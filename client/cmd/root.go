@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/cloudflare/circl/sign/ed448"
@@ -150,6 +151,20 @@ func GetGRPCClient() (*grpc.ClientConn, error) {
 	)
 }
 
+func signatureCheckDefault() bool {
+	envVarValue, envVarExists := os.LookupEnv("QUILIBRIUM_SIGNATURE_CHECK")
+	if envVarExists {
+		def, err := strconv.ParseBool(envVarValue)
+		if err == nil {
+			return def
+		} else {
+			fmt.Println("Invalid environment variable QUILIBRIUM_SIGNATURE_CHECK, must be 'true' or 'false'. Got: " + envVarValue)
+		}
+	}
+
+	return true
+}
+
 func init() {
 	rootCmd.PersistentFlags().StringVar(
 		&configDirectory,
@@ -166,7 +181,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(
 		&signatureCheck,
 		"signature-check",
-		true,
-		"bypass signature check (not recommended for binaries)",
+		signatureCheckDefault(),
+		"bypass signature check (not recommended for binaries) (default true or value of QUILIBRIUM_SIGNATURE_CHECK env var)",
 	)
 }
