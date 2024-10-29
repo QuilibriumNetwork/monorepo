@@ -237,6 +237,23 @@ func NewBlossomSub(
 		opts = append(opts, libp2p.Identity(privKey))
 	}
 
+	allowedPeers := []peer.AddrInfo{}
+	allowedPeers = append(allowedPeers, bootstrappers...)
+
+	directPeers := []peer.AddrInfo{}
+	if len(p2pConfig.DirectPeers) > 0 {
+		logger.Info("found direct peers in config")
+		for _, peerAddr := range p2pConfig.DirectPeers {
+			peerinfo, err := peer.AddrInfoFromString(peerAddr)
+			if err != nil {
+				panic(err)
+			}
+			logger.Info("adding direct peer", zap.String("peer", peerinfo.ID.String()))
+			directPeers = append(directPeers, *peerinfo)
+		}
+	}
+	allowedPeers = append(allowedPeers, directPeers...)
+
 	if p2pConfig.LowWatermarkConnections != 0 &&
 		p2pConfig.HighWatermarkConnections != 0 {
 		cm, err := connmgr.NewConnManager(
@@ -250,7 +267,7 @@ func NewBlossomSub(
 
 		rm, err := resourceManager(
 			p2pConfig.HighWatermarkConnections,
-			bootstrappers,
+			allowedPeers,
 		)
 		if err != nil {
 			panic(err)
@@ -318,21 +335,8 @@ func NewBlossomSub(
 		blossomsub.WithStrictSignatureVerification(true),
 	}
 
-	if len(p2pConfig.DirectPeers) > 0 {
-		logger.Info("Found direct peers in config")
-		directPeers := []peer.AddrInfo{}
-		for _, peerAddr := range p2pConfig.DirectPeers {
-			peerinfo, err := peer.AddrInfoFromString(peerAddr)
-			if err != nil {
-				panic(err)
-			}
-			logger.Info("Adding direct peer", zap.String("peer", peerinfo.ID.String()))
-			directPeers = append(directPeers, *peerinfo)
-		}
-
-		if len(directPeers) > 0 {
-			blossomOpts = append(blossomOpts, blossomsub.WithDirectPeers(directPeers))
-		}
+	if len(directPeers) > 0 {
+		blossomOpts = append(blossomOpts, blossomsub.WithDirectPeers(directPeers))
 	}
 
 	if tracer != nil {
@@ -394,7 +398,7 @@ func NewBlossomSub(
 
 // adjusted from Lotus' reference implementation, addressing
 // https://github.com/libp2p/go-libp2p/issues/1640
-func resourceManager(highWatermark uint, bootstrappers []peer.AddrInfo) (
+func resourceManager(highWatermark uint, allowed []peer.AddrInfo) (
 	network.ResourceManager,
 	error,
 ) {
@@ -461,18 +465,18 @@ func resourceManager(highWatermark uint, bootstrappers []peer.AddrInfo) (
 	)
 
 	resolver := madns.DefaultResolver
-	var bootstrapperMaddrs []ma.Multiaddr
-	for _, pi := range bootstrappers {
+	var allowedMaddrs []ma.Multiaddr
+	for _, pi := range allowed {
 		for _, addr := range pi.Addrs {
 			resolved, err := resolver.Resolve(context.Background(), addr)
 			if err != nil {
 				continue
 			}
-			bootstrapperMaddrs = append(bootstrapperMaddrs, resolved...)
+			allowedMaddrs = append(allowedMaddrs, resolved...)
 		}
 	}
 
-	opts = append(opts, rcmgr.WithAllowlistedMultiaddrs(bootstrapperMaddrs))
+	opts = append(opts, rcmgr.WithAllowlistedMultiaddrs(allowedMaddrs))
 
 	mgr, err := rcmgr.NewResourceManager(limiter, opts...)
 	if err != nil {
