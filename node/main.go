@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"log"
 	"math/big"
+	"net/http"
+	npprof "net/http/pprof"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -76,6 +78,11 @@ var (
 		"memprofile",
 		"",
 		"write memory profile after 20m to this file",
+	)
+	pprofServer = flag.String(
+		"pprof-server",
+		"",
+		"enable pprof server on specified address (e.g. localhost:6060)",
 	)
 	nodeInfo = flag.Bool(
 		"node-info",
@@ -228,6 +235,18 @@ func main() {
 		defer f.Close()
 		pprof.StartCPUProfile(f)
 		defer pprof.StopCPUProfile()
+	}
+
+	if *pprofServer != "" && *core == 0 {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/debug/pprof/", npprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", npprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", npprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", npprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", npprof.Trace)
+			log.Fatal(http.ListenAndServe(*pprofServer, mux))
+		}()
 	}
 
 	if *balance {
