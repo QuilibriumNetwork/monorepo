@@ -924,9 +924,10 @@ func discoverPeers(
 	routingDiscovery *routing.RoutingDiscovery,
 	init bool,
 ) {
-	logger.Info("initiating peer discovery")
-
 	discover := func() {
+		logger.Info("initiating peer discovery")
+		defer logger.Info("completed peer discovery")
+
 		peerChan, err := routingDiscovery.FindPeers(
 			ctx,
 			getNetworkNamespace(p2pConfig.Network),
@@ -937,11 +938,10 @@ func discoverPeers(
 		}
 
 		for peer := range peerChan {
-			peer := peer
 			if peer.ID == h.ID() ||
 				h.Network().Connectedness(peer.ID) == network.Connected ||
 				h.Network().Connectedness(peer.ID) == network.Limited {
-				return
+				continue
 			}
 
 			logger.Debug("found peer", zap.String("peer_id", peer.ID.String()))
@@ -966,8 +966,6 @@ func discoverPeers(
 	} else {
 		discover()
 	}
-
-	logger.Info("completed peer discovery")
 }
 
 func mergeDefaults(p2pConfig *config.P2PConfig) blossomsub.BlossomSubParams {
