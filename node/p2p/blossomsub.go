@@ -384,7 +384,7 @@ func NewBlossomSub(
 	bs.h = h
 	bs.signKey = privKey
 
-	allowedPeerIDs := map[peer.ID]struct{}{}
+	allowedPeerIDs := make(map[peer.ID]struct{}, len(allowedPeers))
 	for _, peerInfo := range allowedPeers {
 		allowedPeerIDs[peerInfo.ID] = struct{}{}
 	}
@@ -705,9 +705,13 @@ func initDHT(
 	}
 
 	reconnect := func() {
+		wg := &sync.WaitGroup{}
+		defer wg.Wait()
 		for _, peerinfo := range bootstrappers {
 			peerinfo := peerinfo
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
 				if peerinfo.ID == h.ID() ||
 					h.Network().Connectedness(peerinfo.ID) == network.Connected ||
 					h.Network().Connectedness(peerinfo.ID) == network.Limited {
@@ -729,10 +733,21 @@ func initDHT(
 
 	reconnect()
 
+	bootstrapPeerIDs := make(map[peer.ID]struct{}, len(bootstrappers))
+	for _, peerinfo := range bootstrappers {
+		bootstrapPeerIDs[peerinfo.ID] = struct{}{}
+	}
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			if len(h.Network().Peers()) == 0 {
+			found := false
+			for _, p := range h.Network().Peers() {
+				if _, ok := bootstrapPeerIDs[p]; ok {
+					found = true
+					break
+				}
+			}
+			if !found {
 				reconnect()
 			}
 		}
