@@ -384,11 +384,22 @@ func NewBlossomSub(
 	bs.h = h
 	bs.signKey = privKey
 
+	allowedPeerIDs := map[peer.ID]struct{}{}
+	for _, peerInfo := range allowedPeers {
+		allowedPeerIDs[peerInfo.ID] = struct{}{}
+	}
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
 			for _, b := range bs.bitmaskMap {
-				if len(b.ListPeers()) < 4 {
+				bitmaskPeers := b.ListPeers()
+				peerCount := len(bitmaskPeers)
+				for _, p := range bitmaskPeers {
+					if _, ok := allowedPeerIDs[p]; ok {
+						peerCount--
+					}
+				}
+				if peerCount < 4 {
 					discoverPeers(p2pConfig, bs.ctx, logger, bs.h, routingDiscovery, false)
 					break
 				}
