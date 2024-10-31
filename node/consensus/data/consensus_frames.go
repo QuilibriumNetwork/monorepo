@@ -17,6 +17,44 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
+func (e *DataClockConsensusEngine) collect(
+	enqueuedFrame *protobufs.ClockFrame,
+) (*protobufs.ClockFrame, error) {
+	e.logger.Info("collecting vdf proofs")
+
+	latest := enqueuedFrame
+
+	for {
+		peerId, maxFrame, err := e.GetMostAheadPeer(latest.FrameNumber)
+		if maxFrame > latest.FrameNumber {
+			e.syncingStatus = SyncStatusSynchronizing
+			if err != nil {
+				e.logger.Info("no peers available for sync, waiting")
+				time.Sleep(5 * time.Second)
+			} else if maxFrame > latest.FrameNumber {
+				if maxFrame-latest.FrameNumber > 100 {
+					maxFrame = latest.FrameNumber + 100
+				}
+				latest, err = e.sync(latest, maxFrame, peerId)
+				if err == nil {
+					break
+				}
+			}
+		} else {
+			break
+		}
+	}
+
+	e.syncingStatus = SyncStatusNotSyncing
+
+	e.logger.Info(
+		"returning leader frame",
+		zap.Uint64("frame_number", latest.FrameNumber),
+	)
+
+	return latest, nil
+}
+
 func (e *DataClockConsensusEngine) prove(
 	previousFrame *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
@@ -169,12 +207,16 @@ func (e *DataClockConsensusEngine) GetMostAheadPeer(
 	uint64,
 	error,
 ) {
-	e.logger.Info(
+	e.logger.Debug(
 		"checking peer list",
 		zap.Int("peers", len(e.peerMap)),
 		zap.Int("uncooperative_peers", len(e.uncooperativePeersMap)),
 		zap.Uint64("current_head_frame", frameNumber),
 	)
+
+	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+		return e.pubSub.GetPeerID(), frameNumber, nil
+	}
 
 	max := frameNumber
 	var peer []byte = nil
@@ -211,7 +253,7 @@ func (e *DataClockConsensusEngine) sync(
 ) (*protobufs.ClockFrame, error) {
 	latest := currentLatest
 	e.logger.Info("polling peer for new frames", zap.Binary("peer_id", peerId))
-	cc, err := e.pubSub.GetDirectChannel(peerId, "")
+	cc, err := e.pubSub.GetDirectChannel(peerId, "sync")
 	if err != nil {
 		e.logger.Debug(
 			"could not establish direct channel",
@@ -265,6 +307,7 @@ func (e *DataClockConsensusEngine) sync(
 
 		if response.ClockFrame == nil ||
 			response.ClockFrame.FrameNumber != latest.FrameNumber+1 ||
+
 			response.ClockFrame.Timestamp < latest.Timestamp {
 			e.logger.Debug("received invalid response from peer")
 			e.peerMapMx.Lock()
@@ -279,12 +322,10 @@ func (e *DataClockConsensusEngine) sync(
 			}
 			return latest, nil
 		}
-
 		e.logger.Info(
 			"received new leading frame",
 			zap.Uint64("frame_number", response.ClockFrame.FrameNumber),
 		)
-
 		if !e.IsInProverTrie(
 			response.ClockFrame.GetPublicKeySignatureEd448().PublicKey.KeyValue,
 		) {
@@ -296,62 +337,19 @@ func (e *DataClockConsensusEngine) sync(
 			}
 			e.peerMapMx.Unlock()
 		}
-
 		if err := e.frameProver.VerifyDataClockFrame(
 			response.ClockFrame,
 		); err != nil {
 			return nil, errors.Wrap(err, "sync")
 		}
-
 		e.dataTimeReel.Insert(response.ClockFrame, true)
 		latest = response.ClockFrame
-
 		if latest.FrameNumber >= maxFrame {
 			break
 		}
 	}
-
 	if err := cc.Close(); err != nil {
 		e.logger.Error("error while closing connection", zap.Error(err))
 	}
-
-	return latest, nil
-}
-
-func (e *DataClockConsensusEngine) collect(
-	enqueuedFrame *protobufs.ClockFrame,
-) (*protobufs.ClockFrame, error) {
-	e.logger.Info("collecting vdf proofs")
-
-	latest := enqueuedFrame
-
-	for {
-		peerId, maxFrame, err := e.GetMostAheadPeer(latest.FrameNumber)
-		if maxFrame > latest.FrameNumber {
-			e.syncingStatus = SyncStatusSynchronizing
-			if err != nil {
-				e.logger.Info("no peers available for sync, waiting")
-				time.Sleep(5 * time.Second)
-			} else if maxFrame > latest.FrameNumber {
-				if maxFrame-latest.FrameNumber > 100 {
-					maxFrame = latest.FrameNumber + 100
-				}
-				latest, err = e.sync(latest, maxFrame, peerId)
-				if err == nil {
-					break
-				}
-			}
-		} else {
-			break
-		}
-	}
-
-	e.syncingStatus = SyncStatusNotSyncing
-
-	e.logger.Info(
-		"returning leader frame",
-		zap.Uint64("frame_number", latest.FrameNumber),
-	)
-
 	return latest, nil
 }

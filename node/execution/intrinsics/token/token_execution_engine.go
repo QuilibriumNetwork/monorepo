@@ -3,7 +3,6 @@ package token
 import (
 	"bytes"
 	"crypto"
-	"encoding/binary"
 	"encoding/hex"
 	"strings"
 	"sync"
@@ -162,7 +161,7 @@ func NewTokenExecutionEngine(
 	)
 
 	e.clock = data.NewDataClockConsensusEngine(
-		cfg.Engine,
+		cfg,
 		logger,
 		keyManager,
 		clockStore,
@@ -316,26 +315,26 @@ func NewTokenExecutionEngine(
 		}
 
 		if err == nil {
-			msg := []byte("resume")
-			msg = binary.BigEndian.AppendUint64(msg, f.FrameNumber)
-			msg = append(msg, e.intrinsicFilter...)
-			sig, err := e.pubSub.SignMessage(msg)
-			if err != nil {
-				panic(err)
-			}
+			// msg := []byte("resume")
+			// msg = binary.BigEndian.AppendUint64(msg, f.FrameNumber)
+			// msg = append(msg, e.intrinsicFilter...)
+			// sig, err := e.pubSub.SignMessage(msg)
+			// if err != nil {
+			// 	panic(err)
+			// }
 
-			// need to wait for peering
-			gotime.Sleep(30 * gotime.Second)
-			e.publishMessage(e.intrinsicFilter, &protobufs.AnnounceProverResume{
-				Filter:      e.intrinsicFilter,
-				FrameNumber: f.FrameNumber,
-				PublicKeySignatureEd448: &protobufs.Ed448Signature{
-					PublicKey: &protobufs.Ed448PublicKey{
-						KeyValue: e.pubSub.GetPublicKey(),
-					},
-					Signature: sig,
-				},
-			})
+			// // need to wait for peering
+			// gotime.Sleep(30 * gotime.Second)
+			// e.publishMessage(e.intrinsicFilter, &protobufs.AnnounceProverResume{
+			// 	Filter:      e.intrinsicFilter,
+			// 	FrameNumber: f.FrameNumber,
+			// 	PublicKeySignatureEd448: &protobufs.Ed448Signature{
+			// 		PublicKey: &protobufs.Ed448PublicKey{
+			// 			KeyValue: e.pubSub.GetPublicKey(),
+			// 		},
+			// 		Signature: sig,
+			// 	},
+			// })
 		}
 	}
 

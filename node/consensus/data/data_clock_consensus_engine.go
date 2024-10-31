@@ -61,7 +61,7 @@ type ChannelServer = protobufs.DataService_GetPublicChannelServer
 type DataClockConsensusEngine struct {
 	protobufs.UnimplementedDataServiceServer
 	difficulty                  uint32
-	engineConfig                *config.EngineConfig
+	config                      *config.Config
 	logger                      *zap.Logger
 	state                       consensus.EngineState
 	clockStore                  store.ClockStore
@@ -93,24 +93,24 @@ type DataClockConsensusEngine struct {
 	currentReceivingSyncPeersMx sync.Mutex
 	currentReceivingSyncPeers   int
 
-	frameChan                      chan *protobufs.ClockFrame
-	executionEngines               map[string]execution.ExecutionEngine
-	filter                         []byte
-	input                          []byte
-	parentSelector                 []byte
-	syncingStatus                  SyncStatusType
-	syncingTarget                  []byte
-	previousHead                   *protobufs.ClockFrame
-	engineMx                       sync.Mutex
-	dependencyMapMx                sync.Mutex
-	stagedTransactions             *protobufs.TokenRequests
-	stagedTransactionsMx           sync.Mutex
-	peerMapMx                      sync.RWMutex
-	peerAnnounceMapMx              sync.Mutex
-	proverTrieJoinRequests         map[string]string
-	proverTrieLeaveRequests        map[string]string
-	proverTriePauseRequests        map[string]string
-	proverTrieResumeRequests       map[string]string
+	frameChan            chan *protobufs.ClockFrame
+	executionEngines     map[string]execution.ExecutionEngine
+	filter               []byte
+	input                []byte
+	parentSelector       []byte
+	syncingStatus        SyncStatusType
+	syncingTarget        []byte
+	previousHead         *protobufs.ClockFrame
+	engineMx             sync.Mutex
+	dependencyMapMx      sync.Mutex
+	stagedTransactions   *protobufs.TokenRequests
+	stagedTransactionsMx sync.Mutex
+	peerMapMx            sync.RWMutex
+	peerAnnounceMapMx    sync.Mutex
+	// proverTrieJoinRequests         map[string]string
+	// proverTrieLeaveRequests        map[string]string
+	// proverTriePauseRequests        map[string]string
+	// proverTrieResumeRequests       map[string]string
 	proverTrieRequestsMx           sync.Mutex
 	lastKeyBundleAnnouncementFrame uint64
 	peerSeniority                  *peerSeniority
@@ -145,7 +145,7 @@ func (p peerSeniorityItem) Priority() *big.Int {
 var _ consensus.DataConsensusEngine = (*DataClockConsensusEngine)(nil)
 
 func NewDataClockConsensusEngine(
-	engineConfig *config.EngineConfig,
+	config *config.Config,
 	logger *zap.Logger,
 	keyManager keys.KeyManager,
 	clockStore store.ClockStore,
@@ -167,7 +167,7 @@ func NewDataClockConsensusEngine(
 		panic(errors.New("logger is nil"))
 	}
 
-	if engineConfig == nil {
+	if config == nil {
 		panic(errors.New("engine config is nil"))
 	}
 
@@ -215,12 +215,12 @@ func NewDataClockConsensusEngine(
 		panic(errors.New("peer info manager is nil"))
 	}
 
-	minimumPeersRequired := engineConfig.MinimumPeersRequired
+	minimumPeersRequired := config.Engine.MinimumPeersRequired
 	if minimumPeersRequired == 0 {
 		minimumPeersRequired = 3
 	}
 
-	difficulty := engineConfig.Difficulty
+	difficulty := config.Engine.Difficulty
 	if difficulty == 0 {
 		difficulty = 160000
 	}
@@ -259,14 +259,14 @@ func NewDataClockConsensusEngine(
 		peerInfoManager:           peerInfoManager,
 		peerSeniority:             newFromMap(peerSeniority),
 		messageProcessorCh:        make(chan *pb.Message),
-		engineConfig:              engineConfig,
+		config:                    config,
 		preMidnightMint:           map[string]struct{}{},
 	}
 
 	logger.Info("constructing consensus engine")
 
 	signer, keyType, bytes, address := e.GetProvingKey(
-		engineConfig,
+		config.Engine,
 	)
 
 	e.filter = filter
@@ -302,17 +302,15 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 
 	e.logger.Info("subscribing to pubsub messages")
 	e.pubSub.Subscribe(e.filter, e.handleMessage)
-
 	go func() {
 		server := grpc.NewServer(
 			grpc.MaxSendMsgSize(600*1024*1024),
 			grpc.MaxRecvMsgSize(600*1024*1024),
 		)
 		protobufs.RegisterDataServiceServer(server, e)
-
 		if err := e.pubSub.StartDirectChannelListener(
 			e.pubSub.GetPeerID(),
-			"",
+			"sync",
 			server,
 		); err != nil {
 			panic(err)
@@ -322,8 +320,8 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	go func() {
 		if e.dataTimeReel.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
 			server := grpc.NewServer(
-				grpc.MaxSendMsgSize(600*1024*1024),
-				grpc.MaxRecvMsgSize(600*1024*1024),
+				grpc.MaxSendMsgSize(1*1024*1024),
+				grpc.MaxRecvMsgSize(1*1024*1024),
 			)
 			protobufs.RegisterDataServiceServer(server, e)
 
@@ -351,9 +349,9 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				panic(err)
 			}
 
-			if frame.FrameNumber >= nextFrame.FrameNumber ||
+			if frame.FrameNumber-100 >= nextFrame.FrameNumber ||
 				nextFrame.FrameNumber == 0 {
-				time.Sleep(30 * time.Second)
+				time.Sleep(60 * time.Second)
 				continue
 			}
 
@@ -436,6 +434,16 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	}()
 
 	go e.runLoop()
+	go e.rebroadcastLoop()
+	go func() {
+		time.Sleep(30 * time.Second)
+		e.logger.Info("checking for snapshots to play forward")
+		if err := e.downloadSnapshot(e.config.DB.Path, e.config.P2P.Network); err != nil {
+			e.logger.Error("error downloading snapshot", zap.Error(err))
+		} else if err := e.applySnapshot(e.config.DB.Path); err != nil {
+			e.logger.Error("error replaying snapshot", zap.Error(err))
+		}
+	}()
 
 	go func() {
 		errChan <- nil
@@ -458,7 +466,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 		}
 
 		var clients []protobufs.DataIPCServiceClient
-		if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
+		if len(e.config.Engine.DataWorkerMultiaddrs) != 0 {
 			clients, err = e.createParallelDataClientsFromList()
 			if err != nil {
 				panic(err)
@@ -510,7 +518,7 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 			for j := 3; j >= 0; j-- {
 				var err error
 				if client == nil {
-					if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
+					if len(e.config.Engine.DataWorkerMultiaddrs) != 0 {
 						e.logger.Error(
 							"client failed, reconnecting after 50ms",
 							zap.Uint32("client", uint32(i)),
@@ -520,7 +528,7 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 						if err != nil {
 							e.logger.Error("failed to reconnect", zap.Error(err))
 						}
-					} else if len(e.engineConfig.DataWorkerMultiaddrs) == 0 {
+					} else if len(e.config.Engine.DataWorkerMultiaddrs) == 0 {
 						e.logger.Error(
 							"client failed, reconnecting after 50ms",
 						)
@@ -549,7 +557,7 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 					if j == 0 {
 						e.logger.Error("unable to get a response in time from worker", zap.Error(err))
 					}
-					if len(e.engineConfig.DataWorkerMultiaddrs) != 0 {
+					if len(e.config.Engine.DataWorkerMultiaddrs) != 0 {
 						e.logger.Error(
 							"client failed, reconnecting after 50ms",
 							zap.Uint32("client", uint32(i)),
@@ -559,7 +567,7 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 						if err != nil {
 							e.logger.Error("failed to reconnect", zap.Error(err))
 						}
-					} else if len(e.engineConfig.DataWorkerMultiaddrs) == 0 {
+					} else if len(e.config.Engine.DataWorkerMultiaddrs) == 0 {
 						e.logger.Error(
 							"client failed, reconnecting after 50ms",
 						)
@@ -607,24 +615,24 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 	e.state = consensus.EngineStateStopping
 	errChan := make(chan error)
 
-	msg := []byte("pause")
-	msg = binary.BigEndian.AppendUint64(msg, e.GetFrame().FrameNumber)
-	msg = append(msg, e.filter...)
-	sig, err := e.pubSub.SignMessage(msg)
-	if err != nil {
-		panic(err)
-	}
+	// msg := []byte("pause")
+	// msg = binary.BigEndian.AppendUint64(msg, e.GetFrame().FrameNumber)
+	// msg = append(msg, e.filter...)
+	// sig, err := e.pubSub.SignMessage(msg)
+	// if err != nil {
+	// 	panic(err)
+	// }
 
-	e.publishMessage(e.filter, &protobufs.AnnounceProverPause{
-		Filter:      e.filter,
-		FrameNumber: e.GetFrame().FrameNumber,
-		PublicKeySignatureEd448: &protobufs.Ed448Signature{
-			PublicKey: &protobufs.Ed448PublicKey{
-				KeyValue: e.pubSub.GetPublicKey(),
-			},
-			Signature: sig,
-		},
-	})
+	// e.publishMessage(e.filter, &protobufs.AnnounceProverPause{
+	// 	Filter:      e.filter,
+	// 	FrameNumber: e.GetFrame().FrameNumber,
+	// 	PublicKeySignatureEd448: &protobufs.Ed448Signature{
+	// 		PublicKey: &protobufs.Ed448PublicKey{
+	// 			KeyValue: e.pubSub.GetPublicKey(),
+	// 		},
+	// 		Signature: sig,
+	// 	},
+	// })
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(e.executionEngines))
@@ -666,7 +674,7 @@ func (e *DataClockConsensusEngine) GetDifficulty() uint32 {
 func (e *DataClockConsensusEngine) GetFrame() *protobufs.ClockFrame {
 	frame, err := e.dataTimeReel.Head()
 	if err != nil {
-		panic(err)
+		return nil
 	}
 
 	return frame
@@ -752,7 +760,7 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromListAndIndex(
 	protobufs.DataIPCServiceClient,
 	error,
 ) {
-	ma, err := multiaddr.NewMultiaddr(e.engineConfig.DataWorkerMultiaddrs[index])
+	ma, err := multiaddr.NewMultiaddr(e.config.Engine.DataWorkerMultiaddrs[index])
 	if err != nil {
 		return nil, errors.Wrap(err, "create parallel data client")
 	}
@@ -798,18 +806,18 @@ func (
 		zap.Uint32("client", index),
 	)
 
-	if e.engineConfig.DataWorkerBaseListenMultiaddr == "" {
-		e.engineConfig.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
+	if e.config.Engine.DataWorkerBaseListenMultiaddr == "" {
+		e.config.Engine.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
 	}
 
-	if e.engineConfig.DataWorkerBaseListenPort == 0 {
-		e.engineConfig.DataWorkerBaseListenPort = 40000
+	if e.config.Engine.DataWorkerBaseListenPort == 0 {
+		e.config.Engine.DataWorkerBaseListenPort = 40000
 	}
 
 	ma, err := multiaddr.NewMultiaddr(
 		fmt.Sprintf(
-			e.engineConfig.DataWorkerBaseListenMultiaddr,
-			int(e.engineConfig.DataWorkerBaseListenPort)+int(index),
+			e.config.Engine.DataWorkerBaseListenMultiaddr,
+			int(e.config.Engine.DataWorkerBaseListenPort)+int(index),
 		),
 	)
 	if err != nil {
@@ -848,7 +856,7 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromList() (
 	[]protobufs.DataIPCServiceClient,
 	error,
 ) {
-	parallelism := len(e.engineConfig.DataWorkerMultiaddrs)
+	parallelism := len(e.config.Engine.DataWorkerMultiaddrs)
 
 	e.logger.Info(
 		"connecting to data worker processes",
@@ -858,7 +866,7 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromList() (
 	clients := make([]protobufs.DataIPCServiceClient, parallelism)
 
 	for i := 0; i < parallelism; i++ {
-		ma, err := multiaddr.NewMultiaddr(e.engineConfig.DataWorkerMultiaddrs[i])
+		ma, err := multiaddr.NewMultiaddr(e.config.Engine.DataWorkerMultiaddrs[i])
 		if err != nil {
 			panic(err)
 		}
@@ -902,12 +910,12 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromBaseMultiaddr(
 		zap.Int("parallelism", parallelism),
 	)
 
-	if e.engineConfig.DataWorkerBaseListenMultiaddr == "" {
-		e.engineConfig.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
+	if e.config.Engine.DataWorkerBaseListenMultiaddr == "" {
+		e.config.Engine.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
 	}
 
-	if e.engineConfig.DataWorkerBaseListenPort == 0 {
-		e.engineConfig.DataWorkerBaseListenPort = 40000
+	if e.config.Engine.DataWorkerBaseListenPort == 0 {
+		e.config.Engine.DataWorkerBaseListenPort = 40000
 	}
 
 	clients := make([]protobufs.DataIPCServiceClient, parallelism)
@@ -915,8 +923,8 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromBaseMultiaddr(
 	for i := 0; i < parallelism; i++ {
 		ma, err := multiaddr.NewMultiaddr(
 			fmt.Sprintf(
-				e.engineConfig.DataWorkerBaseListenMultiaddr,
-				int(e.engineConfig.DataWorkerBaseListenPort)+i,
+				e.config.Engine.DataWorkerBaseListenMultiaddr,
+				int(e.config.Engine.DataWorkerBaseListenPort)+i,
 			),
 		)
 		if err != nil {

@@ -115,7 +115,7 @@ func (a *TokenApplication) handleMint(
 			},
 		}
 		return outputs, nil
-	} else if len(t.Proofs) != 3 && currentFrameNumber > 60480 {
+	} else if len(t.Proofs) != 3 && currentFrameNumber > 77000 {
 		if _, touched := lockMap[string(t.Signature.PublicKey.KeyValue)]; touched {
 			return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 		}

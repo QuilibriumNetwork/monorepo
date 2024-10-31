@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
@@ -67,9 +68,11 @@ func (pubsub) GetNetworkInfo() *protobufs.NetworkInfoResponse {
 func (p pubsub) SignMessage(msg []byte) ([]byte, error) {
 	return p.privkey.Sign(rand.Reader, msg, gocrypto.Hash(0))
 }
-func (p pubsub) GetPublicKey() []byte                  { return p.pubkey }
-func (pubsub) GetPeerScore(peerId []byte) int64        { return 0 }
-func (pubsub) SetPeerScore(peerId []byte, score int64) {}
+func (p pubsub) GetPublicKey() []byte                       { return p.pubkey }
+func (pubsub) GetPeerScore(peerId []byte) int64             { return 0 }
+func (pubsub) SetPeerScore(peerId []byte, score int64)      {}
+func (pubsub) AddPeerScore(peerId []byte, scoreDelta int64) {}
+func (pubsub) Reconnect(peerId []byte) error                { return nil }
 
 type outputs struct {
 	difficulty  uint32
@@ -128,7 +131,7 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		peerInfoManager:           nil,
 		peerSeniority:             newFromMap(map[string]uint64{}),
 		messageProcessorCh:        make(chan *pb.Message),
-		engineConfig:              nil,
+		config:                    nil,
 		preMidnightMint:           map[string]struct{}{},
 	}
 
@@ -623,7 +626,23 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		}
 	}
 
-	assert.Len(t, d.stagedTransactions.Requests, 1)
+	req := <-d.messageProcessorCh
+
+	assert.NotNil(t, req)
+	message := &protobufs.Message{}
+
+	err = proto.Unmarshal(req.Data, message)
+	assert.NoError(t, err)
+	appMsg := &anypb.Any{}
+	err = proto.Unmarshal(message.Payload, appMsg)
+	assert.NoError(t, err)
+	tr := &protobufs.TokenRequest{}
+	err = proto.Unmarshal(appMsg.Value, tr)
+	assert.NoError(t, err)
+
+	d.stagedTransactions = &protobufs.TokenRequests{
+		Requests: []*protobufs.TokenRequest{tr},
+	}
 	// confirm operation cannot occur twice:
 	d.stagedTransactions.Requests = append(
 		d.stagedTransactions.Requests,

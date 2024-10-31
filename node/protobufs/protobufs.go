@@ -22,6 +22,7 @@ const (
 	InclusionProofsMapType       = DataPrefix + "InclusionProofsMap"
 	InclusionSegmentsMapType     = DataPrefix + "InclusionSegmentsMap"
 	InclusionCommitmentsMapType  = DataPrefix + "InclusionCommitmentsMap"
+	FrameRebroadcastType         = DataPrefix + "FrameRebroadcast"
 	ApplicationType              = AppPrefix + "Application"
 	ExecutionContextType         = AppPrefix + "ExecutionContext"
 	MessageType                  = AppPrefix + "Message"

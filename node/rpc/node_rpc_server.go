@@ -161,9 +161,14 @@ func (r *RPCServer) GetNodeInfo(
 	}
 	peerScore := r.pubSub.GetPeerScore(r.pubSub.GetPeerID())
 
+	head := r.executionEngines[0].GetFrame()
+	frame := uint64(0)
+	if head != nil {
+		frame = head.FrameNumber
+	}
 	return &protobufs.NodeInfoResponse{
 		PeerId:    peerID.String(),
-		MaxFrame:  r.masterClock.GetFrame().GetFrameNumber(),
+		MaxFrame:  frame,
 		PeerScore: uint64(peerScore),
 		Version: append(
 			append([]byte{}, config.GetVersion()...), config.GetPatchNumber(),

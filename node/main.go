@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"log"
 	"math/big"
+	"net/http"
+	npprof "net/http/pprof"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -76,6 +78,11 @@ var (
 		"memprofile",
 		"",
 		"write memory profile after 20m to this file",
+	)
+	pprofServer = flag.String(
+		"pprof-server",
+		"",
+		"enable pprof server on specified address (e.g. localhost:6060)",
 	)
 	nodeInfo = flag.Bool(
 		"node-info",
@@ -195,7 +202,7 @@ func main() {
 				count++
 			}
 
-			if count < len(config.Signatories)/2+len(config.Signatories)%2 {
+			if count < ((len(config.Signatories)-4)/2)+((len(config.Signatories)-4)%2) {
 				fmt.Printf("Quorum on signatures not met")
 				os.Exit(1)
 			}
@@ -225,8 +232,21 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		defer f.Close()
 		pprof.StartCPUProfile(f)
 		defer pprof.StopCPUProfile()
+	}
+
+	if *pprofServer != "" && *core == 0 {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/debug/pprof/", npprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", npprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", npprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", npprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", npprof.Trace)
+			log.Fatal(http.ListenAndServe(*pprofServer, mux))
+		}()
 	}
 
 	if *balance {
@@ -332,7 +352,7 @@ func main() {
 	}
 
 	if *core != 0 {
-		runtime.GOMAXPROCS(2)
+		// runtime.GOMAXPROCS(2)
 		rdebug.SetGCPercent(9999)
 
 		if nodeConfig.Engine.DataWorkerMemoryLimit == 0 {
@@ -429,7 +449,7 @@ func main() {
 		return
 	}
 
-	runtime.GOMAXPROCS(1)
+	// runtime.GOMAXPROCS(1)
 
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		srv, err := rpc.NewRPCServer(
@@ -661,7 +681,8 @@ func printNodeInfo(cfg *config.Config) {
 
 	conn, err := app.ConnectToNode(cfg)
 	if err != nil {
-		panic(err)
+		fmt.Println("Could not connect to node. If it is still booting, please wait.")
+		os.Exit(1)
 	}
 	defer conn.Close()
 

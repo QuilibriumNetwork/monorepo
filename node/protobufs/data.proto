@@ -88,6 +88,13 @@ message PreMidnightMintStatusRequest {
   bytes owner = 1;
 }
 
+message FrameRebroadcast {
+  uint64 from = 1;
+  uint64 to = 2;
+  repeated quilibrium.node.clock.pb.ClockFrame clock_frames = 3;
+  bytes random = 4;
+}
+
 service DataService {
   rpc GetCompressedSyncFrames (quilibrium.node.clock.pb.ClockFramesRequest) returns (stream DataCompressedSync);
   rpc NegotiateCompressedSyncFrames (stream DataCompressedSyncRequestMessage) returns (stream DataCompressedSyncResponseMessage);

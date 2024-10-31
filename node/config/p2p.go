@@ -39,4 +39,5 @@ type P2PConfig struct {
 	Network                   uint8         `yaml:"network"`
 	LowWatermarkConnections   uint          `yaml:"lowWatermarkConnections"`
 	HighWatermarkConnections  uint          `yaml:"highWatermarkConnections"`
+	DirectPeers               []string      `yaml:"directPeers"`
 }

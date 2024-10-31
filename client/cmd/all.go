@@ -6,13 +6,19 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-
-	gotime "time"
+	"strings"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
+	"google.golang.org/grpc"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
@@ -27,12 +33,6 @@ var allCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		conn, err := GetGRPCClient()
-		if err != nil {
-			panic(err)
-		}
-		defer conn.Close()
-
 		if !LightNode {
 			fmt.Println(
 				"mint all cannot be run unless node is not running. ensure your node " +
@@ -40,8 +40,6 @@ var allCmd = &cobra.Command{
 			)
 			os.Exit(1)
 		}
-
-		client := protobufs.NewNodeServiceClient(conn)
 
 		db := store.NewPebbleDB(NodeConfig.DB)
 		logger, _ := zap.NewProduction()
@@ -57,137 +55,213 @@ var allCmd = &cobra.Command{
 			panic(err)
 		}
 
+		pubSub := p2p.NewBlossomSub(NodeConfig.P2P, logger)
+		logger.Info("connecting to network")
+		time.Sleep(5 * time.Second)
+
 		increment, _, _, err := dataProofStore.GetLatestDataTimeProof(
 			[]byte(peerId),
 		)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				logger.Info("could not find pre-2.0 proofs")
+				return
+			}
 
-		addr, err := poseidon.HashBytes([]byte(peerId))
+			panic(err)
+		}
+
+		addrBI, err := poseidon.HashBytes([]byte(peerId))
 		if err != nil {
 			panic(err)
 		}
 
+		addr := addrBI.FillBytes(make([]byte, 32))
+
+		genesis := config.GetGenesis()
+		bpub, err := crypto.UnmarshalEd448PublicKey(genesis.Beacon)
 		if err != nil {
 			panic(err)
 		}
 
-		resp, err := client.GetPreCoinProofsByAccount(
-			context.Background(),
-			&protobufs.GetPreCoinProofsByAccountRequest{
-				Address: addr.FillBytes(make([]byte, 32)),
-			},
-		)
+		bpeerId, err := peer.IDFromPublicKey(bpub)
 		if err != nil {
-			panic(err)
+			panic(errors.Wrap(err, "error getting peer id"))
 		}
 
 		resume := make([]byte, 32)
-		for _, pr := range resp.Proofs {
-			if pr.IndexProof != nil {
-				resume, err = token.GetAddressOfPreCoinProof(pr)
-				if err != nil {
-					panic(err)
-				}
-				increment = pr.Difficulty - 1
-			}
-		}
-
-		if increment == 0 && !bytes.Equal(resume, make([]byte, 32)) {
-			fmt.Println("already completed pre-midnight mint")
-			return
-		}
-
-		proofs := [][]byte{
-			[]byte("pre-dusk"),
-			resume,
-		}
-
-		batchCount := 0
-		for i := int(increment); i >= 0; i-- {
-			_, parallelism, input, output, err := dataProofStore.GetDataTimeProof(
-				[]byte(peerId),
-				uint32(i),
+		cc, err := pubSub.GetDirectChannel([]byte(bpeerId), "worker")
+		if err != nil {
+			logger.Info(
+				"could not establish direct channel, waiting...",
+				zap.Error(err),
 			)
-			if err == nil {
-				p := []byte{}
-				p = binary.BigEndian.AppendUint32(p, uint32(i))
-				p = binary.BigEndian.AppendUint32(p, parallelism)
-				p = binary.BigEndian.AppendUint64(p, uint64(len(input)))
-				p = append(p, input...)
-				p = binary.BigEndian.AppendUint64(p, uint64(len(output)))
-				p = append(p, output...)
-
-				proofs = append(proofs, p)
-			} else {
-				fmt.Println("could not find data time proof for peer and increment, stopping at increment", i)
-				panic(err)
+			time.Sleep(10 * time.Second)
+		}
+		for {
+			if cc == nil {
+				cc, err = pubSub.GetDirectChannel([]byte(bpeerId), "worker")
+				if err != nil {
+					logger.Info(
+						"could not establish direct channel, waiting...",
+						zap.Error(err),
+					)
+					cc = nil
+					time.Sleep(10 * time.Second)
+					continue
+				}
 			}
 
-			batchCount++
-			if batchCount == 200 || i == 0 {
-				fmt.Println("publishing proof batch, increment", i)
-				payload := []byte("mint")
-				for _, i := range proofs {
-					payload = append(payload, i...)
-				}
-				sig, err := privKey.Sign(payload)
-				if err != nil {
-					panic(err)
+			client := protobufs.NewDataServiceClient(cc)
+
+			if bytes.Equal(resume, make([]byte, 32)) {
+				status, err := client.GetPreMidnightMintStatus(
+					context.Background(),
+					&protobufs.PreMidnightMintStatusRequest{
+						Owner: addr,
+					},
+					grpc.MaxCallSendMsgSize(1*1024*1024),
+					grpc.MaxCallRecvMsgSize(1*1024*1024),
+				)
+				if err != nil || status == nil {
+					logger.Error(
+						"got error response, waiting...",
+						zap.Error(err),
+					)
+					time.Sleep(10 * time.Second)
+					cc.Close()
+					cc = nil
+					err = pubSub.Reconnect([]byte(peerId))
+					if err != nil {
+						logger.Error(
+							"got error response, waiting...",
+							zap.Error(err),
+						)
+						time.Sleep(10 * time.Second)
+					}
+					continue
 				}
 
-				_, err = client.SendMessage(
-					context.Background(),
-					&protobufs.TokenRequest{
-						Request: &protobufs.TokenRequest_Mint{
-							Mint: &protobufs.MintCoinRequest{
-								Proofs: proofs,
-								Signature: &protobufs.Ed448Signature{
-									PublicKey: &protobufs.Ed448PublicKey{
-										KeyValue: pub,
-									},
-									Signature: sig,
+				resume = status.Address
+
+				if status.Increment != 0 {
+					increment = status.Increment - 1
+				} else if !bytes.Equal(status.Address, make([]byte, 32)) {
+					increment = 0
+				}
+			}
+
+			proofs := [][]byte{
+				[]byte("pre-dusk"),
+				resume,
+			}
+
+			batchCount := 0
+			// the cast is important, it underflows without:
+			for i := int(increment); i >= 0; i-- {
+				_, parallelism, input, output, err := dataProofStore.GetDataTimeProof(
+					[]byte(peerId),
+					uint32(i),
+				)
+				if err == nil {
+					p := []byte{}
+					p = binary.BigEndian.AppendUint32(p, uint32(i))
+					p = binary.BigEndian.AppendUint32(p, parallelism)
+					p = binary.BigEndian.AppendUint64(p, uint64(len(input)))
+					p = append(p, input...)
+					p = binary.BigEndian.AppendUint64(p, uint64(len(output)))
+					p = append(p, output...)
+
+					proofs = append(proofs, p)
+				} else {
+					logger.Error(
+						"could not find data time proof for peer and increment, stopping worker",
+						zap.String("peer_id", peerId.String()),
+						zap.Int("increment", i),
+					)
+					cc.Close()
+					cc = nil
+					return
+				}
+
+				batchCount++
+				if batchCount == 200 || i == 0 {
+					logger.Info("publishing proof batch", zap.Int("increment", i))
+
+					payload := []byte("mint")
+					for _, i := range proofs {
+						payload = append(payload, i...)
+					}
+					sig, err := pubSub.SignMessage(payload)
+					if err != nil {
+						cc.Close()
+						panic(err)
+					}
+
+					resp, err := client.HandlePreMidnightMint(
+						context.Background(),
+						&protobufs.MintCoinRequest{
+							Proofs: proofs,
+							Signature: &protobufs.Ed448Signature{
+								PublicKey: &protobufs.Ed448PublicKey{
+									KeyValue: pub,
 								},
+								Signature: sig,
 							},
 						},
-					},
-				)
-				if err != nil {
-					panic(err)
-				}
-
-			waitForConf:
-				for {
-					gotime.Sleep(20 * gotime.Second)
-					resp, err := client.GetPreCoinProofsByAccount(
-						context.Background(),
-						&protobufs.GetPreCoinProofsByAccountRequest{
-							Address: addr.FillBytes(make([]byte, 32)),
-						},
+						grpc.MaxCallSendMsgSize(1*1024*1024),
+						grpc.MaxCallRecvMsgSize(1*1024*1024),
 					)
-					if err != nil {
-						for _, pr := range resp.Proofs {
-							if pr.IndexProof != nil {
-								newResume, err := token.GetAddressOfPreCoinProof(pr)
-								if err != nil {
-									panic(err)
-								}
-								if bytes.Equal(newResume, resume) {
-									fmt.Println("waiting for confirmation...")
-									continue waitForConf
-								}
-							}
-						}
-					}
-					break
-				}
-				batchCount = 0
-				proofs = [][]byte{
-					[]byte("pre-dusk"),
-					resume,
-				}
 
-				if i == 0 {
-					fmt.Println("all proofs submitted, returning")
-					return
+					if err != nil {
+						if strings.Contains(
+							err.Error(),
+							application.ErrInvalidStateTransition.Error(),
+						) && i == 0 {
+							resume = make([]byte, 32)
+							logger.Info("pre-midnight proofs submitted, returning")
+							cc.Close()
+							cc = nil
+							return
+						}
+
+						logger.Error(
+							"got error response, waiting...",
+							zap.Error(err),
+						)
+
+						resume = make([]byte, 32)
+						cc.Close()
+						cc = nil
+						time.Sleep(10 * time.Second)
+						err = pubSub.Reconnect([]byte(peerId))
+						if err != nil {
+							logger.Error(
+								"got error response, waiting...",
+								zap.Error(err),
+							)
+							time.Sleep(10 * time.Second)
+						}
+						break
+					}
+
+					resume = resp.Address
+					batchCount = 0
+					proofs = [][]byte{
+						[]byte("pre-dusk"),
+						resume,
+					}
+
+					if i == 0 {
+						logger.Info("pre-midnight proofs submitted, returning")
+						cc.Close()
+						cc = nil
+						return
+					} else {
+						increment = uint32(i) - 1
+					}
+
+					break
 				}
 			}
 		}

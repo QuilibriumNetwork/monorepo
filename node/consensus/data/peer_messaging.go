@@ -101,6 +101,7 @@ func (e *DataClockConsensusEngine) HandlePreMidnightMint(
 ) (*protobufs.PreMidnightMintResponse, error) {
 	addr, err := e.handleMint(t)
 	if err != nil {
+		e.logger.Error("error while handling pre-midnight mint", zap.Error(err))
 		return nil, err
 	}
 
@@ -222,13 +223,18 @@ func (e *DataClockConsensusEngine) handleMint(
 		return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 	}
 
+	e.logger.Debug(
+		"got pre-midnight mint request",
+		zap.String("peer", peerId.String()),
+	)
+
 	if len(t.Proofs) >= 3 &&
 		len(t.Proofs) < 204 &&
 		bytes.Equal(
 			t.Proofs[0],
 			[]byte("pre-dusk"),
 		) && (!bytes.Equal(t.Proofs[1], make([]byte, 32)) ||
-		head.FrameNumber < 60480) && e.GetFrameProverTries()[0].Contains(
+		head.FrameNumber < 67000) && e.GetFrameProverTries()[0].Contains(
 		e.provingKeyAddress,
 	) {
 		prevInput := []byte{}
@@ -250,7 +256,9 @@ func (e *DataClockConsensusEngine) handleMint(
 				return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 			}
 			if pre.Difficulty == 0 {
-				_, pr, err := e.coinStore.GetPreCoinProofsForOwner(t.Proofs[0][32:])
+				_, pr, err := e.coinStore.GetPreCoinProofsForOwner(
+					altAddr.FillBytes(make([]byte, 32)),
+				)
 				if err != nil && !errors.Is(err, store.ErrNotFound) {
 					return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
 				}
@@ -505,11 +513,8 @@ func (e *DataClockConsensusEngine) handleMint(
 				txn.Abort()
 				return nil, errors.Wrap(err, "handle mint")
 			}
-			e.stagedTransactionsMx.Lock()
-			if e.stagedTransactions == nil {
-				e.stagedTransactions = &protobufs.TokenRequests{}
-			}
-			e.stagedTransactions.Requests = append(e.stagedTransactions.Requests,
+			err = e.insertMessage(
+				e.filter,
 				&protobufs.TokenRequest{
 					Request: &protobufs.TokenRequest_Mint{
 						Mint: &protobufs.MintCoinRequest{
@@ -522,8 +527,12 @@ func (e *DataClockConsensusEngine) handleMint(
 							},
 						},
 					},
-				})
-			e.stagedTransactionsMx.Unlock()
+				},
+			)
+			if err != nil {
+				txn.Abort()
+				return nil, errors.Wrap(err, "handle mint")
+			}
 		}
 
 		if len(deletes) == 1 {
