@@ -1046,10 +1046,6 @@ func discoverPeers(
 		wg := &sync.WaitGroup{}
 		defer wg.Wait()
 		for peer := range peerChan {
-			if len(h.Network().Peers()) >= 6 {
-				break
-			}
-
 			peer := peer
 			wg.Add(1)
 			go func() {
