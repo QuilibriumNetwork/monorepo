@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
-
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -31,33 +31,69 @@ var mergeCmd = &cobra.Command{
 		defer conn.Close()
 
 		client := protobufs.NewNodeServiceClient(conn)
-		key, err := GetPrivKeyFromConfig(NodeConfig)
+		peerId := GetPeerIDFromConfig(NodeConfig)
+		privKey, err := GetPrivKeyFromConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}
+
+		pub, err := privKey.GetPublic().Raw()
+		if err != nil {
+			panic(err)
+		}
+		addr, err := poseidon.HashBytes([]byte(peerId))
+		if err != nil {
+			panic(err)
+		}
+
+		addrBytes := addr.FillBytes(make([]byte, 32))
+
+		altAddr, err := poseidon.HashBytes([]byte(pub))
+		if err != nil {
+			panic(err)
+		}
+
+		altAddrBytes := altAddr.FillBytes(make([]byte, 32))
 
 		var coinaddrs []*protobufs.CoinRef
 
 		// Process for "merge all" command
 		if len(args) == 1 && args[0] == "all" {
 			// Make a new call to get all existing coins
-			ctx := context.Background()
-			response, err := client.GetCoins(ctx, &protobufs.GetCoinsRequest{})
+			info, err := client.GetTokensByAccount(
+				context.Background(),
+				&protobufs.GetTokensByAccountRequest{
+					Address: addrBytes,
+				},
+			)
 			if err != nil {
 				panic(err)
 			}
-
+			// Add all coins to the list
+			for _, coin := range info.Addresses {
+				coinaddrs = append(coinaddrs, &protobufs.CoinRef{
+					Address: coin,
+				})
+			}
+			info, err = client.GetTokensByAccount(
+				context.Background(),
+				&protobufs.GetTokensByAccountRequest{
+					Address: altAddrBytes,
+				},
+			)
+			if err != nil {
+				panic(err)
+			}
+			// Add all coins to the list
+			for _, coin := range info.Addresses {
+				coinaddrs = append(coinaddrs, &protobufs.CoinRef{
+					Address: coin,
+				})
+			}
 			// Terminate if no coins available
-			if len(response.Coins) == 0 {
+			if len(coinaddrs) == 0 {
 				println("No coins available to merge")
 				return
-			}
-
-			// Add all coins to the list
-			for _, coin := range response.Coins {
-				coinaddrs = append(coinaddrs, &protobufs.CoinRef{
-					Address: coin.Address,
-				})
 			}
 		} else {
 			// Regular coin address processing logic
@@ -97,12 +133,7 @@ var mergeCmd = &cobra.Command{
 		}
 
 		// Signing process
-		sig, err := key.Sign(payload)
-		if err != nil {
-			panic(err)
-		}
-
-		pub, err := key.GetPublic().Raw()
+		sig, err := privKey.Sign(payload)
 		if err != nil {
 			panic(err)
 		}
