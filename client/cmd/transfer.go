@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -13,12 +14,9 @@ var transferCmd = &cobra.Command{
 	Use:   "transfer",
 	Short: "Creates a pending transfer of coin",
 	Long: `Creates a pending transfer of coin:
-	
-	transfer <ToAccount> <OfCoin>
-	
-	ToAccount – account address, must be specified
-	OfCoin – the address of the coin to send in whole
-	`,
+transfer <ToAccount> <OfCoin>
+ToAccount – account address, must be specified
+OfCoin – the address of the coin to send in whole`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 2 {
 			panic("invalid arguments")
@@ -39,6 +37,7 @@ var transferCmd = &cobra.Command{
 		var coinaddr *protobufs.CoinRef
 		payload := []byte("transfer")
 		toaddr := []byte{}
+
 		for i, arg := range args {
 			addrHex, _ := strings.CutPrefix(arg, "0x")
 			addr, err := hex.DecodeString(addrHex)
@@ -49,13 +48,26 @@ var transferCmd = &cobra.Command{
 				toaddr = addr
 				continue
 			}
-
 			coinaddr = &protobufs.CoinRef{
 				Address: addr,
 			}
 			payload = append(payload, addr...)
 		}
 		payload = append(payload, toaddr...)
+
+		// Display transaction details and confirmation prompt
+		fmt.Printf("\nTransaction Details:\n")
+		fmt.Printf("To Address: 0x%x\n", toaddr)
+		fmt.Printf("Coin Address: 0x%x\n", coinaddr.Address)
+		fmt.Print("\nDo you want to proceed with this transaction? (yes/no): ")
+
+		var response string
+		fmt.Scanln(&response)
+
+		if strings.ToLower(response) != "yes" {
+			fmt.Println("Transaction cancelled by user.")
+			return
+		}
 
 		sig, err := key.Sign(payload)
 		if err != nil {
@@ -93,6 +105,8 @@ var transferCmd = &cobra.Command{
 		if err != nil {
 			panic(err)
 		}
+
+		fmt.Println("Transaction sent successfully.")
 	},
 }
 
