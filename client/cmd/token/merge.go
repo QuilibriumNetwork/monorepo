@@ -3,6 +3,7 @@ package token
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"strings"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -113,6 +114,29 @@ var mergeCmd = &cobra.Command{
 		merge := &protobufs.MergeCoinRequest{
 			Coins: coinaddrs,
 		}
+
+		// Display merge details and confirmation prompt
+		fmt.Printf("\nMerge Transaction Details:\n")
+		fmt.Printf("Number of coins to merge: %d\n", len(coinaddrs))
+		fmt.Println("Coins to be merged:")
+		for i, coin := range coinaddrs {
+			fmt.Printf("%d. 0x%x\n", i+1, coin.Address)
+		}
+		fmt.Print("\nDo you want to proceed with this merge? (yes/no): ")
+
+		var response string
+		fmt.Scanln(&response)
+
+		if strings.ToLower(response) != "yes" {
+			fmt.Println("Merge transaction cancelled by user.")
+			return
+		}
+
+		// Create payload for merge operation
+		payload := []byte("merge")
+		for _, coinRef := range coinaddrs {
+			payload = append(payload, coinRef.Address...)
+		}
 		if err := merge.SignED448(pubKeyBytes, privKey.Sign); err != nil {
 			panic(err)
 		}
@@ -129,7 +153,7 @@ var mergeCmd = &cobra.Command{
 			panic(err)
 		}
 
-		println("Merge request sent successfully")
+		fmt.Println("Merge transaction sent successfully.")
 	},
 }
 
