@@ -1,6 +1,7 @@
 package master
 
 import (
+	"bytes"
 	gcrypto "crypto"
 	"encoding/hex"
 	"math/big"
@@ -228,6 +229,10 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 	}()
 
 	go func() {
+		if !bytes.Equal(e.pubSub.GetPeerID(), []byte(e.beacon)) {
+			return
+		}
+
 		for e.state < consensus.EngineStateStopping {
 			frame, err := e.masterTimeReel.Head()
 			if err != nil {
