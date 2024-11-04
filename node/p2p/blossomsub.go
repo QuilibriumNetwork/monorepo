@@ -188,6 +188,8 @@ func NewBlossomSub(
 
 	opts := []libp2pconfig.Option{
 		libp2p.ListenAddrStrings(p2pConfig.ListenMultiaddr),
+		libp2p.EnableNATService(),
+		libp2p.NATPortMap(),
 	}
 
 	isBootstrapPeer := false
