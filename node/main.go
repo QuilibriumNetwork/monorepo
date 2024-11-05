@@ -418,7 +418,7 @@ func main() {
 
 	if *core == 0 {
 		for {
-			genesis, err := config.DownloadAndVerifyGenesis(*network)
+			genesis, err := config.DownloadAndVerifyGenesis(uint(nodeConfig.P2P.Network))
 			if err != nil {
 				time.Sleep(10 * time.Minute)
 				continue
