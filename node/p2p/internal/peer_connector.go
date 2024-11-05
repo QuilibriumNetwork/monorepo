@@ -104,6 +104,7 @@ func (pc *peerConnector) connectToPeers(
 ) {
 	var inflight chan struct{} = make(chan struct{}, pc.parallelism)
 	var wg sync.WaitGroup
+	defer wg.Wait()
 	for p := range ch {
 		logger := pc.logger.With(zap.String("peer_id", p.ID.String()))
 		logger.Debug("received peer")
