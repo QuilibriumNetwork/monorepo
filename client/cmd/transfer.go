@@ -14,12 +14,25 @@ var transferCmd = &cobra.Command{
 	Use:   "transfer",
 	Short: "Creates a pending transfer of coin",
 	Long: `Creates a pending transfer of coin:
-transfer <ToAccount> <OfCoin>
-ToAccount – account address, must be specified
-OfCoin – the address of the coin to send in whole`,
+transfer [--to <ToAccount>] [--coin <OfCoin>]
+ToAccount – account address, defaults to user's main account if not specified
+OfCoin – the address of the coin to send in whole, defaults to user's default coin if not specified`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) != 2 {
-			panic("invalid arguments")
+		var toaddr, coinaddr string
+		var err error
+
+		// Prompt for to address if not provided
+		toaddr, _ = cmd.Flags().GetString("to")
+		if toaddr == "" {
+			fmt.Print("Enter recipient address: ")
+			fmt.Scanln(&toaddr)
+		}
+
+		// Prompt for coin address if not provided
+		coinaddr, _ = cmd.Flags().GetString("coin")
+		if coinaddr == "" {
+			fmt.Print("Enter coin address: ")
+			fmt.Scanln(&coinaddr)
 		}
 
 		conn, err := GetGRPCClient()
@@ -34,31 +47,29 @@ OfCoin – the address of the coin to send in whole`,
 			panic(err)
 		}
 
-		var coinaddr *protobufs.CoinRef
+		var coinRef *protobufs.CoinRef
 		payload := []byte("transfer")
-		toaddr := []byte{}
 
-		for i, arg := range args {
-			addrHex, _ := strings.CutPrefix(arg, "0x")
-			addr, err := hex.DecodeString(addrHex)
-			if err != nil {
-				panic(err)
-			}
-			if i == 0 {
-				toaddr = addr
-				continue
-			}
-			coinaddr = &protobufs.CoinRef{
-				Address: addr,
-			}
-			payload = append(payload, addr...)
+		toAddrBytes, err := hex.DecodeString(strings.TrimPrefix(toaddr, "0x"))
+		if err != nil {
+			panic(err)
 		}
-		payload = append(payload, toaddr...)
+
+		coinAddrBytes, err := hex.DecodeString(strings.TrimPrefix(coinaddr, "0x"))
+		if err != nil {
+			panic(err)
+		}
+
+		coinRef = &protobufs.CoinRef{
+			Address: coinAddrBytes,
+		}
+		payload = append(payload, toAddrBytes...)
+		payload = append(payload, coinAddrBytes...)
 
 		// Display transaction details and confirmation prompt
 		fmt.Printf("\nTransaction Details:\n")
-		fmt.Printf("To Address: 0x%x\n", toaddr)
-		fmt.Printf("Coin Address: 0x%x\n", coinaddr.Address)
+		fmt.Printf("To Address: 0x%x\n", toAddrBytes)
+		fmt.Printf("Coin Address: 0x%x\n", coinAddrBytes)
 		fmt.Print("\nDo you want to proceed with this transaction? (yes/no): ")
 
 		var response string
@@ -84,11 +95,11 @@ OfCoin – the address of the coin to send in whole`,
 			&protobufs.TokenRequest{
 				Request: &protobufs.TokenRequest_Transfer{
 					Transfer: &protobufs.TransferCoinRequest{
-						OfCoin: coinaddr,
+						OfCoin: coinRef,
 						ToAccount: &protobufs.AccountRef{
 							Account: &protobufs.AccountRef_ImplicitAccount{
 								ImplicitAccount: &protobufs.ImplicitAccount{
-									Address: toaddr,
+									Address: toAddrBytes,
 								},
 							},
 						},
@@ -111,5 +122,7 @@ OfCoin – the address of the coin to send in whole`,
 }
 
 func init() {
+	transferCmd.Flags().StringP("to", "", "", "recipient account address")
+	transferCmd.Flags().StringP("coin", "", "", "coin address to transfer")
 	tokenCmd.AddCommand(transferCmd)
 }
