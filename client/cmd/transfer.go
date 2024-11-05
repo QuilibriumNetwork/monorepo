@@ -14,9 +14,9 @@ var transferCmd = &cobra.Command{
 	Use:   "transfer",
 	Short: "Creates a pending transfer of coin",
 	Long: `Creates a pending transfer of coin:
-transfer [--to <ToAccount>] [--coin <OfCoin>]
-ToAccount – account address, defaults to user's main account if not specified
-OfCoin – the address of the coin to send in whole, defaults to user's default coin if not specified`,
+	transfer <ToAccount> <OfCoin>
+	ToAccount – account address, defaults to user's main account if not specified
+	OfCoin – the address of the coin to send in whole, defaults to user's default coin if not specified`,
 	Run: func(cmd *cobra.Command, args []string) {
 		var toaddr, coinaddr string
 		var err error
