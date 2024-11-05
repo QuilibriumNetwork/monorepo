@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/backoff"
@@ -509,6 +510,12 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	go e.runPreMidnightProofWorker()
 
 	go func() {
+		h, err := poseidon.HashBytes(e.pubSub.GetPeerID())
+		if err != nil {
+			panic(err)
+		}
+		peerProvingKeyAddress := h.FillBytes(make([]byte, 32))
+
 		frame, err := e.dataTimeReel.Head()
 		if err != nil {
 			panic(err)
@@ -551,8 +558,8 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			frame = nextFrame
 
 			for i, trie := range e.GetFrameProverTries()[1:] {
-				if trie.Contains(e.provingKeyAddress) {
-					e.logger.Info("creating data shard ring proof", zap.Int("ring", i-1))
+				if trie.Contains(peerProvingKeyAddress) {
+					e.logger.Info("creating data shard ring proof", zap.Int("ring", i))
 					e.PerformTimeProof(frame, frame.Difficulty, clients)
 				}
 			}
