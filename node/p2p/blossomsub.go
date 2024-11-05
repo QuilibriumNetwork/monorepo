@@ -649,7 +649,7 @@ func (b *BlossomSub) GetRandomPeer(bitmask []byte) ([]byte, error) {
 // up to 3 times to ensure they are still reachable. If the peer is not reachable after
 // 3 attempts, the connections to the peer are closed.
 func monitorPeers(ctx context.Context, logger *zap.Logger, h host.Host) {
-	const timeout, period, attempts = time.Minute, 20 * time.Second, 3
+	const timeout, period, attempts = 20 * time.Second, time.Minute, 3
 	// Do not allow the pings to dial new connections. Adding new peers is a separate
 	// process and should not be done during the ping process.
 	ctx = network.WithNoDial(ctx, "monitor peers")
