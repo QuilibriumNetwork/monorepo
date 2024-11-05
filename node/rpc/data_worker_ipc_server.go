@@ -11,7 +11,6 @@ import (
 
 	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
-	"source.quilibrium.com/quilibrium/monorepo/node/consensus/data"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
@@ -22,7 +21,9 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -152,10 +153,7 @@ func (r *DataWorkerIPCServer) CalculateChallengeProof(
 	}
 
 	if !found {
-		return nil, errors.Wrap(
-			data.ErrNoApplicableChallenge,
-			"calculate challenge proof",
-		)
+		return nil, status.Error(codes.NotFound, "no applicable challenge")
 	}
 	proof, err := r.prover.CalculateChallengeProof(
 		challenge,

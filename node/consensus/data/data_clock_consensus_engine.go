@@ -20,7 +20,9 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -37,8 +39,6 @@ import (
 
 const PEER_INFO_TTL = 60 * 60 * 1000
 const UNCOOPERATIVE_PEER_INFO_TTL = 60 * 1000
-
-var ErrNoApplicableChallenge = errors.New("no applicable challenge")
 
 type SyncStatusType int
 
@@ -616,7 +616,7 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 						},
 					)
 				if err != nil {
-					if errors.Is(err, ErrNoApplicableChallenge) {
+					if status.Code(err) == codes.NotFound {
 						break
 					}
 					if j == 0 {
