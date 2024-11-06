@@ -2,11 +2,9 @@ package data
 
 import (
 	"bytes"
-	"encoding/binary"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
-	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -283,118 +281,69 @@ func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 		return errors.Wrap(err, "handle data peer list announce")
 	}
 
-	for _, p := range announce.PeerList {
-		if bytes.Equal(p.PeerId, e.pubSub.GetPeerID()) {
-			continue
-		}
-
-		if !bytes.Equal(p.PeerId, peerID) {
-			continue
-		}
-
-		if p.PublicKey == nil || p.Signature == nil || p.Version == nil {
-			continue
-		}
-
-		head, err := e.dataTimeReel.Head()
-		if err == nil {
-			if p.MaxFrame < head.FrameNumber {
-				continue
-			}
-		}
-
-		if p.PublicKey != nil && p.Signature != nil && p.Version != nil {
-			key, err := pcrypto.UnmarshalEd448PublicKey(p.PublicKey)
-			if err != nil {
-				e.logger.Warn(
-					"peer announcement contained invalid pubkey",
-					zap.Binary("public_key", p.PublicKey),
-				)
-				continue
-			}
-
-			if !(peer.ID(p.PeerId)).MatchesPublicKey(key) {
-				e.logger.Warn(
-					"peer announcement peer id does not match pubkey",
-					zap.Binary("peer_id", p.PeerId),
-					zap.Binary("public_key", p.PublicKey),
-				)
-				continue
-			}
-
-			msg := binary.BigEndian.AppendUint64([]byte{}, p.MaxFrame)
-			msg = append(msg, p.Version...)
-			msg = binary.BigEndian.AppendUint64(msg, uint64(p.Timestamp))
-			b, err := key.Verify(msg, p.Signature)
-			if err != nil || !b {
-				e.logger.Warn(
-					"peer provided invalid signature",
-					zap.Binary("msg", msg),
-					zap.Binary("public_key", p.PublicKey),
-					zap.Binary("signature", p.Signature),
-				)
-				continue
-			}
-
-			if bytes.Compare(p.Version, config.GetMinimumVersion()) < 0 &&
-				p.Timestamp > config.GetMinimumVersionCutoff().UnixMilli() {
-				e.logger.Debug(
-					"peer provided outdated version, penalizing app score",
-					zap.Binary("peer_id", p.PeerId),
-				)
-				e.pubSub.SetPeerScore(p.PeerId, -1000000)
-				continue
-			}
-		}
-
-		e.peerMapMx.RLock()
-		if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {
-			e.peerMapMx.RUnlock()
-			continue
-		}
-		e.peerMapMx.RUnlock()
-
-		multiaddr := e.pubSub.GetMultiaddrOfPeer(p.PeerId)
-
-		e.pubSub.SetPeerScore(p.PeerId, 10)
-
-		e.peerMapMx.RLock()
-		existing, ok := e.peerMap[string(p.PeerId)]
-		e.peerMapMx.RUnlock()
-
-		if ok {
-			if existing.signature != nil && p.Signature == nil {
-				continue
-			}
-
-			if existing.publicKey != nil && p.PublicKey == nil {
-				continue
-			}
-
-			if existing.version != nil && p.Version == nil {
-				continue
-			}
-
-			if existing.timestamp > p.Timestamp {
-				continue
-			}
-		}
-
-		e.peerMapMx.Lock()
-		e.peerMap[string(p.PeerId)] = &peerInfo{
-			peerId:        p.PeerId,
-			multiaddr:     multiaddr,
-			maxFrame:      p.MaxFrame,
-			direct:        bytes.Equal(p.PeerId, peerID),
-			lastSeen:      time.Now().Unix(),
-			timestamp:     p.Timestamp,
-			version:       p.Version,
-			signature:     p.Signature,
-			publicKey:     p.PublicKey,
-			totalDistance: p.TotalDistance,
-		}
-		e.peerMapMx.Unlock()
+	if len(announce.PeerList) != 1 {
+		return nil
 	}
+
+	p := announce.PeerList[0]
+
+	if bytes.Equal(p.PeerId, e.pubSub.GetPeerID()) {
+		return nil
+	}
+
+	if !bytes.Equal(p.PeerId, peerID) {
+		return nil
+	}
+
+	head, err := e.dataTimeReel.Head()
+	if err != nil {
+		return errors.Wrap(err, "handle data peer list announce")
+	}
+	if p.MaxFrame < head.FrameNumber {
+		return nil
+	}
+
+	if p.Version != nil &&
+		bytes.Compare(p.Version, config.GetMinimumVersion()) < 0 &&
+		p.Timestamp > config.GetMinimumVersionCutoff().UnixMilli() {
+		e.logger.Debug(
+			"peer provided outdated version, penalizing app score",
+			zap.String("peer_id", peer.ID(p.PeerId).String()),
+		)
+		e.pubSub.SetPeerScore(p.PeerId, -1000000)
+		return nil
+	}
+
+	e.peerMapMx.RLock()
+	if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {
+		e.peerMapMx.RUnlock()
+		return nil
+	}
+	e.peerMapMx.RUnlock()
+
+	e.pubSub.SetPeerScore(p.PeerId, 10)
+
+	e.peerMapMx.RLock()
+	existing, ok := e.peerMap[string(p.PeerId)]
+	e.peerMapMx.RUnlock()
+
+	if ok && existing.timestamp > p.Timestamp {
+		return nil
+	}
+
+	multiaddr := e.pubSub.GetMultiaddrOfPeer(p.PeerId)
+	e.peerMapMx.Lock()
+	e.peerMap[string(p.PeerId)] = &peerInfo{
+		peerId:        p.PeerId,
+		multiaddr:     multiaddr,
+		maxFrame:      p.MaxFrame,
+		lastSeen:      time.Now().Unix(),
+		timestamp:     p.Timestamp,
+		version:       p.Version,
+		totalDistance: p.TotalDistance,
+	}
+	e.peerMapMx.Unlock()
+
 	return nil
 }
 

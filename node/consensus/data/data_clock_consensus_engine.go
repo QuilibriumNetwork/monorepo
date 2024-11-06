@@ -56,9 +56,6 @@ type peerInfo struct {
 	timestamp     int64
 	lastSeen      int64
 	version       []byte
-	signature     []byte
-	publicKey     []byte
-	direct        bool
 	totalDistance []byte
 }
 
@@ -440,8 +437,6 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				multiaddr: "",
 				maxFrame:  frame.FrameNumber,
 				version:   config.GetVersion(),
-				signature: sig,
-				publicKey: e.pubSub.GetPublicKey(),
 				timestamp: timestamp,
 				totalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
 					make([]byte, 256),
@@ -875,8 +870,6 @@ func (
 			MaxFrame:      v.maxFrame,
 			Timestamp:     v.timestamp,
 			Version:       v.version,
-			Signature:     v.signature,
-			PublicKey:     v.publicKey,
 			TotalDistance: v.totalDistance,
 		})
 	}
@@ -889,8 +882,6 @@ func (
 				MaxFrame:      v.maxFrame,
 				Timestamp:     v.timestamp,
 				Version:       v.version,
-				Signature:     v.signature,
-				PublicKey:     v.publicKey,
 				TotalDistance: v.totalDistance,
 			},
 		)

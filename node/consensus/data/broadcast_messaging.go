@@ -68,8 +68,6 @@ func (e *DataClockConsensusEngine) publishProof(
 		multiaddr: "",
 		maxFrame:  frame.FrameNumber,
 		version:   config.GetVersion(),
-		signature: sig,
-		publicKey: e.pubSub.GetPublicKey(),
 		timestamp: timestamp,
 		totalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
 			make([]byte, 256),
