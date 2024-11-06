@@ -423,13 +423,6 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			)
 
 			timestamp := time.Now().UnixMilli()
-			msg := binary.BigEndian.AppendUint64([]byte{}, frame.FrameNumber)
-			msg = append(msg, config.GetVersion()...)
-			msg = binary.BigEndian.AppendUint64(msg, uint64(timestamp))
-			sig, err := e.pubSub.SignMessage(msg)
-			if err != nil {
-				panic(err)
-			}
 
 			e.peerMapMx.Lock()
 			e.peerMap[string(e.pubSub.GetPeerID())] = &peerInfo{
@@ -448,8 +441,6 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				Multiaddr: "",
 				MaxFrame:  frame.FrameNumber,
 				Version:   config.GetVersion(),
-				Signature: sig,
-				PublicKey: e.pubSub.GetPublicKey(),
 				Timestamp: timestamp,
 				TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
 					make([]byte, 256),

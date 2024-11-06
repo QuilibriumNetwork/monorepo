@@ -299,7 +299,7 @@ func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 	if err != nil {
 		return errors.Wrap(err, "handle data peer list announce")
 	}
-	if p.MaxFrame < head.FrameNumber {
+	if p.MaxFrame <= head.FrameNumber {
 		return nil
 	}
 
