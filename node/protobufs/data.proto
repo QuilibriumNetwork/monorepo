@@ -10,7 +10,9 @@ import "keys.proto";
 import "node.proto";
 
 message DataPeerListAnnounce {
-  repeated DataPeer peer_list = 1;
+  reserved 1;
+  reserved "peer_list";
+  DataPeer peer = 2;
 }
 
 message DataPeer {
@@ -19,8 +21,10 @@ message DataPeer {
   uint64 max_frame = 3;
   int64 timestamp = 4;
   bytes version = 5;
-  bytes signature = 6;
-  bytes public_key = 7;
+  reserved 6;
+  reserved "signature";
+  reserved 7;
+  reserved "public_key";
   bytes total_distance = 8;
 }
 

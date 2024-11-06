@@ -276,24 +276,16 @@ func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 	address []byte,
 	any *anypb.Any,
 ) error {
+	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
+		return nil
+	}
+
 	announce := &protobufs.DataPeerListAnnounce{}
 	if err := any.UnmarshalTo(announce); err != nil {
 		return errors.Wrap(err, "handle data peer list announce")
 	}
 
-	if len(announce.PeerList) != 1 {
-		return nil
-	}
-
-	p := announce.PeerList[0]
-
-	if bytes.Equal(p.PeerId, e.pubSub.GetPeerID()) {
-		return nil
-	}
-
-	if !bytes.Equal(p.PeerId, peerID) {
-		return nil
-	}
+	p := announce.Peer
 
 	head, err := e.dataTimeReel.Head()
 	if err != nil {
@@ -308,33 +300,33 @@ func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 		p.Timestamp > config.GetMinimumVersionCutoff().UnixMilli() {
 		e.logger.Debug(
 			"peer provided outdated version, penalizing app score",
-			zap.String("peer_id", peer.ID(p.PeerId).String()),
+			zap.String("peer_id", peer.ID(peerID).String()),
 		)
-		e.pubSub.SetPeerScore(p.PeerId, -1000000)
+		e.pubSub.SetPeerScore(peerID, -1000000)
 		return nil
 	}
 
 	e.peerMapMx.RLock()
-	if _, ok := e.uncooperativePeersMap[string(p.PeerId)]; ok {
+	if _, ok := e.uncooperativePeersMap[string(peerID)]; ok {
 		e.peerMapMx.RUnlock()
 		return nil
 	}
 	e.peerMapMx.RUnlock()
 
-	e.pubSub.SetPeerScore(p.PeerId, 10)
+	e.pubSub.SetPeerScore(peerID, 10)
 
 	e.peerMapMx.RLock()
-	existing, ok := e.peerMap[string(p.PeerId)]
+	existing, ok := e.peerMap[string(peerID)]
 	e.peerMapMx.RUnlock()
 
 	if ok && existing.timestamp > p.Timestamp {
 		return nil
 	}
 
-	multiaddr := e.pubSub.GetMultiaddrOfPeer(p.PeerId)
+	multiaddr := e.pubSub.GetMultiaddrOfPeer(peerID)
 	e.peerMapMx.Lock()
-	e.peerMap[string(p.PeerId)] = &peerInfo{
-		peerId:        p.PeerId,
+	e.peerMap[string(peerID)] = &peerInfo{
+		peerId:        peerID,
 		multiaddr:     multiaddr,
 		maxFrame:      p.MaxFrame,
 		lastSeen:      time.Now().Unix(),

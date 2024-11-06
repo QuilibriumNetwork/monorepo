@@ -66,18 +66,17 @@ func (e *DataClockConsensusEngine) publishProof(
 		),
 	}
 	list := &protobufs.DataPeerListAnnounce{
-		PeerList: []*protobufs.DataPeer{},
+		Peer: &protobufs.DataPeer{
+			PeerId:    nil,
+			Multiaddr: "",
+			MaxFrame:  frame.FrameNumber,
+			Version:   config.GetVersion(),
+			Timestamp: timestamp,
+			TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
+				make([]byte, 256),
+			),
+		},
 	}
-	list.PeerList = append(list.PeerList, &protobufs.DataPeer{
-		PeerId:    e.pubSub.GetPeerID(),
-		Multiaddr: "",
-		MaxFrame:  frame.FrameNumber,
-		Version:   config.GetVersion(),
-		Timestamp: timestamp,
-		TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
-			make([]byte, 256),
-		),
-	})
 	e.peerMapMx.Unlock()
 	if err := e.publishMessage(e.infoFilter, list); err != nil {
 		e.logger.Debug("error publishing message", zap.Error(err))

@@ -412,8 +412,18 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 
 			frame = nextFrame
 
+			timestamp := time.Now().UnixMilli()
 			list := &protobufs.DataPeerListAnnounce{
-				PeerList: []*protobufs.DataPeer{},
+				Peer: &protobufs.DataPeer{
+					PeerId:    nil,
+					Multiaddr: "",
+					MaxFrame:  frame.FrameNumber,
+					Version:   config.GetVersion(),
+					Timestamp: timestamp,
+					TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
+						make([]byte, 256),
+					),
+				},
 			}
 
 			e.latestFrameReceived = frame.FrameNumber
@@ -421,8 +431,6 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				"preparing peer announce",
 				zap.Uint64("frame_number", frame.FrameNumber),
 			)
-
-			timestamp := time.Now().UnixMilli()
 
 			e.peerMapMx.Lock()
 			e.peerMap[string(e.pubSub.GetPeerID())] = &peerInfo{
@@ -436,16 +444,6 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				),
 			}
 			deletes := []*peerInfo{}
-			list.PeerList = append(list.PeerList, &protobufs.DataPeer{
-				PeerId:    e.pubSub.GetPeerID(),
-				Multiaddr: "",
-				MaxFrame:  frame.FrameNumber,
-				Version:   config.GetVersion(),
-				Timestamp: timestamp,
-				TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
-					make([]byte, 256),
-				),
-			})
 			for _, v := range e.peerMap {
 				if v == nil {
 					continue
