@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/big"
+	"sort"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -17,6 +18,29 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
+
+type sortProofsByFrame struct {
+	frameNumbers []uint64
+	proofs       []*protobufs.PreCoinProof
+}
+
+var _ sort.Interface = (*sortProofsByFrame)(nil)
+
+// Len implements sort.Interface.
+func (s sortProofsByFrame) Len() int {
+	return len(s.proofs)
+}
+
+// Less implements sort.Interface.
+func (s sortProofsByFrame) Less(i, j int) bool {
+	return s.frameNumbers[i] < s.frameNumbers[j]
+}
+
+// Swap implements sort.Interface.
+func (s sortProofsByFrame) Swap(i, j int) {
+	s.frameNumbers[i], s.frameNumbers[j] = s.frameNumbers[j], s.frameNumbers[i]
+	s.proofs[i], s.proofs[j] = s.proofs[j], s.proofs[i]
+}
 
 func (a *TokenApplication) handleMint(
 	currentFrameNumber uint64,
@@ -149,12 +173,17 @@ func (a *TokenApplication) handleMint(
 			return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 		}
 
-		_, prfs, err := a.CoinStore.GetPreCoinProofsForOwner(
+		prfsFrames, prfs, err := a.CoinStore.GetPreCoinProofsForOwner(
 			altAddr.FillBytes(make([]byte, 32)),
 		)
 		if err != nil {
 			return nil, errors.Wrap(ErrInvalidStateTransition, "handle mint")
 		}
+
+		sort.Sort(sortProofsByFrame{
+			frameNumbers: prfsFrames,
+			proofs:       prfs,
+		})
 
 		var delete *protobufs.PreCoinProof
 		var commitment []byte
