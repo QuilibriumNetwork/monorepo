@@ -420,6 +420,7 @@ func NewBlossomSub(
 
 	params := mergeDefaults(p2pConfig)
 	rt := blossomsub.NewBlossomSubRouter(h, params, bs.network)
+	blossomOpts = append(blossomOpts, rt.WithDefaultTagTracer())
 	pubsub, err := blossomsub.NewBlossomSubWithRouter(ctx, h, rt, blossomOpts...)
 	if err != nil {
 		panic(err)
