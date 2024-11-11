@@ -18,8 +18,6 @@ replace github.com/libp2p/go-libp2p => ../go-libp2p
 
 replace github.com/libp2p/go-libp2p-kad-dht => ../go-libp2p-kad-dht
 
-replace github.com/libp2p/go-libp2p-gostream => ../go-libp2p-gostream
-
 replace source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub => ../go-libp2p-blossomsub
 
 replace source.quilibrium.com/quilibrium/monorepo/node => ../node
@@ -94,7 +92,6 @@ require (
 	github.com/libp2p/go-cidranger v1.1.0 // indirect
 	github.com/libp2p/go-flow-metrics v0.1.0 // indirect
 	github.com/libp2p/go-libp2p-asn-util v0.4.1 // indirect
-	github.com/libp2p/go-libp2p-gostream v0.6.0 // indirect
 	github.com/libp2p/go-libp2p-kad-dht v0.23.0 // indirect
 	github.com/libp2p/go-libp2p-kbucket v0.6.3 // indirect
 	github.com/libp2p/go-libp2p-record v0.2.0 // indirect
