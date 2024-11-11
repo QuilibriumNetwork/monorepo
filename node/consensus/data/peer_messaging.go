@@ -31,20 +31,20 @@ func (e *DataClockConsensusEngine) GetDataFrame(
 	ctx context.Context,
 	request *protobufs.GetDataFrameRequest,
 ) (*protobufs.DataFrameResponse, error) {
+	peerID, ok := grpc_internal.PeerIDFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "remote peer ID not found")
+	}
 	if e.config.P2P.GrpcServerRateLimit != -1 {
-		peerID, ok := grpc_internal.PeerIDFromContext(ctx)
-		if !ok {
-			return nil, status.Error(codes.Internal, "remote peer ID not found")
-		}
-
 		if err := e.grpcRateLimiter.Allow(peerID); err != nil {
-			return nil, errors.Wrap(err, "get data frame")
+			return nil, err
 		}
 	}
 
 	e.logger.Debug(
 		"received frame request",
 		zap.Uint64("frame_number", request.FrameNumber),
+		zap.String("peer_id", peerID.String()),
 	)
 	var frame *protobufs.ClockFrame
 	var err error
@@ -67,6 +67,8 @@ func (e *DataClockConsensusEngine) GetDataFrame(
 	if err != nil {
 		e.logger.Debug(
 			"received error while fetching time reel head",
+			zap.String("peer_id", peerID.String()),
+			zap.Uint64("frame_number", request.FrameNumber),
 			zap.Error(err),
 		)
 		return nil, errors.Wrap(err, "get data frame")
