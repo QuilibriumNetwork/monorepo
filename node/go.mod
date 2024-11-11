@@ -19,8 +19,6 @@ replace github.com/libp2p/go-libp2p => ../go-libp2p
 
 replace github.com/libp2p/go-libp2p-kad-dht => ../go-libp2p-kad-dht
 
-replace github.com/libp2p/go-libp2p-gostream => ../go-libp2p-gostream
-
 replace source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub => ../go-libp2p-blossomsub
 
 replace github.com/cockroachdb/pebble => ../pebble
@@ -29,7 +27,6 @@ require (
 	github.com/cockroachdb/pebble v0.0.0-20231210175920-b4d301aeb46a
 	github.com/deiu/rdf2go v0.0.0-20240619132609-81222e324bb9
 	github.com/libp2p/go-libp2p v0.35.4
-	github.com/libp2p/go-libp2p-gostream v0.6.0
 	github.com/libp2p/go-libp2p-kad-dht v0.23.0
 	github.com/shopspring/decimal v1.4.0
 	github.com/txaty/go-merkletree v0.2.2

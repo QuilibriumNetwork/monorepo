@@ -79,7 +79,6 @@ func (pubsub) SetPeerScore(peerId []byte, score int64)      {}
 func (pubsub) AddPeerScore(peerId []byte, scoreDelta int64) {}
 func (pubsub) Reconnect(peerId []byte) error                { return nil }
 func (pubsub) DiscoverPeers() error                         { return nil }
-func (pubsub) GetNetwork() uint                             { return 0 }
 
 type outputs struct {
 	difficulty  uint32
