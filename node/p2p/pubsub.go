@@ -3,10 +3,19 @@ package p2p
 import (
 	"context"
 
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+)
+
+type ValidationResult int
+
+const (
+	ValidationResultAccept ValidationResult = iota
+	ValidationResultReject
+	ValidationResultIgnore
 )
 
 type PubSub interface {
@@ -14,6 +23,11 @@ type PubSub interface {
 	Publish(address []byte, data []byte) error
 	Subscribe(bitmask []byte, handler func(message *pb.Message) error) error
 	Unsubscribe(bitmask []byte, raw bool)
+	RegisterValidator(
+		bitmask []byte,
+		validator func(peerID peer.ID, message *pb.Message) ValidationResult,
+	) error
+	UnregisterValidator(bitmask []byte) error
 	GetPeerID() []byte
 	GetBitmaskPeers() map[string][]string
 	GetPeerstoreCount() int

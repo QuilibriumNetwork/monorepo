@@ -44,10 +44,14 @@ func (pubsub) Publish(address []byte, data []byte) error                        
 func (pubsub) PublishToBitmask(bitmask []byte, data []byte) error                      { return nil }
 func (pubsub) Subscribe(bitmask []byte, handler func(message *pb.Message) error) error { return nil }
 func (pubsub) Unsubscribe(bitmask []byte, raw bool)                                    {}
-func (pubsub) GetPeerID() []byte                                                       { return nil }
-func (pubsub) GetPeerstoreCount() int                                                  { return 0 }
-func (pubsub) GetNetworkPeersCount() int                                               { return 0 }
-func (pubsub) GetRandomPeer(bitmask []byte) ([]byte, error)                            { return nil, nil }
+func (pubsub) RegisterValidator(bitmask []byte, validator func(peerID peer.ID, message *pb.Message) p2p.ValidationResult) error {
+	return nil
+}
+func (pubsub) UnregisterValidator(bitmask []byte) error     { return nil }
+func (pubsub) GetPeerID() []byte                            { return nil }
+func (pubsub) GetPeerstoreCount() int                       { return 0 }
+func (pubsub) GetNetworkPeersCount() int                    { return 0 }
+func (pubsub) GetRandomPeer(bitmask []byte) ([]byte, error) { return nil, nil }
 func (pubsub) GetMultiaddrOfPeerStream(ctx context.Context, peerId []byte) <-chan multiaddr.Multiaddr {
 	return nil
 }
@@ -74,6 +78,7 @@ func (pubsub) SetPeerScore(peerId []byte, score int64)      {}
 func (pubsub) AddPeerScore(peerId []byte, scoreDelta int64) {}
 func (pubsub) Reconnect(peerId []byte) error                { return nil }
 func (pubsub) DiscoverPeers() error                         { return nil }
+func (pubsub) GetNetwork() uint                             { return 0 }
 
 type outputs struct {
 	difficulty  uint32

@@ -623,6 +623,31 @@ func (b *BlossomSub) Unsubscribe(bitmask []byte, raw bool) {
 	bm.Close()
 }
 
+func (b *BlossomSub) RegisterValidator(
+	bitmask []byte, validator func(peerID peer.ID, message *pb.Message) ValidationResult,
+) error {
+	validatorEx := func(
+		ctx context.Context, peerID peer.ID, message *blossomsub.Message,
+	) blossomsub.ValidationResult {
+		switch v := validator(peerID, message.Message); v {
+		case ValidationResultAccept:
+			return blossomsub.ValidationAccept
+		case ValidationResultReject:
+			return blossomsub.ValidationReject
+		case ValidationResultIgnore:
+			return blossomsub.ValidationIgnore
+		default:
+			panic("unreachable")
+		}
+	}
+	var _ blossomsub.ValidatorEx = validatorEx
+	return b.ps.RegisterBitmaskValidator(bitmask, validatorEx)
+}
+
+func (b *BlossomSub) UnregisterValidator(bitmask []byte) error {
+	return b.ps.UnregisterBitmaskValidator(bitmask)
+}
+
 func (b *BlossomSub) GetPeerID() []byte {
 	return []byte(b.peerID)
 }

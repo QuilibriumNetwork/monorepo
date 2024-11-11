@@ -302,6 +302,9 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	go e.runInfoMessageHandler()
 
 	e.logger.Info("subscribing to pubsub messages")
+	e.pubSub.RegisterValidator(e.frameFilter, e.validateFrameMessage)
+	e.pubSub.RegisterValidator(e.txFilter, e.validateTxMessage)
+	e.pubSub.RegisterValidator(e.infoFilter, e.validateInfoMessage)
 	e.pubSub.Subscribe(e.frameFilter, e.handleFrameMessage)
 	e.pubSub.Subscribe(e.txFilter, e.handleTxMessage)
 	e.pubSub.Subscribe(e.infoFilter, e.handleInfoMessage)
@@ -629,6 +632,13 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 			wg.Done()
 		}(name)
 	}
+
+	e.pubSub.Unsubscribe(e.frameFilter, false)
+	e.pubSub.Unsubscribe(e.txFilter, false)
+	e.pubSub.Unsubscribe(e.infoFilter, false)
+	e.pubSub.UnregisterValidator(e.frameFilter)
+	e.pubSub.UnregisterValidator(e.txFilter)
+	e.pubSub.UnregisterValidator(e.infoFilter)
 
 	e.logger.Info("waiting for execution engines to stop")
 	wg.Wait()
