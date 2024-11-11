@@ -100,6 +100,7 @@ type DataClockConsensusEngine struct {
 	filter                         []byte
 	txFilter                       []byte
 	infoFilter                     []byte
+	frameFilter                    []byte
 	input                          []byte
 	parentSelector                 []byte
 	syncingStatus                  SyncStatusType
@@ -268,6 +269,7 @@ func NewDataClockConsensusEngine(
 	e.filter = filter
 	e.txFilter = append([]byte{0x00}, e.filter...)
 	e.infoFilter = append([]byte{0x00, 0x00}, e.filter...)
+	e.frameFilter = append([]byte{0x00, 0x00, 0x00}, e.filter...)
 	e.input = seed
 	e.provingKey = signer
 	e.provingKeyType = keyType
@@ -305,7 +307,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	go e.runInfoMessageHandler()
 
 	e.logger.Info("subscribing to pubsub messages")
-	e.pubSub.Subscribe(e.filter, e.handleFrameMessage)
+	e.pubSub.Subscribe(e.frameFilter, e.handleFrameMessage)
 	e.pubSub.Subscribe(e.txFilter, e.handleTxMessage)
 	e.pubSub.Subscribe(e.infoFilter, e.handleInfoMessage)
 	go func() {

@@ -82,7 +82,7 @@ func (e *DataClockConsensusEngine) publishProof(
 		e.logger.Debug("error publishing message", zap.Error(err))
 	}
 
-	e.publishMessage(e.filter, frame)
+	e.publishMessage(e.frameFilter, frame)
 
 	return nil
 }
