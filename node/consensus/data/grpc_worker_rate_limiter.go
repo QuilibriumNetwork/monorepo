@@ -4,13 +4,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 type RateLimiter struct {
 	mu            sync.RWMutex
-	clients       map[string]*bucket
+	clients       map[peer.ID]*bucket
 	maxTokens     int
 	refillTokens  int
 	refillTime    time.Duration
@@ -31,7 +32,7 @@ func NewRateLimiter(
 	refillDuration time.Duration,
 ) *RateLimiter {
 	return &RateLimiter{
-		clients:       make(map[string]*bucket),
+		clients:       make(map[peer.ID]*bucket),
 		maxTokens:     maxTokens,
 		refillTokens:  refillTokens,
 		refillTime:    refillDuration,
@@ -41,7 +42,7 @@ func NewRateLimiter(
 	}
 }
 
-func (rl *RateLimiter) Allow(peerId string) error {
+func (rl *RateLimiter) Allow(peerId peer.ID) error {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 

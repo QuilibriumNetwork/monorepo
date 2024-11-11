@@ -15,8 +15,11 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+	grpc_internal "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -28,11 +31,12 @@ func (e *DataClockConsensusEngine) GetDataFrame(
 	ctx context.Context,
 	request *protobufs.GetDataFrameRequest,
 ) (*protobufs.DataFrameResponse, error) {
-	if request.PeerId == "" || len(request.PeerId) > 64 {
-		return nil, errors.Wrap(errors.New("invalid request"), "get data frame")
+	peerID, ok := grpc_internal.PeerIDFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "remote peer ID not found")
 	}
 
-	if err := e.grpcRateLimiter.Allow(request.PeerId); err != nil {
+	if err := e.grpcRateLimiter.Allow(peerID); err != nil {
 		return nil, errors.Wrap(err, "get data frame")
 	}
 
