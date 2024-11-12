@@ -26,6 +26,7 @@ import (
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -509,6 +510,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 			"frame_number",
 			frame.FrameNumber,
 		),
+		zap.Duration("frame_age", frametime.Since(frame)),
 	)
 	app, err := application.MaterializeApplicationFromFrame(
 		e.provingKey,

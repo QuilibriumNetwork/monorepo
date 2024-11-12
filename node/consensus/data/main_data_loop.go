@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/cas"
+	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
@@ -97,6 +98,7 @@ func (e *DataClockConsensusEngine) processFrame(
 	e.logger.Info(
 		"current frame head",
 		zap.Uint64("frame_number", dataFrame.FrameNumber),
+		zap.Duration("frame_age", frametime.Since(dataFrame)),
 	)
 	var err error
 	if !e.GetFrameProverTries()[0].Contains(e.provingKeyBytes) {
@@ -248,6 +250,8 @@ func (e *DataClockConsensusEngine) processFrame(
 					"submitting data proof",
 					zap.Int("ring", ring),
 					zap.Int("active_workers", len(outputs)),
+					zap.Uint64("frame_number", latestFrame.FrameNumber),
+					zap.Duration("frame_age", frametime.Since(latestFrame)),
 				)
 
 				e.publishMessage(e.txFilter, &protobufs.TokenRequest{

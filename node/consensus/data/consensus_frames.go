@@ -9,7 +9,9 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/data/internal"
+	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
 
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -45,6 +47,7 @@ func (e *DataClockConsensusEngine) collect(
 	e.logger.Info(
 		"returning leader frame",
 		zap.Uint64("frame_number", latest.FrameNumber),
+		zap.Duration("frame_age", frametime.Since(latest)),
 	)
 
 	return latest, nil
@@ -271,7 +274,12 @@ func (e *DataClockConsensusEngine) sync(
 	e.syncingStatus = SyncStatusSynchronizing
 	defer func() { e.syncingStatus = SyncStatusNotSyncing }()
 	latest := currentLatest
-	e.logger.Info("polling peer for new frames", zap.Binary("peer_id", peerId))
+	e.logger.Info(
+		"polling peer for new frames",
+		zap.String("peer_id", peer.ID(peerId).String()),
+		zap.Uint64("current_frame", latest.FrameNumber),
+		zap.Uint64("max_frame", maxFrame),
+	)
 	cc, err := e.pubSub.GetDirectChannel(peerId, "sync")
 	if err != nil {
 		e.logger.Debug(
@@ -344,6 +352,7 @@ func (e *DataClockConsensusEngine) sync(
 		e.logger.Info(
 			"received new leading frame",
 			zap.Uint64("frame_number", response.ClockFrame.FrameNumber),
+			zap.Duration("frame_age", frametime.Since(response.ClockFrame)),
 		)
 		if !e.IsInProverTrie(
 			response.ClockFrame.GetPublicKeySignatureEd448().PublicKey.KeyValue,

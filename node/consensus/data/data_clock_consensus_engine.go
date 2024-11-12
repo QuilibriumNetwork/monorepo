@@ -27,6 +27,7 @@ import (
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/cas"
+	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -418,6 +419,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			e.logger.Info(
 				"preparing peer announce",
 				zap.Uint64("frame_number", frame.FrameNumber),
+				zap.Duration("frame_age", frametime.Since(frame)),
 			)
 
 			e.peerMapMx.Lock()
@@ -461,6 +463,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			e.logger.Info(
 				"broadcasting peer info",
 				zap.Uint64("frame_number", frame.FrameNumber),
+				zap.Duration("frame_age", frametime.Since(frame)),
 			)
 
 			if err := e.publishMessage(e.infoFilter, list); err != nil {
@@ -542,6 +545,8 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 		"creating data shard ring proof",
 		zap.Int("ring", ring),
 		zap.Int("active_workers", len(actives)),
+		zap.Uint64("frame_number", frame.FrameNumber),
+		zap.Duration("frame_age", frametime.Since(frame)),
 	)
 
 	wg := sync.WaitGroup{}
