@@ -8,6 +8,7 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/node/internal/cas"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
@@ -89,9 +90,7 @@ func (e *DataClockConsensusEngine) processFrame(
 		latestFrame = dataFrame
 	}
 
-	if e.latestFrameReceived < latestFrame.FrameNumber {
-		e.latestFrameReceived = latestFrame.FrameNumber
-	}
+	cas.IfLessThanUint64(&e.latestFrameReceived, latestFrame.FrameNumber)
 	e.frameProverTriesMx.Lock()
 	e.frameProverTries = e.dataTimeReel.GetFrameProverTries()
 	e.frameProverTriesMx.Unlock()

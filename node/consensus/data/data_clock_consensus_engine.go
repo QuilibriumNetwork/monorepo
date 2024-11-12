@@ -26,6 +26,7 @@ import (
 	qtime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
+	"source.quilibrium.com/quilibrium/monorepo/node/internal/cas"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -412,7 +413,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				},
 			}
 
-			e.latestFrameReceived = frame.FrameNumber
+			cas.IfLessThanUint64(&e.latestFrameReceived, frame.FrameNumber)
 			e.logger.Info(
 				"preparing peer announce",
 				zap.Uint64("frame_number", frame.FrameNumber),
