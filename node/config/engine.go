@@ -20,10 +20,10 @@ type EngineConfig struct {
 	DataWorkerMultiaddrs          []string `yaml:"dataWorkerMultiaddrs"`
 	MultisigProverEnrollmentPaths []string `yaml:"multisigProverEnrollmentPaths"`
 	// Fully verifies execution, omit to enable light prover
-	FullProver bool
+	FullProver bool `yaml:"fullProver"`
 	// Automatically merges coins after minting once a sufficient number has been
 	// accrued
-	AutoMergeCoins bool
+	AutoMergeCoins bool `yaml:"autoMergeCoins"`
 
 	// Values used only for testing – do not override these in production, your
 	// node will get kicked out
