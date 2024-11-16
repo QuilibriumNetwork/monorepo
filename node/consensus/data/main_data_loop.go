@@ -41,6 +41,19 @@ func (
 	return frameProverTries
 }
 
+func (e *DataClockConsensusEngine) runSync() {
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case enqueuedFrame := <-e.requestSyncCh:
+			if _, err := e.collect(enqueuedFrame); err != nil {
+				e.logger.Error("could not collect", zap.Error(err))
+			}
+		}
+	}
+}
+
 func (e *DataClockConsensusEngine) runLoop() {
 	dataFrameCh := e.dataTimeReel.NewFrameCh()
 	runOnce := true
@@ -103,8 +116,9 @@ func (e *DataClockConsensusEngine) processFrame(
 	)
 	var err error
 	if !e.GetFrameProverTries()[0].Contains(e.provingKeyBytes) {
-		if latestFrame, err = e.collect(dataFrame); err != nil {
-			e.logger.Error("could not collect", zap.Error(err))
+		select {
+		case e.requestSyncCh <- dataFrame:
+		default:
 		}
 	}
 

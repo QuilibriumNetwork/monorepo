@@ -311,7 +311,7 @@ func (e *DataClockConsensusEngine) sync(
 	client := protobufs.NewDataServiceClient(cc)
 
 	for e.GetState() < consensus.EngineStateStopping {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(e.ctx, 2*time.Second)
 		response, err := client.GetDataFrame(
 			ctx,
 			&protobufs.GetDataFrameRequest{

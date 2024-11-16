@@ -652,7 +652,7 @@ func (e *DataClockConsensusEngine) GetPublicChannelForProvingKey(
 		}
 		client := protobufs.NewDataServiceClient(cc)
 		s, err := client.GetPublicChannel(
-			context.Background(),
+			e.ctx,
 			grpc.MaxCallSendMsgSize(600*1024*1024),
 			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
