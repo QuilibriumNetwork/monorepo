@@ -305,9 +305,9 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	go e.runInfoMessageHandler()
 
 	e.logger.Info("subscribing to pubsub messages")
-	e.pubSub.RegisterValidator(e.frameFilter, e.validateFrameMessage)
-	e.pubSub.RegisterValidator(e.txFilter, e.validateTxMessage)
-	e.pubSub.RegisterValidator(e.infoFilter, e.validateInfoMessage)
+	e.pubSub.RegisterValidator(e.frameFilter, e.validateFrameMessage, true)
+	e.pubSub.RegisterValidator(e.txFilter, e.validateTxMessage, true)
+	e.pubSub.RegisterValidator(e.infoFilter, e.validateInfoMessage, true)
 	e.pubSub.Subscribe(e.frameFilter, e.handleFrameMessage)
 	e.pubSub.Subscribe(e.txFilter, e.handleTxMessage)
 	e.pubSub.Subscribe(e.infoFilter, e.handleInfoMessage)

@@ -26,6 +26,7 @@ type PubSub interface {
 	RegisterValidator(
 		bitmask []byte,
 		validator func(peerID peer.ID, message *pb.Message) ValidationResult,
+		sync bool,
 	) error
 	UnregisterValidator(bitmask []byte) error
 	GetPeerID() []byte

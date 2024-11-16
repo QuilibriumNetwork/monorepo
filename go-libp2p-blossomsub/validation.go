@@ -11,9 +11,12 @@ import (
 )
 
 const (
-	defaultValidateQueueSize   = 32
-	defaultValidateConcurrency = 1024
-	defaultValidateThrottle    = 8192
+	// DefaultValidateQueueSize is the default size of the validation queue.
+	DefaultValidateQueueSize = 16384
+	// DefaultValidateConcurrency is the default number of concurrent instances of a validator per bitmask.
+	DefaultValidateConcurrency = 1024
+	// DefaultValidateThrottle is the default number of concurrent instances of all validators.
+	DefaultValidateThrottle = 8192
 )
 
 // ValidationError is an error that may be signalled from message publication when the message
@@ -121,8 +124,8 @@ type rmValReq struct {
 func newValidation() *validation {
 	return &validation{
 		bitmaskVals:      make(map[string]*validatorImpl),
-		validateQ:        make(chan *validateReq, defaultValidateQueueSize),
-		validateThrottle: make(chan struct{}, defaultValidateThrottle),
+		validateQ:        make(chan *validateReq, DefaultValidateQueueSize),
+		validateThrottle: make(chan struct{}, DefaultValidateThrottle),
 		validateWorkers:  runtime.NumCPU(),
 	}
 }
@@ -196,7 +199,7 @@ func (v *validation) makeValidator(req *addValReq) (*validatorImpl, error) {
 		bitmask:          req.bitmask,
 		validate:         validator,
 		validateTimeout:  0,
-		validateThrottle: make(chan struct{}, defaultValidateConcurrency),
+		validateThrottle: make(chan struct{}, DefaultValidateConcurrency),
 		validateInline:   req.inline,
 	}
 

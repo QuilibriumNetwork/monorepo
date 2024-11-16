@@ -44,7 +44,7 @@ func (pubsub) Publish(address []byte, data []byte) error                        
 func (pubsub) PublishToBitmask(bitmask []byte, data []byte) error                      { return nil }
 func (pubsub) Subscribe(bitmask []byte, handler func(message *pb.Message) error) error { return nil }
 func (pubsub) Unsubscribe(bitmask []byte, raw bool)                                    {}
-func (pubsub) RegisterValidator(bitmask []byte, validator func(peerID peer.ID, message *pb.Message) p2p.ValidationResult) error {
+func (pubsub) RegisterValidator(bitmask []byte, validator func(peerID peer.ID, message *pb.Message) p2p.ValidationResult, sync bool) error {
 	return nil
 }
 func (pubsub) UnregisterValidator(bitmask []byte) error     { return nil }
