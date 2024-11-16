@@ -44,4 +44,7 @@ type P2PConfig struct {
 	BootstrapParallelism      int           `yaml:"bootstrapParallelism"`
 	DiscoveryParallelism      int           `yaml:"discoveryParallelism"`
 	DiscoveryPeerLookupLimit  int           `yaml:"discoveryPeerLookupLimit"`
+	PingTimeout               time.Duration `yaml:"pingTimeout"`
+	PingPeriod                time.Duration `yaml:"pingPeriod"`
+	PingAttempts              int           `yaml:"pingAttempts"`
 }
