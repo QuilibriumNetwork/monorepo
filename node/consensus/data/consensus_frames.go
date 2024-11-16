@@ -280,73 +280,65 @@ func (e *DataClockConsensusEngine) sync(
 		zap.Uint64("current_frame", latest.FrameNumber),
 		zap.Uint64("max_frame", maxFrame),
 	)
+	var cooperative bool = true
+	defer func() {
+		if cooperative {
+			return
+		}
+		e.peerMapMx.Lock()
+		defer e.peerMapMx.Unlock()
+		if _, ok := e.peerMap[string(peerId)]; ok {
+			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
+			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
+			delete(e.peerMap, string(peerId))
+		}
+	}()
 	cc, err := e.pubSub.GetDirectChannel(peerId, "sync")
 	if err != nil {
 		e.logger.Debug(
 			"could not establish direct channel",
 			zap.Error(err),
 		)
-		e.peerMapMx.Lock()
-		if _, ok := e.peerMap[string(peerId)]; ok {
-			e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-			e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-			delete(e.peerMap, string(peerId))
-		}
-		e.peerMapMx.Unlock()
+		cooperative = false
 		return latest, errors.Wrap(err, "sync")
 	}
+	defer func() {
+		if err := cc.Close(); err != nil {
+			e.logger.Error("error while closing connection", zap.Error(err))
+		}
+	}()
 
 	client := protobufs.NewDataServiceClient(cc)
 
 	for e.GetState() < consensus.EngineStateStopping {
+		ctx, cancel := context.WithTimeout(e.ctx, 2*time.Second)
 		response, err := client.GetDataFrame(
-			context.TODO(),
+			ctx,
 			&protobufs.GetDataFrameRequest{
 				FrameNumber: latest.FrameNumber + 1,
 			},
 			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
+		cancel()
 		if err != nil {
 			e.logger.Debug(
 				"could not get frame",
 				zap.Error(err),
 			)
-			e.peerMapMx.Lock()
-			if _, ok := e.peerMap[string(peerId)]; ok {
-				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-				delete(e.peerMap, string(peerId))
-			}
-			e.peerMapMx.Unlock()
-			if err := cc.Close(); err != nil {
-				e.logger.Error("error while closing connection", zap.Error(err))
-			}
+			cooperative = false
 			return latest, errors.Wrap(err, "sync")
 		}
 
 		if response == nil {
 			e.logger.Debug("received no response from peer")
-			if err := cc.Close(); err != nil {
-				e.logger.Error("error while closing connection", zap.Error(err))
-			}
 			return latest, nil
 		}
 
 		if response.ClockFrame == nil ||
 			response.ClockFrame.FrameNumber != latest.FrameNumber+1 ||
-
 			response.ClockFrame.Timestamp < latest.Timestamp {
 			e.logger.Debug("received invalid response from peer")
-			e.peerMapMx.Lock()
-			if _, ok := e.peerMap[string(peerId)]; ok {
-				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-				delete(e.peerMap, string(peerId))
-			}
-			e.peerMapMx.Unlock()
-			if err := cc.Close(); err != nil {
-				e.logger.Error("error while closing connection", zap.Error(err))
-			}
+			cooperative = false
 			return latest, nil
 		}
 		e.logger.Info(
@@ -357,13 +349,7 @@ func (e *DataClockConsensusEngine) sync(
 		if !e.IsInProverTrie(
 			response.ClockFrame.GetPublicKeySignatureEd448().PublicKey.KeyValue,
 		) {
-			e.peerMapMx.Lock()
-			if _, ok := e.peerMap[string(peerId)]; ok {
-				e.uncooperativePeersMap[string(peerId)] = e.peerMap[string(peerId)]
-				e.uncooperativePeersMap[string(peerId)].timestamp = time.Now().UnixMilli()
-				delete(e.peerMap, string(peerId))
-			}
-			e.peerMapMx.Unlock()
+			cooperative = false
 		}
 		if err := e.frameProver.VerifyDataClockFrame(
 			response.ClockFrame,
@@ -373,11 +359,8 @@ func (e *DataClockConsensusEngine) sync(
 		e.dataTimeReel.Insert(response.ClockFrame, true)
 		latest = response.ClockFrame
 		if latest.FrameNumber >= maxFrame {
-			break
+			return latest, nil
 		}
-	}
-	if err := cc.Close(); err != nil {
-		e.logger.Error("error while closing connection", zap.Error(err))
 	}
 	return latest, nil
 }

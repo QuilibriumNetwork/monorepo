@@ -245,6 +245,7 @@ message TokenRequest {
     AnnounceProverPause pause = 8;
     AnnounceProverResume resume = 9;
   }
+  int64 timestamp = 10;
 }
 
 message TokenRequests {

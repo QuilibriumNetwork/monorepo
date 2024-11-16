@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -217,6 +218,8 @@ func (r *RPCServer) SendMessage(
 	ctx context.Context,
 	req *protobufs.TokenRequest,
 ) (*protobufs.SendMessageResponse, error) {
+	req.Timestamp = time.Now().UnixMilli()
+
 	any := &anypb.Any{}
 	if err := any.MarshalFrom(req); err != nil {
 		return nil, errors.Wrap(err, "publish message")

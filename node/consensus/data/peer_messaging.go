@@ -543,6 +543,7 @@ func (e *DataClockConsensusEngine) handleMint(
 							},
 						},
 					},
+					Timestamp: time.Now().UnixMilli(),
 				},
 			)
 			if err != nil {
@@ -652,7 +653,7 @@ func (e *DataClockConsensusEngine) GetPublicChannelForProvingKey(
 		}
 		client := protobufs.NewDataServiceClient(cc)
 		s, err := client.GetPublicChannel(
-			context.Background(),
+			e.ctx,
 			grpc.MaxCallSendMsgSize(600*1024*1024),
 			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
