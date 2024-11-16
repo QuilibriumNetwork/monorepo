@@ -62,7 +62,7 @@ type DataTimeReel struct {
 	newFrameCh      chan *protobufs.ClockFrame
 	badFrameCh      chan *protobufs.ClockFrame
 	done            chan bool
-	alwaysSend      bool
+	syncSend        bool
 	restore         func() []*tries.RollingFrecencyCritbitTrie
 }
 
@@ -83,7 +83,7 @@ func NewDataTimeReel(
 	origin []byte,
 	initialInclusionProof *crypto.InclusionAggregateProof,
 	initialProverKeys [][]byte,
-	alwaysSend bool,
+	syncSend bool,
 	restore func() []*tries.RollingFrecencyCritbitTrie,
 ) *DataTimeReel {
 	if filter == nil {
@@ -133,7 +133,7 @@ func NewDataTimeReel(
 		newFrameCh:      make(chan *protobufs.ClockFrame),
 		badFrameCh:      make(chan *protobufs.ClockFrame),
 		done:            make(chan bool),
-		alwaysSend:      alwaysSend,
+		syncSend:        syncSend,
 		restore:         restore,
 	}
 }
@@ -685,15 +685,16 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) e
 	d.head = frame
 
 	d.headDistance = distance
-	if d.alwaysSend {
+	if d.syncSend {
 		d.newFrameCh <- frame
+	} else {
+		go func() {
+			select {
+			case d.newFrameCh <- frame:
+			default:
+			}
+		}()
 	}
-	go func() {
-		select {
-		case d.newFrameCh <- frame:
-		default:
-		}
-	}()
 	return nil
 }
 
@@ -992,12 +993,16 @@ func (d *DataTimeReel) forkChoice(
 		d.totalDistance,
 	)
 
-	go func() {
-		select {
-		case d.newFrameCh <- frame:
-		default:
-		}
-	}()
+	if d.syncSend {
+		d.newFrameCh <- frame
+	} else {
+		go func() {
+			select {
+			case d.newFrameCh <- frame:
+			default:
+			}
+		}()
+	}
 }
 
 func (d *DataTimeReel) GetTotalDistance() *big.Int {
