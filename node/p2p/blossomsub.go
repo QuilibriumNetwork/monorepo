@@ -46,6 +46,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
+	"source.quilibrium.com/quilibrium/monorepo/node/internal/observability"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p/internal"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -417,7 +418,9 @@ func NewBlossomSub(
 			GraylistThreshold:           -10000,
 			AcceptPXThreshold:           1,
 			OpportunisticGraftThreshold: 2,
-		}))
+		},
+	))
+	blossomOpts = append(blossomOpts, observability.WithPrometheusRawTracer())
 
 	params := mergeDefaults(p2pConfig)
 	rt := blossomsub.NewBlossomSubRouter(h, params, bs.network)
