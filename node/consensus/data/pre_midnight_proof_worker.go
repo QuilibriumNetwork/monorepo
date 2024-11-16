@@ -2,7 +2,6 @@ package data
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"strings"
 	"time"
@@ -127,7 +126,7 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 
 		if bytes.Equal(resume, make([]byte, 32)) {
 			status, err := client.GetPreMidnightMintStatus(
-				context.Background(),
+				e.ctx,
 				&protobufs.PreMidnightMintStatusRequest{
 					Owner: addr,
 				},
@@ -210,7 +209,7 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 				}
 
 				resp, err := client.HandlePreMidnightMint(
-					context.Background(),
+					e.ctx,
 					&protobufs.MintCoinRequest{
 						Proofs: proofs,
 						Signature: &protobufs.Ed448Signature{

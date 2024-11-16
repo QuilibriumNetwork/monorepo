@@ -9,18 +9,18 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/crypto/sha3"
-	"source.quilibrium.com/quilibrium/monorepo/node/config"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
-	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
-
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/multiformats/go-multiaddr"
 	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
+	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -109,7 +109,7 @@ func NewDataWorkerIPCServer(
 }
 
 func (r *DataWorkerIPCServer) Start() error {
-	s := grpc.NewServer(
+	s := qgrpc.NewServer(
 		grpc.MaxRecvMsgSize(600*1024*1024),
 		grpc.MaxSendMsgSize(600*1024*1024),
 	)

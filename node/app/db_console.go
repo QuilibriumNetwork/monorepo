@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -624,7 +625,8 @@ func ConnectToNode(nodeConfig *config.Config) (*grpc.ClientConn, error) {
 		}
 	}
 
-	return grpc.Dial(
+	return qgrpc.DialContext(
+		context.Background(),
 		addr,
 		grpc.WithTransportCredentials(
 			insecure.NewCredentials(),

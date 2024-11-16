@@ -1,6 +1,7 @@
 package data
 
 import (
+	"encoding/binary"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -59,7 +60,38 @@ func (e *DataClockConsensusEngine) validateTxMessage(peerID peer.ID, message *pb
 			e.logger.Debug("could not unmarshal token request", zap.Error(err))
 			return p2p.ValidationResultReject
 		}
-		// NOTE: There are no timestamps to be validated for token requests.
+		if mint := tx.GetMint(); mint != nil {
+			if len(mint.Proofs) < 3 {
+				e.logger.Debug("mint request is missing proofs")
+				return p2p.ValidationResultReject
+			}
+			if len(mint.Proofs[1]) != 4 {
+				e.logger.Debug("mint request has invalid modulo")
+				return p2p.ValidationResultReject
+			}
+			if len(mint.Proofs[2]) != 8 {
+				e.logger.Debug("mint request has invalid frame number")
+				return p2p.ValidationResultReject
+			}
+			head, err := e.dataTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+			if frameNumber := binary.BigEndian.Uint64(mint.Proofs[2]); frameNumber+10 < head.FrameNumber {
+				e.logger.Debug("mint request is too old", zap.Uint64("frame_number", frameNumber))
+				return p2p.ValidationResultIgnore
+			}
+		}
+		if tx.Timestamp == 0 {
+			// NOTE: The timestamp was added in later versions of the protocol,
+			// and as such it is possible to receive requests without it.
+			// We avoid logging due to this reason.
+			return p2p.ValidationResultAccept
+		}
+		if ts := time.UnixMilli(tx.Timestamp); time.Since(ts) > 10*time.Minute {
+			e.logger.Debug("token request is too old", zap.Time("timestamp", ts))
+			return p2p.ValidationResultIgnore
+		}
 		return p2p.ValidationResultAccept
 	default:
 		e.logger.Debug("unknown message type", zap.String("type_url", a.TypeUrl))

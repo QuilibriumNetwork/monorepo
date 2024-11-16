@@ -6,14 +6,11 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
-
-	"source.quilibrium.com/quilibrium/monorepo/node/config"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
-
-	"github.com/iden3/go-iden3-crypto/poseidon"
-	"github.com/libp2p/go-libp2p/core/peer"
+	"time"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
@@ -23,8 +20,11 @@ import (
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -218,6 +218,8 @@ func (r *RPCServer) SendMessage(
 	ctx context.Context,
 	req *protobufs.TokenRequest,
 ) (*protobufs.SendMessageResponse, error) {
+	req.Timestamp = time.Now().UnixMilli()
+
 	any := &anypb.Any{}
 	if err := any.MarshalFrom(req); err != nil {
 		return nil, errors.Wrap(err, "publish message")
@@ -376,7 +378,7 @@ func NewRPCServer(
 }
 
 func (r *RPCServer) Start() error {
-	s := grpc.NewServer(
+	s := qgrpc.NewServer(
 		grpc.MaxRecvMsgSize(600*1024*1024),
 		grpc.MaxSendMsgSize(600*1024*1024),
 	)
@@ -417,13 +419,13 @@ func (r *RPCServer) Start() error {
 
 		go func() {
 			mux := runtime.NewServeMux()
-			opts := []grpc.DialOption{
+			opts := qgrpc.ClientOptions(
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 				grpc.WithDefaultCallOptions(
 					grpc.MaxCallRecvMsgSize(600*1024*1024),
 					grpc.MaxCallSendMsgSize(600*1024*1024),
 				),
-			}
+			)
 
 			if err := protobufs.RegisterNodeServiceHandlerFromEndpoint(
 				context.Background(),
