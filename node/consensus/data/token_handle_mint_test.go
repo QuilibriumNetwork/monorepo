@@ -113,7 +113,7 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		keyStore:         keystore,
 		keyManager:       keys.NewInMemoryKeyManager(),
 		pubSub:           nil,
-		frameChan:        make(chan *protobufs.ClockFrame),
+		frameChan:        make(chan *protobufs.ClockFrame, 8),
 		executionEngines: map[string]execution.ExecutionEngine{},
 		dependencyMap:    make(map[string]*anypb.Any),
 		parentSelector: []byte{
@@ -135,9 +135,9 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		masterTimeReel:            nil,
 		dataTimeReel:              &qtime.DataTimeReel{},
 		peerInfoManager:           nil,
-		frameMessageProcessorCh:   make(chan *pb.Message),
-		txMessageProcessorCh:      make(chan *pb.Message),
-		infoMessageProcessorCh:    make(chan *pb.Message),
+		frameMessageProcessorCh:   make(chan *pb.Message, 8),
+		txMessageProcessorCh:      make(chan *pb.Message, 8),
+		infoMessageProcessorCh:    make(chan *pb.Message, 8),
 		config:                    nil,
 		preMidnightMint:           map[string]struct{}{},
 	}

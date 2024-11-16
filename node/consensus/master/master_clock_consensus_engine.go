@@ -123,7 +123,7 @@ func NewMasterClockConsensusEngine(
 		keyManager:           keyManager,
 		pubSub:               pubSub,
 		executionEngines:     map[string]execution.ExecutionEngine{},
-		frameChan:            make(chan *protobufs.ClockFrame),
+		frameChan:            make(chan *protobufs.ClockFrame, 8),
 		input:                seed,
 		lastFrameReceivedAt:  time.Time{},
 		syncingStatus:        SyncStatusNotSyncing,
@@ -133,7 +133,7 @@ func NewMasterClockConsensusEngine(
 		masterTimeReel:       masterTimeReel,
 		peerInfoManager:      peerInfoManager,
 		report:               report,
-		frameValidationCh:    make(chan *protobufs.ClockFrame),
+		frameValidationCh:    make(chan *protobufs.ClockFrame, 8),
 		collectedProverSlots: []*protobufs.InclusionAggregateProof{},
 		engineConfig:         engineConfig,
 	}

@@ -66,9 +66,9 @@ func NewMasterTimeReel(
 		clockStore:   clockStore,
 		frameProver:  frameProver,
 		pending:      make(map[uint64][]*protobufs.ClockFrame),
-		frames:       make(chan *protobufs.ClockFrame),
-		newFrameCh:   make(chan *protobufs.ClockFrame),
-		badFrameCh:   make(chan *protobufs.ClockFrame),
+		frames:       make(chan *protobufs.ClockFrame, 8),
+		newFrameCh:   make(chan *protobufs.ClockFrame, 8),
+		badFrameCh:   make(chan *protobufs.ClockFrame, 8),
 		done:         make(chan bool),
 	}
 }
