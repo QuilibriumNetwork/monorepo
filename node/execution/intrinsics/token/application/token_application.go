@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto"
 	"encoding/binary"
+	"runtime"
 	"sync"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -365,27 +366,18 @@ func (a *TokenApplication) ApplyTransitions(
 	}
 
 	wg := sync.WaitGroup{}
-	for _, transition := range set {
-		if transition == nil {
-			continue
-		}
-
-		transition := transition
-		switch transition.Request.(type) {
-		case *protobufs.TokenRequest_Mint:
-			wg.Add(1)
-		}
-	}
+	throttle := make(chan struct{}, runtime.GOMAXPROCS(-1))
 	for i, transition := range set {
 		if transition == nil {
 			continue
 		}
-
-		i := i
-		transition := transition
+		i, transition := i, transition
 		switch t := transition.Request.(type) {
 		case *protobufs.TokenRequest_Mint:
+			throttle <- struct{}{}
+			wg.Add(1)
 			go func() {
+				defer func() { <-throttle }()
 				defer wg.Done()
 				success, err := a.handleMint(
 					currentFrameNumber,
@@ -402,7 +394,6 @@ func (a *TokenApplication) ApplyTransitions(
 			}()
 		}
 	}
-
 	wg.Wait()
 
 	finalFails := []*protobufs.TokenRequest{}
