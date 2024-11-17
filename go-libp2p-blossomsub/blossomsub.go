@@ -633,6 +633,19 @@ loop:
 
 func (bs *BlossomSubRouter) RemovePeer(p peer.ID) {
 	log.Debugf("PEERDOWN: Remove disconnected peer %s", p)
+	masks := make([][]byte, 0)
+	bs.meshMx.Lock()
+	for bitmask, peers := range bs.mesh {
+		if _, ok := peers[p]; !ok {
+			continue
+		}
+		masks = append(masks, []byte(bitmask))
+	}
+	bs.meshMx.Unlock()
+	for _, bitmask := range masks {
+		log.Debugf("PEERDOWN: Pruning peer %s from bitmask %s", p, bitmask)
+		bs.tracer.Prune(p, bitmask)
+	}
 	bs.tracer.RemovePeer(p)
 	delete(bs.peers, p)
 	bs.meshMx.Lock()
