@@ -1,5 +1,7 @@
 package config
 
+import "time"
+
 type EngineConfig struct {
 	ProvingKeyId         string `yaml:"provingKeyId"`
 	Filter               string `yaml:"filter"`
@@ -28,4 +30,7 @@ type EngineConfig struct {
 	// Values used only for testing – do not override these in production, your
 	// node will get kicked out
 	Difficulty uint32 `yaml:"difficulty"`
+
+	// Maximum wait time for a frame to be downloaded from a peer.
+	SyncTimeout time.Duration `yaml:"syncTimeout"`
 }

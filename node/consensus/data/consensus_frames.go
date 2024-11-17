@@ -20,6 +20,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
+const defaultSyncTimeout = 2 * time.Second
+
 func (e *DataClockConsensusEngine) collect(
 	enqueuedFrame *protobufs.ClockFrame,
 ) (*protobufs.ClockFrame, error) {
@@ -310,8 +312,13 @@ func (e *DataClockConsensusEngine) sync(
 
 	client := protobufs.NewDataServiceClient(cc)
 
+	syncTimeout := e.config.Engine.SyncTimeout
+	if syncTimeout == 0 {
+		syncTimeout = defaultSyncTimeout
+	}
+
 	for e.GetState() < consensus.EngineStateStopping {
-		ctx, cancel := context.WithTimeout(e.ctx, 2*time.Second)
+		ctx, cancel := context.WithTimeout(e.ctx, syncTimeout)
 		response, err := client.GetDataFrame(
 			ctx,
 			&protobufs.GetDataFrameRequest{
