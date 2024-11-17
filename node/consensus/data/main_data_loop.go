@@ -50,6 +50,17 @@ func (e *DataClockConsensusEngine) runSync() {
 			if _, err := e.collect(enqueuedFrame); err != nil {
 				e.logger.Error("could not collect", zap.Error(err))
 			}
+		case <-time.After(20 * time.Second):
+			if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+				continue
+			}
+			head, err := e.dataTimeReel.Head()
+			if err != nil {
+				panic(err)
+			}
+			if _, err := e.collect(head); err != nil {
+				e.logger.Error("could not collect", zap.Error(err))
+			}
 		}
 	}
 }
@@ -84,6 +95,8 @@ func (e *DataClockConsensusEngine) runLoop() {
 			}
 
 			select {
+			case <-e.ctx.Done():
+				return
 			case dataFrame := <-dataFrameCh:
 				if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
 					if err = e.publishProof(dataFrame); err != nil {
@@ -95,17 +108,6 @@ func (e *DataClockConsensusEngine) runLoop() {
 						e.stateMx.Unlock()
 					}
 				}
-				latestFrame = e.processFrame(latestFrame, dataFrame)
-			case <-time.After(20 * time.Second):
-				if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
-					continue
-				}
-
-				dataFrame, err := e.dataTimeReel.Head()
-				if err != nil {
-					panic(err)
-				}
-
 				latestFrame = e.processFrame(latestFrame, dataFrame)
 			}
 		}
