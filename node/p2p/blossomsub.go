@@ -12,7 +12,6 @@ import (
 	"math/bits"
 	"net"
 	"net/http"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +46,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/observability"
+	qruntime "source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p/internal"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -1107,7 +1107,7 @@ func withDefaults(p2pConfig *config.P2PConfig) *config.P2PConfig {
 		p2pConfig.ValidateQueueSize = blossomsub.DefaultValidateQueueSize
 	}
 	if p2pConfig.ValidateWorkers == 0 {
-		p2pConfig.ValidateWorkers = runtime.NumCPU()
+		p2pConfig.ValidateWorkers = qruntime.WorkerCount(0, false)
 	}
 	return p2pConfig
 }
