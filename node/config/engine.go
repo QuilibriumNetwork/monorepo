@@ -19,7 +19,9 @@ type EngineConfig struct {
 	DataWorkerBaseListenPort uint16 `yaml:"dataWorkerBaseListenPort"`
 	DataWorkerMemoryLimit    int64  `yaml:"dataWorkerMemoryLimit"`
 	// Alternative configuration path to manually specify data workers by multiaddr
-	DataWorkerMultiaddrs          []string `yaml:"dataWorkerMultiaddrs"`
+	DataWorkerMultiaddrs []string `yaml:"dataWorkerMultiaddrs"`
+	// Number of data worker processes to spawn.
+	DataWorkerCount               int      `yaml:"dataWorkerCount"`
 	MultisigProverEnrollmentPaths []string `yaml:"multisigProverEnrollmentPaths"`
 	// Fully verifies execution, omit to enable light prover
 	FullProver bool `yaml:"fullProver"`

@@ -28,17 +28,6 @@ import (
 	"syscall"
 	"time"
 
-	"go.uber.org/zap"
-	"golang.org/x/crypto/sha3"
-	"google.golang.org/protobuf/proto"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
-	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
-	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/node/store"
-	"source.quilibrium.com/quilibrium/monorepo/node/tries"
-	"source.quilibrium.com/quilibrium/monorepo/node/utils"
-
 	"github.com/cloudflare/circl/sign/ed448"
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -46,11 +35,22 @@ import (
 	"github.com/pbnjay/memory"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
+	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/node/app"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto/kzg"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+	qruntime "source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
+	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/node/tries"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 var (
@@ -384,6 +384,12 @@ func main() {
 		return
 	}
 
+	if len(nodeConfig.Engine.DataWorkerMultiaddrs) == 0 {
+		nodeConfig.Engine.DataWorkerCount = qruntime.WorkerCount(
+			nodeConfig.Engine.DataWorkerCount, true,
+		)
+	}
+
 	if *core != 0 {
 		// runtime.GOMAXPROCS(2)
 		rdebug.SetGCPercent(9999)
@@ -533,11 +539,10 @@ func spawnDataWorkers(nodeConfig *config.Config) {
 		panic(err)
 	}
 
-	cores := runtime.GOMAXPROCS(0)
-	dataWorkers = make([]*exec.Cmd, cores-1)
-	fmt.Printf("Spawning %d data workers...\n", cores-1)
+	dataWorkers = make([]*exec.Cmd, nodeConfig.Engine.DataWorkerCount)
+	fmt.Printf("Spawning %d data workers...\n", nodeConfig.Engine.DataWorkerCount)
 
-	for i := 1; i <= cores-1; i++ {
+	for i := 1; i <= nodeConfig.Engine.DataWorkerCount; i++ {
 		i := i
 		go func() {
 			for {

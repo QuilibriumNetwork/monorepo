@@ -509,12 +509,6 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	go e.runPreMidnightProofWorker()
 
 	go func() {
-		parallelism := e.report.Cores - 1
-
-		if parallelism < 3 {
-			panic("invalid system configuration, minimum system configuration must be four cores")
-		}
-
 		if len(e.config.Engine.DataWorkerMultiaddrs) != 0 {
 			e.clients, err = e.createParallelDataClientsFromList()
 			if err != nil {
@@ -522,7 +516,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			}
 		} else {
 			e.clients, err = e.createParallelDataClientsFromBaseMultiaddr(
-				int(parallelism),
+				e.config.Engine.DataWorkerCount,
 			)
 			if err != nil {
 				panic(err)
