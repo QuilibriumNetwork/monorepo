@@ -957,9 +957,12 @@ func (bs *BlossomSubRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 			continue
 		}
 
-		log.Debugf("PRUNE: Remove mesh link to %s in %s", p, bitmask)
-		bs.tracer.Prune(p, bitmask)
-		delete(peers, p)
+		if _, inMesh := peers[p]; inMesh {
+			log.Debugf("PRUNE: Remove mesh link to %s in %s", p, bitmask)
+			bs.tracer.Prune(p, bitmask)
+			delete(peers, p)
+		}
+
 		// is there a backoff specified by the peer? if so obey it.
 		backoff := prune.GetBackoff()
 		if backoff > 0 {
