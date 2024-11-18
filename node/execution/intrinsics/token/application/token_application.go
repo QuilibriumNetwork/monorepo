@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto"
 	"encoding/binary"
-	"runtime"
 	"sync"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -12,6 +11,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	qruntime "source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -366,7 +366,7 @@ func (a *TokenApplication) ApplyTransitions(
 	}
 
 	wg := sync.WaitGroup{}
-	throttle := make(chan struct{}, runtime.GOMAXPROCS(-1))
+	throttle := make(chan struct{}, qruntime.WorkerCount(0, false))
 	for i, transition := range set {
 		if transition == nil {
 			continue
