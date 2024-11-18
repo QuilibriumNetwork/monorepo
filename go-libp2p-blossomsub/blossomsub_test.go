@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"slices"
 	"sync"
@@ -2258,10 +2259,14 @@ func TestBlossomSubJoinBitmask(t *testing.T) {
 	router0 := psubs[0].rt.(*BlossomSubRouter)
 
 	// Add in backoff for peer.
-	peerMap := make(map[peer.ID]time.Time)
-	peerMap[h[1].ID()] = time.Now().Add(router0.params.UnsubscribeBackoff)
-
-	router0.backoff[string([]byte{0x00, 0x00, 0x81, 0x00})] = peerMap
+	ran := make(chan struct{})
+	router0.p.eval <- func() {
+		defer close(ran)
+		peerMap := make(map[peer.ID]time.Time)
+		peerMap[h[1].ID()] = time.Now().Add(router0.params.UnsubscribeBackoff)
+		router0.backoff[string([]byte{0x00, 0x00, 0x81, 0x00})] = peerMap
+	}
+	<-ran
 
 	// Join all peers
 	var subs []*Subscription
@@ -2275,13 +2280,17 @@ func TestBlossomSubJoinBitmask(t *testing.T) {
 
 	time.Sleep(time.Second)
 
-	router0.meshMx.RLock()
-	meshMap := router0.mesh[string([]byte{0x00, 0x00, 0x81, 0x00})]
-	router0.meshMx.RUnlock()
+	ran = make(chan struct{})
+	var meshMap map[peer.ID]struct{}
+	router0.p.eval <- func() {
+		defer close(ran)
+		meshMap = maps.Clone(router0.mesh[string([]byte{0x00, 0x00, 0x81, 0x00})])
+	}
+	<-ran
+
 	if len(meshMap) != 1 {
 		t.Fatalf("Unexpect peer included in the mesh")
 	}
-
 	_, ok := meshMap[h[1].ID()]
 	if ok {
 		t.Fatalf("Peer that was to be backed off is included in the mesh")

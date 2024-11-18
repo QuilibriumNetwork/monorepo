@@ -24,7 +24,12 @@ func TestPubSubRemovesBlacklistedPeer(t *testing.T) {
 	// Bad peer is blacklisted after it has connected.
 	// Calling p.BlacklistPeer directly does the right thing but we should also clean
 	// up the peer if it has been added the the blacklist by another means.
-	bl.Add(hosts[0].ID())
+	ran := make(chan struct{})
+	psubs1.eval <- func() {
+		defer close(ran)
+		bl.Add(hosts[0].ID())
+	}
+	<-ran
 	bitmasks, err := psubs0.Join([]byte{0x01, 0x00})
 	if err != nil {
 		t.Fatal(err)

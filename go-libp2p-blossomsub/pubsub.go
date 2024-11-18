@@ -150,8 +150,7 @@ type PubSub struct {
 	blacklist     Blacklist
 	blacklistPeer chan peer.ID
 
-	peers   map[peer.ID]chan *RPC
-	peersMx sync.RWMutex
+	peers map[peer.ID]chan *RPC
 
 	inboundStreamsMx sync.Mutex
 	inboundStreams   map[peer.ID]network.Stream
@@ -566,13 +565,11 @@ func WithAppSpecificRpcInspector(inspector func(peer.ID, *RPC) error) Option {
 // processLoop handles all inputs arriving on the channels
 func (p *PubSub) processLoop(ctx context.Context) {
 	defer func() {
-		p.peersMx.Lock()
 		// Clean up go routines.
 		for _, ch := range p.peers {
 			close(ch)
 		}
 		p.peers = nil
-		p.peersMx.Unlock()
 		p.bitmasks = nil
 		p.seenMessages.Done()
 	}()
@@ -585,9 +582,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 		case s := <-p.newPeerStream:
 			pid := s.Conn().RemotePeer()
 
-			p.peersMx.RLock()
 			ch, ok := p.peers[pid]
-			p.peersMx.RUnlock()
 			if !ok {
 				log.Warn("new stream for unknown peer: ", pid)
 				s.Reset()
@@ -597,9 +592,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			if p.blacklist.Contains(pid) {
 				log.Warn("closing stream for blacklisted peer: ", pid)
 				close(ch)
-				p.peersMx.Lock()
 				delete(p.peers, pid)
-				p.peersMx.Unlock()
 				s.Reset()
 				continue
 			}
@@ -607,9 +600,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			p.rt.AddPeer(pid, s.Protocol())
 
 		case pid := <-p.newPeerError:
-			p.peersMx.Lock()
 			delete(p.peers, pid)
-			p.peersMx.Unlock()
 
 		case <-p.peerDead:
 			p.handleDeadPeers()
@@ -659,14 +650,10 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			log.Infof("Blacklisting peer %s", pid)
 			p.blacklist.Add(pid)
 
-			p.peersMx.RLock()
 			ch, ok := p.peers[pid]
-			p.peersMx.RUnlock()
 			if ok {
 				close(ch)
-				p.peersMx.Lock()
 				delete(p.peers, pid)
-				p.peersMx.Unlock()
 				for t, tmap := range p.bitmasks {
 					if _, ok := tmap[pid]; ok {
 						delete(tmap, pid)
@@ -695,7 +682,6 @@ peerloop:
 		}
 
 		var peerset []peer.ID
-		p.peersMx.RLock()
 		for p := range p.peers {
 			_, ok := tmap[p]
 			if !ok {
@@ -703,7 +689,6 @@ peerloop:
 			}
 			peerset = append(peerset, p)
 		}
-		p.peersMx.RUnlock()
 
 		if len(peers) == 0 {
 			peers = peerset
@@ -743,13 +728,10 @@ func (p *PubSub) handlePendingPeers() {
 			continue
 		}
 
-		p.peersMx.RLock()
 		if _, ok := p.peers[pid]; ok {
-			p.peersMx.RUnlock()
 			log.Debug("already have connection to peer: ", pid)
 			continue
 		}
-		p.peersMx.RUnlock()
 
 		if p.blacklist.Contains(pid) {
 			log.Warn("ignoring connection from blacklisted peer: ", pid)
@@ -759,9 +741,7 @@ func (p *PubSub) handlePendingPeers() {
 		messages := make(chan *RPC, p.peerOutboundQueueSize)
 		messages <- p.getHelloPacket()
 		go p.handleNewPeer(p.ctx, pid, messages)
-		p.peersMx.Lock()
 		p.peers[pid] = messages
-		p.peersMx.Unlock()
 	}
 }
 
@@ -778,17 +758,13 @@ func (p *PubSub) handleDeadPeers() {
 	p.peerDeadPrioLk.Unlock()
 
 	for pid := range deadPeers {
-		p.peersMx.RLock()
 		ch, ok := p.peers[pid]
-		p.peersMx.RUnlock()
 		if !ok {
 			continue
 		}
 
 		close(ch)
-		p.peersMx.Lock()
 		delete(p.peers, pid)
-		p.peersMx.Unlock()
 
 		for t, tmap := range p.bitmasks {
 			if _, ok := tmap[pid]; ok {
@@ -811,9 +787,7 @@ func (p *PubSub) handleDeadPeers() {
 			log.Debugf("peer declared dead but still connected; respawning writer: %s", pid)
 			messages := make(chan *RPC, p.peerOutboundQueueSize)
 			messages <- p.getHelloPacket()
-			p.peersMx.Lock()
 			p.peers[pid] = messages
-			p.peersMx.Unlock()
 			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, messages)
 		}
 	}
@@ -977,7 +951,6 @@ func (p *PubSub) announce(bitmask []byte, sub bool) {
 	}
 
 	out := rpcWithSubs(subopt)
-	p.peersMx.RLock()
 	for pid, peer := range p.peers {
 		select {
 		case peer <- out:
@@ -988,7 +961,6 @@ func (p *PubSub) announce(bitmask []byte, sub bool) {
 			go p.announceRetry(pid, bitmask, sub)
 		}
 	}
-	p.peersMx.RUnlock()
 }
 
 func (p *PubSub) announceRetry(pid peer.ID, bitmask []byte, sub bool) {
@@ -1012,9 +984,7 @@ func (p *PubSub) announceRetry(pid peer.ID, bitmask []byte, sub bool) {
 }
 
 func (p *PubSub) doAnnounceRetry(pid peer.ID, bitmask []byte, sub bool) {
-	p.peersMx.RLock()
 	peer, ok := p.peers[pid]
-	p.peersMx.RUnlock()
 	if !ok {
 		return
 	}
