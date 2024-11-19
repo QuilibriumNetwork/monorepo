@@ -384,6 +384,15 @@ func main() {
 		return
 	}
 
+	if nodeConfig.Engine.DataWorkerBaseListenMultiaddr == "" {
+		nodeConfig.Engine.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
+	}
+	if nodeConfig.Engine.DataWorkerBaseListenPort == 0 {
+		nodeConfig.Engine.DataWorkerBaseListenPort = 40000
+	}
+	if nodeConfig.Engine.DataWorkerMemoryLimit == 0 {
+		nodeConfig.Engine.DataWorkerMemoryLimit = 1792 * 1024 * 1024 // 1.75GiB
+	}
 	if len(nodeConfig.Engine.DataWorkerMultiaddrs) == 0 {
 		nodeConfig.Engine.DataWorkerCount = qruntime.WorkerCount(
 			nodeConfig.Engine.DataWorkerCount, true,
@@ -391,22 +400,8 @@ func main() {
 	}
 
 	if *core != 0 {
-		// runtime.GOMAXPROCS(2)
 		rdebug.SetGCPercent(9999)
-
-		if nodeConfig.Engine.DataWorkerMemoryLimit == 0 {
-			nodeConfig.Engine.DataWorkerMemoryLimit = 1792 * 1024 * 1024 // 1.75GiB
-		}
-
 		rdebug.SetMemoryLimit(nodeConfig.Engine.DataWorkerMemoryLimit)
-
-		if nodeConfig.Engine.DataWorkerBaseListenMultiaddr == "" {
-			nodeConfig.Engine.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
-		}
-
-		if nodeConfig.Engine.DataWorkerBaseListenPort == 0 {
-			nodeConfig.Engine.DataWorkerBaseListenPort = 40000
-		}
 
 		if *parentProcess == 0 && len(nodeConfig.Engine.DataWorkerMultiaddrs) == 0 {
 			panic("parent process pid not specified")
@@ -443,6 +438,27 @@ func main() {
 			panic(err)
 		}
 		return
+	} else {
+		totalMemory := int64(memory.TotalMemory())
+		dataWorkerReservedMemory := int64(0)
+		if len(nodeConfig.Engine.DataWorkerMultiaddrs) == 0 {
+			dataWorkerReservedMemory = nodeConfig.Engine.DataWorkerMemoryLimit * int64(nodeConfig.Engine.DataWorkerCount)
+		}
+		switch availableOverhead := totalMemory - dataWorkerReservedMemory; {
+		case totalMemory < dataWorkerReservedMemory:
+			fmt.Println("The memory allocated to data workers exceeds the total system memory.")
+			fmt.Println("You are at risk of running out of memory during runtime.")
+		case availableOverhead < 8*1024*1024*1024:
+			fmt.Println("The memory available to the node, unallocated to the data workers, is less than 8GiB.")
+			fmt.Println("You are at risk of running out of memory during runtime.")
+		default:
+			if _, explicitGOGC := os.LookupEnv("GOGC"); !explicitGOGC {
+				rdebug.SetGCPercent(9999)
+			}
+			if _, explicitGOMEMLIMIT := os.LookupEnv("GOMEMLIMIT"); !explicitGOMEMLIMIT {
+				rdebug.SetMemoryLimit(availableOverhead * 8 / 10)
+			}
+		}
 	}
 
 	fmt.Println("Loading ceremony state and starting node...")
