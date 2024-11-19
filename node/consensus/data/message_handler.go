@@ -339,6 +339,13 @@ func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 	}
 	e.peerMapMx.Unlock()
 
+	select {
+	case <-e.ctx.Done():
+		return nil
+	case e.requestSyncCh <- nil:
+	default:
+	}
+
 	return nil
 }
 

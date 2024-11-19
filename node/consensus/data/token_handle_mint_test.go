@@ -78,7 +78,8 @@ func (pubsub) GetPeerScore(peerId []byte) int64             { return 0 }
 func (pubsub) SetPeerScore(peerId []byte, score int64)      {}
 func (pubsub) AddPeerScore(peerId []byte, scoreDelta int64) {}
 func (pubsub) Reconnect(peerId []byte) error                { return nil }
-func (pubsub) DiscoverPeers() error                         { return nil }
+func (pubsub) Bootstrap(context.Context) error              { return nil }
+func (pubsub) DiscoverPeers(context.Context) error          { return nil }
 
 type outputs struct {
 	difficulty  uint32

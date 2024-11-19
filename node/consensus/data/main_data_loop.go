@@ -93,18 +93,17 @@ func (e *DataClockConsensusEngine) runSync() {
 		case <-e.ctx.Done():
 			return
 		case enqueuedFrame := <-e.requestSyncCh:
+			if enqueuedFrame == nil {
+				var err error
+				enqueuedFrame, err = e.dataTimeReel.Head()
+				if err != nil {
+					panic(err)
+				}
+			}
+			if err := e.pubSub.Bootstrap(e.ctx); err != nil {
+				e.logger.Error("could not bootstrap", zap.Error(err))
+			}
 			if _, err := e.collect(enqueuedFrame); err != nil {
-				e.logger.Error("could not collect", zap.Error(err))
-			}
-		case <-time.After(20 * time.Second):
-			if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
-				continue
-			}
-			head, err := e.dataTimeReel.Head()
-			if err != nil {
-				panic(err)
-			}
-			if _, err := e.collect(head); err != nil {
 				e.logger.Error("could not collect", zap.Error(err))
 			}
 		}

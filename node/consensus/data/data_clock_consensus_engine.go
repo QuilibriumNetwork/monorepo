@@ -383,7 +383,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			}
 			if currentHead.FrameNumber == lastHead.FrameNumber {
 				currentBackoff = min(maxBackoff, currentBackoff+1)
-				_ = e.pubSub.DiscoverPeers()
+				_ = e.pubSub.DiscoverPeers(e.ctx)
 			} else {
 				currentBackoff = max(0, currentBackoff-1)
 				lastHead = currentHead

@@ -52,6 +52,7 @@ type PubSub interface {
 	SetPeerScore(peerId []byte, score int64)
 	AddPeerScore(peerId []byte, scoreDelta int64)
 	Reconnect(peerId []byte) error
-	DiscoverPeers() error
+	Bootstrap(ctx context.Context) error
+	DiscoverPeers(ctx context.Context) error
 	GetNetwork() uint
 }

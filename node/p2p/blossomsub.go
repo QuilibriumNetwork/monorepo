@@ -77,6 +77,7 @@ type BlossomSub struct {
 	peerScore   map[string]int64
 	peerScoreMx sync.Mutex
 	network     uint8
+	bootstrap   internal.PeerConnector
 	discovery   internal.PeerConnector
 }
 
@@ -352,6 +353,7 @@ func NewBlossomSub(
 		),
 		bootstrap,
 	)
+	bs.bootstrap = bootstrap
 
 	discovery := internal.NewPeerConnector(
 		ctx,
@@ -731,8 +733,12 @@ func (b *BlossomSub) Reconnect(peerId []byte) error {
 	return nil
 }
 
-func (b *BlossomSub) DiscoverPeers() error {
-	return b.discovery.Connect(b.ctx)
+func (b *BlossomSub) Bootstrap(ctx context.Context) error {
+	return b.bootstrap.Connect(ctx)
+}
+
+func (b *BlossomSub) DiscoverPeers(ctx context.Context) error {
+	return b.discovery.Connect(ctx)
 }
 
 func (b *BlossomSub) GetPeerScore(peerId []byte) int64 {
