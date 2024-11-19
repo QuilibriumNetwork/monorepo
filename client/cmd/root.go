@@ -111,7 +111,11 @@ var rootCmd = &cobra.Command{
 		}
 
 		if publicRPC {
-			fmt.Println("gRPC not enabled, using light node")
+			fmt.Println("Public RPC enabled, using light node")
+			LightNode = true
+		}
+		if !LightNode && NodeConfig.ListenGRPCMultiaddr == "" {
+			fmt.Println("No ListenGRPCMultiaddr found in config, using light node")
 			LightNode = true
 		}
 	},
