@@ -448,6 +448,9 @@ func NewBlossomSub(
 		internal.PeerAddrInfosToPeerIDSlice(bootstrappers),
 		true,
 	)))
+	blossomOpts = append(blossomOpts, blossomsub.WithDiscovery(
+		internal.NewPeerConnectorDiscovery(discovery),
+	))
 
 	params := toBlossomSubParams(p2pConfig)
 	rt := blossomsub.NewBlossomSubRouter(h, params, bs.network)
@@ -462,18 +465,6 @@ func NewBlossomSub(
 	bs.peerID = peerID
 	bs.h = h
 	bs.signKey = privKey
-
-	go func() {
-		for {
-			time.Sleep(30 * time.Second)
-			for _, mask := range pubsub.GetBitmasks() {
-				if !rt.EnoughPeers([]byte(mask), 0) {
-					_ = discovery.Connect(ctx)
-					break
-				}
-			}
-		}
-	}()
 
 	return bs
 }
