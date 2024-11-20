@@ -394,6 +394,12 @@ func main() {
 		nodeConfig.Engine.DataWorkerMemoryLimit = 1792 * 1024 * 1024 // 1.75GiB
 	}
 	if len(nodeConfig.Engine.DataWorkerMultiaddrs) == 0 {
+		maxProcs, numCPU := runtime.GOMAXPROCS(0), runtime.NumCPU()
+		if maxProcs > numCPU && !nodeConfig.Engine.AllowExcessiveGOMAXPROCS {
+			fmt.Println("GOMAXPROCS is set higher than the number of available CPUs.")
+			os.Exit(1)
+		}
+
 		nodeConfig.Engine.DataWorkerCount = qruntime.WorkerCount(
 			nodeConfig.Engine.DataWorkerCount, true,
 		)

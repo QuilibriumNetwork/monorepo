@@ -34,4 +34,6 @@ type EngineConfig struct {
 	// Values used only for testing – do not override these in production, your
 	// node will get kicked out
 	Difficulty uint32 `yaml:"difficulty"`
+	// Whether to allow GOMAXPROCS values above the number of physical cores.
+	AllowExcessiveGOMAXPROCS bool `yaml:"allowExcessiveGOMAXPROCS"`
 }
