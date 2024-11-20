@@ -7,7 +7,6 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"go.uber.org/zap"
 )
@@ -19,7 +18,7 @@ type peerMonitor struct {
 	attempts int
 }
 
-func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, id peer.ID) bool {
+func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, conn network.Conn) bool {
 	pingCtx, cancel := context.WithTimeout(ctx, pm.timeout)
 	defer cancel()
 	select {
@@ -27,7 +26,7 @@ func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, id peer
 	case <-pingCtx.Done():
 		logger.Debug("ping timeout")
 		return false
-	case res := <-ping.Ping(pingCtx, pm.h, id):
+	case res := <-ping.PingConn(pingCtx, pm.h.Peerstore(), conn):
 		if res.Error != nil {
 			logger.Debug("ping error", zap.Error(res.Error))
 			return false
@@ -37,43 +36,35 @@ func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, id peer
 	return true
 }
 
-func (pm *peerMonitor) ping(ctx context.Context, logger *zap.Logger, wg *sync.WaitGroup, id peer.ID) {
+func (pm *peerMonitor) ping(ctx context.Context, logger *zap.Logger, wg *sync.WaitGroup, conn network.Conn) {
 	defer wg.Done()
-	var conns []network.Conn
 	for i := 0; i < pm.attempts; i++ {
-		// There are no fine grained semantics in libp2p that would allow us to 'ping via
-		// a specific connection'. We can only ping a peer, which will attempt to open a stream via a connection.
-		// As such, we save a snapshot of the connections that were potentially in use before
-		// the ping, and close them if the ping fails. If new connections occur between the snapshot
-		// and the ping, they will not be closed, and will be pinged in the next iteration.
-		conns = pm.h.Network().ConnsToPeer(id)
-		if pm.pingOnce(ctx, logger, id) {
+		if pm.pingOnce(ctx, logger, conn) {
+			return
+		}
+		if conn.IsClosed() {
 			return
 		}
 	}
-	for _, conn := range conns {
-		_ = conn.Close()
-	}
+	_ = conn.Close()
 }
 
 func (pm *peerMonitor) run(ctx context.Context, logger *zap.Logger) {
-	// Do not allow the pings to dial new connections. Adding new peers is a separate
-	// process and should not be done during the ping process.
-	ctx = network.WithNoDial(ctx, "monitor peers")
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(pm.period):
-			// This is once again a snapshot of the connected peers at the time of the ping. If new peers
-			// are added between the snapshot and the ping, they will be pinged in the next iteration.
 			peers := pm.h.Network().Peers()
 			logger.Debug("pinging connected peers", zap.Int("peer_count", len(peers)))
 			wg := &sync.WaitGroup{}
 			for _, id := range peers {
 				logger := logger.With(zap.String("peer_id", id.String()))
-				wg.Add(1)
-				go pm.ping(ctx, logger, wg, id)
+				for _, conn := range pm.h.Network().ConnsToPeer(id) {
+					logger := logger.With(zap.String("connection_id", conn.ID()))
+					wg.Add(1)
+					go pm.ping(ctx, logger, wg, conn)
+				}
 			}
 			wg.Wait()
 			logger.Debug("pinged connected peers")
