@@ -5,15 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math/big"
 	"math/bits"
 	"net"
-	"net/http"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,12 +16,14 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	libp2pconfig "github.com/libp2p/go-libp2p/config"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	routedhost "github.com/libp2p/go-libp2p/p2p/host/routed"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
@@ -35,7 +32,6 @@ import (
 	"github.com/mr-tron/base58"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
-	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
@@ -317,6 +313,35 @@ func NewBlossomSub(
 
 	logger.Info("established peer id", zap.String("peer_id", h.ID().String()))
 
+	reachabilitySub, err := h.EventBus().Subscribe(&event.EvtLocalReachabilityChanged{}, eventbus.Name("blossomsub"))
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		defer reachabilitySub.Close()
+		logger := logger.Named("reachability")
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt, ok := <-reachabilitySub.Out():
+				if !ok {
+					return
+				}
+				switch state := evt.(event.EvtLocalReachabilityChanged).Reachability; state {
+				case network.ReachabilityPublic:
+					logger.Info("node is externally reachable")
+				case network.ReachabilityPrivate:
+					logger.Info("node is not externally reachable")
+				case network.ReachabilityUnknown:
+					logger.Info("node reachability is unknown")
+				default:
+					logger.Debug("unknown reachability state", zap.Any("state", state))
+				}
+			}
+		}
+	}()
+
 	kademliaDHT := initDHT(
 		ctx,
 		logger,
@@ -329,8 +354,6 @@ func NewBlossomSub(
 
 	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
 	util.Advertise(ctx, routingDiscovery, getNetworkNamespace(p2pConfig.Network))
-
-	verifyReachability(p2pConfig)
 
 	minBootstrapPeers := min(len(bootstrappers), p2pConfig.MinBootstrapPeers)
 	bootstrap := internal.NewPeerConnector(
@@ -897,101 +920,6 @@ func (b *BlossomSub) GetPublicKey() []byte {
 func (b *BlossomSub) SignMessage(msg []byte) ([]byte, error) {
 	sig, err := b.signKey.Sign(msg)
 	return sig, errors.Wrap(err, "sign message")
-}
-
-type ReachabilityRequest struct {
-	Port uint16 `json:"port"`
-	Type string `json:"type"`
-}
-
-type ReachabilityResponse struct {
-	Reachable bool   `json:"reachable"`
-	Error     string `json:"error"`
-}
-
-func verifyReachability(cfg *config.P2PConfig) bool {
-	a, err := ma.NewMultiaddr(cfg.ListenMultiaddr)
-	if err != nil {
-		return false
-	}
-
-	transport, addr, err := mn.DialArgs(a)
-	if err != nil {
-		return false
-	}
-
-	addrparts := strings.Split(addr, ":")
-	if len(addrparts) != 2 {
-		return false
-	}
-
-	port, err := strconv.ParseUint(addrparts[1], 10, 0)
-	if err != nil {
-		return false
-	}
-
-	if !strings.Contains(transport, "tcp") {
-		transport = "quic"
-	} else {
-		transport = "tcp"
-	}
-
-	req := &ReachabilityRequest{
-		Port: uint16(port),
-		Type: transport,
-	}
-
-	b, err := json.Marshal(req)
-	if err != nil {
-		return false
-	}
-
-	resp, err := http.Post(
-		"https://rpc.quilibrium.com/connectivity-check",
-		"application/json",
-		bytes.NewBuffer(b),
-	)
-	if err != nil {
-		fmt.Println("Reachability check not currently available, skipping test.")
-		return true
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		fmt.Println("Reachability check not currently available, skipping test.")
-		return true
-	}
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Reachability check not currently available, skipping test.")
-		return true
-	}
-
-	r := &ReachabilityResponse{}
-	err = json.Unmarshal(bodyBytes, r)
-	if err != nil {
-		fmt.Println("Reachability check not currently available, skipping test.")
-		return true
-	}
-
-	if r.Error != "" {
-		fmt.Println("Reachability check failed: " + r.Error)
-		if transport == "quic" {
-			fmt.Println("WARNING!")
-			fmt.Println("WARNING!")
-			fmt.Println("WARNING!")
-			fmt.Println("You failed reachability with QUIC enabled. Consider switching to TCP")
-			fmt.Println("WARNING!")
-			fmt.Println("WARNING!")
-			fmt.Println("WARNING!")
-			time.Sleep(5 * time.Second)
-		}
-		return false
-	}
-
-	fmt.Println("Node passed reachability check.")
-	return true
 }
 
 func withDefaults(p2pConfig *config.P2PConfig) *config.P2PConfig {
