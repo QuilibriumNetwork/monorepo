@@ -20,7 +20,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
-const defaultSyncTimeout = 2 * time.Second
+const defaultSyncTimeout = 4 * time.Second
 
 func (e *DataClockConsensusEngine) collect(
 	enqueuedFrame *protobufs.ClockFrame,
