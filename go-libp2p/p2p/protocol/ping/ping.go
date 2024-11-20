@@ -15,6 +15,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	mstream "github.com/multiformats/go-multistream"
 )
 
 var log = logging.Logger("ping")
@@ -114,14 +117,7 @@ func pingError(err error) chan Result {
 	return ch
 }
 
-// Ping pings the remote peer until the context is canceled, returning a stream
-// of RTTs or errors.
-func Ping(ctx context.Context, h host.Host, p peer.ID) <-chan Result {
-	s, err := h.NewStream(network.WithAllowLimitedConn(ctx, "ping"), p, ID)
-	if err != nil {
-		return pingError(err)
-	}
-
+func pingStream(ctx context.Context, ps peerstore.Peerstore, s network.Stream) <-chan Result {
 	if err := s.Scope().SetService(ServiceName); err != nil {
 		log.Debugf("error attaching stream to ping service: %s", err)
 		s.Reset()
@@ -153,7 +149,7 @@ func Ping(ctx context.Context, h host.Host, p peer.ID) <-chan Result {
 
 			// No error, record the RTT.
 			if res.Error == nil {
-				h.Peerstore().RecordLatency(p, res.RTT)
+				ps.RecordLatency(s.Conn().RemotePeer(), res.RTT)
 			}
 
 			select {
@@ -173,6 +169,54 @@ func Ping(ctx context.Context, h host.Host, p peer.ID) <-chan Result {
 	})
 
 	return out
+}
+
+// PingConn pings the peer via the connection until the context is canceled, returning a stream
+// of RTTs or errors.
+func PingConn(ctx context.Context, ps peerstore.Peerstore, conn network.Conn) <-chan Result {
+	s, err := conn.NewStream(ctx)
+	if err != nil {
+		return pingError(err)
+	}
+	var selected protocol.ID
+	var errCh chan error = make(chan error, 1)
+	go func() {
+		var err error
+		selected, err = mstream.SelectOneOf([]protocol.ID{ID}, s)
+		select {
+		case <-ctx.Done():
+		case errCh <- err:
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		_ = s.Reset()
+		return pingError(ctx.Err())
+	case err := <-errCh:
+		if err != nil {
+			_ = s.Reset()
+			return pingError(err)
+		}
+	}
+	if err := s.SetProtocol(selected); err != nil {
+		_ = s.Reset()
+		return pingError(err)
+	}
+	if err := ps.AddProtocols(conn.RemotePeer(), selected); err != nil {
+		_ = s.Reset()
+		return pingError(err)
+	}
+	return pingStream(ctx, ps, s)
+}
+
+// Ping pings the remote peer until the context is canceled, returning a stream
+// of RTTs or errors.
+func Ping(ctx context.Context, h host.Host, p peer.ID) <-chan Result {
+	s, err := h.NewStream(network.WithAllowLimitedConn(ctx, "ping"), p, ID)
+	if err != nil {
+		return pingError(err)
+	}
+	return pingStream(ctx, h.Peerstore(), s)
 }
 
 func ping(s network.Stream, randReader io.Reader) (time.Duration, error) {
