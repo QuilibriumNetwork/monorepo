@@ -368,16 +368,19 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			panic(err)
 		}
 		source := rand.New(rand.NewSource(rand.Int63()))
-		for e.GetState() < consensus.EngineStateStopping {
+		for {
 			// Use exponential backoff with jitter in order to avoid hammering the bootstrappers.
-			time.Sleep(
-				backoff.FullJitter(
-					baseDuration<<currentBackoff,
-					baseDuration,
-					baseDuration<<maxBackoff,
-					source,
-				),
+			duration := backoff.FullJitter(
+				baseDuration<<currentBackoff,
+				baseDuration,
+				baseDuration<<maxBackoff,
+				source,
 			)
+			select {
+			case <-e.ctx.Done():
+				return
+			case <-time.After(duration):
+			}
 			currentHead, err := e.dataTimeReel.Head()
 			if err != nil {
 				panic(err)
@@ -406,7 +409,11 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 
 			if frame.FrameNumber-100 >= nextFrame.FrameNumber ||
 				nextFrame.FrameNumber == 0 {
-				time.Sleep(120 * time.Second)
+				select {
+				case <-e.ctx.Done():
+					return
+				case <-time.After(2 * time.Minute):
+				}
 				continue
 			}
 
@@ -485,7 +492,11 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				thresholdBeforeConfirming--
 			}
 
-			time.Sleep(120 * time.Second)
+			select {
+			case <-e.ctx.Done():
+				return
+			case <-time.After(2 * time.Minute):
+			}
 		}
 	}()
 
@@ -494,7 +505,11 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	go e.runFramePruning()
 
 	go func() {
-		time.Sleep(30 * time.Second)
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-time.After(30 * time.Second):
+		}
 		e.logger.Info("checking for snapshots to play forward")
 		if err := e.downloadSnapshot(e.config.DB.Path, e.config.P2P.Network); err != nil {
 			e.logger.Debug("error downloading snapshot", zap.Error(err))

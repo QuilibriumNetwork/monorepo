@@ -113,14 +113,18 @@ func (e *DataClockConsensusEngine) runSync() {
 func (e *DataClockConsensusEngine) runLoop() {
 	dataFrameCh := e.dataTimeReel.NewFrameCh()
 	runOnce := true
-	for e.GetState() < consensus.EngineStateStopping {
+	for {
 		peerCount := e.pubSub.GetNetworkPeersCount()
 		if peerCount < e.minimumPeersRequired {
 			e.logger.Info(
 				"waiting for minimum peers",
 				zap.Int("peer_count", peerCount),
 			)
-			time.Sleep(1 * time.Second)
+			select {
+			case <-e.ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
 		} else {
 			latestFrame, err := e.dataTimeReel.Head()
 			if err != nil {

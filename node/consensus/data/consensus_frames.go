@@ -7,7 +7,6 @@ import (
 
 	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
-	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/data/internal"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
 
@@ -318,7 +317,7 @@ func (e *DataClockConsensusEngine) sync(
 		syncTimeout = defaultSyncTimeout
 	}
 
-	for e.GetState() < consensus.EngineStateStopping {
+	for {
 		ctx, cancel := context.WithTimeout(e.ctx, syncTimeout)
 		response, err := client.GetDataFrame(
 			ctx,
@@ -370,5 +369,4 @@ func (e *DataClockConsensusEngine) sync(
 			return latest, nil
 		}
 	}
-	return latest, nil
 }

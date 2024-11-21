@@ -2,6 +2,7 @@ package token
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"encoding/binary"
 	"encoding/hex"
@@ -80,6 +81,8 @@ func (p PeerSeniorityItem) Priority() uint64 {
 }
 
 type TokenExecutionEngine struct {
+	ctx                   context.Context
+	cancel                context.CancelFunc
 	logger                *zap.Logger
 	clock                 *data.DataClockConsensusEngine
 	clockStore            store.ClockStore
@@ -205,7 +208,10 @@ func NewTokenExecutionEngine(
 		LoadAggregatedSeniorityMap(uint(cfg.P2P.Network))
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	e := &TokenExecutionEngine{
+		ctx:                   ctx,
+		cancel:                cancel,
 		logger:                logger,
 		engineConfig:          cfg.Engine,
 		keyManager:            keyManager,
@@ -364,14 +370,19 @@ func NewTokenExecutionEngine(
 			}
 
 			// need to wait for peering
+		waitPeers:
 			for {
-				gotime.Sleep(30 * gotime.Second)
-				peerMap := e.pubSub.GetBitmaskPeers()
-				if peers, ok := peerMap[string(
-					append([]byte{0x00}, e.intrinsicFilter...),
-				)]; ok {
-					if len(peers) >= 3 {
-						break
+				select {
+				case <-e.ctx.Done():
+					return
+				case <-gotime.After(30 * gotime.Second):
+					peerMap := e.pubSub.GetBitmaskPeers()
+					if peers, ok := peerMap[string(
+						append([]byte{0x00}, e.intrinsicFilter...),
+					)]; ok {
+						if len(peers) >= 3 {
+							break waitPeers
+						}
 					}
 				}
 			}
@@ -441,6 +452,8 @@ func (e *TokenExecutionEngine) Start() <-chan error {
 
 // Stop implements ExecutionEngine
 func (e *TokenExecutionEngine) Stop(force bool) <-chan error {
+	e.cancel()
+
 	errChan := make(chan error)
 
 	go func() {
