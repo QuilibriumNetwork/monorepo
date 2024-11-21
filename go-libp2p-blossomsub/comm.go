@@ -126,7 +126,7 @@ func (p *PubSub) notifyPeerDead(pid peer.ID) {
 	}
 }
 
-func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan *RPC) {
+func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, q *rpcQueue) {
 	s, err := p.host.NewStream(p.ctx, pid, p.rt.Protocols()...)
 	if err != nil {
 		log.Debug("opening new stream to peer: ", err, pid)
@@ -139,7 +139,7 @@ func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan
 		return
 	}
 
-	go p.handleSendingMessages(ctx, s, outgoing)
+	go p.handleSendingMessages(ctx, s, q)
 	go p.handlePeerDead(s)
 	select {
 	case p.newPeerStream <- s:
@@ -147,10 +147,10 @@ func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan
 	}
 }
 
-func (p *PubSub) handleNewPeerWithBackoff(ctx context.Context, pid peer.ID, backoff time.Duration, outgoing <-chan *RPC) {
+func (p *PubSub) handleNewPeerWithBackoff(ctx context.Context, pid peer.ID, backoff time.Duration, q *rpcQueue) {
 	select {
 	case <-time.After(backoff):
-		p.handleNewPeer(ctx, pid, outgoing)
+		p.handleNewPeer(ctx, pid, q)
 	case <-ctx.Done():
 		return
 	}
@@ -168,39 +168,29 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 	p.notifyPeerDead(pid)
 }
 
-func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing <-chan *RPC) {
+func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, q *rpcQueue) {
+	writeRPC := func(rpc *RPC) error {
+		size := uint64(rpc.Size())
+		buf := pool.Get(varint.UvarintSize(size) + int(size))
+		defer pool.Put(buf)
+		n := binary.PutUvarint(buf, size)
+		_, err := rpc.MarshalTo(buf[n:])
+		if err != nil {
+			return err
+		}
+		_, err = s.Write(buf)
+		return err
+	}
+	defer s.Close()
+	defer s.Reset()
 	for {
-		select {
-		case rpc, ok := <-outgoing:
-			if !ok {
-				s.Close()
-				return
-			}
-
-			size := uint64(rpc.Size())
-
-			buf := pool.Get(varint.UvarintSize(size) + int(size))
-
-			n := binary.PutUvarint(buf, size)
-			_, err := rpc.MarshalTo(buf[n:])
-			if err != nil {
-				s.Reset()
-				log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
-				s.Close()
-				pool.Put(buf)
-				return
-			}
-
-			_, err = s.Write(buf)
-			pool.Put(buf)
-			if err != nil {
-				s.Reset()
-				log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
-				s.Close()
-				return
-			}
-		case <-ctx.Done():
-			s.Close()
+		rpc, err := q.Pop(ctx)
+		if err != nil {
+			log.Debugf("pop RPC from queue: %s", err)
+			return
+		}
+		if err := writeRPC(rpc); err != nil {
+			log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
 			return
 		}
 	}

@@ -150,7 +150,7 @@ type PubSub struct {
 	blacklist     Blacklist
 	blacklistPeer chan peer.ID
 
-	peers map[peer.ID]chan *RPC
+	peers map[peer.ID]*rpcQueue
 
 	inboundStreamsMx sync.Mutex
 	inboundStreams   map[peer.ID]network.Stream
@@ -291,7 +291,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		mySubs:                make(map[string]map[*Subscription]struct{}),
 		myRelays:              make(map[string]int),
 		bitmasks:              make(map[string]map[peer.ID]struct{}),
-		peers:                 make(map[peer.ID]chan *RPC),
+		peers:                 make(map[peer.ID]*rpcQueue),
 		inboundStreams:        make(map[peer.ID]network.Stream),
 		blacklist:             NewMapBlacklist(),
 		blacklistPeer:         make(chan peer.ID),
@@ -566,8 +566,8 @@ func WithAppSpecificRpcInspector(inspector func(peer.ID, *RPC) error) Option {
 func (p *PubSub) processLoop(ctx context.Context) {
 	defer func() {
 		// Clean up go routines.
-		for _, ch := range p.peers {
-			close(ch)
+		for _, q := range p.peers {
+			_ = q.Close()
 		}
 		p.peers = nil
 		p.bitmasks = nil
@@ -582,7 +582,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 		case s := <-p.newPeerStream:
 			pid := s.Conn().RemotePeer()
 
-			ch, ok := p.peers[pid]
+			q, ok := p.peers[pid]
 			if !ok {
 				log.Warn("new stream for unknown peer: ", pid)
 				s.Reset()
@@ -591,7 +591,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 			if p.blacklist.Contains(pid) {
 				log.Warn("closing stream for blacklisted peer: ", pid)
-				close(ch)
+				_ = q.Close()
 				delete(p.peers, pid)
 				s.Reset()
 				continue
@@ -650,9 +650,9 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			log.Infof("Blacklisting peer %s", pid)
 			p.blacklist.Add(pid)
 
-			ch, ok := p.peers[pid]
+			q, ok := p.peers[pid]
 			if ok {
-				close(ch)
+				_ = q.Close()
 				delete(p.peers, pid)
 				for t, tmap := range p.bitmasks {
 					if _, ok := tmap[pid]; ok {
@@ -738,10 +738,14 @@ func (p *PubSub) handlePendingPeers() {
 			continue
 		}
 
-		messages := make(chan *RPC, p.peerOutboundQueueSize)
-		messages <- p.getHelloPacket()
-		go p.handleNewPeer(p.ctx, pid, messages)
-		p.peers[pid] = messages
+		q := newRPCQueue(p.peerOutboundQueueSize, p.peerOutboundQueueSize)
+		if err := q.Push(p.ctx, p.getHelloPacket(), true); err != nil {
+			log.Debug("error sending hello packet to new peer: ", err)
+			_ = q.Close()
+			continue
+		}
+		go p.handleNewPeer(p.ctx, pid, q)
+		p.peers[pid] = q
 	}
 }
 
@@ -758,12 +762,12 @@ func (p *PubSub) handleDeadPeers() {
 	p.peerDeadPrioLk.Unlock()
 
 	for pid := range deadPeers {
-		ch, ok := p.peers[pid]
+		q, ok := p.peers[pid]
 		if !ok {
 			continue
 		}
 
-		close(ch)
+		_ = q.Close()
 		delete(p.peers, pid)
 
 		for t, tmap := range p.bitmasks {
@@ -785,10 +789,14 @@ func (p *PubSub) handleDeadPeers() {
 			// still connected, must be a duplicate connection being closed.
 			// we respawn the writer as we need to ensure there is a stream active
 			log.Debugf("peer declared dead but still connected; respawning writer: %s", pid)
-			messages := make(chan *RPC, p.peerOutboundQueueSize)
-			messages <- p.getHelloPacket()
-			p.peers[pid] = messages
-			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, messages)
+			q := newRPCQueue(p.peerOutboundQueueSize, p.peerOutboundQueueSize)
+			if err := q.Push(p.ctx, p.getHelloPacket(), true); err != nil {
+				log.Debug("error sending hello packet to new peer: ", err)
+				_ = q.Close()
+				continue
+			}
+			p.peers[pid] = q
+			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, q)
 		}
 	}
 }
@@ -951,15 +959,14 @@ func (p *PubSub) announce(bitmask []byte, sub bool) {
 	}
 
 	out := rpcWithSubs(subopt)
-	for pid, peer := range p.peers {
-		select {
-		case peer <- out:
-			p.tracer.SendRPC(out, pid)
-		default:
+	for pid, q := range p.peers {
+		if err := q.TryPush(p.ctx, out, false); err != nil {
 			log.Infof("Can't send announce message to peer %s: queue full; scheduling retry", pid)
 			p.tracer.DropRPC(out, pid)
 			go p.announceRetry(pid, bitmask, sub)
+			continue
 		}
+		p.tracer.SendRPC(out, pid)
 	}
 }
 
@@ -984,7 +991,7 @@ func (p *PubSub) announceRetry(pid peer.ID, bitmask []byte, sub bool) {
 }
 
 func (p *PubSub) doAnnounceRetry(pid peer.ID, bitmask []byte, sub bool) {
-	peer, ok := p.peers[pid]
+	q, ok := p.peers[pid]
 	if !ok {
 		return
 	}
@@ -995,14 +1002,13 @@ func (p *PubSub) doAnnounceRetry(pid peer.ID, bitmask []byte, sub bool) {
 	}
 
 	out := rpcWithSubs(subopt)
-	select {
-	case peer <- out:
-		p.tracer.SendRPC(out, pid)
-	default:
+	if err := q.TryPush(p.ctx, out, false); err != nil {
 		log.Infof("Can't send announce message to peer %s: queue full; scheduling retry", pid)
 		p.tracer.DropRPC(out, pid)
 		go p.announceRetry(pid, bitmask, sub)
+		return
 	}
+	p.tracer.SendRPC(out, pid)
 }
 
 // notifySubs sends a given message to all corresponding subscribers.

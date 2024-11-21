@@ -1304,13 +1304,12 @@ func (bs *BlossomSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
 	}
 }
 
-func (bs *BlossomSubRouter) doSendRPC(rpc *RPC, p peer.ID, mch chan *RPC) {
-	select {
-	case mch <- rpc:
-		bs.tracer.SendRPC(rpc, p)
-	default:
+func (bs *BlossomSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue) {
+	if err := q.TryPush(bs.p.ctx, rpc, false); err != nil {
 		bs.doDropRPC(rpc, p, "queue full")
+		return
 	}
+	bs.tracer.SendRPC(rpc, p)
 }
 
 // appendOrMergeRPC appends the given RPCs to the slice, merging them if possible.
