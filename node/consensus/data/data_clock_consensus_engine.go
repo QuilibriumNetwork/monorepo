@@ -116,6 +116,7 @@ type DataClockConsensusEngine struct {
 	engineMx                       sync.Mutex
 	dependencyMapMx                sync.Mutex
 	stagedTransactions             *protobufs.TokenRequests
+	stagedTransactionsSet          map[string]struct{}
 	stagedTransactionsMx           sync.Mutex
 	peerMapMx                      sync.RWMutex
 	peerAnnounceMapMx              sync.Mutex

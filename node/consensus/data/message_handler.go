@@ -2,12 +2,14 @@ package data
 
 import (
 	"bytes"
+	"fmt"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -349,116 +351,60 @@ func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 	return nil
 }
 
+func TokenRequestIdentifiers(transition *protobufs.TokenRequest) []string {
+	switch t := transition.Request.(type) {
+	case *protobufs.TokenRequest_Transfer:
+		return []string{fmt.Sprintf("transfer-%x", t.Transfer.OfCoin.Address)}
+	case *protobufs.TokenRequest_Split:
+		return []string{fmt.Sprintf("split-%x", t.Split.OfCoin.Address)}
+	case *protobufs.TokenRequest_Merge:
+		identifiers := make([]string, len(t.Merge.Coins))
+		for i, coin := range t.Merge.Coins {
+			identifiers[i] = fmt.Sprintf("merge-%x", coin.Address)
+		}
+		return identifiers
+	case *protobufs.TokenRequest_Mint:
+		if len(t.Mint.Proofs) == 1 {
+			return []string{fmt.Sprintf("mint-%x", sha3.Sum512(t.Mint.Proofs[0]))}
+		}
+		// Large proofs are currently not deduplicated.
+		return nil
+	case *protobufs.TokenRequest_Announce:
+		identifiers := make([]string, len(t.Announce.GetPublicKeySignaturesEd448()))
+		for i, sig := range t.Announce.GetPublicKeySignaturesEd448() {
+			identifiers[i] = fmt.Sprintf("announce-%x", sig.PublicKey.KeyValue)
+		}
+		return identifiers
+	case *protobufs.TokenRequest_Join:
+		return []string{fmt.Sprintf("join-%x", t.Join.GetPublicKeySignatureEd448().PublicKey.KeyValue)}
+	case *protobufs.TokenRequest_Leave:
+		return []string{fmt.Sprintf("leave-%x", t.Leave.GetPublicKeySignatureEd448().PublicKey.KeyValue)}
+	case *protobufs.TokenRequest_Pause:
+		return []string{fmt.Sprintf("pause-%x", t.Pause.GetPublicKeySignatureEd448().PublicKey.KeyValue)}
+	case *protobufs.TokenRequest_Resume:
+		return []string{fmt.Sprintf("resume-%x", t.Resume.GetPublicKeySignatureEd448().PublicKey.KeyValue)}
+	default:
+		panic("unhandled transition type")
+	}
+}
+
 func (e *DataClockConsensusEngine) handleTokenRequest(
 	transition *protobufs.TokenRequest,
 ) error {
 	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+		identifiers := TokenRequestIdentifiers(transition)
+
 		e.stagedTransactionsMx.Lock()
 		if e.stagedTransactions == nil {
 			e.stagedTransactions = &protobufs.TokenRequests{}
+			e.stagedTransactionsSet = make(map[string]struct{})
 		}
 
-		found := false
-		for _, ti := range e.stagedTransactions.Requests {
-			switch t := ti.Request.(type) {
-			case *protobufs.TokenRequest_Transfer:
-				switch r := transition.Request.(type) {
-				case *protobufs.TokenRequest_Transfer:
-					if bytes.Equal(r.Transfer.OfCoin.Address, t.Transfer.OfCoin.Address) {
-						found = true
-					}
-				}
-			case *protobufs.TokenRequest_Split:
-				switch r := transition.Request.(type) {
-				case *protobufs.TokenRequest_Split:
-					if bytes.Equal(r.Split.OfCoin.Address, r.Split.OfCoin.Address) {
-						found = true
-					}
-				}
-			case *protobufs.TokenRequest_Merge:
-				switch r := transition.Request.(type) {
-				case *protobufs.TokenRequest_Merge:
-				checkmerge:
-					for i := range t.Merge.Coins {
-						for j := range r.Merge.Coins {
-							if bytes.Equal(t.Merge.Coins[i].Address, r.Merge.Coins[j].Address) {
-								found = true
-								break checkmerge
-							}
-						}
-					}
-				}
-			case *protobufs.TokenRequest_Mint:
-				switch r := transition.Request.(type) {
-				case *protobufs.TokenRequest_Mint:
-				checkmint:
-					for i := range t.Mint.Proofs {
-						if len(r.Mint.Proofs) < 2 {
-							for j := range r.Mint.Proofs {
-								if bytes.Equal(t.Mint.Proofs[i], r.Mint.Proofs[j]) {
-									found = true
-									break checkmint
-								}
-							}
-						}
-					}
-				}
-			case *protobufs.TokenRequest_Announce:
-				switch r := transition.Request.(type) {
-				case *protobufs.TokenRequest_Announce:
-				checkannounce:
-					for i := range t.Announce.GetPublicKeySignaturesEd448() {
-						for j := range r.Announce.GetPublicKeySignaturesEd448() {
-							if bytes.Equal(
-								t.Announce.GetPublicKeySignaturesEd448()[i].PublicKey.KeyValue,
-								r.Announce.GetPublicKeySignaturesEd448()[j].PublicKey.KeyValue,
-							) {
-								found = true
-								break checkannounce
-							}
-						}
-					}
-				}
-			case *protobufs.TokenRequest_Join:
-				switch r := transition.Request.(type) {
-				case *protobufs.TokenRequest_Join:
-					if bytes.Equal(
-						t.Join.GetPublicKeySignatureEd448().PublicKey.KeyValue,
-						r.Join.GetPublicKeySignatureEd448().PublicKey.KeyValue,
-					) {
-						found = true
-					}
-				}
-			case *protobufs.TokenRequest_Leave:
-				switch r := transition.Request.(type) {
-				case *protobufs.TokenRequest_Leave:
-					if bytes.Equal(
-						t.Leave.GetPublicKeySignatureEd448().PublicKey.KeyValue,
-						r.Leave.GetPublicKeySignatureEd448().PublicKey.KeyValue,
-					) {
-						found = true
-					}
-				}
-			case *protobufs.TokenRequest_Pause:
-				switch r := transition.Request.(type) {
-				case *protobufs.TokenRequest_Pause:
-					if bytes.Equal(
-						t.Pause.GetPublicKeySignatureEd448().PublicKey.KeyValue,
-						r.Pause.GetPublicKeySignatureEd448().PublicKey.KeyValue,
-					) {
-						found = true
-					}
-				}
-			case *protobufs.TokenRequest_Resume:
-				switch r := transition.Request.(type) {
-				case *protobufs.TokenRequest_Resume:
-					if bytes.Equal(
-						t.Resume.GetPublicKeySignatureEd448().PublicKey.KeyValue,
-						r.Resume.GetPublicKeySignatureEd448().PublicKey.KeyValue,
-					) {
-						found = true
-					}
-				}
+		var found bool
+		for _, identifier := range identifiers {
+			if _, ok := e.stagedTransactionsSet[identifier]; ok {
+				found = true
+				break
 			}
 		}
 
@@ -467,6 +413,9 @@ func (e *DataClockConsensusEngine) handleTokenRequest(
 				e.stagedTransactions.Requests,
 				transition,
 			)
+			for _, identifier := range identifiers {
+				e.stagedTransactionsSet[identifier] = struct{}{}
+			}
 		}
 		e.stagedTransactionsMx.Unlock()
 	}

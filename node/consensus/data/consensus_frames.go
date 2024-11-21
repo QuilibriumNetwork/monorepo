@@ -84,6 +84,7 @@ func (e *DataClockConsensusEngine) prove(
 
 	if e.stagedTransactions == nil {
 		e.stagedTransactions = &protobufs.TokenRequests{}
+		e.stagedTransactionsSet = make(map[string]struct{})
 	}
 
 	e.logger.Info(
@@ -100,6 +101,7 @@ func (e *DataClockConsensusEngine) prove(
 	)
 	if err != nil {
 		e.stagedTransactions = &protobufs.TokenRequests{}
+		e.stagedTransactionsSet = make(map[string]struct{})
 		e.stagedTransactionsMx.Unlock()
 		return nil, errors.Wrap(err, "prove")
 	}
@@ -110,6 +112,7 @@ func (e *DataClockConsensusEngine) prove(
 		zap.Int("failed", len(invalidTransactions.Requests)),
 	)
 	e.stagedTransactions = &protobufs.TokenRequests{}
+	e.stagedTransactionsSet = make(map[string]struct{})
 	e.stagedTransactionsMx.Unlock()
 
 	outputState, err := app.MaterializeStateFromApplication()
