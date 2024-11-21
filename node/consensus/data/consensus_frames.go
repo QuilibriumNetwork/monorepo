@@ -61,7 +61,6 @@ func (e *DataClockConsensusEngine) prove(
 	if e.lastProven >= previousFrame.FrameNumber && e.lastProven != 0 {
 		return previousFrame, nil
 	}
-	e.stagedTransactionsMx.Lock()
 	executionOutput := &protobufs.IntrinsicExecutionOutput{}
 	_, tries, err := e.clockStore.GetDataClockFrame(
 		e.filter,
@@ -78,31 +77,33 @@ func (e *DataClockConsensusEngine) prove(
 		e.logger,
 	)
 	if err != nil {
-		e.stagedTransactionsMx.Unlock()
 		return nil, errors.Wrap(err, "prove")
 	}
 
-	if e.stagedTransactions == nil {
-		e.stagedTransactions = &protobufs.TokenRequests{}
-		e.stagedTransactionsSet = make(map[string]struct{})
+	e.stagedTransactionsMx.Lock()
+	stagedTransactions := e.stagedTransactions
+	if stagedTransactions == nil {
+		stagedTransactions = &protobufs.TokenRequests{}
 	}
+	e.stagedTransactions = &protobufs.TokenRequests{
+		Requests: make([]*protobufs.TokenRequest, 0, len(stagedTransactions.Requests)),
+	}
+	e.stagedTransactionsSet = make(map[string]struct{}, len(e.stagedTransactionsSet))
+	e.stagedTransactionsMx.Unlock()
 
 	e.logger.Info(
 		"proving new frame",
-		zap.Int("transactions", len(e.stagedTransactions.Requests)),
+		zap.Int("transactions", len(stagedTransactions.Requests)),
 	)
 
 	var validTransactions *protobufs.TokenRequests
 	var invalidTransactions *protobufs.TokenRequests
 	app, validTransactions, invalidTransactions, err = app.ApplyTransitions(
 		previousFrame.FrameNumber+1,
-		e.stagedTransactions,
+		stagedTransactions,
 		true,
 	)
 	if err != nil {
-		e.stagedTransactions = &protobufs.TokenRequests{}
-		e.stagedTransactionsSet = make(map[string]struct{})
-		e.stagedTransactionsMx.Unlock()
 		return nil, errors.Wrap(err, "prove")
 	}
 
@@ -111,9 +112,6 @@ func (e *DataClockConsensusEngine) prove(
 		zap.Int("successful", len(validTransactions.Requests)),
 		zap.Int("failed", len(invalidTransactions.Requests)),
 	)
-	e.stagedTransactions = &protobufs.TokenRequests{}
-	e.stagedTransactionsSet = make(map[string]struct{})
-	e.stagedTransactionsMx.Unlock()
 
 	outputState, err := app.MaterializeStateFromApplication()
 	if err != nil {
