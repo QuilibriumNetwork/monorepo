@@ -257,9 +257,9 @@ func NewDataClockConsensusEngine(
 		masterTimeReel:            masterTimeReel,
 		dataTimeReel:              dataTimeReel,
 		peerInfoManager:           peerInfoManager,
-		frameMessageProcessorCh:   make(chan *pb.Message),
-		txMessageProcessorCh:      make(chan *pb.Message),
-		infoMessageProcessorCh:    make(chan *pb.Message),
+		frameMessageProcessorCh:   make(chan *pb.Message, 65536),
+		txMessageProcessorCh:      make(chan *pb.Message, 65536),
+		infoMessageProcessorCh:    make(chan *pb.Message, 65536),
 		config:                    cfg,
 		preMidnightMint:           map[string]struct{}{},
 		grpcRateLimiter: NewRateLimiter(

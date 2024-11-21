@@ -129,7 +129,7 @@ func NewDataTimeReel(
 		lruFrames:             cache,
 		// pending:               make(map[uint64][]*pendingFrame),
 		incompleteForks: make(map[uint64][]*pendingFrame),
-		frames:          make(chan *pendingFrame),
+		frames:          make(chan *pendingFrame, 65536),
 		newFrameCh:      make(chan *protobufs.ClockFrame),
 		badFrameCh:      make(chan *protobufs.ClockFrame),
 		done:            make(chan bool),
