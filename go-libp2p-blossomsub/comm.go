@@ -77,6 +77,7 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 			return
 		}
 		if len(msgbytes) == 0 {
+			r.ReleaseMsg(msgbytes)
 			continue
 		}
 
@@ -186,18 +187,18 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 				s.Reset()
 				log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
 				s.Close()
+				pool.Put(buf)
 				return
 			}
 
 			_, err = s.Write(buf)
+			pool.Put(buf)
 			if err != nil {
 				s.Reset()
 				log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
 				s.Close()
 				return
 			}
-
-			pool.Put(buf)
 		case <-ctx.Done():
 			s.Close()
 			return
