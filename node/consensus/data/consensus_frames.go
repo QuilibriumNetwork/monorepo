@@ -364,7 +364,7 @@ func (e *DataClockConsensusEngine) sync(
 		); err != nil {
 			return nil, errors.Wrap(err, "sync")
 		}
-		e.dataTimeReel.Insert(response.ClockFrame, true)
+		e.dataTimeReel.Insert(e.ctx, response.ClockFrame, true)
 		latest = response.ClockFrame
 		if latest.FrameNumber >= maxFrame {
 			return latest, nil

@@ -2,6 +2,7 @@ package time
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"math/big"
 	"os"
@@ -32,7 +33,9 @@ type pendingFrame struct {
 
 type DataTimeReel struct {
 	rwMutex sync.RWMutex
-	running bool
+
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	filter       []byte
 	engineConfig *config.EngineConfig
@@ -61,7 +64,6 @@ type DataTimeReel struct {
 	frames          chan *pendingFrame
 	newFrameCh      chan *protobufs.ClockFrame
 	badFrameCh      chan *protobufs.ClockFrame
-	done            chan bool
 	alwaysSend      bool
 	restore         func() []*tries.RollingFrecencyCritbitTrie
 }
@@ -115,8 +117,10 @@ func NewDataTimeReel(
 		panic(err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &DataTimeReel{
-		running:               false,
+		ctx:                   ctx,
+		cancel:                cancel,
 		logger:                logger,
 		filter:                filter,
 		engineConfig:          engineConfig,
@@ -132,7 +136,6 @@ func NewDataTimeReel(
 		frames:          make(chan *pendingFrame, 65536),
 		newFrameCh:      make(chan *protobufs.ClockFrame),
 		badFrameCh:      make(chan *protobufs.ClockFrame),
-		done:            make(chan bool),
 		alwaysSend:      alwaysSend,
 		restore:         restore,
 	}
@@ -172,17 +175,12 @@ func (d *DataTimeReel) Start() error {
 		d.headDistance, err = d.GetDistance(frame)
 	}
 
-	d.running = true
 	go d.runLoop()
 
 	return nil
 }
 
 func (d *DataTimeReel) SetHead(frame *protobufs.ClockFrame) {
-	if d.running == true {
-		panic("internal test function should never be called outside of tests")
-	}
-
 	d.head = frame
 }
 
@@ -193,9 +191,9 @@ func (d *DataTimeReel) Head() (*protobufs.ClockFrame, error) {
 // Insert enqueues a structurally valid frame into the time reel. If the frame
 // is the next one in sequence, it advances the reel head forward and emits a
 // new frame on the new frame channel.
-func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame, isSync bool) error {
-	if !d.running {
-		return nil
+func (d *DataTimeReel) Insert(ctx context.Context, frame *protobufs.ClockFrame, isSync bool) error {
+	if err := d.ctx.Err(); err != nil {
+		return err
 	}
 
 	d.logger.Debug(
@@ -222,13 +220,17 @@ func (d *DataTimeReel) Insert(frame *protobufs.ClockFrame, isSync bool) error {
 		d.storePending(selector, parent, distance, frame)
 
 		if d.head.FrameNumber+1 == frame.FrameNumber {
-			go func() {
-				d.frames <- &pendingFrame{
-					selector:       selector,
-					parentSelector: parent,
-					frameNumber:    frame.FrameNumber,
-				}
-			}()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-d.ctx.Done():
+				return d.ctx.Err()
+			case d.frames <- &pendingFrame{
+				selector:       selector,
+				parentSelector: parent,
+				frameNumber:    frame.FrameNumber,
+			}:
+			}
 		}
 	}
 
@@ -250,7 +252,7 @@ func (d *DataTimeReel) BadFrameCh() <-chan *protobufs.ClockFrame {
 }
 
 func (d *DataTimeReel) Stop() {
-	d.done <- true
+	d.cancel()
 }
 
 func (d *DataTimeReel) createGenesisFrame() (
@@ -336,8 +338,10 @@ func (d *DataTimeReel) createGenesisFrame() (
 
 // Main data consensus loop
 func (d *DataTimeReel) runLoop() {
-	for d.running {
+	for {
 		select {
+		case <-d.ctx.Done():
+			return
 		case frame := <-d.frames:
 			rawFrame, err := d.clockStore.GetStagedDataClockFrame(
 				d.filter,
@@ -459,9 +463,6 @@ func (d *DataTimeReel) runLoop() {
 				// 	}
 				// }
 			}
-		case <-d.done:
-			d.running = false
-			return
 		}
 	}
 }
@@ -563,8 +564,7 @@ func (d *DataTimeReel) processPending(
 
 	for {
 		select {
-		case <-d.done:
-			d.running = false
+		case <-d.ctx.Done():
 			return
 		default:
 		}
@@ -686,14 +686,19 @@ func (d *DataTimeReel) setHead(frame *protobufs.ClockFrame, distance *big.Int) e
 
 	d.headDistance = distance
 	if d.alwaysSend {
-		d.newFrameCh <- frame
-	}
-	go func() {
 		select {
+		case <-d.ctx.Done():
+			return d.ctx.Err()
+		case d.newFrameCh <- frame:
+		}
+	} else {
+		select {
+		case <-d.ctx.Done():
+			return d.ctx.Err()
 		case d.newFrameCh <- frame:
 		default:
 		}
-	}()
+	}
 	return nil
 }
 
@@ -992,12 +997,11 @@ func (d *DataTimeReel) forkChoice(
 		d.totalDistance,
 	)
 
-	go func() {
-		select {
-		case d.newFrameCh <- frame:
-		default:
-		}
-	}()
+	select {
+	case <-d.ctx.Done():
+	case d.newFrameCh <- frame:
+	default:
+	}
 }
 
 func (d *DataTimeReel) GetTotalDistance() *big.Int {

@@ -17,30 +17,39 @@ import (
 func (e *DataClockConsensusEngine) handleFrameMessage(
 	message *pb.Message,
 ) error {
-	go func() {
-		e.frameMessageProcessorCh <- message
-	}()
-
+	select {
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	case e.frameMessageProcessorCh <- message:
+	default:
+		e.logger.Warn("dropping frame message")
+	}
 	return nil
 }
 
 func (e *DataClockConsensusEngine) handleTxMessage(
 	message *pb.Message,
 ) error {
-	go func() {
-		e.txMessageProcessorCh <- message
-	}()
-
+	select {
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	case e.txMessageProcessorCh <- message:
+	default:
+		e.logger.Warn("dropping tx message")
+	}
 	return nil
 }
 
 func (e *DataClockConsensusEngine) handleInfoMessage(
 	message *pb.Message,
 ) error {
-	go func() {
-		e.infoMessageProcessorCh <- message
-	}()
-
+	select {
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	case e.infoMessageProcessorCh <- message:
+	default:
+		e.logger.Warn("dropping info message")
+	}
 	return nil
 }
 
@@ -130,9 +139,13 @@ func (e *DataClockConsensusEngine) insertTxMessage(
 		Seqno:   nil,
 	}
 
-	go func() {
-		e.txMessageProcessorCh <- m
-	}()
+	select {
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	case e.txMessageProcessorCh <- m:
+	default:
+		e.logger.Warn("dropping tx message")
+	}
 
 	return nil
 }

@@ -2,6 +2,7 @@ package master
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"strings"
 	"time"
@@ -154,7 +155,7 @@ func (e *MasterClockConsensusEngine) publishProof(
 			zap.Uint64("frame_number", frame.FrameNumber),
 		)
 
-		e.masterTimeReel.Insert(frame, false)
+		e.masterTimeReel.Insert(context.TODO(), frame, false)
 	}
 
 	e.state = consensus.EngineStateCollecting

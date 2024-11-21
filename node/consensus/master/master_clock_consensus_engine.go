@@ -2,6 +2,7 @@ package master
 
 import (
 	"bytes"
+	"context"
 	gcrypto "crypto"
 	"encoding/hex"
 	"math/big"
@@ -207,7 +208,7 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 					continue
 				}
 
-				e.masterTimeReel.Insert(newFrame, false)
+				e.masterTimeReel.Insert(context.TODO(), newFrame, false)
 			}
 		}
 	}()

@@ -205,7 +205,7 @@ func (e *DataClockConsensusEngine) processFrame(
 			return dataFrame
 		}
 
-		e.dataTimeReel.Insert(nextFrame, true)
+		e.dataTimeReel.Insert(e.ctx, nextFrame, true)
 
 		return nextFrame
 	} else {

@@ -1,6 +1,7 @@
 package time
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"math/big"
@@ -120,6 +121,7 @@ func (m *MasterTimeReel) Head() (*protobufs.ClockFrame, error) {
 // is the next one in sequence, it advances the reel head forward and emits a
 // new frame on the new frame channel.
 func (m *MasterTimeReel) Insert(
+	ctx context.Context,
 	frame *protobufs.ClockFrame,
 	isSync bool,
 ) error {

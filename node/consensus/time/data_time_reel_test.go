@@ -2,6 +2,7 @@ package time_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -108,6 +109,7 @@ func generateTestProvers() (
 }
 
 func TestDataTimeReel(t *testing.T) {
+	ctx := context.Background()
 	logger, _ := zap.NewDevelopment()
 	db := store.NewInMemKVDB()
 	clockStore := store.NewPebbleClockStore(db, logger)
@@ -231,7 +233,7 @@ func TestDataTimeReel(t *testing.T) {
 			i+1,
 			10,
 		)
-		d.Insert(frame, false)
+		d.Insert(ctx, frame, false)
 		prevBI, _ := frame.GetSelector()
 		prev = prevBI.FillBytes(make([]byte, 32))
 	}
@@ -262,7 +264,7 @@ func TestDataTimeReel(t *testing.T) {
 	}
 
 	for i := 99; i >= 0; i-- {
-		err := d.Insert(insertFrames[i], false)
+		err := d.Insert(ctx, insertFrames[i], false)
 		assert.NoError(t, err)
 	}
 
@@ -284,7 +286,7 @@ func TestDataTimeReel(t *testing.T) {
 			i+1,
 			10,
 		)
-		d.Insert(frame, false)
+		d.Insert(ctx, frame, false)
 
 		prevBI, _ := frame.GetSelector()
 		prev = prevBI.FillBytes(make([]byte, 32))
@@ -332,7 +334,7 @@ func TestDataTimeReel(t *testing.T) {
 	}
 
 	for i := 99; i >= 0; i-- {
-		err := d.Insert(insertFrames[i], false)
+		err := d.Insert(ctx, insertFrames[i], false)
 		assert.NoError(t, err)
 	}
 
@@ -395,7 +397,7 @@ func TestDataTimeReel(t *testing.T) {
 
 	// Someone is honest, but running backwards:
 	for i := 99; i >= 0; i-- {
-		err := d.Insert(insertFrames[i], false)
+		err := d.Insert(ctx, insertFrames[i], false)
 		gotime.Sleep(1 * gotime.Second)
 		assert.NoError(t, err)
 	}

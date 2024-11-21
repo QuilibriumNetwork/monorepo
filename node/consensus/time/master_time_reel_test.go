@@ -1,6 +1,7 @@
 package time_test
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 )
 
 func TestMasterTimeReel(t *testing.T) {
+	ctx := context.Background()
 	logger, _ := zap.NewProduction()
 	db := store.NewInMemKVDB()
 	clockStore := store.NewPebbleClockStore(db, logger)
@@ -59,7 +61,7 @@ func TestMasterTimeReel(t *testing.T) {
 		)
 		assert.NoError(t, err)
 
-		err := m.Insert(frame, false)
+		err := m.Insert(ctx, frame, false)
 		assert.NoError(t, err)
 	}
 
@@ -79,7 +81,7 @@ func TestMasterTimeReel(t *testing.T) {
 	}
 
 	for i := 99; i >= 0; i-- {
-		err := m.Insert(insertFrames[i], false)
+		err := m.Insert(ctx, insertFrames[i], false)
 		assert.NoError(t, err)
 	}
 
