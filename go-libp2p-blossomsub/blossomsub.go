@@ -58,7 +58,10 @@ var (
 	BlossomSubGraftFloodThreshold              = 10 * time.Second
 	BlossomSubMaxIHaveLength                   = 5000
 	BlossomSubMaxIHaveMessages                 = 10
+	BlossomSubMaxIDontWantMessages             = 1000
 	BlossomSubIWantFollowupTime                = 3 * time.Second
+	BlossomSubIDontWantMessageThreshold        = 1024 // 1KB
+	BlossomSubIDontWantMessageTTL              = 3    // 3 heartbeats
 )
 
 // BlossomSubParams defines all the BlossomSub specific parameters.
@@ -197,10 +200,21 @@ type BlossomSubParams struct {
 	// MaxIHaveMessages is the maximum number of IHAVE messages to accept from a peer within a heartbeat.
 	MaxIHaveMessages int
 
+	// MaxIDontWantMessages is the maximum number of IDONTWANT messages to accept from a peer within a heartbeat.
+	MaxIDontWantMessages int
+
 	// Time to wait for a message requested through IWANT following an IHAVE advertisement.
 	// If the message is not received within this window, a broken promise is declared and
 	// the router may apply bahavioural penalties.
 	IWantFollowupTime time.Duration
+
+	// IDONTWANT is only sent for messages larger than the threshold. This should be greater than
+	// D_high * the size of the message id. Otherwise, the attacker can do the amplication attack by sending
+	// small messages while the receiver replies back with larger IDONTWANT messages.
+	IDontWantMessageThreshold int
+
+	// IDONTWANT is cleared when it's older than the TTL.
+	IDontWantMessageTTL int
 }
 
 // NewBlossomSub returns a new PubSub object using the default BlossomSubRouter as the router.
@@ -312,7 +326,10 @@ func DefaultBlossomSubParams() BlossomSubParams {
 		GraftFloodThreshold:       BlossomSubGraftFloodThreshold,
 		MaxIHaveLength:            BlossomSubMaxIHaveLength,
 		MaxIHaveMessages:          BlossomSubMaxIHaveMessages,
+		MaxIDontWantMessages:      BlossomSubMaxIDontWantMessages,
 		IWantFollowupTime:         BlossomSubIWantFollowupTime,
+		IDontWantMessageThreshold: BlossomSubIDontWantMessageThreshold,
+		IDontWantMessageTTL:       BlossomSubIDontWantMessageTTL,
 		SlowHeartbeatWarning:      0.1,
 	}
 }

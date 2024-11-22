@@ -30,7 +30,10 @@ type P2PConfig struct {
 	GraftFloodThreshold       time.Duration `yaml:"graftFloodThreshold"`
 	MaxIHaveLength            int           `yaml:"maxIHaveLength"`
 	MaxIHaveMessages          int           `yaml:"maxIHaveMessages"`
+	MaxIDontWantMessages      int           `yaml:"maxIDontWantMessages"`
 	IWantFollowupTime         time.Duration `yaml:"iWantFollowupTime"`
+	IDontWantMessageThreshold int           `yaml:"iDontWantMessageThreshold"`
+	IDontWantMessageTTL       int           `yaml:"iDontWantMessageTTL"`
 	BootstrapPeers            []string      `yaml:"bootstrapPeers"`
 	ListenMultiaddr           string        `yaml:"listenMultiaddr"`
 	PeerPrivKey               string        `yaml:"peerPrivKey"`

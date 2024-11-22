@@ -1033,8 +1033,17 @@ func withDefaults(p2pConfig *config.P2PConfig) *config.P2PConfig {
 	if p2pConfig.MaxIHaveMessages == 0 {
 		p2pConfig.MaxIHaveMessages = blossomsub.BlossomSubMaxIHaveMessages
 	}
+	if p2pConfig.MaxIDontWantMessages == 0 {
+		p2pConfig.MaxIDontWantMessages = blossomsub.BlossomSubMaxIDontWantMessages
+	}
 	if p2pConfig.IWantFollowupTime == 0 {
 		p2pConfig.IWantFollowupTime = blossomsub.BlossomSubIWantFollowupTime
+	}
+	if p2pConfig.IDontWantMessageThreshold == 0 {
+		p2pConfig.IDontWantMessageThreshold = blossomsub.BlossomSubIDontWantMessageThreshold
+	}
+	if p2pConfig.IDontWantMessageTTL == 0 {
+		p2pConfig.IDontWantMessageTTL = blossomsub.BlossomSubIDontWantMessageTTL
 	}
 	if p2pConfig.LowWatermarkConnections == 0 {
 		p2pConfig.LowWatermarkConnections = defaultLowWatermarkConnections
@@ -1099,7 +1108,10 @@ func toBlossomSubParams(p2pConfig *config.P2PConfig) blossomsub.BlossomSubParams
 		GraftFloodThreshold:       p2pConfig.GraftFloodThreshold,
 		MaxIHaveLength:            p2pConfig.MaxIHaveLength,
 		MaxIHaveMessages:          p2pConfig.MaxIHaveMessages,
+		MaxIDontWantMessages:      p2pConfig.MaxIDontWantMessages,
 		IWantFollowupTime:         p2pConfig.IWantFollowupTime,
+		IDontWantMessageThreshold: p2pConfig.IDontWantMessageThreshold,
+		IDontWantMessageTTL:       p2pConfig.IDontWantMessageTTL,
 		SlowHeartbeatWarning:      0.1,
 	}
 }
