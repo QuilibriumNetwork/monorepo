@@ -18,18 +18,22 @@ const (
 	BlossomSubFeatureMesh = iota
 	// Protocol supports Peer eXchange on prune -- BlossomSub-v2 compatible
 	BlossomSubFeaturePX
+	// Protocol supports IDONTWANT -- BlossomSub-v2.1 compatible
+	BlossomSubFeatureIdontwant
 )
 
 // BlossomSubDefaultProtocols is the default BlossomSub router protocol list
-var BlossomSubDefaultProtocols = []protocol.ID{BlossomSubID_v2}
+var BlossomSubDefaultProtocols = []protocol.ID{BlossomSubID_v21, BlossomSubID_v2}
 
 // BlossomSubDefaultFeatures is the feature test function for the default BlossomSub protocols
 func BlossomSubDefaultFeatures(feat BlossomSubFeature, proto protocol.ID) bool {
 	switch feat {
 	case BlossomSubFeatureMesh:
-		return proto == BlossomSubID_v2
+		return proto == BlossomSubID_v21 || proto == BlossomSubID_v2
 	case BlossomSubFeaturePX:
-		return proto == BlossomSubID_v2
+		return proto == BlossomSubID_v21 || proto == BlossomSubID_v2
+	case BlossomSubFeatureIdontwant:
+		return proto == BlossomSubID_v21
 	default:
 		return false
 	}

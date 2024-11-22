@@ -25,6 +25,9 @@ import (
 const (
 	// BlossomSubID_v2 is the protocol ID for version 2.0.0 of the BlossomSub protocol.
 	BlossomSubID_v2 = protocol.ID("/blossomsub/2.0.0")
+
+	// BlossomSubID_v21 is the protocol ID for version 2.1.0 of the BlossomSub protocol.
+	BlossomSubID_v21 = protocol.ID("/blossomsub/2.1.0")
 )
 
 // Defines the default BlossomSub parameters.
@@ -214,10 +217,24 @@ func NewBlossomSubWithRouter(ctx context.Context, h host.Host, rt PubSubRouter, 
 
 // NewBlossomSubRouter returns a new BlossomSubRouter with custom parameters.
 func NewBlossomSubRouter(h host.Host, params BlossomSubParams, network uint8) *BlossomSubRouter {
+	protos, feature := BlossomSubDefaultProtocols, BlossomSubDefaultFeatures
 	if network != 0 {
-		BlossomSubDefaultProtocols[0] = protocol.ID(
-			string(BlossomSubID_v2) + fmt.Sprintf("-network-%d", network),
-		)
+		protos = append(protos[:0:0], BlossomSubDefaultProtocols...)
+		for i, p := range protos {
+			protos[i] = protocol.ID(fmt.Sprintf("%s-network-%d", p, network))
+		}
+		feature = func(f BlossomSubFeature, proto protocol.ID) bool {
+			switch f {
+			case BlossomSubFeatureMesh:
+				return proto == protos[0] || proto == protos[1]
+			case BlossomSubFeaturePX:
+				return proto == protos[0] || proto == protos[1]
+			case BlossomSubFeatureIdontwant:
+				return proto == protos[0]
+			default:
+				return false
+			}
+		}
 	}
 
 	return &BlossomSubRouter{
@@ -234,8 +251,8 @@ func NewBlossomSubRouter(h host.Host, params BlossomSubParams, network uint8) *B
 		outbound:  make(map[peer.ID]bool),
 		connect:   make(chan connectInfo, params.MaxPendingConnections),
 		mcache:    NewMessageCache(params.HistoryGossip, params.HistoryLength),
-		protos:    BlossomSubDefaultProtocols,
-		feature:   BlossomSubDefaultFeatures,
+		protos:    protos,
+		feature:   feature,
 		tagTracer: newTagTracer(h.ConnManager()),
 		params:    params,
 		network:   network,

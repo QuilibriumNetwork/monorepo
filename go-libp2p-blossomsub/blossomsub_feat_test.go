@@ -15,9 +15,22 @@ func TestDefaultBlossomSubFeatures(t *testing.T) {
 	if !BlossomSubDefaultFeatures(BlossomSubFeatureMesh, BlossomSubID_v2) {
 		t.Fatal("BlossomSub-v2.0 should support Mesh")
 	}
+	if !BlossomSubDefaultFeatures(BlossomSubFeatureMesh, BlossomSubID_v21) {
+		t.Fatal("BlossomSub-v2.1 should support Mesh")
+	}
 
 	if !BlossomSubDefaultFeatures(BlossomSubFeaturePX, BlossomSubID_v2) {
 		t.Fatal("BlossomSub-v2.0 should support PX")
+	}
+	if !BlossomSubDefaultFeatures(BlossomSubFeaturePX, BlossomSubID_v21) {
+		t.Fatal("BlossomSub-v2.0 should support PX")
+	}
+
+	if BlossomSubDefaultFeatures(BlossomSubFeatureIdontwant, BlossomSubID_v2) {
+		t.Fatal("BlossomSub-v2.0 should not support IDONTWANT")
+	}
+	if !BlossomSubDefaultFeatures(BlossomSubFeatureIdontwant, BlossomSubID_v21) {
+		t.Fatal("BlossomSub-v2.1 should support IDONTWANT")
 	}
 }
 
