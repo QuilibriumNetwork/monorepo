@@ -7,6 +7,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/prometheus/client_golang/prometheus"
 	blossomsub "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub"
+	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 )
 
 const blossomSubNamespace = "blossomsub"
@@ -29,6 +30,19 @@ type blossomSubRawTracer struct {
 	sendRPCTotal              prometheus.Counter
 	dropRPCTotal              prometheus.Counter
 	undeliverableMessageTotal *prometheus.CounterVec
+	iHaveMessageHistogram     *prometheus.HistogramVec
+	iWantMessageHistogram     *prometheus.HistogramVec
+}
+
+func (b *blossomSubRawTracer) observeControl(control *pb.ControlMessage, direction string) {
+	labels := []string{direction}
+	for _, iHave := range control.GetIhave() {
+		labels := append(labels, binaryEncoding.EncodeToString(iHave.GetBitmask()))
+		b.iHaveMessageHistogram.WithLabelValues(labels...).Observe(float64(len(iHave.GetMessageIDs())))
+	}
+	for _, iWant := range control.GetIwant() {
+		b.iWantMessageHistogram.WithLabelValues(labels...).Observe(float64(len(iWant.GetMessageIDs())))
+	}
 }
 
 var _ blossomsub.RawTracer = (*blossomSubRawTracer)(nil)
@@ -91,16 +105,19 @@ func (b *blossomSubRawTracer) ThrottlePeer(p peer.ID) {
 // RecvRPC implements blossomsub.RawTracer.
 func (b *blossomSubRawTracer) RecvRPC(rpc *blossomsub.RPC) {
 	b.recvRPCTotal.Inc()
+	b.observeControl(rpc.GetControl(), "recv")
 }
 
 // SendRPC implements blossomsub.RawTracer.
 func (b *blossomSubRawTracer) SendRPC(rpc *blossomsub.RPC, p peer.ID) {
 	b.sendRPCTotal.Inc()
+	b.observeControl(rpc.GetControl(), "send")
 }
 
 // DropRPC implements blossomsub.RawTracer.
 func (b *blossomSubRawTracer) DropRPC(rpc *blossomsub.RPC, p peer.ID) {
 	b.dropRPCTotal.Inc()
+	b.observeControl(rpc.GetControl(), "drop")
 }
 
 // UndeliverableMessage implements blossomsub.RawTracer.
@@ -127,6 +144,8 @@ func (b *blossomSubRawTracer) Describe(ch chan<- *prometheus.Desc) {
 	b.sendRPCTotal.Describe(ch)
 	b.dropRPCTotal.Describe(ch)
 	b.undeliverableMessageTotal.Describe(ch)
+	b.iHaveMessageHistogram.Describe(ch)
+	b.iWantMessageHistogram.Describe(ch)
 }
 
 // Collect implements prometheus.Collector.
@@ -146,6 +165,8 @@ func (b *blossomSubRawTracer) Collect(ch chan<- prometheus.Metric) {
 	b.sendRPCTotal.Collect(ch)
 	b.dropRPCTotal.Collect(ch)
 	b.undeliverableMessageTotal.Collect(ch)
+	b.iHaveMessageHistogram.Collect(ch)
+	b.iWantMessageHistogram.Collect(ch)
 }
 
 type BlossomSubRawTracer interface {
@@ -269,6 +290,24 @@ func NewBlossomSubRawTracer() BlossomSubRawTracer {
 				Help:      "Total number of messages undeliverable.",
 			},
 			[]string{"bitmask"},
+		),
+		iHaveMessageHistogram: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Namespace: blossomSubNamespace,
+				Name:      "ihave_messages",
+				Help:      "Histogram of the number of messages in an IHave message.",
+				Buckets:   prometheus.ExponentialBuckets(1, 2, 14),
+			},
+			[]string{"direction", "bitmask"},
+		),
+		iWantMessageHistogram: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Namespace: blossomSubNamespace,
+				Name:      "iwant_messages",
+				Help:      "Histogram of the number of messages in an IWant message.",
+				Buckets:   prometheus.ExponentialBuckets(1, 2, 14),
+			},
+			[]string{"direction"},
 		),
 	}
 	return b

@@ -597,6 +597,919 @@
         "x": 0,
         "y": 19
       },
+      "id": 12,
+      "panels": [],
+      "title": "Gossip",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "default": false,
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The number of message IDs provided in IWANT control messages sent to remote peers.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Name",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, rate(blossomsub_iwant_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"send\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "P99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, rate(blossomsub_iwant_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"send\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "P95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, rate(blossomsub_iwant_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"send\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "P50",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Sent IWANT message count histogram",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": false,
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The number of message IDs in IHAVE control messages which have been successfully sent to a remote peer.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "id": 14,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Name",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(bitmask, le) (rate(blossomsub_ihave_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"send\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "{{bitmask}} - P95",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Sent IHAVE message count histogram",
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frames Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frames Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQA(.*)",
+            "renamePattern": "Data Frames Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Token Requests Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Token Requests Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Token Requests Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Peer Announcements Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Peer Announcements Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAA(.*)",
+            "renamePattern": "Data Peer Announcements Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Master Frames$1"
+          }
+        }
+      ],
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": false,
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The number of message IDs provided in IWANT control messages received from remote peers.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Name",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, rate(blossomsub_iwant_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"recv\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "P99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, rate(blossomsub_iwant_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"recv\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "P95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, rate(blossomsub_iwant_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"recv\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "P50",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Received IWANT message count histogram",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": false,
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The number of message IDs in IHAVE control messages which have received from a remote peer.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Name",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(bitmask, le) (rate(blossomsub_ihave_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"recv\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "{{bitmask}} - P95",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Received IHAVE message count histogram",
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frames Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frames Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQA(.*)",
+            "renamePattern": "Data Frames Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Token Requests Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Token Requests Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Token Requests Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Peer Announcements Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Peer Announcements Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAA(.*)",
+            "renamePattern": "Data Peer Announcements Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Master Frames$1"
+          }
+        }
+      ],
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": false,
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The number of message IDs provided in IWANT control messages which have not been sent to a remote peer due to an error (usually a full queue).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Name",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, rate(blossomsub_iwant_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"drop\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "P99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, rate(blossomsub_iwant_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"drop\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "P95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, rate(blossomsub_iwant_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"drop\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "P50",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Dropped IWANT message count histogram",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": false,
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The number of message IDs in IHAVE control messages which have not been sent to a remote peer due to an error (usually a full queue).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Name",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(bitmask, le) (rate(blossomsub_ihave_messages_bucket{job=~\"$job\", instance=~\"$host\", direction=\"drop\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "{{bitmask}} - P95",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Dropped IHAVE message count histogram",
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frames Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frames Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQA(.*)",
+            "renamePattern": "Data Frames Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Token Requests Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Token Requests Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Token Requests Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Peer Announcements Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Peer Announcements Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAA(.*)",
+            "renamePattern": "Data Peer Announcements Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Master Frames$1"
+          }
+        }
+      ],
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
       "id": 8,
       "panels": [],
       "title": "Meshes",
@@ -663,7 +1576,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 20
+        "y": 48
       },
       "id": 11,
       "options": {
@@ -836,7 +1749,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 29
+        "y": 57
       },
       "id": 9,
       "options": {
@@ -1009,7 +1922,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 29
+        "y": 57
       },
       "id": 10,
       "options": {
@@ -1126,7 +2039,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 38
+        "y": 66
       },
       "id": 6,
       "panels": [],
@@ -1195,7 +2108,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 67
       },
       "id": 7,
       "options": {
@@ -1338,6 +2251,6 @@
   "timezone": "browser",
   "title": "BlossomSub",
   "uid": "ee47pcfax962ob",
-  "version": 29,
+  "version": 39,
   "weekStart": ""
 }
