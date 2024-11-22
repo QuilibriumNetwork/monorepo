@@ -58,6 +58,8 @@ func (e *DataClockConsensusEngine) runFramePruning() {
 		return
 	}
 
+	e.logger.Info("frame pruning enabled, waiting for delay timeout expiry")
+
 	for {
 		select {
 		case <-e.ctx.Done():
