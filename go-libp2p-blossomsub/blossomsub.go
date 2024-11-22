@@ -689,6 +689,7 @@ func (bs *BlossomSubRouter) RemovePeer(p peer.ID) {
 	delete(bs.gossip, p)
 	delete(bs.control, p)
 	delete(bs.outbound, p)
+	delete(bs.unwanted, p)
 }
 
 func (bs *BlossomSubRouter) EnoughPeers(bitmask []byte, suggested int) bool {
@@ -794,6 +795,7 @@ func (bs *BlossomSubRouter) HandleRPC(rpc *RPC) {
 	ihave := bs.handleIWant(rpc.from, ctl)
 	prune := bs.handleGraft(rpc.from, ctl)
 	bs.handlePrune(rpc.from, ctl)
+	bs.handleIDontWant(rpc.from, ctl)
 
 	if len(iwant) == 0 && len(ihave) == 0 && len(prune) == 0 {
 		return
@@ -1053,6 +1055,26 @@ func (bs *BlossomSubRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 	}
 }
 
+func (bs *BlossomSubRouter) handleIDontWant(p peer.ID, ctl *pb.ControlMessage) {
+	if bs.unwanted[p] == nil {
+		bs.unwanted[p] = make(map[string]int)
+	}
+
+	// IDONTWANT flood protection
+	if bs.peerdontwant[p] >= bs.params.MaxIDontWantMessages {
+		log.Debugf("IDONWANT: peer %s has advertised too many times (%d) within this heartbeat interval; ignoring", p, bs.peerdontwant[p])
+		return
+	}
+	bs.peerdontwant[p]++
+
+	// Remember all the unwanted message ids
+	for _, idontwant := range ctl.GetIdontwant() {
+		for _, mid := range idontwant.GetMessageIDs() {
+			bs.unwanted[p][string(mid)] = bs.params.IDontWantMessageTTL
+		}
+	}
+}
+
 func (bs *BlossomSubRouter) addBackoff(p peer.ID, bitmask []byte, isUnsubscribe bool) {
 	backoff := bs.params.PruneBackoff
 	if isUnsubscribe {
@@ -1234,6 +1256,13 @@ func (bs *BlossomSubRouter) Publish(msg *Message) {
 	out := rpcWithMessages(msg.Message)
 	for pid := range tosend {
 		if pid == from || pid == peer.ID(msg.GetFrom()) {
+			continue
+		}
+
+		mid := bs.p.idGen.ID(msg)
+		// Check if it has already received an IDONTWANT for the message.
+		// If so, don't send it to the peer
+		if _, ok := bs.unwanted[pid][string(mid)]; ok {
 			continue
 		}
 
@@ -1571,6 +1600,9 @@ func (bs *BlossomSubRouter) heartbeat() {
 	// clean up iasked counters
 	bs.clearIHaveCounters()
 
+	// clean up IDONTWANT counters
+	bs.clearIDontWantCounters()
+
 	// apply IWANT request penalties
 	bs.applyIwantPenalties()
 
@@ -1831,6 +1863,23 @@ func (bs *BlossomSubRouter) clearIHaveCounters() {
 	if len(bs.iasked) > 0 {
 		// throw away the old map and make a new one
 		bs.iasked = make(map[peer.ID]int)
+	}
+}
+
+func (bs *BlossomSubRouter) clearIDontWantCounters() {
+	if len(bs.peerdontwant) > 0 {
+		// throw away the old map and make a new one
+		bs.peerdontwant = make(map[peer.ID]int)
+	}
+
+	// decrement TTLs of all the IDONTWANTs and delete it from the cache when it reaches zero
+	for _, mids := range bs.unwanted {
+		for mid := range mids {
+			mids[mid]--
+			if mids[mid] == 0 {
+				delete(mids, mid)
+			}
+		}
 	}
 }
 
