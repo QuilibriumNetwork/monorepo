@@ -697,6 +697,8 @@ func (bs *BlossomSubRouter) AcceptFrom(p peer.ID) AcceptStatus {
 	return bs.gate.AcceptFrom(p)
 }
 
+func (bs *BlossomSubRouter) PreValidation(msgs []*Message) {}
+
 func (bs *BlossomSubRouter) HandleRPC(rpc *RPC) {
 	ctl := rpc.GetControl()
 	if ctl == nil {
