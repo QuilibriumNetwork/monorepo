@@ -62,7 +62,7 @@ func (e *DataClockConsensusEngine) runFramePruning() {
 		select {
 		case <-e.ctx.Done():
 			return
-		case <-time.After(1 * time.Hour):
+		case <-time.After(1 * time.Minute):
 			head, err := e.dataTimeReel.Head()
 			if err != nil {
 				panic(err)
