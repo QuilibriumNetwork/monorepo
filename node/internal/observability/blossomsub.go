@@ -32,6 +32,7 @@ type blossomSubRawTracer struct {
 	undeliverableMessageTotal *prometheus.CounterVec
 	iHaveMessageHistogram     *prometheus.HistogramVec
 	iWantMessageHistogram     *prometheus.HistogramVec
+	iDontWantMessageHistogram *prometheus.HistogramVec
 }
 
 func (b *blossomSubRawTracer) observeControl(control *pb.ControlMessage, direction string) {
@@ -42,6 +43,9 @@ func (b *blossomSubRawTracer) observeControl(control *pb.ControlMessage, directi
 	}
 	for _, iWant := range control.GetIwant() {
 		b.iWantMessageHistogram.WithLabelValues(labels...).Observe(float64(len(iWant.GetMessageIDs())))
+	}
+	for _, iDontWant := range control.GetIdontwant() {
+		b.iDontWantMessageHistogram.WithLabelValues(labels...).Observe(float64(len(iDontWant.GetMessageIDs())))
 	}
 }
 
@@ -146,6 +150,7 @@ func (b *blossomSubRawTracer) Describe(ch chan<- *prometheus.Desc) {
 	b.undeliverableMessageTotal.Describe(ch)
 	b.iHaveMessageHistogram.Describe(ch)
 	b.iWantMessageHistogram.Describe(ch)
+	b.iDontWantMessageHistogram.Describe(ch)
 }
 
 // Collect implements prometheus.Collector.
@@ -167,6 +172,7 @@ func (b *blossomSubRawTracer) Collect(ch chan<- prometheus.Metric) {
 	b.undeliverableMessageTotal.Collect(ch)
 	b.iHaveMessageHistogram.Collect(ch)
 	b.iWantMessageHistogram.Collect(ch)
+	b.iDontWantMessageHistogram.Collect(ch)
 }
 
 type BlossomSubRawTracer interface {
@@ -305,6 +311,15 @@ func NewBlossomSubRawTracer() BlossomSubRawTracer {
 				Namespace: blossomSubNamespace,
 				Name:      "iwant_messages",
 				Help:      "Histogram of the number of messages in an IWant message.",
+				Buckets:   prometheus.ExponentialBuckets(1, 2, 14),
+			},
+			[]string{"direction"},
+		),
+		iDontWantMessageHistogram: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Namespace: blossomSubNamespace,
+				Name:      "idontwant_messages",
+				Help:      "Histogram of the number of messages in an IDontWant message.",
 				Buckets:   prometheus.ExponentialBuckets(1, 2, 14),
 			},
 			[]string{"direction"},
