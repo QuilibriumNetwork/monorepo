@@ -238,7 +238,7 @@ func rpcWithControl(msgs []*pb.Message,
 
 func copyRPC(rpc *RPC) *RPC {
 	res := new(RPC)
-	copiedRPC := (proto.Clone(rpc.RPC)).(*pb.RPC)
-	res.RPC = copiedRPC
+	*res = *rpc
+	res.RPC = (proto.Clone(rpc.RPC)).(*pb.RPC)
 	return res
 }
