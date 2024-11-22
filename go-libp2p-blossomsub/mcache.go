@@ -56,7 +56,9 @@ type CacheEntry struct {
 func (mc *MessageCache) Put(msg *Message) {
 	mid := mc.msgID(msg)
 	mc.msgs[string(mid)] = msg
-	mc.history[0] = append(mc.history[0], CacheEntry{mid: mid, bitmask: msg.GetBitmask()})
+	for _, bitmask := range SliceBitmask(msg.GetBitmask()) {
+		mc.history[0] = append(mc.history[0], CacheEntry{mid: mid, bitmask: bitmask})
+	}
 }
 
 func (mc *MessageCache) Get(mid []byte) (*Message, bool) {
@@ -101,5 +103,5 @@ func (mc *MessageCache) Shift() {
 	for i := len(mc.history) - 2; i >= 0; i-- {
 		mc.history[i+1] = mc.history[i]
 	}
-	mc.history[0] = nil
+	mc.history[0] = last[:0]
 }
