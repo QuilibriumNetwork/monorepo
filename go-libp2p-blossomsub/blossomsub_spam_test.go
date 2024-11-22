@@ -122,7 +122,7 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 			// being spammy)
 			iwantlst := [][]byte{DefaultMsgIdFn(msg)}
 			iwant := []*pb.ControlIWant{{MessageIDs: iwantlst}}
-			orpc := rpcWithControl(nil, nil, iwant, nil, nil)
+			orpc := rpcWithControl(nil, nil, iwant, nil, nil, nil)
 			writeMsg(orpc.RPC)
 		}
 	})
@@ -216,7 +216,7 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 					for i := 0; i < 3*BlossomSubMaxIHaveLength; i++ {
 						ihavelst := [][]byte{[]byte("someid" + strconv.Itoa(i))}
 						ihave := []*pb.ControlIHave{{Bitmask: sub.Bitmask, MessageIDs: ihavelst}}
-						orpc := rpcWithControl(nil, ihave, nil, nil, nil)
+						orpc := rpcWithControl(nil, ihave, nil, nil, nil, nil)
 						writeMsg(orpc.RPC)
 					}
 
@@ -246,7 +246,7 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 					for i := 0; i < 3*BlossomSubMaxIHaveLength; i++ {
 						ihavelst := [][]byte{[]byte("someid" + strconv.Itoa(i+100))}
 						ihave := []*pb.ControlIHave{{Bitmask: sub.Bitmask, MessageIDs: ihavelst}}
-						orpc := rpcWithControl(nil, ihave, nil, nil, nil)
+						orpc := rpcWithControl(nil, ihave, nil, nil, nil, nil)
 						writeMsg(orpc.RPC)
 					}
 

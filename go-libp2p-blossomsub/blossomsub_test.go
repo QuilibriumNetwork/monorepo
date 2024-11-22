@@ -2619,7 +2619,7 @@ func (iwe *iwantEverything) handleStream(s network.Stream) {
 				}
 			}
 
-			msg := rpcWithControl(nil, nil, iwants, nil, prunes)
+			msg := rpcWithControl(nil, nil, iwants, nil, prunes, nil)
 			out, err := proto.Marshal(msg)
 
 			if err != nil {

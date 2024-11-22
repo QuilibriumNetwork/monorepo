@@ -252,24 +252,26 @@ func NewBlossomSubRouter(h host.Host, params BlossomSubParams, network uint8) *B
 	}
 
 	return &BlossomSubRouter{
-		peers:     make(map[peer.ID]protocol.ID),
-		mesh:      make(map[string]map[peer.ID]struct{}),
-		fanout:    make(map[string]map[peer.ID]struct{}),
-		lastpub:   make(map[string]int64),
-		gossip:    make(map[peer.ID][]*pb.ControlIHave),
-		control:   make(map[peer.ID]*pb.ControlMessage),
-		cab:       pstoremem.NewAddrBook(),
-		backoff:   make(map[string]map[peer.ID]time.Time),
-		peerhave:  make(map[peer.ID]int),
-		iasked:    make(map[peer.ID]int),
-		outbound:  make(map[peer.ID]bool),
-		connect:   make(chan connectInfo, params.MaxPendingConnections),
-		mcache:    NewMessageCache(params.HistoryGossip, params.HistoryLength),
-		protos:    protos,
-		feature:   feature,
-		tagTracer: newTagTracer(h.ConnManager()),
-		params:    params,
-		network:   network,
+		peers:        make(map[peer.ID]protocol.ID),
+		mesh:         make(map[string]map[peer.ID]struct{}),
+		fanout:       make(map[string]map[peer.ID]struct{}),
+		lastpub:      make(map[string]int64),
+		gossip:       make(map[peer.ID][]*pb.ControlIHave),
+		control:      make(map[peer.ID]*pb.ControlMessage),
+		cab:          pstoremem.NewAddrBook(),
+		backoff:      make(map[string]map[peer.ID]time.Time),
+		peerhave:     make(map[peer.ID]int),
+		peerdontwant: make(map[peer.ID]int),
+		unwanted:     make(map[peer.ID]map[string]int),
+		iasked:       make(map[peer.ID]int),
+		outbound:     make(map[peer.ID]bool),
+		connect:      make(chan connectInfo, params.MaxPendingConnections),
+		mcache:       NewMessageCache(params.HistoryGossip, params.HistoryLength),
+		protos:       protos,
+		feature:      feature,
+		tagTracer:    newTagTracer(h.ConnManager()),
+		params:       params,
+		network:      network,
 	}
 }
 
@@ -277,23 +279,25 @@ func NewBlossomSubRouter(h host.Host, params BlossomSubParams, network uint8) *B
 func DefaultBlossomSubRouter(h host.Host) *BlossomSubRouter {
 	params := DefaultBlossomSubParams()
 	return &BlossomSubRouter{
-		peers:     make(map[peer.ID]protocol.ID),
-		mesh:      make(map[string]map[peer.ID]struct{}),
-		fanout:    make(map[string]map[peer.ID]struct{}),
-		lastpub:   make(map[string]int64),
-		gossip:    make(map[peer.ID][]*pb.ControlIHave),
-		control:   make(map[peer.ID]*pb.ControlMessage),
-		backoff:   make(map[string]map[peer.ID]time.Time),
-		peerhave:  make(map[peer.ID]int),
-		iasked:    make(map[peer.ID]int),
-		outbound:  make(map[peer.ID]bool),
-		connect:   make(chan connectInfo, params.MaxPendingConnections),
-		cab:       pstoremem.NewAddrBook(),
-		mcache:    NewMessageCache(params.HistoryGossip, params.HistoryLength),
-		protos:    BlossomSubDefaultProtocols,
-		feature:   BlossomSubDefaultFeatures,
-		tagTracer: newTagTracer(h.ConnManager()),
-		params:    params,
+		peers:        make(map[peer.ID]protocol.ID),
+		mesh:         make(map[string]map[peer.ID]struct{}),
+		fanout:       make(map[string]map[peer.ID]struct{}),
+		lastpub:      make(map[string]int64),
+		gossip:       make(map[peer.ID][]*pb.ControlIHave),
+		control:      make(map[peer.ID]*pb.ControlMessage),
+		backoff:      make(map[string]map[peer.ID]time.Time),
+		peerhave:     make(map[peer.ID]int),
+		peerdontwant: make(map[peer.ID]int),
+		unwanted:     make(map[peer.ID]map[string]int),
+		iasked:       make(map[peer.ID]int),
+		outbound:     make(map[peer.ID]bool),
+		connect:      make(chan connectInfo, params.MaxPendingConnections),
+		cab:          pstoremem.NewAddrBook(),
+		mcache:       NewMessageCache(params.HistoryGossip, params.HistoryLength),
+		protos:       BlossomSubDefaultProtocols,
+		feature:      BlossomSubDefaultFeatures,
+		tagTracer:    newTagTracer(h.ConnManager()),
+		params:       params,
 	}
 }
 
@@ -478,21 +482,23 @@ func WithBlossomSubParams(cfg BlossomSubParams) Option {
 // is the fanout map. Fanout peer lists are expired if we don't publish any
 // messages to their bitmask for BlossomSubFanoutTTL.
 type BlossomSubRouter struct {
-	p        *PubSub
-	peers    map[peer.ID]protocol.ID          // peer protocols
-	direct   map[peer.ID]struct{}             // direct peers
-	mesh     map[string]map[peer.ID]struct{}  // bitmask meshes
-	fanout   map[string]map[peer.ID]struct{}  // bitmask fanout
-	lastpub  map[string]int64                 // last publish time for fanout bitmasks
-	gossip   map[peer.ID][]*pb.ControlIHave   // pending gossip
-	control  map[peer.ID]*pb.ControlMessage   // pending control messages
-	peerhave map[peer.ID]int                  // number of IHAVEs received from peer in the last heartbeat
-	iasked   map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
-	outbound map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
-	backoff  map[string]map[peer.ID]time.Time // prune backoff
-	connect  chan connectInfo                 // px connection requests
-	cab      peerstore.AddrBook
-	network  uint8
+	p            *PubSub
+	peers        map[peer.ID]protocol.ID          // peer protocols
+	direct       map[peer.ID]struct{}             // direct peers
+	mesh         map[string]map[peer.ID]struct{}  // bitmask meshes
+	fanout       map[string]map[peer.ID]struct{}  // bitmask fanout
+	lastpub      map[string]int64                 // last publish time for fanout bitmasks
+	gossip       map[peer.ID][]*pb.ControlIHave   // pending gossip
+	control      map[peer.ID]*pb.ControlMessage   // pending control messages
+	peerhave     map[peer.ID]int                  // number of IHAVEs received from peer in the last heartbeat
+	peerdontwant map[peer.ID]int                  // number of IDONTWANTs received from peer in the last heartbeat
+	unwanted     map[peer.ID]map[string]int       // TTL of the message ids peers don't want
+	iasked       map[peer.ID]int                  // number of messages we have asked from peer in the last heartbeat
+	outbound     map[peer.ID]bool                 // connection direction cache, marks peers with outbound connections
+	backoff      map[string]map[peer.ID]time.Time // prune backoff
+	connect      chan connectInfo                 // px connection requests
+	cab          peerstore.AddrBook
+	network      uint8
 
 	protos  []protocol.ID
 	feature BlossomSubFeatureTest
@@ -731,7 +737,52 @@ func (bs *BlossomSubRouter) AcceptFrom(p peer.ID) AcceptStatus {
 	return bs.gate.AcceptFrom(p)
 }
 
-func (bs *BlossomSubRouter) PreValidation(msgs []*Message) {}
+// PreValidation sends the IDONTWANT control messages to all the mesh
+// peers. They need to be sent right before the validation because they
+// should be seen by the peers as soon as possible.
+func (bs *BlossomSubRouter) PreValidation(msgs []*Message) {
+	bmids := make(map[string][][]byte)
+	for _, msg := range msgs {
+		if len(msg.GetData()) < bs.params.IDontWantMessageThreshold {
+			continue
+		}
+		mid := bs.p.idGen.ID(msg)
+		for _, bitmask := range SliceBitmask(msg.GetBitmask()) {
+			bitmask := string(bitmask)
+			bmids[bitmask] = append(bmids[bitmask], mid)
+		}
+	}
+	toSend := make(map[peer.ID]map[string]struct{})
+	for bitmask, mids := range bmids {
+		if len(mids) == 0 {
+			continue
+		}
+		// send IDONTWANT to all the mesh peers
+		for p := range bs.mesh[bitmask] {
+			// send to only peers that support IDONTWANT
+			if !bs.feature(BlossomSubFeatureIdontwant, bs.peers[p]) {
+				continue
+			}
+			if toSend[p] == nil {
+				toSend[p] = make(map[string]struct{}, len(mids))
+			}
+			for _, mid := range mids {
+				toSend[p][string(mid)] = struct{}{}
+			}
+		}
+	}
+	for p, midsS := range toSend {
+		mids := make([][]byte, 0, len(midsS))
+		for mid := range midsS {
+			mids = append(mids, []byte(mid))
+		}
+		// shuffle the messages got from the RPC envelope
+		shuffleBytes(mids)
+		idontwant := []*pb.ControlIDontWant{{MessageIDs: mids}}
+		out := rpcWithControl(nil, nil, nil, nil, nil, idontwant)
+		bs.sendRPC(p, out, true)
+	}
+}
 
 func (bs *BlossomSubRouter) HandleRPC(rpc *RPC) {
 	ctl := rpc.GetControl()
@@ -748,8 +799,8 @@ func (bs *BlossomSubRouter) HandleRPC(rpc *RPC) {
 		return
 	}
 
-	out := rpcWithControl(ihave, nil, iwant, nil, prune)
-	bs.sendRPC(rpc.from, out)
+	out := rpcWithControl(ihave, nil, iwant, nil, prune, nil)
+	bs.sendRPC(rpc.from, out, false)
 }
 
 func (bs *BlossomSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlIWant {
@@ -1186,7 +1237,7 @@ func (bs *BlossomSubRouter) Publish(msg *Message) {
 			continue
 		}
 
-		bs.sendRPC(pid, out)
+		bs.sendRPC(pid, out, false)
 	}
 }
 
@@ -1272,17 +1323,17 @@ func (bs *BlossomSubRouter) Leave(bitmask []byte) {
 
 func (bs *BlossomSubRouter) sendGraft(p peer.ID, bitmask []byte) {
 	graft := []*pb.ControlGraft{{Bitmask: bitmask}}
-	out := rpcWithControl(nil, nil, nil, graft, nil)
-	bs.sendRPC(p, out)
+	out := rpcWithControl(nil, nil, nil, graft, nil, nil)
+	bs.sendRPC(p, out, false)
 }
 
 func (bs *BlossomSubRouter) sendPrune(p peer.ID, bitmask []byte, isUnsubscribe bool) {
 	prune := []*pb.ControlPrune{bs.makePrune(p, bitmask, bs.doPX, isUnsubscribe)}
-	out := rpcWithControl(nil, nil, nil, nil, prune)
-	bs.sendRPC(p, out)
+	out := rpcWithControl(nil, nil, nil, nil, prune, nil)
+	bs.sendRPC(p, out, false)
 }
 
-func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
+func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC, fast bool) {
 	// do we own the RPC?
 	own := false
 
@@ -1313,7 +1364,7 @@ func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
 
 	// If we're below the max message size, go ahead and send
 	if out.Size() < bs.p.maxMessageSize {
-		bs.doSendRPC(out, p, mch)
+		bs.doSendRPC(out, p, mch, fast)
 		return
 	}
 
@@ -1326,7 +1377,7 @@ func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC) {
 			bs.doDropRPC(out, p, fmt.Sprintf("Dropping oversized RPC. Size: %d, limit: %d. (Over by %d bytes)", rpc.Size(), bs.p.maxMessageSize, rpc.Size()-bs.p.maxMessageSize))
 			continue
 		}
-		bs.doSendRPC(rpc, p, mch)
+		bs.doSendRPC(rpc, p, mch, fast)
 	}
 }
 
@@ -1340,8 +1391,8 @@ func (bs *BlossomSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
 	}
 }
 
-func (bs *BlossomSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue) {
-	if err := q.TryPush(bs.p.ctx, rpc, false); err != nil {
+func (bs *BlossomSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, fast bool) {
+	if err := q.TryPush(bs.p.ctx, rpc, fast); err != nil {
 		bs.doDropRPC(rpc, p, "queue full")
 		return
 	}
@@ -1857,8 +1908,8 @@ func (bs *BlossomSubRouter) sendGraftPrune(tograft, toprune map[peer.ID][][]byte
 			}
 		}
 
-		out := rpcWithControl(nil, nil, nil, graft, prune)
-		bs.sendRPC(p, out)
+		out := rpcWithControl(nil, nil, nil, graft, prune, nil)
+		bs.sendRPC(p, out, false)
 	}
 
 	for p, bitmasks := range toprune {
@@ -1867,8 +1918,8 @@ func (bs *BlossomSubRouter) sendGraftPrune(tograft, toprune map[peer.ID][][]byte
 			prune = append(prune, bs.makePrune(p, bitmask, bs.doPX && !noPX[p], false))
 		}
 
-		out := rpcWithControl(nil, nil, nil, nil, prune)
-		bs.sendRPC(p, out)
+		out := rpcWithControl(nil, nil, nil, nil, prune, nil)
+		bs.sendRPC(p, out, false)
 	}
 }
 
@@ -1930,15 +1981,15 @@ func (bs *BlossomSubRouter) flush() {
 	// send gossip first, which will also piggyback pending control
 	for p, ihave := range bs.gossip {
 		delete(bs.gossip, p)
-		out := rpcWithControl(nil, ihave, nil, nil, nil)
-		bs.sendRPC(p, out)
+		out := rpcWithControl(nil, ihave, nil, nil, nil, nil)
+		bs.sendRPC(p, out, false)
 	}
 
 	// send the remaining control messages that wasn't merged with gossip
 	for p, ctl := range bs.control {
 		delete(bs.control, p)
-		out := rpcWithControl(nil, nil, nil, ctl.Graft, ctl.Prune)
-		bs.sendRPC(p, out)
+		out := rpcWithControl(nil, nil, nil, ctl.Graft, ctl.Prune, nil)
+		bs.sendRPC(p, out, false)
 	}
 }
 
