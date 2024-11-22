@@ -1855,22 +1855,12 @@ func (bs *BlossomSubRouter) heartbeat() {
 }
 
 func (bs *BlossomSubRouter) clearIHaveCounters() {
-	if len(bs.peerhave) > 0 {
-		// throw away the old map and make a new one
-		bs.peerhave = make(map[peer.ID]int)
-	}
-
-	if len(bs.iasked) > 0 {
-		// throw away the old map and make a new one
-		bs.iasked = make(map[peer.ID]int)
-	}
+	clear(bs.peerhave)
+	clear(bs.iasked)
 }
 
 func (bs *BlossomSubRouter) clearIDontWantCounters() {
-	if len(bs.peerdontwant) > 0 {
-		// throw away the old map and make a new one
-		bs.peerdontwant = make(map[peer.ID]int)
-	}
+	clear(bs.peerdontwant)
 
 	// decrement TTLs of all the IDONTWANTs and delete it from the cache when it reaches zero
 	for _, mids := range bs.unwanted {
