@@ -36,6 +36,7 @@ type DataTimeReel struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	filter       []byte
 	engineConfig *config.EngineConfig
@@ -175,6 +176,7 @@ func (d *DataTimeReel) Start() error {
 		d.headDistance, err = d.GetDistance(frame)
 	}
 
+	d.wg.Add(1)
 	go d.runLoop()
 
 	return nil
@@ -253,6 +255,7 @@ func (d *DataTimeReel) BadFrameCh() <-chan *protobufs.ClockFrame {
 
 func (d *DataTimeReel) Stop() {
 	d.cancel()
+	d.wg.Wait()
 }
 
 func (d *DataTimeReel) createGenesisFrame() (
@@ -338,6 +341,7 @@ func (d *DataTimeReel) createGenesisFrame() (
 
 // Main data consensus loop
 func (d *DataTimeReel) runLoop() {
+	defer d.wg.Done()
 	for {
 		select {
 		case <-d.ctx.Done():

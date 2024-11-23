@@ -83,6 +83,7 @@ func (p PeerSeniorityItem) Priority() uint64 {
 type TokenExecutionEngine struct {
 	ctx                   context.Context
 	cancel                context.CancelFunc
+	wg                    sync.WaitGroup
 	logger                *zap.Logger
 	clock                 *data.DataClockConsensusEngine
 	clockStore            store.ClockStore
@@ -341,7 +342,9 @@ func NewTokenExecutionEngine(
 	e.proverPublicKey = publicKeyBytes
 	e.provingKeyAddress = provingKeyAddress
 
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		f, tries, err := e.clockStore.GetLatestDataClockFrame(e.intrinsicFilter)
 		if err != nil {
 			return
@@ -453,6 +456,7 @@ func (e *TokenExecutionEngine) Start() <-chan error {
 // Stop implements ExecutionEngine
 func (e *TokenExecutionEngine) Stop(force bool) <-chan error {
 	e.cancel()
+	e.wg.Wait()
 
 	errChan := make(chan error)
 

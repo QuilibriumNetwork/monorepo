@@ -43,6 +43,7 @@ func (
 }
 
 func (e *DataClockConsensusEngine) runFramePruning() {
+	defer e.wg.Done()
 	// A full prover should _never_ do this
 	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) ||
 		e.config.Engine.MaxFrames == -1 || e.config.Engine.FullProver {
@@ -85,6 +86,7 @@ func (e *DataClockConsensusEngine) runFramePruning() {
 }
 
 func (e *DataClockConsensusEngine) runSync() {
+	defer e.wg.Done()
 	// small optimization, beacon should never collect for now:
 	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
 		return
@@ -113,6 +115,7 @@ func (e *DataClockConsensusEngine) runSync() {
 }
 
 func (e *DataClockConsensusEngine) runLoop() {
+	defer e.wg.Done()
 	dataFrameCh := e.dataTimeReel.NewFrameCh()
 	runOnce := true
 	for {

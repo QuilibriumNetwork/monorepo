@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto"
 	"encoding/binary"
+	stderrors "errors"
+
 	"fmt"
 	"math/rand"
 	"sync"
@@ -65,6 +67,7 @@ type DataClockConsensusEngine struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	lastProven                  uint64
 	difficulty                  uint32
@@ -311,6 +314,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 		panic(err)
 	}
 
+	e.wg.Add(3)
 	go e.runFrameMessageHandler()
 	go e.runTxMessageHandler()
 	go e.runInfoMessageHandler()
@@ -359,7 +363,9 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	e.state = consensus.EngineStateCollecting
 	e.stateMx.Unlock()
 
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		const baseDuration = 2 * time.Minute
 		const maxBackoff = 3
 		var currentBackoff = 0
@@ -395,7 +401,9 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 		}
 	}()
 
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		thresholdBeforeConfirming := 4
 		frame, err := e.dataTimeReel.Head()
 		if err != nil {
@@ -500,11 +508,14 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 		}
 	}()
 
+	e.wg.Add(3)
 	go e.runLoop()
 	go e.runSync()
 	go e.runFramePruning()
 
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		select {
 		case <-e.ctx.Done():
 			return
@@ -524,7 +535,9 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 
 	go e.runPreMidnightProofWorker()
 
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		if len(e.config.Engine.DataWorkerMultiaddrs) != 0 {
 			e.clients, err = e.createParallelDataClientsFromList()
 			if err != nil {
@@ -582,6 +595,7 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 		i := i
 		client := client
 		go func() {
+			defer wg.Done()
 			resp, err :=
 				client.client.CalculateChallengeProof(
 					e.ctx,
@@ -595,7 +609,6 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 				)
 			if err != nil {
 				if status.Code(err) == codes.NotFound {
-					wg.Done()
 					return
 				}
 			}
@@ -605,8 +618,6 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 			} else {
 				e.clients[client.index] = nil
 			}
-
-			wg.Done()
 		}()
 	}
 	wg.Wait()
@@ -623,6 +634,7 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 	e.logger.Info("stopping ceremony consensus engine")
 	e.cancel()
+	e.wg.Wait()
 	e.stateMx.Lock()
 	e.state = consensus.EngineStateStopping
 	e.stateMx.Unlock()
@@ -654,9 +666,11 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(e.executionEngines))
+	executionErrors := make(chan error, len(e.executionEngines))
 	for name := range e.executionEngines {
 		name := name
 		go func(name string) {
+			defer wg.Done()
 			frame, err := e.dataTimeReel.Head()
 			if err != nil {
 				panic(err)
@@ -664,9 +678,8 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 
 			err = <-e.UnregisterExecutor(name, frame.FrameNumber, force)
 			if err != nil {
-				errChan <- err
+				executionErrors <- err
 			}
-			wg.Done()
 		}(name)
 	}
 
@@ -679,6 +692,7 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 
 	e.logger.Info("waiting for execution engines to stop")
 	wg.Wait()
+	close(executionErrors)
 	e.logger.Info("execution engines stopped")
 
 	e.dataTimeReel.Stop()
@@ -689,7 +703,12 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 	e.engineMx.Lock()
 	defer e.engineMx.Unlock()
 	go func() {
-		errChan <- nil
+		var errs []error
+		for err := range executionErrors {
+			errs = append(errs, err)
+		}
+		err := stderrors.Join(errs...)
+		errChan <- err
 	}()
 	return errChan
 }

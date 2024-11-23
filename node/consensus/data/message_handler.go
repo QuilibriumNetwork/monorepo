@@ -19,6 +19,7 @@ import (
 )
 
 func (e *DataClockConsensusEngine) runFrameMessageHandler() {
+	defer e.wg.Done()
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -67,6 +68,7 @@ func (e *DataClockConsensusEngine) runFrameMessageHandler() {
 }
 
 func (e *DataClockConsensusEngine) runTxMessageHandler() {
+	defer e.wg.Done()
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -155,6 +157,7 @@ func (e *DataClockConsensusEngine) runTxMessageHandler() {
 }
 
 func (e *DataClockConsensusEngine) runInfoMessageHandler() {
+	defer e.wg.Done()
 	for {
 		select {
 		case <-e.ctx.Done():
