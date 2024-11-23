@@ -58,10 +58,10 @@ var (
 	BlossomSubGraftFloodThreshold              = 10 * time.Second
 	BlossomSubMaxIHaveLength                   = 5000
 	BlossomSubMaxIHaveMessages                 = 10
-	BlossomSubMaxIDontWantMessages             = 1000
+	BlossomSubMaxIDontWantMessages             = 5000
 	BlossomSubIWantFollowupTime                = 3 * time.Second
 	BlossomSubIDontWantMessageThreshold        = 1024 // 1KB
-	BlossomSubIDontWantMessageTTL              = 3    // 3 heartbeats
+	BlossomSubIDontWantMessageTTL              = 60   // 60 heartbeats / 42 seconds
 )
 
 // BlossomSubParams defines all the BlossomSub specific parameters.
