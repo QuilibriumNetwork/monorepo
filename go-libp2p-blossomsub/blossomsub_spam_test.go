@@ -1,9 +1,11 @@
 package blossomsub
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
-	"math/rand"
 	"strconv"
 	"sync"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-msgio"
 	"google.golang.org/protobuf/proto"
 
@@ -775,16 +778,151 @@ func TestBlossomSubAttackInvalidMessageSpam(t *testing.T) {
 	<-ctx.Done()
 }
 
+// Test that when BlossomSub receives too many IDONTWANT messages from a peer
+func TestBlossomSubAttackSpamIDONTWANT(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hosts := getDefaultHosts(t, 3)
+
+	msgID := func(pmsg *pb.Message) []byte {
+		mid := sha256.Sum256(pmsg.GetData())
+		return mid[:]
+	}
+
+	psubs := make([]*PubSub, 2)
+	psubs[0] = getBlossomSub(ctx, hosts[0], WithMessageIdFn(msgID))
+	psubs[1] = getBlossomSub(ctx, hosts[1], WithMessageIdFn(msgID))
+
+	bitmask := []byte{0x20, 0x00, 0x00}
+	for _, ps := range psubs {
+		_, err := ps.Subscribe(bitmask)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait a bit after the last message before checking the result
+	msgWaitMax := time.Second + BlossomSubHeartbeatInterval
+	msgTimer := time.NewTimer(msgWaitMax)
+
+	// Checks we received some messages
+	var midsMu sync.RWMutex
+	var expMid []byte
+	var actMids [][]byte
+	checkMsgs := func() {
+		midsMu.RLock()
+		defer midsMu.RUnlock()
+		if len(actMids) == 0 {
+			t.Fatalf("Expected some messages when the maximum number of IDONTWANTs is reached")
+		}
+		if !bytes.Equal(actMids[0], expMid) {
+			t.Fatalf("The expected message is incorrect")
+		}
+		if len(actMids) > 1 {
+			t.Fatalf("The spam prevention should be reset after the heartbeat")
+		}
+	}
+
+	// Wait for the timer to expire
+	go func() {
+		select {
+		case <-msgTimer.C:
+			checkMsgs()
+			cancel()
+			return
+		case <-ctx.Done():
+			checkMsgs()
+		}
+	}()
+
+	newMockBS(ctx, t, hosts[2], func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+		// Each time the host receives a message
+		midsMu.Lock()
+		for _, msg := range irpc.GetPublish() {
+			actMids = append(actMids, msgID(msg))
+		}
+		midsMu.Unlock()
+		// When the middle peer connects it will send us its subscriptions
+		for _, sub := range irpc.GetSubscriptions() {
+			if sub.GetSubscribe() {
+				// Reply by subcribing to the bitmask and grafting to the middle peer
+				writeMsg(&pb.RPC{
+					Subscriptions: []*pb.RPC_SubOpts{{Subscribe: sub.Subscribe, Bitmask: sub.Bitmask}},
+					Control:       &pb.ControlMessage{Graft: []*pb.ControlGraft{{Bitmask: sub.Bitmask}}},
+				})
+
+				go func() {
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the subscribe + graft
+					time.Sleep(100 * time.Millisecond)
+
+					// Generate a message and send IDONTWANT to the middle peer
+					data := make([]byte, 16)
+					var mid []byte
+					for i := 0; i < 1+BlossomSubMaxIDontWantMessages; i++ {
+						rand.Read(data)
+						mid = msgID(&pb.Message{Data: data})
+						writeMsg(&pb.RPC{
+							Control: &pb.ControlMessage{Idontwant: []*pb.ControlIDontWant{{MessageIDs: [][]byte{mid}}}},
+						})
+					}
+					// The host should receives this message id because the maximum was reached
+					midsMu.Lock()
+					expMid = mid
+					midsMu.Unlock()
+
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the IDONTWANTs
+					time.Sleep(100 * time.Millisecond)
+
+					// Publish the message from the first peer
+					if err := psubs[0].Publish(ctx, bitmask, data); err != nil {
+						t.Error(err)
+						return // cannot call t.Fatal in a non-test goroutine
+					}
+
+					// Wait for the next heartbeat so that the prevention will be reset
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(BlossomSubHeartbeatInterval):
+					}
+
+					// Test IDONTWANT again to see that it now works again
+					rand.Read(data)
+					mid = msgID(&pb.Message{Data: data})
+					writeMsg(&pb.RPC{
+						Control: &pb.ControlMessage{Idontwant: []*pb.ControlIDontWant{{MessageIDs: [][]byte{mid}}}},
+					})
+					time.Sleep(100 * time.Millisecond)
+					if err := psubs[0].Publish(ctx, bitmask, data); err != nil {
+						t.Error(err)
+						return // cannot call t.Fatal in a non-test goroutine
+					}
+				}()
+			}
+		}
+	})
+
+	connect(t, hosts[0], hosts[1])
+	connect(t, hosts[1], hosts[2])
+
+	<-ctx.Done()
+}
+
 type MockBSOnRead func(writeMsg func(*pb.RPC), irpc *pb.RPC)
 
 func newMockBS(ctx context.Context, t *testing.T, attacker host.Host, onReadMsg MockBSOnRead) {
+	newMockBSWithVersion(ctx, t, attacker, BlossomSubID_v21, onReadMsg)
+}
+
+func newMockBSWithVersion(ctx context.Context, t *testing.T, attacker host.Host, blossomSubID protocol.ID, onReadMsg MockBSOnRead) {
 	// Listen on the BlossomSub protocol
-	const BlossomSubID = BlossomSubID_v2
 	const maxMessageSize = 1024 * 1024
-	attacker.SetStreamHandler(BlossomSubID, func(stream network.Stream) {
+	attacker.SetStreamHandler(blossomSubID, func(stream network.Stream) {
 		// When an incoming stream is opened, set up an outgoing stream
 		p := stream.Conn().RemotePeer()
-		ostream, err := attacker.NewStream(ctx, p, BlossomSubID)
+		ostream, err := attacker.NewStream(ctx, p, blossomSubID)
 		if err != nil {
 			t.Fatal(err)
 		}

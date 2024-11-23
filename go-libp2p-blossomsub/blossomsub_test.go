@@ -3,11 +3,14 @@ package blossomsub
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
 	"math/rand"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -42,7 +45,7 @@ func assertPeerLists(t *testing.T, bitmask []byte, hosts []host.Host, ps *PubSub
 func checkMessageRouting(t *testing.T, ctx context.Context, bitmasks []*Bitmask, subs [][]*Subscription) {
 	for _, p := range bitmasks {
 		data := make([]byte, 16)
-		rand.Read(data)
+		crand.Read(data)
 		err := p.Publish(ctx, p.bitmask, data)
 		if err != nil {
 			t.Fatal(err)
@@ -2506,7 +2509,7 @@ func TestBlossomSubRPCFragmentation(t *testing.T) {
 	msgSize := 20000
 	for i := 0; i < nMessages; i++ {
 		msg := make([]byte, msgSize)
-		rand.Read(msg)
+		crand.Read(msg)
 		b[0].Publish(ctx, []byte{0x00, 0x00, 0x81, 0x00}, msg)
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -2644,7 +2647,7 @@ func TestFragmentRPCFunction(t *testing.T) {
 	mkMsg := func(size int) *pb.Message {
 		msg := &pb.Message{}
 		msg.Data = make([]byte, size-4) // subtract the protobuf overhead, so msg.Size() returns requested size
-		rand.Read(msg.Data)
+		crand.Read(msg.Data)
 		return msg
 	}
 
@@ -2746,7 +2749,7 @@ func TestFragmentRPCFunction(t *testing.T) {
 		messageIds := make([][]byte, msgsPerBitmask)
 		for m := 0; m < msgsPerBitmask; m++ {
 			mid := make([]byte, messageIdSize)
-			rand.Read(mid)
+			crand.Read(mid)
 			messageIds[m] = mid
 		}
 		rpc.Control.Ihave[i] = &pb.ControlIHave{MessageIDs: messageIds}
@@ -2763,7 +2766,7 @@ func TestFragmentRPCFunction(t *testing.T) {
 	// Test the pathological case where a single gossip message ID exceeds the limit.
 	rpc.Reset()
 	giantIdBytes := make([]byte, limit*2)
-	rand.Read(giantIdBytes)
+	crand.Read(giantIdBytes)
 	rpc.Control = &pb.ControlMessage{
 		Iwant: []*pb.ControlIWant{
 			{MessageIDs: [][]byte{[]byte("hello"), giantIdBytes}},
@@ -2787,6 +2790,595 @@ func TestFragmentRPCFunction(t *testing.T) {
 		t.Fatalf("expected giant message ID to be included unaltered, got %s instead",
 			results[1].Control.Iwant[0].MessageIDs[0])
 	}
+}
+
+func TestBlossomSubIdontwantSend(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hosts := getDefaultHosts(t, 3)
+
+	msgID := func(pmsg *pb.Message) []byte {
+		mid := sha256.Sum256(pmsg.Data)
+		return mid[:]
+	}
+
+	var validated atomic.Bool
+	validate := func(context.Context, peer.ID, *Message) bool {
+		time.Sleep(100 * time.Millisecond)
+		validated.Store(true)
+		return true
+	}
+
+	params := DefaultBlossomSubParams()
+	params.IDontWantMessageThreshold = 16
+
+	psubs := make([]*PubSub, 2)
+	psubs[0] = getBlossomSub(ctx, hosts[0],
+		WithBlossomSubParams(params),
+		WithMessageIdFn(msgID))
+	psubs[1] = getBlossomSub(ctx, hosts[1],
+		WithBlossomSubParams(params),
+		WithMessageIdFn(msgID),
+		WithDefaultValidator(validate))
+
+	bitmask := []byte{0x20, 0x00, 0x00}
+	for _, ps := range psubs {
+		_, err := ps.Subscribe(bitmask)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var expMids [][]byte
+	var actMids [][]byte
+
+	// Used to publish a message with random data
+	publishMsg := func() {
+		data := make([]byte, 16)
+		crand.Read(data)
+		m := &pb.Message{Data: data}
+		expMids = append(expMids, msgID(m))
+
+		if err := psubs[0].Publish(ctx, bitmask, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait a bit after the last message before checking we got the right messages
+	msgWaitMax := time.Second
+	msgTimer := time.NewTimer(msgWaitMax)
+
+	// Checks we received the right IDONTWANT messages
+	checkMsgs := func() {
+		sort.Slice(actMids, func(i, j int) bool {
+			return bytes.Compare(actMids[i], actMids[j]) < 0
+		})
+		sort.Slice(expMids, func(i, j int) bool {
+			return bytes.Compare(expMids[i], expMids[j]) < 0
+		})
+
+		if len(actMids) != len(expMids) {
+			t.Fatalf("Expected %d IDONTWANT messages, got %d", len(expMids), len(actMids))
+		}
+		for i, expMid := range expMids {
+			actMid := actMids[i]
+			if !bytes.Equal(expMid, actMid) {
+				t.Fatalf("Expected the id of %x in the %d'th IDONTWANT messages, got %x", expMid, i+1, actMid)
+			}
+		}
+	}
+
+	// Wait for the timer to expire
+	go func() {
+		select {
+		case <-msgTimer.C:
+			checkMsgs()
+			cancel()
+			return
+		case <-ctx.Done():
+			checkMsgs()
+		}
+	}()
+
+	newMockBS(ctx, t, hosts[2], func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+		// When the middle peer connects it will send us its subscriptions
+		for _, sub := range irpc.GetSubscriptions() {
+			if sub.GetSubscribe() {
+				// Reply by subcribing to the bitmask and grafting to the middle peer
+				writeMsg(&pb.RPC{
+					Subscriptions: []*pb.RPC_SubOpts{{Subscribe: sub.Subscribe, Bitmask: sub.Bitmask}},
+					Control:       &pb.ControlMessage{Graft: []*pb.ControlGraft{{Bitmask: sub.Bitmask}}},
+				})
+
+				go func() {
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the subscribe + graft
+					time.Sleep(100 * time.Millisecond)
+
+					// Publish messages from the first peer
+					for i := 0; i < 10; i++ {
+						publishMsg()
+					}
+				}()
+			}
+		}
+
+		// Each time the middle peer sends an IDONTWANT message
+		for _, idonthave := range irpc.GetControl().GetIdontwant() {
+			// If true, it means that, when we get IDONTWANT, the middle peer has done validation
+			// already, which should not be the case
+			if validated.Load() {
+				t.Fatalf("IDONTWANT should be sent before doing validation")
+			}
+			for _, mid := range idonthave.GetMessageIDs() {
+				// Add the message to the list and reset the timer
+				actMids = append(actMids, mid)
+				msgTimer.Reset(msgWaitMax)
+			}
+		}
+	})
+
+	connect(t, hosts[0], hosts[1])
+	connect(t, hosts[1], hosts[2])
+
+	<-ctx.Done()
+}
+
+func TestBlossomSubIdontwantReceive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hosts := getDefaultHosts(t, 3)
+
+	msgID := func(pmsg *pb.Message) []byte {
+		mid := sha256.Sum256(pmsg.Data)
+		return mid[:]
+	}
+
+	psubs := make([]*PubSub, 2)
+	psubs[0] = getBlossomSub(ctx, hosts[0], WithMessageIdFn(msgID))
+	psubs[1] = getBlossomSub(ctx, hosts[1], WithMessageIdFn(msgID))
+
+	bitmask := []byte{0x20, 0x00, 0x00}
+	for _, ps := range psubs {
+		_, err := ps.Subscribe(bitmask)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait a bit after the last message before checking the result
+	msgWaitMax := time.Second
+	msgTimer := time.NewTimer(msgWaitMax)
+
+	// Checks we received no messages
+	received := false
+	checkMsgs := func() {
+		if received {
+			t.Fatalf("Expected no messages received after IDONWANT")
+		}
+	}
+
+	// Wait for the timer to expire
+	go func() {
+		select {
+		case <-msgTimer.C:
+			checkMsgs()
+			cancel()
+			return
+		case <-ctx.Done():
+			checkMsgs()
+		}
+	}()
+
+	newMockBS(ctx, t, hosts[2], func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+		// Check if it receives any message
+		if len(irpc.GetPublish()) > 0 {
+			received = true
+		}
+		// When the middle peer connects it will send us its subscriptions
+		for _, sub := range irpc.GetSubscriptions() {
+			if sub.GetSubscribe() {
+				// Reply by subcribing to the bitmask and grafting to the middle peer
+				writeMsg(&pb.RPC{
+					Subscriptions: []*pb.RPC_SubOpts{{Subscribe: sub.Subscribe, Bitmask: sub.Bitmask}},
+					Control:       &pb.ControlMessage{Graft: []*pb.ControlGraft{{Bitmask: sub.Bitmask}}},
+				})
+
+				go func() {
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the subscribe + graft
+					time.Sleep(100 * time.Millisecond)
+
+					// Generate a message and send IDONTWANT to the middle peer
+					data := make([]byte, 16)
+					crand.Read(data)
+					mid := msgID(&pb.Message{Data: data})
+					writeMsg(&pb.RPC{
+						Control: &pb.ControlMessage{Idontwant: []*pb.ControlIDontWant{{MessageIDs: [][]byte{mid}}}},
+					})
+
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the IDONTWANTs
+					time.Sleep(100 * time.Millisecond)
+
+					// Publish the message from the first peer
+					if err := psubs[0].Publish(ctx, bitmask, data); err != nil {
+						t.Error(err)
+						return // cannot call t.Fatal in a non-test goroutine
+					}
+				}()
+			}
+		}
+	})
+
+	connect(t, hosts[0], hosts[1])
+	connect(t, hosts[1], hosts[2])
+
+	<-ctx.Done()
+}
+
+// Test that non-mesh peers will not get IDONTWANT
+func TestBlossomSubIdontwantNonMesh(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hosts := getDefaultHosts(t, 3)
+
+	params := DefaultBlossomSubParams()
+	params.IDontWantMessageThreshold = 16
+	psubs := getBlossomSubs(ctx, hosts[:2], WithBlossomSubParams(params))
+
+	bitmask := []byte{0x20, 0x00, 0x00}
+	for _, ps := range psubs {
+		_, err := ps.Subscribe(bitmask)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Used to publish a message with random data
+	publishMsg := func() {
+		data := make([]byte, 16)
+		crand.Read(data)
+
+		if err := psubs[0].Publish(ctx, bitmask, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait a bit after the last message before checking we got the right messages
+	msgWaitMax := time.Second
+	msgTimer := time.NewTimer(msgWaitMax)
+	received := false
+
+	// Checks if we received any IDONTWANT
+	checkMsgs := func() {
+		if received {
+			t.Fatalf("No IDONTWANT is expected")
+		}
+	}
+
+	// Wait for the timer to expire
+	go func() {
+		select {
+		case <-msgTimer.C:
+			checkMsgs()
+			cancel()
+			return
+		case <-ctx.Done():
+			checkMsgs()
+		}
+	}()
+
+	newMockBS(ctx, t, hosts[2], func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+		// When the middle peer connects it will send us its subscriptions
+		for _, sub := range irpc.GetSubscriptions() {
+			if sub.GetSubscribe() {
+				// Reply by subcribing to the bitmask and pruning to the middle peer to make sure
+				// that it's not in the mesh
+				writeMsg(&pb.RPC{
+					Subscriptions: []*pb.RPC_SubOpts{{Subscribe: sub.Subscribe, Bitmask: sub.Bitmask}},
+					Control:       &pb.ControlMessage{Prune: []*pb.ControlPrune{{Bitmask: sub.Bitmask}}},
+				})
+
+				go func() {
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the subscribe
+					time.Sleep(100 * time.Millisecond)
+
+					// Publish messages from the first peer
+					for i := 0; i < 10; i++ {
+						publishMsg()
+					}
+				}()
+			}
+		}
+
+		// Each time the middle peer sends an IDONTWANT message
+		for range irpc.GetControl().GetIdontwant() {
+			received = true
+		}
+	})
+
+	connect(t, hosts[0], hosts[1])
+	connect(t, hosts[1], hosts[2])
+
+	<-ctx.Done()
+}
+
+// Test that peers with incompatible versions will not get IDONTWANT
+func TestBlossomSubIdontwantIncompat(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hosts := getDefaultHosts(t, 3)
+
+	params := DefaultBlossomSubParams()
+	params.IDontWantMessageThreshold = 16
+	psubs := getBlossomSubs(ctx, hosts[:2], WithBlossomSubParams(params))
+
+	bitmask := []byte{0x20, 0x00, 0x00}
+	for _, ps := range psubs {
+		_, err := ps.Subscribe(bitmask)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Used to publish a message with random data
+	publishMsg := func() {
+		data := make([]byte, 16)
+		crand.Read(data)
+
+		if err := psubs[0].Publish(ctx, bitmask, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait a bit after the last message before checking we got the right messages
+	msgWaitMax := time.Second
+	msgTimer := time.NewTimer(msgWaitMax)
+	received := false
+
+	// Checks if we received any IDONTWANT
+	checkMsgs := func() {
+		if received {
+			t.Fatalf("No IDONTWANT is expected")
+		}
+	}
+
+	// Wait for the timer to expire
+	go func() {
+		select {
+		case <-msgTimer.C:
+			checkMsgs()
+			cancel()
+			return
+		case <-ctx.Done():
+			checkMsgs()
+		}
+	}()
+
+	// Use the old BlossomSub version
+	newMockBSWithVersion(ctx, t, hosts[2], BlossomSubID_v2, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+		// When the middle peer connects it will send us its subscriptions
+		for _, sub := range irpc.GetSubscriptions() {
+			if sub.GetSubscribe() {
+				// Reply by subcribing to the bitmask and grafting to the middle peer
+				writeMsg(&pb.RPC{
+					Subscriptions: []*pb.RPC_SubOpts{{Subscribe: sub.Subscribe, Bitmask: sub.Bitmask}},
+					Control:       &pb.ControlMessage{Graft: []*pb.ControlGraft{{Bitmask: sub.Bitmask}}},
+				})
+
+				go func() {
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the subscribe + graft
+					time.Sleep(100 * time.Millisecond)
+
+					// Publish messages from the first peer
+					for i := 0; i < 10; i++ {
+						publishMsg()
+					}
+				}()
+			}
+		}
+
+		// Each time the middle peer sends an IDONTWANT message
+		for range irpc.GetControl().GetIdontwant() {
+			received = true
+		}
+	})
+
+	connect(t, hosts[0], hosts[1])
+	connect(t, hosts[1], hosts[2])
+
+	<-ctx.Done()
+}
+
+// Test that IDONTWANT will not be sent for small messages
+func TestBlossomSubIdontwantSmallMessage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hosts := getDefaultHosts(t, 3)
+
+	params := DefaultBlossomSubParams()
+	params.IDontWantMessageThreshold = 16
+	psubs := getBlossomSubs(ctx, hosts[:2], WithBlossomSubParams(params))
+
+	bitmask := []byte{0x20, 0x00, 0x00}
+	for _, ps := range psubs {
+		_, err := ps.Subscribe(bitmask)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Used to publish a message with random data
+	publishMsg := func() {
+		data := make([]byte, 8)
+		crand.Read(data)
+
+		if err := psubs[0].Publish(ctx, bitmask, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait a bit after the last message before checking we got the right messages
+	msgWaitMax := time.Second
+	msgTimer := time.NewTimer(msgWaitMax)
+	received := false
+
+	// Checks if we received any IDONTWANT
+	checkMsgs := func() {
+		if received {
+			t.Fatalf("No IDONTWANT is expected")
+		}
+	}
+
+	// Wait for the timer to expire
+	go func() {
+		select {
+		case <-msgTimer.C:
+			checkMsgs()
+			cancel()
+			return
+		case <-ctx.Done():
+			checkMsgs()
+		}
+	}()
+
+	newMockBS(ctx, t, hosts[2], func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+		// When the middle peer connects it will send us its subscriptions
+		for _, sub := range irpc.GetSubscriptions() {
+			if sub.GetSubscribe() {
+				// Reply by subcribing to the bitmask and pruning to the middle peer to make sure
+				// that it's not in the mesh
+				writeMsg(&pb.RPC{
+					Subscriptions: []*pb.RPC_SubOpts{{Subscribe: sub.Subscribe, Bitmask: sub.Bitmask}},
+					Control:       &pb.ControlMessage{Graft: []*pb.ControlGraft{{Bitmask: sub.Bitmask}}},
+				})
+
+				go func() {
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the subscribe
+					time.Sleep(100 * time.Millisecond)
+
+					// Publish messages from the first peer
+					for i := 0; i < 10; i++ {
+						publishMsg()
+					}
+				}()
+			}
+		}
+
+		// Each time the middle peer sends an IDONTWANT message
+		for range irpc.GetControl().GetIdontwant() {
+			received = true
+		}
+	})
+
+	connect(t, hosts[0], hosts[1])
+	connect(t, hosts[1], hosts[2])
+
+	<-ctx.Done()
+}
+
+// Test that IDONTWANT will cleared when it's old enough
+func TestBlossomSubIdontwantClear(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hosts := getDefaultHosts(t, 3)
+
+	msgID := func(pmsg *pb.Message) []byte {
+		mid := sha256.Sum256(pmsg.Data)
+		return mid[:]
+	}
+
+	params := DefaultBlossomSubParams()
+	params.IDontWantMessageTTL = 3
+
+	psubs := make([]*PubSub, 2)
+	psubs[0] = getBlossomSub(ctx, hosts[0], WithMessageIdFn(msgID), WithBlossomSubParams(params))
+	psubs[1] = getBlossomSub(ctx, hosts[1], WithMessageIdFn(msgID), WithBlossomSubParams(params))
+
+	bitmask := []byte{0x20, 0x00, 0x00}
+	for _, ps := range psubs {
+		_, err := ps.Subscribe(bitmask)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait a bit after the last message before checking the result
+	msgWaitMax := 5 * time.Second
+	msgTimer := time.NewTimer(msgWaitMax)
+
+	// Checks we received some message after the IDONTWANT is cleared
+	var received atomic.Bool
+	checkMsgs := func() {
+		if !received.Load() {
+			t.Fatalf("Expected some message after the IDONTWANT is cleared")
+		}
+	}
+
+	// Wait for the timer to expire
+	go func() {
+		select {
+		case <-msgTimer.C:
+			checkMsgs()
+			cancel()
+			return
+		case <-ctx.Done():
+			checkMsgs()
+		}
+	}()
+
+	newMockBS(ctx, t, hosts[2], func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
+		// Check if it receives any message
+		if len(irpc.GetPublish()) > 0 {
+			received.Store(true)
+		}
+		// When the middle peer connects it will send us its subscriptions
+		for _, sub := range irpc.GetSubscriptions() {
+			if sub.GetSubscribe() {
+				// Reply by subcribing to the bitmask and grafting to the middle peer
+				writeMsg(&pb.RPC{
+					Subscriptions: []*pb.RPC_SubOpts{{Subscribe: sub.Subscribe, Bitmask: sub.Bitmask}},
+					Control:       &pb.ControlMessage{Graft: []*pb.ControlGraft{{Bitmask: sub.Bitmask}}},
+				})
+
+				go func() {
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the subscribe + graft
+					time.Sleep(100 * time.Millisecond)
+
+					// Generate a message and send IDONTWANT to the middle peer
+					data := make([]byte, 16)
+					crand.Read(data)
+					mid := msgID(&pb.Message{Data: data})
+					writeMsg(&pb.RPC{
+						Control: &pb.ControlMessage{Idontwant: []*pb.ControlIDontWant{{MessageIDs: [][]byte{mid}}}},
+					})
+
+					// Wait for a short interval to make sure the middle peer
+					// received and processed the IDONTWANTs
+					time.Sleep(100 * time.Millisecond)
+
+					// Wait for 4 heartbeats to make sure the IDONTWANT is cleared
+					time.Sleep(4 * time.Second)
+
+					// Publish the message from the first peer
+					if err := psubs[0].Publish(ctx, bitmask, data); err != nil {
+						t.Error(err)
+						return // cannot call t.Fatal in a non-test goroutine
+					}
+				}()
+			}
+		}
+	})
+
+	connect(t, hosts[0], hosts[1])
+	connect(t, hosts[1], hosts[2])
+
+	<-ctx.Done()
 }
 
 func TestBloomRouting(t *testing.T) {
@@ -2942,7 +3534,7 @@ func TestBloomPropagationOverSubTreeTopology(t *testing.T) {
 
 	for _, p := range bitmasks {
 		data := make([]byte, 32)
-		rand.Read(data)
+		crand.Read(data)
 		err := p[0].Publish(ctx, []byte{0x10, 0x10, 0x10, 0x00}, data)
 		if err != nil {
 			t.Fatal(err)
