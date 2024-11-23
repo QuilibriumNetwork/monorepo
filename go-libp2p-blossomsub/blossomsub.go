@@ -742,40 +742,39 @@ func (bs *BlossomSubRouter) AcceptFrom(p peer.ID) AcceptStatus {
 // peers. They need to be sent right before the validation because they
 // should be seen by the peers as soon as possible.
 func (bs *BlossomSubRouter) PreValidation(msgs []*Message) {
-	bmids := make(map[string][][]byte)
+	slicedMessages := make(map[string][]*Message, len(msgs))
 	for _, msg := range msgs {
 		if len(msg.GetData()) < bs.params.IDontWantMessageThreshold {
 			continue
 		}
-		mid := bs.p.idGen.ID(msg)
 		for _, bitmask := range SliceBitmask(msg.GetBitmask()) {
 			bitmask := string(bitmask)
-			bmids[bitmask] = append(bmids[bitmask], mid)
+			slicedMessages[bitmask] = append(slicedMessages[bitmask], msg)
 		}
 	}
-	toSend := make(map[peer.ID]map[string]struct{})
-	for bitmask, mids := range bmids {
-		if len(mids) == 0 {
-			continue
-		}
+	toSend := make(map[peer.ID]map[*Message]struct{}, len(slicedMessages))
+	for bitmask, msgs := range slicedMessages {
 		// send IDONTWANT to all the mesh peers
 		for p := range bs.mesh[bitmask] {
 			// send to only peers that support IDONTWANT
 			if !bs.feature(BlossomSubFeatureIdontwant, bs.peers[p]) {
 				continue
 			}
-			if toSend[p] == nil {
-				toSend[p] = make(map[string]struct{}, len(mids))
-			}
-			for _, mid := range mids {
-				toSend[p][string(mid)] = struct{}{}
+			for _, msg := range msgs {
+				if msg.ReceivedFrom == p {
+					continue
+				}
+				if toSend[p] == nil {
+					toSend[p] = make(map[*Message]struct{}, len(msgs))
+				}
+				toSend[p][msg] = struct{}{}
 			}
 		}
 	}
-	for p, midsS := range toSend {
-		mids := make([][]byte, 0, len(midsS))
-		for mid := range midsS {
-			mids = append(mids, []byte(mid))
+	for p, msgs := range toSend {
+		mids := make([][]byte, 0, len(msgs))
+		for msg := range msgs {
+			mids = append(mids, bs.p.idGen.ID(msg))
 		}
 		// shuffle the messages got from the RPC envelope
 		shuffleBytes(mids)
