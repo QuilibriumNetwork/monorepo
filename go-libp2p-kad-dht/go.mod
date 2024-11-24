@@ -1,12 +1,16 @@
 module github.com/libp2p/go-libp2p-kad-dht
 
-go 1.21
+go 1.22
+
+toolchain go1.22.5
 
 retract v0.24.3 // this includes a breaking change and should have been released as v0.25.0
 
 replace github.com/multiformats/go-multiaddr => ../go-multiaddr
 
 replace github.com/multiformats/go-multiaddr-dns => ../go-multiaddr-dns
+
+replace github.com/libp2p/go-buffer-pool => ../go-buffer-pool
 
 replace github.com/libp2p/go-libp2p => ../go-libp2p
 

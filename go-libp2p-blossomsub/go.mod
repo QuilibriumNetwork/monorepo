@@ -1,12 +1,14 @@
 module source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub
 
-go 1.21
+go 1.22
 
-toolchain go1.22.4
+toolchain go1.22.5
 
 replace github.com/multiformats/go-multiaddr => ../go-multiaddr
 
 replace github.com/multiformats/go-multiaddr-dns => ../go-multiaddr-dns
+
+replace github.com/libp2p/go-buffer-pool => ../go-buffer-pool
 
 replace github.com/libp2p/go-libp2p => ../go-libp2p
 

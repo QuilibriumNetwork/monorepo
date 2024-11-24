@@ -1,8 +1,8 @@
 module source.quilibrium.com/quilibrium/monorepo/node
 
-go 1.21
+go 1.22
 
-toolchain go1.22.1
+toolchain go1.22.5
 
 // A necessary hack until source.quilibrium.com is open to all
 replace source.quilibrium.com/quilibrium/monorepo/nekryptology => ../nekryptology
@@ -14,6 +14,8 @@ replace source.quilibrium.com/quilibrium/monorepo/vdf => ../vdf
 replace github.com/multiformats/go-multiaddr => ../go-multiaddr
 
 replace github.com/multiformats/go-multiaddr-dns => ../go-multiaddr-dns
+
+replace github.com/libp2p/go-buffer-pool => ../go-buffer-pool
 
 replace github.com/libp2p/go-libp2p => ../go-libp2p
 
