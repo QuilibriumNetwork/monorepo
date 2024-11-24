@@ -1182,20 +1182,7 @@ func (bs *BlossomSubRouter) Publish(msg *Message) {
 	bitmask := msg.GetBitmask()
 
 	tosend := make(map[peer.ID]struct{})
-
-	sliced := SliceBitmask(bitmask)
-	// bloom publish:
-	if len(sliced) != 1 {
-		// any peers in all slices of the bitmask?
-		peers := bs.p.getPeersInBitmask(bitmask)
-		if len(peers) == 0 {
-			return
-		}
-
-		for _, p := range peers {
-			tosend[p] = struct{}{}
-		}
-	} else { // classic gossip mesh
+	for _, bitmask := range SliceBitmask(bitmask) {
 		// any peers in the bitmask?
 		tmap, ok := bs.p.bitmasks[string(bitmask)]
 		if !ok {
