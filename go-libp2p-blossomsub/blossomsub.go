@@ -912,6 +912,13 @@ func (bs *BlossomSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb
 
 	msgs := make([]*pb.Message, 0, len(ihave))
 	for _, msg := range ihave {
+		if peer.ID(msg.GetFrom()) == p {
+			continue
+		}
+		mid := bs.p.idGen.RawID(msg)
+		if _, ok := bs.unwanted[p][string(mid)]; ok {
+			continue
+		}
 		msgs = append(msgs, msg)
 	}
 
