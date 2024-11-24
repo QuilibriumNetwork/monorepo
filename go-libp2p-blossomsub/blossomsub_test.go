@@ -1700,9 +1700,10 @@ func TestBlossomSubEnoughPeers(t *testing.T) {
 	}
 
 	// at this point we have no connections and no mesh, so EnoughPeers should return false
+	// NOTE: EnoughPeers operates with bloom filters, so we need to check for individual filters.
 	res := make(chan bool, 1)
 	psubs[0].eval <- func() {
-		res <- psubs[0].rt.EnoughPeers([]byte{0x00, 0x00, 0x81, 0x00}, 0)
+		res <- psubs[0].rt.EnoughPeers([]byte{0x00, 0x00, 0x80, 0x00}, 0)
 	}
 	enough := <-res
 	if enough {
@@ -1715,7 +1716,7 @@ func TestBlossomSubEnoughPeers(t *testing.T) {
 	time.Sleep(5 * time.Second)
 
 	psubs[0].eval <- func() {
-		res <- psubs[0].rt.EnoughPeers([]byte{0x00, 0x00, 0x81, 0x00}, 0)
+		res <- psubs[0].rt.EnoughPeers([]byte{0x00, 0x00, 0x80, 0x00}, 0)
 	}
 	enough = <-res
 	if !enough {
@@ -2199,11 +2200,12 @@ func TestBlossomSubLeaveBitmask(t *testing.T) {
 	leaveTime := time.Now()
 	done := make(chan struct{})
 
+	// NOTE: Leave operates with bloom filters, so we need to check for individual filters.
 	psubs[0].rt.(*BlossomSubRouter).p.eval <- func() {
 		defer close(done)
-		psubs[0].rt.Leave([]byte{0x00, 0x00, 0x81, 0x00})
+		psubs[0].rt.Leave([]byte{0x00, 0x00, 0x80, 0x00})
 		time.Sleep(time.Second)
-		peerMap := psubs[0].rt.(*BlossomSubRouter).backoff[string([]byte{0x00, 0x00, 0x81, 0x00})]
+		peerMap := psubs[0].rt.(*BlossomSubRouter).backoff[string([]byte{0x00, 0x00, 0x80, 0x00})]
 		if len(peerMap) != 1 {
 			t.Fatalf("No peer is populated in the backoff map for peer 0")
 		}
@@ -2225,7 +2227,7 @@ func TestBlossomSubLeaveBitmask(t *testing.T) {
 	// for peer 0.
 	psubs[1].rt.(*BlossomSubRouter).p.eval <- func() {
 		defer close(done)
-		peerMap2 := psubs[1].rt.(*BlossomSubRouter).backoff[string([]byte{0x00, 0x00, 0x81, 0x00})]
+		peerMap2 := psubs[1].rt.(*BlossomSubRouter).backoff[string([]byte{0x00, 0x00, 0x80, 0x00})]
 		if len(peerMap2) != 1 {
 			t.Fatalf("No peer is populated in the backoff map for peer 1")
 		}
