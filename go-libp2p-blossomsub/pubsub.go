@@ -26,8 +26,8 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
-// DefaultMaximumMessageSize is 10 MB.
-const DefaultMaxMessageSize = 10 << 20
+// DefaultMaximumMessageSize is 20 MB.
+const DefaultMaxMessageSize = 10 << 21
 
 var (
 	// TimeCacheDuration specifies how long a message ID will be remembered as seen.
