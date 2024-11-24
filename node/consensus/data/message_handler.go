@@ -370,10 +370,9 @@ func TokenRequestIdentifiers(transition *protobufs.TokenRequest) []string {
 		return identifiers
 	case *protobufs.TokenRequest_Mint:
 		if len(t.Mint.Proofs) == 1 {
-			return []string{fmt.Sprintf("mint-%x", sha3.Sum512(t.Mint.Proofs[0]))}
+			return []string{fmt.Sprintf("mint-proof-%x", sha3.Sum512(t.Mint.Proofs[0]))}
 		}
-		// Large proofs are currently not deduplicated.
-		return nil
+		return []string{fmt.Sprintf("mint-sign-%x", t.Mint.Signature.PublicKey.KeyValue)}
 	case *protobufs.TokenRequest_Announce:
 		identifiers := make([]string, len(t.Announce.GetPublicKeySignaturesEd448()))
 		for i, sig := range t.Announce.GetPublicKeySignaturesEd448() {
