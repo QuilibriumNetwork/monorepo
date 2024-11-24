@@ -16,22 +16,6 @@ import (
 	"testing"
 )
 
-func TestAllocations(t *testing.T) {
-	var m1, m2 runtime.MemStats
-	runtime.ReadMemStats(&m1)
-	runtime.GC()
-	for i := 0; i < 10000; i++ {
-		b := Get(1010)
-		Put(b)
-	}
-	runtime.GC()
-	runtime.ReadMemStats(&m2)
-	frees := m2.Frees - m1.Frees
-	if frees > 1000 {
-		t.Fatalf("expected less than 100 frees after GC, got %d", frees)
-	}
-}
-
 func TestRange(t *testing.T) {
 	min := nextLogBase2(1)
 	max := nextLogBase2(uint32(MaxLength))

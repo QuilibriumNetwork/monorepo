@@ -40,11 +40,6 @@ const MaxLength = math.MaxInt32
 // You MUST NOT copy Pool after using.
 type BufferPool struct {
 	pools [32]sync.Pool // a list of singlePools
-	ptrs  sync.Pool
-}
-
-type bufp struct {
-	buf []byte
 }
 
 // Get retrieves a buffer of the appropriate length from the buffer pool or
@@ -64,10 +59,8 @@ func (p *BufferPool) Get(length int) []byte {
 	}
 	idx := nextLogBase2(uint32(length))
 	if ptr := p.pools[idx].Get(); ptr != nil {
-		bp := ptr.(*bufp)
-		buf := bp.buf[:uint32(length)]
-		bp.buf = nil
-		p.ptrs.Put(ptr)
+		buf := ptr.([]byte)
+		buf = buf[:uint32(length)]
 		return buf
 	}
 	return make([]byte, 1<<idx)[:uint32(length)]
@@ -80,14 +73,8 @@ func (p *BufferPool) Put(buf []byte) {
 		return // drop it
 	}
 	idx := prevLogBase2(uint32(capacity))
-	var bp *bufp
-	if ptr := p.ptrs.Get(); ptr != nil {
-		bp = ptr.(*bufp)
-	} else {
-		bp = new(bufp)
-	}
-	bp.buf = buf
-	p.pools[idx].Put(bp)
+	// nolint: staticcheck
+	p.pools[idx].Put(buf)
 }
 
 // Get retrieves a buffer of the appropriate length from the global buffer pool
