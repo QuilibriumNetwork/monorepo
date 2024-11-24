@@ -96,19 +96,12 @@ func (e *DataClockConsensusEngine) runSync() {
 		select {
 		case <-e.ctx.Done():
 			return
-		case enqueuedFrame := <-e.requestSyncCh:
-			if enqueuedFrame == nil {
-				var err error
-				enqueuedFrame, err = e.dataTimeReel.Head()
-				if err != nil {
-					panic(err)
-				}
-			}
+		case <-e.requestSyncCh:
 			if err := e.pubSub.Bootstrap(e.ctx); err != nil {
 				e.logger.Error("could not bootstrap", zap.Error(err))
 			}
-			if _, err := e.collect(enqueuedFrame); err != nil {
-				e.logger.Error("could not collect", zap.Error(err))
+			if err := e.syncWithMesh(); err != nil {
+				e.logger.Error("could not sync", zap.Error(err))
 			}
 		}
 	}
@@ -180,7 +173,7 @@ func (e *DataClockConsensusEngine) processFrame(
 	var err error
 	if !e.GetFrameProverTries()[0].Contains(e.provingKeyBytes) {
 		select {
-		case e.requestSyncCh <- dataFrame:
+		case e.requestSyncCh <- struct{}{}:
 		default:
 		}
 	}

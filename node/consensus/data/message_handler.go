@@ -352,7 +352,7 @@ func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 	select {
 	case <-e.ctx.Done():
 		return nil
-	case e.requestSyncCh <- nil:
+	case e.requestSyncCh <- struct{}{}:
 	default:
 	}
 

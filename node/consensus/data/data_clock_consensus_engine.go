@@ -135,7 +135,7 @@ type DataClockConsensusEngine struct {
 	previousFrameProven            *protobufs.ClockFrame
 	previousTree                   *mt.MerkleTree
 	clientReconnectTest            int
-	requestSyncCh                  chan *protobufs.ClockFrame
+	requestSyncCh                  chan struct{}
 }
 
 var _ consensus.DataConsensusEngine = (*DataClockConsensusEngine)(nil)
@@ -269,7 +269,7 @@ func NewDataClockConsensusEngine(
 			rateLimit,
 			time.Minute,
 		),
-		requestSyncCh: make(chan *protobufs.ClockFrame, 1),
+		requestSyncCh: make(chan struct{}, 1),
 	}
 
 	logger.Info("constructing consensus engine")
