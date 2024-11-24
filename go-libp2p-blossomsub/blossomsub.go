@@ -40,6 +40,7 @@ var (
 	BlossomSubHistoryLength                    = 5
 	BlossomSubHistoryGossip                    = 3
 	BlossomSubDlazy                            = 6
+	BlossomSubGossipFactor                     = 0.25
 	BlossomSubGossipRetransmission             = 3
 	BlossomSubBitmaskWidth                     = 256
 	BlossomSubHeartbeatInitialDelay            = 100 * time.Millisecond
@@ -116,8 +117,14 @@ type BlossomSubParams struct {
 
 	// Dlazy affects how many peers we will emit gossip to at each heartbeat.
 	// We will send gossip to at least Dlazy peers outside our mesh. The actual
-	// number may be less, depending on how many peers we're connected to.
+	// number may be more, depending on GossipFactor and how many peers we're
+	// connected to.
 	Dlazy int
+
+	// GossipFactor affects how many peers we will emit gossip to at each heartbeat.
+	// We will send gossip to GossipFactor * (total number of non-mesh peers), or
+	// Dlazy, whichever is greater.
+	GossipFactor float64
 
 	// GossipRetransmission controls how many times we will allow a peer to request
 	// the same message id through IWANT gossip before we start ignoring them. This is designed
@@ -313,6 +320,7 @@ func DefaultBlossomSubParams() BlossomSubParams {
 		HistoryLength:             BlossomSubHistoryLength,
 		HistoryGossip:             BlossomSubHistoryGossip,
 		Dlazy:                     BlossomSubDlazy,
+		GossipFactor:              BlossomSubGossipFactor,
 		GossipRetransmission:      BlossomSubGossipRetransmission,
 		HeartbeatInitialDelay:     BlossomSubHeartbeatInitialDelay,
 		HeartbeatInterval:         BlossomSubHeartbeatInterval,
@@ -1991,6 +1999,8 @@ func (bs *BlossomSubRouter) emitGossip(bitmask []byte, exclude map[peer.ID]struc
 	}
 
 	target := bs.params.Dlazy
+	factor := int(bs.params.GossipFactor * float64(len(peers)))
+	target = max(target, factor)
 
 	if target > len(peers) {
 		target = len(peers)

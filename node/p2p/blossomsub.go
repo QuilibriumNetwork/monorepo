@@ -979,6 +979,9 @@ func withDefaults(p2pConfig *config.P2PConfig) *config.P2PConfig {
 	if p2pConfig.DLazy == 0 {
 		p2pConfig.DLazy = blossomsub.BlossomSubDlazy
 	}
+	if p2pConfig.GossipFactor == 0 {
+		p2pConfig.GossipFactor = blossomsub.BlossomSubGossipFactor
+	}
 	if p2pConfig.GossipRetransmission == 0 {
 		p2pConfig.GossipRetransmission = blossomsub.BlossomSubGossipRetransmission
 	}
@@ -1091,6 +1094,7 @@ func toBlossomSubParams(p2pConfig *config.P2PConfig) blossomsub.BlossomSubParams
 		HistoryLength:             p2pConfig.HistoryLength,
 		HistoryGossip:             p2pConfig.HistoryGossip,
 		Dlazy:                     p2pConfig.DLazy,
+		GossipFactor:              p2pConfig.GossipFactor,
 		GossipRetransmission:      p2pConfig.GossipRetransmission,
 		HeartbeatInitialDelay:     p2pConfig.HeartbeatInitialDelay,
 		HeartbeatInterval:         p2pConfig.HeartbeatInterval,

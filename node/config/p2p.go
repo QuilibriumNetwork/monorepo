@@ -13,6 +13,7 @@ type P2PConfig struct {
 	HistoryLength             int           `yaml:"historyLength"`
 	HistoryGossip             int           `yaml:"historyGossip"`
 	DLazy                     int           `yaml:"dLazy"`
+	GossipFactor              float64       `yaml:"gossipFactor"`
 	GossipRetransmission      int           `yaml:"gossipRetransmission"`
 	HeartbeatInitialDelay     time.Duration `yaml:"heartbeatInitialDelay"`
 	HeartbeatInterval         time.Duration `yaml:"heartbeatInterval"`
