@@ -37,11 +37,16 @@ func (e *DataClockConsensusEngine) syncWithMesh() error {
 			if candidate.MaxFrame <= max(latest.FrameNumber, e.latestFrameReceived) {
 				continue
 			}
-			var err error
+			head, err := e.dataTimeReel.Head()
+			if err != nil {
+				return errors.Wrap(err, "sync")
+			}
+			if latest.FrameNumber < head.FrameNumber {
+				latest = head
+			}
 			latest, err = e.syncWithPeer(latest, candidate.MaxFrame, candidate.PeerID)
 			if err != nil {
 				e.logger.Debug("error syncing frame", zap.Error(err))
-				continue
 			}
 		}
 	}
