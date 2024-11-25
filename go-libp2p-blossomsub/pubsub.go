@@ -26,8 +26,11 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
-// DefaultMaximumMessageSize is 20 MB.
-const DefaultMaxMessageSize = 10 << 21
+// DefaultSoftMaxMessageSize is 10 MiB.
+const DefaultSoftMaxMessageSize = 10 << 20
+
+// DefaultHardMaxMessageSize is 20 MB.
+const DefaultHardMaxMessageSize = 10 << 21
 
 var (
 	// TimeCacheDuration specifies how long a message ID will be remembered as seen.
@@ -68,9 +71,12 @@ type PubSub struct {
 
 	peerFilter PeerFilter
 
-	// maxMessageSize is the maximum message size; it applies globally to all
-	// bitmasks.
-	maxMessageSize int
+	// softMaxMessageSize is the maximum size of a single message fragment that
+	// we will attempt to send.
+	softMaxMessageSize int
+	// hardMaxMessageSize is the maximum size of a single message fragment that
+	// we will accept.
+	hardMaxMessageSize int
 
 	// size of the outbound message channel that we maintain for each peer
 	peerOutboundQueueSize int
@@ -265,7 +271,8 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		val:                   newValidation(),
 		peerFilter:            DefaultPeerFilter,
 		disc:                  &discover{},
-		maxMessageSize:        DefaultMaxMessageSize,
+		softMaxMessageSize:    DefaultSoftMaxMessageSize,
+		hardMaxMessageSize:    DefaultHardMaxMessageSize,
 		peerOutboundQueueSize: 32,
 		signID:                h.ID(),
 		signKey:               nil,
@@ -520,9 +527,10 @@ func WithRawTracer(tracer RawTracer) Option {
 // another type of locator, such that messages can be fetched on-demand, rather
 // than being pushed proactively. Under this design, you'd use the pubsub layer
 // as a signalling system, rather than a data delivery system.
-func WithMaxMessageSize(maxMessageSize int) Option {
+func WithMaxMessageSize(softMaxMessageSize, hardMaxMessageSize int) Option {
 	return func(ps *PubSub) error {
-		ps.maxMessageSize = maxMessageSize
+		ps.softMaxMessageSize = softMaxMessageSize
+		ps.hardMaxMessageSize = hardMaxMessageSize
 		return nil
 	}
 }

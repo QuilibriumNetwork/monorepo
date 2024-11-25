@@ -1402,18 +1402,18 @@ func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC, fast bool) {
 	}
 
 	// If we're below the max message size, go ahead and send
-	if out.Size() < bs.p.maxMessageSize {
+	if out.Size() < bs.p.softMaxMessageSize {
 		bs.doSendRPC(out, p, mch, fast)
 		return
 	}
 
 	outCopy := copyRPC(out)
 	// Potentially split the RPC into multiple RPCs that are below the max message size
-	outRPCs := appendOrMergeRPC(nil, bs.p.maxMessageSize, outCopy)
+	outRPCs := appendOrMergeRPC(nil, bs.p.softMaxMessageSize, outCopy)
 	for _, rpc := range outRPCs {
-		if rpc.Size() > bs.p.maxMessageSize {
+		if rpc.Size() > bs.p.hardMaxMessageSize {
 			// This should only happen if a single message/control is above the maxMessageSize.
-			bs.doDropRPC(out, p, fmt.Sprintf("Dropping oversized RPC. Size: %d, limit: %d. (Over by %d bytes)", rpc.Size(), bs.p.maxMessageSize, rpc.Size()-bs.p.maxMessageSize))
+			bs.doDropRPC(out, p, fmt.Sprintf("Dropping oversized RPC. Size: %d, limit: %d. (Over by %d bytes)", rpc.Size(), bs.p.hardMaxMessageSize, rpc.Size()-bs.p.hardMaxMessageSize))
 			continue
 		}
 		bs.doSendRPC(rpc, p, mch, fast)

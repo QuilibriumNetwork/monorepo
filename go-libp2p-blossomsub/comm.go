@@ -55,7 +55,7 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 	p.inboundStreams[peer] = s
 	p.inboundStreamsMx.Unlock()
 
-	r := msgio.NewVarintReaderSize(s, p.maxMessageSize)
+	r := msgio.NewVarintReaderSize(s, p.hardMaxMessageSize)
 	for {
 		msgbytes, err := r.ReadMsg()
 		if err != nil {

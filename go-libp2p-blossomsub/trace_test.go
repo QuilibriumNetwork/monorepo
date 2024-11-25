@@ -251,7 +251,7 @@ func TestPBTracer(t *testing.T) {
 	}
 	defer f.Close()
 
-	r := msgio.NewVarintReaderSize(f, DefaultMaxMessageSize)
+	r := msgio.NewVarintReaderSize(f, DefaultHardMaxMessageSize)
 
 	for {
 		evt.Reset()

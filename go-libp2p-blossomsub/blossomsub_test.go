@@ -2314,7 +2314,7 @@ func (sq *sybilSquatter) handleStream(s network.Stream) {
 
 	// send a subscription for test in the output stream to become candidate for GRAFT
 	// and then just read and ignore the incoming RPCs
-	r := msgio.NewVarintReaderSize(s, DefaultMaxMessageSize)
+	r := msgio.NewVarintReaderSize(s, DefaultHardMaxMessageSize)
 	w := msgio.NewVarintWriter(os)
 	truth := true
 	bitmask := []byte{0x00, 0x00, 0x81, 0x00}
@@ -2534,7 +2534,7 @@ func TestBlossomSubRPCFragmentation(t *testing.T) {
 	// (nMessages * msgSize) / ps.maxMessageSize total RPCs containing the messages we sent IWANTs for.
 	// The actual number will probably be larger, since there's some overhead for the RPC itself, and
 	// we probably aren't packing each RPC to it's maximum size
-	minExpectedRPCS := (nMessages * msgSize) / ps.maxMessageSize
+	minExpectedRPCS := (nMessages * msgSize) / ps.softMaxMessageSize
 	if iwe.rpcsWithMessages < minExpectedRPCS {
 		t.Fatalf("expected to receive at least %d RPCs containing messages, got %d", minExpectedRPCS, iwe.rpcsWithMessages)
 	}
@@ -2563,7 +2563,7 @@ func (iwe *iwantEverything) handleStream(s network.Stream) {
 	gossipMsgIdsReceived := make(map[string]struct{})
 
 	// send a subscription for test in the output stream to become candidate for gossip
-	r := msgio.NewVarintReaderSize(s, DefaultMaxMessageSize)
+	r := msgio.NewVarintReaderSize(s, DefaultHardMaxMessageSize)
 	w := msgio.NewVarintWriter(os)
 	truth := true
 	bitmasks := [][]byte{{0x00, 0x00, 0x80, 0x00}, {0x00, 0x00, 0x01, 0x00}}
