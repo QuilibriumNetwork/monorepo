@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"encoding/binary"
 	"encoding/hex"
 	"math/big"
 	"slices"
@@ -364,11 +363,14 @@ func NewTokenExecutionEngine(
 		}
 
 		if shouldResume {
-			msg := []byte("resume")
-			msg = binary.BigEndian.AppendUint64(msg, f.FrameNumber)
-			msg = append(msg, e.intrinsicFilter...)
-			sig, err := e.pubSub.SignMessage(msg)
-			if err != nil {
+			resume := &protobufs.AnnounceProverResume{
+				Filter:      e.intrinsicFilter,
+				FrameNumber: f.FrameNumber,
+			}
+			if err := resume.SignED448(e.pubSub.GetPublicKey(), e.pubSub.SignMessage); err != nil {
+				panic(err)
+			}
+			if err := resume.Validate(); err != nil {
 				panic(err)
 			}
 
@@ -391,21 +393,7 @@ func NewTokenExecutionEngine(
 			}
 			e.publishMessage(
 				append([]byte{0x00}, e.intrinsicFilter...),
-				&protobufs.TokenRequest{
-					Request: &protobufs.TokenRequest_Resume{
-						Resume: &protobufs.AnnounceProverResume{
-							Filter:      e.intrinsicFilter,
-							FrameNumber: f.FrameNumber,
-							PublicKeySignatureEd448: &protobufs.Ed448Signature{
-								PublicKey: &protobufs.Ed448PublicKey{
-									KeyValue: e.pubSub.GetPublicKey(),
-								},
-								Signature: sig,
-							},
-						},
-					},
-					Timestamp: gotime.Now().UnixMilli(),
-				},
+				resume.TokenRequest(),
 			)
 		}
 	}()
@@ -473,20 +461,20 @@ func (e *TokenExecutionEngine) ProcessMessage(
 	message *protobufs.Message,
 ) ([]*protobufs.Message, error) {
 	if bytes.Equal(address, e.GetSupportedApplications()[0].Address) {
-		any := &anypb.Any{}
-		if err := proto.Unmarshal(message.Payload, any); err != nil {
+		a := &anypb.Any{}
+		if err := proto.Unmarshal(message.Payload, a); err != nil {
 			return nil, errors.Wrap(err, "process message")
 		}
 
 		e.logger.Debug(
 			"processing execution message",
-			zap.String("type", any.TypeUrl),
+			zap.String("type", a.TypeUrl),
 		)
 
-		switch any.TypeUrl {
+		switch a.TypeUrl {
 		case protobufs.TokenRequestType:
 			if e.clock.IsInProverTrie(e.proverPublicKey) {
-				payload, err := proto.Marshal(any)
+				payload, err := proto.Marshal(a)
 				if err != nil {
 					return nil, errors.Wrap(err, "process message")
 				}
@@ -1114,19 +1102,19 @@ func (e *TokenExecutionEngine) publishMessage(
 	filter []byte,
 	message proto.Message,
 ) error {
-	any := &anypb.Any{}
-	if err := any.MarshalFrom(message); err != nil {
+	a := &anypb.Any{}
+	if err := a.MarshalFrom(message); err != nil {
 		return errors.Wrap(err, "publish message")
 	}
 
-	any.TypeUrl = strings.Replace(
-		any.TypeUrl,
+	a.TypeUrl = strings.Replace(
+		a.TypeUrl,
 		"type.googleapis.com",
 		"types.quilibrium.com",
 		1,
 	)
 
-	payload, err := proto.Marshal(any)
+	payload, err := proto.Marshal(a)
 	if err != nil {
 		return errors.Wrap(err, "publish message")
 	}
@@ -1378,8 +1366,14 @@ func (e *TokenExecutionEngine) AnnounceProverMerge() *protobufs.AnnounceProverRe
 		currentHead.FrameNumber < application.PROOF_FRAME_CUTOFF {
 		return nil
 	}
-	keys := [][]byte{}
-	ksigs := [][]byte{}
+
+	var helpers []protobufs.ED448SignHelper = []protobufs.ED448SignHelper{
+		{
+			PublicKey: e.pubSub.GetPublicKey(),
+			Sign:      e.pubSub.SignMessage,
+		},
+	}
+
 	if len(e.engineConfig.MultisigProverEnrollmentPaths) != 0 &&
 		e.GetSeniority().Cmp(GetAggregatedSeniority(
 			[]string{peer.ID(e.pubSub.GetPeerID()).String()},
@@ -1406,86 +1400,46 @@ func (e *TokenExecutionEngine) AnnounceProverMerge() *protobufs.AnnounceProverRe
 				panic(errors.Wrap(err, "error unmarshaling peerkey"))
 			}
 
-			keys = append(keys, pubBytes)
-			sig, err := privKey.Sign(e.pubSub.GetPublicKey())
-			if err != nil {
-				panic(errors.Wrap(err, "error unmarshaling peerkey"))
-			}
-			ksigs = append(ksigs, sig)
+			helpers = append(helpers, protobufs.ED448SignHelper{
+				PublicKey: pubBytes,
+				Sign:      privKey.Sign,
+			})
 		}
 	}
 
-	keyjoin := []byte{}
-	for _, k := range keys {
-		keyjoin = append(keyjoin, k...)
-	}
-
-	mainsig, err := e.pubSub.SignMessage(keyjoin)
-	if err != nil {
+	announce := &protobufs.AnnounceProverRequest{}
+	if err := announce.SignED448(helpers); err != nil {
 		panic(err)
 	}
-
-	announce := &protobufs.AnnounceProverRequest{
-		PublicKeySignaturesEd448: []*protobufs.Ed448Signature{},
-	}
-
-	announce.PublicKeySignaturesEd448 = append(
-		announce.PublicKeySignaturesEd448,
-		&protobufs.Ed448Signature{
-			PublicKey: &protobufs.Ed448PublicKey{
-				KeyValue: e.pubSub.GetPublicKey(),
-			},
-			Signature: mainsig,
-		},
-	)
-
-	for i := range keys {
-		announce.PublicKeySignaturesEd448 = append(
-			announce.PublicKeySignaturesEd448,
-			&protobufs.Ed448Signature{
-				PublicKey: &protobufs.Ed448PublicKey{
-					KeyValue: keys[i],
-				},
-				Signature: ksigs[i],
-			},
-		)
+	if err := announce.Validate(); err != nil {
+		panic(err)
 	}
 
 	return announce
 }
 
 func (e *TokenExecutionEngine) AnnounceProverJoin() {
-	msg := []byte("join")
 	head := e.GetFrame()
 	if head == nil ||
 		head.FrameNumber < application.PROOF_FRAME_CUTOFF {
 		return
 	}
-	msg = binary.BigEndian.AppendUint64(msg, head.FrameNumber)
-	msg = append(msg, bytes.Repeat([]byte{0xff}, 32)...)
-	sig, err := e.pubSub.SignMessage(msg)
-	if err != nil {
+
+	join := &protobufs.AnnounceProverJoin{
+		Filter:      bytes.Repeat([]byte{0xff}, 32),
+		FrameNumber: head.FrameNumber,
+		Announce:    e.AnnounceProverMerge(),
+	}
+	if err := join.SignED448(e.pubSub.GetPublicKey(), e.pubSub.SignMessage); err != nil {
+		panic(err)
+	}
+	if err := join.Validate(); err != nil {
 		panic(err)
 	}
 
 	e.publishMessage(
 		append([]byte{0x00}, e.intrinsicFilter...),
-		&protobufs.TokenRequest{
-			Request: &protobufs.TokenRequest_Join{
-				Join: &protobufs.AnnounceProverJoin{
-					Filter:      bytes.Repeat([]byte{0xff}, 32),
-					FrameNumber: head.FrameNumber,
-					PublicKeySignatureEd448: &protobufs.Ed448Signature{
-						Signature: sig,
-						PublicKey: &protobufs.Ed448PublicKey{
-							KeyValue: e.pubSub.GetPublicKey(),
-						},
-					},
-					Announce: e.AnnounceProverMerge(),
-				},
-			},
-			Timestamp: gotime.Now().UnixMilli(),
-		},
+		join.TokenRequest(),
 	)
 }
 

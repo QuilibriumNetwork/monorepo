@@ -31,13 +31,16 @@ var transferCmd = &cobra.Command{
 		defer conn.Close()
 
 		client := protobufs.NewNodeServiceClient(conn)
-		key, err := GetPrivKeyFromConfig(NodeConfig)
+		privKey, err := GetPrivKeyFromConfig(NodeConfig)
+		if err != nil {
+			panic(err)
+		}
+		pubKeyBytes, err := privKey.GetPublic().Raw()
 		if err != nil {
 			panic(err)
 		}
 
 		var coinaddr *protobufs.CoinRef
-		payload := []byte("transfer")
 		toaddr := []byte{}
 		for i, arg := range args {
 			addrHex, _ := strings.CutPrefix(arg, "0x")
@@ -53,42 +56,28 @@ var transferCmd = &cobra.Command{
 			coinaddr = &protobufs.CoinRef{
 				Address: addr,
 			}
-			payload = append(payload, addr...)
 		}
-		payload = append(payload, toaddr...)
 
-		sig, err := key.Sign(payload)
-		if err != nil {
+		transfer := &protobufs.TransferCoinRequest{
+			OfCoin: coinaddr,
+			ToAccount: &protobufs.AccountRef{
+				Account: &protobufs.AccountRef_ImplicitAccount{
+					ImplicitAccount: &protobufs.ImplicitAccount{
+						Address: toaddr,
+					},
+				},
+			},
+		}
+		if err := transfer.SignED448(pubKeyBytes, privKey.Sign); err != nil {
 			panic(err)
 		}
-
-		pub, err := key.GetPublic().Raw()
-		if err != nil {
+		if err := transfer.Validate(); err != nil {
 			panic(err)
 		}
 
 		_, err = client.SendMessage(
 			context.Background(),
-			&protobufs.TokenRequest{
-				Request: &protobufs.TokenRequest_Transfer{
-					Transfer: &protobufs.TransferCoinRequest{
-						OfCoin: coinaddr,
-						ToAccount: &protobufs.AccountRef{
-							Account: &protobufs.AccountRef_ImplicitAccount{
-								ImplicitAccount: &protobufs.ImplicitAccount{
-									Address: toaddr,
-								},
-							},
-						},
-						Signature: &protobufs.Ed448Signature{
-							Signature: sig,
-							PublicKey: &protobufs.Ed448PublicKey{
-								KeyValue: pub,
-							},
-						},
-					},
-				},
-			},
+			transfer.TokenRequest(),
 		)
 		if err != nil {
 			panic(err)

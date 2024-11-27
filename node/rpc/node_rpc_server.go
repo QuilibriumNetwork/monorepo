@@ -221,20 +221,20 @@ func (r *RPCServer) SendMessage(
 ) (*protobufs.SendMessageResponse, error) {
 	req.Timestamp = time.Now().UnixMilli()
 
-	any := &anypb.Any{}
-	if err := any.MarshalFrom(req); err != nil {
+	a := &anypb.Any{}
+	if err := a.MarshalFrom(req); err != nil {
 		return nil, errors.Wrap(err, "publish message")
 	}
 
 	// annoying protobuf any hack
-	any.TypeUrl = strings.Replace(
-		any.TypeUrl,
+	a.TypeUrl = strings.Replace(
+		a.TypeUrl,
 		"type.googleapis.com",
 		"types.quilibrium.com",
 		1,
 	)
 
-	payload, err := proto.Marshal(any)
+	payload, err := proto.Marshal(a)
 	if err != nil {
 		return nil, errors.Wrap(err, "publish message")
 	}

@@ -70,10 +70,6 @@ func TestHandleProverJoin(t *testing.T) {
 	}
 
 	addr := addrBI.FillBytes(make([]byte, 32))
-	payload := []byte("join")
-	payload = binary.BigEndian.AppendUint64(payload, 0)
-	payload = append(payload, bytes.Repeat([]byte{0xff}, 32)...)
-	sig, _ := privKey.Sign(payload)
 	wprover := qcrypto.NewWesolowskiFrameProver(app.Logger)
 	gen, _, err := wprover.CreateDataGenesisFrame(
 		p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3),
@@ -87,24 +83,17 @@ func TestHandleProverJoin(t *testing.T) {
 	app.ClockStore.StageDataClockFrame(selbi.FillBytes(make([]byte, 32)), gen, txn)
 	app.ClockStore.CommitDataClockFrame(gen.Filter, 0, selbi.FillBytes(make([]byte, 32)), app.Tries, txn, false)
 	txn.Commit()
+	join := &protobufs.AnnounceProverJoin{
+		Filter:      bytes.Repeat([]byte{0xff}, 32),
+		FrameNumber: 0,
+	}
+	assert.NoError(t, join.SignED448(pubkey, privKey.Sign))
+	assert.NoError(t, join.Validate())
 	app, success, fail, err := app.ApplyTransitions(
 		1,
 		&protobufs.TokenRequests{
 			Requests: []*protobufs.TokenRequest{
-				&protobufs.TokenRequest{
-					Request: &protobufs.TokenRequest_Join{
-						Join: &protobufs.AnnounceProverJoin{
-							Filter:      bytes.Repeat([]byte{0xff}, 32),
-							FrameNumber: 0,
-							PublicKeySignatureEd448: &protobufs.Ed448Signature{
-								Signature: sig,
-								PublicKey: &protobufs.Ed448PublicKey{
-									KeyValue: pubkey,
-								},
-							},
-						},
-					},
-				},
+				join.TokenRequest(),
 			},
 		},
 		false,
@@ -121,24 +110,17 @@ func TestHandleProverJoin(t *testing.T) {
 	app.ClockStore.StageDataClockFrame(selbi.FillBytes(make([]byte, 32)), frame1, txn)
 	app.ClockStore.CommitDataClockFrame(frame1.Filter, 1, selbi.FillBytes(make([]byte, 32)), app.Tries, txn, false)
 	txn.Commit()
+	join = &protobufs.AnnounceProverJoin{
+		Filter:      bytes.Repeat([]byte{0xff}, 32),
+		FrameNumber: 0,
+	}
+	assert.NoError(t, join.SignED448(pubkey, privKey.Sign))
+	assert.NoError(t, join.Validate())
 	_, success, fail, err = app.ApplyTransitions(
 		2,
 		&protobufs.TokenRequests{
 			Requests: []*protobufs.TokenRequest{
-				&protobufs.TokenRequest{
-					Request: &protobufs.TokenRequest_Join{
-						Join: &protobufs.AnnounceProverJoin{
-							Filter:      bytes.Repeat([]byte{0xff}, 32),
-							FrameNumber: 0,
-							PublicKeySignatureEd448: &protobufs.Ed448Signature{
-								Signature: sig,
-								PublicKey: &protobufs.Ed448PublicKey{
-									KeyValue: pubkey,
-								},
-							},
-						},
-					},
-				},
+				join.TokenRequest(),
 			},
 		},
 		false,
@@ -175,7 +157,7 @@ func TestHandleProverJoin(t *testing.T) {
 	fmt.Printf("%x\n", individualChallenge)
 	out2, _ := wprover.CalculateChallengeProof(individualChallenge, 10000)
 
-	proofTree, payload, output, err := tries.PackOutputIntoPayloadAndProof(
+	proofTree, output, err := tries.PackOutputIntoPayloadAndProof(
 		[]merkletree.DataBlock{tries.NewProofLeaf(out1), tries.NewProofLeaf(out2)},
 		2,
 		frame2,
@@ -183,22 +165,15 @@ func TestHandleProverJoin(t *testing.T) {
 	)
 	assert.NoError(t, err)
 
-	sig, _ = privKey.Sign(payload)
+	mint := &protobufs.MintCoinRequest{
+		Proofs: output,
+	}
+	assert.NoError(t, mint.SignED448(pubkey, privKey.Sign))
+	assert.NoError(t, mint.Validate())
+
 	app, success, _, err = app.ApplyTransitions(2, &protobufs.TokenRequests{
 		Requests: []*protobufs.TokenRequest{
-			&protobufs.TokenRequest{
-				Request: &protobufs.TokenRequest_Mint{
-					Mint: &protobufs.MintCoinRequest{
-						Proofs: output,
-						Signature: &protobufs.Ed448Signature{
-							PublicKey: &protobufs.Ed448PublicKey{
-								KeyValue: pubkey,
-							},
-							Signature: sig,
-						},
-					},
-				},
-			},
+			mint.TokenRequest(),
 		},
 	}, false)
 
@@ -240,7 +215,7 @@ func TestHandleProverJoin(t *testing.T) {
 	app.ClockStore.CommitDataClockFrame(frame3.Filter, 3, selbi.FillBytes(make([]byte, 32)), app.Tries, txn, false)
 	txn.Commit()
 
-	proofTree, payload, output, err = tries.PackOutputIntoPayloadAndProof(
+	proofTree, output, err = tries.PackOutputIntoPayloadAndProof(
 		[]merkletree.DataBlock{tries.NewProofLeaf(out1), tries.NewProofLeaf(out2)},
 		2,
 		frame3,
@@ -248,22 +223,15 @@ func TestHandleProverJoin(t *testing.T) {
 	)
 	assert.NoError(t, err)
 
-	sig, _ = privKey.Sign(payload)
+	mint = &protobufs.MintCoinRequest{
+		Proofs: output,
+	}
+	assert.NoError(t, mint.SignED448(pubkey, privKey.Sign))
+	assert.NoError(t, mint.Validate())
+
 	app, success, _, err = app.ApplyTransitions(3, &protobufs.TokenRequests{
 		Requests: []*protobufs.TokenRequest{
-			&protobufs.TokenRequest{
-				Request: &protobufs.TokenRequest_Mint{
-					Mint: &protobufs.MintCoinRequest{
-						Proofs: output,
-						Signature: &protobufs.Ed448Signature{
-							PublicKey: &protobufs.Ed448PublicKey{
-								KeyValue: pubkey,
-							},
-							Signature: sig,
-						},
-					},
-				},
-			},
+			mint.TokenRequest(),
 		},
 	}, false)
 	assert.NoError(t, err)

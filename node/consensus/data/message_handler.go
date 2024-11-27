@@ -34,31 +34,18 @@ func (e *DataClockConsensusEngine) runFrameMessageHandler() {
 				continue
 			}
 
-			any := &anypb.Any{}
-			if err := proto.Unmarshal(msg.Payload, any); err != nil {
+			a := &anypb.Any{}
+			if err := proto.Unmarshal(msg.Payload, a); err != nil {
 				e.logger.Error("error while unmarshaling", zap.Error(err))
 				continue
 			}
 
-			accepted := false
-			switch any.TypeUrl {
-			//expand for future message types
-			case protobufs.ClockFrameType:
-				accepted = true
-			default:
-			}
-
-			if !accepted {
-				e.pubSub.AddPeerScore(message.From, -100000)
-				continue
-			}
-
-			switch any.TypeUrl {
+			switch a.TypeUrl {
 			case protobufs.ClockFrameType:
 				if err := e.handleClockFrameData(
 					message.From,
 					msg.Address,
-					any,
+					a,
 					false,
 				); err != nil {
 					e.logger.Debug("could not handle clock frame data", zap.Error(err))
@@ -83,21 +70,8 @@ func (e *DataClockConsensusEngine) runTxMessageHandler() {
 				continue
 			}
 
-			any := &anypb.Any{}
-			if err := proto.Unmarshal(msg.Payload, any); err != nil {
-				continue
-			}
-
-			accepted := false
-			switch any.TypeUrl {
-			//expand for future message types
-			case protobufs.TokenRequestType:
-				accepted = true
-			default:
-			}
-
-			if !accepted {
-				e.pubSub.AddPeerScore(message.From, -100000)
+			a := &anypb.Any{}
+			if err := proto.Unmarshal(msg.Payload, a); err != nil {
 				continue
 			}
 
@@ -122,8 +96,8 @@ func (e *DataClockConsensusEngine) runTxMessageHandler() {
 						}
 
 						for _, appMessage := range messages {
-							appMsg := &anypb.Any{}
-							err := proto.Unmarshal(appMessage.Payload, appMsg)
+							a := &anypb.Any{}
+							err := proto.Unmarshal(appMessage.Payload, a)
 							if err != nil {
 								e.logger.Error(
 									"could not unmarshal app message",
@@ -133,10 +107,10 @@ func (e *DataClockConsensusEngine) runTxMessageHandler() {
 								continue
 							}
 
-							switch appMsg.TypeUrl {
+							switch a.TypeUrl {
 							case protobufs.TokenRequestType:
 								t := &protobufs.TokenRequest{}
-								err := proto.Unmarshal(appMsg.Value, t)
+								err := proto.Unmarshal(a.Value, t)
 								if err != nil {
 									e.logger.Debug("could not unmarshal token request", zap.Error(err))
 									continue
@@ -172,31 +146,18 @@ func (e *DataClockConsensusEngine) runInfoMessageHandler() {
 				continue
 			}
 
-			any := &anypb.Any{}
-			if err := proto.Unmarshal(msg.Payload, any); err != nil {
+			a := &anypb.Any{}
+			if err := proto.Unmarshal(msg.Payload, a); err != nil {
 				e.logger.Error("error while unmarshaling", zap.Error(err))
 				continue
 			}
 
-			accepted := false
-			switch any.TypeUrl {
-			//expand for future message types
-			case protobufs.DataPeerListAnnounceType:
-				accepted = true
-			default:
-			}
-
-			if !accepted {
-				e.pubSub.AddPeerScore(message.From, -100000)
-				continue
-			}
-
-			switch any.TypeUrl {
+			switch a.TypeUrl {
 			case protobufs.DataPeerListAnnounceType:
 				if err := e.handleDataPeerListAnnounce(
 					message.From,
 					msg.Address,
-					any,
+					a,
 				); err != nil {
 					e.logger.Debug("could not handle data peer list announce", zap.Error(err))
 				}

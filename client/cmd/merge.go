@@ -37,7 +37,7 @@ var mergeCmd = &cobra.Command{
 			panic(err)
 		}
 
-		pub, err := privKey.GetPublic().Raw()
+		pubKeyBytes, err := privKey.GetPublic().Raw()
 		if err != nil {
 			panic(err)
 		}
@@ -48,7 +48,7 @@ var mergeCmd = &cobra.Command{
 
 		addrBytes := addr.FillBytes(make([]byte, 32))
 
-		altAddr, err := poseidon.HashBytes([]byte(pub))
+		altAddr, err := poseidon.HashBytes([]byte(pubKeyBytes))
 		if err != nil {
 			panic(err)
 		}
@@ -109,34 +109,20 @@ var mergeCmd = &cobra.Command{
 			}
 		}
 
-		// Create payload for merge operation
-		payload := []byte("merge")
-		for _, coinRef := range coinaddrs {
-			payload = append(payload, coinRef.Address...)
+		merge := &protobufs.MergeCoinRequest{
+			Coins: coinaddrs,
 		}
-
-		// Signing process
-		sig, err := privKey.Sign(payload)
-		if err != nil {
+		if err := merge.SignED448(pubKeyBytes, privKey.Sign); err != nil {
+			panic(err)
+		}
+		if err := merge.Validate(); err != nil {
 			panic(err)
 		}
 
 		// Send merge request
 		_, err = client.SendMessage(
 			context.Background(),
-			&protobufs.TokenRequest{
-				Request: &protobufs.TokenRequest_Merge{
-					Merge: &protobufs.MergeCoinRequest{
-						Coins: coinaddrs,
-						Signature: &protobufs.Ed448Signature{
-							Signature: sig,
-							PublicKey: &protobufs.Ed448PublicKey{
-								KeyValue: pub,
-							},
-						},
-					},
-				},
-			},
+			merge.TokenRequest(),
 		)
 		if err != nil {
 			panic(err)

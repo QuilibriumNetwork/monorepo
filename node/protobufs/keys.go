@@ -182,6 +182,11 @@ func (s *Ed448Signature) Verify(msg []byte) error {
 		return errors.Wrap(errors.New("invalid length for signature"), "verify")
 	}
 
+	return s.verifyUnsafe(msg)
+}
+
+// verifyUnsafe is used to verify a signature without checking the length of the public key and signature.
+func (s *Ed448Signature) verifyUnsafe(msg []byte) error {
 	if !ed448.Verify(s.PublicKey.KeyValue, msg, s.Signature, "") {
 		return errors.Wrap(errors.New("invalid signature for public key"), "verify")
 	}

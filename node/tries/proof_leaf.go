@@ -31,9 +31,9 @@ func PackOutputIntoPayloadAndProof(
 	modulo int,
 	frame *protobufs.ClockFrame,
 	previousTree *mt.MerkleTree,
-) (*mt.MerkleTree, []byte, [][]byte, error) {
+) (*mt.MerkleTree, [][]byte, error) {
 	if modulo != len(outputs) {
-		return nil, nil, nil, errors.Wrap(
+		return nil, nil, errors.Wrap(
 			errors.New("mismatch of outputs and prover size"),
 			"pack output into payload and proof",
 		)
@@ -50,13 +50,8 @@ func PackOutputIntoPayloadAndProof(
 		outputs,
 	)
 	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "pack output into payload and proof")
+		return nil, nil, errors.Wrap(err, "pack output into payload and proof")
 	}
-
-	payload := []byte("mint")
-	payload = append(payload, tree.Root...)
-	payload = binary.BigEndian.AppendUint32(payload, uint32(modulo))
-	payload = binary.BigEndian.AppendUint64(payload, frame.FrameNumber)
 
 	output := [][]byte{
 		tree.Root,
@@ -68,19 +63,14 @@ func PackOutputIntoPayloadAndProof(
 		hash := sha3.Sum256(frame.Output)
 		pick := BytesToUnbiasedMod(hash, uint64(modulo))
 		if uint64(modulo) < pick {
-			return nil, nil, nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				errors.New("proof size mismatch"),
 				"pack output into payload and proof",
 			)
 		}
 		for _, sib := range previousTree.Proofs[int(pick)].Siblings {
-			payload = append(payload, sib...)
 			output = append(output, sib)
 		}
-		payload = binary.BigEndian.AppendUint32(
-			payload,
-			previousTree.Proofs[int(pick)].Path,
-		)
 		output = append(
 			output,
 			binary.BigEndian.AppendUint32(
@@ -88,10 +78,9 @@ func PackOutputIntoPayloadAndProof(
 				previousTree.Proofs[int(pick)].Path,
 			),
 		)
-		payload = append(payload, previousTree.Leaves[int(pick)]...)
 		output = append(output, previousTree.Leaves[int(pick)])
 	}
-	return tree, payload, output, nil
+	return tree, output, nil
 }
 
 func UnpackAndVerifyOutput(

@@ -1,8 +1,6 @@
 package application
 
 import (
-	"encoding/binary"
-
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -50,25 +48,7 @@ func (a *TokenApplication) handleDataAnnounceProverJoin(
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle join")
 	}
 
-	payload := []byte("join")
-
-	if t == nil || t.PublicKeySignatureEd448 == nil {
-		a.Logger.Debug("invalid data for join")
-
-		return nil, errors.Wrap(ErrInvalidStateTransition, "handle join")
-	}
-
-	if t.PublicKeySignatureEd448.PublicKey == nil ||
-		t.PublicKeySignatureEd448.Signature == nil ||
-		t.PublicKeySignatureEd448.PublicKey.KeyValue == nil ||
-		t.Filter == nil || len(t.Filter) != 32 {
-		a.Logger.Debug(
-			"bad payload",
-			zap.Uint64("given_frame_number", t.FrameNumber),
-			zap.Uint64("current_frame_number", currentFrameNumber),
-			zap.Int("filter_length", len(t.Filter)),
-		)
-
+	if err := t.Validate(); err != nil {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle join")
 	}
 
@@ -77,13 +57,6 @@ func (a *TokenApplication) handleDataAnnounceProverJoin(
 	)]; touched {
 		a.Logger.Debug("already attempted join")
 
-		return nil, errors.Wrap(ErrInvalidStateTransition, "handle join")
-	}
-	payload = binary.BigEndian.AppendUint64(payload, t.FrameNumber)
-	payload = append(payload, t.Filter...)
-
-	if err := t.PublicKeySignatureEd448.Verify(payload); err != nil {
-		a.Logger.Debug("can't verify signature")
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle join")
 	}
 

@@ -16,19 +16,16 @@ func (a *TokenApplication) handleMerge(
 	lockMap map[string]struct{},
 	t *protobufs.MergeCoinRequest,
 ) ([]*protobufs.TokenOutput, error) {
+	if err := t.Validate(); err != nil {
+		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
+	}
+
 	newCoin := &protobufs.Coin{}
 	newTotal := new(big.Int)
 	newIntersection := make([]byte, 1024)
-	payload := []byte("merge")
-	if t == nil || t.Coins == nil || t.Signature == nil {
-		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
-	}
+
 	addresses := [][]byte{}
 	for _, c := range t.Coins {
-		if c.Address == nil || len(c.Address) != 32 {
-			return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
-		}
-
 		if _, touched := lockMap[string(c.Address)]; touched {
 			return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 		}
@@ -40,14 +37,6 @@ func (a *TokenApplication) handleMerge(
 		}
 
 		addresses = append(addresses, c.Address)
-		payload = append(payload, c.Address...)
-	}
-	if t.Signature.PublicKey == nil ||
-		t.Signature.Signature == nil {
-		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
-	}
-	if err := t.Signature.Verify(payload); err != nil {
-		return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 	}
 
 	addr, err := poseidon.HashBytes(t.Signature.PublicKey.KeyValue)

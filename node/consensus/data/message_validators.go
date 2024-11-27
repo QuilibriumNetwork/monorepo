@@ -52,6 +52,9 @@ func (e *DataClockConsensusEngine) validateTxMessage(peerID peer.ID, message *pb
 		if err := proto.Unmarshal(a.Value, tx); err != nil {
 			return p2p.ValidationResultReject
 		}
+		if err := tx.Validate(); err != nil {
+			return p2p.ValidationResultReject
+		}
 		if mint := tx.GetMint(); mint != nil {
 			if len(mint.Proofs) < 3 {
 				return p2p.ValidationResultReject
@@ -61,16 +64,6 @@ func (e *DataClockConsensusEngine) validateTxMessage(peerID peer.ID, message *pb
 			}
 			if len(mint.Proofs[2]) != 8 {
 				return p2p.ValidationResultReject
-			}
-			if mint.Signature == nil ||
-				mint.Signature.PublicKey == nil ||
-				mint.Signature.PublicKey.KeyValue == nil ||
-				len(mint.Signature.PublicKey.KeyValue) > 114 {
-				return p2p.ValidationResultReject
-			}
-			head, err := e.dataTimeReel.Head()
-			if err != nil {
-				panic(err)
 			}
 
 			// cheap hack for handling protobuf trickery: because protobufs can be
@@ -89,8 +82,13 @@ func (e *DataClockConsensusEngine) validateTxMessage(peerID peer.ID, message *pb
 			e.validationFilter[id] = struct{}{}
 			e.validationFilterMx.Unlock()
 			if ok {
-				e.pubSub.AddPeerScore([]byte(message.From), -1000000)
+				e.pubSub.AddPeerScore(message.From, -1000000)
 				return p2p.ValidationResultIgnore
+			}
+
+			head, err := e.dataTimeReel.Head()
+			if err != nil {
+				panic(err)
 			}
 			if frameNumber+2 < head.FrameNumber {
 				return p2p.ValidationResultIgnore
@@ -99,7 +97,6 @@ func (e *DataClockConsensusEngine) validateTxMessage(peerID peer.ID, message *pb
 		if tx.Timestamp == 0 {
 			// NOTE: The timestamp was added in later versions of the protocol,
 			// and as such it is possible to receive requests without it.
-			// We avoid logging due to this reason.
 			return p2p.ValidationResultAccept
 		}
 		if ts := time.UnixMilli(tx.Timestamp); time.Since(ts) > 10*time.Minute {

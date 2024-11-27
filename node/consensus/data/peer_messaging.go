@@ -186,6 +186,10 @@ func (e *DataClockConsensusEngine) handleMint(
 		return nil, errors.Wrap(errors.New("wrong destination"), "handle mint")
 	}
 
+	if err := t.Validate(); err != nil {
+		return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
+	}
+
 	returnAddr := []byte{}
 	e.preMidnightMintMx.Lock()
 	if _, active := e.preMidnightMint[string(
@@ -211,17 +215,6 @@ func (e *DataClockConsensusEngine) handleMint(
 		return nil, errors.Wrap(errors.New("busy"), "handle mint")
 	}
 
-	if t == nil || t.Proofs == nil {
-		return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
-	}
-
-	payload := []byte("mint")
-	for _, p := range t.Proofs {
-		payload = append(payload, p...)
-	}
-	if err := t.Signature.Verify(payload); err != nil {
-		return nil, errors.Wrap(application.ErrInvalidStateTransition, "handle mint")
-	}
 	pk, err := pcrypto.UnmarshalEd448PublicKey(
 		t.Signature.PublicKey.KeyValue,
 	)

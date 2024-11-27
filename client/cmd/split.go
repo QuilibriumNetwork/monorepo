@@ -29,7 +29,6 @@ var splitCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		payload := []byte("split")
 		coinaddrHex, _ := strings.CutPrefix(args[0], "0x")
 		coinaddr, err := hex.DecodeString(coinaddrHex)
 		if err != nil {
@@ -38,7 +37,6 @@ var splitCmd = &cobra.Command{
 		coin := &protobufs.CoinRef{
 			Address: coinaddr,
 		}
-		payload = append(payload, coinaddr...)
 
 		conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
 		amounts := [][]byte{}
@@ -51,7 +49,6 @@ var splitCmd = &cobra.Command{
 			amount = amount.Mul(decimal.NewFromBigInt(conversionFactor, 0))
 			amountBytes := amount.BigInt().FillBytes(make([]byte, 32))
 			amounts = append(amounts, amountBytes)
-			payload = append(payload, amountBytes...)
 		}
 
 		conn, err := GetGRPCClient()
@@ -61,37 +58,29 @@ var splitCmd = &cobra.Command{
 		defer conn.Close()
 
 		client := protobufs.NewNodeServiceClient(conn)
-		key, err := GetPrivKeyFromConfig(NodeConfig)
+		privKey, err := GetPrivKeyFromConfig(NodeConfig)
+		if err != nil {
+			panic(err)
+		}
+		pubKeyBytes, err := privKey.GetPublic().Raw()
 		if err != nil {
 			panic(err)
 		}
 
-		sig, err := key.Sign(payload)
-		if err != nil {
+		split := &protobufs.SplitCoinRequest{
+			OfCoin:  coin,
+			Amounts: amounts,
+		}
+		if err := split.SignED448(pubKeyBytes, privKey.Sign); err != nil {
 			panic(err)
 		}
-
-		pub, err := key.GetPublic().Raw()
-		if err != nil {
+		if err := split.Validate(); err != nil {
 			panic(err)
 		}
 
 		_, err = client.SendMessage(
 			context.Background(),
-			&protobufs.TokenRequest{
-				Request: &protobufs.TokenRequest_Split{
-					Split: &protobufs.SplitCoinRequest{
-						OfCoin:  coin,
-						Amounts: amounts,
-						Signature: &protobufs.Ed448Signature{
-							Signature: sig,
-							PublicKey: &protobufs.Ed448PublicKey{
-								KeyValue: pub,
-							},
-						},
-					},
-				},
-			},
+			split.TokenRequest(),
 		)
 		if err != nil {
 			panic(err)

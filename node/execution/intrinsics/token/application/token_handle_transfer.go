@@ -16,12 +16,7 @@ func (a *TokenApplication) handleTransfer(
 	lockMap map[string]struct{},
 	t *protobufs.TransferCoinRequest,
 ) ([]*protobufs.TokenOutput, error) {
-	payload := []byte("transfer")
-	if t == nil || t.Signature == nil || t.OfCoin == nil ||
-		t.OfCoin.Address == nil || len(t.OfCoin.Address) != 32 ||
-		t.ToAccount == nil || t.ToAccount.GetImplicitAccount() == nil ||
-		t.ToAccount.GetImplicitAccount().Address == nil ||
-		len(t.ToAccount.GetImplicitAccount().Address) != 32 {
+	if err := t.Validate(); err != nil {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle transfer")
 	}
 
@@ -31,16 +26,6 @@ func (a *TokenApplication) handleTransfer(
 
 	coin, err := a.CoinStore.GetCoinByAddress(nil, t.OfCoin.Address)
 	if err != nil {
-		return nil, errors.Wrap(ErrInvalidStateTransition, "handle transfer")
-	}
-
-	payload = append(payload, t.OfCoin.Address...)
-	payload = append(
-		payload,
-		t.ToAccount.GetImplicitAccount().Address...,
-	)
-
-	if err := t.Signature.Verify(payload); err != nil {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle transfer")
 	}
 

@@ -161,15 +161,12 @@ func (a *TokenApplication) ApplyTransitions(
 		i := i
 		switch t := transition.Request.(type) {
 		case *protobufs.TokenRequest_Mint:
-			if t == nil || t.Mint.Proofs == nil || t.Mint.Signature == nil {
+			if t == nil {
+				fails[i] = transition
 				continue
 			}
-
-			payload := []byte("mint")
-			for _, p := range t.Mint.Proofs {
-				payload = append(payload, p...)
-			}
-			if err := t.Mint.Signature.Verify(payload); err != nil {
+			if err := t.Mint.Validate(); err != nil {
+				fails[i] = transition
 				continue
 			}
 
@@ -177,6 +174,7 @@ func (a *TokenApplication) ApplyTransitions(
 				t.Mint.Signature.PublicKey.KeyValue,
 			)
 			if err != nil {
+				fails[i] = transition
 				continue
 			}
 

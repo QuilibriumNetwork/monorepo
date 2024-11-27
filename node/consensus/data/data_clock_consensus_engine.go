@@ -3,7 +3,6 @@ package data
 import (
 	"context"
 	"crypto"
-	"encoding/binary"
 	stderrors "errors"
 
 	"fmt"
@@ -646,29 +645,18 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 	e.stateMx.Unlock()
 	errChan := make(chan error)
 
-	msg := []byte("pause")
-	msg = binary.BigEndian.AppendUint64(msg, e.GetFrame().FrameNumber)
-	msg = append(msg, e.filter...)
-	sig, err := e.pubSub.SignMessage(msg)
-	if err != nil {
+	pause := &protobufs.AnnounceProverPause{
+		Filter:      e.filter,
+		FrameNumber: e.GetFrame().FrameNumber,
+	}
+	if err := pause.SignED448(e.pubSub.GetPublicKey(), e.pubSub.SignMessage); err != nil {
+		panic(err)
+	}
+	if err := pause.Validate(); err != nil {
 		panic(err)
 	}
 
-	e.publishMessage(e.txFilter, &protobufs.TokenRequest{
-		Request: &protobufs.TokenRequest_Pause{
-			Pause: &protobufs.AnnounceProverPause{
-				Filter:      e.filter,
-				FrameNumber: e.GetFrame().FrameNumber,
-				PublicKeySignatureEd448: &protobufs.Ed448Signature{
-					PublicKey: &protobufs.Ed448PublicKey{
-						KeyValue: e.pubSub.GetPublicKey(),
-					},
-					Signature: sig,
-				},
-			},
-		},
-		Timestamp: time.Now().UnixMilli(),
-	})
+	e.publishMessage(e.txFilter, pause.TokenRequest())
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(e.executionEngines))

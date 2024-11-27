@@ -102,19 +102,19 @@ func (e *DataClockConsensusEngine) insertTxMessage(
 	filter []byte,
 	message proto.Message,
 ) error {
-	any := &anypb.Any{}
-	if err := any.MarshalFrom(message); err != nil {
+	a := &anypb.Any{}
+	if err := a.MarshalFrom(message); err != nil {
 		return errors.Wrap(err, "publish message")
 	}
 
-	any.TypeUrl = strings.Replace(
-		any.TypeUrl,
+	a.TypeUrl = strings.Replace(
+		a.TypeUrl,
 		"type.googleapis.com",
 		"types.quilibrium.com",
 		1,
 	)
 
-	payload, err := proto.Marshal(any)
+	payload, err := proto.Marshal(a)
 	if err != nil {
 		return errors.Wrap(err, "publish message")
 	}
@@ -156,19 +156,19 @@ func (e *DataClockConsensusEngine) publishMessage(
 	filter []byte,
 	message proto.Message,
 ) error {
-	any := &anypb.Any{}
-	if err := any.MarshalFrom(message); err != nil {
+	a := &anypb.Any{}
+	if err := a.MarshalFrom(message); err != nil {
 		return errors.Wrap(err, "publish message")
 	}
 
-	any.TypeUrl = strings.Replace(
-		any.TypeUrl,
+	a.TypeUrl = strings.Replace(
+		a.TypeUrl,
 		"type.googleapis.com",
 		"types.quilibrium.com",
 		1,
 	)
 
-	payload, err := proto.Marshal(any)
+	payload, err := proto.Marshal(a)
 	if err != nil {
 		return errors.Wrap(err, "publish message")
 	}

@@ -16,37 +16,19 @@ func (a *TokenApplication) handleSplit(
 	lockMap map[string]struct{},
 	t *protobufs.SplitCoinRequest,
 ) ([]*protobufs.TokenOutput, error) {
-	newCoins := []*protobufs.Coin{}
-	newAmounts := []*big.Int{}
-	payload := []byte{}
-	if t.Signature == nil || t.OfCoin == nil || t.OfCoin.Address == nil ||
-		len(t.OfCoin.Address) != 32 {
+	if err := t.Validate(); err != nil {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
+
+	newCoins := []*protobufs.Coin{}
+	newAmounts := []*big.Int{}
+
 	coin, err := a.CoinStore.GetCoinByAddress(nil, t.OfCoin.Address)
 	if err != nil {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
 	if _, touched := lockMap[string(t.OfCoin.Address)]; touched {
-		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
-	}
-
-	payload = append(payload, []byte("split")...)
-	payload = append(payload, t.OfCoin.Address...)
-
-	if len(t.Amounts) > 100 {
-		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
-	}
-
-	for _, a := range t.Amounts {
-		if len(a) > 32 {
-			return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
-		}
-		payload = append(payload, a...)
-	}
-
-	if err := t.Signature.Verify(payload); err != nil {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}
 
