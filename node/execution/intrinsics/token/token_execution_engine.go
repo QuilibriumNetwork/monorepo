@@ -473,7 +473,7 @@ func (e *TokenExecutionEngine) ProcessMessage(
 
 		switch a.TypeUrl {
 		case protobufs.TokenRequestType:
-			if e.clock.IsInProverTrie(e.proverPublicKey) {
+			if e.clock.FrameProverTriesContains(e.provingKeyAddress) {
 				payload, err := proto.Marshal(a)
 				if err != nil {
 					return nil, errors.Wrap(err, "process message")
