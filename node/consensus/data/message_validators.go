@@ -94,11 +94,6 @@ func (e *DataClockConsensusEngine) validateTxMessage(peerID peer.ID, message *pb
 				return p2p.ValidationResultIgnore
 			}
 		}
-		if tx.Timestamp == 0 {
-			// NOTE: The timestamp was added in later versions of the protocol,
-			// and as such it is possible to receive requests without it.
-			return p2p.ValidationResultAccept
-		}
 		if ts := time.UnixMilli(tx.Timestamp); time.Since(ts) > 10*time.Minute {
 			return p2p.ValidationResultIgnore
 		}
