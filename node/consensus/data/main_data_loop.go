@@ -59,10 +59,35 @@ func (e *DataClockConsensusEngine) GetFrameProverTrie(i int) *tries.RollingFrece
 	return newTrie
 }
 
+func (e *DataClockConsensusEngine) FrameProverTriesContains(
+	key []byte,
+) bool {
+	e.frameProverTriesMx.RLock()
+	defer e.frameProverTriesMx.RUnlock()
+	for _, trie := range e.frameProverTries {
+		if trie.Contains(key) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *DataClockConsensusEngine) FrameProverTrieContains(
+	i int,
+	key []byte,
+) bool {
+	e.frameProverTriesMx.RLock()
+	defer e.frameProverTriesMx.RUnlock()
+	if i < 0 || i >= len(e.frameProverTries) {
+		return false
+	}
+	return e.frameProverTries[i].Contains(key)
+}
+
 func (e *DataClockConsensusEngine) runFramePruning() {
 	defer e.wg.Done()
 	// A full prover should _never_ do this
-	if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) ||
+	if e.FrameProverTrieContains(0, e.provingKeyAddress) ||
 		e.config.Engine.MaxFrames == -1 || e.config.Engine.FullProver {
 		e.logger.Info("frame pruning not enabled")
 		return
@@ -105,7 +130,7 @@ func (e *DataClockConsensusEngine) runFramePruning() {
 func (e *DataClockConsensusEngine) runSync() {
 	defer e.wg.Done()
 	// small optimization, beacon should never collect for now:
-	if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
+	if e.FrameProverTrieContains(0, e.provingKeyAddress) {
 		return
 	}
 
@@ -147,7 +172,7 @@ func (e *DataClockConsensusEngine) runLoop() {
 			}
 
 			if runOnce {
-				if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
+				if e.FrameProverTrieContains(0, e.provingKeyAddress) {
 					dataFrame, err := e.dataTimeReel.Head()
 					if err != nil {
 						panic(err)
@@ -165,7 +190,7 @@ func (e *DataClockConsensusEngine) runLoop() {
 				e.validationFilterMx.Lock()
 				e.validationFilter = make(map[string]struct{}, len(e.validationFilter))
 				e.validationFilterMx.Unlock()
-				if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
+				if e.FrameProverTrieContains(0, e.provingKeyAddress) {
 					if err = e.publishProof(dataFrame); err != nil {
 						e.logger.Error("could not publish", zap.Error(err))
 						e.stateMx.Lock()
@@ -191,7 +216,7 @@ func (e *DataClockConsensusEngine) processFrame(
 		zap.Duration("frame_age", frametime.Since(dataFrame)),
 	)
 	var err error
-	if !e.GetFrameProverTrie(0).Contains(e.provingKeyBytes) {
+	if !e.FrameProverTrieContains(0, e.provingKeyBytes) {
 		select {
 		case e.requestSyncCh <- struct{}{}:
 		default:

@@ -128,7 +128,7 @@ func (e *DataClockConsensusEngine) GetPreMidnightMintStatus(
 	ctx context.Context,
 	t *protobufs.PreMidnightMintStatusRequest,
 ) (*protobufs.PreMidnightMintResponse, error) {
-	if !e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
+	if !e.FrameProverTrieContains(0, e.provingKeyAddress) {
 		return nil, errors.Wrap(
 			errors.New("wrong destination"),
 			"get pre midnight mint status",
@@ -182,7 +182,7 @@ func (e *DataClockConsensusEngine) GetPreMidnightMintStatus(
 func (e *DataClockConsensusEngine) handleMint(
 	t *protobufs.MintCoinRequest,
 ) ([]byte, error) {
-	if !e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
+	if !e.FrameProverTrieContains(0, e.provingKeyAddress) {
 		return nil, errors.Wrap(errors.New("wrong destination"), "handle mint")
 	}
 
@@ -243,7 +243,7 @@ func (e *DataClockConsensusEngine) handleMint(
 			t.Proofs[0],
 			[]byte("pre-dusk"),
 		) && (!bytes.Equal(t.Proofs[1], make([]byte, 32)) ||
-		time.Now().Unix() < 1730523600) && e.GetFrameProverTrie(0).Contains(
+		time.Now().Unix() < 1730523600) && e.FrameProverTrieContains(0,
 		e.provingKeyAddress,
 	) {
 		prevInput := []byte{}

@@ -55,13 +55,6 @@ func (e *DataClockConsensusEngine) IsInProverTrie(key []byte) bool {
 	if err != nil {
 		return false
 	}
-
 	provingKeyAddress := h.FillBytes(make([]byte, 32))
-	for _, tries := range e.GetFrameProverTries() {
-		if tries.Contains(provingKeyAddress) {
-			return true
-		}
-	}
-
-	return false
+	return e.FrameProverTriesContains(provingKeyAddress)
 }

@@ -219,7 +219,7 @@ func (e *DataClockConsensusEngine) prove(
 }
 
 func (e *DataClockConsensusEngine) GetAheadPeers(frameNumber uint64) []internal.PeerCandidate {
-	if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
+	if e.FrameProverTrieContains(0, e.provingKeyAddress) {
 		return nil
 	}
 
