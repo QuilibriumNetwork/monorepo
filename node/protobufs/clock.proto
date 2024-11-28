@@ -59,6 +59,33 @@ message ClockFrame {
   oneof public_key_signature {
     quilibrium.node.keys.pb.Ed448Signature public_key_signature_ed448 = 9;
   }
+  // Padding is used in tests in order to simulate large clock frames.
+  bytes padding = 99;
+}
+
+// Represents a clock frame fragment for a given filter. Clock frame fragments
+// are used to disseminate clock frame data across the network in a more
+// efficient manner. This is particularly useful for large clock frames, where
+// the frame data can be split into smaller fragments and sent across the
+// network in parallel.
+message ClockFrameFragment {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  int64 timestamp = 3;
+  bytes frame_hash = 4;
+  message ReedSolomonEncoding {
+    uint64 frame_size = 1;
+    uint64 fragment_shard = 2;
+    uint64 fragment_data_shard_count = 3;
+    uint64 fragment_parity_shard_count = 4;
+    bytes fragment_data = 5;
+  }
+  oneof encoding {
+    ReedSolomonEncoding reed_solomon = 5;
+  }
+  oneof public_key_signature {
+    quilibrium.node.keys.pb.Ed448Signature public_key_signature_ed448 = 6;
+  }
 }
 
 message ClockFrameParentSelectors {

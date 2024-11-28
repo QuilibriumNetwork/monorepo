@@ -37,6 +37,7 @@ const (
 	IdentityKeyType              = ChannelPrefix + "IdentityKey"
 	SignedPreKeyType             = ChannelPrefix + "SignedPreKey"
 	ClockFrameType               = ClockPrefix + "ClockFrame"
+	ClockFrameFragmentType       = ClockPrefix + "ClockFrameFragment"
 	ClockFramesRequestType       = ClockPrefix + "ClockFramesRequest"
 	ClockFramesResponseType      = ClockPrefix + "ClockFramesResponse"
 	Ed448PublicKeyType           = KeysPrefix + "Ed448PublicKey"
