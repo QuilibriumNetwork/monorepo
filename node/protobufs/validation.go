@@ -1,6 +1,7 @@
 package protobufs
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 
 	"github.com/pkg/errors"
@@ -8,6 +9,33 @@ import (
 
 type signatureMessage interface {
 	signatureMessage() []byte
+}
+
+var _ signatureMessage = (*ClockFrameFragment_ReedSolomonEncoding)(nil)
+
+func (c *ClockFrameFragment_ReedSolomonEncoding) signatureMessage() []byte {
+	payload := []byte("reed-solomon-fragment")
+	payload = binary.BigEndian.AppendUint64(payload, c.FrameSize)
+	payload = binary.BigEndian.AppendUint64(payload, c.FragmentShard)
+	payload = binary.BigEndian.AppendUint64(payload, c.FragmentDataShardCount)
+	payload = binary.BigEndian.AppendUint64(payload, c.FragmentParityShardCount)
+	h := sha256.Sum256(c.FragmentData)
+	payload = append(payload, h[:]...)
+	return payload
+}
+
+var _ signatureMessage = (*ClockFrameFragment)(nil)
+
+func (c *ClockFrameFragment) signatureMessage() []byte {
+	payload := []byte("fragment")
+	payload = binary.BigEndian.AppendUint64(payload, c.FrameNumber)
+	payload = append(payload, c.Filter...)
+	payload = binary.BigEndian.AppendUint64(payload, uint64(c.Timestamp))
+	payload = append(payload, c.FrameHash...)
+	if reedSolomon := c.GetReedSolomon(); reedSolomon != nil {
+		payload = append(payload, reedSolomon.signatureMessage()...)
+	}
+	return payload
 }
 
 var _ signatureMessage = (*TransferCoinRequest)(nil)
@@ -97,6 +125,21 @@ type SignedMessage interface {
 	// The message contents are expected to be valid - validation
 	// of contents must precede validation of the signature.
 	ValidateSignature() error
+}
+
+var _ SignedMessage = (*ClockFrameFragment)(nil)
+
+// ValidateSignature checks the signature of the clock frame fragment.
+func (c *ClockFrameFragment) ValidateSignature() error {
+	switch {
+	case c.GetPublicKeySignatureEd448() != nil:
+		if err := c.GetPublicKeySignatureEd448().verifyUnsafe(c.signatureMessage()); err != nil {
+			return errors.Wrap(err, "validate signature")
+		}
+		return nil
+	default:
+		return errors.New("invalid signature")
+	}
 }
 
 var _ SignedMessage = (*TransferCoinRequest)(nil)
@@ -202,6 +245,61 @@ type ValidatableMessage interface {
 	// Validate checks the message contents.
 	// It will also verify signatures if the message is signed.
 	Validate() error
+}
+
+var _ ValidatableMessage = (*ClockFrameFragment_ReedSolomonEncoding)(nil)
+
+// Validate checks the Reed-Solomon encoding.
+func (c *ClockFrameFragment_ReedSolomonEncoding) Validate() error {
+	if c == nil {
+		return errors.New("nil Reed-Solomon encoding")
+	}
+	if c.FrameSize == 0 {
+		return errors.New("invalid frame size")
+	}
+	if c.FragmentDataShardCount == 0 {
+		return errors.New("invalid fragment data shard count")
+	}
+	if c.FragmentParityShardCount == 0 {
+		return errors.New("invalid fragment parity shard count")
+	}
+	if c.FragmentShard >= c.FragmentDataShardCount+c.FragmentParityShardCount {
+		return errors.New("invalid fragment shard")
+	}
+	if len(c.FragmentData) == 0 {
+		return errors.New("invalid fragment data")
+	}
+	return nil
+}
+
+var _ ValidatableMessage = (*ClockFrameFragment)(nil)
+
+// Validate checks the clock frame fragment.
+func (c *ClockFrameFragment) Validate() error {
+	if c == nil {
+		return errors.New("nil clock frame fragment")
+	}
+	if len(c.Filter) != 32 {
+		return errors.New("invalid filter")
+	}
+	if c.Timestamp == 0 {
+		return errors.New("invalid timestamp")
+	}
+	if n := len(c.FrameHash); n < 28 || n > 64 {
+		return errors.New("invalid frame hash")
+	}
+	switch {
+	case c.GetReedSolomon() != nil:
+		if err := c.GetReedSolomon().Validate(); err != nil {
+			return errors.Wrap(err, "reed-solomon encoding")
+		}
+	default:
+		return errors.New("missing encoding")
+	}
+	if err := c.ValidateSignature(); err != nil {
+		return errors.Wrap(err, "signature")
+	}
+	return nil
 }
 
 var _ ValidatableMessage = (*Ed448PublicKey)(nil)
@@ -571,6 +669,20 @@ func newED448Signature(publicKey, signature []byte) *Ed448Signature {
 		},
 		Signature: signature,
 	}
+}
+
+var _ SignableED448Message = (*ClockFrameFragment)(nil)
+
+// SignED448 signs the clock frame fragment with the given key.
+func (c *ClockFrameFragment) SignED448(publicKey []byte, sign func([]byte) ([]byte, error)) error {
+	signature, err := sign(c.signatureMessage())
+	if err != nil {
+		return errors.Wrap(err, "sign")
+	}
+	c.PublicKeySignature = &ClockFrameFragment_PublicKeySignatureEd448{
+		PublicKeySignatureEd448: newED448Signature(publicKey, signature),
+	}
+	return nil
 }
 
 var _ SignableED448Message = (*TransferCoinRequest)(nil)

@@ -41,6 +41,70 @@ func metaAppend[T any](bs ...[]T) []T {
 	return result
 }
 
+func TestClockFrameFragmentSignatureRoundtrip(t *testing.T) {
+	t.Parallel()
+	message := &protobufs.ClockFrameFragment{
+		Filter:      bytes.Repeat([]byte{0x01}, 32),
+		FrameNumber: 1,
+		Timestamp:   2,
+		FrameHash:   bytes.Repeat([]byte{0x03}, 28),
+		Encoding: &protobufs.ClockFrameFragment_ReedSolomon{
+			ReedSolomon: &protobufs.ClockFrameFragment_ReedSolomonEncoding{
+				FrameSize:                3,
+				FragmentShard:            4,
+				FragmentDataShardCount:   5,
+				FragmentParityShardCount: 6,
+				FragmentData:             bytes.Repeat([]byte{0x02}, 6),
+			},
+		},
+		PublicKeySignature: &protobufs.ClockFrameFragment_PublicKeySignatureEd448{
+			PublicKeySignatureEd448: &protobufs.Ed448Signature{
+				Signature: bytes.Repeat([]byte{0x02}, 114),
+				PublicKey: &protobufs.Ed448PublicKey{
+					KeyValue: bytes.Repeat([]byte{0x03}, 57),
+				},
+			},
+		},
+	}
+	if !bytes.Equal(
+		protobufs.SignatureMessageOf(message),
+		metaAppend(
+			[]byte("fragment"),
+			[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+			bytes.Repeat([]byte{0x01}, 32),
+			[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02},
+			bytes.Repeat([]byte{0x03}, 28),
+			metaAppend(
+				[]byte("reed-solomon-fragment"),
+				[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03},
+				[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04},
+				[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05},
+				[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06},
+				[]byte{
+					0x2e, 0xbd, 0x9a, 0x4e, 0x48, 0x8b, 0x47, 0x1c,
+					0xd7, 0x0a, 0x25, 0xae, 0xcc, 0xb2, 0xdb, 0x50,
+					0xaa, 0xbd, 0xa7, 0x3c, 0x92, 0xce, 0x8e, 0xe0,
+					0xe2, 0x15, 0xcd, 0x89, 0x32, 0x0f, 0x6b, 0x9a,
+				},
+			),
+		),
+	) {
+		t.Fatal("unexpected signature message")
+	}
+	if err := message.ValidateSignature(); err == nil {
+		t.Fatal("expected error")
+	}
+	if err := message.SignED448(primaryPublicKeyBytes, primaryPrivateKey.Sign); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(message.GetPublicKeySignatureEd448().PublicKey.KeyValue, primaryPublicKeyBytes) {
+		t.Fatal("unexpected public key")
+	}
+	if err := message.ValidateSignature(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTransferCoinRequestSignatureRoundtrip(t *testing.T) {
 	t.Parallel()
 	message := &protobufs.TransferCoinRequest{
@@ -418,6 +482,79 @@ func TestAnnounceProverResumeSignatureRoundtrip(t *testing.T) {
 		t.Fatal("unexpected public key")
 	}
 	if err := message.ValidateSignature(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClockFrameFragmentReedSolomonEncodingValidate(t *testing.T) {
+	t.Parallel()
+	if err := (*protobufs.ClockFrameFragment_ReedSolomonEncoding)(nil).Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message := &protobufs.ClockFrameFragment_ReedSolomonEncoding{}
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.FrameSize = 1
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.FragmentShard = 2
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.FragmentDataShardCount = 3
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.FragmentParityShardCount = 4
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.FragmentData = bytes.Repeat([]byte{0x01}, 6)
+	if err := message.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClockFrameFragmentValidate(t *testing.T) {
+	t.Parallel()
+	if err := (*protobufs.ClockFrameFragment)(nil).Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message := &protobufs.ClockFrameFragment{}
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.Filter = bytes.Repeat([]byte{0x01}, 32)
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.FrameNumber = 1
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.Timestamp = 2
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.FrameHash = bytes.Repeat([]byte{0x03}, 28)
+	if err := message.Validate(); err == nil {
+		t.Fatal("expected error")
+	}
+	message.Encoding = &protobufs.ClockFrameFragment_ReedSolomon{
+		ReedSolomon: &protobufs.ClockFrameFragment_ReedSolomonEncoding{
+			FrameSize:                2,
+			FragmentShard:            3,
+			FragmentDataShardCount:   4,
+			FragmentParityShardCount: 5,
+			FragmentData:             bytes.Repeat([]byte{0x02}, 6),
+		},
+	}
+	if err := message.SignED448(primaryPublicKeyBytes, primaryPrivateKey.Sign); err != nil {
+		t.Fatal(err)
+	}
+	if err := message.Validate(); err != nil {
 		t.Fatal(err)
 	}
 }
