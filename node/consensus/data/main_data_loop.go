@@ -42,10 +42,27 @@ func (
 	return frameProverTries
 }
 
+func (e *DataClockConsensusEngine) GetFrameProverTrie(i int) *tries.RollingFrecencyCritbitTrie {
+	e.frameProverTriesMx.RLock()
+	defer e.frameProverTriesMx.RUnlock()
+	newTrie := &tries.RollingFrecencyCritbitTrie{}
+	if i < 0 || i >= len(e.frameProverTries) {
+		return newTrie
+	}
+	b, err := e.frameProverTries[i].Serialize()
+	if err != nil {
+		panic(err)
+	}
+	if err := newTrie.Deserialize(b); err != nil {
+		panic(err)
+	}
+	return newTrie
+}
+
 func (e *DataClockConsensusEngine) runFramePruning() {
 	defer e.wg.Done()
 	// A full prover should _never_ do this
-	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) ||
+	if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) ||
 		e.config.Engine.MaxFrames == -1 || e.config.Engine.FullProver {
 		e.logger.Info("frame pruning not enabled")
 		return
@@ -88,7 +105,7 @@ func (e *DataClockConsensusEngine) runFramePruning() {
 func (e *DataClockConsensusEngine) runSync() {
 	defer e.wg.Done()
 	// small optimization, beacon should never collect for now:
-	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+	if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
 		return
 	}
 
@@ -130,7 +147,7 @@ func (e *DataClockConsensusEngine) runLoop() {
 			}
 
 			if runOnce {
-				if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+				if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
 					dataFrame, err := e.dataTimeReel.Head()
 					if err != nil {
 						panic(err)
@@ -148,7 +165,7 @@ func (e *DataClockConsensusEngine) runLoop() {
 				e.validationFilterMx.Lock()
 				e.validationFilter = make(map[string]struct{}, len(e.validationFilter))
 				e.validationFilterMx.Unlock()
-				if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+				if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
 					if err = e.publishProof(dataFrame); err != nil {
 						e.logger.Error("could not publish", zap.Error(err))
 						e.stateMx.Lock()
@@ -174,7 +191,7 @@ func (e *DataClockConsensusEngine) processFrame(
 		zap.Duration("frame_age", frametime.Since(dataFrame)),
 	)
 	var err error
-	if !e.GetFrameProverTries()[0].Contains(e.provingKeyBytes) {
+	if !e.GetFrameProverTrie(0).Contains(e.provingKeyBytes) {
 		select {
 		case e.requestSyncCh <- struct{}{}:
 		default:
@@ -190,7 +207,7 @@ func (e *DataClockConsensusEngine) processFrame(
 	e.frameProverTries = e.dataTimeReel.GetFrameProverTries()
 	e.frameProverTriesMx.Unlock()
 
-	trie := e.GetFrameProverTries()[0]
+	trie := e.GetFrameProverTrie(0)
 	selBI, _ := dataFrame.GetSelector()
 	sel := make([]byte, 32)
 	sel = selBI.FillBytes(sel)
@@ -234,8 +251,8 @@ func (e *DataClockConsensusEngine) processFrame(
 				peerProvingKeyAddress := h.FillBytes(make([]byte, 32))
 
 				ring := -1
-				if len(e.GetFrameProverTries()) > 1 {
-					for i, tries := range e.GetFrameProverTries()[1:] {
+				if tries := e.GetFrameProverTries(); len(tries) > 1 {
+					for i, tries := range tries[1:] {
 						i := i
 						if tries.Contains(peerProvingKeyAddress) {
 							ring = i

@@ -182,7 +182,7 @@ func (e *DataClockConsensusEngine) handleClockFrame(
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
-	trie := e.GetFrameProverTries()[0]
+	trie := e.GetFrameProverTrie(0)
 	if !trie.Contains(addr.FillBytes(make([]byte, 32))) {
 		e.logger.Debug(
 			"prover not in trie at frame, address may be in fork",
@@ -369,7 +369,7 @@ func TokenRequestIdentifiers(transition *protobufs.TokenRequest) []string {
 func (e *DataClockConsensusEngine) handleTokenRequest(
 	transition *protobufs.TokenRequest,
 ) error {
-	if e.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
+	if e.GetFrameProverTrie(0).Contains(e.provingKeyAddress) {
 		identifiers := TokenRequestIdentifiers(transition)
 
 		e.stagedTransactionsMx.Lock()
