@@ -331,8 +331,8 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	e.pubSub.Subscribe(e.infoFilter, e.handleInfoMessage)
 	go func() {
 		server := qgrpc.NewServer(
-			grpc.MaxSendMsgSize(20*1024*1024),
-			grpc.MaxRecvMsgSize(20*1024*1024),
+			grpc.MaxSendMsgSize(40*1024*1024),
+			grpc.MaxRecvMsgSize(40*1024*1024),
 		)
 		protobufs.RegisterDataServiceServer(server, e)
 		if err := e.pubSub.StartDirectChannelListener(
