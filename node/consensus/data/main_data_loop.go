@@ -216,7 +216,7 @@ func (e *DataClockConsensusEngine) processFrame(
 		zap.Duration("frame_age", frametime.Since(dataFrame)),
 	)
 	var err error
-	if !e.FrameProverTrieContains(0, e.provingKeyBytes) {
+	if !e.FrameProverTrieContains(0, e.provingKeyAddress) {
 		select {
 		case e.requestSyncCh <- struct{}{}:
 		default:
