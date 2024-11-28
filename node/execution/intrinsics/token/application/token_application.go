@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"encoding/binary"
 	"sync"
+	"sync/atomic"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
@@ -29,6 +30,10 @@ var TOKEN_ADDRESS = []byte{
 }
 
 type TokenApplication struct {
+	MintTreeVerificationFailure uint64
+	MintOutOfOrder              uint64
+	MintTooOld                  uint64
+
 	Beacon       []byte
 	TokenOutputs *protobufs.TokenOutputs
 	Tries        []*tries.RollingFrecencyCritbitTrie
@@ -188,6 +193,7 @@ func (a *TokenApplication) ApplyTransitions(
 			} else if len(t.Mint.Proofs) >= 3 && currentFrameNumber > PROOF_FRAME_CUTOFF {
 				frameNumber := binary.BigEndian.Uint64(t.Mint.Proofs[2])
 				if frameNumber < currentFrameNumber-2 {
+					atomic.AddUint64(&a.MintTooOld, 1)
 					fails[i] = transition
 					continue
 				}

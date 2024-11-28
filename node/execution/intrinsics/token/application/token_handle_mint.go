@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/big"
+	"sync/atomic"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -205,6 +206,7 @@ func (a *TokenApplication) handleMint(
 		}
 
 		if !verified {
+			atomic.AddUint64(&a.MintTreeVerificationFailure, 1)
 			a.Logger.Debug(
 				"tree verification failed",
 				zap.String("peer_id", base58.Encode([]byte(peerId))),
@@ -221,6 +223,11 @@ func (a *TokenApplication) handleMint(
 			previousFrameNumber := uint64(0)
 			if previousFrame != nil {
 				previousFrameNumber = previousFrame.FrameNumber
+			}
+			if newFrameNumber < currentFrameNumber-2 {
+				atomic.AddUint64(&a.MintTooOld, 1)
+			} else {
+				atomic.AddUint64(&a.MintOutOfOrder, 1)
 			}
 			a.Logger.Debug(
 				"received out of order proofs, ignoring",
