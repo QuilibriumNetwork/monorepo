@@ -44,7 +44,7 @@ type PubSub interface {
 		purpose string,
 		server *grpc.Server,
 	) error
-	GetDirectChannel(peerId []byte, purpose string) (*grpc.ClientConn, error)
+	GetDirectChannel(ctx context.Context, peerId []byte, purpose string) (*grpc.ClientConn, error)
 	GetNetworkInfo() *protobufs.NetworkInfoResponse
 	SignMessage(msg []byte) ([]byte, error)
 	GetPublicKey() []byte

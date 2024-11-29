@@ -636,7 +636,7 @@ func (e *DataClockConsensusEngine) GetPublicChannelForProvingKey(
 			)
 		}
 	} else {
-		cc, err := e.pubSub.GetDirectChannel(peerID, base58.Encode(provingKey))
+		cc, err := e.pubSub.GetDirectChannel(e.ctx, peerID, base58.Encode(provingKey))
 		if err != nil {
 			e.logger.Error(
 				"could not get public channel for proving key",

@@ -89,8 +89,9 @@ var allCmd = &cobra.Command{
 			panic(errors.Wrap(err, "error getting peer id"))
 		}
 
+		ctx := context.Background()
 		resume := make([]byte, 32)
-		cc, err := pubSub.GetDirectChannel([]byte(bpeerId), "worker")
+		cc, err := pubSub.GetDirectChannel(ctx, []byte(bpeerId), "worker")
 		if err != nil {
 			logger.Info(
 				"could not establish direct channel, waiting...",
@@ -100,7 +101,7 @@ var allCmd = &cobra.Command{
 		}
 		for {
 			if cc == nil {
-				cc, err = pubSub.GetDirectChannel([]byte(bpeerId), "worker")
+				cc, err = pubSub.GetDirectChannel(ctx, []byte(bpeerId), "worker")
 				if err != nil {
 					logger.Info(
 						"could not establish direct channel, waiting...",

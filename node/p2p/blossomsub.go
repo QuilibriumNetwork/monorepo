@@ -937,7 +937,7 @@ func (c *extraCloseConn) Close() error {
 	return err
 }
 
-func (b *BlossomSub) GetDirectChannel(peerID []byte, purpose string) (
+func (b *BlossomSub) GetDirectChannel(ctx context.Context, peerID []byte, purpose string) (
 	cc *grpc.ClientConn, err error,
 ) {
 	// Kind of a weird hack, but gostream can induce panics if the peer drops at
@@ -954,7 +954,7 @@ func (b *BlossomSub) GetDirectChannel(peerID []byte, purpose string) (
 	// Open question: should we prefix this so a node can run both in mainnet and
 	// testnet? Feels like a bad idea and would be preferable to discourage.
 	cc, err = qgrpc.DialContext(
-		b.ctx,
+		ctx,
 		"passthrough:///",
 		grpc.WithContextDialer(
 			func(ctx context.Context, _ string) (net.Conn, error) {
@@ -991,6 +991,7 @@ func (b *BlossomSub) GetDirectChannel(peerID []byte, purpose string) (
 			},
 		),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "dial context")

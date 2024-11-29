@@ -291,6 +291,7 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 		zap.Uint64("current_frame", latest.FrameNumber),
 		zap.Uint64("max_frame", maxFrame),
 	)
+
 	var cooperative bool = true
 	defer func() {
 		if cooperative {
@@ -304,7 +305,15 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 			delete(e.peerMap, string(peerId))
 		}
 	}()
-	cc, err := e.pubSub.GetDirectChannel(peerId, "sync")
+
+	syncTimeout := e.config.Engine.SyncTimeout
+	if syncTimeout == 0 {
+		syncTimeout = defaultSyncTimeout
+	}
+
+	dialCtx, cancelDial := context.WithTimeout(e.ctx, syncTimeout)
+	defer cancelDial()
+	cc, err := e.pubSub.GetDirectChannel(dialCtx, peerId, "sync")
 	if err != nil {
 		e.logger.Debug(
 			"could not establish direct channel",
@@ -320,22 +329,16 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 	}()
 
 	client := protobufs.NewDataServiceClient(cc)
-
-	syncTimeout := e.config.Engine.SyncTimeout
-	if syncTimeout == 0 {
-		syncTimeout = defaultSyncTimeout
-	}
-
 	for {
-		ctx, cancel := context.WithTimeout(e.ctx, syncTimeout)
+		getCtx, cancelGet := context.WithTimeout(e.ctx, syncTimeout)
 		response, err := client.GetDataFrame(
-			ctx,
+			getCtx,
 			&protobufs.GetDataFrameRequest{
 				FrameNumber: latest.FrameNumber + 1,
 			},
 			grpc.MaxCallRecvMsgSize(600*1024*1024),
 		)
-		cancel()
+		cancelGet()
 		if err != nil {
 			e.logger.Debug(
 				"could not get frame",

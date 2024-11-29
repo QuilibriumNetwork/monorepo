@@ -85,7 +85,7 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 	}
 
 	resume := make([]byte, 32)
-	cc, err := e.pubSub.GetDirectChannel([]byte(peerId), "worker")
+	cc, err := e.pubSub.GetDirectChannel(e.ctx, []byte(peerId), "worker")
 	if err != nil {
 		e.logger.Info(
 			"could not establish direct channel, waiting...",
@@ -110,7 +110,7 @@ func (e *DataClockConsensusEngine) runPreMidnightProofWorker() {
 		}
 
 		if cc == nil {
-			cc, err = e.pubSub.GetDirectChannel([]byte(peerId), "worker")
+			cc, err = e.pubSub.GetDirectChannel(e.ctx, []byte(peerId), "worker")
 			if err != nil {
 				e.logger.Info(
 					"could not establish direct channel, waiting...",

@@ -64,7 +64,7 @@ func (pubsub) StartDirectChannelListener(
 ) error {
 	return nil
 }
-func (pubsub) GetDirectChannel(peerId []byte, purpose string) (*grpc.ClientConn, error) {
+func (pubsub) GetDirectChannel(ctx context.Context, peerId []byte, purpose string) (*grpc.ClientConn, error) {
 	return nil, nil
 }
 func (pubsub) GetNetworkInfo() *protobufs.NetworkInfoResponse {
