@@ -11,6 +11,7 @@ import (
 	"math/bits"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
@@ -38,6 +39,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	blossomsub "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -71,18 +73,19 @@ type appScore struct {
 }
 
 type BlossomSub struct {
-	ps          *blossomsub.PubSub
-	ctx         context.Context
-	logger      *zap.Logger
-	peerID      peer.ID
-	bitmaskMap  map[string]*blossomsub.Bitmask
-	h           host.Host
-	signKey     crypto.PrivKey
-	peerScore   map[string]*appScore
-	peerScoreMx sync.Mutex
-	network     uint8
-	bootstrap   internal.PeerConnector
-	discovery   internal.PeerConnector
+	ps           *blossomsub.PubSub
+	ctx          context.Context
+	logger       *zap.Logger
+	peerID       peer.ID
+	bitmaskMap   map[string]*blossomsub.Bitmask
+	h            host.Host
+	signKey      crypto.PrivKey
+	peerScore    map[string]*appScore
+	peerScoreMx  sync.Mutex
+	network      uint8
+	bootstrap    internal.PeerConnector
+	discovery    internal.PeerConnector
+	reachability atomic.Pointer[network.Reachability]
 }
 
 var _ PubSub = (*BlossomSub)(nil)
@@ -337,7 +340,9 @@ func NewBlossomSub(
 				if !ok {
 					return
 				}
-				switch state := evt.(event.EvtLocalReachabilityChanged).Reachability; state {
+				state := evt.(event.EvtLocalReachabilityChanged).Reachability
+				bs.reachability.Store(&state)
+				switch state {
 				case network.ReachabilityPublic:
 					logger.Info("node is externally reachable")
 				case network.ReachabilityPrivate:
@@ -750,6 +755,27 @@ func (b *BlossomSub) GetRandomPeer(bitmask []byte) ([]byte, error) {
 	}
 
 	return []byte(peers[sel.Int64()]), nil
+}
+
+func (b *BlossomSub) IsPeerConnected(peerId []byte) bool {
+	peerID := peer.ID(peerId)
+	connectedness := b.h.Network().Connectedness(peerID)
+	return connectedness == network.Connected || connectedness == network.Limited
+}
+
+func (b *BlossomSub) Reachability() *wrapperspb.BoolValue {
+	reachability := b.reachability.Load()
+	if reachability == nil {
+		return nil
+	}
+	switch *reachability {
+	case network.ReachabilityPublic:
+		return wrapperspb.Bool(true)
+	case network.ReachabilityPrivate:
+		return wrapperspb.Bool(false)
+	default:
+		return nil
+	}
 }
 
 func initDHT(

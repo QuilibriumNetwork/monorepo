@@ -314,6 +314,7 @@ func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 		version:       p.Version,
 		patchVersion:  patchVersion,
 		totalDistance: p.TotalDistance,
+		reachability:  p.ExternallyReachable,
 	}
 	e.peerMapMx.Unlock()
 

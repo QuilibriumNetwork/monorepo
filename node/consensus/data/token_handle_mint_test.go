@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	qtime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -80,6 +81,8 @@ func (pubsub) AddPeerScore(peerId []byte, scoreDelta int64) {}
 func (pubsub) Reconnect(peerId []byte) error                { return nil }
 func (pubsub) Bootstrap(context.Context) error              { return nil }
 func (pubsub) DiscoverPeers(context.Context) error          { return nil }
+func (pubsub) IsPeerConnected(peerId []byte) bool           { return false }
+func (pubsub) Reachability() *wrapperspb.BoolValue          { return nil }
 
 type outputs struct {
 	difficulty  uint32

@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
@@ -58,6 +59,7 @@ type peerInfo struct {
 	version       []byte
 	patchVersion  byte
 	totalDistance []byte
+	reachability  *wrapperspb.BoolValue
 }
 
 type ChannelServer = protobufs.DataService_GetPublicChannelServer
@@ -431,6 +433,8 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			frame = nextFrame
 
 			timestamp := time.Now().UnixMilli()
+			reachability := e.pubSub.Reachability()
+
 			list := &protobufs.DataPeerListAnnounce{
 				Peer: &protobufs.DataPeer{
 					PeerId:       nil,
@@ -442,6 +446,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 					TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
 						make([]byte, 256),
 					),
+					ExternallyReachable: reachability,
 				},
 			}
 
@@ -463,6 +468,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 				totalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
 					make([]byte, 256),
 				),
+				reachability: reachability,
 			}
 			deletes := []*peerInfo{}
 			for _, v := range e.peerMap {

@@ -6,6 +6,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
@@ -55,4 +56,6 @@ type PubSub interface {
 	Bootstrap(ctx context.Context) error
 	DiscoverPeers(ctx context.Context) error
 	GetNetwork() uint
+	IsPeerConnected(peerId []byte) bool
+	Reachability() *wrapperspb.BoolValue
 }

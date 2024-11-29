@@ -62,6 +62,7 @@ func (e *DataClockConsensusEngine) publishProof(
 	)
 
 	timestamp := time.Now().UnixMilli()
+	reachability := e.pubSub.Reachability()
 
 	e.peerMapMx.Lock()
 	e.peerMap[string(e.pubSub.GetPeerID())] = &peerInfo{
@@ -74,6 +75,7 @@ func (e *DataClockConsensusEngine) publishProof(
 		totalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
 			make([]byte, 256),
 		),
+		reachability: reachability,
 	}
 	list := &protobufs.DataPeerListAnnounce{
 		Peer: &protobufs.DataPeer{
@@ -86,6 +88,7 @@ func (e *DataClockConsensusEngine) publishProof(
 			TotalDistance: e.dataTimeReel.GetTotalDistance().FillBytes(
 				make([]byte, 256),
 			),
+			ExternallyReachable: reachability,
 		},
 	}
 	e.peerMapMx.Unlock()
