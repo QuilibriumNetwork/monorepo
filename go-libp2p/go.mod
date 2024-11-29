@@ -6,8 +6,6 @@ toolchain go1.22.5
 
 retract v0.26.1 // Tag was applied incorrectly due to a bug in the release workflow.
 
-replace github.com/libp2p/go-buffer-pool => ../go-buffer-pool
-
 replace github.com/multiformats/go-multiaddr => ../go-multiaddr
 
 replace github.com/multiformats/go-multiaddr-dns => ../go-multiaddr-dns

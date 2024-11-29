@@ -10,8 +10,6 @@ replace github.com/multiformats/go-multiaddr => ../go-multiaddr
 
 replace github.com/multiformats/go-multiaddr-dns => ../go-multiaddr-dns
 
-replace github.com/libp2p/go-buffer-pool => ../go-buffer-pool
-
 replace github.com/libp2p/go-libp2p => ../go-libp2p
 
 require (
