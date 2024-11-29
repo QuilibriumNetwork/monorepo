@@ -4,6 +4,8 @@ package quilibrium.node.data.pb;
 
 option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
 
+import "google/protobuf/wrappers.proto";
+
 import "channel.proto";
 import "clock.proto";
 import "keys.proto";
@@ -27,6 +29,7 @@ message DataPeer {
   reserved "public_key";
   bytes total_distance = 8;
   bytes patch_version = 9;
+  google.protobuf.BoolValue externally_reachable = 10;
 }
 
 message DataCompressedSync {
