@@ -406,7 +406,6 @@ func main() {
 	}
 
 	if *core != 0 {
-		rdebug.SetGCPercent(9999)
 		rdebug.SetMemoryLimit(nodeConfig.Engine.DataWorkerMemoryLimit)
 
 		if *parentProcess == 0 && len(nodeConfig.Engine.DataWorkerMultiaddrs) == 0 {
@@ -458,9 +457,6 @@ func main() {
 			fmt.Println("The memory available to the node, unallocated to the data workers, is less than 8GiB.")
 			fmt.Println("You are at risk of running out of memory during runtime.")
 		default:
-			if _, explicitGOGC := os.LookupEnv("GOGC"); !explicitGOGC {
-				rdebug.SetGCPercent(9999)
-			}
 			if _, explicitGOMEMLIMIT := os.LookupEnv("GOMEMLIMIT"); !explicitGOMEMLIMIT {
 				rdebug.SetMemoryLimit(availableOverhead * 8 / 10)
 			}
