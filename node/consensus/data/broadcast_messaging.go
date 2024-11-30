@@ -27,6 +27,19 @@ func (e *DataClockConsensusEngine) handleFrameMessage(
 	return nil
 }
 
+func (e *DataClockConsensusEngine) handleFrameFragmentMessage(
+	message *pb.Message,
+) error {
+	select {
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	case e.frameFragmentMessageProcessorCh <- message:
+	default:
+		e.logger.Warn("dropping frame fragment message")
+	}
+	return nil
+}
+
 func (e *DataClockConsensusEngine) handleTxMessage(
 	message *pb.Message,
 ) error {

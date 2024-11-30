@@ -30,13 +30,13 @@ func (e *DataClockConsensusEngine) runFrameMessageHandler() {
 			msg := &protobufs.Message{}
 
 			if err := proto.Unmarshal(message.Data, msg); err != nil {
-				e.logger.Debug("bad message")
+				e.logger.Debug("cannot unmarshal data", zap.Error(err))
 				continue
 			}
 
 			a := &anypb.Any{}
 			if err := proto.Unmarshal(msg.Payload, a); err != nil {
-				e.logger.Error("error while unmarshaling", zap.Error(err))
+				e.logger.Debug("cannot unmarshal payload", zap.Error(err))
 				continue
 			}
 
@@ -46,9 +46,43 @@ func (e *DataClockConsensusEngine) runFrameMessageHandler() {
 					message.From,
 					msg.Address,
 					a,
-					false,
 				); err != nil {
 					e.logger.Debug("could not handle clock frame data", zap.Error(err))
+				}
+			}
+		}
+	}
+}
+
+func (e *DataClockConsensusEngine) runFrameFragmentMessageHandler() {
+	defer e.wg.Done()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case message := <-e.frameFragmentMessageProcessorCh:
+			e.logger.Debug("handling frame fragment message")
+			msg := &protobufs.Message{}
+
+			if err := proto.Unmarshal(message.Data, msg); err != nil {
+				e.logger.Debug("cannot unmarshal data", zap.Error(err))
+				continue
+			}
+
+			a := &anypb.Any{}
+			if err := proto.Unmarshal(msg.Payload, a); err != nil {
+				e.logger.Debug("cannot unmarshal payload", zap.Error(err))
+				continue
+			}
+
+			switch a.TypeUrl {
+			case protobufs.ClockFrameFragmentType:
+				if err := e.handleClockFrameFragmentData(
+					message.From,
+					msg.Address,
+					a,
+				); err != nil {
+					e.logger.Debug("could not handle clock frame fragment data", zap.Error(err))
 				}
 			}
 		}
@@ -66,12 +100,13 @@ func (e *DataClockConsensusEngine) runTxMessageHandler() {
 			msg := &protobufs.Message{}
 
 			if err := proto.Unmarshal(message.Data, msg); err != nil {
-				e.logger.Debug("bad message")
+				e.logger.Debug("could not unmarshal data", zap.Error(err))
 				continue
 			}
 
 			a := &anypb.Any{}
 			if err := proto.Unmarshal(msg.Payload, a); err != nil {
+				e.logger.Debug("could not unmarshal payload", zap.Error(err))
 				continue
 			}
 
@@ -142,13 +177,13 @@ func (e *DataClockConsensusEngine) runInfoMessageHandler() {
 			msg := &protobufs.Message{}
 
 			if err := proto.Unmarshal(message.Data, msg); err != nil {
-				e.logger.Debug("bad message")
+				e.logger.Debug("could not unmarshal data", zap.Error(err))
 				continue
 			}
 
 			a := &anypb.Any{}
 			if err := proto.Unmarshal(msg.Payload, a); err != nil {
-				e.logger.Error("error while unmarshaling", zap.Error(err))
+				e.logger.Debug("could not unmarshal payload", zap.Error(err))
 				continue
 			}
 
@@ -224,35 +259,103 @@ func (e *DataClockConsensusEngine) handleClockFrame(
 	return nil
 }
 
+func (e *DataClockConsensusEngine) handleClockFrameFragment(
+	peerID []byte,
+	address []byte,
+	fragment *protobufs.ClockFrameFragment,
+) error {
+	if fragment == nil {
+		return errors.Wrap(errors.New("fragment is nil"), "handle clock frame fragment")
+	}
+
+	addr, err := poseidon.HashBytes(
+		fragment.GetPublicKeySignatureEd448().PublicKey.KeyValue,
+	)
+	if err != nil {
+		return errors.Wrap(err, "handle clock frame fragment data")
+	}
+
+	if !e.FrameProverTrieContains(0, addr.FillBytes(make([]byte, 32))) {
+		e.logger.Debug(
+			"prover not in trie at frame fragment, address may be in fork",
+			zap.Binary("address", address),
+			zap.Binary("filter", fragment.Filter),
+			zap.Uint64("frame_number", fragment.FrameNumber),
+		)
+		return nil
+	}
+
+	e.logger.Debug(
+		"got clock frame fragment",
+		zap.Binary("address", address),
+		zap.Binary("filter", fragment.Filter),
+		zap.Uint64("frame_number", fragment.FrameNumber),
+	)
+
+	frame, err := e.clockFrameFragmentBuffer.AccumulateClockFrameFragment(fragment)
+	if err != nil {
+		e.logger.Debug("could not accumulate clock frame fragment", zap.Error(err))
+		return errors.Wrap(err, "handle clock frame fragment data")
+	}
+	if frame == nil {
+		return nil
+	}
+
+	e.logger.Info(
+		"accumulated clock frame",
+		zap.Binary("address", address),
+		zap.Binary("filter", frame.Filter),
+		zap.Uint64("frame_number", frame.FrameNumber),
+	)
+
+	return e.handleClockFrame(peerID, address, frame)
+}
+
 func (e *DataClockConsensusEngine) handleClockFrameData(
 	peerID []byte,
 	address []byte,
-	any *anypb.Any,
-	isSync bool,
+	a *anypb.Any,
 ) error {
 	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
 		return nil
 	}
 
 	frame := &protobufs.ClockFrame{}
-	if err := any.UnmarshalTo(frame); err != nil {
+	if err := a.UnmarshalTo(frame); err != nil {
 		return errors.Wrap(err, "handle clock frame data")
 	}
 
 	return e.handleClockFrame(peerID, address, frame)
 }
 
+func (e *DataClockConsensusEngine) handleClockFrameFragmentData(
+	peerID []byte,
+	address []byte,
+	a *anypb.Any,
+) error {
+	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
+		return nil
+	}
+
+	fragment := &protobufs.ClockFrameFragment{}
+	if err := a.UnmarshalTo(fragment); err != nil {
+		return errors.Wrap(err, "handle clock frame fragment data")
+	}
+
+	return e.handleClockFrameFragment(peerID, address, fragment)
+}
+
 func (e *DataClockConsensusEngine) handleDataPeerListAnnounce(
 	peerID []byte,
 	address []byte,
-	any *anypb.Any,
+	a *anypb.Any,
 ) error {
 	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
 		return nil
 	}
 
 	announce := &protobufs.DataPeerListAnnounce{}
-	if err := any.UnmarshalTo(announce); err != nil {
+	if err := a.UnmarshalTo(announce); err != nil {
 		return errors.Wrap(err, "handle data peer list announce")
 	}
 

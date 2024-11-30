@@ -282,6 +282,13 @@ func (c *clockFrameFragmentCircularBuffer) AccumulateClockFrameFragment(fragment
 		return nil, err
 	}
 	if frame != nil {
+		delete(c.buffers, key)
+		for i, k := range c.keys {
+			if k == key {
+				c.keys = append(c.keys[:i], c.keys[i+1:]...)
+				break
+			}
+		}
 		if len(c.built) == c.maxSize {
 			delete(c.built, c.builtKeys[0])
 			c.builtKeys = append(c.builtKeys[:0], c.builtKeys[1:]...)

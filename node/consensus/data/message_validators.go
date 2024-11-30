@@ -37,6 +37,33 @@ func (e *DataClockConsensusEngine) validateFrameMessage(peerID peer.ID, message 
 	}
 }
 
+func (e *DataClockConsensusEngine) validateFrameFragmentMessage(peerID peer.ID, message *pb.Message) p2p.ValidationResult {
+	msg := &protobufs.Message{}
+	if err := proto.Unmarshal(message.Data, msg); err != nil {
+		return p2p.ValidationResultReject
+	}
+	a := &anypb.Any{}
+	if err := proto.Unmarshal(msg.Payload, a); err != nil {
+		return p2p.ValidationResultReject
+	}
+	switch a.TypeUrl {
+	case protobufs.ClockFrameFragmentType:
+		fragment := &protobufs.ClockFrameFragment{}
+		if err := proto.Unmarshal(a.Value, fragment); err != nil {
+			return p2p.ValidationResultReject
+		}
+		if err := fragment.Validate(); err != nil {
+			return p2p.ValidationResultReject
+		}
+		if ts := time.UnixMilli(fragment.Timestamp); time.Since(ts) > 2*time.Minute {
+			return p2p.ValidationResultIgnore
+		}
+		return p2p.ValidationResultAccept
+	default:
+		return p2p.ValidationResultReject
+	}
+}
+
 func (e *DataClockConsensusEngine) validateTxMessage(peerID peer.ID, message *pb.Message) p2p.ValidationResult {
 	msg := &protobufs.Message{}
 	if err := proto.Unmarshal(message.Data, msg); err != nil {
