@@ -522,7 +522,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			)
 
 			if err := e.publishMessage(e.infoFilter, list); err != nil {
-				e.logger.Debug("error publishing message", zap.Error(err))
+				e.logger.Debug("error publishing data peer list announce", zap.Error(err))
 			}
 
 			if thresholdBeforeConfirming > 0 {
@@ -680,7 +680,9 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 		panic(err)
 	}
 
-	e.publishMessage(e.txFilter, pause.TokenRequest())
+	if err := e.publishMessage(e.txFilter, pause.TokenRequest()); err != nil {
+		e.logger.Warn("error publishing prover pause", zap.Error(err))
+	}
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(e.executionEngines))

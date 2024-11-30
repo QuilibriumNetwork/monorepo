@@ -191,8 +191,8 @@ func (e *DataClockConsensusEngine) runLoop() {
 				e.validationFilter = make(map[string]struct{}, len(e.validationFilter))
 				e.validationFilterMx.Unlock()
 				if e.FrameProverTrieContains(0, e.provingKeyAddress) {
-					if err = e.publishProof(dataFrame); err != nil {
-						e.logger.Error("could not publish", zap.Error(err))
+					if err := e.publishProof(dataFrame); err != nil {
+						e.logger.Error("could not publish proof", zap.Error(err))
 						e.stateMx.Lock()
 						if e.state < consensus.EngineStateStopping {
 							e.state = consensus.EngineStateCollecting
@@ -375,7 +375,9 @@ func (e *DataClockConsensusEngine) processFrame(
 					zap.Duration("frame_age", frametime.Since(latestFrame)),
 				)
 
-				e.publishMessage(e.txFilter, mint.TokenRequest())
+				if err := e.publishMessage(e.txFilter, mint.TokenRequest()); err != nil {
+					e.logger.Error("could not publish mint", zap.Error(err))
+				}
 
 				if e.config.Engine.AutoMergeCoins {
 					_, addrs, _, err := e.coinStore.GetCoinsForOwner(
@@ -412,7 +414,9 @@ func (e *DataClockConsensusEngine) processFrame(
 							return latestFrame
 						}
 
-						e.publishMessage(e.txFilter, merge.TokenRequest())
+						if err := e.publishMessage(e.txFilter, merge.TokenRequest()); err != nil {
+							e.logger.Warn("could not publish merge", zap.Error(err))
+						}
 					}
 				}
 			}

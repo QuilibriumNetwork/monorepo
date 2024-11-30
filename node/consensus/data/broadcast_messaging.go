@@ -106,10 +106,12 @@ func (e *DataClockConsensusEngine) publishProof(
 	}
 	e.peerMapMx.Unlock()
 	if err := e.publishMessage(e.infoFilter, list); err != nil {
-		e.logger.Debug("error publishing message", zap.Error(err))
+		e.logger.Debug("error publishing data peer list announce", zap.Error(err))
 	}
 
-	e.publishMessage(e.frameFilter, frame)
+	if err := e.publishMessage(e.frameFilter, frame); err != nil {
+		e.logger.Error("error publishing clock frame", zap.Error(err))
+	}
 
 	return nil
 }

@@ -391,10 +391,12 @@ func NewTokenExecutionEngine(
 					}
 				}
 			}
-			e.publishMessage(
+			if err := e.publishMessage(
 				append([]byte{0x00}, e.intrinsicFilter...),
 				resume.TokenRequest(),
-			)
+			); err != nil {
+				e.logger.Warn("error while publishing resume message", zap.Error(err))
+			}
 		}
 	}()
 
@@ -1437,10 +1439,12 @@ func (e *TokenExecutionEngine) AnnounceProverJoin() {
 		panic(err)
 	}
 
-	e.publishMessage(
+	if err := e.publishMessage(
 		append([]byte{0x00}, e.intrinsicFilter...),
 		join.TokenRequest(),
-	)
+	); err != nil {
+		e.logger.Warn("error publishing join message", zap.Error(err))
+	}
 }
 
 func (e *TokenExecutionEngine) GetRingPosition() int {
