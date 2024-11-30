@@ -90,6 +90,12 @@ func (e *DataClockConsensusEngine) publishProof(
 		),
 		reachability: reachability,
 	}
+	e.peerMapMx.Unlock()
+
+	if err := e.publishMessage(e.frameFilter, frame); err != nil {
+		e.logger.Error("error publishing clock frame", zap.Error(err))
+	}
+
 	list := &protobufs.DataPeerListAnnounce{
 		Peer: &protobufs.DataPeer{
 			PeerId:       nil,
@@ -104,13 +110,8 @@ func (e *DataClockConsensusEngine) publishProof(
 			ExternallyReachable: reachability,
 		},
 	}
-	e.peerMapMx.Unlock()
 	if err := e.publishMessage(e.infoFilter, list); err != nil {
 		e.logger.Debug("error publishing data peer list announce", zap.Error(err))
-	}
-
-	if err := e.publishMessage(e.frameFilter, frame); err != nil {
-		e.logger.Error("error publishing clock frame", zap.Error(err))
 	}
 
 	return nil
