@@ -26,8 +26,8 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
-// DefaultSoftMaxMessageSize is 10 MiB.
-const DefaultSoftMaxMessageSize = 10 << 20
+// DefaultSoftMaxMessageSize is 1 MiB.
+const DefaultSoftMaxMessageSize = 1 << 20
 
 // DefaultHardMaxMessageSize is 20 MB.
 const DefaultHardMaxMessageSize = 10 << 21
