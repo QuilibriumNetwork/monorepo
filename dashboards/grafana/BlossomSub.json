@@ -192,6 +192,13 @@
             "regex": "AAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAABAA(.*)",
             "renamePattern": "Data Peer Announcements$1"
           }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments$1"
+          }
         }
       ],
       "type": "timeseries"
@@ -322,6 +329,13 @@
           "options": {
             "regex": "AAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAABAA(.*)",
             "renamePattern": "Data Peer Announcements$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments$1"
           }
         }
       ],
@@ -454,6 +468,13 @@
             "regex": "AAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAABAA(.*)",
             "renamePattern": "Data Peer Announcements$1"
           }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments$1"
+          }
         }
       ],
       "type": "timeseries"
@@ -584,6 +605,13 @@
           "options": {
             "regex": "AAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAABAA(.*)",
             "renamePattern": "Data Peer Announcements$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments$1"
           }
         }
       ],
@@ -897,6 +925,27 @@
         {
           "id": "renameByRegex",
           "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
             "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
             "renamePattern": "Master Frames$1"
           }
@@ -1194,6 +1243,27 @@
           "options": {
             "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAA(.*)",
             "renamePattern": "Data Peer Announcements Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 3$1"
           }
         },
         {
@@ -1500,11 +1570,290 @@
         {
           "id": "renameByRegex",
           "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
             "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
             "renamePattern": "Master Frames$1"
           }
         }
       ],
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": false,
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 47
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Name",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(blossomsub_iwant_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"drop\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Dropped",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(blossomsub_iwant_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"recv\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Received",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(blossomsub_iwant_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"send\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Sent",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "IWANT message rates",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "default": false,
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 47
+      },
+      "id": 24,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Name",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(blossomsub_ihave_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"drop\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Dropped",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(blossomsub_ihave_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"recv\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Received",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(blossomsub_ihave_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"send\"}[$__rate_interval]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Sent",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "IHAVE message rates",
       "type": "timeseries"
     },
     {
@@ -1570,7 +1919,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 47
+        "y": 56
       },
       "id": 19,
       "options": {
@@ -1698,7 +2047,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 47
+        "y": 56
       },
       "id": 20,
       "options": {
@@ -1825,7 +2174,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 56
+        "y": 65
       },
       "id": 21,
       "options": {
@@ -1953,7 +2302,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 56
+        "y": 65
       },
       "id": 22,
       "options": {
@@ -1982,7 +2331,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "rate(blossomsub_idontwant_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"drop\"}[$__rate_interval])",
+          "expr": "sum(rate(blossomsub_idontwant_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"drop\"}[$__rate_interval]))",
           "hide": false,
           "instant": false,
           "legendFormat": "Dropped",
@@ -1995,7 +2344,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rate(blossomsub_idontwant_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"recv\"}[$__rate_interval])",
+          "expr": "sum(rate(blossomsub_idontwant_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"recv\"}[$__rate_interval]))",
           "hide": false,
           "instant": false,
           "legendFormat": "Received",
@@ -2008,7 +2357,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "rate(blossomsub_idontwant_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"send\"}[$__rate_interval])",
+          "expr": "sum(rate(blossomsub_idontwant_messages_count{job=~\"$job\", instance=~\"$host\", direction=\"send\"}[$__rate_interval]))",
           "hide": false,
           "instant": false,
           "legendFormat": "Sent",
@@ -2025,7 +2374,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 74
       },
       "id": 8,
       "panels": [],
@@ -2093,7 +2442,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 66
+        "y": 75
       },
       "id": 11,
       "options": {
@@ -2197,6 +2546,27 @@
         {
           "id": "renameByRegex",
           "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
             "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
             "renamePattern": "Master Frames$1"
           }
@@ -2266,7 +2636,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 75
+        "y": 84
       },
       "id": 9,
       "options": {
@@ -2370,6 +2740,27 @@
         {
           "id": "renameByRegex",
           "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
             "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
             "renamePattern": "Master Frames$1"
           }
@@ -2439,7 +2830,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 75
+        "y": 84
       },
       "id": 10,
       "options": {
@@ -2543,6 +2934,27 @@
         {
           "id": "renameByRegex",
           "options": {
+            "regex": "AAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 1$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 2$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA(.*)",
+            "renamePattern": "Data Frame Fragments Shard 3$1"
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
             "regex": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA(.*)",
             "renamePattern": "Master Frames$1"
           }
@@ -2556,7 +2968,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 84
+        "y": 93
       },
       "id": 6,
       "panels": [],
@@ -2612,8 +3024,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               }
             ]
           },
@@ -2625,7 +3036,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 85
+        "y": 94
       },
       "id": 7,
       "options": {
@@ -2768,6 +3179,6 @@
   "timezone": "browser",
   "title": "BlossomSub",
   "uid": "ee47pcfax962ob",
-  "version": 45,
+  "version": 55,
   "weekStart": ""
 }
