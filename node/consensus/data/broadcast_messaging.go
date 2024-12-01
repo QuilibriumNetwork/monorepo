@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	mrand "math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -15,6 +16,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/data/fragmentation"
+	qruntime "source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -127,13 +129,23 @@ func (e *DataClockConsensusEngine) publishProof(
 		sign := func(b []byte) ([]byte, error) {
 			return e.provingKey.Sign(rand.Reader, b, crypto.Hash(0))
 		}
+		var wg sync.WaitGroup
+		defer wg.Wait()
+		throttle := make(chan struct{}, qruntime.WorkerCount(0, false))
 		for _, fragment := range fragments {
-			if err := fragment.SignED448(e.provingKeyBytes, sign); err != nil {
-				return errors.Wrap(err, "signing clock frame fragment")
-			}
-			if err := e.publishMessage(e.frameFragmentFilter, fragment); err != nil {
-				e.logger.Error("error publishing clock frame fragment", zap.Error(err))
-			}
+			throttle <- struct{}{}
+			wg.Add(1)
+			go func(fragment *protobufs.ClockFrameFragment) {
+				defer func() { <-throttle }()
+				defer wg.Done()
+				if err := fragment.SignED448(e.provingKeyBytes, sign); err != nil {
+					e.logger.Error("error signing clock frame fragment", zap.Error(err))
+					return
+				}
+				if err := e.publishMessage(e.frameFragmentFilter, fragment); err != nil {
+					e.logger.Error("error publishing clock frame fragment", zap.Error(err))
+				}
+			}(fragment)
 		}
 		return nil
 	}
