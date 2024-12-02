@@ -56,10 +56,29 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 	p.inboundStreamsMx.Unlock()
 
 	r := msgio.NewVarintReaderSize(s, p.hardMaxMessageSize)
-	for {
-		msgbytes, err := r.ReadMsg()
+	read := func() (*RPC, error) {
+		n, err := r.NextMsgLen()
 		if err != nil {
-			r.ReleaseMsg(msgbytes)
+			return nil, err
+		}
+		if n == 0 {
+			_, err := r.Read(nil)
+			return nil, err
+		}
+		buf := poolGet(n, p.softMaxMessageSize)
+		defer poolPut(buf, p.softMaxMessageSize)
+		if _, err := r.Read(buf); err != nil {
+			return nil, err
+		}
+		rpc := new(pb.RPC)
+		if err := rpc.Unmarshal(buf); err != nil {
+			return nil, err
+		}
+		return &RPC{RPC: rpc, from: peer}, nil
+	}
+	for {
+		rpc, err := read()
+		if err != nil {
 			if err != io.EOF {
 				s.Reset()
 				log.Debugf("error reading rpc from %s: %s", s.Conn().RemotePeer(), err)
@@ -76,28 +95,10 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 			p.inboundStreamsMx.Unlock()
 			return
 		}
-		if len(msgbytes) == 0 {
-			r.ReleaseMsg(msgbytes)
+		if rpc == nil {
 			continue
 		}
 
-		rpc := &RPC{
-			RPC: new(pb.RPC),
-		}
-		err = rpc.Unmarshal(msgbytes)
-		r.ReleaseMsg(msgbytes)
-		if err != nil {
-			s.Reset()
-			log.Warnf("bogus rpc from %s: %s", s.Conn().RemotePeer(), err)
-			p.inboundStreamsMx.Lock()
-			if p.inboundStreams[peer] == s {
-				delete(p.inboundStreams, peer)
-			}
-			p.inboundStreamsMx.Unlock()
-			return
-		}
-
-		rpc.from = peer
 		select {
 		case p.incoming <- rpc:
 		case <-p.ctx.Done():
@@ -171,8 +172,8 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, q *rpcQueue) {
 	writeRPC := func(rpc *RPC) error {
 		size := uint64(rpc.Size())
-		buf := pool.Get(varint.UvarintSize(size) + int(size))
-		defer pool.Put(buf)
+		buf := poolGet(varint.UvarintSize(size)+int(size), p.softMaxMessageSize)
+		defer poolPut(buf, p.softMaxMessageSize)
 		n := binary.PutUvarint(buf, size)
 		_, err := rpc.MarshalTo(buf[n:])
 		if err != nil {
@@ -233,4 +234,20 @@ func copyRPC(rpc *RPC) *RPC {
 	*res = *rpc
 	res.RPC = (proto.Clone(rpc.RPC)).(*pb.RPC)
 	return res
+}
+
+// poolGet returns a buffer of length n from the pool if n < limit, otherwise it allocates a new buffer.
+func poolGet(n int, limit int) []byte {
+	if n >= limit {
+		return make([]byte, n)
+	}
+	return pool.Get(n)
+}
+
+// poolPut returns a buffer to the pool if its length is less than limit.
+func poolPut(buf []byte, limit int) {
+	if len(buf) >= limit {
+		return
+	}
+	pool.Put(buf)
 }
