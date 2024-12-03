@@ -276,7 +276,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		disc:                  &discover{},
 		softMaxMessageSize:    DefaultSoftMaxMessageSize,
 		hardMaxMessageSize:    DefaultHardMaxMessageSize,
-		peerOutboundQueueSize: 32,
+		peerOutboundQueueSize: DefaultPeerOutboundQueueSize,
 		signID:                h.ID(),
 		signKey:               nil,
 		signPolicy:            LaxSign,
