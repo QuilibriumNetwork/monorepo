@@ -476,6 +476,7 @@ func NewBlossomSub(
 	blossomOpts = append(blossomOpts,
 		blossomsub.WithValidateQueueSize(p2pConfig.ValidateQueueSize),
 		blossomsub.WithValidateWorkers(p2pConfig.ValidateWorkers),
+		blossomsub.WithPeerOutboundQueueSize(p2pConfig.PeerOutboundQueueSize),
 	)
 	blossomOpts = append(blossomOpts, observability.WithPrometheusRawTracer())
 	blossomOpts = append(blossomOpts, blossomsub.WithPeerFilter(internal.NewStaticPeerFilter(
@@ -1173,6 +1174,9 @@ func withDefaults(p2pConfig *config.P2PConfig) *config.P2PConfig {
 	}
 	if p2pConfig.SubscriptionQueueSize == 0 {
 		p2pConfig.SubscriptionQueueSize = blossomsub.DefaultSubscriptionQueueSize
+	}
+	if p2pConfig.PeerOutboundQueueSize == 0 {
+		p2pConfig.PeerOutboundQueueSize = blossomsub.DefaultPeerOutboundQueueSize
 	}
 	return p2pConfig
 }

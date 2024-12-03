@@ -54,4 +54,5 @@ type P2PConfig struct {
 	ValidateQueueSize         int           `yaml:"validateQueueSize"`
 	ValidateWorkers           int           `yaml:"validateWorkers"`
 	SubscriptionQueueSize     int           `yaml:"subscriptionQueueSize"`
+	PeerOutboundQueueSize     int           `yaml:"peerOutboundQueueSize"`
 }

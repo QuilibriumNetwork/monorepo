@@ -32,6 +32,9 @@ const DefaultSoftMaxMessageSize = 1 << 20
 // DefaultHardMaxMessageSize is 20 MB.
 const DefaultHardMaxMessageSize = 10 << 21
 
+// DefaultPeerOutboundQueueSize is the default size of the outbound message channel that we maintain for each peer.
+const DefaultPeerOutboundQueueSize = 128
+
 var (
 	// TimeCacheDuration specifies how long a message ID will be remembered as seen.
 	// Use WithSeenMessagesTTL to configure this per pubsub instance, instead of overriding the global default.
