@@ -37,8 +37,8 @@ var (
 	BlossomSubDhi                              = 12
 	BlossomSubDscore                           = 4
 	BlossomSubDout                             = 2
-	BlossomSubHistoryLength                    = 5
-	BlossomSubHistoryGossip                    = 3
+	BlossomSubHistoryLength                    = 9
+	BlossomSubHistoryGossip                    = 6
 	BlossomSubDlazy                            = 6
 	BlossomSubGossipFactor                     = 0.25
 	BlossomSubGossipRetransmission             = 3
