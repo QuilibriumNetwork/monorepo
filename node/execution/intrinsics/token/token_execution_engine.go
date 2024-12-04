@@ -27,6 +27,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
+	qruntime "source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -547,10 +548,32 @@ func (e *TokenExecutionEngine) ProcessFrame(
 	mapSnapshot := ToSerializedMap(e.peerSeniority)
 	activeMap := NewFromMap(mapSnapshot)
 
+	outputAddresses := make([][]byte, len(app.TokenOutputs.Outputs))
+	outputAddressErrors := make([]error, len(app.TokenOutputs.Outputs))
+	wg := sync.WaitGroup{}
+	throttle := make(chan struct{}, qruntime.WorkerCount(0, false))
+	for i, output := range app.TokenOutputs.Outputs {
+		throttle <- struct{}{}
+		wg.Add(1)
+		go func(i int, output *protobufs.TokenOutput) {
+			defer func() { <-throttle }()
+			defer wg.Done()
+			switch o := output.Output.(type) {
+			case *protobufs.TokenOutput_Coin:
+				outputAddresses[i], outputAddressErrors[i] = GetAddressOfCoin(o.Coin, frame.FrameNumber, uint64(i))
+			case *protobufs.TokenOutput_Proof:
+				outputAddresses[i], outputAddressErrors[i] = GetAddressOfPreCoinProof(o.Proof)
+			case *protobufs.TokenOutput_DeletedProof:
+				outputAddresses[i], outputAddressErrors[i] = GetAddressOfPreCoinProof(o.DeletedProof)
+			}
+		}(i, output)
+	}
+	wg.Wait()
+
 	for i, output := range app.TokenOutputs.Outputs {
 		switch o := output.Output.(type) {
 		case *protobufs.TokenOutput_Coin:
-			address, err := GetAddressOfCoin(o.Coin, frame.FrameNumber, uint64(i))
+			address, err := outputAddresses[i], outputAddressErrors[i]
 			if err != nil {
 				txn.Abort()
 				return nil, errors.Wrap(err, "process frame")
@@ -581,7 +604,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				return nil, errors.Wrap(err, "process frame")
 			}
 		case *protobufs.TokenOutput_Proof:
-			address, err := GetAddressOfPreCoinProof(o.Proof)
+			address, err := outputAddresses[i], outputAddressErrors[i]
 			if err != nil {
 				txn.Abort()
 				return nil, errors.Wrap(err, "process frame")
@@ -619,7 +642,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				}
 			}
 		case *protobufs.TokenOutput_DeletedProof:
-			address, err := GetAddressOfPreCoinProof(o.DeletedProof)
+			address, err := outputAddresses[i], outputAddressErrors[i]
 			if err != nil {
 				txn.Abort()
 				return nil, errors.Wrap(err, "process frame")
