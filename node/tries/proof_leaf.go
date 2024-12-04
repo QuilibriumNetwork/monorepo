@@ -98,11 +98,6 @@ func UnpackAndVerifyOutput(
 	modulo = binary.BigEndian.Uint32(output[1])
 	frameNumber = binary.BigEndian.Uint64(output[2])
 
-	payload := []byte("mint")
-	payload = append(payload, treeRoot...)
-	payload = binary.BigEndian.AppendUint32(payload, modulo)
-	payload = binary.BigEndian.AppendUint64(payload, frameNumber)
-
 	if len(output) > 3 {
 		numSiblings := bits.Len64(uint64(modulo) - 1)
 		if len(output) != 5+numSiblings {
@@ -113,16 +108,8 @@ func UnpackAndVerifyOutput(
 		}
 
 		siblings := output[3 : 3+numSiblings]
-		for _, sib := range siblings {
-			payload = append(payload, sib...)
-		}
-
-		pathBytes := output[3+numSiblings]
-		path := binary.BigEndian.Uint32(pathBytes)
-		payload = binary.BigEndian.AppendUint32(payload, path)
-
+		path := binary.BigEndian.Uint32(output[3+numSiblings])
 		leaf := output[len(output)-1]
-		payload = append(payload, leaf...)
 
 		verified, err = mt.Verify(
 			NewProofLeaf(leaf),
