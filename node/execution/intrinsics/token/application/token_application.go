@@ -170,21 +170,24 @@ func (a *TokenApplication) ApplyTransitions(
 				continue
 			}
 
-			addr, err := poseidon.HashBytes(
-				t.Mint.Signature.PublicKey.KeyValue,
-			)
-			if err != nil {
+			if len(t.Mint.Proofs) == 1 {
+				addr, err := poseidon.HashBytes(
+					t.Mint.Signature.PublicKey.KeyValue,
+				)
+				if err != nil {
+					fails[i] = transition
+					continue
+				}
+				if a.Tries[0].Contains(addr.FillBytes(make([]byte, 32))) &&
+					bytes.Equal(t.Mint.Signature.PublicKey.KeyValue, a.Beacon) {
+					if _, ok := seen[string(t.Mint.Proofs[0][32:])]; !ok {
+						set[i] = transition
+						seen[string(t.Mint.Proofs[0][32:])] = struct{}{}
+						continue
+					}
+				}
 				fails[i] = transition
 				continue
-			}
-
-			if len(t.Mint.Proofs) == 1 && a.Tries[0].Contains(
-				addr.FillBytes(make([]byte, 32)),
-			) && bytes.Equal(t.Mint.Signature.PublicKey.KeyValue, a.Beacon) {
-				if _, ok := seen[string(t.Mint.Proofs[0][32:])]; !ok {
-					set[i] = transition
-					seen[string(t.Mint.Proofs[0][32:])] = struct{}{}
-				}
 			} else if len(t.Mint.Proofs) >= 3 && currentFrameNumber > PROOF_FRAME_CUTOFF {
 				frameNumber := binary.BigEndian.Uint64(t.Mint.Proofs[2])
 				if frameNumber < currentFrameNumber-2 {
