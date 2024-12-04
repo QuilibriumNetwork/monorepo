@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	qruntime "source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -37,6 +38,7 @@ type TokenApplication struct {
 	PubSub       p2p.PubSub
 	Logger       *zap.Logger
 	Difficulty   uint32
+	FrameProver  qcrypto.FrameProver
 }
 
 func GetOutputsFromClockFrame(
@@ -86,6 +88,7 @@ func MaterializeApplicationFromFrame(
 	clockStore store.ClockStore,
 	pubSub p2p.PubSub,
 	logger *zap.Logger,
+	frameProver qcrypto.FrameProver,
 ) (*TokenApplication, error) {
 	_, tokenOutputs, err := GetOutputsFromClockFrame(frame)
 	if err != nil {
@@ -103,6 +106,7 @@ func MaterializeApplicationFromFrame(
 		Logger:       logger,
 		PubSub:       pubSub,
 		Difficulty:   frame.Difficulty,
+		FrameProver:  frameProver,
 	}, nil
 }
 

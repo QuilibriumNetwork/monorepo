@@ -76,8 +76,7 @@ var pubSubSet = wire.NewSet(
 
 var engineSet = wire.NewSet(
 	wire.FieldsOf(new(*config.Config), "Engine"),
-	crypto.NewWesolowskiFrameProver,
-	wire.Bind(new(crypto.FrameProver), new(*crypto.WesolowskiFrameProver)),
+	crypto.NewCachedWesolowskiFrameProver,
 	crypto.NewKZGInclusionProver,
 	wire.Bind(new(crypto.InclusionProver), new(*crypto.KZGInclusionProver)),
 	time.NewMasterTimeReel,

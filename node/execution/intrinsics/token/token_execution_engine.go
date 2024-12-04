@@ -529,6 +529,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 		e.clockStore,
 		e.pubSub,
 		e.logger,
+		e.frameProver,
 	)
 	if err != nil {
 		e.logger.Error(
@@ -1198,6 +1199,7 @@ func (e *TokenExecutionEngine) VerifyExecution(
 						e.clockStore,
 						e.pubSub,
 						e.logger,
+						e.frameProver,
 					)
 					if err != nil {
 						return errors.Wrap(err, "verify execution")
@@ -1220,6 +1222,7 @@ func (e *TokenExecutionEngine) VerifyExecution(
 						e.clockStore,
 						e.pubSub,
 						e.logger,
+						e.frameProver,
 					)
 					if err != nil {
 						return errors.Wrap(err, "verify execution")

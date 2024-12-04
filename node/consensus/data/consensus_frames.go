@@ -81,6 +81,7 @@ func (e *DataClockConsensusEngine) prove(
 		e.clockStore,
 		e.pubSub,
 		e.logger,
+		e.frameProver,
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "prove")

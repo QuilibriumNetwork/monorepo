@@ -794,6 +794,7 @@ func processFrame(
 		clockStore,
 		nil,
 		logger,
+		nil,
 	)
 	if err != nil {
 		logger.Error(

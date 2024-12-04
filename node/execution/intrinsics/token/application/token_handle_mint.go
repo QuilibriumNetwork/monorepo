@@ -12,7 +12,6 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
@@ -301,9 +300,8 @@ func (a *TokenApplication) handleMint(
 				}}, nil
 			}
 
-			wesoProver := crypto.NewWesolowskiFrameProver(a.Logger)
 			if bytes.Equal(leaf, bytes.Repeat([]byte{0x00}, 516)) ||
-				!wesoProver.VerifyChallengeProof(
+				!a.FrameProver.VerifyChallengeProof(
 					individualChallenge,
 					frame.Difficulty,
 					leaf,
