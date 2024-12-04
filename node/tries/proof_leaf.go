@@ -68,9 +68,7 @@ func PackOutputIntoPayloadAndProof(
 				"pack output into payload and proof",
 			)
 		}
-		for _, sib := range previousTree.Proofs[int(pick)].Siblings {
-			output = append(output, sib)
-		}
+		output = append(output, previousTree.Proofs[int(pick)].Siblings...)
 		output = append(
 			output,
 			binary.BigEndian.AppendUint32(
