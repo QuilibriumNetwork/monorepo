@@ -144,6 +144,32 @@ func (a *TokenApplication) ApplyTransitions(
 		requests = transitions.Requests
 	}
 
+	set := make([]*protobufs.TokenRequest, len(requests))
+	fails := make([]*protobufs.TokenRequest, len(requests))
+
+	wg := sync.WaitGroup{}
+	throttle := make(chan struct{}, qruntime.WorkerCount(0, false))
+
+	for i, transition := range requests {
+		switch t := transition.Request.(type) {
+		case *protobufs.TokenRequest_Mint:
+			if t == nil {
+				fails[i] = transition
+				continue
+			}
+			throttle <- struct{}{}
+			wg.Add(1)
+			go func(i int, transition *protobufs.TokenRequest) {
+				defer func() { <-throttle }()
+				defer wg.Done()
+				if err := t.Mint.Validate(); err != nil {
+					fails[i] = transition
+				}
+			}(i, transition)
+		}
+	}
+	wg.Wait()
+
 	parallelismMap := map[int]uint64{}
 	if len(a.Tries) > 1 {
 		for i := range a.Tries[1:] {
@@ -153,23 +179,12 @@ func (a *TokenApplication) ApplyTransitions(
 
 	seen := map[string]struct{}{}
 
-	set := make([]*protobufs.TokenRequest, len(requests))
-	fails := make([]*protobufs.TokenRequest, len(set))
-	outputsSet := make([][]*protobufs.TokenOutput, len(set))
-
 	for i, transition := range requests {
-		i := i
+		if fails[i] != nil {
+			continue
+		}
 		switch t := transition.Request.(type) {
 		case *protobufs.TokenRequest_Mint:
-			if t == nil {
-				fails[i] = transition
-				continue
-			}
-			if err := t.Mint.Validate(); err != nil {
-				fails[i] = transition
-				continue
-			}
-
 			if len(t.Mint.Proofs) == 1 {
 				addr, err := poseidon.HashBytes(
 					t.Mint.Signature.PublicKey.KeyValue,
@@ -225,6 +240,7 @@ func (a *TokenApplication) ApplyTransitions(
 		}
 	}
 
+	outputsSet := make([][]*protobufs.TokenOutput, len(set))
 	successes := make([]*protobufs.TokenRequest, len(set))
 	for i, transition := range set {
 		if transition == nil {
@@ -366,18 +382,15 @@ func (a *TokenApplication) ApplyTransitions(
 		}
 	}
 
-	wg := sync.WaitGroup{}
-	throttle := make(chan struct{}, qruntime.WorkerCount(0, false))
 	for i, transition := range set {
 		if transition == nil {
 			continue
 		}
-		i, transition := i, transition
 		switch t := transition.Request.(type) {
 		case *protobufs.TokenRequest_Mint:
 			throttle <- struct{}{}
 			wg.Add(1)
-			go func() {
+			go func(i int, transition *protobufs.TokenRequest) {
 				defer func() { <-throttle }()
 				defer wg.Done()
 				success, err := a.handleMint(
@@ -392,7 +405,7 @@ func (a *TokenApplication) ApplyTransitions(
 				}
 				outputsSet[i] = success
 				successes[i] = transition
-			}()
+			}(i, transition)
 		}
 	}
 	wg.Wait()
