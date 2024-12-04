@@ -940,7 +940,8 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromList() (
 	clients := make([]protobufs.DataIPCServiceClient, parallelism)
 
 	for i := 0; i < parallelism; i++ {
-		ma, err := multiaddr.NewMultiaddr(e.config.Engine.DataWorkerMultiaddrs[i])
+		wma := e.config.Engine.DataWorkerMultiaddrs[i]
+		ma, err := multiaddr.NewMultiaddr(wma)
 		if err != nil {
 			panic(err)
 		}
@@ -966,7 +967,7 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromList() (
 			grpc.WithBlock(),
 		)
 		if err != nil {
-			e.logger.Error("could not dial", zap.Error(err))
+			e.logger.Error("could not dial", zap.Int("core", i), zap.String("worker multiaddr", wma), zap.Error(err))
 			continue
 		}
 
