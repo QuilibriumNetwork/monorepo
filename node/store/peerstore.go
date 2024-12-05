@@ -74,10 +74,10 @@ func (d *PeerstoreDatastore) Get(
 		}
 		return nil, err
 	}
+	defer closer.Close()
 
 	out := make([]byte, len(val))
 	copy(out[:], val[:])
-	closer.Close()
 
 	return val, nil
 }
@@ -226,10 +226,10 @@ func (t *transaction) Get(
 		}
 		return nil, errors.Wrap(err, "get")
 	}
+	defer closer.Close()
 
 	out := make([]byte, len(b))
 	copy(out[:], b[:])
-	closer.Close()
 
 	return b, nil
 }

@@ -69,6 +69,7 @@ func (e *MasterClockConsensusEngine) Sync(
 		if err != nil {
 			return errors.Wrap(err, "sync")
 		}
+		defer iter.Close()
 
 		response := []*protobufs.ClockFrame{}
 
@@ -79,10 +80,6 @@ func (e *MasterClockConsensusEngine) Sync(
 			}
 
 			response = append(response, frame)
-		}
-
-		if err = iter.Close(); err != nil {
-			return errors.Wrap(err, "sync")
 		}
 
 		if len(response) == 0 {

@@ -216,13 +216,13 @@ func (p *PebbleClockIterator) TruncatedValue() (
 		if err != nil {
 			return nil, errors.Wrap(err, "get truncated clock frame iterator value")
 		}
+		defer frameCloser.Close()
 		if err := proto.Unmarshal(frameValue, frame); err != nil {
 			return nil, errors.Wrap(
 				errors.Wrap(err, ErrInvalidData.Error()),
 				"get truncated clock frame iterator value",
 			)
 		}
-		frameCloser.Close()
 	} else {
 		if err := proto.Unmarshal(value, frame); err != nil {
 			return nil, errors.Wrap(
@@ -252,13 +252,13 @@ func (p *PebbleClockIterator) Value() (*protobufs.ClockFrame, error) {
 		if err != nil {
 			return nil, errors.Wrap(err, "get clock frame iterator value")
 		}
+		defer frameCloser.Close()
 		if err := proto.Unmarshal(frameValue, frame); err != nil {
 			return nil, errors.Wrap(
 				errors.Wrap(err, ErrInvalidData.Error()),
 				"get clock frame iterator value",
 			)
 		}
-		defer frameCloser.Close()
 	} else {
 		if err := proto.Unmarshal(value, frame); err != nil {
 			return nil, errors.Wrap(
@@ -469,8 +469,8 @@ func (p *PebbleClockStore) GetEarliestMasterClockFrame(
 
 		return nil, errors.Wrap(err, "get earliest master clock frame")
 	}
-
 	defer closer.Close()
+
 	frameNumber := binary.BigEndian.Uint64(idxValue)
 	frame, err := p.GetMasterClockFrame(filter, frameNumber)
 	if err != nil {
@@ -492,8 +492,8 @@ func (p *PebbleClockStore) GetLatestMasterClockFrame(
 
 		return nil, errors.Wrap(err, "get latest master clock frame")
 	}
-
 	defer closer.Close()
+
 	frameNumber := binary.BigEndian.Uint64(idxValue)
 	frame, err := p.GetMasterClockFrame(filter, frameNumber)
 	if err != nil {
@@ -516,11 +516,11 @@ func (p *PebbleClockStore) GetMasterClockFrame(
 
 		return nil, errors.Wrap(err, "get master clock frame")
 	}
+	defer closer.Close()
 
 	copied := make([]byte, len(value))
 	copy(copied[:], value[:])
 
-	defer closer.Close()
 	frame := &protobufs.ClockFrame{}
 	frame.FrameNumber = frameNumber
 	frame.Filter = filter
@@ -595,10 +595,8 @@ func (p *PebbleClockStore) PutMasterClockFrame(
 		); err != nil {
 			return errors.Wrap(err, "put master clock frame")
 		}
-	}
-
-	if err == nil && closer != nil {
-		closer.Close()
+	} else {
+		_ = closer.Close()
 	}
 
 	if err = txn.Set(
@@ -625,6 +623,7 @@ func (p *PebbleClockStore) GetDataClockFrame(
 
 		return nil, nil, errors.Wrap(err, "get data clock frame")
 	}
+	defer closer.Close()
 
 	frame := &protobufs.ClockFrame{}
 	genesisFramePreIndex := false
@@ -641,14 +640,13 @@ func (p *PebbleClockStore) GetDataClockFrame(
 
 			return nil, nil, errors.Wrap(err, "get data clock frame")
 		}
+		defer frameCloser.Close()
 		if err := proto.Unmarshal(frameValue, frame); err != nil {
 			return nil, nil, errors.Wrap(
 				errors.Wrap(err, ErrInvalidData.Error()),
 				"get data clock frame",
 			)
 		}
-		closer.Close()
-		defer frameCloser.Close()
 	} else {
 		genesisFramePreIndex = frameNumber == 0
 		if err := proto.Unmarshal(value, frame); err != nil {
@@ -657,7 +655,6 @@ func (p *PebbleClockStore) GetDataClockFrame(
 				"get data clock frame",
 			)
 		}
-		defer closer.Close()
 	}
 
 	if !truncate {
@@ -674,15 +671,17 @@ func (p *PebbleClockStore) GetDataClockFrame(
 			proverTrie := &tries.RollingFrecencyCritbitTrie{}
 			trieData, closer, err := p.db.Get(clockProverTrieKey(filter, i, frameNumber))
 			if err != nil {
+				if !errors.Is(err, pebble.ErrNotFound) {
+					return nil, nil, errors.Wrap(err, "get data clock frame")
+				}
 				break
 			}
+			defer closer.Close()
 
 			if err := proverTrie.Deserialize(trieData); err != nil {
-				closer.Close()
 				return nil, nil, errors.Wrap(err, "get latest data clock frame")
 			}
 
-			closer.Close()
 			i++
 			proverTries = append(proverTries, proverTrie)
 		}
@@ -788,8 +787,8 @@ func (p *PebbleClockStore) GetEarliestDataClockFrame(
 
 		return nil, errors.Wrap(err, "get earliest data clock frame")
 	}
-
 	defer closer.Close()
+
 	frameNumber := binary.BigEndian.Uint64(idxValue)
 	frame, _, err := p.GetDataClockFrame(filter, frameNumber, false)
 	if err != nil {
@@ -811,6 +810,7 @@ func (p *PebbleClockStore) GetLatestDataClockFrame(
 
 		return nil, nil, errors.Wrap(err, "get latest data clock frame")
 	}
+	defer closer.Close()
 
 	frameNumber := binary.BigEndian.Uint64(idxValue)
 	frame, tries, err := p.GetDataClockFrame(filter, frameNumber, false)
@@ -821,8 +821,6 @@ func (p *PebbleClockStore) GetLatestDataClockFrame(
 
 		return nil, nil, errors.Wrap(err, "get latest data clock frame")
 	}
-
-	closer.Close()
 
 	return frame, tries, nil
 }
@@ -843,6 +841,7 @@ func (p *PebbleClockStore) GetStagedDataClockFrame(
 		}
 		return nil, errors.Wrap(err, "get parent data clock frame")
 	}
+	defer closer.Close()
 
 	parent := &protobufs.ClockFrame{}
 	if err := proto.Unmarshal(data, parent); err != nil {
@@ -856,10 +855,6 @@ func (p *PebbleClockStore) GetStagedDataClockFrame(
 				"get clock frame iterator value",
 			)
 		}
-	}
-
-	if closer != nil {
-		closer.Close()
 	}
 
 	return parent, nil
@@ -879,9 +874,9 @@ func (p *PebbleClockStore) GetStagedDataClockFramesForFrameNumber(
 		}
 		return nil, errors.Wrap(err, "get staged data clock frames")
 	}
+	defer iter.Close()
 
 	frames := []*protobufs.ClockFrame{}
-
 	for iter.First(); iter.Valid(); iter.Next() {
 		data := iter.Value()
 		frame := &protobufs.ClockFrame{}
@@ -898,8 +893,6 @@ func (p *PebbleClockStore) GetStagedDataClockFramesForFrameNumber(
 
 		frames = append(frames, frame)
 	}
-
-	iter.Close()
 
 	return frames, nil
 }
@@ -992,10 +985,8 @@ func (p *PebbleClockStore) CommitDataClockFrame(
 		); err != nil {
 			return errors.Wrap(err, "commit data clock frame")
 		}
-	}
-
-	if err == nil && closer != nil {
-		closer.Close()
+	} else {
+		_ = closer.Close()
 	}
 
 	if !backfill {
@@ -1138,7 +1129,7 @@ func (p *PebbleClockStore) Compact(
 		if bytes.Compare(version, config.GetVersion()) < 0 {
 			cleared = false
 		}
-		closer.Close()
+		defer closer.Close()
 	}
 
 	if !cleared {
@@ -1190,10 +1181,9 @@ func (p *PebbleClockStore) Compact(
 
 			return errors.Wrap(err, "compact")
 		}
+		defer closer.Close()
 
 		last := binary.BigEndian.Uint64(idxValue)
-
-		closer.Close()
 
 		for frameNumber := uint64(1); frameNumber <= last; frameNumber++ {
 			value, closer, err := p.db.Get(clockDataFrameKey(dataFilter, frameNumber))
@@ -1204,6 +1194,7 @@ func (p *PebbleClockStore) Compact(
 
 				return errors.Wrap(err, "compact")
 			}
+			defer closer.Close()
 
 			frame := &protobufs.ClockFrame{}
 
@@ -1212,6 +1203,7 @@ func (p *PebbleClockStore) Compact(
 				if err != nil {
 					return errors.Wrap(err, "compact")
 				}
+				defer frameCloser.Close()
 				if err := proto.Unmarshal(frameValue, frame); err != nil {
 					return errors.Wrap(err, "compact")
 				}
@@ -1226,9 +1218,6 @@ func (p *PebbleClockStore) Compact(
 						make([]byte, 32),
 					)),
 				)
-
-				closer.Close()
-				frameCloser.Close()
 			} else {
 				if err := proto.Unmarshal(value, frame); err != nil {
 					return errors.Wrap(err, "compact")
@@ -1255,14 +1244,15 @@ func (p *PebbleClockStore) Compact(
 						make([]byte, 32),
 					)),
 				)
+				if err != nil {
+					return errors.Wrap(err, "compact")
+				}
 
 				parents = append(parents,
 					clockDataParentIndexKey(dataFilter, frameNumber, selector.FillBytes(
 						make([]byte, 32),
 					)),
 				)
-
-				closer.Close()
 			}
 
 			for i := 0; i < len(frame.Input[516:])/74; i++ {
@@ -1523,10 +1513,8 @@ func (p *PebbleClockStore) GetTotalDistance(
 
 		return nil, errors.Wrap(err, "get total distance")
 	}
-
 	defer closer.Close()
 	dist := new(big.Int).SetBytes(value)
-
 	return dist, nil
 }
 
@@ -1564,7 +1552,6 @@ func (p *PebbleClockStore) GetPeerSeniorityMap(filter []byte) (
 	if err = dec.Decode(&seniorityMap); err != nil {
 		return nil, errors.Wrap(err, "get peer seniority map")
 	}
-
 	return seniorityMap, nil
 }
 
@@ -1612,9 +1599,12 @@ func (p *PebbleClockStore) SetProverTriesForFrame(
 			clockProverTrieKey(frame.Filter, uint16(start), frame.FrameNumber),
 		)
 		if err != nil {
+			if !errors.Is(err, pebble.ErrNotFound) {
+				return errors.Wrap(err, "set prover tries for frame")
+			}
 			break
 		}
-		closer.Close()
+		_ = closer.Close()
 
 		if err = p.db.Delete(
 			clockProverTrieKey(frame.Filter, uint16(start), frame.FrameNumber),

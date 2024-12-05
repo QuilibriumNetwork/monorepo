@@ -270,6 +270,8 @@ func (p *PebbleKeyStore) IncludeProvingKey(
 	staged, closer, err := p.db.Get(stagedProvingKeyKey(provingKey.PublicKey()))
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return errors.Wrap(err, "include proving key")
+	} else if err == nil {
+		defer closer.Close()
 	}
 
 	if staged != nil {
@@ -278,9 +280,6 @@ func (p *PebbleKeyStore) IncludeProvingKey(
 		); err != nil {
 			return errors.Wrap(err, "include proving key")
 		}
-	}
-	if err := closer.Close(); err != nil {
-		return errors.Wrap(err, "include proving key")
 	}
 
 	return nil
@@ -297,13 +296,10 @@ func (p *PebbleKeyStore) GetStagedProvingKey(
 
 		return nil, errors.Wrap(err, "get staged proving key")
 	}
+	defer closer.Close()
 
 	stagedKey := &protobufs.ProvingKeyAnnouncement{}
 	if err = proto.Unmarshal(data, stagedKey); err != nil {
-		return nil, errors.Wrap(err, "get staged proving key")
-	}
-
-	if err := closer.Close(); err != nil {
 		return nil, errors.Wrap(err, "get staged proving key")
 	}
 
@@ -322,11 +318,8 @@ func (p *PebbleKeyStore) GetLatestKeyBundle(
 
 		return nil, errors.Wrap(err, "get latest key bundle")
 	}
+	defer closer.Close()
 	frameNumber := binary.BigEndian.Uint64(value)
-
-	if err := closer.Close(); err != nil {
-		return nil, errors.Wrap(err, "get latest key bundle")
-	}
 
 	value, closer, err = p.db.Get(keyBundleKey(provingKey, frameNumber))
 	if err != nil {
@@ -336,7 +329,6 @@ func (p *PebbleKeyStore) GetLatestKeyBundle(
 
 		return nil, errors.Wrap(err, "get latest key bundle")
 	}
-
 	defer closer.Close()
 
 	announcement := &protobufs.InclusionCommitment{}
@@ -440,10 +432,8 @@ func (p *PebbleKeyStore) PutKeyBundle(
 		); err != nil {
 			return errors.Wrap(err, "put key bundle")
 		}
-	}
-
-	if err == nil && closer != nil {
-		closer.Close()
+	} else {
+		_ = closer.Close()
 	}
 
 	if err = txn.Set(

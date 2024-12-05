@@ -139,8 +139,8 @@ func internalGetAggregateProof(
 
 		return nil, errors.Wrap(err, "get aggregate proof")
 	}
-
 	defer closer.Close()
+
 	copied := make([]byte, len(value[8:]))
 	limit := binary.BigEndian.Uint64(value[0:8])
 	copy(copied, value[8:])
@@ -159,6 +159,7 @@ func internalGetAggregateProof(
 	if err != nil {
 		return nil, errors.Wrap(err, "get aggregate proof")
 	}
+	defer iter.Close()
 
 	i := uint32(0)
 
@@ -199,14 +200,11 @@ func internalGetAggregateProof(
 
 				return nil, errors.Wrap(err, "get aggregate proof")
 			}
+			defer dataCloser.Close()
 
 			segCopy := make([]byte, len(segValue))
 			copy(segCopy, segValue)
 			chunks = append(chunks, segCopy)
-
-			if err = dataCloser.Close(); err != nil {
-				return nil, errors.Wrap(err, "get aggregate proof")
-			}
 		}
 
 		if string(url) == protobufs.IntrinsicExecutionOutputType {
@@ -236,10 +234,6 @@ func internalGetAggregateProof(
 		i++
 	}
 
-	if err = iter.Close(); err != nil {
-		return nil, errors.Wrap(err, "get aggregate proof")
-	}
-
 	return aggregate, nil
 }
 
@@ -263,8 +257,8 @@ func internalListAggregateProofKeys(
 
 		return nil, nil, nil, errors.Wrap(err, "list aggregate proof")
 	}
-
 	defer closer.Close()
+
 	copied := make([]byte, len(value[8:]))
 	limit := binary.BigEndian.Uint64(value[0:8])
 	copy(copied, value[8:])
@@ -278,6 +272,7 @@ func internalListAggregateProofKeys(
 
 		return nil, nil, nil, errors.Wrap(err, "list aggregate proof")
 	}
+	defer iter.Close()
 
 	i := uint32(0)
 	commits = append(commits, dataProofInclusionKey(filter, commitment, 0))
@@ -303,10 +298,6 @@ func internalListAggregateProofKeys(
 		}
 
 		i++
-	}
-
-	if err = iter.Close(); err != nil {
-		return nil, nil, nil, errors.Wrap(err, "list aggregate proof")
 	}
 
 	return proofs, commits, data, nil
@@ -467,8 +458,8 @@ func (p *PebbleDataProofStore) GetDataTimeProof(
 		err = errors.Wrap(err, "get data time proof")
 		return
 	}
-
 	defer closer.Close()
+
 	if len(data) < 24 {
 		err = ErrInvalidData
 		return
@@ -513,13 +504,10 @@ func (p *PebbleDataProofStore) GetTotalReward(
 
 		return nil, errors.Wrap(err, "get total difficulty sum")
 	}
+	defer closer.Close()
 
 	if len(prev) != 0 {
 		reward.SetBytes(prev[4:])
-
-		if err = closer.Close(); err != nil {
-			return nil, errors.Wrap(err, "get total difficulty sum")
-		}
 	}
 
 	return reward, nil
@@ -556,14 +544,11 @@ func (p *PebbleDataProofStore) PutDataTimeProof(
 	if err != nil && (!errors.Is(err, pebble.ErrNotFound) || increment != 0) {
 		return errors.Wrap(err, "put data time proof")
 	}
+	defer closer.Close()
 
 	if len(prev) != 0 {
 		priorSum.SetBytes(prev[4:])
 		prevIncrement := binary.BigEndian.Uint32(prev[:4])
-
-		if err = closer.Close(); err != nil {
-			return errors.Wrap(err, "put data time proof")
-		}
 
 		if prevIncrement != increment-1 {
 			return errors.Wrap(errors.New("invalid increment"), "put data time proof")
@@ -609,15 +594,13 @@ func (p *PebbleDataProofStore) GetLatestDataTimeProof(peerId []byte) (
 
 		return 0, 0, nil, errors.Wrap(err, "get latest data time proof")
 	}
+	defer closer.Close()
 
 	if len(prev) < 4 {
 		return 0, 0, nil, ErrInvalidData
 	}
 
 	increment = binary.BigEndian.Uint32(prev[:4])
-	if err = closer.Close(); err != nil {
-		return 0, 0, nil, errors.Wrap(err, "get latest data time proof")
-	}
 
 	_, parallelism, _, output, err = p.GetDataTimeProof(peerId, increment)
 

@@ -94,19 +94,15 @@ func (r *RPCServer) GetFrames(
 		if err != nil {
 			return nil, errors.Wrap(err, "get frames")
 		}
+		defer iter.Close()
 
 		frames := []*protobufs.ClockFrame{}
 		for iter.First(); iter.Valid(); iter.Next() {
 			frame, err := iter.Value()
 			if err != nil {
-				iter.Close()
 				return nil, errors.Wrap(err, "get frames")
 			}
 			frames = append(frames, frame)
-		}
-
-		if err := iter.Close(); err != nil {
-			return nil, errors.Wrap(err, "get frames")
 		}
 
 		return &protobufs.FramesResponse{
@@ -121,19 +117,15 @@ func (r *RPCServer) GetFrames(
 		if err != nil {
 			return nil, errors.Wrap(err, "get frame info")
 		}
+		defer iter.Close()
 
 		frames := []*protobufs.ClockFrame{}
 		for iter.First(); iter.Valid(); iter.Next() {
 			frame, err := iter.TruncatedValue()
 			if err != nil {
-				iter.Close()
 				return nil, errors.Wrap(err, "get frames")
 			}
 			frames = append(frames, frame)
-		}
-
-		if err := iter.Close(); err != nil {
-			return nil, errors.Wrap(err, "get frames")
 		}
 
 		return &protobufs.FramesResponse{

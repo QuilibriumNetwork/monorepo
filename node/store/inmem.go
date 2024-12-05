@@ -281,15 +281,13 @@ func (t *InMemKVDBTransaction) DeleteRange(
 	if err != nil {
 		return err
 	}
+	defer iter.Close()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		t.changes = append(t.changes, InMemKVDBOperation{
 			op:  DeleteOperation,
 			key: iter.Key(),
 		})
-		if err != nil {
-			return err
-		}
 	}
 
 	return nil
@@ -416,6 +414,7 @@ func (d *InMemKVDB) DeleteRange(start, end []byte) error {
 	if err != nil {
 		return err
 	}
+	defer iter.Close()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		err = d.Delete(iter.Key())
