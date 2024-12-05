@@ -103,6 +103,10 @@ func (e *DataClockConsensusEngine) runFramePruning() {
 
 	e.logger.Info("frame pruning enabled, waiting for delay timeout expiry")
 
+	from := uint64(1)
+	maxFrames := uint64(e.config.Engine.MaxFrames)
+	batchSize := uint64(1000)
+outer:
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -113,15 +117,34 @@ func (e *DataClockConsensusEngine) runFramePruning() {
 				panic(err)
 			}
 
-			if head.FrameNumber < uint64(e.config.Engine.MaxFrames)+1 ||
+			if head.FrameNumber <= maxFrames ||
 				head.FrameNumber <= application.PROOF_FRAME_SENIORITY_REPAIR+1 {
 				continue
 			}
 
-			if err := e.pruneFrames(
-				head.FrameNumber - uint64(e.config.Engine.MaxFrames),
-			); err != nil {
-				e.logger.Error("could not prune", zap.Error(err))
+			to := head.FrameNumber - maxFrames
+			for i := from; i < to; i += batchSize {
+				start, stop := i, min(i+batchSize, to)
+				if err := e.clockStore.DeleteDataClockFrameRange(e.filter, start, stop); err != nil {
+					e.logger.Error(
+						"failed to prune frames",
+						zap.Error(err),
+						zap.Uint64("from", start),
+						zap.Uint64("to", stop),
+					)
+					continue outer
+				}
+				e.logger.Info(
+					"pruned frames",
+					zap.Uint64("from", start),
+					zap.Uint64("to", stop),
+				)
+				select {
+				case <-e.ctx.Done():
+					return
+				default:
+				}
+				from = stop
 			}
 		}
 	}

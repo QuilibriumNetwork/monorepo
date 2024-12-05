@@ -725,7 +725,6 @@ func (p *PebbleClockStore) deleteAggregateProofs(
 	for i := 0; i < len(frame.Input[516:])/74; i++ {
 		commit := frame.Input[516+(i*74) : 516+((i+1)*74)]
 		err := internalDeleteAggregateProof(
-			p.db,
 			txn,
 			frame.AggregateProofs[i],
 			commit,
@@ -756,7 +755,6 @@ func (p *PebbleClockStore) saveAggregateProofs(
 	for i := 0; i < len(frame.Input[516:])/74; i++ {
 		commit := frame.Input[516+(i*74) : 516+((i+1)*74)]
 		err := internalPutAggregateProof(
-			p.db,
 			txn,
 			frame.AggregateProofs[i],
 			commit,
@@ -1049,36 +1047,99 @@ func (p *PebbleClockStore) DeleteDataClockFrameRange(
 	for i := fromFrameNumber; i < toFrameNumber; i++ {
 		frames, err := p.GetStagedDataClockFramesForFrameNumber(filter, i)
 		if err != nil {
-			continue
+			if !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrInvalidData) {
+				_ = txn.Abort()
+				return errors.Wrap(err, "delete data clock frame range")
+			}
+			frames = nil
 		}
 
+	outer:
 		for _, frame := range frames {
-			err = p.deleteAggregateProofs(txn, frame)
-			if err != nil {
-				continue
+			for _, ap := range frame.AggregateProofs {
+				for _, inc := range ap.InclusionCommitments {
+					// The commitments collide for very small frames, and as such we have to detect them early
+					// and avoid deleting them. Common cases for such collisions are prover announcement messages
+					// which do not contain the frame number, so their binary contents are equivalent between
+					// multiple frames.
+					if len(inc.Data) < 2048 {
+						continue outer
+					}
+					if inc.TypeUrl == protobufs.IntrinsicExecutionOutputType {
+						o := &protobufs.IntrinsicExecutionOutput{}
+						if err := proto.Unmarshal(inc.Data, o); err != nil {
+							_ = txn.Abort()
+							return errors.Wrap(err, "delete data clock frame range")
+						}
+						// The commitments collide for empty frames, and as such we have to detect them early
+						// and avoid deleting them.
+						if len(o.Output) == 0 || len(o.Proof) == 0 {
+							continue outer
+						}
+					}
+				}
+			}
+			if err := p.deleteAggregateProofs(txn, frame); err != nil {
+				if !errors.Is(err, pebble.ErrNotFound) {
+					_ = txn.Abort()
+					return errors.Wrap(err, "delete data clock frame range")
+				}
 			}
 		}
 
-		err = txn.DeleteRange(
+		if err := txn.DeleteRange(
 			clockDataParentIndexKey(filter, i, bytes.Repeat([]byte{0x00}, 32)),
 			clockDataParentIndexKey(filter, i, bytes.Repeat([]byte{0xff}, 32)),
-		)
-		if err != nil {
-			continue
+		); err != nil {
+			if !errors.Is(err, pebble.ErrNotFound) {
+				_ = txn.Abort()
+				return errors.Wrap(err, "delete data clock frame range")
+			}
 		}
 
-		err = txn.Delete(clockDataFrameKey(filter, i))
-		if err != nil {
-			continue
+		if err := txn.Delete(clockDataFrameKey(filter, i)); err != nil {
+			if !errors.Is(err, pebble.ErrNotFound) {
+				_ = txn.Abort()
+				return errors.Wrap(err, "delete data clock frame range")
+			}
+		}
+
+		// The prover trie keys are not stored continuously with respect
+		// to the same frame number. As such, we need to manually iterate
+		// and discover such keys.
+		for t := uint16(0); t <= 0xffff; t++ {
+			_, closer, err := p.db.Get(clockProverTrieKey(filter, t, i))
+			if err != nil {
+				if !errors.Is(err, pebble.ErrNotFound) {
+					_ = txn.Abort()
+					return errors.Wrap(err, "delete data clock frame range")
+				} else {
+					break
+				}
+			}
+			_ = closer.Close()
+			if err := txn.Delete(clockProverTrieKey(filter, t, i)); err != nil {
+				_ = txn.Abort()
+				return errors.Wrap(err, "delete data clock frame range")
+			}
+		}
+
+		if err := txn.DeleteRange(
+			clockDataTotalDistanceKey(filter, i, bytes.Repeat([]byte{0x00}, 32)),
+			clockDataTotalDistanceKey(filter, i, bytes.Repeat([]byte{0xff}, 32)),
+		); err != nil {
+			if !errors.Is(err, pebble.ErrNotFound) {
+				_ = txn.Abort()
+				return errors.Wrap(err, "delete data clock frame range")
+			}
 		}
 	}
 
-	if err = txn.Commit(); err != nil {
-		txn.Abort()
+	if err := txn.Commit(); err != nil {
 		return errors.Wrap(err, "delete data clock frame range")
 	}
 
-	return errors.Wrap(err, "delete data clock frame range")
+	return nil
 }
 
 func (p *PebbleClockStore) ResetMasterClockFrames(filter []byte) error {

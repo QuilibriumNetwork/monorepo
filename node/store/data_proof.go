@@ -317,17 +317,10 @@ func (p *PebbleDataProofStore) GetAggregateProof(
 }
 
 func internalDeleteAggregateProof(
-	db KVDB,
 	txn Transaction,
 	aggregateProof *protobufs.InclusionAggregateProof,
 	commitment []byte,
 ) error {
-	buf := binary.BigEndian.AppendUint64(
-		nil,
-		uint64(len(aggregateProof.InclusionCommitments)),
-	)
-	buf = append(buf, aggregateProof.Proof...)
-
 	for i, inc := range aggregateProof.InclusionCommitments {
 		var segments [][]byte
 		if inc.TypeUrl == protobufs.IntrinsicExecutionOutputType {
@@ -369,7 +362,6 @@ func internalDeleteAggregateProof(
 }
 
 func internalPutAggregateProof(
-	db KVDB,
 	txn Transaction,
 	aggregateProof *protobufs.InclusionAggregateProof,
 	commitment []byte,
@@ -438,7 +430,6 @@ func (p *PebbleDataProofStore) PutAggregateProof(
 	commitment []byte,
 ) error {
 	return internalPutAggregateProof(
-		p.db,
 		txn,
 		aggregateProof,
 		commitment,
