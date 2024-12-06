@@ -94,6 +94,8 @@ type EngineConfig struct {
 	AutoMergeCoins bool `yaml:"autoMergeCoins"`
 	// Maximum wait time for a frame to be downloaded from a peer.
 	SyncTimeout time.Duration `yaml:"syncTimeout"`
+	// Number of candidate peers per category to sync with.
+	SyncCandidates int `yaml:"syncCandidates"`
 
 	// Values used only for testing – do not override these in production, your
 	// node will get kicked out

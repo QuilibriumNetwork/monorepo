@@ -20,7 +20,10 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
-const defaultSyncTimeout = 4 * time.Second
+const (
+	defaultSyncTimeout    = 4 * time.Second
+	defaultSyncCandidates = 8
+)
 
 func (e *DataClockConsensusEngine) syncWithMesh() error {
 	e.logger.Info("collecting vdf proofs")
@@ -304,11 +307,16 @@ func (e *DataClockConsensusEngine) GetAheadPeers(frameNumber uint64) []internal.
 		}
 	}
 
+	syncCandidates := e.config.Engine.SyncCandidates
+	if syncCandidates == 0 {
+		syncCandidates = defaultSyncCandidates
+	}
+
 	return slices.Concat(
-		internal.WeightedSampleWithoutReplacement(nearCandidates, len(nearCandidates)),
-		internal.WeightedSampleWithoutReplacement(reachableCandidates, len(reachableCandidates)),
-		internal.WeightedSampleWithoutReplacement(unknownCandidates, len(unknownCandidates)),
-		internal.WeightedSampleWithoutReplacement(unreachableCandidates, len(unreachableCandidates)),
+		internal.WeightedSampleWithoutReplacement(nearCandidates, min(len(nearCandidates), syncCandidates)),
+		internal.WeightedSampleWithoutReplacement(reachableCandidates, min(len(reachableCandidates), syncCandidates)),
+		internal.WeightedSampleWithoutReplacement(unknownCandidates, min(len(unknownCandidates), syncCandidates)),
+		internal.WeightedSampleWithoutReplacement(unreachableCandidates, min(len(unreachableCandidates), syncCandidates)),
 	)
 }
 
