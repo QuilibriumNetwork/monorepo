@@ -144,6 +144,11 @@ var (
 		true,
 		"when enabled, frame execution validation is skipped",
 	)
+	compactDB = flag.Bool(
+		"compact-db",
+		false,
+		"compacts the database and exits",
+	)
 )
 
 func signatureCheckDefault() bool {
@@ -328,6 +333,17 @@ func main() {
 	nodeConfig, err := config.LoadConfig(*configDirectory, "", false)
 	if err != nil {
 		panic(err)
+	}
+
+	if *compactDB && *core == 0 {
+		db := store.NewPebbleDB(nodeConfig.DB)
+		if err := db.CompactAll(); err != nil {
+			panic(err)
+		}
+		if err := db.Close(); err != nil {
+			panic(err)
+		}
+		return
 	}
 
 	if *network != 0 {
