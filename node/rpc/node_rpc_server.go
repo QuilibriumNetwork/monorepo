@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -43,6 +44,8 @@ type RPCServer struct {
 	pubSub           p2p.PubSub
 	masterClock      *master.MasterClockConsensusEngine
 	executionEngines []execution.ExecutionEngine
+	grpcServer       *grpc.Server
+	httpServer       *http.Server
 }
 
 // GetFrameInfo implements protobufs.NodeServiceServer.
@@ -384,7 +387,33 @@ func NewRPCServer(
 	masterClock *master.MasterClockConsensusEngine,
 	executionEngines []execution.ExecutionEngine,
 ) (*RPCServer, error) {
-	return &RPCServer{
+	mg, err := multiaddr.NewMultiaddr(listenAddrGRPC)
+	if err != nil {
+		return nil, errors.Wrap(err, "new rpc server")
+	}
+	mga, err := mn.ToNetAddr(mg)
+	if err != nil {
+		return nil, errors.Wrap(err, "new rpc server")
+	}
+
+	mux := runtime.NewServeMux()
+	opts := qgrpc.ClientOptions(
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(600*1024*1024),
+			grpc.MaxCallSendMsgSize(600*1024*1024),
+		),
+	)
+	if err := protobufs.RegisterNodeServiceHandlerFromEndpoint(
+		context.Background(),
+		mux,
+		mga.String(),
+		opts,
+	); err != nil {
+		return nil, err
+	}
+
+	rpcServer := &RPCServer{
 		listenAddrGRPC:   listenAddrGRPC,
 		listenAddrHTTP:   listenAddrHTTP,
 		logger:           logger,
@@ -395,17 +424,22 @@ func NewRPCServer(
 		pubSub:           pubSub,
 		masterClock:      masterClock,
 		executionEngines: executionEngines,
-	}, nil
+		grpcServer: qgrpc.NewServer(
+			grpc.MaxRecvMsgSize(600*1024*1024),
+			grpc.MaxSendMsgSize(600*1024*1024),
+		),
+		httpServer: &http.Server{
+			Handler: mux,
+		},
+	}
+
+	protobufs.RegisterNodeServiceServer(rpcServer.grpcServer, rpcServer)
+	reflection.Register(rpcServer.grpcServer)
+
+	return rpcServer, nil
 }
 
 func (r *RPCServer) Start() error {
-	s := qgrpc.NewServer(
-		grpc.MaxRecvMsgSize(600*1024*1024),
-		grpc.MaxSendMsgSize(600*1024*1024),
-	)
-	protobufs.RegisterNodeServiceServer(s, r)
-	reflection.Register(s)
-
 	mg, err := multiaddr.NewMultiaddr(r.listenAddrGRPC)
 	if err != nil {
 		return errors.Wrap(err, "start")
@@ -417,51 +451,42 @@ func (r *RPCServer) Start() error {
 	}
 
 	go func() {
-		if err := s.Serve(mn.NetListener(lis)); err != nil {
-			panic(err)
+		if err := r.grpcServer.Serve(mn.NetListener(lis)); err != nil {
+			r.logger.Error("serve error", zap.Error(err))
 		}
 	}()
 
 	if r.listenAddrHTTP != "" {
-		m, err := multiaddr.NewMultiaddr(r.listenAddrHTTP)
+		mh, err := multiaddr.NewMultiaddr(r.listenAddrHTTP)
 		if err != nil {
 			return errors.Wrap(err, "start")
 		}
 
-		ma, err := mn.ToNetAddr(m)
-		if err != nil {
-			return errors.Wrap(err, "start")
-		}
-
-		mga, err := mn.ToNetAddr(mg)
+		lis, err := mn.Listen(mh)
 		if err != nil {
 			return errors.Wrap(err, "start")
 		}
 
 		go func() {
-			mux := runtime.NewServeMux()
-			opts := qgrpc.ClientOptions(
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithDefaultCallOptions(
-					grpc.MaxCallRecvMsgSize(600*1024*1024),
-					grpc.MaxCallSendMsgSize(600*1024*1024),
-				),
-			)
-
-			if err := protobufs.RegisterNodeServiceHandlerFromEndpoint(
-				context.Background(),
-				mux,
-				mga.String(),
-				opts,
-			); err != nil {
-				panic(err)
-			}
-
-			if err := http.ListenAndServe(ma.String(), mux); err != nil {
-				panic(err)
+			if err := r.httpServer.Serve(mn.NetListener(lis)); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				r.logger.Error("serve error", zap.Error(err))
 			}
 		}()
 	}
 
 	return nil
+}
+
+func (r *RPCServer) Stop() {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		r.grpcServer.GracefulStop()
+	}()
+	go func() {
+		defer wg.Done()
+		r.httpServer.Shutdown(context.Background())
+	}()
+	wg.Wait()
 }

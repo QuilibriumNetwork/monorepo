@@ -467,6 +467,7 @@ func main() {
 
 	if !*integrityCheck {
 		go spawnDataWorkers(nodeConfig)
+		defer stopDataWorkers()
 	}
 
 	kzg.Init()
@@ -510,6 +511,9 @@ func main() {
 
 	// runtime.GOMAXPROCS(1)
 
+	node.Start()
+	defer node.Stop()
+
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		srv, err := rpc.NewRPCServer(
 			nodeConfig.ListenGRPCMultiaddr,
@@ -526,20 +530,13 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-
-		go func() {
-			err := srv.Start()
-			if err != nil {
-				panic(err)
-			}
-		}()
+		if err := srv.Start(); err != nil {
+			panic(err)
+		}
+		defer srv.Stop()
 	}
 
-	node.Start()
-
 	<-done
-	stopDataWorkers()
-	node.Stop()
 }
 
 var dataWorkers []*exec.Cmd

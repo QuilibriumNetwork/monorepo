@@ -72,6 +72,8 @@ type DataClockConsensusEngine struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	grpcServers []*grpc.Server
+
 	lastProven                  uint64
 	difficulty                  uint32
 	config                      *config.Config
@@ -349,38 +351,40 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	e.pubSub.Subscribe(e.frameFragmentFilter, e.handleFrameFragmentMessage)
 	e.pubSub.Subscribe(e.txFilter, e.handleTxMessage)
 	e.pubSub.Subscribe(e.infoFilter, e.handleInfoMessage)
+
+	syncServer := qgrpc.NewServer(
+		grpc.MaxSendMsgSize(40*1024*1024),
+		grpc.MaxRecvMsgSize(40*1024*1024),
+	)
+	e.grpcServers = append(e.grpcServers[:0:0], syncServer)
+	protobufs.RegisterDataServiceServer(syncServer, e)
 	go func() {
-		server := qgrpc.NewServer(
-			grpc.MaxSendMsgSize(40*1024*1024),
-			grpc.MaxRecvMsgSize(40*1024*1024),
-		)
-		protobufs.RegisterDataServiceServer(server, e)
 		if err := e.pubSub.StartDirectChannelListener(
 			e.pubSub.GetPeerID(),
 			"sync",
-			server,
+			syncServer,
 		); err != nil {
-			panic(err)
+			e.logger.Error("error starting sync server", zap.Error(err))
 		}
 	}()
 
-	go func() {
-		if e.dataTimeReel.GetFrameProverTries()[0].Contains(e.provingKeyAddress) {
-			server := qgrpc.NewServer(
-				grpc.MaxSendMsgSize(1*1024*1024),
-				grpc.MaxRecvMsgSize(1*1024*1024),
-			)
-			protobufs.RegisterDataServiceServer(server, e)
-
+	if e.FrameProverTrieContains(0, e.provingKeyAddress) {
+		workerServer := qgrpc.NewServer(
+			grpc.MaxSendMsgSize(1*1024*1024),
+			grpc.MaxRecvMsgSize(1*1024*1024),
+		)
+		e.grpcServers = append(e.grpcServers, workerServer)
+		protobufs.RegisterDataServiceServer(workerServer, e)
+		go func() {
 			if err := e.pubSub.StartDirectChannelListener(
 				e.pubSub.GetPeerID(),
 				"worker",
-				server,
+				workerServer,
 			); err != nil {
-				panic(err)
+				e.logger.Error("error starting worker server", zap.Error(err))
 			}
-		}
-	}()
+		}()
+	}
 
 	e.stateMx.Lock()
 	e.state = consensus.EngineStateCollecting
@@ -661,6 +665,16 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 }
 
 func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
+	wg := sync.WaitGroup{}
+	wg.Add(len(e.grpcServers))
+	for _, server := range e.grpcServers {
+		go func(server *grpc.Server) {
+			defer wg.Done()
+			server.GracefulStop()
+		}(server)
+	}
+	wg.Wait()
+
 	e.logger.Info("stopping ceremony consensus engine")
 	e.cancel()
 	e.wg.Wait()
@@ -684,7 +698,6 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 		e.logger.Warn("error publishing prover pause", zap.Error(err))
 	}
 
-	wg := sync.WaitGroup{}
 	wg.Add(len(e.executionEngines))
 	executionErrors := make(chan error, len(e.executionEngines))
 	for name := range e.executionEngines {
