@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
@@ -162,9 +163,17 @@ func (n *Node) Start() {
 	}
 
 	// TODO: add config mapping to engine name/frame registration
+	wg := sync.WaitGroup{}
 	for _, e := range n.execEngines {
-		n.engine.RegisterExecutor(e, 0)
+		wg.Add(1)
+		go func(e execution.ExecutionEngine) {
+			defer wg.Done()
+			if err := <-n.engine.RegisterExecutor(e, 0); err != nil {
+				panic(err)
+			}
+		}(e)
 	}
+	wg.Wait()
 }
 
 func (n *Node) Stop() {
