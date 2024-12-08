@@ -967,7 +967,7 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromList() (
 			grpc.WithBlock(),
 		)
 		if err != nil {
-			e.logger.Error("could not dial", zap.Int("core", i), zap.String("worker multiaddr", wma), zap.Error(err))
+			e.logger.Error("could not dial", zap.Int("core", i), zap.String("worker_multiaddr", wma), zap.Error(err))
 			continue
 		}
 
