@@ -110,7 +110,7 @@ func (e *DataClockConsensusEngine) runTxMessageHandler() {
 				continue
 			}
 
-			if e.frameProverTries[0].Contains(e.provingKeyAddress) {
+			if e.FrameProverTrieContains(0, e.provingKeyAddress) {
 				wg := &sync.WaitGroup{}
 				for name := range e.executionEngines {
 					name := name
