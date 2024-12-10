@@ -32,6 +32,14 @@ type Config struct {
 	LogFile             string        `yaml:"logFile"`
 }
 
+// WithDefaults returns a copy of the config with default values filled in.
+func (c Config) WithDefaults() Config {
+	cpy := c
+	engine := cpy.Engine.WithDefaults()
+	cpy.Engine = &engine
+	return cpy
+}
+
 func NewConfig(configPath string) (*Config, error) {
 	file, err := os.Open(configPath)
 	if err != nil {
@@ -447,7 +455,8 @@ func LoadConfig(configPath string, proverKey string, skipGenesisCheck bool) (
 		config.P2P.BootstrapPeers = peers
 	}
 
-	return config, nil
+	withDefaults := config.WithDefaults()
+	return &withDefaults, nil
 }
 
 func SaveConfig(configPath string, config *Config) error {

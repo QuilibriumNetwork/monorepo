@@ -98,7 +98,7 @@ func (e *DataClockConsensusEngine) publishProof(
 	}
 	e.peerMapMx.Unlock()
 
-	cfg := e.config.Engine.FramePublish.WithDefaults()
+	cfg := e.config.Engine.FramePublish
 	if cfg.BallastSize > 0 {
 		frame = proto.Clone(frame).(*protobufs.ClockFrame)
 		frame.Padding = make([]byte, cfg.BallastSize)

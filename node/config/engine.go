@@ -9,7 +9,8 @@ type FramePublishFragmentationReedSolomonConfig struct {
 	ParityShards int `yaml:"parityShards"`
 }
 
-// WithDefaults sets default values for any fields that are not set.
+// WithDefaults returns a copy of the FramePublishFragmentationReedSolomonConfig with any missing fields set to
+// their default values.
 func (c FramePublishFragmentationReedSolomonConfig) WithDefaults() FramePublishFragmentationReedSolomonConfig {
 	cpy := c
 	if cpy.DataShards == 0 {
@@ -29,7 +30,7 @@ type FramePublishFragmentationConfig struct {
 	ReedSolomon FramePublishFragmentationReedSolomonConfig `yaml:"reedSolomon"`
 }
 
-// WithDefaults sets default values for any fields that are not set.
+// WithDefaults returns a copy of the FramePublishFragmentationConfig with any missing fields set to
 func (c FramePublishFragmentationConfig) WithDefaults() FramePublishFragmentationConfig {
 	cpy := c
 	if cpy.Algorithm == "" {
@@ -53,7 +54,7 @@ type FramePublishConfig struct {
 	BallastSize int `yaml:"ballastSize"`
 }
 
-// WithDefaults sets default values for any fields that are not set.
+// WithDefaults returns a copy of the FramePublishConfig with any missing fields set to
 func (c FramePublishConfig) WithDefaults() FramePublishConfig {
 	cpy := c
 	if cpy.Mode == "" {
@@ -105,4 +106,11 @@ type EngineConfig struct {
 
 	// EXPERIMENTAL: The configuration for frame publishing.
 	FramePublish FramePublishConfig `yaml:"framePublish"`
+}
+
+// WithDefaults returns a copy of the EngineConfig with any missing fields set to
+func (c EngineConfig) WithDefaults() EngineConfig {
+	cpy := c
+	cpy.FramePublish = cpy.FramePublish.WithDefaults()
+	return cpy
 }
