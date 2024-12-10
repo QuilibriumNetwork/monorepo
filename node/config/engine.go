@@ -9,6 +9,8 @@ const (
 	defaultDataWorkerMemoryLimit         = 1792 * 1024 * 1024 // 1.75 GiB
 	defaultSyncTimeout                   = 4 * time.Second
 	defaultSyncCandidates                = 8
+	defaultSyncMessageReceiveLimit       = 1 * 1024 * 1024
+	defaultSyncMessageSendLimit          = 600 * 1024 * 1024
 )
 
 type FramePublishFragmentationReedSolomonConfig struct {
@@ -108,6 +110,8 @@ type EngineConfig struct {
 	SyncTimeout time.Duration `yaml:"syncTimeout"`
 	// Number of candidate peers per category to sync with.
 	SyncCandidates int `yaml:"syncCandidates"`
+	// The configuration for the GRPC message limits.
+	SyncMessageLimits GRPCMessageLimitsConfig `yaml:"syncMessageLimits"`
 
 	// Values used only for testing – do not override these in production, your
 	// node will get kicked out
@@ -141,6 +145,10 @@ func (c EngineConfig) WithDefaults() EngineConfig {
 	if cpy.SyncCandidates == 0 {
 		cpy.SyncCandidates = defaultSyncCandidates
 	}
+	cpy.SyncMessageLimits = cpy.SyncMessageLimits.WithDefaults(
+		defaultSyncMessageReceiveLimit,
+		defaultSyncMessageSendLimit,
+	)
 	cpy.FramePublish = cpy.FramePublish.WithDefaults()
 	return cpy
 }

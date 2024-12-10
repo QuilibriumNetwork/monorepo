@@ -366,7 +366,10 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 			&protobufs.GetDataFrameRequest{
 				FrameNumber: latest.FrameNumber + 1,
 			},
-			grpc.MaxCallRecvMsgSize(600*1024*1024),
+			// The message size limits are swapped because the server is the one
+			// sending the data.
+			grpc.MaxCallRecvMsgSize(e.config.Engine.SyncMessageLimits.MaxSendMsgSize),
+			grpc.MaxCallSendMsgSize(e.config.Engine.SyncMessageLimits.MaxRecvMsgSize),
 		)
 		cancelGet()
 		if err != nil {

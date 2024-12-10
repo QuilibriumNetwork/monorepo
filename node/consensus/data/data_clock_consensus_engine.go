@@ -343,8 +343,8 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	e.pubSub.Subscribe(e.infoFilter, e.handleInfoMessage)
 
 	syncServer := qgrpc.NewServer(
-		grpc.MaxSendMsgSize(40*1024*1024),
-		grpc.MaxRecvMsgSize(40*1024*1024),
+		grpc.MaxRecvMsgSize(e.config.Engine.SyncMessageLimits.MaxRecvMsgSize),
+		grpc.MaxSendMsgSize(e.config.Engine.SyncMessageLimits.MaxSendMsgSize),
 	)
 	e.grpcServers = append(e.grpcServers[:0:0], syncServer)
 	protobufs.RegisterDataServiceServer(syncServer, e)

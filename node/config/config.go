@@ -22,6 +22,24 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+type GRPCMessageLimitsConfig struct {
+	MaxRecvMsgSize int `yaml:"maxRecvMsgSize"`
+	MaxSendMsgSize int `yaml:"maxSendMsgSize"`
+}
+
+// WithDefaults returns a copy of the GRPCMessageLimitsConfig with any missing fields set to
+// their default values.
+func (c GRPCMessageLimitsConfig) WithDefaults(recv, send int) GRPCMessageLimitsConfig {
+	cpy := c
+	if cpy.MaxRecvMsgSize == 0 {
+		cpy.MaxRecvMsgSize = recv
+	}
+	if cpy.MaxSendMsgSize == 0 {
+		cpy.MaxSendMsgSize = send
+	}
+	return cpy
+}
+
 type Config struct {
 	Key                 *KeyConfig    `yaml:"key"`
 	P2P                 *P2PConfig    `yaml:"p2p"`
