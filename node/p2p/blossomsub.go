@@ -45,26 +45,13 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/observability"
-	qruntime "source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p/internal"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
-// The default watermarks are the defaults used by libp2p.DefaultConnectionManager.
-// We explicitly set them here in order to force internal consistency between the
-// connection manager and the resource manager.
 const (
-	defaultLowWatermarkConnections  = 160
-	defaultHighWatermarkConnections = 192
-	defaultMinBootstrapPeers        = 3
-	defaultBootstrapParallelism     = 10
-	defaultDiscoveryParallelism     = 50
-	defaultDiscoveryPeerLookupLimit = 1000
-	defaultPingTimeout              = 5 * time.Second
-	defaultPingPeriod               = 30 * time.Second
-	defaultPingAttempts             = 3
-	DecayInterval                   = 10 * time.Second
-	AppDecay                        = .9
+	DecayInterval = 10 * time.Second
+	AppDecay      = .9
 )
 
 type appScore struct {
@@ -192,7 +179,6 @@ func NewBlossomSub(
 	logger *zap.Logger,
 ) *BlossomSub {
 	ctx := context.Background()
-	p2pConfig = withDefaults(p2pConfig)
 
 	opts := []libp2pconfig.Option{
 		libp2p.ListenAddrStrings(p2pConfig.ListenMultiaddr),
@@ -1041,144 +1027,6 @@ func (b *BlossomSub) GetPublicKey() []byte {
 func (b *BlossomSub) SignMessage(msg []byte) ([]byte, error) {
 	sig, err := b.signKey.Sign(msg)
 	return sig, errors.Wrap(err, "sign message")
-}
-
-func withDefaults(p2pConfig *config.P2PConfig) *config.P2PConfig {
-	cfg := *p2pConfig
-	p2pConfig = &cfg
-	if p2pConfig.D == 0 {
-		p2pConfig.D = blossomsub.BlossomSubD
-	}
-	if p2pConfig.DLo == 0 {
-		p2pConfig.DLo = blossomsub.BlossomSubDlo
-	}
-	if p2pConfig.DHi == 0 {
-		p2pConfig.DHi = blossomsub.BlossomSubDhi
-	}
-	if p2pConfig.DScore == 0 {
-		p2pConfig.DScore = blossomsub.BlossomSubDscore
-	}
-	if p2pConfig.DOut == 0 {
-		p2pConfig.DOut = blossomsub.BlossomSubDout
-	}
-	if p2pConfig.HistoryLength == 0 {
-		p2pConfig.HistoryLength = blossomsub.BlossomSubHistoryLength
-	}
-	if p2pConfig.HistoryGossip == 0 {
-		p2pConfig.HistoryGossip = blossomsub.BlossomSubHistoryGossip
-	}
-	if p2pConfig.DLazy == 0 {
-		p2pConfig.DLazy = blossomsub.BlossomSubDlazy
-	}
-	if p2pConfig.GossipFactor == 0 {
-		p2pConfig.GossipFactor = blossomsub.BlossomSubGossipFactor
-	}
-	if p2pConfig.GossipRetransmission == 0 {
-		p2pConfig.GossipRetransmission = blossomsub.BlossomSubGossipRetransmission
-	}
-	if p2pConfig.HeartbeatInitialDelay == 0 {
-		p2pConfig.HeartbeatInitialDelay = blossomsub.BlossomSubHeartbeatInitialDelay
-	}
-	if p2pConfig.HeartbeatInterval == 0 {
-		p2pConfig.HeartbeatInterval = blossomsub.BlossomSubHeartbeatInterval
-	}
-	if p2pConfig.FanoutTTL == 0 {
-		p2pConfig.FanoutTTL = blossomsub.BlossomSubFanoutTTL
-	}
-	if p2pConfig.PrunePeers == 0 {
-		p2pConfig.PrunePeers = blossomsub.BlossomSubPrunePeers
-	}
-	if p2pConfig.PruneBackoff == 0 {
-		p2pConfig.PruneBackoff = blossomsub.BlossomSubPruneBackoff
-	}
-	if p2pConfig.UnsubscribeBackoff == 0 {
-		p2pConfig.UnsubscribeBackoff = blossomsub.BlossomSubUnsubscribeBackoff
-	}
-	if p2pConfig.Connectors == 0 {
-		p2pConfig.Connectors = blossomsub.BlossomSubConnectors
-	}
-	if p2pConfig.MaxPendingConnections == 0 {
-		p2pConfig.MaxPendingConnections = blossomsub.BlossomSubMaxPendingConnections
-	}
-	if p2pConfig.ConnectionTimeout == 0 {
-		p2pConfig.ConnectionTimeout = blossomsub.BlossomSubConnectionTimeout
-	}
-	if p2pConfig.DirectConnectTicks == 0 {
-		p2pConfig.DirectConnectTicks = blossomsub.BlossomSubDirectConnectTicks
-	}
-	if p2pConfig.DirectConnectInitialDelay == 0 {
-		p2pConfig.DirectConnectInitialDelay =
-			blossomsub.BlossomSubDirectConnectInitialDelay
-	}
-	if p2pConfig.OpportunisticGraftTicks == 0 {
-		p2pConfig.OpportunisticGraftTicks =
-			blossomsub.BlossomSubOpportunisticGraftTicks
-	}
-	if p2pConfig.OpportunisticGraftPeers == 0 {
-		p2pConfig.OpportunisticGraftPeers =
-			blossomsub.BlossomSubOpportunisticGraftPeers
-	}
-	if p2pConfig.GraftFloodThreshold == 0 {
-		p2pConfig.GraftFloodThreshold = blossomsub.BlossomSubGraftFloodThreshold
-	}
-	if p2pConfig.MaxIHaveLength == 0 {
-		p2pConfig.MaxIHaveLength = blossomsub.BlossomSubMaxIHaveLength
-	}
-	if p2pConfig.MaxIHaveMessages == 0 {
-		p2pConfig.MaxIHaveMessages = blossomsub.BlossomSubMaxIHaveMessages
-	}
-	if p2pConfig.MaxIDontWantMessages == 0 {
-		p2pConfig.MaxIDontWantMessages = blossomsub.BlossomSubMaxIDontWantMessages
-	}
-	if p2pConfig.IWantFollowupTime == 0 {
-		p2pConfig.IWantFollowupTime = blossomsub.BlossomSubIWantFollowupTime
-	}
-	if p2pConfig.IDontWantMessageThreshold == 0 {
-		p2pConfig.IDontWantMessageThreshold = blossomsub.BlossomSubIDontWantMessageThreshold
-	}
-	if p2pConfig.IDontWantMessageTTL == 0 {
-		p2pConfig.IDontWantMessageTTL = blossomsub.BlossomSubIDontWantMessageTTL
-	}
-	if p2pConfig.LowWatermarkConnections == 0 {
-		p2pConfig.LowWatermarkConnections = defaultLowWatermarkConnections
-	}
-	if p2pConfig.HighWatermarkConnections == 0 {
-		p2pConfig.HighWatermarkConnections = defaultHighWatermarkConnections
-	}
-	if p2pConfig.MinBootstrapPeers == 0 {
-		p2pConfig.MinBootstrapPeers = defaultMinBootstrapPeers
-	}
-	if p2pConfig.BootstrapParallelism == 0 {
-		p2pConfig.BootstrapParallelism = defaultBootstrapParallelism
-	}
-	if p2pConfig.DiscoveryParallelism == 0 {
-		p2pConfig.DiscoveryParallelism = defaultDiscoveryParallelism
-	}
-	if p2pConfig.DiscoveryPeerLookupLimit == 0 {
-		p2pConfig.DiscoveryPeerLookupLimit = defaultDiscoveryPeerLookupLimit
-	}
-	if p2pConfig.PingTimeout == 0 {
-		p2pConfig.PingTimeout = defaultPingTimeout
-	}
-	if p2pConfig.PingPeriod == 0 {
-		p2pConfig.PingPeriod = defaultPingPeriod
-	}
-	if p2pConfig.PingAttempts == 0 {
-		p2pConfig.PingAttempts = defaultPingAttempts
-	}
-	if p2pConfig.ValidateQueueSize == 0 {
-		p2pConfig.ValidateQueueSize = blossomsub.DefaultValidateQueueSize
-	}
-	if p2pConfig.ValidateWorkers == 0 {
-		p2pConfig.ValidateWorkers = qruntime.WorkerCount(0, false)
-	}
-	if p2pConfig.SubscriptionQueueSize == 0 {
-		p2pConfig.SubscriptionQueueSize = blossomsub.DefaultSubscriptionQueueSize
-	}
-	if p2pConfig.PeerOutboundQueueSize == 0 {
-		p2pConfig.PeerOutboundQueueSize = blossomsub.DefaultPeerOutboundQueueSize
-	}
-	return p2pConfig
 }
 
 func toBlossomSubParams(p2pConfig *config.P2PConfig) blossomsub.BlossomSubParams {

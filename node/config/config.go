@@ -35,6 +35,8 @@ type Config struct {
 // WithDefaults returns a copy of the config with default values filled in.
 func (c Config) WithDefaults() Config {
 	cpy := c
+	p2p := cpy.P2P.WithDefaults()
+	cpy.P2P = &p2p
 	engine := cpy.Engine.WithDefaults()
 	cpy.Engine = &engine
 	return cpy
