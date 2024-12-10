@@ -476,6 +476,9 @@ func main() {
 			if _, explicitGOMEMLIMIT := os.LookupEnv("GOMEMLIMIT"); !explicitGOMEMLIMIT {
 				rdebug.SetMemoryLimit(availableOverhead * 8 / 10)
 			}
+			if _, explicitGOGC := os.LookupEnv("GOGC"); !explicitGOGC {
+				rdebug.SetGCPercent(10)
+			}
 		}
 	}
 
