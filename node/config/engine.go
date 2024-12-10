@@ -2,6 +2,11 @@ package config
 
 import "time"
 
+const (
+	defaultSyncTimeout    = 4 * time.Second
+	defaultSyncCandidates = 8
+)
+
 type FramePublishFragmentationReedSolomonConfig struct {
 	// The number of data shards to use for Reed-Solomon encoding and decoding.
 	DataShards int `yaml:"dataShards"`
@@ -31,6 +36,7 @@ type FramePublishFragmentationConfig struct {
 }
 
 // WithDefaults returns a copy of the FramePublishFragmentationConfig with any missing fields set to
+// their default values.
 func (c FramePublishFragmentationConfig) WithDefaults() FramePublishFragmentationConfig {
 	cpy := c
 	if cpy.Algorithm == "" {
@@ -55,6 +61,7 @@ type FramePublishConfig struct {
 }
 
 // WithDefaults returns a copy of the FramePublishConfig with any missing fields set to
+// their default values.
 func (c FramePublishConfig) WithDefaults() FramePublishConfig {
 	cpy := c
 	if cpy.Mode == "" {
@@ -109,8 +116,15 @@ type EngineConfig struct {
 }
 
 // WithDefaults returns a copy of the EngineConfig with any missing fields set to
+// their default values.
 func (c EngineConfig) WithDefaults() EngineConfig {
 	cpy := c
+	if cpy.SyncTimeout == 0 {
+		cpy.SyncTimeout = defaultSyncTimeout
+	}
+	if cpy.SyncCandidates == 0 {
+		cpy.SyncCandidates = defaultSyncCandidates
+	}
 	cpy.FramePublish = cpy.FramePublish.WithDefaults()
 	return cpy
 }
