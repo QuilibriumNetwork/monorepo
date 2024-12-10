@@ -35,7 +35,7 @@ func (e *DataClockConsensusEngine) GetDataFrame(
 	if !ok {
 		return nil, status.Error(codes.Internal, "remote peer ID not found")
 	}
-	if e.config.P2P.GrpcServerRateLimit != -1 {
+	if e.config.P2P.GRPCServerRateLimit != -1 {
 		if err := e.grpcRateLimiter.Allow(peerID); err != nil {
 			return nil, err
 		}

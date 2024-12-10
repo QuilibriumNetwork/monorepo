@@ -275,7 +275,7 @@ func NewDataClockConsensusEngine(
 		config:                          cfg,
 		preMidnightMint:                 map[string]struct{}{},
 		grpcRateLimiter: NewRateLimiter(
-			cfg.P2P.GrpcServerRateLimit,
+			cfg.P2P.GRPCServerRateLimit,
 			time.Minute,
 		),
 		requestSyncCh:            make(chan struct{}, 1),

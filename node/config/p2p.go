@@ -10,7 +10,7 @@ import (
 const (
 	defaultLowWatermarkConnections  = 160
 	defaultHighWatermarkConnections = 192
-	defaultGrpcServerRateLimit      = 10
+	defaultGRPCServerRateLimit      = 10
 	defaultMinBootstrapPeers        = 3
 	defaultBootstrapParallelism     = 10
 	defaultDiscoveryParallelism     = 50
@@ -59,7 +59,7 @@ type P2PConfig struct {
 	LowWatermarkConnections   int           `yaml:"lowWatermarkConnections"`
 	HighWatermarkConnections  int           `yaml:"highWatermarkConnections"`
 	DirectPeers               []string      `yaml:"directPeers"`
-	GrpcServerRateLimit       int           `yaml:"grpcServerRateLimit"`
+	GRPCServerRateLimit       int           `yaml:"grpcServerRateLimit"`
 	MinBootstrapPeers         int           `yaml:"minBootstrapPeers"`
 	BootstrapParallelism      int           `yaml:"bootstrapParallelism"`
 	DiscoveryParallelism      int           `yaml:"discoveryParallelism"`
@@ -176,8 +176,8 @@ func (c P2PConfig) WithDefaults() P2PConfig {
 	if cpy.HighWatermarkConnections == 0 {
 		cpy.HighWatermarkConnections = defaultHighWatermarkConnections
 	}
-	if cpy.GrpcServerRateLimit == 0 {
-		cpy.GrpcServerRateLimit = defaultGrpcServerRateLimit
+	if cpy.GRPCServerRateLimit == 0 {
+		cpy.GRPCServerRateLimit = defaultGRPCServerRateLimit
 	}
 	if cpy.MinBootstrapPeers == 0 {
 		cpy.MinBootstrapPeers = defaultMinBootstrapPeers
