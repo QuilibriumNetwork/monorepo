@@ -220,19 +220,9 @@ func NewDataClockConsensusEngine(
 		panic(errors.New("peer info manager is nil"))
 	}
 
-	minimumPeersRequired := cfg.Engine.MinimumPeersRequired
-	if minimumPeersRequired == 0 {
-		minimumPeersRequired = 3
-	}
-
 	difficulty := cfg.Engine.Difficulty
 	if difficulty == 0 {
 		difficulty = 160000
-	}
-
-	rateLimit := cfg.P2P.GrpcServerRateLimit
-	if rateLimit == 0 {
-		rateLimit = 10
 	}
 
 	clockFrameFragmentBuffer, err := fragmentation.NewClockFrameFragmentCircularBuffer(
@@ -272,7 +262,7 @@ func NewDataClockConsensusEngine(
 		syncingStatus:                   SyncStatusNotSyncing,
 		peerMap:                         map[string]*peerInfo{},
 		uncooperativePeersMap:           map[string]*peerInfo{},
-		minimumPeersRequired:            minimumPeersRequired,
+		minimumPeersRequired:            cfg.Engine.MinimumPeersRequired,
 		report:                          report,
 		frameProver:                     frameProver,
 		masterTimeReel:                  masterTimeReel,
@@ -285,7 +275,7 @@ func NewDataClockConsensusEngine(
 		config:                          cfg,
 		preMidnightMint:                 map[string]struct{}{},
 		grpcRateLimiter: NewRateLimiter(
-			rateLimit,
+			cfg.P2P.GrpcServerRateLimit,
 			time.Minute,
 		),
 		requestSyncCh:            make(chan struct{}, 1),
@@ -889,14 +879,6 @@ func (
 		zap.Uint32("client", index),
 	)
 
-	if e.config.Engine.DataWorkerBaseListenMultiaddr == "" {
-		e.config.Engine.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
-	}
-
-	if e.config.Engine.DataWorkerBaseListenPort == 0 {
-		e.config.Engine.DataWorkerBaseListenPort = 40000
-	}
-
 	ma, err := multiaddr.NewMultiaddr(
 		fmt.Sprintf(
 			e.config.Engine.DataWorkerBaseListenMultiaddr,
@@ -1000,14 +982,6 @@ func (e *DataClockConsensusEngine) createParallelDataClientsFromBaseMultiaddr(
 		"connecting to data worker processes",
 		zap.Int("parallelism", parallelism),
 	)
-
-	if e.config.Engine.DataWorkerBaseListenMultiaddr == "" {
-		e.config.Engine.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
-	}
-
-	if e.config.Engine.DataWorkerBaseListenPort == 0 {
-		e.config.Engine.DataWorkerBaseListenPort = 40000
-	}
 
 	clients := make([]protobufs.DataIPCServiceClient, parallelism)
 

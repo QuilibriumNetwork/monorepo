@@ -400,15 +400,6 @@ func main() {
 		return
 	}
 
-	if nodeConfig.Engine.DataWorkerBaseListenMultiaddr == "" {
-		nodeConfig.Engine.DataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
-	}
-	if nodeConfig.Engine.DataWorkerBaseListenPort == 0 {
-		nodeConfig.Engine.DataWorkerBaseListenPort = 40000
-	}
-	if nodeConfig.Engine.DataWorkerMemoryLimit == 0 {
-		nodeConfig.Engine.DataWorkerMemoryLimit = 1792 * 1024 * 1024 // 1.75GiB
-	}
 	if len(nodeConfig.Engine.DataWorkerMultiaddrs) == 0 {
 		maxProcs, numCPU := runtime.GOMAXPROCS(0), runtime.NumCPU()
 		if maxProcs > numCPU && !nodeConfig.Engine.AllowExcessiveGOMAXPROCS {

@@ -10,6 +10,7 @@ import (
 const (
 	defaultLowWatermarkConnections  = 160
 	defaultHighWatermarkConnections = 192
+	defaultGrpcServerRateLimit      = 10
 	defaultMinBootstrapPeers        = 3
 	defaultBootstrapParallelism     = 10
 	defaultDiscoveryParallelism     = 50
@@ -174,6 +175,9 @@ func (c P2PConfig) WithDefaults() P2PConfig {
 	}
 	if cpy.HighWatermarkConnections == 0 {
 		cpy.HighWatermarkConnections = defaultHighWatermarkConnections
+	}
+	if cpy.GrpcServerRateLimit == 0 {
+		cpy.GrpcServerRateLimit = defaultGrpcServerRateLimit
 	}
 	if cpy.MinBootstrapPeers == 0 {
 		cpy.MinBootstrapPeers = defaultMinBootstrapPeers

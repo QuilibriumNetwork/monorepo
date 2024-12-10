@@ -3,8 +3,12 @@ package config
 import "time"
 
 const (
-	defaultSyncTimeout    = 4 * time.Second
-	defaultSyncCandidates = 8
+	defaultMinimumPeersRequired          = 3
+	defaultDataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
+	defaultDataWorkerBaseListenPort      = 40000
+	defaultDataWorkerMemoryLimit         = 1792 * 1024 * 1024 // 1.75 GiB
+	defaultSyncTimeout                   = 4 * time.Second
+	defaultSyncCandidates                = 8
 )
 
 type FramePublishFragmentationReedSolomonConfig struct {
@@ -119,6 +123,18 @@ type EngineConfig struct {
 // their default values.
 func (c EngineConfig) WithDefaults() EngineConfig {
 	cpy := c
+	if cpy.MinimumPeersRequired == 0 {
+		cpy.MinimumPeersRequired = defaultMinimumPeersRequired
+	}
+	if cpy.DataWorkerBaseListenMultiaddr == "" {
+		cpy.DataWorkerBaseListenMultiaddr = defaultDataWorkerBaseListenMultiaddr
+	}
+	if cpy.DataWorkerBaseListenPort == 0 {
+		cpy.DataWorkerBaseListenPort = defaultDataWorkerBaseListenPort
+	}
+	if cpy.DataWorkerMemoryLimit == 0 {
+		cpy.DataWorkerMemoryLimit = defaultDataWorkerMemoryLimit
+	}
 	if cpy.SyncTimeout == 0 {
 		cpy.SyncTimeout = defaultSyncTimeout
 	}
