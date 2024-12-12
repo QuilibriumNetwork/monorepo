@@ -233,7 +233,7 @@ func TestDataTimeReel(t *testing.T) {
 			i+1,
 			10,
 		)
-		d.Insert(ctx, frame, false)
+		d.Insert(ctx, frame)
 		prevBI, _ := frame.GetSelector()
 		prev = prevBI.FillBytes(make([]byte, 32))
 	}
@@ -264,7 +264,7 @@ func TestDataTimeReel(t *testing.T) {
 	}
 
 	for i := 99; i >= 0; i-- {
-		err := d.Insert(ctx, insertFrames[i], false)
+		_, err := d.Insert(ctx, insertFrames[i])
 		assert.NoError(t, err)
 	}
 
@@ -286,7 +286,7 @@ func TestDataTimeReel(t *testing.T) {
 			i+1,
 			10,
 		)
-		d.Insert(ctx, frame, false)
+		d.Insert(ctx, frame)
 
 		prevBI, _ := frame.GetSelector()
 		prev = prevBI.FillBytes(make([]byte, 32))
@@ -334,7 +334,7 @@ func TestDataTimeReel(t *testing.T) {
 	}
 
 	for i := 99; i >= 0; i-- {
-		err := d.Insert(ctx, insertFrames[i], false)
+		_, err := d.Insert(ctx, insertFrames[i])
 		assert.NoError(t, err)
 	}
 
@@ -397,7 +397,7 @@ func TestDataTimeReel(t *testing.T) {
 
 	// Someone is honest, but running backwards:
 	for i := 99; i >= 0; i-- {
-		err := d.Insert(ctx, insertFrames[i], false)
+		_, err := d.Insert(ctx, insertFrames[i])
 		gotime.Sleep(1 * gotime.Second)
 		assert.NoError(t, err)
 	}

@@ -275,7 +275,9 @@ func (e *DataClockConsensusEngine) processFrame(
 			return dataFrame
 		}
 
-		e.dataTimeReel.Insert(e.ctx, nextFrame, true)
+		if _, err := e.dataTimeReel.Insert(e.ctx, nextFrame); err != nil {
+			e.logger.Debug("could not insert frame", zap.Error(err))
+		}
 
 		return nextFrame
 	} else {

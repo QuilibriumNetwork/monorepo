@@ -61,7 +61,7 @@ func TestMasterTimeReel(t *testing.T) {
 		)
 		assert.NoError(t, err)
 
-		err := m.Insert(ctx, frame, false)
+		_, err := m.Insert(ctx, frame)
 		assert.NoError(t, err)
 	}
 
@@ -81,7 +81,7 @@ func TestMasterTimeReel(t *testing.T) {
 	}
 
 	for i := 99; i >= 0; i-- {
-		err := m.Insert(ctx, insertFrames[i], false)
+		_, err := m.Insert(ctx, insertFrames[i])
 		assert.NoError(t, err)
 	}
 

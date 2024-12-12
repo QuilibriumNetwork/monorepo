@@ -29,6 +29,7 @@ type pendingFrame struct {
 	selector       *big.Int
 	parentSelector *big.Int
 	frameNumber    uint64
+	done           chan struct{}
 }
 
 type DataTimeReel struct {
@@ -190,12 +191,18 @@ func (d *DataTimeReel) Head() (*protobufs.ClockFrame, error) {
 	return d.head, nil
 }
 
+var alreadyDone chan struct{} = func() chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}()
+
 // Insert enqueues a structurally valid frame into the time reel. If the frame
 // is the next one in sequence, it advances the reel head forward and emits a
 // new frame on the new frame channel.
-func (d *DataTimeReel) Insert(ctx context.Context, frame *protobufs.ClockFrame, isSync bool) error {
+func (d *DataTimeReel) Insert(ctx context.Context, frame *protobufs.ClockFrame) (<-chan struct{}, error) {
 	if err := d.ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
 	d.logger.Debug(
@@ -222,21 +229,24 @@ func (d *DataTimeReel) Insert(ctx context.Context, frame *protobufs.ClockFrame, 
 		d.storePending(selector, parent, distance, frame)
 
 		if d.head.FrameNumber+1 == frame.FrameNumber {
+			done := make(chan struct{})
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return nil, ctx.Err()
 			case <-d.ctx.Done():
-				return d.ctx.Err()
+				return nil, d.ctx.Err()
 			case d.frames <- &pendingFrame{
 				selector:       selector,
 				parentSelector: parent,
 				frameNumber:    frame.FrameNumber,
+				done:           done,
 			}:
+				return done, nil
 			}
 		}
 	}
 
-	return nil
+	return alreadyDone, nil
 }
 
 func (
@@ -393,6 +403,7 @@ func (d *DataTimeReel) runLoop() {
 
 				// Otherwise set it as the next and process all pending
 				if err = d.setHead(rawFrame, distance); err != nil {
+					close(frame.done)
 					continue
 				}
 				d.processPending(d.head, frame)
@@ -559,6 +570,7 @@ func (d *DataTimeReel) processPending(
 	frame *protobufs.ClockFrame,
 	lastReceived *pendingFrame,
 ) {
+	defer close(lastReceived.done)
 	// d.logger.Debug(
 	// 	"process pending",
 	// 	zap.Uint64("head_frame", frame.FrameNumber),

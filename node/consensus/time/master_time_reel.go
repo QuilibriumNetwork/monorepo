@@ -123,13 +123,12 @@ func (m *MasterTimeReel) Head() (*protobufs.ClockFrame, error) {
 func (m *MasterTimeReel) Insert(
 	ctx context.Context,
 	frame *protobufs.ClockFrame,
-	isSync bool,
-) error {
+) (<-chan struct{}, error) {
 	go func() {
 		m.frames <- frame
 	}()
 
-	return nil
+	return alreadyDone, nil
 }
 
 // NewFrameCh implements TimeReel.

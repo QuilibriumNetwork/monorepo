@@ -27,15 +27,13 @@ func (e *DataClockConsensusEngine) syncWithMesh() error {
 	if err != nil {
 		return errors.Wrap(err, "sync")
 	}
+	var doneChs []<-chan struct{}
 	for {
 		candidates := e.GetAheadPeers(max(latest.FrameNumber, e.latestFrameReceived))
 		if len(candidates) == 0 {
 			break
 		}
 		for _, candidate := range candidates {
-			if candidate.MaxFrame <= max(latest.FrameNumber, e.latestFrameReceived) {
-				continue
-			}
 			head, err := e.dataTimeReel.Head()
 			if err != nil {
 				return errors.Wrap(err, "sync")
@@ -43,10 +41,21 @@ func (e *DataClockConsensusEngine) syncWithMesh() error {
 			if latest.FrameNumber < head.FrameNumber {
 				latest = head
 			}
-			latest, err = e.syncWithPeer(latest, candidate.MaxFrame, candidate.PeerID)
+			if candidate.MaxFrame <= max(latest.FrameNumber, e.latestFrameReceived) {
+				continue
+			}
+			latest, doneChs, err = e.syncWithPeer(latest, doneChs, candidate.MaxFrame, candidate.PeerID)
 			if err != nil {
 				e.logger.Debug("error syncing frame", zap.Error(err))
 			}
+		}
+	}
+
+	for _, doneCh := range doneChs {
+		select {
+		case <-e.ctx.Done():
+			return e.ctx.Err()
+		case <-doneCh:
 		}
 	}
 
@@ -312,13 +321,13 @@ func (e *DataClockConsensusEngine) GetAheadPeers(frameNumber uint64) []internal.
 }
 
 func (e *DataClockConsensusEngine) syncWithPeer(
-	currentLatest *protobufs.ClockFrame,
+	latest *protobufs.ClockFrame,
+	doneChs []<-chan struct{},
 	maxFrame uint64,
 	peerId []byte,
-) (*protobufs.ClockFrame, error) {
+) (*protobufs.ClockFrame, []<-chan struct{}, error) {
 	e.syncingStatus = SyncStatusSynchronizing
 	defer func() { e.syncingStatus = SyncStatusNotSyncing }()
-	latest := currentLatest
 	e.logger.Info(
 		"polling peer for new frames",
 		zap.String("peer_id", peer.ID(peerId).String()),
@@ -350,7 +359,7 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 			zap.Error(err),
 		)
 		cooperative = false
-		return latest, errors.Wrap(err, "sync")
+		return latest, doneChs, errors.Wrap(err, "sync")
 	}
 	defer func() {
 		if err := cc.Close(); err != nil {
@@ -378,12 +387,12 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 				zap.Error(err),
 			)
 			cooperative = false
-			return latest, errors.Wrap(err, "sync")
+			return latest, doneChs, errors.Wrap(err, "sync")
 		}
 
 		if response == nil {
 			e.logger.Debug("received no response from peer")
-			return latest, nil
+			return latest, doneChs, nil
 		}
 
 		if response.ClockFrame == nil ||
@@ -391,7 +400,7 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 			response.ClockFrame.Timestamp < latest.Timestamp {
 			e.logger.Debug("received invalid response from peer")
 			cooperative = false
-			return latest, nil
+			return latest, doneChs, nil
 		}
 		e.logger.Info(
 			"received new leading frame",
@@ -406,12 +415,16 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 		if err := e.frameProver.VerifyDataClockFrame(
 			response.ClockFrame,
 		); err != nil {
-			return nil, errors.Wrap(err, "sync")
+			return latest, doneChs, errors.Wrap(err, "sync")
 		}
-		e.dataTimeReel.Insert(e.ctx, response.ClockFrame, true)
+		doneCh, err := e.dataTimeReel.Insert(e.ctx, response.ClockFrame)
+		if err != nil {
+			return latest, doneChs, errors.Wrap(err, "sync")
+		}
+		doneChs = append(doneChs, doneCh)
 		latest = response.ClockFrame
 		if latest.FrameNumber >= maxFrame {
-			return latest, nil
+			return latest, doneChs, nil
 		}
 	}
 }

@@ -208,7 +208,7 @@ func (e *MasterClockConsensusEngine) Start() <-chan error {
 					continue
 				}
 
-				e.masterTimeReel.Insert(context.TODO(), newFrame, false)
+				e.masterTimeReel.Insert(context.TODO(), newFrame)
 			}
 		}
 	}()

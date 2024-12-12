@@ -155,7 +155,7 @@ func (e *MasterClockConsensusEngine) publishProof(
 			zap.Uint64("frame_number", frame.FrameNumber),
 		)
 
-		e.masterTimeReel.Insert(context.TODO(), frame, false)
+		e.masterTimeReel.Insert(context.TODO(), frame)
 	}
 
 	e.state = consensus.EngineStateCollecting
