@@ -2,7 +2,6 @@ package data
 
 import (
 	"bytes"
-	"sync"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -233,6 +232,7 @@ func (e *DataClockConsensusEngine) processFrame(
 	latestFrame *protobufs.ClockFrame,
 	dataFrame *protobufs.ClockFrame,
 ) *protobufs.ClockFrame {
+	
 	e.logger.Info(
 		"current frame head",
 		zap.Uint64("frame_number", dataFrame.FrameNumber),
@@ -310,49 +310,7 @@ func (e *DataClockConsensusEngine) processFrame(
 
 				e.clientReconnectTest++
 				if e.clientReconnectTest >= 10 {
-					wg := sync.WaitGroup{}
-					wg.Add(len(e.clients))
-					for i, client := range e.clients {
-						i := i
-						client := client
-						go func() {
-							for j := 3; j >= 0; j-- {
-								var err error
-								if client == nil {
-									if len(e.config.Engine.DataWorkerMultiaddrs) != 0 {
-										e.logger.Error(
-											"client failed, reconnecting after 50ms",
-											zap.Uint32("client", uint32(i)),
-										)
-										time.Sleep(50 * time.Millisecond)
-										client, err = e.createParallelDataClientsFromListAndIndex(uint32(i))
-										if err != nil {
-											e.logger.Error("failed to reconnect", zap.Error(err))
-										}
-									} else if len(e.config.Engine.DataWorkerMultiaddrs) == 0 {
-										e.logger.Error(
-											"client failed, reconnecting after 50ms",
-											zap.Uint32("client", uint32(i)),
-										)
-										time.Sleep(50 * time.Millisecond)
-										client, err =
-											e.createParallelDataClientsFromBaseMultiaddrAndIndex(uint32(i))
-										if err != nil {
-											e.logger.Error(
-												"failed to reconnect",
-												zap.Uint32("client", uint32(i)),
-												zap.Error(err),
-											)
-										}
-									}
-									e.clients[i] = client
-									continue
-								}
-							}
-							wg.Done()
-						}()
-					}
-					wg.Wait()
+					e.tryReconnectDataWorkerClients()
 					e.clientReconnectTest = 0
 				}
 
