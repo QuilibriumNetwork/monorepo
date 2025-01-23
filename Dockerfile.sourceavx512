@@ -59,7 +59,7 @@ COPY docker/rustup-init.sh /opt/rustup-init.sh
 RUN /opt/rustup-init.sh -y --profile minimal
 
 # Install uniffi-bindgen-go
-RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.1+v0.25.0
+RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.2+v0.25.0
 
 FROM build-base as build
 
