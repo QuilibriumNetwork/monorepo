@@ -23,11 +23,11 @@ use super::super::gmp::mpz::{mp_bitcnt_t, mp_limb_t};
 use libc::{c_int, c_long, c_ulong, c_void, size_t};
 // pub use c_ulong;
 use std::{mem, usize};
-// We use the unsafe versions to avoid unecessary allocations.
+// We use the unsafe versions to avoid unnecessary allocations.
 extern "C" {
     fn adapted_nudupl(a: *mut Mpz, b: *mut Mpz, c: *mut Mpz, times: c_ulong);
 }
-// We use the unsafe versions to avoid unecessary allocations.
+// We use the unsafe versions to avoid unnecessary allocations.
 #[link(name = "gmp")]
 extern "C" {
     fn __gmpz_gcdext(gcd: *mut Mpz, s: *mut Mpz, t: *mut Mpz, a: *const Mpz, b: *const Mpz);
