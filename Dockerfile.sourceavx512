@@ -1,4 +1,4 @@
-FROM ubuntu:24.04 as build-base
+FROM ubuntu:24.04 AS build-base
 
 ENV PATH="${PATH}:/root/.cargo/bin/"
 
@@ -61,7 +61,7 @@ RUN /opt/rustup-init.sh -y --profile minimal
 # Install uniffi-bindgen-go
 RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.1+v0.25.0
 
-FROM build-base as build
+FROM build-base AS build
 
 ENV GOEXPERIMENT=arenas
 ENV QUILIBRIUM_SIGNATURE_CHECK=false
@@ -90,7 +90,7 @@ WORKDIR /opt/ceremonyclient/client
 RUN ./build.sh -o qclient && cp qclient /usr/bin
 
 # Allows exporting single binary
-FROM scratch as qclient
+FROM scratch AS qclient
 COPY --from=build /usr/bin/qclient /qclient
 ENTRYPOINT [ "/qclient" ]
 
