@@ -464,7 +464,8 @@ func NewTokenExecutionEngine(
 		}
 
 		if len(rebuildSet) != 0 {
-			e.rebuildMissingSetForHypergraph(rebuildSet)
+			fmt.Printf("missing entries, but skipping rebuild, len: %d\n", len(rebuildSet))
+			// e.rebuildMissingSetForHypergraph(rebuildSet)
 		}
 	}
 
