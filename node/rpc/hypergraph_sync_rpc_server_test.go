@@ -67,6 +67,7 @@ func TestLoadHypergraphFallback(t *testing.T) {
 	}
 	for k, a := range clientLoad.GetVertexAdds() {
 		assert.Equal(t, len(crypto.ConvertAllPreloadedLeaves(string(application.VertexAtomType), string(application.AddsPhaseType), k, clientHypergraphStore, a.GetTree().Root, []int{})), 100000)
+		fmt.Printf("%x\n", a.GetTree().Commit(true))
 	}
 
 	fmt.Println("Should not reattempt")
@@ -75,6 +76,7 @@ func TestLoadHypergraphFallback(t *testing.T) {
 	assert.NoError(t, err)
 	clientLoad, err = clientHypergraphStore.LoadHypergraph()
 	assert.NoError(t, err)
+	t.FailNow()
 }
 
 func TestHypergraphSyncServer(t *testing.T) {

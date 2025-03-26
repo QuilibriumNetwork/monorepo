@@ -103,7 +103,11 @@ func (n *LazyVectorCommitmentBranchNode) Commit(
 	if n.Commitment == nil || recalculate {
 		vector := make([][]byte, len(n.Children))
 		wg := sync.WaitGroup{}
-		throttle := make(chan struct{}, runtime.WorkerCount(0, false))
+		workers := 1
+		if n.LongestBranch == 2 {
+			workers = runtime.WorkerCount(0, false)
+		}
+		throttle := make(chan struct{}, workers)
 		for i, child := range n.Children {
 			throttle <- struct{}{}
 			wg.Add(1)
