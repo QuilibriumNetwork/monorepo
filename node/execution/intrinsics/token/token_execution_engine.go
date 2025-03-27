@@ -466,12 +466,9 @@ func NewTokenExecutionEngine(
 		if len(rebuildSet) != 0 {
 			fmt.Printf("missing entries, but skipping rebuild, len: %d\n", len(rebuildSet))
 			// e.rebuildMissingSetForHypergraph(rebuildSet)
+		} else {
+			fmt.Println("no missing entries")
 		}
-	}
-
-	for k, v := range e.hypergraph.GetVertexAdds() {
-		fmt.Printf("printing debug data for shard key: %x %x\n", k.L1[:], k.L2[:])
-		qcrypto.DebugNode(v.GetTree().SetType, v.GetTree().PhaseType, k, v.GetTree().Root, 0, "")
 	}
 
 	commit := e.hypergraph.Commit()

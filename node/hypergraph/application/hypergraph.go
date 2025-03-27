@@ -420,8 +420,13 @@ func (set *IdSet) GetSize() *big.Int {
 }
 
 func (set *IdSet) Has(key [64]byte) bool {
-	_, ok := set.atoms[key]
-	return ok
+	_, err := set.tree.Store.GetNodeByKey(
+		set.tree.SetType,
+		set.tree.PhaseType,
+		set.tree.ShardKey,
+		key[:],
+	)
+	return err == nil
 }
 
 func (set *IdSet) GetTree() *crypto.LazyVectorCommitmentTree {
