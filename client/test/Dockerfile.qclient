@@ -1,0 +1,87 @@
+FROM ubuntu:24.04 AS build-base
+
+ENV PATH="${PATH}:/root/.cargo/bin/"
+
+# Install GMP 6.2 (6.3 which MacOS is using only available on Debian unstable)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    cmake \
+    libgmp-dev \
+    libmpfr-dev \
+    libmpfr6 \
+    wget \
+    m4 \
+    pkg-config \
+    gcc \
+    g++ \
+    make \
+    autoconf \
+    automake \
+    libtool \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Go 1.22.5 for amd64
+RUN wget https://go.dev/dl/go1.22.5.linux-amd64.tar.gz && \
+    rm -rf /usr/local/go && \
+    tar -C /usr/local -xzf go1.22.5.linux-amd64.tar.gz && \
+    rm go1.22.5.linux-amd64.tar.gz
+
+ENV PATH=$PATH:/usr/local/go/bin
+
+# Install FLINT library
+RUN git clone https://github.com/flintlib/flint.git && \
+    cd flint && \
+    git checkout flint-3.0 && \
+    ./bootstrap.sh && \
+    ./configure \
+        --prefix=/usr/local \
+        --with-gmp=/usr/local \
+        --with-mpfr=/usr/local \
+        --enable-static \
+        --disable-shared \
+        CFLAGS="-O3" && \
+    make && \
+    make install && \
+    cd .. && \
+    rm -rf flint
+
+# Install Rust toolchain
+COPY docker/rustup-init.sh /opt/rustup-init.sh
+RUN /opt/rustup-init.sh -y --profile minimal
+
+# Install uniffi-bindgen-go
+RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.1+v0.25.0
+
+FROM build-base AS build
+
+ENV GOEXPERIMENT=arenas
+ENV QUILIBRIUM_SIGNATURE_CHECK=false
+
+WORKDIR /opt/ceremonyclient
+
+COPY . .
+
+## Generate Rust bindings for VDF
+WORKDIR /opt/ceremonyclient/vdf
+RUN ./generate.sh
+
+## Generate Rust bindings for BLS48581
+WORKDIR /opt/ceremonyclient/bls48581
+RUN ./generate.sh
+
+## Generate Rust bindings for VerEnc
+WORKDIR /opt/ceremonyclient/verenc
+RUN ./generate.sh
+
+# Build and install qclient
+WORKDIR /opt/ceremonyclient/client
+RUN ./build.sh -o qclient
+
+# Create final stage to copy the binary
+FROM scratch AS export-stage
+COPY --from=build /opt/ceremonyclient/client/qclient ./client/test/
+
+
+

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/hex"
@@ -17,6 +18,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
+	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
@@ -27,10 +30,11 @@ var simulateFail bool
 var LightNode bool = false
 var DryRun bool = false
 var publicRPC bool = false
-
 var rootCmd = &cobra.Command{
 	Use:   "qclient",
-	Short: "Quilibrium RPC Client",
+	Short: "Quilibrium client",
+	Long: `Quilibrium client is a command-line tool for managing Quilibrium nodes.
+It provides commands for installing, updating, and managing Quilibrium nodes.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		if signatureCheck {
 			ex, err := os.Executable()
@@ -50,80 +54,97 @@ var rootCmd = &cobra.Command{
 			checksum := sha3.Sum256(b)
 			digest, err := os.ReadFile(ex + ".dgst")
 			if err != nil {
-				fmt.Println("Digest file not found")
-				os.Exit(1)
-			}
+				fmt.Println("The digest file was not found. Do you want to continue without signature verification? (y/n)")
+				fmt.Println("You can also use --signature-check=false in your command to skip this prompt")
 
-			parts := strings.Split(string(digest), " ")
-			if len(parts) != 2 {
-				fmt.Println("Invalid digest file format")
-				os.Exit(1)
-			}
+				reader := bufio.NewReader(os.Stdin)
+				response, _ := reader.ReadString('\n')
+				response = strings.TrimSpace(strings.ToLower(response))
 
-			digestBytes, err := hex.DecodeString(parts[1][:64])
-			if err != nil {
-				fmt.Println("Invalid digest file format")
-				os.Exit(1)
-			}
-
-			if !bytes.Equal(checksum[:], digestBytes) {
-				fmt.Println("Invalid digest for node")
-				os.Exit(1)
-			}
-
-			count := 0
-
-			for i := 1; i <= len(config.Signatories); i++ {
-				signatureFile := fmt.Sprintf(ex+".dgst.sig.%d", i)
-				sig, err := os.ReadFile(signatureFile)
-				if err != nil {
-					continue
-				}
-
-				pubkey, _ := hex.DecodeString(config.Signatories[i-1])
-				if !ed448.Verify(pubkey, digest, sig, "") {
-					fmt.Printf("Failed signature check for signatory #%d\n", i)
+				if response != "y" && response != "yes" {
+					fmt.Println("Exiting due to missing digest file")
 					os.Exit(1)
 				}
-				count++
-			}
 
-			if count < ((len(config.Signatories)-4)/2)+((len(config.Signatories)-4)%2) {
-				fmt.Printf("Quorum on signatures not met")
-				os.Exit(1)
-			}
+				fmt.Println("Continuing without signature verification")
+				signatureCheck = false
+			} else {
+				parts := strings.Split(string(digest), " ")
+				if len(parts) != 2 {
+					fmt.Println("Invalid digest file format")
+					os.Exit(1)
+				}
 
-			fmt.Println("Signature check passed")
+				digestBytes, err := hex.DecodeString(parts[1][:64])
+				if err != nil {
+					fmt.Println("Invalid digest file format")
+					os.Exit(1)
+				}
+
+				if !bytes.Equal(checksum[:], digestBytes) {
+					fmt.Println("Invalid digest for node")
+					os.Exit(1)
+				}
+
+				count := 0
+
+				for i := 1; i <= len(config.Signatories); i++ {
+					signatureFile := fmt.Sprintf(ex+".dgst.sig.%d", i)
+					sig, err := os.ReadFile(signatureFile)
+					if err != nil {
+						continue
+					}
+
+					pubkey, _ := hex.DecodeString(config.Signatories[i-1])
+					if !ed448.Verify(pubkey, digest, sig, "") {
+						fmt.Printf("Failed signature check for signatory #%d\n", i)
+						os.Exit(1)
+					}
+					count++
+				}
+
+				if count < ((len(config.Signatories)-4)/2)+((len(config.Signatories)-4)%2) {
+					fmt.Printf("Quorum on signatures not met")
+					os.Exit(1)
+				}
+
+				fmt.Println("Signature check passed")
+			}
 		} else {
 			fmt.Println("Signature check bypassed, be sure you know what you're doing")
 		}
 
-		_, err := os.Stat(configDirectory)
-		if os.IsNotExist(err) {
-			fmt.Printf("config directory doesn't exist: %s\n", configDirectory)
-			os.Exit(1)
-		}
+		// Skip config checks for node and link commands
+		if len(os.Args) > 1 && (os.Args[1] != "node" && os.Args[1] != "link") {
+			// These commands handle their own configuration
+			_, err := os.Stat(configDirectory)
+			if os.IsNotExist(err) {
+				fmt.Printf("config directory doesn't exist: %s\n", configDirectory)
+				os.Exit(1)
+			}
 
-		NodeConfig, err = config.LoadConfig(configDirectory, "", false)
-		if err != nil {
-			fmt.Printf("invalid config directory: %s\n", configDirectory)
-			os.Exit(1)
-		}
+			NodeConfig, err = config.LoadConfig(configDirectory, "", false)
+			if err != nil {
+				fmt.Printf("invalid config directory: %s\n", configDirectory)
+				os.Exit(1)
+			}
 
-		if publicRPC {
-			fmt.Println("Public RPC enabled, using light node")
-			LightNode = true
-		}
-		if !LightNode && NodeConfig.ListenGRPCMultiaddr == "" {
-			fmt.Println("No ListenGRPCMultiaddr found in config, using light node")
-			LightNode = true
+			if publicRPC {
+				fmt.Println("Public RPC enabled, using light node")
+				LightNode = true
+			}
+
+			if !LightNode && NodeConfig.ListenGRPCMultiaddr == "" {
+				fmt.Println("No ListenGRPCMultiaddr found in config, using light node")
+				LightNode = true
+			}
 		}
 	},
 }
 
 func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -193,6 +214,46 @@ func init() {
 		&publicRPC,
 		"public-rpc",
 		false,
-		"uses the public RPC",
+		"uses the public RPCd",
 	)
+
+	// Create config directory if it doesn't exist
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		// Skip for help command
+		if cmd.Name() == "help" {
+			return nil
+		}
+
+		// Create config directory if it doesn't exist
+		if err := os.MkdirAll(utils.ClientConfigDir, 0755); err != nil {
+			return fmt.Errorf("failed to create config directory: %v", err)
+		}
+
+		// Check for signature files
+		ex, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("failed to get executable path: %v", err)
+		}
+
+		digestPath := ex + ".dgst"
+		if signatureCheck && !utils.FileExists(digestPath) {
+			fmt.Println("Signature file not found. Would you like to download it? (y/n)")
+			reader := bufio.NewReader(os.Stdin)
+			response, _ := reader.ReadString('\n')
+			response = strings.TrimSpace(strings.ToLower(response))
+
+			if response == "y" || response == "yes" {
+				fmt.Println("Downloading signature file...")
+				// TODO: Implement signature download logic
+				fmt.Println("Signature download not implemented yet. Please download manually.")
+			} else {
+				fmt.Println("Continuing without signature verification")
+				signatureCheck = false
+			}
+		}
+		return nil
+	}
+
+	// Add the node command
+	rootCmd.AddCommand(node.NodeCmd)
 }
