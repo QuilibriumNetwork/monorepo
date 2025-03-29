@@ -1,0 +1,12 @@
+# add any files that you don't want to have impact the COPY . . command
+# in the Dockerfile.source file (if listed here, they will not be copied.
+# if they need to be copied, use the --exclude flag in the Dockerfile.source file 
+# and copy them manually at the end to avoid rebuilding everything)
+# e.g. the Dockerfile.source.dockerignore file itself or the README.md file if not 
+# listed here would trigger a rebuild
+
+.gitignore
+Taskfile.yaml
+*.md
+*.env*
+Dockerfile*

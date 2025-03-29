@@ -1,4 +1,5 @@
-FROM golang:1.22.4-bullseye as build-base
+# syntax=docker.io/docker/dockerfile:1.7-labs
+FROM golang:1.22.4-bullseye AS build-base
 
 ENV PATH="${PATH}:/root/.cargo/bin/"
 
@@ -14,36 +15,55 @@ RUN /opt/rustup-init.sh -y --profile minimal
 # Install uniffi-bindgen-go
 RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.1+v0.25.0
 
-FROM build-base as build
+FROM build-base AS build
 
 ENV GOEXPERIMENT=arenas
 ENV QUILIBRIUM_SIGNATURE_CHECK=false
+ENV GOCACHE=/tmp/.cache/go-build
+
+# Install grpcurl before building the node and client 
+# as to avoid needing to redo it on rebuilds
+RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 
 WORKDIR /opt/ceremonyclient
 
-COPY . .
+# Copy everything except node and client so as to avoid 
+# invalidating the cache at this point on client or node rebuilds
+COPY --exclude=node --exclude=client . .
 
 ## Generate Rust bindings for VDF
 WORKDIR /opt/ceremonyclient/vdf
-RUN ./generate.sh
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/opt/target/ \
+    ./generate.sh
 
 ## Generate Rust bindings for BLS48581
 WORKDIR /opt/ceremonyclient/bls48581
-RUN ./generate.sh
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/opt/target/ \
+    ./generate.sh
 
-# Build and install the node
+COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
-
-RUN ./build.sh && cp node /go/bin
-RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/opt/target/ \
+    --mount=type=cache,target=/tmp/.cache/go-build \
+    ./build.sh && cp node /go/bin
 
 # Build and install qclient
+COPY ./client /opt/ceremonyclient/client
 WORKDIR /opt/ceremonyclient/client
-
-RUN ./build.sh -o qclient && cp qclient /go/bin
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/opt/target/ \
+    --mount=type=cache,target=/tmp/.cache/go-build \
+    ./build.sh -o qclient && cp qclient /go/bin
 
 # Allows exporting single binary
-FROM scratch as qclient
+FROM scratch AS qclient
 COPY --from=build /go/bin/qclient /qclient
 ENTRYPOINT [ "/qclient" ]
 
