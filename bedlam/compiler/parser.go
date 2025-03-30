@@ -168,13 +168,26 @@ func (p *Parser) errf(loc utils.Point, format string, a ...interface{}) error {
 			indicator = append(indicator, r)
 		}
 		indicator = append(indicator, '^')
+		pos := fmt.Sprintf("%s\n%s", string(line), string(indicator))
+		compilerError := &CompileError{
+			Stage:     CompileStageParse,
+			SourcePos: pos,
+			Location:  &loc,
+			Err:       errors.New(msg),
+		}
 		p.logger.Errorf(loc, "%s\n%s\n%s\n",
 			msg, string(line), string(indicator))
 
-		return errors.New(msg)
+		return compilerError
 	}
 	p.logger.Errorf(loc, "%s", msg)
-	return errors.New(msg)
+	compilerError := &CompileError{
+		Stage:     CompileStageParse,
+		SourcePos: fmt.Sprintf("%s:%d:%d", p.lexer.Source(), loc.Line, loc.Col),
+		Location:  &loc,
+		Err:       errors.New(msg),
+	}
+	return compilerError
 }
 
 func (p *Parser) errUnexpected(offending *Token, expected TokenType) error {

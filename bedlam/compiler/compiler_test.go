@@ -7,6 +7,7 @@
 package compiler
 
 import (
+	"fmt"
 	"math"
 	"math/big"
 	"math/rand"
@@ -266,5 +267,84 @@ func main(a, b uint64) uint64 {
 			t.Errorf("failed: %d - %d = %d, expected %d\n",
 				g, e, results[0], expected)
 		}
+	}
+}
+
+type parseErrorTestData struct {
+	code         string
+	errorMessage string
+}
+
+var compileErrorTests = []parseErrorTestData{
+	{
+		code: `packag main`,
+		errorMessage: `Compile error [parse]: unexpected token 'packag': expected 'package', {data}:1:0
+packag main
+^`,
+	},
+	{
+		code:         `package mai`,
+		errorMessage: `found packages mai and main`,
+	},
+	{
+		code: `
+	package main
+	func main1(a, b int4) int4 {
+	    return Sum2(MinMax(a, b))
+	}
+	`,
+		errorMessage: `no main function defined`,
+	},
+	{
+		code: `
+	package main
+	fun main(a, b int4) int4 {
+		return Sum2(MinMax(a, b))
+	}`,
+		errorMessage: `Compile error [parse]: unexpected token 'identifier', {data}:3:1
+	fun main(a, b int4) int4 {
+	^`,
+	},
+	{
+		code: `package main
+		func main(a, b) int4 {
+			return Sum2(MinMax(a, b))
+		}`,
+
+		errorMessage: `Compile error [parse]: unexpected token ')' while parsing type, {data}:2:16
+		func main(a, b) int4 {
+		              ^`,
+	},
+	{
+		code: `package main
+		func main(a, b int4 int4 {
+			return Sum2(MinMax(a, b))
+		}`,
+
+		errorMessage: `Compile error [parse]: unexpected token 'int4': expected ',', {data}:2:22
+		func main(a, b int4 int4 {
+		                    ^`,
+	},
+	{
+		code: `package main
+		func main(a, b int4) int4 {
+			a+b
+		}`,
+
+		errorMessage: `missing return at the end of function`,
+	},
+}
+
+func TestCompileErrorMessage(t *testing.T) {
+	for idx, testData := range compileErrorTests {
+		t.Run(fmt.Sprintf("test parse %d", idx), func(t *testing.T) {
+			_, _, err := New(utils.NewParams()).Compile(testData.code, nil)
+			if err == nil {
+				t.Fatalf("Parse test %d failed: expected error", idx)
+			}
+			if err.Error() != testData.errorMessage {
+				t.Fatalf("Parse test %d failed: expected error message %s, got %s", idx, testData.errorMessage, err.Error())
+			}
+		})
 	}
 }
