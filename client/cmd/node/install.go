@@ -85,11 +85,11 @@ func installNode(version string) {
 
 	if err := installByVersion(version); err != nil {
 		fmt.Fprintf(os.Stderr, "Error installing specific version: %v\n", err)
-		return
+		os.Exit(1)
 	}
 
 	// Finish installation
-	nodeBinaryPath := filepath.Join(installPath, version, "node")
+	nodeBinaryPath := filepath.Join(installPath, string(utils.ReleaseTypeNode), version)
 	finishInstallation(nodeBinaryPath, version)
 }
 

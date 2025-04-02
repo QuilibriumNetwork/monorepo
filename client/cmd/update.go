@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
 var (
@@ -22,6 +23,8 @@ var updateCmd = &cobra.Command{
 	Short: "Update Quilibrium client",
 	Long: `Update Quilibrium client to a specified version or the latest version.
 If no version is specified, the latest version will be installed.
+
+If the current version is already the latest version, the command will exit with a message.
 
 Examples:
   # Update to the latest version
@@ -65,6 +68,25 @@ func determineVersion(args []string) string {
 
 // updateClient handles the client update process
 func updateClient(version string) {
+
+	currentVersion := config.GetVersionString()
+
+	// If version is "latest", get the latest version
+	if version == "latest" {
+		latestVersion, err := utils.GetLatestVersion(utils.ReleaseTypeQClient)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting latest version: %v\n", err)
+			return
+		}
+		version = latestVersion
+		fmt.Fprintf(os.Stdout, "Latest version: %s\n", version)
+	}
+
+	if version == currentVersion {
+		fmt.Fprintf(os.Stdout, "Already on version %s\n", currentVersion)
+		return
+	}
+
 	// Check if we need sudo privileges
 	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Updating client at %s requires root privileges", utils.ClientInstallPath)); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -83,17 +105,6 @@ func updateClient(version string) {
 	if err := os.MkdirAll(versionDataDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating data directory: %v\n", err)
 		return
-	}
-
-	// If version is "latest", get the latest version
-	if version == "latest" {
-		latestVersion, err := utils.GetLatestVersion(utils.ReleaseTypeQClient)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting latest version: %v\n", err)
-			return
-		}
-		version = latestVersion
-		fmt.Fprintf(os.Stdout, "Latest version: %s\n", version)
 	}
 
 	// Construct the expected filename for the specified version
@@ -123,22 +134,9 @@ func updateClient(version string) {
 
 // finishInstallation completes the update process
 func finishInstallation(version string) {
-	// Read current config
-	config, err := utils.ReadClientConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading config: %v\n", err)
-		return
-	}
-
-	// Update config with new version
-	config.Version = version
-	if err := utils.UpdateClientConfig(config); err != nil {
-		fmt.Fprintf(os.Stderr, "Error updating config: %v\n", err)
-		return
-	}
 
 	// Construct executable path
-	execPath := filepath.Join(utils.ClientInstallPath, version, "qclient")
+	execPath := filepath.Join(utils.ClientDataPath, version, "qclient-"+version+"-"+osType+"-"+arch)
 
 	// Make the binary executable
 	if err := os.Chmod(execPath, 0755); err != nil {
@@ -148,9 +146,6 @@ func finishInstallation(version string) {
 
 	// Create symlink to the new version
 	symlinkPath := utils.DefaultQClientSymlinkPath
-	if config.SymlinkPath != "" {
-		symlinkPath = config.SymlinkPath
-	}
 
 	// Check if we need sudo privileges for creating symlink in system directory
 	if strings.HasPrefix(symlinkPath, "/usr/") || strings.HasPrefix(symlinkPath, "/bin/") || strings.HasPrefix(symlinkPath, "/sbin/") {

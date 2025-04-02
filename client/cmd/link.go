@@ -45,18 +45,6 @@ Example: qclient link --path /usr/local/bin`),
 			return err
 		}
 
-		// Save the symlink path to ClientConfig
-		config := utils.ClientConfig{
-			SymlinkPath: targetPath,
-		}
-
-		// Use the UpdateClientConfig function to save the config
-		if err := utils.UpdateClientConfig(&config); err != nil {
-			fmt.Printf("Warning: Failed to save symlink path to config: %v\n", err)
-		} else {
-			fmt.Printf("Saved symlink path %s to client configuration\n", targetPath)
-		}
-
 		fmt.Printf("Symlink created at %s\n", targetPath)
 		return nil
 	},
@@ -71,7 +59,7 @@ func determineSymlinkLocation() (string, string, error) {
 	}
 
 	// Otherwise, find a suitable directory in PATH
-	return utils.NodeDefaultSymlinkDir, utils.DefaultQClientSymlinkPath, nil
+	return utils.DefaultSymlinkDir, utils.DefaultQClientSymlinkPath, nil
 }
 
 // isDirectoryInPath checks if a directory is in the PATH environment variable

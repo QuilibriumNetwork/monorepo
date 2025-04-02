@@ -142,3 +142,8 @@ tasks:
     cmds:
       - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}
       - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:latest
+
+  test:qclient:
+    desc: Test the Quilibrium docker image.
+    cmds:
+      - client/test/run_tests.sh -d 'ubuntu' -v '24.04'

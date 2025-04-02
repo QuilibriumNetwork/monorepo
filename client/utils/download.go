@@ -53,7 +53,11 @@ func GetLatestVersion(releaseType ReleaseType) (string, error) {
 // DownloadReleaseFile downloads a release file from the Quilibrium releases server
 func DownloadReleaseFile(releaseType ReleaseType, fileName string, version string, showError bool) error {
 	url := fmt.Sprintf("%s/%s", BaseReleaseURL, fileName)
-	destPath := filepath.Join(DataPath, string(releaseType), version, fileName)
+	destDir := filepath.Join(DataPath, string(releaseType), version)
+	os.MkdirAll(destDir, 0755)
+	destPath := filepath.Join(destDir, fileName)
+
+	fmt.Printf("Downloading %s to %s\n", url, destPath)
 
 	resp, err := http.Get(url)
 	if err != nil {
@@ -87,6 +91,7 @@ func DownloadReleaseFile(releaseType ReleaseType, fileName string, version strin
 func DownloadReleaseSignatures(releaseType ReleaseType, version string) error {
 	var files []string
 	baseName := fmt.Sprintf("%s-%s-%s-%s", releaseType, version, osType, arch)
+	fmt.Printf("Downloading signatures for %s\n", baseName)
 
 	// Add digest file URL
 	files = append(files, baseName+".dgst")
@@ -94,7 +99,26 @@ func DownloadReleaseSignatures(releaseType ReleaseType, version string) error {
 	// Add signature file URLs
 	signerNums := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
 	for _, num := range signerNums {
+		// Check if the remote signature file exists
+		sigFile := fmt.Sprintf("%s.dgst.sig.%d", baseName, num)
+		remoteURL := fmt.Sprintf("%s/%s", BaseReleaseURL, sigFile)
+
+		// Make a HEAD request to check if the file exists
+		resp, err := http.Head(remoteURL)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			// Skip this file if it doesn't exist on the server
+			fmt.Printf("Signature file %s not found on server, skipping\n", sigFile)
+			continue
+		}
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		files = append(files, fmt.Sprintf("%s.dgst.sig.%d", baseName, num))
+	}
+
+	if len(files) == 0 {
+		fmt.Printf("No signature files found for %s\n", baseName)
+		return nil
 	}
 
 	for _, file := range files {

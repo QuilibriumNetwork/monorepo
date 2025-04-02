@@ -2,8 +2,8 @@
 ARG DISTRO=ubuntu
 ARG VERSION=24.04
 
-# Use the specified distribution as the base image
-FROM --platform=$BUILDPLATFORM ${DISTRO}:${VERSION}
+# Base stage with common setup
+FROM --platform=$BUILDPLATFORM ${DISTRO}:${VERSION} AS base
 
 ARG TARGETARCH
 ARG TARGETOS
@@ -22,18 +22,9 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -s /bin/bash testuser && \
     echo "testuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-# Set working directory
+# Final test stage
+FROM base AS qclient-test
 WORKDIR /app
 
-# Copy the client binary and test script
-COPY build/qclient/${TARGETARCH}_${TARGETOS}/qclient /opt/quilibrium/bin/qclient
-COPY test_install.sh /app/
 
-# Set permissions
-RUN chmod +x /opt/quilibrium/bin/qclient /app/test_install.sh
-
-# Switch to test user
-USER testuser
-
-# Run the test script
 CMD ["/app/test_install.sh"] 

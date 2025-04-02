@@ -8,11 +8,12 @@ import (
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
 // Version information - fallback if executable name doesn't contain version
-const (
-	DefaultVersion = "1.0.0"
+var (
+	DefaultVersion = config.GetVersionString()
 )
 
 // VersionInfo holds version and hash information

@@ -17,14 +17,14 @@ import (
 // DefaultNodeUser is the default user name for node operations
 var DefaultNodeUser = "quilibrium"
 var ClientConfigDir = filepath.Join("/etc/quilibrium/", "config")
-var ClientConfigPath = filepath.Join(ClientConfigDir, "client.yaml")
-var ClientInstallPath = filepath.Join("/opt/quilibrium/", "client")
+var ClientConfigPath = filepath.Join(ClientConfigDir, string(ReleaseTypeQClient)+".yaml")
+var ClientInstallPath = filepath.Join("/opt/quilibrium/", string(ReleaseTypeQClient))
 var DataPath = filepath.Join("/var/quilibrium/", "data")
-var ClientDataPath = filepath.Join(DataPath, "client")
-var NodeDataPath = filepath.Join(DataPath, "node")
-var NodeDefaultSymlinkDir = "/usr/local/bin"
-var DefaultNodeSymlinkPath = filepath.Join(NodeDefaultSymlinkDir, "quilibrium-node")
-var DefaultQClientSymlinkPath = filepath.Join(NodeDefaultSymlinkDir, "qclient")
+var ClientDataPath = filepath.Join(DataPath, string(ReleaseTypeQClient))
+var NodeDataPath = filepath.Join(DataPath, string(ReleaseTypeNode))
+var DefaultSymlinkDir = "/usr/local/bin"
+var DefaultNodeSymlinkPath = filepath.Join(DefaultSymlinkDir, string(ReleaseTypeNode))
+var DefaultQClientSymlinkPath = filepath.Join(DefaultSymlinkDir, string(ReleaseTypeQClient))
 var osType = runtime.GOOS
 var arch = runtime.GOARCH
 

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -30,6 +31,8 @@ var simulateFail bool
 var LightNode bool = false
 var DryRun bool = false
 var publicRPC bool = false
+
+var standardizedQClientFileName string = "qclient-" + config.GetVersionString() + "-" + osType + "-" + arch
 var rootCmd = &cobra.Command{
 	Use:   "qclient",
 	Short: "Quilibrium client",
@@ -52,23 +55,37 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 			}
 
 			checksum := sha3.Sum256(b)
-			digest, err := os.ReadFile(ex + ".dgst")
+
+			// First check var data path for signatures
+			varDataPath := filepath.Join(utils.ClientDataPath, config.GetVersionString())
+			digestPath := filepath.Join(varDataPath, standardizedQClientFileName+".dgst")
+
+			fmt.Printf("Checking signature for %s\n", digestPath)
+
+			// Try to read digest from var data path first
+			digest, err := os.ReadFile(digestPath)
 			if err != nil {
-				fmt.Println("The digest file was not found. Do you want to continue without signature verification? (y/n)")
-				fmt.Println("You can also use --signature-check=false in your command to skip this prompt")
+				// Fall back to checking next to executable
+				digest, err = os.ReadFile(ex + ".dgst")
+				if err != nil {
+					fmt.Println("The digest file was not found. Do you want to continue without signature verification? (y/n)")
+					fmt.Println("You can also use --signature-check=false in your command to skip this prompt")
 
-				reader := bufio.NewReader(os.Stdin)
-				response, _ := reader.ReadString('\n')
-				response = strings.TrimSpace(strings.ToLower(response))
+					reader := bufio.NewReader(os.Stdin)
+					response, _ := reader.ReadString('\n')
+					response = strings.TrimSpace(strings.ToLower(response))
 
-				if response != "y" && response != "yes" {
-					fmt.Println("Exiting due to missing digest file")
-					os.Exit(1)
+					if response != "y" && response != "yes" {
+						fmt.Println("Exiting due to missing digest file")
+						os.Exit(1)
+					}
+
+					fmt.Println("Continuing without signature verification")
+					signatureCheck = false
 				}
+			}
 
-				fmt.Println("Continuing without signature verification")
-				signatureCheck = false
-			} else {
+			if signatureCheck {
 				parts := strings.Split(string(digest), " ")
 				if len(parts) != 2 {
 					fmt.Println("Invalid digest file format")
@@ -89,10 +106,16 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 				count := 0
 
 				for i := 1; i <= len(config.Signatories); i++ {
-					signatureFile := fmt.Sprintf(ex+".dgst.sig.%d", i)
+					// Try var data path first for signature files
+					signatureFile := filepath.Join(varDataPath, fmt.Sprintf("%s.dgst.sig.%d", filepath.Base(ex), i))
 					sig, err := os.ReadFile(signatureFile)
 					if err != nil {
-						continue
+						// Fall back to checking next to executable
+						signatureFile = fmt.Sprintf(ex+".dgst.sig.%d", i)
+						sig, err = os.ReadFile(signatureFile)
+						if err != nil {
+							continue
+						}
 					}
 
 					pubkey, _ := hex.DecodeString(config.Signatories[i-1])
@@ -219,8 +242,8 @@ func init() {
 
 	// Create config directory if it doesn't exist
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
-		// Skip for help command
-		if cmd.Name() == "help" {
+		// Skip for help command and download-signatures command
+		if cmd.Name() == "help" || cmd.Name() == "download-signatures" {
 			return nil
 		}
 
@@ -235,20 +258,37 @@ func init() {
 			return fmt.Errorf("failed to get executable path: %v", err)
 		}
 
-		digestPath := ex + ".dgst"
+		// First check var data path for signatures
+		version := config.GetVersionString()
+		varDataPath := filepath.Join(utils.ClientDataPath, version)
+		digestPath := filepath.Join(varDataPath, standardizedQClientFileName+".dgst")
+		fmt.Printf("Checking signature for %s\n", digestPath)
 		if signatureCheck && !utils.FileExists(digestPath) {
-			fmt.Println("Signature file not found. Would you like to download it? (y/n)")
-			reader := bufio.NewReader(os.Stdin)
-			response, _ := reader.ReadString('\n')
-			response = strings.TrimSpace(strings.ToLower(response))
+			// Fall back to checking next to executable
+			digestPath = ex + ".dgst"
+			if !utils.FileExists(digestPath) {
+				fmt.Println("Signature file not found. Would you like to download it? (y/n)")
+				reader := bufio.NewReader(os.Stdin)
+				response, _ := reader.ReadString('\n')
+				response = strings.TrimSpace(strings.ToLower(response))
 
-			if response == "y" || response == "yes" {
-				fmt.Println("Downloading signature file...")
-				// TODO: Implement signature download logic
-				fmt.Println("Signature download not implemented yet. Please download manually.")
-			} else {
-				fmt.Println("Continuing without signature verification")
-				signatureCheck = false
+				if response == "y" || response == "yes" {
+					fmt.Println("Downloading signature files...")
+					if version == "" {
+						fmt.Println("Could not determine version from executable name")
+						return fmt.Errorf("could not determine version from executable name")
+					}
+
+					// Download signature files
+					if err := utils.DownloadReleaseSignatures(utils.ReleaseTypeQClient, version); err != nil {
+						fmt.Printf("Error downloading signature files: %v\n", err)
+						return fmt.Errorf("failed to download signature files: %v", err)
+					}
+					fmt.Println("Successfully downloaded signature files")
+				} else {
+					fmt.Println("Continuing without signature verification")
+					signatureCheck = false
+				}
 			}
 		}
 		return nil

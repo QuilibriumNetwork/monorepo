@@ -15,10 +15,10 @@ var (
 	// Default symlink path for the node binary
 	defaultSymlinkPath = "/usr/local/bin/quilibrium-node"
 
-	// Default installation directory base paths in order of preference
+	// Default installation directory base path
 	installPath = "/opt/quilibrium"
 
-	// Default data directory paths in order of preference
+	// Default data directory paths
 	dataPath = "/var/lib/quilibrium"
 
 	logPath = "/var/log/quilibrium"

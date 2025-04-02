@@ -141,10 +141,12 @@ If you just want to build the qclient in a Docker container without running the 
 ```bash
 # in the project root directory
 ## Will take awhile to build flint on initial build
-docker build -f client/test/Dockerfile.qclient -t qclient .
+sudo task build_qclient_amd64_linux
+sudo task build_qclient_arm64_linux
+# for mac, you will need to build on a mac
 ```
 
-This command builds the Docker image with the qclient binary according to the specifications in `Dockerfile.qclient`. The resulting image will be tagged as `qclient`.
+This command builds the Docker image with the qclient binary according to the specifications in `Dockerfile.source`. The resulting image will be tagged as `qclient`.
 
 ## Contributing
 
@@ -152,4 +154,3 @@ When adding new distributions or versions:
 1. Update the default test configurations in the script
 2. Ensure the corresponding Dockerfile supports the new distribution/version
 3. Test the changes thoroughly before committing
-4. Verify that all dependencies in `Dockerfile.qclient` are available in the target distribution 

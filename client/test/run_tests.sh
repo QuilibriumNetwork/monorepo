@@ -1,5 +1,8 @@
 #!/bin/bash
 set -e
+CLIENT_DIR="${CLIENT_DIR:-$( cd "$(dirname "$(realpath "$( dirname "${BASH_SOURCE[0]}" )")")" >/dev/null 2>&1 && pwd )}"
+
+echo "CLIENT_DIR: $CLIENT_DIR"
 
 # Help function
 show_help() {
@@ -11,6 +14,7 @@ show_help() {
     echo "  -v, --version VERSION  Specify the version (e.g., 22.04, 12)"
     echo "  -t, --tag TAG         Specify a custom tag for the test container"
     echo "  -h, --help           Show this help message"
+    echo "  --no-cache          Disable all Docker build cache"
     echo ""
     echo "If no arguments are provided, runs tests on all supported distributions"
     exit 0
@@ -20,6 +24,7 @@ show_help() {
 DISTRO=""
 VERSION=""
 TAG=""
+NO_CACHE=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         -d|--distro)
@@ -34,6 +39,10 @@ while [[ $# -gt 0 ]]; do
             TAG="$2"
             shift 2
             ;;
+        --no-cache)
+            NO_CACHE="--no-cache"
+            shift
+            ;;
         -h|--help)
             show_help
             ;;
@@ -44,25 +53,43 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Build the client binary using Dockerfile.qclient
-echo "Building client binary using Dockerfile.qclient..."
-docker build -t quil-qclient-builder -f Dockerfile.qclient ..
-docker create --name quil-qclient-temp quil-qclient-builder
-docker cp quil-qclient-temp:/usr/local/bin/qclient ./qclient
-docker rm quil-qclient-temp
-
 # Function to run tests for a specific distribution
 run_distro_test() {
     local distro=$1
     local version=$2
     local tag=$3
     echo "Testing on $distro $version..."
+    
+    # Build the base stage first (this can be cached)
+    docker build \
+        $NO_CACHE \
+        --build-arg DISTRO=$distro \
+        --build-arg VERSION=$version \
+        -t quil-test-$tag-base \
+        --target base \
+        -f client/test/Dockerfile .
+    
+    # Build the final test stage
     docker build \
         --build-arg DISTRO=$distro \
         --build-arg VERSION=$version \
         -t quil-test-$tag \
-        -f Dockerfile .
-    docker run --rm quil-test-$tag
+        --target qclient-test \
+        -f client/test/Dockerfile .
+        
+    # Ensure test files are executable
+    chmod +x "$CLIENT_DIR/test/test_install.sh"
+    chmod +x "$CLIENT_DIR/test/test_utils.sh"
+    chmod +x "$CLIENT_DIR/build/amd64_linux/qclient"
+    
+    # Set ownership to match testuser (uid:gid 1000:1000)
+    chown 1000:1000 "$CLIENT_DIR/build/amd64_linux/qclient"
+    
+    # Run the container with mounted test directory and binary
+    docker run --rm \
+        -v "$CLIENT_DIR/test:/app" \
+        -v "$CLIENT_DIR/build/amd64_linux/qclient:/opt/quilibrium/bin/qclient" \
+        quil-test-$tag
 }
 
 # If custom distro/version/tag is provided, run single test
