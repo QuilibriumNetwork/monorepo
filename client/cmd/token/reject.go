@@ -1,4 +1,4 @@
-package cmd
+package token
 
 import (
 	"fmt"
@@ -6,12 +6,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var acceptCmd = &cobra.Command{
-	Use:   "accept",
-	Short: "Accepts a pending transfer",
-	Long: `Accepts a pending transfer:
+var rejectCmd = &cobra.Command{
+	Use:   "reject",
+	Short: "Rejects the pending transaction",
+	Long: `Rejects a pending transfer:
 	
-	accept <PendingTransaction>
+	reject <PendingTransaction>
 	
 	PendingTransaction - the address of the pending transfer
 	`,
@@ -21,5 +21,5 @@ var acceptCmd = &cobra.Command{
 }
 
 func init() {
-	tokenCmd.AddCommand(acceptCmd)
+	TokenCmd.AddCommand(rejectCmd)
 }

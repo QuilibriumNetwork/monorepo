@@ -20,11 +20,35 @@ else
     exit 1
 fi
 
+# Test: Ensure no config file exists initially
+echo "Testing no config file exists initially..."
+run_test_with_format "test ! -f /etc/quilibrium/config/qclient.yaml"
+
+# Test: Create default config
+echo "Testing default config creation..."
+run_test_with_format "qclient config create-default --signature-check=false"
+
+# Test: Verify config file was created
+echo "Verifying config file was created..."
+run_test_with_format "test -f /etc/quilibrium/config/qclient.yaml"
+
+# Test: Excec arbitrary qclient command and verify signature check
+echo "Testing config print command..."
+run_test_with_format "qclient config print" | grep -v "Checking signature for"
+
+# Test: Toggle signature check
+echo "Testing toggle-signature-check command..."
+run_test_with_format "qclient config toggle-signature-check --signature-check=false"
+run_test_with_format "qclient config print" | grep -v "Checking signature for"
+
+
 # Test: Ensure qclient is in the PATH
 echo "Testing qclient in PATH..."
-run_test_with_format "sudo /opt/quilibrium/bin/qclient link --signature-check=false"
+run_test_with_format "sudo /opt/quilibrium/bin/qclient link"
 run_test_with_format "which qclient"
-run_test_with_format "qclient version --signature-check=false"
+run_test_with_format "qclient version"
+
+run_test_with_format "qclient config print"
 
 
 # Test 0: Install latest version

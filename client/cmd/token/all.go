@@ -1,4 +1,4 @@
-package cmd
+package token
 
 import (
 	"bytes"
@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	qclientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
@@ -44,8 +45,8 @@ var allCmd = &cobra.Command{
 		db := store.NewPebbleDB(NodeConfig.DB)
 		logger, _ := zap.NewProduction()
 		dataProofStore := store.NewPebbleDataProofStore(db, logger)
-		peerId := GetPeerIDFromConfig(NodeConfig)
-		privKey, err := GetPrivKeyFromConfig(NodeConfig)
+		peerId := qclientNode.GetPeerIDFromConfig(NodeConfig)
+		privKey, err := qclientNode.GetPrivKeyFromConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}

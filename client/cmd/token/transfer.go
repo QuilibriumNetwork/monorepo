@@ -1,4 +1,4 @@
-package cmd
+package token
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	qclientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -31,7 +32,7 @@ var transferCmd = &cobra.Command{
 		defer conn.Close()
 
 		client := protobufs.NewNodeServiceClient(conn)
-		privKey, err := GetPrivKeyFromConfig(NodeConfig)
+		privKey, err := qclientNode.GetPrivKeyFromConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}
@@ -86,5 +87,5 @@ var transferCmd = &cobra.Command{
 }
 
 func init() {
-	tokenCmd.AddCommand(transferCmd)
+	TokenCmd.AddCommand(transferCmd)
 }

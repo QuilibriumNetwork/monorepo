@@ -1,21 +1,19 @@
-package cmd
+package node
 
 import (
 	_ "embed"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path"
 	"strconv"
 
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
+
+var DryRun bool
 
 var proverConfigMergeCmd = &cobra.Command{
 	Use:   "merge",
@@ -218,82 +216,22 @@ var proverConfigMergeCmd = &cobra.Command{
 	},
 }
 
-func GetPrivKeyFromConfig(cfg *config.Config) (crypto.PrivKey, error) {
-	peerPrivKey, err := hex.DecodeString(cfg.P2P.PeerPrivKey)
-	if err != nil {
-		panic(errors.Wrap(err, "error unmarshaling peerkey"))
-	}
-
-	privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)
-	return privKey, err
-}
-
-func GetPeerIDFromConfig(cfg *config.Config) peer.ID {
-	peerPrivKey, err := hex.DecodeString(cfg.P2P.PeerPrivKey)
-	if err != nil {
-		panic(errors.Wrap(err, "error unmarshaling peerkey"))
-	}
-
-	privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)
-	if err != nil {
-		panic(errors.Wrap(err, "error unmarshaling peerkey"))
-	}
-
-	pub := privKey.GetPublic()
-	id, err := peer.IDFromPublicKey(pub)
-	if err != nil {
-		panic(errors.Wrap(err, "error getting peer id"))
-	}
-
-	return id
-}
-
-type BridgedPeerJson struct {
-	Amount     string `json:"amount"`
-	Identifier string `json:"identifier"`
-	Variant    string `json:"variant"`
-}
-
-type FirstRetroJson struct {
-	PeerId string `json:"peerId"`
-	Reward string `json:"reward"`
-}
-
-type SecondRetroJson struct {
-	PeerId      string `json:"peerId"`
-	Reward      string `json:"reward"`
-	JanPresence bool   `json:"janPresence"`
-	FebPresence bool   `json:"febPresence"`
-	MarPresence bool   `json:"marPresence"`
-	AprPresence bool   `json:"aprPresence"`
-	MayPresence bool   `json:"mayPresence"`
-}
-
-type ThirdRetroJson struct {
-	PeerId string `json:"peerId"`
-	Reward string `json:"reward"`
-}
-
-type FourthRetroJson struct {
-	PeerId string `json:"peerId"`
-	Reward string `json:"reward"`
-}
-
-//go:embed bridged.json
+//go:embed premainnet-data/bridged.json
 var bridgedPeersJsonBinary []byte
 
-//go:embed first_retro.json
+//go:embed premainnet-data/first_retro.json
 var firstRetroJsonBinary []byte
 
-//go:embed second_retro.json
+//go:embed premainnet-data/second_retro.json
 var secondRetroJsonBinary []byte
 
-//go:embed third_retro.json
+//go:embed premainnet-data/third_retro.json
 var thirdRetroJsonBinary []byte
 
-//go:embed fourth_retro.json
+//go:embed premainnet-data/fourth_retro.json
 var fourthRetroJsonBinary []byte
 
 func init() {
+	proverConfigMergeCmd.Flags().BoolVar(&DryRun, "dry-run", false, "Evaluate seniority score without merging configs")
 	proverCmd.AddCommand(proverConfigMergeCmd)
 }

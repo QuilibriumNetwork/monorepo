@@ -1,4 +1,4 @@
-package cmd
+package token
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/spf13/cobra"
+	qclientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -31,8 +32,8 @@ var mergeCmd = &cobra.Command{
 		defer conn.Close()
 
 		client := protobufs.NewNodeServiceClient(conn)
-		peerId := GetPeerIDFromConfig(NodeConfig)
-		privKey, err := GetPrivKeyFromConfig(NodeConfig)
+		peerId := qclientNode.GetPeerIDFromConfig(NodeConfig)
+		privKey, err := qclientNode.GetPrivKeyFromConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}
@@ -133,5 +134,5 @@ var mergeCmd = &cobra.Command{
 }
 
 func init() {
-	tokenCmd.AddCommand(mergeCmd)
+	TokenCmd.AddCommand(mergeCmd)
 }

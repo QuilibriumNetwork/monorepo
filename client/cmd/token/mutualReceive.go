@@ -1,4 +1,4 @@
-package cmd
+package token
 
 import (
 	"fmt"
@@ -21,5 +21,5 @@ var mutualReceiveCmd = &cobra.Command{
 }
 
 func init() {
-	tokenCmd.AddCommand(mutualReceiveCmd)
+	TokenCmd.AddCommand(mutualReceiveCmd)
 }

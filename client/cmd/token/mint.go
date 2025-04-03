@@ -1,4 +1,4 @@
-package cmd
+package token
 
 import (
 	"github.com/spf13/cobra"
@@ -10,5 +10,5 @@ var mintCmd = &cobra.Command{
 }
 
 func init() {
-	tokenCmd.AddCommand(mintCmd)
+	TokenCmd.AddCommand(mintCmd)
 }

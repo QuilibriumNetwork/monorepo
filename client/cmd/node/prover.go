@@ -1,4 +1,4 @@
-package cmd
+package node
 
 import "github.com/spf13/cobra"
 
@@ -8,5 +8,5 @@ var proverCmd = &cobra.Command{
 }
 
 func init() {
-	configCmd.AddCommand(proverCmd)
+	NodeCmd.AddCommand(proverCmd)
 }

@@ -1,4 +1,4 @@
-package cmd
+package token
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 
 	"github.com/shopspring/decimal"
 	"github.com/spf13/cobra"
+	qclientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -58,7 +59,7 @@ var splitCmd = &cobra.Command{
 		defer conn.Close()
 
 		client := protobufs.NewNodeServiceClient(conn)
-		privKey, err := GetPrivKeyFromConfig(NodeConfig)
+		privKey, err := qclientNode.GetPrivKeyFromConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}
@@ -89,5 +90,5 @@ var splitCmd = &cobra.Command{
 }
 
 func init() {
-	tokenCmd.AddCommand(splitCmd)
+	TokenCmd.AddCommand(splitCmd)
 }

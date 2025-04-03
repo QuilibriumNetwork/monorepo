@@ -15,6 +15,7 @@ RUN echo "TARGETOS: $TARGETOS"
 RUN apt-get update && apt-get install -y \
     curl \
     sudo \
+    bash-completion \
     lsb-release \
     && rm -rf /var/lib/apt/lists/*
 
