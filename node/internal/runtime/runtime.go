@@ -1,6 +1,10 @@
 package runtime
 
-import "runtime"
+import (
+	"runtime"
+
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
+)
 
 const minimumCores = 3
 
@@ -8,13 +12,14 @@ const minimumCores = 3
 // It will use GOMAXPROCS as a base, and then subtract a number of CPUs
 // which are meant to be left for other tasks, such as networking.
 func WorkerCount(requested int, validate bool) int {
+	logger := utils.GetLogger()
 	n := runtime.GOMAXPROCS(0)
 	if validate {
 		if n < minimumCores {
-			panic("invalid system configuration, must have at least 3 cores")
+			logger.Panic("invalid system configuration, must have at least 3 cores")
 		}
 		if requested > 0 && requested < minimumCores {
-			panic("invalid worker count, must have at least 3 workers")
+			logger.Panic("invalid worker count, must have at least 3 workers")
 		}
 	}
 	if requested > 0 {

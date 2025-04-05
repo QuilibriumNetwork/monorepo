@@ -247,7 +247,7 @@ func NewDataClockConsensusEngine(
 		ctx:              ctx,
 		cancel:           cancel,
 		difficulty:       difficulty,
-		logger:           logger,
+		logger:           logger.With(zap.String("stage", "data-clock-consensus")),
 		state:            consensus.EngineStateStopped,
 		clockStore:       clockStore,
 		coinStore:        coinStore,
@@ -326,14 +326,14 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	e.logger.Info("loading last seen state")
 	err := e.dataTimeReel.Start()
 	if err != nil {
-		panic(err)
+		e.logger.Panic("error starting data time reel", zap.Error(err))
 	}
 
 	e.frameProverTries = e.dataTimeReel.GetFrameProverTries()
 
 	err = e.createCommunicationKeys()
 	if err != nil {
-		panic(err)
+		e.logger.Panic("error creating communication keys", zap.Error(err))
 	}
 
 	e.wg.Add(4)
@@ -398,7 +398,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 		var currentBackoff = 0
 		lastHead, err := e.dataTimeReel.Head()
 		if err != nil {
-			panic(err)
+			e.logger.Panic("error getting head", zap.Error(err))
 		}
 		source := rand.New(rand.NewSource(rand.Int63()))
 		for {
@@ -416,7 +416,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 			}
 			currentHead, err := e.dataTimeReel.Head()
 			if err != nil {
-				panic(err)
+				e.logger.Panic("error getting head", zap.Error(err))
 			}
 			if currentHead.FrameNumber == lastHead.FrameNumber {
 				currentBackoff = min(maxBackoff, currentBackoff+1)
@@ -434,12 +434,12 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 		thresholdBeforeConfirming := 4
 		frame, err := e.dataTimeReel.Head()
 		if err != nil {
-			panic(err)
+			e.logger.Panic("error getting head", zap.Error(err))
 		}
 		for {
 			nextFrame, err := e.dataTimeReel.Head()
 			if err != nil {
-				panic(err)
+				e.logger.Panic("error getting head", zap.Error(err))
 			}
 
 			if frame.FrameNumber-100 >= nextFrame.FrameNumber ||
@@ -681,10 +681,10 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 		FrameNumber: e.GetFrame().FrameNumber,
 	}
 	if err := pause.SignED448(e.pubSub.GetPublicKey(), e.pubSub.SignMessage); err != nil {
-		panic(err)
+		e.logger.Panic("error signing prover pause", zap.Error(err))
 	}
 	if err := pause.Validate(); err != nil {
-		panic(err)
+		e.logger.Panic("error validating prover pause", zap.Error(err))
 	}
 
 	if err := e.publishMessage(e.txFilter, pause.TokenRequest()); err != nil {
@@ -699,7 +699,7 @@ func (e *DataClockConsensusEngine) Stop(force bool) <-chan error {
 			defer wg.Done()
 			frame, err := e.dataTimeReel.Head()
 			if err != nil {
-				panic(err)
+				e.logger.Panic("error getting head", zap.Error(err))
 			}
 
 			err = <-e.UnregisterExecutor(name, frame.FrameNumber, force)

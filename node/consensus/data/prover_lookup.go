@@ -23,22 +23,19 @@ func (e *DataClockConsensusEngine) GetProvingKey(
 	}
 
 	if err != nil {
-		e.logger.Error("could not get proving key", zap.Error(err))
-		panic(err)
+		e.logger.Panic("could not get proving key", zap.Error(err))
 	}
 
 	rawKey, err := e.keyManager.GetRawKey(engineConfig.ProvingKeyId)
 	if err != nil {
-		e.logger.Error("could not get proving key type", zap.Error(err))
-		panic(err)
+		e.logger.Panic("could not get proving key type", zap.Error(err))
 	}
 
 	provingKeyType := rawKey.Type
 
 	h, err := poseidon.HashBytes(rawKey.PublicKey)
 	if err != nil {
-		e.logger.Error("could not hash proving key", zap.Error(err))
-		panic(err)
+		e.logger.Panic("could not hash proving key", zap.Error(err))
 	}
 
 	provingKeyAddress := h.Bytes()

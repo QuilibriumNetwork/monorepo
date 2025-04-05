@@ -5,7 +5,9 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 type PebbleDB struct {
@@ -22,7 +24,7 @@ func NewPebbleDB(config *config.DBConfig) *PebbleDB {
 	}
 	db, err := pebble.Open(config.Path, opts)
 	if err != nil {
-		panic(err)
+		utils.GetLogger().Panic("failed to open pebble db", zap.Error(err))
 	}
 
 	return &PebbleDB{db}

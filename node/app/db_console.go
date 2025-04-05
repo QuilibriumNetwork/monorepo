@@ -17,6 +17,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"golang.org/x/term"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
@@ -24,6 +25,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 var (
@@ -434,6 +436,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
+	logger := utils.GetLogger().With(zap.String("stage", "db-console-view-model"))
 	physicalWidth, physicalHeight, _ := term.GetSize(int(os.Stdout.Fd()))
 	doc := strings.Builder{}
 
@@ -510,7 +513,7 @@ func (m model) View() string {
 	} else if m.frame != nil {
 		selector, err := m.frame.GetSelector()
 		if err != nil {
-			panic(err)
+			logger.Panic("error getting selector", zap.Error(err))
 		}
 		committed := "Unconfirmed"
 		if m.committed {
@@ -573,20 +576,21 @@ func consoleModel(
 	nodeConfig *config.Config,
 	grpcWarn bool,
 ) model {
+	logger := utils.GetLogger()
 	peerPrivKey, err := hex.DecodeString(nodeConfig.P2P.PeerPrivKey)
 	if err != nil {
-		panic(errors.Wrap(err, "error unmarshaling peerkey"))
+		logger.Panic("error decode peer private key", zap.Error(err))
 	}
 
 	privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)
 	if err != nil {
-		panic(errors.Wrap(err, "error unmarshaling peerkey"))
+		logger.Panic("error unmarshaling peerkey", zap.Error(err))
 	}
 
 	pub := privKey.GetPublic()
 	id, err := peer.IDFromPublicKey(pub)
 	if err != nil {
-		panic(errors.Wrap(err, "error getting peer id"))
+		logger.Panic("error getting peer id", zap.Error(err))
 	}
 
 	return model{
@@ -612,16 +616,17 @@ var defaultGrpcAddress = "localhost:8337"
 
 // Connect to the node via GRPC
 func ConnectToNode(nodeConfig *config.Config) (*grpc.ClientConn, error) {
+	logger := utils.GetLogger().With(zap.String("stage", "db-console-connect-to-node"))
 	addr := defaultGrpcAddress
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		ma, err := multiaddr.NewMultiaddr(nodeConfig.ListenGRPCMultiaddr)
 		if err != nil {
-			panic(err)
+			logger.Panic("error parsing multiaddr", zap.Error(err))
 		}
 
 		_, addr, err = mn.DialArgs(ma)
 		if err != nil {
-			panic(err)
+			logger.Panic("error getting dial args", zap.Error(err))
 		}
 	}
 
@@ -673,9 +678,10 @@ func FetchNodeInfo(client protobufs.NodeServiceClient) (*protobufs.NodeInfoRespo
 
 // Runs the DB console
 func (c *DBConsole) Run() {
+	logger := utils.GetLogger().With(zap.String("stage", "db-console-run"))
 	conn, err := ConnectToNode(c.nodeConfig)
 	if err != nil {
-		panic(err)
+		logger.Panic("error connecting to node", zap.Error(err))
 	}
 	defer conn.Close()
 
@@ -683,7 +689,7 @@ func (c *DBConsole) Run() {
 
 	p := tea.NewProgram(consoleModel(conn, c.nodeConfig, grpcWarn))
 	if _, err := p.Run(); err != nil {
-		panic(err)
+		logger.Panic("error running program", zap.Error(err))
 	}
 }
 

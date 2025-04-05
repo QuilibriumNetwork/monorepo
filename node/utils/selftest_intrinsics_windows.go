@@ -3,7 +3,10 @@
 
 package utils
 
-import "golang.org/x/sys/windows"
+import (
+	"go.uber.org/zap"
+	"golang.org/x/sys/windows"
+)
 
 func GetDiskSpace(dir string) uint64 {
 	var freeBytesAvailable uint64
@@ -13,7 +16,7 @@ func GetDiskSpace(dir string) uint64 {
 	err := windows.GetDiskFreeSpaceEx(windows.StringToUTF16Ptr(dir),
 		&freeBytesAvailable, &totalNumberOfBytes, &totalNumberOfFreeBytes)
 	if err != nil {
-		panic(err)
+		GetLogger().Panic("failed GetDiskFreeSpaceEx", zap.Error(err))
 	}
 
 	return totalNumberOfBytes

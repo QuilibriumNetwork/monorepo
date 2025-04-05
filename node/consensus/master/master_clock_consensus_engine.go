@@ -119,7 +119,7 @@ func NewMasterClockConsensusEngine(
 
 	e := &MasterClockConsensusEngine{
 		difficulty:           MASTER_CLOCK_RATE,
-		logger:               logger,
+		logger:               logger.With(zap.String("stage", "master-clock-consensus")),
 		state:                consensus.EngineStateStopped,
 		keyManager:           keyManager,
 		pubSub:               pubSub,

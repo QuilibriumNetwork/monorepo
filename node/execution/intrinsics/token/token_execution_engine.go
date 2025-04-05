@@ -249,7 +249,7 @@ func NewTokenExecutionEngine(
 	e := &TokenExecutionEngine{
 		ctx:                        ctx,
 		cancel:                     cancel,
-		logger:                     logger,
+		logger:                     logger.With(zap.String("stage", "token-execution")),
 		engineConfig:               cfg.Engine,
 		keyManager:                 keyManager,
 		clockStore:                 clockStore,
@@ -329,7 +329,7 @@ func NewTokenExecutionEngine(
 	peerId := e.pubSub.GetPeerID()
 	addr, err := poseidon.HashBytes(peerId)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not hash peer id", zap.Error(err))
 	}
 
 	addrBytes := addr.FillBytes(make([]byte, 32))
@@ -347,7 +347,7 @@ func NewTokenExecutionEngine(
 		[]byte{0xff},
 	)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not get range coins", zap.Error(err))
 	}
 
 	totalCoins := 0
@@ -360,11 +360,11 @@ func NewTokenExecutionEngine(
 	}
 	start, err := hex.DecodeString(e.engineConfig.RebuildStart)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not decode start", zap.Error(err))
 	}
 	end, err := hex.DecodeString(e.engineConfig.RebuildEnd)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not decode end", zap.Error(err))
 	}
 
 	includeSet := [][]byte{}
@@ -398,7 +398,7 @@ func NewTokenExecutionEngine(
 		}
 
 		if len(e.hypergraph.GetVertexAdds()) == 0 {
-			panic("hypergraph does not contain id set for application")
+			e.logger.Panic("hypergraph does not contain id set for application")
 		}
 
 		var vertices *hypergraph.IdSet
@@ -407,7 +407,7 @@ func NewTokenExecutionEngine(
 		}
 
 		if vertices == nil {
-			panic("hypergraph does not contain id set for application")
+			e.logger.Panic("hypergraph does not contain id set for application")
 		}
 
 		rebuildSet := [][]byte{}
@@ -517,10 +517,10 @@ func NewTokenExecutionEngine(
 				FrameNumber: f.FrameNumber,
 			}
 			if err := resume.SignED448(e.pubSub.GetPublicKey(), e.pubSub.SignMessage); err != nil {
-				panic(err)
+				e.logger.Panic("error signing resume message", zap.Error(err))
 			}
 			if err := resume.Validate(); err != nil {
-				panic(err)
+				e.logger.Panic("error validating resume message", zap.Error(err))
 			}
 
 			// need to wait for peering
@@ -641,7 +641,7 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 	batchTrees := make([]*qcrypto.VectorCommitmentTree, len(batchKey))
 	txn, err := e.hypergraphStore.NewTransaction(false)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not create transaction", zap.Error(err))
 	}
 
 	for i, chunk := range batchValue {
@@ -711,7 +711,7 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 		err = e.hypergraphStore.SaveVertexTree(txn, id, vertTree)
 		if err != nil {
 			txn.Abort()
-			panic(err)
+			e.logger.Panic("could not save vertex tree", zap.Error(err))
 		}
 	}
 
@@ -720,13 +720,13 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 			txn,
 			batchCompressed[i],
 		); err != nil {
-			panic(err)
+			e.logger.Panic("could not add vertex", zap.Error(err))
 		}
 	}
 
 	if err := txn.Commit(); err != nil {
 		txn.Abort()
-		panic(err)
+		e.logger.Panic("could not commit transaction", zap.Error(err))
 	}
 }
 
@@ -889,7 +889,7 @@ func (e *TokenExecutionEngine) rebuildMissingSetForHypergraph(set [][]byte) {
 
 		frameNumber, coin, err := e.coinStore.GetCoinByAddress(nil, address)
 		if err != nil {
-			panic(err)
+			e.logger.Panic("could not get coin by address", zap.Error(err))
 		}
 
 		value := []byte{}
@@ -920,7 +920,7 @@ func (e *TokenExecutionEngine) rebuildMissingSetForHypergraph(set [][]byte) {
 
 	txn, err := e.clockStore.NewTransaction(false)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not create transaction", zap.Error(err))
 	}
 
 	e.logger.Info("committing hypergraph")
@@ -934,7 +934,7 @@ func (e *TokenExecutionEngine) rebuildMissingSetForHypergraph(set [][]byte) {
 
 	if err = txn.Commit(); err != nil {
 		txn.Abort()
-		panic(err)
+		e.logger.Panic("could not commit transaction", zap.Error(err))
 	}
 	e.hypergraphStore.MarkHypergraphAsComplete()
 }
@@ -950,18 +950,18 @@ func (e *TokenExecutionEngine) rebuildHypergraph(totalRange int) {
 	}
 	start, err := hex.DecodeString(e.engineConfig.RebuildStart)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not decode start", zap.Error(err))
 	}
 	end, err := hex.DecodeString(e.engineConfig.RebuildEnd)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not decode end", zap.Error(err))
 	}
 	iter, err := e.coinStore.RangeCoins(
 		start,
 		end,
 	)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not get range coins", zap.Error(err))
 	}
 	var batchKey, batchValue [][]byte
 	processed := 0
@@ -974,7 +974,7 @@ func (e *TokenExecutionEngine) rebuildHypergraph(totalRange int) {
 		coin := &protobufs.Coin{}
 		err := proto.Unmarshal(iter.Value()[8:], coin)
 		if err != nil {
-			panic(err)
+			e.logger.Panic("could not unmarshal coin", zap.Error(err))
 		}
 
 		value := []byte{}
@@ -1006,7 +1006,7 @@ func (e *TokenExecutionEngine) rebuildHypergraph(totalRange int) {
 
 	txn, err := e.clockStore.NewTransaction(false)
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not create transaction", zap.Error(err))
 	}
 
 	e.logger.Info("committing hypergraph")
@@ -1020,7 +1020,7 @@ func (e *TokenExecutionEngine) rebuildHypergraph(totalRange int) {
 
 	if err = txn.Commit(); err != nil {
 		txn.Abort()
-		panic(err)
+		e.logger.Panic("could not commit transaction", zap.Error(err))
 	}
 	e.hypergraphStore.MarkHypergraphAsComplete()
 }
@@ -1049,12 +1049,12 @@ func (e *TokenExecutionEngine) Start() <-chan error {
 	go func() {
 		err := <-e.clock.Start()
 		if err != nil {
-			panic(err)
+			e.logger.Panic("could not start clock", zap.Error(err))
 		}
 
 		err = <-e.clock.RegisterExecutor(e, 0)
 		if err != nil {
-			panic(err)
+			e.logger.Panic("could not register executor", zap.Error(err))
 		}
 
 		errChan <- nil
@@ -1202,7 +1202,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 	hg, err := e.hypergraphStore.LoadHypergraph()
 	if err != nil {
 		txn.Abort()
-		panic(err)
+		e.logger.Panic("could not load hypergraph", zap.Error(err))
 	}
 
 	for i, output := range app.TokenOutputs.Outputs {
@@ -1253,7 +1253,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 			)
 			if err != nil {
 				txn.Abort()
-				panic(err)
+				e.logger.Panic("could not commit and save vertex data", zap.Error(err))
 			}
 
 			if err := hg.AddVertex(
@@ -1266,7 +1266,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				),
 			); err != nil {
 				txn.Abort()
-				panic(err)
+				e.logger.Panic("could not add vertex", zap.Error(err))
 			}
 		case *protobufs.TokenOutput_DeletedCoin:
 			_, coin, err := e.coinStore.GetCoinByAddress(nil, o.DeletedCoin.Address)
@@ -1319,7 +1319,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				)
 				if err != nil {
 					txn.Abort()
-					panic(err)
+					e.logger.Panic("could not commit and save vertex data", zap.Error(err))
 				}
 			}
 
@@ -1333,7 +1333,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				),
 			); err != nil {
 				txn.Abort()
-				panic(err)
+				e.logger.Panic("could not remove vertex", zap.Error(err))
 			}
 		case *protobufs.TokenOutput_Proof:
 			address, err := outputAddresses[i], outputAddressErrors[i]
@@ -2157,23 +2157,23 @@ func (e *TokenExecutionEngine) AnnounceProverMerge() *protobufs.AnnounceProverRe
 		for _, conf := range e.engineConfig.MultisigProverEnrollmentPaths {
 			extraConf, err := config.LoadConfig(conf, "", false)
 			if err != nil {
-				panic(err)
+				e.logger.Panic("error loading config", zap.Error(err))
 			}
 
 			peerPrivKey, err := hex.DecodeString(extraConf.P2P.PeerPrivKey)
 			if err != nil {
-				panic(errors.Wrap(err, "error unmarshaling peerkey"))
+				e.logger.Panic("error loading config", zap.Error(err))
 			}
 
 			privKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKey)
 			if err != nil {
-				panic(errors.Wrap(err, "error unmarshaling peerkey"))
+				e.logger.Panic("error unmarshaling peerkey", zap.Error(err))
 			}
 
 			pub := privKey.GetPublic()
 			pubBytes, err := pub.Raw()
 			if err != nil {
-				panic(errors.Wrap(err, "error unmarshaling peerkey"))
+				e.logger.Panic("error unmarshaling peerkey", zap.Error(err))
 			}
 
 			helpers = append(helpers, protobufs.ED448SignHelper{
@@ -2185,10 +2185,10 @@ func (e *TokenExecutionEngine) AnnounceProverMerge() *protobufs.AnnounceProverRe
 
 	announce := &protobufs.AnnounceProverRequest{}
 	if err := announce.SignED448(helpers); err != nil {
-		panic(err)
+		e.logger.Panic("error signing announce", zap.Error(err))
 	}
 	if err := announce.Validate(); err != nil {
-		panic(err)
+		e.logger.Panic("error validating announce", zap.Error(err))
 	}
 
 	return announce
@@ -2207,10 +2207,10 @@ func (e *TokenExecutionEngine) AnnounceProverJoin() {
 		Announce:    e.AnnounceProverMerge(),
 	}
 	if err := join.SignED448(e.pubSub.GetPublicKey(), e.pubSub.SignMessage); err != nil {
-		panic(err)
+		e.logger.Panic("error signing join", zap.Error(err))
 	}
 	if err := join.Validate(); err != nil {
-		panic(err)
+		e.logger.Panic("error validating join", zap.Error(err))
 	}
 
 	if err := e.publishMessage(

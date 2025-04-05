@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 // CompareTreesAtHeight compares two vector commitment trees at each level
@@ -67,6 +70,7 @@ func compareLevelCommits(
 	node1, node2 LazyVectorCommitmentNode,
 	targetHeight, currentHeight int,
 ) []ComparisonResult {
+	logger := utils.GetLogger()
 	if node1 == nil && node2 == nil {
 		return nil
 	}
@@ -82,7 +86,7 @@ func compareLevelCommits(
 			} else if bok {
 				commit1 = branch1.Commitment
 			} else {
-				panic("invalid node type")
+				logger.Panic("invalid node type")
 			}
 		}
 		if node2 != nil {
@@ -93,7 +97,7 @@ func compareLevelCommits(
 			} else if bok {
 				commit2 = branch2.Commitment
 			} else {
-				panic("invalid node type")
+				logger.Panic("invalid node type")
 			}
 		}
 
@@ -332,7 +336,7 @@ func GetAllLeaves(
 					slices.Concat(n.FullPrefix, []int{i}),
 				)
 				if err != nil && !strings.Contains(err.Error(), "item not found") {
-					panic(err)
+					utils.GetLogger().Panic("failed to get node by path", zap.Error(err))
 				}
 			}
 			if child != nil {

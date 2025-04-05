@@ -32,7 +32,7 @@ func (e *MasterClockConsensusEngine) Sync(
 
 	masterFrame, err := e.masterTimeReel.Head()
 	if err != nil {
-		panic(err)
+		e.logger.Panic("could not get master time reel head", zap.Error(err))
 	}
 
 	if masterFrame.FrameNumber < from {

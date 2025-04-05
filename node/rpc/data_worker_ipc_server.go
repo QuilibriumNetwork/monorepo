@@ -97,19 +97,19 @@ func NewDataWorkerIPCServer(
 ) (*DataWorkerIPCServer, error) {
 	peerPrivKey, err := hex.DecodeString(config.P2P.PeerPrivKey)
 	if err != nil {
-		panic(errors.Wrap(err, "error unmarshaling peerkey"))
+		logger.Panic("error decoding peerkey", zap.Error(err))
 	}
 
 	privKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKey)
 	if err != nil {
-		panic(errors.Wrap(err, "error unmarshaling peerkey"))
+		logger.Panic("error unmarshaling peerkey", zap.Error(err))
 	}
 
 	pub := privKey.GetPublic()
 
 	pubKey, err := pub.Raw()
 	if err != nil {
-		panic(err)
+		logger.Panic("error getting public key", zap.Error(err))
 	}
 
 	digest := make([]byte, 128)
@@ -117,7 +117,7 @@ func NewDataWorkerIPCServer(
 	s.Write([]byte(pubKey))
 	_, err = s.Read(digest)
 	if err != nil {
-		panic(err)
+		logger.Panic("error reading digest", zap.Error(err))
 	}
 
 	indices := p2p.GetOnesIndices(p2p.GetBloomFilter(digest, 1024, 64))
@@ -159,8 +159,7 @@ func (r *DataWorkerIPCServer) Start() error {
 		zap.String("address", r.listenAddrGRPC),
 	)
 	if err := s.Serve(mn.NetListener(lis)); err != nil {
-		r.logger.Error("terminating server", zap.Error(err))
-		panic(err)
+		r.logger.Panic("terminating server", zap.Error(err))
 	}
 
 	return nil

@@ -2,7 +2,6 @@ package store
 
 import (
 	"encoding/binary"
-	"fmt"
 	"math/big"
 
 	"github.com/cockroachdb/pebble"
@@ -11,6 +10,7 @@ import (
 	"golang.org/x/crypto/sha3"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 type DataProofStore interface {
@@ -243,13 +243,14 @@ func internalListAggregateProofKeys(
 	commitment []byte,
 	frameNumber uint64,
 ) ([][]byte, [][]byte, [][]byte, error) {
+	logger := utils.GetLogger()
 	proofs := [][]byte{dataProofMetadataKey(filter, commitment)}
 	commits := [][]byte{}
 	data := [][]byte{}
 
 	value, closer, err := db.Get(dataProofMetadataKey(filter, commitment))
 	if err != nil {
-		fmt.Println("proof lookup failed")
+		logger.Error("proof lookup failed", zap.Error(err))
 
 		if errors.Is(err, pebble.ErrNotFound) {
 			return nil, nil, nil, ErrNotFound
@@ -268,7 +269,7 @@ func internalListAggregateProofKeys(
 		dataProofInclusionKey(filter, commitment, limit+1),
 	)
 	if err != nil {
-		fmt.Println("inclusion lookup failed")
+		logger.Error("inclusion lookup failed", zap.Error(err))
 
 		return nil, nil, nil, errors.Wrap(err, "list aggregate proof")
 	}
@@ -606,7 +607,7 @@ func (p *PebbleDataProofStore) RewindToIncrement(
 	for j := uint32(0); j <= increment; j++ {
 		_, parallelism, _, _, err := p.GetDataTimeProof(peerId, uint32(j))
 		if err != nil {
-			panic(err)
+			p.logger.Panic("Failed to get data time proof", zap.Error(err))
 		}
 
 		pomwBasis := big.NewInt(1200000)

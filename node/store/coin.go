@@ -70,7 +70,7 @@ func NewPebbleCoinStore(
 ) *PebbleCoinStore {
 	return &PebbleCoinStore{
 		db,
-		logger,
+		logger.With(zap.String("stage", "pebble-coin-store")),
 	}
 }
 
@@ -443,12 +443,12 @@ func (p *PebbleCoinStore) SetMigrationVersion(
 
 	err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x04})
 	if err != nil {
-		panic(err)
+		p.logger.Panic("failed to set migration version", zap.Error(err))
 	}
 
 	err = txn.Set(genesisSeedKey(), seed)
 	if err != nil {
-		panic(err)
+		p.logger.Panic("failed to set genesis seed", zap.Error(err))
 	}
 
 	return txn.Commit()
@@ -470,7 +470,7 @@ func (p *PebbleCoinStore) internalMigrate(
 		),
 	)
 	if err != nil {
-		panic(err)
+		p.logger.Panic("failed to delete range", zap.Error(err))
 	}
 	err = p.db.DeleteRange(
 		coinKey(
@@ -481,7 +481,7 @@ func (p *PebbleCoinStore) internalMigrate(
 		),
 	)
 	if err != nil {
-		panic(err)
+		p.logger.Panic("failed to delete range", zap.Error(err))
 	}
 	err = p.db.DeleteRange(
 		proofByOwnerKey(
@@ -494,7 +494,7 @@ func (p *PebbleCoinStore) internalMigrate(
 		),
 	)
 	if err != nil {
-		panic(err)
+		p.logger.Panic("failed to delete range", zap.Error(err))
 	}
 	err = p.db.DeleteRange(
 		proofKey(
@@ -505,13 +505,13 @@ func (p *PebbleCoinStore) internalMigrate(
 		),
 	)
 	if err != nil {
-		panic(err)
+		p.logger.Panic("failed to delete range", zap.Error(err))
 	}
 	if err := p.db.Delete(clockDataEarliestIndex(filter)); err != nil {
-		panic(err)
+		p.logger.Panic("failed to delete range", zap.Error(err))
 	}
 	if err := p.db.Delete(clockDataLatestIndex(filter)); err != nil {
-		panic(err)
+		p.logger.Panic("failed to delete range", zap.Error(err))
 	}
 
 	txn, err := p.NewTransaction(false)
@@ -521,12 +521,12 @@ func (p *PebbleCoinStore) internalMigrate(
 
 	err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x04})
 	if err != nil {
-		panic(err)
+		p.logger.Panic("failed to set migration version", zap.Error(err))
 	}
 
 	err = txn.Set(genesisSeedKey(), genesisSeed)
 	if err != nil {
-		panic(err)
+		p.logger.Panic("failed to set genesis seed", zap.Error(err))
 	}
 
 	return txn.Commit()
@@ -564,13 +564,13 @@ func (p *PebbleCoinStore) Migrate(filter []byte, genesisSeedHex string) error {
 
 		err = txn.Set(migrationKey(), []byte{0x02, 0x00, 0x01, 0x04})
 		if err != nil {
-			panic(err)
+			p.logger.Panic("failed to set migration version", zap.Error(err))
 		}
 		return txn.Commit()
 	} else {
 		defer closer.Close()
 		if len(status) == 4 && bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x04}) > 0 {
-			panic("database has been migrated to a newer version, do not rollback")
+			p.logger.Panic("database has been migrated to a newer version, do not rollback")
 		} else if len(status) == 3 || bytes.Compare(status, []byte{0x02, 0x00, 0x01, 0x04}) < 0 {
 			return p.internalMigrate(filter, seed)
 		}

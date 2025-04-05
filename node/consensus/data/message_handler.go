@@ -17,6 +17,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 func (e *DataClockConsensusEngine) runFrameMessageHandler() {
@@ -255,7 +256,7 @@ func (e *DataClockConsensusEngine) handleClockFrame(
 
 	head, err := e.dataTimeReel.Head()
 	if err != nil {
-		panic(err)
+		e.logger.Panic("failed to get head frame", zap.Error(err))
 	}
 
 	if frame.FrameNumber > head.FrameNumber {
@@ -475,7 +476,9 @@ func TokenRequestIdentifiers(transition *protobufs.TokenRequest) []string {
 	case *protobufs.TokenRequest_Resume:
 		return []string{fmt.Sprintf("resume-%x", t.Resume.GetPublicKeySignatureEd448().PublicKey.KeyValue)}
 	default:
-		panic("unhandled transition type")
+		utils.GetLogger().Panic("unhandled token request type",
+			zap.String("transitionRequestType", fmt.Sprintf("%T", t)))
+		panic("unhandled token request type")
 	}
 }
 

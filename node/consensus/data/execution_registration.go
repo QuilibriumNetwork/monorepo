@@ -17,7 +17,7 @@ func (e *DataClockConsensusEngine) RegisterExecutor(
 		for {
 			dataFrame, err := e.dataTimeReel.Head()
 			if err != nil {
-				panic(err)
+				e.logger.Panic("failed to get head frame", zap.Error(err))
 			}
 
 			logger.Info(
@@ -59,7 +59,7 @@ func (e *DataClockConsensusEngine) UnregisterExecutor(
 		for {
 			dataFrame, err := e.dataTimeReel.Head()
 			if err != nil {
-				panic(err)
+				e.logger.Panic("failed to get head frame", zap.Error(err))
 			}
 
 			logger.Info(

@@ -28,6 +28,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 type Synchronizer interface {
@@ -54,7 +55,7 @@ func NewStandaloneHypersyncServer(
 ) Synchronizer {
 	listenAddr, err := multiaddr.NewMultiaddr(strictSyncServer)
 	if err != nil {
-		panic(err)
+		utils.GetLogger().Panic("failed to parse listen address", zap.Error(err))
 	}
 
 	return &StandaloneHypersyncServer{
@@ -71,7 +72,7 @@ func NewStandaloneHypersyncClient(
 ) Synchronizer {
 	serverAddr, err := multiaddr.NewMultiaddr(strictSyncClient)
 	if err != nil {
-		panic(err)
+		utils.GetLogger().Panic("failed to parse server address", zap.Error(err))
 	}
 
 	return &StandaloneHypersyncClient{
@@ -87,7 +88,7 @@ func (s *StandaloneHypersyncServer) Start(
 ) {
 	lis, err := mn.Listen(s.listenAddr)
 	if err != nil {
-		panic(err)
+		logger.Panic("failed to listen", zap.Error(err))
 	}
 
 	s.grpcServer = grpc.NewServer(
@@ -98,7 +99,7 @@ func (s *StandaloneHypersyncServer) Start(
 	hypergraphStore := store.NewPebbleHypergraphStore(s.dbConfig, db, logger)
 	hypergraph, err := hypergraphStore.LoadHypergraph()
 	if err != nil {
-		panic(err)
+		logger.Panic("failed to load hypergraph", zap.Error(err))
 	}
 
 	logger.Info("calculating existing hypergraph root commit")
@@ -118,7 +119,7 @@ func (s *StandaloneHypersyncServer) Start(
 		[]byte{0xff},
 	)
 	if err != nil {
-		panic(err)
+		logger.Panic("failed to range coins", zap.Error(err))
 	}
 
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -165,7 +166,7 @@ func (s *StandaloneHypersyncClient) Start(
 	hypergraphStore := store.NewPebbleHypergraphStore(s.dbConfig, db, logger)
 	hypergraph, err := hypergraphStore.LoadHypergraph()
 	if err != nil {
-		panic(err)
+		logger.Panic("failed to load hypergraph", zap.Error(err))
 	}
 
 	logger.Info("calculating existing hypergraph root commit")
@@ -185,7 +186,7 @@ func (s *StandaloneHypersyncClient) Start(
 		[]byte{0xff},
 	)
 	if err != nil {
-		panic(err)
+		logger.Panic("failed to range coins", zap.Error(err))
 	}
 
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -200,7 +201,7 @@ func (s *StandaloneHypersyncClient) Start(
 
 		_, addr, err := mn.DialArgs(s.serverAddr)
 		if err != nil {
-			panic(err)
+			logger.Panic("failed to parse server address", zap.Error(err))
 		}
 		credentials := insecure.NewCredentials()
 
@@ -216,7 +217,7 @@ func (s *StandaloneHypersyncClient) Start(
 			),
 		)
 		if err != nil {
-			panic(err)
+			logger.Panic("failed to dial server", zap.Error(err))
 		}
 
 		client := protobufs.NewHypergraphComparisonServiceClient(cc)
@@ -466,7 +467,7 @@ func getNodeAtPath(
 			slices.Concat(n.FullPrefix, []int{int(childIndex)}),
 		)
 		if err != nil && !strings.Contains(err.Error(), "item not found") {
-			panic(err)
+			utils.GetLogger().Panic("failed to get node by path", zap.Error(err))
 		}
 
 		if child == nil {
@@ -540,7 +541,7 @@ func getBranchInfoFromTree(
 					slices.Concat(branch.FullPrefix, []int{i}),
 				)
 				if err != nil && !strings.Contains(err.Error(), "item not found") {
-					panic(err)
+					utils.GetLogger().Panic("failed to get node by path", zap.Error(err))
 				}
 			}
 			if child != nil {

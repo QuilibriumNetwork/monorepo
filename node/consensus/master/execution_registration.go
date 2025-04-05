@@ -17,7 +17,7 @@ func (e *MasterClockConsensusEngine) RegisterExecutor(
 	go func() {
 		masterFrame, err := e.masterTimeReel.Head()
 		if err != nil {
-			panic(err)
+			logger.Panic("could not get master time reel head", zap.Error(err))
 		}
 
 		logger.Info(
@@ -34,7 +34,7 @@ func (e *MasterClockConsensusEngine) RegisterExecutor(
 		for {
 			masterFrame, err = e.masterTimeReel.Head()
 			if err != nil {
-				panic(err)
+				logger.Panic("could not get master time reel head", zap.Error(err))
 			}
 
 			logger.Info(
@@ -86,7 +86,7 @@ func (e *MasterClockConsensusEngine) UnregisterExecutor(
 		for {
 			masterFrame, err := e.masterTimeReel.Head()
 			if err != nil {
-				panic(err)
+				logger.Panic("could not get master time reel head", zap.Error(err))
 			}
 
 			logger.Info(

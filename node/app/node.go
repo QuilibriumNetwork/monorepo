@@ -17,6 +17,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 type NodeMode string
@@ -136,19 +137,21 @@ func nearestApplicablePowerOfTwo(number uint64) uint64 {
 }
 
 func (n *Node) VerifyProofIntegrity() {
+	logger := utils.GetLogger().With(zap.String("stage", "verify-proof-integrity"))
 	i, _, _, e := n.dataProofStore.GetLatestDataTimeProof(n.pubSub.GetPeerID())
 	if e != nil {
-		panic(e)
+		logger.Panic("failed to get latest data time proof", zap.Error(e))
 	}
 
 	dataProver := crypto.NewKZGInclusionProver(n.logger)
 	wesoProver := crypto.NewWesolowskiFrameProver(n.logger)
 
 	for j := int(i); j >= 0; j-- {
-		fmt.Println(j)
+		loggerWithIncrement := logger.With(zap.Int("increment", j))
+		loggerWithIncrement.Info("verifying proof")
 		_, parallelism, input, o, err := n.dataProofStore.GetDataTimeProof(n.pubSub.GetPeerID(), uint32(j))
 		if err != nil {
-			panic(err)
+			loggerWithIncrement.Panic("failed to get data time proof", zap.Error(err))
 		}
 		idx, idxProof, idxCommit, idxKP := GetOutputs(o)
 
@@ -162,19 +165,19 @@ func (n *Node) VerifyProofIntegrity() {
 			nearestApplicablePowerOfTwo(uint64(parallelism)),
 		)
 		if err != nil {
-			panic(err)
+			loggerWithIncrement.Panic("failed to verify kzg proof", zap.Error(err))
 		}
 
 		if !v {
-			panic(fmt.Sprintf("bad kzg proof at increment %d", j))
+			loggerWithIncrement.Panic("bad kzg proof")
 		}
 		wp := []byte{}
 		wp = append(wp, n.pubSub.GetPeerID()...)
 		wp = append(wp, input...)
-		fmt.Printf("%x\n", wp)
+		loggerWithIncrement.Info("build weso proof", zap.String("wp", fmt.Sprintf("%x", wp)))
 		v = wesoProver.VerifyPreDuskChallengeProof(wp, uint32(j), idx, idxProof)
 		if !v {
-			panic(fmt.Sprintf("bad weso proof at increment %d", j))
+			loggerWithIncrement.Panic("bad weso proof")
 		}
 	}
 }
@@ -190,11 +193,12 @@ func (d *DHTNode) Stop() {
 }
 
 func (n *Node) Start() {
+	logger := utils.GetLogger()
 	switch n.mode {
 	case NormalNodeMode:
 		err := <-n.engine.Start()
 		if err != nil {
-			panic(err)
+			logger.Panic("failed to start engine", zap.Error(err))
 		}
 
 		// TODO: add config mapping to engine name/frame registration
@@ -204,7 +208,7 @@ func (n *Node) Start() {
 			go func(e execution.ExecutionEngine) {
 				defer wg.Done()
 				if err := <-n.engine.RegisterExecutor(e, 0); err != nil {
-					panic(err)
+					logger.Panic("failed to register executor", zap.Error(err))
 				}
 			}(e)
 		}
@@ -215,11 +219,12 @@ func (n *Node) Start() {
 }
 
 func (n *Node) Stop() {
+	logger := utils.GetLogger()
 	switch n.mode {
 	case NormalNodeMode:
 		err := <-n.engine.Stop(false)
 		if err != nil {
-			panic(err)
+			logger.Panic("failed to stop engine", zap.Error(err))
 		}
 	case StrictSyncNodeMode:
 		n.synchronizer.Stop()

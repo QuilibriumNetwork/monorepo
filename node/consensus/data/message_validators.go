@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
@@ -115,7 +116,7 @@ func (e *DataClockConsensusEngine) validateTxMessage(peerID peer.ID, message *pb
 
 			head, err := e.dataTimeReel.Head()
 			if err != nil {
-				panic(err)
+				e.logger.Panic("failed to get head", zap.Error(err))
 			}
 			if frameNumber+1 < head.FrameNumber {
 				return p2p.ValidationResultIgnore

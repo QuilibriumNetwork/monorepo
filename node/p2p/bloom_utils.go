@@ -4,7 +4,9 @@ import (
 	"math/big"
 	"sort"
 
+	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 func GetOnesIndices(input []byte) []int {
@@ -47,17 +49,18 @@ func GetBloomFilter(data []byte, bitLength int, k int) []byte {
 // GetBloomFilterIndices returns the indices of a bloom filter, in increasing
 // order, assuming bitLength is a multiple of 32 as in GetBloomFilter.
 func GetBloomFilterIndices(data []byte, bitLength int, k int) []byte {
+	logger := utils.GetLogger().With(zap.String("stage", "get-bloom-filter-indices"))
 	size := big.NewInt(int64(bitLength)).BitLen() - 1
 	h := sha3.NewShake256()
 	_, err := h.Write(data)
 	if err != nil {
-		panic(err)
+		logger.Panic("could not write to hash", zap.Error(err))
 	}
 
 	digest := make([]byte, size*k)
 	_, err = h.Read(digest)
 	if err != nil {
-		panic(err)
+		logger.Panic("could not read from hash", zap.Error(err))
 	}
 
 	indices := []string{}

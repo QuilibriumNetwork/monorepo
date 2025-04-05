@@ -17,6 +17,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 type HypergraphStore interface {
@@ -1118,7 +1119,7 @@ func (p *PebbleHypergraphStore) GetNodeByPath(
 func generateSlices(fullpref, pref []int) [][]int {
 	result := [][]int{}
 	if len(pref) > len(fullpref) {
-		panic("invalid prefix length")
+		utils.GetLogger().Panic("invalid prefix length")
 	}
 	for i := len(pref); i <= len(fullpref); i++ {
 		newSlice := make([]int, i)

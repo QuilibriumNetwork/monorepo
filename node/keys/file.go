@@ -33,12 +33,12 @@ func NewFileKeyManager(
 	logger *zap.Logger,
 ) *FileKeyManager {
 	if keyStoreConfig.KeyStoreFile == nil {
-		panic("key store config missing")
+		logger.Panic("key store config missing")
 	}
 
 	key, err := hex.DecodeString(keyStoreConfig.KeyStoreFile.EncryptionKey)
 	if err != nil {
-		panic(err)
+		logger.Panic("could not decode encryption key", zap.Error(err))
 	}
 
 	store := make(map[string]Key)
@@ -55,7 +55,7 @@ func NewFileKeyManager(
 		os.FileMode(0600),
 	)
 	if err != nil {
-		panic(err)
+		logger.Panic("could not open store", zap.Error(err))
 	}
 
 	defer file.Close()
@@ -63,7 +63,7 @@ func NewFileKeyManager(
 	d := yaml.NewDecoder(file)
 
 	if err := d.Decode(store); err != nil {
-		panic(err)
+		logger.Panic("could not decode store", zap.Error(err))
 	}
 
 	return &FileKeyManager{

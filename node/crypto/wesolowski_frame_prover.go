@@ -301,7 +301,7 @@ func (w *WesolowskiFrameProver) CreateDataGenesisFrame(
 	for i, s := range proverKeys {
 		addr, err := poseidon.HashBytes(s)
 		if err != nil {
-			panic(err)
+			w.logger.Panic("could not hash proving key", zap.Error(err))
 		}
 
 		addrBytes := addr.Bytes()

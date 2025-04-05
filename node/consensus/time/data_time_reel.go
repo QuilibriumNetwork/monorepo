@@ -123,7 +123,7 @@ func NewDataTimeReel(
 	return &DataTimeReel{
 		ctx:                   ctx,
 		cancel:                cancel,
-		logger:                logger,
+		logger:                logger.With(zap.String("stage", "data-time-reel")),
 		filter:                filter,
 		engineConfig:          engineConfig,
 		clockStore:            clockStore,
@@ -412,7 +412,7 @@ func (d *DataTimeReel) storePending(
 
 		txn, err := d.clockStore.NewTransaction(false)
 		if err != nil {
-			panic(err)
+			d.logger.Panic("failed to create transaction", zap.Error(err))
 		}
 		err = d.clockStore.StageDataClockFrame(
 			selector.FillBytes(make([]byte, 32)),
@@ -421,10 +421,10 @@ func (d *DataTimeReel) storePending(
 		)
 		if err != nil {
 			txn.Abort()
-			panic(err)
+			d.logger.Panic("failed to stage data clock frame", zap.Error(err))
 		}
 		if err = txn.Commit(); err != nil {
-			panic(err)
+			d.logger.Panic("failed to commit transaction", zap.Error(err))
 		}
 	}
 }
@@ -453,7 +453,7 @@ func (d *DataTimeReel) runLoop() {
 				if frameDone != nil {
 					close(frameDone)
 				}
-				panic(err)
+				d.logger.Panic("failed to get staged data clock frame", zap.Error(err))
 			}
 
 			d.logger.Info(
@@ -472,7 +472,7 @@ func (d *DataTimeReel) runLoop() {
 					if frameDone != nil {
 						close(frameDone)
 					}
-					panic(err)
+					d.logger.Panic("failed to get distance", zap.Error(err))
 				}
 			}
 
@@ -601,7 +601,7 @@ func (d *DataTimeReel) processPending(
 
 	headSelector, err := d.head.GetSelector()
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to get head selector", zap.Error(err))
 	}
 
 	selectorHex := hex.EncodeToString(headSelector.Bytes())
@@ -654,7 +654,7 @@ func (d *DataTimeReel) tryFillGap(startFrame, endFrame uint64) bool {
 
 	headSelector, err := d.head.GetSelector()
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to get head selector", zap.Error(err))
 	}
 
 	currentSelector := headSelector
@@ -741,7 +741,7 @@ func (d *DataTimeReel) tryFillGap(startFrame, endFrame uint64) bool {
 
 		currentSelector, err = rawFrame.GetSelector()
 		if err != nil {
-			panic(err)
+			d.logger.Panic("failed to get selector", zap.Error(err))
 		}
 	}
 
@@ -794,7 +794,7 @@ func (d *DataTimeReel) processPendingChain() {
 
 		headSelector, err := d.head.GetSelector()
 		if err != nil {
-			panic(err)
+			d.logger.Panic("failed to get head selector", zap.Error(err))
 		}
 
 		var bestFrame *protobufs.ClockFrame
@@ -900,7 +900,7 @@ func (d *DataTimeReel) setHead(
 
 	txn, err := d.clockStore.NewTransaction(false)
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to create transaction", zap.Error(err))
 	}
 
 	d.logger.Info(
@@ -911,7 +911,7 @@ func (d *DataTimeReel) setHead(
 
 	selector, err := frame.GetSelector()
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to get selector", zap.Error(err))
 	}
 
 	_, tries, err := d.clockStore.GetDataClockFrame(
@@ -937,11 +937,11 @@ func (d *DataTimeReel) setHead(
 		txn,
 		false,
 	); err != nil {
-		panic(err)
+		d.logger.Panic("failed to commit data clock frame", zap.Error(err))
 	}
 
 	if err = txn.Commit(); err != nil {
-		panic(err)
+		d.logger.Panic("failed to commit transaction", zap.Error(err))
 	}
 
 	d.proverTries = tries
@@ -993,7 +993,7 @@ func (d *DataTimeReel) forkChoice(
 	)
 	_, selector, err := frame.GetParentAndSelector()
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to get parent and selector", zap.Error(err))
 	}
 
 	leftIndex := d.head
@@ -1028,7 +1028,7 @@ func (d *DataTimeReel) forkChoice(
 				d.logger.Info("cannot verify lineage, aborting fork choice")
 				return
 			} else {
-				panic(err)
+				d.logger.Panic("failed to get staged data clock frame", zap.Error(err))
 			}
 		}
 
@@ -1036,7 +1036,7 @@ func (d *DataTimeReel) forkChoice(
 
 		rightIndexDistance, err := d.GetDistance(rightIndex)
 		if err != nil {
-			panic(err)
+			d.logger.Panic("failed to get distance", zap.Error(err))
 		}
 
 		// We accumulate right on left when right is longer because we cannot know
@@ -1077,7 +1077,7 @@ func (d *DataTimeReel) forkChoice(
 				),
 				zap.Uint64("frame_number", leftIndex.FrameNumber-1),
 			)
-			panic(err)
+			d.logger.Panic("failed to get staged data clock frame", zap.Error(err))
 		}
 
 		rightIndex, err = d.clockStore.GetStagedDataClockFrame(
@@ -1092,7 +1092,7 @@ func (d *DataTimeReel) forkChoice(
 				d.logger.Info("cannot verify full lineage, aborting fork choice")
 				return
 			} else {
-				panic(err)
+				d.logger.Panic("failed to get staged data clock frame", zap.Error(err))
 			}
 		}
 
@@ -1101,12 +1101,12 @@ func (d *DataTimeReel) forkChoice(
 
 		leftIndexDistance, err := d.GetDistance(leftIndex)
 		if err != nil {
-			panic(err)
+			d.logger.Panic("failed to get distance", zap.Error(err))
 		}
 
 		rightIndexDistance, err := d.GetDistance(rightIndex)
 		if err != nil {
-			panic(err)
+			d.logger.Panic("failed to get distance", zap.Error(err))
 		}
 
 		leftTotal.Add(leftTotal, leftIndexDistance)
@@ -1142,7 +1142,7 @@ func (d *DataTimeReel) forkChoice(
 
 		txn, err := d.clockStore.NewTransaction(false)
 		if err != nil {
-			panic(err)
+			d.logger.Panic("failed to create transaction", zap.Error(err))
 		}
 
 		if err := d.clockStore.CommitDataClockFrame(
@@ -1153,11 +1153,11 @@ func (d *DataTimeReel) forkChoice(
 			txn,
 			rightIndex.FrameNumber < d.head.FrameNumber,
 		); err != nil {
-			panic(err)
+			d.logger.Panic("failed to commit data clock frame", zap.Error(err))
 		}
 
 		if err = txn.Commit(); err != nil {
-			panic(err)
+			d.logger.Panic("failed to commit transaction", zap.Error(err))
 		}
 
 		frameNumber++
@@ -1165,7 +1165,7 @@ func (d *DataTimeReel) forkChoice(
 
 	txn, err := d.clockStore.NewTransaction(false)
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to create transaction", zap.Error(err))
 	}
 
 	if err := d.clockStore.CommitDataClockFrame(
@@ -1176,11 +1176,11 @@ func (d *DataTimeReel) forkChoice(
 		txn,
 		false,
 	); err != nil {
-		panic(err)
+		d.logger.Panic("failed to commit data clock frame", zap.Error(err))
 	}
 
 	if err = txn.Commit(); err != nil {
-		panic(err)
+		d.logger.Panic("failed to commit transaction", zap.Error(err))
 	}
 
 	d.head = frame
@@ -1210,7 +1210,7 @@ func (d *DataTimeReel) forkChoice(
 func (d *DataTimeReel) getTotalDistance(frame *protobufs.ClockFrame) *big.Int {
 	selector, err := frame.GetSelector()
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to get selector", zap.Error(err))
 	}
 
 	existingTotal, err := d.clockStore.GetTotalDistance(

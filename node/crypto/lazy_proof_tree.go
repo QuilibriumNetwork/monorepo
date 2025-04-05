@@ -12,9 +12,11 @@ import (
 	"sync"
 
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	rbls48581 "source.quilibrium.com/quilibrium/monorepo/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
+	"source.quilibrium.com/quilibrium/monorepo/node/utils"
 )
 
 type ShardKey struct {
@@ -82,7 +84,7 @@ func (n *LazyVectorCommitmentLeafNode) Commit(
 			path,
 			n,
 		); err != nil {
-			panic(err)
+			utils.GetLogger().Panic("failed to insert node", zap.Error(err))
 		}
 	}
 	return n.Commitment
@@ -129,6 +131,7 @@ func commitNode(
 	recalculate bool,
 	throttle chan struct{},
 ) []byte {
+	logger := utils.GetLogger().With(zap.String("stage", "lazy-proof-tree-commit"))
 	switch node := n.(type) {
 	case *LazyVectorCommitmentBranchNode:
 		if len(node.Commitment) != 0 && !recalculate {
@@ -157,7 +160,7 @@ func commitNode(
 							childPath,
 						)
 						if err != nil && !strings.Contains(err.Error(), "item not found") {
-							panic(err)
+							logger.Panic("failed to get node by path", zap.Error(err))
 						}
 					}
 					if child != nil {
@@ -195,7 +198,7 @@ func commitNode(
 						childPath,
 					)
 					if err != nil && !strings.Contains(err.Error(), "item not found") {
-						panic(err)
+						logger.Panic("failed to get node by path", zap.Error(err))
 					}
 				}
 				if child != nil {
@@ -242,7 +245,7 @@ func commitNode(
 			path,
 			node,
 		); err != nil {
-			panic(err)
+			logger.Panic("failed to insert node", zap.Error(err))
 		}
 		return node.Commitment
 	case *LazyVectorCommitmentLeafNode:
@@ -255,7 +258,7 @@ func commitNode(
 func (n *LazyVectorCommitmentBranchNode) Verify(index int, proof []byte) bool {
 	data := []byte{}
 	if len(n.Commitment) == 0 {
-		panic("verify cannot be run on nil commitments")
+		utils.GetLogger().Panic("verify cannot be run on nil commitments")
 	} else {
 		child := n.Children[index]
 		if child != nil {
@@ -372,6 +375,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 	key, value, hashTarget []byte,
 	size *big.Int,
 ) error {
+	logger := utils.GetLogger().With(zap.String("stage", "lazy-proof-tree-insert"))
 	if len(key) == 0 {
 		return errors.New("empty key not allowed")
 	}
@@ -395,7 +399,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				path,
 			)
 			if err != nil && !strings.Contains(err.Error(), "item not found") {
-				panic(err)
+				logger.Panic("failed to get node by path", zap.Error(err))
 			}
 		}
 		if node == nil {
@@ -418,7 +422,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 			)
 			if err != nil {
 				// todo: no panic
-				panic(err)
+				logger.Panic("failed to insert node", zap.Error(err))
 			}
 			return 1, newNode
 		} else {
@@ -433,7 +437,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 						slices.Concat(path, []int{i}),
 					)
 					if err != nil && !strings.Contains(err.Error(), "item not found") {
-						panic(err)
+						logger.Panic("failed to get node by path", zap.Error(err))
 					}
 				}
 				branch.FullyLoaded = true
@@ -459,7 +463,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				)
 				if err != nil {
 					// todo: no panic
-					panic(err)
+					logger.Panic("failed to insert node", zap.Error(err))
 				}
 				return 0, n
 			}
@@ -501,7 +505,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 			)
 			if err != nil {
 				// todo: no panic
-				panic(err)
+				logger.Panic("failed to insert node", zap.Error(err))
 			}
 
 			err = t.Store.InsertNode(
@@ -515,7 +519,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 			)
 			if err != nil {
 				// todo: no panic
-				panic(err)
+				logger.Panic("failed to insert node", zap.Error(err))
 			}
 
 			err = t.Store.InsertNode(
@@ -529,7 +533,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 			)
 			if err != nil {
 				// todo: no panic
-				panic(err)
+				logger.Panic("failed to insert node", zap.Error(err))
 			}
 
 			return 1, branch
@@ -572,7 +576,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 						)
 						if err != nil {
 							// todo: no panic
-							panic(err)
+							logger.Panic("failed to insert node", zap.Error(err))
 						}
 
 						n.FullPrefix = slices.Concat(
@@ -593,7 +597,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 						)
 						if err != nil {
 							// todo: no panic
-							panic(err)
+							logger.Panic("failed to insert node", zap.Error(err))
 						}
 
 						err = t.Store.InsertNode(
@@ -607,7 +611,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 						)
 						if err != nil {
 							// todo: no panic
-							panic(err)
+							logger.Panic("failed to insert node", zap.Error(err))
 						}
 
 						return 1, newBranch
@@ -649,7 +653,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				)
 				if err != nil {
 					// todo: no panic
-					panic(err)
+					logger.Panic("failed to insert node", zap.Error(err))
 				}
 
 				return delta, n
@@ -685,7 +689,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				)
 				if err != nil {
 					// todo: no panic
-					panic(err)
+					logger.Panic("failed to insert node", zap.Error(err))
 				}
 
 				return delta, n
@@ -860,7 +864,7 @@ func (t *LazyVectorCommitmentTree) Commit(recalculate bool) []byte {
 
 	err := t.Store.SaveRoot(t.SetType, t.PhaseType, t.ShardKey, t.Root)
 	if err != nil {
-		panic(err)
+		utils.GetLogger().Panic("failed to save root", zap.Error(err))
 	}
 
 	return commitment
