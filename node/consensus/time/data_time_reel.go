@@ -90,40 +90,41 @@ func NewDataTimeReel(
 	initialProverKeys [][]byte,
 	alwaysSend bool,
 ) *DataTimeReel {
-	if filter == nil {
-		panic("filter is nil")
-	}
-
 	if logger == nil {
 		panic("logger is nil")
 	}
+	slogger := logger.With(zap.String("stage", "data-time-reel"))
+
+	if filter == nil {
+		slogger.Panic("filter is nil")
+	}
 
 	if clockStore == nil {
-		panic("clock store is nil")
+		slogger.Panic("clock store is nil")
 	}
 
 	if engineConfig == nil {
-		panic("engine config is nil")
+		slogger.Panic("engine config is nil")
 	}
 
 	if exec == nil {
-		panic("execution function is nil")
+		slogger.Panic("execution function is nil")
 	}
 
 	if frameProver == nil {
-		panic("frame prover is nil")
+		slogger.Panic("frame prover is nil")
 	}
 
 	cache, err := lru.New[string, string](10000)
 	if err != nil {
-		panic(err)
+		slogger.Panic("failed to create LRU cache", zap.Error(err))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &DataTimeReel{
 		ctx:                   ctx,
 		cancel:                cancel,
-		logger:                logger.With(zap.String("stage", "data-time-reel")),
+		logger:                slogger,
 		filter:                filter,
 		engineConfig:          engineConfig,
 		clockStore:            clockStore,
@@ -148,15 +149,15 @@ func (d *DataTimeReel) createGenesisFrame() (
 	[]*tries.RollingFrecencyCritbitTrie,
 ) {
 	if d.origin == nil {
-		panic("origin is nil")
+		d.logger.Panic("origin is nil")
 	}
 
 	if d.initialInclusionProof == nil {
-		panic("initial inclusion proof is nil")
+		d.logger.Panic("initial inclusion proof is nil")
 	}
 
 	if d.initialProverKeys == nil {
-		panic("initial prover keys is nil")
+		d.logger.Panic("initial prover keys is nil")
 	}
 	difficulty := d.engineConfig.Difficulty
 	if difficulty == 0 || difficulty == 10000 {
@@ -170,15 +171,15 @@ func (d *DataTimeReel) createGenesisFrame() (
 		d.initialProverKeys,
 	)
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to create genesis frame", zap.Error(err))
 	}
 	selector, err := frame.GetSelector()
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to get selector", zap.Error(err))
 	}
 	txn, err := d.clockStore.NewTransaction(false)
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to create transaction", zap.Error(err))
 	}
 	err = d.clockStore.StageDataClockFrame(
 		selector.FillBytes(make([]byte, 32)),
@@ -187,16 +188,16 @@ func (d *DataTimeReel) createGenesisFrame() (
 	)
 	if err != nil {
 		txn.Abort()
-		panic(err)
+		d.logger.Panic("failed to stage genesis frame", zap.Error(err))
 	}
 	err = txn.Commit()
 	if err != nil {
 		txn.Abort()
-		panic(err)
+		d.logger.Panic("failed to commit genesis frame", zap.Error(err))
 	}
 	txn, err = d.clockStore.NewTransaction(false)
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to create transaction", zap.Error(err))
 	}
 	if err := d.clockStore.CommitDataClockFrame(
 		d.filter,
@@ -206,10 +207,10 @@ func (d *DataTimeReel) createGenesisFrame() (
 		txn,
 		false,
 	); err != nil {
-		panic(err)
+		d.logger.Panic("failed to commit data clock frame", zap.Error(err))
 	}
 	if err := txn.Commit(); err != nil {
-		panic(err)
+		d.logger.Panic("failed to commit transaction", zap.Error(err))
 	}
 	return frame, tries
 }
@@ -217,7 +218,7 @@ func (d *DataTimeReel) createGenesisFrame() (
 func (d *DataTimeReel) Start() error {
 	frame, tries, err := d.clockStore.GetLatestDataClockFrame(d.filter)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		panic(err)
+		d.logger.Panic("failed to get latest data clock frame", zap.Error(err))
 	}
 
 	if frame == nil {
@@ -227,7 +228,7 @@ func (d *DataTimeReel) Start() error {
 	} else {
 		d.head = frame
 		if err != nil {
-			panic(err)
+			d.logger.Panic("failed to get latest data clock frame", zap.Error(err))
 		}
 		d.totalDistance = big.NewInt(0)
 		d.proverTries = tries
@@ -265,12 +266,12 @@ func (d *DataTimeReel) Insert(
 	parent := new(big.Int).SetBytes(frame.ParentSelector)
 	selector, err := frame.GetSelector()
 	if err != nil {
-		panic(err)
+		d.logger.Panic("failed to get selector", zap.Error(err))
 	}
 
 	distance, err := d.GetDistance(frame)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		panic(err)
+		d.logger.Panic("failed to get distance", zap.Error(err))
 	}
 
 	d.storePending(selector, parent, distance, frame)

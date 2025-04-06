@@ -148,10 +148,11 @@ func NewTokenExecutionEngine(
 	if logger == nil {
 		panic(errors.New("logger is nil"))
 	}
+	slogger := logger.With(zap.String("stage", "token-execution"))
 
 	seed, err := hex.DecodeString(cfg.Engine.GenesisSeed)
 	if err != nil {
-		panic(err)
+		slogger.Panic("failed to decode genesis seed", zap.Error(err))
 	}
 
 	intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
@@ -182,10 +183,10 @@ func NewTokenExecutionEngine(
 		if err := coinStore.SetMigrationVersion(
 			config.GetGenesis().GenesisSeedHex,
 		); err != nil {
-			panic(err)
+			slogger.Panic("failed to set migration version", zap.Error(err))
 		}
 	} else if err != nil {
-		panic(err)
+		slogger.Panic("failed to get data clock frame", zap.Error(err))
 	} else {
 		if pubSub.GetNetwork() == 0 {
 			err := coinStore.Migrate(
@@ -193,7 +194,7 @@ func NewTokenExecutionEngine(
 				config.GetGenesis().GenesisSeedHex,
 			)
 			if err != nil {
-				panic(err)
+				slogger.Panic("failed to migrate coins", zap.Error(err))
 			}
 			_, err = clockStore.GetEarliestDataClockFrame(intrinsicFilter)
 			if err != nil && errors.Is(err, store.ErrNotFound) {
@@ -216,29 +217,29 @@ func NewTokenExecutionEngine(
 	if len(peerSeniority) == 0 {
 		peerSeniority, err = clockStore.GetPeerSeniorityMap(intrinsicFilter)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			panic(err)
+			slogger.Panic("failed to get peer seniority map", zap.Error(err))
 		}
 
 		if len(peerSeniority) == 0 {
 			peerSeniority, err = RebuildPeerSeniority(uint(cfg.P2P.Network))
 			if err != nil {
-				panic(err)
+				slogger.Panic("failed to rebuild peer seniority", zap.Error(err))
 			}
 
 			txn, err := clockStore.NewTransaction(false)
 			if err != nil {
-				panic(err)
+				slogger.Panic("failed to create transaction", zap.Error(err))
 			}
 
 			err = clockStore.PutPeerSeniorityMap(txn, intrinsicFilter, peerSeniority)
 			if err != nil {
 				txn.Abort()
-				panic(err)
+				slogger.Panic("failed to put peer seniority map", zap.Error(err))
 			}
 
 			if err = txn.Commit(); err != nil {
 				txn.Abort()
-				panic(err)
+				slogger.Panic("failed to commit transaction", zap.Error(err))
 			}
 		}
 	} else {
@@ -249,7 +250,7 @@ func NewTokenExecutionEngine(
 	e := &TokenExecutionEngine{
 		ctx:                        ctx,
 		cancel:                     cancel,
-		logger:                     logger.With(zap.String("stage", "token-execution")),
+		logger:                     slogger,
 		engineConfig:               cfg.Engine,
 		keyManager:                 keyManager,
 		clockStore:                 clockStore,

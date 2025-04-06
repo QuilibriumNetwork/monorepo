@@ -175,53 +175,54 @@ func NewDataClockConsensusEngine(
 	if logger == nil {
 		panic(errors.New("logger is nil"))
 	}
+	slogger := logger.With(zap.String("stage", "data-clock-consensus"))
 
 	if cfg == nil {
-		panic(errors.New("engine config is nil"))
+		slogger.Panic("engine config is nil")
 	}
 
 	if keyManager == nil {
-		panic(errors.New("key manager is nil"))
+		slogger.Panic("key manager is nil")
 	}
 
 	if clockStore == nil {
-		panic(errors.New("clock store is nil"))
+		slogger.Panic("clock store is nil")
 	}
 
 	if coinStore == nil {
-		panic(errors.New("coin store is nil"))
+		slogger.Panic("coin store is nil")
 	}
 
 	if dataProofStore == nil {
-		panic(errors.New("data proof store is nil"))
+		slogger.Panic("data proof store is nil")
 	}
 
 	if keyStore == nil {
-		panic(errors.New("key store is nil"))
+		slogger.Panic("key store is nil")
 	}
 
 	if pubSub == nil {
-		panic(errors.New("pubsub is nil"))
+		slogger.Panic("pubsub is nil")
 	}
 
 	if frameProver == nil {
-		panic(errors.New("frame prover is nil"))
+		slogger.Panic("frame prover is nil")
 	}
 
 	if inclusionProver == nil {
-		panic(errors.New("inclusion prover is nil"))
+		slogger.Panic("frame inclusion prover is nil")
 	}
 
 	if masterTimeReel == nil {
-		panic(errors.New("master time reel is nil"))
+		slogger.Panic("master time reel is nil")
 	}
 
 	if dataTimeReel == nil {
-		panic(errors.New("data time reel is nil"))
+		slogger.Panic("data time reel is nil")
 	}
 
 	if peerInfoManager == nil {
-		panic(errors.New("peer info manager is nil"))
+		slogger.Panic("peer info manager is nil")
 	}
 
 	difficulty := cfg.Engine.Difficulty
@@ -234,12 +235,12 @@ func NewDataClockConsensusEngine(
 		16,
 	)
 	if err != nil {
-		panic(err)
+		slogger.Panic("error creating clock frame fragment buffer", zap.Error(err))
 	}
 
 	cache, err := lru.New[string, struct{}](25)
 	if err != nil {
-		panic(err)
+		slogger.Panic("error creating lru cache", zap.Error(err))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -247,7 +248,7 @@ func NewDataClockConsensusEngine(
 		ctx:              ctx,
 		cancel:           cancel,
 		difficulty:       difficulty,
-		logger:           logger.With(zap.String("stage", "data-clock-consensus")),
+		logger:           slogger,
 		state:            consensus.EngineStateStopped,
 		clockStore:       clockStore,
 		coinStore:        coinStore,
