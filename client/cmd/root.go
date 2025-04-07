@@ -16,7 +16,7 @@ import (
 
 	clientConfig "source.quilibrium.com/quilibrium/monorepo/client/cmd/config"
 	"source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
-	token "source.quilibrium.com/quilibrium/monorepo/client/cmd/token"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/token"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
