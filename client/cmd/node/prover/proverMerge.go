@@ -1,4 +1,4 @@
-package node
+package prover
 
 import (
 	_ "embed"
@@ -10,7 +10,8 @@ import (
 
 	"github.com/shopspring/decimal"
 	"github.com/spf13/cobra"
-	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	clientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
+	nodeConfig "source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
 var DryRun bool
@@ -30,35 +31,35 @@ var proverConfigMergeCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		primaryConfig, err := config.LoadConfig(args[0], "", true)
+		primaryConfig, err := nodeConfig.LoadConfig(args[0], "", true)
 		if err != nil {
 			fmt.Printf("invalid config directory: %s\n", args[0])
 			os.Exit(1)
 		}
 
 		otherPaths := []string{}
-		peerIds := []string{GetPeerIDFromConfig(primaryConfig).String()}
+		peerIds := []string{clientNode.GetPeerIDFromConfig(primaryConfig).String()}
 		for _, p := range args[1:] {
 			if !path.IsAbs(p) {
 				fmt.Printf("%s is not an absolute path\n", p)
 			}
-			cfg, err := config.LoadConfig(p, "", true)
+			cfg, err := nodeConfig.LoadConfig(p, "", true)
 			if err != nil {
 				fmt.Printf("invalid config directory: %s\n", p)
 				os.Exit(1)
 			}
 
-			peerId := GetPeerIDFromConfig(cfg).String()
+			peerId := clientNode.GetPeerIDFromConfig(cfg).String()
 			peerIds = append(peerIds, peerId)
 			otherPaths = append(otherPaths, p)
 		}
 
 		if DryRun {
-			bridged := []*BridgedPeerJson{}
-			firstRetro := []*FirstRetroJson{}
-			secondRetro := []*SecondRetroJson{}
-			thirdRetro := []*ThirdRetroJson{}
-			fourthRetro := []*FourthRetroJson{}
+			bridged := []*clientNode.BridgedPeerJson{}
+			firstRetro := []*clientNode.FirstRetroJson{}
+			secondRetro := []*clientNode.SecondRetroJson{}
+			thirdRetro := []*clientNode.ThirdRetroJson{}
+			fourthRetro := []*clientNode.FourthRetroJson{}
 
 			err = json.Unmarshal(bridgedPeersJsonBinary, &bridged)
 			if err != nil {
@@ -208,7 +209,7 @@ var proverConfigMergeCmd = &cobra.Command{
 					p,
 				)
 			}
-			err := config.SaveConfig(args[0], primaryConfig)
+			err := nodeConfig.SaveConfig(args[0], primaryConfig)
 			if err != nil {
 				panic(err)
 			}
@@ -233,5 +234,5 @@ var fourthRetroJsonBinary []byte
 
 func init() {
 	proverConfigMergeCmd.Flags().BoolVar(&DryRun, "dry-run", false, "Evaluate seniority score without merging configs")
-	proverCmd.AddCommand(proverConfigMergeCmd)
+	ProverCmd.AddCommand(proverConfigMergeCmd)
 }

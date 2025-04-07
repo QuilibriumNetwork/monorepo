@@ -54,7 +54,7 @@ var NodeCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		NodeConfig, err = config.LoadConfig(configDirectory, "", false)
+		NodeConfig, err = LoadConfig(configDirectory)
 		if err != nil {
 			fmt.Printf("invalid config directory: %s\n", configDirectory)
 			os.Exit(1)
@@ -80,7 +80,6 @@ func init() {
 	NodeCmd.AddCommand(installCmd)
 	NodeCmd.AddCommand(updateNodeCmd)
 	NodeCmd.AddCommand(nodeServiceCmd)
-
 	localOsType, localArch, err := utils.GetSystemInfo()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

@@ -1,8 +1,9 @@
-package node
+package prover
 
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -13,11 +14,15 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	clientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	nodeConfig "source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
+
+var NodeConfig *nodeConfig.Config
 
 var proverPauseCmd = &cobra.Command{
 	Use:   "pause",
@@ -28,13 +33,23 @@ var proverPauseCmd = &cobra.Command{
 	`,
 	Run: func(cmd *cobra.Command, args []string) {
 		logger, err := zap.NewProduction()
+		if err != nil {
+			panic(err)
+		}
+
+		NodeConfig, err = clientNode.LoadConfig(ConfigDirectory)
+		if err != nil {
+			fmt.Printf("invalid config directory: %s\n", ConfigDirectory)
+			os.Exit(1)
+		}
+
 		pubsub := p2p.NewBlossomSub(NodeConfig.P2P, logger)
 		intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
 		pubsub.Subscribe(
 			append([]byte{0x00}, intrinsicFilter...),
 			func(message *pb.Message) error { return nil },
 		)
-		key, err := GetPrivKeyFromConfig(NodeConfig)
+		key, err := clientNode.GetPrivKeyFromConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}
@@ -145,5 +160,5 @@ func publishMessage(
 }
 
 func init() {
-	proverCmd.AddCommand(proverPauseCmd)
+	ProverCmd.AddCommand(proverPauseCmd)
 }
