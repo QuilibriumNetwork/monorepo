@@ -1,4 +1,4 @@
-package cmd_test
+package token_test
 
 import (
 	"encoding/hex"
@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/shopspring/decimal"
-	"source.quilibrium.com/quilibrium/monorepo/client/cmd"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/token"
 )
 
 func TestSplit(t *testing.T) {
@@ -73,12 +73,12 @@ func TestSplit(t *testing.T) {
 			amounts := [][]byte{}
 
 			if tc.expectError {
-				_, _, err = cmd.Split(tc.args[1:], amounts, payload, totalAmount.BigInt())
+				_, _, err = token.Split(tc.args[1:], amounts, payload, totalAmount.BigInt())
 				if err == nil {
 					t.Errorf("want error for invalid split, got nil")
 				}
 			} else {
-				amounts, payload, err = cmd.Split(tc.args[1:], amounts, payload, totalAmount.BigInt())
+				amounts, payload, err = token.Split(tc.args[1:], amounts, payload, totalAmount.BigInt())
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
@@ -140,7 +140,7 @@ func TestSplitParts(t *testing.T) {
 
 			amounts := [][]byte{}
 
-			amounts, payload = cmd.SplitIntoParts(amounts, payload, totalAmount.BigInt(), tc.parts)
+			amounts, payload = token.SplitIntoParts(amounts, payload, totalAmount.BigInt(), tc.parts)
 			if !reflect.DeepEqual(tc.amounts, amounts) {
 				t.Errorf("expected amounts: %v, got: %v", tc.amounts, amounts)
 			}
@@ -211,12 +211,12 @@ func TestSplitIntoPartsAmount(t *testing.T) {
 			amounts := [][]byte{}
 
 			if tc.expectError {
-				_, _, err = cmd.SplitIntoPartsAmount(amounts, payload, totalAmount.BigInt(), tc.parts, tc.partAmount)
+				_, _, err = token.SplitIntoPartsAmount(amounts, payload, totalAmount.BigInt(), tc.parts, tc.partAmount)
 				if err == nil {
 					t.Errorf("want error for invalid split, got nil")
 				}
 			} else {
-				amounts, payload, err = cmd.SplitIntoPartsAmount(amounts, payload, totalAmount.BigInt(), tc.parts, tc.partAmount)
+				amounts, payload, err = token.SplitIntoPartsAmount(amounts, payload, totalAmount.BigInt(), tc.parts, tc.partAmount)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
