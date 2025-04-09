@@ -1,0 +1,12 @@
+client/build/
+target/
+node/build/
+node/.vscode/
+.git
+.gitignore
+vdf/generated/
+bls48581/generated/
+ferret/generated/
+sidecar/generated/
+verenc/generated/
+Dockerfile*

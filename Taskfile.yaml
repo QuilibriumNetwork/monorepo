@@ -85,7 +85,7 @@ tasks:
       - docker build --platform linux/amd64 -f Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
 
   build_qclient_amd64_linux:
-    desc: Build the QClient node binary for AMD64 Linux. Outputs to node/build.
+    desc: Build the QClient node binary for AMD64 Linux. Outputs to client/build.
     cmds:
       - docker build --platform linux/amd64 -f Dockerfile.source --output client/build/amd64_linux --target=qclient .
 
