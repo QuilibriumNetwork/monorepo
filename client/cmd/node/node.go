@@ -56,18 +56,7 @@ var NodeCmd = &cobra.Command{
 		NodeUser = userLookup
 	},
 	Run: func(cmd *cobra.Command, args []string) {
-		// These commands handle their own configuration
-		_, err := os.Stat(configDirectory)
-		if os.IsNotExist(err) {
-			fmt.Printf("config directory doesn't exist: %s\n", configDirectory)
-			os.Exit(1)
-		}
 
-		NodeConfig, err = LoadConfig(configDirectory)
-		if err != nil {
-			fmt.Printf("invalid config directory: %s\n", configDirectory)
-			os.Exit(1)
-		}
 	},
 }
 
