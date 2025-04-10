@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"os"
+	"os/user"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
@@ -15,19 +16,15 @@ var (
 
 	// Default symlink path for the node binary
 	defaultSymlinkPath = "/usr/local/bin/quilibrium-node"
-
-	// Default installation directory base path
-	installPath = "/opt/quilibrium"
-
-	// Default data directory paths
-	dataPath = "/var/lib/quilibrium"
-
-	logPath = "/var/log/quilibrium"
+	logPath            = "/var/log/quilibrium"
 
 	// Default user to run the node
 	nodeUser = "quilibrium"
 
-	serviceName = "quilibrium-node"
+	ServiceName = "quilibrium-node"
+
+	ConfigDirs      = "/home/quilibrium/configs"
+	NodeConfigToRun = "/home/quilibrium/configs/default"
 
 	// Default config file name
 	defaultConfigFileName = "node.yaml"
@@ -37,8 +34,7 @@ var (
 
 	configDirectory string
 	NodeConfig      *config.Config
-	publicRPC       bool = false
-	LightNode       bool = false
+	NodeUser        *user.User
 )
 
 // NodeCmd represents the node command
@@ -46,6 +42,19 @@ var NodeCmd = &cobra.Command{
 	Use:   "node",
 	Short: "Quilibrium node commands",
 	Long:  `Run Quilibrium node commands.`,
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		var userLookup *user.User
+		var err error
+		userLookup, err = user.Lookup(nodeUser)
+		if err != nil {
+			userLookup, err = InstallQuilibriumUser()
+			if err != nil {
+				fmt.Printf("error installing quilibrium user: %s\n", err)
+				os.Exit(1)
+			}
+		}
+		NodeUser = userLookup
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		// These commands handle their own configuration
 		_, err := os.Stat(configDirectory)
@@ -59,22 +68,11 @@ var NodeCmd = &cobra.Command{
 			fmt.Printf("invalid config directory: %s\n", configDirectory)
 			os.Exit(1)
 		}
-
-		if publicRPC {
-			fmt.Println("Public RPC enabled, using light node")
-			LightNode = true
-		}
-
-		if !LightNode && NodeConfig.ListenGRPCMultiaddr == "" {
-			fmt.Println("No ListenGRPCMultiaddr found in config, using light node")
-			LightNode = true
-		}
 	},
 }
 
 func init() {
 	NodeCmd.PersistentFlags().StringVar(&configDirectory, "config", ".config", "config directory (default is .config/)")
-	NodeCmd.PersistentFlags().BoolVar(&publicRPC, "public-rpc", false, "Use public RPC for node operations")
 
 	// Add subcommands
 	NodeCmd.AddCommand(installCmd)

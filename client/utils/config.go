@@ -8,25 +8,34 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-var ClientConfigDir = filepath.Join("/etc/quilibrium/", "config")
-var ClientConfigFile = string(ReleaseTypeQClient) + ".yaml"
+var ClientConfigDir = filepath.Join(os.Getenv("HOME"), ".quilibrium")
+var ClientConfigFile = string(ReleaseTypeQClient) + "-config.yaml"
 var ClientConfigPath = filepath.Join(ClientConfigDir, ClientConfigFile)
 
-// var clientConfig = &ClientConfig{}
-
 func CreateDefaultConfig() {
-	fmt.Printf("Creating default config: %s\n", ClientConfigPath)
+	configPath := GetConfigPath()
+
+	fmt.Printf("Creating default config: %s\n", configPath)
 	SaveClientConfig(&ClientConfig{
 		DataDir:        ClientDataPath,
 		SymlinkPath:    DefaultQClientSymlinkPath,
 		SignatureCheck: true,
 	})
+
+	sudoUser, err := GetCurrentSudoUser()
+	if err != nil {
+		fmt.Println("Error getting current sudo user")
+		os.Exit(1)
+	}
+	ChownPath(GetUserQuilibriumDir(), sudoUser, true)
 }
 
 // LoadClientConfig loads the client configuration from the config file
 func LoadClientConfig() (*ClientConfig, error) {
+	configPath := GetConfigPath()
+
 	// Create default config if it doesn't exist
-	if _, err := os.Stat(ClientConfigPath); os.IsNotExist(err) {
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		config := &ClientConfig{
 			DataDir:        ClientDataPath,
 			SymlinkPath:    filepath.Join(ClientDataPath, "current"),
@@ -39,7 +48,7 @@ func LoadClientConfig() (*ClientConfig, error) {
 	}
 
 	// Read existing config
-	data, err := os.ReadFile(ClientConfigPath)
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, err
 	}
@@ -60,16 +69,20 @@ func SaveClientConfig(config *ClientConfig) error {
 	}
 
 	// Ensure the config directory exists
-	if err := os.MkdirAll(ClientConfigDir, 0755); err != nil {
+	if err := os.MkdirAll(GetConfigDir(), 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	return os.WriteFile(ClientConfigPath, data, 0644)
+	return os.WriteFile(GetConfigPath(), data, 0644)
 }
 
 // GetConfigPath returns the path to the client configuration file
 func GetConfigPath() string {
-	return ClientConfigPath
+	return filepath.Join(GetConfigDir(), ClientConfigFile)
+}
+
+func GetConfigDir() string {
+	return filepath.Join(GetUserQuilibriumDir())
 }
 
 // IsClientConfigured checks if the client is configured

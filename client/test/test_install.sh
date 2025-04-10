@@ -20,6 +20,19 @@ else
     exit 1
 fi
 
+# Test: Link the qclient binary to the system PATH
+echo "Testing qclient link command..."
+run_test_with_format "sudo /opt/quilibrium/bin/qclient link"
+
+# Verify qclient is now in PATH
+echo "Verifying qclient is in PATH after link command..."
+run_test_with_format "which qclient" | grep -q "/usr/local/bin/qclient" && echo "SUCCESS: qclient found in PATH" || echo "FAILURE: qclient not found in PATH"
+
+# Test qclient can be executed directly
+echo "Testing qclient can be executed directly..."
+run_test_with_format "qclient --help" | grep -q "Usage:" && echo "SUCCESS: qclient executable works" || echo "FAILURE: qclient executable not working properly"
+
+
 # Test: Ensure no config file exists initially
 echo "Testing no config file exists initially..."
 run_test_with_format "test ! -f /etc/quilibrium/config/qclient.yaml"

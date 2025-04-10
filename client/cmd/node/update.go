@@ -44,21 +44,14 @@ func init() {
 // updateNode handles the node update process
 func updateNode(version string) {
 	// Check if we need sudo privileges
-	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Updating node at %s requires root privileges", installPath)); err != nil {
+	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Updating node at %s requires root privileges", utils.NodeDataPath)); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
 
-	// Create version-specific installation directory
-	versionDir := filepath.Join(installPath, "node", version)
-	if err := os.MkdirAll(versionDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating installation directory: %v\n", err)
-		return
-	}
-
-	// Create data directory
-	versionDataDir := filepath.Join(dataPath, "node", version)
-	if err := os.MkdirAll(versionDataDir, 0755); err != nil {
+	// Create new binary version directory
+	versionDataDir := filepath.Join(utils.NodeDataPath, version)
+	if err := utils.ValidateAndCreateDir(versionDataDir, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating data directory: %v\n", err)
 		return
 	}
@@ -66,16 +59,18 @@ func updateNode(version string) {
 	// Construct the expected filename for the specified version
 	// Remove 'v' prefix if present for filename construction
 	versionWithoutV := strings.TrimPrefix(version, "v")
-	fileName := fmt.Sprintf("node-%s-%s-%s", versionWithoutV, osType, arch)
+
+	if IsExistingNodeVersion(versionWithoutV) {
+		fmt.Fprintf(os.Stderr, "Error: Node version %s already exists\n", versionWithoutV)
+		os.Exit(1)
+	}
 
 	// Download the release directly
-	nodeBinaryPath := filepath.Join(dataPath, version, fileName)
 	err := utils.DownloadRelease(utils.ReleaseTypeNode, versionWithoutV)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error downloading version %s: %v\n", version, err)
 		fmt.Fprintf(os.Stderr, "The specified version %s does not exist for %s-%s\n", version, osType, arch)
 		// Clean up the created directories since installation failed
-		os.RemoveAll(versionDir)
 		os.RemoveAll(versionDataDir)
 		return
 	}
@@ -92,5 +87,5 @@ func updateNode(version string) {
 	}
 
 	// Successfully downloaded the specific version
-	finishInstallation(nodeBinaryPath, version)
+	finishInstallation(version)
 }

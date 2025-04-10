@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 )
@@ -15,9 +17,10 @@ import (
 var DefaultNodeUser = "quilibrium"
 
 var ClientInstallPath = filepath.Join("/opt/quilibrium/", string(ReleaseTypeQClient))
-var DataPath = filepath.Join("/var/quilibrium/", "data")
-var ClientDataPath = filepath.Join(DataPath, string(ReleaseTypeQClient))
-var NodeDataPath = filepath.Join(DataPath, string(ReleaseTypeNode))
+var RootQuilibriumPath = filepath.Join("/var/quilibrium/")
+var BinaryPath = filepath.Join(RootQuilibriumPath, "bin")
+var ClientDataPath = filepath.Join(BinaryPath, string(ReleaseTypeQClient))
+var NodeDataPath = filepath.Join(BinaryPath, string(ReleaseTypeNode))
 var DefaultSymlinkDir = "/usr/local/bin"
 var DefaultNodeSymlinkPath = filepath.Join(DefaultSymlinkDir, string(ReleaseTypeNode))
 var DefaultQClientSymlinkPath = filepath.Join(DefaultSymlinkDir, string(ReleaseTypeQClient))
@@ -68,6 +71,8 @@ func CreateSymlink(execPath, targetPath string) error {
 		}
 	}
 
+	fmt.Printf("Creating symlink %s -> %s\n", targetPath, execPath)
+
 	// Create the symlink
 	if err := os.Symlink(execPath, targetPath); err != nil {
 		return fmt.Errorf("failed to create symlink: %w", err)
@@ -77,7 +82,7 @@ func CreateSymlink(execPath, targetPath string) error {
 }
 
 // ValidateAndCreateDir validates a directory path and creates it if it doesn't exist
-func ValidateAndCreateDir(path string) error {
+func ValidateAndCreateDir(path string, user *user.User) error {
 	// Check if the directory exists
 	info, err := os.Stat(path)
 	if err == nil {
@@ -90,8 +95,12 @@ func ValidateAndCreateDir(path string) error {
 
 	// Directory doesn't exist, try to create it
 	if os.IsNotExist(err) {
+		fmt.Printf("Creating directory %s\n", path)
 		if err := os.MkdirAll(path, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %v", path, err)
+		}
+		if user != nil {
+			ChownPath(path, user, false)
 		}
 		return nil
 	}
@@ -134,4 +143,98 @@ func CanCreateAndWrite(dir string) bool {
 func FileExists(path string) bool {
 	_, err := os.Stat(path)
 	return !os.IsNotExist(err)
+}
+
+func IsSudo() bool {
+	user, err := user.Current()
+	if err != nil {
+		return false
+	}
+	return user.Username == "root"
+}
+
+// ChownPath changes the owner of a file or directory to the specified user
+func ChownPath(path string, user *user.User, isRecursive bool) error {
+	// Change ownership of the path
+	if isRecursive {
+		fmt.Printf("Changing ownership of %s (recursive) to %s\n", path, user.Username)
+		if err := exec.Command("chown", "-R", user.Uid+":"+user.Gid, path).Run(); err != nil {
+			return fmt.Errorf("failed to change ownership of %s to %s (requires sudo): %v", path, user.Uid, err)
+		}
+	} else {
+		fmt.Printf("Changing ownership of %s to %s\n", path, user.Username)
+		if err := exec.Command("chown", user.Uid+":"+user.Gid, path).Run(); err != nil {
+			return fmt.Errorf("failed to change ownership of %s to %s (requires sudo): %v", path, user.Uid, err)
+		}
+	}
+
+	return nil
+}
+
+func ChmodPath(path string, mode os.FileMode, description string) error {
+	fmt.Printf("Changing path: %s to %s (%s)\n", path, mode, description)
+	return os.Chmod(path, mode)
+}
+
+func WriteFile(path string, content string) error {
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
+// WriteFileAuto writes content to a file, automatically using sudo only if necessary
+func WriteFileAuto(path string, content string) error {
+	// First check if file exists and is writable
+	if FileExists(path) {
+		// Try to open the file for writing to check permissions
+		file, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err == nil {
+			// File is writable, close it and write normally
+			file.Close()
+			fmt.Printf("Writing to file %s using normal permissions\n", path)
+			return os.WriteFile(path, []byte(content), 0644)
+		}
+	} else {
+		// Check if parent directory is writable
+		dir := filepath.Dir(path)
+		if IsWritable(dir) {
+			fmt.Printf("Writing to file %s using normal permissions\n", path)
+			return os.WriteFile(path, []byte(content), 0644)
+		}
+	}
+
+	// If we reach here, sudo is needed
+	fmt.Printf("Writing to file %s using sudo\n", path)
+	cmd := exec.Command("sudo", "tee", path)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to get stdin pipe: %w", err)
+	}
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start sudo command: %w", err)
+	}
+
+	// Write content to stdin
+	if _, err := io.WriteString(stdin, content); err != nil {
+		return fmt.Errorf("failed to write to stdin: %w", err)
+	}
+	stdin.Close()
+
+	// Wait for the command to finish
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("sudo tee command failed: %w", err)
+	}
+
+	return nil
+}
+
+// CopyFile copies a file from src to dst
+func CopyFile(src, dst string) error {
+	fmt.Printf("Copying file from %s to %s\n", src, dst)
+	sourceData, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(dst, sourceData, 0600)
 }

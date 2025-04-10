@@ -1,0 +1,3 @@
+dataDir: /var/quilibrium/data/qclient
+symlinkPath: /usr/local/bin/qclient
+signatureCheck: true

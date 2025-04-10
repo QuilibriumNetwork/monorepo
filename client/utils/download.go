@@ -53,7 +53,7 @@ func GetLatestVersion(releaseType ReleaseType) (string, error) {
 // DownloadReleaseFile downloads a release file from the Quilibrium releases server
 func DownloadReleaseFile(releaseType ReleaseType, fileName string, version string, showError bool) error {
 	url := fmt.Sprintf("%s/%s", BaseReleaseURL, fileName)
-	destDir := filepath.Join(DataPath, string(releaseType), version)
+	destDir := filepath.Join(BinaryPath, string(releaseType), version)
 	os.MkdirAll(destDir, 0755)
 	destPath := filepath.Join(destDir, fileName)
 
@@ -109,11 +109,13 @@ func DownloadReleaseSignatures(releaseType ReleaseType, version string) error {
 			// Skip this file if it doesn't exist on the server
 			fmt.Printf("Signature file %s not found on server, skipping\n", sigFile)
 			continue
+		} else {
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+			fmt.Printf("Signature file %s found on server, adding to download list\n", sigFile)
+			files = append(files, fmt.Sprintf("%s.dgst.sig.%d", baseName, num))
 		}
-		if resp != nil && resp.Body != nil {
-			resp.Body.Close()
-		}
-		files = append(files, fmt.Sprintf("%s.dgst.sig.%d", baseName, num))
 	}
 
 	if len(files) == 0 {

@@ -41,7 +41,7 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 			return
 		}
 
-		if !utils.FileExists(utils.ClientConfigPath) {
+		if !utils.FileExists(utils.GetConfigPath()) {
 			fmt.Println("Client config not found, creating default config")
 			utils.CreateDefaultConfig()
 		}
@@ -85,9 +85,8 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 				// Fall back to checking next to executable
 				digest, err = os.ReadFile(ex + ".dgst")
 				if err != nil {
+					fmt.Println("")
 					fmt.Println("The digest file was not found. Do you want to continue without signature verification? (y/n)")
-					fmt.Println("The signature files (if they exist)can be downloaded with the 'qclient download-signatures' command")
-					fmt.Println("You can also use --signature-check=false in your command to skip this prompt")
 
 					reader := bufio.NewReader(os.Stdin)
 					response, _ := reader.ReadString('\n')
@@ -95,10 +94,19 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 
 					if response != "y" && response != "yes" {
 						fmt.Println("Exiting due to missing digest file")
+						fmt.Println("The signature files (if they exist) can be downloaded with the 'qclient download-signatures' command")
+						fmt.Println("You can also skip this prompt manually by using the --signature-check=false flag or to permanently disable signature checks running 'qclient config signature-check false'")
+
 						os.Exit(1)
+					}
+					// Check if the user is trying to run the config command to disable/enable signature checks
+					if len(os.Args) >= 3 && os.Args[1] == "config" && os.Args[2] != "signature-check" {
+						fmt.Println("The signature files (if they exist) can be downloaded with the 'qclient download-signatures' command")
+						fmt.Println("You can also skip this prompt manually by using the --signature-check=false flag or to permanently disable signature checks running 'qclient config signature-check false'")
 					}
 
 					fmt.Println("Continuing without signature verification")
+
 					signatureCheck = false
 				}
 			}
@@ -185,17 +193,32 @@ func signatureCheckDefault() bool {
 
 func init() {
 	rootCmd.PersistentFlags().BoolVar(
-		&DryRun,
-		"dry-run",
-		false,
-		"runs the command (if applicable) without actually mutating state (printing effect output)",
-	)
-	rootCmd.PersistentFlags().BoolVar(
 		&signatureCheck,
 		"signature-check",
 		signatureCheckDefault(),
 		"bypass signature check (not recommended for binaries) (default true or value of QUILIBRIUM_SIGNATURE_CHECK env var)",
 	)
+
+	rootCmd.PersistentFlags().BoolP(
+		"yes",
+		"y",
+		false,
+		"auto-approve and bypass signature check (sets signature-check=false)",
+	)
+
+	// Store original PersistentPreRun
+	originalPersistentPreRun := rootCmd.PersistentPreRun
+
+	// Override PersistentPreRun to check for -y flag first
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		// Check if -y flag is set and update signatureCheck
+		if yes, _ := cmd.Flags().GetBool("yes"); yes {
+			signatureCheck = false
+		}
+
+		// Call the original PersistentPreRun
+		originalPersistentPreRun(cmd, args)
+	}
 
 	// Add the node command
 	rootCmd.AddCommand(node.NodeCmd)

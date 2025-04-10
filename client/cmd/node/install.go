@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
@@ -35,17 +36,15 @@ Examples:
 			return
 		}
 
+		if !utils.IsSudo() {
+			fmt.Println("This command must be run with sudo: sudo qclient node install")
+			os.Exit(1)
+		}
+
 		// Determine version to install
 		version := determineVersion(args)
 
 		fmt.Fprintf(os.Stdout, "Installing Quilibrium node for %s-%s, version: %s\n", osType, arch, version)
-
-		// Check if we need to create a dedicated user (opt-out)
-
-		if err := createNodeUser(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating user: %v\n", err)
-			fmt.Fprintf(os.Stdout, "Continuing with installation as current user...\n")
-		}
 
 		// Install the node
 		installNode(version)
@@ -60,14 +59,8 @@ func init() {
 // installNode installs the Quilibrium node
 func installNode(version string) {
 	// Create installation directory
-	if err := utils.ValidateAndCreateDir(installPath); err != nil {
+	if err := utils.ValidateAndCreateDir(utils.NodeDataPath, NodeUser); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating installation directory: %v\n", err)
-		return
-	}
-
-	// Create data directory
-	if err := utils.ValidateAndCreateDir(dataPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating data directory: %v\n", err)
 		return
 	}
 
@@ -80,7 +73,12 @@ func installNode(version string) {
 		}
 
 		version = latestVersion
-		fmt.Fprintf(os.Stdout, "Installing latest version: %s\n", version)
+		fmt.Fprintf(os.Stdout, "Found latest version: %s\n", version)
+	}
+
+	if IsExistingNodeVersion(version) {
+		fmt.Fprintf(os.Stderr, "Error: Node version %s already exists\n", version)
+		os.Exit(1)
 	}
 
 	if err := installByVersion(version); err != nil {
@@ -88,16 +86,20 @@ func installNode(version string) {
 		os.Exit(1)
 	}
 
-	// Finish installation
-	nodeBinaryPath := filepath.Join(installPath, string(utils.ReleaseTypeNode), version)
-	finishInstallation(nodeBinaryPath, version)
+	createService()
+
+	finishInstallation(version)
 }
 
 // installByVersion installs a specific version of the Quilibrium node
 func installByVersion(version string) error {
 	// Create version-specific directory
-	versionDir := filepath.Join(installPath, version)
-	if err := utils.ValidateAndCreateDir(versionDir); err != nil {
+	user, err := user.Lookup(utils.DefaultNodeUser)
+	if err != nil {
+		os.Exit(1)
+	}
+	versionDir := filepath.Join(utils.NodeDataPath, version)
+	if err := utils.ValidateAndCreateDir(versionDir, user); err != nil {
 		return fmt.Errorf("failed to create version directory: %w", err)
 	}
 

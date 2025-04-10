@@ -146,6 +146,15 @@ sudo task build_qclient_arm64_linux
 # for mac, you will need to build on a mac
 ```
 
+## Run a test container
+
+```
+sudo docker run -it \
+   -v "/home/user/ceremonyclient/client/test/:/app" \ 
+   -v "/home/user/ceremenoyclient/client/build/amd64_linux/qclient:/opt/quilibrium/bin/qclient" \
+   quil-test /bin/bash
+
+
 This command builds the Docker image with the qclient binary according to the specifications in `Dockerfile.source`. The resulting image will be tagged as `qclient`.
 
 ## Contributing
