@@ -3,8 +3,6 @@ package node
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
@@ -30,6 +28,23 @@ Examples:
 		// Determine version to install
 		version := determineVersion(args)
 
+		// Download and install the node
+		if version == "latest" {
+			latestVersion, err := utils.GetLatestVersion(utils.ReleaseTypeNode)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting latest version: %v\n", err)
+				return
+			}
+
+			version = latestVersion
+			fmt.Fprintf(os.Stdout, "Found latest version: %s\n", version)
+		}
+
+		if IsExistingNodeVersion(version) {
+			fmt.Fprintf(os.Stderr, "Error: Node version %s already exists\n", version)
+			os.Exit(1)
+		}
+
 		fmt.Fprintf(os.Stdout, "Updating Quilibrium node for %s-%s, version: %s\n", OsType, Arch, version)
 
 		// Update the node
@@ -49,43 +64,5 @@ func updateNode(version string) {
 		return
 	}
 
-	// Create new binary version directory
-	versionDataDir := filepath.Join(utils.NodeDataPath, version)
-	if err := utils.ValidateAndCreateDir(versionDataDir, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating data directory: %v\n", err)
-		return
-	}
-
-	// Construct the expected filename for the specified version
-	// Remove 'v' prefix if present for filename construction
-	versionWithoutV := strings.TrimPrefix(version, "v")
-
-	if IsExistingNodeVersion(versionWithoutV) {
-		fmt.Fprintf(os.Stderr, "Error: Node version %s already exists\n", versionWithoutV)
-		os.Exit(1)
-	}
-
-	// Download the release directly
-	err := utils.DownloadRelease(utils.ReleaseTypeNode, versionWithoutV)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error downloading version %s: %v\n", version, err)
-		fmt.Fprintf(os.Stderr, "The specified version %s does not exist for %s-%s\n", version, OsType, Arch)
-		// Clean up the created directories since installation failed
-		os.RemoveAll(versionDataDir)
-		return
-	}
-
-	// Download signature files
-	if err := utils.DownloadReleaseSignatures(utils.ReleaseTypeNode, versionWithoutV); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: Failed to download signature files: %v\n", err)
-		fmt.Fprintf(os.Stdout, "Continuing with installation...\n")
-	}
-
-	// Ensure log rotation is set up
-	if err := setupLogRotation(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: Failed to set up log rotation: %v\n", err)
-	}
-
-	// Successfully downloaded the specific version
-	finishInstallation(version)
+	InstallNode(version)
 }

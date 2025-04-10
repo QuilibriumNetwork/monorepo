@@ -10,8 +10,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
 
-var setDefault bool
-
 var createCmd = &cobra.Command{
 	Use:   "create [name]",
 	Short: "Create a default configuration file set for a node",
@@ -87,7 +85,7 @@ The third example will create a new configuration at %s/myconfig and symlink it 
 			os.Exit(1)
 		}
 
-		if setDefault {
+		if SetDefault {
 			// Create the symlink
 			if err := utils.CreateSymlink(configDir, NodeConfigToRun); err != nil {
 				fmt.Printf("Failed to create symlink: %s\n", err)
@@ -100,8 +98,4 @@ The third example will create a new configuration at %s/myconfig and symlink it 
 		}
 		fmt.Println("The keys.yml file will only contain 'null:' until the node is started.")
 	},
-}
-
-func init() {
-	createCmd.Flags().BoolVarP(&setDefault, "default", "d", false, "Select this config as the default")
 }

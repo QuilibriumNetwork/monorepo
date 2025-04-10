@@ -72,11 +72,13 @@ var versionCmd = &cobra.Command{
 			return
 		}
 
-		fmt.Printf("qclient %s\n", info.Version)
+		fmt.Printf("%s\n", info.Version)
 
-		if info.SHA256 != "" && info.MD5 != "" {
-			fmt.Printf("SHA256: %s\n", info.SHA256)
-			fmt.Printf("MD5: %s\n", info.MD5)
+		if showChecksum {
+			if info.SHA256 != "" && info.MD5 != "" {
+				fmt.Printf("SHA256: %s\n", info.SHA256)
+				fmt.Printf("MD5: %s\n", info.MD5)
+			}
 		}
 	},
 }

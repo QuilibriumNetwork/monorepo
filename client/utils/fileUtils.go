@@ -13,9 +13,6 @@ import (
 	"runtime"
 )
 
-// DefaultNodeUser is the default user name for node operations
-var DefaultNodeUser = "quilibrium"
-
 var ClientInstallPath = filepath.Join("/opt/quilibrium/", string(ReleaseTypeQClient))
 var RootQuilibriumPath = filepath.Join("/var/quilibrium/")
 var BinaryPath = filepath.Join(RootQuilibriumPath, "bin")

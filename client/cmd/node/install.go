@@ -10,7 +10,7 @@ import (
 )
 
 // installCmd represents the command to install the Quilibrium node
-var installCmd = &cobra.Command{
+var InstallCmd = &cobra.Command{
 	Use:   "install [version]",
 	Short: "Install Quilibrium node",
 	Long: `Install Quilibrium node binary and create a service to run it.
@@ -136,17 +136,12 @@ Examples:
 		fmt.Fprintf(os.Stdout, "Installing Quilibrium node for %s-%s, version: %s\n", osType, arch, version)
 
 		// Install the node
-		installNode(version)
+		InstallNode(version)
 	},
 }
 
-func init() {
-	// Add the install command to the node command
-	NodeCmd.AddCommand(installCmd)
-}
-
 // installNode installs the Quilibrium node
-func installNode(version string) {
+func InstallNode(version string) {
 	// Create installation directory
 	if err := utils.ValidateAndCreateDir(utils.NodeDataPath, NodeUser); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating installation directory: %v\n", err)
@@ -158,7 +153,7 @@ func installNode(version string) {
 		os.Exit(1)
 	}
 
-	if err := installByVersion(version); err != nil {
+	if err := InstallByVersion(version); err != nil {
 		fmt.Fprintf(os.Stderr, "Error installing specific version: %v\n", err)
 		os.Exit(1)
 	}
@@ -169,7 +164,7 @@ func installNode(version string) {
 }
 
 // installByVersion installs a specific version of the Quilibrium node
-func installByVersion(version string) error {
+func InstallByVersion(version string) error {
 
 	versionDir := filepath.Join(utils.NodeDataPath, version)
 	if err := utils.ValidateAndCreateDir(versionDir, NodeUser); err != nil {

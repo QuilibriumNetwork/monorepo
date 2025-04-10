@@ -14,6 +14,7 @@ var (
 	NodeUser        *user.User
 	ConfigDirs      string
 	NodeConfigToRun string
+	SetDefault      bool
 )
 
 // ConfigCmd represents the node config command
@@ -47,7 +48,12 @@ This command provides utilities for configuring your Quilibrium node, such as:
 }
 
 func init() {
+	importCmd.Flags().BoolVarP(&SetDefault, "default", "d", false, "Select this config as the default")
 	ConfigCmd.AddCommand(importCmd)
+
 	ConfigCmd.AddCommand(SwitchConfigCmd)
+
+	createCmd.Flags().BoolVarP(&SetDefault, "default", "d", false, "Select this config as the default")
 	ConfigCmd.AddCommand(createCmd)
+	ConfigCmd.AddCommand(setCmd)
 }

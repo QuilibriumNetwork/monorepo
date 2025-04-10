@@ -80,7 +80,3 @@ Example:
 		fmt.Printf("Successfully updated %s to %s in %s\n", key, value, configFile)
 	},
 }
-
-func init() {
-	ConfigCmd.AddCommand(setCmd)
-}

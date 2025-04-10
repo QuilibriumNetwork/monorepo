@@ -59,6 +59,20 @@ This will copy config.yml and keys.yml from /path/to/source to /home/quilibrium/
 			os.Exit(1)
 		}
 
-		fmt.Printf("Successfully imported config files to %s\n", targetDir)
+		if SetDefault {
+			// Create the symlink
+			if err := utils.CreateSymlink(targetDir, NodeConfigToRun); err != nil {
+				fmt.Printf("Failed to create symlink: %s\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Successfully imported config files to %s and symlinked to default\n", name)
+		} else {
+			fmt.Printf("Successfully imported config files to %s\n", targetDir)
+		}
 	},
+}
+
+func init() {
+
 }

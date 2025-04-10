@@ -66,7 +66,7 @@ func init() {
 	NodeCmd.PersistentFlags().StringVar(&configDirectory, "config", ".config", "config directory (default is .config/)")
 
 	// Add subcommands
-	NodeCmd.AddCommand(installCmd)
+	NodeCmd.AddCommand(InstallCmd)
 	NodeCmd.AddCommand(clientNodeConfig.ConfigCmd)
 	NodeCmd.AddCommand(updateNodeCmd)
 	NodeCmd.AddCommand(nodeServiceCmd)
