@@ -26,7 +26,8 @@ case "$os_type" in
         fi
         ;;
     "Linux")
-        go build -ldflags "-linkmode 'external' -extldflags '-L$BINARIES_DIR -Wl,-Bstatic -lvdf -lbls48581 -lverenc -Wl,-Bdynamic -lstdc++ -ldl -lm -lflint -lgmp -lmpfr'" "$@"
+        export CGO_LDFLAGS="-L/usr/local/lib -lflint -lgmp -lmpfr -ldl -lm -L$BINARIES_DIR -lvdf -lverenc -lbls48581 -static"
+        go build -ldflags "-linkmode 'external'" "$@"
         ;;
     *)
         echo "Unsupported platform"
