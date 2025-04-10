@@ -8,7 +8,7 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/spf13/cobra"
-	qclientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
+	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -33,8 +33,8 @@ var mergeCmd = &cobra.Command{
 		defer conn.Close()
 
 		client := protobufs.NewNodeServiceClient(conn)
-		peerId := qclientNode.GetPeerIDFromConfig(NodeConfig)
-		privKey, err := qclientNode.GetPrivKeyFromConfig(NodeConfig)
+		peerId := utils.GetPeerIDFromConfig(NodeConfig)
+		privKey, err := utils.GetPrivKeyFromConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}

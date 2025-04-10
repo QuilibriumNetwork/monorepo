@@ -14,7 +14,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
-	clientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
+	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	nodeConfig "source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
@@ -37,7 +37,7 @@ var proverPauseCmd = &cobra.Command{
 			panic(err)
 		}
 
-		NodeConfig, err = clientNode.LoadConfig(ConfigDirectory)
+		NodeConfig, err = utils.LoadNodeConfig(ConfigDirectory)
 		if err != nil {
 			fmt.Printf("invalid config directory: %s\n", ConfigDirectory)
 			os.Exit(1)
@@ -49,7 +49,7 @@ var proverPauseCmd = &cobra.Command{
 			append([]byte{0x00}, intrinsicFilter...),
 			func(message *pb.Message) error { return nil },
 		)
-		key, err := clientNode.GetPrivKeyFromConfig(NodeConfig)
+		key, err := utils.GetPrivKeyFromConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}

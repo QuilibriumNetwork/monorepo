@@ -2,7 +2,6 @@ package prover
 
 import (
 	"github.com/spf13/cobra"
-	clientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 )
 
 var ConfigDirectory string
@@ -17,5 +16,4 @@ func init() {
 	ProverCmd.PersistentFlags().StringVar(&ConfigDirectory, "config", ".config", "config directory (default is .config/)")
 	ProverCmd.AddCommand(proverPauseCmd)
 	ProverCmd.AddCommand(proverConfigMergeCmd)
-	clientNode.NodeCmd.AddCommand(ProverCmd)
 }

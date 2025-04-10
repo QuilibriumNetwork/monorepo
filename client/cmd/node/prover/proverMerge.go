@@ -10,7 +10,7 @@ import (
 
 	"github.com/shopspring/decimal"
 	"github.com/spf13/cobra"
-	clientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
+	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 	nodeConfig "source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
@@ -38,7 +38,7 @@ var proverConfigMergeCmd = &cobra.Command{
 		}
 
 		otherPaths := []string{}
-		peerIds := []string{clientNode.GetPeerIDFromConfig(primaryConfig).String()}
+		peerIds := []string{utils.GetPeerIDFromConfig(primaryConfig).String()}
 		for _, p := range args[1:] {
 			if !path.IsAbs(p) {
 				fmt.Printf("%s is not an absolute path\n", p)
@@ -49,17 +49,17 @@ var proverConfigMergeCmd = &cobra.Command{
 				os.Exit(1)
 			}
 
-			peerId := clientNode.GetPeerIDFromConfig(cfg).String()
+			peerId := utils.GetPeerIDFromConfig(cfg).String()
 			peerIds = append(peerIds, peerId)
 			otherPaths = append(otherPaths, p)
 		}
 
 		if DryRun {
-			bridged := []*clientNode.BridgedPeerJson{}
-			firstRetro := []*clientNode.FirstRetroJson{}
-			secondRetro := []*clientNode.SecondRetroJson{}
-			thirdRetro := []*clientNode.ThirdRetroJson{}
-			fourthRetro := []*clientNode.FourthRetroJson{}
+			bridged := []*utils.BridgedPeerJson{}
+			firstRetro := []*utils.FirstRetroJson{}
+			secondRetro := []*utils.SecondRetroJson{}
+			thirdRetro := []*utils.ThirdRetroJson{}
+			fourthRetro := []*utils.FourthRetroJson{}
 
 			err = json.Unmarshal(bridgedPeersJsonBinary, &bridged)
 			if err != nil {

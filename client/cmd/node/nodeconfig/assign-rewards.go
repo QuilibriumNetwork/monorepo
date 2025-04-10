@@ -1,4 +1,4 @@
-package config
+package nodeconfig
 
 // TODO: Implement a command to assign a config's rewards to a config's rewards address
 // Should be able to assign to a specific address or by name of a config directory

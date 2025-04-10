@@ -7,7 +7,8 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	clientNodeConfig "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/config"
+	configCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/nodeconfig"
+	proverCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/prover"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
@@ -67,10 +68,10 @@ func init() {
 
 	// Add subcommands
 	NodeCmd.AddCommand(InstallCmd)
-	NodeCmd.AddCommand(clientNodeConfig.ConfigCmd)
+	NodeCmd.AddCommand(configCmd.ConfigCmd)
 	NodeCmd.AddCommand(updateNodeCmd)
 	NodeCmd.AddCommand(nodeServiceCmd)
-
+	NodeCmd.AddCommand(proverCmd.ProverCmd)
 	localOsType, localArch, err := utils.GetSystemInfo()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

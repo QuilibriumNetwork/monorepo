@@ -5,14 +5,14 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/spf13/cobra"
-	qclientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
+	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
 
 var accountCmd = &cobra.Command{
 	Use:   "account",
 	Short: "Shows the account address of the managing account",
 	Run: func(cmd *cobra.Command, args []string) {
-		peerId := qclientNode.GetPeerIDFromConfig(NodeConfig)
+		peerId := utils.GetPeerIDFromConfig(NodeConfig)
 		addr, err := poseidon.HashBytes([]byte(peerId))
 		if err != nil {
 			panic(err)

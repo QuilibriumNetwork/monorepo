@@ -77,7 +77,7 @@ func installService() {
 		installMacOSService()
 	} else if OsType == "linux" {
 		// systemd is not installed on linux by default, so we need to check for it
-		if !CheckForSystemd() {
+		if !utils.CheckForSystemd() {
 			// install systemd if not found
 			installSystemd()
 		}
@@ -327,7 +327,7 @@ func createService() {
 
 // createSystemdServiceFile creates the systemd service file with environment file support
 func createSystemdServiceFile() error {
-	if !CheckForSystemd() {
+	if !utils.CheckForSystemd() {
 		installSystemd()
 	}
 

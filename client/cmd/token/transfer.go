@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	qclientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
+	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
@@ -30,7 +30,7 @@ OfCoin – the address of the coin to send in whole`,
 		defer conn.Close()
 
 		client := protobufs.NewNodeServiceClient(conn)
-		privKey, err := qclientNode.GetPrivKeyFromConfig(NodeConfig)
+		privKey, err := utils.GetPrivKeyFromConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}

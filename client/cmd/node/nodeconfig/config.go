@@ -1,4 +1,4 @@
-package config
+package nodeconfig
 
 import (
 	"fmt"
@@ -56,4 +56,5 @@ func init() {
 	createCmd.Flags().BoolVarP(&SetDefault, "default", "d", false, "Select this config as the default")
 	ConfigCmd.AddCommand(createCmd)
 	ConfigCmd.AddCommand(setCmd)
+
 }

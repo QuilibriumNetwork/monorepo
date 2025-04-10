@@ -148,7 +148,7 @@ func InstallNode(version string) {
 		return
 	}
 
-	if IsExistingNodeVersion(version) {
+	if utils.IsExistingNodeVersion(version) {
 		fmt.Fprintf(os.Stderr, "Error: Node version %s already exists\n", version)
 		os.Exit(1)
 	}
