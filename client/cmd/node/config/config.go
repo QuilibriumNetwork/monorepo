@@ -1,9 +1,19 @@
 package config
 
 import (
+	"fmt"
+	"os"
+	"os/user"
+	"path/filepath"
+
 	"github.com/spf13/cobra"
-	clientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
+)
+
+var (
+	NodeUser        *user.User
+	ConfigDirs      string
+	NodeConfigToRun string
 )
 
 // ConfigCmd represents the node config command
@@ -20,8 +30,15 @@ This command provides utilities for configuring your Quilibrium node, such as:
 `,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		// Check if the config directory exists
-		if utils.FileExists(clientNode.ConfigDirs) {
-			utils.ValidateAndCreateDir(clientNode.ConfigDirs, clientNode.NodeUser)
+		user, err := utils.GetCurrentSudoUser()
+		if err != nil {
+			fmt.Println("Error getting current user:", err)
+			os.Exit(1)
+		}
+		ConfigDirs = filepath.Join(user.HomeDir, ".quilibrium", "configs")
+		NodeConfigToRun = filepath.Join(user.HomeDir, ".quilibrium", "configs", "default")
+		if utils.FileExists(ConfigDirs) {
+			utils.ValidateAndCreateDir(ConfigDirs, user)
 		}
 	},
 	Run: func(cmd *cobra.Command, args []string) {
@@ -29,36 +46,8 @@ This command provides utilities for configuring your Quilibrium node, such as:
 	},
 }
 
-// GetConfigSubCommands returns all the configuration subcommands
-func GetConfigSubCommands() []*cobra.Command {
-	// This function can be used by other packages to get all config subcommands
-	// It can be expanded in the future to return additional subcommands as they are added
-
-	return []*cobra.Command{
-		importCmd,
-		setCmd,
-		setDefaultCmd,
-		createDefaultCmd,
-	}
-}
-
 func init() {
-	// Add subcommands to the config command
-	// These subcommands will register themselves in their own init() functions
-
-	// Register the config command to the node command
-	clientNode.NodeCmd.AddCommand(ConfigCmd)
-}
-
-// GetRootConfigCmd returns the root config command
-// This is a utility function that can be used by other packages to get the config command
-// and its subcommands
-func GetRootConfigCmd() *cobra.Command {
-	// Return the config command that is defined in import.go
-	return ConfigCmd
-}
-
-// RegisterConfigCommand registers a subcommand to the root config command
-func RegisterConfigCommand(cmd *cobra.Command) {
-	ConfigCmd.AddCommand(cmd)
+	ConfigCmd.AddCommand(importCmd)
+	ConfigCmd.AddCommand(SwitchConfigCmd)
+	ConfigCmd.AddCommand(createCmd)
 }

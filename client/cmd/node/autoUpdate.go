@@ -13,11 +13,11 @@ import (
 
 // autoUpdateCmd represents the command to setup automatic updates
 var autoUpdateCmd = &cobra.Command{
-	Use:   "auto-update [enable|disable]",
+	Use:   "auto-update [enable|disable|status]",
 	Short: "Setup automatic update checks",
-	Long: `Setup or remove a cron job to automatically check for Quilibrium node updates every 10 minutes.
+	Long: `Setup, remove, or check status of a cron job to automatically check for Quilibrium node updates every 10 minutes.
 
-This command will create or remove a cron entry that runs 'qclient node update' every 10 minutes
+This command will create, remove, or check a cron entry that runs 'qclient node update' every 10 minutes
 to check for and apply any available updates.
 
 Example:
@@ -25,18 +25,23 @@ Example:
   qclient node auto-update enable
   
   # Remove automatic update checks
-  qclient node auto-update disable`,
+  qclient node auto-update disable
+  
+  # Check if automatic update is enabled
+  qclient node auto-update status`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) != 1 || (args[0] != "enable" && args[0] != "disable") {
-			fmt.Fprintf(os.Stderr, "Error: must specify either 'enable' or 'disable'\n")
+		if len(args) != 1 || (args[0] != "enable" && args[0] != "disable" && args[0] != "status") {
+			fmt.Fprintf(os.Stderr, "Error: must specify 'enable', 'disable', or 'status'\n")
 			cmd.Help()
 			return
 		}
 
 		if args[0] == "enable" {
 			setupCronJob()
-		} else {
+		} else if args[0] == "disable" {
 			removeCronJob()
+		} else if args[0] == "status" {
+			checkAutoUpdateStatus()
 		}
 	},
 }
@@ -137,39 +142,19 @@ func setupUnixCron(qclientPath string) {
 	}
 
 	// Check if our update command is already in crontab
-	if strings.Contains(currentCrontab, "### qclient managed cron tasks") &&
-		strings.Contains(currentCrontab, "#### node auto-update") {
+	if strings.Contains(currentCrontab, "### qclient-auto-update") {
 		fmt.Fprintf(os.Stdout, "Automatic update check is already configured in crontab\n")
 		return
 	}
 
 	// Add new cron entry with indicators
-	var newCrontab string
-
-	// If qclient section exists but node auto-update doesn't, we need to add it
-	if strings.Contains(currentCrontab, "### qclient managed cron tasks") &&
-		strings.Contains(currentCrontab, "### end qclient managed cron tasks") {
-		// Insert node auto-update section before the end marker
-		parts := strings.Split(currentCrontab, "### end qclient managed cron tasks")
-		if len(parts) >= 2 {
-			newCrontab = parts[0] +
-				"#### node auto-update\n" +
-				cronExpression + "\n" +
-				"#### end node auto-update (DO NOT DELETE)\n\n" +
-				"### end qclient managed cron tasks" + parts[1]
-		}
-	} else {
-		// Add the entire section with markers
-		newCrontab = currentCrontab
-		if strings.TrimSpace(newCrontab) != "" && !strings.HasSuffix(newCrontab, "\n") {
-			newCrontab += "\n"
-		}
-		newCrontab += "\n### qclient managed cron tasks\n" +
-			"#### node auto-update\n" +
-			cronExpression + "\n" +
-			"#### end node auto-update (DO NOT DELETE)\n\n" +
-			"### end qclient managed cron tasks (DO NOT DELETE)\n"
+	newCrontab := currentCrontab
+	if strings.TrimSpace(newCrontab) != "" && !strings.HasSuffix(newCrontab, "\n") {
+		newCrontab += "\n"
 	}
+	newCrontab += "### qclient-auto-update\n" +
+		cronExpression + "\n" +
+		"### end-qclient-auto-update\n"
 
 	// Write to temporary file
 	tempFile, err := os.CreateTemp("", "qclient-crontab")
@@ -216,46 +201,25 @@ func removeUnixCron() {
 	currentCrontab := string(checkOutput)
 
 	// No crontab or doesn't contain our section
-	if currentCrontab == "" ||
-		!strings.Contains(currentCrontab, "### qclient managed cron tasks") ||
-		!strings.Contains(currentCrontab, "#### node auto-update") {
+	if currentCrontab == "" || !strings.Contains(currentCrontab, "### qclient-auto-update") {
 		fmt.Fprintf(os.Stdout, "No auto-update job found in crontab\n")
 		return
 	}
 
+	// Remove our section
+	startMarker := "### qclient-auto-update"
+	endMarker := "### end-qclient-auto-update"
+
+	startIdx := strings.Index(currentCrontab, startMarker)
+	endIdx := strings.Index(currentCrontab, endMarker)
+
 	var newCrontab string
-
-	// If only node auto-update section exists, remove the whole qclient section
-	if !strings.Contains(currentCrontab, "#### end node auto-update") ||
-		!strings.Contains(strings.Split(currentCrontab, "### end qclient managed cron tasks")[0], "####") ||
-		strings.Count(strings.Split(currentCrontab, "### end qclient managed cron tasks")[0], "####") <= 2 {
-		// Remove entire qclient section
-		parts := strings.Split(currentCrontab, "### qclient managed cron tasks")
-		if len(parts) >= 2 {
-			endParts := strings.Split(parts[1], "### end qclient managed cron tasks")
-			if len(endParts) >= 2 {
-				newCrontab = parts[0] + endParts[1]
-			} else {
-				newCrontab = parts[0]
-			}
-		} else {
-			newCrontab = currentCrontab
-		}
+	if startIdx >= 0 && endIdx >= 0 {
+		endIdx += len(endMarker)
+		// Remove the section including markers
+		newCrontab = currentCrontab[:startIdx] + currentCrontab[endIdx:]
 	} else {
-		// Remove just the auto-update section
-		startMarker := "#### node auto-update"
-		endMarker := "#### end node auto-update (DO NOT DELETE)"
-
-		startIdx := strings.Index(currentCrontab, startMarker)
-		endIdx := strings.Index(currentCrontab, endMarker)
-
-		if startIdx >= 0 && endIdx >= 0 {
-			endIdx += len(endMarker)
-			// Remove the section including markers
-			newCrontab = currentCrontab[:startIdx] + currentCrontab[endIdx:]
-		} else {
-			newCrontab = currentCrontab
-		}
+		newCrontab = currentCrontab
 	}
 
 	// Clean up any leftover double newlines
@@ -286,4 +250,47 @@ func removeUnixCron() {
 	}
 
 	fmt.Fprintf(os.Stdout, "Successfully removed auto-update cron job\n")
+}
+
+func checkAutoUpdateStatus() {
+	if !isCrontabInstalled() {
+		fmt.Fprintf(os.Stderr, "Error: crontab command not found\n")
+		fmt.Fprintf(os.Stdout, "Auto-update is not enabled (crontab not installed)\n")
+		return
+	}
+
+	// Check existing crontab
+	checkCmd := exec.Command("crontab", "-l")
+	checkOutput, err := checkCmd.CombinedOutput()
+
+	if err != nil {
+		fmt.Fprintf(os.Stdout, "Auto-update is not enabled (no crontab found)\n")
+		return
+	}
+
+	currentCrontab := string(checkOutput)
+
+	if strings.Contains(currentCrontab, "### qclient-auto-update") {
+		// Extract the cron expression
+		startMarker := "### qclient-auto-update"
+		endMarker := "### end-qclient-auto-update"
+
+		startIdx := strings.Index(currentCrontab, startMarker) + len(startMarker)
+		endIdx := strings.Index(currentCrontab, endMarker)
+
+		if startIdx >= 0 && endIdx >= 0 {
+			cronSection := currentCrontab[startIdx:endIdx]
+			cronLines := strings.Split(strings.TrimSpace(cronSection), "\n")
+			if len(cronLines) > 0 {
+				fmt.Fprintf(os.Stdout, "Auto-update is enabled.")
+				fmt.Fprintf(os.Stdout, "The installed schedule is: %s\n", strings.TrimSpace(cronLines[0]))
+			} else {
+				fmt.Fprintf(os.Stdout, "Auto-update is enabled\n")
+			}
+		} else {
+			fmt.Fprintf(os.Stdout, "Auto-update is enabled\n")
+		}
+	} else {
+		fmt.Fprintf(os.Stdout, "Auto-update is not enabled\n")
+	}
 }

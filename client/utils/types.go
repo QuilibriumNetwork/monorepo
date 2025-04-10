@@ -8,9 +8,13 @@ type ClientConfig struct {
 
 type NodeConfig struct {
 	ClientConfig
-	DataDir string
-	User    string
+	RewardsAddress     string `yaml:"rewardsAddress"`
+	AutoUpdateInterval string `yaml:"autoUpdateInterval"`
 }
+
+const (
+	DefaultAutoUpdateInterval = "*/10 * * * *"
+)
 
 type ReleaseType string
 

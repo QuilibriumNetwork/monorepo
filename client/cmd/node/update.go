@@ -30,7 +30,7 @@ Examples:
 		// Determine version to install
 		version := determineVersion(args)
 
-		fmt.Fprintf(os.Stdout, "Updating Quilibrium node for %s-%s, version: %s\n", osType, arch, version)
+		fmt.Fprintf(os.Stdout, "Updating Quilibrium node for %s-%s, version: %s\n", OsType, Arch, version)
 
 		// Update the node
 		updateNode(version)
@@ -69,7 +69,7 @@ func updateNode(version string) {
 	err := utils.DownloadRelease(utils.ReleaseTypeNode, versionWithoutV)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error downloading version %s: %v\n", version, err)
-		fmt.Fprintf(os.Stderr, "The specified version %s does not exist for %s-%s\n", version, osType, arch)
+		fmt.Fprintf(os.Stderr, "The specified version %s does not exist for %s-%s\n", version, OsType, Arch)
 		// Clean up the created directories since installation failed
 		os.RemoveAll(versionDataDir)
 		return

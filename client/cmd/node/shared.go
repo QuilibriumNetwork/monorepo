@@ -83,7 +83,7 @@ func setupLogRotation() error {
 func finishInstallation(version string) {
 	setOwnership()
 
-	normalizedBinaryName := "node-" + version + "-" + osType + "-" + arch
+	normalizedBinaryName := "node-" + version + "-" + OsType + "-" + Arch
 
 	// Finish installation
 	nodeBinaryPath := filepath.Join(utils.NodeDataPath, version, normalizedBinaryName)
@@ -118,16 +118,33 @@ func finishInstallation(version string) {
 // printSuccessMessage prints a success message after installation
 func printSuccessMessage(version string) {
 	fmt.Fprintf(os.Stdout, "\nSuccessfully installed Quilibrium node %s\n", version)
-	fmt.Fprintf(os.Stdout, "Binary download directory: %s\n", utils.NodeDataPath+"/"+version)
+	fmt.Fprintf(os.Stdout, "Binary download directory: %s\n", filepath.Join(utils.NodeDataPath, version))
 	fmt.Fprintf(os.Stdout, "Binary symlinked to %s\n", defaultSymlinkPath)
 	fmt.Fprintf(os.Stdout, "Log directory: %s\n", logPath)
 	fmt.Fprintf(os.Stdout, "Environment file: /etc/default/quilibrium-node\n")
 	fmt.Fprintf(os.Stdout, "Service file: /etc/systemd/system/quilibrium-node.service\n")
 
-	fmt.Fprintf(os.Stdout, "\nTo start the node, you can run:\n")
-	fmt.Fprintf(os.Stdout, "  %s --config %s/config/config.yaml\n",
+	fmt.Fprintf(os.Stdout, "\nConfiguration:\n")
+	fmt.Fprintf(os.Stdout, "  To create a new configuration:\n")
+	fmt.Fprintf(os.Stdout, "    qclient node config create [name] --default\n")
+	fmt.Fprintf(os.Stdout, "    quilibrium-node --peer-id %s/default-config\n", ConfigDirs)
+
+	fmt.Fprintf(os.Stdout, "\n  To use an existing configuration:\n")
+	fmt.Fprintf(os.Stdout, "    cp -r /path/to/your/existing/config %s/default-config\n", ConfigDirs)
+	fmt.Fprintf(os.Stdout, "    # Or modify the service file to point to your existing config:\n")
+	fmt.Fprintf(os.Stdout, "    sudo nano /etc/systemd/system/quilibrium-node.service\n")
+	fmt.Fprintf(os.Stdout, "    # Then reload systemd:\n")
+	fmt.Fprintf(os.Stdout, "    sudo systemctl daemon-reload\n")
+
+	fmt.Fprintf(os.Stdout, "\nTo select a configuration:\n")
+	fmt.Fprintf(os.Stdout, "  qclient node config switch <config-name>\n")
+	fmt.Fprintf(os.Stdout, "  # Or use the --default flag when creating a config to automatically select it:\n")
+	fmt.Fprintf(os.Stdout, "  qclient node config create --default\n")
+
+	fmt.Fprintf(os.Stdout, "\nTo manually start the node (must create a config first), you can run:\n")
+	fmt.Fprintf(os.Stdout, "  %s --config %s/myconfig/\n",
 		ServiceName, ConfigDirs)
-	fmt.Fprintf(os.Stdout, "  # Or use systemd service:\n")
+	fmt.Fprintf(os.Stdout, "  # Or use systemd service using the default config:\n")
 	fmt.Fprintf(os.Stdout, "  sudo systemctl start quilibrium-node\n")
 
 	fmt.Fprintf(os.Stdout, "\nFor more options, run:\n")

@@ -2,10 +2,7 @@ package node
 
 import (
 	"encoding/hex"
-	"fmt"
-	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 
 	"github.com/pkg/errors"
@@ -54,27 +51,4 @@ func CheckForSystemd() bool {
 	// Check if systemctl command exists
 	_, err := exec.LookPath("systemctl")
 	return err == nil
-}
-
-func checkForQuilibriumUser() (*user.User, error) {
-	user, err := user.Lookup(nodeUser)
-	if err != nil {
-		return nil, err
-	}
-	return user, nil
-}
-
-func InstallQuilibriumUser() (*user.User, error) {
-	var user *user.User
-	var err error
-	user, err = checkForQuilibriumUser()
-	if err != nil {
-		if err := createNodeUser(nodeUser); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating user: %v\n", err)
-			os.Exit(1)
-		}
-		user, err = checkForQuilibriumUser()
-	}
-
-	return user, err
 }

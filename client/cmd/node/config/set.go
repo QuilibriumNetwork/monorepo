@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	clientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
@@ -25,7 +24,7 @@ Example:
 		value := args[2]
 
 		// Construct the config directory path
-		configDir := filepath.Join(clientNode.ConfigDirs, name)
+		configDir := filepath.Join(ConfigDirs, name)
 		configFile := filepath.Join(configDir, "config.yml")
 
 		// Check if config directory exists
@@ -41,7 +40,7 @@ Example:
 		}
 
 		// Load the config
-		cfg, err := config.LoadConfig(configFile, "", false)
+		cfg, err := config.LoadConfig(configDir, "", false)
 		if err != nil {
 			fmt.Printf("Failed to load config: %s\n", err)
 			os.Exit(1)
@@ -73,7 +72,7 @@ Example:
 		}
 
 		// Save the updated config
-		if err := config.SaveConfig(configFile, cfg); err != nil {
+		if err := config.SaveConfig(configDir, cfg); err != nil {
 			fmt.Printf("Failed to save config: %s\n", err)
 			os.Exit(1)
 		}

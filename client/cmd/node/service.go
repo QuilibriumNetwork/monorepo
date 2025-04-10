@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"text/template"
 
@@ -71,12 +70,12 @@ func installService() {
 		return
 	}
 
-	fmt.Fprintf(os.Stdout, "Installing Quilibrium node service for %s...\n", osType)
+	fmt.Fprintf(os.Stdout, "Installing Quilibrium node service for %s...\n", OsType)
 
-	if osType == "darwin" {
+	if OsType == "darwin" {
 		// launchctl is already installed on macOS by default, so no need to check for it
 		installMacOSService()
-	} else if osType == "linux" {
+	} else if OsType == "linux" {
 		// systemd is not installed on linux by default, so we need to check for it
 		if !CheckForSystemd() {
 			// install systemd if not found
@@ -87,7 +86,7 @@ func installService() {
 			return
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "Error: Unsupported operating system: %s\n", osType)
+		fmt.Fprintf(os.Stderr, "Error: Unsupported operating system: %s\n", OsType)
 		return
 	}
 
@@ -120,7 +119,7 @@ func startService() {
 		return
 	}
 
-	if osType == "darwin" {
+	if OsType == "darwin" {
 		// MacOS launchd command
 		cmd := exec.Command("sudo", "launchctl", "start", fmt.Sprintf("com.quilibrium.%s", ServiceName))
 		if err := cmd.Run(); err != nil {
@@ -146,7 +145,7 @@ func stopService() {
 		return
 	}
 
-	if osType == "darwin" {
+	if OsType == "darwin" {
 		// MacOS launchd command
 		cmd := exec.Command("sudo", "launchctl", "stop", fmt.Sprintf("com.quilibrium.%s", ServiceName))
 		if err := cmd.Run(); err != nil {
@@ -172,7 +171,7 @@ func restartService() {
 		return
 	}
 
-	if osType == "darwin" {
+	if OsType == "darwin" {
 		// MacOS launchd command - stop then start
 		stopCmd := exec.Command("sudo", "launchctl", "stop", fmt.Sprintf("com.quilibrium.%s", ServiceName))
 		if err := stopCmd.Run(); err != nil {
@@ -204,7 +203,7 @@ func reloadService() {
 		return
 	}
 
-	if osType == "darwin" {
+	if OsType == "darwin" {
 		// MacOS launchd command - unload then load
 		plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", ServiceName)
 		unloadCmd := exec.Command("sudo", "launchctl", "unload", plistPath)
@@ -239,7 +238,7 @@ func checkServiceStatus() {
 		return
 	}
 
-	if osType == "darwin" {
+	if OsType == "darwin" {
 		// MacOS launchd command
 		cmd := exec.Command("sudo", "launchctl", "list", fmt.Sprintf("com.quilibrium.%s", ServiceName))
 		cmd.Stdout = os.Stdout
@@ -265,7 +264,7 @@ func enableService() {
 		return
 	}
 
-	if osType == "darwin" {
+	if OsType == "darwin" {
 		// MacOS launchd command - load with -w flag to enable at boot
 		plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", ServiceName)
 		cmd := exec.Command("sudo", "launchctl", "load", "-w", plistPath)
@@ -292,7 +291,7 @@ func disableService() {
 		return
 	}
 
-	if osType == "darwin" {
+	if OsType == "darwin" {
 		// MacOS launchd command - unload with -w flag to disable at boot
 		plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", ServiceName)
 		cmd := exec.Command("sudo", "launchctl", "unload", "-w", plistPath)
@@ -314,14 +313,14 @@ func disableService() {
 
 func createService() {
 	// Create systemd service file
-	if osType == "linux" {
+	if OsType == "linux" {
 		if err := createSystemdServiceFile(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to create systemd service file: %v\n", err)
 		}
-	} else if osType == "darwin" {
+	} else if OsType == "darwin" {
 		installMacOSService()
 	} else {
-		fmt.Fprintf(os.Stderr, "Warning: Background service file creation not supported on %s\n", osType)
+		fmt.Fprintf(os.Stderr, "Warning: Background service file creation not supported on %s\n", OsType)
 		return
 	}
 }
@@ -337,11 +336,6 @@ func createSystemdServiceFile() error {
 		return fmt.Errorf("failed to get sudo privileges: %w", err)
 	}
 
-	userLookup, err := user.Lookup(nodeUser)
-	if err != nil {
-		return fmt.Errorf("failed to lookup user: %w", err)
-	}
-
 	// Create environment file content
 	envContent := `# Quilibrium Node Environment`
 
@@ -352,7 +346,7 @@ func createSystemdServiceFile() error {
 	}
 
 	// Set ownership of environment file
-	chownCmd := utils.ChownPath(envPath, userLookup, false)
+	chownCmd := utils.ChownPath(envPath, NodeUser, false)
 	if chownCmd != nil {
 		return fmt.Errorf("failed to set environment file ownership: %w", chownCmd)
 	}

@@ -15,6 +15,15 @@ var BaseReleaseURL = "https://releases.quilibrium.com"
 // DownloadRelease downloads a specific release file
 func DownloadRelease(releaseType ReleaseType, version string) error {
 	fileName := fmt.Sprintf("%s-%s-%s-%s", releaseType, version, osType, arch)
+	fmt.Printf("Getting binary %s...\n", fileName)
+	fmt.Println("Will save to", filepath.Join(BinaryPath, string(releaseType), version))
+	url := fmt.Sprintf("%s/%s", BaseReleaseURL, fileName)
+
+	if !DoesRemoteFileExist(url) {
+		fmt.Printf("the release file %s does not exist on the release server\n", fileName)
+		os.Exit(1)
+	}
+
 	return DownloadReleaseFile(releaseType, fileName, version, true)
 }
 
@@ -25,6 +34,7 @@ func GetLatestVersion(releaseType ReleaseType) (string, error) {
 	if releaseType == ReleaseTypeQClient {
 		releaseURL = fmt.Sprintf("%s/qclient-release", BaseReleaseURL)
 	}
+
 	resp, err := http.Get(releaseURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch latest version: %w", err)
@@ -57,7 +67,7 @@ func DownloadReleaseFile(releaseType ReleaseType, fileName string, version strin
 	os.MkdirAll(destDir, 0755)
 	destPath := filepath.Join(destDir, fileName)
 
-	fmt.Printf("Downloading %s to %s\n", url, destPath)
+	fmt.Printf("Downloading %s...", fileName)
 
 	resp, err := http.Get(url)
 	if err != nil {
@@ -83,7 +93,7 @@ func DownloadReleaseFile(releaseType ReleaseType, fileName string, version strin
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stdout, "Downloaded %s to %s\n", fileName, destPath)
+	fmt.Print(" done\n")
 	return nil
 }
 
@@ -91,7 +101,8 @@ func DownloadReleaseFile(releaseType ReleaseType, fileName string, version strin
 func DownloadReleaseSignatures(releaseType ReleaseType, version string) error {
 	var files []string
 	baseName := fmt.Sprintf("%s-%s-%s-%s", releaseType, version, osType, arch)
-	fmt.Printf("Downloading signatures for %s\n", baseName)
+	fmt.Printf("Searching for signatures for %s from %s\n", baseName, BaseReleaseURL)
+	fmt.Println("Will save to", filepath.Join(BinaryPath, string(releaseType), version))
 
 	// Add digest file URL
 	files = append(files, baseName+".dgst")
@@ -103,19 +114,11 @@ func DownloadReleaseSignatures(releaseType ReleaseType, version string) error {
 		sigFile := fmt.Sprintf("%s.dgst.sig.%d", baseName, num)
 		remoteURL := fmt.Sprintf("%s/%s", BaseReleaseURL, sigFile)
 
-		// Make a HEAD request to check if the file exists
-		resp, err := http.Head(remoteURL)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			// Skip this file if it doesn't exist on the server
-			fmt.Printf("Signature file %s not found on server, skipping\n", sigFile)
+		if !DoesRemoteFileExist(remoteURL) {
 			continue
-		} else {
-			if resp != nil && resp.Body != nil {
-				resp.Body.Close()
-			}
-			fmt.Printf("Signature file %s found on server, adding to download list\n", sigFile)
-			files = append(files, fmt.Sprintf("%s.dgst.sig.%d", baseName, num))
 		}
+		fmt.Printf("Found signature file %s\n", sigFile)
+		files = append(files, fmt.Sprintf("%s.dgst.sig.%d", baseName, num))
 	}
 
 	if len(files) == 0 {
@@ -189,6 +192,17 @@ func DownloadAllReleaseFiles(releaseType ReleaseType, fileNames []string, instal
 			fmt.Fprintf(os.Stderr, "Error downloading release file %s: %v\n", fileName, err)
 			return false
 		}
+	}
+	return true
+}
+
+func DoesRemoteFileExist(url string) bool {
+	resp, err := http.Head(url)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return false
+	}
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
 	}
 	return true
 }

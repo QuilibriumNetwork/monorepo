@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	clientNode "source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
 
@@ -36,8 +35,8 @@ This will copy config.yml and keys.yml from /path/to/source to /home/quilibrium/
 		}
 
 		// Create target directory in the standard location
-		targetDir := filepath.Join(clientNode.ConfigDirs, name)
-		if err := os.MkdirAll(targetDir, 0755); err != nil {
+		targetDir := filepath.Join(ConfigDirs, name)
+		if err := utils.ValidateAndCreateDir(targetDir, NodeUser); err != nil {
 			fmt.Printf("Failed to create target directory: %s\n", err)
 			os.Exit(1)
 		}
@@ -62,9 +61,4 @@ This will copy config.yml and keys.yml from /path/to/source to /home/quilibrium/
 
 		fmt.Printf("Successfully imported config files to %s\n", targetDir)
 	},
-}
-
-func init() {
-	// Add the import command to the config command
-	ConfigCmd.AddCommand(importCmd)
 }

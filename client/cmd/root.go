@@ -23,6 +23,7 @@ import (
 
 var configDirectory string
 var signatureCheck bool = true
+var byPassSignatureCheck bool = false
 var NodeConfig *config.Config
 var simulateFail bool
 var DryRun bool = false
@@ -52,7 +53,7 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 			os.Exit(1)
 		}
 
-		if !clientConfig.SignatureCheck {
+		if !clientConfig.SignatureCheck || byPassSignatureCheck {
 			signatureCheck = false
 		}
 
@@ -90,7 +91,7 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 
 					reader := bufio.NewReader(os.Stdin)
 					response, _ := reader.ReadString('\n')
-					response = strings.TrimSpace(strings.ToLower(response))
+					response = strings.ToLower(strings.TrimSpace(response))
 
 					if response != "y" && response != "yes" {
 						fmt.Println("Exiting due to missing digest file")
@@ -199,26 +200,13 @@ func init() {
 		"bypass signature check (not recommended for binaries) (default true or value of QUILIBRIUM_SIGNATURE_CHECK env var)",
 	)
 
-	rootCmd.PersistentFlags().BoolP(
+	rootCmd.PersistentFlags().BoolVarP(
+		&byPassSignatureCheck,
 		"yes",
 		"y",
 		false,
 		"auto-approve and bypass signature check (sets signature-check=false)",
 	)
-
-	// Store original PersistentPreRun
-	originalPersistentPreRun := rootCmd.PersistentPreRun
-
-	// Override PersistentPreRun to check for -y flag first
-	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
-		// Check if -y flag is set and update signatureCheck
-		if yes, _ := cmd.Flags().GetBool("yes"); yes {
-			signatureCheck = false
-		}
-
-		// Call the original PersistentPreRun
-		originalPersistentPreRun(cmd, args)
-	}
 
 	// Add the node command
 	rootCmd.AddCommand(node.NodeCmd)

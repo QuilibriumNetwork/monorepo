@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
+	clientNodeConfig "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
@@ -18,23 +20,17 @@ var (
 	defaultSymlinkPath = "/usr/local/bin/quilibrium-node"
 	logPath            = "/var/log/quilibrium"
 
-	// Default user to run the node
-	nodeUser = "quilibrium"
-
 	ServiceName = "quilibrium-node"
 
-	ConfigDirs      = "/home/quilibrium/configs"
-	NodeConfigToRun = "/home/quilibrium/configs/default"
-
-	// Default config file name
-	defaultConfigFileName = "node.yaml"
-
-	osType string
-	arch   string
+	OsType string
+	Arch   string
 
 	configDirectory string
 	NodeConfig      *config.Config
+
 	NodeUser        *user.User
+	ConfigDirs      string
+	NodeConfigToRun string
 )
 
 // NodeCmd represents the node command
@@ -43,24 +39,26 @@ var NodeCmd = &cobra.Command{
 	Short: "Quilibrium node commands",
 	Long:  `Run Quilibrium node commands.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Store reference to parent's PersistentPreRun to call it first
+		parent := cmd.Parent()
+		if parent != nil && parent.PersistentPreRun != nil {
+			parent.PersistentPreRun(parent, args)
+		}
+
+		// Then run the node-specific initialization
 		var userLookup *user.User
 		var err error
-		userLookup, err = user.Lookup(nodeUser)
+		userLookup, err = utils.GetCurrentSudoUser()
 		if err != nil {
-			if !utils.IsSudo() {
-				fmt.Printf("need to be sudo to install quilibrium user, retry with sudo: %s\n", err)
-				os.Exit(1)
-			}
-			userLookup, err = InstallQuilibriumUser()
-			if err != nil {
-				fmt.Printf("error installing quilibrium user: %s\n", err)
-				os.Exit(1)
-			}
+			fmt.Fprintf(os.Stderr, "Error getting current user: %v\n", err)
+			os.Exit(1)
 		}
 		NodeUser = userLookup
+		ConfigDirs = filepath.Join(userLookup.HomeDir, ".quilibrium", "configs")
+		NodeConfigToRun = filepath.Join(userLookup.HomeDir, ".quilibrium", "configs", "default")
 	},
 	Run: func(cmd *cobra.Command, args []string) {
-
+		cmd.Help()
 	},
 }
 
@@ -69,14 +67,16 @@ func init() {
 
 	// Add subcommands
 	NodeCmd.AddCommand(installCmd)
+	NodeCmd.AddCommand(clientNodeConfig.ConfigCmd)
 	NodeCmd.AddCommand(updateNodeCmd)
 	NodeCmd.AddCommand(nodeServiceCmd)
+
 	localOsType, localArch, err := utils.GetSystemInfo()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
 
-	osType = localOsType
-	arch = localArch
+	OsType = localOsType
+	Arch = localArch
 }
