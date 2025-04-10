@@ -47,6 +47,10 @@ var NodeCmd = &cobra.Command{
 		var err error
 		userLookup, err = user.Lookup(nodeUser)
 		if err != nil {
+			if !utils.IsSudo() {
+				fmt.Printf("need to be sudo to install quilibrium user, retry with sudo: %s\n", err)
+				os.Exit(1)
+			}
 			userLookup, err = InstallQuilibriumUser()
 			if err != nil {
 				fmt.Printf("error installing quilibrium user: %s\n", err)
