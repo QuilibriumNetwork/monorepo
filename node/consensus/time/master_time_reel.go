@@ -40,28 +40,29 @@ func NewMasterTimeReel(
 	if logger == nil {
 		panic("logger is nil")
 	}
+	slogger := logger.With(zap.String("stage", "master-time-reel"))
 
 	if clockStore == nil {
-		panic("clock store is nil")
+		slogger.Panic("clock store is nil")
 	}
 
 	if engineConfig == nil {
-		panic("engine config is nil")
+		slogger.Panic("engine config is nil")
 	}
 
 	if frameProver == nil {
-		panic("frame prover is nil")
+		slogger.Panic("frame prover is nil")
 	}
 
 	filter, err := hex.DecodeString(
 		"0000000000000000000000000000000000000000000000000000000000000000",
 	)
 	if err != nil {
-		panic(err)
+		slogger.Panic("failed to decode filter", zap.Error(err))
 	}
 
 	return &MasterTimeReel{
-		logger:       logger.With(zap.String("stage", "master-time-reel")),
+		logger:       slogger,
 		filter:       filter,
 		engineConfig: engineConfig,
 		clockStore:   clockStore,

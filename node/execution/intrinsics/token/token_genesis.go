@@ -499,7 +499,7 @@ func RebuildPeerSeniority(network uint) (map[string]uint64, error) {
 
 // Creates a genesis state for the intrinsic
 func CreateGenesisState(
-	logger *zap.Logger,
+	parentLogger *zap.Logger,
 	engineConfig *config.EngineConfig,
 	testProverKeys [][]byte,
 	inclusionProver qcrypto.InclusionProver,
@@ -515,7 +515,7 @@ func CreateGenesisState(
 	[][]byte,
 	map[string]uint64,
 ) {
-	logger = logger.With(zap.String("stage", "create-genesis-state"))
+	logger := parentLogger.With(zap.String("stage", "create-genesis-state"))
 	genesis := config.GetGenesis()
 	if genesis == nil {
 		logger.Panic("genesis is nil")

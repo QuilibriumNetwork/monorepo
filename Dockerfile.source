@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/usr/local/,id=usr-local-${TARGETOS}-${TARGETARCH}
 RUN --mount=type=cache,target=/usr/local/,id=usr-local-${TARGETOS}-${TARGETARCH} \
     cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
 
-ARG GO_VERSION=1.22.5
+ARG GO_VERSION=1.23.5
 RUN --mount=type=cache,target=/usr/local,id=usr-local-${TARGETOS}-${TARGETARCH} \
     apt update && apt install -y wget && \
     ARCH=$(dpkg --print-architecture) && \
