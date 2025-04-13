@@ -1,0 +1,20 @@
+---
+node:
+  image: trancelife/quilibrium:latest
+  replica_count: 3
+  p2p_port: 8336
+  grpc_multiaddr: /ip4/0.0.0.0/tcp/8337
+  rest_multiaddr: /ip4/0.0.0.0/tcp/8338
+  stats_multiaddr: /dns/stats.quilibrium.com/tcp/443
+  cpu_resource: 4000m
+  memory_resource: 8Gi
+  persistence:
+    mount_path: /root/.config
+    volume:
+      type: empty_dir
+      empty_dir: {}
+      host_path:
+        path: /mnt/data/quilibrium-store
+      pvc:
+        size: 1Gi
+        storage_class: standard

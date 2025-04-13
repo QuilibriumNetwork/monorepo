@@ -1,0 +1,92 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: quilibrium-node
+spec:
+  replicas: {{ .Values.node.replica_count }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: quilibrium-node
+  template:
+    metadata:
+      labels:
+        app: quilibrium-node
+    spec:
+      containers:
+      - name: quilibrium-node
+        image: {{ .Values.node.image }}
+        ports:
+        - name: grpc
+          containerPort: {{ include "extractGrpcPortFromMultiaddr" . | int }}
+        - name: rest
+          containerPort: {{ include "extractRestPortFromMultiaddr" . | int }}
+        - name: p2p
+          containerPort: {{ .Values.node.p2p_port }}
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DEFAULT_LISTEN_GRPC_MULTIADDR
+          value: {{ .Values.node.grpc_multiaddr }}
+        - name: DEFAULT_LISTEN_REST_MULTIADDR
+          value: {{ .Values.node.rest_multiaddr }}
+        - name: DEFAULT_STATS_MULTIADDR
+          value: {{ .Values.node.stats_multiaddr }}
+        resources:
+          requests:
+            cpu: {{ .Values.node.cpu_resource }}
+            memory: {{ .Values.node.memory_resource }}
+          limits:
+            cpu: {{ .Values.node.cpu_resource }}
+            memory: {{ .Values.node.memory_resource }}
+        volumeMounts:
+        - name: config-volume
+          mountPath: {{ .Values.node.persistence.mount_path }}
+        livenessProbe:
+          exec:
+            command:
+              - grpcurl
+              - -plaintext
+              - localhost:{{ include "extractGrpcPortFromMultiaddr" . | int }}
+              - list
+              - quilibrium.node.node.pb.NodeService
+          initialDelaySeconds: 900
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+              - grpcurl
+              - -plaintext
+              - localhost:{{ include "extractGrpcPortFromMultiaddr" . | int }}
+              - list
+              - quilibrium.node.node.pb.NodeService
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+      {{- if (eq .Values.node.persistence.volume.type "host_path") }}
+      volumes:
+      - name: config-volume
+        hostPath:
+          path: {{ .Values.node.persistence.volume.host_path.path }}
+      {{- end }}
+      {{- if (eq .Values.node.persistence.volume.type "empty_dir") }}
+      volumes:
+      - name: config-volume
+        emptyDir: {}
+      {{- end }}
+  {{- if (eq .Values.node.persistence.volume.type "pvc") }}
+  volumeClaimTemplates:
+  - metadata:
+      name: config-volume
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: {{ .Values.node.persistence.volume.pvc.size }}
+      {{- if .Values.node.persistence.volume.pvc.storage_class }}
+      storageClassName: {{ .Values.node.persistence.volume.pvc.storage_class }}
+      {{- end }}
+  {{- end }}
