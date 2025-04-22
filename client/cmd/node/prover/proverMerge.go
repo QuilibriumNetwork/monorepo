@@ -16,7 +16,7 @@ import (
 
 var DryRun bool
 
-var proverConfigMergeCmd = &cobra.Command{
+var NodeProverConfigMergeCmd = &cobra.Command{
 	Use:   "merge",
 	Short: "Merges config data for prover seniority",
 	Long: `Merges config data for prover seniority:
@@ -233,6 +233,5 @@ var thirdRetroJsonBinary []byte
 var fourthRetroJsonBinary []byte
 
 func init() {
-	proverConfigMergeCmd.Flags().BoolVar(&DryRun, "dry-run", false, "Evaluate seniority score without merging configs")
-	ProverCmd.AddCommand(proverConfigMergeCmd)
+	NodeProverConfigMergeCmd.Flags().BoolVar(&DryRun, "dry-run", false, "Evaluate seniority score without merging configs")
 }

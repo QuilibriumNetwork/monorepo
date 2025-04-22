@@ -6,7 +6,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var mutualTransferCmd = &cobra.Command{
+var MutualTransferCmd = &cobra.Command{
 	Use:   "mutual-transfer",
 	Short: "Initiates a mutual transfer",
 	Long: `Initiates a mutual transfer:
@@ -22,8 +22,4 @@ var mutualTransferCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("command not yet available")
 	},
-}
-
-func init() {
-	TokenCmd.AddCommand(mutualTransferCmd)
 }

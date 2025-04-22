@@ -8,7 +8,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
 
-var accountCmd = &cobra.Command{
+var AccountCmd = &cobra.Command{
 	Use:   "account",
 	Short: "Shows the account address of the managing account",
 	Run: func(cmd *cobra.Command, args []string) {
@@ -21,8 +21,4 @@ var accountCmd = &cobra.Command{
 		addrBytes := addr.FillBytes(make([]byte, 32))
 		fmt.Printf("Account: 0x%x\n", addrBytes)
 	},
-}
-
-func init() {
-	TokenCmd.AddCommand(accountCmd)
 }

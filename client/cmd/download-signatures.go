@@ -11,13 +11,20 @@ import (
 
 var versionFlag string
 
-var downloadSignaturesCmd = &cobra.Command{
+var DownloadSignaturesCmd = &cobra.Command{
 	Use:   "download-signatures",
-	Short: "Download signature files for the current binary",
-	Long: `Download signature files for the current binary. This command will download
-the digest file and all signature files needed for verification. If --version is specified,
-it will download signatures for that version. Otherwise, it will download signatures for
-the latest version.`,
+	Short: "Download signature files for the current QClient binary",
+	Long: `Download signature files for the current QClient binary. 
+	
+	This command will download the digest file and all signature files needed for verification. 
+	
+	Optionally, if --version is specified, it will download signatures for that version. 
+	Otherwise, by default it will download signatures for the latest version.
+	
+	Example:
+	
+		qclient download-signatures --version 1.0.0
+	`,
 	Run: func(cmd *cobra.Command, args []string) {
 		var version string
 
@@ -40,12 +47,5 @@ the latest version.`,
 }
 
 func init() {
-	downloadSignaturesCmd.Flags().StringVarP(
-		&versionFlag,
-		"version",
-		"v",
-		"",
-		"Version to download signatures for (defaults to latest version)",
-	)
-	rootCmd.AddCommand(downloadSignaturesCmd)
+	DownloadSignaturesCmd.Flags().StringVar(&versionFlag, "version", "", "Version to download signatures for")
 }

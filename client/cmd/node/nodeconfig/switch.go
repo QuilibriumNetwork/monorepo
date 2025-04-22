@@ -3,13 +3,12 @@ package nodeconfig
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
 
-var SwitchConfigCmd = &cobra.Command{
+var NodeConfigSwitchCmd = &cobra.Command{
 	Use:   "switch [name]",
 	Short: "Switch the config to be run by the node",
 	Long: fmt.Sprintf(`Switch the configuration to be run by the node by creating a symlink.
@@ -21,7 +20,8 @@ This will symlink %s/mynode to %s`, ConfigDirs, NodeConfigToRun),
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		var name string
-		if len(args) > 0 {
+		if len(args) > 0 && len(args[0]) == 1 {
+
 			name = args[0]
 		} else {
 			// List available configurations
@@ -53,27 +53,14 @@ This will symlink %s/mynode to %s`, ConfigDirs, NodeConfigToRun),
 			name = configs[choice-1]
 		}
 
-		// Construct the source directory path
-		sourceDir := filepath.Join(ConfigDirs, name)
-
-		// Check if source directory exists
-		if _, err := os.Stat(sourceDir); os.IsNotExist(err) {
-			fmt.Printf("Config directory does not exist: %s\n", sourceDir)
+		if name == "default" {
+			fmt.Println("Invalid configuration name. The 'default' is reserved for the default configuration.")
 			os.Exit(1)
 		}
 
-		// Check if the source directory has both config.yml and keys.yml files
-		if !HasConfigFiles(sourceDir) {
-			fmt.Printf("Source directory does not contain both config.yml and keys.yml files: %s\n", sourceDir)
-			os.Exit(1)
-		}
-
-		// Construct the default directory path
-		defaultDir := filepath.Join(ConfigDirs, "default")
-
-		// Create the symlink
-		if err := utils.CreateSymlink(sourceDir, defaultDir); err != nil {
-			fmt.Printf("Failed to create symlink: %s\n", err)
+		err := utils.SetDefaultNodeConfig(name)
+		if err != nil {
+			fmt.Printf("Error setting default config: %s\n", err)
 			os.Exit(1)
 		}
 

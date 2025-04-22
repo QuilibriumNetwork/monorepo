@@ -14,6 +14,15 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
+var (
+	DefaultNodeConfigName  = "node-quickstart"
+	NodeDataPath           = filepath.Join(BinaryPath, string(ReleaseTypeNode))
+	NodeEnvPath            = filepath.Join(RootQuilibriumPath, "quilibrium.env")
+	NodeServiceName        = "quilibrium-node"
+	DefaultNodeSymlinkPath = filepath.Join(DefaultSymlinkDir, NodeServiceName)
+	LogPath                = "/var/log/quilibrium"
+)
+
 func GetPeerIDFromConfig(cfg *config.Config) peer.ID {
 	peerPrivKey, err := hex.DecodeString(cfg.P2P.PeerPrivKey)
 	if err != nil {
@@ -54,11 +63,164 @@ func CheckForSystemd() bool {
 	return err == nil
 }
 
-func LoadNodeConfig(configDirectory string) (*config.Config, error) {
-	NodeConfig, err := config.LoadConfig(configDirectory, "", false)
+func GetNodeConfigHomeDir() string {
+	userLookup, err := GetCurrentSudoUser()
 	if err != nil {
-		fmt.Printf("invalid config directory: %s\n", configDirectory)
+		fmt.Fprintf(os.Stderr, "Error getting current user: %v\n", err)
 		os.Exit(1)
 	}
-	return NodeConfig, nil
+
+	path := filepath.Join(userLookup.HomeDir, ".quilibrium", "configs")
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		ValidateAndCreateDir(path, userLookup)
+	}
+
+	return path
+}
+
+func GetDefaultNodeConfigDir() (string, error) {
+	configPath := filepath.Join(GetNodeConfigHomeDir(), DefaultNodeConfigName)
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		// if it doesn't exist
+		// check if the .config directory exists in the current working directory
+		altConfigPath := filepath.Join(".", ".config")
+		if _, err := os.Stat(altConfigPath); !os.IsNotExist(err) {
+			return altConfigPath, nil
+		}
+
+		fmt.Printf("Default node config directory does not exist, creating it\n")
+		// if neither exists, create it
+		CreateDefaultNodeConfig(DefaultNodeConfigName)
+		return configPath, nil
+	}
+	// Check if the config path is a symlink
+	realPath, err := filepath.EvalSymlinks(configPath)
+	if err != nil {
+		// If there's an error evaluating symlinks, return the original path
+		return configPath, err
+	}
+	// If it is a symlink, return the real path
+	return realPath, nil
+}
+
+func LoadDefaultNodeConfig() (*config.Config, error) {
+	// check for the symlinked default config
+	configDir, err := GetDefaultNodeConfigDir()
+	if err != nil {
+		return nil, err
+	}
+
+	return config.LoadConfig(configDir, "", false)
+}
+
+func LoadNodeConfig(configDirectory string) (*config.Config, error) {
+	// if the provided config directory is "default", load the default config
+	if configDirectory == "default" {
+		return LoadDefaultNodeConfig()
+	}
+
+	// if the provided config directory has both config.yml and keys.yml files, load it
+	if HasNodeConfigFiles(configDirectory) {
+		return config.LoadConfig(configDirectory, "", false)
+	}
+
+	// if not, check with the user's config home directory
+	configPath := filepath.Join(GetNodeConfigHomeDir(), configDirectory, "config.yml")
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		// Otherwise, the config with this name or location does not exist, return an error
+		// and allow the caller of this function to handle it
+		return nil, errors.New(ErrConfigNotFoundErrorMessage)
+
+	}
+
+	return config.LoadConfig(configDirectory, "", false)
+}
+
+// HasNodeConfigFiles checks if a directory contains both config.yml and keys.yml files
+func HasNodeConfigFiles(dirPath string) bool {
+	configPath := filepath.Join(dirPath, "config.yml")
+	keysPath := filepath.Join(dirPath, "keys.yml")
+
+	// Check if both files exist
+	configExists := false
+	keysExists := false
+
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		configExists = true
+	}
+
+	if _, err := os.Stat(keysPath); !os.IsNotExist(err) {
+		keysExists = true
+	}
+
+	return configExists && keysExists
+}
+
+func SetDefaultNodeConfig(configName string) error {
+	NodeConfigDir := GetNodeConfigHomeDir()
+	configDir := filepath.Join(NodeConfigDir, configName)
+
+	userLookup, err := GetCurrentSudoUser()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting current user: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := ValidateAndCreateDir(configDir, userLookup); err != nil {
+		return err
+	}
+
+	// Construct the source directory path
+	sourceDir := filepath.Join(NodeConfigDir, configName)
+
+	// Check if source directory exists
+	if _, err := os.Stat(sourceDir); os.IsNotExist(err) {
+		fmt.Printf("Config directory does not exist: %s\n", sourceDir)
+		os.Exit(1)
+	}
+
+	// Check if the source directory has both config.yml and keys.yml files
+	if !HasNodeConfigFiles(sourceDir) {
+		fmt.Printf(ErrNotValidConfigDirMessage+": %s\n", sourceDir)
+		os.Exit(1)
+	}
+
+	// Construct the default directory path
+	defaultDir := filepath.Join(NodeConfigDir, "default")
+
+	// Create the symlink
+	if err := CreateSymlink(sourceDir, defaultDir); err != nil {
+		fmt.Printf("Failed to create symlink: %s\n", err)
+		os.Exit(1)
+	}
+
+	return nil
+}
+
+func CreateDefaultNodeConfig(name string) (*config.Config, error) {
+	userLookup, err := GetCurrentSudoUser()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting current user: %v\n", err)
+		os.Exit(1)
+	}
+
+	// create the config directory
+	configsDir := GetNodeConfigHomeDir()
+	configPath := filepath.Join(configsDir, name)
+	ValidateAndCreateDir(configPath, userLookup)
+
+	// create the default config files
+	nodeConfig, err := config.LoadConfig(configPath, "", false)
+	if err != nil {
+		return nil, err
+	}
+
+	// make sure the config directory is owned by the current user
+	ChownPath(configPath, userLookup, true)
+
+	// now set the default config alias for use in qclient commands
+	SetDefaultNodeConfig(name)
+
+	return nodeConfig, nil
 }

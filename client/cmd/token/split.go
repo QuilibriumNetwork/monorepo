@@ -18,7 +18,7 @@ import (
 
 var parts int
 var partAmount string
-var splitCmd = &cobra.Command{
+var SplitCmd = &cobra.Command{
 	Use:   "split",
 	Short: "Splits a coin into multiple coins",
 	Long: `Splits a coin into multiple coins:
@@ -165,12 +165,6 @@ var splitCmd = &cobra.Command{
 			panic(err)
 		}
 	},
-}
-
-func init() {
-	splitCmd.Flags().IntVarP(&parts, "parts", "p", 1, "number of parts to split the coin into")
-	splitCmd.Flags().StringVarP(&partAmount, "part-amount", "a", "", "amount of each part")
-	TokenCmd.AddCommand(splitCmd)
 }
 
 func Split(args []string, amounts [][]byte, payload []byte, totalAmount *big.Int) ([][]byte, []byte, error) {

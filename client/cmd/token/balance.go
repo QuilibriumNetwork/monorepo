@@ -11,7 +11,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
-var balanceCmd = &cobra.Command{
+var BalanceCmd = &cobra.Command{
 	Use:   "balance",
 	Short: "Lists the total balance of tokens in the managing account",
 	Run: func(cmd *cobra.Command, args []string) {
@@ -86,8 +86,4 @@ var balanceCmd = &cobra.Command{
 			))
 		}
 	},
-}
-
-func init() {
-	TokenCmd.AddCommand(balanceCmd)
 }

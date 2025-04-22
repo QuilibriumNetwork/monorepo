@@ -10,19 +10,15 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"runtime"
+
+	cp "github.com/otiai10/copy"
 )
 
-var ClientInstallPath = filepath.Join("/opt/quilibrium/", string(ReleaseTypeQClient))
-var RootQuilibriumPath = filepath.Join("/var/quilibrium/")
-var BinaryPath = filepath.Join(RootQuilibriumPath, "bin")
-var ClientDataPath = filepath.Join(BinaryPath, string(ReleaseTypeQClient))
-var NodeDataPath = filepath.Join(BinaryPath, string(ReleaseTypeNode))
-var DefaultSymlinkDir = "/usr/local/bin"
-var DefaultNodeSymlinkPath = filepath.Join(DefaultSymlinkDir, string(ReleaseTypeNode))
-var DefaultQClientSymlinkPath = filepath.Join(DefaultSymlinkDir, string(ReleaseTypeQClient))
-var osType = runtime.GOOS
-var arch = runtime.GOARCH
+var (
+	RootQuilibriumPath = filepath.Join("/var/quilibrium/")
+	BinaryPath         = filepath.Join(RootQuilibriumPath, "bin")
+	DefaultSymlinkDir  = "/usr/local/bin"
+)
 
 // CalculateFileHashes calculates SHA256 and MD5 hashes for a file
 func CalculateFileHashes(filePath string) (string, string, error) {
@@ -234,4 +230,12 @@ func CopyFile(src, dst string) error {
 	}
 
 	return os.WriteFile(dst, sourceData, 0600)
+}
+
+func CopyDir(src, dst string) error {
+	err := cp.Copy(src, dst)
+	if err != nil {
+		return err
+	}
+	return nil
 }

@@ -12,7 +12,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
-var mergeCmd = &cobra.Command{
+var MergeCmd = &cobra.Command{
 	Use:   "merge [all|<Coin Addresses>...]",
 	Short: "Merges multiple coins",
 	Long: `Merges multiple coins:
@@ -155,8 +155,4 @@ var mergeCmd = &cobra.Command{
 
 		fmt.Println("Merge transaction sent successfully.")
 	},
-}
-
-func init() {
-	TokenCmd.AddCommand(mergeCmd)
 }

@@ -12,10 +12,11 @@ import (
 
 var symlinkPath = "/usr/local/bin/qclient"
 
-var linkCmd = &cobra.Command{
+var LinkCmd = &cobra.Command{
 	Use:   "link",
-	Short: "Create a symlink to qclient in PATH",
-	Long: `Create a symlink to the qclient binary in the directory /usr/local/bin/.
+	Short: "Create a symlink to the Qlient binary (requires sudo)",
+	Long: `Create a symlink to the qclient binary in the directory /usr/local/bin/ and 
+	allows a user to run qclient from anywhere using the shortened 'qclient' command.
 
 Example: qclient link`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -93,8 +94,4 @@ func moveExecutableToStandardLocation(execPath string) error {
 	}
 
 	return nil
-}
-
-func init() {
-	rootCmd.AddCommand(linkCmd)
 }

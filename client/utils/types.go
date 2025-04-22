@@ -1,9 +1,12 @@
 package utils
 
 type ClientConfig struct {
-	DataDir        string `yaml:"dataDir"`
-	SymlinkPath    string `yaml:"symlinkPath"`
-	SignatureCheck bool   `yaml:"signatureCheck"`
+	DataDir         string `yaml:"dataDir"`
+	SymlinkPath     string `yaml:"symlinkPath"`
+	SignatureCheck  bool   `yaml:"signatureCheck"`
+	PublicRpc       bool   `yaml:"publicRpc"`
+	CustomRpc       string `yaml:"customRpc"`
+	NodeSymlinkName string `yaml:"nodeSymlinkName"`
 }
 
 type NodeConfig struct {

@@ -11,26 +11,28 @@ import (
 	"strings"
 )
 
+var (
+	OsType = runtime.GOOS
+	Arch   = runtime.GOARCH
+)
+
 // GetSystemInfo determines and validates the OS and architecture
 func GetSystemInfo() (string, string, error) {
-	osType := runtime.GOOS
-	arch := runtime.GOARCH
-
 	// Check if OS type is supported
-	if osType != "darwin" && osType != "linux" {
-		return "", "", fmt.Errorf("unsupported operating system: %s", osType)
+	if OsType != "darwin" && OsType != "linux" {
+		return "", "", fmt.Errorf("unsupported operating system: %s", OsType)
 	}
 
 	// Map Go architecture names to Quilibrium architecture names
-	if arch == "amd64" {
-		arch = "amd64"
-	} else if arch == "arm64" {
-		arch = "arm64"
+	if Arch == "amd64" {
+		Arch = "amd64"
+	} else if Arch == "arm64" {
+		Arch = "arm64"
 	} else {
-		return "", "", fmt.Errorf("unsupported architecture: %s", arch)
+		return "", "", fmt.Errorf("unsupported architecture: %s", Arch)
 	}
 
-	return osType, arch, nil
+	return OsType, Arch, nil
 }
 
 func GetCurrentSudoUser() (*user.User, error) {

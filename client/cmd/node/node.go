@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	configCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/nodeconfig"
 	proverCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/prover"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
@@ -14,19 +15,10 @@ import (
 )
 
 var (
-	// Base URL for Quilibrium releases
-	baseReleaseURL = "https://releases.quilibrium.com"
-
-	// Default symlink path for the node binary
-	defaultSymlinkPath = "/usr/local/bin/quilibrium-node"
-	logPath            = "/var/log/quilibrium"
-
-	ServiceName = "quilibrium-node"
-
 	OsType string
 	Arch   string
 
-	configDirectory string
+	ConfigDirectory string
 	NodeConfig      *config.Config
 
 	NodeUser        *user.User
@@ -56,7 +48,21 @@ var NodeCmd = &cobra.Command{
 		}
 		NodeUser = userLookup
 		ConfigDirs = filepath.Join(userLookup.HomeDir, ".quilibrium", "configs")
-		NodeConfigToRun = filepath.Join(userLookup.HomeDir, ".quilibrium", "configs", "default")
+		NodeConfig, err = utils.LoadDefaultNodeConfig()
+		if err != nil {
+			if err.Error() == utils.ErrConfigNotFoundErrorMessage {
+				fmt.Println("Config not found, creating default configuration...")
+				nodeConfig, err := utils.CreateDefaultNodeConfig(utils.DefaultNodeConfigName)
+				if err != nil {
+					fmt.Printf("error creating default node config: %s\n", err)
+					os.Exit(1)
+				}
+				NodeConfig = nodeConfig
+			} else {
+				fmt.Printf("error loading node config: %s\n", err)
+				os.Exit(1)
+			}
+		}
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
@@ -64,20 +70,21 @@ var NodeCmd = &cobra.Command{
 }
 
 func init() {
-	NodeCmd.PersistentFlags().StringVar(&configDirectory, "config", ".config", "config directory (default is .config/)")
+	NodeCmd.PersistentFlags().StringVar(&ConfigDirectory, "config", ".config", "config directory (default is .config/)")
+	viper.BindPFlag("config", NodeCmd.PersistentFlags().Lookup("config"))
 
 	// Add subcommands
-	NodeCmd.AddCommand(InstallCmd)
-	NodeCmd.AddCommand(configCmd.ConfigCmd)
-	NodeCmd.AddCommand(updateNodeCmd)
-	NodeCmd.AddCommand(nodeServiceCmd)
+	NodeCmd.AddCommand(configCmd.NodeConfigCmd)
 	NodeCmd.AddCommand(proverCmd.ProverCmd)
-	localOsType, localArch, err := utils.GetSystemInfo()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
+	NodeCmd.AddCommand(NodeAutoUpdateCmd)
+	NodeCmd.AddCommand(NodeCleanCmd)
+	NodeCmd.AddCommand(NodeInfoCmd)
+	NodeCmd.AddCommand(NodeInstallCmd)
+	NodeCmd.AddCommand(NodeServiceCmd)
+	NodeCmd.AddCommand(NodeUpdateCmd)
+	NodeCmd.AddCommand(NodeUninstallCmd)
+	NodeCmd.AddCommand(NodeLinkCmd)
 
-	OsType = localOsType
-	Arch = localArch
+	OsType = utils.OsType
+	Arch = utils.Arch
 }

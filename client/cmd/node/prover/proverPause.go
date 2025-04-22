@@ -24,7 +24,7 @@ import (
 
 var NodeConfig *nodeConfig.Config
 
-var proverPauseCmd = &cobra.Command{
+var NodeProverPauseCmd = &cobra.Command{
 	Use:   "pause",
 	Short: "Pauses a prover",
 	Long: `Pauses a prover (use in emergency when a worker isn't coming back online):
@@ -157,8 +157,4 @@ func publishMessage(
 		return errors.Wrap(err, "publish message")
 	}
 	return pubsub.PublishToBitmask(filter, data)
-}
-
-func init() {
-	ProverCmd.AddCommand(proverPauseCmd)
 }

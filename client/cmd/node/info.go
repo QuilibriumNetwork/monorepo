@@ -3,44 +3,67 @@ package node
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
 
+var (
+	LatestVersion bool
+)
+
 // infoCmd represents the info command
-var infoCmd = &cobra.Command{
-	Use:   "info",
+var NodeInfoCmd = &cobra.Command{
+	Use:   "info [config-name]",
 	Short: "Get information about the Quilibrium node",
 	Long: `Get information about the Quilibrium node.
-Available subcommands:
-  latest-version    Get the latest available version of Quilibrium node
 
 Examples:
-  # Get the latest version
-  qclient node info latest-version`,
+  # Prints the latest node version available for download
+  qclient node info --latest-version`,
+	Run: func(cmd *cobra.Command, args []string) {
+		if len(args) > 0 {
+			NodeGetInfo(args[0])
+		} else {
+			NodeGetInfo("default")
+		}
+	},
+}
+
+func NodeGetInfo(configName string) {
+	configPath := filepath.Join(ConfigDirs, configName)
+	if !utils.FileExists(configPath) {
+		fmt.Fprintf(os.Stderr, "Error: Config file %s not found\n", configPath)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Fetching node information for config: %s (%s)\n", configName, configPath)
+
+	// Execute the command and capture output
+	output, err := exec.Command(utils.NodeServiceName, "--node-info", "--config", configPath).Output()
+	if err != nil {
+		fmt.Println(string(output))
+		fmt.Fprintf(os.Stderr, "Error executing node info command: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Print the output from the command
+	fmt.Println(output)
 }
 
 // latestVersionCmd represents the latest-version command
-var latestVersionCmd = &cobra.Command{
-	Use:   "latest-version",
-	Short: "Get the latest available version of Quilibrium node",
-	Long: `Get the latest available version of Quilibrium node by querying the releases API.
-This command fetches the version information from https://releases.quilibrium.com/release.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		version, err := utils.GetLatestVersion(utils.ReleaseTypeNode)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return
-		}
-		fmt.Fprintf(os.Stdout, "Latest available version: %s\n", version)
-	},
+func NodeGetLatestVersion() {
+	version, err := utils.GetLatestVersion(utils.ReleaseTypeNode)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stdout, "Latest available version: %s\n", version)
 }
 
 func init() {
 	// Add the latest-version subcommand to the info command
-	infoCmd.AddCommand(latestVersionCmd)
-
-	// Add the info command to the node command
-	NodeCmd.AddCommand(infoCmd)
+	NodeInfoCmd.Flags().BoolVarP(&LatestVersion, "latest-version", "l", false, "Get the latest available version of Quilibrium node")
 }

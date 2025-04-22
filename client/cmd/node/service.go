@@ -12,7 +12,7 @@ import (
 )
 
 // nodeServiceCmd represents the command to manage the Quilibrium node service
-var nodeServiceCmd = &cobra.Command{
+var NodeServiceCmd = &cobra.Command{
 	Use:   "service [command]",
 	Short: "Manage the Quilibrium node service",
 	Long: `Manage the Quilibrium node service.
@@ -54,9 +54,13 @@ Examples:
 			reloadService()
 		case "install":
 			installService()
+		case "update":
+			updateServiceFile()
+		case "uninstall":
+			removeService()
 		default:
 			fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
-			fmt.Fprintf(os.Stderr, "Available commands: start, stop, restart, status, enable, disable, reload, install\n")
+			fmt.Fprintf(os.Stderr, "Available commands: start, stop, restart, status, enable, disable, reload, install, update, uninstall\n")
 			os.Exit(1)
 		}
 	},
@@ -64,7 +68,6 @@ Examples:
 
 // installService installs the appropriate service configuration for the current OS
 func installService() {
-
 	if err := utils.CheckAndRequestSudo("Installing service requires root privileges"); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
@@ -81,7 +84,7 @@ func installService() {
 			// install systemd if not found
 			installSystemd()
 		}
-		if err := createSystemdServiceFile(); err != nil {
+		if err := createSystemdServiceFile(true); err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating systemd service file: %v\n", err)
 			return
 		}
@@ -121,14 +124,14 @@ func startService() {
 
 	if OsType == "darwin" {
 		// MacOS launchd command
-		cmd := exec.Command("sudo", "launchctl", "start", fmt.Sprintf("com.quilibrium.%s", ServiceName))
+		cmd := exec.Command("sudo", "launchctl", "start", fmt.Sprintf("com.quilibrium.%s", utils.NodeServiceName))
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error starting service: %v\n", err)
 			return
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "start", ServiceName)
+		cmd := exec.Command("sudo", "systemctl", "start", utils.NodeServiceName)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error starting service: %v\n", err)
 			return
@@ -147,14 +150,14 @@ func stopService() {
 
 	if OsType == "darwin" {
 		// MacOS launchd command
-		cmd := exec.Command("sudo", "launchctl", "stop", fmt.Sprintf("com.quilibrium.%s", ServiceName))
+		cmd := exec.Command("sudo", "launchctl", "stop", fmt.Sprintf("com.quilibrium.%s", utils.NodeServiceName))
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error stopping service: %v\n", err)
 			return
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "stop", ServiceName)
+		cmd := exec.Command("sudo", "systemctl", "stop", utils.NodeServiceName)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error stopping service: %v\n", err)
 			return
@@ -173,20 +176,20 @@ func restartService() {
 
 	if OsType == "darwin" {
 		// MacOS launchd command - stop then start
-		stopCmd := exec.Command("sudo", "launchctl", "stop", fmt.Sprintf("com.quilibrium.%s", ServiceName))
+		stopCmd := exec.Command("sudo", "launchctl", "stop", fmt.Sprintf("com.quilibrium.%s", utils.NodeServiceName))
 		if err := stopCmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error stopping service: %v\n", err)
 			return
 		}
 
-		startCmd := exec.Command("sudo", "launchctl", "start", fmt.Sprintf("com.quilibrium.%s", ServiceName))
+		startCmd := exec.Command("sudo", "launchctl", "start", fmt.Sprintf("com.quilibrium.%s", utils.NodeServiceName))
 		if err := startCmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error starting service: %v\n", err)
 			return
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "restart", ServiceName)
+		cmd := exec.Command("sudo", "systemctl", "restart", utils.NodeServiceName)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error restarting service: %v\n", err)
 			return
@@ -205,7 +208,7 @@ func reloadService() {
 
 	if OsType == "darwin" {
 		// MacOS launchd command - unload then load
-		plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", ServiceName)
+		plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", utils.NodeServiceName)
 		unloadCmd := exec.Command("sudo", "launchctl", "unload", plistPath)
 		if err := unloadCmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error unloading service: %v\n", err)
@@ -240,7 +243,7 @@ func checkServiceStatus() {
 
 	if OsType == "darwin" {
 		// MacOS launchd command
-		cmd := exec.Command("sudo", "launchctl", "list", fmt.Sprintf("com.quilibrium.%s", ServiceName))
+		cmd := exec.Command("sudo", "launchctl", "list", fmt.Sprintf("com.quilibrium.%s", utils.NodeServiceName))
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -248,7 +251,7 @@ func checkServiceStatus() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "status", ServiceName)
+		cmd := exec.Command("sudo", "systemctl", "status", utils.NodeServiceName)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -266,7 +269,7 @@ func enableService() {
 
 	if OsType == "darwin" {
 		// MacOS launchd command - load with -w flag to enable at boot
-		plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", ServiceName)
+		plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", utils.NodeServiceName)
 		cmd := exec.Command("sudo", "launchctl", "load", "-w", plistPath)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error enabling service: %v\n", err)
@@ -274,7 +277,7 @@ func enableService() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "enable", ServiceName)
+		cmd := exec.Command("sudo", "systemctl", "enable", utils.NodeServiceName)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error enabling service: %v\n", err)
 			return
@@ -293,7 +296,7 @@ func disableService() {
 
 	if OsType == "darwin" {
 		// MacOS launchd command - unload with -w flag to disable at boot
-		plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", ServiceName)
+		plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", utils.NodeServiceName)
 		cmd := exec.Command("sudo", "launchctl", "unload", "-w", plistPath)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error disabling service: %v\n", err)
@@ -301,7 +304,7 @@ func disableService() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "disable", ServiceName)
+		cmd := exec.Command("sudo", "systemctl", "disable", utils.NodeServiceName)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error disabling service: %v\n", err)
 			return
@@ -314,7 +317,7 @@ func disableService() {
 func createService() {
 	// Create systemd service file
 	if OsType == "linux" {
-		if err := createSystemdServiceFile(); err != nil {
+		if err := createSystemdServiceFile(true); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to create systemd service file: %v\n", err)
 		}
 	} else if OsType == "darwin" {
@@ -325,8 +328,78 @@ func createService() {
 	}
 }
 
+func removeService() {
+	if err := utils.CheckAndRequestSudo("Installing service requires root privileges"); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+
+	if OsType == "linux" {
+		if err := removeSystemdServiceFile(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to remove systemd service file: %v\n", err)
+		}
+	} else if OsType == "darwin" {
+		if err := removeMacOSService(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to remove launchd service file: %v\n", err)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: Background service file removal not supported on %s\n", OsType)
+	}
+}
+
+func removeSystemdServiceFile() error {
+	servicePath := "/etc/systemd/system/" + utils.NodeServiceName + ".service"
+	if err := os.Remove(servicePath); err != nil {
+		return fmt.Errorf("failed to remove systemd service file: %w", err)
+	}
+	return nil
+}
+
+func removeMacOSService() error {
+	plistPath := fmt.Sprintf("/Library/LaunchDaemons/com.quilibrium.%s.plist", utils.NodeServiceName)
+	if err := os.Remove(plistPath); err != nil {
+		return fmt.Errorf("failed to remove launchd service file: %w", err)
+	}
+	return nil
+}
+
+// updateServiceFile updates the systemd service file with the latest configuration
+func updateServiceFile() {
+	// Create systemd service file
+	if OsType == "linux" {
+		if err := createSystemdServiceFile(false); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to create systemd service file: %v\n", err)
+		}
+	} else if OsType == "darwin" {
+		installMacOSService()
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: Background service file creation not supported on %s\n", OsType)
+		return
+	}
+
+	fmt.Fprintf(os.Stdout, "Service file updated successfully\n")
+}
+
+func CreateEnvFile() error {
+	// Create environment file content
+	envContent := `# Quilibrium Node Environment`
+
+	// Write environment file
+	if err := os.WriteFile(utils.NodeEnvPath, []byte(envContent), 0640); err != nil {
+		return fmt.Errorf("failed to create environment file: %w", err)
+	}
+
+	// Set ownership of environment file
+	chownCmd := utils.ChownPath(utils.NodeEnvPath, NodeUser, false)
+	if chownCmd != nil {
+		return fmt.Errorf("failed to set environment file ownership: %w", chownCmd)
+	}
+
+	return nil
+}
+
 // createSystemdServiceFile creates the systemd service file with environment file support
-func createSystemdServiceFile() error {
+func createSystemdServiceFile(createEnvFile bool) error {
 	if !utils.CheckForSystemd() {
 		installSystemd()
 	}
@@ -336,38 +409,38 @@ func createSystemdServiceFile() error {
 		return fmt.Errorf("failed to get sudo privileges: %w", err)
 	}
 
-	// Create environment file content
-	envContent := `# Quilibrium Node Environment`
-
-	// Write environment file
 	envPath := filepath.Join(utils.RootQuilibriumPath, "quilibrium.env")
-	if err := os.WriteFile(envPath, []byte(envContent), 0640); err != nil {
-		return fmt.Errorf("failed to create environment file: %w", err)
-	}
-
-	// Set ownership of environment file
-	chownCmd := utils.ChownPath(envPath, NodeUser, false)
-	if chownCmd != nil {
-		return fmt.Errorf("failed to set environment file ownership: %w", chownCmd)
+	if createEnvFile {
+		if err := CreateEnvFile(); err != nil {
+			return fmt.Errorf("failed to create environment file: %w", err)
+		}
 	}
 
 	// Create systemd service file content
 	serviceContent := fmt.Sprintf(`[Unit]
 Description=Quilibrium Node Service
 After=network.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=quilibrium
-EnvironmentFile=/opt/quilibrium/config/quilibrium.env
-ExecStart=/usr/local/bin/quilibrium-node --config %s
-Restart=on-failure
+EnvironmentFile=/var/quilibrium/quilibrium.env
+ExecStart=/usr/local/bin/` + utils.NodeServiceName + ` --config ` + ConfigDirs + `/default
+Restart=always
 RestartSec=10
+ExecStop=/bin/kill -s SIGINT $MAINPID
+ExecReload=/bin/kill -s SIGINT $MAINPID && /usr/local/bin/` + utils.NodeServiceName + ` --config ` + ConfigDirs + `/default
+KillSignal=SIGINT
+RestartSignal=SIGINT
+FinalKillSignal=SIGKILL
+KillSignal=SIGKILL
+TimeoutStopSec=240
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-`, ConfigDirs+"/default")
+`)
 
 	// Write service file
 	servicePath := "/etc/systemd/system/quilibrium-node.service"
@@ -389,6 +462,8 @@ WantedBy=multi-user.target
 // installMacOSService installs a launchd service on macOS
 func installMacOSService() {
 	fmt.Println("Installing launchd service for Quilibrium node...")
+	// TODO: Add env file support
+	// https://superuser.com/questions/476752/setting-environment-variables-in-os-x-for-gui-applications
 
 	// Create plist file content
 	plistTemplate := `<?xml version="1.0" encoding="UTF-8"?>
@@ -443,7 +518,7 @@ func installMacOSService() {
 		Label:       fmt.Sprintf("com.quilibrium.node"),
 		DataPath:    utils.NodeDataPath,
 		ServiceName: "node",
-		LogPath:     logPath,
+		LogPath:     utils.LogPath,
 	}
 
 	// Parse and execute template

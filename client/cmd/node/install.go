@@ -10,7 +10,7 @@ import (
 )
 
 // installCmd represents the command to install the Quilibrium node
-var InstallCmd = &cobra.Command{
+var NodeInstallCmd = &cobra.Command{
 	Use:   "install [version]",
 	Short: "Install Quilibrium node",
 	Long: `Install Quilibrium node binary and create a service to run it.

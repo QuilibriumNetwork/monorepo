@@ -3,15 +3,20 @@ package node
 import (
 	"fmt"
 	"os"
+	"os/exec"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
 
+var (
+	restart bool
+)
+
 // updateNodeCmd represents the command to update the Quilibrium node
-var updateNodeCmd = &cobra.Command{
-	Use:   "update [version]",
-	Short: "Update Quilibrium node",
+var NodeUpdateCmd = &cobra.Command{
+	Use:   "update [version] [--restart|-r]",
+	Short: "Update the Quilibrium node version",
 	Long: `Update Quilibrium node to a specified version or the latest version.
 If no version is specified, the latest version will be installed.
 
@@ -20,7 +25,10 @@ Examples:
   qclient node update
 
   # Update to a specific version
-  qclient node update 2.1.0`,
+  qclient node update 2.1.0
+  
+  # Update to the latest version and restart the node
+  qclient node update --restart`,
 	Args: cobra.RangeArgs(0, 1),
 	Run: func(cmd *cobra.Command, args []string) {
 		// Get system information and validate
@@ -49,11 +57,20 @@ Examples:
 
 		// Update the node
 		updateNode(version)
+
+		if restart {
+			restartNode()
+		}
 	},
 }
 
-func init() {
-
+func restartNode() {
+	fmt.Println("Restarting Quilibrium node service...")
+	if err := exec.Command("qclient", "node", "service", "restart").Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error restarting node service: %v\n", err)
+		return
+	}
+	fmt.Println("Node service restarted successfully.")
 }
 
 // updateNode handles the node update process
@@ -65,4 +82,8 @@ func updateNode(version string) {
 	}
 
 	InstallNode(version)
+}
+
+func init() {
+	NodeUpdateCmd.Flags().BoolVarP(&restart, "restart", "r", false, "Restart the node after updating")
 }

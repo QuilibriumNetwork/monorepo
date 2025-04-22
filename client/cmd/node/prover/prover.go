@@ -13,7 +13,6 @@ var ProverCmd = &cobra.Command{
 }
 
 func init() {
-	ProverCmd.PersistentFlags().StringVar(&ConfigDirectory, "config", ".config", "config directory (default is .config/)")
-	ProverCmd.AddCommand(proverPauseCmd)
-	ProverCmd.AddCommand(proverConfigMergeCmd)
+	ProverCmd.AddCommand(NodeProverPauseCmd)
+	ProverCmd.AddCommand(NodeProverConfigMergeCmd)
 }

@@ -9,12 +9,12 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
 
-var signatureCheckCmd = &cobra.Command{
+var ClientConfigSignatureCheckCmd = &cobra.Command{
 	Use:   "signature-check [true|false]",
 	Short: "Set signature check setting",
 	Long: `Set the signature check setting in the client configuration.
 When disabled, signature verification will be bypassed (not recommended for production use).
-Use 'true' to enable or 'false' to disable. If no argument is provided, it toggles the current setting.`,
+Use 'enable' or 'disable' to set the signature check setting. If no argument is provided, it toggles the current setting.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		config, err := utils.LoadClientConfig()
 		if err != nil {
@@ -25,13 +25,13 @@ Use 'true' to enable or 'false' to disable. If no argument is provided, it toggl
 		if len(args) > 0 {
 			// Set the signature check based on the provided argument
 			value := strings.ToLower(args[0])
-			if value == "true" {
+			if value == "enable" {
 				config.SignatureCheck = true
-			} else if value == "false" {
+			} else if value == "disable" {
 				config.SignatureCheck = false
 			} else {
 				// If the value is not true or false, print error message and exit
-				fmt.Printf("Error: Invalid value '%s'. Please use 'true' or 'false'.\n", value)
+				fmt.Printf("Error: Invalid value '%s'. Please use 'enable' or 'disable'.\n", value)
 				os.Exit(1)
 			}
 		} else {
@@ -51,8 +51,4 @@ Use 'true' to enable or 'false' to disable. If no argument is provided, it toggl
 		}
 		fmt.Printf("Signature check has been set to %s and will be persisted across future commands unless reset.\n", status)
 	},
-}
-
-func init() {
-	ConfigCmd.AddCommand(signatureCheckCmd)
 }

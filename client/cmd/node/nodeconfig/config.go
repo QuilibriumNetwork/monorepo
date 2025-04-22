@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
 var (
@@ -15,10 +16,11 @@ var (
 	ConfigDirs      string
 	NodeConfigToRun string
 	SetDefault      bool
+	NodeConfig      *config.Config
 )
 
 // ConfigCmd represents the node config command
-var ConfigCmd = &cobra.Command{
+var NodeConfigCmd = &cobra.Command{
 	Use:   "config",
 	Short: "Manage node configuration",
 	Long: `Manage Quilibrium node configuration.
@@ -30,6 +32,12 @@ This command provides utilities for configuring your Quilibrium node, such as:
 - Importing configuration
 `,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Store reference to parent's PersistentPreRun to call it first
+		parent := cmd.Parent()
+		if parent != nil && parent.PersistentPreRun != nil {
+			parent.PersistentPreRun(parent, args)
+		}
+
 		// Check if the config directory exists
 		user, err := utils.GetCurrentSudoUser()
 		if err != nil {
@@ -37,10 +45,6 @@ This command provides utilities for configuring your Quilibrium node, such as:
 			os.Exit(1)
 		}
 		ConfigDirs = filepath.Join(user.HomeDir, ".quilibrium", "configs")
-		NodeConfigToRun = filepath.Join(user.HomeDir, ".quilibrium", "configs", "default")
-		if utils.FileExists(ConfigDirs) {
-			utils.ValidateAndCreateDir(ConfigDirs, user)
-		}
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
@@ -48,13 +52,9 @@ This command provides utilities for configuring your Quilibrium node, such as:
 }
 
 func init() {
-	importCmd.Flags().BoolVarP(&SetDefault, "default", "d", false, "Select this config as the default")
-	ConfigCmd.AddCommand(importCmd)
-
-	ConfigCmd.AddCommand(SwitchConfigCmd)
-
-	createCmd.Flags().BoolVarP(&SetDefault, "default", "d", false, "Select this config as the default")
-	ConfigCmd.AddCommand(createCmd)
-	ConfigCmd.AddCommand(setCmd)
-
+	NodeConfigCmd.AddCommand(NodeConfigAssignRewardsCmd)
+	NodeConfigCmd.AddCommand(NodeConfigCreateCmd)
+	NodeConfigCmd.AddCommand(NodeConfigImportCmd)
+	NodeConfigCmd.AddCommand(NodeConfigSetCmd)
+	NodeConfigCmd.AddCommand(NodeConfigSwitchCmd)
 }

@@ -21,13 +21,13 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
-var configDirectory string
-var signatureCheck bool = true
-var byPassSignatureCheck bool = false
-var NodeConfig *config.Config
-var simulateFail bool
-var DryRun bool = false
-var ClientConfig *utils.ClientConfig
+var (
+	signatureCheck       bool = true
+	byPassSignatureCheck bool = false
+	simulateFail         bool
+	DryRun               bool = false
+	ClientConfig         *utils.ClientConfig
+)
 
 var StandardizedQClientFileName string = "qclient-" + config.GetVersionString() + "-" + osType + "-" + arch
 
@@ -43,7 +43,7 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 		}
 
 		if !utils.FileExists(utils.GetConfigPath()) {
-			fmt.Println("Client config not found, creating default config")
+			fmt.Println("A QClient config was not found, creating a default config")
 			utils.CreateDefaultConfig()
 		}
 
@@ -208,8 +208,13 @@ func init() {
 		"auto-approve and bypass signature check (sets signature-check=false)",
 	)
 
-	// Add the node command
+	// Add immediate sub commands
+	// following structure here: https://github.com/spf13/cobra/blob/main/site/content/user_guide.md#organizing-subcommands
 	rootCmd.AddCommand(node.NodeCmd)
 	rootCmd.AddCommand(clientConfig.ConfigCmd)
 	rootCmd.AddCommand(token.TokenCmd)
+	rootCmd.AddCommand(CrossMintCmd)
+	rootCmd.AddCommand(DownloadSignaturesCmd)
+	rootCmd.AddCommand(LinkCmd)
+	rootCmd.AddCommand(VersionCmd)
 }

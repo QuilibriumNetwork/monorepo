@@ -12,7 +12,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
-var coinsCmd = &cobra.Command{
+var CoinsCmd = &cobra.Command{
 	Use:   "coins",
 	Short: "Lists all coins under control of the managing account",
 	Long: `Lists all coins under control of the managing account.
@@ -134,8 +134,4 @@ var coinsCmd = &cobra.Command{
 			}
 		}
 	},
-}
-
-func init() {
-	TokenCmd.AddCommand(coinsCmd)
 }

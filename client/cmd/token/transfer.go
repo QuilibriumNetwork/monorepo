@@ -11,7 +11,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
-var transferCmd = &cobra.Command{
+var TransferCmd = &cobra.Command{
 	Use:   "transfer",
 	Short: "Creates a pending transfer of coin",
 	Long: `Creates a pending transfer of coin:
@@ -109,8 +109,4 @@ OfCoin – the address of the coin to send in whole`,
 
 		fmt.Println("Transaction sent successfully.")
 	},
-}
-
-func init() {
-	TokenCmd.AddCommand(transferCmd)
 }

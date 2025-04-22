@@ -12,7 +12,7 @@ import (
 )
 
 // autoUpdateCmd represents the command to setup automatic updates
-var autoUpdateCmd = &cobra.Command{
+var NodeAutoUpdateCmd = &cobra.Command{
 	Use:   "auto-update [enable|disable|status]",
 	Short: "Setup automatic update checks",
 	Long: `Setup, remove, or check status of a cron job to automatically check for Quilibrium node updates every 10 minutes.
@@ -44,10 +44,6 @@ Example:
 			checkAutoUpdateStatus()
 		}
 	},
-}
-
-func init() {
-	NodeCmd.AddCommand(autoUpdateCmd)
 }
 
 func setupCronJob() {
@@ -127,7 +123,7 @@ func setupUnixCron(qclientPath string) {
 
 	fmt.Fprintf(os.Stdout, "Setting up cron job...\n")
 	// Create cron expression: run every 10 minutes
-	cronExpression := fmt.Sprintf("*/10 * * * * %s node update > /dev/null 2>&1", qclientPath)
+	cronExpression := fmt.Sprintf("*/10 * * * * %s node update --restart > /dev/null 2>&1", qclientPath)
 
 	// Check existing crontab
 	checkCmd := exec.Command("crontab", "-l")
@@ -149,9 +145,7 @@ func setupUnixCron(qclientPath string) {
 
 	// Add new cron entry with indicators
 	newCrontab := currentCrontab
-	if strings.TrimSpace(newCrontab) != "" && !strings.HasSuffix(newCrontab, "\n") {
-		newCrontab += "\n"
-	}
+
 	newCrontab += "### qclient-auto-update\n" +
 		cronExpression + "\n" +
 		"### end-qclient-auto-update\n"
@@ -211,7 +205,8 @@ func removeUnixCron() {
 	endMarker := "### end-qclient-auto-update"
 
 	startIdx := strings.Index(currentCrontab, startMarker)
-	endIdx := strings.Index(currentCrontab, endMarker)
+	// +1 to include the newline after the end marker
+	endIdx := strings.Index(currentCrontab, endMarker) + 1
 
 	var newCrontab string
 	if startIdx >= 0 && endIdx >= 0 {
@@ -224,9 +219,6 @@ func removeUnixCron() {
 
 	// Clean up any leftover double newlines
 	newCrontab = strings.ReplaceAll(newCrontab, "\n\n\n", "\n\n")
-	if strings.TrimSpace(newCrontab) != "" && !strings.HasSuffix(newCrontab, "\n") {
-		newCrontab += "\n"
-	}
 
 	// Write to temporary file
 	tempFile, err := os.CreateTemp("", "qclient-crontab")

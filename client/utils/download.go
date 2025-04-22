@@ -14,7 +14,7 @@ var BaseReleaseURL = "https://releases.quilibrium.com"
 
 // DownloadRelease downloads a specific release file
 func DownloadRelease(releaseType ReleaseType, version string) error {
-	fileName := fmt.Sprintf("%s-%s-%s-%s", releaseType, version, osType, arch)
+	fileName := fmt.Sprintf("%s-%s-%s-%s", releaseType, version, OsType, Arch)
 	fmt.Printf("Getting binary %s...\n", fileName)
 	fmt.Println("Will save to", filepath.Join(BinaryPath, string(releaseType), version))
 	url := fmt.Sprintf("%s/%s", BaseReleaseURL, fileName)
@@ -100,7 +100,7 @@ func DownloadReleaseFile(releaseType ReleaseType, fileName string, version strin
 // DownloadReleaseSignatures downloads signature files for a release
 func DownloadReleaseSignatures(releaseType ReleaseType, version string) error {
 	var files []string
-	baseName := fmt.Sprintf("%s-%s-%s-%s", releaseType, version, osType, arch)
+	baseName := fmt.Sprintf("%s-%s-%s-%s", releaseType, version, OsType, Arch)
 	fmt.Printf("Searching for signatures for %s from %s\n", baseName, BaseReleaseURL)
 	fmt.Println("Will save to", filepath.Join(BinaryPath, string(releaseType), version))
 

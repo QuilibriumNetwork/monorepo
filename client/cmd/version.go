@@ -14,6 +14,7 @@ import (
 // Version information - fallback if executable name doesn't contain version
 var (
 	DefaultVersion = config.GetVersionString()
+	showChecksum   bool
 )
 
 // VersionInfo holds version and hash information
@@ -59,7 +60,7 @@ func GetVersionInfo(calcChecksum bool) (VersionInfo, error) {
 	}, nil
 }
 
-var versionCmd = &cobra.Command{
+var VersionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Display the qclient version",
 	Long:  `Display the qclient version and optionally calculate SHA256 and MD5 hashes of the executable.`,
@@ -84,6 +85,5 @@ var versionCmd = &cobra.Command{
 }
 
 func init() {
-	versionCmd.Flags().Bool("checksum", false, "Show SHA256 and MD5 checksums of the executable")
-	rootCmd.AddCommand(versionCmd)
+	VersionCmd.Flags().BoolVarP(&showChecksum, "checksum", "c", false, "Show SHA256 and MD5 hashes of the executable")
 }

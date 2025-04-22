@@ -56,21 +56,21 @@ func setupLogRotation() error {
     postrotate
         systemctl reload quilibrium-node >/dev/null 2>&1 || true
     endscript
-}`, logPath, NodeUser.Username, NodeUser.Username)
+}`, utils.LogPath, NodeUser.Username, NodeUser.Username)
 
 	// Write the configuration file
-	configPath := "/etc/logrotate.d/quilibrium-node"
+	configPath := "/etc/logrotate.d/" + utils.NodeServiceName
 	if err := utils.WriteFile(configPath, configContent); err != nil {
 		return fmt.Errorf("failed to create logrotate configuration: %w", err)
 	}
 
 	// Create log directory with proper permissions
-	if err := utils.ValidateAndCreateDir(logPath, NodeUser); err != nil {
+	if err := utils.ValidateAndCreateDir(utils.LogPath, NodeUser); err != nil {
 		return fmt.Errorf("failed to create log directory: %w", err)
 	}
 
 	// Set ownership of log directory
-	err := utils.ChownPath(logPath, NodeUser, true)
+	err := utils.ChownPath(utils.LogPath, NodeUser, true)
 	if err != nil {
 		return fmt.Errorf("failed to set log directory ownership: %w", err)
 	}
@@ -94,15 +94,15 @@ func finishInstallation(version string) {
 	}
 
 	// Check if we need sudo privileges for creating symlink in system directory
-	if strings.HasPrefix(defaultSymlinkPath, "/usr/") || strings.HasPrefix(defaultSymlinkPath, "/bin/") || strings.HasPrefix(defaultSymlinkPath, "/sbin/") {
-		if err := utils.CheckAndRequestSudo(fmt.Sprintf("Creating symlink at %s requires root privileges", defaultSymlinkPath)); err != nil {
+	if strings.HasPrefix(utils.DefaultNodeSymlinkPath, "/usr/") || strings.HasPrefix(utils.DefaultNodeSymlinkPath, "/bin/") || strings.HasPrefix(utils.DefaultNodeSymlinkPath, "/sbin/") {
+		if err := utils.CheckAndRequestSudo(fmt.Sprintf("Creating symlink at %s requires root privileges", utils.DefaultNodeSymlinkPath)); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to get sudo privileges: %v\n", err)
 			return
 		}
 	}
 
 	// Create symlink using the utils package
-	if err := utils.CreateSymlink(nodeBinaryPath, defaultSymlinkPath); err != nil {
+	if err := utils.CreateSymlink(nodeBinaryPath, utils.DefaultNodeSymlinkPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating symlink: %v\n", err)
 	}
 
@@ -119,20 +119,19 @@ func finishInstallation(version string) {
 func printSuccessMessage(version string) {
 	fmt.Fprintf(os.Stdout, "\nSuccessfully installed Quilibrium node %s\n", version)
 	fmt.Fprintf(os.Stdout, "Binary download directory: %s\n", filepath.Join(utils.NodeDataPath, version))
-	fmt.Fprintf(os.Stdout, "Binary symlinked to %s\n", defaultSymlinkPath)
-	fmt.Fprintf(os.Stdout, "Log directory: %s\n", logPath)
+	fmt.Fprintf(os.Stdout, "Binary symlinked to %s\n", utils.DefaultNodeSymlinkPath)
+	fmt.Fprintf(os.Stdout, "Log directory: %s\n", utils.LogPath)
 	fmt.Fprintf(os.Stdout, "Environment file: /etc/default/quilibrium-node\n")
 	fmt.Fprintf(os.Stdout, "Service file: /etc/systemd/system/quilibrium-node.service\n")
 
 	fmt.Fprintf(os.Stdout, "\nConfiguration:\n")
 	fmt.Fprintf(os.Stdout, "  To create a new configuration:\n")
 	fmt.Fprintf(os.Stdout, "    qclient node config create [name] --default\n")
-	fmt.Fprintf(os.Stdout, "    quilibrium-node --peer-id %s/default-config\n", ConfigDirs)
 
 	fmt.Fprintf(os.Stdout, "\n  To use an existing configuration:\n")
-	fmt.Fprintf(os.Stdout, "    cp -r /path/to/your/existing/config %s/default-config\n", ConfigDirs)
+	fmt.Fprintf(os.Stdout, "    qclient node config import [name] /path/to/your/existing/config --default\n")
 	fmt.Fprintf(os.Stdout, "    # Or modify the service file to point to your existing config:\n")
-	fmt.Fprintf(os.Stdout, "    sudo nano /etc/systemd/system/quilibrium-node.service\n")
+	fmt.Fprintf(os.Stdout, "    sudo nano /etc/systemd/system/"+utils.NodeServiceName+".service\n")
 	fmt.Fprintf(os.Stdout, "    # Then reload systemd:\n")
 	fmt.Fprintf(os.Stdout, "    sudo systemctl daemon-reload\n")
 
@@ -142,11 +141,10 @@ func printSuccessMessage(version string) {
 	fmt.Fprintf(os.Stdout, "  qclient node config create --default\n")
 
 	fmt.Fprintf(os.Stdout, "\nTo manually start the node (must create a config first), you can run:\n")
-	fmt.Fprintf(os.Stdout, "  %s --config %s/myconfig/\n",
-		ServiceName, ConfigDirs)
+	fmt.Fprintf(os.Stdout, "  "+utils.NodeServiceName+" --config "+ConfigDirs+"/myconfig/\n")
 	fmt.Fprintf(os.Stdout, "  # Or use systemd service using the default config:\n")
-	fmt.Fprintf(os.Stdout, "  sudo systemctl start quilibrium-node\n")
+	fmt.Fprintf(os.Stdout, "  sudo systemctl start "+utils.NodeServiceName+"\n")
 
 	fmt.Fprintf(os.Stdout, "\nFor more options, run:\n")
-	fmt.Fprintf(os.Stdout, "  quilibrium-node --help\n")
+	fmt.Fprintf(os.Stdout, "  "+utils.NodeServiceName+" --help\n")
 }

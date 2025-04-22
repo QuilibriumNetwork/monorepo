@@ -41,3 +41,18 @@ package nodeconfig
 // Rewards address: 0x1234567890abcdef1234567890abcdef1234567890abcdef
 //
 // Successfully updated my-config
+
+import (
+	"fmt"
+
+	"github.com/spf13/cobra"
+)
+
+var NodeConfigAssignRewardsCmd = &cobra.Command{
+	Use:   "assign-rewards [config-name]",
+	Short: "Assign rewards to a config",
+	Long:  `Assign rewards to a config`,
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Println("assign-rewards command to be implemented")
+	},
+}

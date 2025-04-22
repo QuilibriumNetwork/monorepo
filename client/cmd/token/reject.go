@@ -6,7 +6,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var rejectCmd = &cobra.Command{
+var RejectCmd = &cobra.Command{
 	Use:   "reject",
 	Short: "Rejects the pending transaction",
 	Long: `Rejects a pending transfer:
@@ -18,8 +18,4 @@ var rejectCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("command not yet available")
 	},
-}
-
-func init() {
-	TokenCmd.AddCommand(rejectCmd)
 }

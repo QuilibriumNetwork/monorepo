@@ -6,7 +6,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var acceptCmd = &cobra.Command{
+var AcceptCmd = &cobra.Command{
 	Use:   "accept",
 	Short: "Accepts a pending transfer",
 	Long: `Accepts a pending transfer:
@@ -18,8 +18,4 @@ var acceptCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("command not yet available")
 	},
-}
-
-func init() {
-	TokenCmd.AddCommand(acceptCmd)
 }

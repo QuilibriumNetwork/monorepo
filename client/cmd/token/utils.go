@@ -12,7 +12,15 @@ import (
 )
 
 func GetGRPCClient() (*grpc.ClientConn, error) {
-	addr := "rpc.quilibrium.com:8337"
+	customRpc := ClientConfig.CustomRpc
+
+	var addr string
+	if customRpc != "" {
+		addr = customRpc
+	} else {
+		addr = "rpc.quilibrium.com:8337"
+	}
+
 	credentials := credentials.NewTLS(&tls.Config{InsecureSkipVerify: false})
 	if !LightNode {
 		ma, err := multiaddr.NewMultiaddr(NodeConfig.ListenGRPCMultiaddr)

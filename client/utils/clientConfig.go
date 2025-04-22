@@ -8,10 +8,6 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-var ClientConfigDir = filepath.Join(os.Getenv("HOME"), ".quilibrium")
-var ClientConfigFile = string(ReleaseTypeQClient) + "-config.yaml"
-var ClientConfigPath = filepath.Join(ClientConfigDir, ClientConfigFile)
-
 func CreateDefaultConfig() {
 	configPath := GetConfigPath()
 
@@ -20,6 +16,8 @@ func CreateDefaultConfig() {
 		DataDir:        ClientDataPath,
 		SymlinkPath:    DefaultQClientSymlinkPath,
 		SignatureCheck: true,
+		PublicRpc:      false,
+		CustomRpc:      "",
 	})
 
 	sudoUser, err := GetCurrentSudoUser()
@@ -40,6 +38,8 @@ func LoadClientConfig() (*ClientConfig, error) {
 			DataDir:        ClientDataPath,
 			SymlinkPath:    filepath.Join(ClientDataPath, "current"),
 			SignatureCheck: true,
+			PublicRpc:      false,
+			CustomRpc:      "",
 		}
 		if err := SaveClientConfig(config); err != nil {
 			return nil, err

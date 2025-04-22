@@ -24,7 +24,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
-var allCmd = &cobra.Command{
+var AllCmd = &cobra.Command{
 	Use:   "all",
 	Short: "Mints all pre-2.0 rewards",
 
@@ -268,8 +268,4 @@ var allCmd = &cobra.Command{
 			}
 		}
 	},
-}
-
-func init() {
-	mintCmd.AddCommand(allCmd)
 }

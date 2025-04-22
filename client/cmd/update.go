@@ -20,8 +20,8 @@ var (
 // updateCmd represents the command to update the Quilibrium client
 var updateCmd = &cobra.Command{
 	Use:   "update [version]",
-	Short: "Update Quilibrium client",
-	Long: `Update Quilibrium client to a specified version or the latest version.
+	Short: "Update Quilibrium QClient version",
+	Long: `Update Quilibrium QClient to a specified version or the latest version.
 If no version is specified, the latest version will be installed.
 
 If the current version is already the latest version, the command will exit with a message.
@@ -88,13 +88,13 @@ func updateClient(version string) {
 	}
 
 	// Check if we need sudo privileges
-	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Updating client at %s requires root privileges", utils.ClientInstallPath)); err != nil {
+	if err := utils.CheckAndRequestSudo(fmt.Sprintf("Updating client at %s requires root privileges", utils.ClientDataPath)); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
 
 	// Create version-specific installation directory
-	versionDir := filepath.Join(utils.ClientInstallPath, version)
+	versionDir := filepath.Join(utils.ClientDataPath, version)
 	if err := os.MkdirAll(versionDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating installation directory: %v\n", err)
 		return
