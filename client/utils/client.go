@@ -11,4 +11,5 @@ var (
 	ClientConfigFile          = string(ReleaseTypeQClient) + "-config.yaml"
 	ClientConfigPath          = filepath.Join(ClientConfigDir, ClientConfigFile)
 	DefaultQClientSymlinkPath = filepath.Join(DefaultSymlinkDir, string(ReleaseTypeQClient))
+	ReservedDefaultConfigName = "default"
 )

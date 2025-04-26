@@ -53,7 +53,7 @@ This will symlink %s/mynode to %s`, ConfigDirs, NodeConfigToRun),
 			name = configs[choice-1]
 		}
 
-		if name == "default" {
+		if name == utils.ReservedDefaultConfigName {
 			fmt.Println("Invalid configuration name. The 'default' is reserved for the default configuration.")
 			os.Exit(1)
 		}

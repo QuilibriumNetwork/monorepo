@@ -27,7 +27,7 @@ Examples:
 		if len(args) > 0 {
 			NodeGetInfo(args[0])
 		} else {
-			NodeGetInfo("default")
+			NodeGetInfo(utils.ReservedDefaultConfigName)
 		}
 	},
 }

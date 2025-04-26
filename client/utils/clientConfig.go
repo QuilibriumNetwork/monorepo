@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v2"
 )
@@ -18,6 +19,7 @@ func CreateDefaultConfig() {
 		SignatureCheck: true,
 		PublicRpc:      false,
 		CustomRpc:      "",
+		AddressList:    make(map[string]string),
 	})
 
 	sudoUser, err := GetCurrentSudoUser()
@@ -40,6 +42,7 @@ func LoadClientConfig() (*ClientConfig, error) {
 			SignatureCheck: true,
 			PublicRpc:      false,
 			CustomRpc:      "",
+			AddressList:    make(map[string]string),
 		}
 		if err := SaveClientConfig(config); err != nil {
 			return nil, err
@@ -88,4 +91,50 @@ func GetConfigDir() string {
 // IsClientConfigured checks if the client is configured
 func IsClientConfigured() bool {
 	return FileExists(ClientConfigPath)
+}
+
+func GetAddressList() (map[string]string, error) {
+	config, err := LoadClientConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if AddressList is nil, and initialize it if necessary
+	if config.AddressList == nil {
+		config.AddressList = make(map[string]string)
+	}
+
+	// Get list of configs in ConfigDir (excluding default)
+	configDir := GetConfigDir()
+	if configDir == "" {
+		configDir = filepath.Join(GetUserQuilibriumDir(), "configs")
+	}
+
+	files, err := os.ReadDir(configDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config directory: %w", err)
+	}
+
+	for _, file := range files {
+		if !file.IsDir() || file.Name() == ReservedDefaultConfigName {
+			continue
+		}
+
+		tempConfig, err := LoadNodeConfig(file.Name())
+		if err != nil {
+			continue // Skip files that can't be parsed
+		}
+
+		address, err := GetAccountFromNodeConfig(tempConfig)
+		if err != nil {
+			continue // Skip files that can't be parsed
+		}
+
+		// Extract address from filename or content if available
+		name := strings.TrimSuffix(file.Name(), filepath.Ext(file.Name()))
+		if _, ok := config.AddressList[name]; ok {
+			config.AddressList[name] = string(address)
+		}
+	}
+	return config.AddressList, nil
 }

@@ -218,5 +218,5 @@ func decodeHexString(hexStr string) ([]byte, error) {
 }
 
 func init() {
-	CrossMintCmd.PersistentFlags().StringVar(&ConfigDirectory, "config", "default", "config directory")
+	CrossMintCmd.PersistentFlags().StringVar(&ConfigDirectory, "config", utils.ReservedDefaultConfigName, "config directory")
 }

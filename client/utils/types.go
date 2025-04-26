@@ -1,12 +1,13 @@
 package utils
 
 type ClientConfig struct {
-	DataDir         string `yaml:"dataDir"`
-	SymlinkPath     string `yaml:"symlinkPath"`
-	SignatureCheck  bool   `yaml:"signatureCheck"`
-	PublicRpc       bool   `yaml:"publicRpc"`
-	CustomRpc       string `yaml:"customRpc"`
-	NodeSymlinkName string `yaml:"nodeSymlinkName"`
+	DataDir         string            `yaml:"dataDir"`
+	SymlinkPath     string            `yaml:"symlinkPath"`
+	SignatureCheck  bool              `yaml:"signatureCheck"`
+	PublicRpc       bool              `yaml:"publicRpc"`
+	CustomRpc       string            `yaml:"customRpc"`
+	NodeSymlinkName string            `yaml:"nodeSymlinkName"`
+	AddressList     map[string]string `yaml:"addresses"`
 }
 
 type NodeConfig struct {

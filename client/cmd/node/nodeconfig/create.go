@@ -41,7 +41,7 @@ The third example will create a new configuration at %s/myconfig and symlink it 
 		}
 
 		// Check if trying to use "default" which is reserved for the symlink
-		if configName == "default" {
+		if configName == utils.ReservedDefaultConfigName {
 			fmt.Println("Error: 'default' is reserved for the symlink. Please use a different name.")
 			os.Exit(1)
 		}
@@ -72,5 +72,5 @@ The third example will create a new configuration at %s/myconfig and symlink it 
 }
 
 func init() {
-	NodeConfigCreateCmd.Flags().BoolVarP(&SetDefault, "default", "d", false, "Select this config as the default")
+	NodeConfigCreateCmd.Flags().BoolVarP(&SetDefault, utils.ReservedDefaultConfigName, "d", false, "Select this config as the default")
 }

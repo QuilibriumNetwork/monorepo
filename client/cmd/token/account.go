@@ -3,7 +3,6 @@ package token
 import (
 	"fmt"
 
-	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
@@ -12,13 +11,10 @@ var AccountCmd = &cobra.Command{
 	Use:   "account",
 	Short: "Shows the account address of the managing account",
 	Run: func(cmd *cobra.Command, args []string) {
-		peerId := utils.GetPeerIDFromConfig(NodeConfig)
-		addr, err := poseidon.HashBytes([]byte(peerId))
+		account, err := utils.GetAccountFromNodeConfig(NodeConfig)
 		if err != nil {
 			panic(err)
 		}
-
-		addrBytes := addr.FillBytes(make([]byte, 32))
-		fmt.Printf("Account: 0x%x\n", addrBytes)
+		fmt.Printf("Account: 0x%x\n", account)
 	},
 }

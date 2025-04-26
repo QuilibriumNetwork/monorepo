@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -116,7 +117,7 @@ func LoadDefaultNodeConfig() (*config.Config, error) {
 
 func LoadNodeConfig(configDirectory string) (*config.Config, error) {
 	// if the provided config directory is "default", load the default config
-	if configDirectory == "default" {
+	if configDirectory == ReservedDefaultConfigName {
 		return LoadDefaultNodeConfig()
 	}
 
@@ -187,7 +188,7 @@ func SetDefaultNodeConfig(configName string) error {
 	}
 
 	// Construct the default directory path
-	defaultDir := filepath.Join(NodeConfigDir, "default")
+	defaultDir := filepath.Join(NodeConfigDir, ReservedDefaultConfigName)
 
 	// Create the symlink
 	if err := CreateSymlink(sourceDir, defaultDir); err != nil {
@@ -223,4 +224,14 @@ func CreateDefaultNodeConfig(name string) (*config.Config, error) {
 	SetDefaultNodeConfig(name)
 
 	return nodeConfig, nil
+}
+
+func GetAccountFromNodeConfig(config *config.Config) ([]byte, error) {
+	peerId := GetPeerIDFromConfig(config)
+	addr, err := poseidon.HashBytes([]byte(peerId))
+	if err != nil {
+		panic(err)
+	}
+
+	return addr.FillBytes(make([]byte, 32)), nil
 }
