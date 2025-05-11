@@ -213,7 +213,7 @@ func (e *DataClockConsensusEngine) applySnapshot(
 		return nil
 	}
 
-	temporaryStore := store.NewPebbleDB(&config.DBConfig{
+	temporaryStore := store.NewMDBXDB(&config.DBConfig{
 		Path: snapshotDBPath,
 	})
 	temporaryClockStore := store.NewPebbleClockStore(temporaryStore, e.logger)
