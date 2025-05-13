@@ -514,43 +514,47 @@ func (n noopClose) Close() error {
 }
 
 type MDBXBatch struct {
-	db    *MDBXDB
-	calls []func(tx Transaction) error
+	db         *MDBXDB
+	operations []BatchOperation
 }
 
 // Abort implements Transaction.
 func (m *MDBXBatch) Abort() error {
-	m.calls = nil
+	m.operations = nil
 	return nil
 }
 
 // Commit implements Transaction.
 func (m *MDBXBatch) Commit() error {
 	tx := m.db.NewTransaction()
-	for _, call := range m.calls {
-		err := call(tx)
+	var err error
+	for _, op := range m.operations {
+		switch op.opcode {
+		case Set:
+			err = tx.Set(op.operand1, op.operand2)
+		case Delete:
+			err = tx.Delete(op.operand1)
+		case DeleteRange:
+			err = tx.DeleteRange(op.operand1, op.operand2)
+		}
 		if err != nil {
 			tx.Abort()
 			return err
 		}
 	}
-	m.calls = nil
+	m.operations = nil
 	return tx.Commit()
 }
 
 // Delete implements Transaction.
 func (m *MDBXBatch) Delete(key []byte) error {
-	m.calls = append(m.calls, func(tx Transaction) error {
-		return tx.Delete(key)
-	})
+	m.operations = append(m.operations, BatchOperation{opcode: Delete, operand1: key})
 	return nil
 }
 
 // DeleteRange implements Transaction.
 func (m *MDBXBatch) DeleteRange(lowerBound []byte, upperBound []byte) error {
-	m.calls = append(m.calls, func(tx Transaction) error {
-		return tx.DeleteRange(lowerBound, upperBound)
-	})
+	m.operations = append(m.operations, BatchOperation{opcode: DeleteRange, operand1: lowerBound, operand2: upperBound})
 	return nil
 }
 
@@ -566,10 +570,20 @@ func (m *MDBXBatch) NewIter(lowerBound []byte, upperBound []byte) (Iterator, err
 
 // Set implements Transaction.
 func (m *MDBXBatch) Set(key []byte, value []byte) error {
-	m.calls = append(m.calls, func(tx Transaction) error {
-		return tx.Set(key, value)
-	})
+	m.operations = append(m.operations, BatchOperation{opcode: Set, operand1: key, operand2: value})
 	return nil
 }
 
 var _ Transaction = (*MDBXBatch)(nil)
+
+type BatchOperation struct {
+	opcode   uint8
+	operand1 []byte
+	operand2 []byte
+}
+
+const (
+	Set = iota
+	Delete
+	DeleteRange
+)
