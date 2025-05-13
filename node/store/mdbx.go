@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"runtime"
+	"sync/atomic"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/erigontech/mdbx-go/mdbx"
@@ -14,6 +16,11 @@ type MDBXDB struct {
 	env *mdbx.Env
 	dbi mdbx.DBI
 }
+
+// this is ugly but I did not find a better way
+var created = false
+var readTxs atomic.Int32
+var writeTxs atomic.Int32
 
 const GB = 1 << 30
 const MB = 1 << 20
@@ -28,6 +35,10 @@ const PAGE_SIZE = 4096
 const DEFAULT_TABLE = "default" // we use only one for now
 
 func NewMDBXDB(config *config.DBConfig) *MDBXDB {
+	if created {
+		panic("do not create two instances")
+	}
+	created = true
 	env, err := mdbx.NewEnv(mdbx.Default)
 	if err != nil {
 		panic(err)
@@ -89,12 +100,18 @@ func (m *MDBXDB) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 func (m *MDBXDB) Set(key, value []byte) error {
+	if writeTxs.Load() > 1 {
+		panic("another tx is writing")
+	}
 	return m.env.Update(func(txn *mdbx.Txn) error {
 		return txn.Put(m.dbi, key, value, mdbx.Upsert)
 	})
 }
 
 func (m *MDBXDB) Delete(key []byte) error {
+	if writeTxs.Load() > 1 {
+		panic("another tx is writing")
+	}
 	return m.env.Update(func(txn *mdbx.Txn) error {
 		return txn.Del(m.dbi, key, nil)
 	})
@@ -103,8 +120,21 @@ func (m *MDBXDB) Delete(key []byte) error {
 func (m *MDBXDB) NewBatch(indexed bool) Transaction {
 	// MDBX doesn't have a direct equivalent to Pebble's indexed batch
 	// We'll use a regular transaction for both cases
+	return &MDBXBatch{
+		db: m,
+	}
+}
+
+func (m *MDBXDB) NewTransaction() Transaction {
 	txn, err := m.env.BeginTxn(nil, 0)
+	if writeTxs.Load() > 1 {
+		panic("another tx is writing")
+	}
+	writeTxs.Add(1)
+	runtime.LockOSThread()
 	if err != nil {
+		writeTxs.Add(-1)
+		runtime.UnlockOSThread()
 		panic(err)
 	}
 
@@ -115,18 +145,20 @@ func (m *MDBXDB) NewBatch(indexed bool) Transaction {
 }
 
 func (m *MDBXDB) NewIter(lowerBound []byte, upperBound []byte) (Iterator, error) {
-	return m.NewIterCustom(lowerBound, upperBound)
-}
-
-func (m *MDBXDB) NewIterCustom(lowerBound []byte, upperBound []byte) (*MDBXIterator, error) {
 	txn, err := m.env.BeginTxn(nil, mdbx.Readonly)
+	runtime.LockOSThread()
+	readTxs.Add(1)
 	if err != nil {
+		runtime.UnlockOSThread()
+		readTxs.Add(-1)
 		return nil, err
 	}
 
 	cursor, err := txn.OpenCursor(m.dbi)
 	if err != nil {
 		txn.Abort()
+		runtime.UnlockOSThread()
+		readTxs.Add(-1)
 		return nil, err
 	}
 
@@ -136,6 +168,7 @@ func (m *MDBXDB) NewIterCustom(lowerBound []byte, upperBound []byte) (*MDBXItera
 		lowerBound: lowerBound,
 		upperBound: upperBound,
 		valid:      false,
+		txOwner:    true,
 	}, nil
 }
 
@@ -158,17 +191,13 @@ func (m *MDBXDB) Close() error {
 }
 
 func (m *MDBXDB) DeleteRange(start, end []byte) error {
-	iter, err := m.NewIterCustom(start, end)
-	defer iter.Close()
+	tx := m.NewBatch(false)
+	err := tx.DeleteRange(start, end)
 	if err != nil {
+		tx.Abort()
 		return err
 	}
-	for iter.First(); iter.Valid(); iter.Next() {
-		err = iter.cursor.Del(mdbx.Current)
-		if err != nil {
-			return err
-		}
-	}
+	tx.Commit()
 	return nil
 }
 
@@ -204,6 +233,8 @@ func (t *MDBXTransaction) Set(key []byte, value []byte) error {
 func (t *MDBXTransaction) Commit() error {
 	// we drop latency here, but it should be saved as metric
 	_, err := t.txn.Commit()
+	runtime.UnlockOSThread()
+	writeTxs.Add(-1)
 	return err
 }
 
@@ -213,6 +244,8 @@ func (t *MDBXTransaction) Delete(key []byte) error {
 
 func (t *MDBXTransaction) Abort() error {
 	t.txn.Abort()
+	runtime.UnlockOSThread()
+	writeTxs.Add(-1)
 	return nil
 }
 
@@ -244,6 +277,7 @@ func (t *MDBXTransaction) NewIterCustom(lowerBound []byte, upperBound []byte) (*
 		valid:      upperBound == nil || bytes.Compare(key, upperBound) < 0,
 		key:        key,
 		value:      value,
+		txOwner:    false,
 	}, nil
 }
 
@@ -254,7 +288,7 @@ func (t *MDBXTransaction) DeleteRange(lowerBound []byte, upperBound []byte) erro
 		return err
 	}
 	for iter.First(); iter.Valid(); iter.Next() {
-		err = iter.cursor.Del(mdbx.Current)
+		err = iter.txn.Del(t.dbi, iter.key, nil)
 		if err != nil {
 			return err
 		}
@@ -274,6 +308,7 @@ type MDBXIterator struct {
 	key        []byte
 	value      []byte
 	valid      bool
+	txOwner    bool
 }
 
 func (i *MDBXIterator) Key() []byte {
@@ -368,7 +403,11 @@ func (i *MDBXIterator) Value() []byte {
 func (i *MDBXIterator) Close() error {
 	i.valid = false
 	i.cursor.Close()
-	i.txn.Abort()
+	if i.txOwner {
+		i.txn.Abort()
+		readTxs.Add(-1)
+		runtime.UnlockOSThread()
+	}
 	return nil
 }
 
@@ -473,3 +512,64 @@ type noopClose struct{}
 func (n noopClose) Close() error {
 	return nil
 }
+
+type MDBXBatch struct {
+	db    *MDBXDB
+	calls []func(tx Transaction) error
+}
+
+// Abort implements Transaction.
+func (m *MDBXBatch) Abort() error {
+	m.calls = nil
+	return nil
+}
+
+// Commit implements Transaction.
+func (m *MDBXBatch) Commit() error {
+	tx := m.db.NewTransaction()
+	for _, call := range m.calls {
+		err := call(tx)
+		if err != nil {
+			tx.Abort()
+			return err
+		}
+	}
+	m.calls = nil
+	return tx.Commit()
+}
+
+// Delete implements Transaction.
+func (m *MDBXBatch) Delete(key []byte) error {
+	m.calls = append(m.calls, func(tx Transaction) error {
+		return tx.Delete(key)
+	})
+	return nil
+}
+
+// DeleteRange implements Transaction.
+func (m *MDBXBatch) DeleteRange(lowerBound []byte, upperBound []byte) error {
+	m.calls = append(m.calls, func(tx Transaction) error {
+		return tx.DeleteRange(lowerBound, upperBound)
+	})
+	return nil
+}
+
+// Get implements Transaction.
+func (m *MDBXBatch) Get(key []byte) ([]byte, io.Closer, error) {
+	panic("unimplemented")
+}
+
+// NewIter implements Transaction.
+func (m *MDBXBatch) NewIter(lowerBound []byte, upperBound []byte) (Iterator, error) {
+	return m.db.NewIter(lowerBound, upperBound)
+}
+
+// Set implements Transaction.
+func (m *MDBXBatch) Set(key []byte, value []byte) error {
+	m.calls = append(m.calls, func(tx Transaction) error {
+		return tx.Set(key, value)
+	})
+	return nil
+}
+
+var _ Transaction = (*MDBXBatch)(nil)
