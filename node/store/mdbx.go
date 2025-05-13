@@ -526,24 +526,40 @@ func (m *MDBXBatch) Abort() error {
 
 // Commit implements Transaction.
 func (m *MDBXBatch) Commit() error {
-	tx := m.db.NewTransaction()
-	var err error
-	for _, op := range m.operations {
-		switch op.opcode {
-		case Set:
-			err = tx.Set(op.operand1, op.operand2)
-		case Delete:
-			err = tx.Delete(op.operand1)
-		case DeleteRange:
-			err = tx.DeleteRange(op.operand1, op.operand2)
+	err := m.db.env.Update(func(tx *mdbx.Txn) error {
+		var err error
+		for _, op := range m.operations {
+			switch op.opcode {
+			case Set:
+				err = tx.Put(m.db.dbi, op.operand1, op.operand2, mdbx.Upsert)
+			case Delete:
+				err = tx.Del(m.db.dbi, op.operand1, nil)
+			case DeleteRange:
+				cursor, err := tx.OpenCursor(m.db.dbi)
+				if err != nil {
+					return err
+				}
+				key, _, err := cursor.Get(op.operand1, nil, mdbx.SetRange)
+				for bytes.Compare(key, op.operand1) >= 0 && bytes.Compare(key, op.operand2) < 0 {
+					err = cursor.Del(mdbx.Current)
+					if err != nil {
+						return err
+					}
+					key, _, err = cursor.Get(nil, nil, mdbx.Next)
+					if err != nil {
+						return err
+					}
+				}
+				cursor.Close()
+			}
+			if err != nil {
+				return err
+			}
 		}
-		if err != nil {
-			tx.Abort()
-			return err
-		}
-	}
+		return err
+	})
 	m.operations = nil
-	return tx.Commit()
+	return err
 }
 
 // Delete implements Transaction.
