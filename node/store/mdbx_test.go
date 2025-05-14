@@ -407,4 +407,45 @@ func TestMDBXDB(t *testing.T) {
 		}
 	})
 
+	t.Run("OpenDB", func(t *testing.T) {
+		names := []string{DEFAULT_TABLE, "table1", "table2"}
+		var dbs []MDBXDB
+		for _, name := range names {
+			newdb, err := db.OpenDB(name)
+			if err != nil {
+				t.Errorf("error opening db: %v", err)
+				t.Fail()
+			}
+			dbs = append(dbs, *newdb)
+		}
+		for j, currentDB := range dbs {
+			for i := 1; i <= 5; i++ {
+				name := names[j]
+				key := []byte("key-" + string(rune('0'+i)))
+				value := []byte(name + string(rune('0'+i)))
+				if err := currentDB.Set(key, value); err != nil {
+					t.Fatalf("Failed to set value: %v", err)
+				}
+			}
+		}
+
+		// Check that values under the same key on different dbs were not overwritten
+		for j, currentDB := range dbs {
+			for i := 1; i <= 5; i++ {
+				name := names[j]
+				key := []byte("key-" + string(rune('0'+i)))
+				expectedValue := []byte(name + string(rune('0'+i)))
+				value, _, err := currentDB.Get(key)
+				if !bytes.Equal(value, expectedValue) {
+					t.Errorf("%s was overwritten by %s on db %s", expectedValue, value, name)
+					t.Fail()
+				}
+				if err != nil {
+					t.Errorf("Error getting value: %v", err)
+				}
+			}
+		}
+
+	})
+
 }

@@ -65,17 +65,30 @@ func NewMDBXDB(config *config.DBConfig) *MDBXDB {
 		panic(err)
 	}
 
-	// Open the database (we use a single one called default, but this should change later)
+	// Open the default database. Other databases are opened using OpenDB)
+	db := &MDBXDB{env: env}
+	db, err = db.OpenDB(DEFAULT_TABLE)
+	if err != nil {
+		panic(err)
+	}
+
+	return db
+}
+
+func (m *MDBXDB) OpenDB(name string) (*MDBXDB, error) {
 	var dbi mdbx.DBI
-	env.Update(func(txn *mdbx.Txn) error {
-		dbi, err = txn.OpenDBI(DEFAULT_TABLE, mdbx.Create, nil, nil)
+	var err error
+	err = m.env.Update(func(txn *mdbx.Txn) error {
+		dbi, err = txn.OpenDBI(name, mdbx.Create, nil, nil)
 		if err != nil {
 			return err
 		}
 		return nil
 	})
-
-	return &MDBXDB{env: env, dbi: dbi}
+	if err != nil {
+		return nil, err
+	}
+	return &MDBXDB{env: m.env, dbi: dbi}, nil
 }
 
 // KVDB interface implementation
