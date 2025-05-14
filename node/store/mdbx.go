@@ -67,15 +67,10 @@ func NewMDBXDB(config *config.DBConfig) *MDBXDB {
 
 	// Open the default database. Other databases are opened using OpenDB)
 	db := &MDBXDB{env: env}
-	db, err = db.OpenDB(DEFAULT_TABLE)
-	if err != nil {
-		panic(err)
-	}
-
-	return db
+	return db.OpenDB(DEFAULT_TABLE)
 }
 
-func (m *MDBXDB) OpenDB(name string) (*MDBXDB, error) {
+func (m *MDBXDB) OpenDB(name string) *MDBXDB {
 	var dbi mdbx.DBI
 	var err error
 	err = m.env.Update(func(txn *mdbx.Txn) error {
@@ -86,9 +81,9 @@ func (m *MDBXDB) OpenDB(name string) (*MDBXDB, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	return &MDBXDB{env: m.env, dbi: dbi}, nil
+	return &MDBXDB{env: m.env, dbi: dbi}
 }
 
 // KVDB interface implementation

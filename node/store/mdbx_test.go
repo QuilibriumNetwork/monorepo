@@ -411,7 +411,7 @@ func TestMDBXDB(t *testing.T) {
 		names := []string{DEFAULT_TABLE, "table1", "table2"}
 		var dbs []MDBXDB
 		for _, name := range names {
-			newdb, err := db.OpenDB(name)
+			newdb := db.OpenDB(name)
 			if err != nil {
 				t.Errorf("error opening db: %v", err)
 				t.Fail()
