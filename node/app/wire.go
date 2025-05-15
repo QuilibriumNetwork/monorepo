@@ -50,44 +50,16 @@ var keyManagerSet = wire.NewSet(
 	wire.Bind(new(keys.KeyManager), new(*keys.FileKeyManager)),
 )
 
-func provideBaseDB(dbConfig *config.DBConfig) *store.MDBXDB {
-	return store.NewMDBXDB(dbConfig)
-}
-
-func providePebbleClockStore(db *store.MDBXDB, logger *zap.Logger) *store.PebbleClockStore {
-	return store.NewPebbleClockStore(db.OpenDB("clock_store"), logger)
-}
-
-func providePebbleCoinStore(db *store.MDBXDB, logger *zap.Logger) *store.PebbleCoinStore {
-	return store.NewPebbleCoinStore(db.OpenDB("coin_store"), logger)
-}
-
-func providePebbleKeyStore(db *store.MDBXDB, logger *zap.Logger) *store.PebbleKeyStore {
-	return store.NewPebbleKeyStore(db.OpenDB("key_store"), logger)
-}
-
-func providePebbleDataProofStore(db *store.MDBXDB, logger *zap.Logger) *store.PebbleDataProofStore {
-	return store.NewPebbleDataProofStore(db.OpenDB("data_proof_store"), logger)
-}
-
-func providePebbleHypergraphStore(db *store.MDBXDB, logger *zap.Logger) *store.PebbleHypergraphStore {
-	return store.NewPebbleHypergraphStore(db.OpenDB("hypergraph_store"), logger)
-}
-
-func providePeerstoreDatastore(db *store.MDBXDB, logger *zap.Logger) *store.PeerstoreDatastore {
-	return store.NewPeerstoreDatastore(db.OpenDB("peerstore"))
-}
-
 var storeSet = wire.NewSet(
 	wire.FieldsOf(new(*config.Config), "DB"),
-	provideBaseDB,
+	store.NewMDBXDB,
 	wire.Bind(new(store.KVDB), new(*store.MDBXDB)),
-	providePebbleClockStore,
-	providePebbleCoinStore,
-	providePebbleKeyStore,
-	providePebbleDataProofStore,
-	providePebbleHypergraphStore,
-	providePeerstoreDatastore,
+	store.NewPebbleClockStore,
+	store.NewPebbleCoinStore,
+	store.NewPebbleKeyStore,
+	store.NewPebbleDataProofStore,
+	store.NewPebbleHypergraphStore,
+	store.NewPeerstoreDatastore,
 	wire.Bind(new(store.ClockStore), new(*store.PebbleClockStore)),
 	wire.Bind(new(store.CoinStore), new(*store.PebbleCoinStore)),
 	wire.Bind(new(store.KeyStore), new(*store.PebbleKeyStore)),

@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/cockroachdb/pebble"
@@ -13,8 +14,8 @@ import (
 )
 
 type MDBXDB struct {
-	env *mdbx.Env
-	dbi mdbx.DBI
+	env  *mdbx.Env
+	dbis map[byte]mdbx.DBI
 }
 
 // this is ugly but I did not find a better way
@@ -45,7 +46,7 @@ func NewMDBXDB(config *config.DBConfig) *MDBXDB {
 	}
 
 	// Configs
-	if err = env.SetOption(mdbx.OptMaxDB, 200); err != nil {
+	if err = env.SetOption(mdbx.OptMaxDB, 300); err != nil {
 		panic(err)
 	}
 	if err = env.SetOption(mdbx.OptMaxReaders, READERS_LIMIT); err != nil {
@@ -66,11 +67,15 @@ func NewMDBXDB(config *config.DBConfig) *MDBXDB {
 	}
 
 	// Open the default database. Other databases are opened using OpenDB)
-	db := &MDBXDB{env: env}
-	return db.OpenDB(DEFAULT_TABLE)
+	db := &MDBXDB{env: env, dbis: make(map[byte]mdbx.DBI)}
+	db.dbis[0] = db.OpenDB(DEFAULT_TABLE)
+	for i := byte(1); i < 255; i++ {
+		db.dbis[i] = db.OpenDB(strconv.Itoa(int(i)))
+	}
+	return db
 }
 
-func (m *MDBXDB) OpenDB(name string) *MDBXDB {
+func (m *MDBXDB) OpenDB(name string) mdbx.DBI {
 	var dbi mdbx.DBI
 	var err error
 	err = m.env.Update(func(txn *mdbx.Txn) error {
@@ -83,7 +88,7 @@ func (m *MDBXDB) OpenDB(name string) *MDBXDB {
 	if err != nil {
 		panic(err)
 	}
-	return &MDBXDB{env: m.env, dbi: dbi}
+	return dbi
 }
 
 // KVDB interface implementation
@@ -91,7 +96,7 @@ func (m *MDBXDB) Get(key []byte) ([]byte, io.Closer, error) {
 	var result []byte
 	var err error
 	err = m.env.View(func(txn *mdbx.Txn) error {
-		val, err := txn.Get(m.dbi, key)
+		val, err := txn.Get(m.dbis[key[0]], key)
 		if err != nil {
 			if mdbx.IsNotFound(err) {
 				return pebble.ErrNotFound
@@ -112,7 +117,7 @@ func (m *MDBXDB) Set(key, value []byte) error {
 		panic("another tx is writing")
 	}
 	return m.env.Update(func(txn *mdbx.Txn) error {
-		return txn.Put(m.dbi, key, value, mdbx.Upsert)
+		return txn.Put(m.dbis[key[0]], key, value, mdbx.Upsert)
 	})
 }
 
@@ -121,7 +126,7 @@ func (m *MDBXDB) Delete(key []byte) error {
 		panic("another tx is writing")
 	}
 	return m.env.Update(func(txn *mdbx.Txn) error {
-		return txn.Del(m.dbi, key, nil)
+		return txn.Del(m.dbis[key[0]], key, nil)
 	})
 }
 
@@ -148,7 +153,7 @@ func (m *MDBXDB) NewTransaction() Transaction {
 
 	return &MDBXTransaction{
 		txn: txn,
-		dbi: m.dbi,
+		db:  m,
 	}
 }
 
@@ -162,7 +167,7 @@ func (m *MDBXDB) NewIter(lowerBound []byte, upperBound []byte) (Iterator, error)
 		return nil, err
 	}
 
-	cursor, err := txn.OpenCursor(m.dbi)
+	cursor, err := txn.OpenCursor(m.dbis[lowerBound[0]])
 	if err != nil {
 		txn.Abort()
 		runtime.UnlockOSThread()
@@ -215,11 +220,11 @@ var _ KVDB = (*MDBXDB)(nil)
 // Transaction implementation
 type MDBXTransaction struct {
 	txn *mdbx.Txn
-	dbi mdbx.DBI
+	db  *MDBXDB
 }
 
 func (t *MDBXTransaction) Get(key []byte) ([]byte, io.Closer, error) {
-	val, err := t.txn.Get(t.dbi, key)
+	val, err := t.txn.Get(t.db.dbis[key[0]], key)
 	if err != nil {
 		if mdbx.IsNotFound(err) {
 			return nil, nil, pebble.ErrNotFound
@@ -235,7 +240,7 @@ func (t *MDBXTransaction) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 func (t *MDBXTransaction) Set(key []byte, value []byte) error {
-	return t.txn.Put(t.dbi, key, value, 0)
+	return t.txn.Put(t.db.dbis[key[0]], key, value, 0)
 }
 
 func (t *MDBXTransaction) Commit() error {
@@ -247,7 +252,7 @@ func (t *MDBXTransaction) Commit() error {
 }
 
 func (t *MDBXTransaction) Delete(key []byte) error {
-	return t.txn.Del(t.dbi, key, nil)
+	return t.txn.Del(t.db.dbis[key[0]], key, nil)
 }
 
 func (t *MDBXTransaction) Abort() error {
@@ -262,7 +267,7 @@ func (t *MDBXTransaction) NewIter(lowerBound []byte, upperBound []byte) (Iterato
 }
 
 func (t *MDBXTransaction) NewIterCustom(lowerBound []byte, upperBound []byte) (*MDBXIterator, error) {
-	cursor, err := t.txn.OpenCursor(t.dbi)
+	cursor, err := t.txn.OpenCursor(t.db.dbis[lowerBound[0]])
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +301,7 @@ func (t *MDBXTransaction) DeleteRange(lowerBound []byte, upperBound []byte) erro
 		return err
 	}
 	for iter.First(); iter.Valid(); iter.Next() {
-		err = iter.txn.Del(t.dbi, iter.key, nil)
+		err = iter.txn.Del(t.db.dbis[lowerBound[0]], iter.key, nil)
 		if err != nil {
 			return err
 		}
@@ -539,11 +544,11 @@ func (m *MDBXBatch) Commit() error {
 		for _, op := range m.operations {
 			switch op.opcode {
 			case Set:
-				err = tx.Put(m.db.dbi, op.operand1, op.operand2, mdbx.Upsert)
+				err = tx.Put(m.db.dbis[op.operand1[0]], op.operand1, op.operand2, mdbx.Upsert)
 			case Delete:
-				err = tx.Del(m.db.dbi, op.operand1, nil)
+				err = tx.Del(m.db.dbis[op.operand1[0]], op.operand1, nil)
 			case DeleteRange:
-				cursor, err := tx.OpenCursor(m.db.dbi)
+				cursor, err := tx.OpenCursor(m.db.dbis[op.operand1[0]])
 				if err != nil {
 					return err
 				}
