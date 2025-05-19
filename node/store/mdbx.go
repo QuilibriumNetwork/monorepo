@@ -553,6 +553,9 @@ func (m *MDBXBatch) Commit() error {
 					return err
 				}
 				key, _, err := cursor.Get(op.operand1, nil, mdbx.SetRange)
+				if err != nil {
+					return err
+				}
 				for bytes.Compare(key, op.operand1) >= 0 && bytes.Compare(key, op.operand2) < 0 {
 					err = cursor.Del(mdbx.Current)
 					if err != nil {
