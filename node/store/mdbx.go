@@ -10,7 +10,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/erigontech/mdbx-go/mdbx"
-	lz4 "github.com/pierrec/lz4/v4"
+	"github.com/golang/snappy"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
@@ -21,8 +21,7 @@ func compressValue(value []byte) ([]byte, error) {
 		return value, nil
 	}
 	var b bytes.Buffer
-	w := lz4.NewWriter(&b)
-	w.Apply(lz4.CompressionLevelOption(lz4.Fast))
+	w := snappy.NewBufferedWriter(&b)
 
 	if _, err := w.Write(value); err != nil {
 		return nil, err
@@ -43,7 +42,7 @@ func decompressValue(value []byte) ([]byte, error) {
 	}
 
 	// Create a zlib reader
-	r := lz4.NewReader(bytes.NewReader(value))
+	r := snappy.NewReader(bytes.NewReader(value))
 
 	// Read the decompressed data
 	var b bytes.Buffer
