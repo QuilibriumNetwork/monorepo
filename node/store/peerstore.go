@@ -41,11 +41,10 @@ var _ ds.Batching = (*PeerstoreDatastore)(nil)
 var _ ds.Batch = (*batch)(nil)
 var _ Peerstore = (*PeerstoreDatastore)(nil)
 
-func NewPeerstoreDatastore(db KVDB) (*PeerstoreDatastore, error) {
-	ds := PeerstoreDatastore{
+func NewPeerstoreDatastore(db KVDB) *PeerstoreDatastore {
+	return &PeerstoreDatastore{
 		db: db,
 	}
-	return &ds, nil
 }
 
 func (d *PeerstoreDatastore) Put(

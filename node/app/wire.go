@@ -52,8 +52,8 @@ var keyManagerSet = wire.NewSet(
 
 var storeSet = wire.NewSet(
 	wire.FieldsOf(new(*config.Config), "DB"),
-	store.NewPebbleDB,
-	wire.Bind(new(store.KVDB), new(*store.PebbleDB)),
+	store.NewMDBXDB,
+	wire.Bind(new(store.KVDB), new(*store.MDBXDB)),
 	store.NewPebbleClockStore,
 	store.NewPebbleCoinStore,
 	store.NewPebbleKeyStore,

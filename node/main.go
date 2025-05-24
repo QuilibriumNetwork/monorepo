@@ -97,6 +97,11 @@ var (
 		false,
 		"print node related information",
 	)
+	migrate = flag.String(
+		"migrate",
+		"",
+		"migrate from Pebble to MDBX from specified path (e.g. /home/user/backup/.config/store)",
+	)
 	debug = flag.Bool(
 		"debug",
 		false,
@@ -329,7 +334,7 @@ func main() {
 	}
 
 	if *compactDB && *core == 0 {
-		db := store.NewPebbleDB(nodeConfig.DB)
+		db := store.NewMDBXDB(nodeConfig.DB)
 		if err := db.CompactAll(); err != nil {
 			panic(err)
 		}
@@ -373,6 +378,60 @@ func main() {
 		}
 
 		console.Run()
+		return
+	}
+	if *migrate != "" {
+		fmt.Printf("Migrating from Pebble to MDBX from %s\n", *migrate)
+		d, err := os.Stat(filepath.Join(*migrate, "LOCK"))
+		if err != nil || d == nil {
+			fmt.Printf("%s does not look like a pebble db! Double check your path", *migrate)
+			return
+		}
+		dbConfig := &config.DBConfig{
+			Path: *migrate,
+		}
+		pebbleInput := store.NewPebbleDB(dbConfig)
+		mdbxOutput := store.NewMDBXDB(nodeConfig.DB)
+
+		allIter, err := pebbleInput.NewIter(nil, nil)
+		if err != nil {
+			panic(err)
+		}
+		batch := mdbxOutput.NewBatch(false)
+		total := 0
+		for allIter.First(); allIter.Valid(); allIter.Next() {
+			err := batch.Set(allIter.Key(), allIter.Value())
+			if err != nil {
+				panic(err)
+			}
+			total++
+			if total%10_000 == 0 {
+				err := batch.Commit()
+				if err != nil {
+					panic(err)
+				}
+				fmt.Printf("Commit. Total: %d\n", total)
+			}
+		}
+		err = batch.Commit()
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("Commit. Total: %d\n", total)
+		err = allIter.Close()
+		if err != nil {
+			panic(err)
+		}
+		err = pebbleInput.Close()
+		if err != nil {
+			panic(err)
+		}
+		err = mdbxOutput.Close()
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("Done.")
+
 		return
 	}
 
