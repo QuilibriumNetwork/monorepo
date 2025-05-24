@@ -20,17 +20,7 @@ func compressValue(value []byte) ([]byte, error) {
 	if value == nil {
 		return value, nil
 	}
-	var b bytes.Buffer
-	w := snappy.NewBufferedWriter(&b)
-
-	if _, err := w.Write(value); err != nil {
-		return nil, err
-	}
-
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
-	return b.Bytes(), nil
+	return snappy.Encode(nil, value), nil
 }
 
 // decompressValue decompresses a byte slice if it was compressed
@@ -40,17 +30,7 @@ func decompressValue(value []byte) ([]byte, error) {
 	if value == nil {
 		return value, nil
 	}
-
-	// Create a zlib reader
-	r := snappy.NewReader(bytes.NewReader(value))
-
-	// Read the decompressed data
-	var b bytes.Buffer
-	if _, err := io.Copy(&b, r); err != nil {
-		return nil, err
-	}
-
-	return b.Bytes(), nil
+	return snappy.Decode(nil, value)
 }
 
 type MDBXDB struct {
