@@ -2,7 +2,7 @@ package store
 
 import (
 	"bytes"
-	"compress/zlib"
+	"compress/gzip"
 	"io"
 	"os"
 	"runtime"
@@ -21,7 +21,7 @@ func compressValue(value []byte) ([]byte, error) {
 		return value, nil
 	}
 	var b bytes.Buffer
-	w, err := zlib.NewWriterLevel(&b, zlib.BestCompression)
+	w, err := gzip.NewWriterLevel(&b, gzip.BestSpeed)
 
 	if err != nil {
 		return nil, err
@@ -46,7 +46,7 @@ func decompressValue(value []byte) ([]byte, error) {
 	}
 
 	// Create a zlib reader
-	r, err := zlib.NewReader(bytes.NewReader(value))
+	r, err := gzip.NewReader(bytes.NewReader(value))
 	if err != nil {
 		return nil, err
 	}
