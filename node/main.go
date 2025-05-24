@@ -410,14 +410,14 @@ func main() {
 				if err != nil {
 					panic(err)
 				}
-				fmt.Printf("Commit. Total: %d", total)
+				fmt.Printf("Commit. Total: %d\n", total)
 			}
 		}
 		err = batch.Commit()
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("Commit. Total: %d", total)
+		fmt.Printf("Commit. Total: %d\n", total)
 		err = allIter.Close()
 		if err != nil {
 			panic(err)

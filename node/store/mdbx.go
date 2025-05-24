@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"compress/zlib"
 	"io"
 	"os"
 	"runtime"
@@ -12,6 +13,72 @@ import (
 	"github.com/erigontech/mdbx-go/mdbx"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
+
+// Compression header to identify compressed values
+var compressionHeader = []byte{0x1F, 0x8B}
+
+// compressValue compresses a byte slice using zlib compression
+// It adds a header to identify the value as compressed
+func compressValue(value []byte) ([]byte, error) {
+	// Don't compress small values or nil values
+	if len(value) < 64 {
+		return value, nil
+	}
+
+	var b bytes.Buffer
+	w := zlib.NewWriter(&b)
+
+	if _, err := w.Write(value); err != nil {
+		return nil, err
+	}
+
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+
+	// Add compression header to the compressed data
+	compressed := append(compressionHeader, b.Bytes()...)
+
+	// Only use compression if it actually reduces the size
+	if len(compressed) < len(value) {
+		return compressed, nil
+	}
+
+	// If compression doesn't help, return the original value
+	return value, nil
+}
+
+// decompressValue decompresses a byte slice if it was compressed
+// It checks for the compression header to determine if decompression is needed
+func decompressValue(value []byte) ([]byte, error) {
+	// Handle nil or empty values
+	if value == nil || len(value) < len(compressionHeader) {
+		return value, nil
+	}
+
+	// Check if the value has our compression header
+	if !bytes.Equal(value[:len(compressionHeader)], compressionHeader) {
+		return value, nil // Not compressed, return as is
+	}
+
+	// Remove the header before decompression
+	compressedData := value[len(compressionHeader):]
+
+	// Create a zlib reader
+	r, err := zlib.NewReader(bytes.NewReader(compressedData))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	// Read the decompressed data
+	var b bytes.Buffer
+	if _, err := io.Copy(&b, r); err != nil {
+		return nil, err
+	}
+
+	return b.Bytes(), nil
+}
 
 type MDBXDB struct {
 	env  *mdbx.Env
@@ -108,6 +175,14 @@ func (m *MDBXDB) Get(key []byte) ([]byte, io.Closer, error) {
 		return err
 	})
 
+	// Decompress the value if it was compressed
+	if result != nil {
+		result, err = decompressValue(result)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
 	// no closer, the transaction is already closed
 	return result, noopClose{}, err
 }
@@ -116,8 +191,15 @@ func (m *MDBXDB) Set(key, value []byte) error {
 	if writeTxs.Load() > 1 {
 		panic("another tx is writing")
 	}
+
+	// Compress the value before storing
+	compressedValue, err := compressValue(value)
+	if err != nil {
+		return err
+	}
+
 	return m.env.Update(func(txn *mdbx.Txn) error {
-		return txn.Put(m.dbis[key[0]], key, value, mdbx.Upsert)
+		return txn.Put(m.dbis[key[0]], key, compressedValue, mdbx.Upsert)
 	})
 }
 
@@ -236,11 +318,23 @@ func (t *MDBXTransaction) Get(key []byte) ([]byte, io.Closer, error) {
 	result := make([]byte, len(val))
 	copy(result, val)
 
+	// Decompress the value if it was compressed
+	result, err = decompressValue(result)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	return result, io.NopCloser(nil), nil
 }
 
 func (t *MDBXTransaction) Set(key []byte, value []byte) error {
-	return t.txn.Put(t.db.dbis[key[0]], key, value, 0)
+	// Compress the value before storing
+	compressedValue, err := compressValue(value)
+	if err != nil {
+		return err
+	}
+
+	return t.txn.Put(t.db.dbis[key[0]], key, compressedValue, 0)
 }
 
 func (t *MDBXTransaction) Commit() error {
