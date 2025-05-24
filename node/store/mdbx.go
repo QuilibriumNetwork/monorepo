@@ -21,12 +21,16 @@ var compressionHeader = []byte{0x1F, 0x8B}
 // It adds a header to identify the value as compressed
 func compressValue(value []byte) ([]byte, error) {
 	// Don't compress small values or nil values
-	if len(value) < 64 {
+	if len(value) < 20 {
 		return value, nil
 	}
 
 	var b bytes.Buffer
-	w := zlib.NewWriter(&b)
+	w, err := zlib.NewWriterLevel(&b, zlib.BestCompression)
+
+	if err != nil {
+		return nil, err
+	}
 
 	if _, err := w.Write(value); err != nil {
 		return nil, err
