@@ -2,7 +2,6 @@ package store
 
 import (
 	"bytes"
-	"compress/gzip"
 	"io"
 	"os"
 	"runtime"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/erigontech/mdbx-go/mdbx"
+	lz4 "github.com/pierrec/lz4/v4"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
@@ -21,11 +21,7 @@ func compressValue(value []byte) ([]byte, error) {
 		return value, nil
 	}
 	var b bytes.Buffer
-	w, err := gzip.NewWriterLevel(&b, gzip.BestSpeed)
-
-	if err != nil {
-		return nil, err
-	}
+	w := lz4.NewWriter(&b)
 
 	if _, err := w.Write(value); err != nil {
 		return nil, err
@@ -46,11 +42,7 @@ func decompressValue(value []byte) ([]byte, error) {
 	}
 
 	// Create a zlib reader
-	r, err := gzip.NewReader(bytes.NewReader(value))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
+	r := lz4.NewReader(bytes.NewReader(value))
 
 	// Read the decompressed data
 	var b bytes.Buffer
