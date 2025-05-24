@@ -22,6 +22,7 @@ func compressValue(value []byte) ([]byte, error) {
 	}
 	var b bytes.Buffer
 	w := lz4.NewWriter(&b)
+	w.Apply(lz4.CompressionLevelOption(lz4.Fast))
 
 	if _, err := w.Write(value); err != nil {
 		return nil, err
