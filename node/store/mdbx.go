@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"sync/atomic"
 
+	"github.com/DataDog/zstd"
 	"github.com/cockroachdb/pebble"
 	"github.com/erigontech/mdbx-go/mdbx"
-	lz4 "github.com/pierrec/lz4/v4"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
@@ -20,18 +20,11 @@ func compressValue(value []byte) ([]byte, error) {
 	if value == nil {
 		return value, nil
 	}
-	var b bytes.Buffer
-	w := lz4.NewWriter(&b)
-	w.Apply(lz4.CompressionLevelOption(lz4.Fast))
-
-	if _, err := w.Write(value); err != nil {
+	value, err := zstd.CompressLevel(nil, value, zstd.BestSpeed)
+	if err != nil {
 		return nil, err
 	}
-
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
-	return b.Bytes(), nil
+	return value, nil
 }
 
 // decompressValue decompresses a byte slice if it was compressed
@@ -41,17 +34,11 @@ func decompressValue(value []byte) ([]byte, error) {
 	if value == nil {
 		return value, nil
 	}
-
-	// Create a zlib reader
-	r := lz4.NewReader(bytes.NewReader(value))
-
-	// Read the decompressed data
-	var b bytes.Buffer
-	if _, err := io.Copy(&b, r); err != nil {
+	value, err := zstd.Decompress(nil, value)
+	if err != nil {
 		return nil, err
 	}
-
-	return b.Bytes(), nil
+	return value, err
 }
 
 type MDBXDB struct {
