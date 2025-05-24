@@ -674,13 +674,19 @@ func (m *MDBXBatch) Commit() error {
 
 // Delete implements Transaction.
 func (m *MDBXBatch) Delete(key []byte) error {
-	m.operations = append(m.operations, BatchOperation{opcode: Delete, operand1: key})
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	m.operations = append(m.operations, BatchOperation{opcode: Delete, operand1: keyCopy})
 	return nil
 }
 
 // DeleteRange implements Transaction.
 func (m *MDBXBatch) DeleteRange(lowerBound []byte, upperBound []byte) error {
-	m.operations = append(m.operations, BatchOperation{opcode: DeleteRange, operand1: lowerBound, operand2: upperBound})
+	lowCopy := make([]byte, len(lowerBound))
+	copy(lowCopy, lowerBound)
+	upCopy := make([]byte, len(upperBound))
+	copy(upCopy, upperBound)
+	m.operations = append(m.operations, BatchOperation{opcode: DeleteRange, operand1: lowCopy, operand2: upCopy})
 	return nil
 }
 
@@ -696,7 +702,11 @@ func (m *MDBXBatch) NewIter(lowerBound []byte, upperBound []byte) (Iterator, err
 
 // Set implements Transaction.
 func (m *MDBXBatch) Set(key []byte, value []byte) error {
-	m.operations = append(m.operations, BatchOperation{opcode: Set, operand1: key, operand2: value})
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+	m.operations = append(m.operations, BatchOperation{opcode: Set, operand1: keyCopy, operand2: valueCopy})
 	return nil
 }
 
