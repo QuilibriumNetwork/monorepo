@@ -14,17 +14,12 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 )
 
-// Compression header to identify compressed values
-var compressionHeader = []byte{0x1F, 0x8B}
-
 // compressValue compresses a byte slice using zlib compression
 // It adds a header to identify the value as compressed
 func compressValue(value []byte) ([]byte, error) {
-	// Don't compress small values or nil values
-	if len(value) < 20 {
+	if value == nil {
 		return value, nil
 	}
-
 	var b bytes.Buffer
 	w, err := zlib.NewWriterLevel(&b, zlib.BestCompression)
 
@@ -39,37 +34,19 @@ func compressValue(value []byte) ([]byte, error) {
 	if err := w.Close(); err != nil {
 		return nil, err
 	}
-
-	// Add compression header to the compressed data
-	compressed := append(compressionHeader, b.Bytes()...)
-
-	// Only use compression if it actually reduces the size
-	if len(compressed) < len(value) {
-		return compressed, nil
-	}
-
-	// If compression doesn't help, return the original value
-	return value, nil
+	return b.Bytes(), nil
 }
 
 // decompressValue decompresses a byte slice if it was compressed
 // It checks for the compression header to determine if decompression is needed
 func decompressValue(value []byte) ([]byte, error) {
 	// Handle nil or empty values
-	if value == nil || len(value) < len(compressionHeader) {
+	if value == nil {
 		return value, nil
 	}
 
-	// Check if the value has our compression header
-	if !bytes.Equal(value[:len(compressionHeader)], compressionHeader) {
-		return value, nil // Not compressed, return as is
-	}
-
-	// Remove the header before decompression
-	compressedData := value[len(compressionHeader):]
-
 	// Create a zlib reader
-	r, err := zlib.NewReader(bytes.NewReader(compressedData))
+	r, err := zlib.NewReader(bytes.NewReader(value))
 	if err != nil {
 		return nil, err
 	}
@@ -449,6 +426,11 @@ func (i *MDBXIterator) First() bool {
 		i.valid = false
 		return false
 	}
+	v, err = decompressValue(v)
+	if err != nil {
+		i.valid = false
+		return false
+	}
 
 	i.key = k
 	i.value = v
@@ -472,6 +454,11 @@ func (i *MDBXIterator) Next() bool {
 		i.valid = false
 		return false
 	}
+	v, err = decompressValue(v)
+	if err != nil {
+		i.valid = false
+		return false
+	}
 
 	i.key = k
 	i.value = v
@@ -491,6 +478,11 @@ func (i *MDBXIterator) Prev() bool {
 
 	// Check if key is within lower bound
 	if i.lowerBound != nil && bytes.Compare(k, i.lowerBound) < 0 {
+		i.valid = false
+		return false
+	}
+	v, err = decompressValue(v)
+	if err != nil {
 		i.valid = false
 		return false
 	}
@@ -555,6 +547,11 @@ func (i *MDBXIterator) SeekLT(target []byte) bool {
 		i.valid = false
 		return false
 	}
+	v, err = decompressValue(v)
+	if err != nil {
+		i.valid = false
+		return false
+	}
 
 	i.key = k
 	i.value = v
@@ -586,6 +583,11 @@ func (i *MDBXIterator) Last() bool {
 				return false
 			}
 		}
+	}
+	v, err = decompressValue(v)
+	if err != nil {
+		i.valid = false
+		return false
 	}
 
 	if err != nil {
@@ -708,8 +710,10 @@ func (m *MDBXBatch) NewIter(lowerBound []byte, upperBound []byte) (Iterator, err
 func (m *MDBXBatch) Set(key []byte, value []byte) error {
 	keyCopy := make([]byte, len(key))
 	copy(keyCopy, key)
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
+	valueCopy, err := compressValue(value)
+	if err != nil {
+		return err
+	}
 	m.operations = append(m.operations, BatchOperation{opcode: Set, operand1: keyCopy, operand2: valueCopy})
 	return nil
 }
