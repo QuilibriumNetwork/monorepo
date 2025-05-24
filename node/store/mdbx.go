@@ -96,8 +96,8 @@ const MB = 1 << 20
 // erigon defaults, should be tuned to quil
 const READERS_LIMIT = 32_000
 const RP_AUGMENT_LIMIT = 1_000_000
-const MAP_SIZE = 16 * GB
-const GROWTH_STEP = 2 * MB
+const MAP_SIZE = 2000 * GB
+const GROWTH_STEP = 2 * GB
 const PAGE_SIZE = 4096
 
 const DEFAULT_TABLE = "default" // we use only one for now
