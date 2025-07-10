@@ -5,12 +5,11 @@ import (
 	"os"
 	"testing"
 
-	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
 )
 
 func TestTransportError(t *testing.T) {
-	aa, _ := ma.StringCast("/ip4/1.2.3.4/tcp/1234")
+	aa := tStringCast("/ip4/1.2.3.4/tcp/1234")
 	te := &TransportError{Address: aa, Cause: ErrDialBackoff}
 	require.ErrorIs(t, te, ErrDialBackoff, "TransportError should implement Unwrap")
 }
@@ -21,8 +20,8 @@ func TestDialError(t *testing.T) {
 		"DialError Unwrap should handle DialError.Cause")
 	require.ErrorIs(t, de, de, "DialError Unwrap should handle match to self")
 
-	aa, _ := ma.StringCast("/ip4/1.2.3.4/tcp/1234")
-	ab, _ := ma.StringCast("/ip6/1::1/udp/1234/quic-v1")
+	aa := tStringCast("/ip4/1.2.3.4/tcp/1234")
+	ab := tStringCast("/ip6/1::1/udp/1234/quic-v1")
 	de = &DialError{
 		Peer: "pid",
 		DialErrors: []TransportError{

@@ -60,6 +60,13 @@ func WithTLSClientConfig(c *tls.Config) Option {
 	}
 }
 
+func WithHandshakeTimeout(d time.Duration) Option {
+	return func(t *transport) error {
+		t.handshakeTimeout = d
+		return nil
+	}
+}
+
 type transport struct {
 	privKey ic.PrivKey
 	pid     peer.ID
@@ -78,8 +85,9 @@ type transport struct {
 
 	noise *noise.Transport
 
-	connMx sync.Mutex
-	conns  map[quic.ConnectionTracingID]*conn // using quic-go's ConnectionTracingKey as map key
+	connMx           sync.Mutex
+	conns            map[quic.ConnectionTracingID]*conn // using quic-go's ConnectionTracingKey as map key
+	handshakeTimeout time.Duration
 }
 
 var _ tpt.Transport = &transport{}
@@ -99,13 +107,14 @@ func New(key ic.PrivKey, psk pnet.PSK, connManager *quicreuse.ConnManager, gater
 		return nil, err
 	}
 	t := &transport{
-		pid:         id,
-		privKey:     key,
-		rcmgr:       rcmgr,
-		gater:       gater,
-		clock:       clock.New(),
-		connManager: connManager,
-		conns:       map[quic.ConnectionTracingID]*conn{},
+		pid:              id,
+		privKey:          key,
+		rcmgr:            rcmgr,
+		gater:            gater,
+		clock:            clock.New(),
+		connManager:      connManager,
+		conns:            map[quic.ConnectionTracingID]*conn{},
+		handshakeTimeout: handshakeTimeout,
 	}
 	for _, opt := range opts {
 		if err := opt(t); err != nil {
@@ -158,30 +167,28 @@ func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p pee
 		return nil, err
 	}
 
-	maddr, _, err := ma.SplitFunc(raddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_WEBTRANSPORT })
-	if err != nil {
-		return nil, err
-	}
-
-	sess, err := t.dial(ctx, maddr, url, sni, certHashes)
+	maddr, _ := ma.SplitFunc(raddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_WEBTRANSPORT })
+	sess, qconn, err := t.dial(ctx, maddr, url, sni, certHashes)
 	if err != nil {
 		return nil, err
 	}
 	sconn, err := t.upgrade(ctx, sess, p, certHashes)
 	if err != nil {
 		sess.CloseWithError(1, "")
+		qconn.CloseWithError(1, "")
 		return nil, err
 	}
 	if t.gater != nil && !t.gater.InterceptSecured(network.DirOutbound, p, sconn) {
 		sess.CloseWithError(errorCodeConnectionGating, "")
+		qconn.CloseWithError(errorCodeConnectionGating, "")
 		return nil, fmt.Errorf("secured connection gated")
 	}
-	conn := newConn(t, sess, sconn, scope)
+	conn := newConn(t, sess, sconn, scope, qconn)
 	t.addConn(sess, conn)
 	return conn, nil
 }
 
-func (t *transport) dial(ctx context.Context, addr ma.Multiaddr, url, sni string, certHashes []multihash.DecodedMultihash) (*webtransport.Session, error) {
+func (t *transport) dial(ctx context.Context, addr ma.Multiaddr, url, sni string, certHashes []multihash.DecodedMultihash) (*webtransport.Session, quic.Connection, error) {
 	var tlsConf *tls.Config
 	if t.tlsClientConf != nil {
 		tlsConf = t.tlsClientConf.Clone()
@@ -202,9 +209,10 @@ func (t *transport) dial(ctx context.Context, addr ma.Multiaddr, url, sni string
 			return verifyRawCerts(rawCerts, certHashes)
 		}
 	}
+	ctx = quicreuse.WithAssociation(ctx, t)
 	conn, err := t.connManager.DialQUIC(ctx, addr, tlsConf, t.allowWindowIncrease)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	dialer := webtransport.Dialer{
 		DialAddr: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
@@ -214,12 +222,14 @@ func (t *transport) dial(ctx context.Context, addr ma.Multiaddr, url, sni string
 	}
 	rsp, sess, err := dialer.Dial(ctx, url, nil)
 	if err != nil {
-		return nil, err
+		conn.CloseWithError(1, "")
+		return nil, nil, err
 	}
 	if rsp.StatusCode < 200 || rsp.StatusCode > 299 {
-		return nil, fmt.Errorf("invalid response status code: %d", rsp.StatusCode)
+		conn.CloseWithError(1, "")
+		return nil, nil, fmt.Errorf("invalid response status code: %d", rsp.StatusCode)
 	}
-	return sess, err
+	return sess, conn, err
 }
 
 func (t *transport) upgrade(ctx context.Context, sess *webtransport.Session, p peer.ID, certHashes []multihash.DecodedMultihash) (*connSecurityMultiaddrs, error) {
@@ -324,7 +334,7 @@ func (t *transport) Listen(laddr ma.Multiaddr) (tpt.Listener, error) {
 	}
 	tlsConf.NextProtos = append(tlsConf.NextProtos, http3.NextProtoH3)
 
-	ln, err := t.connManager.ListenQUIC(laddr, tlsConf, t.allowWindowIncrease)
+	ln, err := t.connManager.ListenQUICAndAssociate(t, laddr, tlsConf, t.allowWindowIncrease)
 	if err != nil {
 		return nil, err
 	}
@@ -377,9 +387,6 @@ func (t *transport) removeConn(sess *webtransport.Session) {
 // foundSniComponent will be false (since we didn't find an actual sni component).
 func extractSNI(maddr ma.Multiaddr) (sni string, foundSniComponent bool) {
 	ma.ForEach(maddr, func(c ma.Component, e error) bool {
-		if e != nil {
-			return false
-		}
 		switch c.Protocol().Code {
 		case ma.P_SNI:
 			sni = c.Value()
@@ -404,22 +411,24 @@ func (t *transport) Resolve(_ context.Context, maddr ma.Multiaddr) ([]ma.Multiad
 		return []ma.Multiaddr{maddr}, nil
 	}
 
-	beforeQuicMA, afterIncludingQuicMA, err := ma.SplitFunc(maddr, func(c ma.Component) bool {
+	beforeQuicMA, afterIncludingQuicMA := ma.SplitFunc(maddr, func(c ma.Component) bool {
 		return c.Protocol().Code == ma.P_QUIC_V1
 	})
-	if err != nil {
-		return nil, err
+	if len(afterIncludingQuicMA) == 0 {
+		return nil, fmt.Errorf("no quic component found in %s", maddr)
 	}
-
-	quicComponent, afterQuicMA, err := ma.SplitFirst(afterIncludingQuicMA)
-	if err != nil {
-		return nil, err
+	quicComponent, afterQuicMA := ma.SplitFirst(afterIncludingQuicMA)
+	if quicComponent == nil {
+		// Should not happen since we split on P_QUIC_V1 already
+		return nil, fmt.Errorf("no quic component found in %s", maddr)
 	}
 	sniComponent, err := ma.NewComponent(ma.ProtocolWithCode(ma.P_SNI).Name, sni)
 	if err != nil {
 		return nil, err
 	}
-	return []ma.Multiaddr{beforeQuicMA.Encapsulate(quicComponent).Encapsulate(sniComponent).Encapsulate(afterQuicMA)}, nil
+	result := beforeQuicMA.AppendComponent(quicComponent, sniComponent)
+	result = append(result, afterQuicMA...)
+	return []ma.Multiaddr{result}, nil
 }
 
 // AddCertHashes adds the current certificate hashes to a multiaddress.

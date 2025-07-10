@@ -18,8 +18,8 @@ func TestSplitFirstLast(t *testing.T) {
 		{ipStr},
 	} {
 		addr, _ := StringCast(strings.Join(x, ""))
-		head, tail, _ := SplitFirst(addr)
-		rest, last, _ := SplitLast(addr)
+		head, tail := SplitFirst(addr)
+		rest, last := SplitLast(addr)
 		if len(x) == 0 {
 			if head != nil {
 				t.Error("expected head to be nil")
@@ -36,11 +36,11 @@ func TestSplitFirstLast(t *testing.T) {
 			continue
 		}
 		s, _ := StringCast(x[0])
-		if !head.Equal(s) {
+		if !head.Multiaddr().Equal(s) {
 			t.Errorf("expected %s to be %s", head, x[0])
 		}
 		s, _ = StringCast(x[len(x)-1])
-		if !last.Equal(s) {
+		if !last.Multiaddr().Equal(s) {
 			t.Errorf("expected %s to be %s", head, x[len(x)-1])
 		}
 		if len(x) == 1 {
@@ -69,33 +69,33 @@ func TestSplitFirstLast(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ci, m, _ := SplitFirst(c)
+	ci, m := SplitFirst(c.Multiaddr())
 	if !ci.Equal(c) || m != nil {
 		t.Error("split first on component failed")
 	}
-	m, ci, _ = SplitLast(c)
+	m, ci = SplitLast(c.Multiaddr())
 	if !ci.Equal(c) || m != nil {
 		t.Error("split last on component failed")
 	}
-	cis := Split(c)
+	cis := Split(c.Multiaddr())
 	if len(cis) != 1 || !cis[0].Equal(c) {
 		t.Error("split on component failed")
 	}
-	m1, m2, _ := SplitFunc(c, func(c Component) bool {
+	m1, m2 := SplitFunc(c.Multiaddr(), func(c Component) bool {
 		return true
 	})
-	if m1 != nil || !m2.Equal(c) {
+	if m1 != nil || !m2.Equal(c.Multiaddr()) {
 		t.Error("split func(true) on component failed")
 	}
-	m1, m2, _ = SplitFunc(c, func(c Component) bool {
+	m1, m2 = SplitFunc(c.Multiaddr(), func(c Component) bool {
 		return false
 	})
-	if !m1.Equal(c) || m2 != nil {
+	if !m1.Equal(c.Multiaddr()) || m2 != nil {
 		t.Error("split func(false) on component failed")
 	}
 
 	i := 0
-	ForEach(c, func(ci Component, e error) bool {
+	ForEach(c.Multiaddr(), func(ci Component, e error) bool {
 		if e != nil {
 			t.Error(e)
 		}
@@ -125,8 +125,8 @@ func TestSplitFunc(t *testing.T) {
 		addr, _ := StringCast(strings.Join(x, ""))
 		for i, cs := range x {
 			target, _ := StringCast(cs)
-			a, b, _ := SplitFunc(addr, func(c Component) bool {
-				return c.Equal(target)
+			a, b := SplitFunc(addr, func(c Component) bool {
+				return c.Multiaddr().Equal(target)
 			})
 			if i == 0 {
 				if a != nil {
@@ -143,7 +143,7 @@ func TestSplitFunc(t *testing.T) {
 				}
 			}
 		}
-		a, b, _ := SplitFunc(addr, func(_ Component) bool { return false })
+		a, b := SplitFunc(addr, func(_ Component) bool { return false })
 		if !a.Equal(addr) || b != nil {
 			t.Error("should not have split")
 		}

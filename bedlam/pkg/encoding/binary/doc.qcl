@@ -1,0 +1,9 @@
+// -*- go -*-
+//
+// Copyright (c) 2021 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package binary implements functions for processing binary data.
+package binary

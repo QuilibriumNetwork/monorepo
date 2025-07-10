@@ -19,7 +19,7 @@ import (
 // can be contacted on. The "seen" events expire by default after 40 minutes
 // (OwnObservedAddressTTL * ActivationThreshold). The are cleaned up during
 // the GC rounds set by GCInterval.
-var ActivationThresh = 1
+var ActivationThresh = 4
 
 // observedAddrManagerWorkerChannelSize defines how many addresses can be enqueued
 // for adding to an ObservedAddrManager.
@@ -40,7 +40,7 @@ type thinWaistWithCount struct {
 
 func thinWaistForm(a ma.Multiaddr) (thinWaist, error) {
 	i := 0
-	tw, rest, err := ma.SplitFunc(a, func(c ma.Component) bool {
+	tw, rest := ma.SplitFunc(a, func(c ma.Component) bool {
 		if i > 1 {
 			return true
 		}
@@ -60,9 +60,6 @@ func thinWaistForm(a ma.Multiaddr) (thinWaist, error) {
 		}
 		return false
 	})
-	if err != nil {
-		return thinWaist{}, err
-	}
 	if i <= 1 {
 		return thinWaist{}, fmt.Errorf("not a thinwaist address: %s", a)
 	}
@@ -116,10 +113,10 @@ func (s *observerSet) cacheMultiaddr(addr ma.Multiaddr) ma.Multiaddr {
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	// Check if some other go routine added this while we were waiting
 	res, ok = s.cachedMultiaddrs[addrStr]
 	if ok {
-		s.mu.Unlock()
 		return res
 	}
 	if s.cachedMultiaddrs == nil {
@@ -133,9 +130,7 @@ func (s *observerSet) cacheMultiaddr(addr ma.Multiaddr) ma.Multiaddr {
 		}
 	}
 	s.cachedMultiaddrs[addrStr] = ma.Join(s.ObservedTWAddr, addr)
-	mas := s.cachedMultiaddrs[addrStr]
-	s.mu.Unlock()
-	return mas
+	return s.cachedMultiaddrs[addrStr]
 }
 
 type observation struct {
@@ -204,9 +199,9 @@ func (o *ObservedAddrManager) AddrsFor(addr ma.Multiaddr) (addrs []ma.Multiaddr)
 		return nil
 	}
 	o.mu.RLock()
+	defer o.mu.RUnlock()
 	tw, err := thinWaistForm(o.normalize(addr))
 	if err != nil {
-		o.mu.RUnlock()
 		return nil
 	}
 
@@ -215,13 +210,55 @@ func (o *ObservedAddrManager) AddrsFor(addr ma.Multiaddr) (addrs []ma.Multiaddr)
 	for _, s := range observerSets {
 		res = append(res, s.cacheMultiaddr(tw.Rest))
 	}
-	o.mu.RUnlock()
 	return res
+}
+
+// appendInferredAddrs infers the external address of other transports that
+// share the local thin waist with a transport that we have do observations for.
+//
+// e.g. If we have observations for a QUIC address on port 9000, and we are
+// listening on the same interface and port 9000 for WebTransport, we can infer
+// the external WebTransport address.
+func (o *ObservedAddrManager) appendInferredAddrs(twToObserverSets map[string][]*observerSet, addrs []ma.Multiaddr) []ma.Multiaddr {
+	if twToObserverSets == nil {
+		twToObserverSets = make(map[string][]*observerSet)
+		for localTWStr := range o.externalAddrs {
+			twToObserverSets[localTWStr] = append(twToObserverSets[localTWStr], o.getTopExternalAddrs(localTWStr)...)
+		}
+	}
+	lAddrs, err := o.interfaceListenAddrs()
+	if err != nil {
+		log.Warnw("failed to get interface resolved listen addrs. Using just the listen addrs", "error", err)
+		lAddrs = nil
+	}
+	lAddrs = append(lAddrs, o.listenAddrs()...)
+	seenTWs := make(map[string]struct{})
+	for _, a := range lAddrs {
+		if _, ok := o.localAddrs[string(a.Bytes())]; ok {
+			// We already have this address in the list
+			continue
+		}
+		if _, ok := seenTWs[string(a.Bytes())]; ok {
+			// We've already added this
+			continue
+		}
+		seenTWs[string(a.Bytes())] = struct{}{}
+		a = o.normalize(a)
+		t, err := thinWaistForm(a)
+		if err != nil {
+			continue
+		}
+		for _, s := range twToObserverSets[string(t.TW.Bytes())] {
+			addrs = append(addrs, s.cacheMultiaddr(t.Rest))
+		}
+	}
+	return addrs
 }
 
 // Addrs return all activated observed addresses
 func (o *ObservedAddrManager) Addrs() []ma.Multiaddr {
 	o.mu.RLock()
+	defer o.mu.RUnlock()
 
 	m := make(map[string][]*observerSet)
 	for localTWStr := range o.externalAddrs {
@@ -233,7 +270,8 @@ func (o *ObservedAddrManager) Addrs() []ma.Multiaddr {
 			addrs = append(addrs, s.cacheMultiaddr(t.Rest))
 		}
 	}
-	o.mu.RUnlock()
+
+	addrs = o.appendInferredAddrs(m, addrs)
 	return addrs
 }
 
@@ -285,15 +323,21 @@ func (o *ObservedAddrManager) Record(conn connMultiaddrs, observed ma.Multiaddr)
 }
 
 func (o *ObservedAddrManager) worker() {
+	defer o.wg.Done()
+
 	for {
 		select {
 		case obs := <-o.wch:
 			o.maybeRecordObservation(obs.conn, obs.observed)
 		case <-o.ctx.Done():
-			o.wg.Done()
 			return
 		}
 	}
+}
+
+func isRelayedAddress(a ma.Multiaddr) bool {
+	_, err := a.ValueForProtocol(ma.P_CIRCUIT)
+	return err == nil
 }
 
 func (o *ObservedAddrManager) shouldRecordObservation(conn connMultiaddrs, observed ma.Multiaddr) (shouldRecord bool, localTW thinWaist, observedTW thinWaist) {
@@ -308,6 +352,12 @@ func (o *ObservedAddrManager) shouldRecordObservation(conn connMultiaddrs, obser
 
 	// Provided by NAT64 peers, these addresses are specific to the peer and not publicly routable
 	if manet.IsNAT64IPv4ConvertedIPv6Addr(observed) {
+		return false, thinWaist{}, thinWaist{}
+	}
+
+	// Ignore p2p-circuit addresses. These are the observed address of the relay.
+	// Not useful for us.
+	if isRelayedAddress(observed) {
 		return false, thinWaist{}, thinWaist{}
 	}
 
@@ -371,15 +421,15 @@ func (o *ObservedAddrManager) maybeRecordObservation(conn connMultiaddrs, observ
 	if !shouldRecord {
 		return
 	}
-	log.Debugw("added own observed listen addr", "observed", observed)
+	log.Debugw("added own observed listen addr", "conn", conn, "observed", observed)
 
 	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.recordObservationUnlocked(conn, localTW, observedTW)
 	select {
 	case o.addrRecordedNotif <- struct{}{}:
 	default:
 	}
-	o.mu.Unlock()
 }
 
 func (o *ObservedAddrManager) recordObservationUnlocked(conn connMultiaddrs, localTW, observedTW thinWaist) {
@@ -455,17 +505,22 @@ func (o *ObservedAddrManager) removeConn(conn connMultiaddrs) {
 		return
 	}
 	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	observedTWAddr, ok := o.connObservedTWAddrs[conn]
+	if !ok {
+		return
+	}
+	delete(o.connObservedTWAddrs, conn)
 
 	// normalize before obtaining the thinWaist so that we are always dealing
 	// with the normalized form of the address
 	localTW, err := thinWaistForm(o.normalize(conn.LocalMultiaddr()))
 	if err != nil {
-		o.mu.Unlock()
 		return
 	}
 	t, ok := o.localAddrs[string(localTW.Addr.Bytes())]
 	if !ok {
-		o.mu.Unlock()
 		return
 	}
 	t.Count--
@@ -473,15 +528,8 @@ func (o *ObservedAddrManager) removeConn(conn connMultiaddrs) {
 		delete(o.localAddrs, string(localTW.Addr.Bytes()))
 	}
 
-	observedTWAddr, ok := o.connObservedTWAddrs[conn]
-	if !ok {
-		o.mu.Unlock()
-		return
-	}
-	delete(o.connObservedTWAddrs, conn)
 	observer, err := getObserver(conn.RemoteMultiaddr())
 	if err != nil {
-		o.mu.Unlock()
 		return
 	}
 
@@ -490,11 +538,11 @@ func (o *ObservedAddrManager) removeConn(conn connMultiaddrs) {
 	case o.addrRecordedNotif <- struct{}{}:
 	default:
 	}
-	o.mu.Unlock()
 }
 
 func (o *ObservedAddrManager) getNATType() (tcpNATType, udpNATType network.NATDeviceType) {
 	o.mu.RLock()
+	defer o.mu.RUnlock()
 
 	var tcpCounts, udpCounts []int
 	var tcpTotal, udpTotal int
@@ -544,7 +592,6 @@ func (o *ObservedAddrManager) getNATType() (tcpNATType, udpNATType network.NATDe
 			udpNATType = network.NATDeviceTypeSymmetric
 		}
 	}
-	o.mu.RUnlock()
 	return
 }
 

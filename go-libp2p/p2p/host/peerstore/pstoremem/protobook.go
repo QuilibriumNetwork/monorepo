@@ -26,9 +26,6 @@ type memoryProtoBook struct {
 	segments protoSegments
 
 	maxProtos int
-
-	lk       sync.RWMutex
-	interned map[protocol.ID]protocol.ID
 }
 
 var _ pstore.ProtoBook = (*memoryProtoBook)(nil)
@@ -44,7 +41,6 @@ func WithMaxProtocols(num int) ProtoBookOption {
 
 func NewProtoBook(opts ...ProtoBookOption) (*memoryProtoBook, error) {
 	pb := &memoryProtoBook{
-		interned: make(map[protocol.ID]protocol.ID, 256),
 		segments: func() (ret protoSegments) {
 			for i := range ret {
 				ret[i] = &protoSegment{
@@ -53,7 +49,7 @@ func NewProtoBook(opts ...ProtoBookOption) (*memoryProtoBook, error) {
 			}
 			return ret
 		}(),
-		maxProtos: 1024,
+		maxProtos: 128,
 	}
 
 	for _, opt := range opts {
@@ -64,31 +60,6 @@ func NewProtoBook(opts ...ProtoBookOption) (*memoryProtoBook, error) {
 	return pb, nil
 }
 
-func (pb *memoryProtoBook) internProtocol(proto protocol.ID) protocol.ID {
-	// check if it is interned with the read lock
-	pb.lk.RLock()
-	interned, ok := pb.interned[proto]
-	pb.lk.RUnlock()
-
-	if ok {
-		return interned
-	}
-
-	// intern with the write lock
-	pb.lk.Lock()
-
-	// check again in case it got interned in between locks
-	interned, ok = pb.interned[proto]
-	if ok {
-		pb.lk.Unlock()
-		return interned
-	}
-
-	pb.interned[proto] = proto
-	pb.lk.Unlock()
-	return proto
-}
-
 func (pb *memoryProtoBook) SetProtocols(p peer.ID, protos ...protocol.ID) error {
 	if len(protos) > pb.maxProtos {
 		return errTooManyProtocols
@@ -96,7 +67,7 @@ func (pb *memoryProtoBook) SetProtocols(p peer.ID, protos ...protocol.ID) error 
 
 	newprotos := make(map[protocol.ID]struct{}, len(protos))
 	for _, proto := range protos {
-		newprotos[pb.internProtocol(proto)] = struct{}{}
+		newprotos[proto] = struct{}{}
 	}
 
 	s := pb.segments.get(p)
@@ -110,6 +81,7 @@ func (pb *memoryProtoBook) SetProtocols(p peer.ID, protos ...protocol.ID) error 
 func (pb *memoryProtoBook) AddProtocols(p peer.ID, protos ...protocol.ID) error {
 	s := pb.segments.get(p)
 	s.Lock()
+	defer s.Unlock()
 
 	protomap, ok := s.protocols[p]
 	if !ok {
@@ -117,51 +89,52 @@ func (pb *memoryProtoBook) AddProtocols(p peer.ID, protos ...protocol.ID) error 
 		s.protocols[p] = protomap
 	}
 	if len(protomap)+len(protos) > pb.maxProtos {
-		s.Unlock()
 		return errTooManyProtocols
 	}
 
 	for _, proto := range protos {
-		protomap[pb.internProtocol(proto)] = struct{}{}
+		protomap[proto] = struct{}{}
 	}
-	s.Unlock()
 	return nil
 }
 
 func (pb *memoryProtoBook) GetProtocols(p peer.ID) ([]protocol.ID, error) {
 	s := pb.segments.get(p)
 	s.RLock()
+	defer s.RUnlock()
 
 	out := make([]protocol.ID, 0, len(s.protocols[p]))
 	for k := range s.protocols[p] {
 		out = append(out, k)
 	}
 
-	s.RUnlock()
 	return out, nil
 }
 
 func (pb *memoryProtoBook) RemoveProtocols(p peer.ID, protos ...protocol.ID) error {
 	s := pb.segments.get(p)
 	s.Lock()
+	defer s.Unlock()
 
 	protomap, ok := s.protocols[p]
 	if !ok {
 		// nothing to remove.
-		s.Unlock()
 		return nil
 	}
 
 	for _, proto := range protos {
-		delete(protomap, pb.internProtocol(proto))
+		delete(protomap, proto)
 	}
-	s.Unlock()
+	if len(protomap) == 0 {
+		delete(s.protocols, p)
+	}
 	return nil
 }
 
 func (pb *memoryProtoBook) SupportsProtocols(p peer.ID, protos ...protocol.ID) ([]protocol.ID, error) {
 	s := pb.segments.get(p)
 	s.RLock()
+	defer s.RUnlock()
 
 	out := make([]protocol.ID, 0, len(protos))
 	for _, proto := range protos {
@@ -170,21 +143,19 @@ func (pb *memoryProtoBook) SupportsProtocols(p peer.ID, protos ...protocol.ID) (
 		}
 	}
 
-	s.RUnlock()
 	return out, nil
 }
 
 func (pb *memoryProtoBook) FirstSupportedProtocol(p peer.ID, protos ...protocol.ID) (protocol.ID, error) {
 	s := pb.segments.get(p)
 	s.RLock()
+	defer s.RUnlock()
 
 	for _, proto := range protos {
 		if _, ok := s.protocols[p][proto]; ok {
-			s.RUnlock()
 			return proto, nil
 		}
 	}
-	s.RUnlock()
 	return "", nil
 }
 

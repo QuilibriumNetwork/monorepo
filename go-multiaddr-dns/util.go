@@ -40,16 +40,13 @@ func addrLen(maddr ma.Multiaddr) int {
 
 // trims `offset` components from the beginning of the multiaddr.
 func offset(maddr ma.Multiaddr, offset int) ma.Multiaddr {
-	_, after, err := ma.SplitFunc(maddr, func(c ma.Component) bool {
+	_, after := ma.SplitFunc(maddr, func(c ma.Component) bool {
 		if offset == 0 {
 			return true
 		}
 		offset--
 		return false
 	})
-	if err != nil {
-		return nil
-	}
 	return after
 }
 

@@ -4,7 +4,16 @@
 
 package tcp
 
-import manet "github.com/multiformats/go-multiaddr/net"
+import (
+	"github.com/libp2p/go-libp2p/core/transport"
+	manet "github.com/multiformats/go-multiaddr/net"
+)
 
-func newTracingConn(c manet.Conn, _ bool) (manet.Conn, error) { return c, nil }
-func newTracingListener(l manet.Listener) manet.Listener      { return l }
+type aggregatingCollector struct{}
+
+func newTracingConn(c manet.Conn, collector *aggregatingCollector, isClient bool) (manet.Conn, error) {
+	return c, nil
+}
+func newTracingListener(l transport.GatedMaListener, collector *aggregatingCollector) transport.GatedMaListener {
+	return l
+}

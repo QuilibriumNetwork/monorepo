@@ -1,0 +1,14 @@
+// -*- go -*-
+//
+// Copyright (c) 2021-2024 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package hmac implements Keyed-Hash Message Authentication Code
+// (HMAC) functions as defined in RFC 2104. All functions take the
+// data that is authenticated and an authentication key.
+//
+//	signature := hmac.SumSHA256([]byte("message"), []byte("abc"))
+//	=> 859cc656e12c0ecd0afdd7e3d034c3ee81609fcac1b454c231211c7ac69895e8
+package hmac

@@ -4,6 +4,7 @@ import (
 	crand "crypto/rand"
 	"fmt"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -14,9 +15,30 @@ import (
 	swarmt "github.com/libp2p/go-libp2p/p2p/net/swarm/testing"
 
 	ma "github.com/multiformats/go-multiaddr"
+	matest "github.com/multiformats/go-multiaddr/matest"
 	manet "github.com/multiformats/go-multiaddr/net"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func requireAddrsMatch(t *testing.T, a, b []ma.Multiaddr) {
+	t.Helper()
+	slices.SortFunc(a, func(a, b ma.Multiaddr) int { return a.Compare(b) })
+	slices.SortFunc(b, func(a, b ma.Multiaddr) int { return a.Compare(b) })
+	requireEqualAddrs(t, a, b)
+}
+
+func requireEqualAddrs(t *testing.T, a, b []ma.Multiaddr) {
+	t.Helper()
+	if len(a) != len(b) {
+		t.Fatalf("length mismatch: %d != %d", len(a), len(b))
+	}
+	for i, addr := range a {
+		if !addr.Equal(b[i]) {
+			t.Fatalf("addr mismatch: %s != %s", addr, b[i])
+		}
+	}
+}
 
 func newConn(local, remote ma.Multiaddr) *mockConn {
 	return &mockConn{local: local, remote: remote}
@@ -24,11 +46,7 @@ func newConn(local, remote ma.Multiaddr) *mockConn {
 
 func normalize(addr ma.Multiaddr) ma.Multiaddr {
 	for {
-		out, last, err := ma.SplitLast(addr)
-		if err != nil {
-			return nil
-		}
-
+		out, last := ma.SplitLast(addr)
 		if last == nil {
 			return addr
 		}
@@ -39,35 +57,19 @@ func normalize(addr ma.Multiaddr) ma.Multiaddr {
 	}
 }
 
-func addrsEqual(a, b []ma.Multiaddr) bool {
-	if len(b) != len(a) {
-		return false
+// subtractFrom takes the difference between two slices of multiaddrs (a - b)
+func subtractFrom(a, b []ma.Multiaddr) []string {
+	bSet := make(map[string]struct{}, len(b))
+	for _, addr := range b {
+		bSet[string(addr.Bytes())] = struct{}{}
 	}
-	for _, x := range b {
-		found := false
-		for _, y := range a {
-			if y.Equal(x) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
+	out := make([]string, 0, len(a))
+	for _, addr := range a {
+		if _, ok := bSet[string(addr.Bytes())]; !ok {
+			out = append(out, addr.String())
 		}
 	}
-	for _, x := range a {
-		found := false
-		for _, y := range b {
-			if y.Equal(x) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
+	return out
 }
 
 func TestObservedAddrManager(t *testing.T) {
@@ -111,7 +113,7 @@ func TestObservedAddrManager(t *testing.T) {
 		o.Record(c3, observed)
 		o.Record(c4, observed)
 		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), []ma.Multiaddr{observed})
+			return matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observed})
 		}, 1*time.Second, 100*time.Millisecond)
 		o.removeConn(c1)
 		o.removeConn(c2)
@@ -135,8 +137,35 @@ func TestObservedAddrManager(t *testing.T) {
 		o.Record(c2, observedQuic)
 		o.Record(c3, observedWebTransport)
 		o.Record(c4, observedWebTransport)
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedQuic, observedWebTransport})
+			matest.AssertEqualMultiaddrs(t, o.appendInferredAddrs(nil, nil), []ma.Multiaddr{})
+		}, 1*time.Second, 100*time.Millisecond)
+		o.removeConn(c1)
+		o.removeConn(c2)
+		o.removeConn(c3)
+		o.removeConn(c4)
 		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), []ma.Multiaddr{observedQuic, observedWebTransport})
+			return checkAllEntriesRemoved(o)
+		}, 1*time.Second, 100*time.Millisecond)
+	})
+
+	t.Run("WebTransport inferred from QUIC, with no WebTransport connections", func(t *testing.T) {
+		o := newObservedAddrMgr()
+		defer o.Close()
+		observedQuic := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1")
+		inferredWebTransport := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1/webtransport")
+		c1 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.1/udp/1/quic-v1"))
+		c2 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.2/udp/1/quic-v1"))
+		c3 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.3/udp/1/quic-v1"))
+		c4 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.4/udp/1/quic-v1"))
+		o.Record(c1, observedQuic)
+		o.Record(c2, observedQuic)
+		o.Record(c3, observedQuic)
+		o.Record(c4, observedQuic)
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedQuic, inferredWebTransport})
+			matest.AssertEqualMultiaddrs(t, o.appendInferredAddrs(nil, nil), []ma.Multiaddr{inferredWebTransport})
 		}, 1*time.Second, 100*time.Millisecond)
 		o.removeConn(c1)
 		o.removeConn(c2)
@@ -152,12 +181,13 @@ func TestObservedAddrManager(t *testing.T) {
 		defer o.Close()
 
 		observedQuic := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1")
+		inferredWebTransport := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1/webtransport")
 
 		const N = 4 // ActivationThresh
 		var ob1, ob2 [N]connMultiaddrs
 		for i := 0; i < N; i++ {
 			ob1[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
-			ob2[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
+			ob2[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/2/quic-v1", i)))
 		}
 		for i := 0; i < N-1; i++ {
 			o.Record(ob1[i], observedQuic)
@@ -169,8 +199,9 @@ func TestObservedAddrManager(t *testing.T) {
 		// We should have a valid address now
 		o.Record(ob1[N-1], observedQuic)
 		o.Record(ob2[N-1], observedQuic)
-		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), []ma.Multiaddr{observedQuic})
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedQuic, inferredWebTransport})
+			matest.AssertEqualMultiaddrs(t, o.appendInferredAddrs(nil, nil), []ma.Multiaddr{inferredWebTransport})
 		}, 2*time.Second, 100*time.Millisecond)
 
 		// Now disconnect first observer group
@@ -178,8 +209,8 @@ func TestObservedAddrManager(t *testing.T) {
 			o.removeConn(ob1[i])
 		}
 		time.Sleep(100 * time.Millisecond)
-		if !addrsEqual(o.Addrs(), []ma.Multiaddr{observedQuic}) {
-			t.Fatalf("address removed too earyly %v %v", o.Addrs(), observedQuic)
+		if !matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedQuic, inferredWebTransport}) {
+			t.Fatalf("address removed too earyl %v %v", o.Addrs(), observedQuic)
 		}
 
 		// Now disconnect the second group to check cleanup
@@ -190,18 +221,21 @@ func TestObservedAddrManager(t *testing.T) {
 			return checkAllEntriesRemoved(o)
 		}, 2*time.Second, 100*time.Millisecond)
 	})
+
 	t.Run("SameObserversDifferentAddrs", func(t *testing.T) {
 		o := newObservedAddrMgr()
 		defer o.Close()
 
 		observedQuic1 := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1")
 		observedQuic2 := tStringCast("/ip4/2.2.2.2/udp/3/quic-v1")
+		inferredWebTransport1 := tStringCast("/ip4/2.2.2.2/udp/2/quic-v1/webtransport")
+		inferredWebTransport2 := tStringCast("/ip4/2.2.2.2/udp/3/quic-v1/webtransport")
 
 		const N = 4 // ActivationThresh
 		var ob1, ob2 [N]connMultiaddrs
 		for i := 0; i < N; i++ {
 			ob1[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
-			ob2[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1", i)))
+			ob2[i] = newConn(quic4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/2/quic-v1", i)))
 		}
 		for i := 0; i < N-1; i++ {
 			o.Record(ob1[i], observedQuic1)
@@ -213,8 +247,9 @@ func TestObservedAddrManager(t *testing.T) {
 		// We should have a valid address now
 		o.Record(ob1[N-1], observedQuic1)
 		o.Record(ob2[N-1], observedQuic2)
-		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), []ma.Multiaddr{observedQuic1, observedQuic2})
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedQuic1, observedQuic2, inferredWebTransport1, inferredWebTransport2})
+			matest.AssertEqualMultiaddrs(t, o.appendInferredAddrs(nil, nil), []ma.Multiaddr{inferredWebTransport1, inferredWebTransport2})
 		}, 2*time.Second, 100*time.Millisecond)
 
 		// Now disconnect first observer group
@@ -222,8 +257,8 @@ func TestObservedAddrManager(t *testing.T) {
 			o.removeConn(ob1[i])
 		}
 		time.Sleep(100 * time.Millisecond)
-		if !addrsEqual(o.Addrs(), []ma.Multiaddr{observedQuic2}) {
-			t.Fatalf("address removed too earyly %v %v", o.Addrs(), observedQuic2)
+		if !matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedQuic2, inferredWebTransport2}) {
+			t.Fatalf("address removed too early %v %v", o.Addrs(), observedQuic2)
 		}
 
 		// Now disconnect the second group to check cleanup
@@ -242,6 +277,8 @@ func TestObservedAddrManager(t *testing.T) {
 		c2 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.2/udp/1/quic-v1"))
 		c3 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.3/udp/1/quic-v1/webtransport"))
 		c4 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport"))
+		c5 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.5/udp/1/quic-v1"))
+		c6 := newConn(quic4ListenAddr, tStringCast("/ip4/1.2.3.6/udp/1/quic-v1"))
 		var observedQuic, observedWebTransport ma.Multiaddr
 		for i := 0; i < 10; i++ {
 			// Change the IP address in each observation
@@ -251,24 +288,35 @@ func TestObservedAddrManager(t *testing.T) {
 			o.Record(c2, observedQuic)
 			o.Record(c3, observedWebTransport)
 			o.Record(c4, observedWebTransport)
+			o.Record(c5, observedQuic)
 			time.Sleep(20 * time.Millisecond)
 		}
 
-		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), []ma.Multiaddr{observedQuic, observedWebTransport})
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedQuic, observedWebTransport})
 		}, 1*time.Second, 100*time.Millisecond)
 
 		tw, err := thinWaistForm(quic4ListenAddr)
 		require.NoError(t, err)
 		require.Less(t, len(o.externalAddrs[string(tw.TW.Bytes())]), 2)
 
-		require.Equal(t, o.AddrsFor(webTransport4ListenAddr), []ma.Multiaddr{observedWebTransport})
-		require.Equal(t, o.AddrsFor(quic4ListenAddr), []ma.Multiaddr{observedQuic})
+		requireEqualAddrs(t, []ma.Multiaddr{observedWebTransport}, o.AddrsFor(webTransport4ListenAddr))
+		requireEqualAddrs(t, []ma.Multiaddr{observedQuic}, o.AddrsFor(quic4ListenAddr))
+		requireAddrsMatch(t, []ma.Multiaddr{observedQuic, observedWebTransport}, o.Addrs())
+
+		for i := 0; i < 3; i++ {
+			// remove non-recorded connection
+			o.removeConn(c6)
+		}
+		requireEqualAddrs(t, []ma.Multiaddr{observedWebTransport}, o.AddrsFor(webTransport4ListenAddr))
+		requireEqualAddrs(t, []ma.Multiaddr{observedQuic}, o.AddrsFor(quic4ListenAddr))
+		requireAddrsMatch(t, []ma.Multiaddr{observedQuic, observedWebTransport}, o.Addrs())
 
 		o.removeConn(c1)
 		o.removeConn(c2)
 		o.removeConn(c3)
 		o.removeConn(c4)
+		o.removeConn(c5)
 		require.Eventually(t, func() bool {
 			return checkAllEntriesRemoved(o)
 		}, 1*time.Second, 100*time.Millisecond)
@@ -323,8 +371,8 @@ func TestObservedAddrManager(t *testing.T) {
 		allAddrs = append(allAddrs, resTCPAddrs[:]...)
 		allAddrs = append(allAddrs, resQuicAddrs[:]...)
 		allAddrs = append(allAddrs, resWebTransportAddrs[:]...)
-		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), allAddrs)
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertMultiaddrsMatch(t, o.Addrs(), allAddrs)
 		}, 1*time.Second, 100*time.Millisecond)
 
 		for i := 0; i < N; i++ {
@@ -340,6 +388,7 @@ func TestObservedAddrManager(t *testing.T) {
 	t.Run("WebTransport certhash", func(t *testing.T) {
 		o := newObservedAddrMgr()
 		observedWebTransport := tStringCast("/ip4/2.2.2.2/udp/1/quic-v1/webtransport")
+		inferredQUIC := tStringCast("/ip4/2.2.2.2/udp/1/quic-v1")
 		c1 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.1/udp/1/quic-v1/webtransport"))
 		c2 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.2/udp/1/quic-v1/webtransport"))
 		c3 := newConn(webTransport4ListenAddr, tStringCast("/ip4/1.2.3.3/udp/1/quic-v1/webtransport"))
@@ -348,8 +397,8 @@ func TestObservedAddrManager(t *testing.T) {
 		o.Record(c2, observedWebTransport)
 		o.Record(c3, observedWebTransport)
 		o.Record(c4, observedWebTransport)
-		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), []ma.Multiaddr{observedWebTransport})
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedWebTransport, inferredQUIC})
 		}, 1*time.Second, 100*time.Millisecond)
 		o.removeConn(c1)
 		o.removeConn(c2)
@@ -365,14 +414,16 @@ func TestObservedAddrManager(t *testing.T) {
 		defer o.Close()
 
 		observedWebTransport := tStringCast("/ip4/2.2.2.2/udp/1/quic-v1/webtransport")
+		inferredQUIC := tStringCast("/ip4/2.2.2.2/udp/1/quic-v1")
 		var udpConns [5 * maxExternalThinWaistAddrsPerLocalAddr]connMultiaddrs
 		for i := 0; i < len(udpConns); i++ {
 			udpConns[i] = newConn(webTransport4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
 			o.Record(udpConns[i], observedWebTransport)
 			time.Sleep(10 * time.Millisecond)
 		}
-		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), []ma.Multiaddr{observedWebTransport})
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedWebTransport, inferredQUIC})
+			matest.AssertEqualMultiaddrs(t, o.appendInferredAddrs(nil, nil), []ma.Multiaddr{inferredQUIC})
 		}, 1*time.Second, 100*time.Millisecond)
 
 		tcpNAT, udpNAT := o.getNATType()
@@ -399,8 +450,8 @@ func TestObservedAddrManager(t *testing.T) {
 		}
 		// At this point we have 20 groups with 5 observations for every connection
 		// The output should remain stable
-		require.Eventually(t, func() bool {
-			return len(o.Addrs()) == 2*maxExternalThinWaistAddrsPerLocalAddr
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			require.Equal(t, len(subtractFrom(o.Addrs(), o.appendInferredAddrs(nil, nil))), 2*maxExternalThinWaistAddrsPerLocalAddr)
 		}, 1*time.Second, 100*time.Millisecond)
 
 		tcpNAT, udpNAT := o.getNATType()
@@ -415,7 +466,7 @@ func TestObservedAddrManager(t *testing.T) {
 			return checkAllEntriesRemoved(o)
 		}, 1*time.Second, 100*time.Millisecond)
 	})
-	t.Run("Nill Input", func(t *testing.T) {
+	t.Run("Nil Input", func(t *testing.T) {
 		o := newObservedAddrMgr()
 		defer o.Close()
 		o.maybeRecordObservation(nil, nil)
@@ -447,14 +498,16 @@ func TestObservedAddrManager(t *testing.T) {
 		sub, err := bus.Subscribe(new(event.EvtNATDeviceTypeChanged))
 		require.NoError(t, err)
 		observedWebTransport := tStringCast("/ip4/2.2.2.2/udp/1/quic-v1/webtransport")
+		inferredQUIC := tStringCast("/ip4/2.2.2.2/udp/1/quic-v1")
 		var udpConns [5 * maxExternalThinWaistAddrsPerLocalAddr]connMultiaddrs
 		for i := 0; i < len(udpConns); i++ {
 			udpConns[i] = newConn(webTransport4ListenAddr, tStringCast(fmt.Sprintf("/ip4/1.2.3.%d/udp/1/quic-v1/webtransport", i)))
 			o.Record(udpConns[i], observedWebTransport)
 			time.Sleep(10 * time.Millisecond)
 		}
-		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), []ma.Multiaddr{observedWebTransport})
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertEqualMultiaddrs(t, o.Addrs(), []ma.Multiaddr{observedWebTransport, inferredQUIC})
+			matest.AssertEqualMultiaddrs(t, o.appendInferredAddrs(nil, nil), []ma.Multiaddr{inferredQUIC})
 		}, 1*time.Second, 100*time.Millisecond)
 
 		var e interface{}
@@ -541,8 +594,8 @@ func TestObservedAddrManager(t *testing.T) {
 		allAddrs = append(allAddrs, resTCPAddrs[:]...)
 		allAddrs = append(allAddrs, resQuicAddrs[:]...)
 		allAddrs = append(allAddrs, resWebTransportAddrs[:]...)
-		require.Eventually(t, func() bool {
-			return addrsEqual(o.Addrs(), allAddrs)
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			matest.AssertMultiaddrsMatch(t, o.Addrs(), allAddrs)
 		}, 1*time.Second, 100*time.Millisecond)
 
 		for i := 0; i < N; i++ {

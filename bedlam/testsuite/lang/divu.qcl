@@ -1,0 +1,26 @@
+// -*- go -*-
+
+package main
+
+// @Test 42  1 = 42
+// @Test 42  2 = 21
+// @Test 42  3 = 14
+// @Test 42  4 = 10
+// @Test 42  5 =  8
+// @Test 42  6 =  7
+// @Test 42  7 =  6
+// @Test 42  8 =  5
+// @Test 42  9 =  4
+// @Test 42 10 =  4
+// @Test 42 11 =  3
+// @Test 42 12 =  3
+// @Test 42 13 =  3
+// @Test 42 14 =  3
+// @Test 42 20 =  2
+// @Test 42 30 =  1
+// @Test 42 40 =  1
+// @Test 42 42 =  1
+// @Test 42 43 =  0
+func main(a, b uint64) uint64 {
+	return a / b
+}

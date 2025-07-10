@@ -89,24 +89,27 @@ func (nmgr *natManager) Close() error {
 
 func (nmgr *natManager) HasDiscoveredNAT() bool {
 	nmgr.natMx.RLock()
-	h := nmgr.nat != nil
-	nmgr.natMx.RUnlock()
-	return h
+	defer nmgr.natMx.RUnlock()
+	return nmgr.nat != nil
 }
 
 func (nmgr *natManager) background(ctx context.Context) {
-	discoverCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer nmgr.refCount.Done()
 
-	natInstance, err := discoverNAT(discoverCtx)
-	if err != nil {
-		log.Info("DiscoverNAT error:", err)
-		nmgr.refCount.Done()
+	defer func() {
 		nmgr.natMx.Lock()
+		defer nmgr.natMx.Unlock()
+
 		if nmgr.nat != nil {
 			nmgr.nat.Close()
 		}
-		nmgr.natMx.Unlock()
-		cancel()
+	}()
+
+	discoverCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	natInstance, err := discoverNAT(discoverCtx)
+	if err != nil {
+		log.Info("DiscoverNAT error:", err)
 		return
 	}
 
@@ -118,6 +121,7 @@ func (nmgr *natManager) background(ctx context.Context) {
 	// we need to sign up here to avoid missing some notifs
 	// before the NAT has been found.
 	nmgr.net.Notify((*nmgrNetNotifiee)(nmgr))
+	defer nmgr.net.StopNotify((*nmgrNetNotifiee)(nmgr))
 
 	nmgr.doSync() // sync one first.
 	for {
@@ -125,14 +129,6 @@ func (nmgr *natManager) background(ctx context.Context) {
 		case <-nmgr.syncFlag:
 			nmgr.doSync() // sync when our listen addresses change.
 		case <-ctx.Done():
-			nmgr.refCount.Done()
-			nmgr.natMx.Lock()
-			if nmgr.nat != nil {
-				nmgr.nat.Close()
-			}
-			nmgr.natMx.Unlock()
-			cancel()
-			nmgr.net.StopNotify((*nmgrNetNotifiee)(nmgr))
 			return
 		}
 	}
@@ -154,8 +150,8 @@ func (nmgr *natManager) doSync() {
 	var newAddresses []entry
 	for _, maddr := range nmgr.net.ListenAddresses() {
 		// Strip the IP
-		maIP, rest, err := ma.SplitFirst(maddr)
-		if maIP == nil || rest == nil || err != nil {
+		maIP, rest := ma.SplitFirst(maddr)
+		if maIP == nil || len(rest) == 0 {
 			continue
 		}
 
@@ -172,8 +168,8 @@ func (nmgr *natManager) doSync() {
 		}
 
 		// Extract the port/protocol
-		proto, _, err := ma.SplitFirst(rest)
-		if proto == nil || err != nil {
+		proto, _ := ma.SplitFirst(rest)
+		if proto == nil {
 			continue
 		}
 
@@ -199,6 +195,9 @@ func (nmgr *natManager) doSync() {
 		}
 	}
 
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	// Close old mappings
 	for e, v := range nmgr.tracked {
 		if !v {
@@ -218,15 +217,15 @@ func (nmgr *natManager) doSync() {
 
 func (nmgr *natManager) GetMapping(addr ma.Multiaddr) ma.Multiaddr {
 	nmgr.natMx.Lock()
+	defer nmgr.natMx.Unlock()
 
 	if nmgr.nat == nil { // NAT not yet initialized
-		nmgr.natMx.Unlock()
 		return nil
 	}
 
 	var found bool
 	var proto int // ma.P_TCP or ma.P_UDP
-	transport, rest, err := ma.SplitFunc(addr, func(c ma.Component) bool {
+	transport, rest := ma.SplitFunc(addr, func(c ma.Component) bool {
 		if found {
 			return true
 		}
@@ -234,20 +233,13 @@ func (nmgr *natManager) GetMapping(addr ma.Multiaddr) ma.Multiaddr {
 		found = proto == ma.P_TCP || proto == ma.P_UDP
 		return false
 	})
-	if err != nil {
-		nmgr.natMx.Unlock()
-		return nil
-	}
-
 	if !manet.IsThinWaist(transport) {
-		nmgr.natMx.Unlock()
 		return nil
 	}
 
 	naddr, err := manet.ToNetAddr(transport)
 	if err != nil {
 		log.Error("error parsing net multiaddr %q: %s", transport, err)
-		nmgr.natMx.Unlock()
 		return nil
 	}
 
@@ -266,19 +258,16 @@ func (nmgr *natManager) GetMapping(addr ma.Multiaddr) ma.Multiaddr {
 		port = naddr.Port
 		protocol = "udp"
 	default:
-		nmgr.natMx.Unlock()
 		return nil
 	}
 
 	if !ip.IsGlobalUnicast() && !ip.IsUnspecified() {
 		// We only map global unicast & unspecified addresses ports, not broadcast, multicast, etc.
-		nmgr.natMx.Unlock()
 		return nil
 	}
 
 	extAddr, ok := nmgr.nat.GetMapping(protocol, port)
 	if !ok {
-		nmgr.natMx.Unlock()
 		return nil
 	}
 
@@ -292,14 +281,12 @@ func (nmgr *natManager) GetMapping(addr ma.Multiaddr) ma.Multiaddr {
 	mappedMaddr, err := manet.FromNetAddr(mappedAddr)
 	if err != nil {
 		log.Errorf("mapped addr can't be turned into a multiaddr %q: %s", mappedAddr, err)
-		nmgr.natMx.Unlock()
 		return nil
 	}
 	extMaddr := mappedMaddr
 	if rest != nil {
 		extMaddr = ma.Join(extMaddr, rest)
 	}
-	nmgr.natMx.Unlock()
 	return extMaddr
 }
 

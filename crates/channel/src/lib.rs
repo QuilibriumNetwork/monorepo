@@ -1,6 +1,7 @@
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, error::Error, io::Read};
+use hex;
 
 use ed448_goldilocks_plus::{elliptic_curve::group::GroupEncoding, CompressedEdwardsY, EdwardsPoint, Scalar};
 use protocols::{doubleratchet::{DoubleRatchetParticipant, P2PChannelEnvelope}, tripleratchet::{PeerInfo, TripleRatchetParticipant}, x3dh};

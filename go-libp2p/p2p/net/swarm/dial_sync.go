@@ -67,6 +67,7 @@ func (ad *activeDial) dial(ctx context.Context) (*Conn, error) {
 
 func (ds *dialSync) getActiveDial(p peer.ID) (*activeDial, error) {
 	ds.mutex.Lock()
+	defer ds.mutex.Unlock()
 
 	actd, ok := ds.dials[p]
 	if !ok {
@@ -83,7 +84,6 @@ func (ds *dialSync) getActiveDial(p peer.ID) (*activeDial, error) {
 	}
 	// increase ref count before dropping mutex
 	actd.refCnt++
-	ds.mutex.Unlock()
 	return actd, nil
 }
 
@@ -98,6 +98,7 @@ func (ds *dialSync) Dial(ctx context.Context, p peer.ID) (*Conn, error) {
 	conn, err := ad.dial(ctx)
 
 	ds.mutex.Lock()
+	defer ds.mutex.Unlock()
 
 	ad.refCnt--
 	if ad.refCnt == 0 {
@@ -110,6 +111,5 @@ func (ds *dialSync) Dial(ctx context.Context, p peer.ID) (*Conn, error) {
 		delete(ds.dials, p)
 	}
 
-	ds.mutex.Unlock()
 	return conn, err
 }

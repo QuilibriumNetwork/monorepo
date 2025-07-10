@@ -1,0 +1,12 @@
+// -*- go -*-
+
+package main
+
+// @Test  42  1 = 0
+// @Test  42  4 = 2
+// @Test -42  4 = 2
+// @Test  42 -4 = 2
+// @Test -42 -4 = 2
+func main(a, b int64) int64 {
+	return a % b
+}

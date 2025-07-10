@@ -1,0 +1,9 @@
+// -*- go -*-
+
+package main
+
+// Test 42 1 = 65535
+func main(a, b uint64) uint {
+	val := uint32(0xffffffff)
+	return uint16(val)
+}

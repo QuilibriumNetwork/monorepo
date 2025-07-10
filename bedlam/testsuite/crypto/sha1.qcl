@@ -1,0 +1,15 @@
+// -*- go -*-
+
+package main
+
+import (
+	"crypto/sha1"
+)
+
+// @Hex
+// @LSB
+// @Test 0x54686973207061676520696e74656e74696f6e616c6c79206c65667420626c616e6b2e _ = 0xaf064923bbf2301596aac4c273ba32178ebc4a96
+// @Test 0x2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2b2121 _ = 0x439cbaa98eefc429e16047dc4b1767671189f426
+func main(data, e []byte) []byte {
+	return sha1.Sum(data)
+}

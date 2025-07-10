@@ -41,6 +41,7 @@ const (
 	P_PLAINTEXTV2       = 7367777
 	P_WEBRTC_DIRECT     = 280
 	P_WEBRTC            = 281
+	P_MEMORY            = 777
 )
 
 var (
@@ -81,6 +82,7 @@ var (
 	codeWSS, _               = CodeToVarint(P_WSS)
 	codeWebRTCDirect, _      = CodeToVarint(P_WEBRTC_DIRECT)
 	codeWebRTC, _            = CodeToVarint(P_WEBRTC)
+	codeMemory, _ 		 = CodeToVarint(P_MEMORY)
 	protoIP4                 = Protocol{
 		Name:       "ip4",
 		Code:       P_IP4,
@@ -318,6 +320,13 @@ var (
 		Code:  P_WEBRTC,
 		VCode: codeWebRTC,
 	}
+	protoMemory = Protocol{
+		Name:       "memory",
+		Code:       P_MEMORY,
+		VCode:      codeMemory,
+		Size:       64,
+		Transcoder: TranscoderMemory,
+	}
 )
 
 func init() {
@@ -359,6 +368,7 @@ func init() {
 		protoPlaintextV2,
 		protoWebRTCDirect,
 		protoWebRTC,
+		protoMemory,
 	} {
 		if err := AddProtocol(p); err != nil {
 			panic(err)

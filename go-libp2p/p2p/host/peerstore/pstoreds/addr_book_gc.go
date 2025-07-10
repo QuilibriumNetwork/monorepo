@@ -92,23 +92,24 @@ func newAddressBookGc(ctx context.Context, ab *dsAddrBook) (*dsAddrBookGc, error
 
 // gc prunes expired addresses from the datastore at regular intervals. It should be spawned as a goroutine.
 func (gc *dsAddrBookGc) background() {
+	defer gc.ab.childrenDone.Done()
 
 	select {
 	case <-gc.ab.clock.After(gc.ab.opts.GCInitialDelay):
 	case <-gc.ab.ctx.Done():
 		// yield if we have been cancelled/closed before the delay elapses.
-		gc.ab.childrenDone.Done()
 		return
 	}
 
 	purgeTimer := time.NewTicker(gc.ab.opts.GCPurgeInterval)
+	defer purgeTimer.Stop()
 
 	var lookaheadCh <-chan time.Time
-	var lookaheadTimer *time.Ticker
 	if gc.lookaheadEnabled {
-		lookaheadTimer = time.NewTicker(gc.ab.opts.GCLookaheadInterval)
+		lookaheadTimer := time.NewTicker(gc.ab.opts.GCLookaheadInterval)
 		lookaheadCh = lookaheadTimer.C
 		gc.populateLookahead() // do a lookahead now
+		defer lookaheadTimer.Stop()
 	}
 
 	for {
@@ -121,11 +122,6 @@ func (gc *dsAddrBookGc) background() {
 			gc.populateLookahead()
 
 		case <-gc.ctx.Done():
-			gc.ab.childrenDone.Done()
-			purgeTimer.Stop()
-			if lookaheadTimer != nil {
-				lookaheadTimer.Stop()
-			}
 			return
 		}
 	}

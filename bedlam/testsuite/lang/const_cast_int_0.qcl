@@ -1,0 +1,9 @@
+// -*- go -*-
+
+package main
+
+// @Test 42 1 = -1
+func main(a, b uint64) int {
+	val := int32(0x7fffffff)
+	return int16(val)
+}

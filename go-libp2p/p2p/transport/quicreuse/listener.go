@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/transport"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/quic-go/quic-go"
@@ -29,7 +30,7 @@ type protoConf struct {
 }
 
 type quicListener struct {
-	l         *quic.Listener
+	l         QUICListener
 	transport refCountedQuicTransport
 	running   chan struct{}
 	addrs     []ma.Multiaddr
@@ -55,18 +56,16 @@ func newQuicListener(tr refCountedQuicTransport, quicConfig *quic.Config) (*quic
 		SessionTicketsDisabled: true, // This is set for the config for client, but we set it here as well: https://github.com/quic-go/quic-go/issues/4029
 		GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
 			cl.protocolsMu.Lock()
+			defer cl.protocolsMu.Unlock()
 			for _, proto := range info.SupportedProtos {
 				if entry, ok := cl.protocols[proto]; ok {
 					conf := entry.tlsConf
 					if conf.GetConfigForClient != nil {
-						cl.protocolsMu.Unlock()
 						return conf.GetConfigForClient(info)
 					}
-					cl.protocolsMu.Unlock()
 					return conf, nil
 				}
 			}
-			cl.protocolsMu.Unlock()
 			return nil, fmt.Errorf("no supported protocol found. offered: %+v", info.SupportedProtos)
 		},
 	}
@@ -83,27 +82,25 @@ func newQuicListener(tr refCountedQuicTransport, quicConfig *quic.Config) (*quic
 
 func (l *quicListener) allowWindowIncrease(conn quic.Connection, delta uint64) bool {
 	l.protocolsMu.Lock()
+	defer l.protocolsMu.Unlock()
 
 	conf, ok := l.protocols[conn.ConnectionState().TLS.NegotiatedProtocol]
 	if !ok {
-		l.protocolsMu.Unlock()
 		return false
 	}
-	l.protocolsMu.Unlock()
 	return conf.allowWindowIncrease(conn, delta)
 }
 
 func (l *quicListener) Add(tlsConf *tls.Config, allowWindowIncrease func(conn quic.Connection, delta uint64) bool, onRemove func()) (Listener, error) {
 	l.protocolsMu.Lock()
+	defer l.protocolsMu.Unlock()
 
 	if len(tlsConf.NextProtos) == 0 {
-		l.protocolsMu.Unlock()
 		return nil, errors.New("no ALPN found in tls.Config")
 	}
 
 	for _, proto := range tlsConf.NextProtos {
 		if _, ok := l.protocols[proto]; ok {
-			l.protocolsMu.Unlock()
 			return nil, fmt.Errorf("already listening for protocol %s", proto)
 		}
 	}
@@ -123,21 +120,18 @@ func (l *quicListener) Add(tlsConf *tls.Config, allowWindowIncrease func(conn qu
 			allowWindowIncrease: allowWindowIncrease,
 		}
 	}
-	l.protocolsMu.Unlock()
 	return ln, nil
 }
 
 func (l *quicListener) Run() error {
+	defer close(l.running)
+	defer l.transport.DecreaseCount()
 	for {
 		conn, err := l.l.Accept(context.Background())
 		if err != nil {
 			if errors.Is(err, quic.ErrServerClosed) || strings.Contains(err.Error(), "use of closed network connection") {
-				close(l.running)
-				l.transport.DecreaseCount()
 				return transport.ErrListenerClosed
 			}
-			close(l.running)
-			l.transport.DecreaseCount()
 			return err
 		}
 		proto := conn.ConnectionState().TLS.NegotiatedProtocol
@@ -146,8 +140,6 @@ func (l *quicListener) Run() error {
 		ln, ok := l.protocols[proto]
 		if !ok {
 			l.protocolsMu.Unlock()
-			close(l.running)
-			l.transport.DecreaseCount()
 			return fmt.Errorf("negotiated unknown protocol: %s", proto)
 		}
 		ln.ln.add(conn)
@@ -221,7 +213,7 @@ func (l *listener) Close() error {
 		close(l.queue)
 		// drain the queue
 		for conn := range l.queue {
-			conn.CloseWithError(1, "closing")
+			conn.CloseWithError(quic.ApplicationErrorCode(network.ConnShutdown), "closing")
 		}
 	})
 	return nil

@@ -45,27 +45,23 @@ func (d *RoutingDiscovery) Advertise(ctx context.Context, ns string, opts ...dis
 	// closest peers to the key/CID before it goes on to provide the record to them.
 	// Not setting a timeout here will make the DHT wander forever.
 	pctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 
 	err = d.Provide(pctx, cid, true)
 	if err != nil {
-		cancel()
 		return 0, err
 	}
 
-	cancel()
 	return ttl, nil
 }
 
 func (d *RoutingDiscovery) FindPeers(ctx context.Context, ns string, opts ...discovery.Option) (<-chan peer.AddrInfo, error) {
-	var options discovery.Options
+	options := discovery.Options{
+		Limit: 100, // default limit if not specified in options
+	}
 	err := options.Apply(opts...)
 	if err != nil {
 		return nil, err
-	}
-
-	limit := options.Limit
-	if limit == 0 {
-		limit = 100 // that's just arbitrary, but FindProvidersAsync needs a count
 	}
 
 	cid, err := nsToCid(ns)
@@ -73,7 +69,7 @@ func (d *RoutingDiscovery) FindPeers(ctx context.Context, ns string, opts ...dis
 		return nil, err
 	}
 
-	return d.FindProvidersAsync(ctx, cid, limit), nil
+	return d.FindProvidersAsync(ctx, cid, options.Limit), nil
 }
 
 func nsToCid(ns string) (cid.Cid, error) {

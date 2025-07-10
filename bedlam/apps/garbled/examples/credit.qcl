@@ -1,0 +1,31 @@
+// -*- go -*-
+
+package main
+
+type Size = uint32
+
+type Applicant struct {
+	male   bool
+	age    Size
+	income Size
+}
+
+type Bank struct {
+	maxAge       Size
+	femaleIncome Size
+	maleIncome   Size
+}
+
+func main(applicant Applicant, bank Bank) bool {
+	// Bank sets the maximum age limit.
+	if applicant.age > bank.maxAge {
+		return false
+	}
+	if applicant.male {
+		// Credit criteria for males.
+		return applicant.age >= 21 && applicant.income >= bank.maleIncome
+	} else {
+		// Credit criteria for females.
+		return applicant.age >= 18 && applicant.income >= bank.femaleIncome
+	}
+}

@@ -51,12 +51,12 @@ func (n *network) getDialer(network string) *dialer {
 	n.mu.RUnlock()
 	if d == nil {
 		n.mu.Lock()
+		defer n.mu.Unlock()
 
 		if n.dialer == nil {
 			n.dialer = newDialer(n.listeners)
 		}
 		d = n.dialer
-		n.mu.Unlock()
 	}
 	return d
 }

@@ -9,6 +9,9 @@ import (
 
 // This function cleans up a relay's address set to remove private addresses and curtail
 // addrsplosion.
+// TODO: Remove this, we don't need this. The current method tries to select the
+// best address for the relay. Instead we should rely on the addresses provided by the
+// relay in response to the reservation request.
 func cleanupAddressSet(addrs []ma.Multiaddr) []ma.Multiaddr {
 	var public, private []ma.Multiaddr
 
@@ -17,13 +20,13 @@ func cleanupAddressSet(addrs []ma.Multiaddr) []ma.Multiaddr {
 			continue
 		}
 
-		if is, err := manet.IsPublicAddr(a); (is && err == nil) || isDNSAddr(a) {
+		if pubadd, err := manet.IsPublicAddr(a); err == nil && pubadd {
 			public = append(public, a)
 			continue
 		}
 
 		// discard unroutable addrs
-		if is, err := manet.IsPrivateAddr(a); is && err == nil {
+		if privadd, err := manet.IsPrivateAddr(a); err == nil && privadd {
 			private = append(private, a)
 		}
 	}
@@ -38,8 +41,8 @@ func cleanupAddressSet(addrs []ma.Multiaddr) []ma.Multiaddr {
 func isRelayAddr(a ma.Multiaddr) bool {
 	isRelay := false
 
-	ma.ForEach(a, func(c ma.Component, e error) bool {
-		if e != nil {
+	ma.ForEach(a, func(c ma.Component, err error) bool {
+		if err != nil {
 			return false
 		}
 		switch c.Protocol().Code {
@@ -52,16 +55,6 @@ func isRelayAddr(a ma.Multiaddr) bool {
 	})
 
 	return isRelay
-}
-
-func isDNSAddr(a ma.Multiaddr) bool {
-	if first, _, err := ma.SplitFirst(a); err == nil && first != nil {
-		switch first.Protocol().Code {
-		case ma.P_DNS, ma.P_DNS4, ma.P_DNS6, ma.P_DNSADDR:
-			return true
-		}
-	}
-	return false
 }
 
 // we have addrsplosion if for some protocol we advertise multiple ports on
@@ -87,10 +80,11 @@ func addrKeyAndPort(a ma.Multiaddr) (string, int) {
 		port int
 	)
 
-	ma.ForEach(a, func(c ma.Component, e error) bool {
-		if e != nil {
+	ma.ForEach(a, func(c ma.Component, err error) bool {
+		if err != nil {
 			return false
 		}
+
 		switch c.Protocol().Code {
 		case ma.P_TCP, ma.P_UDP:
 			port = int(binary.BigEndian.Uint16(c.RawValue()))

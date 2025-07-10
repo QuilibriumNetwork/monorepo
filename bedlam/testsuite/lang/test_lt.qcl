@@ -1,0 +1,16 @@
+// -*- go -*-
+
+package main
+
+// @Test 42 	11 		= 0
+// @Test 42 	42 		= 0
+// @Test 42 	43 		= 1
+// @Test 42 	0  		= 0
+// @Test 0  	0  		= 0
+// @Test 0  	42 		= 1
+// @Test 42     0xffff  = 1
+// @Test 0xffff 0xffff  = 0
+// @Test 0xffff 42      = 0
+func main(a, b uint16) bool {
+	return a < b
+}

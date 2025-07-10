@@ -1,0 +1,10 @@
+// -*- go -*-
+//
+// Copyright (c) 2021 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package math implements various mathematical algorithms and
+// provides commonly used constant values.
+package math

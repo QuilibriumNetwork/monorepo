@@ -3,12 +3,13 @@ package quicreuse
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/google/gopacket/routing"
-	"github.com/libp2p/go-netroute"
 	"github.com/quic-go/quic-go"
 )
 
@@ -25,23 +26,30 @@ type refCountedQuicTransport interface {
 	IncreaseCount()
 
 	Dial(ctx context.Context, addr net.Addr, tlsConf *tls.Config, conf *quic.Config) (quic.Connection, error)
-	Listen(tlsConf *tls.Config, conf *quic.Config) (*quic.Listener, error)
+	Listen(tlsConf *tls.Config, conf *quic.Config) (QUICListener, error)
 }
 
 type singleOwnerTransport struct {
-	quic.Transport
+	Transport QUICTransport
 
 	// Used to write packets directly around QUIC.
 	packetConn net.PacketConn
 }
 
+var _ QUICTransport = &singleOwnerTransport{}
+
 func (c *singleOwnerTransport) IncreaseCount() {}
-func (c *singleOwnerTransport) DecreaseCount() {
-	c.Transport.Close()
+func (c *singleOwnerTransport) DecreaseCount() { c.Transport.Close() }
+func (c *singleOwnerTransport) LocalAddr() net.Addr {
+	return c.packetConn.LocalAddr()
 }
 
-func (c *singleOwnerTransport) LocalAddr() net.Addr {
-	return c.Transport.Conn.LocalAddr()
+func (c *singleOwnerTransport) Dial(ctx context.Context, addr net.Addr, tlsConf *tls.Config, conf *quic.Config) (quic.Connection, error) {
+	return c.Transport.Dial(ctx, addr, tlsConf, conf)
+}
+
+func (c *singleOwnerTransport) ReadNonQUICPacket(ctx context.Context, b []byte) (int, net.Addr, error) {
+	return c.Transport.ReadNonQUICPacket(ctx, b)
 }
 
 func (c *singleOwnerTransport) Close() error {
@@ -54,6 +62,10 @@ func (c *singleOwnerTransport) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return c.Transport.WriteTo(b, addr)
 }
 
+func (c *singleOwnerTransport) Listen(tlsConf *tls.Config, conf *quic.Config) (QUICListener, error) {
+	return c.Transport.Listen(tlsConf, conf)
+}
+
 // Constant. Defined as variables to simplify testing.
 var (
 	garbageCollectInterval = 30 * time.Second
@@ -61,7 +73,7 @@ var (
 )
 
 type refcountedTransport struct {
-	quic.Transport
+	QUICTransport
 
 	// Used to write packets directly around QUIC.
 	packetConn net.PacketConn
@@ -69,6 +81,41 @@ type refcountedTransport struct {
 	mutex       sync.Mutex
 	refCount    int
 	unusedSince time.Time
+
+	// Only set for transports we are borrowing.
+	// If set, we will _never_ close the underlying transport. We only close this
+	// channel to signal to the owner that we are done with it.
+	borrowDoneSignal chan struct{}
+
+	assocations map[any]struct{}
+}
+
+// associate an arbitrary value with this transport.
+// This lets us "tag" the refcountedTransport when listening so we can use it
+// later for dialing. Necessary for holepunching and learning about our own
+// observed listening address.
+func (c *refcountedTransport) associate(a any) {
+	if a == nil {
+		return
+	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.assocations == nil {
+		c.assocations = make(map[any]struct{})
+	}
+	c.assocations[a] = struct{}{}
+}
+
+// hasAssociation returns true if the transport has the given association.
+// If it is a nil association, it will always return true.
+func (c *refcountedTransport) hasAssociation(a any) bool {
+	if a == nil {
+		return true
+	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	_, ok := c.assocations[a]
+	return ok
 }
 
 func (c *refcountedTransport) IncreaseCount() {
@@ -79,17 +126,24 @@ func (c *refcountedTransport) IncreaseCount() {
 }
 
 func (c *refcountedTransport) Close() error {
-	// TODO(when we drop support for go 1.19) use errors.Join
-	c.Transport.Close()
-	return c.packetConn.Close()
+	if c.borrowDoneSignal != nil {
+		close(c.borrowDoneSignal)
+		return nil
+	}
+
+	return errors.Join(c.QUICTransport.Close(), c.packetConn.Close())
 }
 
 func (c *refcountedTransport) WriteTo(b []byte, addr net.Addr) (int, error) {
-	return c.Transport.WriteTo(b, addr)
+	return c.QUICTransport.WriteTo(b, addr)
 }
 
 func (c *refcountedTransport) LocalAddr() net.Addr {
-	return c.Transport.Conn.LocalAddr()
+	return c.packetConn.LocalAddr()
+}
+
+func (c *refcountedTransport) Listen(tlsConf *tls.Config, conf *quic.Config) (QUICListener, error) {
+	return c.QUICTransport.Listen(tlsConf, conf)
 }
 
 func (c *refcountedTransport) DecreaseCount() {
@@ -113,7 +167,11 @@ type reuse struct {
 	closeChan  chan struct{}
 	gcStopChan chan struct{}
 
-	routes  routing.Router
+	listenUDP listenUDP
+
+	sourceIPSelectorFn func() (SourceIPSelector, error)
+
+	routes  SourceIPSelector
 	unicast map[string] /* IP.String() */ map[int] /* port */ *refcountedTransport
 	// globalListeners contains transports that are listening on 0.0.0.0 / ::
 	globalListeners map[int]*refcountedTransport
@@ -126,15 +184,17 @@ type reuse struct {
 	tokenGeneratorKey *quic.TokenGeneratorKey
 }
 
-func newReuse(srk *quic.StatelessResetKey, tokenKey *quic.TokenGeneratorKey) *reuse {
+func newReuse(srk *quic.StatelessResetKey, tokenKey *quic.TokenGeneratorKey, listenUDP listenUDP, sourceIPSelectorFn func() (SourceIPSelector, error)) *reuse {
 	r := &reuse{
-		unicast:           make(map[string]map[int]*refcountedTransport),
-		globalListeners:   make(map[int]*refcountedTransport),
-		globalDialers:     make(map[int]*refcountedTransport),
-		closeChan:         make(chan struct{}),
-		gcStopChan:        make(chan struct{}),
-		statelessResetKey: srk,
-		tokenGeneratorKey: tokenKey,
+		unicast:            make(map[string]map[int]*refcountedTransport),
+		globalListeners:    make(map[int]*refcountedTransport),
+		globalDialers:      make(map[int]*refcountedTransport),
+		closeChan:          make(chan struct{}),
+		gcStopChan:         make(chan struct{}),
+		listenUDP:          listenUDP,
+		sourceIPSelectorFn: sourceIPSelectorFn,
+		statelessResetKey:  srk,
+		tokenGeneratorKey:  tokenKey,
 	}
 	go r.gc()
 	return r
@@ -195,7 +255,7 @@ func (r *reuse) gc() {
 					} else {
 						// Ignore the error, there's nothing we can do about
 						// it.
-						r.routes, _ = netroute.New()
+						r.routes, _ = r.sourceIPSelectorFn()
 					}
 				}
 			}
@@ -204,7 +264,7 @@ func (r *reuse) gc() {
 	}
 }
 
-func (r *reuse) TransportForDial(network string, raddr *net.UDPAddr) (*refcountedTransport, error) {
+func (r *reuse) transportWithAssociationForDial(association any, network string, raddr *net.UDPAddr) (*refcountedTransport, error) {
 	var ip *net.IP
 
 	// Only bother looking up the source address if we actually _have_ non 0.0.0.0 listeners.
@@ -215,7 +275,7 @@ func (r *reuse) TransportForDial(network string, raddr *net.UDPAddr) (*refcounte
 	r.mutex.Unlock()
 
 	if router != nil {
-		_, _, src, err := router.Route(raddr.IP)
+		src, err := router.PreferredSourceIPForDestination(raddr)
 		if err == nil && !src.IsUnspecified() {
 			ip = &src
 		}
@@ -224,7 +284,7 @@ func (r *reuse) TransportForDial(network string, raddr *net.UDPAddr) (*refcounte
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	tr, err := r.transportForDialLocked(network, ip)
+	tr, err := r.transportForDialLocked(association, network, ip)
 	if err != nil {
 		return nil, err
 	}
@@ -232,11 +292,18 @@ func (r *reuse) TransportForDial(network string, raddr *net.UDPAddr) (*refcounte
 	return tr, nil
 }
 
-func (r *reuse) transportForDialLocked(network string, source *net.IP) (*refcountedTransport, error) {
+func (r *reuse) transportForDialLocked(association any, network string, source *net.IP) (*refcountedTransport, error) {
 	if source != nil {
 		// We already have at least one suitable transport...
 		if trs, ok := r.unicast[source.String()]; ok {
-			// ... we don't care which port we're dialing from. Just use the first.
+			// Prefer a transport that has the given association. We want to
+			// reuse the transport the association used for listening.
+			for _, tr := range trs {
+				if tr.hasAssociation(association) {
+					return tr, nil
+				}
+			}
+			// We don't have a transport with the association, use any one
 			for _, tr := range trs {
 				return tr, nil
 			}
@@ -244,7 +311,13 @@ func (r *reuse) transportForDialLocked(network string, source *net.IP) (*refcoun
 	}
 
 	// Use a transport listening on 0.0.0.0 (or ::).
-	// Again, we don't care about the port number.
+	// Again, prefer a transport that has the given association.
+	for _, tr := range r.globalListeners {
+		if tr.hasAssociation(association) {
+			return tr, nil
+		}
+	}
+	// We don't have a transport with the association, use any one
 	for _, tr := range r.globalListeners {
 		return tr, nil
 	}
@@ -263,17 +336,63 @@ func (r *reuse) transportForDialLocked(network string, source *net.IP) (*refcoun
 	case "udp6":
 		addr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
 	}
-	conn, err := net.ListenUDP(network, addr)
+	conn, err := r.listenUDP(network, addr)
 	if err != nil {
 		return nil, err
 	}
-	tr := &refcountedTransport{Transport: quic.Transport{
-		Conn:              conn,
-		StatelessResetKey: r.statelessResetKey,
-		TokenGeneratorKey: r.tokenGeneratorKey,
-	}, packetConn: conn}
+	tr := &refcountedTransport{
+		QUICTransport: &wrappedQUICTransport{
+			Transport: &quic.Transport{
+				Conn:              conn,
+				StatelessResetKey: r.statelessResetKey,
+				TokenGeneratorKey: r.tokenGeneratorKey,
+			},
+		},
+		packetConn: conn,
+	}
 	r.globalDialers[conn.LocalAddr().(*net.UDPAddr).Port] = tr
 	return tr, nil
+}
+
+func (r *reuse) AddTransport(tr *refcountedTransport, laddr *net.UDPAddr) error {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if !laddr.IP.IsUnspecified() {
+		return errors.New("adding transport for specific IP not supported")
+	}
+	if _, ok := r.globalDialers[laddr.Port]; ok {
+		return fmt.Errorf("already have global dialer for port %d", laddr.Port)
+	}
+	r.globalDialers[laddr.Port] = tr
+	return nil
+}
+
+func (r *reuse) AssertTransportExists(tr refCountedQuicTransport) error {
+	t, ok := tr.(*refcountedTransport)
+	if !ok {
+		return fmt.Errorf("invalid transport type: expected: *refcountedTransport, got: %T", tr)
+	}
+	laddr := t.LocalAddr().(*net.UDPAddr)
+	if laddr.IP.IsUnspecified() {
+		if lt, ok := r.globalListeners[laddr.Port]; ok {
+			if lt == t {
+				return nil
+			}
+			return errors.New("two global listeners on the same port")
+		}
+		return errors.New("transport not found")
+	}
+	if m, ok := r.unicast[laddr.IP.String()]; ok {
+		if lt, ok := m[laddr.Port]; ok {
+			if lt == t {
+				return nil
+			}
+			return errors.New("two unicast listeners on same ip:port")
+		}
+		return errors.New("transport not found")
+	}
+	return errors.New("transport not found")
 }
 
 func (r *reuse) TransportForListen(network string, laddr *net.UDPAddr) (*refcountedTransport, error) {
@@ -310,15 +429,17 @@ func (r *reuse) TransportForListen(network string, laddr *net.UDPAddr) (*refcoun
 		}
 	}
 
-	conn, err := net.ListenUDP(network, laddr)
+	conn, err := r.listenUDP(network, laddr)
 	if err != nil {
 		return nil, err
 	}
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	tr := &refcountedTransport{
-		Transport: quic.Transport{
-			Conn:              conn,
-			StatelessResetKey: r.statelessResetKey,
+		QUICTransport: &wrappedQUICTransport{
+			Transport: &quic.Transport{
+				Conn:              conn,
+				StatelessResetKey: r.statelessResetKey,
+			},
 		},
 		packetConn: conn,
 	}
@@ -337,7 +458,7 @@ func (r *reuse) TransportForListen(network string, laddr *net.UDPAddr) (*refcoun
 		r.unicast[localAddr.IP.String()] = make(map[int]*refcountedTransport)
 		// Assume the system's routes may have changed if we're adding a new listener.
 		// Ignore the error, there's nothing we can do.
-		r.routes, _ = netroute.New()
+		r.routes, _ = r.sourceIPSelectorFn()
 	}
 
 	// The kernel already checked that the laddr is not already listen
@@ -350,4 +471,17 @@ func (r *reuse) Close() error {
 	close(r.closeChan)
 	<-r.gcStopChan
 	return nil
+}
+
+type SourceIPSelector interface {
+	PreferredSourceIPForDestination(dst *net.UDPAddr) (net.IP, error)
+}
+
+type netrouteSourceIPSelector struct {
+	routes routing.Router
+}
+
+func (s *netrouteSourceIPSelector) PreferredSourceIPForDestination(dst *net.UDPAddr) (net.IP, error) {
+	_, _, src, err := s.routes.Route(dst.IP)
+	return src, err
 }

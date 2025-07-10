@@ -28,7 +28,7 @@ use crate::bls48581::fp;
 use crate::bls48581::fp::FP;
 use crate::bls48581::dbig::DBIG;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct ECP8 {
     x: FP8,
     y: FP8,

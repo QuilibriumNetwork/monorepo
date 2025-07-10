@@ -1,0 +1,15 @@
+// -*- go -*-
+//
+// Rock, Paper, Scissors
+
+package main
+
+func main(g, e int8) string {
+	if g == e {
+		return "-"
+	}
+	if (g+1)%3 == e {
+		return "evaluator"
+	}
+	return "garbler"
+}

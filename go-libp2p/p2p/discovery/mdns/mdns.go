@@ -86,10 +86,7 @@ func (s *mdnsService) Close() error {
 func (s *mdnsService) getIPs(addrs []ma.Multiaddr) ([]string, error) {
 	var ip4, ip6 string
 	for _, addr := range addrs {
-		first, _, err := ma.SplitFirst(addr)
-		if err != nil {
-			return nil, err
-		}
+		first, _ := ma.SplitFirst(addr)
 		if first == nil {
 			continue
 		}
@@ -157,6 +154,7 @@ func (s *mdnsService) startResolver(ctx context.Context) {
 	s.resolverWG.Add(2)
 	entryChan := make(chan *zeroconf.ServiceEntry, 1000)
 	go func() {
+		defer s.resolverWG.Done()
 		for entry := range entryChan {
 			// We only care about the TXT records.
 			// Ignore A, AAAA and PTR.
@@ -185,13 +183,12 @@ func (s *mdnsService) startResolver(ctx context.Context) {
 				go s.notifee.HandlePeerFound(info)
 			}
 		}
-		s.resolverWG.Done()
 	}()
 	go func() {
+		defer s.resolverWG.Done()
 		if err := zeroconf.Browse(ctx, s.serviceName, mdnsDomain, entryChan); err != nil {
 			log.Debugf("zeroconf browsing failed: %s", err)
 		}
-		s.resolverWG.Done()
 	}()
 }
 

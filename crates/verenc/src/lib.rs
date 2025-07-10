@@ -448,6 +448,20 @@ pub fn combine_chunked_data(chunks: Vec<Vec<u8>>) -> Vec<u8> {
     return decode_from_curve448_scalars(&chunks);
 }
 
+pub fn verenc_verify_statement(input: Vec<u8>, blinding_pubkey: Vec<u8>, statement: Vec<u8>) -> bool {
+  if input.len() != 56 || blinding_pubkey.len() != 57 || statement.len() != 57 {
+    return false
+  }
+  
+  let blind = point_from_bytes(blinding_pubkey);
+  if blind.is_none() {
+    return false;
+  }
+
+  let st = blind.unwrap() * Scalar::from_bytes(input.as_slice().try_into().unwrap());
+  return st.compress().to_bytes().to_vec() == statement;
+}
+
 #[cfg(test)]
 mod tests {
     use rand::RngCore;
@@ -456,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_verenc() {
-        let data = vec![0, 'h' as u8, 'e' as u8, 'l' as u8, 'l' as u8, 'o' as u8, 0, 0, 0, 0,
+        let data = vec!['h' as u8, 'e' as u8, 'l' as u8, 'l' as u8, 'o' as u8, 0, 0, 0, 0, 0,
              0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
              0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
              0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -479,14 +493,21 @@ mod tests {
 
     #[test]
     fn test_chunking() {
+        let mut roundcheck: [u8; 1266] = [0u8;1266];
+        OsRng::fill_bytes(&mut OsRng, &mut roundcheck);
+        let rndch = chunk_data_for_verenc(roundcheck.to_vec());
+        assert!(rndch.len() == 24);
         for i in 0..1000 {
-            let mut data: [u8; 1300] = [0u8;1300];
+            let mut data: [u8; 1265] = [0u8;1265];
             OsRng::fill_bytes(&mut OsRng, &mut data);
             let chunks = chunk_data_for_verenc(data.to_vec());
+            assert!(chunks.len() == 23);
             for chunk in chunks.clone() {
               let scalar_chunk = Scalar::from_bytes(&chunk.clone().try_into().unwrap());
-              assert!(scalar_chunk.to_bytes().to_vec() == chunk)
+              assert!(scalar_chunk.to_bytes().to_vec() == chunk);
+              assert!(chunk[55] == 0);
             }
+
             let result = combine_chunked_data(chunks);
             let mut padded_data = data.to_vec();
             while result.len() > padded_data.len() {
@@ -498,11 +519,14 @@ mod tests {
 
     #[test]
     fn test_full_verenc() {
-        let mut data: [u8; 128] = [0u8;128];
+        let mut data: [u8; 110] = [0u8;110];
         OsRng::fill_bytes(&mut OsRng, &mut data);
         let chunks = chunk_data_for_verenc(data.to_vec());
         for chunk in chunks.clone() {
           let proof = new_verenc_proof(chunk.clone());
+          let blind = Scalar::from_bytes(proof.blinding_key.as_slice().try_into().unwrap());
+          let st = EdwardsPoint::GENERATOR * blind * Scalar::from_bytes(chunk.as_slice().try_into().unwrap());
+          assert!(st.compress().to_bytes().to_vec() == proof.statement);
           let proofdata = proof.clone();
           let pubproof = VerencProof { blinding_pubkey: proof.blinding_pubkey, encryption_key: proof.encryption_key, statement: proof.statement, challenge: proof.challenge, polycom: proof.polycom, ctexts: proof.ctexts, shares_rands: proof.shares_rands };
           assert!(verenc_verify(pubproof.clone()));
@@ -521,6 +545,6 @@ mod tests {
         while result.len() > padded_data.len() {
           padded_data.push(0);
         }
-        assert!(padded_data != result);
+        assert!(padded_data == result);
     }
 }

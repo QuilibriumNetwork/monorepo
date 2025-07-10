@@ -14,8 +14,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-//go:generate protoc --proto_path=$PWD:$PWD/../.. --go_out=. --go_opt=Mpb/peer_record.proto=./pb pb/peer_record.proto
-
 var _ record.Record = (*PeerRecord)(nil)
 
 func init() {
@@ -137,13 +135,13 @@ var (
 func TimestampSeq() uint64 {
 	now := uint64(time.Now().UnixNano())
 	lastTimestampMu.Lock()
+	defer lastTimestampMu.Unlock()
 	// Not all clocks are strictly increasing, but we need these sequence numbers to be strictly
 	// increasing.
 	if now <= lastTimestamp {
 		now = lastTimestamp + 1
 	}
 	lastTimestamp = now
-	lastTimestampMu.Unlock()
 	return now
 }
 

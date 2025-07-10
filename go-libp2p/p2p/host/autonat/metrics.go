@@ -138,23 +138,23 @@ func (mt *metricsTracer) ReachabilityStatusConfidence(confidence int) {
 
 func (mt *metricsTracer) ReceivedDialResponse(status pb.Message_ResponseStatus) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 	*tags = append(*tags, getResponseStatus(status))
 	receivedDialResponseTotal.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) OutgoingDialResponse(status pb.Message_ResponseStatus) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 	*tags = append(*tags, getResponseStatus(status))
 	outgoingDialResponseTotal.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) OutgoingDialRefused(reason string) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 	*tags = append(*tags, reason)
 	outgoingDialRefusedTotal.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) NextProbeTime(t time.Time) {

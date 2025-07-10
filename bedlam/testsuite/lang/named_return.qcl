@@ -1,0 +1,14 @@
+// -*- go -*-
+
+package main
+
+func sum(a, b int32) (result int32) {
+	result = a + b
+	return
+}
+
+// @Test 1 2 = 3
+// @Test 55 66 = 121
+func main(a, b int32) int {
+	return sum(a, b)
+}

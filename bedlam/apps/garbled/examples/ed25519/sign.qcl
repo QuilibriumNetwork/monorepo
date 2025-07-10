@@ -1,0 +1,55 @@
+// -*- go -*-
+
+// This example implements Ed25519 signature computation. The Ed25519
+// keypair is:
+//
+//	pub  : 8ae64963506002e267a59665e9a2e6f9348cc159be53747894478e182ece9fcb
+//
+//	priv : 2f8d55706c0cb226d75aafe2f4c4648e5cd32bd51fbc9764d54908c67812aee2
+//	       8ae64963506002e267a59665e9a2e6f9348cc159be53747894478e182ece9fcb
+//
+// The Garbler and Evaluator share the private key as two random
+// shares. The private key is contructed during the signature
+// computation by XOR:ing the random shares together:
+//
+//	privG: a66e6bb15b6ad6b19bacf163573d0179de7f62bafcd6aba521d525a0d7b79f7e
+//	       153801bc47f6d566a274e370f615f140f20202ab80ec88fdd611b726b8526726
+//
+//
+//	privE: 89e33ec1376664974cf65e81a3f965f782ac496fe36a3cc1f49c2d66afa5319c
+//	       9fde48df1796d784c5d175151fb717b9c68ec3f23ebffc854256393e969cf8ed
+//
+//	priv = privG ^ privE
+//
+// Run the Evaluator with one input: the Evaluator's private key share:
+//
+//	./garbled -e -v -stream -i 0x89e33ec1376664974cf65e81a3f965f782ac496fe36a3cc1f49c2d66afa5319c9fde48df1796d784c5d175151fb717b9c68ec3f23ebffc854256393e969cf8ed
+//
+// The Garbler takes two inputs: the message to sign, and the
+// Garbler's private key share:
+//
+//	./garbled -stream -v -i 0x4d61726b6b7520526f737369203c6d747240696b692e66693e2068747470733a2f2f7777772e6d61726b6b75726f7373692e636f6d2f,0xa66e6bb15b6ad6b19bacf163573d0179de7f62bafcd6aba521d525a0d7b79f7e153801bc47f6d566a274e370f615f140f20202ab80ec88fdd611b726b8526726 examples/ed25519/sign.qcl
+//
+// The result signature is:
+//
+//	Result[0]: f43c1cf1755345852211942af0838414334eec9cbf36e26a9f9e8d4bb720deb145ffbeec82249c875116757441206bcdc56b501e750f1f590917d772dfee980f
+package main
+
+import (
+	"crypto/ed25519"
+)
+
+type Garbler struct {
+	msg       [64]byte
+	privShare [64]byte
+}
+
+func main(g Garbler, privShare [64]byte) []byte {
+	var priv [64]byte
+
+	for i := 0; i < len(priv); i++ {
+		priv[i] = g.privShare[i] ^ privShare[i]
+	}
+
+	return ed25519.Sign(priv, g.msg)
+}

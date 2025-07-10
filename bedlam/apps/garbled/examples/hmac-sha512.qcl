@@ -1,0 +1,62 @@
+// -*- go -*-
+
+// This example computes HMAC-SHA256 where the HMAC key is shared as
+// two random shares between garbler and evaluator. The garbler's key
+// share is:
+//
+//	keyG: 4de216d2fdc9301e5b9c78486f7109a05670d200d9e2f275ec0aad08ec42af47
+//	      fcb59bf460d50b01333a748f3a9efb13e08036d49a26c21ba2e33a5f8a2cf0e7
+//
+// The evaluator's key share is:
+//
+//	keyE: f87a00ef89c2396de32f6ac0748f6fa1b641013d46f74ce25cc625904215a675
+//	      01c0c7196a2602f6516527958a82271847933c35d170d98bfdb04d2ddf3bb197
+//
+// The final HMAC key is keyG ^ keyE:
+//
+//	key : b598163d740b0973b8b312881bfe6601e031d33d9f15be97b0cc8898ae570932
+//	      fd755ced0af309f7625f531ab01cdc0ba7130ae14b561b905f53777255174170
+//
+// The example uses 32-byte messages (Garbler.msg) so with the message:
+//
+//	msg : Hello, world!...................
+//	hex : 48656c6c6f2c20776f726c64212e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e
+//
+// We expect to get the following HMAC-SHA256 output:
+//
+//	sum : 89c648c4d7b4220f6767706dec64f69bbdb2725d062a09a447b9cf32af8636ee8853f92ca59c0e81712b72c79f3503f7f2131d20c7a5dfae87b79f839cecf2c4
+//
+// Now we can run the MPC computation as follows. First, run the
+// evaluator with one input: the evaluator's key share:
+//
+//	./garbled -e -v -i 0xf87a00ef89c2396de32f6ac0748f6fa1b641013d46f74ce25cc625904215a67501c0c7196a2602f6516527958a82271847933c35d170d98bfdb04d2ddf3bb197 examples/hmac-sha512.qcl
+//
+// The garbler takes two inputs: the message and the garbler's key
+// share:
+//
+//	./garbled -v -i 0x48656c6c6f2c20776f726c64212e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e,0x4de216d2fdc9301e5b9c78486f7109a05670d200d9e2f275ec0aad08ec42af47fcb59bf460d50b01333a748f3a9efb13e08036d49a26c21ba2e33a5f8a2cf0e7 examples/hmac-sha512.qcl
+//
+// The MCP computation providers the expected HMAC result:
+//
+//	Result[0]: 89c648c4d7b4220f6767706dec64f69bbdb2725d062a09a447b9cf32af8636ee8853f92ca59c0e81712b72c79f3503f7f2131d20c7a5dfae87b79f839cecf2c4
+
+package main
+
+import (
+	"crypto/hmac"
+)
+
+type Garbler struct {
+	msg      []byte
+	keyShare [64]byte
+}
+
+func main(g Garbler, eKeyShare [64]byte) []byte {
+	var key [64]byte
+
+	for i := 0; i < len(key); i++ {
+		key[i] = g.keyShare[i] ^ eKeyShare[i]
+	}
+
+	return hmac.SumSHA512(g.msg, key)
+}

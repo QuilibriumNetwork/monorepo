@@ -11,7 +11,6 @@ import (
 	tpt "github.com/libp2p/go-libp2p/core/transport"
 	p2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
-
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/quic-go/quic-go"
 )
@@ -23,11 +22,11 @@ type listener struct {
 	rcmgr           network.ResourceManager
 	privKey         ic.PrivKey
 	localPeer       peer.ID
-	localMultiaddrs map[quic.VersionNumber]ma.Multiaddr
+	localMultiaddrs map[quic.Version]ma.Multiaddr
 }
 
 func newListener(ln quicreuse.Listener, t *transport, localPeer peer.ID, key ic.PrivKey, rcmgr network.ResourceManager) (listener, error) {
-	localMultiaddrs := make(map[quic.VersionNumber]ma.Multiaddr)
+	localMultiaddrs := make(map[quic.Version]ma.Multiaddr)
 	for _, addr := range ln.Multiaddrs() {
 		if _, err := addr.ValueForProtocol(ma.P_QUIC_V1); err == nil {
 			localMultiaddrs[quic.Version1] = addr
@@ -51,13 +50,15 @@ func (l *listener) Accept() (tpt.CapableConn, error) {
 		if err != nil {
 			return nil, err
 		}
-		c, err := l.setupConn(qconn)
+		c, err := l.wrapConn(qconn)
 		if err != nil {
+			log.Debugf("failed to setup connection: %s", err)
+			qconn.CloseWithError(quic.ApplicationErrorCode(network.ConnResourceLimitExceeded), "")
 			continue
 		}
 		l.transport.addConn(qconn, c)
 		if l.transport.gater != nil && !(l.transport.gater.InterceptAccept(c) && l.transport.gater.InterceptSecured(network.DirInbound, c.remotePeerID, c)) {
-			c.closeWithError(errorCodeConnectionGating, "connection gated")
+			c.closeWithError(quic.ApplicationErrorCode(network.ConnGated), "connection gated")
 			continue
 		}
 
@@ -79,7 +80,10 @@ func (l *listener) Accept() (tpt.CapableConn, error) {
 	}
 }
 
-func (l *listener) setupConn(qconn quic.Connection) (*conn, error) {
+// wrapConn wraps a QUIC connection into a libp2p [tpt.CapableConn].
+// If wrapping fails. The caller is responsible for cleaning up the
+// connection.
+func (l *listener) wrapConn(qconn quic.Connection) (*conn, error) {
 	remoteMultiaddr, err := quicreuse.ToQuicMultiaddr(qconn.RemoteAddr(), qconn.ConnectionState().Version)
 	if err != nil {
 		return nil, err
@@ -90,18 +94,16 @@ func (l *listener) setupConn(qconn quic.Connection) (*conn, error) {
 		log.Debugw("resource manager blocked incoming connection", "addr", qconn.RemoteAddr(), "error", err)
 		return nil, err
 	}
-	c, err := l.setupConnWithScope(qconn, connScope, remoteMultiaddr)
+	c, err := l.wrapConnWithScope(qconn, connScope, remoteMultiaddr)
 	if err != nil {
 		connScope.Done()
-		qconn.CloseWithError(1, "")
 		return nil, err
 	}
 
 	return c, nil
 }
 
-func (l *listener) setupConnWithScope(qconn quic.Connection, connScope network.ConnManagementScope, remoteMultiaddr ma.Multiaddr) (*conn, error) {
-
+func (l *listener) wrapConnWithScope(qconn quic.Connection, connScope network.ConnManagementScope, remoteMultiaddr ma.Multiaddr) (*conn, error) {
 	// The tls.Config used to establish this connection already verified the certificate chain.
 	// Since we don't have any way of knowing which tls.Config was used though,
 	// we have to re-determine the peer's identity here.

@@ -1,0 +1,32 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2021 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package rsa implements RSA encrypt and decrypt operations. The
+// practical key sizes are <= 512 bits i.e. this must not be used in
+// any real life applications.
+package rsa
+
+import (
+	"math"
+)
+
+const (
+	// E65537 is the public RSA exponent 2^16+1.
+	E65537 = 0x10001
+)
+
+// Encrypt encrypts the message with the public key {e, n}.
+//   cipher = msg**e mod n
+func Encrypt(msg, e, n uint) uint {
+	return math.Exp(msg, e, n)
+}
+
+// Decrypt decrypts the cipher text with the private key {d, n}.
+//   message = cipher**d mod n
+func Decrypt(cipher, d, n uint) uint {
+	return math.Exp(cipher, d, n)
+}

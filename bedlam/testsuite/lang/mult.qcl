@@ -1,0 +1,18 @@
+// -*- go -*-
+
+package main
+
+// @Test 42 1  = 42
+// @Test 42 2  = 84
+// @Test 65536 0 = 0
+// @Test 65536 1 = 65536
+// @Test 65536 65536 = 4294967296
+// @Hex
+// @Test 0xff 0xff = 0xfe01
+// @Test 0xffff 0xff = 0xfeff01
+// @Test 0xff00 0x10 = 0xff000
+// @Test 0xff00 0x100 = 0xff0000
+// @Test 0xff 0xff = 0xfe01
+func main(a, b uint64) uint {
+	return a * b
+}

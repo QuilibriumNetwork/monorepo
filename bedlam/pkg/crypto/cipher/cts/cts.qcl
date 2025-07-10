@@ -1,0 +1,135 @@
+// -*- go -*-
+//
+// Copyright (c) 2024 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package cts implements the ciphertext stealing (CTS) mode of
+// operation for block ciphers. The implementation uses the CTS-3
+// (Kerberos) variant for formatting the cipher text.
+package cts
+
+import (
+	"crypto/aes"
+)
+
+// EncryptAES128 encrypts the data in AES-CTS mode. The key specifies
+// the AES encryption key and iv is a random initialization vector.
+//
+//	key := []byte{
+//		0x63, 0x68, 0x69, 0x63, 0x6b, 0x65, 0x6e, 0x20,
+//		0x74, 0x65, 0x72, 0x69, 0x79, 0x61, 0x6b, 0x69,
+//	}
+//	var iv [16]byte
+//	data := []byte{
+//		0x49, 0x20, 0x77, 0x6f, 0x75, 0x6c, 0x64, 0x20,
+//		0x6c, 0x69, 0x6b, 0x65, 0x20, 0x74, 0x68, 0x65,
+//		0x20,
+//	}
+//	cipher := cts.EncryptAES128(key, iv, data)
+//	=> c6353568f2bf8cb4d8a580362da7ff7f97
+func EncryptAES128(key [16]byte, iv [aes.BlockSize]byte, data []byte) []byte {
+	numBlocks := len(data) / aes.BlockSize
+	tail := len(data) % aes.BlockSize
+
+	if tail != 0 {
+		numBlocks++
+	} else {
+		tail = aes.BlockSize
+	}
+	if numBlocks < 2 {
+		panic("cts.EncryptAES128: input must be at least 2 block")
+	}
+	var block [aes.BlockSize]byte
+	copy(block, iv)
+
+	var plain [aes.BlockSize]byte
+	var cipher [len(data)]byte
+
+	// Standard CBC for the first numBlocks-1 blocks.
+	for i := 0; i < numBlocks-1; i++ {
+		copy(plain, data[i*aes.BlockSize:])
+		for j := 0; j < aes.BlockSize; j++ {
+			plain[j] ^= block[j]
+		}
+		block = aes.EncryptBlock(key, plain)
+		if i < numBlocks-2 {
+			// Store standard CBC output block.
+			copy(cipher[i*aes.BlockSize:], block)
+		} else {
+			// Store last ciphertext block.
+			copy(cipher[(numBlocks-1)*aes.BlockSize:], block)
+		}
+	}
+
+	// Create last input block.
+	copy(plain, data[(numBlocks-1)*aes.BlockSize:])
+	for i := tail; i < aes.BlockSize; i++ {
+		plain[i] = 0
+	}
+	for j := 0; j < aes.BlockSize; j++ {
+		plain[j] ^= block[j]
+	}
+	block = aes.EncryptBlock(key, plain)
+	copy(cipher[(numBlocks-2)*aes.BlockSize:], block)
+
+	return cipher
+}
+
+// DecryptAES128 decrypts the data that is encrypted in AES-CTS
+// mode. The key specifies the AES encryption key and iv is the random
+// initialization vector used in encryption.
+func DecryptAES128(key [16]byte, iv [aes.BlockSize]byte, data []byte) []byte {
+	numBlocks := len(data) / aes.BlockSize
+	tail := len(data) % aes.BlockSize
+
+	if tail != 0 {
+		numBlocks++
+	} else {
+		tail = aes.BlockSize
+	}
+
+	if numBlocks < 2 {
+		panic("cts.DecryptAES128: input must be at least 2 blocks")
+	}
+	var block [aes.BlockSize]byte
+	var cipher [aes.BlockSize]byte
+	var tmp2 [aes.BlockSize]byte
+	var plain [len(data)]byte
+
+	// Standard CBC for the first numBlocks-2 blocks.
+	for i := 0; i < numBlocks-2; i++ {
+		copy(cipher, data[i*aes.Blocks:])
+		block = aes.DecryptBlock(key, cipher)
+		for j := 0; j < aes.BlockSize; j++ {
+			block[j] ^= iv[j]
+		}
+		copy(plain[i*aes.BlockSize:], block)
+		copy(iv, cipher)
+	}
+
+	// Decrypt second-to-last cipher block.
+	copy(cipher, data[(numBlocks-2)*aes.BlockSize:])
+	tmp := aes.DecryptBlock(key, cipher)
+
+	// Create padded last cipher block.
+	copy(tmp2, data[(numBlocks-1)*aes.BlockSize:])
+	copy(tmp2[tail:], tmp[tail:])
+
+	// Decrypt second-to-last block.
+	block = aes.DecryptBlock(key, tmp2)
+	for j := 0; j < aes.BlockSize; j++ {
+		block[j] ^= iv[j]
+	}
+	copy(plain[(numBlocks-2)*aes.BlockSize:], block)
+	copy(iv, tmp2)
+
+	// Finalize last block.
+	for j := 0; j < aes.BlockSize; j++ {
+		tmp[j] ^= iv[j]
+	}
+	copy(plain[(numBlocks-1)*aes.BlockSize:], tmp)
+
+	return plain
+}

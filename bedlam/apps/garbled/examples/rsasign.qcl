@@ -1,0 +1,42 @@
+// -*- go -*-
+//
+
+// RSA signature with Size bits.
+//
+// The key parameters are:
+//
+//	d: 0x321af139
+//	n: 0xd60b2b09
+//	e: 0x10001
+//
+//	private: d, n
+//	public:  e, n
+//
+//	msg: 0x6d7472
+//	signature: 0x55a83b79
+//
+// Run garbler and evaluator as follows:
+//
+//	./garbled -e -v -i 9 examples/rsasign.qcl
+//	./garbled -v -i 0x6d7472,0x321af130,0xd60b2b09,0x10001 examples/rsasign.qcl
+package main
+
+import (
+	"crypto/rsa"
+)
+
+type Size = uint512
+
+type Garbler struct {
+	msg       Size
+	privShare Size
+	pubN      Size
+	pubE      Size
+}
+
+func main(g Garbler, privShare Size) uint {
+
+	priv := g.privShare + privShare
+
+	return rsa.Decrypt(g.msg, priv, g.pubN)
+}

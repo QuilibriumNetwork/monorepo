@@ -1,0 +1,20 @@
+// -*- go -*-
+
+package main
+
+func bar(val *int32) int {
+	*val = int32(42)
+	return 7
+}
+
+// @Test 0 0 = 49
+// @Test 1 2 = 52
+func main(a, b int32) int {
+	var c int32
+
+	sum := a + b
+
+	sum += bar(&c)
+
+	return sum + c
+}

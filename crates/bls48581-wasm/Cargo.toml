@@ -1,0 +1,22 @@
+[package]
+name = "bls48581wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "bls48581wasm"
+
+[dependencies]
+wasm-bindgen = "0.2"
+bls48581 = { path = "../bls48581", version = "^0.1.0", default-features = false }
+getrandom = { version = "0.2", features = ["js"] }
+serde = "1.0.208"
+serde_json = "1.0.117"
+base64 = "0.22.1"
+hex = "0.4"
+ed448-goldilocks-plus = { version = "0.16.0" }
+rand = "0.8.5"
+sha2 = "0.10.8"
+hkdf = "0.12.4"
+aes-gcm = "0.10.3"

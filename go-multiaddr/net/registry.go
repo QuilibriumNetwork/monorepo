@@ -57,45 +57,41 @@ func RegisterToNetAddr(to ToNetAddrFunc, protocols ...string) {
 // RegisterFromNetAddr registers a conversion from net.Addr instances to multiaddrs
 func (cm *CodecMap) RegisterFromNetAddr(from FromNetAddrFunc, networks ...string) {
 	cm.lk.Lock()
+	defer cm.lk.Unlock()
 
 	for _, n := range networks {
 		cm.addrParsers[n] = from
 	}
-
-	cm.lk.Unlock()
 }
 
 // RegisterToNetAddr registers a conversion from multiaddrs to net.Addr instances
 func (cm *CodecMap) RegisterToNetAddr(to ToNetAddrFunc, protocols ...string) {
 	cm.lk.Lock()
+	defer cm.lk.Unlock()
 
 	for _, p := range protocols {
 		cm.maddrParsers[p] = to
 	}
-
-	cm.lk.Unlock()
 }
 
 func (cm *CodecMap) getAddrParser(net string) (FromNetAddrFunc, error) {
 	cm.lk.Lock()
+	defer cm.lk.Unlock()
 
 	parser, ok := cm.addrParsers[net]
 	if !ok {
 		return nil, fmt.Errorf("unknown network %v", net)
 	}
-
-	cm.lk.Unlock()
 	return parser, nil
 }
 
 func (cm *CodecMap) getMaddrParser(name string) (ToNetAddrFunc, error) {
 	cm.lk.Lock()
-
+	defer cm.lk.Unlock()
 	p, ok := cm.maddrParsers[name]
 	if !ok {
 		return nil, fmt.Errorf("network not supported: %s", name)
 	}
 
-	cm.lk.Unlock()
 	return p, nil
 }

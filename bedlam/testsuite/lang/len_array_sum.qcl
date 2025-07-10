@@ -1,0 +1,22 @@
+// -*- go -*-
+
+package main
+
+type Field [10]int32
+
+// @Test 0 0 = 45
+// @Test 1 10 = 56
+func main(a, b int32) int {
+	var arr Field
+
+	for i := 0; i < len(arr); i++ {
+		arr[i] = i
+	}
+
+	var sum int32
+	for i := 0; i < len(arr); i++ {
+		sum += arr[i]
+	}
+
+	return sum + a + b
+}

@@ -23,31 +23,27 @@ func NewPeerMetadata() *memoryPeerMetadata {
 
 func (ps *memoryPeerMetadata) Put(p peer.ID, key string, val interface{}) error {
 	ps.dslock.Lock()
-
+	defer ps.dslock.Unlock()
 	m, ok := ps.ds[p]
 	if !ok {
 		m = make(map[string]interface{})
 		ps.ds[p] = m
 	}
 	m[key] = val
-	ps.dslock.Unlock()
 	return nil
 }
 
 func (ps *memoryPeerMetadata) Get(p peer.ID, key string) (interface{}, error) {
 	ps.dslock.RLock()
-
+	defer ps.dslock.RUnlock()
 	m, ok := ps.ds[p]
 	if !ok {
-		ps.dslock.RUnlock()
 		return nil, pstore.ErrNotFound
 	}
 	val, ok := m[key]
 	if !ok {
-		ps.dslock.RUnlock()
 		return nil, pstore.ErrNotFound
 	}
-	ps.dslock.RUnlock()
 	return val, nil
 }
 

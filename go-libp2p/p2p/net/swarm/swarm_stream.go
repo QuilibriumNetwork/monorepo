@@ -91,10 +91,16 @@ func (s *Stream) Reset() error {
 	return err
 }
 
+func (s *Stream) ResetWithError(errCode network.StreamErrorCode) error {
+	err := s.stream.ResetWithError(errCode)
+	s.closeAndRemoveStream()
+	return err
+}
+
 func (s *Stream) closeAndRemoveStream() {
 	s.closeMx.Lock()
+	defer s.closeMx.Unlock()
 	if s.isClosed {
-		s.closeMx.Unlock()
 		return
 	}
 	s.isClosed = true
@@ -104,7 +110,6 @@ func (s *Stream) closeAndRemoveStream() {
 	if s.acceptStreamGoroutineCompleted {
 		s.conn.removeStream(s)
 	}
-	s.closeMx.Unlock()
 }
 
 // CloseWrite closes the stream for writing, flushing all data and sending an EOF.
@@ -122,15 +127,14 @@ func (s *Stream) CloseRead() error {
 
 func (s *Stream) completeAcceptStreamGoroutine() {
 	s.closeMx.Lock()
+	defer s.closeMx.Unlock()
 	if s.acceptStreamGoroutineCompleted {
-		s.closeMx.Unlock()
 		return
 	}
 	s.acceptStreamGoroutineCompleted = true
 	if s.isClosed {
 		s.conn.removeStream(s)
 	}
-	s.closeMx.Unlock()
 }
 
 // Protocol returns the protocol negotiated on this stream (if set).

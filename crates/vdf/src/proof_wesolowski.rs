@@ -91,7 +91,7 @@ pub fn approximate_parameters(t: f64) -> (usize, u8, u64) {
 
 fn u64_to_bytes(q: u64) -> [u8; 8] {
     if false {
-        // This use of `std::mem::transumte` is correct, but still not justified.
+        // This use of `std::mem::transmute` is correct, but still not justified.
         unsafe { std::mem::transmute(q.to_be()) }
     } else {
         [

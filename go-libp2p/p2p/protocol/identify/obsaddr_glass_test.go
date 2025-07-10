@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	ma "github.com/multiformats/go-multiaddr"
+	"github.com/multiformats/go-multiaddr/matest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,6 +52,24 @@ func TestShouldRecordObservationWithWebTransport(t *testing.T) {
 	require.NoError(t, err)
 	shouldRecord, _, _ := o.shouldRecordObservation(c, observedAddr)
 	require.True(t, shouldRecord)
+}
+
+func TestShouldNotRecordObservationWithRelayedAddr(t *testing.T) {
+	listenAddr := tStringCast("/ip4/1.2.3.4/udp/8888/quic-v1/p2p-circuit")
+	ifaceAddr := tStringCast("/ip4/10.0.0.2/udp/9999/quic-v1")
+	listenAddrs := func() []ma.Multiaddr { return []ma.Multiaddr{listenAddr} }
+	ifaceListenAddrs := func() ([]ma.Multiaddr, error) { return []ma.Multiaddr{ifaceAddr}, nil }
+	addrs := func() []ma.Multiaddr { return []ma.Multiaddr{listenAddr} }
+
+	c := &mockConn{
+		local:  listenAddr,
+		remote: tStringCast("/ip4/1.2.3.6/udp/1236/quic-v1/p2p-circuit"),
+	}
+	observedAddr := tStringCast("/ip4/1.2.3.4/udp/1231/quic-v1/p2p-circuit")
+	o, err := NewObservedAddrManager(listenAddrs, addrs, ifaceListenAddrs, normalize)
+	require.NoError(t, err)
+	shouldRecord, _, _ := o.shouldRecordObservation(c, observedAddr)
+	require.False(t, shouldRecord)
 }
 
 func TestShouldRecordObservationWithNAT64Addr(t *testing.T) {
@@ -150,9 +169,9 @@ func TestThinWaistForm(t *testing.T) {
 			if tt.rest != "" {
 				restTW = tStringCast(tt.rest)
 			}
-			require.Equal(t, tw.Addr, inputAddr, "%s %s", tw.Addr, inputAddr)
-			require.Equal(t, wantTW, tw.TW, "%s %s", tw.TW, wantTW)
-			require.Equal(t, restTW, tw.Rest, "%s %s", restTW, tw.Rest)
+			matest.AssertEqualMultiaddr(t, inputAddr, tw.Addr)
+			matest.AssertEqualMultiaddr(t, wantTW, tw.TW)
+			matest.AssertEqualMultiaddr(t, restTW, tw.Rest)
 		})
 	}
 

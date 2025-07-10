@@ -1,0 +1,48 @@
+namespace bulletproofs {
+    RangeProofResult generate_range_proof(sequence<sequence<u8>> values, sequence<u8> blinding, u64 bit_size);
+
+    boolean sum_check(sequence<sequence<u8>> input_commitments, sequence<sequence<u8>> additional_input_values, sequence<sequence<u8>> output_commitments, sequence<sequence<u8>> additional_output_values);
+
+    boolean verify_range_proof(sequence<u8> proof, sequence<u8> commitment, u64 bit_size);
+
+    sequence<u8> generate_input_commitments(sequence<sequence<u8>> values, sequence<u8> blinding);
+
+    sequence<u8> keygen();
+
+    sequence<u8> scalar_to_point(sequence<u8> input);
+
+    sequence<u8> alt_generator();
+
+    sequence<u8> scalar_addition(sequence<u8> lhs, sequence<u8> rhs);
+
+    sequence<u8> scalar_mult(sequence<u8> lhs, sequence<u8> rhs);
+    
+    sequence<u8> scalar_mult_point(sequence<u8> input_scalar, sequence<u8> public_point);
+
+    sequence<u8> scalar_inverse(sequence<u8> input_scalar);
+
+    sequence<u8> scalar_subtraction(sequence<u8> lhs, sequence<u8> rhs);
+    
+    sequence<u8> scalar_mult_hash_to_scalar(sequence<u8> input_scalar, sequence<u8> public_point);
+
+    sequence<u8> hash_to_scalar(sequence<u8> input);
+
+    sequence<u8> point_addition(sequence<u8> input_point, sequence<u8> public_point);
+
+    sequence<u8> point_subtraction(sequence<u8> input_point, sequence<u8> public_point);
+
+    sequence<u8> sign_hidden(sequence<u8> x, sequence<u8> t, sequence<u8> a, sequence<u8> r);
+
+    sequence<u8> sign_simple(sequence<u8> secret, sequence<u8> message);
+
+    boolean verify_simple(sequence<u8> message, sequence<u8> signature, sequence<u8> public_point);
+
+    boolean verify_hidden(sequence<u8> c, sequence<u8> t, sequence<u8> s1, sequence<u8> s2, sequence<u8> s3, sequence<u8> p_point, sequence<u8> c_point);
+};
+
+// Record type for range proof results
+dictionary RangeProofResult {
+    sequence<u8> proof;
+    sequence<u8> commitment;
+    sequence<u8> blinding;
+};

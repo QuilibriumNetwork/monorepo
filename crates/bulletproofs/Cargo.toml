@@ -1,0 +1,78 @@
+[package]
+name = "ed448-bulletproofs"
+# Before doing a release:
+# - update version field 
+# - ensure yoloproofs was disabled in an atomic (revertable) commit
+# - update CHANGELOG
+version = "1.0.0"
+authors = ["Cassandra Heart <cassandra@quilibrium.com>"]
+# original authors of bulletproofs = ["Cathie Yun <cathieyun@gmail.com>", 
+#           "Henry de Valence <hdevalence@hdevalence.ca>",
+#           "Oleg Andreev <oleganza@gmail.com>"]
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/QuilibriumNetwork/ceremonyclient/crates/bulletproofs"
+categories = ["cryptography"]
+keywords = ["cryptography", "crypto", "ed448", "zero-knowledge", "bulletproofs"]
+description = "A pure-Rust implementation of Bulletproofs using Ed448"
+edition = "2018"
+
+[dependencies]
+ed448-goldilocks-plus = { version = "0.16.0" }
+subtle = { version = "2", default-features = false }
+sha3 = { version = "0.8", default-features = false }
+digest = { version = "0.8", default-features = false }
+rand = "0.8"
+rand_core = "0.6"
+byteorder = { version = "1", default-features = false }
+serde = { version = "1", default-features = false, features = ["alloc"] }
+serde_derive = { version = "1", default-features = false }
+thiserror = { version = "2" }
+merlin = { version = "3", default-features = false }
+clear_on_drop = { version = "0.2", default-features = false, optional = true }
+lazy_static = "1.5"
+uniffi = { version = "0.25.0", optional = true }
+bincode = "1.3.3"
+
+[build-dependencies]
+uniffi = { version = "0.25.0", features = ["build"], optional = true }
+
+[features]
+default = ["uniffi-bindings", "clear_on_drop"]
+yoloproofs = []
+uniffi-bindings = ["uniffi", "uniffi/build"]
+
+[dev-dependencies]
+hex = "0.4"
+criterion = "0.3"
+bincode = "1"
+rand_chacha = "0.3"
+
+[[test]]
+name = "range_proof"
+
+[[test]]
+name = "r1cs"
+required-features = ["yoloproofs"]
+
+[[bench]]
+name = "range_proof"
+harness = false
+
+[[bench]]
+name = "generators"
+harness = false
+
+[[bench]]
+name = "r1cs"
+harness = false
+required-features = ["yoloproofs"]
+
+[[bench]]
+name = "linear_proof"
+harness = false
+
+[lib]
+crate-type = ["lib", "staticlib"]
+name = "bulletproofs"
+

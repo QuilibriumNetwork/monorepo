@@ -25,6 +25,7 @@ func setupPSKConns(ctx context.Context, t *testing.T) (net.Conn, net.Conn) {
 
 func TestPSKSimpelMessges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
 
 	psk1, psk2 := setupPSKConns(ctx, t)
 	msg1 := []byte("hello world")
@@ -52,11 +53,11 @@ func TestPSKSimpelMessges(t *testing.T) {
 	if !bytes.Equal(msg1, out1) {
 		t.Fatalf("input and output are not the same")
 	}
-	cancel()
 }
 
 func TestPSKFragmentation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
 
 	psk1, psk2 := setupPSKConns(ctx, t)
 
@@ -86,5 +87,4 @@ func TestPSKFragmentation(t *testing.T) {
 	if err := <-wch; err != nil {
 		t.Fatal(err)
 	}
-	cancel()
 }

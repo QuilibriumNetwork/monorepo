@@ -338,9 +338,9 @@ func (s *resourceScope) wrapError(err error) error {
 
 func (s *resourceScope) ReserveMemory(size int, prio uint8) error {
 	s.Lock()
+	defer s.Unlock()
 
 	if s.done {
-		s.Unlock()
 		return s.wrapError(network.ErrResourceScopeClosed)
 	}
 
@@ -348,20 +348,17 @@ func (s *resourceScope) ReserveMemory(size int, prio uint8) error {
 		log.Debugw("blocked memory reservation", logValuesMemoryLimit(s.name, "", s.rc.stat(), err)...)
 		s.trace.BlockReserveMemory(s.name, prio, int64(size), s.rc.memory)
 		s.metrics.BlockMemory(size)
-		s.Unlock()
 		return s.wrapError(err)
 	}
 
 	if err := s.reserveMemoryForEdges(size, prio); err != nil {
 		s.rc.releaseMemory(int64(size))
 		s.metrics.BlockMemory(size)
-		s.Unlock()
 		return s.wrapError(err)
 	}
 
 	s.trace.ReserveMemory(s.name, prio, int64(size), s.rc.memory)
 	s.metrics.AllowMemory(size)
-	s.Unlock()
 	return nil
 }
 

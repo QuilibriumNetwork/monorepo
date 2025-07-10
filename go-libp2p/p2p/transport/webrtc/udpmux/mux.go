@@ -1,8 +1,11 @@
+// The udpmux package contains the logic for multiplexing multiple WebRTC (ICE)
+// connections over a single UDP socket.
 package udpmux
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,7 +14,7 @@ import (
 
 	logging "github.com/ipfs/go-log/v2"
 	pool "github.com/libp2p/go-buffer-pool"
-	"github.com/pion/ice/v2"
+	"github.com/pion/ice/v4"
 	"github.com/pion/stun"
 )
 
@@ -82,8 +85,8 @@ func NewUDPMux(socket net.PacketConn) *UDPMux {
 func (mux *UDPMux) Start() {
 	mux.wg.Add(1)
 	go func() {
+		defer mux.wg.Done()
 		mux.readLoop()
-		mux.wg.Done()
 	}()
 }
 
@@ -141,7 +144,7 @@ func (mux *UDPMux) readLoop() {
 
 		n, addr, err := mux.socket.ReadFrom(buf)
 		if err != nil {
-			if strings.Contains(err.Error(), "use of closed network connection") {
+			if strings.Contains(err.Error(), "use of closed network connection") || errors.Is(err, context.Canceled) {
 				log.Debugf("readLoop exiting: socket %s closed", mux.socket.LocalAddr())
 			} else {
 				log.Errorf("error reading from socket %s: %v", mux.socket.LocalAddr(), err)
@@ -264,36 +267,36 @@ func (mux *UDPMux) RemoveConnByUfrag(ufrag string) {
 	}
 
 	mux.mx.Lock()
+	defer mux.mx.Unlock()
 
 	for _, isIPv6 := range [...]bool{true, false} {
 		key := ufragConnKey{ufrag: ufrag, isIPv6: isIPv6}
-		if _, ok := mux.ufragMap[key]; ok {
+		if conn, ok := mux.ufragMap[key]; ok {
 			delete(mux.ufragMap, key)
 			for _, addr := range mux.ufragAddrMap[key] {
 				delete(mux.addrMap, addr.String())
 			}
 			delete(mux.ufragAddrMap, key)
+			conn.close()
 		}
 	}
-	mux.mx.Unlock()
 }
 
 func (mux *UDPMux) getOrCreateConn(ufrag string, isIPv6 bool, _ *UDPMux, addr net.Addr) (created bool, _ *muxedConnection) {
 	key := ufragConnKey{ufrag: ufrag, isIPv6: isIPv6}
 
 	mux.mx.Lock()
+	defer mux.mx.Unlock()
 
 	if conn, ok := mux.ufragMap[key]; ok {
 		mux.addrMap[addr.String()] = conn
 		mux.ufragAddrMap[key] = append(mux.ufragAddrMap[key], addr)
-		mux.mx.Unlock()
 		return false, conn
 	}
 
-	conn := newMuxedConnection(mux, func() { mux.RemoveConnByUfrag(ufrag) })
+	conn := newMuxedConnection(mux, ufrag)
 	mux.ufragMap[key] = conn
 	mux.addrMap[addr.String()] = conn
 	mux.ufragAddrMap[key] = append(mux.ufragAddrMap[key], addr)
-	mux.mx.Unlock()
 	return true, conn
 }

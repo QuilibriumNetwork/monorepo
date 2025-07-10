@@ -30,7 +30,7 @@ func (d *dialPolicy) skipDial(addr ma.Multiaddr) bool {
 	}
 
 	// skip private network (unroutable) addresses
-	if is, err := manet.IsPublicAddr(addr); !is && err == nil {
+	if pubadd, err := manet.IsPublicAddr(addr); !pubadd || err != nil {
 		return true
 	}
 	candidateIP, err := manet.ToIP(addr)
@@ -60,38 +60,34 @@ func (d *dialPolicy) skipPeer(addrs []ma.Multiaddr) bool {
 	localAddrs := d.host.Addrs()
 	localHosts := make([]net.IP, 0)
 	for _, lAddr := range localAddrs {
-		is, err := manet.IsPublicAddr(lAddr)
-		if err != nil {
-			continue
-		}
-		if _, err := lAddr.ValueForProtocol(ma.P_CIRCUIT); err != nil && is {
-			lIP, err := manet.ToIP(lAddr)
-			if err != nil {
-				continue
+		if _, err := lAddr.ValueForProtocol(ma.P_CIRCUIT); err != nil {
+			if pubadd, err := manet.IsPublicAddr(lAddr); err == nil && pubadd {
+				lIP, err := manet.ToIP(lAddr)
+				if err != nil {
+					continue
+				}
+				localHosts = append(localHosts, lIP)
 			}
-			localHosts = append(localHosts, lIP)
 		}
 	}
 
 	// if a public IP of the peer is one of ours: skip the peer.
 	goodPublic := false
 	for _, addr := range addrs {
-		is, err := manet.IsPublicAddr(addr)
-		if err != nil {
-			continue
-		}
-		if _, err := addr.ValueForProtocol(ma.P_CIRCUIT); err != nil && is {
-			aIP, err := manet.ToIP(addr)
-			if err != nil {
-				continue
-			}
-
-			for _, lIP := range localHosts {
-				if lIP.Equal(aIP) {
-					return true
+		if _, err := addr.ValueForProtocol(ma.P_CIRCUIT); err != nil {
+			if pubadd, err := manet.IsPublicAddr(addr); err == nil && pubadd {
+				aIP, err := manet.ToIP(addr)
+				if err != nil {
+					continue
 				}
+
+				for _, lIP := range localHosts {
+					if lIP.Equal(aIP) {
+						return true
+					}
+				}
+				goodPublic = true
 			}
-			goodPublic = true
 		}
 	}
 

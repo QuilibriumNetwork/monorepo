@@ -48,23 +48,20 @@ func SendPing(client http.Client) error {
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	rBody := [pingSize]byte{}
 	_, err = io.ReadFull(resp.Body, rBody[:])
 	if err != nil {
-		resp.Body.Close()
 		return err
 	}
 
 	if !bytes.Equal(body[:], rBody[:]) {
-		resp.Body.Close()
 		return errors.New("ping body mismatch")
 	}
-	resp.Body.Close()
 	return nil
 }

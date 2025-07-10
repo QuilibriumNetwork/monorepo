@@ -1,0 +1,89 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2024 Markku Rossi
+//
+// All rights reserved.
+//
+
+package aes
+
+// Block128 encrypts one data block with 128 bit key.
+func Block128(key [16]byte, data [16]byte) [16]byte {
+	var k uint128
+	var d uint128
+
+	for i := 0; i < len(key); i++ {
+		k <<= 8
+		k |= uint128(key[i])
+	}
+	for i := 0; i < len(data); i++ {
+		d <<= 8
+		d |= uint128(data[i])
+	}
+
+	c := block128(k, d)
+	var cipher [16]byte
+	for i := len(cipher) - 1; i >= 0; i-- {
+		cipher[i] = byte(c & 0xff)
+		c >>= 8
+	}
+	return cipher
+}
+
+// Block192 encrypts one data block with 192 bit key.
+func Block192(key [24]byte, data [16]byte) [16]byte {
+	var k uint192
+	var d uint128
+
+	for i := 0; i < len(key); i++ {
+		k <<= 8
+		k |= uint192(key[i])
+	}
+	for i := 0; i < len(data); i++ {
+		d <<= 8
+		d |= uint128(data[i])
+	}
+
+	c := block192(k, d)
+	var cipher [16]byte
+	for i := len(cipher) - 1; i >= 0; i-- {
+		cipher[i] = c & 0xff
+		c >>= 8
+	}
+	return cipher
+}
+
+// Block256 encrypts one data block with 256 bit key.
+func Block256(key [32]byte, data [16]byte) [16]byte {
+	var k uint256
+	var d uint128
+
+	for i := 0; i < len(key); i++ {
+		k <<= 8
+		k |= uint256(key[i])
+	}
+	for i := 0; i < len(data); i++ {
+		d <<= 8
+		d |= uint128(data[i])
+	}
+
+	c := block256(k, d)
+	var cipher [16]byte
+	for i := len(cipher) - 1; i >= 0; i-- {
+		cipher[i] = c & 0xff
+		c >>= 8
+	}
+	return cipher
+}
+
+func block128(key uint128, block uint128) uint128 {
+	return native("aes_128.circ", key, block)
+}
+
+func block192(key uint192, block uint128) uint128 {
+	return native("aes_192.circ", key, block)
+}
+
+func block256(key uint256, block uint128) uint128 {
+	return native("aes_256.circ", key, block)
+}

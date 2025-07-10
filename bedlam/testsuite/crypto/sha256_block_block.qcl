@@ -1,0 +1,17 @@
+// -*- go -*-
+
+package main
+
+import (
+	"crypto/sha256"
+)
+
+// @Hex
+// @Test 0 0 = 0xd650f570ed931e5cfe52bf339dd77493796f15e5c856a801efc90983e0bfa08b
+func main(g, e byte) []byte {
+	var data [65]byte
+	data[0] = 0x6d
+	data[1] = 0x74
+	data[2] = 0x72
+	return sha256.Sum256(data[:])
+}

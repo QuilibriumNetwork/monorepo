@@ -53,6 +53,7 @@ func newNATEmitter(h host.Host, o *ObservedAddrManager, eventInterval time.Durat
 }
 
 func (n *natEmitter) worker() {
+	defer n.wg.Done()
 	subCh := n.reachabilitySub.Out()
 	ticker := time.NewTicker(n.eventInterval)
 	pendingUpdate := false
@@ -85,7 +86,6 @@ func (n *natEmitter) worker() {
 				enoughTimeSinceLastUpdate = false
 			}
 		case <-n.ctx.Done():
-			n.wg.Done()
 			return
 		}
 	}

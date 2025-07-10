@@ -1,0 +1,16 @@
+// -*- go -*-
+
+package main
+
+// @Test 1 2 = 3 1 2
+// @Test 55 66 = 121 55 66
+func main(a, b int32) (int, int, int) {
+	return sum(a, b)
+}
+
+func sum(a, b int) (h0, h1, h2 int) {
+	h0 = a + b
+	h1 = a
+	h2 = b
+	return
+}

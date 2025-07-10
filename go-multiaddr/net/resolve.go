@@ -11,23 +11,17 @@ import (
 // from the network stack. (this is so you can provide a cached value if resolving many addrs)
 func ResolveUnspecifiedAddress(resolve ma.Multiaddr, ifaceAddrs []ma.Multiaddr) ([]ma.Multiaddr, error) {
 	// split address into its components
-	first, rest, err := ma.SplitFirst(resolve)
-	if err != nil {
-		return nil, err
-	}
+	first, rest := ma.SplitFirst(resolve)
 
 	// if first component (ip) is not unspecified, use it as is.
-	if !IsIPUnspecified(first) {
+	if !IsIPUnspecified(first.Multiaddr()) {
 		return []ma.Multiaddr{resolve}, nil
 	}
 
 	resolveProto := resolve.Protocols()[0].Code
 	out := make([]ma.Multiaddr, 0, len(ifaceAddrs))
 	for _, ia := range ifaceAddrs {
-		iafirst, _, err := ma.SplitFirst(ia)
-		if err != nil {
-			return nil, err
-		}
+		iafirst, _ := ma.SplitFirst(ia)
 
 		// must match the first protocol to be resolve.
 		if iafirst.Protocol().Code != resolveProto {

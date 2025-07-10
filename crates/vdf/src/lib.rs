@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #![deny(warnings)]
-//! # Rust implementations of class groups and verifyable delay functions
+//! # Rust implementations of class groups and verifiable delay functions
 //!
 //! This repo includes three crates
 //!
 //! * `classgroup`, which includes a class group implementation, as well as a
 //!   trait for class groups.
-//! * `vdf`, which includes a Verifyable Delay Function (VDF) trait, as well as
+//! * `vdf`, which includes a Verifiable Delay Function (VDF) trait, as well as
 //!   an implementation of that trait.
 //! * `vdf-cli`, which includes a command-line interface to the `vdf` crate.  It
 //!   also includes additional commands, which are deprecated and will later be
@@ -155,7 +155,7 @@ pub trait VDFParams: Clone + Eq {
 /// consumers of this trait **MUST NOT** expect this.
 ///
 /// Instances of this trait are *not* expected to be `Sync`.  This allows them
-/// to reuse allocations (such as scratch memory) accross invocations without
+/// to reuse allocations (such as scratch memory) across invocations without
 /// the need for locking.  However, they **MUST** be `Send` and `Clone`, so that
 /// consumers can duplicate them and send them across threads.
 pub trait VDF: Send + Debug {
@@ -170,7 +170,7 @@ pub trait VDF: Send + Debug {
     /// The challenge is an opaque byte string of arbitrary length.
     /// Implementors **MUST NOT** make any assumptions about its contents,
     /// and **MUST** produce distinct outputs for distinct challenges
-    /// (except with negiligible probability).
+    /// (except with negligible probability).
     ///
     /// This can be most easily implemented by using the challenge as part of
     /// the input of a cryptographic hash function.  The VDFs provided in this
@@ -209,7 +209,7 @@ pub trait VDF: Send + Debug {
     ///
     /// # Rationale
     ///
-    /// It would be more ideomatic Rust to use the type system to enforce that a
+    /// It would be more idiomatic Rust to use the type system to enforce that a
     /// difficulty has been validated before use.  However, I (Demi) have not
     /// yet figured out an object-safe way to do so.
     fn check_difficulty(&self, difficulty: u64) -> Result<(), InvalidIterations>;

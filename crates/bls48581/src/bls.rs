@@ -73,29 +73,29 @@ pub fn singleton() -> &'static SingletonKZGSetup {
         rootOfUnity.insert(256, big::BIG::frombytes(&r));
       }
 
-      {
-        let root = v["sized"]["rootOfUnity"]["rootOfUnity512"].clone();
-        let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        rootOfUnity.insert(512, big::BIG::frombytes(&r));
-      }
+      // {
+      //   let root = v["sized"]["rootOfUnity"]["rootOfUnity512"].clone();
+      //   let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   rootOfUnity.insert(512, big::BIG::frombytes(&r));
+      // }
 
-      {
-        let root = v["sized"]["rootOfUnity"]["rootOfUnity1024"].clone();
-        let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        rootOfUnity.insert(1024, big::BIG::frombytes(&r));
-      }
+      // {
+      //   let root = v["sized"]["rootOfUnity"]["rootOfUnity1024"].clone();
+      //   let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   rootOfUnity.insert(1024, big::BIG::frombytes(&r));
+      // }
 
-      {
-        let root = v["sized"]["rootOfUnity"]["rootOfUnity2048"].clone();
-        let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        rootOfUnity.insert(2048, big::BIG::frombytes(&r));
-      }
+      // {
+      //   let root = v["sized"]["rootOfUnity"]["rootOfUnity2048"].clone();
+      //   let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   rootOfUnity.insert(2048, big::BIG::frombytes(&r));
+      // }
 
-      {
-        let root = v["sized"]["rootOfUnity"]["rootOfUnity65536"].clone();
-        let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        rootOfUnity.insert(65536, big::BIG::frombytes(&r));
-      }
+      // {
+      //   let root = v["sized"]["rootOfUnity"]["rootOfUnity65536"].clone();
+      //   let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   rootOfUnity.insert(65536, big::BIG::frombytes(&r));
+      // }
 
       let mut rootsOfUnity16 = Vec::<big::BIG>::new();
       for root in v["sized"]["rootsOfUnity"]["rootsOfUnity16"].as_array().unwrap() {
@@ -137,37 +137,37 @@ pub fn singleton() -> &'static SingletonKZGSetup {
       rootsOfUnity.insert(256, rootsOfUnity256.clone());
       reverseRootsOfUnity.insert(256, rootsOfUnity256.into_iter().rev().collect());
 
-      let mut rootsOfUnity512 = Vec::<big::BIG>::new();
-      for root in v["sized"]["rootsOfUnity"]["rootsOfUnity512"].as_array().unwrap() {
-        let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        rootsOfUnity512.push(big::BIG::frombytes(&r));
-      }
-      rootsOfUnity.insert(512, rootsOfUnity512.clone());
-      reverseRootsOfUnity.insert(512, rootsOfUnity512.into_iter().rev().collect());
+      // let mut rootsOfUnity512 = Vec::<big::BIG>::new();
+      // for root in v["sized"]["rootsOfUnity"]["rootsOfUnity512"].as_array().unwrap() {
+      //   let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   rootsOfUnity512.push(big::BIG::frombytes(&r));
+      // }
+      // rootsOfUnity.insert(512, rootsOfUnity512.clone());
+      // reverseRootsOfUnity.insert(512, rootsOfUnity512.into_iter().rev().collect());
 
-      let mut rootsOfUnity1024 = Vec::<big::BIG>::new();
-      for root in v["sized"]["rootsOfUnity"]["rootsOfUnity1024"].as_array().unwrap() {
-        let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        rootsOfUnity1024.push(big::BIG::frombytes(&r));
-      }
-      rootsOfUnity.insert(1024, rootsOfUnity1024.clone());
-      reverseRootsOfUnity.insert(1024, rootsOfUnity1024.into_iter().rev().collect());
+      // let mut rootsOfUnity1024 = Vec::<big::BIG>::new();
+      // for root in v["sized"]["rootsOfUnity"]["rootsOfUnity1024"].as_array().unwrap() {
+      //   let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   rootsOfUnity1024.push(big::BIG::frombytes(&r));
+      // }
+      // rootsOfUnity.insert(1024, rootsOfUnity1024.clone());
+      // reverseRootsOfUnity.insert(1024, rootsOfUnity1024.into_iter().rev().collect());
 
-      let mut rootsOfUnity2048 = Vec::<big::BIG>::new();
-      for root in v["sized"]["rootsOfUnity"]["rootsOfUnity2048"].as_array().unwrap() {
-        let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        rootsOfUnity2048.push(big::BIG::frombytes(&r));
-      }
-      rootsOfUnity.insert(2048, rootsOfUnity2048.clone());
-      reverseRootsOfUnity.insert(2048, rootsOfUnity2048.into_iter().rev().collect());
+      // let mut rootsOfUnity2048 = Vec::<big::BIG>::new();
+      // for root in v["sized"]["rootsOfUnity"]["rootsOfUnity2048"].as_array().unwrap() {
+      //   let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   rootsOfUnity2048.push(big::BIG::frombytes(&r));
+      // }
+      // rootsOfUnity.insert(2048, rootsOfUnity2048.clone());
+      // reverseRootsOfUnity.insert(2048, rootsOfUnity2048.into_iter().rev().collect());
 
-      let mut rootsOfUnity65536 = Vec::<big::BIG>::new();
-      for root in v["sized"]["rootsOfUnity"]["rootsOfUnity65536"].as_array().unwrap() {
-        let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        rootsOfUnity65536.push(big::BIG::frombytes(&r));
-      }
-      rootsOfUnity.insert(65536, rootsOfUnity65536.clone());
-      reverseRootsOfUnity.insert(65536, rootsOfUnity65536.into_iter().rev().collect());
+      // let mut rootsOfUnity65536 = Vec::<big::BIG>::new();
+      // for root in v["sized"]["rootsOfUnity"]["rootsOfUnity65536"].as_array().unwrap() {
+      //   let r = hex::decode(root.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   rootsOfUnity65536.push(big::BIG::frombytes(&r));
+      // }
+      // rootsOfUnity.insert(65536, rootsOfUnity65536.clone());
+      // reverseRootsOfUnity.insert(65536, rootsOfUnity65536.into_iter().rev().collect());
       
       let mut f16 = Vec::<ecp::ECP>::new();
       for power in v["sized"]["G1FFT"]["G1FFT16"].as_array().unwrap() {
@@ -204,33 +204,33 @@ pub fn singleton() -> &'static SingletonKZGSetup {
       }
       ffts.insert(256, f256);
 
-      let mut f512 = Vec::<ecp::ECP>::new();
-      for power in v["sized"]["G1FFT"]["G1FFT512"].as_array().unwrap() {
-        let p = hex::decode(power.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        f512.push(ecp::ECP::frombytes(&p));
-      }
-      ffts.insert(512, f512);
+      // let mut f512 = Vec::<ecp::ECP>::new();
+      // for power in v["sized"]["G1FFT"]["G1FFT512"].as_array().unwrap() {
+      //   let p = hex::decode(power.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   f512.push(ecp::ECP::frombytes(&p));
+      // }
+      // ffts.insert(512, f512);
 
-      let mut f1024 = Vec::<ecp::ECP>::new();
-      for power in v["sized"]["G1FFT"]["G1FFT1024"].as_array().unwrap() {
-        let p = hex::decode(power.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        f1024.push(ecp::ECP::frombytes(&p));
-      }
-      ffts.insert(1024, f1024);
+      // let mut f1024 = Vec::<ecp::ECP>::new();
+      // for power in v["sized"]["G1FFT"]["G1FFT1024"].as_array().unwrap() {
+      //   let p = hex::decode(power.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   f1024.push(ecp::ECP::frombytes(&p));
+      // }
+      // ffts.insert(1024, f1024);
 
-      let mut f2048 = Vec::<ecp::ECP>::new();
-      for power in v["sized"]["G1FFT"]["G1FFT2048"].as_array().unwrap() {
-        let p = hex::decode(power.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        f2048.push(ecp::ECP::frombytes(&p));
-      }
-      ffts.insert(2048, f2048);
+      // let mut f2048 = Vec::<ecp::ECP>::new();
+      // for power in v["sized"]["G1FFT"]["G1FFT2048"].as_array().unwrap() {
+      //   let p = hex::decode(power.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   f2048.push(ecp::ECP::frombytes(&p));
+      // }
+      // ffts.insert(2048, f2048);
 
-      let mut f65536 = Vec::<ecp::ECP>::new();
-      for power in v["sized"]["G1FFT"]["G1FFT65536"].as_array().unwrap() {
-        let p = hex::decode(power.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
-        f65536.push(ecp::ECP::frombytes(&p));
-      }
-      ffts.insert(65536, f65536);
+      // let mut f65536 = Vec::<ecp::ECP>::new();
+      // for power in v["sized"]["G1FFT"]["G1FFT65536"].as_array().unwrap() {
+      //   let p = hex::decode(power.as_str().unwrap().strip_prefix("0x").unwrap()).unwrap();
+      //   f65536.push(ecp::ECP::frombytes(&p));
+      // }
+      // ffts.insert(65536, f65536);
 
       let singleton = SingletonKZGSetup {
         RootOfUnityBLS48581: rootOfUnity,

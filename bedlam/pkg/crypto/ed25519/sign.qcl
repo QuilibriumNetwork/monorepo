@@ -1,0 +1,82 @@
+// -*- go -*-
+//
+// Copyright (c) 2021-2024 Markku Rossi
+//
+// Ed25519 signature computation in QCL. This file is derived from
+// Go's crypto/ed25519 package. The original copyright notice follows:
+//
+// Copyright 2016 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package ed25519
+
+import (
+	"crypto/ed25519/internal/edwards25519"
+	"crypto/sha512"
+)
+
+const (
+	// PublicKeySize is the size, in bytes, of public keys as used in
+	// this package.
+	PublicKeySize = 32
+	// PrivateKeySize is the size, in bytes, of private keys as used
+	// in this package.
+	PrivateKeySize = 64
+	// SignatureSize is the size, in bytes, of signatures generated
+	// and verified by this package.
+	SignatureSize = 64
+	// SeedSize is the size, in bytes, of private key seeds. These are
+	// the private key representations used by RFC 8032.
+	SeedSize = 32
+)
+
+// PrivateKey defines the Ed25519 private key.
+type PrivateKey [PrivateKeySize]byte
+
+// PublicKey defines the Ed25519 public key.
+type PublicKey [PublicKeySize]byte
+
+// Sign signs the message with privateKey and returns the signature.
+func Sign(privateKey PrivateKey, message []byte) []byte {
+
+	digest1 := sha512.Sum512(privateKey[0:32])
+
+	var expandedSecretKey [32]byte
+	copy(expandedSecretKey, digest1)
+	expandedSecretKey[0] &= 248
+	expandedSecretKey[31] &= 63
+	expandedSecretKey[31] |= 64
+
+	buf := make([]byte, 32+len(message))
+	copy(buf, digest1[32:])
+	copy(buf[32:], message)
+	messageDigest := sha512.Sum512(buf)
+
+	var messageDigestReduced [32]byte
+	edwards25519.ScReduce(&messageDigestReduced, messageDigest)
+	var R edwards25519.ExtendedGroupElement
+	edwards25519.GeScalarMultBase(&R, &messageDigestReduced)
+
+	var encodedR [32]byte
+	R.ToBytes(&encodedR)
+
+	buf2 := make([]byte, 64+len(message))
+	copy(buf2, encodedR)
+	copy(buf2[32:], privateKey[32:])
+	copy(buf2[64:], message)
+	hramDigest := sha512.Sum512(buf2)
+
+	var hramDigestReduced [32]byte
+	edwards25519.ScReduce(&hramDigestReduced, hramDigest)
+
+	var s [32]byte
+	edwards25519.ScMulAdd(&s, hramDigestReduced, expandedSecretKey,
+		messageDigestReduced)
+
+	var signature [SignatureSize]byte
+	copy(signature, encodedR)
+	copy(signature[32:], s)
+
+	return signature
+}

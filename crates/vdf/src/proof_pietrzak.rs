@@ -454,7 +454,7 @@ mod test {
         assert_eq!(calculate_final_t(Iterations(100), 8), 100);
     }
     #[test]
-    fn check_assuptions_about_stdlib() {
+    fn check_assumptions_about_stdlib() {
         assert_eq!(62 - u64::leading_zeros(1024u64), 9);
         let mut q: Vec<_> = (1..4).step_by(2).collect();
         assert_eq!(q[..], [1, 3]);

@@ -1,0 +1,11 @@
+// -*- go -*-
+
+package main
+
+// @Test  43  4 =  10
+// @Test -43  4 = -10
+// @Test  43 -4 = -10
+// @Test -43 -4 =  10
+func main(a, b int64) int64 {
+	return a / b
+}

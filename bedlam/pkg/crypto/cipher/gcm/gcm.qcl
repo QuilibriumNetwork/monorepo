@@ -1,0 +1,231 @@
+// -*- go -*-
+//
+// Copyright (c) 2021-2024 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package gcm implements the Galois/Counter Mode of Operation (GCM)
+// for block ciphers.
+package gcm
+
+import (
+	"bytes"
+	"crypto/aes"
+)
+
+// NonceSize specifies the nonce size in bytes.
+const NonceSize = 12
+
+// TagSize specifies the tag size in bytes.
+const TagSize = 16
+
+// EncryptAES128 encrypts the plaintext in AES-GCM mode. The key
+// specifies the AES encryption key and nonce is an unique
+// initialization vector; the nonce must not be reused for the same
+// encryption key. The additionalData specifies additional data that
+// is authenticated but not encrypted. The input plaintext can be of
+// any length i.e. it don't have to be padded to cipher block size.
+func EncryptAES128(key [16]byte, nonce [NonceSize]byte,
+	plaintext, additionalData []byte) []byte {
+
+	var counter [aes.BlockSize]byte
+
+	copy(counter, nonce)
+	counter = incr(counter)
+
+	e0 := byteToUint128(aes.Block128(key, counter))
+
+	var block [aes.BlockSize]byte
+
+	// h = E(k, 0^128)
+	h := byteToUint128(aes.Block128(key, block))
+
+	// Auth data.
+	var x uint128 = 0
+
+	// Add additionalData to auth data.
+	for i := 0; i < len(additionalData); i += aes.BlockSize {
+		for j := 0; j < aes.BlockSize; j++ {
+			if i+j < len(additionalData) {
+				block[j] = additionalData[i+j]
+			} else {
+				block[j] = 0
+			}
+		}
+		x ^= byteToUint128(block)
+		x = multGF2Pow128(x, h)
+	}
+
+	var cipher [len(plaintext) + 16]byte
+	var cipherBlock [aes.BlockSize]byte
+
+	for i := 0; i < len(plaintext); i += aes.BlockSize {
+		counter = incr(counter)
+		block = aes.Block128(key, counter)
+		for j := 0; j < aes.BlockSize; j++ {
+			if i+j < len(plaintext) {
+				cipher[i+j] = plaintext[i+j] ^ block[j]
+				cipherBlock[j] = cipher[i+j]
+			} else {
+				cipherBlock[j] = 0
+			}
+		}
+		// Auth data.
+		x ^= byteToUint128(cipherBlock)
+		x = multGF2Pow128(x, h)
+	}
+
+	// len(A) || len(C)
+	var l uint128
+	l |= uint128(len(additionalData)*8) << 64
+	l |= uint128(len(plaintext) * 8)
+
+	x ^= l
+	x = multGF2Pow128(x, h)
+	x ^= e0
+
+	tag := uint128ToByte(x)
+	for i := 0; i < 16; i++ {
+		cipher[len(plaintext)+i] = tag[i]
+	}
+
+	return cipher
+}
+
+// DecryptAES128 decrypts the ciphertext in AES-GCM mode. They key
+// specifies the AES encryption key and nonce is an unique
+// initialization vector; the nonce must not be reused for the same
+// encryption key. The additionalData specifies additional data that
+// is was authenticated but not encrypted when the ciphertext was
+// created.
+func DecryptAES128(key [16]byte, nonce [NonceSize]byte,
+	ciphertext, additionalData []byte) ([]byte, bool) {
+
+	var counter [aes.BlockSize]byte
+
+	copy(counter, nonce)
+	counter = incr(counter)
+
+	e0 := byteToUint128(aes.Block128(key, counter))
+
+	var block [aes.BlockSize]byte
+
+	// h = E(k, 0^128)
+	h := byteToUint128(aes.Block128(key, block))
+
+	// Auth data.
+	var x uint128 = 0
+
+	// Add additionalData to auth data.
+	for i := 0; i < len(additionalData); i += aes.BlockSize {
+		for j := 0; j < aes.BlockSize; j++ {
+			if i+j < len(additionalData) {
+				block[j] = additionalData[i+j]
+			} else {
+				block[j] = 0
+			}
+		}
+		x ^= byteToUint128(block)
+		x = multGF2Pow128(x, h)
+	}
+
+	if len(ciphertext) < TagSize {
+		return ciphertext[:0], false
+	}
+	cipherLen := len(ciphertext) - TagSize
+	cipher := ciphertext[0:cipherLen]
+	tag := ciphertext[cipherLen:]
+
+	var plain [cipherLen]byte
+	var cipherBlock [aes.BlockSize]byte
+
+	for i := 0; i < len(cipher); i += aes.BlockSize {
+		counter = incr(counter)
+		block = aes.Block128(key, counter)
+		for j := 0; j < aes.BlockSize; j++ {
+			if i+j < len(cipher) {
+				cipherBlock[j] = cipher[i+j]
+				plain[i+j] = cipher[i+j] ^ block[j]
+			} else {
+				cipherBlock[j] = 0
+			}
+		}
+
+		// Auth data.
+		x ^= byteToUint128(cipherBlock)
+		x = multGF2Pow128(x, h)
+	}
+
+	// len(A) || len(C)
+	var l uint128 = 0
+	l |= uint128(len(additionalData)*8) << 64
+	l |= uint128(len(plain) * 8)
+
+	x ^= l
+	x = multGF2Pow128(x, h)
+	x ^= e0
+
+	computedTag := uint128ToByte(x)
+	if bytes.Compare(tag, computedTag) != 0 {
+		return cipher, false
+	}
+
+	return plain, true
+}
+
+func byteToUint128(x [16]byte) uint128 {
+	var r uint128
+
+	for i := 0; i < len(x); i++ {
+		r <<= 8
+		r |= uint128(x[i])
+	}
+	return r
+}
+
+func uint128ToByte(x uint128) [16]byte {
+	var r [16]byte
+
+	for i := 0; i < 16; i++ {
+		r[15-i] = byte(x & 0xff)
+		x >>= 8
+	}
+	return r
+}
+
+func incr(counter [aes.BlockSize]byte) [aes.BlockSize]byte {
+	var c uint32
+
+	for i := 0; i < 4; i++ {
+		c <<= 8
+		c |= uint32(counter[12+i])
+	}
+	c++
+	for i := 0; i < 4; i++ {
+		counter[15-i] = byte(c & 0xff)
+		c >>= 8
+	}
+	return counter
+}
+
+func multGF2Pow128(x, y uint128) uint128 {
+	var z uint128 = 0
+
+	r := uint128(0b11100001)
+
+	r <<= 120
+
+	for i := 127; i >= 0; i-- {
+		if (y>>i)&1 == 1 {
+			z ^= x
+		}
+		if x&1 == 0 {
+			x >>= 1
+		} else {
+			x >>= 1
+			x ^= r
+		}
+	}
+	return z
+}

@@ -1,0 +1,52 @@
+// -*- go -*-
+//
+// Copyright (c) 2021 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package sort implements array sorting functions.
+package sort
+
+// Reverse reverses the argument slice.
+func Reverse(arr []int) []int {
+	tmp := arr[0]
+	for i := 0; i < len(arr)/2; i++ {
+		tmp = arr[i]
+		arr[i] = arr[len(arr)-1-i]
+		arr[len(arr)-1-i] = tmp
+	}
+	return arr
+}
+
+// Sort sorts the argument slice in ascending order.
+func Slice(arr []int) []int {
+	return bitonicSort(arr, 0, len(arr), true)
+}
+
+func bitonicSort(a []int, lo, n int, dir bool) []int {
+	if n > 1 {
+		m := n / 2
+		a = bitonicSort(a, lo, m, !dir)
+		a = bitonicSort(a, lo+m, n-m, dir)
+		a = bitonicMerge(a, lo, n, dir)
+	}
+	return a
+}
+
+func bitonicMerge(a []int, lo, n int, dir bool) []int {
+	if n > 1 {
+		m := floorPow2(n - 1)
+		tmp := a[0]
+		for i := lo; i < lo+n-m; i++ {
+			if dir == (a[i] > a[i+m]) {
+				tmp = a[i]
+				a[i] = a[i+m]
+				a[i+m] = tmp
+			}
+		}
+		a = bitonicMerge(a, lo, m, dir)
+		a = bitonicMerge(a, lo+m, n-m, dir)
+	}
+	return a
+}

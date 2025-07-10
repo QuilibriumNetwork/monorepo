@@ -1,0 +1,11 @@
+// -*- go -*-
+
+package main
+
+type Field [10]int32
+
+// @Test 0 0 = 10
+func main(a, b int32) int {
+	var arr Field
+	return len(arr)
+}

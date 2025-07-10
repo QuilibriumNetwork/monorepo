@@ -72,11 +72,11 @@ func WithStaticRelays(static []peer.AddrInfo) Option {
 				numPeers = len(static)
 			}
 			c := make(chan peer.AddrInfo, numPeers)
+			defer close(c)
 
 			for i := 0; i < numPeers; i++ {
 				c <- static[i]
 			}
-			close(c)
 			return c
 		})(c)
 		WithMinCandidates(len(static))(c)

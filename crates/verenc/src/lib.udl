@@ -6,6 +6,7 @@ namespace verenc {
     sequence<u8> verenc_recover(VerencDecrypt recovery);
     sequence<sequence<u8>> chunk_data_for_verenc(sequence<u8> data);
     sequence<u8> combine_chunked_data(sequence<sequence<u8>> chunks);
+    boolean verenc_verify_statement(sequence<u8> input, sequence<u8> blinding_pubkey, sequence<u8> statement);
 };
 
 dictionary VerencCiphertext {

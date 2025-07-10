@@ -1,0 +1,12 @@
+// -*- go -*-
+
+package main
+
+import (
+	"math/bits"
+)
+
+// @Test 15 -2 = 3221225475
+func main(a, b uint32) uint32 {
+	return bits.RotateLeft32(a, -2)
+}

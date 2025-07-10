@@ -1,0 +1,14 @@
+// -*- go -*-
+
+package main
+
+// @Test 0 0 = 10
+func main(a, b uint8) int32 {
+	var sum int32 = 0
+
+	for i := 0; i < 5; i = i + 1 {
+		sum = sum + i
+	}
+
+	return sum
+}

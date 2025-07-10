@@ -1,0 +1,17 @@
+// -*- go -*-
+
+package main
+
+// @Hex
+// @LSB
+// @Test 0 0 = 0x2c20776f726c6421
+func main(a, b int32) []byte {
+	// 48656c6c6f 2c20776f726c6421
+	data := []byte("Hello, world!")
+	// data := []byte{72, 101, 108, 108, 111, 111}
+	return foo(data[5:])
+}
+
+func foo(data []byte) []byte {
+	return data
+}

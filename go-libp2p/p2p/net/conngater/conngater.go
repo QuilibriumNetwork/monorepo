@@ -72,7 +72,7 @@ func (cg *BasicConnectionGater) loadRules(ctx context.Context) error {
 	for r := range res.Next() {
 		if r.Error != nil {
 			log.Errorf("query result error: %s", r.Error)
-			return err
+			return r.Error
 		}
 
 		p := peer.ID(r.Entry.Value)
@@ -89,7 +89,7 @@ func (cg *BasicConnectionGater) loadRules(ctx context.Context) error {
 	for r := range res.Next() {
 		if r.Error != nil {
 			log.Errorf("query result error: %s", r.Error)
-			return err
+			return r.Error
 		}
 
 		ip := net.IP(r.Entry.Value)
@@ -106,7 +106,7 @@ func (cg *BasicConnectionGater) loadRules(ctx context.Context) error {
 	for r := range res.Next() {
 		if r.Error != nil {
 			log.Errorf("query result error: %s", r.Error)
-			return err
+			return r.Error
 		}
 
 		ipnetStr := string(r.Entry.Value)
@@ -133,8 +133,9 @@ func (cg *BasicConnectionGater) BlockPeer(p peer.ID) error {
 	}
 
 	cg.Lock()
+	defer cg.Unlock()
 	cg.blockedPeers[p] = struct{}{}
-	cg.Unlock()
+
 	return nil
 }
 
@@ -149,21 +150,23 @@ func (cg *BasicConnectionGater) UnblockPeer(p peer.ID) error {
 	}
 
 	cg.Lock()
+	defer cg.Unlock()
 
 	delete(cg.blockedPeers, p)
-	cg.Unlock()
+
 	return nil
 }
 
 // ListBlockedPeers return a list of blocked peers
 func (cg *BasicConnectionGater) ListBlockedPeers() []peer.ID {
 	cg.RLock()
+	defer cg.RUnlock()
 
 	result := make([]peer.ID, 0, len(cg.blockedPeers))
 	for p := range cg.blockedPeers {
 		result = append(result, p)
 	}
-	cg.RUnlock()
+
 	return result
 }
 
@@ -179,9 +182,10 @@ func (cg *BasicConnectionGater) BlockAddr(ip net.IP) error {
 	}
 
 	cg.Lock()
+	defer cg.Unlock()
 
 	cg.blockedAddrs[ip.String()] = struct{}{}
-	cg.Unlock()
+
 	return nil
 }
 
@@ -196,22 +200,24 @@ func (cg *BasicConnectionGater) UnblockAddr(ip net.IP) error {
 	}
 
 	cg.Lock()
+	defer cg.Unlock()
 
 	delete(cg.blockedAddrs, ip.String())
-	cg.Unlock()
+
 	return nil
 }
 
 // ListBlockedAddrs return a list of blocked IP addresses
 func (cg *BasicConnectionGater) ListBlockedAddrs() []net.IP {
 	cg.RLock()
+	defer cg.RUnlock()
 
 	result := make([]net.IP, 0, len(cg.blockedAddrs))
 	for ipStr := range cg.blockedAddrs {
 		ip := net.ParseIP(ipStr)
 		result = append(result, ip)
 	}
-	cg.RUnlock()
+
 	return result
 }
 
@@ -227,9 +233,10 @@ func (cg *BasicConnectionGater) BlockSubnet(ipnet *net.IPNet) error {
 	}
 
 	cg.Lock()
+	defer cg.Unlock()
 
 	cg.blockedSubnets[ipnet.String()] = ipnet
-	cg.Unlock()
+
 	return nil
 }
 
@@ -244,21 +251,23 @@ func (cg *BasicConnectionGater) UnblockSubnet(ipnet *net.IPNet) error {
 	}
 
 	cg.Lock()
+	defer cg.Unlock()
 
 	delete(cg.blockedSubnets, ipnet.String())
-	cg.Unlock()
+
 	return nil
 }
 
 // ListBlockedSubnets return a list of blocked IP subnets
 func (cg *BasicConnectionGater) ListBlockedSubnets() []*net.IPNet {
 	cg.RLock()
+	defer cg.RUnlock()
 
 	result := make([]*net.IPNet, 0, len(cg.blockedSubnets))
 	for _, ipnet := range cg.blockedSubnets {
 		result = append(result, ipnet)
 	}
-	cg.RUnlock()
+
 	return result
 }
 
@@ -267,66 +276,60 @@ var _ connmgr.ConnectionGater = (*BasicConnectionGater)(nil)
 
 func (cg *BasicConnectionGater) InterceptPeerDial(p peer.ID) (allow bool) {
 	cg.RLock()
+	defer cg.RUnlock()
 
 	_, block := cg.blockedPeers[p]
-	cg.RUnlock()
 	return !block
 }
 
 func (cg *BasicConnectionGater) InterceptAddrDial(p peer.ID, a ma.Multiaddr) (allow bool) {
 	// we have already filtered blocked peers in InterceptPeerDial, so we just check the IP
 	cg.RLock()
+	defer cg.RUnlock()
 
 	ip, err := manet.ToIP(a)
 	if err != nil {
-		cg.RUnlock()
 		log.Warnf("error converting multiaddr to IP addr: %s", err)
 		return true
 	}
 
 	_, block := cg.blockedAddrs[ip.String()]
 	if block {
-		cg.RUnlock()
 		return false
 	}
 
 	for _, ipnet := range cg.blockedSubnets {
 		if ipnet.Contains(ip) {
-			cg.RUnlock()
 			return false
 		}
 	}
 
-	cg.RUnlock()
 	return true
 }
 
 func (cg *BasicConnectionGater) InterceptAccept(cma network.ConnMultiaddrs) (allow bool) {
 	cg.RLock()
+	defer cg.RUnlock()
 
 	a := cma.RemoteMultiaddr()
 
 	ip, err := manet.ToIP(a)
 	if err != nil {
-		cg.RUnlock()
 		log.Warnf("error converting multiaddr to IP addr: %s", err)
 		return true
 	}
 
 	_, block := cg.blockedAddrs[ip.String()]
 	if block {
-		cg.RUnlock()
 		return false
 	}
 
 	for _, ipnet := range cg.blockedSubnets {
 		if ipnet.Contains(ip) {
-			cg.RUnlock()
 			return false
 		}
 	}
 
-	cg.RUnlock()
 	return true
 }
 
@@ -338,9 +341,9 @@ func (cg *BasicConnectionGater) InterceptSecured(dir network.Direction, p peer.I
 
 	// we have already filtered addrs in InterceptAccept, so we just check the peer ID
 	cg.RLock()
+	defer cg.RUnlock()
 
 	_, block := cg.blockedPeers[p]
-	cg.RUnlock()
 	return !block
 }
 

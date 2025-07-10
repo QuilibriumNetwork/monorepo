@@ -1,4 +1,6 @@
 .idea/
+node/node
+node/lunchtime-*
 vouchers/
 ceremony-client
 .config*
@@ -9,6 +11,10 @@ ceremony-client
 .task
 node-tmp-*
 build
+cover.out
 
 # Rust
 target
+
+# Build outputs
+vdf-test*

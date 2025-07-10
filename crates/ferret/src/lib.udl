@@ -1,0 +1,16 @@
+
+namespace ferret {
+  NetIOManager create_netio_manager(i32 party, string? address, i32 port);
+  FerretCOTManager create_ferret_cot_manager(i32 party, i32 threads, u64 length, sequence<boolean> choices, [ByRef] NetIOManager netio, boolean malicious);
+};
+
+interface NetIOManager {};
+
+interface FerretCOTManager {
+    void send_cot();
+    void recv_cot();
+    void send_rot();
+    void recv_rot();
+    sequence<u8> get_block_data(u8 block_choice, u64 index);
+    void set_block_data(u8 block_choice, u64 index, sequence<u8> data);
+};

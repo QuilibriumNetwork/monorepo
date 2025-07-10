@@ -1,0 +1,15 @@
+// -*- go -*-
+
+package main
+
+// @Test 1 1  = 1
+// @Test 5 10 = 50
+func main(a, b int32) int {
+	return mult(a, b)
+}
+
+func mult(a, b int) int {
+	mType := make(int, size(a)*2)
+
+	return mType(a) * mType(b)
+}

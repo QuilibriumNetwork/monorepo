@@ -112,38 +112,39 @@ func NewMetricsTracer(opts ...MetricsTracerOption) MetricsTracer {
 
 func (m *metricsTracer) EventEmitted(typ reflect.Type) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, strings.TrimPrefix(typ.String(), "event."))
 	eventsEmitted.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) AddSubscriber(typ reflect.Type) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, strings.TrimPrefix(typ.String(), "event."))
 	totalSubscribers.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) RemoveSubscriber(typ reflect.Type) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, strings.TrimPrefix(typ.String(), "event."))
 	totalSubscribers.WithLabelValues(*tags...).Dec()
-	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) SubscriberQueueLength(name string, n int) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, name)
 	subscriberQueueLength.WithLabelValues(*tags...).Set(float64(n))
-	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) SubscriberQueueFull(name string, isFull bool) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, name)
 	observer := subscriberQueueFull.WithLabelValues(*tags...)
@@ -152,13 +153,12 @@ func (m *metricsTracer) SubscriberQueueFull(name string, isFull bool) {
 	} else {
 		observer.Set(0)
 	}
-	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) SubscriberEventQueued(name string) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, name)
 	subscriberEventQueued.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
 }

@@ -1,0 +1,36 @@
+// -*- go -*-
+
+package main
+
+import (
+	"crypto/curve25519"
+)
+
+func main(g, e [32]byte) ([]byte, []byte, []byte) {
+	// var s [32]byte
+	// curve25519.ScalarMult(&s, &g, &e)
+	// return g, e, s
+
+	var privateKey [32]byte
+	for i := 0; i < len(privateKey); i++ {
+		//privateKey[i] = g[i] ^ e[i]
+		privateKey[i] = (i % 8) + 1
+	}
+
+	var publicKey [32]byte
+	curve25519.ScalarBaseMult(&publicKey, &privateKey)
+
+	var privateKey2 [32]byte
+	for i := 0; i < len(privateKey2); i++ {
+		//privateKey[i] = g[i] ^ e[i]
+		privateKey2[i] = (i % 16) + 1
+	}
+
+	var publicKey2 [32]byte
+	curve25519.ScalarBaseMult(&publicKey2, &privateKey2)
+
+	var secret [32]byte
+	curve25519.ScalarMult(&secret, &privateKey, &publicKey2)
+
+	return publicKey, publicKey2, secret
+}

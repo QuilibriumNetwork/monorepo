@@ -124,12 +124,12 @@ func (dl *dialLimiter) freePeerToken(dj *dialJob) {
 
 func (dl *dialLimiter) finishedDial(dj *dialJob) {
 	dl.lk.Lock()
+	defer dl.lk.Unlock()
 	if dl.shouldConsumeFd(dj.addr) {
 		dl.freeFDToken()
 	}
 
 	dl.freePeerToken(dj)
-	dl.lk.Unlock()
 }
 
 func (dl *dialLimiter) shouldConsumeFd(addr ma.Multiaddr) bool {
@@ -182,32 +182,33 @@ func (dl *dialLimiter) addCheckPeerLimit(dj *dialJob) {
 // it will put it on the waitlist for the requested token.
 func (dl *dialLimiter) AddDialJob(dj *dialJob) {
 	dl.lk.Lock()
+	defer dl.lk.Unlock()
 
 	log.Debugf("[limiter] adding a dial job through limiter: %v", dj.addr)
 	dl.addCheckPeerLimit(dj)
-	dl.lk.Unlock()
 }
 
 func (dl *dialLimiter) clearAllPeerDials(p peer.ID) {
 	dl.lk.Lock()
+	defer dl.lk.Unlock()
 	delete(dl.waitingOnPeerLimit, p)
 	log.Debugf("[limiter] clearing all peer dials: %v", p)
 	// NB: the waitingOnFd list doesn't need to be cleaned out here, we will
 	// remove them as we encounter them because they are 'cancelled' at this
 	// point
-	dl.lk.Unlock()
 }
 
 // executeDial calls the dialFunc, and reports the result through the response
 // channel when finished. Once the response is sent it also releases all tokens
 // it held during the dial.
 func (dl *dialLimiter) executeDial(j *dialJob) {
+	defer dl.finishedDial(j)
 	if j.cancelled() {
-		dl.finishedDial(j)
 		return
 	}
 
 	dctx, cancel := context.WithTimeout(j.ctx, j.timeout)
+	defer cancel()
 
 	con, err := dl.dialFunc(dctx, j.peer, j.addr, j.resp)
 	kind := transport.UpdateKindDialSuccessful
@@ -221,6 +222,4 @@ func (dl *dialLimiter) executeDial(j *dialJob) {
 			con.Close()
 		}
 	}
-	dl.finishedDial(j)
-	cancel()
 }

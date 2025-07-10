@@ -20,9 +20,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func tStringCast(str string) ma.Multiaddr {
-	m, _ := ma.StringCast(str)
-	return m
+func tStringCast(s string) ma.Multiaddr {
+	st, _ := ma.StringCast(s)
+	return st
 }
 
 func checkClosed(t *testing.T, cm *ConnManager) {
@@ -66,8 +66,6 @@ func testListenOnSameProto(t *testing.T, enableReuseport bool) {
 
 	const alpn = "proto"
 
-	var tlsConf tls.Config
-	tlsConf.NextProtos = []string{alpn}
 	ln1, err := cm.ListenQUIC(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"), &tls.Config{NextProtos: []string{alpn}}, nil)
 	require.NoError(t, err)
 	defer ln1.Close()
@@ -101,10 +99,10 @@ func TestConnectionPassedToQUICForListening(t *testing.T) {
 
 	_, err = cm.ListenQUIC(raddr, &tls.Config{NextProtos: []string{"proto"}}, nil)
 	require.NoError(t, err)
-	quicTr, err := cm.transportForListen(netw, naddr)
+	quicTr, err := cm.transportForListen(nil, netw, naddr)
 	require.NoError(t, err)
 	defer quicTr.Close()
-	if _, ok := quicTr.(*singleOwnerTransport).Transport.Conn.(quic.OOBCapablePacketConn); !ok {
+	if _, ok := quicTr.(*singleOwnerTransport).packetConn.(quic.OOBCapablePacketConn); !ok {
 		t.Fatal("connection passed to quic-go cannot be type asserted to a *net.UDPConn")
 	}
 }
@@ -163,7 +161,7 @@ func TestConnectionPassedToQUICForDialing(t *testing.T) {
 
 	require.NoError(t, err, "dial error")
 	defer quicTr.Close()
-	if _, ok := quicTr.(*singleOwnerTransport).Transport.Conn.(quic.OOBCapablePacketConn); !ok {
+	if _, ok := quicTr.(*singleOwnerTransport).packetConn.(quic.OOBCapablePacketConn); !ok {
 		t.Fatal("connection passed to quic-go cannot be type asserted to a *net.UDPConn")
 	}
 }
@@ -263,4 +261,118 @@ func testListener(t *testing.T, enableReuseport bool) {
 	cm.Close()
 
 	checkClosed(t, cm)
+}
+
+func TestExternalTransport(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
+	require.NoError(t, err)
+	defer conn.Close()
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	tr := &quic.Transport{Conn: conn}
+	defer tr.Close()
+
+	cm, err := NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{})
+	require.NoError(t, err)
+	doneWithTr, err := cm.LendTransport("udp4", &wrappedQUICTransport{tr}, conn)
+	require.NoError(t, err)
+
+	// make sure this transport is used when listening on the same port
+	ln, err := cm.ListenQUICAndAssociate(
+		"quic",
+		tStringCast(fmt.Sprintf("/ip4/0.0.0.0/udp/%d", port)),
+		&tls.Config{NextProtos: []string{"libp2p"}},
+		func(quic.Connection, uint64) bool { return false },
+	)
+	require.NoError(t, err)
+	defer ln.Close()
+	require.Equal(t, port, ln.Addr().(*net.UDPAddr).Port)
+
+	// make sure this transport is used when dialing out
+	udpLn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer udpLn.Close()
+	addrChan := make(chan net.Addr, 1)
+	go func() {
+		_, addr, _ := udpLn.ReadFrom(make([]byte, 2000))
+		addrChan <- addr
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = cm.DialQUIC(
+		ctx,
+		tStringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", udpLn.LocalAddr().(*net.UDPAddr).Port)),
+		&tls.Config{NextProtos: []string{"libp2p"}},
+		func(quic.Connection, uint64) bool { return false },
+	)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	select {
+	case addr := <-addrChan:
+		require.Equal(t, port, addr.(*net.UDPAddr).Port)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	cm.Close()
+	select {
+	case <-doneWithTr:
+	default:
+		t.Fatal("doneWithTr not closed")
+	}
+}
+
+func TestAssociate(t *testing.T) {
+	testAssociate := func(lnAddr1, lnAddr2 ma.Multiaddr, dialAddr *net.UDPAddr) {
+		cm, err := NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{})
+		require.NoError(t, err)
+		defer cm.Close()
+
+		lp2pTLS := &tls.Config{NextProtos: []string{"libp2p"}}
+		assoc1 := "test-1"
+		ln1, err := cm.ListenQUICAndAssociate(assoc1, lnAddr1, lp2pTLS, nil)
+		require.NoError(t, err)
+		defer ln1.Close()
+		addrs := ln1.Multiaddrs()
+		require.Len(t, addrs, 1)
+
+		addr := addrs[0]
+		assoc2 := "test-2"
+		h3TLS := &tls.Config{NextProtos: []string{"h3"}}
+		ln2, err := cm.ListenQUICAndAssociate(assoc2, addr, h3TLS, nil)
+		require.NoError(t, err)
+		defer ln2.Close()
+
+		tr1, err := cm.TransportWithAssociationForDial(assoc1, "udp4", dialAddr)
+		require.NoError(t, err)
+		defer tr1.Close()
+		require.Equal(t, tr1.LocalAddr().String(), ln1.Addr().String())
+
+		tr2, err := cm.TransportWithAssociationForDial(assoc2, "udp4", dialAddr)
+		require.NoError(t, err)
+		defer tr2.Close()
+		require.Equal(t, tr2.LocalAddr().String(), ln2.Addr().String())
+
+		ln3, err := cm.ListenQUICAndAssociate(assoc1, lnAddr2, lp2pTLS, nil)
+		require.NoError(t, err)
+		defer ln3.Close()
+
+		// an unused association should also return the same transport
+		// association is only a preference for a specific transport, not an exclusion criteria
+		tr3, err := cm.TransportWithAssociationForDial("unused", "udp4", dialAddr)
+		require.NoError(t, err)
+		defer tr3.Close()
+		require.Contains(t, []string{ln2.Addr().String(), ln3.Addr().String()}, tr3.LocalAddr().String())
+	}
+
+	t.Run("MultipleUnspecifiedListeners", func(t *testing.T) {
+		testAssociate(tStringCast("/ip4/0.0.0.0/udp/0/quic-v1"),
+			tStringCast("/ip4/0.0.0.0/udp/0/quic-v1"),
+			&net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 1})
+	})
+	t.Run("MultipleSpecificListeners", func(t *testing.T) {
+		testAssociate(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"),
+			tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"),
+			&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
+		)
+	})
 }

@@ -1,0 +1,11 @@
+// -*- go -*-
+
+package main
+
+// @Test 42 1 = 1
+func main(a, b int32) int2 {
+	if 1%2 == 0 {
+		return 0
+	}
+	return 1
+}
