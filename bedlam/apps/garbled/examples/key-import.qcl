@@ -1,0 +1,102 @@
+// -*- go -*-
+
+// This example shows how a key can be imported to MCP peers garbler
+// and evaluator so that after the import operation both peers hold a
+// random share of the key, and shareG^shareE=key.
+//
+// The garbler provides three arguments:
+//
+//	key   [64]byte: the key to import
+//	split [64]byte: random input for the key split value
+//	mask  [64]byte: random mask to mask garbler's key share result
+//
+// The evaluator provides two arguments: the split and the mask values.
+//
+// The MPC program splits the key into two random shares:
+//
+//	garbler's share  : keyG = g.Split ^ e.Split
+//	evaluator's share: keyE = keyG ^ g.Key
+//
+// The result shares are masked with respective masks and returned as
+// the result of the computation:
+//
+//	keyGM = keyG ^ g.Mask
+//	keyEM = keyE ^ e.Mask
+//
+// Finally, both parties can extract their key shares because the know
+// their mask values:
+//
+//	keyG = keyGM ^ g.Mask
+//	keyE = keyEM ^ e.Mask
+//
+// Using the example values:
+//
+//	key:    a968f050ebd5c4ed2ddf9717f0f0fd9325b07c68ff5d62094800f5b69464bab9
+//	        8dd886a7c49460503fafa75f5f7430f2cdda7bd5cb60c1cbd471e35d67432d58
+//	splitG: 7e1d9bb27838f5c8481b7194f07b5f3059f9471ae8e69ea3fe79c629a92588d9
+//	        524a6e4364e77d222210135f6c5435a8be52fc99ad8fc8280e8207cac91fc7b3
+//	maskG:  bed1bc2a3e6089bd016ff0175c62346438a9eb7b741f41787e5f7aad1720ee08
+//	        233a89e81e3bbd5eef26d158750a0fdd47471ded518d781f23de6d4346ea68ad
+//
+//	splitE: b2146ed7385d63a76f599b27f03e83971149208b0c41604eea010806460a3266
+//	        93820075bc25c485b2bfcb9226488ba961eeb07980f8ab374b38f793e41e5247
+//	maskE:  a0698ff8e72f51bf3bff3895c80a8ba8a527abaa5a7603391545ed5dcebb22b5
+//	        a2f191bcb3ac3a543cfdba99bded67a3ac6f5f254ff7e5c34520312c9b91f672
+//
+// we run the evaluator with two arguments:
+//
+//	./garbled -e -v -i 0xb2146ed7385d63a76f599b27f03e83971149208b0c41604eea010806460a326693820075bc25c485b2bfcb9226488ba961eeb07980f8ab374b38f793e41e5247,0xa0698ff8e72f51bf3bff3895c80a8ba8a527abaa5a7603391545ed5dcebb22b5a2f191bcb3ac3a543cfdba99bded67a3ac6f5f254ff7e5c34520312c9b91f672 examples/key-import.qcl
+//
+// and the garbler with three arguments:
+//
+//	./garbled -v -i 0xa968f050ebd5c4ed2ddf9717f0f0fd9325b07c68ff5d62094800f5b69464bab98dd886a7c49460503fafa75f5f7430f2cdda7bd5cb60c1cbd471e35d67432d58,0x7e1d9bb27838f5c8481b7194f07b5f3059f9471ae8e69ea3fe79c629a92588d9524a6e4364e77d222210135f6c5435a8be52fc99ad8fc8280e8207cac91fc7b3,0xbed1bc2a3e6089bd016ff0175c62346438a9eb7b741f41787e5f7aad1720ee08233a89e81e3bbd5eef26d158750a0fdd47471ded518d781f23de6d4346ea68ad examples/key-import.qcl
+//
+// The program returns two values: garbler's and evaluator's masked
+// key shares:
+//
+//	Result[0]: 72d8494f7e051fd2262d1aa45c27e8c370198cea90b8bf956a27b482f80f54b7e2f2e7dec6f904f97f8909953f16b1dc98fb510d7cfa1b0066649d1a6bebfd59
+//	Result[1]: c5088acd4c9f033d3162453138bfaa9cc827b053418c9fdd493dd6c4b5f022b3eee1792daffae3a393fdc50ba885e950be096810a9e04717d4eb2228d1d34ede
+//
+// and both peers can extract their key shares by XOR:ing their result
+// with their mask value:
+//
+//	shareG: cc09f5654065966f2742eab30045dca748b06791e4a7feed1478ce2fef2fbabf
+//	        c1c86e36d8c2b9a790afd8cd4a1cbe01dfbc4ce02d77631f45baf0592d0195f4
+//	shareE: 65610535abb052820a9d7da4f0b521346d001bf91bfa9ce45c783b997b4b0006
+//	        4c10e8911c56d9f7af007f9215688ef312663735e617a2d491cb13044a42b8ac
+//
+// and we see that shareG^shareE = key
+package main
+
+type Garbler struct {
+	Key   [64]byte
+	Split [64]byte
+	Mask  [64]byte
+}
+
+type Evaluator struct {
+	Split [64]byte
+	Mask  [64]byte
+}
+
+func main(g Garbler, e Evaluator) ([]byte, []byte) {
+	var keyG [64]byte
+	var keyE [64]byte
+	var keyGM [64]byte
+	var keyEM [64]byte
+
+	for i := 0; i < len(keyG); i++ {
+		keyG[i] = g.Split[i] ^ e.Split[i]
+	}
+	for i := 0; i < len(keyE); i++ {
+		keyE[i] = keyG[i] ^ g.Key[i]
+	}
+
+	for i := 0; i < len(keyGM); i++ {
+		keyGM[i] = keyG[i] ^ g.Mask[i]
+	}
+	for i := 0; i < len(keyEM); i++ {
+		keyEM[i] = keyE[i] ^ e.Mask[i]
+	}
+	return keyGM, keyEM
+}

@@ -1,0 +1,45 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2024 Markku Rossi
+//
+// All rights reserved.
+//
+
+package hmac
+
+import (
+	"crypto/sha512"
+)
+
+// SumSHA512 computes the HMAC-SHA512 signature for the data using the
+// key.
+func SumSHA512(data, key []byte) [sha512.Size]byte {
+	if len(key) > sha512.BlockSize {
+		key = sha512.Sum512(key[:])
+	}
+
+	var ipad [sha512.BlockSize]byte
+	var opad [sha512.BlockSize]byte
+
+	copy(ipad, key)
+	copy(opad, key)
+
+	for i := 0; i < len(ipad); i++ {
+		ipad[i] ^= 0x36
+	}
+	for i := 0; i < len(opad); i++ {
+		opad[i] ^= 0x5c
+	}
+
+	var idata [len(ipad) + len(data)]byte
+	copy(idata, ipad)
+	copy(idata[len(ipad):], data)
+
+	idigest := sha512.Sum512(idata[:])
+
+	var odata [len(opad) + len(idigest)]byte
+	copy(odata, opad)
+	copy(odata[len(opad):], idigest)
+
+	return sha512.Sum512(odata[:])
+}

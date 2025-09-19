@@ -1,0 +1,42 @@
+// -*- go -*-
+//
+// Copyright (c) 2024 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package bits implements bit manipulation functions for predefined
+// unsigned integer types.
+package bits
+
+// RotateLeft rotates x left by (k mod size(x)) bits. To rotate right
+// by k bits, call RotateLeft(x, -k).
+func RotateLeft(x uint, k int) uint {
+	n := size(x)
+	s := uint(k) & uint(n-1)
+	return x<<s | x>>(uint(n)-s)
+}
+
+// RotateLeft16 rotates x left by (k mod 16) bits. To rotate right by
+// k bits, call RotateLeft16(x, -k).
+func RotateLeft16(x uint16, k int) uint16 {
+	n := 16
+	s := uint(k) & uint(n-1)
+	return x<<s | x>>(uint(n)-s)
+}
+
+// RotateLeft32 rotates x left by (k mod 32) bits. To rotate right by
+// k bits, call RotateLeft32(x, -k).
+func RotateLeft32(x uint32, k int) uint32 {
+	n := 32
+	s := uint(k) & uint(n-1)
+	return x<<s | x>>(uint(n)-s)
+}
+
+// RotateLeft64 rotates x left by (k mod 64) bits. To rotate right by
+// k bits, call RotateLeft64(x, -k).
+func RotateLeft64(x uint64, k int) uint64 {
+	n := 64
+	s := uint(k) & uint(n-1)
+	return x<<s | x>>(uint(n)-s)
+}

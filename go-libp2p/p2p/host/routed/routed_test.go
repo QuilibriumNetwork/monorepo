@@ -24,6 +24,11 @@ func (m *mockRouting) FindPeer(ctx context.Context, pid peer.ID) (peer.AddrInfo,
 	return m.findPeerFn(ctx, pid)
 }
 
+func tStringCast(s string) ma.Multiaddr {
+	st, _ := ma.StringCast(s)
+	return st
+}
+
 func TestRoutedHostConnectToObsoleteAddresses(t *testing.T) {
 	h1, err := basic.NewHost(swarmt.GenSwarm(t), nil)
 	require.NoError(t, err)
@@ -33,14 +38,14 @@ func TestRoutedHostConnectToObsoleteAddresses(t *testing.T) {
 	h2, err := basic.NewHost(swarmt.GenSwarm(t), nil)
 	require.NoError(t, err)
 	defer h2.Close()
+	h2.Start()
 
-	m, _ := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
 	// assemble the AddrInfo struct to use for the connection attempt
 	pi := peer.AddrInfo{
 		ID: h2.ID(),
 		// Use a wrong multi address for host 2, so that the initial connection attempt will fail
 		// (we have obsolete, old multi address information)
-		Addrs: []ma.Multiaddr{m},
+		Addrs: []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/1234")},
 	}
 
 	// Build mock routing module and replace the FindPeer function.
@@ -71,14 +76,12 @@ func TestRoutedHostConnectFindPeerNoUsefulAddrs(t *testing.T) {
 	require.NoError(t, err)
 	defer h2.Close()
 
-	m1, _ := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
-
 	// assemble the AddrInfo struct to use for the connection attempt
 	pi := peer.AddrInfo{
 		ID: h2.ID(),
 		// Use a wrong multi address for host 2, so that the initial connection attempt will fail
 		// (we have obsolete, old multi address information)
-		Addrs: []ma.Multiaddr{m1},
+		Addrs: []ma.Multiaddr{tStringCast("/ip4/127.0.0.1/tcp/1234")},
 	}
 
 	// Build mock routing module and replace the FindPeer function.

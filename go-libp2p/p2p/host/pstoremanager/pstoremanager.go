@@ -11,7 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 
-	logging "github.com/ipfs/go-log/v2"
+	logging "github.com/libp2p/go-libp2p/gologshim"
 )
 
 var log = logging.Logger("pstoremanager")
@@ -73,7 +73,7 @@ func (m *PeerstoreManager) Start() {
 	m.cancel = cancel
 	sub, err := m.eventBus.Subscribe(&event.EvtPeerConnectednessChanged{}, eventbus.Name("pstoremanager"))
 	if err != nil {
-		log.Warnf("subscription failed. Peerstore manager not activated. Error: %s", err)
+		log.Warn("subscription failed. Peerstore manager not activated", "err", err)
 		return
 	}
 	m.refCount.Add(1)
@@ -121,10 +121,12 @@ func (m *PeerstoreManager) background(ctx context.Context, sub event.Subscriptio
 					// Check that the peer is actually not connected at this point.
 					// This avoids a race condition where the Connected notification
 					// is processed after this time has fired.
-					if m.network.Connectedness(p) != network.Connected {
+					switch m.network.Connectedness(p) {
+					case network.Connected, network.Limited:
+					default:
 						m.pstore.RemovePeer(p)
-						delete(disconnected, p)
 					}
+					delete(disconnected, p)
 				}
 			}
 		case <-ctx.Done():

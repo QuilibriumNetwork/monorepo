@@ -1,0 +1,9 @@
+// -*- go -*-
+
+package main
+
+// @Test 0 0 = 13
+func main(a, b int32) int {
+	val := "Hello, world!"
+	return len(val)
+}

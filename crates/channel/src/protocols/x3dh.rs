@@ -26,13 +26,13 @@ pub fn sender_x3dh(
     sending_ephemeral_private_key: &Scalar,
     receiving_identity_key: &EdwardsPoint,
     receiving_signed_pre_key: &EdwardsPoint,
-    session_key_length: usize,
+    session_key_length: u64,
 ) -> Option<Vec<u8>> {
     let xdh1 = (receiving_signed_pre_key * sending_identity_private_key).compress().to_bytes().to_vec();
     let xdh2 = (receiving_identity_key * sending_ephemeral_private_key).compress().to_bytes().to_vec();
     let xdh3 = (receiving_signed_pre_key * sending_ephemeral_private_key).compress().to_bytes().to_vec();
 
-    let salt = vec![0u8; session_key_length];
+    let salt = vec![0u8; session_key_length as usize];
     let info = b"quilibrium-x3dh";
 
     let domain_separator = DOMAIN_SEPARATORS.get("ed448")
@@ -45,7 +45,7 @@ pub fn sender_x3dh(
     ikm.extend(xdh3);
 
     let hk = Hkdf::<Sha512>::new(Some(&salt), &ikm);
-    let mut session_key = vec![0u8; session_key_length];
+    let mut session_key = vec![0u8; session_key_length as usize];
     hk.expand(info, &mut session_key).ok()?;
 
     Some(session_key)
@@ -56,13 +56,13 @@ pub fn receiver_x3dh(
     sending_signed_pre_private_key: &Scalar,
     receiving_identity_key: &EdwardsPoint,
     receiving_ephemeral_key: &EdwardsPoint,
-    session_key_length: usize,
+    session_key_length: u64,
 ) -> Option<Vec<u8>> {
     let xdh1 = (receiving_identity_key * sending_signed_pre_private_key).compress().to_bytes().to_vec();
     let xdh2 = (receiving_ephemeral_key * sending_identity_private_key).compress().to_bytes().to_vec();
     let xdh3 = (receiving_ephemeral_key * sending_signed_pre_private_key).compress().to_bytes().to_vec();
 
-    let salt = vec![0u8; session_key_length];
+    let salt = vec![0u8; session_key_length as usize];
     let info = b"quilibrium-x3dh";
 
     let domain_separator = DOMAIN_SEPARATORS.get("ed448")
@@ -75,7 +75,7 @@ pub fn receiver_x3dh(
     ikm.extend(xdh3);
 
     let hk = Hkdf::<Sha512>::new(Some(&salt), &ikm);
-    let mut session_key = vec![0u8; session_key_length];
+    let mut session_key = vec![0u8; session_key_length as usize];
     hk.expand(info, &mut session_key).ok()?;
 
     Some(session_key)

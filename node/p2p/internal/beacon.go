@@ -3,7 +3,7 @@ package internal
 import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"source.quilibrium.com/quilibrium/monorepo/node/config"
+	"source.quilibrium.com/quilibrium/monorepo/config"
 )
 
 // BeaconPeerID returns the peer ID of the beacon node.

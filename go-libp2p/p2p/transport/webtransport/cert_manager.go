@@ -71,7 +71,7 @@ func newCertManager(hostKey ic.PrivKey, clock clock.Clock) (*certManager, error)
 	return m, nil
 }
 
-// getCurrentTimeBucket returns the canonical start time of the given time as
+// getCurrentBucketStartTime returns the canonical start time of the given time as
 // bucketed by ranges of certValidity since unix epoch (plus an offset). This
 // lets you get the same time ranges across reboots without having to persist
 // state.
@@ -126,7 +126,7 @@ func (m *certManager) rollConfig(hostKey ic.PrivKey) error {
 
 func (m *certManager) background(hostKey ic.PrivKey) {
 	d := m.currentConfig.End().Add(-clockSkewAllowance).Sub(m.clock.Now())
-	log.Debugw("setting timer", "duration", d.String())
+	log.Debug("setting timer", "duration", d.String())
 	t := m.clock.Timer(d)
 	m.refCount.Add(1)
 
@@ -142,10 +142,10 @@ func (m *certManager) background(hostKey ic.PrivKey) {
 				now := m.clock.Now()
 				m.mx.Lock()
 				if err := m.rollConfig(hostKey); err != nil {
-					log.Errorw("rolling config failed", "error", err)
+					log.Error("rolling config failed", "error", err)
 				}
 				d := m.currentConfig.End().Add(-clockSkewAllowance).Sub(now)
-				log.Debugw("rolling certificates", "next", d.String())
+				log.Debug("rolling certificates", "next", d.String())
 				t.Reset(d)
 				m.mx.Unlock()
 			}
@@ -191,16 +191,18 @@ func (m *certManager) cacheSerializedCertHashes() error {
 }
 
 func (m *certManager) cacheAddrComponent() error {
-	addr, err := addrComponentForCert(m.currentConfig.sha256[:])
+	var addr ma.Multiaddr
+	c, err := addrComponentForCert(m.currentConfig.sha256[:])
 	if err != nil {
 		return err
 	}
+	addr = addr.AppendComponent(c)
 	if m.nextConfig != nil {
 		comp, err := addrComponentForCert(m.nextConfig.sha256[:])
 		if err != nil {
 			return err
 		}
-		addr = addr.Encapsulate(comp)
+		addr = addr.AppendComponent(comp)
 	}
 	m.addrComp = addr
 	return nil

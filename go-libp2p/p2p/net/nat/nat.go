@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	logging "github.com/ipfs/go-log/v2"
+	logging "github.com/libp2p/go-libp2p/gologshim"
 
-	"github.com/libp2p/go-nat"
+	"github.com/libp2p/go-libp2p/p2p/net/nat/internal/nat"
 )
 
 // ErrNoMapping signals no mapping exists for an address
@@ -48,23 +49,23 @@ func DiscoverNAT(ctx context.Context) (*NAT, error) {
 	// Log the device addr.
 	addr, err := natInstance.GetDeviceAddress()
 	if err != nil {
-		log.Debug("DiscoverGateway address error:", err)
+		log.Debug("DiscoverGateway address error", "err", err)
 	} else {
-		log.Debug("DiscoverGateway address:", addr)
+		log.Debug("DiscoverGateway address", "address", addr)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	nat := &NAT{
 		nat:       natInstance,
-		extAddr:   extAddr,
 		mappings:  make(map[entry]int),
 		ctx:       ctx,
 		ctxCancel: cancel,
 	}
+	nat.extAddr.Store(&extAddr)
 	nat.refCount.Add(1)
 	go func() {
+		defer nat.refCount.Done()
 		nat.background()
-		nat.refCount.Done()
 	}()
 	return nat, nil
 }
@@ -77,7 +78,7 @@ type NAT struct {
 	natmu sync.Mutex
 	nat   nat.NAT
 	// External IP of the NAT. Will be renewed periodically (every CacheTime).
-	extAddr netip.Addr
+	extAddr atomic.Pointer[netip.Addr]
 
 	refCount  sync.WaitGroup
 	ctx       context.Context
@@ -101,18 +102,17 @@ func (nat *NAT) Close() error {
 
 func (nat *NAT) GetMapping(protocol string, port int) (addr netip.AddrPort, found bool) {
 	nat.mappingmu.Lock()
+	defer nat.mappingmu.Unlock()
 
-	if !nat.extAddr.IsValid() {
-		nat.mappingmu.Unlock()
+	if !nat.extAddr.Load().IsValid() {
 		return netip.AddrPort{}, false
 	}
 	extPort, found := nat.mappings[entry{protocol: protocol, port: port}]
-	if !found {
-		nat.mappingmu.Unlock()
+	// The mapping may have an invalid port.
+	if !found || extPort == 0 {
 		return netip.AddrPort{}, false
 	}
-	nat.mappingmu.Unlock()
-	return netip.AddrPortFrom(nat.extAddr, uint16(extPort)), true
+	return netip.AddrPortFrom(*nat.extAddr.Load(), uint16(extPort)), true
 }
 
 // AddMapping attempts to construct a mapping on protocol and internal port.
@@ -128,17 +128,19 @@ func (nat *NAT) AddMapping(ctx context.Context, protocol string, port int) error
 	}
 
 	nat.mappingmu.Lock()
+	defer nat.mappingmu.Unlock()
 
 	if nat.closed {
-		nat.mappingmu.Unlock()
 		return errors.New("closed")
 	}
 
 	// do it once synchronously, so first mapping is done right away, and before exiting,
 	// allowing users -- in the optimistic case -- to use results right after.
 	extPort := nat.establishMapping(ctx, protocol, port)
+	// Don't validate the mapping here, we refresh the mappings based on this map.
+	// We can try getting a port again in case it succeeds. In the worst case,
+	// this is one extra LAN request every few minutes.
 	nat.mappings[entry{protocol: protocol, port: port}] = extPort
-	nat.mappingmu.Unlock()
 	return nil
 }
 
@@ -146,19 +148,17 @@ func (nat *NAT) AddMapping(ctx context.Context, protocol string, port int) error
 // It blocks until the NAT has removed the mapping.
 func (nat *NAT) RemoveMapping(ctx context.Context, protocol string, port int) error {
 	nat.mappingmu.Lock()
+	defer nat.mappingmu.Unlock()
 
 	switch protocol {
 	case "tcp", "udp":
 		e := entry{protocol: protocol, port: port}
 		if _, ok := nat.mappings[e]; ok {
 			delete(nat.mappings, e)
-			nat.mappingmu.Unlock()
 			return nat.nat.DeletePortMapping(ctx, protocol, port)
 		}
-		nat.mappingmu.Unlock()
 		return errors.New("unknown mapping")
 	default:
-		nat.mappingmu.Unlock()
 		return fmt.Errorf("invalid protocol: %s", protocol)
 	}
 }
@@ -171,6 +171,7 @@ func (nat *NAT) background() {
 	nextAddrUpdate := now.Add(CacheTime)
 
 	t := time.NewTimer(minTime(nextMappingUpdate, nextAddrUpdate).Sub(now)) // don't use a ticker here. We don't know how long establishing the mappings takes.
+	defer t.Stop()
 
 	var in []entry
 	var out []int // port numbers
@@ -206,27 +207,26 @@ func (nat *NAT) background() {
 				if err == nil {
 					extAddr, _ = netip.AddrFromSlice(extIP)
 				}
-				nat.extAddr = extAddr
+				nat.extAddr.Store(&extAddr)
 				nextAddrUpdate = time.Now().Add(CacheTime)
 			}
 			t.Reset(time.Until(minTime(nextAddrUpdate, nextMappingUpdate)))
 		case <-nat.ctx.Done():
 			nat.mappingmu.Lock()
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 			for e := range nat.mappings {
 				delete(nat.mappings, e)
 				nat.nat.DeletePortMapping(ctx, e.protocol, e.port)
 			}
 			nat.mappingmu.Unlock()
-			t.Stop()
-			cancel()
 			return
 		}
 	}
 }
 
 func (nat *NAT) establishMapping(ctx context.Context, protocol string, internalPort int) (externalPort int) {
-	log.Debugf("Attempting port map: %s/%d", protocol, internalPort)
+	log.Debug("Attempting port map", "protocol", protocol, "internal_port", internalPort)
 	const comment = "libp2p"
 
 	nat.natmu.Lock()
@@ -239,18 +239,17 @@ func (nat *NAT) establishMapping(ctx context.Context, protocol string, internalP
 	nat.natmu.Unlock()
 
 	if err != nil || externalPort == 0 {
-		// TODO: log.Event
 		if err != nil {
-			log.Warnf("failed to establish port mapping: %s", err)
+			log.Warn("NAT port mapping failed", "protocol", protocol, "internal_port", internalPort, "err", err)
 		} else {
-			log.Warnf("failed to establish port mapping: newport = 0")
+			log.Warn("NAT port mapping failed", "protocol", protocol, "internal_port", internalPort, "external_port", 0)
 		}
 		// we do not close if the mapping failed,
 		// because it may work again next time.
 		return 0
 	}
 
-	log.Debugf("NAT Mapping: %d --> %d (%s)", externalPort, internalPort, protocol)
+	log.Debug("NAT Mapping", "external_port", externalPort, "internal_port", internalPort, "protocol", protocol)
 	return externalPort
 }
 

@@ -1396,7 +1396,10 @@ func (bs *BlossomSubRouter) sendRPC(p peer.ID, out *RPC, fast bool) {
 		delete(bs.gossip, p)
 	}
 
+	bs.p.peerMx.RLock()
 	mch, ok := bs.p.peers[p]
+	bs.p.peerMx.RUnlock()
+
 	if !ok {
 		return
 	}

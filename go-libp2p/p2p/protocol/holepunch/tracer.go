@@ -20,13 +20,10 @@ const (
 func WithTracer(et EventTracer) Option {
 	return func(hps *Service) error {
 		hps.tracer = &tracer{
-			et:   et,
-			mt:   nil,
-			self: hps.host.ID(),
-			peers: make(map[peer.ID]struct {
-				counter int
-				last    time.Time
-			}),
+			et:    et,
+			mt:    nil,
+			self:  hps.host.ID(),
+			peers: make(map[peer.ID]peerInfo),
 		}
 		return nil
 	}
@@ -36,13 +33,10 @@ func WithTracer(et EventTracer) Option {
 func WithMetricsTracer(mt MetricsTracer) Option {
 	return func(hps *Service) error {
 		hps.tracer = &tracer{
-			et:   nil,
-			mt:   mt,
-			self: hps.host.ID(),
-			peers: make(map[peer.ID]struct {
-				counter int
-				last    time.Time
-			}),
+			et:    nil,
+			mt:    mt,
+			self:  hps.host.ID(),
+			peers: make(map[peer.ID]peerInfo),
 		}
 		return nil
 	}
@@ -52,13 +46,10 @@ func WithMetricsTracer(mt MetricsTracer) Option {
 func WithMetricsAndEventTracer(mt MetricsTracer, et EventTracer) Option {
 	return func(hps *Service) error {
 		hps.tracer = &tracer{
-			et:   et,
-			mt:   mt,
-			self: hps.host.ID(),
-			peers: make(map[peer.ID]struct {
-				counter int
-				last    time.Time
-			}),
+			et:    et,
+			mt:    mt,
+			self:  hps.host.ID(),
+			peers: make(map[peer.ID]peerInfo),
 		}
 		return nil
 	}
@@ -74,10 +65,12 @@ type tracer struct {
 	ctxCancel context.CancelFunc
 
 	mutex sync.Mutex
-	peers map[peer.ID]struct {
-		counter int
-		last    time.Time
-	}
+	peers map[peer.ID]peerInfo
+}
+
+type peerInfo struct {
+	counter int
+	last    time.Time
 }
 
 type EventTracer interface {
@@ -259,7 +252,9 @@ func (t *tracer) HolePunchAttempt(p peer.ID) {
 // gc cleans up the peers map. This is only run when tracer is initialised with a non nil
 // EventTracer
 func (t *tracer) gc() {
+	defer t.refCount.Done()
 	timer := time.NewTicker(tracerGCInterval)
+	defer timer.Stop()
 
 	for {
 		select {
@@ -273,8 +268,6 @@ func (t *tracer) gc() {
 			}
 			t.mutex.Unlock()
 		case <-t.ctx.Done():
-			t.refCount.Done()
-			timer.Stop()
 			return
 		}
 	}

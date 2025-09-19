@@ -1,0 +1,9 @@
+// -*- go -*-
+
+// Sample 3-party circuit where each party provides their input bit
+// and the result is bitwise AND of the inputs.
+package main
+
+func main(a, b, e uint1) uint {
+	return a & b & e
+}

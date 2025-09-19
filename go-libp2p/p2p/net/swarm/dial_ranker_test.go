@@ -20,15 +20,16 @@ func sortAddrDelays(addrDelays []network.AddrDelay) {
 }
 
 func TestNoDelayDialRanker(t *testing.T) {
-	q1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	q1v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	wt1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
-	q2, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-	q2v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-	q3, _ := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
-	q3v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
-	q4, _ := ma.StringCast("/ip4/1.2.3.4/udp/4/quic-v1")
-	t1, _ := ma.StringCast("/ip4/1.2.3.5/tcp/1/")
+	q1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	q1v1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	wt1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
+	q2 := tStringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q2v1 := tStringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q3 := tStringCast("/ip4/1.2.3.4/udp/3/quic-v1")
+	q3v1 := tStringCast("/ip4/1.2.3.4/udp/3/quic-v1")
+	q4 := tStringCast("/ip4/1.2.3.4/udp/4/quic-v1")
+	t1 := tStringCast("/ip4/1.2.3.5/tcp/1/")
+	wrtc1 := tStringCast("/ip4/1.1.1.1/udp/1/webrtc-direct")
 
 	testCase := []struct {
 		name   string
@@ -37,7 +38,7 @@ func TestNoDelayDialRanker(t *testing.T) {
 	}{
 		{
 			name:  "quic+webtransport filtered when quicv1",
-			addrs: []ma.Multiaddr{q1, q2, q3, q4, q1v1, q2v1, q3v1, wt1, t1},
+			addrs: []ma.Multiaddr{q1, q2, q3, q4, q1v1, q2v1, q3v1, wt1, t1, wrtc1},
 			output: []network.AddrDelay{
 				{Addr: q1, Delay: 0},
 				{Addr: q2, Delay: 0},
@@ -48,6 +49,7 @@ func TestNoDelayDialRanker(t *testing.T) {
 				{Addr: q3v1, Delay: 0},
 				{Addr: wt1, Delay: 0},
 				{Addr: t1, Delay: 0},
+				{Addr: wrtc1, Delay: 0},
 			},
 		},
 	}
@@ -55,7 +57,7 @@ func TestNoDelayDialRanker(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			res := NoDelayDialRanker(tc.addrs)
 			if len(res) != len(tc.output) {
-				log.Errorf("expected %s got %s", tc.output, res)
+				log.Error("expected elems, got", "elems", tc.output, "got", res)
 				t.Errorf("expected elems: %d got: %d", len(tc.output), len(res))
 			}
 			sortAddrDelays(res)
@@ -70,14 +72,14 @@ func TestNoDelayDialRanker(t *testing.T) {
 }
 
 func TestDelayRankerQUICDelay(t *testing.T) {
-	q1v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	wt1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
-	q2v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-	q3v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/3/quic-v1")
+	q1v1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	wt1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1/webtransport/")
+	q2v1 := tStringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q3v1 := tStringCast("/ip4/1.2.3.4/udp/3/quic-v1")
 
-	q1v16, _ := ma.StringCast("/ip6/1::2/udp/1/quic-v1")
-	q2v16, _ := ma.StringCast("/ip6/1::2/udp/2/quic-v1")
-	q3v16, _ := ma.StringCast("/ip6/1::2/udp/3/quic-v1")
+	q1v16 := tStringCast("/ip6/1::2/udp/1/quic-v1")
+	q2v16 := tStringCast("/ip6/1::2/udp/2/quic-v1")
+	q3v16 := tStringCast("/ip6/1::2/udp/3/quic-v1")
 
 	testCase := []struct {
 		name   string
@@ -136,7 +138,7 @@ func TestDelayRankerQUICDelay(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			res := DefaultDialRanker(tc.addrs)
 			if len(res) != len(tc.output) {
-				log.Errorf("expected %s got %s", tc.output, res)
+				log.Error("expected elems, got", "elems", tc.output, "got", res)
 				t.Errorf("expected elems: %d got: %d", len(tc.output), len(res))
 			}
 			sortAddrDelays(res)
@@ -151,15 +153,17 @@ func TestDelayRankerQUICDelay(t *testing.T) {
 }
 
 func TestDelayRankerTCPDelay(t *testing.T) {
-	q1v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	q2v1, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
-	q1v16, _ := ma.StringCast("/ip6/1::2/udp/1/quic-v1")
-	q2v16, _ := ma.StringCast("/ip6/1::2/udp/2/quic-v1")
-	q3v16, _ := ma.StringCast("/ip6/1::2/udp/3/quic-v1")
-	t1, _ := ma.StringCast("/ip4/1.2.3.5/tcp/1/")
-	t1v6, _ := ma.StringCast("/ip6/1::2/tcp/1")
-	t2, _ := ma.StringCast("/ip4/1.2.3.4/tcp/2")
-	t3, _ := ma.StringCast("/ip4/1.2.3.4/tcp/3")
+	q1v1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	q2v1 := tStringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+
+	q1v16 := tStringCast("/ip6/1::2/udp/1/quic-v1")
+	q2v16 := tStringCast("/ip6/1::2/udp/2/quic-v1")
+	q3v16 := tStringCast("/ip6/1::2/udp/3/quic-v1")
+
+	t1 := tStringCast("/ip4/1.2.3.5/tcp/1/")
+	t1v6 := tStringCast("/ip6/1::2/tcp/1")
+	t2 := tStringCast("/ip4/1.2.3.4/tcp/2")
+	t3 := tStringCast("/ip4/1.2.3.4/tcp/3")
 
 	testCase := []struct {
 		name   string
@@ -230,7 +234,7 @@ func TestDelayRankerTCPDelay(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			res := DefaultDialRanker(tc.addrs)
 			if len(res) != len(tc.output) {
-				log.Errorf("expected %s got %s", tc.output, res)
+				log.Error("expected elems, got", "elems", tc.output, "got", res)
 				t.Errorf("expected elems: %d got: %d", len(tc.output), len(res))
 			}
 			sortAddrDelays(res)
@@ -245,12 +249,12 @@ func TestDelayRankerTCPDelay(t *testing.T) {
 }
 
 func TestDelayRankerRelay(t *testing.T) {
-	q1, _ := ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")
-	q2, _ := ma.StringCast("/ip4/1.2.3.4/udp/2/quic-v1")
+	q1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	q2 := tStringCast("/ip4/1.2.3.4/udp/2/quic-v1")
 
 	pid := test.RandPeerIDFatal(t)
-	r1, _ := ma.StringCast(fmt.Sprintf("/ip4/1.2.3.4/tcp/1/p2p-circuit/p2p/%s", pid))
-	r2, _ := ma.StringCast(fmt.Sprintf("/ip4/1.2.3.4/udp/1/quic/p2p-circuit/p2p/%s", pid))
+	r1 := tStringCast(fmt.Sprintf("/ip4/1.2.3.4/tcp/1/p2p-circuit/p2p/%s", pid))
+	r2 := tStringCast(fmt.Sprintf("/ip4/1.2.3.4/udp/1/quic/p2p-circuit/p2p/%s", pid))
 
 	testCase := []struct {
 		name   string
@@ -272,8 +276,74 @@ func TestDelayRankerRelay(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			res := DefaultDialRanker(tc.addrs)
 			if len(res) != len(tc.output) {
-				log.Errorf("expected %s got %s", tc.output, res)
+				log.Error("expected elems, got", "elems", tc.output, "got", res)
 				t.Errorf("expected elems: %d got: %d", len(tc.output), len(res))
+			}
+			sortAddrDelays(res)
+			sortAddrDelays(tc.output)
+			for i := 0; i < len(tc.output); i++ {
+				if !tc.output[i].Addr.Equal(res[i].Addr) || tc.output[i].Delay != res[i].Delay {
+					t.Fatalf("expected %+v got %+v", tc.output, res)
+				}
+			}
+		})
+	}
+}
+
+func TestDelayRankerOtherTransportDelay(t *testing.T) {
+	q1v1 := tStringCast("/ip4/1.2.3.4/udp/1/quic-v1")
+	q1v16 := tStringCast("/ip6/1::2/udp/1/quic-v1")
+	t1 := tStringCast("/ip4/1.2.3.5/tcp/1/")
+	t1v6 := tStringCast("/ip6/1::2/tcp/1")
+	wrtc1 := tStringCast("/ip4/1.2.3.4/udp/1/webrtc-direct")
+	wrtc1v6 := tStringCast("/ip6/1::2/udp/1/webrtc-direct")
+	onion1 := tStringCast("/onion3/vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd:1234")
+	onlyIP := tStringCast("/ip4/1.2.3.4/")
+	testCase := []struct {
+		name   string
+		addrs  []ma.Multiaddr
+		output []network.AddrDelay
+	}{
+		{
+			name:  "quic-with-other",
+			addrs: []ma.Multiaddr{q1v1, q1v16, wrtc1, wrtc1v6, onion1, onlyIP},
+			output: []network.AddrDelay{
+				{Addr: q1v16, Delay: 0},
+				{Addr: q1v1, Delay: PublicQUICDelay},
+				{Addr: wrtc1, Delay: PublicQUICDelay + PublicOtherDelay},
+				{Addr: wrtc1v6, Delay: PublicQUICDelay + PublicOtherDelay},
+				{Addr: onlyIP, Delay: PublicQUICDelay + PublicOtherDelay},
+				{Addr: onion1, Delay: PublicQUICDelay + 2*PublicOtherDelay},
+			},
+		},
+		{
+			name:  "quic-and-tcp-with-other",
+			addrs: []ma.Multiaddr{q1v1, t1, t1v6, wrtc1, wrtc1v6, onion1, onlyIP},
+			output: []network.AddrDelay{
+				{Addr: q1v1, Delay: 0},
+				{Addr: t1v6, Delay: PublicQUICDelay},
+				{Addr: t1, Delay: 2 * PublicQUICDelay},
+				{Addr: wrtc1, Delay: 2*PublicQUICDelay + PublicOtherDelay},
+				{Addr: wrtc1v6, Delay: 2*PublicQUICDelay + PublicOtherDelay},
+				{Addr: onlyIP, Delay: 2*PublicQUICDelay + PublicOtherDelay},
+				{Addr: onion1, Delay: 2*PublicQUICDelay + 2*PublicOtherDelay},
+			},
+		},
+		{
+			name:  "only-non-ip-addr",
+			addrs: []ma.Multiaddr{onion1},
+			output: []network.AddrDelay{
+				{Addr: onion1, Delay: PublicOtherDelay},
+			},
+		},
+	}
+	for _, tc := range testCase {
+		t.Run(tc.name, func(t *testing.T) {
+			res := DefaultDialRanker(tc.addrs)
+			if len(res) != len(tc.output) {
+				log.Error("expected elems, got", "elems", tc.output, "got", res)
+				t.Errorf("expected elems: %d got: %d", len(tc.output), len(res))
+				return
 			}
 			sortAddrDelays(res)
 			sortAddrDelays(tc.output)

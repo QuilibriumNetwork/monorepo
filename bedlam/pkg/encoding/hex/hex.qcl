@@ -1,0 +1,76 @@
+// -*- go -*-
+//
+// Copyright (c) 2023 Markku Rossi
+//
+// All rights reserved.
+//
+
+package hex
+
+import (
+	"math"
+)
+
+// Digits define the hexadecimal ASCII digits (0-9, a-f).
+var Digits = []byte{
+	0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+	0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66,
+}
+
+// DecodeString decodes the bytes represented by the hexadecimal
+// string s. The function returns also a boolean success value. The
+// success value is false if the input string length is not even or if
+// any of the runes in the input string are not valid hexadecimal
+// digits (0-9, a-f, A-F).
+func DecodeString(s string) ([]byte, bool) {
+	result := make([]byte, len(s)/2)
+
+	if len(s)%2 != 0 {
+		return result, false
+	}
+	var lo, hi int32
+	for i := 0; i < len(s); i += 2 {
+		hi = DigitToByte(rune(s[i]))
+		if hi > 0xff {
+			return result, false
+		}
+		lo = DigitToByte(rune(s[i+1]))
+		if lo > 0xff {
+			return result, false
+		}
+		result[i/2] = hi<<4 | lo
+	}
+	return result, true
+}
+
+// DigitToByte converts the hexadecimal digit r to its byte value. The
+// return value is math.MaxInt32 if the input digit is invalid.
+func DigitToByte(r rune) int32 {
+	if '0' <= r && r <= '9' {
+		return r - '0'
+	}
+	if 'a' <= r && r <= 'f' {
+		return r - 'a' + 10
+	}
+	if 'A' <= r && r <= 'F' {
+		return r - 'A' + 10
+	}
+	return math.MaxInt32
+}
+
+// EncodeToString returns a hexadecimal encoding of src.
+func EncodeToString(src []byte) string {
+	bytes := make([]byte, len(src)*2)
+
+	for i := 0; i < len(src); i++ {
+		bytes[i*2] = Digits[src[i]>>4]
+		bytes[i*2+1] = Digits[src[i]&0xf]
+	}
+	return string(bytes)
+}
+
+// EncodedLen returns the length of an encoding of n source
+// bytes. Specifically, this returns n * 2.
+func EncodedLen(n int) int {
+	return n * 2
+}

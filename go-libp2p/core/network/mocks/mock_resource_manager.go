@@ -10,6 +10,7 @@
 package mocknetwork
 
 import (
+	net "net"
 	reflect "reflect"
 
 	network "github.com/libp2p/go-libp2p/core/network"
@@ -23,6 +24,7 @@ import (
 type MockResourceManager struct {
 	ctrl     *gomock.Controller
 	recorder *MockResourceManagerMockRecorder
+	isgomock struct{}
 }
 
 // MockResourceManagerMockRecorder is the mock recorder for MockResourceManager.
@@ -57,34 +59,48 @@ func (mr *MockResourceManagerMockRecorder) Close() *gomock.Call {
 }
 
 // OpenConnection mocks base method.
-func (m *MockResourceManager) OpenConnection(arg0 network.Direction, arg1 bool, arg2 multiaddr.Multiaddr) (network.ConnManagementScope, error) {
+func (m *MockResourceManager) OpenConnection(dir network.Direction, usefd bool, endpoint multiaddr.Multiaddr) (network.ConnManagementScope, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "OpenConnection", arg0, arg1, arg2)
+	ret := m.ctrl.Call(m, "OpenConnection", dir, usefd, endpoint)
 	ret0, _ := ret[0].(network.ConnManagementScope)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // OpenConnection indicates an expected call of OpenConnection.
-func (mr *MockResourceManagerMockRecorder) OpenConnection(arg0, arg1, arg2 any) *gomock.Call {
+func (mr *MockResourceManagerMockRecorder) OpenConnection(dir, usefd, endpoint any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenConnection", reflect.TypeOf((*MockResourceManager)(nil).OpenConnection), arg0, arg1, arg2)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenConnection", reflect.TypeOf((*MockResourceManager)(nil).OpenConnection), dir, usefd, endpoint)
 }
 
 // OpenStream mocks base method.
-func (m *MockResourceManager) OpenStream(arg0 peer.ID, arg1 network.Direction) (network.StreamManagementScope, error) {
+func (m *MockResourceManager) OpenStream(p peer.ID, dir network.Direction) (network.StreamManagementScope, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "OpenStream", arg0, arg1)
+	ret := m.ctrl.Call(m, "OpenStream", p, dir)
 	ret0, _ := ret[0].(network.StreamManagementScope)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // OpenStream indicates an expected call of OpenStream.
-func (mr *MockResourceManagerMockRecorder) OpenStream(arg0, arg1 any) *gomock.Call {
+func (mr *MockResourceManagerMockRecorder) OpenStream(p, dir any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenStream", reflect.TypeOf((*MockResourceManager)(nil).OpenStream), arg0, arg1)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenStream", reflect.TypeOf((*MockResourceManager)(nil).OpenStream), p, dir)
 }
+																				
+// VerifySourceAddress mocks base method.															
+func (m *MockResourceManager) VerifySourceAddress(addr net.Addr) bool {												
+	m.ctrl.T.Helper()																	
+	ret := m.ctrl.Call(m, "VerifySourceAddress", addr)													
+	ret0, _ := ret[0].(bool)																
+	return ret0																		
+}																				
+																				
+// VerifySourceAddress indicates an expected call of VerifySourceAddress.											
+func (mr *MockResourceManagerMockRecorder) VerifySourceAddress(addr any) *gomock.Call {										
+	mr.mock.ctrl.T.Helper()																	
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "VerifySourceAddress", reflect.TypeOf((*MockResourceManager)(nil).VerifySourceAddress), addr)
+}																				
 
 // ViewPeer mocks base method.
 func (m *MockResourceManager) ViewPeer(arg0 peer.ID, arg1 func(network.PeerScope) error) error {

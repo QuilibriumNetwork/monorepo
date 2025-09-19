@@ -80,10 +80,12 @@ func TestBackoff_Update(t *testing.T) {
 	}
 
 	b.mu.Lock()
-	if len(b.info) != 2 {
-		t.Fatalf("pre-invalidation attempt, info map size mismatch, expected: %d, got: %d", 2, len(b.info))
-	}
+	infoLen := len(b.info)
 	b.mu.Unlock()
+
+	if infoLen != 2 {
+		t.Fatalf("pre-invalidation attempt, info map size mismatch, expected: %d, got: %d", 2, infoLen)
+	}
 }
 
 func TestBackoff_Clean(t *testing.T) {

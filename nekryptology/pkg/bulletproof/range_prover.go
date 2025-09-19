@@ -259,7 +259,7 @@ func (prover *RangeProver) Prove(v, gamma curves.Scalar, n int, proofGenerators 
 		return nil, errors.Wrap(err, "rangeproof prove")
 	}
 
-	wBytes := transcript.ExtractBytes([]byte("getw"), 64)
+	wBytes := transcript.ExtractBytes([]byte("getw"), 56)
 	w, err := prover.curve.NewScalar().SetBytesWide(wBytes)
 	if err != nil {
 		return nil, errors.Wrap(err, "rangeproof prove")
@@ -442,13 +442,13 @@ func calcyz(capV, capA, capS curves.Point, transcript *merlin.Transcript, curve 
 	transcript.AppendMessage([]byte("addV"), capV.ToAffineUncompressed())
 	transcript.AppendMessage([]byte("addcapA"), capA.ToAffineUncompressed())
 	transcript.AppendMessage([]byte("addcapS"), capS.ToAffineUncompressed())
-	// Read 64 bytes twice from, set to scalar for y and z
-	yBytes := transcript.ExtractBytes([]byte("gety"), 64)
+	// Read 56 bytes twice from, set to scalar for y and z
+	yBytes := transcript.ExtractBytes([]byte("gety"), 56)
 	y, err := curve.NewScalar().SetBytesWide(yBytes)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "calcyz NewScalar SetBytesWide")
 	}
-	zBytes := transcript.ExtractBytes([]byte("getz"), 64)
+	zBytes := transcript.ExtractBytes([]byte("getz"), 56)
 	z, err := curve.NewScalar().SetBytesWide(zBytes)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "calcyz NewScalar SetBytesWide")
@@ -465,8 +465,8 @@ func calcx(capT1, capT2 curves.Point, transcript *merlin.Transcript, curve curve
 	// Add the Tau1,2 values to transcript
 	transcript.AppendMessage([]byte("addcapT1"), capT1.ToAffineUncompressed())
 	transcript.AppendMessage([]byte("addcapT2"), capT2.ToAffineUncompressed())
-	// Read 64 bytes from, set to scalar
-	outBytes := transcript.ExtractBytes([]byte("getx"), 64)
+	// Read 56 bytes from, set to scalar
+	outBytes := transcript.ExtractBytes([]byte("getx"), 56)
 	x, err := curve.NewScalar().SetBytesWide(outBytes)
 	if err != nil {
 		return nil, errors.Wrap(err, "calcx NewScalar SetBytesWide")

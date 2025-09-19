@@ -1,38 +1,58 @@
-# Quilibrium - Solstice
-
-Quilibrium is a decentralized alternative to platform as a service providers.
-This release is part of the phases of the Dusk release, which finalizes with
-the full permissionless mainnet in version 2.0. Documentation for the
-underlying technology can be found at https://www.quilibrium.com/
+# Quilibrium - 2.1 - Serene
 
 ## Quick Start
 
-Running production nodes from source is no longer recommended given build complexity. Please refer to our release information to obtain the latest version.
+Running production nodes from source is no longer recommended given build
+complexity. Please refer to our release information to obtain the latest
+version.
 
 ## Running From Source
 
-Builds are now a hybrid of Rust and Go, so you will need both go 1.22 and latest Rust + Cargo.
+Ensure you have all required dependencies.
 
-### VDF
+### Ubuntu Linux
 
-The VDF implementation is now in Rust, and requires GMP to build. On Mac, you can install GMP with brew (`brew install gmp`). On Linux, you will need to find the appropriate package for your distro.
+For Ubuntu Linux, you can install these by running the following from
+the project root:
 
-Install the go plugin for uniffi-rs:
+    ./scripts/install-deps-ubuntu.sh
 
-    cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.1+v0.25.0
+### macOS
 
-Be sure to follow the PATH export given by the installer.
+Because Mac varies in terms of dependency management, we recommend
+installing Xcode for build toolchain, then use homebrew to install openssl.
+Other dependencies via homebrew are the dynamically linked version of the
+libraries, so we recommend manually fetching the required packages:
 
-Build the Rust VDF implementation by navigating to the vdf folder, and run `./generate.sh`.
+    curl https://gmplib.org/download/gmp/gmp-6.3.0.tar.xz > /tmp/gmp.tar.xz
+    pushd /tmp/
+    tar xvf gmp.tar.xz
+    pushd gmp-6.3.0
+    ./configure
+    make
+    make check
+    sudo make install
+    popd
+    git clone https://github.com/flintlib/flint.git
+    pushd flint
+    git checkout flint-3.0
+    ./bootstrap.sh
+    ./configure \
+        --prefix=/usr/local \
+        --with-gmp=/usr/local \
+        --with-mpfr=/usr/local \
+        --enable-static \
+        --disable-shared \
+        CFLAGS="-O3"
+    make
+    sudo make install
+    popd
+    popd
 
-### Node
+From there, you can trigger generation of all dependencies to build the node
+with:
 
-Because of the Rust interop, be sure you follow the above steps for the VDF before proceeding to this. Navigate to the node folder, and run (making sure to update the path for the repo):
-
-    CGO_LDFLAGS="-L/path/to/ceremonyclient/target/release -lvdf -ldl -lm" \
-        CGO_ENABLED=1 \
-        GOEXPERIMENT=arenas \
-        go run ./... --signature-check=false
+    task build_node_arm64_macos
 
 ## gRPC/REST Support
 
@@ -45,24 +65,114 @@ Please note: this interface, while read-only, is unauthenticated and not rate-
 limited. It is recommended that you only enable if you are properly controlling
 access via firewall or only query via localhost.
 
-## Token Balance
+## Prometheus Metrics
 
-In order to query the token balance of a running node, execute the following command from the `node/` folder:
+Quilibrium nodes expose comprehensive Prometheus metrics for monitoring and observability. The metrics are organized across several subsystems:
 
-    ./node-$version-$platform -balance
+### Disk Monitoring (`disk_monitor` namespace)
+Tracks disk usage and space metrics for the node's data directory.
 
-The accumulated token balance will be printed to stdout in QUILs.
+- `disk_monitor_usage_percentage` - Current disk usage percentage
+- `disk_monitor_total_bytes` - Total disk space in bytes
+- `disk_monitor_used_bytes` - Used disk space in bytes
+- `disk_monitor_free_bytes` - Free disk space in bytes
 
-Note that this feature requires that [gRPC support](#grpcrest-support) is enabled.
+### P2P Networking (`blossomsub` namespace)
+Monitors the BlossomSub peer-to-peer protocol performance.
 
-## Community Section
+- `blossomsub_*_total` - Various operation counters (add_peer, remove_peer, join, leave, graft, prune, etc.)
+- `blossomsub_*_messages` - Message count histograms for IHave, IWant, IDontWant messages
 
-This section contains community-built clients, applications, guides, etc <br /><br />
-<b>Disclaimer</b>: Because some of these may contain external links, do note that these are unofficial – every dependency added imparts risk, so if another project's github account were compromised, for example, it could lead people down a dangerous or costly path. Proceed with caution as always and refer to reliable members of the community for verification of links before clicking or connecting your wallets
+### Consensus Time Reel (`quilibrium.time_reel` subsystem)
+Tracks consensus timing, fork choice, and blockchain tree operations.
 
-### 1. The Q Guide - Beginners’ Guide
+- `frames_processed_total` - Total frames processed (by type and status)
+- `equivocations_detected_total` - Equivocation detection counter
+- `head_changes_total` - Blockchain head changes (advances vs reorganizations)
+- `reorganization_depth` - Depth histogram of blockchain reorganizations
+- `tree_depth` / `tree_node_count` - Current tree structure metrics
+- `fork_choice_evaluations_total` - Fork choice algorithm executions
 
-- A detailed beginners' guide for how to setup a Quilibrium Node, created by [@demipoet](https://www.github.com/demipoet) - [link](https://quilibrium.guide/)<br/>
+### Dynamic Fees (`quilibrium.dynamic_fees` subsystem)
+Monitors fee voting and calculation based on sliding window averages.
+
+- `fee_votes_added_total` / `fee_votes_dropped_total` - Fee vote tracking
+- `current_fee_multiplier` - Current calculated fee multiplier
+- `sliding_window_size` - Current number of votes in window
+- `fee_vote_distribution` - Distribution histogram of fee votes
+
+### Event Distribution (`quilibrium.event_distributor` subsystem)
+Tracks internal event processing and distribution.
+
+- `events_processed_total` - Events processed by type
+- `subscribers_count` - Current active subscribers
+- `broadcasts_total` - Event broadcast counter
+- `uptime_seconds` - Distributor uptime
+
+### Hypergraph State (`quilibrium.hypergraph` subsystem)
+The most comprehensive metrics tracking the CRDT hypergraph operations.
+
+#### Core Operations
+- `add_vertex_total` / `remove_vertex_total` - Vertex operations
+- `add_hyperedge_total` / `remove_hyperedge_total` - Hyperedge operations
+- `*_duration_seconds` - Operation timing histograms
+
+#### Lookups and Queries
+- `lookup_vertex_total` / `lookup_hyperedge_total` - Lookup counters
+- `get_vertex_total` / `get_hyperedge_total` - Get operation counters
+
+#### Transactions
+- `transaction_total` - Transaction counters by status
+- `commit_total` / `commit_duration_seconds` - Commit metrics
+
+#### Proofs
+- `traversal_proof_create_total` / `traversal_proof_verify_total` - Proof operations
+- `traversal_proof_duration_seconds` - Proof timing
+
+### Execution Intrinsics (`quilibrium.intrinsics` subsystem)
+Monitors the execution engine's intrinsic operations.
+
+- `materialize_total` / `materialize_duration_seconds` - State materialization
+- `invoke_step_total` / `invoke_step_errors_total` - Step execution
+- `commit_total` / `commit_errors_total` - State commits
+- `state_size_bytes` - Current state size by intrinsic type
+
+### gRPC Metrics
+Standard gRPC server and client metrics are automatically registered, including request duration, message sizes, and in-flight requests.
+
+### App Consensus Engine (`quilibrium.app_consensus` subsystem)
+Monitors shard-specific consensus operations for application shards.
+
+- `frames_processed_total` - Total frames processed (by app_address and status)
+- `frame_processing_duration_seconds` - Frame processing time
+- `frame_validation_total` - Frame validation results
+- `frame_proving_total` / `frame_proving_duration_seconds` - Frame proving metrics
+- `frame_publishing_total` / `frame_publishing_duration_seconds` - Frame publishing metrics
+- `transactions_collected_total` - Transactions collected for frames
+- `pending_messages_count` - Current pending message count
+- `executors_registered` - Current number of registered executors
+- `engine_state` - Current engine state (0=stopped through 7=stopping)
+- `current_difficulty` - Current mining difficulty
+- `current_frame_number` - Current frame number being processed
+- `time_since_last_proven_frame_seconds` - Time elapsed since last proven frame
+
+### Global Consensus Engine (`quilibrium.global_consensus` subsystem)
+Monitors global consensus operations across all shards.
+
+- `frames_processed_total` - Total global frames processed (by status)
+- `frame_processing_duration_seconds` - Global frame processing time
+- `frame_validation_total` - Global frame validation results
+- `frame_proving_total` / `frame_proving_duration_seconds` - Global frame proving metrics
+- `frame_publishing_total` / `frame_publishing_duration_seconds` - Global frame publishing metrics
+- `shard_commitments_collected` - Number of shard commitments collected
+- `shard_commitment_collection_duration_seconds` - Time to collect shard commitments
+- `executors_registered` - Current number of registered shard executors
+- `engine_state` - Current engine state (0=stopped through 7=stopping)
+- `current_difficulty` - Current global consensus difficulty
+- `current_frame_number` - Current global frame number
+- `time_since_last_proven_frame_seconds` - Time elapsed since last proven global frame
+- `global_coordination_total` / `global_coordination_duration_seconds` - Global coordination metrics
+- `state_summaries_aggregated` - Number of shard state summaries aggregated
 
 ## Development
 

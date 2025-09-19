@@ -1,6 +1,7 @@
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, error::Error, io::Read};
+use hex;
 
 use ed448_goldilocks_plus::{elliptic_curve::group::GroupEncoding, CompressedEdwardsY, EdwardsPoint, Scalar};
 use protocols::{doubleratchet::{DoubleRatchetParticipant, P2PChannelEnvelope}, tripleratchet::{PeerInfo, TripleRatchetParticipant}, x3dh};
@@ -39,7 +40,7 @@ pub struct TripleRatchetStateAndMessage {
     pub message: Vec<u8>,
 }
 
-pub fn sender_x3dh(sending_identity_private_key: &Vec<u8>, sending_ephemeral_private_key: &Vec<u8>, receiving_identity_key: &Vec<u8>, receiving_signed_pre_key: &Vec<u8>, session_key_length: usize) -> String {
+pub fn sender_x3dh(sending_identity_private_key: &Vec<u8>, sending_ephemeral_private_key: &Vec<u8>, receiving_identity_key: &Vec<u8>, receiving_signed_pre_key: &Vec<u8>, session_key_length: u64) -> String {
   if sending_identity_private_key.len() != 56 {
     return "invalid sending identity private key length".to_string();
   }
@@ -79,7 +80,7 @@ pub fn sender_x3dh(sending_identity_private_key: &Vec<u8>, sending_ephemeral_pri
   }
 }
 
-pub fn receiver_x3dh(sending_identity_private_key: &Vec<u8>, sending_signed_private_key: &Vec<u8>, receiving_identity_key: &Vec<u8>, receiving_ephemeral_key: &Vec<u8>, session_key_length: usize) -> String {
+pub fn receiver_x3dh(sending_identity_private_key: &Vec<u8>, sending_signed_private_key: &Vec<u8>, receiving_identity_key: &Vec<u8>, receiving_ephemeral_key: &Vec<u8>, session_key_length: u64) -> String {
   if sending_identity_private_key.len() != 56 {
     return "invalid sending identity private key length".to_string();
   }

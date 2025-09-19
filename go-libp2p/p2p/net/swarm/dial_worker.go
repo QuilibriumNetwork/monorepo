@@ -109,6 +109,8 @@ func newDialWorker(s *Swarm, p peer.ID, reqch <-chan dialRequest, cl Clock) *dia
 // The loop exits when w.reqch is closed.
 func (w *dialWorker) loop() {
 	w.wg.Add(1)
+	defer w.wg.Done()
+	defer w.s.limiter.clearAllPeerDials(w.peer)
 
 	// dq is used to pace dials to different addresses of the peer
 	dq := newDialQueue()
@@ -118,6 +120,7 @@ func (w *dialWorker) loop() {
 	startTime := w.cl.Now()
 	// dialTimer is the dialTimer used to trigger dials
 	dialTimer := w.cl.InstantTimer(startTime.Add(math.MaxInt64))
+	defer dialTimer.Stop()
 
 	timerRunning := true
 	// scheduleNextDial updates timer for triggering the next dial
@@ -159,11 +162,8 @@ loop:
 		case req, ok := <-w.reqch:
 			if !ok {
 				if w.s.metricsTracer != nil {
-					w.s.metricsTracer.DialCompleted(w.connected, totalDials)
+					w.s.metricsTracer.DialCompleted(w.connected, totalDials, time.Since(startTime))
 				}
-				w.wg.Done()
-				w.s.limiter.clearAllPeerDials(w.peer)
-				dialTimer.Stop()
 				return
 			}
 			// We have received a new request. If we do not have a suitable connection,
@@ -254,7 +254,7 @@ loop:
 						if simConnect, _, _ := network.GetSimultaneousConnect(ad.ctx); !simConnect {
 							ad.ctx = network.WithSimultaneousConnect(ad.ctx, isClient, reason)
 							// update the element in dq to use the simultaneous connect delay.
-							dq.Add(network.AddrDelay{
+							dq.UpdateOrAdd(network.AddrDelay{
 								Addr:  ad.addr,
 								Delay: addrDelay[string(ad.addr.Bytes())],
 							})
@@ -290,7 +290,7 @@ loop:
 				// spawn the dial
 				ad, ok := w.trackedDials[string(adelay.Addr.Bytes())]
 				if !ok {
-					log.Errorf("SWARM BUG: no entry for address %s in trackedDials", adelay.Addr)
+					log.Error("SWARM BUG: no entry for address in trackedDials", "addr", adelay.Addr)
 					continue
 				}
 				ad.dialed = true
@@ -317,7 +317,7 @@ loop:
 
 			ad, ok := w.trackedDials[string(res.Addr.Bytes())]
 			if !ok {
-				log.Errorf("SWARM BUG: no entry for address %s in trackedDials", res.Addr)
+				log.Error("SWARM BUG: no entry for address in trackedDials", "addr", res.Addr)
 				if res.Conn != nil {
 					res.Conn.Close()
 				}
@@ -330,7 +330,7 @@ loop:
 			if res.Kind == tpt.UpdateKindHandshakeProgressed {
 				// Only wait for public addresses to complete dialing since private dials
 				// are quick any way
-				if is, err := manet.IsPublicAddr(res.Addr); is && err == nil {
+				if isPubAddr, err := manet.IsPublicAddr(res.Addr); isPubAddr && err == nil {
 					ad.expectedTCPUpgradeTime = w.cl.Now().Add(PublicTCPDelay)
 				}
 				scheduleNextDial()
@@ -373,8 +373,8 @@ loop:
 				// for consistency with the old dialer behavior.
 				w.s.backf.AddBackoff(w.peer, res.Addr)
 			} else if res.Err == ErrDialRefusedBlackHole {
-				log.Errorf("SWARM BUG: unexpected ErrDialRefusedBlackHole while dialing peer %s to addr %s",
-					w.peer, res.Addr)
+				log.Error("SWARM BUG: unexpected ErrDialRefusedBlackHole while dialing peer to addr",
+					"peer", w.peer, "addr", res.Addr)
 			}
 
 			w.dispatchError(ad, res.Err)
@@ -436,12 +436,31 @@ type dialQueue struct {
 
 // newDialQueue returns a new dialQueue
 func newDialQueue() *dialQueue {
-	return &dialQueue{q: make([]network.AddrDelay, 0, 16)}
+	return &dialQueue{
+		q: make([]network.AddrDelay, 0, 16),
+	}
 }
 
-// Add adds adelay to the queue. If another element exists in the queue with
-// the same address, it replaces that element.
+// Add adds a new element to the dialQueue. To update an element use UpdateOrAdd.
 func (dq *dialQueue) Add(adelay network.AddrDelay) {
+	for i := dq.Len() - 1; i >= 0; i-- {
+		if dq.q[i].Delay <= adelay.Delay {
+			// insert at pos i+1
+			dq.q = append(dq.q, network.AddrDelay{}) // extend the slice
+			copy(dq.q[i+2:], dq.q[i+1:])
+			dq.q[i+1] = adelay
+			return
+		}
+	}
+	// insert at position 0
+	dq.q = append(dq.q, network.AddrDelay{}) // extend the slice
+	copy(dq.q[1:], dq.q[0:])
+	dq.q[0] = adelay
+}
+
+// UpdateOrAdd updates the elements with address adelay.Addr to the new delay
+// Useful when hole punching
+func (dq *dialQueue) UpdateOrAdd(adelay network.AddrDelay) {
 	for i := 0; i < dq.Len(); i++ {
 		if dq.q[i].Addr.Equal(adelay.Addr) {
 			if dq.q[i].Delay == adelay.Delay {
@@ -451,19 +470,9 @@ func (dq *dialQueue) Add(adelay network.AddrDelay) {
 			// remove the element
 			copy(dq.q[i:], dq.q[i+1:])
 			dq.q = dq.q[:len(dq.q)-1]
-			break
 		}
 	}
-
-	for i := 0; i < dq.Len(); i++ {
-		if dq.q[i].Delay > adelay.Delay {
-			dq.q = append(dq.q, network.AddrDelay{}) // extend the slice
-			copy(dq.q[i+1:], dq.q[i:])
-			dq.q[i] = adelay
-			return
-		}
-	}
-	dq.q = append(dq.q, adelay)
+	dq.Add(adelay)
 }
 
 // NextBatch returns all the elements in the queue with the highest priority

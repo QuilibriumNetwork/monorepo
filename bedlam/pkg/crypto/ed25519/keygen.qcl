@@ -1,0 +1,40 @@
+// -*- go -*-
+//
+// Copyright (c) 2021-2024 Markku Rossi
+//
+// Ed25519 key generation in QCL. This file is derived from Go's
+// crypto/ed25519 package. The original copyright notice follows:
+//
+// Copyright 2016 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// Package ed25519 implements the Ed25519 signature algorithm.
+package ed25519
+
+import (
+	"crypto/ed25519/internal/edwards25519"
+	"crypto/sha512"
+)
+
+// NewKeyFromSeed calculates a private key and a public key from a
+// seed. RFC 8032's private keys correspond to seeds in this package.
+func NewKeyFromSeed(seed [SeedSize]byte) (PublicKey, PrivateKey) {
+	digest := sha512.Sum512(seed)
+	digest[0] &= 248
+	digest[31] &= 127
+	digest[31] |= 64
+
+	var A edwards25519.ExtendedGroupElement
+	var hBytes [32]byte
+	copy(hBytes, digest)
+	edwards25519.GeScalarMultBase(&A, &hBytes)
+	var publicKeyBytes [32]byte
+	A.ToBytes(&publicKeyBytes)
+
+	var privateKey [64]byte
+	copy(privateKey, seed)
+	copy(privateKey[32:], publicKeyBytes)
+
+	return publicKeyBytes, privateKey
+}

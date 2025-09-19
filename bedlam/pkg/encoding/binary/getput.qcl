@@ -1,0 +1,85 @@
+// -*- go -*-
+//
+// Copyright (c) 2021-2024 Markku Rossi
+//
+// All rights reserved.
+//
+
+package binary
+
+// GetUint gets a MSB-encoded unsigned integer from the argument
+// buffer. The size of the result number is determined by the length
+// of the input buffer.
+func GetUint(d []byte) uint {
+	resultType := make(uint, len(d)*8)
+
+	var result resultType
+	for i := 0; i < len(d); i++ {
+		result <<= 8
+		result |= resultType(d[i])
+	}
+	return result
+}
+
+// PutUint puts the unsigned integer v to the buffer d starting from
+// the offset offset in MSB-order. The number of bytes encoded is
+// determined by the size of the input value v.
+func PutUint(d []byte, offset int, v uint) []byte {
+	bytes := size(v) / 8
+
+	for i := 0; i < bytes; i++ {
+		d[offset+bytes-1-i] = byte(v & 0xff)
+		v >>= 8
+	}
+	return d
+}
+
+// GetUint32 gets a MSB-encoded uint32 value from the argument buffer.
+func GetUint32(d []byte) uint32 {
+	return uint32(d[0])<<24 | uint32(d[1])<<16 | uint32(d[2])<<8 | uint32(d[3])
+}
+
+// PutUint32 puts the uint32 value v to the buffer d starting from the
+// offset offset in MSB-order.
+func PutUint32(d []byte, offset int, v uint32) []byte {
+	d[offset+0] = byte(v >> 24)
+	d[offset+1] = byte(v >> 16)
+	d[offset+2] = byte(v >> 8)
+	d[offset+3] = byte(v)
+	return d
+}
+
+// GetUint32 gets a LSB-encoded uint32 value from the argument buffer.
+func GetUint32LSB(d []byte) uint32 {
+	return uint32(d[0]) | uint32(d[1])<<8 | uint32(d[2])<<16 | uint32(d[3])<<24
+}
+
+// GetUint64 gets a MSB-encoded uint64 value from the argument buffer.
+func GetUint64(d []byte) uint64 {
+	return uint64(d[0])<<56 | uint64(d[1])<<48 |
+		uint64(d[2])<<40 | uint64(d[3])<<32 |
+		uint64(d[4])<<24 | uint64(d[5])<<16 |
+		uint64(d[6])<<8 | uint64(d[7])
+}
+
+// PutUint64 puts the uint64 value v to the buffer d starting from the
+// offset offset in MSB-order.
+func PutUint64(d []byte, offset int, v uint64) []byte {
+	d[offset+0] = byte(v >> 56)
+	d[offset+1] = byte(v >> 48)
+	d[offset+2] = byte(v >> 40)
+	d[offset+3] = byte(v >> 32)
+	d[offset+4] = byte(v >> 24)
+	d[offset+5] = byte(v >> 16)
+	d[offset+6] = byte(v >> 8)
+	d[offset+7] = byte(v)
+	return d
+}
+
+// GetUint64LSB gets a LSB-encoded uint64 value from the argument buffer.
+func GetUint64LSB(d []byte) uint64 {
+	return uint64(d[0]) | uint64(d[1])<<8 |
+		uint64(d[2])<<16 | uint64(d[3])<<24 |
+		uint64(d[4])<<32 | uint64(d[5])<<40 |
+		uint64(d[6])<<48 | uint64(d[7])<<56
+}

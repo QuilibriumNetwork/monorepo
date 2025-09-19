@@ -83,9 +83,10 @@ func (c *Conn) RemoteMultiaddr() ma.Multiaddr {
 		c.stream.Conn().RemotePeer().String(),
 	)
 	if err != nil {
-		panic(err)
+		log.Error("failed to create relay address:", "err", err)
+		return ma.Join(c.stream.Conn().RemoteMultiaddr(), circuitAddr)
 	}
-	return ma.Join(c.stream.Conn().RemoteMultiaddr(), relayAddr, circuitAddr)
+	return ma.Join(c.stream.Conn().RemoteMultiaddr(), relayAddr.Multiaddr(), circuitAddr)
 }
 
 func (c *Conn) LocalMultiaddr() ma.Multiaddr {
@@ -95,7 +96,7 @@ func (c *Conn) LocalMultiaddr() ma.Multiaddr {
 func (c *Conn) LocalAddr() net.Addr {
 	na, err := manet.ToNetAddr(c.stream.Conn().LocalMultiaddr())
 	if err != nil {
-		log.Error("failed to convert local multiaddr to net addr:", err)
+		log.Error("failed to convert local multiaddr to net addr:", "err", err)
 		return nil
 	}
 	return na
@@ -122,19 +123,20 @@ func (c *Conn) Stat() network.ConnStats {
 // implicitly because the connection manager closed the underlying relay connection.
 func (c *Conn) tagHop() {
 	c.client.mx.Lock()
+	defer c.client.mx.Unlock()
 
 	p := c.stream.Conn().RemotePeer()
 	c.client.hopCount[p]++
 	if c.client.hopCount[p] == 1 {
 		c.client.host.ConnManager().TagPeer(p, "relay-hop-stream", HopTagWeight)
 	}
-	c.client.mx.Unlock()
 }
 
 // untagHop removes the relay-hop-stream tag if necessary; it is invoked when a relayed connection
 // is closed.
 func (c *Conn) untagHop() {
 	c.client.mx.Lock()
+	defer c.client.mx.Unlock()
 
 	p := c.stream.Conn().RemotePeer()
 	c.client.hopCount[p]--
@@ -142,7 +144,6 @@ func (c *Conn) untagHop() {
 		c.client.host.ConnManager().UntagPeer(p, "relay-hop-stream")
 		delete(c.client.hopCount, p)
 	}
-	c.client.mx.Unlock()
 }
 
 type capableConnWithStat interface {

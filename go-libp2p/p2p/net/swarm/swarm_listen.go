@@ -3,6 +3,7 @@ package swarm
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/canonicallog"
@@ -12,13 +13,44 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
+type OrderedListener interface {
+	// Transports optionally implement this interface to indicate the relative
+	// ordering that listeners should be setup. Some transports may optionally
+	// make use of other listeners if they are setup. e.g. WebRTC may reuse the
+	// same UDP port as QUIC, but only when QUIC is setup first.
+	// lower values are setup first.
+	ListenOrder() int
+}
+
 // Listen sets up listeners for all of the given addresses.
 // It returns as long as we successfully listen on at least *one* address.
 func (s *Swarm) Listen(addrs ...ma.Multiaddr) error {
 	errs := make([]error, len(addrs))
 	var succeeded int
-	for i, a := range addrs {
-		if err := s.AddListenAddr(a); err != nil {
+
+	type addrAndListener struct {
+		addr ma.Multiaddr
+		lTpt transport.Transport
+	}
+	sortedAddrsAndTpts := make([]addrAndListener, 0, len(addrs))
+	for _, a := range addrs {
+		t := s.TransportForListening(a)
+		sortedAddrsAndTpts = append(sortedAddrsAndTpts, addrAndListener{addr: a, lTpt: t})
+	}
+	slices.SortFunc(sortedAddrsAndTpts, func(a, b addrAndListener) int {
+		aOrder := 0
+		bOrder := 0
+		if l, ok := a.lTpt.(OrderedListener); ok {
+			aOrder = l.ListenOrder()
+		}
+		if l, ok := b.lTpt.(OrderedListener); ok {
+			bOrder = l.ListenOrder()
+		}
+		return aOrder - bOrder
+	})
+
+	for i, a := range sortedAddrsAndTpts {
+		if err := s.AddListenAddr(a.addr); err != nil {
 			errs[i] = err
 		} else {
 			succeeded++
@@ -27,11 +59,11 @@ func (s *Swarm) Listen(addrs ...ma.Multiaddr) error {
 
 	for i, e := range errs {
 		if e != nil {
-			log.Warnw("listening failed", "on", addrs[i], "error", errs[i])
+			log.Warn("listening failed", "on", sortedAddrsAndTpts[i].addr, "err", errs[i])
 		}
 	}
 
-	if succeeded == 0 && len(addrs) > 0 {
+	if succeeded == 0 && len(sortedAddrsAndTpts) > 0 {
 		return fmt.Errorf("failed to listen on any addresses: %s", errs)
 	}
 
@@ -105,7 +137,7 @@ func (s *Swarm) AddListenAddr(a ma.Multiaddr) error {
 	})
 
 	go func() {
-		cleanup := func() {
+		defer func() {
 			s.listeners.Lock()
 			_, ok := s.listeners.m[list]
 			if ok {
@@ -116,7 +148,7 @@ func (s *Swarm) AddListenAddr(a ma.Multiaddr) error {
 
 			if ok {
 				list.Close()
-				log.Errorf("swarm listener unintentionally closed")
+				log.Error("swarm listener unintentionally closed")
 			}
 
 			// signal to our notifiees on listen close.
@@ -124,14 +156,13 @@ func (s *Swarm) AddListenAddr(a ma.Multiaddr) error {
 				n.ListenClose(s, maddr)
 			})
 			s.refs.Done()
-		}
+		}()
 		for {
 			c, err := list.Accept()
 			if err != nil {
 				if !errors.Is(err, transport.ErrListenerClosed) {
-					log.Errorf("swarm listener for %s accept error: %s", a, err)
+					log.Error("swarm listener accept error", "addr", a, "err", err)
 				}
-				cleanup()
 				return
 			}
 			canonicallog.LogPeerStatus(100, c.RemotePeer(), c.RemoteMultiaddr(), "connection_status", "established", "dir", "inbound")
@@ -139,22 +170,20 @@ func (s *Swarm) AddListenAddr(a ma.Multiaddr) error {
 				c = wrapWithMetrics(c, s.metricsTracer, time.Now(), network.DirInbound)
 			}
 
-			log.Debugf("swarm listener accepted connection: %s <-> %s", c.LocalMultiaddr(), c.RemoteMultiaddr())
+			log.Debug("swarm listener accepted connection", "local_multiaddr", c.LocalMultiaddr(), "remote_multiaddr", c.RemoteMultiaddr())
 			s.refs.Add(1)
 			go func() {
+				defer s.refs.Done()
 				_, err := s.addConn(c, network.DirInbound)
 				switch err {
 				case nil:
 				case ErrSwarmClosed:
 					// ignore.
-					s.refs.Done()
 					return
 				default:
-					log.Warnw("adding connection failed", "to", a, "error", err)
-					s.refs.Done()
+					log.Warn("adding connection failed", "to", a, "err", err)
 					return
 				}
-				s.refs.Done()
 			}()
 		}
 	}()

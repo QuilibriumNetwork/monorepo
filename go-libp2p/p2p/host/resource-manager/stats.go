@@ -177,9 +177,9 @@ func NewStatsTraceReporter() (StatsTraceReporter, error) {
 
 func (r StatsTraceReporter) ConsumeEvent(evt TraceEvt) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	r.consumeEventWithLabelSlice(evt, tags)
-	metricshelper.PutStringSlice(tags)
 }
 
 // Separate func so that we can test that this function does not allocate. The syncPool may allocate.

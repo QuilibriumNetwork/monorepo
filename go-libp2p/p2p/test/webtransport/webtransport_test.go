@@ -16,9 +16,6 @@ import (
 func extractCertHashes(addr ma.Multiaddr) []string {
 	var certHashesStr []string
 	ma.ForEach(addr, func(c ma.Component, e error) bool {
-		if e != nil {
-			return false
-		}
 		if c.Protocol().Code == ma.P_CERTHASH {
 			certHashesStr = append(certHashesStr, c.Value())
 		}
@@ -27,9 +24,9 @@ func extractCertHashes(addr ma.Multiaddr) []string {
 	return certHashesStr
 }
 
-func tStringCast(str string) ma.Multiaddr {
-	m, _ := ma.StringCast(str)
-	return m
+func tStringCast(s string) ma.Multiaddr {
+	st, _ := ma.StringCast(s)
+	return st
 }
 
 func TestDeterministicCertsAfterReboot(t *testing.T) {

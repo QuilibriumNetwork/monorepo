@@ -1,0 +1,17 @@
+// -*- go -*-
+
+package main
+
+import (
+	"crypto/sha512"
+)
+
+// @Hex
+// @Test 0 0 = 0xeb627442f972d3df69591b22d8a26eadb115c1c82a3e00767c45e3776906f2fb70e487f9282a5193777579954b84e881dbaa1832960e66039678b771b81a704e
+func main(g, e byte) []byte {
+	var data [129]byte
+	data[0] = 0x6d
+	data[1] = 0x74
+	data[2] = 0x72
+	return sha512.Sum512(data[:])
+}

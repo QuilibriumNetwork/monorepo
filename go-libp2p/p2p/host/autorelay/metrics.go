@@ -193,6 +193,7 @@ func (mt *metricsTracer) ReservationOpened(cnt int) {
 
 func (mt *metricsTracer) ReservationRequestFinished(isRefresh bool, err error) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	if isRefresh {
 		*tags = append(*tags, "refresh")
@@ -205,7 +206,6 @@ func (mt *metricsTracer) ReservationRequestFinished(isRefresh bool, err error) {
 	if !isRefresh && err == nil {
 		reservationsOpenedTotal.Inc()
 	}
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) RelayAddressUpdated() {
@@ -218,30 +218,27 @@ func (mt *metricsTracer) RelayAddressCount(cnt int) {
 
 func (mt *metricsTracer) CandidateChecked(supportsCircuitV2 bool) {
 	tags := metricshelper.GetStringSlice()
-
+	defer metricshelper.PutStringSlice(tags)
 	if supportsCircuitV2 {
 		*tags = append(*tags, "yes")
 	} else {
 		*tags = append(*tags, "no")
 	}
 	candidatesCircuitV2SupportTotal.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) CandidateAdded(cnt int) {
 	tags := metricshelper.GetStringSlice()
-
+	defer metricshelper.PutStringSlice(tags)
 	*tags = append(*tags, "added")
 	candidatesTotal.WithLabelValues(*tags...).Add(float64(cnt))
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) CandidateRemoved(cnt int) {
 	tags := metricshelper.GetStringSlice()
-
+	defer metricshelper.PutStringSlice(tags)
 	*tags = append(*tags, "removed")
 	candidatesTotal.WithLabelValues(*tags...).Add(float64(cnt))
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) CandidateLoopState(state candidateLoopState) {
@@ -250,6 +247,7 @@ func (mt *metricsTracer) CandidateLoopState(state candidateLoopState) {
 
 func (mt *metricsTracer) ScheduledWorkUpdated(scheduledWork *scheduledWorkTimes) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, "allowed peer source call")
 	scheduledWorkTime.WithLabelValues(*tags...).Set(float64(scheduledWork.nextAllowedCallToPeerSource.Unix()))
@@ -265,8 +263,6 @@ func (mt *metricsTracer) ScheduledWorkUpdated(scheduledWork *scheduledWorkTimes)
 
 	*tags = append(*tags, "old candidate check")
 	scheduledWorkTime.WithLabelValues(*tags...).Set(float64(scheduledWork.nextOldCandidateCheck.Unix()))
-
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) DesiredReservations(cnt int) {

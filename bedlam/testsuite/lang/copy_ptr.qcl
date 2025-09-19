@@ -1,0 +1,42 @@
+// -*- go -*-
+
+package main
+
+type FieldElement [2]int32
+
+var zero FieldElement
+
+func FeZero(fe *FieldElement) {
+	copy(fe[:], zero[:])
+}
+
+func FeOne(fe *FieldElement) {
+	FeZero(fe)
+	fe[0] = 1
+}
+
+func FeCopy(dst, src *FieldElement) {
+	copy(dst[:], src[:])
+}
+
+type ProjectiveGroupElement struct {
+	X, Y, Z FieldElement
+}
+
+func (p *ProjectiveGroupElement) Zero() {
+	FeZero(&p.X)
+	FeOne(&p.Y)
+	FeOne(&p.Z)
+}
+
+// @Test 0 0 = 2
+func main(a, b int32) int {
+	var pge ProjectiveGroupElement
+
+	pge.Zero()
+
+	var y FieldElement
+	FeCopy(&y, &pge.Y)
+
+	return pge.X[0] + y[0] + pge.Z[0]
+}

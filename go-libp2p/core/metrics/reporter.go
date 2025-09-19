@@ -2,6 +2,8 @@
 package metrics
 
 import (
+	"time"
+
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
@@ -28,4 +30,6 @@ type Reporter interface {
 	GetBandwidthTotals() Stats
 	GetBandwidthByPeer() map[peer.ID]Stats
 	GetBandwidthByProtocol() map[protocol.ID]Stats
+	Reset()
+	TrimIdle(since time.Time)
 }

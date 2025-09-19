@@ -20,7 +20,7 @@ import (
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/multiformats/go-multibase"
 	"github.com/multiformats/go-multihash"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 type connMultiaddrs struct {
@@ -33,8 +33,12 @@ func (c *connMultiaddrs) LocalMultiaddr() ma.Multiaddr  { return c.local }
 func (c *connMultiaddrs) RemoteMultiaddr() ma.Multiaddr { return c.remote }
 
 const (
-	candidateSetupTimeout         = 20 * time.Second
-	DefaultMaxInFlightConnections = 10
+	candidateSetupTimeout = 10 * time.Second
+	// This is higher than other transports(64) as there's no way to detect a peer that has gone away after
+	// sending the initial connection request message(STUN Binding request). Such peers take up a goroutine
+	// till connection timeout. As the number of handshakes in parallel is still guarded by the resource
+	// manager, this higher number is okay.
+	DefaultMaxInFlightConnections = 128
 )
 
 type listener struct {
@@ -118,7 +122,7 @@ func (l *listener) listen() {
 		candidate, err := l.mux.Accept(l.ctx)
 		if err != nil {
 			if l.ctx.Err() == nil {
-				log.Debugf("accepting candidate failed: %s", err)
+				log.Debug("accepting candidate failed", "error", err)
 			}
 			return
 		}
@@ -132,13 +136,13 @@ func (l *listener) listen() {
 			conn, err := l.handleCandidate(ctx, candidate)
 			if err != nil {
 				l.mux.RemoveConnByUfrag(candidate.Ufrag)
-				log.Debugf("could not accept connection: %s: %v", candidate.Ufrag, err)
+				log.Debug("could not accept connection", "ufrag", candidate.Ufrag, "error", err)
 				return
 			}
 
 			select {
-			case <-ctx.Done():
-				log.Warn("could not push connection: ctx done")
+			case <-l.ctx.Done():
+				log.Debug("dropping connection, listener closed")
 				conn.Close()
 			case l.acceptQueue <- conn:
 				// acceptQueue is an unbuffered channel, so this blocks until the connection is accepted.
@@ -153,10 +157,7 @@ func (l *listener) handleCandidate(ctx context.Context, candidate udpmux.Candida
 		return nil, err
 	}
 	if l.transport.gater != nil {
-		localAddr, _, err := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
-		if err != nil {
-			return nil, err
-		}
+		localAddr, _ := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
 		if !l.transport.gater.InterceptAccept(&connMultiaddrs{local: localAddr, remote: remoteMultiaddr}) {
 			// The connection attempt is rejected before we can send the client an error.
 			// This means that the connection attempt will time out.
@@ -252,7 +253,7 @@ func (l *listener) setupConnection(
 	if err != nil {
 		return nil, err
 	}
-	handshakeChannel := newStream(w.HandshakeDataChannel, rwc, func() {})
+	handshakeChannel := newStream(w.HandshakeDataChannel, rwc, maxSendMessageSize, nil)
 	// we do not yet know A's peer ID so accept any inbound
 	remotePubKey, err := l.transport.noiseHandshake(ctx, w.PeerConnection, handshakeChannel, "", crypto.SHA256, true)
 	if err != nil {
@@ -267,11 +268,7 @@ func (l *listener) setupConnection(
 		return nil, err
 	}
 
-	localMultiaddrWithoutCerthash, _, err := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
-	if err != nil {
-		return nil, err
-	}
-
+	localMultiaddrWithoutCerthash, _ := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
 	conn, err := newConnection(
 		network.DirInbound,
 		w.PeerConnection,
@@ -283,6 +280,7 @@ func (l *listener) setupConnection(
 		remotePubKey,
 		remoteMultiaddr,
 		w.IncomingDataChannels,
+		w.PeerConnectionClosedCh,
 	)
 	if err != nil {
 		return nil, err
@@ -331,26 +329,23 @@ func (l *listener) Multiaddr() ma.Multiaddr {
 // addOnConnectionStateChangeCallback adds the OnConnectionStateChange to the PeerConnection.
 // The channel returned here:
 // * is closed when the state changes to Connection
-// * receives an error when the state changes to Failed
-// * doesn't receive anything (nor is closed) when the state changes to Disconnected
+// * receives an error when the state changes to Failed or Closed or Disconnected
 func addOnConnectionStateChangeCallback(pc *webrtc.PeerConnection) <-chan error {
 	errC := make(chan error, 1)
 	var once sync.Once
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		switch state {
+	pc.OnConnectionStateChange(func(_ webrtc.PeerConnectionState) {
+		switch pc.ConnectionState() {
 		case webrtc.PeerConnectionStateConnected:
 			once.Do(func() { close(errC) })
-		case webrtc.PeerConnectionStateFailed:
+		// PeerConnectionStateFailed happens when we fail to negotiate the connection.
+		// PeerConnectionStateDisconnected happens when we disconnect immediately after connecting.
+		// PeerConnectionStateClosed happens when we close the peer connection locally, not when remote closes. We don't need
+		// to error in this case, but it's a no-op, so it doesn't hurt.
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateDisconnected:
 			once.Do(func() {
 				errC <- errors.New("peerconnection failed")
 				close(errC)
 			})
-		case webrtc.PeerConnectionStateDisconnected:
-			// the connection can move to a disconnected state and back to a connected state without ICE renegotiation.
-			// This could happen when underlying UDP packets are lost, and therefore the connection moves to the disconnected state.
-			// If the connection then receives packets on the connection, it can move back to the connected state.
-			// If no packets are received until the failed timeout is triggered, the connection moves to the failed state.
-			log.Warn("peerconnection disconnected")
 		}
 	})
 	return errC

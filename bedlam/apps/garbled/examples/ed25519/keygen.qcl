@@ -1,0 +1,105 @@
+// -*- go -*-
+
+// This example implements Ed25519 key generation. Both parties
+// provide 3 random arguments:
+//
+//	Seed  [32]byte
+//	Split [64]byte
+//	Mask  [64]byte
+//
+// The key generation seed is g.Seed^e.Seed. The generated private key
+// is split into two random shares:
+//
+//	Garbler's share  : privG = g.Split^e.Split
+//	Evaluator's share: privE = privG ^ priv
+//
+// Garbler's and evaluator's shares are masked with respective masks:
+//
+//	privGM = privG^g.Mask
+//	privEM = privE^e.Mask
+//
+// The key generation function returns pub, privGM, and privEM to both
+// parties. After the multiparty protocol completes, both Garbler and
+// Evaluator reveal their private key share:
+//
+//	privG = privGM^g.Mask
+//	privE = privEM^e.Mask
+//
+// The following commands run the key generation algorithm. Both
+// Evaluator and Garbler are started with 3 random arguments:
+//
+//	./garbled -stream -e -v -i 0x784db0ec4ca0cf5338249e6a09139109366dca1fac2838e5f0e5a46f0e191bae,0xd0da45d3c99e756da831d1e7d696eae3fa9fe39d3b1b2618c7ff997d17777989b5cf415b114298c8b10bed0f0eff118e43ab606ab01143151dff89171307dffa,0x44bf09357e19b1f96f9cf6d9e7d25a0e8dd62d6e0d4bba2bec4c59983c7dc84d1486677b6d8837746cd948c881913c36faeaee08e8309afac58be4757a1c544e
+//	./garbled -stream -v -i 0x57c0e59c20ac7d75ef7e3188fdd7f5876abee1cab394af8125acaca9760bb54c,0x76b42e6292f4a3dc339d208481abeb9a24e08127c7cd8dbde62abcddc0c0e6f7a0f740e756b44dae137f0e7ff8eae0ceb1a962c130fdcbe8cbee3e31ab55b8dc,0xeb83eb1f5203f5b752c96264a21ff4a27fa60cf2313f5f53c3fa96e0b52a2814b786e43a3af64b66291b5b29f432cb8d5a930e31f4e6f072a6d33b861b5b5f13 examples/ed25519/keygen.qcl
+//
+// The example values return the following results:
+//
+//	Result[0]: 8ae64963506002e267a59665e9a2e6f9348cc159be53747894478e182ece9fcb
+//	Result[1]: 4ded80ae09692306c9659307f522f5dba1d96e48cde9f4f6e22fb340629db76aa2bee5867d009e008b6fb85902273acda8910c9a740a788f70c28ca0a3093835
+//	Result[2]: cd5c37f4497fd56e236aa858442b3ff90f7a6401ee2186ea18d074fe93d8f9d18b582fa47a1ee0f0a9083ddd9e262b8f3c642dfad68f667f87dddd4bec80aca3
+//
+// The Garbler reveals its private key share by computing Result[1]^g.Mask:
+//
+//	4ded80ae09692306c9659307f522f5dba1d96e48cde9f4f6e22fb340629db76aa2bee5867d009e008b6fb85902273acda8910c9a740a788f70c28ca0a3093835
+//	^ eb83eb1f5203f5b752c96264a21ff4a27fa60cf2313f5f53c3fa96e0b52a2814b786e43a3af64b66291b5b29f432cb8d5a930e31f4e6f072a6d33b861b5b5f13
+//	= a66e6bb15b6ad6b19bacf163573d0179de7f62bafcd6aba521d525a0d7b79f7e153801bc47f6d566a274e370f615f140f20202ab80ec88fdd611b726b8526726
+//
+// And Evaluator does the same computation for its values: Result[2]^e.Mask:
+//
+//	cd5c37f4497fd56e236aa858442b3ff90f7a6401ee2186ea18d074fe93d8f9d18b582fa47a1ee0f0a9083ddd9e262b8f3c642dfad68f667f87dddd4bec80aca3
+//	^ 44bf09357e19b1f96f9cf6d9e7d25a0e8dd62d6e0d4bba2bec4c59983c7dc84d1486677b6d8837746cd948c881913c36faeaee08e8309afac58be4757a1c544e
+//	= 89e33ec1376664974cf65e81a3f965f782ac496fe36a3cc1f49c2d66afa5319c9fde48df1796d784c5d175151fb717b9c68ec3f23ebffc854256393e969cf8ed
+//
+// Now Garbler and Evaluator have their private key shares and public
+// key, but they do not know the full combined Ed25519 private
+// key. The private key shares can be used in the `sign.qcl' example
+// which computes the signature with the combined private key:
+//
+//	privG ^ privE = priv:
+//	priv: 2f8d55706c0cb226d75aafe2f4c4648e5cd32bd51fbc9764d54908c67812aee2
+//	      8ae64963506002e267a59665e9a2e6f9348cc159be53747894478e182ece9fcb
+//	pub : 8ae64963506002e267a59665e9a2e6f9348cc159be53747894478e182ece9fcb
+package main
+
+import (
+	"crypto/ed25519"
+)
+
+type Arguments struct {
+	Seed  [32]byte
+	Split [64]byte
+	Mask  [64]byte
+}
+
+func main(g, e Arguments) ([]byte, []byte, []byte) {
+	var seed [32]byte
+
+	// Construct seed from peer seeds.
+	for i := 0; i < len(seed); i++ {
+		seed[i] = g.Seed[i] ^ e.Seed[i]
+	}
+	pub, priv := ed25519.NewKeyFromSeed(seed)
+
+	// Garbler's private key share is random value, constructed from
+	// peer split values.
+	var privG [64]byte
+	for i := 0; i < len(privG); i++ {
+		privG[i] = g.Split[i] ^ e.Split[i]
+	}
+
+	// Evaluator's private key share is real private key, xor'ed with
+	// Garbler's private key share.
+	var privE [64]byte
+	for i := 0; i < len(privE); i++ {
+		privE[i] = priv[i] ^ privG[i]
+	}
+
+	// Mask private key shares.
+	for i := 0; i < len(privG); i++ {
+		privG[i] ^= g.Mask[i]
+	}
+	for i := 0; i < len(privE); i++ {
+		privE[i] ^= e.Mask[i]
+	}
+
+	return pub, privG, privE
+}

@@ -1,4 +1,7 @@
 namespace channel {
+    string sender_x3dh([ByRef] sequence<u8> sending_identity_private_key, [ByRef] sequence<u8> sending_ephemeral_private_key, [ByRef] sequence<u8> receiving_identity_key, [ByRef] sequence<u8> receiving_signed_pre_key, u64 session_key_length);
+    string receiver_x3dh([ByRef] sequence<u8> sending_identity_private_key, [ByRef] sequence<u8> sending_signed_private_key, [ByRef] sequence<u8> receiving_identity_key, [ByRef] sequence<u8> receiving_ephemeral_key, u64 session_key_length);
+
     string new_double_ratchet([ByRef] sequence<u8> session_key, [ByRef] sequence<u8> sending_header_key, [ByRef] sequence<u8> next_receiving_header_key, boolean is_sender, [ByRef] sequence<u8> sending_ephemeral_private_key, [ByRef] sequence<u8> receiving_ephemeral_key);
     DoubleRatchetStateAndEnvelope double_ratchet_encrypt(DoubleRatchetStateAndMessage ratchet_state_and_message);
     DoubleRatchetStateAndMessage double_ratchet_decrypt(DoubleRatchetStateAndEnvelope ratchet_state_and_envelope);

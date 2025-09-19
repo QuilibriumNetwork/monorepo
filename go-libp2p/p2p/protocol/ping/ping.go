@@ -10,21 +10,19 @@ import (
 	mrand "math/rand"
 	"time"
 
-	logging "github.com/ipfs/go-log/v2"
 	pool "github.com/libp2p/go-buffer-pool"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/peerstore"
-	"github.com/libp2p/go-libp2p/core/protocol"
-	mstream "github.com/multiformats/go-multistream"
+	logging "github.com/libp2p/go-libp2p/gologshim"
 )
 
 var log = logging.Logger("ping")
 
 const (
-	PingSize    = 32
-	pingTimeout = time.Second * 60
+	PingSize     = 32
+	pingTimeout  = 10 * time.Second
+	pingDuration = 30 * time.Second
 
 	ID = "/ipfs/ping/1.0.0"
 
@@ -43,21 +41,27 @@ func NewPingService(h host.Host) *PingService {
 
 func (p *PingService) PingHandler(s network.Stream) {
 	if err := s.Scope().SetService(ServiceName); err != nil {
-		log.Debugf("error attaching stream to ping service: %s", err)
+		log.Debug("error attaching stream to ping service", "err", err)
 		s.Reset()
 		return
 	}
 
 	if err := s.Scope().ReserveMemory(PingSize, network.ReservationPriorityAlways); err != nil {
-		log.Debugf("error reserving memory for ping stream: %s", err)
+		log.Debug("error reserving memory for ping stream", "err", err)
 		s.Reset()
 		return
 	}
+	defer s.Scope().ReleaseMemory(PingSize)
+
+	s.SetDeadline(time.Now().Add(pingDuration))
 
 	buf := pool.Get(PingSize)
+	defer pool.Put(buf)
 
 	errCh := make(chan error, 1)
+	defer close(errCh)
 	timer := time.NewTimer(pingTimeout)
+	defer timer.Stop()
 
 	go func() {
 		select {
@@ -65,7 +69,7 @@ func (p *PingService) PingHandler(s network.Stream) {
 			log.Debug("ping timeout")
 		case err, ok := <-errCh:
 			if ok {
-				log.Debug(err)
+				log.Debug("ping error", "err", err)
 			} else {
 				log.Error("ping loop failed without error")
 			}
@@ -77,22 +81,12 @@ func (p *PingService) PingHandler(s network.Stream) {
 		_, err := io.ReadFull(s, buf)
 		if err != nil {
 			errCh <- err
-
-			s.Scope().ReleaseMemory(PingSize)
-			pool.Put(buf)
-			close(errCh)
-			timer.Stop()
 			return
 		}
 
 		_, err = s.Write(buf)
 		if err != nil {
 			errCh <- err
-
-			s.Scope().ReleaseMemory(PingSize)
-			pool.Put(buf)
-			close(errCh)
-			timer.Stop()
 			return
 		}
 
@@ -117,16 +111,23 @@ func pingError(err error) chan Result {
 	return ch
 }
 
-func pingStream(ctx context.Context, ps peerstore.Peerstore, s network.Stream) <-chan Result {
+// Ping pings the remote peer until the context is canceled, returning a stream
+// of RTTs or errors.
+func Ping(ctx context.Context, h host.Host, p peer.ID) <-chan Result {
+	s, err := h.NewStream(network.WithAllowLimitedConn(ctx, "ping"), p, ID)
+	if err != nil {
+		return pingError(err)
+	}
+
 	if err := s.Scope().SetService(ServiceName); err != nil {
-		log.Debugf("error attaching stream to ping service: %s", err)
+		log.Debug("error attaching stream to ping service", "err", err)
 		s.Reset()
 		return pingError(err)
 	}
 
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
-		log.Errorf("failed to get cryptographic random: %s", err)
+		log.Error("failed to get cryptographic random", "err", err)
 		s.Reset()
 		return pingError(err)
 	}
@@ -136,32 +137,29 @@ func pingStream(ctx context.Context, ps peerstore.Peerstore, s network.Stream) <
 
 	out := make(chan Result)
 	go func() {
+		defer close(out)
+		defer cancel()
+
 		for ctx.Err() == nil {
 			var res Result
 			res.RTT, res.Error = ping(s, ra)
 
 			// canceled, ignore everything.
 			if ctx.Err() != nil {
-				close(out)
-				cancel()
 				return
 			}
 
 			// No error, record the RTT.
 			if res.Error == nil {
-				ps.RecordLatency(s.Conn().RemotePeer(), res.RTT)
+				h.Peerstore().RecordLatency(p, res.RTT)
 			}
 
 			select {
 			case out <- res:
 			case <-ctx.Done():
-				close(out)
-				cancel()
 				return
 			}
 		}
-		close(out)
-		cancel()
 	}()
 	context.AfterFunc(ctx, func() {
 		// forces the ping to abort.
@@ -171,94 +169,36 @@ func pingStream(ctx context.Context, ps peerstore.Peerstore, s network.Stream) <
 	return out
 }
 
-// PingConn pings the peer via the connection until the context is canceled, returning a stream
-// of RTTs or errors.
-func PingConn(ctx context.Context, ps peerstore.Peerstore, conn network.Conn) <-chan Result {
-	s, err := conn.NewStream(ctx)
-	if err != nil {
-		return pingError(err)
-	}
-	var selected protocol.ID
-	var errCh chan error = make(chan error, 1)
-	go func() {
-		var err error
-		selected, err = mstream.SelectOneOf([]protocol.ID{ID}, s)
-		select {
-		case <-ctx.Done():
-		case errCh <- err:
-		}
-	}()
-	select {
-	case <-ctx.Done():
-		_ = s.Reset()
-		return pingError(ctx.Err())
-	case err := <-errCh:
-		if err != nil {
-			_ = s.Reset()
-			return pingError(err)
-		}
-	}
-	if err := s.SetProtocol(selected); err != nil {
-		_ = s.Reset()
-		return pingError(err)
-	}
-	if err := ps.AddProtocols(conn.RemotePeer(), selected); err != nil {
-		_ = s.Reset()
-		return pingError(err)
-	}
-	return pingStream(ctx, ps, s)
-}
-
-// Ping pings the remote peer until the context is canceled, returning a stream
-// of RTTs or errors.
-func Ping(ctx context.Context, h host.Host, p peer.ID) <-chan Result {
-	s, err := h.NewStream(network.WithAllowLimitedConn(ctx, "ping"), p, ID)
-	if err != nil {
-		return pingError(err)
-	}
-	return pingStream(ctx, h.Peerstore(), s)
-}
-
 func ping(s network.Stream, randReader io.Reader) (time.Duration, error) {
 	if err := s.Scope().ReserveMemory(2*PingSize, network.ReservationPriorityAlways); err != nil {
-		log.Debugf("error reserving memory for ping stream: %s", err)
+		log.Debug("error reserving memory for ping stream", "err", err)
 		s.Reset()
 		return 0, err
 	}
+	defer s.Scope().ReleaseMemory(2 * PingSize)
 
 	buf := pool.Get(PingSize)
+	defer pool.Put(buf)
 
 	if _, err := io.ReadFull(randReader, buf); err != nil {
-		s.Scope().ReleaseMemory(2 * PingSize)
-		pool.Put(buf)
 		return 0, err
 	}
 
 	before := time.Now()
 	if _, err := s.Write(buf); err != nil {
-		s.Scope().ReleaseMemory(2 * PingSize)
-		pool.Put(buf)
 		return 0, err
 	}
 
 	rbuf := pool.Get(PingSize)
+	defer pool.Put(rbuf)
 
 	if _, err := io.ReadFull(s, rbuf); err != nil {
-		s.Scope().ReleaseMemory(2 * PingSize)
-		pool.Put(buf)
-		pool.Put(rbuf)
 		return 0, err
 	}
 
 	if !bytes.Equal(buf, rbuf) {
-		s.Scope().ReleaseMemory(2 * PingSize)
-		pool.Put(buf)
-		pool.Put(rbuf)
 		return 0, errors.New("ping packet was incorrect")
 	}
 
-	s.Scope().ReleaseMemory(2 * PingSize)
-	pool.Put(buf)
-	pool.Put(rbuf)
 	return time.Since(before), nil
 }

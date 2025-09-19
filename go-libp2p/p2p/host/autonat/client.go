@@ -41,18 +41,29 @@ func (c *client) DialBack(ctx context.Context, p peer.ID) error {
 	}
 
 	if err := s.Scope().SetService(ServiceName); err != nil {
-		log.Debugf("error attaching stream to autonat service: %s", err)
+		log.Debug("error attaching stream to autonat service", "err", err)
 		s.Reset()
 		return err
 	}
 
 	if err := s.Scope().ReserveMemory(maxMsgSize, network.ReservationPriorityAlways); err != nil {
-		log.Debugf("error reserving memory for autonat stream: %s", err)
+		log.Debug("error reserving memory for autonat stream", "err", err)
 		s.Reset()
 		return err
 	}
+	defer s.Scope().ReleaseMemory(maxMsgSize)
 
-	s.SetDeadline(time.Now().Add(streamTimeout))
+	deadline := time.Now().Add(streamTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok {
+		if ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+	}
+
+	s.SetDeadline(deadline)
+	// Might as well just reset the stream. Once we get to this point, we
+	// don't care about being nice.
+	defer s.Close()
 
 	r := pbio.NewDelimitedReader(s, maxMsgSize)
 	w := pbio.NewDelimitedWriter(s)
@@ -60,22 +71,16 @@ func (c *client) DialBack(ctx context.Context, p peer.ID) error {
 	req := newDialMessage(peer.AddrInfo{ID: c.h.ID(), Addrs: c.addrFunc()})
 	if err := w.WriteMsg(req); err != nil {
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMsgSize)
-		s.Close()
 		return err
 	}
 
 	var res pb.Message
 	if err := r.ReadMsg(&res); err != nil {
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMsgSize)
-		s.Close()
 		return err
 	}
 	if res.GetType() != pb.Message_DIAL_RESPONSE {
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMsgSize)
-		s.Close()
 		return fmt.Errorf("unexpected response: %s", res.GetType().String())
 	}
 
@@ -83,8 +88,6 @@ func (c *client) DialBack(ctx context.Context, p peer.ID) error {
 	if c.mt != nil {
 		c.mt.ReceivedDialResponse(status)
 	}
-	s.Scope().ReleaseMemory(maxMsgSize)
-	s.Close()
 	switch status {
 	case pb.Message_OK:
 		return nil

@@ -19,20 +19,20 @@ import (
 	p2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
 
-	logging "github.com/ipfs/go-log/v2"
+	logging "github.com/libp2p/go-libp2p/gologshim"
 	ma "github.com/multiformats/go-multiaddr"
 	mafmt "github.com/multiformats/go-multiaddr-fmt"
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/quic-go/quic-go"
 )
 
+const ListenOrder = 1
+
 var log = logging.Logger("quic-transport")
 
 var ErrHolePunching = errors.New("hole punching attempted; no active dial")
 
 var HolePunchTimeout = 5 * time.Second
-
-const errorCodeConnectionGating = 0x47415445 // GATE in ASCII
 
 // The Transport implements the tpt.Transport interface for QUIC connections.
 type transport struct {
@@ -50,7 +50,7 @@ type transport struct {
 	rnd   rand.Rand
 
 	connMx sync.Mutex
-	conns  map[quic.Connection]*conn
+	conns  map[*quic.Conn]*conn
 
 	listenersMu sync.Mutex
 	// map of UDPAddr as string to a virtualListeners
@@ -95,12 +95,16 @@ func NewTransport(key ic.PrivKey, connManager *quicreuse.ConnManager, psk pnet.P
 		connManager:  connManager,
 		gater:        gater,
 		rcmgr:        rcmgr,
-		conns:        make(map[quic.Connection]*conn),
+		conns:        make(map[*quic.Conn]*conn),
 		holePunching: make(map[holePunchKey]*activeHolePunch),
 		rnd:          *rand.New(rand.NewSource(time.Now().UnixNano())),
 
 		listeners: make(map[string][]*virtualListener),
 	}, nil
+}
+
+func (t *transport) ListenOrder() int {
+	return ListenOrder
 }
 
 // Dial dials a new QUIC connection
@@ -111,7 +115,7 @@ func (t *transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (_c
 
 	scope, err := t.rcmgr.OpenConnection(network.DirOutbound, false, raddr)
 	if err != nil {
-		log.Debugw("resource manager blocked outgoing connection", "peer", p, "addr", raddr, "error", err)
+		log.Debug("resource manager blocked outgoing connection", "peer", p, "addr", raddr, "err", err)
 		return nil, err
 	}
 
@@ -125,11 +129,12 @@ func (t *transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (_c
 
 func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p peer.ID, scope network.ConnManagementScope) (tpt.CapableConn, error) {
 	if err := scope.SetPeer(p); err != nil {
-		log.Debugw("resource manager blocked outgoing connection for peer", "peer", p, "addr", raddr, "error", err)
+		log.Debug("resource manager blocked outgoing connection for peer", "peer", p, "addr", raddr, "err", err)
 		return nil, err
 	}
 
 	tlsConf, keyCh := t.identity.ConfigForPeer(p)
+	ctx = quicreuse.WithAssociation(ctx, t)
 	pconn, err := t.connManager.DialQUIC(ctx, raddr, tlsConf, t.allowWindowIncrease)
 	if err != nil {
 		return nil, err
@@ -162,20 +167,20 @@ func (t *transport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p pee
 		remoteMultiaddr: raddr,
 	}
 	if t.gater != nil && !t.gater.InterceptSecured(network.DirOutbound, p, c) {
-		pconn.CloseWithError(errorCodeConnectionGating, "connection gated")
+		pconn.CloseWithError(quic.ApplicationErrorCode(network.ConnGated), "connection gated")
 		return nil, fmt.Errorf("secured connection gated")
 	}
 	t.addConn(pconn, c)
 	return c, nil
 }
 
-func (t *transport) addConn(conn quic.Connection, c *conn) {
+func (t *transport) addConn(conn *quic.Conn, c *conn) {
 	t.connMx.Lock()
 	t.conns[conn] = c
 	t.connMx.Unlock()
 }
 
-func (t *transport) removeConn(conn quic.Connection) {
+func (t *transport) removeConn(conn *quic.Conn) {
 	t.connMx.Lock()
 	delete(t.conns, conn)
 	t.connMx.Unlock()
@@ -190,19 +195,19 @@ func (t *transport) holePunch(ctx context.Context, raddr ma.Multiaddr, p peer.ID
 	if err != nil {
 		return nil, err
 	}
-	tr, err := t.connManager.TransportForDial(network, addr)
+	tr, err := t.connManager.TransportWithAssociationForDial(t, network, addr)
 	if err != nil {
 		return nil, err
 	}
+	defer tr.DecreaseCount()
 
 	ctx, cancel := context.WithTimeout(ctx, HolePunchTimeout)
+	defer cancel()
 
 	key := holePunchKey{addr: addr.String(), peer: p}
 	t.holePunchingMx.Lock()
 	if _, ok := t.holePunching[key]; ok {
 		t.holePunchingMx.Unlock()
-		tr.DecreaseCount()
-		cancel()
 		return nil, fmt.Errorf("already punching hole for %s", addr)
 	}
 	connCh := make(chan tpt.CapableConn, 1)
@@ -210,6 +215,11 @@ func (t *transport) holePunch(ctx context.Context, raddr ma.Multiaddr, p peer.ID
 	t.holePunchingMx.Unlock()
 
 	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 
 	payload := make([]byte, 64)
 	var punchErr error
@@ -242,11 +252,6 @@ loop:
 			t.holePunchingMx.Lock()
 			delete(t.holePunching, key)
 			t.holePunchingMx.Unlock()
-			tr.DecreaseCount()
-			cancel()
-			if timer != nil {
-				timer.Stop()
-			}
 			return c, nil
 		case <-timer.C:
 		case <-ctx.Done():
@@ -256,24 +261,14 @@ loop:
 	}
 	// we only arrive here if punchErr != nil
 	t.holePunchingMx.Lock()
+	defer func() {
+		delete(t.holePunching, key)
+		t.holePunchingMx.Unlock()
+	}()
 	select {
 	case c := <-t.holePunching[key].connCh:
-		tr.DecreaseCount()
-		cancel()
-		if timer != nil {
-			timer.Stop()
-		}
-		delete(t.holePunching, key)
-		t.holePunchingMx.Unlock()
 		return c, nil
 	default:
-		tr.DecreaseCount()
-		cancel()
-		if timer != nil {
-			timer.Stop()
-		}
-		delete(t.holePunching, key)
-		t.holePunchingMx.Unlock()
 		return nil, punchErr
 	}
 }
@@ -304,6 +299,7 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 	}
 
 	t.listenersMu.Lock()
+	defer t.listenersMu.Unlock()
 	listeners := t.listeners[udpAddr.String()]
 	var underlyingListener *listener
 	var acceptRunner *acceptLoopRunner
@@ -313,26 +309,23 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 		acceptRunner = listeners[0].acceptRunnner
 		// Make sure our underlying listener is listening on the specified QUIC version
 		if _, ok := underlyingListener.localMultiaddrs[version]; !ok {
-			t.listenersMu.Unlock()
 			return nil, fmt.Errorf("can't listen on quic version %v, underlying listener doesn't support it", version)
 		}
 	} else {
-		ln, err := t.connManager.ListenQUIC(addr, &tlsConf, t.allowWindowIncrease)
+		ln, err := t.connManager.ListenQUICAndAssociate(t, addr, &tlsConf, t.allowWindowIncrease)
 		if err != nil {
-			t.listenersMu.Unlock()
 			return nil, err
 		}
 		l, err := newListener(ln, t, t.localPeer, t.privKey, t.rcmgr)
 		if err != nil {
 			_ = ln.Close()
-			t.listenersMu.Unlock()
 			return nil, err
 		}
 		underlyingListener = &l
 
 		acceptRunner = &acceptLoopRunner{
 			acceptSem: make(chan struct{}, 1),
-			muxer:     make(map[quic.VersionNumber]chan acceptVal),
+			muxer:     make(map[quic.Version]chan acceptVal),
 		}
 	}
 
@@ -347,11 +340,11 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 
 	listeners = append(listeners, l)
 	t.listeners[udpAddr.String()] = listeners
-	t.listenersMu.Unlock()
+
 	return l, nil
 }
 
-func (t *transport) allowWindowIncrease(conn quic.Connection, size uint64) bool {
+func (t *transport) allowWindowIncrease(conn *quic.Conn, size uint64) bool {
 	// If the QUIC connection tries to increase the window before we've inserted it
 	// into our connections map (which we do right after dialing / accepting it),
 	// we have no way to account for that memory. This should be very rare.
@@ -385,6 +378,7 @@ func (t *transport) Close() error {
 
 func (t *transport) CloseVirtualListener(l *virtualListener) error {
 	t.listenersMu.Lock()
+	defer t.listenersMu.Unlock()
 
 	var err error
 	listeners := t.listeners[l.udpAddr]
@@ -392,7 +386,6 @@ func (t *transport) CloseVirtualListener(l *virtualListener) error {
 		// This is the last virtual listener here, so we can close the underlying listener
 		err = l.listener.Close()
 		delete(t.listeners, l.udpAddr)
-		t.listenersMu.Unlock()
 		return err
 	}
 
@@ -406,6 +399,6 @@ func (t *transport) CloseVirtualListener(l *virtualListener) error {
 		}
 	}
 
-	t.listenersMu.Unlock()
 	return nil
+
 }

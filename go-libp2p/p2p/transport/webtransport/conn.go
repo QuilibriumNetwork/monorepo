@@ -7,6 +7,7 @@ import (
 	tpt "github.com/libp2p/go-libp2p/core/transport"
 
 	ma "github.com/multiformats/go-multiaddr"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/webtransport-go"
 )
 
@@ -31,16 +32,18 @@ type conn struct {
 	session   *webtransport.Session
 
 	scope network.ConnManagementScope
+	qconn *quic.Conn
 }
 
 var _ tpt.CapableConn = &conn{}
 
-func newConn(tr *transport, sess *webtransport.Session, sconn *connSecurityMultiaddrs, scope network.ConnManagementScope) *conn {
+func newConn(tr *transport, sess *webtransport.Session, sconn *connSecurityMultiaddrs, scope network.ConnManagementScope, qconn *quic.Conn) *conn {
 	return &conn{
 		connSecurityMultiaddrs: sconn,
 		transport:              tr,
 		session:                sess,
 		scope:                  scope,
+		qconn:                  qconn,
 	}
 }
 
@@ -68,9 +71,15 @@ func (c *conn) allowWindowIncrease(size uint64) bool {
 // It must be called even if the peer closed the connection in order for
 // garbage collection to properly work in this package.
 func (c *conn) Close() error {
-	c.scope.Done()
-	c.transport.removeConn(c.session)
-	return c.session.CloseWithError(0, "")
+	defer c.scope.Done()
+	c.transport.removeConn(c.qconn)
+	err := c.session.CloseWithError(0, "")
+	_ = c.qconn.CloseWithError(1, "")
+	return err
+}
+
+func (c *conn) CloseWithError(_ network.ConnErrorCode) error {
+	return c.Close()
 }
 
 func (c *conn) IsClosed() bool           { return c.session.Context().Err() != nil }

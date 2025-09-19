@@ -212,9 +212,9 @@ type TraceEvt struct {
 
 func (t *trace) push(evt TraceEvt) {
 	t.mx.Lock()
+	defer t.mx.Unlock()
 
 	if t.done {
-		t.mx.Unlock()
 		return
 	}
 	evt.Time = time.Now().Format(time.RFC3339Nano)
@@ -229,13 +229,19 @@ func (t *trace) push(evt TraceEvt) {
 	if t.path != "" {
 		t.pendingWrites = append(t.pendingWrites, evt)
 	}
-	t.mx.Unlock()
 }
 
 func (t *trace) backgroundWriter(out io.WriteCloser) {
+	defer t.wg.Done()
+	defer out.Close()
+
 	gzOut := gzip.NewWriter(out)
+	defer gzOut.Close()
+
 	jsonOut := json.NewEncoder(gzOut)
+
 	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
 	var pend []interface{}
 
@@ -257,28 +263,18 @@ func (t *trace) backgroundWriter(out io.WriteCloser) {
 			}
 
 			if err := t.writeEvents(pend, jsonOut); err != nil {
-				log.Warnf("error writing rcmgr trace: %s", err)
+				log.Warn("error writing rcmgr trace", "err", err)
 				t.mx.Lock()
 				t.done = true
 				t.mx.Unlock()
-
-				ticker.Stop()
-				gzOut.Close()
-				out.Close()
-				t.wg.Done()
 				return
 			}
 
 			if err := gzOut.Flush(); err != nil {
-				log.Warnf("error flushing rcmgr trace: %s", err)
+				log.Warn("error flushing rcmgr trace", "err", err)
 				t.mx.Lock()
 				t.done = true
 				t.mx.Unlock()
-
-				ticker.Stop()
-				gzOut.Close()
-				out.Close()
-				t.wg.Done()
 				return
 			}
 
@@ -286,30 +282,18 @@ func (t *trace) backgroundWriter(out io.WriteCloser) {
 			getEvents()
 
 			if len(pend) == 0 {
-				ticker.Stop()
-				gzOut.Close()
-				out.Close()
-				t.wg.Done()
 				return
 			}
 
 			if err := t.writeEvents(pend, jsonOut); err != nil {
-				log.Warnf("error writing rcmgr trace: %s", err)
-				ticker.Stop()
-				gzOut.Close()
-				out.Close()
-				t.wg.Done()
+				log.Warn("error writing rcmgr trace", "err", err)
 				return
 			}
 
 			if err := gzOut.Flush(); err != nil {
-				log.Warnf("error flushing rcmgr trace: %s", err)
+				log.Warn("error flushing rcmgr trace", "err", err)
 			}
 
-			ticker.Stop()
-			gzOut.Close()
-			out.Close()
-			t.wg.Done()
 			return
 		}
 	}

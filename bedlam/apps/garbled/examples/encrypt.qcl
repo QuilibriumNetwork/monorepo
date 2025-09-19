@@ -1,0 +1,44 @@
+// -*- go -*-
+
+// Example how to encrypt fixed sized data with AES-128-GCM.
+//
+// Run the Evaluator with two inputs: evaluator's key and nonce shares:
+//
+//	./garbled -e -i 0x8cd98b88adab08d6d60fe57c8b8a33f3,0xfd5e0f8f155e7102aa526ad0 examples/encrypt.qcl
+//
+// The Garbler takes three arguments: the message to encrypt, and its
+// key and nonce shares:
+//
+//	./garbled -i 0x48656c6c6f2c20776f726c6421,0xed800b17b0c9d2334b249332155ddef5,0xa300751458c775a08762c2cd examples/encrypt.qcl
+package main
+
+import (
+	"crypto/cipher/gcm"
+)
+
+type Garbler struct {
+	msg        [64]byte
+	keyShare   [16]byte
+	nonceShare [12]byte
+}
+
+type Evaluator struct {
+	keyShare   [16]byte
+	nonceShare [12]byte
+}
+
+func main(g Garbler, e Evaluator) []byte {
+	var key [16]byte
+
+	for i := 0; i < len(key); i++ {
+		key[i] = g.keyShare[i] ^ e.keyShare[i]
+	}
+
+	var nonce [12]byte
+
+	for i := 0; i < len(nonce); i++ {
+		nonce[i] = g.nonceShare[i] ^ e.nonceShare[i]
+	}
+
+	return gcm.EncryptAES128(key, nonce, g.msg, []byte("unused"))
+}

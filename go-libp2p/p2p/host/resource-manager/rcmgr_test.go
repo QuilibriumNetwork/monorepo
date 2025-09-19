@@ -1,6 +1,7 @@
 package rcmgr
 
 import (
+	"net"
 	"net/netip"
 	"testing"
 
@@ -8,12 +9,18 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/test"
+	"github.com/libp2p/go-libp2p/x/rate"
 	"github.com/stretchr/testify/require"
 
 	"github.com/multiformats/go-multiaddr"
 )
 
-var dummyMA, _ = multiaddr.StringCast("/ip4/1.2.3.4/tcp/1234")
+func tStringCast(s string) multiaddr.Multiaddr {
+	st, _ := multiaddr.StringCast(s)
+	return st
+}
+
+var dummyMA = tStringCast("/ip4/1.2.3.4/tcp/1234")
 
 func TestResourceManager(t *testing.T) {
 	peerA := peer.ID("A")
@@ -1000,11 +1007,9 @@ func TestResourceManagerWithAllowlist(t *testing.T) {
 	baseLimit.Apply(limits.allowlistedTransient)
 	limits.allowlistedTransient = baseLimit
 
-	m1, _ := multiaddr.StringCast("/ip4/1.2.3.4")
-	m2, _ := multiaddr.StringCast("/ip4/4.3.2.1/p2p/" + peerA.String())
 	rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithAllowlistedMultiaddrs([]multiaddr.Multiaddr{
-		m1,
-		m2,
+		tStringCast("/ip4/1.2.3.4"),
+		tStringCast("/ip4/4.3.2.1/p2p/" + peerA.String()),
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -1016,17 +1021,14 @@ func TestResourceManagerWithAllowlist(t *testing.T) {
 		t.Fatal("Expected to be able to get the allowlist")
 	}
 
-	m3, _ := multiaddr.StringCast("/ip4/1.2.3.5")
-	m4, _ := multiaddr.StringCast("/ip4/1.2.3.4")
-
 	// A connection comes in from a non-allowlisted ip address
-	_, err = rcmgr.OpenConnection(network.DirInbound, true, m3)
+	_, err = rcmgr.OpenConnection(network.DirInbound, true, tStringCast("/ip4/1.2.3.5"))
 	if err == nil {
 		t.Fatalf("Expected this to fail. err=%v", err)
 	}
 
 	// A connection comes in from an allowlisted ip address
-	connScope, err := rcmgr.OpenConnection(network.DirInbound, true, m4)
+	connScope, err := rcmgr.OpenConnection(network.DirInbound, true, tStringCast("/ip4/1.2.3.4"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1036,11 +1038,8 @@ func TestResourceManagerWithAllowlist(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m5, _ := multiaddr.StringCast("/ip4/4.3.2.1")
-	m6, _ := multiaddr.StringCast("/ip4/4.3.2.1")
-
 	// A connection comes in that looks like it should be allowlisted, but then has the wrong peer id.
-	connScope, err = rcmgr.OpenConnection(network.DirInbound, true, m5)
+	connScope, err = rcmgr.OpenConnection(network.DirInbound, true, tStringCast("/ip4/4.3.2.1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1051,7 +1050,7 @@ func TestResourceManagerWithAllowlist(t *testing.T) {
 	}
 
 	// A connection comes in that looks like it should be allowlisted, and it has the allowlisted peer id
-	connScope, err = rcmgr.OpenConnection(network.DirInbound, true, m6)
+	connScope, err = rcmgr.OpenConnection(network.DirInbound, true, tStringCast("/ip4/4.3.2.1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1068,12 +1067,9 @@ func TestAllowlistAndConnLimiterPlayNice(t *testing.T) {
 	limits.allowlistedSystem.Conns = 8
 	limits.allowlistedSystem.ConnsInbound = 8
 	limits.allowlistedSystem.ConnsOutbound = 8
-	m1, _ := multiaddr.StringCast("/ip4/1.2.3.0/ipcidr/24")
-	m2, _ := multiaddr.StringCast("/ip6/1:2:3::/ipcidr/58")
-	m3, _ := multiaddr.StringCast("/ip4/1.2.3.0/ipcidr/24")
 	t.Run("IPv4", func(t *testing.T) {
 		rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithAllowlistedMultiaddrs([]multiaddr.Multiaddr{
-			m1,
+			tStringCast("/ip4/1.2.3.0/ipcidr/24"),
 		}), WithNetworkPrefixLimit([]NetworkPrefixLimit{}, []NetworkPrefixLimit{}))
 		if err != nil {
 			t.Fatal(err)
@@ -1088,7 +1084,7 @@ func TestAllowlistAndConnLimiterPlayNice(t *testing.T) {
 	})
 	t.Run("IPv6", func(t *testing.T) {
 		rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithAllowlistedMultiaddrs([]multiaddr.Multiaddr{
-			m2,
+			tStringCast("/ip6/1:2:3::/ipcidr/58"),
 		}), WithNetworkPrefixLimit([]NetworkPrefixLimit{}, []NetworkPrefixLimit{}))
 		if err != nil {
 			t.Fatal(err)
@@ -1104,7 +1100,7 @@ func TestAllowlistAndConnLimiterPlayNice(t *testing.T) {
 
 	t.Run("Does not override if you set a limit directly", func(t *testing.T) {
 		rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithAllowlistedMultiaddrs([]multiaddr.Multiaddr{
-			m3,
+			tStringCast("/ip4/1.2.3.0/ipcidr/24"),
 		}), WithNetworkPrefixLimit([]NetworkPrefixLimit{
 			{Network: netip.MustParsePrefix("1.2.3.0/24"), ConnCount: 1},
 		}, []NetworkPrefixLimit{}))
@@ -1121,4 +1117,64 @@ func TestAllowlistAndConnLimiterPlayNice(t *testing.T) {
 		// The connLimiter should use the limit we defined explicitly
 		require.Equal(t, 1, rcmgr.(*resourceManager).connLimiter.networkPrefixLimitV4[0].ConnCount)
 	})
+}
+
+func TestResourceManagerRateLimiting(t *testing.T) {
+	// Create a resource manager with very low rate limits
+	limits := DefaultLimits.AutoScale()
+	limits.system.Conns = 100 // High enough to not be the limiting factor
+	limits.transient.Conns = 100
+
+	// Create limiters with very low RPS
+	limiter := &rate.Limiter{
+		GlobalLimit: rate.Limit{RPS: 0.00001, Burst: 2},
+	}
+
+	rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithConnRateLimiters(limiter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rcmgr.Close()
+
+	addr := tStringCast("/ip4/1.2.3.4")
+
+	connScope, err := rcmgr.OpenConnection(network.DirInbound, true, addr)
+	require.NoError(t, err)
+	connScope.Done()
+
+	connScope, err = rcmgr.OpenConnection(network.DirInbound, true, addr)
+	require.NoError(t, err)
+	connScope.Done()
+
+	_, err = rcmgr.OpenConnection(network.DirInbound, true, addr)
+	require.ErrorContains(t, err, "rate limit exceeded")
+}
+
+func TestVerifySourceAddressRateLimiter(t *testing.T) {
+	limits := DefaultLimits.AutoScale()
+	limits.allowlistedSystem.Conns = 100
+	limits.allowlistedSystem.ConnsInbound = 100
+	limits.allowlistedSystem.ConnsOutbound = 100
+
+	rcmgr, err := NewResourceManager(NewFixedLimiter(limits), WithLimitPerSubnet([]ConnLimitPerSubnet{
+		{PrefixLength: 32, ConnCount: 2},
+	}, []ConnLimitPerSubnet{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rcmgr.Close()
+
+	na1 := &net.UDPAddr{
+		IP:   net.ParseIP("1.2.3.4"),
+		Port: 1234,
+	}
+	require.False(t, rcmgr.VerifySourceAddress(na1))
+	require.True(t, rcmgr.VerifySourceAddress(na1))
+
+	na2 := &net.UDPAddr{
+		IP:   net.ParseIP("1.2.3.5"),
+		Port: 1234,
+	}
+	require.False(t, rcmgr.VerifySourceAddress(na2))
+	require.True(t, rcmgr.VerifySourceAddress(na2))
 }

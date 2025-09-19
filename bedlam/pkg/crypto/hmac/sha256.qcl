@@ -1,0 +1,45 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2024 Markku Rossi
+//
+// All rights reserved.
+//
+
+package hmac
+
+import (
+	"crypto/sha256"
+)
+
+// SumSHA256 computes the HMAC-SHA256 signature for the data using the
+// key.
+func SumSHA256(data, key []byte) [sha256.Size]byte {
+	if len(key) > sha256.BlockSize {
+		key = sha256.Sum256(key[:])
+	}
+
+	var ipad [sha256.BlockSize]byte
+	var opad [sha256.BlockSize]byte
+
+	copy(ipad, key)
+	copy(opad, key)
+
+	for i := 0; i < len(ipad); i++ {
+		ipad[i] ^= 0x36
+	}
+	for i := 0; i < len(opad); i++ {
+		opad[i] ^= 0x5c
+	}
+
+	var idata [len(ipad) + len(data)]byte
+	copy(idata, ipad)
+	copy(idata[len(ipad):], data)
+
+	idigest := sha256.Sum256(idata[:])
+
+	var odata [len(opad) + len(idigest)]byte
+	copy(odata, opad)
+	copy(odata[len(opad):], idigest)
+
+	return sha256.Sum256(odata[:])
+}

@@ -1,0 +1,18 @@
+// -*- go -*-
+
+package main
+
+// @Test 1 7 = 1 7
+// @Test 7 1 = 1 7
+func main(a, b int32) (int, int) {
+	min, max := minMax(a, b)
+	return min, max
+}
+
+func minMax(a, b int) (int, int) {
+	if a < b {
+		return a, b
+	} else {
+		return b, a
+	}
+}

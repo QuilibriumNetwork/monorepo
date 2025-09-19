@@ -3,6 +3,7 @@ package pnet
 import (
 	"crypto/cipher"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"net"
 
@@ -33,7 +34,7 @@ func (c *pskConn) Read(out []byte) (int, error) {
 		nonce := make([]byte, 24)
 		_, err := io.ReadFull(c.Conn, nonce)
 		if err != nil {
-			return 0, errShortNonce
+			return 0, fmt.Errorf("%w: %w", errShortNonce, err)
 		}
 		c.readS20 = salsa20.New(c.psk, nonce)
 	}
@@ -60,12 +61,11 @@ func (c *pskConn) Write(in []byte) (int, error) {
 		c.writeS20 = salsa20.New(c.psk, nonce)
 	}
 	out := pool.Get(len(in))
+	defer pool.Put(out)
 
 	c.writeS20.XORKeyStream(out, in) // encrypt
 
-	n, err := c.Conn.Write(out)
-	pool.Put(out)
-	return n, err // send
+	return c.Conn.Write(out) // send
 }
 
 var _ net.Conn = (*pskConn)(nil)

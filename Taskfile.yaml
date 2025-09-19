@@ -10,7 +10,7 @@ env:
 
 vars:
   VERSION:
-    sh: cat node/config/version.go | grep -A 1 "func GetVersion() \[\]byte {" | grep -Eo '0x[0-9a-fA-F]+' | xargs printf "%d.%d.%d"
+    sh: cat config/version.go | grep -A 1 "func GetVersion() \[\]byte {" | grep -Eo '0x[0-9a-fA-F]+' | xargs printf "%d.%d.%d"
   GIT_REPO:
     sh: git config --get remote.origin.url | sed 's/\.git$//'
   GIT_BRANCH:
@@ -37,6 +37,10 @@ tasks:
       - vdf/generate.sh
       - bls48581/generate.sh
       - verenc/generate.sh
+      - bulletproofs/generate.sh
+      - ferret/generate.sh
+      - channel/generate.sh
+      - rpm/generate.sh
       - node/build.sh -o build/arm64_macos/node
 
   build_qclient_arm64_macos:
@@ -44,6 +48,11 @@ tasks:
     cmds:
       - vdf/generate.sh
       - bls48581/generate.sh
+      - verenc/generate.sh
+      - bulletproofs/generate.sh
+      - ferret/generate.sh
+      - channel/generate.sh
+      - rpm/generate.sh
       - client/build.sh -o build/arm64_macos/qclient
 
   build_node_arm64_linux:
@@ -67,9 +76,34 @@ tasks:
       - docker build --platform linux/amd64 -f Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
 
   build_qclient_amd64_linux:
-    desc: Build the QClient node binary for AMD64 Linux. Outputs to node/build.
+    desc: Build the QClient node binary for AMD64 Linux. Outputs to client/build.
     cmds:
       - docker build --platform linux/amd64 -f Dockerfile.source --output client/build/amd64_linux --target=qclient .
+
+  build_qclient_amd64_avx512_linux:
+    desc: Build the QClient node binary for AMD64 Linux with AVX-512 extensions. Outputs to client/build.
+    cmds:
+      - docker build --platform linux/amd64 -f Dockerfile.sourceavx512 --output client/build/amd64_avx512_linux --target=qclient .
+
+  build_vdf_perf_analysis_amd64_linux:
+    cmds:
+      - docker build --platform linux/amd64 -f Dockerfile.vdf.source --output vdf/build/amd64_linux --target=vdf  --progress=plain --no-cache .
+
+  build_vdf_perf_analysis_amd64_avx512_linux:
+    cmds:
+      - docker build --platform linux/amd64 -f Dockerfile.vdf.sourceavx512 --output vdf/build/amd64_avx512_linux --target=vdf-avx512 .
+
+  build_vdf_perf_analysis_amd64_zen3_linux:
+    cmds:
+      - docker build --platform linux/amd64 -f Dockerfile.vdf.sourcezen3 --output vdf/build/amd64_zen3_linux --target=vdf-zen3 --progress=plain --no-cache .
+
+  build_vdf_perf_analysis_amd64_zen4_linux:
+    cmds:
+      - docker build --platform linux/amd64 -f Dockerfile.vdf.sourcezen4 --output vdf/build/amd64_zen4_linux --target=vdf-zen4 --progress=plain --no-cache .
+  
+  build_vdf_perf_analysis_arm64_linux:
+    cmds:
+      - docker build --platform linux/arm64 -f Dockerfile.vdf.source --output vdf/build/arm64_linux --target=vdf --progress=plain --no-cache .
 
   build:source:
     desc: Build the Quilibrium docker image from source.
@@ -124,3 +158,8 @@ tasks:
     cmds:
       - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}
       - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:latest
+
+  test:qclient:
+    desc: Test the Quilibrium docker image.
+    cmds:
+      - client/test/run_tests.sh -d 'ubuntu' -v '24.04'

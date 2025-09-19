@@ -1,0 +1,20 @@
+// -*- go -*-
+
+package main
+
+import (
+	"crypto/hmac"
+)
+
+// Test vectors from RFC-2202.
+
+// @Hex
+// @pprof
+// @LSB
+// @Test 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b 0x4869205468657265 = 0xb617318655057264e28bc0b6fb378c8ef146be00
+// @Test 0x4a656665 0x7768617420646f2079612077616e7420666f72206e6f7468696e673f = 0xeffcdf6ae5eb2fa2d27416d5f184df9c259a7c79
+// @Test 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd = 0x125d7342b9ac11cd91a39af48aa17b4f63f175d3
+// @Test 0x0102030405060708090a0b0c0d0e0f10111213141516171819 0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd = 0x4c9007f4026250c6bc8414f9bf50c86c2d7235da
+func main(key, data []byte) []byte {
+	return hmac.SumSHA1(data, key)
+}

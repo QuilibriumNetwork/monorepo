@@ -79,7 +79,7 @@ func TestDialAddressSelection(t *testing.T) {
 	s, err := swarm.NewSwarm("local", nil, eventbus.NewBus())
 	require.NoError(t, err)
 
-	tcpTr, err := tcp.NewTCPTransport(nil, nil)
+	tcpTr, err := tcp.NewTCPTransport(nil, nil, nil)
 	require.NoError(t, err)
 	require.NoError(t, s.AddTransport(tcpTr))
 	reuse, err := quicreuse.NewConnManager(quic.StatelessResetKey{}, quic.TokenGeneratorKey{})
@@ -100,17 +100,10 @@ func TestDialAddressSelection(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.AddTransport(circuitTr))
 
-	m1, _ := ma.StringCast("/ip4/127.0.0.1/tcp/1234")
-	m2, _ := ma.StringCast("/ip4/127.0.0.1/udp/1234/quic-v1")
-	m3, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/1234/quic/p2p-circuit/p2p/%s", id))
-	m4, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/%s", certHash))
-	m5, _ := ma.StringCast("/ip4/1.2.3.4")
-	m6, _ := ma.StringCast("/ip4/1.2.3.4/tcp/443/ws")
-
-	require.Equal(t, tcpTr, s.TransportForDialing(m1))
-	require.Equal(t, quicTr, s.TransportForDialing(m2))
-	require.Equal(t, circuitTr, s.TransportForDialing(m3))
-	require.Equal(t, webtransportTr, s.TransportForDialing(m4))
-	require.Nil(t, s.TransportForDialing(m5))
-	require.Nil(t, s.TransportForDialing(m6))
+	require.Equal(t, tcpTr, s.TransportForDialing(tStringCast("/ip4/127.0.0.1/tcp/1234")))
+	require.Equal(t, quicTr, s.TransportForDialing(tStringCast("/ip4/127.0.0.1/udp/1234/quic-v1")))
+	require.Equal(t, circuitTr, s.TransportForDialing(tStringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/1234/quic/p2p-circuit/p2p/%s", id))))
+	require.Equal(t, webtransportTr, s.TransportForDialing(tStringCast(fmt.Sprintf("/ip4/127.0.0.1/udp/1234/quic-v1/webtransport/certhash/%s", certHash))))
+	require.Nil(t, s.TransportForDialing(tStringCast("/ip4/1.2.3.4")))
+	require.Nil(t, s.TransportForDialing(tStringCast("/ip4/1.2.3.4/tcp/443/ws")))
 }

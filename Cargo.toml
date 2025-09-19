@@ -16,11 +16,16 @@ members = [
     "crates/vdf",
     "crates/channel",
     "crates/channel-wasm",
+    "crates/bulletproofs-wasm",
+    "crates/bls48581-wasm",
+    "crates/verenc-wasm",
     "crates/classgroup",
     "crates/bls48581",
     "crates/ed448-rust",
     "crates/rpm",
+    "crates/bulletproofs",
     "crates/verenc",
+    "crates/ferret"
 ]
 
 [profile.release]

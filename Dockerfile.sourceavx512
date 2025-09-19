@@ -1,6 +1,10 @@
-FROM ubuntu:24.04 as build-base
+# syntax=docker.io/docker/dockerfile:1.7-labs
+FROM --platform=${TARGETPLATFORM} ubuntu:24.04 AS base-avx512
 
 ENV PATH="${PATH}:/root/.cargo/bin/"
+
+ARG TARGETOS
+ARG TARGETARCH
 
 # Install GMP 6.2 (6.3 which MacOS is using only available on Debian unstable)
 RUN apt-get update && apt-get install -y \
@@ -20,8 +24,12 @@ RUN apt-get update && apt-get install -y \
     autoconf \
     automake \
     libtool \
+    libssl-dev \
+    python3 \
+    python-is-python3 \
     && rm -rf /var/lib/apt/lists/*
 
+ARG GO_VERSION=1.23.5
 RUN apt update && apt install -y wget && \
     ARCH=$(dpkg --print-architecture) && \
     case ${ARCH} in \
@@ -29,10 +37,10 @@ RUN apt update && apt install -y wget && \
         arm64) GOARCH=arm64 ;; \
         *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
     esac && \
-    wget https://go.dev/dl/go1.22.0.linux-${GOARCH}.tar.gz && \
+    wget https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz && \
     rm -rf /usr/local/go && \
-    tar -C /usr/local -xzf go1.22.0.linux-${GOARCH}.tar.gz && \
-    rm go1.22.0.linux-${GOARCH}.tar.gz
+    tar -C /usr/local -xzf go${GO_VERSION}.linux-${GOARCH}.tar.gz && \
+    rm go${GO_VERSION}.linux-${GOARCH}.tar.gz
 
 ENV PATH=$PATH:/usr/local/go/bin
 
@@ -45,7 +53,7 @@ RUN git clone https://github.com/flintlib/flint.git && \
         --prefix=/usr/local \
         --with-gmp=/usr/local \
         --with-mpfr=/usr/local \
-	--enable-avx512 \
+	      --enable-avx512 \
         --enable-static \
         --disable-shared \
         CFLAGS="-march=skylake-avx512 -mtune=skylake-avx512 -O3" && \
@@ -61,43 +69,116 @@ RUN /opt/rustup-init.sh -y --profile minimal
 # Install uniffi-bindgen-go
 RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.1+v0.25.0
 
-FROM build-base as build
+FROM base-avx512 AS build-avx512
 
 ENV GOEXPERIMENT=arenas
 ENV QUILIBRIUM_SIGNATURE_CHECK=false
 
+# Install grpcurl before building the node and client 
+# as to avoid needing to redo it on rebuilds
+RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+
 WORKDIR /opt/ceremonyclient
 
-COPY . .
+# Copy everything except node and client so as to avoid 
+# invalidating the cache at this point on client or node rebuilds
+
+COPY --exclude=node \
+    --exclude=client \
+    --exclude=sidecar . .
+
+RUN python emp-install.py --install --tool --ot
+
+ENV CFLAGS="-march=skylake-avx512 -mtune=skylake-avx512"
+RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
+
+RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
+
+RUN go mod download
+    
+## Generate Rust bindings for channel
+WORKDIR /opt/ceremonyclient/channel
+
+RUN go mod download
+    
+RUN ./generate.sh
+        
 
 ## Generate Rust bindings for VDF
 WORKDIR /opt/ceremonyclient/vdf
+
+RUN go mod download
+
+RUN ./generate.sh
+
+## Generate Rust bindings for Ferret
+WORKDIR /opt/ceremonyclient/ferret
+
+RUN go mod download
+
 RUN ./generate.sh
 
 ## Generate Rust bindings for BLS48581
 WORKDIR /opt/ceremonyclient/bls48581
+
+RUN go mod download
+
 RUN ./generate.sh
 
+## Generate Rust bindings for VerEnc
+WORKDIR /opt/ceremonyclient/verenc
+
+RUN go mod download
+
+RUN ./generate.sh
+
+## Generate Rust bindings for Bulletproofs
+WORKDIR /opt/ceremonyclient/bulletproofs
+
+RUN go mod download
+
+RUN ./generate.sh
+
+FROM build-avx512 AS build-node-avx512
+
 # Build and install the node
+COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
 
 RUN ./build.sh && cp node /usr/bin
-RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 
+FROM build-avx512 AS build-qclient-avx512
+ARG TARGETOS
+ARG TARGETARCH
 # Build and install qclient
+COPY ./node /opt/ceremonyclient/node
+
+WORKDIR /opt/ceremonyclient/node
+
+RUN go mod download
+
+COPY ./client /opt/ceremonyclient/client
 WORKDIR /opt/ceremonyclient/client
 
-RUN ./build.sh -o qclient && cp qclient /usr/bin
+RUN go mod download
 
-# Allows exporting single binary
-FROM scratch as qclient
-COPY --from=build /usr/bin/qclient /qclient
-ENTRYPOINT [ "/qclient" ]
+ARG BINARIES_DIR=/opt/ceremonyclient/target/release
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh -o qclient
+RUN cp qclient /usr/bin
 
 # Allows exporting single binary
 FROM scratch AS node
-COPY --from=build /usr/bin/node /node
+COPY --from=build-node-avx512 /usr/bin/node /node
 ENTRYPOINT [ "/node" ]
+
+# Allows exporting single binary
+FROM scratch AS qclient-unix
+COPY --from=build-qclient-avx512 /usr/bin/qclient /qclient
+ENTRYPOINT [ "/qclient" ]
+
+FROM qclient-unix AS qclient-linux
+FROM qclient-unix AS qclient-darwin
+FROM qclient-${TARGETOS} AS qclient
 
 FROM ubuntu:24.04
 
@@ -122,8 +203,8 @@ LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
 RUN apt-get update && apt-get install -y ca-certificates
 
-COPY --from=build /usr/bin/node /usr/local/bin
-COPY --from=build /opt/ceremonyclient/client/qclient /usr/local/bin
+COPY --from=build-node-avx512 /usr/bin/node /usr/local/bin
+COPY --from=build-qclient-avx512 /opt/ceremonyclient/client/qclient /usr/local/bin
 
 WORKDIR /root
 

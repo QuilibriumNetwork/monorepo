@@ -1,0 +1,28 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+.DS_Store
+,*
+*~
+*.dot
+*.pdf
+*.ssa
+*.prof
+*.bristol
+apps/circuit/circuit
+apps/garbled/garbled
+apps/iotest/iotest
+apps/iter/iter
+apps/qcldoc/qcldoc
+apps/objdump/objdump
+apps/ot/ot

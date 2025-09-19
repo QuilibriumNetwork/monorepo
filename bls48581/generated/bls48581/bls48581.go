@@ -344,6 +344,42 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bls48581_checksum_func_bls_aggregate(uniffiStatus)
+		})
+		if checksum != 25405 {
+			// If this happens try cleaning and rebuilding your project
+			panic("bls48581: uniffi_bls48581_checksum_func_bls_aggregate: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bls48581_checksum_func_bls_keygen(uniffiStatus)
+		})
+		if checksum != 58096 {
+			// If this happens try cleaning and rebuilding your project
+			panic("bls48581: uniffi_bls48581_checksum_func_bls_keygen: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bls48581_checksum_func_bls_sign(uniffiStatus)
+		})
+		if checksum != 44903 {
+			// If this happens try cleaning and rebuilding your project
+			panic("bls48581: uniffi_bls48581_checksum_func_bls_sign: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bls48581_checksum_func_bls_verify(uniffiStatus)
+		})
+		if checksum != 59437 {
+			// If this happens try cleaning and rebuilding your project
+			panic("bls48581: uniffi_bls48581_checksum_func_bls_verify: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_bls48581_checksum_func_commit_raw(uniffiStatus)
 		})
 		if checksum != 20099 {
@@ -362,11 +398,29 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bls48581_checksum_func_prove_multiple(uniffiStatus)
+		})
+		if checksum != 15323 {
+			// If this happens try cleaning and rebuilding your project
+			panic("bls48581: uniffi_bls48581_checksum_func_prove_multiple: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_bls48581_checksum_func_prove_raw(uniffiStatus)
 		})
 		if checksum != 64858 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bls48581: uniffi_bls48581_checksum_func_prove_raw: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bls48581_checksum_func_verify_multiple(uniffiStatus)
+		})
+		if checksum != 33757 {
+			// If this happens try cleaning and rebuilding your project
+			panic("bls48581: uniffi_bls48581_checksum_func_verify_multiple: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -509,6 +563,130 @@ type FfiDestroyerString struct{}
 
 func (FfiDestroyerString) Destroy(_ string) {}
 
+type BlsAggregateOutput struct {
+	AggregatePublicKey []uint8
+	AggregateSignature []uint8
+}
+
+func (r *BlsAggregateOutput) Destroy() {
+	FfiDestroyerSequenceUint8{}.Destroy(r.AggregatePublicKey)
+	FfiDestroyerSequenceUint8{}.Destroy(r.AggregateSignature)
+}
+
+type FfiConverterTypeBlsAggregateOutput struct{}
+
+var FfiConverterTypeBlsAggregateOutputINSTANCE = FfiConverterTypeBlsAggregateOutput{}
+
+func (c FfiConverterTypeBlsAggregateOutput) Lift(rb RustBufferI) BlsAggregateOutput {
+	return LiftFromRustBuffer[BlsAggregateOutput](c, rb)
+}
+
+func (c FfiConverterTypeBlsAggregateOutput) Read(reader io.Reader) BlsAggregateOutput {
+	return BlsAggregateOutput{
+		FfiConverterSequenceUint8INSTANCE.Read(reader),
+		FfiConverterSequenceUint8INSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeBlsAggregateOutput) Lower(value BlsAggregateOutput) RustBuffer {
+	return LowerIntoRustBuffer[BlsAggregateOutput](c, value)
+}
+
+func (c FfiConverterTypeBlsAggregateOutput) Write(writer io.Writer, value BlsAggregateOutput) {
+	FfiConverterSequenceUint8INSTANCE.Write(writer, value.AggregatePublicKey)
+	FfiConverterSequenceUint8INSTANCE.Write(writer, value.AggregateSignature)
+}
+
+type FfiDestroyerTypeBlsAggregateOutput struct{}
+
+func (_ FfiDestroyerTypeBlsAggregateOutput) Destroy(value BlsAggregateOutput) {
+	value.Destroy()
+}
+
+type BlsKeygenOutput struct {
+	SecretKey            []uint8
+	PublicKey            []uint8
+	ProofOfPossessionSig []uint8
+}
+
+func (r *BlsKeygenOutput) Destroy() {
+	FfiDestroyerSequenceUint8{}.Destroy(r.SecretKey)
+	FfiDestroyerSequenceUint8{}.Destroy(r.PublicKey)
+	FfiDestroyerSequenceUint8{}.Destroy(r.ProofOfPossessionSig)
+}
+
+type FfiConverterTypeBlsKeygenOutput struct{}
+
+var FfiConverterTypeBlsKeygenOutputINSTANCE = FfiConverterTypeBlsKeygenOutput{}
+
+func (c FfiConverterTypeBlsKeygenOutput) Lift(rb RustBufferI) BlsKeygenOutput {
+	return LiftFromRustBuffer[BlsKeygenOutput](c, rb)
+}
+
+func (c FfiConverterTypeBlsKeygenOutput) Read(reader io.Reader) BlsKeygenOutput {
+	return BlsKeygenOutput{
+		FfiConverterSequenceUint8INSTANCE.Read(reader),
+		FfiConverterSequenceUint8INSTANCE.Read(reader),
+		FfiConverterSequenceUint8INSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeBlsKeygenOutput) Lower(value BlsKeygenOutput) RustBuffer {
+	return LowerIntoRustBuffer[BlsKeygenOutput](c, value)
+}
+
+func (c FfiConverterTypeBlsKeygenOutput) Write(writer io.Writer, value BlsKeygenOutput) {
+	FfiConverterSequenceUint8INSTANCE.Write(writer, value.SecretKey)
+	FfiConverterSequenceUint8INSTANCE.Write(writer, value.PublicKey)
+	FfiConverterSequenceUint8INSTANCE.Write(writer, value.ProofOfPossessionSig)
+}
+
+type FfiDestroyerTypeBlsKeygenOutput struct{}
+
+func (_ FfiDestroyerTypeBlsKeygenOutput) Destroy(value BlsKeygenOutput) {
+	value.Destroy()
+}
+
+type Multiproof struct {
+	D     []uint8
+	Proof []uint8
+}
+
+func (r *Multiproof) Destroy() {
+	FfiDestroyerSequenceUint8{}.Destroy(r.D)
+	FfiDestroyerSequenceUint8{}.Destroy(r.Proof)
+}
+
+type FfiConverterTypeMultiproof struct{}
+
+var FfiConverterTypeMultiproofINSTANCE = FfiConverterTypeMultiproof{}
+
+func (c FfiConverterTypeMultiproof) Lift(rb RustBufferI) Multiproof {
+	return LiftFromRustBuffer[Multiproof](c, rb)
+}
+
+func (c FfiConverterTypeMultiproof) Read(reader io.Reader) Multiproof {
+	return Multiproof{
+		FfiConverterSequenceUint8INSTANCE.Read(reader),
+		FfiConverterSequenceUint8INSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeMultiproof) Lower(value Multiproof) RustBuffer {
+	return LowerIntoRustBuffer[Multiproof](c, value)
+}
+
+func (c FfiConverterTypeMultiproof) Write(writer io.Writer, value Multiproof) {
+	FfiConverterSequenceUint8INSTANCE.Write(writer, value.D)
+	FfiConverterSequenceUint8INSTANCE.Write(writer, value.Proof)
+}
+
+type FfiDestroyerTypeMultiproof struct{}
+
+func (_ FfiDestroyerTypeMultiproof) Destroy(value Multiproof) {
+	value.Destroy()
+}
+
 type FfiConverterSequenceUint8 struct{}
 
 var FfiConverterSequenceUint8INSTANCE = FfiConverterSequenceUint8{}
@@ -552,6 +730,116 @@ func (FfiDestroyerSequenceUint8) Destroy(sequence []uint8) {
 	}
 }
 
+type FfiConverterSequenceUint64 struct{}
+
+var FfiConverterSequenceUint64INSTANCE = FfiConverterSequenceUint64{}
+
+func (c FfiConverterSequenceUint64) Lift(rb RustBufferI) []uint64 {
+	return LiftFromRustBuffer[[]uint64](c, rb)
+}
+
+func (c FfiConverterSequenceUint64) Read(reader io.Reader) []uint64 {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]uint64, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterUint64INSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceUint64) Lower(value []uint64) RustBuffer {
+	return LowerIntoRustBuffer[[]uint64](c, value)
+}
+
+func (c FfiConverterSequenceUint64) Write(writer io.Writer, value []uint64) {
+	if len(value) > math.MaxInt32 {
+		panic("[]uint64 is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterUint64INSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceUint64 struct{}
+
+func (FfiDestroyerSequenceUint64) Destroy(sequence []uint64) {
+	for _, value := range sequence {
+		FfiDestroyerUint64{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceSequenceUint8 struct{}
+
+var FfiConverterSequenceSequenceUint8INSTANCE = FfiConverterSequenceSequenceUint8{}
+
+func (c FfiConverterSequenceSequenceUint8) Lift(rb RustBufferI) [][]uint8 {
+	return LiftFromRustBuffer[[][]uint8](c, rb)
+}
+
+func (c FfiConverterSequenceSequenceUint8) Read(reader io.Reader) [][]uint8 {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([][]uint8, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterSequenceUint8INSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceSequenceUint8) Lower(value [][]uint8) RustBuffer {
+	return LowerIntoRustBuffer[[][]uint8](c, value)
+}
+
+func (c FfiConverterSequenceSequenceUint8) Write(writer io.Writer, value [][]uint8) {
+	if len(value) > math.MaxInt32 {
+		panic("[][]uint8 is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterSequenceUint8INSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceSequenceUint8 struct{}
+
+func (FfiDestroyerSequenceSequenceUint8) Destroy(sequence [][]uint8) {
+	for _, value := range sequence {
+		FfiDestroyerSequenceUint8{}.Destroy(value)
+	}
+}
+
+func BlsAggregate(pks [][]uint8, sigs [][]uint8) BlsAggregateOutput {
+	return FfiConverterTypeBlsAggregateOutputINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return C.uniffi_bls48581_fn_func_bls_aggregate(FfiConverterSequenceSequenceUint8INSTANCE.Lower(pks), FfiConverterSequenceSequenceUint8INSTANCE.Lower(sigs), _uniffiStatus)
+	}))
+}
+
+func BlsKeygen() BlsKeygenOutput {
+	return FfiConverterTypeBlsKeygenOutputINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return C.uniffi_bls48581_fn_func_bls_keygen(_uniffiStatus)
+	}))
+}
+
+func BlsSign(sk []uint8, msg []uint8, domain []uint8) []uint8 {
+	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return C.uniffi_bls48581_fn_func_bls_sign(FfiConverterSequenceUint8INSTANCE.Lower(sk), FfiConverterSequenceUint8INSTANCE.Lower(msg), FfiConverterSequenceUint8INSTANCE.Lower(domain), _uniffiStatus)
+	}))
+}
+
+func BlsVerify(pk []uint8, sig []uint8, msg []uint8, domain []uint8) bool {
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_bls48581_fn_func_bls_verify(FfiConverterSequenceUint8INSTANCE.Lower(pk), FfiConverterSequenceUint8INSTANCE.Lower(sig), FfiConverterSequenceUint8INSTANCE.Lower(msg), FfiConverterSequenceUint8INSTANCE.Lower(domain), _uniffiStatus)
+	}))
+}
+
 func CommitRaw(data []uint8, polySize uint64) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
 		return C.uniffi_bls48581_fn_func_commit_raw(FfiConverterSequenceUint8INSTANCE.Lower(data), FfiConverterUint64INSTANCE.Lower(polySize), _uniffiStatus)
@@ -565,9 +853,21 @@ func Init() {
 	})
 }
 
+func ProveMultiple(commitments [][]uint8, polys [][]uint8, indices []uint64, polySize uint64) Multiproof {
+	return FfiConverterTypeMultiproofINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return C.uniffi_bls48581_fn_func_prove_multiple(FfiConverterSequenceSequenceUint8INSTANCE.Lower(commitments), FfiConverterSequenceSequenceUint8INSTANCE.Lower(polys), FfiConverterSequenceUint64INSTANCE.Lower(indices), FfiConverterUint64INSTANCE.Lower(polySize), _uniffiStatus)
+	}))
+}
+
 func ProveRaw(data []uint8, index uint64, polySize uint64) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
 		return C.uniffi_bls48581_fn_func_prove_raw(FfiConverterSequenceUint8INSTANCE.Lower(data), FfiConverterUint64INSTANCE.Lower(index), FfiConverterUint64INSTANCE.Lower(polySize), _uniffiStatus)
+	}))
+}
+
+func VerifyMultiple(commitments [][]uint8, evaluations [][]uint8, indices []uint64, polySize uint64, multiCommitment []uint8, proof []uint8) bool {
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_bls48581_fn_func_verify_multiple(FfiConverterSequenceSequenceUint8INSTANCE.Lower(commitments), FfiConverterSequenceSequenceUint8INSTANCE.Lower(evaluations), FfiConverterSequenceUint64INSTANCE.Lower(indices), FfiConverterUint64INSTANCE.Lower(polySize), FfiConverterSequenceUint8INSTANCE.Lower(multiCommitment), FfiConverterSequenceUint8INSTANCE.Lower(proof), _uniffiStatus)
 	}))
 }
 

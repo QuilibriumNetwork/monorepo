@@ -105,19 +105,32 @@ func New(security []sec.SecureTransport, muxers []StreamMuxer, psk ipnet.PSK, rc
 
 // UpgradeListener upgrades the passed multiaddr-net listener into a full libp2p-transport listener.
 func (u *upgrader) UpgradeListener(t transport.Transport, list manet.Listener) transport.Listener {
-	ctx, cancel := context.WithCancel(context.Background())
-	l := &listener{
-		Listener:  list,
-		upgrader:  u,
-		transport: t,
+	return u.UpgradeGatedMaListener(t, u.GateMaListener(list))
+}
+
+func (u *upgrader) GateMaListener(l manet.Listener) transport.GatedMaListener {
+	return &gatedMaListener{
+		Listener:  l,
 		rcmgr:     u.rcmgr,
-		threshold: newThreshold(AcceptQueueLength),
-		incoming:  make(chan transport.CapableConn),
-		cancel:    cancel,
-		ctx:       ctx,
+		connGater: u.connGater,
 	}
-	go l.handleIncoming()
-	return l
+}
+
+// UpgradeGatedMaListener upgrades the passed multiaddr-net listener into a full libp2p-transport listener.
+func (u *upgrader) UpgradeGatedMaListener(t transport.Transport, l transport.GatedMaListener) transport.Listener {
+	ctx, cancel := context.WithCancel(context.Background())
+	list := &listener{
+		GatedMaListener: l,
+		upgrader:        u,
+		transport:       t,
+		rcmgr:           u.rcmgr,
+		threshold:       newThreshold(AcceptQueueLength),
+		incoming:        make(chan transport.CapableConn),
+		cancel:          cancel,
+		ctx:             ctx,
+	}
+	go list.handleIncoming()
+	return list
 }
 
 // Upgrade upgrades the multiaddr/net connection into a full libp2p-transport connection.
@@ -162,7 +175,7 @@ func (u *upgrader) upgrade(ctx context.Context, t transport.Transport, maconn ma
 	// call the connection gater, if one is registered.
 	if u.connGater != nil && !u.connGater.InterceptSecured(dir, sconn.RemotePeer(), maconn) {
 		if err := maconn.Close(); err != nil {
-			log.Errorw("failed to close connection", "peer", p, "addr", maconn.RemoteMultiaddr(), "error", err)
+			log.Error("failed to close connection", "peer", p, "remote_multiaddr", maconn.RemoteMultiaddr(), "err", err)
 		}
 		return nil, fmt.Errorf("gater rejected connection with peer %s and addr %s with direction %d",
 			sconn.RemotePeer(), maconn.RemoteMultiaddr(), dir)
@@ -171,9 +184,9 @@ func (u *upgrader) upgrade(ctx context.Context, t transport.Transport, maconn ma
 	// the peer in advance and in some bug scenarios.
 	if connScope.PeerScope() == nil {
 		if err := connScope.SetPeer(sconn.RemotePeer()); err != nil {
-			log.Debugw("resource manager blocked connection for peer", "peer", sconn.RemotePeer(), "addr", conn.RemoteAddr(), "error", err)
+			log.Debug("resource manager blocked connection for peer", "peer", sconn.RemotePeer(), "remote_addr", conn.RemoteAddr(), "err", err)
 			if err := maconn.Close(); err != nil {
-				log.Errorw("failed to close connection", "peer", p, "addr", maconn.RemoteMultiaddr(), "error", err)
+				log.Error("failed to close connection", "peer", p, "remote_multiaddr", maconn.RemoteMultiaddr(), "err", err)
 			}
 			return nil, fmt.Errorf("resource manager connection with peer %s and addr %s with direction %d",
 				sconn.RemotePeer(), maconn.RemoteMultiaddr(), dir)

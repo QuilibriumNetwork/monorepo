@@ -1,0 +1,44 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2021 Markku Rossi
+//
+// All rights reserved.
+//
+
+package math
+
+// AddUint64 adds two unsigned 64-bit integer numbers.
+func AddUint64(a, b uint64) uint64 {
+	return native("add64.circ", a, b)
+}
+
+// SubUint64 subtracts two unsigned 64-bit integer numbers.
+func SubUint64(a, b uint64) uint64 {
+	return native("sub64.circ", a, b)
+}
+
+// MulUint64 multiplies two unsigned 64-bit integer numbers.
+func MulUint64(a, b uint64) uint64 {
+	return native("mul64.circ", a, b)
+}
+
+// DivUint64 divides two unsigned 64-bit integer numbers.
+func DivUint64(a, b uint64) uint64 {
+	return native("div64.circ", a, b)
+}
+
+// MaxUint returns the maximum of the argument unsigned integer numbers.
+func MaxUint(a, b uint) uint {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// MinUint returns the minimum of the argument unsigned integer numbers.
+func MinUint(a, b uint) uint {
+	if a < b {
+		return a
+	}
+	return b
+}

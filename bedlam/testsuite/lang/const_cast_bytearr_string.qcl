@@ -1,0 +1,11 @@
+// -*- go -*-
+
+package main
+
+// 0x48656c6c6f2c20776f726c6421
+
+// @Test 42 1 = 0x21646c726f77202c6f6c6c6548
+func main(a []byte, b int) []byte {
+	ret := []byte("Hello, world!")
+	return ret
+}

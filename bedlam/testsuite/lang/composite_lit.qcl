@@ -1,0 +1,21 @@
+// -*- go -*-
+
+package main
+
+// @Test 0 0 = 21
+// @Test 1 2 = 24
+func main(a, b int32) int {
+	arr := [3][2]int32{
+		{1, 2},
+		{3, 4},
+		{5, 6},
+	}
+
+	var sum int32
+	for i := 0; i < len(arr); i++ {
+		sum += arr[i][0]
+		sum += arr[i][1]
+	}
+
+	return sum + a + b
+}

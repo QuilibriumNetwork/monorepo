@@ -1,0 +1,21 @@
+// -*- go -*-
+
+package main
+
+func Add(ptr *uint32, val uint32) {
+	*ptr = val
+}
+
+// @Test 0 0 = 0
+// @Test 1 2 = 6
+// @Test 3 7 = 20
+func main(a, b uint32) uint {
+	var sum [2][2]uint32
+
+	Add(&sum[0][0], a)
+	Add(&sum[0][1], a)
+	Add(&sum[1][0], b)
+	Add(&sum[1][1], b)
+
+	return sum[0][0] + sum[0][1] + sum[1][0] + sum[1][1]
+}

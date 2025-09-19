@@ -1,0 +1,28 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2023 Markku Rossi
+//
+// All rights reserved.
+//
+
+package math
+
+const (
+	// MaxUint8 is the maximum unsigned 8-bit integer value.
+	MaxUint8 = 0xff
+	// MaxUint16 is the maximum unsigned 16-bit integer value.
+	MaxUint16 = 0xffff
+	// MaxUint32 is the maximum unsigned 32-bit integer value.
+	MaxUint32 = 0xffffffff
+	// MaxUint64 is the maximum unsigned 64-bit integer value.
+	MaxUint64 = 0xffffffffffffffff
+
+	// MaxInt32 is the maximum signed 8-bit integer value.
+	MaxInt8 = 127
+	// MaxInt32 is the maximum signed 16-bit integer value.
+	MaxInt16 = 32767
+	// MaxInt32 is the maximum signed 32-bit integer value.
+	MaxInt32 = 2147483647
+	// MaxInt32 is the maximum signed 64-bit integer value.
+	MaxInt64 = 9223372036854775807
+)

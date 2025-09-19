@@ -52,7 +52,7 @@ func TestBasicDialPeerWithResolver(t *testing.T) {
 	resolver, err := madns.NewResolver(madns.WithDomainResolver("example.com", &mockResolver))
 	require.NoError(t, err)
 
-	swarms := makeSwarms(t, 2, swarmt.WithSwarmOpts(swarm.WithMultiaddrResolver(resolver)))
+	swarms := makeSwarms(t, 2, swarmt.WithSwarmOpts(swarm.WithMultiaddrResolver(swarm.ResolverFromMaDNS{resolver})))
 	defer closeSwarms(swarms)
 	s1 := swarms[0]
 	s2 := swarms[1]
@@ -61,13 +61,12 @@ func TestBasicDialPeerWithResolver(t *testing.T) {
 	// that the resovler has to resolve this
 	var s2Addrs []ma.Multiaddr
 	for _, a := range s2.ListenAddresses() {
-		_, rest, _ := ma.SplitFunc(a, func(c ma.Component) bool {
+		_, rest := ma.SplitFunc(a, func(c ma.Component) bool {
 			return c.Protocol().Code == ma.P_TCP || c.Protocol().Code == ma.P_UDP
 		},
 		)
 		if rest != nil {
-			e, _ := ma.StringCast("/dns4/example.com")
-			s2Addrs = append(s2Addrs, e.Encapsulate(rest))
+			s2Addrs = append(s2Addrs, tStringCast("/dns4/example.com").Encapsulate(rest))
 		}
 	}
 
@@ -124,7 +123,7 @@ func TestSimultDials(t *testing.T) {
 		errs := make(chan error, 20) // 2 connect calls in each of the 10 for-loop iterations
 		connect := func(s *swarm.Swarm, dst peer.ID, addr ma.Multiaddr) {
 			// copy for other peer
-			log.Debugf("TestSimultOpen: connecting: %s --> %s (%s)", s.LocalPeer(), dst, addr)
+			log.Debug("TestSimultOpen: connecting", "local", s.LocalPeer(), "remote", dst, "addr", addr)
 			s.Peerstore().AddAddr(dst, addr, peerstore.TempAddrTTL)
 			if _, err := s.DialPeer(ctx, dst); err != nil {
 				errs <- err
@@ -647,8 +646,7 @@ func TestDialSelf(t *testing.T) {
 func TestDialQUICDraft29(t *testing.T) {
 	s := makeDialOnlySwarm(t)
 	id := testutil.RandPeerIDFatal(t)
-	l, _ := ma.StringCast("/ip4/127.0.0.1/udp/1234/quic")
-	s.Peerstore().AddAddr(id, l, time.Hour)
+	s.Peerstore().AddAddr(id, tStringCast("/ip4/127.0.0.1/udp/1234/quic"), time.Hour)
 	_, err := s.DialPeer(context.Background(), id)
 	require.ErrorIs(t, err, swarm.ErrQUICDraft29)
 	require.ErrorIs(t, err, swarm.ErrNoTransport)

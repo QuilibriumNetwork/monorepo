@@ -380,6 +380,24 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_receiver_x3dh(uniffiStatus)
+		})
+		if checksum != 53802 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_receiver_x3dh: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_sender_x3dh(uniffiStatus)
+		})
+		if checksum != 2887 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_sender_x3dh: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_channel_checksum_func_triple_ratchet_decrypt(uniffiStatus)
 		})
 		if checksum != 56417 {
@@ -914,6 +932,18 @@ func NewDoubleRatchet(sessionKey []uint8, sendingHeaderKey []uint8, nextReceivin
 func NewTripleRatchet(peers [][]uint8, peerKey []uint8, identityKey []uint8, signedPreKey []uint8, threshold uint64, asyncDkgRatchet bool) TripleRatchetStateAndMetadata {
 	return FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
 		return C.uniffi_channel_fn_func_new_triple_ratchet(FfiConverterSequenceSequenceUint8INSTANCE.Lower(peers), FfiConverterSequenceUint8INSTANCE.Lower(peerKey), FfiConverterSequenceUint8INSTANCE.Lower(identityKey), FfiConverterSequenceUint8INSTANCE.Lower(signedPreKey), FfiConverterUint64INSTANCE.Lower(threshold), FfiConverterBoolINSTANCE.Lower(asyncDkgRatchet), _uniffiStatus)
+	}))
+}
+
+func ReceiverX3dh(sendingIdentityPrivateKey []uint8, sendingSignedPrivateKey []uint8, receivingIdentityKey []uint8, receivingEphemeralKey []uint8, sessionKeyLength uint64) string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return C.uniffi_channel_fn_func_receiver_x3dh(FfiConverterSequenceUint8INSTANCE.Lower(sendingIdentityPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(sendingSignedPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingIdentityKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingEphemeralKey), FfiConverterUint64INSTANCE.Lower(sessionKeyLength), _uniffiStatus)
+	}))
+}
+
+func SenderX3dh(sendingIdentityPrivateKey []uint8, sendingEphemeralPrivateKey []uint8, receivingIdentityKey []uint8, receivingSignedPreKey []uint8, sessionKeyLength uint64) string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return C.uniffi_channel_fn_func_sender_x3dh(FfiConverterSequenceUint8INSTANCE.Lower(sendingIdentityPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(sendingEphemeralPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingIdentityKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingSignedPreKey), FfiConverterUint64INSTANCE.Lower(sessionKeyLength), _uniffiStatus)
 	}))
 }
 

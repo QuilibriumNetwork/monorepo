@@ -31,7 +31,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	ma "github.com/multiformats/go-multiaddr"
-	madns "github.com/multiformats/go-multiaddr-dns"
 	"go.uber.org/fx"
 )
 
@@ -495,7 +494,7 @@ func UserAgent(userAgent string) Option {
 }
 
 // MultiaddrResolver sets the libp2p dns resolver
-func MultiaddrResolver(rslv *madns.Resolver) Option {
+func MultiaddrResolver(rslv network.MultiaddrDNSResolver) Option {
 	return func(cfg *Config) error {
 		cfg.MultiaddrResolver = rslv
 		return nil
@@ -606,6 +605,53 @@ func SwarmOpts(opts ...swarm.Option) Option {
 func DisableIdentifyAddressDiscovery() Option {
 	return func(cfg *Config) error {
 		cfg.DisableIdentifyAddressDiscovery = true
+		return nil
+	}
+}
+
+// EnableAutoNATv2 enables autonat v2
+func EnableAutoNATv2() Option {
+	return func(cfg *Config) error {
+		cfg.EnableAutoNATv2 = true
+		return nil
+	}
+}
+
+// UDPBlackHoleSuccessCounter configures libp2p to use f as the black hole filter for UDP addrs
+func UDPBlackHoleSuccessCounter(f *swarm.BlackHoleSuccessCounter) Option {
+	return func(cfg *Config) error {
+		cfg.UDPBlackHoleSuccessCounter = f
+		cfg.CustomUDPBlackHoleSuccessCounter = true
+		return nil
+	}
+}
+
+// IPv6BlackHoleSuccessCounter configures libp2p to use f as the black hole filter for IPv6 addrs
+func IPv6BlackHoleSuccessCounter(f *swarm.BlackHoleSuccessCounter) Option {
+	return func(cfg *Config) error {
+		cfg.IPv6BlackHoleSuccessCounter = f
+		cfg.CustomIPv6BlackHoleSuccessCounter = true
+		return nil
+	}
+}
+
+// WithFxOption adds a user provided fx.Option to the libp2p constructor.
+// Experimental: This option is subject to change or removal.
+func WithFxOption(opts ...fx.Option) Option {
+	return func(cfg *Config) error {
+		cfg.UserFxOptions = append(cfg.UserFxOptions, opts...)
+		return nil
+	}
+}
+
+// ShareTCPListener shares the same listen address between TCP and Websocket
+// transports. This lets both transports use the same TCP port.
+//
+// Currently this behavior is Opt-in. In a future release this will be the
+// default, and this option will be removed.
+func ShareTCPListener() Option {
+	return func(cfg *Config) error {
+		cfg.ShareTCPListener = true
 		return nil
 	}
 }

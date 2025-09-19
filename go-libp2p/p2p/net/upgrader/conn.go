@@ -51,9 +51,8 @@ func (t *transportConn) Scope() network.ConnScope {
 }
 
 func (t *transportConn) Close() error {
-	err := t.MuxedConn.Close()
-	t.scope.Done()
-	return err
+	defer t.scope.Done()
+	return t.MuxedConn.Close()
 }
 
 func (t *transportConn) ConnState() network.ConnectionState {
@@ -63,4 +62,9 @@ func (t *transportConn) ConnState() network.ConnectionState {
 		Transport:                 "tcp",
 		UsedEarlyMuxerNegotiation: t.usedEarlyMuxerNegotiation,
 	}
+}
+
+func (t *transportConn) CloseWithError(errCode network.ConnErrorCode) error {
+	defer t.scope.Done()
+	return t.MuxedConn.CloseWithError(errCode)
 }

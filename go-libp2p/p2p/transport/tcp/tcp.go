@@ -3,6 +3,7 @@ package tcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"runtime"
@@ -13,8 +14,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/net/reuseport"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcpreuse"
 
-	logging "github.com/ipfs/go-log/v2"
+	logging "github.com/libp2p/go-libp2p/gologshim"
 	ma "github.com/multiformats/go-multiaddr"
 	mafmt "github.com/multiformats/go-multiaddr-fmt"
 	manet "github.com/multiformats/go-multiaddr/net"
@@ -33,10 +35,13 @@ type canKeepAlive interface {
 
 var _ canKeepAlive = &net.TCPConn{}
 
+// Deprecated: Use tcpreuse.ReuseportIsAvailable
+var ReuseportIsAvailable = tcpreuse.ReuseportIsAvailable
+
 func tryKeepAlive(conn net.Conn, keepAlive bool) {
 	keepAliveConn, ok := conn.(canKeepAlive)
 	if !ok {
-		log.Errorf("Can't set TCP keepalives.")
+		log.Error("can't set TCP keepalives. net.Conn doesn't support SetKeepAlive", "conn_type", fmt.Sprintf("%T", conn))
 		return
 	}
 	if err := keepAliveConn.SetKeepAlive(keepAlive); err != nil {
@@ -46,16 +51,16 @@ func tryKeepAlive(conn net.Conn, keepAlive bool) {
 		// But there's nothing we can do about invalid arguments, so we'll drop this to a
 		// debug.
 		if errors.Is(err, os.ErrInvalid) || errors.Is(err, syscall.EINVAL) {
-			log.Debugw("failed to enable TCP keepalive", "error", err)
+			log.Debug("failed to enable TCP keepalive", "error", err)
 		} else {
-			log.Errorw("failed to enable TCP keepalive", "error", err)
+			log.Error("failed to enable TCP keepalive", "error", err)
 		}
 		return
 	}
 
 	if runtime.GOOS != "openbsd" {
 		if err := keepAliveConn.SetKeepAlivePeriod(keepAlivePeriod); err != nil {
-			log.Errorw("failed set keepalive period", "error", err)
+			log.Error("failed set keepalive period", "error", err)
 		}
 	}
 }
@@ -71,23 +76,23 @@ func tryLinger(conn net.Conn, sec int) {
 	}
 }
 
-type tcpListener struct {
-	manet.Listener
+type tcpGatedMaListener struct {
+	transport.GatedMaListener
 	sec int
 }
 
-func (ll *tcpListener) Accept() (manet.Conn, error) {
-	c, err := ll.Listener.Accept()
+func (ll *tcpGatedMaListener) Accept() (manet.Conn, network.ConnManagementScope, error) {
+	c, scope, err := ll.GatedMaListener.Accept()
 	if err != nil {
-		return nil, err
+		if scope != nil {
+			log.Error("BUG: got non-nil scope but also an error", "error", err)
+			scope.Done()
+		}
+		return nil, nil, err
 	}
 	tryLinger(c, ll.sec)
 	tryKeepAlive(c, true)
-	// We're not calling OpenConnection in the resource manager here,
-	// since the manet.Conn doesn't allow us to save the scope.
-	// It's the caller's (usually the p2p/net/upgrader) responsibility
-	// to call the resource manager.
-	return c, nil
+	return c, scope, nil
 }
 
 type Option func(*TcpTransport) error
@@ -113,14 +118,40 @@ func WithMetrics() Option {
 	}
 }
 
+// WithDialerForAddr sets a custom dialer for the given address.
+// If set, it will be the *ONLY* dialer used.
+func WithDialerForAddr(d DialerForAddr) Option {
+	return func(tr *TcpTransport) error {
+		tr.overrideDialerForAddr = d
+		return nil
+	}
+}
+
+type ContextDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// DialerForAddr is a function that returns a dialer for a given address.
+// Implementations must return either a ContextDialer or an error. It is
+// invalid to return nil, nil.
+type DialerForAddr func(raddr ma.Multiaddr) (ContextDialer, error)
+
 // TcpTransport is the TCP transport.
 type TcpTransport struct {
 	// Connection upgrader for upgrading insecure stream connections to
 	// secure multiplex connections.
 	upgrader transport.Upgrader
 
+	// optional custom dialer to use for dialing. If set, it will be the *ONLY* dialer
+	// used. The transport will not attempt to reuse the listen port to
+	// dial or the shared TCP transport for dialing.
+	overrideDialerForAddr DialerForAddr
+
 	disableReuseport bool // Explicitly disable reuseport.
 	enableMetrics    bool
+
+	// share and demultiplex TCP listeners across multiple transports
+	sharedTcp *tcpreuse.ConnMgr
 
 	// TCP connect timeout
 	connectTimeout time.Duration
@@ -128,14 +159,16 @@ type TcpTransport struct {
 	rcmgr network.ResourceManager
 
 	reuse reuseport.Transport
+
+	metricsCollector *aggregatingCollector
 }
 
 var _ transport.Transport = &TcpTransport{}
 var _ transport.DialUpdater = &TcpTransport{}
 
 // NewTCPTransport creates a tcp transport object that tracks dialers and listeners
-// created. It represents an entire TCP stack (though it might not necessarily be).
-func NewTCPTransport(upgrader transport.Upgrader, rcmgr network.ResourceManager, opts ...Option) (*TcpTransport, error) {
+// created.
+func NewTCPTransport(upgrader transport.Upgrader, rcmgr network.ResourceManager, sharedTCP *tcpreuse.ConnMgr, opts ...Option) (*TcpTransport, error) {
 	if rcmgr == nil {
 		rcmgr = &network.NullResourceManager{}
 	}
@@ -143,6 +176,7 @@ func NewTCPTransport(upgrader transport.Upgrader, rcmgr network.ResourceManager,
 		upgrader:       upgrader,
 		connectTimeout: defaultConnectTimeout, // can be set by using the WithConnectionTimeout option
 		rcmgr:          rcmgr,
+		sharedTcp:      sharedTCP,
 	}
 	for _, o := range opts {
 		if err := o(tr); err != nil {
@@ -160,12 +194,49 @@ func (t *TcpTransport) CanDial(addr ma.Multiaddr) bool {
 	return dialMatcher.Matches(addr)
 }
 
+func (t *TcpTransport) customDial(ctx context.Context, raddr ma.Multiaddr) (manet.Conn, error) {
+	// get the net.Dial friendly arguments from the remote addr
+	rnet, rnaddr, err := manet.DialArgs(raddr)
+	if err != nil {
+		return nil, err
+	}
+	dialer, err := t.overrideDialerForAddr(raddr)
+	if err != nil {
+		return nil, err
+	}
+	if dialer == nil {
+		return nil, fmt.Errorf("dialer for address %s is nil", raddr)
+	}
+
+	// ok, Dial!
+	var nconn net.Conn
+	switch rnet {
+	case "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6", "unix":
+		nconn, err = dialer.DialContext(ctx, rnet, rnaddr)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unrecognized network: %s", rnet)
+	}
+
+	return manet.WrapNetConn(nconn)
+}
+
 func (t *TcpTransport) maDial(ctx context.Context, raddr ma.Multiaddr) (manet.Conn, error) {
 	// Apply the deadline iff applicable
 	if t.connectTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, t.connectTimeout)
 		defer cancel()
+	}
+
+	if t.overrideDialerForAddr != nil {
+		return t.customDial(ctx, raddr)
+	}
+
+	if t.sharedTcp != nil {
+		return t.sharedTcp.DialContext(ctx, raddr)
 	}
 
 	if t.UseReuseport() {
@@ -183,7 +254,7 @@ func (t *TcpTransport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) 
 func (t *TcpTransport) DialWithUpdates(ctx context.Context, raddr ma.Multiaddr, p peer.ID, updateChan chan<- transport.DialUpdate) (transport.CapableConn, error) {
 	connScope, err := t.rcmgr.OpenConnection(network.DirOutbound, true, raddr)
 	if err != nil {
-		log.Debugw("resource manager blocked outgoing connection", "peer", p, "addr", raddr, "error", err)
+		log.Debug("resource manager blocked outgoing connection", "peer", p, "addr", raddr, "error", err)
 		return nil, err
 	}
 
@@ -197,7 +268,7 @@ func (t *TcpTransport) DialWithUpdates(ctx context.Context, raddr ma.Multiaddr, 
 
 func (t *TcpTransport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p peer.ID, connScope network.ConnManagementScope, updateChan chan<- transport.DialUpdate) (transport.CapableConn, error) {
 	if err := connScope.SetPeer(p); err != nil {
-		log.Debugw("resource manager blocked outgoing connection for peer", "peer", p, "addr", raddr, "error", err)
+		log.Debug("resource manager blocked outgoing connection for peer", "peer", p, "addr", raddr, "error", err)
 		return nil, err
 	}
 	conn, err := t.maDial(ctx, raddr)
@@ -212,7 +283,7 @@ func (t *TcpTransport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p 
 	c := conn
 	if t.enableMetrics {
 		var err error
-		c, err = newTracingConn(conn, true)
+		c, err = newTracingConn(conn, t.metricsCollector, true)
 		if err != nil {
 			return nil, err
 		}
@@ -233,10 +304,10 @@ func (t *TcpTransport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p 
 
 // UseReuseport returns true if reuseport is enabled and available.
 func (t *TcpTransport) UseReuseport() bool {
-	return !t.disableReuseport && ReuseportIsAvailable()
+	return !t.disableReuseport && tcpreuse.ReuseportIsAvailable()
 }
 
-func (t *TcpTransport) maListen(laddr ma.Multiaddr) (manet.Listener, error) {
+func (t *TcpTransport) unsharedMAListen(laddr ma.Multiaddr) (manet.Listener, error) {
 	if t.UseReuseport() {
 		return t.reuse.Listen(laddr)
 	}
@@ -245,14 +316,31 @@ func (t *TcpTransport) maListen(laddr ma.Multiaddr) (manet.Listener, error) {
 
 // Listen listens on the given multiaddr.
 func (t *TcpTransport) Listen(laddr ma.Multiaddr) (transport.Listener, error) {
-	list, err := t.maListen(laddr)
-	if err != nil {
-		return nil, err
+	var list transport.GatedMaListener
+	var err error
+	if t.sharedTcp != nil {
+		list, err = t.sharedTcp.DemultiplexedListen(laddr, tcpreuse.DemultiplexedConnType_MultistreamSelect)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		mal, err := t.unsharedMAListen(laddr)
+		if err != nil {
+			return nil, err
+		}
+		list = t.upgrader.GateMaListener(mal)
 	}
+
+	// Always wrap the listener with tcpGatedMaListener to apply TCP-specific configurations
+	tcpList := &tcpGatedMaListener{list, 0}
+
 	if t.enableMetrics {
-		list = newTracingListener(&tcpListener{list, 0})
+		// Wrap with tracing listener if metrics are enabled
+		return t.upgrader.UpgradeGatedMaListener(t, newTracingListener(tcpList, t.metricsCollector)), nil
 	}
-	return t.upgrader.UpgradeListener(t, list), nil
+
+	// Regular path without metrics
+	return t.upgrader.UpgradeGatedMaListener(t, tcpList), nil
 }
 
 // Protocols returns the list of terminal protocols this transport can dial.

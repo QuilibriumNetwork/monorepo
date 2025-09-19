@@ -1,0 +1,11 @@
+// -*- go -*-
+
+package main
+
+import (
+	"crypto/aes"
+)
+
+func main(key, data [16]byte) []uint {
+	return aes.ExpandEncryptionKey(key)
+}

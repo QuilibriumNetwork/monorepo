@@ -1,0 +1,22 @@
+// -*- go -*-
+
+package main
+
+// @Test 0 0 = 10
+// @Test 1 2 = 13
+func main(a, b int32) int {
+	var src [5]int32
+	for i := 0; i < len(src); i++ {
+		src[i] = i
+	}
+
+	var dst [10]int32
+	copy(dst, src)
+
+	var sum int32
+	for i := 0; i < len(dst); i++ {
+		sum += dst[i]
+	}
+
+	return a + b + sum
+}

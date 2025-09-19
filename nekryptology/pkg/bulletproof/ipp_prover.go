@@ -331,8 +331,8 @@ func (prover *InnerProductProver) calcx(capL, capR curves.Point, transcript *mer
 	// Add the newest capL and capR values to transcript
 	transcript.AppendMessage([]byte("addRecursiveL"), capL.ToAffineUncompressed())
 	transcript.AppendMessage([]byte("addRecursiveR"), capR.ToAffineUncompressed())
-	// Read 64 bytes from, set to scalar
-	outBytes := transcript.ExtractBytes([]byte("getx"), 64)
+	// Read 56 bytes from, set to scalar
+	outBytes := transcript.ExtractBytes([]byte("getx"), 56)
 	x, err := prover.curve.NewScalar().SetBytesWide(outBytes)
 	if err != nil {
 		return nil, errors.Wrap(err, "calcx NewScalar SetBytesWide")

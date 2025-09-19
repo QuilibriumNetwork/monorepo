@@ -15,8 +15,6 @@ import (
 	"github.com/multiformats/go-base32"
 )
 
-//go:generate protoc --proto_path=$PWD:$PWD/../../../.. --go_out=. --go_opt=Mpb/pstore.proto=./pb pb/pstore.proto
-
 // Configuration object for the peerstore.
 type Options struct {
 	// The size of the in-memory cache. A value of 0 or lower disables the cache.
@@ -111,7 +109,7 @@ func uniquePeerIds(ds ds.Datastore, prefix ds.Key, extractor func(result query.R
 	)
 
 	if results, err = ds.Query(context.TODO(), q); err != nil {
-		log.Error(err)
+		log.Error("failed to query database", "err", err)
 		return nil, err
 	}
 

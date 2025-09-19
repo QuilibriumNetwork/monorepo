@@ -58,11 +58,20 @@ func (c *Conn) ID() string {
 // open notifications must finish before we can fire off the close
 // notifications).
 func (c *Conn) Close() error {
-	c.closeOnce.Do(c.doClose)
+	c.closeOnce.Do(func() {
+		c.doClose(0)
+	})
 	return c.err
 }
 
-func (c *Conn) doClose() {
+func (c *Conn) CloseWithError(errCode network.ConnErrorCode) error {
+	c.closeOnce.Do(func() {
+		c.doClose(errCode)
+	})
+	return c.err
+}
+
+func (c *Conn) doClose(errCode network.ConnErrorCode) {
 	c.swarm.removeConn(c)
 
 	// Prevent new streams from opening.
@@ -71,7 +80,11 @@ func (c *Conn) doClose() {
 	c.streams.m = nil
 	c.streams.Unlock()
 
-	c.err = c.conn.Close()
+	if errCode != 0 {
+		c.err = c.conn.CloseWithError(errCode)
+	} else {
+		c.err = c.conn.Close()
+	}
 
 	// Send the connectedness event after closing the connection.
 	// This ensures that both remote connection close and local connection
@@ -88,13 +101,13 @@ func (c *Conn) doClose() {
 	go func() {
 		// prevents us from issuing close notifications before finishing the open notifications
 		c.notifyLk.Lock()
+		defer c.notifyLk.Unlock()
 
 		// Only notify for disconnection if we notified for connection
 		c.swarm.notifyAll(func(f network.Notifiee) {
 			f.Disconnected(c.swarm, c)
 		})
 		c.swarm.refs.Done()
-		c.notifyLk.Unlock()
 	}()
 }
 
@@ -112,16 +125,16 @@ func (c *Conn) removeStream(s *Stream) {
 // swarm ref count.
 func (c *Conn) start() {
 	go func() {
+		defer c.swarm.refs.Done()
+		defer c.Close()
 		for {
 			ts, err := c.conn.AcceptStream()
 			if err != nil {
-				c.swarm.refs.Done()
-				c.Close()
 				return
 			}
 			scope, err := c.swarm.ResourceManager().OpenStream(c.RemotePeer(), network.DirInbound)
 			if err != nil {
-				ts.Reset()
+				ts.ResetWithError(network.StreamResourceLimitExceeded)
 				continue
 			}
 			c.swarm.refs.Add(1)
@@ -192,9 +205,8 @@ func (c *Conn) ConnState() network.ConnectionState {
 // Stat returns metadata pertaining to this connection
 func (c *Conn) Stat() network.ConnStats {
 	c.streams.Lock()
-	stats := c.stat
-	c.streams.Unlock()
-	return stats
+	defer c.streams.Unlock()
+	return c.stat
 }
 
 // NewStream returns a new Stream from this connection
@@ -210,9 +222,18 @@ func (c *Conn) NewStream(ctx context.Context) (network.Stream, error) {
 		return nil, err
 	}
 
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultNewStreamTimeout)
+		defer cancel()
+	}
+
 	s, err := c.openAndAddStream(ctx, scope)
 	if err != nil {
 		scope.Done()
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("timed out: %w", err)
+		}
 		return nil, err
 	}
 	return s, nil
@@ -261,11 +282,11 @@ func (c *Conn) addStream(ts network.MuxedStream, dir network.Direction, scope ne
 // GetStreams returns the streams associated with this connection.
 func (c *Conn) GetStreams() []network.Stream {
 	c.streams.Lock()
+	defer c.streams.Unlock()
 	streams := make([]network.Stream, 0, len(c.streams.m))
 	for s := range c.streams.m {
 		streams = append(streams, s)
 	}
-	c.streams.Unlock()
 	return streams
 }
 

@@ -2,33 +2,17 @@ package holepunch
 
 import (
 	"context"
+	"slices"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	ma "github.com/multiformats/go-multiaddr"
-	manet "github.com/multiformats/go-multiaddr/net"
 )
 
-func containsPublicAddr(addrs []ma.Multiaddr) bool {
-	for _, addr := range addrs {
-		if is, err := manet.IsPublicAddr(addr); err != nil || !is || isRelayAddress(addr) {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
 func removeRelayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
-	result := make([]ma.Multiaddr, 0, len(addrs))
-	for _, addr := range addrs {
-		if !isRelayAddress(addr) {
-			result = append(result, addr)
-		}
-	}
-	return result
+	return slices.DeleteFunc(addrs, isRelayAddress)
 }
 
 func isRelayAddress(a ma.Multiaddr) bool {
@@ -67,14 +51,12 @@ func getDirectConnection(h host.Host, p peer.ID) network.Conn {
 func holePunchConnect(ctx context.Context, host host.Host, pi peer.AddrInfo, isClient bool) error {
 	holePunchCtx := network.WithSimultaneousConnect(ctx, isClient, "hole-punching")
 	forceDirectConnCtx := network.WithForceDirectDial(holePunchCtx, "hole-punching")
-	dialCtx, cancel := context.WithTimeout(forceDirectConnCtx, dialTimeout)
 
-	if err := host.Connect(dialCtx, pi); err != nil {
-		log.Debugw("hole punch attempt with peer failed", "peer ID", pi.ID, "error", err)
-		cancel()
+	log.Debug("holepunchConnect", "source_peer", host.ID(), "destination_peer", pi.ID, "addrs", pi.Addrs)
+	if err := host.Connect(forceDirectConnCtx, pi); err != nil {
+		log.Debug("hole punch attempt with peer failed", "destination_peer", pi.ID, "err", err)
 		return err
 	}
-	log.Debugw("hole punch successful", "peer", pi.ID)
-	cancel()
+	log.Debug("hole punch successful", "destination_peer", pi.ID)
 	return nil
 }

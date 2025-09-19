@@ -21,6 +21,12 @@ func TestSigning(t *testing.T) {
 		t.Fatal(err)
 	}
 	testSignVerify(t, privk)
+
+	privk, _, err = crypto.GenerateKeyPair(crypto.Ed448, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testSignVerify(t, privk)
 }
 
 func testSignVerify(t *testing.T, privk crypto.PrivKey) {

@@ -13,7 +13,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	logging "github.com/ipfs/go-log/v2"
+	logging "github.com/libp2p/go-libp2p/gologshim"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -141,11 +141,6 @@ func NewConnManager(low, hi int, opts ...Option) (*BasicConnMgr, error) {
 
 	cm.ctx, cm.cancel = context.WithCancel(context.Background())
 
-	if cfg.emergencyTrim {
-		// When we're running low on memory, immediately trigger a trim.
-		cm.unregisterMemoryWatcher = registerWatchdog(cm.memoryEmergency)
-	}
-
 	decay, _ := NewDecayer(cfg.decayer, cm)
 	cm.decayer = decay
 
@@ -154,34 +149,35 @@ func NewConnManager(low, hi int, opts ...Option) (*BasicConnMgr, error) {
 	return cm, nil
 }
 
-// memoryEmergency is run when we run low on memory.
-// Close connections until we right the low watermark.
-// We don't pay attention to the silence period or the grace period.
-// We try to not kill protected connections, but if that turns out to be necessary, not connection is safe!
-func (cm *BasicConnMgr) memoryEmergency() {
+// ForceTrim trims connections down to the low watermark ignoring silence period, grace period,
+// or protected status. It prioritizes closing Unprotected connections. If after closing all
+// unprotected connections, we still have more than lowWaterMark connections, it'll close
+// protected connections.
+func (cm *BasicConnMgr) ForceTrim() {
 	connCount := int(cm.connCount.Load())
 	target := connCount - cm.cfg.lowWater
 	if target < 0 {
-		log.Warnw("Low on memory, but we only have a few connections", "num", connCount, "low watermark", cm.cfg.lowWater)
+		log.Warn("Low on memory, but we only have a few connections", "num", connCount, "low_watermark", cm.cfg.lowWater)
 		return
 	} else {
-		log.Warnf("Low on memory. Closing %d connections.", target)
+		log.Warn("Low on memory. Closing connections.", "count", target)
 	}
 
 	cm.trimMutex.Lock()
+	defer atomic.AddUint64(&cm.trimCount, 1)
+	defer cm.trimMutex.Unlock()
 
 	// Trim connections without paying attention to the silence period.
 	for _, c := range cm.getConnsToCloseEmergency(target) {
-		log.Infow("low on memory. closing conn", "peer", c.RemotePeer())
-		c.Close()
+		log.Info("low on memory. closing conn", "peer", c.RemotePeer())
+
+		c.CloseWithError(network.ConnGarbageCollected)
 	}
 
 	// finally, update the last trim time.
 	cm.lastTrimMu.Lock()
 	cm.lastTrim = cm.clock.Now()
 	cm.lastTrimMu.Unlock()
-	atomic.AddUint64(&cm.trimCount, 1)
-	cm.trimMutex.Unlock()
 }
 
 func (cm *BasicConnMgr) Close() error {
@@ -198,6 +194,7 @@ func (cm *BasicConnMgr) Close() error {
 
 func (cm *BasicConnMgr) Protect(id peer.ID, tag string) {
 	cm.plk.Lock()
+	defer cm.plk.Unlock()
 
 	tags, ok := cm.protected[id]
 	if !ok {
@@ -205,42 +202,37 @@ func (cm *BasicConnMgr) Protect(id peer.ID, tag string) {
 		cm.protected[id] = tags
 	}
 	tags[tag] = struct{}{}
-	cm.plk.Unlock()
 }
 
 func (cm *BasicConnMgr) Unprotect(id peer.ID, tag string) (protected bool) {
 	cm.plk.Lock()
+	defer cm.plk.Unlock()
 
 	tags, ok := cm.protected[id]
 	if !ok {
-		cm.plk.Unlock()
 		return false
 	}
 	if delete(tags, tag); len(tags) == 0 {
 		delete(cm.protected, id)
-		cm.plk.Unlock()
 		return false
 	}
-	cm.plk.Unlock()
 	return true
 }
 
 func (cm *BasicConnMgr) IsProtected(id peer.ID, tag string) (protected bool) {
 	cm.plk.Lock()
+	defer cm.plk.Unlock()
 
 	tags, ok := cm.protected[id]
 	if !ok {
-		cm.plk.Unlock()
 		return false
 	}
 
 	if tag == "" {
-		cm.plk.Unlock()
 		return true
 	}
 
 	_, protected = tags[tag]
-	cm.plk.Unlock()
 	return protected
 }
 
@@ -285,30 +277,22 @@ func (p peerInfos) SortByValueAndStreams(segments *segments, sortByMoreStreams b
 		// lock this to protect from concurrent modifications from connect/disconnect events
 		leftSegment := segments.get(left.id)
 		leftSegment.Lock()
+		defer leftSegment.Unlock()
 
 		rightSegment := segments.get(right.id)
-		rsLocked := false
 		if leftSegment != rightSegment {
 			// These two peers are not in the same segment, lets get the lock
 			rightSegment.Lock()
-			rsLocked = true
+			defer rightSegment.Unlock()
 		}
 		segments.bucketsMu.Unlock()
 
 		// temporary peers are preferred for pruning.
 		if left.temp != right.temp {
-			leftSegment.Unlock()
-			if rsLocked {
-				rightSegment.Unlock()
-			}
 			return left.temp
 		}
 		// otherwise, compare by value.
 		if left.value != right.value {
-			leftSegment.Unlock()
-			if rsLocked {
-				rightSegment.Unlock()
-			}
 			return left.value < right.value
 		}
 		incomingAndStreams := func(m map[network.Conn]time.Time) (incoming bool, numStreams int) {
@@ -325,25 +309,13 @@ func (p peerInfos) SortByValueAndStreams(segments *segments, sortByMoreStreams b
 		rightIncoming, rightStreams := incomingAndStreams(right.conns)
 		// prefer closing inactive connections (no streams open)
 		if rightStreams != leftStreams && (leftStreams == 0 || rightStreams == 0) {
-			leftSegment.Unlock()
-			if rsLocked {
-				rightSegment.Unlock()
-			}
 			return leftStreams < rightStreams
 		}
 		// incoming connections are preferred for pruning
 		if leftIncoming != rightIncoming {
-			leftSegment.Unlock()
-			if rsLocked {
-				rightSegment.Unlock()
-			}
 			return leftIncoming
 		}
 
-		leftSegment.Unlock()
-		if rsLocked {
-			rightSegment.Unlock()
-		}
 		if sortByMoreStreams {
 			// prune connections with a higher number of streams first
 			return rightStreams < leftStreams
@@ -369,12 +341,15 @@ func (cm *BasicConnMgr) TrimOpenConns(_ context.Context) {
 }
 
 func (cm *BasicConnMgr) background() {
+	defer cm.refCount.Done()
+
 	interval := cm.cfg.gracePeriod / 2
 	if cm.cfg.silencePeriod != 0 {
 		interval = cm.cfg.silencePeriod
 	}
 
 	ticker := cm.clock.Ticker(interval)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -384,8 +359,6 @@ func (cm *BasicConnMgr) background() {
 				continue
 			}
 		case <-cm.ctx.Done():
-			cm.refCount.Done()
-			ticker.Stop()
 			return
 		}
 		cm.trim()
@@ -396,6 +369,7 @@ func (cm *BasicConnMgr) doTrim() {
 	// This logic is mimicking the implementation of sync.Once in the standard library.
 	count := atomic.LoadUint64(&cm.trimCount)
 	cm.trimMutex.Lock()
+	defer cm.trimMutex.Unlock()
 	if count == atomic.LoadUint64(&cm.trimCount) {
 		cm.trim()
 		cm.lastTrimMu.Lock()
@@ -403,15 +377,14 @@ func (cm *BasicConnMgr) doTrim() {
 		cm.lastTrimMu.Unlock()
 		atomic.AddUint64(&cm.trimCount, 1)
 	}
-	cm.trimMutex.Unlock()
 }
 
 // trim starts the trim, if the last trim happened before the configured silence period.
 func (cm *BasicConnMgr) trim() {
 	// do the actual trim.
 	for _, c := range cm.getConnsToClose() {
-		log.Debugw("closing conn", "peer", c.RemotePeer())
-		c.Close()
+		log.Debug("closing conn", "peer", c.RemotePeer())
+		c.CloseWithError(network.ConnGarbageCollected)
 	}
 }
 
@@ -567,10 +540,10 @@ func (cm *BasicConnMgr) getConnsToClose() []network.Conn {
 func (cm *BasicConnMgr) GetTagInfo(p peer.ID) *connmgr.TagInfo {
 	s := cm.segments.get(p)
 	s.Lock()
+	defer s.Unlock()
 
 	pi, ok := s.peers[p]
 	if !ok {
-		s.Unlock()
 		return nil
 	}
 
@@ -590,7 +563,7 @@ func (cm *BasicConnMgr) GetTagInfo(p peer.ID) *connmgr.TagInfo {
 	for c, t := range pi.conns {
 		out.Conns[c.RemoteMultiaddr().String()] = t
 	}
-	s.Unlock()
+
 	return out
 }
 
@@ -598,37 +571,37 @@ func (cm *BasicConnMgr) GetTagInfo(p peer.ID) *connmgr.TagInfo {
 func (cm *BasicConnMgr) TagPeer(p peer.ID, tag string, val int) {
 	s := cm.segments.get(p)
 	s.Lock()
+	defer s.Unlock()
 
 	pi := s.tagInfoFor(p, cm.clock.Now())
 
 	// Update the total value of the peer.
 	pi.value += val - pi.tags[tag]
 	pi.tags[tag] = val
-	s.Unlock()
 }
 
 // UntagPeer is called to disassociate a string and integer from a given peer.
 func (cm *BasicConnMgr) UntagPeer(p peer.ID, tag string) {
 	s := cm.segments.get(p)
 	s.Lock()
+	defer s.Unlock()
 
 	pi, ok := s.peers[p]
 	if !ok {
-		log.Info("tried to remove tag from untracked peer: ", p)
-		s.Unlock()
+		log.Debug("tried to remove tag from untracked peer", "peer", p, "tag", tag)
 		return
 	}
 
 	// Update the total value of the peer.
 	pi.value -= pi.tags[tag]
 	delete(pi.tags, tag)
-	s.Unlock()
 }
 
 // UpsertTag is called to insert/update a peer tag
 func (cm *BasicConnMgr) UpsertTag(p peer.ID, tag string, upsert func(int) int) {
 	s := cm.segments.get(p)
 	s.Lock()
+	defer s.Unlock()
 
 	pi := s.tagInfoFor(p, cm.clock.Now())
 
@@ -636,7 +609,6 @@ func (cm *BasicConnMgr) UpsertTag(p peer.ID, tag string, upsert func(int) int) {
 	newval := upsert(oldval)
 	pi.value += newval - oldval
 	pi.tags[tag] = newval
-	s.Unlock()
 }
 
 // CMInfo holds the configuration for BasicConnMgr, as well as status data.
@@ -688,12 +660,13 @@ func (nn *cmNotifee) cm() *BasicConnMgr {
 // Connected is called by notifiers to inform that a new connection has been established.
 // The notifee updates the BasicConnMgr to start tracking the connection. If the new connection
 // count exceeds the high watermark, a trim may be triggered.
-func (nn *cmNotifee) Connected(n network.Network, c network.Conn) {
+func (nn *cmNotifee) Connected(_ network.Network, c network.Conn) {
 	cm := nn.cm()
 
 	p := c.RemotePeer()
 	s := cm.segments.get(p)
 	s.Lock()
+	defer s.Unlock()
 
 	id := c.RemotePeer()
 	pinfo, ok := s.peers[id]
@@ -716,36 +689,33 @@ func (nn *cmNotifee) Connected(n network.Network, c network.Conn) {
 
 	_, ok = pinfo.conns[c]
 	if ok {
-		log.Error("received connected notification for conn we are already tracking: ", p)
-		s.Unlock()
+		log.Error("received connected notification for conn we are already tracking", "peer", p)
 		return
 	}
 
 	pinfo.conns[c] = cm.clock.Now()
 	cm.connCount.Add(1)
-	s.Unlock()
 }
 
 // Disconnected is called by notifiers to inform that an existing connection has been closed or terminated.
 // The notifee updates the BasicConnMgr accordingly to stop tracking the connection, and performs housekeeping.
-func (nn *cmNotifee) Disconnected(n network.Network, c network.Conn) {
+func (nn *cmNotifee) Disconnected(_ network.Network, c network.Conn) {
 	cm := nn.cm()
 
 	p := c.RemotePeer()
 	s := cm.segments.get(p)
 	s.Lock()
+	defer s.Unlock()
 
 	cinf, ok := s.peers[p]
 	if !ok {
-		log.Error("received disconnected notification for peer we are not tracking: ", p)
-		s.Unlock()
+		log.Error("received disconnected notification for peer we are not tracking", "peer", p)
 		return
 	}
 
 	_, ok = cinf.conns[c]
 	if !ok {
-		log.Error("received disconnected notification for conn we are not tracking: ", p)
-		s.Unlock()
+		log.Error("received disconnected notification for conn we are not tracking", "peer", p)
 		return
 	}
 
@@ -754,11 +724,10 @@ func (nn *cmNotifee) Disconnected(n network.Network, c network.Conn) {
 		delete(s.peers, p)
 	}
 	cm.connCount.Add(-1)
-	s.Unlock()
 }
 
 // Listen is no-op in this implementation.
-func (nn *cmNotifee) Listen(n network.Network, addr ma.Multiaddr) {}
+func (nn *cmNotifee) Listen(_ network.Network, _ ma.Multiaddr) {}
 
 // ListenClose is no-op in this implementation.
-func (nn *cmNotifee) ListenClose(n network.Network, addr ma.Multiaddr) {}
+func (nn *cmNotifee) ListenClose(_ network.Network, _ ma.Multiaddr) {}

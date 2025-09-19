@@ -22,6 +22,10 @@ func VerencCompress(proof generated.VerencProof) generated.CompressedCiphertext 
 	return generated.VerencCompress(proof)
 }
 
+func VerencVerifyStatement(input []byte, blindingPubkey []byte, statement []byte) bool {
+	return generated.VerencVerifyStatement(input, blindingPubkey, statement)
+}
+
 func VerencRecover(recovery generated.VerencDecrypt) []byte {
 	return generated.VerencRecover(recovery)
 }

@@ -1,0 +1,10 @@
+// -*- go -*-
+
+package main
+
+// @Test 0 0 = 0 0 0 42
+// @Test 1 2 = 3 1 2 42
+func main(a, b int32) (int, int, int, int) {
+	var z int = int128(42)
+	return a + b, a, b, z
+}

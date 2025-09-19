@@ -1,0 +1,69 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2021 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package sha256 implements the he SHA-224 and SHA-256 cryptographic
+// hash functions.
+package sha256
+
+const (
+	// The size of a SHA256 checksum in bytes.
+	Size = 32
+
+	// The blocksize of SHA256 and SHA224 in bytes.
+	BlockSize = 64
+
+	init = 0x6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19
+)
+
+// Sum256 returns the SHA256 checksum of the data.
+func Sum256(data []byte) [Size]byte {
+	var state uint256 = init
+	var block uint512
+	var hash [Size]byte
+
+	var pad [BlockSize]byte
+	pad[0] = 0x80
+
+	for i := 0; i < len(data); i++ {
+		block <<= 8
+		block = block | uint512(data[i])
+
+		if (i+1)%BlockSize == 0 {
+			state = Block(block, state)
+			block = uint512(0)
+		}
+	}
+	if len(data)%BlockSize < 56 {
+		for i := len(data) % BlockSize; i < 56; i++ {
+			block <<= 8
+			block |= uint512(pad[i-len(data)%BlockSize])
+		}
+	} else {
+		for i := len(data) % BlockSize; i < BlockSize; i++ {
+			block <<= 8
+			block |= uint512(pad[i-len(data)%BlockSize])
+		}
+		state = Block(block, state)
+		block = uint512(0)
+	}
+	// Length in bits.
+	block <<= 64
+	block |= uint512(len(data) << 3)
+
+	state = Block(block, state)
+
+	for i := 0; i < Size; i++ {
+		hash[Size-i-1] = byte(state & 0xff)
+		state >>= 8
+	}
+	return hash
+}
+
+// Block adds a new SHA-256 block to the state.
+func Block(block uint512, state uint256) uint256 {
+	return native("sha256.circ", block, state)
+}

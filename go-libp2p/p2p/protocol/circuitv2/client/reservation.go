@@ -69,9 +69,11 @@ func Reserve(ctx context.Context, h host.Host, ai peer.AddrInfo) (*Reservation, 
 	if err != nil {
 		return nil, ReservationError{Status: pbv2.Status_CONNECTION_FAILED, Reason: "failed to open stream", err: err}
 	}
+	defer s.Close()
 
 	rd := util.NewDelimitedReader(s, maxMessageSize)
 	wr := util.NewDelimitedWriter(s)
+	defer rd.Close()
 
 	var msg pbv2.HopMessage
 	msg.Type = pbv2.HopMessage_RESERVE.Enum()
@@ -80,8 +82,6 @@ func Reserve(ctx context.Context, h host.Host, ai peer.AddrInfo) (*Reservation, 
 
 	if err := wr.WriteMsg(&msg); err != nil {
 		s.Reset()
-		s.Close()
-		rd.Close()
 		return nil, ReservationError{Status: pbv2.Status_CONNECTION_FAILED, Reason: "error writing reservation message", err: err}
 	}
 
@@ -89,38 +89,25 @@ func Reserve(ctx context.Context, h host.Host, ai peer.AddrInfo) (*Reservation, 
 
 	if err := rd.ReadMsg(&msg); err != nil {
 		s.Reset()
-		s.Close()
-		rd.Close()
 		return nil, ReservationError{Status: pbv2.Status_CONNECTION_FAILED, Reason: "error reading reservation response message: %w", err: err}
 	}
 
 	if msg.GetType() != pbv2.HopMessage_STATUS {
-		s.Close()
-		rd.Close()
-		return nil, ReservationError{
-			Status: pbv2.Status_MALFORMED_MESSAGE,
-			Reason: fmt.Sprintf("unexpected relay response: not a status message (%d)", msg.GetType()),
-			err:    err}
+		return nil, ReservationError{Status: pbv2.Status_MALFORMED_MESSAGE, Reason: fmt.Sprintf("unexpected relay response: not a status message (%d)", msg.GetType())}
 	}
 
 	if status := msg.GetStatus(); status != pbv2.Status_OK {
-		s.Close()
-		rd.Close()
 		return nil, ReservationError{Status: msg.GetStatus(), Reason: "reservation failed"}
 	}
 
 	rsvp := msg.GetReservation()
 	if rsvp == nil {
-		s.Close()
-		rd.Close()
 		return nil, ReservationError{Status: pbv2.Status_MALFORMED_MESSAGE, Reason: "missing reservation info"}
 	}
 
 	result := &Reservation{}
 	result.Expiration = time.Unix(int64(rsvp.GetExpire()), 0)
 	if result.Expiration.Before(time.Now()) {
-		s.Close()
-		rd.Close()
 		return nil, ReservationError{
 			Status: pbv2.Status_MALFORMED_MESSAGE,
 			Reason: fmt.Sprintf("received reservation with expiration date in the past: %s", result.Expiration),
@@ -132,7 +119,7 @@ func Reserve(ctx context.Context, h host.Host, ai peer.AddrInfo) (*Reservation, 
 	for _, ab := range addrs {
 		a, err := ma.NewMultiaddrBytes(ab)
 		if err != nil {
-			log.Warnf("ignoring unparsable relay address: %s", err)
+			log.Warn("ignoring unparsable relay address", "err", err)
 			continue
 		}
 		result.Addrs = append(result.Addrs, a)
@@ -140,10 +127,8 @@ func Reserve(ctx context.Context, h host.Host, ai peer.AddrInfo) (*Reservation, 
 
 	voucherBytes := rsvp.GetVoucher()
 	if voucherBytes != nil {
-		_, rec, err := record.ConsumeEnvelope(voucherBytes, proto.RecordDomain)
+		env, rec, err := record.ConsumeEnvelope(voucherBytes, proto.RecordDomain)
 		if err != nil {
-			s.Close()
-			rd.Close()
 			return nil, ReservationError{
 				Status: pbv2.Status_MALFORMED_MESSAGE,
 				Reason: fmt.Sprintf("error consuming voucher envelope: %s", err),
@@ -153,12 +138,31 @@ func Reserve(ctx context.Context, h host.Host, ai peer.AddrInfo) (*Reservation, 
 
 		voucher, ok := rec.(*proto.ReservationVoucher)
 		if !ok {
-			s.Close()
-			rd.Close()
 			return nil, ReservationError{
 				Status: pbv2.Status_MALFORMED_MESSAGE,
 				Reason: fmt.Sprintf("unexpected voucher record type: %+T", rec),
 			}
+		}
+		signerPeerID, err := peer.IDFromPublicKey(env.PublicKey)
+		if err != nil {
+			return nil, ReservationError{
+				Status: pbv2.Status_MALFORMED_MESSAGE,
+				Reason: fmt.Sprintf("invalid voucher signing public key: %s", err),
+				err:    err,
+			}
+		}
+		if signerPeerID != voucher.Relay {
+			return nil, ReservationError{
+				Status: pbv2.Status_MALFORMED_MESSAGE,
+				Reason: fmt.Sprintf("invalid voucher relay id: expected %s, got %s", signerPeerID, voucher.Relay),
+			}
+		}
+		if h.ID() != voucher.Peer {
+			return nil, ReservationError{
+				Status: pbv2.Status_MALFORMED_MESSAGE,
+				Reason: fmt.Sprintf("invalid voucher peer id: expected %s, got %s", h.ID(), voucher.Peer),
+			}
+
 		}
 		result.Voucher = voucher
 	}
@@ -169,7 +173,5 @@ func Reserve(ctx context.Context, h host.Host, ai peer.AddrInfo) (*Reservation, 
 		result.LimitData = limit.GetData()
 	}
 
-	s.Close()
-	rd.Close()
 	return result, nil
 }

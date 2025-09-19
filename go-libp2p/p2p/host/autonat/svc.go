@@ -52,21 +52,23 @@ func newAutoNATService(c *config) (*autoNATService, error) {
 
 func (as *autoNATService) handleStream(s network.Stream) {
 	if err := s.Scope().SetService(ServiceName); err != nil {
-		log.Debugf("error attaching stream to autonat service: %s", err)
+		log.Debug("error attaching stream to autonat service", "err", err)
 		s.Reset()
 		return
 	}
 
 	if err := s.Scope().ReserveMemory(maxMsgSize, network.ReservationPriorityAlways); err != nil {
-		log.Debugf("error reserving memory for autonat stream: %s", err)
+		log.Debug("error reserving memory for autonat stream", "err", err)
 		s.Reset()
 		return
 	}
+	defer s.Scope().ReleaseMemory(maxMsgSize)
 
 	s.SetDeadline(time.Now().Add(streamTimeout))
+	defer s.Close()
 
 	pid := s.Conn().RemotePeer()
-	log.Debugf("New stream from %s", pid)
+	log.Debug("New stream from peer", "peer", pid)
 
 	r := pbio.NewDelimitedReader(s, maxMsgSize)
 	w := pbio.NewDelimitedWriter(s)
@@ -76,19 +78,15 @@ func (as *autoNATService) handleStream(s network.Stream) {
 
 	err := r.ReadMsg(&req)
 	if err != nil {
-		log.Debugf("Error reading message from %s: %s", pid, err.Error())
+		log.Debug("Error reading message", "peer", pid, "err", err)
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMsgSize)
-		s.Close()
 		return
 	}
 
 	t := req.GetType()
 	if t != pb.Message_DIAL {
-		log.Debugf("Unexpected message from %s: %s (%d)", pid, t.String(), t)
+		log.Debug("Unexpected message", "peer", pid, "message_type", t.String(), "expected_type", pb.Message_DIAL.String())
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMsgSize)
-		s.Close()
 		return
 	}
 
@@ -98,17 +96,13 @@ func (as *autoNATService) handleStream(s network.Stream) {
 
 	err = w.WriteMsg(&res)
 	if err != nil {
-		log.Debugf("Error writing response to %s: %s", pid, err.Error())
+		log.Debug("Error writing response", "peer", pid, "err", err)
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMsgSize)
-		s.Close()
 		return
 	}
 	if as.config.metricsTracer != nil {
 		as.config.metricsTracer.OutgoingDialResponse(res.GetDialResponse().GetStatus())
 	}
-	s.Scope().ReleaseMemory(maxMsgSize)
-	s.Close()
 }
 
 func (as *autoNATService) handleDial(p peer.ID, obsaddr ma.Multiaddr, mpi *pb.Message_PeerInfo) *pb.Message_DialResponse {
@@ -143,10 +137,7 @@ func (as *autoNATService) handleDial(p peer.ID, obsaddr ma.Multiaddr, mpi *pb.Me
 	}
 
 	// Determine the peer's IP address.
-	hostIP, _, err := ma.SplitFirst(obsaddr)
-	if err != nil {
-		return newDialResponseError(pb.Message_E_INTERNAL_ERROR, err.Error())
-	}
+	hostIP, _ := ma.SplitFirst(obsaddr)
 	switch hostIP.Protocol().Code {
 	case ma.P_IP4, ma.P_IP6:
 	default:
@@ -162,22 +153,22 @@ func (as *autoNATService) handleDial(p peer.ID, obsaddr ma.Multiaddr, mpi *pb.Me
 	for _, maddr := range mpi.GetAddrs() {
 		addr, err := ma.NewMultiaddrBytes(maddr)
 		if err != nil {
-			log.Debugf("Error parsing multiaddr: %s", err.Error())
+			log.Debug("Error parsing multiaddr", "err", err)
 			continue
 		}
 
 		// For security reasons, we _only_ dial the observed IP address.
 		// Replace other IP addresses with the observed one so we can still try the
 		// requested ports/transports.
-		if ip, rest, _ := ma.SplitFirst(addr); !ip.Equal(hostIP) {
+		if ip, rest := ma.SplitFirst(addr); !ip.Equal(hostIP) {
 			// Make sure it's an IP address
 			switch ip.Protocol().Code {
 			case ma.P_IP4, ma.P_IP6:
 			default:
 				continue
 			}
-			addr = hostIP
-			if rest != nil {
+			addr = hostIP.Multiaddr()
+			if len(rest) > 0 {
 				addr = addr.Encapsulate(rest)
 			}
 		}
@@ -230,36 +221,36 @@ func (as *autoNATService) doDial(pi peer.AddrInfo) *pb.Message_DialResponse {
 	as.mx.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), as.config.dialTimeout)
+	defer cancel()
 
 	as.config.dialer.Peerstore().ClearAddrs(pi.ID)
 
 	as.config.dialer.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstore.TempAddrTTL)
 
+	defer func() {
+		as.config.dialer.Peerstore().ClearAddrs(pi.ID)
+		as.config.dialer.Peerstore().RemovePeer(pi.ID)
+	}()
+
 	conn, err := as.config.dialer.DialPeer(ctx, pi.ID)
 	if err != nil {
-		log.Debugf("error dialing %s: %s", pi.ID, err.Error())
+		log.Debug("error dialing peer", "peer", pi.ID, "err", err)
 		// wait for the context to timeout to avoid leaking timing information
 		// this renders the service ineffective as a port scanner
 		<-ctx.Done()
-		cancel()
-		as.config.dialer.Peerstore().ClearAddrs(pi.ID)
-		as.config.dialer.Peerstore().RemovePeer(pi.ID)
 		return newDialResponseError(pb.Message_E_DIAL_ERROR, "dial failed")
 	}
 
 	ra := conn.RemoteMultiaddr()
 	as.config.dialer.ClosePeer(pi.ID)
-	cancel()
-	as.config.dialer.Peerstore().ClearAddrs(pi.ID)
-	as.config.dialer.Peerstore().RemovePeer(pi.ID)
 	return newDialResponseOK(ra)
 }
 
 // Enable the autoNAT service if it is not running.
 func (as *autoNATService) Enable() {
 	as.instanceLock.Lock()
+	defer as.instanceLock.Unlock()
 	if as.instance != nil {
-		as.instanceLock.Unlock()
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -268,19 +259,18 @@ func (as *autoNATService) Enable() {
 	as.config.host.SetStreamHandler(AutoNATProto, as.handleStream)
 
 	go as.background(ctx)
-	as.instanceLock.Unlock()
 }
 
 // Disable the autoNAT service if it is running.
 func (as *autoNATService) Disable() {
 	as.instanceLock.Lock()
+	defer as.instanceLock.Unlock()
 	if as.instance != nil {
 		as.config.host.RemoveStreamHandler(AutoNATProto)
 		as.instance()
 		as.instance = nil
 		<-as.backgroundRunning
 	}
-	as.instanceLock.Unlock()
 }
 
 func (as *autoNATService) Close() error {
@@ -289,7 +279,10 @@ func (as *autoNATService) Close() error {
 }
 
 func (as *autoNATService) background(ctx context.Context) {
+	defer close(as.backgroundRunning)
+
 	timer := time.NewTimer(as.config.throttleResetPeriod)
+	defer timer.Stop()
 
 	for {
 		select {
@@ -301,8 +294,6 @@ func (as *autoNATService) background(ctx context.Context) {
 			jitter := rand.Float32() * float32(as.config.throttleResetJitter)
 			timer.Reset(as.config.throttleResetPeriod + time.Duration(int64(jitter)))
 		case <-ctx.Done():
-			close(as.backgroundRunning)
-			timer.Stop()
 			return
 		}
 	}

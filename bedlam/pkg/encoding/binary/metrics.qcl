@@ -1,0 +1,12 @@
+// -*- go -*-
+//
+// Copyright (c) 2020 Markku Rossi
+//
+// All rights reserved.
+//
+
+package binary
+
+func HammingDistance(a, b uint) uint {
+	return native("hamming", a, b)
+}

@@ -1,0 +1,19 @@
+// -*- go -*-
+
+package main
+
+import (
+	"crypto/cipher/cts"
+)
+
+// @Hex
+// @LSB
+// @Test 0xc6353568f2bf8cb4d8a580362da7ff7f97 _ = 0x4920776f756c64206c696b652074686520
+func main(data []byte, e []byte) []byte {
+	key := []byte{
+		0x63, 0x68, 0x69, 0x63, 0x6b, 0x65, 0x6e, 0x20,
+		0x74, 0x65, 0x72, 0x69, 0x79, 0x61, 0x6b, 0x69,
+	}
+	var iv [16]byte
+	return cts.DecryptAES128(key, iv, data)
+}

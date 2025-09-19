@@ -3,4 +3,26 @@ namespace bls48581 {
     sequence<u8> commit_raw([ByRef] sequence<u8> data, u64 poly_size);
     sequence<u8> prove_raw([ByRef] sequence<u8> data, u64 index, u64 poly_size);
     boolean verify_raw([ByRef] sequence<u8> data, [ByRef] sequence<u8> commit, u64 index, [ByRef] sequence<u8> proof, u64 poly_size);
+    Multiproof prove_multiple([ByRef] sequence<sequence<u8>> commitments, [ByRef] sequence<sequence<u8>> polys, [ByRef] sequence<u64> indices, u64 poly_size);
+    boolean verify_multiple([ByRef] sequence<sequence<u8>> commitments, [ByRef] sequence<sequence<u8>> evaluations, [ByRef] sequence<u64> indices, u64 poly_size, [ByRef] sequence<u8> multi_commitment, [ByRef] sequence<u8> proof);
+    BlsKeygenOutput bls_keygen();
+    sequence<u8> bls_sign([ByRef] sequence<u8> sk, [ByRef] sequence<u8> msg, [ByRef] sequence<u8> domain);
+    boolean bls_verify([ByRef] sequence<u8> pk, [ByRef] sequence<u8> sig, [ByRef] sequence<u8> msg, [ByRef] sequence<u8> domain);
+    BlsAggregateOutput bls_aggregate([ByRef] sequence<sequence<u8>> pks, [ByRef] sequence<sequence<u8>> sigs);
+};
+
+dictionary Multiproof {
+  sequence<u8> d;
+  sequence<u8> proof;
+};
+
+dictionary BlsKeygenOutput {
+  sequence<u8> secret_key;
+  sequence<u8> public_key;
+  sequence<u8> proof_of_possession_sig;
+};
+
+dictionary BlsAggregateOutput {
+  sequence<u8> aggregate_public_key;
+  sequence<u8> aggregate_signature;
 };

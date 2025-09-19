@@ -1,0 +1,31 @@
+// -*- go -*-
+
+package main
+
+func sum(arr []int32) int32 {
+	var sum int32
+	for i := 0; i < len(arr); i++ {
+		sum += arr[i]
+	}
+	return sum
+}
+
+func trampoline(a *[10]int32) int {
+	return sum(a)
+}
+
+// @Test 0 0 = 0
+// @Test 1 0 = 5
+// @Test 1 2 = 15
+func main(a, b int32) int {
+	var arr [10]int32
+
+	for i := 0; i < len(arr); i++ {
+		if i < len(arr)/2 {
+			arr[i] = a
+		} else {
+			arr[i] = b
+		}
+	}
+	return trampoline(&arr)
+}

@@ -68,6 +68,31 @@ int8_t uniffiForeignExecutorCallbackbls48581(uint64_t, uint32_t, RustTaskCallbac
 
 void uniffiFutureContinuationCallbackbls48581(void*, int8_t);
 
+RustBuffer uniffi_bls48581_fn_func_bls_aggregate(
+	RustBuffer pks,
+	RustBuffer sigs,
+	RustCallStatus* out_status
+);
+
+RustBuffer uniffi_bls48581_fn_func_bls_keygen(
+	RustCallStatus* out_status
+);
+
+RustBuffer uniffi_bls48581_fn_func_bls_sign(
+	RustBuffer sk,
+	RustBuffer msg,
+	RustBuffer domain,
+	RustCallStatus* out_status
+);
+
+int8_t uniffi_bls48581_fn_func_bls_verify(
+	RustBuffer pk,
+	RustBuffer sig,
+	RustBuffer msg,
+	RustBuffer domain,
+	RustCallStatus* out_status
+);
+
 RustBuffer uniffi_bls48581_fn_func_commit_raw(
 	RustBuffer data,
 	uint64_t poly_size,
@@ -78,10 +103,28 @@ void uniffi_bls48581_fn_func_init(
 	RustCallStatus* out_status
 );
 
+RustBuffer uniffi_bls48581_fn_func_prove_multiple(
+	RustBuffer commitments,
+	RustBuffer polys,
+	RustBuffer indices,
+	uint64_t poly_size,
+	RustCallStatus* out_status
+);
+
 RustBuffer uniffi_bls48581_fn_func_prove_raw(
 	RustBuffer data,
 	uint64_t index,
 	uint64_t poly_size,
+	RustCallStatus* out_status
+);
+
+int8_t uniffi_bls48581_fn_func_verify_multiple(
+	RustBuffer commitments,
+	RustBuffer evaluations,
+	RustBuffer indices,
+	uint64_t poly_size,
+	RustBuffer multi_commitment,
+	RustBuffer proof,
 	RustCallStatus* out_status
 );
 
@@ -393,6 +436,22 @@ void ffi_bls48581_rust_future_complete_void(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_bls48581_checksum_func_bls_aggregate(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_bls48581_checksum_func_bls_keygen(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_bls48581_checksum_func_bls_sign(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_bls48581_checksum_func_bls_verify(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_bls48581_checksum_func_commit_raw(
 	RustCallStatus* out_status
 );
@@ -401,7 +460,15 @@ uint16_t uniffi_bls48581_checksum_func_init(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_bls48581_checksum_func_prove_multiple(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_bls48581_checksum_func_prove_raw(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_bls48581_checksum_func_verify_multiple(
 	RustCallStatus* out_status
 );
 

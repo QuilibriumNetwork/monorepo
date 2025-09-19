@@ -10,7 +10,9 @@ name = "bls48581"
 [dependencies]
 hex = "0.4.3"
 serde_json = "1.0.117"
-uniffi = {  version= "0.25", features = ["cli"]}
+uniffi = { version= "0.25", features = ["cli"] }
+rand = "0.8.5"
+sha2 = "0.10.8"
 
 [dev-dependencies]
 criterion = { version = "0.4", features = ["html_reports"] }

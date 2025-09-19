@@ -1,0 +1,33 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2021 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package aes implements the Advanced Encryption Standard (AES)
+// block cipher operations.
+package aes
+
+// BlockSize defines the AES cipher block size in bytes.
+const BlockSize = 16
+
+// EncryptBlock encrypts one data block with the key. The key must be
+// 16, 24, or 32 bytes long.
+func EncryptBlock(key []byte, data [BlockSize]byte) [BlockSize]byte {
+	enc := ExpandEncryptionKey(key)
+
+	var dst [BlockSize]byte
+
+	return EncryptBlockExpanded(enc, dst, data)
+}
+
+// DecryptBlock decrypts one data block with the key. The key must be
+// 16, 24, or 32 bytes long.
+func DecryptBlock(key []byte, data [BlockSize]byte) [BlockSize]byte {
+	enc, dec := ExpandKey(key)
+
+	var dst [BlockSize]byte
+
+	return DecryptBlockExpanded(dec, dst, data)
+}

@@ -1,0 +1,24 @@
+// -*- go -*-
+
+package main
+
+type Foo struct {
+	A int32
+	B int32
+}
+
+func Set(ptr *int32, val int32) {
+	*ptr = val
+}
+
+var f Foo
+
+// @Test 0 0 = 0
+// @Test 1 2 = 3
+// @Test 7 4 = 11
+func main(a, b int32) int {
+	Set(&f.A, a)
+	Set(&f.B, b)
+
+	return f.A + f.B
+}

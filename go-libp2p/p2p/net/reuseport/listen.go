@@ -68,6 +68,7 @@ func (t *Transport) Listen(laddr ma.Multiaddr) (manet.Listener, error) {
 	}
 
 	n.mu.Lock()
+	defer n.mu.Unlock()
 
 	if n.listeners == nil {
 		n.listeners = make(map[*listener]struct{})
@@ -75,6 +76,5 @@ func (t *Transport) Listen(laddr ma.Multiaddr) (manet.Listener, error) {
 	n.listeners[list] = struct{}{}
 	n.dialer = nil
 
-	n.mu.Unlock()
 	return list, nil
 }

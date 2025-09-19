@@ -6,19 +6,19 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"go.uber.org/zap"
 )
 
 type peerMonitor struct {
-	h        host.Host
+	ps       *ping.PingService
 	timeout  time.Duration
 	period   time.Duration
 	attempts int
 }
 
-func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, conn network.Conn) bool {
+func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, peer peer.ID) bool {
 	pingCtx, cancel := context.WithTimeout(ctx, pm.timeout)
 	defer cancel()
 	select {
@@ -26,7 +26,7 @@ func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, conn ne
 	case <-pingCtx.Done():
 		logger.Debug("ping timeout")
 		return false
-	case res := <-ping.PingConn(pingCtx, pm.h.Peerstore(), conn):
+	case res := <-pm.ps.Ping(pingCtx, peer):
 		if res.Error != nil {
 			logger.Debug("ping error", zap.Error(res.Error))
 			return false
@@ -36,17 +36,11 @@ func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, conn ne
 	return true
 }
 
-func (pm *peerMonitor) ping(ctx context.Context, logger *zap.Logger, wg *sync.WaitGroup, conn network.Conn) {
+func (pm *peerMonitor) ping(ctx context.Context, logger *zap.Logger, wg *sync.WaitGroup, peer peer.ID) {
 	defer wg.Done()
 	for i := 0; i < pm.attempts; i++ {
-		if pm.pingOnce(ctx, logger, conn) {
-			return
-		}
-		if conn.IsClosed() {
-			return
-		}
+		pm.pingOnce(ctx, logger, peer)
 	}
-	_ = conn.Close()
 }
 
 func (pm *peerMonitor) run(ctx context.Context, logger *zap.Logger) {
@@ -55,16 +49,13 @@ func (pm *peerMonitor) run(ctx context.Context, logger *zap.Logger) {
 		case <-ctx.Done():
 			return
 		case <-time.After(pm.period):
-			peers := pm.h.Network().Peers()
+			peers := pm.ps.Host.Network().Peers()
 			logger.Debug("pinging connected peers", zap.Int("peer_count", len(peers)))
 			wg := &sync.WaitGroup{}
 			for _, id := range peers {
-				logger := logger.With(zap.String("peer_id", id.String()))
-				for _, conn := range pm.h.Network().ConnsToPeer(id) {
-					logger := logger.With(zap.String("connection_id", conn.ID()))
-					wg.Add(1)
-					go pm.ping(ctx, logger, wg, conn)
-				}
+				slogger := logger.With(zap.String("peer_id", id.String()))
+				wg.Add(1)
+				go pm.ping(ctx, slogger, wg, id)
 			}
 			wg.Wait()
 			logger.Debug("pinged connected peers")
@@ -78,11 +69,13 @@ func (pm *peerMonitor) run(ctx context.Context, logger *zap.Logger) {
 func MonitorPeers(
 	ctx context.Context, logger *zap.Logger, h host.Host, timeout, period time.Duration, attempts int,
 ) {
+	ps := ping.NewPingService(h)
 	pm := &peerMonitor{
-		h:        h,
+		ps:       ps,
 		timeout:  timeout,
 		period:   period,
 		attempts: attempts,
 	}
+
 	go pm.run(ctx, logger)
 }

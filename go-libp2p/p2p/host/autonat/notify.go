@@ -17,10 +17,12 @@ func (as *AmbientAutoNAT) ListenClose(net network.Network, a ma.Multiaddr) {}
 
 // Connected is part of the network.Notifiee interface
 func (as *AmbientAutoNAT) Connected(net network.Network, c network.Conn) {
-	if is, err := manet.IsPublicAddr(c.RemoteMultiaddr()); c.Stat().Direction == network.DirInbound && is && err == nil {
-		select {
-		case as.inboundConn <- c:
-		default:
+	if c.Stat().Direction == network.DirInbound {
+		if pubadd, err := manet.IsPublicAddr(c.RemoteMultiaddr()); err == nil && pubadd {
+			select {
+			case as.inboundConn <- c:
+			default:
+			}
 		}
 	}
 }

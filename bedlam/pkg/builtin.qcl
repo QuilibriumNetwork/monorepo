@@ -1,0 +1,94 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2024 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package builtin defines QCL built-in functions and types. This
+// package is always imported, and the functions and types can be used
+// in all programs.
+package builtin
+
+// bool is a boolean value true or false.
+type bool bool
+
+// byte is an alias for unsigned 8-bit integer numbers.
+type byte = uint8
+
+// rune is an alias for int32.
+type rune = int32
+
+// intSize is a Size-bit signed integer number. The signed integer
+// numbers can be instantiated in any bit sizes.
+type intSize int
+
+// uintSize is a Size-bit unsigned integer number. The unsigned
+// integer numbers can be instantiated in any bit sizes.
+type uintSize uint
+
+// stringSize defines Size-bit long string.
+type stringSize string
+
+// The copy built-in function copies elements from a source slice into
+// a destination slice. The source and destination slices may
+// overlap. The function returns the number of elements copied, which
+// will be the minimum of len(src) and len(dst).
+func copy(dst, src []Type) int32 {}
+
+// The floorPow2 built-in function returns the power of 2 number that
+// is smaller than or equal to the argument value.
+func floorPow2(v int) int {}
+
+// The len built-in function returns the length of the argument value,
+// according to its type:
+//
+//	Array:  the number of elements in the array
+//	Slice:  the number of elements in the slice
+//	String: the number of bytes in the string
+func len(v Type) int32 {}
+
+// The make built-in function creates arrays or concrete type
+// instances. The arrays are created by specifying a concrete array
+// type as the Type argument:
+//
+//	buf := make([]byte, 10)
+//
+// The concrete type instances are created by specifying an inconcrete
+// type as the Type argument, and type bit size as the Size argument:
+//
+//	i1024 := make(int, 1024)
+//	var x i1024
+func make(t Type, s Size) {}
+
+// The native built-in function loads the native circuit from the
+// named file. The circuit must be located in the same directory as
+// the calling QCL program. The native built-in function supports the
+// following circuit formats:
+//
+//	.circ    Bristol circuit format
+//	.bristol Bristol circuit format
+//	.qclc   compiled QCL circuit format
+func native(name string) []Type {}
+
+// The size built-in function returns the size of the argument value
+// in bits. The argument value can be of any type.
+func size(v Type) int32 {}
+
+// The panic built-in function terminates the compilation with an
+// error message. The first argument is used as a format string, and
+// the remaining arguments are positional arguments for the formatted
+// message. Any extra arguments are appended to the result string,
+// separated by a space character. The panic built-in function is a
+// compile-time call. If any of the live execution paths contains a
+// panic call, it will be triggered during the compilation phase and
+// terminate the compilation. The panic function is usually used in
+// parametrized functions to assert pre-conditions:
+//
+//	func CryptBlocks(data []byte) []byte {
+//	    if len(data)%blockSize != 0 {
+//	        panic("input not full blocks")
+//	    }
+//	    ...
+//	}
+func panic(args any) {}

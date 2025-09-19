@@ -3,16 +3,15 @@ package autorelay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
-	basic "github.com/libp2p/go-libp2p/p2p/host/basic"
 	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 
-	logging "github.com/ipfs/go-log/v2"
-	ma "github.com/multiformats/go-multiaddr"
+	logging "github.com/libp2p/go-libp2p/gologshim"
 )
 
 var log = logging.Logger("autorelay")
@@ -22,23 +21,19 @@ type AutoRelay struct {
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 
-	conf *config
-
 	mx     sync.Mutex
 	status network.Reachability
 
 	relayFinder *relayFinder
 
-	host   host.Host
-	addrsF basic.AddrsFactory
+	host host.Host
 
 	metricsTracer MetricsTracer
 }
 
-func NewAutoRelay(bhost *basic.BasicHost, opts ...Option) (*AutoRelay, error) {
+func NewAutoRelay(host host.Host, opts ...Option) (*AutoRelay, error) {
 	r := &AutoRelay{
-		host:   bhost,
-		addrsF: bhost.AddrsFactory,
+		host:   host,
 		status: network.ReachabilityUnknown,
 	}
 	conf := defaultConfig
@@ -48,10 +43,12 @@ func NewAutoRelay(bhost *basic.BasicHost, opts ...Option) (*AutoRelay, error) {
 		}
 	}
 	r.ctx, r.ctxCancel = context.WithCancel(context.Background())
-	r.conf = &conf
-	r.relayFinder = newRelayFinder(bhost, conf.peerSource, &conf)
+	rf, err := newRelayFinder(host, &conf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create autorelay: %w", err)
+	}
+	r.relayFinder = rf
 	r.metricsTracer = &wrappedMetricsTracer{conf.metricsTracer}
-	bhost.AddrsFactory = r.hostAddrs
 
 	return r, nil
 }
@@ -59,8 +56,8 @@ func NewAutoRelay(bhost *basic.BasicHost, opts ...Option) (*AutoRelay, error) {
 func (r *AutoRelay) Start() {
 	r.refCount.Add(1)
 	go func() {
+		defer r.refCount.Done()
 		r.background()
-		r.refCount.Done()
 	}()
 }
 
@@ -70,18 +67,16 @@ func (r *AutoRelay) background() {
 		log.Debug("failed to subscribe to the EvtLocalReachabilityChanged")
 		return
 	}
+	defer subReachability.Close()
 
 	for {
 		select {
 		case <-r.ctx.Done():
-			subReachability.Close()
 			return
 		case ev, ok := <-subReachability.Out():
 			if !ok {
-				subReachability.Close()
 				return
 			}
-			// TODO: push changed addresses
 			evt := ev.(event.EvtLocalReachabilityChanged)
 			switch evt.Reachability {
 			case network.ReachabilityPrivate, network.ReachabilityUnknown:
@@ -89,7 +84,7 @@ func (r *AutoRelay) background() {
 				if errors.Is(err, errAlreadyRunning) {
 					log.Debug("tried to start already running relay finder")
 				} else if err != nil {
-					log.Errorw("failed to start relay finder", "error", err)
+					log.Error("failed to start relay finder", "err", err)
 				} else {
 					r.metricsTracer.RelayFinderStatus(true)
 				}
@@ -102,23 +97,6 @@ func (r *AutoRelay) background() {
 			r.mx.Unlock()
 		}
 	}
-}
-
-func (r *AutoRelay) hostAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
-	return r.relayAddrs(r.addrsF(addrs))
-}
-
-func (r *AutoRelay) relayAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
-	r.mx.Lock()
-
-	if r.status != network.ReachabilityPrivate {
-		r.mx.Unlock()
-		return addrs
-	}
-
-	a := r.relayFinder.relayAddrs(addrs)
-	r.mx.Unlock()
-	return a
 }
 
 func (r *AutoRelay) Close() error {

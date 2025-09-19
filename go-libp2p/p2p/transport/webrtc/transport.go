@@ -1,15 +1,5 @@
 // Package libp2pwebrtc implements the WebRTC transport for go-libp2p,
 // as described in https://github.com/libp2p/specs/tree/master/webrtc.
-//
-// At this point, this package is EXPERIMENTAL, and the WebRTC transport is not enabled by default.
-// While we're fairly confident that the implementation correctly implements the specification,
-// we're not making any guarantees regarding its security (especially regarding resource exhaustion attacks).
-// Fixes, even for security-related issues, will be conducted in the open.
-//
-// Experimentation is encouraged. Please open an issue if you encounter any problems with this transport.
-//
-// The udpmux subpackage contains the logic for multiplexing multiple WebRTC (ICE)
-// connections over a single UDP socket.
 package libp2pwebrtc
 
 import (
@@ -19,13 +9,14 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"time"
 
-	mrand "golang.org/x/exp/rand"
+	mrand "math/rand/v2"
+
 	"google.golang.org/protobuf/proto"
 
 	"github.com/libp2p/go-libp2p/core/connmgr"
@@ -36,6 +27,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/sec"
 	tpt "github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/webrtc/pb"
 	"github.com/libp2p/go-msgio"
 
@@ -44,7 +36,7 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/pion/datachannel"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 var webrtcComponent *ma.Component
@@ -53,7 +45,8 @@ func init() {
 	var err error
 	webrtcComponent, err = ma.NewComponent(ma.ProtocolWithCode(ma.P_WEBRTC_DIRECT).Name, "")
 	if err != nil {
-		log.Fatal(err)
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Executable()
 	}
 }
 
@@ -77,7 +70,13 @@ const (
 	DefaultFailedTimeout       = 30 * time.Second
 	DefaultKeepaliveTimeout    = 15 * time.Second
 
-	sctpReceiveBufferSize = 100_000
+	// sctpReceiveBufferSize is the size of the buffer for incoming messages.
+	//
+	// This is enough space for enqueuing 10 full sized messages.
+	// Besides throughput, this only matters if an application is using multiple dependent
+	// streams, say streams 1 & 2. It reads from stream 1 only after receiving message from
+	// stream 2. A buffer of 10 messages should serve all such situations.
+	sctpReceiveBufferSize = 10 * maxReceiveMessageSize
 )
 
 type WebRTCTransport struct {
@@ -87,6 +86,8 @@ type WebRTCTransport struct {
 	privKey      ic.PrivKey
 	noiseTpt     *noise.Transport
 	localPeerId  peer.ID
+
+	listenUDP func(network string, laddr *net.UDPAddr) (net.PacketConn, error)
 
 	// timeouts
 	peerConnectionTimeouts iceTimeouts
@@ -105,7 +106,9 @@ type iceTimeouts struct {
 	Keepalive  time.Duration
 }
 
-func New(privKey ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr network.ResourceManager, opts ...Option) (*WebRTCTransport, error) {
+type ListenUDPFn func(network string, laddr *net.UDPAddr) (net.PacketConn, error)
+
+func New(privKey ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr network.ResourceManager, listenUDP ListenUDPFn, opts ...Option) (*WebRTCTransport, error) {
 	if psk != nil {
 		log.Error("WebRTC doesn't support private networks yet.")
 		return nil, fmt.Errorf("WebRTC doesn't support private networks yet")
@@ -151,6 +154,7 @@ func New(privKey ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr 
 		noiseTpt:     noiseTpt,
 		localPeerId:  localPeerID,
 
+		listenUDP: listenUDP,
 		peerConnectionTimeouts: iceTimeouts{
 			Disconnect: DefaultDisconnectedTimeout,
 			Failed:     DefaultFailedTimeout,
@@ -165,6 +169,10 @@ func New(privKey ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr 
 		}
 	}
 	return transport, nil
+}
+
+func (t *WebRTCTransport) ListenOrder() int {
+	return libp2pquic.ListenOrder + 1 // We want to listen after QUIC listens so we can possibly reuse the same port.
 }
 
 func (t *WebRTCTransport) Protocols() []int {
@@ -186,11 +194,7 @@ func (t *WebRTCTransport) CanDial(addr ma.Multiaddr) bool {
 // be multiplexed on the same port as other UDP based transports like QUIC and WebTransport.
 // See https://github.com/libp2p/go-libp2p/issues/2446 for details.
 func (t *WebRTCTransport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
-	addr, wrtcComponent, err := ma.SplitLast(addr)
-	if err != nil {
-		return nil, err
-	}
-
+	addr, wrtcComponent := ma.SplitLast(addr)
 	isWebrtc := wrtcComponent.Equal(webrtcComponent)
 	if !isWebrtc {
 		return nil, fmt.Errorf("must listen on webrtc multiaddr")
@@ -204,7 +208,7 @@ func (t *WebRTCTransport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 		return nil, fmt.Errorf("listener could not resolve udp address: %w", err)
 	}
 
-	socket, err := net.ListenUDP(nw, udpAddr)
+	socket, err := t.listenUDP(nw, udpAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen on udp: %w", err)
 	}
@@ -217,7 +221,7 @@ func (t *WebRTCTransport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 	return listener, nil
 }
 
-func (t *WebRTCTransport) listenSocket(socket *net.UDPConn) (tpt.Listener, error) {
+func (t *WebRTCTransport) listenSocket(socket net.PacketConn) (tpt.Listener, error) {
 	listenerMultiaddr, err := manet.FromNetAddr(socket.LocalAddr())
 	if err != nil {
 		return nil, err
@@ -237,7 +241,7 @@ func (t *WebRTCTransport) listenSocket(socket *net.UDPConn) (tpt.Listener, error
 	if err != nil {
 		return nil, err
 	}
-	listenerMultiaddr = listenerMultiaddr.Encapsulate(webrtcComponent).Encapsulate(certComp)
+	listenerMultiaddr = listenerMultiaddr.AppendComponent(webrtcComponent, certComp)
 
 	return newListener(
 		t,
@@ -273,6 +277,7 @@ func (t *WebRTCTransport) dial(ctx context.Context, scope network.ConnManagement
 			}
 			if tConn != nil {
 				_ = tConn.Close()
+				tConn = nil
 			}
 		}
 	}()
@@ -370,7 +375,7 @@ func (t *WebRTCTransport) dial(ctx context.Context, scope network.ConnManagement
 	if err != nil {
 		return nil, err
 	}
-	channel := newStream(w.HandshakeDataChannel, detached, func() {})
+	channel := newStream(w.HandshakeDataChannel, detached, maxSendMessageSize, nil)
 
 	remotePubKey, err := t.noiseHandshake(ctx, w.PeerConnection, channel, p, remoteHashFunction, false)
 	if err != nil {
@@ -390,10 +395,7 @@ func (t *WebRTCTransport) dial(ctx context.Context, scope network.ConnManagement
 	if err != nil {
 		return nil, err
 	}
-	remoteMultiaddrWithoutCerthash, _, err := ma.SplitFunc(remoteMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
-	if err != nil {
-		return nil, err
-	}
+	remoteMultiaddrWithoutCerthash, _ := ma.SplitFunc(remoteMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
 
 	conn, err := newConnection(
 		network.DirOutbound,
@@ -406,6 +408,7 @@ func (t *WebRTCTransport) dial(ctx context.Context, scope network.ConnManagement
 		remotePubKey,
 		remoteMultiaddrWithoutCerthash,
 		w.IncomingDataChannels,
+		w.PeerConnectionClosedCh,
 	)
 	if err != nil {
 		return nil, err
@@ -422,16 +425,18 @@ func genUfrag() string {
 		uFragAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
 		uFragPrefix   = "libp2p+webrtc+v1/"
 		uFragIdLength = 32
-		uFragIdOffset = len(uFragPrefix)
-		uFragLength   = uFragIdOffset + uFragIdLength
+		uFragLength   = len(uFragPrefix) + uFragIdLength
 	)
 
-	seed := [8]byte{}
+	seed := [32]byte{}
 	rand.Read(seed[:])
-	r := mrand.New(mrand.NewSource(binary.BigEndian.Uint64(seed[:])))
+	r := mrand.New(mrand.New(mrand.NewChaCha8(seed)))
 	b := make([]byte, uFragLength)
-	for i := uFragIdOffset; i < uFragLength; i++ {
-		b[i] = uFragAlphabet[r.Intn(len(uFragAlphabet))]
+	for i := 0; i < len(uFragPrefix); i++ {
+		b[i] = uFragPrefix[i]
+	}
+	for i := len(uFragPrefix); i < uFragLength; i++ {
+		b[i] = uFragAlphabet[r.IntN(len(uFragAlphabet))]
 	}
 	return string(b)
 }
@@ -470,12 +475,12 @@ func (t *WebRTCTransport) generateNoisePrologue(pc *webrtc.PeerConnection, hash 
 
 	localEncoded, err := multihash.Encode(localFpBytes, multihash.SHA2_256)
 	if err != nil {
-		log.Debugf("could not encode multihash for local fingerprint")
+		log.Debug("could not encode multihash for local fingerprint")
 		return nil, err
 	}
 	remoteEncoded, err := multihash.Encode(remoteFpBytes, multihash.SHA2_256)
 	if err != nil {
-		log.Debugf("could not encode multihash for remote fingerprint")
+		log.Debug("could not encode multihash for remote fingerprint")
 		return nil, err
 	}
 
@@ -577,9 +582,10 @@ func detachHandshakeDataChannel(ctx context.Context, dc *webrtc.DataChannel) (da
 // a small window of time where datachannels created by the peer may not surface to us and cause a
 // memory leak.
 type webRTCConnection struct {
-	PeerConnection       *webrtc.PeerConnection
-	HandshakeDataChannel *webrtc.DataChannel
-	IncomingDataChannels chan dataChannel
+	PeerConnection         *webrtc.PeerConnection
+	HandshakeDataChannel   *webrtc.DataChannel
+	IncomingDataChannels   chan dataChannel
+	PeerConnectionClosedCh chan struct{}
 }
 
 func newWebRTCConnection(settings webrtc.SettingEngine, config webrtc.Configuration) (webRTCConnection, error) {
@@ -604,13 +610,13 @@ func newWebRTCConnection(settings webrtc.SettingEngine, config webrtc.Configurat
 		dc.OnOpen(func() {
 			rwc, err := dc.Detach()
 			if err != nil {
-				log.Warnf("could not detach datachannel: id: %d", *dc.ID())
+				log.Warn("could not detach datachannel", "id", *dc.ID())
 				return
 			}
 			select {
 			case incomingDataChannels <- dataChannel{rwc, dc}:
 			default:
-				log.Warnf("connection busy, rejecting stream")
+				log.Warn("connection busy, rejecting stream")
 				b, _ := proto.Marshal(&pb.Message{Flag: pb.Message_RESET.Enum()})
 				w := msgio.NewWriter(rwc)
 				w.WriteMsg(b)
@@ -618,10 +624,20 @@ func newWebRTCConnection(settings webrtc.SettingEngine, config webrtc.Configurat
 			}
 		})
 	})
+
+	connectionClosedCh := make(chan struct{}, 1)
+	pc.SCTP().OnClose(func(_ error) {
+		// We only need one message. Closing a connection is a problem as pion might invoke the callback more than once.
+		select {
+		case connectionClosedCh <- struct{}{}:
+		default:
+		}
+	})
 	return webRTCConnection{
-		PeerConnection:       pc,
-		HandshakeDataChannel: handshakeDataChannel,
-		IncomingDataChannels: incomingDataChannels,
+		PeerConnection:         pc,
+		HandshakeDataChannel:   handshakeDataChannel,
+		IncomingDataChannels:   incomingDataChannels,
+		PeerConnectionClosedCh: connectionClosedCh,
 	}, nil
 }
 

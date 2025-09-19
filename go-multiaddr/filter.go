@@ -54,14 +54,13 @@ func (fs *Filters) find(ipnet net.IPNet) (int, *filterEntry) {
 // the provided IPNet mask.
 func (fs *Filters) AddFilter(ipnet net.IPNet, action Action) {
 	fs.mu.Lock()
+	defer fs.mu.Unlock()
 
 	if _, f := fs.find(ipnet); f != nil {
 		f.action = action
 	} else {
 		fs.filters = append(fs.filters, &filterEntry{ipnet, action})
 	}
-
-	fs.mu.Unlock()
 }
 
 // RemoveLiteral removes the first filter associated with the supplied IPNet,
@@ -69,14 +68,12 @@ func (fs *Filters) AddFilter(ipnet net.IPNet, action Action) {
 // between whether the rule is an accept or a deny.
 func (fs *Filters) RemoveLiteral(ipnet net.IPNet) (removed bool) {
 	fs.mu.Lock()
+	defer fs.mu.Unlock()
 
 	if idx, _ := fs.find(ipnet); idx != -1 {
 		fs.filters = append(fs.filters[:idx], fs.filters[idx+1:]...)
-		fs.mu.Unlock()
 		return true
 	}
-
-	fs.mu.Unlock()
 	return false
 }
 
@@ -101,7 +98,6 @@ func (fs *Filters) AddrBlocked(a Multiaddr) (deny bool) {
 		if e != nil {
 			return false
 		}
-
 		switch c.Protocol().Code {
 		case P_IP6ZONE:
 			return true
@@ -119,6 +115,7 @@ func (fs *Filters) AddrBlocked(a Multiaddr) (deny bool) {
 	}
 
 	fs.mu.RLock()
+	defer fs.mu.RUnlock()
 
 	action := fs.DefaultAction
 	for _, ft := range fs.filters {
@@ -127,7 +124,6 @@ func (fs *Filters) AddrBlocked(a Multiaddr) (deny bool) {
 		}
 	}
 
-	fs.mu.RUnlock()
 	return action == ActionDeny
 }
 
@@ -141,13 +137,12 @@ func (fs *Filters) ActionForFilter(ipnet net.IPNet) (action Action, ok bool) {
 // FiltersForAction returns the filters associated with the indicated action.
 func (fs *Filters) FiltersForAction(action Action) (result []net.IPNet) {
 	fs.mu.RLock()
+	defer fs.mu.RUnlock()
 
 	for _, ff := range fs.filters {
 		if ff.action == action {
 			result = append(result, ff.f)
 		}
 	}
-
-	fs.mu.RUnlock()
 	return result
 }

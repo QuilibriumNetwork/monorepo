@@ -1,0 +1,143 @@
+# syntax=docker.io/docker/dockerfile:1.7-labs
+FROM --platform=${TARGETPLATFORM} ubuntu:24.04 AS base-zen3
+
+ENV PATH="${PATH}:/root/.cargo/bin/"
+
+ARG TARGETOS
+ARG TARGETARCH
+
+# Install GMP 6.2 (6.3 which MacOS is using only available on Debian unstable)
+RUN --mount=type=cache,target=/usr/local/,id=usr-local-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    cmake \
+    libgmp-dev \
+    libmpfr-dev \
+    libmpfr6 \
+    wget \
+    m4 \
+    pkg-config \
+    gcc \
+    g++ \
+    make \
+    autoconf \
+    automake \
+    libtool \
+    libssl-dev \
+    python3 \
+    python-is-python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG GO_VERSION=1.23.5
+RUN --mount=type=cache,target=/usr/local,id=usr-local-${TARGETOS}-${TARGETARCH}-zen3 \
+    apt update && apt install -y wget && \
+    ARCH=$(dpkg --print-architecture) && \
+    case ${ARCH} in \
+        amd64) GOARCH=amd64 ;; \
+        arm64) GOARCH=arm64 ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    wget https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz && \
+    rm -rf /usr/local/go && \
+    tar -C /usr/local -xzf go${GO_VERSION}.linux-${GOARCH}.tar.gz && \
+    rm go${GO_VERSION}.linux-${GOARCH}.tar.gz
+
+ENV PATH=$PATH:/usr/local/go/bin
+
+# Build FLINT from source with AVX-512
+RUN --mount=type=cache,target=/usr/local,id=usr-local-${TARGETOS}-${TARGETARCH}-zen3 \
+    git clone https://github.com/flintlib/flint.git && \
+    cd flint && \
+    git checkout flint-3.0 && \
+    ./bootstrap.sh && \
+    ./configure \
+        --prefix=/usr/local \
+        --with-gmp=/usr/local \
+        --with-mpfr=/usr/local \
+	      --enable-avx2 \
+        --enable-static \
+        --disable-shared \
+        CFLAGS="-march=znver3 -mtune=znver3 -O3" && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && \
+    rm -rf flint
+
+COPY docker/rustup-init.sh /opt/rustup-init.sh
+
+RUN --mount=type=cache,target=/root/.cargo,id=cargo-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/opt/ceremonyclient/target/,id=target-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/usr/local/,id=usr-local-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/go/pkg/mod,id=go-mod-${TARGETOS}-${TARGETARCH}-zen3 \
+    /opt/rustup-init.sh -y --profile minimal
+
+# Install uniffi-bindgen-go
+RUN --mount=type=cache,target=/root/.cargo,id=cargo-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/opt/ceremonyclient/target/,id=target-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/usr/local/,id=usr-local-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/go/pkg/mod,id=go-mod-${TARGETOS}-${TARGETARCH}-zen3 \
+    cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.1+v0.25.0
+
+FROM base-zen3 AS build-zen3
+
+ENV QUILIBRIUM_SIGNATURE_CHECK=false
+
+WORKDIR /opt/ceremonyclient
+
+# Copy everything except node and client so as to avoid 
+# invalidating the cache at this point on client or node rebuilds
+
+COPY --exclude=node \
+    --exclude=client \
+    --exclude=sidecar . .
+
+## Generate Rust bindings for VDF
+WORKDIR /opt/ceremonyclient/vdf
+
+RUN --mount=type=cache,target=/usr/local/,id=usr-local-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/go/pkg/mod,id=go-mod-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/root/.cache/go-build,id=go-build-${TARGETOS}-${TARGETARCH}-zen3 \
+    go mod download
+
+RUN --mount=type=cache,target=/root/.cargo,id=cargo-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/opt/ceremonyclient/target/,id=target-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/usr/local/,id=usr-local-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/go/pkg/mod,id=go-mod-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/root/.cache/go-build,id=go-build-${TARGETOS}-${TARGETARCH}-zen3 \
+    ./generate.sh
+
+
+FROM build-zen3 AS build-node-zen3
+
+WORKDIR /opt/ceremonyclient/vdf
+
+RUN --mount=type=cache,target=/usr/local/,id=usr-local-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/opt/ceremonyclient/target/,id=target-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/go/pkg/mod,id=go-mod-${TARGETOS}-${TARGETARCH}-zen3 \
+    --mount=type=cache,target=/root/.cache/go-build,id=go-build-${TARGETOS}-${TARGETARCH}-zen3 \
+    ./build-test.sh -o vdf-test perftest/main.go && cp vdf-test /usr/bin
+
+# Allows exporting single binary
+FROM scratch AS vdf-zen3
+COPY --from=build-node-zen3 /usr/bin/vdf-test /vdf-test
+ENTRYPOINT [ "/vdf-test" ]
+
+LABEL org.opencontainers.image.title="Quilibrium Network Node"
+LABEL org.opencontainers.image.description="Quilibrium is a decentralized alternative to platform as a service providers."
+LABEL org.opencontainers.image.version=$NODE_VERSION
+LABEL org.opencontainers.image.vendor=Quilibrium
+LABEL org.opencontainers.image.url=https://quilibrium.com/
+LABEL org.opencontainers.image.documentation=https://quilibrium.com/docs
+LABEL org.opencontainers.image.source=$GIT_REPO
+LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
+LABEL org.opencontainers.image.revision=$GIT_COMMIT
+
+COPY --from=build-node-zen3 /usr/bin/vdf-test /usr/local/vdf-test
+
+WORKDIR /root
+
+ENTRYPOINT ["vdf-test"]

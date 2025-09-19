@@ -21,6 +21,75 @@ func newMultiaddr(t *testing.T, a string) Multiaddr {
 	return m
 }
 
+func TestReturnsNilOnEmpty(t *testing.T) {
+	a, _ := StringCast("/ip4/1.2.3.4")
+	a, _ = SplitLast(a)
+	require.Nil(t, a)
+	a, _ = SplitLast(a)
+	require.Nil(t, a)
+
+	a, c := SplitLast(nil)
+	require.Zero(t, len(a.Protocols()))
+	require.Nil(t, a)
+	require.Nil(t, c)
+
+	// Test that empty multiaddr from various operations returns nil
+	a, _ = StringCast("/ip4/1.2.3.4/tcp/1234")
+	_, a = SplitFirst(a)
+	_, a = SplitFirst(a)
+	require.Nil(t, a)
+	_, a = SplitFirst(a)
+	require.Nil(t, a)
+
+	c, a = SplitFirst(nil)
+	require.Nil(t, a)
+	require.Nil(t, c)
+
+	a, _ = StringCast("/ip4/1.2.3.4/tcp/1234")
+	a = a.Decapsulate(a)
+	require.Nil(t, a)
+
+	a, _ = StringCast("/ip4/1.2.3.4/tcp/1234")
+	b, _ := StringCast("/tcp/1234")
+	a = a.Decapsulate(b)
+	b, _ = StringCast("/ip4/1.2.3.4")
+	a = a.Decapsulate(b)
+	require.Nil(t, a)
+
+	// Test that SplitFunc returns nil when we split at beginning and end
+	a, _ = StringCast("/ip4/1.2.3.4/tcp/1234")
+	pre, _ := SplitFunc(a, func(c Component) bool {
+		return c.Protocol().Code == P_IP4
+	})
+	require.Nil(t, pre)
+
+	a, _ = StringCast("/ip4/1.2.3.4/tcp/1234")
+	_, post := SplitFunc(a, func(c Component) bool {
+		return false
+	})
+	require.Nil(t, post)
+
+	_, err := NewMultiaddr("")
+	require.Error(t, err)
+
+	var nilMultiaddr Multiaddr
+	a = nilMultiaddr.AppendComponent()
+	require.Nil(t, a)
+
+	a = Join()
+	require.Nil(t, a)
+}
+
+func TestJoinWithComponents(t *testing.T) {
+	var m Multiaddr
+	c, err := NewComponent("ip4", "127.0.0.1")
+	require.NoError(t, err)
+
+	expected := "/ip4/127.0.0.1"
+	require.Equal(t, expected, Join(m, c).String())
+
+}
+
 func TestConstructFails(t *testing.T) {
 	cases := []string{
 		"/ip4",
@@ -85,6 +154,7 @@ func TestConstructFails(t *testing.T) {
 		"/ip4/1.2.3.4/tcp/80/unix",
 		"/ip4/1.2.3.4/tcp/-1",
 		"/ip4/127.0.0.1/tcp/9090/http/p2p-webcrt-direct",
+		fmt.Sprintf("/memory/%d1", uint64(1<<63)),
 		"/",
 		"",
 		"/p2p/QmxoHT6iViN5xAjoz1VZ553cL31U9F94ht3QvWR1FrEbZY", // sha256 multihash with digest len > 32
@@ -197,6 +267,7 @@ var good = []string{
 	"/http-path/foo",
 	"/ip4/127.0.0.1/tcp/0/p2p/12D3KooWCryG7Mon9orvQxcS1rYZjotPgpwoJNHHKcLLfE4Hf5mV/http-path/foo",
 	"/ip4/127.0.0.1/tcp/443/tls/sni/example.com/http/http-path/foo",
+	"/memory/4",
 }
 
 func TestConstructSucceeds(t *testing.T) {
@@ -252,15 +323,15 @@ func TestNilInterface(t *testing.T) {
 	m1.Decapsulate(m2)
 
 	// Test components
-	c, _, _ := SplitFirst(m1)
-	c.Equal(m2)
+	c, _ := SplitFirst(m1)
+	c.Multiaddr().Equal(m2)
 	c.Encapsulate(m2)
 	c.Decapsulate(m2)
 
 	// Util funcs
 	_ = Split(m2)
-	_, _, _ = SplitFirst(m2)
-	_, _, _ = SplitLast(m2)
+	_, _ = SplitFirst(m2)
+	_, _ = SplitLast(m2)
 	ForEach(m2, func(c Component, e error) bool { return true })
 }
 
@@ -283,7 +354,7 @@ func TestStringToBytes(t *testing.T) {
 			t.Error("failed to convert \n", s, "to\n", hex.EncodeToString(b1), "got\n", hex.EncodeToString(b2))
 		}
 
-		if err := validateBytes(b2); err != nil {
+		if _, err := NewMultiaddrBytes(b2); err != nil {
 			t.Error(err, "len:", len(b2))
 		}
 	}
@@ -301,7 +372,6 @@ func TestStringToBytes(t *testing.T) {
 }
 
 func TestBytesToString(t *testing.T) {
-
 	testString := func(s1 string, h string) {
 		t.Helper()
 		b, err := hex.DecodeString(h)
@@ -309,11 +379,12 @@ func TestBytesToString(t *testing.T) {
 			t.Error("failed to decode hex", h)
 		}
 
-		if err := validateBytes(b); err != nil {
+		if _, err := NewMultiaddrBytes(b); err != nil {
 			t.Error(err)
 		}
 
-		s2, err := bytesToString(b)
+		m, err := NewMultiaddrBytes(b)
+		s2 := m.String()
 		if err != nil {
 			t.Log("236", s1, ":", string(h), ":", s2)
 			t.Error("failed to convert", b, err)
@@ -351,18 +422,18 @@ func TestBytesSplitAndJoin(t *testing.T) {
 
 		for i, a := range split {
 			if a.String() != res[i] {
-				t.Errorf("split component failed: %s != %s", a, res[i])
+				t.Errorf("split component failed: %s != %s", &a, res[i])
 			}
 		}
 
-		joined := Join(split...)
+		joined := append(Multiaddr{}, split...)
 		if !m.Equal(joined) {
 			t.Errorf("joined components failed: %s != %s", m, joined)
 		}
 
 		for i, a := range split {
 			if a.String() != res[i] {
-				t.Errorf("split component failed: %s != %s", a, res[i])
+				t.Errorf("split component failed: %s != %s", &a, res[i])
 			}
 		}
 	}
@@ -460,27 +531,40 @@ func TestEncapsulate(t *testing.T) {
 	if d != nil {
 		t.Error("decapsulate /ip4 failed: ", d)
 	}
+
+	t.Run("Encapsulating with components", func(t *testing.T) {
+		left, last := SplitLast(m)
+		joined := left.Encapsulate(last)
+		require.True(t, joined.Equal(m))
+
+		first, rest := SplitFirst(m)
+		joined = first.Encapsulate(rest)
+		require.True(t, joined.Equal(m))
+		// Component type
+		joined = (*first).Encapsulate(rest)
+		require.True(t, joined.Equal(m))
+	})
 }
 
 func TestDecapsulateComment(t *testing.T) {
 	// shows the behavior from the interface comment
 	m, _ := StringCast("/ip4/1.2.3.4/tcp/80")
-	n, _ := StringCast("/tcp/80")
-	rest := m.Decapsulate(n)
+	a, _ := StringCast("/tcp/80")
+	rest := m.Decapsulate(a)
 	if rest.String() != "/ip4/1.2.3.4" {
 		t.Fatalf("Documented behavior is not correct. Expected %v saw %v", "/ip4/1.2.3.4/", rest.String())
 	}
 
 	m, _ = StringCast("/ip4/1.2.3.4/tcp/80")
-	n, _ = StringCast("/udp/80")
-	rest = m.Decapsulate(n)
+	a, _ = StringCast("/udp/80")
+	rest = m.Decapsulate(a)
 	if !rest.Equal(m) {
 		t.Fatalf("Documented behavior is not correct. Expected %v saw %v", "/ip4/1.2.3.4/tcp/80", rest.String())
 	}
 
 	m, _ = StringCast("/ip4/1.2.3.4/tcp/80")
-	n, _ = StringCast("/ip4/1.2.3.4")
-	rest = m.Decapsulate(n)
+	a, _ = StringCast("/ip4/1.2.3.4")
+	rest = m.Decapsulate(a)
 	require.Nil(t, rest, "expected a nil multiaddr if we decapsulate everything")
 }
 
@@ -523,6 +607,17 @@ func TestDecapsulate(t *testing.T) {
 			require.Equal(t, expected.String(), actual)
 		})
 	}
+
+	for _, tc := range testcases {
+		t.Run("Decapsulating with components"+tc.left, func(t *testing.T) {
+			l, _ := StringCast(tc.left)
+			left, last := SplitLast(l)
+			butLast := left.Decapsulate(last)
+			require.Equal(t, butLast.String(), left.String())
+			// Round trip
+			require.Equal(t, tc.left, butLast.Encapsulate(last).String())
+		})
+	}
 }
 
 func assertValueForProto(t *testing.T, a Multiaddr, p int, exp string) {
@@ -535,6 +630,17 @@ func assertValueForProto(t *testing.T, a Multiaddr, p int, exp string) {
 	if fv != exp {
 		t.Fatalf("expected %q for %d in %s, but got %q instead", exp, p, a, fv)
 	}
+}
+
+func TestAppendComponent(t *testing.T) {
+	var m Multiaddr
+	res := m.AppendComponent(nil)
+	require.Equal(t, m, res)
+
+	c, err := NewComponent("ip4", "127.0.0.1")
+	require.NoError(t, err)
+	res = m.AppendComponent(c)
+	require.Equal(t, "/ip4/127.0.0.1", res.String())
 }
 
 func TestGetValue(t *testing.T) {
@@ -762,11 +868,11 @@ func TestBinaryMarshaler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var addr2 multiaddr
+	var addr2 Multiaddr
 	if err = addr2.UnmarshalBinary(b); err != nil {
 		t.Fatal(err)
 	}
-	if !addr.Equal(&addr2) {
+	if !addr.Equal(addr2) {
 		t.Error("expected equal addresses in circular marshaling test")
 	}
 }
@@ -778,11 +884,11 @@ func TestTextMarshaler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var addr2 multiaddr
+	var addr2 Multiaddr
 	if err = addr2.UnmarshalText(b); err != nil {
 		t.Fatal(err)
 	}
-	if !addr.Equal(&addr2) {
+	if !addr.Equal(addr2) {
 		t.Error("expected equal addresses in circular marshaling test")
 	}
 }
@@ -794,11 +900,11 @@ func TestJSONMarshaler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var addr2 multiaddr
+	var addr2 Multiaddr
 	if err = addr2.UnmarshalJSON(b); err != nil {
 		t.Fatal(err)
 	}
-	if !addr.Equal(&addr2) {
+	if !addr.Equal(addr2) {
 		t.Error("expected equal addresses in circular marshaling test")
 	}
 }
@@ -813,11 +919,11 @@ func TestComponentBinaryMarshaler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	comp2 := &Component{}
+	var comp2 Component
 	if err = comp2.UnmarshalBinary(b); err != nil {
 		t.Fatal(err)
 	}
-	if !comp.Equal(comp2) {
+	if !comp.Equal(&comp2) {
 		t.Error("expected equal components in circular marshaling test")
 	}
 }
@@ -832,11 +938,11 @@ func TestComponentTextMarshaler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	comp2 := &Component{}
+	var comp2 Component
 	if err = comp2.UnmarshalText(b); err != nil {
 		t.Fatal(err)
 	}
-	if !comp.Equal(comp2) {
+	if !comp.Equal(&comp2) {
 		t.Error("expected equal components in circular marshaling test")
 	}
 }
@@ -851,13 +957,66 @@ func TestComponentJSONMarshaler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	comp2 := &Component{}
+	var comp2 Component
 	if err = comp2.UnmarshalJSON(b); err != nil {
 		t.Fatal(err)
 	}
-	if !comp.Equal(comp2) {
+	if !comp.Equal(&comp2) {
 		t.Error("expected equal components in circular marshaling test")
 	}
+}
+
+func TestUseNil(t *testing.T) {
+	f := func() Multiaddr {
+		return nil
+	}
+
+	_ = f()
+
+	var foo Multiaddr = nil
+	_, right := SplitFirst(foo)
+	right.Protocols()
+	foo.Protocols()
+	foo.Bytes()
+	foo.Compare(nil)
+	foo.Decapsulate(nil)
+	foo.Encapsulate(nil)
+	foo.Equal(nil)
+	_, _ = foo.MarshalBinary()
+	_, _ = foo.MarshalJSON()
+	_, _ = foo.MarshalText()
+	foo.Protocols()
+	_ = foo.String()
+	_ = foo.UnmarshalBinary(nil)
+	_ = foo.UnmarshalJSON(nil)
+	_ = foo.UnmarshalText(nil)
+	_, _ = foo.ValueForProtocol(0)
+}
+
+func TestUseNilComponent(t *testing.T) {
+	var foo *Component
+	foo.Multiaddr()
+	foo.Encapsulate(nil)
+	foo.Decapsulate(nil)
+	require.True(t, foo == nil)
+	foo.Bytes()
+	foo.MarshalBinary()
+	foo.MarshalJSON()
+	foo.MarshalText()
+	foo.UnmarshalBinary(nil)
+	foo.UnmarshalJSON(nil)
+	foo.UnmarshalText(nil)
+	foo.Equal(nil)
+	foo.Compare(nil)
+	foo.Protocols()
+	foo.ValueForProtocol(0)
+	foo.Protocol()
+	foo.RawValue()
+	foo.Value()
+	_ = foo.String()
+
+	var m Multiaddr = nil
+	m.Encapsulate(foo)
 }
 
 func TestFilterAddrs(t *testing.T) {
@@ -995,7 +1154,7 @@ func TestHTTPPath(t *testing.T) {
 		require.Equal(t, "tmp%2Fbar", v)
 
 		// If we want the raw unescaped version, we can use the component and read it
-		_, component, _ := SplitLast(m)
+		_, component := SplitLast(m)
 		require.Equal(t, "tmp/bar", string(component.RawValue()))
 	})
 }
@@ -1013,14 +1172,14 @@ func FuzzSplitRoundtrip(f *testing.F) {
 		}
 
 		// Test SplitFirst
-		first, rest, _ := SplitFirst(addr)
+		first, rest := SplitFirst(addr)
 		joined := Join(first, rest)
-		require.Equal(t, addr, joined, "SplitFirst and Join should round-trip")
+		require.True(t, addr.Equal(joined), "SplitFirst and Join should round-trip")
 
 		// Test SplitLast
-		rest, last, _ := SplitLast(addr)
+		rest, last := SplitLast(addr)
 		joined = Join(rest, last)
-		require.Equal(t, addr, joined, "SplitLast and Join should round-trip")
+		require.True(t, addr.Equal(joined), "SplitLast and Join should round-trip")
 
 		p := addr.Protocols()
 		if len(p) == 0 {
@@ -1044,21 +1203,61 @@ func FuzzSplitRoundtrip(f *testing.F) {
 			splitFunc := func(c Component) bool {
 				return c.Protocol().Code == proto.Code
 			}
-			beforeC, after, _ := SplitFirst(addr)
+			beforeC, after := SplitFirst(addr)
 			joined = Join(beforeC, after)
-			require.Equal(t, addr, joined)
+			require.True(t, addr.Equal(joined))
 			tryPubMethods(after)
 
-			before, afterC, _ := SplitLast(addr)
+			before, afterC := SplitLast(addr)
 			joined = Join(before, afterC)
-			require.Equal(t, addr, joined)
+			require.True(t, addr.Equal(joined))
 			tryPubMethods(before)
 
-			before, after, _ = SplitFunc(addr, splitFunc)
+			before, after = SplitFunc(addr, splitFunc)
 			joined = Join(before, after)
-			require.Equal(t, addr, joined)
+			require.True(t, addr.Equal(joined))
 			tryPubMethods(before)
 			tryPubMethods(after)
+		}
+	})
+}
+
+func BenchmarkComponentValidation(b *testing.B) {
+	comp, err := NewComponent("ip4", "127.0.0.1")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		err := validateComponent(comp)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func FuzzComponents(f *testing.F) {
+	for _, v := range good {
+		m, _ := StringCast(v)
+		for _, c := range m {
+			f.Add(c.Bytes())
+		}
+	}
+	f.Fuzz(func(t *testing.T, compBytes []byte) {
+		n, c, err := readComponent(compBytes)
+		if err != nil {
+			t.Skip()
+		}
+		if c.protocol == nil {
+			t.Fatal("component has nil protocol")
+		}
+		if c.protocol.Code == 0 {
+			t.Fatal("component has nil protocol code")
+		}
+		if !bytes.Equal(c.Bytes(), compBytes[:n]) {
+			t.Logf("component bytes: %v", c.Bytes())
+			t.Logf("original bytes: %v", compBytes[:n])
+			t.Fatal("component bytes are not equal to the original bytes")
 		}
 	})
 }

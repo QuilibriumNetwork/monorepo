@@ -1,11 +1,13 @@
 package identify
 
+import "time"
+
 type config struct {
-	protocolVersion            string
-	userAgent                  string
-	disableSignedPeerRecord    bool
-	metricsTracer              MetricsTracer
-	disableObservedAddrManager bool
+	protocolVersion         string
+	userAgent               string
+	disableSignedPeerRecord bool
+	metricsTracer           MetricsTracer
+	timeout                 time.Duration
 }
 
 // Option is an option function for identify.
@@ -40,10 +42,9 @@ func WithMetricsTracer(tr MetricsTracer) Option {
 	}
 }
 
-// DisableObservedAddrManager disables the observed address manager. It also
-// effectively disables the nat emitter and EvtNATDeviceTypeChanged
-func DisableObservedAddrManager() Option {
+// WithTimeout sets the timeout for identify interactions.
+func WithTimeout(timeout time.Duration) Option {
 	return func(cfg *config) {
-		cfg.disableObservedAddrManager = true
+		cfg.timeout = timeout
 	}
 }

@@ -47,9 +47,8 @@ func (m *metrics) RecordLatency(p peer.ID, next time.Duration) {
 // of all measurements of a peer's latency.
 func (m *metrics) LatencyEWMA(p peer.ID) time.Duration {
 	m.mutex.RLock()
-	l := m.latmap[p]
-	m.mutex.RUnlock()
-	return l
+	defer m.mutex.RUnlock()
+	return m.latmap[p]
 }
 
 func (m *metrics) RemovePeer(p peer.ID) {

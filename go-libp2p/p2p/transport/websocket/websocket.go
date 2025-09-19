@@ -5,12 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
-	"net/http"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/transport"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcpreuse"
 
 	ma "github.com/multiformats/go-multiaddr"
 	mafmt "github.com/multiformats/go-multiaddr-fmt"
@@ -38,24 +38,16 @@ var dialMatcher = mafmt.And(
 		mafmt.Base(ma.P_WSS)))
 
 var (
-	wssComponent, _   = ma.StringCast("/wss")
-	tlsWsComponent, _ = ma.StringCast("/tls/ws")
-	tlsComponent, _   = ma.StringCast("/tls")
-	wsComponent, _    = ma.StringCast("/ws")
+	wssComponent, _ = ma.NewComponent("wss", "")
+	tlsComponent, _ = ma.NewComponent("tls", "")
+	wsComponent, _  = ma.NewComponent("ws", "")
+	tlsWsAddr       = ma.Multiaddr{*tlsComponent, *wsComponent}
 )
 
 func init() {
 	manet.RegisterFromNetAddr(ParseWebsocketNetAddr, "websocket")
 	manet.RegisterToNetAddr(ConvertWebsocketMultiaddrToNetAddr, "ws")
 	manet.RegisterToNetAddr(ConvertWebsocketMultiaddrToNetAddr, "wss")
-}
-
-// Default gorilla upgrader
-var upgrader = ws.Upgrader{
-	// Allow requests from *all* origins.
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
 }
 
 type Option func(*WebsocketTransport) error
@@ -80,25 +72,38 @@ func WithTLSConfig(conf *tls.Config) Option {
 	}
 }
 
+var defaultHandshakeTimeout = 15 * time.Second
+
+// WithHandshakeTimeout sets a timeout for the websocket upgrade.
+func WithHandshakeTimeout(timeout time.Duration) Option {
+	return func(t *WebsocketTransport) error {
+		t.handshakeTimeout = timeout
+		return nil
+	}
+}
+
 // WebsocketTransport is the actual go-libp2p transport
 type WebsocketTransport struct {
-	upgrader transport.Upgrader
-	rcmgr    network.ResourceManager
-
-	tlsClientConf *tls.Config
-	tlsConf       *tls.Config
+	upgrader         transport.Upgrader
+	rcmgr            network.ResourceManager
+	tlsClientConf    *tls.Config
+	tlsConf          *tls.Config
+	sharedTcp        *tcpreuse.ConnMgr
+	handshakeTimeout time.Duration
 }
 
 var _ transport.Transport = (*WebsocketTransport)(nil)
 
-func New(u transport.Upgrader, rcmgr network.ResourceManager, opts ...Option) (*WebsocketTransport, error) {
+func New(u transport.Upgrader, rcmgr network.ResourceManager, sharedTCP *tcpreuse.ConnMgr, opts ...Option) (*WebsocketTransport, error) {
 	if rcmgr == nil {
 		rcmgr = &network.NullResourceManager{}
 	}
 	t := &WebsocketTransport{
-		upgrader:      u,
-		rcmgr:         rcmgr,
-		tlsClientConf: &tls.Config{},
+		upgrader:         u,
+		rcmgr:            rcmgr,
+		tlsClientConf:    &tls.Config{},
+		sharedTcp:        sharedTCP,
+		handshakeTimeout: defaultHandshakeTimeout,
 	}
 	for _, opt := range opts {
 		if err := opt(t); err != nil {
@@ -133,20 +138,16 @@ func (t *WebsocketTransport) Resolve(_ context.Context, maddr ma.Multiaddr) ([]m
 
 	if parsed.sni == nil {
 		var err error
-		// We don't have an sni component, we'll use dns/dnsaddr
-		ma.ForEach(parsed.restMultiaddr, func(c ma.Component, e error) bool {
-			if e != nil {
-				err = e
-				return false
-			}
+		// We don't have an sni component, we'll use dns
+	loop:
+		for _, c := range parsed.restMultiaddr {
 			switch c.Protocol().Code {
 			case ma.P_DNS, ma.P_DNS4, ma.P_DNS6:
 				// err shouldn't happen since this means we couldn't parse a dns hostname for an sni value.
 				parsed.sni, err = ma.NewComponent("sni", c.Value())
-				return false
+				break loop
 			}
-			return true
-		})
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -160,6 +161,8 @@ func (t *WebsocketTransport) Resolve(_ context.Context, maddr ma.Multiaddr) ([]m
 	return []ma.Multiaddr{parsed.toMultiaddr()}, nil
 }
 
+// Dial will dial the given multiaddr and expect the given peer. If an
+// HTTPS_PROXY env is set, it will use that for the dial out.
 func (t *WebsocketTransport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (transport.CapableConn, error) {
 	connScope, err := t.rcmgr.OpenConnection(network.DirOutbound, true, raddr)
 	if err != nil {
@@ -174,7 +177,7 @@ func (t *WebsocketTransport) Dial(ctx context.Context, raddr ma.Multiaddr, p pee
 }
 
 func (t *WebsocketTransport) dialWithScope(ctx context.Context, raddr ma.Multiaddr, p peer.ID, connScope network.ConnManagementScope) (transport.CapableConn, error) {
-	macon, err := t.maDial(ctx, raddr)
+	macon, err := t.maDial(ctx, raddr, connScope)
 	if err != nil {
 		return nil, err
 	}
@@ -185,13 +188,17 @@ func (t *WebsocketTransport) dialWithScope(ctx context.Context, raddr ma.Multiad
 	return &capableConn{CapableConn: conn}, nil
 }
 
-func (t *WebsocketTransport) maDial(ctx context.Context, raddr ma.Multiaddr) (manet.Conn, error) {
+func (t *WebsocketTransport) maDial(ctx context.Context, raddr ma.Multiaddr, scope network.ConnManagementScope) (manet.Conn, error) {
 	wsurl, err := parseMultiaddr(raddr)
 	if err != nil {
 		return nil, err
 	}
 	isWss := wsurl.Scheme == "wss"
-	dialer := ws.Dialer{HandshakeTimeout: 30 * time.Second}
+	dialer := ws.Dialer{
+		HandshakeTimeout: t.handshakeTimeout,
+		// Inherit the default proxy behavior
+		Proxy: ws.DefaultDialer.Proxy,
+	}
 	if isWss {
 		sni := ""
 		sni, err = raddr.ValueForProtocol(ma.P_SNI)
@@ -203,17 +210,23 @@ func (t *WebsocketTransport) maDial(ctx context.Context, raddr ma.Multiaddr) (ma
 			copytlsClientConf := t.tlsClientConf.Clone()
 			copytlsClientConf.ServerName = sni
 			dialer.TLSClientConfig = copytlsClientConf
-			ipAddr := wsurl.Host
-			// Setting the NetDial because we already have the resolved IP address, so we don't want to do another resolution.
+			ipPortAddr := wsurl.Host
 			// We set the `.Host` to the sni field so that the host header gets properly set.
+			wsurl.Host = sni + ":" + wsurl.Port()
+			// Setting the NetDial because we already have the resolved IP address, so we can avoid another resolution.
 			dialer.NetDial = func(network, address string) (net.Conn, error) {
-				tcpAddr, err := net.ResolveTCPAddr(network, ipAddr)
+				var tcpAddr *net.TCPAddr
+				var err error
+				if address == wsurl.Host {
+					tcpAddr, err = net.ResolveTCPAddr(network, ipPortAddr) // Use our already resolved IP address
+				} else {
+					tcpAddr, err = net.ResolveTCPAddr(network, address)
+				}
 				if err != nil {
 					return nil, err
 				}
 				return net.DialTCP("tcp", nil, tcpAddr)
 			}
-			wsurl.Host = sni + ":" + wsurl.Port()
 		} else {
 			dialer.TLSClientConfig = t.tlsClientConf
 		}
@@ -224,7 +237,7 @@ func (t *WebsocketTransport) maDial(ctx context.Context, raddr ma.Multiaddr) (ma
 		return nil, err
 	}
 
-	mnc, err := manet.WrapNetConn(NewConn(wscon, isWss))
+	mnc, err := manet.WrapNetConn(newConn(wscon, isWss, scope))
 	if err != nil {
 		wscon.Close()
 		return nil, err
@@ -232,8 +245,12 @@ func (t *WebsocketTransport) maDial(ctx context.Context, raddr ma.Multiaddr) (ma
 	return mnc, nil
 }
 
-func (t *WebsocketTransport) maListen(a ma.Multiaddr) (manet.Listener, error) {
-	l, err := newListener(a, t.tlsConf)
+func (t *WebsocketTransport) gatedMaListen(a ma.Multiaddr) (transport.GatedMaListener, error) {
+	var tlsConf *tls.Config
+	if t.tlsConf != nil {
+		tlsConf = t.tlsConf.Clone()
+	}
+	l, err := newListener(a, tlsConf, t.sharedTcp, t.upgrader, t.handshakeTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -242,9 +259,32 @@ func (t *WebsocketTransport) maListen(a ma.Multiaddr) (manet.Listener, error) {
 }
 
 func (t *WebsocketTransport) Listen(a ma.Multiaddr) (transport.Listener, error) {
-	malist, err := t.maListen(a)
+	gmal, err := t.gatedMaListen(a)
 	if err != nil {
 		return nil, err
 	}
-	return &transportListener{Listener: t.upgrader.UpgradeListener(t, malist)}, nil
+	return &transportListener{Listener: t.upgrader.UpgradeGatedMaListener(t, gmal)}, nil
+}
+
+// transportListener wraps a transport.Listener to provide connections with a `ConnState() network.ConnectionState` method.
+type transportListener struct {
+	transport.Listener
+}
+
+type capableConn struct {
+	transport.CapableConn
+}
+
+func (c *capableConn) ConnState() network.ConnectionState {
+	cs := c.CapableConn.ConnState()
+	cs.Transport = "websocket"
+	return cs
+}
+
+func (l *transportListener) Accept() (transport.CapableConn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &capableConn{CapableConn: conn}, nil
 }

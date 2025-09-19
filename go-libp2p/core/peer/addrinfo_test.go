@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	. "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/stretchr/testify/require"
 
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -13,19 +14,24 @@ var (
 	maddrFull, maddrTpt, maddrPeer ma.Multiaddr
 )
 
+func tStringCast(s string) ma.Multiaddr {
+	st, _ := ma.StringCast(s)
+	return st
+}
+
 func init() {
 	var err error
 	testID, err = Decode("QmS3zcG7LhYZYSJMhyRZvTddvbNUqtt8BJpaSs6mi1K5Va")
 	if err != nil {
 		panic(err)
 	}
-	maddrPeer, _ = ma.StringCast("/p2p/" + testID.String())
-	maddrTpt, _ = ma.StringCast("/ip4/127.0.0.1/tcp/1234")
+	maddrPeer = tStringCast("/p2p/" + testID.String())
+	maddrTpt = tStringCast("/ip4/127.0.0.1/tcp/1234")
 	maddrFull = maddrTpt.Encapsulate(maddrPeer)
 }
 
 func TestSplitAddr(t *testing.T) {
-	tpt, id, _ := SplitAddr(maddrFull)
+	tpt, id := SplitAddr(maddrFull)
 	if !tpt.Equal(maddrTpt) {
 		t.Fatal("expected transport")
 	}
@@ -33,7 +39,7 @@ func TestSplitAddr(t *testing.T) {
 		t.Fatalf("%s != %s", id, testID)
 	}
 
-	tpt, id, _ = SplitAddr(maddrPeer)
+	tpt, id = SplitAddr(maddrPeer)
 	if tpt != nil {
 		t.Fatal("expected no transport")
 	}
@@ -41,13 +47,26 @@ func TestSplitAddr(t *testing.T) {
 		t.Fatalf("%s != %s", id, testID)
 	}
 
-	tpt, id, _ = SplitAddr(maddrTpt)
+	tpt, id = SplitAddr(maddrTpt)
 	if !tpt.Equal(maddrTpt) {
 		t.Fatal("expected a transport")
 	}
 	if id != "" {
 		t.Fatal("expected no peer ID")
 	}
+}
+
+func TestIDFromP2PAddr(t *testing.T) {
+	id, err := IDFromP2PAddr(maddrFull)
+	require.NoError(t, err)
+	require.Equal(t, testID, id)
+
+	id, err = IDFromP2PAddr(maddrPeer)
+	require.NoError(t, err)
+	require.Equal(t, testID, id)
+
+	_, err = IDFromP2PAddr(maddrTpt)
+	require.ErrorIs(t, err, ErrInvalidAddr)
 }
 
 func TestAddrInfoFromP2pAddr(t *testing.T) {
@@ -91,30 +110,22 @@ func TestAddrInfosFromP2pAddrs(t *testing.T) {
 		t.Fatal("expected nil multiaddr to fail")
 	}
 
-	m1, _ := ma.StringCast("/ip4/128.199.219.111/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64")
-	m2, _ := ma.StringCast("/ip4/104.236.76.40/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64")
-	m3, _ := ma.StringCast("/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd")
-	m4, _ := ma.StringCast("/ip4/178.62.158.247/tcp/4001/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd")
-	m5, _ := ma.StringCast("/ipfs/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM")
 	addrs := []ma.Multiaddr{
-		m1,
-		m2,
+		tStringCast("/ip4/128.199.219.111/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64"),
+		tStringCast("/ip4/104.236.76.40/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64"),
 
-		m3,
-		m4,
+		tStringCast("/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd"),
+		tStringCast("/ip4/178.62.158.247/tcp/4001/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd"),
 
-		m5,
+		tStringCast("/ipfs/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM"),
 	}
-	p1, _ := ma.StringCast("/ip4/128.199.219.111/tcp/4001")
-	p2, _ := ma.StringCast("/ip4/104.236.76.40/tcp/4001")
-	p3, _ := ma.StringCast("/ip4/178.62.158.247/tcp/4001")
 	expected := map[string][]ma.Multiaddr{
 		"QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64": {
-			p1,
-			p2,
+			tStringCast("/ip4/128.199.219.111/tcp/4001"),
+			tStringCast("/ip4/104.236.76.40/tcp/4001"),
 		},
 		"QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd": {
-			p3,
+			tStringCast("/ip4/178.62.158.247/tcp/4001"),
 		},
 		"QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM": nil,
 	}

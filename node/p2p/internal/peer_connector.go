@@ -87,7 +87,7 @@ func (pc *peerConnector) connectToPeer(
 	select {
 	case <-ctx.Done():
 		return
-	case <-time.After(identify.Timeout / 2):
+	case <-time.After(identify.DefaultTimeout / 2):
 		logger.Debug("identifying peer timed out")
 		atomic.AddUint32(failure, 1)
 		_ = conn.Close()
@@ -136,7 +136,7 @@ func (pc *peerConnector) connectToPeers(
 func (pc *peerConnector) connect() {
 	logger := pc.logger
 
-	logger.Info("initiating peer connections")
+	logger.Debug("initiating peer connections")
 	var success, failure, duplicate uint32
 	defer func() {
 		logger.Debug(

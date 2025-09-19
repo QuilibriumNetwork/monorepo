@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
-	"fmt"
 	"io"
 	mrand "math/rand"
 	"net"
@@ -29,6 +28,11 @@ import (
 
 //go:generate sh -c "go run go.uber.org/mock/mockgen -package libp2pquic -destination mock_connection_gater_test.go github.com/libp2p/go-libp2p/core/connmgr ConnectionGater && go run golang.org/x/tools/cmd/goimports -w mock_connection_gater_test.go"
 
+func tStringCast(s string) ma.Multiaddr {
+	st, _ := ma.StringCast(s)
+	return st
+}
+
 type connTestCase struct {
 	Name    string
 	Options []quicreuse.Option
@@ -37,11 +41,6 @@ type connTestCase struct {
 var connTestCases = []*connTestCase{
 	{"reuseport_on", []quicreuse.Option{}},
 	{"reuseport_off", []quicreuse.Option{quicreuse.DisableReuseport()}},
-}
-
-func tStringCast(str string) ma.Multiaddr {
-	m, _ := ma.StringCast(str)
-	return m
 }
 
 func createPeer(t *testing.T) (peer.ID, ic.PrivKey) {
@@ -275,6 +274,9 @@ func TestStreams(t *testing.T) {
 		t.Run(tc.Name, func(t *testing.T) {
 			testStreams(t, tc)
 		})
+		t.Run(tc.Name, func(t *testing.T) {
+			testStreamsErrorCode(t, tc)
+		})
 	}
 }
 
@@ -308,6 +310,45 @@ func testStreams(t *testing.T, tc *connTestCase) {
 	data, err := io.ReadAll(sstr)
 	require.NoError(t, err)
 	require.Equal(t, data, []byte("foobar"))
+}
+
+func testStreamsErrorCode(t *testing.T, tc *connTestCase) {
+	serverID, serverKey := createPeer(t)
+	_, clientKey := createPeer(t)
+
+	serverTransport, err := NewTransport(serverKey, newConnManager(t, tc.Options...), nil, nil, nil)
+	require.NoError(t, err)
+	defer serverTransport.(io.Closer).Close()
+	ln := runServer(t, serverTransport, "/ip4/127.0.0.1/udp/0/quic-v1")
+	defer ln.Close()
+
+	clientTransport, err := NewTransport(clientKey, newConnManager(t, tc.Options...), nil, nil, nil)
+	require.NoError(t, err)
+	defer clientTransport.(io.Closer).Close()
+	conn, err := clientTransport.Dial(context.Background(), ln.Multiaddr(), serverID)
+	require.NoError(t, err)
+	defer conn.Close()
+	serverConn, err := ln.Accept()
+	require.NoError(t, err)
+	defer serverConn.Close()
+
+	str, err := conn.OpenStream(context.Background())
+	require.NoError(t, err)
+	err = str.ResetWithError(42)
+	require.NoError(t, err)
+
+	sstr, err := serverConn.AcceptStream()
+	require.NoError(t, err)
+	_, err = io.ReadAll(sstr)
+	require.Error(t, err)
+	se := &network.StreamError{}
+	if errors.As(err, &se) {
+		require.Equal(t, se.ErrorCode, network.StreamErrorCode(42))
+		require.True(t, se.Remote)
+	} else {
+		t.Fatalf("expected error to be of network.StreamError type, got %T, %v", err, err)
+	}
+
 }
 
 func TestHandshakeFailPeerIDMismatch(t *testing.T) {
@@ -527,6 +568,13 @@ func TestStatelessReset(t *testing.T) {
 	}
 }
 
+func newUDPConnLocalhost(t testing.TB, port int) (*net.UDPConn, func()) {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+	require.NoError(t, err)
+	return conn, func() { conn.Close() }
+}
+
 func testStatelessReset(t *testing.T, tc *connTestCase) {
 	serverID, serverKey := createPeer(t)
 	_, clientKey := createPeer(t)
@@ -537,13 +585,15 @@ func testStatelessReset(t *testing.T, tc *connTestCase) {
 	ln := runServer(t, serverTransport, "/ip4/127.0.0.1/udp/0/quic-v1")
 
 	var drop uint32
-	dropCallback := func(quicproxy.Direction, []byte) bool { return atomic.LoadUint32(&drop) > 0 }
-	proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-		RemoteAddr: fmt.Sprintf("localhost:%d", ln.Addr().(*net.UDPAddr).Port),
+	dropCallback := func(quicproxy.Direction, net.Addr, net.Addr, []byte) bool { return atomic.LoadUint32(&drop) > 0 }
+	proxyConn, cleanup := newUDPConnLocalhost(t, 0)
+	proxy := quicproxy.Proxy{
+		Conn:       proxyConn,
+		ServerAddr: ln.Addr().(*net.UDPAddr),
 		DropPacket: dropCallback,
-	})
+	}
+	err = proxy.Start()
 	require.NoError(t, err)
-	proxyLocalAddr := proxy.LocalAddr()
 
 	// establish a connection
 	clientTransport, err := NewTransport(clientKey, newConnManager(t, tc.Options...), nil, nil, nil)
@@ -575,7 +625,9 @@ func testStatelessReset(t *testing.T, tc *connTestCase) {
 	atomic.StoreUint32(&drop, 1)
 	ln.Close()
 	(<-connChan).Close()
+	proxyLocalPort := proxy.LocalAddr().(*net.UDPAddr).Port
 	proxy.Close()
+	cleanup()
 
 	// Start another listener (on a different port).
 	ln, err = serverTransport.Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
@@ -584,13 +636,17 @@ func testStatelessReset(t *testing.T, tc *connTestCase) {
 	// Now that the new server is up, re-enable packet forwarding.
 	atomic.StoreUint32(&drop, 0)
 
+	proxyConn, cleanup = newUDPConnLocalhost(t, proxyLocalPort)
+	defer cleanup()
 	// Recreate the proxy, such that its client-facing port stays constant.
-	proxy, err = quicproxy.NewQuicProxy(proxyLocalAddr.String(), &quicproxy.Opts{
-		RemoteAddr: fmt.Sprintf("localhost:%d", ln.Addr().(*net.UDPAddr).Port),
+	proxyBis := quicproxy.Proxy{
+		Conn:       proxyConn,
+		ServerAddr: ln.Addr().(*net.UDPAddr),
 		DropPacket: dropCallback,
-	})
+	}
+	err = proxyBis.Start()
 	require.NoError(t, err)
-	defer proxy.Close()
+	defer proxyBis.Close()
 
 	// Trigger something (not too small) to be sent, so that we receive the stateless reset.
 	// The new server doesn't have any state for the previously established connection.

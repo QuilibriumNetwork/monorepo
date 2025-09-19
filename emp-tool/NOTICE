@@ -1,0 +1,13 @@
+This repository is forked from the mainline EMP repository. The changes are minimal,
+but resolve some issues with respect to specific architectures, and notable bugs.
+
+Structure is preserved, so to track differences, you can run in a directory above
+the project root (e.g., ~/source/):
+
+    git clone https://github.com/emp-toolkit/emp-tool.git
+    git clone https://github.com/emp-toolkit/emp-ot.git
+
+    diff -ry --suppress-common-lines emp-tool ceremonyclient/emp-tool
+    diff -ry --suppress-common-lines emp-ot ceremonyclient/emp-ot
+
+

@@ -115,14 +115,13 @@ impl<'a> BitReader<'a> {
 }
 
 // Encodes an arbitrary byte slice into a vector of Curve448 clamped scalars.
-// Each scalar encodes 432 bits of data (i.e. about 54 bytes).
+// Each scalar encodes 440 bits of data (i.e. 55 bytes).
 //
 // The mapping is as follows (little–endian view):
-//   - Byte 0: empty
-//   - Bytes 1..54: all 8 bits are free
+//   - Bytes 0..=54: all 8 bits are free
 //   - Byte 55: empty
 //
-// If the final chunk has fewer than 432 bits, it is padded with zero bits.
+// If the final chunk has fewer than 440 bits, it is padded with zero bits.
 pub fn encode_to_curve448_scalars(input: &[u8]) -> Vec<Vec<u8>> {
   let mut reader = BitReader::new(input);
   let mut scalars = Vec::new();
@@ -134,7 +133,7 @@ pub fn encode_to_curve448_scalars(input: &[u8]) -> Vec<Vec<u8>> {
 
       let mut scalar = vec![0;56];
 
-      for i in 1..55 {
+      for i in 0..55 {
           // If there aren’t enough bits, pad with 0.
           let byte = reader.read_bits(8).unwrap_or(0);
           scalar[i] = byte as u8;
@@ -146,12 +145,11 @@ pub fn encode_to_curve448_scalars(input: &[u8]) -> Vec<Vec<u8>> {
   scalars
 }
 
-// Recombines a slice of 56-byte scalars (each containing 432 free bits)
+// Recombines a slice of 56-byte scalars (each containing 440 free bits)
 // into the original bit–stream, returned as a Vec<u8>.
 //
 // The packing was as follows (little–endian bit–order):
-//   - Byte 0: empty
-//   - Bytes 1..54: all 8 bits are free (432 bits total)
+//   - Bytes 0..=54: all 8 bits are free (440 bits total)
 //   - Byte 55: empty
 pub fn decode_from_curve448_scalars(scalars: &Vec<Vec<u8>>) -> Vec<u8> {
   let mut output: Vec<u8> = Vec::new();
@@ -180,7 +178,7 @@ pub fn decode_from_curve448_scalars(scalars: &Vec<Vec<u8>>) -> Vec<u8> {
           return vec![];
       }
 
-      for &byte in &scalar[1..55] {
+      for &byte in &scalar[0..55] {
           push_bits!(byte, 8);
       }
   }

@@ -2832,9 +2832,12 @@ func TestBlossomSubIdontwantSend(t *testing.T) {
 
 	var expMids [][]byte
 	var actMids [][]byte
+	mx := sync.Mutex{}
 
 	// Used to publish a message with random data
 	publishMsg := func() {
+		mx.Lock()
+		defer mx.Unlock()
 		data := make([]byte, 16)
 		crand.Read(data)
 		m := &pb.Message{Data: data}
@@ -2851,6 +2854,8 @@ func TestBlossomSubIdontwantSend(t *testing.T) {
 
 	// Checks we received the right IDONTWANT messages
 	checkMsgs := func() {
+		mx.Lock()
+		defer mx.Unlock()
 		sort.Slice(actMids, func(i, j int) bool {
 			return bytes.Compare(actMids[i], actMids[j]) < 0
 		})

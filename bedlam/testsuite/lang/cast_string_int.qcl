@@ -1,0 +1,8 @@
+// -*- go -*-
+
+package main
+
+// @Test 64 1 = 0x40
+func main(a, b uint8) string {
+	return string(a)
+}

@@ -1,0 +1,14 @@
+// -*- go -*-
+
+package main
+
+import (
+	"math"
+)
+
+const MaxUint64 = 42
+
+// @Test 0 0 = 42 0xffffffffffffffff
+func main(a, b uint64) (uint64, uint64) {
+	return MaxUint64, math.MaxUint64
+}

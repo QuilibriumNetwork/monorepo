@@ -3,11 +3,18 @@ package transport_integration
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -15,22 +22,31 @@ import (
 	"testing"
 	"time"
 
+	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
+
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/config"
 	"github.com/libp2p/go-libp2p/core/connmgr"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	mocknetwork "github.com/libp2p/go-libp2p/core/network/mocks"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/sec"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
-	tls "github.com/libp2p/go-libp2p/p2p/security/tls"
+	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
+	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
+	"go.uber.org/mock/gomock"
 
-	"github.com/multiformats/go-multiaddr"
+	ma "github.com/multiformats/go-multiaddr"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -62,6 +78,44 @@ func transformOpts(opts TransportTestCaseOpts) []config.Option {
 	return libp2pOpts
 }
 
+func selfSignedTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	notBefore := time.Now()
+	notAfter := notBefore.Add(365 * 24 * time.Hour)
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	require.NoError(t, err)
+
+	certTemplate := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"Test"},
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &certTemplate, &certTemplate, &priv.PublicKey, priv)
+	require.NoError(t, err)
+
+	cert := tls.Certificate{
+		Certificate: [][]byte{derBytes},
+		PrivateKey:  priv,
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+	return tlsConfig
+}
+
 var transportsToTest = []TransportTestCase{
 	{
 		Name: "TCP / Noise / Yamux",
@@ -83,12 +137,96 @@ var transportsToTest = []TransportTestCase{
 		Name: "TCP / TLS / Yamux",
 		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
 			libp2pOpts := transformOpts(opts)
-			libp2pOpts = append(libp2pOpts, libp2p.Security(tls.ID, tls.New))
+			libp2pOpts = append(libp2pOpts, libp2p.Security(libp2ptls.ID, libp2ptls.New))
 			libp2pOpts = append(libp2pOpts, libp2p.Muxer(yamux.ID, yamux.DefaultTransport))
 			if opts.NoListen {
 				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs)
 			} else {
 				libp2pOpts = append(libp2pOpts, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+			}
+			h, err := libp2p.New(libp2pOpts...)
+			require.NoError(t, err)
+			return h
+		},
+	},
+	{
+		Name: "TCP-Shared / TLS / Yamux",
+		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
+			libp2pOpts := transformOpts(opts)
+			libp2pOpts = append(libp2pOpts, libp2p.ShareTCPListener())
+			libp2pOpts = append(libp2pOpts, libp2p.Security(libp2ptls.ID, libp2ptls.New))
+			libp2pOpts = append(libp2pOpts, libp2p.Muxer(yamux.ID, yamux.DefaultTransport))
+			if opts.NoListen {
+				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs)
+			} else {
+				libp2pOpts = append(libp2pOpts, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+			}
+			h, err := libp2p.New(libp2pOpts...)
+			require.NoError(t, err)
+			return h
+		},
+	},
+	{
+		Name: "TCP-Shared-WithMetrics / TLS / Yamux",
+		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
+			libp2pOpts := transformOpts(opts)
+			libp2pOpts = append(libp2pOpts, libp2p.ShareTCPListener())
+			libp2pOpts = append(libp2pOpts, libp2p.Security(libp2ptls.ID, libp2ptls.New))
+			libp2pOpts = append(libp2pOpts, libp2p.Muxer(yamux.ID, yamux.DefaultTransport))
+			libp2pOpts = append(libp2pOpts, libp2p.Transport(tcp.NewTCPTransport, tcp.WithMetrics()))
+			if opts.NoListen {
+				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs)
+			} else {
+				libp2pOpts = append(libp2pOpts, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+			}
+			h, err := libp2p.New(libp2pOpts...)
+			require.NoError(t, err)
+			return h
+		},
+	},
+	{
+		Name: "TCP-WithMetrics / TLS / Yamux",
+		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
+			libp2pOpts := transformOpts(opts)
+			libp2pOpts = append(libp2pOpts, libp2p.Security(libp2ptls.ID, libp2ptls.New))
+			libp2pOpts = append(libp2pOpts, libp2p.Muxer(yamux.ID, yamux.DefaultTransport))
+			libp2pOpts = append(libp2pOpts, libp2p.Transport(tcp.NewTCPTransport, tcp.WithMetrics()))
+			if opts.NoListen {
+				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs)
+			} else {
+				libp2pOpts = append(libp2pOpts, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+			}
+			h, err := libp2p.New(libp2pOpts...)
+			require.NoError(t, err)
+			return h
+		},
+	},
+	{
+		Name: "WebSocket-Shared",
+		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
+			libp2pOpts := transformOpts(opts)
+			libp2pOpts = append(libp2pOpts, libp2p.ShareTCPListener())
+			if opts.NoListen {
+				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs)
+			} else {
+				libp2pOpts = append(libp2pOpts, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0/ws"))
+			}
+			h, err := libp2p.New(libp2pOpts...)
+			require.NoError(t, err)
+			return h
+		},
+	},
+	{
+		Name: "WebSocket-Secured-Shared",
+		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
+			libp2pOpts := transformOpts(opts)
+			libp2pOpts = append(libp2pOpts, libp2p.ShareTCPListener())
+			if opts.NoListen {
+				config := tls.Config{InsecureSkipVerify: true}
+				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs, libp2p.Transport(websocket.New, websocket.WithTLSClientConfig(&config)))
+			} else {
+				config := selfSignedTLSConfig(t)
+				libp2pOpts = append(libp2pOpts, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0/sni/localhost/tls/ws"), libp2p.Transport(websocket.New, websocket.WithTLSConfig(config)))
 			}
 			h, err := libp2p.New(libp2pOpts...)
 			require.NoError(t, err)
@@ -110,6 +248,22 @@ var transportsToTest = []TransportTestCase{
 		},
 	},
 	{
+		Name: "WebSocket-Secured",
+		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
+			libp2pOpts := transformOpts(opts)
+			if opts.NoListen {
+				config := tls.Config{InsecureSkipVerify: true}
+				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs, libp2p.Transport(websocket.New, websocket.WithTLSClientConfig(&config)))
+			} else {
+				config := selfSignedTLSConfig(t)
+				libp2pOpts = append(libp2pOpts, libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0/sni/localhost/tls/ws"), libp2p.Transport(websocket.New, websocket.WithTLSConfig(config)))
+			}
+			h, err := libp2p.New(libp2pOpts...)
+			require.NoError(t, err)
+			return h
+		},
+	},
+	{
 		Name: "QUIC",
 		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
 			libp2pOpts := transformOpts(opts)
@@ -124,6 +278,29 @@ var transportsToTest = []TransportTestCase{
 		},
 	},
 	{
+		Name: "QUIC-CustomReuse",
+		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
+			libp2pOpts := transformOpts(opts)
+			if opts.NoListen {
+				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs, libp2p.QUICReuse(quicreuse.NewConnManager))
+			} else {
+				qr := libp2p.QUICReuse(quicreuse.NewConnManager)
+				if !opts.NoRcmgr && opts.ResourceManager != nil {
+					qr = libp2p.QUICReuse(
+						quicreuse.NewConnManager,
+						quicreuse.VerifySourceAddress(opts.ResourceManager.VerifySourceAddress))
+				}
+				libp2pOpts = append(libp2pOpts,
+					qr,
+					libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1"),
+				)
+			}
+			h, err := libp2p.New(libp2pOpts...)
+			require.NoError(t, err)
+			return h
+		},
+	},
+	{
 		Name: "WebTransport",
 		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
 			libp2pOpts := transformOpts(opts)
@@ -131,6 +308,30 @@ var transportsToTest = []TransportTestCase{
 				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs)
 			} else {
 				libp2pOpts = append(libp2pOpts, libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1/webtransport"))
+			}
+			h, err := libp2p.New(libp2pOpts...)
+			require.NoError(t, err)
+			return h
+		},
+	},
+	{
+		Name: "WebTransport-CustomReuse",
+		HostGenerator: func(t *testing.T, opts TransportTestCaseOpts) host.Host {
+			libp2pOpts := transformOpts(opts)
+			if opts.NoListen {
+				libp2pOpts = append(libp2pOpts, libp2p.NoListenAddrs, libp2p.QUICReuse(quicreuse.NewConnManager))
+			} else {
+				qr := libp2p.QUICReuse(quicreuse.NewConnManager)
+				if !opts.NoRcmgr && opts.ResourceManager != nil {
+					qr = libp2p.QUICReuse(
+						quicreuse.NewConnManager,
+						quicreuse.VerifySourceAddress(opts.ResourceManager.VerifySourceAddress),
+					)
+				}
+				libp2pOpts = append(libp2pOpts,
+					qr,
+					libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/quic-v1/webtransport"),
+				)
 			}
 			h, err := libp2p.New(libp2pOpts...)
 			require.NoError(t, err)
@@ -455,7 +656,7 @@ func TestMoreStreamsThanOurLimits(t *testing.T) {
 						var err error
 						// maxRetries is an arbitrary retry amount if there's any error.
 						maxRetries := streamCount * 4
-						shouldRetry := func(err error) bool {
+						shouldRetry := func(_ error) bool {
 							didErr = true
 							sawFirstErr.Store(true)
 							maxRetries--
@@ -669,7 +870,7 @@ func TestDiscoverPeerIDFromSecurityNegotiation(t *testing.T) {
 
 			ai := &peer.AddrInfo{
 				ID:    bogusPeerId,
-				Addrs: []multiaddr.Multiaddr{h1.Addrs()[0]},
+				Addrs: []ma.Multiaddr{h1.Addrs()[0]},
 			}
 
 			// Try connecting with the bogus peer ID
@@ -685,6 +886,281 @@ func TestDiscoverPeerIDFromSecurityNegotiation(t *testing.T) {
 
 			// and just to double-check try connecting again to make sure it works
 			require.NoError(t, h2.Connect(ctx, *ai))
+		})
+	}
+}
+
+// TestCloseConnWhenBlocked tests that the server closes the connection when the rcmgr blocks it.
+func TestCloseConnWhenBlocked(t *testing.T) {
+	for _, tc := range transportsToTest {
+		// WebRTC doesn't have a connection when rcmgr blocks it, so there's nothing to close.
+		if tc.Name == "WebRTC" {
+			continue
+		}
+		t.Run(tc.Name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			mockRcmgr := mocknetwork.NewMockResourceManager(ctrl)
+			if matched, _ := regexp.MatchString(`^(QUIC|WebTransport)`, tc.Name); matched {
+				mockRcmgr.EXPECT().VerifySourceAddress(gomock.Any()).AnyTimes().Return(false)
+				// If the initial TLS ClientHello is split into two quic-go might call the transport multiple times to open a
+				// connection. This will only be called multiple times if the connection is rejected. If were were to accept
+				// the connection, this would have been called only once.
+				mockRcmgr.EXPECT().OpenConnection(network.DirInbound, gomock.Any(), gomock.Any()).Return(nil, errors.New("connection blocked")).AnyTimes()
+			} else {
+				mockRcmgr.EXPECT().OpenConnection(network.DirInbound, gomock.Any(), gomock.Any()).Return(nil, errors.New("connection blocked"))
+			}
+			mockRcmgr.EXPECT().Close().AnyTimes()
+
+			server := tc.HostGenerator(t, TransportTestCaseOpts{ResourceManager: mockRcmgr})
+			client := tc.HostGenerator(t, TransportTestCaseOpts{NoListen: true})
+			defer server.Close()
+			defer client.Close()
+
+			client.Peerstore().AddAddrs(server.ID(), server.Addrs(), peerstore.PermanentAddrTTL)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, err := client.NewStream(ctx, server.ID(), ping.ID)
+			require.Error(t, err)
+			require.False(t, errors.Is(err, context.DeadlineExceeded), "expected error to be not be context deadline exceeded")
+		})
+	}
+}
+
+// TestConnDroppedWhenBlocked is similar to TestCloseConnWhenBlocked, but for
+// transports like WebRTC we don't have a connection when we block it.  Instead
+// we just ignore the connection attempt. This tests that the client hits the
+// connection attempt deadline and neither server nor client see a successful
+// connection attempt
+func TestConnDroppedWhenBlocked(t *testing.T) {
+	for _, tc := range transportsToTest {
+		if tc.Name != "WebRTC" {
+			continue
+		}
+		t.Run(tc.Name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			mockRcmgr := mocknetwork.NewMockResourceManager(ctrl)
+			mockRcmgr.EXPECT().OpenConnection(network.DirInbound, gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(func(network.Direction, bool, ma.Multiaddr) (network.ConnManagementScope, error) {
+				// Block the connection
+				return nil, fmt.Errorf("connections blocked")
+			})
+			mockRcmgr.EXPECT().Close().AnyTimes()
+
+			server := tc.HostGenerator(t, TransportTestCaseOpts{ResourceManager: mockRcmgr})
+			client := tc.HostGenerator(t, TransportTestCaseOpts{NoListen: true})
+			defer server.Close()
+			defer client.Close()
+
+			serverSub, err := server.EventBus().Subscribe(new(event.EvtPeerConnectednessChanged))
+			require.NoError(t, err)
+			clientSub, err := client.EventBus().Subscribe(new(event.EvtPeerConnectednessChanged))
+			require.NoError(t, err)
+
+			client.Peerstore().AddAddrs(server.ID(), server.Addrs(), peerstore.PermanentAddrTTL)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_, err = client.NewStream(ctx, server.ID(), ping.ID)
+			require.Error(t, err)
+			require.True(t, errors.Is(err, context.DeadlineExceeded), "The client should have hit the deadline when connecting")
+			select {
+			case <-serverSub.Out():
+				t.Fatal("expected no connected event. Connection should have failed")
+			case <-clientSub.Out():
+				t.Fatal("expected no connected event. Connection should have failed")
+			case <-time.After(time.Second):
+			}
+		})
+	}
+}
+
+// TestConnClosedWhenRemoteCloses tests that a connection is closed locally when it's closed by remote
+func TestConnClosedWhenRemoteCloses(t *testing.T) {
+	for _, tc := range transportsToTest {
+		t.Run(tc.Name, func(t *testing.T) {
+			server := tc.HostGenerator(t, TransportTestCaseOpts{})
+			client := tc.HostGenerator(t, TransportTestCaseOpts{NoListen: true})
+			defer server.Close()
+			defer client.Close()
+
+			client.Peerstore().AddAddrs(server.ID(), server.Addrs(), peerstore.PermanentAddrTTL)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := client.Connect(ctx, peer.AddrInfo{ID: server.ID(), Addrs: server.Addrs()})
+			require.NoError(t, err)
+
+			require.Eventually(t, func() bool {
+				return server.Network().Connectedness(client.ID()) != network.NotConnected
+			}, 5*time.Second, 50*time.Millisecond)
+			for _, c := range client.Network().ConnsToPeer(server.ID()) {
+				c.Close()
+			}
+			require.Eventually(t, func() bool {
+				return server.Network().Connectedness(client.ID()) == network.NotConnected
+			}, 5*time.Second, 50*time.Millisecond)
+		})
+	}
+}
+
+func TestErrorCodes(t *testing.T) {
+	assertStreamErrors := func(s network.Stream, expectedError error) {
+		buf := make([]byte, 10)
+		_, err := s.Read(buf)
+		require.ErrorIs(t, err, expectedError)
+
+		_, err = s.Write(buf)
+		require.ErrorIs(t, err, expectedError)
+	}
+
+	for _, tc := range transportsToTest {
+		if strings.HasPrefix(tc.Name, "WebTransport") {
+			t.Skipf("skipping: %s, not implemented", tc.Name)
+			continue
+		}
+		t.Run(tc.Name, func(t *testing.T) {
+			server := tc.HostGenerator(t, TransportTestCaseOpts{})
+			client := tc.HostGenerator(t, TransportTestCaseOpts{NoListen: true})
+			defer server.Close()
+			defer client.Close()
+
+			client.Peerstore().AddAddrs(server.ID(), server.Addrs(), peerstore.PermanentAddrTTL)
+
+			// setup stream handler
+			remoteStreamQ := make(chan network.Stream)
+			server.SetStreamHandler("/test", func(s network.Stream) {
+				b := make([]byte, 10)
+				n, err := s.Read(b)
+				if !assert.NoError(t, err) {
+					return
+				}
+				_, err = s.Write(b[:n])
+				if !assert.NoError(t, err) {
+					return
+				}
+				remoteStreamQ <- s
+			})
+
+			// pingPong writes and reads "hello" on the stream
+			pingPong := func(s network.Stream) {
+				buf := []byte("hello")
+				_, err := s.Write(buf)
+				require.NoError(t, err)
+
+				_, err = s.Read(buf)
+				require.NoError(t, err)
+				require.Equal(t, buf, []byte("hello"))
+			}
+
+			t.Run("StreamResetWithError", func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				s, err := client.NewStream(ctx, server.ID(), "/test")
+				require.NoError(t, err)
+				pingPong(s)
+
+				remoteStream := <-remoteStreamQ
+				defer remoteStream.Reset()
+
+				err = s.ResetWithError(42)
+				require.NoError(t, err)
+				assertStreamErrors(s, &network.StreamError{
+					ErrorCode: 42,
+					Remote:    false,
+				})
+
+				assertStreamErrors(remoteStream, &network.StreamError{
+					ErrorCode: 42,
+					Remote:    true,
+				})
+			})
+			t.Run("StreamResetWithErrorByRemote", func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				s, err := client.NewStream(ctx, server.ID(), "/test")
+				require.NoError(t, err)
+				pingPong(s)
+
+				remoteStream := <-remoteStreamQ
+
+				err = remoteStream.ResetWithError(42)
+				require.NoError(t, err)
+
+				assertStreamErrors(s, &network.StreamError{
+					ErrorCode: 42,
+					Remote:    true,
+				})
+
+				assertStreamErrors(remoteStream, &network.StreamError{
+					ErrorCode: 42,
+					Remote:    false,
+				})
+			})
+
+			t.Run("StreamResetByConnCloseWithError", func(t *testing.T) {
+				if tc.Name == "WebRTC" {
+					t.Skipf("skipping: %s, not implemented", tc.Name)
+					return
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				s, err := client.NewStream(ctx, server.ID(), "/test")
+				require.NoError(t, err)
+				pingPong(s)
+
+				remoteStream := <-remoteStreamQ
+				defer remoteStream.Reset()
+
+				err = s.Conn().CloseWithError(42)
+				require.NoError(t, err)
+
+				assertStreamErrors(s, &network.ConnError{
+					ErrorCode: 42,
+					Remote:    false,
+				})
+
+				assertStreamErrors(remoteStream, &network.ConnError{
+					ErrorCode: 42,
+					Remote:    true,
+				})
+			})
+
+			t.Run("NewStreamErrorByConnCloseWithError", func(t *testing.T) {
+				if tc.Name == "WebRTC" {
+					t.Skipf("skipping: %s, not implemented", tc.Name)
+					return
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				s, err := client.NewStream(ctx, server.ID(), "/test")
+				require.NoError(t, err)
+				pingPong(s)
+
+				err = s.Conn().CloseWithError(42)
+				require.NoError(t, err)
+
+				remoteStream := <-remoteStreamQ
+				defer remoteStream.Reset()
+
+				localErr := &network.ConnError{
+					ErrorCode: 42,
+					Remote:    false,
+				}
+
+				remoteErr := &network.ConnError{
+					ErrorCode: 42,
+					Remote:    true,
+				}
+
+				// assert these first to ensure that remote has closed the connection
+				assertStreamErrors(remoteStream, remoteErr)
+
+				_, err = s.Conn().NewStream(ctx)
+				require.ErrorIs(t, err, localErr)
+
+				_, err = remoteStream.Conn().NewStream(ctx)
+				require.ErrorIs(t, err, remoteErr)
+			})
 		})
 	}
 }

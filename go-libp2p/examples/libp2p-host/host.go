@@ -21,11 +21,6 @@ func main() {
 }
 
 func run() {
-	// The context governs the lifetime of the libp2p node.
-	// Cancelling it will stop the host.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// To construct a simple host with all the default settings, just use `New`
 	h, err := libp2p.New()
 	if err != nil {
@@ -63,8 +58,8 @@ func run() {
 		libp2p.Identity(priv),
 		// Multiple listen addresses
 		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/9000",      // regular tcp connections
-			"/ip4/0.0.0.0/udp/9000/quic", // a UDP endpoint for the QUIC transport
+			"/ip4/0.0.0.0/tcp/9000",         // regular tcp connections
+			"/ip4/0.0.0.0/udp/9000/quic-v1", // a UDP endpoint for the QUIC transport
 		),
 		// support TLS connections
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
@@ -79,7 +74,7 @@ func run() {
 		libp2p.NATPortMap(),
 		// Let this host use the DHT to find other hosts
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
-			idht, err = dht.New(ctx, h)
+			idht, err = dht.New(context.Background(), h)
 			return idht, err
 		}),
 		// If you want to help other peers to figure out if they are behind

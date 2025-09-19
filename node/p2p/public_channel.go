@@ -1,26 +1,24 @@
 package p2p
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"sync"
 
 	"github.com/pkg/errors"
-	"google.golang.org/protobuf/proto"
-	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
-	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/core/curves"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto/channel"
-	"source.quilibrium.com/quilibrium/monorepo/node/keys"
-	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	typeschannel "source.quilibrium.com/quilibrium/monorepo/types/channel"
+	"source.quilibrium.com/quilibrium/monorepo/types/keys"
+	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
 )
 
 // A simplified P2P channel – the pair of actors communicating is public
 // knowledge, even though the data itself is encrypted.
 type PublicP2PChannel struct {
-	participant         *channel.DoubleRatchetParticipant
+	encryptedChannel    typeschannel.EncryptedChannel
+	channelState        string
 	sendMap             map[uint64][]byte
 	receiveMap          map[uint64][]byte
-	pubSub              PubSub
+	pubSub              p2p.PubSub
 	sendFilter          []byte
 	receiveFilter       []byte
 	initiator           bool
@@ -28,25 +26,20 @@ type PublicP2PChannel struct {
 	receiverSeqNo       uint64
 	receiveChan         chan []byte
 	receiveMx           sync.Mutex
-	publicChannelClient PublicChannelClient
-}
-
-type PublicChannelClient interface {
-	Send(m *protobufs.P2PChannelEnvelope) error
-	Recv() (*protobufs.P2PChannelEnvelope, error)
+	publicChannelClient typeschannel.PublicChannelClient
 }
 
 func NewPublicP2PChannel(
-	publicChannelClient PublicChannelClient,
+	encryptedChannel typeschannel.EncryptedChannel,
+	publicChannelClient typeschannel.PublicChannelClient,
 	senderIdentifier, receiverIdentifier []byte,
 	initiator bool,
-	sendingIdentityPrivateKey curves.Scalar,
-	sendingSignedPrePrivateKey curves.Scalar,
-	receivingIdentityKey curves.Point,
-	receivingSignedPreKey curves.Point,
-	curve *curves.Curve,
+	sendingIdentityPrivateKey []byte,
+	sendingSignedPrePrivateKey []byte,
+	receivingIdentityKey []byte,
+	receivingSignedPreKey []byte,
 	keyManager keys.KeyManager,
-	pubSub PubSub,
+	pubSub p2p.PubSub,
 ) (*PublicP2PChannel, error) {
 	sendFilter := append(
 		append([]byte{}, senderIdentifier...),
@@ -58,6 +51,7 @@ func NewPublicP2PChannel(
 	)
 
 	ch := &PublicP2PChannel{
+		encryptedChannel:    encryptedChannel,
 		publicChannelClient: publicChannelClient,
 		sendMap:             map[uint64][]byte{},
 		receiveMap:          map[uint64][]byte{},
@@ -71,83 +65,19 @@ func NewPublicP2PChannel(
 	}
 
 	var err error
-	var participant *channel.DoubleRatchetParticipant
-	if initiator {
-		sendingEphemeralPrivateKey := curve.Scalar.Random(
-			rand.Reader,
-		)
-		x3dh := channel.SenderX3DH(
-			sendingIdentityPrivateKey,
-			sendingSignedPrePrivateKey,
-			receivingIdentityKey,
-			receivingSignedPreKey,
-			96,
-		)
-		participant, err = channel.NewDoubleRatchetParticipant(
-			x3dh[:32],
-			x3dh[32:64],
-			x3dh[64:],
-			true,
-			sendingEphemeralPrivateKey,
-			receivingSignedPreKey,
-			curve,
-			keyManager,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "new public p2p channel")
-		}
-	} else {
-		x3dh := channel.SenderX3DH(
-			sendingIdentityPrivateKey,
-			sendingSignedPrePrivateKey,
-			receivingIdentityKey,
-			receivingSignedPreKey,
-			96,
-		)
-		participant, err = channel.NewDoubleRatchetParticipant(
-			x3dh[:32],
-			x3dh[32:64],
-			x3dh[64:],
-			false,
-			sendingSignedPrePrivateKey,
-			nil,
-			curve,
-			keyManager,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "new public p2p channel")
-		}
+	channelState, err := encryptedChannel.EstablishTwoPartyChannel(
+		initiator,
+		sendingIdentityPrivateKey,
+		sendingSignedPrePrivateKey,
+		receivingIdentityKey,
+		receivingSignedPreKey,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "new public p2p channel")
 	}
-
-	ch.participant = participant
+	ch.channelState = channelState
 
 	return ch, nil
-}
-
-func (c *PublicP2PChannel) handleReceive(message *pb.Message) error {
-	envelope := &protobufs.P2PChannelEnvelope{}
-	if err := proto.Unmarshal(message.Data, envelope); err != nil {
-		return errors.Wrap(err, "handle receive")
-	}
-
-	c.receiveMx.Lock()
-	rawData, err := c.participant.RatchetDecrypt(envelope)
-	c.receiveMx.Unlock()
-	if err != nil {
-		return errors.Wrap(err, "handle receive")
-	}
-
-	seqNo := binary.BigEndian.Uint64(rawData[:8])
-
-	if seqNo == c.receiverSeqNo {
-		c.receiveChan <- rawData[8:]
-	} else {
-		c.receiveMx.Lock()
-		c.receiveMap[seqNo] = rawData[8:]
-		c.receiveMx.Unlock()
-	}
-
-	return nil
 }
 
 func (c *PublicP2PChannel) Send(message []byte) error {
@@ -157,13 +87,30 @@ func (c *PublicP2PChannel) Send(message []byte) error {
 		message...,
 	)
 
-	envelope, err := c.participant.RatchetEncrypt(message)
+	newState, envelope, err := c.encryptedChannel.EncryptTwoPartyMessage(
+		c.channelState,
+		message,
+	)
 	if err != nil {
 		return errors.Wrap(err, "send")
 	}
 
+	c.channelState = newState
+
 	return errors.Wrap(
-		c.publicChannelClient.Send(envelope),
+		c.publicChannelClient.Send(&protobufs.P2PChannelEnvelope{
+			ProtocolIdentifier: uint32(envelope.ProtocolIdentifier),
+			MessageHeader: &protobufs.MessageCiphertext{
+				InitializationVector: envelope.MessageHeader.InitializationVector,
+				Ciphertext:           envelope.MessageHeader.Ciphertext,
+				AssociatedData:       envelope.MessageHeader.AssociatedData,
+			},
+			MessageBody: &protobufs.MessageCiphertext{
+				InitializationVector: envelope.MessageBody.InitializationVector,
+				Ciphertext:           envelope.MessageBody.Ciphertext,
+				AssociatedData:       envelope.MessageBody.AssociatedData,
+			},
+		}),
 		"send",
 	)
 }
@@ -176,10 +123,27 @@ func (c *PublicP2PChannel) Receive() ([]byte, error) {
 		return nil, errors.Wrap(err, "receive")
 	}
 
-	rawData, err := c.participant.RatchetDecrypt(msg)
+	newState, rawData, err := c.encryptedChannel.DecryptTwoPartyMessage(
+		c.channelState,
+		&typeschannel.P2PChannelEnvelope{
+			ProtocolIdentifier: uint16(msg.ProtocolIdentifier),
+			MessageHeader: typeschannel.MessageCiphertext{
+				InitializationVector: msg.MessageHeader.InitializationVector,
+				Ciphertext:           msg.MessageHeader.Ciphertext,
+				AssociatedData:       msg.MessageHeader.AssociatedData,
+			},
+			MessageBody: typeschannel.MessageCiphertext{
+				InitializationVector: msg.MessageBody.InitializationVector,
+				Ciphertext:           msg.MessageBody.Ciphertext,
+				AssociatedData:       msg.MessageBody.AssociatedData,
+			},
+		},
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "receive")
 	}
+
+	c.channelState = newState
 
 	seqNo := binary.BigEndian.Uint64(rawData[:8])
 

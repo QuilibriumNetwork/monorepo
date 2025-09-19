@@ -1,0 +1,9 @@
+// -*- go -*-
+//
+// Copyright (c) 2023 Markku Rossi
+//
+// All rights reserved.
+//
+
+// Package hex implements hexadecimal encoding and decoding functions.
+package hex

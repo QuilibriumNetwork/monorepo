@@ -286,7 +286,7 @@ func (s *ScalarEd448) SetBytes(input []byte) (Scalar, error) {
 	return &ScalarEd448{value}, nil
 }
 
-// SetBytesWide takes input a 56-byte long byte array, reduce it and return an
+// SetBytesWide takes input a 112-byte long byte array, reduce it and return an
 // Ed448 scalar. If bytes is not of the right length, it returns nil and an
 // error
 func (s *ScalarEd448) SetBytesWide(bytes []byte) (Scalar, error) {

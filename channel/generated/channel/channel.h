@@ -98,6 +98,24 @@ RustBuffer uniffi_channel_fn_func_new_triple_ratchet(
 	RustCallStatus* out_status
 );
 
+RustBuffer uniffi_channel_fn_func_receiver_x3dh(
+	RustBuffer sending_identity_private_key,
+	RustBuffer sending_signed_private_key,
+	RustBuffer receiving_identity_key,
+	RustBuffer receiving_ephemeral_key,
+	uint64_t session_key_length,
+	RustCallStatus* out_status
+);
+
+RustBuffer uniffi_channel_fn_func_sender_x3dh(
+	RustBuffer sending_identity_private_key,
+	RustBuffer sending_ephemeral_private_key,
+	RustBuffer receiving_identity_key,
+	RustBuffer receiving_signed_pre_key,
+	uint64_t session_key_length,
+	RustCallStatus* out_status
+);
+
 RustBuffer uniffi_channel_fn_func_triple_ratchet_decrypt(
 	RustBuffer ratchet_state_and_envelope,
 	RustCallStatus* out_status
@@ -440,6 +458,14 @@ uint16_t uniffi_channel_checksum_func_new_double_ratchet(
 );
 
 uint16_t uniffi_channel_checksum_func_new_triple_ratchet(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_channel_checksum_func_receiver_x3dh(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_channel_checksum_func_sender_x3dh(
 	RustCallStatus* out_status
 );
 

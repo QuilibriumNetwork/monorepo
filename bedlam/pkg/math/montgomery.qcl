@@ -1,0 +1,62 @@
+// -*- go -*-
+//
+// Copyright (c) 2020-2021 Markku Rossi
+//
+// All rights reserved.
+//
+
+package math
+
+func makeMontgomery(m uint) uint {
+	n := size(m)
+	tmpType := make(uint, size(m)*2+1)
+	rrmType := make(uint, size(m))
+
+	var tmp tmpType = 1
+	tmp = (tmp << (n * 2)) % tmpType(m)
+	return rrmType(tmp)
+}
+
+func reduce(m, rrm, t uint) uint {
+	n := size(m)
+	a := t
+	aType := make(uint, size(a))
+
+	for i := 0; i < n; i++ {
+		if a&1 != 0 {
+			a += aType(m)
+		}
+		a = a >> 1
+	}
+	if a >= aType(m) {
+		a = a - aType(m)
+	}
+	return a
+}
+
+// ExpMontgomery computes modular exponentiation b**e mod |m|
+// (i.e. the sign of m is ignored). The m must be bigger than 0 and
+// not even number.
+func ExpMontgomery(b, e, m uint) uint {
+	cType := make(uint, size(m)*2)
+
+	rrm := makeMontgomery(m)
+
+	t1 := cType(b) * cType(rrm)
+	t2 := cType(e) * cType(rrm)
+
+	r1 := math.reduce(m, rrm, t1)
+	r2 := math.reduce(m, rrm, t2)
+
+	prod := math.reduce(m, rrm, rrm)
+	base := math.reduce(m, rrm, b*rrm)
+
+	for i := 0; i < size(e); i++ {
+		if e>>i&1 != 0 {
+			prod = math.reduce(m, rrm, prod*base)
+		}
+		base = math.reduce(m, rrm, base*base)
+	}
+
+	return math.reduce(m, rrm, prod)
+}

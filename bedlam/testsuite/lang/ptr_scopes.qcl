@@ -1,0 +1,29 @@
+// -*- go -*-
+
+package main
+
+var c int32
+
+func set(ptr *int32, val int32) {
+	*ptr = val
+}
+
+func setGlobal(val int32) {
+	set(&c, val)
+}
+
+func getGlobal() int32 {
+	return c
+}
+
+// @Test 0 0 = 0
+// @Test 1 2 = 3
+// @Test 7 9 = 16
+func main(a, b int32) int {
+	var c int32
+
+	set(&c, a)
+	setGlobal(b)
+
+	return c + getGlobal()
+}

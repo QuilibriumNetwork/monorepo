@@ -11,7 +11,6 @@ import (
 	tpt "github.com/libp2p/go-libp2p/core/transport"
 	p2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
-
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/quic-go/quic-go"
 )
@@ -23,11 +22,11 @@ type listener struct {
 	rcmgr           network.ResourceManager
 	privKey         ic.PrivKey
 	localPeer       peer.ID
-	localMultiaddrs map[quic.VersionNumber]ma.Multiaddr
+	localMultiaddrs map[quic.Version]ma.Multiaddr
 }
 
 func newListener(ln quicreuse.Listener, t *transport, localPeer peer.ID, key ic.PrivKey, rcmgr network.ResourceManager) (listener, error) {
-	localMultiaddrs := make(map[quic.VersionNumber]ma.Multiaddr)
+	localMultiaddrs := make(map[quic.Version]ma.Multiaddr)
 	for _, addr := range ln.Multiaddrs() {
 		if _, err := addr.ValueForProtocol(ma.P_QUIC_V1); err == nil {
 			localMultiaddrs[quic.Version1] = addr
@@ -51,13 +50,15 @@ func (l *listener) Accept() (tpt.CapableConn, error) {
 		if err != nil {
 			return nil, err
 		}
-		c, err := l.setupConn(qconn)
+		c, err := l.wrapConn(qconn)
 		if err != nil {
+			log.Debug("failed to setup connection", "err", err)
+			qconn.CloseWithError(quic.ApplicationErrorCode(network.ConnResourceLimitExceeded), "")
 			continue
 		}
 		l.transport.addConn(qconn, c)
 		if l.transport.gater != nil && !(l.transport.gater.InterceptAccept(c) && l.transport.gater.InterceptSecured(network.DirInbound, c.remotePeerID, c)) {
-			c.closeWithError(errorCodeConnectionGating, "connection gated")
+			c.closeWithError(quic.ApplicationErrorCode(network.ConnGated), "connection gated")
 			continue
 		}
 
@@ -79,29 +80,39 @@ func (l *listener) Accept() (tpt.CapableConn, error) {
 	}
 }
 
-func (l *listener) setupConn(qconn quic.Connection) (*conn, error) {
+// wrapConn wraps a QUIC connection into a libp2p [tpt.CapableConn].
+// If wrapping fails. The caller is responsible for cleaning up the
+// connection.
+func (l *listener) wrapConn(qconn *quic.Conn) (*conn, error) {
 	remoteMultiaddr, err := quicreuse.ToQuicMultiaddr(qconn.RemoteAddr(), qconn.ConnectionState().Version)
 	if err != nil {
 		return nil, err
 	}
-
-	connScope, err := l.rcmgr.OpenConnection(network.DirInbound, false, remoteMultiaddr)
+	connScope, err := network.UnwrapConnManagementScope(qconn.Context())
 	if err != nil {
-		log.Debugw("resource manager blocked incoming connection", "addr", qconn.RemoteAddr(), "error", err)
-		return nil, err
+		connScope = nil
+		// Don't error here.
+		// Setup scope if we don't have scope from quicreuse.
+		// This is better than failing so that users that don't use quicreuse.ConnContext option with the resource
+		// manager work correctly.
 	}
-	c, err := l.setupConnWithScope(qconn, connScope, remoteMultiaddr)
+	if connScope == nil {
+		connScope, err = l.rcmgr.OpenConnection(network.DirInbound, false, remoteMultiaddr)
+		if err != nil {
+			log.Debug("resource manager blocked incoming connection", "addr", qconn.RemoteAddr(), "err", err)
+			return nil, err
+		}
+	}
+	c, err := l.wrapConnWithScope(qconn, connScope, remoteMultiaddr)
 	if err != nil {
 		connScope.Done()
-		qconn.CloseWithError(1, "")
 		return nil, err
 	}
 
 	return c, nil
 }
 
-func (l *listener) setupConnWithScope(qconn quic.Connection, connScope network.ConnManagementScope, remoteMultiaddr ma.Multiaddr) (*conn, error) {
-
+func (l *listener) wrapConnWithScope(qconn *quic.Conn, connScope network.ConnManagementScope, remoteMultiaddr ma.Multiaddr) (*conn, error) {
 	// The tls.Config used to establish this connection already verified the certificate chain.
 	// Since we don't have any way of knowing which tls.Config was used though,
 	// we have to re-determine the peer's identity here.
@@ -115,7 +126,7 @@ func (l *listener) setupConnWithScope(qconn quic.Connection, connScope network.C
 		return nil, err
 	}
 	if err := connScope.SetPeer(remotePeerID); err != nil {
-		log.Debugw("resource manager blocked incoming connection for peer", "peer", remotePeerID, "addr", qconn.RemoteAddr(), "error", err)
+		log.Debug("resource manager blocked incoming connection for peer", "peer", remotePeerID, "addr", qconn.RemoteAddr(), "err", err)
 		return nil, err
 	}
 

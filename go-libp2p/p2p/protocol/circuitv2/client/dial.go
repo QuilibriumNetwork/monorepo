@@ -41,13 +41,9 @@ func isRelayError(err error) bool {
 // dialer
 func (c *Client) dial(ctx context.Context, a ma.Multiaddr, p peer.ID) (*Conn, error) {
 	// split /a/p2p-circuit/b into (/a, /p2p-circuit/b)
-	relayaddr, destaddr, err := ma.SplitFunc(a, func(c ma.Component) bool {
+	relayaddr, destaddr := ma.SplitFunc(a, func(c ma.Component) bool {
 		return c.Protocol().Code == ma.P_CIRCUIT
 	})
-
-	if err != nil {
-		return nil, err
-	}
 
 	// If the address contained no /p2p-circuit part, the second part is nil.
 	if destaddr == nil {
@@ -62,11 +58,7 @@ func (c *Client) dial(ctx context.Context, a ma.Multiaddr, p peer.ID) (*Conn, er
 
 	// Strip the /p2p-circuit prefix from the destaddr so that we can pass the destination address
 	// (if present) for active relays
-	_, destaddr, err = ma.SplitFirst(destaddr)
-	if err != nil {
-		return nil, err
-	}
-
+	_, destaddr = ma.SplitFirst(destaddr)
 	if destaddr != nil {
 		dinfo.Addrs = append(dinfo.Addrs, destaddr)
 	}
@@ -123,22 +115,21 @@ retry:
 }
 
 func (c *Client) dialPeer(ctx context.Context, relay, dest peer.AddrInfo) (*Conn, error) {
-	log.Debugf("dialing peer %s through relay %s", dest.ID, relay.ID)
+	log.Debug("dialing peer through relay",
+		"destination_peer", dest.ID,
+		"relay_peer", relay.ID)
 
 	if len(relay.Addrs) > 0 {
 		c.host.Peerstore().AddAddrs(relay.ID, relay.Addrs, peerstore.TempAddrTTL)
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, DialRelayTimeout)
-
+	defer cancel()
 	s, err := c.host.NewStream(dialCtx, relay.ID, proto.ProtoIDv2Hop)
 	if err != nil {
-		cancel()
 		return nil, fmt.Errorf("error opening hop stream to relay: %w", err)
 	}
-	conn, err := c.connect(s, dest)
-	cancel()
-	return conn, err
+	return c.connect(s, dest)
 }
 
 func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
@@ -146,9 +137,11 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 		s.Reset()
 		return nil, err
 	}
+	defer s.Scope().ReleaseMemory(maxMessageSize)
 
 	rd := util.NewDelimitedReader(s, maxMessageSize)
 	wr := util.NewDelimitedWriter(s)
+	defer rd.Close()
 
 	var msg pbv2.HopMessage
 
@@ -160,8 +153,6 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 	err := wr.WriteMsg(&msg)
 	if err != nil {
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMessageSize)
-		rd.Close()
 		return nil, err
 	}
 
@@ -170,8 +161,6 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 	err = rd.ReadMsg(&msg)
 	if err != nil {
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMessageSize)
-		rd.Close()
 		return nil, err
 	}
 
@@ -179,16 +168,12 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 
 	if msg.GetType() != pbv2.HopMessage_STATUS {
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMessageSize)
-		rd.Close()
 		return nil, newRelayError("unexpected relay response; not a status message (%d)", msg.GetType())
 	}
 
 	status := msg.GetStatus()
 	if status != pbv2.Status_OK {
 		s.Reset()
-		s.Scope().ReleaseMemory(maxMessageSize)
-		rd.Close()
 		return nil, newRelayError("error opening relay circuit: %s (%d)", pbv2.Status_name[int32(status)], status)
 	}
 
@@ -202,7 +187,5 @@ func (c *Client) connect(s network.Stream, dest peer.AddrInfo) (*Conn, error) {
 		stat.Extra[StatLimitData] = limit.GetData()
 	}
 
-	s.Scope().ReleaseMemory(maxMessageSize)
-	rd.Close()
 	return &Conn{stream: s, remote: dest, stat: stat, client: c}, nil
 }

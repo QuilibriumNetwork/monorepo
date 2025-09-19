@@ -1,0 +1,26 @@
+// -*- go -*-
+//
+
+// Example of how to add two uint256 values. You can use any data type for the input as long as it is divisible by 8,
+// such as uint512.
+//
+// To run the Evaluator:
+//
+//	./garbled -e -i 0xb33d6a91b4ca8ac31c639c6742cba5a74c661a63311548af191c298a945d4891 examples/add.qcl
+//
+// To run the Garbler:
+//
+//	./garbled -i 0x5bf6db5927d799cf225f165e9508238edc5a1200fcad08c6411648733eb3100f examples/add.qcl
+//
+// The expected result should be:
+// 6877051328478326342308659403308568813546041258230645271156059935820089415840 (0x0f3445eadca224923ec2b2c5d7d3c93628c02c642dc251755a3271fdd31058a0)
+
+package main
+
+import (
+	"math"
+)
+
+func main(a, b uint256) uint {
+	return a + b
+}

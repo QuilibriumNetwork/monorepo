@@ -1,0 +1,11 @@
+// -*- go -*-
+
+package main
+
+var base uint32 = 42
+
+// @Test 0 0 = 42
+// @Test 1 2 = 45
+func main(a, b uint32) uint {
+	return base + a + b
+}

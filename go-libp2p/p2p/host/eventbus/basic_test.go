@@ -3,7 +3,9 @@ package eventbus
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,11 +15,14 @@ import (
 
 	"github.com/libp2p/go-libp2p-testing/race"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-type EventA struct{}
-type EventB int
+type (
+	EventA struct{}
+	EventB int
+)
 
 func getN() int {
 	n := 50000
@@ -129,6 +134,86 @@ func TestEmitNoSubNoBlock(t *testing.T) {
 	defer em.Close()
 
 	em.Emit(EventA{})
+}
+
+type mockLogger struct {
+	mu   sync.Mutex
+	logs []string
+}
+
+func (m *mockLogger) Write(p []byte) (n int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logs = append(m.logs, string(p))
+	return len(p), nil
+}
+
+func (m *mockLogger) Logs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.logs
+}
+
+func (m *mockLogger) Clear() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logs = nil
+}
+
+func TestEmitLogsErrorOnStall(t *testing.T) {
+	oldLogger := log
+	defer func() {
+		log = oldLogger
+	}()
+	ml := mockLogger{}
+	log = slog.New(slog.NewTextHandler(&ml, nil))
+
+	bus1 := NewBus()
+	bus2 := NewBus()
+
+	eventSub, err := bus1.Subscribe(new(EventA))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wildcardSub, err := bus2.Subscribe(event.WildcardSubscription)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []event.Subscription{eventSub, wildcardSub}
+	eventBuses := []event.Bus{bus1, bus2}
+
+	for i, sub := range testCases {
+		bus := eventBuses[i]
+		em, err := bus.Emitter(new(EventA))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer em.Close()
+
+		go func() {
+			for i := 0; i < subSettingsDefault.buffer+2; i++ {
+				em.Emit(EventA{})
+			}
+		}()
+
+		require.EventuallyWithT(t, func(collect *assert.CollectT) {
+			logs := ml.Logs()
+			found := false
+			for _, log := range logs {
+				if strings.Contains(log, "slow consumer") {
+					found = true
+					break
+				}
+			}
+			assert.True(collect, found, "expected to find slow consumer log")
+		}, 3*time.Second, 500*time.Millisecond)
+		ml.Clear()
+
+		// Close the subscriber so the worker can finish.
+		sub.Close()
+	}
 }
 
 func TestEmitOnClosed(t *testing.T) {
@@ -313,10 +398,13 @@ func TestManyWildcardSubscriptions(t *testing.T) {
 	require.NoError(t, em1.Emit(EventA{}))
 	require.NoError(t, em2.Emit(EventB(1)))
 
-	// the first five still have 2 events, while the other five have 4 events.
-	for _, s := range subs[:5] {
-		require.Len(t, s.Out(), 2)
-	}
+	// the first five 0 events because it was closed. The other five
+	// have 4 events.
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		for _, s := range subs[:5] {
+			require.Len(t, s.Out(), 0, "expected closed subscription to have flushed events")
+		}
+	}, 2*time.Second, 100*time.Millisecond)
 
 	for _, s := range subs[5:] {
 		require.Len(t, s.Out(), 4)
@@ -325,6 +413,10 @@ func TestManyWildcardSubscriptions(t *testing.T) {
 	// close them all, the first five will be closed twice (asserts idempotency).
 	for _, s := range subs {
 		require.NoError(t, s.Close())
+	}
+
+	for _, s := range subs {
+		require.Zero(t, s.(*wildcardSub).w.nSinks.Load())
 	}
 }
 
@@ -479,6 +571,17 @@ func TestSubFailFully(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout")
 	}
+}
+
+func TestSubCloseMultiple(t *testing.T) {
+	bus := NewBus()
+
+	sub, err := bus.Subscribe([]interface{}{new(EventB)})
+	require.NoError(t, err)
+	err = sub.Close()
+	require.NoError(t, err)
+	err = sub.Close()
+	require.NoError(t, err)
 }
 
 func testMany(t testing.TB, subs, emits, msgs int, stateful bool) {

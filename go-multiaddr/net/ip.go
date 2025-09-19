@@ -63,7 +63,7 @@ func IsIPLoopback(m ma.Multiaddr) bool {
 	if m == nil {
 		return false
 	}
-	c, _, _ := ma.SplitFirst(m)
+	c, _ := ma.SplitFirst(m)
 	if c == nil {
 		return false
 	}
@@ -82,7 +82,7 @@ func IsIP6LinkLocal(m ma.Multiaddr) bool {
 	if m == nil {
 		return false
 	}
-	c, _, _ := ma.SplitFirst(m)
+	c, _ := ma.SplitFirst(m)
 	if c == nil || c.Protocol().Code != ma.P_IP6 {
 		return false
 	}
@@ -97,7 +97,7 @@ func IsIPUnspecified(m ma.Multiaddr) bool {
 	if m == nil {
 		return false
 	}
-	c, _, _ := ma.SplitFirst(m)
+	c, _ := ma.SplitFirst(m)
 	return net.IP(c.RawValue()).IsUnspecified()
 }
 
@@ -105,7 +105,7 @@ func IsIPUnspecified(m ma.Multiaddr) bool {
 // else if m matches [], [zone], or [zone,...], return nil
 // else return m
 func zoneless(m ma.Multiaddr) ma.Multiaddr {
-	head, tail, _ := ma.SplitFirst(m)
+	head, tail := ma.SplitFirst(m)
 	if head == nil {
 		return nil
 	}
@@ -113,7 +113,7 @@ func zoneless(m ma.Multiaddr) ma.Multiaddr {
 		if tail == nil {
 			return nil
 		}
-		tailhead, _, _ := ma.SplitFirst(tail)
+		tailhead, _ := ma.SplitFirst(tail)
 		if tailhead.Protocol().Code != ma.P_IP6 {
 			return nil
 		}
@@ -126,7 +126,7 @@ func zoneless(m ma.Multiaddr) ma.Multiaddr {
 // IsNAT64IPv4ConvertedIPv6Addr returns whether addr is a well-known prefix "64:ff9b::/96" addr
 // used for NAT64 Translation. See RFC 6052
 func IsNAT64IPv4ConvertedIPv6Addr(addr ma.Multiaddr) bool {
-	c, _, _ := ma.SplitFirst(addr)
+	c, _ := ma.SplitFirst(addr)
 	return c != nil && c.Protocol().Code == ma.P_IP6 &&
 		inAddrRange(c.RawValue(), nat64)
 }

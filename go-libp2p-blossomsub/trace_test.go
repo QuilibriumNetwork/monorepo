@@ -105,13 +105,22 @@ func testWithTracer(t *testing.T, tracer EventTracer) {
 	// publish some messages
 	for i := 0; i < 20; i++ {
 		if i%7 == 0 {
-			bitmasks[i].Publish(ctx, bitmasks[i].bitmask, []byte("invalid!"))
+			err := bitmasks[i].Publish(ctx, bitmasks[i].bitmask, []byte("invalid!"))
+			if err != nil {
+				fmt.Println(err)
+			}
 		} else {
 			if i%9 == 0 {
-				bitmasks[i].Publish(ctx, bitmasks[i].bitmask, []byte("dupe"))
+				err := bitmasks[i].Publish(ctx, bitmasks[i].bitmask, []byte("dupe"))
+				if err != nil {
+					fmt.Println(err)
+				}
 			} else {
 				msg := []byte(fmt.Sprintf("message %d", i))
-				bitmasks[i].Publish(ctx, bitmasks[i].bitmask, msg)
+				err := bitmasks[i].Publish(ctx, bitmasks[i].bitmask, msg)
+				if err != nil {
+					fmt.Println(err)
+				}
 			}
 		}
 	}
@@ -207,7 +216,7 @@ func TestJSONTracer(t *testing.T) {
 
 	testWithTracer(t, tracer)
 	time.Sleep(time.Second)
-	tracer.Close()
+	defer tracer.Close()
 
 	var stats traceStats
 	var evt pb.TraceEvent
@@ -240,7 +249,7 @@ func TestPBTracer(t *testing.T) {
 
 	testWithTracer(t, tracer)
 	time.Sleep(time.Second)
-	tracer.Close()
+	defer tracer.Close()
 
 	var stats traceStats
 	var evt pb.TraceEvent
@@ -335,7 +344,7 @@ func TestRemoteTracer(t *testing.T) {
 
 	testWithTracer(t, tracer)
 	time.Sleep(time.Second)
-	tracer.Close()
+	defer tracer.Close()
 
 	mrt.check(t)
 }

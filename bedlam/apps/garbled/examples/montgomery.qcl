@@ -1,0 +1,39 @@
+// -*- go -*-
+//
+
+// RSA encryption with Montgomery modular multiplication.
+//
+//	./garbled -e -v -i 0x321af130 examples/montgomery.qcl
+//	./garbled -v -i 0x6d7472,9,0xd60b2b09,0x10001 examples/montgomery.qcl
+package main
+
+import (
+	"math"
+)
+
+type Size = uint64
+
+type Garbler struct {
+	msg       Size
+	privShare Size
+	pubN      Size
+	pubE      Size
+}
+
+func main(g Garbler, privShare Size) (uint, uint) {
+
+	priv := g.privShare + privShare
+
+	cipher := Encrypt(g.msg, g.pubE, g.pubN)
+	plain := Decrypt(cipher, priv, g.pubN)
+
+	return cipher, plain
+}
+
+func Encrypt(msg, e, n uint) uint {
+	return math.ExpMontgomery(msg, e, n)
+}
+
+func Decrypt(cipher, d, n uint) uint {
+	return math.ExpMontgomery(cipher, d, n)
+}

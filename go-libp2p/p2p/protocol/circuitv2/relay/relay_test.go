@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
@@ -28,6 +29,11 @@ import (
 
 	ma "github.com/multiformats/go-multiaddr"
 )
+
+func tStringCast(s string) ma.Multiaddr {
+	st, _ := ma.StringCast(s)
+	return st
+}
 
 func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, upgraders []transport.Upgrader) {
 	for i := 0; i < n; i++ {
@@ -60,7 +66,7 @@ func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, u
 		upgrader := swarmt.GenUpgrader(t, netw, nil)
 		upgraders = append(upgraders, upgrader)
 
-		tpt, err := tcp.NewTCPTransport(upgrader, nil)
+		tpt, err := tcp.NewTCPTransport(upgrader, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -68,8 +74,7 @@ func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, u
 			t.Fatal(err)
 		}
 
-		m, _ := ma.StringCast("/ip4/127.0.0.1/tcp/0")
-		err = netw.Listen(m)
+		err = netw.Listen(tStringCast("/ip4/127.0.0.1/tcp/0"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -268,12 +273,12 @@ func TestRelayLimitTime(t *testing.T) {
 	if n > 0 {
 		t.Fatalf("expected to write 0 bytes, wrote %d", n)
 	}
-	if err != network.ErrReset {
+	if !errors.Is(err, network.ErrReset) {
 		t.Fatalf("expected reset, but got %s", err)
 	}
 
 	err = <-rch
-	if err != network.ErrReset {
+	if !errors.Is(err, network.ErrReset) {
 		t.Fatalf("expected reset, but got %s", err)
 	}
 }
@@ -301,7 +306,7 @@ func TestRelayLimitData(t *testing.T) {
 		}
 
 		n, err := s.Read(buf)
-		if err != network.ErrReset {
+		if !errors.Is(err, network.ErrReset) {
 			t.Fatalf("expected reset but got %s", err)
 		}
 		rch <- n

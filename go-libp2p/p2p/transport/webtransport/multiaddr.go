@@ -43,20 +43,12 @@ func stringToWebtransportMultiaddr(str string) (ma.Multiaddr, error) {
 
 func extractCertHashes(addr ma.Multiaddr) ([]multihash.DecodedMultihash, error) {
 	certHashesStr := make([]string, 0, 2)
-	var err error
 	ma.ForEach(addr, func(c ma.Component, e error) bool {
-		if e != nil {
-			err = e
-			return false
-		}
 		if c.Protocol().Code == ma.P_CERTHASH {
 			certHashesStr = append(certHashesStr, c.Value())
 		}
 		return true
 	})
-	if err != nil {
-		return nil, err
-	}
 	certHashes := make([]multihash.DecodedMultihash, 0, len(certHashesStr))
 	for _, s := range certHashesStr {
 		_, ch, err := multibase.Decode(s)
@@ -72,7 +64,7 @@ func extractCertHashes(addr ma.Multiaddr) ([]multihash.DecodedMultihash, error) 
 	return certHashes, nil
 }
 
-func addrComponentForCert(hash []byte) (ma.Multiaddr, error) {
+func addrComponentForCert(hash []byte) (*ma.Component, error) {
 	mh, err := multihash.Encode(hash, multihash.SHA2_256)
 	if err != nil {
 		return nil, err
@@ -97,9 +89,6 @@ func IsWebtransportMultiaddr(multiaddr ma.Multiaddr) (bool, int) {
 	certhashCount := 0
 
 	ma.ForEach(multiaddr, func(c ma.Component, e error) bool {
-		if e != nil {
-			return false
-		}
 		switch c.Protocol().Code {
 		case ma.P_UDP:
 			if state == init {

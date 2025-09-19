@@ -1,11 +1,11 @@
 
 ## Introduction
-Implementation of the DKG-in-the-head (DKGitH) and Robust DKG-in-the-head (RDKGitH) verifiable encryption schemes.
+Implementation of the Robust DKG-in-the-head (RDKGitH) verifiable encryption scheme.
 
 ## Description
-These verifiable encryption (VE) schemes allow one to encrypt a discrete logarithm instance under an Elgamal public key and prove to anyone that the correct value is encrypted.  
+This verifiable encryption (VE) scheme allows one to encrypt a discrete logarithm instance under an Elgamal public key and prove to anyone that the correct value is encrypted.  
 
-We use the elliptic curve implementation of [`arkworks`](https://github.com/arkworks-rs), and our implementation defaults to using the `secp256r1` curve, but is generic over the choice of curve and can easily be modified used to other curves implemented in `arkworks`.
+We use the ed448-goldilocks-plus library for ed448, but it was converted from an arkworks implementation. There was also a significant performance issue in the original implementation it was forked from in the lagrange calculation – previously the numerator and denominator of the polynomial evaluation was calculated at every degree, incurring the cost of modular inversion with every degree. We defer inversion to the final step of the accumulated value, drastically increasing performance of compression.
 
 Hashing is done with SHA512, using the Rust [`sha2`](https://docs.rs/sha2/latest/sha2/) crate. 
 
@@ -17,11 +17,7 @@ To run unit tests type `cargo test --release`.
 Sizes of the proofs and ciphertexts for the two schemes are computed in unit tests, use the script `run_size_benchmarks.sh` to run the tests and display the output. 
 
 Benchmarks of the time required to run the main VE operations `Prove()`, `Verify()`, `Compress()` and `Recover()`
-are also provided, and can be run with `cargo bench`.  To run only the DKGitH benchmarks, use 
-```
-cargo bench -- "^DKGitH"
-```
-and to run only the RDKGitH benchmarks use
+are also provided, and can be run with `cargo bench`.  To run the RDKGitH benchmarks use
 ```
 cargo bench -- "^RDKGitH"
 ```

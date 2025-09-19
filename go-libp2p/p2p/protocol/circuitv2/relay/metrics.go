@@ -163,23 +163,24 @@ func (mt *metricsTracer) RelayStatus(enabled bool) {
 
 func (mt *metricsTracer) ConnectionOpened() {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 	*tags = append(*tags, "opened")
 
 	connectionsTotal.WithLabelValues(*tags...).Add(1)
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) ConnectionClosed(d time.Duration) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 	*tags = append(*tags, "closed")
 
 	connectionsTotal.WithLabelValues(*tags...).Add(1)
 	connectionDurationSeconds.Observe(d.Seconds())
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) ConnectionRequestHandled(status pbv2.Status) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	respStatus := getResponseStatus(status)
 
@@ -190,11 +191,11 @@ func (mt *metricsTracer) ConnectionRequestHandled(status pbv2.Status) {
 		*tags = append(*tags, getRejectionReason(status))
 		connectionRejectionsTotal.WithLabelValues(*tags...).Add(1)
 	}
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) ReservationAllowed(isRenewal bool) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 	if isRenewal {
 		*tags = append(*tags, "renewed")
 	} else {
@@ -202,19 +203,19 @@ func (mt *metricsTracer) ReservationAllowed(isRenewal bool) {
 	}
 
 	reservationsTotal.WithLabelValues(*tags...).Add(1)
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) ReservationClosed(cnt int) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 	*tags = append(*tags, "closed")
 
 	reservationsTotal.WithLabelValues(*tags...).Add(float64(cnt))
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) ReservationRequestHandled(status pbv2.Status) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	respStatus := getResponseStatus(status)
 
@@ -225,7 +226,6 @@ func (mt *metricsTracer) ReservationRequestHandled(status pbv2.Status) {
 		*tags = append(*tags, getRejectionReason(status))
 		reservationRejectionsTotal.WithLabelValues(*tags...).Add(1)
 	}
-	metricshelper.PutStringSlice(tags)
 }
 
 func (mt *metricsTracer) BytesTransferred(cnt int) {

@@ -1,0 +1,13 @@
+// -*- go -*-
+
+package main
+
+// @Test 0 0 = 2
+func main(a, b uint2) uint {
+	var r uint2 = 1 // init 1 bugs, 0 works.
+
+	r = r * 1
+	r = r + 1
+
+	return r
+}

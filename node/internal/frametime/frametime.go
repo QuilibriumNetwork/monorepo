@@ -3,10 +3,15 @@ package frametime
 import (
 	"time"
 
-	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
 
-// Since returns the time elapsed since the given frame was created.
-func Since(frame *protobufs.ClockFrame) time.Duration {
-	return time.Since(time.UnixMilli(frame.Timestamp))
+// AppFrameSince returns the time elapsed since the given frame was created.
+func AppFrameSince(frame *protobufs.AppShardFrame) time.Duration {
+	return time.Since(time.UnixMilli(frame.Header.Timestamp))
+}
+
+// GlobalFrameSince returns the time elapsed since the given frame was created.
+func GlobalFrameSince(frame *protobufs.GlobalFrame) time.Duration {
+	return time.Since(time.UnixMilli(frame.Header.Timestamp))
 }

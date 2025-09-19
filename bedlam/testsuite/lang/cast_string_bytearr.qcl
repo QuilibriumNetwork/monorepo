@@ -1,0 +1,8 @@
+// -*- go -*-
+
+package main
+
+// @Test 0x40414243 1 = 0x40414243
+func main(a []byte, b int) string {
+	return string(a)
+}

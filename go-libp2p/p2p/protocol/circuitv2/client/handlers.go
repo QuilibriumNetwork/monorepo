@@ -14,31 +14,31 @@ var (
 )
 
 func (c *Client) handleStreamV2(s network.Stream) {
-	log.Debugf("new relay/v2 stream from: %s", s.Conn().RemotePeer())
+	log.Debug("new relay/v2 stream", "remote_peer", s.Conn().RemotePeer())
 
 	s.SetReadDeadline(time.Now().Add(StreamTimeout))
 
 	rd := util.NewDelimitedReader(s, maxMessageSize)
+	defer rd.Close()
 
 	writeResponse := func(status pbv2.Status) error {
 		s.SetWriteDeadline(time.Now().Add(StreamTimeout))
+		defer s.SetWriteDeadline(time.Time{})
 		wr := util.NewDelimitedWriter(s)
 
 		var msg pbv2.StopMessage
 		msg.Type = pbv2.StopMessage_STATUS.Enum()
 		msg.Status = status.Enum()
 
-		err := wr.WriteMsg(&msg)
-		s.SetWriteDeadline(time.Time{})
-		return err
+		return wr.WriteMsg(&msg)
 	}
 
 	handleError := func(status pbv2.Status) {
-		log.Debugf("protocol error: %s (%d)", pbv2.Status_name[int32(status)], status)
+		log.Debug("protocol error", "status_name", pbv2.Status_name[int32(status)], "status_code", status)
 		err := writeResponse(status)
 		if err != nil {
 			s.Reset()
-			log.Debugf("error writing circuit response: %s", err.Error())
+			log.Debug("error writing circuit response", "err", err)
 		} else {
 			s.Close()
 		}
@@ -49,7 +49,6 @@ func (c *Client) handleStreamV2(s network.Stream) {
 	err := rd.ReadMsg(&msg)
 	if err != nil {
 		handleError(pbv2.Status_MALFORMED_MESSAGE)
-		rd.Close()
 		return
 	}
 	// reset stream deadline as message has been read
@@ -57,14 +56,12 @@ func (c *Client) handleStreamV2(s network.Stream) {
 
 	if msg.GetType() != pbv2.StopMessage_CONNECT {
 		handleError(pbv2.Status_UNEXPECTED_MESSAGE)
-		rd.Close()
 		return
 	}
 
 	src, err := util.PeerToPeerInfoV2(msg.GetPeer())
 	if err != nil {
 		handleError(pbv2.Status_MALFORMED_MESSAGE)
-		rd.Close()
 		return
 	}
 
@@ -78,7 +75,7 @@ func (c *Client) handleStreamV2(s network.Stream) {
 		stat.Extra[StatLimitData] = limit.GetData()
 	}
 
-	log.Debugf("incoming relay connection from: %s", src.ID)
+	log.Debug("incoming relay connection", "source_peer", src.ID)
 
 	select {
 	case c.incoming <- accept{
@@ -90,5 +87,4 @@ func (c *Client) handleStreamV2(s network.Stream) {
 	case <-time.After(AcceptTimeout):
 		handleError(pbv2.Status_CONNECTION_FAILED)
 	}
-	rd.Close()
 }

@@ -1,13 +1,16 @@
 #![allow(non_snake_case)]
 
+use std::convert::TryInto;
+
 use crate::utils::*;
 use crate::pke::*;
 use crate::ve::*;
 
 use rand::rngs::OsRng;
 use rand::seq::IteratorRandom;
+use rand_chacha::rand_core::SeedableRng;
 use sha2::{Digest, Sha512};
-
+use rand_chacha::ChaChaRng;
 
 use ed448_goldilocks_plus::elliptic_curve::{Group, PrimeField};
 use ed448_goldilocks_plus::EdwardsPoint as GGA;
@@ -81,7 +84,7 @@ impl RDkgith {
         }
         output.sort();
         output
-    }    
+    }
     
     fn mul_G(&self, scalar : FF) -> GGA {
         self.precomp_G * scalar
@@ -308,6 +311,7 @@ impl VerEnc for RDkgith {
         let mut new_ctexts = Vec::<PKECipherText>::with_capacity(n);
         let mut aux = Vec::<FF>::with_capacity(n);
         let hide_indices = self.expand_challenge(&pi.challenge);
+        let mut rng = ChaChaRng::from_seed(pi.challenge[..32].try_into().unwrap());
         let mut open_indices = Vec::<usize>::with_capacity(t);
 
         let mut lagrange = vec![FF::ZERO; N];
@@ -335,7 +339,7 @@ impl VerEnc for RDkgith {
         }
         
         // sample random subset of size n
-        let subset= hide_indices.iter().choose_multiple(&mut OsRng, n);
+        let subset= hide_indices.iter().choose_multiple(&mut rng, n);
 
         let mut ctr_hide = 0;
         // process each ciphertext

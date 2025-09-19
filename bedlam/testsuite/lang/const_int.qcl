@@ -1,0 +1,8 @@
+// -*- go -*-
+
+package main
+
+// @Test 42 1 = 123
+func main(a, b int32) int {
+	return 1 + 0x01 + 0b10 + 077 + 0o70
+}

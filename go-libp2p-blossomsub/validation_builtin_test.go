@@ -76,8 +76,7 @@ func testBasicSeqnoValidator(t *testing.T, ttl time.Duration) {
 		msgs = append(msgs, subch...)
 	}
 
-	// connectAll(t, hosts)
-	sparseConnect(t, hosts)
+	connectAll(t, hosts)
 
 	time.Sleep(time.Millisecond * 100)
 
@@ -85,7 +84,6 @@ func testBasicSeqnoValidator(t *testing.T, ttl time.Duration) {
 		msg := []byte(fmt.Sprintf("%d the flooooooood %d", i, i))
 
 		owner := rng.Intn(len(psubs))
-
 		bitmasks[owner].Publish(ctx, bitmasks[owner].bitmask, msg)
 
 		for _, sub := range msgs {
@@ -131,7 +129,7 @@ func TestBasicSeqnoValidatorReplay(t *testing.T) {
 		msgs = append(msgs, subch...)
 	}
 
-	sparseConnect(t, hosts)
+	connectAll(t, hosts)
 
 	time.Sleep(time.Millisecond * 100)
 

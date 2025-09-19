@@ -58,14 +58,11 @@ func newPeer(t *testing.T) (crypto.PrivKey, peer.ID) {
 
 func makeSwarm(t *testing.T) *Swarm {
 	s := makeSwarmWithNoListenAddrs(t, WithDialTimeout(1*time.Second))
-	q, _ := ma.StringCast("/ip4/127.0.0.1/tcp/0")
-	if err := s.Listen(q); err != nil {
+	if err := s.Listen(tStringCast("/ip4/127.0.0.1/tcp/0")); err != nil {
 		t.Fatal(err)
 	}
 
-	q, _ = ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")
-
-	if err := s.Listen(q); err != nil {
+	if err := s.Listen(tStringCast("/ip4/127.0.0.1/udp/0/quic-v1")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -87,7 +84,7 @@ func makeSwarmWithNoListenAddrs(t *testing.T, opts ...Option) *Swarm {
 	upgrader := makeUpgrader(t, s)
 	var tcpOpts []tcp.Option
 	tcpOpts = append(tcpOpts, tcp.DisableReuseport())
-	tcpTransport, err := tcp.NewTCPTransport(upgrader, nil, tcpOpts...)
+	tcpTransport, err := tcp.NewTCPTransport(upgrader, nil, nil, tcpOpts...)
 	require.NoError(t, err)
 	if err := s.AddTransport(tcpTransport); err != nil {
 		t.Fatal(err)
@@ -238,9 +235,7 @@ func TestDialWorkerLoopFailure(t *testing.T) {
 
 	_, p2 := newPeer(t)
 
-	m1, _ := ma.StringCast("/ip4/11.0.0.1/tcp/1234")
-	m2, _ := ma.StringCast("/ip4/11.0.0.1/udp/1234/quic-v1")
-	s1.Peerstore().AddAddrs(p2, []ma.Multiaddr{m1, m2}, peerstore.PermanentAddrTTL)
+	s1.Peerstore().AddAddrs(p2, []ma.Multiaddr{tStringCast("/ip4/11.0.0.1/tcp/1234"), tStringCast("/ip4/11.0.0.1/udp/1234/quic-v1")}, peerstore.PermanentAddrTTL)
 
 	reqch := make(chan dialRequest)
 	resch := make(chan dialResponse)
@@ -265,9 +260,7 @@ func TestDialWorkerLoopConcurrentFailure(t *testing.T) {
 
 	_, p2 := newPeer(t)
 
-	m1, _ := ma.StringCast("/ip4/11.0.0.1/tcp/1234")
-	m2, _ := ma.StringCast("/ip4/11.0.0.1/udp/1234/quic-v1")
-	s1.Peerstore().AddAddrs(p2, []ma.Multiaddr{m1, m2}, peerstore.PermanentAddrTTL)
+	s1.Peerstore().AddAddrs(p2, []ma.Multiaddr{tStringCast("/ip4/11.0.0.1/tcp/1234"), tStringCast("/ip4/11.0.0.1/udp/1234/quic-v1")}, peerstore.PermanentAddrTTL)
 
 	reqch := make(chan dialRequest)
 	worker := newDialWorker(s1, p2, reqch, nil)
@@ -315,10 +308,7 @@ func TestDialWorkerLoopConcurrentMix(t *testing.T) {
 	defer s2.Close()
 
 	s1.Peerstore().AddAddrs(s2.LocalPeer(), s2.ListenAddresses(), peerstore.PermanentAddrTTL)
-
-	m1, _ := ma.StringCast("/ip4/11.0.0.1/tcp/1234")
-	m2, _ := ma.StringCast("/ip4/11.0.0.1/udp/1234/quic-v1")
-	s1.Peerstore().AddAddrs(s2.LocalPeer(), []ma.Multiaddr{m1, m2}, peerstore.PermanentAddrTTL)
+	s1.Peerstore().AddAddrs(s2.LocalPeer(), []ma.Multiaddr{tStringCast("/ip4/11.0.0.1/tcp/1234"), tStringCast("/ip4/11.0.0.1/udp/1234/quic-v1")}, peerstore.PermanentAddrTTL)
 
 	reqch := make(chan dialRequest)
 	worker := newDialWorker(s1, s2.LocalPeer(), reqch, nil)
@@ -362,8 +352,7 @@ func TestDialWorkerLoopConcurrentFailureStress(t *testing.T) {
 
 	var addrs []ma.Multiaddr
 	for i := 0; i < 16; i++ {
-		m1, _ := ma.StringCast(fmt.Sprintf("/ip4/11.0.0.%d/tcp/%d", i%256, 1234+i))
-		addrs = append(addrs, m1)
+		addrs = append(addrs, tStringCast(fmt.Sprintf("/ip4/11.0.0.%d/tcp/%d", i%256, 1234+i)))
 	}
 	s1.Peerstore().AddAddrs(p2, addrs, peerstore.PermanentAddrTTL)
 
@@ -409,13 +398,13 @@ func TestDialWorkerLoopConcurrentFailureStress(t *testing.T) {
 func TestDialQueueNextBatch(t *testing.T) {
 	addrs := make([]ma.Multiaddr, 0)
 	for i := 0; i < 10; i++ {
-		m1, _ := ma.StringCast(fmt.Sprintf("/ip4/1.2.3.4/tcp/%d", i))
-		addrs = append(addrs, m1)
+		addrs = append(addrs, tStringCast(fmt.Sprintf("/ip4/1.2.3.4/tcp/%d", i)))
 	}
 	testcase := []struct {
-		name   string
-		input  []network.AddrDelay
-		output [][]ma.Multiaddr
+		name       string
+		input      []network.AddrDelay
+		output     [][]ma.Multiaddr
+		hasUpdates bool
 	}{
 		{
 			name: "next batch",
@@ -468,6 +457,7 @@ func TestDialQueueNextBatch(t *testing.T) {
 				{addrs[4]},
 				{},
 			},
+			hasUpdates: true,
 		},
 		{
 			name:  "null input",
@@ -482,7 +472,11 @@ func TestDialQueueNextBatch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			q := newDialQueue()
 			for i := 0; i < len(tc.input); i++ {
-				q.Add(tc.input[i])
+				if tc.hasUpdates {
+					q.UpdateOrAdd(tc.input[i])
+				} else {
+					q.Add(tc.input[i])
+				}
 			}
 			for _, batch := range tc.output {
 				b := q.NextBatch()
@@ -493,7 +487,7 @@ func TestDialQueueNextBatch(t *testing.T) {
 				sort.Slice(batch, func(i, j int) bool { return batch[i].String() < batch[j].String() })
 				for i := 0; i < len(b); i++ {
 					if !b[i].Addr.Equal(batch[i]) {
-						log.Errorf("expected %s got %s", batch[i], b[i].Addr)
+						log.Error("expected, got", "expected", batch[i], "got", b[i].Addr)
 					}
 				}
 			}
@@ -535,9 +529,8 @@ func (s schedulingTestCase) Generate(rand *mrand.Rand, size int) reflect.Value {
 	input := make([]timedDial, size)
 	delays := make(map[time.Duration]struct{})
 	for i := 0; i < size; i++ {
-		m1, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", i+10550))
 		input[i] = timedDial{
-			addr:      m1,
+			addr:      tStringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", i+10550)),
 			delay:     time.Duration(mrand.Intn(100)) * 10 * time.Millisecond, // max 1 second
 			success:   false,
 			failAfter: time.Duration(mrand.Intn(100)) * 10 * time.Millisecond, // max 1 second
@@ -585,11 +578,11 @@ func checkDialWorkerLoopScheduling(t *testing.T, s1, s2 *Swarm, tc schedulingTes
 	// failDials is used to track dials which should fail in the future
 	// at appropriate moment a message is sent to dialState.ch to trigger
 	// failure
-	failDials := make(map[ma.Multiaddr]dialState)
+	failDials := make(map[*ma.Multiaddr]dialState)
 	// recvCh is used to receive dial notifications for dials that will fail
 	recvCh := make(chan struct{}, 100)
 	// allDials tracks all pending dials
-	allDials := make(map[ma.Multiaddr]dialState)
+	allDials := make(map[*ma.Multiaddr]dialState)
 	// addrs are the peer addresses the swarm will use for dialing
 	addrs := make([]ma.Multiaddr, 0)
 	// create pending dials
@@ -617,7 +610,7 @@ func checkDialWorkerLoopScheduling(t *testing.T, s1, s2 *Swarm, tc schedulingTes
 		}
 		addrs = append(addrs, inp.addr)
 		// add to pending dials
-		allDials[inp.addr] = dialState{
+		allDials[&inp.addr] = dialState{
 			ch:        failCh,
 			addr:      inp.addr,
 			delay:     inp.delay,
@@ -702,7 +695,7 @@ loop:
 					failDials[a] = dialState{
 						ch:     ds.ch,
 						failAt: cl.Now().Add(ds.failAfter),
-						addr:   a,
+						addr:   *a,
 						delay:  ds.delay,
 					}
 				}
@@ -765,8 +758,7 @@ func TestCheckDialWorkerLoopScheduling(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		for {
 			p := 20000 + i
-			m1, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p))
-			addrs = append(addrs, m1)
+			addrs = append(addrs, tStringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p)))
 			break
 		}
 	}
@@ -812,8 +804,7 @@ func TestDialWorkerLoopRanking(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		for {
 			p := 20000 + i
-			m1, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p))
-			addrs = append(addrs, m1)
+			addrs = append(addrs, tStringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p)))
 			break
 		}
 	}
@@ -919,7 +910,7 @@ func TestDialWorkerLoopSchedulingProperty(t *testing.T) {
 		s1.dialRanker = makeRanker(tc.input)
 		err := checkDialWorkerLoopScheduling(t, s1, s2, tc)
 		if err != nil {
-			log.Error(err)
+			log.Error("error", "err", err)
 		}
 		return err == nil
 	}
@@ -930,17 +921,15 @@ func TestDialWorkerLoopSchedulingProperty(t *testing.T) {
 }
 
 func TestDialWorkerLoopQuicOverTCP(t *testing.T) {
-	m1, _ := ma.StringCast("/ip4/127.0.0.1/udp/20000/quic-v1")
-	m2, _ := ma.StringCast("/ip4/127.0.0.1/tcp/20000")
 	tc := schedulingTestCase{
 		input: []timedDial{
 			{
-				addr:    m1,
+				addr:    tStringCast("/ip4/127.0.0.1/udp/20000/quic-v1"),
 				delay:   0,
 				success: true,
 			},
 			{
-				addr:    m2,
+				addr:    tStringCast("/ip4/127.0.0.1/tcp/20000"),
 				delay:   30 * time.Millisecond,
 				success: true,
 			},
@@ -967,14 +956,14 @@ func TestDialWorkerLoopHolePunching(t *testing.T) {
 	defer s2.Close()
 
 	// t1 will accept and keep the other end waiting
-	t1, _ := ma.StringCast("/ip4/127.0.0.1/tcp/10000")
+	t1 := tStringCast("/ip4/127.0.0.1/tcp/10000")
 	recvCh := make(chan struct{})
 	list, ch := makeTCPListener(t, t1, recvCh) // ignore ch because we want to hang forever
 	defer list.Close()
 	defer func() { ch <- struct{}{} }() // close listener
 
 	// t2 will succeed
-	t2, _ := ma.StringCast("/ip4/127.0.0.1/tcp/10001")
+	t2 := tStringCast("/ip4/127.0.0.1/tcp/10001")
 
 	err := s2.AddListenAddr(t2)
 	if err != nil {
@@ -1040,8 +1029,8 @@ func TestDialWorkerLoopAddrDedup(t *testing.T) {
 	s2 := makeSwarm(t)
 	defer s1.Close()
 	defer s2.Close()
-	t1, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", 10000))
-	t2, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", 10000))
+	t1 := tStringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", 10000))
+	t2 := tStringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", 10000))
 
 	// acceptAndClose accepts a connection and closes it
 	acceptAndClose := func(a ma.Multiaddr, ch chan struct{}, closech chan struct{}) {
@@ -1107,9 +1096,9 @@ func TestDialWorkerLoopTCPConnUpgradeWait(t *testing.T) {
 	defer s2.Close()
 	// Connection to a1 will fail but a1 is a public address so we can test waiting for tcp
 	// connection established dial update. ipv4only.arpa reserved address.
-	a1, _ := ma.StringCast(fmt.Sprintf("/ip4/192.0.0.170/tcp/%d", 10001))
+	a1 := tStringCast(fmt.Sprintf("/ip4/192.0.0.170/tcp/%d", 10001))
 	// Connection to a2 will succeed.
-	a2, _ := ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", 10002))
+	a2 := tStringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", 10002))
 	s2.Listen(a2)
 
 	s1.Peerstore().AddAddrs(s2.LocalPeer(), []ma.Multiaddr{a1, a2}, peerstore.PermanentAddrTTL)
@@ -1156,4 +1145,52 @@ func TestDialWorkerLoopTCPConnUpgradeWait(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Errorf("expected a fail response")
 	}
+}
+
+func BenchmarkDialRanker(b *testing.B) {
+	const N = 10000
+
+	benchDialQueue := func(adelays []network.AddrDelay) {
+		dq := newDialQueue()
+		for _, a := range adelays {
+			dq.Add(a)
+		}
+		for {
+			batch := dq.NextBatch()
+			if len(batch) == 0 {
+				return
+			}
+		}
+	}
+	addrs := make([]ma.Multiaddr, N)
+	for i := 0; i < N; i++ {
+		addrs[i] = tStringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", i))
+	}
+
+	b.Run("equal delay", func(b *testing.B) {
+		b.ReportAllocs()
+		addrDelays := make([]network.AddrDelay, N)
+		for i := 0; i < N; i++ {
+			addrDelays[i] = network.AddrDelay{
+				Addr:  addrs[i],
+				Delay: 0,
+			}
+		}
+		for i := 0; i < b.N; i++ {
+			benchDialQueue(addrDelays)
+		}
+	})
+	b.Run("sorted delay", func(b *testing.B) {
+		b.ReportAllocs()
+		addrDelays := make([]network.AddrDelay, N)
+		for i := 0; i < N; i++ {
+			addrDelays[i] = network.AddrDelay{
+				Addr:  addrs[i],
+				Delay: time.Millisecond * time.Duration(i),
+			}
+		}
+		for i := 0; i < b.N; i++ {
+			benchDialQueue(addrDelays)
+		}
+	})
 }
