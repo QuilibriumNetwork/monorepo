@@ -167,13 +167,15 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 						L2:   keyBytes,
 						Path: []uint32{uint32(i), uint32(j)},
 					})
-					e.logger.Error(
-						"failed to place app shard",
-						zap.String("value", base64Value),
-						zap.Error(err),
-					)
-					txn.Abort()
-					return nil
+					if err != nil {
+						e.logger.Error(
+							"failed to place app shard",
+							zap.String("value", base64Value),
+							zap.Error(err),
+						)
+						txn.Abort()
+						return nil
+					}
 				}
 			}
 

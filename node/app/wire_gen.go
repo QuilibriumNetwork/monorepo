@@ -62,6 +62,119 @@ func NewClockStore(logger *zap.Logger, configConfig *config.Config, uint2 uint) 
 	return pebbleClockStore, nil
 }
 
+func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config, coreId uint, rpcMultiaddr string, parentProcess int) (*DataWorkerNode, error) {
+	dbConfig := config2.DB
+	pebbleDB := store2.NewPebbleDB(logger, dbConfig, coreId)
+	pebbleDataProofStore := store2.NewPebbleDataProofStore(pebbleDB, logger)
+	pebbleClockStore := store2.NewPebbleClockStore(pebbleDB, logger)
+	pebbleTokenStore := store2.NewPebbleTokenStore(pebbleDB, logger)
+	bls48581KeyConstructor := provideBLSConstructor()
+	decaf448KeyConstructor := provideDecafConstructor()
+	fileKeyManager := keys.NewFileKeyManager(config2, bls48581KeyConstructor, decaf448KeyConstructor, logger)
+	frameProver := vdf.NewCachedWesolowskiFrameProver(logger)
+	pebbleKeyStore := store2.NewPebbleKeyStore(pebbleDB, logger)
+	decaf448BulletproofProver := bulletproofs.NewBulletproofProver()
+	cachedSignerRegistry, err := registration.NewCachedSignerRegistry(pebbleKeyStore, fileKeyManager, bls48581KeyConstructor, decaf448BulletproofProver, logger)
+	if err != nil {
+		return nil, err
+	}
+	mpCitHVerifiableEncryptor := newVerifiableEncryptor()
+	kzgInclusionProver := bls48581.NewKZGInclusionProver(logger)
+	pebbleHypergraphStore := store2.NewPebbleHypergraphStore(dbConfig, pebbleDB, logger, mpCitHVerifiableEncryptor, kzgInclusionProver)
+	hypergraph, err := provideHypergraph(pebbleHypergraphStore)
+	if err != nil {
+		return nil, err
+	}
+	proverRegistry, err := provers.NewProverRegistry(logger, hypergraph)
+	if err != nil {
+		return nil, err
+	}
+	p2PConfig := config2.P2P
+	engineConfig := config2.Engine
+	proxyBlossomSub, err := rpc.NewProxyBlossomSub(p2PConfig, engineConfig, logger, coreId)
+	if err != nil {
+		return nil, err
+	}
+	pebbleInboxStore := store2.NewPebbleInboxStore(pebbleDB, logger)
+	bedlamCompiler := compiler.NewBedlamCompiler()
+	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(logger)
+	dynamicFeeManager := fees.NewDynamicFeeManager(logger, kzgInclusionProver)
+	blsAppFrameValidator := validator.NewBLSAppFrameValidator(proverRegistry, bls48581KeyConstructor, frameProver, logger)
+	blsGlobalFrameValidator := validator.NewBLSGlobalFrameValidator(proverRegistry, bls48581KeyConstructor, frameProver, logger)
+	uint64_2 := provideDifficultyAnchorFrameNumber(config2)
+	int64_2 := provideDifficultyAnchorParentTime()
+	uint32_2 := provideDifficultyAnchorDifficulty()
+	asertDifficultyAdjuster := difficulty.NewAsertDifficultyAdjuster(uint64_2, int64_2, uint32_2)
+	optimizedProofOfMeaningfulWorkRewardIssuance := reward.NewOptRewardIssuance()
+	doubleRatchetEncryptedChannel := channel.NewDoubleRatchetEncryptedChannel()
+	appConsensusEngineFactory := app.NewAppConsensusEngineFactory(logger, config2, proxyBlossomSub, hypergraph, fileKeyManager, pebbleKeyStore, pebbleClockStore, pebbleInboxStore, pebbleHypergraphStore, frameProver, kzgInclusionProver, decaf448BulletproofProver, mpCitHVerifiableEncryptor, decaf448KeyConstructor, bedlamCompiler, cachedSignerRegistry, proverRegistry, inMemoryPeerInfoManager, dynamicFeeManager, blsAppFrameValidator, blsGlobalFrameValidator, asertDifficultyAdjuster, optimizedProofOfMeaningfulWorkRewardIssuance, bls48581KeyConstructor, doubleRatchetEncryptedChannel)
+	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, logger, coreId, parentProcess)
+	globalTimeReel, err := provideGlobalTimeReel(appConsensusEngineFactory)
+	if err != nil {
+		return nil, err
+	}
+	dataWorkerNode, err := newDataWorkerNode(logger, pebbleDataProofStore, pebbleClockStore, pebbleTokenStore, fileKeyManager, pebbleDB, frameProver, dataWorkerIPCServer, globalTimeReel, coreId, parentProcess)
+	if err != nil {
+		return nil, err
+	}
+	return dataWorkerNode, nil
+}
+
+func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Config, coreId uint, rpcMultiaddr string, parentProcess int) (*DataWorkerNode, error) {
+	dbConfig := config2.DB
+	pebbleDB := store2.NewPebbleDB(logger, dbConfig, coreId)
+	pebbleDataProofStore := store2.NewPebbleDataProofStore(pebbleDB, logger)
+	pebbleClockStore := store2.NewPebbleClockStore(pebbleDB, logger)
+	pebbleTokenStore := store2.NewPebbleTokenStore(pebbleDB, logger)
+	bls48581KeyConstructor := provideBLSConstructor()
+	decaf448KeyConstructor := provideDecafConstructor()
+	fileKeyManager := keys.NewFileKeyManager(config2, bls48581KeyConstructor, decaf448KeyConstructor, logger)
+	frameProver := vdf.NewCachedWesolowskiFrameProver(logger)
+	pebbleKeyStore := store2.NewPebbleKeyStore(pebbleDB, logger)
+	decaf448BulletproofProver := bulletproofs.NewBulletproofProver()
+	cachedSignerRegistry, err := registration.NewCachedSignerRegistry(pebbleKeyStore, fileKeyManager, bls48581KeyConstructor, decaf448BulletproofProver, logger)
+	if err != nil {
+		return nil, err
+	}
+	mpCitHVerifiableEncryptor := newVerifiableEncryptor()
+	kzgInclusionProver := bls48581.NewKZGInclusionProver(logger)
+	pebbleHypergraphStore := store2.NewPebbleHypergraphStore(dbConfig, pebbleDB, logger, mpCitHVerifiableEncryptor, kzgInclusionProver)
+	hypergraph, err := provideHypergraph(pebbleHypergraphStore)
+	if err != nil {
+		return nil, err
+	}
+	proverRegistry, err := provers.NewProverRegistry(logger, hypergraph)
+	if err != nil {
+		return nil, err
+	}
+	p2PConfig := config2.P2P
+	engineConfig := config2.Engine
+	blossomSub := p2p.NewBlossomSub(p2PConfig, engineConfig, logger, coreId)
+	pebbleInboxStore := store2.NewPebbleInboxStore(pebbleDB, logger)
+	bedlamCompiler := compiler.NewBedlamCompiler()
+	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(logger)
+	dynamicFeeManager := fees.NewDynamicFeeManager(logger, kzgInclusionProver)
+	blsAppFrameValidator := validator.NewBLSAppFrameValidator(proverRegistry, bls48581KeyConstructor, frameProver, logger)
+	blsGlobalFrameValidator := validator.NewBLSGlobalFrameValidator(proverRegistry, bls48581KeyConstructor, frameProver, logger)
+	uint64_2 := provideDifficultyAnchorFrameNumber(config2)
+	int64_2 := provideDifficultyAnchorParentTime()
+	uint32_2 := provideDifficultyAnchorDifficulty()
+	asertDifficultyAdjuster := difficulty.NewAsertDifficultyAdjuster(uint64_2, int64_2, uint32_2)
+	optimizedProofOfMeaningfulWorkRewardIssuance := reward.NewOptRewardIssuance()
+	doubleRatchetEncryptedChannel := channel.NewDoubleRatchetEncryptedChannel()
+	appConsensusEngineFactory := app.NewAppConsensusEngineFactory(logger, config2, blossomSub, hypergraph, fileKeyManager, pebbleKeyStore, pebbleClockStore, pebbleInboxStore, pebbleHypergraphStore, frameProver, kzgInclusionProver, decaf448BulletproofProver, mpCitHVerifiableEncryptor, decaf448KeyConstructor, bedlamCompiler, cachedSignerRegistry, proverRegistry, inMemoryPeerInfoManager, dynamicFeeManager, blsAppFrameValidator, blsGlobalFrameValidator, asertDifficultyAdjuster, optimizedProofOfMeaningfulWorkRewardIssuance, bls48581KeyConstructor, doubleRatchetEncryptedChannel)
+	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, logger, coreId, parentProcess)
+	globalTimeReel, err := provideGlobalTimeReel(appConsensusEngineFactory)
+	if err != nil {
+		return nil, err
+	}
+	dataWorkerNode, err := newDataWorkerNode(logger, pebbleDataProofStore, pebbleClockStore, pebbleTokenStore, fileKeyManager, pebbleDB, frameProver, dataWorkerIPCServer, globalTimeReel, coreId, parentProcess)
+	if err != nil {
+		return nil, err
+	}
+	return dataWorkerNode, nil
+}
+
 func NewMasterNode(logger *zap.Logger, config2 *config.Config, coreId uint) (*MasterNode, error) {
 	dbConfig := config2.DB
 	pebbleDB := store2.NewPebbleDB(logger, dbConfig, coreId)
@@ -157,7 +270,7 @@ var pubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), wire.Fiel
 ),
 )
 
-var proxyPubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), wire.FieldsOf(new(*config.Config), "Engine"), p2p.NewInMemoryPeerInfoManager, p2p.NewBlossomSub, channel.NewDoubleRatchetEncryptedChannel, wire.Bind(new(p2p2.PubSub), new(*rpc.ProxyBlossomSub)), wire.Bind(new(p2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)), wire.Bind(
+var proxyPubSubSet = wire.NewSet(wire.FieldsOf(new(*config.Config), "P2P"), wire.FieldsOf(new(*config.Config), "Engine"), p2p.NewInMemoryPeerInfoManager, rpc.NewProxyBlossomSub, channel.NewDoubleRatchetEncryptedChannel, wire.Bind(new(p2p2.PubSub), new(*rpc.ProxyBlossomSub)), wire.Bind(new(p2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)), wire.Bind(
 	new(channel2.EncryptedChannel),
 	new(*channel.DoubleRatchetEncryptedChannel),
 ),
@@ -209,35 +322,17 @@ func NewDataWorkerNode(
 	parentProcess int,
 ) (*DataWorkerNode, error) {
 	if config2.Engine.EnableMasterProxy {
-		panic(wire.Build(
-			verencSet,
-			compilerSet,
-			keyManagerSet,
-			storeSet,
-			proxyPubSubSet,
-			engineSet,
-			hypergraphSet,
-			validatorSet,
-			appConsensusSet,
-			provideGlobalTimeReel,
-			provideDataWorkerIPC,
-			newDataWorkerNode,
-		))
+		return NewDataWorkerNodeWithProxyPubsub(
+			logger, config2, coreId,
+			rpcMultiaddr,
+			parentProcess,
+		)
 	} else {
-		panic(wire.Build(
-			verencSet,
-			compilerSet,
-			keyManagerSet,
-			storeSet,
-			pubSubSet,
-			engineSet,
-			hypergraphSet,
-			validatorSet,
-			appConsensusSet,
-			provideGlobalTimeReel,
-			provideDataWorkerIPC,
-			newDataWorkerNode,
-		))
+		return NewDataWorkerNodeWithoutProxyPubsub(
+			logger, config2, coreId,
+			rpcMultiaddr,
+			parentProcess,
+		)
 	}
 }
 

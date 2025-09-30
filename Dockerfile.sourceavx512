@@ -125,6 +125,13 @@ RUN go mod download
 
 RUN ./generate.sh
 
+## Generate Rust bindings for RPM
+WORKDIR /opt/ceremonyclient/rpm
+
+RUN go mod download
+
+RUN ./generate.sh
+
 ## Generate Rust bindings for VerEnc
 WORKDIR /opt/ceremonyclient/verenc
 

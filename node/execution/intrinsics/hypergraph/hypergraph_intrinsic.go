@@ -784,7 +784,12 @@ func (h *HypergraphIntrinsic) Validate(
 
 	case protobufs.VertexRemoveType:
 		vertexRemove := &VertexRemove{}
-		if err := vertexRemove.FromBytes(input); err != nil {
+		if err := vertexRemove.FromBytes(
+			input,
+			h.config,
+			h.keyManager,
+			h.signer,
+		); err != nil {
 			observability.ValidateErrors.WithLabelValues(
 				"hypergraph",
 				"vertex_remove",
@@ -818,7 +823,13 @@ func (h *HypergraphIntrinsic) Validate(
 
 	case protobufs.HyperedgeAddType:
 		hyperedgeAdd := &HyperedgeAdd{}
-		if err := hyperedgeAdd.FromBytes(input); err != nil {
+		if err := hyperedgeAdd.FromBytes(
+			input,
+			h.config,
+			h.inclusionProver,
+			h.keyManager,
+			h.signer,
+		); err != nil {
 			observability.ValidateErrors.WithLabelValues(
 				"hypergraph",
 				"hyperedge_add",
@@ -852,7 +863,12 @@ func (h *HypergraphIntrinsic) Validate(
 
 	case protobufs.HyperedgeRemoveType:
 		hyperedgeRemove := &HyperedgeRemove{}
-		if err := hyperedgeRemove.FromBytes(input); err != nil {
+		if err := hyperedgeRemove.FromBytes(
+			input,
+			h.config,
+			h.keyManager,
+			h.signer,
+		); err != nil {
 			observability.ValidateErrors.WithLabelValues(
 				"hypergraph",
 				"hyperedge_remove",

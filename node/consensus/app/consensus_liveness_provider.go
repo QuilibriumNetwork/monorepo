@@ -31,17 +31,21 @@ func (p *AppLivenessProvider) Collect(
 		)
 	}
 
-	// Prepare mixnet for collecting messages
-	err := p.engine.mixnet.PrepareMixnet()
-	if err != nil {
-		p.engine.logger.Error(
-			"error preparing mixnet",
-			zap.Error(err),
-		)
-	}
+	mixnetMessages := []*protobufs.Message{}
+	currentSet, _ := p.engine.proverRegistry.GetActiveProvers(nil)
+	if len(currentSet) >= 9 {
+		// Prepare mixnet for collecting messages
+		err := p.engine.mixnet.PrepareMixnet()
+		if err != nil {
+			p.engine.logger.Error(
+				"error preparing mixnet",
+				zap.Error(err),
+			)
+		}
 
-	// Get messages from mixnet
-	mixnetMessages := p.engine.mixnet.GetMessages()
+		// Get messages from mixnet
+		mixnetMessages = p.engine.mixnet.GetMessages()
+	}
 
 	var state state.State
 	state = hgstate.NewHypergraphState(p.engine.hypergraph)

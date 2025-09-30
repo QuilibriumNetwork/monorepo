@@ -4,7 +4,9 @@ import (
 	"github.com/pkg/errors"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/types/keys"
 )
 
 // Operation type constants
@@ -29,6 +31,11 @@ func (va *VertexAdd) ToBytes() ([]byte, error) {
 // FromBytes deserializes a VertexAdd from bytes using protobuf
 func (va *VertexAdd) FromBytes(
 	data []byte,
+	config *HypergraphIntrinsicConfiguration,
+	inclusionProver crypto.InclusionProver,
+	keyManager keys.KeyManager,
+	signer crypto.Signer,
+	verenc crypto.VerifiableEncryptor,
 ) error {
 	pb := &protobufs.VertexAdd{}
 	if err := pb.FromCanonicalBytes(data); err != nil {
@@ -37,6 +44,11 @@ func (va *VertexAdd) FromBytes(
 
 	var err error
 	va.Data, err = extractVertexAddProofFromBytes(pb.Data, va.verenc)
+	va.config = config
+	va.inclusionProver = inclusionProver
+	va.keyManager = keyManager
+	va.signer = signer
+	va.verenc = verenc
 
 	return errors.Wrap(err, "from bytes")
 }
@@ -50,6 +62,9 @@ func (vr *VertexRemove) ToBytes() ([]byte, error) {
 // FromBytes deserializes a VertexRemove from bytes using protobuf
 func (vr *VertexRemove) FromBytes(
 	data []byte,
+	config *HypergraphIntrinsicConfiguration,
+	keyManager keys.KeyManager,
+	signer crypto.Signer,
 ) error {
 	pb := &protobufs.VertexRemove{}
 	if err := pb.FromCanonicalBytes(data); err != nil {
@@ -57,10 +72,12 @@ func (vr *VertexRemove) FromBytes(
 	}
 
 	// Copy the basic fields from protobuf
-	// Note: Runtime dependencies need to be injected separately
 	copy(vr.Domain[:], pb.Domain)
 	copy(vr.DataAddress[:], pb.DataAddress)
 	vr.Signature = pb.Signature
+	vr.config = config
+	vr.keyManager = keyManager
+	vr.signer = signer
 
 	return nil
 }
@@ -77,6 +94,10 @@ func (ha *HyperedgeAdd) ToBytes() ([]byte, error) {
 // FromBytes deserializes a HyperedgeAdd from bytes using protobuf
 func (ha *HyperedgeAdd) FromBytes(
 	data []byte,
+	config *HypergraphIntrinsicConfiguration,
+	inclusionProver crypto.InclusionProver,
+	keyManager keys.KeyManager,
+	signer crypto.Signer,
 ) error {
 	pb := &protobufs.HyperedgeAdd{}
 	if err := pb.FromCanonicalBytes(data); err != nil {
@@ -84,9 +105,12 @@ func (ha *HyperedgeAdd) FromBytes(
 	}
 
 	// Copy the basic fields from protobuf
-	// Note: Runtime dependencies need to be injected separately
 	copy(ha.Domain[:], pb.Domain)
 	ha.Signature = pb.Signature
+	ha.config = config
+	ha.inclusionProver = inclusionProver
+	ha.keyManager = keyManager
+	ha.signer = signer
 
 	// Deserialize Value (Hyperedge) if present
 	if len(pb.Value) > 0 {
@@ -117,6 +141,9 @@ func (hr *HyperedgeRemove) ToBytes() ([]byte, error) {
 // FromBytes deserializes a HyperedgeRemove from bytes using protobuf
 func (hr *HyperedgeRemove) FromBytes(
 	data []byte,
+	config *HypergraphIntrinsicConfiguration,
+	keyManager keys.KeyManager,
+	signer crypto.Signer,
 ) error {
 	pb := &protobufs.HyperedgeRemove{}
 	if err := pb.FromCanonicalBytes(data); err != nil {
@@ -124,9 +151,11 @@ func (hr *HyperedgeRemove) FromBytes(
 	}
 
 	// Copy the basic fields from protobuf
-	// Note: Runtime dependencies need to be injected separately
 	copy(hr.Domain[:], pb.Domain)
 	hr.Signature = pb.Signature
+	hr.config = config
+	hr.keyManager = keyManager
+	hr.signer = signer
 
 	// Deserialize Value (Hyperedge) if present
 	if len(pb.Value) > 0 {

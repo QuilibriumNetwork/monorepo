@@ -5,6 +5,7 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/rpm"
 	tp2p "source.quilibrium.com/quilibrium/monorepo/types/p2p"
@@ -66,6 +67,10 @@ func (e *GlobalConsensusEngine) subscribeToGlobalConsensus() error {
 				}
 			},
 		); err != nil {
+			e.logger.Error(
+				"error while subscribing to app shard consensus channels",
+				zap.Error(err),
+			)
 			return false
 		}
 

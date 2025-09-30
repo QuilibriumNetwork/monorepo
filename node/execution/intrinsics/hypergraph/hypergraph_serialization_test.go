@@ -66,7 +66,14 @@ func TestVertexAddSerialization(t *testing.T) {
 
 	// Deserialize and verify
 	newVertexAdd := hypergraph.NewVertexAdd(domain, dataAddress, nil, nil, nil, nil, nil, verenc, nil)
-	err = newVertexAdd.FromBytes(bytes)
+	err = newVertexAdd.FromBytes(
+		bytes,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
 	require.NoError(t, err)
 
 	// Verify fields match
@@ -118,7 +125,12 @@ func TestVertexRemoveSerialization(t *testing.T) {
 
 	// Deserialize and verify
 	newVertexRemove := &hypergraph.VertexRemove{}
-	err = newVertexRemove.FromBytes(bytes)
+	err = newVertexRemove.FromBytes(
+		bytes,
+		nil,
+		nil,
+		nil,
+	)
 	require.NoError(t, err)
 
 	// Verify fields match
@@ -173,7 +185,13 @@ func TestHyperedgeAddSerialization(t *testing.T) {
 	require.NotNil(t, bytes)
 	// Deserialize and verify
 	newHyperedgeAdd := &hypergraph.HyperedgeAdd{}
-	err = newHyperedgeAdd.FromBytes(bytes)
+	err = newHyperedgeAdd.FromBytes(
+		bytes,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
 	require.NoError(t, err)
 
 	// Verify fields match
@@ -193,7 +211,13 @@ func TestHyperedgeAddSerialization(t *testing.T) {
 	require.NotNil(t, bytesNil)
 
 	newHyperedgeAddNil := &hypergraph.HyperedgeAdd{}
-	err = newHyperedgeAddNil.FromBytes(bytesNil)
+	err = newHyperedgeAddNil.FromBytes(
+		bytesNil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
 	require.NoError(t, err)
 
 	assert.Equal(t, hyperedgeAddNil.Domain, newHyperedgeAddNil.Domain)
@@ -239,7 +263,12 @@ func TestHyperedgeRemoveSerialization(t *testing.T) {
 
 	// Deserialize and verify
 	newHyperedgeRemove := &hypergraph.HyperedgeRemove{}
-	err = newHyperedgeRemove.FromBytes(bytes)
+	err = newHyperedgeRemove.FromBytes(
+		bytes,
+		nil,
+		nil,
+		nil,
+	)
 	require.NoError(t, err)
 
 	// Verify fields match
@@ -258,7 +287,12 @@ func TestHyperedgeRemoveSerialization(t *testing.T) {
 	require.NotNil(t, bytesNil)
 
 	newHyperedgeRemoveNil := &hypergraph.HyperedgeRemove{}
-	err = newHyperedgeRemoveNil.FromBytes(bytesNil)
+	err = newHyperedgeRemoveNil.FromBytes(
+		bytesNil,
+		nil,
+		nil,
+		nil,
+	)
 	require.NoError(t, err)
 
 	assert.Equal(t, hyperedgeRemoveNil.Domain, newHyperedgeRemoveNil.Domain)
@@ -314,13 +348,27 @@ func TestInvalidSerialization(t *testing.T) {
 	// Test with truncated data
 	truncatedBytes := bytes[:len(bytes)/2]
 	newVertexAdd := &hypergraph.VertexAdd{}
-	err = newVertexAdd.FromBytes(truncatedBytes)
+	err = newVertexAdd.FromBytes(
+		truncatedBytes,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "from bytes")
 
 	// Test with empty data
 	emptyVertexAdd := &hypergraph.VertexAdd{}
-	err = emptyVertexAdd.FromBytes([]byte{})
+	err = emptyVertexAdd.FromBytes(
+		[]byte{},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
 	assert.Error(t, err)
 
 	// Test with corrupted data - wrong type
@@ -328,7 +376,14 @@ func TestInvalidSerialization(t *testing.T) {
 	copy(corruptedBytes, bytes)
 	corruptedBytes[0] = 0xFF // Set invalid type
 	corruptedVertexAdd := &hypergraph.VertexAdd{}
-	err = corruptedVertexAdd.FromBytes(corruptedBytes)
+	err = corruptedVertexAdd.FromBytes(
+		corruptedBytes,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid type")
 
@@ -349,7 +404,13 @@ func TestInvalidSerialization(t *testing.T) {
 	copy(corruptedHyperedgeBytes, hyperedgeBytes)
 	corruptedHyperedgeBytes[0] = 0xFF // Set invalid type
 	corruptedHyperedgeAdd := &hypergraph.HyperedgeAdd{}
-	err = corruptedHyperedgeAdd.FromBytes(corruptedHyperedgeBytes)
+	err = corruptedHyperedgeAdd.FromBytes(
+		corruptedHyperedgeBytes,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid type")
 }

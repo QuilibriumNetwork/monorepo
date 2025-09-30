@@ -61,8 +61,12 @@ func (p *PebbleShardsStore) GetAppShards(
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		value := iter.Value()
+		offset := 0
+		if len(value)%4 != 0 {
+			offset += len(value) % 4
+		}
 		out := make([]uint32, len(value)/4)
-		buf := bytes.NewBuffer(value)
+		buf := bytes.NewBuffer(value[offset:])
 		err = binary.Read(buf, binary.BigEndian, &out)
 		if err != nil {
 			return nil, errors.Wrap(err, "get app shards")
@@ -82,7 +86,7 @@ func (p *PebbleShardsStore) PutAppShard(
 	shard store.ShardInfo,
 ) error {
 	key := appShardKey(slices.Concat(shard.L1, shard.L2), shard.Path)
-	return errors.Wrap(txn.Set(key, key[35:]), "put app shard")
+	return errors.Wrap(txn.Set(key, key[37:]), "put app shard")
 }
 
 func (p *PebbleShardsStore) DeleteAppShard(

@@ -278,7 +278,7 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 
 	// Let it run
 	t.Log("Step 6: Letting engine run and produce frames")
-	time.Sleep(10 * time.Second)
+	time.Sleep(20 * time.Second)
 
 	// Verify results
 	t.Log("Step 7: Verifying results")

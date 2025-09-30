@@ -1347,13 +1347,9 @@ func (p *PubSub) PeerScore(pr peer.ID) float64 {
 // Join joins the bitmasks and returns a set of Bitmask handles. Only one Bitmask
 // handle should exist per bit, and Join will error if all the Bitmask handles already exist.
 func (p *PubSub) Join(bitmask []byte, opts ...BitmaskOpt) ([]*Bitmask, error) {
-	ts, news, errs := p.tryJoin(bitmask, opts...)
+	ts, _, errs := p.tryJoin(bitmask, opts...)
 	if len(errs) != 0 {
 		return nil, errors.Join(errs...)
-	}
-
-	if !slices.Contains(news, true) {
-		return nil, fmt.Errorf("bitmask already exists")
 	}
 
 	return ts, nil

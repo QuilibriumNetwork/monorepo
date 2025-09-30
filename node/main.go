@@ -50,11 +50,6 @@ var (
 		filepath.Join(".", ".config"),
 		"the configuration directory",
 	)
-	balance = flag.Bool(
-		"balance",
-		false,
-		"print the node's confirmed token balance to stdout and exit",
-	)
 	peerId = flag.Bool(
 		"peer-id",
 		false,
@@ -310,17 +305,6 @@ func main() {
 		}()
 	}
 
-	if *balance {
-		config, err := config.LoadConfig(*configDirectory, "", false)
-		if err != nil {
-			logger.Fatal("failed to load config", zap.Error(err))
-		}
-
-		printBalance(logger, config)
-
-		return
-	}
-
 	if *peerId {
 		config, err := config.LoadConfig(*configDirectory, "", false)
 		if err != nil {
@@ -548,32 +532,6 @@ func main() {
 	}
 }
 
-func printBalance(logger *zap.Logger, config *config.Config) {
-	if config.ListenGRPCMultiaddr == "" {
-		logger.Fatal("grpc not enabled, please configure")
-	}
-
-	conn, err := ConnectToNode(logger, config)
-	if err != nil {
-		logger.Panic("connect to node failed", zap.Error(err))
-	}
-	defer conn.Close()
-
-	client := protobufs.NewNodeServiceClient(conn)
-
-	balance, err := FetchTokenBalance(client)
-	if err != nil {
-		logger.Panic("failed to fetch token balance", zap.Error(err))
-	}
-
-	conversionFactor, _ := new(big.Int).SetString("1DCD65000", 16)
-	r := new(big.Rat).SetFrac(balance.Owned, conversionFactor)
-	fmt.Println("Owned balance:", r.FloatString(12), "QUIL")
-	fmt.Println(
-		"Note: bridged balance is not reflected here, you must bridge back to QUIL to use QUIL on mainnet.",
-	)
-}
-
 func getPeerID(logger *zap.Logger, p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
 	if err != nil {
@@ -630,7 +588,6 @@ func printNodeInfo(logger *zap.Logger, cfg *config.Config) {
 		nodeInfo.PeerSeniority,
 	).String())
 	fmt.Println("Active Workers:", nodeInfo.Workers)
-	printBalance(logger, cfg)
 }
 
 var defaultGrpcAddress = "localhost:8337"
@@ -666,24 +623,6 @@ func ConnectToNode(logger *zap.Logger, nodeConfig *config.Config) (*grpc.ClientC
 type TokenBalance struct {
 	Owned            *big.Int
 	UnconfirmedOwned *big.Int
-}
-
-func FetchTokenBalance(
-	client protobufs.NodeServiceClient,
-) (TokenBalance, error) {
-	// info, err := client.GetTokenInfo(
-	// 	context.Background(),
-	// 	&protobufs.GetTokenInfoRequest{},
-	// )
-	// if err != nil {
-	return TokenBalance{}, errors.Wrap(nil, "error getting token info")
-	// }
-
-	// owned := new(big.Int).SetBytes(info.OwnedTokens)
-
-	// return TokenBalance{
-	// 	Owned: owned,
-	// }, nil
 }
 
 func FetchNodeInfo(

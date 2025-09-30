@@ -123,6 +123,13 @@ RUN go mod download
 
 RUN ./generate.sh
 
+## Generate Rust bindings for RPM
+WORKDIR /opt/ceremonyclient/rpm
+
+RUN go mod download
+
+RUN ./generate.sh
+
 ## Generate Rust bindings for VerEnc
 WORKDIR /opt/ceremonyclient/verenc
 
@@ -143,6 +150,7 @@ FROM build AS build-node
 COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
 
+ENV GOPROXY=direct
 RUN ./build.sh && cp node /usr/bin
 
 FROM build AS build-qclient

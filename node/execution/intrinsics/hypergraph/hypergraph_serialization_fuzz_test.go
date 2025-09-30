@@ -38,7 +38,12 @@ func FuzzVertexRemoveSerialization(f *testing.F) {
 
 		// Deserialize
 		vertexRemove2 := &hypergraph.VertexRemove{}
-		err = vertexRemove2.FromBytes(data)
+		err = vertexRemove2.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+		)
 
 		// If deserialization succeeds, verify round-trip
 		if err == nil {
@@ -95,7 +100,13 @@ func FuzzHyperedgeAddSerialization(f *testing.F) {
 
 		// Deserialize
 		hyperedgeAdd2 := &hypergraph.HyperedgeAdd{}
-		err = hyperedgeAdd2.FromBytes(data)
+		err = hyperedgeAdd2.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+			nil,
+		)
 
 		// If deserialization succeeds, verify round-trip
 		if err == nil {
@@ -144,7 +155,12 @@ func FuzzHyperedgeRemoveSerialization(f *testing.F) {
 
 		// Deserialize
 		hyperedgeRemove2 := &hypergraph.HyperedgeRemove{}
-		err = hyperedgeRemove2.FromBytes(data)
+		err = hyperedgeRemove2.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+		)
 
 		// If deserialization succeeds, verify round-trip
 		if err == nil {
@@ -224,22 +240,52 @@ func FuzzHypergraphOperationTypeDetection(f *testing.F) {
 			_, _ = hypergraph.DeployFromBytes(data)
 		case hypergraph.VertexAddType:
 			obj := &hypergraph.VertexAdd{}
-			_ = obj.FromBytes(data)
+			_ = obj.FromBytes(
+				data,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+			)
 		case hypergraph.VertexRemoveType:
 			obj := &hypergraph.VertexRemove{}
-			_ = obj.FromBytes(data)
+			_ = obj.FromBytes(
+				data,
+				nil,
+				nil,
+				nil,
+			)
 		case hypergraph.HyperedgeAddType:
 			obj := &hypergraph.HyperedgeAdd{}
-			_ = obj.FromBytes(data)
+			_ = obj.FromBytes(
+				data,
+				nil,
+				nil,
+				nil,
+				nil,
+			)
 		case hypergraph.HyperedgeRemoveType:
 			obj := &hypergraph.HyperedgeRemove{}
-			_ = obj.FromBytes(data)
+			_ = obj.FromBytes(
+				data,
+				nil,
+				nil,
+				nil,
+			)
 		}
 
 		// Test that wrong types fail appropriately
 		if typePrefix != hypergraph.VertexAddType && len(data) >= 4 {
 			obj := &hypergraph.VertexAdd{}
-			err := obj.FromBytes(data)
+			err := obj.FromBytes(
+				data,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+			)
 			if typePrefix >= hypergraph.VertexAddType && typePrefix <= hypergraph.HyperedgeRemoveType {
 				// Should fail for wrong but valid type
 				require.Error(t, err)
@@ -275,17 +321,40 @@ func FuzzDeserializationRobustness(f *testing.F) {
 
 		// Test vertex operations
 		vertexAdd := &hypergraph.VertexAdd{}
-		_ = vertexAdd.FromBytes(data)
+		_ = vertexAdd.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+		)
 
 		vertexRemove := &hypergraph.VertexRemove{}
-		_ = vertexRemove.FromBytes(data)
+		_ = vertexRemove.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+		)
 
 		// Test hyperedge operations
 		hyperedgeAdd := &hypergraph.HyperedgeAdd{}
-		_ = hyperedgeAdd.FromBytes(data)
+		_ = hyperedgeAdd.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+			nil,
+		)
 
 		hyperedgeRemove := &hypergraph.HyperedgeRemove{}
-		_ = hyperedgeRemove.FromBytes(data)
+		_ = hyperedgeRemove.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+		)
 	})
 }
 
@@ -310,7 +379,12 @@ func FuzzVertexRemove_Deserialization(f *testing.F) {
 		}
 
 		vertexRemove := &hypergraph.VertexRemove{}
-		_ = vertexRemove.FromBytes(data) // Should not panic
+		_ = vertexRemove.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+		) // Should not panic
 	})
 }
 
@@ -336,7 +410,13 @@ func FuzzHyperedgeAdd_Deserialization(f *testing.F) {
 		}
 
 		hyperedgeAdd := &hypergraph.HyperedgeAdd{}
-		_ = hyperedgeAdd.FromBytes(data) // Should not panic
+		_ = hyperedgeAdd.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+			nil,
+		) // Should not panic
 	})
 }
 
@@ -362,7 +442,12 @@ func FuzzHyperedgeRemove_Deserialization(f *testing.F) {
 		}
 
 		hyperedgeRemove := &hypergraph.HyperedgeRemove{}
-		_ = hyperedgeRemove.FromBytes(data) // Should not panic
+		_ = hyperedgeRemove.FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+		) // Should not panic
 	})
 }
 
@@ -423,10 +508,33 @@ func FuzzMixedTypeDeserialization(f *testing.F) {
 
 		// Try deserializing as each type - should handle gracefully
 		_, _ = hypergraph.DeployFromBytes(data)
-		_ = (&hypergraph.VertexAdd{}).FromBytes(data)
-		_ = (&hypergraph.VertexRemove{}).FromBytes(data)
-		_ = (&hypergraph.HyperedgeAdd{}).FromBytes(data)
-		_ = (&hypergraph.HyperedgeRemove{}).FromBytes(data)
+		_ = (&hypergraph.VertexAdd{}).FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+		)
+		_ = (&hypergraph.VertexRemove{}).FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+		)
+		_ = (&hypergraph.HyperedgeAdd{}).FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+			nil,
+		)
+		_ = (&hypergraph.HyperedgeRemove{}).FromBytes(
+			data,
+			nil,
+			nil,
+			nil,
+		)
 	})
 }
 
@@ -458,7 +566,14 @@ func FuzzTreeDataHandling(f *testing.F) {
 
 		// Try to deserialize
 		vertexAdd := &hypergraph.VertexAdd{}
-		_ = vertexAdd.FromBytes(buf.Bytes())
+		_ = vertexAdd.FromBytes(
+			buf.Bytes(),
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+		)
 	})
 }
 
@@ -498,7 +613,13 @@ func FuzzHyperedgeExtrinsicsHandling(f *testing.F) {
 
 		// Try to deserialize
 		hyperedgeAdd := &hypergraph.HyperedgeAdd{}
-		_ = hyperedgeAdd.FromBytes(buf.Bytes())
+		_ = hyperedgeAdd.FromBytes(
+			buf.Bytes(),
+			nil,
+			nil,
+			nil,
+			nil,
+		)
 	})
 }
 
@@ -530,7 +651,14 @@ func FuzzLengthOverflows(f *testing.F) {
 
 		// Try to deserialize - should handle gracefully
 		vertexAdd := &hypergraph.VertexAdd{}
-		_ = vertexAdd.FromBytes(buf.Bytes())
+		_ = vertexAdd.FromBytes(
+			buf.Bytes(),
+			nil,
+			nil,
+			nil,
+			nil,
+			nil,
+		)
 	})
 }
 

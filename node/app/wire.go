@@ -119,7 +119,7 @@ var proxyPubSubSet = wire.NewSet(
 	wire.FieldsOf(new(*config.Config), "P2P"),
 	wire.FieldsOf(new(*config.Config), "Engine"),
 	p2p.NewInMemoryPeerInfoManager,
-	p2p.NewBlossomSub,
+	rpc.NewProxyBlossomSub,
 	channel.NewDoubleRatchetEncryptedChannel,
 	wire.Bind(new(tp2p.PubSub), new(*rpc.ProxyBlossomSub)),
 	wire.Bind(new(p2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)),
@@ -210,6 +210,52 @@ func NewClockStore(
 	panic(wire.Build(storeSet))
 }
 
+func NewDataWorkerNodeWithProxyPubsub(
+	logger *zap.Logger,
+	config *config.Config,
+	coreId uint,
+	rpcMultiaddr string,
+	parentProcess int,
+) (*DataWorkerNode, error) {
+	panic(wire.Build(
+		verencSet,
+		compilerSet,
+		keyManagerSet,
+		storeSet,
+		proxyPubSubSet,
+		engineSet,
+		hypergraphSet,
+		validatorSet,
+		appConsensusSet,
+		provideGlobalTimeReel,
+		provideDataWorkerIPC,
+		newDataWorkerNode,
+	))
+}
+
+func NewDataWorkerNodeWithoutProxyPubsub(
+	logger *zap.Logger,
+	config *config.Config,
+	coreId uint,
+	rpcMultiaddr string,
+	parentProcess int,
+) (*DataWorkerNode, error) {
+	panic(wire.Build(
+		verencSet,
+		compilerSet,
+		keyManagerSet,
+		storeSet,
+		pubSubSet,
+		engineSet,
+		hypergraphSet,
+		validatorSet,
+		appConsensusSet,
+		provideGlobalTimeReel,
+		provideDataWorkerIPC,
+		newDataWorkerNode,
+	))
+}
+
 func NewDataWorkerNode(
 	logger *zap.Logger,
 	config *config.Config,
@@ -218,35 +264,21 @@ func NewDataWorkerNode(
 	parentProcess int,
 ) (*DataWorkerNode, error) {
 	if config.Engine.EnableMasterProxy {
-		panic(wire.Build(
-			verencSet,
-			compilerSet,
-			keyManagerSet,
-			storeSet,
-			proxyPubSubSet,
-			engineSet,
-			hypergraphSet,
-			validatorSet,
-			appConsensusSet,
-			provideGlobalTimeReel,
-			provideDataWorkerIPC,
-			newDataWorkerNode,
-		))
+		return NewDataWorkerNodeWithProxyPubsub(
+			logger,
+			config,
+			coreId,
+			rpcMultiaddr,
+			parentProcess,
+		)
 	} else {
-		panic(wire.Build(
-			verencSet,
-			compilerSet,
-			keyManagerSet,
-			storeSet,
-			pubSubSet,
-			engineSet,
-			hypergraphSet,
-			validatorSet,
-			appConsensusSet,
-			provideGlobalTimeReel,
-			provideDataWorkerIPC,
-			newDataWorkerNode,
-		))
+		return NewDataWorkerNodeWithoutProxyPubsub(
+			logger,
+			config,
+			coreId,
+			rpcMultiaddr,
+			parentProcess,
+		)
 	}
 }
 

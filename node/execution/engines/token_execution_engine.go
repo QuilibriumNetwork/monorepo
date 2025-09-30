@@ -730,7 +730,7 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 		intrinsic = loaded
 	}
 
-	err = e.validateIndividualMessage(frameNumber, address, message, fromBundle)
+	err = e.validateIndividualMessage(frameNumber, domain, message, fromBundle)
 	if err != nil {
 		return nil, errors.Wrap(err, "process individual message")
 	}
