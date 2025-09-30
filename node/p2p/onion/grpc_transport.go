@@ -1,6 +1,7 @@
 package onion
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ type GRPCTransport struct {
 	logger  *zap.Logger
 	peers   p2p.PeerInfoManager
 	signers consensus.SignerRegistry
+	peerID  []byte
 
 	mu            sync.RWMutex
 	serverStreams map[string]protobufs.OnionService_ConnectServer // peerID -> server stream
@@ -37,11 +39,13 @@ type GRPCTransport struct {
 // NewGRPCTransport creates a new gRPC-based transport implementation
 func NewGRPCTransport(
 	logger *zap.Logger,
+	peerID []byte,
 	peers p2p.PeerInfoManager,
 	signers consensus.SignerRegistry,
 ) *GRPCTransport {
 	return &GRPCTransport{
 		logger:        logger,
+		peerID:        peerID,
 		peers:         peers,
 		signers:       signers,
 		serverStreams: make(map[string]protobufs.OnionService_ConnectServer),
@@ -247,6 +251,10 @@ func (g *GRPCTransport) ConnectToPeer(
 	ctx context.Context,
 	peerID []byte,
 ) error {
+	if bytes.Equal(peerID, g.peerID) {
+		return errors.Wrap(errors.New("invalid connection"), "connect to peer")
+	}
+
 	if err := g.validatePeer(peerID); err != nil {
 		return errors.Wrap(err, "connect to peer")
 	}

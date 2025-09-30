@@ -11,6 +11,6 @@ BINARIES_DIR="$ROOT_DIR/target/release"
 
 # Link the native VDF and execute tests
 pushd "$NODE_DIR" > /dev/null
-	CGO_LDFLAGS="-L$BINARIES_DIR -lbls48581 -lverenc -lvdf -ldl -lm -lflint -lgmp -lmpfr" \
+	CGO_LDFLAGS="-L$BINARIES_DIR -L/usr/local/lib/ -L/opt/homebrew/Cellar/openssl@3/3.5.0/lib -lbls48581 -lverenc -lbulletproofs -lvdf -lchannel -lferret -lrpm -lstdc++ -ldl -lm -lflint -lgmp -lmpfr -lcrypto -lssl" \
 	CGO_ENABLED=1 \
   go test "$@"

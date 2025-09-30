@@ -47,6 +47,12 @@ func (m *MockVerEncProof) ToBytes() []byte {
 	return args.Get(0).([]byte)
 }
 
+// GetEncryptionKey implements crypto.VerEncProof.
+func (m *MockVerEncProof) GetEncryptionKey() []byte {
+	args := m.Called()
+	return args.Get(0).([]byte)
+}
+
 // Verify implements crypto.VerEncProof.
 func (m *MockVerEncProof) Verify() bool {
 	args := m.Called()

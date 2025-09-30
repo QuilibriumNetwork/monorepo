@@ -11,6 +11,7 @@ type VerEncProof interface {
 	Compress() VerEnc
 	VerifyStatement(input []byte) bool
 	GetStatement() []byte
+	GetEncryptionKey() []byte
 	Verify() bool
 }
 

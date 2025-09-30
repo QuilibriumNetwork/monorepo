@@ -115,6 +115,9 @@ type GlobalTimeReel struct {
 
 	// Network-specific consensus toggles
 	genesisFrameNumber uint64
+
+	// Archive mode: whether to hold historic frame data
+	archiveMode bool
 }
 
 // NewGlobalTimeReel creates a new global time reel
@@ -123,6 +126,7 @@ func NewGlobalTimeReel(
 	proverRegistry consensus.ProverRegistry,
 	clockStore store.ClockStore,
 	network uint8,
+	archiveMode bool,
 ) (*GlobalTimeReel, error) {
 	cache, err := lru.New[string, *GlobalFrameNode](
 		defaultGlobalCacheSize,
@@ -168,6 +172,7 @@ func NewGlobalTimeReel(
 		ctx:                ctx,
 		cancel:             cancel,
 		genesisFrameNumber: genesisFrameNumber,
+		archiveMode:        archiveMode,
 	}, nil
 }
 
@@ -316,11 +321,44 @@ func (g *GlobalTimeReel) Insert(
 		return g.insertGenesisFrame(frame, frameID)
 	}
 
+	// In non-archive mode, if we have no frames yet and this frame is recent
+	// enough, accept it as a starting point
+	if !g.archiveMode && g.root == nil && len(g.nodes) == 0 {
+		// Accept this frame as the initial pseudo-root
+		g.logger.Info(
+			"non-archive mode: accepting first frame as pseudo-root",
+			zap.Uint64("frame_number", frame.Header.FrameNumber),
+		)
+		return g.insertGenesisFrame(frame, frameID)
+	}
+
 	// Try to find parent
 	parentSelector := string(frame.Header.ParentSelector)
 	parentNode := g.findNodeBySelector(frame.Header.ParentSelector)
 
 	if parentNode == nil {
+		if !g.archiveMode {
+			// In non-archive mode, check if we should accept this frame based on
+			// frame number proximity to our current head
+			if g.head != nil {
+				// Check if frame is within reasonable range of our head
+				if frame.Header.FrameNumber > g.head.Frame.Header.FrameNumber &&
+					frame.Header.FrameNumber <= g.head.Frame.Header.FrameNumber+10 {
+					// Frame is slightly ahead, add to pending
+					g.addPendingFrame(frame, parentSelector)
+					return nil
+				} else if frame.Header.FrameNumber < g.head.Frame.Header.FrameNumber &&
+					g.head.Frame.Header.FrameNumber-frame.Header.FrameNumber > maxGlobalTreeDepth {
+					// Frame is too old, reject it
+					g.logger.Debug(
+						"rejecting old frame in non-archive mode",
+						zap.Uint64("frame_number", frame.Header.FrameNumber),
+						zap.Uint64("head_frame", g.head.Frame.Header.FrameNumber),
+					)
+					return nil
+				}
+			}
+		}
 		// Parent not found, add to pending frames
 		g.addPendingFrame(frame, parentSelector)
 		return nil
@@ -370,13 +408,28 @@ func (g *GlobalTimeReel) Insert(
 	return nil
 }
 
-// insertGenesisFrame handles genesis frame insertion
+// insertGenesisFrame handles genesis frame insertion or pseudo-root in non-archive mode
 func (g *GlobalTimeReel) insertGenesisFrame(
 	frame *protobufs.GlobalFrame,
 	frameID string,
 ) error {
-	if g.root != nil {
+	if g.root != nil && g.archiveMode {
+		// In archive mode, don't replace existing root
 		return errors.New("genesis frame already exists")
+	}
+
+	if g.root != nil && !g.archiveMode {
+		// In non-archive mode, check if this frame should replace the current pseudo-root
+		if frame.Header.FrameNumber >= g.root.Frame.Header.FrameNumber {
+			// This frame is not older than current root, don't replace
+			return errors.New("frame is not older than current root")
+		}
+		// This frame is older, it should become the new pseudo-root
+		g.logger.Info(
+			"non-archive mode: replacing pseudo-root with older frame",
+			zap.Uint64("old_root_frame", g.root.Frame.Header.FrameNumber),
+			zap.Uint64("new_root_frame", frame.Header.FrameNumber),
+		)
 	}
 
 	g.root = &GlobalFrameNode{
@@ -387,7 +440,7 @@ func (g *GlobalTimeReel) insertGenesisFrame(
 	}
 
 	g.nodes[frameID] = g.root
-	g.framesByNumber[0] = []*GlobalFrameNode{g.root}
+	g.framesByNumber[frame.Header.FrameNumber] = []*GlobalFrameNode{g.root}
 	g.head = g.root
 	g.cache.Add(frameID, g.root)
 
@@ -996,10 +1049,13 @@ func (g *GlobalTimeReel) rewindFrames(revertNodes []*GlobalFrameNode) {
 		)
 		return
 	}
-	defer txn.Abort() // Will be no-op if committed successfully
 
 	// Process each frame in the revert list (already in correct order)
 	for _, node := range revertNodes {
+		if node.Frame.Header.FrameNumber == 244200 {
+			continue
+		}
+
 		g.logger.Info(
 			"reverting frame",
 			zap.Uint64("frame_number", node.Frame.Header.FrameNumber),
@@ -1011,6 +1067,7 @@ func (g *GlobalTimeReel) rewindFrames(revertNodes []*GlobalFrameNode) {
 			node.Frame.Header.FrameNumber,
 			node.Frame.Requests,
 		); err != nil {
+			txn.Abort()
 			g.logger.Error(
 				"failed to revert frame side effects",
 				zap.Uint64("frame_number", node.Frame.Header.FrameNumber),
@@ -1217,8 +1274,9 @@ func (g *GlobalTimeReel) SetForkChoiceParams(params Params) {
 	g.forkChoiceParams = params
 }
 
-// pruneOldFrames removes frames older than maxGlobalTreeDepth from the current
-// head
+// pruneOldFrames removes frames older than maxGlobalTreeDepth from the in-memory
+// cache to prevent unbounded memory growth. The store handles its own pruning
+// based on archive mode.
 func (g *GlobalTimeReel) pruneOldFrames() {
 	if g.head == nil || g.head.Depth < maxGlobalTreeDepth {
 		return // Not enough frames to prune
@@ -1439,10 +1497,12 @@ func (g *GlobalTimeReel) bootstrapFromStore() error {
 	latestNum := latest.Header.FrameNumber
 
 	var start uint64
-	if latestNum+1 > maxGlobalTreeDepth {
+	if !g.archiveMode && latestNum+1 > maxGlobalTreeDepth {
+		// Non-archive mode: only load last 360 frames
 		start = latestNum - (maxGlobalTreeDepth - 1)
 	} else {
-		start = 0
+		// Archive mode or insufficient frames: load all available
+		start = g.genesisFrameNumber
 	}
 
 	iter, err := g.store.RangeGlobalClockFrames(start, latestNum)
@@ -1486,10 +1546,19 @@ func (g *GlobalTimeReel) bootstrapFromStore() error {
 				node.Parent = p
 				node.Depth = p.Depth + 1
 				p.Children[frameID] = node
+			} else if !g.archiveMode && frame.Header.FrameNumber == start {
+				// Non-archive mode: first frame loaded may not have parent in DB.
+				// Treat it as a pseudo-root with depth 0.
+				node.Depth = 0
+				g.logger.Info(
+					"non-archive mode: treating first loaded frame as pseudo-root",
+					zap.Uint64("frame_number", frame.Header.FrameNumber),
+				)
 			}
 		}
 
-		if g.root == nil {
+		if g.root == nil || (!g.archiveMode && frame.Header.FrameNumber == start) {
+			// Set root to first loaded frame (actual genesis or pseudo-root in non-archive mode)
 			g.root = node
 		}
 
@@ -1513,14 +1582,23 @@ func (g *GlobalTimeReel) bootstrapFromStore() error {
 			zap.Uint64("loaded_from_frame", start),
 			zap.Uint64("loaded_to_frame", g.head.Frame.Header.FrameNumber),
 			zap.Int("loaded_count", len(g.nodes)),
+			zap.Bool("archive_mode", g.archiveMode),
 		)
+
+		if !g.archiveMode && g.root != nil {
+			g.logger.Info(
+				"non-archive mode: accepting last 360 frames as valid chain",
+				zap.Uint64("pseudo_root_frame", g.root.Frame.Header.FrameNumber),
+				zap.Uint64("head_frame", g.head.Frame.Header.FrameNumber),
+			)
+		}
 	}
 
 	return nil
 }
 
 // persistCanonicalFrames writes a contiguous set of canonical frames to the
-// store in one txn.
+// store in one txn. In non-archive mode, it also prunes old frames from the store.
 func (g *GlobalTimeReel) persistCanonicalFrames(
 	frames []*protobufs.GlobalFrame,
 ) error {
@@ -1547,8 +1625,22 @@ func (g *GlobalTimeReel) persistCanonicalFrames(
 			return errors.Wrap(err, "persist canonical frames")
 		}
 	}
+
 	if err := txn.Commit(); err != nil {
 		return errors.Wrap(err, "persist canonical frames")
 	}
+
+	// In non-archive mode, prune frames older than maxGlobalTreeDepth from store
+	if !g.archiveMode && g.head != nil {
+		// Calculate the oldest frame we want to keep
+		if g.head.Frame.Header.FrameNumber > maxGlobalTreeDepth {
+			oldestToKeep := g.head.Frame.Header.FrameNumber - maxGlobalTreeDepth + 1
+			err := g.store.DeleteGlobalClockFrameRange(0, oldestToKeep)
+			if err != nil {
+				g.logger.Error("unable to delete frame range", zap.Error(err))
+			}
+		}
+	}
+
 	return nil
 }

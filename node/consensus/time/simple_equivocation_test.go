@@ -14,7 +14,7 @@ import (
 func TestGlobalTimeReel_SimpleEquivocation(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	globalReel, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	globalReel, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = globalReel.Start()

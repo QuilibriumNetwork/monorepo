@@ -98,6 +98,10 @@ func (p MPCitHVerEncProof) GetStatement() []byte {
 	return slices.Clone(p.Statement)
 }
 
+func (p MPCitHVerEncProof) GetEncryptionKey() []byte {
+	return slices.Clone(p.EncryptionKey)
+}
+
 func (p MPCitHVerEncProof) Compress() crypto.VerEnc {
 	compressed := VerencCompress(generated.VerencProof{
 		BlindingPubkey: p.BlindingPubkey,

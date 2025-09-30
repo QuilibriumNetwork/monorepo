@@ -122,13 +122,6 @@ func TokenDeployFromProtobuf(
 		return nil, nil
 	}
 
-	if len(pb.RdfSchema) == 0 {
-		return nil, errors.Wrap(
-			errors.New("missing rdf schema"),
-			"token deploy from protobuf",
-		)
-	}
-
 	config, err := TokenConfigurationFromProtobuf(pb.Config)
 	if err != nil {
 		return nil, errors.Wrap(err, "token deploy from protobuf")
@@ -151,6 +144,41 @@ func (
 	return &protobufs.TokenDeploy{
 		Config:    t.Config.ToProtobuf(),
 		RdfSchema: t.RDFSchema,
+	}
+}
+
+// FromProtobuf converts a protobuf TokenUpdate to intrinsics TokenUpdate
+func TokenUpdateFromProtobuf(
+	pb *protobufs.TokenUpdate,
+) (*TokenUpdate, error) {
+	if pb == nil {
+		return nil, nil
+	}
+
+	config, err := TokenConfigurationFromProtobuf(pb.Config)
+	if err != nil {
+		return nil, errors.Wrap(err, "token update from protobuf")
+	}
+
+	return &TokenUpdate{
+		Config:         config,
+		RDFSchema:      pb.RdfSchema,
+		OwnerSignature: pb.PublicKeySignatureBls48581,
+	}, nil
+}
+
+// ToProtobuf converts an intrinsics TokenUpdate to protobuf TokenUpdate
+func (
+	t *TokenUpdate,
+) ToProtobuf() *protobufs.TokenUpdate {
+	if t == nil {
+		return nil
+	}
+
+	return &protobufs.TokenUpdate{
+		Config:                     t.Config.ToProtobuf(),
+		RdfSchema:                  t.RDFSchema,
+		PublicKeySignatureBls48581: t.OwnerSignature,
 	}
 }
 
@@ -644,12 +672,12 @@ func MintTransactionInputFromProtobuf(pb *protobufs.MintTransactionInput) (
 	}
 
 	return &MintTransactionInput{
-		Value:                               value,
-		Commitment:                          pb.Commitment,
-		Signature:                           pb.Signature,
-		Proofs:                              pb.Proofs,
-		AdditionalReferenceEncryptionKey:    pb.AdditionalReferenceEncryptionKey,
-		AdditionalReferenceKeyEncryptionKey: pb.AdditionalReferenceKeyEncryptionKey,
+		Value:                  value,
+		Commitment:             pb.Commitment,
+		Signature:              pb.Signature,
+		Proofs:                 pb.Proofs,
+		AdditionalReference:    pb.AdditionalReference,
+		AdditionalReferenceKey: pb.AdditionalReferenceKey,
 	}, nil
 }
 
@@ -666,12 +694,12 @@ func (m *MintTransactionInput) ToProtobuf() *protobufs.MintTransactionInput {
 	}
 
 	return &protobufs.MintTransactionInput{
-		Value:                               valueBytes,
-		Commitment:                          m.Commitment,
-		Signature:                           m.Signature,
-		Proofs:                              m.Proofs,
-		AdditionalReferenceEncryptionKey:    m.AdditionalReferenceEncryptionKey,
-		AdditionalReferenceKeyEncryptionKey: m.AdditionalReferenceKeyEncryptionKey,
+		Value:                  valueBytes,
+		Commitment:             m.Commitment,
+		Signature:              m.Signature,
+		Proofs:                 m.Proofs,
+		AdditionalReference:    m.AdditionalReference,
+		AdditionalReferenceKey: m.AdditionalReferenceKey,
 	}
 }
 

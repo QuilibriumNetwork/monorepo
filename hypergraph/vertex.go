@@ -81,6 +81,9 @@ func (v *vertex) Commit(prover crypto.InclusionProver) []byte {
 // GetVertex retrieves a vertex by its ID. Returns ErrRemoved if the vertex has
 // been removed, or an error if not found.
 func (hg *HypergraphCRDT) GetVertex(id [64]byte) (hypergraph.Vertex, error) {
+	hg.mu.RLock()
+	defer hg.mu.RUnlock()
+
 	timer := prometheus.NewTimer(GetDuration.WithLabelValues("vertex"))
 	defer timer.ObserveDuration()
 
@@ -93,6 +96,7 @@ func (hg *HypergraphCRDT) GetVertex(id [64]byte) (hypergraph.Vertex, error) {
 		hg.vertexAdds,
 		hg.vertexRemoves,
 		hypergraph.VertexAtomType,
+		hg.getCoveredPrefix(),
 	)
 	if removeSet.Has(id) {
 		GetVertexTotal.WithLabelValues("removed").Inc()
@@ -100,26 +104,14 @@ func (hg *HypergraphCRDT) GetVertex(id [64]byte) (hypergraph.Vertex, error) {
 		return nil, errors.Wrap(hypergraph.ErrRemoved, "get vertex")
 	}
 
-	n, err := addSet.GetTree().Store.GetNodeByKey(
-		addSet.GetTree().SetType,
-		addSet.GetTree().PhaseType,
-		addSet.GetTree().ShardKey,
-		id[:],
-	)
+	value, err := addSet.GetTree().Get(id[:])
 	if err != nil {
 		GetVertexTotal.WithLabelValues("error").Inc()
 		ErrorsTotal.WithLabelValues("get_vertex", "not_found").Inc()
 		return nil, errors.Wrap(err, "get vertex")
 	}
 
-	leaf, ok := n.(*tries.LazyVectorCommitmentLeafNode)
-	if !ok {
-		GetVertexTotal.WithLabelValues("error").Inc()
-		ErrorsTotal.WithLabelValues("get_vertex", "invalid_location").Inc()
-		return nil, errors.Wrap(hypergraph.ErrInvalidLocation, "get vertex")
-	}
-
-	atom := AtomFromBytes(leaf.Value)
+	atom := AtomFromBytes(value)
 	if atom == nil {
 		GetVertexTotal.WithLabelValues("error").Inc()
 		ErrorsTotal.WithLabelValues("get_vertex", "invalid_atom").Inc()
@@ -143,6 +135,16 @@ func (hg *HypergraphCRDT) AddVertex(
 	txn tries.TreeBackingStoreTransaction,
 	v hypergraph.Vertex,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
+	return hg.addVertex(txn, v)
+}
+
+func (hg *HypergraphCRDT) addVertex(
+	txn tries.TreeBackingStoreTransaction,
+	v hypergraph.Vertex,
+) error {
 	timer := prometheus.NewTimer(AddVertexDuration)
 	defer timer.ObserveDuration()
 
@@ -152,6 +154,7 @@ func (hg *HypergraphCRDT) AddVertex(
 		hg.vertexAdds,
 		hg.vertexRemoves,
 		hypergraph.VertexAtomType,
+		hg.getCoveredPrefix(),
 	)
 
 	err := addSet.Add(txn, v)
@@ -172,12 +175,16 @@ func (hg *HypergraphCRDT) RevertAddVertex(
 	txn tries.TreeBackingStoreTransaction,
 	v hypergraph.Vertex,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
 	shardAddr := hypergraph.GetShardKey(v)
 	addSet, _ := hg.getOrCreateIdSet(
 		shardAddr,
 		hg.vertexAdds,
 		hg.vertexRemoves,
 		hypergraph.VertexAtomType,
+		hg.getCoveredPrefix(),
 	)
 	if !addSet.Has(v.GetID()) {
 		RevertAddVertexTotal.WithLabelValues("success").Inc()
@@ -203,16 +210,20 @@ func (hg *HypergraphCRDT) RemoveVertex(
 	txn tries.TreeBackingStoreTransaction,
 	v hypergraph.Vertex,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
 	timer := prometheus.NewTimer(RemoveVertexDuration)
 	defer timer.ObserveDuration()
 
 	shardKey := hypergraph.GetShardKey(v)
-	if !hg.LookupVertex(v.(*vertex)) {
+	if !hg.lookupVertex(v) {
 		addSet, removeSet := hg.getOrCreateIdSet(
 			shardKey,
 			hg.vertexAdds,
 			hg.vertexRemoves,
 			hypergraph.VertexAtomType,
+			hg.getCoveredPrefix(),
 		)
 		if err := addSet.Add(txn, v); err != nil {
 			RemoveVertexTotal.WithLabelValues("error").Inc()
@@ -233,6 +244,7 @@ func (hg *HypergraphCRDT) RemoveVertex(
 		hg.vertexAdds,
 		hg.vertexRemoves,
 		hypergraph.VertexAtomType,
+		hg.getCoveredPrefix(),
 	)
 	err := removeSet.Add(txn, v)
 	if err != nil {
@@ -251,12 +263,16 @@ func (hg *HypergraphCRDT) RevertRemoveVertex(
 	txn tries.TreeBackingStoreTransaction,
 	v hypergraph.Vertex,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
 	shardKey := hypergraph.GetShardKey(v)
 	_, removeSet := hg.getOrCreateIdSet(
 		shardKey,
 		hg.vertexAdds,
 		hg.vertexRemoves,
 		hypergraph.VertexAtomType,
+		hg.getCoveredPrefix(),
 	)
 	err := removeSet.Delete(txn, v)
 	if err != nil {
@@ -272,6 +288,12 @@ func (hg *HypergraphCRDT) RevertRemoveVertex(
 // LookupVertex checks if a vertex exists in the hypergraph. Returns true if the
 // vertex is in the add set and not in the remove set.
 func (hg *HypergraphCRDT) LookupVertex(v hypergraph.Vertex) bool {
+	hg.mu.RLock()
+	defer hg.mu.RUnlock()
+	return hg.lookupVertex(v)
+}
+
+func (hg *HypergraphCRDT) lookupVertex(v hypergraph.Vertex) bool {
 	timer := prometheus.NewTimer(LookupDuration.WithLabelValues("vertex"))
 	defer timer.ObserveDuration()
 
@@ -281,6 +303,7 @@ func (hg *HypergraphCRDT) LookupVertex(v hypergraph.Vertex) bool {
 		hg.vertexAdds,
 		hg.vertexRemoves,
 		hypergraph.VertexAtomType,
+		hg.getCoveredPrefix(),
 	)
 	id := v.GetID()
 	found := addSet.Has(id) && !removeSet.Has(id)

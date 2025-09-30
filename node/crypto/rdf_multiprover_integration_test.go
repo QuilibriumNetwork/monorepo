@@ -98,17 +98,20 @@ func TestRDFMultiprover(t *testing.T) {
 	})
 
 	t.Run("GetFieldOrder", func(t *testing.T) {
-		order, err := multiprover.GetFieldOrder(rdfDoc, "coin:Coin", "Commitment")
+		order, maxOrder, err := multiprover.GetFieldOrder(rdfDoc, "coin:Coin", "Commitment")
 		require.NoError(t, err)
 		assert.Equal(t, 1, order)
+		assert.Equal(t, 3, maxOrder)
 
-		order, err = multiprover.GetFieldOrder(rdfDoc, "coin:Coin", "OneTimeKey")
+		order, maxOrder, err = multiprover.GetFieldOrder(rdfDoc, "coin:Coin", "OneTimeKey")
 		require.NoError(t, err)
 		assert.Equal(t, 2, order)
+		assert.Equal(t, 3, maxOrder)
 
-		order, err = multiprover.GetFieldOrder(rdfDoc, "coin:Coin", "VerificationKey")
+		order, maxOrder, err = multiprover.GetFieldOrder(rdfDoc, "coin:Coin", "VerificationKey")
 		require.NoError(t, err)
 		assert.Equal(t, 3, order)
+		assert.Equal(t, 3, maxOrder)
 	})
 
 	t.Run("GetFieldKey", func(t *testing.T) {

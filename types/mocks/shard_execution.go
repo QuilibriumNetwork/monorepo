@@ -15,6 +15,21 @@ type MockShardExecutionEngine struct {
 	mock.Mock
 }
 
+// Prove implements execution.ShardExecutionEngine.
+func (m *MockShardExecutionEngine) Prove(
+	domain []byte,
+	frameNumber uint64,
+	message []byte,
+) (*protobufs.MessageRequest, error) {
+	args := m.Called(domain, frameNumber, message)
+	return args.Get(0).(*protobufs.MessageRequest), args.Error(1)
+}
+
+func (m *MockShardExecutionEngine) GetCost(message []byte) (*big.Int, error) {
+	args := m.Called(message)
+	return args.Get(0).(*big.Int), args.Error(1)
+}
+
 // GetCapabilities implements execution.ShardExecutionEngine.
 func (m *MockShardExecutionEngine) GetCapabilities() []*protobufs.Capability {
 	args := m.Called()
@@ -86,8 +101,8 @@ func (m *MockShardExecutionEngine) ProcessMessage(
 }
 
 // Start implements execution.ShardExecutionEngine.
-func (m *MockShardExecutionEngine) Start(in chan struct{}) <-chan error {
-	args := m.Called(in)
+func (m *MockShardExecutionEngine) Start() <-chan error {
+	args := m.Called()
 	return args.Get(0).(chan error)
 }
 

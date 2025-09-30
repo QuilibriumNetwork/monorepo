@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package quilibrium.node.ferretproxy.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/protobufs";
+
+// Data packet exchanged between Alice and Bob
+message ProxyData {
+  bytes data = 1;
+  bool close_connection = 2; // Signal to close the connection
+}
+
+// FerretProxy service for tunneling TCP connections over gRPC
+service FerretProxy {
+  // Alice-side: Create TCP connection to specified port and forward data
+  // Alice receives gRPC stream and forwards to local TCP connection
+  rpc AliceProxy(stream ProxyData) returns (stream ProxyData);
+  
+  // Bob-side: Create TCP listener and forward data to gRPC stream  
+  // Bob creates TCP listener and forwards data to/from gRPC stream
+  rpc BobProxy(stream ProxyData) returns (stream ProxyData);
+}

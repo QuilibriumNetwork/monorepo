@@ -1473,11 +1473,6 @@ func (p *PubSub) GetBitmasks() []string {
 }
 
 func (p *PubSub) Publish(ctx context.Context, bitmask []byte, data []byte, opts ...PubOpt) error {
-	peers := p.ListPeers(bitmask)
-	if len(peers) == 0 {
-		return ErrBitmaskClosed
-	}
-
 	slices := SliceBitmask(bitmask)
 	o := rand.Intn(len(slices))
 	b, _, errs := p.tryJoin(slices[o])

@@ -475,6 +475,12 @@ type TreeBackingStore interface {
 	GetVertexDataIterator(
 		prefix ShardKey,
 	) (VertexDataIterator, error)
+	DeleteUncoveredPrefix(
+		setType string,
+		phaseType string,
+		shardKey ShardKey,
+		prefix []int,
+	) error
 
 	ReapOldChangesets(
 		txn TreeBackingStoreTransaction,
@@ -504,6 +510,9 @@ type TreeBackingStore interface {
 		setType string,
 		shardKey ShardKey,
 	) error
+	SetCoveredPrefix(
+		path []int,
+	) error
 }
 
 // LazyVectorCommitmentTree is a lazy-loaded (from a TreeBackingStore based
@@ -522,6 +531,105 @@ type LazyVectorCommitmentTree struct {
 	treeMx          sync.RWMutex
 }
 
+func (t *LazyVectorCommitmentTree) PruneUncoveredBranches() error {
+	t.treeMx.Lock()
+	defer t.treeMx.Unlock()
+
+	if len(t.CoveredPrefix) == 0 {
+		return errors.New("full tree cannot prune")
+	}
+
+	t.Root = nil
+
+	return t.Store.DeleteUncoveredPrefix(
+		t.SetType,
+		t.PhaseType,
+		t.ShardKey,
+		t.CoveredPrefix,
+	)
+}
+
+// InsertBranchSkeleton writes a branch node at fullPrefix with the given
+// metadata. prefix is the compressed prefix stored in the node, commitment
+// should be the source tree’s commitment for this branch node. size, leafCount,
+// longestBranch mirror source metadata. Never call this for a tree that has
+// not undergone shard-out.
+func (t *LazyVectorCommitmentTree) InsertBranchSkeleton(
+	txn TreeBackingStoreTransaction,
+	branch *LazyVectorCommitmentBranchNode,
+	isRoot bool,
+) error {
+	t.treeMx.Lock()
+	defer t.treeMx.Unlock()
+
+	if len(t.CoveredPrefix) == 0 {
+		return errors.New("skeleton data cannot be used with full tree")
+	}
+
+	if err := t.Store.InsertNode(
+		txn,
+		t.SetType,
+		t.PhaseType,
+		t.ShardKey,
+		generateKeyFromPath(branch.FullPrefix),
+		branch.FullPrefix,
+		branch,
+	); err != nil {
+		return errors.Wrap(err, "insert branch skeleton")
+	}
+
+	// If this is the root skeleton, set Root in-memory so Commit() has a top.
+	if isRoot {
+		t.Root = branch
+		return errors.Wrap(
+			t.Store.SaveRoot(t.SetType, t.PhaseType, t.ShardKey, branch),
+			"insert branch skeleton",
+		)
+	}
+
+	return nil
+}
+
+// InsertLeafSkeleton writes a leaf node with the given metadata. prefix is the
+// compressed prefix stored in the node, commitment should be the source tree’s
+// commitment for this node. Never call this for a tree that has not undergone
+// shard-out.
+func (t *LazyVectorCommitmentTree) InsertLeafSkeleton(
+	txn TreeBackingStoreTransaction,
+	leaf *LazyVectorCommitmentLeafNode,
+	isRoot bool,
+) error {
+	t.treeMx.Lock()
+	defer t.treeMx.Unlock()
+
+	if len(t.CoveredPrefix) == 0 {
+		return errors.New("skeleton data cannot be used with full tree")
+	}
+
+	if err := t.Store.InsertNode(
+		txn,
+		t.SetType,
+		t.PhaseType,
+		t.ShardKey,
+		leaf.Key,
+		getFullPath(leaf.Key),
+		leaf,
+	); err != nil {
+		return err
+	}
+
+	// If this is the root skeleton, set Root in-memory so Commit() has a top.
+	if isRoot {
+		t.Root = leaf
+		return errors.Wrap(
+			t.Store.SaveRoot(t.SetType, t.PhaseType, t.ShardKey, leaf),
+			"insert leaf skeleton",
+		)
+	}
+
+	return nil
+}
+
 // Insert adds or updates a key-value pair in the tree
 func (t *LazyVectorCommitmentTree) Insert(
 	txn TreeBackingStoreTransaction,
@@ -532,6 +640,24 @@ func (t *LazyVectorCommitmentTree) Insert(
 	defer t.treeMx.Unlock()
 	if len(key) == 0 {
 		return errors.New("empty key not allowed")
+	}
+
+	// Get the size value, and check if it's a branch (i.e. someone is trying
+	// to use key derivation conflicts and the upstream caller doesn't check)
+	maybeLeaf, err := t.Store.GetNodeByKey(
+		t.SetType,
+		t.PhaseType,
+		t.ShardKey,
+		key,
+	)
+	sizeDelta := size
+	if err == nil {
+		if _, ok := maybeLeaf.(*LazyVectorCommitmentBranchNode); ok {
+			return errors.New("value is branch")
+		}
+		if leaf, ok := maybeLeaf.(*LazyVectorCommitmentLeafNode); ok {
+			sizeDelta = new(big.Int).Sub(size, leaf.Size)
+		}
 	}
 
 	// Check if key is within the covered prefix (if one is defined)
@@ -561,6 +687,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				path,
 			)
 			if err != nil && !strings.Contains(err.Error(), "item not found") {
+				// TODO[2.1.1]: no panic
 				log.Panic("failed to get node by path", zap.Error(err))
 			}
 		}
@@ -638,7 +765,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				Prefix:        sharedNibbles,
 				LeafCount:     2,
 				LongestBranch: 1,
-				Size:          new(big.Int).Add(n.Size, size),
+				Size:          new(big.Int).Add(n.Size, sizeDelta),
 				FullPrefix:    slices.Concat(path, sharedNibbles),
 				Store:         t.Store,
 				FullyLoaded:   true,
@@ -698,7 +825,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 							Prefix:        n.Prefix[:i],
 							LeafCount:     n.LeafCount + 1,
 							LongestBranch: n.LongestBranch + 1,
-							Size:          new(big.Int).Add(n.Size, size),
+							Size:          new(big.Int).Add(n.Size, sizeDelta),
 							Store:         t.Store,
 							FullPrefix:    slices.Concat(path, n.Prefix[:i]),
 							FullyLoaded:   true,
@@ -811,9 +938,8 @@ func (t *LazyVectorCommitmentTree) Insert(
 				case *LazyVectorCommitmentLeafNode:
 					n.LongestBranch = 1
 				}
-				if delta != 0 {
-					n.Size = n.Size.Add(n.Size, size)
-				}
+
+				n.Size = n.Size.Add(n.Size, sizeDelta)
 				err := t.Store.InsertNode(
 					txn,
 					t.SetType,
@@ -845,9 +971,8 @@ func (t *LazyVectorCommitmentTree) Insert(
 				case *LazyVectorCommitmentLeafNode:
 					n.LongestBranch = 1
 				}
-				if delta != 0 {
-					n.Size = n.Size.Add(n.Size, size)
-				}
+
+				n.Size = n.Size.Add(n.Size, sizeDelta)
 
 				err := t.Store.InsertNode(
 					txn,
@@ -1853,6 +1978,7 @@ func DeserializeTree(
 	shardKey ShardKey,
 	store TreeBackingStore,
 	data []byte,
+	coveredPrefix []int,
 ) (*LazyVectorCommitmentTree, error) {
 	buf := bytes.NewReader(data)
 	node, err := deserializeNode(store, buf)
@@ -1865,7 +1991,7 @@ func DeserializeTree(
 		PhaseType:     phaseType,
 		ShardKey:      shardKey,
 		Store:         store,
-		CoveredPrefix: []int{}, // Empty by default, must be set explicitly
+		CoveredPrefix: coveredPrefix, // Empty by default, must be set explicitly
 	}, nil
 }
 

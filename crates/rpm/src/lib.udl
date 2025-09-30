@@ -1,24 +1,24 @@
 namespace rpm {
-    InitialShares rpm_generate_initial_shares(u64 size, u64 depth, u64 dealers, u64 players);
-    CombinedSharesAndMask rpm_combine_shares_and_mask([ByRef] sequence<sequence<sequence<sequence<sequence<sequence<u8>>>>>> ms, [ByRef] sequence<sequence<sequence<sequence<u8>>>> rs, u64 size, u64 depth, u64 dealers);
-    SketchProposal rpm_sketch_propose([ByRef] sequence<sequence<sequence<sequence<sequence<u8>>>>> m, [ByRef] sequence<sequence<sequence<u8>>> r);
-    boolean rpm_sketch_verify([ByRef] sequence<sequence<sequence<sequence<sequence<u8>>>>> mcs, [ByRef] sequence<sequence<sequence<u8>>> rcs, u64 dealers);
-    sequence<sequence<sequence<u8>>> rpm_permute([ByRef] sequence<sequence<sequence<u8>>> masked_input_shares, [ByRef] sequence<sequence<sequence<sequence<sequence<u8>>>>> mb, [ByRef] sequence<sequence<sequence<u8>>> rb, [ByRef] sequence<sequence<sequence<sequence<sequence<u8>>>>> mrmb, u64 depth_index, [ByRef] sequence<u64> parties);
-    sequence<sequence<u8>> rpm_finalize([ByRef] sequence<sequence<sequence<u8>>> input, [ByRef] sequence<u64> parties);
+    WrappedInitialShares wrapped_rpm_generate_initial_shares(u64 size, u64 depth, u64 dealers, u64 players);
+    WrappedCombinedSharesAndMask wrapped_rpm_combine_shares_and_mask([ByRef] sequence<sequence<sequence<sequence<sequence<sequence<u8>>>>>> ms, [ByRef] sequence<sequence<sequence<sequence<u8>>>> rs, u64 size, u64 depth, u64 dealers);
+    WrappedSketchProposal wrapped_rpm_sketch_propose([ByRef] sequence<sequence<sequence<sequence<sequence<u8>>>>> m, [ByRef] sequence<sequence<sequence<u8>>> r);
+    boolean wrapped_rpm_sketch_verify([ByRef] sequence<sequence<sequence<sequence<sequence<u8>>>>> mcs, [ByRef] sequence<sequence<sequence<u8>>> rcs, u64 dealers);
+    sequence<sequence<sequence<u8>>> wrapped_rpm_permute([ByRef] sequence<sequence<sequence<u8>>> masked_input_shares, [ByRef] sequence<sequence<sequence<sequence<sequence<u8>>>>> mb, [ByRef] sequence<sequence<sequence<u8>>> rb, [ByRef] sequence<sequence<sequence<sequence<sequence<u8>>>>> mrmb, u64 depth_index, [ByRef] sequence<u64> parties);
+    sequence<sequence<u8>> wrapped_rpm_finalize([ByRef] sequence<sequence<sequence<u8>>> input, [ByRef] sequence<u64> parties);
 };
 
-dictionary InitialShares {
+dictionary WrappedInitialShares {
     sequence<sequence<sequence<sequence<sequence<sequence<u8>>>>>> ms;
-    sequence<sequence<sequence<sequence<sequence<u8>>>>> rs;
+    sequence<sequence<sequence<sequence<u8>>>> rs;
 };
 
-dictionary CombinedSharesAndMask {
+dictionary WrappedCombinedSharesAndMask {
     sequence<sequence<sequence<sequence<sequence<u8>>>>> ms;
     sequence<sequence<sequence<u8>>> rs;
     sequence<sequence<sequence<sequence<sequence<u8>>>>> mrms;
 };
 
-dictionary SketchProposal {
+dictionary WrappedSketchProposal {
   sequence<sequence<sequence<sequence<u8>>>> mp;
   sequence<sequence<u8>> rp;
 };

@@ -7,6 +7,48 @@ import (
 )
 
 // MockKeyManager mocks the KeyManager interface for testing
+type MockKeyRing struct {
+	mock.Mock
+}
+
+// GetAgreementKey implements keys.KeyRing.
+func (m *MockKeyRing) GetAgreementKey(
+	reference string,
+	address []byte,
+	keyType crypto.KeyType,
+) (crypto.Agreement, error) {
+	args := m.Called(reference, address, keyType)
+	return args.Get(0).(crypto.Agreement), args.Error(1)
+}
+
+// GetSigningKey implements keys.KeyRing.
+func (m *MockKeyRing) GetSigningKey(
+	id string,
+	keyType crypto.KeyType,
+) (crypto.Signer, error) {
+	args := m.Called(id, keyType)
+	return args.Get(0).(crypto.Signer), args.Error(1)
+}
+
+// ValidateSignature implements keys.KeyRing.
+func (m *MockKeyRing) ValidateSignature(
+	keyType crypto.KeyType,
+	publicKey []byte,
+	message []byte,
+	signature []byte,
+	domain []byte,
+) (bool, error) {
+	args := m.Called(
+		keyType,
+		publicKey,
+		message,
+		signature,
+		domain,
+	)
+	return args.Bool(0), args.Error(1)
+}
+
+// MockKeyManager mocks the KeyManager interface for testing
 type MockKeyManager struct {
 	mock.Mock
 }
@@ -105,3 +147,4 @@ func (k *MockKeyManager) PutRawKey(key *keys.Key) error {
 }
 
 var _ keys.KeyManager = (*MockKeyManager)(nil)
+var _ keys.KeyRing = (*MockKeyRing)(nil)

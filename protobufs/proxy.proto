@@ -1,0 +1,210 @@
+syntax = "proto3";
+
+package quilibrium.node.proxy.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/protobufs";
+
+import "google/protobuf/wrappers.proto";
+import "google/protobuf/empty.proto";
+
+
+// Publishing messages
+message PublishToBitmaskRequest {
+  bytes bitmask = 1;
+  bytes data = 2;
+}
+
+message PublishRequest {
+  bytes address = 1;
+  bytes data = 2;
+}
+
+// Subscription messages
+message SubscribeRequest {
+  bytes bitmask = 1;
+  string subscription_id = 2; // Unique ID for this subscription
+}
+
+message UnsubscribeRequest {
+  bytes bitmask = 1;
+  bool raw = 2;
+}
+
+message MessageEvent {
+  bytes data = 1;
+  bytes from = 2;
+  bytes seqno = 3;
+  bytes bitmask = 4;
+  bytes signature = 5;
+  bytes key = 6;
+}
+
+// Validator streaming messages for bidirectional communication
+message ValidationStreamMessage {
+  oneof message {
+    RegisterValidatorRequest register = 1;
+    UnregisterValidatorRequest unregister = 2;
+    ValidationRequest validation_request = 3;
+    ValidationResponse validation_response = 4;
+  }
+}
+
+message RegisterValidatorRequest {
+  bytes bitmask = 1;
+  string validator_id = 2; // Unique ID for callback routing
+  bool sync = 3;
+}
+
+message UnregisterValidatorRequest {
+  bytes bitmask = 1;
+  string validator_id = 2;
+}
+
+message ValidationRequest {
+  string validator_id = 1;
+  bytes peer_id = 2;
+  MessageEvent message = 3;
+}
+
+message ValidationResponse {
+  string validator_id = 1;
+  enum ValidationResult {
+    ACCEPT = 0;
+    REJECT = 1;
+    IGNORE = 2;
+  }
+  ValidationResult result = 2;
+}
+
+// Peer information messages
+message GetPeerIDResponse {
+  bytes peer_id = 1;
+}
+
+message GetPeerstoreCountResponse {
+  int32 count = 1;
+}
+
+message GetNetworkPeersCountResponse {
+  int32 count = 1;
+}
+
+message GetRandomPeerRequest {
+  bytes bitmask = 1;
+}
+
+message GetRandomPeerResponse {
+  bytes peer_id = 1;
+}
+
+message GetMultiaddrOfPeerRequest {
+  bytes peer_id = 1;
+}
+
+message GetMultiaddrOfPeerResponse {
+  string multiaddr = 1;
+}
+
+message GetOwnMultiaddrsResponse {
+  repeated string multiaddrs = 1;
+}
+
+message NetworkInfo {
+  bytes peer_id = 1;
+  repeated string multiaddrs = 2;
+  double peer_score = 3;
+}
+
+message NetworkInfoResponse {
+  repeated NetworkInfo network_info = 1;
+}
+
+// Scoring messages
+message GetPeerScoreRequest {
+  bytes peer_id = 1;
+}
+
+message GetPeerScoreResponse {
+  int64 score = 1;
+}
+
+message SetPeerScoreRequest {
+  bytes peer_id = 1;
+  int64 score = 2;
+}
+
+message AddPeerScoreRequest {
+  bytes peer_id = 1;
+  int64 score_delta = 2;
+}
+
+// Connection management messages
+message ReconnectRequest {
+  bytes peer_id = 1;
+}
+
+message IsPeerConnectedRequest {
+  bytes peer_id = 1;
+}
+
+message IsPeerConnectedResponse {
+  bool connected = 1;
+}
+
+// Utility messages
+message GetNetworkResponse {
+  uint32 network = 1;
+}
+
+message SignMessageRequest {
+  bytes message = 1;
+}
+
+message SignMessageResponse {
+  bytes signature = 1;
+}
+
+message GetPublicKeyResponse {
+  bytes public_key = 1;
+}
+
+// PubSubProxy service defines the RPC interface for proxying pubsub calls
+service PubSubProxy {
+  // Publishing methods
+  rpc PublishToBitmask(PublishToBitmaskRequest) returns (google.protobuf.Empty);
+  rpc Publish(PublishRequest) returns (google.protobuf.Empty);
+  
+  // Subscription methods
+  rpc Subscribe(SubscribeRequest) returns (stream MessageEvent);
+  rpc Unsubscribe(UnsubscribeRequest) returns (google.protobuf.Empty);
+  
+  // Validator methods - bidirectional streaming for validation callbacks
+  rpc ValidatorStream(stream ValidationStreamMessage) returns (stream ValidationStreamMessage);
+  
+  // Peer information methods
+  rpc GetPeerID(google.protobuf.Empty) returns (GetPeerIDResponse);
+  rpc GetPeerstoreCount(google.protobuf.Empty) returns (GetPeerstoreCountResponse);
+  rpc GetNetworkPeersCount(google.protobuf.Empty) returns (GetNetworkPeersCountResponse);
+  rpc GetRandomPeer(GetRandomPeerRequest) returns (GetRandomPeerResponse);
+  rpc GetMultiaddrOfPeer(GetMultiaddrOfPeerRequest) returns (GetMultiaddrOfPeerResponse);
+  rpc GetMultiaddrOfPeerStream(GetMultiaddrOfPeerRequest) returns (stream GetMultiaddrOfPeerResponse);
+  rpc GetOwnMultiaddrs(google.protobuf.Empty) returns (GetOwnMultiaddrsResponse);
+  rpc GetNetworkInfo(google.protobuf.Empty) returns (NetworkInfoResponse);
+  
+  // Scoring methods
+  rpc GetPeerScore(GetPeerScoreRequest) returns (GetPeerScoreResponse);
+  rpc SetPeerScore(SetPeerScoreRequest) returns (google.protobuf.Empty);
+  rpc AddPeerScore(AddPeerScoreRequest) returns (google.protobuf.Empty);
+  
+  // Connection management
+  rpc Reconnect(ReconnectRequest) returns (google.protobuf.Empty);
+  rpc Bootstrap(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc DiscoverPeers(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc IsPeerConnected(IsPeerConnectedRequest) returns (IsPeerConnectedResponse);
+  
+  // Utility methods
+  rpc GetNetwork(google.protobuf.Empty) returns (GetNetworkResponse);
+  rpc Reachability(google.protobuf.Empty) returns (google.protobuf.BoolValue);
+  rpc SignMessage(SignMessageRequest) returns (SignMessageResponse);
+  rpc GetPublicKey(google.protobuf.Empty) returns (GetPublicKeyResponse);
+}

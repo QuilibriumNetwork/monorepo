@@ -1,0 +1,162 @@
+syntax = "proto3";
+
+package quilibrium.node.compute.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+import "keys.proto";
+
+message Application {
+  bytes address = 1;
+  ExecutionContext execution_context = 2;
+}
+
+// The ExecutionContext defines the operating environment of the application
+enum ExecutionContext {
+  // Intrinsic execution is a protocol-native application – Nodes are expected
+  // to have the necessary information required to execute.
+  // Intrinsic applications have addresses that have infinitessimal likelihood
+  // of collision and must be constructed as nothing-up-my-sleeve values.
+  EXECUTION_CONTEXT_INTRINSIC = 0;
+  // Hypergraph execution is also protocol-native, however it imparts specific
+  // rules on data encoding/decoding such that the inputs/outputs must be
+  // handled differently. Hypergraph applications have addresses that are
+  // derived from location within the hypergraph.
+  EXECUTION_CONTEXT_HYPERGRAPH = 1;
+  // Extrinsic execution is evaluation of application code that lives on the
+  // protocol, either within the hypergraph or supplementary to it, e.g. MetaVM.
+  EXECUTION_CONTEXT_EXTRINSIC = 2;
+}
+
+message IntrinsicExecutionInput {
+  bytes address = 1;
+  bytes input = 2;
+}
+
+message IntrinsicExecutionOutput {
+  bytes address = 1;
+  bytes output = 2;
+  bytes proof = 3;
+}
+
+// ComputeConfiguration defines the keys for a compute intrinsic
+// deployment
+message ComputeConfiguration {
+  // Ed448 read public key (57 bytes)
+  bytes read_public_key = 1;
+  // Ed448 write public key (57 bytes)
+  bytes write_public_key = 2;
+  // 585 byte BLS48-581
+  bytes owner_public_key = 3;
+}
+
+// ComputeDeploy creates a new compute intrinsic
+message ComputeDeploy {
+  // The compute configuration
+  ComputeConfiguration config = 1;
+  // RDF schema definition
+  bytes rdf_schema = 2;
+}
+
+message ComputeUpdate {
+  // The compute configuration
+  ComputeConfiguration config = 1;
+  // RDF schema definition
+  bytes rdf_schema = 2;
+  // Signature from the owner key
+  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 3;
+}
+
+// Code deployment operation - deploys a QCL circuit
+message CodeDeployment {
+  // The QCL circuit to deploy
+  bytes circuit = 1;
+  // QCL types/classes of main arguments (max 2: garbler, evaluator)
+  repeated string input_types = 2;
+  // QCL types/classes of output values
+  repeated string output_types = 3;
+  // App address (32 bytes)
+  bytes domain = 4;
+}
+
+// Dependency information for execution operations
+message ExecutionDependency {
+  bytes identifier = 1;
+  // Addresses read by this operation
+  repeated bytes read_set = 2;
+  // Addresses written by this operation
+  repeated bytes write_set = 3;
+  // Execution stage after DAG analysis
+  uint32 stage = 4;
+}
+
+// Single operation to execute
+message ExecuteOperation {
+  Application application = 1;
+  bytes identifier = 2;
+  repeated bytes dependencies = 3;
+}
+
+// Node in the execution DAG (for internal use, not serialized directly)
+message ExecutionNode {
+  ExecuteOperation operation = 1;
+  // Addresses read by this operation
+  repeated bytes read_set = 2;
+  // Addresses written by this operation
+  repeated bytes write_set = 3;
+  uint32 stage = 4;
+  bool visited = 5;
+  bool in_progress = 6;
+}
+
+// Execution DAG structure (for internal use, not serialized directly)
+message ExecutionDAG {
+  map<string, ExecutionNode> operations = 1;
+  // Operations grouped by execution stage
+  repeated ExecutionStage stages = 2;
+}
+
+// Helper message for stages in ExecutionDAG
+message ExecutionStage {
+  repeated string operation_ids = 1;
+}
+
+// Code execution operation
+message CodeExecute {
+  // Array of 2 byte arrays
+  repeated bytes proof_of_payment = 1;
+  // 32 bytes
+  bytes domain = 2;
+  // 32 bytes
+  bytes rendezvous = 3;
+  repeated ExecuteOperation execute_operations = 4;
+}
+
+// State transition to be committed
+message StateTransition {
+  // 32 bytes
+  bytes domain = 1;
+  bytes address = 2;
+  bytes old_value = 3;
+  bytes new_value = 4;
+  bytes proof = 5;
+}
+
+// Result of a single operation execution
+message ExecutionResult {
+  bytes operation_id = 1;
+  bool success = 2;
+  bytes output = 3;
+  bytes error = 4;
+}
+
+// Finalizes the execution of a CodeExecute operation
+message CodeFinalize {
+  // 32 bytes
+  bytes rendezvous = 1;
+  repeated ExecutionResult results = 2;
+  repeated StateTransition state_changes = 3;
+  bytes proof_of_execution = 4;
+  // Transient output to return to requestor
+  bytes message_output = 5;
+}

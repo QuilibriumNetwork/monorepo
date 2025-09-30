@@ -19,17 +19,17 @@ const (
 // - Order 64-4093: Two bytes, shifted left by 4
 // - Order 4094-262142: Three bytes, shifted left by 6
 // - Order > 262142: Error
-func OrderToKey(order int) ([]byte, error) {
+func OrderToKey(order int, maxOrder int) ([]byte, error) {
 	if order < 0 {
 		return nil, errors.New("order must be non-negative")
 	}
 
-	if order <= MaxOrderSingleByte {
+	if maxOrder <= MaxOrderSingleByte {
 		// Single byte encoding: order << 2
 		return []byte{byte(order << 2)}, nil
 	}
 
-	if order <= MaxOrderTwoByte {
+	if maxOrder <= MaxOrderTwoByte {
 		// Two byte encoding: order << 4
 		shifted := order << 4
 		return []byte{
@@ -38,7 +38,7 @@ func OrderToKey(order int) ([]byte, error) {
 		}, nil
 	}
 
-	if order <= MaxOrderThreeByte {
+	if maxOrder <= MaxOrderThreeByte {
 		// Three byte encoding: order << 6
 		shifted := order << 6
 		return []byte{
@@ -51,7 +51,7 @@ func OrderToKey(order int) ([]byte, error) {
 	return nil, errors.Wrap(
 		fmt.Errorf(
 			"order value %d exceeds maximum allowed value of %d",
-			order,
+			maxOrder,
 			MaxOrderThreeByte,
 		),
 		"order to key",

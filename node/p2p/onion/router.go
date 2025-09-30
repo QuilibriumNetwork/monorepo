@@ -1170,9 +1170,8 @@ func (r *OnionRouter) sendRelay(c *Circuit, h relayHeader) error {
 func payloadMax() int {
 	// AEAD adds 16 bytes tag per layer; but we layer *before* link padding.
 	// We packed header+data and then layered; the tag growth is inside the
-	// layered blob. To stay simple for now, we cap relay payload to (CellSize -
-	// minimal headers) generously. You can compute tight bounds if you want
-	// maximum throughput.
+	// layered blob. To stay simple, we cap relay payload to (CellSize - minimal
+	// headers) generously.
 	return 256
 }
 

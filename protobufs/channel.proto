@@ -1,0 +1,175 @@
+syntax = "proto3";
+
+package quilibrium.node.channel.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+// Describes a general channel envelope for a message.
+message P2PChannelEnvelope {
+  // A general protocol identifier as a uint32 – this is expected to rarely
+  // iterate, and should be uniquely identifying both protocol and version.
+  // Pragmatically speaking, this implies that the least significant byte
+  // specifies version (which should iterate most minimally), and the three most
+  // significant bytes should specify protocol. Recipients SHOULD ignore
+  // messages with incompatible protocol identifiers, but also SHOULD warn on
+  // identifiers with versions higher than the supported protocol. A large
+  // number of unsupported protocol messages may indicate spam/some other
+  // attack, whereas a large number of unsupported protocol versions may
+  // indicate an out of date client, respective to which side is the maximum of
+  // the version number.
+  uint32 protocol_identifier = 1;
+
+  // The encrypted message header. Message header encryption is mandatory –
+  // P2P channels in some cases pre-empt the mixnet and leaky information from
+  // unencrypted message headers could de-anonymize the recipient. It is thus
+  // also mandatory at the protocol implementation level that header sizes are
+  // consistent within a protocol so as to not leak metadata. An example of this
+  // is in Double and Triple-Ratchet, where the sequence identifiers MUST be
+  // encoded as fixed-length integers, as variable encoding can indicate a
+  // message being in the first 256, 65,536, etc. if an exchange is highly
+  // asymmetrical in sends/receives. This is especially critical in long
+  // running protocols with a need for fixed length messages (see message_body
+  // notes).
+  MessageCiphertext message_header = 2;
+
+  // The encrypted message body. Message bodies are variable length – ciphertext
+  // could range widely, however if this metadata is pertinent to determining
+  // protocol state, such as knowing what round an encapsulated protocol is in,
+  // or potentially what might be transferred over the protocol, protocol
+  // implementers SHOULD utilize chunking and send fixed length messages.
+  // Additionally, if rounds themselves are highly asymmetric or have
+  // long-standing processing times that could dangerously leak information of
+  // round state, implementers SHOULD defer protocol use to leverage the mixnet.
+  // If this is not feasible, the implementation details are left up to the
+  // exercise of the protocol author.
+  MessageCiphertext message_body = 3;
+}
+
+// Describes a general ciphertext payload.
+message MessageCiphertext {
+  // The intialization vector used for encryption. While cipher specific,
+  // typically this should be a unique value for every ciphertext. If this is
+  // not the case for a protocol where it should be, this SHOULD be considered
+  // an invalid message and warned, as it could either indicate compromise,
+  // or a faulty cryptographic implementation – such as a faulty PKCS#11
+  // implementation that has a code path to handle HSM vendors which mandate
+  // zeroed IVs before passing into encryption methods, as they will update the
+  // IV within the HSM through hardware-supplied entropy.
+  bytes initialization_vector = 1;
+
+  // The raw ciphertext byte string. This will be cipher specific, however some
+  // general attributes are expected to be followed. If there is a common
+  // layout expected, such as AES-GCM having the GCM tag appended to the
+  // ciphertext, please follow the common layout.
+  bytes ciphertext = 2;
+  
+  // The associated data byte string, if available. This will be highly protocol
+  // specific, but SHOULD NOT leak metadata.
+  bytes associated_data = 3;
+}
+
+// InboxMessage represents a message stored in an inbox
+message InboxMessage {
+  // The address of the inbox
+  bytes address = 1;
+  // Unix timestamp in milliseconds
+  uint64 timestamp = 2;
+  // The ephemeral public key used for the message
+  bytes ephemeral_public_key = 3;
+  // The actual message content (encrypted)
+  bytes message = 4;
+}
+
+message HubAddInboxMessage {
+  // The address of the hub
+  bytes address = 1;
+  // The inbox public key to associate
+  bytes inbox_public_key = 2;
+  // The hub public key to associate
+  bytes hub_public_key = 3;
+  // The signature of the hub public key over the message
+  // `domain("add") || inbox_public_key`
+  bytes hub_signature = 4;
+  // The signature of the inbox public key over the message
+  // `domain("add") || hub_public_key`
+  bytes inbox_signature = 5;
+}
+
+message HubDeleteInboxMessage {
+  // The address of the hub
+  bytes address = 1;
+  // The inbox public key to associate
+  bytes inbox_public_key = 2;
+  // The hub public key to associate
+  bytes hub_public_key = 3;
+  // The signature of the hub public key over the message
+  // `domain("delete") || inbox_public_key`
+  bytes hub_signature = 4;
+  // The signature of the inbox public key over the message
+  // `domain("delete") || hub_public_key`
+  bytes inbox_signature = 5;
+}
+
+// InboxMessageRequest is used to request specific messages
+message InboxMessageRequest {
+  // The 3-byte filter for message routing
+  bytes filter = 1;
+  // Optional: specific message ID to retrieve
+  bytes message_id = 2;
+  // Optional: address to filter messages by
+  bytes address = 3;
+  // Optional: retrieve messages after this timestamp
+  uint64 from_timestamp = 4;
+  // Optional: retrieve messages before this timestamp
+  uint64 to_timestamp = 5;
+}
+
+// InboxMessageResponse contains requested messages
+message InboxMessageResponse {
+  // List of messages matching the request criteria
+  repeated InboxMessage messages = 1;
+}
+
+// InboxMessagePut is used to store a new message
+message InboxMessagePut {
+  // The message to store
+  InboxMessage message = 1;
+}
+
+// HubRequest is used to retrieve hub information
+message HubRequest {
+  // The 3-byte filter for the hub
+  bytes filter = 1;
+  // The hub address to retrieve
+  bytes hub_address = 2;
+}
+
+// HubResponse is used to return hub information
+message HubResponse {
+  // The inbox addresses associated with a hub
+  repeated HubAddInboxMessage adds = 1;
+  // The inbox addresses no longer associated with a hub
+  repeated HubDeleteInboxMessage deletes = 2;
+}
+
+// HubPut is used to create or update a hub
+message HubPut {
+  // The addition of an inbox address association
+  HubAddInboxMessage add = 1;
+  // The deletion of an inbox address association
+  HubDeleteInboxMessage delete = 2;
+}
+
+// DispatchSyncRequest is used to request synchronization of dispatch data
+message DispatchSyncRequest {
+  // The filters this peer is interested in (3 bytes each)
+  repeated bytes filters = 1;
+}
+
+// DispatchSyncResponse contains synchronized data
+message DispatchSyncResponse {
+  // Messages matching the requested filters
+  repeated InboxMessage messages = 1;
+  // Hub information for the requested filters
+  repeated HubResponse hubs = 2;
+}

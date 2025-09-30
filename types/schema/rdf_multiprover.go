@@ -244,6 +244,10 @@ func (m *RDFMultiprover) VerifyWithType(
 	commits := make([][]byte, 0, len(fields)+1)
 	evaluations := make([][]byte, 0, len(fields)+1)
 
+	// Determine the maximum order value to select appropriate polynomial size
+	maxOrder := GetMaxOrderForDocument(tagsByClass)
+	polySize := GetPolySizeForMaxOrder(maxOrder)
+
 	for i, field := range fields {
 		var tag *RDFTag
 		var found bool
@@ -291,7 +295,7 @@ func (m *RDFMultiprover) VerifyWithType(
 			h.Write(keys[i])
 		} else {
 			// Use flexible order encoding
-			key, err := OrderToKey(tag.Order)
+			key, err := OrderToKey(tag.Order, maxOrder)
 			if err != nil {
 				return false, errors.Wrap(err, "verify")
 			}
@@ -324,10 +328,6 @@ func (m *RDFMultiprover) VerifyWithType(
 	if err := mp.FromBytes(proof); err != nil {
 		return false, errors.Wrap(err, "verify")
 	}
-
-	// Determine the maximum order value to select appropriate polynomial size
-	maxOrder := GetMaxOrderForDocument(tagsByClass)
-	polySize := GetPolySizeForMaxOrder(maxOrder)
 
 	// Verify multiproof
 	valid := m.inclusionProver.VerifyMultiple(
@@ -386,8 +386,11 @@ func (m *RDFMultiprover) Get(
 		)
 	}
 
+	// Determine the maximum order value to select appropriate polynomial size
+	maxOrder := GetMaxOrderForDocument(tagsByClass)
+
 	// Get value from tree using flexible order encoding
-	key, err := OrderToKey(tag.Order)
+	key, err := OrderToKey(tag.Order, maxOrder)
 	if err != nil {
 		return nil, errors.Wrap(err, "get")
 	}
@@ -411,23 +414,28 @@ func (m *RDFMultiprover) GetFieldOrder(
 	document string,
 	rdfClass string,
 	field string,
-) (int, error) {
+) (int, int, error) {
 	tagsByClass, err := m.getOrParseDocument(document)
 	if err != nil {
-		return -1, errors.Wrap(err, "get field order")
+		return -1, -1, errors.Wrap(err, "get field order")
 	}
 
 	classTags, ok := tagsByClass[rdfClass]
 	if !ok {
-		return -1, errors.Errorf("class %s not found in RDF schema", rdfClass)
+		return -1, -1, errors.Errorf("class %s not found in RDF schema", rdfClass)
 	}
 
 	tag, ok := classTags[field]
 	if !ok {
-		return -1, errors.Errorf("field %s not found in class %s", field, rdfClass)
+		return -1, -1, errors.Errorf(
+			"field %s not found in class %s", field, rdfClass,
+		)
 	}
 
-	return tag.Order, nil
+	// Determine the maximum order value to select appropriate polynomial size
+	maxOrder := GetMaxOrderForDocument(tagsByClass)
+
+	return tag.Order, maxOrder, nil
 }
 
 // GetFieldKey returns the key bytes for a specific field using flexible
@@ -437,12 +445,12 @@ func (m *RDFMultiprover) GetFieldKey(
 	rdfClass string,
 	field string,
 ) ([]byte, error) {
-	order, err := m.GetFieldOrder(document, rdfClass, field)
+	order, maxOrder, err := m.GetFieldOrder(document, rdfClass, field)
 	if err != nil {
 		return nil, err
 	}
 
-	return OrderToKey(order)
+	return OrderToKey(order, maxOrder)
 }
 
 // Set stores a field value in the tree using RDF ordering
@@ -514,8 +522,11 @@ func (m *RDFMultiprover) Set(
 		)
 	}
 
+	// Determine the maximum order value to select appropriate polynomial size
+	maxOrder := GetMaxOrderForDocument(tagsByClass)
+
 	// Set value in tree using flexible order encoding
-	key, err := OrderToKey(tag.Order)
+	key, err := OrderToKey(tag.Order, maxOrder)
 	if err != nil {
 		return errors.Wrap(err, "set")
 	}
@@ -571,9 +582,12 @@ func (m *RDFMultiprover) ValidateWithOptions(
 	expectedIndexes := make(map[string]struct{})
 	fieldsByKey := make(map[string]*RDFTag)
 
+	// Determine the maximum order value to select appropriate polynomial size
+	maxOrder := GetMaxOrderForDocument(tagsByClass)
+
 	for _, classTags := range tagsByClass {
 		for _, tag := range classTags {
-			key, err := OrderToKey(tag.Order)
+			key, err := OrderToKey(tag.Order, maxOrder)
 			if err != nil {
 				return false, errors.Wrap(err, "validate")
 			}

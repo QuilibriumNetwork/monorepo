@@ -14,7 +14,7 @@ type ProcessMessageResult struct {
 
 type ShardExecutionEngine interface {
 	GetName() string
-	Start(chan struct{}) <-chan error
+	Start() <-chan error
 	Stop(force bool) <-chan error
 	ValidateMessage(frameNumber uint64, address []byte, message []byte) error
 	ProcessMessage(
@@ -24,5 +24,11 @@ type ShardExecutionEngine interface {
 		message []byte,
 		state state.State,
 	) (*ProcessMessageResult, error)
+	Prove(
+		domain []byte,
+		frameNumber uint64,
+		message []byte,
+	) (*protobufs.MessageRequest, error)
+	GetCost(message []byte) (*big.Int, error)
 	GetCapabilities() []*protobufs.Capability
 }

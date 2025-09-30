@@ -10,7 +10,6 @@ package ot
 
 import (
 	"encoding/binary"
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -73,7 +72,6 @@ func (f *Ferret) Send(wires []Wire) error {
 		return err
 	}
 	go func() {
-		fmt.Println(" - Starting FERRET OT Sender")
 		alice, err := ferret.NewFerretOT(
 			1,
 			addr,
@@ -88,11 +86,8 @@ func (f *Ferret) Send(wires []Wire) error {
 			return
 		}
 
-		fmt.Println(" - Performing FERRET cOT for wires len =", wiresCnt)
 		alice.SendCOT()
-		fmt.Println(" - Performing FERRET ROT for wires len =", wiresCnt)
 		alice.SendROT()
-		fmt.Println(" - Completed FERRET OT")
 
 		// Transfer the random values to wire labels
 		for i := 0; i < wiresCnt; i++ {
@@ -143,18 +138,14 @@ func (f *Ferret) Receive(flags []bool, result []Label) error {
 	}
 
 	go func() {
-		fmt.Println(" - Starting FERRET OT Receiver")
 		bob, err := ferret.NewFerretOT(2, addr, int(port), 1, uint64(flagsCnt), flags, true)
 		if err != nil {
 			errch <- errors.Wrap(err, "receive")
 			return
 		}
-		fmt.Println(" - Performing FERRET cOT for inputs len =", flagsCnt)
 
 		bob.RecvCOT()
-		fmt.Println(" - Performing FERRET ROT for inputs len =", flagsCnt)
 		bob.RecvROT()
-		fmt.Println(" - Completed FERRET OT")
 
 		for i := 0; i < flagsCnt; i++ {
 			data := bob.ReceiverGetBlockData(uint64(i))

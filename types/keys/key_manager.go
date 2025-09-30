@@ -34,6 +34,25 @@ type KeyManager interface {
 	)
 }
 
+type KeyRing interface {
+	GetSigningKey(
+		id string,
+		keyType crypto.KeyType,
+	) (crypto.Signer, error)
+	GetAgreementKey(
+		reference string,
+		address []byte,
+		keyType crypto.KeyType,
+	) (crypto.Agreement, error)
+	ValidateSignature(
+		keyType crypto.KeyType,
+		publicKey []byte,
+		message []byte,
+		signature []byte,
+		domain []byte,
+	) (bool, error)
+}
+
 type ByteString []byte
 
 func (b ByteString) MarshalText() ([]byte, error) {

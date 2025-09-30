@@ -2,65 +2,86 @@ package store
 
 import (
 	"encoding/binary"
+	"math/big"
+	"slices"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
-	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
-type KeyStore interface {
-	NewTransaction() (Transaction, error)
-	StageProvingKey(provingKey *protobufs.ProvingKeyAnnouncement) error
-	IncludeProvingKey(
-		inclusionCommitment *protobufs.InclusionCommitment,
-		txn Transaction,
-	) error
-	GetStagedProvingKey(
-		provingKey []byte,
-	) (*protobufs.ProvingKeyAnnouncement, error)
-	GetProvingKey(provingKey []byte) (*protobufs.InclusionCommitment, error)
-	GetKeyBundle(
-		provingKey []byte,
-		frameNumber uint64,
-	) (*protobufs.InclusionCommitment, error)
-	GetLatestKeyBundle(provingKey []byte) (*protobufs.InclusionCommitment, error)
-	PutKeyBundle(
-		provingKey []byte,
-		keyBundleCommitment *protobufs.InclusionCommitment,
-		txn Transaction,
-	) error
-	RangeProvingKeys() (*PebbleProvingKeyIterator, error)
-	RangeStagedProvingKeys() (*PebbleStagedProvingKeyIterator, error)
-	RangeKeyBundleKeys(provingKey []byte) (*PebbleKeyBundleIterator, error)
-}
-
 type PebbleKeyStore struct {
-	db     KVDB
+	db     store.KVDB
 	logger *zap.Logger
 }
 
+type PebbleIdentityKeyIterator struct {
+	i store.Iterator
+}
+
 type PebbleProvingKeyIterator struct {
-	i Iterator
+	i store.Iterator
 }
 
-type PebbleStagedProvingKeyIterator struct {
-	i Iterator
+type PebbleSignedKeyIterator struct {
+	i  store.Iterator
+	db *PebbleKeyStore
 }
 
-type PebbleKeyBundleIterator struct {
-	i Iterator
+var _ store.TypedIterator[*protobufs.Ed448PublicKey] = (*PebbleIdentityKeyIterator)(nil)
+var _ store.TypedIterator[*protobufs.BLS48581SignatureWithProofOfPossession] = (*PebbleProvingKeyIterator)(nil)
+var _ store.TypedIterator[*protobufs.SignedX448Key] = (*PebbleSignedKeyIterator)(nil)
+var _ store.KeyStore = (*PebbleKeyStore)(nil)
+
+// Identity key iterator methods
+func (p *PebbleIdentityKeyIterator) First() bool {
+	return p.i.First()
 }
 
-var pki = (*PebbleProvingKeyIterator)(nil)
-var spki = (*PebbleStagedProvingKeyIterator)(nil)
-var kbi = (*PebbleKeyBundleIterator)(nil)
-var _ TypedIterator[*protobufs.InclusionCommitment] = pki
-var _ TypedIterator[*protobufs.ProvingKeyAnnouncement] = spki
-var _ TypedIterator[*protobufs.InclusionCommitment] = kbi
-var _ KeyStore = (*PebbleKeyStore)(nil)
+func (p *PebbleIdentityKeyIterator) Next() bool {
+	return p.i.Next()
+}
 
+func (p *PebbleIdentityKeyIterator) Valid() bool {
+	return p.i.Valid()
+}
+
+func (p *PebbleIdentityKeyIterator) Value() (
+	*protobufs.Ed448PublicKey,
+	error,
+) {
+	if !p.i.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	value := p.i.Value()
+	key := &protobufs.Ed448PublicKey{}
+	if err := proto.Unmarshal(value, key); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"get identity key iterator value",
+		)
+	}
+
+	return key, nil
+}
+
+func (p *PebbleIdentityKeyIterator) TruncatedValue() (
+	*protobufs.Ed448PublicKey,
+	error,
+) {
+	return p.Value()
+}
+
+func (p *PebbleIdentityKeyIterator) Close() error {
+	return errors.Wrap(p.i.Close(), "closing iterator")
+}
+
+// Proving key iterator methods
 func (p *PebbleProvingKeyIterator) First() bool {
 	return p.i.First()
 }
@@ -74,401 +95,309 @@ func (p *PebbleProvingKeyIterator) Valid() bool {
 }
 
 func (p *PebbleProvingKeyIterator) Value() (
-	*protobufs.InclusionCommitment,
+	*protobufs.BLS48581SignatureWithProofOfPossession,
 	error,
 ) {
 	if !p.i.Valid() {
-		return nil, ErrNotFound
+		return nil, store.ErrNotFound
 	}
 
 	value := p.i.Value()
-	frame := &protobufs.InclusionCommitment{}
-	if err := proto.Unmarshal(value, frame); err != nil {
+	sig := &protobufs.BLS48581SignatureWithProofOfPossession{}
+	if err := proto.Unmarshal(value, sig); err != nil {
 		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
+			errors.Wrap(err, store.ErrInvalidData.Error()),
 			"get proving key iterator value",
 		)
 	}
 
-	return frame, nil
+	return sig, nil
+}
+
+func (p *PebbleProvingKeyIterator) TruncatedValue() (
+	*protobufs.BLS48581SignatureWithProofOfPossession,
+	error,
+) {
+	return p.Value()
 }
 
 func (p *PebbleProvingKeyIterator) Close() error {
 	return errors.Wrap(p.i.Close(), "closing iterator")
 }
 
-func (p *PebbleStagedProvingKeyIterator) First() bool {
+// Signed key iterator methods
+func (p *PebbleSignedKeyIterator) First() bool {
 	return p.i.First()
 }
 
-func (p *PebbleStagedProvingKeyIterator) Next() bool {
+func (p *PebbleSignedKeyIterator) Next() bool {
 	return p.i.Next()
 }
 
-func (p *PebbleStagedProvingKeyIterator) Valid() bool {
+func (p *PebbleSignedKeyIterator) Valid() bool {
 	return p.i.Valid()
 }
 
-func (p *PebbleStagedProvingKeyIterator) Value() (
-	*protobufs.ProvingKeyAnnouncement,
+func (p *PebbleSignedKeyIterator) Value() (
+	*protobufs.SignedX448Key,
 	error,
 ) {
 	if !p.i.Valid() {
-		return nil, ErrNotFound
+		return nil, store.ErrNotFound
 	}
 
-	value := p.i.Value()
-	frame := &protobufs.ProvingKeyAnnouncement{}
-	if err := proto.Unmarshal(value, frame); err != nil {
+	key := p.i.Key()[len(p.i.Key())-32:]
+
+	signedKey, err := p.db.GetSignedKey(key)
+	if err != nil {
 		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get staged proving key iterator value",
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"get signed key iterator value",
 		)
 	}
 
-	return frame, nil
+	return signedKey, nil
 }
 
-func (p *PebbleStagedProvingKeyIterator) Close() error {
-	return errors.Wrap(p.i.Close(), "closing iterator")
-}
-
-func (p *PebbleKeyBundleIterator) First() bool {
-	return p.i.First()
-}
-
-func (p *PebbleKeyBundleIterator) Next() bool {
-	return p.i.Next()
-}
-
-func (p *PebbleKeyBundleIterator) Valid() bool {
-	return p.i.Valid()
-}
-
-func (p *PebbleKeyBundleIterator) Value() (
-	*protobufs.InclusionCommitment,
+func (p *PebbleSignedKeyIterator) TruncatedValue() (
+	*protobufs.SignedX448Key,
 	error,
 ) {
-	if !p.i.Valid() {
-		return nil, ErrNotFound
-	}
-
-	value := p.i.Value()
-	frame := &protobufs.InclusionCommitment{}
-	if err := proto.Unmarshal(value, frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get key bundle iterator value",
-		)
-	}
-
-	return frame, nil
+	return p.Value()
 }
 
-func (p *PebbleKeyBundleIterator) Close() error {
+func (p *PebbleSignedKeyIterator) Close() error {
 	return errors.Wrap(p.i.Close(), "closing iterator")
 }
 
-func NewPebbleKeyStore(db KVDB, logger *zap.Logger) *PebbleKeyStore {
+func NewPebbleKeyStore(db store.KVDB, logger *zap.Logger) *PebbleKeyStore {
 	return &PebbleKeyStore{
 		db,
 		logger,
 	}
 }
 
-const (
-	PROVING_KEY               = 0x01
-	PROVING_KEY_STAGED        = 0x02
-	KEY_BUNDLE                = 0x03
-	KEY_DATA                  = 0x00
-	KEY_BUNDLE_INDEX_EARLIEST = 0x10
-	KEY_BUNDLE_INDEX_LATEST   = 0x20
-)
+func identityKeyKey(identityKey []byte) []byte {
+	key := []byte{KEY_BUNDLE, KEY_IDENTITY}
+	key = append(key, identityKey...)
+	return key
+}
 
 func provingKeyKey(provingKey []byte) []byte {
-	key := []byte{PROVING_KEY, KEY_DATA}
+	key := []byte{KEY_BUNDLE, KEY_PROVING}
 	key = append(key, provingKey...)
 	return key
 }
 
-func stagedProvingKeyKey(provingKey []byte) []byte {
-	key := []byte{PROVING_KEY_STAGED, KEY_DATA}
-	key = append(key, provingKey...)
+func crossSignatureKey(
+	signingAddress []byte,
+) []byte {
+	key := []byte{KEY_BUNDLE, KEY_CROSS_SIGNATURE}
+	key = append(key, signingAddress...)
 	return key
 }
 
-func keyBundleKey(provingKey []byte, frameNumber uint64) []byte {
-	key := []byte{KEY_BUNDLE, KEY_DATA}
-	key = append(key, provingKey...)
-	key = binary.BigEndian.AppendUint64(key, frameNumber)
+func signedKeyKey(address []byte) []byte {
+	key := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_ID}
+	key = append(key, address...)
 	return key
 }
 
-func keyBundleLatestKey(provingKey []byte) []byte {
-	key := []byte{KEY_BUNDLE, KEY_BUNDLE_INDEX_LATEST}
-	key = append(key, provingKey...)
+func signedKeyByParentKey(
+	parentKeyAddress []byte,
+	keyPurpose string,
+	keyAddress []byte,
+) []byte {
+	purpose := make([]byte, 8)
+	copy(purpose[:len(keyPurpose)], []byte(keyPurpose))
+
+	key := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+	key = append(key, parentKeyAddress...)
+	key = append(key, purpose...)
+	key = append(key, keyAddress...)
 	return key
 }
 
-func keyBundleEarliestKey(provingKey []byte) []byte {
-	key := []byte{KEY_BUNDLE, KEY_BUNDLE_INDEX_EARLIEST}
-	key = append(key, provingKey...)
+func signedKeyByPurposeKey(keyPurpose string, keyAddress []byte) []byte {
+	purpose := make([]byte, 8)
+	copy(purpose[:len(keyPurpose)], []byte(keyPurpose))
+
+	key := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PURPOSE}
+	key = append(key, purpose...)
+	key = append(key, keyAddress...)
 	return key
 }
 
-func (p *PebbleKeyStore) NewTransaction() (Transaction, error) {
+func signedKeyExpiryKey(expiresAt uint64, keyAddress []byte) []byte {
+	key := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_EXPIRY}
+	key = binary.BigEndian.AppendUint64(key, expiresAt)
+	key = append(key, keyAddress...)
+	return key
+}
+
+func (p *PebbleKeyStore) NewTransaction() (store.Transaction, error) {
 	return p.db.NewBatch(false), nil
 }
 
-// Stages a proving key for later inclusion on proof of meaningful work.
-// Does not verify, upstream callers must verify.
-func (p *PebbleKeyStore) StageProvingKey(
-	provingKey *protobufs.ProvingKeyAnnouncement,
+// PutIdentityKey stores an identity key
+func (p *PebbleKeyStore) PutIdentityKey(
+	txn store.Transaction,
+	address []byte,
+	identityKey *protobufs.Ed448PublicKey,
+) error {
+	data, err := proto.Marshal(identityKey)
+	if err != nil {
+		return errors.Wrap(err, "put identity key")
+	}
+
+	if err := txn.Set(identityKeyKey(address), data); err != nil {
+		return errors.Wrap(err, "put identity key")
+	}
+
+	return nil
+}
+
+// GetIdentityKey retrieves an identity key by address
+func (p *PebbleKeyStore) GetIdentityKey(address []byte) (
+	*protobufs.Ed448PublicKey,
+	error,
+) {
+	value, closer, err := p.db.Get(identityKeyKey(address))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get identity key")
+	}
+	defer closer.Close()
+
+	key := &protobufs.Ed448PublicKey{}
+	if err := proto.Unmarshal(value, key); err != nil {
+		return nil, errors.Wrap(err, "get identity key")
+	}
+
+	return key, nil
+}
+
+// PutProvingKey stores a proving key with proof of possession
+func (p *PebbleKeyStore) PutProvingKey(
+	txn store.Transaction,
+	address []byte,
+	provingKey *protobufs.BLS48581SignatureWithProofOfPossession,
 ) error {
 	data, err := proto.Marshal(provingKey)
 	if err != nil {
-		return errors.Wrap(err, "stage proving key")
+		return errors.Wrap(err, "put proving key")
 	}
 
-	err = p.db.Set(
-		stagedProvingKeyKey(provingKey.PublicKey()),
-		data,
-	)
-	if err != nil {
-		return errors.Wrap(err, "stage proving key")
+	if err := txn.Set(provingKeyKey(address), data); err != nil {
+		return errors.Wrap(err, "put proving key")
 	}
 
 	return nil
 }
 
-// Includes a proving key with an inclusion commitment. If a proving key is
-// staged, promotes it by including it in the primary key store and deletes the
-// staged key.
-func (p *PebbleKeyStore) IncludeProvingKey(
-	inclusionCommitment *protobufs.InclusionCommitment,
-	txn Transaction,
-) error {
-	provingKey := &protobufs.ProvingKeyAnnouncement{}
-	if err := proto.Unmarshal(inclusionCommitment.Data, provingKey); err != nil {
-		return errors.Wrap(err, "include proving key")
-	}
-
-	if err := provingKey.Verify(); err != nil {
-		return errors.Wrap(err, "include proving key")
-	}
-
-	data, err := proto.Marshal(inclusionCommitment)
-	if err != nil {
-		return errors.Wrap(err, "include proving key")
-	}
-
-	txn.Set(
-		provingKeyKey(provingKey.PublicKey()),
-		data,
-	)
-
-	staged, closer, err := p.db.Get(stagedProvingKeyKey(provingKey.PublicKey()))
-	if err != nil && !errors.Is(err, ErrNotFound) {
-		return errors.Wrap(err, "include proving key")
-	} else if err == nil {
-		defer closer.Close()
-	}
-
-	if staged != nil {
-		if err := txn.Delete(
-			stagedProvingKeyKey(provingKey.PublicKey()),
-		); err != nil {
-			return errors.Wrap(err, "include proving key")
-		}
-	}
-
-	return nil
-}
-
-func (p *PebbleKeyStore) GetStagedProvingKey(
-	provingKey []byte,
-) (*protobufs.ProvingKeyAnnouncement, error) {
-	data, closer, err := p.db.Get(stagedProvingKeyKey(provingKey))
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
-		}
-
-		return nil, errors.Wrap(err, "get staged proving key")
-	}
-	defer closer.Close()
-
-	stagedKey := &protobufs.ProvingKeyAnnouncement{}
-	if err = proto.Unmarshal(data, stagedKey); err != nil {
-		return nil, errors.Wrap(err, "get staged proving key")
-	}
-
-	return stagedKey, nil
-}
-
-// Returns the latest key bundle for a given proving key.
-func (p *PebbleKeyStore) GetLatestKeyBundle(
-	provingKey []byte,
-) (*protobufs.InclusionCommitment, error) {
-	value, closer, err := p.db.Get(keyBundleLatestKey(provingKey))
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
-		}
-
-		return nil, errors.Wrap(err, "get latest key bundle")
-	}
-	defer closer.Close()
-	frameNumber := binary.BigEndian.Uint64(value)
-
-	value, closer, err = p.db.Get(keyBundleKey(provingKey, frameNumber))
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
-		}
-
-		return nil, errors.Wrap(err, "get latest key bundle")
-	}
-	defer closer.Close()
-
-	announcement := &protobufs.InclusionCommitment{}
-	if err := proto.Unmarshal(value, announcement); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get latest key bundle",
-		)
-	}
-
-	return announcement, nil
-}
-
-// Retrieves the specific key bundle included at a given frame number.
-func (p *PebbleKeyStore) GetKeyBundle(
-	provingKey []byte,
-	frameNumber uint64,
-) (*protobufs.InclusionCommitment, error) {
-	value, closer, err := p.db.Get(keyBundleKey(provingKey, frameNumber))
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
-		}
-
-		return nil, errors.Wrap(err, "get key bundle")
-	}
-
-	defer closer.Close()
-
-	announcement := &protobufs.InclusionCommitment{}
-	if err := proto.Unmarshal(value, announcement); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get key bundle",
-		)
-	}
-
-	return announcement, nil
-}
-
-// Retrieves an included proving key, returns ErrNotFound if not present.
+// GetProvingKey retrieves a proving key by address
 func (p *PebbleKeyStore) GetProvingKey(
-	provingKey []byte,
-) (*protobufs.InclusionCommitment, error) {
-	value, closer, err := p.db.Get(provingKeyKey(provingKey))
+	address []byte,
+) (*protobufs.BLS48581SignatureWithProofOfPossession, error) {
+	value, closer, err := p.db.Get(provingKeyKey(address))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
+			return nil, store.ErrNotFound
 		}
+		return nil, errors.Wrap(err, "get proving key")
+	}
+	defer closer.Close()
 
+	sig := &protobufs.BLS48581SignatureWithProofOfPossession{}
+	if err := proto.Unmarshal(value, sig); err != nil {
 		return nil, errors.Wrap(err, "get proving key")
 	}
 
-	defer closer.Close()
-
-	announcement := &protobufs.InclusionCommitment{}
-	if err := proto.Unmarshal(value, announcement); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"get proving key",
-		)
-	}
-
-	return announcement, nil
+	return sig, nil
 }
 
-// Inserts a key bundle with inclusion commitment. Does not verify, upstream
-// callers must perform the verification.
-func (p *PebbleKeyStore) PutKeyBundle(
-	provingKey []byte,
-	keyBundle *protobufs.InclusionCommitment,
-	txn Transaction,
+// PutCrossSignature stores the cross signatures between identity and proving
+// keys
+func (p *PebbleKeyStore) PutCrossSignature(
+	txn store.Transaction,
+	identityKeyAddress []byte,
+	provingKeyAddress []byte,
+	identityKeySignatureOfProvingKey []byte,
+	provingKeySignatureOfIdentityKey []byte,
 ) error {
-	data, err := proto.Marshal(keyBundle)
-	if err != nil {
-		return errors.Wrap(
-			errors.Wrap(err, ErrInvalidData.Error()),
-			"put key bundle",
-		)
-	}
-
-	frameNumberBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(frameNumberBytes, keyBundle.FrameNumber)
-
-	if err = txn.Set(
-		keyBundleKey(provingKey, keyBundle.FrameNumber),
-		data,
+	// Store identity to prover signature
+	if err := txn.Set(
+		crossSignatureKey(identityKeyAddress),
+		slices.Concat(provingKeyAddress, identityKeySignatureOfProvingKey),
 	); err != nil {
-		return errors.Wrap(err, "put key bundle")
+		return errors.Wrap(err, "put cross signature")
 	}
 
-	_, closer, err := p.db.Get(keyBundleEarliestKey(provingKey))
-	if err != nil {
-		if !errors.Is(err, pebble.ErrNotFound) {
-			return errors.Wrap(err, "put key bundle")
-		}
-
-		if err = txn.Set(
-			keyBundleEarliestKey(provingKey),
-			frameNumberBytes,
-		); err != nil {
-			return errors.Wrap(err, "put key bundle")
-		}
-	} else {
-		_ = closer.Close()
-	}
-
-	if err = txn.Set(
-		keyBundleLatestKey(provingKey),
-		frameNumberBytes,
+	// Store prover to identity signature
+	if err := txn.Set(
+		crossSignatureKey(provingKeyAddress),
+		slices.Concat(identityKeyAddress, provingKeySignatureOfIdentityKey),
 	); err != nil {
-		return errors.Wrap(err, "put key bundle")
+		return errors.Wrap(err, "put cross signature")
 	}
 
 	return nil
 }
 
-func (p *PebbleKeyStore) RangeProvingKeys() (*PebbleProvingKeyIterator, error) {
-	iter, err := p.db.NewIter(
-		provingKeyKey([]byte{
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00,
-		}),
-		provingKeyKey([]byte{
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff,
-		}),
-	)
+// GetCrossSignatureByIdentityKey retrieves the cross signature for an identity
+// key
+func (p *PebbleKeyStore) GetCrossSignatureByIdentityKey(
+	identityKeyAddress []byte,
+) ([]byte, error) {
+	prefix := crossSignatureKey(identityKeyAddress)
+	value, closer, err := p.db.Get(prefix)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+
+		return nil, errors.Wrap(err, "get cross signature by identity key")
+	}
+	defer closer.Close()
+
+	payload := make([]byte, len(value))
+	copy(payload, value)
+
+	return payload, nil
+}
+
+// GetCrossSignatureByProvingKey retrieves the cross signature for a proving key
+func (p *PebbleKeyStore) GetCrossSignatureByProvingKey(
+	provingKeyAddress []byte,
+) ([]byte, error) {
+	prefix := crossSignatureKey(provingKeyAddress)
+	value, closer, err := p.db.Get(prefix)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+
+		return nil, errors.Wrap(err, "get cross signature by proving key")
+	}
+	defer closer.Close()
+
+	payload := make([]byte, len(value))
+	copy(payload, value)
+
+	return payload, nil
+}
+
+// RangeProvingKeys returns an iterator over all proving keys
+func (p *PebbleKeyStore) RangeProvingKeys() (
+	store.TypedIterator[*protobufs.BLS48581SignatureWithProofOfPossession],
+	error,
+) {
+	startKey := []byte{KEY_BUNDLE, KEY_PROVING}
+	endKey := []byte{KEY_BUNDLE, KEY_PROVING + 1}
+
+	iter, err := p.db.NewIter(startKey, endKey)
 	if err != nil {
 		return nil, errors.Wrap(err, "range proving keys")
 	}
@@ -476,50 +405,457 @@ func (p *PebbleKeyStore) RangeProvingKeys() (*PebbleProvingKeyIterator, error) {
 	return &PebbleProvingKeyIterator{i: iter}, nil
 }
 
-func (p *PebbleKeyStore) RangeStagedProvingKeys() (
-	*PebbleStagedProvingKeyIterator,
+// RangeIdentityKeys returns an iterator over all identity keys
+func (p *PebbleKeyStore) RangeIdentityKeys() (
+	store.TypedIterator[*protobufs.Ed448PublicKey],
 	error,
 ) {
-	iter, err := p.db.NewIter(
-		stagedProvingKeyKey([]byte{
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00,
-		}),
-		stagedProvingKeyKey([]byte{
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff,
-		}),
-	)
+	startKey := []byte{KEY_BUNDLE, KEY_IDENTITY}
+	endKey := []byte{KEY_BUNDLE, KEY_IDENTITY + 1}
+
+	iter, err := p.db.NewIter(startKey, endKey)
 	if err != nil {
-		return nil, errors.Wrap(err, "range staged proving keys")
+		return nil, errors.Wrap(err, "range identity keys")
 	}
 
-	return &PebbleStagedProvingKeyIterator{i: iter}, nil
+	return &PebbleIdentityKeyIterator{i: iter}, nil
 }
 
-func (p *PebbleKeyStore) RangeKeyBundleKeys(provingKey []byte) (
-	*PebbleKeyBundleIterator,
-	error,
-) {
-	iter, err := p.db.NewIter(
-		keyBundleKey(provingKey, 0),
-		keyBundleKey(provingKey, 0xffffffffffffffff),
-	)
+// PutSignedKey stores a signed X448 key
+func (p *PebbleKeyStore) PutSignedKey(
+	txn store.Transaction,
+	address []byte,
+	key *protobufs.SignedX448Key,
+) error {
+	data, err := proto.Marshal(key)
 	if err != nil {
-		return nil, errors.Wrap(err, "range key bundle keys")
+		return errors.Wrap(err, "put signed key")
 	}
 
-	return &PebbleKeyBundleIterator{i: iter}, nil
+	// Store by address
+	if err := txn.Set(signedKeyKey(address), data); err != nil {
+		return errors.Wrap(err, "put signed key")
+	}
+
+	// Store by parent key index
+	if err := txn.Set(
+		signedKeyByParentKey(key.ParentKeyAddress, key.KeyPurpose, address),
+		[]byte{0x01}, // Just a marker
+	); err != nil {
+		return errors.Wrap(err, "put signed key")
+	}
+
+	// Store by purpose index
+	if err := txn.Set(
+		signedKeyByPurposeKey(key.KeyPurpose, address),
+		[]byte{0x01}, // Just a marker
+	); err != nil {
+		return errors.Wrap(err, "put signed key")
+	}
+
+	// Store by expiry if set
+	if key.ExpiresAt > 0 {
+		if err := txn.Set(
+			signedKeyExpiryKey(key.ExpiresAt, address),
+			[]byte{0x01}, // Just a marker
+		); err != nil {
+			return errors.Wrap(err, "put signed key")
+		}
+	}
+
+	return nil
+}
+
+// GetSignedKey retrieves a signed key by address
+func (p *PebbleKeyStore) GetSignedKey(
+	address []byte,
+) (*protobufs.SignedX448Key, error) {
+	value, closer, err := p.db.Get(signedKeyKey(address))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get signed key")
+	}
+	defer closer.Close()
+
+	key := &protobufs.SignedX448Key{}
+	if err := proto.Unmarshal(value, key); err != nil {
+		return nil, errors.Wrap(err, "get signed key")
+	}
+
+	return key, nil
+}
+
+// GetSignedKeysByParent retrieves all signed keys for a parent key, optionally
+// filtered by purpose
+func (p *PebbleKeyStore) GetSignedKeysByParent(
+	parentKeyAddress []byte,
+	keyPurpose string,
+) ([]*protobufs.SignedX448Key, error) {
+	var prefix []byte
+	if keyPurpose != "" {
+		// Create prefix without keyId to get all keys of this purpose
+		purpose := make([]byte, 8)
+		copy(purpose[:len(keyPurpose)], []byte(keyPurpose))
+
+		prefix = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+		prefix = append(prefix, parentKeyAddress...)
+		prefix = append(prefix, purpose...)
+	} else {
+		prefix = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+		prefix = append(prefix, parentKeyAddress...)
+	}
+
+	endPrefixBI := new(big.Int).SetBytes(prefix)
+	endPrefixBI.Add(endPrefixBI, big.NewInt(1))
+
+	iter, err := p.db.NewIter(prefix, endPrefixBI.Bytes())
+	if err != nil {
+		return nil, errors.Wrap(err, "get signed keys by parent")
+	}
+	defer iter.Close()
+
+	var keys []*protobufs.SignedX448Key
+	for iter.First(); iter.Valid(); iter.Next() {
+		keyAddress := iter.Key()[len(iter.Key())-32:]
+
+		// Get the actual key data
+		keyData, closer, err := p.db.Get(signedKeyKey(keyAddress))
+		if err != nil {
+			continue
+		}
+
+		key := &protobufs.SignedX448Key{}
+		if err := proto.Unmarshal(keyData, key); err != nil {
+			closer.Close()
+			continue
+		}
+		closer.Close()
+
+		keys = append(keys, key)
+	}
+
+	return keys, nil
+}
+
+// DeleteSignedKey removes a signed key
+func (p *PebbleKeyStore) DeleteSignedKey(
+	txn store.Transaction,
+	address []byte,
+) error {
+	// First get the key to extract metadata for index deletion
+	value, closer, err := p.db.Get(signedKeyKey(address))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return store.ErrNotFound
+		}
+		return errors.Wrap(err, "delete signed key")
+	}
+	defer closer.Close()
+
+	key := &protobufs.SignedX448Key{}
+	if err := proto.Unmarshal(value, key); err != nil {
+		return errors.Wrap(err, "delete signed key")
+	}
+
+	// Delete all indexes
+	if err := txn.Delete(signedKeyKey(address)); err != nil {
+		return errors.Wrap(err, "delete signed key")
+	}
+
+	if err := txn.Delete(
+		signedKeyByParentKey(key.ParentKeyAddress, key.KeyPurpose, address),
+	); err != nil {
+		return errors.Wrap(err, "delete signed key")
+	}
+
+	if err := txn.Delete(
+		signedKeyByPurposeKey(key.KeyPurpose, address),
+	); err != nil {
+		return errors.Wrap(err, "delete signed key")
+	}
+
+	if key.ExpiresAt > 0 {
+		if err := txn.Delete(
+			signedKeyExpiryKey(key.ExpiresAt, address),
+		); err != nil {
+			return errors.Wrap(err, "delete signed key")
+		}
+	}
+
+	return nil
+}
+
+// ReapExpiredKeys removes all expired keys
+func (p *PebbleKeyStore) ReapExpiredKeys() error {
+	currentTime := uint64(time.Now().Unix())
+
+	// Iterate through all keys with expiry
+	prefix := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_EXPIRY}
+	endPrefix := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_EXPIRY + 1}
+	iter, err := p.db.NewIter(prefix, endPrefix)
+	if err != nil {
+		return errors.Wrap(err, "reap expired keys")
+	}
+	defer iter.Close()
+
+	txn, err := p.NewTransaction()
+	if err != nil {
+		return errors.Wrap(err, "reap expired keys")
+	}
+
+	deletedCount := 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		indexKey := iter.Key()
+
+		// Extract expiry time
+		if len(indexKey) < len(prefix)+8 {
+			continue
+		}
+		expiryTime := binary.BigEndian.Uint64(indexKey[len(prefix) : len(prefix)+8])
+
+		// If not expired, we can stop (keys are sorted by expiry)
+		if expiryTime > currentTime {
+			break
+		}
+
+		// Extract key address
+		keyAddress := indexKey[len(prefix)+8:]
+
+		// Delete the key
+		if err := p.DeleteSignedKey(txn, keyAddress); err != nil {
+			p.logger.Warn("failed to delete expired key", zap.Error(err))
+			continue
+		}
+
+		deletedCount++
+	}
+
+	if deletedCount > 0 {
+		if err := txn.Commit(); err != nil {
+			return errors.Wrap(err, "reap expired keys")
+		}
+		p.logger.Info("reaped expired keys", zap.Int("count", deletedCount))
+	}
+
+	return nil
+}
+
+// GetKeyRegistry retrieves the complete key registry for an identity key
+// address
+func (p *PebbleKeyStore) GetKeyRegistry(
+	identityKeyAddress []byte,
+) (*protobufs.KeyRegistry, error) {
+	registry := &protobufs.KeyRegistry{
+		KeysByPurpose: make(map[string]*protobufs.KeyCollection),
+	}
+
+	// Get identity key
+	identityKey, err := p.GetIdentityKey(identityKeyAddress)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+
+		return nil, errors.Wrap(err, "get key registry")
+	} else {
+		registry.IdentityKey = identityKey
+	}
+
+	// Find prover key via cross signatures
+	crossSigData, err := p.GetCrossSignatureByIdentityKey(identityKeyAddress)
+	if err == nil && len(crossSigData) > 0 {
+		proverKeyAddress := crossSigData[:32]
+
+		// Get the prover key
+		proverKey, err := p.GetProvingKey(proverKeyAddress)
+		if err == nil {
+			registry.ProverKey = proverKey.PublicKey
+
+			// Get the signatures
+			registry.IdentityToProver = &protobufs.Ed448Signature{
+				Signature: crossSigData[32:],
+			}
+
+			// Get reverse signature
+			proverSigData, err := p.GetCrossSignatureByProvingKey(proverKeyAddress)
+			if err == nil {
+				registry.ProverToIdentity = &protobufs.BLS48581Signature{
+					Signature: proverSigData[32:],
+				}
+			}
+		}
+	}
+
+	// Get all signed keys by parent (identity key)
+	allKeys, err := p.GetSignedKeysByParent(identityKeyAddress, "")
+	if err == nil {
+		// Group by purpose
+		for _, key := range allKeys {
+			if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
+				registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
+					KeyPurpose: key.KeyPurpose,
+					Keys:       []*protobufs.SignedX448Key{},
+				}
+			}
+			registry.KeysByPurpose[key.KeyPurpose].Keys = append(
+				registry.KeysByPurpose[key.KeyPurpose].Keys, key,
+			)
+			if registry.LastUpdated < key.CreatedAt {
+				registry.LastUpdated = key.CreatedAt
+			}
+		}
+	}
+
+	// If we have a prover key, also get keys signed by it
+	if registry.ProverKey != nil && len(crossSigData) > 0 {
+		proverKeyAddress := crossSigData[:32]
+		proverKeys, err := p.GetSignedKeysByParent(proverKeyAddress, "")
+		if err == nil {
+			for _, key := range proverKeys {
+				if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
+					registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
+						KeyPurpose: key.KeyPurpose,
+						Keys:       []*protobufs.SignedX448Key{},
+					}
+				}
+				registry.KeysByPurpose[key.KeyPurpose].Keys = append(
+					registry.KeysByPurpose[key.KeyPurpose].Keys, key,
+				)
+				if registry.LastUpdated < key.CreatedAt {
+					registry.LastUpdated = key.CreatedAt
+				}
+			}
+		}
+	}
+
+	return registry, nil
+}
+
+// GetKeyRegistryByProver retrieves the complete key registry for a prover key
+// address
+func (p *PebbleKeyStore) GetKeyRegistryByProver(
+	proverKeyAddress []byte,
+) (*protobufs.KeyRegistry, error) {
+	registry := &protobufs.KeyRegistry{
+		KeysByPurpose: make(map[string]*protobufs.KeyCollection),
+	}
+
+	// Get identity key
+	provingKey, err := p.GetProvingKey(proverKeyAddress)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+
+		return nil, errors.Wrap(err, "get key registry")
+	} else {
+		registry.ProverKey = provingKey.PublicKey
+	}
+
+	// Find identity key via cross signatures
+	crossSigData, err := p.GetCrossSignatureByProvingKey(proverKeyAddress)
+	if err == nil && len(crossSigData) > 0 {
+		identityKeyAddress := crossSigData[:32]
+
+		// Get the identity key
+		identityKey, err := p.GetIdentityKey(identityKeyAddress)
+		if err == nil {
+			registry.IdentityKey = identityKey
+
+			// Get the signatures
+			registry.IdentityToProver = &protobufs.Ed448Signature{
+				Signature: crossSigData[32:],
+			}
+
+			// Get reverse signature
+			proverSigData, err := p.GetCrossSignatureByProvingKey(proverKeyAddress)
+			if err == nil {
+				registry.ProverToIdentity = &protobufs.BLS48581Signature{
+					Signature: proverSigData[32:],
+				}
+			}
+		}
+	}
+
+	// Get all signed keys by parent (prover key)
+	allKeys, err := p.GetSignedKeysByParent(proverKeyAddress, "")
+	if err == nil {
+		// Group by purpose
+		for _, key := range allKeys {
+			if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
+				registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
+					KeyPurpose: key.KeyPurpose,
+					Keys:       []*protobufs.SignedX448Key{},
+				}
+			}
+			registry.KeysByPurpose[key.KeyPurpose].Keys = append(
+				registry.KeysByPurpose[key.KeyPurpose].Keys, key,
+			)
+			if registry.LastUpdated < key.CreatedAt {
+				registry.LastUpdated = key.CreatedAt
+			}
+		}
+	}
+
+	// If we have a prover key, also get keys signed by it
+	if registry.ProverKey != nil && len(crossSigData) > 0 {
+		proverKeyAddress := crossSigData[:32]
+		proverKeys, err := p.GetSignedKeysByParent(proverKeyAddress, "")
+		if err == nil {
+			for _, key := range proverKeys {
+				if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
+					registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
+						KeyPurpose: key.KeyPurpose,
+						Keys:       []*protobufs.SignedX448Key{},
+					}
+				}
+				registry.KeysByPurpose[key.KeyPurpose].Keys = append(
+					registry.KeysByPurpose[key.KeyPurpose].Keys, key,
+				)
+				if registry.LastUpdated < key.CreatedAt {
+					registry.LastUpdated = key.CreatedAt
+				}
+			}
+		}
+	}
+
+	return registry, nil
+}
+
+// RangeSignedKeys returns an iterator over signed keys, optionally filtered
+func (p *PebbleKeyStore) RangeSignedKeys(
+	parentKeyAddress []byte,
+	keyPurpose string,
+) (store.TypedIterator[*protobufs.SignedX448Key], error) {
+	var startKey, endKey []byte
+
+	if parentKeyAddress != nil && keyPurpose != "" {
+		// Range for specific parent and purpose
+		startKey = signedKeyByParentKey(parentKeyAddress, keyPurpose, []byte{0x00})
+		endKey = signedKeyByParentKey(parentKeyAddress, keyPurpose, []byte{0xff})
+	} else if parentKeyAddress != nil {
+		// Range for specific parent, all purposes
+		startKey = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+		startKey = append(startKey, parentKeyAddress...)
+		endKey = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+		endKey = append(endKey, parentKeyAddress...)
+		endKey = append(endKey, 0xff)
+	} else if keyPurpose != "" {
+		// Range for specific purpose, all parents
+		startKey = signedKeyByPurposeKey(keyPurpose, []byte{0x00})
+		endKey = signedKeyByPurposeKey(keyPurpose, []byte{0xff})
+	} else {
+		// Range all signed keys
+		startKey = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_ID}
+		endKey = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_ID + 1}
+	}
+
+	iter, err := p.db.NewIter(startKey, endKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "range signed keys")
+	}
+
+	return &PebbleSignedKeyIterator{i: iter, db: p}, nil
 }

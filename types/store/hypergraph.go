@@ -1,6 +1,7 @@
 package store
 
 import (
+	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
@@ -19,7 +20,10 @@ type HypergraphStore interface {
 	GetVertexDataIterator(
 		prefix tries.ShardKey,
 	) (tries.VertexDataIterator, error)
-	LoadHypergraph() (
+	SetCoveredPrefix(coveredPrefix []int) error
+	LoadHypergraph(
+		authenticationProvider channel.AuthenticationProvider,
+	) (
 		hypergraph.Hypergraph,
 		error,
 	)
@@ -58,6 +62,12 @@ type HypergraphStore interface {
 		key []byte,
 		path []int,
 	) error
+	DeleteUncoveredPrefix(
+		setType string,
+		phaseType string,
+		shardKey tries.ShardKey,
+		prefix []int,
+	) error
 	ReapOldChangesets(
 		txn tries.TreeBackingStoreTransaction,
 		frameNumber uint64,
@@ -87,4 +97,5 @@ type HypergraphStore interface {
 		shardKey tries.ShardKey,
 	) error
 	MarkHypergraphAsComplete()
+	ApplySnapshot(dbPath string) error
 }

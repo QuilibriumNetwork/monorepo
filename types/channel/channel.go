@@ -1,6 +1,13 @@
 package channel
 
-import "source.quilibrium.com/quilibrium/monorepo/protobufs"
+import (
+	"context"
+
+	"github.com/libp2p/go-libp2p/core/peer"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+)
 
 type MessageCiphertext struct {
 	Ciphertext           []byte `json:"ciphertext"`
@@ -42,4 +49,43 @@ type EncryptedChannel interface {
 		ratchetState string,
 		envelope *P2PChannelEnvelope,
 	) (newRatchetState string, message []byte, err error)
+}
+
+// AllowedPeer types
+type AllowedPeerPolicyType int
+
+const (
+	AnyPeer AllowedPeerPolicyType = iota
+	OnlySelfPeer
+	AnyProverPeer
+	OnlyGlobalProverPeer
+	OnlyShardProverPeer
+	OnlyWhitelistedPeers
+)
+
+// AuthenticationProvider describes an interface for identifying auth
+// information from the provided context, creating mTLS credentials, and
+// server interceptor methods
+type AuthenticationProvider interface {
+	Identify(ctx context.Context) (peer.ID, error)
+	CreateServerTLSCredentials() (
+		credentials.TransportCredentials,
+		error,
+	)
+	CreateClientTLSCredentials(expectedPeerId []byte) (
+		credentials.TransportCredentials,
+		error,
+	)
+	UnaryInterceptor(
+		ctx context.Context,
+		req any,
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (any, error)
+	StreamInterceptor(
+		srv any,
+		ss grpc.ServerStream,
+		info *grpc.StreamServerInfo,
+		handler grpc.StreamHandler,
+	) error
 }

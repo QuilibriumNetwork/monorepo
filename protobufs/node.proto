@@ -1,0 +1,220 @@
+syntax = "proto3";
+
+package quilibrium.node.node.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+import "channel.proto";
+import "global.proto";
+import "google/protobuf/wrappers.proto";
+
+message GetPeerInfoRequest {}
+
+message GetNodeInfoRequest {}
+
+message GetWorkerInfoRequest {}
+
+message Reachability {
+  // The filter this reachability information references.
+  bytes filter = 1;
+  // The node's pubsub interface multiaddrs for the given shard.
+  repeated string pubsub_multiaddrs = 2;
+  // The node's streaming interface multiaddrs for the given shard.
+  repeated string stream_multiaddrs = 3;
+}
+
+message PeerInfo {
+  // The node's peer id, derived from ed448 public key.
+  bytes peer_id = 1;
+  // The node's reachability information for given filters.
+  repeated Reachability reachability = 2;
+  // The timestamp the peer info report was generated.
+  int64 timestamp = 3;
+  // The core version string of the node, in semantic versioning:
+  // [byte 0].[byte 1].[byte 2]
+  bytes version = 4;
+  // The patch version of the node
+  bytes patch_version = 5;
+  // The list of supported capabilities.
+  repeated Capability capabilities = 6;
+  // The public key of the node.
+  bytes public_key = 7;
+  // The signature of the node.
+  bytes signature = 8;
+}
+
+message PeerInfoResponse {
+  PeerInfo peer_info = 1;
+}
+
+message NodeInfoResponse {
+  string peer_id = 1;
+  uint64 peer_score = 2;
+  bytes version = 3;
+  bytes peer_seniority = 4;
+  uint32 workers = 5;
+}
+
+message WorkerInfo {
+  uint32 core_id = 1;
+  bytes filter = 2;
+  uint64 available_storage = 3;
+  uint64 total_storage = 4;
+}
+
+message WorkerInfoResponse {
+  repeated WorkerInfo worker_info = 1;
+}
+
+message Capability {
+  // A general protocol identifier as a uint32 – this is expected to rarely
+  // iterate, and should be uniquely identifying both protocol and version.
+  // Pragmatically speaking, this implies that the least significant byte
+  // specifies version (which should iterate most minimally), and the three most
+  // significant bytes should specify protocol. Recipients SHOULD ignore
+  // messages with incompatible protocol identifiers, but also SHOULD warn on
+  // identifiers with versions higher than the supported protocol. A large
+  // number of unsupported protocol messages may indicate spam/some other
+  // attack, whereas a large number of unsupported protocol versions may
+  // indicate an out of date client, respective to which side is the maximum of
+  // the version number.
+  uint32 protocol_identifier = 1;
+  // An optional bundle of information specific to the capability – used for
+  // extensibility in negotiating variations of a protocol – e.g. Triple-Ratchet
+  // but only for certain curve types.
+  bytes additional_metadata = 2;
+}
+
+message InlineKey {
+  bytes ref = 1;
+  bytes key = 2;
+}
+ 
+message KeyRing {
+  repeated InlineKey keys = 1;
+}
+
+// Specifies the delivery method for the transaction's dispatchable outputs.
+// Must match the number of outputs for the given transaction for multiple
+// output transactions (for example, token transfers).
+message DeliveryMethod {
+  // Dictates the method of delivery to be performed, 0 for normal inbox
+  // delivery, 1 for suppressed delivery.
+  uint32 delivery_type = 1;
+  // The inbox or hub address to deliver to.
+  bytes address = 2;
+}
+
+message DeliveryData {
+  repeated quilibrium.node.channel.pb.InboxMessage messages = 1;
+}
+
+// Sends either a message, delivery data, or both
+message SendRequest {
+  // The applicable domain to the messages
+  bytes domain = 1;
+  // The underlying request(s) to send
+  quilibrium.node.global.pb.MessageBundle request = 2;
+  // The authentication token
+  bytes authentication = 3;
+  // Delivery data to send
+  repeated DeliveryData delivery_data = 4;
+}
+
+// The response confirming deliveries
+message SendResponse {
+  repeated DeliveryData delivery_data = 1;
+}
+
+message OriginatedAccountRef {
+  bytes address = 1;
+}
+
+message ImplicitAccount {
+  uint32 implicit_type = 1;
+  bytes address = 2;
+  bytes domain = 3;
+}
+
+message AccountRef {
+  oneof account {
+    OriginatedAccountRef originated_account = 1;
+    ImplicitAccount implicit_account = 2;
+  }
+}
+
+message Coin {
+  bytes amount = 1;
+  bytes intersection = 2;
+  AccountRef owner = 3;
+}
+
+message LegacyCoin {
+  Coin coin = 1;
+  uint64 frame_number = 2;
+  bytes address = 3;
+}
+
+message MaterializedTransaction {
+  bytes address = 1;
+  bytes raw_balance = 2;
+  uint64 frame_number = 3;
+  bytes commitment = 4;
+  bytes one_time_key = 5;
+  bytes verification_key = 6;
+  bytes coin_balance = 7;
+  bytes mask = 8;
+  bytes additional_reference = 9;
+  bytes additional_reference_key = 10;
+}
+
+message MaterializedPendingTransaction {
+  bytes address = 1;
+  bytes raw_balance = 2;
+  uint64 frame_number = 3;
+  bytes commitment = 4;
+  bytes to_one_time_key = 5;
+  bytes refund_one_time_key = 6;
+  bytes to_verification_key = 7;
+  bytes refund_verification_key = 8;
+  bytes to_coin_balance = 9;
+  bytes refund_coin_balance = 10;
+  bytes to_mask = 11;
+  bytes refund_mask = 12;
+  bytes to_additional_reference = 13;
+  bytes to_additional_reference_key = 14;
+  bytes refund_additional_reference = 15;
+  bytes refund_additional_reference_key = 16;
+  uint64 expiration = 17;
+}
+
+message GetTokensByAccountRequest {
+  bytes address = 1;
+  bytes domain = 2;
+}
+
+message GetTokensByAccountResponse {
+  repeated LegacyCoin legacy_coins = 1;
+  repeated MaterializedTransaction transactions = 2;
+  repeated MaterializedPendingTransaction pending_transactions = 3;
+}
+
+service NodeService {
+  rpc GetPeerInfo(GetPeerInfoRequest) returns (PeerInfoResponse);
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
+  rpc GetWorkerInfo(GetWorkerInfoRequest) returns (WorkerInfoResponse);
+  rpc Send(SendRequest) returns (SendResponse);
+  rpc GetTokensByAccount(GetTokensByAccountRequest)
+    returns (GetTokensByAccountResponse);
+}
+
+message RespawnRequest {
+  bytes filter = 1;
+}
+
+message RespawnResponse {
+}
+
+service DataIPCService {
+  rpc Respawn(RespawnRequest) returns (RespawnResponse);
+}

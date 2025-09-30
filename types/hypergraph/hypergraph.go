@@ -4,6 +4,7 @@ import (
 	"math/big"
 
 	"github.com/pkg/errors"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
@@ -28,17 +29,30 @@ var ErrInvalidAtomType = errors.New("invalid atom type for set")
 var ErrInvalidLocation = errors.New("invalid location")
 var ErrRemoved = errors.New("removed")
 
+// HyperStream defines the synchronization stream interface shared by a syncing
+// client and server instance.
+type HyperStream interface {
+	Send(*protobufs.HypergraphComparison) error
+	Recv() (*protobufs.HypergraphComparison, error)
+}
+
 // Hypergraph defines the interface for hypergraph operations. A hypergraph is a
 // higher-dimensional generalization of a graph where edges (hyperedges) can
 // connect any number of vertices or hyperedges themselves.
 type Hypergraph interface {
-	// GetSize returns the current total size of the hypergraph. The size is
-	// calculated as the sum of all added atoms' sizes minus removed atoms.
-	GetSize() *big.Int
+	// GetSize returns the current total size of the hypergraph or at a key. The
+	// size is calculated as the sum of all added atoms' sizes minus removed
+	// atoms.
+	GetSize(shardKey *tries.ShardKey, path []int) *big.Int
 
 	// Commit calculates the hierarchical vector commitments for each shard's
 	// add/remove sets and returns the roots.
-	Commit() [][]byte
+	Commit() map[tries.ShardKey][][]byte
+
+	// SetCoveredPrefix sets a prefix where inserted values are retained. Values
+	// outside of this will be rejected – synchronization will only set neighbor
+	// and ascendant branches.
+	SetCoveredPrefix(prefix []int) error
 
 	// Vertex operations
 
@@ -119,21 +133,9 @@ type Hypergraph interface {
 	// containment and recursive containment through nested hyperedges.
 	Within(a, h Atom) bool
 
-	// Access to sets
-
+	// GetVertexDataIterator exposes an iterator to enumerate all data objects
+	// stored under the given domain
 	GetVertexDataIterator(domain [32]byte) tries.VertexDataIterator
-
-	// GetVertexAdds returns the map of vertex add sets by shard key.
-	GetVertexAdds() map[tries.ShardKey]*IdSet
-
-	// GetVertexRemoves returns the map of vertex remove sets by shard key.
-	GetVertexRemoves() map[tries.ShardKey]*IdSet
-
-	// GetHyperedgeAdds returns the map of hyperedge add sets by shard key.
-	GetHyperedgeAdds() map[tries.ShardKey]*IdSet
-
-	// GetHyperedgeRemoves returns the map of hyperedge remove sets by shard key.
-	GetHyperedgeRemoves() map[tries.ShardKey]*IdSet
 
 	// Import operations
 
@@ -227,6 +229,18 @@ type Hypergraph interface {
 		shardKey tries.ShardKey,
 	) error
 
+	// Synchronization operations
+
+	// Embeds the comparison service
+	protobufs.HypergraphComparisonServiceServer
+
+	// Sync is the client-side initiator for synchronization.
+	Sync(
+		stream protobufs.HypergraphComparisonService_HyperStreamClient,
+		shardKey tries.ShardKey,
+		phaseSet protobufs.HypergraphPhaseSet,
+	) error
+
 	// Transaction and utility operations
 
 	// NewTransaction creates a new transaction for batch operations.
@@ -235,7 +249,7 @@ type Hypergraph interface {
 		error,
 	)
 
-	// GetProver returns the inclusion prover used for triesgraphic operations.
+	// GetProver returns the inclusion prover used for cryptographic operations.
 	GetProver() crypto.InclusionProver
 }
 

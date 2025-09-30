@@ -7,30 +7,21 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 	"github.com/pkg/errors"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
 // shim structs for go-datastore
 type batch struct {
 	b  *transaction
-	db KVDB
+	db store.KVDB
 }
 
 type transaction struct {
-	tx Transaction
+	tx store.Transaction
 }
 
 type PeerstoreDatastore struct {
-	db KVDB
-}
-
-const (
-	PEERSTORE = 0x06
-)
-
-type Peerstore interface {
-	ds.TxnDatastore
-	ds.PersistentDatastore
-	ds.Batching
+	db store.KVDB
 }
 
 var _ ds.Datastore = (*PeerstoreDatastore)(nil)
@@ -39,9 +30,8 @@ var _ ds.Txn = (*transaction)(nil)
 var _ ds.PersistentDatastore = (*PeerstoreDatastore)(nil)
 var _ ds.Batching = (*PeerstoreDatastore)(nil)
 var _ ds.Batch = (*batch)(nil)
-var _ Peerstore = (*PeerstoreDatastore)(nil)
 
-func NewPeerstoreDatastore(db KVDB) (*PeerstoreDatastore, error) {
+func NewPeerstoreDatastore(db store.KVDB) (*PeerstoreDatastore, error) {
 	ds := PeerstoreDatastore{
 		db: db,
 	}
@@ -168,7 +158,6 @@ func (d *PeerstoreDatastore) Query(ctx context.Context, q dsq.Query) (
 	return dsq.NaiveQueryApply(qNaive, r), nil
 }
 
-// TODO: get disk usage of peerstore later
 func (d *PeerstoreDatastore) DiskUsage(ctx context.Context) (uint64, error) {
 	return 0, nil
 }
@@ -243,7 +232,7 @@ func (t *transaction) Has(ctx context.Context, key ds.Key) (
 	err error,
 ) {
 	if _, err := t.Get(ctx, key); err != nil {
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, store.ErrNotFound) {
 			return false, nil
 		}
 

@@ -10,7 +10,8 @@ type peerIDKeyType struct{}
 
 var peerIDKey peerIDKeyType
 
-// PeerIDFromContext returns the peer.ID of the remote peer from the given context.
+// PeerIDFromContext returns the peer.ID of the remote peer from the given
+// context.
 func PeerIDFromContext(ctx context.Context) (peer.ID, bool) {
 	if peerID, ok := ctx.Value(peerIDKey).(peer.ID); ok {
 		return peerID, true

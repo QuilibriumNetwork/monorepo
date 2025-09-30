@@ -7,9 +7,11 @@ use rand::{Rng, RngCore};
 use curve25519_dalek::{edwards::CompressedEdwardsY, scalar::Scalar, EdwardsPoint};
 use subtle::{Choice, ConstantTimeEq, ConstantTimeGreater};
 
-fn usize_to_le_bytes(value: usize) -> [u8; 32] {
+uniffi::include_scaffolding!("lib");
+
+fn u64_to_le_bytes(value: u64) -> [u8; 32] {
     let mut bytes = [0u8; 32];
-    bytes[..std::mem::size_of::<usize>()].copy_from_slice(&value.to_le_bytes());
+    bytes[..std::mem::size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
     bytes
 }
 
@@ -20,8 +22,8 @@ type SecretSharedVector = Vec<Vector>;
 
 pub fn gen_poly_frags(
     secret: &Scalar,
-    total: usize,
-    threshold: usize,
+    total: u64,
+    threshold: u64,
 ) -> Vec<[u8; 32]> {
     let mut coeffs = vec![*secret];
     let mut rng = rand::thread_rng();
@@ -33,15 +35,15 @@ pub fn gen_poly_frags(
         coeffs.push(scalar);
     }
 
-    let mut frags = Vec::with_capacity(total);
+    let mut frags = Vec::with_capacity(total as usize);
 
     for i in 1..=total {
         let mut result = coeffs[0];
-        let i_bytes = usize_to_le_bytes(i);
+        let i_bytes = u64_to_le_bytes(i);
         let mut x = Scalar::from_bytes_mod_order(i_bytes);
 
         for j in 1..threshold {
-            let xi = coeffs[j] * x;
+            let xi = coeffs[j as usize] * x;
             result += xi;
             x *= Scalar::from_bytes_mod_order(i_bytes);
         }
@@ -54,16 +56,16 @@ pub fn gen_poly_frags(
 
 fn shamir_split_matrix(
     matrix: &[Vec<Scalar>],
-    total: usize,
-    threshold: usize,
+    total: u64,
+    threshold: u64,
 ) -> SecretSharedMatrix {
-    let mut shamir_matrix = vec![vec![vec![[0u8; 32]; matrix[0].len()]; matrix.len()]; total];
+    let mut shamir_matrix = vec![vec![vec![[0u8; 32]; matrix[0].len()]; matrix.len()]; total as usize];
 
     for x in 0..matrix.len() {
         for y in 0..matrix[0].len() {
             let frags = gen_poly_frags(&matrix[x][y], total, threshold);
             for i in 0..total {
-                shamir_matrix[i][x][y] = frags[i];
+                shamir_matrix[i as usize][x as usize][y as usize] = frags[i as usize];
             }
         }
     }
@@ -72,11 +74,11 @@ fn shamir_split_matrix(
 }
 
 fn generate_random_vector_shares(
-    length: usize,
-    total: usize,
-    threshold: usize,
+    length: u64,
+    total: u64,
+    threshold: u64,
 ) -> SecretSharedVector {
-    let mut result = vec![vec![[0u8; 32]; length]; total];
+    let mut result = vec![vec![[0u8; 32]; length as usize]; total as usize];
     let mut rng = rand::thread_rng();
 
     for j in 0..length {
@@ -85,7 +87,7 @@ fn generate_random_vector_shares(
         let scalar = Scalar::from_bytes_mod_order(bi_bytes);
         let frags = gen_poly_frags(&scalar, total, threshold);
         for i in 0..total {
-            result[i][j] = frags[i];
+            result[i as usize][j as usize] = frags[i as usize];
         }
     }
 
@@ -94,7 +96,7 @@ fn generate_random_vector_shares(
 
 pub fn interpolate_polynomial_shares(
     shares: &[Scalar],
-    ids: &[usize],
+    ids: &[u64],
 ) -> Scalar {
     let mut reconstructed_sum = Scalar::ZERO;
 
@@ -113,7 +115,7 @@ pub fn interpolate_polynomial_shares(
         }
 
         let coeff = coeff_num * coeff_denom.invert();
-        let reconstructed_frag = coeff * shares[ids[j] - 1];
+        let reconstructed_frag = coeff * shares[(ids[j] - 1) as usize];
         reconstructed_sum += reconstructed_frag;
     }
 
@@ -122,7 +124,7 @@ pub fn interpolate_polynomial_shares(
 
 fn interpolate_polynomial_point_shares(
     shares: &[EdwardsPoint],
-    ids: &[usize],
+    ids: &[u64],
 ) -> EdwardsPoint {
     let mut reconstructed_sum = EdwardsPoint::mul_base(&Scalar::ZERO);
 
@@ -141,7 +143,7 @@ fn interpolate_polynomial_point_shares(
         }
 
         let coeff = coeff_num * coeff_denom.invert();
-        let reconstructed_frag = shares[ids[j] - 1] * coeff;
+        let reconstructed_frag = shares[(ids[j] - 1) as usize] * coeff;
         reconstructed_sum += reconstructed_frag;
     }
 
@@ -239,7 +241,7 @@ fn invert(matrix: &[Vec<Scalar>]) -> Vec<Vec<Scalar>> {
 
 fn interpolate_matrix_shares(
     matrix_shares: &SecretSharedMatrix,
-    ids: &[usize],
+    ids: &[u64],
 ) -> Vec<Vec<Scalar>> {
     let mut matrix = vec![vec![Scalar::ZERO; matrix_shares[0][0].len()]; matrix_shares[0].len()];
 
@@ -443,18 +445,18 @@ fn generate_dot_product(
 }
 
 fn generate_random_matrix_and_inverse_shares(
-    size: usize,
-    total: usize,
-    threshold: usize,
+    size: u64,
+    total: u64,
+    threshold: u64,
 ) -> [SecretSharedMatrix; 2] {
-    let mut output = vec![vec![Scalar::ZERO; size]; size];
+    let mut output = vec![vec![Scalar::ZERO; size as usize]; size as usize];
     let mut rng = rand::thread_rng();
 
     for x in 0..size {
         for y in 0..size {
             let mut i_bytes = [0u8; 32];
             rng.fill_bytes(&mut i_bytes);
-            output[x][y] = Scalar::from_bytes_mod_order(i_bytes);
+            output[x as usize][y as usize] = Scalar::from_bytes_mod_order(i_bytes);
         }
     }
 
@@ -465,20 +467,20 @@ fn generate_random_matrix_and_inverse_shares(
 }
 
 fn generate_random_beaver_triple_matrix_shares(
-    size_x: usize,
-    size_y: usize,
-    total: usize,
-    threshold: usize,
+    size_x: u64,
+    size_y: u64,
+    total: u64,
+    threshold: u64,
 ) -> (Vec<Vec<Scalar>>, Vec<Vec<Scalar>>, SecretSharedMatrix, SecretSharedMatrix, SecretSharedMatrix) {
-    let mut u_matrix = vec![vec![Scalar::ZERO; size_x]; size_y];
-    let mut v_matrix = vec![vec![Scalar::ZERO; size_x]; size_x];
+    let mut u_matrix = vec![vec![Scalar::ZERO; size_x as usize]; size_y as usize];
+    let mut v_matrix = vec![vec![Scalar::ZERO; size_x as usize]; size_x as usize];
     let mut rng = rand::thread_rng();
 
     for i in 0..size_y {
         for j in 0..size_x {
             let mut uj_bytes = [0u8; 32];
             rng.fill_bytes(&mut uj_bytes);
-            u_matrix[i][j] = Scalar::from_bytes_mod_order(uj_bytes);
+            u_matrix[i as usize][j as usize] = Scalar::from_bytes_mod_order(uj_bytes);
         }
     }
 
@@ -486,7 +488,7 @@ fn generate_random_beaver_triple_matrix_shares(
         for j in 0..size_x {
             let mut vj_bytes = [0u8; 32];
             rng.fill_bytes(&mut vj_bytes);
-            v_matrix[i][j] = Scalar::from_bytes_mod_order(vj_bytes);
+            v_matrix[i as usize][j as usize] = Scalar::from_bytes_mod_order(vj_bytes);
         }
     }
 
@@ -499,17 +501,17 @@ fn generate_random_beaver_triple_matrix_shares(
     return (u_matrix, v_matrix, u_matrix_shares, v_matrix_shares, uv_matrix_shares);
 }
 
-pub fn generate_permutation_matrix(size: usize) -> Vec<Vec<Scalar>> {
+pub fn generate_permutation_matrix(size: u64) -> Vec<Vec<Scalar>> {
     let mut rng = rand::thread_rng();
-    let mut matrix = Vec::with_capacity(size);
-    let mut elements: Vec<usize> = (0..size).collect();
+    let mut matrix = Vec::with_capacity(size as usize);
+    let mut elements: Vec<u64> = (0..size).collect();
 
     for _ in 0..size {
         let pos = rng.gen_range(0..elements.len());
         let vec_pos = elements.remove(pos);
 
-        let mut vector = vec![Scalar::ZERO; size];
-        vector[vec_pos] = Scalar::ONE;
+        let mut vector = vec![Scalar::ZERO; size as usize];
+        vector[vec_pos as usize] = Scalar::ONE;
 
         matrix.push(vector);
     }
@@ -517,12 +519,12 @@ pub fn generate_permutation_matrix(size: usize) -> Vec<Vec<Scalar>> {
     matrix
 }
 
-fn rpm_collect_r(rs: Vec<Vec<Vec<Scalar>>>, size: usize, depth: usize, players: usize) -> Vec<Vec<Scalar>> {
-  let mut r = vec![vec![Scalar::ZERO; size]; depth];
+fn rpm_collect_r(rs: Vec<Vec<Vec<Scalar>>>, size: u64, depth: u64, players: u64) -> Vec<Vec<Scalar>> {
+  let mut r = vec![vec![Scalar::ZERO; size as usize]; depth as usize];
   for j in 0..depth {
       for k in 0..size {
           for i in 0..players {
-              r[j][k] += rs[i][j][k];
+              r[j as usize][k as usize] += rs[i as usize][j as usize][k as usize];
           }
       }
   }
@@ -530,16 +532,16 @@ fn rpm_collect_r(rs: Vec<Vec<Vec<Scalar>>>, size: usize, depth: usize, players: 
   r
 }
 
-fn rpm_collect_m(ms: Vec<Vec<Vec<Vec<Vec<Scalar>>>>>, size: usize, depth: usize, players: usize) -> Vec<Vec<Vec<Vec<Scalar>>>> {
+fn rpm_collect_m(ms: Vec<Vec<Vec<Vec<Vec<Scalar>>>>>, size: u64, depth: u64, players: u64) -> Vec<Vec<Vec<Vec<Scalar>>>> {
   let k = sqrt(size);
-  let mut m = vec![vec![vec![vec![Scalar::ZERO; k]; k]; k]; depth];
+  let mut m = vec![vec![vec![vec![Scalar::ZERO; k as usize]; k as usize]; k as usize]; depth as usize];
   for j in 0..depth {
       for l in 0..k {
           for i in 0..players {
               if i == 0 {
-                  m[j][l] = ms[i][j][l].clone();
+                  m[j as usize][l as usize] = ms[i as usize][j as usize][l as usize].clone();
               } else {
-                  m[j][l] = generate_dot_product(&m[j][l], &ms[i][j][l]);
+                  m[j as usize][l as usize] = generate_dot_product(&m[j as usize][l as usize], &ms[i as usize][j as usize][l as usize]);
               }
           }
       }
@@ -565,17 +567,17 @@ pub struct InitialShares {
 
 // The truly offline portion of RPM Variant 3 (subvariant 2) – generates `dealers^2` shamir splits of `sqrt(size) x sqrt(size)` permutation matrices and `depth` `size`-sized vectors.
 // Output matrices are indexed by depth, then sub matrix for the depth, then party (minus 1). Output vectors are indexed by depth, then party (minus 1). 
-pub fn rpm_generate_initial_shares(size: usize, depth: usize, dealers: usize, players: usize) -> InitialShares {
+pub fn rpm_generate_initial_shares(size: u64, depth: u64, dealers: u64, players: u64) -> InitialShares {
     if players < dealers*dealers {
       assert!(false, "players must be at greater than or equal to dealers^2");
     }
 
     let k = sqrt(size);
 
-    let mut permutation_matrices_shares = Vec::<Vec<Vec<Matrix>>>::with_capacity(depth);
-    let mut random_shares = Vec::<Vec<Vector>>::with_capacity(depth);
+    let mut permutation_matrices_shares = Vec::<Vec<Vec<Matrix>>>::with_capacity(depth as usize);
+    let mut random_shares = Vec::<Vec<Vector>>::with_capacity(depth as usize);
     for _i in 0..depth {
-        let mut share_set = Vec::<Vec<Vec<Vector>>>::with_capacity(k);
+        let mut share_set = Vec::<Vec<Vec<Vector>>>::with_capacity(k as usize);
         for _j in 0..k {
             let matrix = generate_permutation_matrix(k);
             share_set.push(shamir_split_matrix(&matrix, players, dealers));
@@ -611,7 +613,7 @@ pub struct CombinedSharesAndMask {
 // they never explained it (and their example MP-SPDZ "code" for perf testing doesn't have this shape, let alone actually work beyond drilling the equivalent number of operations to
 // get performance data).
 // WARNING: this function has NO guardrails – it is expected bounds are checked upstream.
-pub fn rpm_combine_shares_and_mask(ms: Vec<Vec<Vec<Matrix>>>, rs: Vec<Vec<Vector>>, size: usize, depth: usize, dealers: usize) -> CombinedSharesAndMask {
+pub fn rpm_combine_shares_and_mask(ms: Vec<Vec<Vec<Matrix>>>, rs: Vec<Vec<Vector>>, size: u64, depth: u64, dealers: u64) -> CombinedSharesAndMask {
     let k = sqrt(size);
     let mut mss = vec![vec![vec![vec![vec![Scalar::ZERO; ms[0][0][0][0].len()]; ms[0][0][0].len()]; ms[0][0].len()]; ms[0].len()]; ms.len()];
     let mut rss = vec![vec![vec![Scalar::ZERO; rs[0][0].len()]; rs[0].len()]; rs.len()];
@@ -622,7 +624,7 @@ pub fn rpm_combine_shares_and_mask(ms: Vec<Vec<Vec<Matrix>>>, rs: Vec<Vec<Vector
             }
         }
     }
-
+    
     for i in 0..ms.len() {
         for j in 0..ms[0].len() {
             for k in 0..ms[0][0].len() {
@@ -637,14 +639,14 @@ pub fn rpm_combine_shares_and_mask(ms: Vec<Vec<Vec<Matrix>>>, rs: Vec<Vec<Vector
 
     let r = rpm_collect_r(rss, size, depth, dealers);
     let m = rpm_collect_m(mss, size, depth, dealers);
-    let mut mrm = vec![vec![vec![vec![Scalar::ZERO; k]; 1]; k]; depth];
+    let mut mrm = vec![vec![vec![vec![Scalar::ZERO; k as usize]; 1]; k as usize]; depth as usize];
     for d in 0..depth {
-        let rd = &r[d];
+        let rd = &r[d as usize];
         let opt_butterfly = if d == 0 { &rd } else { &rpm_butterfly(rd) };
         for i in 0..k {
-            mrm[d][i] = generate_dot_product(
-              &vec![opt_butterfly[i*k..(i+1)*k].to_vec()],
-              &m[d][i],
+            mrm[d as usize][i as usize] = generate_dot_product(
+              &vec![opt_butterfly[(i*k) as usize..((i+1)*k) as usize].to_vec()],
+              &m[d as usize][i as usize],
             );
         }
     }
@@ -726,7 +728,7 @@ pub fn rpm_sketch_propose(m: Vec<Vec<Matrix>>, r: Vec<Vector>) -> SketchProposal
 }
 
 // WARNING: this function has NO guardrails – it is expected bounds are checked upstream.
-pub fn rpm_sketch_verify(mcs: Vec<Vec<Vec<Vec<[u8; 32]>>>>, rcs: Vec<Vec<[u8; 32]>>, dealers: usize) -> bool {
+pub fn rpm_sketch_verify(mcs: Vec<Vec<Vec<Vec<[u8; 32]>>>>, rcs: Vec<Vec<[u8; 32]>>, dealers: u64) -> bool {
     let two = EdwardsPoint::mul_base(&(Scalar::ONE + Scalar::ONE));
     for i in 0..mcs[0].len() {
         for j in 0..mcs[0][0].len() {
@@ -749,10 +751,10 @@ pub fn rpm_sketch_verify(mcs: Vec<Vec<Vec<Vec<[u8; 32]>>>>, rcs: Vec<Vec<[u8; 32
                         }
                     }
                 }
-                for p in 1..=(mcs.len()-(dealers*dealers)+1) {
-                    let mut pset = Vec::<usize>::with_capacity(dealers*dealers);
-                    for pi in p..(p+(dealers*dealers)) {
-                        pset.push(pi);
+                for p in 1..=(mcs.len()-((dealers as usize)*(dealers as usize))+1) {
+                    let mut pset = Vec::<u64>::with_capacity((dealers*dealers) as usize);
+                    for pi in p..(p+((dealers as usize)*(dealers as usize))) {
+                        pset.push(pi as u64);
                     }
 
                     let v = interpolate_polynomial_point_shares(&l, &pset);
@@ -784,11 +786,11 @@ pub fn rpm_sketch_verify(mcs: Vec<Vec<Vec<Vec<[u8; 32]>>>>, rcs: Vec<Vec<[u8; 32
             }
         }
 
-        let mut rs = Vec::<EdwardsPoint>::with_capacity(rcs.len()-dealers+1);
-        for p in 1..=(rcs.len()-dealers+1) {
-            let mut pset = Vec::<usize>::with_capacity(dealers);
-            for pi in p..(p+dealers) {
-                pset.push(pi);
+        let mut rs = Vec::<EdwardsPoint>::with_capacity(rcs.len()-dealers as usize+1);
+        for p in 1..=(rcs.len()-dealers as usize+1) {
+            let mut pset = Vec::<u64>::with_capacity(dealers as usize);
+            for pi in p..(p+dealers as usize) {
+                pset.push(pi as u64);
             }
 
             rs.push(interpolate_polynomial_point_shares(&l, &pset));
@@ -806,7 +808,7 @@ pub fn rpm_sketch_verify(mcs: Vec<Vec<Vec<Vec<[u8; 32]>>>>, rcs: Vec<Vec<[u8; 32
 
 // The online fast permutation phase of the matrices. Outputs in a format expected to be broadcasted, collated by party and redirected back into masked_input_shares for the next round.
 // WARNING: this function has NO guardrails – it is expected bounds are checked upstream.
-pub fn rpm_permute(masked_input_shares: Vec<Vector>, mb: Vec<Vec<Matrix>>, rb: Vec<Vector>, mrmb: Vec<Vec<Matrix>>, depth_index: usize, parties: Vec<usize>) -> Vec<Vector> {
+pub fn rpm_permute(masked_input_shares: Vec<Vector>, mb: Vec<Vec<Matrix>>, rb: Vec<Vector>, mrmb: Vec<Vec<Matrix>>, depth_index: u64, parties: Vec<u64>) -> Vec<Vector> {
     let mut big_r  = Vec::<Scalar>::with_capacity(rb[0].len());
     for j in 0..masked_input_shares[0].len() {
         let mut r = Vec::<Scalar>::with_capacity(masked_input_shares.len());
@@ -850,10 +852,10 @@ pub fn rpm_permute(masked_input_shares: Vec<Vector>, mb: Vec<Vec<Matrix>>, rb: V
     
     let k = sqrt(r[0].len());
     for i in 0..k {
-        let mut out = generate_dot_product(&vec![big_r[i*k..(i+1)*k].to_vec()], &m[depth_index][i]);
-        out = subtract_matrices(&out, &mrm[depth_index][i]);
-        if depth_index + 1 != r.len() {
-          out = add_matrices(&out, &vec![r[depth_index + 1][i*k..(i+1)*k].to_vec()]);
+        let mut out = generate_dot_product(&vec![big_r[i*k..(i+1)*k].to_vec()], &m[depth_index as usize][i]);
+        out = subtract_matrices(&out, &mrm[depth_index as usize][i]);
+        if depth_index as usize + 1 != r.len() {
+          out = add_matrices(&out, &vec![r[depth_index as usize + 1][i*k..(i+1)*k].to_vec()]);
         }
         
         for j in 0..k {
@@ -873,7 +875,7 @@ pub fn rpm_permute(masked_input_shares: Vec<Vector>, mb: Vec<Vec<Matrix>>, rb: V
 
 // Convenience function for collecting the last round's output and interpolating it.
 // WARNING: this function has NO guardrails – it is expected bounds are checked upstream.
-pub fn rpm_finalize(input: Vec<Vector>, parties: Vec<usize>) -> Vector {
+pub fn rpm_finalize(input: Vec<Vector>, parties: Vec<u64>) -> Vector {
   let mut result  = Vec::<[u8; 32]>::with_capacity(input[0].len());
 
   for j in 0..input[0].len() {
@@ -885,6 +887,218 @@ pub fn rpm_finalize(input: Vec<Vector>, parties: Vec<usize>) -> Vector {
   }
 
   result
+}
+
+#[inline]
+fn vec32_to_arr32(v: &[u8]) -> [u8; 32] {
+    // Fast path with clear panic on invalid shapes (UDL should ensure len==32).
+    v.try_into().expect("expected 32-byte element")
+}
+
+#[inline]
+fn arr32_to_vec32(a: [u8; 32]) -> Vec<u8> {
+    a.to_vec()
+}
+
+// Matrix <-> sequence<sequence<sequence<u8>>>
+fn ffi_matrix_to_internal(m: &Vec<Vec<Vec<u8>>>) -> Matrix {
+    m.iter()
+        .map(|row| row.iter().map(|cell| vec32_to_arr32(cell)).collect())
+        .collect()
+}
+fn internal_matrix_to_ffi(m: Matrix) -> Vec<Vec<Vec<u8>>> {
+    m.into_iter()
+        .map(|row| row.into_iter().map(arr32_to_vec32).collect())
+        .collect()
+}
+
+// Vector <-> sequence<sequence<u8>>
+fn ffi_vector_to_internal(v: &Vec<Vec<u8>>) -> Vector {
+    v.iter().map(|bytes| vec32_to_arr32(bytes)).collect()
+}
+fn internal_vector_to_ffi(v: Vector) -> Vec<Vec<u8>> {
+    v.into_iter().map(arr32_to_vec32).collect()
+}
+
+// SecretSharedMatrix <-> sequence<sequence<sequence<sequence<u8>>>>
+fn ffi_ssm_to_internal(ssm: &Vec<Vec<Vec<Vec<u8>>>>) -> SecretSharedMatrix {
+    ssm.iter().map(ffi_matrix_to_internal).collect()
+}
+fn internal_ssm_to_ffi(ssm: SecretSharedMatrix) -> Vec<Vec<Vec<Vec<u8>>>> {
+    ssm.into_iter().map(internal_matrix_to_ffi).collect()
+}
+
+// SecretSharedVector <-> sequence<sequence<sequence<u8>>>
+fn ffi_ssv_to_internal(ssv: &Vec<Vec<Vec<u8>>>) -> SecretSharedVector {
+    ssv.iter().map(ffi_vector_to_internal).collect()
+}
+fn internal_ssv_to_ffi(ssv: SecretSharedVector) -> Vec<Vec<Vec<u8>>> {
+    ssv.into_iter().map(internal_vector_to_ffi).collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrappedInitialShares {
+    // ms: Vec<Vec<SecretSharedMatrix>> => seq^6
+    pub ms: Vec<Vec<Vec<Vec<Vec<Vec<u8>>>>>>,
+    // rs: Vec<SecretSharedVector>      => seq^4
+    pub rs: Vec<Vec<Vec<Vec<u8>>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrappedCombinedSharesAndMask {
+    // ms: Vec<Vec<Matrix>> => seq^5
+    pub ms: Vec<Vec<Vec<Vec<Vec<u8>>>>>,
+    // rs: Vec<Vector>      => seq^3
+    pub rs: Vec<Vec<Vec<u8>>>,
+    // mrms: Vec<Vec<Matrix>> => seq^5
+    pub mrms: Vec<Vec<Vec<Vec<Vec<u8>>>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrappedSketchProposal {
+    // mp: Vec<Vec<Vec<[u8;32]>>> => seq^4
+    pub mp: Vec<Vec<Vec<Vec<u8>>>>,
+    // rp: Vec<[u8;32]>           => seq^2
+    pub rp: Vec<Vec<u8>>,
+}
+
+impl From<InitialShares> for WrappedInitialShares {
+    fn from(x: InitialShares) -> Self {
+        let ms = x.ms
+            .into_iter()
+            .map(|row| row.into_iter().map(internal_ssm_to_ffi).collect())
+            .collect();
+        let rs = x.rs
+            .into_iter()
+            .map(internal_ssv_to_ffi)
+            .collect();
+        WrappedInitialShares { ms, rs }
+    }
+}
+
+impl From<CombinedSharesAndMask> for WrappedCombinedSharesAndMask {
+    fn from(x: CombinedSharesAndMask) -> Self {
+        let ms = x.ms
+            .into_iter()
+            .map(|row| row.into_iter().map(internal_matrix_to_ffi).collect())
+            .collect();
+        let rs = x.rs
+            .into_iter()
+            .map(internal_vector_to_ffi)
+            .collect();
+        let mrms = x.mrms
+            .into_iter()
+            .map(|row| row.into_iter().map(internal_matrix_to_ffi).collect())
+            .collect();
+        WrappedCombinedSharesAndMask { ms, rs, mrms }
+    }
+}
+
+impl From<SketchProposal> for WrappedSketchProposal {
+    fn from(x: SketchProposal) -> Self {
+        let mp = x.mp
+            .into_iter()
+            .map(internal_matrix_to_ffi)
+            .collect();
+        let rp = internal_vector_to_ffi(x.rp);
+        WrappedSketchProposal { mp, rp }
+    }
+}
+
+pub fn wrapped_rpm_generate_initial_shares(
+    size: u64, depth: u64, dealers: u64, players: u64
+) -> WrappedInitialShares {
+    rpm_generate_initial_shares(size, depth, dealers, players).into()
+}
+
+pub fn wrapped_rpm_combine_shares_and_mask(
+    // ms: Vec<Vec<Vec<Matrix>>> => seq^6
+    ms: &Vec<Vec<Vec<Vec<Vec<Vec<u8>>>>>>,
+    // rs: Vec<Vec<Vector>>      => seq^4
+    rs: &Vec<Vec<Vec<Vec<u8>>>>,
+    size: u64, depth: u64, dealers: u64,
+) -> WrappedCombinedSharesAndMask {
+    // Convert ms
+    let ms_int: Vec<Vec<Vec<Matrix>>> = ms.iter()
+        .map(|row| {
+            row.iter()
+               .map(|matset| matset.iter().map(ffi_matrix_to_internal).collect())
+               .collect()
+        })
+        .collect();
+
+    // Convert rs
+    let rs_int: Vec<Vec<Vector>> = rs.iter()
+        .map(|row| row.iter().map(ffi_vector_to_internal).collect())
+        .collect();
+
+    rpm_combine_shares_and_mask(ms_int, rs_int, size, depth, dealers).into()
+}
+
+pub fn wrapped_rpm_sketch_propose(
+    // m: Vec<Vec<Matrix>> => seq^5
+    m: &Vec<Vec<Vec<Vec<Vec<u8>>>>>,
+    // r: Vec<Vector>      => seq^3
+    r: &Vec<Vec<Vec<u8>>>,
+) -> WrappedSketchProposal {
+    let m_int: Vec<Vec<Matrix>> =
+        m.iter().map(|row| row.iter().map(ffi_matrix_to_internal).collect()).collect();
+    let r_int: Vec<Vector> =
+        r.iter().map(ffi_vector_to_internal).collect();
+    rpm_sketch_propose(m_int, r_int).into()
+}
+
+pub fn wrapped_rpm_sketch_verify(
+    // mcs: Vec<Vec<Vec<Vec<[u8; 32]>>>> => seq^5
+    mcs: &Vec<Vec<Vec<Vec<Vec<u8>>>>>,
+    // rcs: Vec<Vec<[u8; 32]>>           => seq^3
+    rcs: &Vec<Vec<Vec<u8>>>,
+    dealers: u64,
+) -> bool {
+    let mcs_int: Vec<Vec<Vec<Vec<[u8; 32]>>>> = mcs.iter()
+        .map(|a| a.iter()
+            .map(|b| b.iter()
+                .map(|c| c.iter().map(|bytes| vec32_to_arr32(bytes)).collect())
+                .collect())
+            .collect())
+        .collect();
+
+    let rcs_int: Vec<Vec<[u8; 32]>> = rcs.iter()
+        .map(|row| row.iter().map(|bytes| vec32_to_arr32(bytes)).collect())
+        .collect();
+
+    rpm_sketch_verify(mcs_int, rcs_int, dealers)
+}
+
+pub fn wrapped_rpm_permute(
+    // masked_input_shares: Vec<Vector> => seq^3
+    masked_input_shares: &Vec<Vec<Vec<u8>>>,
+    // mb: Vec<Vec<Matrix>>             => seq^5
+    mb: &Vec<Vec<Vec<Vec<Vec<u8>>>>>,
+    // rb: Vec<Vector>                  => seq^3
+    rb: &Vec<Vec<Vec<u8>>>,
+    // mrmb: Vec<Vec<Matrix>>           => seq^5
+    mrmb: &Vec<Vec<Vec<Vec<Vec<u8>>>>>,
+    depth_index: u64,
+    parties: &Vec<u64>,
+) -> Vec<Vec<Vec<u8>>> {
+    let masked_int: Vec<Vector> = masked_input_shares.iter().map(ffi_vector_to_internal).collect();
+    let mb_int: Vec<Vec<Matrix>> = mb.iter().map(|row| row.iter().map(ffi_matrix_to_internal).collect()).collect();
+    let rb_int: Vec<Vector> = rb.iter().map(ffi_vector_to_internal).collect();
+    let mrmb_int: Vec<Vec<Matrix>> = mrmb.iter().map(|row| row.iter().map(ffi_matrix_to_internal).collect()).collect();
+
+    let out: Vec<Vector> = rpm_permute(masked_int, mb_int, rb_int, mrmb_int, depth_index, parties.clone());
+    out.into_iter().map(internal_vector_to_ffi).collect()
+}
+
+pub fn wrapped_rpm_finalize(
+    // input: Vec<Vector> => seq^3
+    input: &Vec<Vec<Vec<u8>>>,
+    parties: &Vec<u64>,
+) -> Vec<Vec<u8>> { 
+    let input_int: Vec<Vector> = input.iter().map(ffi_vector_to_internal).collect();
+    let out: Vector = rpm_finalize(input_int, parties.clone());
+    internal_vector_to_ffi(out)
 }
 
 #[cfg(test)]
@@ -905,7 +1119,7 @@ mod tests {
         }
     }
 
-    fn verify_lagrange(shares: &[Scalar], expected: &Scalar, total: usize, threshold: usize) {
+    fn verify_lagrange(shares: &[Scalar], expected: &Scalar, total: u64, threshold: u64) {
         let mut result: Option<Scalar> = None;
 
         for i in 1..=(total - threshold + 1) {
@@ -927,7 +1141,7 @@ mod tests {
 
                 coeff_denom = coeff_denom.invert();
                 coeff_num *= coeff_denom;
-                let reconstructed_frag = coeff_num * shares[i + j - 1];
+                let reconstructed_frag = coeff_num * shares[(i + j - 1) as usize];
 
                 reconstructed_sum += reconstructed_frag;
             }
@@ -982,13 +1196,13 @@ mod tests {
 
     #[test]
     fn test_rpm() {
-        let depth = 15;
-        let players = 9;
-        let dealers = 3;
+        let depth = 15 as usize;
+        let players = 9 as usize;
+        let dealers = 3 as usize;
 
-        let is1 = rpm_generate_initial_shares(100, depth, dealers, players);
-        let is2 = rpm_generate_initial_shares(100, depth, dealers, players);
-        let is3 = rpm_generate_initial_shares(100, depth, dealers, players);
+        let is1 = rpm_generate_initial_shares(100, depth as u64, dealers as u64, players as u64);
+        let is2 = rpm_generate_initial_shares(100, depth as u64, dealers as u64, players as u64);
+        let is3 = rpm_generate_initial_shares(100, depth as u64, dealers as u64, players as u64);
         let (m1, r1) = (is1.ms, is1.rs);
         let (m2, r2) = (is2.ms, is2.rs);
         let (m3, r3) = (is3.ms, is3.rs);
@@ -1013,7 +1227,7 @@ mod tests {
                 rs[i][1][j] = r2[j][i].clone();
                 rs[i][2][j] = r3[j][i].clone();
             }
-            let cs = rpm_combine_shares_and_mask(ms[i].clone(), rs[i].clone(), 100, depth, dealers);
+            let cs = rpm_combine_shares_and_mask(ms[i].clone(), rs[i].clone(), 100, depth as u64, dealers as u64);
             let (m, r, mrm) = (cs.ms, cs.rs, cs.mrms);
             let sp = rpm_sketch_propose(m.clone(), r.clone());
             let (mcc, rcc) = (sp.mp, sp.rp);
@@ -1024,7 +1238,7 @@ mod tests {
             rccs.push(rcc);
         }
 
-        assert!(rpm_sketch_verify(mccs, rccs, dealers));
+        assert!(rpm_sketch_verify(mccs, rccs, dealers as u64));
 
         let mut xs = vec![vec![[0u8; 32]; 100]; players];
 
@@ -1038,7 +1252,7 @@ mod tests {
         for d in 0..depth {
             let mut ys = vec![vec![[0u8; 32]; 100]; 9];
             for i in 0..players {
-                let out = rpm_permute(xs.clone(), mc[i].clone(), rc[i].clone(), mrmc[i].clone(), d, vec![1,2,3,4,5,6,7,8,9]);
+                let out = rpm_permute(xs.clone(), mc[i].clone(), rc[i].clone(), mrmc[i].clone(), d as u64, vec![1,2,3,4,5,6,7,8,9]);
                 ys[i] = out[0].clone();
             }
 
@@ -1066,11 +1280,11 @@ mod tests {
     }
 
     // just generates all ones
-    fn generate_malicious_permutation_matrix(size: usize) -> Vec<Vec<Scalar>> {
-        let mut matrix = Vec::with_capacity(size);
+    fn generate_malicious_permutation_matrix(size: u64) -> Vec<Vec<Scalar>> {
+        let mut matrix = Vec::with_capacity(size as usize);
     
         for _ in 0..size {
-            let vector = vec![Scalar::ONE; size];
+            let vector = vec![Scalar::ONE; size as usize];
     
             matrix.push(vector);
         }
@@ -1078,17 +1292,17 @@ mod tests {
         matrix
     }
 
-    fn rpm_generate_malicious_shares(size: usize, depth: usize, dealers: usize, players: usize) -> (Vec<Vec<SecretSharedMatrix>>, Vec<SecretSharedVector>) {
+    fn rpm_generate_malicious_shares(size: u64, depth: u64, dealers: u64, players: u64) -> (Vec<Vec<SecretSharedMatrix>>, Vec<SecretSharedVector>) {
       if players < dealers*dealers {
         assert!(false, "players must be at greater than or equal to dealers^2");
       }
   
       let k = sqrt(size);
   
-      let mut permutation_matrices_shares = Vec::<Vec<Vec<Vec<Vec<[u8; 32]>>>>>::with_capacity(depth);
-      let mut random_shares = Vec::<Vec<Vec<[u8; 32]>>>::with_capacity(depth);
+      let mut permutation_matrices_shares = Vec::<Vec<Vec<Vec<Vec<[u8; 32]>>>>>::with_capacity(depth as usize);
+      let mut random_shares = Vec::<Vec<Vec<[u8; 32]>>>::with_capacity(depth as usize);
       for _i in 0..depth {
-          let mut share_set = Vec::<Vec<Vec<Vec<[u8; 32]>>>>::with_capacity(k);
+          let mut share_set = Vec::<Vec<Vec<Vec<[u8; 32]>>>>::with_capacity(k as usize);
           for _j in 0..k {
               let matrix = generate_malicious_permutation_matrix(k);
               share_set.push(shamir_split_matrix(&matrix, players, dealers));
@@ -1105,13 +1319,13 @@ mod tests {
 
     #[test]
     fn malicious_matrix_rpm() {
-        let depth = 15;
-        let players = 9;
-        let dealers = 3;
+        let depth = 15 as usize;
+        let players = 9 as usize;
+        let dealers = 3 as usize;
 
-        let (m1, r1) = rpm_generate_malicious_shares(100, depth, dealers, players);
-        let is2 = rpm_generate_initial_shares(100, depth, dealers, players);
-        let is3 = rpm_generate_initial_shares(100, depth, dealers, players);
+        let (m1, r1) = rpm_generate_malicious_shares(100, depth as u64, dealers as u64, players as u64);
+        let is2 = rpm_generate_initial_shares(100, depth as u64, dealers as u64, players as u64);
+        let is3 = rpm_generate_initial_shares(100, depth as u64, dealers as u64, players as u64);
         let (m2, r2) = (is2.ms, is2.rs);
         let (m3, r3) = (is3.ms, is3.rs);
 
@@ -1132,7 +1346,7 @@ mod tests {
                 rs[i][1][j] = r2[j][i].clone();
                 rs[i][2][j] = r3[j][i].clone();
             }
-            let cs = rpm_combine_shares_and_mask(ms[i].clone(), rs[i].clone(), 100, depth, dealers);
+            let cs = rpm_combine_shares_and_mask(ms[i].clone(), rs[i].clone(), 100, depth as u64, dealers as u64);
             let (m, r) = (cs.ms, cs.rs);
             let sp = rpm_sketch_propose(m.clone(), r.clone());
             let (mcc, rcc) = (sp.mp, sp.rp);
@@ -1141,16 +1355,16 @@ mod tests {
             rccs.push(rcc);
         }
 
-        assert!(!rpm_sketch_verify(mccs, rccs, dealers));
+        assert!(!rpm_sketch_verify(mccs, rccs, dealers as u64));
     }
 
     #[test]
     fn malicious_mask_rpm() {
-        let depth = 15;
-        let players = 9;
-        let dealers = 3;
+        let depth = 15 as usize;
+        let players = 9 as usize;
+        let dealers = 3 as usize;
 
-        let is1 = rpm_generate_initial_shares(100, depth, dealers, players);
+        let is1 = rpm_generate_initial_shares(100, depth as u64, dealers as u64, players as u64);
         let (m1, mut r1) = (is1.ms, is1.rs);
         // set all random secret shares for the first depth for player 7 to zero:
         r1[0][6][0] = Scalar::ZERO.to_bytes();
@@ -1162,8 +1376,8 @@ mod tests {
         r1[0][6][6] = Scalar::ZERO.to_bytes();
         r1[0][6][7] = Scalar::ZERO.to_bytes();
         r1[0][6][8] = Scalar::ZERO.to_bytes();
-        let is2 = rpm_generate_initial_shares(100, depth, dealers, players);
-        let is3 = rpm_generate_initial_shares(100, depth, dealers, players);
+        let is2 = rpm_generate_initial_shares(100, depth as u64, dealers as u64, players as u64);
+        let is3 = rpm_generate_initial_shares(100, depth as u64, dealers as u64, players as u64);
         let (m2, r2) = (is2.ms, is2.rs);
         let (m3, r3) = (is3.ms, is3.rs);
 
@@ -1184,7 +1398,7 @@ mod tests {
                 rs[i][1][j] = r2[j][i].clone();
                 rs[i][2][j] = r3[j][i].clone();
             }
-            let cs = rpm_combine_shares_and_mask(ms[i].clone(), rs[i].clone(), 100, depth, dealers);
+            let cs = rpm_combine_shares_and_mask(ms[i].clone(), rs[i].clone(), 100, depth as u64, dealers as u64);
             let (m, r) = (cs.ms, cs.rs);
             let sp = rpm_sketch_propose(m.clone(), r.clone());
             let (mcc, rcc) = (sp.mp, sp.rp);
@@ -1193,7 +1407,7 @@ mod tests {
             rccs.push(rcc);
         }
 
-        assert!(!rpm_sketch_verify(mccs, rccs, dealers));
+        assert!(!rpm_sketch_verify(mccs, rccs, dealers as u64));
     }
 
     #[test]

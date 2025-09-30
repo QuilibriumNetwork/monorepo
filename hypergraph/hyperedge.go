@@ -111,6 +111,16 @@ func (hg *HypergraphCRDT) GetHyperedge(id [64]byte) (
 	hypergraph.Hyperedge,
 	error,
 ) {
+	hg.mu.RLock()
+	defer hg.mu.RUnlock()
+
+	return hg.getHyperedge(id)
+}
+
+func (hg *HypergraphCRDT) getHyperedge(id [64]byte) (
+	hypergraph.Hyperedge,
+	error,
+) {
 	timer := prometheus.NewTimer(GetDuration.WithLabelValues("hyperedge"))
 	defer timer.ObserveDuration()
 
@@ -123,6 +133,7 @@ func (hg *HypergraphCRDT) GetHyperedge(id [64]byte) (
 		hg.hyperedgeAdds,
 		hg.hyperedgeRemoves,
 		hypergraph.HyperedgeAtomType,
+		hg.getCoveredPrefix(),
 	)
 	if removeSet.Has(id) {
 		GetHyperedgeTotal.WithLabelValues("removed").Inc()
@@ -173,6 +184,16 @@ func (hg *HypergraphCRDT) AddHyperedge(
 	txn tries.TreeBackingStoreTransaction,
 	h hypergraph.Hyperedge,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
+	return hg.addHyperedge(txn, h)
+}
+
+func (hg *HypergraphCRDT) addHyperedge(
+	txn tries.TreeBackingStoreTransaction,
+	h hypergraph.Hyperedge,
+) error {
 	timer := prometheus.NewTimer(AddHyperedgeDuration)
 	defer timer.ObserveDuration()
 
@@ -182,6 +203,7 @@ func (hg *HypergraphCRDT) AddHyperedge(
 		hg.hyperedgeAdds,
 		hg.hyperedgeRemoves,
 		hypergraph.HyperedgeAtomType,
+		hg.getCoveredPrefix(),
 	)
 	id := h.GetID()
 	if !removeSet.Has(id) {
@@ -205,12 +227,16 @@ func (hg *HypergraphCRDT) RevertAddHyperedge(
 	txn tries.TreeBackingStoreTransaction,
 	h hypergraph.Hyperedge,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
 	shardAddr := hypergraph.GetShardKey(h)
 	addSet, removeSet := hg.getOrCreateIdSet(
 		shardAddr,
 		hg.hyperedgeAdds,
 		hg.hyperedgeRemoves,
 		hypergraph.HyperedgeAtomType,
+		hg.getCoveredPrefix(),
 	)
 
 	id := h.GetID()
@@ -239,17 +265,21 @@ func (hg *HypergraphCRDT) RemoveHyperedge(
 	txn tries.TreeBackingStoreTransaction,
 	h hypergraph.Hyperedge,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
 	timer := prometheus.NewTimer(RemoveHyperedgeDuration)
 	defer timer.ObserveDuration()
 
 	shardKey := hypergraph.GetShardKey(h)
-	wasPresent := hg.LookupHyperedge(h.(*hyperedge))
+	wasPresent := hg.lookupHyperedge(h.(*hyperedge))
 	if !wasPresent {
 		addSet, removeSet := hg.getOrCreateIdSet(
 			shardKey,
 			hg.hyperedgeAdds,
 			hg.hyperedgeRemoves,
 			hypergraph.HyperedgeAtomType,
+			hg.getCoveredPrefix(),
 		)
 		if err := addSet.Add(txn, h); err != nil {
 			RemoveHyperedgeTotal.WithLabelValues("error").Inc()
@@ -271,6 +301,7 @@ func (hg *HypergraphCRDT) RemoveHyperedge(
 		hg.hyperedgeAdds,
 		hg.hyperedgeRemoves,
 		hypergraph.HyperedgeAtomType,
+		hg.getCoveredPrefix(),
 	)
 	err := removeSet.Add(txn, h)
 	if err != nil {
@@ -289,12 +320,16 @@ func (hg *HypergraphCRDT) RevertRemoveHyperedge(
 	txn tries.TreeBackingStoreTransaction,
 	h hypergraph.Hyperedge,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
 	shardKey := hypergraph.GetShardKey(h)
 	_, removeSet := hg.getOrCreateIdSet(
 		shardKey,
 		hg.hyperedgeAdds,
 		hg.hyperedgeRemoves,
 		hypergraph.HyperedgeAtomType,
+		hg.getCoveredPrefix(),
 	)
 
 	err := removeSet.Delete(txn, h)
@@ -311,6 +346,12 @@ func (hg *HypergraphCRDT) RevertRemoveHyperedge(
 // LookupHyperedge checks if a hyperedge exists in the hypergraph. Returns true
 // if the hyperedge is in the add set and not in the remove set.
 func (hg *HypergraphCRDT) LookupHyperedge(h hypergraph.Hyperedge) bool {
+	hg.mu.RLock()
+	defer hg.mu.RUnlock()
+	return hg.lookupHyperedge(h)
+}
+
+func (hg *HypergraphCRDT) lookupHyperedge(h hypergraph.Hyperedge) bool {
 	timer := prometheus.NewTimer(LookupDuration.WithLabelValues("hyperedge"))
 	defer timer.ObserveDuration()
 
@@ -320,6 +361,7 @@ func (hg *HypergraphCRDT) LookupHyperedge(h hypergraph.Hyperedge) bool {
 		hg.hyperedgeAdds,
 		hg.hyperedgeRemoves,
 		hypergraph.HyperedgeAtomType,
+		hg.getCoveredPrefix(),
 	)
 	id := h.GetID()
 	found := addSet.Has(id) && !removeSet.Has(id)

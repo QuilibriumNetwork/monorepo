@@ -1,10 +1,12 @@
 package mocks
 
 import (
+	"context"
 	"io"
 	"math/big"
 
 	"github.com/stretchr/testify/mock"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	hg "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
@@ -175,7 +177,35 @@ func (m *MockHyperedge) ToBytes() []byte {
 
 // MockHypergraph mocks the Hypergraph implementation for testing
 type MockHypergraph struct {
+	protobufs.HypergraphComparisonServiceServer
 	mock.Mock
+}
+
+// GetChildrenForPath implements hypergraph.Hypergraph.
+func (h *MockHypergraph) GetChildrenForPath(
+	context context.Context,
+	req *protobufs.GetChildrenForPathRequest,
+) (*protobufs.GetChildrenForPathResponse, error) {
+	args := h.Called(context, req)
+	return args.Get(0).(*protobufs.GetChildrenForPathResponse), args.Error(1)
+}
+
+// HyperStream implements hypergraph.Hypergraph.
+func (h *MockHypergraph) HyperStream(
+	server protobufs.HypergraphComparisonService_HyperStreamServer,
+) error {
+	args := h.Called(server)
+	return args.Error(0)
+}
+
+// Sync implements hypergraph.Hypergraph.
+func (h *MockHypergraph) Sync(
+	stream protobufs.HypergraphComparisonService_HyperStreamClient,
+	shardKey tries.ShardKey,
+	phaseSet protobufs.HypergraphPhaseSet,
+) error {
+	args := h.Called(stream, shardKey, phaseSet)
+	return args.Error(0)
 }
 
 // RunDataPruning implements hypergraph.Hypergraph.
@@ -184,6 +214,12 @@ func (h *MockHypergraph) RunDataPruning(
 	frameNumber uint64,
 ) error {
 	args := h.Called(txn, frameNumber)
+	return args.Error(0)
+}
+
+// SetCoveredPrefix implements hypergraph.Hypergraph.
+func (h *MockHypergraph) SetCoveredPrefix(prefix []int) error {
+	args := h.Called(prefix)
 	return args.Error(0)
 }
 
@@ -297,15 +333,15 @@ func (h *MockHypergraph) SetVertexData(
 }
 
 // GetSize implements the interface
-func (h *MockHypergraph) GetSize() *big.Int {
-	args := h.Called()
+func (h *MockHypergraph) GetSize(key *tries.ShardKey, path []int) *big.Int {
+	args := h.Called(key, path)
 	return args.Get(0).(*big.Int)
 }
 
 // Commit implements the interface
-func (h *MockHypergraph) Commit() [][]byte {
+func (h *MockHypergraph) Commit() map[tries.ShardKey][][]byte {
 	args := h.Called()
-	return args.Get(0).([][]byte)
+	return args.Get(0).(map[tries.ShardKey][][]byte)
 }
 
 // GetVertex implements the interface
@@ -440,28 +476,34 @@ func (h *MockHypergraph) Within(a, he hg.Atom) bool {
 	return args.Bool(0)
 }
 
-// GetVertexAdds implements the interface
-func (h *MockHypergraph) GetVertexAdds() map[tries.ShardKey]*hg.IdSet {
-	args := h.Called()
-	return args.Get(0).(map[tries.ShardKey]*hg.IdSet)
+// GetVertexAddsSet implements the interface
+func (h *MockHypergraph) GetVertexAddsSet(shardKey tries.ShardKey) hg.IdSet {
+	args := h.Called(shardKey)
+	return args.Get(0).(hg.IdSet)
 }
 
-// GetVertexRemoves implements the interface
-func (h *MockHypergraph) GetVertexRemoves() map[tries.ShardKey]*hg.IdSet {
-	args := h.Called()
-	return args.Get(0).(map[tries.ShardKey]*hg.IdSet)
+// GetVertexRemovesSet implements the interface
+func (h *MockHypergraph) GetVertexRemovesSet(
+	shardKey tries.ShardKey,
+) hg.IdSet {
+	args := h.Called(shardKey)
+	return args.Get(0).(hg.IdSet)
 }
 
-// GetHyperedgeAdds implements the interface
-func (h *MockHypergraph) GetHyperedgeAdds() map[tries.ShardKey]*hg.IdSet {
-	args := h.Called()
-	return args.Get(0).(map[tries.ShardKey]*hg.IdSet)
+// GetHyperedgeAddsSet implements the interface
+func (h *MockHypergraph) GetHyperedgeAddsSet(
+	shardKey tries.ShardKey,
+) hg.IdSet {
+	args := h.Called(shardKey)
+	return args.Get(0).(hg.IdSet)
 }
 
-// GetHyperedgeRemoves implements the interface
-func (h *MockHypergraph) GetHyperedgeRemoves() map[tries.ShardKey]*hg.IdSet {
-	args := h.Called()
-	return args.Get(0).(map[tries.ShardKey]*hg.IdSet)
+// GetHyperedgeRemovesSet implements the interface
+func (h *MockHypergraph) GetHyperedgeRemovesSet(
+	shardKey tries.ShardKey,
+) hg.IdSet {
+	args := h.Called(shardKey)
+	return args.Get(0).(hg.IdSet)
 }
 
 // ImportTree implements the interface

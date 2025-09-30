@@ -24,7 +24,7 @@ func setupTestClockStore(t *testing.T) *store.PebbleClockStore {
 func TestGlobalTimeReel_BasicOperations(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -105,7 +105,7 @@ func TestGlobalTimeReel_BasicOperations(t *testing.T) {
 func TestGlobalTimeReel_Equivocation(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -205,7 +205,7 @@ func TestGlobalTimeReel_Equivocation(t *testing.T) {
 func TestGlobalTimeReel_Fork(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -277,7 +277,7 @@ func TestGlobalTimeReel_Fork(t *testing.T) {
 func TestGlobalTimeReel_ParentValidation(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -339,7 +339,7 @@ func TestGlobalTimeReel_ParentValidation(t *testing.T) {
 func TestGlobalTimeReel_ForkDetection(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -420,7 +420,7 @@ func TestGlobalTimeReel_ForkDetection(t *testing.T) {
 func TestGlobalTimeReel_ForkChoice_MoreSignatures(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -533,7 +533,7 @@ func TestGlobalTimeReel_ForkChoice_MoreSignatures(t *testing.T) {
 func TestGlobalTimeReel_ForkChoice_NoReplacement(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -638,7 +638,7 @@ func TestGlobalTimeReel_ForkChoice_NoReplacement(t *testing.T) {
 func TestGlobalTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -869,7 +869,7 @@ func TestGlobalTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 func TestGlobalTimeReel_TreePruning(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -953,7 +953,7 @@ func TestGlobalTimeReel_TreePruning(t *testing.T) {
 func TestGlobalTimeReel_TreePruningWithForks(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1063,7 +1063,7 @@ func TestGlobalTimeReel_TreePruningWithForks(t *testing.T) {
 func TestGlobalTimeReel_ForkChoiceInsertionOrder(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1224,7 +1224,7 @@ loop:
 func TestGlobalTimeReel_ForkEventsWithReplay(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1392,7 +1392,7 @@ func TestGlobalTimeReel_ForkEventsWithReplay(t *testing.T) {
 func TestGlobalTimeReel_ComprehensiveEquivocation(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()

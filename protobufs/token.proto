@@ -1,0 +1,227 @@
+syntax = "proto3";
+
+package quilibrium.node.token.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+import "application.proto";
+import "keys.proto";
+
+// Token behavior flags
+enum TokenIntrinsicBehavior {
+  TOKEN_BEHAVIOR_NONE = 0;
+  // Token can be minted, decrements total available supply, is no longer
+  // mintable once the total supply has been reached
+  TOKEN_BEHAVIOR_MINTABLE = 1;
+  // Token can be burned, decrements total supply
+  TOKEN_BEHAVIOR_BURNABLE = 2;
+  // Token has decimal units
+  TOKEN_BEHAVIOR_DIVISIBLE = 4;
+  // Token has pending transaction flows and must be accepted or rejected
+  TOKEN_BEHAVIOR_ACCEPTABLE = 8;
+  // Token's pending transaction flows can set expiration limits on the ability
+  // for the recipient to accept, after which only the refund address can accept
+  TOKEN_BEHAVIOR_EXPIRABLE = 16;
+  // Token can be used as a method of payment, for alternative-fee-basis shards
+  TOKEN_BEHAVIOR_TENDERABLE = 32;
+}
+
+// Mint behavior types
+enum TokenMintBehavior {
+  // Token cannot be minted
+  NO_MINT_BEHAVIOR = 0;
+  // Token can only be minted with a proof, ProofBasisType determines the
+  // accepted format
+  MINT_WITH_PROOF = 1;
+  // Token can only be minted by a configuration-defined authority's signature
+  MINT_WITH_AUTHORITY = 2;
+  // Token can only be minted with a configuration-defined signature
+  MINT_WITH_SIGNATURE = 3;
+  // Token can only be minted in exchange for a payment
+  MINT_WITH_PAYMENT = 4;
+}
+
+// Proof basis types
+enum ProofBasisType {
+  // Token does not accept any proof type for minting
+  NO_PROOF_BASIS = 0;
+  // Token accepts proof of meaningful work for minting, requires a proof of
+  // meaningful work entry for the minter's address in the token's domain
+  PROOF_OF_MEANINGFUL_WORK = 1;
+  // Token accepts a verkle multiproof as proof
+  VERKLE_MULTIPROOF_WITH_SIGNATURE = 2;
+}
+
+// Fee basis types
+enum FeeBasisType {
+  // Token cannot be purchased
+  NO_FEE_BASIS = 0;
+  // Token has a per-unit fee
+  PER_UNIT = 1;
+}
+
+// Authority configuration
+message Authority {
+  // The key type
+  uint32 key_type = 1;
+  // The public key
+  bytes public_key = 2;
+  // Authority has the ability to burn any token, provided the token is
+  // configured to be burnable
+  bool can_burn = 3;
+}
+
+// Fee basis configuration
+message FeeBasis {
+  FeeBasisType type = 1;
+  // Big endian encoded value representing the per-unit fee
+  bytes baseline = 2;
+}
+
+// Token mint strategy
+message TokenMintStrategy {
+  TokenMintBehavior mint_behavior = 1;
+  ProofBasisType proof_basis = 2;
+  // If ProofBasis is VerkleMultiproofWithSignature
+  bytes verkle_root = 3;
+  // If MintWithAuthority or MintWithSignature
+  Authority authority = 4;
+  // If MintWithPayment
+  bytes payment_address = 5;
+  // If MintWithPayment
+  FeeBasis fee_basis = 6;
+}
+
+// Token configuration
+message TokenConfiguration {
+  // TokenIntrinsicBehavior bit flags
+  uint32 behavior = 1;
+  // If Mintable is set
+  TokenMintStrategy mint_strategy = 2;
+  // Big.Int serialized, if Divisible is set
+  bytes units = 3;
+  // Big.Int serialized, if Mintable is not set
+  bytes supply = 4;
+  string name = 5;
+  string symbol = 6;
+  // 64 byte address values
+  repeated bytes additional_reference = 7;
+  // 585 byte BLS48-581
+  bytes owner_public_key = 8;
+}
+
+// TokenDeploy creates a new token instance
+message TokenDeploy {
+  // The token configuration
+  TokenConfiguration config = 1;
+  // The raw RDF schema definition
+  bytes rdf_schema = 2;
+}
+
+// TokenUpdate updates an existing token instance
+message TokenUpdate {
+  // The token configuration
+  TokenConfiguration config = 1;
+  // The raw RDF schema definition
+  bytes rdf_schema = 2;
+  // Signature from the owner key
+  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 3;
+}
+
+// Transaction input
+message TransactionInput {
+  bytes commitment = 1;
+  bytes signature = 2;
+  repeated bytes proofs = 3;
+}
+
+// Transaction output
+message TransactionOutput {
+  bytes frame_number = 1;
+  bytes commitment = 2;
+  RecipientBundle recipient_output = 3;
+}
+
+// Recipient bundle
+message RecipientBundle {
+  bytes one_time_key = 1;
+  bytes verification_key = 2;
+  bytes coin_balance = 3;
+  bytes mask = 4;
+  // if non-divisible
+  bytes additional_reference = 5;
+  // if non-divisible
+  bytes additional_reference_key = 6;
+}
+
+// Transaction for token transfers
+message Transaction {
+  // 32 bytes
+  bytes domain = 1;
+  repeated TransactionInput inputs = 2;
+  repeated TransactionOutput outputs = 3;
+  // Big.Int serialized
+  repeated bytes fees = 4;
+  bytes range_proof = 5;
+  // Optional TraversalProof
+  quilibrium.node.application.pb.TraversalProof traversal_proof = 6;
+}
+
+// Pending transaction input
+message PendingTransactionInput {
+  bytes commitment = 1;
+  bytes signature = 2;
+  repeated bytes proofs = 3;
+}
+
+// Pending transaction output
+message PendingTransactionOutput {
+  bytes frame_number = 1;
+  bytes commitment = 2;
+  RecipientBundle to = 3;
+  RecipientBundle refund = 4;
+  // If Expirable is set
+  uint64 expiration = 5;
+}
+
+// Pending transaction for acceptable tokens
+message PendingTransaction {
+  // 32 bytes
+  bytes domain = 1;
+  repeated PendingTransactionInput inputs = 2;
+  repeated PendingTransactionOutput outputs = 3;
+  // Big.Int serialized
+  repeated bytes fees = 4;
+  bytes range_proof = 5;
+  // Optional TraversalProof
+  quilibrium.node.application.pb.TraversalProof traversal_proof = 6;
+}
+
+// Mint transaction input
+message MintTransactionInput {
+  // Big.Int serialized
+  bytes value = 1;
+  bytes commitment = 2;
+  bytes signature = 3;
+  repeated bytes proofs = 4;
+  bytes additional_reference = 5;
+  bytes additional_reference_key = 6;
+}
+
+// Mint transaction output
+message MintTransactionOutput {
+  bytes frame_number = 1;
+  bytes commitment = 2;
+  RecipientBundle recipient_output = 3;
+}
+
+// Mint transaction
+message MintTransaction {
+  // 32 bytes
+  bytes domain = 1;
+  repeated MintTransactionInput inputs = 2;
+  repeated MintTransactionOutput outputs = 3;
+  // Big.Int serialized
+  repeated bytes fees = 4;
+  bytes range_proof = 5;
+}

@@ -202,7 +202,7 @@ func BlsAggregate(pks [][]byte, sigs [][]byte) crypto.BlsAggregateOutput {
 		}
 	}
 
-	// For small inputs, use the original non-parallelized version
+	// For small inputs, use the non-parallelized version
 	// Parallelization overhead isn't worth it for small sets
 	const minParallelSize = 100
 	if len(pks) < minParallelSize {

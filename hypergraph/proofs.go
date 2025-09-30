@@ -9,27 +9,44 @@ import (
 
 // Commit calculates the hierarchical vector commitments of each set and returns
 // the roots of all sets.
-func (hg *HypergraphCRDT) Commit() [][]byte {
+func (hg *HypergraphCRDT) Commit() map[tries.ShardKey][][]byte {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
 	timer := prometheus.NewTimer(CommitDuration)
 	defer timer.ObserveDuration()
 
-	commits := [][]byte{}
+	commits := map[tries.ShardKey][][]byte{}
 
-	for _, vertexAdds := range hg.vertexAdds {
+	ensureSet := func(shardKey tries.ShardKey) {
+		if _, ok := commits[shardKey]; !ok {
+			commits[shardKey] = make([][]byte, 4)
+			commits[shardKey][0] = make([]byte, 64)
+			commits[shardKey][1] = make([]byte, 64)
+			commits[shardKey][2] = make([]byte, 64)
+			commits[shardKey][3] = make([]byte, 64)
+		}
+	}
+
+	for shardKey, vertexAdds := range hg.vertexAdds {
 		root := vertexAdds.GetTree().Commit(false)
-		commits = append(commits, root)
+		ensureSet(shardKey)
+		commits[shardKey][0] = root
 	}
-	for _, vertexRemoves := range hg.vertexRemoves {
+	for shardKey, vertexRemoves := range hg.vertexRemoves {
 		root := vertexRemoves.GetTree().Commit(false)
-		commits = append(commits, root)
+		ensureSet(shardKey)
+		commits[shardKey][1] = root
 	}
-	for _, hyperedgeAdds := range hg.hyperedgeAdds {
+	for shardKey, hyperedgeAdds := range hg.hyperedgeAdds {
 		root := hyperedgeAdds.GetTree().Commit(false)
-		commits = append(commits, root)
+		ensureSet(shardKey)
+		commits[shardKey][2] = root
 	}
-	for _, hyperedgeRemoves := range hg.hyperedgeRemoves {
+	for shardKey, hyperedgeRemoves := range hg.hyperedgeRemoves {
 		root := hyperedgeRemoves.GetTree().Commit(false)
-		commits = append(commits, root)
+		ensureSet(shardKey)
+		commits[shardKey][3] = root
 	}
 
 	// Update metrics
@@ -59,6 +76,9 @@ func (hg *HypergraphCRDT) CreateTraversalProof(
 	phaseType hypergraph.PhaseType,
 	keys [][]byte,
 ) (*tries.TraversalProof, error) {
+	hg.mu.RLock()
+	defer hg.mu.RUnlock()
+
 	timer := prometheus.NewTimer(TraversalProofDuration.WithLabelValues("create"))
 	defer timer.ObserveDuration()
 
@@ -69,14 +89,15 @@ func (hg *HypergraphCRDT) CreateTraversalProof(
 		L2: domain,
 	}
 
-	var addSet *hypergraph.IdSet
-	var removeSet *hypergraph.IdSet
+	var addSet hypergraph.IdSet
+	var removeSet hypergraph.IdSet
 	if atomType == hypergraph.VertexAtomType {
 		addSet, removeSet = hg.getOrCreateIdSet(
 			shardKey,
 			hg.vertexAdds,
 			hg.vertexRemoves,
 			atomType,
+			hg.getCoveredPrefix(),
 		)
 	} else {
 		addSet, removeSet = hg.getOrCreateIdSet(
@@ -84,6 +105,7 @@ func (hg *HypergraphCRDT) CreateTraversalProof(
 			hg.hyperedgeAdds,
 			hg.hyperedgeRemoves,
 			atomType,
+			hg.getCoveredPrefix(),
 		)
 	}
 
@@ -115,6 +137,9 @@ func (hg *HypergraphCRDT) VerifyTraversalProof(
 	phaseType hypergraph.PhaseType,
 	traversalProof *tries.TraversalProof,
 ) (bool, error) {
+	hg.mu.RLock()
+	defer hg.mu.RUnlock()
+
 	timer := prometheus.NewTimer(TraversalProofDuration.WithLabelValues("verify"))
 	defer timer.ObserveDuration()
 
@@ -123,14 +148,15 @@ func (hg *HypergraphCRDT) VerifyTraversalProof(
 		L2: domain,
 	}
 
-	var addSet *hypergraph.IdSet
-	var removeSet *hypergraph.IdSet
+	var addSet hypergraph.IdSet
+	var removeSet hypergraph.IdSet
 	if atomType == hypergraph.VertexAtomType {
 		addSet, removeSet = hg.getOrCreateIdSet(
 			shardKey,
 			hg.vertexAdds,
 			hg.vertexRemoves,
 			atomType,
+			hg.getCoveredPrefix(),
 		)
 	} else {
 		addSet, removeSet = hg.getOrCreateIdSet(
@@ -138,6 +164,7 @@ func (hg *HypergraphCRDT) VerifyTraversalProof(
 			hg.hyperedgeAdds,
 			hg.hyperedgeRemoves,
 			atomType,
+			hg.getCoveredPrefix(),
 		)
 	}
 

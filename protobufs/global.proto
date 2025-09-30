@@ -1,0 +1,534 @@
+syntax = "proto3";
+
+package quilibrium.node.global.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+import "application.proto";
+import "channel.proto";
+import "compute.proto";
+import "hypergraph.proto";
+import "keys.proto";
+import "token.proto";
+import "google/protobuf/empty.proto";
+
+message LegacyProverRequest {
+  repeated quilibrium.node.keys.pb.Ed448Signature public_key_signatures_ed448 = 1;
+}
+
+message SeniorityMerge {
+  bytes signature = 1;
+  uint32 key_type = 2;
+  bytes prover_public_key = 3;
+}
+
+message ProverJoin {
+  repeated bytes filters = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession public_key_signature_bls48581 = 3;
+  bytes delegate_address = 4;
+  repeated SeniorityMerge merge_targets = 5;
+}
+
+message ProverLeave {
+  repeated bytes filters = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
+}
+
+message ProverPause {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
+}
+
+message ProverResume {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
+}
+
+message ProverConfirm {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
+}
+
+message ProverUpdate {
+  bytes delegate_address = 1;
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 2;
+}
+
+message ProverKick {
+  uint64 frame_number = 1;
+  bytes kicked_prover_public_key = 2;
+  bytes conflicting_frame_1 = 3;
+  bytes conflicting_frame_2 = 4;
+  bytes commitment = 5;
+  bytes proof = 6;
+  quilibrium.node.application.pb.TraversalProof traversal_proof = 7;
+}
+
+// ProverReject remains the same structure as before
+message ProverReject {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
+}
+
+message MessageRequest {
+  oneof request {
+    quilibrium.node.global.pb.ProverJoin join = 1;
+    quilibrium.node.global.pb.ProverLeave leave = 2;
+    quilibrium.node.global.pb.ProverPause pause = 3;
+    quilibrium.node.global.pb.ProverResume resume = 4;
+    quilibrium.node.global.pb.ProverConfirm confirm = 5;
+    quilibrium.node.global.pb.ProverReject reject = 6;
+    quilibrium.node.global.pb.ProverKick kick = 7;
+    quilibrium.node.global.pb.ProverUpdate update = 8;
+    quilibrium.node.token.pb.TokenDeploy token_deploy = 9;
+    quilibrium.node.token.pb.TokenUpdate token_update = 10;
+    quilibrium.node.token.pb.Transaction transaction = 11;
+    quilibrium.node.token.pb.PendingTransaction pending_transaction = 12;
+    quilibrium.node.token.pb.MintTransaction mint_transaction = 13;
+    quilibrium.node.hypergraph.pb.HypergraphDeploy hypergraph_deploy = 14;
+    quilibrium.node.hypergraph.pb.HypergraphUpdate hypergraph_update = 15;
+    quilibrium.node.hypergraph.pb.VertexAdd vertex_add = 16;
+    quilibrium.node.hypergraph.pb.VertexRemove vertex_remove = 17;
+    quilibrium.node.hypergraph.pb.HyperedgeAdd hyperedge_add = 18;
+    quilibrium.node.hypergraph.pb.HyperedgeRemove hyperedge_remove = 19;
+    quilibrium.node.compute.pb.ComputeDeploy compute_deploy = 20;
+    quilibrium.node.compute.pb.ComputeUpdate compute_update = 21;
+    quilibrium.node.compute.pb.CodeDeployment code_deploy = 22;
+    quilibrium.node.compute.pb.CodeExecute code_execute = 23;
+    quilibrium.node.compute.pb.CodeFinalize code_finalize = 24;
+  }
+  int64 timestamp = 99;
+}
+
+message MessageBundle {
+  repeated MessageRequest requests = 1;
+  int64 timestamp = 2;
+}
+
+message GlobalFrameHeader {
+  // A strictly monotonically-increasing frame number. Used for culling old
+  // frames past a configurable cutoff point.
+  uint64 frame_number = 1;
+  // The self-reported timestamp from the proof publisher, encoded as an int64
+  // of the Unix epoch in milliseconds. Should be good until
+  // 292278994-08-17 07:12:55.807, at which point, this is someone else's
+  // problem. Timestamps are imperfect, but smoothed in a rolling window to
+  // ensure a network and quorum-stable difficulty adjustment. Anomalies are
+  // bounded such that a timestamp beyond ten times the average issuance rate
+  // is discarded in preference to the runner up electees, unless there is
+  // simply no alternative available (for example, if a network outage occurred
+  // from an upgrade or bug).
+  int64 timestamp = 2;
+  // The difficulty level used for the frame. Difficulty is calculated based on
+  // the previous 60 timestamps correlated with difficulties, such that the
+  // interval smooths out to align to the type-defined rate. This is expected to
+  // increase subtly with clock speed and future hardware implementations, but
+  // due to incentive alignment associated with global proofs, not fastest clock
+  // in the west, should be gradual.
+  uint32 difficulty = 3;
+  // The output data from the VDF, serialized as bytes. For Wesolowski, this is
+  // an encoding of the 258 byte Y value concatenated with the 258 byte proof
+  // value.
+  bytes output = 4;
+  // The selector value of the previous frame's output, produced as a Poseidon
+  // hash of the output.
+  bytes parent_selector = 5;
+  // The 256 global commitment values
+  repeated bytes global_commitments = 6;
+  // The prover tree root commitment
+  bytes prover_tree_commitment = 7;
+  // The confirmation signatures of the frame
+  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 8;
+}
+
+message FrameHeader {
+  // The address dictates the depth of the shard, at a minimum, the app domain.
+  bytes address = 1;
+  // A strictly monotonically-increasing frame number. Used for culling old
+  // frames past a configurable cutoff point.
+  uint64 frame_number = 2;
+  // The self-reported timestamp from the proof publisher, encoded as an int64
+  // of the Unix epoch in milliseconds. Should be good until
+  // 292278994-08-17 07:12:55.807, at which point, this is someone else's
+  // problem. Timestamps are imperfect, but smoothed in a rolling window to
+  // ensure a network and quorum-stable difficulty adjustment. Anomalies are
+  // bounded such that a timestamp beyond ten times the average issuance rate
+  // is discarded in preference to the runner up electees, unless there is
+  // simply no alternative available (for example, if a network outage occurred
+  // from an upgrade or bug).
+  int64 timestamp = 3;
+  // The difficulty level used for the frame. Difficulty is calculated based on
+  // the previous 60 timestamps correlated with difficulties, such that the
+  // interval smooths out to align to the type-defined rate. This is expected to
+  // increase subtly with clock speed and future hardware implementations, but
+  // due to incentive alignment associated with global proofs, not fastest clock
+  // in the west, should be gradual.
+  uint32 difficulty = 4;
+  // The output data from the VDF, serialized as bytes. For Wesolowski, this is
+  // an encoding of the 258 byte Y value concatenated with the 258 byte proof
+  // value.
+  bytes output = 5;
+  // The selector value of the previous frame's output, produced as a Poseidon
+  // hash of the output.
+  bytes parent_selector = 6;
+  // The root commitment to the set of requests for the frame.
+  bytes requests_root = 7;
+  // The root commitments to to the hypergraph state at the address.
+  repeated bytes state_roots = 8;
+  // The prover of the frame, incorporated into the input to the VDF.
+  bytes prover = 9;
+  // The prover's proposed fee multiplier, incorporated into sliding window
+  // averaging.
+  uint64 fee_multiplier_vote = 10;
+  // The confirmation signatures of the frame
+  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 11;
+}
+
+message ProverLivenessCheck {
+  // The filter for the prover's commitment in the trie
+  bytes filter = 1;
+  // The frame number for which this liveness check is being sent
+  uint64 frame_number = 2;
+  // The timestamp when the liveness check was created
+  int64 timestamp = 3;
+  // The hash of the shard commitments and prover root
+  bytes commitment_hash = 4;
+  // The BLS signature with the prover's address
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 5;
+}
+
+message FrameVote {
+  // The frame number being voted on
+  uint64 frame_number = 1;
+  // The proposer of the frame
+  bytes proposer = 2;
+  // Whether the voter approves the frame
+  bool approve = 3;
+  // The BLS signature with the voter's address
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 4;
+}
+
+message FrameConfirmation {
+  // The frame number that was confirmed
+  uint64 frame_number = 1;
+  // The selector (hash) of the confirmed frame
+  bytes selector = 2;
+  // The aggregated BLS signature from all voters
+  quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 3;
+}
+
+message GlobalFrame {
+  GlobalFrameHeader header = 1;
+  repeated MessageBundle requests = 2;
+}
+
+message AppShardFrame {
+  FrameHeader header = 1;
+  repeated MessageBundle requests = 2;
+}
+
+message GlobalAlert {
+  string message = 1;
+  bytes signature = 2;
+}
+
+message GetGlobalFrameRequest {
+  uint64 frame_number = 1;
+}
+
+message GlobalFrameResponse {
+  GlobalFrame frame = 1;
+  bytes proof = 2;
+}
+
+message GetAppShardFrameRequest {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+}
+
+message AppShardFrameResponse {
+  AppShardFrame frame = 1;
+  bytes proof = 2;
+}
+
+message GetAppShardsRequest {
+  bytes shard_key = 1;
+  repeated uint32 prefix = 2;
+}
+
+message AppShardInfo {
+  repeated uint32 prefix = 1;
+  bytes size = 2;
+  uint64 data_shards = 3;
+  repeated bytes commitment = 4;
+}
+
+message GetAppShardsResponse {
+  repeated AppShardInfo info = 1;
+}
+
+message GetGlobalShardsRequest {
+  bytes l1 = 1;
+  bytes l2 = 2;
+}
+
+message GetGlobalShardsResponse {
+  bytes size = 1;
+  repeated bytes commitment = 2;
+}
+
+service GlobalService {
+  rpc GetGlobalFrame (GetGlobalFrameRequest) returns (GlobalFrameResponse);
+  rpc GetAppShards(GetAppShardsRequest) returns (GetAppShardsResponse);
+  rpc GetGlobalShards(GetGlobalShardsRequest) returns (GetGlobalShardsResponse);
+}
+
+service AppShardService {
+  rpc GetAppShardFrame (GetAppShardFrameRequest) returns (AppShardFrameResponse);
+}
+
+message SendMessage {
+  bytes peer_id = 1;
+  uint32 circ_id = 2;
+  bytes cell = 3;
+}
+
+message ReceiveMessage {
+  bytes source_peer_id = 1;
+  uint32 circ_id = 2;
+  bytes cell = 3;
+}
+
+service OnionService {
+  rpc Connect(stream SendMessage) returns (stream ReceiveMessage);
+}
+
+message GetKeyRegistryRequest {
+  bytes identity_key_address = 1;
+}
+
+message GetKeyRegistryResponse {
+  quilibrium.node.keys.pb.KeyRegistry registry = 1;
+  string error = 2;
+}
+
+message GetKeyRegistryByProverRequest {
+  bytes prover_key_address = 1;
+}
+
+message GetKeyRegistryByProverResponse {
+  quilibrium.node.keys.pb.KeyRegistry registry = 1;
+  string error = 2;
+}
+
+message PutIdentityKeyRequest {
+  bytes address = 1;
+	quilibrium.node.keys.pb.Ed448PublicKey identity_key = 2;
+}
+
+message PutIdentityKeyResponse {
+  string error = 1;
+}
+
+message PutProvingKeyRequest {
+  quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession proving_key = 1;
+}
+
+message PutProvingKeyResponse {
+  string error = 1;
+}
+
+message PutCrossSignatureRequest {
+  bytes identity_key_address = 1;
+  bytes proving_key_address = 2;
+  bytes identity_key_signature_of_proving_key = 3;
+  bytes proving_key_signature_of_identity_key = 4;
+}
+
+message PutCrossSignatureResponse {
+  string error = 1;
+}
+
+message PutSignedKeyRequest {
+  bytes address = 1;
+  quilibrium.node.keys.pb.SignedX448Key key = 2;
+}
+
+message PutSignedKeyResponse {
+  string error = 1;
+}
+
+message GetIdentityKeyRequest {
+  bytes address = 1;
+}
+
+message GetIdentityKeyResponse {
+  quilibrium.node.keys.pb.Ed448PublicKey key = 1;
+  string error = 2;
+}
+
+message GetProvingKeyRequest {
+  bytes address = 1;
+}
+
+message GetProvingKeyResponse {
+  quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession key = 1;
+  string error = 2;
+}
+
+message GetSignedKeyRequest {
+  bytes address = 1;
+}
+
+message GetSignedKeyResponse {
+  quilibrium.node.keys.pb.SignedX448Key key = 1;
+  string error = 2;
+}
+
+message GetSignedKeysByParentRequest {
+  bytes parent_key_address = 1;
+  string key_purpose = 2;
+}
+
+message GetSignedKeysByParentResponse {
+  repeated quilibrium.node.keys.pb.SignedX448Key keys = 1;
+  string error = 2;
+}
+
+message RangeProvingKeysRequest {
+}
+
+message RangeProvingKeysResponse {
+  quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession key = 1;
+  string error = 2;
+}
+
+message RangeIdentityKeysRequest {
+}
+
+message RangeIdentityKeysResponse {
+  quilibrium.node.keys.pb.Ed448PublicKey key = 1;
+  string error = 2;
+}
+
+message RangeSignedKeysRequest {
+  bytes parent_key_address = 1;
+	string key_purpose = 2;
+}
+
+message RangeSignedKeysResponse {
+  quilibrium.node.keys.pb.SignedX448Key key = 1;
+  string error = 2;
+}
+
+message MessageKeyShard {
+  uint32 party_identifier = 1;
+  bytes encrypted_key = 2;
+}
+
+message PutMessageRequest {
+  // The fragmented key used to encrypt the message, encrypted to the distinct
+  // mixnet peers
+  repeated MessageKeyShard message_shards = 1;
+  // The encrypted message to send
+  bytes message = 2;
+  // The ephemeral public key used to encrypt the original tag shard, used to
+  // encrypt the message key shards and confirm authenticity
+  bytes ephemeral_public_key = 3;
+}
+
+message PutMessageResponse {}
+
+service MixnetService {
+  // PutMessage puts a message into the round for use with message settlement.
+  rpc PutMessage(PutMessageRequest)
+    returns (PutMessageResponse);
+
+  // RoundStream is the p2p stream channel for the mixnet peers.
+  rpc RoundStream(stream quilibrium.node.application.pb.Message)
+    returns (stream quilibrium.node.application.pb.Message);
+}
+
+service KeyRegistryService {
+  // GetKeyRegistry retrieves the complete key registry for an identity key
+	// address
+	rpc GetKeyRegistry(GetKeyRegistryRequest)
+    returns (GetKeyRegistryResponse);
+
+	// GetKeyRegistryByProver retrieves the complete key registry for a prover key
+	// address
+	rpc GetKeyRegistryByProver(GetKeyRegistryByProverRequest)
+    returns (GetKeyRegistryByProverResponse);
+
+	// PutIdentityKey stores an identity key
+	rpc PutIdentityKey(PutIdentityKeyRequest)
+    returns (PutIdentityKeyResponse);
+
+	// PutProvingKey stores a proving key with proof of possession
+	rpc PutProvingKey(PutProvingKeyRequest)
+    returns (PutProvingKeyResponse);
+
+	// PutCrossSignature stores cross signatures between identity and proving keys
+	rpc PutCrossSignature(PutCrossSignatureRequest)
+    returns (PutCrossSignatureResponse);
+
+	// PutSignedKey stores a signed X448 key
+	rpc PutSignedKey(PutSignedKeyRequest)
+    returns (PutSignedKeyResponse);
+
+	// GetIdentityKey retrieves an identity key by address
+	rpc GetIdentityKey(GetIdentityKeyRequest)
+    returns (GetIdentityKeyResponse);
+
+	// GetProvingKey retrieves a proving key by address
+	rpc GetProvingKey(GetProvingKeyRequest)
+    returns (GetProvingKeyResponse);
+
+	// GetSignedKey retrieves a signed key by address
+	rpc GetSignedKey(GetSignedKeyRequest)
+    returns (GetSignedKeyResponse);
+
+	// GetSignedKeysByParent retrieves all signed keys for a parent key
+	rpc GetSignedKeysByParent(GetSignedKeysByParentRequest)
+    returns (GetSignedKeysByParentResponse);
+
+	// RangeProvingKeys returns an iterator over all proving keys
+	rpc RangeProvingKeys(RangeProvingKeysRequest)
+    returns (RangeProvingKeysResponse);
+
+	// RangeIdentityKeys returns an iterator over all identity keys
+	rpc RangeIdentityKeys(RangeIdentityKeysRequest)
+    returns (RangeIdentityKeysResponse);
+
+	// RangeSignedKeys returns an iterator over signed keys
+	rpc RangeSignedKeys(RangeSignedKeysRequest)
+    returns (RangeSignedKeysResponse);
+}
+
+service DispatchService {
+  // Store a new message in an inbox
+  rpc PutInboxMessage(quilibrium.node.channel.pb.InboxMessagePut) 
+      returns (google.protobuf.Empty);
+  
+  // Retrieve messages based on criteria
+  rpc GetInboxMessages(quilibrium.node.channel.pb.InboxMessageRequest) 
+      returns (quilibrium.node.channel.pb.InboxMessageResponse);
+  
+  // Create or update a hub
+  rpc PutHub(quilibrium.node.channel.pb.HubPut) 
+      returns (google.protobuf.Empty);
+  
+  // Retrieve hub information
+  rpc GetHub(quilibrium.node.channel.pb.HubRequest) 
+      returns (quilibrium.node.channel.pb.HubResponse);
+  
+  // Synchronize dispatch data
+  rpc Sync(quilibrium.node.channel.pb.DispatchSyncRequest) 
+      returns (quilibrium.node.channel.pb.DispatchSyncResponse);
+}

@@ -78,7 +78,7 @@ func TestOrderToKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			key, err := OrderToKey(tt.order)
+			key, err := OrderToKey(1, tt.order)
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -173,14 +173,14 @@ func TestKeyToOrder(t *testing.T) {
 func TestRoundTrip(t *testing.T) {
 	// Test round-trip conversion for various order values
 	testOrders := []int{
-		0, 1, 10, 63,           // Single byte range
-		64, 100, 1000, 4093,    // Two byte range
+		0, 1, 10, 63, // Single byte range
+		64, 100, 1000, 4093, // Two byte range
 		4094, 10000, 100000, 262142, // Three byte range
 	}
 
 	for _, order := range testOrders {
 		t.Run(fmt.Sprintf("order_%d", order), func(t *testing.T) {
-			key, err := OrderToKey(order)
+			key, err := OrderToKey(1, order)
 			require.NoError(t, err)
 
 			decodedOrder, err := KeyToOrder(key)

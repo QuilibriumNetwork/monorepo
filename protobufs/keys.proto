@@ -1,0 +1,166 @@
+syntax = "proto3";
+
+package quilibrium.node.keys.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+// Describes a raw Ed448 public key
+message Ed448PublicKey {
+  // 57 byte value
+  bytes key_value = 1;
+}
+
+// Describes a raw Ed448 private key – notably this is post-derivation,
+// not the seed.
+message Ed448PrivateKey {
+  // 57 byte value
+  bytes key_value = 1;
+  Ed448PublicKey public_key = 2;
+}
+
+// Describes a raw Ed448 signature
+message Ed448Signature {
+  // 114 byte value
+  bytes signature = 1;
+  Ed448PublicKey public_key = 2;
+}
+
+// Describes a raw X448 public key
+message X448PublicKey {
+  // 57 byte value
+  bytes key_value = 1;
+}
+
+// Describes a raw X448 private key – notably this is post-derivation,
+// not the seed.
+message X448PrivateKey {
+  // 57 byte value
+  bytes key_value = 1;
+  X448PublicKey public_key = 2;
+}
+
+// Describes a raw PCAS public key
+message PCASPublicKey {
+  // 256 kilobyte value
+  bytes key_value = 1;
+}
+
+// Describes a raw PCAS private key
+message PCASPrivateKey {
+  // 256 byte value
+  bytes key_value = 1;
+  PCASPublicKey public_key = 2;
+}
+
+// Describes a raw compressed BLS48-581 G2 public key
+message BLS48581G2PublicKey {
+  // 585 byte value
+  bytes key_value = 1;
+}
+
+// Describes a raw BLS48-581 private key, with corresponding G2 public key
+message BLS48581G2PrivateKey {
+  // 73 byte value
+  bytes key_value = 1;
+  BLS48581G2PublicKey public_key = 2;
+}
+
+// Describes a raw BLS48-581 signature, minimal signature size variant
+message BLS48581Signature {
+  // 74 byte value
+  bytes signature = 1;
+  BLS48581G2PublicKey public_key = 2;
+}
+
+// Describes a raw BLS48-581 signature, minimal signature size variant
+message BLS48581SignatureWithProofOfPossession {
+  // 74 byte value
+  bytes signature = 1;
+  // 585 byte value
+  BLS48581G2PublicKey public_key = 2;
+  // 74 byte value
+  bytes pop_signature = 3;
+}
+
+// Describes a raw BLS48-581 signature, minimal signature size variant
+message BLS48581AddressedSignature {
+  // 74 byte value
+  bytes signature = 1;
+  // 32 byte value
+  bytes address = 2;
+}
+
+// Describes an aggregated BLS48-581 signature, minimal signature size variant
+message BLS48581AggregateSignature {
+  // 74 byte value
+  bytes signature = 1;
+  // 585 byte value
+  BLS48581G2PublicKey public_key = 2;
+  bytes bitmask = 3;
+}
+
+// Describes a raw Decaf448 public key
+message Decaf448PublicKey {
+  // 56 byte value
+  bytes key_value = 1;
+}
+
+// Describes a raw Decaf448 private key
+message Decaf448PrivateKey {
+  // 56 byte value
+  bytes key_value = 1;
+  Decaf448PublicKey public_key = 2;
+}
+
+// Describes a Schnorr signature over Decaf448
+message Decaf448Signature {
+  // 112 byte value (56 bytes R + 56 bytes S)
+  bytes signature = 1;
+  Decaf448PublicKey public_key = 2;
+}
+
+// Individual signed key with metadata
+message SignedX448Key {
+  X448PublicKey key = 1;
+  
+  // The parent key that signed this
+  bytes parent_key_address = 2;
+  
+  // Signature by the parent
+  oneof signature {
+    Ed448Signature ed448_signature = 3;
+    BLS48581Signature bls_signature = 4;
+    Decaf448Signature decaf_signature = 5;
+  }
+  
+  // Metadata
+  uint64 created_at = 6;
+  // 0 means no expiry
+  uint64 expires_at = 7;
+  // "view", "spend", "inbox", "device", "pre"
+  string key_purpose = 8;
+}
+
+// A collection of keys for a specific purpose
+message KeyCollection {
+  // "view", "spend", "inbox", "device", "pre"
+  string key_purpose = 1;
+  repeated SignedX448Key keys = 2;
+}
+
+// Complete key registry (for querying all keys)
+message KeyRegistry {
+  // Primary keys
+  Ed448PublicKey identity_key = 1;
+  BLS48581G2PublicKey prover_key = 2;
+  
+  // Cross signatures
+  Ed448Signature identity_to_prover = 3;
+  BLS48581Signature prover_to_identity = 4;
+  
+  // All signed keys by purpose
+  map<string, KeyCollection> keys_by_purpose = 5;
+  
+  // Metadata
+  uint64 last_updated = 6;
+}

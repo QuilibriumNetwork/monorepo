@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package quilibrium.node.hypergraph.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+import "keys.proto";
+
+// HypergraphConfiguration defines the keys for a hypergraph instance
+message HypergraphConfiguration {
+  // 57 bytes Ed448
+  bytes read_public_key = 1;
+  // 57 bytes Ed448
+  bytes write_public_key = 2;
+  // 585 byte BLS48-581
+  bytes owner_public_key = 3;
+}
+
+// HypergraphDeploy creates a new hypergraph instance
+message HypergraphDeploy {
+  // The hypergraph configuration
+  HypergraphConfiguration config = 1;
+  // The raw RDF schema definition
+  bytes rdf_schema = 2;
+}
+
+// HypergraphUpdate updates the configuration of a hypergraph instance
+message HypergraphUpdate {
+  // The updated configuration, omitted if no update
+  HypergraphConfiguration config = 1;
+  // The raw RDF schema definition, omitted if no update
+  bytes rdf_schema = 2;
+  // Signature from the owner key
+  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 3;
+}
+
+// VertexAdd adds a new vertex to the hypergraph
+message VertexAdd {
+  // 32 bytes
+  bytes domain = 1;
+  // 32 bytes
+  bytes data_address = 2;
+  // VectorCommitmentTree serialized
+  bytes data = 3;
+  // Ed448 signature
+  bytes signature = 4;
+}
+
+// VertexRemove removes a vertex from the hypergraph
+message VertexRemove {
+  // 32 bytes
+  bytes domain = 1;
+  // 32 bytes
+  bytes data_address = 2;
+  // Ed448 signature
+  bytes signature = 3;
+}
+
+// HyperedgeAdd adds a new hyperedge to the hypergraph
+message HyperedgeAdd {
+  // 32 bytes
+  bytes domain = 1;
+  // Hyperedge serialized
+  bytes value = 2;
+  // Ed448 signature
+  bytes signature = 3;
+}
+
+// HyperedgeRemove removes a hyperedge from the hypergraph
+message HyperedgeRemove {
+  // 32 bytes
+  bytes domain = 1;
+  // Hyperedge serialized
+  bytes value = 2;
+  // Ed448 signature
+  bytes signature = 3;
+}

@@ -1,6 +1,6 @@
-# BLS48581
+# RPM
 
-Wrapper for the Rust implementation of the BLS48581 in [crates/bls48581](../crates/bls48581).
+Wrapper for the Rust implementation of the RPM in [crates/rpm](../crates/bls48581).
 
 ## Generate Go bindings
 

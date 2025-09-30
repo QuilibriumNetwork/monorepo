@@ -32,6 +32,8 @@ replace source.quilibrium.com/quilibrium/monorepo/hypergraph => ../hypergraph
 
 replace source.quilibrium.com/quilibrium/monorepo/consensus => ../consensus
 
+replace source.quilibrium.com/quilibrium/monorepo/rpm => ../rpm
+
 replace github.com/multiformats/go-multiaddr => ../go-multiaddr
 
 replace github.com/multiformats/go-multiaddr-dns => ../go-multiaddr-dns
@@ -62,6 +64,7 @@ require (
 	source.quilibrium.com/quilibrium/monorepo/protobufs v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/types v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/utils v0.0.0-00010101000000-000000000000
+	source.quilibrium.com/quilibrium/monorepo/rpm v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/vdf v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/verenc v0.0.0-00010101000000-000000000000
 )

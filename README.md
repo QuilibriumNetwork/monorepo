@@ -1,4 +1,4 @@
-# Quilibrium - 2.1 - Serene
+# Quilibrium - 2.1 - Bloom
 
 ## Quick Start
 

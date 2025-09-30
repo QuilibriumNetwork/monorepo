@@ -437,9 +437,11 @@ func (sm *StateMachine[
 					if found {
 						sm.SendEvent(EventSyncComplete)
 					} else {
+						time.Sleep(10 * time.Second)
 						sm.SendEvent(EventSyncTimeout)
 					}
 				case <-errCh:
+					time.Sleep(10 * time.Second)
 					sm.SendEvent(EventSyncTimeout)
 				case <-ctx.Done():
 					return
@@ -560,7 +562,7 @@ func (sm *StateMachine[
 			sm.traceLogger.Trace(
 				fmt.Sprintf(
 					"insufficient liveness checks: need %d, have %d",
-					sm.minimumProvers,
+					sm.minimumProvers(),
 					livenessLen,
 				),
 			)
@@ -747,7 +749,7 @@ func (sm *StateMachine[
 						fmt.Sprintf(
 							"quorum not reached: proposals: %d, needed: %d",
 							len(sm.proposals[(*sm.activeState).Rank()+1]),
-							sm.minimumProvers,
+							sm.minimumProvers(),
 						),
 					)
 				}

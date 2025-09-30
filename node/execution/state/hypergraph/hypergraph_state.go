@@ -676,13 +676,6 @@ func (h *HypergraphState) Set(
 	frameNumber uint64,
 	value state.MaterializedState,
 ) error {
-	for _, c := range h.changeset {
-		if bytes.Equal(c.Address, address) && bytes.Equal(c.Domain, domain) &&
-			bytes.Equal(c.Discriminator, discriminator) {
-			return errors.Wrap(state.ErrConflictingChange, "set")
-		}
-	}
-
 	id := [64]byte{}
 	copy(id[:32], domain)
 	copy(id[32:], address)

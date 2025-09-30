@@ -5,9 +5,8 @@ import (
 	"context"
 	"math/big"
 	"net/http"
-	"strings"
+	"slices"
 	"sync"
-	"time"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -18,450 +17,394 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/reflection"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/anypb"
-	"source.quilibrium.com/quilibrium/monorepo/node/config"
-	"source.quilibrium.com/quilibrium/monorepo/node/consensus/master"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+
+	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/manager"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
-	"source.quilibrium.com/quilibrium/monorepo/node/keys"
-	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
-	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/types/keys"
+	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
+	"source.quilibrium.com/quilibrium/monorepo/types/worker"
+	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
+type PeerInfoProvider interface {
+	GetPeerInfo() *protobufs.PeerInfo
+}
+
+// RPCServer strictly implements NodeService.
 type RPCServer struct {
-	protobufs.UnimplementedNodeServiceServer
-	listenAddrGRPC   string
-	listenAddrHTTP   string
+	protobufs.NodeServiceServer
+
+	// dependencies
+	config           *config.Config
 	logger           *zap.Logger
-	dataProofStore   store.DataProofStore
-	clockStore       store.ClockStore
-	coinStore        store.CoinStore
 	keyManager       keys.KeyManager
 	pubSub           p2p.PubSub
-	masterClock      *master.MasterClockConsensusEngine
-	executionEngines []execution.ExecutionEngine
-	grpcServer       *grpc.Server
-	httpServer       *http.Server
+	peerInfoProvider PeerInfoProvider
+	workerManager    worker.WorkerManager
+	proverRegistry   consensus.ProverRegistry
+	executionManager *manager.ExecutionEngineManager
+	coinStore        store.TokenStore
+	hypergraph       hypergraph.Hypergraph
+
+	// server interfaces
+	grpcServer *grpc.Server
+	httpServer *http.Server
 }
 
-// GetFrameInfo implements protobufs.NodeServiceServer.
-func (r *RPCServer) GetFrameInfo(
-	ctx context.Context,
-	req *protobufs.GetFrameInfoRequest,
-) (*protobufs.FrameInfoResponse, error) {
-	if bytes.Equal(req.Filter, make([]byte, 32)) {
-		frame, err := r.clockStore.GetMasterClockFrame(
-			req.Filter,
-			req.FrameNumber,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "get frame info")
-		}
-
-		return &protobufs.FrameInfoResponse{
-			ClockFrame: frame,
-		}, nil
-	} else if req.Selector == nil {
-		frame, _, err := r.clockStore.GetDataClockFrame(
-			req.Filter,
-			req.FrameNumber,
-			false,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "get frame info")
-		}
-
-		return &protobufs.FrameInfoResponse{
-			ClockFrame: frame,
-		}, nil
-	} else {
-		return nil, errors.Wrap(errors.New("not found"), "get frame info")
-	}
-}
-
-// GetFrames implements protobufs.NodeServiceServer.
-func (r *RPCServer) GetFrames(
-	ctx context.Context,
-	req *protobufs.GetFramesRequest,
-) (*protobufs.FramesResponse, error) {
-	if bytes.Equal(req.Filter, make([]byte, 32)) {
-		iter, err := r.clockStore.RangeMasterClockFrames(
-			req.Filter,
-			req.FromFrameNumber,
-			req.ToFrameNumber,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "get frames")
-		}
-		defer iter.Close()
-
-		frames := []*protobufs.ClockFrame{}
-		for iter.First(); iter.Valid(); iter.Next() {
-			frame, err := iter.Value()
-			if err != nil {
-				return nil, errors.Wrap(err, "get frames")
-			}
-			frames = append(frames, frame)
-		}
-
-		return &protobufs.FramesResponse{
-			TruncatedClockFrames: frames,
-		}, nil
-	} else {
-		iter, err := r.clockStore.RangeDataClockFrames(
-			req.Filter,
-			req.FromFrameNumber,
-			req.ToFrameNumber,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "get frame info")
-		}
-		defer iter.Close()
-
-		frames := []*protobufs.ClockFrame{}
-		for iter.First(); iter.Valid(); iter.Next() {
-			frame, err := iter.TruncatedValue()
-			if err != nil {
-				return nil, errors.Wrap(err, "get frames")
-			}
-			frames = append(frames, frame)
-		}
-
-		return &protobufs.FramesResponse{
-			TruncatedClockFrames: frames,
-		}, nil
-	}
-}
-
-// GetNetworkInfo implements protobufs.NodeServiceServer.
-func (r *RPCServer) GetNetworkInfo(
-	ctx context.Context,
-	req *protobufs.GetNetworkInfoRequest,
-) (*protobufs.NetworkInfoResponse, error) {
-	return r.pubSub.GetNetworkInfo(), nil
-}
-
-// GetNodeInfo implements protobufs.NodeServiceServer.
-func (r *RPCServer) GetNodeInfo(
-	ctx context.Context,
-	req *protobufs.GetNodeInfoRequest,
-) (*protobufs.NodeInfoResponse, error) {
-	peerID, err := peer.IDFromBytes(r.pubSub.GetPeerID())
-	if err != nil {
-		return nil, errors.Wrap(err, "getting id from bytes")
-	}
-	peerScore := r.pubSub.GetPeerScore(r.pubSub.GetPeerID())
-
-	head := r.executionEngines[0].GetFrame()
-	frame := uint64(0)
-	if head != nil {
-		frame = head.FrameNumber
-	}
-	var seniority *big.Int
-	ring := -1
-	if frame > 0 {
-		seniority = r.executionEngines[0].GetSeniority()
-		ring = r.executionEngines[0].GetRingPosition()
-	}
-	if seniority == nil {
-		seniority = big.NewInt(0)
-	}
-	return &protobufs.NodeInfoResponse{
-		PeerId:    peerID.String(),
-		MaxFrame:  frame,
-		PeerScore: uint64(peerScore),
-		Version: append(
-			append([]byte{}, config.GetVersion()...), config.GetPatchNumber(),
-		),
-		PeerSeniority: seniority.FillBytes(make([]byte, 32)),
-		ProverRing:    int32(ring),
-		Workers:       r.executionEngines[0].GetWorkerCount(),
-	}, nil
-}
-
-// GetPeerInfo implements protobufs.NodeServiceServer.
-func (r *RPCServer) GetPeerInfo(
-	ctx context.Context,
-	req *protobufs.GetPeerInfoRequest,
-) (*protobufs.PeerInfoResponse, error) {
-	resp := &protobufs.PeerInfoResponse{}
-	manifests := r.masterClock.GetPeerManifests()
-	for _, m := range manifests.PeerManifests {
-		multiaddr := r.pubSub.GetMultiaddrOfPeer(m.PeerId)
-		addrs := []string{}
-		if multiaddr != "" {
-			addrs = append(addrs, multiaddr)
-		}
-
-		resp.PeerInfo = append(resp.PeerInfo, &protobufs.PeerInfo{
-			PeerId:     m.PeerId,
-			Multiaddrs: addrs,
-			MaxFrame:   m.MasterHeadFrame,
-			Timestamp:  m.LastSeen,
-			// We can get away with this for this release only, we will want to add
-			// version info in manifests.
-			Version: config.GetVersion(),
-		})
-	}
-	return resp, nil
-}
-
-func (r *RPCServer) SendMessage(
-	ctx context.Context,
-	req *protobufs.TokenRequest,
-) (*protobufs.SendMessageResponse, error) {
-	req.Timestamp = time.Now().UnixMilli()
-
-	a := &anypb.Any{}
-	if err := a.MarshalFrom(req); err != nil {
-		return nil, errors.Wrap(err, "publish message")
-	}
-
-	// annoying protobuf any hack
-	a.TypeUrl = strings.Replace(
-		a.TypeUrl,
-		"type.googleapis.com",
-		"types.quilibrium.com",
-		1,
-	)
-
-	payload, err := proto.Marshal(a)
-	if err != nil {
-		return nil, errors.Wrap(err, "publish message")
-	}
-
-	h, err := poseidon.HashBytes(payload)
-	if err != nil {
-		return nil, errors.Wrap(err, "publish message")
-	}
-
-	intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
-
-	msg := &protobufs.Message{
-		Hash:    h.Bytes(),
-		Address: intrinsicFilter,
-		Payload: payload,
-	}
-	data, err := proto.Marshal(msg)
-	if err != nil {
-		return nil, errors.Wrap(err, "publish message")
-	}
-	return &protobufs.SendMessageResponse{}, r.pubSub.PublishToBitmask(
-		append([]byte{0x00}, intrinsicFilter...),
-		data,
-	)
-}
-
+// GetTokensByAccount implements protobufs.NodeServiceServer.
 func (r *RPCServer) GetTokensByAccount(
 	ctx context.Context,
 	req *protobufs.GetTokensByAccountRequest,
-) (*protobufs.TokensByAccountResponse, error) {
-	frameNumbers, addresses, coins, err := r.coinStore.GetCoinsForOwner(
+) (*protobufs.GetTokensByAccountResponse, error) {
+	// Handle legacy (pre-2.1) coins:
+	if (len(req.Domain) == 0 ||
+		bytes.Equal(req.Domain, token.QUIL_TOKEN_ADDRESS)) &&
+		len(req.Address) == 32 {
+		frameNumbers, addresses, coins, err := r.coinStore.GetCoinsForOwner(
+			req.Address,
+		)
+
+		if err != nil {
+			return nil, errors.Wrap(err, "get tokens by account")
+		}
+
+		legacyCoins := []*protobufs.LegacyCoin{}
+		for i, coin := range coins {
+			legacyCoins = append(legacyCoins, &protobufs.LegacyCoin{
+				Coin:        coin,
+				Address:     addresses[i],
+				FrameNumber: frameNumbers[i],
+			})
+		}
+
+		return &protobufs.GetTokensByAccountResponse{
+			LegacyCoins: legacyCoins,
+		}, nil
+	}
+
+	if len(req.Address) != 112 {
+		return nil, errors.Wrap(
+			errors.New("invalid address"),
+			"get tokens by account",
+		)
+	}
+
+	if len(req.Domain) != 32 && len(req.Domain) != 0 {
+		return nil, errors.Wrap(
+			errors.New("invalid domain"),
+			"get tokens by account",
+		)
+	}
+
+	if len(req.Domain) == 0 {
+		req.Domain = token.QUIL_TOKEN_ADDRESS
+	}
+
+	transactions, err := r.coinStore.GetTransactionsForOwner(
+		req.Domain,
 		req.Address,
 	)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(
+			err,
+			"get tokens by account",
+		)
 	}
 
-	timestamps := []int64{}
-	if req.IncludeMetadata {
-		tcache := map[uint64]int64{}
-		intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
-		for _, frame := range frameNumbers {
-			if t, ok := tcache[frame]; ok {
-				timestamps = append(timestamps, t)
-				continue
-			}
-
-			f, _, err := r.clockStore.GetDataClockFrame(intrinsicFilter, frame, true)
-			if err != nil {
-				return nil, err
-			}
-
-			timestamps = append(timestamps, f.Timestamp)
-		}
+	pendingTransactions, err := r.coinStore.GetPendingTransactionsForOwner(
+		req.Domain,
+		req.Address,
+	)
+	if err != nil {
+		return nil, errors.Wrap(
+			err,
+			"get tokens by account",
+		)
 	}
 
-	return &protobufs.TokensByAccountResponse{
-		Coins:        coins,
-		FrameNumbers: frameNumbers,
-		Addresses:    addresses,
-		Timestamps:   timestamps,
+	return &protobufs.GetTokensByAccountResponse{
+		Transactions:        transactions,
+		PendingTransactions: pendingTransactions,
 	}, nil
 }
 
-func (r *RPCServer) GetTokenInfo(
+func (r *RPCServer) GetPeerInfo(
 	ctx context.Context,
-	req *protobufs.GetTokenInfoRequest,
-) (*protobufs.TokenInfoResponse, error) {
-	// 1 QUIL = 0x1DCD65000 units
-	if req.Address != nil {
-		_, _, coins, err := r.coinStore.GetCoinsForOwner(req.Address)
-		if err != nil {
-			return nil, errors.New("no coins found for address")
-		}
-
-		total := big.NewInt(0)
-		for _, coin := range coins {
-			total.Add(total, new(big.Int).SetBytes(coin.Amount))
-		}
-
-		return &protobufs.TokenInfoResponse{
-			OwnedTokens: total.FillBytes(make([]byte, 32)),
-		}, nil
-	} else {
-		provingKey, err := r.keyManager.GetRawKey(
-			"default-proving-key",
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "get token info")
-		}
-
-		peerBytes := r.pubSub.GetPeerID()
-		peerAddr, err := poseidon.HashBytes(peerBytes)
-		if err != nil {
-			panic(err)
-		}
-
-		addr, err := poseidon.HashBytes(provingKey.PublicKey)
-		if err != nil {
-			panic(err)
-		}
-
-		addrBytes := addr.FillBytes(make([]byte, 32))
-		peerAddrBytes := peerAddr.FillBytes(make([]byte, 32))
-
-		_, _, coins, err := r.coinStore.GetCoinsForOwner(addrBytes)
-		if err != nil {
-			panic(err)
-		}
-
-		_, _, otherCoins, err := r.coinStore.GetCoinsForOwner(peerAddrBytes)
-		if err != nil {
-			panic(err)
-		}
-
-		total := big.NewInt(0)
-		for _, coin := range coins {
-			total.Add(total, new(big.Int).SetBytes(coin.Amount))
-		}
-
-		for _, coin := range otherCoins {
-			total.Add(total, new(big.Int).SetBytes(coin.Amount))
-		}
-
-		return &protobufs.TokenInfoResponse{
-			OwnedTokens: total.FillBytes(make([]byte, 32)),
-		}, nil
+	_ *protobufs.GetPeerInfoRequest,
+) (*protobufs.PeerInfoResponse, error) {
+	self := r.peerInfoProvider.GetPeerInfo()
+	if self == nil {
+		return nil, errors.Wrap(errors.New("no peer info"), "get peer info")
 	}
+
+	return &protobufs.PeerInfoResponse{
+		PeerInfo: self,
+	}, nil
 }
 
-func (r *RPCServer) GetPeerManifests(
+func (r *RPCServer) GetNodeInfo(
 	ctx context.Context,
-	req *protobufs.GetPeerManifestsRequest,
-) (*protobufs.PeerManifestsResponse, error) {
-	return r.masterClock.GetPeerManifests(), nil
+	_ *protobufs.GetNodeInfoRequest,
+) (*protobufs.NodeInfoResponse, error) {
+	peerID := r.pubSub.GetPeerID()
+
+	workers, err := r.workerManager.RangeWorkers()
+	if err != nil {
+		return nil, errors.Wrap(err, "get node info")
+	}
+
+	proverKey, err := r.keyManager.GetSigningKey("q-prover-key")
+	if err != nil {
+		return nil, errors.Wrap(err, "get node info")
+	}
+
+	proverAddress, err := poseidon.HashBytes(proverKey.Public().([]byte))
+	if err != nil {
+		return nil, errors.Wrap(err, "get node info")
+	}
+
+	proverInfo, err := r.proverRegistry.GetProverInfo(
+		proverAddress.FillBytes(make([]byte, 32)),
+	)
+	seniority := big.NewInt(0)
+	if err == nil && proverInfo != nil {
+		seniority = seniority.SetUint64(proverInfo.Seniority)
+	}
+
+	return &protobufs.NodeInfoResponse{
+		PeerId:        peer.ID(peerID).String(),
+		PeerScore:     uint64(r.pubSub.GetPeerScore(peerID)),
+		Version:       append([]byte{}, config.GetVersion()...),
+		PeerSeniority: seniority.FillBytes(make([]byte, 8)),
+		Workers:       uint32(len(workers)),
+	}, nil
+}
+
+func (r *RPCServer) GetWorkerInfo(
+	ctx context.Context,
+	_ *protobufs.GetWorkerInfoRequest,
+) (*protobufs.WorkerInfoResponse, error) {
+	workers, err := r.workerManager.RangeWorkers()
+	if err != nil {
+		return nil, errors.Wrap(err, "get worker info")
+	}
+
+	info := []*protobufs.WorkerInfo{}
+	for _, worker := range workers {
+		info = append(info, &protobufs.WorkerInfo{
+			CoreId: uint32(worker.CoreId),
+			Filter: worker.Filter,
+			// TODO(2.1.1+): Expose available storage
+			AvailableStorage: uint64(worker.TotalStorage),
+			TotalStorage:     uint64(worker.TotalStorage),
+		})
+	}
+
+	return &protobufs.WorkerInfoResponse{
+		WorkerInfo: info,
+	}, nil
+}
+
+// Send implements protobufs.NodeServiceServer.
+func (r *RPCServer) Send(
+	ctx context.Context,
+	req *protobufs.SendRequest,
+) (*protobufs.SendResponse, error) {
+	if req == nil || req.Request == nil || len(req.Authentication) == 0 {
+		return &protobufs.SendResponse{}, nil
+	}
+
+	signer, err := r.keyManager.GetSigningKey("q-node-auth")
+	if err != nil {
+		r.logger.Error("no node auth key found")
+		// Do not flag auth failures
+		return &protobufs.SendResponse{}, nil
+	}
+
+	var payload []byte
+	var request []byte
+	if req.Request != nil {
+		payload, err = req.Request.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "send")
+		}
+		request = slices.Clone(payload)
+	}
+
+	if len(req.DeliveryData) != 0 {
+		for _, d := range req.DeliveryData {
+			p, err := proto.Marshal(d)
+			if err != nil {
+				return nil, errors.Wrap(err, "send")
+			}
+			payload = append(payload, p...)
+		}
+	}
+
+	if len(payload) == 0 {
+		return &protobufs.SendResponse{}, nil
+	}
+
+	valid, err := r.keyManager.ValidateSignature(
+		crypto.KeyTypeEd448,
+		signer.Public().([]byte),
+		payload,
+		req.Authentication,
+		slices.Concat([]byte("NODE_AUTHENTICATION"), req.Domain),
+	)
+	if err != nil || !valid {
+		// Do not flag auth failures
+		return &protobufs.SendResponse{}, nil
+	}
+
+	if len(request) != 0 {
+		if bytes.Equal(req.Domain, bytes.Repeat([]byte{0xff}, 32)) {
+			r.pubSub.Subscribe(
+				[]byte{0x00, 0x00, 0x00},
+				func(message *pb.Message) error { return nil },
+			)
+			err := r.pubSub.PublishToBitmask([]byte{0x00, 0x00, 0x00}, payload)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			bitmask := up2p.GetBloomFilter(req.Domain, 256, 3)
+			r.pubSub.Subscribe(
+				bitmask,
+				func(message *pb.Message) error { return nil },
+			)
+			err := r.pubSub.PublishToBitmask(bitmask, payload)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if len(req.DeliveryData) != 0 {
+		for _, d := range req.DeliveryData {
+			for _, i := range d.Messages {
+				bitmask := slices.Concat(
+					[]byte{0, 0},
+					up2p.GetBloomFilter(i.Address, 256, 3),
+				)
+				r.pubSub.Subscribe(
+					bitmask,
+					func(message *pb.Message) error { return nil },
+				)
+				msg, err := i.ToCanonicalBytes()
+				if err != nil {
+					return nil, err
+				}
+				err = r.pubSub.PublishToBitmask(bitmask, msg)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	return &protobufs.SendResponse{}, nil
 }
 
 func NewRPCServer(
-	listenAddrGRPC string,
-	listenAddrHTTP string,
+	config *config.Config,
 	logger *zap.Logger,
-	dataProofStore store.DataProofStore,
-	clockStore store.ClockStore,
-	coinStore store.CoinStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
-	masterClock *master.MasterClockConsensusEngine,
-	executionEngines []execution.ExecutionEngine,
+	peerInfoProvider PeerInfoProvider,
+	workerManager worker.WorkerManager,
+	proverRegistry consensus.ProverRegistry,
+	executionManager *manager.ExecutionEngineManager,
 ) (*RPCServer, error) {
-	mg, err := multiaddr.NewMultiaddr(listenAddrGRPC)
+	mg, err := multiaddr.NewMultiaddr(config.ListenGRPCMultiaddr)
 	if err != nil {
-		return nil, errors.Wrap(err, "new rpc server")
+		return nil, errors.Wrap(err, "new rpc server: grpc multiaddr")
 	}
 	mga, err := mn.ToNetAddr(mg)
 	if err != nil {
-		return nil, errors.Wrap(err, "new rpc server")
+		return nil, errors.Wrap(err, "new rpc server: grpc netaddr")
 	}
 
+	// HTTP gateway mux (optional)
 	mux := runtime.NewServeMux()
 	opts := qgrpc.ClientOptions(
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(600*1024*1024),
-			grpc.MaxCallSendMsgSize(600*1024*1024),
+			grpc.MaxCallRecvMsgSize(10*1024*1024),
+			grpc.MaxCallSendMsgSize(10*1024*1024),
 		),
 	)
-	if err := protobufs.RegisterNodeServiceHandlerFromEndpoint(
-		context.Background(),
-		mux,
-		mga.String(),
-		opts,
-	); err != nil {
-		return nil, err
+	if config.ListenRestMultiaddr != "" {
+		if err := protobufs.RegisterNodeServiceHandlerFromEndpoint(
+			context.Background(),
+			mux,
+			mga.String(),
+			opts,
+		); err != nil {
+			return nil, errors.Wrap(err, "register node service handler")
+		}
 	}
 
 	rpcServer := &RPCServer{
-		listenAddrGRPC:   listenAddrGRPC,
-		listenAddrHTTP:   listenAddrHTTP,
+		config:           config,
 		logger:           logger,
-		dataProofStore:   dataProofStore,
-		clockStore:       clockStore,
-		coinStore:        coinStore,
 		keyManager:       keyManager,
 		pubSub:           pubSub,
-		masterClock:      masterClock,
-		executionEngines: executionEngines,
+		peerInfoProvider: peerInfoProvider,
+		workerManager:    workerManager,
+		proverRegistry:   proverRegistry,
+		executionManager: executionManager,
 		grpcServer: qgrpc.NewServer(
-			grpc.MaxRecvMsgSize(600*1024*1024),
-			grpc.MaxSendMsgSize(600*1024*1024),
+			grpc.MaxRecvMsgSize(10*1024*1024),
+			grpc.MaxSendMsgSize(10*1024*1024),
 		),
-		httpServer: &http.Server{
-			Handler: mux,
-		},
+		httpServer: &http.Server{Handler: mux},
 	}
 
 	protobufs.RegisterNodeServiceServer(rpcServer.grpcServer, rpcServer)
-	reflection.Register(rpcServer.grpcServer)
-
 	return rpcServer, nil
 }
 
 func (r *RPCServer) Start() error {
-	mg, err := multiaddr.NewMultiaddr(r.listenAddrGRPC)
+	// Start GRPC
+	mg, err := multiaddr.NewMultiaddr(r.config.ListenGRPCMultiaddr)
 	if err != nil {
-		return errors.Wrap(err, "start")
+		return errors.Wrap(err, "start: grpc multiaddr")
 	}
-
 	lis, err := mn.Listen(mg)
 	if err != nil {
-		return errors.Wrap(err, "start")
+		return errors.Wrap(err, "start: grpc listen")
 	}
-
 	go func() {
 		if err := r.grpcServer.Serve(mn.NetListener(lis)); err != nil {
-			r.logger.Error("serve error", zap.Error(err))
+			r.logger.Error("grpc serve error", zap.Error(err))
 		}
 	}()
 
-	if r.listenAddrHTTP != "" {
-		mh, err := multiaddr.NewMultiaddr(r.listenAddrHTTP)
+	// Start HTTP gateway if requested
+	if r.config.ListenRestMultiaddr != "" {
+		mh, err := multiaddr.NewMultiaddr(r.config.ListenRestMultiaddr)
 		if err != nil {
-			return errors.Wrap(err, "start")
+			return errors.Wrap(err, "start: http multiaddr")
 		}
-
-		lis, err := mn.Listen(mh)
+		hl, err := mn.Listen(mh)
 		if err != nil {
-			return errors.Wrap(err, "start")
+			return errors.Wrap(err, "start: http listen")
 		}
-
 		go func() {
-			if err := r.httpServer.Serve(mn.NetListener(lis)); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				r.logger.Error("serve error", zap.Error(err))
+			if err := r.httpServer.Serve(
+				mn.NetListener(hl),
+			); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				r.logger.Error("http serve error", zap.Error(err))
 			}
 		}()
 	}
@@ -478,7 +421,7 @@ func (r *RPCServer) Stop() {
 	}()
 	go func() {
 		defer wg.Done()
-		r.httpServer.Shutdown(context.Background())
+		_ = r.httpServer.Shutdown(context.Background())
 	}()
 	wg.Wait()
 }

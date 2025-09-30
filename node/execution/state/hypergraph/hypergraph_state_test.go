@@ -17,6 +17,7 @@ import (
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/node/tests"
 	tcrypto "source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 	thypergraph "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
@@ -41,8 +42,11 @@ func setupTest(t *testing.T) (*hypergraph.HypergraphState, thypergraph.Hypergrap
 		vep,
 	})
 	hg := hgcrdt.NewHypergraph(
+		logger,
 		store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, s, logger, enc, incProver),
 		incProver,
+		[]int{},
+		&tests.Nopthenticator{},
 	)
 	st := hypergraph.NewHypergraphState(hg)
 
@@ -87,8 +91,11 @@ func TestHypergraphState(t *testing.T) {
 			vep,
 		})
 		hg := hgcrdt.NewHypergraph(
+			logger,
 			store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, s, logger, enc, incProver),
 			incProver,
+			[]int{},
+			&tests.Nopthenticator{},
 		)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
@@ -266,45 +273,6 @@ func TestHypergraphState(t *testing.T) {
 		)
 		assert.Error(t, err)
 		assert.True(t, errors.Is(errors.Cause(errors.Cause(err)), state.ErrInvalidDiscriminator))
-	})
-
-	// Test setting a conflicting change
-	t.Run("Set with Conflicting Change", func(t *testing.T) {
-		st, _, vep, _, incProver := setupTest(t)
-
-		// Setup data
-		domain := generateRandomBytes(32)
-		vertexAddress := generateRandomBytes(32)
-		dataTree := createDataTree(vep, incProver)
-
-		vertexAddState := st.NewVertexAddMaterializedState(
-			[32]byte(domain),
-			[32]byte(vertexAddress),
-			0,
-			nil,
-			dataTree,
-		)
-
-		// Set the first time
-		err := st.Set(
-			domain,
-			vertexAddress,
-			hypergraph.VertexAddsDiscriminator,
-			0,
-			vertexAddState,
-		)
-		assert.NoError(t, err)
-
-		// Try to set again with the same domain, address, and discriminator
-		err = st.Set(
-			domain,
-			vertexAddress,
-			hypergraph.VertexAddsDiscriminator,
-			0,
-			vertexAddState,
-		)
-		assert.Error(t, err)
-		assert.True(t, errors.Is(errors.Cause(errors.Cause(err)), state.ErrConflictingChange))
 	})
 
 	// Test getting with invalid discriminator
@@ -521,10 +489,12 @@ func TestHypergraphState(t *testing.T) {
 		postRevert := hg.Commit()
 
 		for i := range preRemove {
-			assert.True(t, bytes.Equal(preRemove[i], postRevert[i]))
-			// The remove records create commit values
-			if i%2 == 1 {
-				assert.False(t, bytes.Equal(preRemove[i], postRemove[i]))
+			for j := range preRemove[i] {
+				assert.True(t, bytes.Equal(preRemove[i][j], postRevert[i][j]))
+				// The remove records will have differing commit values
+				if j%2 == 1 {
+					assert.False(t, bytes.Equal(preRemove[i][j], postRemove[i][j]))
+				}
 			}
 		}
 

@@ -21,7 +21,7 @@ import (
 func TestGlobalTimeReel_MassiveEquivocationForkChoice(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -149,7 +149,7 @@ func TestGlobalTimeReel_MassiveEquivocationForkChoice(t *testing.T) {
 func TestGlobalTimeReel_EquivocationWithForkChoice(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -249,7 +249,7 @@ func TestGlobalTimeReel_EquivocationWithForkChoice(t *testing.T) {
 func TestGlobalTimeReel_NonOverlappingForks(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	s := setupTestClockStore(t)
-	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99)
+	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
 	err = atr.Start()

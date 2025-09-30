@@ -1,0 +1,179 @@
+syntax = "proto3";
+
+package quilibrium.node.application.pb;
+
+option go_package = "source.quilibrium.com/quilibrium/monorepo/node/protobufs";
+
+message Message {
+  bytes hash = 1;
+  bytes address = 2;
+  bytes payload = 3;
+}
+
+// The HypergraphPhaseSet defines the specific phase set for further operation.
+enum HypergraphPhaseSet {
+  HYPERGRAPH_PHASE_SET_VERTEX_ADDS = 0;
+  HYPERGRAPH_PHASE_SET_VERTEX_REMOVES = 1;
+  HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS = 2;
+  HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES = 3;
+}
+
+message HypersyncMetadata {
+  uint64 leaves = 1;
+  bytes root_commitment = 2;
+}
+
+// Defines the request for comparison of hypergraph data
+message HypergraphComparisonQuery {
+  // The shard to compare.
+  bytes shard_key = 1;
+  // The phase set to compare.
+  HypergraphPhaseSet phase_set = 2;
+  // The branch path (sequence of nibble indices) in the vector commitment tree.
+  repeated int32 path = 3;
+  // The commitment for the node at this path.
+  bytes commitment = 4;
+  // For branch nodes, a list of its immediate children (by index) and their
+  // commitments. When the list is empty, it means either the node is a leaf or
+  // no children diff info is needed.
+  repeated BranchChild children = 5;
+  // If set, the comparison response will contain the data of leaves if present
+  // in the results.
+  bool include_leaf_data = 6;
+}
+
+// Defines the response containing the commitment for a node and (optionally)
+// its immediate children. The children are identified by their index (0–63) and
+// their commitments.
+message HypergraphComparisonResponse {
+  // The branch path for this node.
+  repeated int32 path = 1;
+  // The commitment for the node at this path.
+  bytes commitment = 2;
+  // If non-empty, a list of children for which the node can report commitments.
+  // (For instance, if the node is a branch you may want to send the commitment
+  // for each child.)
+  repeated BranchChild children = 3;
+  // If set, indicates the response is for the root of the given set tree.
+  bool is_root = 4;
+}
+
+// Defines the child commitment.
+message BranchChild {
+  // The index on the branch's children.
+  int32 index = 1;
+  // The commitment of the data.
+  bytes commitment = 2;
+}
+
+// Defines the data of the leaf.
+message LeafData {
+  // The full key of the leaf.
+  bytes key = 1;
+  // The value for the leaf.
+  bytes value = 2;
+  // The hash target if any.
+  bytes hash_target = 3;
+  // The size, represented as big endian unsigned bytes.
+  bytes size = 4;
+  // The underlying data backing the leaf, if a vertex.
+  bytes underlying_data = 5;
+}
+
+// Defines the bidirectional sync payload options.
+message HypergraphComparison {
+  oneof payload {
+    HypergraphComparisonQuery query = 1;
+    HypergraphComparisonResponse response = 2;
+    LeafData leaf_data = 3;
+    HypersyncMetadata metadata = 4;
+  }
+}
+
+// Multiproof contains the cryptographic proof data
+message Multiproof {
+  bytes multicommitment = 1;
+  bytes proof = 2;
+}
+
+// Path represents a sequence of indices through the tree
+message Path {
+  repeated uint64 indices = 1;
+}
+
+// TraversalSubProof contains proof data for a single path traversal
+message TraversalSubProof {
+  repeated bytes commits = 1;
+  repeated bytes ys = 2;
+  repeated Path paths = 3;
+}
+
+// TraversalProof is the main proof structure for tree traversals
+message TraversalProof {
+  Multiproof multiproof = 1;
+  repeated TraversalSubProof sub_proofs = 2;
+}
+
+message GetChildrenForPathRequest {
+  // The shard key
+  bytes shard_key = 1;
+  // The path to request
+  repeated uint32 path = 2;
+  // The phase set to compare.
+  HypergraphPhaseSet phase_set = 3;
+}
+
+message TreePathLeaf {
+  // The key associated with the leaf
+  bytes key = 1;
+  // The raw value associated with the leaf
+	bytes value = 2;
+  // The hash target of the leaf, if applicable
+	bytes hash_target = 3;
+  // The commitment of the leaf
+	bytes commitment = 4;
+  // The big endian encoded size of the leaf
+	bytes size = 5;
+}
+
+message TreePathBranch {
+  // The prefix segment of the branch that exists only within the branch
+  repeated uint32 prefix = 1;
+  // The commitment of the branch
+	bytes commitment = 2;
+  // The big endian encoded size of the branch
+	bytes size = 3;
+  // The number of leaves under the branch
+	uint64 leaf_count = 4;
+  // The longest branch length under the branch
+	uint32 longest_branch = 5;
+  // The full path prefix to the branch
+	repeated uint32 full_prefix = 6;
+}
+
+message TreePathSegment {
+  uint32 index = 1;
+  oneof segment {
+    TreePathLeaf leaf = 2;
+    TreePathBranch branch = 3;
+  }
+}
+
+message TreePathSegments {
+  repeated TreePathSegment segments = 1;
+}
+
+message GetChildrenForPathResponse {
+  repeated TreePathSegments path_segments = 1;
+}
+
+// A bidirectional streaming service in which nodes send queries for a
+// particular hypergraph shard phase set (identified by its key, phase and path)
+// and the other responds with the commitment for that branch and its children.
+// Note: this should be used for synchronization purposes only – attempting to
+// use this as a query service will explicitly reveal the query data to the
+// node.
+service HypergraphComparisonService {
+  rpc HyperStream(stream HypergraphComparison) returns (stream HypergraphComparison);
+  rpc GetChildrenForPath(GetChildrenForPathRequest) returns (GetChildrenForPathResponse);
+}

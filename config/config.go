@@ -39,6 +39,7 @@ func (c GRPCMessageLimitsConfig) WithDefaults(recv, send int) GRPCMessageLimitsC
 }
 
 type Config struct {
+	Alias               *AliasConfig  `yaml:"alias"`
 	Key                 *KeyConfig    `yaml:"key"`
 	P2P                 *P2PConfig    `yaml:"p2p"`
 	Engine              *EngineConfig `yaml:"engine"`
@@ -49,8 +50,13 @@ type Config struct {
 }
 
 // WithDefaults returns a copy of the config with default values filled in.
-func (c Config) WithDefaults() Config {
+func (c Config) WithDefaults(configPath string) Config {
 	cpy := c
+	if cpy.Alias == nil {
+		cpy.Alias = &AliasConfig{}
+	}
+	alias := cpy.Alias.WithDefaults(configPath)
+	cpy.Alias = &alias
 	db := cpy.DB.WithDefaults()
 	cpy.DB = &db
 	p2p := cpy.P2P.WithDefaults()
@@ -80,12 +86,7 @@ func NewConfig(configPath string) (*Config, error) {
 
 var BootstrapPeers = []string{
 	"/dns/bootstrap.quilibrium.com/udp/8336/quic-v1/p2p/Qme3g6rJWuz8HVXxpDb7aV2hiFq8bZJNqxMmwzmASzfq1M",
-	"/dns/quaalude.quilibrium.com/udp/8336/quic-v1/p2p/QmYruNcruYNgyTKeUqJSxjbuTFYWYDw2r5df9YKMGWCRKA",
 	"/dns/quecifer.quilibrium.com/udp/8336/quic-v1/p2p/QmdWF9bGTH5mwJXkxrG859HA5r34MxXtMSTuEikSMDSESv",
-	"/dns/quantum.quilibrium.com/udp/8336/quic-v1/p2p/QmbmVeKnSWK9HHAQHSS714XU3gx77TrS356JmHmKFj7q7M",
-	"/dns/quidditas.quilibrium.com/udp/8336/quic-v1/p2p/QmR1rF5E9zAob9FZyMF7uTUM27D7GYtX9RaiSsNY9UP72J",
-	"/dns/quillon.quilibrium.com/udp/8336/quic-v1/p2p/QmWgHv6z3tyimW4JvrvYRgsJEimgV7J2xbE7QEpFNPvAnB",
-	"/dns/quidditch.quilibrium.com/udp/8336/quic-v1/p2p/QmbZEGuinaCndj4XLb6fteZmjmP3C1Tsgijmc5BGuUk8Ma",
 	"/dns/quagmire.quilibrium.com/udp/8336/quic-v1/p2p/QmaQ9KAaKtqXhYSQ5ARQNnn8B8474cWGvvD6PgJ4gAtMrx",
 	"/ip4/204.186.74.46/udp/8316/quic-v1/p2p/QmeqBjm3iX7sdTieyto1gys5ruQrQNPKfaTGcVQQWJPYDV",
 	"/ip4/65.109.17.13/udp/8336/quic-v1/p2p/Qmc35n99eojSvW3PkbfBczJoSX92WmnnKh3Fg114ok3oo4",
@@ -144,7 +145,7 @@ var Signatories = []string{
 	"de4cfe7083104bfe32f0d4082fa0200464d8b10804a811653eedda376efcad64dd222f0f0ceb0b8ae58abe830d7a7e3f3b2d79d691318daa00",
 	"540237a35e124882d6b64e7bb5718273fa338e553f772b77fe90570e45303762b34131bdcb6c0b9f2cf9e393d9c7e0f546eeab0bcbbd881680",
 	"fbe4166e37f93f90d2ebf06305315ae11b37e501d09596f8bde11ba9d343034fbca80f252205aa2f582a512a72ad293df371baa582da072900",
-	"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+	"4160572e493e1bf15c44e055b11bf75230c76c7d2c67b48066770ab03dfd5ed34c97b9a431ec18578c83a0df9250b8362c38068650e8b01400",
 	"45170b626884b85d61ae109f2aa9b0e1ecc18b181508431ea6308f3869f2adae49da9799a0a594eaa4ef3ad492518fb1729decd44169d40d00",
 	"92cd8ee5362f3ae274a75ab9471024dbc144bff441ed8af7d19750ac512ff51e40e7f7b01e4f96b6345dd58878565948c3eb52c53f250b5080",
 	"001a4cbfce5d9aeb7e20665b0d236721b228a32f0baee62ffa77f45b82ecaf577e8a38b7ef91fcf7d2d2d2b504f085461398d30b24abb1d700",
@@ -413,7 +414,7 @@ func LoadConfig(configPath string, proverKey string, skipGenesisCheck bool) (
 		config.P2P.BootstrapPeers = peers
 	}
 
-	withDefaults := config.WithDefaults()
+	withDefaults := config.WithDefaults(configPath)
 	return &withDefaults, nil
 }
 

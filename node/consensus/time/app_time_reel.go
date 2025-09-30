@@ -898,7 +898,7 @@ func (a *AppTimeReel) findCommonAncestor(
 				zap.Uint64("ancestor_frame", current.Frame.Header.FrameNumber),
 				zap.Uint64("node1_frame", node1.Frame.Header.FrameNumber),
 				zap.Uint64("node2_frame", node2.Frame.Header.FrameNumber))
-			
+
 			// Build revert path from node1 back to the common ancestor (not including it)
 			prev := []*FrameNode{node1}
 			walk := node1
@@ -999,7 +999,6 @@ func (a *AppTimeReel) rewindFrames(revertNodes []*FrameNode) {
 		)
 		return
 	}
-	defer txn.Abort() // Will be no-op if committed successfully
 
 	// Process each frame in the revert list (already in correct order)
 	for _, node := range revertNodes {
@@ -1014,6 +1013,7 @@ func (a *AppTimeReel) rewindFrames(revertNodes []*FrameNode) {
 			txn,
 			node.Frame,
 		); err != nil {
+			txn.Abort()
 			a.logger.Error(
 				"failed to revert frame side effects",
 				zap.String("address", fmt.Sprintf("%x", a.address)),
@@ -1068,7 +1068,10 @@ func (a *AppTimeReel) GetHead() (*protobufs.AppShardFrame, error) {
 }
 
 // GetFrame retrieves a frame by frame ID
-func (a *AppTimeReel) GetFrame(frameID string) (*protobufs.AppShardFrame, error) {
+func (a *AppTimeReel) GetFrame(frameID string) (
+	*protobufs.AppShardFrame,
+	error,
+) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 

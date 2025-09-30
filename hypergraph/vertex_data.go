@@ -29,6 +29,9 @@ func (hg *HypergraphCRDT) GetVertexData(id [64]byte) (
 	*tries.VectorCommitmentTree,
 	error,
 ) {
+	hg.mu.RLock()
+	defer hg.mu.RUnlock()
+
 	timer := prometheus.NewTimer(GetDuration.WithLabelValues("vertex_data"))
 	defer timer.ObserveDuration()
 
@@ -44,6 +47,7 @@ func (hg *HypergraphCRDT) GetVertexData(id [64]byte) (
 		hg.vertexAdds,
 		hg.vertexRemoves,
 		hypergraph.VertexAtomType,
+		hg.getCoveredPrefix(),
 	)
 	if removeSet.Has(id) {
 		GetVertexDataTotal.WithLabelValues("removed").Inc()
@@ -69,6 +73,9 @@ func (hg *HypergraphCRDT) SetVertexData(
 	id [64]byte,
 	data *tries.VectorCommitmentTree,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
 	err := hg.store.SaveVertexTree(txn, id[:], data)
 	if err != nil {
 		VertexDataSetTotal.WithLabelValues("error").Inc()
@@ -85,6 +92,9 @@ func (hg *HypergraphCRDT) RunDataPruning(
 	txn tries.TreeBackingStoreTransaction,
 	frameNumber uint64,
 ) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
 	timer := prometheus.NewTimer(VertexDataPruningDuration)
 	defer timer.ObserveDuration()
 
@@ -102,11 +112,34 @@ func (hg *HypergraphCRDT) RunDataPruning(
 // used when an error occurs creating the real iterator
 type noOpVertexDataIterator struct{}
 
-func (n *noOpVertexDataIterator) Key() []byte                        { return nil }
-func (n *noOpVertexDataIterator) First() bool                        { return false }
-func (n *noOpVertexDataIterator) Next() bool                         { return false }
-func (n *noOpVertexDataIterator) Prev() bool                         { return false }
-func (n *noOpVertexDataIterator) Valid() bool                        { return false }
-func (n *noOpVertexDataIterator) Value() *tries.VectorCommitmentTree { return nil }
-func (n *noOpVertexDataIterator) Close() error                       { return nil }
-func (n *noOpVertexDataIterator) Last() bool                         { return false }
+func (n *noOpVertexDataIterator) Key() []byte {
+	return nil
+}
+
+func (n *noOpVertexDataIterator) First() bool {
+	return false
+}
+
+func (n *noOpVertexDataIterator) Next() bool {
+	return false
+}
+
+func (n *noOpVertexDataIterator) Prev() bool {
+	return false
+}
+
+func (n *noOpVertexDataIterator) Valid() bool {
+	return false
+}
+
+func (n *noOpVertexDataIterator) Value() *tries.VectorCommitmentTree {
+	return nil
+}
+
+func (n *noOpVertexDataIterator) Close() error {
+	return nil
+}
+
+func (n *noOpVertexDataIterator) Last() bool {
+	return false
+}
