@@ -3,47 +3,51 @@ package runtime
 import (
 	"log"
 	"runtime"
+	"strconv"
 )
 
-const minimumCores = 3
+const minCores = 4
+const minWorkers = minCores - 1
 
 // WorkerCount returns the number of workers to use CPU bound tasks.
 // It will use GOMAXPROCS as a base, and then subtract a number of CPUs
 // which are meant to be left for other tasks, such as networking.
 func WorkerCount(requested int, validate bool, legacy bool) int {
-	n := runtime.GOMAXPROCS(0)
+	cores := runtime.GOMAXPROCS(0)
 	if validate {
-		if n < minimumCores {
-			log.Panic("invalid system configuration, must have at least 3 cores")
+		if cores < minCores {
+			log.Panic("invalid system configuration, must have at least " +
+				strconv.Itoa(minCores) + " cores")
 		}
-		if requested > 0 && requested < minimumCores {
-			log.Panic("invalid worker count, must have at least 3 workers")
+		if requested > 0 && requested < minWorkers {
+			log.Panic("invalid worker count, must have at least " +
+				strconv.Itoa(minWorkers) + " workers")
 		}
 	}
 	if requested > 0 {
-		return min(requested, n)
+		return min(requested, cores)
 	}
 
 	if legacy {
 		switch {
-		case n == 1:
+		case cores == 1:
 			return 1
-		case n <= 4:
-			return n - 1
-		case n <= 16:
-			return n - 2
-		case n <= 32:
-			return n - 3
-		case n <= 64:
-			return n - 4
+		case cores <= 4:
+			return cores - 1
+		case cores <= 16:
+			return cores - 2
+		case cores <= 32:
+			return cores - 3
+		case cores <= 64:
+			return cores - 4
 		default:
-			return n - 5
+			return cores - 5
 		}
 	}
 
-	if n == 1 {
+	if cores == 1 {
 		return 1
 	}
 
-	return n - 1
+	return cores - 1
 }
