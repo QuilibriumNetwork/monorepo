@@ -91,8 +91,8 @@ func (m *MockKeyStore) GetCrossSignatureByProvingKey(
 	return args.Get(0).([]byte), args.Error(1)
 }
 
-// PutSignedKey implements store.KeyStore.
-func (m *MockKeyStore) PutSignedKey(
+// PutSignedX448Key implements store.KeyStore.
+func (m *MockKeyStore) PutSignedX448Key(
 	txn store.Transaction,
 	address []byte,
 	key *protobufs.SignedX448Key,
@@ -101,16 +101,16 @@ func (m *MockKeyStore) PutSignedKey(
 	return args.Error(0)
 }
 
-// GetSignedKey implements store.KeyStore.
-func (m *MockKeyStore) GetSignedKey(
+// GetSignedX448Key implements store.KeyStore.
+func (m *MockKeyStore) GetSignedX448Key(
 	address []byte,
 ) (*protobufs.SignedX448Key, error) {
 	args := m.Called(address)
 	return args.Get(0).(*protobufs.SignedX448Key), args.Error(1)
 }
 
-// GetSignedKeysByParent implements store.KeyStore.
-func (m *MockKeyStore) GetSignedKeysByParent(
+// GetSignedX448KeysByParent implements store.KeyStore.
+func (m *MockKeyStore) GetSignedX448KeysByParent(
 	parentKeyAddress []byte,
 	keyPurpose string,
 ) ([]*protobufs.SignedX448Key, error) {
@@ -118,8 +118,44 @@ func (m *MockKeyStore) GetSignedKeysByParent(
 	return args.Get(0).([]*protobufs.SignedX448Key), args.Error(1)
 }
 
-// DeleteSignedKey implements store.KeyStore.
-func (m *MockKeyStore) DeleteSignedKey(
+// DeleteSignedX448Key implements store.KeyStore.
+func (m *MockKeyStore) DeleteSignedX448Key(
+	txn store.Transaction,
+	address []byte,
+) error {
+	args := m.Called(txn, address)
+	return args.Error(0)
+}
+
+// PutSignedDecaf448Key implements store.KeyStore.
+func (m *MockKeyStore) PutSignedDecaf448Key(
+	txn store.Transaction,
+	address []byte,
+	key *protobufs.SignedDecaf448Key,
+) error {
+	args := m.Called(txn, address, key)
+	return args.Error(0)
+}
+
+// GetSignedDecaf448Key implements store.KeyStore.
+func (m *MockKeyStore) GetSignedDecaf448Key(
+	address []byte,
+) (*protobufs.SignedDecaf448Key, error) {
+	args := m.Called(address)
+	return args.Get(0).(*protobufs.SignedDecaf448Key), args.Error(1)
+}
+
+// GetSignedDecaf448KeysByParent implements store.KeyStore.
+func (m *MockKeyStore) GetSignedDecaf448KeysByParent(
+	parentKeyAddress []byte,
+	keyPurpose string,
+) ([]*protobufs.SignedDecaf448Key, error) {
+	args := m.Called(parentKeyAddress, keyPurpose)
+	return args.Get(0).([]*protobufs.SignedDecaf448Key), args.Error(1)
+}
+
+// DeleteSignedDecaf448Key implements store.KeyStore.
+func (m *MockKeyStore) DeleteSignedDecaf448Key(
 	txn store.Transaction,
 	address []byte,
 ) error {
@@ -169,12 +205,22 @@ func (m *MockKeyStore) RangeIdentityKeys() (
 		args.Error(1)
 }
 
-// RangeSignedKeys implements store.KeyStore.
-func (m *MockKeyStore) RangeSignedKeys(
+// RangeSignedX448Keys implements store.KeyStore.
+func (m *MockKeyStore) RangeSignedX448Keys(
 	parentKeyAddress []byte,
 	keyPurpose string,
 ) (store.TypedIterator[*protobufs.SignedX448Key], error) {
 	args := m.Called(parentKeyAddress, keyPurpose)
 	return args.Get(0).(store.TypedIterator[*protobufs.SignedX448Key]),
+		args.Error(1)
+}
+
+// RangeSignedKeys implements store.KeyStore.
+func (m *MockKeyStore) RangeSignedDecaf448Keys(
+	parentKeyAddress []byte,
+	keyPurpose string,
+) (store.TypedIterator[*protobufs.SignedDecaf448Key], error) {
+	args := m.Called(parentKeyAddress, keyPurpose)
+	return args.Get(0).(store.TypedIterator[*protobufs.SignedDecaf448Key]),
 		args.Error(1)
 }

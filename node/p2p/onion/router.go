@@ -945,7 +945,7 @@ func hasCapability(pm *p2p.PeerInfo, x uint32) bool {
 func (r *OnionRouter) resolveOnionKey(
 	peerIdentityAddr []byte,
 ) ([]byte, error) {
-	keys, err := r.signers.GetSignedKeysByParent(peerIdentityAddr, r.keyUsage)
+	keys, err := r.signers.GetSignedX448KeysByParent(peerIdentityAddr, r.keyUsage)
 	if err != nil {
 		return nil, err
 	}

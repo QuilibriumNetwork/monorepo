@@ -325,12 +325,12 @@ func TestValidateSignedKey(t *testing.T) {
 		addressBI, _ := poseidon.HashBytes(pubKey)
 		signedKey.ParentKeyAddress = addressBI.FillBytes(make([]byte, 32))
 
-		err := registry.ValidateSignedKey(signedKey)
+		err := registry.ValidateSignedX448Key(signedKey)
 		require.NoError(t, err)
 	})
 
 	t.Run("Nil signed key", func(t *testing.T) {
-		err := registry.ValidateSignedKey(nil)
+		err := registry.ValidateSignedX448Key(nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "validate signed key")
 	})
@@ -442,9 +442,9 @@ func TestPutSignedKey(t *testing.T) {
 	signedKey.ParentKeyAddress = addressBI.FillBytes(make([]byte, 32))
 
 	// Mock the keyStore PutSignedKey
-	keyStore.On("PutSignedKey", mockTxn, address, signedKey).Return(nil)
+	keyStore.On("PutSignedX448Key", mockTxn, address, signedKey).Return(nil)
 
-	err = registry.PutSignedKey(mockTxn, address, signedKey)
+	err = registry.PutSignedX448Key(mockTxn, address, signedKey)
 	require.NoError(t, err)
 
 	keyStore.AssertExpectations(t)
@@ -480,7 +480,7 @@ func TestGetKeyRegistry(t *testing.T) {
 		KeysByPurpose: map[string]*protobufs.KeyCollection{
 			"inbox": {
 				KeyPurpose: "inbox",
-				Keys: []*protobufs.SignedX448Key{
+				X448Keys: []*protobufs.SignedX448Key{
 					createTestSignedX448Key(priv, "inbox"),
 				},
 			},

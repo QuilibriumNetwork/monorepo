@@ -94,6 +94,41 @@ type memKeyStore struct {
 	signed map[string][]*protobufs.SignedX448Key // parentAddr(string) -> keys
 }
 
+// DeleteSignedDecaf448Key implements store.KeyStore.
+func (m *memKeyStore) DeleteSignedDecaf448Key(txn store.Transaction, address []byte) error {
+	panic("unimplemented")
+}
+
+// DeleteSignedX448Key implements store.KeyStore.
+func (m *memKeyStore) DeleteSignedX448Key(txn store.Transaction, address []byte) error {
+	panic("unimplemented")
+}
+
+// GetSignedDecaf448Key implements store.KeyStore.
+func (m *memKeyStore) GetSignedDecaf448Key(address []byte) (*protobufs.SignedDecaf448Key, error) {
+	panic("unimplemented")
+}
+
+// GetSignedDecaf448KeysByParent implements store.KeyStore.
+func (m *memKeyStore) GetSignedDecaf448KeysByParent(parentKeyAddress []byte, keyPurpose string) ([]*protobufs.SignedDecaf448Key, error) {
+	panic("unimplemented")
+}
+
+// GetSignedX448Key implements store.KeyStore.
+func (m *memKeyStore) GetSignedX448Key(address []byte) (*protobufs.SignedX448Key, error) {
+	panic("unimplemented")
+}
+
+// PutSignedDecaf448Key implements store.KeyStore.
+func (m *memKeyStore) PutSignedDecaf448Key(txn store.Transaction, address []byte, key *protobufs.SignedDecaf448Key) error {
+	panic("unimplemented")
+}
+
+// RangeSignedDecaf448Keys implements store.KeyStore.
+func (m *memKeyStore) RangeSignedDecaf448Keys(parentKeyAddress []byte, keyPurpose string) (store.TypedIterator[*protobufs.SignedDecaf448Key], error) {
+	panic("unimplemented")
+}
+
 // DeleteSignedKey implements store.KeyStore.
 func (m *memKeyStore) DeleteSignedKey(txn store.Transaction, address []byte) error {
 	panic("unimplemented")
@@ -123,7 +158,7 @@ func newMemKeyStore() *memKeyStore {
 	return &memKeyStore{signed: make(map[string][]*protobufs.SignedX448Key)}
 }
 
-func (m *memKeyStore) GetSignedKeysByParent(parentKeyAddress []byte, keyPurpose string) ([]*protobufs.SignedX448Key, error) {
+func (m *memKeyStore) GetSignedX448KeysByParent(parentKeyAddress []byte, keyPurpose string) ([]*protobufs.SignedX448Key, error) {
 	return m.signed[string(parentKeyAddress)], nil
 }
 
@@ -134,7 +169,7 @@ func (m *memKeyStore) RangeProvingKeys() (store.TypedIterator[*protobufs.BLS4858
 func (m *memKeyStore) RangeIdentityKeys() (store.TypedIterator[*protobufs.Ed448PublicKey], error) {
 	return nil, nil
 }
-func (m *memKeyStore) RangeSignedKeys([]byte, string) (store.TypedIterator[*protobufs.SignedX448Key], error) {
+func (m *memKeyStore) RangeSignedX448Keys([]byte, string) (store.TypedIterator[*protobufs.SignedX448Key], error) {
 	return nil, nil
 }
 func (m *memKeyStore) GetIdentityKey([]byte) (*protobufs.Ed448PublicKey, error) { return nil, nil }
@@ -154,10 +189,10 @@ func (m *memKeyStore) PutProvingKey(store.Transaction, []byte, *protobufs.BLS485
 func (m *memKeyStore) PutCrossSignature(store.Transaction, []byte, []byte, []byte, []byte) error {
 	return nil
 }
-func (m *memKeyStore) PutSignedKey(store.Transaction, []byte, *protobufs.SignedX448Key) error {
+func (m *memKeyStore) PutSignedX448Key(store.Transaction, []byte, *protobufs.SignedX448Key) error {
 	return nil
 }
-func (m *memKeyStore) GetSignedKeysByParentAndPurpose([]byte, string) ([]*protobufs.SignedX448Key, error) {
+func (m *memKeyStore) GetSignedX448KeysByParentAndPurpose([]byte, string) ([]*protobufs.SignedX448Key, error) {
 	return nil, nil
 }
 func (m *memKeyStore) Begin() (store.Transaction, error) { return nil, nil }

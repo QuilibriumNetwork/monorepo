@@ -167,37 +167,37 @@ func TestPebbleKeyStore_SignedKeys(t *testing.T) {
 	txn, err := store.NewTransaction()
 	require.NoError(t, err)
 
-	err = store.PutSignedKey(txn, keyAddress, signedKey)
+	err = store.PutSignedX448Key(txn, keyAddress, signedKey)
 	require.NoError(t, err)
 
 	err = txn.Commit()
 	require.NoError(t, err)
 
 	// Test getting signed key
-	retrievedKey, err := store.GetSignedKey(keyAddress)
+	retrievedKey, err := store.GetSignedX448Key(keyAddress)
 	require.NoError(t, err)
 	assert.True(t, bytes.Equal(signedKey.Key.KeyValue, retrievedKey.Key.KeyValue))
 	assert.True(t, bytes.Equal(signedKey.ParentKeyAddress, retrievedKey.ParentKeyAddress))
 	assert.Equal(t, signedKey.KeyPurpose, retrievedKey.KeyPurpose)
 
 	// Test getting by parent
-	keys, err := store.GetSignedKeysByParent(parentKeyAddress, "")
+	keys, err := store.GetSignedX448KeysByParent(parentKeyAddress, "")
 	require.NoError(t, err)
 	assert.Len(t, keys, 1)
 	assert.True(t, bytes.Equal(signedKey.Key.KeyValue, keys[0].Key.KeyValue))
 
 	// Test getting by parent and purpose
-	keys, err = store.GetSignedKeysByParent(parentKeyAddress, "inbox")
+	keys, err = store.GetSignedX448KeysByParent(parentKeyAddress, "inbox")
 	require.NoError(t, err)
 	assert.Len(t, keys, 1)
 
 	// Test getting by parent and wrong purpose
-	keys, err = store.GetSignedKeysByParent(parentKeyAddress, "device")
+	keys, err = store.GetSignedX448KeysByParent(parentKeyAddress, "device")
 	require.NoError(t, err)
 	assert.Len(t, keys, 0)
 
 	// Test non-existent key
-	_, err = store.GetSignedKey(generateRandomBytes(t, 32))
+	_, err = store.GetSignedX448Key(generateRandomBytes(t, 32))
 	assert.ErrorIs(t, err, tstore.ErrNotFound)
 }
 
@@ -219,7 +219,7 @@ func TestPebbleKeyStore_SignedKeysMultiplePurposes(t *testing.T) {
 		keyAddresses[i] = keyAddress
 		signedKey := createTestSignedX448Key(t, parentKeyAddress, purpose)
 
-		err = store.PutSignedKey(txn, keyAddress, signedKey)
+		err = store.PutSignedX448Key(txn, keyAddress, signedKey)
 		require.NoError(t, err)
 	}
 
@@ -227,20 +227,20 @@ func TestPebbleKeyStore_SignedKeysMultiplePurposes(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test getting all keys by parent
-	keys, err := store.GetSignedKeysByParent(parentKeyAddress, "")
+	keys, err := store.GetSignedX448KeysByParent(parentKeyAddress, "")
 	require.NoError(t, err)
 	assert.Len(t, keys, len(purposes))
 
 	// Test getting keys by specific purpose
 	for _, purpose := range purposes {
-		keys, err = store.GetSignedKeysByParent(parentKeyAddress, purpose)
+		keys, err = store.GetSignedX448KeysByParent(parentKeyAddress, purpose)
 		require.NoError(t, err)
 		assert.Len(t, keys, 1)
 		assert.Equal(t, purpose, keys[0].KeyPurpose)
 	}
 }
 
-func TestPebbleKeyStore_DeleteSignedKey(t *testing.T) {
+func TestPebbleKeyStore_DeleteSignedX448Key(t *testing.T) {
 	store := setupTestKeyStore(t)
 	defer store.db.Close()
 
@@ -252,32 +252,32 @@ func TestPebbleKeyStore_DeleteSignedKey(t *testing.T) {
 	txn, err := store.NewTransaction()
 	require.NoError(t, err)
 
-	err = store.PutSignedKey(txn, keyAddress, signedKey)
+	err = store.PutSignedX448Key(txn, keyAddress, signedKey)
 	require.NoError(t, err)
 
 	err = txn.Commit()
 	require.NoError(t, err)
 
 	// Verify it exists
-	_, err = store.GetSignedKey(keyAddress)
+	_, err = store.GetSignedX448Key(keyAddress)
 	require.NoError(t, err)
 
 	// Delete the key
 	txn, err = store.NewTransaction()
 	require.NoError(t, err)
 
-	err = store.DeleteSignedKey(txn, keyAddress)
+	err = store.DeleteSignedX448Key(txn, keyAddress)
 	require.NoError(t, err)
 
 	err = txn.Commit()
 	require.NoError(t, err)
 
 	// Verify it's deleted
-	_, err = store.GetSignedKey(keyAddress)
+	_, err = store.GetSignedX448Key(keyAddress)
 	assert.ErrorIs(t, err, tstore.ErrNotFound)
 
 	// Verify it's removed from parent index
-	keys, err := store.GetSignedKeysByParent(parentKeyAddress, "")
+	keys, err := store.GetSignedX448KeysByParent(parentKeyAddress, "")
 	require.NoError(t, err)
 	assert.Len(t, keys, 0)
 }
@@ -308,13 +308,13 @@ func TestPebbleKeyStore_ExpiredKeys(t *testing.T) {
 	txn, err := store.NewTransaction()
 	require.NoError(t, err)
 
-	err = store.PutSignedKey(txn, expiredKeyAddress, expiredKey)
+	err = store.PutSignedX448Key(txn, expiredKeyAddress, expiredKey)
 	require.NoError(t, err)
 
-	err = store.PutSignedKey(txn, validKeyAddress, validKey)
+	err = store.PutSignedX448Key(txn, validKeyAddress, validKey)
 	require.NoError(t, err)
 
-	err = store.PutSignedKey(txn, permanentKeyAddress, permanentKey)
+	err = store.PutSignedX448Key(txn, permanentKeyAddress, permanentKey)
 	require.NoError(t, err)
 
 	err = txn.Commit()
@@ -325,14 +325,14 @@ func TestPebbleKeyStore_ExpiredKeys(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify expired key is deleted
-	_, err = store.GetSignedKey(expiredKeyAddress)
+	_, err = store.GetSignedX448Key(expiredKeyAddress)
 	assert.ErrorIs(t, err, tstore.ErrNotFound)
 
 	// Verify valid keys remain
-	_, err = store.GetSignedKey(validKeyAddress)
+	_, err = store.GetSignedX448Key(validKeyAddress)
 	require.NoError(t, err)
 
-	_, err = store.GetSignedKey(permanentKeyAddress)
+	_, err = store.GetSignedX448Key(permanentKeyAddress)
 	require.NoError(t, err)
 }
 
@@ -376,13 +376,13 @@ func TestPebbleKeyStore_GetKeyRegistry(t *testing.T) {
 	err = store.PutCrossSignature(txn, identityKeyAddress, provingKeyAddress, identitySig, provingSig)
 	require.NoError(t, err)
 
-	err = store.PutSignedKey(txn, inboxKeyAddress, inboxKey)
+	err = store.PutSignedX448Key(txn, inboxKeyAddress, inboxKey)
 	require.NoError(t, err)
 
-	err = store.PutSignedKey(txn, deviceKeyAddress, deviceKey)
+	err = store.PutSignedX448Key(txn, deviceKeyAddress, deviceKey)
 	require.NoError(t, err)
 
-	err = store.PutSignedKey(txn, preKeyAddress, preKey)
+	err = store.PutSignedX448Key(txn, preKeyAddress, preKey)
 	require.NoError(t, err)
 
 	err = txn.Commit()
@@ -412,15 +412,15 @@ func TestPebbleKeyStore_GetKeyRegistry(t *testing.T) {
 	assert.Len(t, registry.KeysByPurpose, 3) // inbox, device, pre
 
 	assert.NotNil(t, registry.KeysByPurpose["inbox"])
-	assert.Len(t, registry.KeysByPurpose["inbox"].Keys, 1)
+	assert.Len(t, registry.KeysByPurpose["inbox"].X448Keys, 1)
 	assert.Equal(t, "inbox", registry.KeysByPurpose["inbox"].KeyPurpose)
 
 	assert.NotNil(t, registry.KeysByPurpose["device"])
-	assert.Len(t, registry.KeysByPurpose["device"].Keys, 1)
+	assert.Len(t, registry.KeysByPurpose["device"].X448Keys, 1)
 	assert.Equal(t, "device", registry.KeysByPurpose["device"].KeyPurpose)
 
 	assert.NotNil(t, registry.KeysByPurpose["pre"])
-	assert.Len(t, registry.KeysByPurpose["pre"].Keys, 1)
+	assert.Len(t, registry.KeysByPurpose["pre"].X448Keys, 1)
 	assert.Equal(t, "pre", registry.KeysByPurpose["pre"].KeyPurpose)
 
 	// Test GetKeyRegistryByProver
@@ -542,7 +542,7 @@ func TestPebbleKeyStore_Iterators(t *testing.T) {
 		key := createTestSignedX448Key(t, parentKeyAddress, "test")
 		signedKeys[string(address)] = key
 
-		err = store.PutSignedKey(txn, address, key)
+		err = store.PutSignedX448Key(txn, address, key)
 		require.NoError(t, err)
 	}
 
@@ -550,7 +550,7 @@ func TestPebbleKeyStore_Iterators(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test RangeSignedKeys
-	iter3, err := store.RangeSignedKeys(parentKeyAddress, "test")
+	iter3, err := store.RangeSignedX448Keys(parentKeyAddress, "test")
 	require.NoError(t, err)
 	defer iter3.Close()
 

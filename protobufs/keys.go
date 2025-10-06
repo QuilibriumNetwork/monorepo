@@ -165,6 +165,106 @@ func (s *SignedX448Key) Validate() error {
 	return nil
 }
 
+func (s *SignedDecaf448Key) Validate() error {
+	if s == nil {
+		return errors.New("nil signed decaf448 key")
+	}
+
+	// Check key exists and has valid length
+	if s.Key == nil {
+		return errors.Wrap(
+			errors.New("nil decaf448 key"),
+			"validate",
+		)
+	}
+	if len(s.Key.KeyValue) != 56 {
+		return errors.Wrap(
+			errors.New("invalid decaf448 key length"),
+			"validate",
+		)
+	}
+
+	// Parent key address should be 32 bytes
+	if len(s.ParentKeyAddress) != 32 {
+		return errors.Wrap(
+			errors.New("invalid parent key address length"),
+			"validate",
+		)
+	}
+
+	// Must have a signature
+	switch sig := s.Signature.(type) {
+	case *SignedDecaf448Key_Ed448Signature:
+		if sig.Ed448Signature == nil {
+			return errors.Wrap(
+				errors.New("nil ed448 signature"),
+				"validate",
+			)
+		}
+		// Ed448Signature has its own Validate method
+		if err := sig.Ed448Signature.Validate(); err != nil {
+			return errors.Wrap(
+				errors.Wrap(err, "ed448 signature"),
+				"validate",
+			)
+		}
+	case *SignedDecaf448Key_BlsSignature:
+		if sig.BlsSignature == nil {
+			return errors.Wrap(
+				errors.New("nil bls signature"),
+				"validate",
+			)
+		}
+		// BLS48581Signature validation
+		if len(sig.BlsSignature.Signature) != 74 {
+			return errors.Wrap(
+				errors.New("invalid bls signature length"),
+				"validate",
+			)
+		}
+		if sig.BlsSignature.PublicKey != nil &&
+			len(sig.BlsSignature.PublicKey.KeyValue) != 585 {
+			return errors.Wrap(
+				errors.New("invalid bls public key length"),
+				"validate",
+			)
+		}
+	case *SignedDecaf448Key_DecafSignature:
+		if sig.DecafSignature == nil {
+			return errors.Wrap(
+				errors.New("nil decaf signature"),
+				"validate",
+			)
+		}
+		// Decaf448Signature validation
+		if len(sig.DecafSignature.Signature) != 112 {
+			return errors.Wrap(
+				errors.New("invalid decaf signature length"),
+				"validate",
+			)
+		}
+		if sig.DecafSignature.PublicKey != nil &&
+			len(sig.DecafSignature.PublicKey.KeyValue) != 56 {
+			return errors.Wrap(
+				errors.New("invalid decaf public key length"),
+				"validate",
+			)
+		}
+	case nil:
+		return errors.Wrap(
+			errors.New("no signature specified"),
+			"validate",
+		)
+	default:
+		return errors.Wrap(
+			errors.New("unknown signature type"),
+			"validate",
+		)
+	}
+
+	return nil
+}
+
 func (k *KeyCollection) Validate() error {
 	if k == nil {
 		return errors.Wrap(errors.New("nil key collection"), "validate")
@@ -175,8 +275,15 @@ func (k *KeyCollection) Validate() error {
 		return errors.Wrap(errors.New("empty key purpose"), "validate")
 	}
 
-	// Validate all keys
-	for i, key := range k.Keys {
+	// Validate all x448 keys
+	for i, key := range k.X448Keys {
+		if err := key.Validate(); err != nil {
+			return errors.Wrap(errors.Wrapf(err, "key %d", i), "validate")
+		}
+	}
+
+	// Validate all decaf448 keys
+	for i, key := range k.Decaf448Keys {
 		if err := key.Validate(); err != nil {
 			return errors.Wrap(errors.Wrapf(err, "key %d", i), "validate")
 		}
@@ -367,6 +474,124 @@ func (s *SignedX448Key) Verify(
 		}
 
 	case *SignedX448Key_DecafSignature:
+		if sig.DecafSignature == nil || sig.DecafSignature.PublicKey == nil {
+			return errors.Wrap(
+				errors.New("decaf signature or public key nil"),
+				"verify",
+			)
+		}
+
+		// Verify the signature
+		if err := sig.DecafSignature.Verify(
+			s.Key.KeyValue,
+			context,
+			schnorrVerifier,
+		); err != nil {
+			return errors.Wrap(err, "verify")
+		}
+
+		// Check that parent key address matches the public key
+		addrBI, err := poseidon.HashBytes(sig.DecafSignature.PublicKey.KeyValue)
+		if err != nil {
+			return errors.Wrap(err, "verify")
+		}
+		addressToCheck := addrBI.FillBytes(make([]byte, 32))
+		if !bytes.Equal(addressToCheck, s.ParentKeyAddress) {
+			return errors.Wrap(
+				errors.New("parent key address does not match public key"),
+				"verify",
+			)
+		}
+
+	case nil:
+		return errors.Wrap(errors.New("no signature"), "verify")
+	default:
+		return errors.Wrap(errors.New("unknown signature type"), "verify")
+	}
+
+	return nil
+}
+
+func (s *SignedDecaf448Key) Verify(
+	context []byte,
+	blsVerifier BlsVerifier,
+	schnorrVerifier SchnorrVerifier,
+) error {
+	if s == nil {
+		return errors.Wrap(errors.New("nil signed x448 key"), "verify")
+	}
+
+	if s.Key == nil {
+		return errors.Wrap(errors.New("key nil"), "verify")
+	}
+
+	if len(s.Key.KeyValue) != 56 {
+		return errors.Wrap(errors.New("invalid length for key"), "verify")
+	}
+
+	if len(s.ParentKeyAddress) == 0 {
+		return errors.Wrap(errors.New("parent key address required"), "verify")
+	}
+
+	// Verify signature and check that parent key address matches
+	switch sig := s.Signature.(type) {
+	case *SignedDecaf448Key_Ed448Signature:
+		if sig.Ed448Signature == nil || sig.Ed448Signature.PublicKey == nil {
+			return errors.Wrap(
+				errors.New("ed448 signature or public key nil"),
+				"verify",
+			)
+		}
+
+		// Verify the signature
+		if err := sig.Ed448Signature.Verify(s.Key.KeyValue, context); err != nil {
+			return errors.Wrap(err, "verify signature")
+		}
+
+		// Check that parent key address matches the public key
+		addrBI, err := poseidon.HashBytes(sig.Ed448Signature.PublicKey.KeyValue)
+		if err != nil {
+			return errors.Wrap(err, "compute address from public key")
+		}
+		addressToCheck := addrBI.FillBytes(make([]byte, 32))
+		if !bytes.Equal(addressToCheck, s.ParentKeyAddress) {
+			return errors.Wrap(
+				errors.New("parent key address does not match public key"),
+				"verify",
+			)
+		}
+
+	case *SignedDecaf448Key_BlsSignature:
+		if sig.BlsSignature == nil || sig.BlsSignature.PublicKey == nil {
+			return errors.Wrap(
+				errors.New("bls signature or public key nil"),
+				"verify",
+			)
+		}
+
+		// Verify the signature
+		if err := sig.BlsSignature.Verify(
+			s.Key.KeyValue,
+			context,
+			blsVerifier,
+		); err != nil {
+			return errors.Wrap(err, "verify")
+		}
+
+		// Check that parent key address matches the public key
+		addrBI, err := poseidon.HashBytes(sig.BlsSignature.PublicKey.KeyValue)
+		if err != nil {
+			return errors.Wrap(err, "verify")
+		}
+		addressToCheck := addrBI.FillBytes(make([]byte, 32))
+		if !bytes.Equal(addressToCheck, s.ParentKeyAddress) {
+			return errors.Wrap(
+				errors.New("parent key address does not match public key"),
+				"verify",
+			)
+		}
+
+	case *SignedDecaf448Key_DecafSignature:
 		if sig.DecafSignature == nil || sig.DecafSignature.PublicKey == nil {
 			return errors.Wrap(
 				errors.New("decaf signature or public key nil"),
@@ -1470,6 +1695,256 @@ func (s *SignedX448Key) FromCanonicalBytes(data []byte) error {
 	return nil
 }
 
+// ToCanonicalBytes serializes a SignedDecaf448Key to canonical bytes
+func (s *SignedDecaf448Key) ToCanonicalBytes() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Write type prefix
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		SignedDecaf448KeyType,
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write key
+	if s.Key != nil {
+		keyBytes, err := s.Key.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(keyBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(keyBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	} else {
+		if err := binary.Write(buf, binary.BigEndian, uint32(0)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write parent_key_address
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(s.ParentKeyAddress)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(s.ParentKeyAddress); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write signature type and data
+	switch sig := s.Signature.(type) {
+	case *SignedDecaf448Key_Ed448Signature:
+		// Type 1 for Ed448 signature
+		if err := binary.Write(buf, binary.BigEndian, uint8(1)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		sigBytes, err := sig.Ed448Signature.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(sigBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(sigBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	case *SignedDecaf448Key_BlsSignature:
+		// Type 2 for BLS signature
+		if err := binary.Write(buf, binary.BigEndian, uint8(2)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		sigBytes, err := sig.BlsSignature.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(sigBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(sigBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	case *SignedDecaf448Key_DecafSignature:
+		// Type 3 for Decaf signature
+		if err := binary.Write(buf, binary.BigEndian, uint8(3)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		sigBytes, err := sig.DecafSignature.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(sigBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(sigBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	default:
+		// Type 0 for nil
+		if err := binary.Write(buf, binary.BigEndian, uint8(0)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write created_at
+	if err := binary.Write(buf, binary.BigEndian, s.CreatedAt); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write expires_at
+	if err := binary.Write(buf, binary.BigEndian, s.ExpiresAt); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write key_purpose
+	purposeBytes := []byte(s.KeyPurpose)
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(purposeBytes)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(purposeBytes); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	return buf.Bytes(), nil
+}
+
+// FromCanonicalBytes deserializes a SignedDecaf448Key from canonical bytes
+func (s *SignedDecaf448Key) FromCanonicalBytes(data []byte) error {
+	buf := bytes.NewBuffer(data)
+
+	// Read and verify type prefix
+	var typePrefix uint32
+	if err := binary.Read(buf, binary.BigEndian, &typePrefix); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if typePrefix != SignedDecaf448KeyType {
+		return errors.Wrap(
+			errors.New("invalid type prefix"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read key
+	var keyLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if keyLen > 0 {
+		keyBytes := make([]byte, keyLen)
+		if _, err := buf.Read(keyBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		s.Key = &Decaf448PublicKey{}
+		if err := s.Key.FromCanonicalBytes(keyBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	// Read parent_key_address
+	var parentKeyAddressLen uint32
+	if err := binary.Read(
+		buf,
+		binary.BigEndian,
+		&parentKeyAddressLen,
+	); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	s.ParentKeyAddress = make([]byte, parentKeyAddressLen)
+	if _, err := buf.Read(s.ParentKeyAddress); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read signature type
+	var sigType uint8
+	if err := binary.Read(buf, binary.BigEndian, &sigType); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read signature data based on type
+	if sigType > 0 {
+		var sigLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		sigBytes := make([]byte, sigLen)
+		if _, err := buf.Read(sigBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+
+		switch sigType {
+		case 1:
+			ed448Sig := &Ed448Signature{}
+			if err := ed448Sig.FromCanonicalBytes(sigBytes); err != nil {
+				return errors.Wrap(err, "from canonical bytes")
+			}
+			s.Signature = &SignedDecaf448Key_Ed448Signature{
+				Ed448Signature: ed448Sig,
+			}
+		case 2:
+			blsSig := &BLS48581Signature{}
+			if err := blsSig.FromCanonicalBytes(sigBytes); err != nil {
+				return errors.Wrap(err, "from canonical bytes")
+			}
+			s.Signature = &SignedDecaf448Key_BlsSignature{BlsSignature: blsSig}
+		case 3:
+			decafSig := &Decaf448Signature{}
+			if err := decafSig.FromCanonicalBytes(sigBytes); err != nil {
+				return errors.Wrap(err, "from canonical bytes")
+			}
+			s.Signature = &SignedDecaf448Key_DecafSignature{DecafSignature: decafSig}
+		}
+	}
+
+	// Read created_at
+	if err := binary.Read(buf, binary.BigEndian, &s.CreatedAt); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read expires_at
+	if err := binary.Read(buf, binary.BigEndian, &s.ExpiresAt); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read key_purpose
+	var purposeLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &purposeLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	purposeBytes := make([]byte, purposeLen)
+	if _, err := buf.Read(purposeBytes); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	s.KeyPurpose = string(purposeBytes)
+
+	return nil
+}
+
 // Validate checks that all fields have valid lengths
 func (e *Ed448PrivateKey) Validate() error {
 	if e == nil {
@@ -1770,17 +2245,44 @@ func (k *KeyCollection) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
-	// Write keys count
+	// Write x448 keys count
 	if err := binary.Write(
 		buf,
 		binary.BigEndian,
-		uint32(len(k.Keys)),
+		uint32(len(k.X448Keys)),
 	); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
-	// Write each key
-	for _, key := range k.Keys {
+	// Write each x448 key
+	for _, key := range k.X448Keys {
+		keyBytes, err := key.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(keyBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(keyBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write decaf448 keys count
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(k.Decaf448Keys)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write each decaf448 key
+	for _, key := range k.Decaf448Keys {
 		keyBytes, err := key.ToCanonicalBytes()
 		if err != nil {
 			return nil, errors.Wrap(err, "to canonical bytes")
@@ -1827,15 +2329,15 @@ func (k *KeyCollection) FromCanonicalBytes(data []byte) error {
 	}
 	k.KeyPurpose = string(purposeBytes)
 
-	// Read keys count
-	var keysCount uint32
-	if err := binary.Read(buf, binary.BigEndian, &keysCount); err != nil {
+	// Read x448 keys count
+	var x448KeysCount uint32
+	if err := binary.Read(buf, binary.BigEndian, &x448KeysCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
 
 	// Read each key
-	k.Keys = make([]*SignedX448Key, keysCount)
-	for i := uint32(0); i < keysCount; i++ {
+	k.X448Keys = make([]*SignedX448Key, x448KeysCount)
+	for i := uint32(0); i < x448KeysCount; i++ {
 		var keyLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
@@ -1844,8 +2346,31 @@ func (k *KeyCollection) FromCanonicalBytes(data []byte) error {
 		if _, err := buf.Read(keyBytes); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
 		}
-		k.Keys[i] = &SignedX448Key{}
-		if err := k.Keys[i].FromCanonicalBytes(keyBytes); err != nil {
+		k.X448Keys[i] = &SignedX448Key{}
+		if err := k.X448Keys[i].FromCanonicalBytes(keyBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	// Read decaf448 keys count
+	var decaf448KeysCount uint32
+	if err := binary.Read(buf, binary.BigEndian, &decaf448KeysCount); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read each key
+	k.Decaf448Keys = make([]*SignedDecaf448Key, decaf448KeysCount)
+	for i := uint32(0); i < decaf448KeysCount; i++ {
+		var keyLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		keyBytes := make([]byte, keyLen)
+		if _, err := buf.Read(keyBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		k.Decaf448Keys[i] = &SignedDecaf448Key{}
+		if err := k.Decaf448Keys[i].FromCanonicalBytes(keyBytes); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
 		}
 	}

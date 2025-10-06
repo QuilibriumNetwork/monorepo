@@ -37,19 +37,37 @@ type KeyStore interface {
 	GetCrossSignatureByProvingKey(provingKeyAddress []byte) ([]byte, error)
 
 	// Signed X448 key operations (supports multiple keys per type)
-	PutSignedKey(
+	PutSignedX448Key(
 		txn Transaction,
 		address []byte,
 		key *protobufs.SignedX448Key,
 	) error
-	GetSignedKey(
+	GetSignedX448Key(
 		address []byte,
 	) (*protobufs.SignedX448Key, error)
-	GetSignedKeysByParent(
+	GetSignedX448KeysByParent(
 		parentKeyAddress []byte,
 		keyPurpose string, // Optional filter by purpose
 	) ([]*protobufs.SignedX448Key, error)
-	DeleteSignedKey(
+	DeleteSignedX448Key(
+		txn Transaction,
+		address []byte,
+	) error
+
+	// Signed Decaf448 key operations (supports multiple keys per type)
+	PutSignedDecaf448Key(
+		txn Transaction,
+		address []byte,
+		key *protobufs.SignedDecaf448Key,
+	) error
+	GetSignedDecaf448Key(
+		address []byte,
+	) (*protobufs.SignedDecaf448Key, error)
+	GetSignedDecaf448KeysByParent(
+		parentKeyAddress []byte,
+		keyPurpose string, // Optional filter by purpose
+	) ([]*protobufs.SignedDecaf448Key, error)
+	DeleteSignedDecaf448Key(
 		txn Transaction,
 		address []byte,
 	) error
@@ -72,11 +90,18 @@ type KeyStore interface {
 		TypedIterator[*protobufs.Ed448PublicKey],
 		error,
 	)
-	RangeSignedKeys(
+	RangeSignedX448Keys(
 		parentKeyAddress []byte, // Optional filter
 		keyPurpose string, // Optional filter
 	) (
 		TypedIterator[*protobufs.SignedX448Key],
+		error,
+	)
+	RangeSignedDecaf448Keys(
+		parentKeyAddress []byte, // Optional filter
+		keyPurpose string, // Optional filter
+	) (
+		TypedIterator[*protobufs.SignedDecaf448Key],
 		error,
 	)
 }

@@ -141,11 +141,34 @@ message SignedX448Key {
   string key_purpose = 8;
 }
 
+// Individual signed key with metadata
+message SignedDecaf448Key {
+  Decaf448PublicKey key = 1;
+  
+  // The parent key that signed this
+  bytes parent_key_address = 2;
+  
+  // Signature by the parent
+  oneof signature {
+    Ed448Signature ed448_signature = 3;
+    BLS48581Signature bls_signature = 4;
+    Decaf448Signature decaf_signature = 5;
+  }
+  
+  // Metadata
+  uint64 created_at = 6;
+  // 0 means no expiry
+  uint64 expires_at = 7;
+  // "view", "spend", "inbox", "device", "pre"
+  string key_purpose = 8;
+}
+
 // A collection of keys for a specific purpose
 message KeyCollection {
   // "view", "spend", "inbox", "device", "pre"
   string key_purpose = 1;
-  repeated SignedX448Key keys = 2;
+  repeated SignedX448Key x448_keys = 2;
+  repeated SignedDecaf448Key decaf448_keys = 3;
 }
 
 // Complete key registry (for querying all keys)

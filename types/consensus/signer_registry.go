@@ -27,8 +27,11 @@ type SignerRegistry interface {
 		provingKey *protobufs.BLS48581SignatureWithProofOfPossession,
 	) error
 
-	// ValidateSignedKey validates a signed X448 key
-	ValidateSignedKey(signedKey *protobufs.SignedX448Key) error
+	// ValidateSignedX448Key validates a signed X448 key
+	ValidateSignedX448Key(signedKey *protobufs.SignedX448Key) error
+
+	// ValidateSignedDecaf448Key validates a signed Decaf448 key
+	ValidateSignedDecaf448Key(signedKey *protobufs.SignedDecaf448Key) error
 
 	// PutIdentityKey stores an identity key
 	PutIdentityKey(
@@ -53,11 +56,18 @@ type SignerRegistry interface {
 		provingKeySignatureOfIdentityKey []byte,
 	) error
 
-	// PutSignedKey stores a signed X448 key
-	PutSignedKey(
+	// PutSignedX448Key stores a signed X448 key
+	PutSignedX448Key(
 		txn store.Transaction,
 		address []byte,
 		key *protobufs.SignedX448Key,
+	) error
+
+	// PutSignedDecaf448Key stores a signed Decaf448 key
+	PutSignedDecaf448Key(
+		txn store.Transaction,
+		address []byte,
+		key *protobufs.SignedDecaf448Key,
 	) error
 
 	// GetIdentityKey retrieves an identity key by address
@@ -69,14 +79,23 @@ type SignerRegistry interface {
 		error,
 	)
 
-	// GetSignedKey retrieves a signed key by address
-	GetSignedKey(address []byte) (*protobufs.SignedX448Key, error)
+	// GetSignedX448Key retrieves a signed key by address
+	GetSignedX448Key(address []byte) (*protobufs.SignedX448Key, error)
 
-	// GetSignedKeysByParent retrieves all signed keys for a parent key
-	GetSignedKeysByParent(
+	// GetSignedDecaf448Key retrieves a signed key by address
+	GetSignedDecaf448Key(address []byte) (*protobufs.SignedDecaf448Key, error)
+
+	// GetSignedX448KeysByParent retrieves all signed keys for a parent key
+	GetSignedX448KeysByParent(
 		parentKeyAddress []byte,
 		keyPurpose string, // Optional filter by purpose
 	) ([]*protobufs.SignedX448Key, error)
+
+	// GetSignedDecaf448KeysByParent retrieves all signed keys for a parent key
+	GetSignedDecaf448KeysByParent(
+		parentKeyAddress []byte,
+		keyPurpose string, // Optional filter by purpose
+	) ([]*protobufs.SignedDecaf448Key, error)
 
 	// RangeProvingKeys returns an iterator over all proving keys
 	RangeProvingKeys() (
@@ -90,12 +109,21 @@ type SignerRegistry interface {
 		error,
 	)
 
-	// RangeSignedKeys returns an iterator over signed keys
-	RangeSignedKeys(
+	// RangeSignedX448Keys returns an iterator over signed keys
+	RangeSignedX448Keys(
 		parentKeyAddress []byte, // Optional filter
 		keyPurpose string, // Optional filter
 	) (
 		store.TypedIterator[*protobufs.SignedX448Key],
+		error,
+	)
+
+	// RangeSignedDecaf448Keys returns an iterator over signed keys
+	RangeSignedDecaf448Keys(
+		parentKeyAddress []byte, // Optional filter
+		keyPurpose string, // Optional filter
+	) (
+		store.TypedIterator[*protobufs.SignedDecaf448Key],
 		error,
 	)
 }

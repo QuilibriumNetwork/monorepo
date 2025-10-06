@@ -525,6 +525,19 @@ func (e *GlobalConsensusEngine) publishKeyRegistry() {
 			return
 		}
 	}
+
+	onion, err := e.keyManager.GetAgreementKey("q-onion-key")
+	if err != nil {
+		onion, err = e.keyManager.CreateAgreementKey(
+			"q-onion-key",
+			crypto.KeyTypeX448,
+		)
+		if err != nil {
+			e.logger.Error("could not publish key registry", zap.Error(err))
+			return
+		}
+	}
+
 	sig, err := e.pubsub.SignMessage(
 		slices.Concat(
 			[]byte("KEY_REGISTRY"),
@@ -563,6 +576,16 @@ func (e *GlobalConsensusEngine) publishKeyRegistry() {
 		e.logger.Error("could not publish key registry", zap.Error(err))
 		return
 	}
+	sigonion, err := e.pubsub.SignMessage(
+		slices.Concat(
+			[]byte("KEY_REGISTRY"),
+			onion.Public(),
+		),
+	)
+	if err != nil {
+		e.logger.Error("could not publish key registry", zap.Error(err))
+		return
+	}
 	registry := &protobufs.KeyRegistry{
 		IdentityKey: &protobufs.Ed448PublicKey{
 			KeyValue: e.pubsub.GetPublicKey(),
@@ -577,14 +600,28 @@ func (e *GlobalConsensusEngine) publishKeyRegistry() {
 			Signature: sigp,
 		},
 		KeysByPurpose: map[string]*protobufs.KeyCollection{
-			"view": &protobufs.KeyCollection{
-				KeyPurpose: "view",
-				Keys: []*protobufs.SignedX448Key{{
+			"ONION_ROUTING": &protobufs.KeyCollection{
+				KeyPurpose: "ONION_ROUTING",
+				X448Keys: []*protobufs.SignedX448Key{{
 					Key: &protobufs.X448PublicKey{
-						KeyValue: vk.Public(),
+						KeyValue: onion.Public(),
 					},
 					ParentKeyAddress: e.pubsub.GetPeerID(),
 					Signature: &protobufs.SignedX448Key_Ed448Signature{
+						Ed448Signature: &protobufs.Ed448Signature{
+							Signature: sigonion,
+						},
+					},
+				}},
+			},
+			"view": &protobufs.KeyCollection{
+				KeyPurpose: "view",
+				Decaf448Keys: []*protobufs.SignedDecaf448Key{{
+					Key: &protobufs.Decaf448PublicKey{
+						KeyValue: vk.Public(),
+					},
+					ParentKeyAddress: e.pubsub.GetPeerID(),
+					Signature: &protobufs.SignedDecaf448Key_Ed448Signature{
 						Ed448Signature: &protobufs.Ed448Signature{
 							Signature: sigvk,
 						},
@@ -593,12 +630,12 @@ func (e *GlobalConsensusEngine) publishKeyRegistry() {
 			},
 			"spend": &protobufs.KeyCollection{
 				KeyPurpose: "spend",
-				Keys: []*protobufs.SignedX448Key{{
-					Key: &protobufs.X448PublicKey{
+				Decaf448Keys: []*protobufs.SignedDecaf448Key{{
+					Key: &protobufs.Decaf448PublicKey{
 						KeyValue: sk.Public(),
 					},
 					ParentKeyAddress: e.pubsub.GetPeerID(),
-					Signature: &protobufs.SignedX448Key_Ed448Signature{
+					Signature: &protobufs.SignedDecaf448Key_Ed448Signature{
 						Ed448Signature: &protobufs.Ed448Signature{
 							Signature: sigsk,
 						},

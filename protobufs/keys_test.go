@@ -554,7 +554,7 @@ func TestKeyCollection_Serialization(t *testing.T) {
 			name: "complete collection",
 			collection: &KeyCollection{
 				KeyPurpose: "inbox",
-				Keys: []*SignedX448Key{
+				X448Keys: []*SignedX448Key{
 					{
 						Key: &X448PublicKey{
 							KeyValue: make([]byte, 57),
@@ -584,13 +584,43 @@ func TestKeyCollection_Serialization(t *testing.T) {
 						},
 					},
 				},
+				Decaf448Keys: []*SignedDecaf448Key{
+					{
+						Key: &Decaf448PublicKey{
+							KeyValue: make([]byte, 56),
+						},
+						ParentKeyAddress: make([]byte, 32),
+						Signature: &SignedDecaf448Key_Ed448Signature{
+							Ed448Signature: &Ed448Signature{
+								Signature: make([]byte, 114),
+								PublicKey: &Ed448PublicKey{
+									KeyValue: make([]byte, 57),
+								},
+							},
+						},
+					},
+					{
+						Key: &Decaf448PublicKey{
+							KeyValue: make([]byte, 56),
+						},
+						ParentKeyAddress: make([]byte, 32),
+						Signature: &SignedDecaf448Key_BlsSignature{
+							BlsSignature: &BLS48581Signature{
+								Signature: make([]byte, 74),
+								PublicKey: &BLS48581G2PublicKey{
+									KeyValue: make([]byte, 585),
+								},
+							},
+						},
+					},
+				},
 			},
 		},
 		{
 			name: "empty collection",
 			collection: &KeyCollection{
 				KeyPurpose: "device",
-				Keys:       []*SignedX448Key{},
+				X448Keys:   []*SignedX448Key{},
 			},
 		},
 		{
@@ -616,18 +646,32 @@ func TestKeyCollection_Serialization(t *testing.T) {
 			// Compare fields
 			assert.Equal(t, tt.collection.KeyPurpose, collection2.KeyPurpose)
 
-			if tt.collection.Keys != nil {
-				require.NotNil(t, collection2.Keys)
-				assert.Equal(t, len(tt.collection.Keys), len(collection2.Keys))
+			if tt.collection.X448Keys != nil {
+				require.NotNil(t, collection2.X448Keys)
+				assert.Equal(t, len(tt.collection.X448Keys), len(collection2.X448Keys))
 
-				for i := range tt.collection.Keys {
-					assert.NotNil(t, collection2.Keys[i].Key)
-					assert.True(t, equalBytes(tt.collection.Keys[i].Key.KeyValue, collection2.Keys[i].Key.KeyValue))
-					assert.True(t, equalBytes(tt.collection.Keys[i].ParentKeyAddress, collection2.Keys[i].ParentKeyAddress))
+				for i := range tt.collection.X448Keys {
+					assert.NotNil(t, collection2.X448Keys[i].Key)
+					assert.True(t, equalBytes(tt.collection.X448Keys[i].Key.KeyValue, collection2.X448Keys[i].Key.KeyValue))
+					assert.True(t, equalBytes(tt.collection.X448Keys[i].ParentKeyAddress, collection2.X448Keys[i].ParentKeyAddress))
 				}
 			} else {
 				// protobuf deserialization returns empty slice instead of nil
-				assert.Empty(t, collection2.Keys)
+				assert.Empty(t, collection2.X448Keys)
+			}
+
+			if tt.collection.Decaf448Keys != nil {
+				require.NotNil(t, collection2.Decaf448Keys)
+				assert.Equal(t, len(tt.collection.Decaf448Keys), len(collection2.Decaf448Keys))
+
+				for i := range tt.collection.Decaf448Keys {
+					assert.NotNil(t, collection2.Decaf448Keys[i].Key)
+					assert.True(t, equalBytes(tt.collection.Decaf448Keys[i].Key.KeyValue, collection2.Decaf448Keys[i].Key.KeyValue))
+					assert.True(t, equalBytes(tt.collection.Decaf448Keys[i].ParentKeyAddress, collection2.Decaf448Keys[i].ParentKeyAddress))
+				}
+			} else {
+				// protobuf deserialization returns empty slice instead of nil
+				assert.Empty(t, collection2.Decaf448Keys)
 			}
 		})
 	}
@@ -662,7 +706,7 @@ func TestKeyRegistry_Serialization(t *testing.T) {
 				KeysByPurpose: map[string]*KeyCollection{
 					"inbox": {
 						KeyPurpose: "inbox",
-						Keys: []*SignedX448Key{
+						X448Keys: []*SignedX448Key{
 							{
 								Key: &X448PublicKey{
 									KeyValue: make([]byte, 57),
@@ -682,7 +726,7 @@ func TestKeyRegistry_Serialization(t *testing.T) {
 					},
 					"device": {
 						KeyPurpose: "device",
-						Keys: []*SignedX448Key{
+						X448Keys: []*SignedX448Key{
 							{
 								Key: &X448PublicKey{
 									KeyValue: make([]byte, 57),
@@ -758,8 +802,8 @@ func TestKeyRegistry_Serialization(t *testing.T) {
 					collection2, ok := registry2.KeysByPurpose[purpose]
 					require.True(t, ok)
 					assert.Equal(t, collection.KeyPurpose, collection2.KeyPurpose)
-					if collection.Keys != nil {
-						assert.Equal(t, len(collection.Keys), len(collection2.Keys))
+					if collection.X448Keys != nil {
+						assert.Equal(t, len(collection.X448Keys), len(collection2.X448Keys))
 					}
 				}
 			}

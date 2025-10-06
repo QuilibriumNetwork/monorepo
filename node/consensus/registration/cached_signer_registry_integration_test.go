@@ -158,7 +158,7 @@ func TestLoadExistingKeys(t *testing.T) {
 		signedKeyAddressBI, _ := poseidon.HashBytes(signedKey.Key.KeyValue)
 		signedKeyAddress := signedKeyAddressBI.FillBytes(make([]byte, 32))
 
-		err = keyStore.PutSignedKey(txn, signedKeyAddress, signedKey)
+		err = keyStore.PutSignedX448Key(txn, signedKeyAddress, signedKey)
 		require.NoError(t, err)
 	}
 
@@ -223,7 +223,7 @@ func TestFullWorkflow(t *testing.T) {
 	signedKeyAddressBI, _ := poseidon.HashBytes(signedKey.Key.KeyValue)
 	signedKeyAddress := signedKeyAddressBI.FillBytes(make([]byte, 32))
 
-	err = keyStore.PutSignedKey(txn, signedKeyAddress, signedKey)
+	err = keyStore.PutSignedX448Key(txn, signedKeyAddress, signedKey)
 	require.NoError(t, err)
 
 	// Commit the transaction
@@ -297,7 +297,7 @@ func TestValidationIntegration(t *testing.T) {
 		randomAddress := generateTestAddress()
 		signedKey.ParentKeyAddress = randomAddress
 
-		err = registry.ValidateSignedKey(signedKey)
+		err = registry.ValidateSignedX448Key(signedKey)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "validate signed key")
 	})

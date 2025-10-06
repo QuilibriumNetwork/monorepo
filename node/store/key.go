@@ -27,14 +27,20 @@ type PebbleProvingKeyIterator struct {
 	i store.Iterator
 }
 
-type PebbleSignedKeyIterator struct {
+type PebbleSignedX448KeyIterator struct {
+	i  store.Iterator
+	db *PebbleKeyStore
+}
+
+type PebbleSignedDecaf448KeyIterator struct {
 	i  store.Iterator
 	db *PebbleKeyStore
 }
 
 var _ store.TypedIterator[*protobufs.Ed448PublicKey] = (*PebbleIdentityKeyIterator)(nil)
 var _ store.TypedIterator[*protobufs.BLS48581SignatureWithProofOfPossession] = (*PebbleProvingKeyIterator)(nil)
-var _ store.TypedIterator[*protobufs.SignedX448Key] = (*PebbleSignedKeyIterator)(nil)
+var _ store.TypedIterator[*protobufs.SignedX448Key] = (*PebbleSignedX448KeyIterator)(nil)
+var _ store.TypedIterator[*protobufs.SignedDecaf448Key] = (*PebbleSignedDecaf448KeyIterator)(nil)
 var _ store.KeyStore = (*PebbleKeyStore)(nil)
 
 // Identity key iterator methods
@@ -126,19 +132,19 @@ func (p *PebbleProvingKeyIterator) Close() error {
 }
 
 // Signed key iterator methods
-func (p *PebbleSignedKeyIterator) First() bool {
+func (p *PebbleSignedX448KeyIterator) First() bool {
 	return p.i.First()
 }
 
-func (p *PebbleSignedKeyIterator) Next() bool {
+func (p *PebbleSignedX448KeyIterator) Next() bool {
 	return p.i.Next()
 }
 
-func (p *PebbleSignedKeyIterator) Valid() bool {
+func (p *PebbleSignedX448KeyIterator) Valid() bool {
 	return p.i.Valid()
 }
 
-func (p *PebbleSignedKeyIterator) Value() (
+func (p *PebbleSignedX448KeyIterator) Value() (
 	*protobufs.SignedX448Key,
 	error,
 ) {
@@ -148,7 +154,7 @@ func (p *PebbleSignedKeyIterator) Value() (
 
 	key := p.i.Key()[len(p.i.Key())-32:]
 
-	signedKey, err := p.db.GetSignedKey(key)
+	signedKey, err := p.db.GetSignedX448Key(key)
 	if err != nil {
 		return nil, errors.Wrap(
 			errors.Wrap(err, store.ErrInvalidData.Error()),
@@ -159,14 +165,58 @@ func (p *PebbleSignedKeyIterator) Value() (
 	return signedKey, nil
 }
 
-func (p *PebbleSignedKeyIterator) TruncatedValue() (
+func (p *PebbleSignedX448KeyIterator) TruncatedValue() (
 	*protobufs.SignedX448Key,
 	error,
 ) {
 	return p.Value()
 }
 
-func (p *PebbleSignedKeyIterator) Close() error {
+func (p *PebbleSignedX448KeyIterator) Close() error {
+	return errors.Wrap(p.i.Close(), "closing iterator")
+}
+
+func (p *PebbleSignedDecaf448KeyIterator) First() bool {
+	return p.i.First()
+}
+
+func (p *PebbleSignedDecaf448KeyIterator) Next() bool {
+	return p.i.Next()
+}
+
+func (p *PebbleSignedDecaf448KeyIterator) Valid() bool {
+	return p.i.Valid()
+}
+
+func (p *PebbleSignedDecaf448KeyIterator) Value() (
+	*protobufs.SignedDecaf448Key,
+	error,
+) {
+	if !p.i.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	key := p.i.Key()[len(p.i.Key())-32:]
+
+	signedKey, err := p.db.GetSignedDecaf448Key(key)
+	if err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"get signed key iterator value",
+		)
+	}
+
+	return signedKey, nil
+}
+
+func (p *PebbleSignedDecaf448KeyIterator) TruncatedValue() (
+	*protobufs.SignedDecaf448Key,
+	error,
+) {
+	return p.Value()
+}
+
+func (p *PebbleSignedDecaf448KeyIterator) Close() error {
 	return errors.Wrap(p.i.Close(), "closing iterator")
 }
 
@@ -197,13 +247,13 @@ func crossSignatureKey(
 	return key
 }
 
-func signedKeyKey(address []byte) []byte {
-	key := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_ID}
+func signedX448KeyKey(address []byte) []byte {
+	key := []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_ID}
 	key = append(key, address...)
 	return key
 }
 
-func signedKeyByParentKey(
+func signedX448KeyByParentKey(
 	parentKeyAddress []byte,
 	keyPurpose string,
 	keyAddress []byte,
@@ -211,25 +261,63 @@ func signedKeyByParentKey(
 	purpose := make([]byte, 8)
 	copy(purpose[:len(keyPurpose)], []byte(keyPurpose))
 
-	key := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+	key := []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_PARENT}
 	key = append(key, parentKeyAddress...)
 	key = append(key, purpose...)
 	key = append(key, keyAddress...)
 	return key
 }
 
-func signedKeyByPurposeKey(keyPurpose string, keyAddress []byte) []byte {
+func signedX448KeyByPurposeKey(keyPurpose string, keyAddress []byte) []byte {
 	purpose := make([]byte, 8)
 	copy(purpose[:len(keyPurpose)], []byte(keyPurpose))
 
-	key := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PURPOSE}
+	key := []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_PURPOSE}
 	key = append(key, purpose...)
 	key = append(key, keyAddress...)
 	return key
 }
 
-func signedKeyExpiryKey(expiresAt uint64, keyAddress []byte) []byte {
-	key := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_EXPIRY}
+func signedX448KeyExpiryKey(expiresAt uint64, keyAddress []byte) []byte {
+	key := []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_EXPIRY}
+	key = binary.BigEndian.AppendUint64(key, expiresAt)
+	key = append(key, keyAddress...)
+	return key
+}
+
+func signedDecaf448KeyKey(address []byte) []byte {
+	key := []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_ID}
+	key = append(key, address...)
+	return key
+}
+
+func signedDecaf448KeyByParentKey(
+	parentKeyAddress []byte,
+	keyPurpose string,
+	keyAddress []byte,
+) []byte {
+	purpose := make([]byte, 8)
+	copy(purpose[:len(keyPurpose)], []byte(keyPurpose))
+
+	key := []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_PARENT}
+	key = append(key, parentKeyAddress...)
+	key = append(key, purpose...)
+	key = append(key, keyAddress...)
+	return key
+}
+
+func signedDecaf448KeyByPurposeKey(keyPurpose string, keyAddress []byte) []byte {
+	purpose := make([]byte, 8)
+	copy(purpose[:len(keyPurpose)], []byte(keyPurpose))
+
+	key := []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_PURPOSE}
+	key = append(key, purpose...)
+	key = append(key, keyAddress...)
+	return key
+}
+
+func signedDecaf448KeyExpiryKey(expiresAt uint64, keyAddress []byte) []byte {
+	key := []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_EXPIRY}
 	key = binary.BigEndian.AppendUint64(key, expiresAt)
 	key = append(key, keyAddress...)
 	return key
@@ -421,75 +509,141 @@ func (p *PebbleKeyStore) RangeIdentityKeys() (
 	return &PebbleIdentityKeyIterator{i: iter}, nil
 }
 
-// PutSignedKey stores a signed X448 key
-func (p *PebbleKeyStore) PutSignedKey(
+// PutSignedX448Key stores a signed X448 key
+func (p *PebbleKeyStore) PutSignedX448Key(
 	txn store.Transaction,
 	address []byte,
 	key *protobufs.SignedX448Key,
 ) error {
 	data, err := proto.Marshal(key)
 	if err != nil {
-		return errors.Wrap(err, "put signed key")
+		return errors.Wrap(err, "put signed x448 key")
 	}
 
 	// Store by address
-	if err := txn.Set(signedKeyKey(address), data); err != nil {
-		return errors.Wrap(err, "put signed key")
+	if err := txn.Set(signedX448KeyKey(address), data); err != nil {
+		return errors.Wrap(err, "put signed x448 key")
 	}
 
 	// Store by parent key index
 	if err := txn.Set(
-		signedKeyByParentKey(key.ParentKeyAddress, key.KeyPurpose, address),
+		signedX448KeyByParentKey(key.ParentKeyAddress, key.KeyPurpose, address),
 		[]byte{0x01}, // Just a marker
 	); err != nil {
-		return errors.Wrap(err, "put signed key")
+		return errors.Wrap(err, "put signed x448 key")
 	}
 
 	// Store by purpose index
 	if err := txn.Set(
-		signedKeyByPurposeKey(key.KeyPurpose, address),
+		signedX448KeyByPurposeKey(key.KeyPurpose, address),
 		[]byte{0x01}, // Just a marker
 	); err != nil {
-		return errors.Wrap(err, "put signed key")
+		return errors.Wrap(err, "put signed x448 key")
 	}
 
 	// Store by expiry if set
 	if key.ExpiresAt > 0 {
 		if err := txn.Set(
-			signedKeyExpiryKey(key.ExpiresAt, address),
+			signedX448KeyExpiryKey(key.ExpiresAt, address),
 			[]byte{0x01}, // Just a marker
 		); err != nil {
-			return errors.Wrap(err, "put signed key")
+			return errors.Wrap(err, "put signed x448 key")
 		}
 	}
 
 	return nil
 }
 
-// GetSignedKey retrieves a signed key by address
-func (p *PebbleKeyStore) GetSignedKey(
+// PutSignedDecaf448Key stores a signed Decaf448 key
+func (p *PebbleKeyStore) PutSignedDecaf448Key(
+	txn store.Transaction,
+	address []byte,
+	key *protobufs.SignedDecaf448Key,
+) error {
+	data, err := proto.Marshal(key)
+	if err != nil {
+		return errors.Wrap(err, "put signed decaf448 key")
+	}
+
+	// Store by address
+	if err := txn.Set(signedDecaf448KeyKey(address), data); err != nil {
+		return errors.Wrap(err, "put signed decaf448 key")
+	}
+
+	// Store by parent key index
+	if err := txn.Set(
+		signedDecaf448KeyByParentKey(key.ParentKeyAddress, key.KeyPurpose, address),
+		[]byte{0x01}, // Just a marker
+	); err != nil {
+		return errors.Wrap(err, "put signed decaf448 key")
+	}
+
+	// Store by purpose index
+	if err := txn.Set(
+		signedDecaf448KeyByPurposeKey(key.KeyPurpose, address),
+		[]byte{0x01}, // Just a marker
+	); err != nil {
+		return errors.Wrap(err, "put signed decaf448 key")
+	}
+
+	// Store by expiry if set
+	if key.ExpiresAt > 0 {
+		if err := txn.Set(
+			signedDecaf448KeyExpiryKey(key.ExpiresAt, address),
+			[]byte{0x01}, // Just a marker
+		); err != nil {
+			return errors.Wrap(err, "put signed decaf448 key")
+		}
+	}
+
+	return nil
+}
+
+// GetSignedX448Key retrieves a signed key by address
+func (p *PebbleKeyStore) GetSignedX448Key(
 	address []byte,
 ) (*protobufs.SignedX448Key, error) {
-	value, closer, err := p.db.Get(signedKeyKey(address))
+	value, closer, err := p.db.Get(signedX448KeyKey(address))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return nil, store.ErrNotFound
 		}
-		return nil, errors.Wrap(err, "get signed key")
+		return nil, errors.Wrap(err, "get signed x448 key")
 	}
 	defer closer.Close()
 
 	key := &protobufs.SignedX448Key{}
 	if err := proto.Unmarshal(value, key); err != nil {
-		return nil, errors.Wrap(err, "get signed key")
+		return nil, errors.Wrap(err, "get signed x448 key")
 	}
 
 	return key, nil
 }
 
-// GetSignedKeysByParent retrieves all signed keys for a parent key, optionally
-// filtered by purpose
-func (p *PebbleKeyStore) GetSignedKeysByParent(
+// GetSignedDecaf448Key retrieves a signed key by address
+func (p *PebbleKeyStore) GetSignedDecaf448Key(
+	address []byte,
+) (*protobufs.SignedDecaf448Key, error) {
+	value, closer, err := p.db.Get(signedDecaf448KeyKey(address))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get signed decaf448 key")
+	}
+	defer closer.Close()
+
+	key := &protobufs.SignedDecaf448Key{}
+	if err := proto.Unmarshal(value, key); err != nil {
+		return nil, errors.Wrap(err, "get signed decaf448 key")
+	}
+
+	return key, nil
+}
+
+// GetSignedX448KeysByParent retrieves all signed keys for a parent key,
+// optionally filtered by purpose
+func (p *PebbleKeyStore) GetSignedX448KeysByParent(
 	parentKeyAddress []byte,
 	keyPurpose string,
 ) ([]*protobufs.SignedX448Key, error) {
@@ -499,11 +653,11 @@ func (p *PebbleKeyStore) GetSignedKeysByParent(
 		purpose := make([]byte, 8)
 		copy(purpose[:len(keyPurpose)], []byte(keyPurpose))
 
-		prefix = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+		prefix = []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_PARENT}
 		prefix = append(prefix, parentKeyAddress...)
 		prefix = append(prefix, purpose...)
 	} else {
-		prefix = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+		prefix = []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_PARENT}
 		prefix = append(prefix, parentKeyAddress...)
 	}
 
@@ -512,7 +666,7 @@ func (p *PebbleKeyStore) GetSignedKeysByParent(
 
 	iter, err := p.db.NewIter(prefix, endPrefixBI.Bytes())
 	if err != nil {
-		return nil, errors.Wrap(err, "get signed keys by parent")
+		return nil, errors.Wrap(err, "get signed x448 keys by parent")
 	}
 	defer iter.Close()
 
@@ -521,7 +675,7 @@ func (p *PebbleKeyStore) GetSignedKeysByParent(
 		keyAddress := iter.Key()[len(iter.Key())-32:]
 
 		// Get the actual key data
-		keyData, closer, err := p.db.Get(signedKeyKey(keyAddress))
+		keyData, closer, err := p.db.Get(signedX448KeyKey(keyAddress))
 		if err != nil {
 			continue
 		}
@@ -539,48 +693,148 @@ func (p *PebbleKeyStore) GetSignedKeysByParent(
 	return keys, nil
 }
 
-// DeleteSignedKey removes a signed key
-func (p *PebbleKeyStore) DeleteSignedKey(
+// GetSignedDecaf448KeysByParent retrieves all signed keys for a parent key,
+// optionally filtered by purpose
+func (p *PebbleKeyStore) GetSignedDecaf448KeysByParent(
+	parentKeyAddress []byte,
+	keyPurpose string,
+) ([]*protobufs.SignedDecaf448Key, error) {
+	var prefix []byte
+	if keyPurpose != "" {
+		// Create prefix without keyId to get all keys of this purpose
+		purpose := make([]byte, 8)
+		copy(purpose[:len(keyPurpose)], []byte(keyPurpose))
+
+		prefix = []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_PARENT}
+		prefix = append(prefix, parentKeyAddress...)
+		prefix = append(prefix, purpose...)
+	} else {
+		prefix = []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_PARENT}
+		prefix = append(prefix, parentKeyAddress...)
+	}
+
+	endPrefixBI := new(big.Int).SetBytes(prefix)
+	endPrefixBI.Add(endPrefixBI, big.NewInt(1))
+
+	iter, err := p.db.NewIter(prefix, endPrefixBI.Bytes())
+	if err != nil {
+		return nil, errors.Wrap(err, "get signed decaf448 keys by parent")
+	}
+	defer iter.Close()
+
+	var keys []*protobufs.SignedDecaf448Key
+	for iter.First(); iter.Valid(); iter.Next() {
+		keyAddress := iter.Key()[len(iter.Key())-32:]
+
+		// Get the actual key data
+		keyData, closer, err := p.db.Get(signedDecaf448KeyKey(keyAddress))
+		if err != nil {
+			continue
+		}
+
+		key := &protobufs.SignedDecaf448Key{}
+		if err := proto.Unmarshal(keyData, key); err != nil {
+			closer.Close()
+			continue
+		}
+		closer.Close()
+
+		keys = append(keys, key)
+	}
+
+	return keys, nil
+}
+
+// DeleteSignedX448Key removes a signed key
+func (p *PebbleKeyStore) DeleteSignedX448Key(
 	txn store.Transaction,
 	address []byte,
 ) error {
 	// First get the key to extract metadata for index deletion
-	value, closer, err := p.db.Get(signedKeyKey(address))
+	value, closer, err := p.db.Get(signedX448KeyKey(address))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return store.ErrNotFound
 		}
-		return errors.Wrap(err, "delete signed key")
+		return errors.Wrap(err, "delete signed x448 key")
 	}
 	defer closer.Close()
 
 	key := &protobufs.SignedX448Key{}
 	if err := proto.Unmarshal(value, key); err != nil {
-		return errors.Wrap(err, "delete signed key")
+		return errors.Wrap(err, "delete signed x448 key")
 	}
 
 	// Delete all indexes
-	if err := txn.Delete(signedKeyKey(address)); err != nil {
-		return errors.Wrap(err, "delete signed key")
+	if err := txn.Delete(signedX448KeyKey(address)); err != nil {
+		return errors.Wrap(err, "delete signed x448 key")
 	}
 
 	if err := txn.Delete(
-		signedKeyByParentKey(key.ParentKeyAddress, key.KeyPurpose, address),
+		signedX448KeyByParentKey(key.ParentKeyAddress, key.KeyPurpose, address),
 	); err != nil {
-		return errors.Wrap(err, "delete signed key")
+		return errors.Wrap(err, "delete signed x448 key")
 	}
 
 	if err := txn.Delete(
-		signedKeyByPurposeKey(key.KeyPurpose, address),
+		signedX448KeyByPurposeKey(key.KeyPurpose, address),
 	); err != nil {
-		return errors.Wrap(err, "delete signed key")
+		return errors.Wrap(err, "delete signed x448 key")
 	}
 
 	if key.ExpiresAt > 0 {
 		if err := txn.Delete(
-			signedKeyExpiryKey(key.ExpiresAt, address),
+			signedX448KeyExpiryKey(key.ExpiresAt, address),
 		); err != nil {
-			return errors.Wrap(err, "delete signed key")
+			return errors.Wrap(err, "delete signed x448 key")
+		}
+	}
+
+	return nil
+}
+
+// DeleteSignedDecaf448Key removes a signed key
+func (p *PebbleKeyStore) DeleteSignedDecaf448Key(
+	txn store.Transaction,
+	address []byte,
+) error {
+	// First get the key to extract metadata for index deletion
+	value, closer, err := p.db.Get(signedDecaf448KeyKey(address))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return store.ErrNotFound
+		}
+		return errors.Wrap(err, "delete signed decaf448 key")
+	}
+	defer closer.Close()
+
+	key := &protobufs.SignedDecaf448Key{}
+	if err := proto.Unmarshal(value, key); err != nil {
+		return errors.Wrap(err, "delete signed decaf448 key")
+	}
+
+	// Delete all indexes
+	if err := txn.Delete(signedDecaf448KeyKey(address)); err != nil {
+		return errors.Wrap(err, "delete signed decaf448 key")
+	}
+
+	if err := txn.Delete(
+		signedDecaf448KeyByParentKey(key.ParentKeyAddress, key.KeyPurpose, address),
+	); err != nil {
+		return errors.Wrap(err, "delete signed decaf448 key")
+	}
+
+	if err := txn.Delete(
+		signedDecaf448KeyByPurposeKey(key.KeyPurpose, address),
+	); err != nil {
+		return errors.Wrap(err, "delete signed decaf448 key")
+	}
+
+	if key.ExpiresAt > 0 {
+		if err := txn.Delete(
+			signedDecaf448KeyExpiryKey(key.ExpiresAt, address),
+		); err != nil {
+			return errors.Wrap(err, "delete signed decaf448 key")
 		}
 	}
 
@@ -592,8 +846,8 @@ func (p *PebbleKeyStore) ReapExpiredKeys() error {
 	currentTime := uint64(time.Now().Unix())
 
 	// Iterate through all keys with expiry
-	prefix := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_EXPIRY}
-	endPrefix := []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_EXPIRY + 1}
+	prefix := []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_EXPIRY}
+	endPrefix := []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_EXPIRY + 1}
 	iter, err := p.db.NewIter(prefix, endPrefix)
 	if err != nil {
 		return errors.Wrap(err, "reap expired keys")
@@ -624,7 +878,41 @@ func (p *PebbleKeyStore) ReapExpiredKeys() error {
 		keyAddress := indexKey[len(prefix)+8:]
 
 		// Delete the key
-		if err := p.DeleteSignedKey(txn, keyAddress); err != nil {
+		if err := p.DeleteSignedX448Key(txn, keyAddress); err != nil {
+			p.logger.Warn("failed to delete expired key", zap.Error(err))
+			continue
+		}
+
+		deletedCount++
+	}
+
+	// Iterate through all decaf keys with expiry
+	decafPrefix := []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_EXPIRY}
+	decafEndPrefix := []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_EXPIRY + 1}
+	decafIter, err := p.db.NewIter(decafPrefix, decafEndPrefix)
+	if err != nil {
+		return errors.Wrap(err, "reap expired keys")
+	}
+	defer decafIter.Close()
+	for decafIter.First(); decafIter.Valid(); decafIter.Next() {
+		indexKey := decafIter.Key()
+
+		// Extract expiry time
+		if len(indexKey) < len(prefix)+8 {
+			continue
+		}
+		expiryTime := binary.BigEndian.Uint64(indexKey[len(prefix) : len(prefix)+8])
+
+		// If not expired, we can stop (keys are sorted by expiry)
+		if expiryTime > currentTime {
+			break
+		}
+
+		// Extract key address
+		keyAddress := indexKey[len(prefix)+8:]
+
+		// Delete the key
+		if err := p.DeleteSignedDecaf448Key(txn, keyAddress); err != nil {
 			p.logger.Warn("failed to delete expired key", zap.Error(err))
 			continue
 		}
@@ -689,18 +977,19 @@ func (p *PebbleKeyStore) GetKeyRegistry(
 	}
 
 	// Get all signed keys by parent (identity key)
-	allKeys, err := p.GetSignedKeysByParent(identityKeyAddress, "")
+	allKeys, err := p.GetSignedX448KeysByParent(identityKeyAddress, "")
 	if err == nil {
 		// Group by purpose
 		for _, key := range allKeys {
 			if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
 				registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
-					KeyPurpose: key.KeyPurpose,
-					Keys:       []*protobufs.SignedX448Key{},
+					KeyPurpose:   key.KeyPurpose,
+					X448Keys:     []*protobufs.SignedX448Key{},
+					Decaf448Keys: []*protobufs.SignedDecaf448Key{},
 				}
 			}
-			registry.KeysByPurpose[key.KeyPurpose].Keys = append(
-				registry.KeysByPurpose[key.KeyPurpose].Keys, key,
+			registry.KeysByPurpose[key.KeyPurpose].X448Keys = append(
+				registry.KeysByPurpose[key.KeyPurpose].X448Keys, key,
 			)
 			if registry.LastUpdated < key.CreatedAt {
 				registry.LastUpdated = key.CreatedAt
@@ -711,17 +1000,62 @@ func (p *PebbleKeyStore) GetKeyRegistry(
 	// If we have a prover key, also get keys signed by it
 	if registry.ProverKey != nil && len(crossSigData) > 0 {
 		proverKeyAddress := crossSigData[:32]
-		proverKeys, err := p.GetSignedKeysByParent(proverKeyAddress, "")
+		proverKeys, err := p.GetSignedX448KeysByParent(proverKeyAddress, "")
 		if err == nil {
 			for _, key := range proverKeys {
 				if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
 					registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
-						KeyPurpose: key.KeyPurpose,
-						Keys:       []*protobufs.SignedX448Key{},
+						KeyPurpose:   key.KeyPurpose,
+						X448Keys:     []*protobufs.SignedX448Key{},
+						Decaf448Keys: []*protobufs.SignedDecaf448Key{},
 					}
 				}
-				registry.KeysByPurpose[key.KeyPurpose].Keys = append(
-					registry.KeysByPurpose[key.KeyPurpose].Keys, key,
+				registry.KeysByPurpose[key.KeyPurpose].X448Keys = append(
+					registry.KeysByPurpose[key.KeyPurpose].X448Keys, key,
+				)
+				if registry.LastUpdated < key.CreatedAt {
+					registry.LastUpdated = key.CreatedAt
+				}
+			}
+		}
+	}
+
+	// Get all signed keys by parent (identity key)
+	allDecafKeys, err := p.GetSignedDecaf448KeysByParent(identityKeyAddress, "")
+	if err == nil {
+		// Group by purpose
+		for _, key := range allDecafKeys {
+			if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
+				registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
+					KeyPurpose:   key.KeyPurpose,
+					X448Keys:     []*protobufs.SignedX448Key{},
+					Decaf448Keys: []*protobufs.SignedDecaf448Key{},
+				}
+			}
+			registry.KeysByPurpose[key.KeyPurpose].Decaf448Keys = append(
+				registry.KeysByPurpose[key.KeyPurpose].Decaf448Keys, key,
+			)
+			if registry.LastUpdated < key.CreatedAt {
+				registry.LastUpdated = key.CreatedAt
+			}
+		}
+	}
+
+	// If we have a prover key, also get keys signed by it
+	if registry.ProverKey != nil && len(crossSigData) > 0 {
+		proverKeyAddress := crossSigData[:32]
+		proverKeys, err := p.GetSignedDecaf448KeysByParent(proverKeyAddress, "")
+		if err == nil {
+			for _, key := range proverKeys {
+				if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
+					registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
+						KeyPurpose:   key.KeyPurpose,
+						X448Keys:     []*protobufs.SignedX448Key{},
+						Decaf448Keys: []*protobufs.SignedDecaf448Key{},
+					}
+				}
+				registry.KeysByPurpose[key.KeyPurpose].Decaf448Keys = append(
+					registry.KeysByPurpose[key.KeyPurpose].Decaf448Keys, key,
 				)
 				if registry.LastUpdated < key.CreatedAt {
 					registry.LastUpdated = key.CreatedAt
@@ -780,18 +1114,19 @@ func (p *PebbleKeyStore) GetKeyRegistryByProver(
 	}
 
 	// Get all signed keys by parent (prover key)
-	allKeys, err := p.GetSignedKeysByParent(proverKeyAddress, "")
+	allKeys, err := p.GetSignedX448KeysByParent(proverKeyAddress, "")
 	if err == nil {
 		// Group by purpose
 		for _, key := range allKeys {
 			if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
 				registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
-					KeyPurpose: key.KeyPurpose,
-					Keys:       []*protobufs.SignedX448Key{},
+					KeyPurpose:   key.KeyPurpose,
+					X448Keys:     []*protobufs.SignedX448Key{},
+					Decaf448Keys: []*protobufs.SignedDecaf448Key{},
 				}
 			}
-			registry.KeysByPurpose[key.KeyPurpose].Keys = append(
-				registry.KeysByPurpose[key.KeyPurpose].Keys, key,
+			registry.KeysByPurpose[key.KeyPurpose].X448Keys = append(
+				registry.KeysByPurpose[key.KeyPurpose].X448Keys, key,
 			)
 			if registry.LastUpdated < key.CreatedAt {
 				registry.LastUpdated = key.CreatedAt
@@ -802,17 +1137,62 @@ func (p *PebbleKeyStore) GetKeyRegistryByProver(
 	// If we have a prover key, also get keys signed by it
 	if registry.ProverKey != nil && len(crossSigData) > 0 {
 		proverKeyAddress := crossSigData[:32]
-		proverKeys, err := p.GetSignedKeysByParent(proverKeyAddress, "")
+		proverKeys, err := p.GetSignedX448KeysByParent(proverKeyAddress, "")
 		if err == nil {
 			for _, key := range proverKeys {
 				if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
 					registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
-						KeyPurpose: key.KeyPurpose,
-						Keys:       []*protobufs.SignedX448Key{},
+						KeyPurpose:   key.KeyPurpose,
+						X448Keys:     []*protobufs.SignedX448Key{},
+						Decaf448Keys: []*protobufs.SignedDecaf448Key{},
 					}
 				}
-				registry.KeysByPurpose[key.KeyPurpose].Keys = append(
-					registry.KeysByPurpose[key.KeyPurpose].Keys, key,
+				registry.KeysByPurpose[key.KeyPurpose].X448Keys = append(
+					registry.KeysByPurpose[key.KeyPurpose].X448Keys, key,
+				)
+				if registry.LastUpdated < key.CreatedAt {
+					registry.LastUpdated = key.CreatedAt
+				}
+			}
+		}
+	}
+
+	// Get all signed keys by parent (prover key)
+	allDecafKeys, err := p.GetSignedDecaf448KeysByParent(proverKeyAddress, "")
+	if err == nil {
+		// Group by purpose
+		for _, key := range allDecafKeys {
+			if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
+				registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
+					KeyPurpose:   key.KeyPurpose,
+					X448Keys:     []*protobufs.SignedX448Key{},
+					Decaf448Keys: []*protobufs.SignedDecaf448Key{},
+				}
+			}
+			registry.KeysByPurpose[key.KeyPurpose].Decaf448Keys = append(
+				registry.KeysByPurpose[key.KeyPurpose].Decaf448Keys, key,
+			)
+			if registry.LastUpdated < key.CreatedAt {
+				registry.LastUpdated = key.CreatedAt
+			}
+		}
+	}
+
+	// If we have a prover key, also get keys signed by it
+	if registry.ProverKey != nil && len(crossSigData) > 0 {
+		proverKeyAddress := crossSigData[:32]
+		proverKeys, err := p.GetSignedDecaf448KeysByParent(proverKeyAddress, "")
+		if err == nil {
+			for _, key := range proverKeys {
+				if _, exists := registry.KeysByPurpose[key.KeyPurpose]; !exists {
+					registry.KeysByPurpose[key.KeyPurpose] = &protobufs.KeyCollection{
+						KeyPurpose:   key.KeyPurpose,
+						X448Keys:     []*protobufs.SignedX448Key{},
+						Decaf448Keys: []*protobufs.SignedDecaf448Key{},
+					}
+				}
+				registry.KeysByPurpose[key.KeyPurpose].Decaf448Keys = append(
+					registry.KeysByPurpose[key.KeyPurpose].Decaf448Keys, key,
 				)
 				if registry.LastUpdated < key.CreatedAt {
 					registry.LastUpdated = key.CreatedAt
@@ -824,8 +1204,8 @@ func (p *PebbleKeyStore) GetKeyRegistryByProver(
 	return registry, nil
 }
 
-// RangeSignedKeys returns an iterator over signed keys, optionally filtered
-func (p *PebbleKeyStore) RangeSignedKeys(
+// RangeSignedX448Keys returns an iterator over signed keys, optionally filtered
+func (p *PebbleKeyStore) RangeSignedX448Keys(
 	parentKeyAddress []byte,
 	keyPurpose string,
 ) (store.TypedIterator[*protobufs.SignedX448Key], error) {
@@ -833,23 +1213,31 @@ func (p *PebbleKeyStore) RangeSignedKeys(
 
 	if parentKeyAddress != nil && keyPurpose != "" {
 		// Range for specific parent and purpose
-		startKey = signedKeyByParentKey(parentKeyAddress, keyPurpose, []byte{0x00})
-		endKey = signedKeyByParentKey(parentKeyAddress, keyPurpose, []byte{0xff})
+		startKey = signedX448KeyByParentKey(
+			parentKeyAddress,
+			keyPurpose,
+			[]byte{0x00},
+		)
+		endKey = signedX448KeyByParentKey(
+			parentKeyAddress,
+			keyPurpose,
+			[]byte{0xff},
+		)
 	} else if parentKeyAddress != nil {
 		// Range for specific parent, all purposes
-		startKey = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+		startKey = []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_PARENT}
 		startKey = append(startKey, parentKeyAddress...)
-		endKey = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_PARENT}
+		endKey = []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_PARENT}
 		endKey = append(endKey, parentKeyAddress...)
 		endKey = append(endKey, 0xff)
 	} else if keyPurpose != "" {
 		// Range for specific purpose, all parents
-		startKey = signedKeyByPurposeKey(keyPurpose, []byte{0x00})
-		endKey = signedKeyByPurposeKey(keyPurpose, []byte{0xff})
+		startKey = signedX448KeyByPurposeKey(keyPurpose, []byte{0x00})
+		endKey = signedX448KeyByPurposeKey(keyPurpose, []byte{0xff})
 	} else {
 		// Range all signed keys
-		startKey = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_ID}
-		endKey = []byte{KEY_BUNDLE, KEY_SIGNED_KEY_BY_ID + 1}
+		startKey = []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_ID}
+		endKey = []byte{KEY_BUNDLE, KEY_X448_SIGNED_KEY_BY_ID + 1}
 	}
 
 	iter, err := p.db.NewIter(startKey, endKey)
@@ -857,5 +1245,50 @@ func (p *PebbleKeyStore) RangeSignedKeys(
 		return nil, errors.Wrap(err, "range signed keys")
 	}
 
-	return &PebbleSignedKeyIterator{i: iter, db: p}, nil
+	return &PebbleSignedX448KeyIterator{i: iter, db: p}, nil
+}
+
+// RangeSignedDecaf448Keys returns an iterator over signed keys, optionally
+// filtered
+func (p *PebbleKeyStore) RangeSignedDecaf448Keys(
+	parentKeyAddress []byte,
+	keyPurpose string,
+) (store.TypedIterator[*protobufs.SignedDecaf448Key], error) {
+	var startKey, endKey []byte
+
+	if parentKeyAddress != nil && keyPurpose != "" {
+		// Range for specific parent and purpose
+		startKey = signedDecaf448KeyByParentKey(
+			parentKeyAddress,
+			keyPurpose,
+			[]byte{0x00},
+		)
+		endKey = signedDecaf448KeyByParentKey(
+			parentKeyAddress,
+			keyPurpose,
+			[]byte{0xff},
+		)
+	} else if parentKeyAddress != nil {
+		// Range for specific parent, all purposes
+		startKey = []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_PARENT}
+		startKey = append(startKey, parentKeyAddress...)
+		endKey = []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_PARENT}
+		endKey = append(endKey, parentKeyAddress...)
+		endKey = append(endKey, 0xff)
+	} else if keyPurpose != "" {
+		// Range for specific purpose, all parents
+		startKey = signedDecaf448KeyByPurposeKey(keyPurpose, []byte{0x00})
+		endKey = signedDecaf448KeyByPurposeKey(keyPurpose, []byte{0xff})
+	} else {
+		// Range all signed keys
+		startKey = []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_ID}
+		endKey = []byte{KEY_BUNDLE, KEY_DECAF448_SIGNED_KEY_BY_ID + 1}
+	}
+
+	iter, err := p.db.NewIter(startKey, endKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "range signed keys")
+	}
+
+	return &PebbleSignedDecaf448KeyIterator{i: iter, db: p}, nil
 }

@@ -27,6 +27,7 @@ const (
 	SignedDevicePreKeyType                     uint32 = 0x0121
 	KeyCollectionType                          uint32 = 0x0122
 	KeyRegistryType                            uint32 = 0x0123
+	SignedDecaf448KeyType                      uint32 = 0x0124
 
 	// Channel types (0x0200 - 0x02FF)
 	P2PChannelEnvelopeType uint32 = 0x0200

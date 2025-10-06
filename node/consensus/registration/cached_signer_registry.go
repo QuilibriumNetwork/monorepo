@@ -198,9 +198,30 @@ func (c *CachedSignerRegistry) ValidateProvingKey(
 	return nil
 }
 
-// ValidateSignedKey validates a signed X448 key
-func (c *CachedSignerRegistry) ValidateSignedKey(
+// ValidateSignedX448Key validates a signed X448 key
+func (c *CachedSignerRegistry) ValidateSignedX448Key(
 	signedKey *protobufs.SignedX448Key,
+) error {
+	// First validate the structure
+	if err := signedKey.Validate(); err != nil {
+		return errors.Wrap(err, "validate signed key")
+	}
+
+	// Then verify the signature using the appropriate verifier
+	if err := signedKey.Verify(
+		[]byte("KEY_REGISTRY"),
+		c.blsConstructor,
+		c.bulletproofProver,
+	); err != nil {
+		return errors.Wrap(err, "validate signed key")
+	}
+
+	return nil
+}
+
+// ValidateSignedDecaf448Key validates a signed Decaf448 key
+func (c *CachedSignerRegistry) ValidateSignedDecaf448Key(
+	signedKey *protobufs.SignedDecaf448Key,
 ) error {
 	// First validate the structure
 	if err := signedKey.Validate(); err != nil {
@@ -305,18 +326,47 @@ func (c *CachedSignerRegistry) PutCrossSignature(
 }
 
 // PutSignedKey stores a signed X448 key
-func (c *CachedSignerRegistry) PutSignedKey(
+func (c *CachedSignerRegistry) PutSignedX448Key(
 	txn store.Transaction,
 	address []byte,
 	key *protobufs.SignedX448Key,
 ) error {
 	// Validate the key
-	if err := c.ValidateSignedKey(key); err != nil {
+	if err := c.ValidateSignedX448Key(key); err != nil {
 		return errors.Wrap(err, "put signed key")
 	}
 
 	// Store in the key store
-	if err := c.keyStore.PutSignedKey(txn, address, key); err != nil {
+	if err := c.keyStore.PutSignedX448Key(txn, address, key); err != nil {
+		return errors.Wrap(err, "put signed key")
+	}
+
+	// Clear cache entries that might be affected
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Clear cache for parent key
+	addressBI, _ := poseidon.HashBytes(key.ParentKeyAddress)
+	var parentAddr [32]byte
+	addressBI.FillBytes(parentAddr[:])
+	delete(c.cache, parentAddr)
+
+	return nil
+}
+
+// PutSignedDecaf448Key stores a signed Decaf448 key
+func (c *CachedSignerRegistry) PutSignedDecaf448Key(
+	txn store.Transaction,
+	address []byte,
+	key *protobufs.SignedDecaf448Key,
+) error {
+	// Validate the key
+	if err := c.ValidateSignedDecaf448Key(key); err != nil {
+		return errors.Wrap(err, "put signed key")
+	}
+
+	// Store in the key store
+	if err := c.keyStore.PutSignedDecaf448Key(txn, address, key); err != nil {
 		return errors.Wrap(err, "put signed key")
 	}
 
@@ -347,19 +397,34 @@ func (c *CachedSignerRegistry) GetProvingKey(
 	return c.keyStore.GetProvingKey(address)
 }
 
-// GetSignedKey retrieves a signed key by address
-func (c *CachedSignerRegistry) GetSignedKey(
+// GetSignedX448Key retrieves a signed key by address
+func (c *CachedSignerRegistry) GetSignedX448Key(
 	address []byte,
 ) (*protobufs.SignedX448Key, error) {
-	return c.keyStore.GetSignedKey(address)
+	return c.keyStore.GetSignedX448Key(address)
 }
 
-// GetSignedKeysByParent retrieves all signed keys for a parent key
-func (c *CachedSignerRegistry) GetSignedKeysByParent(
+// GetSignedX448KeysByParent retrieves all signed keys for a parent key
+func (c *CachedSignerRegistry) GetSignedX448KeysByParent(
 	parentKeyAddress []byte,
 	keyPurpose string,
 ) ([]*protobufs.SignedX448Key, error) {
-	return c.keyStore.GetSignedKeysByParent(parentKeyAddress, keyPurpose)
+	return c.keyStore.GetSignedX448KeysByParent(parentKeyAddress, keyPurpose)
+}
+
+// GetSignedDecaf448Key retrieves a signed key by address
+func (c *CachedSignerRegistry) GetSignedDecaf448Key(
+	address []byte,
+) (*protobufs.SignedDecaf448Key, error) {
+	return c.keyStore.GetSignedDecaf448Key(address)
+}
+
+// GetSignedDecaf448KeysByParent retrieves all signed keys for a parent key
+func (c *CachedSignerRegistry) GetSignedDecaf448KeysByParent(
+	parentKeyAddress []byte,
+	keyPurpose string,
+) ([]*protobufs.SignedDecaf448Key, error) {
+	return c.keyStore.GetSignedDecaf448KeysByParent(parentKeyAddress, keyPurpose)
 }
 
 // RangeProvingKeys returns an iterator over all proving keys
@@ -378,12 +443,20 @@ func (c *CachedSignerRegistry) RangeIdentityKeys() (
 	return c.keyStore.RangeIdentityKeys()
 }
 
-// RangeSignedKeys returns an iterator over signed keys
-func (c *CachedSignerRegistry) RangeSignedKeys(
+// RangeSignedX448Keys returns an iterator over signed keys
+func (c *CachedSignerRegistry) RangeSignedX448Keys(
 	parentKeyAddress []byte,
 	keyPurpose string,
 ) (store.TypedIterator[*protobufs.SignedX448Key], error) {
-	return c.keyStore.RangeSignedKeys(parentKeyAddress, keyPurpose)
+	return c.keyStore.RangeSignedX448Keys(parentKeyAddress, keyPurpose)
+}
+
+// RangeSignedDecaf448Keys returns an iterator over signed keys
+func (c *CachedSignerRegistry) RangeSignedDecaf448Keys(
+	parentKeyAddress []byte,
+	keyPurpose string,
+) (store.TypedIterator[*protobufs.SignedDecaf448Key], error) {
+	return c.keyStore.RangeSignedDecaf448Keys(parentKeyAddress, keyPurpose)
 }
 
 // GetAllSigners returns all cached signers
