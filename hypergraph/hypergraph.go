@@ -174,7 +174,29 @@ func (hg *HypergraphCRDT) GetSize(
 	hg.mu.RLock()
 	defer hg.mu.RUnlock()
 	if shardKey == nil {
-		return hg.size
+		sk := tries.ShardKey{
+			L1: [3]byte{0, 0, 0},
+			L2: [32]byte{
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			},
+		}
+		vas := hg.getVertexAddsSet(sk)
+		has := hg.getHyperedgeAddsSet(sk)
+		vrs := hg.getVertexRemovesSet(sk)
+		hrs := hg.getHyperedgeRemovesSet(sk)
+		size := new(big.Int).Set(hg.size)
+		size = size.Sub(
+			size,
+			new(big.Int).Add(
+				new(big.Int).Add(vas.GetSize(), has.GetSize()),
+				new(big.Int).Add(vrs.GetSize(), hrs.GetSize()),
+			),
+		)
+
+		return size
 	}
 
 	vas := hg.getVertexAddsSet(*shardKey)
