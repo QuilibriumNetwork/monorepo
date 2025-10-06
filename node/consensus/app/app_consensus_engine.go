@@ -292,6 +292,7 @@ func NewAppConsensusEngine(
 		verEnc,
 		decafConstructor,
 		compiler,
+		frameProver,
 		false, // includeGlobal
 	)
 	if err != nil {
@@ -332,12 +333,25 @@ func NewAppConsensusEngine(
 	appTimeReel.SetRevertFunc(engine.revert)
 
 	// 99 (local devnet) is the special case where consensus is of one node
-	minimumProvers := func() uint64 { return 6 }
-	if config.P2P != nil && config.P2P.Network == 99 {
-		minimumProvers = func() uint64 { return 1 }
-	}
+	if config.P2P.Network == 99 {
+		logger.Debug("devnet detected, setting minimum provers to 1")
+		engine.minimumProvers = func() uint64 { return 1 }
+	} else {
+		engine.minimumProvers = func() uint64 {
+			currentSet, err := engine.proverRegistry.GetActiveProvers(
+				engine.appAddress,
+			)
+			if err != nil {
+				return 1
+			}
 
-	engine.minimumProvers = minimumProvers
+			if len(currentSet) > 6 {
+				return 6
+			}
+
+			return uint64(len(currentSet))
+		}
+	}
 
 	// Establish hypersync service
 	engine.hyperSync = hypergraph
@@ -544,13 +558,10 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	}
 
 	// Unsubscribe from pubsub to stop new messages from arriving
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		e.pubsub.Unsubscribe(e.getConsensusMessageBitmask(), false)
-		e.pubsub.UnregisterValidator(e.getConsensusMessageBitmask())
-		e.pubsub.Unsubscribe(e.getProverMessageBitmask(), false)
-		e.pubsub.UnregisterValidator(e.getProverMessageBitmask())
-	}
-
+	e.pubsub.Unsubscribe(e.getConsensusMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getConsensusMessageBitmask())
+	e.pubsub.Unsubscribe(e.getProverMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getProverMessageBitmask())
 	e.pubsub.Unsubscribe(e.getFrameMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getFrameMessageBitmask())
 	e.pubsub.Unsubscribe(e.getGlobalFrameMessageBitmask(), false)
@@ -688,7 +699,9 @@ func (e *AppConsensusEngine) RegisterExecutor(
 
 	// Update metrics
 	executorRegistrationTotal.WithLabelValues(e.appAddressHex, "register").Inc()
-	executorsRegistered.WithLabelValues(e.appAddressHex).Set(float64(len(e.executors)))
+	executorsRegistered.WithLabelValues(
+		e.appAddressHex,
+	).Set(float64(len(e.executors)))
 
 	close(errChan)
 	return errChan
@@ -733,7 +746,9 @@ func (e *AppConsensusEngine) UnregisterExecutor(
 
 	// Update metrics
 	executorRegistrationTotal.WithLabelValues(e.appAddressHex, "unregister").Inc()
-	executorsRegistered.WithLabelValues(e.appAddressHex).Set(float64(len(e.executors)))
+	executorsRegistered.WithLabelValues(
+		e.appAddressHex,
+	).Set(float64(len(e.executors)))
 
 	close(errChan)
 	return errChan
@@ -907,7 +922,10 @@ func (e *AppConsensusEngine) materialize(
 		acceptedMessages = append(acceptedMessages, request)
 	}
 
-	err := e.proverRegistry.ProcessStateTransition(state, frame.Header.FrameNumber)
+	err := e.proverRegistry.ProcessStateTransition(
+		state,
+		frame.Header.FrameNumber,
+	)
 	if err != nil {
 		return errors.Wrap(err, "materialize")
 	}
@@ -1319,7 +1337,7 @@ func (e *AppConsensusEngine) internalProveFrame(
 
 	timestamp := time.Now().UnixMilli()
 	difficulty := e.difficultyAdjuster.GetNextDifficulty(
-		previousFrame.Rank(),
+		previousFrame.Rank()+1,
 		timestamp,
 	)
 

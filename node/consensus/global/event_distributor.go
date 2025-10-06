@@ -7,12 +7,16 @@ import (
 	"slices"
 	"time"
 
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
@@ -72,216 +76,10 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 					_, err := e.signerRegistry.GetIdentityKey(e.GetPeerInfo().PeerId)
 					if err != nil && !e.hasSentKeyBundle {
 						e.hasSentKeyBundle = true
-						vk, err := e.keyManager.GetAgreementKey("q-view-key")
-						if err != nil {
-							vk, err = e.keyManager.CreateAgreementKey(
-								"q-view-key",
-								crypto.KeyTypeDecaf448,
-							)
-							if err != nil {
-								continue
-							}
-						}
-
-						sk, err := e.keyManager.GetAgreementKey("q-spend-key")
-						if err != nil {
-							sk, err = e.keyManager.CreateAgreementKey(
-								"q-spend-key",
-								crypto.KeyTypeDecaf448,
-							)
-							if err != nil {
-								continue
-							}
-						}
-
-						pk, err := e.keyManager.GetSigningKey("q-prover-key")
-						if err != nil {
-							pk, _, err = e.keyManager.CreateSigningKey(
-								"q-prover-key",
-								crypto.KeyTypeBLS48581G1,
-							)
-							if err != nil {
-								continue
-							}
-						}
-						sig, err := e.pubsub.SignMessage(
-							slices.Concat(
-								[]byte("KEY_REGISTRY"),
-								pk.Public().([]byte),
-							),
-						)
-						if err != nil {
-							continue
-						}
-						sigp, err := pk.SignWithDomain(
-							e.pubsub.GetPublicKey(),
-							[]byte("KEY_REGISTRY"),
-						)
-						if err != nil {
-							continue
-						}
-						sigvk, err := e.pubsub.SignMessage(
-							slices.Concat(
-								[]byte("KEY_REGISTRY"),
-								vk.Public(),
-							),
-						)
-						if err != nil {
-							continue
-						}
-						sigsk, err := e.pubsub.SignMessage(
-							slices.Concat(
-								[]byte("KEY_REGISTRY"),
-								sk.Public(),
-							),
-						)
-						if err != nil {
-							continue
-						}
-						registry := &protobufs.KeyRegistry{
-							IdentityKey: &protobufs.Ed448PublicKey{
-								KeyValue: e.pubsub.GetPublicKey(),
-							},
-							ProverKey: &protobufs.BLS48581G2PublicKey{
-								KeyValue: pk.Public().([]byte),
-							},
-							IdentityToProver: &protobufs.Ed448Signature{
-								Signature: sig,
-							},
-							ProverToIdentity: &protobufs.BLS48581Signature{
-								Signature: sigp,
-							},
-							KeysByPurpose: map[string]*protobufs.KeyCollection{
-								"view": &protobufs.KeyCollection{
-									KeyPurpose: "view",
-									Keys: []*protobufs.SignedX448Key{{
-										Key: &protobufs.X448PublicKey{
-											KeyValue: vk.Public(),
-										},
-										ParentKeyAddress: e.pubsub.GetPeerID(),
-										Signature: &protobufs.SignedX448Key_Ed448Signature{
-											Ed448Signature: &protobufs.Ed448Signature{
-												Signature: sigvk,
-											},
-										},
-									}},
-								},
-								"spend": &protobufs.KeyCollection{
-									KeyPurpose: "spend",
-									Keys: []*protobufs.SignedX448Key{{
-										Key: &protobufs.X448PublicKey{
-											KeyValue: sk.Public(),
-										},
-										ParentKeyAddress: e.pubsub.GetPeerID(),
-										Signature: &protobufs.SignedX448Key_Ed448Signature{
-											Ed448Signature: &protobufs.Ed448Signature{
-												Signature: sigsk,
-											},
-										},
-									}},
-								},
-							},
-						}
-						kr, err := registry.ToCanonicalBytes()
-						if err != nil {
-							continue
-						}
-						e.pubsub.PublishToBitmask(
-							GLOBAL_PEER_INFO_BITMASK,
-							kr,
-						)
+						e.publishKeyRegistry()
 					}
 					if e.proposer != nil {
-						shardDescriptors := []provers.ShardDescriptor{}
-						shardKeys := e.hypergraph.Commit()
-						for key := range shardKeys {
-							shards, err := e.shardsStore.GetAppShards(
-								slices.Concat(key.L1[:], key.L2[:]),
-								[]uint32{},
-							)
-							if err != nil {
-								e.logger.Error("failed to retrieve shards", zap.Error(err))
-								continue
-							}
-
-							ps, err := e.proverRegistry.GetActiveProvers(nil)
-							if err != nil {
-								e.logger.Error("could not find global provers", zap.Error(err))
-								continue
-							}
-
-							idx := rand.Int63n(int64(len(ps)))
-							e.syncProvider.hyperSyncWithProver(ps[idx].Address, key)
-
-							for _, shard := range shards {
-								path := []int{}
-								bp := []byte{}
-								for _, p := range shard.Path {
-									path = append(path, int(p))
-									bp = append(bp, byte(p))
-								}
-
-								filter := slices.Concat(key.L1[:], key.L2[:], bp)
-								info, err := e.proverRegistry.GetActiveProvers(filter)
-								if err != nil {
-									e.logger.Error("failed to get active provers", zap.Error(err))
-									continue
-								}
-
-								size := e.hypergraph.GetSize(&key, path)
-								resp, err := e.hypergraph.GetChildrenForPath(
-									e.ctx,
-									&protobufs.GetChildrenForPathRequest{
-										ShardKey: slices.Concat(key.L1[:], key.L2[:]),
-										Path:     shard.Path,
-									},
-								)
-								if err != nil {
-									e.logger.Error("failed to get shard info", zap.Error(err))
-									continue
-								}
-
-								if len(resp.PathSegments) == 0 {
-									continue
-								}
-
-								if len(
-									resp.PathSegments[len(resp.PathSegments)-1].Segments,
-								) != 1 {
-									continue
-								}
-
-								shardCount := uint64(0)
-								if resp.PathSegments[len(resp.PathSegments)-1].Segments[0].GetBranch() != nil {
-									shardCount = resp.PathSegments[len(resp.PathSegments)-1].Segments[0].GetBranch().LeafCount
-								} else {
-									shardCount = 1
-								}
-
-								shardDescriptors = append(
-									shardDescriptors,
-									provers.ShardDescriptor{
-										Filter: filter,
-										Size:   size.Uint64(),
-										Ring:   uint8(len(info) / 8),
-										Shards: shardCount,
-									},
-								)
-							}
-						}
-						proposals, err := e.proposer.PlanAndAllocate(
-							uint64(data.Frame.Header.Difficulty),
-							shardDescriptors,
-							0,
-						)
-						if err != nil {
-							e.logger.Error("could not plan shard allocations", zap.Error(err))
-						} else {
-							e.logger.Info(
-								"proposed joins",
-								zap.Int("proposals", len(proposals)),
-							)
-						}
+						e.evaluateForProposals(data)
 					}
 				}
 
@@ -381,6 +179,31 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 							)
 						}
 					}
+				}
+
+			case typesconsensus.ControlEventCoverageHalt:
+				data, ok := event.Data.(*typesconsensus.CoverageEventData)
+				if ok && data.Message != "" {
+					e.logger.Error(data.Message)
+					e.halt()
+					if err := e.stateMachine.Stop(); err != nil {
+						e.logger.Error(
+							"error occurred while halting consensus",
+							zap.Error(err),
+						)
+					}
+					go func() {
+						for {
+							select {
+							case <-e.ctx.Done():
+								return
+							case <-time.After(10 * time.Second):
+								e.logger.Error(
+									"full halt detected, leaving system in halted state until recovery",
+								)
+							}
+						}
+					}()
 				}
 
 			case typesconsensus.ControlEventHalt:
@@ -491,4 +314,280 @@ func (e *GlobalConsensusEngine) emitAlertEvent(alertMessage string) {
 	go e.eventDistributor.Publish(event)
 
 	e.logger.Info("emitted alert message")
+}
+
+func (e *GlobalConsensusEngine) estimateSeniorityFromConfig() uint64 {
+	peerIds := []string{}
+	peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
+	if len(e.config.Engine.MultisigProverEnrollmentPaths) != 0 {
+		for _, conf := range e.config.Engine.MultisigProverEnrollmentPaths {
+			extraConf, err := config.LoadConfig(conf, "", false)
+			if err != nil {
+				e.logger.Error("could not load config", zap.Error(err))
+				continue
+			}
+
+			peerPrivKey, err := hex.DecodeString(extraConf.P2P.PeerPrivKey)
+			if err != nil {
+				e.logger.Error("could not decode peer key", zap.Error(err))
+				continue
+			}
+
+			privKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKey)
+			if err != nil {
+				e.logger.Error("could not unmarshal peer key", zap.Error(err))
+				continue
+			}
+
+			pub := privKey.GetPublic()
+			id, err := peer.IDFromPublicKey(pub)
+			if err != nil {
+				e.logger.Error("could not unmarshal peerid", zap.Error(err))
+				continue
+			}
+
+			peerIds = append(peerIds, id.String())
+		}
+	}
+	seniorityBI := compat.GetAggregatedSeniority(peerIds)
+	return seniorityBI.Uint64()
+}
+
+func (e *GlobalConsensusEngine) evaluateForProposals(
+	data *consensustime.GlobalEvent,
+) {
+	info, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
+	var effectiveSeniority uint64
+	if err != nil {
+		effectiveSeniority = e.estimateSeniorityFromConfig()
+	} else {
+		effectiveSeniority = info.Seniority
+	}
+
+	shardDescriptors := []provers.ShardDescriptor{}
+	shardKeys := e.hypergraph.Commit()
+	for key := range shardKeys {
+		shards, err := e.shardsStore.GetAppShards(
+			slices.Concat(key.L1[:], key.L2[:]),
+			[]uint32{},
+		)
+		if err != nil {
+			e.logger.Error("failed to retrieve shards", zap.Error(err))
+			continue
+		}
+
+		ps, err := e.proverRegistry.GetActiveProvers(nil)
+		if err != nil {
+			e.logger.Error("could not find global provers", zap.Error(err))
+			continue
+		}
+
+		idx := rand.Int63n(int64(len(ps)))
+		e.syncProvider.hyperSyncWithProver(ps[idx].Address, key)
+
+		for _, shard := range shards {
+			path := []int{}
+			bp := []byte{}
+			for _, p := range shard.Path {
+				path = append(path, int(p))
+				bp = append(bp, byte(p))
+			}
+
+			filter := slices.Concat(key.L1[:], key.L2[:], bp)
+			info, err := e.proverRegistry.GetProvers(filter)
+			if err != nil {
+				e.logger.Error("failed to get provers", zap.Error(err))
+				continue
+			}
+
+			size := e.hypergraph.GetSize(&key, path)
+			resp, err := e.hypergraph.GetChildrenForPath(
+				e.ctx,
+				&protobufs.GetChildrenForPathRequest{
+					ShardKey: slices.Concat(key.L1[:], key.L2[:]),
+					Path:     shard.Path,
+				},
+			)
+			if err != nil {
+				e.logger.Error("failed to get shard info", zap.Error(err))
+				continue
+			}
+
+			if len(resp.PathSegments) == 0 {
+				continue
+			}
+
+			if len(
+				resp.PathSegments[len(resp.PathSegments)-1].Segments,
+			) != 1 {
+				continue
+			}
+
+			shardCount := uint64(0)
+			if resp.PathSegments[len(resp.PathSegments)-1].Segments[0].GetBranch() != nil {
+				shardCount = resp.PathSegments[len(resp.PathSegments)-1].Segments[0].GetBranch().LeafCount
+			} else {
+				shardCount = 1
+			}
+
+			above := []*typesconsensus.ProverInfo{}
+			for _, i := range info {
+				if i.Seniority >= effectiveSeniority {
+					above = append(above, i)
+				}
+			}
+
+			shardDescriptors = append(
+				shardDescriptors,
+				provers.ShardDescriptor{
+					Filter: filter,
+					Size:   size.Uint64(),
+					Ring:   uint8(len(above) / 8),
+					Shards: shardCount,
+				},
+			)
+		}
+	}
+	proposals, err := e.proposer.PlanAndAllocate(
+		uint64(data.Frame.Header.Difficulty),
+		shardDescriptors,
+		0,
+	)
+	if err != nil {
+		e.logger.Error("could not plan shard allocations", zap.Error(err))
+	} else {
+		e.logger.Info(
+			"proposed joins",
+			zap.Int("proposals", len(proposals)),
+		)
+	}
+}
+
+func (e *GlobalConsensusEngine) publishKeyRegistry() {
+	vk, err := e.keyManager.GetAgreementKey("q-view-key")
+	if err != nil {
+		vk, err = e.keyManager.CreateAgreementKey(
+			"q-view-key",
+			crypto.KeyTypeDecaf448,
+		)
+		if err != nil {
+			e.logger.Error("could not publish key registry", zap.Error(err))
+			return
+		}
+	}
+
+	sk, err := e.keyManager.GetAgreementKey("q-spend-key")
+	if err != nil {
+		sk, err = e.keyManager.CreateAgreementKey(
+			"q-spend-key",
+			crypto.KeyTypeDecaf448,
+		)
+		if err != nil {
+			e.logger.Error("could not publish key registry", zap.Error(err))
+			return
+		}
+	}
+
+	pk, err := e.keyManager.GetSigningKey("q-prover-key")
+	if err != nil {
+		pk, _, err = e.keyManager.CreateSigningKey(
+			"q-prover-key",
+			crypto.KeyTypeBLS48581G1,
+		)
+		if err != nil {
+			e.logger.Error("could not publish key registry", zap.Error(err))
+			return
+		}
+	}
+	sig, err := e.pubsub.SignMessage(
+		slices.Concat(
+			[]byte("KEY_REGISTRY"),
+			pk.Public().([]byte),
+		),
+	)
+	if err != nil {
+		e.logger.Error("could not publish key registry", zap.Error(err))
+		return
+	}
+	sigp, err := pk.SignWithDomain(
+		e.pubsub.GetPublicKey(),
+		[]byte("KEY_REGISTRY"),
+	)
+	if err != nil {
+		e.logger.Error("could not publish key registry", zap.Error(err))
+		return
+	}
+	sigvk, err := e.pubsub.SignMessage(
+		slices.Concat(
+			[]byte("KEY_REGISTRY"),
+			vk.Public(),
+		),
+	)
+	if err != nil {
+		e.logger.Error("could not publish key registry", zap.Error(err))
+		return
+	}
+	sigsk, err := e.pubsub.SignMessage(
+		slices.Concat(
+			[]byte("KEY_REGISTRY"),
+			sk.Public(),
+		),
+	)
+	if err != nil {
+		e.logger.Error("could not publish key registry", zap.Error(err))
+		return
+	}
+	registry := &protobufs.KeyRegistry{
+		IdentityKey: &protobufs.Ed448PublicKey{
+			KeyValue: e.pubsub.GetPublicKey(),
+		},
+		ProverKey: &protobufs.BLS48581G2PublicKey{
+			KeyValue: pk.Public().([]byte),
+		},
+		IdentityToProver: &protobufs.Ed448Signature{
+			Signature: sig,
+		},
+		ProverToIdentity: &protobufs.BLS48581Signature{
+			Signature: sigp,
+		},
+		KeysByPurpose: map[string]*protobufs.KeyCollection{
+			"view": &protobufs.KeyCollection{
+				KeyPurpose: "view",
+				Keys: []*protobufs.SignedX448Key{{
+					Key: &protobufs.X448PublicKey{
+						KeyValue: vk.Public(),
+					},
+					ParentKeyAddress: e.pubsub.GetPeerID(),
+					Signature: &protobufs.SignedX448Key_Ed448Signature{
+						Ed448Signature: &protobufs.Ed448Signature{
+							Signature: sigvk,
+						},
+					},
+				}},
+			},
+			"spend": &protobufs.KeyCollection{
+				KeyPurpose: "spend",
+				Keys: []*protobufs.SignedX448Key{{
+					Key: &protobufs.X448PublicKey{
+						KeyValue: sk.Public(),
+					},
+					ParentKeyAddress: e.pubsub.GetPeerID(),
+					Signature: &protobufs.SignedX448Key_Ed448Signature{
+						Ed448Signature: &protobufs.Ed448Signature{
+							Signature: sigsk,
+						},
+					},
+				}},
+			},
+		},
+	}
+	kr, err := registry.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not publish key registry", zap.Error(err))
+		return
+	}
+	e.pubsub.PublishToBitmask(
+		GLOBAL_PEER_INFO_BITMASK,
+		kr,
+	)
 }

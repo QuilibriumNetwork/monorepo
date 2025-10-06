@@ -25,6 +25,7 @@ func TestCreateExecutionEngine(t *testing.T) {
 	mockVerEnc := new(mocks.MockVerifiableEncryptor)
 	mockDecaf := new(mocks.MockDecafConstructor)
 	mockCompiler := new(mocks.MockCompiler)
+	mockFrameProver := new(mocks.MockFrameProver)
 
 	tests := []struct {
 		name          string
@@ -79,6 +80,7 @@ func TestCreateExecutionEngine(t *testing.T) {
 				mockVerEnc,
 				mockDecaf,
 				mockCompiler,
+				mockFrameProver,
 				engines.GlobalMode,
 			)
 
@@ -109,6 +111,7 @@ func TestCreateAllEngines(t *testing.T) {
 	mockVerEnc := new(mocks.MockVerifiableEncryptor)
 	mockDecaf := new(mocks.MockDecafConstructor)
 	mockCompiler := new(mocks.MockCompiler)
+	mockFrameProver := new(mocks.MockFrameProver)
 
 	engines, err := engines.CreateAllEngines(
 		logger,
@@ -122,6 +125,7 @@ func TestCreateAllEngines(t *testing.T) {
 		mockVerEnc,
 		mockDecaf,
 		mockCompiler,
+		mockFrameProver,
 		true, // includeGlobal
 	)
 	// CreateAllEngines doesn't return error, it just logs warnings

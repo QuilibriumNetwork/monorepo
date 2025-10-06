@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 
 	"go.uber.org/zap"
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
-	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 // checkShardCoverage verifies coverage levels for all active shards
@@ -41,15 +41,21 @@ func (e *GlobalConsensusEngine) checkShardCoverage() error {
 		proverCount := coverage.ProverCount
 		attestedStorage := coverage.AttestedStorage
 
+		size := big.NewInt(0)
+		for _, metadata := range coverage.TreeMetadata {
+			size = size.Add(size, new(big.Int).SetUint64(metadata.TotalSize))
+		}
+
 		e.logger.Debug(
 			"checking shard coverage",
 			zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
 			zap.Int("prover_count", proverCount),
 			zap.Uint64("attested_storage", attestedStorage),
+			zap.Uint64("shard_size", size.Uint64()),
 		)
 
 		// Check for critical coverage (halt condition)
-		if proverCount <= haltThreshold {
+		if proverCount <= haltThreshold && size.Cmp(big.NewInt(0)) > 0 {
 			// Check if this address is blacklisted
 			if e.isAddressBlacklisted([]byte(shardAddress)) {
 				e.logger.Warn(
@@ -300,33 +306,17 @@ func (e *GlobalConsensusEngine) getShardCoverageMap() map[string]*ShardCoverage 
 
 		// Get tree metadata from hypergraph
 		var treeMetadata []typesconsensus.TreeMetadata
-		expandedFilter := make([]byte, 64)
-		copy(expandedFilter[:len(shardAddress)], []byte(shardAddress)[:])
-		treeData, err := e.hypergraph.GetVertexData([64]byte(expandedFilter))
+		metadata, err := e.hypergraph.GetMetadataAtKey([]byte(shardAddress))
 		if err != nil {
-			e.logger.Warn(
-				"failed to get shard data for shard",
-				zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
-				zap.Error(err),
-			)
-			// Use empty metadata if we can't get the data
-			treeMetadata = []typesconsensus.TreeMetadata{
-				{
-					CommitmentRoot: make([]byte, 74),
-					TotalSize:      0,
-					TotalLeaves:    0,
-				},
-			}
-		} else {
-			treeMetadata = []typesconsensus.TreeMetadata{
-				{
-					CommitmentRoot: make([]byte, 74),
-					TotalSize:      treeData.GetSize().Uint64(),
-					TotalLeaves: uint64(
-						len(tries.GetAllPreloadedLeaves(treeData.Root)),
-					),
-				},
-			}
+			e.logger.Error("could not obtain metadata for path", zap.Error(err))
+			return nil
+		}
+		for _, metadata := range metadata {
+			treeMetadata = append(treeMetadata, typesconsensus.TreeMetadata{
+				CommitmentRoot: metadata.Commitment,
+				TotalSize:      metadata.Size,
+				TotalLeaves:    metadata.LeafCount,
+			})
 		}
 
 		coverageMap[shardAddress] = &ShardCoverage{
@@ -378,29 +368,18 @@ func (e *GlobalConsensusEngine) getShardCoverage(shardAddress []byte) (
 
 	// Get tree metadata from hypergraph
 	var treeMetadata []typesconsensus.TreeMetadata
-	treeData, err := e.hypergraph.GetVertexData([64]byte([]byte(shardAddress)))
+
+	metadata, err := e.hypergraph.GetMetadataAtKey(shardAddress)
 	if err != nil {
-		e.logger.Warn(
-			"failed to get shard data for shard",
-			zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
-			zap.Error(err),
-		)
-		// Use empty metadata if we can't get the data
-		treeMetadata = []typesconsensus.TreeMetadata{
-			{
-				CommitmentRoot: make([]byte, 74),
-				TotalSize:      0,
-				TotalLeaves:    0,
-			},
-		}
-	} else {
-		treeMetadata = []typesconsensus.TreeMetadata{
-			{
-				CommitmentRoot: make([]byte, 74),
-				TotalSize:      treeData.Root.GetSize().Uint64(),
-				TotalLeaves:    uint64(len(tries.GetAllPreloadedLeaves(treeData.Root))),
-			},
-		}
+		e.logger.Error("could not obtain metadata for path", zap.Error(err))
+		return nil, false
+	}
+	for _, metadata := range metadata {
+		treeMetadata = append(treeMetadata, typesconsensus.TreeMetadata{
+			CommitmentRoot: metadata.Commitment,
+			TotalSize:      metadata.Size,
+			TotalLeaves:    metadata.LeafCount,
+		})
 	}
 
 	coverage := &ShardCoverage{

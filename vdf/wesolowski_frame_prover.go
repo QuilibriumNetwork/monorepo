@@ -55,6 +55,33 @@ func GetSetBitIndices(mask []byte) []uint8 {
 	return indices
 }
 
+func (w *WesolowskiFrameProver) CalculateMultiProof(
+	challenge [32]byte,
+	difficulty uint32,
+	ids [][]byte,
+	index uint32,
+) [516]byte {
+	return WesolowskiSolveMulti(challenge, difficulty, ids, index)
+}
+
+func (w *WesolowskiFrameProver) VerifyMultiProof(
+	challenge [32]byte,
+	difficulty uint32,
+	ids [][]byte,
+	allegedSolutions [][516]byte,
+) (bool, error) {
+	if len(ids) != len(allegedSolutions) || len(ids) == 0 {
+		return false, errors.New("invalid payload")
+	}
+
+	return WesolowskiVerifyMulti(
+		challenge,
+		difficulty,
+		ids,
+		allegedSolutions,
+	), nil
+}
+
 func (w *WesolowskiFrameProver) ProveFrameHeaderGenesis(
 	address []byte,
 	difficulty uint32,

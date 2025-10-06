@@ -1,6 +1,3 @@
-//go:build integrationtest
-// +build integrationtest
-
 package global
 
 import (
@@ -11,14 +8,17 @@ import (
 	"fmt"
 	"math/big"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -43,6 +43,7 @@ import (
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/validator"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
+	qp2p "source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -70,16 +71,18 @@ func (l *testTransitionListener) OnTransition(from, to consensus.State, event co
 // mockIntegrationPubSub is a pubsub mock for integration testing
 type mockIntegrationPubSub struct {
 	mock.Mock
-	mu               sync.RWMutex
-	subscribers      map[string][]func(message *pb.Message) error
-	validators       map[string]func(peerID peer.ID, message *pb.Message) p2p.ValidationResult
-	peerID           []byte
-	peerCount        int
-	networkPeers     map[string]*mockIntegrationPubSub
-	frames           []*protobufs.GlobalFrame
-	onPublish        func(bitmask []byte, data []byte)
-	deliveryComplete chan struct{}     // Signal when all deliveries are done
-	msgProcessor     func(*pb.Message) // Custom message processor for tracking
+	mu                   sync.RWMutex
+	subscribers          map[string][]func(message *pb.Message) error
+	validators           map[string]func(peerID peer.ID, message *pb.Message) p2p.ValidationResult
+	peerID               []byte
+	peerCount            int
+	networkPeers         map[string]*mockIntegrationPubSub
+	frames               []*protobufs.GlobalFrame
+	onPublish            func(bitmask []byte, data []byte)
+	deliveryComplete     chan struct{}     // Signal when all deliveries are done
+	msgProcessor         func(*pb.Message) // Custom message processor for tracking
+	underlyingHost       host.Host
+	underlyingBlossomSub *qp2p.BlossomSub
 }
 
 // GetOwnMultiaddrs implements p2p.PubSub.
@@ -88,24 +91,28 @@ func (m *mockIntegrationPubSub) GetOwnMultiaddrs() []multiaddr.Multiaddr {
 	return []multiaddr.Multiaddr{ma}
 }
 
-func newMockIntegrationPubSub(peerID []byte) *mockIntegrationPubSub {
+func newMockIntegrationPubSub(config *config.Config, logger *zap.Logger, peerID []byte, host host.Host, privKey pcrypto.PrivKey, bootstrapHosts []host.Host) *mockIntegrationPubSub {
+	blossomSub := qp2p.NewBlossomSubWithHost(config.P2P, config.Engine, logger, 1, true, host, privKey, bootstrapHosts)
 	return &mockIntegrationPubSub{
-		subscribers:      make(map[string][]func(message *pb.Message) error),
-		validators:       make(map[string]func(peerID peer.ID, message *pb.Message) p2p.ValidationResult),
-		peerID:           peerID,
-		peerCount:        0, // Start with 0 to trigger genesis
-		networkPeers:     make(map[string]*mockIntegrationPubSub),
-		frames:           make([]*protobufs.GlobalFrame, 0),
-		deliveryComplete: make(chan struct{}),
+		subscribers:          make(map[string][]func(message *pb.Message) error),
+		validators:           make(map[string]func(peerID peer.ID, message *pb.Message) p2p.ValidationResult),
+		peerID:               peerID,
+		peerCount:            0, // Start with 0 to trigger genesis
+		networkPeers:         make(map[string]*mockIntegrationPubSub),
+		frames:               make([]*protobufs.GlobalFrame, 0),
+		deliveryComplete:     make(chan struct{}),
+		underlyingHost:       host,
+		underlyingBlossomSub: blossomSub,
 	}
 }
 
 func (m *mockIntegrationPubSub) Subscribe(bitmask []byte, handler func(message *pb.Message) error) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	key := string(bitmask)
 	m.subscribers[key] = append(m.subscribers[key], handler)
-	return nil
+	m.mu.Unlock()
+
+	return m.underlyingBlossomSub.Subscribe(bitmask, handler)
 }
 
 func (m *mockIntegrationPubSub) PublishToBitmask(bitmask []byte, data []byte) error {
@@ -140,55 +147,7 @@ func (m *mockIntegrationPubSub) PublishToBitmask(bitmask []byte, data []byte) er
 	}
 	m.mu.RUnlock()
 
-	// Track deliveries with wait group
-	deliveryWg := sync.WaitGroup{}
-	deliveryWg.Add(totalHandlers)
-
-	// Create wrapped handler that decrements counter
-	wrappedHandler := func(h func(*pb.Message) error, msg *pb.Message) {
-		defer deliveryWg.Done()
-		if m.msgProcessor != nil {
-			m.msgProcessor(msg)
-		}
-		h(msg)
-	}
-
-	message := &pb.Message{
-		From: m.peerID,
-		Data: data,
-	}
-
-	// Deliver to self asynchronously
-	m.mu.RLock()
-	localHandlers := m.subscribers[string(bitmask)]
-	m.mu.RUnlock()
-
-	for _, handler := range localHandlers {
-		go wrappedHandler(handler, message)
-	}
-
-	// Distribute to network peers
-	m.mu.RLock()
-	peers := make([]*mockIntegrationPubSub, 0, len(m.networkPeers))
-	for _, peer := range m.networkPeers {
-		peers = append(peers, peer)
-	}
-	m.mu.RUnlock()
-
-	for _, peer := range peers {
-		peer.deliverMessage(bitmask, message, &deliveryWg)
-	}
-
-	// Start goroutine to signal when all deliveries complete
-	go func() {
-		deliveryWg.Wait()
-		select {
-		case m.deliveryComplete <- struct{}{}:
-		default:
-		}
-	}()
-
-	return nil
+	return m.underlyingBlossomSub.PublishToBitmask(bitmask, data)
 }
 
 func (m *mockIntegrationPubSub) deliverMessage(bitmask []byte, message *pb.Message, wg *sync.WaitGroup) {
@@ -232,22 +191,23 @@ func (m *mockIntegrationPubSub) deliverMessage(bitmask []byte, message *pb.Messa
 
 func (m *mockIntegrationPubSub) RegisterValidator(bitmask []byte, validator func(peerID peer.ID, message *pb.Message) p2p.ValidationResult, sync bool) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.validators[string(bitmask)] = validator
-	return nil
+	m.mu.Unlock()
+	return m.underlyingBlossomSub.RegisterValidator(bitmask, validator, sync)
 }
 
 func (m *mockIntegrationPubSub) UnregisterValidator(bitmask []byte) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	delete(m.validators, string(bitmask))
-	return nil
+	m.mu.Unlock()
+	return m.underlyingBlossomSub.UnregisterValidator(bitmask)
 }
 
 func (m *mockIntegrationPubSub) Unsubscribe(bitmask []byte, raw bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	delete(m.subscribers, string(bitmask))
+	m.mu.Unlock()
+	m.underlyingBlossomSub.Unsubscribe(bitmask, raw)
 }
 
 func (m *mockIntegrationPubSub) GetPeerID() []byte {
@@ -261,16 +221,6 @@ func (m *mockIntegrationPubSub) GetPeerstoreCount() int {
 func (m *mockIntegrationPubSub) GetNetworkInfo() *protobufs.NetworkInfoResponse {
 	return &protobufs.NetworkInfoResponse{
 		NetworkInfo: []*protobufs.NetworkInfo{},
-	}
-}
-
-// WaitForDeliveries waits for all message deliveries to complete
-func (m *mockIntegrationPubSub) WaitForDeliveries(timeout time.Duration) error {
-	select {
-	case <-m.deliveryComplete:
-		return nil
-	case <-time.After(timeout):
-		return errors.New("timeout waiting for message deliveries")
 	}
 }
 
@@ -398,13 +348,16 @@ func createIntegrationTestGlobalConsensusEngine(
 	t *testing.T,
 	peerID []byte,
 	network uint8,
+	h host.Host,
+	privKey pcrypto.PrivKey,
+	bootstrapHosts []host.Host,
 ) (
 	*GlobalConsensusEngine,
 	*mockIntegrationPubSub,
 	*consensustime.GlobalTimeReel,
 	func(),
 ) {
-	return createIntegrationTestGlobalConsensusEngineWithHypergraph(t, peerID, nil, network)
+	return createIntegrationTestGlobalConsensusEngineWithHypergraph(t, peerID, nil, network, h, privKey, bootstrapHosts)
 }
 
 // createIntegrationTestGlobalConsensusEngineWithHypergraph creates an engine with optional shared hypergraph
@@ -413,13 +366,16 @@ func createIntegrationTestGlobalConsensusEngineWithHypergraph(
 	peerID []byte,
 	sharedHypergraph thypergraph.Hypergraph,
 	network uint8,
+	h host.Host,
+	privKey pcrypto.PrivKey,
+	bootstrapHosts []host.Host,
 ) (
 	*GlobalConsensusEngine,
 	*mockIntegrationPubSub,
 	*consensustime.GlobalTimeReel,
 	func(),
 ) {
-	return createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(t, peerID, sharedHypergraph, nil, network)
+	return createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(t, peerID, sharedHypergraph, nil, network, h, privKey, bootstrapHosts)
 }
 
 // createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey creates an engine with optional shared hypergraph and pre-generated key
@@ -429,6 +385,9 @@ func createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(
 	sharedHypergraph thypergraph.Hypergraph,
 	preGeneratedKey *tkeys.Key,
 	network uint8,
+	h host.Host,
+	privKey pcrypto.PrivKey,
+	bootstrapHosts []host.Host,
 ) (
 	*GlobalConsensusEngine,
 	*mockIntegrationPubSub,
@@ -460,19 +419,19 @@ func createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(
 	peerkey, _, _ := keyManager.CreateSigningKey("q-peer-key", crypto.KeyTypeEd448)
 	peerpriv := peerkey.Private()
 	peerHex := hex.EncodeToString(peerpriv)
+	p2pcfg := config.P2PConfig{}.WithDefaults()
 
+	p2pcfg.Network = network
+	p2pcfg.PeerPrivKey = peerHex
+	p2pcfg.StreamListenMultiaddr = "/ip4/0.0.0.0/tcp/0"
 	cfg := &config.Config{
 		Engine: &config.EngineConfig{
-			Difficulty:   10,
+			Difficulty:   100,
 			ProvingKeyId: "q-prover-key", // Always use the required key ID
 			AlertKey:     alertHex,
 			ArchiveMode:  true,
 		},
-		P2P: &config.P2PConfig{
-			Network:               network,
-			PeerPrivKey:           peerHex,
-			StreamListenMultiaddr: "/ip4/0.0.0.0/tcp/0",
-		},
+		P2P: &p2pcfg,
 	}
 
 	// Create the required "q-prover-key"
@@ -551,7 +510,7 @@ func createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(
 	rewardIssuance := reward.NewOptRewardIssuance()
 
 	// Create pubsub
-	pubsub := newMockIntegrationPubSub(peerID)
+	pubsub := newMockIntegrationPubSub(cfg, logger, peerID, h, privKey, bootstrapHosts)
 
 	// Create time reel
 	globalTimeReel, err := consensustime.NewGlobalTimeReel(logger, proverRegistry, clockStore, network, true)
@@ -605,8 +564,11 @@ func createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(
 }
 
 func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
-	engine, pubsub, _, cleanup := createIntegrationTestGlobalConsensusEngine(t, []byte{0x01}, 99)
-	defer cleanup()
+	// Generate hosts for testing
+	_, m, cleanupHosts := tests.GenerateSimnetHosts(t, 1, []libp2p.Option{})
+	defer cleanupHosts()
+
+	engine, pubsub, _, _ := createIntegrationTestGlobalConsensusEngine(t, []byte(m.Nodes[0].ID()), 99, m.Nodes[0], m.Keys[0], m.Nodes)
 
 	// Track published frames
 	publishedFrames := make([]*protobufs.GlobalFrame, 0)
@@ -651,7 +613,7 @@ func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	assert.NotEqual(t, tconsensus.EngineStateStarting, state)
 
 	// Wait for frame processing
-	time.Sleep(1 * time.Second)
+	time.Sleep(10 * time.Second)
 
 	// Check if frames were published
 	mu.Lock()
@@ -666,8 +628,11 @@ func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 }
 
 func TestGlobalConsensusEngine_Integration_StateTransitions(t *testing.T) {
-	engine, _, _, cleanup := createIntegrationTestGlobalConsensusEngine(t, []byte{0x02}, 99)
-	defer cleanup()
+	// Generate hosts for testing
+	_, m, cleanupHosts := tests.GenerateSimnetHosts(t, 1, []libp2p.Option{})
+	defer cleanupHosts()
+
+	engine, _, _, _ := createIntegrationTestGlobalConsensusEngine(t, []byte(m.Nodes[0].ID()), 99, m.Nodes[0], m.Keys[0], m.Nodes)
 
 	// Track state transitions
 	transitions := make([]string, 0)
@@ -696,7 +661,7 @@ func TestGlobalConsensusEngine_Integration_StateTransitions(t *testing.T) {
 	}
 
 	// Wait for state transitions
-	time.Sleep(2 * time.Second)
+	time.Sleep(10 * time.Second)
 
 	// Verify we had some state transitions
 	mu.Lock()
@@ -711,6 +676,10 @@ func TestGlobalConsensusEngine_Integration_StateTransitions(t *testing.T) {
 }
 
 func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
+	// Generate hosts for all 6 nodes first
+	_, m, cleanupHosts := tests.GenerateSimnetHosts(t, 6, []libp2p.Option{})
+	defer cleanupHosts()
+
 	// Create shared components first
 	logger, _ := zap.NewDevelopment()
 
@@ -762,21 +731,19 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 	// Create six engines that can communicate (minimum required for consensus)
 	engines := make([]*GlobalConsensusEngine, 6)
 	pubsubs := make([]*mockIntegrationPubSub, 6)
-	cleanups := make([]func(), 6)
 
 	for i := 0; i < 6; i++ {
-		peerID := []byte{byte(i + 1)}
-		engine, pubsub, _, cleanup := createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(t, peerID, hypergraphs[i], nodeRawKeys[i], 1)
+		peerID := []byte(m.Nodes[i].ID())
+		engine, pubsub, _, _ := createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(t, peerID, hypergraphs[i], nodeRawKeys[i], 1, m.Nodes[i], m.Keys[i], m.Nodes)
 		engines[i] = engine
 		pubsubs[i] = pubsub
-		cleanups[i] = cleanup
-		defer cleanup()
 	}
 
 	// Connect all pubsubs to each other
 	for i := 0; i < 6; i++ {
 		for j := 0; j < 6; j++ {
 			if i != j {
+				tests.ConnectSimnetHosts(t, m.Nodes[i], m.Nodes[j])
 				pubsubs[i].networkPeers[fmt.Sprintf("peer%d", j)] = pubsubs[j]
 			}
 		}
@@ -811,7 +778,7 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 		}
 
 		// Track message processing
-		pubsubs[i].msgProcessor = func(msg *pb.Message) {
+		pubsubs[i].Subscribe([]byte{0x00}, func(msg *pb.Message) error {
 			// Check if data is long enough to contain type prefix
 			if len(msg.Data) >= 4 {
 				// Read type prefix from first 4 bytes
@@ -828,7 +795,8 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 					livenessCount[nodeIdx]++
 				}
 			}
-		}
+			return nil
+		})
 	}
 
 	// Start all engines
@@ -877,11 +845,7 @@ loop:
 
 			if allSeen {
 				// Wait for message deliveries to complete
-				for i := 0; i < 6; i++ {
-					if err := pubsubs[i].WaitForDeliveries(5 * time.Second); err != nil {
-						t.Logf("Node %d: %v", i+1, err)
-					}
-				}
+				time.Sleep(1 * time.Second)
 				t.Log("All nodes have seen all proposals, proceeding")
 				break loop
 			}
@@ -927,8 +891,32 @@ loop:
 }
 
 func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
-	engine, _, _, cleanup := createIntegrationTestGlobalConsensusEngine(t, []byte{0x03}, 99)
-	defer cleanup()
+	// Generate hosts for testing
+	_, m, cleanupHosts := tests.GenerateSimnetHosts(t, 1, []libp2p.Option{})
+	defer cleanupHosts()
+
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global_shared"}, 0)
+
+	inclusionProver := bls48581.NewKZGInclusionProver(zap.L())
+	hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{
+		InMemoryDONOTUSE: true,
+		Path:             ".test/global",
+	}, pebbleDB, zap.L(), &verenc.MPCitHVerifiableEncryptor{}, inclusionProver)
+	hg := hgcrdt.NewHypergraph(zap.NewNop(), hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+	for i := range 3 {
+		k := make([]byte, 585)
+		k[1] = byte(i)
+		abi, _ := poseidon.HashBytes(k)
+		registerProverInHypergraphWithFilter(t, hg, k, abi.FillBytes(make([]byte, 32)), []byte{1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8})
+	}
+	engine, _, _, _ := createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(t, []byte(m.Nodes[0].ID()), hg, nil, 1, m.Nodes[0], m.Keys[0], m.Nodes)
+
+	// simulate a one byte vertex so the shard has space being used
+	txn, _ := hg.NewTransaction(false)
+	c := make([]byte, 74)
+	c[0] = 0x02
+	hg.AddVertex(txn, hgcrdt.NewVertex([32]byte{1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8}, [32]byte{}, c, big.NewInt(1)))
+	txn.Commit()
 
 	// Track emitted events
 	var publishedEvents []tconsensus.ControlEvent
@@ -953,6 +941,8 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 	// Start the event distributor
 	engine.Start(make(chan struct{}))
 
+	time.Sleep(1 * time.Second)
+
 	// Configure low coverage scenario in hypergraph
 	// Since we registered only 1 prover above, this is already a low coverage scenario
 
@@ -960,8 +950,23 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 	err := engine.checkShardCoverage()
 	require.NoError(t, err)
 
-	// Wait for event processing
-	time.Sleep(100 * time.Millisecond)
+	// Wait for event processing and possible new app shard head
+	time.Sleep(10 * time.Second)
+	mu.Lock()
+	found := false
+	newHeadAfter := false
+	for _, e := range publishedEvents {
+		if e.Type == tconsensus.ControlEventCoverageHalt {
+			found = true
+		}
+		if found && e.Type == tconsensus.ControlEventAppNewHead {
+			newHeadAfter = true
+		}
+	}
+	mu.Unlock()
+
+	require.True(t, found)
+	require.False(t, newHeadAfter)
 
 	// Stop the event distributor
 	eventDistributor.Stop()
@@ -972,11 +977,16 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.T) {
 	t.Log("Testing global consensus engines with no registered provers")
 
+	// Create six nodes
+	numNodes := 6
+
+	// Generate hosts for all nodes first
+	_, m, cleanupHosts := tests.GenerateSimnetHosts(t, numNodes, []libp2p.Option{})
+	defer cleanupHosts()
+
 	// Create shared components
 	logger, _ := zap.NewDevelopment()
 
-	// Create six nodes
-	numNodes := 6
 	engines := make([]*GlobalConsensusEngine, numNodes)
 	pubsubs := make([]*mockIntegrationPubSub, numNodes)
 	quits := make([]chan struct{}, numNodes)
@@ -988,7 +998,7 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 	// Create separate hypergraph and prover registry for each node to ensure isolation
 	for i := 0; i < numNodes; i++ {
 		nodeID := i + 1
-		peerID := []byte{byte(nodeID)}
+		peerID := []byte(m.Nodes[i].ID())
 
 		t.Logf("Creating node %d with peer ID: %x", nodeID, peerID)
 
@@ -1023,7 +1033,7 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 		require.NoError(t, err)
 
 		// Create global time reel
-		globalTimeReel, err := consensustime.NewGlobalTimeReel(logger, proverRegistry, clockStore, 99, true)
+		globalTimeReel, err := consensustime.NewGlobalTimeReel(logger, proverRegistry, clockStore, 1, true)
 		require.NoError(t, err)
 
 		eventDistributor := events.NewGlobalEventDistributor(
@@ -1036,26 +1046,27 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 		difficultyAdjuster := difficulty.NewAsertDifficultyAdjuster(0, time.Now().UnixMilli(), 10)
 		rewardIssuance := reward.NewOptRewardIssuance()
 
-		// Create pubsub
-		pubsubs[i] = newMockIntegrationPubSub(peerID)
-		pubsubs[i].peerCount = 10 // Set high peer count
-
 		// Set up peer key
 		peerkey, _, _ := keyManager.CreateSigningKey("q-peer-key", crypto.KeyTypeEd448)
 		peerpriv := peerkey.Private()
 		peerHex := hex.EncodeToString(peerpriv)
 
+		p2pcfg := config.P2PConfig{}.WithDefaults()
+		p2pcfg.Network = 2
+		p2pcfg.PeerPrivKey = peerHex
+		p2pcfg.StreamListenMultiaddr = "/ip4/0.0.0.0/tcp/0"
 		cfg := &config.Config{
 			Engine: &config.EngineConfig{
 				Difficulty:   10,
 				ProvingKeyId: "q-prover-key",
+				GenesisSeed:  strings.Repeat("00", 585),
 			},
-			P2P: &config.P2PConfig{
-				Network:               2,
-				PeerPrivKey:           peerHex,
-				StreamListenMultiaddr: "/ip4/0.0.0.0/tcp/0",
-			},
+			P2P: &p2pcfg,
 		}
+
+		// Create pubsub with host and key
+		pubsubs[i] = newMockIntegrationPubSub(cfg, logger, peerID, m.Nodes[i], m.Keys[i], m.Nodes)
+		pubsubs[i].peerCount = 10 // Set high peer count
 		// Create engine
 		engine, err := NewGlobalConsensusEngine(
 			logger,
@@ -1141,8 +1152,11 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 // TestGlobalConsensusEngine_Integration_AlertStopsProgression tests that engines
 // halt when an alert broadcast occurs
 func TestGlobalConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
-	engine, pubsub, _, cleanup := createIntegrationTestGlobalConsensusEngine(t, []byte{0x01}, 99)
-	defer cleanup()
+	// Generate hosts for testing
+	_, m, cleanupHosts := tests.GenerateSimnetHosts(t, 1, []libp2p.Option{})
+	defer cleanupHosts()
+
+	engine, pubsub, _, _ := createIntegrationTestGlobalConsensusEngine(t, []byte(m.Nodes[0].ID()), 99, m.Nodes[0], m.Keys[0], m.Nodes)
 
 	// Track published frames
 	publishedFrames := make([]*protobufs.GlobalFrame, 0)
@@ -1235,4 +1249,86 @@ func TestGlobalConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 	// Stop the engine
 	close(quit)
 	<-engine.Stop(false)
+}
+
+// registerProverInHypergraphWithFilter registers a prover with a specific filter (shard address)
+func registerProverInHypergraphWithFilter(t *testing.T, hg thypergraph.Hypergraph, publicKey []byte, address []byte, filter []byte) {
+	// Create the full address: GLOBAL_INTRINSIC_ADDRESS + prover address
+	fullAddress := [64]byte{}
+	copy(fullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(fullAddress[32:], address)
+
+	// Create a VectorCommitmentTree with the prover data
+	tree := &qcrypto.VectorCommitmentTree{}
+
+	// Index 0: Public key
+	err := tree.Insert([]byte{0}, publicKey, nil, big.NewInt(0))
+	if err != nil {
+		t.Fatalf("Failed to insert public key: %v", err)
+	}
+
+	// Index 1<<2 (4): Status (1 byte) - 1 = active
+	err = tree.Insert([]byte{1 << 2}, []byte{1}, nil, big.NewInt(0))
+	if err != nil {
+		t.Fatalf("Failed to insert status: %v", err)
+	}
+
+	// Type Index:
+	typeBI, _ := poseidon.HashBytes(
+		slices.Concat(bytes.Repeat([]byte{0xff}, 32), []byte("prover:Prover")),
+	)
+	tree.Insert(bytes.Repeat([]byte{0xff}, 32), typeBI.FillBytes(make([]byte, 32)), nil, big.NewInt(32))
+
+	// Create allocation
+	allocationAddressBI, err := poseidon.HashBytes(slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, []byte{}))
+	require.NoError(t, err)
+	allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
+
+	allocationTree := &qcrypto.VectorCommitmentTree{}
+	// Store allocation data
+	err = allocationTree.Insert([]byte{0 << 2}, fullAddress[32:], nil, big.NewInt(0))
+	require.NoError(t, err)
+	err = allocationTree.Insert([]byte{2 << 2}, filter, nil, big.NewInt(0)) // confirm filter
+	require.NoError(t, err)
+	err = allocationTree.Insert([]byte{1 << 2}, []byte{1}, nil, big.NewInt(0)) // active
+	require.NoError(t, err)
+	joinFrameBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(joinFrameBytes, 0)
+	err = allocationTree.Insert([]byte{4 << 2}, joinFrameBytes, nil, big.NewInt(0))
+	require.NoError(t, err)
+	allocationTypeBI, _ := poseidon.HashBytes(
+		slices.Concat(bytes.Repeat([]byte{0xff}, 32), []byte("allocation:ProverAllocation")),
+	)
+	allocationTree.Insert(bytes.Repeat([]byte{0xff}, 32), allocationTypeBI.FillBytes(make([]byte, 32)), nil, big.NewInt(32))
+
+	// Add the prover to the hypergraph
+	inclusionProver := bls48581.NewKZGInclusionProver(zap.L())
+	commitment := tree.Commit(inclusionProver, false)
+	if len(commitment) != 74 && len(commitment) != 64 {
+		t.Fatalf("Invalid commitment length: %d", len(commitment))
+	}
+	allocCommitment := allocationTree.Commit(inclusionProver, false)
+	if len(allocCommitment) != 74 && len(allocCommitment) != 64 {
+		t.Fatalf("Invalid commitment length: %d", len(allocCommitment))
+	}
+
+	// Add vertex to hypergraph
+	txn, _ := hg.NewTransaction(false)
+	err = hg.AddVertex(txn, hgcrdt.NewVertex([32]byte(fullAddress[:32]), [32]byte(fullAddress[32:]), commitment, big.NewInt(0)))
+	if err != nil {
+		t.Fatalf("Failed to add prover vertex to hypergraph: %v", err)
+	}
+	err = hg.AddVertex(txn, hgcrdt.NewVertex([32]byte(fullAddress[:32]), [32]byte(allocationAddress[:]), allocCommitment, big.NewInt(0)))
+	if err != nil {
+		t.Fatalf("Failed to add prover vertex to hypergraph: %v", err)
+	}
+
+	hg.SetVertexData(txn, fullAddress, tree)
+	hg.SetVertexData(txn, [64]byte(slices.Concat(fullAddress[:32], allocationAddress)), allocationTree)
+	txn.Commit()
+
+	// Commit the hypergraph
+	hg.Commit()
+
+	t.Logf("    Registered prover with address: %x, filter: %x (public key length: %d)", address, filter, len(publicKey))
 }

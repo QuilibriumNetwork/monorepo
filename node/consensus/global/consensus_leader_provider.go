@@ -90,7 +90,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	// Get current timestamp and difficulty
 	timestamp := time.Now().UnixMilli()
 	difficulty := p.engine.difficultyAdjuster.GetNextDifficulty(
-		(*prior).Rank(),
+		(*prior).Rank()+1,
 		timestamp,
 	)
 

@@ -3,7 +3,6 @@ package global
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"math/big"
 	"slices"
 	"time"
@@ -228,14 +227,15 @@ func (p *GlobalLivenessProvider) SendLiveness(
 	}
 
 	// Sign the message
-	signatureData := slices.Concat(
-		make([]byte, 32),
-		binary.BigEndian.AppendUint64(nil, collected.frameNumber),
-		collected.commitmentHash,
-		binary.BigEndian.AppendUint64(nil, uint64(livenessCheck.Timestamp)),
-	)
+	signatureData, err := livenessCheck.ConstructSignaturePayload()
+	if err != nil {
+		return errors.Wrap(err, "send liveness")
+	}
 
-	sig, err := signer.SignWithDomain(signatureData, []byte("liveness"))
+	sig, err := signer.SignWithDomain(
+		signatureData,
+		livenessCheck.GetSignatureDomain(),
+	)
 	if err != nil {
 		return errors.Wrap(err, "send liveness")
 	}

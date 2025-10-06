@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -14,10 +15,6 @@ import (
 )
 
 func (e *AppConsensusEngine) processConsensusMessageQueue() {
-	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-		return
-	}
-
 	defer e.wg.Done()
 
 	for {
@@ -34,10 +31,6 @@ func (e *AppConsensusEngine) processConsensusMessageQueue() {
 
 func (e *AppConsensusEngine) processProverMessageQueue() {
 	defer e.wg.Done()
-
-	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-		return
-	}
 
 	for {
 		select {
@@ -177,7 +170,7 @@ func (e *AppConsensusEngine) handleFrameMessage(message *pb.Message) {
 	}()
 
 	// we're already getting this from consensus
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
+	if e.IsInProverTrie(e.getProverAddress()) {
 		return
 	}
 
@@ -467,6 +460,84 @@ func (e *AppConsensusEngine) handleLivenessCheck(message *pb.Message) {
 	livenessCheck := &protobufs.ProverLivenessCheck{}
 	if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
+		return
+	}
+
+	// Validate the liveness check structure
+	if err := livenessCheck.Validate(); err != nil {
+		e.logger.Debug("invalid liveness check", zap.Error(err))
+		return
+	}
+
+	proverSet, err := e.proverRegistry.GetActiveProvers(e.appAddress)
+	if err != nil {
+		e.logger.Error("could not receive liveness check", zap.Error(err))
+		return
+	}
+
+	var found []byte = nil
+	for _, prover := range proverSet {
+		if bytes.Equal(
+			prover.Address,
+			livenessCheck.PublicKeySignatureBls48581.Address,
+		) {
+			lcBytes, err := livenessCheck.ConstructSignaturePayload()
+			if err != nil {
+				e.logger.Error(
+					"could not construct signature message for liveness check",
+					zap.Error(err),
+				)
+				break
+			}
+			valid, err := e.keyManager.ValidateSignature(
+				crypto.KeyTypeBLS48581G1,
+				prover.PublicKey,
+				lcBytes,
+				livenessCheck.PublicKeySignatureBls48581.Signature,
+				livenessCheck.GetSignatureDomain(),
+			)
+			if err != nil || !valid {
+				e.logger.Error(
+					"could not validate signature for liveness check",
+					zap.Error(err),
+				)
+				break
+			}
+			found = prover.PublicKey
+
+			break
+		}
+	}
+
+	if found == nil {
+		e.logger.Warn(
+			"invalid liveness check",
+			zap.String(
+				"prover",
+				hex.EncodeToString(
+					livenessCheck.PublicKeySignatureBls48581.Address,
+				),
+			),
+		)
+		return
+	}
+
+	signatureData, err := livenessCheck.ConstructSignaturePayload()
+	if err != nil {
+		e.logger.Error("invalid signature payload", zap.Error(err))
+		return
+	}
+
+	valid, err := e.keyManager.ValidateSignature(
+		crypto.KeyTypeBLS48581G1,
+		found,
+		signatureData,
+		livenessCheck.PublicKeySignatureBls48581.Signature,
+		livenessCheck.GetSignatureDomain(),
+	)
+
+	if err != nil || !valid {
+		e.logger.Error("invalid liveness check signature", zap.Error(err))
 		return
 	}
 

@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"math/bits"
-	"slices"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -402,7 +401,30 @@ func (e *GlobalConsensusEngine) handleLivenessCheck(message *pb.Message) {
 			prover.Address,
 			livenessCheck.PublicKeySignatureBls48581.Address,
 		) {
+			lcBytes, err := livenessCheck.ConstructSignaturePayload()
+			if err != nil {
+				e.logger.Error(
+					"could not construct signature message for liveness check",
+					zap.Error(err),
+				)
+				break
+			}
+			valid, err := e.keyManager.ValidateSignature(
+				crypto.KeyTypeBLS48581G1,
+				prover.PublicKey,
+				lcBytes,
+				livenessCheck.PublicKeySignatureBls48581.Signature,
+				livenessCheck.GetSignatureDomain(),
+			)
+			if err != nil || !valid {
+				e.logger.Error(
+					"could not validate signature for liveness check",
+					zap.Error(err),
+				)
+				break
+			}
 			found = prover.PublicKey
+
 			break
 		}
 	}
@@ -420,19 +442,18 @@ func (e *GlobalConsensusEngine) handleLivenessCheck(message *pb.Message) {
 		return
 	}
 
-	signatureData := slices.Concat(
-		make([]byte, 32),
-		binary.BigEndian.AppendUint64(nil, livenessCheck.FrameNumber),
-		livenessCheck.CommitmentHash,
-		binary.BigEndian.AppendUint64(nil, uint64(livenessCheck.Timestamp)),
-	)
+	signatureData, err := livenessCheck.ConstructSignaturePayload()
+	if err != nil {
+		e.logger.Error("invalid signature payload", zap.Error(err))
+		return
+	}
 
 	valid, err := e.keyManager.ValidateSignature(
 		crypto.KeyTypeBLS48581G1,
 		found,
 		signatureData,
 		livenessCheck.PublicKeySignatureBls48581.Signature,
-		[]byte("liveness"),
+		livenessCheck.GetSignatureDomain(),
 	)
 
 	if err != nil || !valid {

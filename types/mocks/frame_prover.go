@@ -11,6 +11,26 @@ type MockFrameProver struct {
 	mock.Mock
 }
 
+func (m *MockFrameProver) CalculateMultiProof(
+	challenge [32]byte,
+	difficulty uint32,
+	ids [][]byte,
+	index uint32,
+) [516]byte {
+	args := m.Called(challenge, difficulty, ids, index)
+	return args.Get(0).([516]byte)
+}
+
+func (m *MockFrameProver) VerifyMultiProof(
+	challenge [32]byte,
+	difficulty uint32,
+	ids [][]byte,
+	allegedSolutions [][516]byte,
+) (bool, error) {
+	args := m.Called(challenge, difficulty, ids, allegedSolutions)
+	return args.Bool(0), args.Error(1)
+}
+
 func (m *MockFrameProver) ProveFrameHeaderGenesis(
 	address []byte,
 	difficulty uint32,

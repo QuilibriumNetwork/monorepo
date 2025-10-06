@@ -2,15 +2,25 @@ package worker
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
 	"testing"
 
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	typesStore "source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
@@ -139,7 +149,7 @@ func (t *mockTransaction) Abort() error {
 func TestWorkerManager_StartStop(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
 
 	// Test starting the manager
 	ctx := context.Background()
@@ -164,7 +174,7 @@ func TestWorkerManager_StartStop(t *testing.T) {
 func TestWorkerManager_RegisterWorker(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -201,7 +211,7 @@ func TestWorkerManager_RegisterWorker(t *testing.T) {
 func TestWorkerManager_RegisterWorkerNotStarted(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
 
 	// Try to register without starting
 	workerInfo := &typesStore.WorkerInfo{
@@ -221,11 +231,72 @@ func TestWorkerManager_RegisterWorkerNotStarted(t *testing.T) {
 func TestWorkerManager_AllocateDeallocateWorker(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	engcfg := (config.EngineConfig{}).WithDefaults()
+	engcfg.DataWorkerCount = 2
+	engcfg.DataWorkerP2PMultiaddrs = []string{"/ip4/0.0.0.0/tcp/8000", "/ip4/0.0.0.0/tcp/8000"}
+	engcfg.DataWorkerStreamMultiaddrs = []string{"/ip4/0.0.0.0/tcp/60002", "/ip4/0.0.0.0/tcp/60002"}
+	p2pcfg := (config.P2PConfig{}).WithDefaults()
+	priv, _, err := crypto.GenerateEd448Key(rand.Reader)
+	require.NoError(t, err)
+	k, _ := priv.Raw()
+	p2pcfg.PeerPrivKey = hex.EncodeToString(k)
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &engcfg, P2P: &p2pcfg}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
+	auth := p2p.NewPeerAuthenticator(
+		zap.L(),
+		&p2pcfg,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		map[string]channel.AllowedPeerPolicyType{
+			"quilibrium.node.application.pb.HypergraphComparisonService": channel.AnyProverPeer,
+			"quilibrium.node.node.pb.DataIPCService":                     channel.OnlySelfPeer,
+			"quilibrium.node.global.pb.GlobalService":                    channel.OnlyGlobalProverPeer,
+			"quilibrium.node.global.pb.AppShardService":                  channel.OnlyShardProverPeer,
+			"quilibrium.node.global.pb.OnionService":                     channel.AnyPeer,
+			"quilibrium.node.global.pb.KeyRegistryService":               channel.OnlySelfPeer,
+		},
+		map[string]channel.AllowedPeerPolicyType{
+			"/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream": channel.OnlyShardProverPeer,
+			"/quilibrium.node.global.pb.MixnetService/GetTag":                         channel.AnyPeer,
+			"/quilibrium.node.global.pb.MixnetService/PutTag":                         channel.AnyPeer,
+			"/quilibrium.node.global.pb.MixnetService/PutMessage":                     channel.AnyPeer,
+			"/quilibrium.node.global.pb.MixnetService/RoundStream":                    channel.OnlyGlobalProverPeer,
+			"/quilibrium.node.global.pb.DispatchService/PutInboxMessage":              channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/GetInboxMessages":             channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/PutHub":                       channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/GetHub":                       channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/Sync":                         channel.AnyProverPeer,
+			"/quilibrium.node.ferretproxy.pb.FerretProxy/AliceProxy":                  channel.OnlySelfPeer,
+			"/quilibrium.node.ferretproxy.pb.FerretProxy/BobProxy":                    channel.AnyPeer,
+		},
+	)
+
+	tlsCreds, err := auth.CreateServerTLSCredentials()
+	require.NoError(t, err)
+	server := qgrpc.NewServer(
+		grpc.Creds(tlsCreds),
+		grpc.MaxRecvMsgSize(10*1024*1024),
+		grpc.MaxSendMsgSize(10*1024*1024),
+	)
+
+	mg, err := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/60002")
+	require.NoError(t, err)
+
+	lis, err := mn.Listen(mg)
+	require.NoError(t, err)
+	go func() {
+		protobufs.RegisterDataIPCServiceServer(server, &mockIPC{})
+		if err := server.Serve(mn.NetListener(lis)); err != nil {
+			zap.L().Info("terminating server", zap.Error(err))
+		}
+	}()
+	defer server.Stop()
 
 	// Start the manager
 	ctx := context.Background()
-	err := manager.Start(ctx)
+	err = manager.Start(ctx)
 	require.NoError(t, err)
 	defer manager.Stop()
 
@@ -275,7 +346,7 @@ func TestWorkerManager_AllocateDeallocateWorker(t *testing.T) {
 func TestWorkerManager_AllocateNonExistentWorker(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -292,7 +363,7 @@ func TestWorkerManager_AllocateNonExistentWorker(t *testing.T) {
 func TestWorkerManager_GetWorkerIdByFilter(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -328,7 +399,7 @@ func TestWorkerManager_GetWorkerIdByFilter(t *testing.T) {
 func TestWorkerManager_GetFilterByWorkerId(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -389,7 +460,7 @@ func TestWorkerManager_LoadWorkersOnStart(t *testing.T) {
 	store.workersByFilter[string(worker2.Filter)] = worker2
 
 	// Create manager and start it
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
 	ctx := context.Background()
 	err := manager.Start(ctx)
 	require.NoError(t, err)
@@ -416,7 +487,7 @@ func TestWorkerManager_LoadWorkersOnStart(t *testing.T) {
 func TestWorkerManager_ConcurrentOperations(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -457,11 +528,72 @@ func TestWorkerManager_ConcurrentOperations(t *testing.T) {
 func TestWorkerManager_EmptyFilter(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	engcfg := (config.EngineConfig{}).WithDefaults()
+	engcfg.DataWorkerCount = 1
+	engcfg.DataWorkerP2PMultiaddrs = []string{"/ip4/0.0.0.0/tcp/8000"}
+	engcfg.DataWorkerStreamMultiaddrs = []string{"/ip4/0.0.0.0/tcp/60000"}
+	p2pcfg := (config.P2PConfig{}).WithDefaults()
+	priv, _, err := crypto.GenerateEd448Key(rand.Reader)
+	require.NoError(t, err)
+	k, _ := priv.Raw()
+	p2pcfg.PeerPrivKey = hex.EncodeToString(k)
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &engcfg, P2P: &p2pcfg}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
+	auth := p2p.NewPeerAuthenticator(
+		zap.L(),
+		&p2pcfg,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		map[string]channel.AllowedPeerPolicyType{
+			"quilibrium.node.application.pb.HypergraphComparisonService": channel.AnyProverPeer,
+			"quilibrium.node.node.pb.DataIPCService":                     channel.OnlySelfPeer,
+			"quilibrium.node.global.pb.GlobalService":                    channel.OnlyGlobalProverPeer,
+			"quilibrium.node.global.pb.AppShardService":                  channel.OnlyShardProverPeer,
+			"quilibrium.node.global.pb.OnionService":                     channel.AnyPeer,
+			"quilibrium.node.global.pb.KeyRegistryService":               channel.OnlySelfPeer,
+		},
+		map[string]channel.AllowedPeerPolicyType{
+			"/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream": channel.OnlyShardProverPeer,
+			"/quilibrium.node.global.pb.MixnetService/GetTag":                         channel.AnyPeer,
+			"/quilibrium.node.global.pb.MixnetService/PutTag":                         channel.AnyPeer,
+			"/quilibrium.node.global.pb.MixnetService/PutMessage":                     channel.AnyPeer,
+			"/quilibrium.node.global.pb.MixnetService/RoundStream":                    channel.OnlyGlobalProverPeer,
+			"/quilibrium.node.global.pb.DispatchService/PutInboxMessage":              channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/GetInboxMessages":             channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/PutHub":                       channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/GetHub":                       channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/Sync":                         channel.AnyProverPeer,
+			"/quilibrium.node.ferretproxy.pb.FerretProxy/AliceProxy":                  channel.OnlySelfPeer,
+			"/quilibrium.node.ferretproxy.pb.FerretProxy/BobProxy":                    channel.AnyPeer,
+		},
+	)
+
+	tlsCreds, err := auth.CreateServerTLSCredentials()
+	require.NoError(t, err)
+	server := qgrpc.NewServer(
+		grpc.Creds(tlsCreds),
+		grpc.MaxRecvMsgSize(10*1024*1024),
+		grpc.MaxSendMsgSize(10*1024*1024),
+	)
+
+	mg, err := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/60000")
+	require.NoError(t, err)
+
+	lis, err := mn.Listen(mg)
+	require.NoError(t, err)
+	go func() {
+		protobufs.RegisterDataIPCServiceServer(server, &mockIPC{})
+		if err := server.Serve(mn.NetListener(lis)); err != nil {
+			zap.L().Info("terminating server", zap.Error(err))
+		}
+	}()
+	defer server.Stop()
 
 	// Start the manager
 	ctx := context.Background()
-	err := manager.Start(ctx)
+	err = manager.Start(ctx)
 	require.NoError(t, err)
 	defer manager.Stop()
 
@@ -522,11 +654,72 @@ func TestWorkerManager_EmptyFilter(t *testing.T) {
 func TestWorkerManager_FilterUpdate(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreId uint, filter []byte) error { return nil })
+	engcfg := (config.EngineConfig{}).WithDefaults()
+	engcfg.DataWorkerCount = 2
+	engcfg.DataWorkerP2PMultiaddrs = []string{"/ip4/0.0.0.0/tcp/8000", "/ip4/0.0.0.0/tcp/8000"}
+	engcfg.DataWorkerStreamMultiaddrs = []string{"/ip4/0.0.0.0/tcp/60001", "/ip4/0.0.0.0/tcp/60001"}
+	p2pcfg := (config.P2PConfig{}).WithDefaults()
+	priv, _, err := crypto.GenerateEd448Key(rand.Reader)
+	require.NoError(t, err)
+	k, _ := priv.Raw()
+	p2pcfg.PeerPrivKey = hex.EncodeToString(k)
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &engcfg, P2P: &p2pcfg}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil })
+	auth := p2p.NewPeerAuthenticator(
+		zap.L(),
+		&p2pcfg,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		map[string]channel.AllowedPeerPolicyType{
+			"quilibrium.node.application.pb.HypergraphComparisonService": channel.AnyProverPeer,
+			"quilibrium.node.node.pb.DataIPCService":                     channel.OnlySelfPeer,
+			"quilibrium.node.global.pb.GlobalService":                    channel.OnlyGlobalProverPeer,
+			"quilibrium.node.global.pb.AppShardService":                  channel.OnlyShardProverPeer,
+			"quilibrium.node.global.pb.OnionService":                     channel.AnyPeer,
+			"quilibrium.node.global.pb.KeyRegistryService":               channel.OnlySelfPeer,
+		},
+		map[string]channel.AllowedPeerPolicyType{
+			"/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream": channel.OnlyShardProverPeer,
+			"/quilibrium.node.global.pb.MixnetService/GetTag":                         channel.AnyPeer,
+			"/quilibrium.node.global.pb.MixnetService/PutTag":                         channel.AnyPeer,
+			"/quilibrium.node.global.pb.MixnetService/PutMessage":                     channel.AnyPeer,
+			"/quilibrium.node.global.pb.MixnetService/RoundStream":                    channel.OnlyGlobalProverPeer,
+			"/quilibrium.node.global.pb.DispatchService/PutInboxMessage":              channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/GetInboxMessages":             channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/PutHub":                       channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/GetHub":                       channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.DispatchService/Sync":                         channel.AnyProverPeer,
+			"/quilibrium.node.ferretproxy.pb.FerretProxy/AliceProxy":                  channel.OnlySelfPeer,
+			"/quilibrium.node.ferretproxy.pb.FerretProxy/BobProxy":                    channel.AnyPeer,
+		},
+	)
+
+	tlsCreds, err := auth.CreateServerTLSCredentials()
+	require.NoError(t, err)
+	server := qgrpc.NewServer(
+		grpc.Creds(tlsCreds),
+		grpc.MaxRecvMsgSize(10*1024*1024),
+		grpc.MaxSendMsgSize(10*1024*1024),
+	)
+
+	mg, err := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/60001")
+	require.NoError(t, err)
+
+	lis, err := mn.Listen(mg)
+	require.NoError(t, err)
+	go func() {
+		protobufs.RegisterDataIPCServiceServer(server, &mockIPC{})
+		if err := server.Serve(mn.NetListener(lis)); err != nil {
+			zap.L().Info("terminating server", zap.Error(err))
+		}
+	}()
+	defer server.Stop()
 
 	// Start the manager
 	ctx := context.Background()
-	err := manager.Start(ctx)
+	err = manager.Start(ctx)
 	require.NoError(t, err)
 	defer manager.Stop()
 
@@ -580,4 +773,13 @@ func TestWorkerManager_FilterUpdate(t *testing.T) {
 	filter, err := manager.GetFilterByWorkerId(2)
 	require.NoError(t, err)
 	assert.Equal(t, newFilter, filter)
+}
+
+type mockIPC struct {
+	protobufs.DataIPCServiceServer
+}
+
+// Respawn implements protobufs.DataIPCServiceServer.
+func (m *mockIPC) Respawn(context.Context, *protobufs.RespawnRequest) (*protobufs.RespawnResponse, error) {
+	return &protobufs.RespawnResponse{}, nil
 }

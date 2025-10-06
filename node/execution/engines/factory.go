@@ -61,6 +61,7 @@ func CreateExecutionEngine(
 	verEnc crypto.VerifiableEncryptor,
 	decafConstructor crypto.DecafConstructor,
 	compiler compiler.CircuitCompiler,
+	frameProver crypto.FrameProver,
 	mode ExecutionMode,
 ) (execution.ShardExecutionEngine, error) {
 	switch engineType {
@@ -76,6 +77,7 @@ func CreateExecutionEngine(
 			bulletproofProver,
 			verEnc,
 			decafConstructor,
+			frameProver,
 		)
 	case EngineTypeCompute:
 		return NewComputeExecutionEngine(
@@ -131,6 +133,7 @@ func CreateAllEngines(
 	verEnc crypto.VerifiableEncryptor,
 	decafConstructor crypto.DecafConstructor,
 	compiler compiler.CircuitCompiler,
+	frameProver crypto.FrameProver,
 	includeGlobal bool,
 ) ([]execution.ShardExecutionEngine, error) {
 	engines := make([]execution.ShardExecutionEngine, 0, 4)
@@ -153,6 +156,7 @@ func CreateAllEngines(
 			verEnc,
 			decafConstructor,
 			compiler,
+			frameProver,
 			mode,
 		)
 		if err != nil {
@@ -180,6 +184,7 @@ func CreateAllEngines(
 			verEnc,
 			decafConstructor,
 			compiler,
+			frameProver,
 			mode,
 		)
 		if err != nil {

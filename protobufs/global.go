@@ -3,6 +3,7 @@ package protobufs
 import (
 	"bytes"
 	"encoding/binary"
+	"slices"
 	"time"
 
 	"github.com/multiformats/go-multiaddr"
@@ -318,6 +319,18 @@ func (p *ProverJoin) ToCanonicalBytes() ([]byte, error) {
 		}
 	}
 
+	// Write proof
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(p.Proof)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(p.Proof); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
 	return buf.Bytes(), nil
 }
 
@@ -409,6 +422,16 @@ func (p *ProverJoin) FromCanonicalBytes(data []byte) error {
 		); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
 		}
+	}
+
+	// Read proof
+	var proofLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &proofLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	p.Proof = make([]byte, proofLen)
+	if _, err := buf.Read(p.Proof); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
 	}
 
 	return nil
@@ -3764,12 +3787,23 @@ func (p *ProverLivenessCheck) Validate() error {
 		return errors.Wrap(errors.New("missing signature"), "validate")
 	}
 
-	// Validate the signature
+	// Validate the signature payload (not the signature itself)
 	if err := p.PublicKeySignatureBls48581.Validate(); err != nil {
 		return errors.Wrap(err, "validate")
 	}
 
 	return nil
+}
+
+func (p *ProverLivenessCheck) ConstructSignaturePayload() ([]byte, error) {
+	clone := proto.Clone(p).(*ProverLivenessCheck)
+	clone.PublicKeySignatureBls48581 = nil
+	cloneBytes, err := clone.ToCanonicalBytes()
+	return cloneBytes, errors.Wrap(err, "construct signature payload")
+}
+
+func (p *ProverLivenessCheck) GetSignatureDomain() []byte {
+	return slices.Concat([]byte("PROVER_LIVENESS"), p.Filter)
 }
 
 var _ ValidatableMessage = (*FrameVote)(nil)

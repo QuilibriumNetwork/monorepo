@@ -1,7 +1,7 @@
 package global
 
 import (
-	"slices"
+	"bytes"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
@@ -49,71 +49,42 @@ func (e *GlobalConsensusEngine) subscribeToGlobalConsensus() error {
 		return errors.Wrap(err, "subscribe to global consensus")
 	}
 
-	GenerateThreeBitSlices(func(bitmask []byte) bool {
-		b := slices.Clone(bitmask)
-		if err := e.pubsub.Subscribe(
-			b,
-			func(message *pb.Message) error {
-				select {
-				case <-e.haltCtx.Done():
-					return nil
-				case e.appFramesMessageQueue <- message:
-					return nil
-				case <-e.ctx.Done():
-					return errors.New("context cancelled")
-				default:
-					e.logger.Warn("app frames message queue full, dropping message")
-					return nil
-				}
-			},
-		); err != nil {
-			e.logger.Error(
-				"error while subscribing to app shard consensus channels",
-				zap.Error(err),
-			)
-			return false
-		}
+	// Initiate a bulk subscribe to entire bitmask
+	if err := e.pubsub.Subscribe(
+		bytes.Repeat([]byte{0xff}, 32),
+		func(message *pb.Message) error {
+			select {
+			case <-e.haltCtx.Done():
+				return nil
+			case e.appFramesMessageQueue <- message:
+				return nil
+			case <-e.ctx.Done():
+				return errors.New("context cancelled")
+			default:
+				e.logger.Warn("app frames message queue full, dropping message")
+				return nil
+			}
+		},
+	); err != nil {
+		e.logger.Error(
+			"error while subscribing to app shard consensus channels",
+			zap.Error(err),
+		)
+		return nil
+	}
 
-		// Register frame validator
-		if err := e.pubsub.RegisterValidator(
-			b,
-			func(peerID peer.ID, message *pb.Message) tp2p.ValidationResult {
-				return e.validateAppFrameMessage(peerID, message)
-			},
-			true,
-		); err != nil {
-			return false
-		}
-
-		return true
-	})
+	// Register frame validator
+	if err := e.pubsub.RegisterValidator(
+		bytes.Repeat([]byte{0xff}, 32),
+		func(peerID peer.ID, message *pb.Message) tp2p.ValidationResult {
+			return e.validateAppFrameMessage(peerID, message)
+		},
+		true,
+	); err != nil {
+		return nil
+	}
 
 	return nil
-}
-
-func GenerateThreeBitSlices(emit func(b []byte) bool) {
-	var buf [32]byte
-
-	set := func(pos int) { buf[pos>>3] |= 1 << uint(pos&7) }
-	zero := func() {
-		for i := range buf {
-			buf[i] = 0
-		}
-	}
-
-	for i := 0; i < 256; i++ {
-		for j := i + 1; j < 256; j++ {
-			for k := j + 1; k < 256; k++ {
-				zero()
-				set(i)
-				set(j)
-				set(k)
-				if !emit(buf[:]) {
-					return
-				}
-			}
-		}
-	}
 }
 
 func (e *GlobalConsensusEngine) subscribeToFrameMessages() error {

@@ -25,6 +25,12 @@ type Extrinsic struct {
 
 type Location [64]byte // 32 bytes for AppAddress + 32 bytes for DataAddress
 
+type ShardMetadata struct {
+	Commitment []byte
+	LeafCount  uint64
+	Size       uint64
+}
+
 var ErrInvalidAtomType = errors.New("invalid atom type for set")
 var ErrInvalidLocation = errors.New("invalid location")
 var ErrRemoved = errors.New("removed")
@@ -53,6 +59,10 @@ type Hypergraph interface {
 	// outside of this will be rejected – synchronization will only set neighbor
 	// and ascendant branches.
 	SetCoveredPrefix(prefix []int) error
+
+	// GetMetadataAtKey is a fast path to retrieve metadata information used for
+	// consensus, avoiding unnecessary recomputation for lookups.
+	GetMetadataAtKey(pathKey []byte) ([]ShardMetadata, error)
 
 	// Vertex operations
 

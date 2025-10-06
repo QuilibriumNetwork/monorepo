@@ -190,6 +190,15 @@ func (h *MockHypergraph) GetChildrenForPath(
 	return args.Get(0).(*protobufs.GetChildrenForPathResponse), args.Error(1)
 }
 
+// GetMetadataAtKey implements hypergraph.Hypergraph.
+func (h *MockHypergraph) GetMetadataAtKey(pathKey []byte) (
+	[]hg.ShardMetadata,
+	error,
+) {
+	args := h.Called(pathKey)
+	return args.Get(0).([]hg.ShardMetadata), args.Error(1)
+}
+
 // HyperStream implements hypergraph.Hypergraph.
 func (h *MockHypergraph) HyperStream(
 	server protobufs.HypergraphComparisonService_HyperStreamServer,

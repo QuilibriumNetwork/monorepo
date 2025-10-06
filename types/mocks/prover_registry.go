@@ -10,6 +10,17 @@ type MockProverRegistry struct {
 	mock.Mock
 }
 
+var _ consensus.ProverRegistry = (*MockProverRegistry)(nil)
+
+// GetProvers implements consensus.ProverRegistry.
+func (m *MockProverRegistry) GetProvers(filter []byte) (
+	[]*consensus.ProverInfo,
+	error,
+) {
+	args := m.Called(filter)
+	return args.Get(0).([]*consensus.ProverInfo), args.Error(1)
+}
+
 // GetAllActiveAppShardProvers implements consensus.ProverRegistry.
 func (m *MockProverRegistry) GetAllActiveAppShardProvers() (
 	[]*consensus.ProverInfo,

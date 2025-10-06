@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
 	"source.quilibrium.com/quilibrium/monorepo/config"
@@ -21,11 +22,13 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
+	"source.quilibrium.com/quilibrium/monorepo/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/verenc"
 )
 
@@ -112,15 +115,24 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 	// Test data
 	filter := []byte("integration-test-filter000000000000000")
 	filter2 := []byte("integration-test-filter000000000000002")
-	frameNumber := uint64(123456789)
-
+	frameNumber := uint64(100)
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
+	txn, err := frameStore.NewTransaction(false)
+	require.NoError(t, err)
+	frameStore.PutGlobalClockFrame(&protobufs.GlobalFrame{Header: &protobufs.GlobalFrameHeader{FrameNumber: 100, Output: make([]byte, 516), Difficulty: 50000}}, txn)
+	txn.Commit()
 	// Test ProverJoin with signatures
 	t.Run("ProverJoin", func(t *testing.T) {
 		// Create a fresh hypergraph for ProverJoin (no pre-existing prover)
 		hg, _, rm := createHypergraph(t)
 
-		proverJoin, err := global.NewProverJoin([][]byte{filter}, frameNumber, nil, nil, keyManager, hg, rm)
+		proverJoin, err := global.NewProverJoin([][]byte{filter}, frameNumber, nil, nil, keyManager, hg, rm, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 		require.NoError(t, err)
+		challenge := sha3.Sum256(make([]byte, 516))
+		addr, _ := poseidon.HashBytes(signer.Public().([]byte))
+		out := vdf.NewWesolowskiFrameProver(zap.L()).CalculateMultiProof(challenge, 50000, [][]byte{slices.Concat(addr.FillBytes(make([]byte, 32)), filter, binary.BigEndian.AppendUint32(nil, 0))}, 0)
+		proverJoin.Proof = out[:]
 
 		// Generate the signatures with keys
 		err = proverJoin.Prove(frameNumber)
@@ -137,8 +149,19 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 		// Create a fresh hypergraph for ProverJoin (no pre-existing prover)
 		hg, _, rm := createHypergraph(t)
 
-		proverJoin, err := global.NewProverJoin([][]byte{filter, filter2}, frameNumber, nil, nil, keyManager, hg, rm)
+		proverJoin, err := global.NewProverJoin([][]byte{filter, filter2}, frameNumber, nil, nil, keyManager, hg, rm, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 		require.NoError(t, err)
+		challenge := sha3.Sum256(make([]byte, 516))
+		addr, _ := poseidon.HashBytes(signer.Public().([]byte))
+		out1 := vdf.NewWesolowskiFrameProver(zap.L()).CalculateMultiProof(challenge, 50000, [][]byte{
+			slices.Concat(addr.FillBytes(make([]byte, 32)), filter, binary.BigEndian.AppendUint32(nil, 0)),
+			slices.Concat(addr.FillBytes(make([]byte, 32)), filter2, binary.BigEndian.AppendUint32(nil, 1)),
+		}, 0)
+		out2 := vdf.NewWesolowskiFrameProver(zap.L()).CalculateMultiProof(challenge, 50000, [][]byte{
+			slices.Concat(addr.FillBytes(make([]byte, 32)), filter, binary.BigEndian.AppendUint32(nil, 0)),
+			slices.Concat(addr.FillBytes(make([]byte, 32)), filter2, binary.BigEndian.AppendUint32(nil, 1)),
+		}, 1)
+		proverJoin.Proof = slices.Concat(out1[:], out2[:])
 
 		// Generate the signatures with keys
 		err = proverJoin.Prove(frameNumber)
@@ -439,14 +462,14 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 		require.NotNil(t, differentPubKey)
 
 		// Attempt to verify a signature created with the original key using the different key
-		proverJoin, err := global.NewProverJoin([][]byte{filter}, frameNumber, nil, nil, keyManager, hg, rm)
+		proverJoin, err := global.NewProverJoin([][]byte{filter}, frameNumber, nil, nil, keyManager, hg, rm, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 		require.NoError(t, err)
 		err = proverJoin.Prove(frameNumber)
 		require.NoError(t, err)
 
 		// Replace the key manager with the different one
 		// This simulates an attempt to verify with a different key
-		proverJoin2, err := global.NewProverJoin([][]byte{filter}, frameNumber, nil, nil, differentKeyManager, hg, rm)
+		proverJoin2, err := global.NewProverJoin([][]byte{filter}, frameNumber, nil, nil, differentKeyManager, hg, rm, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 		require.NoError(t, err)
 		proverJoin2.PublicKeySignatureBLS48581 = proverJoin.PublicKeySignatureBLS48581
 		proverJoin2.PublicKeySignatureBLS48581.PublicKey = []byte("foobar")

@@ -293,7 +293,7 @@ func commitNode(
 			setType,
 			phaseType,
 			shardKey,
-			getFullPath(node.Key),
+			GetFullPath(node.Key),
 			recalculate,
 		), nil
 	default:
@@ -612,7 +612,7 @@ func (t *LazyVectorCommitmentTree) InsertLeafSkeleton(
 		t.PhaseType,
 		t.ShardKey,
 		leaf.Key,
-		getFullPath(leaf.Key),
+		GetFullPath(leaf.Key),
 		leaf,
 	); err != nil {
 		return err
@@ -662,7 +662,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 
 	// Check if key is within the covered prefix (if one is defined)
 	if len(t.CoveredPrefix) > 0 {
-		keyPath := getFullPath(key)
+		keyPath := GetFullPath(key)
 		if !t.isPathWithinCoveredPrefix(keyPath) {
 			return errors.New("key is outside covered prefix range")
 		}
@@ -706,7 +706,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				t.PhaseType,
 				t.ShardKey,
 				key,
-				getFullPath(key),
+				GetFullPath(key),
 				newNode,
 			)
 			if err != nil {
@@ -747,7 +747,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 					t.PhaseType,
 					t.ShardKey,
 					key,
-					getFullPath(key),
+					GetFullPath(key),
 					n,
 				)
 				if err != nil {
@@ -789,7 +789,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				t.PhaseType,
 				t.ShardKey,
 				key,
-				getFullPath(key),
+				GetFullPath(key),
 				branch.Children[finalNewNibble],
 			)
 			if err != nil {
@@ -1401,7 +1401,7 @@ func (t *LazyVectorCommitmentTree) Prove(key []byte) *TraversalProof {
 				t.SetType,
 				t.PhaseType,
 				t.ShardKey,
-				getFullPath(n.Key),
+				GetFullPath(n.Key),
 				false,
 			)
 			if bytes.Equal(n.Key, key) {
@@ -1542,7 +1542,7 @@ func (t *LazyVectorCommitmentTree) ProveMultiple(
 				t.SetType,
 				t.PhaseType,
 				t.ShardKey,
-				getFullPath(n.Key),
+				GetFullPath(n.Key),
 				false,
 			)
 			if bytes.Equal(n.Key, key) {
@@ -1787,7 +1787,7 @@ func (t *LazyVectorCommitmentTree) Delete(
 					t.PhaseType,
 					t.ShardKey,
 					key,
-					getFullPath(key),
+					GetFullPath(key),
 				)
 				if err != nil {
 					log.Panic("failed to delete path", zap.Error(err))

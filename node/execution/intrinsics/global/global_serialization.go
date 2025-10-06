@@ -6,6 +6,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
 // ToBytes serializes a BLS48581SignatureWithProofOfPossession to bytes using
@@ -102,7 +103,7 @@ func (p *ProverJoin) FromBytes(data []byte) error {
 
 	// Note: Runtime dependencies are not available here
 	// They need to be injected separately after deserialization
-	converted, err := ProverJoinFromProtobuf(pb, nil, nil, nil, nil)
+	converted, err := ProverJoinFromProtobuf(pb, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		return errors.Wrap(err, "from bytes")
 	}
@@ -369,13 +370,23 @@ func GlobalRequestFromBytes(
 	signer crypto.Signer,
 	inclusionProver crypto.InclusionProver,
 	keyManager keys.KeyManager,
+	frameProver crypto.FrameProver,
+	frameStore store.ClockStore,
 ) (interface{}, error) {
 	pb := &protobufs.MessageRequest{}
 	if err := pb.FromCanonicalBytes(data); err != nil {
 		return nil, errors.Wrap(err, "global request from bytes")
 	}
 
-	return GlobalRequestFromProtobuf(pb, hg, signer, inclusionProver, keyManager)
+	return GlobalRequestFromProtobuf(
+		pb,
+		hg,
+		signer,
+		inclusionProver,
+		keyManager,
+		frameProver,
+		frameStore,
+	)
 }
 
 // ToBytes serializes a ProverUpdate to bytes using protobuf

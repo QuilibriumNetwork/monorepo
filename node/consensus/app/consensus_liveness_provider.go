@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/binary"
 	"math/big"
 	"slices"
 	"time"
@@ -172,18 +171,14 @@ func (p *AppLivenessProvider) SendLiveness(
 	}
 
 	// Sign the message
-	signatureData := append(
-		p.engine.appAddress,
-		binary.BigEndian.AppendUint64(nil, frameNumber)...,
-	)
-	signatureData = append(
-		signatureData,
-		binary.BigEndian.AppendUint64(nil, uint64(livenessCheck.Timestamp))...,
-	)
+	signatureData, err := livenessCheck.ConstructSignaturePayload()
+	if err != nil {
+		return errors.Wrap(err, "send liveness")
+	}
 
 	sig, err := signer.SignWithDomain(
 		signatureData,
-		slices.Concat([]byte("liveness"), p.engine.appAddress),
+		livenessCheck.GetSignatureDomain(),
 	)
 	if err != nil {
 		return errors.Wrap(err, "send liveness")

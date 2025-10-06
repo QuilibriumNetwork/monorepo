@@ -94,6 +94,9 @@ type ProverRegistry interface {
 	// GetProverCount returns the number of active provers for a filter/shard.
 	GetProverCount(filter []byte) (int, error)
 
+	// GetProvers returns all provers for a filter/shard
+	GetProvers(filter []byte) ([]*ProverInfo, error)
+
 	// GetProversByStatus returns all provers with a specific status for a
 	// filter/shard.
 	GetProversByStatus(filter []byte, status ProverStatus) ([]*ProverInfo, error)

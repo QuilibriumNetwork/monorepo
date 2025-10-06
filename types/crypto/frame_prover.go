@@ -54,4 +54,16 @@ type FrameProver interface {
 	GetGlobalFrameSignaturePayload(
 		frame *protobufs.GlobalFrameHeader,
 	) ([]byte, error)
+	CalculateMultiProof(
+		challenge [32]byte,
+		difficulty uint32,
+		ids [][]byte,
+		index uint32,
+	) [516]byte
+	VerifyMultiProof(
+		challenge [32]byte,
+		difficulty uint32,
+		ids [][]byte,
+		allegedSolutions [][516]byte,
+	) (bool, error)
 }

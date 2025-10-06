@@ -455,10 +455,10 @@ func main() {
 				zap.Int64("data_worker_reserved_memory", dataWorkerReservedMemory),
 			)
 			logger.Warn("you are at risk of running out of memory during runtime")
-		case availableOverhead < 8*1024*1024*1024:
+		case availableOverhead < 2*1024*1024*1024:
 			logger.Warn(
 				"the memory available to the node, unallocated to "+
-					"the data workers, is less than 8gb",
+					"the data workers, is less than 2gb",
 				zap.Int64("available_overhead", availableOverhead),
 			)
 			logger.Warn("you are at risk of running out of memory during runtime")

@@ -166,6 +166,31 @@ func (e *AppConsensusEngine) eventDistributorLoop() {
 					}
 				}
 
+			case typesconsensus.ControlEventCoverageHalt:
+				data, ok := event.Data.(*typesconsensus.CoverageEventData)
+				if ok && data.Message != "" {
+					e.logger.Error(data.Message)
+					e.halt()
+					if err := e.stateMachine.Stop(); err != nil {
+						e.logger.Error(
+							"error occurred while halting consensus",
+							zap.Error(err),
+						)
+					}
+					go func() {
+						for {
+							select {
+							case <-e.ctx.Done():
+								return
+							case <-time.After(10 * time.Second):
+								e.logger.Error(
+									"full halt detected, leaving system in halted state until recovery",
+								)
+							}
+						}
+					}()
+				}
+
 			case typesconsensus.ControlEventHalt:
 				data, ok := event.Data.(*typesconsensus.ErrorEventData)
 				if ok && data.Error != nil {

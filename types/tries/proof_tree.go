@@ -237,7 +237,7 @@ func getNextNibble(key []byte, pos int) int {
 	return result & BranchMask
 }
 
-func getFullPath(key []byte) []int {
+func GetFullPath(key []byte) []int {
 	var nibbles []int
 	depth := 0
 	for {

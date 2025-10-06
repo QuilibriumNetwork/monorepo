@@ -17,6 +17,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
 type GlobalIntrinsic struct {
@@ -29,6 +30,8 @@ type GlobalIntrinsic struct {
 	rdfMultiprover      *schema.RDFMultiprover
 	hypergraph          hypergraph.Hypergraph
 	keyManager          keys.KeyManager
+	frameProver         crypto.FrameProver
+	frameStore          store.ClockStore
 }
 
 var GLOBAL_RDF_SCHEMA = `BASE <https://types.quilibrium.com/schema-repository/>
@@ -247,6 +250,8 @@ func (a *GlobalIntrinsic) Validate(
 			nil,
 			nil,
 			a.keyManager,
+			a.frameProver,
+			a.frameStore,
 		)
 		if err != nil {
 			observability.ValidateErrors.WithLabelValues(
@@ -675,6 +680,8 @@ func (a *GlobalIntrinsic) InvokeStep(
 			nil,
 			nil,
 			a.keyManager,
+			a.frameProver,
+			a.frameStore,
 		)
 		if err != nil {
 			observability.InvokeStepErrors.WithLabelValues(
@@ -1307,6 +1314,8 @@ func LoadGlobalIntrinsic(
 	hypergraph hypergraph.Hypergraph,
 	inclusionProver crypto.InclusionProver,
 	keyManager keys.KeyManager,
+	frameProver crypto.FrameProver,
+	frameStore store.ClockStore,
 ) (*GlobalIntrinsic, error) {
 	// Verify the address is the global intrinsic address
 	if !bytes.Equal(address, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:]) {
@@ -1329,6 +1338,8 @@ func LoadGlobalIntrinsic(
 		rdfMultiprover:      rdfMultiprover,
 		hypergraph:          hypergraph,
 		keyManager:          keyManager,
+		frameProver:         frameProver,
+		frameStore:          frameStore,
 	}, nil
 }
 

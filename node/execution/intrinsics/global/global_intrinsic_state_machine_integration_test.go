@@ -25,6 +25,7 @@ import (
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
+	"source.quilibrium.com/quilibrium/monorepo/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/verenc"
 )
 
@@ -111,13 +112,15 @@ func TestProverJoinConfirmFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// Test 1: Join at frame 252840
 	t.Run("Join and confirm after 360 frames", func(t *testing.T) {
 		joinFrame := uint64(252840)
 
 		// Create and prove join
-		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover)
+		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 		require.NoError(t, err)
 		err = proverJoin.Prove(joinFrame)
 		require.NoError(t, err)
@@ -164,12 +167,14 @@ func TestProverJoinRejectFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	t.Run("Join and reject immediately", func(t *testing.T) {
 		joinFrame := uint64(252840)
 
 		// Create and prove join
-		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover)
+		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 		require.NoError(t, err)
 		err = proverJoin.Prove(joinFrame)
 		require.NoError(t, err)
@@ -204,10 +209,12 @@ func TestProverPauseResumeFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// First join and confirm to get to active state
 	joinFrame := uint64(252840)
-	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover)
+	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 	require.NoError(t, err)
 	err = proverJoin.Prove(joinFrame)
 	require.NoError(t, err)
@@ -264,10 +271,12 @@ func TestProverLeaveFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// First join and confirm to get to active state
 	joinFrame := uint64(252840)
-	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover)
+	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 	require.NoError(t, err)
 	err = proverJoin.Prove(joinFrame)
 	require.NoError(t, err)
@@ -335,10 +344,12 @@ func TestProverLeaveRejectFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// First join and confirm to get to active state
 	joinFrame := uint64(252840)
-	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover)
+	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 	require.NoError(t, err)
 	err = proverJoin.Prove(joinFrame)
 	require.NoError(t, err)
@@ -387,12 +398,14 @@ func TestProverLeaveRejectFlow(t *testing.T) {
 func TestProverTimingEdgeCases(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	filter := []byte("test-filter")
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	t.Run("Join before 252840 with special confirmation rules", func(t *testing.T) {
 		joinFrame := uint64(252000)
 
 		// Create and prove join
-		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover)
+		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 		require.NoError(t, err)
 		err = proverJoin.Prove(joinFrame)
 		require.NoError(t, err)
@@ -427,7 +440,7 @@ func TestProverTimingEdgeCases(t *testing.T) {
 	t.Run("Pause timeout causes implicit leave", func(t *testing.T) {
 		// First get to active state
 		joinFrame := uint64(252840)
-		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover)
+		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 		require.NoError(t, err)
 		err = proverJoin.Prove(joinFrame)
 		require.NoError(t, err)
@@ -466,10 +479,12 @@ func TestProverTimingEdgeCases(t *testing.T) {
 func TestProverInvalidStateTransitions(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	filter := []byte("test-filter")
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// Join first
 	joinFrame := uint64(252840)
-	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover)
+	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 	require.NoError(t, err)
 	err = proverJoin.Prove(joinFrame)
 	require.NoError(t, err)

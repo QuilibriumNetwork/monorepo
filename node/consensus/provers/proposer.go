@@ -225,18 +225,20 @@ func (m *Manager) PlanAndAllocate(
 		})
 	}
 
-	// Perform allocations (best-effort, continue on per-worker error).
+	// Perform allocations
 	out := make([]Proposal, 0, len(proposals))
+	workerIds := []uint{}
+	filters := [][]byte{}
 	for _, p := range proposals {
-		if err := m.workerMgr.ProposeAllocation(p.WorkerId, p.Filter); err != nil {
-			// Keep going; return successful ones plus the error at the end.
-			m.logger.Warn("allocate worker failed",
-				zap.Uint("worker_id", p.WorkerId),
-				zap.Error(err),
-			)
-			continue
-		}
-		out = append(out, p)
+		workerIds = append(workerIds, p.WorkerId)
+		filters = append(filters, p.Filter)
+	}
+
+	err = m.workerMgr.ProposeAllocations(workerIds, filters)
+	if err != nil {
+		m.logger.Warn("allocate worker failed",
+			zap.Error(err),
+		)
 	}
 
 	return out, nil

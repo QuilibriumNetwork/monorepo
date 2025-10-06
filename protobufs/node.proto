@@ -215,6 +215,18 @@ message RespawnRequest {
 message RespawnResponse {
 }
 
+message CreateJoinProofRequest {
+  bytes challenge = 1;
+  uint32 difficulty = 2;
+  repeated bytes ids = 3;
+  uint32 prover_index = 4;
+}
+
+message CreateJoinProofResponse {
+  bytes response = 1;
+}
+
 service DataIPCService {
   rpc Respawn(RespawnRequest) returns (RespawnResponse);
+  rpc CreateJoinProof(CreateJoinProofRequest) returns (CreateJoinProofResponse);
 }

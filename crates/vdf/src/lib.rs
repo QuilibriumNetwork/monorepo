@@ -262,3 +262,117 @@ pub fn wesolowski_verify(int_size_bits: u16, challenge: &[u8], difficulty: u32, 
     let vdf = WesolowskiVDFParams(int_size_bits).new();
     vdf.verify(challenge, difficulty.into(), alleged_solution).is_ok()
 }
+
+/// Solve (single worker `i`) with Wesolowski using ID-bound base and a shared prime `b`.
+/// Produces this worker’s blob in the same layout as `wesolowski_solve`: `[y_i | π_i]`.
+pub fn wesolowski_solve_multi(
+  int_size_bits: u16,
+  challenge: &[u8],
+  difficulty: u32,
+  ids: &Vec<Vec<u8>>,
+  i: u32,
+) -> Vec<u8> {
+  use classgroup::{gmp_classgroup::GmpClassGroup, BigNumExt, ClassGroup};
+  use crate::proof_of_time::serialize;
+  use crate::proof_wesolowski::{commit_ids, hash_prime_fixed, worker_prove_id_bound};
+
+  assert!(!ids.is_empty(), "ids must be non-empty");
+  assert!((i as usize) < ids.len(), "worker index out of range");
+
+  // Bind the entire ID set and derive shared prime b
+  let ids_commitment = commit_ids(&ids);
+  let b = hash_prime_fixed::<<GmpClassGroup as ClassGroup>::BigNum>(
+      challenge,
+      int_size_bits,
+      difficulty as u64,
+      &ids_commitment,
+  );
+
+  // This worker runs its own chain on its ID-bound base
+  let (y_i, pi_i) = worker_prove_id_bound::<<GmpClassGroup as ClassGroup>::BigNum, GmpClassGroup>(
+      challenge,
+      int_size_bits,
+      difficulty as u64,
+      &ids[i as usize],
+      &b,
+  );
+
+  serialize(&[pi_i], &y_i, int_size_bits as usize)
+}
+
+/// Verify all workers in one shot from their individual blobs.
+/// `alleged_solutions` must be parallel to `ids`, each entry a `[y_i | π_i]` blob
+/// produced by `wesolowski_solve_multi` for that same `id`.
+pub fn wesolowski_verify_multi(
+  int_size_bits: u16,
+  challenge: &[u8],
+  difficulty: u32,
+  ids: &Vec<Vec<u8>>,
+  alleged_solutions: &Vec<Vec<u8>>,
+) -> bool {
+  use classgroup::{gmp_classgroup::GmpClassGroup, BigNum, BigNumExt, ClassGroup};
+  use crate::proof_wesolowski::{commit_ids, hash_prime_fixed, hash_to_exponent};
+
+  // Basic shape checks
+  if ids.is_empty() || ids.len() != alleged_solutions.len() { return false; }
+  if (usize::MAX - 16) < int_size_bits as usize { return false; }
+  let elem_units = ((int_size_bits as usize) + 16) >> 4; // element is 2 * elem_units bytes
+  if elem_units == 0 { return false; }
+  let element_len = elem_units * 2;
+  let blob_len = element_len * 2; // [y | π]
+
+  // Discriminant and canonical base x
+  let disc: <GmpClassGroup as ClassGroup>::BigNum = create_discriminant(challenge, int_size_bits);
+  let x = GmpClassGroup::from_ab_discriminant(2.into(), 1.into(), disc.clone());
+
+  // Fixed prime b from (challenge, bits, t, ids_commitment)
+  let ids_slices: Vec<&[u8]> = ids.iter().map(|v| v.as_slice()).collect();
+  let ids_commitment = commit_ids(&ids_slices);
+  let b = hash_prime_fixed::<<GmpClassGroup as ClassGroup>::BigNum>(
+      challenge,
+      int_size_bits,
+      difficulty as u64,
+      &ids_commitment,
+  );
+  
+  let two = <<GmpClassGroup as ClassGroup>::BigNum>::from(2u64);
+  if !(b > two) { return false; }
+
+  // r = 2^t mod b
+  let mut r = <<GmpClassGroup as ClassGroup>::BigNum>::from(0u64);
+  r.mod_powm(
+      &<<GmpClassGroup as ClassGroup>::BigNum>::from(2u64),
+      &<<GmpClassGroup as ClassGroup>::BigNum>::from(difficulty as u64),
+      &b,
+  );
+
+  // Aggregate Y = ∏ y_i and Π = ∏ π_i; compute S = Σ h_i
+  let (first_id, first_blob) = (&ids[0], &alleged_solutions[0]);
+  if first_blob.len() != blob_len { return false; }
+  let (y0_bytes, pi0_bytes) = first_blob.split_at(element_len);
+  let mut y_agg  = GmpClassGroup::from_bytes(y0_bytes, disc.clone());
+  let mut pi_agg = GmpClassGroup::from_bytes(pi0_bytes, disc.clone());
+  let mut S = hash_to_exponent::<<GmpClassGroup as ClassGroup>::BigNum>(challenge, first_id.as_slice());
+
+
+  for (id_bytes, blob) in ids.iter().zip(alleged_solutions.iter()).skip(1) {
+      if blob.len() != blob_len { return false; }
+      let (y_bytes, pi_bytes) = blob.split_at(element_len);
+      let y_i  = GmpClassGroup::from_bytes(y_bytes, disc.clone());
+      let pi_i = GmpClassGroup::from_bytes(pi_bytes,  disc.clone());
+      y_agg  = &y_agg  * &y_i;
+      pi_agg = &pi_agg * &pi_i;
+      S = S + hash_to_exponent::<<GmpClassGroup as ClassGroup>::BigNum>(challenge, id_bytes.as_slice());
+  }
+
+  // Single aggregated check:  Π^b * x^{ r * S } ?= Y
+  let mut lhs = pi_agg.clone();
+  lhs.pow(b.clone()); // Π^b
+
+  let mut x_exp = x.clone();
+  x_exp.pow(r * S);   // x^{r*S}
+
+  lhs *= &x_exp;
+
+  lhs == y_agg
+}

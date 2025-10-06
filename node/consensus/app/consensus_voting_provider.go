@@ -99,6 +99,10 @@ func (p *AppVotingProvider) DecideAndSendVote(
 	for _, id := range provers {
 		prop := proposals[PeerID{ID: id}.Identity()]
 		if prop == nil {
+			p.engine.logger.Debug(
+				"proposer not found for prover",
+				zap.String("prover", PeerID{ID: id}.Identity()),
+			)
 			continue
 		}
 		// Validate the proposal

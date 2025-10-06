@@ -109,6 +109,250 @@ func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	return id
 }
 
+// NewBlossomSubWithHost creates a new blossomsub instance with a pre-defined
+// host. This method is intended for integration tests that need something
+// more realistic for pubsub purposes, with a supplied simulator (see
+// node/tests/simnet.go for utility methods to construct a flaky host)
+func NewBlossomSubWithHost(
+	p2pConfig *config.P2PConfig,
+	engineConfig *config.EngineConfig,
+	logger *zap.Logger,
+	coreId uint,
+	isBootstrapPeer bool,
+	host host.Host,
+	privKey crypto.PrivKey,
+	bootstrapHosts []host.Host,
+) *BlossomSub {
+	ctx := context.Background()
+	if coreId == 0 {
+		logger = logger.With(zap.String("process", "master"))
+	} else {
+		logger = logger.With(zap.String(
+			"process",
+			fmt.Sprintf("worker %d", coreId),
+		))
+	}
+
+	bs := &BlossomSub{
+		ctx:                 ctx,
+		logger:              logger,
+		bitmaskMap:          make(map[string]*blossomsub.Bitmask),
+		subscriptionTracker: make(map[string][][]byte),
+		signKey:             privKey,
+		peerScore:           make(map[string]*appScore),
+		p2pConfig:           *p2pConfig,
+	}
+
+	idService := internal.IDServiceFromHost(host)
+
+	logger.Info("established peer id", zap.String("peer_id", host.ID().String()))
+
+	reachabilitySub, err := host.EventBus().Subscribe(
+		&event.EvtLocalReachabilityChanged{},
+		eventbus.Name("blossomsub"),
+	)
+	if err != nil {
+		logger.Panic("error subscribing to reachability events", zap.Error(err))
+	}
+	go func() {
+		defer reachabilitySub.Close()
+		instance := "node"
+		if coreId != 0 {
+			instance = "worker"
+		}
+		logger := logger.Named("reachability")
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt, ok := <-reachabilitySub.Out():
+				if !ok {
+					return
+				}
+				state := evt.(event.EvtLocalReachabilityChanged).Reachability
+				bs.reachability.Store(&state)
+				switch state {
+				case network.ReachabilityPublic:
+					logger.Info(
+						instance+" is externally reachable",
+						zap.Uint("core_id", coreId),
+					)
+				case network.ReachabilityPrivate:
+					logger.Error(
+						instance+" is not externally reachable",
+						zap.Uint("core_id", coreId),
+					)
+				case network.ReachabilityUnknown:
+					logger.Info(
+						instance+" reachability is unknown",
+						zap.Uint("core_id", coreId),
+					)
+				default:
+					logger.Debug("unknown reachability state", zap.Any("state", state))
+				}
+			}
+		}
+	}()
+
+	bootstrappers := []peer.AddrInfo{}
+	for _, bh := range bootstrapHosts {
+		// manually construct the p2p string, kind of kludgy, but this is intended
+		// for use with tests
+		ai, err := peer.AddrInfoFromString(
+			bh.Addrs()[0].String() + "/p2p/" + bh.ID().String(),
+		)
+		if err != nil {
+			panic(fmt.Sprintf("error for addr %v, %+v:", bh.Addrs()[0], err))
+		}
+		bootstrappers = append(bootstrappers, *ai)
+	}
+	kademliaDHT := initDHT(
+		ctx,
+		logger,
+		host,
+		isBootstrapPeer,
+		bootstrappers,
+		p2pConfig.Network,
+	)
+	host = routedhost.Wrap(host, kademliaDHT)
+
+	routingDiscovery := routing.NewRoutingDiscovery(kademliaDHT)
+	util.Advertise(ctx, routingDiscovery, getNetworkNamespace(p2pConfig.Network))
+
+	minBootstrapPeers := min(len(bootstrappers), p2pConfig.MinBootstrapPeers)
+	bootstrap := internal.NewPeerConnector(
+		ctx,
+		zap.NewNop(),
+		host,
+		idService,
+		minBootstrapPeers,
+		p2pConfig.BootstrapParallelism,
+		internal.NewStaticPeerSource(bootstrappers, true),
+	)
+	if err := bootstrap.Connect(ctx); err != nil {
+		logger.Panic("error connecting to bootstrap peers", zap.Error(err))
+	}
+	bs.bootstrap = bootstrap
+
+	discovery := internal.NewPeerConnector(
+		ctx,
+		zap.NewNop(),
+		host,
+		idService,
+		p2pConfig.D,
+		p2pConfig.DiscoveryParallelism,
+		internal.NewRoutingDiscoveryPeerSource(
+			routingDiscovery,
+			getNetworkNamespace(p2pConfig.Network),
+			p2pConfig.DiscoveryPeerLookupLimit,
+		),
+	)
+	if err := discovery.Connect(ctx); err != nil {
+		logger.Panic("error connecting to discovery peers", zap.Error(err))
+	}
+	discovery = internal.NewChainedPeerConnector(ctx, bootstrap, discovery)
+	bs.discovery = discovery
+
+	internal.MonitorPeers(
+		ctx,
+		logger.Named("peer-monitor"),
+		host,
+		p2pConfig.PingTimeout,
+		p2pConfig.PingPeriod,
+		p2pConfig.PingAttempts,
+	)
+
+	var tracer *blossomsub.JSONTracer
+	if p2pConfig.TraceLogStdout {
+		tracer, err = blossomsub.NewStdoutJSONTracer()
+		if err != nil {
+			panic(errors.Wrap(err, "error building stdout tracer"))
+		}
+	} else if p2pConfig.TraceLogFile != "" {
+		tracer, err = blossomsub.NewJSONTracer(p2pConfig.TraceLogFile)
+		if err != nil {
+			logger.Panic("error building file tracer", zap.Error(err))
+		}
+	}
+
+	blossomOpts := []blossomsub.Option{
+		blossomsub.WithStrictSignatureVerification(true),
+		blossomsub.WithValidateQueueSize(blossomsub.DefaultValidateQueueSize),
+		blossomsub.WithValidateWorkers(1),
+		blossomsub.WithPeerOutboundQueueSize(
+			blossomsub.DefaultPeerOutboundQueueSize,
+		),
+	}
+
+	if tracer != nil {
+		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
+	}
+	blossomOpts = append(blossomOpts, blossomsub.WithPeerScore(
+		&blossomsub.PeerScoreParams{
+			SkipAtomicValidation:        false,
+			BitmaskScoreCap:             0,
+			IPColocationFactorWeight:    0,
+			IPColocationFactorThreshold: 6,
+			BehaviourPenaltyWeight:      -10,
+			BehaviourPenaltyThreshold:   100,
+			BehaviourPenaltyDecay:       .5,
+			DecayInterval:               DecayInterval,
+			DecayToZero:                 .1,
+			RetainScore:                 60 * time.Minute,
+			AppSpecificScore: func(p peer.ID) float64 {
+				return float64(bs.GetPeerScore([]byte(p)))
+			},
+			AppSpecificWeight: 10.0,
+		},
+		&blossomsub.PeerScoreThresholds{
+			SkipAtomicValidation:        false,
+			GossipThreshold:             -2000,
+			PublishThreshold:            -5000,
+			GraylistThreshold:           -10000,
+			AcceptPXThreshold:           1,
+			OpportunisticGraftThreshold: 2,
+		},
+	))
+	blossomOpts = append(blossomOpts, observability.WithPrometheusRawTracer())
+	if p2pConfig.Network == 0 {
+		blossomOpts = append(blossomOpts, blossomsub.WithPeerFilter(
+			internal.NewStaticPeerFilter(
+				[]peer.ID{},
+				internal.PeerAddrInfosToPeerIDSlice(bootstrappers),
+				true,
+			),
+		))
+	}
+	blossomOpts = append(blossomOpts, blossomsub.WithDiscovery(
+		internal.NewPeerConnectorDiscovery(discovery),
+	))
+	blossomOpts = append(blossomOpts, blossomsub.WithMessageIdFn(
+		func(pmsg *pb.Message) []byte {
+			id := sha256.Sum256(pmsg.Data)
+			return id[:]
+		}),
+	)
+
+	params := toBlossomSubParams(p2pConfig)
+	rt := blossomsub.NewBlossomSubRouter(host, params, bs.p2pConfig.Network)
+	blossomOpts = append(blossomOpts, rt.WithDefaultTagTracer())
+	pubsub, err := blossomsub.NewBlossomSubWithRouter(ctx, host, rt, blossomOpts...)
+	if err != nil {
+		logger.Panic("error creating pubsub", zap.Error(err))
+	}
+
+	peerID := host.ID()
+	bs.dht = kademliaDHT
+	bs.ps = pubsub
+	bs.peerID = peerID
+	bs.h = host
+	bs.signKey = privKey
+
+	go bs.background(ctx)
+
+	return bs
+}
+
 func NewBlossomSub(
 	p2pConfig *config.P2PConfig,
 	engineConfig *config.EngineConfig,
@@ -246,6 +490,26 @@ func NewBlossomSub(
 	}
 	allowedPeers = append(allowedPeers, directPeers...)
 
+	opts = append(
+		opts,
+		libp2p.SwarmOpts(
+			swarm.WithUDPBlackHoleSuccessCounter(
+				&swarm.BlackHoleSuccessCounter{
+					N:            8000,
+					MinSuccesses: 1,
+					Name:         "permissive-udp",
+				},
+			),
+			swarm.WithIPv6BlackHoleSuccessCounter(
+				&swarm.BlackHoleSuccessCounter{
+					N:            8000,
+					MinSuccesses: 1,
+					Name:         "permissive-ip6",
+				},
+			),
+		),
+	)
+
 	if p2pConfig.LowWatermarkConnections != -1 &&
 		p2pConfig.HighWatermarkConnections != -1 {
 		cm, err := connmgr.NewConnManager(
@@ -264,10 +528,6 @@ func NewBlossomSub(
 			logger.Panic("error creating resource manager", zap.Error(err))
 		}
 
-		opts = append(
-			opts,
-			libp2p.SwarmOpts(swarm.WithReadOnlyBlackHoleDetector()),
-		)
 		opts = append(opts, libp2p.ConnectionManager(cm))
 		opts = append(opts, libp2p.ResourceManager(rm))
 	}
@@ -666,6 +926,10 @@ func (b *BlossomSub) Subscribe(
 	b.subscriptionTracker[string(bitmask)] = bitSlices
 	b.subscriptionMutex.Unlock()
 
+	// If the bitmask count is greater than three, this is a broad subscribe
+	// and the caller is expected to handle disambiguation of addresses
+	exact := len(bm) <= 3
+
 	subs := []*blossomsub.Subscription{}
 	for _, bit := range bm {
 		sub, err := bit.Subscribe(
@@ -679,10 +943,12 @@ func (b *BlossomSub) Subscribe(
 			b.subscriptionMutex.Unlock()
 			return errors.Wrap(err, "subscribe")
 		}
+		b.subscriptionMutex.Lock()
 		_, ok := b.bitmaskMap[string(bit.Bitmask())]
 		if !ok {
 			b.bitmaskMap[string(bit.Bitmask())] = bit
 		}
+		b.subscriptionMutex.Unlock()
 		subs = append(subs, sub)
 	}
 
@@ -698,10 +964,15 @@ func (b *BlossomSub) Subscribe(
 
 		go func() {
 			for {
-				b.subscribeHandler(sub, copiedBitmask, handler)
+				b.subscribeHandler(sub, copiedBitmask, exact, handler)
 			}
 		}()
 	}
+
+	b.logger.Info(
+		"successfully subscribed to bitmask",
+		zap.String("bitmask", hex.EncodeToString(bitmask)),
+	)
 
 	return nil
 }
@@ -709,6 +980,7 @@ func (b *BlossomSub) Subscribe(
 func (b *BlossomSub) subscribeHandler(
 	sub *blossomsub.Subscription,
 	copiedBitmask []byte,
+	exact bool,
 	handler func(message *pb.Message) error,
 ) {
 	defer func() {
@@ -727,7 +999,7 @@ func (b *BlossomSub) subscribeHandler(
 			zap.Error(err),
 		)
 	}
-	if bytes.Equal(m.Bitmask, copiedBitmask) {
+	if bytes.Equal(m.Bitmask, copiedBitmask) || !exact {
 		if err = handler(m.Message); err != nil {
 			b.logger.Debug("message handler returned error", zap.Error(err))
 		}
@@ -1044,8 +1316,11 @@ func (b *BlossomSub) GetOwnMultiaddrs() []ma.Multiaddr {
 	return b.filterAndPrioritizeAddrs(allAddrs)
 }
 
-// filterAndPrioritizeAddrs filters and prioritizes addresses for external visibility
-func (b *BlossomSub) filterAndPrioritizeAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
+// filterAndPrioritizeAddrs filters and prioritizes addresses for external
+// visibility
+func (b *BlossomSub) filterAndPrioritizeAddrs(
+	addrs []ma.Multiaddr,
+) []ma.Multiaddr {
 	var public, private, relay []ma.Multiaddr
 
 	for _, addr := range addrs {
@@ -1122,7 +1397,8 @@ func (b *BlossomSub) isPublicAddr(addr ma.Multiaddr) bool {
 	return !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsUnspecified()
 }
 
-// isPrivateButRoutable checks if this is a private but potentially routable address
+// isPrivateButRoutable checks if this is a private but potentially routable
+// address
 func (b *BlossomSub) isPrivateButRoutable(addr ma.Multiaddr) bool {
 	ipComponent, err := addr.ValueForProtocol(ma.P_IP4)
 	if err != nil {
@@ -1199,23 +1475,27 @@ func (b *BlossomSub) GetDirectChannel(
 		return nil, errors.Wrap(err, "get direct channel")
 	}
 
+	var lastError error
 	for _, addr := range pi.Addrs {
-		mga, err := mn.ToNetAddr(addr)
-		if err != nil {
-			return nil, errors.Wrap(err, "get direct channel")
+		var mga net.Addr
+		mga, lastError = mn.ToNetAddr(addr)
+		if lastError != nil {
+			continue
 		}
-		cc, err := grpc.NewClient(
+
+		var cc *grpc.ClientConn
+		cc, lastError = grpc.NewClient(
 			mga.String(),
 			grpc.WithTransportCredentials(creds),
 		)
-		if err != nil {
-			return nil, errors.Wrap(err, "dial direct channel")
+		if lastError != nil {
+			continue
 		}
 
 		return cc, nil
 	}
 
-	return nil, nil
+	return nil, errors.Wrap(lastError, "get direct channel")
 }
 
 func (b *BlossomSub) GetPublicKey() []byte {

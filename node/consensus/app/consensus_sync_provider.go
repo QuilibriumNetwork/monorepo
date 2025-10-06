@@ -152,8 +152,10 @@ func (p *AppSyncProvider) Synchronize(
 		}
 
 		if latestFrame != nil {
+			p.engine.logger.Info("returning latest frame")
 			dataCh <- &latestFrame
 		} else if existing != nil {
+			p.engine.logger.Info("returning existing frame")
 			dataCh <- existing
 		}
 
@@ -175,6 +177,7 @@ func (p *AppSyncProvider) syncWithMesh() error {
 
 	peers, err := p.engine.proverRegistry.GetActiveProvers(p.engine.appAddress)
 	if len(peers) <= 1 || err != nil {
+		p.engine.logger.Info("no peers to sync from")
 		return nil
 	}
 

@@ -35,6 +35,7 @@ type GlobalExecutionEngine struct {
 	bulletproofProver crypto.BulletproofProver
 	verEnc            crypto.VerifiableEncryptor
 	decafConstructor  crypto.DecafConstructor
+	frameProver       crypto.FrameProver
 
 	// State
 	intrinsics      map[string]intrinsics.Intrinsic
@@ -54,6 +55,7 @@ func NewGlobalExecutionEngine(
 	bulletproofProver crypto.BulletproofProver,
 	verEnc crypto.VerifiableEncryptor,
 	decafConstructor crypto.DecafConstructor,
+	frameProver crypto.FrameProver,
 ) (*GlobalExecutionEngine, error) {
 	return &GlobalExecutionEngine{
 		logger:            logger,
@@ -66,6 +68,7 @@ func NewGlobalExecutionEngine(
 		bulletproofProver: bulletproofProver,
 		verEnc:            verEnc,
 		decafConstructor:  decafConstructor,
+		frameProver:       frameProver,
 		intrinsics:        make(map[string]intrinsics.Intrinsic),
 	}, nil
 }
@@ -344,6 +347,8 @@ func (e *GlobalExecutionEngine) validateIndividualMessage(
 			e.hypergraph,
 			e.inclusionProver,
 			e.keyManager,
+			e.frameProver,
+			e.clockStore,
 		)
 		if err != nil {
 			return errors.Wrap(err, "validate individual message")
@@ -582,6 +587,8 @@ func (e *GlobalExecutionEngine) processIndividualMessage(
 			e.hypergraph,
 			e.inclusionProver,
 			e.keyManager,
+			e.frameProver,
+			e.clockStore,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "process individual message")

@@ -35,6 +35,7 @@ func TestGlobalExecutionEngine_Start(t *testing.T) {
 	mockBulletproofProver := new(mocks.MockBulletproofProver)
 	mockVerEnc := new(mocks.MockVerifiableEncryptor)
 	mockDecaf := new(mocks.MockDecafConstructor)
+	mockFrameProver := new(mocks.MockFrameProver)
 
 	engine, err := engines.NewGlobalExecutionEngine(
 		logger,
@@ -47,6 +48,7 @@ func TestGlobalExecutionEngine_Start(t *testing.T) {
 		mockBulletproofProver,
 		mockVerEnc,
 		mockDecaf,
+		mockFrameProver,
 	)
 	require.NoError(t, err)
 
@@ -124,6 +126,7 @@ func TestGlobalExecutionEngine_ProcessMessage(t *testing.T) {
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
 			mockVerEnc := new(mocks.MockVerifiableEncryptor)
 			mockDecaf := new(mocks.MockDecafConstructor)
+			mockFrameProver := new(mocks.MockFrameProver)
 
 			tt.setupMocks(mockHG, mockInclusionProver, mockKeyManager)
 
@@ -138,6 +141,7 @@ func TestGlobalExecutionEngine_ProcessMessage(t *testing.T) {
 				mockBulletproofProver,
 				mockVerEnc,
 				mockDecaf,
+				mockFrameProver,
 			)
 			require.NoError(t, err)
 
@@ -208,6 +212,7 @@ func TestGlobalExecutionEngine_AllOperationTypes(t *testing.T) {
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
 			mockVerEnc := new(mocks.MockVerifiableEncryptor)
 			mockDecaf := new(mocks.MockDecafConstructor)
+			mockFrameProver := new(mocks.MockFrameProver)
 
 			// Set up mocks for loading global intrinsic
 			mockInclusionProver.On("VerifyInclusion", mock.Anything, mock.Anything, mock.Anything).Return(true, nil).Maybe()
@@ -363,6 +368,7 @@ func TestGlobalExecutionEngine_AllOperationTypes(t *testing.T) {
 				mockBulletproofProver,
 				mockVerEnc,
 				mockDecaf,
+				mockFrameProver,
 			)
 			require.NoError(t, err)
 

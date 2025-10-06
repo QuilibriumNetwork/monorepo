@@ -13,7 +13,7 @@ func GetMinimumVersionCutoff() time.Time {
 // if there is something in the patch update that is needed to cut off
 // unupgraded peers. Be sure to update this to 0x00 for any new minor release.
 func GetMinimumPatchVersion() byte {
-	return 0x00
+	return 0x02
 }
 
 func GetMinimumVersion() []byte {
@@ -43,7 +43,7 @@ func FormatVersion(version []byte) string {
 }
 
 func GetPatchNumber() byte {
-	return 0x01
+	return 0x02
 }
 
 func GetRCNumber() byte {

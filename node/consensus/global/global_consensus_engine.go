@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,8 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
@@ -366,6 +370,7 @@ func NewGlobalConsensusEngine(
 		verEnc,
 		decafConstructor,
 		compiler,
+		frameProver,
 		true, // includeGlobal
 	)
 	if err != nil {
@@ -428,16 +433,25 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 	e.quit = quit
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 
+	// Start worker manager background process (if applicable)
+	if !e.config.Engine.ArchiveMode {
+		if err := e.workerManager.Start(e.ctx); err != nil {
+			errChan <- errors.Wrap(err, "start")
+			close(errChan)
+			return errChan
+		}
+	}
+
 	// Start execution engines
 	if err := e.executionManager.StartAll(e.quit); err != nil {
-		errChan <- errors.Wrap(err, "start execution engines")
+		errChan <- errors.Wrap(err, "start")
 		close(errChan)
 		return errChan
 	}
 
 	// Start the event distributor
 	if err := e.eventDistributor.Start(e.ctx); err != nil {
-		errChan <- errors.Wrap(err, "start event distributor")
+		errChan <- errors.Wrap(err, "start")
 		close(errChan)
 		return errChan
 	}
@@ -691,6 +705,15 @@ func (e *GlobalConsensusEngine) getAddressFromPublicKey(
 func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	errChan := make(chan error, 1)
 
+	// Stop worker manager background process (if applicable)
+	if !e.config.Engine.ArchiveMode {
+		if err := e.workerManager.Stop(); err != nil {
+			errChan <- errors.Wrap(err, "stop")
+			close(errChan)
+			return errChan
+		}
+	}
+
 	if e.grpcServer != nil {
 		e.logger.Info("stopping gRPC server")
 		e.grpcServer.GracefulStop()
@@ -702,14 +725,14 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
 		// Stop the state machine
 		if err := e.stateMachine.Stop(); err != nil && !force {
-			errChan <- errors.Wrap(err, "stop state machine")
+			errChan <- errors.Wrap(err, "stop")
 		}
 	}
 
 	// Stop execution engines
 	if e.executionManager != nil {
 		if err := e.executionManager.StopAll(force); err != nil && !force {
-			errChan <- errors.Wrap(err, "stop execution engines")
+			errChan <- errors.Wrap(err, "stop")
 		}
 	}
 
@@ -720,13 +743,15 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 
 	// Stop event distributor
 	if err := e.eventDistributor.Stop(); err != nil && !force {
-		errChan <- errors.Wrap(err, "stop event distributor")
+		errChan <- errors.Wrap(err, "stop")
 	}
 
 	// Unsubscribe from pubsub
 	if e.config.Engine.ArchiveMode || e.config.P2P.Network == 99 {
 		e.pubsub.Unsubscribe(GLOBAL_CONSENSUS_BITMASK, false)
 		e.pubsub.UnregisterValidator(GLOBAL_CONSENSUS_BITMASK)
+		e.pubsub.Unsubscribe(bytes.Repeat([]byte{0xff}, 32), false)
+		e.pubsub.UnregisterValidator(bytes.Repeat([]byte{0xff}, 32))
 	}
 
 	e.pubsub.Unsubscribe(GLOBAL_FRAME_BITMASK, false)
@@ -1947,8 +1972,9 @@ func reservedPrefixes(proto int) []netip.Prefix {
 
 // TODO(2.1.1+): This could use refactoring
 func (e *GlobalConsensusEngine) ProposeWorkerJoin(
-	coreId uint,
-	filter []byte,
+	coreIds []uint,
+	filters [][]byte,
+	serviceClients map[uint]*grpc.ClientConn,
 ) error {
 	frame := e.GetFrame()
 	if frame == nil {
@@ -2049,14 +2075,67 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		}
 	}
 
+	challenge := sha3.Sum256(frame.Header.Output)
+
+	results := make([][516]byte, len(serviceClients))
+	idx := uint32(0)
+	ids := [][]byte{}
+	for range len(serviceClients) {
+		ids = append(
+			ids,
+			slices.Concat(
+				e.getProverAddress(),
+				filters[idx],
+				binary.BigEndian.AppendUint32(nil, idx),
+			),
+		)
+		idx++
+	}
+
+	idx = 0
+
+	wg := errgroup.Group{}
+	wg.SetLimit(len(serviceClients))
+
+	for _, svc := range serviceClients {
+		svc := svc
+		i := idx
+		wg.Go(func() error {
+			client := protobufs.NewDataIPCServiceClient(svc)
+			resp, err := client.CreateJoinProof(
+				e.ctx,
+				&protobufs.CreateJoinProofRequest{
+					Challenge:   challenge[:],
+					Difficulty:  frame.Header.Difficulty,
+					Ids:         ids,
+					ProverIndex: i,
+				},
+			)
+			if err != nil {
+				return err
+			}
+
+			results[i] = [516]byte(resp.Response)
+			return nil
+		})
+		idx++
+	}
+
+	err = wg.Wait()
+	if err != nil {
+		return errors.Wrap(err, "propose worker join")
+	}
+
 	join, err := global.NewProverJoin(
-		[][]byte{filter},
+		filters,
 		frame.Header.FrameNumber,
 		helpers,
 		delegate,
 		e.keyManager,
 		e.hypergraph,
 		schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		e.frameProver,
+		e.clockStore,
 	)
 	if err != nil {
 		e.logger.Error("could not construct join", zap.Error(err))

@@ -1,4 +1,6 @@
 namespace vdf {
     sequence<u8> wesolowski_solve(u16 int_size_bits, [ByRef] sequence<u8> challenge, u32 difficulty);
     boolean wesolowski_verify(u16 int_size_bits, [ByRef] sequence<u8> challenge, u32 difficulty, [ByRef] sequence<u8> alleged_solution);
+    sequence<u8> wesolowski_solve_multi(u16 int_size_bits, [ByRef] sequence<u8> challenge, u32 difficulty, [ByRef] sequence<sequence<u8>> ids, u32 i);
+    boolean wesolowski_verify_multi(u16 int_size_bits, [ByRef] sequence<u8> challenge, u32 difficulty, [ByRef] sequence<sequence<u8>> ids, [ByRef] sequence<sequence<u8>> alleged_solutions);
 };

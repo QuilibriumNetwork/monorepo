@@ -287,6 +287,33 @@ func (r *ProverRegistry) GetActiveProvers(
 	return result, nil
 }
 
+// GetProvers implements ProverRegistry
+func (r *ProverRegistry) GetProvers(filter []byte) (
+	[]*consensus.ProverInfo,
+	error,
+) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	r.logger.Debug(
+		"getting provers",
+		zap.String("filter", fmt.Sprintf("%x", filter)),
+	)
+
+	var result []*consensus.ProverInfo
+
+	for _, info := range r.filterCache[string(filter)] {
+		result = append(result, info)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return bytes.Compare(result[i].Address, result[j].Address) == -1
+	})
+
+	r.logger.Debug("provers retrieved", zap.Int("count", len(result)))
+	return result, nil
+}
+
 // GetProverCount implements ProverRegistry
 func (r *ProverRegistry) GetProverCount(filter []byte) (int, error) {
 	r.mu.RLock()
@@ -402,7 +429,7 @@ func (r *ProverRegistry) getProversByStatusInternal(
 ) ([]*consensus.ProverInfo, error) {
 	var result []*consensus.ProverInfo
 
-	for _, info := range r.proverCache {
+	for _, info := range r.filterCache[string(filter)] {
 		for _, allocation := range info.Allocations {
 			if allocation.Status == status && bytes.Equal(
 				allocation.ConfirmationFilter,
@@ -761,9 +788,20 @@ func (r *ProverRegistry) extractGlobalState() error {
 						index := sort.Search(len(info), func(i int) bool {
 							return bytes.Compare(info[i].Address, proverAddress) >= 0
 						})
-						r.filterCache[string(
+						skipAdd := false
+						for _, i := range r.filterCache[string(
 							allocation.ConfirmationFilter,
-						)] = slices.Insert(info, index, proverInfo)
+						)] {
+							if bytes.Equal(i.Address, proverAddress) {
+								skipAdd = true
+								break
+							}
+						}
+						if !skipAdd {
+							r.filterCache[string(
+								allocation.ConfirmationFilter,
+							)] = slices.Insert(info, index, proverInfo)
+						}
 					}
 				}
 			}
@@ -960,9 +998,20 @@ func (r *ProverRegistry) extractGlobalState() error {
 				index := sort.Search(len(info), func(i int) bool {
 					return bytes.Compare(info[i].Address, proverRef) >= 0
 				})
-				r.filterCache[string(
+				skipAdd := false
+				for _, i := range r.filterCache[string(
 					allocationInfo.ConfirmationFilter,
-				)] = slices.Insert(info, index, proverInfo)
+				)] {
+					if bytes.Equal(i.Address, proverRef) {
+						skipAdd = true
+						break
+					}
+				}
+				if !skipAdd {
+					r.filterCache[string(
+						allocationInfo.ConfirmationFilter,
+					)] = slices.Insert(info, index, proverInfo)
+				}
 			}
 
 			r.logger.Debug(

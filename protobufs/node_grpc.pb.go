@@ -257,7 +257,8 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	DataIPCService_Respawn_FullMethodName = "/quilibrium.node.node.pb.DataIPCService/Respawn"
+	DataIPCService_Respawn_FullMethodName         = "/quilibrium.node.node.pb.DataIPCService/Respawn"
+	DataIPCService_CreateJoinProof_FullMethodName = "/quilibrium.node.node.pb.DataIPCService/CreateJoinProof"
 )
 
 // DataIPCServiceClient is the client API for DataIPCService service.
@@ -265,6 +266,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type DataIPCServiceClient interface {
 	Respawn(ctx context.Context, in *RespawnRequest, opts ...grpc.CallOption) (*RespawnResponse, error)
+	CreateJoinProof(ctx context.Context, in *CreateJoinProofRequest, opts ...grpc.CallOption) (*CreateJoinProofResponse, error)
 }
 
 type dataIPCServiceClient struct {
@@ -284,11 +286,21 @@ func (c *dataIPCServiceClient) Respawn(ctx context.Context, in *RespawnRequest, 
 	return out, nil
 }
 
+func (c *dataIPCServiceClient) CreateJoinProof(ctx context.Context, in *CreateJoinProofRequest, opts ...grpc.CallOption) (*CreateJoinProofResponse, error) {
+	out := new(CreateJoinProofResponse)
+	err := c.cc.Invoke(ctx, DataIPCService_CreateJoinProof_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DataIPCServiceServer is the server API for DataIPCService service.
 // All implementations must embed UnimplementedDataIPCServiceServer
 // for forward compatibility
 type DataIPCServiceServer interface {
 	Respawn(context.Context, *RespawnRequest) (*RespawnResponse, error)
+	CreateJoinProof(context.Context, *CreateJoinProofRequest) (*CreateJoinProofResponse, error)
 	mustEmbedUnimplementedDataIPCServiceServer()
 }
 
@@ -298,6 +310,9 @@ type UnimplementedDataIPCServiceServer struct {
 
 func (UnimplementedDataIPCServiceServer) Respawn(context.Context, *RespawnRequest) (*RespawnResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Respawn not implemented")
+}
+func (UnimplementedDataIPCServiceServer) CreateJoinProof(context.Context, *CreateJoinProofRequest) (*CreateJoinProofResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateJoinProof not implemented")
 }
 func (UnimplementedDataIPCServiceServer) mustEmbedUnimplementedDataIPCServiceServer() {}
 
@@ -330,6 +345,24 @@ func _DataIPCService_Respawn_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DataIPCService_CreateJoinProof_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateJoinProofRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataIPCServiceServer).CreateJoinProof(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataIPCService_CreateJoinProof_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataIPCServiceServer).CreateJoinProof(ctx, req.(*CreateJoinProofRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DataIPCService_ServiceDesc is the grpc.ServiceDesc for DataIPCService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -340,6 +373,10 @@ var DataIPCService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Respawn",
 			Handler:    _DataIPCService_Respawn_Handler,
+		},
+		{
+			MethodName: "CreateJoinProof",
+			Handler:    _DataIPCService_CreateJoinProof_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

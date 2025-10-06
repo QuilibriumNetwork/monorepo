@@ -28,6 +28,7 @@ message ProverJoin {
   quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession public_key_signature_bls48581 = 3;
   bytes delegate_address = 4;
   repeated SeniorityMerge merge_targets = 5;
+  bytes proof = 6;
 }
 
 message ProverLeave {

@@ -108,6 +108,61 @@ fn u64_to_bytes(q: u64) -> [u8; 8] {
 
 /// Quote:
 ///
+/// > Commit to a list of IDs so order cannot be mutated by the aggregator.
+pub fn commit_ids(ids: &[impl AsRef<[u8]>]) -> [u8; 32] {
+  let mut ids_sorted: Vec<&[u8]> = ids.iter().map(|x| x.as_ref()).collect();
+  ids_sorted.sort_unstable();
+  let mut hasher = Sha256::new();
+  hasher.input(b"wesolowski-ids-multicommit");
+  for id in ids_sorted {
+      hasher.input((id.len() as u64).to_be_bytes());
+      hasher.input(id);
+  }
+  hasher.fixed_result().into()
+}
+
+/// Quote:
+///
+/// > Creates a random prime based on input challenge and ids_commitment.
+pub fn hash_prime_fixed<T: BigNum>(
+  challenge: &[u8],
+  int_size_bits: u16,
+  t: u64,
+  ids_commitment: &[u8; 32],
+) -> T {
+  let mut j = 0u64;
+  loop {
+      let mut hasher = Sha256::new();
+      hasher.input(b"wesolowski-fixed-multicommit");
+      hasher.input(challenge);
+      hasher.input(int_size_bits.to_be_bytes());
+      hasher.input(u64_to_bytes(t));
+      hasher.input(ids_commitment);
+      hasher.input(u64_to_bytes(j));
+      let n = T::from(&hasher.fixed_result()[..16]);
+      if n.probab_prime(1) {
+          break n;
+      }
+      j += 1;
+  }
+}
+
+pub fn hash_to_exponent<T: BigNum>(challenge: &[u8], id: &[u8]) -> T {
+  let mut hasher = Sha256::new();
+  hasher.input(b"wesolowski-exp-multicommit");
+  hasher.input(challenge);
+  hasher.input((id.len() as u64).to_be_bytes());
+  hasher.input(id);
+  let bytes = hasher.fixed_result();
+  let mut val = T::from(&bytes[..]);
+  if val == T::from(0u64) {
+      val = T::from(1u64);
+  }
+  val
+}
+
+/// Quote:
+///
 /// > Creates a random prime based on input s.
 fn hash_prime<T: BigNum>(seed: &[&[u8]], t: u32) -> T {
     let mut j = 0u64;
@@ -312,4 +367,153 @@ where
     let y = ClassGroup::from_bytes(result_bytes, discriminant);
 
     verify_proof(x, &y, proof, iterations, int_size_bits.into())
+}
+
+pub fn generate_proof_with_fixed_b<U, T: BigNumExt, V: ClassGroup<BigNum = T> + Eq + std::hash::Hash>(
+  x: &V,
+  iterations: u64,
+  k: u8,
+  l: usize,
+  powers: &U,
+  b: &T,
+) -> V
+where
+  U: for<'a> std::ops::Index<&'a u64, Output = V>,
+{
+  eval_optimized(x, b, iterations as _, k, l, powers)
+}
+
+/// Per-worker proof on a distinct ID-bound base x_i = x^{h_i}.
+/// Returns (y_i, pi_i) where:
+///   y_i  = x_i^{2^t}
+///   pi_i = x_i^{ floor(2^t / b) }  (Wesolowski quotient for fixed 'b')
+pub fn worker_prove_id_bound<TN, V>(
+  challenge: &[u8],
+  int_size_bits: u16,
+  iterations: u64,
+  id: &[u8],
+  b: &TN,
+) -> (V /* y_i */, V /* pi_i */)
+where
+  TN: BigNumExt,
+  V: ClassGroup<BigNum = TN> + Eq + std::hash::Hash + Clone,
+  for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
+  for<'a, 'b> &'a V::BigNum: std::ops::Mul<&'b V::BigNum, Output = V::BigNum>,
+{
+  // Canonical base for discriminant
+  let disc: TN = super::create_discriminant::create_discriminant(challenge, int_size_bits);
+  let mut x = V::from_ab_discriminant(2.into(), 1.into(), disc.clone());
+
+  // Distinct base: x_i = x^{h_i}
+  let h_i = hash_to_exponent::<TN>(challenge, id);
+  x.pow(h_i.clone());
+  let (l, k, _) = approximate_parameters(iterations as f64);
+  let q = l.checked_mul(k as _).expect("k*l overflow");
+
+  // Squaring checkpoints (as in create_proof_of_time_wesolowski, but for x_i)
+  let powers = iterate_squarings(
+      x.clone(),
+      (0..= (iterations as usize)/q + 1)
+          .map(|i| (i * q) as u64)
+          .chain(Some(iterations)),
+  );
+
+  let y_i  = powers[&iterations].clone();
+  let pi_i = generate_proof_with_fixed_b(&x, iterations, k, l, &powers, b);
+  (y_i, pi_i)
+}
+
+pub struct Aggregated<V: ClassGroup, T: BigNum> {
+  pub y_agg: V,              // ∏ y_i
+  pub pi_agg: V,             // ∏ pi_i
+  pub ids_commitment: [u8; 32],
+  pub m: u64,                // number of parts aggregated (optional metadata)
+  pub _phantom_b: std::marker::PhantomData<T>,
+}
+
+pub fn aggregate_worker_parts<V, T>(parts: &[(V, V)], ids_commitment: [u8; 32]) -> Aggregated<V, T>
+where
+  V: ClassGroup<BigNum = T> + Clone,
+  for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
+  T: BigNum,
+{
+  assert!(!parts.is_empty());
+  let id_elem = parts[0].0.identity();
+  let mut y_agg  = id_elem.clone();
+  let mut pi_agg = id_elem;
+
+  for (y_i, pi_i) in parts {
+      y_agg  = &y_agg  * y_i;
+      pi_agg = &pi_agg * pi_i;
+  }
+
+  Aggregated {
+      y_agg,
+      pi_agg,
+      ids_commitment,
+      m: parts.len() as u64,
+      _phantom_b: std::marker::PhantomData,
+  }
+}
+
+pub fn serialize_aggregated<V: ClassGroup>(agg: &Aggregated<V, V::BigNum>, int_size_bits: usize) -> Vec<u8> {
+  super::proof_of_time::serialize(&[agg.pi_agg.clone()], &agg.y_agg, int_size_bits)
+}
+
+/// Verify a single aggregated proof built from ID-bound bases.
+/// Inputs:
+///  - challenge, int_size_bits, iterations (t)
+///  - the sorted list of IDs
+///  - aggregated y, π
+///
+/// Check:
+///   Y == Π^b * x^{ r * S }
+/// where:
+///   b = HashPrimeFixed(challenge, int_size_bits, t, commit_ids(ids))
+///   r = 2^t mod b
+///   S = sum_i HashToExponent(challenge, id_i)
+pub fn verify_aggregated<TN, V>(
+  challenge: &[u8],
+  int_size_bits: u16,
+  iterations: u64,
+  ids: &[impl AsRef<[u8]>],
+  y_agg: &V,
+  pi_agg: &V,
+) -> Result<(), ()>
+where
+  TN: BigNumExt,
+  V: ClassGroup<BigNum = TN> + Clone + Eq,
+  for<'a, 'b> &'a V: std::ops::Mul<&'b V, Output = V>,
+  for<'a, 'b> &'a V::BigNum: std::ops::Mul<&'b V::BigNum, Output = V::BigNum>,
+{
+  // canonical base 'x' for the discriminant
+  let disc: TN = super::create_discriminant::create_discriminant(challenge, int_size_bits);
+  let x = V::from_ab_discriminant(2.into(), 1.into(), disc.clone());
+
+  // derive shared prime 'b' from the committed ID set
+  let ids_commitment = commit_ids(ids);
+  let b = hash_prime_fixed::<TN>(challenge, int_size_bits, iterations, &ids_commitment);
+
+  // r = 2^t mod b
+  let mut r = TN::from(0);
+  r.mod_powm(&TN::from(2u64), &TN::from(iterations), &b);
+
+  // S = sum_i h_i
+  let mut S = TN::from(0);
+  for id in ids {
+      let hi = hash_to_exponent::<TN>(challenge, id.as_ref());
+      S = S + hi;
+  }
+
+  // lhs = pi_agg^b * x^{ r * S }
+  let mut lhs = pi_agg.clone();
+  lhs.pow(b.clone());
+
+  let rS = r * S;
+  let mut xrS = x.clone();
+  xrS.pow(rS);
+
+  lhs *= &xrS;
+
+  if &lhs == y_agg { Ok(()) } else { Err(()) }
 }

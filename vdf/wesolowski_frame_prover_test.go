@@ -14,49 +14,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/vdf"
 )
 
-func TestMasterProve(t *testing.T) {
-	l, _ := zap.NewProduction()
-	w := vdf.NewWesolowskiFrameProver(l)
-	m, err := w.CreateMasterGenesisFrame([]byte{
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	}, bytes.Repeat([]byte{0x00}, 516), 10000)
-	assert.NoError(t, err)
-
-	next, err := w.ProveMasterClockFrame(
-		m,
-		time.Now().UnixMilli(),
-		10000,
-		[]*protobufs.InclusionAggregateProof{},
-	)
-	assert.NoError(t, err)
-	err = w.VerifyMasterClockFrame(next)
-	assert.NoError(t, err)
-}
-
-func TestCalculateChallengeProofDifficulty(t *testing.T) {
-	l, _ := zap.NewProduction()
-	w := vdf.NewWesolowskiFrameProver(l)
-
-	// At 0 increments, the difficulty should be 200,000
-	difficulty0 := w.CalculateChallengeProofDifficulty(0)
-	assert.Equal(t, uint32(200000), difficulty0)
-
-	// At 100,000 increments, the difficulty should be 175,000
-	difficulty100k := w.CalculateChallengeProofDifficulty(100000)
-	assert.Equal(t, uint32(175000), difficulty100k)
-
-	// At 700,000 increments, the difficulty should be 25,000
-	difficulty700k := w.CalculateChallengeProofDifficulty(700000)
-	assert.Equal(t, uint32(25000), difficulty700k)
-
-	// At 800,000 increments, the difficulty should stay at 25,000
-	difficulty800k := w.CalculateChallengeProofDifficulty(800000)
-	assert.Equal(t, uint32(25000), difficulty800k)
-}
-
 func TestProveAndVerifyFrameHeader(t *testing.T) {
 	l, _ := zap.NewProduction()
 	w := vdf.NewWesolowskiFrameProver(l)
@@ -139,26 +96,6 @@ func TestVerifyFrameHeaderValidation(t *testing.T) {
 		frame       *protobufs.FrameHeader
 		expectError string
 	}{
-		{
-			name: "missing signature",
-			frame: &protobufs.FrameHeader{
-				Address:        []byte("test"),
-				FrameNumber:    1,
-				Timestamp:      time.Now().UnixMilli(),
-				Difficulty:     10000,
-				Output:         bytes.Repeat([]byte{0x01}, 516),
-				ParentSelector: bytes.Repeat([]byte{0x00}, 32),
-				RequestsRoot:   bytes.Repeat([]byte{0x02}, 74),
-				StateRoots: [][]byte{
-					bytes.Repeat([]byte{0x03}, 74),
-					bytes.Repeat([]byte{0x04}, 74),
-					bytes.Repeat([]byte{0x05}, 74),
-					bytes.Repeat([]byte{0x06}, 74),
-				},
-				Prover: bytes.Repeat([]byte{0x07}, 32),
-			},
-			expectError: "no valid signature provided",
-		},
 		{
 			name: "empty address",
 			frame: &protobufs.FrameHeader{
@@ -360,6 +297,10 @@ func TestProveFrameHeaderMissingPreviousFrame(t *testing.T) {
 // Mock implementations for testing
 
 type MockBlsConstructor struct{}
+
+func (m *MockBlsConstructor) Aggregate(publicKeys [][]byte, signatures [][]byte) (crypto.BlsAggregateOutput, error) {
+	return nil, nil
+}
 
 func (m *MockBlsConstructor) New() (crypto.Signer, []byte, error) {
 	return &MockBlsSigner{}, bytes.Repeat([]byte{0x01}, 74), nil

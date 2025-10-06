@@ -2,6 +2,7 @@ package global
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"slices"
 
@@ -9,6 +10,7 @@ import (
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
+	"golang.org/x/crypto/sha3"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
@@ -19,6 +21,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
@@ -67,11 +70,15 @@ type ProverJoin struct {
 	// The optional delegated address for rewards to accrue, when omitted, uses
 	// the prover address
 	DelegateAddress []byte
+	// The proof element assuring availability and commitment of the workers
+	Proof []byte
 
 	// Private fields
 	keyManager     keys.KeyManager
 	hypergraph     hypergraph.Hypergraph
 	rdfMultiprover *schema.RDFMultiprover
+	frameProver    crypto.FrameProver
+	frameStore     store.ClockStore
 }
 
 func NewProverJoin(
@@ -82,6 +89,8 @@ func NewProverJoin(
 	keyManager keys.KeyManager,
 	hypergraph hypergraph.Hypergraph,
 	rdfMultiprover *schema.RDFMultiprover,
+	frameProver crypto.FrameProver,
+	frameStore store.ClockStore,
 ) (*ProverJoin, error) {
 	return &ProverJoin{
 		Filters:         filters,
@@ -91,6 +100,8 @@ func NewProverJoin(
 		keyManager:      keyManager,
 		hypergraph:      hypergraph,
 		rdfMultiprover:  rdfMultiprover,
+		frameProver:     frameProver,
+		frameStore:      frameStore,
 	}, nil
 }
 
@@ -430,6 +441,39 @@ func (p *ProverJoin) Materialize(
 		hyperedge.AddExtrinsic(allocationVertex.GetVertex())
 	}
 
+	for _, mt := range p.MergeTargets {
+		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
+			[]byte("PROVER_JOIN_MERGE"),
+			mt.PublicKey,
+		))
+		if err != nil {
+			return nil, errors.Wrap(err, "materialize")
+		}
+
+		// confirm this has not already been used
+		spentAddress := [64]byte{}
+		copy(spentAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(spentAddress[32:], spentMergeBI.FillBytes(make([]byte, 32)))
+		spentMergeVertex := hg.NewVertexAddMaterializedState(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+			[32]byte(spentMergeBI.FillBytes(make([]byte, 32))),
+			frameNumber,
+			nil,
+			&tries.VectorCommitmentTree{},
+		)
+
+		err = hg.Set(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			spentMergeBI.FillBytes(make([]byte, 32)),
+			hgstate.VertexAddsDiscriminator,
+			frameNumber,
+			spentMergeVertex,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "materialize")
+		}
+	}
+
 	var priorHyperedge *tries.VectorCommitmentTree
 	previousHyperedge, err := hg.Get(
 		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
@@ -540,7 +584,13 @@ func (p *ProverJoin) Prove(frameNumber uint64) error {
 }
 
 // Verify implements intrinsics.IntrinsicOperation.
-func (p *ProverJoin) Verify(frameNumber uint64) (bool, error) {
+func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			valid = false
+			err = fmt.Errorf("panic from: %v", r)
+		}
+	}()
 	// First check if prover can join (not in tree or in left state)
 	addressBI, err := poseidon.HashBytes(p.PublicKeySignatureBLS48581.PublicKey)
 	if err != nil {
@@ -551,6 +601,79 @@ func (p *ProverJoin) Verify(frameNumber uint64) (bool, error) {
 	for _, filter := range p.Filters {
 		if len(filter) < 32 {
 			return false, errors.Wrap(errors.New("invalid filter size"), "verify")
+		}
+	}
+
+	if len(p.Proof)%516 != 0 || len(p.Proof)/516 != len(p.Filters) {
+		return false, errors.Wrap(errors.New("proof size mismatch"), "verify")
+	}
+
+	// Disallow too old of a request
+	if p.FrameNumber < frameNumber-10 {
+		return false, errors.Wrap(errors.New("outdated request"), "verify")
+	}
+
+	frame, err := p.frameStore.GetGlobalClockFrame(frameNumber)
+	if err != nil {
+		return false, errors.Wrap(err, "verify")
+	}
+
+	// Prepare challenge for verification
+	challenge := sha3.Sum256(frame.Header.Output)
+	ids := [][]byte{}
+	for idx, filter := range p.Filters {
+		ids = append(ids, slices.Concat(
+			address,
+			filter,
+			binary.BigEndian.AppendUint32(nil, uint32(idx)),
+		))
+	}
+
+	solutions := [][516]byte{}
+	for i := range p.Filters {
+		solutions = append(solutions, [516]byte(p.Proof[i*516:(i+1)*516]))
+	}
+	valid, err = p.frameProver.VerifyMultiProof(
+		challenge,
+		frame.Header.Difficulty,
+		ids,
+		solutions,
+	)
+	if err != nil || !valid {
+		return false, errors.Wrap(errors.New("invalid multi proof"), "verify")
+	}
+
+	for _, mt := range p.MergeTargets {
+		valid, err := p.keyManager.ValidateSignature(
+			mt.KeyType,
+			mt.PublicKey,
+			p.PublicKeySignatureBLS48581.PublicKey,
+			mt.Signature,
+			[]byte("PROVER_JOIN_MERGE"),
+		)
+		if err != nil || !valid {
+			return false, errors.Wrap(err, "verify")
+		}
+
+		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
+			[]byte("PROVER_JOIN_MERGE"),
+			mt.PublicKey,
+		))
+		if err != nil {
+			return false, errors.Wrap(err, "verify")
+		}
+
+		// confirm this has not already been used
+		spentAddress := [64]byte{}
+		copy(spentAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(spentAddress[32:], spentMergeBI.FillBytes(make([]byte, 32)))
+
+		v, err := p.hypergraph.GetVertex(spentAddress)
+		if err == nil && v != nil {
+			return false, errors.Wrap(
+				errors.New("merge target already used"),
+				"verify",
+			)
 		}
 	}
 
@@ -609,7 +732,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (bool, error) {
 	popDomain := []byte("BLS48_POP_SK")
 
 	// Verify the signature
-	valid, err := p.keyManager.ValidateSignature(
+	valid, err = p.keyManager.ValidateSignature(
 		crypto.KeyTypeBLS48581G1,
 		p.PublicKeySignatureBLS48581.PublicKey,
 		joinMessage,

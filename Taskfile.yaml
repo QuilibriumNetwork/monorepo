@@ -70,6 +70,11 @@ tasks:
     cmds:
       - docker build --platform linux/amd64 -f Dockerfile.source --output node/build/amd64_linux --target=node .
 
+  build_conntest_amd64_linux:
+    desc: Build the Quilibrium node connection test binary for AMD64 Linux. Outputs to conntest/build.
+    cmds:
+      - docker build --platform linux/amd64 -f Dockerfile.conntest.source --output conntest/build/amd64_linux --target=conntest .
+
   build_node_amd64_avx512_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux with AVX-512 extensions. Outputs to node/build.
     cmds:

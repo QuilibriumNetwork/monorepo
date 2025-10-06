@@ -29,10 +29,18 @@ type peerConnector struct {
 	minPeers    int
 	parallelism int
 	source      PeerSource
+	warned      bool
 }
 
 // Connect implements PeerConnector.
 func (pc *peerConnector) Connect(ctx context.Context) error {
+	if pc.minPeers == 0 && !pc.warned {
+		pc.warned = true
+		pc.logger.Warn(
+			"skipped due to minpeer = 0, make sure this was intentional",
+		)
+		return nil
+	}
 	done := make(chan struct{})
 	select {
 	case <-ctx.Done():
@@ -70,7 +78,6 @@ func (pc *peerConnector) connectToPeer(
 	if p.ID == pc.host.ID() ||
 		pc.host.Network().Connectedness(p.ID) == network.Connected ||
 		pc.host.Network().Connectedness(p.ID) == network.Limited {
-		logger.Debug("peer already connected")
 		atomic.AddUint32(duplicate, 1)
 		return
 	}
@@ -79,7 +86,6 @@ func (pc *peerConnector) connectToPeer(
 
 	conn, err := pc.host.Network().DialPeer(ctx, p.ID)
 	if err != nil {
-		logger.Debug("error while connecting to dht peer", zap.Error(err))
 		atomic.AddUint32(failure, 1)
 		return
 	}
@@ -92,7 +98,6 @@ func (pc *peerConnector) connectToPeer(
 		atomic.AddUint32(failure, 1)
 		_ = conn.Close()
 	case <-pc.idService.IdentifyWait(conn):
-		logger.Debug("connected to peer")
 		atomic.AddUint32(success, 1)
 	}
 }
@@ -107,7 +112,6 @@ func (pc *peerConnector) connectToPeers(
 	defer wg.Wait()
 	for p := range ch {
 		logger := pc.logger.With(zap.String("peer_id", p.ID.String()))
-		logger.Debug("received peer")
 
 		if atomic.LoadUint32(success) >= uint32(pc.minPeers) {
 			logger.Debug("reached max findings")

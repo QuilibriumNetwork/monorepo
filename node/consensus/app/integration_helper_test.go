@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	multiaddr "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/mock"
@@ -23,8 +25,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"source.quilibrium.com/quilibrium/monorepo/bls48581"
+	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	qp2p "source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
@@ -39,14 +43,16 @@ import (
 // mockAppIntegrationPubSub extends the basic mock with app-specific features
 type mockAppIntegrationPubSub struct {
 	mock.Mock
-	mu           sync.RWMutex
-	subscribers  map[string][]func(message *pb.Message) error
-	validators   map[string]func(peerID peer.ID, message *pb.Message) p2p.ValidationResult
-	peerID       []byte
-	peerCount    int
-	networkPeers map[string]*mockAppIntegrationPubSub
-	messageLog   []messageRecord            // Track all messages for debugging
-	frames       []*protobufs.AppShardFrame // Store frames for sync
+	mu                   sync.RWMutex
+	subscribers          map[string][]func(message *pb.Message) error
+	validators           map[string]func(peerID peer.ID, message *pb.Message) p2p.ValidationResult
+	peerID               []byte
+	peerCount            int
+	networkPeers         map[string]*mockAppIntegrationPubSub
+	messageLog           []messageRecord            // Track all messages for debugging
+	frames               []*protobufs.AppShardFrame // Store frames for sync
+	underlyingHost       host.Host
+	underlyingBlossomSub *qp2p.BlossomSub
 }
 
 // GetOwnMultiaddrs implements p2p.PubSub.
@@ -151,24 +157,28 @@ type messageRecord struct {
 	data      []byte
 }
 
-func newMockAppIntegrationPubSub(peerID []byte) *mockAppIntegrationPubSub {
+func newMockAppIntegrationPubSub(config *config.Config, logger *zap.Logger, peerID []byte, host host.Host, privKey pcrypto.PrivKey, bootstrapHosts []host.Host) *mockAppIntegrationPubSub {
+	blossomSub := qp2p.NewBlossomSubWithHost(config.P2P, config.Engine, logger, 1, true, host, privKey, bootstrapHosts)
+
 	return &mockAppIntegrationPubSub{
-		subscribers:  make(map[string][]func(message *pb.Message) error),
-		validators:   make(map[string]func(peerID peer.ID, message *pb.Message) p2p.ValidationResult),
-		peerID:       peerID,
-		peerCount:    10,
-		networkPeers: make(map[string]*mockAppIntegrationPubSub),
-		messageLog:   make([]messageRecord, 0),
-		frames:       make([]*protobufs.AppShardFrame, 0),
+		subscribers:          make(map[string][]func(message *pb.Message) error),
+		validators:           make(map[string]func(peerID peer.ID, message *pb.Message) p2p.ValidationResult),
+		peerID:               peerID,
+		peerCount:            10,
+		networkPeers:         make(map[string]*mockAppIntegrationPubSub),
+		messageLog:           make([]messageRecord, 0),
+		frames:               make([]*protobufs.AppShardFrame, 0),
+		underlyingHost:       host,
+		underlyingBlossomSub: blossomSub,
 	}
 }
 
 func (m *mockAppIntegrationPubSub) Subscribe(bitmask []byte, handler func(message *pb.Message) error) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	key := string(bitmask)
 	m.subscribers[key] = append(m.subscribers[key], handler)
-	return nil
+	m.mu.Unlock()
+	return m.underlyingBlossomSub.Subscribe(bitmask, handler)
 }
 
 func (m *mockAppIntegrationPubSub) PublishToBitmask(bitmask []byte, data []byte) error {
@@ -196,74 +206,46 @@ func (m *mockAppIntegrationPubSub) PublishToBitmask(bitmask []byte, data []byte)
 	}
 	m.mu.Unlock()
 
-	message := &pb.Message{
-		Data: data,
-		From: m.peerID,
-	}
-
-	// Deliver to local subscribers
-	m.mu.RLock()
-	handlers := m.subscribers[string(bitmask)]
-	m.mu.RUnlock()
-
-	for _, handler := range handlers {
-		go handler(message)
-	}
-
-	// Deliver to network peers
-	m.mu.RLock()
-	peers := make([]*mockAppIntegrationPubSub, 0, len(m.networkPeers))
-	for _, peer := range m.networkPeers {
-		if peer != m {
-			peers = append(peers, peer)
-		}
-	}
-	m.mu.RUnlock()
-
-	for _, peer := range peers {
-		// Deliver synchronously to ensure proper ordering
-		peer.receiveFromNetwork(bitmask, message)
-	}
-
-	return nil
+	return m.underlyingBlossomSub.PublishToBitmask(bitmask, data)
 }
 
-func (m *mockAppIntegrationPubSub) receiveFromNetwork(bitmask []byte, message *pb.Message) {
-	m.mu.RLock()
-	validator := m.validators[string(bitmask)]
-	m.mu.RUnlock()
+// func (m *mockAppIntegrationPubSub) receiveFromNetwork(bitmask []byte, message *pb.Message) {
+// 	m.mu.RLock()
+// 	validator := m.validators[string(bitmask)]
+// 	m.mu.RUnlock()
 
-	if validator != nil {
-		result := validator(peer.ID(message.From), message)
-		if result != p2p.ValidationResultAccept {
-			// Log validation rejection for debugging
-			if len(message.Data) >= 4 {
-				typePrefix := binary.BigEndian.Uint32(message.Data[:4])
-				if typePrefix == protobufs.AppShardFrameType {
-					frame := &protobufs.AppShardFrame{}
-					if err := frame.FromCanonicalBytes(message.Data); err == nil && frame.Header != nil {
-						fmt.Printf("DEBUG: Node %x rejected frame %d from %x (validation result: %v)\n",
-							m.peerID[:4], frame.Header.FrameNumber, message.From[:4], result)
-					}
-				}
-			}
-			return
-		}
-	}
+// 	if validator != nil {
+// 		result := validator(peer.ID(message.From), message)
+// 		if result != p2p.ValidationResultAccept {
+// 			// Log validation rejection for debugging
+// 			if len(message.Data) >= 4 {
+// 				typePrefix := binary.BigEndian.Uint32(message.Data[:4])
+// 				if typePrefix == protobufs.AppShardFrameType {
+// 					frame := &protobufs.AppShardFrame{}
+// 					if err := frame.FromCanonicalBytes(message.Data); err == nil && frame.Header != nil {
+// 						fmt.Printf("DEBUG: Node %x rejected frame %d from %x (validation result: %v)\n",
+// 							m.peerID[:4], frame.Header.FrameNumber, message.From[:4], result)
+// 					}
+// 				}
+// 			}
+// 			return
+// 		}
+// 	}
 
-	m.mu.RLock()
-	handlers := m.subscribers[string(bitmask)]
-	m.mu.RUnlock()
+// 	m.mu.RLock()
+// 	handlers := m.subscribers[string(bitmask)]
+// 	m.mu.RUnlock()
 
-	for _, handler := range handlers {
-		go handler(message) // Make async to match PublishToBitmask behavior
-	}
-}
+// 	for _, handler := range handlers {
+// 		go handler(message) // Make async to match PublishToBitmask behavior
+// 	}
+// }
 
 func (m *mockAppIntegrationPubSub) RegisterValidator(bitmask []byte, validator func(peerID peer.ID, message *pb.Message) p2p.ValidationResult, sync bool) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.validators[string(bitmask)] = validator
+	m.mu.Unlock()
+	m.underlyingBlossomSub.RegisterValidator(bitmask, validator, sync)
 	return nil
 }
 

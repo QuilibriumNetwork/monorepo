@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -183,6 +184,21 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 	t.Log("Step 2: Creating chaos test nodes with engine using factory")
 
+	_, m, cleanup := tests.GenerateSimnetHosts(t, numNodes, []libp2p.Option{})
+	defer cleanup()
+
+	p2pcfg := config.P2PConfig{}.WithDefaults()
+	p2pcfg.Network = 1
+	p2pcfg.StreamListenMultiaddr = "/ip4/0.0.0.0/tcp/0"
+	p2pcfg.MinBootstrapPeers = numNodes - 1
+	p2pcfg.DiscoveryPeerLookupLimit = numNodes - 1
+	c := &config.Config{
+		Engine: &config.EngineConfig{
+			Difficulty:   80000,
+			ProvingKeyId: "q-prover-key",
+		},
+		P2P: &p2pcfg,
+	}
 	// Helper to create node using factory
 	createAppNodeWithFactory := func(nodeIdx int, appAddress []byte, proverRegistry tconsensus.ProverRegistry, proverKey []byte, keyManager tkeys.KeyManager) (*AppConsensusEngine, *mockAppIntegrationPubSub, *consensustime.GlobalTimeReel, func()) {
 		cfg := zap.NewDevelopmentConfig()
@@ -204,7 +220,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{})
 
 		// Create mock pubsub for network simulation
-		pubsub := newMockAppIntegrationPubSub([]byte(fmt.Sprintf("node-%d", nodeIdx)))
+		pubsub := newMockAppIntegrationPubSub(c, logger, []byte(m.Nodes[nodeIdx].ID()), m.Nodes[nodeIdx], m.Keys[nodeIdx], m.Nodes)
 
 		// Aside from pubsub, the rest should be concrete instances
 		conf := &config.Config{
@@ -213,7 +229,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 				ProvingKeyId: "q-prover-key",
 			},
 			P2P: &config.P2PConfig{
-				Network:               99,
+				Network:               1,
 				StreamListenMultiaddr: "/ip4/0.0.0.0/tcp/0",
 			},
 		}

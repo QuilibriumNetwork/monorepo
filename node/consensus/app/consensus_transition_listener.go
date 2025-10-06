@@ -9,7 +9,9 @@ type AppTracer struct {
 	logger *zap.Logger
 }
 
-func (t *AppTracer) Trace(message string) {}
+func (t *AppTracer) Trace(message string) {
+	t.logger.Debug(message)
+}
 
 func (t *AppTracer) Error(message string, err error) {
 	t.logger.Error(message, zap.Error(err))

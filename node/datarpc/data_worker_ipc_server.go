@@ -24,6 +24,7 @@ import (
 
 type DataWorkerIPCServer struct {
 	protobufs.UnimplementedDataIPCServiceServer
+
 	listenAddrGRPC            string
 	config                    *config.Config
 	logger                    *zap.Logger
@@ -37,6 +38,7 @@ type DataWorkerIPCServer struct {
 	appConsensusEngineFactory *app.AppConsensusEngineFactory
 	appConsensusEngine        *app.AppConsensusEngine
 	server                    *grpc.Server
+	frameProver               crypto.FrameProver
 	quit                      chan struct{}
 }
 
@@ -46,6 +48,7 @@ func NewDataWorkerIPCServer(
 	signerRegistry consensus.SignerRegistry,
 	proverRegistry consensus.ProverRegistry,
 	peerInfoManager p2p.PeerInfoManager,
+	frameProver crypto.FrameProver,
 	appConsensusEngineFactory *app.AppConsensusEngineFactory,
 	logger *zap.Logger,
 	coreId uint32,
@@ -86,6 +89,7 @@ func NewDataWorkerIPCServer(
 		appConsensusEngineFactory: appConsensusEngineFactory,
 		signerRegistry:            signerRegistry,
 		proverRegistry:            proverRegistry,
+		frameProver:               frameProver,
 		peerInfoManager:           peerInfoManager,
 	}, nil
 }
@@ -139,6 +143,7 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 		nil,
 		map[string]channel.AllowedPeerPolicyType{
 			"quilibrium.node.application.pb.HypergraphComparisonService": channel.AnyProverPeer,
+			"quilibrium.node.node.pb.DataIPCService":                     channel.OnlySelfPeer,
 			"quilibrium.node.global.pb.GlobalService":                    channel.OnlyGlobalProverPeer,
 			"quilibrium.node.global.pb.AppShardService":                  channel.OnlyShardProverPeer,
 			"quilibrium.node.global.pb.OnionService":                     channel.AnyPeer,
@@ -205,4 +210,21 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 	}()
 
 	return nil
+}
+
+// CreateJoinProof implements protobufs.DataIPCServiceServer.
+func (r *DataWorkerIPCServer) CreateJoinProof(
+	ctx context.Context,
+	req *protobufs.CreateJoinProofRequest,
+) (*protobufs.CreateJoinProofResponse, error) {
+	proof := r.frameProver.CalculateMultiProof(
+		[32]byte(req.Challenge),
+		req.Difficulty,
+		req.Ids,
+		req.ProverIndex,
+	)
+
+	return &protobufs.CreateJoinProofResponse{
+		Response: proof[:],
+	}, nil
 }

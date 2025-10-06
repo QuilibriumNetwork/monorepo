@@ -44,6 +44,7 @@ type ExecutionEngineManager struct {
 	verEnc            crypto.VerifiableEncryptor
 	decafConstructor  crypto.DecafConstructor
 	compiler          compiler.CircuitCompiler
+	frameProver       crypto.FrameProver
 	includeGlobal     bool
 	quit              chan struct{}
 	wg                sync.WaitGroup
@@ -62,6 +63,7 @@ func NewExecutionEngineManager(
 	verEnc crypto.VerifiableEncryptor,
 	decafConstructor crypto.DecafConstructor,
 	compiler compiler.CircuitCompiler,
+	frameProver crypto.FrameProver,
 	includeGlobal bool,
 ) (*ExecutionEngineManager, error) {
 	return &ExecutionEngineManager{
@@ -79,6 +81,7 @@ func NewExecutionEngineManager(
 		verEnc:            verEnc,
 		decafConstructor:  decafConstructor,
 		compiler:          compiler,
+		frameProver:       frameProver,
 		includeGlobal:     includeGlobal,
 		quit:              make(chan struct{}),
 	}, nil
@@ -101,6 +104,7 @@ func (m *ExecutionEngineManager) InitializeEngines() error {
 		m.verEnc,
 		m.decafConstructor,
 		m.compiler,
+		m.frameProver,
 		m.includeGlobal,
 	)
 	if err != nil {
