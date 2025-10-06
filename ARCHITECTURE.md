@@ -4,7 +4,7 @@
 
 Quilibrium is a distributed protocol that leverages advanced cryptographic
 techniques including multi-party computation (MPC) for privacy-preserving
-compute. The system operates on a sharded network architecture where the main
+compute. The system operates on a sharded network architecture where the master
 process runs global consensus while data worker processes run app-level
 consensus for their assigned shards, each maintaining their own hypergraph
 state, storage, and networking stack.
@@ -25,7 +25,7 @@ state, storage, and networking stack.
 └───────────────────────────────┬─────────────────────────────────┘
                                 │
 ┌───────────────────────────────┴─────────────────────────────────┐
-│                     Main Node Process (Core 0)                  │
+│                       Master Process (Core 0)                   │
 │   ┌──────────────┐  ┌─────────────┐  ┌─────────────────────┐    │
 │   │    Global    │  │   Global    │  │    P2P Network      │    │
 │   │  Consensus   │  │  Execution  │  │   (BlossomSub)      │    │
@@ -62,7 +62,7 @@ multi-process architecture where each process has its own complete stack.
 
 **Process Types:**
 
-##### Main Process (Core 0)
+##### Master Process (Core 0)
 Runs the global consensus and coordination:
 - **Global Consensus Engine**: System-wide consensus and coordination
 - **Global Execution Engine**: System-level operations
@@ -81,7 +81,7 @@ Each worker manages specific shards:
 - **Shard Hypergraph State**: Shard-specific state management
 
 **Application Layer** (`app/`):
-- `Node`: Main node implementation (runs in main process)
+- `Node`: Main node implementation (runs in master process)
 - `DataWorkerNode`: Worker node implementation (runs in worker processes)
 
 **Key Subsystems:**
@@ -90,7 +90,7 @@ Each worker manages specific shards:
 
 Two distinct consensus implementations:
 
-**Global Consensus** (`node/global/`) - Main Process:
+**Global Consensus** (`node/global/`) - Master Process:
 - System-wide coordination
 - Cross-shard transaction ordering
 - Global state transitions
@@ -113,7 +113,7 @@ Two distinct consensus implementations:
 
 Distribution across processes:
 
-**Global Execution Engine** - Main Process:
+**Global Execution Engine** - Master Process:
 - System-wide operations
 - Cross-shard coordination
 - Global state updates
@@ -125,14 +125,14 @@ Distribution across processes:
 
 ##### P2P Networking (`node/p2p/`)
 
-Each process (main and workers) has its own complete P2P stack:
+Each process (master and workers) has its own complete P2P stack:
 - **BlossomSub**: Custom pub/sub protocol
 - **Peer Management**: Discovery and connections
 - **Public Channels**: Point to point authenticated message routing
 - **Private Channels**: Onion-routing authenticated message channels
 - **DHT Integration**: Distributed peer discovery
 
-Main process handles global bitmask, workers handle shard-specific bitmasks.
+Master process handles global bitmask, workers handle shard-specific bitmasks.
 
 ##### Storage Layer (`node/store/`)
 
@@ -148,7 +148,7 @@ Storage is partitioned by process responsibility (global vs shard).
 ##### Hypergraph (`hypergraph/`)
 
 Distributed graph structure:
-- **Global Hypergraph**: Maintained by main process
+- **Global Hypergraph**: Maintained by master process
 - **Shard Hypergraphs**: Maintained by respective workers
 - **CRDT Semantics**: Conflict-free updates
 - **Components**:
@@ -293,7 +293,7 @@ Benefits:
 #### 2. Sharded State Management
 
 State is partitioned across processes:
-- Main process: Global state and coordination
+- Master process: Global state and coordination
 - Worker processes: Shard-specific state
 - CRDT hypergraph for convergence
 
@@ -355,7 +355,7 @@ Inter-process communication design:
 ### System Boundaries
 
 #### Process Boundaries
-- Main process: Global operations
+- Master process: Global operations
 - Worker processes: Shard operations
 - Clear IPC interfaces between processes
 
@@ -365,7 +365,7 @@ Inter-process communication design:
 - Well-defined interaction protocols
 
 #### State Boundaries
-- Global state in main process
+- Global state in master process
 - Shard state in worker processes
 - CRDT merge protocols for synchronization
 
@@ -444,19 +444,19 @@ Inter-process communication design:
 
 **Q: How does the multi-process architecture work?**
 - Process spawning: `node/main.go` (see `spawnDataWorkers` function)
-- Main process runs on core 0, spawns workers for cores 1+ using `exec.Command`
+- Master process runs on core 0, spawns workers for cores 1+ using `exec.Command`
 - Each worker receives `--core` parameter to identify its role
 
 **Q: How do I run the node?**
 - Build: `./node/build.sh` (creates static binary)
-- Run: `./node/node` (starts main process which spawns workers)
+- Run: `./node/node` (starts master process which spawns workers)
 - Configuration: `config.yml` or environment variables
 
 ### Architecture & Design
 
 **Q: How do processes communicate (IPC)?**
 - Uses IPC over private pubsub topics for structured message passing
-- Main process acts as coordinator, workers connect via IPC
+- Master process acts as coordinator, workers connect via IPC
 
 **Q: Where is consensus implemented?**
 - App Consensus (workers): `node/consensus/app/app_consensus_engine.go`
@@ -479,7 +479,7 @@ Inter-process communication design:
 - Each process has independent P2P stack
 
 **Q: How does cross-shard communication work?**
-- Through main process coordination via P2P
+- Through master process coordination via P2P
 - Topic-based routing in BlossomSub
 - Shard-aware peer connections
 - Majority of cross-shard communication requires only proof data, keeping shards
@@ -543,7 +543,7 @@ Inter-process communication design:
 - Docker: Multiple Dockerfiles for different scenarios
 
 **Q: What happens when a worker crashes?**
-- Main process monitors worker processes
+- Master process monitors worker processes
 - Automatic restart logic in `spawnDataWorkers`
 - Process isolation prevents cascade failures
 
@@ -572,5 +572,5 @@ Inter-process communication design:
 1. BlossomSub receives message
 2. Topic routing to appropriate handler
 3. Shard-specific messages to workers
-4. Global messages to main process
+4. Global messages to master process
 
