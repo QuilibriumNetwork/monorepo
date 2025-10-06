@@ -99,7 +99,7 @@ type BlankHostOpts struct {
 }
 
 func newBlankHost(opts BlankHostOpts) (*wrappedHost, error) {
-	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	priv, _, err := crypto.GenerateEd448Key(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
@@ -185,9 +185,9 @@ func newBlankHost(opts BlankHostOpts) (*wrappedHost, error) {
 	}, nil
 }
 
-type NodeLinkSettingsAndCount struct {
+type NodeLinkSettingsAndIndex struct {
 	LinkSettings simnet.NodeBiDiLinkSettings
-	Count        int
+	Idx          int
 }
 
 type HostAndIdx struct {
@@ -197,6 +197,7 @@ type HostAndIdx struct {
 
 type SimpleLibp2pNetworkMeta struct {
 	Nodes      []host.Host
+	Keys       []crypto.PrivKey
 	AddrToNode map[string]HostAndIdx
 }
 
@@ -204,55 +205,63 @@ type NetworkSettings struct {
 	UseBlankHost            bool
 	QUICReuseOptsForHostIdx func(idx int) []quicreuse.Option
 	BlankHostOptsForHostIdx func(idx int) BlankHostOpts
+	OptsForHostIdx          func(idx int) []libp2p.Option
 }
 
-func SimpleLibp2pNetwork(linkSettings []NodeLinkSettingsAndCount, networkSettings NetworkSettings) (*simnet.Simnet, *SimpleLibp2pNetworkMeta, error) {
+func SimpleLibp2pNetwork(linkSettings []NodeLinkSettingsAndIndex, networkSettings NetworkSettings) (*simnet.Simnet, *SimpleLibp2pNetworkMeta, error) {
 	nw := &simnet.Simnet{}
 	meta := &SimpleLibp2pNetworkMeta{
 		AddrToNode: make(map[string]HostAndIdx),
 	}
 
 	for _, l := range linkSettings {
-		for i := 0; i < l.Count; i++ {
-			idx := len(meta.Nodes)
-			ip := simnet.IntToPublicIPv4(idx)
-			addr := fmt.Sprintf("/ip4/%s/udp/8000/quic-v1", ip)
-			var h host.Host
-			var err error
-			var quicReuseOpts []quicreuse.Option
-			if networkSettings.QUICReuseOptsForHostIdx != nil {
-				quicReuseOpts = networkSettings.QUICReuseOptsForHostIdx(idx)
-			}
-			if networkSettings.UseBlankHost {
-				var opts BlankHostOpts
-				if networkSettings.BlankHostOptsForHostIdx != nil {
-					opts = networkSettings.BlankHostOptsForHostIdx(idx)
-				}
-
-				a, _ := multiaddr.StringCast(addr)
-				h, err = newBlankHost(BlankHostOpts{
-					listenMultiaddr: a,
-					simnet:          nw,
-					linkSettings:    l.LinkSettings,
-					quicReuseOpts:   quicReuseOpts,
-					ConnMgr:         opts.ConnMgr,
-				})
-			} else {
-				h, err = libp2p.New(
-					libp2p.ListenAddrStrings(addr),
-					QUICSimnet(nw, l.LinkSettings, quicReuseOpts...),
-					// TODO: Currently using identify address discovery stalls
-					// synctest
-					libp2p.DisableIdentifyAddressDiscovery(),
-					libp2p.ResourceManager(&network.NullResourceManager{}),
-				)
-			}
-			if err != nil {
-				return nil, nil, err
-			}
-			meta.Nodes = append(meta.Nodes, h)
-			meta.AddrToNode[addr] = HostAndIdx{Host: h, Idx: idx}
+		idx := l.Idx
+		ip := simnet.IntToPublicIPv4(idx)
+		addr := fmt.Sprintf("/ip4/%s/udp/8000/quic-v1", ip)
+		var h host.Host
+		var err error
+		var quicReuseOpts []quicreuse.Option
+		if networkSettings.QUICReuseOptsForHostIdx != nil {
+			quicReuseOpts = networkSettings.QUICReuseOptsForHostIdx(idx)
 		}
+		privkey, _, err := crypto.GenerateEd448Key(rand.Reader)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if networkSettings.UseBlankHost {
+			var opts BlankHostOpts
+			if networkSettings.BlankHostOptsForHostIdx != nil {
+				opts = networkSettings.BlankHostOptsForHostIdx(idx)
+			}
+
+			a, _ := multiaddr.StringCast(addr)
+			h, err = newBlankHost(BlankHostOpts{
+				listenMultiaddr: a,
+				simnet:          nw,
+				linkSettings:    l.LinkSettings,
+				quicReuseOpts:   quicReuseOpts,
+				ConnMgr:         opts.ConnMgr,
+			})
+		} else {
+			h, err = libp2p.New(
+				append(
+					[]libp2p.Option{
+						libp2p.ListenAddrStrings(addr),
+						QUICSimnet(nw, l.LinkSettings, quicReuseOpts...),
+						libp2p.ResourceManager(&network.NullResourceManager{}),
+						libp2p.Identity(privkey),
+					},
+					networkSettings.OptsForHostIdx(idx)...,
+				)...,
+			)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		meta.Keys = append(meta.Keys, privkey)
+		meta.Nodes = append(meta.Nodes, h)
+		meta.AddrToNode[addr] = HostAndIdx{Host: h, Idx: idx}
 	}
 
 	return nw, meta, nil
