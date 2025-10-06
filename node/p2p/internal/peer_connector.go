@@ -20,6 +20,8 @@ type PeerConnector interface {
 	Connect(context.Context) error
 }
 
+// TODO(2.1.1+): metrics only, no debug logging unless configurable logging, too
+// noisy
 type peerConnector struct {
 	ctx         context.Context
 	logger      *zap.Logger
@@ -94,7 +96,6 @@ func (pc *peerConnector) connectToPeer(
 	case <-ctx.Done():
 		return
 	case <-time.After(identify.DefaultTimeout / 2):
-		logger.Debug("identifying peer timed out")
 		atomic.AddUint32(failure, 1)
 		_ = conn.Close()
 	case <-pc.idService.IdentifyWait(conn):
@@ -114,7 +115,6 @@ func (pc *peerConnector) connectToPeers(
 		logger := pc.logger.With(zap.String("peer_id", p.ID.String()))
 
 		if atomic.LoadUint32(success) >= uint32(pc.minPeers) {
-			logger.Debug("reached max findings")
 			return
 		}
 
@@ -140,16 +140,7 @@ func (pc *peerConnector) connectToPeers(
 func (pc *peerConnector) connect() {
 	logger := pc.logger
 
-	logger.Debug("initiating peer connections")
 	var success, failure, duplicate uint32
-	defer func() {
-		logger.Debug(
-			"completed peer connections",
-			zap.Uint32("success", success),
-			zap.Uint32("failure", failure),
-			zap.Uint32("duplicate", duplicate),
-		)
-	}()
 	ctx, cancel := context.WithCancel(pc.ctx)
 	defer cancel()
 
