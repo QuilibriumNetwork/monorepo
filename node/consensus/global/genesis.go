@@ -22,6 +22,7 @@ import (
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
@@ -239,6 +240,38 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 	} else {
 		// For non-mainnet, use stub genesis
 		genesisFrame = e.createStubGenesis()
+		txn, err := e.clockStore.NewTransaction(false)
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			return nil
+		}
+
+		l1 := up2p.GetBloomFilterIndices(token.QUIL_TOKEN_ADDRESS, 256, 3)
+
+		err = e.shardsStore.PutAppShard(txn, store.ShardInfo{
+			L1:   l1,
+			L2:   token.QUIL_TOKEN_ADDRESS,
+			Path: []uint32{},
+		})
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil
+		}
+		if err = txn.Commit(); err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil
+		}
 	}
 
 	// Compute frame ID and store the full frame
@@ -277,8 +310,14 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 		Output:               make([]byte, 516),
 	}
 
+	// Initialize all commitments with empty values first
 	for i := range 256 {
 		genesisHeader.GlobalCommitments[i] = make([]byte, 64)
+	}
+
+	commitments := make([]*tries.VectorCommitmentTree, 256)
+	for i := range 256 {
+		commitments[i] = &tries.VectorCommitmentTree{}
 	}
 
 	var proverPubKeys [][]byte
@@ -307,11 +346,91 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 		proverPubKeys = [][]byte{proverKey.Public().([]byte)}
 	}
 
+	state := hgstate.NewHypergraphState(e.hypergraph)
+
 	rdfMultiprover := schema.NewRDFMultiprover(
 		&schema.TurtleRDFParser{},
 		e.inclusionProver,
 	)
-	state := hgstate.NewHypergraphState(e.hypergraph)
+
+	for _, prover := range proverPubKeys {
+		addrbi, err := poseidon.HashBytes(prover)
+		if err != nil {
+			panic(err)
+		}
+
+		// Create ProverReward entry in QUIL token address with 10000 balance
+		rewardTree := &tries.VectorCommitmentTree{}
+
+		err = rdfMultiprover.Set(
+			globalintrinsics.GLOBAL_RDF_SCHEMA,
+			token.QUIL_TOKEN_ADDRESS,
+			"reward:ProverReward",
+			"DelegateAddress",
+			addrbi.FillBytes(make([]byte, 32)),
+			rewardTree,
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		// Set 10000 balance
+		balance := make([]byte, 32)
+		balanceBI := big.NewInt(10000 * 8000000000)
+		balance = balanceBI.FillBytes(balance)
+		err = rdfMultiprover.Set(
+			globalintrinsics.GLOBAL_RDF_SCHEMA,
+			token.QUIL_TOKEN_ADDRESS,
+			"reward:ProverReward",
+			"Balance",
+			balance,
+			rewardTree,
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		// Create reward vertex in QUIL token address
+		rewardVertex := state.NewVertexAddMaterializedState(
+			[32]byte(token.QUIL_TOKEN_ADDRESS),
+			[32]byte(addrbi.FillBytes(make([]byte, 32))),
+			0,
+			nil,
+			rewardTree,
+		)
+
+		err = state.Set(
+			token.QUIL_TOKEN_ADDRESS,
+			addrbi.FillBytes(make([]byte, 32)),
+			hgstate.VertexAddsDiscriminator,
+			0,
+			rewardVertex,
+		)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	if err := state.Commit(); err != nil {
+		e.logger.Error("failed to commit", zap.Error(err))
+		return nil
+	}
+
+	roots := e.hypergraph.Commit()
+
+	// Parse and set initial commitments from JSON
+	for shardKey, commits := range roots {
+		for i := 0; i < 3; i++ {
+			commitments[shardKey.L1[i]].Insert(
+				shardKey.L2[:],
+				commits[0],
+				nil,
+				big.NewInt(int64(len(commits[0]))),
+			)
+			commitments[shardKey.L1[i]].Commit(e.inclusionProver, false)
+		}
+	}
+	state = hgstate.NewHypergraphState(e.hypergraph)
 
 	for _, pubkey := range proverPubKeys {
 		err = e.addGenesisProver(rdfMultiprover, state, pubkey, 0, 0)
@@ -327,7 +446,7 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 		return nil
 	}
 
-	roots := e.hypergraph.Commit()
+	roots = e.hypergraph.Commit()
 	proverRoots := roots[tries.ShardKey{
 		L1: [3]byte{},
 		L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
@@ -336,6 +455,13 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 	proverRoot := proverRoots[0]
 
 	genesisHeader.ProverTreeCommitment = proverRoot
+
+	for i := 0; i < 256; i++ {
+		genesisHeader.GlobalCommitments[i] = commitments[i].Commit(
+			e.inclusionProver,
+			false,
+		)
+	}
 
 	// Establish an empty signature payload – this avoids panics on broken
 	// header readers
@@ -668,7 +794,7 @@ func (e *GlobalConsensusEngine) addGenesisProver(
 
 	// Store last active frame number
 	lastActiveFrameNumberBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(lastActiveFrameNumberBytes, 244200)
+	binary.BigEndian.PutUint64(lastActiveFrameNumberBytes, frameNumber)
 	err = rdfMultiprover.Set(
 		globalintrinsics.GLOBAL_RDF_SCHEMA,
 		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
