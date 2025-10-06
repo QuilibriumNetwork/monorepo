@@ -439,12 +439,13 @@ Inter-process communication design:
 
 **Q: Where is the main entry point?**
 - Main entry: `node/main.go`
-- The `main()` function handles initialization, spawns worker processes, and
-    manages the lifecycle
+- The `main()` function handles initialization, and manages the lifecycle
 
 **Q: How does the multi-process architecture work?**
-- Process spawning: `node/main.go` (see `spawnDataWorkers` function)
-- Master process runs on core 0, spawns workers for cores 1+ using `exec.Command`
+- Process spawning: `node/worker/manager.go` (see `spawnDataWorkers` function)
+- Master process runs on core 0, creates and starts Global Consensus Engine with
+embedded Worker Manager
+- Upon start, Worker Manager spawns workers for cores 1+ using `exec.Command`
 - Each worker receives `--core` parameter to identify its role
 
 **Q: How do I run the node?**
