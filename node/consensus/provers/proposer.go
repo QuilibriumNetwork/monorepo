@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"sort"
+	"sync"
 
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
@@ -64,6 +65,9 @@ type Manager struct {
 	// Static issuance parameters for planning
 	Units    uint64
 	Strategy Strategy
+
+	mu         sync.Mutex
+	isPlanning bool
 }
 
 // NewManager wires up a planning manager
@@ -93,6 +97,22 @@ func (m *Manager) PlanAndAllocate(
 	shards []ShardDescriptor,
 	maxAllocations int,
 ) ([]Proposal, error) {
+	m.mu.Lock()
+	isPlanning := m.isPlanning
+	m.mu.Unlock()
+	if isPlanning {
+		m.logger.Debug("planning already in progress")
+		return []Proposal{}, nil
+	}
+	m.mu.Lock()
+	m.isPlanning = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.isPlanning = false
+		m.mu.Unlock()
+	}()
+
 	if len(shards) == 0 {
 		m.logger.Debug("no shards to allocate")
 		return nil, nil
@@ -152,18 +172,16 @@ func (m *Manager) PlanAndAllocate(
 			score = big.NewInt(int64(s.Size))
 		default:
 			// factor = (stateSize / worldBytes)
-			factor := big.NewInt(int64(s.Size))
-			factor.Quo(
-				factor,
-				worldBytes,
-			)
+			factor := decimal.NewFromUint64(s.Size)
+			factor = factor.Mul(decimal.NewFromBigInt(basis, 0))
+			factor = factor.Div(decimal.NewFromBigInt(worldBytes, 0))
 
 			// ring divisor = 2^Ring
 			divisor := int64(1)
 			for j := uint8(0); j < s.Ring+1; j++ {
 				divisor <<= 1
 			}
-			ringDiv := big.NewInt(divisor)
+			ringDiv := decimal.NewFromInt(divisor)
 
 			// shard factor = sqrt(Shards)
 			shardsSqrt, err := decimal.NewFromUint64(s.Shards).PowWithPrecision(
@@ -177,9 +195,19 @@ func (m *Manager) PlanAndAllocate(
 				return nil, errors.New("plan and allocate")
 			}
 
-			score := basis.Mul(basis, factor)
-			score.Quo(score, ringDiv)
-			score.Quo(score, shardsSqrt.BigInt())
+			m.logger.Debug(
+				"calculating score",
+				zap.Int("index", i),
+				zap.String("basis", basis.String()),
+				zap.String("size", big.NewInt(int64(s.Size)).String()),
+				zap.String("worldBytes", worldBytes.String()),
+				zap.String("factor", factor.String()),
+				zap.String("divisor", ringDiv.String()),
+				zap.String("shardsSqrt", shardsSqrt.String()),
+			)
+			factor = factor.Div(ringDiv)
+			factor = factor.Div(shardsSqrt)
+			score = factor.BigInt()
 		}
 
 		m.logger.Debug(
@@ -215,6 +243,13 @@ func (m *Manager) PlanAndAllocate(
 	if limit > len(scores) {
 		limit = len(scores)
 	}
+	m.logger.Debug(
+		"deciding on scored proposals",
+		zap.Int("free_workers", len(free)),
+		zap.Int("max_allocations", maxAllocations),
+		zap.Int("scores", len(scores)),
+		zap.Int("limit", limit),
+	)
 
 	proposals := make([]Proposal, 0, limit)
 
@@ -241,13 +276,14 @@ func (m *Manager) PlanAndAllocate(
 	}
 
 	// Perform allocations
-	out := make([]Proposal, 0, len(proposals))
 	workerIds := []uint{}
 	filters := [][]byte{}
 	for _, p := range proposals {
 		workerIds = append(workerIds, p.WorkerId)
 		filters = append(filters, p.Filter)
 	}
+
+	m.logger.Debug("proposals collated", zap.Int("count", len(proposals)))
 
 	err = m.workerMgr.ProposeAllocations(workerIds, filters)
 	if err != nil {
@@ -256,5 +292,5 @@ func (m *Manager) PlanAndAllocate(
 		)
 	}
 
-	return out, nil
+	return proposals, errors.Wrap(err, "plan and allocate")
 }
