@@ -2077,10 +2077,11 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 
 	challenge := sha3.Sum256(frame.Header.Output)
 
-	results := make([][516]byte, len(serviceClients))
+	joins := min(len(serviceClients), len(filters))
+	results := make([][516]byte, joins)
 	idx := uint32(0)
 	ids := [][]byte{}
-	for range len(serviceClients) {
+	for range joins {
 		ids = append(
 			ids,
 			slices.Concat(
@@ -2095,11 +2096,15 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 	idx = 0
 
 	wg := errgroup.Group{}
-	wg.SetLimit(len(serviceClients))
+	wg.SetLimit(joins)
 
 	for _, svc := range serviceClients {
 		svc := svc
 		i := idx
+		// limit to available joins
+		if i == uint32(joins) {
+			break
+		}
 		wg.Go(func() error {
 			client := protobufs.NewDataIPCServiceClient(svc)
 			resp, err := client.CreateJoinProof(
@@ -2148,6 +2153,10 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		return errors.Wrap(err, "propose worker join")
 	}
 
+	for _, res := range results {
+		join.Proof = append(join.Proof, res[:]...)
+	}
+
 	bundle := &protobufs.MessageBundle{
 		Requests: []*protobufs.MessageRequest{
 			{
@@ -2156,6 +2165,7 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 				},
 			},
 		},
+		Timestamp: time.Now().UnixMilli(),
 	}
 
 	msg, err := bundle.ToCanonicalBytes()
