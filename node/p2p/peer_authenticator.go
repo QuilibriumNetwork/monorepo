@@ -155,12 +155,14 @@ func (p *PeerAuthenticator) CreateServerTLSCredentials() (
 			verifiedChains [][]*x509.Certificate,
 		) error {
 			if len(rawCerts) == 0 {
+				p.logger.Debug("no peer certificate provided")
 				return errors.New("no peer certificate provided")
 			}
 
 			// Parse the peer certificate
 			peerCert, err := x509.ParseCertificate(rawCerts[0])
 			if err != nil {
+				p.logger.Debug("could not parse peer certificate")
 				return errors.Wrap(err, "failed to parse peer certificate")
 			}
 
@@ -168,15 +170,18 @@ func (p *PeerAuthenticator) CreateServerTLSCredentials() (
 			// from the same Ed448 seed by checking if the xsign matches
 			peerEd25519PubKey, ok := peerCert.PublicKey.(ed25519.PublicKey)
 			if !ok {
+				p.logger.Debug("peer certificate has invalid key type")
 				return errors.New("peer certificate does not use Ed25519 key")
 			}
 
 			if len(peerCert.DNSNames) != 1 {
+				p.logger.Debug("dns mismatch")
 				return errors.New("peer certificate dns mismatch")
 			}
 
 			xsign, err := hex.DecodeString(peerCert.DNSNames[0])
 			if err != nil {
+				p.logger.Debug("failed ot parse xsign")
 				return errors.Wrap(err, "failed to parse xsign")
 			}
 
@@ -187,18 +192,23 @@ func (p *PeerAuthenticator) CreateServerTLSCredentials() (
 				"",
 			)
 			if !valid {
+				p.logger.Debug("peer certificate invalid xsign")
 				return errors.New("peer certificate invalid xsign")
 			}
 
 			pubkey, err := crypto.UnmarshalEd448PublicKey(xsign[:57])
 			if err != nil {
+				p.logger.Debug("could not obtain ed448 pubkey")
 				return err
 			}
 
 			_, err = ppeer.IDFromPublicKey(pubkey)
 			if err != nil {
+				p.logger.Debug("could not derive peer id")
 				return err
 			}
+
+			p.logger.Debug("certificate check succeeded")
 
 			return nil
 		},
