@@ -100,7 +100,7 @@ func (r *ProverRegistry) ProcessStateTransition(
 	r.currentFrame = frameNumber
 
 	changes := state.Changeset()
-	r.logger.Debug("processing changeset", zap.Int("changeCount", len(changes)))
+	r.logger.Debug("processing changeset", zap.Int("change_count", len(changes)))
 
 	// Process each change
 	for _, change := range changes {
