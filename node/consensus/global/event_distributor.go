@@ -30,7 +30,9 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 			if e.cancel != nil {
 				e.cancel()
 			}
-			e.quit <- struct{}{}
+			go func() {
+				e.Stop(false)
+			}()
 		}
 	}()
 	defer e.wg.Done()
@@ -358,7 +360,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 ) {
 	info, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
 	var effectiveSeniority uint64
-	if err != nil {
+	if err != nil || info == nil {
 		effectiveSeniority = e.estimateSeniorityFromConfig()
 	} else {
 		effectiveSeniority = info.Seniority
@@ -393,7 +395,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				bp = append(bp, byte(p))
 			}
 
-			filter := slices.Concat(key.L1[:], key.L2[:], bp)
+			filter := slices.Concat(key.L2[:], bp)
 			info, err := e.proverRegistry.GetProvers(filter)
 			if err != nil {
 				e.logger.Error("failed to get provers", zap.Error(err))
@@ -413,13 +415,25 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				continue
 			}
 
+			e.logger.Debug(
+				"checking descriptor for eligibility",
+				zap.String("shard_key", hex.EncodeToString(filter)),
+			)
 			if len(resp.PathSegments) == 0 {
+				e.logger.Debug("no path segments")
 				continue
 			}
 
 			if len(
 				resp.PathSegments[len(resp.PathSegments)-1].Segments,
 			) != 1 {
+				e.logger.Debug(
+					"path segment length mismatch",
+					zap.Int(
+						"length",
+						len(resp.PathSegments[len(resp.PathSegments)-1].Segments),
+					),
+				)
 				continue
 			}
 
@@ -430,6 +444,11 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				shardCount = 1
 			}
 
+			e.logger.Debug(
+				"logical shard count",
+				zap.Int("shard_count", int(shardCount)),
+			)
+
 			above := []*typesconsensus.ProverInfo{}
 			for _, i := range info {
 				if i.Seniority >= effectiveSeniority {
@@ -437,6 +456,13 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				}
 			}
 
+			e.logger.Debug(
+				"appending descriptor for allocation planning",
+				zap.String("shard_key", hex.EncodeToString(filter)),
+				zap.Uint64("size", size.Uint64()),
+				zap.Int("ring", len(above)/8),
+				zap.Int("shard_count", int(shardCount)),
+			)
 			shardDescriptors = append(
 				shardDescriptors,
 				provers.ShardDescriptor{

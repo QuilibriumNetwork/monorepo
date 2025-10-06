@@ -486,7 +486,7 @@ func main() {
 	// Start the master node
 	quitCh := make(chan struct{})
 	go func() {
-		if err := masterNode.Start(); err != nil {
+		if err := masterNode.Start(quitCh); err != nil {
 			logger.Error("master node start error", zap.Error(err))
 			close(quitCh)
 		}

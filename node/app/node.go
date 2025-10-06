@@ -79,9 +79,10 @@ func (d *DHTNode) Stop() {
 	}()
 }
 
-func (m *MasterNode) Start() error {
+func (m *MasterNode) Start(quitCh chan struct{}) error {
 	// Start the global consensus engine
-	errChan := m.globalConsensus.Start(m.quit)
+	m.quit = quitCh
+	errChan := m.globalConsensus.Start(quitCh)
 	select {
 	case err := <-errChan:
 		if err != nil {
