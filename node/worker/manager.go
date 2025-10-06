@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -553,6 +554,10 @@ func (w *WorkerManager) getMultiaddrOfWorker(coreId uint) (
 		rpcMultiaddr = w.config.Engine.DataWorkerStreamMultiaddrs[coreId-1]
 	}
 
+	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/0.0.0.0/", "/127.0.0.1/", 1)
+	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/0:0:0:0:0:0:0:0/", "/::1/", 1)
+	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/::/", "/::1/", 1)
+
 	ma, err := multiaddr.StringCast(rpcMultiaddr)
 	return ma, errors.Wrap(err, "get multiaddr of worker")
 }
@@ -651,6 +656,7 @@ func (w *WorkerManager) getIPCOfWorker(coreId uint) (
 			grpc.WithTransportCredentials(creds),
 		)
 		if err != nil {
+
 			return nil, errors.Wrap(err, "get ipc of worker")
 		}
 
