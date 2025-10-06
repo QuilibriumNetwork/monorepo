@@ -338,27 +338,35 @@ func (g *GlobalTimeReel) Insert(
 
 	if parentNode == nil {
 		if !g.archiveMode {
-			// In non-archive mode, check if we should accept this frame based on
-			// frame number proximity to our current head
 			if g.head != nil {
-				// Check if frame is within reasonable range of our head
-				if frame.Header.FrameNumber > g.head.Frame.Header.FrameNumber &&
-					frame.Header.FrameNumber <= g.head.Frame.Header.FrameNumber+10 {
-					// Frame is slightly ahead, add to pending
+				// Check if frame is ahead of our head
+				if frame.Header.FrameNumber > g.head.Frame.Header.FrameNumber {
+					// Frame is ahead, add to pending
 					g.addPendingFrame(frame, parentSelector)
-					return nil
-				} else if frame.Header.FrameNumber < g.head.Frame.Header.FrameNumber &&
-					g.head.Frame.Header.FrameNumber-frame.Header.FrameNumber > maxGlobalTreeDepth {
-					// Frame is too old, reject it
-					g.logger.Debug(
-						"rejecting old frame in non-archive mode",
-						zap.Uint64("frame_number", frame.Header.FrameNumber),
-						zap.Uint64("head_frame", g.head.Frame.Header.FrameNumber),
+
+					// Insert frame into tree
+					newNode := &GlobalFrameNode{
+						Frame:    frame,
+						Parent:   nil,
+						Children: make(map[string]*GlobalFrameNode),
+						Depth:    1,
+					}
+
+					// Add to data structures
+					g.nodes[frameID] = newNode
+					g.framesByNumber[frame.Header.FrameNumber] = append(
+						g.framesByNumber[frame.Header.FrameNumber],
+						newNode,
 					)
+					g.cache.Add(frameID, newNode)
+
+					// Evaluate fork choice if we have competing branches
+					g.evaluateForkChoice(newNode)
 					return nil
 				}
 			}
 		}
+
 		// Parent not found, add to pending frames
 		g.addPendingFrame(frame, parentSelector)
 		return nil
@@ -408,7 +416,8 @@ func (g *GlobalTimeReel) Insert(
 	return nil
 }
 
-// insertGenesisFrame handles genesis frame insertion or pseudo-root in non-archive mode
+// insertGenesisFrame handles genesis frame insertion or pseudo-root in
+// non-archive mode
 func (g *GlobalTimeReel) insertGenesisFrame(
 	frame *protobufs.GlobalFrame,
 	frameID string,
@@ -419,7 +428,8 @@ func (g *GlobalTimeReel) insertGenesisFrame(
 	}
 
 	if g.root != nil && !g.archiveMode {
-		// In non-archive mode, check if this frame should replace the current pseudo-root
+		// In non-archive mode, check if this frame should replace the current
+		// pseudo-root
 		if frame.Header.FrameNumber >= g.root.Frame.Header.FrameNumber {
 			// This frame is not older than current root, don't replace
 			return errors.New("frame is not older than current root")
@@ -564,9 +574,11 @@ func (g *GlobalTimeReel) findNodeBySelector(selector []byte) *GlobalFrameNode {
 
 // evaluateForkChoice evaluates fork choice and updates head if necessary
 func (g *GlobalTimeReel) evaluateForkChoice(newNode *GlobalFrameNode) {
-	if g.head == nil {
+	if g.head == nil || (!g.archiveMode &&
+		newNode.Frame.Header.FrameNumber-g.head.Frame.Header.FrameNumber > 360) {
+		oldHead := g.head
 		g.head = newNode
-		g.sendHeadEvent(newNode, nil)
+		g.sendHeadEvent(newNode, oldHead)
 		return
 	}
 
@@ -602,7 +614,8 @@ func (g *GlobalTimeReel) evaluateForkChoice(newNode *GlobalFrameNode) {
 	}
 
 	// If only one leaf at max depth, make it head
-	if len(competingLeaves) == 1 {
+	if len(competingLeaves) == 1 &&
+		competingLeaves[0].Frame.Header.FrameNumber == g.head.Frame.Header.FrameNumber {
 		chosenNode := competingLeaves[0]
 		if chosenNode != g.head {
 			oldHead := g.head
@@ -1274,9 +1287,9 @@ func (g *GlobalTimeReel) SetForkChoiceParams(params Params) {
 	g.forkChoiceParams = params
 }
 
-// pruneOldFrames removes frames older than maxGlobalTreeDepth from the in-memory
-// cache to prevent unbounded memory growth. The store handles its own pruning
-// based on archive mode.
+// pruneOldFrames removes frames older than maxGlobalTreeDepth from the
+// in-memory cache to prevent unbounded memory growth. The store handles its own
+// pruning based on archive mode.
 func (g *GlobalTimeReel) pruneOldFrames() {
 	if g.head == nil || g.head.Depth < maxGlobalTreeDepth {
 		return // Not enough frames to prune
@@ -1369,8 +1382,8 @@ func (g *GlobalTimeReel) pruneOldFrames() {
 
 // pruneOldPendingFrames removes pending frames that are too old
 func (g *GlobalTimeReel) pruneOldPendingFrames() {
-	// Prune pending frames older than 5 minutes
-	const maxPendingAge = 5 * 60 * 1000 // 5 minutes in milliseconds
+	// Prune pending frames older than 1.5 hours
+	const maxPendingAge = 1 * 90 * 60 * 1000 // 1.5 hours in milliseconds
 	currentTime := time.Now().UnixMilli()
 
 	prunedCount := 0

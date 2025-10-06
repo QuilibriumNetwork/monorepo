@@ -498,9 +498,11 @@ func (a *AppTimeReel) findNodeBySelector(selector []byte) *FrameNode {
 
 // evaluateForkChoice evaluates fork choice and updates head if necessary
 func (a *AppTimeReel) evaluateForkChoice(newNode *FrameNode) {
-	if a.head == nil {
+	if a.head == nil ||
+		newNode.Frame.Header.FrameNumber-a.head.Frame.Header.FrameNumber > 360 {
+		oldHead := a.head
 		a.head = newNode
-		a.sendHeadEvent(newNode, nil)
+		a.sendHeadEvent(newNode, oldHead)
 		return
 	}
 
@@ -1313,8 +1315,8 @@ func (a *AppTimeReel) pruneOldFrames() {
 
 // pruneOldPendingFrames removes pending frames that are too old
 func (a *AppTimeReel) pruneOldPendingFrames() {
-	// Prune pending frames older than 5 minutes
-	const maxPendingAge = 5 * 60 * 1000 // 5 minutes in milliseconds
+	// Prune pending frames older than 1.5 hours
+	const maxPendingAge = 1 * 90 * 60 * 1000 // 1.5 hours in milliseconds
 	currentTime := time.Now().UnixMilli()
 
 	prunedCount := 0
