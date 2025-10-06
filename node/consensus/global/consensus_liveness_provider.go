@@ -83,6 +83,10 @@ func (p *GlobalLivenessProvider) Collect(
 
 	frameNumber++
 
+	p.engine.logger.Debug(
+		"collected messages, validating",
+		zap.Int("message_count", len(messages)),
+	)
 	for i, message := range messages {
 		costBasis, err := p.engine.executionManager.GetCost(message.Payload)
 		if err != nil {
@@ -97,13 +101,18 @@ func (p *GlobalLivenessProvider) Collect(
 		p.engine.currentDifficultyMu.RLock()
 		difficulty := uint64(p.engine.currentDifficulty)
 		p.engine.currentDifficultyMu.RUnlock()
-		baseline := reward.GetBaselineFee(
-			difficulty,
-			p.engine.hypergraph.GetSize(nil, nil).Uint64(),
-			costBasis.Uint64(),
-			8000000000,
-		)
-		baseline.Quo(baseline, costBasis)
+		var baseline *big.Int
+		if costBasis.Cmp(big.NewInt(0)) == 0 {
+			baseline = big.NewInt(0)
+		} else {
+			baseline = reward.GetBaselineFee(
+				difficulty,
+				p.engine.hypergraph.GetSize(nil, nil).Uint64(),
+				costBasis.Uint64(),
+				8000000000,
+			)
+			baseline.Quo(baseline, costBasis)
+		}
 
 		result, err := p.engine.executionManager.ProcessMessage(
 			frameNumber,

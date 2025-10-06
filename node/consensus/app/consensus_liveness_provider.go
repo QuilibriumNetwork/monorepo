@@ -90,13 +90,18 @@ func (p *AppLivenessProvider) Collect(
 		p.engine.currentDifficultyMu.RLock()
 		difficulty := uint64(p.engine.currentDifficulty)
 		p.engine.currentDifficultyMu.RUnlock()
-		baseline := reward.GetBaselineFee(
-			difficulty,
-			p.engine.hypergraph.GetSize(nil, nil).Uint64(),
-			costBasis.Uint64(),
-			8000000000,
-		)
-		baseline.Quo(baseline, costBasis)
+		var baseline *big.Int
+		if costBasis.Cmp(big.NewInt(0)) == 0 {
+			baseline = big.NewInt(0)
+		} else {
+			baseline = reward.GetBaselineFee(
+				difficulty,
+				p.engine.hypergraph.GetSize(nil, nil).Uint64(),
+				costBasis.Uint64(),
+				8000000000,
+			)
+			baseline.Quo(baseline, costBasis)
+		}
 
 		result, err := p.engine.executionManager.ProcessMessage(
 			uint64(p.engine.GetFrame().Header.FrameNumber),

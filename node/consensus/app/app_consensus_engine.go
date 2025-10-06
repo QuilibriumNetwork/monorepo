@@ -891,13 +891,18 @@ func (e *AppConsensusEngine) materialize(
 		e.currentDifficultyMu.RLock()
 		difficulty := uint64(e.currentDifficulty)
 		e.currentDifficultyMu.RUnlock()
-		baseline := reward.GetBaselineFee(
-			difficulty,
-			e.hypergraph.GetSize(nil, nil).Uint64(),
-			costBasis.Uint64(),
-			8000000000,
-		)
-		baseline.Quo(baseline, costBasis)
+		var baseline *big.Int
+		if costBasis.Cmp(big.NewInt(0)) == 0 {
+			baseline = big.NewInt(0)
+		} else {
+			baseline = reward.GetBaselineFee(
+				difficulty,
+				e.hypergraph.GetSize(nil, nil).Uint64(),
+				costBasis.Uint64(),
+				8000000000,
+			)
+			baseline.Quo(baseline, costBasis)
+		}
 
 		result, err := e.executionManager.ProcessMessage(
 			frame.Header.FrameNumber,

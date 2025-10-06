@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"net"
 	"net/netip"
 	"slices"
@@ -1166,6 +1167,10 @@ func (e *GlobalConsensusEngine) materialize(
 
 	acceptedMessages := []*protobufs.MessageBundle{}
 
+	e.logger.Debug(
+		"materializing messages",
+		zap.Int("message_count", len(requests)),
+	)
 	for i, request := range requests {
 		requestBytes, err := request.ToCanonicalBytes()
 
@@ -1199,13 +1204,18 @@ func (e *GlobalConsensusEngine) materialize(
 		e.currentDifficultyMu.RLock()
 		difficulty := uint64(e.currentDifficulty)
 		e.currentDifficultyMu.RUnlock()
-		baseline := reward.GetBaselineFee(
-			difficulty,
-			e.hypergraph.GetSize(nil, nil).Uint64(),
-			costBasis.Uint64(),
-			8000000000,
-		)
-		baseline.Quo(baseline, costBasis)
+		var baseline *big.Int
+		if costBasis.Cmp(big.NewInt(0)) == 0 {
+			baseline = big.NewInt(0)
+		} else {
+			baseline = reward.GetBaselineFee(
+				difficulty,
+				e.hypergraph.GetSize(nil, nil).Uint64(),
+				costBasis.Uint64(),
+				8000000000,
+			)
+			baseline.Quo(baseline, costBasis)
+		}
 
 		result, err := e.executionManager.ProcessMessage(
 			frameNumber,
@@ -1978,11 +1988,13 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 ) error {
 	frame := e.GetFrame()
 	if frame == nil {
+		e.logger.Debug("cannot propose, no frame")
 		return errors.New("not ready")
 	}
 
 	_, err := e.keyManager.GetSigningKey("q-prover-key")
 	if err != nil {
+		e.logger.Debug("cannot propose, no signer key")
 		return errors.Wrap(err, "propose worker join")
 	}
 
@@ -1994,12 +2006,14 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 
 	helpers := []*global.SeniorityMerge{}
 	if !skipMerge {
+		e.logger.Debug("attempting merge")
 		peerIds := []string{}
 		oldProver, err := keys.Ed448KeyFromBytes(
 			[]byte(e.config.P2P.PeerPrivKey),
 			e.pubsub.GetPublicKey(),
 		)
 		if err != nil {
+			e.logger.Debug("cannot get peer key", zap.Error(err))
 			return errors.Wrap(err, "propose worker join")
 		}
 		helpers = append(helpers, global.NewSeniorityMerge(
@@ -2008,6 +2022,7 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		))
 		peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
 		if len(e.config.Engine.MultisigProverEnrollmentPaths) != 0 {
+			e.logger.Debug("loading old configs")
 			for _, conf := range e.config.Engine.MultisigProverEnrollmentPaths {
 				extraConf, err := config.LoadConfig(conf, "", false)
 				if err != nil {
@@ -2081,6 +2096,7 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 	results := make([][516]byte, joins)
 	idx := uint32(0)
 	ids := [][]byte{}
+	e.logger.Debug("preparing join commitment")
 	for range joins {
 		ids = append(
 			ids,
@@ -2097,6 +2113,13 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 
 	wg := errgroup.Group{}
 	wg.SetLimit(joins)
+
+	e.logger.Debug(
+		"attempting join proof",
+		zap.String("challenge", hex.EncodeToString(challenge[:])),
+		zap.Uint64("difficulty", uint64(frame.Header.Difficulty)),
+		zap.Int("ids_count", len(ids)),
+	)
 
 	for _, svc := range serviceClients {
 		svc := svc
@@ -2125,9 +2148,11 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		})
 		idx++
 	}
+	e.logger.Debug("waiting for join proof to complete")
 
 	err = wg.Wait()
 	if err != nil {
+		e.logger.Debug("failed join proof", zap.Error(err))
 		return errors.Wrap(err, "propose worker join")
 	}
 
@@ -2182,6 +2207,8 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		e.logger.Error("could not construct join", zap.Error(err))
 		return errors.Wrap(err, "propose worker join")
 	}
+
+	e.logger.Debug("submitted join request")
 
 	return nil
 }

@@ -139,6 +139,10 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		0,
 		len(p.engine.collectedMessages),
 	)
+	p.engine.logger.Debug(
+		"including messages",
+		zap.Int("message_count", len(p.engine.collectedMessages)),
+	)
 	for _, msgData := range p.engine.collectedMessages {
 		// Check if data is long enough to contain type prefix
 		if len(msgData) < 4 {
