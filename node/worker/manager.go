@@ -159,13 +159,6 @@ func (w *WorkerManager) registerWorker(info *typesStore.WorkerInfo) error {
 		zap.Bool("automatic", info.Automatic),
 	)
 
-	// Check if worker already exists
-	existingWorker, err := w.store.GetWorker(info.CoreId)
-	if err == nil && existingWorker != nil {
-		workerOperationsTotal.WithLabelValues("register", "error").Inc()
-		return errors.New("worker already registered")
-	}
-
 	// Save to store
 	txn, err := w.store.NewTransaction(false)
 	if err != nil {

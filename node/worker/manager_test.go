@@ -201,11 +201,6 @@ func TestWorkerManager_RegisterWorker(t *testing.T) {
 	assert.Equal(t, workerInfo.CoreId, storedWorker.CoreId)
 	assert.Equal(t, workerInfo.ListenMultiaddr, storedWorker.ListenMultiaddr)
 	assert.Equal(t, workerInfo.Filter, storedWorker.Filter)
-
-	// Test registering the same worker again should fail
-	err = manager.RegisterWorker(workerInfo)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "already registered")
 }
 
 func TestWorkerManager_RegisterWorkerNotStarted(t *testing.T) {
