@@ -499,7 +499,8 @@ func (a *AppTimeReel) findNodeBySelector(selector []byte) *FrameNode {
 // evaluateForkChoice evaluates fork choice and updates head if necessary
 func (a *AppTimeReel) evaluateForkChoice(newNode *FrameNode) {
 	if a.head == nil ||
-		newNode.Frame.Header.FrameNumber-a.head.Frame.Header.FrameNumber > 360 {
+		(newNode.Frame.Header.FrameNumber > a.head.Frame.Header.FrameNumber &&
+			newNode.Frame.Header.FrameNumber-a.head.Frame.Header.FrameNumber > 360) {
 		oldHead := a.head
 		a.head = newNode
 		a.sendHeadEvent(newNode, oldHead)

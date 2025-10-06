@@ -575,6 +575,7 @@ func (g *GlobalTimeReel) findNodeBySelector(selector []byte) *GlobalFrameNode {
 // evaluateForkChoice evaluates fork choice and updates head if necessary
 func (g *GlobalTimeReel) evaluateForkChoice(newNode *GlobalFrameNode) {
 	if g.head == nil || (!g.archiveMode &&
+		newNode.Frame.Header.FrameNumber > g.head.Frame.Header.FrameNumber &&
 		newNode.Frame.Header.FrameNumber-g.head.Frame.Header.FrameNumber > 360) {
 		oldHead := g.head
 		g.head = newNode
