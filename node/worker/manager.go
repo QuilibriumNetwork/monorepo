@@ -143,6 +143,10 @@ func (w *WorkerManager) RegisterWorker(info *typesStore.WorkerInfo) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	return w.registerWorker(info)
+}
+
+func (w *WorkerManager) registerWorker(info *typesStore.WorkerInfo) error {
 	if !w.started {
 		workerOperationsTotal.WithLabelValues("register", "error").Inc()
 		return errors.New("worker manager not started")
@@ -196,6 +200,7 @@ func (w *WorkerManager) RegisterWorker(info *typesStore.WorkerInfo) error {
 		"worker registered successfully",
 		zap.Uint("core_id", info.CoreId),
 	)
+
 	return nil
 }
 
@@ -494,6 +499,16 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 		return errors.Wrap(err, "load workers from store")
 	}
 
+	if len(workers) != w.config.Engine.DataWorkerCount {
+		for i := range w.config.Engine.DataWorkerCount {
+			_, err := w.getIPCOfWorker(uint(i + 1))
+			if err != nil {
+				w.logger.Error("could not obtain IPC for worker", zap.Error(err))
+				continue
+			}
+		}
+	}
+
 	var totalStorage uint64
 	var allocatedCount int
 	for _, worker := range workers {
@@ -549,6 +564,23 @@ func (w *WorkerManager) getMultiaddrOfWorker(coreId uint) (
 	return ma, errors.Wrap(err, "get multiaddr of worker")
 }
 
+func (w *WorkerManager) getP2PMultiaddrOfWorker(coreId uint) (
+	multiaddr.Multiaddr,
+	error,
+) {
+	p2pMultiaddr := fmt.Sprintf(
+		w.config.Engine.DataWorkerBaseListenMultiaddr,
+		int(w.config.Engine.DataWorkerBaseP2PPort)+int(coreId-1),
+	)
+
+	if len(w.config.Engine.DataWorkerP2PMultiaddrs) != 0 {
+		p2pMultiaddr = w.config.Engine.DataWorkerP2PMultiaddrs[coreId-1]
+	}
+
+	ma, err := multiaddr.StringCast(p2pMultiaddr)
+	return ma, errors.Wrap(err, "get p2p multiaddr of worker")
+}
+
 func (w *WorkerManager) getIPCOfWorker(coreId uint) (
 	protobufs.DataIPCServiceClient,
 	error,
@@ -570,6 +602,25 @@ func (w *WorkerManager) getIPCOfWorker(coreId uint) (
 		if err != nil {
 			w.logger.Error("error unmarshaling peerkey", zap.Error(err))
 			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+
+		if _, ok := w.filtersByWorker[coreId]; !ok {
+			p2pAddr, err := w.getP2PMultiaddrOfWorker(coreId)
+			if err != nil {
+				return nil, errors.Wrap(err, "get ipc of worker")
+			}
+			err = w.registerWorker(&typesStore.WorkerInfo{
+				CoreId:                coreId,
+				ListenMultiaddr:       p2pAddr.String(),
+				StreamListenMultiaddr: addr.String(),
+				Filter:                nil,
+				TotalStorage:          0,
+				Automatic:             len(w.config.Engine.DataWorkerP2PMultiaddrs) == 0,
+				Allocated:             false,
+			})
+			if err != nil {
+				return nil, errors.Wrap(err, "get ipc of worker")
+			}
 		}
 
 		privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)

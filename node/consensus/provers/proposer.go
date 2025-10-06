@@ -2,6 +2,7 @@ package provers
 
 import (
 	"bytes"
+	"encoding/hex"
 	"math/big"
 	"sort"
 
@@ -93,11 +94,12 @@ func (m *Manager) PlanAndAllocate(
 	maxAllocations int,
 ) ([]Proposal, error) {
 	if len(shards) == 0 {
+		m.logger.Debug("no shards to allocate")
 		return nil, nil
 	}
 
 	// Enumerate free workers (unallocated).
-	all, err := m.store.RangeWorkers()
+	all, err := m.workerMgr.RangeWorkers()
 	if err != nil {
 		return nil, errors.Wrap(err, "plan and allocate")
 	}
@@ -109,6 +111,7 @@ func (m *Manager) PlanAndAllocate(
 	}
 
 	if len(free) == 0 {
+		m.logger.Debug("no workers free")
 		return nil, nil
 	}
 
@@ -132,6 +135,11 @@ func (m *Manager) PlanAndAllocate(
 
 	for i, s := range shards {
 		if len(s.Filter) == 0 || s.Size == 0 {
+			m.logger.Debug(
+				"filtering out empty shard",
+				zap.String("filter", hex.EncodeToString(s.Filter)),
+				zap.Uint64("size", s.Size),
+			)
 			continue
 		}
 		if s.Shards == 0 {
@@ -173,10 +181,17 @@ func (m *Manager) PlanAndAllocate(
 			score.Quo(score, ringDiv)
 			score.Quo(score, shardsSqrt.BigInt())
 		}
+
+		m.logger.Debug(
+			"adding score proposal",
+			zap.Int("index", i),
+			zap.String("score", score.String()),
+		)
 		scores = append(scores, scored{idx: i, score: score})
 	}
 
 	if len(scores) == 0 {
+		m.logger.Debug("no scores")
 		return nil, nil
 	}
 
