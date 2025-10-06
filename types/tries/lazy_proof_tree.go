@@ -1736,6 +1736,9 @@ func (t *LazyVectorCommitmentTree) Commit(recalculate bool) []byte {
 func (t *LazyVectorCommitmentTree) GetSize() *big.Int {
 	t.treeMx.RLock()
 	defer t.treeMx.RUnlock()
+	if t.Root == nil {
+		return big.NewInt(0)
+	}
 	return t.Root.GetSize()
 }
 

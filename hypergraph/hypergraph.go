@@ -12,6 +12,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
+	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
 // HypergraphCRDT implements a CRDT-based 2P2P-Hypergraph. It maintains separate
@@ -164,7 +165,8 @@ func (hg *HypergraphCRDT) ImportTree(
 }
 
 // GetSize returns the current total size of the hypergraph. The size is
-// calculated as the sum of all added atoms' data minus removed atoms.
+// calculated as the sum of all added atoms' data minus removed atoms (note:
+// removed meaning removed from a set, not the atoms in remove sets).
 func (hg *HypergraphCRDT) GetSize(
 	shardKey *tries.ShardKey,
 	path []int,
@@ -177,27 +179,39 @@ func (hg *HypergraphCRDT) GetSize(
 
 	vas := hg.getVertexAddsSet(*shardKey)
 	has := hg.getHyperedgeAddsSet(*shardKey)
-	if vas == nil {
-		return big.NewInt(0)
-	}
+	vrs := hg.getVertexRemovesSet(*shardKey)
+	hrs := hg.getHyperedgeRemovesSet(*shardKey)
 
 	if len(path) == 0 {
-		return new(big.Int).Add(vas.GetSize(), has.GetSize())
+		return new(big.Int).Add(
+			new(big.Int).Add(vas.GetSize(), has.GetSize()),
+			new(big.Int).Add(vrs.GetSize(), hrs.GetSize()),
+		)
 	} else {
 		sum := big.NewInt(0)
-		n, err := vas.GetTree().GetByPath(path)
-		if err != nil {
-			return sum
+		n, _ := vas.GetTree().GetByPath(path)
+
+		if n != nil {
+			sum = sum.Add(sum, n.GetSize())
 		}
 
-		sum = sum.Add(sum, n.GetSize())
+		o, _ := has.GetTree().GetByPath(path)
 
-		o, err := has.GetTree().GetByPath(path)
-		if err != nil {
-			return sum
+		if o != nil {
+			sum = sum.Add(sum, o.GetSize())
 		}
 
-		sum = sum.Add(sum, o.GetSize())
+		p, _ := vrs.GetTree().GetByPath(path)
+
+		if p != nil {
+			sum = sum.Add(sum, o.GetSize())
+		}
+
+		q, _ := hrs.GetTree().GetByPath(path)
+		if q != nil {
+			sum = sum.Add(sum, o.GetSize())
+		}
+
 		return sum
 	}
 }
@@ -484,6 +498,99 @@ func (hg *HypergraphCRDT) RevertChanges(
 	}
 
 	return nil
+}
+
+// GetMetadataAtKey is a fast path to retrieve metadata information used for
+// consensus, avoiding unnecessary recomputation for lookups.
+func (hg *HypergraphCRDT) GetMetadataAtKey(pathKey []byte) (
+	[]hypergraph.ShardMetadata,
+	error,
+) {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+	if len(pathKey) < 32 {
+		return nil, errors.Wrap(
+			hypergraph.ErrInvalidLocation,
+			"get metadata at key",
+		)
+	}
+
+	l1 := up2p.GetBloomFilterIndices(pathKey[:32], 256, 3)
+	shardKey := tries.ShardKey{
+		L1: [3]byte(l1),
+		L2: [32]byte(pathKey[:32]),
+	}
+	vertexAdds, vertexRemoves := hg.getOrCreateIdSet(
+		shardKey,
+		hg.vertexAdds,
+		hg.vertexRemoves,
+		hypergraph.VertexAtomType,
+		hg.coveredPrefix,
+	)
+	hyperedgeAdds, hyperedgeRemoves := hg.getOrCreateIdSet(
+		shardKey,
+		hg.hyperedgeAdds,
+		hg.hyperedgeRemoves,
+		hypergraph.HyperedgeAtomType,
+		hg.coveredPrefix,
+	)
+
+	metadata := []hypergraph.ShardMetadata{}
+	ipath := tries.GetFullPath(pathKey[:32])
+	path := []int{}
+	for _, p := range ipath {
+		path = append(path, int(p))
+	}
+	for _, p := range pathKey[32:] {
+		path = append(path, int(p))
+	}
+
+	for _, set := range []hypergraph.IdSet{
+		vertexAdds,
+		vertexRemoves,
+		hyperedgeAdds,
+		hyperedgeRemoves,
+	} {
+		node, err := set.GetTree().Store.GetNodeByPath(
+			set.GetTree().SetType,
+			set.GetTree().PhaseType,
+			shardKey,
+			path,
+		)
+		if err != nil {
+			hg.logger.Debug("could not get node by path", zap.Error(err))
+			metadata = append(metadata, hypergraph.ShardMetadata{
+				Commitment: make([]byte, 64),
+				LeafCount:  0,
+				Size:       0,
+			})
+			continue
+		}
+		if node != nil {
+			switch t := node.(type) {
+			case *tries.LazyVectorCommitmentBranchNode:
+				metadata = append(metadata, hypergraph.ShardMetadata{
+					Commitment: t.Commitment,
+					LeafCount:  uint64(t.LeafCount),
+					Size:       t.Size.Uint64(),
+				})
+			case *tries.LazyVectorCommitmentLeafNode:
+				metadata = append(metadata, hypergraph.ShardMetadata{
+					Commitment: t.Commitment,
+					LeafCount:  1,
+					Size:       t.Size.Uint64(),
+				})
+			}
+		} else {
+			metadata = append(metadata, hypergraph.ShardMetadata{
+				Commitment: make([]byte, 64),
+				LeafCount:  0,
+				Size:       0,
+			})
+		}
+	}
+
+	return metadata, nil
 }
 
 // boolToString converts a boolean to string for Prometheus labels.

@@ -236,7 +236,7 @@ func (
 		shardKey,
 		hg.hyperedgeAdds,
 		hg.hyperedgeRemoves,
-		hypergraph.VertexAtomType,
+		hypergraph.HyperedgeAtomType,
 		coveredPrefix,
 	)
 	return adds
@@ -262,7 +262,7 @@ func (
 		shardKey,
 		hg.hyperedgeAdds,
 		hg.hyperedgeRemoves,
-		hypergraph.VertexAtomType,
+		hypergraph.HyperedgeAtomType,
 		coveredPrefix,
 	)
 	return removes
