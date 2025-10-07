@@ -2,6 +2,7 @@ package provers
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/hex"
 	"math/big"
 	"sort"
@@ -237,6 +238,32 @@ func (m *Manager) PlanAndAllocate(
 		fj := shards[scores[j].idx].Filter
 		return bytes.Compare(fi, fj) < 0
 	})
+
+	// For reward-greedy strategy, randomize within equal-score groups so equally
+	// good shards are chosen fairly instead of skewing toward lexicographically
+	// earlier filters.
+	if m.Strategy != DataGreedy && len(scores) > 1 {
+		for start := 0; start < len(scores); {
+			end := start + 1
+			// Find run [start,end) where scores are equal.
+			for end < len(scores) && scores[end].score.Cmp(scores[start].score) == 0 {
+				end++
+			}
+
+			// Shuffle the run with Fisher–Yates:
+			if end-start > 1 {
+				for i := end - 1; i > start; i-- {
+					n := big.NewInt(int64(i - start + 1))
+					r, err := rand.Int(rand.Reader, n)
+					if err == nil {
+						j := start + int(r.Int64())
+						scores[i], scores[j] = scores[j], scores[i]
+					}
+				}
+			}
+			start = end
+		}
+	}
 
 	// Determine how many allocations we’ll attempt.
 	limit := len(free)
