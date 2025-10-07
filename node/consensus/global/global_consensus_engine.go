@@ -289,6 +289,7 @@ func NewGlobalConsensusEngine(
 		logger,
 		config,
 		engine.ProposeWorkerJoin,
+		engine.DecideWorkerJoins,
 	)
 	if !config.Engine.ArchiveMode {
 		strategy := provers.RewardGreedy
@@ -2210,6 +2211,104 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 	}
 
 	e.logger.Debug("submitted join request")
+
+	return nil
+}
+
+func (e *GlobalConsensusEngine) DecideWorkerJoins(
+	reject [][]byte,
+	confirm [][]byte,
+) error {
+	frame := e.GetFrame()
+	if frame == nil {
+		e.logger.Debug("cannot decide, no frame")
+		return errors.New("not ready")
+	}
+
+	_, err := e.keyManager.GetSigningKey("q-prover-key")
+	if err != nil {
+		e.logger.Debug("cannot decide, no signer key")
+		return errors.Wrap(err, "decide worker joins")
+	}
+
+	bundle := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{},
+	}
+
+	if len(reject) != 0 {
+		for _, r := range reject {
+			rejectMessage, err := global.NewProverReject(
+				r,
+				frame.Header.FrameNumber,
+				e.keyManager,
+				e.hypergraph,
+				schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+			)
+			if err != nil {
+				e.logger.Error("could not construct reject", zap.Error(err))
+				return errors.Wrap(err, "decide worker joins")
+			}
+
+			err = rejectMessage.Prove(frame.Header.FrameNumber)
+			if err != nil {
+				e.logger.Error("could not construct reject", zap.Error(err))
+				return errors.Wrap(err, "decide worker joins")
+			}
+
+			bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+				Request: &protobufs.MessageRequest_Reject{
+					Reject: rejectMessage.ToProtobuf(),
+				},
+			})
+		}
+	}
+
+	if len(confirm) != 0 {
+		for _, r := range confirm {
+			confirmMessage, err := global.NewProverConfirm(
+				r,
+				frame.Header.FrameNumber,
+				e.keyManager,
+				e.hypergraph,
+				schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+			)
+			if err != nil {
+				e.logger.Error("could not construct confirm", zap.Error(err))
+				return errors.Wrap(err, "decide worker joins")
+			}
+
+			err = confirmMessage.Prove(frame.Header.FrameNumber)
+			if err != nil {
+				e.logger.Error("could not construct confirm", zap.Error(err))
+				return errors.Wrap(err, "decide worker joins")
+			}
+
+			bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+				Request: &protobufs.MessageRequest_Confirm{
+					Confirm: confirmMessage.ToProtobuf(),
+				},
+			})
+		}
+	}
+
+	bundle.Timestamp = time.Now().UnixMilli()
+
+	msg, err := bundle.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not construct decision", zap.Error(err))
+		return errors.Wrap(err, "decide worker joins")
+	}
+
+	err = e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		msg,
+	)
+	if err != nil {
+		e.logger.Error("could not construct join", zap.Error(err))
+		return errors.Wrap(err, "decide worker joins")
+	}
+
+	e.logger.Debug("submitted join decisions")
 
 	return nil
 }

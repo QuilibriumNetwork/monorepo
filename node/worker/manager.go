@@ -40,6 +40,10 @@ type WorkerManager struct {
 		filters [][]byte,
 		serviceClients map[uint]*grpc.ClientConn,
 	) error
+	decideFunc func(
+		reject [][]byte,
+		confirm [][]byte,
+	) error
 
 	// When automatic, hold reference to the workers
 	dataWorkers []*exec.Cmd
@@ -64,6 +68,10 @@ func NewWorkerManager(
 		filters [][]byte,
 		serviceClients map[uint]*grpc.ClientConn,
 	) error,
+	decideFunc func(
+		reject [][]byte,
+		confirm [][]byte,
+	) error,
 ) typesWorker.WorkerManager {
 	return &WorkerManager{
 		store:            store,
@@ -74,6 +82,7 @@ func NewWorkerManager(
 		serviceClients:   make(map[uint]*grpc.ClientConn),
 		config:           config,
 		proposeFunc:      proposeFunc,
+		decideFunc:       decideFunc,
 	}
 }
 
@@ -484,6 +493,15 @@ func (w *WorkerManager) ProposeAllocations(
 		}
 	}
 	return w.proposeFunc(coreIds, filters, w.serviceClients)
+}
+
+// DecideAllocations invokes a deciding function set by the parent of the
+// manager.
+func (w *WorkerManager) DecideAllocations(
+	reject [][]byte,
+	confirm [][]byte,
+) error {
+	return w.decideFunc(reject, confirm)
 }
 
 // loadWorkersFromStore loads all workers from persistent storage into memory

@@ -26,6 +26,14 @@ type mockWorkerManager struct {
 	workers        []*store.WorkerInfo
 	lastWorkers    []uint
 	lastFiltersHex []string
+	rejected       [][]byte
+	confirmed      [][]byte
+}
+
+func (m *mockWorkerManager) DecideAllocations(reject [][]byte, confirm [][]byte) error {
+	m.rejected = reject
+	m.confirmed = confirm
+	return nil
 }
 
 func (m *mockWorkerManager) AllocateWorker(coreId uint, filter []byte) error {
@@ -192,6 +200,105 @@ func TestPlanAndAllocate_UnequalScores_PicksMax(t *testing.T) {
 	}
 }
 
+// Confirm when pending is best (RewardGreedy)
+func TestDecideJoins_ConfirmWhenBest_RewardGreedy(t *testing.T) {
+	wm := &mockWorkerManager{}
+	m := newTestManager(t, RewardGreedy, wm)
+	shards := []ShardDescriptor{
+		{Filter: mustDecodeHex(t, "01"), Size: 50_000, Ring: 0, Shards: 1},
+		{Filter: mustDecodeHex(t, "02"), Size: 200_000, Ring: 0, Shards: 1}, // best
+		{Filter: mustDecodeHex(t, "03"), Size: 50_000, Ring: 0, Shards: 1},
+	}
+	pending := [][]byte{mustDecodeHex(t, "02")}
+
+	err := m.DecideJoins(100, shards, pending)
+	if err != nil {
+		t.Fatalf("DecideJoins error: %v", err)
+	}
+	if len(wm.rejected) != 0 || len(wm.confirmed) != 1 || hex.EncodeToString(wm.confirmed[0]) != "02" {
+		t.Fatalf("expected confirm 02, got reject=%v confirm=%v", toHex(wm.rejected), toHex(wm.confirmed))
+	}
+}
+
+// Reject when a strictly better shard exists (RewardGreedy)
+func TestDecideJoins_RejectWhenBetterExists_RewardGreedy(t *testing.T) {
+	wm := &mockWorkerManager{}
+	m := newTestManager(t, RewardGreedy, wm)
+	shards := []ShardDescriptor{
+		{Filter: mustDecodeHex(t, "0a"), Size: 200_000, Ring: 0, Shards: 1}, // best
+		{Filter: mustDecodeHex(t, "01"), Size: 50_000, Ring: 0, Shards: 1},
+	}
+	pending := [][]byte{mustDecodeHex(t, "01")}
+
+	err := m.DecideJoins(100, shards, pending)
+	if err != nil {
+		t.Fatalf("DecideJoins error: %v", err)
+	}
+	if len(wm.rejected) != 1 || hex.EncodeToString(wm.rejected[0]) != "01" || len(wm.confirmed) != 0 {
+		t.Fatalf("expected reject 01, got reject=%v confirm=%v", toHex(wm.rejected), toHex(wm.confirmed))
+	}
+}
+
+// Tie -> confirm (RewardGreedy)
+func TestDecideJoins_TieConfirms_RewardGreedy(t *testing.T) {
+
+	wm := &mockWorkerManager{}
+	m := newTestManager(t, RewardGreedy, wm)
+	// Same size/ring/shards -> same score
+	shards := []ShardDescriptor{
+		{Filter: mustDecodeHex(t, "01"), Size: 100_000, Ring: 1, Shards: 4},
+		{Filter: mustDecodeHex(t, "02"), Size: 100_000, Ring: 1, Shards: 4},
+	}
+	pending := [][]byte{mustDecodeHex(t, "02")}
+
+	err := m.DecideJoins(100, shards, pending)
+	if err != nil {
+		t.Fatalf("DecideJoins error: %v", err)
+	}
+	if len(wm.rejected) != 0 || len(wm.confirmed) != 1 || hex.EncodeToString(wm.confirmed[0]) != "02" {
+		t.Fatalf("expected confirm 02 on tie, got reject=%v confirm=%v", toHex(wm.rejected), toHex(wm.confirmed))
+	}
+}
+
+func TestDecideJoins_DataGreedy_SizeOnly(t *testing.T) {
+	wm := &mockWorkerManager{}
+	m := newTestManager(t, DataGreedy, wm)
+	shards := []ShardDescriptor{
+		{Filter: mustDecodeHex(t, "aa"), Size: 10_000, Ring: 3, Shards: 16}, // worse by size
+		{Filter: mustDecodeHex(t, "bb"), Size: 80_000, Ring: 0, Shards: 1},  // best by size
+		{Filter: mustDecodeHex(t, "cc"), Size: 80_000, Ring: 5, Shards: 64}, // tie by size
+	}
+	// Pending on aa (worse), bb (best), cc (tie-best)
+	pending := [][]byte{mustDecodeHex(t, "aa"), mustDecodeHex(t, "bb"), mustDecodeHex(t, "cc")}
+	err := m.DecideJoins(100, shards, pending)
+	if err != nil {
+		t.Fatalf("DecideJoins error: %v", err)
+	}
+	rej := setOf(toHex(wm.rejected))
+	cfm := setOf(toHex(wm.confirmed))
+	if !(rej["aa"] && !rej["bb"] && !rej["cc"] && cfm["bb"] && cfm["cc"]) {
+		t.Fatalf("expected reject{aa} confirm{bb,cc}; got reject=%v confirm=%v", toHex(wm.rejected), toHex(wm.confirmed))
+	}
+}
+
+// Missing/invalid pending -> reject
+func TestDecideJoins_PendingMissingOrInvalid_Reject(t *testing.T) {
+	wm := &mockWorkerManager{}
+	m := newTestManager(t, RewardGreedy, wm)
+	shards := []ShardDescriptor{
+		{Filter: mustDecodeHex(t, "01"), Size: 100_000, Ring: 0, Shards: 1},
+	}
+	pending := [][]byte{mustDecodeHex(t, "deadbeef"), nil, {}}
+
+	err := m.DecideJoins(100, shards, pending)
+	if err != nil {
+		t.Fatalf("DecideJoins error: %v", err)
+	}
+	if len(wm.confirmed) != 0 || len(wm.rejected) != 1 || hex.EncodeToString(wm.rejected[0]) != "deadbeef" {
+		t.Fatalf("expected only deadbeef rejected; got reject=%v confirm=%v", toHex(wm.rejected), toHex(wm.confirmed))
+	}
+}
+
 func mustDecodeHex(t *testing.T, s string) []byte {
 	t.Helper()
 	b, err := hex.DecodeString(s)
@@ -199,4 +306,20 @@ func mustDecodeHex(t *testing.T, s string) []byte {
 		t.Fatalf("hex decode failed: %v", err)
 	}
 	return b
+}
+
+func toHex(bs [][]byte) []string {
+	out := make([]string, 0, len(bs))
+	for _, b := range bs {
+		out = append(out, hex.EncodeToString(b))
+	}
+	return out
+}
+
+func setOf(ss []string) map[string]bool {
+	m := make(map[string]bool, len(ss))
+	for _, s := range ss {
+		m[s] = true
+	}
+	return m
 }

@@ -56,6 +56,12 @@ type Proposal struct {
 	ShardsDenominator uint64
 }
 
+// scored is an internal struct for ranking proposals
+type scored struct {
+	idx   int
+	score *big.Int
+}
+
 // Manager ranks shards and assigns free workers to the best ones.
 type Manager struct {
 	logger    *zap.Logger
@@ -147,79 +153,9 @@ func (m *Manager) PlanAndAllocate(
 	// Pre-compute basis (independent of shard specifics).
 	basis := reward.PomwBasis(difficulty, worldBytes.Uint64(), m.Units)
 
-	// Score each shard by expected reward for a single allocation.
-	type scored struct {
-		idx   int
-		score *big.Int
-	}
-	scores := make([]scored, 0, len(shards))
-
-	for i, s := range shards {
-		if len(s.Filter) == 0 || s.Size == 0 {
-			m.logger.Debug(
-				"filtering out empty shard",
-				zap.String("filter", hex.EncodeToString(s.Filter)),
-				zap.Uint64("size", s.Size),
-			)
-			continue
-		}
-
-		if s.Shards == 0 {
-			s.Shards = 1
-		}
-
-		var score *big.Int
-		switch m.Strategy {
-		case DataGreedy:
-			// Pure data coverage: larger shards first.
-			score = big.NewInt(int64(s.Size))
-		default:
-			// factor = (stateSize / worldBytes)
-			factor := decimal.NewFromUint64(s.Size)
-			factor = factor.Mul(decimal.NewFromBigInt(basis, 0))
-			factor = factor.Div(decimal.NewFromBigInt(worldBytes, 0))
-
-			// ring divisor = 2^Ring
-			divisor := int64(1)
-			for j := uint8(0); j < s.Ring+1; j++ {
-				divisor <<= 1
-			}
-			ringDiv := decimal.NewFromInt(divisor)
-
-			// shard factor = sqrt(Shards)
-			shardsSqrt, err := decimal.NewFromUint64(s.Shards).PowWithPrecision(
-				decimal.NewFromBigRat(big.NewRat(1, 2), 53),
-				53,
-			)
-			if err != nil {
-				return nil, errors.Wrap(err, "plan and allocate")
-			}
-
-			if shardsSqrt.IsZero() {
-				return nil, errors.New("plan and allocate")
-			}
-
-			m.logger.Debug(
-				"calculating score",
-				zap.Int("index", i),
-				zap.String("basis", basis.String()),
-				zap.String("size", big.NewInt(int64(s.Size)).String()),
-				zap.String("worldBytes", worldBytes.String()),
-				zap.String("factor", factor.String()),
-				zap.String("divisor", ringDiv.String()),
-				zap.String("shardsSqrt", shardsSqrt.String()),
-			)
-			factor = factor.Div(ringDiv)
-			factor = factor.Div(shardsSqrt)
-			score = factor.BigInt()
-		}
-
-		m.logger.Debug(
-			"adding score proposal",
-			zap.Int("index", i),
-			zap.String("score", score.String()),
-		)
-		scores = append(scores, scored{idx: i, score: score})
+	scores, err := m.scoreShards(shards, basis, worldBytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "plan and allocate")
 	}
 
 	if len(scores) == 0 {
@@ -323,4 +259,173 @@ func (m *Manager) PlanAndAllocate(
 	}
 
 	return proposals, errors.Wrap(err, "plan and allocate")
+}
+
+func (m *Manager) scoreShards(
+	shards []ShardDescriptor,
+	basis *big.Int,
+	worldBytes *big.Int,
+) ([]scored, error) {
+	scores := make([]scored, 0, len(shards))
+	for i, s := range shards {
+		if len(s.Filter) == 0 || s.Size == 0 {
+			m.logger.Debug(
+				"filtering out empty shard",
+				zap.String("filter", hex.EncodeToString(s.Filter)),
+				zap.Uint64("size", s.Size),
+			)
+			continue
+		}
+
+		if s.Shards == 0 {
+			s.Shards = 1
+		}
+
+		var score *big.Int
+		switch m.Strategy {
+		case DataGreedy:
+			// Pure data coverage: larger shards first.
+			score = big.NewInt(int64(s.Size))
+		default:
+			// factor = (stateSize / worldBytes)
+			factor := decimal.NewFromUint64(s.Size)
+			factor = factor.Mul(decimal.NewFromBigInt(basis, 0))
+			factor = factor.Div(decimal.NewFromBigInt(worldBytes, 0))
+
+			// ring divisor = 2^Ring
+			divisor := int64(1)
+			for j := uint8(0); j < s.Ring+1; j++ {
+				divisor <<= 1
+			}
+			ringDiv := decimal.NewFromInt(divisor)
+
+			// shard factor = sqrt(Shards)
+			shardsSqrt, err := decimal.NewFromUint64(s.Shards).PowWithPrecision(
+				decimal.NewFromBigRat(big.NewRat(1, 2), 53),
+				53,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "score shards")
+			}
+
+			if shardsSqrt.IsZero() {
+				return nil, errors.New("score shards")
+			}
+
+			m.logger.Debug(
+				"calculating score",
+				zap.Int("index", i),
+				zap.String("basis", basis.String()),
+				zap.String("size", big.NewInt(int64(s.Size)).String()),
+				zap.String("worldBytes", worldBytes.String()),
+				zap.String("factor", factor.String()),
+				zap.String("divisor", ringDiv.String()),
+				zap.String("shardsSqrt", shardsSqrt.String()),
+			)
+			factor = factor.Div(ringDiv)
+			factor = factor.Div(shardsSqrt)
+			score = factor.BigInt()
+		}
+
+		m.logger.Debug(
+			"adding score proposal",
+			zap.Int("index", i),
+			zap.String("score", score.String()),
+		)
+		scores = append(scores, scored{idx: i, score: score})
+	}
+	return scores, nil
+}
+
+// DecideJoins evaluates pending shard joins using the latest shard view. It
+// uses the same scoring basis as initial planning. For each pending join:
+//   - If there exists a strictly better shard in the latest view, reject the
+//     existing one (this will result in a new join attempt).
+//   - Otherwise (tie or better), confirm the existing one.
+func (m *Manager) DecideJoins(
+	difficulty uint64,
+	shards []ShardDescriptor,
+	pending [][]byte,
+) error {
+	if len(pending) == 0 {
+		return nil
+	}
+
+	// If no shards remain, we should warn
+	if len(shards) == 0 {
+		m.logger.Warn("no shards available to decide")
+		return nil
+	}
+
+	worldBytes := m.world.GetSize(nil, nil)
+
+	basis := reward.PomwBasis(difficulty, worldBytes.Uint64(), m.Units)
+
+	scores, err := m.scoreShards(shards, basis, worldBytes)
+	if err != nil {
+		return errors.Wrap(err, "decide joins")
+	}
+
+	type srec struct {
+		desc  ShardDescriptor
+		score *big.Int
+	}
+	byHex := make(map[string]srec, len(shards))
+	var bestScore *big.Int
+	for _, sc := range scores {
+		s := shards[sc.idx]
+		key := hex.EncodeToString(s.Filter)
+		byHex[key] = srec{desc: s, score: sc.score}
+		if bestScore == nil || sc.score.Cmp(bestScore) > 0 {
+			bestScore = sc.score
+		}
+	}
+
+	// If nothing valid, reject everything.
+	if bestScore == nil {
+		reject := make([][]byte, 0, len(pending))
+		for _, p := range pending {
+			if len(p) == 0 {
+				continue
+			}
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			reject = append(reject, pc)
+		}
+		return m.workerMgr.DecideAllocations(reject, nil)
+	}
+
+	reject := make([][]byte, 0, len(pending))
+	confirm := make([][]byte, 0, len(pending))
+
+	for _, p := range pending {
+		if len(p) == 0 {
+			continue
+		}
+
+		key := hex.EncodeToString(p)
+		rec, ok := byHex[key]
+		if !ok {
+			// If a pending shard is missing, we should reject it. This could happen
+			// if shard-out produces a bunch of divisions.
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			reject = append(reject, pc)
+			continue
+		}
+
+		// Reject only if there exists a strictly better score.
+		if rec.score.Cmp(bestScore) < 0 {
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			reject = append(reject, pc)
+		} else {
+			// Otherwise confirm
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			confirm = append(confirm, pc)
+		}
+	}
+
+	return m.workerMgr.DecideAllocations(reject, confirm)
 }
