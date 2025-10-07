@@ -609,13 +609,16 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	}
 
 	// Disallow too old of a request
-	if p.FrameNumber < frameNumber-10 {
+	if p.FrameNumber+10 < frameNumber {
 		return false, errors.Wrap(errors.New("outdated request"), "verify")
 	}
 
 	frame, err := p.frameStore.GetGlobalClockFrame(p.FrameNumber)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(errors.Wrap(
+			err,
+			fmt.Sprintf("frame number: %d", p.FrameNumber),
+		), "verify")
 	}
 
 	// Prepare challenge for verification
