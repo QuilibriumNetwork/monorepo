@@ -181,6 +181,7 @@ func ProverJoinFromProtobuf(
 		FrameNumber:                pb.FrameNumber,
 		PublicKeySignatureBLS48581: *pubKeySig,
 		MergeTargets:               mergeTargets,
+		DelegateAddress:            pb.DelegateAddress,
 		Proof:                      pb.Proof,
 		hypergraph:                 hg,
 		keyManager:                 keyManager,
@@ -207,6 +208,7 @@ func (p *ProverJoin) ToProtobuf() *protobufs.ProverJoin {
 		FrameNumber:                p.FrameNumber,
 		PublicKeySignatureBls48581: p.PublicKeySignatureBLS48581.ToProtobuf(),
 		Proof:                      p.Proof,
+		DelegateAddress:            p.DelegateAddress,
 		MergeTargets:               mergeTargets,
 	}
 }
