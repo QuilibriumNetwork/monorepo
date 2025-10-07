@@ -1,6 +1,7 @@
 package global
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"math/rand"
@@ -81,7 +82,18 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 						e.publishKeyRegistry()
 					}
 					if e.proposer != nil {
-						e.evaluateForProposals(data)
+						workers, err := e.workerManager.RangeWorkers()
+						if err != nil {
+							e.logger.Error("could not retrieve workers", zap.Error(err))
+						} else {
+							allocated := true
+							for _, w := range workers {
+								allocated = allocated && w.Allocated
+							}
+							if !allocated {
+								e.evaluateForProposals(data)
+							}
+						}
 					}
 				}
 
@@ -399,6 +411,17 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			info, err := e.proverRegistry.GetProvers(filter)
 			if err != nil {
 				e.logger.Error("failed to get provers", zap.Error(err))
+				continue
+			}
+
+			allocated := false
+			for _, prover := range info {
+				if bytes.Equal(prover.Address, e.getProverAddress()) {
+					allocated = true
+				}
+			}
+
+			if allocated {
 				continue
 			}
 
