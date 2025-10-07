@@ -2172,14 +2172,14 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		return errors.Wrap(err, "propose worker join")
 	}
 
+	for _, res := range results {
+		join.Proof = append(join.Proof, res[:]...)
+	}
+
 	err = join.Prove(frame.Header.FrameNumber)
 	if err != nil {
 		e.logger.Error("could not construct join", zap.Error(err))
 		return errors.Wrap(err, "propose worker join")
-	}
-
-	for _, res := range results {
-		join.Proof = append(join.Proof, res[:]...)
 	}
 
 	bundle := &protobufs.MessageBundle{
