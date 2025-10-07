@@ -1612,7 +1612,8 @@ func (g *GlobalTimeReel) bootstrapFromStore() error {
 }
 
 // persistCanonicalFrames writes a contiguous set of canonical frames to the
-// store in one txn. In non-archive mode, it also prunes old frames from the store.
+// store in one txn. In non-archive mode, it also prunes old frames from the
+// store.
 func (g *GlobalTimeReel) persistCanonicalFrames(
 	frames []*protobufs.GlobalFrame,
 ) error {

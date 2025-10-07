@@ -188,6 +188,7 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 	r.logger.Info(
 		"data worker listening",
 		zap.String("address", r.listenAddrGRPC),
+		zap.String("resolved", lis.Addr().String()),
 	)
 	if len(filter) != 0 {
 		globalTimeReel, err := r.appConsensusEngineFactory.CreateGlobalTimeReel()
@@ -217,6 +218,7 @@ func (r *DataWorkerIPCServer) CreateJoinProof(
 	ctx context.Context,
 	req *protobufs.CreateJoinProofRequest,
 ) (*protobufs.CreateJoinProofResponse, error) {
+	r.logger.Debug("received request to create join proof")
 	proof := r.frameProver.CalculateMultiProof(
 		[32]byte(req.Challenge),
 		req.Difficulty,

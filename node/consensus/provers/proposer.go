@@ -162,9 +162,11 @@ func (m *Manager) PlanAndAllocate(
 			)
 			continue
 		}
+
 		if s.Shards == 0 {
 			s.Shards = 1
 		}
+
 		var score *big.Int
 		switch m.Strategy {
 		case DataGreedy:
@@ -191,6 +193,7 @@ func (m *Manager) PlanAndAllocate(
 			if err != nil {
 				return nil, errors.Wrap(err, "plan and allocate")
 			}
+
 			if shardsSqrt.IsZero() {
 				return nil, errors.New("plan and allocate")
 			}
