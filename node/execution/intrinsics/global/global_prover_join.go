@@ -613,7 +613,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		return false, errors.Wrap(errors.New("outdated request"), "verify")
 	}
 
-	frame, err := p.frameStore.GetGlobalClockFrame(frameNumber)
+	frame, err := p.frameStore.GetGlobalClockFrame(p.FrameNumber)
 	if err != nil {
 		return false, errors.Wrap(err, "verify")
 	}
@@ -737,7 +737,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		p.PublicKeySignatureBLS48581.PublicKey,
 		joinMessage,
 		p.PublicKeySignatureBLS48581.Signature,
-		joinDomain.Bytes(),
+		joinDomain.FillBytes(make([]byte, 32)),
 	)
 	if err != nil || !valid {
 		return false, errors.Wrap(errors.New("invalid signature"), "verify")
