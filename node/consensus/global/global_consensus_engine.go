@@ -2121,9 +2121,10 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		zap.Int("ids_count", len(ids)),
 	)
 
-	for _, svc := range serviceClients {
-		svc := svc
+	for _, core := range coreIds {
+		svc := serviceClients[core]
 		i := idx
+
 		// limit to available joins
 		if i == uint32(joins) {
 			break
