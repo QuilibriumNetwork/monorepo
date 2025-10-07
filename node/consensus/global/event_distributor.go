@@ -370,15 +370,17 @@ func (e *GlobalConsensusEngine) estimateSeniorityFromConfig() uint64 {
 func (e *GlobalConsensusEngine) evaluateForProposals(
 	data *consensustime.GlobalEvent,
 ) {
-	info, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
+	self, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
 	var effectiveSeniority uint64
-	if err != nil || info == nil {
+	if err != nil || self == nil {
 		effectiveSeniority = e.estimateSeniorityFromConfig()
 	} else {
-		effectiveSeniority = info.Seniority
+		effectiveSeniority = self.Seniority
 	}
 
-	shardDescriptors := []provers.ShardDescriptor{}
+	pendingFilters := [][]byte{}
+	proposalDescriptors := []provers.ShardDescriptor{}
+	decideDescriptors := []provers.ShardDescriptor{}
 	shardKeys := e.hypergraph.Commit()
 	for key := range shardKeys {
 		shards, err := e.shardsStore.GetAppShards(
@@ -415,14 +417,15 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			}
 
 			allocated := false
-			for _, prover := range info {
-				if bytes.Equal(prover.Address, e.getProverAddress()) {
-					allocated = true
+			pending := false
+			for _, allocation := range self.Allocations {
+				if bytes.Equal(allocation.ConfirmationFilter, filter) {
+					allocated = allocation.Status != 4
+					if e.config.P2P.Network != 0 || data.Frame.Header.FrameNumber > 252840 {
+						pending = allocation.Status == 0 &&
+							allocation.JoinFrameNumber+360 <= data.Frame.Header.FrameNumber
+					}
 				}
-			}
-
-			if allocated {
-				continue
 			}
 
 			size := e.hypergraph.GetSize(&key, path)
@@ -486,8 +489,23 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				zap.Int("ring", len(above)/8),
 				zap.Int("shard_count", int(shardCount)),
 			)
-			shardDescriptors = append(
-				shardDescriptors,
+
+			if allocated && pending {
+				pendingFilters = append(pendingFilters, filter)
+			}
+			if !allocated {
+				proposalDescriptors = append(
+					proposalDescriptors,
+					provers.ShardDescriptor{
+						Filter: filter,
+						Size:   size.Uint64(),
+						Ring:   uint8(len(above) / 8),
+						Shards: shardCount,
+					},
+				)
+			}
+			decideDescriptors = append(
+				decideDescriptors,
 				provers.ShardDescriptor{
 					Filter: filter,
 					Size:   size.Uint64(),
@@ -497,18 +515,35 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			)
 		}
 	}
-	proposals, err := e.proposer.PlanAndAllocate(
-		uint64(data.Frame.Header.Difficulty),
-		shardDescriptors,
-		0,
-	)
-	if err != nil {
-		e.logger.Error("could not plan shard allocations", zap.Error(err))
-	} else {
-		e.logger.Info(
-			"proposed joins",
-			zap.Int("proposals", len(proposals)),
+	if len(proposalDescriptors) != 0 {
+		proposals, err := e.proposer.PlanAndAllocate(
+			uint64(data.Frame.Header.Difficulty),
+			proposalDescriptors,
+			0,
 		)
+		if err != nil {
+			e.logger.Error("could not plan shard allocations", zap.Error(err))
+		} else {
+			e.logger.Info(
+				"proposed joins",
+				zap.Int("proposals", len(proposals)),
+			)
+		}
+	}
+	if len(pendingFilters) != 0 {
+		err = e.proposer.DecideJoins(
+			uint64(data.Frame.Header.Difficulty),
+			decideDescriptors,
+			pendingFilters,
+		)
+		if err != nil {
+			e.logger.Error("could not decide shard allocations", zap.Error(err))
+		} else {
+			e.logger.Info(
+				"decided on joins",
+				zap.Int("joins", len(pendingFilters)),
+			)
+		}
 	}
 }
 
