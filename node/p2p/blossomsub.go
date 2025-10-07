@@ -64,11 +64,12 @@ type appScore struct {
 }
 
 type BlossomSub struct {
-	ps         *blossomsub.PubSub
-	ctx        context.Context
-	logger     *zap.Logger
-	peerID     peer.ID
-	bitmaskMap map[string]*blossomsub.Bitmask
+	ps            *blossomsub.PubSub
+	ctx           context.Context
+	logger        *zap.Logger
+	peerID        peer.ID
+	derivedPeerID peer.ID
+	bitmaskMap    map[string]*blossomsub.Bitmask
 	// Track which bit slices belong to which original bitmasks, used to reference
 	// count bitmasks for closed subscriptions
 	subscriptionTracker map[string][][]byte
@@ -315,6 +316,7 @@ func NewBlossomSubWithHost(
 	))
 	blossomOpts = append(blossomOpts, observability.WithPrometheusRawTracer())
 	if p2pConfig.Network == 0 {
+		logger.Info("enabling blacklist for bootstrappers for blossomsub")
 		blossomOpts = append(blossomOpts, blossomsub.WithPeerFilter(
 			internal.NewStaticPeerFilter(
 				[]peer.ID{},
@@ -410,30 +412,33 @@ func NewBlossomSub(
 	}
 
 	isBootstrapPeer := false
-	peerId := getPeerID(p2pConfig)
 
-	if p2pConfig.Network == 0 {
-		for _, peerAddr := range config.BootstrapPeers {
-			peerinfo, err := peer.AddrInfoFromString(peerAddr)
-			if err != nil {
-				logger.Panic("error getting peer info", zap.Error(err))
-			}
+	if coreId == 0 {
+		peerId := getPeerID(p2pConfig)
 
-			if bytes.Equal([]byte(peerinfo.ID), []byte(peerId)) {
-				isBootstrapPeer = true
-				break
-			}
-		}
-	} else {
-		for _, peerAddr := range p2pConfig.BootstrapPeers {
-			peerinfo, err := peer.AddrInfoFromString(peerAddr)
-			if err != nil {
-				logger.Panic("error getting peer info", zap.Error(err))
-			}
+		if p2pConfig.Network == 0 {
+			for _, peerAddr := range config.BootstrapPeers {
+				peerinfo, err := peer.AddrInfoFromString(peerAddr)
+				if err != nil {
+					logger.Panic("error getting peer info", zap.Error(err))
+				}
 
-			if bytes.Equal([]byte(peerinfo.ID), []byte(peerId)) {
-				isBootstrapPeer = true
-				break
+				if bytes.Equal([]byte(peerinfo.ID), []byte(peerId)) {
+					isBootstrapPeer = true
+					break
+				}
+			}
+		} else {
+			for _, peerAddr := range p2pConfig.BootstrapPeers {
+				peerinfo, err := peer.AddrInfoFromString(peerAddr)
+				if err != nil {
+					logger.Panic("error getting peer info", zap.Error(err))
+				}
+
+				if bytes.Equal([]byte(peerinfo.ID), []byte(peerId)) {
+					isBootstrapPeer = true
+					break
+				}
 			}
 		}
 	}
@@ -456,6 +461,7 @@ func NewBlossomSub(
 	}
 
 	var privKey crypto.PrivKey
+	var derivedPeerId peer.ID
 	if p2pConfig.PeerPrivKey != "" {
 		peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
 		if err != nil {
@@ -467,7 +473,21 @@ func NewBlossomSub(
 			logger.Panic("error unmarshaling peerkey", zap.Error(err))
 		}
 
-		opts = append(opts, libp2p.Identity(privKey))
+		derivedPeerId, err = peer.IDFromPrivateKey(privKey)
+		if err != nil {
+			logger.Panic("error deriving peer id", zap.Error(err))
+		}
+
+		if coreId == 0 {
+			opts = append(opts, libp2p.Identity(privKey))
+		} else {
+			workerKey, _, err := crypto.GenerateEd448Key(rand.Reader)
+			if err != nil {
+				logger.Panic("error generating worker peerkey", zap.Error(err))
+			}
+
+			opts = append(opts, libp2p.Identity(workerKey))
+		}
 	}
 
 	allowedPeers := []peer.AddrInfo{}
@@ -540,6 +560,7 @@ func NewBlossomSub(
 		signKey:             privKey,
 		peerScore:           make(map[string]*appScore),
 		p2pConfig:           *p2pConfig,
+		derivedPeerID:       derivedPeerId,
 	}
 
 	h, err := libp2p.New(opts...)
@@ -719,6 +740,7 @@ func NewBlossomSub(
 	)
 	blossomOpts = append(blossomOpts, observability.WithPrometheusRawTracer())
 	if p2pConfig.Network == 0 {
+		logger.Info("enabling blacklist for bootstrappers for blossomsub")
 		blossomOpts = append(blossomOpts, blossomsub.WithPeerFilter(
 			internal.NewStaticPeerFilter(
 				[]peer.ID{},
@@ -881,7 +903,12 @@ func (b *BlossomSub) refreshScores() {
 }
 
 func (b *BlossomSub) PublishToBitmask(bitmask []byte, data []byte) error {
-	err := b.ps.Publish(b.ctx, bitmask, data)
+	err := b.ps.Publish(
+		b.ctx,
+		bitmask,
+		data,
+		blossomsub.WithSecretKeyAndPeerId(b.signKey, b.derivedPeerID),
+	)
 	if err != nil && errors.Is(err, blossomsub.ErrBitmaskClosed) &&
 		b.p2pConfig.Network == 99 {
 		// Ignore bitmask closed errors for devnet
@@ -1102,7 +1129,7 @@ func (b *BlossomSub) UnregisterValidator(bitmask []byte) error {
 }
 
 func (b *BlossomSub) GetPeerID() []byte {
-	return []byte(b.peerID)
+	return []byte(b.derivedPeerID)
 }
 
 func (b *BlossomSub) GetRandomPeer(bitmask []byte) ([]byte, error) {

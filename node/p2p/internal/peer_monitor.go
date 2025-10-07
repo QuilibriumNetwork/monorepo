@@ -18,7 +18,11 @@ type peerMonitor struct {
 	attempts int
 }
 
-func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, peer peer.ID) bool {
+func (pm *peerMonitor) pingOnce(
+	ctx context.Context,
+	logger *zap.Logger,
+	peer peer.ID,
+) bool {
 	pingCtx, cancel := context.WithTimeout(ctx, pm.timeout)
 	defer cancel()
 	select {
@@ -36,7 +40,12 @@ func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, peer pe
 	return true
 }
 
-func (pm *peerMonitor) ping(ctx context.Context, logger *zap.Logger, wg *sync.WaitGroup, peer peer.ID) {
+func (pm *peerMonitor) ping(
+	ctx context.Context,
+	logger *zap.Logger,
+	wg *sync.WaitGroup,
+	peer peer.ID,
+) {
 	defer wg.Done()
 	for i := 0; i < pm.attempts; i++ {
 		pm.pingOnce(ctx, logger, peer)
@@ -63,11 +72,15 @@ func (pm *peerMonitor) run(ctx context.Context, logger *zap.Logger) {
 	}
 }
 
-// MonitorPeers periodically looks up the peers connected to the host and pings them
-// repeatedly to ensure they are still reachable. If the peer is not reachable after
-// the attempts, the connections to the peer are closed.
+// MonitorPeers periodically looks up the peers connected to the host and pings
+// them repeatedly to ensure they are still reachable. If the peer is not
+// reachable after the attempts, the connections to the peer are closed.
 func MonitorPeers(
-	ctx context.Context, logger *zap.Logger, h host.Host, timeout, period time.Duration, attempts int,
+	ctx context.Context,
+	logger *zap.Logger,
+	h host.Host,
+	timeout, period time.Duration,
+	attempts int,
 ) {
 	ps := ping.NewPingService(h)
 	pm := &peerMonitor{
