@@ -419,11 +419,19 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			allocated := false
 			pending := false
 			if self != nil {
+				e.logger.Debug("checking allocations")
 				for _, allocation := range self.Allocations {
+					e.logger.Debug("checking allocation", zap.String("filter", hex.EncodeToString(allocation.ConfirmationFilter)))
 					if bytes.Equal(allocation.ConfirmationFilter, filter) {
 						allocated = allocation.Status != 4
 						if e.config.P2P.Network != 0 ||
 							data.Frame.Header.FrameNumber > 252840 {
+							e.logger.Debug(
+								"checking pending status of allocation",
+								zap.Int("status", int(allocation.Status)),
+								zap.Uint64("join_frame_number", allocation.JoinFrameNumber),
+								zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
+							)
 							pending = allocation.Status == 0 &&
 								allocation.JoinFrameNumber+360 <= data.Frame.Header.FrameNumber
 						}

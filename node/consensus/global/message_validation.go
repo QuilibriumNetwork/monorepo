@@ -118,6 +118,10 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 	peerID peer.ID,
 	message *pb.Message,
 ) tp2p.ValidationResult {
+	e.logger.Debug(
+		"validating prover message from peer",
+		zap.String("peer_id", peerID.String()),
+	)
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
 		e.logger.Error(
@@ -133,6 +137,10 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 	switch typePrefix {
 
 	case protobufs.MessageBundleType:
+		e.logger.Debug(
+			"validating message bundle from peer",
+			zap.String("peer_id", peerID.String()),
+		)
 		// Prover messages come wrapped in MessageBundle
 		messageBundle := &protobufs.MessageBundle{}
 		if err := messageBundle.FromCanonicalBytes(message.Data); err != nil {
@@ -147,6 +155,7 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 
 		now := time.Now().UnixMilli()
 		if messageBundle.Timestamp > now+5000 || messageBundle.Timestamp < now-5000 {
+			e.logger.Debug("message too late or too early")
 			return tp2p.ValidationResultIgnore
 		}
 

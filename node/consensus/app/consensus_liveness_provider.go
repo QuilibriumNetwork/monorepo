@@ -114,7 +114,7 @@ func (p *AppLivenessProvider) Collect(
 			state,
 		)
 		if err != nil {
-			p.engine.logger.Error(
+			p.engine.logger.Info(
 				"could not validate for execution",
 				zap.Int("message_index", i),
 				zap.Error(err),

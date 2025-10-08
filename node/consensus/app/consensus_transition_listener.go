@@ -10,7 +10,7 @@ type AppTracer struct {
 }
 
 func (t *AppTracer) Trace(message string) {
-	t.logger.Debug(message)
+	// t.logger.Debug(message)
 }
 
 func (t *AppTracer) Error(message string, err error) {

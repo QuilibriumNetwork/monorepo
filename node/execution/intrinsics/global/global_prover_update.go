@@ -88,6 +88,14 @@ func (p *ProverUpdate) Materialize(
 		)
 	}
 
+	rewardAddress, err := poseidon.HashBytes(slices.Concat(
+		token.QUIL_TOKEN_ADDRESS[:],
+		proverAddress,
+	))
+	if err != nil {
+		return nil, errors.Wrap(err, "materialize")
+	}
+
 	// Ensure the prover exists (under GLOBAL_INTRINSIC_ADDRESS + proverAddress)
 	proverFullAddr := [64]byte{}
 	copy(proverFullAddr[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
@@ -132,12 +140,11 @@ func (p *ProverUpdate) Materialize(
 		)
 	}
 
-	// Now update only the reward entry under the QUIL token namespace:
-	// key = (token.QUIL_TOKEN_ADDRESS , proverAddress) in VertexAddsDiscriminator
+	// Now update only the reward entry in VertexAddsDiscriminator
 	// We will preserve the existing Balance and only set DelegateAddress.
 	rewardPriorVertex, err := hg.Get(
-		token.QUIL_TOKEN_ADDRESS,
-		proverAddress,
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+		rewardAddress.FillBytes(make([]byte, 32)),
 		hgstate.VertexAddsDiscriminator,
 	)
 	if err != nil {
@@ -162,7 +169,7 @@ func (p *ProverUpdate) Materialize(
 	// Set new DelegateAddress
 	if err := p.rdfMultiprover.Set(
 		GLOBAL_RDF_SCHEMA,
-		token.QUIL_TOKEN_ADDRESS,
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 		"reward:ProverReward",
 		"DelegateAddress",
 		p.DelegateAddress,
@@ -172,8 +179,8 @@ func (p *ProverUpdate) Materialize(
 	}
 
 	unmodifiedPrior, err := hg.Get(
-		token.QUIL_TOKEN_ADDRESS,
-		proverAddress,
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+		rewardAddress.FillBytes(make([]byte, 32)),
 		hgstate.VertexAddsDiscriminator,
 	)
 	var unmodifiedTree *tries.VectorCommitmentTree
@@ -190,16 +197,16 @@ func (p *ProverUpdate) Materialize(
 
 	// Build the updated reward vertex
 	rewardVertex := hg.NewVertexAddMaterializedState(
-		[32]byte(token.QUIL_TOKEN_ADDRESS),
-		[32]byte(slices.Clone(proverAddress)),
+		[32]byte(intrinsics.GLOBAL_INTRINSIC_ADDRESS),
+		[32]byte(slices.Clone(rewardAddress.FillBytes(make([]byte, 32)))),
 		frameNumber,
 		unmodifiedTree,
 		rewardPriorTree,
 	)
 
 	if err := hg.Set(
-		token.QUIL_TOKEN_ADDRESS,
-		proverAddress,
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+		rewardAddress.FillBytes(make([]byte, 32)),
 		hgstate.VertexAddsDiscriminator,
 		frameNumber,
 		rewardVertex,

@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/exp/slices"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
+	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
@@ -149,13 +150,6 @@ func (r *ProverRegistry) GetProverInfo(
 	)
 
 	if info, exists := r.proverCache[string(address)]; exists {
-		r.logger.Debug(
-			"prover info found",
-			zap.String("address", fmt.Sprintf("%x", address)),
-			zap.String("public_key", fmt.Sprintf("%x", info.PublicKey)),
-			zap.Uint8("status", uint8(info.Status)),
-			zap.Int("allocation_count", len(info.Allocations)),
-		)
 		return info, nil
 	}
 
@@ -1125,20 +1119,38 @@ func (r *ProverRegistry) processProverChange(
 
 	switch change.StateChange {
 	case state.CreateStateChangeEvent, state.UpdateStateChangeEvent:
+		if !bytes.Equal(change.Discriminator, hgstate.VertexAddsDiscriminator) {
+			return nil
+		}
+
 		// A prover was created or updated
 		if change.Value != nil && change.Value.DataValue() != nil {
 			data := change.Value.DataValue()
 
-			// Check if this is a Prover or ProverAllocation
-			publicKey, err := r.rdfMultiprover.Get(
+			t, err := r.rdfMultiprover.GetType(
 				global.GLOBAL_RDF_SCHEMA,
-				"prover:Prover",
-				"PublicKey",
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 				data,
 			)
+			if err != nil {
+				return nil
+			}
 
-			if err == nil && len(publicKey) > 0 {
-				// This is a Prover vertex
+			// Check if this is a Prover or ProverAllocation
+			switch t {
+			case "prover:Prover":
+				r.logger.Debug("processing prover change")
+				publicKey, err := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"prover:Prover",
+					"PublicKey",
+					data,
+				)
+				if err != nil {
+					r.logger.Debug("no public key")
+					return nil
+				}
+
 				statusBytes, err := r.rdfMultiprover.Get(
 					global.GLOBAL_RDF_SCHEMA,
 					"prover:Prover",
@@ -1146,9 +1158,11 @@ func (r *ProverRegistry) processProverChange(
 					data,
 				)
 				if err != nil || len(statusBytes) == 0 {
+					r.logger.Debug("no status")
 					return nil // Skip if no status
 				}
 				status := statusBytes[0]
+				r.logger.Debug("status of prover change", zap.Int("status", int(status)))
 
 				// Map internal status to our ProverStatus enum
 				var mappedStatus consensus.ProverStatus
@@ -1234,33 +1248,16 @@ func (r *ProverRegistry) processProverChange(
 					proverInfo.DelegateAddress = delegateAddress
 					proverInfo.KickFrameNumber = kickFrameNumber
 				}
-
-				// If global prover is active, add to global trie
-				if mappedStatus == consensus.ProverStatusActive {
-					if err := r.addProverToTrie(
-						proverAddress,
-						publicKey,
-						nil,
-						frameNumber,
-					); err != nil {
-						return errors.Wrap(err, "failed to add prover to global trie")
-					}
-				} else {
-					// Remove from global trie if not active
-					if err := r.removeProverFromTrie(proverAddress, nil); err != nil {
-						return errors.Wrap(err, "failed to remove prover from global trie")
-					}
-				}
-			} else {
-				// Try to read as ProverAllocation
+			case "allocation:ProverAllocation":
+				r.logger.Debug("processing prover allocation change")
 				proverRef, err := r.rdfMultiprover.Get(
 					global.GLOBAL_RDF_SCHEMA,
 					"allocation:ProverAllocation",
-					"prover:Prover",
+					"Prover",
 					data,
 				)
 				if err != nil || len(proverRef) == 0 {
-					// Neither Prover nor ProverAllocation, skip
+					r.logger.Debug("no prover")
 					return nil
 				}
 
@@ -1272,6 +1269,7 @@ func (r *ProverRegistry) processProverChange(
 					data,
 				)
 				if err != nil || len(statusBytes) == 0 {
+					r.logger.Debug("no status")
 					return nil
 				}
 				status := statusBytes[0]
@@ -1302,12 +1300,15 @@ func (r *ProverRegistry) processProverChange(
 				)
 
 				// Extract filters
-				confirmationFilter, _ := r.rdfMultiprover.Get(
+				confirmationFilter, err := r.rdfMultiprover.Get(
 					global.GLOBAL_RDF_SCHEMA,
 					"allocation:ProverAllocation",
 					"ConfirmationFilter",
 					data,
 				)
+				if err != nil {
+					return errors.Wrap(err, "process prover change")
+				}
 
 				// Find the prover this allocation belongs to
 				if proverInfo, exists := r.proverCache[string(proverRef)]; exists {
@@ -1320,7 +1321,7 @@ func (r *ProverRegistry) processProverChange(
 							confirmationFilter,
 							frameNumber,
 						); err != nil {
-							return errors.Wrap(err, "failed to add prover to filter trie")
+							return errors.Wrap(err, "process prover change")
 						}
 					} else {
 						// Remove from filter trie if not active
@@ -1330,7 +1331,7 @@ func (r *ProverRegistry) processProverChange(
 						); err != nil {
 							return errors.Wrap(
 								err,
-								"failed to remove prover from filter trie",
+								"process prover change",
 							)
 						}
 					}

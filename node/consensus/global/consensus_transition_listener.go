@@ -10,7 +10,7 @@ type GlobalTracer struct {
 }
 
 func (t *GlobalTracer) Trace(message string) {
-	t.logger.Debug(message)
+	// t.logger.Debug(message)
 }
 
 func (t *GlobalTracer) Error(message string, err error) {

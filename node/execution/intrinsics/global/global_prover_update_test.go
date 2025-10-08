@@ -241,23 +241,24 @@ func TestProverUpdate_Materialize_PreservesBalance(t *testing.T) {
 	nonZero := make([]byte, 32)
 	binary.BigEndian.PutUint64(nonZero[24:], 12345)
 	require.NoError(t, rdf.Set(
-		global.GLOBAL_RDF_SCHEMA, token.QUIL_TOKEN_ADDRESS,
+		global.GLOBAL_RDF_SCHEMA, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 		"reward:ProverReward", "Balance", nonZero, rewardPrior,
 	))
 
 	fullProver := [64]byte{}
 	fullReward := [64]byte{}
+	rewardAddr, err := poseidon.HashBytes(slices.Concat(token.QUIL_TOKEN_ADDRESS[:], addr))
 	copy(fullProver[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-	copy(fullReward[:32], token.QUIL_TOKEN_ADDRESS)
+	copy(fullReward[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
 	copy(fullProver[32:], addr)
-	copy(fullReward[32:], addr)
+	copy(fullReward[32:], rewardAddr.FillBytes(make([]byte, 32)))
 	mockHG.On("GetVertex", fullProver).Return(nil, nil)
 	mockHG.On("GetVertexData", fullProver).Return(proverTree, nil)
 	mockHG.On("GetVertex", fullReward).Return(nil, nil)
 	mockHG.On("GetVertexData", fullReward).Return(rewardPrior, nil)
 
 	// Hypergraph lookups
-	mockHG.On("Get", token.QUIL_TOKEN_ADDRESS, addr, hgstate.VertexAddsDiscriminator).Return(rewardPrior, nil)
+	mockHG.On("Get", intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], rewardAddr.FillBytes(make([]byte, 32)), hgstate.VertexAddsDiscriminator).Return(rewardPrior, nil)
 	mockHG.On("Get", intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], addr, hgstate.HyperedgeAddsDiscriminator).Return(nil, assert.AnError)
 
 	delegate := make([]byte, 32)
@@ -271,8 +272,8 @@ func TestProverUpdate_Materialize_PreservesBalance(t *testing.T) {
 		On("SetVertexData",
 			mock.Anything,
 			mock.MatchedBy(func(id [64]byte) bool {
-				return bytes.Equal(id[:32], token.QUIL_TOKEN_ADDRESS) &&
-					bytes.Equal(id[32:], addr)
+				return bytes.Equal(id[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:]) &&
+					bytes.Equal(id[32:], rewardAddr.FillBytes(make([]byte, 32)))
 			}),
 			mock.MatchedBy(func(tree *qcrypto.VectorCommitmentTree) bool {
 				d, err := rdf.Get(global.GLOBAL_RDF_SCHEMA, "reward:ProverReward", "DelegateAddress", tree)

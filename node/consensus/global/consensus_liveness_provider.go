@@ -11,10 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
-	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
-	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
@@ -72,9 +69,6 @@ func (p *GlobalLivenessProvider) Collect(
 
 	acceptedMessages := []*protobufs.Message{}
 
-	var state state.State
-	state = hgstate.NewHypergraphState(p.engine.hypergraph)
-
 	frameNumber := uint64(0)
 	currentFrame, _ := p.engine.globalTimeReel.GetHead()
 	if currentFrame != nil && currentFrame.Header != nil {
@@ -88,9 +82,13 @@ func (p *GlobalLivenessProvider) Collect(
 		zap.Int("message_count", len(messages)),
 	)
 	for i, message := range messages {
-		costBasis, err := p.engine.executionManager.GetCost(message.Payload)
+		err := p.engine.executionManager.ValidateMessage(
+			frameNumber,
+			message.Address,
+			message.Payload,
+		)
 		if err != nil {
-			p.engine.logger.Error(
+			p.engine.logger.Debug(
 				"invalid message",
 				zap.Int("message_index", i),
 				zap.Error(err),
@@ -98,39 +96,6 @@ func (p *GlobalLivenessProvider) Collect(
 			continue
 		}
 
-		p.engine.currentDifficultyMu.RLock()
-		difficulty := uint64(p.engine.currentDifficulty)
-		p.engine.currentDifficultyMu.RUnlock()
-		var baseline *big.Int
-		if costBasis.Cmp(big.NewInt(0)) == 0 {
-			baseline = big.NewInt(0)
-		} else {
-			baseline = reward.GetBaselineFee(
-				difficulty,
-				p.engine.hypergraph.GetSize(nil, nil).Uint64(),
-				costBasis.Uint64(),
-				8000000000,
-			)
-			baseline.Quo(baseline, costBasis)
-		}
-
-		result, err := p.engine.executionManager.ProcessMessage(
-			frameNumber,
-			baseline,
-			message.Address,
-			message.Payload,
-			state,
-		)
-		if err != nil {
-			p.engine.logger.Error(
-				"error processing message",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		state = result.State
 		acceptedMessages = append(acceptedMessages, message)
 	}
 

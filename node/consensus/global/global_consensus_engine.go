@@ -1166,8 +1166,6 @@ func (e *GlobalConsensusEngine) materialize(
 	var state state.State
 	state = hgstate.NewHypergraphState(e.hypergraph)
 
-	acceptedMessages := []*protobufs.MessageBundle{}
-
 	e.logger.Debug(
 		"materializing messages",
 		zap.Int("message_count", len(requests)),
@@ -1235,15 +1233,14 @@ func (e *GlobalConsensusEngine) materialize(
 		}
 
 		state = result.State
-		acceptedMessages = append(acceptedMessages, request)
+	}
+
+	if err := state.Commit(); err != nil {
+		return errors.Wrap(err, "materialize")
 	}
 
 	err := e.proverRegistry.ProcessStateTransition(state, frameNumber)
 	if err != nil {
-		return errors.Wrap(err, "materialize")
-	}
-
-	if err := state.Commit(); err != nil {
 		return errors.Wrap(err, "materialize")
 	}
 
