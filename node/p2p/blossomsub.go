@@ -349,6 +349,7 @@ func NewBlossomSubWithHost(
 	bs.peerID = peerID
 	bs.h = host
 	bs.signKey = privKey
+	bs.derivedPeerID = peerID
 
 	go bs.background(ctx)
 
