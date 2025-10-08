@@ -29,6 +29,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 	thypergraph "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
@@ -230,6 +231,7 @@ func TestValidMintWithProofOfMeaningfulWorkTransaction(t *testing.T) {
 	assert.NoError(t, err)
 
 	proveraddr, err := poseidon.HashBytes(prover.Public().([]byte))
+	rewardaddr, err := poseidon.HashBytes(slices.Concat(token.QUIL_TOKEN_ADDRESS[:], proveraddr.FillBytes(make([]byte, 32))))
 	txn, _ := hg.NewTransaction(false)
 	rand1 := make([]byte, 32)
 	rand2 := make([]byte, 32)
@@ -240,10 +242,10 @@ func TestValidMintWithProofOfMeaningfulWorkTransaction(t *testing.T) {
 	tree := &qcrypto.VectorCommitmentTree{}
 	tree.Insert([]byte{0}, proveraddr.FillBytes(make([]byte, 32)), nil, big.NewInt(0))
 	tree.Insert([]byte{1 << 2}, big.NewInt(10000).FillBytes(make([]byte, 32)), nil, big.NewInt(0))
-	vert := hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(proveraddr.FillBytes(make([]byte, 32))), tree.Commit(ip, false), big.NewInt(74))
+	vert := hypergraph.NewVertex([32]byte(intrinsics.GLOBAL_INTRINSIC_ADDRESS), [32]byte(rewardaddr.FillBytes(make([]byte, 32))), tree.Commit(ip, false), big.NewInt(74))
 	err = hg.AddVertex(txn, vert)
 	assert.NoError(t, err)
-	err = hg.SetVertexData(txn, [64]byte(slices.Concat(token.QUIL_TOKEN_ADDRESS[:], proveraddr.FillBytes(make([]byte, 32)))), tree)
+	err = hg.SetVertexData(txn, [64]byte(slices.Concat(intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], rewardaddr.FillBytes(make([]byte, 32)))), tree)
 	assert.NoError(t, err)
 	hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(rand1), nil, big.NewInt(74)))
 	err = txn.Commit()
@@ -2420,6 +2422,9 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 	proveraddr, err := poseidon.HashBytes(prover.Public().([]byte))
 	assert.NoError(t, err)
 
+	rewardAddress, err := poseidon.HashBytes(slices.Concat(token.QUIL_TOKEN_ADDRESS[:], proveraddr.FillBytes(make([]byte, 32))))
+	assert.NoError(t, err)
+
 	proverTree := &qcrypto.VectorCommitmentTree{}
 	proverTree.Insert([]byte{0}, proveraddr.FillBytes(make([]byte, 32)), nil, big.NewInt(0))
 	proverTree.Insert([]byte{1 << 2}, big.NewInt(10000).FillBytes(make([]byte, 32)), nil, big.NewInt(0))
@@ -2427,8 +2432,8 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 	// Set up prover with 10000 balance
 	txn, _ := hg.NewTransaction(false)
 	vert := hypergraph.NewVertex(
-		[32]byte(token.QUIL_TOKEN_ADDRESS),
-		[32]byte(proveraddr.FillBytes(make([]byte, 32))),
+		[32]byte(intrinsics.GLOBAL_INTRINSIC_ADDRESS),
+		[32]byte(rewardAddress.FillBytes(make([]byte, 32))),
 		proverTree.Commit(ip, false),
 		big.NewInt(74),
 	)
@@ -2656,7 +2661,7 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 	assert.Nil(t, acceptSpendVertex) // Should not be spent
 
 	// Verify prover balance is reduced by 10000
-	globalVertex, err := hg.GetVertexData([64]byte(append(token.QUIL_TOKEN_ADDRESS[:], proveraddr.FillBytes(make([]byte, 32))...)))
+	globalVertex, err := hg.GetVertexData([64]byte(append(intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], rewardAddress.FillBytes(make([]byte, 32))...)))
 	assert.NoError(t, err)
 	assert.NotNil(t, globalVertex)
 	amtBytes, err := globalVertex.Get([]byte{1 << 2})

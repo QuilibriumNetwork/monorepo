@@ -266,9 +266,16 @@ func (p *ProverJoin) Materialize(
 			delegateAddress = p.DelegateAddress
 		}
 
+		derivedRewardAddress, err := poseidon.HashBytes(
+			slices.Concat(token.QUIL_TOKEN_ADDRESS[:], proverAddress),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "materialize")
+		}
+
 		err = p.rdfMultiprover.Set(
 			GLOBAL_RDF_SCHEMA,
-			token.QUIL_TOKEN_ADDRESS,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 			"reward:ProverReward",
 			"DelegateAddress",
 			delegateAddress,
@@ -282,7 +289,7 @@ func (p *ProverJoin) Materialize(
 		zeroBalance := make([]byte, 32)
 		err = p.rdfMultiprover.Set(
 			GLOBAL_RDF_SCHEMA,
-			token.QUIL_TOKEN_ADDRESS,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 			"reward:ProverReward",
 			"Balance",
 			zeroBalance,
@@ -294,16 +301,16 @@ func (p *ProverJoin) Materialize(
 
 		// Create reward vertex in QUIL token address
 		rewardVertex := hg.NewVertexAddMaterializedState(
-			[32]byte(token.QUIL_TOKEN_ADDRESS),
-			[32]byte(proverAddress),
+			[32]byte(intrinsics.GLOBAL_INTRINSIC_ADDRESS[:]),
+			[32]byte(derivedRewardAddress.FillBytes(make([]byte, 32))),
 			frameNumber,
 			nil,
 			rewardTree,
 		)
 
 		err = hg.Set(
-			token.QUIL_TOKEN_ADDRESS,
-			proverAddress,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			derivedRewardAddress.FillBytes(make([]byte, 32)),
 			hgstate.VertexAddsDiscriminator,
 			frameNumber,
 			rewardVertex,
