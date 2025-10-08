@@ -418,12 +418,15 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 
 			allocated := false
 			pending := false
-			for _, allocation := range self.Allocations {
-				if bytes.Equal(allocation.ConfirmationFilter, filter) {
-					allocated = allocation.Status != 4
-					if e.config.P2P.Network != 0 || data.Frame.Header.FrameNumber > 252840 {
-						pending = allocation.Status == 0 &&
-							allocation.JoinFrameNumber+360 <= data.Frame.Header.FrameNumber
+			if self != nil {
+				for _, allocation := range self.Allocations {
+					if bytes.Equal(allocation.ConfirmationFilter, filter) {
+						allocated = allocation.Status != 4
+						if e.config.P2P.Network != 0 ||
+							data.Frame.Header.FrameNumber > 252840 {
+							pending = allocation.Status == 0 &&
+								allocation.JoinFrameNumber+360 <= data.Frame.Header.FrameNumber
+						}
 					}
 				}
 			}
