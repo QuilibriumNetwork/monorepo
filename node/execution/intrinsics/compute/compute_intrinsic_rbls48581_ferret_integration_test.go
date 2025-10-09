@@ -392,45 +392,6 @@ func main(a, b int) int {
 		assert.Contains(t, err.Error(), "unknown operation type: 99")
 	})
 
-	// Test Lock/Unlock mechanism
-	t.Run("LockUnlock", func(t *testing.T) {
-		// Test addresses
-		writeAddr1 := []byte("write_address_1")
-		writeAddr2 := []byte("write_address_2")
-		readAddr1 := []byte("read_address_1")
-		readAddr2 := []byte("read_address_2")
-
-		// Lock addresses
-		err := computeIntrinsic.Lock([][]byte{writeAddr1}, [][]byte{readAddr1})
-		require.NoError(t, err)
-
-		// Try to lock same write address again - should fail
-		err = computeIntrinsic.Lock([][]byte{writeAddr1}, [][]byte{})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "already locked for writing")
-
-		// Try to lock for reading an address that's locked for writing - should fail
-		err = computeIntrinsic.Lock([][]byte{}, [][]byte{writeAddr1})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "already locked for writing")
-
-		// Lock additional addresses
-		err = computeIntrinsic.Lock([][]byte{writeAddr2}, [][]byte{readAddr2})
-		require.NoError(t, err)
-
-		// Unlock first set
-		err = computeIntrinsic.Unlock([][]byte{writeAddr1}, [][]byte{readAddr1})
-		require.NoError(t, err)
-
-		// Now we should be able to lock writeAddr1 again
-		err = computeIntrinsic.Lock([][]byte{writeAddr1}, [][]byte{})
-		require.NoError(t, err)
-
-		// Unlock all
-		err = computeIntrinsic.Unlock([][]byte{writeAddr1, writeAddr2}, [][]byte{readAddr2})
-		require.NoError(t, err)
-	})
-
 	// Test LoadComputeIntrinsic
 	t.Run("LoadComputeIntrinsic", func(t *testing.T) {
 		var state state.State = hgstate.NewHypergraphState(hg)

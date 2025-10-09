@@ -281,27 +281,21 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	}
 	t.Log("  - Engine started successfully")
 
-	// Register an executor to generate activity
-	t.Log("Step 3: Registering executor")
-	executor := newMockIntegrationExecutor("test-executor")
-	engine.RegisterExecutor(executor, 0)
-	t.Log("  - Registered executor: test-executor")
-
 	// Wait for genesis initialization
-	t.Log("Step 4: Waiting for genesis initialization (0 peers)")
+	t.Log("Step 3: Waiting for genesis initialization (0 peers)")
 	time.Sleep(2 * time.Second)
 
 	// Now increase peer count to allow normal operation
-	t.Log("Step 5: Enabling normal operation")
+	t.Log("Step 4: Enabling normal operation")
 	pubsub.peerCount = 10
 	t.Log("  - Increased peer count to 10")
 
 	// Let it run
-	t.Log("Step 6: Letting engine run and produce frames")
+	t.Log("Step 5: Letting engine run and produce frames")
 	time.Sleep(20 * time.Second)
 
 	// Verify results
-	t.Log("Step 7: Verifying results")
+	t.Log("Step 6: Verifying results")
 	frame := engine.GetFrame()
 	assert.NotNil(t, frame)
 	if frame != nil && frame.Header != nil {

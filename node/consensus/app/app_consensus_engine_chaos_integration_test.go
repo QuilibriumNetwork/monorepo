@@ -110,7 +110,6 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		ScenarioNetworkPartition
 		ScenarioEquivocation
 		ScenarioGlobalEvents
-		ScenarioExecutorChurn
 		ScenarioStateRewind
 	)
 
@@ -121,7 +120,6 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		ScenarioNetworkPartition: "Network Partition",
 		ScenarioEquivocation:     "Equivocation Attempt",
 		ScenarioGlobalEvents:     "Global Events",
-		ScenarioExecutorChurn:    "Executor Churn",
 		ScenarioStateRewind:      "State Rewind",
 	}
 
@@ -341,17 +339,8 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 	// Start all nodes
 	t.Log("Step 4: Starting all nodes")
-	for i, node := range nodes {
+	for _, node := range nodes {
 		node.engine.Start(node.quit)
-
-		// Add initial executors
-		for j := 0; j < 2; j++ {
-			execName := fmt.Sprintf("node-%d-exec-%d", i, j)
-			executor := newMockIntegrationExecutor(execName)
-			node.executors[execName] = executor
-			node.engine.RegisterExecutor(executor, uint64(j))
-		}
-		t.Logf("  - Started node %d with 2 executors", i)
 	}
 
 	// Wait for genesis
@@ -677,42 +666,6 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		t.Log("    - Simulated global event impact")
 	}
 
-	runExecutorChurn := func() {
-		t.Log("  [Scenario] Executor Churn")
-
-		// Pick random node
-		nodeIdx := random.Intn(numNodes)
-		node := nodes[nodeIdx]
-
-		// Remove an executor
-		node.mu.Lock()
-		var removedExec string
-		for name := range node.executors {
-			removedExec = name
-			delete(node.executors, name)
-			break
-		}
-		node.mu.Unlock()
-
-		if removedExec != "" {
-			node.engine.UnregisterExecutor(removedExec, 0, false)
-			t.Logf("    - Removed executor %s from node %d", removedExec, nodeIdx)
-		}
-
-		// Add new executor
-		newExecName := fmt.Sprintf("node-%d-exec-new-%d", nodeIdx, time.Now().Unix())
-		newExecutor := newMockIntegrationExecutor(newExecName)
-
-		node.mu.Lock()
-		node.executors[newExecName] = newExecutor
-		node.mu.Unlock()
-
-		node.engine.RegisterExecutor(newExecutor, uint64(len(node.executors)))
-		t.Logf("    - Added executor %s to node %d", newExecName, nodeIdx)
-
-		time.Sleep(2 * time.Second)
-	}
-
 	runStateRewind := func() {
 		frames := random.Intn(maxFramesPerScenario) + 1
 		t.Logf("  [Scenario] State Rewind Simulation for %d frames", frames)
@@ -856,9 +809,6 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 		case ScenarioGlobalEvents:
 			runGlobalEvents()
-
-		case ScenarioExecutorChurn:
-			runExecutorChurn()
 
 		case ScenarioStateRewind:
 			runStateRewind()
