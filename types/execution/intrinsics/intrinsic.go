@@ -26,9 +26,9 @@ type Intrinsic interface {
 		state state.State,
 	) (state.State, error)
 	// Locks addresses for writing or reading
-	Lock(writeAddresses [][]byte, readAddresses [][]byte) error
+	Lock(frameNumber uint64, input []byte) error
 	// Unlocks addresses for writing or reading
-	Unlock(writeAddresses [][]byte, readAddresses [][]byte) error
+	Unlock() error
 	// Performs strictly the validation of an intrinsic operation, encoded via
 	// the ToBytes method of the given operation
 	Validate(frameNumber uint64, input []byte) error

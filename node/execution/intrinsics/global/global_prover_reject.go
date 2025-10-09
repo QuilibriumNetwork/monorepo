@@ -312,6 +312,61 @@ func (p *ProverReject) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (p *ProverReject) GetReadAddresses(frameNumber uint64) ([][]byte, error) {
+	return nil, nil
+}
+
+func (p *ProverReject) GetWriteAddresses(frameNumber uint64) ([][]byte, error) {
+	proverAddress := p.PublicKeySignatureBLS48581.Address
+	proverFullAddress := [64]byte{}
+	copy(proverFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(proverFullAddress[32:], proverAddress)
+
+	// Get the existing prover vertex
+	proverTree, err := p.hypergraph.GetVertexData(proverFullAddress)
+	if err != nil || proverTree == nil {
+		return nil, errors.Wrap(
+			errors.New("prover not found"),
+			"get write addresses",
+		)
+	}
+
+	// Get prover public key for allocation lookup
+	publicKey, err := p.rdfMultiprover.Get(
+		GLOBAL_RDF_SCHEMA,
+		"prover:Prover",
+		"PublicKey",
+		proverTree,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+
+	// Calculate allocation address:
+	allocationAddressBI, err := poseidon.HashBytes(
+		slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, p.Filter),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+
+	allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
+	allocationFullAddress := [64]byte{}
+	copy(allocationFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(allocationFullAddress[32:], allocationAddress)
+
+	addresses := map[string]struct{}{}
+	addresses[string(proverFullAddress[:])] = struct{}{}
+	addresses[string(allocationFullAddress[:])] = struct{}{}
+
+	result := [][]byte{}
+	for key := range addresses {
+		result = append(result, []byte(key))
+	}
+
+	return result, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 	// Create reject message contents

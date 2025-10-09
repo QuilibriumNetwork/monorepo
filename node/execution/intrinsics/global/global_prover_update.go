@@ -267,6 +267,41 @@ func (p *ProverUpdate) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (p *ProverUpdate) GetReadAddresses(frameNumber uint64) ([][]byte, error) {
+	return nil, nil
+}
+
+func (p *ProverUpdate) GetWriteAddresses(frameNumber uint64) ([][]byte, error) {
+	proverAddress := p.PublicKeySignatureBLS48581.Address
+	proverFullAddress := [64]byte{}
+	copy(proverFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(proverFullAddress[32:], proverAddress)
+
+	rewardAddressBI, err := poseidon.HashBytes(slices.Concat(
+		token.QUIL_TOKEN_ADDRESS[:],
+		proverAddress,
+	))
+	if err != nil {
+		return nil, errors.Wrap(err, "get write address")
+	}
+
+	rewardAddress := rewardAddressBI.FillBytes(make([]byte, 32))
+	rewardFullAddress := [64]byte{}
+	copy(rewardFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(rewardFullAddress[32:], rewardAddress)
+
+	addresses := map[string]struct{}{}
+	addresses[string(proverFullAddress[:])] = struct{}{}
+	addresses[string(rewardFullAddress[:])] = struct{}{}
+
+	result := [][]byte{}
+	for key := range addresses {
+		result = append(result, []byte(key))
+	}
+
+	return result, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (p *ProverUpdate) Verify(frameNumber uint64) (bool, error) {
 	if p.hypergraph == nil {

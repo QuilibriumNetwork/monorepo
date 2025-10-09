@@ -220,7 +220,7 @@ func (a *GlobalIntrinsic) Validate(
 
 	// Check type prefix to determine request type
 	if len(input) < 4 {
-		observability.InvokeStepErrors.WithLabelValues(
+		observability.ValidateErrors.WithLabelValues(
 			"global",
 			"invalid_input",
 		).Inc()
@@ -1191,10 +1191,7 @@ func (a *GlobalIntrinsic) InvokeStep(
 }
 
 // Lock implements intrinsics.Intrinsic.
-func (a *GlobalIntrinsic) Lock(
-	writeAddresses [][]byte,
-	readAddresses [][]byte,
-) error {
+func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	a.lockedReadsMx.Lock()
 	a.lockedWritesMx.Lock()
 	defer a.lockedReadsMx.Unlock()
@@ -1208,7 +1205,106 @@ func (a *GlobalIntrinsic) Lock(
 		a.lockedWrites = make(map[string]struct{})
 	}
 
-	for _, address := range writeAddresses {
+	// Check type prefix to determine request type
+	if len(input) < 4 {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"invalid_input",
+		).Inc()
+		return errors.Wrap(errors.New("input too short"), "lock")
+	}
+
+	// Read the type prefix
+	typePrefix := binary.BigEndian.Uint32(input[:4])
+
+	var reads, writes [][]byte
+	var err error
+
+	// Handle each type based on type prefix
+	switch typePrefix {
+	case protobufs.ProverJoinType:
+		reads, writes, err = a.tryLockJoin(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues("global", "prover_join").Inc()
+
+	case protobufs.ProverLeaveType:
+		reads, writes, err = a.tryLockLeave(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"global",
+			"prover_leave",
+		).Inc()
+
+	case protobufs.ProverPauseType:
+		reads, writes, err = a.tryLockPause(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"global",
+			"prover_pause",
+		).Inc()
+
+	case protobufs.ProverResumeType:
+		reads, writes, err = a.tryLockResume(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"global",
+			"prover_resume",
+		).Inc()
+
+	case protobufs.ProverConfirmType:
+		reads, writes, err = a.tryLockConfirm(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"global",
+			"prover_confirm",
+		).Inc()
+
+	case protobufs.ProverRejectType:
+		reads, writes, err = a.tryLockReject(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"global",
+			"prover_reject",
+		).Inc()
+
+	case protobufs.ProverKickType:
+		reads, writes, err = a.tryLockKick(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues("global", "prover_kick").Inc()
+
+	default:
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"unknown_type",
+		).Inc()
+		return errors.Wrap(
+			errors.New("unknown global request type"),
+			"lock",
+		)
+	}
+
+	for _, address := range writes {
 		if _, ok := a.lockedWrites[string(address)]; ok {
 			return errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
@@ -1223,7 +1319,7 @@ func (a *GlobalIntrinsic) Lock(
 		}
 	}
 
-	for _, address := range readAddresses {
+	for _, address := range reads {
 		if _, ok := a.lockedWrites[string(address)]; ok {
 			return errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
@@ -1232,12 +1328,12 @@ func (a *GlobalIntrinsic) Lock(
 		}
 	}
 
-	for _, address := range writeAddresses {
+	for _, address := range writes {
 		a.lockedWrites[string(address)] = struct{}{}
 		a.lockedReads[string(address)] = a.lockedReads[string(address)] + 1
 	}
 
-	for _, address := range readAddresses {
+	for _, address := range reads {
 		a.lockedReads[string(address)] = a.lockedReads[string(address)] + 1
 	}
 
@@ -1245,65 +1341,410 @@ func (a *GlobalIntrinsic) Lock(
 }
 
 // Unlock implements intrinsics.Intrinsic.
-func (a *GlobalIntrinsic) Unlock(
-	writeAddresses [][]byte,
-	readAddresses [][]byte,
-) error {
+func (a *GlobalIntrinsic) Unlock() error {
 	a.lockedReadsMx.Lock()
 	a.lockedWritesMx.Lock()
 	defer a.lockedReadsMx.Unlock()
 	defer a.lockedWritesMx.Unlock()
 
-	if a.lockedReads == nil {
-		a.lockedReads = make(map[string]int)
-	}
-
-	if a.lockedWrites == nil {
-		a.lockedWrites = make(map[string]struct{})
-	}
-
-	alteredWriteLocks := make(map[string]struct{})
-	for k, v := range a.lockedWrites {
-		alteredWriteLocks[k] = v
-	}
-
-	for _, address := range writeAddresses {
-		delete(alteredWriteLocks, string(address))
-	}
-
-	for _, address := range readAddresses {
-		if _, ok := alteredWriteLocks[string(address)]; ok {
-			return errors.Wrap(
-				fmt.Errorf("address %x is still locked for writing", address),
-				"unlock",
-			)
-		}
-	}
-
-	for _, address := range writeAddresses {
-		delete(a.lockedWrites, string(address))
-		i, ok := a.lockedReads[string(address)]
-		if ok {
-			if i <= 1 {
-				delete(a.lockedReads, string(address))
-			} else {
-				a.lockedReads[string(address)] = i - 1
-			}
-		}
-	}
-
-	for _, address := range readAddresses {
-		i, ok := a.lockedReads[string(address)]
-		if ok {
-			if i <= 1 {
-				delete(a.lockedReads, string(address))
-			} else {
-				a.lockedReads[string(address)] = i - 1
-			}
-		}
-	}
+	a.lockedReads = make(map[string]int)
+	a.lockedWrites = make(map[string]struct{})
 
 	return nil
+}
+
+func (a *GlobalIntrinsic) tryLockJoin(frameNumber uint64, input []byte) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	// Parse ProverJoin directly from input
+	pbJoin := &protobufs.ProverJoin{}
+	if err := pbJoin.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_join",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Convert from protobuf to intrinsics type
+	op, err := ProverJoinFromProtobuf(
+		pbJoin,
+		a.hypergraph,
+		nil,
+		nil,
+		a.keyManager,
+		a.frameProver,
+		a.frameStore,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_join",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Set runtime dependencies
+	op.rdfMultiprover = a.rdfMultiprover
+	op.hypergraph = a.hypergraph
+	op.keyManager = a.keyManager
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_join",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_join",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (a *GlobalIntrinsic) tryLockLeave(frameNumber uint64, input []byte) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	// Parse ProverLeave directly from input
+	pbLeave := &protobufs.ProverLeave{}
+	if err := pbLeave.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_leave",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Convert from protobuf to intrinsics type
+	op, err := ProverLeaveFromProtobuf(
+		pbLeave,
+		a.hypergraph,
+		nil,
+		nil,
+		a.keyManager,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_leave",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Set runtime dependencies
+	op.rdfMultiprover = a.rdfMultiprover
+	op.hypergraph = a.hypergraph
+	op.keyManager = a.keyManager
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_leave",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_leave",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (a *GlobalIntrinsic) tryLockPause(frameNumber uint64, input []byte) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	// Parse ProverPause directly from input
+	pbPause := &protobufs.ProverPause{}
+	if err := pbPause.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_pause",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Convert from protobuf to intrinsics type
+	op, err := ProverPauseFromProtobuf(
+		pbPause,
+		a.hypergraph,
+		nil,
+		nil,
+		a.keyManager,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_pause",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Set runtime dependencies
+	op.rdfMultiprover = a.rdfMultiprover
+	op.hypergraph = a.hypergraph
+	op.keyManager = a.keyManager
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_pause",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_pause",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (a *GlobalIntrinsic) tryLockResume(frameNumber uint64, input []byte) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	// Parse ProverResume directly from input
+	pbResume := &protobufs.ProverResume{}
+	if err := pbResume.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_resume",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Convert from protobuf to intrinsics type
+	op, err := ProverResumeFromProtobuf(
+		pbResume,
+		a.hypergraph,
+		nil,
+		nil,
+		a.keyManager,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_resume",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Set runtime dependencies
+	op.rdfMultiprover = a.rdfMultiprover
+	op.hypergraph = a.hypergraph
+	op.keyManager = a.keyManager
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_resume",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_resume",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (a *GlobalIntrinsic) tryLockConfirm(frameNumber uint64, input []byte) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	// Parse ProverConfirm directly from input
+	pbConfirm := &protobufs.ProverConfirm{}
+	if err := pbConfirm.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_confirm",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Convert from protobuf to intrinsics type
+	op, err := ProverConfirmFromProtobuf(
+		pbConfirm,
+		a.hypergraph,
+		nil,
+		nil,
+		a.keyManager,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_confirm",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Set runtime dependencies
+	op.rdfMultiprover = a.rdfMultiprover
+	op.hypergraph = a.hypergraph
+	op.keyManager = a.keyManager
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_confirm",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_confirm",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (a *GlobalIntrinsic) tryLockReject(frameNumber uint64, input []byte) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	// Parse ProverReject directly from input
+	pbReject := &protobufs.ProverReject{}
+	if err := pbReject.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_reject",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Convert from protobuf to intrinsics type
+	op, err := ProverRejectFromProtobuf(
+		pbReject,
+		a.hypergraph,
+		nil,
+		nil,
+		a.keyManager,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_reject",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Set runtime dependencies
+	op.rdfMultiprover = a.rdfMultiprover
+	op.hypergraph = a.hypergraph
+	op.keyManager = a.keyManager
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_reject",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_reject",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (a *GlobalIntrinsic) tryLockKick(frameNumber uint64, input []byte) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	// Parse ProverKick directly from input
+	pbKick := &protobufs.ProverKick{}
+	if err := pbKick.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_kick",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Convert from protobuf to intrinsics type
+	op, err := ProverKickFromProtobuf(pbKick, a.hypergraph, nil, a.keyManager)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_kick",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Set runtime dependencies
+	op.rdfMultiprover = a.rdfMultiprover
+	op.hypergraph = a.hypergraph
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_kick",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_kick",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
 }
 
 // LoadGlobalIntrinsic loads the global intrinsic from the global intrinsic

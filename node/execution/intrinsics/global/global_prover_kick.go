@@ -339,6 +339,49 @@ func (p *ProverKick) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (p *ProverKick) GetReadAddresses(frameNumber uint64) ([][]byte, error) {
+	return nil, nil
+}
+
+func (p *ProverKick) GetWriteAddresses(frameNumber uint64) ([][]byte, error) {
+	// Compute the kicked prover's address from their public key
+	kickedAddressBI, err := poseidon.HashBytes(p.KickedProverPublicKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+	kickedAddress := kickedAddressBI.FillBytes(make([]byte, 32))
+
+	fullAddress := [64]byte{}
+	copy(fullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(fullAddress[32:], kickedAddress)
+	hyperedgeAddress := [64]byte{}
+	copy(hyperedgeAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(hyperedgeAddress[32:], kickedAddress)
+
+	hyperedge, err := p.hypergraph.GetHyperedge(hyperedgeAddress)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+
+	addresses := map[string]struct{}{}
+	addresses[string(fullAddress[:])] = struct{}{}
+	addresses[string(hyperedgeAddress[:])] = struct{}{}
+
+	vertices := tries.GetAllPreloadedLeaves(hyperedge.GetExtrinsicTree().Root)
+	if err == nil && len(vertices) > 0 {
+		for _, vertex := range vertices {
+			addresses[string(vertex.Key)] = struct{}{}
+		}
+	}
+
+	result := [][]byte{}
+	for key := range addresses {
+		result = append(result, []byte(key))
+	}
+
+	return result, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (p *ProverKick) Verify(frameNumber uint64) (bool, error) {
 	// First verify the conflicting frames prove equivocation

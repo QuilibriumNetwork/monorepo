@@ -263,11 +263,6 @@ func (r *ProverRegistry) GetActiveProvers(
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	r.logger.Debug(
-		"getting active provers",
-		zap.String("filter", fmt.Sprintf("%x", filter)),
-	)
-
 	result, err := r.getProversByStatusInternal(
 		filter,
 		consensus.ProverStatusActive,
@@ -277,7 +272,6 @@ func (r *ProverRegistry) GetActiveProvers(
 		return nil, err
 	}
 
-	r.logger.Debug("active provers retrieved", zap.Int("count", len(result)))
 	return result, nil
 }
 
@@ -295,10 +289,7 @@ func (r *ProverRegistry) GetProvers(filter []byte) (
 	)
 
 	var result []*consensus.ProverInfo
-
-	for _, info := range r.filterCache[string(filter)] {
-		result = append(result, info)
-	}
+	result = append(result, r.filterCache[string(filter)]...)
 
 	sort.Slice(result, func(i, j int) bool {
 		return bytes.Compare(result[i].Address, result[j].Address) == -1
@@ -1311,12 +1302,12 @@ func (r *ProverRegistry) processProverChange(
 				}
 
 				// Find the prover this allocation belongs to
-				if proverInfo, exists := r.proverCache[string(proverRef)]; exists {
+				if proverInfo, exists := r.proverCache[string(proverRef[32:])]; exists {
 					// Update tries based on allocation status
 					if mappedStatus == consensus.ProverStatusActive &&
 						len(confirmationFilter) > 0 {
 						if err := r.addProverToTrie(
-							proverRef,
+							proverRef[32:],
 							proverInfo.PublicKey,
 							confirmationFilter,
 							frameNumber,
@@ -1326,7 +1317,7 @@ func (r *ProverRegistry) processProverChange(
 					} else {
 						// Remove from filter trie if not active
 						if err := r.removeProverFromTrie(
-							proverRef,
+							proverRef[32:],
 							confirmationFilter,
 						); err != nil {
 							return errors.Wrap(

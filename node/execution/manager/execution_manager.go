@@ -622,6 +622,23 @@ func (m *ExecutionEngineManager) ProcessMessage(
 }
 
 // ValidateMessage validates a message without materializing state changes
+func (m *ExecutionEngineManager) Lock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) error {
+	m.enginesMu.RLock()
+	defer m.enginesMu.RUnlock()
+
+	engine := m.selectEngine(address)
+	if engine == nil {
+		return errors.Errorf("no execution engine found for address: %x", address)
+	}
+
+	return engine.Lock(frameNumber, address, message)
+}
+
+// ValidateMessage validates a message without materializing state changes
 func (m *ExecutionEngineManager) ValidateMessage(
 	frameNumber uint64,
 	address []byte,

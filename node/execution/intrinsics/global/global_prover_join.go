@@ -590,6 +590,78 @@ func (p *ProverJoin) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (p *ProverJoin) GetReadAddresses(frameNumber uint64) ([][]byte, error) {
+	return nil, nil
+}
+
+func (p *ProverJoin) GetWriteAddresses(frameNumber uint64) ([][]byte, error) {
+	publicKey := p.PublicKeySignatureBLS48581.PublicKey
+	proverAddressBI, err := poseidon.HashBytes(publicKey)
+	if err != nil || proverAddressBI == nil {
+		return nil, errors.Wrap(
+			errors.New("invalid address"),
+			"get write addresses",
+		)
+	}
+	proverAddress := proverAddressBI.FillBytes(make([]byte, 32))
+
+	proverFullAddress := [64]byte{}
+	copy(proverFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(proverFullAddress[32:], proverAddress)
+
+	addresses := map[string]struct{}{}
+	addresses[string(proverFullAddress[:])] = struct{}{}
+
+	derivedRewardAddress, err := poseidon.HashBytes(
+		slices.Concat(token.QUIL_TOKEN_ADDRESS[:], proverAddress),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+
+	addresses[string(slices.Concat(
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+		derivedRewardAddress.FillBytes(make([]byte, 32)),
+	))] = struct{}{}
+
+	for _, filter := range p.Filters {
+		allocationAddressBI, err := poseidon.HashBytes(
+			slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, filter),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+		allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
+
+		addresses[string(slices.Concat(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			allocationAddress,
+		))] = struct{}{}
+	}
+
+	for _, mt := range p.MergeTargets {
+		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
+			[]byte("PROVER_JOIN_MERGE"),
+			mt.PublicKey,
+		))
+		if err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		addresses[string(slices.Concat(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			spentMergeBI.FillBytes(make([]byte, 32)),
+		))] = struct{}{}
+	}
+
+	result := [][]byte{}
+	for key := range addresses {
+		result = append(result, []byte(key))
+	}
+
+	return result, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	defer func() {

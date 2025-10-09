@@ -65,6 +65,69 @@ var (
 		[]string{"intrinsic_type", "operation"},
 	)
 
+	// Lock operation metrics
+	LockDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "lock_duration_seconds",
+			Help:      "Time taken to lock an intrinsic step",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"intrinsic_type"}, // intrinsic type only for overall timing
+	)
+
+	LockTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "lock_total",
+			Help:      "Total number of successful lock operations",
+		},
+		[]string{"intrinsic_type", "operation"},
+	)
+
+	LockErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "lock_errors_total",
+			Help:      "Total number of failed lock operations",
+		},
+		[]string{"intrinsic_type", "operation"},
+	)
+
+	UnlockDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "unlock_duration_seconds",
+			Help:      "Time taken to unlock an intrinsic step",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"intrinsic_type"}, // intrinsic type only for overall timing
+	)
+
+	UnlockTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "unlock_total",
+			Help:      "Total number of successful unlock operations",
+		},
+		[]string{"intrinsic_type", "operation"},
+	)
+
+	UnlockErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "unlock_errors_total",
+			Help:      "Total number of failed unlock operations",
+		},
+		[]string{"intrinsic_type", "operation"},
+	)
+
 	// InvokeStep operation metrics
 	InvokeStepDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{

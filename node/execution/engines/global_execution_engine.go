@@ -273,52 +273,6 @@ func (e *GlobalExecutionEngine) validateIndividualMessage(
 	message *protobufs.MessageRequest,
 	fromBundle bool,
 ) error {
-	isGlobalOp := false
-	var err error
-	switch r := message.Request.(type) {
-	case *protobufs.MessageRequest_Update:
-		isGlobalOp = true
-	case *protobufs.MessageRequest_Join:
-		for _, f := range r.Join.Filters {
-			if len(f) >= 32 {
-				l1 := up2p.GetBloomFilterIndices(f[:32], 256, 3)
-				path := []uint32{}
-				for _, p := range f[32:] {
-					path = append(path, uint32(p))
-				}
-				shards, err := e.shardsStore.GetAppShards(
-					slices.Concat(l1, f[:32]),
-					path,
-				)
-				if err != nil {
-					return errors.Wrap(err, "validate individual message")
-				}
-				if len(shards) != 1 || !slices.Equal(shards[0].Path, path) {
-					return errors.Wrap(
-						errors.New("invalid shard"),
-						"validate individual message",
-					)
-				}
-			}
-		}
-		isGlobalOp = true
-	case *protobufs.MessageRequest_Leave:
-		isGlobalOp = true
-	case *protobufs.MessageRequest_Pause:
-		isGlobalOp = true
-	case *protobufs.MessageRequest_Resume:
-		isGlobalOp = true
-	case *protobufs.MessageRequest_Confirm:
-		isGlobalOp = true
-	case *protobufs.MessageRequest_Reject:
-		isGlobalOp = true
-	case *protobufs.MessageRequest_Kick:
-		isGlobalOp = true
-	}
-	if err != nil {
-		return errors.Wrap(err, "validate individual message")
-	}
-
 	if !isGlobalOp {
 		return errors.Wrap(
 			errors.New("invalid type"),
@@ -326,61 +280,13 @@ func (e *GlobalExecutionEngine) validateIndividualMessage(
 		)
 	}
 
-	// Check if the message is for the global intrinsic
-	if !bytes.Equal(address, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:]) {
-		return errors.Wrap(
-			errors.New("invalid address for global execution engine"),
-			"validate individual message",
-		)
-	}
-
 	// Try to get or load the global intrinsic
-	addressStr := string(address)
-	e.intrinsicsMutex.RLock()
-	intrinsic, exists := e.intrinsics[addressStr]
-	e.intrinsicsMutex.RUnlock()
-
-	if !exists {
-		// Load the global intrinsic
-		loaded, err := global.LoadGlobalIntrinsic(
-			address,
-			e.hypergraph,
-			e.inclusionProver,
-			e.keyManager,
-			e.frameProver,
-			e.clockStore,
-		)
-		if err != nil {
-			return errors.Wrap(err, "validate individual message")
-		}
-
-		e.intrinsicsMutex.Lock()
-		e.intrinsics[addressStr] = loaded
-		e.intrinsicsMutex.Unlock()
-		intrinsic = loaded
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		return errors.Wrap(err, "validate individual message")
 	}
 
-	payload := []byte{}
-	switch message.Request.(type) {
-	case *protobufs.MessageRequest_Update:
-		payload, err = message.GetUpdate().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Join:
-		payload, err = message.GetJoin().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Leave:
-		payload, err = message.GetLeave().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Pause:
-		payload, err = message.GetPause().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Resume:
-		payload, err = message.GetResume().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Confirm:
-		payload, err = message.GetConfirm().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Reject:
-		payload, err = message.GetReject().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Kick:
-		payload, err = message.GetKick().ToCanonicalBytes()
-	default:
-		err = errors.New("unsupported message type")
-	}
+	payload, err := e.tryExtractMessageForIntrinsic(message)
 	if err != nil {
 		return errors.Wrap(err, "validate individual message")
 	}
@@ -467,42 +373,6 @@ func (e *GlobalExecutionEngine) handleBundle(
 
 	// Process each operation in the bundle sequentially
 	for i, op := range bundle.Requests {
-		e.logger.Debug(
-			"processing bundled operation",
-			zap.Int("operation", i),
-			zap.String("address", hex.EncodeToString(address)),
-		)
-
-		isGlobalOp := false
-		switch op.Request.(type) {
-		case *protobufs.MessageRequest_Update:
-			isGlobalOp = true
-		case *protobufs.MessageRequest_Join:
-			isGlobalOp = true
-		case *protobufs.MessageRequest_Leave:
-			isGlobalOp = true
-		case *protobufs.MessageRequest_Pause:
-			isGlobalOp = true
-		case *protobufs.MessageRequest_Resume:
-			isGlobalOp = true
-		case *protobufs.MessageRequest_Confirm:
-			isGlobalOp = true
-		case *protobufs.MessageRequest_Reject:
-			isGlobalOp = true
-		case *protobufs.MessageRequest_Kick:
-			isGlobalOp = true
-		}
-
-		if !isGlobalOp {
-			// Skip non-global operations (e.g., token payments, compute ops)
-			// They are retained in the bundle for reference but not processed here
-			e.logger.Debug(
-				"skipping non-global operation in bundle",
-				zap.Int("operation", i),
-			)
-			continue
-		}
-
 		// Process this operation individually
 		opResponses, err := e.processIndividualMessage(
 			frameNumber,
@@ -513,7 +383,13 @@ func (e *GlobalExecutionEngine) handleBundle(
 			state,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle bundle")
+			// Skip non-global operations (e.g., token payments, compute ops)
+			// They are retained in the bundle for reference but not processed here
+			e.logger.Debug(
+				"skipping non-global operation in bundle",
+				zap.Int("operation", i),
+			)
+			continue
 		}
 
 		// Collect responses
@@ -540,64 +416,15 @@ func (e *GlobalExecutionEngine) processIndividualMessage(
 	fromBundle bool,
 	state state.State,
 ) (*execution.ProcessMessageResult, error) {
-	payload := []byte{}
-	var err error
-	switch message.Request.(type) {
-	case *protobufs.MessageRequest_Update:
-		payload, err = message.GetUpdate().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Join:
-		payload, err = message.GetJoin().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Leave:
-		payload, err = message.GetLeave().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Pause:
-		payload, err = message.GetPause().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Resume:
-		payload, err = message.GetResume().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Confirm:
-		payload, err = message.GetConfirm().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Reject:
-		payload, err = message.GetReject().ToCanonicalBytes()
-	case *protobufs.MessageRequest_Kick:
-		payload, err = message.GetKick().ToCanonicalBytes()
-	default:
-		err = errors.New("unsupported message type")
-	}
+	payload, err := e.tryExtractMessageForIntrinsic(message)
 	if err != nil {
 		return nil, errors.Wrap(err, "process individual message")
 	}
 
-	// Check if the message is for the global intrinsic
-	if !bytes.Equal(address, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:]) {
-		return nil, errors.Wrap(
-			errors.New("invalid address for global execution engine"),
-			"process individual message",
-		)
-	}
-
 	// Try to get or load the global intrinsic
-	addressStr := string(address)
-	e.intrinsicsMutex.RLock()
-	intrinsic, exists := e.intrinsics[addressStr]
-	e.intrinsicsMutex.RUnlock()
-
-	if !exists {
-		// Load the global intrinsic
-		loaded, err := global.LoadGlobalIntrinsic(
-			address,
-			e.hypergraph,
-			e.inclusionProver,
-			e.keyManager,
-			e.frameProver,
-			e.clockStore,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "process individual message")
-		}
-
-		e.intrinsicsMutex.Lock()
-		e.intrinsics[addressStr] = loaded
-		e.intrinsicsMutex.Unlock()
-		intrinsic = loaded
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		return nil, errors.Wrap(err, "process individual message")
 	}
 
 	err = e.validateIndividualMessage(frameNumber, address, message, fromBundle)
@@ -641,6 +468,125 @@ func (e *GlobalExecutionEngine) Prove(
 	message []byte,
 ) (*protobufs.MessageRequest, error) {
 	return nil, errors.New("unimplemented")
+}
+
+func (e *GlobalExecutionEngine) Lock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) error {
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		// non-applicable
+		return nil
+	}
+
+	return errors.Wrap(intrinsic.Lock(frameNumber, message), "lock")
+}
+
+func (e *GlobalExecutionEngine) Unlock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) error {
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		// non-applicable
+		return nil
+	}
+
+	return errors.Wrap(intrinsic.Unlock(), "unlock")
+}
+
+func (e *GlobalExecutionEngine) tryGetIntrinsic(address []byte) (
+	intrinsics.Intrinsic,
+	error,
+) {
+	// Check if the message is for the global intrinsic
+	if !bytes.Equal(address, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:]) {
+		return nil, errors.Wrap(
+			errors.New("invalid address for global execution engine"),
+			"try get intrinsic",
+		)
+	}
+
+	addressStr := string(address)
+	e.intrinsicsMutex.RLock()
+	intrinsic, exists := e.intrinsics[addressStr]
+	e.intrinsicsMutex.RUnlock()
+
+	if !exists {
+		// Load the global intrinsic
+		loaded, err := global.LoadGlobalIntrinsic(
+			address,
+			e.hypergraph,
+			e.inclusionProver,
+			e.keyManager,
+			e.frameProver,
+			e.clockStore,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "try get intrinsic")
+		}
+
+		e.intrinsicsMutex.Lock()
+		e.intrinsics[addressStr] = loaded
+		e.intrinsicsMutex.Unlock()
+		intrinsic = loaded
+	}
+
+	return intrinsic, nil
+}
+
+func (e *GlobalExecutionEngine) tryExtractMessageForIntrinsic(
+	message *protobufs.MessageRequest,
+) ([]byte, error) {
+	payload := []byte{}
+	var err error
+	switch r := message.Request.(type) {
+	case *protobufs.MessageRequest_Update:
+		payload, err = r.Update.ToCanonicalBytes()
+	case *protobufs.MessageRequest_Join:
+		for _, f := range r.Join.Filters {
+			if len(f) >= 32 {
+				l1 := up2p.GetBloomFilterIndices(f[:32], 256, 3)
+				path := []uint32{}
+				for _, p := range f[32:] {
+					path = append(path, uint32(p))
+				}
+				shards, err := e.shardsStore.GetAppShards(
+					slices.Concat(l1, f[:32]),
+					path,
+				)
+				if err != nil {
+					return nil, errors.Wrap(err, "try extract message for intrinsic")
+				}
+				if len(shards) != 1 || !slices.Equal(shards[0].Path, path) {
+					return nil, errors.Wrap(
+						errors.New("invalid shard"),
+						"try extract message for intrinsic",
+					)
+				}
+			}
+		}
+		payload, err = r.Join.ToCanonicalBytes()
+	case *protobufs.MessageRequest_Leave:
+		payload, err = r.Leave.ToCanonicalBytes()
+	case *protobufs.MessageRequest_Pause:
+		payload, err = r.Pause.ToCanonicalBytes()
+	case *protobufs.MessageRequest_Resume:
+		payload, err = r.Resume.ToCanonicalBytes()
+	case *protobufs.MessageRequest_Confirm:
+		payload, err = r.Confirm.ToCanonicalBytes()
+	case *protobufs.MessageRequest_Reject:
+		payload, err = r.Reject.ToCanonicalBytes()
+	case *protobufs.MessageRequest_Kick:
+		payload, err = r.Kick.ToCanonicalBytes()
+	default:
+		err = errors.New("unsupported message type")
+	}
+
+	return payload, errors.Wrap(err, "try extract message for intrinsic")
 }
 
 var _ execution.ShardExecutionEngine = (*GlobalExecutionEngine)(nil)
