@@ -302,6 +302,47 @@ func (c *CodeFinalize) Prove(frameNumber uint64) error {
 	return errors.Wrap(err, "prove")
 }
 
+func (c *CodeFinalize) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (c *CodeFinalize) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	// Generate results address
+	resultsBI, err := poseidon.HashBytes(slices.Concat(
+		c.Rendezvous[:],
+		[]byte("RESULTS_CODE_FINALIZE"),
+	))
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+	resultsAddress := resultsBI.FillBytes(make([]byte, 32))
+
+	// Generate state changes address similar to results address
+	changesBI, err := poseidon.HashBytes(slices.Concat(
+		c.Rendezvous[:],
+		[]byte("STATE_CHANGES_CODE_FINALIZE"),
+	))
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+	changesAddress := changesBI.FillBytes(make([]byte, 32))
+
+	return [][]byte{
+		slices.Concat(
+			c.domain[:],
+			resultsAddress,
+		),
+		slices.Concat(
+			c.domain[:],
+			changesAddress,
+		),
+	}, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (c *CodeFinalize) Verify(frameNumber uint64) (bool, error) {
 	// Verify all results are present

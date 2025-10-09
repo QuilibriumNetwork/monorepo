@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"slices"
 
 	"github.com/pkg/errors"
 	hg "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
@@ -328,6 +329,21 @@ func (c *CodeExecute) Prove(frameNumber uint64) error {
 	)
 
 	return nil
+}
+
+func (c *CodeExecute) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (c *CodeExecute) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return [][]byte{slices.Concat(
+		c.Domain[:],
+		c.Rendezvous[:],
+	)}, nil
 }
 
 // Verify implements intrinsics.IntrinsicOperation.

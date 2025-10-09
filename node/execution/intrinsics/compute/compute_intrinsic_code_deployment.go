@@ -85,6 +85,37 @@ func (c *CodeDeployment) Prove(frameNumber uint64) (err error) {
 	return nil
 }
 
+func (c *CodeDeployment) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (c *CodeDeployment) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	// Get the domain from the hypergraph
+	domain := c.Domain
+
+	// Generate a unique address for this code file
+	codeAddressBI, err := poseidon.HashBytes(
+		slices.Concat(
+			domain[:],
+			c.Circuit,
+		),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+
+	codeAddress := codeAddressBI.FillBytes(make([]byte, 32))
+	codeFullAddress := [64]byte{}
+	copy(codeFullAddress[:32], c.Domain[:])
+	copy(codeFullAddress[32:], codeAddress)
+
+	return [][]byte{codeFullAddress[:]}, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation
 func (c *CodeDeployment) Verify(frameNumber uint64) (bool, error) {
 	buf := bytes.NewReader(c.Circuit)
