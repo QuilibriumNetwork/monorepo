@@ -1124,7 +1124,7 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	// Check type prefix to determine request type
 	if len(input) < 4 {
 		observability.LockErrors.WithLabelValues(
-			"compute",
+			"hypergraph",
 			"invalid_input",
 		).Inc()
 		return errors.Wrap(errors.New("input too short"), "lock")
@@ -1181,7 +1181,7 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 
 	default:
 		observability.LockErrors.WithLabelValues(
-			"compute",
+			"hypergraph",
 			"unknown_type",
 		).Inc()
 		return errors.Wrap(

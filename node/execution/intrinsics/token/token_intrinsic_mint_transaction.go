@@ -2113,8 +2113,17 @@ func (tx *MintTransaction) GetCost() (*big.Int, error) {
 	return size, nil
 }
 
+func (tx *MintTransaction) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
 // GetWriteAddresses implements intrinsics.IntrinsicOperation.
-func (tx *MintTransaction) GetWriteAddresses() [][]byte {
+func (tx *MintTransaction) GetWriteAddresses(frameNumber uint64) (
+	[][]byte,
+	error,
+) {
 	addresses := [][]byte{}
 
 	// Each output creates a new coin, which is written to an address based on
@@ -2142,26 +2151,28 @@ func (tx *MintTransaction) GetWriteAddresses() [][]byte {
 
 		for i := range tx.Inputs {
 			proverRootDomain := [32]byte(tx.Domain)
-
-			proverAddress := slices.Concat(
-				proverRootDomain[:],
-				tx.Inputs[i].Proofs[1][:32],
-			)
-			// Check if not already in addresses
-			found := false
-			for _, addr := range addresses {
-				if bytes.Equal(addr, proverAddress) {
-					found = true
-					break
+			rewardAddress := []byte{}
+			if bytes.Equal(tx.Domain[:], QUIL_TOKEN_ADDRESS) {
+				// Special case: PoMW mints under QUIL use global records for proofs
+				proverRootDomain = intrinsics.GLOBAL_INTRINSIC_ADDRESS
+				rewardAddressBI, err := poseidon.HashBytes(slices.Concat(
+					QUIL_TOKEN_ADDRESS[:],
+					tx.Inputs[i].Proofs[1][:32],
+				))
+				if err != nil {
+					return nil, errors.Wrap(err, "materialize")
 				}
+				rewardAddress = rewardAddressBI.FillBytes(make([]byte, 32))
 			}
-			if !found {
-				addresses = append(addresses, proverAddress)
-			}
+
+			addresses = append(addresses, slices.Concat(
+				proverRootDomain[:],
+				rewardAddress,
+			))
 		}
 	}
 
-	return addresses
+	return addresses, nil
 }
 
 // Materialize implements intrinsics.IntrinsicOperation.

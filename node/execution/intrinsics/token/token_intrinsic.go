@@ -750,10 +750,7 @@ func (t *TokenIntrinsic) InvokeStep(
 }
 
 // Lock implements intrinsics.Intrinsic.
-func (t *TokenIntrinsic) Lock(
-	writeAddresses [][]byte,
-	readAddresses [][]byte,
-) error {
+func (t *TokenIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	t.lockedReadsMx.Lock()
 	t.lockedWritesMx.Lock()
 	defer t.lockedReadsMx.Unlock()
@@ -767,7 +764,65 @@ func (t *TokenIntrinsic) Lock(
 		t.lockedWrites = make(map[string]struct{})
 	}
 
-	for _, address := range writeAddresses {
+	// Check type prefix to determine request type
+	if len(input) < 4 {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"invalid_input",
+		).Inc()
+		return errors.Wrap(errors.New("input too short"), "lock")
+	}
+
+	// Read the type prefix
+	typePrefix := binary.BigEndian.Uint32(input[:4])
+
+	var reads, writes [][]byte
+	var err error
+
+	// Handle each type based on type prefix
+	switch typePrefix {
+	case protobufs.TransactionType:
+		reads, writes, err = t.tryLockTransaction(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues("token", "transaction").Inc()
+
+	case protobufs.PendingTransactionType:
+		reads, writes, err = t.tryLockPendingTransaction(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"token",
+			"pending_transaction",
+		).Inc()
+
+	case protobufs.MintTransactionType:
+		reads, writes, err = t.tryLockMintTransaction(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"token",
+			"mint_transaction",
+		).Inc()
+
+	default:
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"unknown_type",
+		).Inc()
+		return errors.Wrap(
+			errors.New("unknown compute request type"),
+			"lock",
+		)
+	}
+
+	for _, address := range writes {
 		if _, ok := t.lockedWrites[string(address)]; ok {
 			return errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
@@ -782,7 +837,7 @@ func (t *TokenIntrinsic) Lock(
 		}
 	}
 
-	for _, address := range readAddresses {
+	for _, address := range reads {
 		if _, ok := t.lockedWrites[string(address)]; ok {
 			return errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
@@ -791,12 +846,12 @@ func (t *TokenIntrinsic) Lock(
 		}
 	}
 
-	for _, address := range writeAddresses {
+	for _, address := range writes {
 		t.lockedWrites[string(address)] = struct{}{}
 		t.lockedReads[string(address)] = t.lockedReads[string(address)] + 1
 	}
 
-	for _, address := range readAddresses {
+	for _, address := range reads {
 		t.lockedReads[string(address)] = t.lockedReads[string(address)] + 1
 	}
 
@@ -804,65 +859,163 @@ func (t *TokenIntrinsic) Lock(
 }
 
 // Unlock implements intrinsics.Intrinsic.
-func (t *TokenIntrinsic) Unlock(
-	writeAddresses [][]byte,
-	readAddresses [][]byte,
-) error {
+func (t *TokenIntrinsic) Unlock() error {
 	t.lockedReadsMx.Lock()
 	t.lockedWritesMx.Lock()
 	defer t.lockedReadsMx.Unlock()
 	defer t.lockedWritesMx.Unlock()
 
-	if t.lockedReads == nil {
-		t.lockedReads = make(map[string]int)
-	}
-
-	if t.lockedWrites == nil {
-		t.lockedWrites = make(map[string]struct{})
-	}
-
-	alteredWriteLocks := make(map[string]struct{})
-	for k, v := range t.lockedWrites {
-		alteredWriteLocks[k] = v
-	}
-
-	for _, address := range writeAddresses {
-		delete(alteredWriteLocks, string(address))
-	}
-
-	for _, address := range readAddresses {
-		if _, ok := alteredWriteLocks[string(address)]; ok {
-			return errors.Wrap(
-				fmt.Errorf("address %x is still locked for writing", address),
-				"unlock",
-			)
-		}
-	}
-
-	for _, address := range writeAddresses {
-		delete(t.lockedWrites, string(address))
-		i, ok := t.lockedReads[string(address)]
-		if ok {
-			if i <= 1 {
-				delete(t.lockedReads, string(address))
-			} else {
-				t.lockedReads[string(address)] = i - 1
-			}
-		}
-	}
-
-	for _, address := range readAddresses {
-		i, ok := t.lockedReads[string(address)]
-		if ok {
-			if i <= 1 {
-				delete(t.lockedReads, string(address))
-			} else {
-				t.lockedReads[string(address)] = i - 1
-			}
-		}
-	}
+	t.lockedReads = make(map[string]int)
+	t.lockedWrites = make(map[string]struct{})
 
 	return nil
+}
+
+func (t *TokenIntrinsic) tryLockTransaction(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	tx := &Transaction{}
+	if err := tx.FromBytes(
+		input,
+		t.config,
+		t.hypergraph,
+		t.bulletproofProver,
+		t.inclusionProver,
+		t.verEnc,
+		t.decafConstructor,
+		keys.ToKeyRing(t.keyManager, true),
+		"",
+		t.rdfMultiprover,
+	); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"transaction",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := tx.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"transaction",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := tx.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"transaction",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (t *TokenIntrinsic) tryLockPendingTransaction(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	pendingTx := &PendingTransaction{}
+	if err := pendingTx.FromBytes(
+		input,
+		t.config,
+		t.hypergraph,
+		t.bulletproofProver,
+		t.inclusionProver,
+		t.verEnc,
+		t.decafConstructor,
+		keys.ToKeyRing(t.keyManager, true),
+		"",
+		t.rdfMultiprover,
+	); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"pending_transaction",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := pendingTx.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"pending_transaction",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := pendingTx.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"pending_transaction",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (t *TokenIntrinsic) tryLockMintTransaction(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	mintTx := &MintTransaction{}
+	if err := mintTx.FromBytes(
+		input,
+		t.config,
+		t.hypergraph,
+		t.bulletproofProver,
+		t.inclusionProver,
+		t.verEnc,
+		t.decafConstructor,
+		keys.ToKeyRing(t.keyManager, true),
+		"",
+		t.rdfMultiprover,
+	); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"mint_transaction",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := mintTx.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"mint_transaction",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := mintTx.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"token",
+			"mint_transaction",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
 }
 
 func (t *TokenIntrinsic) GetRDFSchemaDocument() string {

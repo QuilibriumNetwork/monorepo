@@ -1504,6 +1504,30 @@ func (tx *PendingTransaction) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (tx *PendingTransaction) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (tx *PendingTransaction) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	addresses := [][]byte{}
+
+	// Build the trees if not already built
+	if err := tx.buildPendingTransactionTrees(); err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+
+	// Add pending transactions using cached trees
+	for i := range tx.cachedTrees {
+		addresses = append(addresses, tx.cachedAddresses[i])
+	}
+
+	return addresses, nil
+}
+
 func (tx *PendingTransaction) GetChallenge() ([]byte, error) {
 	transcript := []byte{}
 	transcript = append(transcript, tx.Domain[:]...)

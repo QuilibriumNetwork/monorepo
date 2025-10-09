@@ -1271,6 +1271,171 @@ func (tx *Transaction) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (tx *Transaction) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (tx *Transaction) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	// Create the coin type hash
+	coinTypeBI, err := poseidon.HashBytes(
+		slices.Concat(tx.Domain[:], []byte("coin:Coin")),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+	coinTypeBytes := coinTypeBI.FillBytes(make([]byte, 32))
+
+	addresses := [][]byte{}
+
+	// For each output, create a coin
+	for _, output := range tx.Outputs {
+		// Create coin tree
+		coinTree := &qcrypto.VectorCommitmentTree{}
+
+		// Index 0: FrameNumber
+		if err := coinTree.Insert(
+			[]byte{0},
+			output.FrameNumber,
+			nil,
+			big.NewInt(8),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 1: Commitment
+		if err := coinTree.Insert(
+			[]byte{1 << 2},
+			output.Commitment,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 2: OneTimeKey
+		if err := coinTree.Insert(
+			[]byte{2 << 2},
+			output.RecipientOutput.OneTimeKey,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 3: VerificationKey
+		if err := coinTree.Insert(
+			[]byte{3 << 2},
+			output.RecipientOutput.VerificationKey,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 4: CoinBalance (encrypted)
+		if err := coinTree.Insert(
+			[]byte{4 << 2},
+			output.RecipientOutput.CoinBalance,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 5: Mask (encrypted)
+		if err := coinTree.Insert(
+			[]byte{5 << 2},
+			output.RecipientOutput.Mask,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 6 & 7: Additional references (for non-divisible tokens)
+		if len(output.RecipientOutput.AdditionalReference) == 64 &&
+			len(output.RecipientOutput.AdditionalReferenceKey) == 56 {
+			if err := coinTree.Insert(
+				[]byte{6 << 2},
+				output.RecipientOutput.AdditionalReference,
+				nil,
+				big.NewInt(56),
+			); err != nil {
+				return nil, errors.Wrap(err, "get write addresses")
+			}
+
+			if err := coinTree.Insert(
+				[]byte{7 << 2},
+				output.RecipientOutput.AdditionalReferenceKey,
+				nil,
+				big.NewInt(56),
+			); err != nil {
+				return nil, errors.Wrap(err, "get write addresses")
+			}
+		}
+
+		// Type marker at max index
+		if err := coinTree.Insert(
+			bytes.Repeat([]byte{0xff}, 32),
+			coinTypeBytes,
+			nil,
+			big.NewInt(32),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Compute address and add to state
+		commit := coinTree.Commit(tx.inclusionProver, false)
+		outAddrBI, err := poseidon.HashBytes(commit)
+		if err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		coinAddress := outAddrBI.FillBytes(make([]byte, 32))
+
+		addresses = append(addresses, slices.Concat(
+			tx.Domain[:],
+			coinAddress,
+		))
+	}
+
+	// Mark inputs as spent
+	for _, input := range tx.Inputs {
+		if len(input.Signature) == 336 {
+			// Standard format
+			verificationKey := input.Signature[56*4 : 56*5]
+			spendCheckBI, err := poseidon.HashBytes(verificationKey)
+			if err != nil {
+				return nil, errors.Wrap(err, "get write addresses")
+			}
+
+			// Create spent marker
+			spentTree := &qcrypto.VectorCommitmentTree{}
+			if err := spentTree.Insert(
+				[]byte{0},
+				[]byte{0x01},
+				nil,
+				big.NewInt(0),
+			); err != nil {
+				return nil, errors.Wrap(err, "get write addresses")
+			}
+
+			spentAddress := spendCheckBI.FillBytes(make([]byte, 32))
+
+			addresses = append(addresses, slices.Concat(
+				tx.Domain[:],
+				spentAddress,
+			))
+		}
+	}
+
+	return addresses, nil
+}
+
 func (tx *Transaction) GetChallenge() ([]byte, error) {
 	transcript := []byte{}
 	transcript = append(transcript, tx.Domain[:]...)
