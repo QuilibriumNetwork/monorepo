@@ -493,6 +493,8 @@ func (e *GlobalExecutionEngine) Lock(
 				return err
 			}
 		}
+
+		return nil
 	}
 
 	return intrinsic.Lock(frameNumber, message)

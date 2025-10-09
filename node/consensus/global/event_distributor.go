@@ -432,7 +432,8 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 								zap.Uint64("join_frame_number", allocation.JoinFrameNumber),
 								zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
 							)
-							pending = allocation.Status == 0 &&
+							pending = allocation.Status ==
+								typesconsensus.ProverStatusJoining &&
 								allocation.JoinFrameNumber+360 <= data.Frame.Header.FrameNumber
 						}
 					}

@@ -304,6 +304,8 @@ func (e *ComputeExecutionEngine) Lock(
 				return err
 			}
 		}
+
+		return nil
 	}
 
 	return errors.Wrap(intrinsic.Lock(frameNumber, message), "lock")

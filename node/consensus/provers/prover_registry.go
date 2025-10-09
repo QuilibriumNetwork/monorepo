@@ -1020,9 +1020,6 @@ func (r *ProverRegistry) extractGlobalState() error {
 				}
 			}
 			allocationsFound++
-		default:
-			r.logger.Debug("unknown vertex type", zap.String("type", typeName))
-			return errors.Wrap(errors.New("invalid type"), "extract global state")
 		}
 	}
 
@@ -1290,7 +1287,7 @@ func (r *ProverRegistry) processProverChange(
 					zap.Uint8("status", uint8(mappedStatus)),
 				)
 
-				// Extract filters
+				// Extract data
 				confirmationFilter, err := r.rdfMultiprover.Get(
 					global.GLOBAL_RDF_SCHEMA,
 					"allocation:ProverAllocation",
@@ -1301,8 +1298,185 @@ func (r *ProverRegistry) processProverChange(
 					return errors.Wrap(err, "process prover change")
 				}
 
+				rejectionFilter, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"RejectionFilter",
+					data,
+				)
+
+				joinFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"JoinFrameNumber",
+					data,
+				)
+
+				var joinFrameNumber uint64
+				if len(joinFrameNumberBytes) != 0 {
+					joinFrameNumber = binary.BigEndian.Uint64(joinFrameNumberBytes)
+				}
+
+				leaveFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"LeaveFrameNumber",
+					data,
+				)
+
+				var leaveFrameNumber uint64
+				if len(leaveFrameNumberBytes) != 0 {
+					leaveFrameNumber = binary.BigEndian.Uint64(leaveFrameNumberBytes)
+				}
+
+				pauseFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"PauseFrameNumber",
+					data,
+				)
+
+				var pauseFrameNumber uint64
+				if len(pauseFrameNumberBytes) != 0 {
+					pauseFrameNumber = binary.BigEndian.Uint64(pauseFrameNumberBytes)
+				}
+
+				resumeFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"ResumeFrameNumber",
+					data,
+				)
+
+				var resumeFrameNumber uint64
+				if len(resumeFrameNumberBytes) != 0 {
+					resumeFrameNumber = binary.BigEndian.Uint64(resumeFrameNumberBytes)
+				}
+
+				kickFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"KickFrameNumber",
+					data,
+				)
+
+				var kickFrameNumber uint64
+				if len(kickFrameNumberBytes) != 0 {
+					kickFrameNumber = binary.BigEndian.Uint64(kickFrameNumberBytes)
+				}
+
+				joinConfirmFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"JoinConfirmFrameNumber",
+					data,
+				)
+
+				var joinConfirmFrameNumber uint64
+				if len(joinConfirmFrameNumberBytes) != 0 {
+					joinConfirmFrameNumber = binary.BigEndian.Uint64(
+						joinConfirmFrameNumberBytes,
+					)
+				}
+
+				joinRejectFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"JoinRejectFrameNumber",
+					data,
+				)
+
+				var joinRejectFrameNumber uint64
+				if len(joinRejectFrameNumberBytes) != 0 {
+					joinRejectFrameNumber = binary.BigEndian.Uint64(
+						joinRejectFrameNumberBytes,
+					)
+				}
+
+				leaveConfirmFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"LeaveConfirmFrameNumber",
+					data,
+				)
+
+				var leaveConfirmFrameNumber uint64
+				if len(leaveConfirmFrameNumberBytes) != 0 {
+					leaveConfirmFrameNumber = binary.BigEndian.Uint64(
+						leaveConfirmFrameNumberBytes,
+					)
+				}
+
+				leaveRejectFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"LeaveRejectFrameNumber",
+					data,
+				)
+
+				var leaveRejectFrameNumber uint64
+				if len(leaveRejectFrameNumberBytes) != 0 {
+					leaveRejectFrameNumber = binary.BigEndian.Uint64(
+						leaveRejectFrameNumberBytes,
+					)
+				}
+
+				lastActiveFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"LastActiveFrameNumber",
+					data,
+				)
+
+				var lastActiveFrameNumber uint64
+				if len(lastActiveFrameNumberBytes) != 0 {
+					lastActiveFrameNumber = binary.BigEndian.Uint64(
+						lastActiveFrameNumberBytes,
+					)
+				}
+
 				// Find the prover this allocation belongs to
 				if proverInfo, exists := r.proverCache[string(proverRef[32:])]; exists {
+					for i, allocation := range proverInfo.Allocations {
+						if bytes.Equal(allocation.ConfirmationFilter, confirmationFilter) {
+							proverInfo.Allocations[i].Status = mappedStatus
+							proverInfo.Allocations[i].RejectionFilter = rejectionFilter
+							proverInfo.Allocations[i].JoinFrameNumber = joinFrameNumber
+							proverInfo.Allocations[i].LeaveFrameNumber = leaveFrameNumber
+							proverInfo.Allocations[i].PauseFrameNumber = pauseFrameNumber
+							proverInfo.Allocations[i].ResumeFrameNumber = resumeFrameNumber
+							proverInfo.Allocations[i].KickFrameNumber = kickFrameNumber
+							proverInfo.Allocations[i].JoinConfirmFrameNumber =
+								joinConfirmFrameNumber
+							proverInfo.Allocations[i].JoinRejectFrameNumber =
+								joinRejectFrameNumber
+							proverInfo.Allocations[i].LeaveConfirmFrameNumber =
+								leaveConfirmFrameNumber
+							proverInfo.Allocations[i].LeaveRejectFrameNumber =
+								leaveRejectFrameNumber
+							proverInfo.Allocations[i].LastActiveFrameNumber =
+								lastActiveFrameNumber
+						}
+					}
+					proverInfo.Allocations = append(
+						proverInfo.Allocations,
+						consensus.ProverAllocationInfo{
+							Status:                  mappedStatus,
+							ConfirmationFilter:      confirmationFilter,
+							RejectionFilter:         rejectionFilter,
+							JoinFrameNumber:         joinFrameNumber,
+							LeaveFrameNumber:        leaveFrameNumber,
+							PauseFrameNumber:        pauseFrameNumber,
+							ResumeFrameNumber:       resumeFrameNumber,
+							KickFrameNumber:         kickFrameNumber,
+							JoinConfirmFrameNumber:  joinConfirmFrameNumber,
+							JoinRejectFrameNumber:   joinRejectFrameNumber,
+							LeaveConfirmFrameNumber: leaveConfirmFrameNumber,
+							LeaveRejectFrameNumber:  leaveRejectFrameNumber,
+							LastActiveFrameNumber:   lastActiveFrameNumber,
+						},
+					)
+
 					// Update tries based on allocation status
 					if mappedStatus == consensus.ProverStatusActive &&
 						len(confirmationFilter) > 0 {
@@ -1314,7 +1488,8 @@ func (r *ProverRegistry) processProverChange(
 						); err != nil {
 							return errors.Wrap(err, "process prover change")
 						}
-					} else {
+					} else if mappedStatus == consensus.ProverStatusKicked ||
+						mappedStatus == consensus.ProverStatusUnknown {
 						// Remove from filter trie if not active
 						if err := r.removeProverFromTrie(
 							proverRef[32:],

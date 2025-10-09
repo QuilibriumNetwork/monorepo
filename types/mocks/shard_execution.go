@@ -26,12 +26,8 @@ func (m *MockShardExecutionEngine) Lock(
 }
 
 // Unlock implements execution.ShardExecutionEngine.
-func (m *MockShardExecutionEngine) Unlock(
-	frameNumber uint64,
-	address []byte,
-	message []byte,
-) error {
-	args := m.Called(frameNumber, address, message)
+func (m *MockShardExecutionEngine) Unlock() error {
+	args := m.Called()
 	return args.Error(0)
 }
 
