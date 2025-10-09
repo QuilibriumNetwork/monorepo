@@ -110,7 +110,7 @@ func TestGlobalExecutionEngine_ProcessMessage(t *testing.T) {
 			},
 			address:     []byte("invalid_address"),
 			wantErr:     true,
-			errContains: "invalid address for global execution engine",
+			errContains: "invalid shard",
 		},
 	}
 

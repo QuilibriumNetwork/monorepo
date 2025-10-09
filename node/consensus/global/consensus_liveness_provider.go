@@ -96,7 +96,29 @@ func (p *GlobalLivenessProvider) Collect(
 			continue
 		}
 
+		err = p.engine.executionManager.Lock(
+			frameNumber,
+			message.Address,
+			message.Payload,
+		)
+		if err != nil {
+			p.engine.logger.Debug(
+				"message failed lock",
+				zap.Int("message_index", i),
+				zap.Error(err),
+			)
+			continue
+		}
+
 		acceptedMessages = append(acceptedMessages, message)
+	}
+
+	err := p.engine.executionManager.Unlock()
+	if err != nil {
+		p.engine.logger.Error(
+			"unable to unlock",
+			zap.Error(err),
+		)
 	}
 
 	commitments := make([]*tries.VectorCommitmentTree, 256)

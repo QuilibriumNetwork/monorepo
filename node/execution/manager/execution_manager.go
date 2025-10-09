@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -636,6 +637,28 @@ func (m *ExecutionEngineManager) Lock(
 	}
 
 	return engine.Lock(frameNumber, address, message)
+}
+
+func (m *ExecutionEngineManager) Unlock() error {
+	m.enginesMu.RLock()
+	defer m.enginesMu.RUnlock()
+
+	errs := []string{}
+	for _, engine := range m.engines {
+		err := engine.Unlock()
+		if err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
+	if len(errs) != 0 {
+		return errors.Wrap(
+			errors.Errorf("multiple errors: %s", strings.Join(errs, ", ")),
+			"unlock",
+		)
+	}
+
+	return nil
 }
 
 // ValidateMessage validates a message without materializing state changes

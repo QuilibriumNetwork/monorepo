@@ -30,7 +30,7 @@ type ShardExecutionEngine interface {
 		message []byte,
 	) (*protobufs.MessageRequest, error)
 	Lock(frameNumber uint64, address []byte, message []byte) error
-	Unlock(frameNumber uint64, address []byte, message []byte) error
+	Unlock() error
 	GetCost(message []byte) (*big.Int, error)
 	GetCapabilities() []*protobufs.Capability
 }

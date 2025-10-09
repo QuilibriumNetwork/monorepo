@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/pkg/errors"
@@ -477,21 +478,48 @@ func (e *HypergraphExecutionEngine) Lock(
 		return nil
 	}
 
+	if len(message) > 4 &&
+		binary.BigEndian.Uint32(message[:4]) == protobufs.MessageBundleType {
+		bundle := &protobufs.MessageBundle{}
+		err = bundle.FromCanonicalBytes(message)
+		if err != nil {
+			return errors.Wrap(err, "lock")
+		}
+
+		for _, r := range bundle.Requests {
+			req, err := r.ToCanonicalBytes()
+			if err != nil {
+				return errors.Wrap(err, "lock")
+			}
+
+			if err = intrinsic.Lock(frameNumber, req[8:]); err != nil {
+				return err
+			}
+		}
+	}
+
 	return errors.Wrap(intrinsic.Lock(frameNumber, message), "lock")
 }
 
-func (e *HypergraphExecutionEngine) Unlock(
-	frameNumber uint64,
-	address []byte,
-	message []byte,
-) error {
-	intrinsic, err := e.tryGetIntrinsic(address)
-	if err != nil {
-		// non-applicable
-		return nil
+func (e *HypergraphExecutionEngine) Unlock() error {
+	e.intrinsicsMutex.RLock()
+	errs := []string{}
+	for _, intrinsic := range e.intrinsics {
+		err := intrinsic.Unlock()
+		if err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	e.intrinsicsMutex.RUnlock()
+
+	if len(errs) != 0 {
+		return errors.Wrap(
+			errors.Errorf("multiple errors: %s", strings.Join(errs, ", ")),
+			"unlock",
+		)
 	}
 
-	return errors.Wrap(intrinsic.Unlock(), "unlock")
+	return nil
 }
 
 func (e *HypergraphExecutionEngine) handleBundle(
