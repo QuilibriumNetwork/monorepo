@@ -92,6 +92,25 @@ func (h *HyperedgeRemove) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (h *HyperedgeRemove) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (h *HyperedgeRemove) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	hyperedgeID := h.Value.GetID()
+
+	return [][]byte{
+		slices.Concat(
+			h.Domain[:],
+			hyperedgeID[32:],
+		),
+	}, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (h *HyperedgeRemove) Verify(frameNumber uint64) (bool, error) {
 	// Verify that the hyperedge is valid

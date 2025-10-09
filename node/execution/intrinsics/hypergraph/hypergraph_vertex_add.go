@@ -158,6 +158,23 @@ func (h *VertexAdd) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (h *VertexAdd) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (h *VertexAdd) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return [][]byte{
+		slices.Concat(
+			h.Domain[:],
+			h.DataAddress[:],
+		),
+	}, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (h *VertexAdd) Verify(frameNumber uint64) (bool, error) {
 	// Check if data is valid and can be committed

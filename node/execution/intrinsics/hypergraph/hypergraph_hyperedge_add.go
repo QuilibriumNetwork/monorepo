@@ -125,6 +125,25 @@ func (h *HyperedgeAdd) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (h *HyperedgeAdd) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (h *HyperedgeAdd) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	hyperedgeID := h.Value.GetID()
+
+	return [][]byte{
+		slices.Concat(
+			h.Domain[:],
+			hyperedgeID[32:],
+		),
+	}, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (h *HyperedgeAdd) Verify(frameNumber uint64) (bool, error) {
 	if h.Value == nil {

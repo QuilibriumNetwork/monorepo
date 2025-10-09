@@ -78,6 +78,23 @@ func (h *VertexRemove) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (h *VertexRemove) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (h *VertexRemove) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return [][]byte{
+		slices.Concat(
+			h.Domain[:],
+			h.DataAddress[:],
+		),
+	}, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (h *VertexRemove) Verify(frameNumber uint64) (bool, error) {
 	message := make([]byte, 0, 64)

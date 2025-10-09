@@ -1107,10 +1107,7 @@ func (h *HypergraphIntrinsic) InvokeStep(
 }
 
 // Lock implements intrinsics.Intrinsic.
-func (h *HypergraphIntrinsic) Lock(
-	writeAddresses [][]byte,
-	readAddresses [][]byte,
-) error {
+func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	h.lockedReadsMx.Lock()
 	h.lockedWritesMx.Lock()
 	defer h.lockedReadsMx.Unlock()
@@ -1124,7 +1121,76 @@ func (h *HypergraphIntrinsic) Lock(
 		h.lockedWrites = make(map[string]struct{})
 	}
 
-	for _, address := range writeAddresses {
+	// Check type prefix to determine request type
+	if len(input) < 4 {
+		observability.LockErrors.WithLabelValues(
+			"compute",
+			"invalid_input",
+		).Inc()
+		return errors.Wrap(errors.New("input too short"), "lock")
+	}
+
+	// Read the type prefix
+	typePrefix := binary.BigEndian.Uint32(input[:4])
+
+	var reads, writes [][]byte
+	var err error
+
+	// Handle each type based on type prefix
+	switch typePrefix {
+	case protobufs.VertexAddType:
+		reads, writes, err = h.tryLockVertexAdd(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues("hypergraph", "vertex_add").Inc()
+
+	case protobufs.VertexRemoveType:
+		reads, writes, err = h.tryLockVertexRemove(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"hypergraph",
+			"vertex_remove",
+		).Inc()
+
+	case protobufs.HyperedgeAddType:
+		reads, writes, err = h.tryLockHyperedgeAdd(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"hypergraph",
+			"hyperedge_add",
+		).Inc()
+
+	case protobufs.HyperedgeRemoveType:
+		reads, writes, err = h.tryLockHyperedgeRemove(frameNumber, input)
+		if err != nil {
+			return err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"hypergraph",
+			"hyperedge_remove",
+		).Inc()
+
+	default:
+		observability.LockErrors.WithLabelValues(
+			"compute",
+			"unknown_type",
+		).Inc()
+		return errors.Wrap(
+			errors.New("unknown compute request type"),
+			"lock",
+		)
+	}
+
+	for _, address := range writes {
 		if _, ok := h.lockedWrites[string(address)]; ok {
 			return errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
@@ -1139,7 +1205,7 @@ func (h *HypergraphIntrinsic) Lock(
 		}
 	}
 
-	for _, address := range readAddresses {
+	for _, address := range reads {
 		if _, ok := h.lockedWrites[string(address)]; ok {
 			return errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
@@ -1148,12 +1214,12 @@ func (h *HypergraphIntrinsic) Lock(
 		}
 	}
 
-	for _, address := range writeAddresses {
+	for _, address := range writes {
 		h.lockedWrites[string(address)] = struct{}{}
 		h.lockedReads[string(address)] = h.lockedReads[string(address)] + 1
 	}
 
-	for _, address := range readAddresses {
+	for _, address := range reads {
 		h.lockedReads[string(address)] = h.lockedReads[string(address)] + 1
 	}
 
@@ -1161,65 +1227,199 @@ func (h *HypergraphIntrinsic) Lock(
 }
 
 // Unlock implements intrinsics.Intrinsic.
-func (h *HypergraphIntrinsic) Unlock(
-	writeAddresses [][]byte,
-	readAddresses [][]byte,
-) error {
+func (h *HypergraphIntrinsic) Unlock() error {
 	h.lockedReadsMx.Lock()
 	h.lockedWritesMx.Lock()
 	defer h.lockedReadsMx.Unlock()
 	defer h.lockedWritesMx.Unlock()
 
-	if h.lockedReads == nil {
-		h.lockedReads = make(map[string]int)
-	}
-
-	if h.lockedWrites == nil {
-		h.lockedWrites = make(map[string]struct{})
-	}
-
-	alteredWriteLocks := make(map[string]struct{})
-	for k, v := range h.lockedWrites {
-		alteredWriteLocks[k] = v
-	}
-
-	for _, address := range writeAddresses {
-		delete(alteredWriteLocks, string(address))
-	}
-
-	for _, address := range readAddresses {
-		if _, ok := alteredWriteLocks[string(address)]; ok {
-			return errors.Wrap(
-				fmt.Errorf("address %x is still locked for writing", address),
-				"unlock",
-			)
-		}
-	}
-
-	for _, address := range writeAddresses {
-		delete(h.lockedWrites, string(address))
-		i, ok := h.lockedReads[string(address)]
-		if ok {
-			if i <= 1 {
-				delete(h.lockedReads, string(address))
-			} else {
-				h.lockedReads[string(address)] = i - 1
-			}
-		}
-	}
-
-	for _, address := range readAddresses {
-		i, ok := h.lockedReads[string(address)]
-		if ok {
-			if i <= 1 {
-				delete(h.lockedReads, string(address))
-			} else {
-				h.lockedReads[string(address)] = i - 1
-			}
-		}
-	}
+	h.lockedReads = make(map[string]int)
+	h.lockedWrites = make(map[string]struct{})
 
 	return nil
+}
+
+func (h *HypergraphIntrinsic) tryLockVertexAdd(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	pbVertexAdd := &protobufs.VertexAdd{}
+	if err := pbVertexAdd.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"vertex_add",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+	vertexAdd, err := VertexAddFromProtobuf(
+		pbVertexAdd,
+		h.inclusionProver,
+		h.keyManager,
+		h.signer,
+		h.verenc,
+		h.config,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"vertex_add",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := vertexAdd.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"vertex_add",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := vertexAdd.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"vertex_add",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (h *HypergraphIntrinsic) tryLockVertexRemove(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	vertexRemove := &VertexRemove{}
+	if err := vertexRemove.FromBytes(
+		input,
+		h.config,
+		h.keyManager,
+		h.signer,
+	); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"vertex_remove",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := vertexRemove.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"vertex_remove",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := vertexRemove.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"vertex_remove",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (h *HypergraphIntrinsic) tryLockHyperedgeAdd(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	hyperedgeAdd := &HyperedgeAdd{}
+	if err := hyperedgeAdd.FromBytes(
+		input,
+		h.config,
+		h.inclusionProver,
+		h.keyManager,
+		h.signer,
+	); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"hyperedge_add",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := hyperedgeAdd.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"hyperedge_add",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := hyperedgeAdd.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"hyperedge_add",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (h *HypergraphIntrinsic) tryLockHyperedgeRemove(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	hyperedgeRemove := &HyperedgeRemove{}
+	if err := hyperedgeRemove.FromBytes(
+		input,
+		h.config,
+		h.keyManager,
+		h.signer,
+	); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"hyperedge_remove",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := hyperedgeRemove.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"hyperedge_remove",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := hyperedgeRemove.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"hypergraph",
+			"hyperedge_remove",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
 }
 
 var _ intrinsics.Intrinsic = (*HypergraphIntrinsic)(nil)
