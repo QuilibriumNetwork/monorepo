@@ -273,13 +273,6 @@ func (e *GlobalExecutionEngine) validateIndividualMessage(
 	message *protobufs.MessageRequest,
 	fromBundle bool,
 ) error {
-	if !isGlobalOp {
-		return errors.Wrap(
-			errors.New("invalid type"),
-			"validate individual message",
-		)
-	}
-
 	// Try to get or load the global intrinsic
 	intrinsic, err := e.tryGetIntrinsic(address)
 	if err != nil {

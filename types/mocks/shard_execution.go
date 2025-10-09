@@ -15,6 +15,26 @@ type MockShardExecutionEngine struct {
 	mock.Mock
 }
 
+// Lock implements execution.ShardExecutionEngine.
+func (m *MockShardExecutionEngine) Lock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) error {
+	args := m.Called(frameNumber, address, message)
+	return args.Error(0)
+}
+
+// Unlock implements execution.ShardExecutionEngine.
+func (m *MockShardExecutionEngine) Unlock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) error {
+	args := m.Called(frameNumber, address, message)
+	return args.Error(0)
+}
+
 // Prove implements execution.ShardExecutionEngine.
 func (m *MockShardExecutionEngine) Prove(
 	domain []byte,

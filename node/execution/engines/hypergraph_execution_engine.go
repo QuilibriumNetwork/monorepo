@@ -396,29 +396,9 @@ func (e *HypergraphExecutionEngine) validateIndividualMessage(
 	}
 
 	// For other operations, try to load the intrinsic and validate
-	addressStr := string(address)
-	e.intrinsicsMutex.RLock()
-	intrinsic, exists := e.intrinsics[addressStr]
-	e.intrinsicsMutex.RUnlock()
-
-	if !exists {
-		// Try to load existing intrinsic
-		loaded, err := hypergraphintrinsic.LoadHypergraphIntrinsic(
-			address,
-			e.hypergraph,
-			e.inclusionProver,
-			e.keyManager,
-			nil, // Signer can and should be nil for verifier path
-			e.verEnc,
-		)
-		if err != nil {
-			return errors.Wrap(err, "validate individual message")
-		}
-
-		e.intrinsicsMutex.Lock()
-		e.intrinsics[addressStr] = loaded
-		e.intrinsicsMutex.Unlock()
-		intrinsic = loaded
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		return errors.Wrap(err, "validate individual message")
 	}
 
 	payload := []byte{}
@@ -484,6 +464,34 @@ func (e *HypergraphExecutionEngine) ProcessMessage(
 		errors.New("unsupported message type"),
 		"process message",
 	)
+}
+
+func (e *HypergraphExecutionEngine) Lock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) error {
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		// non-applicable
+		return nil
+	}
+
+	return errors.Wrap(intrinsic.Lock(frameNumber, message), "lock")
+}
+
+func (e *HypergraphExecutionEngine) Unlock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) error {
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		// non-applicable
+		return nil
+	}
+
+	return errors.Wrap(intrinsic.Unlock(), "unlock")
 }
 
 func (e *HypergraphExecutionEngine) handleBundle(
@@ -644,29 +652,9 @@ func (e *HypergraphExecutionEngine) processIndividualMessage(
 	}
 
 	// Otherwise, try to handle it as an operation on existing intrinsic
-	addressStr := string(address)
-	e.intrinsicsMutex.RLock()
-	intrinsic, exists := e.intrinsics[addressStr]
-	e.intrinsicsMutex.RUnlock()
-
-	if !exists {
-		// Try to load existing intrinsic
-		loaded, err := hypergraphintrinsic.LoadHypergraphIntrinsic(
-			address,
-			e.hypergraph,
-			e.inclusionProver,
-			e.keyManager,
-			nil, // Signer can and should be nil for verifier path
-			e.verEnc,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "process individual message")
-		}
-
-		e.intrinsicsMutex.Lock()
-		e.intrinsics[addressStr] = loaded
-		e.intrinsicsMutex.Unlock()
-		intrinsic = loaded
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		return nil, errors.Wrap(err, "process individual message")
 	}
 
 	err = e.validateIndividualMessage(frameNumber, address, message, fromBundle)
@@ -814,6 +802,37 @@ func (e *HypergraphExecutionEngine) handleDeploy(
 		Messages: []*protobufs.Message{},
 		State:    state,
 	}, nil
+}
+
+func (e *HypergraphExecutionEngine) tryGetIntrinsic(
+	address []byte,
+) (intrinsics.Intrinsic, error) {
+	addressStr := string(address)
+	e.intrinsicsMutex.RLock()
+	intrinsic, exists := e.intrinsics[addressStr]
+	e.intrinsicsMutex.RUnlock()
+
+	if !exists {
+		// Try to load existing intrinsic
+		loaded, err := hypergraphintrinsic.LoadHypergraphIntrinsic(
+			address,
+			e.hypergraph,
+			e.inclusionProver,
+			e.keyManager,
+			nil, // Signer can and should be nil for verifier path
+			e.verEnc,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "try get intrinsic")
+		}
+
+		e.intrinsicsMutex.Lock()
+		e.intrinsics[addressStr] = loaded
+		e.intrinsicsMutex.Unlock()
+		intrinsic = loaded
+	}
+
+	return intrinsic, nil
 }
 
 var _ execution.ShardExecutionEngine = (*HypergraphExecutionEngine)(nil)
