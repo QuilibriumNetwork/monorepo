@@ -1437,7 +1437,7 @@ func (r *ProverRegistry) processProverChange(
 				}
 
 				// Find the prover this allocation belongs to
-				if proverInfo, exists := r.proverCache[string(proverRef[32:])]; exists {
+				if proverInfo, exists := r.proverCache[string(proverRef)]; exists {
 					found := false
 					for i, allocation := range proverInfo.Allocations {
 						if bytes.Equal(allocation.ConfirmationFilter, confirmationFilter) {
@@ -1487,7 +1487,7 @@ func (r *ProverRegistry) processProverChange(
 					if mappedStatus == consensus.ProverStatusActive &&
 						len(confirmationFilter) > 0 {
 						if err := r.addProverToTrie(
-							proverRef[32:],
+							proverRef,
 							proverInfo.PublicKey,
 							confirmationFilter,
 							frameNumber,
@@ -1498,7 +1498,7 @@ func (r *ProverRegistry) processProverChange(
 						mappedStatus == consensus.ProverStatusUnknown {
 						// Remove from filter trie if not active
 						if err := r.removeProverFromTrie(
-							proverRef[32:],
+							proverRef,
 							confirmationFilter,
 						); err != nil {
 							return errors.Wrap(

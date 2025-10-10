@@ -365,7 +365,7 @@ func (p *ProverJoin) Materialize(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 			"allocation:ProverAllocation",
 			"Prover",
-			slices.Concat(intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], proverAddress),
+			proverAddress,
 			allocationTree,
 		)
 		if err != nil {
