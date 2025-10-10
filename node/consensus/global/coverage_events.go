@@ -11,12 +11,13 @@ import (
 )
 
 // checkShardCoverage verifies coverage levels for all active shards
-func (e *GlobalConsensusEngine) checkShardCoverage() error {
+func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 	// Define coverage thresholds
 	const (
-		minProvers    = 5  // Minimum provers for safe operation
-		maxProvers    = 32 // Maximum provers before split consideration
-		haltThreshold = 3  // Network halt if <= 3 provers
+		minProvers      = 5   // Minimum provers for safe operation
+		maxProvers      = 32  // Maximum provers before split consideration
+		haltThreshold   = 3   // Network halt if <= 3 provers
+		haltGraceFrames = 360 // Require sustained critical state for 360 frames
 	)
 
 	// Get shard coverage information from prover registry
@@ -67,16 +68,46 @@ func (e *GlobalConsensusEngine) checkShardCoverage() error {
 				continue
 			}
 
-			e.logger.Error(
-				"CRITICAL: Shard has insufficient coverage - triggering network halt",
+			// Bump the streak – only increments once per frame
+			streak := e.bumpStreak(shardAddress, frameNumber)
+			remaining := int(haltGraceFrames - streak.Count)
+			if remaining <= 0 {
+				e.logger.Error(
+					"CRITICAL: Shard has insufficient coverage - triggering network halt",
+					zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
+					zap.Int("prover_count", proverCount),
+					zap.Int("halt_threshold", haltThreshold),
+				)
+
+				// Emit halt event
+				e.emitCoverageEvent(
+					typesconsensus.ControlEventCoverageHalt,
+					&typesconsensus.CoverageEventData{
+						ShardAddress:    []byte(shardAddress),
+						ProverCount:     proverCount,
+						RequiredProvers: minProvers,
+						AttestedStorage: attestedStorage,
+						TreeMetadata:    coverage.TreeMetadata,
+						Message: fmt.Sprintf(
+							"Shard has only %d provers, network halt required",
+							proverCount,
+						),
+					},
+				)
+				continue
+			}
+
+			// During grace, warn and include progress toward halt
+			e.logger.Warn(
+				"Shard at critical coverage — grace window in effect",
 				zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
 				zap.Int("prover_count", proverCount),
 				zap.Int("halt_threshold", haltThreshold),
+				zap.Uint64("streak_frames", streak.Count),
+				zap.Int("frames_until_halt", remaining),
 			)
-
-			// Emit halt event
 			e.emitCoverageEvent(
-				typesconsensus.ControlEventCoverageHalt,
+				typesconsensus.ControlEventCoverageWarn,
 				&typesconsensus.CoverageEventData{
 					ShardAddress:    []byte(shardAddress),
 					ProverCount:     proverCount,
@@ -84,13 +115,16 @@ func (e *GlobalConsensusEngine) checkShardCoverage() error {
 					AttestedStorage: attestedStorage,
 					TreeMetadata:    coverage.TreeMetadata,
 					Message: fmt.Sprintf(
-						"Shard has only %d provers, network halt required",
-						proverCount,
+						"Critical coverage (less than or equal to %d provers). Grace period: %d/%d frames toward halt.",
+						haltThreshold, streak.Count, haltGraceFrames,
 					),
 				},
 			)
 			continue
 		}
+
+		// Not in critical state — clear any ongoing streak
+		e.clearStreak(shardAddress)
 
 		// Check for low coverage
 		if proverCount < minProvers {
@@ -498,4 +532,37 @@ func (e *GlobalConsensusEngine) proposeShardSplit(
 	)
 
 	return proposedShards
+}
+
+func (e *GlobalConsensusEngine) ensureStreakMap() {
+	if e.lowCoverageStreak == nil {
+		e.lowCoverageStreak = make(map[string]*coverageStreak)
+	}
+}
+
+func (e *GlobalConsensusEngine) bumpStreak(
+	shardKey string,
+	frame uint64,
+) *coverageStreak {
+	e.ensureStreakMap()
+	s := e.lowCoverageStreak[shardKey]
+	if s == nil {
+		s = &coverageStreak{StartFrame: frame, LastFrame: frame, Count: 1}
+		e.lowCoverageStreak[shardKey] = s
+		return s
+	}
+
+	// Only increment if we advanced frames, prevents double counting within the
+	// same frame due to single-slot fork choice
+	if frame > s.LastFrame {
+		s.Count += (frame - s.LastFrame)
+		s.LastFrame = frame
+	}
+	return s
+}
+
+func (e *GlobalConsensusEngine) clearStreak(shardKey string) {
+	if e.lowCoverageStreak != nil {
+		delete(e.lowCoverageStreak, shardKey)
+	}
 }

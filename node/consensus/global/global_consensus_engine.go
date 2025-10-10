@@ -66,10 +66,10 @@ var GLOBAL_PEER_INFO_BITMASK = []byte{0x00, 0x00, 0x00, 0x00}
 
 var GLOBAL_ALERT_BITMASK = bytes.Repeat([]byte{0x00}, 16)
 
-// timestampedPeerInfo stores peer info with a timestamp for expiry management
-type timestampedPeerInfo struct {
-	peerInfo  *protobufs.PeerInfo
-	timestamp time.Time
+type coverageStreak struct {
+	StartFrame uint64
+	LastFrame  uint64
+	Count      uint64
 }
 
 // GlobalConsensusEngine  uses the generic state machine for consensus
@@ -136,6 +136,7 @@ type GlobalConsensusEngine struct {
 	frameStore            map[string]*protobufs.GlobalFrame
 	appFrameStore         map[string]*protobufs.AppShardFrame
 	frameStoreMu          sync.RWMutex
+	lowCoverageStreak     map[string]*coverageStreak
 
 	// Generic state machine
 	stateMachine *consensus.StateMachine[
@@ -1413,16 +1414,16 @@ func (e *GlobalConsensusEngine) cleanupFrameStore() {
 				zap.Uint64("max_frame", cutoffFrameNumber-1),
 			)
 		}
-	}
 
-	e.logger.Debug(
-		"cleaned up frame store",
-		zap.Int("deleted_frames", deletedCount),
-		zap.Int("remaining_frames", len(e.frameStore)),
-		zap.Uint64("max_frame_number", maxFrameNumber),
-		zap.Uint64("cutoff_frame_number", cutoffFrameNumber),
-		zap.Bool("archive_mode", e.config.Engine.ArchiveMode),
-	)
+		e.logger.Debug(
+			"cleaned up frame store",
+			zap.Int("deleted_frames", deletedCount),
+			zap.Int("remaining_frames", len(e.frameStore)),
+			zap.Uint64("max_frame_number", maxFrameNumber),
+			zap.Uint64("cutoff_frame_number", cutoffFrameNumber),
+			zap.Bool("archive_mode", e.config.Engine.ArchiveMode),
+		)
+	}
 }
 
 // isAddressBlacklisted checks if a given address (full or partial) is in the

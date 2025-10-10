@@ -947,7 +947,7 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 	// Since we registered only 1 prover above, this is already a low coverage scenario
 
 	// Run shard coverage check
-	err := engine.checkShardCoverage()
+	err := engine.checkShardCoverage(1)
 	require.NoError(t, err)
 
 	// Wait for event processing and possible new app shard head

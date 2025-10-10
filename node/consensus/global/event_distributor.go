@@ -68,7 +68,9 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 					)
 
 					// Check shard coverage
-					if err := e.checkShardCoverage(); err != nil {
+					if err := e.checkShardCoverage(
+						data.Frame.Header.FrameNumber,
+					); err != nil {
 						e.logger.Error("failed to check shard coverage", zap.Error(err))
 					}
 
