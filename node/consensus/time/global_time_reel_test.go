@@ -1518,6 +1518,164 @@ func TestGlobalTimeReel_ComprehensiveEquivocation(t *testing.T) {
 		}
 	}
 }
+func TestGlobalTimeReel_NonArchive_BootstrapLoadsWindowOf360(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	s := setupTestClockStore(t)
+
+	// Persist 1000 -> 1500 (501 frames) so bootstrap has history to load.
+	buildAndPersistChain(t, s, 1000, 1500)
+
+	// Start a new reel in non-archive mode; it should bootstrap only last 360.
+	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, tr.Start())
+	defer tr.Stop()
+
+	head, err := tr.GetHead()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1500), head.Header.FrameNumber)
+
+	info := tr.GetTreeInfo()
+	span := info["tree_span"].(uint64)
+	assert.LessOrEqual(t, span, uint64(maxGlobalTreeDepth), "tree span must be less than or equal to 360 in non-archive bootstrap")
+
+	// Old in-memory nodes before the 360-window should not be retrievable via
+	// in-memory index.
+	_, err = tr.GetFramesByNumber(1000)
+	assert.Error(t, err, "old frames should not be in memory after non-archive bootstrap")
+}
+
+func TestGlobalTimeReel_NonArchive_SnapForward_WhenGapExceeds360(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	s := setupTestClockStore(t)
+
+	// Persist a tiny tail 1000 -> 1020, so non-archive starts at 1020.
+	buildAndPersistChain(t, s, 1000, 1020)
+
+	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, tr.Start())
+	defer tr.Stop()
+
+	head, err := tr.GetHead()
+	require.NoError(t, err)
+	require.Equal(t, uint64(1020), head.Header.FrameNumber)
+
+	// Insert a future frame whose height is > head + 360 (i.e. 1381).
+	// Parent is unknown: leave ParentSelector nil/garbage, non-archive path
+	// should snap to head.
+	future := &protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:    1381,
+			Timestamp:      time.Now().UnixMilli(),
+			Output:         []byte("future_1381"),
+			ParentSelector: []byte("unknown_parent"),
+		},
+	}
+	require.NoError(t, tr.Insert(context.Background(), future))
+
+	newHead, err := tr.GetHead()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1381), newHead.Header.FrameNumber, "gap over 360 should snap head to future frame")
+}
+
+func TestGlobalTimeReel_NonArchive_PrunesStore_AsHeadAdvances(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	s := setupTestClockStore(t)
+
+	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, tr.Start())
+	defer tr.Stop()
+
+	// Insert a contiguous chain via Insert so persistCanonicalFrames runs and
+	// prunes store.
+	var prev *protobufs.GlobalFrame
+	for n := uint64(1); n <= uint64(maxGlobalTreeDepth)+25; n++ {
+		f := createGlobalFrame(n, prev, []byte(fmt.Sprintf("out%d", n)))
+		require.NoError(t, tr.Insert(context.Background(), f))
+		prev = f
+	}
+
+	head, err := tr.GetHead()
+	require.NoError(t, err)
+
+	// Oldest to keep in store should be (head - 360 + 1).
+	oldestToKeep := head.Header.FrameNumber - maxGlobalTreeDepth + 1
+
+	// Old frames should be gone from the store, head should remain.
+	_, err = s.GetGlobalClockFrame(1)
+	assert.Error(t, err, "very old frame should be pruned from store in non-archive mode")
+
+	latest, err := s.GetLatestGlobalClockFrame()
+	require.NoError(t, err)
+	assert.Equal(t, head.Header.FrameNumber, latest.Header.FrameNumber)
+
+	// Boundary itself should have been deleted by current code path.
+	_, err = s.GetGlobalClockFrame(oldestToKeep)
+	assert.Error(t, err, "boundary oldestToKeep is deleted by range deletion in current implementation")
+}
+
+func TestGlobalTimeReel_NonArchive_PendingResolves_WhenParentArrives(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	s := setupTestClockStore(t)
+
+	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, tr.Start())
+	defer tr.Stop()
+
+	ctx := context.Background()
+
+	var prev *protobufs.GlobalFrame
+	for n := uint64(90); n <= 99; n++ {
+		f := createGlobalFrame(n, prev, []byte(fmt.Sprintf("base_%d", n)))
+		require.NoError(t, tr.Insert(ctx, f))
+		prev = f
+	}
+
+	// Insert the child frame (101) first, referencing the output of the parent
+	// (100), but 100 is not in the reel yet. Set child's ParentSelector to
+	// hash(out100).
+	out100 := []byte("base_100")
+	child101 := &protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:    101,
+			Timestamp:      time.Now().UnixMilli(),
+			Output:         []byte("child_101"),
+			ParentSelector: computeGlobalPoseidonHash(out100), // points to future parent 100
+		},
+	}
+	require.NoError(t, tr.Insert(ctx, child101))
+
+	// Should appear in pending (under the selector for out100).
+	pending := tr.GetPendingFrames()
+	require.NotZero(t, len(pending), "child without known parent should be pending")
+
+	// Now insert the missing parent 100 that links to 99 and has output out100.
+	parent100 := &protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:    100,
+			Timestamp:      time.Now().UnixMilli(),
+			Output:         out100,
+			ParentSelector: computeGlobalPoseidonHash([]byte("base_99")),
+		},
+	}
+	require.NoError(t, tr.Insert(ctx, parent100))
+
+	// Give a beat for pending processing.
+	time.Sleep(25 * time.Millisecond)
+
+	// Pending for that selector should be cleared; head should advance to 101.
+	after := tr.GetPendingFrames()
+	for sel, list := range after {
+		assert.Failf(t, "unexpected pending remains", "selector=%x len=%d", sel, len(list))
+	}
+
+	head, err := tr.GetHead()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(101), head.Header.FrameNumber)
+}
 
 func mustLatestGlobal(t *testing.T, s *store.PebbleClockStore) *protobufs.GlobalFrame {
 	t.Helper()
@@ -1551,4 +1709,36 @@ func assertLatestNumOutput(t *testing.T, s *store.PebbleClockStore, n uint64, ou
 	f := mustLatestGlobal(t, s)
 	assert.Equal(t, n, f.Header.FrameNumber)
 	assert.Equal(t, output, f.Header.Output)
+}
+
+func createGlobalFrame(num uint64, parent *protobufs.GlobalFrame, out []byte) *protobufs.GlobalFrame {
+	var sel []byte
+	if parent != nil {
+		sel = computeGlobalPoseidonHash(parent.Header.Output)
+	}
+	return &protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:    num,
+			Timestamp:      time.Now().UnixMilli(),
+			Difficulty:     0,
+			Output:         out,
+			ParentSelector: sel,
+		},
+	}
+}
+
+func buildAndPersistChain(t *testing.T, s *store.PebbleClockStore, start, end uint64) {
+	t.Helper()
+	logger, _ := zap.NewDevelopment()
+	reel, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
+	require.NoError(t, err)
+	require.NoError(t, reel.Start())
+	defer reel.Stop()
+
+	var prev *protobufs.GlobalFrame
+	for n := start; n <= end; n++ {
+		f := createGlobalFrame(n, prev, []byte(fmt.Sprintf("out%d", n)))
+		require.NoError(t, reel.Insert(context.Background(), f))
+		prev = f
+	}
 }
