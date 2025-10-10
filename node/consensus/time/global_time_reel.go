@@ -527,8 +527,29 @@ func (g *GlobalTimeReel) processPendingFrames(
 	for _, pending := range pendingList {
 		frameID := g.ComputeFrameID(pending.Frame)
 
-		// Skip if already processed
-		if _, exists := g.nodes[frameID]; exists {
+		if existing, exists := g.nodes[frameID]; exists {
+			// Re-parent previously pre-inserted orphan
+			if existing.Parent == nil {
+				existing.Parent = parentNode
+				existing.Depth = parentNode.Depth + 1
+				parentNode.Children[frameID] = existing
+				g.framesByNumber[pending.Frame.Header.FrameNumber] = append(
+					g.framesByNumber[pending.Frame.Header.FrameNumber], existing)
+
+				g.cache.Add(frameID, existing)
+
+				g.logger.Debug("reparented pending orphan frame",
+					zap.Uint64("frame_number", pending.Frame.Header.FrameNumber),
+					zap.String("id", frameID),
+					zap.String("parent_id", parentFrameID),
+				)
+
+				g.processPendingFrames(frameID, existing)
+
+				g.evaluateForkChoice(existing)
+			}
+
+			// Skip if already processed
 			continue
 		}
 
@@ -791,15 +812,43 @@ func (g *GlobalTimeReel) evaluateForkChoice(newNode *GlobalFrameNode) {
 	}
 }
 
-// findLeafNodes returns all leaf nodes (nodes with no children)
+// findLeafNodes returns all leaf nodes (nodes with no children) that are in the
+// same connected component as the current head. This prevents spurious fork
+// choice across disconnected forests (e.g., after a non-archive snap-ahead).
 func (g *GlobalTimeReel) findLeafNodes() []*GlobalFrameNode {
 	var leaves []*GlobalFrameNode
+	if g.head == nil {
+		// Fallback: no head yet, return all leaves
+		for _, node := range g.nodes {
+			if len(node.Children) == 0 {
+				leaves = append(leaves, node)
+			}
+		}
+
+		return leaves
+	}
+
+	headRoot := g.findRoot(g.head)
 	for _, node := range g.nodes {
-		if len(node.Children) == 0 {
+		if len(node.Children) != 0 {
+			continue
+		}
+
+		if g.findRoot(node) == headRoot {
 			leaves = append(leaves, node)
 		}
 	}
+
 	return leaves
+}
+
+// findRoot walks parents to identify the root of a node
+func (g *GlobalTimeReel) findRoot(n *GlobalFrameNode) *GlobalFrameNode {
+	cur := n
+	for cur != nil && cur.Parent != nil {
+		cur = cur.Parent
+	}
+	return cur
 }
 
 // nodeToBranch converts a node and its lineage to a Branch for fork choice
