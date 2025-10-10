@@ -3,6 +3,7 @@ package provers
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"sync"
@@ -1437,6 +1438,7 @@ func (r *ProverRegistry) processProverChange(
 
 				// Find the prover this allocation belongs to
 				if proverInfo, exists := r.proverCache[string(proverRef[32:])]; exists {
+					found := false
 					for i, allocation := range proverInfo.Allocations {
 						if bytes.Equal(allocation.ConfirmationFilter, confirmationFilter) {
 							proverInfo.Allocations[i].Status = mappedStatus
@@ -1456,26 +1458,30 @@ func (r *ProverRegistry) processProverChange(
 								leaveRejectFrameNumber
 							proverInfo.Allocations[i].LastActiveFrameNumber =
 								lastActiveFrameNumber
+							found = true
 						}
 					}
-					proverInfo.Allocations = append(
-						proverInfo.Allocations,
-						consensus.ProverAllocationInfo{
-							Status:                  mappedStatus,
-							ConfirmationFilter:      confirmationFilter,
-							RejectionFilter:         rejectionFilter,
-							JoinFrameNumber:         joinFrameNumber,
-							LeaveFrameNumber:        leaveFrameNumber,
-							PauseFrameNumber:        pauseFrameNumber,
-							ResumeFrameNumber:       resumeFrameNumber,
-							KickFrameNumber:         kickFrameNumber,
-							JoinConfirmFrameNumber:  joinConfirmFrameNumber,
-							JoinRejectFrameNumber:   joinRejectFrameNumber,
-							LeaveConfirmFrameNumber: leaveConfirmFrameNumber,
-							LeaveRejectFrameNumber:  leaveRejectFrameNumber,
-							LastActiveFrameNumber:   lastActiveFrameNumber,
-						},
-					)
+
+					if !found {
+						proverInfo.Allocations = append(
+							proverInfo.Allocations,
+							consensus.ProverAllocationInfo{
+								Status:                  mappedStatus,
+								ConfirmationFilter:      confirmationFilter,
+								RejectionFilter:         rejectionFilter,
+								JoinFrameNumber:         joinFrameNumber,
+								LeaveFrameNumber:        leaveFrameNumber,
+								PauseFrameNumber:        pauseFrameNumber,
+								ResumeFrameNumber:       resumeFrameNumber,
+								KickFrameNumber:         kickFrameNumber,
+								JoinConfirmFrameNumber:  joinConfirmFrameNumber,
+								JoinRejectFrameNumber:   joinRejectFrameNumber,
+								LeaveConfirmFrameNumber: leaveConfirmFrameNumber,
+								LeaveRejectFrameNumber:  leaveRejectFrameNumber,
+								LastActiveFrameNumber:   lastActiveFrameNumber,
+							},
+						)
+					}
 
 					// Update tries based on allocation status
 					if mappedStatus == consensus.ProverStatusActive &&
@@ -1721,6 +1727,12 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 		// Check if this prover has any active allocations (app shard provers)
 		hasActiveAllocation := false
 		for _, allocation := range proverInfo.Allocations {
+			r.logger.Debug(
+				"checking allocation status",
+				zap.String("address", hex.EncodeToString(proverInfo.Address)),
+				zap.String("filter", hex.EncodeToString(allocation.ConfirmationFilter)),
+				zap.Uint32("status", uint32(allocation.Status)),
+			)
 			if allocation.Status == consensus.ProverStatusActive &&
 				len(allocation.ConfirmationFilter) > 0 {
 				hasActiveAllocation = true
@@ -1730,6 +1742,10 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 
 		// Only include provers with active allocations
 		if hasActiveAllocation {
+			r.logger.Debug(
+				"copying prover info for status",
+				zap.String("address", hex.EncodeToString(proverInfo.Address)),
+			)
 			// Make a copy to avoid external modification
 			proverCopy := &consensus.ProverInfo{
 				PublicKey:        make([]byte, len(proverInfo.PublicKey)),
@@ -1750,6 +1766,14 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 
 			// Copy allocations
 			for i, allocation := range proverInfo.Allocations {
+				r.logger.Debug(
+					"copying prover allocation for status",
+					zap.String("address", hex.EncodeToString(proverInfo.Address)),
+					zap.String(
+						"filter",
+						hex.EncodeToString(allocation.ConfirmationFilter),
+					),
+				)
 				proverCopy.Allocations[i] = consensus.ProverAllocationInfo{
 					Status: allocation.Status,
 					ConfirmationFilter: make(
