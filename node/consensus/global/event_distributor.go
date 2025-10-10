@@ -202,11 +202,13 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 				if ok && data.Message != "" {
 					e.logger.Error(data.Message)
 					e.halt()
-					if err := e.stateMachine.Stop(); err != nil {
-						e.logger.Error(
-							"error occurred while halting consensus",
-							zap.Error(err),
-						)
+					if e.stateMachine != nil {
+						if err := e.stateMachine.Stop(); err != nil {
+							e.logger.Error(
+								"error occurred while halting consensus",
+								zap.Error(err),
+							)
+						}
 					}
 					go func() {
 						for {
@@ -230,11 +232,13 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 						zap.Error(data.Error),
 					)
 					e.halt()
-					if err := e.stateMachine.Stop(); err != nil {
-						e.logger.Error(
-							"error occurred while halting consensus",
-							zap.Error(err),
-						)
+					if e.stateMachine != nil {
+						if err := e.stateMachine.Stop(); err != nil {
+							e.logger.Error(
+								"error occurred while halting consensus",
+								zap.Error(err),
+							)
+						}
 					}
 					go func() {
 						for {
