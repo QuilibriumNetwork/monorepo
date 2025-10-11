@@ -48,7 +48,7 @@ func TestAppTimeReel_BasicOperations(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -132,7 +132,7 @@ func TestAppTimeReel_WrongAddress(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("correct_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -163,7 +163,7 @@ func TestAppTimeReel_Equivocation(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -265,7 +265,7 @@ func TestAppTimeReel_Fork(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -339,7 +339,7 @@ func TestAppTimeReel_ParentValidation(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -406,7 +406,7 @@ func TestAppTimeReel_ForkDetection(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -489,7 +489,7 @@ func TestAppTimeReel_ForkChoice_MoreSignatures(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -600,7 +600,7 @@ func TestAppTimeReel_ForkChoice_NoReplacement(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -711,7 +711,7 @@ func TestAppTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 	address := []byte("test_app_address")
 	reg := createTestProverRegistry(false)
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, reg, s)
+	atr, err := NewAppTimeReel(logger, address, reg, s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1044,7 +1044,7 @@ func TestAppTimeReel_MultipleProvers(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1172,7 +1172,7 @@ func TestAppTimeReel_ComplexForkWithOutOfOrderInsertion(t *testing.T) {
 	proverRegistry.On("GetOrderedProvers", mock.Anything, mock.Anything).Return(nil, errors.New("unknown parent selector"))
 
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, proverRegistry, s)
+	atr, err := NewAppTimeReel(logger, address, proverRegistry, s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1389,7 +1389,7 @@ func TestAppTimeReel_TreePruning(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1478,7 +1478,7 @@ func TestAppTimeReel_TreePruningWithForks(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1598,7 +1598,7 @@ func TestAppTimeReel_ForkChoiceInsertionOrder(t *testing.T) {
 	address := []byte("test_app_address")
 	reg := createTestProverRegistry(false)
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, reg, s)
+	atr, err := NewAppTimeReel(logger, address, reg, s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1814,7 +1814,7 @@ func TestAppTimeReel_ForkEventsWithReplay(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -1997,7 +1997,7 @@ func TestAppTimeReel_ComprehensiveEquivocation(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	address := []byte("test_app_address")
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s)
+	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -2159,7 +2159,7 @@ func TestAppTimeReel_ProverRegistryForkChoice(t *testing.T) {
 	proverRegistry.On("GetOrderedProvers", mock.Anything, mock.Anything).Return(nil, errors.New("unknown parent selector"))
 
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, proverRegistry, s)
+	atr, err := NewAppTimeReel(logger, address, proverRegistry, s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()
@@ -2290,7 +2290,7 @@ func TestAppTimeReel_ProverRegistryWithOrderedProvers(t *testing.T) {
 	proverRegistry.On("GetOrderedProvers", mock.Anything, mock.Anything).Return([][]byte{[]byte("default_prover")}, nil)
 
 	s := setupTestClockStore(t)
-	atr, err := NewAppTimeReel(logger, address, proverRegistry, s)
+	atr, err := NewAppTimeReel(logger, address, proverRegistry, s, true)
 	require.NoError(t, err)
 
 	err = atr.Start()

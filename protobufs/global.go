@@ -2116,6 +2116,10 @@ func (f *FrameVote) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
+	if err := binary.Write(buf, binary.BigEndian, f.Timestamp); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
 	// Write public_key_signature_bls48581
 	if f.PublicKeySignatureBls48581 != nil {
 		sigBytes, err := f.PublicKeySignatureBls48581.ToCanonicalBytes()
@@ -2177,6 +2181,11 @@ func (f *FrameVote) FromCanonicalBytes(data []byte) error {
 		return errors.Wrap(err, "from canonical bytes")
 	}
 	f.Approve = approve != 0
+
+	// Read timestamp
+	if err := binary.Read(buf, binary.BigEndian, &f.Timestamp); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
 
 	// Read public_key_signature_bls48581
 	var sigLen uint32

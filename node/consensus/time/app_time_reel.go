@@ -108,6 +108,9 @@ type AppTimeReel struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// Archive mode: whether to hold historic frame data
+	archiveMode bool
 }
 
 // NewAppTimeReel creates a new app time reel for a specific shard address
@@ -116,6 +119,7 @@ func NewAppTimeReel(
 	address []byte,
 	proverRegistry consensus.ProverRegistry,
 	clockStore store.ClockStore,
+	archiveMode bool,
 ) (*AppTimeReel, error) {
 	cache, err := lru.New[string, *FrameNode](defaultAppCacheSize)
 	if err != nil {
@@ -148,9 +152,10 @@ func NewAppTimeReel(
 		) error {
 			return nil
 		},
-		store:  clockStore,
-		ctx:    ctx,
-		cancel: cancel,
+		store:       clockStore,
+		ctx:         ctx,
+		cancel:      cancel,
+		archiveMode: archiveMode,
 	}, nil
 }
 
@@ -309,11 +314,42 @@ func (a *AppTimeReel) Insert(
 		return a.insertGenesisFrame(frame, frameID)
 	}
 
+	// Non-archive: if we have no in-memory frames yet, accept the first as
+	// pseudo-root
+	if !a.archiveMode && a.root == nil && len(a.nodes) == 0 {
+		a.logger.Info("non-archive: accepting first frame as pseudo-root",
+			zap.String("address", fmt.Sprintf("%x", a.address)),
+			zap.Uint64("frame_number", frame.Header.FrameNumber))
+		return a.insertGenesisFrame(frame, frameID)
+	}
+
 	// Try to find parent
 	parentSelector := string(frame.Header.ParentSelector)
 	parentNode := a.findNodeBySelector(frame.Header.ParentSelector)
 
 	if parentNode == nil {
+		if !a.archiveMode && a.head != nil &&
+			frame.Header.FrameNumber > a.head.Frame.Header.FrameNumber {
+			// ahead-of-head orphan: stage as pending and pre-insert as orphan node
+			a.addPendingFrame(frame, parentSelector)
+
+			orphan := &FrameNode{
+				Frame:    frame,
+				Parent:   nil, // reparent later when parent arrives
+				Children: make(map[string]*FrameNode),
+				Depth:    1,
+			}
+
+			a.nodes[frameID] = orphan
+			a.framesByNumber[frame.Header.FrameNumber] =
+				append(a.framesByNumber[frame.Header.FrameNumber], orphan)
+			a.cache.Add(frameID, orphan)
+
+			// Evaluate fork choice (may snap ahead if gap > 360)
+			a.evaluateForkChoice(orphan)
+			return nil
+		}
+
 		// Parent not found, add to pending frames
 		a.addPendingFrame(frame, parentSelector)
 		return nil
@@ -452,8 +488,30 @@ func (a *AppTimeReel) processPendingFrames(
 	for _, pending := range pendingList {
 		frameID := a.ComputeFrameID(pending.Frame)
 
-		// Skip if already processed
-		if _, exists := a.nodes[frameID]; exists {
+		if existing, ok := a.nodes[frameID]; ok {
+			// Re-parent previously pre-inserted orphan
+			if existing.Parent == nil {
+				existing.Parent = parentNode
+				existing.Depth = parentNode.Depth + 1
+				parentNode.Children[frameID] = existing
+				a.framesByNumber[pending.Frame.Header.FrameNumber] =
+					append(
+						a.framesByNumber[pending.Frame.Header.FrameNumber],
+						existing,
+					)
+				a.cache.Add(frameID, existing)
+
+				a.logger.Debug("reparented pending orphan frame",
+					zap.String("address", fmt.Sprintf("%x", a.address)),
+					zap.Uint64("frame_number", pending.Frame.Header.FrameNumber),
+					zap.String("id", frameID))
+
+				a.processPendingFrames(frameID, existing)
+
+				a.evaluateForkChoice(existing)
+			}
+
+			// Skip if already processed
 			continue
 		}
 
@@ -498,9 +556,9 @@ func (a *AppTimeReel) findNodeBySelector(selector []byte) *FrameNode {
 
 // evaluateForkChoice evaluates fork choice and updates head if necessary
 func (a *AppTimeReel) evaluateForkChoice(newNode *FrameNode) {
-	if a.head == nil ||
-		(newNode.Frame.Header.FrameNumber > a.head.Frame.Header.FrameNumber &&
-			newNode.Frame.Header.FrameNumber-a.head.Frame.Header.FrameNumber > 360) {
+	if a.head == nil || (!a.archiveMode &&
+		newNode.Frame.Header.FrameNumber > a.head.Frame.Header.FrameNumber &&
+		newNode.Frame.Header.FrameNumber-a.head.Frame.Header.FrameNumber > 360) {
 		oldHead := a.head
 		a.head = newNode
 		a.sendHeadEvent(newNode, oldHead)
@@ -708,15 +766,43 @@ func (a *AppTimeReel) evaluateForkChoice(newNode *FrameNode) {
 	}
 }
 
-// findLeafNodes returns all leaf nodes (nodes with no children)
-func (a *AppTimeReel) findLeafNodes() []*FrameNode {
+// findLeafNodes returns all leaf nodes (nodes with no children) that are in the
+// same connected component as the current head. This prevents spurious fork
+// choice across disconnected forests (e.g., after a non-archive snap-ahead).
+func (g *AppTimeReel) findLeafNodes() []*FrameNode {
 	var leaves []*FrameNode
-	for _, node := range a.nodes {
-		if len(node.Children) == 0 {
+	if g.head == nil {
+		// Fallback: no head yet, return all leaves
+		for _, node := range g.nodes {
+			if len(node.Children) == 0 {
+				leaves = append(leaves, node)
+			}
+		}
+
+		return leaves
+	}
+
+	headRoot := g.findRoot(g.head)
+	for _, node := range g.nodes {
+		if len(node.Children) != 0 {
+			continue
+		}
+
+		if g.findRoot(node) == headRoot {
 			leaves = append(leaves, node)
 		}
 	}
+
 	return leaves
+}
+
+// findRoot walks parents to identify the root of a node
+func (a *AppTimeReel) findRoot(n *FrameNode) *FrameNode {
+	cur := n
+	for cur != nil && cur.Parent != nil {
+		cur = cur.Parent
+	}
+	return cur
 }
 
 // nodeToBranch converts a node and its lineage to a Branch for fork choice
@@ -1435,13 +1521,14 @@ func (a *AppTimeReel) bootstrapFromStore() error {
 	latest, _, err := a.store.GetLatestShardClockFrame(a.address)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return nil // fresh DB
+			return nil
 		}
 		return errors.Wrap(err, "bootstrap from store")
 	}
 	latestNum := latest.Header.FrameNumber
+
 	var start uint64
-	if latestNum+1 > maxTreeDepth {
+	if !a.archiveMode && latestNum+1 > maxTreeDepth {
 		start = latestNum - (maxTreeDepth - 1)
 	} else {
 		start = 0
@@ -1481,18 +1568,22 @@ func (a *AppTimeReel) bootstrapFromStore() error {
 				node.Parent = p
 				node.Depth = p.Depth + 1
 				p.Children[frameID] = node
+			} else if !a.archiveMode && frame.Header.FrameNumber == start {
+				// treat it as pseudo-root
+				node.Depth = 0
+				a.logger.Info("non-archive: treating first loaded frame as pseudo-root",
+					zap.String("address", fmt.Sprintf("%x", a.address)),
+					zap.Uint64("frame_number", frame.Header.FrameNumber))
 			}
 		}
 
-		if a.root == nil {
+		if a.root == nil || (!a.archiveMode && frame.Header.FrameNumber == start) {
 			a.root = node
 		}
 
 		a.nodes[frameID] = node
-		a.framesByNumber[frame.Header.FrameNumber] = append(
-			a.framesByNumber[frame.Header.FrameNumber],
-			node,
-		)
+		a.framesByNumber[frame.Header.FrameNumber] =
+			append(a.framesByNumber[frame.Header.FrameNumber], node)
 		a.cache.Add(frameID, node)
 
 		prev = node
@@ -1502,12 +1593,18 @@ func (a *AppTimeReel) bootstrapFromStore() error {
 	a.updateTreeMetrics()
 
 	if a.head != nil {
-		a.logger.Info(
-			"bootstrapped app reel from store",
+		a.logger.Info("bootstrapped app reel from store",
 			zap.String("address", fmt.Sprintf("%x", a.address)),
+			zap.Uint64("loaded_from", start),
 			zap.Uint64("loaded_to", a.head.Frame.Header.FrameNumber),
 			zap.Int("loaded_count", len(a.nodes)),
+			zap.Bool("archive_mode", a.archiveMode),
 		)
+		if !a.archiveMode && a.root != nil {
+			a.logger.Info("non-archive: accepting last 360 frames as valid chain",
+				zap.Uint64("pseudo_root_frame", a.root.Frame.Header.FrameNumber),
+				zap.Uint64("head_frame", a.head.Frame.Header.FrameNumber))
+		}
 	}
 	return nil
 }
@@ -1552,15 +1649,14 @@ func (a *AppTimeReel) persistCanonicalFrames(
 	if len(frames) == 0 {
 		return nil
 	}
+
 	txn, err := a.store.NewTransaction(false)
 	if err != nil {
 		return errors.Wrap(err, "persist canonical frames")
 	}
+
 	for _, f := range frames {
-		if err := a.materializeFunc(
-			txn,
-			f,
-		); err != nil {
+		if err := a.materializeFunc(txn, f); err != nil {
 			_ = txn.Abort()
 			return errors.Wrap(err, "persist canonical frames")
 		}
@@ -1577,8 +1673,24 @@ func (a *AppTimeReel) persistCanonicalFrames(
 			return errors.Wrap(err, "persist canonical frames")
 		}
 	}
+
 	if err := txn.Commit(); err != nil {
 		return errors.Wrap(err, "persist canonical frames")
+	}
+
+	// prune old frames in non-archive mode
+	if !a.archiveMode && a.head != nil &&
+		a.head.Frame.Header.FrameNumber > maxTreeDepth {
+		oldestToKeep := a.head.Frame.Header.FrameNumber - maxTreeDepth + 1
+		if err := a.store.DeleteShardClockFrameRange(
+			a.address,
+			0,
+			oldestToKeep,
+		); err != nil {
+			a.logger.Error("unable to delete shard frame range",
+				zap.String("address", fmt.Sprintf("%x", a.address)),
+				zap.Error(err))
+		}
 	}
 	return nil
 }

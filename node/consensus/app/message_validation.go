@@ -53,9 +53,8 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 		}
 
 		if !bytes.Equal(frame.Header.Address, e.appAddress) {
-			e.logger.Debug("frame address incorrect")
 			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
-			return p2p.ValidationResultReject
+			return p2p.ValidationResultIgnore
 		}
 
 		if frame.Header.PublicKeySignatureBls48581 != nil {
@@ -86,6 +85,12 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 			return p2p.ValidationResultReject
 		}
 
+		now := time.Now().UnixMilli()
+		if livenessCheck.Timestamp > now+5000 ||
+			livenessCheck.Timestamp < now-5000 {
+			return p2p.ValidationResultIgnore
+		}
+
 		if err := livenessCheck.Validate(); err != nil {
 			e.logger.Debug("failed to validate liveness check", zap.Error(err))
 			return p2p.ValidationResultReject
@@ -96,6 +101,11 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 		if err := vote.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal vote", zap.Error(err))
 			return p2p.ValidationResultReject
+		}
+
+		now := time.Now().UnixMilli()
+		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
+			return p2p.ValidationResultIgnore
 		}
 
 		if err := vote.Validate(); err != nil {

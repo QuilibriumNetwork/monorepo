@@ -117,6 +117,7 @@ func (f *AppConsensusEngineFactory) CreateAppConsensusEngine(
 		appAddress,
 		f.proverRegistry,
 		f.clockStore,
+		f.config.Engine.ArchiveMode,
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "create app time reel")

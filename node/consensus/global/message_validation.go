@@ -73,6 +73,12 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			return tp2p.ValidationResultReject
 		}
 
+		now := time.Now().UnixMilli()
+		if livenessCheck.Timestamp > now+5000 ||
+			livenessCheck.Timestamp < now-5000 {
+			return tp2p.ValidationResultIgnore
+		}
+
 		// Validate the liveness check
 		if err := livenessCheck.Validate(); err != nil {
 			e.logger.Debug("invalid liveness check", zap.Error(err))
@@ -84,6 +90,11 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 		if err := vote.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal vote", zap.Error(err))
 			return tp2p.ValidationResultReject
+		}
+
+		now := time.Now().UnixMilli()
+		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
+			return tp2p.ValidationResultIgnore
 		}
 
 		// Validate the vote
@@ -111,6 +122,105 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 	}
 
 	frameValidationTotal.WithLabelValues("accept").Inc()
+	return tp2p.ValidationResultAccept
+}
+
+func (e *GlobalConsensusEngine) validateShardConsensusMessage(
+	peerID peer.ID,
+	message *pb.Message,
+) tp2p.ValidationResult {
+	// Check if data is long enough to contain type prefix
+	if len(message.Data) < 4 {
+		e.logger.Debug(
+			"message too short",
+			zap.Int("data_length", len(message.Data)),
+		)
+		return tp2p.ValidationResultReject
+	}
+
+	// Read type prefix from first 4 bytes
+	typePrefix := binary.BigEndian.Uint32(message.Data[:4])
+
+	switch typePrefix {
+	case protobufs.AppShardFrameType:
+		frame := &protobufs.AppShardFrame{}
+		if err := frame.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+		if frame.Header == nil {
+			e.logger.Debug("frame has no header")
+			return tp2p.ValidationResultReject
+		}
+
+		if frame.Header.PublicKeySignatureBls48581 != nil {
+			e.logger.Debug("frame validation has signature")
+			return tp2p.ValidationResultReject
+		}
+
+		valid, err := e.appFrameValidator.Validate(frame)
+		if err != nil {
+			e.logger.Debug("frame validation error", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+		if !valid {
+			e.logger.Debug("invalid app frame")
+			return tp2p.ValidationResultReject
+		}
+
+	case protobufs.ProverLivenessCheckType:
+		livenessCheck := &protobufs.ProverLivenessCheck{}
+		if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+		now := time.Now().UnixMilli()
+		if livenessCheck.Timestamp > now+5000 ||
+			livenessCheck.Timestamp < now-5000 {
+			return tp2p.ValidationResultIgnore
+		}
+
+		if err := livenessCheck.Validate(); err != nil {
+			e.logger.Debug("failed to validate liveness check", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+	case protobufs.FrameVoteType:
+		vote := &protobufs.FrameVote{}
+		if err := vote.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal vote", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+		now := time.Now().UnixMilli()
+		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
+			return tp2p.ValidationResultIgnore
+		}
+
+		if err := vote.Validate(); err != nil {
+			e.logger.Debug("failed to validate vote", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+	case protobufs.FrameConfirmationType:
+		confirmation := &protobufs.FrameConfirmation{}
+		if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+		if err := confirmation.Validate(); err != nil {
+			e.logger.Debug("failed to validate confirmation", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+	default:
+		return tp2p.ValidationResultReject
+	}
+
 	return tp2p.ValidationResultAccept
 }
 

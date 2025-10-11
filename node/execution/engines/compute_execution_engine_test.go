@@ -446,7 +446,7 @@ func createTestAppTimeReel(
 ) *consensustime.AppTimeReel {
 	logger := zap.NewNop()
 	proverRegistry := createTestProverRegistry()
-	appTimeReel, err := consensustime.NewAppTimeReel(logger, appAddress, proverRegistry, clockStore)
+	appTimeReel, err := consensustime.NewAppTimeReel(logger, appAddress, proverRegistry, clockStore, true)
 	require.NoError(t, err)
 	return appTimeReel
 }

@@ -20,9 +20,10 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	GlobalService_GetGlobalFrame_FullMethodName  = "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame"
-	GlobalService_GetAppShards_FullMethodName    = "/quilibrium.node.global.pb.GlobalService/GetAppShards"
-	GlobalService_GetGlobalShards_FullMethodName = "/quilibrium.node.global.pb.GlobalService/GetGlobalShards"
+	GlobalService_GetGlobalFrame_FullMethodName     = "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame"
+	GlobalService_GetAppShards_FullMethodName       = "/quilibrium.node.global.pb.GlobalService/GetAppShards"
+	GlobalService_GetGlobalShards_FullMethodName    = "/quilibrium.node.global.pb.GlobalService/GetGlobalShards"
+	GlobalService_GetLockedAddresses_FullMethodName = "/quilibrium.node.global.pb.GlobalService/GetLockedAddresses"
 )
 
 // GlobalServiceClient is the client API for GlobalService service.
@@ -32,6 +33,7 @@ type GlobalServiceClient interface {
 	GetGlobalFrame(ctx context.Context, in *GetGlobalFrameRequest, opts ...grpc.CallOption) (*GlobalFrameResponse, error)
 	GetAppShards(ctx context.Context, in *GetAppShardsRequest, opts ...grpc.CallOption) (*GetAppShardsResponse, error)
 	GetGlobalShards(ctx context.Context, in *GetGlobalShardsRequest, opts ...grpc.CallOption) (*GetGlobalShardsResponse, error)
+	GetLockedAddresses(ctx context.Context, in *GetLockedAddressesRequest, opts ...grpc.CallOption) (*GetLockedAddressesResponse, error)
 }
 
 type globalServiceClient struct {
@@ -69,6 +71,15 @@ func (c *globalServiceClient) GetGlobalShards(ctx context.Context, in *GetGlobal
 	return out, nil
 }
 
+func (c *globalServiceClient) GetLockedAddresses(ctx context.Context, in *GetLockedAddressesRequest, opts ...grpc.CallOption) (*GetLockedAddressesResponse, error) {
+	out := new(GetLockedAddressesResponse)
+	err := c.cc.Invoke(ctx, GlobalService_GetLockedAddresses_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GlobalServiceServer is the server API for GlobalService service.
 // All implementations must embed UnimplementedGlobalServiceServer
 // for forward compatibility
@@ -76,6 +87,7 @@ type GlobalServiceServer interface {
 	GetGlobalFrame(context.Context, *GetGlobalFrameRequest) (*GlobalFrameResponse, error)
 	GetAppShards(context.Context, *GetAppShardsRequest) (*GetAppShardsResponse, error)
 	GetGlobalShards(context.Context, *GetGlobalShardsRequest) (*GetGlobalShardsResponse, error)
+	GetLockedAddresses(context.Context, *GetLockedAddressesRequest) (*GetLockedAddressesResponse, error)
 	mustEmbedUnimplementedGlobalServiceServer()
 }
 
@@ -91,6 +103,9 @@ func (UnimplementedGlobalServiceServer) GetAppShards(context.Context, *GetAppSha
 }
 func (UnimplementedGlobalServiceServer) GetGlobalShards(context.Context, *GetGlobalShardsRequest) (*GetGlobalShardsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetGlobalShards not implemented")
+}
+func (UnimplementedGlobalServiceServer) GetLockedAddresses(context.Context, *GetLockedAddressesRequest) (*GetLockedAddressesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLockedAddresses not implemented")
 }
 func (UnimplementedGlobalServiceServer) mustEmbedUnimplementedGlobalServiceServer() {}
 
@@ -159,6 +174,24 @@ func _GlobalService_GetGlobalShards_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _GlobalService_GetLockedAddresses_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLockedAddressesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GlobalServiceServer).GetLockedAddresses(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GlobalService_GetLockedAddresses_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GlobalServiceServer).GetLockedAddresses(ctx, req.(*GetLockedAddressesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // GlobalService_ServiceDesc is the grpc.ServiceDesc for GlobalService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -177,6 +210,10 @@ var GlobalService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetGlobalShards",
 			Handler:    _GlobalService_GetGlobalShards_Handler,
+		},
+		{
+			MethodName: "GetLockedAddresses",
+			Handler:    _GlobalService_GetLockedAddresses_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

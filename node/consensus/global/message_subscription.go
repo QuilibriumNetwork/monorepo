@@ -2,6 +2,7 @@ package global
 
 import (
 	"bytes"
+	"slices"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
@@ -82,6 +83,46 @@ func (e *GlobalConsensusEngine) subscribeToGlobalConsensus() error {
 		true,
 	); err != nil {
 		return nil
+	}
+
+	return nil
+}
+
+func (e *GlobalConsensusEngine) subscribeToShardConsensusMessages() error {
+	if err := e.pubsub.Subscribe(
+		slices.Concat(
+			[]byte{0},
+			bytes.Repeat([]byte{0xff}, 32),
+		),
+		func(message *pb.Message) error {
+			select {
+			case <-e.haltCtx.Done():
+				return nil
+			case e.shardConsensusMessageQueue <- message:
+				return nil
+			case <-e.ctx.Done():
+				return errors.New("context cancelled")
+			default:
+				e.logger.Warn("shard consensus queue full, dropping message")
+				return nil
+			}
+		},
+	); err != nil {
+		return errors.Wrap(err, "subscribe to shard consensus messages")
+	}
+
+	// Register frame validator
+	if err := e.pubsub.RegisterValidator(
+		slices.Concat(
+			[]byte{0},
+			bytes.Repeat([]byte{0xff}, 32),
+		),
+		func(peerID peer.ID, message *pb.Message) tp2p.ValidationResult {
+			return e.validateShardConsensusMessage(peerID, message)
+		},
+		true,
+	); err != nil {
+		return errors.Wrap(err, "subscribe to shard consensus messages")
 	}
 
 	return nil

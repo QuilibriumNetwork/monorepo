@@ -114,6 +114,7 @@ type GlobalConsensusEngine struct {
 	globalPeerInfoMessageQueue  chan *pb.Message
 	globalAlertMessageQueue     chan *pb.Message
 	appFramesMessageQueue       chan *pb.Message
+	shardConsensusMessageQueue  chan *pb.Message
 
 	// Emergency halt
 	haltCtx context.Context
@@ -235,9 +236,10 @@ func NewGlobalConsensusEngine(
 		globalConsensusMessageQueue: make(chan *pb.Message, 1000),
 		globalFrameMessageQueue:     make(chan *pb.Message, 100),
 		globalProverMessageQueue:    make(chan *pb.Message, 1000),
-		appFramesMessageQueue:       make(chan *pb.Message, 1000000),
+		appFramesMessageQueue:       make(chan *pb.Message, 10000),
 		globalPeerInfoMessageQueue:  make(chan *pb.Message, 1000),
 		globalAlertMessageQueue:     make(chan *pb.Message, 100),
+		shardConsensusMessageQueue:  make(chan *pb.Message, 10000),
 		currentDifficulty:           config.Engine.Difficulty,
 		lastProvenFrameTime:         time.Now(),
 		blacklistMap:                make(map[string]bool),
@@ -519,6 +521,13 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 		return errChan
 	}
 
+	err = e.subscribeToShardConsensusMessages()
+	if err != nil {
+		errChan <- errors.Wrap(err, "start")
+		close(errChan)
+		return errChan
+	}
+
 	// Subscribe to frames
 	err = e.subscribeToFrameMessages()
 	if err != nil {
@@ -554,6 +563,10 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 	// Start consensus message queue processor
 	e.wg.Add(1)
 	go e.processGlobalConsensusMessageQueue()
+
+	// Start shard consensus message queue processor
+	e.wg.Add(1)
+	go e.processShardConsensusMessageQueue()
 
 	// Start frame message queue processor
 	e.wg.Add(1)
@@ -757,6 +770,14 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 		e.pubsub.UnregisterValidator(bytes.Repeat([]byte{0xff}, 32))
 	}
 
+	e.pubsub.Unsubscribe(slices.Concat(
+		[]byte{0},
+		bytes.Repeat([]byte{0xff}, 32),
+	), false)
+	e.pubsub.UnregisterValidator(slices.Concat(
+		[]byte{0},
+		bytes.Repeat([]byte{0xff}, 32),
+	))
 	e.pubsub.Unsubscribe(GLOBAL_FRAME_BITMASK, false)
 	e.pubsub.UnregisterValidator(GLOBAL_FRAME_BITMASK)
 	e.pubsub.Unsubscribe(GLOBAL_PROVER_BITMASK, false)
