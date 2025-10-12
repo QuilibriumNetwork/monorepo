@@ -468,6 +468,10 @@ func (e *AppConsensusEngine) handleLivenessCheck(message *pb.Message) {
 		return
 	}
 
+	if !bytes.Equal(livenessCheck.Filter, e.appAddress) {
+		return
+	}
+
 	// Validate the liveness check structure
 	if err := livenessCheck.Validate(); err != nil {
 		e.logger.Debug("invalid liveness check", zap.Error(err))
@@ -586,6 +590,10 @@ func (e *AppConsensusEngine) handleVote(message *pb.Message) {
 		return
 	}
 
+	if !bytes.Equal(vote.Filter, e.appAddress) {
+		return
+	}
+
 	if vote.PublicKeySignatureBls48581 == nil {
 		e.logger.Error("vote without signature")
 		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
@@ -615,6 +623,10 @@ func (e *AppConsensusEngine) handleConfirmation(message *pb.Message) {
 	if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
 		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	if !bytes.Equal(confirmation.Filter, e.appAddress) {
 		return
 	}
 

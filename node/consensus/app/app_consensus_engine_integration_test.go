@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
@@ -1663,11 +1664,14 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 	type shardNode struct {
 		engine *AppConsensusEngine
 		pubsub *mockAppIntegrationPubSub
+		hg     *hypergraph.Hypergraph
 	}
+
+	mockGSC := &mockGlobalClientLocks{}
 
 	_, m, cleanup := tests.GenerateSimnetHosts(t, numShards*numNodesPerShard, []libp2p.Option{})
 	defer cleanup()
-	createAppNodeWithFactory := func(nodeIdx int, appAddress []byte, proverRegistry tconsensus.ProverRegistry, proverKey []byte, keyManager tkeys.KeyManager) (*AppConsensusEngine, *mockAppIntegrationPubSub, *consensustime.GlobalTimeReel, func()) {
+	createAppNodeWithFactory := func(nodeIdx int, appAddress []byte, proverRegistry tconsensus.ProverRegistry, proverKey []byte, keyManager tkeys.KeyManager) (*AppConsensusEngine, *mockAppIntegrationPubSub, *consensustime.GlobalTimeReel, *hypergraph.Hypergraph, func()) {
 		cfg := zap.NewDevelopmentConfig()
 		adBI, _ := poseidon.HashBytes(proverKey)
 		addr := adBI.FillBytes(make([]byte, 32))
@@ -1776,7 +1780,7 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 
 		for nodeIdx := 0; nodeIdx < numNodesPerShard; nodeIdx++ {
 			nodeID := shardIdx*numNodesPerShard + nodeIdx
-			engine, pubsub, _, cleanup := createAppNodeWithFactory(nodeID, shardAddresses[shardIdx], proverRegistry, proverKeys[nodeID], keyManagers[nodeID])
+			engine, pubsub, _, nodeHg, cleanup := createAppNodeWithFactory(nodeID, shardAddresses[shardIdx], proverRegistry, proverKeys[nodeID], keyManagers[nodeID])
 			defer cleanup()
 
 			// Start with 0 peers for genesis initialization
@@ -1785,6 +1789,7 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 			shards[shardIdx][nodeIdx] = shardNode{
 				engine: engine,
 				pubsub: pubsub,
+				hg:     nodeHg,
 			}
 		}
 	}
@@ -1841,12 +1846,18 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 		messageBitmask[0] = 0x01
 		copy(messageBitmask[1:], shardAddresses[shardIdx])
 		node := shards[shardIdx][0]
+		hgs := []*hypergraph.Hypergraph{}
+		for _, s := range shards[shardIdx] {
+			hgs = append(hgs, s.hg)
+		}
 
 		// Send shard-specific messages
 		for i := 0; i < 3; i++ {
+			payload := createValidPendingTxPayload(t, hgs, keys.NewInMemoryKeyManager(bc, dc))
+			hash := sha3.Sum256(payload)
 			msg := &protobufs.Message{
-				Hash:    []byte(fmt.Sprintf("shard-%d-msg-%d", shardIdx, i)),
-				Payload: []byte(fmt.Sprintf("shard %d payload %d", shardIdx, i)),
+				Hash:    hash[:],
+				Payload: payload,
 			}
 
 			msgData, err := proto.Marshal(msg)

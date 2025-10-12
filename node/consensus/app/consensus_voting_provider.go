@@ -11,6 +11,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -363,6 +364,58 @@ func (p *AppVotingProvider) FinalizeVotes(
 			errors.New("no proposals to finalize"),
 			"finalize votes",
 		)
+	}
+
+	err := p.engine.ensureGlobalClient()
+	if err != nil {
+		return &parentFrame, PeerID{}, errors.Wrap(
+			errors.New("cannot confirm cross-shard locks"),
+			"finalize votes",
+		)
+	}
+
+	res, err := p.engine.globalClient.GetLockedAddresses(
+		ctx,
+		&protobufs.GetLockedAddressesRequest{
+			ShardAddress: p.engine.appAddress,
+			FrameNumber:  (*chosenProposal).Header.FrameNumber,
+		},
+	)
+	if err != nil {
+		p.engine.globalClient = nil
+		return &parentFrame, PeerID{}, errors.Wrap(
+			errors.New("cannot confirm cross-shard locks"),
+			"finalize votes",
+		)
+	}
+
+	txMap := map[string]bool{}
+	for _, req := range (*chosenProposal).Requests {
+		tx, err := req.ToCanonicalBytes()
+		if err != nil {
+			return &parentFrame, PeerID{}, errors.Wrap(
+				err,
+				"finalize votes",
+			)
+		}
+
+		txHash := sha3.Sum256(tx)
+		txMap[string(txHash[:])] = false
+	}
+
+	for _, tx := range res.Transactions {
+		if _, ok := txMap[string(tx.TransactionHash)]; ok {
+			txMap[string(tx.TransactionHash)] = tx.Committed
+		}
+	}
+
+	for _, committed := range txMap {
+		if !committed {
+			return &parentFrame, PeerID{}, errors.Wrap(
+				errors.New("tx cross-shard lock unconfirmed"),
+				"finalize votes",
+			)
+		}
 	}
 
 	proverSet, err := p.engine.proverRegistry.GetActiveProvers(

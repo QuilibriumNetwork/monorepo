@@ -750,7 +750,10 @@ func (t *TokenIntrinsic) InvokeStep(
 }
 
 // Lock implements intrinsics.Intrinsic.
-func (t *TokenIntrinsic) Lock(frameNumber uint64, input []byte) error {
+func (t *TokenIntrinsic) Lock(
+	frameNumber uint64,
+	input []byte,
+) ([][]byte, error) {
 	t.lockedReadsMx.Lock()
 	t.lockedWritesMx.Lock()
 	defer t.lockedReadsMx.Unlock()
@@ -770,7 +773,7 @@ func (t *TokenIntrinsic) Lock(frameNumber uint64, input []byte) error {
 			"token",
 			"invalid_input",
 		).Inc()
-		return errors.Wrap(errors.New("input too short"), "lock")
+		return nil, errors.Wrap(errors.New("input too short"), "lock")
 	}
 
 	// Read the type prefix
@@ -784,7 +787,7 @@ func (t *TokenIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.TransactionType:
 		reads, writes, err = t.tryLockTransaction(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues("token", "transaction").Inc()
@@ -792,7 +795,7 @@ func (t *TokenIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.PendingTransactionType:
 		reads, writes, err = t.tryLockPendingTransaction(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -803,7 +806,7 @@ func (t *TokenIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.MintTransactionType:
 		reads, writes, err = t.tryLockMintTransaction(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -816,7 +819,7 @@ func (t *TokenIntrinsic) Lock(frameNumber uint64, input []byte) error {
 			"token",
 			"unknown_type",
 		).Inc()
-		return errors.Wrap(
+		return nil, errors.Wrap(
 			errors.New("unknown compute request type"),
 			"lock",
 		)
@@ -824,13 +827,13 @@ func (t *TokenIntrinsic) Lock(frameNumber uint64, input []byte) error {
 
 	for _, address := range writes {
 		if _, ok := t.lockedWrites[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
 				"lock",
 			)
 		}
 		if _, ok := t.lockedReads[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for reading", address),
 				"lock",
 			)
@@ -839,23 +842,32 @@ func (t *TokenIntrinsic) Lock(frameNumber uint64, input []byte) error {
 
 	for _, address := range reads {
 		if _, ok := t.lockedWrites[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
 				"lock",
 			)
 		}
 	}
 
+	set := map[string]struct{}{}
+
 	for _, address := range writes {
 		t.lockedWrites[string(address)] = struct{}{}
 		t.lockedReads[string(address)] = t.lockedReads[string(address)] + 1
+		set[string(address)] = struct{}{}
 	}
 
 	for _, address := range reads {
 		t.lockedReads[string(address)] = t.lockedReads[string(address)] + 1
+		set[string(address)] = struct{}{}
 	}
 
-	return nil
+	result := [][]byte{}
+	for a := range set {
+		result = append(result, []byte(a))
+	}
+
+	return result, nil
 }
 
 // Unlock implements intrinsics.Intrinsic.

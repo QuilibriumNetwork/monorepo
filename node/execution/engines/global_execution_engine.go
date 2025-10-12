@@ -468,11 +468,11 @@ func (e *GlobalExecutionEngine) Lock(
 	frameNumber uint64,
 	address []byte,
 	message []byte,
-) error {
+) ([][]byte, error) {
 	intrinsic, err := e.tryGetIntrinsic(address)
 	if err != nil {
 		// non-applicable
-		return nil
+		return nil, nil
 	}
 
 	if len(message) > 4 &&
@@ -480,21 +480,24 @@ func (e *GlobalExecutionEngine) Lock(
 		bundle := &protobufs.MessageBundle{}
 		err = bundle.FromCanonicalBytes(message)
 		if err != nil {
-			return errors.Wrap(err, "lock")
+			return nil, errors.Wrap(err, "lock")
 		}
 
+		addresses := [][]byte{}
 		for _, r := range bundle.Requests {
 			req, err := r.ToCanonicalBytes()
 			if err != nil {
-				return errors.Wrap(err, "lock")
+				return nil, errors.Wrap(err, "lock")
 			}
 
-			if err = intrinsic.Lock(frameNumber, req[8:]); err != nil {
-				return err
+			addrs, err := intrinsic.Lock(frameNumber, req[8:])
+			if err != nil {
+				return nil, err
 			}
+			addresses = append(addresses, addrs...)
 		}
 
-		return nil
+		return addresses, nil
 	}
 
 	return intrinsic.Lock(frameNumber, message)

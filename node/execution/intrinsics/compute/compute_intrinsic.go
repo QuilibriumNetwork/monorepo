@@ -1082,7 +1082,10 @@ func (c *ComputeIntrinsic) InvokeStep(
 }
 
 // Lock implements intrinsics.Intrinsic.
-func (a *ComputeIntrinsic) Lock(frameNumber uint64, input []byte) error {
+func (a *ComputeIntrinsic) Lock(
+	frameNumber uint64,
+	input []byte,
+) ([][]byte, error) {
 	a.lockedReadsMx.Lock()
 	a.lockedWritesMx.Lock()
 	defer a.lockedReadsMx.Unlock()
@@ -1102,7 +1105,7 @@ func (a *ComputeIntrinsic) Lock(frameNumber uint64, input []byte) error {
 			"compute",
 			"invalid_input",
 		).Inc()
-		return errors.Wrap(errors.New("input too short"), "lock")
+		return nil, errors.Wrap(errors.New("input too short"), "lock")
 	}
 
 	// Read the type prefix
@@ -1116,7 +1119,7 @@ func (a *ComputeIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.CodeDeploymentType:
 		reads, writes, err = a.tryLockCodeDeployment(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1127,7 +1130,7 @@ func (a *ComputeIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.CodeExecuteType:
 		reads, writes, err = a.tryLockCodeExecute(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues("compute", "code_execute").Inc()
@@ -1135,7 +1138,7 @@ func (a *ComputeIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.CodeFinalizeType:
 		reads, writes, err = a.tryLockCodeFinalize(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1148,7 +1151,7 @@ func (a *ComputeIntrinsic) Lock(frameNumber uint64, input []byte) error {
 			"compute",
 			"unknown_type",
 		).Inc()
-		return errors.Wrap(
+		return nil, errors.Wrap(
 			errors.New("unknown compute request type"),
 			"lock",
 		)
@@ -1156,13 +1159,13 @@ func (a *ComputeIntrinsic) Lock(frameNumber uint64, input []byte) error {
 
 	for _, address := range writes {
 		if _, ok := a.lockedWrites[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
 				"lock",
 			)
 		}
 		if _, ok := a.lockedReads[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for reading", address),
 				"lock",
 			)
@@ -1171,23 +1174,32 @@ func (a *ComputeIntrinsic) Lock(frameNumber uint64, input []byte) error {
 
 	for _, address := range reads {
 		if _, ok := a.lockedWrites[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
 				"lock",
 			)
 		}
 	}
 
+	set := map[string]struct{}{}
+
 	for _, address := range writes {
 		a.lockedWrites[string(address)] = struct{}{}
 		a.lockedReads[string(address)] = a.lockedReads[string(address)] + 1
+		set[string(address)] = struct{}{}
 	}
 
 	for _, address := range reads {
 		a.lockedReads[string(address)] = a.lockedReads[string(address)] + 1
+		set[string(address)] = struct{}{}
 	}
 
-	return nil
+	result := [][]byte{}
+	for a := range set {
+		result = append(result, []byte(a))
+	}
+
+	return result, nil
 }
 
 // Unlock implements intrinsics.Intrinsic.

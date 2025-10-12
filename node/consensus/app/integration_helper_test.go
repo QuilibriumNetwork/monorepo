@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"slices"
 	"sync"
 	"testing"
@@ -19,15 +21,21 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	multiaddr "github.com/multiformats/go-multiaddr"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"source.quilibrium.com/quilibrium/monorepo/bls48581"
+	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
+	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	qp2p "source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -37,7 +45,9 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 	thypergraph "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
+	"source.quilibrium.com/quilibrium/monorepo/verenc"
 )
 
 // mockAppIntegrationPubSub extends the basic mock with app-specific features
@@ -545,4 +555,359 @@ func registerProverInHypergraphWithFilter(t *testing.T, hg thypergraph.Hypergrap
 	hg.Commit()
 
 	t.Logf("    Registered prover with address: %x, filter: %x (public key length: %d)", address, filter, len(publicKey))
+}
+
+type mockGlobalClientLocks struct {
+	committed bool
+	hashes    [][]byte
+}
+
+func (m *mockGlobalClientLocks) GetGlobalFrame(ctx context.Context, in *protobufs.GetGlobalFrameRequest, opts ...grpc.CallOption) (*protobufs.GlobalFrameResponse, error) {
+	return nil, errors.New("not used in this test")
+}
+func (m *mockGlobalClientLocks) GetAppShards(ctx context.Context, in *protobufs.GetAppShardsRequest, opts ...grpc.CallOption) (*protobufs.GetAppShardsResponse, error) {
+	return nil, errors.New("not used in this test")
+}
+func (m *mockGlobalClientLocks) GetGlobalShards(ctx context.Context, in *protobufs.GetGlobalShardsRequest, opts ...grpc.CallOption) (*protobufs.GetGlobalShardsResponse, error) {
+	return nil, errors.New("not used in this test")
+}
+func (m *mockGlobalClientLocks) GetLockedAddresses(ctx context.Context, in *protobufs.GetLockedAddressesRequest, opts ...grpc.CallOption) (*protobufs.GetLockedAddressesResponse, error) {
+	out := &protobufs.GetLockedAddressesResponse{Transactions: make([]*protobufs.LockedTransaction, 0, len(m.hashes))}
+	for _, h := range m.hashes {
+		out.Transactions = append(out.Transactions, &protobufs.LockedTransaction{
+			TransactionHash: h,
+			Committed:       m.committed,
+		})
+	}
+	return out, nil
+}
+
+func createValidPendingTxPayload(t *testing.T, hgs []thypergraph.Hypergraph, km *keys.InMemoryKeyManager) []byte {
+	dc := &bulletproofs.Decaf448KeyConstructor{}
+	vk, _ := dc.New()
+	sk, _ := dc.New()
+	rvk, _ := dc.New()
+	rsk, _ := dc.New()
+
+	out1, err := token.NewPendingTransactionOutput(big.NewInt(7), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out2, err := token.NewPendingTransactionOutput(big.NewInt(2), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bp := &bulletproofs.Decaf448BulletproofProver{}
+	pvk, err := km.CreateAgreementKey("q-view-key", crypto.KeyTypeDecaf448)
+	assert.NoError(t, err)
+	psk, err := km.CreateAgreementKey("q-spend-key", crypto.KeyTypeDecaf448)
+	assert.NoError(t, err)
+
+	address1 := [64]byte{}
+	copy(address1[:32], token.QUIL_TOKEN_ADDRESS)
+	rand.Read(address1[32:])
+	address2 := [64]byte{}
+	copy(address2[:32], token.QUIL_TOKEN_ADDRESS)
+	rand.Read(address2[32:])
+
+	tree1 := &qcrypto.VectorCommitmentTree{}
+	tree2 := &qcrypto.VectorCommitmentTree{}
+	otk1, _ := dc.New()
+	otk2, _ := dc.New()
+	c1, _ := dc.New()
+	c2, _ := dc.New()
+	comm1 := bp.GenerateInputCommitmentsFromBig([]*big.Int{big.NewInt(3)}, c1.Private())
+	comm2 := bp.GenerateInputCommitmentsFromBig([]*big.Int{big.NewInt(9)}, c2.Private())
+	mask1 := c1.Private()
+	mask2 := c2.Private()
+	a1, _ := otk1.AgreeWithAndHashToScalar(pvk.Public())
+	a2, _ := otk2.AgreeWithAndHashToScalar(pvk.Public())
+
+	blindMask1 := make([]byte, 56)
+	coinMask1 := make([]byte, 56)
+	shake := sha3.NewCShake256([]byte{}, []byte("blind"))
+	shake.Write(a1.Public())
+	shake.Read(blindMask1)
+
+	shake = sha3.NewCShake256([]byte{}, []byte("coin"))
+	shake.Write(a1.Public())
+	shake.Read(coinMask1)
+
+	for i := range blindMask1 {
+		mask1[i] ^= blindMask1[i]
+	}
+	maskedCoinBalanceBytes1 := make([]byte, 56)
+	maskedCoinBalanceBytes1[0] = 0x03
+	for i := range maskedCoinBalanceBytes1 {
+		maskedCoinBalanceBytes1[i] ^= coinMask1[i]
+	}
+	blindMask2 := make([]byte, 56)
+	coinMask2 := make([]byte, 56)
+	shake = sha3.NewCShake256([]byte{}, []byte("blind"))
+	shake.Write(a2.Public())
+	shake.Read(blindMask2)
+
+	shake = sha3.NewCShake256([]byte{}, []byte("coin"))
+	shake.Write(a2.Public())
+	shake.Read(coinMask2)
+
+	for i := range blindMask2 {
+		mask2[i] ^= blindMask2[i]
+	}
+	maskedCoinBalanceBytes2 := make([]byte, 56)
+	maskedCoinBalanceBytes2[0] = 0x09
+	for i := range maskedCoinBalanceBytes2 {
+		maskedCoinBalanceBytes2[i] ^= coinMask2[i]
+	}
+
+	verifkey1, _ := a1.Add(psk.Public())
+	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, 0), nil, big.NewInt(8))
+	tree1.Insert([]byte{1 << 2}, comm1, nil, big.NewInt(56))
+	tree1.Insert([]byte{2 << 2}, otk1.Public(), nil, big.NewInt(56))
+	tree1.Insert([]byte{3 << 2}, verifkey1, nil, big.NewInt(56))
+	tree1.Insert([]byte{4 << 2}, maskedCoinBalanceBytes1, nil, big.NewInt(56))
+	tree1.Insert([]byte{5 << 2}, mask1, nil, big.NewInt(56))
+	verifkey2, _ := a2.Add(psk.Public())
+	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, 0), nil, big.NewInt(8))
+	tree2.Insert([]byte{1 << 2}, comm2, nil, big.NewInt(56))
+	tree2.Insert([]byte{2 << 2}, otk2.Public(), nil, big.NewInt(56))
+	tree2.Insert([]byte{3 << 2}, verifkey2, nil, big.NewInt(56))
+	tree2.Insert([]byte{4 << 2}, maskedCoinBalanceBytes2, nil, big.NewInt(56))
+	tree2.Insert([]byte{5 << 2}, mask2, nil, big.NewInt(56))
+
+	// qcrypto.DebugNonLazyNode(tree.Root, 0, "")
+	typeAddr, _ := hex.DecodeString("096de9a09f693f92cfa9cf3349bab2b3baee09f3e4f9c596514ecb3e8b0dff8f")
+	tree1.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
+	tree2.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
+	for _, hg := range hgs {
+		txn, _ := hg.NewTransaction(false)
+		hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address1[32:]), tree1.Commit(hg.GetProver(), false), big.NewInt(55*26)))
+		hg.SetVertexData(txn, address1, tree1)
+		hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address2[32:]), tree2.Commit(hg.GetProver(), false), big.NewInt(55*26)))
+		hg.SetVertexData(txn, address2, tree2)
+		txn.Commit()
+	}
+
+	// simulate input as commitment to total
+	input1, _ := token.NewPendingTransactionInput(address1[:])
+	input2, _ := token.NewPendingTransactionInput(address2[:])
+	tokenconfig := &token.TokenIntrinsicConfiguration{
+		Behavior: token.Mintable | token.Burnable | token.Divisible | token.Acceptable | token.Expirable | token.Tenderable,
+		MintStrategy: &token.TokenMintStrategy{
+			MintBehavior: token.MintWithProof,
+			ProofBasis:   token.ProofOfMeaningfulWork,
+		},
+		Units:  big.NewInt(8000000000),
+		Name:   "QUIL",
+		Symbol: "QUIL",
+	}
+
+	// Create RDF multiprover for testing
+	rdfSchema, err := prepareRDFSchemaFromConfig(token.QUIL_TOKEN_ADDRESS, tokenconfig)
+	assert.NoError(t, err)
+	parser := &schema.TurtleRDFParser{}
+	rdfMultiprover := schema.NewRDFMultiprover(parser, hgs[0].GetProver())
+
+	tx := token.NewPendingTransaction(
+		[32]byte(token.QUIL_TOKEN_ADDRESS),
+		[]*token.PendingTransactionInput{input1, input2},
+		[]*token.PendingTransactionOutput{out1, out2},
+		[]*big.Int{big.NewInt(1), big.NewInt(2)},
+		tokenconfig,
+		hgs[0],
+		bp,
+		hgs[0].GetProver(),
+		verenc.NewMPCitHVerifiableEncryptor(1),
+		dc,
+		keys.ToKeyRing(km, false),
+		rdfSchema,
+		rdfMultiprover,
+	)
+
+	if err := tx.Prove(1); err != nil {
+		t.Fatal(err)
+	}
+
+	req := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{
+			{
+				Request: &protobufs.MessageRequest_PendingTransaction{
+					PendingTransaction: tx.ToProtobuf(),
+				},
+			},
+		},
+	}
+	out, err := req.ToCanonicalBytes()
+	assert.NoError(t, err)
+	return out
+}
+
+func prepareRDFSchemaFromConfig(
+	appAddress []byte,
+	config *token.TokenIntrinsicConfiguration,
+) (string, error) {
+	schema := generateRDFPrelude(appAddress, config)
+
+	schema += "coin:Coin a rdfs:Class.\n" +
+		"coin:FrameNumber a rdfs:Property;\n" +
+		"  rdfs:domain qcl:Uint;\n" +
+		"  qcl:size 8;\n" +
+		"  qcl:order 0;\n" +
+		"  rdfs:range coin:Coin.\n" +
+		"coin:Commitment a rdfs:Property;\n" +
+		"  rdfs:domain qcl:ByteArray;\n" +
+		"  qcl:size 56;\n" +
+		"  qcl:order 1;\n" +
+		"  rdfs:range coin:Coin.\n" +
+		"coin:OneTimeKey a rdfs:Property;\n" +
+		"  rdfs:domain qcl:ByteArray;\n" +
+		"  qcl:size 56;\n" +
+		"  qcl:order 2;\n" +
+		"  rdfs:range coin:Coin.\n" +
+		"coin:VerificationKey a rdfs:Property;\n" +
+		"  rdfs:domain qcl:ByteArray;\n" +
+		"  qcl:size 56;\n" +
+		"  qcl:order 3;\n" +
+		"  rdfs:range coin:Coin.\n" +
+		"coin:CoinBalance a rdfs:Property;\n" +
+		"  rdfs:domain qcl:Uint;\n" +
+		"  qcl:size 56;\n" +
+		"  qcl:order 4;\n" +
+		"  rdfs:range coin:Coin.\n" +
+		"coin:Mask a rdfs:Property;\n" +
+		"  rdfs:domain qcl:ByteArray;\n" +
+		"  qcl:size 56;\n" +
+		"  qcl:order 5;\n" +
+		"  rdfs:range coin:Coin.\n"
+
+	if config.Behavior&token.Divisible == 0 {
+		schema += "coin:AdditionalReference a rdfs:Property;\n" +
+			"  rdfs:domain qcl:ByteArray;\n" +
+			"  qcl:size 64;\n" +
+			"  qcl:order 6;\n" +
+			"  rdfs:range coin:Coin.\n"
+		schema += "coin:AdditionalReferenceKey a rdfs:Property;\n" +
+			"  rdfs:domain qcl:ByteArray;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 7;\n" +
+			"  rdfs:range coin:Coin.\n"
+	}
+
+	if config.Behavior&token.Acceptable != 0 {
+		schema += "\npending:PendingTransaction a rdfs:Class;\n" +
+			"  rdfs:label \"a pending transaction\".\n" +
+			"pending:FrameNumber a rdfs:Property;\n" +
+			"  rdfs:domain qcl:Uint;\n" +
+			"  qcl:size 8;\n" +
+			"  qcl:order 0;\n" +
+			"  rdfs:range pending:PendingTransaction.\n" +
+			"pending:Commitment a rdfs:Property;\n" +
+			"  rdfs:domain qcl:ByteArray;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 1;\n" +
+			"  rdfs:range pending:PendingTransaction.\n" +
+			"pending:ToOneTimeKey a rdfs:Property;\n" +
+			"  rdfs:domain qcl:ByteArray;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 2;\n" +
+			"  rdfs:range pending:PendingTransaction.\n" +
+			"pending:RefundOneTimeKey a rdfs:Property;\n" +
+			"  rdfs:domain qcl:ByteArray;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 3;\n" +
+			"  rdfs:range pending:PendingTransaction.\n" +
+			"pending:ToVerificationKey a rdfs:Property;\n" +
+			"  rdfs:domain qcl:ByteArray;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 4;\n" +
+			"  rdfs:range pending:PendingTransaction.\n" +
+			"pending:RefundVerificationKey a rdfs:Property;\n" +
+			"  rdfs:domain qcl:ByteArray;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 5;\n" +
+			"  rdfs:range pending:PendingTransaction.\n" +
+			"pending:ToCoinBalance a rdfs:Property;\n" +
+			"  rdfs:domain qcl:Uint;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 6;\n" +
+			"  rdfs:range pending:PendingTransaction.\n" +
+			"pending:RefundCoinBalance a rdfs:Property;\n" +
+			"  rdfs:domain qcl:Uint;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 7;\n" +
+			"  rdfs:range pending:PendingTransaction.\n" +
+			"pending:ToMask a rdfs:Property;\n" +
+			"  rdfs:domain qcl:ByteArray;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 8;\n" +
+			"  rdfs:range pending:PendingTransaction.\n" +
+			"pending:RefundMask a rdfs:Property;\n" +
+			"  rdfs:domain qcl:ByteArray;\n" +
+			"  qcl:size 56;\n" +
+			"  qcl:order 9;\n" +
+			"  rdfs:range pending:PendingTransaction.\n"
+
+		if config.Behavior&token.Divisible == 0 {
+			schema += "pending:ToAdditionalReference a rdfs:Property;\n" +
+				"  rdfs:domain qcl:ByteArray;\n" +
+				"  qcl:size 64;\n" +
+				"  qcl:order 10;\n" +
+				"  rdfs:range pending:PendingTransaction.\n" +
+				"pending:ToAdditionalReferenceKey a rdfs:Property;\n" +
+				"  rdfs:domain qcl:ByteArray;\n" +
+				"  qcl:size 56;\n" +
+				"  qcl:order 11;\n" +
+				"  rdfs:range pending:PendingTransaction.\n" +
+				"pending:RefundAdditionalReference a rdfs:Property;\n" +
+				"  rdfs:domain qcl:ByteArray;\n" +
+				"  qcl:size 64;\n" +
+				"  qcl:order 12;\n" +
+				"  rdfs:range pending:PendingTransaction.\n" +
+				"pending:RefundAdditionalReferenceKey a rdfs:Property;\n" +
+				"  rdfs:domain qcl:ByteArray;\n" +
+				"  qcl:size 56;\n" +
+				"  qcl:order 13;\n" +
+				"  rdfs:range pending:PendingTransaction.\n"
+		}
+
+		if config.Behavior&token.Expirable != 0 {
+			schema += "pending:Expiration a rdfs:Property;\n" +
+				"  rdfs:domain qcl:Uint;\n" +
+				"  qcl:size 8;\n"
+
+			if config.Behavior&token.Divisible == 0 {
+				schema += "  qcl:order 14;\n"
+			} else {
+				schema += "  qcl:order 10;\n"
+			}
+
+			schema += "  rdfs:range pending:PendingTransaction.\n"
+		}
+	}
+
+	schema += "\n"
+
+	return schema, nil
+}
+
+func generateRDFPrelude(
+	appAddress []byte,
+	config *token.TokenIntrinsicConfiguration,
+) string {
+	appAddressHex := hex.EncodeToString(appAddress)
+
+	prelude := "BASE <https://types.quilibrium.com/schema-repository/>\n" +
+		"PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n" +
+		"PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n" +
+		"PREFIX qcl: <https://types.quilibrium.com/qcl/>\n" +
+		"PREFIX coin: <https://types.quilibrium.com/schema-repository/token/" + appAddressHex + "/coin/>\n"
+
+	if config.Behavior&token.Acceptable != 0 {
+		prelude += "PREFIX pending: <https://types.quilibrium.com/schema-repository/token/" + appAddressHex + "/pending/>\n"
+	}
+
+	prelude += "\n"
+
+	return prelude
 }

@@ -232,6 +232,36 @@ func (e *GlobalConsensusEngine) GetGlobalShards(
 	}, nil
 }
 
+func (e *GlobalConsensusEngine) GetLockedAddresses(
+	ctx context.Context,
+	req *protobufs.GetLockedAddressesRequest,
+) (*protobufs.GetLockedAddressesResponse, error) {
+	e.txLockMu.RLock()
+	defer e.txLockMu.RUnlock()
+	if _, ok := e.txLockMap[req.FrameNumber]; !ok {
+		return &protobufs.GetLockedAddressesResponse{}, nil
+	}
+
+	locks := e.txLockMap[req.FrameNumber]
+	if _, ok := locks[string(req.ShardAddress)]; !ok {
+		return &protobufs.GetLockedAddressesResponse{}, nil
+	}
+
+	transactions := []*protobufs.LockedTransaction{}
+	for _, tx := range locks[string(req.ShardAddress)] {
+		transactions = append(transactions, &protobufs.LockedTransaction{
+			TransactionHash: tx.TransactionHash,
+			ShardAddresses:  tx.ShardAddresses,
+			Committed:       tx.Committed,
+			Filled:          tx.Filled,
+		})
+	}
+
+	return &protobufs.GetLockedAddressesResponse{
+		Transactions: transactions,
+	}, nil
+}
+
 func (e *GlobalConsensusEngine) RegisterServices(server *grpc.Server) {
 	protobufs.RegisterGlobalServiceServer(server, e)
 	protobufs.RegisterDispatchServiceServer(server, e.dispatchService)

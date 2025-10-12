@@ -26,7 +26,7 @@ type Intrinsic interface {
 		state state.State,
 	) (state.State, error)
 	// Locks addresses for writing or reading
-	Lock(frameNumber uint64, input []byte) error
+	Lock(frameNumber uint64, input []byte) ([][]byte, error)
 	// Unlocks addresses for writing or reading
 	Unlock() error
 	// Performs strictly the validation of an intrinsic operation, encoded via

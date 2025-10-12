@@ -72,6 +72,14 @@ type coverageStreak struct {
 	Count      uint64
 }
 
+type LockedTransaction struct {
+	TransactionHash []byte
+	ShardAddresses  [][]byte
+	Prover          []byte
+	Committed       bool
+	Filled          bool
+}
+
 // GlobalConsensusEngine  uses the generic state machine for consensus
 type GlobalConsensusEngine struct {
 	protobufs.GlobalServiceServer
@@ -135,9 +143,14 @@ type GlobalConsensusEngine struct {
 	lastProvenFrameTime   time.Time
 	lastProvenFrameTimeMu sync.RWMutex
 	frameStore            map[string]*protobufs.GlobalFrame
-	appFrameStore         map[string]*protobufs.AppShardFrame
 	frameStoreMu          sync.RWMutex
+	appFrameStore         map[string]*protobufs.AppShardFrame
+	appFrameStoreMu       sync.RWMutex
 	lowCoverageStreak     map[string]*coverageStreak
+
+	// Transaction cross-shard lock tracking
+	txLockMap map[uint64]map[string]map[string]*LockedTransaction
+	txLockMu  sync.RWMutex
 
 	// Generic state machine
 	stateMachine *consensus.StateMachine[
@@ -245,6 +258,7 @@ func NewGlobalConsensusEngine(
 		blacklistMap:                make(map[string]bool),
 		pendingMessages:             [][]byte{},
 		alertPublicKey:              []byte{},
+		txLockMap:                   make(map[uint64]map[string]map[string]*LockedTransaction),
 	}
 
 	if config.Engine.AlertKey != "" {
@@ -675,6 +689,9 @@ func (e *GlobalConsensusEngine) setupGRPCServer() error {
 			"quilibrium.node.global.pb.KeyRegistryService":               channel.OnlySelfPeer,
 		},
 		map[string]channel.AllowedPeerPolicyType{
+			// Alternative nodes may not need to make this only self peer, but this
+			// prevents a repeated lock DoS
+			"/quilibrium.node.global.pb.GlobalService/GetLockedAddresses": channel.OnlySelfPeer,
 			"/quilibrium.node.global.pb.MixnetService/GetTag":             channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutTag":             channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutMessage":         channel.AnyPeer,

@@ -81,6 +81,7 @@ func (p *GlobalLivenessProvider) Collect(
 		"collected messages, validating",
 		zap.Int("message_count", len(messages)),
 	)
+
 	for i, message := range messages {
 		err := p.engine.executionManager.ValidateMessage(
 			frameNumber,
@@ -96,7 +97,7 @@ func (p *GlobalLivenessProvider) Collect(
 			continue
 		}
 
-		err = p.engine.executionManager.Lock(
+		_, err = p.engine.executionManager.Lock(
 			frameNumber,
 			message.Address,
 			message.Payload,

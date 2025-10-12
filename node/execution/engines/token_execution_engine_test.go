@@ -7,12 +7,12 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/engines"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
@@ -248,9 +248,8 @@ func TestTokenExecutionEngine_BundledMessages(t *testing.T) {
 	}
 
 	// Set hash
-	hashBI, err := poseidon.HashBytes(bundleMsg.Payload)
-	require.NoError(t, err)
-	bundleMsg.Hash = hashBI.FillBytes(make([]byte, 32))
+	hash := sha3.Sum256(bundleMsg.Payload)
+	bundleMsg.Hash = hash[:]
 
 	// Process bundle
 	state := hgstate.NewHypergraphState(mockHG)

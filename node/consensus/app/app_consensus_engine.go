@@ -14,8 +14,10 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
@@ -40,6 +42,7 @@ import (
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
 	tp2p "source.quilibrium.com/quilibrium/monorepo/types/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
@@ -134,6 +137,9 @@ type AppConsensusEngine struct {
 	// Private routing
 	onionRouter  *onion.OnionRouter
 	onionService *onion.GRPCTransport
+
+	// Communication with master process
+	globalClient protobufs.GlobalServiceClient
 }
 
 // NewAppConsensusEngine creates a new app consensus engine using the generic
@@ -421,6 +427,8 @@ func (e *AppConsensusEngine) Start(quit chan struct{}) <-chan error {
 			zap.Error(err),
 		)
 	}
+
+	e.ensureGlobalClient()
 
 	var initialState **protobufs.AppShardFrame = nil
 	if frame != nil {
@@ -980,6 +988,7 @@ func (e *AppConsensusEngine) calculateFrameSelector(
 
 func (e *AppConsensusEngine) calculateRequestsRoot(
 	messages []*protobufs.Message,
+	txMap map[string][][]byte,
 ) ([]byte, error) {
 	if len(messages) == 0 {
 		return make([]byte, 64), nil
@@ -987,17 +996,24 @@ func (e *AppConsensusEngine) calculateRequestsRoot(
 
 	tree := &qcrypto.VectorCommitmentTree{}
 
-	for i, msg := range messages {
-		if msg.Hash != nil {
-			err := tree.Insert(
-				binary.BigEndian.AppendUint64(nil, uint64(i)),
-				msg.Hash,
-				nil,
-				big.NewInt(0),
+	for _, msg := range messages {
+		hash := sha3.Sum256(msg.Payload)
+
+		if msg.Hash == nil || !bytes.Equal(msg.Hash, hash[:]) {
+			return nil, errors.Wrap(
+				errors.New("invalid hash"),
+				"calculate requests root",
 			)
-			if err != nil {
-				return nil, errors.Wrap(err, "calculate requests root")
-			}
+		}
+
+		err := tree.Insert(
+			msg.Hash,
+			slices.Concat(txMap[string(msg.Hash)]...),
+			nil,
+			big.NewInt(0),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "calculate requests root")
 		}
 	}
 
@@ -1007,7 +1023,14 @@ func (e *AppConsensusEngine) calculateRequestsRoot(
 		return nil, errors.Errorf("invalid commitment length %d", len(commitment))
 	}
 
-	return commitment, nil
+	commitHash := sha3.Sum256(commitment)
+
+	set, err := tries.SerializeNonLazyTree(tree)
+	if err != nil {
+		return nil, errors.Wrap(err, "calculate requests root")
+	}
+
+	return slices.Concat(commitHash[:], set), nil
 }
 
 func (e *AppConsensusEngine) getConsensusMessageBitmask() []byte {
@@ -1338,7 +1361,37 @@ func (e *AppConsensusEngine) internalProveFrame(
 		stateRoots[3] = make([]byte, 64)
 	}
 
-	requestsRoot, err := e.calculateRequestsRoot(messages)
+	txMap := map[string][][]byte{}
+	for i, message := range messages {
+		lockedAddrs, err := e.executionManager.Lock(
+			previousFrame.Header.FrameNumber+1,
+			message.Address,
+			message.Payload,
+		)
+		if err != nil {
+			e.logger.Debug(
+				"message failed lock",
+				zap.Int("message_index", i),
+				zap.Error(err),
+			)
+
+			err := e.executionManager.Unlock()
+			if err != nil {
+				e.logger.Error("could not unlock", zap.Error(err))
+				return nil, err
+			}
+		}
+
+		txMap[string(message.Hash)] = lockedAddrs
+	}
+
+	err := e.executionManager.Unlock()
+	if err != nil {
+		e.logger.Error("could not unlock", zap.Error(err))
+		return nil, err
+	}
+
+	requestsRoot, err := e.calculateRequestsRoot(messages, txMap)
 	if err != nil {
 		return nil, err
 	}
@@ -1385,7 +1438,7 @@ func (e *AppConsensusEngine) internalProveFrame(
 	newHeader, err := e.frameProver.ProveFrameHeader(
 		previousFrame.Header,
 		e.appAddress,
-		requestsRoot,
+		requestsRoot[:32],
 		stateRoots,
 		e.getProverAddress(),
 		signer,
@@ -1618,4 +1671,55 @@ func (e *AppConsensusEngine) signPeerInfo(
 	// }
 
 	return e.pubsub.SignMessage(msg)
+}
+
+// SetGlobalClient sets the global client manually, used for tests
+func (e *AppConsensusEngine) SetGlobalClient(
+	client protobufs.GlobalServiceClient,
+) {
+	e.globalClient = client
+}
+
+func (e *AppConsensusEngine) ensureGlobalClient() error {
+	if e.globalClient != nil {
+		return nil
+	}
+
+	addr, err := multiaddr.StringCast(e.config.P2P.StreamListenMultiaddr)
+	if err != nil {
+		return errors.Wrap(err, "ensure global client")
+	}
+
+	mga, err := mn.ToNetAddr(addr)
+	if err != nil {
+		return errors.Wrap(err, "ensure global client")
+	}
+
+	creds, err := p2p.NewPeerAuthenticator(
+		e.logger,
+		e.config.P2P,
+		nil,
+		nil,
+		nil,
+		nil,
+		[][]byte{[]byte(e.pubsub.GetPeerID())},
+		map[string]channel.AllowedPeerPolicyType{
+			"quilibrium.node.global.pb.GlobalService": channel.OnlySelfPeer,
+		},
+		map[string]channel.AllowedPeerPolicyType{},
+	).CreateClientTLSCredentials([]byte(e.pubsub.GetPeerID()))
+	if err != nil {
+		return errors.Wrap(err, "ensure global client")
+	}
+
+	client, err := grpc.NewClient(
+		mga.String(),
+		grpc.WithTransportCredentials(creds),
+	)
+	if err != nil {
+		return errors.Wrap(err, "ensure global client")
+	}
+
+	e.globalClient = protobufs.NewGlobalServiceClient(client)
+	return nil
 }

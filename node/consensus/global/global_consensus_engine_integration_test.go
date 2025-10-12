@@ -1,3 +1,6 @@
+//go:build integrationtest
+// +build integrationtest
+
 package global
 
 import (

@@ -1191,7 +1191,10 @@ func (a *GlobalIntrinsic) InvokeStep(
 }
 
 // Lock implements intrinsics.Intrinsic.
-func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
+func (a *GlobalIntrinsic) Lock(
+	frameNumber uint64,
+	input []byte,
+) ([][]byte, error) {
 	a.lockedReadsMx.Lock()
 	a.lockedWritesMx.Lock()
 	defer a.lockedReadsMx.Unlock()
@@ -1211,7 +1214,7 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 			"global",
 			"invalid_input",
 		).Inc()
-		return errors.Wrap(errors.New("input too short"), "lock")
+		return nil, errors.Wrap(errors.New("input too short"), "lock")
 	}
 
 	// Read the type prefix
@@ -1225,7 +1228,7 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.ProverJoinType:
 		reads, writes, err = a.tryLockJoin(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues("global", "prover_join").Inc()
@@ -1233,7 +1236,7 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.ProverLeaveType:
 		reads, writes, err = a.tryLockLeave(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1244,7 +1247,7 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.ProverPauseType:
 		reads, writes, err = a.tryLockPause(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1255,7 +1258,7 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.ProverResumeType:
 		reads, writes, err = a.tryLockResume(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1266,7 +1269,7 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.ProverConfirmType:
 		reads, writes, err = a.tryLockConfirm(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1277,7 +1280,7 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.ProverRejectType:
 		reads, writes, err = a.tryLockReject(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1288,7 +1291,7 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.ProverKickType:
 		reads, writes, err = a.tryLockKick(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues("global", "prover_kick").Inc()
@@ -1298,7 +1301,7 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 			"global",
 			"unknown_type",
 		).Inc()
-		return errors.Wrap(
+		return nil, errors.Wrap(
 			errors.New("unknown global request type"),
 			"lock",
 		)
@@ -1306,13 +1309,13 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 
 	for _, address := range writes {
 		if _, ok := a.lockedWrites[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
 				"lock",
 			)
 		}
 		if _, ok := a.lockedReads[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for reading", address),
 				"lock",
 			)
@@ -1321,23 +1324,32 @@ func (a *GlobalIntrinsic) Lock(frameNumber uint64, input []byte) error {
 
 	for _, address := range reads {
 		if _, ok := a.lockedWrites[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
 				"lock",
 			)
 		}
 	}
 
+	set := map[string]struct{}{}
+
 	for _, address := range writes {
 		a.lockedWrites[string(address)] = struct{}{}
 		a.lockedReads[string(address)] = a.lockedReads[string(address)] + 1
+		set[string(address)] = struct{}{}
 	}
 
 	for _, address := range reads {
 		a.lockedReads[string(address)] = a.lockedReads[string(address)] + 1
+		set[string(address)] = struct{}{}
 	}
 
-	return nil
+	result := [][]byte{}
+	for a := range set {
+		result = append(result, []byte(a))
+	}
+
+	return result, nil
 }
 
 // Unlock implements intrinsics.Intrinsic.

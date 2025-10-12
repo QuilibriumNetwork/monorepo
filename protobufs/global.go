@@ -3839,8 +3839,9 @@ func (p *ProverLivenessCheck) Validate() error {
 		return errors.Wrap(errors.New("invalid filter length"), "validate")
 	}
 
-	// Commitment hash should be 32 bytes
-	if len(p.CommitmentHash) != 32 {
+	// Commitment hash should be 32 bytes if global, at least 32 if not
+	if (len(p.Filter) == 0 && len(p.CommitmentHash) != 32) ||
+		(len(p.Filter) != 0 && len(p.CommitmentHash) >= 32) {
 		return errors.Wrap(errors.New("invalid commitment hash length"), "validate")
 	}
 

@@ -1107,7 +1107,10 @@ func (h *HypergraphIntrinsic) InvokeStep(
 }
 
 // Lock implements intrinsics.Intrinsic.
-func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
+func (h *HypergraphIntrinsic) Lock(
+	frameNumber uint64,
+	input []byte,
+) ([][]byte, error) {
 	h.lockedReadsMx.Lock()
 	h.lockedWritesMx.Lock()
 	defer h.lockedReadsMx.Unlock()
@@ -1127,7 +1130,7 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 			"hypergraph",
 			"invalid_input",
 		).Inc()
-		return errors.Wrap(errors.New("input too short"), "lock")
+		return nil, errors.Wrap(errors.New("input too short"), "lock")
 	}
 
 	// Read the type prefix
@@ -1141,7 +1144,7 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.VertexAddType:
 		reads, writes, err = h.tryLockVertexAdd(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues("hypergraph", "vertex_add").Inc()
@@ -1149,7 +1152,7 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.VertexRemoveType:
 		reads, writes, err = h.tryLockVertexRemove(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1160,7 +1163,7 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.HyperedgeAddType:
 		reads, writes, err = h.tryLockHyperedgeAdd(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1171,7 +1174,7 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 	case protobufs.HyperedgeRemoveType:
 		reads, writes, err = h.tryLockHyperedgeRemove(frameNumber, input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		observability.LockTotal.WithLabelValues(
@@ -1184,7 +1187,7 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 			"hypergraph",
 			"unknown_type",
 		).Inc()
-		return errors.Wrap(
+		return nil, errors.Wrap(
 			errors.New("unknown compute request type"),
 			"lock",
 		)
@@ -1192,13 +1195,13 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 
 	for _, address := range writes {
 		if _, ok := h.lockedWrites[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
 				"lock",
 			)
 		}
 		if _, ok := h.lockedReads[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for reading", address),
 				"lock",
 			)
@@ -1207,23 +1210,32 @@ func (h *HypergraphIntrinsic) Lock(frameNumber uint64, input []byte) error {
 
 	for _, address := range reads {
 		if _, ok := h.lockedWrites[string(address)]; ok {
-			return errors.Wrap(
+			return nil, errors.Wrap(
 				fmt.Errorf("address %x is already locked for writing", address),
 				"lock",
 			)
 		}
 	}
 
+	set := map[string]struct{}{}
+
 	for _, address := range writes {
 		h.lockedWrites[string(address)] = struct{}{}
 		h.lockedReads[string(address)] = h.lockedReads[string(address)] + 1
+		set[string(address)] = struct{}{}
 	}
 
 	for _, address := range reads {
 		h.lockedReads[string(address)] = h.lockedReads[string(address)] + 1
+		set[string(address)] = struct{}{}
 	}
 
-	return nil
+	result := [][]byte{}
+	for a := range set {
+		result = append(result, []byte(a))
+	}
+
+	return result, nil
 }
 
 // Unlock implements intrinsics.Intrinsic.
