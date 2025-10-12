@@ -507,6 +507,9 @@ func (e *AppConsensusEngine) Start(quit chan struct{}) <-chan error {
 	go e.processConsensusMessageQueue()
 
 	e.wg.Add(1)
+	go e.processProverMessageQueue()
+
+	e.wg.Add(1)
 	go e.processFrameMessageQueue()
 
 	e.wg.Add(1)

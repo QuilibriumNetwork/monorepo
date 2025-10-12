@@ -2090,6 +2090,18 @@ func (f *FrameVote) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
+	// Write filter
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(f.Filter)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(f.Filter); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
 	// Write frame_number
 	if err := binary.Write(buf, binary.BigEndian, f.FrameNumber); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
@@ -2160,6 +2172,16 @@ func (f *FrameVote) FromCanonicalBytes(data []byte) error {
 		)
 	}
 
+	// Read filter
+	var filterLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	f.Filter = make([]byte, filterLen)
+	if _, err := buf.Read(f.Filter); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
 	// Read frame_number
 	if err := binary.Read(buf, binary.BigEndian, &f.FrameNumber); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2220,6 +2242,18 @@ func (f *FrameConfirmation) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
+	// Write filter
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(f.Filter)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(f.Filter); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
 	// Write frame_number
 	if err := binary.Write(buf, binary.BigEndian, f.FrameNumber); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
@@ -2234,6 +2268,10 @@ func (f *FrameConfirmation) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 	if _, err := buf.Write(f.Selector); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, f.Timestamp); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
@@ -2277,6 +2315,16 @@ func (f *FrameConfirmation) FromCanonicalBytes(data []byte) error {
 		)
 	}
 
+	// Read filter
+	var filterLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	f.Filter = make([]byte, filterLen)
+	if _, err := buf.Read(f.Filter); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
 	// Read frame_number
 	if err := binary.Read(buf, binary.BigEndian, &f.FrameNumber); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2289,6 +2337,11 @@ func (f *FrameConfirmation) FromCanonicalBytes(data []byte) error {
 	}
 	f.Selector = make([]byte, selectorLen)
 	if _, err := buf.Read(f.Selector); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read timestamp
+	if err := binary.Read(buf, binary.BigEndian, &f.Timestamp); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
 

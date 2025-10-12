@@ -205,25 +205,31 @@ message ProverLivenessCheck {
 }
 
 message FrameVote {
+  // The filter for the prover's commitment in the trie
+  bytes filter = 1;
   // The frame number being voted on
-  uint64 frame_number = 1;
+  uint64 frame_number = 2;
   // The proposer of the frame
-  bytes proposer = 2;
+  bytes proposer = 3;
   // Whether the voter approves the frame
-  bool approve = 3;
+  bool approve = 4;
   // The timestamp when the vote was created
-  int64 timestamp = 4;
+  int64 timestamp = 5;
   // The BLS signature with the voter's address
-  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 5;
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 6;
 }
 
 message FrameConfirmation {
+  // The filter for the prover's commitment in the trie
+  bytes filter = 1;
   // The frame number that was confirmed
-  uint64 frame_number = 1;
+  uint64 frame_number = 2;
   // The selector (hash) of the confirmed frame
-  bytes selector = 2;
+  bytes selector = 3;
+  // The timestamp when the vote was created
+  int64 timestamp = 4;
   // The aggregated BLS signature from all voters
-  quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 3;
+  quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 5;
 }
 
 message GlobalFrame {

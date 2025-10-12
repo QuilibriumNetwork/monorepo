@@ -99,13 +99,189 @@ var (
 		[]string{"app_address"},
 	)
 
+	// Shard liveness check processing metrics
+	livenessCheckProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "liveness_check_processed_total",
+			Help:      "Total number of shard liveness checks processed by the app consensus engine",
+		},
+		[]string{"app_address", "status"}, // status: "success", "error", "invalid"
+	)
+
+	livenessCheckProcessingDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "liveness_check_processing_duration_seconds",
+			Help:      "Time taken to process a shard liveness check",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"app_address"},
+	)
+
+	// Shard liveness check validation metrics
+	livenessCheckValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "liveness_check_validation_total",
+			Help:      "Total number of shard liveness check validations",
+		},
+		[]string{"app_address", "result"}, // result: "accept", "reject", "ignore"
+	)
+
+	livenessCheckValidationDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "liveness_check_validation_duration_seconds",
+			Help:      "Time taken to validate a shard liveness check",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"app_address"},
+	)
+
+	// Shard vote processing metrics
+	voteProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "vote_processed_total",
+			Help:      "Total number of shard votes processed by the app consensus engine",
+		},
+		[]string{"app_address", "status"}, // status: "success", "error", "invalid"
+	)
+
+	voteProcessingDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "vote_processing_duration_seconds",
+			Help:      "Time taken to process a shard vote",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"app_address"},
+	)
+
+	// Shard vote validation metrics
+	voteValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "vote_validation_total",
+			Help:      "Total number of shard vote validations",
+		},
+		[]string{"app_address", "result"}, // result: "accept", "reject", "ignore"
+	)
+
+	voteValidationDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "vote_validation_duration_seconds",
+			Help:      "Time taken to validate a shard vote",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"app_address"},
+	)
+
+	// Shard confirmation processing metrics
+	confirmationProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "confirmation_processed_total",
+			Help:      "Total number of shard confirmations processed by the app consensus engine",
+		},
+		[]string{"app_address", "status"}, // status: "success", "error", "invalid"
+	)
+
+	confirmationProcessingDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "confirmation_processing_duration_seconds",
+			Help:      "Time taken to process a shard confirmation",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"app_address"},
+	)
+
+	// Shard confirmation validation metrics
+	confirmationValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "confirmation_validation_total",
+			Help:      "Total number of shard confirmation validations",
+		},
+		[]string{"app_address", "result"}, // result: "accept", "reject", "ignore"
+	)
+
+	confirmationValidationDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "confirmation_validation_duration_seconds",
+			Help:      "Time taken to validate a shard confirmation",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"app_address"},
+	)
+
+	// Shard proposal processing metrics
+	proposalProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "proposal_processed_total",
+			Help:      "Total number of shard proposals processed by the app consensus engine",
+		},
+		[]string{"app_address", "status"}, // status: "success", "error", "invalid"
+	)
+
+	proposalProcessingDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "proposal_processing_duration_seconds",
+			Help:      "Time taken to process a shard proposal",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"app_address"},
+	)
+
+	// Shard proposal validation metrics
+	proposalValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "proposal_validation_total",
+			Help:      "Total number of shard proposal validations",
+		},
+		[]string{"app_address", "result"}, // result: "accept", "reject", "ignore"
+	)
+
+	proposalValidationDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "proposal_validation_duration_seconds",
+			Help:      "Time taken to validate a shard proposal",
+			Buckets:   prometheus.DefBuckets,
+		},
+		[]string{"app_address"},
+	)
+
 	// Global frame processing metrics
 	globalFramesProcessedTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: subsystem,
 			Name:      "global_frames_processed_total",
-			Help:      "Total number of frames processed by the global consensus engine",
+			Help:      "Total number of frames processed by the app consensus engine",
 		},
 		[]string{"status"}, // status: "success", "error", "invalid"
 	)

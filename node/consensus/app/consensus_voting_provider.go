@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"sync"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
@@ -226,9 +227,11 @@ func (p *AppVotingProvider) DecideAndSendVote(
 
 	// Create vote message
 	vote := &protobufs.FrameVote{
+		Filter:      p.engine.appAddress,
 		FrameNumber: chosenProposal.Header.FrameNumber,
 		Proposer:    chosenProposal.Header.Prover,
 		Approve:     true,
+		Timestamp:   time.Now().UnixMilli(),
 		PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
 			Address:   voterAddress,
 			Signature: sig,
@@ -490,8 +493,10 @@ func (p *AppVotingProvider) SendConfirmation(
 
 	// Create frame confirmation
 	confirmation := &protobufs.FrameConfirmation{
+		Filter:             p.engine.appAddress,
 		FrameNumber:        copiedFinalized.Header.FrameNumber,
 		Selector:           p.engine.calculateFrameSelector((*finalized).Header),
+		Timestamp:          time.Now().UnixMilli(),
 		AggregateSignature: copiedFinalized.Header.PublicKeySignatureBls48581,
 	}
 

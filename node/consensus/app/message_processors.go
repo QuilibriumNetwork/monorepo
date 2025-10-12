@@ -419,14 +419,14 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 
 func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 	timer := prometheus.NewTimer(
-		frameProcessingDuration.WithLabelValues(e.appAddressHex),
+		proposalProcessingDuration.WithLabelValues(e.appAddressHex),
 	)
 	defer timer.ObserveDuration()
+
 	frame := &protobufs.AppShardFrame{}
 	if err := frame.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal frame", zap.Error(err))
-		framesProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		timer.ObserveDuration()
+		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
@@ -434,11 +434,10 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 		valid, err := e.frameValidator.Validate(frame)
 		if !valid || err != nil {
 			e.logger.Error("received invalid frame", zap.Error(err))
-			framesProcessedTotal.WithLabelValues(
+			proposalProcessedTotal.WithLabelValues(
 				e.appAddressHex,
 				"invalid",
 			).Inc()
-			timer.ObserveDuration()
 			return
 		}
 
@@ -452,26 +451,34 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 			PeerID{ID: frame.Header.Prover},
 			&frame,
 		)
-		framesProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
+		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 	}
 }
 
 func (e *AppConsensusEngine) handleLivenessCheck(message *pb.Message) {
+	timer := prometheus.NewTimer(
+		livenessCheckProcessingDuration.WithLabelValues(e.appAddressHex),
+	)
+	defer timer.ObserveDuration()
+
 	livenessCheck := &protobufs.ProverLivenessCheck{}
 	if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
 	// Validate the liveness check structure
 	if err := livenessCheck.Validate(); err != nil {
 		e.logger.Debug("invalid liveness check", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
 	proverSet, err := e.proverRegistry.GetActiveProvers(e.appAddress)
 	if err != nil {
 		e.logger.Error("could not receive liveness check", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
@@ -519,12 +526,14 @@ func (e *AppConsensusEngine) handleLivenessCheck(message *pb.Message) {
 				),
 			),
 		)
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
 	signatureData, err := livenessCheck.ConstructSignaturePayload()
 	if err != nil {
 		e.logger.Error("invalid signature payload", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
@@ -538,42 +547,74 @@ func (e *AppConsensusEngine) handleLivenessCheck(message *pb.Message) {
 
 	if err != nil || !valid {
 		e.logger.Error("invalid liveness check signature", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if livenessCheck.PublicKeySignatureBls48581 != nil {
-		commitment := CollectedCommitments{
-			commitmentHash: livenessCheck.CommitmentHash,
-			frameNumber:    livenessCheck.FrameNumber,
-			prover:         livenessCheck.PublicKeySignatureBls48581.Address,
-		}
-		e.stateMachine.ReceiveLivenessCheck(
-			PeerID{ID: livenessCheck.PublicKeySignatureBls48581.Address},
-			commitment,
-		)
+	if livenessCheck.PublicKeySignatureBls48581 == nil {
+		e.logger.Error("no signature on liveness check")
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 	}
+
+	commitment := CollectedCommitments{
+		commitmentHash: livenessCheck.CommitmentHash,
+		frameNumber:    livenessCheck.FrameNumber,
+		prover:         livenessCheck.PublicKeySignatureBls48581.Address,
+	}
+	if err := e.stateMachine.ReceiveLivenessCheck(
+		PeerID{ID: livenessCheck.PublicKeySignatureBls48581.Address},
+		commitment,
+	); err != nil {
+		e.logger.Error("could not receive liveness check", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }
 
 func (e *AppConsensusEngine) handleVote(message *pb.Message) {
+	timer := prometheus.NewTimer(
+		voteProcessingDuration.WithLabelValues(e.appAddressHex),
+	)
+	defer timer.ObserveDuration()
+
 	vote := &protobufs.FrameVote{}
 	if err := vote.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal vote", zap.Error(err))
+		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if vote.PublicKeySignatureBls48581 != nil {
-		e.stateMachine.ReceiveVote(
-			PeerID{ID: vote.Proposer},
-			PeerID{ID: vote.PublicKeySignatureBls48581.Address},
-			&vote,
-		)
+	if vote.PublicKeySignatureBls48581 == nil {
+		e.logger.Error("vote without signature")
+		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
 	}
+
+	if err := e.stateMachine.ReceiveVote(
+		PeerID{ID: vote.Proposer},
+		PeerID{ID: vote.PublicKeySignatureBls48581.Address},
+		&vote,
+	); err != nil {
+		e.logger.Error("could not receive vote", zap.Error(err))
+		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	voteProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }
 
 func (e *AppConsensusEngine) handleConfirmation(message *pb.Message) {
+	timer := prometheus.NewTimer(
+		confirmationProcessingDuration.WithLabelValues(e.appAddressHex),
+	)
+	defer timer.ObserveDuration()
+
 	confirmation := &protobufs.FrameConfirmation{}
 	if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
@@ -604,22 +645,35 @@ func (e *AppConsensusEngine) handleConfirmation(message *pb.Message) {
 	valid, err := e.frameValidator.Validate(matchingFrame)
 	if !valid || err != nil {
 		e.logger.Error("received invalid confirmation", zap.Error(err))
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if matchingFrame.Header.Prover != nil {
-		e.stateMachine.ReceiveConfirmation(
-			PeerID{ID: matchingFrame.Header.Prover},
-			&matchingFrame,
-		)
-		err := e.appTimeReel.Insert(e.ctx, matchingFrame)
-		if err != nil {
-			e.logger.Error(
-				"could not insert into time reel",
-				zap.Error(err),
-			)
-		}
+	if matchingFrame.Header.Prover == nil {
+		e.logger.Error("confirmation with no matched prover")
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
 	}
+
+	if err := e.stateMachine.ReceiveConfirmation(
+		PeerID{ID: matchingFrame.Header.Prover},
+		&matchingFrame,
+	); err != nil {
+		e.logger.Error("could not receive confirmation", zap.Error(err))
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	if err := e.appTimeReel.Insert(e.ctx, matchingFrame); err != nil {
+		e.logger.Error(
+			"could not insert into time reel",
+			zap.Error(err),
+		)
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }
 
 func (e *AppConsensusEngine) peekMessageType(message *pb.Message) uint32 {

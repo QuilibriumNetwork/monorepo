@@ -32,6 +32,27 @@ var (
 		},
 	)
 
+	// Frame processing metrics
+	shardFramesProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_frames_processed_total",
+			Help:      "Total number of shard frames processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	shardFrameProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_frame_processing_duration_seconds",
+			Help:      "Time taken to process a shard frame",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
 	// Frame validation metrics
 	frameValidationTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -49,6 +70,363 @@ var (
 			Subsystem: subsystem,
 			Name:      "frame_validation_duration_seconds",
 			Help:      "Time taken to validate a global frame",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Shard frame validation metrics
+	shardFrameValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_frame_validation_total",
+			Help:      "Total number of shard frame validations",
+		},
+		[]string{"result"}, // result: "accept", "reject", "ignore"
+	)
+
+	shardFrameValidationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_frame_validation_duration_seconds",
+			Help:      "Time taken to validate a shard frame",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Global liveness check processing metrics
+	livenessCheckProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "liveness_check_processed_total",
+			Help:      "Total number of global liveness checks processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	livenessCheckProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "liveness_check_processing_duration_seconds",
+			Help:      "Time taken to process a global liveness check",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Global liveness check validation metrics
+	livenessCheckValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "liveness_check_validation_total",
+			Help:      "Total number of global liveness check validations",
+		},
+		[]string{"result"}, // result: "accept", "reject", "ignore"
+	)
+
+	livenessCheckValidationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "liveness_check_validation_duration_seconds",
+			Help:      "Time taken to validate a global liveness check",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Shard liveness check processing metrics
+	shardLivenessCheckProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_liveness_check_processed_total",
+			Help:      "Total number of shard liveness checks processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	shardLivenessCheckProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_liveness_check_processing_duration_seconds",
+			Help:      "Time taken to process a shard liveness check",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Shard liveness check validation metrics
+	shardLivenessCheckValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_liveness_check_validation_total",
+			Help:      "Total number of shard liveness check validations",
+		},
+		[]string{"result"}, // result: "accept", "reject", "ignore"
+	)
+
+	shardLivenessCheckValidationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_liveness_check_validation_duration_seconds",
+			Help:      "Time taken to validate a shard liveness check",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Global vote processing metrics
+	voteProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "vote_processed_total",
+			Help:      "Total number of global votes processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	voteProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "vote_processing_duration_seconds",
+			Help:      "Time taken to process a global vote",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Global vote validation metrics
+	voteValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "vote_validation_total",
+			Help:      "Total number of global vote validations",
+		},
+		[]string{"result"}, // result: "accept", "reject", "ignore"
+	)
+
+	voteValidationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "vote_validation_duration_seconds",
+			Help:      "Time taken to validate a global vote",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Shard vote processing metrics
+	shardVoteProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_vote_processed_total",
+			Help:      "Total number of shard votes processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	shardVoteProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_vote_processing_duration_seconds",
+			Help:      "Time taken to process a shard vote",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Shard vote validation metrics
+	shardVoteValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_vote_validation_total",
+			Help:      "Total number of shard vote validations",
+		},
+		[]string{"result"}, // result: "accept", "reject", "ignore"
+	)
+
+	shardVoteValidationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_vote_validation_duration_seconds",
+			Help:      "Time taken to validate a shard vote",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Global confirmation processing metrics
+	confirmationProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "confirmation_processed_total",
+			Help:      "Total number of global confirmations processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	confirmationProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "confirmation_processing_duration_seconds",
+			Help:      "Time taken to process a global confirmation",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Global confirmation validation metrics
+	confirmationValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "confirmation_validation_total",
+			Help:      "Total number of global confirmation validations",
+		},
+		[]string{"result"}, // result: "accept", "reject", "ignore"
+	)
+
+	confirmationValidationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "confirmation_validation_duration_seconds",
+			Help:      "Time taken to validate a global confirmation",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Shard confirmation processing metrics
+	shardConfirmationProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_confirmation_processed_total",
+			Help:      "Total number of shard confirmations processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	shardConfirmationProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_confirmation_processing_duration_seconds",
+			Help:      "Time taken to process a shard confirmation",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Shard confirmation validation metrics
+	shardConfirmationValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_confirmation_validation_total",
+			Help:      "Total number of shard confirmation validations",
+		},
+		[]string{"result"}, // result: "accept", "reject", "ignore"
+	)
+
+	shardConfirmationValidationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_confirmation_validation_duration_seconds",
+			Help:      "Time taken to validate a shard confirmation",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Global proposal processing metrics
+	proposalProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "proposal_processed_total",
+			Help:      "Total number of global proposals processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	proposalProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "proposal_processing_duration_seconds",
+			Help:      "Time taken to process a global proposal",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Global proposal validation metrics
+	proposalValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "proposal_validation_total",
+			Help:      "Total number of global proposal validations",
+		},
+		[]string{"result"}, // result: "accept", "reject", "ignore"
+	)
+
+	proposalValidationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "proposal_validation_duration_seconds",
+			Help:      "Time taken to validate a global proposal",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Shard proposal processing metrics
+	shardProposalProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_proposal_processed_total",
+			Help:      "Total number of shard proposals processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	shardProposalProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_proposal_processing_duration_seconds",
+			Help:      "Time taken to process a shard proposal",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
+	// Shard proposal validation metrics
+	shardProposalValidationTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_proposal_validation_total",
+			Help:      "Total number of shard proposal validations",
+		},
+		[]string{"result"}, // result: "accept", "reject", "ignore"
+	)
+
+	shardProposalValidationDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_proposal_validation_duration_seconds",
+			Help:      "Time taken to validate a shard proposal",
 			Buckets:   prometheus.DefBuckets,
 		},
 	)

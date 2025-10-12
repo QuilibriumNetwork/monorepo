@@ -19,11 +19,6 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 	peerID peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
-	timer := prometheus.NewTimer(
-		frameValidationDuration.WithLabelValues(e.appAddressHex),
-	)
-	defer timer.ObserveDuration()
-
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
 		e.logger.Debug(
@@ -39,49 +34,62 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 	switch typePrefix {
 	case protobufs.AppShardFrameType:
+		timer := prometheus.NewTimer(
+			proposalValidationDuration.WithLabelValues(e.appAddressHex),
+		)
+		defer timer.ObserveDuration()
+
 		frame := &protobufs.AppShardFrame{}
 		if err := frame.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
 		if frame.Header == nil {
 			e.logger.Debug("frame has no header")
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
 		if !bytes.Equal(frame.Header.Address, e.appAddress) {
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultIgnore
 		}
 
 		if frame.Header.PublicKeySignatureBls48581 != nil {
 			e.logger.Debug("frame validation has signature")
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
 		valid, err := e.frameValidator.Validate(frame)
 		if err != nil {
 			e.logger.Debug("frame validation error", zap.Error(err))
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
 		if !valid {
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			e.logger.Debug("invalid frame")
+			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
-		frameValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
+		proposalValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 
 	case protobufs.ProverLivenessCheckType:
+		timer := prometheus.NewTimer(
+			livenessCheckValidationDuration.WithLabelValues(e.appAddressHex),
+		)
+		defer timer.ObserveDuration()
+
 		livenessCheck := &protobufs.ProverLivenessCheck{}
 		if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
+			livenessCheckValidationTotal.WithLabelValues(
+				e.appAddressHex,
+				"reject",
+			).Inc()
 			return p2p.ValidationResultReject
 		}
 
@@ -93,13 +101,28 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		if err := livenessCheck.Validate(); err != nil {
 			e.logger.Debug("failed to validate liveness check", zap.Error(err))
+			livenessCheckValidationTotal.WithLabelValues(
+				e.appAddressHex,
+				"reject",
+			).Inc()
 			return p2p.ValidationResultReject
 		}
 
+		livenessCheckValidationTotal.WithLabelValues(
+			e.appAddressHex,
+			"accept",
+		).Inc()
+
 	case protobufs.FrameVoteType:
+		timer := prometheus.NewTimer(
+			voteValidationDuration.WithLabelValues(e.appAddressHex),
+		)
+		defer timer.ObserveDuration()
+
 		vote := &protobufs.FrameVote{}
 		if err := vote.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal vote", zap.Error(err))
+			voteValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
@@ -110,27 +133,48 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		if err := vote.Validate(); err != nil {
 			e.logger.Debug("failed to validate vote", zap.Error(err))
+			voteValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
+		voteValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
+
 	case protobufs.FrameConfirmationType:
+		timer := prometheus.NewTimer(
+			confirmationValidationDuration.WithLabelValues(e.appAddressHex),
+		)
+		defer timer.ObserveDuration()
+
 		confirmation := &protobufs.FrameConfirmation{}
 		if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
+			confirmationValidationTotal.WithLabelValues(
+				e.appAddressHex,
+				"reject",
+			).Inc()
 			return p2p.ValidationResultReject
+		}
+
+		now := time.Now().UnixMilli()
+		if confirmation.Timestamp > now+5000 || confirmation.Timestamp < now-5000 {
+			return p2p.ValidationResultIgnore
 		}
 
 		if err := confirmation.Validate(); err != nil {
 			e.logger.Debug("failed to validate confirmation", zap.Error(err))
+			confirmationValidationTotal.WithLabelValues(
+				e.appAddressHex,
+				"reject",
+			).Inc()
 			return p2p.ValidationResultReject
 		}
 
+		confirmationValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
+
 	default:
-		frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 		return p2p.ValidationResultReject
 	}
 
-	frameValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 	return p2p.ValidationResultAccept
 }
 
@@ -299,15 +343,13 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 	peerID peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
-	timer := prometheus.NewTimer(
-		frameValidationDuration.WithLabelValues(e.appAddressHex),
-	)
+	timer := prometheus.NewTimer(globalFrameValidationDuration)
 	defer timer.ObserveDuration()
 
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
 		e.logger.Debug("message too short", zap.Int("data_length", len(message.Data)))
-		frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+		globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 		return p2p.ValidationResultReject
 	}
 
@@ -319,7 +361,7 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 		frame := &protobufs.GlobalFrame{}
 		if err := frame.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
@@ -327,20 +369,20 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 			frame.Header.PublicKeySignatureBls48581.PublicKey == nil ||
 			frame.Header.PublicKeySignatureBls48581.PublicKey.KeyValue == nil {
 			e.logger.Debug("frame validation missing signature")
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
 		valid, err := e.globalFrameValidator.Validate(frame)
 		if err != nil {
 			e.logger.Debug("frame validation error", zap.Error(err))
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
 		if !valid {
-			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			e.logger.Debug("invalid frame")
+			globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
@@ -348,7 +390,7 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 			return p2p.ValidationResultIgnore
 		}
 
-		frameValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
+		globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 
 	default:
 		return p2p.ValidationResultReject
