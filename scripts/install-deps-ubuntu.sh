@@ -1,6 +1,8 @@
 #!/bin/bash
 
-sudo apt-get update && apt-get install -y \
+set -euo pipefail
+
+sudo apt-get update && sudo apt-get install -y \
     build-essential \
     curl \
     git \
@@ -22,33 +24,34 @@ sudo apt-get update && apt-get install -y \
     python-is-python3 \
     wget
 
-sudo apt update && apt install -y wget && \
-ARCH=$(dpkg --print-architecture) && \
+sudo apt update && sudo apt install -y wget
+ARCH=$(dpkg --print-architecture)
 case ${ARCH} in \
     amd64) GOARCH=amd64 ;; \
     arm64) GOARCH=arm64 ;; \
     *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
-esac && \
-wget https://go.dev/dl/go1.23.5.linux-${GOARCH}.tar.gz && \
-sudo rm -rf /usr/local/go && \
-sudo tar -C /usr/local -xzf go1.23.5.linux-${GOARCH}.tar.gz && \
+esac
+wget https://go.dev/dl/go1.23.5.linux-${GOARCH}.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go1.23.5.linux-${GOARCH}.tar.gz
 rm go1.23.5.linux-${GOARCH}.tar.gz
 
-git clone https://github.com/flintlib/flint.git && \
-cd flint && \
-git checkout flint-3.0 && \
-./bootstrap.sh && \
+FLINT_TMP=$(mktemp -d)
+git clone https://github.com/flintlib/flint.git "$FLINT_TMP"
+pushd "$FLINT_TMP"
+git checkout flint-3.0
+./bootstrap.sh
 ./configure \
     --prefix=/usr/local \
     --with-gmp=/usr/local \
     --with-mpfr=/usr/local \
     --enable-static \
     --disable-shared \
-    CFLAGS="-O3" && \
-make && \
-sudo make install && \
-cd .. && \
-rm -rf flint
+    CFLAGS="-O3"
+make
+sudo make install
+popd
+rm -rf "$FLINT_TMP"
 
 ./docker/rustup-init.sh -y --profile minimal
 
@@ -56,43 +59,55 @@ cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bin
 
 python emp-install.py --install --tool --ot
 
-cd emp-tool && \
-sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && \
-mkdir build && \
-cd build && \
-cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && \
-cd .. && \
-make && \
-sudo make install && \
-cd ..
+pushd emp-tool
+sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt
+mkdir -p build
+pushd build
+cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local
+popd
+make
+sudo make install
+popd
 
-cd emp-ot && \
-mkdir build && \
-cd build && \
-cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && \
-cd .. && \
-make && \
-sudo make install && \
-cd ..
+pushd emp-ot
+mkdir -p build
+pushd build
+cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local
+popd
+make
+sudo make install
+popd
 
-cd vdf && \
-./generate.sh && \
-cd ..
+pushd vdf
+./generate.sh
+popd
 
-cd ferret && \
-./generate.sh && \
-cd ..
+pushd ferret
+./generate.sh
+popd
 
-cd bls48581 && \
-./generate.sh && \
-cd ..
+pushd bls48581
+./generate.sh
+popd
 
-cd bulletproofs && \
-./generate.sh && \
-cd ..
+pushd bulletproofs
+./generate.sh
+popd
 
-cd verenc && \
-./generate.sh && \
-cd ..
+pushd verenc
+./generate.sh
+popd
+
+pushd channel
+./generate.sh
+popd
+
+pushd channel
+./generate.sh
+popd
+
+pushd rpm
+./generate.sh
+popd
 
 echo "Source dependencies installed."
