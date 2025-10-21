@@ -2,6 +2,9 @@ package app
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"go.uber.org/zap"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -57,6 +60,9 @@ func newDataWorkerNode(
 }
 
 func (n *DataWorkerNode) Start() error {
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
+
 	go func() {
 		err := n.ipcServer.Start()
 		if err != nil {
@@ -72,7 +78,10 @@ func (n *DataWorkerNode) Start() error {
 
 	defer n.Stop()
 
-	<-n.quit
+	select {
+	case <-done:
+	case <-n.quit:
+	}
 
 	return nil
 }
