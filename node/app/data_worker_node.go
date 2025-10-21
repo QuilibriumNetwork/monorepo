@@ -70,7 +70,15 @@ func (n *DataWorkerNode) Start() error {
 
 	n.logger.Info("data worker node started", zap.Uint("core_id", n.coreId))
 
-	defer func() {
+	<-n.quit
+
+	return nil
+}
+
+func (n *DataWorkerNode) Stop() {
+	n.logger.Info("stopping data worker node")
+
+	if n.pebble != nil {
 		err := n.pebble.Close()
 		if err != nil {
 			n.logger.Error(
@@ -84,15 +92,7 @@ func (n *DataWorkerNode) Start() error {
 				zap.Uint("core_id", n.coreId),
 			)
 		}
-	}()
-
-	<-n.quit
-
-	return nil
-}
-
-func (n *DataWorkerNode) Stop() {
-	n.logger.Info("stopping data worker node")
+	}
 
 	// Signal quit
 	if n.quit != nil {
