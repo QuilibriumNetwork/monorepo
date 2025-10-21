@@ -70,6 +70,8 @@ func (n *DataWorkerNode) Start() error {
 
 	n.logger.Info("data worker node started", zap.Uint("core_id", n.coreId))
 
+	defer n.Stop()
+
 	<-n.quit
 
 	return nil
