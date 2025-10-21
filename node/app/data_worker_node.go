@@ -78,7 +78,7 @@ func (n *DataWorkerNode) Start() error {
 }
 
 func (n *DataWorkerNode) Stop() {
-	n.logger.Info("stopping data worker node")
+	n.logger.Info("stopping data worker node", zap.Uint("core_id", n.coreId))
 
 	if n.pebble != nil {
 		err := n.pebble.Close()
