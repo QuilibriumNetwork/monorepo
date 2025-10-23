@@ -25,6 +25,7 @@ func TestProverUpdate_Prove(t *testing.T) {
 	mockKM := new(mocks.MockKeyManager)
 	mockSigner := new(mocks.MockBLSSigner)
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 
 	delegate := make([]byte, 32)
 	for i := range delegate {
@@ -70,6 +71,7 @@ func TestProverUpdate_Prove(t *testing.T) {
 func TestProverUpdate_Verify_Succeeds(t *testing.T) {
 	mockKM := new(mocks.MockKeyManager)
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil).Maybe()
 
 	// Setup pubkey and its address
 	pubKey := make([]byte, 585)
@@ -127,6 +129,7 @@ func TestProverUpdate_Verify_Succeeds(t *testing.T) {
 func TestProverUpdate_Verify_FailsOnBadSignature(t *testing.T) {
 	mockKM := new(mocks.MockKeyManager)
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 
 	// Prover tree with pubkey
 	pubKey := make([]byte, 585)
@@ -177,6 +180,7 @@ func TestProverUpdate_Verify_FailsOnBadSignature(t *testing.T) {
 func TestProverUpdate_Verify_FailsOnAddressMismatch(t *testing.T) {
 	mockKM := new(mocks.MockKeyManager)
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 
 	// Prover tree with pubkey
 	pubKey := make([]byte, 585)
@@ -219,6 +223,7 @@ func TestProverUpdate_Verify_FailsOnAddressMismatch(t *testing.T) {
 func TestProverUpdate_Materialize_PreservesBalance(t *testing.T) {
 	mockKM := new(mocks.MockKeyManager)
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 	hypergraphState := hgstate.NewHypergraphState(mockHG)
 
 	// Prover exists with PublicKey

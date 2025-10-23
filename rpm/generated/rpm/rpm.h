@@ -24,24 +24,10 @@
 // ⚠️ increment the version suffix in all instances of UNIFFI_SHARED_HEADER_V6 in this file.           ⚠️
 
 typedef struct RustBuffer {
-	int32_t capacity;
-	int32_t len;
+	uint64_t capacity;
+	uint64_t len;
 	uint8_t *data;
 } RustBuffer;
-
-typedef int32_t (*ForeignCallback)(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
-
-// Task defined in Rust that Go executes
-typedef void (*RustTaskCallback)(const void *, int8_t);
-
-// Callback to execute Rust tasks using a Go routine
-//
-// Args:
-//   executor: ForeignExecutor lowered into a uint64_t value
-//   delay: Delay in MS
-//   task: RustTaskCallback to call
-//   task_data: data to pass the task callback
-typedef int8_t (*ForeignExecutorCallback)(uint64_t, uint32_t, RustTaskCallback, void *);
 
 typedef struct ForeignBytes {
 	int32_t len;
@@ -54,392 +40,694 @@ typedef struct RustCallStatus {
 	RustBuffer errorBuf;
 } RustCallStatus;
 
-// Continuation callback for UniFFI Futures
-typedef void (*RustFutureContinuation)(void * , int8_t);
-
-// ⚠️ Attention: If you change this #else block (ending in `#endif // def UNIFFI_SHARED_H`) you *must* ⚠️
-// ⚠️ increment the version suffix in all instances of UNIFFI_SHARED_HEADER_V6 in this file.           ⚠️
-#endif // def UNIFFI_SHARED_H
-
-// Needed because we can't execute the callback directly from go.
-void cgo_rust_task_callback_bridge_rpm(RustTaskCallback, const void *, int8_t);
-
-int8_t uniffiForeignExecutorCallbackrpm(uint64_t, uint32_t, RustTaskCallback, void*);
-
-void uniffiFutureContinuationCallbackrpm(void*, int8_t);
-
-RustBuffer uniffi_rpm_fn_func_wrapped_rpm_combine_shares_and_mask(
-	RustBuffer ms,
-	RustBuffer rs,
-	uint64_t size,
-	uint64_t depth,
-	uint64_t dealers,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_rpm_fn_func_wrapped_rpm_finalize(
-	RustBuffer input,
-	RustBuffer parties,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_rpm_fn_func_wrapped_rpm_generate_initial_shares(
-	uint64_t size,
-	uint64_t depth,
-	uint64_t dealers,
-	uint64_t players,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_rpm_fn_func_wrapped_rpm_permute(
-	RustBuffer masked_input_shares,
-	RustBuffer mb,
-	RustBuffer rb,
-	RustBuffer mrmb,
-	uint64_t depth_index,
-	RustBuffer parties,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_rpm_fn_func_wrapped_rpm_sketch_propose(
-	RustBuffer m,
-	RustBuffer r,
-	RustCallStatus* out_status
-);
-
-int8_t uniffi_rpm_fn_func_wrapped_rpm_sketch_verify(
-	RustBuffer mcs,
-	RustBuffer rcs,
-	uint64_t dealers,
-	RustCallStatus* out_status
-);
-
-RustBuffer ffi_rpm_rustbuffer_alloc(
-	int32_t size,
-	RustCallStatus* out_status
-);
-
-RustBuffer ffi_rpm_rustbuffer_from_bytes(
-	ForeignBytes bytes,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rustbuffer_free(
-	RustBuffer buf,
-	RustCallStatus* out_status
-);
-
-RustBuffer ffi_rpm_rustbuffer_reserve(
-	RustBuffer buf,
-	int32_t additional,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_continuation_callback_set(
-	RustFutureContinuation callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_u8(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_u8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_u8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint8_t ffi_rpm_rust_future_complete_u8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_i8(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_i8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_i8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-int8_t ffi_rpm_rust_future_complete_i8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_u16(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_u16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_u16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint16_t ffi_rpm_rust_future_complete_u16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_i16(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_i16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_i16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-int16_t ffi_rpm_rust_future_complete_i16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_u32(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_u32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_u32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint32_t ffi_rpm_rust_future_complete_u32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_i32(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_i32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_i32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-int32_t ffi_rpm_rust_future_complete_i32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_u64(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_u64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_u64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint64_t ffi_rpm_rust_future_complete_u64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_i64(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_i64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_i64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-int64_t ffi_rpm_rust_future_complete_i64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_f32(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_f32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_f32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-float ffi_rpm_rust_future_complete_f32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_f64(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_f64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_f64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-double ffi_rpm_rust_future_complete_f64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_pointer(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_pointer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_pointer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void* ffi_rpm_rust_future_complete_pointer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_rust_buffer(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_rust_buffer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_rust_buffer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-RustBuffer ffi_rpm_rust_future_complete_rust_buffer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_poll_void(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_cancel_void(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_free_void(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_rpm_rust_future_complete_void(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rpm_checksum_func_wrapped_rpm_combine_shares_and_mask(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rpm_checksum_func_wrapped_rpm_finalize(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rpm_checksum_func_wrapped_rpm_generate_initial_shares(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rpm_checksum_func_wrapped_rpm_permute(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rpm_checksum_func_wrapped_rpm_sketch_propose(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rpm_checksum_func_wrapped_rpm_sketch_verify(
-	RustCallStatus* out_status
-);
-
-uint32_t ffi_rpm_uniffi_contract_version(
-	RustCallStatus* out_status
-);
-
-
+#endif // UNIFFI_SHARED_H
+
+
+#ifndef UNIFFI_FFIDEF_RUST_FUTURE_CONTINUATION_CALLBACK
+#define UNIFFI_FFIDEF_RUST_FUTURE_CONTINUATION_CALLBACK
+typedef void (*UniffiRustFutureContinuationCallback)(uint64_t data, int8_t poll_result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiRustFutureContinuationCallback(
+				UniffiRustFutureContinuationCallback cb, uint64_t data, int8_t poll_result)
+{
+	return cb(data, poll_result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_FREE
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_FREE
+typedef void (*UniffiForeignFutureFree)(uint64_t handle);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureFree(
+				UniffiForeignFutureFree cb, uint64_t handle)
+{
+	return cb(handle);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_FREE
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_FREE
+typedef void (*UniffiCallbackInterfaceFree)(uint64_t handle);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiCallbackInterfaceFree(
+				UniffiCallbackInterfaceFree cb, uint64_t handle)
+{
+	return cb(handle);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE
+typedef struct UniffiForeignFuture {
+    uint64_t handle;
+    UniffiForeignFutureFree free;
+} UniffiForeignFuture;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U8
+typedef struct UniffiForeignFutureStructU8 {
+    uint8_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructU8;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U8
+typedef void (*UniffiForeignFutureCompleteU8)(uint64_t callback_data, UniffiForeignFutureStructU8 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteU8(
+				UniffiForeignFutureCompleteU8 cb, uint64_t callback_data, UniffiForeignFutureStructU8 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I8
+typedef struct UniffiForeignFutureStructI8 {
+    int8_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructI8;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I8
+typedef void (*UniffiForeignFutureCompleteI8)(uint64_t callback_data, UniffiForeignFutureStructI8 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteI8(
+				UniffiForeignFutureCompleteI8 cb, uint64_t callback_data, UniffiForeignFutureStructI8 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U16
+typedef struct UniffiForeignFutureStructU16 {
+    uint16_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructU16;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U16
+typedef void (*UniffiForeignFutureCompleteU16)(uint64_t callback_data, UniffiForeignFutureStructU16 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteU16(
+				UniffiForeignFutureCompleteU16 cb, uint64_t callback_data, UniffiForeignFutureStructU16 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I16
+typedef struct UniffiForeignFutureStructI16 {
+    int16_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructI16;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I16
+typedef void (*UniffiForeignFutureCompleteI16)(uint64_t callback_data, UniffiForeignFutureStructI16 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteI16(
+				UniffiForeignFutureCompleteI16 cb, uint64_t callback_data, UniffiForeignFutureStructI16 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U32
+typedef struct UniffiForeignFutureStructU32 {
+    uint32_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructU32;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U32
+typedef void (*UniffiForeignFutureCompleteU32)(uint64_t callback_data, UniffiForeignFutureStructU32 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteU32(
+				UniffiForeignFutureCompleteU32 cb, uint64_t callback_data, UniffiForeignFutureStructU32 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I32
+typedef struct UniffiForeignFutureStructI32 {
+    int32_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructI32;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I32
+typedef void (*UniffiForeignFutureCompleteI32)(uint64_t callback_data, UniffiForeignFutureStructI32 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteI32(
+				UniffiForeignFutureCompleteI32 cb, uint64_t callback_data, UniffiForeignFutureStructI32 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U64
+typedef struct UniffiForeignFutureStructU64 {
+    uint64_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructU64;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U64
+typedef void (*UniffiForeignFutureCompleteU64)(uint64_t callback_data, UniffiForeignFutureStructU64 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteU64(
+				UniffiForeignFutureCompleteU64 cb, uint64_t callback_data, UniffiForeignFutureStructU64 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I64
+typedef struct UniffiForeignFutureStructI64 {
+    int64_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructI64;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I64
+typedef void (*UniffiForeignFutureCompleteI64)(uint64_t callback_data, UniffiForeignFutureStructI64 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteI64(
+				UniffiForeignFutureCompleteI64 cb, uint64_t callback_data, UniffiForeignFutureStructI64 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F32
+typedef struct UniffiForeignFutureStructF32 {
+    float returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructF32;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F32
+typedef void (*UniffiForeignFutureCompleteF32)(uint64_t callback_data, UniffiForeignFutureStructF32 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteF32(
+				UniffiForeignFutureCompleteF32 cb, uint64_t callback_data, UniffiForeignFutureStructF32 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F64
+typedef struct UniffiForeignFutureStructF64 {
+    double returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructF64;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F64
+typedef void (*UniffiForeignFutureCompleteF64)(uint64_t callback_data, UniffiForeignFutureStructF64 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteF64(
+				UniffiForeignFutureCompleteF64 cb, uint64_t callback_data, UniffiForeignFutureStructF64 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_POINTER
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_POINTER
+typedef struct UniffiForeignFutureStructPointer {
+    void* returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructPointer;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_POINTER
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_POINTER
+typedef void (*UniffiForeignFutureCompletePointer)(uint64_t callback_data, UniffiForeignFutureStructPointer result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompletePointer(
+				UniffiForeignFutureCompletePointer cb, uint64_t callback_data, UniffiForeignFutureStructPointer result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_RUST_BUFFER
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_RUST_BUFFER
+typedef struct UniffiForeignFutureStructRustBuffer {
+    RustBuffer returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructRustBuffer;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_RUST_BUFFER
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_RUST_BUFFER
+typedef void (*UniffiForeignFutureCompleteRustBuffer)(uint64_t callback_data, UniffiForeignFutureStructRustBuffer result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteRustBuffer(
+				UniffiForeignFutureCompleteRustBuffer cb, uint64_t callback_data, UniffiForeignFutureStructRustBuffer result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_VOID
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_VOID
+typedef struct UniffiForeignFutureStructVoid {
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructVoid;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_VOID
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_VOID
+typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t callback_data, UniffiForeignFutureStructVoid result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteVoid(
+				UniffiForeignFutureCompleteVoid cb, uint64_t callback_data, UniffiForeignFutureStructVoid result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_COMBINE_SHARES_AND_MASK
+#define UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_COMBINE_SHARES_AND_MASK
+RustBuffer uniffi_rpm_fn_func_wrapped_rpm_combine_shares_and_mask(RustBuffer ms, RustBuffer rs, uint64_t size, uint64_t depth, uint64_t dealers, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_FINALIZE
+#define UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_FINALIZE
+RustBuffer uniffi_rpm_fn_func_wrapped_rpm_finalize(RustBuffer input, RustBuffer parties, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_GENERATE_INITIAL_SHARES
+#define UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_GENERATE_INITIAL_SHARES
+RustBuffer uniffi_rpm_fn_func_wrapped_rpm_generate_initial_shares(uint64_t size, uint64_t depth, uint64_t dealers, uint64_t players, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_PERMUTE
+#define UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_PERMUTE
+RustBuffer uniffi_rpm_fn_func_wrapped_rpm_permute(RustBuffer masked_input_shares, RustBuffer mb, RustBuffer rb, RustBuffer mrmb, uint64_t depth_index, RustBuffer parties, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_SKETCH_PROPOSE
+#define UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_SKETCH_PROPOSE
+RustBuffer uniffi_rpm_fn_func_wrapped_rpm_sketch_propose(RustBuffer m, RustBuffer r, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_SKETCH_VERIFY
+#define UNIFFI_FFIDEF_UNIFFI_RPM_FN_FUNC_WRAPPED_RPM_SKETCH_VERIFY
+int8_t uniffi_rpm_fn_func_wrapped_rpm_sketch_verify(RustBuffer mcs, RustBuffer rcs, uint64_t dealers, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUSTBUFFER_ALLOC
+#define UNIFFI_FFIDEF_FFI_RPM_RUSTBUFFER_ALLOC
+RustBuffer ffi_rpm_rustbuffer_alloc(uint64_t size, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUSTBUFFER_FROM_BYTES
+#define UNIFFI_FFIDEF_FFI_RPM_RUSTBUFFER_FROM_BYTES
+RustBuffer ffi_rpm_rustbuffer_from_bytes(ForeignBytes bytes, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUSTBUFFER_FREE
+#define UNIFFI_FFIDEF_FFI_RPM_RUSTBUFFER_FREE
+void ffi_rpm_rustbuffer_free(RustBuffer buf, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUSTBUFFER_RESERVE
+#define UNIFFI_FFIDEF_FFI_RPM_RUSTBUFFER_RESERVE
+RustBuffer ffi_rpm_rustbuffer_reserve(RustBuffer buf, uint64_t additional, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_U8
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_U8
+void ffi_rpm_rust_future_poll_u8(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_U8
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_U8
+void ffi_rpm_rust_future_cancel_u8(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_U8
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_U8
+void ffi_rpm_rust_future_free_u8(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_U8
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_U8
+uint8_t ffi_rpm_rust_future_complete_u8(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_I8
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_I8
+void ffi_rpm_rust_future_poll_i8(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_I8
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_I8
+void ffi_rpm_rust_future_cancel_i8(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_I8
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_I8
+void ffi_rpm_rust_future_free_i8(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_I8
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_I8
+int8_t ffi_rpm_rust_future_complete_i8(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_U16
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_U16
+void ffi_rpm_rust_future_poll_u16(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_U16
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_U16
+void ffi_rpm_rust_future_cancel_u16(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_U16
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_U16
+void ffi_rpm_rust_future_free_u16(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_U16
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_U16
+uint16_t ffi_rpm_rust_future_complete_u16(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_I16
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_I16
+void ffi_rpm_rust_future_poll_i16(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_I16
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_I16
+void ffi_rpm_rust_future_cancel_i16(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_I16
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_I16
+void ffi_rpm_rust_future_free_i16(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_I16
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_I16
+int16_t ffi_rpm_rust_future_complete_i16(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_U32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_U32
+void ffi_rpm_rust_future_poll_u32(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_U32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_U32
+void ffi_rpm_rust_future_cancel_u32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_U32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_U32
+void ffi_rpm_rust_future_free_u32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_U32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_U32
+uint32_t ffi_rpm_rust_future_complete_u32(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_I32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_I32
+void ffi_rpm_rust_future_poll_i32(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_I32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_I32
+void ffi_rpm_rust_future_cancel_i32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_I32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_I32
+void ffi_rpm_rust_future_free_i32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_I32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_I32
+int32_t ffi_rpm_rust_future_complete_i32(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_U64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_U64
+void ffi_rpm_rust_future_poll_u64(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_U64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_U64
+void ffi_rpm_rust_future_cancel_u64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_U64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_U64
+void ffi_rpm_rust_future_free_u64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_U64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_U64
+uint64_t ffi_rpm_rust_future_complete_u64(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_I64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_I64
+void ffi_rpm_rust_future_poll_i64(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_I64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_I64
+void ffi_rpm_rust_future_cancel_i64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_I64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_I64
+void ffi_rpm_rust_future_free_i64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_I64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_I64
+int64_t ffi_rpm_rust_future_complete_i64(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_F32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_F32
+void ffi_rpm_rust_future_poll_f32(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_F32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_F32
+void ffi_rpm_rust_future_cancel_f32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_F32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_F32
+void ffi_rpm_rust_future_free_f32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_F32
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_F32
+float ffi_rpm_rust_future_complete_f32(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_F64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_F64
+void ffi_rpm_rust_future_poll_f64(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_F64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_F64
+void ffi_rpm_rust_future_cancel_f64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_F64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_F64
+void ffi_rpm_rust_future_free_f64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_F64
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_F64
+double ffi_rpm_rust_future_complete_f64(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_POINTER
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_POINTER
+void ffi_rpm_rust_future_poll_pointer(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_POINTER
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_POINTER
+void ffi_rpm_rust_future_cancel_pointer(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_POINTER
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_POINTER
+void ffi_rpm_rust_future_free_pointer(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_POINTER
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_POINTER
+void* ffi_rpm_rust_future_complete_pointer(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_RUST_BUFFER
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_RUST_BUFFER
+void ffi_rpm_rust_future_poll_rust_buffer(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_RUST_BUFFER
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_RUST_BUFFER
+void ffi_rpm_rust_future_cancel_rust_buffer(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_RUST_BUFFER
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_RUST_BUFFER
+void ffi_rpm_rust_future_free_rust_buffer(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_RUST_BUFFER
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_RUST_BUFFER
+RustBuffer ffi_rpm_rust_future_complete_rust_buffer(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_VOID
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_POLL_VOID
+void ffi_rpm_rust_future_poll_void(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_VOID
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_CANCEL_VOID
+void ffi_rpm_rust_future_cancel_void(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_VOID
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_FREE_VOID
+void ffi_rpm_rust_future_free_void(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_VOID
+#define UNIFFI_FFIDEF_FFI_RPM_RUST_FUTURE_COMPLETE_VOID
+void ffi_rpm_rust_future_complete_void(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_COMBINE_SHARES_AND_MASK
+#define UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_COMBINE_SHARES_AND_MASK
+uint16_t uniffi_rpm_checksum_func_wrapped_rpm_combine_shares_and_mask(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_FINALIZE
+#define UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_FINALIZE
+uint16_t uniffi_rpm_checksum_func_wrapped_rpm_finalize(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_GENERATE_INITIAL_SHARES
+#define UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_GENERATE_INITIAL_SHARES
+uint16_t uniffi_rpm_checksum_func_wrapped_rpm_generate_initial_shares(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_PERMUTE
+#define UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_PERMUTE
+uint16_t uniffi_rpm_checksum_func_wrapped_rpm_permute(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_SKETCH_PROPOSE
+#define UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_SKETCH_PROPOSE
+uint16_t uniffi_rpm_checksum_func_wrapped_rpm_sketch_propose(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_SKETCH_VERIFY
+#define UNIFFI_FFIDEF_UNIFFI_RPM_CHECKSUM_FUNC_WRAPPED_RPM_SKETCH_VERIFY
+uint16_t uniffi_rpm_checksum_func_wrapped_rpm_sketch_verify(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_RPM_UNIFFI_CONTRACT_VERSION
+#define UNIFFI_FFIDEF_FFI_RPM_UNIFFI_CONTRACT_VERSION
+uint32_t ffi_rpm_uniffi_contract_version(void
+    
+);
+#endif
 

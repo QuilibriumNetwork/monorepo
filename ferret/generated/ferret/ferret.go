@@ -14,60 +14,67 @@ import (
 	"unsafe"
 )
 
-type RustBuffer = C.RustBuffer
+// This is needed, because as of go 1.24
+// type RustBuffer C.RustBuffer cannot have methods,
+// RustBuffer is treated as non-local type
+type GoRustBuffer struct {
+	inner C.RustBuffer
+}
 
 type RustBufferI interface {
 	AsReader() *bytes.Reader
 	Free()
 	ToGoBytes() []byte
 	Data() unsafe.Pointer
-	Len() int
-	Capacity() int
+	Len() uint64
+	Capacity() uint64
 }
 
-func RustBufferFromExternal(b RustBufferI) RustBuffer {
-	return RustBuffer{
-		capacity: C.int(b.Capacity()),
-		len:      C.int(b.Len()),
-		data:     (*C.uchar)(b.Data()),
+func RustBufferFromExternal(b RustBufferI) GoRustBuffer {
+	return GoRustBuffer{
+		inner: C.RustBuffer{
+			capacity: C.uint64_t(b.Capacity()),
+			len:      C.uint64_t(b.Len()),
+			data:     (*C.uchar)(b.Data()),
+		},
 	}
 }
 
-func (cb RustBuffer) Capacity() int {
-	return int(cb.capacity)
+func (cb GoRustBuffer) Capacity() uint64 {
+	return uint64(cb.inner.capacity)
 }
 
-func (cb RustBuffer) Len() int {
-	return int(cb.len)
+func (cb GoRustBuffer) Len() uint64 {
+	return uint64(cb.inner.len)
 }
 
-func (cb RustBuffer) Data() unsafe.Pointer {
-	return unsafe.Pointer(cb.data)
+func (cb GoRustBuffer) Data() unsafe.Pointer {
+	return unsafe.Pointer(cb.inner.data)
 }
 
-func (cb RustBuffer) AsReader() *bytes.Reader {
-	b := unsafe.Slice((*byte)(cb.data), C.int(cb.len))
+func (cb GoRustBuffer) AsReader() *bytes.Reader {
+	b := unsafe.Slice((*byte)(cb.inner.data), C.uint64_t(cb.inner.len))
 	return bytes.NewReader(b)
 }
 
-func (cb RustBuffer) Free() {
+func (cb GoRustBuffer) Free() {
 	rustCall(func(status *C.RustCallStatus) bool {
-		C.ffi_ferret_rustbuffer_free(cb, status)
+		C.ffi_ferret_rustbuffer_free(cb.inner, status)
 		return false
 	})
 }
 
-func (cb RustBuffer) ToGoBytes() []byte {
-	return C.GoBytes(unsafe.Pointer(cb.data), C.int(cb.len))
+func (cb GoRustBuffer) ToGoBytes() []byte {
+	return C.GoBytes(unsafe.Pointer(cb.inner.data), C.int(cb.inner.len))
 }
 
-func stringToRustBuffer(str string) RustBuffer {
+func stringToRustBuffer(str string) C.RustBuffer {
 	return bytesToRustBuffer([]byte(str))
 }
 
-func bytesToRustBuffer(b []byte) RustBuffer {
+func bytesToRustBuffer(b []byte) C.RustBuffer {
 	if len(b) == 0 {
-		return RustBuffer{}
+		return C.RustBuffer{}
 	}
 	// We can pass the pointer along here, as it is pinned
 	// for the duration of this call
@@ -76,7 +83,7 @@ func bytesToRustBuffer(b []byte) RustBuffer {
 		data: (*C.uchar)(unsafe.Pointer(&b[0])),
 	}
 
-	return rustCall(func(status *C.RustCallStatus) RustBuffer {
+	return rustCall(func(status *C.RustCallStatus) C.RustBuffer {
 		return C.ffi_ferret_rustbuffer_from_bytes(foreign, status)
 	})
 }
@@ -86,12 +93,7 @@ type BufLifter[GoType any] interface {
 }
 
 type BufLowerer[GoType any] interface {
-	Lower(value GoType) RustBuffer
-}
-
-type FfiConverter[GoType any, FfiType any] interface {
-	Lift(value FfiType) GoType
-	Lower(value GoType) FfiType
+	Lower(value GoType) C.RustBuffer
 }
 
 type BufReader[GoType any] interface {
@@ -102,12 +104,7 @@ type BufWriter[GoType any] interface {
 	Write(writer io.Writer, value GoType)
 }
 
-type FfiRustBufConverter[GoType any, FfiType any] interface {
-	FfiConverter[GoType, FfiType]
-	BufReader[GoType]
-}
-
-func LowerIntoRustBuffer[GoType any](bufWriter BufWriter[GoType], value GoType) RustBuffer {
+func LowerIntoRustBuffer[GoType any](bufWriter BufWriter[GoType], value GoType) C.RustBuffer {
 	// This might be not the most efficient way but it does not require knowing allocation size
 	// beforehand
 	var buffer bytes.Buffer
@@ -132,31 +129,30 @@ func LiftFromRustBuffer[GoType any](bufReader BufReader[GoType], rbuf RustBuffer
 	return item
 }
 
-func rustCallWithError[U any](converter BufLifter[error], callback func(*C.RustCallStatus) U) (U, error) {
+func rustCallWithError[E any, U any](converter BufReader[*E], callback func(*C.RustCallStatus) U) (U, *E) {
 	var status C.RustCallStatus
 	returnValue := callback(&status)
 	err := checkCallStatus(converter, status)
-
 	return returnValue, err
 }
 
-func checkCallStatus(converter BufLifter[error], status C.RustCallStatus) error {
+func checkCallStatus[E any](converter BufReader[*E], status C.RustCallStatus) *E {
 	switch status.code {
 	case 0:
 		return nil
 	case 1:
-		return converter.Lift(status.errorBuf)
+		return LiftFromRustBuffer(converter, GoRustBuffer{inner: status.errorBuf})
 	case 2:
-		// when the rust code sees a panic, it tries to construct a rustbuffer
+		// when the rust code sees a panic, it tries to construct a rustBuffer
 		// with the message.  but if that code panics, then it just sends back
 		// an empty buffer.
 		if status.errorBuf.len > 0 {
-			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(status.errorBuf)))
+			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(GoRustBuffer{inner: status.errorBuf})))
 		} else {
 			panic(fmt.Errorf("Rust panicked while handling Rust panic"))
 		}
 	default:
-		return fmt.Errorf("unknown status code: %d", status.code)
+		panic(fmt.Errorf("unknown status code: %d", status.code))
 	}
 }
 
@@ -167,11 +163,13 @@ func checkCallStatusUnknown(status C.RustCallStatus) error {
 	case 1:
 		panic(fmt.Errorf("function not returning an error returned an error"))
 	case 2:
-		// when the rust code sees a panic, it tries to construct a rustbuffer
+		// when the rust code sees a panic, it tries to construct a C.RustBuffer
 		// with the message.  but if that code panics, then it just sends back
 		// an empty buffer.
 		if status.errorBuf.len > 0 {
-			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(status.errorBuf)))
+			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(GoRustBuffer{
+				inner: status.errorBuf,
+			})))
 		} else {
 			panic(fmt.Errorf("Rust panicked while handling Rust panic"))
 		}
@@ -181,11 +179,15 @@ func checkCallStatusUnknown(status C.RustCallStatus) error {
 }
 
 func rustCall[U any](callback func(*C.RustCallStatus) U) U {
-	returnValue, err := rustCallWithError(nil, callback)
+	returnValue, err := rustCallWithError[error](nil, callback)
 	if err != nil {
 		panic(err)
 	}
 	return returnValue
+}
+
+type NativeError interface {
+	AsError() error
 }
 
 func writeInt8(writer io.Writer, value int8) {
@@ -335,45 +337,45 @@ func init() {
 
 func uniffiCheckChecksums() {
 	// Get the bindings contract version from our ComponentInterface
-	bindingsContractVersion := 24
+	bindingsContractVersion := 26
 	// Get the scaffolding contract version by calling the into the dylib
-	scaffoldingContractVersion := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint32_t {
-		return C.ffi_ferret_uniffi_contract_version(uniffiStatus)
+	scaffoldingContractVersion := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint32_t {
+		return C.ffi_ferret_uniffi_contract_version()
 	})
 	if bindingsContractVersion != int(scaffoldingContractVersion) {
 		// If this happens try cleaning and rebuilding your project
 		panic("ferret: UniFFI contract version mismatch")
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_ferret_checksum_func_create_ferret_cot_manager(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_func_create_ferret_cot_manager()
 		})
-		if checksum != 55889 {
+		if checksum != 49338 {
 			// If this happens try cleaning and rebuilding your project
 			panic("ferret: uniffi_ferret_checksum_func_create_ferret_cot_manager: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_ferret_checksum_func_create_netio_manager(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_func_create_netio_manager()
 		})
-		if checksum != 43279 {
+		if checksum != 37785 {
 			// If this happens try cleaning and rebuilding your project
 			panic("ferret: uniffi_ferret_checksum_func_create_netio_manager: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_ferret_checksum_method_ferretcotmanager_get_block_data(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotmanager_get_block_data()
 		})
-		if checksum != 48460 {
+		if checksum != 54850 {
 			// If this happens try cleaning and rebuilding your project
 			panic("ferret: uniffi_ferret_checksum_method_ferretcotmanager_get_block_data: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_ferret_checksum_method_ferretcotmanager_recv_cot(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotmanager_recv_cot()
 		})
 		if checksum != 47983 {
 			// If this happens try cleaning and rebuilding your project
@@ -381,8 +383,8 @@ func uniffiCheckChecksums() {
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_ferret_checksum_method_ferretcotmanager_recv_rot(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotmanager_recv_rot()
 		})
 		if checksum != 38722 {
 			// If this happens try cleaning and rebuilding your project
@@ -390,8 +392,8 @@ func uniffiCheckChecksums() {
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_ferret_checksum_method_ferretcotmanager_send_cot(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotmanager_send_cot()
 		})
 		if checksum != 25816 {
 			// If this happens try cleaning and rebuilding your project
@@ -399,8 +401,8 @@ func uniffiCheckChecksums() {
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_ferret_checksum_method_ferretcotmanager_send_rot(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotmanager_send_rot()
 		})
 		if checksum != 51835 {
 			// If this happens try cleaning and rebuilding your project
@@ -408,10 +410,10 @@ func uniffiCheckChecksums() {
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_ferret_checksum_method_ferretcotmanager_set_block_data(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotmanager_set_block_data()
 		})
-		if checksum != 15140 {
+		if checksum != 39823 {
 			// If this happens try cleaning and rebuilding your project
 			panic("ferret: uniffi_ferret_checksum_method_ferretcotmanager_set_block_data: UniFFI API checksum mismatch")
 		}
@@ -539,7 +541,7 @@ func (FfiConverterString) Read(reader io.Reader) string {
 	length := readInt32(reader)
 	buffer := make([]byte, length)
 	read_length, err := reader.Read(buffer)
-	if err != nil {
+	if err != nil && err != io.EOF {
 		panic(err)
 	}
 	if read_length != int(length) {
@@ -548,7 +550,7 @@ func (FfiConverterString) Read(reader io.Reader) string {
 	return string(buffer)
 }
 
-func (FfiConverterString) Lower(value string) RustBuffer {
+func (FfiConverterString) Lower(value string) C.RustBuffer {
 	return stringToRustBuffer(value)
 }
 
@@ -575,16 +577,22 @@ func (FfiDestroyerString) Destroy(_ string) {}
 // https://github.com/mozilla/uniffi-rs/blob/0dc031132d9493ca812c3af6e7dd60ad2ea95bf0/uniffi_bindgen/src/bindings/kotlin/templates/ObjectRuntime.kt#L31
 
 type FfiObject struct {
-	pointer      unsafe.Pointer
-	callCounter  atomic.Int64
-	freeFunction func(unsafe.Pointer, *C.RustCallStatus)
-	destroyed    atomic.Bool
+	pointer       unsafe.Pointer
+	callCounter   atomic.Int64
+	cloneFunction func(unsafe.Pointer, *C.RustCallStatus) unsafe.Pointer
+	freeFunction  func(unsafe.Pointer, *C.RustCallStatus)
+	destroyed     atomic.Bool
 }
 
-func newFfiObject(pointer unsafe.Pointer, freeFunction func(unsafe.Pointer, *C.RustCallStatus)) FfiObject {
+func newFfiObject(
+	pointer unsafe.Pointer,
+	cloneFunction func(unsafe.Pointer, *C.RustCallStatus) unsafe.Pointer,
+	freeFunction func(unsafe.Pointer, *C.RustCallStatus),
+) FfiObject {
 	return FfiObject{
-		pointer:      pointer,
-		freeFunction: freeFunction,
+		pointer:       pointer,
+		cloneFunction: cloneFunction,
+		freeFunction:  freeFunction,
 	}
 }
 
@@ -602,7 +610,9 @@ func (ffiObject *FfiObject) incrementPointer(debugName string) unsafe.Pointer {
 		}
 	}
 
-	return ffiObject.pointer
+	return rustCall(func(status *C.RustCallStatus) unsafe.Pointer {
+		return ffiObject.cloneFunction(ffiObject.pointer, status)
+	})
 }
 
 func (ffiObject *FfiObject) decrementPointer() {
@@ -626,6 +636,14 @@ func (ffiObject *FfiObject) freeRustArcPtr() {
 	})
 }
 
+type FerretCotManagerInterface interface {
+	GetBlockData(blockChoice uint8, index uint64) []uint8
+	RecvCot()
+	RecvRot()
+	SendCot()
+	SendRot()
+	SetBlockData(blockChoice uint8, index uint64, data []uint8)
+}
 type FerretCotManager struct {
 	ffiObject FfiObject
 }
@@ -634,8 +652,10 @@ func (_self *FerretCotManager) GetBlockData(blockChoice uint8, index uint64) []u
 	_pointer := _self.ffiObject.incrementPointer("*FerretCotManager")
 	defer _self.ffiObject.decrementPointer()
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_ferret_fn_method_ferretcotmanager_get_block_data(
-			_pointer, FfiConverterUint8INSTANCE.Lower(blockChoice), FfiConverterUint64INSTANCE.Lower(index), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_ferret_fn_method_ferretcotmanager_get_block_data(
+				_pointer, FfiConverterUint8INSTANCE.Lower(blockChoice), FfiConverterUint64INSTANCE.Lower(index), _uniffiStatus),
+		}
 	}))
 }
 
@@ -688,42 +708,46 @@ func (_self *FerretCotManager) SetBlockData(blockChoice uint8, index uint64, dat
 		return false
 	})
 }
-
 func (object *FerretCotManager) Destroy() {
 	runtime.SetFinalizer(object, nil)
 	object.ffiObject.destroy()
 }
 
-type FfiConverterFerretCOTManager struct{}
+type FfiConverterFerretCotManager struct{}
 
-var FfiConverterFerretCOTManagerINSTANCE = FfiConverterFerretCOTManager{}
+var FfiConverterFerretCotManagerINSTANCE = FfiConverterFerretCotManager{}
 
-func (c FfiConverterFerretCOTManager) Lift(pointer unsafe.Pointer) *FerretCotManager {
+func (c FfiConverterFerretCotManager) Lift(pointer unsafe.Pointer) *FerretCotManager {
 	result := &FerretCotManager{
 		newFfiObject(
 			pointer,
+			func(pointer unsafe.Pointer, status *C.RustCallStatus) unsafe.Pointer {
+				return C.uniffi_ferret_fn_clone_ferretcotmanager(pointer, status)
+			},
 			func(pointer unsafe.Pointer, status *C.RustCallStatus) {
 				C.uniffi_ferret_fn_free_ferretcotmanager(pointer, status)
-			}),
+			},
+		),
 	}
 	runtime.SetFinalizer(result, (*FerretCotManager).Destroy)
 	return result
 }
 
-func (c FfiConverterFerretCOTManager) Read(reader io.Reader) *FerretCotManager {
+func (c FfiConverterFerretCotManager) Read(reader io.Reader) *FerretCotManager {
 	return c.Lift(unsafe.Pointer(uintptr(readUint64(reader))))
 }
 
-func (c FfiConverterFerretCOTManager) Lower(value *FerretCotManager) unsafe.Pointer {
+func (c FfiConverterFerretCotManager) Lower(value *FerretCotManager) unsafe.Pointer {
 	// TODO: this is bad - all synchronization from ObjectRuntime.go is discarded here,
 	// because the pointer will be decremented immediately after this function returns,
 	// and someone will be left holding onto a non-locked pointer.
 	pointer := value.ffiObject.incrementPointer("*FerretCotManager")
 	defer value.ffiObject.decrementPointer()
 	return pointer
+
 }
 
-func (c FfiConverterFerretCOTManager) Write(writer io.Writer, value *FerretCotManager) {
+func (c FfiConverterFerretCotManager) Write(writer io.Writer, value *FerretCotManager) {
 	writeUint64(writer, uint64(uintptr(c.Lower(value))))
 }
 
@@ -733,6 +757,8 @@ func (_ FfiDestroyerFerretCotManager) Destroy(value *FerretCotManager) {
 	value.Destroy()
 }
 
+type NetIoManagerInterface interface {
+}
 type NetIoManager struct {
 	ffiObject FfiObject
 }
@@ -742,36 +768,41 @@ func (object *NetIoManager) Destroy() {
 	object.ffiObject.destroy()
 }
 
-type FfiConverterNetIOManager struct{}
+type FfiConverterNetIoManager struct{}
 
-var FfiConverterNetIOManagerINSTANCE = FfiConverterNetIOManager{}
+var FfiConverterNetIoManagerINSTANCE = FfiConverterNetIoManager{}
 
-func (c FfiConverterNetIOManager) Lift(pointer unsafe.Pointer) *NetIoManager {
+func (c FfiConverterNetIoManager) Lift(pointer unsafe.Pointer) *NetIoManager {
 	result := &NetIoManager{
 		newFfiObject(
 			pointer,
+			func(pointer unsafe.Pointer, status *C.RustCallStatus) unsafe.Pointer {
+				return C.uniffi_ferret_fn_clone_netiomanager(pointer, status)
+			},
 			func(pointer unsafe.Pointer, status *C.RustCallStatus) {
 				C.uniffi_ferret_fn_free_netiomanager(pointer, status)
-			}),
+			},
+		),
 	}
 	runtime.SetFinalizer(result, (*NetIoManager).Destroy)
 	return result
 }
 
-func (c FfiConverterNetIOManager) Read(reader io.Reader) *NetIoManager {
+func (c FfiConverterNetIoManager) Read(reader io.Reader) *NetIoManager {
 	return c.Lift(unsafe.Pointer(uintptr(readUint64(reader))))
 }
 
-func (c FfiConverterNetIOManager) Lower(value *NetIoManager) unsafe.Pointer {
+func (c FfiConverterNetIoManager) Lower(value *NetIoManager) unsafe.Pointer {
 	// TODO: this is bad - all synchronization from ObjectRuntime.go is discarded here,
 	// because the pointer will be decremented immediately after this function returns,
 	// and someone will be left holding onto a non-locked pointer.
 	pointer := value.ffiObject.incrementPointer("*NetIoManager")
 	defer value.ffiObject.decrementPointer()
 	return pointer
+
 }
 
-func (c FfiConverterNetIOManager) Write(writer io.Writer, value *NetIoManager) {
+func (c FfiConverterNetIoManager) Write(writer io.Writer, value *NetIoManager) {
 	writeUint64(writer, uint64(uintptr(c.Lower(value))))
 }
 
@@ -797,7 +828,7 @@ func (_ FfiConverterOptionalString) Read(reader io.Reader) *string {
 	return &temp
 }
 
-func (c FfiConverterOptionalString) Lower(value *string) RustBuffer {
+func (c FfiConverterOptionalString) Lower(value *string) C.RustBuffer {
 	return LowerIntoRustBuffer[*string](c, value)
 }
 
@@ -838,7 +869,7 @@ func (c FfiConverterSequenceUint8) Read(reader io.Reader) []uint8 {
 	return result
 }
 
-func (c FfiConverterSequenceUint8) Lower(value []uint8) RustBuffer {
+func (c FfiConverterSequenceUint8) Lower(value []uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[]uint8](c, value)
 }
 
@@ -881,7 +912,7 @@ func (c FfiConverterSequenceBool) Read(reader io.Reader) []bool {
 	return result
 }
 
-func (c FfiConverterSequenceBool) Lower(value []bool) RustBuffer {
+func (c FfiConverterSequenceBool) Lower(value []bool) C.RustBuffer {
 	return LowerIntoRustBuffer[[]bool](c, value)
 }
 
@@ -905,13 +936,13 @@ func (FfiDestroyerSequenceBool) Destroy(sequence []bool) {
 }
 
 func CreateFerretCotManager(party int32, threads int32, length uint64, choices []bool, netio *NetIoManager, malicious bool) *FerretCotManager {
-	return FfiConverterFerretCOTManagerINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) unsafe.Pointer {
-		return C.uniffi_ferret_fn_func_create_ferret_cot_manager(FfiConverterInt32INSTANCE.Lower(party), FfiConverterInt32INSTANCE.Lower(threads), FfiConverterUint64INSTANCE.Lower(length), FfiConverterSequenceBoolINSTANCE.Lower(choices), FfiConverterNetIOManagerINSTANCE.Lower(netio), FfiConverterBoolINSTANCE.Lower(malicious), _uniffiStatus)
+	return FfiConverterFerretCotManagerINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) unsafe.Pointer {
+		return C.uniffi_ferret_fn_func_create_ferret_cot_manager(FfiConverterInt32INSTANCE.Lower(party), FfiConverterInt32INSTANCE.Lower(threads), FfiConverterUint64INSTANCE.Lower(length), FfiConverterSequenceBoolINSTANCE.Lower(choices), FfiConverterNetIoManagerINSTANCE.Lower(netio), FfiConverterBoolINSTANCE.Lower(malicious), _uniffiStatus)
 	}))
 }
 
 func CreateNetioManager(party int32, address *string, port int32) *NetIoManager {
-	return FfiConverterNetIOManagerINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) unsafe.Pointer {
+	return FfiConverterNetIoManagerINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) unsafe.Pointer {
 		return C.uniffi_ferret_fn_func_create_netio_manager(FfiConverterInt32INSTANCE.Lower(party), FfiConverterOptionalStringINSTANCE.Lower(address), FfiConverterInt32INSTANCE.Lower(port), _uniffiStatus)
 	}))
 }

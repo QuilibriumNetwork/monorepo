@@ -26,6 +26,9 @@ const FRAME_2_1_CUTOVER = 244200
 const FRAME_2_1_EXTENDED_ENROLL_END = 252840
 const FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END = FRAME_2_1_EXTENDED_ENROLL_END + 360
 
+// used to skip frame-based checks, for tests
+var BEHAVIOR_PASS = false
+
 // using ed448 derivation process of seed = [57]byte{0x00..}
 var publicReadKey, _ = hex.DecodeString("2cf07ca8d9ab1a4bb0902e25a9b90759dd54d881f54d52a76a17e79bf0361c325650f12746e4337ffb5940e7665ad7bf83f44af98d964bbe")
 
@@ -87,7 +90,7 @@ func (i *TransactionInput) Prove(tx *Transaction, index int) ([]byte, error) {
 	var blind []byte
 
 	if bytes.Equal(i.address[:32], QUIL_TOKEN_ADDRESS) &&
-		frameNumber <= FRAME_2_1_CUTOVER {
+		frameNumber <= FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END && !BEHAVIOR_PASS {
 		return nil, errors.Wrap(errors.New("invalid action"), "prove input")
 	}
 
@@ -133,7 +136,13 @@ func (i *TransactionInput) Prove(tx *Transaction, index int) ([]byte, error) {
 	if tx.config.Behavior&Acceptable != 0 {
 		if !bytes.Equal(pendingTypeBytes, checkType) {
 			return nil, errors.Wrap(
-				errors.New("invalid type for address"),
+				errors.New(
+					fmt.Sprintf(
+						"invalid type for address: %x, expected %x",
+						checkType,
+						pendingTypeBytes,
+					),
+				),
 				"prove input",
 			)
 		}
@@ -884,10 +893,7 @@ func (o *TransactionOutput) Verify(
 	frameNumber uint64,
 	config *TokenIntrinsicConfiguration,
 ) (bool, error) {
-	if !bytes.Equal(
-		binary.BigEndian.AppendUint64(nil, frameNumber),
-		o.FrameNumber,
-	) {
+	if frameNumber <= binary.BigEndian.Uint64(o.FrameNumber) {
 		return false, errors.Wrap(
 			errors.New("invalid frame number"),
 			"verify output",
@@ -1235,7 +1241,8 @@ func (tx *Transaction) Prove(frameNumber uint64) error {
 		return err
 	}
 
-	if len(res.Commitment) != len(tx.Outputs)*56 {
+	if len(res.Commitment) != len(tx.Outputs)*56 ||
+		len(res.Blinding) != len(tx.Outputs)*56 {
 		return errors.Wrap(errors.New("invalid range proof"), "prove")
 	}
 
@@ -1553,10 +1560,19 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 		commitments = append(commitments, tx.Outputs[i].Commitment)
 	}
 
+	roots, err := tx.hypergraph.GetShardCommits(
+		binary.BigEndian.Uint64(tx.Outputs[0].FrameNumber),
+		tx.Domain[:],
+	)
+	if err != nil {
+		return false, errors.Wrap(err, "verify")
+	}
+
 	valid, err := tx.hypergraph.VerifyTraversalProof(
 		tx.Domain,
 		hypergraph.VertexAtomType,
 		hypergraph.AddsPhaseType,
+		roots[0],
 		tx.TraversalProof,
 	)
 	if err != nil || !valid {

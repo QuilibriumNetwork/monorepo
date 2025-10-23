@@ -80,6 +80,7 @@ func (e *AppConsensusEngine) subscribeToProverMessages() error {
 			case <-e.haltCtx.Done():
 				return nil
 			case e.proverMessageQueue <- message:
+				e.logger.Debug("got prover message")
 				return nil
 			case <-e.ctx.Done():
 				return errors.New("context cancelled")

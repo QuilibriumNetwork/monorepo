@@ -15,6 +15,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
@@ -37,6 +38,9 @@ type GlobalExecutionEngine struct {
 	verEnc            crypto.VerifiableEncryptor
 	decafConstructor  crypto.DecafConstructor
 	frameProver       crypto.FrameProver
+	rewardIssuance    consensus.RewardIssuance
+	proverRegistry    consensus.ProverRegistry
+	blsConstructor    crypto.BlsConstructor
 
 	// State
 	intrinsics      map[string]intrinsics.Intrinsic
@@ -57,6 +61,9 @@ func NewGlobalExecutionEngine(
 	verEnc crypto.VerifiableEncryptor,
 	decafConstructor crypto.DecafConstructor,
 	frameProver crypto.FrameProver,
+	rewardIssuance consensus.RewardIssuance,
+	proverRegistry consensus.ProverRegistry,
+	blsConstructor crypto.BlsConstructor,
 ) (*GlobalExecutionEngine, error) {
 	return &GlobalExecutionEngine{
 		logger:            logger,
@@ -70,6 +77,9 @@ func NewGlobalExecutionEngine(
 		verEnc:            verEnc,
 		decafConstructor:  decafConstructor,
 		frameProver:       frameProver,
+		rewardIssuance:    rewardIssuance,
+		proverRegistry:    proverRegistry,
+		blsConstructor:    blsConstructor,
 		intrinsics:        make(map[string]intrinsics.Intrinsic),
 	}, nil
 }
@@ -119,13 +129,8 @@ func (e *GlobalExecutionEngine) Start() <-chan error {
 	go func() {
 		e.logger.Info("starting global execution engine")
 
-		for {
-			select {
-			case <-e.stopChan:
-				e.logger.Info("stopping global execution engine")
-				return
-			}
-		}
+		<-e.stopChan
+		e.logger.Info("stopping global execution engine")
 	}()
 
 	return errChan
@@ -226,7 +231,8 @@ func (e *GlobalExecutionEngine) validateBundle(
 			op.GetConfirm() != nil ||
 			op.GetReject() != nil ||
 			op.GetKick() != nil ||
-			op.GetUpdate() != nil
+			op.GetUpdate() != nil ||
+			op.GetShard() != nil
 
 		if !isGlobalOp {
 			if e.config.Network == 0 &&
@@ -272,7 +278,7 @@ func (e *GlobalExecutionEngine) validateIndividualMessage(
 	frameNumber uint64,
 	address []byte,
 	message *protobufs.MessageRequest,
-	fromBundle bool,
+	_ bool,
 ) error {
 	// Try to get or load the global intrinsic
 	intrinsic, err := e.tryGetIntrinsic(address)
@@ -427,7 +433,7 @@ func (e *GlobalExecutionEngine) processIndividualMessage(
 	}
 
 	// Process the operation
-	newState, err := intrinsic.InvokeStep(
+	_, err = intrinsic.InvokeStep(
 		frameNumber,
 		payload,
 		big.NewInt(0),
@@ -438,7 +444,7 @@ func (e *GlobalExecutionEngine) processIndividualMessage(
 		return nil, errors.Wrap(err, "process individual message")
 	}
 
-	newState, err = intrinsic.Commit()
+	newState, err := intrinsic.Commit()
 	if err != nil {
 		return nil, errors.Wrap(err, "process individual message")
 	}
@@ -446,7 +452,6 @@ func (e *GlobalExecutionEngine) processIndividualMessage(
 	e.logger.Debug(
 		"processed individual message",
 		zap.String("address", hex.EncodeToString(address)),
-		zap.Any("state", newState),
 	)
 
 	return &execution.ProcessMessageResult{
@@ -550,6 +555,9 @@ func (e *GlobalExecutionEngine) tryGetIntrinsic(address []byte) (
 			e.keyManager,
 			e.frameProver,
 			e.clockStore,
+			e.rewardIssuance,
+			e.proverRegistry,
+			e.blsConstructor,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "try get intrinsic")
@@ -572,6 +580,8 @@ func (e *GlobalExecutionEngine) tryExtractMessageForIntrinsic(
 	switch r := message.Request.(type) {
 	case *protobufs.MessageRequest_Update:
 		payload, err = r.Update.ToCanonicalBytes()
+	case *protobufs.MessageRequest_Shard:
+		payload, err = r.Shard.ToCanonicalBytes()
 	case *protobufs.MessageRequest_Join:
 		for _, f := range r.Join.Filters {
 			if len(f) >= 32 {

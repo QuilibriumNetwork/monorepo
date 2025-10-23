@@ -14,7 +14,7 @@ import (
 )
 
 func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -163,7 +163,7 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 }
 
 func (e *GlobalConsensusEngine) validateShardConsensusMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -199,7 +199,7 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 		}
 
 		if frametime.AppFrameSince(frame) > 20*time.Second {
-			shardProposalValidationTotal.WithLabelValues("reject").Inc()
+			shardProposalValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
 
@@ -238,8 +238,9 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 		}
 
 		now := time.Now().UnixMilli()
-		if livenessCheck.Timestamp > now+5000 ||
-			livenessCheck.Timestamp < now-5000 {
+		if livenessCheck.Timestamp > now+500 ||
+			livenessCheck.Timestamp < now-1000 {
+			shardLivenessCheckValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
 
@@ -266,6 +267,7 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 
 		now := time.Now().UnixMilli()
 		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
+			shardVoteValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
 
@@ -292,6 +294,7 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 
 		now := time.Now().UnixMilli()
 		if confirmation.Timestamp > now+5000 || confirmation.Timestamp < now-5000 {
+			shardConfirmationValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
 
@@ -365,7 +368,7 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 }
 
 func (e *GlobalConsensusEngine) validateAppFrameMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -382,9 +385,15 @@ func (e *GlobalConsensusEngine) validateAppFrameMessage(
 
 	switch typePrefix {
 	case protobufs.AppShardFrameType:
+		start := time.Now()
+		defer func() {
+			shardFrameValidationDuration.Observe(time.Since(start).Seconds())
+		}()
+
 		frame := &protobufs.AppShardFrame{}
 		if err := frame.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
+			shardFrameValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
@@ -392,23 +401,29 @@ func (e *GlobalConsensusEngine) validateAppFrameMessage(
 			frame.Header.PublicKeySignatureBls48581.PublicKey == nil ||
 			frame.Header.PublicKeySignatureBls48581.PublicKey.KeyValue == nil {
 			e.logger.Debug("frame validation missing signature")
+			shardFrameValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
 		valid, err := e.appFrameValidator.Validate(frame)
 		if err != nil {
 			e.logger.Debug("frame validation error", zap.Error(err))
+			shardFrameValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
 		if !valid {
 			e.logger.Debug("invalid frame")
+			shardFrameValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
 		if frametime.AppFrameSince(frame) > 20*time.Second {
+			shardFrameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
+
+		shardFrameValidationTotal.WithLabelValues("accept").Inc()
 
 	default:
 		return tp2p.ValidationResultReject
@@ -418,7 +433,7 @@ func (e *GlobalConsensusEngine) validateAppFrameMessage(
 }
 
 func (e *GlobalConsensusEngine) validateFrameMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -469,6 +484,7 @@ func (e *GlobalConsensusEngine) validateFrameMessage(
 		}
 
 		if frametime.GlobalFrameSince(frame) > 20*time.Second {
+			frameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
 
@@ -482,7 +498,7 @@ func (e *GlobalConsensusEngine) validateFrameMessage(
 }
 
 func (e *GlobalConsensusEngine) validatePeerInfoMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -511,28 +527,45 @@ func (e *GlobalConsensusEngine) validatePeerInfoMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		// Validate timestamp: reject if older than 1 minute or newer than 5 minutes
-		// from now
 		now := time.Now().UnixMilli()
-		oneMinuteAgo := now - (1 * 60 * 1000)     // 1 minute ago
-		fiveMinutesLater := now + (5 * 60 * 1000) // 5 minutes from now
 
-		if peerInfo.Timestamp < oneMinuteAgo {
+		if peerInfo.Timestamp < now-1000 {
 			e.logger.Debug("peer info timestamp too old",
 				zap.Int64("peer_timestamp", peerInfo.Timestamp),
-				zap.Int64("cutoff", oneMinuteAgo),
 			)
 			return tp2p.ValidationResultIgnore
 		}
 
-		if peerInfo.Timestamp > fiveMinutesLater {
+		if peerInfo.Timestamp > now+5000 {
 			e.logger.Debug("peer info timestamp too far in future",
 				zap.Int64("peer_timestamp", peerInfo.Timestamp),
-				zap.Int64("cutoff", fiveMinutesLater),
 			)
 			return tp2p.ValidationResultIgnore
 		}
+	case protobufs.KeyRegistryType:
+		keyRegistry := &protobufs.KeyRegistry{}
+		if err := keyRegistry.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal key registry", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
 
+		err := keyRegistry.Validate()
+		if err != nil {
+			e.logger.Debug("key registry validation error", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+		now := time.Now().UnixMilli()
+
+		if int64(keyRegistry.LastUpdated) < now-1000 {
+			e.logger.Debug("key registry timestamp too old")
+			return tp2p.ValidationResultIgnore
+		}
+
+		if int64(keyRegistry.LastUpdated) > now+5000 {
+			e.logger.Debug("key registry timestamp too far in future")
+			return tp2p.ValidationResultIgnore
+		}
 	default:
 		e.logger.Debug("received unknown type", zap.Uint32("type", typePrefix))
 		return tp2p.ValidationResultIgnore
@@ -542,7 +575,7 @@ func (e *GlobalConsensusEngine) validatePeerInfoMessage(
 }
 
 func (e *GlobalConsensusEngine) validateAlertMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix

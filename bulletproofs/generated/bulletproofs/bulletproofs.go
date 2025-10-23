@@ -12,60 +12,67 @@ import (
 	"unsafe"
 )
 
-type RustBuffer = C.RustBuffer
+// This is needed, because as of go 1.24
+// type RustBuffer C.RustBuffer cannot have methods,
+// RustBuffer is treated as non-local type
+type GoRustBuffer struct {
+	inner C.RustBuffer
+}
 
 type RustBufferI interface {
 	AsReader() *bytes.Reader
 	Free()
 	ToGoBytes() []byte
 	Data() unsafe.Pointer
-	Len() int
-	Capacity() int
+	Len() uint64
+	Capacity() uint64
 }
 
-func RustBufferFromExternal(b RustBufferI) RustBuffer {
-	return RustBuffer{
-		capacity: C.int(b.Capacity()),
-		len:      C.int(b.Len()),
-		data:     (*C.uchar)(b.Data()),
+func RustBufferFromExternal(b RustBufferI) GoRustBuffer {
+	return GoRustBuffer{
+		inner: C.RustBuffer{
+			capacity: C.uint64_t(b.Capacity()),
+			len:      C.uint64_t(b.Len()),
+			data:     (*C.uchar)(b.Data()),
+		},
 	}
 }
 
-func (cb RustBuffer) Capacity() int {
-	return int(cb.capacity)
+func (cb GoRustBuffer) Capacity() uint64 {
+	return uint64(cb.inner.capacity)
 }
 
-func (cb RustBuffer) Len() int {
-	return int(cb.len)
+func (cb GoRustBuffer) Len() uint64 {
+	return uint64(cb.inner.len)
 }
 
-func (cb RustBuffer) Data() unsafe.Pointer {
-	return unsafe.Pointer(cb.data)
+func (cb GoRustBuffer) Data() unsafe.Pointer {
+	return unsafe.Pointer(cb.inner.data)
 }
 
-func (cb RustBuffer) AsReader() *bytes.Reader {
-	b := unsafe.Slice((*byte)(cb.data), C.int(cb.len))
+func (cb GoRustBuffer) AsReader() *bytes.Reader {
+	b := unsafe.Slice((*byte)(cb.inner.data), C.uint64_t(cb.inner.len))
 	return bytes.NewReader(b)
 }
 
-func (cb RustBuffer) Free() {
+func (cb GoRustBuffer) Free() {
 	rustCall(func(status *C.RustCallStatus) bool {
-		C.ffi_bulletproofs_rustbuffer_free(cb, status)
+		C.ffi_bulletproofs_rustbuffer_free(cb.inner, status)
 		return false
 	})
 }
 
-func (cb RustBuffer) ToGoBytes() []byte {
-	return C.GoBytes(unsafe.Pointer(cb.data), C.int(cb.len))
+func (cb GoRustBuffer) ToGoBytes() []byte {
+	return C.GoBytes(unsafe.Pointer(cb.inner.data), C.int(cb.inner.len))
 }
 
-func stringToRustBuffer(str string) RustBuffer {
+func stringToRustBuffer(str string) C.RustBuffer {
 	return bytesToRustBuffer([]byte(str))
 }
 
-func bytesToRustBuffer(b []byte) RustBuffer {
+func bytesToRustBuffer(b []byte) C.RustBuffer {
 	if len(b) == 0 {
-		return RustBuffer{}
+		return C.RustBuffer{}
 	}
 	// We can pass the pointer along here, as it is pinned
 	// for the duration of this call
@@ -74,7 +81,7 @@ func bytesToRustBuffer(b []byte) RustBuffer {
 		data: (*C.uchar)(unsafe.Pointer(&b[0])),
 	}
 
-	return rustCall(func(status *C.RustCallStatus) RustBuffer {
+	return rustCall(func(status *C.RustCallStatus) C.RustBuffer {
 		return C.ffi_bulletproofs_rustbuffer_from_bytes(foreign, status)
 	})
 }
@@ -84,12 +91,7 @@ type BufLifter[GoType any] interface {
 }
 
 type BufLowerer[GoType any] interface {
-	Lower(value GoType) RustBuffer
-}
-
-type FfiConverter[GoType any, FfiType any] interface {
-	Lift(value FfiType) GoType
-	Lower(value GoType) FfiType
+	Lower(value GoType) C.RustBuffer
 }
 
 type BufReader[GoType any] interface {
@@ -100,12 +102,7 @@ type BufWriter[GoType any] interface {
 	Write(writer io.Writer, value GoType)
 }
 
-type FfiRustBufConverter[GoType any, FfiType any] interface {
-	FfiConverter[GoType, FfiType]
-	BufReader[GoType]
-}
-
-func LowerIntoRustBuffer[GoType any](bufWriter BufWriter[GoType], value GoType) RustBuffer {
+func LowerIntoRustBuffer[GoType any](bufWriter BufWriter[GoType], value GoType) C.RustBuffer {
 	// This might be not the most efficient way but it does not require knowing allocation size
 	// beforehand
 	var buffer bytes.Buffer
@@ -130,31 +127,30 @@ func LiftFromRustBuffer[GoType any](bufReader BufReader[GoType], rbuf RustBuffer
 	return item
 }
 
-func rustCallWithError[U any](converter BufLifter[error], callback func(*C.RustCallStatus) U) (U, error) {
+func rustCallWithError[E any, U any](converter BufReader[*E], callback func(*C.RustCallStatus) U) (U, *E) {
 	var status C.RustCallStatus
 	returnValue := callback(&status)
 	err := checkCallStatus(converter, status)
-
 	return returnValue, err
 }
 
-func checkCallStatus(converter BufLifter[error], status C.RustCallStatus) error {
+func checkCallStatus[E any](converter BufReader[*E], status C.RustCallStatus) *E {
 	switch status.code {
 	case 0:
 		return nil
 	case 1:
-		return converter.Lift(status.errorBuf)
+		return LiftFromRustBuffer(converter, GoRustBuffer{inner: status.errorBuf})
 	case 2:
-		// when the rust code sees a panic, it tries to construct a rustbuffer
+		// when the rust code sees a panic, it tries to construct a rustBuffer
 		// with the message.  but if that code panics, then it just sends back
 		// an empty buffer.
 		if status.errorBuf.len > 0 {
-			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(status.errorBuf)))
+			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(GoRustBuffer{inner: status.errorBuf})))
 		} else {
 			panic(fmt.Errorf("Rust panicked while handling Rust panic"))
 		}
 	default:
-		return fmt.Errorf("unknown status code: %d", status.code)
+		panic(fmt.Errorf("unknown status code: %d", status.code))
 	}
 }
 
@@ -165,11 +161,13 @@ func checkCallStatusUnknown(status C.RustCallStatus) error {
 	case 1:
 		panic(fmt.Errorf("function not returning an error returned an error"))
 	case 2:
-		// when the rust code sees a panic, it tries to construct a rustbuffer
+		// when the rust code sees a panic, it tries to construct a C.RustBuffer
 		// with the message.  but if that code panics, then it just sends back
 		// an empty buffer.
 		if status.errorBuf.len > 0 {
-			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(status.errorBuf)))
+			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(GoRustBuffer{
+				inner: status.errorBuf,
+			})))
 		} else {
 			panic(fmt.Errorf("Rust panicked while handling Rust panic"))
 		}
@@ -179,11 +177,15 @@ func checkCallStatusUnknown(status C.RustCallStatus) error {
 }
 
 func rustCall[U any](callback func(*C.RustCallStatus) U) U {
-	returnValue, err := rustCallWithError(nil, callback)
+	returnValue, err := rustCallWithError[error](nil, callback)
 	if err != nil {
 		panic(err)
 	}
 	return returnValue
+}
+
+type NativeError interface {
+	AsError() error
 }
 
 func writeInt8(writer io.Writer, value int8) {
@@ -333,191 +335,191 @@ func init() {
 
 func uniffiCheckChecksums() {
 	// Get the bindings contract version from our ComponentInterface
-	bindingsContractVersion := 24
+	bindingsContractVersion := 26
 	// Get the scaffolding contract version by calling the into the dylib
-	scaffoldingContractVersion := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint32_t {
-		return C.ffi_bulletproofs_uniffi_contract_version(uniffiStatus)
+	scaffoldingContractVersion := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint32_t {
+		return C.ffi_bulletproofs_uniffi_contract_version()
 	})
 	if bindingsContractVersion != int(scaffoldingContractVersion) {
 		// If this happens try cleaning and rebuilding your project
 		panic("bulletproofs: UniFFI contract version mismatch")
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_alt_generator(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_alt_generator()
 		})
-		if checksum != 26422 {
+		if checksum != 26339 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_alt_generator: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_generate_input_commitments(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_generate_input_commitments()
 		})
-		if checksum != 65001 {
+		if checksum != 19822 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_generate_input_commitments: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_generate_range_proof(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_generate_range_proof()
 		})
-		if checksum != 40322 {
+		if checksum != 985 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_generate_range_proof: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_hash_to_scalar(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_hash_to_scalar()
 		})
-		if checksum != 19176 {
+		if checksum != 13632 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_hash_to_scalar: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_keygen(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_keygen()
 		})
-		if checksum != 46171 {
+		if checksum != 9609 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_keygen: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_point_addition(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_point_addition()
 		})
-		if checksum != 6828 {
+		if checksum != 32221 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_point_addition: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_point_subtraction(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_point_subtraction()
 		})
-		if checksum != 48479 {
+		if checksum != 38806 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_point_subtraction: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_scalar_addition(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_scalar_addition()
 		})
-		if checksum != 29576 {
+		if checksum != 60180 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_scalar_addition: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_scalar_inverse(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_scalar_inverse()
 		})
-		if checksum != 11499 {
+		if checksum != 37774 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_scalar_inverse: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_scalar_mult(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_scalar_mult()
 		})
-		if checksum != 6075 {
+		if checksum != 45102 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_scalar_mult: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_scalar_mult_hash_to_scalar(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_scalar_mult_hash_to_scalar()
 		})
-		if checksum != 53652 {
+		if checksum != 53592 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_scalar_mult_hash_to_scalar: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_scalar_mult_point(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_scalar_mult_point()
 		})
-		if checksum != 46237 {
+		if checksum != 61743 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_scalar_mult_point: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_scalar_subtraction(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_scalar_subtraction()
 		})
-		if checksum != 13728 {
+		if checksum != 7250 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_scalar_subtraction: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_scalar_to_point(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_scalar_to_point()
 		})
-		if checksum != 61077 {
+		if checksum != 51818 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_scalar_to_point: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_sign_hidden(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_sign_hidden()
 		})
-		if checksum != 57560 {
+		if checksum != 32104 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_sign_hidden: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_sign_simple(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_sign_simple()
 		})
-		if checksum != 5535 {
+		if checksum != 35259 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_sign_simple: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_sum_check(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_sum_check()
 		})
-		if checksum != 18164 {
+		if checksum != 47141 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_sum_check: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_verify_hidden(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_verify_hidden()
 		})
-		if checksum != 55266 {
+		if checksum != 64726 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_verify_hidden: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_verify_range_proof(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_verify_range_proof()
 		})
-		if checksum != 37611 {
+		if checksum != 62924 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_verify_range_proof: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_bulletproofs_checksum_func_verify_simple(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bulletproofs_checksum_func_verify_simple()
 		})
-		if checksum != 32821 {
+		if checksum != 27860 {
 			// If this happens try cleaning and rebuilding your project
 			panic("bulletproofs: uniffi_bulletproofs_checksum_func_verify_simple: UniFFI API checksum mismatch")
 		}
@@ -621,7 +623,7 @@ func (FfiConverterString) Read(reader io.Reader) string {
 	length := readInt32(reader)
 	buffer := make([]byte, length)
 	read_length, err := reader.Read(buffer)
-	if err != nil {
+	if err != nil && err != io.EOF {
 		panic(err)
 	}
 	if read_length != int(length) {
@@ -630,7 +632,7 @@ func (FfiConverterString) Read(reader io.Reader) string {
 	return string(buffer)
 }
 
-func (FfiConverterString) Lower(value string) RustBuffer {
+func (FfiConverterString) Lower(value string) C.RustBuffer {
 	return stringToRustBuffer(value)
 }
 
@@ -665,15 +667,15 @@ func (r *RangeProofResult) Destroy() {
 	FfiDestroyerSequenceUint8{}.Destroy(r.Blinding)
 }
 
-type FfiConverterTypeRangeProofResult struct{}
+type FfiConverterRangeProofResult struct{}
 
-var FfiConverterTypeRangeProofResultINSTANCE = FfiConverterTypeRangeProofResult{}
+var FfiConverterRangeProofResultINSTANCE = FfiConverterRangeProofResult{}
 
-func (c FfiConverterTypeRangeProofResult) Lift(rb RustBufferI) RangeProofResult {
+func (c FfiConverterRangeProofResult) Lift(rb RustBufferI) RangeProofResult {
 	return LiftFromRustBuffer[RangeProofResult](c, rb)
 }
 
-func (c FfiConverterTypeRangeProofResult) Read(reader io.Reader) RangeProofResult {
+func (c FfiConverterRangeProofResult) Read(reader io.Reader) RangeProofResult {
 	return RangeProofResult{
 		FfiConverterSequenceUint8INSTANCE.Read(reader),
 		FfiConverterSequenceUint8INSTANCE.Read(reader),
@@ -681,19 +683,19 @@ func (c FfiConverterTypeRangeProofResult) Read(reader io.Reader) RangeProofResul
 	}
 }
 
-func (c FfiConverterTypeRangeProofResult) Lower(value RangeProofResult) RustBuffer {
+func (c FfiConverterRangeProofResult) Lower(value RangeProofResult) C.RustBuffer {
 	return LowerIntoRustBuffer[RangeProofResult](c, value)
 }
 
-func (c FfiConverterTypeRangeProofResult) Write(writer io.Writer, value RangeProofResult) {
+func (c FfiConverterRangeProofResult) Write(writer io.Writer, value RangeProofResult) {
 	FfiConverterSequenceUint8INSTANCE.Write(writer, value.Proof)
 	FfiConverterSequenceUint8INSTANCE.Write(writer, value.Commitment)
 	FfiConverterSequenceUint8INSTANCE.Write(writer, value.Blinding)
 }
 
-type FfiDestroyerTypeRangeProofResult struct{}
+type FfiDestroyerRangeProofResult struct{}
 
-func (_ FfiDestroyerTypeRangeProofResult) Destroy(value RangeProofResult) {
+func (_ FfiDestroyerRangeProofResult) Destroy(value RangeProofResult) {
 	value.Destroy()
 }
 
@@ -717,7 +719,7 @@ func (c FfiConverterSequenceUint8) Read(reader io.Reader) []uint8 {
 	return result
 }
 
-func (c FfiConverterSequenceUint8) Lower(value []uint8) RustBuffer {
+func (c FfiConverterSequenceUint8) Lower(value []uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[]uint8](c, value)
 }
 
@@ -760,7 +762,7 @@ func (c FfiConverterSequenceSequenceUint8) Read(reader io.Reader) [][]uint8 {
 	return result
 }
 
-func (c FfiConverterSequenceSequenceUint8) Lower(value [][]uint8) RustBuffer {
+func (c FfiConverterSequenceSequenceUint8) Lower(value [][]uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[][]uint8](c, value)
 }
 
@@ -785,97 +787,129 @@ func (FfiDestroyerSequenceSequenceUint8) Destroy(sequence [][]uint8) {
 
 func AltGenerator() []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_alt_generator(_uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_alt_generator(_uniffiStatus),
+		}
 	}))
 }
 
 func GenerateInputCommitments(values [][]uint8, blinding []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_generate_input_commitments(FfiConverterSequenceSequenceUint8INSTANCE.Lower(values), FfiConverterSequenceUint8INSTANCE.Lower(blinding), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_generate_input_commitments(FfiConverterSequenceSequenceUint8INSTANCE.Lower(values), FfiConverterSequenceUint8INSTANCE.Lower(blinding), _uniffiStatus),
+		}
 	}))
 }
 
 func GenerateRangeProof(values [][]uint8, blinding []uint8, bitSize uint64) RangeProofResult {
-	return FfiConverterTypeRangeProofResultINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_generate_range_proof(FfiConverterSequenceSequenceUint8INSTANCE.Lower(values), FfiConverterSequenceUint8INSTANCE.Lower(blinding), FfiConverterUint64INSTANCE.Lower(bitSize), _uniffiStatus)
+	return FfiConverterRangeProofResultINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_generate_range_proof(FfiConverterSequenceSequenceUint8INSTANCE.Lower(values), FfiConverterSequenceUint8INSTANCE.Lower(blinding), FfiConverterUint64INSTANCE.Lower(bitSize), _uniffiStatus),
+		}
 	}))
 }
 
 func HashToScalar(input []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_hash_to_scalar(FfiConverterSequenceUint8INSTANCE.Lower(input), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_hash_to_scalar(FfiConverterSequenceUint8INSTANCE.Lower(input), _uniffiStatus),
+		}
 	}))
 }
 
 func Keygen() []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_keygen(_uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_keygen(_uniffiStatus),
+		}
 	}))
 }
 
 func PointAddition(inputPoint []uint8, publicPoint []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_point_addition(FfiConverterSequenceUint8INSTANCE.Lower(inputPoint), FfiConverterSequenceUint8INSTANCE.Lower(publicPoint), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_point_addition(FfiConverterSequenceUint8INSTANCE.Lower(inputPoint), FfiConverterSequenceUint8INSTANCE.Lower(publicPoint), _uniffiStatus),
+		}
 	}))
 }
 
 func PointSubtraction(inputPoint []uint8, publicPoint []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_point_subtraction(FfiConverterSequenceUint8INSTANCE.Lower(inputPoint), FfiConverterSequenceUint8INSTANCE.Lower(publicPoint), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_point_subtraction(FfiConverterSequenceUint8INSTANCE.Lower(inputPoint), FfiConverterSequenceUint8INSTANCE.Lower(publicPoint), _uniffiStatus),
+		}
 	}))
 }
 
 func ScalarAddition(lhs []uint8, rhs []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_scalar_addition(FfiConverterSequenceUint8INSTANCE.Lower(lhs), FfiConverterSequenceUint8INSTANCE.Lower(rhs), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_scalar_addition(FfiConverterSequenceUint8INSTANCE.Lower(lhs), FfiConverterSequenceUint8INSTANCE.Lower(rhs), _uniffiStatus),
+		}
 	}))
 }
 
 func ScalarInverse(inputScalar []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_scalar_inverse(FfiConverterSequenceUint8INSTANCE.Lower(inputScalar), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_scalar_inverse(FfiConverterSequenceUint8INSTANCE.Lower(inputScalar), _uniffiStatus),
+		}
 	}))
 }
 
 func ScalarMult(lhs []uint8, rhs []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_scalar_mult(FfiConverterSequenceUint8INSTANCE.Lower(lhs), FfiConverterSequenceUint8INSTANCE.Lower(rhs), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_scalar_mult(FfiConverterSequenceUint8INSTANCE.Lower(lhs), FfiConverterSequenceUint8INSTANCE.Lower(rhs), _uniffiStatus),
+		}
 	}))
 }
 
 func ScalarMultHashToScalar(inputScalar []uint8, publicPoint []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_scalar_mult_hash_to_scalar(FfiConverterSequenceUint8INSTANCE.Lower(inputScalar), FfiConverterSequenceUint8INSTANCE.Lower(publicPoint), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_scalar_mult_hash_to_scalar(FfiConverterSequenceUint8INSTANCE.Lower(inputScalar), FfiConverterSequenceUint8INSTANCE.Lower(publicPoint), _uniffiStatus),
+		}
 	}))
 }
 
 func ScalarMultPoint(inputScalar []uint8, publicPoint []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_scalar_mult_point(FfiConverterSequenceUint8INSTANCE.Lower(inputScalar), FfiConverterSequenceUint8INSTANCE.Lower(publicPoint), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_scalar_mult_point(FfiConverterSequenceUint8INSTANCE.Lower(inputScalar), FfiConverterSequenceUint8INSTANCE.Lower(publicPoint), _uniffiStatus),
+		}
 	}))
 }
 
 func ScalarSubtraction(lhs []uint8, rhs []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_scalar_subtraction(FfiConverterSequenceUint8INSTANCE.Lower(lhs), FfiConverterSequenceUint8INSTANCE.Lower(rhs), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_scalar_subtraction(FfiConverterSequenceUint8INSTANCE.Lower(lhs), FfiConverterSequenceUint8INSTANCE.Lower(rhs), _uniffiStatus),
+		}
 	}))
 }
 
 func ScalarToPoint(input []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_scalar_to_point(FfiConverterSequenceUint8INSTANCE.Lower(input), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_scalar_to_point(FfiConverterSequenceUint8INSTANCE.Lower(input), _uniffiStatus),
+		}
 	}))
 }
 
 func SignHidden(x []uint8, t []uint8, a []uint8, r []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_sign_hidden(FfiConverterSequenceUint8INSTANCE.Lower(x), FfiConverterSequenceUint8INSTANCE.Lower(t), FfiConverterSequenceUint8INSTANCE.Lower(a), FfiConverterSequenceUint8INSTANCE.Lower(r), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_sign_hidden(FfiConverterSequenceUint8INSTANCE.Lower(x), FfiConverterSequenceUint8INSTANCE.Lower(t), FfiConverterSequenceUint8INSTANCE.Lower(a), FfiConverterSequenceUint8INSTANCE.Lower(r), _uniffiStatus),
+		}
 	}))
 }
 
 func SignSimple(secret []uint8, message []uint8) []uint8 {
 	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_bulletproofs_fn_func_sign_simple(FfiConverterSequenceUint8INSTANCE.Lower(secret), FfiConverterSequenceUint8INSTANCE.Lower(message), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_bulletproofs_fn_func_sign_simple(FfiConverterSequenceUint8INSTANCE.Lower(secret), FfiConverterSequenceUint8INSTANCE.Lower(message), _uniffiStatus),
+		}
 	}))
 }
 

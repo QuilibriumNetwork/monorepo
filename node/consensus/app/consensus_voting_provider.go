@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"slices"
 	"sync"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
+	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
 // AppVotingProvider implements VotingProvider
@@ -389,6 +392,7 @@ func (p *AppVotingProvider) FinalizeVotes(
 		)
 	}
 
+	// Build a map of transaction hashes to their committed status
 	txMap := map[string]bool{}
 	for _, req := range (*chosenProposal).Requests {
 		tx, err := req.ToCanonicalBytes()
@@ -400,21 +404,89 @@ func (p *AppVotingProvider) FinalizeVotes(
 		}
 
 		txHash := sha3.Sum256(tx)
+		p.engine.logger.Debug(
+			"adding transaction in frame to commit check",
+			zap.String("tx_hash", hex.EncodeToString(txHash[:])),
+		)
 		txMap[string(txHash[:])] = false
 	}
 
+	// Check that transactions are committed in our shard and collect shard
+	// addresses
+	shardAddressesSet := make(map[string]bool)
 	for _, tx := range res.Transactions {
+		p.engine.logger.Debug(
+			"checking transaction from global map",
+			zap.String("tx_hash", hex.EncodeToString(tx.TransactionHash)),
+		)
 		if _, ok := txMap[string(tx.TransactionHash)]; ok {
 			txMap[string(tx.TransactionHash)] = tx.Committed
+
+			// Extract shard addresses from each locked transaction's shard addresses
+			for _, shardAddr := range tx.ShardAddresses {
+				// Extract the applicable shard address (can be shorter than the full
+				// address)
+				extractedShards := p.extractShardAddresses(shardAddr)
+				for _, extractedShard := range extractedShards {
+					shardAddrStr := string(extractedShard)
+					shardAddressesSet[shardAddrStr] = true
+				}
+			}
 		}
 	}
 
+	// Check that all transactions are committed in our shard
 	for _, committed := range txMap {
 		if !committed {
 			return &parentFrame, PeerID{}, errors.Wrap(
-				errors.New("tx cross-shard lock unconfirmed"),
+				errors.New("tx not committed in our shard"),
 				"finalize votes",
 			)
+		}
+	}
+
+	// Check cross-shard locks for each unique shard address
+	for shardAddrStr := range shardAddressesSet {
+		shardAddr := []byte(shardAddrStr)
+
+		// Skip our own shard since we already checked it
+		if bytes.Equal(shardAddr, p.engine.appAddress) {
+			continue
+		}
+
+		// Query the global client for locked addresses in this shard
+		shardRes, err := p.engine.globalClient.GetLockedAddresses(
+			ctx,
+			&protobufs.GetLockedAddressesRequest{
+				ShardAddress: shardAddr,
+				FrameNumber:  (*chosenProposal).Header.FrameNumber,
+			},
+		)
+		if err != nil {
+			p.engine.logger.Debug(
+				"failed to get locked addresses for shard",
+				zap.String("shard_addr", hex.EncodeToString(shardAddr)),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		// Check that all our transactions are committed in this shard
+		for txHashStr := range txMap {
+			committedInShard := false
+			for _, tx := range shardRes.Transactions {
+				if string(tx.TransactionHash) == txHashStr {
+					committedInShard = tx.Committed
+					break
+				}
+			}
+
+			if !committedInShard {
+				return &parentFrame, PeerID{}, errors.Wrap(
+					errors.New("tx cross-shard lock unconfirmed"),
+					"finalize votes",
+				)
+			}
 		}
 	}
 
@@ -480,12 +552,6 @@ func (p *AppVotingProvider) FinalizeVotes(
 
 	for i := 0; i < len(provers); i++ {
 		activeProver := provers[i]
-		if err != nil {
-			p.engine.logger.Error(
-				"could not get prover info",
-				zap.String("address", hex.EncodeToString(provers[i].Address)),
-			)
-		}
 		if _, ok := voterMap[string(activeProver.Address)]; !ok {
 			continue
 		}
@@ -587,4 +653,112 @@ func (p *AppVotingProvider) SendConfirmation(
 	)
 
 	return nil
+}
+
+// GetFullPath converts a key to its path representation using 6-bit nibbles
+func GetFullPath(key []byte) []int32 {
+	var nibbles []int32
+	depth := 0
+	for {
+		n1 := getNextNibble(key, depth)
+		if n1 == -1 {
+			break
+		}
+		nibbles = append(nibbles, n1)
+		depth += tries.BranchBits
+	}
+
+	return nibbles
+}
+
+// getNextNibble returns the next BranchBits bits from the key starting at pos
+func getNextNibble(key []byte, pos int) int32 {
+	startByte := pos / 8
+	if startByte >= len(key) {
+		return -1
+	}
+
+	// Calculate how many bits we need from the current byte
+	startBit := pos % 8
+	bitsFromCurrentByte := 8 - startBit
+
+	result := int(key[startByte] & ((1 << bitsFromCurrentByte) - 1))
+
+	if bitsFromCurrentByte >= tries.BranchBits {
+		// We have enough bits in the current byte
+		return int32((result >> (bitsFromCurrentByte - tries.BranchBits)) &
+			tries.BranchMask)
+	}
+
+	// We need bits from the next byte
+	result = result << (tries.BranchBits - bitsFromCurrentByte)
+	if startByte+1 < len(key) {
+		remainingBits := tries.BranchBits - bitsFromCurrentByte
+		nextByte := int(key[startByte+1])
+		result |= (nextByte >> (8 - remainingBits))
+	}
+
+	return int32(result & tries.BranchMask)
+}
+
+// extractShardAddresses extracts all possible shard addresses from a transaction address
+func (p *AppVotingProvider) extractShardAddresses(txAddress []byte) [][]byte {
+	var shardAddresses [][]byte
+
+	// Get the full path from the transaction address
+	path := GetFullPath(txAddress)
+
+	// The first 43 nibbles (258 bits) represent the base shard address
+	// We need to extract all possible shard addresses by considering path segments after the 43rd nibble
+	if len(path) <= 43 {
+		// If the path is too short, just return the original address truncated to 32 bytes
+		if len(txAddress) >= 32 {
+			shardAddresses = append(shardAddresses, txAddress[:32])
+		}
+		return shardAddresses
+	}
+
+	// Convert the first 43 nibbles to bytes (base shard address)
+	baseShardAddr := txAddress[:32]
+	l1 := up2p.GetBloomFilterIndices(baseShardAddr, 256, 3)
+	candidates := map[string]struct{}{}
+
+	// Now generate all possible shard addresses by extending the path
+	// Each additional nibble after the 43rd creates a new shard address
+	for i := 43; i < len(path); i++ {
+		// Create a new shard address by extending the base with this path segment
+		extendedAddr := make([]byte, 32)
+		copy(extendedAddr, baseShardAddr)
+
+		// Add the path segment as a byte
+		extendedAddr = append(extendedAddr, byte(path[i]))
+
+		candidates[string(extendedAddr)] = struct{}{}
+	}
+
+	shards, err := p.engine.shardsStore.GetAppShards(
+		slices.Concat(l1, baseShardAddr),
+		[]uint32{},
+	)
+	if err != nil {
+		return [][]byte{}
+	}
+
+	for _, shard := range shards {
+		if _, ok := candidates[string(
+			slices.Concat(shard.L2, uint32ToBytes(shard.Path)),
+		)]; ok {
+			shardAddresses = append(shardAddresses, shard.L2)
+		}
+	}
+
+	return shardAddresses
+}
+
+func uint32ToBytes(path []uint32) []byte {
+	bytes := []byte{}
+	for _, p := range path {
+		bytes = append(bytes, byte(p))
+	}
+	return bytes
 }

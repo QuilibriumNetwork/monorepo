@@ -20,9 +20,9 @@ func (m *MockShardExecutionEngine) Lock(
 	frameNumber uint64,
 	address []byte,
 	message []byte,
-) error {
+) ([][]byte, error) {
 	args := m.Called(frameNumber, address, message)
-	return args.Error(0)
+	return args.Get(0).([][]byte), args.Error(1)
 }
 
 // Unlock implements execution.ShardExecutionEngine.

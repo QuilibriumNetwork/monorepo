@@ -12,60 +12,67 @@ import (
 	"unsafe"
 )
 
-type RustBuffer = C.RustBuffer
+// This is needed, because as of go 1.24
+// type RustBuffer C.RustBuffer cannot have methods,
+// RustBuffer is treated as non-local type
+type GoRustBuffer struct {
+	inner C.RustBuffer
+}
 
 type RustBufferI interface {
 	AsReader() *bytes.Reader
 	Free()
 	ToGoBytes() []byte
 	Data() unsafe.Pointer
-	Len() int
-	Capacity() int
+	Len() uint64
+	Capacity() uint64
 }
 
-func RustBufferFromExternal(b RustBufferI) RustBuffer {
-	return RustBuffer{
-		capacity: C.int(b.Capacity()),
-		len:      C.int(b.Len()),
-		data:     (*C.uchar)(b.Data()),
+func RustBufferFromExternal(b RustBufferI) GoRustBuffer {
+	return GoRustBuffer{
+		inner: C.RustBuffer{
+			capacity: C.uint64_t(b.Capacity()),
+			len:      C.uint64_t(b.Len()),
+			data:     (*C.uchar)(b.Data()),
+		},
 	}
 }
 
-func (cb RustBuffer) Capacity() int {
-	return int(cb.capacity)
+func (cb GoRustBuffer) Capacity() uint64 {
+	return uint64(cb.inner.capacity)
 }
 
-func (cb RustBuffer) Len() int {
-	return int(cb.len)
+func (cb GoRustBuffer) Len() uint64 {
+	return uint64(cb.inner.len)
 }
 
-func (cb RustBuffer) Data() unsafe.Pointer {
-	return unsafe.Pointer(cb.data)
+func (cb GoRustBuffer) Data() unsafe.Pointer {
+	return unsafe.Pointer(cb.inner.data)
 }
 
-func (cb RustBuffer) AsReader() *bytes.Reader {
-	b := unsafe.Slice((*byte)(cb.data), C.int(cb.len))
+func (cb GoRustBuffer) AsReader() *bytes.Reader {
+	b := unsafe.Slice((*byte)(cb.inner.data), C.uint64_t(cb.inner.len))
 	return bytes.NewReader(b)
 }
 
-func (cb RustBuffer) Free() {
+func (cb GoRustBuffer) Free() {
 	rustCall(func(status *C.RustCallStatus) bool {
-		C.ffi_rpm_rustbuffer_free(cb, status)
+		C.ffi_rpm_rustbuffer_free(cb.inner, status)
 		return false
 	})
 }
 
-func (cb RustBuffer) ToGoBytes() []byte {
-	return C.GoBytes(unsafe.Pointer(cb.data), C.int(cb.len))
+func (cb GoRustBuffer) ToGoBytes() []byte {
+	return C.GoBytes(unsafe.Pointer(cb.inner.data), C.int(cb.inner.len))
 }
 
-func stringToRustBuffer(str string) RustBuffer {
+func stringToRustBuffer(str string) C.RustBuffer {
 	return bytesToRustBuffer([]byte(str))
 }
 
-func bytesToRustBuffer(b []byte) RustBuffer {
+func bytesToRustBuffer(b []byte) C.RustBuffer {
 	if len(b) == 0 {
-		return RustBuffer{}
+		return C.RustBuffer{}
 	}
 	// We can pass the pointer along here, as it is pinned
 	// for the duration of this call
@@ -74,7 +81,7 @@ func bytesToRustBuffer(b []byte) RustBuffer {
 		data: (*C.uchar)(unsafe.Pointer(&b[0])),
 	}
 
-	return rustCall(func(status *C.RustCallStatus) RustBuffer {
+	return rustCall(func(status *C.RustCallStatus) C.RustBuffer {
 		return C.ffi_rpm_rustbuffer_from_bytes(foreign, status)
 	})
 }
@@ -84,12 +91,7 @@ type BufLifter[GoType any] interface {
 }
 
 type BufLowerer[GoType any] interface {
-	Lower(value GoType) RustBuffer
-}
-
-type FfiConverter[GoType any, FfiType any] interface {
-	Lift(value FfiType) GoType
-	Lower(value GoType) FfiType
+	Lower(value GoType) C.RustBuffer
 }
 
 type BufReader[GoType any] interface {
@@ -100,12 +102,7 @@ type BufWriter[GoType any] interface {
 	Write(writer io.Writer, value GoType)
 }
 
-type FfiRustBufConverter[GoType any, FfiType any] interface {
-	FfiConverter[GoType, FfiType]
-	BufReader[GoType]
-}
-
-func LowerIntoRustBuffer[GoType any](bufWriter BufWriter[GoType], value GoType) RustBuffer {
+func LowerIntoRustBuffer[GoType any](bufWriter BufWriter[GoType], value GoType) C.RustBuffer {
 	// This might be not the most efficient way but it does not require knowing allocation size
 	// beforehand
 	var buffer bytes.Buffer
@@ -130,31 +127,30 @@ func LiftFromRustBuffer[GoType any](bufReader BufReader[GoType], rbuf RustBuffer
 	return item
 }
 
-func rustCallWithError[U any](converter BufLifter[error], callback func(*C.RustCallStatus) U) (U, error) {
+func rustCallWithError[E any, U any](converter BufReader[*E], callback func(*C.RustCallStatus) U) (U, *E) {
 	var status C.RustCallStatus
 	returnValue := callback(&status)
 	err := checkCallStatus(converter, status)
-
 	return returnValue, err
 }
 
-func checkCallStatus(converter BufLifter[error], status C.RustCallStatus) error {
+func checkCallStatus[E any](converter BufReader[*E], status C.RustCallStatus) *E {
 	switch status.code {
 	case 0:
 		return nil
 	case 1:
-		return converter.Lift(status.errorBuf)
+		return LiftFromRustBuffer(converter, GoRustBuffer{inner: status.errorBuf})
 	case 2:
-		// when the rust code sees a panic, it tries to construct a rustbuffer
+		// when the rust code sees a panic, it tries to construct a rustBuffer
 		// with the message.  but if that code panics, then it just sends back
 		// an empty buffer.
 		if status.errorBuf.len > 0 {
-			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(status.errorBuf)))
+			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(GoRustBuffer{inner: status.errorBuf})))
 		} else {
 			panic(fmt.Errorf("Rust panicked while handling Rust panic"))
 		}
 	default:
-		return fmt.Errorf("unknown status code: %d", status.code)
+		panic(fmt.Errorf("unknown status code: %d", status.code))
 	}
 }
 
@@ -165,11 +161,13 @@ func checkCallStatusUnknown(status C.RustCallStatus) error {
 	case 1:
 		panic(fmt.Errorf("function not returning an error returned an error"))
 	case 2:
-		// when the rust code sees a panic, it tries to construct a rustbuffer
+		// when the rust code sees a panic, it tries to construct a C.RustBuffer
 		// with the message.  but if that code panics, then it just sends back
 		// an empty buffer.
 		if status.errorBuf.len > 0 {
-			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(status.errorBuf)))
+			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(GoRustBuffer{
+				inner: status.errorBuf,
+			})))
 		} else {
 			panic(fmt.Errorf("Rust panicked while handling Rust panic"))
 		}
@@ -179,11 +177,15 @@ func checkCallStatusUnknown(status C.RustCallStatus) error {
 }
 
 func rustCall[U any](callback func(*C.RustCallStatus) U) U {
-	returnValue, err := rustCallWithError(nil, callback)
+	returnValue, err := rustCallWithError[error](nil, callback)
 	if err != nil {
 		panic(err)
 	}
 	return returnValue
+}
+
+type NativeError interface {
+	AsError() error
 }
 
 func writeInt8(writer io.Writer, value int8) {
@@ -333,65 +335,65 @@ func init() {
 
 func uniffiCheckChecksums() {
 	// Get the bindings contract version from our ComponentInterface
-	bindingsContractVersion := 24
+	bindingsContractVersion := 26
 	// Get the scaffolding contract version by calling the into the dylib
-	scaffoldingContractVersion := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint32_t {
-		return C.ffi_rpm_uniffi_contract_version(uniffiStatus)
+	scaffoldingContractVersion := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint32_t {
+		return C.ffi_rpm_uniffi_contract_version()
 	})
 	if bindingsContractVersion != int(scaffoldingContractVersion) {
 		// If this happens try cleaning and rebuilding your project
 		panic("rpm: UniFFI contract version mismatch")
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rpm_checksum_func_wrapped_rpm_combine_shares_and_mask(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rpm_checksum_func_wrapped_rpm_combine_shares_and_mask()
 		})
-		if checksum != 14550 {
+		if checksum != 25936 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rpm: uniffi_rpm_checksum_func_wrapped_rpm_combine_shares_and_mask: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rpm_checksum_func_wrapped_rpm_finalize(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rpm_checksum_func_wrapped_rpm_finalize()
 		})
-		if checksum != 59972 {
+		if checksum != 47686 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rpm: uniffi_rpm_checksum_func_wrapped_rpm_finalize: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rpm_checksum_func_wrapped_rpm_generate_initial_shares(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rpm_checksum_func_wrapped_rpm_generate_initial_shares()
 		})
-		if checksum != 49132 {
+		if checksum != 41549 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rpm: uniffi_rpm_checksum_func_wrapped_rpm_generate_initial_shares: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rpm_checksum_func_wrapped_rpm_permute(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rpm_checksum_func_wrapped_rpm_permute()
 		})
-		if checksum != 21224 {
+		if checksum != 65187 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rpm: uniffi_rpm_checksum_func_wrapped_rpm_permute: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rpm_checksum_func_wrapped_rpm_sketch_propose(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rpm_checksum_func_wrapped_rpm_sketch_propose()
 		})
-		if checksum != 29586 {
+		if checksum != 14675 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rpm: uniffi_rpm_checksum_func_wrapped_rpm_sketch_propose: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rpm_checksum_func_wrapped_rpm_sketch_verify(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rpm_checksum_func_wrapped_rpm_sketch_verify()
 		})
-		if checksum != 1146 {
+		if checksum != 49221 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rpm: uniffi_rpm_checksum_func_wrapped_rpm_sketch_verify: UniFFI API checksum mismatch")
 		}
@@ -495,7 +497,7 @@ func (FfiConverterString) Read(reader io.Reader) string {
 	length := readInt32(reader)
 	buffer := make([]byte, length)
 	read_length, err := reader.Read(buffer)
-	if err != nil {
+	if err != nil && err != io.EOF {
 		panic(err)
 	}
 	if read_length != int(length) {
@@ -504,7 +506,7 @@ func (FfiConverterString) Read(reader io.Reader) string {
 	return string(buffer)
 }
 
-func (FfiConverterString) Lower(value string) RustBuffer {
+func (FfiConverterString) Lower(value string) C.RustBuffer {
 	return stringToRustBuffer(value)
 }
 
@@ -539,15 +541,15 @@ func (r *WrappedCombinedSharesAndMask) Destroy() {
 	FfiDestroyerSequenceSequenceSequenceSequenceSequenceUint8{}.Destroy(r.Mrms)
 }
 
-type FfiConverterTypeWrappedCombinedSharesAndMask struct{}
+type FfiConverterWrappedCombinedSharesAndMask struct{}
 
-var FfiConverterTypeWrappedCombinedSharesAndMaskINSTANCE = FfiConverterTypeWrappedCombinedSharesAndMask{}
+var FfiConverterWrappedCombinedSharesAndMaskINSTANCE = FfiConverterWrappedCombinedSharesAndMask{}
 
-func (c FfiConverterTypeWrappedCombinedSharesAndMask) Lift(rb RustBufferI) WrappedCombinedSharesAndMask {
+func (c FfiConverterWrappedCombinedSharesAndMask) Lift(rb RustBufferI) WrappedCombinedSharesAndMask {
 	return LiftFromRustBuffer[WrappedCombinedSharesAndMask](c, rb)
 }
 
-func (c FfiConverterTypeWrappedCombinedSharesAndMask) Read(reader io.Reader) WrappedCombinedSharesAndMask {
+func (c FfiConverterWrappedCombinedSharesAndMask) Read(reader io.Reader) WrappedCombinedSharesAndMask {
 	return WrappedCombinedSharesAndMask{
 		FfiConverterSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Read(reader),
 		FfiConverterSequenceSequenceSequenceUint8INSTANCE.Read(reader),
@@ -555,19 +557,19 @@ func (c FfiConverterTypeWrappedCombinedSharesAndMask) Read(reader io.Reader) Wra
 	}
 }
 
-func (c FfiConverterTypeWrappedCombinedSharesAndMask) Lower(value WrappedCombinedSharesAndMask) RustBuffer {
+func (c FfiConverterWrappedCombinedSharesAndMask) Lower(value WrappedCombinedSharesAndMask) C.RustBuffer {
 	return LowerIntoRustBuffer[WrappedCombinedSharesAndMask](c, value)
 }
 
-func (c FfiConverterTypeWrappedCombinedSharesAndMask) Write(writer io.Writer, value WrappedCombinedSharesAndMask) {
+func (c FfiConverterWrappedCombinedSharesAndMask) Write(writer io.Writer, value WrappedCombinedSharesAndMask) {
 	FfiConverterSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Write(writer, value.Ms)
 	FfiConverterSequenceSequenceSequenceUint8INSTANCE.Write(writer, value.Rs)
 	FfiConverterSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Write(writer, value.Mrms)
 }
 
-type FfiDestroyerTypeWrappedCombinedSharesAndMask struct{}
+type FfiDestroyerWrappedCombinedSharesAndMask struct{}
 
-func (_ FfiDestroyerTypeWrappedCombinedSharesAndMask) Destroy(value WrappedCombinedSharesAndMask) {
+func (_ FfiDestroyerWrappedCombinedSharesAndMask) Destroy(value WrappedCombinedSharesAndMask) {
 	value.Destroy()
 }
 
@@ -581,33 +583,33 @@ func (r *WrappedInitialShares) Destroy() {
 	FfiDestroyerSequenceSequenceSequenceSequenceUint8{}.Destroy(r.Rs)
 }
 
-type FfiConverterTypeWrappedInitialShares struct{}
+type FfiConverterWrappedInitialShares struct{}
 
-var FfiConverterTypeWrappedInitialSharesINSTANCE = FfiConverterTypeWrappedInitialShares{}
+var FfiConverterWrappedInitialSharesINSTANCE = FfiConverterWrappedInitialShares{}
 
-func (c FfiConverterTypeWrappedInitialShares) Lift(rb RustBufferI) WrappedInitialShares {
+func (c FfiConverterWrappedInitialShares) Lift(rb RustBufferI) WrappedInitialShares {
 	return LiftFromRustBuffer[WrappedInitialShares](c, rb)
 }
 
-func (c FfiConverterTypeWrappedInitialShares) Read(reader io.Reader) WrappedInitialShares {
+func (c FfiConverterWrappedInitialShares) Read(reader io.Reader) WrappedInitialShares {
 	return WrappedInitialShares{
 		FfiConverterSequenceSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Read(reader),
 		FfiConverterSequenceSequenceSequenceSequenceUint8INSTANCE.Read(reader),
 	}
 }
 
-func (c FfiConverterTypeWrappedInitialShares) Lower(value WrappedInitialShares) RustBuffer {
+func (c FfiConverterWrappedInitialShares) Lower(value WrappedInitialShares) C.RustBuffer {
 	return LowerIntoRustBuffer[WrappedInitialShares](c, value)
 }
 
-func (c FfiConverterTypeWrappedInitialShares) Write(writer io.Writer, value WrappedInitialShares) {
+func (c FfiConverterWrappedInitialShares) Write(writer io.Writer, value WrappedInitialShares) {
 	FfiConverterSequenceSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Write(writer, value.Ms)
 	FfiConverterSequenceSequenceSequenceSequenceUint8INSTANCE.Write(writer, value.Rs)
 }
 
-type FfiDestroyerTypeWrappedInitialShares struct{}
+type FfiDestroyerWrappedInitialShares struct{}
 
-func (_ FfiDestroyerTypeWrappedInitialShares) Destroy(value WrappedInitialShares) {
+func (_ FfiDestroyerWrappedInitialShares) Destroy(value WrappedInitialShares) {
 	value.Destroy()
 }
 
@@ -621,33 +623,33 @@ func (r *WrappedSketchProposal) Destroy() {
 	FfiDestroyerSequenceSequenceUint8{}.Destroy(r.Rp)
 }
 
-type FfiConverterTypeWrappedSketchProposal struct{}
+type FfiConverterWrappedSketchProposal struct{}
 
-var FfiConverterTypeWrappedSketchProposalINSTANCE = FfiConverterTypeWrappedSketchProposal{}
+var FfiConverterWrappedSketchProposalINSTANCE = FfiConverterWrappedSketchProposal{}
 
-func (c FfiConverterTypeWrappedSketchProposal) Lift(rb RustBufferI) WrappedSketchProposal {
+func (c FfiConverterWrappedSketchProposal) Lift(rb RustBufferI) WrappedSketchProposal {
 	return LiftFromRustBuffer[WrappedSketchProposal](c, rb)
 }
 
-func (c FfiConverterTypeWrappedSketchProposal) Read(reader io.Reader) WrappedSketchProposal {
+func (c FfiConverterWrappedSketchProposal) Read(reader io.Reader) WrappedSketchProposal {
 	return WrappedSketchProposal{
 		FfiConverterSequenceSequenceSequenceSequenceUint8INSTANCE.Read(reader),
 		FfiConverterSequenceSequenceUint8INSTANCE.Read(reader),
 	}
 }
 
-func (c FfiConverterTypeWrappedSketchProposal) Lower(value WrappedSketchProposal) RustBuffer {
+func (c FfiConverterWrappedSketchProposal) Lower(value WrappedSketchProposal) C.RustBuffer {
 	return LowerIntoRustBuffer[WrappedSketchProposal](c, value)
 }
 
-func (c FfiConverterTypeWrappedSketchProposal) Write(writer io.Writer, value WrappedSketchProposal) {
+func (c FfiConverterWrappedSketchProposal) Write(writer io.Writer, value WrappedSketchProposal) {
 	FfiConverterSequenceSequenceSequenceSequenceUint8INSTANCE.Write(writer, value.Mp)
 	FfiConverterSequenceSequenceUint8INSTANCE.Write(writer, value.Rp)
 }
 
-type FfiDestroyerTypeWrappedSketchProposal struct{}
+type FfiDestroyerWrappedSketchProposal struct{}
 
-func (_ FfiDestroyerTypeWrappedSketchProposal) Destroy(value WrappedSketchProposal) {
+func (_ FfiDestroyerWrappedSketchProposal) Destroy(value WrappedSketchProposal) {
 	value.Destroy()
 }
 
@@ -671,7 +673,7 @@ func (c FfiConverterSequenceUint8) Read(reader io.Reader) []uint8 {
 	return result
 }
 
-func (c FfiConverterSequenceUint8) Lower(value []uint8) RustBuffer {
+func (c FfiConverterSequenceUint8) Lower(value []uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[]uint8](c, value)
 }
 
@@ -714,7 +716,7 @@ func (c FfiConverterSequenceUint64) Read(reader io.Reader) []uint64 {
 	return result
 }
 
-func (c FfiConverterSequenceUint64) Lower(value []uint64) RustBuffer {
+func (c FfiConverterSequenceUint64) Lower(value []uint64) C.RustBuffer {
 	return LowerIntoRustBuffer[[]uint64](c, value)
 }
 
@@ -757,7 +759,7 @@ func (c FfiConverterSequenceSequenceUint8) Read(reader io.Reader) [][]uint8 {
 	return result
 }
 
-func (c FfiConverterSequenceSequenceUint8) Lower(value [][]uint8) RustBuffer {
+func (c FfiConverterSequenceSequenceUint8) Lower(value [][]uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[][]uint8](c, value)
 }
 
@@ -800,7 +802,7 @@ func (c FfiConverterSequenceSequenceSequenceUint8) Read(reader io.Reader) [][][]
 	return result
 }
 
-func (c FfiConverterSequenceSequenceSequenceUint8) Lower(value [][][]uint8) RustBuffer {
+func (c FfiConverterSequenceSequenceSequenceUint8) Lower(value [][][]uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[][][]uint8](c, value)
 }
 
@@ -843,7 +845,7 @@ func (c FfiConverterSequenceSequenceSequenceSequenceUint8) Read(reader io.Reader
 	return result
 }
 
-func (c FfiConverterSequenceSequenceSequenceSequenceUint8) Lower(value [][][][]uint8) RustBuffer {
+func (c FfiConverterSequenceSequenceSequenceSequenceUint8) Lower(value [][][][]uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[][][][]uint8](c, value)
 }
 
@@ -886,7 +888,7 @@ func (c FfiConverterSequenceSequenceSequenceSequenceSequenceUint8) Read(reader i
 	return result
 }
 
-func (c FfiConverterSequenceSequenceSequenceSequenceSequenceUint8) Lower(value [][][][][]uint8) RustBuffer {
+func (c FfiConverterSequenceSequenceSequenceSequenceSequenceUint8) Lower(value [][][][][]uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[][][][][]uint8](c, value)
 }
 
@@ -929,7 +931,7 @@ func (c FfiConverterSequenceSequenceSequenceSequenceSequenceSequenceUint8) Read(
 	return result
 }
 
-func (c FfiConverterSequenceSequenceSequenceSequenceSequenceSequenceUint8) Lower(value [][][][][][]uint8) RustBuffer {
+func (c FfiConverterSequenceSequenceSequenceSequenceSequenceSequenceUint8) Lower(value [][][][][][]uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[][][][][][]uint8](c, value)
 }
 
@@ -953,32 +955,42 @@ func (FfiDestroyerSequenceSequenceSequenceSequenceSequenceSequenceUint8) Destroy
 }
 
 func WrappedRpmCombineSharesAndMask(ms [][][][][][]uint8, rs [][][][]uint8, size uint64, depth uint64, dealers uint64) WrappedCombinedSharesAndMask {
-	return FfiConverterTypeWrappedCombinedSharesAndMaskINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_rpm_fn_func_wrapped_rpm_combine_shares_and_mask(FfiConverterSequenceSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(ms), FfiConverterSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(rs), FfiConverterUint64INSTANCE.Lower(size), FfiConverterUint64INSTANCE.Lower(depth), FfiConverterUint64INSTANCE.Lower(dealers), _uniffiStatus)
+	return FfiConverterWrappedCombinedSharesAndMaskINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_rpm_fn_func_wrapped_rpm_combine_shares_and_mask(FfiConverterSequenceSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(ms), FfiConverterSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(rs), FfiConverterUint64INSTANCE.Lower(size), FfiConverterUint64INSTANCE.Lower(depth), FfiConverterUint64INSTANCE.Lower(dealers), _uniffiStatus),
+		}
 	}))
 }
 
 func WrappedRpmFinalize(input [][][]uint8, parties []uint64) [][]uint8 {
 	return FfiConverterSequenceSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_rpm_fn_func_wrapped_rpm_finalize(FfiConverterSequenceSequenceSequenceUint8INSTANCE.Lower(input), FfiConverterSequenceUint64INSTANCE.Lower(parties), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_rpm_fn_func_wrapped_rpm_finalize(FfiConverterSequenceSequenceSequenceUint8INSTANCE.Lower(input), FfiConverterSequenceUint64INSTANCE.Lower(parties), _uniffiStatus),
+		}
 	}))
 }
 
 func WrappedRpmGenerateInitialShares(size uint64, depth uint64, dealers uint64, players uint64) WrappedInitialShares {
-	return FfiConverterTypeWrappedInitialSharesINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_rpm_fn_func_wrapped_rpm_generate_initial_shares(FfiConverterUint64INSTANCE.Lower(size), FfiConverterUint64INSTANCE.Lower(depth), FfiConverterUint64INSTANCE.Lower(dealers), FfiConverterUint64INSTANCE.Lower(players), _uniffiStatus)
+	return FfiConverterWrappedInitialSharesINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_rpm_fn_func_wrapped_rpm_generate_initial_shares(FfiConverterUint64INSTANCE.Lower(size), FfiConverterUint64INSTANCE.Lower(depth), FfiConverterUint64INSTANCE.Lower(dealers), FfiConverterUint64INSTANCE.Lower(players), _uniffiStatus),
+		}
 	}))
 }
 
 func WrappedRpmPermute(maskedInputShares [][][]uint8, mb [][][][][]uint8, rb [][][]uint8, mrmb [][][][][]uint8, depthIndex uint64, parties []uint64) [][][]uint8 {
 	return FfiConverterSequenceSequenceSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_rpm_fn_func_wrapped_rpm_permute(FfiConverterSequenceSequenceSequenceUint8INSTANCE.Lower(maskedInputShares), FfiConverterSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(mb), FfiConverterSequenceSequenceSequenceUint8INSTANCE.Lower(rb), FfiConverterSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(mrmb), FfiConverterUint64INSTANCE.Lower(depthIndex), FfiConverterSequenceUint64INSTANCE.Lower(parties), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_rpm_fn_func_wrapped_rpm_permute(FfiConverterSequenceSequenceSequenceUint8INSTANCE.Lower(maskedInputShares), FfiConverterSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(mb), FfiConverterSequenceSequenceSequenceUint8INSTANCE.Lower(rb), FfiConverterSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(mrmb), FfiConverterUint64INSTANCE.Lower(depthIndex), FfiConverterSequenceUint64INSTANCE.Lower(parties), _uniffiStatus),
+		}
 	}))
 }
 
 func WrappedRpmSketchPropose(m [][][][][]uint8, r [][][]uint8) WrappedSketchProposal {
-	return FfiConverterTypeWrappedSketchProposalINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_rpm_fn_func_wrapped_rpm_sketch_propose(FfiConverterSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(m), FfiConverterSequenceSequenceSequenceUint8INSTANCE.Lower(r), _uniffiStatus)
+	return FfiConverterWrappedSketchProposalINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_rpm_fn_func_wrapped_rpm_sketch_propose(FfiConverterSequenceSequenceSequenceSequenceSequenceUint8INSTANCE.Lower(m), FfiConverterSequenceSequenceSequenceUint8INSTANCE.Lower(r), _uniffiStatus),
+		}
 	}))
 }
 

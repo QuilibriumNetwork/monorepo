@@ -7,6 +7,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/fees"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/types/compiler"
+	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
@@ -62,6 +63,9 @@ func CreateExecutionEngine(
 	decafConstructor crypto.DecafConstructor,
 	compiler compiler.CircuitCompiler,
 	frameProver crypto.FrameProver,
+	rewardIssuance consensus.RewardIssuance,
+	proverRegistry consensus.ProverRegistry,
+	blsConstructor crypto.BlsConstructor,
 	mode ExecutionMode,
 ) (execution.ShardExecutionEngine, error) {
 	switch engineType {
@@ -78,6 +82,9 @@ func CreateExecutionEngine(
 			verEnc,
 			decafConstructor,
 			frameProver,
+			rewardIssuance,
+			proverRegistry,
+			blsConstructor,
 		)
 	case EngineTypeCompute:
 		return NewComputeExecutionEngine(
@@ -134,6 +141,9 @@ func CreateAllEngines(
 	decafConstructor crypto.DecafConstructor,
 	compiler compiler.CircuitCompiler,
 	frameProver crypto.FrameProver,
+	rewardIssuance consensus.RewardIssuance,
+	proverRegistry consensus.ProverRegistry,
+	blsConstructor crypto.BlsConstructor,
 	includeGlobal bool,
 ) ([]execution.ShardExecutionEngine, error) {
 	engines := make([]execution.ShardExecutionEngine, 0, 4)
@@ -157,6 +167,9 @@ func CreateAllEngines(
 			decafConstructor,
 			compiler,
 			frameProver,
+			rewardIssuance,
+			proverRegistry,
+			blsConstructor,
 			mode,
 		)
 		if err != nil {
@@ -185,6 +198,9 @@ func CreateAllEngines(
 			decafConstructor,
 			compiler,
 			frameProver,
+			rewardIssuance,
+			proverRegistry,
+			blsConstructor,
 			mode,
 		)
 		if err != nil {

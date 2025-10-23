@@ -214,14 +214,8 @@ func (e *HypergraphExecutionEngine) Start() <-chan error {
 	go func() {
 		e.logger.Info("starting hypergraph execution engine")
 
-		// Main loop
-		for {
-			select {
-			case <-e.stopChan:
-				e.logger.Info("stopping hypergraph execution engine")
-				return
-			}
-		}
+		<-e.stopChan
+		e.logger.Info("stopping hypergraph execution engine")
 	}()
 
 	return errChan
@@ -363,7 +357,6 @@ func (e *HypergraphExecutionEngine) validateIndividualMessage(
 ) error {
 	isHypergraphOp := false
 	isUpdate := false
-	var err error
 	switch message.Request.(type) {
 	case *protobufs.MessageRequest_HypergraphDeploy:
 		isHypergraphOp = true
@@ -379,9 +372,6 @@ func (e *HypergraphExecutionEngine) validateIndividualMessage(
 		isHypergraphOp = true
 	case *protobufs.MessageRequest_HyperedgeRemove:
 		isHypergraphOp = true
-	}
-	if err != nil {
-		return errors.Wrap(err, "validate individual message")
 	}
 
 	if !isHypergraphOp {
@@ -696,7 +686,7 @@ func (e *HypergraphExecutionEngine) processIndividualMessage(
 	}
 
 	// Process the operation
-	newState, err := intrinsic.InvokeStep(
+	_, err = intrinsic.InvokeStep(
 		frameNumber,
 		payload,
 		feePaid,
@@ -707,7 +697,7 @@ func (e *HypergraphExecutionEngine) processIndividualMessage(
 		return nil, errors.Wrap(err, "process individual message")
 	}
 
-	newState, err = intrinsic.Commit()
+	newState, err := intrinsic.Commit()
 	if err != nil {
 		return nil, errors.Wrap(err, "process individual message")
 	}
@@ -715,7 +705,6 @@ func (e *HypergraphExecutionEngine) processIndividualMessage(
 	e.logger.Debug(
 		"processed individual message",
 		zap.String("address", hex.EncodeToString(address)),
-		zap.Any("state", newState),
 	)
 
 	return &execution.ProcessMessageResult{

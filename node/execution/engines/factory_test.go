@@ -81,6 +81,9 @@ func TestCreateExecutionEngine(t *testing.T) {
 				mockDecaf,
 				mockCompiler,
 				mockFrameProver,
+				nil,
+				nil,
+				nil,
 				engines.GlobalMode,
 			)
 
@@ -126,6 +129,9 @@ func TestCreateAllEngines(t *testing.T) {
 		mockDecaf,
 		mockCompiler,
 		mockFrameProver,
+		nil,
+		nil,
+		nil,
 		true, // includeGlobal
 	)
 	// CreateAllEngines doesn't return error, it just logs warnings

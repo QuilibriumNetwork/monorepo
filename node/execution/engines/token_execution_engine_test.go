@@ -7,6 +7,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -19,6 +20,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/mocks"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
@@ -62,6 +64,7 @@ func createMintableTestConfig() *token.TokenIntrinsicConfiguration {
 func TestTokenExecutionEngine_Start(t *testing.T) {
 	logger := zap.NewNop()
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil).Maybe()
 	mockClockStore := new(mocks.MockClockStore)
 	mockKeyManager := new(mocks.MockKeyManager)
 	mockInclusionProver := new(mocks.MockInclusionProver)
@@ -137,6 +140,7 @@ func TestTokenExecutionEngine_ProcessMessage_DeployEdgeCases(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := zap.NewNop()
 			mockHG := new(mocks.MockHypergraph)
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil).Maybe()
 			mockClockStore := new(mocks.MockClockStore)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockInclusionProver := new(mocks.MockInclusionProver)
@@ -183,6 +187,7 @@ func TestTokenExecutionEngine_BundledMessages(t *testing.T) {
 	t.Skip("something weird about payment setup")
 	logger := zap.NewNop()
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil).Maybe()
 	mockClockStore := new(mocks.MockClockStore)
 	mockKeyManager := new(mocks.MockKeyManager)
 	mockInclusionProver := new(mocks.MockInclusionProver)
@@ -264,6 +269,7 @@ func TestTokenExecutionEngine_ModeSwitch(t *testing.T) {
 	// Test that GlobalMode properly restricts operations after deployment
 	logger := zap.NewNop()
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil).Maybe()
 	mockClockStore := new(mocks.MockClockStore)
 	mockKeyManager := new(mocks.MockKeyManager)
 	mockInclusionProver := new(mocks.MockInclusionProver)
@@ -290,6 +296,7 @@ func TestTokenExecutionEngine_ModeSwitch(t *testing.T) {
 	mockHG.On("NewTransaction", mock.Anything).Return(mockTxn, nil).Maybe()
 	mockHG.On("AddVertex", mock.Anything, mock.Anything).Return(nil).Maybe()
 	mockHG.On("SetVertexData", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	mockHG.On("GetShardCommits", mock.Anything, mock.Anything).Return([][]byte{make([]byte, 64), make([]byte, 64), make([]byte, 64), make([]byte, 64)}, nil)
 
 	// Mock for TrackChange
 	mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
@@ -327,7 +334,7 @@ func TestTokenExecutionEngine_ModeSwitch(t *testing.T) {
 	}
 
 	state := hgstate.NewHypergraphState(mockHG)
-	responses, err := globalEngine.ProcessMessage(1, big.NewInt(1), token.TOKEN_BASE_DOMAIN[:], deployMsg.Payload, state)
+	responses, err := globalEngine.ProcessMessage(2, big.NewInt(1), token.TOKEN_BASE_DOMAIN[:], deployMsg.Payload, state)
 	assert.NoError(t, err)
 	assert.NotNil(t, responses)
 	err = responses.State.Commit()
@@ -376,7 +383,7 @@ func TestTokenExecutionEngine_ModeSwitch(t *testing.T) {
 	}
 
 	state = hgstate.NewHypergraphState(mockHG)
-	responses, err = globalEngine.ProcessMessage(1, big.NewInt(1), testAddr, txMsg.Payload, state)
+	_, err = globalEngine.ProcessMessage(2, big.NewInt(1), testAddr, txMsg.Payload, state)
 	assert.Error(t, err)
 }
 
@@ -428,10 +435,40 @@ func createTokenTransactionPayload(t *testing.T) *protobufs.MessageRequest {
 	// Create mock dependencies
 	mockHG := new(mocks.MockHypergraph)
 	mockBP := new(mocks.MockBulletproofProver)
+	mockBP.On("GenerateRangeProofFromBig", mock.Anything, mock.Anything, mock.Anything).Return(crypto.RangeProofResult{
+		Proof:      make([]byte, 56),
+		Commitment: make([]byte, 112),
+		Blinding:   make([]byte, 112),
+	}, nil)
+	mockBP.On("SignHidden", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(make([]byte, 336))
 	mockIP := new(mocks.MockInclusionProver)
+	mockIP.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil)
+	mockMultiproof := new(mocks.MockMultiproof)
+	mockMultiproof.On("FromBytes", mock.Anything).Return(nil)
+	mockMultiproof.On("ToBytes").Return([]byte{}, nil)
+	mockIP.On("ProveMultiple", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(mockMultiproof).Maybe()
 	mockVE := new(mocks.MockVerifiableEncryptor)
 	mockDC := new(mocks.MockDecafConstructor)
 	mockKM := new(mocks.MockKeyManager)
+	mockKM.On("GetAgreementKey", "q-view-key").Return(&mocks.MockDecafAgreement{}, nil)
+	mockKM.On("GetAgreementKey", "q-spend-key").Return(&mocks.MockDecafAgreement{}, nil)
+	mockHG.On("GetVertex", mock.Anything).Return(nil, nil)
+	mockTraversalProofMultiproof := new(mocks.MockMultiproof)
+	// Create a properly sized multiproof byte array (74 bytes multicommitment + some proof data)
+	multiproofBytes := make([]byte, 148) // 74 for multicommitment + 74 for proof
+	rand.Read(multiproofBytes)
+	mockTraversalProofMultiproof.On("ToBytes").Return(multiproofBytes, nil)
+	mockTraversalProof := &tries.TraversalProof{
+		Multiproof: mockTraversalProofMultiproof,
+		SubProofs: []tries.TraversalSubProof{
+			{
+				Commits: [][]byte{make([]byte, 74)}, // At least one commit
+				Ys:      [][]byte{make([]byte, 64)}, // Matching Ys
+				Paths:   [][]uint64{{0}},            // At least one path
+			},
+		},
+	}
+	mockHG.On("CreateTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(mockTraversalProof, nil).Maybe()
 
 	// Mock token configuration
 	tokenconfig := &token.TokenIntrinsicConfiguration{
@@ -445,6 +482,26 @@ func createTokenTransactionPayload(t *testing.T) *protobufs.MessageRequest {
 	domain := make([]byte, 32)
 	rand.Read(domain)
 
+	tr := &tries.VectorCommitmentTree{}
+	tr.Insert([]byte{0}, []byte{0, 0, 0, 0, 0, 0, 0, 0}, nil, big.NewInt(0))
+	tr.Insert([]byte{1 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{2 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{3 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{4 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{5 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{6 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{7 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{8 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{9 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{10 << 2}, make([]byte, 56), nil, big.NewInt(0))
+	tr.Insert([]byte{11 << 2}, make([]byte, 64), nil, big.NewInt(0))
+	tr.Insert([]byte{12 << 2}, make([]byte, 56), nil, big.NewInt(0))
+
+	tybi, _ := poseidon.HashBytes(slices.Concat(make([]byte, 32), []byte("pending:PendingTransaction")))
+	ty := tybi.FillBytes(make([]byte, 32))
+	tr.Insert(slices.Repeat([]byte{0xff}, 32), ty, nil, big.NewInt(0))
+	mockHG.On("GetVertexData", mock.Anything).Return(tr, nil)
+
 	// Create mock inputs
 	input1, _ := token.NewTransactionInput(make([]byte, 64))
 	input2, _ := token.NewTransactionInput(make([]byte, 64))
@@ -456,7 +513,7 @@ func createTokenTransactionPayload(t *testing.T) *protobufs.MessageRequest {
 	rand.Read(mockSK)
 	out1, _ := token.NewTransactionOutput(big.NewInt(7), mockVK, mockSK)
 	out2, _ := token.NewTransactionOutput(big.NewInt(2), mockVK, mockSK)
-
+	rdf, _ := newTokenRDFHypergraphSchema(domain, tokenconfig)
 	// Create transaction
 	tx := token.NewTransaction(
 		[32]byte(domain),
@@ -470,17 +527,15 @@ func createTokenTransactionPayload(t *testing.T) *protobufs.MessageRequest {
 		mockVE,
 		mockDC,
 		keys.ToKeyRing(mockKM, false),
-		"",  // rdfSchema
-		nil, // rdfMultiprover
+		rdf,
+		schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, mockIP),
 	)
 
 	// Mock the Prove call to set required fields
 	tx.RangeProof = make([]byte, 100) // Mock range proof
 
-	// Create a mock multiproof
-	mockMultiproof := new(mocks.MockMultiproof)
-	mockMultiproof.On("ToBytes").Return(make([]byte, 100), nil)
-
+	err := tx.Prove(0)
+	require.NoError(t, err)
 	tx.TraversalProof = &tries.TraversalProof{
 		Multiproof: mockMultiproof,
 		SubProofs: []tries.TraversalSubProof{
@@ -646,6 +701,7 @@ func createTokenMintTransactionPayload(t *testing.T) *protobufs.MessageRequest {
 		keys.ToKeyRing(mockKM, false),
 		"",  // rdfSchema
 		nil, // rdfMultiprover
+		&mocks.MockClockStore{},
 	)
 
 	// Mock the Prove call to set required fields

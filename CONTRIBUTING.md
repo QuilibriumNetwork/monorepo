@@ -2,9 +2,7 @@
 
 ## Testing
 
-Testing the [`vdf`](./vdf) and [`node`](./node) packages requires linking the
-[native VDF](./crates/vdf). The `test.sh` scripts in the respective directories
-help with this.
+See [TESTING.md](./TESTING.md) for testing instructions.
 
 ## Pull Requests
 

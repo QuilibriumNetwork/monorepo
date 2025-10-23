@@ -16,7 +16,7 @@ import (
 )
 
 func (e *AppConsensusEngine) validateConsensusMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -53,6 +53,12 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 		}
 
 		if !bytes.Equal(frame.Header.Address, e.appAddress) {
+			proposalValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
+			return p2p.ValidationResultIgnore
+		}
+
+		if frametime.AppFrameSince(frame) > 20*time.Second {
+			proposalValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}
 
@@ -94,8 +100,12 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 		}
 
 		now := time.Now().UnixMilli()
-		if livenessCheck.Timestamp > now+5000 ||
-			livenessCheck.Timestamp < now-5000 {
+		if livenessCheck.Timestamp > now+500 ||
+			livenessCheck.Timestamp < now-1000 {
+			livenessCheckValidationTotal.WithLabelValues(
+				e.appAddressHex,
+				"ignore",
+			).Inc()
 			return p2p.ValidationResultIgnore
 		}
 
@@ -128,6 +138,7 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		now := time.Now().UnixMilli()
 		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
+			voteValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}
 
@@ -157,6 +168,10 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		now := time.Now().UnixMilli()
 		if confirmation.Timestamp > now+5000 || confirmation.Timestamp < now-5000 {
+			confirmationValidationTotal.WithLabelValues(
+				e.appAddressHex,
+				"ignore",
+			).Inc()
 			return p2p.ValidationResultIgnore
 		}
 
@@ -179,7 +194,7 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 }
 
 func (e *AppConsensusEngine) validateProverMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -223,7 +238,7 @@ func (e *AppConsensusEngine) validateProverMessage(
 }
 
 func (e *AppConsensusEngine) validateGlobalProverMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -267,7 +282,7 @@ func (e *AppConsensusEngine) validateGlobalProverMessage(
 }
 
 func (e *AppConsensusEngine) validateFrameMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
 	timer := prometheus.NewTimer(
@@ -340,7 +355,7 @@ func (e *AppConsensusEngine) validateFrameMessage(
 }
 
 func (e *AppConsensusEngine) validateGlobalFrameMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
 	timer := prometheus.NewTimer(globalFrameValidationDuration)
@@ -400,7 +415,7 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 }
 
 func (e *AppConsensusEngine) validateAlertMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -450,7 +465,7 @@ func (e *AppConsensusEngine) validateAlertMessage(
 }
 
 func (e *AppConsensusEngine) validatePeerInfoMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
@@ -510,7 +525,7 @@ func (e *AppConsensusEngine) validatePeerInfoMessage(
 }
 
 func (e *AppConsensusEngine) validateDispatchMessage(
-	peerID peer.ID,
+	_ peer.ID,
 	message *pb.Message,
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix

@@ -61,6 +61,16 @@ func (h *HypergraphState) NewVertexAddMaterializedState(
 func (v *VertexAddMaterializedState) Commit(
 	txn tries.TreeBackingStoreTransaction,
 ) error {
+	prefix, err := v.hypergraph.hypergraph.GetCoveredPrefix()
+	if err != nil {
+		return errors.Wrap(err, "vertex add commit")
+	}
+
+	path := tries.GetFullPath(slices.Concat(v.appAddress[:], v.dataAddress[:]))
+	if !slices.Equal(path[:len(prefix)], prefix) {
+		return nil
+	}
+
 	if err := v.hypergraph.hypergraph.AddVertex(txn, hg.NewVertex(
 		v.appAddress,
 		v.dataAddress,
@@ -71,7 +81,7 @@ func (v *VertexAddMaterializedState) Commit(
 	}
 
 	id := slices.Concat(v.appAddress[:], v.dataAddress[:])
-	err := v.hypergraph.hypergraph.SetVertexData(txn, [64]byte(id), v.data)
+	err = v.hypergraph.hypergraph.SetVertexData(txn, [64]byte(id), v.data)
 	if err != nil {
 		return errors.Wrap(err, "vertex add commit")
 	}
@@ -143,9 +153,19 @@ func (h *HypergraphState) NewVertexRemoveMaterializedState(
 func (v *VertexRemoveMaterializedState) Commit(
 	txn tries.TreeBackingStoreTransaction,
 ) error {
+	prefix, err := v.hypergraph.hypergraph.GetCoveredPrefix()
+	if err != nil {
+		return errors.Wrap(err, "vertex add commit")
+	}
+
+	path := tries.GetFullPath(slices.Concat(v.appAddress[:], v.dataAddress[:]))
+	if !slices.Equal(path[:len(prefix)], prefix) {
+		return nil
+	}
+
 	id := slices.Concat(v.appAddress[:], v.dataAddress[:])
 
-	err := v.hypergraph.hypergraph.RemoveVertex(txn, hg.NewVertex(
+	err = v.hypergraph.hypergraph.RemoveVertex(txn, hg.NewVertex(
 		v.appAddress,
 		v.dataAddress,
 		v.commitment,
@@ -203,12 +223,22 @@ func (h *HypergraphState) NewHyperedgeAddMaterializedState(
 func (h *HyperedgeAddMaterializedState) Commit(
 	txn tries.TreeBackingStoreTransaction,
 ) error {
-	err := h.hypergraph.hypergraph.AddHyperedge(txn, h.value)
+	prefix, err := h.hypergraph.hypergraph.GetCoveredPrefix()
+	if err != nil {
+		return errors.Wrap(err, "vertex add commit")
+	}
+
+	id := h.value.GetID()
+	path := tries.GetFullPath(id[:])
+	if !slices.Equal(path[:len(prefix)], prefix) {
+		return nil
+	}
+
+	err = h.hypergraph.hypergraph.AddHyperedge(txn, h.value)
 	if err != nil {
 		return errors.Wrap(err, "hyperedge add commit")
 	}
 
-	id := h.value.GetID()
 	shardKey := tries.ShardKey{
 		L1: [3]byte(p2p.GetBloomFilterIndices(id[:32], 256, 3)),
 		L2: [32]byte(append([]byte{}, id[:32]...)),
@@ -257,12 +287,22 @@ func (h *HypergraphState) NewHyperedgeRemoveMaterializedState(
 func (h *HyperedgeRemoveMaterializedState) Commit(
 	txn tries.TreeBackingStoreTransaction,
 ) error {
-	err := h.hypergraph.hypergraph.RemoveHyperedge(txn, h.value)
+	prefix, err := h.hypergraph.hypergraph.GetCoveredPrefix()
+	if err != nil {
+		return errors.Wrap(err, "vertex add commit")
+	}
+
+	id := h.value.GetID()
+	path := tries.GetFullPath(id[:])
+	if !slices.Equal(path[:len(prefix)], prefix) {
+		return nil
+	}
+
+	err = h.hypergraph.hypergraph.RemoveHyperedge(txn, h.value)
 	if err != nil {
 		return errors.Wrap(err, "hyperedge remove commit")
 	}
 
-	id := h.value.GetID()
 	shardKey := tries.ShardKey{
 		L1: [3]byte(p2p.GetBloomFilterIndices(id[:32], 256, 3)),
 		L2: [32]byte(append([]byte{}, id[:32]...)),
@@ -746,8 +786,6 @@ func (h *HypergraphState) Commit() error {
 	if err := txn.Commit(); err != nil {
 		return errors.Wrap(err, "commit")
 	}
-
-	h.hypergraph.Commit()
 
 	return nil
 }

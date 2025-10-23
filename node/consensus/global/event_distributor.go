@@ -83,6 +83,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 						e.hasSentKeyBundle = true
 						e.publishKeyRegistry()
 					}
+
 					if e.proposer != nil {
 						workers, err := e.workerManager.RangeWorkers()
 						if err != nil {
@@ -150,6 +151,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 								e.inclusionProver,
 							),
 							e.proverRegistry,
+							e.clockStore,
 						)
 						if err != nil {
 							e.logger.Error(
@@ -387,7 +389,12 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	pendingFilters := [][]byte{}
 	proposalDescriptors := []provers.ShardDescriptor{}
 	decideDescriptors := []provers.ShardDescriptor{}
-	shardKeys := e.hypergraph.Commit()
+	shardKeys, err := e.hypergraph.Commit(data.Frame.Header.FrameNumber)
+	if err != nil {
+		e.logger.Error("could not commit", zap.Error(err))
+		return
+	}
+
 	for key := range shardKeys {
 		shards, err := e.shardsStore.GetAppShards(
 			slices.Concat(key.L1[:], key.L2[:]),
@@ -427,7 +434,13 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			if self != nil {
 				e.logger.Debug("checking allocations")
 				for _, allocation := range self.Allocations {
-					e.logger.Debug("checking allocation", zap.String("filter", hex.EncodeToString(allocation.ConfirmationFilter)))
+					e.logger.Debug(
+						"checking allocation",
+						zap.String(
+							"filter",
+							hex.EncodeToString(allocation.ConfirmationFilter),
+						),
+					)
 					if bytes.Equal(allocation.ConfirmationFilter, filter) {
 						allocated = allocation.Status != 4
 						if e.config.P2P.Network != 0 ||

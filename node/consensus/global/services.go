@@ -15,6 +15,7 @@ import (
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
 func (e *GlobalConsensusEngine) GetGlobalFrame(
@@ -26,14 +27,17 @@ func (e *GlobalConsensusEngine) GetGlobalFrame(
 		return nil, status.Error(codes.Internal, "remote peer ID not found")
 	}
 
-	registry, err := e.keyStore.GetKeyRegistry(
-		[]byte(peerID),
-	)
-	if err != nil {
-		return nil, status.Error(codes.PermissionDenied, "could not identify peer")
-	}
-
 	if !bytes.Equal(e.pubsub.GetPeerID(), []byte(peerID)) {
+		registry, err := e.keyStore.GetKeyRegistry(
+			[]byte(peerID),
+		)
+		if err != nil {
+			return nil, status.Error(
+				codes.PermissionDenied,
+				"could not identify peer",
+			)
+		}
+
 		if registry.ProverKey == nil || registry.ProverKey.KeyValue == nil {
 			return nil, status.Error(
 				codes.PermissionDenied,
@@ -80,6 +84,7 @@ func (e *GlobalConsensusEngine) GetGlobalFrame(
 		zap.String("peer_id", peerID.String()),
 	)
 	var frame *protobufs.GlobalFrame
+	var err error
 	if request.FrameNumber == 0 {
 		frame, err = e.globalTimeReel.GetHead()
 		if frame.Header.FrameNumber == 0 {
@@ -111,11 +116,24 @@ func (e *GlobalConsensusEngine) GetAppShards(
 	ctx context.Context,
 	req *protobufs.GetAppShardsRequest,
 ) (*protobufs.GetAppShardsResponse, error) {
-	if len(req.ShardKey) != 35 {
-		return nil, errors.Wrap(errors.New("invalid shard key"), "get app shards")
+	peerID, ok := qgrpc.PeerIDFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "remote peer ID not found")
 	}
 
-	shards, err := e.shardsStore.GetAppShards(req.ShardKey, req.Prefix)
+	if !bytes.Equal(e.pubsub.GetPeerID(), []byte(peerID)) {
+		if len(req.ShardKey) != 35 {
+			return nil, errors.Wrap(errors.New("invalid shard key"), "get app shards")
+		}
+	}
+
+	var shards []store.ShardInfo
+	var err error
+	if len(req.ShardKey) != 35 {
+		shards, err = e.shardsStore.RangeAppShards()
+	} else {
+		shards, err = e.shardsStore.GetAppShards(req.ShardKey, req.Prefix)
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, "get app shards")
 	}
@@ -164,11 +182,17 @@ func (e *GlobalConsensusEngine) GetAppShards(
 			}
 		}
 
+		shardKey := []byte{}
+		if len(req.ShardKey) != 35 {
+			shardKey = slices.Concat(shard.L1, shard.L2)
+		}
+
 		response.Info = append(response.Info, &protobufs.AppShardInfo{
 			Prefix:     shard.Path,
 			Size:       size.Bytes(),
 			Commitment: commitment,
 			DataShards: dataShards,
+			ShardKey:   shardKey,
 		})
 	}
 
@@ -260,6 +284,45 @@ func (e *GlobalConsensusEngine) GetLockedAddresses(
 	return &protobufs.GetLockedAddressesResponse{
 		Transactions: transactions,
 	}, nil
+}
+
+func (e *GlobalConsensusEngine) GetWorkerInfo(
+	ctx context.Context,
+	req *protobufs.GlobalGetWorkerInfoRequest,
+) (*protobufs.GlobalGetWorkerInfoResponse, error) {
+	peerID, ok := qgrpc.PeerIDFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "remote peer ID not found")
+	}
+
+	if !bytes.Equal(e.pubsub.GetPeerID(), []byte(peerID)) {
+		return nil, status.Error(codes.Internal, "remote peer ID not found")
+	}
+
+	workers, err := e.workerManager.RangeWorkers()
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	resp := &protobufs.GlobalGetWorkerInfoResponse{
+		Workers: []*protobufs.GlobalGetWorkerInfoResponseItem{},
+	}
+
+	for _, w := range workers {
+		resp.Workers = append(
+			resp.Workers,
+			&protobufs.GlobalGetWorkerInfoResponseItem{
+				CoreId:                uint32(w.CoreId),
+				ListenMultiaddr:       w.ListenMultiaddr,
+				StreamListenMultiaddr: w.StreamListenMultiaddr,
+				Filter:                w.Filter,
+				TotalStorage:          uint64(w.TotalStorage),
+				Allocated:             w.Allocated,
+			},
+		)
+	}
+
+	return resp, nil
 }
 
 func (e *GlobalConsensusEngine) RegisterServices(server *grpc.Server) {

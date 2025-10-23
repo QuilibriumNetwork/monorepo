@@ -198,9 +198,9 @@ func NewDHTNode(*zap.Logger, *config.Config, uint) (*DHTNode, error) {
 	))
 }
 
-// func NewDBConsole(*config.Config) (*DBConsole, error) {
-// 	panic(wire.Build(newDBConsole))
-// }
+func NewDBConsole(*config.Config) (*DBConsole, error) {
+	panic(wire.Build(newDBConsole))
+}
 
 func NewClockStore(
 	*zap.Logger,

@@ -3,8 +3,6 @@ package app
 import (
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"go.uber.org/zap"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -59,10 +57,10 @@ func newDataWorkerNode(
 	}, nil
 }
 
-func (n *DataWorkerNode) Start() error {
-	done := make(chan os.Signal, 1)
-	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
-
+func (n *DataWorkerNode) Start(
+	done chan os.Signal,
+	quitCh chan struct{},
+) error {
 	go func() {
 		err := n.ipcServer.Start()
 		if err != nil {
@@ -76,36 +74,33 @@ func (n *DataWorkerNode) Start() error {
 
 	n.logger.Info("data worker node started", zap.Uint("core_id", n.coreId))
 
-	defer n.Stop()
-
 	select {
-	case <-done:
 	case <-n.quit:
+	case <-done:
 	}
 
+	n.ipcServer.Stop()
+	err := n.pebble.Close()
+	if err != nil {
+		n.logger.Error(
+			"database shut down with errors",
+			zap.Error(err),
+			zap.Uint("core_id", n.coreId),
+		)
+	} else {
+		n.logger.Info(
+			"database stopped cleanly",
+			zap.Uint("core_id", n.coreId),
+		)
+	}
+
+	quitCh <- struct{}{}
 	return nil
 }
 
 func (n *DataWorkerNode) Stop() {
-	n.logger.Info("stopping data worker node", zap.Uint("core_id", n.coreId))
+	n.logger.Info("stopping data worker node")
 
-	if n.pebble != nil {
-		err := n.pebble.Close()
-		if err != nil {
-			n.logger.Error(
-				"database shut down with errors",
-				zap.Error(err),
-				zap.Uint("core_id", n.coreId),
-			)
-		} else {
-			n.logger.Info(
-				"database stopped cleanly",
-				zap.Uint("core_id", n.coreId),
-			)
-		}
-	}
-
-	// Signal quit
 	if n.quit != nil {
 		close(n.quit)
 	}

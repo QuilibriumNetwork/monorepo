@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	observability "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
@@ -32,6 +33,9 @@ type GlobalIntrinsic struct {
 	keyManager          keys.KeyManager
 	frameProver         crypto.FrameProver
 	frameStore          store.ClockStore
+	rewardIssuance      consensus.RewardIssuance
+	proverRegistry      consensus.ProverRegistry
+	blsConstructor      crypto.BlsConstructor
 }
 
 var GLOBAL_RDF_SCHEMA = `BASE <https://types.quilibrium.com/schema-repository/>
@@ -616,6 +620,60 @@ func (a *GlobalIntrinsic) Validate(
 		}
 
 		observability.ValidateTotal.WithLabelValues("global", "prover_kick").Inc()
+		return nil
+
+	case protobufs.FrameHeaderType:
+		// Parse ProverKick directly from input
+		pbHeader := &protobufs.FrameHeader{}
+		if err := pbHeader.FromCanonicalBytes(input); err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		op, err := NewProverShardUpdate(
+			pbHeader,
+			a.keyManager,
+			a.hypergraph,
+			a.rdfMultiprover,
+			a.frameProver,
+			a.rewardIssuance,
+			a.proverRegistry,
+			a.blsConstructor,
+		)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+		valid, err := op.Verify(frameNumber)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		if !valid {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			).Inc()
+			return errors.Wrap(
+				errors.New("invalid prover shard update"),
+				"validate",
+			)
+		}
+
+		observability.ValidateTotal.WithLabelValues(
+			"global",
+			"prover_shard_update",
+		).Inc()
 		return nil
 
 	default:
@@ -1769,6 +1827,9 @@ func LoadGlobalIntrinsic(
 	keyManager keys.KeyManager,
 	frameProver crypto.FrameProver,
 	frameStore store.ClockStore,
+	rewardIssuance consensus.RewardIssuance,
+	proverRegistry consensus.ProverRegistry,
+	blsConstructor crypto.BlsConstructor,
 ) (*GlobalIntrinsic, error) {
 	// Verify the address is the global intrinsic address
 	if !bytes.Equal(address, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:]) {
@@ -1793,6 +1854,9 @@ func LoadGlobalIntrinsic(
 		keyManager:          keyManager,
 		frameProver:         frameProver,
 		frameStore:          frameStore,
+		rewardIssuance:      rewardIssuance,
+		proverRegistry:      proverRegistry,
+		blsConstructor:      blsConstructor,
 	}, nil
 }
 

@@ -24,6 +24,7 @@ const (
 	GlobalService_GetAppShards_FullMethodName       = "/quilibrium.node.global.pb.GlobalService/GetAppShards"
 	GlobalService_GetGlobalShards_FullMethodName    = "/quilibrium.node.global.pb.GlobalService/GetGlobalShards"
 	GlobalService_GetLockedAddresses_FullMethodName = "/quilibrium.node.global.pb.GlobalService/GetLockedAddresses"
+	GlobalService_GetWorkerInfo_FullMethodName      = "/quilibrium.node.global.pb.GlobalService/GetWorkerInfo"
 )
 
 // GlobalServiceClient is the client API for GlobalService service.
@@ -34,6 +35,7 @@ type GlobalServiceClient interface {
 	GetAppShards(ctx context.Context, in *GetAppShardsRequest, opts ...grpc.CallOption) (*GetAppShardsResponse, error)
 	GetGlobalShards(ctx context.Context, in *GetGlobalShardsRequest, opts ...grpc.CallOption) (*GetGlobalShardsResponse, error)
 	GetLockedAddresses(ctx context.Context, in *GetLockedAddressesRequest, opts ...grpc.CallOption) (*GetLockedAddressesResponse, error)
+	GetWorkerInfo(ctx context.Context, in *GlobalGetWorkerInfoRequest, opts ...grpc.CallOption) (*GlobalGetWorkerInfoResponse, error)
 }
 
 type globalServiceClient struct {
@@ -80,6 +82,15 @@ func (c *globalServiceClient) GetLockedAddresses(ctx context.Context, in *GetLoc
 	return out, nil
 }
 
+func (c *globalServiceClient) GetWorkerInfo(ctx context.Context, in *GlobalGetWorkerInfoRequest, opts ...grpc.CallOption) (*GlobalGetWorkerInfoResponse, error) {
+	out := new(GlobalGetWorkerInfoResponse)
+	err := c.cc.Invoke(ctx, GlobalService_GetWorkerInfo_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GlobalServiceServer is the server API for GlobalService service.
 // All implementations must embed UnimplementedGlobalServiceServer
 // for forward compatibility
@@ -88,6 +99,7 @@ type GlobalServiceServer interface {
 	GetAppShards(context.Context, *GetAppShardsRequest) (*GetAppShardsResponse, error)
 	GetGlobalShards(context.Context, *GetGlobalShardsRequest) (*GetGlobalShardsResponse, error)
 	GetLockedAddresses(context.Context, *GetLockedAddressesRequest) (*GetLockedAddressesResponse, error)
+	GetWorkerInfo(context.Context, *GlobalGetWorkerInfoRequest) (*GlobalGetWorkerInfoResponse, error)
 	mustEmbedUnimplementedGlobalServiceServer()
 }
 
@@ -106,6 +118,9 @@ func (UnimplementedGlobalServiceServer) GetGlobalShards(context.Context, *GetGlo
 }
 func (UnimplementedGlobalServiceServer) GetLockedAddresses(context.Context, *GetLockedAddressesRequest) (*GetLockedAddressesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetLockedAddresses not implemented")
+}
+func (UnimplementedGlobalServiceServer) GetWorkerInfo(context.Context, *GlobalGetWorkerInfoRequest) (*GlobalGetWorkerInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetWorkerInfo not implemented")
 }
 func (UnimplementedGlobalServiceServer) mustEmbedUnimplementedGlobalServiceServer() {}
 
@@ -192,6 +207,24 @@ func _GlobalService_GetLockedAddresses_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _GlobalService_GetWorkerInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GlobalGetWorkerInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GlobalServiceServer).GetWorkerInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GlobalService_GetWorkerInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GlobalServiceServer).GetWorkerInfo(ctx, req.(*GlobalGetWorkerInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // GlobalService_ServiceDesc is the grpc.ServiceDesc for GlobalService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -214,6 +247,10 @@ var GlobalService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetLockedAddresses",
 			Handler:    _GlobalService_GetLockedAddresses_Handler,
+		},
+		{
+			MethodName: "GetWorkerInfo",
+			Handler:    _GlobalService_GetWorkerInfo_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -12,12 +12,12 @@ name = "ferret"
 
 [dependencies]
 libc = "0.2"
-uniffi = {  version= "0.25", features = ["cli"]}
+uniffi = {  version= "0.28.3", features = ["cli"]}
 hex = "0.4.3"
 rand = "0.9.0"
 rand_chacha = "0.9.0"
 
 [build-dependencies]
-uniffi = { version = "0.25", features = [ "build" ] }
+uniffi = { version = "0.28.3", features = [ "build" ] }
 bindgen = "0.63.0"
 cc = "1.0"

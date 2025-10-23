@@ -28,14 +28,12 @@ func (pm *peerMonitor) pingOnce(
 	select {
 	case <-ctx.Done():
 	case <-pingCtx.Done():
-		logger.Debug("ping timeout")
 		return false
 	case res := <-pm.ps.Ping(pingCtx, peer):
 		if res.Error != nil {
 			logger.Debug("ping error", zap.Error(res.Error))
 			return false
 		}
-		logger.Debug("ping success", zap.Duration("rtt", res.RTT))
 	}
 	return true
 }
@@ -59,7 +57,6 @@ func (pm *peerMonitor) run(ctx context.Context, logger *zap.Logger) {
 			return
 		case <-time.After(pm.period):
 			peers := pm.ps.Host.Network().Peers()
-			logger.Debug("pinging connected peers", zap.Int("peer_count", len(peers)))
 			wg := &sync.WaitGroup{}
 			for _, id := range peers {
 				slogger := logger.With(zap.String("peer_id", id.String()))
@@ -67,7 +64,6 @@ func (pm *peerMonitor) run(ctx context.Context, logger *zap.Logger) {
 				go pm.ping(ctx, slogger, wg, id)
 			}
 			wg.Wait()
-			logger.Debug("pinged connected peers")
 		}
 	}
 }

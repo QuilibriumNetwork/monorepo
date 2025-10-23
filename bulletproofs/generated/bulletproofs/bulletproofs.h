@@ -24,24 +24,10 @@
 // ⚠️ increment the version suffix in all instances of UNIFFI_SHARED_HEADER_V6 in this file.           ⚠️
 
 typedef struct RustBuffer {
-	int32_t capacity;
-	int32_t len;
+	uint64_t capacity;
+	uint64_t len;
 	uint8_t *data;
 } RustBuffer;
-
-typedef int32_t (*ForeignCallback)(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
-
-// Task defined in Rust that Go executes
-typedef void (*RustTaskCallback)(const void *, int8_t);
-
-// Callback to execute Rust tasks using a Go routine
-//
-// Args:
-//   executor: ForeignExecutor lowered into a uint64_t value
-//   delay: Delay in MS
-//   task: RustTaskCallback to call
-//   task_data: data to pass the task callback
-typedef int8_t (*ForeignExecutorCallback)(uint64_t, uint32_t, RustTaskCallback, void *);
 
 typedef struct ForeignBytes {
 	int32_t len;
@@ -54,527 +40,850 @@ typedef struct RustCallStatus {
 	RustBuffer errorBuf;
 } RustCallStatus;
 
-// Continuation callback for UniFFI Futures
-typedef void (*RustFutureContinuation)(void * , int8_t);
-
-// ⚠️ Attention: If you change this #else block (ending in `#endif // def UNIFFI_SHARED_H`) you *must* ⚠️
-// ⚠️ increment the version suffix in all instances of UNIFFI_SHARED_HEADER_V6 in this file.           ⚠️
-#endif // def UNIFFI_SHARED_H
-
-// Needed because we can't execute the callback directly from go.
-void cgo_rust_task_callback_bridge_bulletproofs(RustTaskCallback, const void *, int8_t);
-
-int8_t uniffiForeignExecutorCallbackbulletproofs(uint64_t, uint32_t, RustTaskCallback, void*);
-
-void uniffiFutureContinuationCallbackbulletproofs(void*, int8_t);
-
-RustBuffer uniffi_bulletproofs_fn_func_alt_generator(
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_generate_input_commitments(
-	RustBuffer values,
-	RustBuffer blinding,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_generate_range_proof(
-	RustBuffer values,
-	RustBuffer blinding,
-	uint64_t bit_size,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_hash_to_scalar(
-	RustBuffer input,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_keygen(
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_point_addition(
-	RustBuffer input_point,
-	RustBuffer public_point,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_point_subtraction(
-	RustBuffer input_point,
-	RustBuffer public_point,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_scalar_addition(
-	RustBuffer lhs,
-	RustBuffer rhs,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_scalar_inverse(
-	RustBuffer input_scalar,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_scalar_mult(
-	RustBuffer lhs,
-	RustBuffer rhs,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_scalar_mult_hash_to_scalar(
-	RustBuffer input_scalar,
-	RustBuffer public_point,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_scalar_mult_point(
-	RustBuffer input_scalar,
-	RustBuffer public_point,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_scalar_subtraction(
-	RustBuffer lhs,
-	RustBuffer rhs,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_scalar_to_point(
-	RustBuffer input,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_sign_hidden(
-	RustBuffer x,
-	RustBuffer t,
-	RustBuffer a,
-	RustBuffer r,
-	RustCallStatus* out_status
-);
-
-RustBuffer uniffi_bulletproofs_fn_func_sign_simple(
-	RustBuffer secret,
-	RustBuffer message,
-	RustCallStatus* out_status
-);
-
-int8_t uniffi_bulletproofs_fn_func_sum_check(
-	RustBuffer input_commitments,
-	RustBuffer additional_input_values,
-	RustBuffer output_commitments,
-	RustBuffer additional_output_values,
-	RustCallStatus* out_status
-);
-
-int8_t uniffi_bulletproofs_fn_func_verify_hidden(
-	RustBuffer c,
-	RustBuffer t,
-	RustBuffer s1,
-	RustBuffer s2,
-	RustBuffer s3,
-	RustBuffer p_point,
-	RustBuffer c_point,
-	RustCallStatus* out_status
-);
-
-int8_t uniffi_bulletproofs_fn_func_verify_range_proof(
-	RustBuffer proof,
-	RustBuffer commitment,
-	uint64_t bit_size,
-	RustCallStatus* out_status
-);
-
-int8_t uniffi_bulletproofs_fn_func_verify_simple(
-	RustBuffer message,
-	RustBuffer signature,
-	RustBuffer public_point,
-	RustCallStatus* out_status
-);
-
-RustBuffer ffi_bulletproofs_rustbuffer_alloc(
-	int32_t size,
-	RustCallStatus* out_status
-);
-
-RustBuffer ffi_bulletproofs_rustbuffer_from_bytes(
-	ForeignBytes bytes,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rustbuffer_free(
-	RustBuffer buf,
-	RustCallStatus* out_status
-);
-
-RustBuffer ffi_bulletproofs_rustbuffer_reserve(
-	RustBuffer buf,
-	int32_t additional,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_continuation_callback_set(
-	RustFutureContinuation callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_u8(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_u8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_u8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint8_t ffi_bulletproofs_rust_future_complete_u8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_i8(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_i8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_i8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-int8_t ffi_bulletproofs_rust_future_complete_i8(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_u16(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_u16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_u16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint16_t ffi_bulletproofs_rust_future_complete_u16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_i16(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_i16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_i16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-int16_t ffi_bulletproofs_rust_future_complete_i16(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_u32(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_u32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_u32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint32_t ffi_bulletproofs_rust_future_complete_u32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_i32(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_i32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_i32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-int32_t ffi_bulletproofs_rust_future_complete_i32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_u64(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_u64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_u64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint64_t ffi_bulletproofs_rust_future_complete_u64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_i64(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_i64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_i64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-int64_t ffi_bulletproofs_rust_future_complete_i64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_f32(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_f32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_f32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-float ffi_bulletproofs_rust_future_complete_f32(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_f64(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_f64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_f64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-double ffi_bulletproofs_rust_future_complete_f64(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_pointer(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_pointer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_pointer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void* ffi_bulletproofs_rust_future_complete_pointer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_rust_buffer(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_rust_buffer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_rust_buffer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-RustBuffer ffi_bulletproofs_rust_future_complete_rust_buffer(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_poll_void(
-	void* handle,
-	void* uniffi_callback,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_cancel_void(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_free_void(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-void ffi_bulletproofs_rust_future_complete_void(
-	void* handle,
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_alt_generator(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_generate_input_commitments(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_generate_range_proof(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_hash_to_scalar(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_keygen(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_point_addition(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_point_subtraction(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_scalar_addition(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_scalar_inverse(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_scalar_mult(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_scalar_mult_hash_to_scalar(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_scalar_mult_point(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_scalar_subtraction(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_scalar_to_point(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_sign_hidden(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_sign_simple(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_sum_check(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_verify_hidden(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_verify_range_proof(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_bulletproofs_checksum_func_verify_simple(
-	RustCallStatus* out_status
-);
-
-uint32_t ffi_bulletproofs_uniffi_contract_version(
-	RustCallStatus* out_status
-);
-
-
+#endif // UNIFFI_SHARED_H
+
+
+#ifndef UNIFFI_FFIDEF_RUST_FUTURE_CONTINUATION_CALLBACK
+#define UNIFFI_FFIDEF_RUST_FUTURE_CONTINUATION_CALLBACK
+typedef void (*UniffiRustFutureContinuationCallback)(uint64_t data, int8_t poll_result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiRustFutureContinuationCallback(
+				UniffiRustFutureContinuationCallback cb, uint64_t data, int8_t poll_result)
+{
+	return cb(data, poll_result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_FREE
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_FREE
+typedef void (*UniffiForeignFutureFree)(uint64_t handle);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureFree(
+				UniffiForeignFutureFree cb, uint64_t handle)
+{
+	return cb(handle);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_FREE
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_FREE
+typedef void (*UniffiCallbackInterfaceFree)(uint64_t handle);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiCallbackInterfaceFree(
+				UniffiCallbackInterfaceFree cb, uint64_t handle)
+{
+	return cb(handle);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE
+typedef struct UniffiForeignFuture {
+    uint64_t handle;
+    UniffiForeignFutureFree free;
+} UniffiForeignFuture;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U8
+typedef struct UniffiForeignFutureStructU8 {
+    uint8_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructU8;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U8
+typedef void (*UniffiForeignFutureCompleteU8)(uint64_t callback_data, UniffiForeignFutureStructU8 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteU8(
+				UniffiForeignFutureCompleteU8 cb, uint64_t callback_data, UniffiForeignFutureStructU8 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I8
+typedef struct UniffiForeignFutureStructI8 {
+    int8_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructI8;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I8
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I8
+typedef void (*UniffiForeignFutureCompleteI8)(uint64_t callback_data, UniffiForeignFutureStructI8 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteI8(
+				UniffiForeignFutureCompleteI8 cb, uint64_t callback_data, UniffiForeignFutureStructI8 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U16
+typedef struct UniffiForeignFutureStructU16 {
+    uint16_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructU16;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U16
+typedef void (*UniffiForeignFutureCompleteU16)(uint64_t callback_data, UniffiForeignFutureStructU16 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteU16(
+				UniffiForeignFutureCompleteU16 cb, uint64_t callback_data, UniffiForeignFutureStructU16 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I16
+typedef struct UniffiForeignFutureStructI16 {
+    int16_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructI16;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I16
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I16
+typedef void (*UniffiForeignFutureCompleteI16)(uint64_t callback_data, UniffiForeignFutureStructI16 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteI16(
+				UniffiForeignFutureCompleteI16 cb, uint64_t callback_data, UniffiForeignFutureStructI16 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U32
+typedef struct UniffiForeignFutureStructU32 {
+    uint32_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructU32;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U32
+typedef void (*UniffiForeignFutureCompleteU32)(uint64_t callback_data, UniffiForeignFutureStructU32 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteU32(
+				UniffiForeignFutureCompleteU32 cb, uint64_t callback_data, UniffiForeignFutureStructU32 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I32
+typedef struct UniffiForeignFutureStructI32 {
+    int32_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructI32;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I32
+typedef void (*UniffiForeignFutureCompleteI32)(uint64_t callback_data, UniffiForeignFutureStructI32 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteI32(
+				UniffiForeignFutureCompleteI32 cb, uint64_t callback_data, UniffiForeignFutureStructI32 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_U64
+typedef struct UniffiForeignFutureStructU64 {
+    uint64_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructU64;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_U64
+typedef void (*UniffiForeignFutureCompleteU64)(uint64_t callback_data, UniffiForeignFutureStructU64 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteU64(
+				UniffiForeignFutureCompleteU64 cb, uint64_t callback_data, UniffiForeignFutureStructU64 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_I64
+typedef struct UniffiForeignFutureStructI64 {
+    int64_t returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructI64;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_I64
+typedef void (*UniffiForeignFutureCompleteI64)(uint64_t callback_data, UniffiForeignFutureStructI64 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteI64(
+				UniffiForeignFutureCompleteI64 cb, uint64_t callback_data, UniffiForeignFutureStructI64 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F32
+typedef struct UniffiForeignFutureStructF32 {
+    float returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructF32;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F32
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F32
+typedef void (*UniffiForeignFutureCompleteF32)(uint64_t callback_data, UniffiForeignFutureStructF32 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteF32(
+				UniffiForeignFutureCompleteF32 cb, uint64_t callback_data, UniffiForeignFutureStructF32 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_F64
+typedef struct UniffiForeignFutureStructF64 {
+    double returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructF64;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F64
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_F64
+typedef void (*UniffiForeignFutureCompleteF64)(uint64_t callback_data, UniffiForeignFutureStructF64 result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteF64(
+				UniffiForeignFutureCompleteF64 cb, uint64_t callback_data, UniffiForeignFutureStructF64 result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_POINTER
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_POINTER
+typedef struct UniffiForeignFutureStructPointer {
+    void* returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructPointer;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_POINTER
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_POINTER
+typedef void (*UniffiForeignFutureCompletePointer)(uint64_t callback_data, UniffiForeignFutureStructPointer result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompletePointer(
+				UniffiForeignFutureCompletePointer cb, uint64_t callback_data, UniffiForeignFutureStructPointer result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_RUST_BUFFER
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_RUST_BUFFER
+typedef struct UniffiForeignFutureStructRustBuffer {
+    RustBuffer returnValue;
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructRustBuffer;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_RUST_BUFFER
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_RUST_BUFFER
+typedef void (*UniffiForeignFutureCompleteRustBuffer)(uint64_t callback_data, UniffiForeignFutureStructRustBuffer result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteRustBuffer(
+				UniffiForeignFutureCompleteRustBuffer cb, uint64_t callback_data, UniffiForeignFutureStructRustBuffer result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_VOID
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_STRUCT_VOID
+typedef struct UniffiForeignFutureStructVoid {
+    RustCallStatus callStatus;
+} UniffiForeignFutureStructVoid;
+
+#endif
+#ifndef UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_VOID
+#define UNIFFI_FFIDEF_FOREIGN_FUTURE_COMPLETE_VOID
+typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t callback_data, UniffiForeignFutureStructVoid result);
+
+// Making function static works arround:
+// https://github.com/golang/go/issues/11263
+static void call_UniffiForeignFutureCompleteVoid(
+				UniffiForeignFutureCompleteVoid cb, uint64_t callback_data, UniffiForeignFutureStructVoid result)
+{
+	return cb(callback_data, result);
+}
+
+
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_ALT_GENERATOR
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_ALT_GENERATOR
+RustBuffer uniffi_bulletproofs_fn_func_alt_generator(RustCallStatus *out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_GENERATE_INPUT_COMMITMENTS
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_GENERATE_INPUT_COMMITMENTS
+RustBuffer uniffi_bulletproofs_fn_func_generate_input_commitments(RustBuffer values, RustBuffer blinding, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_GENERATE_RANGE_PROOF
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_GENERATE_RANGE_PROOF
+RustBuffer uniffi_bulletproofs_fn_func_generate_range_proof(RustBuffer values, RustBuffer blinding, uint64_t bit_size, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_HASH_TO_SCALAR
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_HASH_TO_SCALAR
+RustBuffer uniffi_bulletproofs_fn_func_hash_to_scalar(RustBuffer input, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_KEYGEN
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_KEYGEN
+RustBuffer uniffi_bulletproofs_fn_func_keygen(RustCallStatus *out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_POINT_ADDITION
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_POINT_ADDITION
+RustBuffer uniffi_bulletproofs_fn_func_point_addition(RustBuffer input_point, RustBuffer public_point, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_POINT_SUBTRACTION
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_POINT_SUBTRACTION
+RustBuffer uniffi_bulletproofs_fn_func_point_subtraction(RustBuffer input_point, RustBuffer public_point, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_ADDITION
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_ADDITION
+RustBuffer uniffi_bulletproofs_fn_func_scalar_addition(RustBuffer lhs, RustBuffer rhs, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_INVERSE
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_INVERSE
+RustBuffer uniffi_bulletproofs_fn_func_scalar_inverse(RustBuffer input_scalar, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_MULT
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_MULT
+RustBuffer uniffi_bulletproofs_fn_func_scalar_mult(RustBuffer lhs, RustBuffer rhs, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_MULT_HASH_TO_SCALAR
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_MULT_HASH_TO_SCALAR
+RustBuffer uniffi_bulletproofs_fn_func_scalar_mult_hash_to_scalar(RustBuffer input_scalar, RustBuffer public_point, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_MULT_POINT
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_MULT_POINT
+RustBuffer uniffi_bulletproofs_fn_func_scalar_mult_point(RustBuffer input_scalar, RustBuffer public_point, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_SUBTRACTION
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_SUBTRACTION
+RustBuffer uniffi_bulletproofs_fn_func_scalar_subtraction(RustBuffer lhs, RustBuffer rhs, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_TO_POINT
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SCALAR_TO_POINT
+RustBuffer uniffi_bulletproofs_fn_func_scalar_to_point(RustBuffer input, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SIGN_HIDDEN
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SIGN_HIDDEN
+RustBuffer uniffi_bulletproofs_fn_func_sign_hidden(RustBuffer x, RustBuffer t, RustBuffer a, RustBuffer r, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SIGN_SIMPLE
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SIGN_SIMPLE
+RustBuffer uniffi_bulletproofs_fn_func_sign_simple(RustBuffer secret, RustBuffer message, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SUM_CHECK
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_SUM_CHECK
+int8_t uniffi_bulletproofs_fn_func_sum_check(RustBuffer input_commitments, RustBuffer additional_input_values, RustBuffer output_commitments, RustBuffer additional_output_values, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_VERIFY_HIDDEN
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_VERIFY_HIDDEN
+int8_t uniffi_bulletproofs_fn_func_verify_hidden(RustBuffer c, RustBuffer t, RustBuffer s1, RustBuffer s2, RustBuffer s3, RustBuffer p_point, RustBuffer c_point, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_VERIFY_RANGE_PROOF
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_VERIFY_RANGE_PROOF
+int8_t uniffi_bulletproofs_fn_func_verify_range_proof(RustBuffer proof, RustBuffer commitment, uint64_t bit_size, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_VERIFY_SIMPLE
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_FN_FUNC_VERIFY_SIMPLE
+int8_t uniffi_bulletproofs_fn_func_verify_simple(RustBuffer message, RustBuffer signature, RustBuffer public_point, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUSTBUFFER_ALLOC
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUSTBUFFER_ALLOC
+RustBuffer ffi_bulletproofs_rustbuffer_alloc(uint64_t size, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUSTBUFFER_FROM_BYTES
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUSTBUFFER_FROM_BYTES
+RustBuffer ffi_bulletproofs_rustbuffer_from_bytes(ForeignBytes bytes, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUSTBUFFER_FREE
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUSTBUFFER_FREE
+void ffi_bulletproofs_rustbuffer_free(RustBuffer buf, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUSTBUFFER_RESERVE
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUSTBUFFER_RESERVE
+RustBuffer ffi_bulletproofs_rustbuffer_reserve(RustBuffer buf, uint64_t additional, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_U8
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_U8
+void ffi_bulletproofs_rust_future_poll_u8(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_U8
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_U8
+void ffi_bulletproofs_rust_future_cancel_u8(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_U8
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_U8
+void ffi_bulletproofs_rust_future_free_u8(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_U8
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_U8
+uint8_t ffi_bulletproofs_rust_future_complete_u8(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_I8
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_I8
+void ffi_bulletproofs_rust_future_poll_i8(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_I8
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_I8
+void ffi_bulletproofs_rust_future_cancel_i8(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_I8
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_I8
+void ffi_bulletproofs_rust_future_free_i8(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_I8
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_I8
+int8_t ffi_bulletproofs_rust_future_complete_i8(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_U16
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_U16
+void ffi_bulletproofs_rust_future_poll_u16(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_U16
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_U16
+void ffi_bulletproofs_rust_future_cancel_u16(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_U16
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_U16
+void ffi_bulletproofs_rust_future_free_u16(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_U16
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_U16
+uint16_t ffi_bulletproofs_rust_future_complete_u16(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_I16
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_I16
+void ffi_bulletproofs_rust_future_poll_i16(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_I16
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_I16
+void ffi_bulletproofs_rust_future_cancel_i16(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_I16
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_I16
+void ffi_bulletproofs_rust_future_free_i16(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_I16
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_I16
+int16_t ffi_bulletproofs_rust_future_complete_i16(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_U32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_U32
+void ffi_bulletproofs_rust_future_poll_u32(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_U32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_U32
+void ffi_bulletproofs_rust_future_cancel_u32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_U32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_U32
+void ffi_bulletproofs_rust_future_free_u32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_U32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_U32
+uint32_t ffi_bulletproofs_rust_future_complete_u32(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_I32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_I32
+void ffi_bulletproofs_rust_future_poll_i32(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_I32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_I32
+void ffi_bulletproofs_rust_future_cancel_i32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_I32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_I32
+void ffi_bulletproofs_rust_future_free_i32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_I32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_I32
+int32_t ffi_bulletproofs_rust_future_complete_i32(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_U64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_U64
+void ffi_bulletproofs_rust_future_poll_u64(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_U64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_U64
+void ffi_bulletproofs_rust_future_cancel_u64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_U64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_U64
+void ffi_bulletproofs_rust_future_free_u64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_U64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_U64
+uint64_t ffi_bulletproofs_rust_future_complete_u64(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_I64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_I64
+void ffi_bulletproofs_rust_future_poll_i64(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_I64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_I64
+void ffi_bulletproofs_rust_future_cancel_i64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_I64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_I64
+void ffi_bulletproofs_rust_future_free_i64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_I64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_I64
+int64_t ffi_bulletproofs_rust_future_complete_i64(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_F32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_F32
+void ffi_bulletproofs_rust_future_poll_f32(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_F32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_F32
+void ffi_bulletproofs_rust_future_cancel_f32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_F32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_F32
+void ffi_bulletproofs_rust_future_free_f32(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_F32
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_F32
+float ffi_bulletproofs_rust_future_complete_f32(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_F64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_F64
+void ffi_bulletproofs_rust_future_poll_f64(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_F64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_F64
+void ffi_bulletproofs_rust_future_cancel_f64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_F64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_F64
+void ffi_bulletproofs_rust_future_free_f64(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_F64
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_F64
+double ffi_bulletproofs_rust_future_complete_f64(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_POINTER
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_POINTER
+void ffi_bulletproofs_rust_future_poll_pointer(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_POINTER
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_POINTER
+void ffi_bulletproofs_rust_future_cancel_pointer(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_POINTER
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_POINTER
+void ffi_bulletproofs_rust_future_free_pointer(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_POINTER
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_POINTER
+void* ffi_bulletproofs_rust_future_complete_pointer(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_RUST_BUFFER
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_RUST_BUFFER
+void ffi_bulletproofs_rust_future_poll_rust_buffer(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_RUST_BUFFER
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_RUST_BUFFER
+void ffi_bulletproofs_rust_future_cancel_rust_buffer(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_RUST_BUFFER
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_RUST_BUFFER
+void ffi_bulletproofs_rust_future_free_rust_buffer(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_RUST_BUFFER
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_RUST_BUFFER
+RustBuffer ffi_bulletproofs_rust_future_complete_rust_buffer(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_VOID
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_POLL_VOID
+void ffi_bulletproofs_rust_future_poll_void(uint64_t handle, UniffiRustFutureContinuationCallback callback, uint64_t callback_data
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_VOID
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_CANCEL_VOID
+void ffi_bulletproofs_rust_future_cancel_void(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_VOID
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_FREE_VOID
+void ffi_bulletproofs_rust_future_free_void(uint64_t handle
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_VOID
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_RUST_FUTURE_COMPLETE_VOID
+void ffi_bulletproofs_rust_future_complete_void(uint64_t handle, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_ALT_GENERATOR
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_ALT_GENERATOR
+uint16_t uniffi_bulletproofs_checksum_func_alt_generator(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_GENERATE_INPUT_COMMITMENTS
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_GENERATE_INPUT_COMMITMENTS
+uint16_t uniffi_bulletproofs_checksum_func_generate_input_commitments(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_GENERATE_RANGE_PROOF
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_GENERATE_RANGE_PROOF
+uint16_t uniffi_bulletproofs_checksum_func_generate_range_proof(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_HASH_TO_SCALAR
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_HASH_TO_SCALAR
+uint16_t uniffi_bulletproofs_checksum_func_hash_to_scalar(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_KEYGEN
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_KEYGEN
+uint16_t uniffi_bulletproofs_checksum_func_keygen(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_POINT_ADDITION
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_POINT_ADDITION
+uint16_t uniffi_bulletproofs_checksum_func_point_addition(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_POINT_SUBTRACTION
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_POINT_SUBTRACTION
+uint16_t uniffi_bulletproofs_checksum_func_point_subtraction(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_ADDITION
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_ADDITION
+uint16_t uniffi_bulletproofs_checksum_func_scalar_addition(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_INVERSE
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_INVERSE
+uint16_t uniffi_bulletproofs_checksum_func_scalar_inverse(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_MULT
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_MULT
+uint16_t uniffi_bulletproofs_checksum_func_scalar_mult(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_MULT_HASH_TO_SCALAR
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_MULT_HASH_TO_SCALAR
+uint16_t uniffi_bulletproofs_checksum_func_scalar_mult_hash_to_scalar(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_MULT_POINT
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_MULT_POINT
+uint16_t uniffi_bulletproofs_checksum_func_scalar_mult_point(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_SUBTRACTION
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_SUBTRACTION
+uint16_t uniffi_bulletproofs_checksum_func_scalar_subtraction(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_TO_POINT
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SCALAR_TO_POINT
+uint16_t uniffi_bulletproofs_checksum_func_scalar_to_point(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SIGN_HIDDEN
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SIGN_HIDDEN
+uint16_t uniffi_bulletproofs_checksum_func_sign_hidden(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SIGN_SIMPLE
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SIGN_SIMPLE
+uint16_t uniffi_bulletproofs_checksum_func_sign_simple(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SUM_CHECK
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_SUM_CHECK
+uint16_t uniffi_bulletproofs_checksum_func_sum_check(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_VERIFY_HIDDEN
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_VERIFY_HIDDEN
+uint16_t uniffi_bulletproofs_checksum_func_verify_hidden(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_VERIFY_RANGE_PROOF
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_VERIFY_RANGE_PROOF
+uint16_t uniffi_bulletproofs_checksum_func_verify_range_proof(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_VERIFY_SIMPLE
+#define UNIFFI_FFIDEF_UNIFFI_BULLETPROOFS_CHECKSUM_FUNC_VERIFY_SIMPLE
+uint16_t uniffi_bulletproofs_checksum_func_verify_simple(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_FFI_BULLETPROOFS_UNIFFI_CONTRACT_VERSION
+#define UNIFFI_FFIDEF_FFI_BULLETPROOFS_UNIFFI_CONTRACT_VERSION
+uint32_t ffi_bulletproofs_uniffi_contract_version(void
+    
+);
+#endif
 

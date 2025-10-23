@@ -447,9 +447,6 @@ func (p *PebbleInboxStore) updateMaterializedHub(
 	}
 
 	response := &protobufs.HubResponse{Adds: effAdds, Deletes: effDels}
-	if err != nil {
-		return err
-	}
 
 	materializedKey := hubMaterializedKey(filter, hubAddress)
 	value, err := proto.Marshal(response)

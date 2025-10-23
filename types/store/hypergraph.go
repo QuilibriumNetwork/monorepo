@@ -96,6 +96,20 @@ type HypergraphStore interface {
 		setType string,
 		shardKey tries.ShardKey,
 	) error
-	MarkHypergraphAsComplete()
+	SetShardCommit(
+		txn tries.TreeBackingStoreTransaction,
+		frameNumber uint64,
+		phaseType string,
+		setType string,
+		shardAddress []byte,
+		commitment []byte,
+	) error
+	GetShardCommit(
+		frameNumber uint64,
+		phaseType string,
+		setType string,
+		shardAddress []byte,
+	) ([]byte, error)
+	GetRootCommits(frameNumber uint64) (map[tries.ShardKey][][]byte, error)
 	ApplySnapshot(dbPath string) error
 }

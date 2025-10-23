@@ -122,7 +122,7 @@ func (i *PendingTransactionInput) Prove(
 	var blind []byte
 
 	if bytes.Equal(i.address[:32], QUIL_TOKEN_ADDRESS) &&
-		frameNumber <= FRAME_2_1_CUTOVER {
+		frameNumber <= FRAME_2_1_CUTOVER && !BEHAVIOR_PASS {
 		// Structurally, the composition of the pre-2.1 packed tree is:
 		// 0x0000000000000000 - FrameNumber
 		// 0x0000000000000001 - CoinBalance
@@ -939,12 +939,13 @@ func (o *PendingTransactionOutput) Verify(
 	frameNumber uint64,
 	config *TokenIntrinsicConfiguration,
 ) (bool, error) {
-	if !bytes.Equal(
-		binary.BigEndian.AppendUint64(nil, frameNumber),
-		o.FrameNumber,
-	) {
+	if frameNumber <= binary.BigEndian.Uint64(o.FrameNumber) {
 		return false, errors.Wrap(
-			errors.New("invalid frame number"),
+			errors.New(fmt.Sprintf(
+				"invalid frame number: output: %d, actual: %d",
+				binary.BigEndian.Uint64(o.FrameNumber),
+				frameNumber,
+			)),
 			"verify output",
 		)
 	}
@@ -1666,14 +1667,25 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 		commitments = append(commitments, tx.Outputs[i].Commitment)
 	}
 
+	roots, err := tx.hypergraph.GetShardCommits(
+		binary.BigEndian.Uint64(tx.Outputs[0].FrameNumber),
+		tx.Domain[:],
+	)
+	if err != nil {
+		return false, errors.Wrap(err, "verify")
+	}
+
 	valid, err := tx.hypergraph.VerifyTraversalProof(
 		tx.Domain,
 		hypergraph.VertexAtomType,
 		hypergraph.AddsPhaseType,
+		roots[0],
 		tx.TraversalProof,
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid traversal proof"), "verify")
+		return false, errors.Wrap(errors.New(
+			fmt.Sprintf("invalid traversal proof: %v", err),
+		), "verify")
 	}
 
 	if !tx.bulletproofProver.VerifyRangeProof(tx.RangeProof, commitment, 128) {

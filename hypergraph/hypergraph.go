@@ -580,7 +580,6 @@ func (hg *HypergraphCRDT) GetMetadataAtKey(pathKey []byte) (
 			path,
 		)
 		if err != nil {
-			hg.logger.Debug("could not get node by path", zap.Error(err))
 			metadata = append(metadata, hypergraph.ShardMetadata{
 				Commitment: make([]byte, 64),
 				LeafCount:  0,

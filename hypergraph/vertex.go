@@ -147,7 +147,6 @@ func (hg *HypergraphCRDT) addVertex(
 ) error {
 	timer := prometheus.NewTimer(AddVertexDuration)
 	defer timer.ObserveDuration()
-
 	shardAddr := hypergraph.GetShardKey(v)
 	addSet, _ := hg.getOrCreateIdSet(
 		shardAddr,

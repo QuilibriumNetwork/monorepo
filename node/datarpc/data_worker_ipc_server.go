@@ -103,6 +103,7 @@ func (r *DataWorkerIPCServer) Start() error {
 }
 
 func (r *DataWorkerIPCServer) Stop() error {
+	r.logger.Info("stopping server gracefully")
 	r.server.GracefulStop()
 	go func() {
 		r.quit <- struct{}{}
@@ -171,6 +172,8 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 	}
 	r.server = qgrpc.NewServer(
 		grpc.Creds(tlsCreds),
+		grpc.ChainUnaryInterceptor(r.authProvider.UnaryInterceptor),
+		grpc.ChainStreamInterceptor(r.authProvider.StreamInterceptor),
 		grpc.MaxRecvMsgSize(10*1024*1024),
 		grpc.MaxSendMsgSize(10*1024*1024),
 	)

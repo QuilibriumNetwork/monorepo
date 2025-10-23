@@ -101,6 +101,7 @@ func (e *TokenExecutionEngine) Prove(
 	case *protobufs.MessageRequest_Transaction:
 		transaction, err := token.TransactionFromProtobuf(
 			req.Transaction,
+			e.inclusionProver,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "prove")
@@ -119,6 +120,7 @@ func (e *TokenExecutionEngine) Prove(
 	case *protobufs.MessageRequest_PendingTransaction:
 		pendingTransaction, err := token.PendingTransactionFromProtobuf(
 			req.PendingTransaction,
+			e.inclusionProver,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "prove")
@@ -191,6 +193,7 @@ func (e *TokenExecutionEngine) GetCost(message []byte) (*big.Int, error) {
 	case *protobufs.MessageRequest_Transaction:
 		transaction, err := token.TransactionFromProtobuf(
 			req.Transaction,
+			e.inclusionProver,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "get cost")
@@ -201,6 +204,7 @@ func (e *TokenExecutionEngine) GetCost(message []byte) (*big.Int, error) {
 	case *protobufs.MessageRequest_PendingTransaction:
 		pendingTransaction, err := token.PendingTransactionFromProtobuf(
 			req.PendingTransaction,
+			e.inclusionProver,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "get cost")
@@ -260,14 +264,8 @@ func (e *TokenExecutionEngine) Start() <-chan error {
 	go func() {
 		e.logger.Info("starting token execution engine")
 
-		// Main loop
-		for {
-			select {
-			case <-e.stopChan:
-				e.logger.Info("stopping token execution engine")
-				return
-			}
-		}
+		<-e.stopChan
+		e.logger.Info("stopping token execution engine")
 	}()
 
 	return errChan
@@ -405,7 +403,6 @@ func (e *TokenExecutionEngine) validateIndividualMessage(
 ) error {
 	isTokenOp := false
 	isUpdate := false
-	var err error
 	switch message.Request.(type) {
 	case *protobufs.MessageRequest_TokenDeploy:
 		isTokenOp = true
@@ -419,9 +416,6 @@ func (e *TokenExecutionEngine) validateIndividualMessage(
 		isTokenOp = true
 	case *protobufs.MessageRequest_Transaction:
 		isTokenOp = true
-	}
-	if err != nil {
-		return errors.Wrap(err, "validate individual message")
 	}
 
 	if !isTokenOp {
@@ -771,7 +765,6 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 	e.logger.Debug(
 		"processed individual message",
 		zap.String("address", hex.EncodeToString(address)),
-		zap.Any("state", newState),
 	)
 
 	return &execution.ProcessMessageResult{
@@ -869,6 +862,7 @@ func (e *TokenExecutionEngine) handleDeploy(
 			e.bulletproofProver,
 			e.inclusionProver,
 			e.keyManager,
+			e.clockStore,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "handle deploy")
@@ -927,6 +921,7 @@ func (e *TokenExecutionEngine) tryGetIntrinsic(
 			e.bulletproofProver,
 			e.inclusionProver,
 			e.keyManager,
+			e.clockStore,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "try get intrinsic")

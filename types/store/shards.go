@@ -7,6 +7,7 @@ type ShardInfo struct {
 }
 
 type ShardsStore interface {
+	RangeAppShards() ([]ShardInfo, error)
 	GetAppShards(
 		shardKey []byte,
 		prefix []uint32,

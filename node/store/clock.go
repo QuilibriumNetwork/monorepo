@@ -303,19 +303,19 @@ func clockShardParentIndexKey(
 	)
 }
 
-func clockShardCandidateFrameKey(
-	address []byte,
-	frameNumber uint64,
-	parent []byte,
-	distance []byte,
-) []byte {
-	key := []byte{CLOCK_FRAME, CLOCK_SHARD_FRAME_CANDIDATE_SHARD}
-	key = binary.BigEndian.AppendUint64(key, frameNumber)
-	key = append(key, address...)
-	key = append(key, rightAlign(parent, 32)...)
-	key = append(key, rightAlign(distance, 32)...)
-	return key
-}
+// func clockShardCandidateFrameKey(
+// 	address []byte,
+// 	frameNumber uint64,
+// 	parent []byte,
+// 	distance []byte,
+// ) []byte {
+// 	key := []byte{CLOCK_FRAME, CLOCK_SHARD_FRAME_CANDIDATE_SHARD}
+// 	key = binary.BigEndian.AppendUint64(key, frameNumber)
+// 	key = append(key, address...)
+// 	key = append(key, rightAlign(parent, 32)...)
+// 	key = append(key, rightAlign(distance, 32)...)
+// 	return key
+// }
 
 func clockProverTrieKey(filter []byte, ring uint16, frameNumber uint64) []byte {
 	key := []byte{CLOCK_FRAME, CLOCK_SHARD_FRAME_FRECENCY_SHARD}
@@ -924,7 +924,7 @@ func (p *PebbleClockStore) DeleteShardClockFrameRange(
 		// The prover trie keys are not stored continuously with respect
 		// to the same frame number. As such, we need to manually iterate
 		// and discover such keys.
-		for t := uint16(0); t <= 0xffff; t++ {
+		for t := uint16(0); true; t++ {
 			_, closer, err := p.db.Get(clockProverTrieKey(filter, t, i))
 			if err != nil {
 				if !errors.Is(err, pebble.ErrNotFound) {

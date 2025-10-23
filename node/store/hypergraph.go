@@ -19,6 +19,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
+	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
 var _ store.HypergraphStore = (*PebbleHypergraphStore)(nil)
@@ -295,6 +296,52 @@ func hypergraphHyperedgeRemovesTreeRootKey(
 	return key
 }
 
+// shard commits have a slightly different structure, because fast scanning
+// of the range in a given frame number is preferable
+func hypergraphVertexAddsShardCommitKey(
+	frameNumber uint64,
+	shardAddress []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD}
+	key = binary.BigEndian.AppendUint64(key, frameNumber)
+	key = append(key, HYPERGRAPH_VERTEX_ADDS_SHARD_COMMIT)
+	key = append(key, shardAddress...)
+	return key
+}
+
+func hypergraphVertexRemovesShardCommitKey(
+	frameNumber uint64,
+	shardAddress []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD}
+	key = binary.BigEndian.AppendUint64(key, frameNumber)
+	key = append(key, HYPERGRAPH_VERTEX_REMOVES_SHARD_COMMIT)
+	key = append(key, shardAddress...)
+	return key
+}
+
+func hypergraphHyperedgeAddsShardCommitKey(
+	frameNumber uint64,
+	shardAddress []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD}
+	key = binary.BigEndian.AppendUint64(key, frameNumber)
+	key = append(key, HYPERGRAPH_HYPEREDGE_ADDS_SHARD_COMMIT)
+	key = append(key, shardAddress...)
+	return key
+}
+
+func hypergraphHyperedgeRemovesShardCommitKey(
+	frameNumber uint64,
+	shardAddress []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD}
+	key = binary.BigEndian.AppendUint64(key, frameNumber)
+	key = append(key, HYPERGRAPH_HYPEREDGE_REMOVES_SHARD_COMMIT)
+	key = append(key, shardAddress...)
+	return key
+}
+
 func hypergraphCoveredPrefixKey() []byte {
 	key := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_COVERED_PREFIX}
 	return key
@@ -357,7 +404,12 @@ func (p *PebbleHypergraphStore) SaveVertexTree(
 
 func (p *PebbleHypergraphStore) SetCoveredPrefix(coveredPrefix []int) error {
 	buf := bytes.NewBuffer(nil)
-	err := binary.Write(buf, binary.BigEndian, coveredPrefix)
+	prefix := []int64{}
+	for _, p := range coveredPrefix {
+		prefix = append(prefix, int64(p))
+	}
+
+	err := binary.Write(buf, binary.BigEndian, prefix)
 	if err != nil {
 		return errors.Wrap(err, "set covered prefix")
 	}
@@ -376,12 +428,17 @@ func (p *PebbleHypergraphStore) LoadHypergraph(
 	coveredPrefix := []int{}
 	coveredPrefixBytes, closer, err := p.db.Get(hypergraphCoveredPrefixKey())
 	if err == nil && len(coveredPrefixBytes) != 0 {
-		coveredPrefix = make([]int, len(coveredPrefixBytes)/8)
+		prefix := make([]int64, len(coveredPrefixBytes)/8)
 		buf := bytes.NewBuffer(coveredPrefixBytes)
-		err = binary.Read(buf, binary.BigEndian, &coveredPrefix)
+		err = binary.Read(buf, binary.BigEndian, &prefix)
 		closer.Close()
 		if err != nil {
 			return nil, errors.Wrap(err, "load hypergraph")
+		}
+
+		coveredPrefix = make([]int, len(prefix))
+		for i, p := range prefix {
+			coveredPrefix[i] = int(p)
 		}
 	}
 	hg := hgcrdt.NewHypergraph(
@@ -1292,6 +1349,128 @@ func (p *PebbleHypergraphStore) UntrackChange(
 	)
 
 	return errors.Wrap(deleter(changeKey), "untrack change")
+}
+
+// SetShardCommit sets the shard-level commit value at a given address for a
+// given frame number.
+func (p *PebbleHypergraphStore) SetShardCommit(
+	txn tries.TreeBackingStoreTransaction,
+	frameNumber uint64,
+	phaseType string,
+	setType string,
+	shardAddress []byte,
+	commitment []byte,
+) error {
+	keyFn := hypergraphVertexAddsShardCommitKey
+	switch phaseType {
+	case "adds":
+		switch setType {
+		case "vertex":
+			keyFn = hypergraphVertexAddsShardCommitKey
+		case "hyperedge":
+			keyFn = hypergraphHyperedgeAddsShardCommitKey
+		}
+	case "removes":
+		switch setType {
+		case "vertex":
+			keyFn = hypergraphVertexRemovesShardCommitKey
+		case "hyperedge":
+			keyFn = hypergraphHyperedgeRemovesShardCommitKey
+		}
+	}
+
+	err := txn.Set(keyFn(frameNumber, shardAddress), commitment)
+	return errors.Wrap(err, "set shard commit")
+}
+
+// GetShardCommit retrieves the shard-level commit value at a given address for
+// a given frame number.
+func (p *PebbleHypergraphStore) GetShardCommit(
+	frameNumber uint64,
+	phaseType string,
+	setType string,
+	shardAddress []byte,
+) ([]byte, error) {
+	keyFn := hypergraphVertexAddsShardCommitKey
+	switch phaseType {
+	case "adds":
+		switch setType {
+		case "vertex":
+			keyFn = hypergraphVertexAddsShardCommitKey
+		case "hyperedge":
+			keyFn = hypergraphHyperedgeAddsShardCommitKey
+		}
+	case "removes":
+		switch setType {
+		case "vertex":
+			keyFn = hypergraphVertexRemovesShardCommitKey
+		case "hyperedge":
+			keyFn = hypergraphHyperedgeRemovesShardCommitKey
+		}
+	}
+
+	value, closer, err := p.db.Get(keyFn(frameNumber, shardAddress))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, errors.Wrap(store.ErrNotFound, "get shard commit")
+		}
+
+		return nil, errors.Wrap(err, "get shard commit")
+	}
+
+	defer closer.Close()
+	commitment := make([]byte, len(value))
+	copy(commitment, value)
+
+	return commitment, nil
+}
+
+// GetRootCommits retrieves the entire set of root commitments for all shards,
+// including global-level, for a given frame number.
+func (p *PebbleHypergraphStore) GetRootCommits(
+	frameNumber uint64,
+) (map[tries.ShardKey][][]byte, error) {
+	iter, err := p.db.NewIter(
+		hypergraphVertexAddsShardCommitKey(frameNumber, nil),
+		hypergraphHyperedgeAddsShardCommitKey(
+			frameNumber,
+			bytes.Repeat([]byte{0xff}, 65),
+		),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get root commits")
+	}
+
+	result := make(map[tries.ShardKey][][]byte)
+	for iter.First(); iter.Valid(); iter.Next() {
+		// root shard keys have a constant size of key type (2) + frame number (8) +
+		// root address (32)
+		if len(iter.Key()) != 2+8+32 {
+			continue
+		}
+
+		l1 := up2p.GetBloomFilterIndices(iter.Key()[10:], 256, 3)
+		l2 := slices.Clone(iter.Key()[10:])
+		_, ok := result[tries.ShardKey{
+			L1: [3]byte(l1),
+			L2: [32]byte(l2),
+		}]
+		if !ok {
+			result[tries.ShardKey{
+				L1: [3]byte(l1),
+				L2: [32]byte(l2),
+			}] = make([][]byte, 4)
+		}
+
+		commitIdx := iter.Key()[9] - HYPERGRAPH_VERTEX_ADDS_SHARD_COMMIT
+		result[tries.ShardKey{
+			L1: [3]byte(l1),
+			L2: [32]byte(l2),
+		}][commitIdx] = slices.Clone(iter.Value())
+	}
+	iter.Close()
+
+	return result, nil
 }
 
 // ApplySnapshot opens the downloaded Pebble DB at <dbPath>/snapshot and

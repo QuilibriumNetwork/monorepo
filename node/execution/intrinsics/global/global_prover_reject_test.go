@@ -80,6 +80,7 @@ func TestProverReject_Verify(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 
 		// Test data
 		filter := []byte("testfilter")
@@ -151,6 +152,7 @@ func TestProverReject_Verify(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 
 		// Test data
 		filter := []byte("testfilter")
@@ -222,6 +224,7 @@ func TestProverReject_Verify(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 
 		// Test data
 		filter := []byte("testfilter")
@@ -314,6 +317,7 @@ func TestProverReject_Verify(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 
 		// Test data
 		filter := []byte("testfilter")

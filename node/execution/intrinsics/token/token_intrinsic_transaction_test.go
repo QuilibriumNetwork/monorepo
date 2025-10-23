@@ -78,9 +78,9 @@ func TestValidTransactionWithMocks(t *testing.T) {
 	mp.On("FromBytes", mock.Anything).Return(nil)
 	ip.On("ProveMultiple", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(mp, nil)
 	ip.On("VerifyMultiple", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+	hg.On("GetShardCommits", mock.Anything, mock.Anything).Return([][]byte{make([]byte, 64), make([]byte, 64), make([]byte, 64), make([]byte, 64)}, nil)
 	bp.On("GenerateInputCommitmentsFromBig", mock.Anything, mock.Anything).Return([]byte("input-commit" + string(bytes.Repeat([]byte{0x00}, 56-12))))
 	hg.On("CreateTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&qcrypto.TraversalProof{
-
 		Multiproof: &mocks.MockMultiproof{},
 		SubProofs: []qcrypto.TraversalSubProof{{
 			Commits: [][]byte{[]byte("valid-hg-commit" + string(bytes.Repeat([]byte{0x00}, 74-15)))},
@@ -88,12 +88,12 @@ func TestValidTransactionWithMocks(t *testing.T) {
 			Paths:   [][]uint64{{0}},
 		}},
 	}, nil)
-	hg.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+	hg.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 	hg.On("GetProver").Return(ip)
 	ip.On("VerifyRaw", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 	bp.On("VerifyHidden", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true)
 	tree := &qcrypto.VectorCommitmentTree{}
-	tree.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, FRAME_2_1_CUTOVER+1), nil, big.NewInt(55))
+	tree.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(55))
 	tree.Insert([]byte{1 << 2}, []byte("valid-commitment"+string(bytes.Repeat([]byte{0x00}, 56-16))), nil, big.NewInt(56))
 	tree.Insert([]byte{2 << 2}, []byte("one-time-key"+string(bytes.Repeat([]byte{0x00}, 56-12))), nil, big.NewInt(56))
 	tree.Insert([]byte{3 << 2}, []byte("verification-key"+string(bytes.Repeat([]byte{0x00}, 56-16))), nil, big.NewInt(56))
@@ -137,11 +137,11 @@ func TestValidTransactionWithMocks(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(FRAME_2_1_CUTOVER + 1); err != nil {
+	if err := tx.Prove(FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1); err != nil {
 		t.Fatal(err)
 	}
 
-	if valid, err := tx.Verify(FRAME_2_1_CUTOVER + 1); !valid {
+	if valid, err := tx.Verify(FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2); !valid {
 		t.Fatal("Expected transaction to verify but it failed", err)
 	}
 }

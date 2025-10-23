@@ -11,6 +11,12 @@ type MockShardsStore struct {
 	mock.Mock
 }
 
+// RangeAppShards implements store.ShardsStore.
+func (m *MockShardsStore) RangeAppShards() ([]store.ShardInfo, error) {
+	args := m.Called()
+	return args.Get(0).([]store.ShardInfo), args.Error(1)
+}
+
 // DeleteAppShard implements store.ShardsStore.
 func (m *MockShardsStore) DeleteAppShard(
 	txn store.Transaction,

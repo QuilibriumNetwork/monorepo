@@ -1268,8 +1268,8 @@ func CreateValidQUILPendingTransactionPayload(
 	mp.On("GetProof").Return(make([]byte, 74))
 	mockHG.GetProver().(*mocks.MockInclusionProver).On("NewMultiproof").Return(mp)
 	mockHG.GetProver().(*mocks.MockInclusionProver).On("VerifyMultiple", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true)
-	mockHG.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
-
+	mockHG.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+	mockHG.On("GetVertex", mock.Anything).Return(nil, nil)
 	pendingInputs := []*protobufs.PendingTransactionInput{}
 
 	for _, input := range inputAmounts {
