@@ -94,9 +94,9 @@ func BenchmarkLazyVectorCommitmentTreeVerify(b *testing.B) {
 		if err != nil {
 			b.Errorf("Failed to insert item %d: %v", i, err)
 		}
-		tree.Commit(false)
+		c := tree.Commit(false)
 		p := tree.Prove(d)
-		if !tree.Verify(p) {
+		if valid, _ := tree.Verify(c, p); !valid {
 			b.Errorf("bad proof")
 		}
 	}
@@ -407,7 +407,7 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 	}
 
 	proofs := tree.Prove(addresses[500])
-	if !tree.Verify(proofs) {
+	if valid, _ := tree.Verify(tcommit, proofs); !valid {
 		t.Errorf("proof failed")
 	}
 
@@ -475,7 +475,7 @@ func TestTreeLeafReaddition(t *testing.T) {
 	originalProof := tree.Prove(testKey)
 
 	// Validate the proof
-	if !tree.Verify(originalProof) {
+	if valid, _ := tree.Verify(originalRoot, originalProof); !valid {
 		t.Errorf("Failed to verify original proof")
 	}
 
@@ -500,7 +500,7 @@ func TestTreeLeafReaddition(t *testing.T) {
 	}
 
 	// Verify the original proof still works
-	if !tree.Verify(originalProof) {
+	if valid, _ := tree.Verify(newRoot, originalProof); !valid {
 		t.Errorf("Original proof no longer valid after re-adding the same leaf")
 	}
 }
@@ -556,7 +556,7 @@ func TestTreeRemoveReaddLeaf(t *testing.T) {
 	originalProof := tree.Prove(testKey)
 
 	// Validate the proof
-	if !tree.Verify(originalProof) {
+	if valid, _ := tree.Verify(originalRoot, originalProof); !valid {
 		t.Errorf("Failed to verify original proof")
 	}
 
@@ -582,7 +582,7 @@ func TestTreeRemoveReaddLeaf(t *testing.T) {
 	}
 
 	// Verify the proof fails
-	if tree.Verify(originalProof) {
+	if valid, _ := tree.Verify(deletedRoot, originalProof); valid {
 		t.Errorf("Original proof still verified")
 	}
 
@@ -610,7 +610,7 @@ func TestTreeRemoveReaddLeaf(t *testing.T) {
 	newProof := tree.Prove(testKey)
 
 	// Verify the new proof works
-	if !tree.Verify(newProof) {
+	if valid, _ := tree.Verify(restoredRoot, newProof); !valid {
 		t.Errorf("New proof not valid after re-adding the leaf")
 	}
 
@@ -757,7 +757,7 @@ func TestTreeLongestBranch(t *testing.T) {
 	}
 	newCommit := tree.Commit(false)
 
-	if !tree.Verify(origProof) {
+	if valid, _ := tree.Verify(newCommit, origProof); !valid {
 		t.Errorf("Proof does not sustain after tree rollback.")
 	}
 
@@ -895,7 +895,7 @@ func TestTreeBranchStructure(t *testing.T) {
 	}
 
 	// Confirm original proof still works
-	if !tree.Verify(initialProof) {
+	if valid, _ := tree.Verify(restoredRoot, initialProof); !valid {
 		t.Errorf("Original proof no longer valid after restoring tree structure")
 	}
 
@@ -952,7 +952,7 @@ func TestTreeBranchStructure(t *testing.T) {
 	}
 
 	// Commit after removal
-	tree.Commit(false)
+	c := tree.Commit(false)
 
 	afterGroupRemoval := tree.GetSize()
 	expectedAfterRemoval := big.NewInt(3 + keysPerGroup)
@@ -968,7 +968,7 @@ func TestTreeBranchStructure(t *testing.T) {
 	// 	t.Errorf("Fetch had error: %v", err)
 	// }
 
-	if !tree.Verify(fullProof) {
+	if valid, _ := tree.Verify(c, fullProof); !valid {
 		t.Errorf("somehow the regular proof failed?")
 	}
 }

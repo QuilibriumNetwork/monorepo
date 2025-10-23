@@ -226,6 +226,12 @@ func (h *MockHypergraph) RunDataPruning(
 	return args.Error(0)
 }
 
+// GetCoveredPrefix implements hypergraph.Hypergraph.
+func (h *MockHypergraph) GetCoveredPrefix() ([]int, error) {
+	args := h.Called()
+	return args.Get(0).([]int), args.Error(1)
+}
+
 // SetCoveredPrefix implements hypergraph.Hypergraph.
 func (h *MockHypergraph) SetCoveredPrefix(prefix []int) error {
 	args := h.Called(prefix)
@@ -310,9 +316,10 @@ func (h *MockHypergraph) VerifyTraversalProof(
 	domain [32]byte,
 	atomType hg.AtomType,
 	phaseType hg.PhaseType,
+	root []byte,
 	traversalProof *tries.TraversalProof,
 ) (bool, error) {
-	args := h.Called(domain, atomType, phaseType, traversalProof)
+	args := h.Called(domain, atomType, phaseType, root, traversalProof)
 	return args.Bool(0), args.Error(1)
 }
 
@@ -341,19 +348,39 @@ func (h *MockHypergraph) SetVertexData(
 	return args.Error(0)
 }
 
-// GetSize implements the interface
+// GetSize implements hypergraph.Hypergraph.
 func (h *MockHypergraph) GetSize(key *tries.ShardKey, path []int) *big.Int {
 	args := h.Called(key, path)
 	return args.Get(0).(*big.Int)
 }
 
-// Commit implements the interface
-func (h *MockHypergraph) Commit() map[tries.ShardKey][][]byte {
-	args := h.Called()
-	return args.Get(0).(map[tries.ShardKey][][]byte)
+// Commit implements hypergraph.Hypergraph.
+func (h *MockHypergraph) Commit(
+	frameNumber uint64,
+) (map[tries.ShardKey][][]byte, error) {
+	args := h.Called(frameNumber)
+	return args.Get(0).(map[tries.ShardKey][][]byte), args.Error(1)
 }
 
-// GetVertex implements the interface
+// CommitShard implements hypergraph.Hypergraph.
+func (h *MockHypergraph) CommitShard(
+	frameNumber uint64,
+	shardAddress []byte,
+) ([][]byte, error) {
+	args := h.Called(frameNumber)
+	return args.Get(0).([][]byte), args.Error(1)
+}
+
+// GetShardCommits implements hypergraph.Hypergraph.
+func (h *MockHypergraph) GetShardCommits(
+	frameNumber uint64,
+	shardAddress []byte,
+) ([][]byte, error) {
+	args := h.Called(frameNumber, shardAddress)
+	return args.Get(0).([][]byte), args.Error(1)
+}
+
+// GetVertex implements hypergraph.Hypergraph.
 func (h *MockHypergraph) GetVertex(id [64]byte) (hg.Vertex, error) {
 	args := h.Called(id)
 	if args.Get(0) == nil {
@@ -362,7 +389,7 @@ func (h *MockHypergraph) GetVertex(id [64]byte) (hg.Vertex, error) {
 	return args.Get(0).(hg.Vertex), args.Error(1)
 }
 
-// GetVertexData implements the interface
+// GetVertexData implements hypergraph.Hypergraph.
 func (h *MockHypergraph) GetVertexData(id [64]byte) (
 	*tries.VectorCommitmentTree,
 	error,
@@ -374,7 +401,7 @@ func (h *MockHypergraph) GetVertexData(id [64]byte) (
 	return args.Get(0).(*tries.VectorCommitmentTree), args.Error(1)
 }
 
-// AddVertex implements the interface
+// AddVertex implements hypergraph.Hypergraph.
 func (h *MockHypergraph) AddVertex(
 	txn tries.TreeBackingStoreTransaction,
 	v hg.Vertex,
@@ -383,7 +410,7 @@ func (h *MockHypergraph) AddVertex(
 	return args.Error(0)
 }
 
-// RemoveVertex implements the interface
+// RemoveVertex implements hypergraph.Hypergraph.
 func (h *MockHypergraph) RemoveVertex(
 	txn tries.TreeBackingStoreTransaction,
 	v hg.Vertex,
@@ -392,7 +419,7 @@ func (h *MockHypergraph) RemoveVertex(
 	return args.Error(0)
 }
 
-// RevertAddVertex implements the interface
+// RevertAddVertex implements hypergraph.Hypergraph.
 func (h *MockHypergraph) RevertAddVertex(
 	txn tries.TreeBackingStoreTransaction,
 	v hg.Vertex,
@@ -401,7 +428,7 @@ func (h *MockHypergraph) RevertAddVertex(
 	return args.Error(0)
 }
 
-// RevertRemoveVertex implements the interface
+// RevertRemoveVertex implements hypergraph.Hypergraph.
 func (h *MockHypergraph) RevertRemoveVertex(
 	txn tries.TreeBackingStoreTransaction,
 	v hg.Vertex,
@@ -410,13 +437,13 @@ func (h *MockHypergraph) RevertRemoveVertex(
 	return args.Error(0)
 }
 
-// LookupVertex implements the interface
+// LookupVertex implements hypergraph.Hypergraph.
 func (h *MockHypergraph) LookupVertex(v hg.Vertex) bool {
 	args := h.Called(v)
 	return args.Bool(0)
 }
 
-// GetHyperedge implements the interface
+// GetHyperedge implements hypergraph.Hypergraph.
 func (h *MockHypergraph) GetHyperedge(id [64]byte) (hg.Hyperedge, error) {
 	args := h.Called(id)
 	if args.Get(0) == nil {
@@ -425,7 +452,7 @@ func (h *MockHypergraph) GetHyperedge(id [64]byte) (hg.Hyperedge, error) {
 	return args.Get(0).(hg.Hyperedge), args.Error(1)
 }
 
-// AddHyperedge implements the interface
+// AddHyperedge implements hypergraph.Hypergraph.
 func (h *MockHypergraph) AddHyperedge(
 	txn tries.TreeBackingStoreTransaction,
 	he hg.Hyperedge,
@@ -434,7 +461,7 @@ func (h *MockHypergraph) AddHyperedge(
 	return args.Error(0)
 }
 
-// RemoveHyperedge implements the interface
+// RemoveHyperedge implements hypergraph.Hypergraph.
 func (h *MockHypergraph) RemoveHyperedge(
 	txn tries.TreeBackingStoreTransaction,
 	he hg.Hyperedge,
@@ -443,7 +470,7 @@ func (h *MockHypergraph) RemoveHyperedge(
 	return args.Error(0)
 }
 
-// RevertAddHyperedge implements the interface
+// RevertAddHyperedge implements hypergraph.Hypergraph.
 func (h *MockHypergraph) RevertAddHyperedge(
 	txn tries.TreeBackingStoreTransaction,
 	he hg.Hyperedge,
@@ -452,7 +479,7 @@ func (h *MockHypergraph) RevertAddHyperedge(
 	return args.Error(0)
 }
 
-// RevertRemoveHyperedge implements the interface
+// RevertRemoveHyperedge implements hypergraph.Hypergraph.
 func (h *MockHypergraph) RevertRemoveHyperedge(
 	txn tries.TreeBackingStoreTransaction,
 	he hg.Hyperedge,
@@ -461,37 +488,37 @@ func (h *MockHypergraph) RevertRemoveHyperedge(
 	return args.Error(0)
 }
 
-// LookupHyperedge implements the interface
+// LookupHyperedge implements hypergraph.Hypergraph.
 func (h *MockHypergraph) LookupHyperedge(he hg.Hyperedge) bool {
 	args := h.Called(he)
 	return args.Bool(0)
 }
 
-// LookupAtom implements the interface
+// LookupAtom implements hypergraph.Hypergraph.
 func (h *MockHypergraph) LookupAtom(a hg.Atom) bool {
 	args := h.Called(a)
 	return args.Bool(0)
 }
 
-// LookupAtomSet implements the interface
+// LookupAtomSet implements hypergraph.Hypergraph.
 func (h *MockHypergraph) LookupAtomSet(atomSet []hg.Atom) bool {
 	args := h.Called(atomSet)
 	return args.Bool(0)
 }
 
-// Within implements the interface
+// Within implements hypergraph.Hypergraph.
 func (h *MockHypergraph) Within(a, he hg.Atom) bool {
 	args := h.Called(a, he)
 	return args.Bool(0)
 }
 
-// GetVertexAddsSet implements the interface
+// GetVertexAddsSet implements hypergraph.Hypergraph.
 func (h *MockHypergraph) GetVertexAddsSet(shardKey tries.ShardKey) hg.IdSet {
 	args := h.Called(shardKey)
 	return args.Get(0).(hg.IdSet)
 }
 
-// GetVertexRemovesSet implements the interface
+// GetVertexRemovesSet implements hypergraph.Hypergraph.
 func (h *MockHypergraph) GetVertexRemovesSet(
 	shardKey tries.ShardKey,
 ) hg.IdSet {
@@ -499,7 +526,7 @@ func (h *MockHypergraph) GetVertexRemovesSet(
 	return args.Get(0).(hg.IdSet)
 }
 
-// GetHyperedgeAddsSet implements the interface
+// GetHyperedgeAddsSet implements hypergraph.Hypergraph.
 func (h *MockHypergraph) GetHyperedgeAddsSet(
 	shardKey tries.ShardKey,
 ) hg.IdSet {
@@ -507,7 +534,7 @@ func (h *MockHypergraph) GetHyperedgeAddsSet(
 	return args.Get(0).(hg.IdSet)
 }
 
-// GetHyperedgeRemovesSet implements the interface
+// GetHyperedgeRemovesSet implements hypergraph.Hypergraph.
 func (h *MockHypergraph) GetHyperedgeRemovesSet(
 	shardKey tries.ShardKey,
 ) hg.IdSet {
@@ -515,7 +542,7 @@ func (h *MockHypergraph) GetHyperedgeRemovesSet(
 	return args.Get(0).(hg.IdSet)
 }
 
-// ImportTree implements the interface
+// ImportTree implements hypergraph.Hypergraph.
 func (h *MockHypergraph) ImportTree(
 	atomType hg.AtomType,
 	phaseType hg.PhaseType,

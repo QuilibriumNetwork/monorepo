@@ -73,7 +73,7 @@ pub fn generate_range_proof(
           blinding: vec![],
         };
       }
-        total = total + s.unwrap();
+      total = total + s.unwrap();
     }
     let mut blinding_scalars: Vec<Scalar> = Vec::new();
     for _ in 0..values.len()-1 {

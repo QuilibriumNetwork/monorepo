@@ -146,13 +146,8 @@ func (e *ComputeExecutionEngine) Start() <-chan error {
 	go func() {
 		e.logger.Info("starting compute execution engine")
 
-		for {
-			select {
-			case <-e.stopChan:
-				e.logger.Info("stopping compute execution engine")
-				return
-			}
-		}
+		<-e.stopChan
+		e.logger.Info("stopping compute execution engine")
 	}()
 
 	return errChan
@@ -920,7 +915,6 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 	e.logger.Debug(
 		"processed individual message",
 		zap.String("address", hex.EncodeToString(address)),
-		zap.Any("state", state),
 	)
 
 	return &execution.ProcessMessageResult{

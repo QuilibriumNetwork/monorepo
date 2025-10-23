@@ -103,6 +103,7 @@ message MessageRequest {
     quilibrium.node.compute.pb.CodeDeployment code_deploy = 22;
     quilibrium.node.compute.pb.CodeExecute code_execute = 23;
     quilibrium.node.compute.pb.CodeFinalize code_finalize = 24;
+    quilibrium.node.global.pb.FrameHeader shard = 25;
   }
   int64 timestamp = 99;
 }
@@ -276,6 +277,7 @@ message AppShardInfo {
   bytes size = 2;
   uint64 data_shards = 3;
   repeated bytes commitment = 4;
+  bytes shard_key = 5;
 }
 
 message GetAppShardsResponse {
@@ -315,11 +317,27 @@ message GetLockedAddressesResponse {
   repeated LockedTransaction transactions = 1;
 }
 
+message GlobalGetWorkerInfoRequest {}
+
+message GlobalGetWorkerInfoResponseItem {
+  uint32 core_id = 1;
+  string listen_multiaddr = 2;
+  string stream_listen_multiaddr = 3;
+  bytes filter = 4;
+  uint64 total_storage = 5;
+  bool allocated = 6;
+}
+
+message GlobalGetWorkerInfoResponse {
+  repeated GlobalGetWorkerInfoResponseItem workers = 1;
+}
+
 service GlobalService {
   rpc GetGlobalFrame (GetGlobalFrameRequest) returns (GlobalFrameResponse);
   rpc GetAppShards(GetAppShardsRequest) returns (GetAppShardsResponse);
   rpc GetGlobalShards(GetGlobalShardsRequest) returns (GetGlobalShardsResponse);
   rpc GetLockedAddresses(GetLockedAddressesRequest) returns (GetLockedAddressesResponse);
+  rpc GetWorkerInfo(GlobalGetWorkerInfoRequest) returns (GlobalGetWorkerInfoResponse);
 }
 
 service AppShardService {

@@ -119,6 +119,7 @@ func (e *AppConsensusEngine) eventDistributorLoop() {
 								e.inclusionProver,
 							),
 							e.proverRegistry,
+							e.clockStore,
 						)
 						if err != nil {
 							e.logger.Error(

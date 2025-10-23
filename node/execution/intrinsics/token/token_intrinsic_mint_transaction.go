@@ -17,6 +17,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
@@ -1728,6 +1729,7 @@ func (i *MintTransactionInput) verifyWithProofOfMeaningfulWork(
 	}
 
 	proverRootDomain := [32]byte(tx.Domain)
+	var rewardRoot []byte
 	if bytes.Equal(tx.Domain[:], QUIL_TOKEN_ADDRESS) {
 		// Special case: PoMW mints under QUIL use global records for proofs
 		proverRootDomain = intrinsics.GLOBAL_INTRINSIC_ADDRESS
@@ -1743,6 +1745,32 @@ func (i *MintTransactionInput) verifyWithProofOfMeaningfulWork(
 				"verify with mint with proof of meaningful work",
 			)
 		}
+
+		frame, err := tx.clockStore.GetGlobalClockFrame(
+			binary.BigEndian.Uint64(tx.Outputs[0].FrameNumber),
+		)
+		if err != nil {
+			return errors.Wrap(
+				err,
+				"verify with mint with proof of meaningful work",
+			)
+		}
+
+		rewardRoot = frame.Header.ProverTreeCommitment
+	} else {
+		// Normal case: use our own record of commitments
+		roots, err := tx.hypergraph.GetShardCommits(
+			binary.BigEndian.Uint64(tx.Outputs[0].FrameNumber),
+			tx.Domain[:],
+		)
+		if err != nil {
+			return errors.Wrap(
+				err,
+				"verify with mint with proof of meaningful work",
+			)
+		}
+
+		rewardRoot = roots[0]
 	}
 
 	// Verify the membership proof of the prover:
@@ -1750,6 +1778,7 @@ func (i *MintTransactionInput) verifyWithProofOfMeaningfulWork(
 		proverRootDomain,
 		hypergraph.VertexAtomType,
 		hypergraph.AddsPhaseType,
+		rewardRoot,
 		traversalProof,
 	); err != nil || !valid {
 		return errors.Wrap(
@@ -1994,10 +2023,7 @@ func (o *MintTransactionOutput) Verify(
 	index int,
 	tx *MintTransaction,
 ) (bool, error) {
-	if !bytes.Equal(
-		binary.BigEndian.AppendUint64(nil, frameNumber),
-		o.FrameNumber,
-	) {
+	if frameNumber <= binary.BigEndian.Uint64(o.FrameNumber) {
 		return false, errors.Wrap(
 			errors.New("invalid frame number"),
 			"verify output",
@@ -2061,6 +2087,7 @@ type MintTransaction struct {
 	// RDF schema support
 	rdfHypergraphSchema string
 	rdfMultiprover      *schema.RDFMultiprover
+	clockStore          store.ClockStore
 }
 
 func NewMintTransaction(
@@ -2077,6 +2104,7 @@ func NewMintTransaction(
 	keyRing keys.KeyRing,
 	rdfHypergraphSchema string,
 	rdfMultiprover *schema.RDFMultiprover,
+	clockStore store.ClockStore,
 ) *MintTransaction {
 	return &MintTransaction{
 		Domain:              domain,
@@ -2092,6 +2120,7 @@ func NewMintTransaction(
 		config:              config,
 		rdfHypergraphSchema: rdfHypergraphSchema,
 		rdfMultiprover:      rdfMultiprover,
+		clockStore:          clockStore,
 	}
 }
 

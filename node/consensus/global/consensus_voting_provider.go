@@ -361,13 +361,7 @@ func (p *GlobalVotingProvider) FinalizeVotes(
 
 	for i := 0; i < len(provers); i++ {
 		activeProver := provers[i]
-		if err != nil {
-			p.engine.logger.Error(
-				"could not get prover info",
-				zap.String("address", hex.EncodeToString(activeProver.Address)),
-			)
-			continue
-		}
+
 		// Check if this prover voted in our voterMap
 		if _, ok := voterMap[string(activeProver.Address)]; ok {
 			byteIndex := i / 8

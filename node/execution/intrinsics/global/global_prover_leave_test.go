@@ -94,6 +94,7 @@ func TestProverLeave_Verify(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 
 		// Test data
 		filters := [][]byte{[]byte("testfilter1"), []byte("testfilter2")}
@@ -196,6 +197,7 @@ func TestProverLeave_Verify(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 
 		// Test data
 		filters := [][]byte{[]byte("testfilter")}
@@ -251,6 +253,7 @@ func TestProverLeave_Verify(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 
 		// Test data
 		filters := [][]byte{[]byte("testfilter")}
@@ -340,6 +343,7 @@ func TestProverLeave_Materialize(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 
 		// Test data
@@ -440,6 +444,7 @@ func TestProverLeave_Materialize(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 
 		// Test data

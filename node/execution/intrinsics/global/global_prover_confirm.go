@@ -174,9 +174,22 @@ func (p *ProverConfirm) Materialize(
 			return nil, errors.Wrap(err, "materialize")
 		}
 
-		// Store join confirmation frame number
+		// Set active frame to current
 		frameNumberBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(frameNumberBytes, p.FrameNumber)
+		err = p.rdfMultiprover.Set(
+			GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"allocation:ProverAllocation",
+			"LastActiveFrameNumber",
+			frameNumberBytes,
+			allocationTree,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "materialize")
+		}
+
+		// Store join confirmation frame number
 		err = p.rdfMultiprover.Set(
 			GLOBAL_RDF_SCHEMA,
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],

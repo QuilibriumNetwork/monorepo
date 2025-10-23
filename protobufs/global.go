@@ -1110,6 +1110,8 @@ func (m *MessageRequest) ToCanonicalBytes() ([]byte, error) {
 		innerBytes, err = request.CodeExecute.ToCanonicalBytes()
 	case *MessageRequest_CodeFinalize:
 		innerBytes, err = request.CodeFinalize.ToCanonicalBytes()
+	case *MessageRequest_Shard:
+		innerBytes, err = request.Shard.ToCanonicalBytes()
 	default:
 		return nil, errors.New("unknown request type")
 	}
@@ -1358,6 +1360,13 @@ func (m *MessageRequest) FromCanonicalBytes(data []byte) error {
 			return errors.Wrap(err, "from canonical bytes")
 		}
 		m.Request = &MessageRequest_CodeFinalize{CodeFinalize: codeFinalize}
+
+	case FrameHeaderType:
+		frameHeader := &FrameHeader{}
+		if err := frameHeader.FromCanonicalBytes(dataBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		m.Request = &MessageRequest_Shard{Shard: frameHeader}
 
 	default:
 		return errors.Errorf("unknown message type: 0x%08X", innerType)
@@ -3333,6 +3342,9 @@ func (m *MessageRequest) Validate() error {
 		return m.GetCodeExecute().Validate()
 	case m.GetCodeFinalize() != nil:
 		return m.GetCodeFinalize().Validate()
+	case m.GetShard() != nil:
+		return m.GetShard().Validate()
+
 	default:
 		return nil
 	}
@@ -3841,7 +3853,7 @@ func (p *ProverLivenessCheck) Validate() error {
 
 	// Commitment hash should be 32 bytes if global, at least 32 if not
 	if (len(p.Filter) == 0 && len(p.CommitmentHash) != 32) ||
-		(len(p.Filter) != 0 && len(p.CommitmentHash) >= 32) {
+		(len(p.Filter) != 0 && len(p.CommitmentHash) < 32) {
 		return errors.Wrap(errors.New("invalid commitment hash length"), "validate")
 	}
 

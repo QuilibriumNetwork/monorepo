@@ -42,6 +42,13 @@ func createTestFrameHeader(frameNumber uint64, pubKey []byte, bitmask []byte, ou
 func TestProverKick_Prove(t *testing.T) {
 	// Setup
 	mockHypergraph := new(mocks.MockHypergraph)
+	mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+	mockClockStore := new(mocks.MockClockStore)
+	mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+		},
+	}, nil)
 
 	// Test data
 	frameNumber := uint64(12345)
@@ -101,6 +108,7 @@ func TestProverKick_Prove(t *testing.T) {
 		mockHypergraph,
 		rdfMultiprover,
 		&mocks.MockProverRegistry{},
+		mockClockStore,
 	)
 	require.NoError(t, err)
 
@@ -119,6 +127,13 @@ func TestProverKick_Verify(t *testing.T) {
 	t.Run("Valid kick with equivocation", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(12345)
@@ -168,7 +183,7 @@ func TestProverKick_Verify(t *testing.T) {
 				big.NewInt(0),
 			), nil)
 		mockHypergraph.On("CreateTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&tries.TraversalProof{}, nil)
-		mockHypergraph.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+		mockHypergraph.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(kickedTree, nil)
 		mockFrameProver := &mocks.MockFrameProver{}
 		mockFrameProver.On("VerifyFrameHeaderSignature", mock.Anything, mock.Anything).Return(true, nil)
@@ -218,6 +233,7 @@ func TestProverKick_Verify(t *testing.T) {
 			mockHypergraph,
 			rdfMultiprover,
 			mockProverRegistry,
+			mockClockStore,
 		)
 		require.NoError(t, err)
 
@@ -233,6 +249,13 @@ func TestProverKick_Verify(t *testing.T) {
 	t.Run("Invalid - no equivocation (same frames)", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(12345)
@@ -265,6 +288,7 @@ func TestProverKick_Verify(t *testing.T) {
 			mockHypergraph,
 			rdfMultiprover,
 			&mocks.MockProverRegistry{},
+			mockClockStore,
 		)
 		require.NoError(t, err)
 
@@ -278,6 +302,13 @@ func TestProverKick_Verify(t *testing.T) {
 	t.Run("Invalid - different frame numbers", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(12345)
@@ -322,6 +353,7 @@ func TestProverKick_Verify(t *testing.T) {
 			mockHypergraph,
 			rdfMultiprover,
 			&mocks.MockProverRegistry{},
+			mockClockStore,
 		)
 		require.NoError(t, err)
 
@@ -335,8 +367,15 @@ func TestProverKick_Verify(t *testing.T) {
 	t.Run("Invalid - no overlapping bitmasks", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		mockFrameProver := new(mocks.MockFrameProver)
 		mockFrameProver.On("VerifyFrameHeaderSignature", mock.Anything, mock.Anything).Return(true, nil)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(12345)
@@ -386,6 +425,7 @@ func TestProverKick_Verify(t *testing.T) {
 			mockHypergraph,
 			rdfMultiprover,
 			mockProverRegistry,
+			mockClockStore,
 		)
 		require.NoError(t, err)
 
@@ -399,8 +439,15 @@ func TestProverKick_Verify(t *testing.T) {
 	t.Run("Invalid - kicked not active", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		mockFrameProver := new(mocks.MockFrameProver)
 		mockFrameProver.On("VerifyFrameHeaderSignature", mock.Anything, mock.Anything).Return(true, nil)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(12345)
@@ -452,7 +499,7 @@ func TestProverKick_Verify(t *testing.T) {
 				big.NewInt(0),
 			), nil)
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(kickedTree, nil)
-		mockHypergraph.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+		mockHypergraph.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 		// Create the prover kick operation
 		rdfMultiprover := createMockRDFMultiprover()
@@ -466,6 +513,7 @@ func TestProverKick_Verify(t *testing.T) {
 			mockHypergraph,
 			rdfMultiprover,
 			mockProverRegistry,
+			mockClockStore,
 		)
 		require.NoError(t, err)
 
@@ -481,7 +529,14 @@ func TestProverKick_Materialize(t *testing.T) {
 	t.Run("Materialize kick - updates status to left", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(253000)
@@ -581,6 +636,7 @@ func TestProverKick_Materialize(t *testing.T) {
 			nil,
 			rdfMultiprover,
 			&mocks.MockProverRegistry{},
+			mockClockStore,
 		)
 		require.NoError(t, err)
 
@@ -594,7 +650,14 @@ func TestProverKick_Materialize(t *testing.T) {
 	t.Run("Materialize prover not found - returns error", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(253000)
@@ -646,6 +709,7 @@ func TestProverKick_Materialize(t *testing.T) {
 			nil,
 			createMockRDFMultiprover(),
 			&mocks.MockProverRegistry{},
+			mockClockStore,
 		)
 		require.NoError(t, err)
 
@@ -659,7 +723,14 @@ func TestProverKick_Materialize(t *testing.T) {
 	t.Run("Materialize hypergraph add error - returns error", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(253000)
@@ -733,6 +804,7 @@ func TestProverKick_Materialize(t *testing.T) {
 			nil,
 			createMockRDFMultiprover(),
 			&mocks.MockProverRegistry{},
+			mockClockStore,
 		)
 		require.NoError(t, err)
 
@@ -748,7 +820,14 @@ func TestProverKick_Materialize(t *testing.T) {
 	t.Run("Materialize with existing data - preserves other data", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(253000)
@@ -844,6 +923,7 @@ func TestProverKick_Materialize(t *testing.T) {
 			nil,
 			createMockRDFMultiprover(),
 			&mocks.MockProverRegistry{},
+			mockClockStore,
 		)
 		require.NoError(t, err)
 
@@ -857,6 +937,13 @@ func TestProverKick_Materialize(t *testing.T) {
 func TestProverKick_GetCost(t *testing.T) {
 	// Setup
 	mockHypergraph := new(mocks.MockHypergraph)
+	mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+	mockClockStore := new(mocks.MockClockStore)
+	mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+		},
+	}, nil)
 
 	out1, out2 := make([]byte, 516), make([]byte, 516)
 	out1[0] = 0xff
@@ -880,6 +967,7 @@ func TestProverKick_GetCost(t *testing.T) {
 		mockHypergraph,
 		rdfMultiprover,
 		&mocks.MockProverRegistry{},
+		mockClockStore,
 	)
 	require.NoError(t, err)
 
@@ -893,8 +981,15 @@ func TestProverKick_VerifyEquivocation(t *testing.T) {
 	t.Run("Different bitmask lengths with overlap", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		mockFrameProver := new(mocks.MockFrameProver)
 		mockFrameProver.On("VerifyFrameHeaderSignature", mock.Anything, mock.Anything).Return(true, nil)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(12345)
@@ -939,7 +1034,7 @@ func TestProverKick_VerifyEquivocation(t *testing.T) {
 			), nil)
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(kickedTree, nil)
 		mockHypergraph.On("GetHyperedge", mock.Anything).Return(&mockHyperedge{}, nil)
-		mockHypergraph.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+		mockHypergraph.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 		mockInclusionProver := &mocks.MockInclusionProver{}
 		mp := &mocks.MockMultiproof{}
 		mp.On("FromBytes", mock.Anything).Return(nil)
@@ -990,6 +1085,7 @@ func TestProverKick_VerifyEquivocation(t *testing.T) {
 			mockHypergraph,
 			rdfMultiprover,
 			mockProverRegistry,
+			mockClockStore,
 		)
 		require.NoError(t, err)
 		proverKick.Proof = []byte{0x00}
@@ -1005,6 +1101,13 @@ func TestProverKick_VerifyEquivocation(t *testing.T) {
 	t.Run("Missing BLS signature in frame", func(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockClockStore := new(mocks.MockClockStore)
+		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				ProverTreeCommitment: make([]byte, 64), // just needs to match shape
+			},
+		}, nil)
 
 		// Test data
 		frameNumber := uint64(12345)
@@ -1043,6 +1146,7 @@ func TestProverKick_VerifyEquivocation(t *testing.T) {
 			mockHypergraph,
 			rdfMultiprover,
 			&mocks.MockProverRegistry{},
+			mockClockStore,
 		)
 		require.NoError(t, err)
 

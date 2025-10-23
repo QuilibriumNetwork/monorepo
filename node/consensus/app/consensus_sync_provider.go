@@ -25,7 +25,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
-	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
@@ -42,6 +41,8 @@ func (p *AppSyncProvider) Synchronize(
 	errCh := make(chan error, 1)
 
 	go func() {
+		defer close(dataCh)
+		defer close(errCh)
 		defer func() {
 			if r := recover(); r != nil {
 				errCh <- errors.Wrap(
@@ -50,8 +51,6 @@ func (p *AppSyncProvider) Synchronize(
 				)
 			}
 		}()
-		defer close(dataCh)
-		defer close(errCh)
 
 		// Check if we have a current frame
 		p.engine.frameStoreMu.RLock()
@@ -94,22 +93,29 @@ func (p *AppSyncProvider) Synchronize(
 			l2 := make([]byte, 32)
 			copy(l2, p.engine.appAddress[:min(len(p.engine.appAddress), 32)])
 
-			shardKey := qcrypto.ShardKey{
+			shardKey := tries.ShardKey{
 				L1: [3]byte(bits),
 				L2: [32]byte(l2),
 			}
 
 			shouldHypersync := false
-			comm := p.engine.hypergraph.Commit()
-			for i, c := range comm[shardKey] {
-				if !bytes.Equal(c, latestFrame.Header.StateRoots[i]) {
-					shouldHypersync = true
-					break
+			comm, err := p.engine.hypergraph.GetShardCommits(
+				latestFrame.Header.FrameNumber,
+				p.engine.appAddress,
+			)
+			if err != nil {
+				p.engine.logger.Error("could not get commits", zap.Error(err))
+			} else {
+				for i, c := range comm {
+					if !bytes.Equal(c, latestFrame.Header.StateRoots[i]) {
+						shouldHypersync = true
+						break
+					}
 				}
-			}
 
-			if shouldHypersync {
-				p.hyperSyncWithProver(latestFrame.Header.Prover, shardKey)
+				if shouldHypersync {
+					p.hyperSyncWithProver(latestFrame.Header.Prover, shardKey)
+				}
 			}
 		}
 

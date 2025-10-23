@@ -49,6 +49,9 @@ func TestGlobalExecutionEngine_Start(t *testing.T) {
 		mockVerEnc,
 		mockDecaf,
 		mockFrameProver,
+		nil,
+		nil,
+		nil,
 	)
 	require.NoError(t, err)
 
@@ -142,6 +145,9 @@ func TestGlobalExecutionEngine_ProcessMessage(t *testing.T) {
 				mockVerEnc,
 				mockDecaf,
 				mockFrameProver,
+				nil,
+				nil,
+				nil,
 			)
 			require.NoError(t, err)
 
@@ -205,6 +211,7 @@ func TestGlobalExecutionEngine_AllOperationTypes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := zap.NewNop()
 			mockHG := new(mocks.MockHypergraph)
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockClockStore := new(mocks.MockClockStore)
 			mockShardsStore := new(mocks.MockShardsStore)
 			mockKeyManager := new(mocks.MockKeyManager)
@@ -369,6 +376,9 @@ func TestGlobalExecutionEngine_AllOperationTypes(t *testing.T) {
 				mockVerEnc,
 				mockDecaf,
 				mockFrameProver,
+				nil,
+				nil,
+				nil,
 			)
 			require.NoError(t, err)
 

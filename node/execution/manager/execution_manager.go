@@ -20,6 +20,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/compiler"
+	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
@@ -46,6 +47,9 @@ type ExecutionEngineManager struct {
 	decafConstructor  crypto.DecafConstructor
 	compiler          compiler.CircuitCompiler
 	frameProver       crypto.FrameProver
+	rewardIssuance    consensus.RewardIssuance
+	proverRegistry    consensus.ProverRegistry
+	blsConstructor    crypto.BlsConstructor
 	includeGlobal     bool
 	quit              chan struct{}
 	wg                sync.WaitGroup
@@ -65,6 +69,9 @@ func NewExecutionEngineManager(
 	decafConstructor crypto.DecafConstructor,
 	compiler compiler.CircuitCompiler,
 	frameProver crypto.FrameProver,
+	rewardIssuance consensus.RewardIssuance,
+	proverRegistry consensus.ProverRegistry,
+	blsConstructor crypto.BlsConstructor,
 	includeGlobal bool,
 ) (*ExecutionEngineManager, error) {
 	return &ExecutionEngineManager{
@@ -83,6 +90,9 @@ func NewExecutionEngineManager(
 		decafConstructor:  decafConstructor,
 		compiler:          compiler,
 		frameProver:       frameProver,
+		rewardIssuance:    rewardIssuance,
+		proverRegistry:    proverRegistry,
+		blsConstructor:    blsConstructor,
 		includeGlobal:     includeGlobal,
 		quit:              make(chan struct{}),
 	}, nil
@@ -106,6 +116,9 @@ func (m *ExecutionEngineManager) InitializeEngines() error {
 		m.decafConstructor,
 		m.compiler,
 		m.frameProver,
+		m.rewardIssuance,
+		m.proverRegistry,
+		m.blsConstructor,
 		m.includeGlobal,
 	)
 	if err != nil {
@@ -627,13 +640,13 @@ func (m *ExecutionEngineManager) Lock(
 	frameNumber uint64,
 	address []byte,
 	message []byte,
-) error {
+) ([][]byte, error) {
 	m.enginesMu.RLock()
 	defer m.enginesMu.RUnlock()
 
 	engine := m.selectEngine(address)
 	if engine == nil {
-		return errors.Errorf("no execution engine found for address: %x", address)
+		return nil, errors.Errorf("no execution engine found for address: %x", address)
 	}
 
 	return engine.Lock(frameNumber, address, message)

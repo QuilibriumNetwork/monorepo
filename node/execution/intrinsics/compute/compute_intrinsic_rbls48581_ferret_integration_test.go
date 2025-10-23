@@ -727,12 +727,12 @@ func main(a int, b int) int {
 		deployment1, err := compute.NewCodeDeployment(domain, circuit1Code, [2]string{"qcl:Int", "qcl:Int"}, inputSizes1, []string{"qcl:Int"}, compiler.NewBedlamCompiler())
 		require.NoError(t, err)
 
-		err = deployment1.Prove(token.FRAME_2_1_CUTOVER + 1)
+		err = deployment1.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 		require.NoError(t, err)
 
 		// Materialize first circuit
 		state := hgstate.NewHypergraphState(hg)
-		newst, err := deployment1.Materialize(token.FRAME_2_1_CUTOVER+1, state)
+		newst, err := deployment1.Materialize(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1, state)
 		state = newst.(*hgstate.HypergraphState)
 		require.NoError(t, err)
 
@@ -753,11 +753,11 @@ func main(a int, b int) int {
 		deployment2, err := compute.NewCodeDeployment(domain, circuit2Code, [2]string{"qcl:Int", "qcl:Int"}, inputSizes2, []string{"qcl:Int"}, compiler.NewBedlamCompiler())
 		require.NoError(t, err)
 
-		err = deployment2.Prove(token.FRAME_2_1_CUTOVER + 2)
+		err = deployment2.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 		require.NoError(t, err)
 
 		// Materialize second circuit
-		newst, err = deployment2.Materialize(token.FRAME_2_1_CUTOVER+2, state)
+		newst, err = deployment2.Materialize(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+2, state)
 		require.NoError(t, err)
 		state = newst.(*hgstate.HypergraphState)
 

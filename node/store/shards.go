@@ -38,6 +38,45 @@ func appShardKey(shardKey []byte, prefix []uint32) []byte {
 	return key
 }
 
+func (p *PebbleShardsStore) RangeAppShards() ([]store.ShardInfo, error) {
+	shards := []store.ShardInfo{}
+
+	iter, err := p.db.NewIter(
+		appShardKey(bytes.Repeat([]byte{0}, 35), []uint32{}),
+		appShardKey(bytes.Repeat([]byte{0xff}, 35), []uint32{0xffff}),
+	)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+
+		return nil, errors.Wrap(err, "get app shards")
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		value := iter.Value()
+		offset := 0
+		if len(value)%4 != 0 {
+			offset += len(value) % 4
+		}
+		out := make([]uint32, len(value)/4)
+		buf := bytes.NewBuffer(value[offset:])
+		err = binary.Read(buf, binary.BigEndian, &out)
+		if err != nil {
+			return nil, errors.Wrap(err, "get app shards")
+		}
+		key := slices.Clone(iter.Key())
+		shards = append(shards, store.ShardInfo{
+			L1:   key[2:5],
+			L2:   key[5:37],
+			Path: out,
+		})
+	}
+
+	return shards, nil
+}
+
 func (p *PebbleShardsStore) GetAppShards(
 	shardKey []byte,
 	prefix []uint32,

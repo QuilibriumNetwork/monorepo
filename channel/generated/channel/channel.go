@@ -12,60 +12,67 @@ import (
 	"unsafe"
 )
 
-type RustBuffer = C.RustBuffer
+// This is needed, because as of go 1.24
+// type RustBuffer C.RustBuffer cannot have methods,
+// RustBuffer is treated as non-local type
+type GoRustBuffer struct {
+	inner C.RustBuffer
+}
 
 type RustBufferI interface {
 	AsReader() *bytes.Reader
 	Free()
 	ToGoBytes() []byte
 	Data() unsafe.Pointer
-	Len() int
-	Capacity() int
+	Len() uint64
+	Capacity() uint64
 }
 
-func RustBufferFromExternal(b RustBufferI) RustBuffer {
-	return RustBuffer{
-		capacity: C.int(b.Capacity()),
-		len:      C.int(b.Len()),
-		data:     (*C.uchar)(b.Data()),
+func RustBufferFromExternal(b RustBufferI) GoRustBuffer {
+	return GoRustBuffer{
+		inner: C.RustBuffer{
+			capacity: C.uint64_t(b.Capacity()),
+			len:      C.uint64_t(b.Len()),
+			data:     (*C.uchar)(b.Data()),
+		},
 	}
 }
 
-func (cb RustBuffer) Capacity() int {
-	return int(cb.capacity)
+func (cb GoRustBuffer) Capacity() uint64 {
+	return uint64(cb.inner.capacity)
 }
 
-func (cb RustBuffer) Len() int {
-	return int(cb.len)
+func (cb GoRustBuffer) Len() uint64 {
+	return uint64(cb.inner.len)
 }
 
-func (cb RustBuffer) Data() unsafe.Pointer {
-	return unsafe.Pointer(cb.data)
+func (cb GoRustBuffer) Data() unsafe.Pointer {
+	return unsafe.Pointer(cb.inner.data)
 }
 
-func (cb RustBuffer) AsReader() *bytes.Reader {
-	b := unsafe.Slice((*byte)(cb.data), C.int(cb.len))
+func (cb GoRustBuffer) AsReader() *bytes.Reader {
+	b := unsafe.Slice((*byte)(cb.inner.data), C.uint64_t(cb.inner.len))
 	return bytes.NewReader(b)
 }
 
-func (cb RustBuffer) Free() {
+func (cb GoRustBuffer) Free() {
 	rustCall(func(status *C.RustCallStatus) bool {
-		C.ffi_channel_rustbuffer_free(cb, status)
+		C.ffi_channel_rustbuffer_free(cb.inner, status)
 		return false
 	})
 }
 
-func (cb RustBuffer) ToGoBytes() []byte {
-	return C.GoBytes(unsafe.Pointer(cb.data), C.int(cb.len))
+func (cb GoRustBuffer) ToGoBytes() []byte {
+	return C.GoBytes(unsafe.Pointer(cb.inner.data), C.int(cb.inner.len))
 }
 
-func stringToRustBuffer(str string) RustBuffer {
+func stringToRustBuffer(str string) C.RustBuffer {
 	return bytesToRustBuffer([]byte(str))
 }
 
-func bytesToRustBuffer(b []byte) RustBuffer {
+func bytesToRustBuffer(b []byte) C.RustBuffer {
 	if len(b) == 0 {
-		return RustBuffer{}
+		return C.RustBuffer{}
 	}
 	// We can pass the pointer along here, as it is pinned
 	// for the duration of this call
@@ -74,7 +81,7 @@ func bytesToRustBuffer(b []byte) RustBuffer {
 		data: (*C.uchar)(unsafe.Pointer(&b[0])),
 	}
 
-	return rustCall(func(status *C.RustCallStatus) RustBuffer {
+	return rustCall(func(status *C.RustCallStatus) C.RustBuffer {
 		return C.ffi_channel_rustbuffer_from_bytes(foreign, status)
 	})
 }
@@ -84,12 +91,7 @@ type BufLifter[GoType any] interface {
 }
 
 type BufLowerer[GoType any] interface {
-	Lower(value GoType) RustBuffer
-}
-
-type FfiConverter[GoType any, FfiType any] interface {
-	Lift(value FfiType) GoType
-	Lower(value GoType) FfiType
+	Lower(value GoType) C.RustBuffer
 }
 
 type BufReader[GoType any] interface {
@@ -100,12 +102,7 @@ type BufWriter[GoType any] interface {
 	Write(writer io.Writer, value GoType)
 }
 
-type FfiRustBufConverter[GoType any, FfiType any] interface {
-	FfiConverter[GoType, FfiType]
-	BufReader[GoType]
-}
-
-func LowerIntoRustBuffer[GoType any](bufWriter BufWriter[GoType], value GoType) RustBuffer {
+func LowerIntoRustBuffer[GoType any](bufWriter BufWriter[GoType], value GoType) C.RustBuffer {
 	// This might be not the most efficient way but it does not require knowing allocation size
 	// beforehand
 	var buffer bytes.Buffer
@@ -130,31 +127,30 @@ func LiftFromRustBuffer[GoType any](bufReader BufReader[GoType], rbuf RustBuffer
 	return item
 }
 
-func rustCallWithError[U any](converter BufLifter[error], callback func(*C.RustCallStatus) U) (U, error) {
+func rustCallWithError[E any, U any](converter BufReader[*E], callback func(*C.RustCallStatus) U) (U, *E) {
 	var status C.RustCallStatus
 	returnValue := callback(&status)
 	err := checkCallStatus(converter, status)
-
 	return returnValue, err
 }
 
-func checkCallStatus(converter BufLifter[error], status C.RustCallStatus) error {
+func checkCallStatus[E any](converter BufReader[*E], status C.RustCallStatus) *E {
 	switch status.code {
 	case 0:
 		return nil
 	case 1:
-		return converter.Lift(status.errorBuf)
+		return LiftFromRustBuffer(converter, GoRustBuffer{inner: status.errorBuf})
 	case 2:
-		// when the rust code sees a panic, it tries to construct a rustbuffer
+		// when the rust code sees a panic, it tries to construct a rustBuffer
 		// with the message.  but if that code panics, then it just sends back
 		// an empty buffer.
 		if status.errorBuf.len > 0 {
-			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(status.errorBuf)))
+			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(GoRustBuffer{inner: status.errorBuf})))
 		} else {
 			panic(fmt.Errorf("Rust panicked while handling Rust panic"))
 		}
 	default:
-		return fmt.Errorf("unknown status code: %d", status.code)
+		panic(fmt.Errorf("unknown status code: %d", status.code))
 	}
 }
 
@@ -165,11 +161,13 @@ func checkCallStatusUnknown(status C.RustCallStatus) error {
 	case 1:
 		panic(fmt.Errorf("function not returning an error returned an error"))
 	case 2:
-		// when the rust code sees a panic, it tries to construct a rustbuffer
+		// when the rust code sees a panic, it tries to construct a C.RustBuffer
 		// with the message.  but if that code panics, then it just sends back
 		// an empty buffer.
 		if status.errorBuf.len > 0 {
-			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(status.errorBuf)))
+			panic(fmt.Errorf("%s", FfiConverterStringINSTANCE.Lift(GoRustBuffer{
+				inner: status.errorBuf,
+			})))
 		} else {
 			panic(fmt.Errorf("Rust panicked while handling Rust panic"))
 		}
@@ -179,11 +177,15 @@ func checkCallStatusUnknown(status C.RustCallStatus) error {
 }
 
 func rustCall[U any](callback func(*C.RustCallStatus) U) U {
-	returnValue, err := rustCallWithError(nil, callback)
+	returnValue, err := rustCallWithError[error](nil, callback)
 	if err != nil {
 		panic(err)
 	}
 	return returnValue
+}
+
+type NativeError interface {
+	AsError() error
 }
 
 func writeInt8(writer io.Writer, value int8) {
@@ -333,119 +335,119 @@ func init() {
 
 func uniffiCheckChecksums() {
 	// Get the bindings contract version from our ComponentInterface
-	bindingsContractVersion := 24
+	bindingsContractVersion := 26
 	// Get the scaffolding contract version by calling the into the dylib
-	scaffoldingContractVersion := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint32_t {
-		return C.ffi_channel_uniffi_contract_version(uniffiStatus)
+	scaffoldingContractVersion := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint32_t {
+		return C.ffi_channel_uniffi_contract_version()
 	})
 	if bindingsContractVersion != int(scaffoldingContractVersion) {
 		// If this happens try cleaning and rebuilding your project
 		panic("channel: UniFFI contract version mismatch")
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_double_ratchet_decrypt(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_double_ratchet_decrypt()
 		})
-		if checksum != 57128 {
+		if checksum != 13335 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_double_ratchet_decrypt: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_double_ratchet_encrypt(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_double_ratchet_encrypt()
 		})
-		if checksum != 10167 {
+		if checksum != 59209 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_double_ratchet_encrypt: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_new_double_ratchet(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_new_double_ratchet()
 		})
-		if checksum != 21249 {
+		if checksum != 16925 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_new_double_ratchet: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_new_triple_ratchet(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_new_triple_ratchet()
 		})
-		if checksum != 11118 {
+		if checksum != 20275 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_new_triple_ratchet: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_receiver_x3dh(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_receiver_x3dh()
 		})
-		if checksum != 53802 {
+		if checksum != 19343 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_receiver_x3dh: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_sender_x3dh(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_sender_x3dh()
 		})
-		if checksum != 2887 {
+		if checksum != 41646 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_sender_x3dh: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_triple_ratchet_decrypt(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_triple_ratchet_decrypt()
 		})
-		if checksum != 56417 {
+		if checksum != 42324 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_triple_ratchet_decrypt: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_triple_ratchet_encrypt(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_triple_ratchet_encrypt()
 		})
-		if checksum != 63768 {
+		if checksum != 61617 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_triple_ratchet_encrypt: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_triple_ratchet_init_round_1(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_triple_ratchet_init_round_1()
 		})
-		if checksum != 48593 {
+		if checksum != 42612 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_triple_ratchet_init_round_1: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_triple_ratchet_init_round_2(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_triple_ratchet_init_round_2()
 		})
-		if checksum != 55359 {
+		if checksum != 11875 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_triple_ratchet_init_round_2: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_triple_ratchet_init_round_3(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_triple_ratchet_init_round_3()
 		})
-		if checksum != 50330 {
+		if checksum != 50331 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_triple_ratchet_init_round_3: UniFFI API checksum mismatch")
 		}
 	}
 	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_channel_checksum_func_triple_ratchet_init_round_4(uniffiStatus)
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_triple_ratchet_init_round_4()
 		})
-		if checksum != 58513 {
+		if checksum != 14779 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_triple_ratchet_init_round_4: UniFFI API checksum mismatch")
 		}
@@ -549,7 +551,7 @@ func (FfiConverterString) Read(reader io.Reader) string {
 	length := readInt32(reader)
 	buffer := make([]byte, length)
 	read_length, err := reader.Read(buffer)
-	if err != nil {
+	if err != nil && err != io.EOF {
 		panic(err)
 	}
 	if read_length != int(length) {
@@ -558,7 +560,7 @@ func (FfiConverterString) Read(reader io.Reader) string {
 	return string(buffer)
 }
 
-func (FfiConverterString) Lower(value string) RustBuffer {
+func (FfiConverterString) Lower(value string) C.RustBuffer {
 	return stringToRustBuffer(value)
 }
 
@@ -591,33 +593,33 @@ func (r *DoubleRatchetStateAndEnvelope) Destroy() {
 	FfiDestroyerString{}.Destroy(r.Envelope)
 }
 
-type FfiConverterTypeDoubleRatchetStateAndEnvelope struct{}
+type FfiConverterDoubleRatchetStateAndEnvelope struct{}
 
-var FfiConverterTypeDoubleRatchetStateAndEnvelopeINSTANCE = FfiConverterTypeDoubleRatchetStateAndEnvelope{}
+var FfiConverterDoubleRatchetStateAndEnvelopeINSTANCE = FfiConverterDoubleRatchetStateAndEnvelope{}
 
-func (c FfiConverterTypeDoubleRatchetStateAndEnvelope) Lift(rb RustBufferI) DoubleRatchetStateAndEnvelope {
+func (c FfiConverterDoubleRatchetStateAndEnvelope) Lift(rb RustBufferI) DoubleRatchetStateAndEnvelope {
 	return LiftFromRustBuffer[DoubleRatchetStateAndEnvelope](c, rb)
 }
 
-func (c FfiConverterTypeDoubleRatchetStateAndEnvelope) Read(reader io.Reader) DoubleRatchetStateAndEnvelope {
+func (c FfiConverterDoubleRatchetStateAndEnvelope) Read(reader io.Reader) DoubleRatchetStateAndEnvelope {
 	return DoubleRatchetStateAndEnvelope{
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
 	}
 }
 
-func (c FfiConverterTypeDoubleRatchetStateAndEnvelope) Lower(value DoubleRatchetStateAndEnvelope) RustBuffer {
+func (c FfiConverterDoubleRatchetStateAndEnvelope) Lower(value DoubleRatchetStateAndEnvelope) C.RustBuffer {
 	return LowerIntoRustBuffer[DoubleRatchetStateAndEnvelope](c, value)
 }
 
-func (c FfiConverterTypeDoubleRatchetStateAndEnvelope) Write(writer io.Writer, value DoubleRatchetStateAndEnvelope) {
+func (c FfiConverterDoubleRatchetStateAndEnvelope) Write(writer io.Writer, value DoubleRatchetStateAndEnvelope) {
 	FfiConverterStringINSTANCE.Write(writer, value.RatchetState)
 	FfiConverterStringINSTANCE.Write(writer, value.Envelope)
 }
 
-type FfiDestroyerTypeDoubleRatchetStateAndEnvelope struct{}
+type FfiDestroyerDoubleRatchetStateAndEnvelope struct{}
 
-func (_ FfiDestroyerTypeDoubleRatchetStateAndEnvelope) Destroy(value DoubleRatchetStateAndEnvelope) {
+func (_ FfiDestroyerDoubleRatchetStateAndEnvelope) Destroy(value DoubleRatchetStateAndEnvelope) {
 	value.Destroy()
 }
 
@@ -631,33 +633,33 @@ func (r *DoubleRatchetStateAndMessage) Destroy() {
 	FfiDestroyerSequenceUint8{}.Destroy(r.Message)
 }
 
-type FfiConverterTypeDoubleRatchetStateAndMessage struct{}
+type FfiConverterDoubleRatchetStateAndMessage struct{}
 
-var FfiConverterTypeDoubleRatchetStateAndMessageINSTANCE = FfiConverterTypeDoubleRatchetStateAndMessage{}
+var FfiConverterDoubleRatchetStateAndMessageINSTANCE = FfiConverterDoubleRatchetStateAndMessage{}
 
-func (c FfiConverterTypeDoubleRatchetStateAndMessage) Lift(rb RustBufferI) DoubleRatchetStateAndMessage {
+func (c FfiConverterDoubleRatchetStateAndMessage) Lift(rb RustBufferI) DoubleRatchetStateAndMessage {
 	return LiftFromRustBuffer[DoubleRatchetStateAndMessage](c, rb)
 }
 
-func (c FfiConverterTypeDoubleRatchetStateAndMessage) Read(reader io.Reader) DoubleRatchetStateAndMessage {
+func (c FfiConverterDoubleRatchetStateAndMessage) Read(reader io.Reader) DoubleRatchetStateAndMessage {
 	return DoubleRatchetStateAndMessage{
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterSequenceUint8INSTANCE.Read(reader),
 	}
 }
 
-func (c FfiConverterTypeDoubleRatchetStateAndMessage) Lower(value DoubleRatchetStateAndMessage) RustBuffer {
+func (c FfiConverterDoubleRatchetStateAndMessage) Lower(value DoubleRatchetStateAndMessage) C.RustBuffer {
 	return LowerIntoRustBuffer[DoubleRatchetStateAndMessage](c, value)
 }
 
-func (c FfiConverterTypeDoubleRatchetStateAndMessage) Write(writer io.Writer, value DoubleRatchetStateAndMessage) {
+func (c FfiConverterDoubleRatchetStateAndMessage) Write(writer io.Writer, value DoubleRatchetStateAndMessage) {
 	FfiConverterStringINSTANCE.Write(writer, value.RatchetState)
 	FfiConverterSequenceUint8INSTANCE.Write(writer, value.Message)
 }
 
-type FfiDestroyerTypeDoubleRatchetStateAndMessage struct{}
+type FfiDestroyerDoubleRatchetStateAndMessage struct{}
 
-func (_ FfiDestroyerTypeDoubleRatchetStateAndMessage) Destroy(value DoubleRatchetStateAndMessage) {
+func (_ FfiDestroyerDoubleRatchetStateAndMessage) Destroy(value DoubleRatchetStateAndMessage) {
 	value.Destroy()
 }
 
@@ -671,33 +673,33 @@ func (r *TripleRatchetStateAndEnvelope) Destroy() {
 	FfiDestroyerString{}.Destroy(r.Envelope)
 }
 
-type FfiConverterTypeTripleRatchetStateAndEnvelope struct{}
+type FfiConverterTripleRatchetStateAndEnvelope struct{}
 
-var FfiConverterTypeTripleRatchetStateAndEnvelopeINSTANCE = FfiConverterTypeTripleRatchetStateAndEnvelope{}
+var FfiConverterTripleRatchetStateAndEnvelopeINSTANCE = FfiConverterTripleRatchetStateAndEnvelope{}
 
-func (c FfiConverterTypeTripleRatchetStateAndEnvelope) Lift(rb RustBufferI) TripleRatchetStateAndEnvelope {
+func (c FfiConverterTripleRatchetStateAndEnvelope) Lift(rb RustBufferI) TripleRatchetStateAndEnvelope {
 	return LiftFromRustBuffer[TripleRatchetStateAndEnvelope](c, rb)
 }
 
-func (c FfiConverterTypeTripleRatchetStateAndEnvelope) Read(reader io.Reader) TripleRatchetStateAndEnvelope {
+func (c FfiConverterTripleRatchetStateAndEnvelope) Read(reader io.Reader) TripleRatchetStateAndEnvelope {
 	return TripleRatchetStateAndEnvelope{
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
 	}
 }
 
-func (c FfiConverterTypeTripleRatchetStateAndEnvelope) Lower(value TripleRatchetStateAndEnvelope) RustBuffer {
+func (c FfiConverterTripleRatchetStateAndEnvelope) Lower(value TripleRatchetStateAndEnvelope) C.RustBuffer {
 	return LowerIntoRustBuffer[TripleRatchetStateAndEnvelope](c, value)
 }
 
-func (c FfiConverterTypeTripleRatchetStateAndEnvelope) Write(writer io.Writer, value TripleRatchetStateAndEnvelope) {
+func (c FfiConverterTripleRatchetStateAndEnvelope) Write(writer io.Writer, value TripleRatchetStateAndEnvelope) {
 	FfiConverterStringINSTANCE.Write(writer, value.RatchetState)
 	FfiConverterStringINSTANCE.Write(writer, value.Envelope)
 }
 
-type FfiDestroyerTypeTripleRatchetStateAndEnvelope struct{}
+type FfiDestroyerTripleRatchetStateAndEnvelope struct{}
 
-func (_ FfiDestroyerTypeTripleRatchetStateAndEnvelope) Destroy(value TripleRatchetStateAndEnvelope) {
+func (_ FfiDestroyerTripleRatchetStateAndEnvelope) Destroy(value TripleRatchetStateAndEnvelope) {
 	value.Destroy()
 }
 
@@ -711,33 +713,33 @@ func (r *TripleRatchetStateAndMessage) Destroy() {
 	FfiDestroyerSequenceUint8{}.Destroy(r.Message)
 }
 
-type FfiConverterTypeTripleRatchetStateAndMessage struct{}
+type FfiConverterTripleRatchetStateAndMessage struct{}
 
-var FfiConverterTypeTripleRatchetStateAndMessageINSTANCE = FfiConverterTypeTripleRatchetStateAndMessage{}
+var FfiConverterTripleRatchetStateAndMessageINSTANCE = FfiConverterTripleRatchetStateAndMessage{}
 
-func (c FfiConverterTypeTripleRatchetStateAndMessage) Lift(rb RustBufferI) TripleRatchetStateAndMessage {
+func (c FfiConverterTripleRatchetStateAndMessage) Lift(rb RustBufferI) TripleRatchetStateAndMessage {
 	return LiftFromRustBuffer[TripleRatchetStateAndMessage](c, rb)
 }
 
-func (c FfiConverterTypeTripleRatchetStateAndMessage) Read(reader io.Reader) TripleRatchetStateAndMessage {
+func (c FfiConverterTripleRatchetStateAndMessage) Read(reader io.Reader) TripleRatchetStateAndMessage {
 	return TripleRatchetStateAndMessage{
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterSequenceUint8INSTANCE.Read(reader),
 	}
 }
 
-func (c FfiConverterTypeTripleRatchetStateAndMessage) Lower(value TripleRatchetStateAndMessage) RustBuffer {
+func (c FfiConverterTripleRatchetStateAndMessage) Lower(value TripleRatchetStateAndMessage) C.RustBuffer {
 	return LowerIntoRustBuffer[TripleRatchetStateAndMessage](c, value)
 }
 
-func (c FfiConverterTypeTripleRatchetStateAndMessage) Write(writer io.Writer, value TripleRatchetStateAndMessage) {
+func (c FfiConverterTripleRatchetStateAndMessage) Write(writer io.Writer, value TripleRatchetStateAndMessage) {
 	FfiConverterStringINSTANCE.Write(writer, value.RatchetState)
 	FfiConverterSequenceUint8INSTANCE.Write(writer, value.Message)
 }
 
-type FfiDestroyerTypeTripleRatchetStateAndMessage struct{}
+type FfiDestroyerTripleRatchetStateAndMessage struct{}
 
-func (_ FfiDestroyerTypeTripleRatchetStateAndMessage) Destroy(value TripleRatchetStateAndMessage) {
+func (_ FfiDestroyerTripleRatchetStateAndMessage) Destroy(value TripleRatchetStateAndMessage) {
 	value.Destroy()
 }
 
@@ -751,33 +753,33 @@ func (r *TripleRatchetStateAndMetadata) Destroy() {
 	FfiDestroyerMapStringString{}.Destroy(r.Metadata)
 }
 
-type FfiConverterTypeTripleRatchetStateAndMetadata struct{}
+type FfiConverterTripleRatchetStateAndMetadata struct{}
 
-var FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE = FfiConverterTypeTripleRatchetStateAndMetadata{}
+var FfiConverterTripleRatchetStateAndMetadataINSTANCE = FfiConverterTripleRatchetStateAndMetadata{}
 
-func (c FfiConverterTypeTripleRatchetStateAndMetadata) Lift(rb RustBufferI) TripleRatchetStateAndMetadata {
+func (c FfiConverterTripleRatchetStateAndMetadata) Lift(rb RustBufferI) TripleRatchetStateAndMetadata {
 	return LiftFromRustBuffer[TripleRatchetStateAndMetadata](c, rb)
 }
 
-func (c FfiConverterTypeTripleRatchetStateAndMetadata) Read(reader io.Reader) TripleRatchetStateAndMetadata {
+func (c FfiConverterTripleRatchetStateAndMetadata) Read(reader io.Reader) TripleRatchetStateAndMetadata {
 	return TripleRatchetStateAndMetadata{
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterMapStringStringINSTANCE.Read(reader),
 	}
 }
 
-func (c FfiConverterTypeTripleRatchetStateAndMetadata) Lower(value TripleRatchetStateAndMetadata) RustBuffer {
+func (c FfiConverterTripleRatchetStateAndMetadata) Lower(value TripleRatchetStateAndMetadata) C.RustBuffer {
 	return LowerIntoRustBuffer[TripleRatchetStateAndMetadata](c, value)
 }
 
-func (c FfiConverterTypeTripleRatchetStateAndMetadata) Write(writer io.Writer, value TripleRatchetStateAndMetadata) {
+func (c FfiConverterTripleRatchetStateAndMetadata) Write(writer io.Writer, value TripleRatchetStateAndMetadata) {
 	FfiConverterStringINSTANCE.Write(writer, value.RatchetState)
 	FfiConverterMapStringStringINSTANCE.Write(writer, value.Metadata)
 }
 
-type FfiDestroyerTypeTripleRatchetStateAndMetadata struct{}
+type FfiDestroyerTripleRatchetStateAndMetadata struct{}
 
-func (_ FfiDestroyerTypeTripleRatchetStateAndMetadata) Destroy(value TripleRatchetStateAndMetadata) {
+func (_ FfiDestroyerTripleRatchetStateAndMetadata) Destroy(value TripleRatchetStateAndMetadata) {
 	value.Destroy()
 }
 
@@ -801,7 +803,7 @@ func (c FfiConverterSequenceUint8) Read(reader io.Reader) []uint8 {
 	return result
 }
 
-func (c FfiConverterSequenceUint8) Lower(value []uint8) RustBuffer {
+func (c FfiConverterSequenceUint8) Lower(value []uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[]uint8](c, value)
 }
 
@@ -844,7 +846,7 @@ func (c FfiConverterSequenceSequenceUint8) Read(reader io.Reader) [][]uint8 {
 	return result
 }
 
-func (c FfiConverterSequenceSequenceUint8) Lower(value [][]uint8) RustBuffer {
+func (c FfiConverterSequenceSequenceUint8) Lower(value [][]uint8) C.RustBuffer {
 	return LowerIntoRustBuffer[[][]uint8](c, value)
 }
 
@@ -886,7 +888,7 @@ func (_ FfiConverterMapStringString) Read(reader io.Reader) map[string]string {
 	return result
 }
 
-func (c FfiConverterMapStringString) Lower(value map[string]string) RustBuffer {
+func (c FfiConverterMapStringString) Lower(value map[string]string) C.RustBuffer {
 	return LowerIntoRustBuffer[map[string]string](c, value)
 }
 
@@ -912,73 +914,97 @@ func (_ FfiDestroyerMapStringString) Destroy(mapValue map[string]string) {
 }
 
 func DoubleRatchetDecrypt(ratchetStateAndEnvelope DoubleRatchetStateAndEnvelope) DoubleRatchetStateAndMessage {
-	return FfiConverterTypeDoubleRatchetStateAndMessageINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_double_ratchet_decrypt(FfiConverterTypeDoubleRatchetStateAndEnvelopeINSTANCE.Lower(ratchetStateAndEnvelope), _uniffiStatus)
+	return FfiConverterDoubleRatchetStateAndMessageINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_double_ratchet_decrypt(FfiConverterDoubleRatchetStateAndEnvelopeINSTANCE.Lower(ratchetStateAndEnvelope), _uniffiStatus),
+		}
 	}))
 }
 
 func DoubleRatchetEncrypt(ratchetStateAndMessage DoubleRatchetStateAndMessage) DoubleRatchetStateAndEnvelope {
-	return FfiConverterTypeDoubleRatchetStateAndEnvelopeINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_double_ratchet_encrypt(FfiConverterTypeDoubleRatchetStateAndMessageINSTANCE.Lower(ratchetStateAndMessage), _uniffiStatus)
+	return FfiConverterDoubleRatchetStateAndEnvelopeINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_double_ratchet_encrypt(FfiConverterDoubleRatchetStateAndMessageINSTANCE.Lower(ratchetStateAndMessage), _uniffiStatus),
+		}
 	}))
 }
 
 func NewDoubleRatchet(sessionKey []uint8, sendingHeaderKey []uint8, nextReceivingHeaderKey []uint8, isSender bool, sendingEphemeralPrivateKey []uint8, receivingEphemeralKey []uint8) string {
 	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_new_double_ratchet(FfiConverterSequenceUint8INSTANCE.Lower(sessionKey), FfiConverterSequenceUint8INSTANCE.Lower(sendingHeaderKey), FfiConverterSequenceUint8INSTANCE.Lower(nextReceivingHeaderKey), FfiConverterBoolINSTANCE.Lower(isSender), FfiConverterSequenceUint8INSTANCE.Lower(sendingEphemeralPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingEphemeralKey), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_new_double_ratchet(FfiConverterSequenceUint8INSTANCE.Lower(sessionKey), FfiConverterSequenceUint8INSTANCE.Lower(sendingHeaderKey), FfiConverterSequenceUint8INSTANCE.Lower(nextReceivingHeaderKey), FfiConverterBoolINSTANCE.Lower(isSender), FfiConverterSequenceUint8INSTANCE.Lower(sendingEphemeralPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingEphemeralKey), _uniffiStatus),
+		}
 	}))
 }
 
 func NewTripleRatchet(peers [][]uint8, peerKey []uint8, identityKey []uint8, signedPreKey []uint8, threshold uint64, asyncDkgRatchet bool) TripleRatchetStateAndMetadata {
-	return FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_new_triple_ratchet(FfiConverterSequenceSequenceUint8INSTANCE.Lower(peers), FfiConverterSequenceUint8INSTANCE.Lower(peerKey), FfiConverterSequenceUint8INSTANCE.Lower(identityKey), FfiConverterSequenceUint8INSTANCE.Lower(signedPreKey), FfiConverterUint64INSTANCE.Lower(threshold), FfiConverterBoolINSTANCE.Lower(asyncDkgRatchet), _uniffiStatus)
+	return FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_new_triple_ratchet(FfiConverterSequenceSequenceUint8INSTANCE.Lower(peers), FfiConverterSequenceUint8INSTANCE.Lower(peerKey), FfiConverterSequenceUint8INSTANCE.Lower(identityKey), FfiConverterSequenceUint8INSTANCE.Lower(signedPreKey), FfiConverterUint64INSTANCE.Lower(threshold), FfiConverterBoolINSTANCE.Lower(asyncDkgRatchet), _uniffiStatus),
+		}
 	}))
 }
 
 func ReceiverX3dh(sendingIdentityPrivateKey []uint8, sendingSignedPrivateKey []uint8, receivingIdentityKey []uint8, receivingEphemeralKey []uint8, sessionKeyLength uint64) string {
 	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_receiver_x3dh(FfiConverterSequenceUint8INSTANCE.Lower(sendingIdentityPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(sendingSignedPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingIdentityKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingEphemeralKey), FfiConverterUint64INSTANCE.Lower(sessionKeyLength), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_receiver_x3dh(FfiConverterSequenceUint8INSTANCE.Lower(sendingIdentityPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(sendingSignedPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingIdentityKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingEphemeralKey), FfiConverterUint64INSTANCE.Lower(sessionKeyLength), _uniffiStatus),
+		}
 	}))
 }
 
 func SenderX3dh(sendingIdentityPrivateKey []uint8, sendingEphemeralPrivateKey []uint8, receivingIdentityKey []uint8, receivingSignedPreKey []uint8, sessionKeyLength uint64) string {
 	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_sender_x3dh(FfiConverterSequenceUint8INSTANCE.Lower(sendingIdentityPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(sendingEphemeralPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingIdentityKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingSignedPreKey), FfiConverterUint64INSTANCE.Lower(sessionKeyLength), _uniffiStatus)
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_sender_x3dh(FfiConverterSequenceUint8INSTANCE.Lower(sendingIdentityPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(sendingEphemeralPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingIdentityKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingSignedPreKey), FfiConverterUint64INSTANCE.Lower(sessionKeyLength), _uniffiStatus),
+		}
 	}))
 }
 
 func TripleRatchetDecrypt(ratchetStateAndEnvelope TripleRatchetStateAndEnvelope) TripleRatchetStateAndMessage {
-	return FfiConverterTypeTripleRatchetStateAndMessageINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_triple_ratchet_decrypt(FfiConverterTypeTripleRatchetStateAndEnvelopeINSTANCE.Lower(ratchetStateAndEnvelope), _uniffiStatus)
+	return FfiConverterTripleRatchetStateAndMessageINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_triple_ratchet_decrypt(FfiConverterTripleRatchetStateAndEnvelopeINSTANCE.Lower(ratchetStateAndEnvelope), _uniffiStatus),
+		}
 	}))
 }
 
 func TripleRatchetEncrypt(ratchetStateAndMessage TripleRatchetStateAndMessage) TripleRatchetStateAndEnvelope {
-	return FfiConverterTypeTripleRatchetStateAndEnvelopeINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_triple_ratchet_encrypt(FfiConverterTypeTripleRatchetStateAndMessageINSTANCE.Lower(ratchetStateAndMessage), _uniffiStatus)
+	return FfiConverterTripleRatchetStateAndEnvelopeINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_triple_ratchet_encrypt(FfiConverterTripleRatchetStateAndMessageINSTANCE.Lower(ratchetStateAndMessage), _uniffiStatus),
+		}
 	}))
 }
 
 func TripleRatchetInitRound1(ratchetStateAndMetadata TripleRatchetStateAndMetadata) TripleRatchetStateAndMetadata {
-	return FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_triple_ratchet_init_round_1(FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lower(ratchetStateAndMetadata), _uniffiStatus)
+	return FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_triple_ratchet_init_round_1(FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lower(ratchetStateAndMetadata), _uniffiStatus),
+		}
 	}))
 }
 
 func TripleRatchetInitRound2(ratchetStateAndMetadata TripleRatchetStateAndMetadata) TripleRatchetStateAndMetadata {
-	return FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_triple_ratchet_init_round_2(FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lower(ratchetStateAndMetadata), _uniffiStatus)
+	return FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_triple_ratchet_init_round_2(FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lower(ratchetStateAndMetadata), _uniffiStatus),
+		}
 	}))
 }
 
 func TripleRatchetInitRound3(ratchetStateAndMetadata TripleRatchetStateAndMetadata) TripleRatchetStateAndMetadata {
-	return FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_triple_ratchet_init_round_3(FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lower(ratchetStateAndMetadata), _uniffiStatus)
+	return FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_triple_ratchet_init_round_3(FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lower(ratchetStateAndMetadata), _uniffiStatus),
+		}
 	}))
 }
 
 func TripleRatchetInitRound4(ratchetStateAndMetadata TripleRatchetStateAndMetadata) TripleRatchetStateAndMetadata {
-	return FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
-		return C.uniffi_channel_fn_func_triple_ratchet_init_round_4(FfiConverterTypeTripleRatchetStateAndMetadataINSTANCE.Lower(ratchetStateAndMetadata), _uniffiStatus)
+	return FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_triple_ratchet_init_round_4(FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lower(ratchetStateAndMetadata), _uniffiStatus),
+		}
 	}))
 }

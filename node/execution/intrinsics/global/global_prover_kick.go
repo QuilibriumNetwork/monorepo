@@ -16,6 +16,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
@@ -41,6 +42,7 @@ type ProverKick struct {
 	hypergraph     hypergraph.Hypergraph
 	rdfMultiprover *schema.RDFMultiprover
 	proverRegistry consensus.ProverRegistry
+	clockStore     store.ClockStore
 }
 
 func NewProverKick(
@@ -53,6 +55,7 @@ func NewProverKick(
 	hypergraph hypergraph.Hypergraph,
 	rdfMultiprover *schema.RDFMultiprover,
 	proverRegistry consensus.ProverRegistry,
+	clockStore store.ClockStore,
 ) (*ProverKick, error) {
 	return &ProverKick{
 		FrameNumber:           frameNumber,
@@ -64,6 +67,7 @@ func NewProverKick(
 		hypergraph:            hypergraph,
 		rdfMultiprover:        rdfMultiprover,
 		proverRegistry:        proverRegistry,
+		clockStore:            clockStore,
 	}, nil
 }
 
@@ -392,10 +396,16 @@ func (p *ProverKick) Verify(frameNumber uint64) (bool, error) {
 		)
 	}
 
+	frame, err := p.clockStore.GetGlobalClockFrame(frameNumber - 1)
+	if err != nil {
+		return false, errors.Wrap(err, "verify")
+	}
+
 	validTraversal, err := p.hypergraph.VerifyTraversalProof(
 		intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 		hypergraph.VertexAtomType,
 		hypergraph.AddsPhaseType,
+		frame.Header.ProverTreeCommitment,
 		p.TraversalProof,
 	)
 	if err != nil {

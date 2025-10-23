@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"google.golang.org/protobuf/proto"
+	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
 	"source.quilibrium.com/quilibrium/monorepo/channel"
@@ -35,6 +35,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/validator"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -42,6 +43,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	tconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
+	thypergraph "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/verenc"
@@ -123,7 +125,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		ScenarioStateRewind:      "State Rewind",
 	}
 
-	appAddress := []byte{0xCC, 0x01, 0x02, 0x03}
+	appAddress := token.QUIL_TOKEN_ADDRESS
 
 	// Create nodes
 	type chaosNode struct {
@@ -134,6 +136,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		frameHistory   []*protobufs.AppShardFrame
 		quit           chan struct{}
 		mu             sync.RWMutex
+		gsc            *mockGlobalClientLocks
 	}
 
 	nodes := make([]*chaosNode, numNodes)
@@ -215,6 +218,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		nodeKeyStore := store.NewPebbleKeyStore(nodeDB, logger)
 		nodeClockStore := store.NewPebbleClockStore(nodeDB, logger)
 		nodeInboxStore := store.NewPebbleInboxStore(nodeDB, logger)
+		nodeShardsStore := store.NewPebbleShardsStore(nodeDB, logger)
 		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{})
 
 		// Create mock pubsub for network simulation
@@ -255,6 +259,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 			nodeKeyStore,
 			nodeClockStore,
 			nodeInboxStore,
+			nodeShardsStore,
 			nodeHypergraphStore,
 			frameProver,
 			nodeInclusionProver,
@@ -294,6 +299,8 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		cleanup := func() {
 			nodeDB.Close()
 		}
+		mockGSC := &mockGlobalClientLocks{}
+		engine.SetGlobalClient(mockGSC)
 
 		return engine, pubsub, globalTimeReel, cleanup
 	}
@@ -312,7 +319,11 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 			executors:      make(map[string]*mockIntegrationExecutor),
 			frameHistory:   make([]*protobufs.AppShardFrame, 0),
 			quit:           make(chan struct{}),
+			gsc:            &mockGlobalClientLocks{},
 		}
+
+		// ensure unique global service client per node
+		node.engine.SetGlobalClient(node.gsc)
 
 		// Subscribe to frames
 		pubsub.Subscribe(engine.getConsensusMessageBitmask(), func(message *pb.Message) error {
@@ -350,6 +361,52 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 	// Increase peer count
 	for _, node := range nodes {
 		node.pubsub.peerCount = numNodes - 1
+	}
+
+	// Pre-generate valid payloads and stash for broadcast; commit initial world state for verification
+	// Create per-node hypergraphs slice to feed payload creation
+	hgs := make([]thypergraph.Hypergraph, 0, numNodes)
+	for _, node := range nodes {
+		hgs = append(hgs, node.engine.hypergraph)
+	}
+
+	t.Logf("Step 5.a: Generating 6,000 pending transactions")
+	pending := make([]*token.PendingTransaction, 0, 6)
+	for i := 0; i < 6; i++ {
+		for j := 0; j < 1000; j++ {
+			tx := createValidPendingTxPayload(t, hgs, keys.NewInMemoryKeyManager(bc, dc), byte(i))
+			pending = append(pending, tx)
+		}
+	}
+
+	t.Logf("Step 5.b: Sealing world state at genesis")
+	// Seal initial world state for reference in verification
+	for _, hg := range hgs {
+		hg.Commit(0)
+	}
+
+	// Encode payloads as MessageBundle and stash
+	stashedPayloads := make([][]byte, 0, len(pending))
+	for _, tx := range pending {
+		require.NoError(t, tx.Prove(0))
+		req := &protobufs.MessageBundle{
+			Requests: []*protobufs.MessageRequest{
+				{Request: &protobufs.MessageRequest_PendingTransaction{PendingTransaction: tx.ToProtobuf()}},
+			},
+			Timestamp: time.Now().UnixMilli(),
+		}
+		out, err := req.ToCanonicalBytes()
+		require.NoError(t, err)
+		stashedPayloads = append(stashedPayloads, out)
+	}
+
+	// Record hashes into each node's global service client for lock checks
+	for _, node := range nodes {
+		for _, payload := range stashedPayloads {
+			h := sha3.Sum256(payload)
+			node.gsc.hashes = append(node.gsc.hashes, h[:])
+			node.gsc.committed = true
+		}
 	}
 
 	// Chaos test state
@@ -480,26 +537,20 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		messageBitmask[0] = 0x01
 		copy(messageBitmask[1:], appAddress)
 
-		// Send batch of messages
-		msgCount := random.Intn(20) + 10
-		for i := 0; i < msgCount; i++ {
-			msg := &protobufs.Message{
-				Hash:    []byte(fmt.Sprintf("chaos-msg-%d-%d", time.Now().Unix(), i)),
-				Payload: []byte(fmt.Sprintf("chaos payload %d", i)),
-			}
-
-			if msgData, err := proto.Marshal(msg); err == nil {
-				// Pick random non-partitioned node to send from
-				for j, node := range nodes {
-					if !state.partitionedNodes[j] {
-						node.pubsub.PublishToBitmask(node.engine.getConsensusMessageBitmask(), msgData)
-						break
-					}
+		// Broadcast pre-generated valid payloads to ensure end-to-end processing
+		sent := 0
+		for _, payload := range stashedPayloads {
+			// Pick random non-partitioned node to send from
+			for j, node := range nodes {
+				if !state.partitionedNodes[j] {
+					node.pubsub.PublishToBitmask(node.engine.getProverMessageBitmask(), payload)
+					sent++
+					break
 				}
 			}
 		}
 
-		t.Logf("    - Sent %d messages", msgCount)
+		t.Logf("    - Sent %d stashed valid payloads", sent)
 		time.Sleep(3 * time.Second)
 	}
 

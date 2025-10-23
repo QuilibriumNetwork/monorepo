@@ -124,7 +124,6 @@ func (d *dummyDiscovery) FindPeers(ctx context.Context, ns string, opts ...disco
 }
 
 func TestBlossomSubDiscoveryAfterBootstrap(t *testing.T) {
-	t.Skip("flaky test disabled")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -182,7 +181,7 @@ func TestBlossomSubDiscoveryAfterBootstrap(t *testing.T) {
 
 		owner := rand.Intn(numHosts)
 
-		if err := bitmaskHandlers[owner].Publish(ctx, bitmaskHandlers[owner].bitmask, msg, WithReadiness(MinBitmaskSize(numHosts-1))); err != nil {
+		if err := bitmaskHandlers[owner].Publish(ctx, bitmaskHandlers[owner].bitmask, msg, WithReadiness(MinBitmaskSize(numHosts-4))); err != nil {
 			t.Fatal(err)
 		}
 

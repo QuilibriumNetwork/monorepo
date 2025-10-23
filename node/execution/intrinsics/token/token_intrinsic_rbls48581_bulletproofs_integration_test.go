@@ -28,12 +28,13 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 	thypergraph "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
-	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	"source.quilibrium.com/quilibrium/monorepo/verenc"
 )
 
@@ -239,7 +240,7 @@ func TestValidMintWithProofOfMeaningfulWorkTransaction(t *testing.T) {
 	rand.Read(rand1[1:])
 	rand.Read(rand2)
 	rand.Read(rand3)
-	tree := &qcrypto.VectorCommitmentTree{}
+	tree := &tries.VectorCommitmentTree{}
 	tree.Insert([]byte{0}, proveraddr.FillBytes(make([]byte, 32)), nil, big.NewInt(0))
 	tree.Insert([]byte{1 << 2}, big.NewInt(10000).FillBytes(make([]byte, 32)), nil, big.NewInt(0))
 	vert := hypergraph.NewVertex([32]byte(intrinsics.GLOBAL_INTRINSIC_ADDRESS), [32]byte(rewardaddr.FillBytes(make([]byte, 32))), tree.Commit(ip, false), big.NewInt(74))
@@ -250,7 +251,7 @@ func TestValidMintWithProofOfMeaningfulWorkTransaction(t *testing.T) {
 	hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(rand1), nil, big.NewInt(74)))
 	err = txn.Commit()
 	assert.NoError(t, err)
-	hg.Commit()
+	roots, err := hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	address1 := [64]byte{}
 	copy(address1[:32], token.QUIL_TOKEN_ADDRESS)
 	rand.Read(address1[32:])
@@ -265,6 +266,16 @@ func TestValidMintWithProofOfMeaningfulWorkTransaction(t *testing.T) {
 	assert.NoError(t, err)
 
 	tokenconfig := token.QUIL_TOKEN_CONFIGURATION
+
+	clockStore := store.NewPebbleClockStore(s, zap.L())
+	tx, _ := clockStore.NewTransaction(false)
+	clockStore.PutGlobalClockFrame(&protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:          token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1,
+			ProverTreeCommitment: roots[tries.ShardKey{L1: [3]byte{0, 0, 0}, L2: [32]byte(slices.Repeat([]byte{0xff}, 32))}][0],
+		},
+	}, tx)
+	tx.Commit()
 
 	// Create RDF multiprover for testing
 	rdfSchema, _ := prepareRDFSchemaFromConfig(token.QUIL_TOKEN_ADDRESS, tokenconfig)
@@ -285,12 +296,13 @@ func TestValidMintWithProofOfMeaningfulWorkTransaction(t *testing.T) {
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		clockStore,
 	)
 
-	err = minttx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = minttx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 
-	valid, err := minttx.Verify(token.FRAME_2_1_CUTOVER + 2)
+	valid, err := minttx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.NoError(t, err)
 	assert.True(t, valid)
 }
@@ -344,7 +356,7 @@ func TestValidMintWithVerkleMultiproofSignatureTransaction(t *testing.T) {
 	rand.Read(rand2)
 	rand.Read(rand3)
 
-	proofTree := &qcrypto.VectorCommitmentTree{}
+	proofTree := &tries.VectorCommitmentTree{}
 	proofTree.Insert([]byte{0x00, 0x00}, message, nil, big.NewInt(int64(len(message))))
 	proofTree.Insert([]byte{0x00, 0x01}, rand1, nil, big.NewInt(int64(len(message))))
 	proofTree.Insert([]byte{0x00, 0x02}, rand2, nil, big.NewInt(int64(len(message))))
@@ -397,12 +409,13 @@ func TestValidMintWithVerkleMultiproofSignatureTransaction(t *testing.T) {
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		store.NewPebbleClockStore(s, zap.L()),
 	)
 
-	err = minttx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = minttx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 
-	valid, err := minttx.Verify(token.FRAME_2_1_CUTOVER + 2)
+	valid, err := minttx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.NoError(t, err)
 	assert.True(t, valid)
 }
@@ -500,12 +513,13 @@ func TestValidMintWithAuthorityTransaction(t *testing.T) {
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		store.NewPebbleClockStore(s, zap.L()),
 	)
 
-	err = minttx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = minttx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 
-	valid, err := minttx.Verify(token.FRAME_2_1_CUTOVER + 2)
+	valid, err := minttx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.NoError(t, err)
 	assert.True(t, valid)
 }
@@ -601,12 +615,13 @@ func TestValidMintWithSignatureTransaction(t *testing.T) {
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		store.NewPebbleClockStore(s, zap.L()),
 	)
 
-	err = minttx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = minttx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 
-	valid, err := minttx.Verify(token.FRAME_2_1_CUTOVER + 2)
+	valid, err := minttx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.NoError(t, err)
 	assert.True(t, valid)
 }
@@ -718,12 +733,13 @@ func TestValidMintWithPaymentZeroFeeBasisTransaction(t *testing.T) {
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		store.NewPebbleClockStore(s, zap.L()),
 	)
 
-	err = minttx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = minttx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 
-	valid, err := minttx.Verify(token.FRAME_2_1_CUTOVER + 2)
+	valid, err := minttx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.NoError(t, err)
 	assert.True(t, valid)
 }
@@ -780,7 +796,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisValidQuantityTransaction
 	copy(address2[:32], token.QUIL_TOKEN_ADDRESS)
 	rand.Read(address2[32:])
 
-	tree1 := &qcrypto.VectorCommitmentTree{}
+	tree1 := &tries.VectorCommitmentTree{}
 	otk1, _ := dc.New()
 	c1, _ := dc.New()
 	comm1 := bp.GenerateInputCommitmentsFromBig([]*big.Int{big.NewInt(8000000004)}, c1.Private())
@@ -808,20 +824,21 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisValidQuantityTransaction
 	}
 
 	verifkey1, _ := a1.Add(psk.Public())
-	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree1.Insert([]byte{1 << 2}, comm1, nil, big.NewInt(56))
 	tree1.Insert([]byte{2 << 2}, otk1.Public(), nil, big.NewInt(56))
 	tree1.Insert([]byte{3 << 2}, verifkey1, nil, big.NewInt(56))
 	tree1.Insert([]byte{4 << 2}, maskedCoinBalanceBytes1, nil, big.NewInt(56))
 	tree1.Insert([]byte{5 << 2}, mask1, nil, big.NewInt(56))
 
-	// qcrypto.DebugNonLazyNode(tree.Root, 0, "")
+	// tries.DebugNonLazyNode(tree.Root, 0, "")
 	typeAddr, _ := hex.DecodeString("096de9a09f693f92cfa9cf3349bab2b3baee09f3e4f9c596514ecb3e8b0dff8f")
 	tree1.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
 	txn, _ := hg.NewTransaction(false)
 	hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address1[32:]), tree1.Commit(ip, false), big.NewInt(55*26)))
 	hg.SetVertexData(txn, address1, tree1)
 	txn.Commit()
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 
 	// simulate input as commitment to total
 	input1, _ := token.NewPendingTransactionInput(address1[:])
@@ -860,7 +877,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisValidQuantityTransaction
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(token.FRAME_2_1_CUTOVER + 2); err != nil {
+	if err := tx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -871,7 +888,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisValidQuantityTransaction
 	err = newTx.FromBytes(output, tokenconfig, hg, bp, ip, ve, dc, keys.ToKeyRing(km, false), "", rdfMultiprover)
 	assert.NoError(t, err)
 
-	if valid, err := newTx.Verify(token.FRAME_2_1_CUTOVER + 2); !valid {
+	if valid, err := newTx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2); !valid {
 		t.Fatal("Expected transaction to verify but it failed", err)
 	}
 
@@ -922,12 +939,13 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisValidQuantityTransaction
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		store.NewPebbleClockStore(s, zap.L()),
 	)
 
-	err = minttx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = minttx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 
-	valid, err := minttx.Verify(token.FRAME_2_1_CUTOVER + 2)
+	valid, err := minttx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.NoError(t, err)
 	assert.True(t, valid)
 }
@@ -974,7 +992,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisInvalidQuantityTransacti
 	copy(address2[:32], token.QUIL_TOKEN_ADDRESS)
 	rand.Read(address2[32:])
 
-	tree1 := &qcrypto.VectorCommitmentTree{}
+	tree1 := &tries.VectorCommitmentTree{}
 	otk1, _ := dc.New()
 	c1, _ := dc.New()
 	comm1 := bp.GenerateInputCommitmentsFromBig([]*big.Int{big.NewInt(8000000002)}, c1.Private())
@@ -1002,20 +1020,21 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisInvalidQuantityTransacti
 	}
 
 	verifkey1, _ := a1.Add(psk.Public())
-	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree1.Insert([]byte{1 << 2}, comm1, nil, big.NewInt(56))
 	tree1.Insert([]byte{2 << 2}, otk1.Public(), nil, big.NewInt(56))
 	tree1.Insert([]byte{3 << 2}, verifkey1, nil, big.NewInt(56))
 	tree1.Insert([]byte{4 << 2}, maskedCoinBalanceBytes1, nil, big.NewInt(56))
 	tree1.Insert([]byte{5 << 2}, mask1, nil, big.NewInt(56))
 
-	// qcrypto.DebugNonLazyNode(tree.Root, 0, "")
+	// tries.DebugNonLazyNode(tree.Root, 0, "")
 	typeAddr, _ := hex.DecodeString("096de9a09f693f92cfa9cf3349bab2b3baee09f3e4f9c596514ecb3e8b0dff8f")
 	tree1.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
 	txn, _ := hg.NewTransaction(false)
 	hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address1[32:]), tree1.Commit(ip, false), big.NewInt(55*26)))
 	hg.SetVertexData(txn, address1, tree1)
 	txn.Commit()
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 
 	// simulate input as commitment to total
 	input1, _ := token.NewPendingTransactionInput(address1[:])
@@ -1054,7 +1073,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisInvalidQuantityTransacti
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(token.FRAME_2_1_CUTOVER + 2); err != nil {
+	if err := tx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1065,7 +1084,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisInvalidQuantityTransacti
 	err = newTx.FromBytes(output, tokenconfig, hg, bp, ip, ve, dc, keys.ToKeyRing(km, true), "", rdfMultiprover)
 	assert.NoError(t, err)
 
-	if valid, err := newTx.Verify(token.FRAME_2_1_CUTOVER + 2); !valid {
+	if valid, err := newTx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2); !valid {
 		t.Fatal("Expected transaction to verify but it failed", err)
 	}
 
@@ -1112,12 +1131,13 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisInvalidQuantityTransacti
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		store.NewPebbleClockStore(s, zap.L()),
 	)
 
-	err = minttx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = minttx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 
-	valid, err := minttx.Verify(token.FRAME_2_1_CUTOVER + 2)
+	valid, err := minttx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.Error(t, err)
 	assert.False(t, valid)
 }
@@ -1163,7 +1183,7 @@ func TestValidMintWithPaymentNonZeroFeeBasisTransaction(t *testing.T) {
 	copy(address2[:32], token.QUIL_TOKEN_ADDRESS)
 	rand.Read(address2[32:])
 
-	tree1 := &qcrypto.VectorCommitmentTree{}
+	tree1 := &tries.VectorCommitmentTree{}
 	otk1, _ := dc.New()
 	c1, _ := dc.New()
 	comm1 := bp.GenerateInputCommitmentsFromBig([]*big.Int{big.NewInt(8000000002)}, c1.Private())
@@ -1191,20 +1211,21 @@ func TestValidMintWithPaymentNonZeroFeeBasisTransaction(t *testing.T) {
 	}
 
 	verifkey1, _ := a1.Add(psk.Public())
-	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree1.Insert([]byte{1 << 2}, comm1, nil, big.NewInt(56))
 	tree1.Insert([]byte{2 << 2}, otk1.Public(), nil, big.NewInt(56))
 	tree1.Insert([]byte{3 << 2}, verifkey1, nil, big.NewInt(56))
 	tree1.Insert([]byte{4 << 2}, maskedCoinBalanceBytes1, nil, big.NewInt(56))
 	tree1.Insert([]byte{5 << 2}, mask1, nil, big.NewInt(56))
 
-	// qcrypto.DebugNonLazyNode(tree.Root, 0, "")
+	// tries.DebugNonLazyNode(tree.Root, 0, "")
 	typeAddr, _ := hex.DecodeString("096de9a09f693f92cfa9cf3349bab2b3baee09f3e4f9c596514ecb3e8b0dff8f")
 	tree1.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
 	txn, _ := hg.NewTransaction(false)
 	hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address1[32:]), tree1.Commit(ip, false), big.NewInt(55*26)))
 	hg.SetVertexData(txn, address1, tree1)
 	txn.Commit()
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 
 	// simulate input as commitment to total
 	input1, _ := token.NewPendingTransactionInput(address1[:])
@@ -1243,7 +1264,7 @@ func TestValidMintWithPaymentNonZeroFeeBasisTransaction(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(token.FRAME_2_1_CUTOVER + 2); err != nil {
+	if err := tx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1254,7 +1275,7 @@ func TestValidMintWithPaymentNonZeroFeeBasisTransaction(t *testing.T) {
 	err = newTx.FromBytes(output, tokenconfig, hg, bp, ip, ve, dc, keys.ToKeyRing(km, true), "", rdfMultiprover)
 	assert.NoError(t, err)
 
-	if valid, err := newTx.Verify(token.FRAME_2_1_CUTOVER + 2); !valid {
+	if valid, err := newTx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2); !valid {
 		t.Fatal("Expected transaction to verify but it failed", err)
 	}
 
@@ -1301,12 +1322,13 @@ func TestValidMintWithPaymentNonZeroFeeBasisTransaction(t *testing.T) {
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		store.NewPebbleClockStore(s, zap.L()),
 	)
 
-	err = minttx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = minttx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 
-	valid, err := minttx.Verify(token.FRAME_2_1_CUTOVER + 2)
+	valid, err := minttx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.NoError(t, err)
 	assert.True(t, valid)
 }
@@ -1352,8 +1374,8 @@ func TestValidPendingTransaction(t *testing.T) {
 	copy(address2[:32], token.QUIL_TOKEN_ADDRESS)
 	rand.Read(address2[32:])
 
-	tree1 := &qcrypto.VectorCommitmentTree{}
-	tree2 := &qcrypto.VectorCommitmentTree{}
+	tree1 := &tries.VectorCommitmentTree{}
+	tree2 := &tries.VectorCommitmentTree{}
 	otk1, _ := dc.New()
 	otk2, _ := dc.New()
 	c1, _ := dc.New()
@@ -1403,21 +1425,21 @@ func TestValidPendingTransaction(t *testing.T) {
 	}
 
 	verifkey1, _ := a1.Add(psk.Public())
-	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree1.Insert([]byte{1 << 2}, comm1, nil, big.NewInt(56))
 	tree1.Insert([]byte{2 << 2}, otk1.Public(), nil, big.NewInt(56))
 	tree1.Insert([]byte{3 << 2}, verifkey1, nil, big.NewInt(56))
 	tree1.Insert([]byte{4 << 2}, maskedCoinBalanceBytes1, nil, big.NewInt(56))
 	tree1.Insert([]byte{5 << 2}, mask1, nil, big.NewInt(56))
 	verifkey2, _ := a2.Add(psk.Public())
-	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree2.Insert([]byte{1 << 2}, comm2, nil, big.NewInt(56))
 	tree2.Insert([]byte{2 << 2}, otk2.Public(), nil, big.NewInt(56))
 	tree2.Insert([]byte{3 << 2}, verifkey2, nil, big.NewInt(56))
 	tree2.Insert([]byte{4 << 2}, maskedCoinBalanceBytes2, nil, big.NewInt(56))
 	tree2.Insert([]byte{5 << 2}, mask2, nil, big.NewInt(56))
 
-	// qcrypto.DebugNonLazyNode(tree.Root, 0, "")
+	// tries.DebugNonLazyNode(tree.Root, 0, "")
 	typeAddr, _ := hex.DecodeString("096de9a09f693f92cfa9cf3349bab2b3baee09f3e4f9c596514ecb3e8b0dff8f")
 	tree1.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
 	tree2.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
@@ -1427,6 +1449,7 @@ func TestValidPendingTransaction(t *testing.T) {
 	hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address2[32:]), tree2.Commit(ip, false), big.NewInt(55*26)))
 	hg.SetVertexData(txn, address2, tree2)
 	txn.Commit()
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 
 	// simulate input as commitment to total
 	input1, _ := token.NewPendingTransactionInput(address1[:])
@@ -1464,7 +1487,7 @@ func TestValidPendingTransaction(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(token.FRAME_2_1_CUTOVER + 2); err != nil {
+	if err := tx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1475,7 +1498,7 @@ func TestValidPendingTransaction(t *testing.T) {
 	err = newTx.FromBytes(output, tokenconfig, hg, bp, ip, ve, dc, keys.ToKeyRing(km, false), "", rdfMultiprover)
 	assert.NoError(t, err)
 
-	if valid, err := newTx.Verify(token.FRAME_2_1_CUTOVER + 2); !valid {
+	if valid, err := newTx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2); !valid {
 		t.Fatal("Expected transaction to verify but it failed", err)
 	}
 }
@@ -1517,8 +1540,8 @@ func TestValidPendingTransactionFeeOnly(t *testing.T) {
 	copy(address2[:32], token.QUIL_TOKEN_ADDRESS)
 	rand.Read(address2[32:])
 
-	tree1 := &qcrypto.VectorCommitmentTree{}
-	tree2 := &qcrypto.VectorCommitmentTree{}
+	tree1 := &tries.VectorCommitmentTree{}
+	tree2 := &tries.VectorCommitmentTree{}
 	otk1, _ := dc.New()
 	otk2, _ := dc.New()
 	c1, _ := dc.New()
@@ -1568,21 +1591,21 @@ func TestValidPendingTransactionFeeOnly(t *testing.T) {
 	}
 
 	verifkey1, _ := a1.Add(psk.Public())
-	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree1.Insert([]byte{1 << 2}, comm1, nil, big.NewInt(56))
 	tree1.Insert([]byte{2 << 2}, otk1.Public(), nil, big.NewInt(56))
 	tree1.Insert([]byte{3 << 2}, verifkey1, nil, big.NewInt(56))
 	tree1.Insert([]byte{4 << 2}, maskedCoinBalanceBytes1, nil, big.NewInt(56))
 	tree1.Insert([]byte{5 << 2}, mask1, nil, big.NewInt(56))
 	verifkey2, _ := a2.Add(psk.Public())
-	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree2.Insert([]byte{1 << 2}, comm2, nil, big.NewInt(56))
 	tree2.Insert([]byte{2 << 2}, otk2.Public(), nil, big.NewInt(56))
 	tree2.Insert([]byte{3 << 2}, verifkey2, nil, big.NewInt(56))
 	tree2.Insert([]byte{4 << 2}, maskedCoinBalanceBytes2, nil, big.NewInt(56))
 	tree2.Insert([]byte{5 << 2}, mask2, nil, big.NewInt(56))
 
-	// qcrypto.DebugNonLazyNode(tree.Root, 0, "")
+	// tries.DebugNonLazyNode(tree.Root, 0, "")
 	typeAddr, _ := hex.DecodeString("096de9a09f693f92cfa9cf3349bab2b3baee09f3e4f9c596514ecb3e8b0dff8f")
 	tree1.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
 	tree2.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
@@ -1592,6 +1615,7 @@ func TestValidPendingTransactionFeeOnly(t *testing.T) {
 	hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address2[32:]), tree2.Commit(ip, false), big.NewInt(55*26)))
 	hg.SetVertexData(txn, address2, tree2)
 	txn.Commit()
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 
 	// simulate input as commitment to total
 	input1, _ := token.NewPendingTransactionInput(address1[:])
@@ -1629,7 +1653,7 @@ func TestValidPendingTransactionFeeOnly(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(token.FRAME_2_1_CUTOVER + 2); err != nil {
+	if err := tx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1640,7 +1664,7 @@ func TestValidPendingTransactionFeeOnly(t *testing.T) {
 	err = newTx.FromBytes(output, tokenconfig, hg, bp, ip, ve, dc, keys.ToKeyRing(km, true), "", rdfMultiprover)
 	assert.NoError(t, err)
 
-	if valid, err := newTx.Verify(token.FRAME_2_1_CUTOVER + 2); !valid {
+	if valid, err := newTx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2); !valid {
 		t.Fatal("Expected transaction to verify but it failed", err)
 	}
 }
@@ -1652,11 +1676,11 @@ func TestValidPendingTransactionMixed(t *testing.T) {
 	rvk, _ := dc.New()
 	rsk, _ := dc.New()
 
-	out1, err := token.NewPendingTransactionOutput(big.NewInt(7), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), token.FRAME_2_1_CUTOVER+3)
+	out1, err := token.NewPendingTransactionOutput(big.NewInt(7), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out2, err := token.NewPendingTransactionOutput(big.NewInt(2), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), token.FRAME_2_1_CUTOVER+3)
+	out2, err := token.NewPendingTransactionOutput(big.NewInt(2), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1703,7 +1727,7 @@ func TestValidPendingTransactionMixed(t *testing.T) {
 	copy(address2[:32], token.QUIL_TOKEN_ADDRESS)
 	rand.Read(address2[32:])
 
-	tree2 := &qcrypto.VectorCommitmentTree{}
+	tree2 := &tries.VectorCommitmentTree{}
 	otk2, _ := dc.New()
 	c2, _ := dc.New()
 	comm2 := bp.GenerateInputCommitmentsFromBig([]*big.Int{big.NewInt(6)}, c2.Private())
@@ -1730,14 +1754,14 @@ func TestValidPendingTransactionMixed(t *testing.T) {
 	}
 
 	verifkey2, _ := a2.Add(psk.Public())
-	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree2.Insert([]byte{1 << 2}, comm2, nil, big.NewInt(56))
 	tree2.Insert([]byte{2 << 2}, otk2.Public(), nil, big.NewInt(56))
 	tree2.Insert([]byte{3 << 2}, verifkey2, nil, big.NewInt(56))
 	tree2.Insert([]byte{4 << 2}, maskedCoinBalanceBytes2, nil, big.NewInt(56))
 	tree2.Insert([]byte{5 << 2}, mask2, nil, big.NewInt(56))
 
-	// qcrypto.DebugNonLazyNode(tree.Root, 0, "")
+	// tries.DebugNonLazyNode(tree.Root, 0, "")
 	typeAddr, _ := hex.DecodeString("096de9a09f693f92cfa9cf3349bab2b3baee09f3e4f9c596514ecb3e8b0dff8f")
 	tree2.Insert(bytes.Repeat([]byte{0xff}, 32), typeAddr, nil, big.NewInt(32))
 	txn, _ := hg.NewTransaction(false)
@@ -1747,6 +1771,7 @@ func TestValidPendingTransactionMixed(t *testing.T) {
 	hg.SetVertexData(txn, address2, tree2)
 
 	txn.Commit()
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 
 	// simulate input as commitment to total
 	input1, _ := token.NewPendingTransactionInput(address1[:])
@@ -1784,7 +1809,7 @@ func TestValidPendingTransactionMixed(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(token.FRAME_2_1_CUTOVER + 3); err != nil {
+	if err := tx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1795,7 +1820,7 @@ func TestValidPendingTransactionMixed(t *testing.T) {
 	err = newTx.FromBytes(output, tokenconfig, hg, bp, ip, ve, dc, keys.ToKeyRing(km, true), "", rdfMultiprover)
 	assert.NoError(t, err)
 
-	if valid, err := newTx.Verify(token.FRAME_2_1_CUTOVER + 3); !valid {
+	if valid, err := newTx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 3); !valid {
 		t.Fatal("Expected transaction to verify but it failed", err)
 	}
 }
@@ -1818,11 +1843,11 @@ func TestValidPendingTransactionLegacyOnly(t *testing.T) {
 		rvk, _ := dc.FromBytes(rvkpriv, rvkpub)
 		rsk, _ := dc.FromBytes(rskpriv, rskpub)
 
-		out1, err := token.NewPendingTransactionOutput(big.NewInt(9), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), token.FRAME_2_1_CUTOVER+3)
+		out1, err := token.NewPendingTransactionOutput(big.NewInt(9), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// out2, err := token.NewPendingTransactionOutput(big.NewInt(2), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), token.FRAME_2_1_CUTOVER+3)
+		// out2, err := token.NewPendingTransactionOutput(big.NewInt(2), vk.Public(), sk.Public(), rvk.Public(), rsk.Public(), token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3)
 		// if err != nil {
 		// 	t.Fatal(err)
 		// }
@@ -1866,6 +1891,7 @@ func TestValidPendingTransactionLegacyOnly(t *testing.T) {
 		hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address1[32:]), vertTree.Commit(ip, false), big.NewInt(55*26)))
 		hg.SetVertexData(txn, address1, vertTree)
 		txn.Commit()
+		hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 
 		// simulate input as commitment to total
 		input1, _ := token.NewPendingTransactionInput(address1[:])
@@ -1896,7 +1922,7 @@ func TestValidPendingTransactionLegacyOnly(t *testing.T) {
 			nil,
 		)
 
-		if err := tx.Prove(token.FRAME_2_1_CUTOVER + 3); err != nil {
+		if err := tx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1909,7 +1935,7 @@ func TestValidPendingTransactionLegacyOnly(t *testing.T) {
 
 		comms = append(comms, newTx.Outputs[0].Commitment)
 
-		if valid, err := newTx.Verify(token.FRAME_2_1_CUTOVER + 3); !valid {
+		if valid, err := newTx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 3); !valid {
 			t.Fatal("Expected transaction to verify but it failed", err)
 		}
 	}
@@ -1964,8 +1990,8 @@ func TestValidTransaction(t *testing.T) {
 	copy(address2[:32], token.QUIL_TOKEN_ADDRESS)
 	rand.Read(address2[32:])
 
-	tree1 := &qcrypto.VectorCommitmentTree{}
-	tree2 := &qcrypto.VectorCommitmentTree{}
+	tree1 := &tries.VectorCommitmentTree{}
+	tree2 := &tries.VectorCommitmentTree{}
 	otk1a, _ := dc.New()
 	otk1b, _ := dc.New()
 	otk2a, _ := dc.New()
@@ -2061,7 +2087,7 @@ func TestValidTransaction(t *testing.T) {
 
 	verifkey1a, _ := a1.Add(psk.Public())
 	verifkey1b, _ := b1.Add(othersk.Public())
-	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree1.Insert([]byte{1 << 2}, comm1, nil, big.NewInt(56))
 	tree1.Insert([]byte{2 << 2}, otk1a.Public(), nil, big.NewInt(56))
 	tree1.Insert([]byte{3 << 2}, otk1b.Public(), nil, big.NewInt(56))
@@ -2071,10 +2097,10 @@ func TestValidTransaction(t *testing.T) {
 	tree1.Insert([]byte{7 << 2}, maskedCoinBalanceBytes1b, nil, big.NewInt(56))
 	tree1.Insert([]byte{8 << 2}, mask1a, nil, big.NewInt(56))
 	tree1.Insert([]byte{9 << 2}, mask1b, nil, big.NewInt(56))
-	tree1.Insert([]byte{10 << 2}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+3), nil, big.NewInt(8))
+	tree1.Insert([]byte{10 << 2}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3), nil, big.NewInt(8))
 	verifkey2a, _ := a2.Add(othersk.Public())
 	verifkey2b, _ := b2.Add(psk.Public())
-	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree2.Insert([]byte{1 << 2}, comm2, nil, big.NewInt(56))
 	tree2.Insert([]byte{2 << 2}, otk2a.Public(), nil, big.NewInt(56))
 	tree2.Insert([]byte{3 << 2}, otk2b.Public(), nil, big.NewInt(56))
@@ -2084,9 +2110,9 @@ func TestValidTransaction(t *testing.T) {
 	tree2.Insert([]byte{7 << 2}, maskedCoinBalanceBytes2b, nil, big.NewInt(56))
 	tree2.Insert([]byte{8 << 2}, mask2a, nil, big.NewInt(56))
 	tree2.Insert([]byte{9 << 2}, mask2b, nil, big.NewInt(56))
-	tree2.Insert([]byte{10 << 2}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+3), nil, big.NewInt(8))
+	tree2.Insert([]byte{10 << 2}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3), nil, big.NewInt(8))
 
-	// qcrypto.DebugNonLazyNode(tree.Root, 0, "")
+	// tries.DebugNonLazyNode(tree.Root, 0, "")
 
 	pendingTypeBI, _ := poseidon.HashBytes(
 		slices.Concat(token.QUIL_TOKEN_ADDRESS, []byte("pending:PendingTransaction")),
@@ -2101,6 +2127,7 @@ func TestValidTransaction(t *testing.T) {
 	hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address2[32:]), tree2.Commit(ip, false), big.NewInt(55*26)))
 	hg.SetVertexData(txn, address2, tree2)
 	txn.Commit()
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 
 	// simulate input as commitment to total
 	input1, _ := token.NewTransactionInput(address1[:])
@@ -2138,7 +2165,7 @@ func TestValidTransaction(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(token.FRAME_2_1_CUTOVER + 3); err != nil {
+	if err := tx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2149,7 +2176,7 @@ func TestValidTransaction(t *testing.T) {
 	err = newTx.FromBytes(output, tokenconfig, hg, bp, ip, ve, dc, keys.ToKeyRing(km, true), "", rdfMultiprover)
 	assert.NoError(t, err)
 
-	if valid, err := newTx.Verify(token.FRAME_2_1_CUTOVER + 3); !valid {
+	if valid, err := newTx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 3); !valid {
 		t.Fatal("Expected transaction to verify but it failed", err)
 	}
 }
@@ -2219,8 +2246,8 @@ func TestValidAltTransaction(t *testing.T) {
 	copy(address2[:32], domain)
 	rand.Read(address2[32:])
 
-	tree1 := &qcrypto.VectorCommitmentTree{}
-	tree2 := &qcrypto.VectorCommitmentTree{}
+	tree1 := &tries.VectorCommitmentTree{}
+	tree2 := &tries.VectorCommitmentTree{}
 	otk1a, _ := dc.New()
 	otk1b, _ := dc.New()
 	otk2a, _ := dc.New()
@@ -2316,7 +2343,7 @@ func TestValidAltTransaction(t *testing.T) {
 
 	verifkey1a, _ := a1.Add(psk.Public())
 	verifkey1b, _ := b1.Add(othersk.Public())
-	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree1.Insert([]byte{1 << 2}, comm1, nil, big.NewInt(56))
 	tree1.Insert([]byte{2 << 2}, otk1a.Public(), nil, big.NewInt(56))
 	tree1.Insert([]byte{3 << 2}, otk1b.Public(), nil, big.NewInt(56))
@@ -2326,10 +2353,10 @@ func TestValidAltTransaction(t *testing.T) {
 	tree1.Insert([]byte{7 << 2}, maskedCoinBalanceBytes1b, nil, big.NewInt(56))
 	tree1.Insert([]byte{8 << 2}, mask1a, nil, big.NewInt(56))
 	tree1.Insert([]byte{9 << 2}, mask1b, nil, big.NewInt(56))
-	tree1.Insert([]byte{10 << 2}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+3), nil, big.NewInt(8))
+	tree1.Insert([]byte{10 << 2}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3), nil, big.NewInt(8))
 	verifkey2a, _ := a2.Add(othersk.Public())
 	verifkey2b, _ := b2.Add(psk.Public())
-	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+	tree2.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 	tree2.Insert([]byte{1 << 2}, comm2, nil, big.NewInt(56))
 	tree2.Insert([]byte{2 << 2}, otk2a.Public(), nil, big.NewInt(56))
 	tree2.Insert([]byte{3 << 2}, otk2b.Public(), nil, big.NewInt(56))
@@ -2339,9 +2366,9 @@ func TestValidAltTransaction(t *testing.T) {
 	tree2.Insert([]byte{7 << 2}, maskedCoinBalanceBytes2b, nil, big.NewInt(56))
 	tree2.Insert([]byte{8 << 2}, mask2a, nil, big.NewInt(56))
 	tree2.Insert([]byte{9 << 2}, mask2b, nil, big.NewInt(56))
-	tree2.Insert([]byte{10 << 2}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+3), nil, big.NewInt(8))
+	tree2.Insert([]byte{10 << 2}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3), nil, big.NewInt(8))
 
-	// qcrypto.DebugNonLazyNode(tree.Root, 0, "")
+	// tries.DebugNonLazyNode(tree.Root, 0, "")
 
 	pendingTypeBI, _ := poseidon.HashBytes(
 		slices.Concat(domain, []byte("pending:PendingTransaction")),
@@ -2356,6 +2383,7 @@ func TestValidAltTransaction(t *testing.T) {
 	hg.AddVertex(txn, hypergraph.NewVertex([32]byte(domain), [32]byte(address2[32:]), tree2.Commit(ip, false), big.NewInt(55*26)))
 	hg.SetVertexData(txn, address2, tree2)
 	txn.Commit()
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 3)
 
 	// simulate input as commitment to total
 	input1, _ := token.NewTransactionInput(address1[:])
@@ -2382,7 +2410,7 @@ func TestValidAltTransaction(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(token.FRAME_2_1_CUTOVER + 3); err != nil {
+	if err := tx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 3); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2393,7 +2421,7 @@ func TestValidAltTransaction(t *testing.T) {
 	err = newTx.FromBytes(output, tokenconfig, hg, bp, ip, ve, dc, keys.ToKeyRing(km, true), "", rdfMultiprover)
 	assert.NoError(t, err)
 
-	if valid, err := newTx.Verify(token.FRAME_2_1_CUTOVER + 3); !valid {
+	if valid, err := newTx.Verify(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 4); !valid {
 		t.Fatal("Expected transaction to verify but it failed", err)
 	}
 }
@@ -2425,7 +2453,7 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 	rewardAddress, err := poseidon.HashBytes(slices.Concat(token.QUIL_TOKEN_ADDRESS[:], proveraddr.FillBytes(make([]byte, 32))))
 	assert.NoError(t, err)
 
-	proverTree := &qcrypto.VectorCommitmentTree{}
+	proverTree := &tries.VectorCommitmentTree{}
 	proverTree.Insert([]byte{0}, proveraddr.FillBytes(make([]byte, 32)), nil, big.NewInt(0))
 	proverTree.Insert([]byte{1 << 2}, big.NewInt(10000).FillBytes(make([]byte, 32)), nil, big.NewInt(0))
 
@@ -2441,8 +2469,9 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 	assert.NoError(t, err)
 	err = hg.SetVertexData(txn, vert.GetID(), proverTree)
 	assert.NoError(t, err)
-	hg.Commit()
 	err = txn.Commit()
+	assert.NoError(t, err)
+	roots, err := hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 
 	hgs := hgstate.NewHypergraphState(hg)
@@ -2479,6 +2508,15 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 		senderSpendKey.Public(),
 	)
 	assert.NoError(t, err)
+	clockStore := store.NewPebbleClockStore(s, zap.L())
+	trx, _ := clockStore.NewTransaction(false)
+	clockStore.PutGlobalClockFrame(&protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:          token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1,
+			ProverTreeCommitment: roots[tries.ShardKey{L1: [3]byte{}, L2: [32]byte(intrinsics.GLOBAL_INTRINSIC_ADDRESS)}][0],
+		},
+	}, trx)
+	trx.Commit()
 
 	mintTx := token.NewMintTransaction(
 		[32]byte(token.QUIL_TOKEN_ADDRESS),
@@ -2494,9 +2532,10 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		clockStore,
 	)
 
-	err = mintTx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = mintTx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 	out, err := mintTx.ToBytes()
 	assert.NoError(t, err)
@@ -2509,10 +2548,11 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 		bp,
 		ip,
 		km,
+		clockStore,
 	)
 	assert.NoError(t, err)
 
-	nhgs, err := intrinsic.InvokeStep(token.FRAME_2_1_CUTOVER+2, out, big.NewInt(0), big.NewInt(1), hgs)
+	nhgs, err := intrinsic.InvokeStep(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+2, out, big.NewInt(0), big.NewInt(1), hgs)
 	assert.NoError(t, err)
 
 	mintedAddress := nhgs.Changeset()[1].Address
@@ -2523,6 +2563,7 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 	err = hgs.Commit()
 	assert.NoError(t, err)
 	hgs = hgstate.NewHypergraphState(hg)
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 
 	// Step 3: Create PendingTransaction
 	pendingInput, err := token.NewPendingTransactionInput(slices.Concat(token.QUIL_TOKEN_ADDRESS, mintedAddress))
@@ -2555,12 +2596,12 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	err = pendingTx.Prove(token.FRAME_2_1_CUTOVER + 3)
+	err = pendingTx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.NoError(t, err)
 	out, err = pendingTx.ToBytes()
 	assert.NoError(t, err)
 
-	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_CUTOVER+3, out, big.NewInt(0), big.NewInt(1), hgs)
+	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3, out, big.NewInt(0), big.NewInt(1), hgs)
 	assert.NoError(t, err)
 	hgs = nhgs.(*hgstate.HypergraphState)
 	pendingAddr := hgs.Changeset()[0].Address
@@ -2572,6 +2613,7 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 	err = hgs.Commit()
 	assert.NoError(t, err)
 	hgs = hgstate.NewHypergraphState(hg)
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 3)
 
 	// Step 4: Create Transaction to accept the pending transaction
 	// Receiver accepts the pending transaction
@@ -2602,13 +2644,13 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	err = acceptTx.Prove(token.FRAME_2_1_CUTOVER + 4)
+	err = acceptTx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 3)
 	assert.NoError(t, err)
 
 	out, err = acceptTx.ToBytes()
 	assert.NoError(t, err)
 
-	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_CUTOVER+4, out, big.NewInt(0), big.NewInt(1), hgs)
+	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+4, out, big.NewInt(0), big.NewInt(1), hgs)
 	assert.NoError(t, err)
 	hgs = nhgs.(*hgstate.HypergraphState)
 	acceptAddr := hgs.Changeset()[0].Address
@@ -2693,7 +2735,7 @@ func TestFullTokenFlow_MintPendingTransactionNonDivisible(t *testing.T) {
 	proveraddr, err := poseidon.HashBytes(prover.Public().([]byte))
 	assert.NoError(t, err)
 
-	proverTree := &qcrypto.VectorCommitmentTree{}
+	proverTree := &tries.VectorCommitmentTree{}
 	proverTree.Insert([]byte{0}, prover.Public().([]byte), nil, big.NewInt(0))
 	proverTree.Insert([]byte{1 << 2}, big.NewInt(10000).FillBytes(make([]byte, 32)), nil, big.NewInt(0))
 
@@ -2709,9 +2751,9 @@ func TestFullTokenFlow_MintPendingTransactionNonDivisible(t *testing.T) {
 	assert.NoError(t, err)
 	err = hg.SetVertexData(txn, vert.GetID(), proverTree)
 	assert.NoError(t, err)
-	hg.Commit()
 	err = txn.Commit()
 	assert.NoError(t, err)
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 
 	hgs := hgstate.NewHypergraphState(hg)
 
@@ -2790,16 +2832,17 @@ func TestFullTokenFlow_MintPendingTransactionNonDivisible(t *testing.T) {
 		keys.ToKeyRing(km, false),
 		rdfSchema,
 		rdfMultiprover,
+		store.NewPebbleClockStore(s, zap.L()),
 	)
 
-	err = mintTx.Prove(token.FRAME_2_1_CUTOVER + 2)
+	err = mintTx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 	assert.NoError(t, err)
 	out, err := mintTx.ToBytes()
 	assert.NoError(t, err)
 
 	hgs = hgstate.NewHypergraphState(hg)
 
-	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_CUTOVER+2, out, big.NewInt(0), big.NewInt(1), hgs)
+	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+2, out, big.NewInt(0), big.NewInt(1), hgs)
 	assert.NoError(t, err)
 
 	mintedAddress := nhgs.Changeset()[1].Address
@@ -2810,6 +2853,7 @@ func TestFullTokenFlow_MintPendingTransactionNonDivisible(t *testing.T) {
 	err = hgs.Commit()
 	assert.NoError(t, err)
 	hgs = hgstate.NewHypergraphState(hg)
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 
 	// Step 3: Create PendingTransaction
 	pendingInput, err := token.NewPendingTransactionInput(slices.Concat(tokenAddress, mintedAddress))
@@ -2842,18 +2886,19 @@ func TestFullTokenFlow_MintPendingTransactionNonDivisible(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	err = pendingTx.Prove(token.FRAME_2_1_CUTOVER + 3)
+	err = pendingTx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 	assert.NoError(t, err)
 	out, err = pendingTx.ToBytes()
 	assert.NoError(t, err)
 
-	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_CUTOVER+3, out, big.NewInt(0), big.NewInt(1), hgs)
+	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+3, out, big.NewInt(0), big.NewInt(1), hgs)
 	assert.NoError(t, err)
 	hgs = nhgs.(*hgstate.HypergraphState)
 	pendingAddr := hgs.Changeset()[0].Address
 
 	nhgs, err = intrinsic.Commit()
 	assert.NoError(t, err)
+	hg.Commit(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 3)
 	hgs = nhgs.(*hgstate.HypergraphState)
 
 	err = hgs.Commit()
@@ -2889,13 +2934,13 @@ func TestFullTokenFlow_MintPendingTransactionNonDivisible(t *testing.T) {
 		rdfMultiprover,
 	)
 
-	err = acceptTx.Prove(token.FRAME_2_1_CUTOVER + 4)
+	err = acceptTx.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 3)
 	assert.NoError(t, err)
 
 	out, err = acceptTx.ToBytes()
 	assert.NoError(t, err)
 
-	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_CUTOVER+4, out, big.NewInt(0), big.NewInt(1), hgs)
+	nhgs, err = intrinsic.InvokeStep(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+4, out, big.NewInt(0), big.NewInt(1), hgs)
 	assert.NoError(t, err)
 	hgs = nhgs.(*hgstate.HypergraphState)
 	acceptAddr := hgs.Changeset()[0].Address

@@ -72,16 +72,22 @@ func (p *AppLeaderProvider) ProveNextState(
 		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
 	}
 
-	// Get pending messages to include in frame
+	// Get collected messages to include in frame
 	p.engine.pendingMessagesMu.RLock()
-	messages := make([]*protobufs.Message, len(p.engine.pendingMessages))
-	copy(messages, p.engine.pendingMessages)
+	messages := make([]*protobufs.Message, len(p.engine.collectedMessages[string(
+		collected.commitmentHash[:32],
+	)]))
+	copy(messages, p.engine.collectedMessages[string(
+		collected.commitmentHash[:32],
+	)])
 	p.engine.pendingMessagesMu.RUnlock()
 
-	// Clear pending messages after copying
-	p.engine.pendingMessagesMu.Lock()
-	p.engine.pendingMessages = p.engine.pendingMessages[:0]
-	p.engine.pendingMessagesMu.Unlock()
+	// Clear collected messages after copying
+	p.engine.collectedMessagesMu.Lock()
+	p.engine.collectedMessages[string(
+		collected.commitmentHash[:32],
+	)] = []*protobufs.Message{}
+	p.engine.collectedMessagesMu.Unlock()
 
 	// Update pending messages metric
 	pendingMessagesCount.WithLabelValues(p.engine.appAddressHex).Set(0)

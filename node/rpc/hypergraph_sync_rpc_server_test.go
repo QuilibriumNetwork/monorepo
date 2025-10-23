@@ -201,9 +201,9 @@ func TestHypergraphSyncServer(t *testing.T) {
 
 	logger.Info("run commit server")
 
-	crdts[0].Commit()
+	crdts[0].Commit(0)
 	logger.Info("run commit client")
-	crdts[1].Commit()
+	crdts[1].Commit(0)
 	// crdts[2].Commit()
 	// err := serverHypergraphStore.SaveHypergraph(crdts[0])
 	// assert.NoError(t, err)
@@ -480,9 +480,9 @@ func TestHypergraphPartialSync(t *testing.T) {
 
 	logger.Info("run commit server")
 
-	crdts[0].Commit()
+	crdts[0].Commit(1)
 	logger.Info("run commit client")
-	crdts[1].Commit()
+	crdts[1].Commit(1)
 	// crdts[2].Commit()
 	// err := serverHypergraphStore.SaveHypergraph(crdts[0])
 	// assert.NoError(t, err)

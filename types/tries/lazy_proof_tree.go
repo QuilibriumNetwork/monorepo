@@ -513,6 +513,21 @@ type TreeBackingStore interface {
 	SetCoveredPrefix(
 		path []int,
 	) error
+	SetShardCommit(
+		txn TreeBackingStoreTransaction,
+		frameNumber uint64,
+		phaseType string,
+		setType string,
+		shardAddress []byte,
+		commitment []byte,
+	) error
+	GetShardCommit(
+		frameNumber uint64,
+		phaseType string,
+		setType string,
+		shardAddress []byte,
+	) ([]byte, error)
+	GetRootCommits(frameNumber uint64) (map[ShardKey][][]byte, error)
 }
 
 // LazyVectorCommitmentTree is a lazy-loaded (from a TreeBackingStore based
@@ -1039,43 +1054,68 @@ func (t *LazyVectorCommitmentTree) isPathWithinCoveredPrefix(path []int) bool {
 	return isPrefixOf(path, t.CoveredPrefix)
 }
 
-func (t *LazyVectorCommitmentTree) Verify(proof *TraversalProof) bool {
+func (t *LazyVectorCommitmentTree) Verify(
+	root []byte,
+	proof *TraversalProof,
+) (bool, error) {
 	t.treeMx.RLock()
 	defer t.treeMx.RUnlock()
 
 	if len(proof.Multiproof.GetMulticommitment()) == 0 ||
 		len(proof.Multiproof.GetProof()) == 0 {
-		return false
+		return false, errors.Wrap(
+			errors.New("invalid multiproof sizes"),
+			"verify",
+		)
 	}
 
 	for _, subProof := range proof.SubProofs {
 		if len(subProof.Commits) == 0 ||
 			len(subProof.Paths) != len(subProof.Commits)-1 ||
 			len(subProof.Ys) != len(subProof.Commits) {
-			return false
+			return false, errors.Wrap(
+				errors.New("invalid subproof lengths"),
+				"verify",
+			)
 		}
 	}
 
-	rootCommit := t.Root.Commit(
-		t.InclusionProver,
-		nil,
-		t.SetType,
-		t.PhaseType,
-		t.ShardKey,
-		[]int{},
-		false,
-	)
+	var rootCommit []byte
+	if len(root) == 0 {
+		rootCommit = t.Root.Commit(
+			t.InclusionProver,
+			nil,
+			t.SetType,
+			t.PhaseType,
+			t.ShardKey,
+			[]int{},
+			false,
+		)
+	} else {
+		rootCommit = root
+	}
 
 	for _, subProof := range proof.SubProofs {
 		if !bytes.Equal(rootCommit, subProof.Commits[0]) {
-			return false
+			return false, errors.Wrap(
+				errors.New("invalid subproof commit root"),
+				"verify",
+			)
 		}
 	}
 
-	var verify func(commits [][]byte, indices [][]uint64, ys [][]byte) bool
-	verify = func(commits [][]byte, indices [][]uint64, ys [][]byte) bool {
+	var verify func(
+		commits [][]byte,
+		indices [][]uint64,
+		ys [][]byte,
+	) (bool, error)
+	verify = func(
+		commits [][]byte,
+		indices [][]uint64,
+		ys [][]byte,
+	) (bool, error) {
 		if len(commits) <= 1 {
-			return true
+			return true, nil
 		}
 
 		var out []byte
@@ -1093,7 +1133,10 @@ func (t *LazyVectorCommitmentTree) Verify(proof *TraversalProof) bool {
 		}
 
 		if !bytes.Equal(out, ys[0]) {
-			return false
+			return false, errors.Wrap(
+				errors.New("invalid eval"),
+				"verify",
+			)
 		}
 
 		return verify(
@@ -1118,8 +1161,9 @@ func (t *LazyVectorCommitmentTree) Verify(proof *TraversalProof) bool {
 		commits = append(commits, subProof.Commits[:len(subProof.Commits)-1]...)
 		ys = append(ys, subProof.Ys[:len(subProof.Ys)-1]...)
 
-		if !verify(subProof.Commits, subProof.Paths, subProof.Ys) {
-			return false
+		valid, err := verify(subProof.Commits, subProof.Paths, subProof.Ys)
+		if !valid {
+			return false, err
 		}
 	}
 
@@ -1131,10 +1175,13 @@ func (t *LazyVectorCommitmentTree) Verify(proof *TraversalProof) bool {
 		proof.Multiproof.GetMulticommitment(),
 		proof.Multiproof.GetProof(),
 	) {
-		return false
+		return false, errors.Wrap(
+			errors.New("invalid multiproof"),
+			"verify",
+		)
 	}
 
-	return true
+	return true, nil
 }
 
 type TraversalSubProof struct {

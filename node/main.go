@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	npprof "net/http/pprof"
@@ -115,6 +116,11 @@ var (
 		false,
 		"compacts the database and exits",
 	)
+	dbConsole = flag.Bool(
+		"db-console",
+		false,
+		"starts the db console mode (does not run nodes)",
+	)
 
 	// *char flags
 	blockchar         = "█"
@@ -171,12 +177,26 @@ func monitorParentProcess(
 func main() {
 	config.Flags(&char, &ver)
 	flag.Parse()
-	var logger *zap.Logger
-	if *debug {
-		logger, _ = zap.NewDevelopment()
-	} else {
-		logger, _ = zap.NewProduction()
+
+	nodeConfig, err := config.LoadConfig(*configDirectory, "", false)
+	if err != nil {
+		log.Fatal("failed to load config", err)
 	}
+
+	if *dbConsole {
+		db, err := app.NewDBConsole(nodeConfig)
+		if err != nil {
+			log.Fatal(err)
+		}
+		db.Run()
+		os.Exit(0)
+	}
+
+	logger, closer, err := nodeConfig.CreateLogger(uint(*core), *debug)
+	if err != nil {
+		log.Fatal("failed to create logger", err)
+	}
+	defer closer.Close()
 
 	if *signatureCheck {
 		if runtime.GOOS == "windows" {
@@ -306,12 +326,7 @@ func main() {
 	}
 
 	if *peerId {
-		config, err := config.LoadConfig(*configDirectory, "", false)
-		if err != nil {
-			logger.Fatal("failed to load config", zap.Error(err))
-		}
-
-		printPeerID(logger, config.P2P)
+		printPeerID(logger, nodeConfig.P2P)
 		return
 	}
 
@@ -329,11 +344,6 @@ func main() {
 		config.PrintLogo(*char)
 		config.PrintVersion(uint8(*network), *char, *ver)
 		fmt.Println(" ")
-	}
-
-	nodeConfig, err := config.LoadConfig(*configDirectory, "", false)
-	if err != nil {
-		logger.Fatal("failed to load config", zap.Error(err))
 	}
 
 	if *compactDB {
@@ -431,12 +441,41 @@ func main() {
 			)
 		}
 
-		err = dataWorkerNode.Start()
-		if err != nil {
-			logger.Panic("failed to start data worker node", zap.Error(err))
+		done := make(chan os.Signal, 1)
+		signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
+		quitCh := make(chan struct{})
+
+		go func() {
+			err = dataWorkerNode.Start(done, quitCh)
+			if err != nil {
+				logger.Panic("failed to start data worker node", zap.Error(err))
+				close(quitCh)
+			}
+		}()
+
+		diskFullCh := make(chan error, 1)
+		monitor := store.NewDiskMonitor(
+			uint(*core),
+			*nodeConfig.DB,
+			logger,
+			diskFullCh,
+		)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		monitor.Start(ctx)
+
+	loop:
+		for {
+			select {
+			case <-diskFullCh:
+				dataWorkerNode.Stop()
+			case <-quitCh:
+				dataWorkerNode.Stop()
+				break loop
+			}
 		}
 
-		dataWorkerNode.Stop()
 		return
 	} else {
 		totalMemory := int64(memory.TotalMemory())

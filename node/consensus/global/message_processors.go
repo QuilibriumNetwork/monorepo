@@ -9,6 +9,7 @@ import (
 	"slices"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
@@ -17,6 +18,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
+
+var keyRegistryDomain = []byte("KEY_REGISTRY")
 
 func (e *GlobalConsensusEngine) processGlobalConsensusMessageQueue() {
 	defer e.wg.Done()
@@ -286,29 +289,56 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 	typePrefix := e.peekMessageType(message)
 	switch typePrefix {
 	case protobufs.AppShardFrameType:
+		timer := prometheus.NewTimer(shardFrameProcessingDuration)
+		defer timer.ObserveDuration()
+
 		frame := &protobufs.AppShardFrame{}
 		if err := frame.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
+			shardFramesProcessedTotal.WithLabelValues("error").Inc()
 			return
 		}
+
+		e.frameStoreMu.RLock()
+		existing, ok := e.appFrameStore[string(frame.Header.Address)]
+		if ok && existing != nil &&
+			existing.Header.FrameNumber >= frame.Header.FrameNumber {
+			e.frameStoreMu.RUnlock()
+			return
+		}
+		e.frameStoreMu.RUnlock()
 
 		valid, err := e.appFrameValidator.Validate(frame)
 		if !valid || err != nil {
 			e.logger.Debug("failed to validate frame", zap.Error(err))
+			shardFramesProcessedTotal.WithLabelValues("error").Inc()
 		}
+
+		e.pendingMessagesMu.Lock()
+		bundle := &protobufs.MessageBundle{
+			Requests: []*protobufs.MessageRequest{
+				&protobufs.MessageRequest{
+					Request: &protobufs.MessageRequest_Shard{
+						Shard: frame.Header,
+					},
+				},
+			},
+			Timestamp: frame.Header.Timestamp,
+		}
+
+		bundleBytes, err := bundle.ToCanonicalBytes()
+		if err != nil {
+			e.logger.Error("failed to add shard bundle", zap.Error(err))
+			e.pendingMessagesMu.Unlock()
+			return
+		}
+
+		e.pendingMessages = append(e.pendingMessages, bundleBytes)
+		e.pendingMessagesMu.Unlock()
 		e.frameStoreMu.Lock()
 		defer e.frameStoreMu.Unlock()
-		if old, ok := e.appFrameStore[string(frame.Header.Address)]; ok {
-			if old.Header.FrameNumber > frame.Header.FrameNumber ||
-				(old.Header.FrameNumber == frame.Header.FrameNumber &&
-					compareBits(
-						old.Header.PublicKeySignatureBls48581.Bitmask,
-						frame.Header.PublicKeySignatureBls48581.Bitmask,
-					) >= 0) {
-				return
-			}
-		}
 		e.appFrameStore[string(frame.Header.Address)] = frame
+		shardFramesProcessedTotal.WithLabelValues("success").Inc()
 	default:
 		e.logger.Debug(
 			"unknown message type",
@@ -347,6 +377,134 @@ func (e *GlobalConsensusEngine) handlePeerInfoMessage(message *pb.Message) {
 
 		// Also add to the existing peer info manager
 		e.peerInfoManager.AddPeerInfo(peerInfo)
+	case protobufs.KeyRegistryType:
+		keyRegistry := &protobufs.KeyRegistry{}
+		if err := keyRegistry.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal key registry", zap.Error(err))
+			return
+		}
+
+		if err := keyRegistry.Validate(); err != nil {
+			e.logger.Debug("invalid key registry", zap.Error(err))
+			return
+		}
+
+		validation, err := e.validateKeyRegistry(keyRegistry)
+		if err != nil {
+			e.logger.Debug("invalid key registry signatures", zap.Error(err))
+			return
+		}
+
+		txn, err := e.keyStore.NewTransaction()
+		if err != nil {
+			e.logger.Error("failed to create keystore txn", zap.Error(err))
+			return
+		}
+
+		commit := false
+		defer func() {
+			if !commit {
+				if abortErr := txn.Abort(); abortErr != nil {
+					e.logger.Warn("failed to abort keystore txn", zap.Error(abortErr))
+				}
+			}
+		}()
+
+		var identityAddress []byte
+		if keyRegistry.IdentityKey != nil &&
+			len(keyRegistry.IdentityKey.KeyValue) != 0 {
+			if err := e.keyStore.PutIdentityKey(
+				txn,
+				validation.identityPeerID,
+				keyRegistry.IdentityKey,
+			); err != nil {
+				e.logger.Error("failed to store identity key", zap.Error(err))
+				return
+			}
+			identityAddress = validation.identityPeerID
+		}
+
+		var proverAddress []byte
+		if keyRegistry.ProverKey != nil &&
+			len(keyRegistry.ProverKey.KeyValue) != 0 {
+			if err := e.keyStore.PutProvingKey(
+				txn,
+				validation.proverAddress,
+				&protobufs.BLS48581SignatureWithProofOfPossession{
+					PublicKey: keyRegistry.ProverKey,
+				},
+			); err != nil {
+				e.logger.Error("failed to store prover key", zap.Error(err))
+				return
+			}
+			proverAddress = validation.proverAddress
+		}
+
+		if len(identityAddress) != 0 && len(proverAddress) == 32 &&
+			keyRegistry.IdentityToProver != nil &&
+			len(keyRegistry.IdentityToProver.Signature) != 0 &&
+			keyRegistry.ProverToIdentity != nil &&
+			len(keyRegistry.ProverToIdentity.Signature) != 0 {
+			if err := e.keyStore.PutCrossSignature(
+				txn,
+				identityAddress,
+				proverAddress,
+				keyRegistry.IdentityToProver.Signature,
+				keyRegistry.ProverToIdentity.Signature,
+			); err != nil {
+				e.logger.Error("failed to store cross signatures", zap.Error(err))
+				return
+			}
+		}
+
+		for _, collection := range keyRegistry.KeysByPurpose {
+			for _, key := range collection.X448Keys {
+				if key == nil || key.Key == nil ||
+					len(key.Key.KeyValue) == 0 {
+					continue
+				}
+				addrBI, err := poseidon.HashBytes(key.Key.KeyValue)
+				if err != nil {
+					e.logger.Error("failed to derive x448 key address", zap.Error(err))
+					return
+				}
+				address := addrBI.FillBytes(make([]byte, 32))
+				if err := e.keyStore.PutSignedX448Key(txn, address, key); err != nil {
+					e.logger.Error("failed to store signed x448 key", zap.Error(err))
+					return
+				}
+			}
+
+			for _, key := range collection.Decaf448Keys {
+				if key == nil || key.Key == nil ||
+					len(key.Key.KeyValue) == 0 {
+					continue
+				}
+				addrBI, err := poseidon.HashBytes(key.Key.KeyValue)
+				if err != nil {
+					e.logger.Error(
+						"failed to derive decaf448 key address",
+						zap.Error(err),
+					)
+					return
+				}
+				address := addrBI.FillBytes(make([]byte, 32))
+				if err := e.keyStore.PutSignedDecaf448Key(
+					txn,
+					address,
+					key,
+				); err != nil {
+					e.logger.Error("failed to store signed decaf448 key", zap.Error(err))
+					return
+				}
+			}
+		}
+
+		if err := txn.Commit(); err != nil {
+			e.logger.Error("failed to commit key registry txn", zap.Error(err))
+			return
+		}
+		commit = true
 
 	default:
 		e.logger.Debug(
@@ -354,6 +512,264 @@ func (e *GlobalConsensusEngine) handlePeerInfoMessage(message *pb.Message) {
 			zap.Uint32("type", typePrefix),
 		)
 	}
+}
+
+type keyRegistryValidationResult struct {
+	identityPeerID []byte
+	proverAddress  []byte
+}
+
+func (e *GlobalConsensusEngine) validateKeyRegistry(
+	keyRegistry *protobufs.KeyRegistry,
+) (*keyRegistryValidationResult, error) {
+	if keyRegistry.IdentityKey == nil ||
+		len(keyRegistry.IdentityKey.KeyValue) == 0 {
+		return nil, fmt.Errorf("key registry missing identity key")
+	}
+	if err := keyRegistry.IdentityKey.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid identity key: %w", err)
+	}
+
+	pubKey, err := pcrypto.UnmarshalEd448PublicKey(
+		keyRegistry.IdentityKey.KeyValue,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal identity key: %w", err)
+	}
+	peerID, err := peer.IDFromPublicKey(pubKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive identity peer id: %w", err)
+	}
+	identityPeerID := []byte(peerID.String())
+
+	if keyRegistry.ProverKey == nil ||
+		len(keyRegistry.ProverKey.KeyValue) == 0 {
+		return nil, fmt.Errorf("key registry missing prover key")
+	}
+	if err := keyRegistry.ProverKey.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid prover key: %w", err)
+	}
+
+	if keyRegistry.IdentityToProver == nil ||
+		len(keyRegistry.IdentityToProver.Signature) == 0 {
+		return nil, fmt.Errorf("missing identity-to-prover signature")
+	}
+
+	identityMsg := slices.Concat(
+		keyRegistryDomain,
+		keyRegistry.ProverKey.KeyValue,
+	)
+	valid, err := e.keyManager.ValidateSignature(
+		crypto.KeyTypeEd448,
+		keyRegistry.IdentityKey.KeyValue,
+		identityMsg,
+		keyRegistry.IdentityToProver.Signature,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"identity-to-prover signature validation failed: %w",
+			err,
+		)
+	}
+	if !valid {
+		return nil, fmt.Errorf("identity-to-prover signature invalid")
+	}
+
+	if keyRegistry.ProverToIdentity == nil ||
+		len(keyRegistry.ProverToIdentity.Signature) == 0 {
+		return nil, fmt.Errorf("missing prover-to-identity signature")
+	}
+
+	valid, err = e.keyManager.ValidateSignature(
+		crypto.KeyTypeBLS48581G1,
+		keyRegistry.ProverKey.KeyValue,
+		keyRegistry.IdentityKey.KeyValue,
+		keyRegistry.ProverToIdentity.Signature,
+		keyRegistryDomain,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"prover-to-identity signature validation failed: %w",
+			err,
+		)
+	}
+	if !valid {
+		return nil, fmt.Errorf("prover-to-identity signature invalid")
+	}
+
+	addrBI, err := poseidon.HashBytes(keyRegistry.ProverKey.KeyValue)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive prover key address: %w", err)
+	}
+	proverAddress := addrBI.FillBytes(make([]byte, 32))
+
+	for purpose, collection := range keyRegistry.KeysByPurpose {
+		if collection == nil {
+			continue
+		}
+		for _, key := range collection.X448Keys {
+			if err := e.validateSignedX448Key(
+				key,
+				identityPeerID,
+				proverAddress,
+				keyRegistry,
+			); err != nil {
+				return nil, fmt.Errorf(
+					"invalid x448 key (purpose %s): %w",
+					purpose,
+					err,
+				)
+			}
+		}
+		for _, key := range collection.Decaf448Keys {
+			if err := e.validateSignedDecaf448Key(
+				key,
+				identityPeerID,
+				proverAddress,
+				keyRegistry,
+			); err != nil {
+				return nil, fmt.Errorf(
+					"invalid decaf448 key (purpose %s): %w",
+					purpose,
+					err,
+				)
+			}
+		}
+	}
+
+	return &keyRegistryValidationResult{
+		identityPeerID: identityPeerID,
+		proverAddress:  proverAddress,
+	}, nil
+}
+
+func (e *GlobalConsensusEngine) validateSignedX448Key(
+	key *protobufs.SignedX448Key,
+	identityPeerID []byte,
+	proverAddress []byte,
+	keyRegistry *protobufs.KeyRegistry,
+) error {
+	if key == nil || key.Key == nil || len(key.Key.KeyValue) == 0 {
+		return nil
+	}
+
+	msg := slices.Concat(keyRegistryDomain, key.Key.KeyValue)
+	switch sig := key.Signature.(type) {
+	case *protobufs.SignedX448Key_Ed448Signature:
+		if sig.Ed448Signature == nil ||
+			len(sig.Ed448Signature.Signature) == 0 {
+			return fmt.Errorf("missing ed448 signature")
+		}
+		if !bytes.Equal(key.ParentKeyAddress, identityPeerID) {
+			return fmt.Errorf("unexpected parent for ed448 signed x448 key")
+		}
+		valid, err := e.keyManager.ValidateSignature(
+			crypto.KeyTypeEd448,
+			keyRegistry.IdentityKey.KeyValue,
+			msg,
+			sig.Ed448Signature.Signature,
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to validate ed448 signature: %w", err)
+		}
+		if !valid {
+			return fmt.Errorf("ed448 signature invalid")
+		}
+	case *protobufs.SignedX448Key_BlsSignature:
+		if sig.BlsSignature == nil ||
+			len(sig.BlsSignature.Signature) == 0 {
+			return fmt.Errorf("missing bls signature")
+		}
+		if len(proverAddress) != 0 &&
+			!bytes.Equal(key.ParentKeyAddress, proverAddress) {
+			return fmt.Errorf("unexpected parent for bls signed x448 key")
+		}
+		valid, err := e.keyManager.ValidateSignature(
+			crypto.KeyTypeBLS48581G1,
+			keyRegistry.ProverKey.KeyValue,
+			key.Key.KeyValue,
+			sig.BlsSignature.Signature,
+			keyRegistryDomain,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to validate bls signature: %w", err)
+		}
+		if !valid {
+			return fmt.Errorf("bls signature invalid")
+		}
+	case *protobufs.SignedX448Key_DecafSignature:
+		return fmt.Errorf("decaf signature not supported for x448 key")
+	default:
+		return fmt.Errorf("missing signature for x448 key")
+	}
+
+	return nil
+}
+
+func (e *GlobalConsensusEngine) validateSignedDecaf448Key(
+	key *protobufs.SignedDecaf448Key,
+	identityPeerID []byte,
+	proverAddress []byte,
+	keyRegistry *protobufs.KeyRegistry,
+) error {
+	if key == nil || key.Key == nil || len(key.Key.KeyValue) == 0 {
+		return nil
+	}
+
+	msg := slices.Concat(keyRegistryDomain, key.Key.KeyValue)
+	switch sig := key.Signature.(type) {
+	case *protobufs.SignedDecaf448Key_Ed448Signature:
+		if sig.Ed448Signature == nil ||
+			len(sig.Ed448Signature.Signature) == 0 {
+			return fmt.Errorf("missing ed448 signature")
+		}
+		if !bytes.Equal(key.ParentKeyAddress, identityPeerID) {
+			return fmt.Errorf("unexpected parent for ed448 signed decaf key")
+		}
+		valid, err := e.keyManager.ValidateSignature(
+			crypto.KeyTypeEd448,
+			keyRegistry.IdentityKey.KeyValue,
+			msg,
+			sig.Ed448Signature.Signature,
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to validate ed448 signature: %w", err)
+		}
+		if !valid {
+			return fmt.Errorf("ed448 signature invalid")
+		}
+	case *protobufs.SignedDecaf448Key_BlsSignature:
+		if sig.BlsSignature == nil ||
+			len(sig.BlsSignature.Signature) == 0 {
+			return fmt.Errorf("missing bls signature")
+		}
+		if len(proverAddress) != 0 &&
+			!bytes.Equal(key.ParentKeyAddress, proverAddress) {
+			return fmt.Errorf("unexpected parent for bls signed decaf key")
+		}
+		valid, err := e.keyManager.ValidateSignature(
+			crypto.KeyTypeBLS48581G1,
+			keyRegistry.ProverKey.KeyValue,
+			key.Key.KeyValue,
+			sig.BlsSignature.Signature,
+			keyRegistryDomain,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to validate bls signature: %w", err)
+		}
+		if !valid {
+			return fmt.Errorf("bls signature invalid")
+		}
+	case *protobufs.SignedDecaf448Key_DecafSignature:
+		return fmt.Errorf("decaf signature validation not supported")
+	default:
+		return fmt.Errorf("missing signature for decaf key")
+	}
+
+	return nil
 }
 
 func (e *GlobalConsensusEngine) handleAlertMessage(message *pb.Message) {

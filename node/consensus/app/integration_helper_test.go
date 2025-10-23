@@ -552,14 +552,16 @@ func registerProverInHypergraphWithFilter(t *testing.T, hg thypergraph.Hypergrap
 	txn.Commit()
 
 	// Commit the hypergraph
-	hg.Commit()
+	hg.Commit(0)
 
 	t.Logf("    Registered prover with address: %x, filter: %x (public key length: %d)", address, filter, len(publicKey))
 }
 
 type mockGlobalClientLocks struct {
-	committed bool
-	hashes    [][]byte
+	committed        bool
+	hashes           [][]byte
+	shardAddresses   map[string][][]byte
+	shardAddressesMu sync.Mutex
 }
 
 func (m *mockGlobalClientLocks) GetGlobalFrame(ctx context.Context, in *protobufs.GetGlobalFrameRequest, opts ...grpc.CallOption) (*protobufs.GlobalFrameResponse, error) {
@@ -572,17 +574,23 @@ func (m *mockGlobalClientLocks) GetGlobalShards(ctx context.Context, in *protobu
 	return nil, errors.New("not used in this test")
 }
 func (m *mockGlobalClientLocks) GetLockedAddresses(ctx context.Context, in *protobufs.GetLockedAddressesRequest, opts ...grpc.CallOption) (*protobufs.GetLockedAddressesResponse, error) {
-	out := &protobufs.GetLockedAddressesResponse{Transactions: make([]*protobufs.LockedTransaction, 0, len(m.hashes))}
-	for _, h := range m.hashes {
+	out := &protobufs.GetLockedAddressesResponse{Transactions: []*protobufs.LockedTransaction{}}
+	m.shardAddressesMu.Lock()
+	hits := m.shardAddresses[string(in.ShardAddress)]
+	for _, h := range hits {
 		out.Transactions = append(out.Transactions, &protobufs.LockedTransaction{
 			TransactionHash: h,
 			Committed:       m.committed,
 		})
 	}
+	m.shardAddressesMu.Unlock()
 	return out, nil
 }
 
-func createValidPendingTxPayload(t *testing.T, hgs []thypergraph.Hypergraph, km *keys.InMemoryKeyManager) []byte {
+func createValidPendingTxPayload(t *testing.T, hgs []thypergraph.Hypergraph, km *keys.InMemoryKeyManager, prefix byte) *token.PendingTransaction {
+	// set this value so we skip cutover checks
+	token.BEHAVIOR_PASS = true
+
 	dc := &bulletproofs.Decaf448KeyConstructor{}
 	vk, _ := dc.New()
 	sk, _ := dc.New()
@@ -604,12 +612,15 @@ func createValidPendingTxPayload(t *testing.T, hgs []thypergraph.Hypergraph, km 
 	psk, err := km.CreateAgreementKey("q-spend-key", crypto.KeyTypeDecaf448)
 	assert.NoError(t, err)
 
+	// Control shard placement
 	address1 := [64]byte{}
 	copy(address1[:32], token.QUIL_TOKEN_ADDRESS)
-	rand.Read(address1[32:])
+	address1[32] = prefix
+	rand.Read(address1[33:])
 	address2 := [64]byte{}
 	copy(address2[:32], token.QUIL_TOKEN_ADDRESS)
-	rand.Read(address2[32:])
+	address2[32] = prefix
+	rand.Read(address2[33:])
 
 	tree1 := &qcrypto.VectorCommitmentTree{}
 	tree2 := &qcrypto.VectorCommitmentTree{}
@@ -686,7 +697,10 @@ func createValidPendingTxPayload(t *testing.T, hgs []thypergraph.Hypergraph, km 
 		hg.SetVertexData(txn, address1, tree1)
 		hg.AddVertex(txn, hypergraph.NewVertex([32]byte(token.QUIL_TOKEN_ADDRESS), [32]byte(address2[32:]), tree2.Commit(hg.GetProver(), false), big.NewInt(55*26)))
 		hg.SetVertexData(txn, address2, tree2)
-		txn.Commit()
+		err := txn.Commit()
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// simulate input as commitment to total
@@ -725,22 +739,7 @@ func createValidPendingTxPayload(t *testing.T, hgs []thypergraph.Hypergraph, km 
 		rdfMultiprover,
 	)
 
-	if err := tx.Prove(1); err != nil {
-		t.Fatal(err)
-	}
-
-	req := &protobufs.MessageBundle{
-		Requests: []*protobufs.MessageRequest{
-			{
-				Request: &protobufs.MessageRequest_PendingTransaction{
-					PendingTransaction: tx.ToProtobuf(),
-				},
-			},
-		},
-	}
-	out, err := req.ToCanonicalBytes()
-	assert.NoError(t, err)
-	return out
+	return tx
 }
 
 func prepareRDFSchemaFromConfig(

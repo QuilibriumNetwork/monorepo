@@ -31,10 +31,10 @@ classgroup = { path = "../classgroup", version = "^0.1.0" }
 num-traits = "0.2"
 sha2 = "0.8"
 bit-vec = "0.5"
-uniffi = {  version= "0.25", features = ["cli"]}
+uniffi = {  version= "0.28.3", features = ["cli"]}
 
 [build-dependencies]
-uniffi = { version = "0.25", features = [ "build" ] }
+uniffi = { version = "0.28.3", features = [ "build" ] }
 
 [dev-dependencies]
 criterion = ">=0.2"

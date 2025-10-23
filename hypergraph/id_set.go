@@ -136,6 +136,12 @@ func (set *idSet) Has(key [64]byte) bool {
 	return err == nil
 }
 
+func (hg *HypergraphCRDT) GetCoveredPrefix() ([]int, error) {
+	hg.mu.RLock()
+	defer hg.mu.RUnlock()
+	return hg.getCoveredPrefix(), nil
+}
+
 func (hg *HypergraphCRDT) getCoveredPrefix() []int {
 	return slices.Clone(hg.coveredPrefix)
 }

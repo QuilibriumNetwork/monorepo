@@ -29,6 +29,7 @@ type AppConsensusEngineFactory struct {
 	keyStore             store.KeyStore
 	clockStore           store.ClockStore
 	inboxStore           store.InboxStore
+	shardsStore          store.ShardsStore
 	hypergraphStore      store.HypergraphStore
 	frameProver          crypto.FrameProver
 	inclusionProver      crypto.InclusionProver
@@ -58,6 +59,7 @@ func NewAppConsensusEngineFactory(
 	keyStore store.KeyStore,
 	clockStore store.ClockStore,
 	inboxStore store.InboxStore,
+	shardsStore store.ShardsStore,
 	hypergraphStore store.HypergraphStore,
 	frameProver crypto.FrameProver,
 	inclusionProver crypto.InclusionProver,
@@ -85,6 +87,7 @@ func NewAppConsensusEngineFactory(
 		keyStore:             keyStore,
 		clockStore:           clockStore,
 		inboxStore:           inboxStore,
+		shardsStore:          shardsStore,
 		hypergraphStore:      hypergraphStore,
 		frameProver:          frameProver,
 		inclusionProver:      inclusionProver,
@@ -141,6 +144,7 @@ func (f *AppConsensusEngineFactory) CreateAppConsensusEngine(
 		f.keyStore,
 		f.clockStore,
 		f.inboxStore,
+		f.shardsStore,
 		f.hypergraphStore,
 		f.frameProver,
 		f.inclusionProver,

@@ -490,6 +490,7 @@ func createTestAppConsensusEngine(
 	pebbleDB := pstore.NewPebbleDB(logger, config.DB, 0)
 	clockStore := pstore.NewPebbleClockStore(pebbleDB, logger)
 	inboxStore := pstore.NewPebbleInboxStore(pebbleDB, logger)
+	shardStore := pstore.NewPebbleShardsStore(pebbleDB, logger)
 	hypergraphStore := pstore.NewPebbleHypergraphStore(config.DB, pebbleDB, logger, &mocks.MockVerifiableEncryptor{}, mockInclusionProver)
 	appTimeReel := createTestAppTimeReel(t, appAddress, clockStore)
 	mockProverRegistry := createTestProverRegistry()
@@ -545,6 +546,7 @@ func createTestAppConsensusEngine(
 		mockKeyStore,
 		clockStore,
 		inboxStore,
+		shardStore,
 		hypergraphStore,
 		mockFrameProver,
 		mockInclusionProver,
@@ -1015,6 +1017,8 @@ func TestComputeExecutionEngine_ProcessMessage_DeployWithPaymentAndExecute(
 ) {
 	// Helper function to perform deployment steps with specific keys
 	performDeploymentWithKeys := func(t *testing.T, engine *engines.ComputeExecutionEngine, mockHG *mocks.MockHypergraph, mockCompiler *mocks.MockCompiler, readKey, writeKey []byte, engineMode engines.ExecutionMode) []byte {
+		mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
+
 		// Use provided keys
 		outFees := []*big.Int{big.NewInt(1)}
 		total := big.NewInt(10000000)
@@ -2212,7 +2216,7 @@ req:A a rdfs:Property;
 			maskedCoinBalanceBytes1 := make([]byte, 56)
 			rand.Read(maskedCoinBalanceBytes1)
 
-			tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_CUTOVER+1), nil, big.NewInt(8))
+			tree1.Insert([]byte{0}, binary.BigEndian.AppendUint64(nil, token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1), nil, big.NewInt(8))
 			tree1.Insert([]byte{1 << 2}, comm1, nil, big.NewInt(56))
 			tree1.Insert([]byte{2 << 2}, otk1, nil, big.NewInt(56))
 			tree1.Insert([]byte{3 << 2}, verifkey1, nil, big.NewInt(56))
@@ -3581,6 +3585,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockKeyManager.On("ValidateSignature", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
@@ -3667,6 +3672,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockKeyManager.On("ValidateSignature", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
@@ -3798,6 +3804,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockKeyManager.On("ValidateSignature", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
@@ -3922,6 +3929,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockKeyManager.On("ValidateSignature", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
@@ -4101,6 +4109,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockKeyManager.On("ValidateSignature", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
@@ -4233,6 +4242,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockKeyManager.On("ValidateSignature", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
@@ -4356,6 +4366,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockKeyManager.On("ValidateSignature", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
@@ -4493,6 +4504,7 @@ rdfs:range req:Request.
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockKeyManager.On("ValidateSignature", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
@@ -4611,6 +4623,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
 			mockVerEnc := new(mocks.MockVerifiableEncryptor)
@@ -4705,6 +4718,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
 			mockVerEnc := new(mocks.MockVerifiableEncryptor)
@@ -4830,6 +4844,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
 			mockVerEnc := new(mocks.MockVerifiableEncryptor)
@@ -4952,6 +4967,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
 			mockVerEnc := new(mocks.MockVerifiableEncryptor)
@@ -5074,6 +5090,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
 			mockVerEnc := new(mocks.MockVerifiableEncryptor)
@@ -5192,6 +5209,7 @@ req:A a rdfs:Property;
 			mockHG := tests.CreateHypergraphWithInclusionProver(mockInclusionProver)
 			mockHG.On("Commit").Return(map[tries.ShardKey][][]byte{}).Maybe()
 			mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockBulletproofProver := new(mocks.MockBulletproofProver)
 			mockVerEnc := new(mocks.MockVerifiableEncryptor)

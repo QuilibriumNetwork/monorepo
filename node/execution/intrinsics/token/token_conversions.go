@@ -396,7 +396,10 @@ func (t *TransactionOutput) ToProtobuf() *protobufs.TransactionOutput {
 }
 
 // FromProtobuf converts a protobuf Transaction to intrinsics Transaction
-func TransactionFromProtobuf(pb *protobufs.Transaction) (*Transaction, error) {
+func TransactionFromProtobuf(
+	pb *protobufs.Transaction,
+	inclusionProver crypto.InclusionProver,
+) (*Transaction, error) {
 	if pb == nil {
 		return nil, nil
 	}
@@ -431,12 +434,18 @@ func TransactionFromProtobuf(pb *protobufs.Transaction) (*Transaction, error) {
 		fees[i] = new(big.Int).SetBytes(fee)
 	}
 
+	proof, err := TraversalProofFromProtobuf(pb.TraversalProof, inclusionProver)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Transaction{
-		Domain:     domain,
-		Inputs:     inputs,
-		Outputs:    outputs,
-		Fees:       fees,
-		RangeProof: pb.RangeProof,
+		Domain:         domain,
+		Inputs:         inputs,
+		Outputs:        outputs,
+		Fees:           fees,
+		RangeProof:     pb.RangeProof,
+		TraversalProof: proof,
 		// Runtime dependencies will be injected separately
 	}, nil
 }
@@ -564,7 +573,10 @@ func (
 
 // FromProtobuf converts a protobuf PendingTransaction to intrinsics
 // PendingTransaction
-func PendingTransactionFromProtobuf(pb *protobufs.PendingTransaction) (
+func PendingTransactionFromProtobuf(
+	pb *protobufs.PendingTransaction,
+	inclusionProver crypto.InclusionProver,
+) (
 	*PendingTransaction,
 	error,
 ) {
@@ -602,12 +614,18 @@ func PendingTransactionFromProtobuf(pb *protobufs.PendingTransaction) (
 		fees[i] = new(big.Int).SetBytes(fee)
 	}
 
+	proof, err := TraversalProofFromProtobuf(pb.TraversalProof, inclusionProver)
+	if err != nil {
+		return nil, err
+	}
+
 	return &PendingTransaction{
-		Domain:     domain,
-		Inputs:     inputs,
-		Outputs:    outputs,
-		Fees:       fees,
-		RangeProof: pb.RangeProof,
+		Domain:         domain,
+		Inputs:         inputs,
+		Outputs:        outputs,
+		Fees:           fees,
+		RangeProof:     pb.RangeProof,
+		TraversalProof: proof,
 		// Runtime dependencies will be injected separately
 	}, nil
 }

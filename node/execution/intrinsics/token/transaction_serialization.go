@@ -38,7 +38,7 @@ func (tx *PendingTransaction) FromBytes(
 	}
 
 	// Convert from protobuf
-	converted, err := PendingTransactionFromProtobuf(pb)
+	converted, err := PendingTransactionFromProtobuf(pb, inclusionProver)
 	if err != nil {
 		return errors.Wrap(err, "from bytes")
 	}
@@ -46,22 +46,8 @@ func (tx *PendingTransaction) FromBytes(
 	// Copy converted fields
 	*tx = *converted
 
-	tx.rdfHypergraphSchema = rdfHypergraphSchema
-
-	// Convert TraversalProof from protobuf if present
-	if pb.TraversalProof != nil {
-		tp, err := TraversalProofFromProtobuf(pb.TraversalProof, inclusionProver)
-		if err != nil {
-			return errors.Wrap(err, "deserializing traversal proof")
-		}
-		tx.TraversalProof = tp
-
-		if tx.TraversalProof != nil && len(tx.TraversalProof.SubProofs) == 0 {
-			return errors.Wrap(errors.New("invalid payload"), "from bytes")
-		}
-	}
-
 	// Set injected values
+	tx.rdfHypergraphSchema = rdfHypergraphSchema
 	tx.hypergraph = hypergraph
 	tx.bulletproofProver = bulletproofProver
 	tx.inclusionProver = inclusionProver
@@ -103,7 +89,7 @@ func (tx *Transaction) FromBytes(
 	}
 
 	// Convert from protobuf
-	converted, err := TransactionFromProtobuf(pb)
+	converted, err := TransactionFromProtobuf(pb, inclusionProver)
 	if err != nil {
 		return errors.Wrap(err, "from bytes")
 	}
@@ -113,15 +99,6 @@ func (tx *Transaction) FromBytes(
 
 	// Load intrinsic for RDF schema
 	tx.rdfHypergraphSchema = rdfHypergraphSchema
-
-	// Convert TraversalProof from protobuf if present
-	if pb.TraversalProof != nil {
-		tp, err := TraversalProofFromProtobuf(pb.TraversalProof, inclusionProver)
-		if err != nil {
-			return errors.Wrap(err, "deserializing traversal proof")
-		}
-		tx.TraversalProof = tp
-	}
 
 	// Set injected values
 	tx.hypergraph = hypergraph

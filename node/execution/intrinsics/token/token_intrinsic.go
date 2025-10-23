@@ -22,6 +22,7 @@ import (
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
@@ -44,6 +45,7 @@ type TokenIntrinsic struct {
 	lockedWritesMx      sync.RWMutex
 	lockedReadsMx       sync.RWMutex
 	state               state.State
+	clockStore          store.ClockStore
 }
 
 // SumCheck implements intrinsics.Intrinsic.
@@ -573,7 +575,7 @@ func (t *TokenIntrinsic) InvokeStep(
 		}
 
 		// Convert from protobuf to intrinsics type
-		tx, err := TransactionFromProtobuf(pbTx)
+		tx, err := TransactionFromProtobuf(pbTx, t.inclusionProver)
 		if err != nil {
 			observability.InvokeStepErrors.WithLabelValues("token", opName).Inc()
 			return nil, errors.Wrap(err, "invoke step")
@@ -588,19 +590,6 @@ func (t *TokenIntrinsic) InvokeStep(
 		tx.decafConstructor = t.decafConstructor
 		tx.keyRing = keys.ToKeyRing(t.keyManager, true)
 		tx.rdfMultiprover = t.rdfMultiprover
-
-		// Handle TraversalProof conversion from protobuf
-		if pbTx.TraversalProof != nil {
-			tp, err := TraversalProofFromProtobuf(
-				pbTx.TraversalProof,
-				t.inclusionProver,
-			)
-			if err != nil {
-				observability.InvokeStepErrors.WithLabelValues("token", opName).Inc()
-				return nil, errors.Wrap(err, "invoke step")
-			}
-			tx.TraversalProof = tp
-		}
 
 		// Verify the transaction
 		valid, err := tx.Verify(frameNumber)
@@ -630,7 +619,7 @@ func (t *TokenIntrinsic) InvokeStep(
 		}
 
 		// Convert from protobuf to intrinsics type
-		tx, err := PendingTransactionFromProtobuf(pbTx)
+		tx, err := PendingTransactionFromProtobuf(pbTx, t.inclusionProver)
 		if err != nil {
 			observability.InvokeStepErrors.WithLabelValues("token", opName).Inc()
 			return nil, errors.Wrap(err, "invoke step")
@@ -645,19 +634,6 @@ func (t *TokenIntrinsic) InvokeStep(
 		tx.decafConstructor = t.decafConstructor
 		tx.keyRing = keys.ToKeyRing(t.keyManager, true)
 		tx.rdfMultiprover = t.rdfMultiprover
-
-		// Handle TraversalProof conversion from protobuf
-		if pbTx.TraversalProof != nil {
-			tp, err := TraversalProofFromProtobuf(
-				pbTx.TraversalProof,
-				t.inclusionProver,
-			)
-			if err != nil {
-				observability.InvokeStepErrors.WithLabelValues("token", opName).Inc()
-				return nil, errors.Wrap(err, "invoke step")
-			}
-			tx.TraversalProof = tp
-		}
 
 		// Verify the transaction
 		valid, err := tx.Verify(frameNumber)
@@ -705,6 +681,7 @@ func (t *TokenIntrinsic) InvokeStep(
 		tx.decafConstructor = t.decafConstructor
 		tx.keyRing = keys.ToKeyRing(t.keyManager, true)
 		tx.rdfMultiprover = t.rdfMultiprover
+		tx.clockStore = t.clockStore
 
 		// Verify the transaction
 		valid, err := tx.Verify(frameNumber)
@@ -1050,6 +1027,7 @@ func LoadTokenIntrinsic(
 	bulletproofProver crypto.BulletproofProver,
 	inclusionProver crypto.InclusionProver,
 	keyManager tkeys.KeyManager,
+	clockStore store.ClockStore,
 ) (*TokenIntrinsic, error) {
 	var config *TokenIntrinsicConfiguration
 	var consensusMetadata *qcrypto.VectorCommitmentTree
@@ -1121,6 +1099,7 @@ func LoadTokenIntrinsic(
 		rdfHypergraphSchema: rdfHypergraphSchema,
 		rdfMultiprover:      rdfMultiprover,
 		state:               hg.NewHypergraphState(hypergraph),
+		clockStore:          clockStore,
 	}, nil
 }
 

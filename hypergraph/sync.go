@@ -25,7 +25,7 @@ func (hg *HypergraphCRDT) HyperStream(
 	if !hg.syncController.TryEstablishSyncSession() {
 		return errors.New("unavailable")
 	}
-	hg.Commit()
+
 	hg.mu.RLock()
 	defer hg.mu.RUnlock()
 	defer hg.syncController.EndSyncSession()
@@ -63,7 +63,6 @@ func (hg *HypergraphCRDT) Sync(
 		return errors.New("unavailable")
 	}
 
-	hg.Commit()
 	hg.mu.RLock()
 	defer hg.mu.RUnlock()
 	defer hg.syncController.EndSyncSession()

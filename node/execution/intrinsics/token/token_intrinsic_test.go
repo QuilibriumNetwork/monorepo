@@ -252,7 +252,7 @@ func TestLoadTokenIntrinsic(t *testing.T) {
 	inclusionProver.On("CommitRaw", mock.Anything, mock.Anything).Return([]byte("mock-commitment"), nil)
 
 	t.Run("load failure - vertex not found", func(t *testing.T) {
-		_, err := LoadTokenIntrinsic(appAddress, mockHypergraphErr, verEnc, decafConstructor, bulletproofProver, inclusionProver, keyManager)
+		_, err := LoadTokenIntrinsic(appAddress, mockHypergraphErr, verEnc, decafConstructor, bulletproofProver, inclusionProver, keyManager, nil)
 
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "vertex not found")
@@ -262,7 +262,7 @@ func TestLoadTokenIntrinsic(t *testing.T) {
 	t.Run("load success - valid token intrinsic", func(t *testing.T) {
 		inclusionProver.On("CommitRaw", mock.Anything, mock.Anything).Return([]byte("commitment"), nil)
 
-		tokenIntrinsic, err := LoadTokenIntrinsic(appAddress, mockHypergraphSuccess, verEnc, decafConstructor, bulletproofProver, inclusionProver, keyManager)
+		tokenIntrinsic, err := LoadTokenIntrinsic(appAddress, mockHypergraphSuccess, verEnc, decafConstructor, bulletproofProver, inclusionProver, keyManager, nil)
 
 		require.NoError(t, err)
 		require.NotNil(t, tokenIntrinsic)

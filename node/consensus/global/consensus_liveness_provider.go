@@ -83,31 +83,8 @@ func (p *GlobalLivenessProvider) Collect(
 	)
 
 	for i, message := range messages {
-		err := p.engine.executionManager.ValidateMessage(
-			frameNumber,
-			message.Address,
-			message.Payload,
-		)
+		err := p.validateAndLockMessage(frameNumber, i, message)
 		if err != nil {
-			p.engine.logger.Debug(
-				"invalid message",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		_, err = p.engine.executionManager.Lock(
-			frameNumber,
-			message.Address,
-			message.Payload,
-		)
-		if err != nil {
-			p.engine.logger.Debug(
-				"message failed lock",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
 			continue
 		}
 
@@ -130,7 +107,14 @@ func (p *GlobalLivenessProvider) Collect(
 	proverRoot := make([]byte, 64)
 
 	// TODO(2.1.1+): Refactor this with caching
-	commitSet := p.engine.hypergraph.Commit()
+	commitSet, err := p.engine.hypergraph.Commit(frameNumber)
+	if err != nil {
+		p.engine.logger.Error(
+			"could not commit",
+			zap.Error(err),
+		)
+		return GlobalCollectedCommitments{}, errors.Wrap(err, "collect")
+	}
 	collected := 0
 
 	// The poseidon hash's field is < 0x3fff...ffff, so we use the upper two bits
@@ -260,6 +244,53 @@ func (p *GlobalLivenessProvider) SendLiveness(
 		"sent liveness check",
 		zap.Uint64("frame_number", collected.frameNumber),
 	)
+
+	return nil
+}
+
+func (p *GlobalLivenessProvider) validateAndLockMessage(
+	frameNumber uint64,
+	i int,
+	message *protobufs.Message,
+) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.engine.logger.Error(
+				"panic recovered from message",
+				zap.Any("panic", r),
+				zap.Stack("stacktrace"),
+			)
+			err = errors.New("panicked processing message")
+		}
+	}()
+
+	err = p.engine.executionManager.ValidateMessage(
+		frameNumber,
+		message.Address,
+		message.Payload,
+	)
+	if err != nil {
+		p.engine.logger.Debug(
+			"invalid message",
+			zap.Int("message_index", i),
+			zap.Error(err),
+		)
+		return err
+	}
+
+	_, err = p.engine.executionManager.Lock(
+		frameNumber,
+		message.Address,
+		message.Payload,
+	)
+	if err != nil {
+		p.engine.logger.Debug(
+			"message failed lock",
+			zap.Int("message_index", i),
+			zap.Error(err),
+		)
+		return err
+	}
 
 	return nil
 }

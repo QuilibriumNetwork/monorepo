@@ -9,6 +9,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
@@ -224,18 +225,22 @@ func (e *AppConsensusEngine) handleProverMessage(message *pb.Message) {
 
 	typePrefix := e.peekMessageType(message)
 
+	e.logger.Debug("handling prover message", zap.Uint32("type_prefix", typePrefix))
 	switch typePrefix {
 	case protobufs.MessageBundleType:
 		// MessageBundle messages need to be collected for execution
 		// Store them in pendingMessages to be processed during Collect
+		hash := sha3.Sum256(message.Data)
 		e.pendingMessagesMu.Lock()
 		e.pendingMessages = append(e.pendingMessages, &protobufs.Message{
+			Address: e.appAddress[:32],
+			Hash:    hash[:],
 			Payload: message.Data,
 		})
 		e.pendingMessagesMu.Unlock()
 
 		e.logger.Debug(
-			"collected global request for execution",
+			"collected app request for execution",
 			zap.Uint32("type", typePrefix),
 		)
 
@@ -486,20 +491,22 @@ func (e *AppConsensusEngine) handleLivenessCheck(message *pb.Message) {
 		return
 	}
 
+	lcBytes, err := livenessCheck.ConstructSignaturePayload()
+	if err != nil {
+		e.logger.Error(
+			"could not construct signature message for liveness check",
+			zap.Error(err),
+		)
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
 	var found []byte = nil
 	for _, prover := range proverSet {
 		if bytes.Equal(
 			prover.Address,
 			livenessCheck.PublicKeySignatureBls48581.Address,
 		) {
-			lcBytes, err := livenessCheck.ConstructSignaturePayload()
-			if err != nil {
-				e.logger.Error(
-					"could not construct signature message for liveness check",
-					zap.Error(err),
-				)
-				break
-			}
 			valid, err := e.keyManager.ValidateSignature(
 				crypto.KeyTypeBLS48581G1,
 				prover.PublicKey,
@@ -530,27 +537,6 @@ func (e *AppConsensusEngine) handleLivenessCheck(message *pb.Message) {
 				),
 			),
 		)
-		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	signatureData, err := livenessCheck.ConstructSignaturePayload()
-	if err != nil {
-		e.logger.Error("invalid signature payload", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	valid, err := e.keyManager.ValidateSignature(
-		crypto.KeyTypeBLS48581G1,
-		found,
-		signatureData,
-		livenessCheck.PublicKeySignatureBls48581.Signature,
-		livenessCheck.GetSignatureDomain(),
-	)
-
-	if err != nil || !valid {
-		e.logger.Error("invalid liveness check signature", zap.Error(err))
 		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}

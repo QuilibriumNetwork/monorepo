@@ -402,7 +402,8 @@ func TestHypergraphState(t *testing.T) {
 		assert.NoError(t, err)
 		_, err = hg.GetHyperedge([64]byte(slices.Concat(domain, hyperedgeAddress)))
 		assert.NoError(t, err)
-		preRemove := hg.Commit()
+		preRemove, err := hg.Commit(0)
+		assert.NoError(t, err)
 
 		// Delete vertex and hyperedge
 		st = hypergraph.NewHypergraphState(hg)
@@ -425,7 +426,8 @@ func TestHypergraphState(t *testing.T) {
 		// Commit the deletes
 		err = st.Commit()
 		assert.NoError(t, err)
-		postRemove := hg.Commit()
+		postRemove, err := hg.Commit(1)
+		assert.NoError(t, err)
 
 		// Verify vertex and hyperedge are removed
 		_, err = hg.GetVertex([64]byte(slices.Concat(domain, vertexAddress)))
@@ -486,7 +488,8 @@ func TestHypergraphState(t *testing.T) {
 		assert.NoError(t, err)
 		err = txn.Commit()
 		assert.NoError(t, err)
-		postRevert := hg.Commit()
+		postRevert, err := hg.Commit(2)
+		assert.NoError(t, err)
 
 		for i := range preRemove {
 			for j := range preRemove[i] {

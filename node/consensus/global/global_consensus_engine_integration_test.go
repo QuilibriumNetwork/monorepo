@@ -341,7 +341,7 @@ func registerProverInHypergraph(t *testing.T, hg thypergraph.Hypergraph, publicK
 	txn.Commit()
 
 	// Commit the hypergraph
-	hg.Commit()
+	hg.Commit(0)
 
 	t.Logf("    Registered global prover with address: %x (public key length: %d)", address, len(publicKey))
 }
@@ -728,7 +728,7 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 
 	// Commit the hypergraph
 	for i := 0; i < 6; i++ {
-		hypergraphs[i].Commit()
+		hypergraphs[i].Commit(0)
 	}
 
 	// Create six engines that can communicate (minimum required for consensus)
@@ -894,6 +894,11 @@ loop:
 }
 
 func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
+	// This test needs to run long enough to hit the condition required
+	if testing.Short() {
+		t.Skip("Skipping shard coverage scenario test in short mode")
+	}
+
 	// Generate hosts for testing
 	_, m, cleanupHosts := tests.GenerateSimnetHosts(t, 1, []libp2p.Option{})
 	defer cleanupHosts()
@@ -906,7 +911,7 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 		Path:             ".test/global",
 	}, pebbleDB, zap.L(), &verenc.MPCitHVerifiableEncryptor{}, inclusionProver)
 	hg := hgcrdt.NewHypergraph(zap.NewNop(), hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
-	for i := range 3 {
+	for i := range 6 {
 		k := make([]byte, 585)
 		k[1] = byte(i)
 		abi, _ := poseidon.HashBytes(k)
@@ -944,17 +949,12 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 	// Start the event distributor
 	engine.Start(make(chan struct{}))
 
-	time.Sleep(1 * time.Second)
-
-	// Configure low coverage scenario in hypergraph
-	// Since we registered only 1 prover above, this is already a low coverage scenario
-
 	// Run shard coverage check
 	err := engine.checkShardCoverage(1)
 	require.NoError(t, err)
 
 	// Wait for event processing and possible new app shard head
-	time.Sleep(10 * time.Second)
+	time.Sleep(1800 * time.Second)
 	mu.Lock()
 	found := false
 	newHeadAfter := false
@@ -1331,7 +1331,7 @@ func registerProverInHypergraphWithFilter(t *testing.T, hg thypergraph.Hypergrap
 	txn.Commit()
 
 	// Commit the hypergraph
-	hg.Commit()
+	hg.Commit(0)
 
 	t.Logf("    Registered prover with address: %x, filter: %x (public key length: %d)", address, filter, len(publicKey))
 }
