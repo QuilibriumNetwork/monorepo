@@ -520,6 +520,10 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 				continue
 			}
 		}
+		workers, err = w.store.RangeWorkers()
+		if err != nil {
+			return errors.Wrap(err, "load workers from store")
+		}
 	}
 
 	var totalStorage uint64

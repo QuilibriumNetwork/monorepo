@@ -7,7 +7,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/events"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
-	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -47,7 +46,7 @@ type ConsensusEngineFactory struct {
 	decafConstructor   crypto.DecafConstructor
 	compiler           compiler.CircuitCompiler
 	blsConstructor     crypto.BlsConstructor
-	peerInfoManager    p2p.PeerInfoManager
+	peerInfoManager    tp2p.PeerInfoManager
 }
 
 // NewConsensusEngineFactory creates a new factory for consensus engines
@@ -78,7 +77,7 @@ func NewConsensusEngineFactory(
 	decafConstructor crypto.DecafConstructor,
 	compiler compiler.CircuitCompiler,
 	blsConstructor crypto.BlsConstructor,
-	peerInfoManager p2p.PeerInfoManager,
+	peerInfoManager tp2p.PeerInfoManager,
 ) *ConsensusEngineFactory {
 	// Initialize peer seniority data
 	compat.RebuildPeerSeniority(uint(config.P2P.Network))

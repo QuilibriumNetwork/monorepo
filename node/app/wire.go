@@ -108,7 +108,7 @@ var pubSubSet = wire.NewSet(
 	p2p.NewBlossomSub,
 	channel.NewDoubleRatchetEncryptedChannel,
 	wire.Bind(new(tp2p.PubSub), new(*p2p.BlossomSub)),
-	wire.Bind(new(p2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)),
+	wire.Bind(new(tp2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)),
 	wire.Bind(
 		new(tchannel.EncryptedChannel),
 		new(*channel.DoubleRatchetEncryptedChannel),
@@ -122,7 +122,7 @@ var proxyPubSubSet = wire.NewSet(
 	rpc.NewProxyBlossomSub,
 	channel.NewDoubleRatchetEncryptedChannel,
 	wire.Bind(new(tp2p.PubSub), new(*rpc.ProxyBlossomSub)),
-	wire.Bind(new(p2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)),
+	wire.Bind(new(tp2p.PeerInfoManager), new(*p2p.InMemoryPeerInfoManager)),
 	wire.Bind(
 		new(tchannel.EncryptedChannel),
 		new(*channel.DoubleRatchetEncryptedChannel),
@@ -288,7 +288,7 @@ func provideDataWorkerIPC(
 	signerRegistry consensus.SignerRegistry,
 	proverRegistry consensus.ProverRegistry,
 	appConsensusEngineFactory *app.AppConsensusEngineFactory,
-	peerInfoManager p2p.PeerInfoManager,
+	peerInfoManager tp2p.PeerInfoManager,
 	frameProver crypto.FrameProver,
 	logger *zap.Logger,
 	coreId uint,

@@ -22,9 +22,9 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 
-	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
+	tp2p "source.quilibrium.com/quilibrium/monorepo/types/p2p"
 )
 
 type createdWaitKey struct {
@@ -38,7 +38,7 @@ type createdWaitKey struct {
 // to provide better performance where hardware acceleration is unavailable.
 type OnionRouter struct {
 	logger     *zap.Logger
-	peers      p2p.PeerInfoManager
+	peers      tp2p.PeerInfoManager
 	signers    consensus.SignerRegistry
 	keyManager keys.KeyManager
 	link       Transport
@@ -71,7 +71,7 @@ func WithSharedSecret(f SharedSecretFn) Option {
 
 func NewOnionRouter(
 	logger *zap.Logger,
-	peerManager p2p.PeerInfoManager,
+	peerManager tp2p.PeerInfoManager,
 	signerRegistry consensus.SignerRegistry,
 	keyManager keys.KeyManager,
 	opts ...Option,
@@ -335,7 +335,7 @@ func (r *OnionRouter) BuildCircuitToExit(
 	}
 
 	// Filter out the chosen exit.
-	filtered := make([]*p2p.PeerInfo, 0, len(cands))
+	filtered := make([]*tp2p.PeerInfo, 0, len(cands))
 	for _, pm := range cands {
 		if string(pm.PeerId) == string(exitPeerID) {
 			continue
@@ -356,7 +356,7 @@ func (r *OnionRouter) BuildCircuitToExit(
 
 	// Pick first (hops-1) from filtered (already shuffled in selectRoutingPeers),
 	// then append exit at the end.
-	route := make([]*p2p.PeerInfo, 0, hops)
+	route := make([]*tp2p.PeerInfo, 0, hops)
 	if hops > 1 {
 		route = append(route, filtered[:hops-1]...)
 	}
@@ -904,9 +904,9 @@ func (r *OnionRouter) closeStream(c *Circuit, s *onionStream) {
 	r.mu.Unlock()
 }
 
-func (r *OnionRouter) selectRoutingPeers() ([]*p2p.PeerInfo, error) {
+func (r *OnionRouter) selectRoutingPeers() ([]*tp2p.PeerInfo, error) {
 	ids := r.peers.GetPeersBySpeed()
-	out := make([]*p2p.PeerInfo, 0, len(ids))
+	out := make([]*tp2p.PeerInfo, 0, len(ids))
 	seen := map[string]struct{}{}
 
 	for _, id := range ids {
@@ -933,7 +933,7 @@ func (r *OnionRouter) selectRoutingPeers() ([]*p2p.PeerInfo, error) {
 	return out, nil
 }
 
-func hasCapability(pm *p2p.PeerInfo, x uint32) bool {
+func hasCapability(pm *tp2p.PeerInfo, x uint32) bool {
 	for _, c := range pm.Capabilities {
 		if c.ProtocolIdentifier == x {
 			return true

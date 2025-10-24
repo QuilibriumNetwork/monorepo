@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha3"
 	_ "embed"
 	"encoding/hex"
 	"flag"
@@ -33,7 +34,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"source.quilibrium.com/quilibrium/monorepo/config"
@@ -80,6 +80,11 @@ var (
 		"node-info",
 		false,
 		"print node related information",
+	)
+	peerInfo = flag.Bool(
+		"peer-info",
+		false,
+		"prints peer info",
 	)
 	debug = flag.Bool(
 		"debug",
@@ -128,6 +133,24 @@ var (
 	char      *string = &blockchar
 	ver       *string = &bver
 )
+
+var capabilityLabels = map[uint32]string{
+	0x00010001: "Compute Protocol v1",
+	0x00010101: "KZG Verify (BLS48581)",
+	0x00010201: "Bulletproof Range Verify (Decaf448)",
+	0x00010301: "Bulletproof Sum Verify (Decaf448)",
+	0x00010401: "SECP256K1 ECDSA Verify",
+	0x00010501: "ED25519 EdDSA Verify",
+	0x00010601: "ED448 EdDSA Verify",
+	0x00010701: "DECAF448 Schnorr Verify",
+	0x00010801: "SECP256R1 ECDSA Verify",
+	0x00020001: "Global Protocol v1",
+	0x00030001: "Hypergraph Protocol v1",
+	0x00040001: "Token Protocol v1",
+	0x0101:     "Double Ratchet v1",
+	0x0201:     "Triple Ratchet v1",
+	0x0301:     "Onion Routing v1",
+}
 
 func signatureCheckDefault() bool {
 	envVarValue, envVarExists := os.LookupEnv("QUILIBRIUM_SIGNATURE_CHECK")
@@ -340,6 +363,16 @@ func main() {
 		return
 	}
 
+	if *peerInfo {
+		config, err := config.LoadConfig(*configDirectory, "", false)
+		if err != nil {
+			logger.Fatal("failed to load config", zap.Error(err))
+		}
+
+		printPeerInfo(logger, config)
+		return
+	}
+
 	if *core == 0 {
 		config.PrintLogo(*char)
 		config.PrintVersion(uint8(*network), *char, *ver)
@@ -538,7 +571,7 @@ func main() {
 			masterNode.GetLogger(),
 			masterNode.GetKeyManager(),
 			masterNode.GetPubSub(),
-			masterNode.GetPeerInfoProvider(),
+			masterNode.GetPeerInfoManager(),
 			masterNode.GetWorkerManager(),
 			masterNode.GetProverRegistry(),
 			masterNode.GetExecutionEngineManager(),
@@ -629,10 +662,179 @@ func printNodeInfo(logger *zap.Logger, cfg *config.Config) {
 	fmt.Println("Active Workers:", nodeInfo.Workers)
 }
 
+func printPeerInfo(logger *zap.Logger, cfg *config.Config) {
+	if cfg.ListenGRPCMultiaddr == "" {
+		logger.Fatal("gRPC Not Enabled, Please Configure")
+	}
+
+	printPeerID(logger, cfg.P2P)
+
+	conn, err := ConnectToNode(logger, cfg)
+	if err != nil {
+		logger.Fatal(
+			"could not connect to node. if it is still booting, please wait.",
+			zap.Error(err),
+		)
+	}
+	defer conn.Close()
+
+	client := protobufs.NewNodeServiceClient(conn)
+
+	peerInfo, err := client.GetPeerInfo(
+		context.Background(),
+		&protobufs.GetPeerInfoRequest{},
+	)
+	if err != nil {
+		logger.Panic("failed to fetch node info", zap.Error(err))
+	}
+
+	for idx, p := range peerInfo.PeerInfo {
+		if p == nil {
+			continue
+		}
+		fmt.Printf("Peer %d:\n", idx+1)
+
+		if peerID := formatPeerID(p.PeerId); peerID != "" {
+			fmt.Println("  Peer ID:", peerID)
+		}
+
+		if len(p.Version) >= 3 {
+			fmt.Println("  Version:", config.FormatVersion(p.Version))
+		}
+
+		if patch := formatPatchVersion(p.PatchVersion); patch != "" {
+			fmt.Println("  Patch Version:", patch)
+		}
+
+		if p.Timestamp != 0 {
+			fmt.Println(
+				"  Last Seen:",
+				time.UnixMilli(p.Timestamp).UTC().Format(time.RFC3339),
+			)
+		}
+
+		printReachability(p.Reachability)
+		printCapabilities(p.Capabilities)
+
+		if len(p.PublicKey) > 0 {
+			fmt.Println("  Public Key:", hex.EncodeToString(p.PublicKey))
+		}
+
+		if len(p.Signature) > 0 {
+			fmt.Println("  Signature:", hex.EncodeToString(p.Signature))
+		}
+
+		if idx < len(peerInfo.PeerInfo)-1 {
+			fmt.Println()
+		}
+	}
+}
+
+func formatPeerID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	id, err := peer.IDFromBytes(raw)
+	if err != nil {
+		return hex.EncodeToString(raw)
+	}
+	return id.String()
+}
+
+func capabilityDescription(id uint32) string {
+	if name, ok := capabilityLabels[id]; ok {
+		return fmt.Sprintf("%s (0x%08X)", name, id)
+	}
+	return fmt.Sprintf("0x%08X", id)
+}
+
+func formatPatchVersion(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if len(raw) == 1 {
+		return fmt.Sprintf("%d", raw[0])
+	}
+	return fmt.Sprintf("0x%s", hex.EncodeToString(raw))
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func printReachability(reach []*protobufs.Reachability) {
+	printed := false
+	for _, r := range reach {
+		if r == nil {
+			continue
+		}
+		filter := hex.EncodeToString(r.Filter)
+		pubsub := nonEmptyStrings(r.PubsubMultiaddrs)
+		stream := nonEmptyStrings(r.StreamMultiaddrs)
+		if filter == "" && len(pubsub) == 0 && len(stream) == 0 {
+			continue
+		}
+		if !printed {
+			fmt.Println("  Reachability:")
+			printed = true
+		}
+		fmt.Println("    -")
+		if filter != "" {
+			fmt.Println("      Filter:", filter)
+		}
+		if len(pubsub) > 0 {
+			fmt.Println("      Pubsub Multiaddrs:")
+			for _, addr := range pubsub {
+				fmt.Println("        " + addr)
+			}
+		}
+		if len(stream) > 0 {
+			fmt.Println("      Stream Multiaddrs:")
+			for _, addr := range stream {
+				fmt.Println("        " + addr)
+			}
+		}
+	}
+}
+
+func printCapabilities(list []*protobufs.Capability) {
+	entries := make([]string, 0, len(list))
+	for _, capability := range list {
+		if capability == nil {
+			continue
+		}
+		desc := capabilityDescription(capability.ProtocolIdentifier)
+		if len(capability.AdditionalMetadata) > 0 {
+			desc = fmt.Sprintf(
+				"%s (metadata: %s)",
+				desc,
+				hex.EncodeToString(capability.AdditionalMetadata),
+			)
+		}
+		entries = append(entries, desc)
+	}
+	if len(entries) == 0 {
+		return
+	}
+	fmt.Println("  Capabilities:")
+	for _, entry := range entries {
+		fmt.Println("    - " + entry)
+	}
+}
+
 var defaultGrpcAddress = "localhost:8337"
 
 // Connect to the node via GRPC
-func ConnectToNode(logger *zap.Logger, nodeConfig *config.Config) (*grpc.ClientConn, error) {
+func ConnectToNode(logger *zap.Logger, nodeConfig *config.Config) (
+	*grpc.ClientConn,
+	error,
+) {
 	addr := defaultGrpcAddress
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		ma, err := multiaddr.NewMultiaddr(nodeConfig.ListenGRPCMultiaddr)

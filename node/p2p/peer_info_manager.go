@@ -7,36 +7,8 @@ import (
 
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
 )
-
-type PeerInfoManager interface {
-	Start()
-	Stop()
-	AddPeerInfo(info *protobufs.PeerInfo)
-	GetPeerInfo(peerId []byte) *PeerInfo
-	GetPeerMap() map[string]*PeerInfo
-	GetPeersBySpeed() [][]byte
-}
-
-type Reachability struct {
-	Filter           []byte
-	PubsubMultiaddrs []string
-	StreamMultiaddrs []string
-}
-
-type Capability struct {
-	ProtocolIdentifier uint32
-	AdditionalMetadata []byte
-}
-
-type PeerInfo struct {
-	PeerId       []byte
-	Cores        uint32
-	Capabilities []Capability
-	Reachability []Reachability
-	Bandwidth    uint64
-	LastSeen     int64
-}
 
 type InMemoryPeerInfoManager struct {
 	logger     *zap.Logger
@@ -44,18 +16,18 @@ type InMemoryPeerInfoManager struct {
 	quitCh     chan struct{}
 	peerInfoMx sync.RWMutex
 
-	peerMap      map[string]*PeerInfo
-	fastestPeers []*PeerInfo
+	peerMap      map[string]*p2p.PeerInfo
+	fastestPeers []*p2p.PeerInfo
 }
 
-var _ PeerInfoManager = (*InMemoryPeerInfoManager)(nil)
+var _ p2p.PeerInfoManager = (*InMemoryPeerInfoManager)(nil)
 
 func NewInMemoryPeerInfoManager(logger *zap.Logger) *InMemoryPeerInfoManager {
 	return &InMemoryPeerInfoManager{
 		logger:       logger,
 		peerInfoCh:   make(chan *protobufs.PeerInfo, 1000),
-		fastestPeers: []*PeerInfo{},
-		peerMap:      make(map[string]*PeerInfo),
+		fastestPeers: []*p2p.PeerInfo{},
+		peerMap:      make(map[string]*p2p.PeerInfo),
 	}
 }
 
@@ -65,23 +37,23 @@ func (m *InMemoryPeerInfoManager) Start() {
 			select {
 			case info := <-m.peerInfoCh:
 				m.peerInfoMx.Lock()
-				reachability := []Reachability{}
+				reachability := []p2p.Reachability{}
 				for _, r := range info.Reachability {
-					reachability = append(reachability, Reachability{
+					reachability = append(reachability, p2p.Reachability{
 						Filter:           r.Filter,
 						PubsubMultiaddrs: r.PubsubMultiaddrs,
 						StreamMultiaddrs: r.StreamMultiaddrs,
 					})
 				}
-				capabilities := []Capability{}
+				capabilities := []p2p.Capability{}
 				for _, c := range info.Capabilities {
-					capabilities = append(capabilities, Capability{
+					capabilities = append(capabilities, p2p.Capability{
 						ProtocolIdentifier: c.ProtocolIdentifier,
 						AdditionalMetadata: c.AdditionalMetadata,
 					})
 				}
 				seen := time.Now().UnixMilli()
-				m.peerMap[string(info.PeerId)] = &PeerInfo{
+				m.peerMap[string(info.PeerId)] = &p2p.PeerInfo{
 					PeerId:       info.PeerId,
 					Bandwidth:    100,
 					Capabilities: capabilities,
@@ -89,7 +61,7 @@ func (m *InMemoryPeerInfoManager) Start() {
 					Cores:        uint32(len(reachability)),
 					LastSeen:     seen,
 				}
-				m.searchAndInsertPeer(&PeerInfo{
+				m.searchAndInsertPeer(&p2p.PeerInfo{
 					PeerId:       info.PeerId,
 					Bandwidth:    100,
 					Capabilities: capabilities,
@@ -117,7 +89,7 @@ func (m *InMemoryPeerInfoManager) AddPeerInfo(info *protobufs.PeerInfo) {
 	}()
 }
 
-func (m *InMemoryPeerInfoManager) GetPeerInfo(peerId []byte) *PeerInfo {
+func (m *InMemoryPeerInfoManager) GetPeerInfo(peerId []byte) *p2p.PeerInfo {
 	m.peerInfoMx.RLock()
 	manifest, ok := m.peerMap[string(peerId)]
 	m.peerInfoMx.RUnlock()
@@ -127,8 +99,8 @@ func (m *InMemoryPeerInfoManager) GetPeerInfo(peerId []byte) *PeerInfo {
 	return manifest
 }
 
-func (m *InMemoryPeerInfoManager) GetPeerMap() map[string]*PeerInfo {
-	data := make(map[string]*PeerInfo)
+func (m *InMemoryPeerInfoManager) GetPeerMap() map[string]*p2p.PeerInfo {
+	data := make(map[string]*p2p.PeerInfo)
 	m.peerInfoMx.RLock()
 	for k, v := range m.peerMap {
 		data[k] = v
@@ -150,7 +122,7 @@ func (m *InMemoryPeerInfoManager) GetPeersBySpeed() [][]byte {
 
 // blatantly lifted from slices.BinarySearchFunc, optimized for direct insertion
 // and uint64 comparison without overflow
-func (m *InMemoryPeerInfoManager) searchAndInsertPeer(info *PeerInfo) {
+func (m *InMemoryPeerInfoManager) searchAndInsertPeer(info *p2p.PeerInfo) {
 	n := len(m.fastestPeers)
 	i, j := 0, n
 	for i < j {
@@ -166,7 +138,7 @@ func (m *InMemoryPeerInfoManager) searchAndInsertPeer(info *PeerInfo) {
 		bytes.Equal(m.fastestPeers[i].PeerId, info.PeerId) {
 		m.fastestPeers[i] = info
 	} else {
-		m.fastestPeers = append(m.fastestPeers, new(PeerInfo))
+		m.fastestPeers = append(m.fastestPeers, new(p2p.PeerInfo))
 		copy(m.fastestPeers[i+1:], m.fastestPeers[i:])
 		m.fastestPeers[i] = info
 	}

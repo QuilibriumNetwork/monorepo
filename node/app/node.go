@@ -5,7 +5,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/global"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/manager"
-	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
@@ -25,6 +24,7 @@ type MasterNode struct {
 	coinStore       store.TokenStore
 	keyManager      keys.KeyManager
 	pubSub          p2p.PubSub
+	peerInfoManager p2p.PeerInfoManager
 	globalConsensus *global.GlobalConsensusEngine
 	globalTimeReel  *consensustime.GlobalTimeReel
 	pebble          store.KVDB
@@ -48,6 +48,7 @@ func newMasterNode(
 	coinStore store.TokenStore,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
+	peerInfoManager p2p.PeerInfoManager,
 	globalConsensus *global.GlobalConsensusEngine,
 	globalTimeReel *consensustime.GlobalTimeReel,
 	pebble store.KVDB,
@@ -61,6 +62,7 @@ func newMasterNode(
 		coinStore:       coinStore,
 		keyManager:      keyManager,
 		pubSub:          pubSub,
+		peerInfoManager: peerInfoManager,
 		globalConsensus: globalConsensus,
 		globalTimeReel:  globalTimeReel,
 		pebble:          pebble,
@@ -154,8 +156,8 @@ func (m *MasterNode) GetCoreId() uint {
 	return m.coreId
 }
 
-func (m *MasterNode) GetPeerInfoProvider() rpc.PeerInfoProvider {
-	return m.globalConsensus
+func (m *MasterNode) GetPeerInfoManager() p2p.PeerInfoManager {
+	return m.peerInfoManager
 }
 
 func (m *MasterNode) GetWorkerManager() worker.WorkerManager {

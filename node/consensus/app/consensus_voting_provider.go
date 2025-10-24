@@ -273,6 +273,41 @@ func (p *AppVotingProvider) DecideAndSendVote(
 	return PeerID{ID: chosenProposal.Header.Prover}, &vote, nil
 }
 
+func (p *AppVotingProvider) SendVote(
+	vote **protobufs.FrameVote,
+	ctx context.Context,
+) (PeerID, error) {
+	if vote == nil || *vote == nil {
+		return PeerID{}, errors.Wrap(
+			errors.New("no vote provided"),
+			"send vote",
+		)
+	}
+
+	bumpVote := &protobufs.FrameVote{
+		Filter:                     p.engine.appAddress,
+		FrameNumber:                (*vote).FrameNumber,
+		Proposer:                   (*vote).Proposer,
+		Approve:                    true,
+		Timestamp:                  time.Now().UnixMilli(),
+		PublicKeySignatureBls48581: (*vote).PublicKeySignatureBls48581,
+	}
+
+	data, err := (*bumpVote).ToCanonicalBytes()
+	if err != nil {
+		return PeerID{}, errors.Wrap(err, "serialize vote")
+	}
+
+	if err := p.engine.pubsub.PublishToBitmask(
+		p.engine.getConsensusMessageBitmask(),
+		data,
+	); err != nil {
+		p.engine.logger.Error("failed to publish vote", zap.Error(err))
+	}
+
+	return PeerID{ID: (*vote).Proposer}, nil
+}
+
 func (p *AppVotingProvider) IsQuorum(
 	proposalVotes map[consensus.Identity]**protobufs.FrameVote,
 	ctx context.Context,

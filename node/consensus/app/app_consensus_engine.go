@@ -82,7 +82,7 @@ type AppConsensusEngine struct {
 	executors             map[string]execution.ShardExecutionEngine
 	executorsMu           sync.RWMutex
 	executionManager      *manager.ExecutionEngineManager
-	peerInfoManager       p2p.PeerInfoManager
+	peerInfoManager       tp2p.PeerInfoManager
 	currentDifficulty     uint32
 	currentDifficultyMu   sync.RWMutex
 	pendingMessages       []*protobufs.Message
@@ -171,7 +171,7 @@ func NewAppConsensusEngine(
 	difficultyAdjuster typesconsensus.DifficultyAdjuster,
 	rewardIssuance typesconsensus.RewardIssuance,
 	eventDistributor typesconsensus.EventDistributor,
-	peerInfoManager p2p.PeerInfoManager,
+	peerInfoManager tp2p.PeerInfoManager,
 	appTimeReel *consensustime.AppTimeReel,
 	globalTimeReel *consensustime.GlobalTimeReel,
 	blsConstructor crypto.BlsConstructor,

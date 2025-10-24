@@ -139,6 +139,8 @@ type VotingProvider[StateT Unique, VoteT Unique, PeerIDT Unique] interface {
 		proposals map[Identity]*StateT,
 		ctx context.Context,
 	) (PeerIDT, *VoteT, error)
+	// Re-publishes a vote message, used to help lagging peers catch up.
+	SendVote(vote *VoteT, ctx context.Context) (PeerIDT, error)
 	// IsQuorum returns a response indicating whether or not quorum has been
 	// reached.
 	IsQuorum(
@@ -603,32 +605,96 @@ func (sm *StateMachine[
 				return
 			}
 
-			proposal, err := sm.leaderProvider.ProveNextState(
-				data,
-				*collected,
-				ctx,
-			)
+			peers, err := sm.leaderProvider.GetNextLeaders(data, ctx)
 			if err != nil {
-				sm.traceLogger.Error(
-					fmt.Sprintf("error encountered in %s", sm.machineState),
-					err,
-				)
-
+				sm.traceLogger.Error("could not obtain leaders", err)
 				sm.SendEvent(EventInduceSync)
 				return
 			}
 
-			sm.mu.Lock()
-			sm.traceLogger.Trace(
-				fmt.Sprintf("adding proposal with rank %d", (*proposal).Rank()),
-			)
-			if _, ok := sm.proposals[(*proposal).Rank()]; !ok {
-				sm.proposals[(*proposal).Rank()] = make(map[Identity]*StateT)
-			}
-			sm.proposals[(*proposal).Rank()][sm.id.Identity()] = proposal
-			sm.mu.Unlock()
+			proposalCh := make(chan *StateT)
+			go func() {
+				proposal, err := sm.leaderProvider.ProveNextState(
+					data,
+					*collected,
+					ctx,
+				)
+				if err != nil {
+					sm.traceLogger.Error(
+						fmt.Sprintf("error encountered in %s", sm.machineState),
+						err,
+					)
 
-			sm.SendEvent(EventProofComplete)
+					proposalCh <- nil
+					return
+				}
+
+				proposalCh <- proposal
+			}()
+
+			timer := time.NewTicker(1 * time.Second)
+			checks := 0
+
+			for {
+				select {
+				case proposal, ok := <-proposalCh:
+					if !ok || proposal == nil {
+						sm.SendEvent(EventInduceSync)
+						return
+					}
+
+					sm.mu.Lock()
+					sm.traceLogger.Trace(
+						fmt.Sprintf("adding proposal with rank %d", (*proposal).Rank()),
+					)
+					if _, ok := sm.proposals[(*proposal).Rank()]; !ok {
+						sm.proposals[(*proposal).Rank()] = make(map[Identity]*StateT)
+					}
+					sm.proposals[(*proposal).Rank()][sm.id.Identity()] = proposal
+					sm.mu.Unlock()
+
+					sm.SendEvent(EventProofComplete)
+					return
+				case <-timer.C:
+					checks++
+					sm.mu.Lock()
+					proposals, ok := sm.proposals[(*data).Rank()+1]
+					if !ok {
+						sm.mu.Unlock()
+						continue
+					}
+
+					// We have the winner, move on
+					if _, ok := proposals[peers[0].Identity()]; ok {
+						sm.mu.Unlock()
+
+						sm.SendEvent(EventPublishTimeout)
+						return
+					}
+
+					// Reverse decay acceptance on target time
+					for i := range peers {
+						if i == 0 {
+							// already checked
+							continue
+						}
+
+						checkTime := i + 10
+						if checkTime <= checks {
+							if _, ok := proposals[peers[i].Identity()]; ok {
+								sm.mu.Unlock()
+
+								sm.SendEvent(EventPublishTimeout)
+								return
+							}
+						}
+					}
+					sm.mu.Unlock()
+				case <-ctx.Done():
+					sm.traceLogger.Trace("context canceled")
+					return
+				}
+			}
 		},
 		Timeout:   120 * time.Second,
 		OnTimeout: EventPublishTimeout,
@@ -685,18 +751,6 @@ func (sm *StateMachine[
 					}
 				}
 
-				if len(sm.proposals[(*sm.activeState).Rank()+1]) < int(sm.minimumProvers()) {
-					sm.traceLogger.Trace(
-						fmt.Sprintf(
-							"insufficient proposal count: %d, need %d",
-							len(sm.proposals[(*sm.activeState).Rank()+1]),
-							int(sm.minimumProvers()),
-						),
-					)
-					sm.mu.Unlock()
-					return
-				}
-
 				if ctx == nil {
 					sm.traceLogger.Trace("context null")
 					sm.mu.Unlock()
@@ -714,6 +768,16 @@ func (sm *StateMachine[
 					for k, v := range sm.proposals[(*sm.activeState).Rank()+1] {
 						state := (*v).Clone().(StateT)
 						proposals[k] = &state
+					}
+
+					if len(proposals) == 0 {
+						sm.mu.Unlock()
+						sm.traceLogger.Error(
+							"no proposals to vote on",
+							errors.New("no proposals"),
+						)
+						sm.SendEvent(EventInduceSync)
+						break
 					}
 
 					sm.mu.Unlock()
@@ -745,39 +809,64 @@ func (sm *StateMachine[
 				}
 			} else {
 				sm.traceLogger.Trace("proposal chosen, checking for quorum")
-				proposalVotes := map[Identity]*VoteT{}
-				for p, vp := range sm.votes[(*sm.activeState).Rank()+1] {
-					vclone := (*vp).Clone().(VoteT)
-					proposalVotes[p] = &vclone
-				}
-				haveEnoughProposals := len(sm.proposals[(*sm.activeState).Rank()+1]) >=
-					int(sm.minimumProvers())
-				sm.mu.Unlock()
-				isQuorum, err := sm.votingProvider.IsQuorum(proposalVotes, ctx)
-				if err != nil {
-					sm.traceLogger.Error(
-						fmt.Sprintf("error encountered in %s", sm.machineState),
-						err,
-					)
-					sm.SendEvent(EventInduceSync)
-					return
-				}
+				for {
+					proposalVotes := map[Identity]*VoteT{}
+					for p, vp := range sm.votes[(*sm.activeState).Rank()+1] {
+						vclone := (*vp).Clone().(VoteT)
+						proposalVotes[p] = &vclone
+					}
+					sm.mu.Unlock()
+					isQuorum, err := sm.votingProvider.IsQuorum(proposalVotes, ctx)
+					if err != nil {
+						sm.traceLogger.Error(
+							fmt.Sprintf("error encountered in %s", sm.machineState),
+							err,
+						)
+						sm.SendEvent(EventInduceSync)
+						return
+					}
 
-				if isQuorum && haveEnoughProposals {
-					sm.traceLogger.Trace("quorum reached")
-					sm.SendEvent(EventQuorumReached)
-				} else {
-					sm.traceLogger.Trace(
-						fmt.Sprintf(
-							"quorum not reached: proposals: %d, needed: %d",
-							len(sm.proposals[(*sm.activeState).Rank()+1]),
-							sm.minimumProvers(),
-						),
-					)
+					if isQuorum {
+						sm.traceLogger.Trace("quorum reached")
+						sm.SendEvent(EventQuorumReached)
+						return
+					} else {
+						select {
+						case <-time.After(1 * time.Second):
+							vote, ok := proposalVotes[sm.id.Identity()]
+							if !ok {
+								sm.traceLogger.Error(
+									"no vote found",
+									errors.New("prover has no vote"),
+								)
+								sm.SendEvent(EventInduceSync)
+								return
+							}
+							_, err := sm.votingProvider.SendVote(vote, ctx)
+							if err != nil {
+								sm.traceLogger.Error(
+									fmt.Sprintf("error encountered in %s", sm.machineState),
+									err,
+								)
+								sm.SendEvent(EventInduceSync)
+								return
+							}
+						case <-ctx.Done():
+							return
+						}
+						sm.traceLogger.Trace(
+							fmt.Sprintf(
+								"quorum not reached: votes: %d, needed: %d",
+								len(proposalVotes),
+								sm.minimumProvers(),
+							),
+						)
+					}
+					sm.mu.Lock()
 				}
 			}
 		},
-		Timeout:   1 * time.Second,
+		Timeout:   16 * time.Second,
 		OnTimeout: EventVotingTimeout,
 	}
 

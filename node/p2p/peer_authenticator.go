@@ -32,6 +32,7 @@ import (
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
 )
 
 type PeerAuthenticator struct {
@@ -41,7 +42,7 @@ type PeerAuthenticator struct {
 	config *config.P2PConfig
 
 	// peer info manager is used to identify live peers
-	peerInfoManager PeerInfoManager
+	peerInfoManager p2p.PeerInfoManager
 
 	// prover registry and signer registry are used to confirm membership of
 	// a given shard or global prover status
@@ -65,7 +66,7 @@ type PeerAuthenticator struct {
 func NewPeerAuthenticator(
 	logger *zap.Logger,
 	config *config.P2PConfig,
-	peerInfoManager PeerInfoManager,
+	peerInfoManager p2p.PeerInfoManager,
 	proverRegistry consensus.ProverRegistry,
 	signerRegistry consensus.SignerRegistry,
 	filter []byte,

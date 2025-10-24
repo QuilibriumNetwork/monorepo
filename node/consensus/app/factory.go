@@ -7,7 +7,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/events"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
-	qp2p "source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -39,7 +38,7 @@ type AppConsensusEngineFactory struct {
 	compiler             compiler.CircuitCompiler
 	signerRegistry       consensus.SignerRegistry
 	proverRegistry       consensus.ProverRegistry
-	peerInfoManager      qp2p.PeerInfoManager
+	peerInfoManager      p2p.PeerInfoManager
 	dynamicFeeManager    consensus.DynamicFeeManager
 	frameValidator       consensus.AppFrameValidator
 	globalFrameValidator consensus.GlobalFrameValidator
@@ -69,7 +68,7 @@ func NewAppConsensusEngineFactory(
 	compiler compiler.CircuitCompiler,
 	signerRegistry consensus.SignerRegistry,
 	proverRegistry consensus.ProverRegistry,
-	peerInfoManager qp2p.PeerInfoManager,
+	peerInfoManager p2p.PeerInfoManager,
 	dynamicFeeManager consensus.DynamicFeeManager,
 	frameValidator consensus.AppFrameValidator,
 	globalFrameValidator consensus.GlobalFrameValidator,

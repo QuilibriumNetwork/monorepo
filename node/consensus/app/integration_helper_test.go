@@ -573,6 +573,9 @@ func (m *mockGlobalClientLocks) GetAppShards(ctx context.Context, in *protobufs.
 func (m *mockGlobalClientLocks) GetGlobalShards(ctx context.Context, in *protobufs.GetGlobalShardsRequest, opts ...grpc.CallOption) (*protobufs.GetGlobalShardsResponse, error) {
 	return nil, errors.New("not used in this test")
 }
+func (m *mockGlobalClientLocks) GetWorkerInfo(ctx context.Context, in *protobufs.GlobalGetWorkerInfoRequest, opts ...grpc.CallOption) (*protobufs.GlobalGetWorkerInfoResponse, error) {
+	return nil, errors.New("not used in this test")
+}
 func (m *mockGlobalClientLocks) GetLockedAddresses(ctx context.Context, in *protobufs.GetLockedAddressesRequest, opts ...grpc.CallOption) (*protobufs.GetLockedAddressesResponse, error) {
 	out := &protobufs.GetLockedAddressesResponse{Transactions: []*protobufs.LockedTransaction{}}
 	m.shardAddressesMu.Lock()

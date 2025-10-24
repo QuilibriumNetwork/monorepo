@@ -35,10 +35,6 @@ import (
 	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
-type PeerInfoProvider interface {
-	GetPeerInfo() *protobufs.PeerInfo
-}
-
 // RPCServer strictly implements NodeService.
 type RPCServer struct {
 	protobufs.NodeServiceServer
@@ -48,7 +44,7 @@ type RPCServer struct {
 	logger           *zap.Logger
 	keyManager       keys.KeyManager
 	pubSub           p2p.PubSub
-	peerInfoProvider PeerInfoProvider
+	peerInfoProvider p2p.PeerInfoManager
 	workerManager    worker.WorkerManager
 	proverRegistry   consensus.ProverRegistry
 	executionManager *manager.ExecutionEngineManager
@@ -141,13 +137,38 @@ func (r *RPCServer) GetPeerInfo(
 	ctx context.Context,
 	_ *protobufs.GetPeerInfoRequest,
 ) (*protobufs.PeerInfoResponse, error) {
-	self := r.peerInfoProvider.GetPeerInfo()
-	if self == nil {
+	set := r.peerInfoProvider.GetPeerMap()
+	if set == nil {
 		return nil, errors.Wrap(errors.New("no peer info"), "get peer info")
 	}
 
+	out := []*protobufs.PeerInfo{}
+	for _, pi := range set {
+		re := []*protobufs.Reachability{}
+		for _, e := range pi.Reachability {
+			re = append(re, &protobufs.Reachability{
+				Filter:           e.Filter,
+				PubsubMultiaddrs: e.PubsubMultiaddrs,
+				StreamMultiaddrs: e.StreamMultiaddrs,
+			})
+		}
+		cs := []*protobufs.Capability{}
+		for _, e := range pi.Capabilities {
+			cs = append(cs, &protobufs.Capability{
+				ProtocolIdentifier: e.ProtocolIdentifier,
+				AdditionalMetadata: e.AdditionalMetadata,
+			})
+		}
+		out = append(out, &protobufs.PeerInfo{
+			PeerId:       pi.PeerId,
+			Reachability: re,
+			Timestamp:    pi.LastSeen,
+			Capabilities: cs,
+		})
+	}
+
 	return &protobufs.PeerInfoResponse{
-		PeerInfo: self,
+		PeerInfo: out,
 	}, nil
 }
 
@@ -320,7 +341,7 @@ func NewRPCServer(
 	logger *zap.Logger,
 	keyManager keys.KeyManager,
 	pubSub p2p.PubSub,
-	peerInfoProvider PeerInfoProvider,
+	peerInfoProvider p2p.PeerInfoManager,
 	workerManager worker.WorkerManager,
 	proverRegistry consensus.ProverRegistry,
 	executionManager *manager.ExecutionEngineManager,

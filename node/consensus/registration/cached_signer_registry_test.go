@@ -7,6 +7,8 @@ import (
 
 	"github.com/cloudflare/circl/sign/ed448"
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -322,10 +324,19 @@ func TestValidateSignedKey(t *testing.T) {
 
 		// Fix the parent key address to match the signature's public key
 		pubKey := signedKey.Signature.(*protobufs.SignedX448Key_Ed448Signature).Ed448Signature.PublicKey.KeyValue
-		addressBI, _ := poseidon.HashBytes(pubKey)
-		signedKey.ParentKeyAddress = addressBI.FillBytes(make([]byte, 32))
+		pubkey, err := pcrypto.UnmarshalEd448PublicKey(pubKey)
+		if err != nil {
+			panic(err)
+		}
 
-		err := registry.ValidateSignedX448Key(signedKey)
+		peerID, err := peer.IDFromPublicKey(pubkey)
+		if err != nil {
+			panic(err)
+		}
+
+		signedKey.ParentKeyAddress = []byte(peerID)
+
+		err = registry.ValidateSignedX448Key(signedKey)
 		require.NoError(t, err)
 	})
 
@@ -438,8 +449,17 @@ func TestPutSignedKey(t *testing.T) {
 
 	// Fix the parent key address to match the signature's public key
 	pubKey := signedKey.Signature.(*protobufs.SignedX448Key_Ed448Signature).Ed448Signature.PublicKey.KeyValue
-	addressBI, _ := poseidon.HashBytes(pubKey)
-	signedKey.ParentKeyAddress = addressBI.FillBytes(make([]byte, 32))
+	pubkey, err := pcrypto.UnmarshalEd448PublicKey(pubKey)
+	if err != nil {
+		panic(err)
+	}
+
+	peerID, err := peer.IDFromPublicKey(pubkey)
+	if err != nil {
+		panic(err)
+	}
+
+	signedKey.ParentKeyAddress = []byte(peerID)
 
 	// Mock the keyStore PutSignedKey
 	keyStore.On("PutSignedX448Key", mockTxn, address, signedKey).Return(nil)

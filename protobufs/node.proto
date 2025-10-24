@@ -44,7 +44,7 @@ message PeerInfo {
 }
 
 message PeerInfoResponse {
-  PeerInfo peer_info = 1;
+  repeated PeerInfo peer_info = 1;
 }
 
 message NodeInfoResponse {

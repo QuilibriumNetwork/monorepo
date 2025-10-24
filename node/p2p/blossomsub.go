@@ -261,6 +261,7 @@ func NewBlossomSubWithHost(
 		p2pConfig.PingTimeout,
 		p2pConfig.PingPeriod,
 		p2pConfig.PingAttempts,
+		nil,
 	)
 
 	var tracer *blossomsub.JSONTracer
@@ -682,6 +683,7 @@ func NewBlossomSub(
 		p2pConfig.PingTimeout,
 		p2pConfig.PingPeriod,
 		p2pConfig.PingAttempts,
+		directPeers,
 	)
 
 	var tracer *blossomsub.JSONTracer

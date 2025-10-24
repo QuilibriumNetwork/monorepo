@@ -299,6 +299,34 @@ func (m *MockVotingProvider) DecideAndSendVote(
 	return PeerID{ID: chosenID}, vote, nil
 }
 
+func (m *MockVotingProvider) SendVote(vote *Vote, ctx context.Context) (
+	PeerID,
+	error,
+) {
+	m.logger.Info("re-sent vote",
+		zap.String("node_id", vote.NodeID),
+		zap.String("vote", vote.VoteValue),
+		zap.Uint64("round", vote.Round),
+		zap.String("for_proposal", vote.ProposerID))
+
+	if m.messageBus != nil {
+		// Make a copy to avoid sharing pointers
+		voteCopy := &Vote{
+			NodeID:     vote.NodeID,
+			Round:      vote.Round,
+			VoteValue:  vote.VoteValue,
+			Timestamp:  vote.Timestamp,
+			ProposerID: vote.ProposerID,
+		}
+		m.messageBus.Broadcast(Message{
+			Type:   "vote",
+			Sender: m.nodeID,
+			Data:   voteCopy,
+		})
+	}
+	return PeerID{ID: vote.ProposerID}, nil
+}
+
 func (m *MockVotingProvider) IsQuorum(
 	proposalVotes map[consensus.Identity]*Vote,
 	ctx context.Context,

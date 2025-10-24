@@ -222,6 +222,40 @@ func (p *GlobalVotingProvider) DecideAndSendVote(
 	return GlobalPeerID{ID: proposerID}, &vote, nil
 }
 
+func (p *GlobalVotingProvider) SendVote(
+	vote **protobufs.FrameVote,
+	ctx context.Context,
+) (GlobalPeerID, error) {
+	if vote == nil || *vote == nil {
+		return GlobalPeerID{}, errors.Wrap(
+			errors.New("no vote provided"),
+			"send vote",
+		)
+	}
+
+	bumpVote := &protobufs.FrameVote{
+		FrameNumber:                (*vote).FrameNumber,
+		Proposer:                   (*vote).Proposer,
+		Approve:                    true,
+		Timestamp:                  time.Now().UnixMilli(),
+		PublicKeySignatureBls48581: (*vote).PublicKeySignatureBls48581,
+	}
+
+	data, err := (*bumpVote).ToCanonicalBytes()
+	if err != nil {
+		return GlobalPeerID{}, errors.Wrap(err, "serialize vote")
+	}
+
+	if err := p.engine.pubsub.PublishToBitmask(
+		GLOBAL_CONSENSUS_BITMASK,
+		data,
+	); err != nil {
+		p.engine.logger.Error("failed to publish vote", zap.Error(err))
+	}
+
+	return GlobalPeerID{ID: (*vote).Proposer}, nil
+}
+
 func (p *GlobalVotingProvider) IsQuorum(
 	proposalVotes map[consensus.Identity]**protobufs.FrameVote,
 	ctx context.Context,

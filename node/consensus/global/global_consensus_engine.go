@@ -28,7 +28,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
-	qhypergraph "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -111,7 +110,7 @@ type GlobalConsensusEngine struct {
 	executorsMu        sync.RWMutex
 	executionManager   *manager.ExecutionEngineManager
 	mixnet             typesconsensus.Mixnet
-	peerInfoManager    p2p.PeerInfoManager
+	peerInfoManager    tp2p.PeerInfoManager
 	workerManager      worker.WorkerManager
 	proposer           *provers.Manager
 	alertPublicKey     []byte
@@ -221,7 +220,7 @@ func NewGlobalConsensusEngine(
 	decafConstructor crypto.DecafConstructor,
 	compiler compiler.CircuitCompiler,
 	blsConstructor crypto.BlsConstructor,
-	peerInfoManager p2p.PeerInfoManager,
+	peerInfoManager tp2p.PeerInfoManager,
 ) (*GlobalConsensusEngine, error) {
 	engine := &GlobalConsensusEngine{
 		logger:                      logger,
@@ -497,42 +496,7 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 
 	var initialState **protobufs.GlobalFrame = nil
 	if frame != nil {
-		if frame.Header.FrameNumber == 244200 && e.config.P2P.Network == 0 {
-			e.logger.Warn("purging previous genesis to start new")
-			err = e.clockStore.DeleteGlobalClockFrameRange(0, 244201)
-			if err != nil {
-				panic(err)
-			}
-			set := e.hypergraph.(*qhypergraph.HypergraphCRDT).GetVertexAddsSet(
-				tries.ShardKey{
-					L1: [3]byte{},
-					L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
-				},
-			)
-			leaves := tries.GetAllLeaves(
-				set.GetTree().SetType,
-				set.GetTree().PhaseType,
-				set.GetTree().ShardKey,
-				set.GetTree().Root,
-			)
-			txn, err := e.hypergraph.NewTransaction(false)
-			if err != nil {
-				panic(err)
-			}
-			for _, l := range leaves {
-				err = set.GetTree().Delete(txn, l.Key)
-				if err != nil {
-					txn.Abort()
-					panic(err)
-				}
-			}
-			if err = txn.Commit(); err != nil {
-				panic(err)
-			}
-			frame = nil
-		} else {
-			initialState = &frame
-		}
+		initialState = &frame
 	}
 
 	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
@@ -614,6 +578,8 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 		close(errChan)
 		return errChan
 	}
+
+	e.peerInfoManager.Start()
 
 	// Start consensus message queue processor
 	e.wg.Add(1)
@@ -732,6 +698,7 @@ func (e *GlobalConsensusEngine) setupGRPCServer() error {
 			"quilibrium.node.global.pb.GlobalService":                    channel.AnyPeer,
 			"quilibrium.node.global.pb.OnionService":                     channel.AnyPeer,
 			"quilibrium.node.global.pb.KeyRegistryService":               channel.OnlySelfPeer,
+			"quilibrium.node.proxy.pb.PubSubProxy":                       channel.OnlySelfPeer,
 		},
 		map[string]channel.AllowedPeerPolicyType{
 			// Alternative nodes may not need to make this only self peer, but this
@@ -850,6 +817,8 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.UnregisterValidator(GLOBAL_PEER_INFO_BITMASK)
 	e.pubsub.Unsubscribe(GLOBAL_ALERT_BITMASK, false)
 	e.pubsub.UnregisterValidator(GLOBAL_ALERT_BITMASK)
+
+	e.peerInfoManager.Stop()
 
 	// Wait for goroutines to finish
 	done := make(chan struct{})

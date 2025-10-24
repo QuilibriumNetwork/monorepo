@@ -175,6 +175,10 @@ func (m *mockVotingProvider) DecideAndSendVote(
 	return "", nil, errors.New("no proposal to vote for")
 }
 
+func (m *mockVotingProvider) SendVote(vote *TestVote, ctx context.Context) (TestPeerID, error) {
+	return "", nil
+}
+
 func (m *mockVotingProvider) IsQuorum(proposalVotes map[Identity]*TestVote, ctx context.Context) (bool, error) {
 	totalVotes := 0
 	voteCount := map[string]int{}
@@ -997,6 +1001,10 @@ func (m *mockPanickingVotingProvider) FinalizeVotes(
 	}
 
 	return nil, "", nil
+}
+
+func (m *mockPanickingVotingProvider) SendVote(vote *TestVote, ctx context.Context) (TestPeerID, error) {
+	return "", nil
 }
 
 func (m *mockPanickingVotingProvider) SendConfirmation(finalized *TestState, ctx context.Context) error {

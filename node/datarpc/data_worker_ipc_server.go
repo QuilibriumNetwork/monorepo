@@ -20,6 +20,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
+	tp2p "source.quilibrium.com/quilibrium/monorepo/types/p2p"
 )
 
 type DataWorkerIPCServer struct {
@@ -33,7 +34,7 @@ type DataWorkerIPCServer struct {
 	signer                    crypto.Signer
 	signerRegistry            consensus.SignerRegistry
 	proverRegistry            consensus.ProverRegistry
-	peerInfoManager           p2p.PeerInfoManager
+	peerInfoManager           tp2p.PeerInfoManager
 	authProvider              channel.AuthenticationProvider
 	appConsensusEngineFactory *app.AppConsensusEngineFactory
 	appConsensusEngine        *app.AppConsensusEngine
@@ -47,7 +48,7 @@ func NewDataWorkerIPCServer(
 	config *config.Config,
 	signerRegistry consensus.SignerRegistry,
 	proverRegistry consensus.ProverRegistry,
-	peerInfoManager p2p.PeerInfoManager,
+	peerInfoManager tp2p.PeerInfoManager,
 	frameProver crypto.FrameProver,
 	appConsensusEngineFactory *app.AppConsensusEngineFactory,
 	logger *zap.Logger,

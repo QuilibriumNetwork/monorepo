@@ -433,7 +433,7 @@ func (s *SignedX448Key) Verify(
 		}
 
 		pubKey, err := pcrypto.UnmarshalEd448PublicKey(
-			s.Key.KeyValue,
+			sig.Ed448Signature.PublicKey.KeyValue,
 		)
 		if err != nil {
 			return errors.Wrap(err, "verify signature")
@@ -444,7 +444,7 @@ func (s *SignedX448Key) Verify(
 		}
 
 		// Check that parent key address matches the public key
-		identityPeerID := []byte(peerID.String())
+		identityPeerID := []byte(peerID)
 
 		if !bytes.Equal(identityPeerID, s.ParentKeyAddress) {
 			return errors.Wrap(
@@ -559,7 +559,7 @@ func (s *SignedDecaf448Key) Verify(
 		}
 
 		pubKey, err := pcrypto.UnmarshalEd448PublicKey(
-			s.Key.KeyValue,
+			sig.Ed448Signature.PublicKey.KeyValue,
 		)
 		if err != nil {
 			return errors.Wrap(err, "verify signature")
@@ -570,7 +570,7 @@ func (s *SignedDecaf448Key) Verify(
 		}
 
 		// Check that parent key address matches the public key
-		identityPeerID := []byte(peerID.String())
+		identityPeerID := []byte(peerID)
 		if !bytes.Equal(identityPeerID, s.ParentKeyAddress) {
 			return errors.Wrap(
 				errors.New("parent key address does not match public key"),
