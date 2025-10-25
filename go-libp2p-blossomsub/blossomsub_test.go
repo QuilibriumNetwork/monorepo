@@ -3795,11 +3795,9 @@ func assertReceivedBitmaskSubgroup(t *testing.T, ctx context.Context, subs [][]*
 		var msg *struct{} = nil
 		go func() {
 			for range subs {
-				select {
-				case m := <-msgch:
-					msg = &m
-					cancel()
-				}
+				m := <-msgch
+				msg = &m
+				cancel()
 			}
 		}()
 		g.Wait()
