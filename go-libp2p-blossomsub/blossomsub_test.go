@@ -3469,7 +3469,7 @@ func TestBloomRouting(t *testing.T) {
 			}
 
 			go func() {
-				for _ = range sub {
+				for range sub {
 					select {
 					case err := <-errch:
 						if err != nil {
