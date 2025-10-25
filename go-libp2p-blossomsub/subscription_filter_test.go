@@ -32,15 +32,15 @@ func TestBasicSubscriptionFilter(t *testing.T) {
 	bitmask3 := []byte{0x00, 0x00, 0x02, 0x00}
 	yes := true
 	subs := []*pb.RPC_SubOpts{
-		&pb.RPC_SubOpts{
+		{
 			Bitmask:   bitmask1,
 			Subscribe: yes,
 		},
-		&pb.RPC_SubOpts{
+		{
 			Bitmask:   bitmask2,
 			Subscribe: yes,
 		},
-		&pb.RPC_SubOpts{
+		{
 			Bitmask:   bitmask3,
 			Subscribe: yes,
 		},
@@ -88,24 +88,24 @@ func TestSubscriptionFilterDeduplication(t *testing.T) {
 	yes := true
 	no := false
 	subs := []*pb.RPC_SubOpts{
-		&pb.RPC_SubOpts{
+		{
 			Bitmask:   bitmask1,
 			Subscribe: yes,
 		},
-		&pb.RPC_SubOpts{
+		{
 			Bitmask:   bitmask1,
 			Subscribe: yes,
 		},
 
-		&pb.RPC_SubOpts{
+		{
 			Bitmask:   bitmask2,
 			Subscribe: yes,
 		},
-		&pb.RPC_SubOpts{
+		{
 			Bitmask:   bitmask2,
 			Subscribe: no,
 		},
-		&pb.RPC_SubOpts{
+		{
 			Bitmask:   bitmask3,
 			Subscribe: yes,
 		},
