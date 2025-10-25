@@ -14,6 +14,7 @@ const (
 	HYPERGRAPH_SHARD   = 0x09
 	SHARD              = 0x0A
 	INBOX              = 0x0B
+	MIGRATION          = 0xF0
 	WORKER             = 0xFF
 )
 
@@ -59,10 +60,7 @@ const (
 
 // Hypergraph store indexes:
 const (
-	VERTEX_ADDS                               = 0x00
-	VERTEX_REMOVES                            = 0x10
-	VERTEX_DATA                               = 0xF0
-	VERTEX_TOMBSTONE                          = 0xF1
+	SHARD_COMMIT                              = 0x00
 	HYPEREDGE_ADDS                            = 0x01
 	HYPEREDGE_REMOVES                         = 0x11
 	VERTEX_ADDS_TREE_NODE                     = 0x02
@@ -81,6 +79,8 @@ const (
 	HYPERGRAPH_VERTEX_REMOVES_SHARD_COMMIT    = 0xE1
 	HYPERGRAPH_HYPEREDGE_ADDS_SHARD_COMMIT    = 0xE2
 	HYPERGRAPH_HYPEREDGE_REMOVES_SHARD_COMMIT = 0xE3
+	VERTEX_DATA                               = 0xF0
+	VERTEX_TOMBSTONE                          = 0xF1
 	HYPERGRAPH_COVERED_PREFIX                 = 0xFA
 	HYPERGRAPH_COMPLETE                       = 0xFB
 	VERTEX_ADDS_TREE_ROOT                     = 0xFC

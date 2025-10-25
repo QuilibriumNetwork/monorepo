@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -29,7 +28,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
-	qhypergraph "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -42,7 +40,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p/onion"
-	qstore "source.quilibrium.com/quilibrium/monorepo/node/store"
 	mgr "source.quilibrium.com/quilibrium/monorepo/node/worker"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
@@ -499,170 +496,7 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 
 	var initialState **protobufs.GlobalFrame = nil
 	if frame != nil {
-		// HACK: fix-up incorrect prover info
-		if e.config.P2P.Network == 0 && frame.Header.FrameNumber < 244205 {
-			e.logger.Debug("fixing prover info")
-			set := e.hypergraph.(*qhypergraph.HypergraphCRDT).GetVertexAddsSet(
-				tries.ShardKey{
-					L1: [3]byte{0x00, 0x00, 0x00},
-					L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-				},
-			)
-			hset := e.hypergraph.(*qhypergraph.HypergraphCRDT).GetHyperedgeAddsSet(
-				tries.ShardKey{
-					L1: [3]byte{0x00, 0x00, 0x00},
-					L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-				},
-			)
-			txn, err := e.hypergraph.NewTransaction(false)
-			if err != nil {
-				panic(err)
-			}
-			genesisData := e.getMainnetGenesisJSON()
-			e.proverRegistry.Refresh()
-			e.logger.Debug("loaded genesis info and prover registry")
-
-			globalProvers, _ := e.proverRegistry.GetActiveProvers(nil)
-			sen := uint64(0)
-			toAdd := [][]byte{}
-			archivePeers := [][]byte{}
-			bpub, err := base64.StdEncoding.DecodeString(
-				genesisData.BeaconBLS48581Key,
-			)
-			archivePeers = append(archivePeers, bpub)
-			for _, pubkeyhex := range genesisData.ArchivePeers {
-				pubkey, err := hex.DecodeString(pubkeyhex)
-				if err != nil {
-					panic(err)
-				}
-				archivePeers = append(archivePeers, pubkey)
-			}
-
-			for _, pubkey := range archivePeers {
-				found := false
-				for _, p := range globalProvers {
-					if sen == 0 {
-						sen = p.Seniority
-					}
-					if bytes.Equal(p.PublicKey, pubkey) {
-						found = true
-						break
-					}
-				}
-
-				if !found {
-					e.logger.Debug(
-						"adding prover",
-						zap.String("pubkey", hex.EncodeToString(pubkey)),
-					)
-					toAdd = append(toAdd, pubkey)
-				}
-			}
-
-			toRemove := []*typesconsensus.ProverInfo{}
-			for _, p := range globalProvers {
-				found := false
-				for _, pubkey := range archivePeers {
-					if bytes.Equal(p.PublicKey, pubkey) {
-						found = true
-						break
-					}
-				}
-
-				if !found {
-					e.logger.Debug(
-						"removing prover",
-						zap.String("pubkey", hex.EncodeToString(p.Address)),
-					)
-					toRemove = append(toRemove, p)
-				}
-			}
-
-			for _, p := range toRemove {
-				proverAddress := slices.Concat(
-					intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-					p.Address[:],
-				)
-				err = set.GetTree().Delete(txn, proverAddress)
-				if err != nil {
-					txn.Abort()
-					panic(err)
-				}
-
-				allocationAddressBI, err := poseidon.HashBytes(
-					slices.Concat([]byte("PROVER_ALLOCATION"), p.PublicKey, nil),
-				)
-				if err != nil {
-					panic(err)
-				}
-
-				allocationAddress := slices.Concat(
-					intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-					allocationAddressBI.FillBytes(make([]byte, 32)),
-				)
-
-				err = set.GetTree().Delete(txn, allocationAddress)
-				if err != nil {
-					txn.Abort()
-					panic(err)
-				}
-
-				err = txn.Delete(slices.Concat(
-					[]byte{qstore.HYPERGRAPH_SHARD, qstore.VERTEX_DATA},
-					proverAddress,
-				))
-				if err != nil {
-					txn.Abort()
-					panic(err)
-				}
-
-				err = txn.Delete(slices.Concat(
-					[]byte{qstore.HYPERGRAPH_SHARD, qstore.VERTEX_DATA},
-					allocationAddress,
-				))
-				if err != nil {
-					txn.Abort()
-					panic(err)
-				}
-
-				err = hset.GetTree().Delete(txn, proverAddress)
-				if err != nil {
-					txn.Abort()
-					panic(err)
-				}
-			}
-
-			e.logger.Debug("commiting state")
-			if err = txn.Commit(); err != nil {
-				panic(err)
-			}
-			state := hgstate.NewHypergraphState(e.hypergraph)
-			for _, p := range toAdd {
-				err = e.addGenesisProver(
-					schema.NewRDFMultiprover(
-						&schema.TurtleRDFParser{},
-						e.inclusionProver,
-					),
-					state,
-					p,
-					sen,
-					0,
-				)
-				if err != nil {
-					panic(err)
-				}
-			}
-			if err = state.Commit(); err != nil {
-				panic(err)
-			}
-
-			e.logger.Debug("refreshing registry")
-			if err = e.proverRegistry.Refresh(); err != nil {
-				panic(err)
-			}
-		} else {
-			initialState = &frame
-		}
+		initialState = &frame
 	}
 
 	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {

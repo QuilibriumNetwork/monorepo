@@ -446,7 +446,7 @@ type setter struct {
 	ver    string
 }
 
-func (s setter) String() string { return *s.dst }
+func (s setter) String() string { return "" }
 func (s setter) Set(_ string) error {
 	*s.dst = s.value
 	*s.dstver = s.ver

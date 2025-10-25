@@ -555,7 +555,7 @@ func createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(
 		&bulletproofs.Decaf448KeyConstructor{},     // decafConstructor
 		compiler.NewBedlamCompiler(),
 		nil,
-		nil,
+		qp2p.NewInMemoryPeerInfoManager(logger),
 	)
 	require.NoError(t, err)
 
@@ -1101,7 +1101,7 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 			&bulletproofs.Decaf448KeyConstructor{},    // decafConstructor
 			compiler.NewBedlamCompiler(),
 			nil, // blsConstructor
-			nil,
+			qp2p.NewInMemoryPeerInfoManager(logger),
 		)
 		require.NoError(t, err)
 

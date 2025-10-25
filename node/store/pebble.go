@@ -1,6 +1,8 @@
 package store
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +17,12 @@ import (
 
 type PebbleDB struct {
 	db *pebble.DB
+}
+
+// pebbleMigrations contains ordered migration steps. New migrations append to
+// the end.
+var pebbleMigrations = []func(*pebble.Batch) error{
+	migration_2_1_0_4,
 }
 
 func NewPebbleDB(
@@ -84,7 +92,112 @@ func NewPebbleDB(
 		os.Exit(1)
 	}
 
-	return &PebbleDB{db}
+	pebbleDB := &PebbleDB{db}
+	if err := pebbleDB.migrate(logger); err != nil {
+		logger.Error(
+			fmt.Sprintf("failed to migrate %s", storeType),
+			zap.Error(err),
+			zap.String("path", path),
+			zap.Uint("core_id", coreId),
+		)
+		pebbleDB.Close()
+		os.Exit(1)
+	}
+
+	return pebbleDB
+}
+
+func (p *PebbleDB) migrate(logger *zap.Logger) error {
+	currentVersion := uint64(len(pebbleMigrations))
+
+	var storedVersion uint64
+	var foundVersion bool
+
+	value, closer, err := p.db.Get([]byte{MIGRATION})
+	switch {
+	case err == pebble.ErrNotFound:
+		// missing version implies zero
+	case err != nil:
+		return errors.Wrap(err, "load migration version")
+	default:
+		foundVersion = true
+		if len(value) != 8 {
+			if closer != nil {
+				_ = closer.Close()
+			}
+			return errors.Errorf(
+				"invalid migration version length: %d",
+				len(value),
+			)
+		}
+		storedVersion = binary.BigEndian.Uint64(value)
+		if closer != nil {
+			if err := closer.Close(); err != nil {
+				logger.Warn("failed to close migration version reader", zap.Error(err))
+			}
+		}
+	}
+
+	if storedVersion > currentVersion {
+		return errors.Errorf(
+			"store migration version %d ahead of binary %d – running a migrated db "+
+				"with an earlier version can cause irreparable corruption, shutting down",
+			storedVersion,
+			currentVersion,
+		)
+	}
+
+	needsUpdate := !foundVersion || storedVersion < currentVersion
+	if !needsUpdate {
+		logger.Info("no pebble store migrations required")
+		return nil
+	}
+
+	batch := p.db.NewBatch()
+	for i := int(storedVersion); i < len(pebbleMigrations); i++ {
+		logger.Warn(
+			"performing pebble store migration",
+			zap.Int("from_version", int(storedVersion)),
+			zap.Int("to_version", int(storedVersion+1)),
+		)
+		if err := pebbleMigrations[i](batch); err != nil {
+			batch.Close()
+			logger.Error("migration failed", zap.Error(err))
+			return errors.Wrapf(err, "apply migration %d", i+1)
+		}
+		logger.Info(
+			"migration step completed",
+			zap.Int("from_version", int(storedVersion)),
+			zap.Int("to_version", int(storedVersion+1)),
+		)
+	}
+
+	var versionBuf [8]byte
+	binary.BigEndian.PutUint64(versionBuf[:], currentVersion)
+	if err := batch.Set([]byte{MIGRATION}, versionBuf[:], nil); err != nil {
+		batch.Close()
+		return errors.Wrap(err, "set migration version")
+	}
+
+	if err := batch.Commit(&pebble.WriteOptions{Sync: true}); err != nil {
+		batch.Close()
+		return errors.Wrap(err, "commit migration batch")
+	}
+
+	if currentVersion != storedVersion {
+		logger.Info(
+			"applied pebble store migrations",
+			zap.Uint64("from_version", storedVersion),
+			zap.Uint64("to_version", currentVersion),
+		)
+	} else {
+		logger.Info(
+			"initialized pebble store migration version",
+			zap.Uint64("version", currentVersion),
+		)
+	}
+
+	return nil
 }
 
 func (p *PebbleDB) Get(key []byte) ([]byte, io.Closer, error) {
@@ -220,4 +333,107 @@ func rightAlign(data []byte, size int) []byte {
 	pad := make([]byte, size)
 	copy(pad[size-l:], data)
 	return pad
+}
+
+// Resolves all the variations of store issues from any series of upgrade steps
+// in 2.1.0.1->2.1.0.3
+func migration_2_1_0_4(b *pebble.Batch) error {
+	// batches don't use this but for backcompat the parameter is required
+	wo := &pebble.WriteOptions{}
+
+	frame_start, _ := hex.DecodeString("0000000000000003b9e8")
+	frame_end, _ := hex.DecodeString("0000000000000003b9ec")
+	err := b.DeleteRange(frame_start, frame_end, wo)
+	if err != nil {
+		return errors.Wrap(err, "frame removal")
+	}
+
+	frame_first_index, _ := hex.DecodeString("0010")
+	frame_last_index, _ := hex.DecodeString("0020")
+	err = b.Delete(frame_first_index, wo)
+	if err != nil {
+		return errors.Wrap(err, "frame first index removal")
+	}
+
+	err = b.Delete(frame_last_index, wo)
+	if err != nil {
+		return errors.Wrap(err, "frame last index removal")
+	}
+
+	shard_commits_hex := []string{
+		"090000000000000000e0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		"090000000000000000e1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		"090000000000000000e2ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		"090000000000000000e3ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	}
+	for _, shard_commit_hex := range shard_commits_hex {
+		shard_commit, _ := hex.DecodeString(shard_commit_hex)
+		err = b.Delete(shard_commit, wo)
+		if err != nil {
+			return errors.Wrap(err, "shard commit removal")
+		}
+	}
+
+	vertex_adds_tree_start, _ := hex.DecodeString("0902000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	vertex_adds_tree_end, _ := hex.DecodeString("0902000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	err = b.DeleteRange(vertex_adds_tree_start, vertex_adds_tree_end, wo)
+	if err != nil {
+		return errors.Wrap(err, "vertex adds tree removal")
+	}
+
+	hyperedge_adds_tree_start, _ := hex.DecodeString("0903000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	hyperedge_adds_tree_end, _ := hex.DecodeString("0903000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	err = b.DeleteRange(hyperedge_adds_tree_start, hyperedge_adds_tree_end, wo)
+	if err != nil {
+		return errors.Wrap(err, "hyperedge adds tree removal")
+	}
+
+	vertex_adds_by_path_start, _ := hex.DecodeString("0922000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	vertex_adds_by_path_end, _ := hex.DecodeString("0922000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	err = b.DeleteRange(vertex_adds_by_path_start, vertex_adds_by_path_end, wo)
+	if err != nil {
+		return errors.Wrap(err, "vertex adds by path removal")
+	}
+
+	hyperedge_adds_by_path_start, _ := hex.DecodeString("0923000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	hyperedge_adds_by_path_end, _ := hex.DecodeString("0923000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	err = b.DeleteRange(hyperedge_adds_by_path_start, hyperedge_adds_by_path_end, wo)
+	if err != nil {
+		return errors.Wrap(err, "hyperedge adds by path removal")
+	}
+
+	vertex_adds_change_record_start, _ := hex.DecodeString("0942000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	vertex_adds_change_record_end, _ := hex.DecodeString("0942000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	hyperedge_adds_change_record_start, _ := hex.DecodeString("0943000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	hyperedge_adds_change_record_end, _ := hex.DecodeString("0943000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	err = b.DeleteRange(vertex_adds_change_record_start, vertex_adds_change_record_end, wo)
+	if err != nil {
+		return errors.Wrap(err, "vertex adds change record removal")
+	}
+
+	err = b.DeleteRange(hyperedge_adds_change_record_start, hyperedge_adds_change_record_end, wo)
+	if err != nil {
+		return errors.Wrap(err, "hyperedge adds change record removal")
+	}
+
+	vertex_data_start, _ := hex.DecodeString("09f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	vertex_data_end, _ := hex.DecodeString("09f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	err = b.DeleteRange(vertex_data_start, vertex_data_end, wo)
+	if err != nil {
+		return errors.Wrap(err, "vertex data removal")
+	}
+
+	vertex_add_root, _ := hex.DecodeString("09fc000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	hyperedge_add_root, _ := hex.DecodeString("09fe000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	err = b.Delete(vertex_add_root, wo)
+	if err != nil {
+		return errors.Wrap(err, "vertex add root removal")
+	}
+
+	err = b.Delete(hyperedge_add_root, wo)
+	if err != nil {
+		return errors.Wrap(err, "hyperedge add root removal")
+	}
+
+	return nil
 }

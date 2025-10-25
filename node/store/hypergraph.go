@@ -303,6 +303,8 @@ func hypergraphVertexAddsShardCommitKey(
 	shardAddress []byte,
 ) []byte {
 	key := []byte{HYPERGRAPH_SHARD}
+	// The first byte is technically reserved – but in practicality won't be
+	// non-zero (SHARD_COMMMIT)
 	key = binary.BigEndian.AppendUint64(key, frameNumber)
 	key = append(key, HYPERGRAPH_VERTEX_ADDS_SHARD_COMMIT)
 	key = append(key, shardAddress...)
@@ -314,6 +316,8 @@ func hypergraphVertexRemovesShardCommitKey(
 	shardAddress []byte,
 ) []byte {
 	key := []byte{HYPERGRAPH_SHARD}
+	// The first byte is technically reserved – but in practicality won't be
+	// non-zero (SHARD_COMMMIT)
 	key = binary.BigEndian.AppendUint64(key, frameNumber)
 	key = append(key, HYPERGRAPH_VERTEX_REMOVES_SHARD_COMMIT)
 	key = append(key, shardAddress...)
@@ -325,6 +329,8 @@ func hypergraphHyperedgeAddsShardCommitKey(
 	shardAddress []byte,
 ) []byte {
 	key := []byte{HYPERGRAPH_SHARD}
+	// The first byte is technically reserved – but in practicality won't be
+	// non-zero (SHARD_COMMMIT)
 	key = binary.BigEndian.AppendUint64(key, frameNumber)
 	key = append(key, HYPERGRAPH_HYPEREDGE_ADDS_SHARD_COMMIT)
 	key = append(key, shardAddress...)
@@ -336,6 +342,8 @@ func hypergraphHyperedgeRemovesShardCommitKey(
 	shardAddress []byte,
 ) []byte {
 	key := []byte{HYPERGRAPH_SHARD}
+	// The first byte is technically reserved – but in practicality won't be
+	// non-zero (SHARD_COMMMIT)
 	key = binary.BigEndian.AppendUint64(key, frameNumber)
 	key = append(key, HYPERGRAPH_HYPEREDGE_REMOVES_SHARD_COMMIT)
 	key = append(key, shardAddress...)
