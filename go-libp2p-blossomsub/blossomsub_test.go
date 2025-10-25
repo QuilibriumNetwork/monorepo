@@ -3572,12 +3572,11 @@ func TestBloomPropagationOverSubTreeTopology(t *testing.T) {
 			var msg *struct{} = nil
 			go func() {
 				for range subs {
-					select {
-					case m := <-msgch:
-						msg = &m
-						cancel()
-					}
+					m := <-msgch
+					msg = &m
+					cancel()
 				}
+
 			}()
 			g.Wait()
 			if msg == nil {
