@@ -3571,7 +3571,7 @@ func TestBloomPropagationOverSubTreeTopology(t *testing.T) {
 
 			var msg *struct{} = nil
 			go func() {
-				for i := 0; i < len(subs); i++ {
+				for range subs {
 					select {
 					case m := <-msgch:
 						msg = &m
