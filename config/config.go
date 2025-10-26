@@ -47,7 +47,6 @@ type Config struct {
 	Logger              *LogConfig    `yaml:"logger"`
 	ListenGRPCMultiaddr string        `yaml:"listenGrpcMultiaddr"`
 	ListenRestMultiaddr string        `yaml:"listenRESTMultiaddr"`
-	LogFile             string        `yaml:"logFile"`
 }
 
 // WithDefaults returns a copy of the config with default values filled in.
