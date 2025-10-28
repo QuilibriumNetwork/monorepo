@@ -459,7 +459,7 @@ func Flags(blockchar **string, ver **string) {
 		setter{
 			*blockchar,
 			*ver,
-			"\U0001F1EB\U0001F1F7 ",
+			"\U0001F1EB\U0001F1F7",
 			"\U00000047\U0000006F\U0000006F\U00000062\U00000079",
 		},
 		"\U00000067\U0000006F\U0000006F\U00000062\U00000079",
