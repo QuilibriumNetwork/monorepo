@@ -195,40 +195,57 @@ message FrameHeader {
 message ProverLivenessCheck {
   // The filter for the prover's commitment in the trie
   bytes filter = 1;
+  // The rank of the consensus clique
+  uint64 rank = 2;
   // The frame number for which this liveness check is being sent
-  uint64 frame_number = 2;
+  uint64 frame_number = 3;
   // The timestamp when the liveness check was created
-  int64 timestamp = 3;
+  int64 timestamp = 4;
   // The hash of the shard commitments and prover root
-  bytes commitment_hash = 4;
+  bytes commitment_hash = 5;
   // The BLS signature with the prover's address
-  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 5;
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 6;
 }
 
-message FrameVote {
+message ProposalVote {
   // The filter for the prover's commitment in the trie
   bytes filter = 1;
-  // The frame number being voted on
-  uint64 frame_number = 2;
-  // The proposer of the frame
-  bytes proposer = 3;
-  // Whether the voter approves the frame
-  bool approve = 4;
+  // The rank of the consensus clique
+  uint64 rank = 2;
+  // The frame number for which this proposal applies
+  uint64 frame_number = 3;
+  // The selector being voted for
+  bytes selector = 4;
   // The timestamp when the vote was created
   int64 timestamp = 5;
   // The BLS signature with the voter's address
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 6;
 }
 
-message FrameConfirmation {
+message QuorumCertificate {
   // The filter for the prover's commitment in the trie
   bytes filter = 1;
-  // The frame number that was confirmed
-  uint64 frame_number = 2;
+  // The rank of the consensus clique
+  uint64 rank = 2;
+  // The frame number for which this certificate applies
+  uint64 frame_number = 3;
   // The selector (hash) of the confirmed frame
-  bytes selector = 3;
+  bytes selector = 4;
   // The timestamp when the vote was created
-  int64 timestamp = 4;
+  int64 timestamp = 5;
+  // The aggregated BLS signature from all voters
+  quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 6;
+}
+
+message TimeoutCertificate {
+  // The filter for the prover's commitment in the trie
+  bytes filter = 1;
+  // The rank of the consensus clique
+  uint64 rank = 2;
+  // The latest ranks in signer order
+  repeated uint64 latest_ranks = 3;
+  // The latest quorum certificate from all timeouts
+  QuorumCertificate latest_quorum_certificate = 4;
   // The aggregated BLS signature from all voters
   quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 5;
 }

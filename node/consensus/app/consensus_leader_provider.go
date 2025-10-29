@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
 
@@ -70,6 +72,28 @@ func (p *AppLeaderProvider) ProveNextState(
 	if prior == nil || *prior == nil {
 		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
 		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
+	}
+
+	// Get prover index
+	provers, err := p.engine.proverRegistry.GetActiveProvers(p.engine.appAddress)
+	if err != nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, errors.Wrap(err, "prove next state")
+	}
+
+	found := false
+	for _, prover := range provers {
+		if bytes.Equal(prover.Address, p.engine.getProverAddress()) {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, errors.Wrap(
+			models.NewNoVoteErrorf("not a prover"),
+			"prove next state",
+		)
 	}
 
 	// Get collected messages to include in frame

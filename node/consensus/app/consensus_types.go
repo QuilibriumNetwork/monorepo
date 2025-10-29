@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 )
 
 // Type aliases for consensus types
@@ -21,7 +22,7 @@ func (p PeerID) Rank() uint64 {
 	return 0
 }
 
-func (p PeerID) Clone() consensus.Unique {
+func (p PeerID) Clone() models.Unique {
 	return PeerID{
 		ID: slices.Clone(p.ID),
 	}
@@ -48,7 +49,7 @@ func (c CollectedCommitments) Rank() uint64 {
 	return c.frameNumber
 }
 
-func (c CollectedCommitments) Clone() consensus.Unique {
+func (c CollectedCommitments) Clone() models.Unique {
 	return CollectedCommitments{
 		frameNumber:    c.frameNumber,
 		commitmentHash: slices.Clone(c.commitmentHash),

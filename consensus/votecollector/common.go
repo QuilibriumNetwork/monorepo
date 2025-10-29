@@ -1,0 +1,68 @@
+package votecollector
+
+import (
+	"errors"
+	"fmt"
+
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+)
+
+var (
+	VoteForIncompatibleRankError  = errors.New("vote for incompatible rank")
+	VoteForIncompatibleStateError = errors.New("vote for incompatible state")
+)
+
+/******************************* NoopProcessor *******************************/
+
+// NoopProcessor implements consensus.VoteProcessor. It drops all votes.
+type NoopProcessor[VoteT models.Unique] struct {
+	status consensus.VoteCollectorStatus
+}
+
+func NewNoopCollector[VoteT models.Unique](
+	status consensus.VoteCollectorStatus,
+) *NoopProcessor[VoteT] {
+	return &NoopProcessor[VoteT]{status}
+}
+
+func (c *NoopProcessor[VoteT]) Process(*VoteT) error {
+	return nil
+}
+
+func (c *NoopProcessor[VoteT]) Status() consensus.VoteCollectorStatus {
+	return c.status
+}
+
+/************************ enforcing vote is for state ************************/
+
+// EnsureVoteForState verifies that the vote is for the given state.
+// Returns nil on success and sentinel errors:
+//   - models.VoteForIncompatibleRankError if the vote is from a different rank
+//     than state
+//   - models.VoteForIncompatibleStateError if the vote is from the same rank as
+//     state but for a different stateID
+func EnsureVoteForState[StateT models.Unique, VoteT models.Unique](
+	vote *VoteT,
+	state *StateT,
+) error {
+	if (*vote).GetRank() != (*state).GetRank() {
+		return fmt.Errorf(
+			"vote %v has rank %d while state's rank is %d: %w ",
+			(*vote).Identity(),
+			(*vote).GetRank(),
+			(*state).GetRank(),
+			VoteForIncompatibleRankError,
+		)
+	}
+	if (*vote).Source() != (*state).Identity() {
+		return fmt.Errorf(
+			"expecting only votes for state %v, but vote %v is for state %v: %w ",
+			(*state).Identity(),
+			(*vote).Identity(),
+			(*vote).Source(),
+			VoteForIncompatibleStateError,
+		)
+	}
+	return nil
+}

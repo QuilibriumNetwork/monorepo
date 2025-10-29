@@ -11,6 +11,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
 
@@ -72,6 +73,30 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
 	}
 
+	// Get prover index
+	provers, err := p.engine.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, errors.Wrap(err, "prove next state")
+	}
+
+	proverIndex := uint8(0)
+	found := false
+	for i, prover := range provers {
+		if bytes.Equal(prover.Address, p.engine.getProverAddress()) {
+			proverIndex = uint8(i)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, errors.Wrap(
+			models.NewNoVoteErrorf("not a prover"),
+			"prove next state",
+		)
+	}
+
 	p.engine.logger.Info(
 		"proving next global state",
 		zap.Uint64("frame_number", (*prior).Header.FrameNumber+1),
@@ -102,21 +127,6 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	)
 	p.engine.currentDifficulty = uint32(difficulty)
 	p.engine.currentDifficultyMu.Unlock()
-
-	// Get prover index
-	provers, err := p.engine.proverRegistry.GetActiveProvers(nil)
-	if err != nil {
-		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(err, "prove next state")
-	}
-
-	proverIndex := uint8(0)
-	for i, prover := range provers {
-		if bytes.Equal(prover.Address, p.engine.getProverAddress()) {
-			proverIndex = uint8(i)
-			break
-		}
-	}
 
 	// Prove the global frame header
 	newHeader, err := p.engine.frameProver.ProveGlobalFrameHeader(

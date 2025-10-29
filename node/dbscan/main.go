@@ -205,7 +205,11 @@ func main() {
 			var status string
 			switch {
 			case entry.inFirst && entry.inSecond:
-				status = fmt.Sprintf("present in %s and %s", *configDirectory1, *configDirectory2)
+				status = fmt.Sprintf(
+					"present in %s and %s",
+					*configDirectory1,
+					*configDirectory2,
+				)
 			case entry.inFirst:
 				status = fmt.Sprintf("only present in %s", *configDirectory1)
 			case entry.inSecond:
@@ -354,7 +358,11 @@ func decodeKeyBundleValue(sub byte, value []byte) string {
 		if len(value) >= 32 {
 			counterparty := shortHex(value[:32])
 			signature := shortHex(value[32:])
-			return fmt.Sprintf("counterparty=%s\nsignature=%s", counterparty, signature)
+			return fmt.Sprintf(
+				"counterparty=%s\nsignature=%s",
+				counterparty,
+				signature,
+			)
 		}
 	}
 	return shortHex(value)
@@ -487,7 +495,10 @@ func decodeHypergraphProto(value []byte) (string, bool) {
 		}
 
 		hasFields := false
-		msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		msg.ProtoReflect().Range(func(
+			fd protoreflect.FieldDescriptor,
+			v protoreflect.Value,
+		) bool {
 			hasFields = true
 			return false
 		})
@@ -516,7 +527,11 @@ func decodeHypergraphProto(value []byte) (string, bool) {
 func summarizeVectorCommitmentTree(value []byte) string {
 	_, err := tries.DeserializeNonLazyTree(value)
 	if err != nil {
-		return fmt.Sprintf("vector_commitment_tree decode_error=%v raw=%s", err, shortHex(value))
+		return fmt.Sprintf(
+			"vector_commitment_tree decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
 	}
 
 	sum := sha256.Sum256(value)
@@ -569,7 +584,11 @@ func summarizeHypergraphTreeNode(value []byte) string {
 
 		jsonBytes, err := json.MarshalIndent(summary, "", "  ")
 		if err != nil {
-			return fmt.Sprintf("tree_leaf key=%s sha256=%s", shortHex(leaf.Key), hashStr)
+			return fmt.Sprintf(
+				"tree_leaf key=%s sha256=%s",
+				shortHex(leaf.Key),
+				hashStr,
+			)
 		}
 		return string(jsonBytes)
 	case tries.TypeBranch:
