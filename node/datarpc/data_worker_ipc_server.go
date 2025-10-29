@@ -193,6 +193,7 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 		"data worker listening",
 		zap.String("address", r.listenAddrGRPC),
 		zap.String("resolved", lis.Addr().String()),
+		zap.ByteString("filter", filter),
 	)
 	if len(filter) != 0 {
 		globalTimeReel, err := r.appConsensusEngineFactory.CreateGlobalTimeReel()
