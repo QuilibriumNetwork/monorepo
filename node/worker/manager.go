@@ -540,18 +540,21 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 			allocatedCount++
 		}
 		totalStorage += uint64(worker.TotalStorage)
-		svc, err := w.getIPCOfWorker(worker.CoreId)
-		if err != nil {
-			w.logger.Error("could not obtain IPC for worker", zap.Error(err))
-			continue
-		}
 
-		_, err = svc.Respawn(w.ctx, &protobufs.RespawnRequest{
-			Filter: worker.Filter,
-		})
-		if err != nil {
-			w.logger.Error("could not respawn worker", zap.Error(err))
-			continue
+		if len(worker.Filter) > 0 {
+			svc, err := w.getIPCOfWorker(worker.CoreId)
+			if err != nil {
+				w.logger.Error("could not obtain IPC for worker", zap.Error(err))
+				continue
+			}
+
+			_, err = svc.Respawn(w.ctx, &protobufs.RespawnRequest{
+				Filter: worker.Filter,
+			})
+			if err != nil {
+				w.logger.Error("could not respawn worker", zap.Error(err))
+				continue
+			}
 		}
 	}
 
