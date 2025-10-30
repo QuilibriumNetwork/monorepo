@@ -12,9 +12,9 @@ type Signer[StateT models.Unique, VoteT models.Unique] struct {
 	mock.Mock
 }
 
-// CreateTimeout provides a mock function with given fields: curView, newestQC, previousRankTimeoutCert
-func (_m *Signer[StateT, VoteT]) CreateTimeout(curView uint64, newestQC models.QuorumCertificate, previousRankTimeoutCert models.TimeoutCertificate) (*models.TimeoutState[VoteT], error) {
-	ret := _m.Called(curView, newestQC, previousRankTimeoutCert)
+// CreateTimeout provides a mock function with given fields: curRank, newestQC, previousRankTimeoutCert
+func (_m *Signer[StateT, VoteT]) CreateTimeout(curRank uint64, newestQC models.QuorumCertificate, previousRankTimeoutCert models.TimeoutCertificate) (*models.TimeoutState[VoteT], error) {
+	ret := _m.Called(curRank, newestQC, previousRankTimeoutCert)
 
 	if len(ret) == 0 {
 		panic("no return value specified for CreateTimeout")
@@ -23,10 +23,10 @@ func (_m *Signer[StateT, VoteT]) CreateTimeout(curView uint64, newestQC models.Q
 	var r0 *models.TimeoutState[VoteT]
 	var r1 error
 	if rf, ok := ret.Get(0).(func(uint64, models.QuorumCertificate, models.TimeoutCertificate) (*models.TimeoutState[VoteT], error)); ok {
-		return rf(curView, newestQC, previousRankTimeoutCert)
+		return rf(curRank, newestQC, previousRankTimeoutCert)
 	}
 	if rf, ok := ret.Get(0).(func(uint64, models.QuorumCertificate, models.TimeoutCertificate) *models.TimeoutState[VoteT]); ok {
-		r0 = rf(curView, newestQC, previousRankTimeoutCert)
+		r0 = rf(curRank, newestQC, previousRankTimeoutCert)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(*models.TimeoutState[VoteT])
@@ -34,7 +34,7 @@ func (_m *Signer[StateT, VoteT]) CreateTimeout(curView uint64, newestQC models.Q
 	}
 
 	if rf, ok := ret.Get(1).(func(uint64, models.QuorumCertificate, models.TimeoutCertificate) error); ok {
-		r1 = rf(curView, newestQC, previousRankTimeoutCert)
+		r1 = rf(curRank, newestQC, previousRankTimeoutCert)
 	} else {
 		r1 = ret.Error(1)
 	}

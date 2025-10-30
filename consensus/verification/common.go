@@ -15,7 +15,7 @@ import (
 // message without having the full state contents.
 func MakeVoteMessage(rank uint64, stateID models.Identity) []byte {
 	msg := []byte{}
-	binary.BigEndian.PutUint64(msg, rank)
+	binary.BigEndian.AppendUint64(msg, rank)
 	msg = append(msg, stateID[:]...)
 	return msg
 }

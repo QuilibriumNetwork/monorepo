@@ -10,7 +10,7 @@ import (
 
 // CommunicatorDistributor ingests outbound consensus messages from HotStuff's
 // core logic and distributes them to consumers. This logic only runs inside
-// active consensus participants proposing state, voting, collecting +
+// active consensus participants proposing states, voting, collecting +
 // aggregating votes to QCs, and participating in the pacemaker (sending
 // timeouts, collecting + aggregating timeouts to TCs).
 // Concurrency safe.

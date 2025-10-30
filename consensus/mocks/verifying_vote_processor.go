@@ -33,19 +33,19 @@ func (_m *VerifyingVoteProcessor[StateT, VoteT]) Process(vote *VoteT) error {
 }
 
 // State provides a mock function with no fields
-func (_m *VerifyingVoteProcessor[StateT, VoteT]) State() *StateT {
+func (_m *VerifyingVoteProcessor[StateT, VoteT]) State() *models.State[StateT] {
 	ret := _m.Called()
 
 	if len(ret) == 0 {
 		panic("no return value specified for State")
 	}
 
-	var r0 *StateT
-	if rf, ok := ret.Get(0).(func() *StateT); ok {
+	var r0 *models.State[StateT]
+	if rf, ok := ret.Get(0).(func() *models.State[StateT]); ok {
 		r0 = rf()
 	} else {
 		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(*StateT)
+			r0 = ret.Get(0).(*models.State[StateT])
 		}
 	}
 

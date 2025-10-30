@@ -52,108 +52,108 @@ func (
 
 func (
 	d *ParticipantDistributor[StateT, VoteT],
-) OnStart(currentView uint64) {
+) OnStart(currentRank uint64) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnStart(currentView)
+		subscriber.OnStart(currentRank)
 	}
 }
 
 func (
 	d *ParticipantDistributor[StateT, VoteT],
 ) OnReceiveProposal(
-	currentView uint64,
+	currentRank uint64,
 	proposal *models.SignedProposal[StateT, VoteT],
 ) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnReceiveProposal(currentView, proposal)
+		subscriber.OnReceiveProposal(currentRank, proposal)
 	}
 }
 
 func (
 	d *ParticipantDistributor[StateT, VoteT],
-) OnReceiveQuorumCertificate(currentView uint64, qc models.QuorumCertificate) {
+) OnReceiveQuorumCertificate(currentRank uint64, qc models.QuorumCertificate) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnReceiveQuorumCertificate(currentView, qc)
+		subscriber.OnReceiveQuorumCertificate(currentRank, qc)
 	}
 }
 
 func (
 	d *ParticipantDistributor[StateT, VoteT],
 ) OnReceiveTimeoutCertificate(
-	currentView uint64,
+	currentRank uint64,
 	tc models.TimeoutCertificate,
 ) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnReceiveTimeoutCertificate(currentView, tc)
+		subscriber.OnReceiveTimeoutCertificate(currentRank, tc)
 	}
 }
 
 func (
 	d *ParticipantDistributor[StateT, VoteT],
 ) OnPartialTimeoutCertificate(
-	currentView uint64,
-	partialTc *consensus.PartialTimeoutCertificateCreated,
+	currentRank uint64,
+	partialTimeoutCertificate *consensus.PartialTimeoutCertificateCreated,
 ) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnPartialTimeoutCertificate(currentView, partialTc)
+		subscriber.OnPartialTimeoutCertificate(currentRank, partialTimeoutCertificate)
 	}
 }
 
 func (
 	d *ParticipantDistributor[StateT, VoteT],
-) OnLocalTimeout(currentView uint64) {
+) OnLocalTimeout(currentRank uint64) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnLocalTimeout(currentView)
+		subscriber.OnLocalTimeout(currentRank)
 	}
 }
 
 func (
 	d *ParticipantDistributor[StateT, VoteT],
-) OnRankChange(oldView, newView uint64) {
+) OnRankChange(oldRank, newRank uint64) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnRankChange(oldView, newView)
+		subscriber.OnRankChange(oldRank, newRank)
 	}
 }
 
 func (
 	d *ParticipantDistributor[StateT, VoteT],
 ) OnQuorumCertificateTriggeredRankChange(
-	oldView uint64,
-	newView uint64,
+	oldRank uint64,
+	newRank uint64,
 	qc models.QuorumCertificate,
 ) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnQuorumCertificateTriggeredRankChange(oldView, newView, qc)
+		subscriber.OnQuorumCertificateTriggeredRankChange(oldRank, newRank, qc)
 	}
 }
 
 func (
 	d *ParticipantDistributor[StateT, VoteT],
 ) OnTimeoutCertificateTriggeredRankChange(
-	oldView uint64,
-	newView uint64,
+	oldRank uint64,
+	newRank uint64,
 	tc models.TimeoutCertificate,
 ) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnTimeoutCertificateTriggeredRankChange(oldView, newView, tc)
+		subscriber.OnTimeoutCertificateTriggeredRankChange(oldRank, newRank, tc)
 	}
 }
 
@@ -170,12 +170,12 @@ func (
 func (
 	d *ParticipantDistributor[StateT, VoteT],
 ) OnCurrentRankDetails(
-	currentView, finalizedView uint64,
+	currentRank, finalizedRank uint64,
 	currentLeader models.Identity,
 ) {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 	for _, subscriber := range d.consumers {
-		subscriber.OnCurrentRankDetails(currentView, finalizedView, currentLeader)
+		subscriber.OnCurrentRankDetails(currentRank, finalizedRank, currentLeader)
 	}
 }

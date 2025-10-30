@@ -36,7 +36,7 @@ type WeightedSignatureAggregator interface {
 	// TotalWeight returns the total weight presented by the collected signatures.
 	TotalWeight() uint64
 
-	// Aggregate aggregates the signatures and returns the aggregated signature.
+	// Aggregate aggregates the signatures and returns the aggregated consensus.
 	// The function performs a final verification and errors if the aggregated
 	// signature is invalid. This is required for the function safety since
 	// `TrustedAdd` allows adding invalid signatures.

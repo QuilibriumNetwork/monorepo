@@ -17,8 +17,8 @@ var (
 
 // voteContainer container stores the vote and in index representing
 // the order in which the votes were received
-type voteContainer struct {
-	*models.Vote
+type voteContainer[VoteT models.Unique] struct {
+	Vote  *VoteT
 	index int
 }
 
@@ -33,7 +33,7 @@ type voteContainer struct {
 type VotesCache[VoteT models.Unique] struct {
 	lock          sync.RWMutex
 	rank          uint64
-	votes         map[models.Identity]voteContainer // signerID -> first vote
+	votes         map[models.Identity]voteContainer[VoteT] // signerID -> first vote
 	voteConsumers []consensus.VoteConsumer[VoteT]
 }
 
@@ -41,7 +41,7 @@ type VotesCache[VoteT models.Unique] struct {
 func NewVotesCache[VoteT models.Unique](rank uint64) *VotesCache[VoteT] {
 	return &VotesCache[VoteT]{
 		rank:  rank,
-		votes: make(map[models.Identity]voteContainer),
+		votes: make(map[models.Identity]voteContainer[VoteT]),
 	}
 }
 
@@ -85,7 +85,7 @@ func (vc *VotesCache[VoteT]) AddVote(vote *VoteT) error {
 	}
 
 	// previously unknown vote: (1) store and (2) forward to consumers
-	vc.votes[(*vote).Identity()] = voteContainer{vote, len(vc.votes)}
+	vc.votes[(*vote).Identity()] = voteContainer[VoteT]{vote, len(vc.votes)}
 	for _, consumer := range vc.voteConsumers {
 		consumer(vote)
 	}

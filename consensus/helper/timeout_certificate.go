@@ -125,7 +125,19 @@ func TimeoutStateFixture[VoteT models.Unique](
 		opt(timeout)
 	}
 
+	if timeout.Vote == nil {
+		panic("WithTimeoutVote must be called")
+	}
+
 	return timeout
+}
+
+func WithTimeoutVote[VoteT models.Unique](
+	vote VoteT,
+) func(*models.TimeoutState[VoteT]) {
+	return func(state *models.TimeoutState[VoteT]) {
+		state.Vote = &vote
+	}
 }
 
 func WithTimeoutNewestQC[VoteT models.Unique](
@@ -149,5 +161,11 @@ func WithTimeoutStateRank[VoteT models.Unique](
 ) func(*models.TimeoutState[VoteT]) {
 	return func(timeout *models.TimeoutState[VoteT]) {
 		timeout.Rank = rank
+		if timeout.LatestQuorumCertificate != nil {
+			timeout.LatestQuorumCertificate.(*TestQuorumCertificate).Rank = rank
+		}
+		if timeout.PriorRankTimeoutCertificate != nil {
+			timeout.PriorRankTimeoutCertificate.(*TestTimeoutCertificate).Rank = rank - 1
+		}
 	}
 }

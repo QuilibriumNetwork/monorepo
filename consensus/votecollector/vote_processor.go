@@ -39,6 +39,7 @@ func (f *provingVoteProcessorFactoryBase[StateT, VoteT, PeerIDT]) Create(
 	state *models.State[StateT],
 	dsTag []byte,
 	aggregator consensus.SignatureAggregator,
+	votingProvider consensus.VotingProvider[StateT, VoteT, PeerIDT],
 ) (consensus.VerifyingVoteProcessor[StateT, VoteT], error) {
 	allParticipants, err := f.committee.IdentitiesByState(state.Identifier)
 	if err != nil {
@@ -81,6 +82,7 @@ func (f *provingVoteProcessorFactoryBase[StateT, VoteT, PeerIDT]) Create(
 		tracer:            tracer,
 		state:             state,
 		provingSigAggtor:  provingSigAggtor,
+		votingProvider:    votingProvider,
 		onQCCreated:       f.onQCCreated,
 		minRequiredWeight: minRequiredWeight,
 		done:              *atomic.NewBool(false),
@@ -92,7 +94,7 @@ func (f *provingVoteProcessorFactoryBase[StateT, VoteT, PeerIDT]) Create(
 
 // VoteProcessor implements the consensus.VerifyingVoteProcessor interface.
 // It processes hotstuff votes from a collector cluster, where participants vote
-// in favour of a state by proving their proving key signature.
+// in favour of a state by proving their proving key consensus.
 // Concurrency safe.
 type VoteProcessor[
 	StateT models.Unique,

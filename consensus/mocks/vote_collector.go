@@ -50,6 +50,24 @@ func (_m *VoteCollector[StateT, VoteT]) ProcessState(state *models.SignedProposa
 	return r0
 }
 
+// Rank provides a mock function with no fields
+func (_m *VoteCollector[StateT, VoteT]) Rank() uint64 {
+	ret := _m.Called()
+
+	if len(ret) == 0 {
+		panic("no return value specified for Rank")
+	}
+
+	var r0 uint64
+	if rf, ok := ret.Get(0).(func() uint64); ok {
+		r0 = rf()
+	} else {
+		r0 = ret.Get(0).(uint64)
+	}
+
+	return r0
+}
+
 // RegisterVoteConsumer provides a mock function with given fields: consumer
 func (_m *VoteCollector[StateT, VoteT]) RegisterVoteConsumer(consumer consensus.VoteConsumer[VoteT]) {
 	_m.Called(consumer)
@@ -68,24 +86,6 @@ func (_m *VoteCollector[StateT, VoteT]) Status() consensus.VoteCollectorStatus {
 		r0 = rf()
 	} else {
 		r0 = ret.Get(0).(consensus.VoteCollectorStatus)
-	}
-
-	return r0
-}
-
-// View provides a mock function with no fields
-func (_m *VoteCollector[StateT, VoteT]) View() uint64 {
-	ret := _m.Called()
-
-	if len(ret) == 0 {
-		panic("no return value specified for View")
-	}
-
-	var r0 uint64
-	if rf, ok := ret.Get(0).(func() uint64); ok {
-		r0 = rf()
-	} else {
-		r0 = ret.Get(0).(uint64)
 	}
 
 	return r0

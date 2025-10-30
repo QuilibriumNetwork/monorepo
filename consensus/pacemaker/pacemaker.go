@@ -48,6 +48,7 @@ func NewPacemaker[
 		store:                    store,
 		traceLogger:              traceLogger,
 		livenessState:            livenessState,
+		backoffTimer:             consensus.NewBackoffTimer(),
 		started:                  false,
 	}, nil
 }

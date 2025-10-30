@@ -65,9 +65,9 @@ type CertifiedState[StateT Unique] struct {
 func NewCertifiedState[StateT Unique](
 	state *State[StateT],
 	quorumCertificate QuorumCertificate,
-) (CertifiedState[StateT], error) {
+) (*CertifiedState[StateT], error) {
 	if state.Rank != quorumCertificate.GetRank() {
-		return CertifiedState[StateT]{},
+		return &CertifiedState[StateT]{},
 			fmt.Errorf(
 				"state's rank (%d) should equal the qc's rank (%d)",
 				state.Rank,
@@ -75,14 +75,14 @@ func NewCertifiedState[StateT Unique](
 			)
 	}
 	if state.Identifier != quorumCertificate.GetSelector() {
-		return CertifiedState[StateT]{},
+		return &CertifiedState[StateT]{},
 			fmt.Errorf(
 				"state's ID (%x) should equal the state referenced by the qc (%x)",
 				state.Identifier,
 				quorumCertificate.GetSelector(),
 			)
 	}
-	return CertifiedState[StateT]{
+	return &CertifiedState[StateT]{
 		State:                       state,
 		CertifyingQuorumCertificate: quorumCertificate,
 	}, nil

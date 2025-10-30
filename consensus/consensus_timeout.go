@@ -53,7 +53,7 @@ type TimeoutCollector[VoteT models.Unique] interface {
 
 // TimeoutProcessor ingests Timeout States  for a particular rank. It
 // implements the algorithms for validating TSs, orchestrates their low-level
-// aggregation and emits `OnPartialTcCreated` and `OnTcConstructedFromTimeouts`
+// aggregation and emits `OnPartialTimeoutCertificateCreated` and `OnTimeoutCertificateConstructedFromTimeouts`
 // notifications. TimeoutProcessor cannot deduplicate TSs (this should be
 // handled by the higher-level TimeoutCollector) and errors instead. Depending
 // on their implementation, a TimeoutProcessor might drop timeouts or attempt to

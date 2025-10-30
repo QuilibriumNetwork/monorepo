@@ -44,21 +44,21 @@ func (c *NoopProcessor[VoteT]) Status() consensus.VoteCollectorStatus {
 //     state but for a different stateID
 func EnsureVoteForState[StateT models.Unique, VoteT models.Unique](
 	vote *VoteT,
-	state *StateT,
+	state *models.State[StateT],
 ) error {
-	if (*vote).GetRank() != (*state).GetRank() {
+	if (*vote).GetRank() != state.Rank {
 		return fmt.Errorf(
 			"vote %v has rank %d while state's rank is %d: %w ",
 			(*vote).Identity(),
 			(*vote).GetRank(),
-			(*state).GetRank(),
+			state.Rank,
 			VoteForIncompatibleRankError,
 		)
 	}
-	if (*vote).Source() != (*state).Identity() {
+	if (*vote).Source() != state.Identifier {
 		return fmt.Errorf(
 			"expecting only votes for state %v, but vote %v is for state %v: %w ",
-			(*state).Identity(),
+			state.Identifier,
 			(*vote).Identity(),
 			(*vote).Source(),
 			VoteForIncompatibleStateError,

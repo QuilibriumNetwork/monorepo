@@ -2,11 +2,201 @@ package helper
 
 import (
 	crand "crypto/rand"
+	"fmt"
 	"math/rand"
+	"slices"
 	"time"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 )
+
+type TestWeightedIdentity struct {
+	ID string
+}
+
+// Identity implements models.WeightedIdentity.
+func (t *TestWeightedIdentity) Identity() models.Identity {
+	return t.ID
+}
+
+// PublicKey implements models.WeightedIdentity.
+func (t *TestWeightedIdentity) PublicKey() []byte {
+	return make([]byte, 585)
+}
+
+// Weight implements models.WeightedIdentity.
+func (t *TestWeightedIdentity) Weight() uint64 {
+	return 1000
+}
+
+var _ models.WeightedIdentity = (*TestWeightedIdentity)(nil)
+
+type TestState struct {
+	Rank      uint64
+	Signature []byte
+	Timestamp uint64
+	ID        models.Identity
+	Prover    models.Identity
+}
+
+// Clone implements models.Unique.
+func (t *TestState) Clone() models.Unique {
+	return &TestState{
+		Rank:      t.Rank,
+		Signature: slices.Clone(t.Signature),
+		Timestamp: t.Timestamp,
+		ID:        t.ID,
+		Prover:    t.Prover,
+	}
+}
+
+// GetRank implements models.Unique.
+func (t *TestState) GetRank() uint64 {
+	return t.Rank
+}
+
+// GetSignature implements models.Unique.
+func (t *TestState) GetSignature() []byte {
+	return t.Signature
+}
+
+// GetTimestamp implements models.Unique.
+func (t *TestState) GetTimestamp() uint64 {
+	return t.Timestamp
+}
+
+// Identity implements models.Unique.
+func (t *TestState) Identity() models.Identity {
+	return t.ID
+}
+
+// Source implements models.Unique.
+func (t *TestState) Source() models.Identity {
+	return t.Prover
+}
+
+type TestVote struct {
+	Rank      uint64
+	Signature []byte
+	Timestamp uint64
+	ID        models.Identity
+	StateID   models.Identity
+}
+
+// Clone implements models.Unique.
+func (t *TestVote) Clone() models.Unique {
+	return &TestVote{
+		Rank:      t.Rank,
+		Signature: slices.Clone(t.Signature),
+		Timestamp: t.Timestamp,
+		ID:        t.ID,
+		StateID:   t.StateID,
+	}
+}
+
+// GetRank implements models.Unique.
+func (t *TestVote) GetRank() uint64 {
+	return t.Rank
+}
+
+// GetSignature implements models.Unique.
+func (t *TestVote) GetSignature() []byte {
+	return t.Signature
+}
+
+// GetTimestamp implements models.Unique.
+func (t *TestVote) GetTimestamp() uint64 {
+	return t.Timestamp
+}
+
+// Identity implements models.Unique.
+func (t *TestVote) Identity() models.Identity {
+	return t.ID
+}
+
+// Source implements models.Unique.
+func (t *TestVote) Source() models.Identity {
+	return t.StateID
+}
+
+type TestPeer struct {
+	PeerID string
+}
+
+// Clone implements models.Unique.
+func (t *TestPeer) Clone() models.Unique {
+	return &TestPeer{
+		PeerID: t.PeerID,
+	}
+}
+
+// GetRank implements models.Unique.
+func (t *TestPeer) GetRank() uint64 {
+	return 0
+}
+
+// GetSignature implements models.Unique.
+func (t *TestPeer) GetSignature() []byte {
+	return []byte{}
+}
+
+// GetTimestamp implements models.Unique.
+func (t *TestPeer) GetTimestamp() uint64 {
+	return 0
+}
+
+// Identity implements models.Unique.
+func (t *TestPeer) Identity() models.Identity {
+	return t.PeerID
+}
+
+// Source implements models.Unique.
+func (t *TestPeer) Source() models.Identity {
+	return t.PeerID
+}
+
+type TestCollected struct {
+	Rank uint64
+	TXs  [][]byte
+}
+
+// Clone implements models.Unique.
+func (t *TestCollected) Clone() models.Unique {
+	return &TestCollected{
+		Rank: t.Rank,
+		TXs:  slices.Clone(t.TXs),
+	}
+}
+
+// GetRank implements models.Unique.
+func (t *TestCollected) GetRank() uint64 {
+	return t.Rank
+}
+
+// GetSignature implements models.Unique.
+func (t *TestCollected) GetSignature() []byte {
+	return []byte{}
+}
+
+// GetTimestamp implements models.Unique.
+func (t *TestCollected) GetTimestamp() uint64 {
+	return 0
+}
+
+// Identity implements models.Unique.
+func (t *TestCollected) Identity() models.Identity {
+	return fmt.Sprintf("%d", t.Rank)
+}
+
+// Source implements models.Unique.
+func (t *TestCollected) Source() models.Identity {
+	return ""
+}
+
+var _ models.Unique = (*TestState)(nil)
+var _ models.Unique = (*TestVote)(nil)
+var _ models.Unique = (*TestPeer)(nil)
+var _ models.Unique = (*TestCollected)(nil)
 
 func MakeIdentity() models.Identity {
 	s := make([]byte, 32)
@@ -109,4 +299,44 @@ func WithPreviousRankTimeoutCertificate[StateT models.Unique](previousRankTimeou
 	return func(proposal *models.Proposal[StateT]) {
 		proposal.PreviousRankTimeoutCertificate = previousRankTimeoutCert
 	}
+}
+
+func WithWeightedIdentityList(count int) []models.WeightedIdentity {
+	wi := []models.WeightedIdentity{}
+	for i := range count {
+		wi = append(wi, &TestWeightedIdentity{
+			ID: fmt.Sprintf("%d", i),
+		})
+	}
+	return wi
+}
+
+func VoteForStateFixture[StateT models.Unique, VoteT models.Unique](state *models.State[StateT], ops ...func(vote *VoteT)) VoteT {
+	v := new(VoteT)
+	for _, op := range ops {
+		op(v)
+	}
+	return *v
+}
+
+func VoteFixture[VoteT models.Unique](op func(vote *VoteT)) VoteT {
+	v := new(VoteT)
+	op(v)
+	return *v
+}
+
+type FmtLog struct{}
+
+// Error implements consensus.TraceLogger.
+func (n *FmtLog) Error(message string, err error) {
+	fmt.Printf("ERROR: %s: %v\n", message, err)
+}
+
+// Trace implements consensus.TraceLogger.
+func (n *FmtLog) Trace(message string) {
+	fmt.Printf("TRACE: %s\n", message)
+}
+
+func Logger() *FmtLog {
+	return &FmtLog{}
 }

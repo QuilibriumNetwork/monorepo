@@ -207,7 +207,7 @@ func (r *SafetyRules[StateT, VoteT]) produceVote(
 		}
 	}
 
-	vote, err := r.signer.CreateVote(state.State)
+	vote, err := r.signer.CreateVote(state)
 	if err != nil {
 		return nil, fmt.Errorf("could not vote for state: %w", err)
 	}
@@ -223,7 +223,7 @@ func (r *SafetyRules[StateT, VoteT]) produceVote(
 		return nil, fmt.Errorf("could not persist safety data: %w", err)
 	}
 
-	return &vote, nil
+	return vote, nil
 }
 
 // ProduceTimeout takes current rank, highest locally known QC and TC (optional,
@@ -252,6 +252,7 @@ func (r *SafetyRules[StateT, VoteT]) ProduceTimeout(
 			LatestQuorumCertificate:     lastTimeout.LatestQuorumCertificate,
 			PriorRankTimeoutCertificate: lastTimeout.PriorRankTimeoutCertificate,
 			TimeoutTick:                 lastTimeout.TimeoutTick + 1,
+			Vote:                        lastTimeout.Vote,
 		}
 
 		// persist updated TimeoutState in `safetyData` and return it

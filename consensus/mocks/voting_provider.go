@@ -14,6 +14,36 @@ type VotingProvider[StateT models.Unique, VoteT models.Unique, PeerIDT models.Un
 	mock.Mock
 }
 
+// FinalizeQuorumCertificate provides a mock function with given fields: ctx, state, aggregatedSignature
+func (_m *VotingProvider[StateT, VoteT, PeerIDT]) FinalizeQuorumCertificate(ctx context.Context, state *models.State[StateT], aggregatedSignature models.AggregatedSignature) (models.QuorumCertificate, error) {
+	ret := _m.Called(ctx, state, aggregatedSignature)
+
+	if len(ret) == 0 {
+		panic("no return value specified for FinalizeQuorumCertificate")
+	}
+
+	var r0 models.QuorumCertificate
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *models.State[StateT], models.AggregatedSignature) (models.QuorumCertificate, error)); ok {
+		return rf(ctx, state, aggregatedSignature)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *models.State[StateT], models.AggregatedSignature) models.QuorumCertificate); ok {
+		r0 = rf(ctx, state, aggregatedSignature)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(models.QuorumCertificate)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *models.State[StateT], models.AggregatedSignature) error); ok {
+		r1 = rf(ctx, state, aggregatedSignature)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
 // FinalizeTimeout provides a mock function with given fields: ctx, filter, rank, latestQuorumCertificateRanks, aggregatedSignature
 func (_m *VotingProvider[StateT, VoteT, PeerIDT]) FinalizeTimeout(ctx context.Context, filter []byte, rank uint64, latestQuorumCertificateRanks []uint64, aggregatedSignature models.AggregatedSignature) (models.TimeoutCertificate, error) {
 	ret := _m.Called(ctx, filter, rank, latestQuorumCertificateRanks, aggregatedSignature)

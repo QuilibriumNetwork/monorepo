@@ -103,23 +103,23 @@ func (_m *DynamicCommittee) IdentityByRank(rank uint64, participantID models.Ide
 }
 
 // IdentityByState provides a mock function with given fields: stateID, participantID
-func (_m *DynamicCommittee) IdentityByState(stateID models.Identity, participantID models.Identity) (*models.WeightedIdentity, error) {
+func (_m *DynamicCommittee) IdentityByState(stateID models.Identity, participantID models.Identity) (models.WeightedIdentity, error) {
 	ret := _m.Called(stateID, participantID)
 
 	if len(ret) == 0 {
 		panic("no return value specified for IdentityByState")
 	}
 
-	var r0 *models.WeightedIdentity
+	var r0 models.WeightedIdentity
 	var r1 error
-	if rf, ok := ret.Get(0).(func(models.Identity, models.Identity) (*models.WeightedIdentity, error)); ok {
+	if rf, ok := ret.Get(0).(func(models.Identity, models.Identity) (models.WeightedIdentity, error)); ok {
 		return rf(stateID, participantID)
 	}
-	if rf, ok := ret.Get(0).(func(models.Identity, models.Identity) *models.WeightedIdentity); ok {
+	if rf, ok := ret.Get(0).(func(models.Identity, models.Identity) models.WeightedIdentity); ok {
 		r0 = rf(stateID, participantID)
 	} else {
 		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(*models.WeightedIdentity)
+			r0 = ret.Get(0).(models.WeightedIdentity)
 		}
 	}
 

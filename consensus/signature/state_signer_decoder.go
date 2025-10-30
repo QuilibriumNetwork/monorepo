@@ -29,7 +29,7 @@ var _ consensus.StateSignerDecoder[*nilUnique] = (*StateSignerDecoder[*nilUnique
 // validity of parent state. Consequently, the returned IdentifierList contains
 // the consensus participants that signed the parent state. Expected Error
 // returns during normal operations:
-//   - signature.InvalidSignerIndicesError if signer indices included in the
+//   - consensus.InvalidSignerIndicesError if signer indices included in the
 //     state do not encode a valid subset of the consensus committee
 //   - state.ErrUnknownSnapshotReference if the input state is not a known
 //     incorporated state.

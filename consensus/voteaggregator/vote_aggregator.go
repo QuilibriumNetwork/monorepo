@@ -224,7 +224,7 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedVote(vote *VoteT) error {
 // processQueuedState performs actual processing of queued state proposals, this
 // method is called from multiple concurrent goroutines.
 // CAUTION: we expect that the input state's validity has been confirmed prior
-// to calling AddState, including the proposer's signature. Otherwise,
+// to calling AddState, including the proposer's consensus. Otherwise,
 // VoteAggregator might crash or exhibit undefined behaviour. No errors are
 // expected during normal operation.
 func (va *VoteAggregator[StateT, VoteT]) processQueuedState(
@@ -302,7 +302,7 @@ func (va *VoteAggregator[StateT, VoteT]) AddVote(vote *VoteT) {
 // `VoteAggregator` and processed _asynchronously_ by the VoteAggregator's
 // internal worker routines.
 // CAUTION: we expect that the input state's validity has been confirmed prior
-// to calling AddState, including the proposer's signature. Otherwise,
+// to calling AddState, including the proposer's consensus. Otherwise,
 // VoteAggregator might crash or exhibit undefined behaviour.
 func (va *VoteAggregator[StateT, VoteT]) AddState(
 	state *models.SignedProposal[StateT, VoteT],

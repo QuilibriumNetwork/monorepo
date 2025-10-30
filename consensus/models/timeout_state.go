@@ -1,6 +1,8 @@
 package models
 
-import "bytes"
+import (
+	"bytes"
+)
 
 // TimeoutState represents the stored state change step relevant to the point of
 // rank of a given instance of the consensus state machine.
@@ -36,10 +38,21 @@ func (t *TimeoutState[VoteT]) Equals(other *TimeoutState[VoteT]) bool {
 		return false
 	}
 
+	if t.Vote != other.Vote && (other.Vote == nil || t.Vote == nil) {
+		return false
+	}
+
 	// both are not nil, so we can compare the fields
 	return t.Rank == other.Rank &&
-		t.LatestQuorumCertificate.Equals(other.LatestQuorumCertificate) &&
-		t.PriorRankTimeoutCertificate.Equals(other.PriorRankTimeoutCertificate) &&
-		(*t.Vote).Source() == (*other.Vote).Source() &&
-		bytes.Equal((*t.Vote).GetSignature(), (*other.Vote).GetSignature())
+		((t.LatestQuorumCertificate == nil &&
+			other.LatestQuorumCertificate == nil) ||
+			t.LatestQuorumCertificate.Equals(other.LatestQuorumCertificate)) &&
+		((t.PriorRankTimeoutCertificate == nil &&
+			other.PriorRankTimeoutCertificate == nil) ||
+			t.PriorRankTimeoutCertificate.Equals(
+				other.PriorRankTimeoutCertificate,
+			)) &&
+		((t.Vote == other.Vote) ||
+			((*t.Vote).Source() == (*other.Vote).Source()) &&
+				bytes.Equal((*t.Vote).GetSignature(), (*other.Vote).GetSignature()))
 }

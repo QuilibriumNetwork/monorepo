@@ -4,18 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"sync"
 	"time"
 
-	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker"
 )
 
 // Example using the generic state machine from the consensus package
 
-// ConsensusData represents the state data
-type ConsensusData struct {
+// consensusData represents the state data
+type consensusData struct {
 	Round      uint64
 	Hash       string
 	Votes      map[string]interface{}
@@ -26,16 +28,16 @@ type ConsensusData struct {
 }
 
 // Identity implements Unique interface
-func (c ConsensusData) Identity() consensus.Identity {
+func (c consensusData) Identity() models.Identity {
 	return fmt.Sprintf("%s-%d", c.Hash, c.Round)
 }
 
-func (c ConsensusData) Rank() uint64 {
+func (c consensusData) GetRank() uint64 {
 	return c.Round
 }
 
-func (c ConsensusData) Clone() consensus.Unique {
-	return ConsensusData{
+func (c consensusData) Clone() models.Unique {
+	return consensusData{
 		Round:      c.Round,
 		Hash:       c.Hash,
 		Votes:      c.Votes,
@@ -47,7 +49,7 @@ func (c ConsensusData) Clone() consensus.Unique {
 }
 
 // Vote represents a vote in the consensus
-type Vote struct {
+type vote struct {
 	NodeID     string
 	Round      uint64
 	VoteValue  string
@@ -56,16 +58,16 @@ type Vote struct {
 }
 
 // Identity implements Unique interface
-func (v Vote) Identity() consensus.Identity {
+func (v vote) Identity() consensus.Identity {
 	return fmt.Sprintf("%s-%d-%s", v.ProposerID, v.Round, v.VoteValue)
 }
 
-func (v Vote) Rank() uint64 {
+func (v vote) GetRank() uint64 {
 	return v.Round
 }
 
-func (v Vote) Clone() consensus.Unique {
-	return Vote{
+func (v vote) Clone() models.Unique {
+	return vote{
 		NodeID:     v.NodeID,
 		Round:      v.Round,
 		VoteValue:  v.VoteValue,
@@ -74,21 +76,113 @@ func (v Vote) Clone() consensus.Unique {
 	}
 }
 
-// PeerID represents a peer identifier
-type PeerID struct {
+type aggregateSignature struct {
+	Signature []byte
+	PublicKey []byte
+	Bitmask   []byte
+}
+
+// GetBitmask implements models.AggregatedSignature.
+func (b *aggregateSignature) GetBitmask() []byte {
+	return b.Bitmask
+}
+
+// GetPublicKey implements models.AggregatedSignature.
+func (b *aggregateSignature) GetPublicKey() []byte {
+	return b.PublicKey
+}
+
+// GetSignature implements models.AggregatedSignature.
+func (b *aggregateSignature) GetSignature() []byte {
+	return b.Signature
+}
+
+type quorumCertificate struct {
+	Filter              []byte
+	Rank                uint64
+	FrameNumber         uint64
+	Selector            []byte
+	Timestamp           int64
+	AggregatedSignature *aggregateSignature
+}
+
+// GetAggregatedSignature implements models.QuorumCertificate.
+func (q *quorumCertificate) GetAggregatedSignature() models.AggregatedSignature {
+	return q.AggregatedSignature
+}
+
+// GetFilter implements models.QuorumCertificate.
+func (q *quorumCertificate) GetFilter() []byte {
+	return q.Filter
+}
+
+// GetFrameNumber implements models.QuorumCertificate.
+func (q *quorumCertificate) GetFrameNumber() uint64 {
+	return q.FrameNumber
+}
+
+// GetRank implements models.QuorumCertificate.
+func (q *quorumCertificate) GetRank() uint64 {
+	return q.Rank
+}
+
+// GetSelector implements models.QuorumCertificate.
+func (q *quorumCertificate) GetSelector() []byte {
+	return q.Selector
+}
+
+// GetTimestamp implements models.QuorumCertificate.
+func (q *quorumCertificate) GetTimestamp() int64 {
+	return q.Timestamp
+}
+
+var _ models.AggregatedSignature = (*aggregateSignature)(nil)
+var _ models.QuorumCertificate = (*quorumCertificate)(nil)
+
+type store struct {
+	consensusState *models.ConsensusState
+	livenessState  *models.LivenessState
+}
+
+// GetConsensusState implements consensus.ConsensusStore.
+func (s *store) GetConsensusState() (*models.ConsensusState, error) {
+	return s.consensusState, nil
+}
+
+// GetLivenessState implements consensus.ConsensusStore.
+func (s *store) GetLivenessState() (*models.LivenessState, error) {
+	return s.livenessState, nil
+}
+
+// PutConsensusState implements consensus.ConsensusStore.
+func (s *store) PutConsensusState(state *models.ConsensusState) error {
+	s.consensusState = state
+	return nil
+}
+
+// PutLivenessState implements consensus.ConsensusStore.
+func (s *store) PutLivenessState(state *models.LivenessState) error {
+	s.livenessState = state
+	return nil
+}
+
+var _ consensus.ConsensusStore = (*store)(nil)
+
+// peerID represents a peer identifier
+type peerID struct {
 	ID string
 }
 
 // Identity implements Unique interface
-func (p PeerID) Identity() consensus.Identity {
+func (p peerID) Identity() consensus.Identity {
 	return p.ID
 }
 
-func (p PeerID) Rank() uint64 {
+func (p peerID) GetRank() uint64 {
 	return 0
 }
 
-func (p PeerID) Clone() consensus.Unique {
+func (p peerID) Clone() models.Unique {
 	return p
 }
 
@@ -104,11 +198,11 @@ func (c CollectedData) Identity() consensus.Identity {
 	return fmt.Sprintf("collected-%d", c.Timestamp.Unix())
 }
 
-func (c CollectedData) Rank() uint64 {
+func (c CollectedData) GetRank() uint64 {
 	return c.Round
 }
 
-func (c CollectedData) Clone() consensus.Unique {
+func (c CollectedData) Clone() models.Unique {
 	return CollectedData{
 		Mutations: slices.Clone(c.Mutations),
 		Timestamp: c.Timestamp,
@@ -117,28 +211,27 @@ func (c CollectedData) Clone() consensus.Unique {
 
 // MockSyncProvider implements SyncProvider
 type MockSyncProvider struct {
-	logger *zap.Logger
 }
 
 func (m *MockSyncProvider) Synchronize(
-	existing *ConsensusData,
 	ctx context.Context,
-) (<-chan *ConsensusData, <-chan error) {
-	dataCh := make(chan *ConsensusData, 1)
+	existing *consensusData,
+) (<-chan *consensusData, <-chan error) {
+	dataCh := make(chan *consensusData, 1)
 	errCh := make(chan error, 1)
 
 	go func() {
 		defer close(dataCh)
 		defer close(errCh)
 
-		m.logger.Info("synchronizing...")
+		log.Println("synchronizing...")
 		select {
 		case <-time.After(10 * time.Millisecond):
-			m.logger.Info("sync complete")
+			log.Println("sync complete")
 			if existing != nil {
 				dataCh <- existing
 			} else {
-				dataCh <- &ConsensusData{
+				dataCh <- &consensusData{
 					Round:     0,
 					Hash:      "genesis",
 					Votes:     make(map[string]interface{}),
@@ -156,8 +249,7 @@ func (m *MockSyncProvider) Synchronize(
 
 // MockVotingProvider implements VotingProvider
 type MockVotingProvider struct {
-	logger       *zap.Logger
-	votes        map[string]*Vote
+	votes        map[string]*vote
 	currentRound uint64
 	voteTarget   int
 	mu           sync.Mutex
@@ -167,26 +259,22 @@ type MockVotingProvider struct {
 }
 
 func NewMockVotingProvider(
-	logger *zap.Logger,
 	voteTarget int,
 	nodeID string,
 ) *MockVotingProvider {
 	return &MockVotingProvider{
-		logger:     logger,
-		votes:      make(map[string]*Vote),
+		votes:      make(map[string]*vote),
 		voteTarget: voteTarget,
 		nodeID:     nodeID,
 	}
 }
 
 func NewMaliciousVotingProvider(
-	logger *zap.Logger,
 	voteTarget int,
 	nodeID string,
 ) *MockVotingProvider {
 	return &MockVotingProvider{
-		logger:      logger,
-		votes:       make(map[string]*Vote),
+		votes:       make(map[string]*vote),
 		voteTarget:  voteTarget,
 		isMalicious: true,
 		nodeID:      nodeID,
@@ -194,16 +282,18 @@ func NewMaliciousVotingProvider(
 }
 
 func (m *MockVotingProvider) SendProposal(
-	proposal *ConsensusData,
 	ctx context.Context,
+	proposal *consensusData,
 ) error {
-	m.logger.Info("sending proposal",
-		zap.Uint64("round", proposal.Round),
-		zap.String("hash", proposal.Hash))
+	log.Printf(
+		"sending proposal, round: %d, hash: %s\n",
+		proposal.Round,
+		proposal.Hash,
+	)
 
 	if m.messageBus != nil {
 		// Make a copy to avoid sharing pointers between nodes
-		proposalCopy := &ConsensusData{
+		proposalCopy := &consensusData{
 			Round:      proposal.Round,
 			Hash:       proposal.Hash,
 			Votes:      make(map[string]interface{}),
@@ -228,16 +318,18 @@ func (m *MockVotingProvider) SendProposal(
 }
 
 func (m *MockVotingProvider) DecideAndSendVote(
-	proposals map[consensus.Identity]*ConsensusData,
 	ctx context.Context,
-) (PeerID, *Vote, error) {
+	proposals map[consensus.Identity]*consensusData,
+) (peerID, *vote, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Log available proposals
-	m.logger.Info("deciding vote",
-		zap.Int("proposal_count", len(proposals)),
-		zap.String("node_id", m.nodeID))
+	log.Printf(
+		"deciding vote, proposal count: %d, node id: %s\n",
+		len(proposals),
+		m.nodeID,
+	)
 
 	nodes := []string{
 		"prover-node-1",
@@ -246,7 +338,7 @@ func (m *MockVotingProvider) DecideAndSendVote(
 		"validator-node-3",
 	}
 
-	var chosenProposal *ConsensusData
+	var chosenProposal *consensusData
 	var chosenID consensus.Identity
 	if len(proposals) > 3 {
 		leaderIdx := int(proposals[nodes[0]].Round % uint64(len(nodes)))
@@ -257,15 +349,17 @@ func (m *MockVotingProvider) DecideAndSendVote(
 			chosenProposal = proposals[nodes[(leaderIdx+1)%len(nodes)]]
 			chosenID = nodes[(leaderIdx+1)%len(nodes)]
 		}
-		m.logger.Info("found proposal",
-			zap.String("from", chosenID),
-			zap.Uint64("round", chosenProposal.Round))
+		log.Printf(
+			"found proposal, from: %s, round: %d\n",
+			chosenID,
+			chosenProposal.Round,
+		)
 	}
 	if chosenProposal == nil {
-		return PeerID{}, nil, fmt.Errorf("no proposals to vote on")
+		return peerID{}, nil, fmt.Errorf("no proposals to vote on")
 	}
 
-	vote := &Vote{
+	vt := &vote{
 		NodeID:     m.nodeID,
 		Round:      chosenProposal.Round,
 		VoteValue:  "approve",
@@ -273,21 +367,23 @@ func (m *MockVotingProvider) DecideAndSendVote(
 		ProposerID: chosenID,
 	}
 
-	m.votes[vote.NodeID] = vote
-	m.logger.Info("decided and sent vote",
-		zap.String("node_id", vote.NodeID),
-		zap.String("vote", vote.VoteValue),
-		zap.Uint64("round", vote.Round),
-		zap.String("for_proposal", chosenID))
+	m.votes[vt.NodeID] = vt
+	log.Printf(
+		"decided and sent vote, node id: %s, vote: %s, round: %d, for proposal: %s\n",
+		vt.NodeID,
+		vt.VoteValue,
+		vt.Round,
+		chosenID,
+	)
 
 	if m.messageBus != nil {
 		// Make a copy to avoid sharing pointers
-		voteCopy := &Vote{
-			NodeID:     vote.NodeID,
-			Round:      vote.Round,
-			VoteValue:  vote.VoteValue,
-			Timestamp:  vote.Timestamp,
-			ProposerID: vote.ProposerID,
+		voteCopy := &vote{
+			NodeID:     vt.NodeID,
+			Round:      vt.Round,
+			VoteValue:  vt.VoteValue,
+			Timestamp:  vt.Timestamp,
+			ProposerID: vt.ProposerID,
 		}
 		m.messageBus.Broadcast(Message{
 			Type:   "vote",
@@ -296,27 +392,29 @@ func (m *MockVotingProvider) DecideAndSendVote(
 		})
 	}
 
-	return PeerID{ID: chosenID}, vote, nil
+	return peerID{ID: chosenID}, vt, nil
 }
 
-func (m *MockVotingProvider) SendVote(vote *Vote, ctx context.Context) (
-	PeerID,
+func (m *MockVotingProvider) SendVote(ctx context.Context, vt *vote) (
+	peerID,
 	error,
 ) {
-	m.logger.Info("re-sent vote",
-		zap.String("node_id", vote.NodeID),
-		zap.String("vote", vote.VoteValue),
-		zap.Uint64("round", vote.Round),
-		zap.String("for_proposal", vote.ProposerID))
+	log.Printf(
+		"re-sent vote, node id: %s, vote: %s, round: %d, for proposal: %s\n",
+		vt.NodeID,
+		vt.VoteValue,
+		vt.Round,
+		vt.ProposerID,
+	)
 
 	if m.messageBus != nil {
 		// Make a copy to avoid sharing pointers
-		voteCopy := &Vote{
-			NodeID:     vote.NodeID,
-			Round:      vote.Round,
-			VoteValue:  vote.VoteValue,
-			Timestamp:  vote.Timestamp,
-			ProposerID: vote.ProposerID,
+		voteCopy := &vote{
+			NodeID:     vt.NodeID,
+			Round:      vt.Round,
+			VoteValue:  vt.VoteValue,
+			Timestamp:  vt.Timestamp,
+			ProposerID: vt.ProposerID,
 		}
 		m.messageBus.Broadcast(Message{
 			Type:   "vote",
@@ -324,18 +422,20 @@ func (m *MockVotingProvider) SendVote(vote *Vote, ctx context.Context) (
 			Data:   voteCopy,
 		})
 	}
-	return PeerID{ID: vote.ProposerID}, nil
+	return peerID{ID: vt.ProposerID}, nil
 }
 
 func (m *MockVotingProvider) IsQuorum(
-	proposalVotes map[consensus.Identity]*Vote,
 	ctx context.Context,
+	proposalVotes map[consensus.Identity]*vote,
 ) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.logger.Info("checking quorum",
-		zap.Int("target", m.voteTarget))
+	log.Printf(
+		"checking quorum, target: %d\n",
+		m.voteTarget,
+	)
 	totalVotes := 0
 	fmt.Printf("%s %+v\n", m.nodeID, proposalVotes)
 	voteCount := map[string]int{}
@@ -360,16 +460,18 @@ func (m *MockVotingProvider) IsQuorum(
 }
 
 func (m *MockVotingProvider) FinalizeVotes(
-	proposals map[consensus.Identity]*ConsensusData,
-	proposalVotes map[consensus.Identity]*Vote,
 	ctx context.Context,
-) (*ConsensusData, PeerID, error) {
+	proposals map[consensus.Identity]*consensusData,
+	proposalVotes map[consensus.Identity]*vote,
+) (*consensusData, peerID, error) {
 	// Count approvals
-	m.logger.Info("finalizing votes",
-		zap.Int("total_proposals", len(proposals)))
+	log.Printf(
+		"finalizing votes, total proposals: %d\n",
+		len(proposals),
+	)
 	winnerCount := 0
-	var winnerProposal *ConsensusData = nil
-	var winnerProposer PeerID
+	var winnerProposal *consensusData = nil
+	var winnerProposer peerID
 	voteCount := map[string]int{}
 	for _, votes := range proposalVotes {
 		count, ok := voteCount[votes.ProposerID]
@@ -379,7 +481,7 @@ func (m *MockVotingProvider) FinalizeVotes(
 			voteCount[votes.ProposerID] = count + 1
 		}
 	}
-	for peerID, proposal := range proposals {
+	for pid, proposal := range proposals {
 		if proposal == nil {
 			continue
 		}
@@ -387,16 +489,18 @@ func (m *MockVotingProvider) FinalizeVotes(
 		if voteCount > winnerCount {
 			winnerCount = voteCount
 			winnerProposal = proposal
-			winnerProposer = PeerID{ID: peerID}
+			winnerProposer = peerID{ID: pid}
 		}
 	}
 
-	m.logger.Info("vote summary",
-		zap.Int("approvals", winnerCount),
-		zap.Int("required", m.voteTarget))
+	log.Printf(
+		"vote summary, approvals: %d, required: %d\n",
+		winnerCount,
+		m.voteTarget,
+	)
 
 	if winnerCount < m.voteTarget {
-		return nil, PeerID{}, fmt.Errorf(
+		return nil, peerID{}, fmt.Errorf(
 			"not enough approvals: %d < %d",
 			winnerCount,
 			m.voteTarget,
@@ -410,7 +514,7 @@ func (m *MockVotingProvider) FinalizeVotes(
 	// Pick the first proposal
 	for id, prop := range proposals {
 		// Create a new finalized state based on the chosen proposal
-		finalizedState := &ConsensusData{
+		finalizedState := &consensusData{
 			Round:      prop.Round,
 			Hash:       prop.Hash,
 			Votes:      make(map[string]interface{}),
@@ -424,32 +528,36 @@ func (m *MockVotingProvider) FinalizeVotes(
 			finalizedState.Votes[k] = v
 		}
 
-		m.logger.Info("finalized state",
-			zap.Uint64("round", finalizedState.Round),
-			zap.String("hash", finalizedState.Hash),
-			zap.String("proposer", id))
-		return finalizedState, PeerID{ID: id}, nil
+		log.Printf(
+			"finalized state, round: %d, hash: %s, proposer: %d\n",
+			finalizedState.Round,
+			finalizedState.Hash,
+			id,
+		)
+		return finalizedState, peerID{ID: id}, nil
 	}
 
-	return nil, PeerID{}, fmt.Errorf("no proposals to finalize")
+	return nil, peerID{}, fmt.Errorf("no proposals to finalize")
 }
 
 func (m *MockVotingProvider) SendConfirmation(
-	finalized *ConsensusData,
 	ctx context.Context,
+	finalized *consensusData,
 ) error {
 	if finalized == nil {
-		m.logger.Warn("cannot send confirmation for nil state")
+		log.Println("cannot send confirmation for nil state")
 		return fmt.Errorf("cannot send confirmation for nil state")
 	}
 
-	m.logger.Info("sending confirmation",
-		zap.Uint64("round", finalized.Round),
-		zap.String("hash", finalized.Hash))
+	log.Printf(
+		"sending confirmation, round: %d, hash: %s\n",
+		finalized.Round,
+		finalized.Hash,
+	)
 
 	if m.messageBus != nil {
 		// Make a copy to avoid sharing pointers
-		confirmationCopy := &ConsensusData{
+		confirmationCopy := &consensusData{
 			Round:      finalized.Round,
 			Hash:       finalized.Hash,
 			Votes:      make(map[string]interface{}),
@@ -476,10 +584,10 @@ func (m *MockVotingProvider) SendConfirmation(
 func (m *MockVotingProvider) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.votes = make(map[string]*Vote)
-	m.logger.Info(
-		"reset voting provider",
-		zap.Uint64("current_round", m.currentRound),
+	m.votes = make(map[string]*vote)
+	log.Printf(
+		"reset voting provider, current round: %d\n",
+		m.currentRound,
 	)
 }
 
@@ -487,20 +595,19 @@ func (m *MockVotingProvider) SetRound(round uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.currentRound = round
-	m.logger.Info("voting provider round updated", zap.Uint64("round", round))
+	log.Printf("voting provider round updated, round: %d\n", round)
 }
 
 // MockLeaderProvider implements LeaderProvider
 type MockLeaderProvider struct {
-	logger   *zap.Logger
 	isProver bool
 	nodeID   string
 }
 
 func (m *MockLeaderProvider) GetNextLeaders(
-	prior *ConsensusData,
 	ctx context.Context,
-) ([]PeerID, error) {
+	prior *consensusData,
+) ([]peerID, error) {
 	// Simple round-robin leader selection
 	round := uint64(0)
 	if prior != nil {
@@ -516,36 +623,31 @@ func (m *MockLeaderProvider) GetNextLeaders(
 
 	// Select leader based on round
 	leaderIdx := int(round % uint64(len(nodes)))
-	leaders := []PeerID{
+	leaders := []peerID{
 		{ID: nodes[leaderIdx]},
 		{ID: nodes[uint64(leaderIdx+1)%uint64(len(nodes))]},
 		{ID: nodes[uint64(leaderIdx+2)%uint64(len(nodes))]},
 		{ID: nodes[uint64(leaderIdx+3)%uint64(len(nodes))]},
 	}
 
-	m.logger.Info("selected next leaders",
-		zap.Uint64("round", round),
-		zap.String("leader", leaders[0].ID))
+	fmt.Printf(
+		"selected next leaders, round: %d, leader: %s\n",
+		round,
+		leaders[0].ID,
+	)
 
 	return leaders, nil
 }
 
 func (m *MockLeaderProvider) ProveNextState(
-	prior *ConsensusData,
-	collected CollectedData,
 	ctx context.Context,
-) (*ConsensusData, error) {
+	prior *consensusData,
+	collected CollectedData,
+) (*consensusData, error) {
 	priorRound := uint64(0)
-	priorHash := "genesis"
 	if prior != nil {
 		priorRound = prior.Round
-		priorHash = prior.Hash
 	}
-
-	m.logger.Info("generating proof",
-		zap.Uint64("prior_round", priorRound),
-		zap.String("prior_hash", priorHash),
-		zap.Int("mutations", len(collected.Mutations)))
 
 	select {
 	case <-time.After(500 * time.Millisecond):
@@ -555,7 +657,7 @@ func (m *MockLeaderProvider) ProveNextState(
 			"prover":    m.nodeID,
 		}
 
-		newState := &ConsensusData{
+		newState := &consensusData{
 			Round:      priorRound + 1,
 			Hash:       fmt.Sprintf("block_%d", priorRound+1),
 			Votes:      make(map[string]interface{}),
@@ -573,7 +675,6 @@ func (m *MockLeaderProvider) ProveNextState(
 
 // MockLivenessProvider implements LivenessProvider
 type MockLivenessProvider struct {
-	logger     *zap.Logger
 	round      uint64
 	nodeID     string
 	messageBus *MessageBus
@@ -582,7 +683,7 @@ type MockLivenessProvider struct {
 func (m *MockLivenessProvider) Collect(
 	ctx context.Context,
 ) (CollectedData, error) {
-	m.logger.Info("collecting mutations")
+	fmt.Println("collecting mutations")
 
 	// Simulate collecting some mutations
 	mutations := []string{
@@ -599,18 +700,20 @@ func (m *MockLivenessProvider) Collect(
 }
 
 func (m *MockLivenessProvider) SendLiveness(
-	prior *ConsensusData,
-	collected CollectedData,
 	ctx context.Context,
+	prior *consensusData,
+	collected CollectedData,
 ) error {
 	round := uint64(0)
 	if prior != nil {
 		round = prior.Round
 	}
 
-	m.logger.Info("sending liveness signal",
-		zap.Uint64("round", round),
-		zap.Int("mutations", len(collected.Mutations)))
+	fmt.Printf(
+		"sending liveness signal, round: %d, mutations: %d\n",
+		round,
+		len(collected.Mutations),
+	)
 
 	if m.messageBus != nil {
 		// Make a copy to avoid sharing pointers
@@ -633,13 +736,18 @@ func (m *MockLivenessProvider) SendLiveness(
 
 // ConsensusNode represents a node using the generic state machine
 type ConsensusNode struct {
-	sm *consensus.StateMachine[
-		ConsensusData,
-		Vote,
-		PeerID,
+	p *pacemaker.Pacemaker[
+		consensusData,
+		vote,
+		peerID,
 		CollectedData,
 	]
-	logger           *zap.Logger
+	sm *consensus.StateMachine[
+		consensusData,
+		vote,
+		peerID,
+		CollectedData,
+	]
 	nodeID           string
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -655,13 +763,11 @@ func NewConsensusNode(
 	nodeID string,
 	isProver bool,
 	voteTarget int,
-	logger *zap.Logger,
 ) *ConsensusNode {
 	return newConsensusNodeWithBehavior(
 		nodeID,
 		isProver,
 		voteTarget,
-		logger,
 		false,
 	)
 }
@@ -671,13 +777,11 @@ func NewMaliciousNode(
 	nodeID string,
 	isProver bool,
 	voteTarget int,
-	logger *zap.Logger,
 ) *ConsensusNode {
 	return newConsensusNodeWithBehavior(
 		nodeID,
 		isProver,
 		voteTarget,
-		logger,
 		true,
 	)
 }
@@ -686,11 +790,10 @@ func newConsensusNodeWithBehavior(
 	nodeID string,
 	isProver bool,
 	voteTarget int,
-	logger *zap.Logger,
 	isMalicious bool,
 ) *ConsensusNode {
 	// Create initial consensus data
-	initialData := &ConsensusData{
+	initialData := &consensusData{
 		Round:      0,
 		Hash:       "genesis",
 		Votes:      make(map[string]interface{}),
@@ -700,29 +803,27 @@ func newConsensusNodeWithBehavior(
 	}
 
 	// Create mock implementations
-	syncProvider := &MockSyncProvider{logger: logger}
+	syncProvider := &MockSyncProvider{}
 
 	var votingProvider *MockVotingProvider
 	if isMalicious {
-		votingProvider = NewMaliciousVotingProvider(logger, voteTarget, nodeID)
+		votingProvider = NewMaliciousVotingProvider(voteTarget, nodeID)
 	} else {
-		votingProvider = NewMockVotingProvider(logger, voteTarget, nodeID)
+		votingProvider = NewMockVotingProvider(voteTarget, nodeID)
 	}
 
 	leaderProvider := &MockLeaderProvider{
-		logger:   logger,
 		isProver: isProver,
 		nodeID:   nodeID,
 	}
 
 	livenessProvider := &MockLivenessProvider{
-		logger: logger,
 		nodeID: nodeID,
 	}
 
 	// Create the state machine
-	sm := consensus.NewStateMachine(
-		PeerID{ID: nodeID},
+	sm := consensus.NewStateMachine[consensusData, vote, peerID, CollectedData](
+		peerID{ID: nodeID},
 		initialData,
 		true,
 		func() uint64 { return uint64(3) },
@@ -730,14 +831,36 @@ func newConsensusNodeWithBehavior(
 		votingProvider,
 		leaderProvider,
 		livenessProvider,
-		tracer{logger: logger},
+		tracer{},
 	)
+
+	p, err := pacemaker.NewPacemaker[consensusData, vote, peerID, CollectedData](
+		peerID{ID: nodeID},
+		func() *models.LivenessState {
+			return &models.LivenessState{
+				Filter:                      nil,
+				CurrentRank:                 0,
+				LatestQuorumCertificate:     &quorumCertificate{},
+				PriorRankTimeoutCertificate: nil,
+			}
+		},
+		func() uint64 { return uint64(3) },
+		votingProvider,
+		leaderProvider,
+		livenessProvider,
+		sm,
+		&store{},
+		tracer{},
+	)
+	if err != nil {
+		panic(err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	node := &ConsensusNode{
+		p:                p,
 		sm:               sm,
-		logger:           logger,
 		nodeID:           nodeID,
 		ctx:              ctx,
 		cancel:           cancel,
@@ -748,42 +871,40 @@ func newConsensusNodeWithBehavior(
 
 	// Add transition listener
 	sm.AddListener(&NodeTransitionListener{
-		logger: logger,
-		node:   node,
+		node: node,
 	})
 
 	return node
 }
 
 type tracer struct {
-	logger *zap.Logger
 }
 
 // Error implements consensus.TraceLogger.
 func (t tracer) Error(message string, err error) {
-	t.logger.Error(message, zap.Error(err))
+	fmt.Println(message, err)
 }
 
 // Trace implements consensus.TraceLogger.
 func (t tracer) Trace(message string) {
-	t.logger.Debug(message)
+	fmt.Println(message)
 }
 
 // Start begins the consensus node
 func (n *ConsensusNode) Start() error {
-	n.logger.Info("starting consensus node", zap.String("node_id", n.nodeID))
+	fmt.Printf("starting consensus node, node id: %s\n", n.nodeID)
 
 	// Start monitoring for messages
 	go n.monitor()
 
-	return n.sm.Start()
+	return n.p.Start(n.ctx)
 }
 
 // Stop halts the consensus node
 func (n *ConsensusNode) Stop() error {
-	n.logger.Info("stopping consensus node", zap.String("node_id", n.nodeID))
+	fmt.Printf("stopping consensus node, node id: %s\n", n.nodeID)
 	n.cancel()
-	return n.sm.Stop()
+	return nil
 }
 
 // SetMessageBus connects the node to the message bus
@@ -814,38 +935,39 @@ func (n *ConsensusNode) monitor() {
 
 // handleMessage processes messages from other nodes
 func (n *ConsensusNode) handleMessage(msg Message) {
-	n.logger.Debug("received message",
-		zap.String("type", msg.Type),
-		zap.String("from", msg.Sender))
+	fmt.Printf(
+		"received message, type: %s, from: %s\n",
+		msg.Type,
+		msg.Sender,
+	)
 
 	switch msg.Type {
 	case "proposal":
-		if proposal, ok := msg.Data.(*ConsensusData); ok {
-			n.sm.ReceiveProposal(PeerID{ID: msg.Sender}, proposal)
+		if proposal, ok := msg.Data.(*consensusData); ok {
+			n.sm.ReceiveProposal(proposal.Round, peerID{ID: msg.Sender}, proposal)
 		}
 	case "vote":
-		if vote, ok := msg.Data.(*Vote); ok {
+		if vote, ok := msg.Data.(*vote); ok {
 			n.sm.ReceiveVote(
-				PeerID{ID: vote.ProposerID},
-				PeerID{ID: msg.Sender},
+				peerID{ID: vote.ProposerID},
+				peerID{ID: msg.Sender},
 				vote,
 			)
 		}
 	case "liveness_check":
 		if collected, ok := msg.Data.(CollectedData); ok {
-			n.sm.ReceiveLivenessCheck(PeerID{ID: msg.Sender}, collected)
+			n.sm.ReceiveLivenessCheck(peerID{ID: msg.Sender}, collected)
 		}
 	case "confirmation":
-		if confirmation, ok := msg.Data.(*ConsensusData); ok {
-			n.sm.ReceiveConfirmation(PeerID{ID: msg.Sender}, confirmation)
+		if confirmation, ok := msg.Data.(*consensusData); ok {
+			n.sm.ReceiveConfirmation(peerID{ID: msg.Sender}, confirmation)
 		}
 	}
 }
 
 // NodeTransitionListener handles state transitions
 type NodeTransitionListener struct {
-	logger *zap.Logger
-	node   *ConsensusNode
+	node *ConsensusNode
 }
 
 func (l *NodeTransitionListener) OnTransition(
@@ -853,11 +975,13 @@ func (l *NodeTransitionListener) OnTransition(
 	to consensus.State,
 	event consensus.Event,
 ) {
-	l.logger.Info("state transition",
-		zap.String("node_id", l.node.nodeID),
-		zap.String("from", string(from)),
-		zap.String("to", string(to)),
-		zap.String("event", string(event)))
+	fmt.Printf(
+		"state transition, node id: %s, from: %s, to: %s, event: %s\n",
+		l.node.nodeID,
+		string(from),
+		string(to),
+		string(event),
+	)
 
 	// Handle state-specific actions
 	switch to {
@@ -878,9 +1002,9 @@ func (l *NodeTransitionListener) handleEnterVoting() {
 
 	// Malicious nodes exhibit Byzantine behavior
 	if l.node.isMalicious {
-		l.logger.Warn(
-			"MALICIOUS NODE: Executing Byzantine behavior",
-			zap.String("node_id", l.node.nodeID),
+		fmt.Printf(
+			"MALICIOUS NODE: Executing Byzantine behavior, node id: %s\n",
+			l.node.nodeID,
 		)
 
 		// Byzantine behavior: Send different votes to different nodes
@@ -898,7 +1022,7 @@ func (l *NodeTransitionListener) handleEnterVoting() {
 			}
 
 			// Create conflicting vote
-			vote := &Vote{
+			vt := &vote{
 				NodeID:     l.node.nodeID,
 				Round:      0, // Will be updated based on proposals
 				VoteValue:  voteValues[i],
@@ -906,21 +1030,21 @@ func (l *NodeTransitionListener) handleEnterVoting() {
 				ProposerID: targetNode,
 			}
 
-			l.logger.Warn(
-				"MALICIOUS: Sending conflicting vote",
-				zap.String("node_id", l.node.nodeID),
-				zap.String("target", targetNode),
-				zap.String("vote", voteValues[i]),
+			fmt.Printf(
+				"MALICIOUS: Sending conflicting vote, node id: %s, target: %s, vote: %s\n",
+				l.node.nodeID,
+				targetNode,
+				voteValues[i],
 			)
 
 			if i == 0 && l.node.messageBus != nil {
 				// Make a copy to avoid sharing pointers
-				voteCopy := &Vote{
-					NodeID:     vote.NodeID,
-					Round:      vote.Round,
-					VoteValue:  vote.VoteValue,
-					Timestamp:  vote.Timestamp,
-					ProposerID: vote.ProposerID,
+				voteCopy := &vote{
+					NodeID:     vt.NodeID,
+					Round:      vt.Round,
+					VoteValue:  vt.VoteValue,
+					Timestamp:  vt.Timestamp,
+					ProposerID: vt.ProposerID,
 				}
 				l.node.messageBus.Broadcast(Message{
 					Type:   "vote",
@@ -932,7 +1056,7 @@ func (l *NodeTransitionListener) handleEnterVoting() {
 
 		// Also try to vote multiple times with same value
 		time.Sleep(100 * time.Millisecond)
-		doubleVote := &Vote{
+		doubleVote := &vote{
 			NodeID:     l.node.nodeID,
 			Round:      0,
 			VoteValue:  "approve",
@@ -940,20 +1064,20 @@ func (l *NodeTransitionListener) handleEnterVoting() {
 			ProposerID: nodes[0],
 		}
 
-		l.logger.Warn(
-			"MALICIOUS: Attempting double vote",
-			zap.String("node_id", l.node.nodeID),
+		fmt.Printf(
+			"MALICIOUS: Attempting double vote, node id: %s\n",
+			l.node.nodeID,
 		)
 
 		l.node.sm.ReceiveVote(
-			PeerID{ID: nodes[0]},
-			PeerID{ID: l.node.nodeID},
+			peerID{ID: nodes[0]},
+			peerID{ID: l.node.nodeID},
 			doubleVote,
 		)
 
 		if l.node.messageBus != nil {
 			// Make a copy to avoid sharing pointers
-			doubleVoteCopy := &Vote{
+			doubleVoteCopy := &vote{
 				NodeID:     doubleVote.NodeID,
 				Round:      doubleVote.Round,
 				VoteValue:  doubleVote.VoteValue,
@@ -970,21 +1094,27 @@ func (l *NodeTransitionListener) handleEnterVoting() {
 		return
 	}
 
-	l.logger.Info("entering voting state",
-		zap.String("node_id", l.node.nodeID))
+	fmt.Printf(
+		"entering voting state, node id: %s\n",
+		l.node.nodeID,
+	)
 }
 
 func (l *NodeTransitionListener) handleEnterCollecting() {
-	l.logger.Info("entered collecting state",
-		zap.String("node_id", l.node.nodeID))
+	fmt.Printf(
+		"entered collecting state, node id: %s\n",
+		l.node.nodeID,
+	)
 
 	// Reset vote handler for new round
 	l.node.votingProvider.Reset()
 }
 
 func (l *NodeTransitionListener) handleEnterPublishing() {
-	l.logger.Info("entered publishing state",
-		zap.String("node_id", l.node.nodeID))
+	fmt.Printf(
+		"entered publishing state, node id: %s\n",
+		l.node.nodeID,
+	)
 }
 
 // MessageBus simulates network communication
@@ -1029,9 +1159,6 @@ func (mb *MessageBus) Broadcast(msg Message) {
 }
 
 func main() {
-	logger, _ := zap.NewDevelopment()
-	defer logger.Sync()
-
 	// Create message bus
 	messageBus := NewMessageBus()
 
@@ -1039,10 +1166,10 @@ func main() {
 	// Note: We need 4 nodes total with vote target of 3 to demonstrate Byzantine
 	// fault tolerance
 	nodes := []*ConsensusNode{
-		NewConsensusNode("prover-node-1", true, 3, logger.Named("prover")),
-		NewConsensusNode("validator-node-1", true, 3, logger.Named("validator1")),
-		NewConsensusNode("validator-node-2", true, 3, logger.Named("validator2")),
-		NewMaliciousNode("validator-node-3", false, 3, logger.Named("malicious")),
+		NewConsensusNode("prover-node-1", true, 3),
+		NewConsensusNode("validator-node-1", true, 3),
+		NewConsensusNode("validator-node-2", true, 3),
+		NewMaliciousNode("validator-node-3", false, 3),
 	}
 
 	// Connect nodes to message bus
@@ -1051,15 +1178,17 @@ func main() {
 	}
 
 	// Start all nodes
-	logger.Info("=== Starting Consensus Network with Generic State Machine ===")
-	logger.Info("Using the generic state machine from consensus package")
-	logger.Warn("Network includes 1 MALICIOUS node (validator-node-3) demonstrating Byzantine behavior")
+	fmt.Println("=== Starting Consensus Network with Generic State Machine ===")
+	fmt.Println("Using the generic state machine from consensus package")
+	fmt.Println("Network includes 1 MALICIOUS node (validator-node-3) demonstrating Byzantine behavior")
 
 	for _, node := range nodes {
 		if err := node.Start(); err != nil {
-			logger.Fatal("failed to start node",
-				zap.String("node_id", node.nodeID),
-				zap.Error(err))
+			fmt.Printf(
+				"failed to start node, node id: %s, %v\n",
+				node.nodeID,
+				err,
+			)
 		}
 	}
 
@@ -1067,34 +1196,38 @@ func main() {
 	time.Sleep(30 * time.Second)
 
 	// Print statistics
-	logger.Info("=== Node Statistics ===")
+	fmt.Println("=== Node Statistics ===")
 	for _, node := range nodes {
 		viz := consensus.NewStateMachineViz(node.sm)
 
-		logger.Info(fmt.Sprintf("\nStats for %s:\n%s",
+		fmt.Printf("\nStats for %s:\n%s",
 			node.nodeID,
-			viz.GetStateStats()))
+			viz.GetStateStats())
 
-		logger.Info("final state",
-			zap.String("node_id", node.nodeID),
-			zap.String("current_state", string(node.sm.GetState())),
-			zap.Uint64("transition_count", node.sm.GetTransitionCount()),
-			zap.Bool("is_malicious", node.isMalicious))
+		fmt.Printf(
+			"final state, node id: %s, current state: %s, transition count: %s, malicious: %v\n",
+			node.nodeID,
+			string(node.sm.GetState()),
+			node.sm.GetTransitionCount(),
+			node.isMalicious,
+		)
 	}
 
 	// Generate visualization
 	if len(nodes) > 0 {
 		viz := consensus.NewStateMachineViz(nodes[0].sm)
-		logger.Info("\nState Machine Diagram:\n" + viz.GenerateMermaidDiagram())
+		fmt.Println("\nState Machine Diagram:\n" + viz.GenerateMermaidDiagram())
 	}
 
 	// Stop all nodes
-	logger.Info("=== Stopping Consensus Network ===")
+	fmt.Println("=== Stopping Consensus Network ===")
 	for _, node := range nodes {
 		if err := node.Stop(); err != nil {
-			logger.Error("failed to stop node",
-				zap.String("node_id", node.nodeID),
-				zap.Error(err))
+			fmt.Printf(
+				"failed to stop node, node id: %s, %v\n",
+				node.nodeID,
+				err,
+			)
 		}
 	}
 

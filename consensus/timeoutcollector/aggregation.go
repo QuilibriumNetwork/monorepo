@@ -177,7 +177,7 @@ func (a *TimeoutSignatureAggregator) Rank() uint64 {
 	return a.rank
 }
 
-// Aggregate aggregates the signatures and returns the aggregated signature.
+// Aggregate aggregates the signatures and returns the aggregated consensus.
 // The resulting aggregated signature is guaranteed to be valid, as all
 // individual signatures are pre-validated before their addition. Expected
 // errors during normal operations:

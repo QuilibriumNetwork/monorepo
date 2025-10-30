@@ -71,6 +71,7 @@ func NewTimeoutProcessor[
 	validator consensus.Validator[StateT, VoteT],
 	sigAggregator consensus.TimeoutSignatureAggregator,
 	notifier consensus.TimeoutCollectorConsumer[VoteT],
+	voting consensus.VotingProvider[StateT, VoteT, PeerIDT],
 ) (*TimeoutProcessor[StateT, VoteT, PeerIDT], error) {
 	rank := sigAggregator.Rank()
 	qcThreshold, err := committee.QuorumThresholdForRank(rank)
@@ -105,6 +106,7 @@ func NewTimeoutProcessor[
 		},
 		sigAggregator:   sigAggregator,
 		newestQCTracker: tracker.NewNewestQCTracker(),
+		voting:          voting,
 	}, nil
 }
 
@@ -159,7 +161,7 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) Process(
 	p.newestQCTracker.Track(&timeout.LatestQuorumCertificate)
 
 	totalWeight, err := p.sigAggregator.VerifyAndAdd(
-		(*timeout.Vote).Source(),
+		(*timeout.Vote).Identity(),
 		(*timeout.Vote).GetSignature(),
 		timeout.LatestQuorumCertificate.GetRank(),
 	)
@@ -309,7 +311,7 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) validateTimeout(
 	// 3. If TC is included, it must be valid
 	if timeout.PriorRankTimeoutCertificate != nil {
 		err = p.validator.ValidateTimeoutCertificate(
-			&timeout.PriorRankTimeoutCertificate,
+			timeout.PriorRankTimeoutCertificate,
 		)
 		if err != nil {
 			if models.IsInvalidTimeoutCertificateError(err) {

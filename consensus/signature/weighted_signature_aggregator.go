@@ -17,11 +17,11 @@ type signerInfo struct {
 }
 
 // WeightedSignatureAggregator implements consensus.WeightedSignatureAggregator.
-// It is a wrapper around signature.SignatureAggregatorSameMessage, which
+// It is a wrapper around consensus.SignatureAggregatorSameMessage, which
 // implements a mapping from node IDs (as used by HotStuff) to index-based
 // addressing of authorized signers (as used by SignatureAggregatorSameMessage).
 //
-// Similarly to module/signature.SignatureAggregatorSameMessage, this module
+// Similarly to module/consensus.SignatureAggregatorSameMessage, this module
 // assumes proofs of possession (PoP) of all identity public keys are valid.
 type WeightedSignatureAggregator struct {
 	aggregator  consensus.SignatureAggregator
@@ -166,7 +166,7 @@ func (w *WeightedSignatureAggregator) TotalWeight() uint64 {
 	return w.totalWeight
 }
 
-// Aggregate aggregates the signatures and returns the aggregated signature.
+// Aggregate aggregates the signatures and returns the aggregated consensus.
 // The function performs a final verification and errors if the aggregated
 // signature is invalid. This is required for the function safety since
 // `TrustedAdd` allows adding invalid signatures. The function errors with:

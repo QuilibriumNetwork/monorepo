@@ -242,12 +242,7 @@ func (v *Validator[StateT, VoteT]) ValidateQuorumCertificate(
 	err = v.verifier.VerifyQuorumCertificate(qc)
 	if err != nil {
 		// Considerations about other errors that `VerifyQC` could return:
-		//  * models.InvalidSignerError: for the time being, we assume that _every_
-		//    HotStuff participant is also a member of the random beacon committee.
-		//    Consequently, `InvalidSignerError` should not occur atm.
-		//    TODO: if the random beacon committee is a strict subset of the
-		//          HotStuff committee, we expect `models.InvalidSignerError` here
-		//          during normal operations.
+		// * models.InvalidSignerError
 		// * models.InsufficientSignaturesError: we previously checked the total
 		//   weight of all signers meets the supermajority threshold, which is a
 		//   _positive_ number. Hence, there must be at least one signer. Hence,
@@ -470,12 +465,7 @@ func (v *Validator[StateT, VoteT]) ValidateVote(vote *VoteT) (
 	err = v.verifier.VerifyVote(vote)
 	if err != nil {
 		// Theoretically, `VerifyVote` could also return a
-		// `models.InvalidSignerError`. However, for the time being, we assume that
-		// _every_ HotStuff participant is also a member of the random beacon
-		// committee. Consequently, `InvalidSignerError` should not occur atm.
-		// TODO: if the random beacon committee is a strict subset of the HotStuff
-		//       committee, we expect `models.InvalidSignerError` here during normal
-		//       operations.
+		// `models.InvalidSignerError`.
 		if models.IsInvalidFormatError(err) ||
 			errors.Is(err, models.ErrInvalidSignature) {
 			return nil, newInvalidVoteError(vote, err)

@@ -17,13 +17,17 @@ import (
 // `consensus.VoteProcessorFactory` by itself. The VoteProcessorFactory adds the
 // missing logic to verify the proposer's vote, by wrapping the baseFactory
 // (decorator pattern).
-type baseFactory[StateT models.Unique, VoteT models.Unique] func(
+type baseFactory[
+	StateT models.Unique,
+	VoteT models.Unique,
+	PeerIDT models.Unique,
+] func(
 	tracer consensus.TraceLogger,
 	state *models.State[StateT],
-) (
-	consensus.VerifyingVoteProcessor[StateT, VoteT],
-	error,
-)
+	dsTag []byte,
+	aggregator consensus.SignatureAggregator,
+	votingProvider consensus.VotingProvider[StateT, VoteT, PeerIDT],
+) (consensus.VerifyingVoteProcessor[StateT, VoteT], error)
 
 // VoteProcessorFactory implements `consensus.VoteProcessorFactory`. Its main
 // purpose is to construct instances of VerifyingVoteProcessors for a given
@@ -34,21 +38,34 @@ type baseFactory[StateT models.Unique, VoteT models.Unique] func(
 // Thereby, VoteProcessorFactory guarantees that only proposals with valid
 // proposer vote are accepted (as per API specification). Otherwise, an
 // `models.InvalidProposalError` is returned.
-type VoteProcessorFactory[StateT models.Unique, VoteT models.Unique] struct {
-	baseFactory baseFactory[StateT, VoteT]
+type VoteProcessorFactory[
+	StateT models.Unique,
+	VoteT models.Unique,
+	PeerIDT models.Unique,
+] struct {
+	baseFactory baseFactory[StateT, VoteT, PeerIDT]
 }
 
-var _ consensus.VoteProcessorFactory[*nilUnique, *nilUnique] = (*VoteProcessorFactory[*nilUnique, *nilUnique])(nil)
+var _ consensus.VoteProcessorFactory[*nilUnique, *nilUnique, *nilUnique] = (*VoteProcessorFactory[*nilUnique, *nilUnique, *nilUnique])(nil)
 
 // Create instantiates a VerifyingVoteProcessor for the given state proposal.
 // A VerifyingVoteProcessor are only created for proposals with valid proposer
 // votes. Expected error returns during normal operations:
 // * models.InvalidProposalError - proposal has invalid proposer vote
-func (f *VoteProcessorFactory[StateT, VoteT]) Create(
+func (f *VoteProcessorFactory[StateT, VoteT, PeerIDT]) Create(
 	tracer consensus.TraceLogger,
 	proposal *models.SignedProposal[StateT, VoteT],
+	dsTag []byte,
+	aggregator consensus.SignatureAggregator,
+	votingProvider consensus.VotingProvider[StateT, VoteT, PeerIDT],
 ) (consensus.VerifyingVoteProcessor[StateT, VoteT], error) {
-	processor, err := f.baseFactory(tracer, proposal.State)
+	processor, err := f.baseFactory(
+		tracer,
+		proposal.State,
+		dsTag,
+		aggregator,
+		votingProvider,
+	)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"instantiating vote processor for state %v failed: %w",
@@ -88,12 +105,12 @@ func NewVoteProcessorFactory[
 ](
 	committee consensus.DynamicCommittee,
 	onQCCreated consensus.OnQuorumCertificateCreated,
-) *VoteProcessorFactory[StateT, VoteT] {
+) *VoteProcessorFactory[StateT, VoteT, PeerIDT] {
 	base := &provingVoteProcessorFactoryBase[StateT, VoteT, PeerIDT]{
 		committee:   committee,
 		onQCCreated: onQCCreated,
 	}
-	return &VoteProcessorFactory[StateT, VoteT]{
+	return &VoteProcessorFactory[StateT, VoteT, PeerIDT]{
 		baseFactory: base.Create,
 	}
 }
@@ -113,12 +130,15 @@ func NewBootstrapVoteProcessor[
 	committee consensus.DynamicCommittee,
 	state *models.State[StateT],
 	onQCCreated consensus.OnQuorumCertificateCreated,
+	dsTag []byte,
+	aggregator consensus.SignatureAggregator,
+	votingProvider consensus.VotingProvider[StateT, VoteT, PeerIDT],
 ) (consensus.VerifyingVoteProcessor[StateT, VoteT], error) {
 	factory := &provingVoteProcessorFactoryBase[StateT, VoteT, PeerIDT]{
 		committee:   committee,
 		onQCCreated: onQCCreated,
 	}
-	return factory.Create(tracer, state)
+	return factory.Create(tracer, state, dsTag, aggregator, votingProvider)
 }
 
 // Type used to satisfy generic arguments in compiler time type assertion check

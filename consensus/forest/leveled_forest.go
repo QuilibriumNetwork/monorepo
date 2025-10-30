@@ -229,8 +229,8 @@ func (f *LevelledForest) registerWithParent(vertexContainer *vertexContainer) {
 		return
 	}
 
-	_, parentView := vertexContainer.vertex.Parent()
-	if parentView < f.LowestLevel {
+	_, parentRank := vertexContainer.vertex.Parent()
+	if parentRank < f.LowestLevel {
 		return
 	}
 	parentContainer := f.getOrCreateVertexContainer(

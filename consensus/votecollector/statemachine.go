@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/rs/zerolog"
 	"go.uber.org/atomic"
 
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/voteaggregator"
 )
 
@@ -29,7 +30,7 @@ type VerifyingVoteProcessorFactory[
 // states of vote collector
 type VoteCollector[StateT models.Unique, VoteT models.Unique] struct {
 	sync.Mutex
-	log                      zerolog.Logger
+	tracer                   consensus.TraceLogger
 	workers                  consensus.Workers
 	notifier                 consensus.VoteAggregationConsumer[StateT, VoteT]
 	createVerifyingProcessor VerifyingVoteProcessorFactory[StateT, VoteT]
@@ -81,16 +82,16 @@ func NewStateMachine[StateT models.Unique, VoteT models.Unique](
 	verifyingVoteProcessorFactory VerifyingVoteProcessorFactory[StateT, VoteT],
 ) *VoteCollector[StateT, VoteT] {
 	sm := &VoteCollector[StateT, VoteT]{
-		tracer: tracer
+		tracer:                   tracer,
 		workers:                  workers,
 		notifier:                 notifier,
 		createVerifyingProcessor: verifyingVoteProcessorFactory,
-		votesCache:               *NewVotesCache[StateT, VoteT](rank),
+		votesCache:               *NewVotesCache[VoteT](rank),
 	}
 
 	// without a state, we don't process votes (only cache them)
-	sm.votesProcessor.Store(&atomicValueWrapper{
-		processor: NewNoopCollector(consensus.VoteCollectorStatusCaching),
+	sm.votesProcessor.Store(&atomicValueWrapper[VoteT]{
+		processor: NewNoopCollector[VoteT](consensus.VoteCollectorStatusCaching),
 	})
 	return sm
 }
@@ -105,7 +106,7 @@ func (m *VoteCollector[StateT, VoteT]) AddVote(vote *VoteT) error {
 		if errors.Is(err, RepeatedVoteErr) {
 			return nil
 		}
-		doubleVoteErr, isDoubleVoteErr := models.AsDoubleVoteError(err)
+		doubleVoteErr, isDoubleVoteErr := models.AsDoubleVoteError[VoteT](err)
 		if isDoubleVoteErr {
 			m.notifier.OnDoubleVotingDetected(
 				doubleVoteErr.FirstVote,
@@ -115,8 +116,8 @@ func (m *VoteCollector[StateT, VoteT]) AddVote(vote *VoteT) error {
 		}
 		return fmt.Errorf(
 			"internal error adding vote %v to cache for state %v: %w",
-			vote.ID(),
-			vote.Identifier,
+			(*vote).Identity(),
+			(*vote).Source(),
 			err,
 		)
 	}
@@ -143,8 +144,8 @@ func (m *VoteCollector[StateT, VoteT]) AddVote(vote *VoteT) error {
 		}
 		return fmt.Errorf(
 			"internal error processing vote %v for state %v: %w",
-			vote.ID(),
-			vote.Identifier,
+			(*vote).Identity(),
+			(*vote).Source(),
 			err,
 		)
 	}
@@ -159,7 +160,7 @@ func (m *VoteCollector[StateT, VoteT]) processVote(vote *VoteT) error {
 		currentState := processor.Status()
 		err := processor.Process(vote)
 		if err != nil {
-			if invalidVoteErr, ok := models.AsInvalidVoteError(err); ok {
+			if invalidVoteErr, ok := models.AsInvalidVoteError[VoteT](err); ok {
 				m.notifier.OnInvalidVoteDetected(*invalidVoteErr)
 				return nil
 			}
@@ -168,7 +169,7 @@ func (m *VoteCollector[StateT, VoteT]) processVote(vote *VoteT) error {
 			// double voting. This scenario is possible if leader submits their vote
 			// additionally to the vote in proposal.
 			if models.IsDuplicatedSignerError(err) {
-				m.tracer.Trace(fmt.Sprintf("duplicated signer %x", vote.SignerID))
+				m.tracer.Trace(fmt.Sprintf("duplicated signer %x", (*vote).Identity()))
 				return nil
 			}
 			return err
@@ -207,7 +208,9 @@ func (m *VoteCollector[StateT, VoteT]) Rank() uint64 {
 //	CachingVotes   -> VerifyingVotes
 //	CachingVotes   -> Invalid
 //	VerifyingVotes -> Invalid
-func (m *VoteCollector[StateT, VoteT]) ProcessState(proposal *models.SignedProposal) error {
+func (m *VoteCollector[StateT, VoteT]) ProcessState(
+	proposal *models.SignedProposal[StateT, VoteT],
+) error {
 
 	if proposal.State.Rank != m.Rank() {
 		return fmt.Errorf(
@@ -240,9 +243,7 @@ func (m *VoteCollector[StateT, VoteT]) ProcessState(proposal *models.SignedPropo
 				)
 			}
 
-			m.log.Info().
-				Hex("state_id", proposal.State.Identifier[:]).
-				Msg("vote collector status changed from caching to verifying")
+			m.tracer.Trace("vote collector status changed from caching to verifying")
 
 			m.processCachedVotes(proposal.State)
 
@@ -251,7 +252,7 @@ func (m *VoteCollector[StateT, VoteT]) ProcessState(proposal *models.SignedPropo
 		// Note: proposal equivocation is handled by consensus.Forks, so we don't
 		// have to do anything else here.
 		case consensus.VoteCollectorStatusVerifying:
-			verifyingProc, ok := proc.(consensus.VerifyingVoteProcessor)
+			verifyingProc, ok := proc.(consensus.VerifyingVoteProcessor[StateT, VoteT])
 			if !ok {
 				return fmt.Errorf(
 					"while processing state %v, found that VoteProcessor reports status %s but has an incompatible implementation type %T",
@@ -296,25 +297,33 @@ func (m *VoteCollector[StateT, VoteT]) RegisterVoteConsumer(
 // `VoteCollectorStatusCaching` and replaces it by a newly-created
 // VerifyingVoteProcessor.
 // Error returns:
-// * ErrDifferentCollectorState if the VoteCollector's state is _not_
-//   `CachingVotes`
-// * all other errors are unexpected and potential symptoms of internal bugs or
-//   state corruption (fatal)
+//   - ErrDifferentCollectorState if the VoteCollector's state is _not_
+//     `CachingVotes`
+//   - all other errors are unexpected and potential symptoms of internal bugs
+//     or state corruption (fatal)
 func (m *VoteCollector[StateT, VoteT]) caching2Verifying(
 	proposal *models.SignedProposal[StateT, VoteT],
 ) error {
 	stateID := proposal.State.Identifier
-	newProc, err := m.createVerifyingProcessor(m.log, proposal)
+	newProc, err := m.createVerifyingProcessor(m.tracer, proposal)
 	if err != nil {
-		return fmt.Errorf("failed to create VerifyingVoteProcessor for state %v: %w", stateID, err)
+		return fmt.Errorf(
+			"failed to create VerifyingVoteProcessor for state %v: %w",
+			stateID,
+			err,
+		)
 	}
-	newProcWrapper := &atomicValueWrapper{processor: newProc}
+	newProcWrapper := &atomicValueWrapper[VoteT]{processor: newProc}
 
 	m.Lock()
 	defer m.Unlock()
 	proc := m.atomicLoadProcessor()
 	if proc.Status() != consensus.VoteCollectorStatusCaching {
-		return fmt.Errorf("processors's current state is %s: %w", proc.Status().String(), ErrDifferentCollectorState)
+		return fmt.Errorf(
+			"processors's current state is %s: %w",
+			proc.Status().String(),
+			ErrDifferentCollectorState,
+		)
 	}
 	m.votesProcessor.Store(newProcWrapper)
 	return nil
@@ -324,8 +333,8 @@ func (m *VoteCollector[StateT, VoteT]) terminateVoteProcessing() {
 	if m.Status() == consensus.VoteCollectorStatusInvalid {
 		return
 	}
-	newProcWrapper := &atomicValueWrapper{
-		processor: NewNoopCollector(consensus.VoteCollectorStatusInvalid),
+	newProcWrapper := &atomicValueWrapper[VoteT]{
+		processor: NewNoopCollector[VoteT](consensus.VoteCollectorStatusInvalid),
 	}
 
 	m.Lock()
@@ -334,11 +343,13 @@ func (m *VoteCollector[StateT, VoteT]) terminateVoteProcessing() {
 }
 
 // processCachedVotes feeds all cached votes into the VoteProcessor
-func (m *VoteCollector[StateT, VoteT]) processCachedVotes(state *models.State) {
+func (m *VoteCollector[StateT, VoteT]) processCachedVotes(
+	state *models.State[StateT],
+) {
 	cachedVotes := m.votesCache.All()
-	m.log.Info().Msgf("processing %d cached votes", len(cachedVotes))
+	m.tracer.Trace(fmt.Sprintf("processing %d cached votes", len(cachedVotes)))
 	for _, vote := range cachedVotes {
-		if vote.Identifier != state.Identifier {
+		if (*vote).Source() != state.Identifier {
 			continue
 		}
 
@@ -346,7 +357,7 @@ func (m *VoteCollector[StateT, VoteT]) processCachedVotes(state *models.State) {
 		voteProcessingTask := func() {
 			err := m.processVote(stateVote)
 			if err != nil {
-				m.log.Fatal().Err(err).Msg("internal error processing cached vote")
+				m.tracer.Error("internal error processing cached vote", err)
 			}
 		}
 		m.workers.Submit(voteProcessingTask)

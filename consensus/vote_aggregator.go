@@ -24,7 +24,7 @@ type VoteAggregator[StateT models.Unique, VoteT models.Unique] interface {
 	// `VoteAggregator` and processed _asynchronously_ by the VoteAggregator's
 	// internal worker routines.
 	// CAUTION: we expect that the input state's validity has been confirmed prior
-	// to calling AddState, including the proposer's signature. Otherwise,
+	// to calling AddState, including the proposer's consensus. Otherwise,
 	// VoteAggregator might crash or exhibit undefined behaviour.
 	AddState(state *models.SignedProposal[StateT, VoteT])
 

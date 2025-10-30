@@ -354,7 +354,7 @@ func (f *Forks[StateT, VoteT]) AddValidatedState(
 			err,
 		)
 	}
-	err = f.checkForAdvancingFinalization(&certifiedParent)
+	err = f.checkForAdvancingFinalization(certifiedParent)
 	if err != nil {
 		return fmt.Errorf("updating finalization failed: %w", err)
 	}
@@ -650,39 +650,3 @@ func (f *Forks[StateT, VoteT]) collectStatesForFinalization(
 
 	return statesToBeFinalized, nil
 }
-
-// Type used to satisfy generic arguments in compiler time type assertion check
-type nilUnique struct{}
-
-// GetSignature implements models.Unique.
-func (n *nilUnique) GetSignature() []byte {
-	panic("unimplemented")
-}
-
-// GetTimestamp implements models.Unique.
-func (n *nilUnique) GetTimestamp() uint64 {
-	panic("unimplemented")
-}
-
-// Source implements models.Unique.
-func (n *nilUnique) Source() models.Identity {
-	panic("unimplemented")
-}
-
-// Clone implements models.Unique.
-func (n *nilUnique) Clone() models.Unique {
-	panic("unimplemented")
-}
-
-// GetRank implements models.Unique.
-func (n *nilUnique) GetRank() uint64 {
-	panic("unimplemented")
-}
-
-// Identity implements models.Unique.
-func (n *nilUnique) Identity() models.Identity {
-	panic("unimplemented")
-}
-
-var _ models.Unique = (*nilUnique)(nil)
-

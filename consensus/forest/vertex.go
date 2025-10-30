@@ -20,7 +20,7 @@ type Vertex interface {
 func VertexToString(v Vertex) string {
 	parentID, parentLevel := v.Parent()
 	return fmt.Sprintf(
-		"<id=%x level=%d parent_id=%d parent_level=%d>",
+		"<id=%x level=%d parent_id=%s parent_level=%d>",
 		v.VertexID(),
 		v.Level(),
 		parentID,

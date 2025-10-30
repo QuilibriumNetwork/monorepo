@@ -13,7 +13,7 @@ type Signer[StateT models.Unique, VoteT models.Unique] interface {
 	// CreateTimeout creates a timeout for given rank. No errors return are
 	// expected during normal operations(incl presence of byz. actors).
 	CreateTimeout(
-		curView uint64,
+		curRank uint64,
 		newestQC models.QuorumCertificate,
 		previousRankTimeoutCert models.TimeoutCertificate,
 	) (*models.TimeoutState[VoteT], error)

@@ -132,7 +132,7 @@ type DynamicCommittee interface {
 	IdentityByState(
 		stateID models.Identity,
 		participantID models.Identity,
-	) (*models.WeightedIdentity, error)
+	) (models.WeightedIdentity, error)
 }
 
 // StateSignerDecoder defines how to convert the ParentSignerIndices field
@@ -146,7 +146,7 @@ type StateSignerDecoder[StateT models.Unique] interface {
 	// parent state. Consequently, the returned IdentifierList contains the
 	// consensus participants that signed the parent state.
 	// Expected Error returns during normal operations:
-	//  - signature.InvalidSignerIndicesError if signer indices included in the
+	//  - consensus.InvalidSignerIndicesError if signer indices included in the
 	//    header do not encode a valid subset of the consensus committee
 	DecodeSignerIDs(
 		state *models.State[StateT],

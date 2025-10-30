@@ -256,7 +256,7 @@ func (e *EventHandler[
 	return nil
 }
 
-// OnPartialTcCreated handles notification produces by the internal timeout
+// OnPartialTimeoutCertificateCreated handles notification produces by the internal timeout
 // aggregator. If the notification is for the current rank, a corresponding
 // models.TimeoutState is broadcast to the consensus committee. No errors are
 // expected during normal operation.
@@ -426,8 +426,11 @@ func (e *EventHandler[
 
 	// check that I am the primary for this rank
 	if e.committee.Self() != currentLeader {
+		e.tracer.Trace("not primary")
 		return nil
 	}
+
+	e.tracer.Trace("primary")
 
 	// attempt to generate proposal:
 	newestQC := e.paceMaker.LatestQuorumCertificate()

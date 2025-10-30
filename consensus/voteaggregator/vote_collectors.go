@@ -32,17 +32,11 @@ type VoteCollectors[StateT models.Unique, VoteT models.Unique] struct {
 var _ consensus.VoteCollectors[*nilUnique, *nilUnique] = (*VoteCollectors[*nilUnique, *nilUnique])(nil)
 
 func NewVoteCollectors[StateT models.Unique, VoteT models.Unique](
-	ctx context.Context,
 	tracer consensus.TraceLogger,
 	lowestRetainedRank uint64,
 	workerPool consensus.Workerpool,
 	factoryMethod NewCollectorFactoryMethod[StateT, VoteT],
 ) *VoteCollectors[StateT, VoteT] {
-	go func() {
-		<-ctx.Done()          // wait for parent context to signal shutdown
-		workerPool.StopWait() // wait till all workers exit
-	}()
-
 	return &VoteCollectors[StateT, VoteT]{
 		tracer:             tracer,
 		lowestRetainedRank: lowestRetainedRank,
@@ -50,6 +44,14 @@ func NewVoteCollectors[StateT models.Unique, VoteT models.Unique](
 		workerPool:         workerPool,
 		createCollector:    factoryMethod,
 	}
+}
+
+func (v *VoteCollectors[StateT, VoteT]) Start(ctx context.Context) error {
+	go func() {
+		<-ctx.Done()            // wait for parent context to signal shutdown
+		v.workerPool.StopWait() // wait till all workers exit
+	}()
+	return nil
 }
 
 // GetOrCreateCollector retrieves the consensus.VoteCollector for the specified

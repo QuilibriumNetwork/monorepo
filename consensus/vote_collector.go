@@ -123,12 +123,22 @@ type VerifyingVoteProcessor[
 // VoteProcessorFactory is a factory that can be used to create a verifying vote
 // processors for a specific proposal. Depending on factory implementation it
 // will return processors for consensus or collection clusters
-type VoteProcessorFactory[StateT models.Unique, VoteT models.Unique] interface {
+type VoteProcessorFactory[
+	StateT models.Unique,
+	VoteT models.Unique,
+	PeerIDT models.Unique,
+] interface {
 	// Create instantiates a VerifyingVoteProcessor for processing votes for a
 	// specific proposal. Caller can be sure that proposal vote was successfully
 	// verified and processed. Expected error returns during normal operations:
 	// * models.InvalidProposalError - proposal has invalid proposer vote
-	Create(tracer TraceLogger, proposal *models.SignedProposal[StateT, VoteT]) (
+	Create(
+		tracer TraceLogger,
+		proposal *models.SignedProposal[StateT, VoteT],
+		dsTag []byte,
+		aggregator SignatureAggregator,
+		votingProvider VotingProvider[StateT, VoteT, PeerIDT],
+	) (
 		VerifyingVoteProcessor[StateT, VoteT],
 		error,
 	)

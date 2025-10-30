@@ -64,6 +64,7 @@ type TimeoutProcessorFactory[
 	committee           consensus.Replicas
 	notifier            consensus.TimeoutCollectorConsumer[VoteT]
 	validator           consensus.Validator[StateT, VoteT]
+	voting              consensus.VotingProvider[StateT, VoteT, PeerIDT]
 	domainSeparationTag []byte
 }
 
@@ -127,6 +128,7 @@ func (f *TimeoutProcessorFactory[StateT, VoteT, PeerIDT]) Create(rank uint64) (
 		f.validator,
 		sigAggregator,
 		f.notifier,
+		f.voting,
 	)
 }
 

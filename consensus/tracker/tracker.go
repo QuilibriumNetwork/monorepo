@@ -128,48 +128,48 @@ func (t *NewestStateTracker[StateT]) NewestState() *models.State[StateT] {
 	return (*models.State[StateT])(t.newestState.Load())
 }
 
-// NewestPartialTcTracker tracks the newest partial TC (by rank) in a
+// NewestPartialTimeoutCertificateTracker tracks the newest partial TC (by rank) in a
 // concurrency safe way.
-type NewestPartialTcTracker struct {
-	newestPartialTc *atomic.UnsafePointer
+type NewestPartialTimeoutCertificateTracker struct {
+	newestPartialTimeoutCertificate *atomic.UnsafePointer
 }
 
-func NewNewestPartialTcTracker() *NewestPartialTcTracker {
-	tracker := &NewestPartialTcTracker{
-		newestPartialTc: atomic.NewUnsafePointer(unsafe.Pointer(nil)),
+func NewNewestPartialTimeoutCertificateTracker() *NewestPartialTimeoutCertificateTracker {
+	tracker := &NewestPartialTimeoutCertificateTracker{
+		newestPartialTimeoutCertificate: atomic.NewUnsafePointer(unsafe.Pointer(nil)),
 	}
 	return tracker
 }
 
-// Track updates local state of newestPartialTc if the provided instance is
+// Track updates local state of newestPartialTimeoutCertificate if the provided instance is
 // newer (by rank). Concurrency safe.
-func (t *NewestPartialTcTracker) Track(
-	partialTc *consensus.PartialTimeoutCertificateCreated,
+func (t *NewestPartialTimeoutCertificateTracker) Track(
+	partialTimeoutCertificate *consensus.PartialTimeoutCertificateCreated,
 ) bool {
 	// To record the newest value that we have ever seen, we need to use loop
 	// with CAS atomic operation to make sure that we always write the latest
 	// value in case of shared access to updated value.
 	for {
 		// take a snapshot
-		newestPartialTc := t.NewestPartialTc()
+		newestPartialTimeoutCertificate := t.NewestPartialTimeoutCertificate()
 		// verify that our partial TC is from a newer rank
-		if newestPartialTc != nil && newestPartialTc.Rank >= partialTc.Rank {
+		if newestPartialTimeoutCertificate != nil && newestPartialTimeoutCertificate.Rank >= partialTimeoutCertificate.Rank {
 			return false
 		}
 		// attempt to install new value, repeat in case of shared update.
-		if t.newestPartialTc.CompareAndSwap(
-			unsafe.Pointer(newestPartialTc),
-			unsafe.Pointer(partialTc),
+		if t.newestPartialTimeoutCertificate.CompareAndSwap(
+			unsafe.Pointer(newestPartialTimeoutCertificate),
+			unsafe.Pointer(partialTimeoutCertificate),
 		) {
 			return true
 		}
 	}
 }
 
-// NewestPartialTc returns the newest partial TC (by rank) tracked.
+// NewestPartialTimeoutCertificate returns the newest partial TC (by rank) tracked.
 // Concurrency safe.
 func (
-	t *NewestPartialTcTracker,
-) NewestPartialTc() *consensus.PartialTimeoutCertificateCreated {
-	return (*consensus.PartialTimeoutCertificateCreated)(t.newestPartialTc.Load())
+	t *NewestPartialTimeoutCertificateTracker,
+) NewestPartialTimeoutCertificate() *consensus.PartialTimeoutCertificateCreated {
+	return (*consensus.PartialTimeoutCertificateCreated)(t.newestPartialTimeoutCertificate.Load())
 }

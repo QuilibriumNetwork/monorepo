@@ -36,7 +36,7 @@ type Verifier[VoteT models.Unique] interface {
 	// Return values:
 	//  * nil if `sigData` is cryptographically valid
 	//  * models.InsufficientSignaturesError if `signers is empty.
-	//  * models.InvalidFormatError if `signers`/`highQCViews` have differing
+	//  * models.InvalidFormatError if `signers`/`highQCRanks` have differing
 	//    lengths
 	//  * models.ErrInvalidSignature if a signature is invalid
 	//  * unexpected errors should be treated as symptoms of bugs or uncovered

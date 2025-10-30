@@ -3,6 +3,7 @@ package helper
 import (
 	"bytes"
 	crand "crypto/rand"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -100,15 +101,15 @@ func MakeQC(options ...func(*TestQuorumCertificate)) models.QuorumCertificate {
 	return qc
 }
 
-func WithQCState[StateT models.Unique](state *models.State[StateT]) func(TestQuorumCertificate) {
-	return func(qc TestQuorumCertificate) {
+func WithQCState[StateT models.Unique](state *models.State[StateT]) func(*TestQuorumCertificate) {
+	return func(qc *TestQuorumCertificate) {
 		qc.Rank = state.Rank
 		qc.Selector = state.Identifier
 	}
 }
 
-func WithQCSigners(signerIndices []byte) func(TestQuorumCertificate) {
-	return func(qc TestQuorumCertificate) {
+func WithQCSigners(signerIndices []byte) func(*TestQuorumCertificate) {
+	return func(qc *TestQuorumCertificate) {
 		qc.AggregatedSignature.(*TestAggregatedSignature).Bitmask = signerIndices
 	}
 }
@@ -116,5 +117,6 @@ func WithQCSigners(signerIndices []byte) func(TestQuorumCertificate) {
 func WithQCRank(rank uint64) func(*TestQuorumCertificate) {
 	return func(qc *TestQuorumCertificate) {
 		qc.Rank = rank
+		qc.Selector = fmt.Sprintf("%d", rank)
 	}
 }

@@ -22,17 +22,17 @@ type queuedProposal[StateT models.Unique, VoteT models.Unique] struct {
 // EventLoop buffers all incoming events to the hotstuff EventHandler, and feeds
 // EventHandler one event at a time.
 type EventLoop[StateT models.Unique, VoteT models.Unique] struct {
-	ctx                      context.Context
-	eventHandler             consensus.EventHandler[StateT, VoteT]
-	proposals                chan queuedProposal[StateT, VoteT]
-	newestSubmittedTc        *tracker.NewestTCTracker
-	newestSubmittedQc        *tracker.NewestQCTracker
-	newestSubmittedPartialTc *tracker.NewestPartialTcTracker
-	tcSubmittedNotifier      chan struct{}
-	qcSubmittedNotifier      chan struct{}
-	partialTcCreatedNotifier chan struct{}
-	startTime                time.Time
-	tracer                   consensus.TraceLogger
+	ctx                                      context.Context
+	eventHandler                             consensus.EventHandler[StateT, VoteT]
+	proposals                                chan queuedProposal[StateT, VoteT]
+	newestSubmittedTimeoutCertificate        *tracker.NewestTCTracker
+	newestSubmittedQc                        *tracker.NewestQCTracker
+	newestSubmittedPartialTimeoutCertificate *tracker.NewestPartialTimeoutCertificateTracker
+	tcSubmittedNotifier                      chan struct{}
+	qcSubmittedNotifier                      chan struct{}
+	partialTimeoutCertificateCreatedNotifier chan struct{}
+	startTime                                time.Time
+	tracer                                   consensus.TraceLogger
 }
 
 var _ consensus.EventLoop[*nilUnique, *nilUnique] = (*EventLoop[*nilUnique, *nilUnique])(nil)
@@ -53,16 +53,16 @@ func NewEventLoop[StateT models.Unique, VoteT models.Unique](
 	proposals := make(chan queuedProposal[StateT, VoteT], 1000)
 
 	el := &EventLoop[StateT, VoteT]{
-		tracer:                   tracer,
-		eventHandler:             eventHandler,
-		proposals:                proposals,
-		tcSubmittedNotifier:      make(chan struct{}, 1),
-		qcSubmittedNotifier:      make(chan struct{}, 1),
-		partialTcCreatedNotifier: make(chan struct{}, 1),
-		newestSubmittedTc:        tracker.NewNewestTCTracker(),
-		newestSubmittedQc:        tracker.NewNewestQCTracker(),
-		newestSubmittedPartialTc: tracker.NewNewestPartialTcTracker(),
-		startTime:                startTime,
+		tracer:                                   tracer,
+		eventHandler:                             eventHandler,
+		proposals:                                proposals,
+		tcSubmittedNotifier:                      make(chan struct{}, 1),
+		qcSubmittedNotifier:                      make(chan struct{}, 1),
+		partialTimeoutCertificateCreatedNotifier: make(chan struct{}, 1),
+		newestSubmittedTimeoutCertificate:        tracker.NewNewestTCTracker(),
+		newestSubmittedQc:                        tracker.NewNewestQCTracker(),
+		newestSubmittedPartialTimeoutCertificate: tracker.NewNewestPartialTimeoutCertificateTracker(),
+		startTime:                                startTime,
 	}
 
 	return el, nil
@@ -71,17 +71,19 @@ func NewEventLoop[StateT models.Unique, VoteT models.Unique](
 func (el *EventLoop[StateT, VoteT]) Start(ctx context.Context) error {
 	el.ctx = ctx
 
-	select {
-	case <-ctx.Done():
-		return nil
-	case <-time.After(time.Until(el.startTime)):
-		el.tracer.Trace("starting event loop")
-		err := el.loop(ctx)
-		if err != nil {
-			el.tracer.Error("irrecoverable event loop error", err)
-			return err
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Until(el.startTime)):
+			el.tracer.Trace("starting event loop")
+			err := el.loop(ctx)
+			if err != nil {
+				el.tracer.Error("irrecoverable event loop error", err)
+				return
+			}
 		}
-	}
+	}()
 	return nil
 }
 
@@ -102,7 +104,7 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 	shutdownSignaled := ctx.Done()
 	timeoutCertificates := el.tcSubmittedNotifier
 	quorumCertificates := el.qcSubmittedNotifier
-	partialTCs := el.partialTcCreatedNotifier
+	partialTCs := el.partialTimeoutCertificateCreatedNotifier
 
 	for {
 		// Giving timeout events the priority to be processed first.
@@ -116,12 +118,14 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 
 		// if we receive the shutdown signal, exit the loop
 		case <-shutdownSignaled:
+			el.tracer.Trace("shutting down event loop")
 			return nil
 
 		// processing timeout or partial TC event are top priority since
 		// they allow node to contribute to TC aggregation when replicas can't
 		// make progress on happy path
 		case <-timeoutChannel:
+			el.tracer.Trace("received timeout")
 			err = el.eventHandler.OnLocalTimeout()
 			if err != nil {
 				return fmt.Errorf("could not process timeout: %w", err)
@@ -136,8 +140,9 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 			continue
 
 		case <-partialTCs:
+			el.tracer.Trace("received partial timeout")
 			err = el.eventHandler.OnPartialTimeoutCertificateCreated(
-				el.newestSubmittedPartialTc.NewestPartialTc(),
+				el.newestSubmittedPartialTimeoutCertificate.NewestPartialTimeoutCertificate(),
 			)
 			if err != nil {
 				return fmt.Errorf("could not process partial created TC event: %w", err)
@@ -153,6 +158,8 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 			continue
 
 		default:
+			el.tracer.Trace("non-priority event")
+
 			// fall through to non-priority events
 		}
 
@@ -161,10 +168,13 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 
 		// same as before
 		case <-shutdownSignaled:
+			el.tracer.Trace("shutting down event loop")
 			return nil
 
 		// same as before
 		case <-timeoutChannel:
+			el.tracer.Trace("received timeout")
+
 			err = el.eventHandler.OnLocalTimeout()
 			if err != nil {
 				return fmt.Errorf("could not process timeout: %w", err)
@@ -172,6 +182,8 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 
 		// if we have a new proposal, process it
 		case queuedItem := <-el.proposals:
+			el.tracer.Trace("received proposal")
+
 			proposal := queuedItem.proposal
 			err = el.eventHandler.OnReceiveProposal(proposal)
 			if err != nil {
@@ -186,6 +198,7 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 
 		// if we have a new QC, process it
 		case <-quorumCertificates:
+			el.tracer.Trace("received quorum certificate")
 			err = el.eventHandler.OnReceiveQuorumCertificate(
 				*el.newestSubmittedQc.NewestQC(),
 			)
@@ -195,16 +208,18 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 
 			// if we have a new TC, process it
 		case <-timeoutCertificates:
+			el.tracer.Trace("received timeout certificate")
 			err = el.eventHandler.OnReceiveTimeoutCertificate(
-				*el.newestSubmittedTc.NewestTC(),
+				*el.newestSubmittedTimeoutCertificate.NewestTC(),
 			)
 			if err != nil {
 				return fmt.Errorf("could not process TC: %w", err)
 			}
 
 		case <-partialTCs:
+			el.tracer.Trace("received partial timeout certificate")
 			err = el.eventHandler.OnPartialTimeoutCertificateCreated(
-				el.newestSubmittedPartialTc.NewestPartialTc(),
+				el.newestSubmittedPartialTimeoutCertificate.NewestPartialTimeoutCertificate(),
 			)
 			if err != nil {
 				return fmt.Errorf("could no process partial created TC event: %w", err)
@@ -239,7 +254,7 @@ func (el *EventLoop[StateT, VoteT]) onTrustedQC(qc *models.QuorumCertificate) {
 // onTrustedTC pushes the received TC (which MUST be validated) to the
 // timeoutCertificates channel
 func (el *EventLoop[StateT, VoteT]) onTrustedTC(tc *models.TimeoutCertificate) {
-	if el.newestSubmittedTc.Track(tc) {
+	if el.newestSubmittedTimeoutCertificate.Track(tc) {
 		el.tcSubmittedNotifier <- struct{}{}
 	} else {
 		qc := (*tc).GetLatestQuorumCert()
@@ -257,8 +272,8 @@ func (el *EventLoop[StateT, VoteT]) OnTimeoutCertificateConstructedFromTimeouts(
 	el.onTrustedTC(&tc)
 }
 
-// OnPartialTimeoutCertificateCreated created a consensus.PartialTcCreated
-// payload and pushes it into partialTcCreated buffered channel for further
+// OnPartialTimeoutCertificateCreated created a consensus.PartialTimeoutCertificateCreated
+// payload and pushes it into partialTimeoutCertificateCreated buffered channel for further
 // processing by EventHandler. Since we use buffered channel this function can
 // block if buffer is full.
 func (el *EventLoop[StateT, VoteT]) OnPartialTimeoutCertificateCreated(
@@ -271,8 +286,8 @@ func (el *EventLoop[StateT, VoteT]) OnPartialTimeoutCertificateCreated(
 		NewestQuorumCertificate:     newestQC,
 		PriorRankTimeoutCertificate: previousRankTimeoutCert,
 	}
-	if el.newestSubmittedPartialTc.Track(event) {
-		el.partialTcCreatedNotifier <- struct{}{}
+	if el.newestSubmittedPartialTimeoutCertificate.Track(event) {
+		el.partialTimeoutCertificateCreatedNotifier <- struct{}{}
 	}
 }
 
