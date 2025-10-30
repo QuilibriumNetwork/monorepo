@@ -47,7 +47,7 @@ func NewTimeoutCollectors[VoteT models.Unique](
 //
 // Expected error returns during normal operations:
 //   - models.BelowPrunedThresholdError if rank is below the pruning threshold
-//   - models.ErrRankUnknown if rank is not yet pruned but no epoch containing
+//   - models.ErrRankUnknown if rank is not yet pruned but no rank containing
 //     the given rank is known, this error
 //
 // can be returned from factory method.

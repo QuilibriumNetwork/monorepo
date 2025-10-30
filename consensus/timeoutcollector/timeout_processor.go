@@ -58,7 +58,7 @@ var _ consensus.TimeoutProcessor[*nilUnique] = (*TimeoutProcessor[*nilUnique, *n
 
 // NewTimeoutProcessor creates new instance of TimeoutProcessor
 // Returns the following expected errors for invalid inputs:
-//   - models.ErrRankUnknown if no epoch containing the given rank is known
+//   - models.ErrRankUnknown if no rank containing the given rank is known
 //
 // All other errors should be treated as exceptions.
 func NewTimeoutProcessor[
@@ -296,12 +296,12 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) validateTimeout(
 		}
 		if errors.Is(err, models.ErrRankUnknown) {
 			// We require each replica to be bootstrapped with a QC pointing to a
-			// finalized state. Therefore, we should know the Epoch for any QC.Rank
+			// finalized state. Therefore, we should know the Rank for any QC.Rank
 			// and TC.Rank we encounter. Receiving a `models.ErrRankUnknown` is
 			// conceptually impossible, i.e. a symptom of an internal bug or invalid
 			// bootstrapping information.
 			return fmt.Errorf(
-				"no Epoch information availalbe for QC that was included in TO; symptom of internal bug or invalid bootstrapping information: %s",
+				"no Rank information availalbe for QC that was included in TO; symptom of internal bug or invalid bootstrapping information: %s",
 				err.Error(),
 			)
 		}
@@ -323,12 +323,12 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) validateTimeout(
 			}
 			if errors.Is(err, models.ErrRankUnknown) {
 				// We require each replica to be bootstrapped with a QC pointing to a
-				// finalized state. Therefore, we should know the Epoch for any QC.Rank
+				// finalized state. Therefore, we should know the Rank for any QC.Rank
 				// and TC.Rank we encounter. Receiving a `models.ErrRankUnknown` is
 				// conceptually impossible, i.e. a symptom of an internal bug or invalid
 				// bootstrapping information.
 				return fmt.Errorf(
-					"no Epoch information availalbe for TC that was included in TO; symptom of internal bug or invalid bootstrapping information: %s",
+					"no Rank information availalbe for TC that was included in TO; symptom of internal bug or invalid bootstrapping information: %s",
 					err.Error(),
 				)
 			}

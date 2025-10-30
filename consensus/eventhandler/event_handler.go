@@ -343,7 +343,7 @@ func (e *EventHandler[
 // models.TimeoutState, adds it to `timeoutAggregator` and broadcasts it to the
 // consensus commettee. We check, whether this node, at the current rank, is
 // part of the consensus committee. Otherwise, this method is functionally a
-// no-op. For example, right after an epoch switchover a consensus node might
+// no-op. For example, right after an rank switchover a consensus node might
 // still be online but not part of the _active_ consensus committee anymore.
 // Consequently, it should not broadcast timeouts anymore. No errors are
 // expected during normal operation.

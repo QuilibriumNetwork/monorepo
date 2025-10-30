@@ -33,7 +33,7 @@ func NewTimeoutCollectorFactory[VoteT models.Unique](
 
 // Create is a factory method to generate a TimeoutCollector for a given rank
 // Expected error returns during normal operations:
-//   - models.ErrRankUnknown if rank is not yet pruned but no epoch containing
+//   - models.ErrRankUnknown if rank is not yet pruned but no rank containing
 //     the given rank is known
 //
 // All other errors should be treated as exceptions.
@@ -96,7 +96,7 @@ func NewTimeoutProcessorFactory[
 
 // Create is a factory method to generate a TimeoutProcessor for a given rank
 // Expected error returns during normal operations:
-//   - models.ErrRankUnknown no epoch containing the given rank is known
+//   - models.ErrRankUnknown no rank containing the given rank is known
 //
 // All other errors should be treated as exceptions.
 func (f *TimeoutProcessorFactory[StateT, VoteT, PeerIDT]) Create(rank uint64) (

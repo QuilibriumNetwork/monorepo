@@ -58,7 +58,7 @@ func (s *TimeoutProcessorTestSuite) SetupTest() {
 
 	s.committee.On("QuorumThresholdForRank", mock.Anything).Return(uint64(8000), nil).Maybe()
 	s.committee.On("TimeoutThresholdForRank", mock.Anything).Return(uint64(8000), nil).Maybe()
-	s.committee.On("IdentityByEpoch", mock.Anything, mock.Anything).Return(s.signer, nil).Maybe()
+	s.committee.On("IdentityByRank", mock.Anything, mock.Anything).Return(s.signer, nil).Maybe()
 	s.sigAggregator.On("Rank").Return(s.rank).Maybe()
 	s.sigAggregator.On("VerifyAndAdd", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		s.totalWeight.Add(s.sigWeight)
@@ -208,7 +208,7 @@ func (s *TimeoutProcessorTestSuite) TestProcess_IncludedQCInvalid() {
 		require.ErrorIs(s.T(), err, exception)
 		require.False(s.T(), models.IsInvalidTimeoutError[*helper.TestVote](err))
 	})
-	s.Run("invalid-qc-err-rank-for-unknown-epoch", func() {
+	s.Run("invalid-qc-err-rank-for-unknown-rank", func() {
 		*s.validator = *mocks.NewValidator[*helper.TestState, *helper.TestVote](s.T())
 		s.validator.On("ValidateQuorumCertificate", timeout.LatestQuorumCertificate).Return(models.ErrRankUnknown).Once()
 
@@ -242,7 +242,7 @@ func (s *TimeoutProcessorTestSuite) TestProcess_IncludedTCInvalid() {
 		require.ErrorIs(s.T(), err, exception)
 		require.False(s.T(), models.IsInvalidTimeoutError[*helper.TestVote](err))
 	})
-	s.Run("invalid-tc-err-rank-for-unknown-epoch", func() {
+	s.Run("invalid-tc-err-rank-for-unknown-rank", func() {
 		*s.validator = *mocks.NewValidator[*helper.TestState, *helper.TestVote](s.T())
 		s.validator.On("ValidateQuorumCertificate", timeout.LatestQuorumCertificate).Return(nil)
 		s.validator.On("ValidateTimeoutCertificate", timeout.PriorRankTimeoutCertificate).Return(models.ErrRankUnknown).Once()

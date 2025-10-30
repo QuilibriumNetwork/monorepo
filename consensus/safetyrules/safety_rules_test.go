@@ -285,7 +285,7 @@ func (s *SafetyRulesTestSuite) TestProduceVote_InvalidProposerIdentity() {
 }
 
 // TestProduceVote_NodeNotAuthorizedToVote tests that no vote is created if the voter is not authorized to vote.
-// Nodes have zero weight in the grace periods around the epochs where they are authorized to participate.
+// Nodes have zero weight in the grace periods around the ranks where they are authorized to participate.
 // We don't want zero-weight nodes to vote in the first place, to avoid unnecessary traffic.
 // Note: this also covers ejected nodes. In both cases, the committee will return an `InvalidSignerError`.
 func (s *SafetyRulesTestSuite) TestProduceVote_NodeEjected() {
@@ -733,7 +733,7 @@ func (s *SafetyRulesTestSuite) TestProduceTimeout_InvalidProposerIdentity() {
 }
 
 // TestProduceTimeout_NodeEjected tests that no timeout is created if the replica is not authorized to create timeout.
-// Nodes have zero weight in the grace periods around the epochs where they are authorized to participate.
+// Nodes have zero weight in the grace periods around the ranks where they are authorized to participate.
 // We don't want zero-weight nodes to participate in the first place, to avoid unnecessary traffic.
 // Note: this also covers ejected nodes. In both cases, the committee will return an `InvalidSignerError`.
 func (s *SafetyRulesTestSuite) TestProduceTimeout_NodeEjected() {

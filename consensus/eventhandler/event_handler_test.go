@@ -204,7 +204,7 @@ func NewSafetyRules(t *testing.T) *SafetyRules {
 				timeout.Rank = curRank
 				timeout.LatestQuorumCertificate = newestQC
 				timeout.PriorRankTimeoutCertificate = lastRankTC
-			})
+			}, helper.WithTimeoutVote(&helper.TestVote{Rank: curRank, ID: helper.MakeIdentity()}))
 		},
 		func(uint64, models.QuorumCertificate, models.TimeoutCertificate) error { return nil }).Maybe()
 

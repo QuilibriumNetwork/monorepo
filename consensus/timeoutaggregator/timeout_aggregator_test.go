@@ -71,7 +71,7 @@ func (s *TimeoutAggregatorTestSuite) TestAddTimeout_HappyPath() {
 	start.Add(timeoutsCount)
 	for i := 0; i < timeoutsCount; i++ {
 		go func() {
-			timeout := helper.TimeoutStateFixture[*helper.TestVote](helper.WithTimeoutStateRank[*helper.TestVote](s.lowestRetainedRank))
+			timeout := helper.TimeoutStateFixture[*helper.TestVote](helper.WithTimeoutStateRank[*helper.TestVote](s.lowestRetainedRank), helper.WithTimeoutVote(&helper.TestVote{Rank: s.lowestRetainedRank, ID: helper.MakeIdentity()}))
 
 			start.Done()
 			// Wait for last worker routine to signal ready. Then,
@@ -89,9 +89,9 @@ func (s *TimeoutAggregatorTestSuite) TestAddTimeout_HappyPath() {
 	}, time.Second, time.Millisecond*20)
 }
 
-// TestAddTimeout_EpochUnknown tests if timeout states targeting unknown epoch should be ignored
-func (s *TimeoutAggregatorTestSuite) TestAddTimeout_EpochUnknown() {
-	timeout := helper.TimeoutStateFixture(helper.WithTimeoutStateRank[*helper.TestVote](s.lowestRetainedRank))
+// TestAddTimeout_RankUnknown tests if timeout states targeting unknown rank should be ignored
+func (s *TimeoutAggregatorTestSuite) TestAddTimeout_RankUnknown() {
+	timeout := helper.TimeoutStateFixture(helper.WithTimeoutStateRank[*helper.TestVote](s.lowestRetainedRank), helper.WithTimeoutVote(&helper.TestVote{Rank: s.lowestRetainedRank, ID: helper.MakeIdentity()}))
 	*s.collectors = *mocks.NewTimeoutCollectors[*helper.TestVote](s.T())
 	done := make(chan struct{})
 	s.collectors.On("GetOrCreateCollector", timeout.Rank).Return(nil, false, models.ErrRankUnknown).Run(func(args mock.Arguments) {

@@ -176,7 +176,7 @@ func (r *SafetyRules[StateT, VoteT]) produceVote(
 		if models.IsInvalidSignerError(err) {
 			// the proposer must be ejected since the proposal has already been
 			// validated, which ensures that the proposer was a valid committee member
-			// at the start of the epoch
+			// at the start of the rank
 			return nil, models.NewNoVoteErrorf("proposer ejected: %w", err)
 		}
 		if err != nil {
@@ -190,7 +190,7 @@ func (r *SafetyRules[StateT, VoteT]) produceVote(
 
 		// (ii) Do not produce a vote for states where we are not an active
 		// committee member. The HotStuff state machine may request to vote during
-		// grace periods outside the epochs, where the node is authorized to
+		// grace periods outside the ranks, where the node is authorized to
 		// actively participate. If we voted during those grace periods, we would
 		// needlessly waste network bandwidth, as such votes can't be used to
 		// produce valid QCs.
@@ -235,7 +235,7 @@ func (r *SafetyRules[StateT, VoteT]) produceVote(
 //   - (nil, models.NoTimeoutError): If replica is not part of the authorized
 //     consensus committee (anymore) and therefore is not authorized to produce
 //     a valid timeout state. This sentinel error is _expected_ during normal
-//     operation, e.g. during the grace-period after Epoch switchover or after
+//     operation, e.g. during the grace-period after Rank switchover or after
 //     the replica self-ejected.
 //
 // All other errors are unexpected and potential symptoms of uncovered edge

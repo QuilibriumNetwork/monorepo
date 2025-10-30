@@ -48,7 +48,7 @@ func (b *StateSignerDecoder[StateT]) DecodeSignerIDs(
 	members, err := b.IdentitiesByRank(state.ParentQuorumCertificate.GetRank())
 	if err != nil {
 		if errors.Is(err, models.ErrRankUnknown) {
-			// possibly, we request epoch which is far behind in the past, in this
+			// possibly, we request rank which is far behind in the past, in this
 			// case we won't have it in cache. try asking by parent ID
 			byStateMembers, err := b.IdentitiesByState(
 				state.ParentQuorumCertificate.GetSelector(),

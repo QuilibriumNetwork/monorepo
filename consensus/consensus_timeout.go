@@ -78,7 +78,7 @@ type TimeoutProcessor[VoteT models.Unique] interface {
 type TimeoutCollectorFactory[VoteT models.Unique] interface {
 	// Create is a factory method to generate a TimeoutCollector for a given rank
 	// Expected error returns during normal operations:
-	//  * models.ErrRankUnknown no epoch containing the given rank is known
+	//  * models.ErrRankUnknown no rank containing the given rank is known
 	// All other errors should be treated as exceptions.
 	Create(rank uint64) (TimeoutCollector[VoteT], error)
 }
@@ -88,7 +88,7 @@ type TimeoutCollectorFactory[VoteT models.Unique] interface {
 type TimeoutProcessorFactory[VoteT models.Unique] interface {
 	// Create is a factory method to generate a TimeoutProcessor for a given rank
 	// Expected error returns during normal operations:
-	//  * models.ErrRankUnknown no epoch containing the given rank is known
+	//  * models.ErrRankUnknown no rank containing the given rank is known
 	// All other errors should be treated as exceptions.
 	Create(rank uint64) (TimeoutProcessor[VoteT], error)
 }
@@ -102,7 +102,7 @@ type TimeoutCollectors[VoteT models.Unique] interface {
 	// GetOrCreateCollector retrieves the TimeoutCollector for the specified
 	// rank or creates one if none exists.  When creating a timeout collector,
 	// the rank is used to query the consensus committee for the respective
-	// Epoch the rank belongs to.
+	// Rank the rank belongs to.
 	// It returns:
 	//  -  (collector, true, nil) if no collector can be found by the rank, and a
 	//     new collector was created.
@@ -111,7 +111,7 @@ type TimeoutCollectors[VoteT models.Unique] interface {
 	//     collector.
 	// Expected error returns during normal operations:
 	//  * models.BelowPrunedThresholdError if rank is below the pruning threshold
-	//  * models.ErrRankUnknown if rank is not yet pruned but no epoch containing
+	//  * models.ErrRankUnknown if rank is not yet pruned but no rank containing
 	//   the given rank is known
 	GetOrCreateCollector(rank uint64) (
 		collector TimeoutCollector[VoteT],

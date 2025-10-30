@@ -9,23 +9,23 @@ import "source.quilibrium.com/quilibrium/monorepo/consensus/models"
 //
 // For the purposes of validating votes, timeouts, quorum certificates, and
 // timeout certificates we consider a committee which is static over the course
-// of an epoch. Although committee members may be ejected, or have their weight
-// change during an epoch, we ignore these changes. For these purposes we use
-// the Replicas and *ByEpoch methods.
+// of an rank. Although committee members may be ejected, or have their weight
+// change during an rank, we ignore these changes. For these purposes we use
+// the Replicas and *ByRank methods.
 //
 // When validating proposals, we take into account changes to the committee
-// during the course of an epoch. In particular, if a node is ejected, we will
+// during the course of an rank. In particular, if a node is ejected, we will
 // immediately reject all future proposals from that node. For these purposes we
 // use the DynamicCommittee and *ByState methods.
 
 // Replicas defines the consensus committee for the purposes of validating
 // votes, timeouts, quorum certificates, and timeout certificates. Any consensus
 // committee member who was authorized to contribute to consensus AT THE
-// BEGINNING of the epoch may produce valid votes and timeouts for the entire
-// epoch, even if they are later ejected. So for validating votes/timeouts we
-// use *ByEpoch methods.
+// BEGINNING of the rank may produce valid votes and timeouts for the entire
+// rank, even if they are later ejected. So for validating votes/timeouts we
+// use *ByRank methods.
 //
-// Since the voter committee is considered static over an epoch:
+// Since the voter committee is considered static over an rank:
 //   - we can query identities by rank
 //   - we don't need the full state ancestry prior to validating messages
 type Replicas interface {
@@ -36,24 +36,24 @@ type Replicas interface {
 	//          slots even if it is slashed. Its proposal is simply considered
 	//          invalid, as it is not from a legitimate participant.
 	// Returns the following expected errors for invalid inputs:
-	//   - model.ErrRankUnknown if no epoch containing the given rank is
+	//   - model.ErrRankUnknown if no rank containing the given rank is
 	//     known
 	LeaderForRank(rank uint64) (models.Identity, error)
 
 	// QuorumThresholdForRank returns the minimum total weight for a supermajority
 	// at the given rank. This weight threshold is computed using the total weight
-	// of the initial committee and is static over the course of an epoch.
+	// of the initial committee and is static over the course of an rank.
 	// Returns the following expected errors for invalid inputs:
-	//   - model.ErrRankUnknown if no epoch containing the given rank is
+	//   - model.ErrRankUnknown if no rank containing the given rank is
 	//     known
 	QuorumThresholdForRank(rank uint64) (uint64, error)
 
 	// TimeoutThresholdForRank returns the minimum total weight of observed
 	// timeout states required to safely timeout for the given rank. This weight
 	// threshold is computed using the total weight of the initial committee and
-	// is static over the course of an epoch.
+	// is static over the course of an rank.
 	// Returns the following expected errors for invalid inputs:
-	//   - model.ErrRankUnknown if no epoch containing the given rank is
+	//   - model.ErrRankUnknown if no rank containing the given rank is
 	//     known
 	TimeoutThresholdForRank(rank uint64) (uint64, error)
 
@@ -65,22 +65,22 @@ type Replicas interface {
 	Self() models.Identity
 
 	// IdentitiesByRank returns a list of the legitimate HotStuff participants
-	// for the epoch given by the input rank.
+	// for the rank given by the input rank.
 	// The returned list of HotStuff participants:
 	//   - contains nodes that are allowed to submit votes or timeouts within the
-	//     given epoch (un-ejected, non-zero weight at the beginning of the epoch)
+	//     given rank (un-ejected, non-zero weight at the beginning of the rank)
 	//   - is ordered in the canonical order
 	//   - contains no duplicates.
 	//
 	// CAUTION: DO NOT use this method for validating state proposals.
 	//
 	// Returns the following expected errors for invalid inputs:
-	//   - model.ErrRankUnknown if no epoch containing the given rank is
+	//   - model.ErrRankUnknown if no rank containing the given rank is
 	//     known
 	//
 	IdentitiesByRank(rank uint64) ([]models.WeightedIdentity, error)
 
-	// IdentityByEpoch returns the full Identity for specified HotStuff
+	// IdentityByRank returns the full Identity for specified HotStuff
 	// participant. The node must be a legitimate HotStuff participant with
 	// NON-ZERO WEIGHT at the specified state.
 	//
@@ -89,7 +89,7 @@ type Replicas interface {
 	//    authorized HotStuff participant at the specified state.
 	//
 	// Returns the following expected errors for invalid inputs:
-	//   - model.ErrRankUnknown if no epoch containing the given rank is
+	//   - model.ErrRankUnknown if no rank containing the given rank is
 	//     known
 	//
 	IdentityByRank(

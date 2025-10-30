@@ -1,4 +1,4 @@
-package timeoutaggregator
+package voteaggregator
 
 import (
 	"errors"
@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/gammazero/workerpool"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/atomic"
@@ -20,78 +19,61 @@ import (
 
 var factoryError = errors.New("factory error")
 
-func TestTimeoutCollectors(t *testing.T) {
-	suite.Run(t, new(TimeoutCollectorsTestSuite))
+func TestVoteCollectors(t *testing.T) {
+	suite.Run(t, new(VoteCollectorsTestSuite))
 }
 
-// TimeoutCollectorsTestSuite is a test suite for isolated testing of TimeoutCollectors.
-// Contains helper methods and mocked state which is used to verify correct behavior of TimeoutCollectors.
-type TimeoutCollectorsTestSuite struct {
+// VoteCollectorsTestSuite is a test suite for isolated testing of VoteCollectors.
+// Contains helper methods and mocked state which is used to verify correct behavior of VoteCollectors.
+type VoteCollectorsTestSuite struct {
 	suite.Suite
 
-	mockedCollectors map[uint64]*mocks.TimeoutCollector[*helper.TestVote]
-	factoryMethod    *mocks.TimeoutCollectorFactory[*helper.TestVote]
-	collectors       *TimeoutCollectors[*helper.TestVote]
-	lowestRank       uint64
+	mockedCollectors map[uint64]*mocks.VoteCollector[*helper.TestState, *helper.TestVote]
+	factoryMethod    NewCollectorFactoryMethod[*helper.TestState, *helper.TestVote]
+	collectors       *VoteCollectors[*helper.TestState, *helper.TestVote]
+	lowestLevel      uint64
 	workerPool       *workerpool.WorkerPool
 }
 
-func (s *TimeoutCollectorsTestSuite) SetupTest() {
-	s.lowestRank = 1000
-	s.mockedCollectors = make(map[uint64]*mocks.TimeoutCollector[*helper.TestVote])
+func (s *VoteCollectorsTestSuite) SetupTest() {
+	s.lowestLevel = 1000
+	s.mockedCollectors = make(map[uint64]*mocks.VoteCollector[*helper.TestState, *helper.TestVote])
 	s.workerPool = workerpool.New(2)
-	s.factoryMethod = mocks.NewTimeoutCollectorFactory[*helper.TestVote](s.T())
-	s.factoryMethod.On("Create", mock.Anything).Return(func(rank uint64) consensus.TimeoutCollector[*helper.TestVote] {
+	s.factoryMethod = func(rank uint64, _ consensus.Workers) (consensus.VoteCollector[*helper.TestState, *helper.TestVote], error) {
 		if collector, found := s.mockedCollectors[rank]; found {
-			return collector
+			return collector, nil
 		}
-		return nil
-	}, func(rank uint64) error {
-		if _, found := s.mockedCollectors[rank]; found {
-			return nil
-		}
-		return fmt.Errorf("mocked collector %v not found: %w", rank, factoryError)
-	}).Maybe()
-	s.collectors = NewTimeoutCollectors(helper.Logger(), s.lowestRank, s.factoryMethod)
+		return nil, fmt.Errorf("mocked collector %v not found: %w", rank, factoryError)
+	}
+	s.collectors = NewVoteCollectors(helper.Logger(), s.lowestLevel, s.workerPool, s.factoryMethod)
 }
 
-func (s *TimeoutCollectorsTestSuite) TearDownTest() {
+func (s *VoteCollectorsTestSuite) TearDownTest() {
 	s.workerPool.StopWait()
 }
 
 // prepareMockedCollector prepares a mocked collector and stores it in map, later it will be used
-// to mock behavior of timeout collectors.
-func (s *TimeoutCollectorsTestSuite) prepareMockedCollector(rank uint64) *mocks.TimeoutCollector[*helper.TestVote] {
-	collector := mocks.NewTimeoutCollector[*helper.TestVote](s.T())
+// to mock behavior of vote collectors.
+func (s *VoteCollectorsTestSuite) prepareMockedCollector(rank uint64) *mocks.VoteCollector[*helper.TestState, *helper.TestVote] {
+	collector := &mocks.VoteCollector[*helper.TestState, *helper.TestVote]{}
 	collector.On("Rank").Return(rank).Maybe()
 	s.mockedCollectors[rank] = collector
 	return collector
 }
 
-// TestGetOrCreateCollector_RankLowerThanLowest tests a scenario where caller tries to create a collector with rank
+// TestGetOrCreatorCollector_RankLowerThanLowest tests a scenario where caller tries to create a collector with rank
 // lower than already pruned one. This should result in sentinel error `BelowPrunedThresholdError`
-func (s *TimeoutCollectorsTestSuite) TestGetOrCreateCollector_RankLowerThanLowest() {
-	collector, created, err := s.collectors.GetOrCreateCollector(s.lowestRank - 10)
+func (s *VoteCollectorsTestSuite) TestGetOrCreatorCollector_RankLowerThanLowest() {
+	collector, created, err := s.collectors.GetOrCreateCollector(s.lowestLevel - 10)
 	require.Nil(s.T(), collector)
 	require.False(s.T(), created)
 	require.Error(s.T(), err)
 	require.True(s.T(), models.IsBelowPrunedThresholdError(err))
 }
 
-// TestGetOrCreateCollector_UnknownRank tests a scenario where caller tries to create a collector with rank referring rank
-// that we don't know about. This should result in sentinel error `
-func (s *TimeoutCollectorsTestSuite) TestGetOrCreateCollector_UnknownRank() {
-	*s.factoryMethod = *mocks.NewTimeoutCollectorFactory[*helper.TestVote](s.T())
-	s.factoryMethod.On("Create", mock.Anything).Return(nil, models.ErrRankUnknown)
-	collector, created, err := s.collectors.GetOrCreateCollector(s.lowestRank + 100)
-	require.Nil(s.T(), collector)
-	require.False(s.T(), created)
-	require.ErrorIs(s.T(), err, models.ErrRankUnknown)
-}
-
 // TestGetOrCreateCollector_ValidCollector tests a happy path scenario where we try first to create and then retrieve cached collector.
-func (s *TimeoutCollectorsTestSuite) TestGetOrCreateCollector_ValidCollector() {
-	rank := s.lowestRank + 10
+func (s *VoteCollectorsTestSuite) TestGetOrCreateCollector_ValidCollector() {
+	rank := s.lowestLevel + 10
 	s.prepareMockedCollector(rank)
 	collector, created, err := s.collectors.GetOrCreateCollector(rank)
 	require.NoError(s.T(), err)
@@ -105,9 +87,9 @@ func (s *TimeoutCollectorsTestSuite) TestGetOrCreateCollector_ValidCollector() {
 }
 
 // TestGetOrCreateCollector_FactoryError tests that error from factory method is propagated to caller.
-func (s *TimeoutCollectorsTestSuite) TestGetOrCreateCollector_FactoryError() {
+func (s *VoteCollectorsTestSuite) TestGetOrCreateCollector_FactoryError() {
 	// creating collector without calling prepareMockedCollector will yield factoryError.
-	collector, created, err := s.collectors.GetOrCreateCollector(s.lowestRank + 10)
+	collector, created, err := s.collectors.GetOrCreateCollector(s.lowestLevel + 10)
 	require.Nil(s.T(), collector)
 	require.False(s.T(), created)
 	require.ErrorIs(s.T(), err, factoryError)
@@ -115,42 +97,42 @@ func (s *TimeoutCollectorsTestSuite) TestGetOrCreateCollector_FactoryError() {
 
 // TestGetOrCreateCollectors_ConcurrentAccess tests that concurrently accessing of GetOrCreateCollector creates
 // only one collector and all other instances are retrieved from cache.
-func (s *TimeoutCollectorsTestSuite) TestGetOrCreateCollectors_ConcurrentAccess() {
+func (s *VoteCollectorsTestSuite) TestGetOrCreateCollectors_ConcurrentAccess() {
 	createdTimes := atomic.NewUint64(0)
-	rank := s.lowestRank + 10
+	rank := s.lowestLevel + 10
 	s.prepareMockedCollector(rank)
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
-			defer wg.Done()
 			_, created, err := s.collectors.GetOrCreateCollector(rank)
 			require.NoError(s.T(), err)
 			if created {
 				createdTimes.Add(1)
 			}
+			wg.Done()
 		}()
 	}
-	wg.Wait()
 
+	wg.Wait()
 	require.Equal(s.T(), uint64(1), createdTimes.Load())
 }
 
 // TestPruneUpToRank tests pruning removes item below pruning height and leaves unmodified other items.
-func (s *TimeoutCollectorsTestSuite) TestPruneUpToRank() {
+func (s *VoteCollectorsTestSuite) TestPruneUpToRank() {
 	numberOfCollectors := uint64(10)
 	prunedRanks := make([]uint64, 0)
 	for i := uint64(0); i < numberOfCollectors; i++ {
-		rank := s.lowestRank + i
+		rank := s.lowestLevel + i
 		s.prepareMockedCollector(rank)
 		_, _, err := s.collectors.GetOrCreateCollector(rank)
 		require.NoError(s.T(), err)
 		prunedRanks = append(prunedRanks, rank)
 	}
 
-	pruningHeight := s.lowestRank + numberOfCollectors
+	pruningHeight := s.lowestLevel + numberOfCollectors
 
-	expectedCollectors := make([]consensus.TimeoutCollector[*helper.TestVote], 0)
+	expectedCollectors := make([]consensus.VoteCollector[*helper.TestState, *helper.TestVote], 0)
 	for i := uint64(0); i < numberOfCollectors; i++ {
 		rank := pruningHeight + i
 		s.prepareMockedCollector(rank)

@@ -30,7 +30,7 @@ func NewValidator[StateT models.Unique, VoteT models.Unique](
 // ValidateTimeoutCertificate validates the TimeoutCertificate `TC`.
 // During normal operations, the following error returns are expected:
 //   - models.InvalidTCError if the TC is invalid
-//   - models.ErrRankUnknown if the TC refers unknown epoch
+//   - models.ErrRankUnknown if the TC refers unknown rank
 //
 // Any other error should be treated as exception
 func (v *Validator[StateT, VoteT]) ValidateTimeoutCertificate(
@@ -69,6 +69,10 @@ func (v *Validator[StateT, VoteT]) ValidateTimeoutCertificate(
 	sigIndices := tc.GetAggregatedSignature().GetBitmask()
 	totalWeight := uint64(0)
 	for i, member := range allParticipants {
+		if len(sigIndices) < (i/8)+1 {
+			return models.NewInsufficientSignaturesErrorf("insufficient signatures")
+		}
+
 		if sigIndices[i/8]>>i%8&1 == 1 {
 			signerIDs = append(signerIDs, member)
 			totalWeight += member.Weight()
@@ -79,10 +83,13 @@ func (v *Validator[StateT, VoteT]) ValidateTimeoutCertificate(
 	// consensus
 	threshold, err := v.committee.QuorumThresholdForRank(tc.GetRank())
 	if err != nil {
-		return fmt.Errorf(
-			"could not get weight threshold for rank %d: %w",
-			tc.GetRank(),
-			err,
+		return newInvalidTimeoutCertificateError(
+			tc,
+			fmt.Errorf(
+				"could not get weight threshold for rank %d: %w",
+				tc.GetRank(),
+				err,
+			),
 		)
 	}
 
@@ -166,11 +173,11 @@ func (v *Validator[StateT, VoteT]) ValidateTimeoutCertificate(
 			// must include signatures from a supermajority of replicas, including at
 			// least one honest replica, which attest to their locally highest known
 			// QC. Hence, any QC included in a TC must be the root QC or newer.
-			// Therefore, we should know the Epoch for any QC we encounter. Receiving
+			// Therefore, we should know the rank for any QC we encounter. Receiving
 			// a `models.ErrRankUnknown` is conceptually impossible, i.e. a symptom of
 			// an internal bug or invalid bootstrapping information.
 			return fmt.Errorf(
-				"no Epoch information availalbe for QC that was included in TC; symptom of internal bug or invalid bootstrapping information: %s",
+				"no rank information availalbe for QC that was included in TC; symptom of internal bug or invalid bootstrapping information: %s",
 				err.Error(),
 			)
 		}
@@ -186,18 +193,18 @@ func (v *Validator[StateT, VoteT]) ValidateTimeoutCertificate(
 // ValidateQuorumCertificate validates the Quorum Certificate `qc`.
 // During normal operations, the following error returns are expected:
 //   - models.InvalidQCError if the QC is invalid
-//   - models.ErrRankUnknown if the QC refers unknown epoch
+//   - models.ErrRankUnknown if the QC refers unknown rank
 //
 // Any other error should be treated as exception
 func (v *Validator[StateT, VoteT]) ValidateQuorumCertificate(
 	qc models.QuorumCertificate,
 ) error {
-	// Retrieve the initial identities of consensus participants for this epoch,
+	// Retrieve the initial identities of consensus participants for this rank,
 	// and those that signed the QC. IdentitiesByRank contains all nodes that were
-	// authorized to sign during this epoch. Ejection and dynamic weight
-	// adjustments are not taken into account here. By using an epoch-static set
-	// of authorized
-	// signers, we can check QC validity without needing all ancestor states.
+	// authorized to sign during this rank. Ejection and dynamic weight
+	// adjustments are not taken into account here. By using an rank-static set
+	// of authorized signers, we can check QC validity without needing all
+	// ancestor states.
 	allParticipants, err := v.committee.IdentitiesByRank(qc.GetRank())
 	if err != nil {
 		return fmt.Errorf(
@@ -211,6 +218,12 @@ func (v *Validator[StateT, VoteT]) ValidateQuorumCertificate(
 	sigIndices := qc.GetAggregatedSignature().GetBitmask()
 	totalWeight := uint64(0)
 	for i, member := range allParticipants {
+		if len(sigIndices) < (i/8)+1 {
+			return newInvalidQuorumCertificateError(
+				qc,
+				models.NewInsufficientSignaturesErrorf("insufficient signatures"),
+			)
+		}
 		if sigIndices[i/8]>>i%8&1 == 1 {
 			signerIDs = append(signerIDs, member)
 			totalWeight += member.Weight()
@@ -221,12 +234,16 @@ func (v *Validator[StateT, VoteT]) ValidateQuorumCertificate(
 	// consensus
 	threshold, err := v.committee.QuorumThresholdForRank(qc.GetRank())
 	if err != nil {
-		return fmt.Errorf(
-			"could not get weight threshold for rank %d: %w",
-			qc.GetRank(),
-			err,
+		return newInvalidQuorumCertificateError(
+			qc,
+			fmt.Errorf(
+				"could not get weight threshold for rank %d: %w",
+				qc.GetRank(),
+				err,
+			),
 		)
 	}
+
 	if totalWeight < threshold {
 		return newInvalidQuorumCertificateError(
 			qc,
@@ -265,7 +282,7 @@ func (v *Validator[StateT, VoteT]) ValidateQuorumCertificate(
 			// ErrRankUnknown. To avoid confusion with expected sentinel errors, we
 			// only preserve the error messages here, but not the error types.
 			return fmt.Errorf(
-				"internal error, as querying identities for rank %d succeeded earlier but now the rank supposedly belongs to an unknown epoch: %s",
+				"internal error, as querying identities for rank %d succeeded earlier but now the rank supposedly belongs to an unknown rank: %s",
 				qc.GetRank(),
 				err.Error(),
 			)
@@ -286,7 +303,7 @@ func (v *Validator[StateT, VoteT]) ValidateQuorumCertificate(
 // Note it doesn't check if it's conflicting with finalized state
 // During normal operations, the following error returns are expected:
 //   - models.InvalidProposalError if the state is invalid
-//   - models.ErrRankUnknown if the proposal refers unknown epoch
+//   - models.ErrRankUnknown if the proposal refers unknown rank
 //
 // Any other error should be treated as exception
 func (v *Validator[StateT, VoteT]) ValidateProposal(
@@ -395,7 +412,7 @@ func (v *Validator[StateT, VoteT]) ValidateProposal(
 			// conceptually impossible, i.e. a symptom of an internal bug or invalid
 			// bootstrapping information.
 			return fmt.Errorf(
-				"no Epoch information availalbe for QC that was included in proposal; symptom of internal bug or invalid bootstrapping information: %s",
+				"no rank information availalbe for QC that was included in proposal; symptom of internal bug or invalid bootstrapping information: %s",
 				err.Error(),
 			)
 		}
@@ -415,12 +432,12 @@ func (v *Validator[StateT, VoteT]) ValidateProposal(
 			}
 			if errors.Is(err, models.ErrRankUnknown) {
 				// We require each replica to be bootstrapped with a QC pointing to a
-				// finalized state. Therefore, we should know the Epoch for any QC.Rank
+				// finalized state. Therefore, we should know the rank for any QC.Rank
 				// and TC.Rank we encounter. Receiving a `models.ErrRankUnknown` is
 				// conceptually impossible, i.e. a symptom of an internal bug or invalid
 				// bootstrapping information.
 				return fmt.Errorf(
-					"no Epoch information availalbe for QC that was included in TC; symptom of internal bug or invalid bootstrapping information: %s",
+					"no rank information availalbe for QC that was included in TC; symptom of internal bug or invalid bootstrapping information: %s",
 					err.Error(),
 				)
 			}
@@ -438,7 +455,7 @@ func (v *Validator[StateT, VoteT]) ValidateProposal(
 // signed the vote - the vote to be validated
 // During normal operations, the following error returns are expected:
 //   - models.InvalidVoteError for invalid votes
-//   - models.ErrRankUnknown if the vote refers unknown epoch
+//   - models.ErrRankUnknown if the vote refers unknown rank
 //
 // Any other error should be treated as exception
 func (v *Validator[StateT, VoteT]) ValidateVote(vote *VoteT) (
@@ -472,7 +489,7 @@ func (v *Validator[StateT, VoteT]) ValidateVote(vote *VoteT) (
 		}
 		if errors.Is(err, models.ErrRankUnknown) {
 			return nil, fmt.Errorf(
-				"no Epoch information available for vote; symptom of internal bug or invalid bootstrapping information: %s",
+				"no rank information available for vote; symptom of internal bug or invalid bootstrapping information: %s",
 				err.Error(),
 			)
 		}

@@ -3,9 +3,9 @@ package voteaggregator
 import (
 	"context"
 	"fmt"
-	"sync"
 	"sync/atomic"
 
+	"golang.org/x/sync/errgroup"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 )
@@ -35,7 +35,7 @@ type VoteAggregator[StateT models.Unique, VoteT models.Unique] struct {
 	finalizedRank              atomic.Uint64 // cache the last finalized rank to queue up the pruning work, and unstate the caller who's delivering the finalization event.
 	queuedVotes                chan *VoteT
 	queuedStates               chan *models.SignedProposal[StateT, VoteT]
-	wg                         sync.WaitGroup
+	wg                         errgroup.Group
 }
 
 var _ consensus.VoteAggregator[*nilUnique, *nilUnique] = (*VoteAggregator[*nilUnique, *nilUnique])(nil)
@@ -64,7 +64,7 @@ func NewVoteAggregator[StateT models.Unique, VoteT models.Unique](
 		queuedStates:               queuedStates,
 		queuedMessagesNotifier:     make(chan struct{}, 1),
 		finalizationEventsNotifier: make(chan struct{}, 1),
-		wg:                         sync.WaitGroup{},
+		wg:                         errgroup.Group{},
 	}
 
 	aggregator.lowestRetainedRank.Store(lowestRetainedRank)
@@ -74,16 +74,19 @@ func NewVoteAggregator[StateT models.Unique, VoteT models.Unique](
 }
 
 func (va *VoteAggregator[StateT, VoteT]) Start(ctx context.Context) error {
-	va.wg.Add(defaultVoteAggregatorWorkers + 1)
+	internalCtx, internalCancel := context.WithCancel(ctx)
+	va.wg.SetLimit(defaultVoteAggregatorWorkers + 1)
 	for i := 0; i < defaultVoteAggregatorWorkers; i++ {
 		// manager for worker routines that process inbound messages
-		go func() {
-			defer va.wg.Done()
-			va.queuedMessagesProcessingLoop(ctx)
-		}()
+		va.wg.Go(func() error {
+			err := va.queuedMessagesProcessingLoop(internalCtx)
+			if err != nil {
+				internalCancel()
+			}
+			return err
+		})
 	}
-	go func() {
-		defer va.wg.Done()
+	va.wg.Go(func() error {
 		// create new context which is not connected to parent
 		// we need to ensure that our internal workers stop before asking
 		// vote collectors to stop. We want to avoid delivering events to already
@@ -93,14 +96,15 @@ func (va *VoteAggregator[StateT, VoteT]) Start(ctx context.Context) error {
 		// start vote collectors
 		err := va.collectors.Start(innerCtx)
 		if err != nil {
-			return
+			internalCancel()
+			return err
 		}
 
 		// Handle the component lifecycle in a separate goroutine so we can capture
 		// any errors thrown during initialization in the main goroutine.
 		go func() {
 			select {
-			case <-ctx.Done():
+			case <-internalCtx.Done():
 				// wait for internal workers to stop, then signal vote collectors to
 				// stop
 				va.wg.Wait()
@@ -108,19 +112,20 @@ func (va *VoteAggregator[StateT, VoteT]) Start(ctx context.Context) error {
 			}
 		}()
 
-		va.finalizationProcessingLoop(ctx)
-	}()
-	return nil
+		va.finalizationProcessingLoop(internalCtx)
+		return nil
+	})
+	return va.wg.Wait()
 }
 
 func (va *VoteAggregator[StateT, VoteT]) queuedMessagesProcessingLoop(
 	ctx context.Context,
-) {
+) error {
 	notifier := va.queuedMessagesNotifier
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-notifier:
 			err := va.processQueuedMessages(ctx)
 			if err != nil {
@@ -128,7 +133,7 @@ func (va *VoteAggregator[StateT, VoteT]) queuedMessagesProcessingLoop(
 					"stopping mesage processing loop",
 					fmt.Errorf("internal error processing queued messages: %w", err),
 				)
-				return
+				return err
 			}
 		}
 	}

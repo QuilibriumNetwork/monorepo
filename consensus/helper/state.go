@@ -311,18 +311,28 @@ func WithWeightedIdentityList(count int) []models.WeightedIdentity {
 	return wi
 }
 
-func VoteForStateFixture[StateT models.Unique, VoteT models.Unique](state *models.State[StateT], ops ...func(vote *VoteT)) VoteT {
-	v := new(VoteT)
-	for _, op := range ops {
-		op(v)
+func VoteForStateFixture(state *models.State[*TestState], ops ...func(vote **TestVote)) *TestVote {
+	v := &TestVote{
+		Rank:      state.Rank,
+		ID:        MakeIdentity(),
+		StateID:   state.Identifier,
+		Signature: make([]byte, 74),
 	}
-	return *v
+	for _, op := range ops {
+		op(&v)
+	}
+	return v
 }
 
-func VoteFixture[VoteT models.Unique](op func(vote *VoteT)) VoteT {
-	v := new(VoteT)
-	op(v)
-	return *v
+func VoteFixture(op func(vote **TestVote)) *TestVote {
+	v := &TestVote{
+		Rank:      rand.Uint64(),
+		ID:        MakeIdentity(),
+		StateID:   MakeIdentity(),
+		Signature: make([]byte, 74),
+	}
+	op(&v)
+	return v
 }
 
 type FmtLog struct{}

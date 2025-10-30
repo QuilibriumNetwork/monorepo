@@ -94,7 +94,7 @@ type VoteProcessor[VoteT models.Unique] interface {
 	// Process performs processing of single vote. This function is safe to call
 	// from multiple goroutines.
 	// Expected error returns during normal operations:
-	// * VoteForIncompatibleBlockError - submitted vote for incompatible state
+	// * VoteForIncompatibleStateError - submitted vote for incompatible state
 	// * VoteForIncompatibleRankError - submitted vote for incompatible rank
 	// * models.InvalidVoteError - submitted vote with invalid signature
 	// * models.DuplicatedSignerError - vote from a signer whose vote was

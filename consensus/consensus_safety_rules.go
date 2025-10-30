@@ -41,7 +41,7 @@ type SafetyRules[StateT models.Unique, VoteT models.Unique] interface {
 	//  * (nil, model.NoTimeoutError): If replica is not part of the authorized
 	//    consensus committee (anymore) and therefore is not authorized to produce
 	//    a valid timeout state. This sentinel error is _expected_ during normal
-	//    operation, e.g. during the grace-period after Epoch switchover or after
+	//    operation, e.g. during the grace-period after Rank switchover or after
 	//    the replica self-ejected.
 	// All other errors are unexpected and potential symptoms of uncovered edge
 	// cases or corrupted internal state (fatal).
