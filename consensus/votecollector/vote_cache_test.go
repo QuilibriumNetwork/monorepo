@@ -155,7 +155,7 @@ func BenchmarkAdd(b *testing.B) {
 	var done sync.WaitGroup
 	done.Add(threads)
 
-	blockID := helper.MakeIdentity()
+	stateID := helper.MakeIdentity()
 	n := numberVotes / threads
 
 	for ; threads > 0; threads-- {
@@ -165,7 +165,7 @@ func BenchmarkAdd(b *testing.B) {
 			for len(votes) < n {
 				v := helper.VoteFixture(func(v **helper.TestVote) {
 					(*v).Rank = rank
-					(*v).StateID = blockID
+					(*v).StateID = stateID
 				})
 				votes = append(votes, v)
 			}

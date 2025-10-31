@@ -104,7 +104,12 @@ func (e *EventHandler[
 ]) OnReceiveQuorumCertificate(qc models.QuorumCertificate) error {
 	curRank := e.paceMaker.CurrentRank()
 
-	e.tracer.Trace("received QC")
+	e.tracer.Trace(
+		"received QC",
+		consensus.Uint64Param("current_rank", curRank),
+		consensus.Uint64Param("qc_rank", qc.GetRank()),
+		consensus.IdentityParam("state_id", qc.GetSelector()),
+	)
 	e.notifier.OnReceiveQuorumCertificate(curRank, qc)
 	defer e.notifier.OnEventProcessed()
 
@@ -133,7 +138,13 @@ func (e *EventHandler[
 	CollectedT,
 ]) OnReceiveTimeoutCertificate(tc models.TimeoutCertificate) error {
 	curRank := e.paceMaker.CurrentRank()
-	e.tracer.Trace("received TC")
+	e.tracer.Trace(
+		"received TC",
+		consensus.Uint64Param("current_rank", curRank),
+		consensus.Uint64Param("tc_rank", tc.GetRank()),
+		consensus.Uint64Param("tc_newest_qc_rank", tc.GetLatestQuorumCert().GetRank()),
+		consensus.IdentityParam("tc_newest_qc_state_id", tc.GetLatestQuorumCert().GetSelector()),
+	)
 	e.notifier.OnReceiveTimeoutCertificate(curRank, tc)
 	defer e.notifier.OnEventProcessed()
 
@@ -142,12 +153,20 @@ func (e *EventHandler[
 		return fmt.Errorf("could not process TC for rank %d: %w", tc.GetRank(), err)
 	}
 	if newRankEvent == nil {
-		e.tracer.Trace("TC didn't trigger rank change, nothing to do")
+		e.tracer.Trace("TC didn't trigger rank change, nothing to do",
+			consensus.Uint64Param("current_rank", curRank),
+			consensus.Uint64Param("tc_rank", tc.GetRank()),
+			consensus.Uint64Param("tc_newest_qc_rank", tc.GetLatestQuorumCert().GetRank()),
+			consensus.IdentityParam("tc_newest_qc_state_id", tc.GetLatestQuorumCert().GetSelector()))
 		return nil
 	}
 
 	// current rank has changed, go to new rank
-	e.tracer.Trace("TC triggered rank change, starting new rank now")
+	e.tracer.Trace("TC triggered rank change, starting new rank now",
+		consensus.Uint64Param("current_rank", curRank),
+		consensus.Uint64Param("tc_rank", tc.GetRank()),
+		consensus.Uint64Param("tc_newest_qc_rank", tc.GetLatestQuorumCert().GetRank()),
+		consensus.IdentityParam("tc_newest_qc_state_id", tc.GetLatestQuorumCert().GetSelector()))
 	return e.proposeForNewRankIfPrimary()
 }
 
@@ -163,13 +182,27 @@ func (e *EventHandler[
 ]) OnReceiveProposal(proposal *models.SignedProposal[StateT, VoteT]) error {
 	state := proposal.State
 	curRank := e.paceMaker.CurrentRank()
-	e.tracer.Trace("proposal received from compliance engine")
+	e.tracer.Trace(
+		"proposal received from compliance engine",
+		consensus.Uint64Param("current_rank", curRank),
+		consensus.Uint64Param("state_rank", state.Rank),
+		consensus.IdentityParam("state_id", state.Identifier),
+		consensus.Uint64Param("qc_rank", state.ParentQuorumCertificate.GetRank()),
+		consensus.IdentityParam("proposer_id", state.ProposerID),
+	)
 	e.notifier.OnReceiveProposal(curRank, proposal)
 	defer e.notifier.OnEventProcessed()
 
 	// ignore stale proposals
 	if (*state).Rank < e.forks.FinalizedRank() {
-		e.tracer.Trace("stale proposal")
+		e.tracer.Trace(
+			"stale proposal",
+			consensus.Uint64Param("current_rank", curRank),
+			consensus.Uint64Param("state_rank", state.Rank),
+			consensus.IdentityParam("state_id", state.Identifier),
+			consensus.Uint64Param("qc_rank", state.ParentQuorumCertificate.GetRank()),
+			consensus.IdentityParam("proposer_id", state.ProposerID),
+		)
 		return nil
 	}
 
@@ -210,7 +243,14 @@ func (e *EventHandler[
 	if err != nil {
 		return fmt.Errorf("failed processing current state: %w", err)
 	}
-	e.tracer.Trace("proposal processed from compliance engine")
+	e.tracer.Trace(
+		"proposal processed from compliance engine",
+		consensus.Uint64Param("current_rank", curRank),
+		consensus.Uint64Param("state_rank", state.Rank),
+		consensus.IdentityParam("state_id", state.Identifier),
+		consensus.Uint64Param("qc_rank", state.ParentQuorumCertificate.GetRank()),
+		consensus.IdentityParam("proposer_id", state.ProposerID),
+	)
 
 	// nothing to do if this proposal is for current rank
 	if proposal.State.Rank == e.paceMaker.CurrentRank() {
@@ -241,7 +281,10 @@ func (e *EventHandler[
 	CollectedT,
 ]) OnLocalTimeout() error {
 	curRank := e.paceMaker.CurrentRank()
-	e.tracer.Trace("timeout received from event loop")
+	e.tracer.Trace(
+		"timeout received from event loop",
+		consensus.Uint64Param("current_rank", curRank),
+	)
 	e.notifier.OnLocalTimeout(curRank)
 	defer e.notifier.OnEventProcessed()
 
@@ -256,10 +299,10 @@ func (e *EventHandler[
 	return nil
 }
 
-// OnPartialTimeoutCertificateCreated handles notification produces by the internal timeout
-// aggregator. If the notification is for the current rank, a corresponding
-// models.TimeoutState is broadcast to the consensus committee. No errors are
-// expected during normal operation.
+// OnPartialTimeoutCertificateCreated handles notification produces by the
+// internal timeout aggregator. If the notification is for the current rank, a
+// corresponding models.TimeoutState is broadcast to the consensus committee. No
+// errors are expected during normal operation.
 func (e *EventHandler[
 	StateT,
 	VoteT,
@@ -270,7 +313,14 @@ func (e *EventHandler[
 ) error {
 	curRank := e.paceMaker.CurrentRank()
 	previousRankTimeoutCert := partialTC.PriorRankTimeoutCertificate
-	e.tracer.Trace("constructed partial TC")
+	e.tracer.Trace(
+		"constructed partial TC",
+		consensus.Uint64Param("current_rank", curRank),
+		consensus.Uint64Param(
+			"qc_rank",
+			partialTC.NewestQuorumCertificate.GetRank(),
+		),
+	)
 
 	e.notifier.OnPartialTimeoutCertificate(curRank, partialTC)
 	defer e.notifier.OnEventProcessed()
@@ -307,7 +357,14 @@ func (e *EventHandler[
 		return nil
 	}
 
-	e.tracer.Trace("partial TC generated for current rank, broadcasting timeout")
+	e.tracer.Trace(
+		"partial TC generated for current rank, broadcasting timeout",
+		consensus.Uint64Param("current_rank", curRank),
+		consensus.Uint64Param(
+			"qc_rank",
+			partialTC.NewestQuorumCertificate.GetRank(),
+		),
+	)
 	err = e.broadcastTimeoutStateIfAuthorized()
 	if err != nil {
 		return fmt.Errorf(
@@ -375,6 +432,7 @@ func (e *EventHandler[
 			e.tracer.Error(
 				"not generating timeout as this node is not part of the active committee",
 				err,
+				consensus.Uint64Param("current_rank", curRank),
 			)
 			return nil
 		}
@@ -383,7 +441,10 @@ func (e *EventHandler[
 
 	// raise a notification to broadcast timeout
 	e.notifier.OnOwnTimeout(timeout)
-	e.tracer.Trace("broadcast TimeoutState done")
+	e.tracer.Trace(
+		"broadcast TimeoutState done",
+		consensus.Uint64Param("current_rank", curRank),
+	)
 
 	return nil
 }
@@ -426,11 +487,8 @@ func (e *EventHandler[
 
 	// check that I am the primary for this rank
 	if e.committee.Self() != currentLeader {
-		e.tracer.Trace("not primary")
 		return nil
 	}
-
-	e.tracer.Trace("primary")
 
 	// attempt to generate proposal:
 	newestQC := e.paceMaker.LatestQuorumCertificate()
@@ -441,10 +499,20 @@ func (e *EventHandler[
 		// we don't know anything about state referenced by our newest QC, in this
 		// case we can't create a valid proposal since we can't guarantee validity
 		// of state payload.
-		e.tracer.Trace("haven't synced the latest state yet; can't propose")
+		e.tracer.Trace(
+			"haven't synced the latest state yet; can't propose",
+			consensus.Uint64Param("current_rank", curRank),
+			consensus.Uint64Param("finalized_rank", finalizedRank),
+			consensus.IdentityParam("leader_id", currentLeader),
+		)
 		return nil
 	}
-	e.tracer.Trace("generating proposal as leader")
+	e.tracer.Trace(
+		"generating proposal as leader",
+		consensus.Uint64Param("current_rank", curRank),
+		consensus.Uint64Param("finalized_rank", finalizedRank),
+		consensus.IdentityParam("leader_id", currentLeader),
+	)
 
 	// Sanity checks to make sure that resulting proposal is valid:
 	// In its proposal, the leader for rank N needs to present evidence that it
@@ -542,6 +610,9 @@ func (e *EventHandler[
 			e.tracer.Error(
 				"aborting state proposal to prevent equivocation (likely re-entered proposal logic due to crash)",
 				err,
+				consensus.Uint64Param("current_rank", curRank),
+				consensus.Uint64Param("finalized_rank", finalizedRank),
+				consensus.IdentityParam("leader_id", currentLeader),
 			)
 			return nil
 		}
@@ -556,7 +627,15 @@ func (e *EventHandler[
 		start,
 		stateProposal.State.ParentQuorumCertificate.GetSelector(),
 	) // determine target publication time
-	e.tracer.Trace("forwarding proposal to communicator for broadcasting")
+	e.tracer.Trace(
+		"forwarding proposal to communicator for broadcasting",
+		consensus.Uint64Param("state_rank", stateProposal.State.Rank),
+		consensus.TimeParam("target_publication", targetPublicationTime),
+		consensus.IdentityParam("state_id", stateProposal.State.Identifier),
+		consensus.Uint64Param("parent_rank", newestQC.GetRank()),
+		consensus.IdentityParam("parent_id", newestQC.GetSelector()),
+		consensus.IdentityParam("signer", stateProposal.State.ProposerID),
+	)
 
 	// emit notification with own proposal (also triggers broadcast)
 	e.notifier.OnOwnProposal(stateProposal, targetPublicationTime)
@@ -646,11 +725,37 @@ func (e *EventHandler[
 			// unknown error, exit the event loop
 			return fmt.Errorf("could not produce vote: %w", err)
 		}
-		e.tracer.Trace("should not vote for this state")
+		e.tracer.Trace(
+			"should not vote for this state",
+			consensus.Uint64Param("state_rank", proposal.State.Rank),
+			consensus.IdentityParam("state_id", proposal.State.Identifier),
+			consensus.Uint64Param(
+				"parent_rank",
+				proposal.State.ParentQuorumCertificate.GetRank(),
+			),
+			consensus.IdentityParam(
+				"parent_id",
+				proposal.State.ParentQuorumCertificate.GetSelector(),
+			),
+			consensus.IdentityParam("signer", proposal.State.ProposerID[:]),
+		)
 		return nil
 	}
 
-	e.tracer.Trace("forwarding vote to compliance engine")
+	e.tracer.Trace(
+		"forwarding vote to compliance engine",
+		consensus.Uint64Param("state_rank", proposal.State.Rank),
+		consensus.IdentityParam("state_id", proposal.State.Identifier),
+		consensus.Uint64Param(
+			"parent_rank",
+			proposal.State.ParentQuorumCertificate.GetRank(),
+		),
+		consensus.IdentityParam(
+			"parent_id",
+			proposal.State.ParentQuorumCertificate.GetSelector(),
+		),
+		consensus.IdentityParam("signer", proposal.State.ProposerID[:]),
+	)
 	e.notifier.OnOwnVote(ownVote, nextLeader)
 	return nil
 }

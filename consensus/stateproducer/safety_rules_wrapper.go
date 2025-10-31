@@ -23,22 +23,22 @@ import (
 //
 // Concurrency safety:
 //
-//		(a) There is one dedicated thread executing the Event Loop, including the
-//	     EventHandler, that also runs the logic of
-//	     `StateProducer.MakeStateProposal`. Hence, while the 'Event Loop Thread'
-//	     is in `MakeStateProposal`, we are guaranteed the only interactions with
-//	     `SafetyRules` are in `consensus.LeaderProvider.BuildOn`
-//		(b) The Event Loop Thread instantiates the variable `signingStatus`.
-//	     Furthermore, the `signer` call first reads `signingStatus`. Therefore,
-//	     all operations in the EventHandler prior to calling
-//	     `Builder.BuildOn(..)` happen before the call to `signer`. Hence, it is
-//	     guaranteed that the `signer` uses the most recent state of
-//	     `SafetyRules`, even if `Sign` is executed by a different thread.
-//		(c) Just before the `signer` call returns, it writes `signingStatus`.
-//	     Furthermore, the Event Loop Thread reads `signingStatus` right after the
-//	     `Builder.BuildOn(..)` call returns. Thereby, Event Loop Thread sees the
-//	     most recent state of `SafetyRules` after completing the signing
-//	     operation.
+//	(a) There is one dedicated thread executing the Event Loop, including the
+//	    EventHandler, that also runs the logic of
+//	    `StateProducer.MakeStateProposal`. Hence, while the 'Event Loop Thread'
+//	    is in `MakeStateProposal`, we are guaranteed the only interactions with
+//	    `SafetyRules` are in `consensus.LeaderProvider.ProveNextState`
+//	(b) The Event Loop Thread instantiates the variable `signingStatus`.
+//	    Furthermore, the `signer` call first reads `signingStatus`. Therefore,
+//	    all operations in the EventHandler prior to calling
+//	    `Builder.ProveNextState(..)` happen before the call to `signer`. Hence,
+//	    it is guaranteed that the `signer` uses the most recent state of
+//	    `SafetyRules`, even if `Sign` is executed by a different thread.
+//	(c) Just before the `signer` call returns, it writes `signingStatus`.
+//	    Furthermore, the Event Loop Thread reads `signingStatus` right after
+//	    the `Builder.ProveNextState(..)` call returns. Thereby, Event Loop
+//	    Thread sees the most recent state of `SafetyRules` after completing the
+//	    signing operation.
 //
 // With the transitivity of the 'Happens Before' relationship (-> go Memory
 // Model https://go.dev/ref/mem#atomic), we have proven that concurrent access
@@ -48,7 +48,7 @@ import (
 //
 // ╰──────────────┬───────────────╯    ╰──────────────────────────────────────┬─────────────────────────────────────╯    ╰────────────────┬────────────────╯
 //
-//	Event Loop Thread                                 within the scope of Builder.BuildOn                                  Event Loop Thread
+//	Event Loop Thread                                 within the scope of Builder.ProveNextState                                 Event Loop Thread
 //
 // All state transitions _other_ than the one above yield exceptions without
 // modifying `SafetyRules`.

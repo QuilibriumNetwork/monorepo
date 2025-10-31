@@ -7,6 +7,7 @@ import (
 	"slices"
 	"time"
 
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 )
 
@@ -303,9 +304,9 @@ func WithPreviousRankTimeoutCertificate[StateT models.Unique](previousRankTimeou
 
 func WithWeightedIdentityList(count int) []models.WeightedIdentity {
 	wi := []models.WeightedIdentity{}
-	for i := range count {
+	for _ = range count {
 		wi = append(wi, &TestWeightedIdentity{
-			ID: fmt.Sprintf("%d", i),
+			ID: MakeIdentity(),
 		})
 	}
 	return wi
@@ -335,16 +336,47 @@ func VoteFixture(op func(vote **TestVote)) *TestVote {
 	return v
 }
 
-type FmtLog struct{}
+type FmtLog struct {
+	params []consensus.LogParam
+}
 
 // Error implements consensus.TraceLogger.
-func (n *FmtLog) Error(message string, err error) {
+func (n *FmtLog) Error(message string, err error, params ...consensus.LogParam) {
 	fmt.Printf("ERROR: %s: %v\n", message, err)
+	for _, param := range n.params {
+		fmt.Printf("\t%s: %s\n", param.GetKey(), stringFromValue(param))
+	}
+	for _, param := range params {
+		fmt.Printf("\t%s: %s\n", param.GetKey(), stringFromValue(param))
+	}
 }
 
 // Trace implements consensus.TraceLogger.
-func (n *FmtLog) Trace(message string) {
+func (n *FmtLog) Trace(message string, params ...consensus.LogParam) {
 	fmt.Printf("TRACE: %s\n", message)
+	for _, param := range n.params {
+		fmt.Printf("\t%s: %s\n", param.GetKey(), stringFromValue(param))
+	}
+	for _, param := range params {
+		fmt.Printf("\t%s: %s\n", param.GetKey(), stringFromValue(param))
+	}
+}
+
+func (n *FmtLog) With(params ...consensus.LogParam) consensus.TraceLogger {
+	return &FmtLog{
+		params: params,
+	}
+}
+
+func stringFromValue(param consensus.LogParam) string {
+	switch param.GetKind() {
+	case "string":
+		return param.GetValue().(string)
+	case "time":
+		return param.GetValue().(time.Time).String()
+	default:
+		return fmt.Sprintf("%v", param.GetValue())
+	}
 }
 
 func Logger() *FmtLog {

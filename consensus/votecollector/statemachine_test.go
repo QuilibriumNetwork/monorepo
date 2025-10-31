@@ -48,7 +48,7 @@ func (s *StateMachineTestSuite) SetupTest() {
 	s.mockedProcessors = make(map[models.Identity]*mocks.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote])
 	s.notifier = mocks.NewVoteAggregationConsumer[*helper.TestState, *helper.TestVote](s.T())
 
-	s.factoryMethod = func(log consensus.TraceLogger, state *models.SignedProposal[*helper.TestState, *helper.TestVote]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+	s.factoryMethod = func(log consensus.TraceLogger, state *models.SignedProposal[*helper.TestState, *helper.TestVote], dsTag []byte, aggregator consensus.SignatureAggregator) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
 		if processor, found := s.mockedProcessors[state.State.Identifier]; found {
 			return processor, nil
 		}
@@ -56,7 +56,7 @@ func (s *StateMachineTestSuite) SetupTest() {
 	}
 
 	s.workerPool = workerpool.New(4)
-	s.collector = NewStateMachine(s.rank, helper.Logger(), s.workerPool, s.notifier, s.factoryMethod)
+	s.collector = NewStateMachine(s.rank, helper.Logger(), s.workerPool, s.notifier, s.factoryMethod, []byte{}, consensus.SignatureAggregator(mocks.NewSignatureAggregator(s.T())))
 }
 
 // prepareMockedProcessor prepares a mocked processor and stores it in map, later it will be used
@@ -96,7 +96,7 @@ func (s *StateMachineTestSuite) TestStatus_StateTransitions() {
 // factory are handed through (potentially wrapped), but are not replaced.
 func (s *StateMachineTestSuite) Test_FactoryErrorPropagation() {
 	factoryError := errors.New("factory error")
-	factory := func(log consensus.TraceLogger, state *models.SignedProposal[*helper.TestState, *helper.TestVote]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+	factory := func(log consensus.TraceLogger, state *models.SignedProposal[*helper.TestState, *helper.TestVote], dsTag []byte, aggregator consensus.SignatureAggregator) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
 		return nil, factoryError
 	}
 	s.collector.createVerifyingProcessor = factory

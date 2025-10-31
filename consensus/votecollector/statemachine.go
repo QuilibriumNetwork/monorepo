@@ -24,6 +24,8 @@ type VerifyingVoteProcessorFactory[
 ] = func(
 	tracer consensus.TraceLogger,
 	proposal *models.SignedProposal[StateT, VoteT],
+	dsTag []byte,
+	aggregator consensus.SignatureAggregator,
 ) (consensus.VerifyingVoteProcessor[StateT, VoteT], error)
 
 // VoteCollector implements a state machine for transition between different
@@ -34,6 +36,8 @@ type VoteCollector[StateT models.Unique, VoteT models.Unique] struct {
 	workers                  consensus.Workers
 	notifier                 consensus.VoteAggregationConsumer[StateT, VoteT]
 	createVerifyingProcessor VerifyingVoteProcessorFactory[StateT, VoteT]
+	dsTag                    []byte
+	aggregator               consensus.SignatureAggregator
 
 	votesCache     VotesCache[VoteT]
 	votesProcessor atomic.Value
@@ -59,6 +63,8 @@ func NewStateMachineFactory[StateT models.Unique, VoteT models.Unique](
 	tracer consensus.TraceLogger,
 	notifier consensus.VoteAggregationConsumer[StateT, VoteT],
 	verifyingVoteProcessorFactory VerifyingVoteProcessorFactory[StateT, VoteT],
+	dsTag []byte,
+	aggregator consensus.SignatureAggregator,
 ) voteaggregator.NewCollectorFactoryMethod[StateT, VoteT] {
 	return func(rank uint64, workers consensus.Workers) (
 		consensus.VoteCollector[StateT, VoteT],
@@ -70,6 +76,8 @@ func NewStateMachineFactory[StateT models.Unique, VoteT models.Unique](
 			workers,
 			notifier,
 			verifyingVoteProcessorFactory,
+			dsTag,
+			aggregator,
 		), nil
 	}
 }
@@ -80,6 +88,8 @@ func NewStateMachine[StateT models.Unique, VoteT models.Unique](
 	workers consensus.Workers,
 	notifier consensus.VoteAggregationConsumer[StateT, VoteT],
 	verifyingVoteProcessorFactory VerifyingVoteProcessorFactory[StateT, VoteT],
+	dsTag []byte,
+	aggregator consensus.SignatureAggregator,
 ) *VoteCollector[StateT, VoteT] {
 	sm := &VoteCollector[StateT, VoteT]{
 		tracer:                   tracer,
@@ -87,6 +97,8 @@ func NewStateMachine[StateT models.Unique, VoteT models.Unique](
 		notifier:                 notifier,
 		createVerifyingProcessor: verifyingVoteProcessorFactory,
 		votesCache:               *NewVotesCache[VoteT](rank),
+		dsTag:                    dsTag,
+		aggregator:               aggregator,
 	}
 
 	// without a state, we don't process votes (only cache them)
@@ -305,7 +317,12 @@ func (m *VoteCollector[StateT, VoteT]) caching2Verifying(
 	proposal *models.SignedProposal[StateT, VoteT],
 ) error {
 	stateID := proposal.State.Identifier
-	newProc, err := m.createVerifyingProcessor(m.tracer, proposal)
+	newProc, err := m.createVerifyingProcessor(
+		m.tracer,
+		proposal,
+		m.dsTag,
+		m.aggregator,
+	)
 	if err != nil {
 		return fmt.Errorf(
 			"failed to create VerifyingVoteProcessor for state %v: %w",

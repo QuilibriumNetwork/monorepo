@@ -26,7 +26,7 @@ func TestVoteProcessorFactory_CreateWithValidProposal(t *testing.T) {
 	mockedFactory.On("Create", helper.Logger(), proposal, mock.Anything, mock.Anything).Return(mockedProcessor, nil).Once()
 
 	voteProcessorFactory := &VoteProcessorFactory[*helper.TestState, *helper.TestVote, *helper.TestPeer]{
-		baseFactory: func(log consensus.TraceLogger, block *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+		baseFactory: func(log consensus.TraceLogger, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
 			return mockedFactory.Create(log, proposal, dsTag, aggregator)
 		},
 	}
@@ -53,7 +53,7 @@ func TestVoteProcessorFactory_CreateWithInvalidVote(t *testing.T) {
 		mockedFactory.On("Create", helper.Logger(), proposal, mock.Anything, mock.Anything).Return(mockedProcessor, nil).Once()
 
 		voteProcessorFactory := &VoteProcessorFactory[*helper.TestState, *helper.TestVote, *helper.TestPeer]{
-			baseFactory: func(log consensus.TraceLogger, block *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+			baseFactory: func(log consensus.TraceLogger, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
 				return mockedFactory.Create(log, proposal, dsTag, aggregator)
 			},
 		}
@@ -76,7 +76,7 @@ func TestVoteProcessorFactory_CreateWithInvalidVote(t *testing.T) {
 		mockedFactory.On("Create", helper.Logger(), proposal, mock.Anything, mock.Anything).Return(mockedProcessor, nil).Once()
 
 		voteProcessorFactory := &VoteProcessorFactory[*helper.TestState, *helper.TestVote, *helper.TestPeer]{
-			baseFactory: func(log consensus.TraceLogger, block *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+			baseFactory: func(log consensus.TraceLogger, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
 				return mockedFactory.Create(log, proposal, dsTag, aggregator)
 			},
 		}
@@ -84,7 +84,7 @@ func TestVoteProcessorFactory_CreateWithInvalidVote(t *testing.T) {
 		processor, err := voteProcessorFactory.Create(helper.Logger(), proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
 		require.ErrorIs(t, err, exception)
 		require.Nil(t, processor)
-		// an unexpected exception should _not_ be interpreted as the block being invalid
+		// an unexpected exception should _not_ be interpreted as the state being invalid
 		require.False(t, models.IsInvalidProposalError[*helper.TestState, *helper.TestVote](err))
 
 		mockedProcessor.AssertExpectations(t)
@@ -103,7 +103,7 @@ func TestVoteProcessorFactory_CreateProcessException(t *testing.T) {
 
 	mockedFactory.On("Create", helper.Logger(), proposal, mock.Anything, mock.Anything).Return(nil, exception).Once()
 	voteProcessorFactory := &VoteProcessorFactory[*helper.TestState, *helper.TestVote, *helper.TestPeer]{
-		baseFactory: func(log consensus.TraceLogger, block *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+		baseFactory: func(log consensus.TraceLogger, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
 			return mockedFactory.Create(log, proposal, dsTag, aggregator)
 		},
 	}
@@ -111,7 +111,7 @@ func TestVoteProcessorFactory_CreateProcessException(t *testing.T) {
 	processor, err := voteProcessorFactory.Create(helper.Logger(), proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
 	require.ErrorIs(t, err, exception)
 	require.Nil(t, processor)
-	// an unexpected exception should _not_ be interpreted as the block being invalid
+	// an unexpected exception should _not_ be interpreted as the state being invalid
 	require.False(t, models.IsInvalidProposalError[*helper.TestState, *helper.TestVote](err))
 
 	mockedFactory.AssertExpectations(t)

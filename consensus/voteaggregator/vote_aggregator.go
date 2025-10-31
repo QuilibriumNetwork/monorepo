@@ -150,37 +150,38 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedMessages(
 		select {
 		case <-ctx.Done():
 			return nil
+
+		case state, ok := <-va.queuedStates:
+			if ok {
+				err := va.processQueuedState(state)
+				if err != nil {
+					return fmt.Errorf(
+						"could not process pending state %v: %w",
+						state.State.Identifier,
+						err,
+					)
+				}
+
+				continue
+			}
+
+		case vote, ok := <-va.queuedVotes:
+			if ok {
+				err := va.processQueuedVote(vote)
+
+				if err != nil {
+					return fmt.Errorf(
+						"could not process pending vote %v for state %v: %w",
+						(*vote).Identity(),
+						(*vote).Source(),
+						err,
+					)
+				}
+
+				continue
+			}
+
 		default:
-		}
-
-		state, ok := <-va.queuedStates
-		if ok {
-			err := va.processQueuedState(state)
-			if err != nil {
-				return fmt.Errorf(
-					"could not process pending state %v: %w",
-					state.State.Identifier,
-					err,
-				)
-			}
-
-			continue
-		}
-
-		vote, ok := <-va.queuedVotes
-		if ok {
-			err := va.processQueuedVote(vote)
-
-			if err != nil {
-				return fmt.Errorf(
-					"could not process pending vote %v for state %v: %w",
-					(*vote).Identity(),
-					(*vote).Source(),
-					err,
-				)
-			}
-
-			continue
 		}
 
 		// when there is no more messages in the queue, back to the loop to wait
