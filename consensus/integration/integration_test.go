@@ -48,8 +48,8 @@ func TestThreeInstances(t *testing.T) {
 	root := DefaultRoot()
 
 	// set up three instances that are exactly the same
-	// since we don't state any messages we should have enough data to advance in happy path
-	// for that reason we will state all TO related communication.
+	// since we don't drop any messages we should have enough data to advance in happy path
+	// for that reason we will drop all TO related communication.
 	instances := make([]*Instance, 0, num)
 	for n := 0; n < num; n++ {
 		in := NewInstance(t,

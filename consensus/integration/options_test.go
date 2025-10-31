@@ -6,6 +6,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/helper"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker/timeout"
 )
 
 var errStopCondition = errors.New("stop condition reached")
@@ -17,6 +18,7 @@ type Config struct {
 	Root                  *models.State[*helper.TestState]
 	Participants          []models.WeightedIdentity
 	LocalID               models.Identity
+	Timeouts              timeout.Config
 	IncomingVotes         VoteFilter
 	OutgoingVotes         VoteFilter
 	IncomingTimeoutStates TimeoutStateFilter
@@ -43,6 +45,18 @@ func WithLocalID(localID models.Identity) Option {
 	return func(cfg *Config) {
 		cfg.LocalID = localID
 		cfg.Logger = cfg.Logger.With(consensus.IdentityParam("self", localID))
+	}
+}
+
+func WithTimeouts(timeouts timeout.Config) Option {
+	return func(cfg *Config) {
+		cfg.Timeouts = timeouts
+	}
+}
+
+func WithLoggerParams(params ...consensus.LogParam) Option {
+	return func(cfg *Config) {
+		cfg.Logger = cfg.Logger.With(params...)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"slices"
+	"strings"
 	"time"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
@@ -342,29 +343,49 @@ type FmtLog struct {
 
 // Error implements consensus.TraceLogger.
 func (n *FmtLog) Error(message string, err error, params ...consensus.LogParam) {
-	fmt.Printf("ERROR: %s: %v\n", message, err)
+	b := strings.Builder{}
+	b.WriteString(fmt.Sprintf("ERROR: %s: %v\n", message, err))
 	for _, param := range n.params {
-		fmt.Printf("\t%s: %s\n", param.GetKey(), stringFromValue(param))
+		b.WriteString(fmt.Sprintf(
+			"\t%s: %s\n",
+			param.GetKey(),
+			stringFromValue(param),
+		))
 	}
 	for _, param := range params {
-		fmt.Printf("\t%s: %s\n", param.GetKey(), stringFromValue(param))
+		b.WriteString(fmt.Sprintf(
+			"\t%s: %s\n",
+			param.GetKey(),
+			stringFromValue(param),
+		))
 	}
+	fmt.Println(b.String())
 }
 
 // Trace implements consensus.TraceLogger.
 func (n *FmtLog) Trace(message string, params ...consensus.LogParam) {
-	fmt.Printf("TRACE: %s\n", message)
+	b := strings.Builder{}
+	b.WriteString(fmt.Sprintf("TRACE: %s\n", message))
 	for _, param := range n.params {
-		fmt.Printf("\t%s: %s\n", param.GetKey(), stringFromValue(param))
+		b.WriteString(fmt.Sprintf(
+			"\t%s: %s\n",
+			param.GetKey(),
+			stringFromValue(param),
+		))
 	}
 	for _, param := range params {
-		fmt.Printf("\t%s: %s\n", param.GetKey(), stringFromValue(param))
+		b.WriteString(fmt.Sprintf(
+			"\t%s: %s\n",
+			param.GetKey(),
+			stringFromValue(param),
+		))
 	}
+	fmt.Println(b.String())
 }
 
 func (n *FmtLog) With(params ...consensus.LogParam) consensus.TraceLogger {
 	return &FmtLog{
-		params: params,
+		params: slices.Concat(n.params, params),
 	}
 }
 

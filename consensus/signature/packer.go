@@ -47,10 +47,10 @@ func (p *ConsensusSigDataPacker) Pack(
 		sigSet[s.Identity()] = struct{}{}
 	}
 
-	signerIndices := make([]byte, len(fullMembers)+7/8)
+	signerIndices := make([]byte, (len(fullMembers)+7)/8)
 	for i, member := range fullMembers {
 		if _, ok := sigSet[member.Identity()]; ok {
-			signerIndices[i/8] |= 1 << i % 8
+			signerIndices[i/8] |= 1 << (i % 8)
 		}
 	}
 

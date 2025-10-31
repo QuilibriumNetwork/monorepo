@@ -2,282 +2,289 @@ package pacemaker
 
 import (
 	"context"
+	"fmt"
 	"time"
 
-	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker/timeout"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/tracker"
 )
 
-type Pacemaker[
-	StateT models.Unique,
-	VoteT models.Unique,
-	PeerIDT models.Unique,
-	CollectedT models.Unique,
-] struct {
-	ctx                      context.Context
-	started                  bool
-	proposalDurationProvider consensus.ProposalDurationProvider
-	notifier                 consensus.Consumer[StateT, VoteT]
-	store                    consensus.ConsensusStore[VoteT]
-	backoffTimer             *consensus.BackoffTimer
-	traceLogger              consensus.TraceLogger
-	livenessState            *models.LivenessState
+// Pacemaker implements consensus.Pacemaker
+// Conceptually, we use the Pacemaker algorithm first proposed in [1]
+// (specifically Jolteon) and described in more detail in [2] (aka DiemBFT v4).
+// [1] https://arxiv.org/abs/2106.10362
+// [2] https://developers.diem.com/papers/diem-consensus-state-machine-replication-in-the-diem-statechain/2021-08-17.pdf
+//
+// To enter a new rank `r`, the Pacemaker must observe a valid QC or TC for rank
+// `r-1`. The Pacemaker also controls when a node should locally time out for a
+// given rank. Locally timing a rank does not cause a rank change.
+// A local timeout for a rank `r` causes a node to:
+//   - never produce a vote for any proposal with rank ≤ `r`, after the timeout
+//   - produce and broadcast a timeout object, which can form a part of the TC
+//     for the timed out rank
+//
+// Not concurrency safe.
+type Pacemaker[StateT models.Unique, VoteT models.Unique] struct {
+	consensus.ProposalDurationProvider
+
+	ctx            context.Context
+	timeoutControl *timeout.Controller
+	notifier       consensus.ParticipantConsumer[StateT, VoteT]
+	rankTracker    rankTracker[StateT, VoteT]
+	started        bool
 }
 
-func NewPacemaker[
-	StateT models.Unique,
-	VoteT models.Unique,
-	PeerIDT models.Unique,
-	CollectedT models.Unique,
-](
-	initialParameters func() *models.LivenessState,
+var _ consensus.Pacemaker = (*Pacemaker[*nilUnique, *nilUnique])(nil)
+var _ consensus.ProposalDurationProvider = (*Pacemaker[*nilUnique, *nilUnique])(nil)
+
+// New creates a new Pacemaker instance
+//   - startRank is the rank for the pacemaker to start with.
+//   - timeoutController controls the timeout trigger.
+//   - notifier provides callbacks for pacemaker events.
+//
+// Expected error conditions:
+// * models.ConfigurationError if initial LivenessState is invalid
+func NewPacemaker[StateT models.Unique, VoteT models.Unique](
+	timeoutController *timeout.Controller,
 	proposalDurationProvider consensus.ProposalDurationProvider,
 	notifier consensus.Consumer[StateT, VoteT],
 	store consensus.ConsensusStore[VoteT],
-	traceLogger consensus.TraceLogger,
-) (*Pacemaker[StateT, VoteT, PeerIDT, CollectedT], error) {
-	livenessState, err := store.GetLivenessState()
+	recovery ...recoveryInformation[StateT, VoteT],
+) (*Pacemaker[StateT, VoteT], error) {
+	vt, err := newRankTracker[StateT, VoteT](store)
 	if err != nil {
-		livenessState = initialParameters()
+		return nil, fmt.Errorf("initializing rank tracker failed: %w", err)
 	}
 
-	return &Pacemaker[StateT, VoteT, PeerIDT, CollectedT]{
-		proposalDurationProvider: proposalDurationProvider,
+	pm := &Pacemaker[StateT, VoteT]{
+		ProposalDurationProvider: proposalDurationProvider,
+		timeoutControl:           timeoutController,
 		notifier:                 notifier,
-		store:                    store,
-		traceLogger:              traceLogger,
-		livenessState:            livenessState,
-		backoffTimer:             consensus.NewBackoffTimer(),
+		rankTracker:              vt,
 		started:                  false,
-	}, nil
-}
-
-// CurrentRank implements consensus.PacemakerProvider.
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) CurrentRank() uint64 {
-	return p.livenessState.CurrentRank
-}
-
-// LatestQuorumCertificate implements consensus.PacemakerProvider.
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) LatestQuorumCertificate() models.QuorumCertificate {
-	return p.livenessState.LatestQuorumCertificate
-}
-
-// PriorRankTimeoutCertificate implements consensus.PacemakerProvider.
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) PriorRankTimeoutCertificate() models.TimeoutCertificate {
-	return p.livenessState.PriorRankTimeoutCertificate
-}
-
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) newRankAndTimeout(
-	currentRank uint64,
-	newRank uint64,
-) (*models.NextRank, error) {
-	p.notifier.OnRankChange(currentRank, newRank)
-	start, end := p.backoffTimer.Start(p.ctx)
-	p.notifier.OnStartingTimeout(start, end)
-
-	return &models.NextRank{
-		Rank:  newRank,
-		Start: start,
-		End:   end,
-	}, nil
-}
-
-// ReceiveQuorumCertificate implements consensus.PacemakerProvider.
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) ReceiveQuorumCertificate(
-	quorumCertificate models.QuorumCertificate,
-) (*models.NextRank, error) {
-	currentRank := p.livenessState.CurrentRank
-	newRank, err := p.processQuorumCertificate(quorumCertificate)
-	if err != nil {
-		return nil, errors.Wrap(err, "receive quorum certificate")
 	}
-
-	p.backoffTimer.ReceiveSuccess()
-	p.notifier.OnQuorumCertificateTriggeredRankChange(
-		currentRank,
-		newRank,
-		quorumCertificate,
-	)
-
-	return p.newRankAndTimeout(currentRank, newRank)
-}
-
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) processQuorumCertificate(
-	quorumCertificate models.QuorumCertificate,
-) (uint64, error) {
-	currentRank := p.livenessState.CurrentRank
-	if quorumCertificate.GetRank() < currentRank {
-		if p.livenessState.LatestQuorumCertificate.GetRank() >=
-			quorumCertificate.GetRank() {
-			return currentRank, nil
-		}
-
-		p.livenessState.LatestQuorumCertificate = quorumCertificate
-		err := p.store.PutLivenessState(p.livenessState)
+	for _, recoveryAction := range recovery {
+		err = recoveryAction(pm)
 		if err != nil {
-			return currentRank, errors.Wrap(err, "process quorum certificate")
+			return nil, fmt.Errorf("ingesting recovery information failed: %w", err)
 		}
-
-		return currentRank, nil
 	}
-
-	newRank := quorumCertificate.GetRank() + 1
-	p.livenessState.CurrentRank = newRank
-	p.livenessState.LatestQuorumCertificate = quorumCertificate
-	p.livenessState.PriorRankTimeoutCertificate = nil
-	err := p.store.PutLivenessState(p.livenessState)
-	if err != nil {
-		return 0, errors.Wrap(err, "process quorum certificate")
-	}
-
-	return newRank, nil
+	return pm, nil
 }
 
-// ReceiveTimeoutCertificate implements consensus.PacemakerProvider.
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) ReceiveTimeoutCertificate(
-	timeoutCertificate models.TimeoutCertificate,
+// CurrentRank returns the current rank
+func (p *Pacemaker[StateT, VoteT]) CurrentRank() uint64 {
+	return p.rankTracker.CurrentRank()
+}
+
+// LatestQuorumCertificate returns QC with the highest rank discovered by
+// Pacemaker.
+func (
+	p *Pacemaker[StateT, VoteT],
+) LatestQuorumCertificate() models.QuorumCertificate {
+	return p.rankTracker.LatestQuorumCertificate()
+}
+
+// PriorRankTimeoutCertificate returns TC for last rank, this will be nil only
+// if the current rank was entered with a QC.
+func (
+	p *Pacemaker[StateT, VoteT],
+) PriorRankTimeoutCertificate() models.TimeoutCertificate {
+	return p.rankTracker.PriorRankTimeoutCertificate()
+}
+
+// TimeoutCh returns the timeout channel for current active timeout.
+// Note the returned timeout channel returns only one timeout, which is the
+// current timeout. To get the timeout for the next timeout, you need to call
+// TimeoutCh() again.
+func (p *Pacemaker[StateT, VoteT]) TimeoutCh() <-chan time.Time {
+	return p.timeoutControl.Channel()
+}
+
+// ReceiveQuorumCertificate notifies the pacemaker with a new QC, which might
+// allow pacemaker to fast-forward its rank. In contrast to
+// `ReceiveTimeoutCertificate`, this function does _not_ handle `nil` inputs.
+// No errors are expected, any error should be treated as exception.
+func (p *Pacemaker[StateT, VoteT]) ReceiveQuorumCertificate(
+	qc models.QuorumCertificate,
 ) (*models.NextRank, error) {
-	currentRank := p.livenessState.CurrentRank
-	newRank, err := p.processTimeoutCertificate(timeoutCertificate)
+	initialRank := p.CurrentRank()
+	resultingRank, err := p.rankTracker.ReceiveQuorumCertificate(qc)
 	if err != nil {
-		return nil, errors.Wrap(err, "receive timeout certificate")
+		return nil, fmt.Errorf(
+			"unexpected exception in rankTracker while processing QC for rank %d: %w",
+			qc.GetRank(),
+			err,
+		)
 	}
-	if newRank <= currentRank {
+	if resultingRank <= initialRank {
 		return nil, nil
 	}
 
-	p.backoffTimer.ReceiveTimeout()
-	p.notifier.OnTimeoutCertificateTriggeredRankChange(
-		currentRank,
-		newRank,
-		timeoutCertificate,
+	// QC triggered rank change:
+	p.timeoutControl.OnProgressBeforeTimeout()
+	p.notifier.OnQuorumCertificateTriggeredRankChange(
+		initialRank,
+		resultingRank,
+		qc,
 	)
 
-	return p.newRankAndTimeout(currentRank, newRank)
+	p.notifier.OnRankChange(initialRank, resultingRank)
+	timerInfo := p.timeoutControl.StartTimeout(p.ctx, resultingRank)
+	p.notifier.OnStartingTimeout(
+		timerInfo.StartTime,
+		timerInfo.StartTime.Add(timerInfo.Duration),
+	)
+
+	return &models.NextRank{
+		Rank:  timerInfo.Rank,
+		Start: timerInfo.StartTime,
+		End:   timerInfo.StartTime.Add(timerInfo.Duration),
+	}, nil
 }
 
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) processTimeoutCertificate(
-	timeoutCertificate models.TimeoutCertificate,
-) (uint64, error) {
-	currentRank := p.livenessState.CurrentRank
-	if timeoutCertificate == nil {
-		return currentRank, nil
-	}
-
-	if timeoutCertificate.GetRank() < currentRank {
-		if p.livenessState.LatestQuorumCertificate.GetRank() >=
-			timeoutCertificate.GetLatestQuorumCert().GetRank() {
-			return currentRank, nil
-		}
-
-		p.livenessState.LatestQuorumCertificate = timeoutCertificate.
-			GetLatestQuorumCert()
-		err := p.store.PutLivenessState(p.livenessState)
-		if err != nil {
-			return currentRank, errors.Wrap(err, "process timeout certificate")
-		}
-
-		return currentRank, nil
-	}
-
-	newRank := timeoutCertificate.GetRank() + 1
-	p.livenessState.CurrentRank = newRank
-	p.livenessState.LatestQuorumCertificate = timeoutCertificate.
-		GetLatestQuorumCert()
-	p.livenessState.PriorRankTimeoutCertificate = timeoutCertificate
-	err := p.store.PutLivenessState(p.livenessState)
+// ReceiveTimeoutCertificate notifies the Pacemaker of a new timeout
+// certificate, which may allow Pacemaker to fast-forward its current rank. A
+// nil TC is an expected valid input, so that callers may pass in e.g.
+// `Proposal.PriorRankTimeoutCertificate`, which may or may not have a value.
+// No errors are expected, any error should be treated as exception
+func (p *Pacemaker[StateT, VoteT]) ReceiveTimeoutCertificate(
+	tc models.TimeoutCertificate,
+) (*models.NextRank, error) {
+	initialRank := p.CurrentRank()
+	resultingRank, err := p.rankTracker.ReceiveTimeoutCertificate(tc)
 	if err != nil {
-		return 0, errors.Wrap(err, "process timeout certificate")
+		return nil, fmt.Errorf(
+			"unexpected exception in rankTracker while processing TC for rank %d: %w",
+			tc.GetRank(),
+			err,
+		)
+	}
+	if resultingRank <= initialRank {
+		return nil, nil
 	}
 
-	return newRank, nil
+	// TC triggered rank change:
+	p.timeoutControl.OnTimeout()
+	p.notifier.OnTimeoutCertificateTriggeredRankChange(
+		initialRank,
+		resultingRank,
+		tc,
+	)
+
+	p.notifier.OnRankChange(initialRank, resultingRank)
+	timerInfo := p.timeoutControl.StartTimeout(p.ctx, resultingRank)
+	p.notifier.OnStartingTimeout(
+		timerInfo.StartTime,
+		timerInfo.StartTime.Add(timerInfo.Duration),
+	)
+
+	return &models.NextRank{
+		Rank:  timerInfo.Rank,
+		Start: timerInfo.StartTime,
+		End:   timerInfo.StartTime.Add(timerInfo.Duration),
+	}, nil
 }
 
-// TimeoutCh implements consensus.PacemakerProvider.
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) TimeoutCh() <-chan time.Time {
-	return p.backoffTimer.TimeoutCh()
-}
-
-func (p *Pacemaker[
-	StateT,
-	VoteT,
-	PeerIDT,
-	CollectedT,
-]) Start(ctx context.Context) error {
+// Start starts the pacemaker by starting the initial timer for the current
+// rank. Start should only be called once - subsequent calls are a no-op.
+// CAUTION: Pacemaker is not concurrency safe. The Start method must
+// be executed by the same goroutine that also calls the other business logic
+// methods, or concurrency safety has to be implemented externally.
+func (p *Pacemaker[StateT, VoteT]) Start(ctx context.Context) {
 	if p.started {
-		return nil
+		return
 	}
 	p.started = true
 	p.ctx = ctx
-	start, end := p.backoffTimer.Start(ctx)
-	p.notifier.OnStartingTimeout(start, end)
-	return nil
-}
-
-func (p *Pacemaker[StateT, VoteT, PeerIDT, CollectedT]) TargetPublicationTime(
-	proposalRank uint64,
-	timeRankEntered time.Time,
-	parentStateId models.Identity,
-) time.Time {
-	return p.proposalDurationProvider.TargetPublicationTime(
-		proposalRank,
-		timeRankEntered,
-		parentStateId,
+	timerInfo := p.timeoutControl.StartTimeout(ctx, p.CurrentRank())
+	p.notifier.OnStartingTimeout(
+		timerInfo.StartTime,
+		timerInfo.StartTime.Add(timerInfo.Duration),
 	)
 }
 
-var _ consensus.Pacemaker = (*Pacemaker[
-	*nilUnique,
-	*nilUnique,
-	*nilUnique,
-	*nilUnique,
-])(nil)
+/* ------------------------------------ recovery parameters for Pacemaker ------------------------------------ */
+
+// recoveryInformation provides optional information to the Pacemaker during its
+// construction to ingest additional information that was potentially lost
+// during a crash or reboot. Following the "information-driven" approach, we
+// consider potentially older or redundant information as consistent with our
+// already-present knowledge, i.e. as a no-op.
+type recoveryInformation[
+	StateT models.Unique,
+	VoteT models.Unique,
+] func(p *Pacemaker[StateT, VoteT]) error
+
+// WithQCs informs the Pacemaker about the given QCs. Old and nil QCs are
+// accepted (no-op).
+func WithQCs[
+	StateT models.Unique,
+	VoteT models.Unique,
+](qcs ...models.QuorumCertificate) recoveryInformation[StateT, VoteT] {
+	// To avoid excessive database writes during initialization, we pre-filter the
+	// newest QC here and only hand that one to the rankTracker. For recovery, we
+	// allow the special case of nil QCs, because the genesis state has no QC.
+	tracker := tracker.NewNewestQCTracker()
+	for _, qc := range qcs {
+		if qc == nil {
+			continue // no-op
+		}
+		tracker.Track(&qc)
+	}
+	newestQC := tracker.NewestQC()
+	if newestQC == nil {
+		return func(p *Pacemaker[StateT, VoteT]) error { return nil } // no-op
+	}
+
+	return func(p *Pacemaker[StateT, VoteT]) error {
+		_, err := p.rankTracker.ReceiveQuorumCertificate(*newestQC)
+		return err
+	}
+}
+
+// WithTCs informs the Pacemaker about the given TCs. Old and nil TCs are
+// accepted (no-op).
+func WithTCs[
+	StateT models.Unique,
+	VoteT models.Unique,
+](tcs ...models.TimeoutCertificate) recoveryInformation[StateT, VoteT] {
+	qcTracker := tracker.NewNewestQCTracker()
+	tcTracker := tracker.NewNewestTCTracker()
+	for _, tc := range tcs {
+		if tc == nil {
+			continue // no-op
+		}
+		tcTracker.Track(&tc)
+		qc := tc.GetLatestQuorumCert()
+		qcTracker.Track(&qc)
+	}
+	newestTC := tcTracker.NewestTC()
+	newestQC := qcTracker.NewestQC()
+	if newestTC == nil { // shortcut if no TCs provided
+		return func(p *Pacemaker[StateT, VoteT]) error { return nil } // no-op
+	}
+
+	return func(p *Pacemaker[StateT, VoteT]) error {
+		_, err := p.rankTracker.ReceiveTimeoutCertificate(*newestTC) // allows nil inputs
+		if err != nil {
+			return fmt.Errorf(
+				"rankTracker failed to process newest TC provided in constructor: %w",
+				err,
+			)
+		}
+		_, err = p.rankTracker.ReceiveQuorumCertificate(*newestQC) // should never be nil, because a valid TC always contain a QC
+		if err != nil {
+			return fmt.Errorf(
+				"rankTracker failed to process newest QC extracted from the TCs provided in constructor: %w",
+				err,
+			)
+		}
+		return nil
+	}
+}
 
 // Type used to satisfy generic arguments in compiler time type assertion check
 type nilUnique struct{}

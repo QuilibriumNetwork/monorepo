@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/helper"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 )
@@ -42,6 +43,7 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithLoggerParams(consensus.StringParam("status", "healthy")),
 			WithStopCondition(RankFinalized(finalRank)),
 		)
 		instances = append(instances, in)
@@ -53,6 +55,7 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithLoggerParams(consensus.StringParam("status", "unhealthy")),
 			WithStopCondition(RankFinalized(finalRank)),
 			WithOutgoingVotes(DropAllVotes),
 			WithOutgoingProposals(DropAllProposals),
@@ -81,7 +84,7 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 
 	select {
 	case <-ch:
-	case <-time.After(10 * time.Second):
+	case <-time.After(140 * time.Second): // Need timeout to mirror 2 full failures for every five successes, so 30 (finalized) / 5 (successes) * 2 (failure timeouts) * 10 (seconds) = 120 seconds, we add two more failure intervals to account for finalization window
 	}
 	// check that all instances have the same finalized state
 	ref := instances[0]

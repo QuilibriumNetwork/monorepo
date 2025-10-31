@@ -85,8 +85,10 @@ func (
 		case <-ctx.Done():
 			return
 		case <-notifier:
+			t.tracer.Trace("notified for queued timeout state")
 			err := t.processQueuedTimeoutStates(ctx)
 			if err != nil {
+				t.tracer.Error("fatal error encountered", err)
 				return
 			}
 		}
@@ -144,6 +146,7 @@ func (t *TimeoutAggregator[VoteT]) processQueuedTimeout(
 			timeoutState.Rank, err)
 	}
 
+	t.tracer.Trace("adding timeout to collector")
 	err = collector.AddTimeout(timeoutState)
 	if err != nil {
 		return fmt.Errorf("could not process TO for rank %d: %w",

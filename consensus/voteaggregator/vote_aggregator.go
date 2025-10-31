@@ -156,7 +156,7 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedMessages(
 				err := va.processQueuedState(state)
 				if err != nil {
 					return fmt.Errorf(
-						"could not process pending state %v: %w",
+						"could not process pending state %x: %w",
 						state.State.Identifier,
 						err,
 					)
@@ -171,7 +171,7 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedMessages(
 
 				if err != nil {
 					return fmt.Errorf(
-						"could not process pending vote %v for state %v: %w",
+						"could not process pending vote %x for state %x: %w",
 						(*vote).Identity(),
 						(*vote).Source(),
 						err,
@@ -215,7 +215,7 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedVote(vote *VoteT) error {
 	err = collector.AddVote(vote)
 	if err != nil {
 		return fmt.Errorf(
-			"could not process vote for rank %d, stateID %v: %w",
+			"could not process vote for rank %d, stateID %x: %w",
 			(*vote).GetRank(),
 			(*vote).Source(),
 			err,
@@ -250,7 +250,7 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedState(
 			return nil
 		}
 		return fmt.Errorf(
-			"could not get or create collector for state %v: %w",
+			"could not get or create collector for state %x: %w",
 			state.State.Identifier,
 			err,
 		)
@@ -267,13 +267,13 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedState(
 			// VoteAggregator needs to make sure that it's submitting for processing
 			// ONLY valid states.
 			return fmt.Errorf(
-				"received invalid state for processing %v at rank %d",
+				"received invalid state for processing %x at rank %d",
 				state.State.Identifier,
 				state.State.Rank,
 			)
 		}
 		return fmt.Errorf(
-			"could not process state: %v, %w",
+			"could not process state: %x, %w",
 			state.State.Identifier,
 			err,
 		)

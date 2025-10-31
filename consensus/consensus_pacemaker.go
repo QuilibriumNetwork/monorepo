@@ -31,7 +31,7 @@ type Pacemaker interface {
 	// TimeoutCh provides a channel for timing out on the current rank.
 	TimeoutCh() <-chan time.Time
 	// Start starts the pacemaker, takes a cancellable context.
-	Start(ctx context.Context) error
+	Start(ctx context.Context)
 }
 
 // ProposalDurationProvider generates the target publication time for state

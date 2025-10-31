@@ -44,9 +44,9 @@ func (_m *VotingProvider[StateT, VoteT, PeerIDT]) FinalizeQuorumCertificate(ctx 
 	return r0, r1
 }
 
-// FinalizeTimeout provides a mock function with given fields: ctx, filter, rank, latestQuorumCertificateRanks, aggregatedSignature
-func (_m *VotingProvider[StateT, VoteT, PeerIDT]) FinalizeTimeout(ctx context.Context, filter []byte, rank uint64, latestQuorumCertificateRanks []uint64, aggregatedSignature models.AggregatedSignature) (models.TimeoutCertificate, error) {
-	ret := _m.Called(ctx, filter, rank, latestQuorumCertificateRanks, aggregatedSignature)
+// FinalizeTimeout provides a mock function with given fields: ctx, rank, latestQuorumCertificate, latestQuorumCertificateRanks, aggregatedSignature
+func (_m *VotingProvider[StateT, VoteT, PeerIDT]) FinalizeTimeout(ctx context.Context, rank uint64, latestQuorumCertificate models.QuorumCertificate, latestQuorumCertificateRanks []uint64, aggregatedSignature models.AggregatedSignature) (models.TimeoutCertificate, error) {
+	ret := _m.Called(ctx, rank, latestQuorumCertificate, latestQuorumCertificateRanks, aggregatedSignature)
 
 	if len(ret) == 0 {
 		panic("no return value specified for FinalizeTimeout")
@@ -54,19 +54,19 @@ func (_m *VotingProvider[StateT, VoteT, PeerIDT]) FinalizeTimeout(ctx context.Co
 
 	var r0 models.TimeoutCertificate
 	var r1 error
-	if rf, ok := ret.Get(0).(func(context.Context, []byte, uint64, []uint64, models.AggregatedSignature) (models.TimeoutCertificate, error)); ok {
-		return rf(ctx, filter, rank, latestQuorumCertificateRanks, aggregatedSignature)
+	if rf, ok := ret.Get(0).(func(context.Context, uint64, models.QuorumCertificate, []uint64, models.AggregatedSignature) (models.TimeoutCertificate, error)); ok {
+		return rf(ctx, rank, latestQuorumCertificate, latestQuorumCertificateRanks, aggregatedSignature)
 	}
-	if rf, ok := ret.Get(0).(func(context.Context, []byte, uint64, []uint64, models.AggregatedSignature) models.TimeoutCertificate); ok {
-		r0 = rf(ctx, filter, rank, latestQuorumCertificateRanks, aggregatedSignature)
+	if rf, ok := ret.Get(0).(func(context.Context, uint64, models.QuorumCertificate, []uint64, models.AggregatedSignature) models.TimeoutCertificate); ok {
+		r0 = rf(ctx, rank, latestQuorumCertificate, latestQuorumCertificateRanks, aggregatedSignature)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(models.TimeoutCertificate)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(context.Context, []byte, uint64, []uint64, models.AggregatedSignature) error); ok {
-		r1 = rf(ctx, filter, rank, latestQuorumCertificateRanks, aggregatedSignature)
+	if rf, ok := ret.Get(1).(func(context.Context, uint64, models.QuorumCertificate, []uint64, models.AggregatedSignature) error); ok {
+		r1 = rf(ctx, rank, latestQuorumCertificate, latestQuorumCertificateRanks, aggregatedSignature)
 	} else {
 		r1 = ret.Error(1)
 	}

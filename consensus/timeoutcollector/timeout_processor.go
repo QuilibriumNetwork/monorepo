@@ -301,7 +301,7 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) validateTimeout(
 			// conceptually impossible, i.e. a symptom of an internal bug or invalid
 			// bootstrapping information.
 			return fmt.Errorf(
-				"no Rank information availalbe for QC that was included in TO; symptom of internal bug or invalid bootstrapping information: %s",
+				"no Rank information available for QC that was included in TO; symptom of internal bug or invalid bootstrapping information: %s",
 				err.Error(),
 			)
 		}
@@ -370,8 +370,8 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) buildTC() (
 
 	tc, err := p.voting.FinalizeTimeout(
 		context.TODO(),
-		(*newestQC).GetFilter(),
 		p.rank,
+		*newestQC,
 		newestQCRanks,
 		aggregatedSig,
 	)
@@ -401,10 +401,10 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) signerIndicesFromIdentities(
 		signerSet[signerID.Identity()] = struct{}{}
 	}
 
-	signerIndices := make([]byte, len(allIdentities)+7/8)
+	signerIndices := make([]byte, (len(allIdentities)+7)/8)
 	for i, member := range allIdentities {
 		if _, ok := signerSet[member.Identity()]; ok {
-			signerIndices[i/8] |= 1 << i % 8
+			signerIndices[i/8] |= 1 << (i % 8)
 		}
 	}
 

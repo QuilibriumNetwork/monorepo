@@ -54,7 +54,7 @@ func NewForks[StateT models.Unique, VoteT models.Unique](
 	err := forks.EnsureStateIsValidExtension(trustedRoot.State)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"invalid root state %v: %w",
+			"invalid root state %x: %w",
 			trustedRoot.Identifier(),
 			err,
 		)
@@ -260,7 +260,7 @@ func (f *Forks[StateT, VoteT]) AddCertifiedState(
 	err := f.checkForByzantineEvidence(certifiedState.State)
 	if err != nil {
 		return fmt.Errorf(
-			"cannot check for Byzantine evidence in certified state %v: %w",
+			"cannot check for Byzantine evidence in certified state %x: %w",
 			certifiedState.State.Identifier,
 			err,
 		)
@@ -268,7 +268,7 @@ func (f *Forks[StateT, VoteT]) AddCertifiedState(
 	err = f.checkForConflictingQCs(&certifiedState.CertifyingQuorumCertificate)
 	if err != nil {
 		return fmt.Errorf(
-			"certifying QC for state %v failed check for conflicts: %w",
+			"certifying QC for state %x failed check for conflicts: %w",
 			certifiedState.State.Identifier,
 			err,
 		)
@@ -326,7 +326,7 @@ func (f *Forks[StateT, VoteT]) AddValidatedState(
 	err := f.checkForByzantineEvidence(proposal)
 	if err != nil {
 		return fmt.Errorf(
-			"cannot check Byzantine evidence for state %v: %w",
+			"cannot check Byzantine evidence for state %x: %w",
 			proposal.Identifier,
 			err,
 		)
@@ -430,7 +430,7 @@ func (f *Forks[StateT, VoteT]) checkForConflictingQCs(
 				otherChild := otherChildren.NextVertex().(*StateContainer[StateT]).GetState()
 				conflictingQC := otherChild.ParentQuorumCertificate
 				return models.ByzantineThresholdExceededError{Evidence: fmt.Sprintf(
-					"conflicting QCs at rank %d: %v and %v",
+					"conflicting QCs at rank %d: %x and %x",
 					(*qc).GetRank(), (*qc).GetSelector(), conflictingQC.GetSelector(),
 				)}
 			}
@@ -549,7 +549,7 @@ func (f *Forks[StateT, VoteT]) checkForAdvancingFinalization(
 	statesToBeFinalized, err := f.collectStatesForFinalization(&qcForParent)
 	if err != nil {
 		return fmt.Errorf(
-			"advancing finalization to state %v from rank %d failed: %w",
+			"advancing finalization to state %x from rank %d failed: %w",
 			qcForParent.GetSelector(),
 			qcForParent.GetRank(),
 			err,

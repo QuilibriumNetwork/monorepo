@@ -48,7 +48,7 @@ func EnsureVoteForState[StateT models.Unique, VoteT models.Unique](
 ) error {
 	if (*vote).GetRank() != state.Rank {
 		return fmt.Errorf(
-			"vote %v has rank %d while state's rank is %d: %w ",
+			"vote %x has rank %d while state's rank is %d: %w ",
 			(*vote).Identity(),
 			(*vote).GetRank(),
 			state.Rank,
@@ -57,7 +57,7 @@ func EnsureVoteForState[StateT models.Unique, VoteT models.Unique](
 	}
 	if (*vote).Source() != state.Identifier {
 		return fmt.Errorf(
-			"expecting only votes for state %v, but vote %v is for state %v: %w ",
+			"expecting only votes for state %x, but vote %x is for state %x: %w ",
 			state.Identifier,
 			(*vote).Identity(),
 			(*vote).Source(),

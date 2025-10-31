@@ -18,6 +18,9 @@ func FinalizedStates(in *Instance) []*models.State[*helper.TestState] {
 
 	for {
 		finalized = append(finalized, finalizedState)
+		if finalizedState.ParentQuorumCertificate == nil {
+			break
+		}
 		finalizedState, found =
 			in.headers[finalizedState.ParentQuorumCertificate.GetSelector()]
 		if !found {

@@ -65,7 +65,7 @@ func (b *StateSignerDecoder[StateT]) DecodeSignerIDs(
 			members = byStateMembers
 		} else {
 			return nil, fmt.Errorf(
-				"unexpected error retrieving identities for state %v: %w",
+				"unexpected error retrieving identities for state %x: %w",
 				state.Identifier,
 				err,
 			)

@@ -9,7 +9,7 @@ import (
 )
 
 // StateProducer is responsible for producing new state proposals. It is a
-// ervice component to HotStuff's main state machine (implemented in the
+// service component to HotStuff's main state machine (implemented in the
 // EventHandler). The StateProducer's central purpose is to mediate concurrent
 // signing requests to its embedded `consensus.SafetyRules` during state
 // production. The actual work of producing a state proposal is delegated to the
@@ -75,7 +75,7 @@ func (bp *StateProducer[StateT, VoteT, PeerIDT, CollectedT]) MakeStateProposal(
 			)
 		}
 		return nil, fmt.Errorf(
-			"could not build state proposal on top of %v: %w",
+			"could not build state proposal on top of %x: %w",
 			qc.GetSelector(),
 			err,
 		)
@@ -90,7 +90,7 @@ func (bp *StateProducer[StateT, VoteT, PeerIDT, CollectedT]) MakeStateProposal(
 	vote, err := signer.Sign(proposal)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"could not vote on state proposal on top of %v: %w",
+			"could not vote on state proposal on top of %x: %w",
 			qc.GetSelector(),
 			err,
 		)

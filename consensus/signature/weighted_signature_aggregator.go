@@ -100,7 +100,7 @@ func (w *WeightedSignatureAggregator) Verify(
 	info, ok := w.idToInfo[signerID]
 	if !ok {
 		return models.NewInvalidSignerErrorf(
-			"%v is not an authorized signer",
+			"%x is not an authorized signer",
 			signerID,
 		)
 	}
@@ -135,7 +135,7 @@ func (w *WeightedSignatureAggregator) TrustedAdd(
 	info, found := w.idToInfo[signerID]
 	if !found {
 		return w.TotalWeight(), models.NewInvalidSignerErrorf(
-			"%v is not an authorized signer",
+			"%x is not an authorized signer",
 			signerID,
 		)
 	}
@@ -147,7 +147,7 @@ func (w *WeightedSignatureAggregator) TrustedAdd(
 	// check for repeated occurrence of signerID
 	if _, duplicate := w.collectedSigs[signerID]; duplicate {
 		return w.totalWeight, models.NewDuplicatedSignerErrorf(
-			"signature from %v was already added",
+			"signature from %x was already added",
 			signerID,
 		)
 	}

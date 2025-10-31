@@ -111,7 +111,7 @@ func (a *TimeoutSignatureAggregator) VerifyAndAdd(
 	info, ok := a.idToInfo[signerID]
 	if !ok {
 		return a.TotalWeight(), models.NewInvalidSignerErrorf(
-			"%v is not an authorized signer",
+			"%x is not an authorized signer",
 			signerID,
 		)
 	}
@@ -120,7 +120,7 @@ func (a *TimeoutSignatureAggregator) VerifyAndAdd(
 	// style check
 	if a.hasSignature(signerID) {
 		return a.TotalWeight(), models.NewDuplicatedSignerErrorf(
-			"signature from %v was already added",
+			"signature from %x was already added",
 			signerID,
 		)
 	}
@@ -140,7 +140,7 @@ func (a *TimeoutSignatureAggregator) VerifyAndAdd(
 
 	if _, duplicate := a.idToSignature[signerID]; duplicate {
 		return a.totalWeight, models.NewDuplicatedSignerErrorf(
-			"signature from %v was already added",
+			"signature from %x was already added",
 			signerID,
 		)
 	}

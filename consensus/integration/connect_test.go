@@ -26,7 +26,6 @@ func Connect(t *testing.T, instances []*Instance) {
 			func(args mock.Arguments) {
 				proposal, ok := args[0].(*models.SignedProposal[*helper.TestState, *helper.TestVote])
 				require.True(t, ok)
-
 				// sender should always have the parent
 				sender.updatingStates.RLock()
 				_, exists := sender.headers[proposal.State.ParentQuorumCertificate.GetSelector()]
@@ -45,7 +44,6 @@ func Connect(t *testing.T, instances []*Instance) {
 
 				// iterate through potential receivers
 				for _, receiver := range instances {
-
 					// we should skip ourselves always
 					if receiver.localID == sender.localID {
 						continue
@@ -62,7 +60,7 @@ func Connect(t *testing.T, instances []*Instance) {
 		)
 		sender.notifier.CommunicatorConsumer.On("OnOwnVote", mock.Anything, mock.Anything).Run(
 			func(args mock.Arguments) {
-				vote, ok := args[0].(*helper.TestVote)
+				vote, ok := args[0].(**helper.TestVote)
 				require.True(t, ok)
 				recipientID, ok := args[1].(models.Identity)
 				require.True(t, ok)
@@ -71,22 +69,20 @@ func Connect(t *testing.T, instances []*Instance) {
 				if !exists {
 					t.Fatalf("recipient doesn't exist (sender: %x, receiver: %x)", sender.localID, recipientID)
 				}
-
 				// if we are next leader we should be receiving our own vote
 				if recipientID != sender.localID {
 					// check if we should drop the outgoing vote
-					if sender.dropVoteOut(vote) {
+					if sender.dropVoteOut(*vote) {
 						return
 					}
-
-					// check if e should drop the incoming vote
-					if receiver.dropVoteIn(vote) {
+					// check if we should drop the incoming vote
+					if receiver.dropVoteIn(*vote) {
 						return
 					}
 				}
 
-				// submit the vote to the receiving event loop (non-droping)
-				receiver.queue <- vote
+				// submit the vote to the receiving event loop (non-dropping)
+				receiver.queue <- *vote
 			},
 		)
 		sender.notifier.CommunicatorConsumer.On("OnOwnTimeout", mock.Anything).Run(
@@ -100,7 +96,6 @@ func Connect(t *testing.T, instances []*Instance) {
 					if receiver.localID == sender.localID {
 						continue
 					}
-
 					// check if we should drop the outgoing value
 					if sender.dropTimeoutStateOut(timeoutState) {
 						continue

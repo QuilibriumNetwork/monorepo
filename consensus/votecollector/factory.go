@@ -68,7 +68,7 @@ func (f *VoteProcessorFactory[StateT, VoteT, PeerIDT]) Create(
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"instantiating vote processor for state %v failed: %w",
+			"instantiating vote processor for state %x failed: %w",
 			proposal.State.Identifier,
 			err,
 		)
@@ -89,7 +89,7 @@ func (f *VoteProcessorFactory[StateT, VoteT, PeerIDT]) Create(
 			)
 		}
 		return nil, fmt.Errorf(
-			"processing proposer's vote for state %v failed: %w",
+			"processing proposer's vote for state %x failed: %w",
 			proposal.State.Identifier,
 			err,
 		)

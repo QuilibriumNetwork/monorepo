@@ -617,7 +617,7 @@ func (e *EventHandler[
 			return nil
 		}
 		return fmt.Errorf(
-			"can not make state proposal for curRank %v: %w",
+			"can not make state proposal for curRank %d: %w",
 			curRank,
 			err,
 		)

@@ -16,6 +16,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus/mocks"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker/timeout"
 )
 
 const (
@@ -43,19 +44,12 @@ func NewTestPacemaker[
 	PeerIDT models.Unique,
 	CollectedT models.Unique,
 ](
-	initialParameters func() *models.LivenessState,
-	proposalDurationProvider consensus.ProposalDurationProvider,
+	timeoutController *timeout.Controller,
+	proposalDelayProvider consensus.ProposalDurationProvider,
 	notifier consensus.Consumer[StateT, VoteT],
 	store consensus.ConsensusStore[VoteT],
-	traceLogger consensus.TraceLogger,
 ) *TestPacemaker[StateT, VoteT, PeerIDT, CollectedT] {
-	p, err := pacemaker.NewPacemaker[StateT, VoteT, PeerIDT, CollectedT](
-		initialParameters,
-		proposalDurationProvider,
-		notifier,
-		store,
-		traceLogger,
-	)
+	p, err := pacemaker.NewPacemaker[StateT, VoteT](timeoutController, proposalDelayProvider, notifier, store)
 	if err != nil {
 		panic(err)
 	}
@@ -116,23 +110,12 @@ var _ consensus.ProposalDurationProvider = (*nodelay)(nil)
 // using a real pacemaker for testing event handler
 func initPacemaker(t require.TestingT, ctx context.Context, livenessData *models.LivenessState) consensus.Pacemaker {
 	notifier := &mocks.Consumer[*helper.TestState, *helper.TestVote]{}
+	tc, err := timeout.NewConfig(time.Duration(minRepTimeout*1e6), time.Duration(maxRepTimeout*1e6), multiplicativeIncrease, happyPathMaxRoundFailures, time.Duration(maxRepTimeout*1e6))
+	require.NoError(t, err)
 	persist := &mocks.ConsensusStore[*helper.TestVote]{}
 	persist.On("PutLivenessState", mock.Anything).Return(nil).Maybe()
 	persist.On("GetLivenessState").Return(livenessData, nil).Once()
-	pm := NewTestPacemaker[*helper.TestState, *helper.TestVote, *helper.TestPeer, *helper.TestCollected](
-		func() *models.LivenessState {
-			return &models.LivenessState{
-				Filter:                      nil,
-				CurrentRank:                 0,
-				LatestQuorumCertificate:     &helper.TestQuorumCertificate{},
-				PriorRankTimeoutCertificate: nil,
-			}
-		},
-		&nodelay{},
-		notifier,
-		persist,
-		helper.Logger(),
-	)
+	pm := NewTestPacemaker[*helper.TestState, *helper.TestVote, *helper.TestPeer, *helper.TestCollected](timeout.NewController(tc), pacemaker.NoProposalDelay(), notifier, persist)
 	notifier.On("OnStartingTimeout", mock.Anything, mock.Anything).Return()
 	notifier.On("OnQuorumCertificateTriggeredRankChange", mock.Anything, mock.Anything, mock.Anything).Return()
 	notifier.On("OnTimeoutCertificateTriggeredRankChange", mock.Anything, mock.Anything, mock.Anything).Return()

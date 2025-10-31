@@ -22,6 +22,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus/notifications"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/notifications/pubsub"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker/timeout"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/safetyrules"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/stateproducer"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/timeoutaggregator"
@@ -103,6 +104,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 			ID: identity,
 		}},
 		LocalID:               identity,
+		Timeouts:              timeout.DefaultConfig,
 		IncomingVotes:         DropNoVotes,
 		OutgoingVotes:         DropNoVotes,
 		IncomingProposals:     DropNoProposals,
@@ -255,7 +257,9 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 	in.signer.On("CreateQuorumCertificate", mock.Anything).Return(
 		func(votes []*helper.TestVote) models.QuorumCertificate {
 			voterIDs := make([]models.Identity, 0, len(votes))
-			for _, vote := range votes {
+			bitmask := []byte{0, 0}
+			for i, vote := range votes {
+				bitmask[i/8] |= 1 << (i % 8)
 				voterIDs = append(voterIDs, vote.ID)
 			}
 
@@ -266,7 +270,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 				Timestamp:   time.Now().UnixMilli(),
 				AggregatedSignature: &helper.TestAggregatedSignature{
 					Signature: make([]byte, 74),
-					Bitmask:   []byte{0b11111111, 0b00000000},
+					Bitmask:   bitmask,
 					PublicKey: make([]byte, 585),
 				},
 			}
@@ -300,7 +304,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 		},
 	)
 	in.notifier.CommunicatorConsumer.On("OnOwnTimeout", mock.Anything).Run(func(args mock.Arguments) {
-		timeoutState, ok := args[0].(*models.TimeoutState[*helper.TestState])
+		timeoutState, ok := args[0].(*models.TimeoutState[*helper.TestVote])
 		require.True(t, ok)
 		in.queue <- timeoutState
 	},
@@ -308,8 +312,8 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 	// in case of single node setup we should just forward vote to our own node
 	// for multi-node setup this method will be overridden
 	in.notifier.CommunicatorConsumer.On("OnOwnVote", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
-		vote := args[1].(*helper.TestVote)
-		in.queue <- vote
+		vote := args[0].(**helper.TestVote)
+		in.queue <- *vote
 	})
 
 	// program the finalizer module behaviour
@@ -373,9 +377,8 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 	in.persist.On("GetLivenessState").Return(livenessData, nil).Once()
 
 	// initialize the pacemaker
-	durationProvider := mocks.NewProposalDurationProvider(t)
-	durationProvider.On("TargetPublicationTime", mock.Anything, mock.Anything, mock.Anything).Return(time.Now().Add(time.Second))
-	in.pacemaker, err = pacemaker.NewPacemaker[*helper.TestState, *helper.TestVote, *helper.TestPeer, *helper.TestCollected](func() *models.LivenessState { return livenessData }, durationProvider, notifier, in.persist, in.logger)
+	controller := timeout.NewController(cfg.Timeouts)
+	in.pacemaker, err = pacemaker.NewPacemaker[*helper.TestState, *helper.TestVote](controller, pacemaker.NoProposalDelay(), notifier, in.persist)
 	require.NoError(t, err)
 
 	// initialize the forks handler
@@ -385,10 +388,17 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 	// initialize the validator
 	in.validator = validator.NewValidator[*helper.TestState, *helper.TestVote](in.committee, in.verifier)
 
-	indices := []byte{0b11111111, 0b00000000}
-
 	packer := &mocks.Packer{}
-	packer.On("Pack", mock.Anything, mock.Anything).Return(indices, make([]byte, 74), nil).Maybe()
+	packer.On("Pack", mock.Anything, mock.Anything).Return(
+		func(rank uint64, sig *consensus.StateSignatureData) ([]byte, []byte, error) {
+			indices := []byte{0, 0}
+			for i := range sig.Signers {
+				indices[i/8] |= 1 << (i % 8)
+			}
+
+			return indices, make([]byte, 74), nil
+		},
+	).Maybe()
 
 	onQCCreated := func(qc models.QuorumCertificate) {
 		in.queue <- qc
@@ -432,14 +442,32 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 			}, nil
 		},
 	)
+	in.voting.On("FinalizeTimeout", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(
+		func(ctx context.Context, rank uint64, latestQuorumCertificate models.QuorumCertificate, latestQuorumCertificateRanks []uint64, aggregatedSignature models.AggregatedSignature) (models.TimeoutCertificate, error) {
+			return &helper.TestTimeoutCertificate{
+				Filter:              nil,
+				Rank:                rank,
+				LatestRanks:         latestQuorumCertificateRanks,
+				LatestQuorumCert:    latestQuorumCertificate,
+				AggregatedSignature: aggregatedSignature,
+			}, nil
+		},
+	)
 
 	voteAggregationDistributor := pubsub.NewVoteAggregationDistributor[*helper.TestState, *helper.TestVote]()
 	sigAgg := mocks.NewSignatureAggregator(t)
-	sigAgg.On("Aggregate", mock.Anything, mock.Anything).Return(&helper.TestAggregatedSignature{
-		Signature: make([]byte, 74),
-		Bitmask:   []byte{0b11111111, 0b00000000},
-		PublicKey: make([]byte, 585),
-	}, nil)
+	sigAgg.On("Aggregate", mock.Anything, mock.Anything).Return(
+		func(publicKeys [][]byte, signatures [][]byte) (models.AggregatedSignature, error) {
+			bitmask := []byte{0, 0}
+			for i := range publicKeys {
+				bitmask[i/8] |= 1 << (i % 8)
+			}
+			return &helper.TestAggregatedSignature{
+				Signature: make([]byte, 74),
+				Bitmask:   bitmask,
+				PublicKey: make([]byte, 585),
+			}, nil
+		})
 	sigAgg.On("VerifySignatureRaw", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 	createCollectorFactoryMethod := votecollector.NewStateMachineFactory(in.logger, voteAggregationDistributor, voteProcessorFactory.Create, []byte{}, sigAgg)
 	voteCollectors := voteaggregator.NewVoteCollectors(in.logger, livenessData.CurrentRank, workerpool.New(2), createCollectorFactoryMethod)
@@ -462,6 +490,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 			aggregator := &mocks.TimeoutSignatureAggregator{}
 			totalWeight := atomic.NewUint64(0)
 			newestRank := atomic.NewUint64(0)
+			bits := atomic.NewInt64(0)
 			aggregator.On("Rank").Return(rank).Maybe()
 			aggregator.On("TotalWeight").Return(func() uint64 {
 				return totalWeight.Load()
@@ -480,6 +509,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 						}
 					}
 					require.NotNil(t, signer)
+					bits.Add(1)
 					return totalWeight.Add(signer.Weight())
 				}, nil,
 			).Maybe()
@@ -495,10 +525,18 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 					}
 					return signersData
 				},
-				&helper.TestAggregatedSignature{
-					Signature: make([]byte, 74),
-					Bitmask:   []byte{0b11111111, 0b00000000},
-					PublicKey: make([]byte, 585),
+				func() models.AggregatedSignature {
+					bitCount := bits.Load()
+					bitmask := []byte{0, 0}
+					for i := range bitCount {
+						pos := i / 8
+						bitmask[pos] |= 1 << (i % 8)
+					}
+					return &helper.TestAggregatedSignature{
+						Signature: make([]byte, 74),
+						Bitmask:   bitmask,
+						PublicKey: make([]byte, 585),
+					}
 				},
 				nil,
 			).Maybe()

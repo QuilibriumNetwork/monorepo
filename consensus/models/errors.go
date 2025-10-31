@@ -104,7 +104,7 @@ type MissingStateError struct {
 
 func (e MissingStateError) Error() string {
 	return fmt.Sprintf(
-		"missing state at rank %d with ID %v",
+		"missing state at rank %d with ID %x",
 		e.Rank,
 		e.Identifier,
 	)

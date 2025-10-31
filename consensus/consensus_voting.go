@@ -37,8 +37,8 @@ type VotingProvider[
 	// Produces a timeout certificate
 	FinalizeTimeout(
 		ctx context.Context,
-		filter []byte,
 		rank uint64,
+		latestQuorumCertificate models.QuorumCertificate,
 		latestQuorumCertificateRanks []uint64,
 		aggregatedSignature models.AggregatedSignature,
 	) (models.TimeoutCertificate, error)

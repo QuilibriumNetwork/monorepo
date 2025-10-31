@@ -127,7 +127,7 @@ func (m *VoteCollector[StateT, VoteT]) AddVote(vote *VoteT) error {
 			return nil
 		}
 		return fmt.Errorf(
-			"internal error adding vote %v to cache for state %v: %w",
+			"internal error adding vote %x to cache for state %x: %w",
 			(*vote).Identity(),
 			(*vote).Source(),
 			err,
@@ -155,7 +155,7 @@ func (m *VoteCollector[StateT, VoteT]) AddVote(vote *VoteT) error {
 			return nil
 		}
 		return fmt.Errorf(
-			"internal error processing vote %v for state %v: %w",
+			"internal error processing vote %x for state %x: %w",
 			(*vote).Identity(),
 			(*vote).Source(),
 			err,
@@ -226,7 +226,7 @@ func (m *VoteCollector[StateT, VoteT]) ProcessState(
 
 	if proposal.State.Rank != m.Rank() {
 		return fmt.Errorf(
-			"this VoteCollector requires a proposal for rank %d but received state %v with rank %d",
+			"this VoteCollector requires a proposal for rank %d but received state %x with rank %d",
 			m.votesCache.Rank(),
 			proposal.State.Identifier,
 			proposal.State.Rank,
@@ -247,7 +247,7 @@ func (m *VoteCollector[StateT, VoteT]) ProcessState(
 
 			if err != nil {
 				return fmt.Errorf(
-					"internal error updating VoteProcessor's status from %s to %s for state %v: %w",
+					"internal error updating VoteProcessor's status from %s to %s for state %x: %w",
 					proc.Status().String(),
 					consensus.VoteCollectorStatusVerifying.String(),
 					proposal.State.Identifier,
@@ -267,7 +267,7 @@ func (m *VoteCollector[StateT, VoteT]) ProcessState(
 			verifyingProc, ok := proc.(consensus.VerifyingVoteProcessor[StateT, VoteT])
 			if !ok {
 				return fmt.Errorf(
-					"while processing state %v, found that VoteProcessor reports status %s but has an incompatible implementation type %T",
+					"while processing state %x, found that VoteProcessor reports status %s but has an incompatible implementation type %T",
 					proposal.State.Identifier,
 					proc.Status(),
 					verifyingProc,
@@ -284,7 +284,7 @@ func (m *VoteCollector[StateT, VoteT]) ProcessState(
 
 		default:
 			return fmt.Errorf(
-				"while processing state %v, found that VoteProcessor reported unknown status %s",
+				"while processing state %x, found that VoteProcessor reported unknown status %s",
 				proposal.State.Identifier,
 				proc.Status(),
 			)
@@ -325,7 +325,7 @@ func (m *VoteCollector[StateT, VoteT]) caching2Verifying(
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"failed to create VerifyingVoteProcessor for state %v: %w",
+			"failed to create VerifyingVoteProcessor for state %x: %w",
 			stateID,
 			err,
 		)

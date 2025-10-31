@@ -188,7 +188,7 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 			err = el.eventHandler.OnReceiveProposal(proposal)
 			if err != nil {
 				return fmt.Errorf(
-					"could not process proposal %v: %w",
+					"could not process proposal %x: %w",
 					proposal.State.Identifier,
 					err,
 				)
