@@ -45,8 +45,8 @@ func (_m *LeaderProvider[StateT, PeerIDT, CollectedT]) GetNextLeaders(ctx contex
 }
 
 // ProveNextState provides a mock function with given fields: ctx, filter, priorState
-func (_m *LeaderProvider[StateT, PeerIDT, CollectedT]) ProveNextState(ctx context.Context, filter []byte, priorState models.Identity) (*StateT, error) {
-	ret := _m.Called(ctx, filter, priorState)
+func (_m *LeaderProvider[StateT, PeerIDT, CollectedT]) ProveNextState(ctx context.Context, rank uint64, filter []byte, priorState models.Identity) (*StateT, error) {
+	ret := _m.Called(ctx, rank, filter, priorState)
 
 	if len(ret) == 0 {
 		panic("no return value specified for ProveNextState")
@@ -54,19 +54,19 @@ func (_m *LeaderProvider[StateT, PeerIDT, CollectedT]) ProveNextState(ctx contex
 
 	var r0 *StateT
 	var r1 error
-	if rf, ok := ret.Get(0).(func(context.Context, []byte, models.Identity) (*StateT, error)); ok {
-		return rf(ctx, filter, priorState)
+	if rf, ok := ret.Get(0).(func(context.Context, uint64, []byte, models.Identity) (*StateT, error)); ok {
+		return rf(ctx, rank, filter, priorState)
 	}
-	if rf, ok := ret.Get(0).(func(context.Context, []byte, models.Identity) *StateT); ok {
-		r0 = rf(ctx, filter, priorState)
+	if rf, ok := ret.Get(0).(func(context.Context, uint64, []byte, models.Identity) *StateT); ok {
+		r0 = rf(ctx, rank, filter, priorState)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(*StateT)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(context.Context, []byte, models.Identity) error); ok {
-		r1 = rf(ctx, filter, priorState)
+	if rf, ok := ret.Get(1).(func(context.Context, uint64, []byte, models.Identity) error); ok {
+		r1 = rf(ctx, rank, filter, priorState)
 	} else {
 		r1 = ret.Error(1)
 	}

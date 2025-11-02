@@ -366,6 +366,7 @@ func (n *FmtLog) Error(message string, err error, params ...consensus.LogParam) 
 func (n *FmtLog) Trace(message string, params ...consensus.LogParam) {
 	b := strings.Builder{}
 	b.WriteString(fmt.Sprintf("TRACE: %s\n", message))
+	b.WriteString(fmt.Sprintf("\t[%s]\n", time.Now().String()))
 	for _, param := range n.params {
 		b.WriteString(fmt.Sprintf(
 			"\t%s: %s\n",

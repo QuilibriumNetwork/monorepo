@@ -15,6 +15,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus/helper"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/mocks"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle/unittest"
 )
 
 // TestEventLoop performs unit testing of event loop, checks if submitted events are propagated
@@ -44,13 +45,15 @@ func (s *EventLoopTestSuite) SetupTest() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
-	signalerCtx := ctx
+	signalerCtx := unittest.NewMockSignalerContext(s.T(), ctx)
 
 	s.eventLoop.Start(signalerCtx)
+	unittest.RequireCloseBefore(s.T(), s.eventLoop.Ready(), 100*time.Millisecond, "event loop not started")
 }
 
 func (s *EventLoopTestSuite) TearDownTest() {
 	s.cancel()
+	unittest.RequireCloseBefore(s.T(), s.eventLoop.Done(), 100*time.Millisecond, "event loop not stopped")
 }
 
 // TestReadyDone tests if event loop stops internal worker thread
@@ -59,6 +62,7 @@ func (s *EventLoopTestSuite) TestReadyDone() {
 	go func() {
 		s.cancel()
 	}()
+	unittest.RequireCloseBefore(s.T(), s.eventLoop.Done(), 100*time.Millisecond, "event loop not stopped")
 }
 
 // Test_SubmitQC tests that submitted proposal is eventually sent to event handler for processing
@@ -192,8 +196,10 @@ func TestEventLoop_Timeout(t *testing.T) {
 	eh.On("TimeoutChannel").Return(time.After(100 * time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	signalerCtx := ctx
+	signalerCtx := unittest.NewMockSignalerContext(t, ctx)
 	eventLoop.Start(signalerCtx)
+
+	unittest.RequireCloseBefore(t, eventLoop.Ready(), 100*time.Millisecond, "event loop not stopped")
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -217,8 +223,10 @@ func TestEventLoop_Timeout(t *testing.T) {
 	}()
 
 	require.Eventually(t, processed.Load, time.Millisecond*200, time.Millisecond*10)
+	unittest.AssertReturnsBefore(t, func() { wg.Wait() }, time.Millisecond*200)
 
 	cancel()
+	unittest.RequireCloseBefore(t, eventLoop.Done(), 100*time.Millisecond, "event loop not stopped")
 }
 
 // TestReadyDoneWithStartTime tests that event loop correctly starts and schedules start of processing
@@ -235,16 +243,20 @@ func TestReadyDoneWithStartTime(t *testing.T) {
 	require.NoError(t, err)
 
 	done := make(chan struct{})
-	eh.On("OnReceiveProposal", mock.AnythingOfType("*models.SignedProposal")).Run(func(args mock.Arguments) {
+	eh.On("OnReceiveProposal", mock.Anything).Run(func(args mock.Arguments) {
 		require.True(t, time.Now().After(startTime))
 		close(done)
 	}).Return(nil).Once()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	signalerCtx := ctx
+	signalerCtx := unittest.NewMockSignalerContext(t, ctx)
 	eventLoop.Start(signalerCtx)
+
+	unittest.RequireCloseBefore(t, eventLoop.Ready(), 100*time.Millisecond, "event loop not started")
 
 	eventLoop.SubmitProposal(helper.MakeSignedProposal[*helper.TestState, *helper.TestVote]())
 
+	unittest.RequireCloseBefore(t, done, startTimeDuration+100*time.Millisecond, "proposal wasn't received")
 	cancel()
+	unittest.RequireCloseBefore(t, eventLoop.Done(), 100*time.Millisecond, "event loop not stopped")
 }

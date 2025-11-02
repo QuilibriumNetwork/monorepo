@@ -19,8 +19,8 @@ import (
 //     `NewestQC()`.
 //     Furthermore, `PriorRankTimeoutCertificate()` returns nil.
 //   - If the current rank was entered by observing a TC, `NewestQC()` returns
-//     the newest QC known. `PriorRankTimeoutCertificate()` returns the TC that triggered the
-//     rank change
+//     the newest QC known. `PriorRankTimeoutCertificate()` returns the TC that
+//     triggered the rank change
 type rankTracker[StateT models.Unique, VoteT models.Unique] struct {
 	livenessState models.LivenessState
 	store         consensus.ConsensusStore[VoteT]

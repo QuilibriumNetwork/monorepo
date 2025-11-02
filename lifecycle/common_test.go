@@ -38,8 +38,9 @@ func TestAllDone(t *testing.T) {
 func testAllDone(n int, t *testing.T) {
 	components := make([]lifecycle.Component, n)
 	for i := 0; i < n; i++ {
-		components[i] = mocks.NewComponent(t)
-		unittest.Componentify(components[i])
+		c := mocks.NewComponent(t)
+		unittest.Componentify(&c.Mock)
+		components[i] = c
 	}
 
 	unittest.AssertClosesBefore(t, lifecycle.AllReady(components...), time.Second)
@@ -54,8 +55,9 @@ func testAllDone(n int, t *testing.T) {
 func testAllReady(n int, t *testing.T) {
 	components := make([]lifecycle.Component, n)
 	for i := 0; i < n; i++ {
-		components[i] = mocks.NewComponent(t)
-		unittest.Componentify(components[i])
+		c := mocks.NewComponent(t)
+		unittest.Componentify(&c.Mock)
+		components[i] = c
 	}
 
 	unittest.AssertClosesBefore(t, lifecycle.AllDone(components...), time.Second)

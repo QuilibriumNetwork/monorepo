@@ -14,6 +14,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus/helper"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/mocks"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle/unittest"
 )
 
 func TestTimeoutAggregator(t *testing.T) {
@@ -47,13 +48,15 @@ func (s *TimeoutAggregatorTestSuite) SetupTest() {
 	require.NoError(s.T(), err)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	signalerCtx := ctx
+	signalerCtx := unittest.NewMockSignalerContext(s.T(), ctx)
 	s.stopAggregator = cancel
 	s.aggregator.Start(signalerCtx)
+	unittest.RequireCloseBefore(s.T(), s.aggregator.Ready(), 100*time.Millisecond, "should close before timeout")
 }
 
 func (s *TimeoutAggregatorTestSuite) TearDownTest() {
 	s.stopAggregator()
+	unittest.RequireCloseBefore(s.T(), s.aggregator.Done(), time.Second, "should close before timeout")
 }
 
 // TestAddTimeout_HappyPath tests a happy path when multiple threads are adding timeouts for processing
@@ -98,7 +101,7 @@ func (s *TimeoutAggregatorTestSuite) TestAddTimeout_RankUnknown() {
 		close(done)
 	}).Once()
 	s.aggregator.AddTimeout(timeout)
-	time.Sleep(100 * time.Millisecond)
+	unittest.AssertClosesBefore(s.T(), done, time.Second)
 }
 
 // TestPruneUpToRank tests that pruning removes collectors lower that retained rank
@@ -116,7 +119,7 @@ func (s *TimeoutAggregatorTestSuite) TestOnQuorumCertificateTriggeredRankChange(
 	}).Once()
 	qc := helper.MakeQC(helper.WithQCRank(s.lowestRetainedRank))
 	s.aggregator.OnRankChange(qc.GetRank(), qc.GetRank()+1)
-	time.Sleep(100 * time.Millisecond)
+	unittest.AssertClosesBefore(s.T(), done, time.Second)
 }
 
 // TestOnTimeoutCertificateTriggeredRankChange tests if entering rank event gets processed when send through `TimeoutAggregator`.
@@ -129,5 +132,5 @@ func (s *TimeoutAggregatorTestSuite) TestOnTimeoutCertificateTriggeredRankChange
 	}).Once()
 	tc := helper.MakeTC(helper.WithTCRank(s.lowestRetainedRank))
 	s.aggregator.OnRankChange(tc.GetRank(), tc.GetRank()+1)
-	time.Sleep(100 * time.Millisecond)
+	unittest.AssertClosesBefore(s.T(), done, time.Second)
 }

@@ -96,6 +96,7 @@ func Connect(t *testing.T, instances []*Instance) {
 					if receiver.localID == sender.localID {
 						continue
 					}
+
 					// check if we should drop the outgoing value
 					if sender.dropTimeoutStateOut(timeoutState) {
 						continue

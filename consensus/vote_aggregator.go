@@ -1,9 +1,8 @@
 package consensus
 
 import (
-	"context"
-
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 )
 
 // VoteAggregator verifies and aggregates votes to build QC. When enough votes
@@ -11,7 +10,7 @@ import (
 // VoteAggregator also detects protocol violation, including invalid votes,
 // double voting etc, and notifies a HotStuff consumer for slashing.
 type VoteAggregator[StateT models.Unique, VoteT models.Unique] interface {
-	Start(ctx context.Context) error
+	lifecycle.Component
 
 	// AddVote verifies and aggregates a vote. The voting state could either be
 	// known or unknown. If the voting state is unknown, the vote won't be

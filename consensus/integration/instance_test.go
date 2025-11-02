@@ -14,6 +14,7 @@ import (
 	"go.uber.org/atomic"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/counters"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/eventhandler"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/forks"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/helper"
@@ -30,6 +31,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus/validator"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/voteaggregator"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/votecollector"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle/unittest"
 )
 
 type Instance struct {
@@ -190,17 +193,17 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 	in.committee.On("TimeoutThresholdForRank", mock.Anything).Return(uint64(len(in.participants)*2000/3), nil)
 
 	// program the builder module behaviour
-	in.builder.On("ProveNextState", mock.Anything, mock.Anything, mock.Anything).Return(
-		func(ctx context.Context, filter []byte, parentID models.Identity) **helper.TestState {
+	in.builder.On("ProveNextState", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(
+		func(ctx context.Context, rank uint64, filter []byte, parentID models.Identity) **helper.TestState {
 			in.updatingStates.Lock()
 			defer in.updatingStates.Unlock()
 
-			parent, ok := in.headers[parentID]
+			_, ok := in.headers[parentID]
 			if !ok {
 				return nil
 			}
 			s := &helper.TestState{
-				Rank:      parent.Rank + 1,
+				Rank:      rank,
 				Signature: []byte{},
 				Timestamp: uint64(time.Now().UnixMilli()),
 				ID:        helper.MakeIdentity(),
@@ -208,7 +211,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 			}
 			return &s
 		},
-		func(ctx context.Context, filter []byte, parentID models.Identity) error {
+		func(ctx context.Context, rank uint64, filter []byte, parentID models.Identity) error {
 			in.updatingStates.RLock()
 			_, ok := in.headers[parentID]
 			in.updatingStates.RUnlock()
@@ -312,7 +315,8 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 	// in case of single node setup we should just forward vote to our own node
 	// for multi-node setup this method will be overridden
 	in.notifier.CommunicatorConsumer.On("OnOwnVote", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
-		vote := args[0].(**helper.TestVote)
+		vote, ok := args[0].(**helper.TestVote)
+		require.True(t, ok)
 		in.queue <- *vote
 	})
 
@@ -346,6 +350,8 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 
 	notifier := pubsub.NewDistributor[*helper.TestState, *helper.TestVote]()
 	notifier.AddConsumer(in.notifier)
+	logConsumer := notifications.NewLogConsumer[*helper.TestState, *helper.TestVote](in.logger)
+	notifier.AddConsumer(logConsumer)
 
 	// initialize the finalizer
 	var rootState *models.State[*helper.TestState]
@@ -489,19 +495,15 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 			// mock signature aggregator which doesn't perform any crypto operations and just tracks total weight
 			aggregator := &mocks.TimeoutSignatureAggregator{}
 			totalWeight := atomic.NewUint64(0)
-			newestRank := atomic.NewUint64(0)
-			bits := atomic.NewInt64(0)
+			newestRank := counters.NewMonotonicCounter(0)
+			bits := counters.NewMonotonicCounter(0)
 			aggregator.On("Rank").Return(rank).Maybe()
 			aggregator.On("TotalWeight").Return(func() uint64 {
 				return totalWeight.Load()
 			}).Maybe()
-			aggregator.On("VerifySignatureRaw", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 			aggregator.On("VerifyAndAdd", mock.Anything, mock.Anything, mock.Anything).Return(
 				func(signerID models.Identity, _ []byte, newestQCRank uint64) uint64 {
-					newest := newestRank.Load()
-					if newestQCRank > newest {
-						newestRank.Store(newestQCRank)
-					}
+					newestRank.Set(newestQCRank)
 					var signer models.WeightedIdentity
 					for _, p := range in.participants {
 						if p.Identity() == signerID {
@@ -509,14 +511,14 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 						}
 					}
 					require.NotNil(t, signer)
-					bits.Add(1)
+					bits.Increment()
 					return totalWeight.Add(signer.Weight())
 				}, nil,
 			).Maybe()
-			aggregator.On("Aggregate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(
+			aggregator.On("Aggregate").Return(
 				func() []consensus.TimeoutSignerInfo {
 					signersData := make([]consensus.TimeoutSignerInfo, 0, len(in.participants))
-					newestQCRank := newestRank.Load()
+					newestQCRank := newestRank.Value()
 					for _, signer := range in.participants {
 						signersData = append(signersData, consensus.TimeoutSignerInfo{
 							NewestQCRank: newestQCRank,
@@ -526,7 +528,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 					return signersData
 				},
 				func() models.AggregatedSignature {
-					bitCount := bits.Load()
+					bitCount := bits.Value()
 					bitmask := []byte{0, 0}
 					for i := range bitCount {
 						pos := i / 8
@@ -607,16 +609,12 @@ func (in *Instance) Run(t *testing.T) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		cancel()
-		<-ctx.Done()
+		<-lifecycle.AllDone(in.voteAggregator, in.timeoutAggregator)
 	}()
-	signalerCtx := ctx
-	go func() {
-		err := in.voteAggregator.Start(signalerCtx)
-		if err != nil {
-			panic(err)
-		}
-	}()
+	signalerCtx := unittest.NewMockSignalerContext(t, ctx)
+	in.voteAggregator.Start(signalerCtx)
 	in.timeoutAggregator.Start(signalerCtx)
+	<-lifecycle.AllReady(in.voteAggregator, in.timeoutAggregator)
 
 	// start the event handler
 	err := in.handler.Start(ctx)
@@ -730,4 +728,5 @@ func (in *Instance) OnNewTimeoutCertificateDiscovered(tc models.TimeoutCertifica
 	in.queue <- tc
 }
 
-func (in *Instance) OnTimeoutProcessed(*models.TimeoutState[*helper.TestVote]) {}
+func (in *Instance) OnTimeoutProcessed(*models.TimeoutState[*helper.TestVote]) {
+}

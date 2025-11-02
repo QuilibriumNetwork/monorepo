@@ -12,6 +12,8 @@ replace github.com/libp2p/go-libp2p => ../go-libp2p
 
 replace github.com/libp2p/go-libp2p-kad-dht => ../go-libp2p-kad-dht
 
+replace source.quilibrium.com/quilibrium/monorepo/lifecycle => ../lifecycle
+
 require (
 	github.com/gammazero/workerpool v1.1.3
 	github.com/rs/zerolog v1.34.0
@@ -36,4 +38,5 @@ require (
 	go.uber.org/atomic v1.11.0
 	golang.org/x/sync v0.17.0
 	golang.org/x/sys v0.33.0 // indirect
+	source.quilibrium.com/quilibrium/monorepo/lifecycle v0.0.0-00010101000000-000000000000
 )

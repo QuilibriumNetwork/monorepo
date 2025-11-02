@@ -13,6 +13,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/helper"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker/timeout"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle/unittest"
 )
 
 // pacemaker timeout
@@ -36,6 +38,8 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 	participants := helper.WithWeightedIdentityList(healthyReplicas + notVotingReplicas)
 	instances := make([]*Instance, 0, healthyReplicas+notVotingReplicas)
 	root := DefaultRoot()
+	timeouts, err := timeout.NewConfig(pmTimeout, pmTimeout, 1.5, happyPathMaxRoundFailures, maxTimeoutRebroadcast)
+	require.NoError(t, err)
 
 	// set up five instances that work fully
 	for n := 0; n < healthyReplicas; n++ {
@@ -43,6 +47,7 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithTimeouts(timeouts),
 			WithLoggerParams(consensus.StringParam("status", "healthy")),
 			WithStopCondition(RankFinalized(finalRank)),
 		)
@@ -55,6 +60,7 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithTimeouts(timeouts),
 			WithLoggerParams(consensus.StringParam("status", "unhealthy")),
 			WithStopCondition(RankFinalized(finalRank)),
 			WithOutgoingVotes(DropAllVotes),
@@ -76,16 +82,8 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 			wg.Done()
 		}(in)
 	}
-	ch := make(chan struct{})
-	go func() {
-		wg.Wait()
-		ch <- struct{}{}
-	}()
+	unittest.AssertReturnsBefore(t, wg.Wait, 10*time.Second, "expect to finish before timeout")
 
-	select {
-	case <-ch:
-	case <-time.After(140 * time.Second): // Need timeout to mirror 2 full failures for every five successes, so 30 (finalized) / 5 (successes) * 2 (failure timeouts) * 10 (seconds) = 120 seconds, we add two more failure intervals to account for finalization window
-	}
 	// check that all instances have the same finalized state
 	ref := instances[0]
 	assert.Equal(t, finalRank, ref.forks.FinalizedState().Rank, "expect instance 0 should made enough progress, but didn't")
@@ -109,6 +107,8 @@ func Test2TimeoutOutof4Instances(t *testing.T) {
 	participants := helper.WithWeightedIdentityList(healthyReplicas + replicasDroppingHappyPathMsgs)
 	instances := make([]*Instance, 0, healthyReplicas+replicasDroppingHappyPathMsgs)
 	root := DefaultRoot()
+	timeouts, err := timeout.NewConfig(10*time.Millisecond, 50*time.Millisecond, 1.5, happyPathMaxRoundFailures, maxTimeoutRebroadcast)
+	require.NoError(t, err)
 
 	// set up two instances that work fully
 	for n := 0; n < healthyReplicas; n++ {
@@ -116,6 +116,8 @@ func Test2TimeoutOutof4Instances(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithTimeouts(timeouts),
+			WithLoggerParams(consensus.StringParam("status", "healthy")),
 			WithStopCondition(RankReached(finalRank)),
 		)
 		instances = append(instances, in)
@@ -127,6 +129,8 @@ func Test2TimeoutOutof4Instances(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithTimeouts(timeouts),
+			WithLoggerParams(consensus.StringParam("status", "unhealthy")),
 			WithStopCondition(RankReached(finalRank)),
 			WithOutgoingVotes(DropAllVotes),
 			WithIncomingVotes(DropAllVotes),
@@ -148,16 +152,7 @@ func Test2TimeoutOutof4Instances(t *testing.T) {
 			wg.Done()
 		}(in)
 	}
-	ch := make(chan struct{})
-	go func() {
-		wg.Wait()
-		ch <- struct{}{}
-	}()
-
-	select {
-	case <-ch:
-	case <-time.After(10 * time.Second):
-	}
+	unittest.AssertReturnsBefore(t, wg.Wait, 10*time.Second, "expect to finish before timeout")
 
 	// check that all instances have the same finalized state
 	ref := instances[0]
@@ -183,6 +178,8 @@ func Test1TimeoutOutof5Instances(t *testing.T) {
 	participants := helper.WithWeightedIdentityList(healthyReplicas + stateedReplicas)
 	instances := make([]*Instance, 0, healthyReplicas+stateedReplicas)
 	root := DefaultRoot()
+	timeouts, err := timeout.NewConfig(pmTimeout, pmTimeout, 1.5, happyPathMaxRoundFailures, maxTimeoutRebroadcast)
+	require.NoError(t, err)
 
 	// set up instances that work fully
 	for n := 0; n < healthyReplicas; n++ {
@@ -190,6 +187,8 @@ func Test1TimeoutOutof5Instances(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithTimeouts(timeouts),
+			WithLoggerParams(consensus.StringParam("status", "healthy")),
 			WithStopCondition(RankFinalized(finalRank)),
 		)
 		instances = append(instances, in)
@@ -201,6 +200,8 @@ func Test1TimeoutOutof5Instances(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithTimeouts(timeouts),
+			WithLoggerParams(consensus.StringParam("status", "unhealthy")),
 			WithStopCondition(RankReached(finalRank)),
 			WithOutgoingVotes(DropAllVotes),
 			WithOutgoingProposals(DropAllProposals),
@@ -221,18 +222,7 @@ func Test1TimeoutOutof5Instances(t *testing.T) {
 			wg.Done()
 		}(in)
 	}
-	ch := make(chan struct{})
-	go func() {
-		wg.Wait()
-		ch <- struct{}{}
-	}()
-
-	success := false
-	select {
-	case <-ch:
-		success = true
-	case <-time.After(10 * time.Second):
-	}
+	success := unittest.AssertReturnsBefore(t, wg.Wait, 10*time.Second, "expect to finish before timeout")
 	if !success {
 		t.Logf("dumping state of system:")
 		for i, inst := range instances {
@@ -286,6 +276,8 @@ func TestStateDelayIsHigherThanTimeout(t *testing.T) {
 	participants := helper.WithWeightedIdentityList(healthyReplicas + replicasNotGeneratingTimeouts)
 	instances := make([]*Instance, 0, healthyReplicas+replicasNotGeneratingTimeouts)
 	root := DefaultRoot()
+	timeouts, err := timeout.NewConfig(pmTimeout, pmTimeout, 1.5, happyPathMaxRoundFailures, maxTimeoutRebroadcast)
+	require.NoError(t, err)
 
 	// set up 2 instances that fully work (incl. sending TimeoutStates)
 	for n := 0; n < healthyReplicas; n++ {
@@ -293,6 +285,7 @@ func TestStateDelayIsHigherThanTimeout(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithTimeouts(timeouts),
 			WithStopCondition(RankFinalized(finalRank)),
 		)
 		instances = append(instances, in)
@@ -304,6 +297,7 @@ func TestStateDelayIsHigherThanTimeout(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithTimeouts(timeouts),
 			WithStopCondition(RankFinalized(finalRank)),
 			WithIncomingTimeoutStates(DropAllTimeoutStates),
 			WithOutgoingTimeoutStates(DropAllTimeoutStates),
@@ -324,16 +318,7 @@ func TestStateDelayIsHigherThanTimeout(t *testing.T) {
 			wg.Done()
 		}(in)
 	}
-	ch := make(chan struct{})
-	go func() {
-		wg.Wait()
-		ch <- struct{}{}
-	}()
-
-	select {
-	case <-ch:
-	case <-time.After(10 * time.Second):
-	}
+	unittest.AssertReturnsBefore(t, wg.Wait, 10*time.Second, "expect to finish before timeout")
 
 	// check that all instances have the same finalized state
 	ref := instances[0]
@@ -369,10 +354,12 @@ func TestAsyncClusterStartup(t *testing.T) {
 	replicas := 4
 	finalRank := uint64(20)
 
-	// generate the seven hotstuff participants
+	// generate the four hotstuff participants
 	participants := helper.WithWeightedIdentityList(replicas)
 	instances := make([]*Instance, 0, replicas)
 	root := DefaultRoot()
+	timeouts, err := timeout.NewConfig(pmTimeout, pmTimeout, 1.5, 6, maxTimeoutRebroadcast)
+	require.NoError(t, err)
 
 	// set up instances that work fully
 	var lock sync.Mutex
@@ -382,6 +369,7 @@ func TestAsyncClusterStartup(t *testing.T) {
 			WithRoot(root),
 			WithParticipants(participants),
 			WithLocalID(participants[n].Identity()),
+			WithTimeouts(timeouts),
 			WithStopCondition(RankFinalized(finalRank)),
 			WithOutgoingVotes(func(vote *helper.TestVote) bool {
 				return vote.Rank == 1
@@ -411,16 +399,7 @@ func TestAsyncClusterStartup(t *testing.T) {
 			wg.Done()
 		}(in)
 	}
-	ch := make(chan struct{})
-	go func() {
-		wg.Wait()
-		ch <- struct{}{}
-	}()
-
-	select {
-	case <-ch:
-	case <-time.After(10 * time.Second):
-	}
+	unittest.AssertReturnsBefore(t, wg.Wait, 10*time.Second, "expect to finish before timeout")
 
 	// check that all instances have the same finalized state
 	ref := instances[0]

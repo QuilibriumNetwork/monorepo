@@ -63,6 +63,7 @@ func (bp *StateProducer[StateT, VoteT, PeerIDT, CollectedT]) MakeStateProposal(
 ) (*models.SignedProposal[StateT, VoteT], error) {
 	newState, err := bp.builder.ProveNextState(
 		context.TODO(),
+		rank,
 		qc.GetFilter(),
 		qc.GetSelector(),
 	)

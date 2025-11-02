@@ -1,9 +1,8 @@
 package consensus
 
 import (
-	"context"
-
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 )
 
 // VoteCollectors is an interface which allows VoteAggregator to interact with
@@ -11,7 +10,7 @@ import (
 // Implementations of this interface are responsible for state transitions of
 // `VoteCollector`s and pruning of stale and outdated collectors by rank.
 type VoteCollectors[StateT models.Unique, VoteT models.Unique] interface {
-	Start(ctx context.Context) error
+	lifecycle.Component
 
 	// GetOrCreateCollector retrieves the consensus.VoteCollector for the specified
 	// rank or creates one if none exists.

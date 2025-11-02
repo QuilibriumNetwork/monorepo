@@ -1,12 +1,12 @@
 package voteaggregator
 
 import (
-	"context"
 	"fmt"
 	"sync"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 )
 
 // NewCollectorFactoryMethod is a factory method to generate a VoteCollector for
@@ -21,6 +21,7 @@ type NewCollectorFactoryMethod[StateT models.Unique, VoteT models.Unique] = func
 // for a particular rank is lazy (instances are created on demand).
 // This structure is concurrency safe.
 type VoteCollectors[StateT models.Unique, VoteT models.Unique] struct {
+	*lifecycle.ComponentManager
 	tracer             consensus.TraceLogger
 	lock               sync.RWMutex
 	lowestRetainedRank uint64                                            // lowest rank, for which we still retain a VoteCollector and process votes
@@ -37,21 +38,25 @@ func NewVoteCollectors[StateT models.Unique, VoteT models.Unique](
 	workerPool consensus.Workerpool,
 	factoryMethod NewCollectorFactoryMethod[StateT, VoteT],
 ) *VoteCollectors[StateT, VoteT] {
-	return &VoteCollectors[StateT, VoteT]{
+	v := &VoteCollectors[StateT, VoteT]{
 		tracer:             tracer,
 		lowestRetainedRank: lowestRetainedRank,
 		collectors:         make(map[uint64]consensus.VoteCollector[StateT, VoteT]),
 		workerPool:         workerPool,
 		createCollector:    factoryMethod,
 	}
-}
-
-func (v *VoteCollectors[StateT, VoteT]) Start(ctx context.Context) error {
-	go func() {
+	// Component manager for wrapped worker pool
+	componentBuilder := lifecycle.NewComponentManagerBuilder()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
 		<-ctx.Done()            // wait for parent context to signal shutdown
 		v.workerPool.StopWait() // wait till all workers exit
-	}()
-	return nil
+	})
+	v.ComponentManager = componentBuilder.Build()
+	return v
 }
 
 // GetOrCreateCollector retrieves the consensus.VoteCollector for the specified

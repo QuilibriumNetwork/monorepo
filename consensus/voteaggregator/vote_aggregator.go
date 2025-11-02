@@ -3,11 +3,13 @@ package voteaggregator
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
+	"sync"
 
 	"golang.org/x/sync/errgroup"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/counters"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 )
 
 // defaultVoteAggregatorWorkers number of workers to dispatch events for vote
@@ -23,16 +25,17 @@ const defaultStateQueueCapacity = 1000
 // VoteAggregator stores the votes and aggregates them into a QC when enough
 // votes have been collected.
 type VoteAggregator[StateT models.Unique, VoteT models.Unique] struct {
+	*lifecycle.ComponentManager
 	tracer   consensus.TraceLogger
 	notifier consensus.VoteAggregationViolationConsumer[
 		StateT,
 		VoteT,
 	]
-	lowestRetainedRank         atomic.Uint64 // lowest rank, for which we still process votes
+	lowestRetainedRank         counters.StrictMonotonicCounter // lowest rank, for which we still process votes
 	collectors                 consensus.VoteCollectors[StateT, VoteT]
 	queuedMessagesNotifier     chan struct{}
 	finalizationEventsNotifier chan struct{}
-	finalizedRank              atomic.Uint64 // cache the last finalized rank to queue up the pruning work, and unstate the caller who's delivering the finalization event.
+	finalizedRank              counters.StrictMonotonicCounter // cache the last finalized rank to queue up the pruning work, and unstate the caller who's delivering the finalization event.
 	queuedVotes                chan *VoteT
 	queuedStates               chan *models.SignedProposal[StateT, VoteT]
 	wg                         errgroup.Group
@@ -55,10 +58,14 @@ func NewVoteAggregator[StateT models.Unique, VoteT models.Unique](
 	)
 
 	aggregator := &VoteAggregator[StateT, VoteT]{
-		tracer:                     tracer,
-		notifier:                   notifier,
-		lowestRetainedRank:         atomic.Uint64{},
-		finalizedRank:              atomic.Uint64{},
+		tracer:   tracer,
+		notifier: notifier,
+		lowestRetainedRank: counters.NewMonotonicCounter(
+			lowestRetainedRank,
+		),
+		finalizedRank: counters.NewMonotonicCounter(
+			lowestRetainedRank,
+		),
 		collectors:                 collectors,
 		queuedVotes:                queuedVotes,
 		queuedStates:               queuedStates,
@@ -67,73 +74,92 @@ func NewVoteAggregator[StateT models.Unique, VoteT models.Unique](
 		wg:                         errgroup.Group{},
 	}
 
-	aggregator.lowestRetainedRank.Store(lowestRetainedRank)
-	aggregator.finalizedRank.Store(lowestRetainedRank)
+	componentBuilder := lifecycle.NewComponentManagerBuilder()
+	var wg sync.WaitGroup
+	wg.Add(defaultVoteAggregatorWorkers)
+	for i := 0; i < defaultVoteAggregatorWorkers; i++ {
+		// manager for worker routines that process inbound messages
+		componentBuilder.AddWorker(func(
+			ctx lifecycle.SignalerContext,
+			ready lifecycle.ReadyFunc,
+		) {
+			defer wg.Done()
+			ready()
+			aggregator.queuedMessagesProcessingLoop(ctx)
+		})
+	}
+	componentBuilder.AddWorker(func(
+		parentCtx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		// Create new context which is not connected to parent. We need to
+		// ensure that our internal workers stop before asking vote collectors
+		// to stop. We want to avoid delivering events to already stopped vote
+		// collectors.
+		ctx, cancel := context.WithCancel(context.Background())
+		signalerCtx, errCh := lifecycle.WithSignaler(ctx)
 
+		// start vote collectors
+		aggregator.collectors.Start(signalerCtx)
+
+		// Handle the component lifecycle in a separate goroutine so we can
+		// capture any errors thrown during initialization in the main
+		// goroutine.
+		go func() {
+			if err := lifecycle.WaitClosed(
+				parentCtx,
+				aggregator.collectors.Ready(),
+			); err == nil {
+				// only signal ready when collectors are ready, but always handle
+				// shutdown
+				ready()
+			}
+
+			// wait for internal workers to stop, then signal vote collectors to stop
+			wg.Wait()
+			cancel()
+		}()
+
+		// since we are breaking the connection between parentCtx and signalerCtx,
+		// we need to explicitly rethrow any errors from signalerCtx to parentCtx,
+		// otherwise they are dropped. Handle errors in the main worker goroutine to
+		// guarantee that they are rethrown to the parent before the component is
+		// marked done.
+		if err := lifecycle.WaitError(
+			errCh,
+			aggregator.collectors.Done(),
+		); err != nil {
+			parentCtx.Throw(err)
+		}
+	})
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		aggregator.finalizationProcessingLoop(ctx)
+	})
+
+	aggregator.ComponentManager = componentBuilder.Build()
 	return aggregator, nil
 }
 
-func (va *VoteAggregator[StateT, VoteT]) Start(ctx context.Context) error {
-	internalCtx, internalCancel := context.WithCancel(ctx)
-	va.wg.SetLimit(defaultVoteAggregatorWorkers + 1)
-	for i := 0; i < defaultVoteAggregatorWorkers; i++ {
-		// manager for worker routines that process inbound messages
-		va.wg.Go(func() error {
-			err := va.queuedMessagesProcessingLoop(internalCtx)
-			if err != nil {
-				internalCancel()
-			}
-			return err
-		})
-	}
-	va.wg.Go(func() error {
-		// create new context which is not connected to parent
-		// we need to ensure that our internal workers stop before asking
-		// vote collectors to stop. We want to avoid delivering events to already
-		// stopped vote collectors
-		innerCtx, cancel := context.WithCancel(context.Background())
-
-		// start vote collectors
-		err := va.collectors.Start(innerCtx)
-		if err != nil {
-			internalCancel()
-			return err
-		}
-
-		// Handle the component lifecycle in a separate goroutine so we can capture
-		// any errors thrown during initialization in the main goroutine.
-		go func() {
-			select {
-			case <-internalCtx.Done():
-				// wait for internal workers to stop, then signal vote collectors to
-				// stop
-				va.wg.Wait()
-				cancel()
-			}
-		}()
-
-		va.finalizationProcessingLoop(internalCtx)
-		return nil
-	})
-	return va.wg.Wait()
-}
-
 func (va *VoteAggregator[StateT, VoteT]) queuedMessagesProcessingLoop(
-	ctx context.Context,
-) error {
+	ctx lifecycle.SignalerContext,
+) {
 	notifier := va.queuedMessagesNotifier
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-notifier:
 			err := va.processQueuedMessages(ctx)
 			if err != nil {
-				va.tracer.Error(
-					"stopping mesage processing loop",
-					fmt.Errorf("internal error processing queued messages: %w", err),
-				)
-				return err
+				ctx.Throw(fmt.Errorf(
+					"internal error processing queued messages: %w",
+					err,
+				))
+				return
 			}
 		}
 	}
@@ -238,7 +264,7 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedState(
 ) error {
 	// check if the state is for a rank that has already been pruned (and is thus
 	// stale)
-	if state.State.Rank < va.lowestRetainedRank.Load() {
+	if state.State.Rank < va.lowestRetainedRank.Value() {
 		return nil
 	}
 
@@ -288,7 +314,7 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedState(
 // actual vote processing will be called in other dispatching goroutine.
 func (va *VoteAggregator[StateT, VoteT]) AddVote(vote *VoteT) {
 	// drop stale votes
-	if (*vote).GetRank() < va.lowestRetainedRank.Load() {
+	if (*vote).GetRank() < va.lowestRetainedRank.Value() {
 		va.tracer.Trace("drop stale votes")
 		return
 	}
@@ -366,8 +392,7 @@ func (va *VoteAggregator[StateT, VoteT]) InvalidState(
 func (va *VoteAggregator[StateT, VoteT]) PruneUpToRank(
 	lowestRetainedRank uint64,
 ) {
-	if va.lowestRetainedRank.Load() < lowestRetainedRank {
-		va.lowestRetainedRank.Store(lowestRetainedRank)
+	if va.lowestRetainedRank.Set(lowestRetainedRank) {
 		va.collectors.PruneUpToRank(lowestRetainedRank)
 	}
 }
@@ -382,8 +407,7 @@ func (va *VoteAggregator[StateT, VoteT]) PruneUpToRank(
 func (va *VoteAggregator[StateT, VoteT]) OnFinalizedState(
 	state *models.State[StateT],
 ) {
-	if va.finalizedRank.Load() < state.Rank {
-		va.finalizedRank.Store(state.Rank)
+	if va.finalizedRank.Set(state.Rank) {
 		va.finalizationEventsNotifier <- struct{}{}
 	}
 }
@@ -399,7 +423,7 @@ func (va *VoteAggregator[StateT, VoteT]) finalizationProcessingLoop(
 		case <-ctx.Done():
 			return
 		case <-finalizationNotifier:
-			va.PruneUpToRank(va.finalizedRank.Load())
+			va.PruneUpToRank(va.finalizedRank.Value())
 		}
 	}
 }

@@ -1,9 +1,8 @@
 package consensus
 
 import (
-	"context"
-
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 )
 
 // TimeoutAggregator verifies and aggregates timeout states to build timeout
@@ -12,7 +11,7 @@ import (
 // violation, including invalid timeouts, double timeout, etc and notifies a
 // HotStuff consumer for slashing.
 type TimeoutAggregator[VoteT models.Unique] interface {
-	Start(ctx context.Context) error
+	lifecycle.Component
 
 	// AddTimeout verifies and aggregates a timeout state.
 	// This method can be called concurrently, timeouts will be queued and

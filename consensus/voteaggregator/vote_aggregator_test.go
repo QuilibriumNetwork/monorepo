@@ -12,6 +12,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus/helper"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/mocks"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle/unittest"
 )
 
 func TestVoteAggregator(t *testing.T) {
@@ -30,7 +32,7 @@ type VoteAggregatorTestSuite struct {
 	collectors     *mocks.VoteCollectors[*helper.TestState, *helper.TestVote]
 	consumer       *mocks.VoteAggregationConsumer[*helper.TestState, *helper.TestVote]
 	stopAggregator context.CancelFunc
-	errs           chan error
+	errs           <-chan error
 }
 
 func (s *VoteAggregatorTestSuite) SetupTest() {
@@ -39,7 +41,7 @@ func (s *VoteAggregatorTestSuite) SetupTest() {
 	s.consumer = mocks.NewVoteAggregationConsumer[*helper.TestState, *helper.TestVote](s.T())
 
 	s.collectors.On("Start", mock.Anything).Return(nil).Once()
-
+	unittest.Componentify(&s.collectors.Mock)
 	s.aggregator, err = NewVoteAggregator(
 		helper.Logger(),
 		s.consumer,
@@ -49,18 +51,16 @@ func (s *VoteAggregatorTestSuite) SetupTest() {
 	require.NoError(s.T(), err)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	signalerCtx := ctx
+	signalerCtx, errs := lifecycle.WithSignaler(ctx)
 	s.stopAggregator = cancel
-	go func() {
-		err := s.aggregator.Start(signalerCtx)
-		if err != nil {
-			s.errs <- err
-		}
-	}()
+	s.errs = errs
+	s.aggregator.Start(signalerCtx)
+	unittest.RequireCloseBefore(s.T(), s.aggregator.Ready(), 100*time.Millisecond, "should close before timeout")
 }
 
 func (s *VoteAggregatorTestSuite) TearDownTest() {
 	s.stopAggregator()
+	unittest.RequireCloseBefore(s.T(), s.aggregator.Done(), 10*time.Second, "should close before timeout")
 }
 
 // TestOnFinalizedState tests if finalized state gets processed when send through `VoteAggregator`.
@@ -72,7 +72,7 @@ func (s *VoteAggregatorTestSuite) TestOnFinalizedState() {
 		close(done)
 	}).Once()
 	s.aggregator.OnFinalizedState(finalizedState)
-	time.Sleep(100 * time.Millisecond)
+	unittest.AssertClosesBefore(s.T(), done, time.Second)
 }
 
 // TestProcessInvalidState tests that processing invalid state results in exception, when given as
@@ -95,6 +95,7 @@ func (s *VoteAggregatorTestSuite) TestProcessInvalidState() {
 
 	// submit state for processing
 	s.aggregator.AddState(state)
+	unittest.RequireCloseBefore(s.T(), processed, 100*time.Millisecond, "should close before timeout")
 
 	// expect a thrown error
 	select {

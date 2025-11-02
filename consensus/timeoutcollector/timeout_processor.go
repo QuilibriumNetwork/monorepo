@@ -367,7 +367,6 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) buildTC() (
 	// Therefore, races are possible, where the `newestQCTracker` already knows of
 	// a QC with larger rank than the data stored in `sigAggregator`.
 	newestQC := p.newestQCTracker.NewestQC()
-
 	tc, err := p.voting.FinalizeTimeout(
 		context.TODO(),
 		p.rank,

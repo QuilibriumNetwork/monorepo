@@ -127,8 +127,8 @@ func (e *EventHandler[
 	return e.proposeForNewRankIfPrimary()
 }
 
-// OnReceiveTimeoutCertificate processes a valid tc constructed by internal timeout aggregator,
-// discovered in TimeoutState or broadcast over the network.
+// OnReceiveTimeoutCertificate processes a valid tc constructed by internal
+// timeout aggregator, discovered in TimeoutState or broadcast over the network.
 // All inputs should be validated before feeding into this function. Assuming
 // trusted data. No errors are expected during normal operation.
 func (e *EventHandler[
@@ -142,8 +142,14 @@ func (e *EventHandler[
 		"received TC",
 		consensus.Uint64Param("current_rank", curRank),
 		consensus.Uint64Param("tc_rank", tc.GetRank()),
-		consensus.Uint64Param("tc_newest_qc_rank", tc.GetLatestQuorumCert().GetRank()),
-		consensus.IdentityParam("tc_newest_qc_state_id", tc.GetLatestQuorumCert().GetSelector()),
+		consensus.Uint64Param(
+			"tc_newest_qc_rank",
+			tc.GetLatestQuorumCert().GetRank(),
+		),
+		consensus.IdentityParam(
+			"tc_newest_qc_state_id",
+			tc.GetLatestQuorumCert().GetSelector(),
+		),
 	)
 	e.notifier.OnReceiveTimeoutCertificate(curRank, tc)
 	defer e.notifier.OnEventProcessed()
@@ -156,8 +162,14 @@ func (e *EventHandler[
 		e.tracer.Trace("TC didn't trigger rank change, nothing to do",
 			consensus.Uint64Param("current_rank", curRank),
 			consensus.Uint64Param("tc_rank", tc.GetRank()),
-			consensus.Uint64Param("tc_newest_qc_rank", tc.GetLatestQuorumCert().GetRank()),
-			consensus.IdentityParam("tc_newest_qc_state_id", tc.GetLatestQuorumCert().GetSelector()))
+			consensus.Uint64Param(
+				"tc_newest_qc_rank",
+				tc.GetLatestQuorumCert().GetRank(),
+			),
+			consensus.IdentityParam(
+				"tc_newest_qc_state_id",
+				tc.GetLatestQuorumCert().GetSelector(),
+			))
 		return nil
 	}
 
@@ -165,8 +177,14 @@ func (e *EventHandler[
 	e.tracer.Trace("TC triggered rank change, starting new rank now",
 		consensus.Uint64Param("current_rank", curRank),
 		consensus.Uint64Param("tc_rank", tc.GetRank()),
-		consensus.Uint64Param("tc_newest_qc_rank", tc.GetLatestQuorumCert().GetRank()),
-		consensus.IdentityParam("tc_newest_qc_state_id", tc.GetLatestQuorumCert().GetSelector()))
+		consensus.Uint64Param(
+			"tc_newest_qc_rank",
+			tc.GetLatestQuorumCert().GetRank(),
+		),
+		consensus.IdentityParam(
+			"tc_newest_qc_state_id",
+			tc.GetLatestQuorumCert().GetSelector(),
+		))
 	return e.proposeForNewRankIfPrimary()
 }
 
@@ -487,6 +505,12 @@ func (e *EventHandler[
 
 	// check that I am the primary for this rank
 	if e.committee.Self() != currentLeader {
+		e.tracer.Trace(
+			"not current leader, waiting",
+			consensus.Uint64Param("current_rank", curRank),
+			consensus.Uint64Param("finalized_rank", finalizedRank),
+			consensus.IdentityParam("leader_id", currentLeader),
+		)
 		return nil
 	}
 

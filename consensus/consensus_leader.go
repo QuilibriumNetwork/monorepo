@@ -23,6 +23,7 @@ type LeaderProvider[
 	// to halt long-running prover operations.
 	ProveNextState(
 		ctx context.Context,
+		rank uint64,
 		filter []byte,
 		priorState models.Identity,
 	) (*StateT, error)

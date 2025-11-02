@@ -3,9 +3,9 @@ package timeoutcollector
 import (
 	"errors"
 	"fmt"
-	"sync/atomic"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/counters"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 )
 
@@ -19,8 +19,8 @@ type TimeoutCollector[VoteT models.Unique] struct {
 	timeoutsCache    *TimeoutStatesCache[VoteT] // cache for tracking double timeout and timeout equivocation
 	notifier         consensus.TimeoutAggregationConsumer[VoteT]
 	processor        consensus.TimeoutProcessor[VoteT]
-	newestReportedQC atomic.Uint64 // rank of newest QC that was reported
-	newestReportedTC atomic.Uint64 // rank of newest TC that was reported
+	newestReportedQC counters.StrictMonotonicCounter // rank of newest QC that was reported
+	newestReportedTC counters.StrictMonotonicCounter // rank of newest TC that was reported
 }
 
 var _ consensus.TimeoutCollector[*nilUnique] = (*TimeoutCollector[*nilUnique])(nil)
@@ -37,11 +37,10 @@ func NewTimeoutCollector[VoteT models.Unique](
 		notifier:         notifier,
 		timeoutsCache:    NewTimeoutStatesCache[VoteT](rank),
 		processor:        processor,
-		newestReportedQC: atomic.Uint64{},
-		newestReportedTC: atomic.Uint64{},
+		newestReportedQC: counters.NewMonotonicCounter(0),
+		newestReportedTC: counters.NewMonotonicCounter(0),
 	}
-	tc.newestReportedQC.Store(0)
-	tc.newestReportedTC.Store(0)
+
 	return tc
 }
 
@@ -132,14 +131,12 @@ func (c *TimeoutCollector[VoteT]) processTimeout(
 	// later in a strongly ordered system can only arrive earlier in our weakly
 	// ordered implementation. Hence, if anything, the recipient receives the
 	// desired information _earlier_ but not later.
-	if c.newestReportedQC.Load() < timeout.LatestQuorumCertificate.GetRank() {
-		c.newestReportedQC.Store(timeout.LatestQuorumCertificate.GetRank())
+	if c.newestReportedQC.Set(timeout.LatestQuorumCertificate.GetRank()) {
 		c.notifier.OnNewQuorumCertificateDiscovered(timeout.LatestQuorumCertificate)
 	}
 	// Same explanation for weak ordering of QCs also applies to TCs.
 	if timeout.PriorRankTimeoutCertificate != nil {
-		if c.newestReportedTC.Load() < timeout.PriorRankTimeoutCertificate.GetRank() {
-			c.newestReportedTC.Store(timeout.PriorRankTimeoutCertificate.GetRank())
+		if c.newestReportedTC.Set(timeout.PriorRankTimeoutCertificate.GetRank()) {
 			c.notifier.OnNewTimeoutCertificateDiscovered(
 				timeout.PriorRankTimeoutCertificate,
 			)

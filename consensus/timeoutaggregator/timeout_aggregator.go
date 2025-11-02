@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/counters"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 )
 
 // defaultTimeoutAggregatorWorkers number of workers to dispatch events for
@@ -23,8 +24,9 @@ const defaultTimeoutQueueCapacity = 1000
 // when enough TSs have been collected. It's safe to use in concurrent
 // environment.
 type TimeoutAggregator[VoteT models.Unique] struct {
+	*lifecycle.ComponentManager
 	tracer                 consensus.TraceLogger
-	lowestRetainedRank     atomic.Uint64
+	lowestRetainedRank     counters.StrictMonotonicCounter
 	collectors             consensus.TimeoutCollectors[VoteT]
 	queuedTimeoutsNotifier chan struct{}
 	enteringRankNotifier   chan struct{}
@@ -48,7 +50,7 @@ func NewTimeoutAggregator[VoteT models.Unique](
 
 	aggregator := &TimeoutAggregator[VoteT]{
 		tracer:                 tracer,
-		lowestRetainedRank:     atomic.Uint64{},
+		lowestRetainedRank:     counters.NewMonotonicCounter(lowestRetainedRank),
 		collectors:             collectors,
 		queuedTimeoutsNotifier: make(chan struct{}, 1),
 		enteringRankNotifier:   make(chan struct{}, 1),
@@ -56,21 +58,29 @@ func NewTimeoutAggregator[VoteT models.Unique](
 		wg:                     sync.WaitGroup{},
 	}
 
-	aggregator.lowestRetainedRank.Store(lowestRetainedRank)
 	aggregator.wg.Add(defaultTimeoutAggregatorWorkers + 1)
+	componentBuilder := lifecycle.NewComponentManagerBuilder()
+	for i := 0; i < defaultTimeoutAggregatorWorkers; i++ {
+		// manager for worker routines that process inbound events
+		componentBuilder.AddWorker(func(
+			ctx lifecycle.SignalerContext,
+			ready lifecycle.ReadyFunc,
+		) {
+			ready()
+			aggregator.queuedTimeoutsProcessingLoop(ctx)
+		})
+	}
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		aggregator.enteringRankProcessingLoop(ctx)
+	})
+
+	aggregator.ComponentManager = componentBuilder.Build()
 
 	return aggregator, nil
-}
-
-func (t *TimeoutAggregator[VoteT]) Start(ctx context.Context) error {
-	// manager for worker routines that process inbound events
-	for i := 0; i < defaultTimeoutAggregatorWorkers; i++ {
-		go t.queuedTimeoutsProcessingLoop(ctx)
-	}
-
-	go t.enteringRankProcessingLoop(ctx)
-
-	return nil
 }
 
 // queuedTimeoutsProcessingLoop is the event loop which waits for notification
@@ -162,7 +172,7 @@ func (t *TimeoutAggregator[VoteT]) AddTimeout(
 	timeoutState *models.TimeoutState[VoteT],
 ) {
 	// drop stale objects
-	if timeoutState.Rank < t.lowestRetainedRank.Load() {
+	if timeoutState.Rank < t.lowestRetainedRank.Value() {
 		t.tracer.Trace("drop stale timeouts")
 		return
 	}
@@ -192,7 +202,7 @@ func (t *TimeoutAggregator[VoteT]) PruneUpToRank(lowestRetainedRank uint64) {
 // treated as trusted; precautions should be taken that messages from external
 // nodes cannot be considered as inputs to this function
 func (t *TimeoutAggregator[VoteT]) OnRankChange(oldRank, newRank uint64) {
-	if t.lowestRetainedRank.CompareAndSwap(oldRank, newRank) {
+	if t.lowestRetainedRank.Set(newRank) {
 		t.enteringRankNotifier <- struct{}{}
 	}
 }
@@ -209,7 +219,7 @@ func (t *TimeoutAggregator[VoteT]) enteringRankProcessingLoop(
 		case <-ctx.Done():
 			return
 		case <-notifier:
-			t.PruneUpToRank(t.lowestRetainedRank.Load())
+			t.PruneUpToRank(t.lowestRetainedRank.Value())
 		}
 	}
 }

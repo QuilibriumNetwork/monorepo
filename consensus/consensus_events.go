@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 )
 
 // PartialTimeoutCertificateCreated represents a notification emitted by the
@@ -70,6 +71,7 @@ type EventHandler[StateT models.Unique, VoteT models.Unique] interface {
 
 // EventLoop performs buffer and processing of incoming proposals and QCs.
 type EventLoop[StateT models.Unique, VoteT models.Unique] interface {
+	lifecycle.Component
 	TimeoutCollectorConsumer[VoteT]
 	VoteCollectorConsumer[VoteT]
 	SubmitProposal(proposal *models.SignedProposal[StateT, VoteT])

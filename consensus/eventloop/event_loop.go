@@ -8,6 +8,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/tracker"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 )
 
 // queuedProposal is a helper structure that is used to transmit proposal in
@@ -22,7 +23,7 @@ type queuedProposal[StateT models.Unique, VoteT models.Unique] struct {
 // EventLoop buffers all incoming events to the hotstuff EventHandler, and feeds
 // EventHandler one event at a time.
 type EventLoop[StateT models.Unique, VoteT models.Unique] struct {
-	ctx                                      context.Context
+	*lifecycle.ComponentManager
 	eventHandler                             consensus.EventHandler[StateT, VoteT]
 	proposals                                chan queuedProposal[StateT, VoteT]
 	newestSubmittedTimeoutCertificate        *tracker.NewestTCTracker
@@ -65,13 +66,15 @@ func NewEventLoop[StateT models.Unique, VoteT models.Unique](
 		startTime:                                startTime,
 	}
 
-	return el, nil
-}
+	componentBuilder := lifecycle.NewComponentManagerBuilder()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
 
-func (el *EventLoop[StateT, VoteT]) Start(ctx context.Context) error {
-	el.ctx = ctx
-
-	go func() {
+		// launch when scheduled by el.startTime
+		el.tracer.Trace(fmt.Sprintf("event loop will start at: %v", el.startTime))
 		select {
 		case <-ctx.Done():
 			return
@@ -80,11 +83,13 @@ func (el *EventLoop[StateT, VoteT]) Start(ctx context.Context) error {
 			err := el.loop(ctx)
 			if err != nil {
 				el.tracer.Error("irrecoverable event loop error", err)
-				return
+				ctx.Throw(err)
 			}
 		}
-	}()
-	return nil
+	})
+	el.ComponentManager = componentBuilder.Build()
+
+	return el, nil
 }
 
 // loop executes the core HotStuff logic in a single thread. It picks inputs
@@ -238,7 +243,7 @@ func (el *EventLoop[StateT, VoteT]) SubmitProposal(
 	}
 	select {
 	case el.proposals <- queueItem:
-	case <-el.ctx.Done():
+	case <-el.ComponentManager.ShutdownSignal():
 		return
 	}
 }
