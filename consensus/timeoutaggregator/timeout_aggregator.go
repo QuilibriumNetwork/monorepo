@@ -87,7 +87,7 @@ func NewTimeoutAggregator[VoteT models.Unique](
 // about pending work and as soon as there is some it triggers processing.
 func (
 	t *TimeoutAggregator[VoteT],
-) queuedTimeoutsProcessingLoop(ctx context.Context) {
+) queuedTimeoutsProcessingLoop(ctx lifecycle.SignalerContext) {
 	defer t.wg.Done()
 	notifier := t.queuedTimeoutsNotifier
 	for {
@@ -98,7 +98,10 @@ func (
 			t.tracer.Trace("notified for queued timeout state")
 			err := t.processQueuedTimeoutStates(ctx)
 			if err != nil {
-				t.tracer.Error("fatal error encountered", err)
+				ctx.Throw(fmt.Errorf(
+					"internal error processing queued timeout events: %w",
+					err,
+				))
 				return
 			}
 		}
@@ -118,8 +121,6 @@ func (t *TimeoutAggregator[VoteT]) processQueuedTimeoutStates(
 			return nil
 		case timeoutState, ok := <-t.queuedTimeouts:
 			if !ok {
-				// when there is no more messages in the queue, back to the loop to wait
-				// for the next incoming message to arrive.
 				return nil
 			}
 
@@ -133,6 +134,10 @@ func (t *TimeoutAggregator[VoteT]) processQueuedTimeoutStates(
 			}
 
 			t.tracer.Trace("TimeoutState processed successfully")
+		default:
+			// when there is no more messages in the queue, back to the loop to wait
+			// for the next incoming message to arrive.
+			return nil
 		}
 	}
 }

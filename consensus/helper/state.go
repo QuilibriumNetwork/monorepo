@@ -404,3 +404,64 @@ func stringFromValue(param consensus.LogParam) string {
 func Logger() *FmtLog {
 	return &FmtLog{}
 }
+
+type BufferLog struct {
+	params []consensus.LogParam
+	b      *strings.Builder
+}
+
+// Error implements consensus.TraceLogger.
+func (n *BufferLog) Error(message string, err error, params ...consensus.LogParam) {
+	n.b.WriteString(fmt.Sprintf("ERROR: %s: %v\n", message, err))
+	for _, param := range n.params {
+		n.b.WriteString(fmt.Sprintf(
+			"\t%s: %s\n",
+			param.GetKey(),
+			stringFromValue(param),
+		))
+	}
+	for _, param := range params {
+		n.b.WriteString(fmt.Sprintf(
+			"\t%s: %s\n",
+			param.GetKey(),
+			stringFromValue(param),
+		))
+	}
+}
+
+// Trace implements consensus.TraceLogger.
+func (n *BufferLog) Trace(message string, params ...consensus.LogParam) {
+	n.b.WriteString(fmt.Sprintf("TRACE: %s\n", message))
+	n.b.WriteString(fmt.Sprintf("\t[%s]\n", time.Now().String()))
+	for _, param := range n.params {
+		n.b.WriteString(fmt.Sprintf(
+			"\t%s: %s\n",
+			param.GetKey(),
+			stringFromValue(param),
+		))
+	}
+	for _, param := range params {
+		n.b.WriteString(fmt.Sprintf(
+			"\t%s: %s\n",
+			param.GetKey(),
+			stringFromValue(param),
+		))
+	}
+}
+
+func (n *BufferLog) Flush() {
+	fmt.Println(n.b.String())
+}
+
+func (n *BufferLog) With(params ...consensus.LogParam) consensus.TraceLogger {
+	return &BufferLog{
+		params: slices.Concat(n.params, params),
+		b:      n.b,
+	}
+}
+
+func BufferLogger() *BufferLog {
+	return &BufferLog{
+		b: &strings.Builder{},
+	}
+}

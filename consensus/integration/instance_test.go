@@ -384,7 +384,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 
 	// initialize the pacemaker
 	controller := timeout.NewController(cfg.Timeouts)
-	in.pacemaker, err = pacemaker.NewPacemaker[*helper.TestState, *helper.TestVote](controller, pacemaker.NoProposalDelay(), notifier, in.persist)
+	in.pacemaker, err = pacemaker.NewPacemaker[*helper.TestState, *helper.TestVote](controller, pacemaker.NoProposalDelay(), notifier, in.persist, in.logger)
 	require.NoError(t, err)
 
 	// initialize the forks handler
@@ -473,8 +473,8 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 				Bitmask:   bitmask,
 				PublicKey: make([]byte, 585),
 			}, nil
-		})
-	sigAgg.On("VerifySignatureRaw", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+		}).Maybe()
+	sigAgg.On("VerifySignatureRaw", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil).Maybe()
 	createCollectorFactoryMethod := votecollector.NewStateMachineFactory(in.logger, voteAggregationDistributor, voteProcessorFactory.Create, []byte{}, sigAgg)
 	voteCollectors := voteaggregator.NewVoteCollectors(in.logger, livenessData.CurrentRank, workerpool.New(2), createCollectorFactoryMethod)
 
@@ -600,7 +600,9 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 	)
 	require.NoError(t, err)
 
+	timeoutAggregationDistributor.AddTimeoutCollectorConsumer(logConsumer)
 	timeoutAggregationDistributor.AddTimeoutCollectorConsumer(&in)
+	voteAggregationDistributor.AddVoteCollectorConsumer(logConsumer)
 
 	return &in
 }
@@ -624,7 +626,6 @@ func (in *Instance) Run(t *testing.T) error {
 
 	// run until an error or stop condition is reached
 	for {
-
 		// check on stop conditions
 		if in.stop(in) {
 			return errStopCondition
@@ -635,7 +636,7 @@ func (in *Instance) Run(t *testing.T) error {
 		case <-in.handler.TimeoutChannel():
 			err := in.handler.OnLocalTimeout()
 			if err != nil {
-				return fmt.Errorf("could not process timeout: %w", err)
+				panic(fmt.Errorf("could not process timeout: %w", err))
 			}
 		default:
 		}

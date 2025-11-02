@@ -49,7 +49,7 @@ func NewTestPacemaker[
 	notifier consensus.Consumer[StateT, VoteT],
 	store consensus.ConsensusStore[VoteT],
 ) *TestPacemaker[StateT, VoteT, PeerIDT, CollectedT] {
-	p, err := pacemaker.NewPacemaker[StateT, VoteT](timeoutController, proposalDelayProvider, notifier, store)
+	p, err := pacemaker.NewPacemaker[StateT, VoteT](timeoutController, proposalDelayProvider, notifier, store, helper.Logger())
 	if err != nil {
 		panic(err)
 	}

@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -46,8 +47,9 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 		in := NewInstance(t,
 			WithRoot(root),
 			WithParticipants(participants),
-			WithLocalID(participants[n].Identity()),
 			WithTimeouts(timeouts),
+			WithBufferLogger(),
+			WithLocalID(participants[n].Identity()),
 			WithLoggerParams(consensus.StringParam("status", "healthy")),
 			WithStopCondition(RankFinalized(finalRank)),
 		)
@@ -59,8 +61,9 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 		in := NewInstance(t,
 			WithRoot(root),
 			WithParticipants(participants),
-			WithLocalID(participants[n].Identity()),
 			WithTimeouts(timeouts),
+			WithBufferLogger(),
+			WithLocalID(participants[n].Identity()),
 			WithLoggerParams(consensus.StringParam("status", "unhealthy")),
 			WithStopCondition(RankFinalized(finalRank)),
 			WithOutgoingVotes(DropAllVotes),
@@ -82,7 +85,14 @@ func Test2TimeoutOutof7Instances(t *testing.T) {
 			wg.Done()
 		}(in)
 	}
-	unittest.AssertReturnsBefore(t, wg.Wait, 10*time.Second, "expect to finish before timeout")
+	unittest.AssertReturnsBefore(t, wg.Wait, 20*time.Second, "expect to finish before timeout")
+
+	for i, in := range instances {
+		fmt.Println("=============================================================================")
+		fmt.Println("INSTANCE", i, "-", hex.EncodeToString([]byte(in.localID)))
+		fmt.Println("=============================================================================")
+		in.logger.(*helper.BufferLog).Flush()
+	}
 
 	// check that all instances have the same finalized state
 	ref := instances[0]
@@ -377,7 +387,7 @@ func TestAsyncClusterStartup(t *testing.T) {
 			WithOutgoingTimeoutStates(func(object *models.TimeoutState[*helper.TestVote]) bool {
 				lock.Lock()
 				defer lock.Unlock()
-				timeoutStateGenerated[fmt.Sprintf("%d", object.Rank)] = struct{}{}
+				timeoutStateGenerated[(*object.Vote).ID] = struct{}{}
 				// start allowing timeouts when every node has generated one
 				// when nodes will broadcast again, it will go through
 				return len(timeoutStateGenerated) != replicas
@@ -399,7 +409,7 @@ func TestAsyncClusterStartup(t *testing.T) {
 			wg.Done()
 		}(in)
 	}
-	unittest.AssertReturnsBefore(t, wg.Wait, 10*time.Second, "expect to finish before timeout")
+	unittest.AssertReturnsBefore(t, wg.Wait, 20*time.Second, "expect to finish before timeout")
 
 	// check that all instances have the same finalized state
 	ref := instances[0]

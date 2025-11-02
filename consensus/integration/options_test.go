@@ -54,6 +54,12 @@ func WithTimeouts(timeouts timeout.Config) Option {
 	}
 }
 
+func WithBufferLogger() Option {
+	return func(cfg *Config) {
+		cfg.Logger = helper.BufferLogger()
+	}
+}
+
 func WithLoggerParams(params ...consensus.LogParam) Option {
 	return func(cfg *Config) {
 		cfg.Logger = cfg.Logger.With(params...)

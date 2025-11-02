@@ -30,6 +30,7 @@ type Pacemaker[StateT models.Unique, VoteT models.Unique] struct {
 	consensus.ProposalDurationProvider
 
 	ctx            context.Context
+	tracer         consensus.TraceLogger
 	timeoutControl *timeout.Controller
 	notifier       consensus.ParticipantConsumer[StateT, VoteT]
 	rankTracker    rankTracker[StateT, VoteT]
@@ -51,6 +52,7 @@ func NewPacemaker[StateT models.Unique, VoteT models.Unique](
 	proposalDurationProvider consensus.ProposalDurationProvider,
 	notifier consensus.Consumer[StateT, VoteT],
 	store consensus.ConsensusStore[VoteT],
+	tracer consensus.TraceLogger,
 	recovery ...recoveryInformation[StateT, VoteT],
 ) (*Pacemaker[StateT, VoteT], error) {
 	vt, err := newRankTracker[StateT, VoteT](store)
@@ -63,6 +65,7 @@ func NewPacemaker[StateT models.Unique, VoteT models.Unique](
 		timeoutControl:           timeoutController,
 		notifier:                 notifier,
 		rankTracker:              vt,
+		tracer:                   tracer,
 		started:                  false,
 	}
 	for _, recoveryAction := range recovery {
@@ -162,6 +165,11 @@ func (p *Pacemaker[StateT, VoteT]) ReceiveTimeoutCertificate(
 			err,
 		)
 	}
+	p.tracer.Trace(
+		"pacemaker receive tc",
+		consensus.Uint64Param("resulting_rank", resultingRank),
+		consensus.Uint64Param("initial_rank", initialRank),
+	)
 	if resultingRank <= initialRank {
 		return nil, nil
 	}

@@ -206,6 +206,10 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) Process(
 	// true only once.
 	willBuildTC := p.tcTracker.Track(totalWeight)
 	if !willBuildTC {
+		p.tracer.Trace(
+			"insufficient weight to build tc",
+			consensus.Uint64Param("total_weight", totalWeight),
+		)
 		// either we do not have enough timeouts to build a TC, or another thread
 		// has already passed this gate and created a TC
 		return nil
@@ -216,7 +220,10 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) Process(
 		return fmt.Errorf("internal error constructing TC: %w", err)
 	}
 	p.notifier.OnTimeoutCertificateConstructedFromTimeouts(*tc)
-
+	p.tracer.Trace(
+		"timeout constructed from timeouts",
+		consensus.Uint64Param("rank", (*tc).GetRank()),
+	)
 	return nil
 }
 

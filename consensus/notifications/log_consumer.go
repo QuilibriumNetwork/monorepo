@@ -234,19 +234,24 @@ func (lc *LogConsumer[StateT, VoteT]) OnVoteProcessed(vote *VoteT) {
 func (lc *LogConsumer[StateT, VoteT]) OnTimeoutProcessed(
 	timeout *models.TimeoutState[VoteT],
 ) {
-	lc.log.With(
+	logger := lc.log.With(
 		consensus.Uint64Param("timeout_rank", timeout.Rank),
 		consensus.Uint64Param(
 			"timeout_newest_qc_rank",
 			timeout.LatestQuorumCertificate.GetRank(),
 		),
-		consensus.Uint64Param(
-			"timeout_last_tc_rank",
-			timeout.PriorRankTimeoutCertificate.GetRank(),
-		),
 		consensus.IdentityParam("timeout_vote_id", (*timeout.Vote).Identity()),
 		consensus.Uint64Param("timeout_tick", timeout.TimeoutTick),
-	).Trace("processed valid timeout object")
+	)
+	if timeout.PriorRankTimeoutCertificate != nil {
+		logger = logger.With(
+			consensus.Uint64Param(
+				"timeout_last_tc_rank",
+				timeout.PriorRankTimeoutCertificate.GetRank(),
+			),
+		)
+	}
+	logger.Trace("processed valid timeout object")
 }
 
 func (lc *LogConsumer[StateT, VoteT]) OnCurrentRankDetails(
@@ -322,20 +327,25 @@ func (lc *LogConsumer[StateT, VoteT]) OnInvalidTimeoutDetected(
 	err models.InvalidTimeoutError[VoteT],
 ) {
 	timeout := err.Timeout
-	lc.log.With(
+	logger := lc.log.With(
 		consensus.StringParam("suspicious", "true"),
 		consensus.Uint64Param("timeout_rank", timeout.Rank),
 		consensus.Uint64Param(
 			"timeout_newest_qc_rank",
 			timeout.LatestQuorumCertificate.GetRank(),
 		),
-		consensus.Uint64Param(
-			"timeout_last_tc_rank",
-			timeout.PriorRankTimeoutCertificate.GetRank(),
-		),
 		consensus.IdentityParam("timeout_vote_id", (*timeout.Vote).Identity()),
 		consensus.Uint64Param("timeout_tick", timeout.TimeoutTick),
-	).Error("invalid timeout detected", err)
+	)
+	if timeout.PriorRankTimeoutCertificate != nil {
+		logger = logger.With(
+			consensus.Uint64Param(
+				"timeout_last_tc_rank",
+				timeout.PriorRankTimeoutCertificate.GetRank(),
+			),
+		)
+	}
+	logger.Error("invalid timeout detected", err)
 }
 
 func (lc *LogConsumer[StateT, VoteT]) logBasicStateData(
