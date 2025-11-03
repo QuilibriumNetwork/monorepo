@@ -507,7 +507,7 @@ func TestTimeoutProcessor_BuildVerifyTC(t *testing.T) {
 			StateID:   state.Identifier,
 		}
 		v.On("SignVote", mock.Anything, mock.Anything).Return(&vote, nil).Once()
-		signers[s.Identity()] = verification.NewSigner(v)
+		signers[s.Identity()] = verification.NewSigner[*helper.TestState, *helper.TestVote, *helper.TestPeer](v)
 	}
 
 	// utility function which generates a valid timeout for every signer
@@ -660,7 +660,7 @@ func createRealQC(
 		Rank:                state.Rank,
 		FrameNumber:         state.Rank,
 		Selector:            state.Identifier,
-		Timestamp:           time.Now().UnixMilli(),
+		Timestamp:           uint64(time.Now().UnixMilli()),
 		AggregatedSignature: &helper.TestAggregatedSignature{PublicKey: make([]byte, 585), Signature: make([]byte, 74), Bitmask: []byte{0b11111111, 0b00000111}},
 	}, nil)
 	voteProcessor, err := voteProcessorFactory.Create(helper.Logger(), proposal, []byte{}, sigagg, votingProvider)

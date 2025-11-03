@@ -108,7 +108,7 @@ func (e *EventHandler[
 		"received QC",
 		consensus.Uint64Param("current_rank", curRank),
 		consensus.Uint64Param("qc_rank", qc.GetRank()),
-		consensus.IdentityParam("state_id", qc.GetSelector()),
+		consensus.IdentityParam("state_id", qc.Identity()),
 	)
 	e.notifier.OnReceiveQuorumCertificate(curRank, qc)
 	defer e.notifier.OnEventProcessed()
@@ -148,7 +148,7 @@ func (e *EventHandler[
 		),
 		consensus.IdentityParam(
 			"tc_newest_qc_state_id",
-			tc.GetLatestQuorumCert().GetSelector(),
+			tc.GetLatestQuorumCert().Identity(),
 		),
 	)
 	e.notifier.OnReceiveTimeoutCertificate(curRank, tc)
@@ -168,7 +168,7 @@ func (e *EventHandler[
 			),
 			consensus.IdentityParam(
 				"tc_newest_qc_state_id",
-				tc.GetLatestQuorumCert().GetSelector(),
+				tc.GetLatestQuorumCert().Identity(),
 			))
 		return nil
 	}
@@ -183,7 +183,7 @@ func (e *EventHandler[
 		),
 		consensus.IdentityParam(
 			"tc_newest_qc_state_id",
-			tc.GetLatestQuorumCert().GetSelector(),
+			tc.GetLatestQuorumCert().Identity(),
 		))
 	return e.proposeForNewRankIfPrimary()
 }
@@ -518,7 +518,7 @@ func (e *EventHandler[
 	newestQC := e.paceMaker.LatestQuorumCertificate()
 	previousRankTimeoutCert := e.paceMaker.PriorRankTimeoutCertificate()
 
-	_, found := e.forks.GetState(newestQC.GetSelector())
+	_, found := e.forks.GetState(newestQC.Identity())
 	if !found {
 		// we don't know anything about state referenced by our newest QC, in this
 		// case we can't create a valid proposal since we can't guarantee validity
@@ -649,7 +649,7 @@ func (e *EventHandler[
 	targetPublicationTime := e.paceMaker.TargetPublicationTime(
 		stateProposal.State.Rank,
 		start,
-		stateProposal.State.ParentQuorumCertificate.GetSelector(),
+		stateProposal.State.ParentQuorumCertificate.Identity(),
 	) // determine target publication time
 	e.tracer.Trace(
 		"forwarding proposal to communicator for broadcasting",
@@ -657,7 +657,7 @@ func (e *EventHandler[
 		consensus.TimeParam("target_publication", targetPublicationTime),
 		consensus.IdentityParam("state_id", stateProposal.State.Identifier),
 		consensus.Uint64Param("parent_rank", newestQC.GetRank()),
-		consensus.IdentityParam("parent_id", newestQC.GetSelector()),
+		consensus.IdentityParam("parent_id", newestQC.Identity()),
 		consensus.IdentityParam("signer", stateProposal.State.ProposerID),
 	)
 
@@ -729,7 +729,7 @@ func (e *EventHandler[
 	nextLeader models.Identity,
 ) error {
 	_, found := e.forks.GetState(
-		proposal.State.ParentQuorumCertificate.GetSelector(),
+		proposal.State.ParentQuorumCertificate.Identity(),
 	)
 	if !found {
 		// we don't have parent for this proposal, we can't vote since we can't
@@ -759,7 +759,7 @@ func (e *EventHandler[
 			),
 			consensus.IdentityParam(
 				"parent_id",
-				proposal.State.ParentQuorumCertificate.GetSelector(),
+				proposal.State.ParentQuorumCertificate.Identity(),
 			),
 			consensus.IdentityParam("signer", proposal.State.ProposerID[:]),
 		)
@@ -776,7 +776,7 @@ func (e *EventHandler[
 		),
 		consensus.IdentityParam(
 			"parent_id",
-			proposal.State.ParentQuorumCertificate.GetSelector(),
+			proposal.State.ParentQuorumCertificate.Identity(),
 		),
 		consensus.IdentityParam("signer", proposal.State.ProposerID[:]),
 	)

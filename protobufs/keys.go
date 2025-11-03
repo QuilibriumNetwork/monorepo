@@ -319,6 +319,10 @@ func (s *BLS48581AggregateSignature) Identity() string {
 	return string(s.GetPublicKey().GetKeyValue())
 }
 
+func (s *BLS48581AggregateSignature) GetPubKey() []byte {
+	return s.PublicKey.KeyValue
+}
+
 func (s *BLS48581Signature) Verify(
 	msg, context []byte,
 	blsVerifier BlsVerifier,

@@ -9,10 +9,10 @@ type QuorumCertificate interface {
 	GetRank() uint64
 	// GetFrameNumber returns the frame number applied to the round.
 	GetFrameNumber() uint64
-	// GetSelector returns the selector of the frame.
-	GetSelector() Identity
+	// Identity returns the selector of the frame.
+	Identity() Identity
 	// GetTimestamp returns the timestamp of the certificate.
-	GetTimestamp() int64
+	GetTimestamp() uint64
 	// GetAggregatedSignature returns the set of signers who voted on the round.
 	GetAggregatedSignature() AggregatedSignature
 	// Equals compares inner equality with another quorum certificate.

@@ -117,44 +117,10 @@ message GlobalFrameHeader {
   // A strictly monotonically-increasing frame number. Used for culling old
   // frames past a configurable cutoff point.
   uint64 frame_number = 1;
-  // The self-reported timestamp from the proof publisher, encoded as an int64
-  // of the Unix epoch in milliseconds. Should be good until
-  // 292278994-08-17 07:12:55.807, at which point, this is someone else's
-  // problem. Timestamps are imperfect, but smoothed in a rolling window to
-  // ensure a network and quorum-stable difficulty adjustment. Anomalies are
-  // bounded such that a timestamp beyond ten times the average issuance rate
-  // is discarded in preference to the runner up electees, unless there is
-  // simply no alternative available (for example, if a network outage occurred
-  // from an upgrade or bug).
-  int64 timestamp = 2;
-  // The difficulty level used for the frame. Difficulty is calculated based on
-  // the previous 60 timestamps correlated with difficulties, such that the
-  // interval smooths out to align to the type-defined rate. This is expected to
-  // increase subtly with clock speed and future hardware implementations, but
-  // due to incentive alignment associated with global proofs, not fastest clock
-  // in the west, should be gradual.
-  uint32 difficulty = 3;
-  // The output data from the VDF, serialized as bytes. For Wesolowski, this is
-  // an encoding of the 258 byte Y value concatenated with the 258 byte proof
-  // value.
-  bytes output = 4;
-  // The selector value of the previous frame's output, produced as a Poseidon
-  // hash of the output.
-  bytes parent_selector = 5;
-  // The 256 global commitment values
-  repeated bytes global_commitments = 6;
-  // The prover tree root commitment
-  bytes prover_tree_commitment = 7;
-  // The confirmation signatures of the frame
-  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 8;
-}
-
-message FrameHeader {
-  // The address dictates the depth of the shard, at a minimum, the app domain.
-  bytes address = 1;
-  // A strictly monotonically-increasing frame number. Used for culling old
-  // frames past a configurable cutoff point.
-  uint64 frame_number = 2;
+  // A strictly monotonically-increasing rank number. Disambiguates timeouts
+  // and allows for consistent determination of leader, without having to rely
+  // on parsing internal state.
+  uint64 rank = 2;
   // The self-reported timestamp from the proof publisher, encoded as an int64
   // of the Unix epoch in milliseconds. Should be good until
   // 292278994-08-17 07:12:55.807, at which point, this is someone else's
@@ -179,17 +145,59 @@ message FrameHeader {
   // The selector value of the previous frame's output, produced as a Poseidon
   // hash of the output.
   bytes parent_selector = 6;
+  // The 256 global commitment values
+  repeated bytes global_commitments = 7;
+  // The prover tree root commitment
+  bytes prover_tree_commitment = 8;
+  // The confirmation signatures of the frame
+  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 9;
+}
+
+message FrameHeader {
+  // The address dictates the depth of the shard, at a minimum, the app domain.
+  bytes address = 1;
+  // A strictly monotonically-increasing frame number. Used for culling old
+  // frames past a configurable cutoff point.
+  uint64 frame_number = 2;
+  // A strictly monotonically-increasing rank number. Disambiguates timeouts
+  // and allows for consistent determination of leader, without having to rely
+  // on parsing internal state.
+  uint64 rank = 3;
+  // The self-reported timestamp from the proof publisher, encoded as an int64
+  // of the Unix epoch in milliseconds. Should be good until
+  // 292278994-08-17 07:12:55.807, at which point, this is someone else's
+  // problem. Timestamps are imperfect, but smoothed in a rolling window to
+  // ensure a network and quorum-stable difficulty adjustment. Anomalies are
+  // bounded such that a timestamp beyond ten times the average issuance rate
+  // is discarded in preference to the runner up electees, unless there is
+  // simply no alternative available (for example, if a network outage occurred
+  // from an upgrade or bug).
+  int64 timestamp = 4;
+  // The difficulty level used for the frame. Difficulty is calculated based on
+  // the previous 60 timestamps correlated with difficulties, such that the
+  // interval smooths out to align to the type-defined rate. This is expected to
+  // increase subtly with clock speed and future hardware implementations, but
+  // due to incentive alignment associated with global proofs, not fastest clock
+  // in the west, should be gradual.
+  uint32 difficulty = 5;
+  // The output data from the VDF, serialized as bytes. For Wesolowski, this is
+  // an encoding of the 258 byte Y value concatenated with the 258 byte proof
+  // value.
+  bytes output = 6;
+  // The selector value of the previous frame's output, produced as a Poseidon
+  // hash of the output.
+  bytes parent_selector = 7;
   // The root commitment to the set of requests for the frame.
-  bytes requests_root = 7;
+  bytes requests_root = 8;
   // The root commitments to to the hypergraph state at the address.
-  repeated bytes state_roots = 8;
+  repeated bytes state_roots = 9;
   // The prover of the frame, incorporated into the input to the VDF.
-  bytes prover = 9;
+  bytes prover = 10;
   // The prover's proposed fee multiplier, incorporated into sliding window
   // averaging.
-  uint64 fee_multiplier_vote = 10;
+  uint64 fee_multiplier_vote = 11;
   // The confirmation signatures of the frame
-  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 11;
+  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 12;
 }
 
 message ProverLivenessCheck {
@@ -217,9 +225,30 @@ message ProposalVote {
   // The selector being voted for
   bytes selector = 4;
   // The timestamp when the vote was created
-  int64 timestamp = 5;
+  uint64 timestamp = 5;
   // The BLS signature with the voter's address
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 6;
+}
+
+message TimeoutState {
+  // The latest quorum certificate seen by the pacemaker.
+  QuorumCertificate latest_quorum_certificate = 1;
+  // The previous rank's timeout certificate, if applicable.
+  TimeoutCertificate prior_rank_timeout_certificate = 2;
+  // The signed payload which will become part of the new timeout certificate.
+  ProposalVote vote = 3;
+  // TimeoutTick is the number of times the `timeout.Controller` has
+	// (re-)emitted the timeout for this rank. When the timer for the rank's
+	// original duration expires, a `TimeoutState` with `TimeoutTick = 0` is
+	// broadcast. Subsequently, `timeout.Controller` re-broadcasts the
+	// `TimeoutState` periodically  based on some internal heuristic. Each time
+	// we attempt a re-broadcast, the `TimeoutTick` is incremented. Incrementing
+	// the field prevents de-duplicated within the network layer, which in turn
+	// guarantees quick delivery of the `TimeoutState` after GST and facilitates
+	// recovery.
+  uint64 timeout_tick = 4;
+  // The timestamp of the message (not the timeout state)
+  uint64 timestamp = 5;
 }
 
 message QuorumCertificate {
@@ -231,8 +260,8 @@ message QuorumCertificate {
   uint64 frame_number = 3;
   // The selector (hash) of the confirmed frame
   bytes selector = 4;
-  // The timestamp when the vote was created
-  int64 timestamp = 5;
+  // The timestamp of the message (not the certificate)
+  uint64 timestamp = 5;
   // The aggregated BLS signature from all voters
   quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 6;
 }
@@ -246,8 +275,10 @@ message TimeoutCertificate {
   repeated uint64 latest_ranks = 3;
   // The latest quorum certificate from all timeouts
   QuorumCertificate latest_quorum_certificate = 4;
+  // The timestamp of the message (not the certificate)
+  uint64 timestamp = 5;
   // The aggregated BLS signature from all voters
-  quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 5;
+  quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 6;
 }
 
 message GlobalFrame {

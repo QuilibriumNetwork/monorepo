@@ -68,7 +68,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnInvalidStateDetected(
 		),
 		consensus.IdentityParam(
 			"qc_state_id",
-			invalidState.ParentQuorumCertificate.GetSelector(),
+			invalidState.ParentQuorumCertificate.Identity(),
 		),
 	).Error("invalid state detected", err)
 }
@@ -103,7 +103,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnReceiveProposal(
 			),
 			consensus.IdentityParam(
 				"last_rank_tc_newest_qc_state_id",
-				lastRankTC.GetLatestQuorumCert().GetSelector(),
+				lastRankTC.GetLatestQuorumCert().Identity(),
 			),
 		)
 	}
@@ -118,7 +118,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnReceiveQuorumCertificate(
 	lc.log.With(
 		consensus.Uint64Param("cur_rank", currentRank),
 		consensus.Uint64Param("qc_rank", qc.GetRank()),
-		consensus.IdentityParam("qc_state_id", qc.GetSelector()),
+		consensus.IdentityParam("qc_state_id", qc.Identity()),
 	).Trace("processing QC")
 }
 
@@ -132,7 +132,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnReceiveTimeoutCertificate(
 		consensus.Uint64Param("newest_qc_rank", tc.GetLatestQuorumCert().GetRank()),
 		consensus.IdentityParam(
 			"newest_qc_state_id",
-			tc.GetLatestQuorumCert().GetSelector(),
+			tc.GetLatestQuorumCert().Identity(),
 		),
 	).Trace("processing TC")
 }
@@ -150,7 +150,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnPartialTimeoutCertificate(
 		),
 		consensus.IdentityParam(
 			"qc_state_id",
-			partialTc.NewestQuorumCertificate.GetSelector(),
+			partialTc.NewestQuorumCertificate.Identity(),
 		),
 	)
 	lastRankTC := partialTc.PriorRankTimeoutCertificate
@@ -163,7 +163,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnPartialTimeoutCertificate(
 			),
 			consensus.IdentityParam(
 				"last_rank_tc_newest_qc_state_id",
-				lastRankTC.GetLatestQuorumCert().GetSelector(),
+				lastRankTC.GetLatestQuorumCert().Identity(),
 			),
 		)
 	}
@@ -191,7 +191,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnQuorumCertificateTriggeredRankChange(
 ) {
 	lc.log.With(
 		consensus.Uint64Param("qc_rank", qc.GetRank()),
-		consensus.IdentityParam("qc_state_id", qc.GetSelector()),
+		consensus.IdentityParam("qc_state_id", qc.Identity()),
 		consensus.Uint64Param("old_rank", oldRank),
 		consensus.Uint64Param("new_rank", newRank),
 	).Trace("QC triggered rank change")
@@ -359,7 +359,7 @@ func (lc *LogConsumer[StateT, VoteT]) logBasicStateData(
 		consensus.Uint64Param("qc_rank", state.ParentQuorumCertificate.GetRank()),
 		consensus.IdentityParam(
 			"qc_state_id",
-			state.ParentQuorumCertificate.GetSelector(),
+			state.ParentQuorumCertificate.Identity(),
 		),
 	)
 }
@@ -374,7 +374,7 @@ func (
 		consensus.Uint64Param("newest_qc_rank", tc.GetLatestQuorumCert().GetRank()),
 		consensus.IdentityParam(
 			"newest_qc_state_id",
-			tc.GetLatestQuorumCert().GetSelector(),
+			tc.GetLatestQuorumCert().Identity(),
 		),
 	).Trace("TC constructed")
 }
@@ -391,7 +391,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnPartialTimeoutCertificateCreated(
 	lc.log.With(
 		consensus.Uint64Param("rank", rank),
 		consensus.Uint64Param("newest_qc_rank", newestQC.GetRank()),
-		consensus.IdentityParam("newest_qc_state_id", newestQC.GetSelector()),
+		consensus.IdentityParam("newest_qc_state_id", newestQC.Identity()),
 		consensus.StringParam("has_last_rank_tc", has),
 	).Trace("partial TC constructed")
 }
@@ -401,7 +401,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnNewQuorumCertificateDiscovered(
 ) {
 	lc.log.With(
 		consensus.Uint64Param("qc_rank", qc.GetRank()),
-		consensus.IdentityParam("qc_state_id", qc.GetSelector()),
+		consensus.IdentityParam("qc_state_id", qc.Identity()),
 	).Trace("new QC discovered")
 }
 
@@ -413,7 +413,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnNewTimeoutCertificateDiscovered(
 		consensus.Uint64Param("newest_qc_rank", tc.GetLatestQuorumCert().GetRank()),
 		consensus.IdentityParam(
 			"newest_qc_state_id",
-			tc.GetLatestQuorumCert().GetSelector(),
+			tc.GetLatestQuorumCert().Identity(),
 		),
 	).Trace("new TC discovered")
 }
@@ -466,7 +466,7 @@ func (lc *LogConsumer[StateT, VoteT]) OnOwnProposal(
 		consensus.IdentityParam("state_id", header.State.Identifier),
 		consensus.IdentityParam(
 			"parent_qc_id",
-			header.State.ParentQuorumCertificate.GetSelector(),
+			header.State.ParentQuorumCertificate.Identity(),
 		),
 		consensus.TimeParam(
 			"timestamp",
@@ -481,6 +481,6 @@ func (lc *LogConsumer[StateT, VoteT]) OnQuorumCertificateConstructedFromVotes(
 ) {
 	lc.log.With(
 		consensus.Uint64Param("rank", qc.GetRank()),
-		consensus.IdentityParam("state_id", qc.GetSelector()),
+		consensus.IdentityParam("state_id", qc.Identity()),
 	).Trace("QC constructed from votes")
 }

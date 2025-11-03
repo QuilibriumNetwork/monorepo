@@ -20,7 +20,7 @@ func (t *TestAggregatedSignature) GetSignature() []byte {
 	return t.Signature
 }
 
-func (t *TestAggregatedSignature) GetPublicKey() []byte {
+func (t *TestAggregatedSignature) GetPubKey() []byte {
 	return t.PublicKey
 }
 
@@ -33,7 +33,7 @@ type TestQuorumCertificate struct {
 	Rank                uint64
 	FrameNumber         uint64
 	Selector            models.Identity
-	Timestamp           int64
+	Timestamp           uint64
 	AggregatedSignature models.AggregatedSignature
 }
 
@@ -49,11 +49,11 @@ func (t *TestQuorumCertificate) GetFrameNumber() uint64 {
 	return t.FrameNumber
 }
 
-func (t *TestQuorumCertificate) GetSelector() models.Identity {
+func (t *TestQuorumCertificate) Identity() models.Identity {
 	return t.Selector
 }
 
-func (t *TestQuorumCertificate) GetTimestamp() int64 {
+func (t *TestQuorumCertificate) GetTimestamp() uint64 {
 	return t.Timestamp
 }
 
@@ -65,15 +65,15 @@ func (t *TestQuorumCertificate) Equals(other models.QuorumCertificate) bool {
 	return bytes.Equal(t.Filter, other.GetFilter()) &&
 		t.Rank == other.GetRank() &&
 		t.FrameNumber == other.GetFrameNumber() &&
-		t.Selector == other.GetSelector() &&
+		t.Selector == other.Identity() &&
 		t.Timestamp == other.GetTimestamp() &&
 		bytes.Equal(
 			t.AggregatedSignature.GetBitmask(),
 			other.GetAggregatedSignature().GetBitmask(),
 		) &&
 		bytes.Equal(
-			t.AggregatedSignature.GetPublicKey(),
-			other.GetAggregatedSignature().GetPublicKey(),
+			t.AggregatedSignature.GetPubKey(),
+			other.GetAggregatedSignature().GetPubKey(),
 		) &&
 		bytes.Equal(
 			t.AggregatedSignature.GetSignature(),
@@ -88,7 +88,7 @@ func MakeQC(options ...func(*TestQuorumCertificate)) models.QuorumCertificate {
 		Rank:        rand.Uint64(),
 		FrameNumber: rand.Uint64() + 1,
 		Selector:    string(s),
-		Timestamp:   time.Now().UnixMilli(),
+		Timestamp:   uint64(time.Now().UnixMilli()),
 		AggregatedSignature: &TestAggregatedSignature{
 			PublicKey: make([]byte, 585),
 			Signature: make([]byte, 74),

@@ -34,7 +34,7 @@ func NewForks[StateT models.Unique, VoteT models.Unique](
 	finalizationCallback consensus.Finalizer,
 	notifier consensus.FollowerConsumer[StateT, VoteT],
 ) (*Forks[StateT, VoteT], error) {
-	if (trustedRoot.State.Identifier != trustedRoot.CertifyingQuorumCertificate.GetSelector()) ||
+	if (trustedRoot.State.Identifier != trustedRoot.CertifyingQuorumCertificate.Identity()) ||
 		(trustedRoot.State.Rank != trustedRoot.CertifyingQuorumCertificate.GetRank()) {
 		return nil,
 			models.NewConfigurationErrorf(
@@ -209,12 +209,12 @@ func (f *Forks[StateT, VoteT]) EnsureStateIsValidExtension(
 	// For a state whose parent is _not_ below the pruning height, we expect the
 	// parent to be known.
 	_, isParentKnown := f.forest.GetVertex(
-		state.ParentQuorumCertificate.GetSelector(),
+		state.ParentQuorumCertificate.Identity(),
 	)
 	if !isParentKnown { // missing parent
 		return models.MissingStateError{
 			Rank:       state.ParentQuorumCertificate.GetRank(),
-			Identifier: state.ParentQuorumCertificate.GetSelector(),
+			Identifier: state.ParentQuorumCertificate.Identity(),
 		}
 	}
 	return nil
@@ -338,7 +338,7 @@ func (f *Forks[StateT, VoteT]) AddValidatedState(
 	// based on certified states.
 	// The certified parent essentially combines the parent, with the QC contained
 	// in state, to drive finalization.
-	parent, found := f.GetState(proposal.ParentQuorumCertificate.GetSelector())
+	parent, found := f.GetState(proposal.ParentQuorumCertificate.Identity())
 	if !found {
 		// Not finding the parent means it is already pruned; hence this state does
 		// not change the finalization state.
@@ -418,7 +418,7 @@ func (f *Forks[StateT, VoteT]) checkForConflictingQCs(
 	it := f.forest.GetVerticesAtLevel((*qc).GetRank())
 	for it.HasNext() {
 		otherState := it.NextVertex() // by construction, must have same rank as qc.Rank
-		if (*qc).GetSelector() != otherState.VertexID() {
+		if (*qc).Identity() != otherState.VertexID() {
 			// * we have just found another state at the same rank number as qc.Rank
 			//   but with different hash
 			// * if this state has a child c, this child will have
@@ -431,7 +431,7 @@ func (f *Forks[StateT, VoteT]) checkForConflictingQCs(
 				conflictingQC := otherChild.ParentQuorumCertificate
 				return models.ByzantineThresholdExceededError{Evidence: fmt.Sprintf(
 					"conflicting QCs at rank %d: %x and %x",
-					(*qc).GetRank(), (*qc).GetSelector(), conflictingQC.GetSelector(),
+					(*qc).GetRank(), (*qc).Identity(), conflictingQC.Identity(),
 				)}
 			}
 		}
@@ -506,12 +506,12 @@ func (f *Forks[StateT, VoteT]) checkForAdvancingFinalization(
 	// above
 	qcForParent := certifiedState.State.ParentQuorumCertificate
 	parentVertex, parentStateKnown := f.forest.GetVertex(
-		qcForParent.GetSelector(),
+		qcForParent.Identity(),
 	)
 	if !parentStateKnown {
 		return models.MissingStateError{
 			Rank:       qcForParent.GetRank(),
-			Identifier: qcForParent.GetSelector(),
+			Identifier: qcForParent.Identity(),
 		}
 	}
 	parentState := parentVertex.(*StateContainer[StateT]).GetState()
@@ -550,7 +550,7 @@ func (f *Forks[StateT, VoteT]) checkForAdvancingFinalization(
 	if err != nil {
 		return fmt.Errorf(
 			"advancing finalization to state %x from rank %d failed: %w",
-			qcForParent.GetSelector(),
+			qcForParent.Identity(),
 			qcForParent.GetRank(),
 			err,
 		)
@@ -614,12 +614,12 @@ func (f *Forks[StateT, VoteT]) collectStatesForFinalization(
 	l := (*qc).GetRank() - lastFinalized.Rank // l is an upper limit to the number of states that can be maximally finalized
 	statesToBeFinalized := make([]*models.State[StateT], l)
 	for (*qc).GetRank() > lastFinalized.Rank {
-		b, ok := f.GetState((*qc).GetSelector())
+		b, ok := f.GetState((*qc).Identity())
 		if !ok {
 			return nil, fmt.Errorf(
 				"failed to get state (rank=%d, stateID=%x) for finalization",
 				(*qc).GetRank(),
-				(*qc).GetSelector(),
+				(*qc).Identity(),
 			)
 		}
 		l--
@@ -641,10 +641,10 @@ func (f *Forks[StateT, VoteT]) collectStatesForFinalization(
 		)}
 	}
 	if (*qc).GetRank() == lastFinalized.Rank &&
-		lastFinalized.Identifier != (*qc).GetSelector() {
+		lastFinalized.Identifier != (*qc).Identity() {
 		return nil, models.ByzantineThresholdExceededError{Evidence: fmt.Sprintf(
 			"finalizing states with rank %d at conflicting forks: %x and %x",
-			(*qc).GetRank(), (*qc).GetSelector(), lastFinalized.Identifier,
+			(*qc).GetRank(), (*qc).Identity(), lastFinalized.Identifier,
 		)}
 	}
 

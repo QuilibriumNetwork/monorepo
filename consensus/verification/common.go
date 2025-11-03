@@ -49,7 +49,7 @@ func verifyAggregatedSignatureOneMessage(
 	msg []byte, // message to verify against
 ) error {
 	valid := validator.VerifySignatureRaw(
-		aggregatedSig.GetPublicKey(),
+		aggregatedSig.GetPubKey(),
 		aggregatedSig.GetSignature(),
 		msg,
 		dsTag,

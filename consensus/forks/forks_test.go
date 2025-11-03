@@ -857,7 +857,7 @@ func addCertifiedStatesToForks(forks *Forks[*helper.TestState, *helper.TestVote]
 	uncertifiedStates := make(map[models.Identity]*models.State[*helper.TestState])
 	for _, b := range states {
 		uncertifiedStates[b.Identifier] = b
-		parentID := b.ParentQuorumCertificate.GetSelector()
+		parentID := b.ParentQuorumCertificate.Identity()
 		parent, found := uncertifiedStates[parentID]
 		if !found {
 			continue

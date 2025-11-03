@@ -21,32 +21,39 @@ var (
 type VerifyingVoteProcessorFactory[
 	StateT models.Unique,
 	VoteT models.Unique,
+	PeerIDT models.Unique,
 ] = func(
 	tracer consensus.TraceLogger,
 	proposal *models.SignedProposal[StateT, VoteT],
 	dsTag []byte,
 	aggregator consensus.SignatureAggregator,
+	votingProvider consensus.VotingProvider[StateT, VoteT, PeerIDT],
 ) (consensus.VerifyingVoteProcessor[StateT, VoteT], error)
 
 // VoteCollector implements a state machine for transition between different
 // states of vote collector
-type VoteCollector[StateT models.Unique, VoteT models.Unique] struct {
+type VoteCollector[
+	StateT models.Unique,
+	VoteT models.Unique,
+	PeerIDT models.Unique,
+] struct {
 	sync.Mutex
 	tracer                   consensus.TraceLogger
 	workers                  consensus.Workers
 	notifier                 consensus.VoteAggregationConsumer[StateT, VoteT]
-	createVerifyingProcessor VerifyingVoteProcessorFactory[StateT, VoteT]
+	createVerifyingProcessor VerifyingVoteProcessorFactory[StateT, VoteT, PeerIDT]
 	dsTag                    []byte
 	aggregator               consensus.SignatureAggregator
+	voter                    consensus.VotingProvider[StateT, VoteT, PeerIDT]
 
 	votesCache     VotesCache[VoteT]
 	votesProcessor atomic.Value
 }
 
-var _ consensus.VoteCollector[*nilUnique, *nilUnique] = (*VoteCollector[*nilUnique, *nilUnique])(nil)
+var _ consensus.VoteCollector[*nilUnique, *nilUnique] = (*VoteCollector[*nilUnique, *nilUnique, *nilUnique])(nil)
 
 func (
-	m *VoteCollector[StateT, VoteT],
+	m *VoteCollector[StateT, VoteT, PeerIDT],
 ) atomicLoadProcessor() consensus.VoteProcessor[VoteT] {
 	return m.votesProcessor.Load().(*atomicValueWrapper[VoteT]).processor
 }
@@ -59,12 +66,21 @@ type atomicValueWrapper[VoteT models.Unique] struct {
 	processor consensus.VoteProcessor[VoteT]
 }
 
-func NewStateMachineFactory[StateT models.Unique, VoteT models.Unique](
+func NewStateMachineFactory[
+	StateT models.Unique,
+	VoteT models.Unique,
+	PeerIDT models.Unique,
+](
 	tracer consensus.TraceLogger,
 	notifier consensus.VoteAggregationConsumer[StateT, VoteT],
-	verifyingVoteProcessorFactory VerifyingVoteProcessorFactory[StateT, VoteT],
+	verifyingVoteProcessorFactory VerifyingVoteProcessorFactory[
+		StateT,
+		VoteT,
+		PeerIDT,
+	],
 	dsTag []byte,
 	aggregator consensus.SignatureAggregator,
+	voter consensus.VotingProvider[StateT, VoteT, PeerIDT],
 ) voteaggregator.NewCollectorFactoryMethod[StateT, VoteT] {
 	return func(rank uint64, workers consensus.Workers) (
 		consensus.VoteCollector[StateT, VoteT],
@@ -78,20 +94,30 @@ func NewStateMachineFactory[StateT models.Unique, VoteT models.Unique](
 			verifyingVoteProcessorFactory,
 			dsTag,
 			aggregator,
+			voter,
 		), nil
 	}
 }
 
-func NewStateMachine[StateT models.Unique, VoteT models.Unique](
+func NewStateMachine[
+	StateT models.Unique,
+	VoteT models.Unique,
+	PeerIDT models.Unique,
+](
 	rank uint64,
 	tracer consensus.TraceLogger,
 	workers consensus.Workers,
 	notifier consensus.VoteAggregationConsumer[StateT, VoteT],
-	verifyingVoteProcessorFactory VerifyingVoteProcessorFactory[StateT, VoteT],
+	verifyingVoteProcessorFactory VerifyingVoteProcessorFactory[
+		StateT,
+		VoteT,
+		PeerIDT,
+	],
 	dsTag []byte,
 	aggregator consensus.SignatureAggregator,
-) *VoteCollector[StateT, VoteT] {
-	sm := &VoteCollector[StateT, VoteT]{
+	voter consensus.VotingProvider[StateT, VoteT, PeerIDT],
+) *VoteCollector[StateT, VoteT, PeerIDT] {
+	sm := &VoteCollector[StateT, VoteT, PeerIDT]{
 		tracer:                   tracer,
 		workers:                  workers,
 		notifier:                 notifier,
@@ -99,6 +125,7 @@ func NewStateMachine[StateT models.Unique, VoteT models.Unique](
 		votesCache:               *NewVotesCache[VoteT](rank),
 		dsTag:                    dsTag,
 		aggregator:               aggregator,
+		voter:                    voter,
 	}
 
 	// without a state, we don't process votes (only cache them)
@@ -111,7 +138,7 @@ func NewStateMachine[StateT models.Unique, VoteT models.Unique](
 // AddVote adds a vote to current vote collector
 // All expected errors are handled via callbacks to notifier.
 // Under normal execution only exceptions are propagated to caller.
-func (m *VoteCollector[StateT, VoteT]) AddVote(vote *VoteT) error {
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) AddVote(vote *VoteT) error {
 	// Cache vote
 	err := m.votesCache.AddVote(vote)
 	if err != nil {
@@ -166,7 +193,7 @@ func (m *VoteCollector[StateT, VoteT]) AddVote(vote *VoteT) error {
 
 // processVote uses compare-and-repeat pattern to process vote with underlying
 // vote processor
-func (m *VoteCollector[StateT, VoteT]) processVote(vote *VoteT) error {
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) processVote(vote *VoteT) error {
 	for {
 		processor := m.atomicLoadProcessor()
 		currentState := processor.Status()
@@ -197,12 +224,12 @@ func (m *VoteCollector[StateT, VoteT]) processVote(vote *VoteT) error {
 }
 
 // Status returns the status of underlying vote processor
-func (m *VoteCollector[StateT, VoteT]) Status() consensus.VoteCollectorStatus {
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) Status() consensus.VoteCollectorStatus {
 	return m.atomicLoadProcessor().Status()
 }
 
 // Rank returns rank associated with this collector
-func (m *VoteCollector[StateT, VoteT]) Rank() uint64 {
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) Rank() uint64 {
 	return m.votesCache.Rank()
 }
 
@@ -220,7 +247,7 @@ func (m *VoteCollector[StateT, VoteT]) Rank() uint64 {
 //	CachingVotes   -> VerifyingVotes
 //	CachingVotes   -> Invalid
 //	VerifyingVotes -> Invalid
-func (m *VoteCollector[StateT, VoteT]) ProcessState(
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) ProcessState(
 	proposal *models.SignedProposal[StateT, VoteT],
 ) error {
 
@@ -299,7 +326,7 @@ func (m *VoteCollector[StateT, VoteT]) ProcessState(
 // CAUTION, VoteConsumer implementations must be
 //   - NON-BLOCKING and consume the votes without noteworthy delay, and
 //   - CONCURRENCY SAFE
-func (m *VoteCollector[StateT, VoteT]) RegisterVoteConsumer(
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) RegisterVoteConsumer(
 	consumer consensus.VoteConsumer[VoteT],
 ) {
 	m.votesCache.RegisterVoteConsumer(consumer)
@@ -313,7 +340,7 @@ func (m *VoteCollector[StateT, VoteT]) RegisterVoteConsumer(
 //     `CachingVotes`
 //   - all other errors are unexpected and potential symptoms of internal bugs
 //     or state corruption (fatal)
-func (m *VoteCollector[StateT, VoteT]) caching2Verifying(
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) caching2Verifying(
 	proposal *models.SignedProposal[StateT, VoteT],
 ) error {
 	stateID := proposal.State.Identifier
@@ -322,6 +349,7 @@ func (m *VoteCollector[StateT, VoteT]) caching2Verifying(
 		proposal,
 		m.dsTag,
 		m.aggregator,
+		m.voter,
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -346,7 +374,7 @@ func (m *VoteCollector[StateT, VoteT]) caching2Verifying(
 	return nil
 }
 
-func (m *VoteCollector[StateT, VoteT]) terminateVoteProcessing() {
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) terminateVoteProcessing() {
 	if m.Status() == consensus.VoteCollectorStatusInvalid {
 		return
 	}
@@ -360,7 +388,7 @@ func (m *VoteCollector[StateT, VoteT]) terminateVoteProcessing() {
 }
 
 // processCachedVotes feeds all cached votes into the VoteProcessor
-func (m *VoteCollector[StateT, VoteT]) processCachedVotes(
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) processCachedVotes(
 	state *models.State[StateT],
 ) {
 	cachedVotes := m.votesCache.All()

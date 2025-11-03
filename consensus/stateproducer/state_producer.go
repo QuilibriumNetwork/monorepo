@@ -65,19 +65,19 @@ func (bp *StateProducer[StateT, VoteT, PeerIDT, CollectedT]) MakeStateProposal(
 		context.TODO(),
 		rank,
 		qc.GetFilter(),
-		qc.GetSelector(),
+		qc.Identity(),
 	)
 	if err != nil {
 		if models.IsNoVoteError(err) {
 			return nil, fmt.Errorf(
 				"unsafe to vote for own proposal on top of %x: %w",
-				qc.GetSelector(),
+				qc.Identity(),
 				err,
 			)
 		}
 		return nil, fmt.Errorf(
 			"could not build state proposal on top of %x: %w",
-			qc.GetSelector(),
+			qc.Identity(),
 			err,
 		)
 	}
@@ -92,7 +92,7 @@ func (bp *StateProducer[StateT, VoteT, PeerIDT, CollectedT]) MakeStateProposal(
 	if err != nil {
 		return nil, fmt.Errorf(
 			"could not vote on state proposal on top of %x: %w",
-			qc.GetSelector(),
+			qc.Identity(),
 			err,
 		)
 	}

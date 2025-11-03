@@ -22,7 +22,7 @@ func FinalizedStates(in *Instance) []*models.State[*helper.TestState] {
 			break
 		}
 		finalizedState, found =
-			in.headers[finalizedState.ParentQuorumCertificate.GetSelector()]
+			in.headers[finalizedState.ParentQuorumCertificate.Identity()]
 		if !found {
 			break
 		}

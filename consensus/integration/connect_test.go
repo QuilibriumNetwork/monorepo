@@ -28,10 +28,10 @@ func Connect(t *testing.T, instances []*Instance) {
 				require.True(t, ok)
 				// sender should always have the parent
 				sender.updatingStates.RLock()
-				_, exists := sender.headers[proposal.State.ParentQuorumCertificate.GetSelector()]
+				_, exists := sender.headers[proposal.State.ParentQuorumCertificate.Identity()]
 				sender.updatingStates.RUnlock()
 				if !exists {
-					t.Fatalf("parent for proposal not found (sender: %x, parent: %x)", sender.localID, proposal.State.ParentQuorumCertificate.GetSelector())
+					t.Fatalf("parent for proposal not found (sender: %x, parent: %x)", sender.localID, proposal.State.ParentQuorumCertificate.Identity())
 				}
 
 				// store locally and loop back to engine for processing

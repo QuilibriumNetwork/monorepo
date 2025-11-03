@@ -51,14 +51,14 @@ func (b *StateSignerDecoder[StateT]) DecodeSignerIDs(
 			// possibly, we request rank which is far behind in the past, in this
 			// case we won't have it in cache. try asking by parent ID
 			byStateMembers, err := b.IdentitiesByState(
-				state.ParentQuorumCertificate.GetSelector(),
+				state.ParentQuorumCertificate.Identity(),
 			)
 			if err != nil {
 				return nil, fmt.Errorf(
 					"could not retrieve identities for state %x with QC rank %d for parent %x: %w",
 					state.Identifier,
 					state.ParentQuorumCertificate.GetRank(),
-					state.ParentQuorumCertificate.GetSelector(),
+					state.ParentQuorumCertificate.Identity(),
 					err,
 				) // state.ErrUnknownSnapshotReference or exception
 			}

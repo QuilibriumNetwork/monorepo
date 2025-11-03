@@ -270,7 +270,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 				Rank:        votes[0].Rank,
 				FrameNumber: votes[0].Rank,
 				Selector:    votes[0].StateID,
-				Timestamp:   time.Now().UnixMilli(),
+				Timestamp:   uint64(time.Now().UnixMilli()),
 				AggregatedSignature: &helper.TestAggregatedSignature{
 					Signature: make([]byte, 74),
 					Bitmask:   bitmask,
@@ -295,11 +295,11 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 
 			// sender should always have the parent
 			in.updatingStates.RLock()
-			_, exists := in.headers[proposal.State.ParentQuorumCertificate.GetSelector()]
+			_, exists := in.headers[proposal.State.ParentQuorumCertificate.Identity()]
 			in.updatingStates.RUnlock()
 
 			if !exists {
-				t.Fatalf("parent for proposal not found parent: %x", proposal.State.ParentQuorumCertificate.GetSelector())
+				t.Fatalf("parent for proposal not found parent: %x", proposal.State.ParentQuorumCertificate.Identity())
 			}
 
 			// store locally and loop back to engine for processing
@@ -365,7 +365,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 		Rank:        rootState.Rank,
 		FrameNumber: rootState.Rank,
 		Selector:    rootState.Identifier,
-		Timestamp:   time.Now().UnixMilli(),
+		Timestamp:   uint64(time.Now().UnixMilli()),
 		AggregatedSignature: &helper.TestAggregatedSignature{
 			Signature: make([]byte, 74),
 			Bitmask:   []byte{0b11111111, 0b00000000},
@@ -410,10 +410,10 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 		in.queue <- qc
 	}
 
-	voteProcessorFactory := mocks.NewVoteProcessorFactory[*helper.TestState, *helper.TestVote](t)
-	voteProcessorFactory.On("Create", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(
-		func(tracer consensus.TraceLogger, proposal *models.SignedProposal[*helper.TestState, *helper.TestVote], dsTag []byte, aggregator consensus.SignatureAggregator) consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote] {
-			processor, err := votecollector.NewBootstrapVoteProcessor(
+	voteProcessorFactory := mocks.NewVoteProcessorFactory[*helper.TestState, *helper.TestVote, *helper.TestPeer](t)
+	voteProcessorFactory.On("Create", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(
+		func(tracer consensus.TraceLogger, proposal *models.SignedProposal[*helper.TestState, *helper.TestVote], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote] {
+			processor, err := votecollector.NewBootstrapVoteProcessor[*helper.TestState, *helper.TestVote, *helper.TestPeer](
 				in.logger,
 				in.committee,
 				proposal.State,
@@ -441,7 +441,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 		) (models.QuorumCertificate, error) {
 			return &helper.TestQuorumCertificate{
 				Rank:                state.Rank,
-				Timestamp:           int64(state.Timestamp),
+				Timestamp:           state.Timestamp,
 				FrameNumber:         state.Rank,
 				Selector:            state.Identifier,
 				AggregatedSignature: aggregatedSignature,
@@ -475,11 +475,11 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 			}, nil
 		}).Maybe()
 	sigAgg.On("VerifySignatureRaw", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil).Maybe()
-	createCollectorFactoryMethod := votecollector.NewStateMachineFactory(in.logger, voteAggregationDistributor, voteProcessorFactory.Create, []byte{}, sigAgg)
-	voteCollectors := voteaggregator.NewVoteCollectors(in.logger, livenessData.CurrentRank, workerpool.New(2), createCollectorFactoryMethod)
+	createCollectorFactoryMethod := votecollector.NewStateMachineFactory(in.logger, voteAggregationDistributor, voteProcessorFactory.Create, []byte{}, sigAgg, in.voting)
+	voteCollectors := voteaggregator.NewVoteCollectors[*helper.TestState, *helper.TestVote](in.logger, livenessData.CurrentRank, workerpool.New(2), createCollectorFactoryMethod)
 
 	// initialize the vote aggregator
-	in.voteAggregator, err = voteaggregator.NewVoteAggregator(
+	in.voteAggregator, err = voteaggregator.NewVoteAggregator[*helper.TestState, *helper.TestVote](
 		in.logger,
 		voteAggregationDistributor,
 		livenessData.CurrentRank,
@@ -543,7 +543,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 				nil,
 			).Maybe()
 
-			p, err := timeoutcollector.NewTimeoutProcessor(
+			p, err := timeoutcollector.NewTimeoutProcessor[*helper.TestState, *helper.TestVote, *helper.TestPeer](
 				in.logger,
 				in.committee,
 				in.validator,
@@ -692,7 +692,7 @@ func (in *Instance) Run(t *testing.T) error {
 func (in *Instance) ProcessState(proposal *models.SignedProposal[*helper.TestState, *helper.TestVote]) {
 	in.updatingStates.Lock()
 	defer in.updatingStates.Unlock()
-	_, parentExists := in.headers[proposal.State.ParentQuorumCertificate.GetSelector()]
+	_, parentExists := in.headers[proposal.State.ParentQuorumCertificate.Identity()]
 
 	if parentExists {
 		next := proposal
@@ -701,11 +701,11 @@ func (in *Instance) ProcessState(proposal *models.SignedProposal[*helper.TestSta
 
 			in.queue <- next
 			// keep processing the pending states
-			next = in.pendings[next.State.ParentQuorumCertificate.GetSelector()]
+			next = in.pendings[next.State.ParentQuorumCertificate.Identity()]
 		}
 	} else {
 		// cache it in pendings by ParentID
-		in.pendings[proposal.State.ParentQuorumCertificate.GetSelector()] = proposal
+		in.pendings[proposal.State.ParentQuorumCertificate.Identity()] = proposal
 	}
 }
 

@@ -289,7 +289,7 @@ func (v *Validator[StateT, VoteT]) ValidateQuorumCertificate(
 		default:
 			return fmt.Errorf(
 				"cannot verify qc's aggregated signature (qc.Identifier: %x): %w",
-				qc.GetSelector(),
+				qc.Identity(),
 				err,
 			)
 		}
@@ -508,7 +508,7 @@ func newInvalidQuorumCertificateError(
 	err error,
 ) error {
 	return models.InvalidQuorumCertificateError{
-		Identifier: qc.GetSelector(),
+		Identifier: qc.Identity(),
 		Rank:       qc.GetRank(),
 		Err:        err,
 	}

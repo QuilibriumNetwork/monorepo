@@ -391,7 +391,7 @@ func (es *EventHandlerSuite) TestStartNewRank_ParentProposalNotFound() {
 	require.NoError(es.T(), err)
 
 	require.Equal(es.T(), es.endRank, es.paceMaker.CurrentRank(), "incorrect rank change")
-	es.forks.AssertCalled(es.T(), "GetState", newestQC.GetSelector())
+	es.forks.AssertCalled(es.T(), "GetState", newestQC.Identity())
 	es.notifier.AssertNotCalled(es.T(), "OnOwnProposal", mock.Anything, mock.Anything)
 }
 
@@ -449,7 +449,7 @@ func (es *EventHandlerSuite) TestOnReceiveProposal_NoVote_ParentProposalNotFound
 	proposal := createProposal(es.initRank, es.initRank-1)
 
 	// remove parent from known proposals
-	delete(es.forks.proposals, proposal.State.ParentQuorumCertificate.GetSelector())
+	delete(es.forks.proposals, proposal.State.ParentQuorumCertificate.Identity())
 
 	// no vote for this proposal, no parent found
 	err := es.eventhandler.OnReceiveProposal(proposal)
@@ -842,7 +842,7 @@ func (es *EventHandlerSuite) TestLeaderBuild100States() {
 		// for first proposal we need to store the parent otherwise it won't be voted for
 		if i == 0 {
 			parentState := helper.MakeState(func(state *models.State[*helper.TestState]) {
-				state.Identifier = proposal.State.ParentQuorumCertificate.GetSelector()
+				state.Identifier = proposal.State.ParentQuorumCertificate.Identity()
 				state.Rank = proposal.State.ParentQuorumCertificate.GetRank()
 			})
 			es.forks.proposals[parentState.Identifier] = parentState

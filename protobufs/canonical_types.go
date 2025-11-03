@@ -60,6 +60,7 @@ const (
 	PathType                uint32 = 0x0314
 	TraversalSubProofType   uint32 = 0x0315
 	TraversalProofType      uint32 = 0x0316
+	TimeoutStateType        uint32 = 0x031C
 	TimeoutCertificateType  uint32 = 0x031D
 
 	// Hypergraph types (0x0400 - 0x04FF)

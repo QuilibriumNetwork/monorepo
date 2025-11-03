@@ -37,7 +37,7 @@ func (b *StateContainer[StateT]) Parent() (models.Identity, uint64) {
 	if b.ParentQuorumCertificate == nil {
 		return "", 0
 	}
-	return b.ParentQuorumCertificate.GetSelector(),
+	return b.ParentQuorumCertificate.Identity(),
 		b.ParentQuorumCertificate.GetRank()
 }
 

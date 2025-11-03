@@ -47,8 +47,8 @@ func (t *TestTimeoutCertificate) Equals(other models.TimeoutCertificate) bool {
 			other.GetAggregatedSignature().GetBitmask(),
 		) &&
 		bytes.Equal(
-			t.AggregatedSignature.GetPublicKey(),
-			other.GetAggregatedSignature().GetPublicKey(),
+			t.AggregatedSignature.GetPubKey(),
+			other.GetAggregatedSignature().GetPubKey(),
 		) &&
 		bytes.Equal(
 			t.AggregatedSignature.GetSignature(),

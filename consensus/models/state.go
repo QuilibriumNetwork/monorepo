@@ -74,12 +74,12 @@ func NewCertifiedState[StateT Unique](
 				quorumCertificate.GetRank(),
 			)
 	}
-	if state.Identifier != quorumCertificate.GetSelector() {
+	if state.Identifier != quorumCertificate.Identity() {
 		return &CertifiedState[StateT]{},
 			fmt.Errorf(
 				"state's ID (%x) should equal the state referenced by the qc (%x)",
 				state.Identifier,
-				quorumCertificate.GetSelector(),
+				quorumCertificate.Identity(),
 			)
 	}
 	return &CertifiedState[StateT]{
@@ -92,7 +92,7 @@ func NewCertifiedState[StateT Unique](
 // produce a state vote). To avoid repeated computation, we use value from the
 // QuorumCertificate.
 func (b *CertifiedState[StateT]) Identifier() Identity {
-	return b.CertifyingQuorumCertificate.GetSelector()
+	return b.CertifyingQuorumCertificate.Identity()
 }
 
 // Rank returns rank where the state was proposed.

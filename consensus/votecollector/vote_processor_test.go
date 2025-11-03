@@ -242,7 +242,7 @@ func (s *VoteProcessorTestSuite) TestProcess_ConcurrentCreatingQC() {
 		Rank:                s.proposal.State.Rank,
 		Selector:            s.proposal.State.Identifier,
 		FrameNumber:         s.proposal.State.Rank,
-		Timestamp:           int64(s.proposal.State.Timestamp),
+		Timestamp:           uint64(s.proposal.State.Timestamp),
 		AggregatedSignature: expectedSig,
 	}, nil)
 	var startupWg, shutdownWg sync.WaitGroup

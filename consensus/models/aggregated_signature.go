@@ -5,8 +5,8 @@ package models
 type AggregatedSignature interface {
 	// GetSignature returns the aggregated signature in raw canonical bytes
 	GetSignature() []byte
-	// GetPublicKey returns the public key in raw canonical bytes
-	GetPublicKey() []byte
+	// GetPubKey returns the public key in raw canonical bytes
+	GetPubKey() []byte
 	// GetBitmask returns the bitmask of the signers in the signature, in matching
 	// order to the clique's prover set (in ascending ring order).
 	GetBitmask() []byte
