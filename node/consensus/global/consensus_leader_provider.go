@@ -11,18 +11,20 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
 
 // GlobalLeaderProvider implements LeaderProvider
 type GlobalLeaderProvider struct {
-	engine *GlobalConsensusEngine
+	engine    *GlobalConsensusEngine
+	collected GlobalCollectedCommitments
 }
 
 func (p *GlobalLeaderProvider) GetNextLeaders(
-	prior **protobufs.GlobalFrame,
 	ctx context.Context,
+	prior **protobufs.GlobalFrame,
 ) ([]GlobalPeerID, error) {
 	// Get the parent selector for next prover calculation
 	if prior == nil || *prior == nil || (*prior).Header == nil ||
@@ -61,14 +63,20 @@ func (p *GlobalLeaderProvider) GetNextLeaders(
 }
 
 func (p *GlobalLeaderProvider) ProveNextState(
-	prior **protobufs.GlobalFrame,
-	collected GlobalCollectedCommitments,
 	ctx context.Context,
+	rank uint64,
+	filter []byte,
+	priorState models.Identity,
 ) (**protobufs.GlobalFrame, error) {
 	timer := prometheus.NewTimer(frameProvingDuration)
 	defer timer.ObserveDuration()
 
-	if prior == nil || *prior == nil {
+	prior, err := p.engine.globalTimeReel.GetFrame(priorState)
+	if err != nil {
+		return nil, errors.Wrap(err, "prove next state")
+	}
+
+	if prior == nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
 	}
@@ -115,7 +123,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	// Get current timestamp and difficulty
 	timestamp := time.Now().UnixMilli() + 30000
 	difficulty := p.engine.difficultyAdjuster.GetNextDifficulty(
-		(*prior).Rank()+1,
+		rank,
 		timestamp,
 	)
 
@@ -212,3 +220,5 @@ func (p *GlobalLeaderProvider) ProveNextState(
 
 	return &newFrame, nil
 }
+
+var _ consensus.LeaderProvider[*protobufs.GlobalFrame, GlobalPeerID, GlobalCollectedCommitments] = (*GlobalLeaderProvider)(nil)

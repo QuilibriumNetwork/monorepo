@@ -27,10 +27,16 @@ import (
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/notifications/pubsub"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/participant"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/aggregator"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/tracing"
 	"source.quilibrium.com/quilibrium/monorepo/node/dispatch"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
@@ -93,6 +99,7 @@ type GlobalConsensusEngine struct {
 	keyStore           store.KeyStore
 	clockStore         store.ClockStore
 	shardsStore        store.ShardsStore
+	consensusStore     consensus.ConsensusStore[*protobufs.ProposalVote]
 	frameProver        crypto.FrameProver
 	inclusionProver    crypto.InclusionProver
 	signerRegistry     typesconsensus.SignerRegistry
@@ -130,7 +137,7 @@ type GlobalConsensusEngine struct {
 	halt    context.CancelFunc
 
 	// Internal state
-	ctx                   context.Context
+	ctx                   lifecycle.SignalerContext
 	cancel                context.CancelFunc
 	quit                  chan struct{}
 	wg                    sync.WaitGroup
@@ -153,13 +160,19 @@ type GlobalConsensusEngine struct {
 	txLockMap map[uint64]map[string]map[string]*LockedTransaction
 	txLockMu  sync.RWMutex
 
-	// Generic state machine
-	stateMachine *consensus.StateMachine[
+	// Consensus participant instance
+	consensusParticipant consensus.EventLoop[
 		*protobufs.GlobalFrame,
-		*protobufs.FrameVote,
-		GlobalPeerID,
-		GlobalCollectedCommitments,
+		*protobufs.ProposalVote,
 	]
+
+	// Consensus plugins
+	signatureAggregator        consensus.SignatureAggregator
+	voteAggregationDistributor *pubsub.VoteAggregationDistributor[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]
+	timeoutCollectorDistributor *pubsub.TimeoutCollectorDistributor[*protobufs.ProposalVote]
 
 	// Provider implementations
 	syncProvider     *GlobalSyncProvider
@@ -194,7 +207,7 @@ func NewGlobalConsensusEngine(
 	logger *zap.Logger,
 	config *config.Config,
 	frameTimeMillis int64,
-	pubsub tp2p.PubSub,
+	ps tp2p.PubSub,
 	hypergraph hypergraph.Hypergraph,
 	keyManager typeskeys.KeyManager,
 	keyStore store.KeyStore,
@@ -225,7 +238,7 @@ func NewGlobalConsensusEngine(
 	engine := &GlobalConsensusEngine{
 		logger:                      logger,
 		config:                      config,
-		pubsub:                      pubsub,
+		pubsub:                      ps,
 		hypergraph:                  hypergraph,
 		keyManager:                  keyManager,
 		keyStore:                    keyStore,
@@ -301,6 +314,17 @@ func NewGlobalConsensusEngine(
 		}
 	}
 
+	engine.signatureAggregator = aggregator.WrapSignatureAggregator(
+		engine.blsConstructor,
+		engine.proverRegistry,
+		nil,
+	)
+	engine.voteAggregationDistributor = pubsub.NewVoteAggregationDistributor[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]()
+	engine.timeoutCollectorDistributor = pubsub.NewTimeoutCollectorDistributor[*protobufs.ProposalVote]()
+
 	// Create the worker manager
 	engine.workerManager = mgr.NewWorkerManager(
 		workerStore,
@@ -360,12 +384,7 @@ func NewGlobalConsensusEngine(
 
 	// Create provider implementations
 	engine.syncProvider = &GlobalSyncProvider{engine: engine}
-	engine.votingProvider = &GlobalVotingProvider{
-		engine: engine,
-		proposalVotes: make(
-			map[consensus.Identity]map[consensus.Identity]**protobufs.FrameVote,
-		),
-	}
+	engine.votingProvider = &GlobalVotingProvider{engine: engine}
 	engine.leaderProvider = &GlobalLeaderProvider{engine: engine}
 	engine.livenessProvider = &GlobalLivenessProvider{engine: engine}
 
@@ -374,7 +393,7 @@ func NewGlobalConsensusEngine(
 		inboxStore,
 		logger,
 		keyManager,
-		pubsub,
+		ps,
 	)
 
 	// Create execution engine manager
@@ -422,7 +441,7 @@ func NewGlobalConsensusEngine(
 	engine.hyperSync = hypergraph
 	engine.onionService = onion.NewGRPCTransport(
 		logger,
-		pubsub.GetPeerID(),
+		ps.GetPeerID(),
 		peerInfoManager,
 		signerRegistry,
 	)
@@ -454,7 +473,7 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 	errChan := make(chan error, 1)
 
 	e.quit = quit
-	e.ctx, e.cancel = context.WithCancel(context.Background())
+	e.ctx, e.cancel, _ = lifecycle.WithSignallerAndCancel(context.Background())
 
 	// Start worker manager background process (if applicable)
 	if !e.config.Engine.ArchiveMode {
@@ -500,26 +519,11 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 	}
 
 	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		// Create the generic state machine
-		e.stateMachine = consensus.NewStateMachine(
-			e.getPeerID(),
-			initialState,
-			true,
-			e.minimumProvers,
-			e.syncProvider,
-			e.votingProvider,
-			e.leaderProvider,
-			e.livenessProvider,
-			&GlobalTracer{
-				logger: e.logger.Named("state_machine"),
-			},
-		)
-
-		// Add transition listener
-		e.stateMachine.AddListener(&GlobalTransitionListener{
-			engine: e,
-			logger: e.logger.Named("transitions"),
-		})
+		if err := e.startConsensus(initialState); err != nil {
+			errChan <- errors.Wrap(err, "start state machine")
+			close(errChan)
+			return errChan
+		}
 	}
 
 	// Confirm initial state
@@ -620,15 +624,6 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 	// Start periodic tx lock pruning
 	e.wg.Add(1)
 	go e.pruneTxLocksPeriodically()
-
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		// Start the state machine
-		if err := e.stateMachine.Start(); err != nil {
-			errChan <- errors.Wrap(err, "start state machine")
-			close(errChan)
-			return errChan
-		}
-	}
 
 	if e.grpcServer != nil {
 		// Register all services with the gRPC server
@@ -769,13 +764,6 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 		}
 	}
 
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		// Stop the state machine
-		if err := e.stateMachine.Stop(); err != nil && !force {
-			errChan <- errors.Wrap(err, "stop")
-		}
-	}
-
 	// Stop execution engines
 	if e.executionManager != nil {
 		if err := e.executionManager.StopAll(force); err != nil && !force {
@@ -836,11 +824,6 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 		}
 	}
 
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		// Close the state machine
-		e.stateMachine.Close()
-	}
-
 	close(errChan)
 	return errChan
 }
@@ -868,31 +851,13 @@ func (e *GlobalConsensusEngine) GetState() typesconsensus.EngineState {
 	}
 
 	// Map the generic state machine state to engine state
-	if e.stateMachine == nil {
-		return typesconsensus.EngineStateStopped
-	}
-	smState := e.stateMachine.GetState()
-	switch smState {
-	case consensus.StateStopped:
-		return typesconsensus.EngineStateStopped
-	case consensus.StateStarting:
-		return typesconsensus.EngineStateStarting
-	case consensus.StateLoading:
-		return typesconsensus.EngineStateLoading
-	case consensus.StateCollecting:
-		return typesconsensus.EngineStateCollecting
-	case consensus.StateLivenessCheck:
-		return typesconsensus.EngineStateLivenessCheck
-	case consensus.StateProving:
+	select {
+	case <-e.consensusParticipant.Ready():
 		return typesconsensus.EngineStateProving
-	case consensus.StatePublishing:
-		return typesconsensus.EngineStatePublishing
-	case consensus.StateVoting:
-		return typesconsensus.EngineStateVoting
-	case consensus.StateFinalizing:
-		return typesconsensus.EngineStateFinalizing
-	default:
+	case <-e.consensusParticipant.Done():
 		return typesconsensus.EngineStateStopped
+	default:
+		return typesconsensus.EngineStateStarting
 	}
 }
 
@@ -2432,3 +2397,343 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 
 	return nil
 }
+
+func (e *GlobalConsensusEngine) startConsensus(
+	initialFrame **protobufs.GlobalFrame,
+) error {
+	var err error
+	e.consensusParticipant, err = participant.NewParticipant[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+		GlobalPeerID,
+		GlobalCollectedCommitments,
+	](
+		tracing.NewZapTracer(e.logger), // logger
+		e,                              // committee
+		e.leaderProvider,               // prover
+		e.votingProvider,               // voter
+		e.consensusStore,               // consensusStore
+		e.signatureAggregator,          // signatureAggregator
+		e,                              // consensusVerifier
+		e.voteAggregationDistributor,   // voteNotifier
+		e.timeoutCollectorDistributor,  // timeoutNotifier
+		e,                              // consumer
+		e,                              // finalizer
+		nil,                            // filter
+		&models.CertifiedState[*protobufs.GlobalFrame]{ // trustedRoot
+			State: &models.State[*protobufs.GlobalFrame]{
+				State: initialFrame,
+			},
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	e.consensusParticipant.Start(e.ctx)
+	return nil
+}
+
+// MakeFinal implements consensus.Finalizer.
+func (e *GlobalConsensusEngine) MakeFinal(stateID models.Identity) error {
+	// In a standard BFT-only approach, this would be how frames are finalized on
+	// the time reel. But we're PoMW, so we don't rely on BFT for anything outside
+	// of basic coordination. If the protocol were ever to move to something like
+	// PoS, this would be one of the touch points to revisit.
+	return nil
+}
+
+// OnCurrentRankDetails implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnCurrentRankDetails(
+	currentRank uint64,
+	finalizedRank uint64,
+	currentLeader models.Identity,
+) {
+	e.logger.Info(
+		"entered new rank",
+		zap.Uint64("current_rank", currentRank),
+		zap.String("current_leader", hex.EncodeToString([]byte(currentLeader))),
+	)
+}
+
+// OnDoubleProposeDetected implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnDoubleProposeDetected(
+	proposal1 *models.State[*protobufs.GlobalFrame],
+	proposal2 *models.State[*protobufs.GlobalFrame],
+) {
+	e.eventDistributor.Publish(typesconsensus.ControlEvent{
+		Type: typesconsensus.ControlEventGlobalEquivocation,
+		Data: &consensustime.GlobalEvent{
+			Type:    consensustime.TimeReelEventEquivocationDetected,
+			Frame:   *proposal2.State,
+			OldHead: *proposal1.State,
+			Message: fmt.Sprintf(
+				"equivocation at rank %d",
+				proposal1.Rank,
+			),
+		},
+	})
+}
+
+// OnEventProcessed implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnEventProcessed() {}
+
+// OnFinalizedState implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnFinalizedState(
+	state *models.State[*protobufs.GlobalFrame],
+) {
+}
+
+// OnInvalidStateDetected implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnInvalidStateDetected(
+	err *models.InvalidProposalError[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	],
+) {
+} // Presently a no-op, up for reconsideration
+
+// OnLocalTimeout implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnLocalTimeout(currentRank uint64) {}
+
+// OnOwnProposal implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnOwnProposal(
+	proposal *models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	],
+	targetPublicationTime time.Time,
+) {
+}
+
+// OnOwnTimeout implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnOwnTimeout(
+	timeout *models.TimeoutState[*protobufs.ProposalVote],
+) {
+}
+
+// OnOwnVote implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnOwnVote(
+	vote **protobufs.ProposalVote,
+	recipientID models.Identity,
+) {
+}
+
+// OnPartialTimeoutCertificate implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnPartialTimeoutCertificate(
+	currentRank uint64,
+	partialTimeoutCertificate *consensus.PartialTimeoutCertificateCreated,
+) {
+}
+
+// OnQuorumCertificateTriggeredRankChange implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
+	oldRank uint64,
+	newRank uint64,
+	qc models.QuorumCertificate,
+) {
+}
+
+// OnRankChange implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {}
+
+// OnReceiveProposal implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnReceiveProposal(
+	currentRank uint64,
+	proposal *models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	],
+) {
+}
+
+// OnReceiveQuorumCertificate implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnReceiveQuorumCertificate(
+	currentRank uint64,
+	qc models.QuorumCertificate,
+) {
+}
+
+// OnReceiveTimeoutCertificate implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnReceiveTimeoutCertificate(
+	currentRank uint64,
+	tc models.TimeoutCertificate,
+) {
+}
+
+// OnStart implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnStart(currentRank uint64) {}
+
+// OnStartingTimeout implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnStartingTimeout(
+	startTime time.Time,
+	endTime time.Time,
+) {
+}
+
+// OnStateIncorporated implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnStateIncorporated(
+	state *models.State[*protobufs.GlobalFrame],
+) {
+}
+
+// OnTimeoutCertificateTriggeredRankChange implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnTimeoutCertificateTriggeredRankChange(
+	oldRank uint64,
+	newRank uint64,
+	tc models.TimeoutCertificate,
+) {
+}
+
+// VerifyQuorumCertificate implements consensus.Verifier.
+func (e *GlobalConsensusEngine) VerifyQuorumCertificate(
+	quorumCertificate models.QuorumCertificate,
+) error {
+	qc, ok := quorumCertificate.(*protobufs.QuorumCertificate)
+	if !ok {
+		return errors.Wrap(
+			errors.New("invalid quorum certificate"),
+			"verify quorum certificate",
+		)
+	}
+
+	if err := qc.Validate(); err != nil {
+		return errors.Wrap(err, "verify quorum certificate")
+	}
+
+	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		return errors.Wrap(err, "verify quorum certificate")
+	}
+
+	pubkeys := [][]byte{}
+	signatures := [][]byte{}
+	if (len(provers) + 7/8) > len(qc.AggregateSignature.Bitmask) {
+		return errors.Wrap(
+			errors.New("bitmask invalid for prover set"),
+			"verify quorum certificate",
+		)
+	}
+	for i, prover := range provers {
+		if qc.AggregateSignature.Bitmask[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
+			pubkeys = append(pubkeys, prover.PublicKey)
+			signatures = append(signatures, qc.AggregateSignature.GetSignature())
+		}
+	}
+
+	aggregationCheck, err := e.blsConstructor.Aggregate(pubkeys, signatures)
+	if err != nil {
+		return errors.Wrap(err, "verify quorum certificate")
+	}
+
+	if !bytes.Equal(
+		qc.AggregateSignature.GetPubKey(),
+		aggregationCheck.GetAggregatePublicKey(),
+	) {
+		return errors.Wrap(
+			errors.New("pubkey does not match prover set"),
+			"verify quorum certificate",
+		)
+	}
+
+	if valid := e.blsConstructor.VerifySignatureRaw(
+		qc.AggregateSignature.GetPubKey(),
+		qc.AggregateSignature.GetSignature(),
+		binary.BigEndian.AppendUint64(
+			binary.BigEndian.AppendUint64(
+				slices.Concat(qc.Filter, qc.Selector),
+				qc.Rank,
+			),
+			qc.FrameNumber,
+		),
+		[]byte("global"),
+	); !valid {
+		return errors.Wrap(
+			errors.New("invalid signature"),
+			"verify quorum certificate",
+		)
+	}
+
+	return nil
+}
+
+// VerifyTimeoutCertificate implements consensus.Verifier.
+func (e *GlobalConsensusEngine) VerifyTimeoutCertificate(
+	timeoutCertificate models.TimeoutCertificate,
+) error {
+	tc, ok := timeoutCertificate.(*protobufs.TimeoutCertificate)
+	if !ok {
+		return errors.Wrap(
+			errors.New("invalid timeout certificate"),
+			"verify timeout certificate",
+		)
+	}
+
+	if err := tc.Validate(); err != nil {
+		return errors.Wrap(err, "verify timeout certificate")
+	}
+
+	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		return errors.Wrap(err, "verify timeout certificate")
+	}
+
+	pubkeys := [][]byte{}
+	signatures := [][]byte{}
+	if (len(provers) + 7/8) > len(tc.AggregateSignature.Bitmask) {
+		return errors.Wrap(
+			errors.New("bitmask invalid for prover set"),
+			"verify timeout certificate",
+		)
+	}
+	for i, prover := range provers {
+		if tc.AggregateSignature.Bitmask[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
+			pubkeys = append(pubkeys, prover.PublicKey)
+			signatures = append(signatures, tc.AggregateSignature.GetSignature())
+		}
+	}
+
+	aggregationCheck, err := e.blsConstructor.Aggregate(pubkeys, signatures)
+	if err != nil {
+		return errors.Wrap(err, "verify timeout certificate")
+	}
+
+	if !bytes.Equal(
+		tc.AggregateSignature.GetPubKey(),
+		aggregationCheck.GetAggregatePublicKey(),
+	) {
+		return errors.Wrap(
+			errors.New("pubkey does not match prover set"),
+			"verify timeout certificate",
+		)
+	}
+
+	if valid := e.blsConstructor.VerifySignatureRaw(
+		tc.AggregateSignature.GetPubKey(),
+		tc.AggregateSignature.GetSignature(),
+		binary.BigEndian.AppendUint64(
+			binary.BigEndian.AppendUint64(
+				slices.Clone(tc.Filter),
+				tc.Rank,
+			),
+			tc.LatestQuorumCertificate.GetRank(),
+		),
+		[]byte("globaltimeout"),
+	); !valid {
+		return errors.Wrap(
+			errors.New("invalid signature"),
+			"verify timeout certificate",
+		)
+	}
+
+	return nil
+}
+
+// VerifyVote implements consensus.Verifier.
+func (e *GlobalConsensusEngine) VerifyVote(
+	vote **protobufs.ProposalVote,
+) error {
+	panic("unimplemented")
+}
+
+var _ consensus.DynamicCommittee = (*GlobalConsensusEngine)(nil)

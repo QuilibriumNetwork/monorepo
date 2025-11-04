@@ -277,10 +277,11 @@ func (el *EventLoop[StateT, VoteT]) OnTimeoutCertificateConstructedFromTimeouts(
 	el.onTrustedTC(&tc)
 }
 
-// OnPartialTimeoutCertificateCreated created a consensus.PartialTimeoutCertificateCreated
-// payload and pushes it into partialTimeoutCertificateCreated buffered channel for further
-// processing by EventHandler. Since we use buffered channel this function can
-// block if buffer is full.
+// OnPartialTimeoutCertificateCreated created a
+// consensus.PartialTimeoutCertificateCreated payload and pushes it into
+// partialTimeoutCertificateCreated buffered channel for further processing by
+// EventHandler. Since we use buffered channel this function can block if buffer
+// is full.
 func (el *EventLoop[StateT, VoteT]) OnPartialTimeoutCertificateCreated(
 	rank uint64,
 	newestQC models.QuorumCertificate,

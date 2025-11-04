@@ -4398,6 +4398,36 @@ func (f *ProposalVote) Validate() error {
 	return nil
 }
 
+var _ ValidatableMessage = (*TimeoutState)(nil)
+
+func (f *TimeoutState) Validate() error {
+	if f == nil {
+		return errors.Wrap(errors.New("nil vote"), "validate")
+	}
+
+	if f.LatestQuorumCertificate != nil {
+		if err := f.LatestQuorumCertificate.Validate(); err != nil {
+			return err
+		}
+	}
+
+	if f.PriorRankTimeoutCertificate != nil {
+		if err := f.PriorRankTimeoutCertificate.Validate(); err != nil {
+			return err
+		}
+	}
+
+	if f.Vote == nil {
+		return errors.Wrap(errors.New("missing vote"), "validate")
+	}
+
+	if err := f.Vote.Validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 var _ ValidatableMessage = (*QuorumCertificate)(nil)
 
 func (f *QuorumCertificate) Validate() error {
@@ -4420,7 +4450,24 @@ func (f *QuorumCertificate) Validate() error {
 		return errors.Wrap(errors.New("missing aggregate signature"), "validate")
 	}
 
-	return nil
+	return f.AggregateSignature.Validate()
+}
+
+var _ ValidatableMessage = (*TimeoutCertificate)(nil)
+
+func (f *TimeoutCertificate) Validate() error {
+	if f == nil {
+		return errors.Wrap(errors.New("nil frame confirmation"), "validate")
+	}
+
+	// Rank and frame number is uint64, any value is valid
+
+	// Aggregate signature must be present
+	if f.AggregateSignature == nil {
+		return errors.Wrap(errors.New("missing aggregate signature"), "validate")
+	}
+
+	return f.AggregateSignature.Validate()
 }
 
 var _ ValidatableMessage = (*GlobalFrame)(nil)
