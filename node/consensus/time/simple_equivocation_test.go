@@ -3,10 +3,12 @@ package time
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
 
@@ -17,9 +19,10 @@ func TestGlobalTimeReel_SimpleEquivocation(t *testing.T) {
 	globalReel, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = globalReel.Start()
-	require.NoError(t, err)
-	defer globalReel.Stop()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go globalReel.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.GlobalFrame{

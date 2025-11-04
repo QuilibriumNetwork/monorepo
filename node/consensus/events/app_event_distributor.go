@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 )
@@ -36,52 +37,32 @@ func NewAppEventDistributor(
 }
 
 // Start begins the event processing loop
-func (a *AppEventDistributor) Start(ctx context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.running {
-		return nil
-	}
-
-	a.ctx, a.cancel = context.WithCancel(ctx)
-	a.running = true
-	a.startTime = time.Now()
+func (g *AppEventDistributor) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	g.mu.Lock()
+	g.ctx = ctx
+	g.running = true
+	g.startTime = time.Now()
 
 	distributorStartsTotal.WithLabelValues("app").Inc()
+	g.mu.Unlock()
+	ready()
+	g.wg.Add(2)
+	go g.processEvents()
+	go g.trackUptime()
 
-	a.wg.Add(1)
-	go a.processEvents()
-
-	go a.trackUptime()
-
-	return nil
-}
-
-// Stop gracefully shuts down the distributor
-func (a *AppEventDistributor) Stop() error {
-	a.mu.Lock()
-	if !a.running {
-		a.mu.Unlock()
-		return nil
-	}
-	a.running = false
-	a.mu.Unlock()
-
-	a.cancel()
-	a.wg.Wait()
-
-	a.mu.Lock()
-	for _, ch := range a.subscribers {
+	<-ctx.Done()
+	g.mu.Lock()
+	g.running = false
+	for _, ch := range g.subscribers {
 		close(ch)
 	}
-	a.subscribers = make(map[string]chan consensus.ControlEvent)
-	a.mu.Unlock()
-
+	g.subscribers = make(map[string]chan consensus.ControlEvent)
 	distributorStopsTotal.WithLabelValues("app").Inc()
 	distributorUptime.WithLabelValues("app").Set(0)
-
-	return nil
+	g.mu.Unlock()
 }
 
 // Subscribe registers a new subscriber

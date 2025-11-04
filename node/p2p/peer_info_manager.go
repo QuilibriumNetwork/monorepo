@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
 )
@@ -13,11 +14,11 @@ import (
 type InMemoryPeerInfoManager struct {
 	logger     *zap.Logger
 	peerInfoCh chan *protobufs.PeerInfo
-	quitCh     chan struct{}
 	peerInfoMx sync.RWMutex
 
 	peerMap      map[string]*p2p.PeerInfo
 	fastestPeers []*p2p.PeerInfo
+	ctx          lifecycle.SignalerContext
 }
 
 var _ p2p.PeerInfoManager = (*InMemoryPeerInfoManager)(nil)
@@ -31,62 +32,59 @@ func NewInMemoryPeerInfoManager(logger *zap.Logger) *InMemoryPeerInfoManager {
 	}
 }
 
-func (m *InMemoryPeerInfoManager) Start() {
-	go func() {
-		for {
-			select {
-			case info := <-m.peerInfoCh:
-				m.peerInfoMx.Lock()
-				reachability := []p2p.Reachability{}
-				for _, r := range info.Reachability {
-					reachability = append(reachability, p2p.Reachability{
-						Filter:           r.Filter,
-						PubsubMultiaddrs: r.PubsubMultiaddrs,
-						StreamMultiaddrs: r.StreamMultiaddrs,
-					})
-				}
-				capabilities := []p2p.Capability{}
-				for _, c := range info.Capabilities {
-					capabilities = append(capabilities, p2p.Capability{
-						ProtocolIdentifier: c.ProtocolIdentifier,
-						AdditionalMetadata: c.AdditionalMetadata,
-					})
-				}
-				seen := time.Now().UnixMilli()
-				m.peerMap[string(info.PeerId)] = &p2p.PeerInfo{
-					PeerId:       info.PeerId,
-					Bandwidth:    100,
-					Capabilities: capabilities,
-					Reachability: reachability,
-					Cores:        uint32(len(reachability)),
-					LastSeen:     seen,
-				}
-				m.searchAndInsertPeer(&p2p.PeerInfo{
-					PeerId:       info.PeerId,
-					Bandwidth:    100,
-					Capabilities: capabilities,
-					Reachability: reachability,
-					Cores:        uint32(len(reachability)),
-					LastSeen:     seen,
+func (m *InMemoryPeerInfoManager) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	ready()
+	for {
+		select {
+		case info := <-m.peerInfoCh:
+			m.peerInfoMx.Lock()
+			reachability := []p2p.Reachability{}
+			for _, r := range info.Reachability {
+				reachability = append(reachability, p2p.Reachability{
+					Filter:           r.Filter,
+					PubsubMultiaddrs: r.PubsubMultiaddrs,
+					StreamMultiaddrs: r.StreamMultiaddrs,
 				})
-				m.peerInfoMx.Unlock()
-			case <-m.quitCh:
-				return
 			}
+			capabilities := []p2p.Capability{}
+			for _, c := range info.Capabilities {
+				capabilities = append(capabilities, p2p.Capability{
+					ProtocolIdentifier: c.ProtocolIdentifier,
+					AdditionalMetadata: c.AdditionalMetadata,
+				})
+			}
+			seen := time.Now().UnixMilli()
+			m.peerMap[string(info.PeerId)] = &p2p.PeerInfo{
+				PeerId:       info.PeerId,
+				Bandwidth:    100,
+				Capabilities: capabilities,
+				Reachability: reachability,
+				Cores:        uint32(len(reachability)),
+				LastSeen:     seen,
+			}
+			m.searchAndInsertPeer(&p2p.PeerInfo{
+				PeerId:       info.PeerId,
+				Bandwidth:    100,
+				Capabilities: capabilities,
+				Reachability: reachability,
+				Cores:        uint32(len(reachability)),
+				LastSeen:     seen,
+			})
+			m.peerInfoMx.Unlock()
+		case <-m.ctx.Done():
+			return
 		}
-	}()
-}
-
-func (m *InMemoryPeerInfoManager) Stop() {
-	go func() {
-		m.quitCh <- struct{}{}
-	}()
+	}
 }
 
 func (m *InMemoryPeerInfoManager) AddPeerInfo(info *protobufs.PeerInfo) {
-	go func() {
-		m.peerInfoCh <- info
-	}()
+	select {
+	case <-m.ctx.Done():
+	case m.peerInfoCh <- info:
+	}
 }
 
 func (m *InMemoryPeerInfoManager) GetPeerInfo(peerId []byte) *p2p.PeerInfo {

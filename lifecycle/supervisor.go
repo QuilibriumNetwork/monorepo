@@ -74,7 +74,7 @@ func NewSupervisor(nodes []*Node) (*Supervisor, error) {
 	return s, nil
 }
 
-func (s *Supervisor) Run(ctx context.Context) error {
+func (s *Supervisor) Start(ctx context.Context) error {
 	ctx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
 

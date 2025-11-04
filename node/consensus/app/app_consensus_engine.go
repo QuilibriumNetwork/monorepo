@@ -54,6 +54,7 @@ import (
 
 // AppConsensusEngine uses the generic state machine for consensus
 type AppConsensusEngine struct {
+	*lifecycle.ComponentManager
 	protobufs.AppShardServiceServer
 
 	logger                *zap.Logger
@@ -105,7 +106,6 @@ type AppConsensusEngine struct {
 	ctx                   lifecycle.SignalerContext
 	cancel                context.CancelFunc
 	quit                  chan struct{}
-	wg                    sync.WaitGroup
 	canRunStandalone      bool
 	blacklistMap          map[string]bool
 	alertPublicKey        []byte
@@ -352,12 +352,6 @@ func NewAppConsensusEngine(
 		return nil, errors.Wrap(err, "failed to initialize execution engines")
 	}
 
-	// Register all execution engines with the consensus engine
-	err = engine.executionManager.RegisterAllEngines(engine.RegisterExecutor)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to register execution engines")
-	}
-
 	engine.syncProvider = &AppSyncProvider{engine: engine}
 	engine.votingProvider = &AppVotingProvider{engine: engine}
 	engine.leaderProvider = &AppLeaderProvider{engine: engine}
@@ -419,6 +413,162 @@ func NewAppConsensusEngine(
 	executorsRegistered.WithLabelValues(engine.appAddressHex).Set(0)
 	pendingMessagesCount.WithLabelValues(engine.appAddressHex).Set(0)
 
+	engine.ctx, engine.cancel, _ = lifecycle.WithSignallerAndCancel(
+		context.Background(),
+	)
+	componentBuilder := lifecycle.NewComponentManagerBuilder()
+	// Add execution engines
+	componentBuilder.AddWorker(engine.executionManager.Start)
+	componentBuilder.AddWorker(engine.eventDistributor.Start)
+	componentBuilder.AddWorker(engine.appTimeReel.Start)
+	frame, _, err := engine.clockStore.GetLatestShardClockFrame(engine.appAddress)
+	if err != nil {
+		engine.logger.Warn(
+			"invalid frame retrieved, will resync",
+			zap.Error(err),
+		)
+	}
+
+	var initialState **protobufs.AppShardFrame = nil
+	if frame != nil {
+		initialState = &frame
+	}
+
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		if err := engine.startConsensus(initialState, ctx, ready); err != nil {
+			ctx.Throw(err)
+			return
+		}
+
+		<-ctx.Done()
+	})
+
+	err = engine.subscribeToConsensusMessages()
+	if err != nil {
+		engine.ctx.Throw(errors.Wrap(err, "start"))
+		return nil, err
+	}
+
+	err = engine.subscribeToProverMessages()
+	if err != nil {
+		engine.ctx.Throw(errors.Wrap(err, "start"))
+		return nil, err
+	}
+
+	err = engine.subscribeToFrameMessages()
+	if err != nil {
+		engine.ctx.Throw(errors.Wrap(err, "start"))
+		return nil, err
+	}
+
+	err = engine.subscribeToGlobalFrameMessages()
+	if err != nil {
+		engine.ctx.Throw(errors.Wrap(err, "start"))
+		return nil, err
+	}
+
+	err = engine.subscribeToGlobalProverMessages()
+	if err != nil {
+		engine.ctx.Throw(errors.Wrap(err, "start"))
+		return nil, err
+	}
+
+	err = engine.subscribeToGlobalAlertMessages()
+	if err != nil {
+		engine.ctx.Throw(errors.Wrap(err, "start"))
+		return nil, err
+	}
+
+	err = engine.subscribeToPeerInfoMessages()
+	if err != nil {
+		engine.ctx.Throw(errors.Wrap(err, "start"))
+		return nil, err
+	}
+
+	err = engine.subscribeToDispatchMessages()
+	if err != nil {
+		engine.ctx.Throw(errors.Wrap(err, "start"))
+		return nil, err
+	}
+
+	// Start message queue processors
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processConsensusMessageQueue(ctx)
+	})
+
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processProverMessageQueue(ctx)
+	})
+
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processFrameMessageQueue(ctx)
+	})
+
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processGlobalFrameMessageQueue(ctx)
+	})
+
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processAlertMessageQueue(ctx)
+	})
+
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processPeerInfoMessageQueue(ctx)
+	})
+
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processDispatchMessageQueue(ctx)
+	})
+
+	// Start event distributor event loop
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.eventDistributorLoop(ctx)
+	})
+
+	// Start metrics update goroutine
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.updateMetricsLoop(ctx)
+	})
+
 	return engine, nil
 }
 
@@ -426,134 +576,6 @@ func (e *AppConsensusEngine) Start(quit chan struct{}) <-chan error {
 	errChan := make(chan error, 1)
 
 	e.quit = quit
-	e.ctx, e.cancel, _ = lifecycle.WithSignallerAndCancel(context.Background())
-
-	// Start execution engines
-	if err := e.executionManager.StartAll(e.quit); err != nil {
-		errChan <- errors.Wrap(err, "start execution engines")
-		close(errChan)
-		return errChan
-	}
-
-	if err := e.eventDistributor.Start(e.ctx); err != nil {
-		errChan <- errors.Wrap(err, "start event distributor")
-		close(errChan)
-		return errChan
-	}
-
-	err := e.appTimeReel.Start()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	frame, _, err := e.clockStore.GetLatestShardClockFrame(e.appAddress)
-	if err != nil {
-		e.logger.Warn(
-			"invalid frame retrieved, will resync",
-			zap.Error(err),
-		)
-	}
-
-	e.ensureGlobalClient()
-
-	var initialState **protobufs.AppShardFrame = nil
-	if frame != nil {
-		initialState = &frame
-	}
-
-	if err := e.startConsensus(initialState); err != nil {
-		errChan <- errors.Wrap(err, "start state machine")
-		close(errChan)
-		return errChan
-	}
-
-	err = e.subscribeToConsensusMessages()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	err = e.subscribeToProverMessages()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	err = e.subscribeToFrameMessages()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	err = e.subscribeToGlobalFrameMessages()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	err = e.subscribeToGlobalProverMessages()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	err = e.subscribeToGlobalAlertMessages()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	err = e.subscribeToPeerInfoMessages()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	err = e.subscribeToDispatchMessages()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	// Start message queue processors
-	e.wg.Add(1)
-	go e.processConsensusMessageQueue()
-
-	e.wg.Add(1)
-	go e.processProverMessageQueue()
-
-	e.wg.Add(1)
-	go e.processFrameMessageQueue()
-
-	e.wg.Add(1)
-	go e.processGlobalFrameMessageQueue()
-
-	e.wg.Add(1)
-	go e.processAlertMessageQueue()
-
-	e.wg.Add(1)
-	go e.processPeerInfoMessageQueue()
-
-	e.wg.Add(1)
-	go e.processDispatchMessageQueue()
-
-	// Start event distributor event loop
-	e.wg.Add(1)
-	go e.eventDistributorLoop()
-
-	// Start metrics update goroutine
-	e.wg.Add(1)
-	go e.updateMetricsLoop()
 
 	e.logger.Info(
 		"app consensus engine started",
@@ -574,57 +596,6 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	// First, cancel context to signal all goroutines to stop
 	if e.cancel != nil {
 		e.cancel()
-	}
-
-	// Stop event distributor
-	if e.eventDistributor != nil {
-		if err := e.eventDistributor.Stop(); err != nil && !force {
-			e.logger.Warn("error stopping event distributor", zap.Error(err))
-			select {
-			case errChan <- errors.Wrap(err, "stop event distributor"):
-			default:
-			}
-		}
-	}
-
-	// Stop execution engines
-	if e.executionManager != nil {
-		if err := e.executionManager.StopAll(force); err != nil && !force {
-			e.logger.Warn("error stopping execution engines", zap.Error(err))
-			select {
-			case errChan <- errors.Wrap(err, "stop execution engines"):
-			default:
-			}
-		}
-	}
-
-	// Wait for goroutines to finish with shorter timeout for tests
-	done := make(chan struct{})
-	go func() {
-		e.wg.Wait()
-		close(done)
-	}()
-
-	// Use shorter timeout in test environments
-	timeout := 30 * time.Second
-	if e.config.P2P.Network == 99 {
-		timeout = 5 * time.Second
-	}
-
-	select {
-	case <-done:
-		// Clean shutdown
-		e.logger.Info("app consensus engine stopped cleanly")
-	case <-time.After(timeout):
-		if !force {
-			e.logger.Error("timeout waiting for graceful shutdown")
-			select {
-			case errChan <- errors.New("timeout waiting for graceful shutdown"):
-			default:
-			}
-		} else {
-			e.logger.Warn("forced shutdown after timeout")
-		}
 	}
 
 	// Unsubscribe from pubsub to stop new messages from arriving
@@ -678,81 +649,6 @@ func (e *AppConsensusEngine) GetState() typesconsensus.EngineState {
 	default:
 		return typesconsensus.EngineStateStarting
 	}
-}
-
-func (e *AppConsensusEngine) RegisterExecutor(
-	exec execution.ShardExecutionEngine,
-	frame uint64,
-) <-chan error {
-	errChan := make(chan error, 1)
-
-	e.executorsMu.Lock()
-	defer e.executorsMu.Unlock()
-
-	name := exec.GetName()
-	if _, exists := e.executors[name]; exists {
-		errChan <- errors.New("executor already registered")
-		close(errChan)
-		return errChan
-	}
-
-	e.executors[name] = exec
-
-	// Update metrics
-	executorRegistrationTotal.WithLabelValues(e.appAddressHex, "register").Inc()
-	executorsRegistered.WithLabelValues(
-		e.appAddressHex,
-	).Set(float64(len(e.executors)))
-
-	close(errChan)
-	return errChan
-}
-
-func (e *AppConsensusEngine) UnregisterExecutor(
-	name string,
-	frame uint64,
-	force bool,
-) <-chan error {
-	errChan := make(chan error, 1)
-
-	e.executorsMu.Lock()
-	defer e.executorsMu.Unlock()
-
-	if _, exists := e.executors[name]; !exists {
-		errChan <- errors.New("executor not registered")
-		close(errChan)
-		return errChan
-	}
-
-	// Stop the executor
-	if exec, ok := e.executors[name]; ok {
-		stopErrChan := exec.Stop(force)
-		select {
-		case err := <-stopErrChan:
-			if err != nil && !force {
-				errChan <- errors.Wrap(err, "stop executor")
-				close(errChan)
-				return errChan
-			}
-		case <-time.After(5 * time.Second):
-			if !force {
-				errChan <- errors.New("timeout stopping executor")
-				close(errChan)
-				return errChan
-			}
-		}
-	}
-
-	delete(e.executors, name)
-
-	// Update metrics
-	executorRegistrationTotal.WithLabelValues(e.appAddressHex, "unregister").Inc()
-	executorsRegistered.WithLabelValues(
-		e.appAddressHex,
-	).Set(float64(len(e.executors)))
-
-	close(errChan)
-	return errChan
 }
 
 func (e *AppConsensusEngine) GetProvingKey(
@@ -1130,28 +1026,22 @@ func (e *AppConsensusEngine) cleanupFrameStore() {
 	)
 }
 
-func (e *AppConsensusEngine) updateMetricsLoop() {
+func (e *AppConsensusEngine) updateMetricsLoop(
+	ctx lifecycle.SignalerContext,
+) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.logger.Error("fatal error encountered", zap.Any("panic", r))
-			if e.cancel != nil {
-				e.cancel()
-			}
-			// Avoid blocking on quit channel during panic recovery
-			select {
-			case e.quit <- struct{}{}:
-			default:
-			}
+			ctx.Throw(errors.Errorf("fatal unhandled error encountered: %v", r))
 		}
 	}()
-	defer e.wg.Done()
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -1388,7 +1278,7 @@ func (e *AppConsensusEngine) internalProveFrame(
 
 	timestamp := time.Now().UnixMilli()
 	difficulty := e.difficultyAdjuster.GetNextDifficulty(
-		previousFrame.Rank()+1,
+		previousFrame.GetRank()+1,
 		timestamp,
 	)
 
@@ -1525,6 +1415,8 @@ func (e *AppConsensusEngine) ensureGlobalClient() error {
 
 func (e *AppConsensusEngine) startConsensus(
 	initialFrame **protobufs.AppShardFrame,
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
 ) error {
 	var err error
 	e.consensusParticipant, err = participant.NewParticipant[
@@ -1555,7 +1447,8 @@ func (e *AppConsensusEngine) startConsensus(
 		return err
 	}
 
-	e.consensusParticipant.Start(e.ctx)
+	ready()
+	e.consensusParticipant.Start(ctx)
 	return nil
 }
 

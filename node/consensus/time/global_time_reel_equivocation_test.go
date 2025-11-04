@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
 
@@ -24,11 +25,10 @@ func TestGlobalTimeReel_MassiveEquivocationForkChoice(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Collect events
@@ -152,11 +152,10 @@ func TestGlobalTimeReel_EquivocationWithForkChoice(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Drain initial events
@@ -252,11 +251,10 @@ func TestGlobalTimeReel_NonOverlappingForks(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.GlobalFrame{

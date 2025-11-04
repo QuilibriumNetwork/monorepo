@@ -349,7 +349,7 @@ func TestSupervisor_Stop_StopsDescendantsOnly(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		_ = s.Run(ctx)
+		_ = s.Start(ctx)
 	}()
 
 	// Wait for all to be Ready.
@@ -394,7 +394,7 @@ func TestSupervisor_StopParents_StopsAncestorsAndDesc(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = s.Run(ctx) }()
+	go func() { _ = s.Start(ctx) }()
 
 	time.Sleep(150 * time.Millisecond)
 
@@ -433,7 +433,7 @@ func TestSupervisor_ShutdownAll(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		_ = s.Run(ctx) // Run should return after Shutdown cascade completes
+		_ = s.Start(ctx) // Run should return after Shutdown cascade completes
 		close(done)
 	}()
 

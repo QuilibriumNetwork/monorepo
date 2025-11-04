@@ -1487,8 +1487,6 @@ req:A a rdfs:Property;
 				assert.NoError(t, err)
 				assertCodeExecutionResult(t, mode, msgs, err, false)
 			}
-
-			<-engine.Stop(false)
 		})
 	})
 
@@ -1569,8 +1567,6 @@ req:A a rdfs:Property;
 			if engineMode == engines.GlobalMode && err == nil {
 				assert.NotNil(t, msgs, "Bundled operations should produce responses in GlobalMode")
 			}
-
-			<-engine.Stop(false)
 		})
 	})
 
@@ -1660,7 +1656,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -1753,7 +1748,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -1855,7 +1849,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -1943,7 +1936,6 @@ req:A a rdfs:Property;
 			assert.Error(t, err)
 			assert.Nil(t, msgs)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2015,7 +2007,6 @@ req:A a rdfs:Property;
 			assert.Error(t, err)
 			assert.Nil(t, msgs)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2124,7 +2115,6 @@ req:A a rdfs:Property;
 			}
 			assert.Nil(t, msgs)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2401,7 +2391,6 @@ req:A a rdfs:Property;
 			}
 			assert.Nil(t, msgs)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2485,7 +2474,6 @@ req:A a rdfs:Property;
 			assert.Error(t, err)
 			assert.Nil(t, msgs)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2570,7 +2558,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2648,7 +2635,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2728,7 +2714,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2814,7 +2799,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2901,7 +2885,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -2997,7 +2980,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -3093,7 +3075,6 @@ req:A a rdfs:Property;
 
 			// All operations should be in the same stage since there are no conflicts
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -3197,7 +3178,6 @@ req:A a rdfs:Property;
 
 			// Should produce stages: [op1], [op2, op3], [op4]
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -3304,7 +3284,6 @@ req:A a rdfs:Property;
 			// Stage 1: op3 (conflicts with op1)
 			// Stage 2: op4 (depends on op1 and op2)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -3396,7 +3375,6 @@ req:A a rdfs:Property;
 			assert.Equal(t, []byte("op2"), ce.ExecuteOperations[1].Identifier)
 			assert.Equal(t, [][]byte{[]byte("op1")}, ce.ExecuteOperations[1].Dependencies)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -3492,7 +3470,6 @@ req:A a rdfs:Property;
 
 			// The execution stages should be computed and stored
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -3572,7 +3549,6 @@ req:A a rdfs:Property;
 			// Verify rendezvous is stored correctly
 			assert.NotNil(t, ce.Rendezvous)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -3659,7 +3635,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -3791,7 +3766,6 @@ req:A a rdfs:Property;
 				// Since we can't easily verify the exact calls, we trust the test passes
 			}
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -3916,7 +3890,6 @@ req:A a rdfs:Property;
 
 			// State changes should not be committed for failed operations
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -4096,7 +4069,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -4229,7 +4201,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -4353,7 +4324,6 @@ req:A a rdfs:Property;
 				assert.Contains(t, err.Error(), "empty")
 			}
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -4491,7 +4461,6 @@ rdfs:range req:Request.
 				assert.Contains(t, err.Error(), "limit")
 			}
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -4610,7 +4579,6 @@ req:A a rdfs:Property;
 			assertCodeExecutionResult(t, mode, msgs, err, true)
 			assert.Len(t, cf.Results, 2)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -4705,7 +4673,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -4831,7 +4798,6 @@ req:A a rdfs:Property;
 			}
 			assert.Nil(t, msgs)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -4954,7 +4920,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -5077,7 +5042,6 @@ req:A a rdfs:Property;
 			msgs, err := engine.ProcessMessage(1, big.NewInt(0), msg.Address, msg.Payload, state)
 			assertCodeExecutionResult(t, mode, msgs, err, false)
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -5196,7 +5160,6 @@ req:A a rdfs:Property;
 				assertCodeExecutionResult(t, mode, msgs, err, false)
 			}
 
-			<-engine.Stop(false)
 		})
 	})
 
@@ -5335,7 +5298,6 @@ req:A a rdfs:Property;
 				}
 			}
 
-			<-engine.Stop(false)
 		})
 	})
 }

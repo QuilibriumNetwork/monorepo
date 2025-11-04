@@ -71,48 +71,20 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 
 		proposalValidationTotal.WithLabelValues("accept").Inc()
 
-	case protobufs.ProverLivenessCheckType:
-		start := time.Now()
-		defer func() {
-			livenessCheckValidationDuration.Observe(time.Since(start).Seconds())
-		}()
-
-		livenessCheck := &protobufs.ProverLivenessCheck{}
-		if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
-			livenessCheckValidationTotal.WithLabelValues("reject").Inc()
-			return tp2p.ValidationResultReject
-		}
-
-		now := time.Now().UnixMilli()
-		if livenessCheck.Timestamp > now+5000 ||
-			livenessCheck.Timestamp < now-5000 {
-			return tp2p.ValidationResultIgnore
-		}
-
-		// Validate the liveness check
-		if err := livenessCheck.Validate(); err != nil {
-			e.logger.Debug("invalid liveness check", zap.Error(err))
-			livenessCheckValidationTotal.WithLabelValues("reject").Inc()
-			return tp2p.ValidationResultReject
-		}
-
-		livenessCheckValidationTotal.WithLabelValues("accept").Inc()
-
-	case protobufs.FrameVoteType:
+	case protobufs.ProposalVoteType:
 		start := time.Now()
 		defer func() {
 			voteValidationDuration.Observe(time.Since(start).Seconds())
 		}()
 
-		vote := &protobufs.FrameVote{}
+		vote := &protobufs.ProposalVote{}
 		if err := vote.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal vote", zap.Error(err))
 			voteValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
-		now := time.Now().UnixMilli()
+		now := uint64(time.Now().UnixMilli())
 		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
 			return tp2p.ValidationResultIgnore
 		}
@@ -126,33 +98,33 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 
 		voteValidationTotal.WithLabelValues("accept").Inc()
 
-	case protobufs.FrameConfirmationType:
+	case protobufs.TimeoutStateType:
 		start := time.Now()
 		defer func() {
-			confirmationValidationDuration.Observe(time.Since(start).Seconds())
+			timeoutStateValidationDuration.Observe(time.Since(start).Seconds())
 		}()
 
-		confirmation := &protobufs.FrameConfirmation{}
-		if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
-			confirmationValidationTotal.WithLabelValues("reject").Inc()
+		timeoutState := &protobufs.QuorumCertificate{}
+		if err := timeoutState.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal timeoutState", zap.Error(err))
+			timeoutStateValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
-		now := time.Now().UnixMilli()
-		if confirmation.Timestamp > now+5000 ||
-			confirmation.Timestamp < now-5000 {
+		now := uint64(time.Now().UnixMilli())
+		if timeoutState.Timestamp > now+5000 ||
+			timeoutState.Timestamp < now-5000 {
 			return tp2p.ValidationResultIgnore
 		}
 
-		// Validate the confirmation
-		if err := confirmation.Validate(); err != nil {
-			e.logger.Debug("invalid confirmation", zap.Error(err))
-			confirmationValidationTotal.WithLabelValues("reject").Inc()
+		// Validate the timeoutState
+		if err := timeoutState.Validate(); err != nil {
+			e.logger.Debug("invalid timeoutState", zap.Error(err))
+			timeoutStateValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
-		confirmationValidationTotal.WithLabelValues("accept").Inc()
+		timeoutStateValidationTotal.WithLabelValues("accept").Inc()
 
 	default:
 		e.logger.Debug("received unknown type", zap.Uint32("type", typePrefix))
@@ -224,48 +196,20 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 
 		shardProposalValidationTotal.WithLabelValues("accept").Inc()
 
-	case protobufs.ProverLivenessCheckType:
-		start := time.Now()
-		defer func() {
-			shardLivenessCheckValidationDuration.Observe(time.Since(start).Seconds())
-		}()
-
-		livenessCheck := &protobufs.ProverLivenessCheck{}
-		if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
-			shardLivenessCheckValidationTotal.WithLabelValues("reject").Inc()
-			return tp2p.ValidationResultReject
-		}
-
-		now := time.Now().UnixMilli()
-		if livenessCheck.Timestamp > now+500 ||
-			livenessCheck.Timestamp < now-1000 {
-			shardLivenessCheckValidationTotal.WithLabelValues("ignore").Inc()
-			return tp2p.ValidationResultIgnore
-		}
-
-		if err := livenessCheck.Validate(); err != nil {
-			e.logger.Debug("failed to validate liveness check", zap.Error(err))
-			shardLivenessCheckValidationTotal.WithLabelValues("reject").Inc()
-			return tp2p.ValidationResultReject
-		}
-
-		shardLivenessCheckValidationTotal.WithLabelValues("accept").Inc()
-
-	case protobufs.FrameVoteType:
+	case protobufs.ProposalVoteType:
 		start := time.Now()
 		defer func() {
 			shardVoteValidationDuration.Observe(time.Since(start).Seconds())
 		}()
 
-		vote := &protobufs.FrameVote{}
+		vote := &protobufs.ProposalVote{}
 		if err := vote.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal vote", zap.Error(err))
 			shardVoteValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
-		now := time.Now().UnixMilli()
+		now := uint64(time.Now().UnixMilli())
 		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
 			shardVoteValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
@@ -279,32 +223,32 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 
 		shardVoteValidationTotal.WithLabelValues("accept").Inc()
 
-	case protobufs.FrameConfirmationType:
+	case protobufs.TimeoutStateType:
 		start := time.Now()
 		defer func() {
-			shardConfirmationValidationDuration.Observe(time.Since(start).Seconds())
+			shardTimeoutStateValidationDuration.Observe(time.Since(start).Seconds())
 		}()
 
-		confirmation := &protobufs.FrameConfirmation{}
-		if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
-			shardConfirmationValidationTotal.WithLabelValues("reject").Inc()
+		timeoutState := &protobufs.TimeoutState{}
+		if err := timeoutState.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal timeoutState", zap.Error(err))
+			shardTimeoutStateValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
-		now := time.Now().UnixMilli()
-		if confirmation.Timestamp > now+5000 || confirmation.Timestamp < now-5000 {
-			shardConfirmationValidationTotal.WithLabelValues("ignore").Inc()
+		now := uint64(time.Now().UnixMilli())
+		if timeoutState.Timestamp > now+5000 || timeoutState.Timestamp < now-5000 {
+			shardTimeoutStateValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
 
-		if err := confirmation.Validate(); err != nil {
-			e.logger.Debug("failed to validate confirmation", zap.Error(err))
-			shardConfirmationValidationTotal.WithLabelValues("reject").Inc()
+		if err := timeoutState.Validate(); err != nil {
+			e.logger.Debug("failed to validate timeoutState", zap.Error(err))
+			shardTimeoutStateValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
-		shardConfirmationValidationTotal.WithLabelValues("accept").Inc()
+		shardTimeoutStateValidationTotal.WithLabelValues("accept").Inc()
 
 	default:
 		return tp2p.ValidationResultReject

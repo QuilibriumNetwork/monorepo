@@ -53,7 +53,6 @@ import (
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	typesdispatch "source.quilibrium.com/quilibrium/monorepo/types/dispatch"
-	"source.quilibrium.com/quilibrium/monorepo/types/execution"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
@@ -89,6 +88,7 @@ type LockedTransaction struct {
 
 // GlobalConsensusEngine  uses the generic state machine for consensus
 type GlobalConsensusEngine struct {
+	*lifecycle.ComponentManager
 	protobufs.GlobalServiceServer
 
 	logger             *zap.Logger
@@ -113,8 +113,6 @@ type GlobalConsensusEngine struct {
 	dispatchService    typesdispatch.DispatchService
 	globalTimeReel     *consensustime.GlobalTimeReel
 	blsConstructor     crypto.BlsConstructor
-	executors          map[string]execution.ShardExecutionEngine
-	executorsMu        sync.RWMutex
 	executionManager   *manager.ExecutionEngineManager
 	mixnet             typesconsensus.Mixnet
 	peerInfoManager    tp2p.PeerInfoManager
@@ -257,7 +255,6 @@ func NewGlobalConsensusEngine(
 		eventDistributor:            eventDistributor,
 		globalTimeReel:              globalTimeReel,
 		peerInfoManager:             peerInfoManager,
-		executors:                   make(map[string]execution.ShardExecutionEngine),
 		frameStore:                  make(map[string]*protobufs.GlobalFrame),
 		appFrameStore:               make(map[string]*protobufs.AppShardFrame),
 		globalConsensusMessageQueue: make(chan *pb.Message, 1000),
@@ -425,12 +422,6 @@ func NewGlobalConsensusEngine(
 		return nil, errors.Wrap(err, "new global consensus engine")
 	}
 
-	// Register all execution engines with the consensus engine
-	err = engine.executionManager.RegisterAllEngines(engine.RegisterExecutor)
-	if err != nil {
-		return nil, errors.Wrap(err, "new global consensus engine")
-	}
-
 	// Initialize metrics
 	engineState.Set(0) // EngineStateStopped
 	currentDifficulty.Set(float64(config.Engine.Difficulty))
@@ -463,54 +454,34 @@ func NewGlobalConsensusEngine(
 
 	// Set up gRPC server with TLS credentials
 	if err := engine.setupGRPCServer(); err != nil {
-		panic(errors.Wrap(err, "failed to setup gRPC server"))
+		return nil, errors.Wrap(err, "failed to setup gRPC server")
 	}
 
-	return engine, nil
-}
+	componentBuilder := lifecycle.NewComponentManagerBuilder()
 
-func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
-	errChan := make(chan error, 1)
-
-	e.quit = quit
-	e.ctx, e.cancel, _ = lifecycle.WithSignallerAndCancel(context.Background())
-
-	// Start worker manager background process (if applicable)
-	if !e.config.Engine.ArchiveMode {
-		if err := e.workerManager.Start(e.ctx); err != nil {
-			errChan <- errors.Wrap(err, "start")
-			close(errChan)
-			return errChan
-		}
+	// Add worker manager background process (if applicable)
+	if !engine.config.Engine.ArchiveMode {
+		componentBuilder.AddWorker(func(
+			ctx lifecycle.SignalerContext,
+			ready lifecycle.ReadyFunc,
+		) {
+			if err := engine.workerManager.Start(ctx); err != nil {
+				ctx.Throw(err)
+				return
+			}
+			ready()
+			<-ctx.Done()
+		})
 	}
 
-	// Start execution engines
-	if err := e.executionManager.StartAll(e.quit); err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
+	// Add execution engines
+	componentBuilder.AddWorker(engine.executionManager.Start)
+	componentBuilder.AddWorker(engine.eventDistributor.Start)
+	componentBuilder.AddWorker(engine.globalTimeReel.Start)
 
-	// Start the event distributor
-	if err := e.eventDistributor.Start(e.ctx); err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	err := e.globalTimeReel.Start()
+	frame, err := engine.clockStore.GetLatestGlobalClockFrame()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	frame, err := e.clockStore.GetLatestGlobalClockFrame()
-	if err != nil {
-		e.logger.Warn(
-			"invalid frame retrieved, will resync",
-			zap.Error(err),
-		)
+		frame = engine.initializeGenesis()
 	}
 
 	var initialState **protobufs.GlobalFrame = nil
@@ -518,132 +489,183 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 		initialState = &frame
 	}
 
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		if err := e.startConsensus(initialState); err != nil {
-			errChan <- errors.Wrap(err, "start state machine")
-			close(errChan)
-			return errChan
-		}
+	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
+		componentBuilder.AddWorker(func(
+			ctx lifecycle.SignalerContext,
+			ready lifecycle.ReadyFunc,
+		) {
+			if err := engine.startConsensus(initialState, ctx, ready); err != nil {
+				ctx.Throw(err)
+				return
+			}
+
+			<-ctx.Done()
+		})
 	}
 
-	// Confirm initial state
-	if !e.config.Engine.ArchiveMode {
-		latest, err := e.clockStore.GetLatestGlobalClockFrame()
-		if err != nil || latest == nil {
-			e.logger.Info("initializing genesis")
-			e.initializeGenesis()
-		}
-	}
+	componentBuilder.AddWorker(engine.peerInfoManager.Start)
 
 	// Subscribe to global consensus if participating
-	err = e.subscribeToGlobalConsensus()
+	err = engine.subscribeToGlobalConsensus()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		engine.ctx.Throw(errors.Wrap(err, "start"))
+		return nil, err
 	}
 
 	// Subscribe to shard consensus messages to broker lock agreement
-	err = e.subscribeToShardConsensusMessages()
+	err = engine.subscribeToShardConsensusMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		engine.ctx.Throw(err)
+		return nil, errors.Wrap(err, "start")
 	}
 
 	// Subscribe to frames
-	err = e.subscribeToFrameMessages()
+	err = engine.subscribeToFrameMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		engine.ctx.Throw(err)
+		return nil, errors.Wrap(err, "start")
 	}
 
 	// Subscribe to prover messages
-	err = e.subscribeToProverMessages()
+	err = engine.subscribeToProverMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		engine.ctx.Throw(err)
+		return nil, errors.Wrap(err, "start")
 	}
 
 	// Subscribe to peer info messages
-	err = e.subscribeToPeerInfoMessages()
+	err = engine.subscribeToPeerInfoMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		engine.ctx.Throw(err)
+		return nil, errors.Wrap(err, "start")
 	}
 
 	// Subscribe to alert messages
-	err = e.subscribeToAlertMessages()
+	err = engine.subscribeToAlertMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		engine.ctx.Throw(err)
+		return nil, errors.Wrap(err, "start")
 	}
-
-	e.peerInfoManager.Start()
 
 	// Start consensus message queue processor
-	e.wg.Add(1)
-	go e.processGlobalConsensusMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processGlobalConsensusMessageQueue(ctx)
+	})
 
 	// Start shard consensus message queue processor
-	e.wg.Add(1)
-	go e.processShardConsensusMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processShardConsensusMessageQueue(ctx)
+	})
 
 	// Start frame message queue processor
-	e.wg.Add(1)
-	go e.processFrameMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processFrameMessageQueue(ctx)
+	})
 
 	// Start prover message queue processor
-	e.wg.Add(1)
-	go e.processProverMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processProverMessageQueue(ctx)
+	})
 
 	// Start peer info message queue processor
-	e.wg.Add(1)
-	go e.processPeerInfoMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processPeerInfoMessageQueue(ctx)
+	})
 
 	// Start alert message queue processor
-	e.wg.Add(1)
-	go e.processAlertMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processAlertMessageQueue(ctx)
+	})
 
 	// Start periodic peer info reporting
-	e.wg.Add(1)
-	go e.reportPeerInfoPeriodically()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.reportPeerInfoPeriodically(ctx)
+	})
 
 	// Start event distributor event loop
-	e.wg.Add(1)
-	go e.eventDistributorLoop()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.eventDistributorLoop(ctx)
+	})
 
 	// Start periodic metrics update
-	e.wg.Add(1)
-	go e.updateMetrics()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.updateMetrics(ctx)
+	})
 
 	// Start periodic tx lock pruning
-	e.wg.Add(1)
-	go e.pruneTxLocksPeriodically()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.pruneTxLocksPeriodically(ctx)
+	})
 
-	if e.grpcServer != nil {
+	if engine.grpcServer != nil {
 		// Register all services with the gRPC server
-		e.RegisterServices(e.grpcServer)
+		engine.RegisterServices(engine.grpcServer)
 
 		// Start serving the gRPC server
-		go func() {
-			if err := e.grpcServer.Serve(e.grpcListener); err != nil {
-				e.logger.Error("gRPC server error", zap.Error(err))
+		componentBuilder.AddWorker(func(
+			ctx lifecycle.SignalerContext,
+			ready lifecycle.ReadyFunc,
+		) {
+			go func() {
+				if err := engine.grpcServer.Serve(engine.grpcListener); err != nil {
+					engine.logger.Error("gRPC server error", zap.Error(err))
+					ctx.Throw(err)
+				}
+			}()
+			ready()
+			engine.logger.Info("started gRPC server",
+				zap.String("address", engine.grpcListener.Addr().String()))
+			<-ctx.Done()
+			engine.logger.Info("stopping gRPC server")
+			engine.grpcServer.GracefulStop()
+			if engine.grpcListener != nil {
+				engine.grpcListener.Close()
 			}
-		}()
-
-		e.logger.Info("started gRPC server",
-			zap.String("address", e.grpcListener.Addr().String()))
+		})
 	}
 
-	e.logger.Info("global consensus engine started")
-
-	close(errChan)
-	return errChan
+	engine.ComponentManager = componentBuilder.Build()
+	return engine, nil
 }
 
 func (e *GlobalConsensusEngine) setupGRPCServer() error {
@@ -747,38 +769,9 @@ func (e *GlobalConsensusEngine) getAddressFromPublicKey(
 func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	errChan := make(chan error, 1)
 
-	// Stop worker manager background process (if applicable)
-	if !e.config.Engine.ArchiveMode {
-		if err := e.workerManager.Stop(); err != nil {
-			errChan <- errors.Wrap(err, "stop")
-			close(errChan)
-			return errChan
-		}
-	}
-
-	if e.grpcServer != nil {
-		e.logger.Info("stopping gRPC server")
-		e.grpcServer.GracefulStop()
-		if e.grpcListener != nil {
-			e.grpcListener.Close()
-		}
-	}
-
-	// Stop execution engines
-	if e.executionManager != nil {
-		if err := e.executionManager.StopAll(force); err != nil && !force {
-			errChan <- errors.Wrap(err, "stop")
-		}
-	}
-
 	// Cancel context
 	if e.cancel != nil {
 		e.cancel()
-	}
-
-	// Stop event distributor
-	if err := e.eventDistributor.Stop(); err != nil && !force {
-		errChan <- errors.Wrap(err, "stop")
 	}
 
 	// Unsubscribe from pubsub
@@ -806,17 +799,8 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.Unsubscribe(GLOBAL_ALERT_BITMASK, false)
 	e.pubsub.UnregisterValidator(GLOBAL_ALERT_BITMASK)
 
-	e.peerInfoManager.Stop()
-
-	// Wait for goroutines to finish
-	done := make(chan struct{})
-	go func() {
-		e.wg.Wait()
-		close(done)
-	}()
-
 	select {
-	case <-done:
+	case <-e.ctx.Done():
 		// Clean shutdown
 	case <-time.After(30 * time.Second):
 		if !force {
@@ -859,77 +843,6 @@ func (e *GlobalConsensusEngine) GetState() typesconsensus.EngineState {
 	default:
 		return typesconsensus.EngineStateStarting
 	}
-}
-
-func (e *GlobalConsensusEngine) RegisterExecutor(
-	exec execution.ShardExecutionEngine,
-	frame uint64,
-) <-chan error {
-	errChan := make(chan error, 1)
-
-	e.executorsMu.Lock()
-	defer e.executorsMu.Unlock()
-
-	name := exec.GetName()
-	if _, exists := e.executors[name]; exists {
-		errChan <- errors.New("executor already registered")
-		close(errChan)
-		return errChan
-	}
-
-	e.executors[name] = exec
-
-	// Update metrics
-	executorRegistrationTotal.WithLabelValues("register").Inc()
-	executorsRegistered.Set(float64(len(e.executors)))
-
-	close(errChan)
-	return errChan
-}
-
-func (e *GlobalConsensusEngine) UnregisterExecutor(
-	name string,
-	frame uint64,
-	force bool,
-) <-chan error {
-	errChan := make(chan error, 1)
-
-	e.executorsMu.Lock()
-	defer e.executorsMu.Unlock()
-
-	if _, exists := e.executors[name]; !exists {
-		errChan <- errors.New("executor not registered")
-		close(errChan)
-		return errChan
-	}
-
-	// Stop the executor
-	if exec, ok := e.executors[name]; ok {
-		stopErrChan := exec.Stop(force)
-		select {
-		case err := <-stopErrChan:
-			if err != nil && !force {
-				errChan <- errors.Wrap(err, "stop executor")
-				close(errChan)
-				return errChan
-			}
-		case <-time.After(5 * time.Second):
-			if !force {
-				errChan <- errors.New("timeout stopping executor")
-				close(errChan)
-				return errChan
-			}
-		}
-	}
-
-	delete(e.executors, name)
-
-	// Update metrics
-	executorRegistrationTotal.WithLabelValues("unregister").Inc()
-	executorsRegistered.Set(float64(len(e.executors)))
-
-	close(errChan)
-	return errChan
 }
 
 func (e *GlobalConsensusEngine) GetProvingKey(
@@ -1325,24 +1238,22 @@ func (e *GlobalConsensusEngine) getProverAddress() []byte {
 	return addressBI.FillBytes(make([]byte, 32))
 }
 
-func (e *GlobalConsensusEngine) updateMetrics() {
+func (e *GlobalConsensusEngine) updateMetrics(
+	ctx lifecycle.SignalerContext,
+) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.logger.Error("fatal error encountered", zap.Any("panic", r))
-			if e.cancel != nil {
-				e.cancel()
-			}
-			e.quit <- struct{}{}
+			ctx.Throw(errors.Errorf("fatal unhandled error encountered: %v", r))
 		}
 	}()
-	defer e.wg.Done()
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -1352,12 +1263,6 @@ func (e *GlobalConsensusEngine) updateMetrics() {
 			timeSince := time.Since(e.lastProvenFrameTime).Seconds()
 			e.lastProvenFrameTimeMu.RUnlock()
 			timeSinceLastProvenFrame.Set(timeSince)
-
-			// Update executor count
-			e.executorsMu.RLock()
-			execCount := len(e.executors)
-			e.executorsMu.RUnlock()
-			executorsRegistered.Set(float64(execCount))
 
 			// Update current frame number
 			if frame := e.GetFrame(); frame != nil && frame.Header != nil {
@@ -1828,16 +1733,16 @@ func (e *GlobalConsensusEngine) signPeerInfo(
 
 // reportPeerInfoPeriodically sends peer info over the peer info bitmask every
 // 5 minutes
-func (e *GlobalConsensusEngine) reportPeerInfoPeriodically() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) reportPeerInfoPeriodically(
+	ctx lifecycle.SignalerContext,
+) {
 	e.logger.Info("starting periodic peer info reporting")
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			e.logger.Info("stopping periodic peer info reporting")
 			return
 		case <-ticker.C:
@@ -1867,9 +1772,9 @@ func (e *GlobalConsensusEngine) reportPeerInfoPeriodically() {
 	}
 }
 
-func (e *GlobalConsensusEngine) pruneTxLocksPeriodically() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) pruneTxLocksPeriodically(
+	ctx lifecycle.SignalerContext,
+) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -1877,7 +1782,7 @@ func (e *GlobalConsensusEngine) pruneTxLocksPeriodically() {
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			e.pruneTxLocks()
@@ -2400,6 +2305,8 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 
 func (e *GlobalConsensusEngine) startConsensus(
 	initialFrame **protobufs.GlobalFrame,
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
 ) error {
 	var err error
 	e.consensusParticipant, err = participant.NewParticipant[

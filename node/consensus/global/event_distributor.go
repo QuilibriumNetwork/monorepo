@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
@@ -24,19 +25,15 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 )
 
-func (e *GlobalConsensusEngine) eventDistributorLoop() {
+func (e *GlobalConsensusEngine) eventDistributorLoop(
+	ctx lifecycle.SignalerContext,
+) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.logger.Error("fatal error encountered", zap.Any("panic", r))
-			if e.cancel != nil {
-				e.cancel()
-			}
-			go func() {
-				e.Stop(false)
-			}()
+			ctx.Throw(errors.Errorf("fatal unhandled error encountered: %v", r))
 		}
 	}()
-	defer e.wg.Done()
 
 	// Subscribe to events from the event distributor
 	eventCh := e.eventDistributor.Subscribe("global")
@@ -44,7 +41,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return

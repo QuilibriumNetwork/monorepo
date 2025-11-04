@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -81,25 +82,21 @@ func TestGlobalEventDistributor_StartStop(t *testing.T) {
 	globalEventCh := make(chan consensustime.GlobalEvent, 10)
 	distributor := NewGlobalEventDistributor(globalEventCh)
 
-	ctx := context.Background()
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
 
 	// Test starting
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
-
-	// Test starting again (should be idempotent)
-	err = distributor.Start(ctx)
-	require.NoError(t, err)
+	go distributor.Start(ctx, func() {})
 
 	// Test stopping
-	err = distributor.Stop()
-	require.NoError(t, err)
-
-	// Test stopping again (should be idempotent)
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 
 	close(globalEventCh)
+
 }
 
 func TestGlobalEventDistributor_Subscribe(t *testing.T) {
@@ -116,9 +113,8 @@ func TestGlobalEventDistributor_Subscribe(t *testing.T) {
 	assert.NotNil(t, sub3Ch)
 
 	// Start the distributor
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	// Send a test event
 	testEvent := createTestGlobalEvent(consensustime.TimeReelEventNewHead, 100)
@@ -146,8 +142,12 @@ func TestGlobalEventDistributor_Subscribe(t *testing.T) {
 	}
 
 	// Stop the distributor
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 	close(globalEventCh)
 }
 
@@ -160,9 +160,8 @@ func TestGlobalEventDistributor_Unsubscribe(t *testing.T) {
 	sub2Ch := distributor.Subscribe("subscriber2")
 
 	// Start the distributor
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	// Unsubscribe subscriber1
 	distributor.Unsubscribe("subscriber1")
@@ -198,8 +197,12 @@ func TestGlobalEventDistributor_Unsubscribe(t *testing.T) {
 	assert.False(t, ok, "Unsubscribed channel should be closed")
 
 	// Stop the distributor
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 	close(globalEventCh)
 }
 
@@ -211,9 +214,8 @@ func TestGlobalEventDistributor_EventTypes(t *testing.T) {
 	subCh := distributor.Subscribe("test-subscriber")
 
 	// Start the distributor
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	// Test NewHead event
 	newHeadEvent := createTestGlobalEvent(consensustime.TimeReelEventNewHead, 100)
@@ -243,8 +245,12 @@ func TestGlobalEventDistributor_EventTypes(t *testing.T) {
 	assert.Equal(t, equivocationEvent, *eventData)
 
 	// Stop the distributor
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 	close(globalEventCh)
 }
 
@@ -253,11 +259,10 @@ func TestGlobalEventDistributor_ContextCancellation(t *testing.T) {
 	distributor := NewGlobalEventDistributor(globalEventCh)
 
 	// Create a cancellable context
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
 
 	// Start the distributor
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
+	go distributor.Start(ctx, func() {})
 
 	// Subscribe
 	subCh := distributor.Subscribe("test-subscriber")
@@ -269,8 +274,12 @@ func TestGlobalEventDistributor_ContextCancellation(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Stop should work gracefully
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 
 	// Channel should be closed
 	_, ok := <-subCh
@@ -284,23 +293,18 @@ func TestAppEventDistributor_StartStop(t *testing.T) {
 	appEventCh := make(chan consensustime.AppEvent, 10)
 	distributor := NewAppEventDistributor(globalEventCh, appEventCh)
 
-	ctx := context.Background()
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
 
 	// Test starting
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
-
-	// Test starting again (should be idempotent)
-	err = distributor.Start(ctx)
-	require.NoError(t, err)
+	go distributor.Start(ctx, func() {})
 
 	// Test stopping
-	err = distributor.Stop()
-	require.NoError(t, err)
-
-	// Test stopping again (should be idempotent)
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 
 	close(globalEventCh)
 	close(appEventCh)
@@ -315,9 +319,8 @@ func TestAppEventDistributor_GlobalAndAppEvents(t *testing.T) {
 	subCh := distributor.Subscribe("test-subscriber")
 
 	// Start the distributor
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	// Test Global event
 	globalEvent := createTestGlobalEvent(consensustime.TimeReelEventNewHead, 100)
@@ -338,8 +341,12 @@ func TestAppEventDistributor_GlobalAndAppEvents(t *testing.T) {
 	assert.Equal(t, appEvent, *appEventData)
 
 	// Stop the distributor
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 	close(globalEventCh)
 	close(appEventCh)
 }
@@ -353,9 +360,8 @@ func TestAppEventDistributor_AllEventTypes(t *testing.T) {
 	subCh := distributor.Subscribe("test-subscriber")
 
 	// Start the distributor
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	// Test all global event types
 	globalNewHead := createTestGlobalEvent(consensustime.TimeReelEventNewHead, 100)
@@ -390,8 +396,12 @@ func TestAppEventDistributor_AllEventTypes(t *testing.T) {
 	assert.Equal(t, consensus.ControlEventAppEquivocation, event.Type)
 
 	// Stop the distributor
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 	close(globalEventCh)
 	close(appEventCh)
 }
@@ -406,9 +416,8 @@ func TestAppEventDistributor_MultipleSubscribers(t *testing.T) {
 	sub2Ch := distributor.Subscribe("subscriber2")
 
 	// Start the distributor
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	// Send events
 	globalEvent := createTestGlobalEvent(consensustime.TimeReelEventNewHead, 100)
@@ -445,8 +454,12 @@ func TestAppEventDistributor_MultipleSubscribers(t *testing.T) {
 	assert.Equal(t, 2, receivedApp)
 
 	// Stop the distributor
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 	close(globalEventCh)
 	close(appEventCh)
 }
@@ -460,9 +473,8 @@ func TestAppEventDistributor_ChannelClosure(t *testing.T) {
 	subCh := distributor.Subscribe("test-subscriber")
 
 	// Start the distributor
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	// Close the input channels
 	close(globalEventCh)
@@ -471,8 +483,12 @@ func TestAppEventDistributor_ChannelClosure(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Stop should work gracefully
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 
 	// Subscriber channel should be closed
 	_, ok := <-subCh
@@ -495,9 +511,8 @@ func TestConcurrentSubscribeUnsubscribe(t *testing.T) {
 	globalEventCh := make(chan consensustime.GlobalEvent, 10)
 	distributor := NewGlobalEventDistributor(globalEventCh)
 
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(t, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	// Concurrently subscribe and unsubscribe
 	done := make(chan bool)
@@ -537,8 +552,12 @@ func TestConcurrentSubscribeUnsubscribe(t *testing.T) {
 	}
 
 	// Stop the distributor
-	err = distributor.Stop()
-	require.NoError(t, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(t, err)
+	}
 	wg.Wait()
 
 	close(globalEventCh)
@@ -568,9 +587,8 @@ func BenchmarkGlobalEventDistributor_Broadcast(b *testing.B) {
 		}(ch)
 	}
 
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(b, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	b.ResetTimer()
 
@@ -588,8 +606,12 @@ func BenchmarkGlobalEventDistributor_Broadcast(b *testing.B) {
 	// Signal consumers to stop
 	close(done)
 
-	err = distributor.Stop()
-	require.NoError(b, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(b, err)
+	}
 	close(globalEventCh)
 
 	// Wait for all consumers to finish
@@ -620,9 +642,8 @@ func BenchmarkAppEventDistributor_MixedEvents(b *testing.B) {
 		}(ch)
 	}
 
-	ctx := context.Background()
-	err := distributor.Start(ctx)
-	require.NoError(b, err)
+	ctx, cancel, errCh := lifecycle.WithSignallerAndCancel(context.Background())
+	go distributor.Start(ctx, func() {})
 
 	b.ResetTimer()
 
@@ -642,8 +663,12 @@ func BenchmarkAppEventDistributor_MixedEvents(b *testing.B) {
 	// Signal consumers to stop
 	close(done)
 
-	err = distributor.Stop()
-	require.NoError(b, err)
+	cancel()
+	select {
+	case <-ctx.Done():
+	case err, _ := <-errCh:
+		require.NoError(b, err)
+	}
 	close(globalEventCh)
 	close(appEventCh)
 

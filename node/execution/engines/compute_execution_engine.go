@@ -11,6 +11,7 @@ import (
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/fees"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/compute"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
@@ -41,7 +42,7 @@ type ComputeExecutionEngine struct {
 	intrinsicsMutex sync.RWMutex
 	mode            ExecutionMode
 	mu              sync.RWMutex
-	stopChan        chan struct{}
+	ctx             lifecycle.SignalerContext
 }
 
 func NewComputeExecutionEngine(
@@ -136,45 +137,16 @@ func (e *ComputeExecutionEngine) GetCapabilities() []*protobufs.Capability {
 	return capabilities
 }
 
-func (e *ComputeExecutionEngine) Start() <-chan error {
-	errChan := make(chan error, 1)
+func (e *ComputeExecutionEngine) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	e.logger.Info("starting compute execution engine")
+	e.ctx = ctx
+	ready()
 
-	e.mu.Lock()
-	e.stopChan = make(chan struct{}, 1)
-	e.mu.Unlock()
-
-	go func() {
-		e.logger.Info("starting compute execution engine")
-
-		<-e.stopChan
-		e.logger.Info("stopping compute execution engine")
-	}()
-
-	return errChan
-}
-
-func (e *ComputeExecutionEngine) Stop(force bool) <-chan error {
-	errChan := make(chan error)
-
-	go func() {
-		e.logger.Info("stopping compute execution engine", zap.Bool("force", force))
-
-		// Signal stop if we have a stopChan
-		e.mu.RLock()
-		if e.stopChan != nil {
-			select {
-			case <-e.stopChan:
-				// Already closed
-			default:
-				close(e.stopChan)
-			}
-		}
-		e.mu.RUnlock()
-
-		close(errChan)
-	}()
-
-	return errChan
+	<-ctx.Done()
+	e.logger.Info("stopping compute execution engine")
 }
 
 func (e *ComputeExecutionEngine) Prove(
@@ -478,37 +450,42 @@ func (e *ComputeExecutionEngine) validateBundle(
 
 	// Validate each operation in the bundle sequentially
 	for i, op := range bundle.Requests {
-		e.logger.Debug(
-			"validating bundled operation",
-			zap.Int("operation", i),
-			zap.String("address", hex.EncodeToString(address)),
-		)
-
-		// Check if this is a compute operation type
-		isComputeOp := op.GetComputeDeploy() != nil ||
-			op.GetComputeUpdate() != nil ||
-			op.GetCodeDeploy() != nil ||
-			op.GetCodeExecute() != nil ||
-			op.GetCodeFinalize() != nil
-
-		if !isComputeOp {
-			// Skip non-compute operations
+		select {
+		case <-e.ctx.Done():
+			return errors.Wrap(errors.New("context canceled"), "validate bundle")
+		default:
 			e.logger.Debug(
-				"skipping non-compute operation in bundle",
+				"validating bundled operation",
 				zap.Int("operation", i),
+				zap.String("address", hex.EncodeToString(address)),
 			)
-			continue
-		}
 
-		// Validate this operation individually
-		err := e.validateIndividualMessage(
-			frameNumber,
-			address,
-			op,
-			true,
-		)
-		if err != nil {
-			return errors.Wrap(err, "validate bundle")
+			// Check if this is a compute operation type
+			isComputeOp := op.GetComputeDeploy() != nil ||
+				op.GetComputeUpdate() != nil ||
+				op.GetCodeDeploy() != nil ||
+				op.GetCodeExecute() != nil ||
+				op.GetCodeFinalize() != nil
+
+			if !isComputeOp {
+				// Skip non-compute operations
+				e.logger.Debug(
+					"skipping non-compute operation in bundle",
+					zap.Int("operation", i),
+				)
+				continue
+			}
+
+			// Validate this operation individually
+			err := e.validateIndividualMessage(
+				frameNumber,
+				address,
+				op,
+				true,
+			)
+			if err != nil {
+				return errors.Wrap(err, "validate bundle")
+			}
 		}
 	}
 

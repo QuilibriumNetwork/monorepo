@@ -3,7 +3,6 @@ package app
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -11,16 +10,17 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 )
 
-func (e *AppConsensusEngine) processConsensusMessageQueue() {
-	defer e.wg.Done()
-
+func (e *AppConsensusEngine) processConsensusMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -30,14 +30,14 @@ func (e *AppConsensusEngine) processConsensusMessageQueue() {
 	}
 }
 
-func (e *AppConsensusEngine) processProverMessageQueue() {
-	defer e.wg.Done()
-
+func (e *AppConsensusEngine) processProverMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
 		case <-e.haltCtx.Done():
 			return
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case message := <-e.proverMessageQueue:
 			e.handleProverMessage(message)
@@ -45,14 +45,14 @@ func (e *AppConsensusEngine) processProverMessageQueue() {
 	}
 }
 
-func (e *AppConsensusEngine) processFrameMessageQueue() {
-	defer e.wg.Done()
-
+func (e *AppConsensusEngine) processFrameMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
 		case <-e.haltCtx.Done():
 			return
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -62,14 +62,14 @@ func (e *AppConsensusEngine) processFrameMessageQueue() {
 	}
 }
 
-func (e *AppConsensusEngine) processGlobalFrameMessageQueue() {
-	defer e.wg.Done()
-
+func (e *AppConsensusEngine) processGlobalFrameMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
 		case <-e.haltCtx.Done():
 			return
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -79,12 +79,12 @@ func (e *AppConsensusEngine) processGlobalFrameMessageQueue() {
 	}
 }
 
-func (e *AppConsensusEngine) processAlertMessageQueue() {
-	defer e.wg.Done()
-
+func (e *AppConsensusEngine) processAlertMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -94,14 +94,14 @@ func (e *AppConsensusEngine) processAlertMessageQueue() {
 	}
 }
 
-func (e *AppConsensusEngine) processPeerInfoMessageQueue() {
-	defer e.wg.Done()
-
+func (e *AppConsensusEngine) processPeerInfoMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
 		case <-e.haltCtx.Done():
 			return
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -111,12 +111,12 @@ func (e *AppConsensusEngine) processPeerInfoMessageQueue() {
 	}
 }
 
-func (e *AppConsensusEngine) processDispatchMessageQueue() {
-	defer e.wg.Done()
-
+func (e *AppConsensusEngine) processDispatchMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -142,14 +142,11 @@ func (e *AppConsensusEngine) handleConsensusMessage(message *pb.Message) {
 	case protobufs.AppShardFrameType:
 		e.handleProposal(message)
 
-	case protobufs.ProverLivenessCheckType:
-		e.handleLivenessCheck(message)
-
-	case protobufs.FrameVoteType:
+	case protobufs.ProposalVoteType:
 		e.handleVote(message)
 
-	case protobufs.FrameConfirmationType:
-		e.handleConfirmation(message)
+	case protobufs.TimeoutStateType:
+		e.handleTimeoutState(message)
 
 	default:
 		e.logger.Debug(
@@ -196,7 +193,7 @@ func (e *AppConsensusEngine) handleFrameMessage(message *pb.Message) {
 		e.frameStore[string(frameID)] = frame
 		e.frameStoreMu.Unlock()
 
-		if err := e.appTimeReel.Insert(e.ctx, frame); err != nil {
+		if err := e.appTimeReel.Insert(ctx, frame); err != nil {
 			// Success metric recorded at the end of processing
 			framesProcessedTotal.WithLabelValues("error").Inc()
 			return
@@ -276,7 +273,7 @@ func (e *AppConsensusEngine) handleGlobalFrameMessage(message *pb.Message) {
 			return
 		}
 
-		if err := e.globalTimeReel.Insert(e.ctx, frame); err != nil {
+		if err := e.globalTimeReel.Insert(ctx, frame); err != nil {
 			// Success metric recorded at the end of processing
 			globalFramesProcessedTotal.WithLabelValues("error").Inc()
 			return
@@ -382,7 +379,7 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 		}
 
 		if err := e.dispatchService.AddInboxMessage(
-			e.ctx,
+			ctx,
 			envelope,
 		); err != nil {
 			e.logger.Debug("failed to add inbox message", zap.Error(err))
@@ -395,7 +392,7 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 		}
 
 		if err := e.dispatchService.AddHubInboxAssociation(
-			e.ctx,
+			ctx,
 			envelope,
 		); err != nil {
 			e.logger.Debug("failed to add inbox message", zap.Error(err))
@@ -408,7 +405,7 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 		}
 
 		if err := e.dispatchService.DeleteHubInboxAssociation(
-			e.ctx,
+			ctx,
 			envelope,
 		); err != nil {
 			e.logger.Debug("failed to add inbox message", zap.Error(err))
@@ -460,116 +457,13 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 	}
 }
 
-func (e *AppConsensusEngine) handleLivenessCheck(message *pb.Message) {
-	timer := prometheus.NewTimer(
-		livenessCheckProcessingDuration.WithLabelValues(e.appAddressHex),
-	)
-	defer timer.ObserveDuration()
-
-	livenessCheck := &protobufs.ProverLivenessCheck{}
-	if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
-		e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	if !bytes.Equal(livenessCheck.Filter, e.appAddress) {
-		return
-	}
-
-	// Validate the liveness check structure
-	if err := livenessCheck.Validate(); err != nil {
-		e.logger.Debug("invalid liveness check", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	proverSet, err := e.proverRegistry.GetActiveProvers(e.appAddress)
-	if err != nil {
-		e.logger.Error("could not receive liveness check", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	lcBytes, err := livenessCheck.ConstructSignaturePayload()
-	if err != nil {
-		e.logger.Error(
-			"could not construct signature message for liveness check",
-			zap.Error(err),
-		)
-		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	var found []byte = nil
-	for _, prover := range proverSet {
-		if bytes.Equal(
-			prover.Address,
-			livenessCheck.PublicKeySignatureBls48581.Address,
-		) {
-			valid, err := e.keyManager.ValidateSignature(
-				crypto.KeyTypeBLS48581G1,
-				prover.PublicKey,
-				lcBytes,
-				livenessCheck.PublicKeySignatureBls48581.Signature,
-				livenessCheck.GetSignatureDomain(),
-			)
-			if err != nil || !valid {
-				e.logger.Error(
-					"could not validate signature for liveness check",
-					zap.Error(err),
-				)
-				break
-			}
-			found = prover.PublicKey
-
-			break
-		}
-	}
-
-	if found == nil {
-		e.logger.Warn(
-			"invalid liveness check",
-			zap.String(
-				"prover",
-				hex.EncodeToString(
-					livenessCheck.PublicKeySignatureBls48581.Address,
-				),
-			),
-		)
-		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	if livenessCheck.PublicKeySignatureBls48581 == nil {
-		e.logger.Error("no signature on liveness check")
-		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-	}
-
-	commitment := CollectedCommitments{
-		commitmentHash: livenessCheck.CommitmentHash,
-		frameNumber:    livenessCheck.FrameNumber,
-		prover:         livenessCheck.PublicKeySignatureBls48581.Address,
-	}
-	if err := e.stateMachine.ReceiveLivenessCheck(
-		PeerID{ID: livenessCheck.PublicKeySignatureBls48581.Address},
-		commitment,
-	); err != nil {
-		e.logger.Error("could not receive liveness check", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
-}
-
 func (e *AppConsensusEngine) handleVote(message *pb.Message) {
 	timer := prometheus.NewTimer(
 		voteProcessingDuration.WithLabelValues(e.appAddressHex),
 	)
 	defer timer.ObserveDuration()
 
-	vote := &protobufs.FrameVote{}
+	vote := &protobufs.ProposalVote{}
 	if err := vote.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal vote", zap.Error(err))
 		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
@@ -599,20 +493,20 @@ func (e *AppConsensusEngine) handleVote(message *pb.Message) {
 	voteProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }
 
-func (e *AppConsensusEngine) handleConfirmation(message *pb.Message) {
+func (e *AppConsensusEngine) handleTimeoutState(message *pb.Message) {
 	timer := prometheus.NewTimer(
-		confirmationProcessingDuration.WithLabelValues(e.appAddressHex),
+		timeoutStateProcessingDuration.WithLabelValues(e.appAddressHex),
 	)
 	defer timer.ObserveDuration()
 
-	confirmation := &protobufs.FrameConfirmation{}
-	if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
-		e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
-		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+	timeoutState := &protobufs.TimeoutState{}
+	if err := timeoutState.FromCanonicalBytes(message.Data); err != nil {
+		e.logger.Debug("failed to unmarshal timeoutState", zap.Error(err))
+		timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if !bytes.Equal(confirmation.Filter, e.appAddress) {
+	if !bytes.Equal(timeoutState.Filter, e.appAddress) {
 		return
 	}
 
@@ -620,9 +514,9 @@ func (e *AppConsensusEngine) handleConfirmation(message *pb.Message) {
 	var matchingFrame *protobufs.AppShardFrame
 	for _, frame := range e.frameStore {
 		if frame.Header != nil &&
-			frame.Header.FrameNumber == confirmation.FrameNumber {
+			frame.Header.FrameNumber == timeoutState.FrameNumber {
 			frameSelector := e.calculateFrameSelector(frame.Header)
-			if bytes.Equal(frameSelector, confirmation.Selector) {
+			if bytes.Equal(frameSelector, timeoutState.Selector) {
 				matchingFrame = frame
 				break
 			}
@@ -639,39 +533,39 @@ func (e *AppConsensusEngine) handleConfirmation(message *pb.Message) {
 	defer e.frameStoreMu.Unlock()
 
 	matchingFrame.Header.PublicKeySignatureBls48581 =
-		confirmation.AggregateSignature
+		timeoutState.AggregateSignature
 	valid, err := e.frameValidator.Validate(matchingFrame)
 	if !valid || err != nil {
-		e.logger.Error("received invalid confirmation", zap.Error(err))
-		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		e.logger.Error("received invalid timeoutState", zap.Error(err))
+		timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
 	if matchingFrame.Header.Prover == nil {
-		e.logger.Error("confirmation with no matched prover")
-		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		e.logger.Error("timeoutState with no matched prover")
+		timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if err := e.stateMachine.ReceiveConfirmation(
+	if err := e.stateMachine.ReceivetimeoutState(
 		PeerID{ID: matchingFrame.Header.Prover},
 		&matchingFrame,
 	); err != nil {
-		e.logger.Error("could not receive confirmation", zap.Error(err))
-		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		e.logger.Error("could not receive timeoutState", zap.Error(err))
+		timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if err := e.appTimeReel.Insert(e.ctx, matchingFrame); err != nil {
+	if err := e.appTimeReel.Insert(ctx, matchingFrame); err != nil {
 		e.logger.Error(
 			"could not insert into time reel",
 			zap.Error(err),
 		)
-		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
+	timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }
 
 func (e *AppConsensusEngine) peekMessageType(message *pb.Message) uint32 {

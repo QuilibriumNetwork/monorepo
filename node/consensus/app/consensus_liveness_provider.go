@@ -77,7 +77,7 @@ func (p *AppLivenessProvider) Collect(
 		zap.Int("valid_message_count", len(finalizedMessages)),
 		zap.Uint64(
 			"current_frame",
-			p.engine.GetFrame().Rank(),
+			p.engine.GetFrame().GetRank(),
 		),
 	)
 	transactionsCollectedTotal.WithLabelValues(p.engine.appAddressHex).Add(

@@ -2,6 +2,7 @@ package mocks
 
 import (
 	"github.com/stretchr/testify/mock"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
 )
@@ -36,11 +37,9 @@ func (m *MockPeerInfoManager) GetPeersBySpeed() [][]byte {
 }
 
 // Start implements p2p.PeerInfoManager.
-func (m *MockPeerInfoManager) Start() {
-	m.Called()
-}
-
-// Stop implements p2p.PeerInfoManager.
-func (m *MockPeerInfoManager) Stop() {
-	m.Called()
+func (m *MockPeerInfoManager) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	m.Called(ctx, ready)
 }

@@ -99,50 +99,6 @@ var (
 		[]string{"app_address"},
 	)
 
-	// Shard liveness check processing metrics
-	livenessCheckProcessedTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: subsystem,
-			Name:      "liveness_check_processed_total",
-			Help:      "Total number of shard liveness checks processed by the app consensus engine",
-		},
-		[]string{"app_address", "status"}, // status: "success", "error", "invalid"
-	)
-
-	livenessCheckProcessingDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Subsystem: subsystem,
-			Name:      "liveness_check_processing_duration_seconds",
-			Help:      "Time taken to process a shard liveness check",
-			Buckets:   prometheus.DefBuckets,
-		},
-		[]string{"app_address"},
-	)
-
-	// Shard liveness check validation metrics
-	livenessCheckValidationTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: subsystem,
-			Name:      "liveness_check_validation_total",
-			Help:      "Total number of shard liveness check validations",
-		},
-		[]string{"app_address", "result"}, // result: "accept", "reject", "ignore"
-	)
-
-	livenessCheckValidationDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Subsystem: subsystem,
-			Name:      "liveness_check_validation_duration_seconds",
-			Help:      "Time taken to validate a shard liveness check",
-			Buckets:   prometheus.DefBuckets,
-		},
-		[]string{"app_address"},
-	)
-
 	// Shard vote processing metrics
 	voteProcessedTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -187,45 +143,45 @@ var (
 		[]string{"app_address"},
 	)
 
-	// Shard confirmation processing metrics
-	confirmationProcessedTotal = promauto.NewCounterVec(
+	// Shard timeout stateprocessing metrics
+	timeoutStateProcessedTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: subsystem,
-			Name:      "confirmation_processed_total",
-			Help:      "Total number of shard confirmations processed by the app consensus engine",
+			Name:      "timeout_state_processed_total",
+			Help:      "Total number of shard timeout states processed by the app consensus engine",
 		},
 		[]string{"app_address", "status"}, // status: "success", "error", "invalid"
 	)
 
-	confirmationProcessingDuration = promauto.NewHistogramVec(
+	timeoutStateProcessingDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Subsystem: subsystem,
-			Name:      "confirmation_processing_duration_seconds",
-			Help:      "Time taken to process a shard confirmation",
+			Name:      "timeout_state_processing_duration_seconds",
+			Help:      "Time taken to process a shard timeout state",
 			Buckets:   prometheus.DefBuckets,
 		},
 		[]string{"app_address"},
 	)
 
-	// Shard confirmation validation metrics
-	confirmationValidationTotal = promauto.NewCounterVec(
+	// Shard timeout statevalidation metrics
+	timeoutStateValidationTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: subsystem,
-			Name:      "confirmation_validation_total",
-			Help:      "Total number of shard confirmation validations",
+			Name:      "timeout_state_validation_total",
+			Help:      "Total number of shard timeout statevalidations",
 		},
 		[]string{"app_address", "result"}, // result: "accept", "reject", "ignore"
 	)
 
-	confirmationValidationDuration = promauto.NewHistogramVec(
+	timeoutStateValidationDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Subsystem: subsystem,
-			Name:      "confirmation_validation_duration_seconds",
-			Help:      "Time taken to validate a shard confirmation",
+			Name:      "timeout_state_validation_duration_seconds",
+			Help:      "Time taken to validate a shard timeout state",
 			Buckets:   prometheus.DefBuckets,
 		},
 		[]string{"app_address"},

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
@@ -27,11 +28,10 @@ func TestGlobalTimeReel_BasicOperations(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Test inserting genesis frame
 	genesis := &protobufs.GlobalFrame{
@@ -108,11 +108,10 @@ func TestGlobalTimeReel_Equivocation(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Subscribe to events
 	eventCh := atr.GetEventCh()
@@ -208,11 +207,10 @@ func TestGlobalTimeReel_Fork(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.GlobalFrame{
@@ -280,11 +278,10 @@ func TestGlobalTimeReel_ParentValidation(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.GlobalFrame{
@@ -342,11 +339,10 @@ func TestGlobalTimeReel_ForkDetection(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Collect events
@@ -423,11 +419,10 @@ func TestGlobalTimeReel_ForkChoice_MoreSignatures(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Drain any existing events
@@ -536,11 +531,10 @@ func TestGlobalTimeReel_ForkChoice_NoReplacement(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Drain any existing events
@@ -641,11 +635,10 @@ func TestGlobalTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Drain any existing events
@@ -872,11 +865,10 @@ func TestGlobalTimeReel_TreePruning(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.GlobalFrame{
@@ -956,11 +948,10 @@ func TestGlobalTimeReel_TreePruningWithForks(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.GlobalFrame{
@@ -1066,11 +1057,10 @@ func TestGlobalTimeReel_ForkChoiceInsertionOrder(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Drain any existing events
@@ -1227,11 +1217,10 @@ func TestGlobalTimeReel_ForkEventsWithReplay(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Collect all events
@@ -1395,11 +1384,10 @@ func TestGlobalTimeReel_ComprehensiveEquivocation(t *testing.T) {
 	atr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Collect equivocation events
@@ -1529,8 +1517,10 @@ func TestGlobalTimeReel_NonArchive_BootstrapLoadsWindowOf360(t *testing.T) {
 	// Start a new reel in non-archive mode; it should bootstrap only last 360.
 	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
 	require.NoError(t, err)
-	require.NoError(t, tr.Start())
-	defer tr.Stop()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go tr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	head, err := tr.GetHead()
 	require.NoError(t, err)
@@ -1555,8 +1545,10 @@ func TestGlobalTimeReel_NonArchive_SnapForward_WhenGapExceeds360(t *testing.T) {
 
 	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
 	require.NoError(t, err)
-	require.NoError(t, tr.Start())
-	defer tr.Stop()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go tr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	head, err := tr.GetHead()
 	require.NoError(t, err)
@@ -1586,8 +1578,10 @@ func TestGlobalTimeReel_NonArchive_PrunesStore_AsHeadAdvances(t *testing.T) {
 
 	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
 	require.NoError(t, err)
-	require.NoError(t, tr.Start())
-	defer tr.Stop()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go tr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert a contiguous chain via Insert so persistCanonicalFrames runs and
 	// prunes store.
@@ -1622,10 +1616,10 @@ func TestGlobalTimeReel_NonArchive_PendingResolves_WhenParentArrives(t *testing.
 
 	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
 	require.NoError(t, err)
-	require.NoError(t, tr.Start())
-	defer tr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go tr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	var prev *protobufs.GlobalFrame
 	for n := uint64(90); n <= 99; n++ {
@@ -1686,10 +1680,11 @@ func TestGlobalTimeReel_NonArchive_SnapThenAppend_NoSpuriousForks(t *testing.T) 
 
 	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
 	require.NoError(t, err)
-	require.NoError(t, tr.Start())
-	defer tr.Stop()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go tr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
-	ctx := context.Background()
 	eventCh := tr.GetEventCh()
 
 	// Drain any startup/new head events.
@@ -1823,8 +1818,10 @@ func buildAndPersistChain(t *testing.T, s *store.PebbleClockStore, start, end ui
 	// note: needs to be non-archive otherwise insert will only set as pending
 	reel, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
 	require.NoError(t, err)
-	require.NoError(t, reel.Start())
-	defer reel.Stop()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go reel.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	var prev *protobufs.GlobalFrame
 	for n := start; n <= end; n++ {

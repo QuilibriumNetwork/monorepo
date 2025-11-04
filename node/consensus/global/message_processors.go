@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"math/bits"
 	"slices"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -14,6 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
@@ -21,10 +21,11 @@ import (
 
 var keyRegistryDomain = []byte("KEY_REGISTRY")
 
-func (e *GlobalConsensusEngine) processGlobalConsensusMessageQueue() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) processGlobalConsensusMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
+		<-ctx.Done()
 		return
 	}
 
@@ -32,7 +33,7 @@ func (e *GlobalConsensusEngine) processGlobalConsensusMessageQueue() {
 		select {
 		case <-e.haltCtx.Done():
 			return
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case message := <-e.globalConsensusMessageQueue:
 			e.handleGlobalConsensusMessage(message)
@@ -42,14 +43,14 @@ func (e *GlobalConsensusEngine) processGlobalConsensusMessageQueue() {
 	}
 }
 
-func (e *GlobalConsensusEngine) processShardConsensusMessageQueue() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) processShardConsensusMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
 		case <-e.haltCtx.Done():
 			return
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case message := <-e.shardConsensusMessageQueue:
 			e.handleShardConsensusMessage(message)
@@ -57,9 +58,9 @@ func (e *GlobalConsensusEngine) processShardConsensusMessageQueue() {
 	}
 }
 
-func (e *GlobalConsensusEngine) processProverMessageQueue() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) processProverMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
 		return
 	}
@@ -68,7 +69,7 @@ func (e *GlobalConsensusEngine) processProverMessageQueue() {
 		select {
 		case <-e.haltCtx.Done():
 			return
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case message := <-e.globalProverMessageQueue:
 			e.handleProverMessage(message)
@@ -76,14 +77,14 @@ func (e *GlobalConsensusEngine) processProverMessageQueue() {
 	}
 }
 
-func (e *GlobalConsensusEngine) processFrameMessageQueue() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) processFrameMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
 		case <-e.haltCtx.Done():
 			return
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case message := <-e.globalFrameMessageQueue:
 			e.handleFrameMessage(message)
@@ -91,14 +92,14 @@ func (e *GlobalConsensusEngine) processFrameMessageQueue() {
 	}
 }
 
-func (e *GlobalConsensusEngine) processPeerInfoMessageQueue() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) processPeerInfoMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
 		case <-e.haltCtx.Done():
 			return
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case message := <-e.globalPeerInfoMessageQueue:
 			e.handlePeerInfoMessage(message)
@@ -106,12 +107,12 @@ func (e *GlobalConsensusEngine) processPeerInfoMessageQueue() {
 	}
 }
 
-func (e *GlobalConsensusEngine) processAlertMessageQueue() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) processAlertMessageQueue(
+	ctx lifecycle.SignalerContext,
+) {
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case message := <-e.globalAlertMessageQueue:
 			e.handleAlertMessage(message)
@@ -138,14 +139,11 @@ func (e *GlobalConsensusEngine) handleGlobalConsensusMessage(
 	case protobufs.GlobalFrameType:
 		e.handleProposal(message)
 
-	case protobufs.ProverLivenessCheckType:
-		e.handleLivenessCheck(message)
-
-	case protobufs.FrameVoteType:
+	case protobufs.ProposalVoteType:
 		e.handleVote(message)
 
-	case protobufs.FrameConfirmationType:
-		e.handleConfirmation(message)
+	case protobufs.TimeoutStateType:
+		e.handleTimeoutState(message)
 
 	case protobufs.MessageBundleType:
 		e.handleMessageBundle(message)
@@ -174,17 +172,14 @@ func (e *GlobalConsensusEngine) handleShardConsensusMessage(
 	typePrefix := e.peekMessageType(message)
 
 	switch typePrefix {
-	case protobufs.GlobalFrameType:
+	case protobufs.AppShardFrameType:
 		e.handleShardProposal(message)
 
 	case protobufs.ProverLivenessCheckType:
 		e.handleShardLivenessCheck(message)
 
-	case protobufs.FrameVoteType:
+	case protobufs.ProposalVoteType:
 		e.handleShardVote(message)
-
-	case protobufs.FrameConfirmationType:
-		e.handleShardConfirmation(message)
 	}
 }
 
@@ -843,122 +838,11 @@ func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {
 	proposalProcessedTotal.WithLabelValues("success").Inc()
 }
 
-func (e *GlobalConsensusEngine) handleLivenessCheck(message *pb.Message) {
-	timer := prometheus.NewTimer(livenessCheckProcessingDuration)
-	defer timer.ObserveDuration()
-
-	livenessCheck := &protobufs.ProverLivenessCheck{}
-	if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
-		e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Validate the liveness check structure
-	if err := livenessCheck.Validate(); err != nil {
-		e.logger.Debug("invalid liveness check", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	proverSet, err := e.proverRegistry.GetActiveProvers(nil)
-	if err != nil {
-		e.logger.Error("could not receive liveness check", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	var found []byte = nil
-	for _, prover := range proverSet {
-		if bytes.Equal(
-			prover.Address,
-			livenessCheck.PublicKeySignatureBls48581.Address,
-		) {
-			lcBytes, err := livenessCheck.ConstructSignaturePayload()
-			if err != nil {
-				e.logger.Error(
-					"could not construct signature message for liveness check",
-					zap.Error(err),
-				)
-				break
-			}
-			valid, err := e.keyManager.ValidateSignature(
-				crypto.KeyTypeBLS48581G1,
-				prover.PublicKey,
-				lcBytes,
-				livenessCheck.PublicKeySignatureBls48581.Signature,
-				livenessCheck.GetSignatureDomain(),
-			)
-			if err != nil || !valid {
-				e.logger.Error(
-					"could not validate signature for liveness check",
-					zap.Error(err),
-				)
-				break
-			}
-			found = prover.PublicKey
-
-			break
-		}
-	}
-
-	if found == nil {
-		e.logger.Warn(
-			"invalid liveness check",
-			zap.String(
-				"prover",
-				hex.EncodeToString(
-					livenessCheck.PublicKeySignatureBls48581.Address,
-				),
-			),
-		)
-		livenessCheckProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	signatureData, err := livenessCheck.ConstructSignaturePayload()
-	if err != nil {
-		e.logger.Error("invalid signature payload", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	valid, err := e.keyManager.ValidateSignature(
-		crypto.KeyTypeBLS48581G1,
-		found,
-		signatureData,
-		livenessCheck.PublicKeySignatureBls48581.Signature,
-		livenessCheck.GetSignatureDomain(),
-	)
-
-	if err != nil || !valid {
-		e.logger.Error("invalid liveness check signature", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	commitment := GlobalCollectedCommitments{
-		frameNumber:    livenessCheck.FrameNumber,
-		commitmentHash: livenessCheck.CommitmentHash,
-		prover:         livenessCheck.PublicKeySignatureBls48581.Address,
-	}
-	if err := e.stateMachine.ReceiveLivenessCheck(
-		GlobalPeerID{ID: livenessCheck.PublicKeySignatureBls48581.Address},
-		commitment,
-	); err != nil {
-		e.logger.Error("could not receive liveness check", zap.Error(err))
-		livenessCheckProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	livenessCheckProcessedTotal.WithLabelValues("success").Inc()
-}
-
 func (e *GlobalConsensusEngine) handleVote(message *pb.Message) {
 	timer := prometheus.NewTimer(voteProcessingDuration)
 	defer timer.ObserveDuration()
 
-	vote := &protobufs.FrameVote{}
+	vote := &protobufs.ProposalVote{}
 	if err := vote.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal vote", zap.Error(err))
 		voteProcessedTotal.WithLabelValues("error").Inc()
@@ -1078,6 +962,64 @@ func (e *GlobalConsensusEngine) handleVote(message *pb.Message) {
 	voteProcessedTotal.WithLabelValues("success").Inc()
 }
 
+func (e *GlobalConsensusEngine) handleTimeoutState(message *pb.Message) {
+	timer := prometheus.NewTimer(voteProcessingDuration)
+	defer timer.ObserveDuration()
+
+	state := &protobufs.TimeoutState{}
+	if err := state.FromCanonicalBytes(message.Data); err != nil {
+		e.logger.Debug("failed to unmarshal timeout", zap.Error(err))
+		voteProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Validate the vote structure
+	if err := state.Validate(); err != nil {
+		e.logger.Debug("invalid timeout", zap.Error(err))
+		voteProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Validate the voter's signature
+	proverSet, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		e.logger.Error("could not get active provers", zap.Error(err))
+		voteProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Find the voter's public key
+	var voterPublicKey []byte = nil
+	for _, prover := range proverSet {
+		if bytes.Equal(
+			prover.Address,
+			state.Vote.PublicKeySignatureBls48581.Address,
+		) {
+			voterPublicKey = prover.PublicKey
+			break
+		}
+	}
+
+	if voterPublicKey == nil {
+		e.logger.Warn(
+			"invalid vote - voter not found",
+			zap.String(
+				"voter",
+				hex.EncodeToString(
+					state.Vote.PublicKeySignatureBls48581.Address,
+				),
+			),
+		)
+		voteProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Signature is valid, process the vote
+	if err := e.timeoutCollectorDistributor.OnTimeoutProcessed(state)
+
+	voteProcessedTotal.WithLabelValues("success").Inc()
+}
+
 func (e *GlobalConsensusEngine) handleMessageBundle(message *pb.Message) {
 	// MessageBundle messages need to be collected for execution
 	// Store them in pendingMessages to be processed during Collect
@@ -1086,130 +1028,6 @@ func (e *GlobalConsensusEngine) handleMessageBundle(message *pb.Message) {
 	e.pendingMessagesMu.Unlock()
 
 	e.logger.Debug("collected global request for execution")
-}
-
-func (e *GlobalConsensusEngine) handleConfirmation(message *pb.Message) {
-	timer := prometheus.NewTimer(confirmationProcessingDuration)
-	defer timer.ObserveDuration()
-
-	confirmation := &protobufs.FrameConfirmation{}
-	if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
-		e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
-		confirmationProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Validate the confirmation structure
-	if err := confirmation.Validate(); err != nil {
-		e.logger.Debug("invalid confirmation", zap.Error(err))
-		confirmationProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Find the frame with matching selector
-	e.frameStoreMu.RLock()
-	var matchingFrame *protobufs.GlobalFrame
-	for frameID, frame := range e.frameStore {
-		if frame.Header != nil &&
-			frame.Header.FrameNumber == confirmation.FrameNumber &&
-			frameID == string(confirmation.Selector) {
-			matchingFrame = frame
-			break
-		}
-	}
-
-	if matchingFrame == nil {
-		e.frameStoreMu.RUnlock()
-		return
-	}
-
-	e.frameStoreMu.RUnlock()
-	e.frameStoreMu.Lock()
-	defer e.frameStoreMu.Unlock()
-	matchingFrame.Header.PublicKeySignatureBls48581 =
-		confirmation.AggregateSignature
-	valid, err := e.frameValidator.Validate(matchingFrame)
-	if !valid || err != nil {
-		e.logger.Error("received invalid confirmation", zap.Error(err))
-		confirmationProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Check if we already have a confirmation stowed
-	exceeds := false
-	set := 0
-	for _, b := range matchingFrame.Header.PublicKeySignatureBls48581.Bitmask {
-		set += bits.OnesCount8(b)
-		if set > 1 {
-			exceeds = true
-			break
-		}
-	}
-	if exceeds {
-		// Skip the remaining operations
-		return
-	}
-
-	// Extract proposer address from the original frame
-	var proposerAddress []byte
-	frameSignature := matchingFrame.Header.PublicKeySignatureBls48581
-	if frameSignature != nil && frameSignature.PublicKey != nil &&
-		len(frameSignature.PublicKey.KeyValue) > 0 {
-		proposerAddress = e.getAddressFromPublicKey(
-			frameSignature.PublicKey.KeyValue,
-		)
-	} else if frameSignature != nil &&
-		frameSignature.Bitmask != nil {
-		// Extract from bitmask if no public key
-		provers, err := e.proverRegistry.GetActiveProvers(nil)
-		if err == nil {
-			for i := 0; i < len(provers); i++ {
-				byteIndex := i / 8
-				bitIndex := i % 8
-				if byteIndex < len(frameSignature.Bitmask) &&
-					(frameSignature.Bitmask[byteIndex]&(1<<bitIndex)) != 0 {
-					proposerAddress = provers[i].Address
-					break
-				}
-			}
-		}
-	}
-
-	// We may receive multiple confirmations, should be idempotent
-	if bytes.Equal(
-		frameSignature.Signature,
-		confirmation.AggregateSignature.Signature,
-	) {
-		e.logger.Debug("received duplicate confirmation, ignoring")
-		return
-	}
-
-	// Apply confirmation to frame
-	matchingFrame.Header.PublicKeySignatureBls48581 =
-		confirmation.AggregateSignature
-
-	// Send confirmation to state machine
-	if len(proposerAddress) > 0 {
-		if err := e.stateMachine.ReceiveConfirmation(
-			GlobalPeerID{ID: proposerAddress},
-			&matchingFrame,
-		); err != nil {
-			e.logger.Error("could not receive confirmation", zap.Error(err))
-			confirmationProcessedTotal.WithLabelValues("error").Inc()
-			return
-		}
-	}
-	err = e.globalTimeReel.Insert(e.ctx, matchingFrame)
-	if err != nil {
-		e.logger.Error(
-			"could not insert into time reel",
-			zap.Error(err),
-		)
-		confirmationProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	confirmationProcessedTotal.WithLabelValues("success").Inc()
 }
 
 func (e *GlobalConsensusEngine) handleShardProposal(message *pb.Message) {
@@ -1492,83 +1310,6 @@ func (e *GlobalConsensusEngine) handleShardVote(message *pb.Message) {
 	}
 
 	shardVoteProcessedTotal.WithLabelValues("success").Inc()
-}
-
-func (e *GlobalConsensusEngine) handleShardConfirmation(message *pb.Message) {
-	timer := prometheus.NewTimer(shardConfirmationProcessingDuration)
-	defer timer.ObserveDuration()
-
-	confirmation := &protobufs.FrameConfirmation{}
-	if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
-		e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
-		shardConfirmationProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Validate the confirmation structure
-	if err := confirmation.Validate(); err != nil {
-		e.logger.Debug("invalid confirmation", zap.Error(err))
-		shardConfirmationProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	e.appFrameStoreMu.Lock()
-	matchingFrame := e.appFrameStore[string(confirmation.Selector)]
-	e.appFrameStoreMu.Unlock()
-
-	if matchingFrame == nil {
-		e.logger.Error("could not find matching frame")
-		shardConfirmationProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	matchingFrame.Header.PublicKeySignatureBls48581 =
-		confirmation.AggregateSignature
-	valid, err := e.appFrameValidator.Validate(matchingFrame)
-	if !valid || err != nil {
-		e.logger.Error("received invalid confirmation", zap.Error(err))
-		shardConfirmationProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Check if we already have a confirmation stowed
-	exceeds := false
-	set := 0
-	for _, b := range matchingFrame.Header.PublicKeySignatureBls48581.Bitmask {
-		set += bits.OnesCount8(b)
-		if set > 1 {
-			exceeds = true
-			break
-		}
-	}
-	if exceeds {
-		// Skip the remaining operations
-		return
-	}
-
-	e.txLockMu.Lock()
-	if _, ok := e.txLockMap[confirmation.FrameNumber]; !ok {
-		e.txLockMap[confirmation.FrameNumber] = make(
-			map[string]map[string]*LockedTransaction,
-		)
-	}
-	_, ok := e.txLockMap[confirmation.FrameNumber][string(confirmation.Filter)]
-	if !ok {
-		e.txLockMap[confirmation.FrameNumber][string(confirmation.Filter)] =
-			make(map[string]*LockedTransaction)
-	}
-	txSet := e.txLockMap[confirmation.FrameNumber][string(confirmation.Filter)]
-	for _, l := range txSet {
-		for _, p := range slices.Collect(slices.Chunk(l.Prover, 32)) {
-			if bytes.Equal(p, matchingFrame.Header.Prover) {
-				l.Committed = true
-				l.Filled = true
-			}
-		}
-	}
-	e.txLockMu.Unlock()
-
-	shardConfirmationProcessedTotal.WithLabelValues("success").Inc()
 }
 
 func (e *GlobalConsensusEngine) peekMessageType(message *pb.Message) uint32 {

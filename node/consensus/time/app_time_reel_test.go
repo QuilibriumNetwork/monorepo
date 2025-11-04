@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/mocks"
 )
@@ -51,12 +52,10 @@ func TestAppTimeReel_BasicOperations(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
-
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	// Test address getter
 	assert.Equal(t, address, atr.GetAddress())
 
@@ -135,11 +134,10 @@ func TestAppTimeReel_WrongAddress(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Try to insert frame with wrong address
 	wrongFrame := &protobufs.AppShardFrame{
@@ -166,11 +164,10 @@ func TestAppTimeReel_Equivocation(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Subscribe to events
 	eventCh := atr.GetEventCh()
@@ -268,11 +265,10 @@ func TestAppTimeReel_Fork(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.AppShardFrame{
@@ -342,11 +338,10 @@ func TestAppTimeReel_ParentValidation(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.AppShardFrame{
@@ -409,11 +404,10 @@ func TestAppTimeReel_ForkDetection(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Collect events
@@ -492,11 +486,10 @@ func TestAppTimeReel_ForkChoice_MoreSignatures(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Drain any existing events
@@ -603,11 +596,10 @@ func TestAppTimeReel_ForkChoice_NoReplacement(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Drain any existing events
@@ -714,11 +706,10 @@ func TestAppTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, reg, s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Drain any existing events
@@ -1047,11 +1038,10 @@ func TestAppTimeReel_MultipleProvers(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Different provers create frames
 	provers := [][]byte{
@@ -1175,11 +1165,10 @@ func TestAppTimeReel_ComplexForkWithOutOfOrderInsertion(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, proverRegistry, s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Collect all events
@@ -1392,11 +1381,10 @@ func TestAppTimeReel_TreePruning(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.AppShardFrame{
@@ -1481,11 +1469,10 @@ func TestAppTimeReel_TreePruningWithForks(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Insert genesis
 	genesis := &protobufs.AppShardFrame{
@@ -1601,11 +1588,10 @@ func TestAppTimeReel_ForkChoiceInsertionOrder(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, reg, s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Drain any existing events
@@ -1817,11 +1803,10 @@ func TestAppTimeReel_ForkEventsWithReplay(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Collect all events
@@ -2000,11 +1985,10 @@ func TestAppTimeReel_ComprehensiveEquivocation(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, createTestProverRegistry(true), s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Collect equivocation events
@@ -2162,11 +2146,10 @@ func TestAppTimeReel_ProverRegistryForkChoice(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, proverRegistry, s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	eventCh := atr.GetEventCh()
 
 	// Create genesis frame
@@ -2293,11 +2276,10 @@ func TestAppTimeReel_ProverRegistryWithOrderedProvers(t *testing.T) {
 	atr, err := NewAppTimeReel(logger, address, proverRegistry, s, true)
 	require.NoError(t, err)
 
-	err = atr.Start()
-	require.NoError(t, err)
-	defer atr.Stop()
-
-	ctx := context.Background()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go atr.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 
 	// Create genesis frame
 	genesis := &protobufs.AppShardFrame{

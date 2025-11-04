@@ -8,12 +8,12 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/engines"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/compute"
 	hypergraphintrinsic "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/hypergraph"
@@ -33,6 +33,7 @@ import (
 // ExecutionEngineManager manages the lifecycle and coordination of execution
 // engines
 type ExecutionEngineManager struct {
+	builder           lifecycle.ComponentManagerBuilder
 	logger            *zap.Logger
 	config            *config.Config
 	engines           map[string]execution.ShardExecutionEngine
@@ -51,8 +52,6 @@ type ExecutionEngineManager struct {
 	proverRegistry    consensus.ProverRegistry
 	blsConstructor    crypto.BlsConstructor
 	includeGlobal     bool
-	quit              chan struct{}
-	wg                sync.WaitGroup
 }
 
 // NewExecutionEngineManager creates a new execution engine manager
@@ -74,7 +73,7 @@ func NewExecutionEngineManager(
 	blsConstructor crypto.BlsConstructor,
 	includeGlobal bool,
 ) (*ExecutionEngineManager, error) {
-	return &ExecutionEngineManager{
+	em := &ExecutionEngineManager{
 		logger: logger.With(
 			zap.String("component", "execution_manager"),
 		),
@@ -94,8 +93,20 @@ func NewExecutionEngineManager(
 		proverRegistry:    proverRegistry,
 		blsConstructor:    blsConstructor,
 		includeGlobal:     includeGlobal,
-		quit:              make(chan struct{}),
-	}, nil
+	}
+
+	err := em.InitializeEngines()
+	if err != nil {
+		return nil, err
+	}
+
+	em.builder = lifecycle.NewComponentManagerBuilder()
+
+	for _, engine := range em.engines {
+		em.builder.AddWorker(engine.Start)
+	}
+
+	return em, nil
 }
 
 // InitializeEngines creates and registers all execution engines
@@ -146,109 +157,15 @@ func (m *ExecutionEngineManager) InitializeEngines() error {
 }
 
 // StartAll starts all registered execution engines
-func (m *ExecutionEngineManager) StartAll(quit chan struct{}) error {
-	m.enginesMu.RLock()
-	defer m.enginesMu.RUnlock()
-
+func (m *ExecutionEngineManager) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
 	m.logger.Info("starting all execution engines")
-
-	for name, engine := range m.engines {
-		m.wg.Add(1)
-		go func(name string, engine execution.ShardExecutionEngine) {
-			defer m.wg.Done()
-
-			m.logger.Info("starting execution engine", zap.String("engine", name))
-
-			// Start the engine
-			errChan := engine.Start()
-
-			// Wait for any startup errors
-			select {
-			case err := <-errChan:
-				if err != nil {
-					m.logger.Error(
-						"execution engine failed to start",
-						zap.String("engine", name),
-						zap.Error(err),
-					)
-				}
-			case <-time.After(5 * time.Second):
-				// Give engines time to report startup errors
-				m.logger.Info(
-					"execution engine started successfully",
-					zap.String("engine", name),
-				)
-			}
-		}(name, engine)
-	}
-
-	return nil
-}
-
-// StopAll stops all execution engines
-func (m *ExecutionEngineManager) StopAll(force bool) error {
-	m.enginesMu.RLock()
-	defer m.enginesMu.RUnlock()
-
-	m.logger.Info("stopping all execution engines")
-
-	var stopErrors []error
-	stopWg := sync.WaitGroup{}
-
-	for name, engine := range m.engines {
-		stopWg.Add(1)
-		go func(name string, engine execution.ShardExecutionEngine) {
-			defer stopWg.Done()
-
-			m.logger.Info("stopping execution engine", zap.String("engine", name))
-
-			errChan := engine.Stop(force)
-			select {
-			case err := <-errChan:
-				if err != nil && !force {
-					m.logger.Error(
-						"error stopping execution engine",
-						zap.String("engine", name),
-						zap.Error(err),
-					)
-					stopErrors = append(stopErrors, err)
-				}
-			case <-time.After(10 * time.Second):
-				if !force {
-					err := errors.Errorf("timeout stopping engine: %s", name)
-					m.logger.Error(
-						"timeout stopping execution engine",
-						zap.String("engine", name),
-					)
-					stopErrors = append(stopErrors, err)
-				}
-			}
-		}(name, engine)
-	}
-
-	stopWg.Wait()
-
-	if len(stopErrors) > 0 && !force {
-		return errors.Errorf("failed to stop %d engines", len(stopErrors))
-	}
-
-	// Wait for all goroutines to finish
-	done := make(chan struct{})
-	go func() {
-		m.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		m.logger.Info("all execution engines stopped")
-	case <-time.After(30 * time.Second):
-		if !force {
-			return errors.New("timeout waiting for execution engines to stop")
-		}
-	}
-
-	return nil
+	m.builder.Build().Start(ctx)
+	ready()
+	<-ctx.Done()
+	m.logger.Info("all execution engines stopped")
 }
 
 // GetEngine returns a specific execution engine by name
@@ -732,33 +649,6 @@ func (m *ExecutionEngineManager) selectEngine(
 				return engine
 			}
 			return nil
-		}
-	}
-
-	return nil
-}
-
-// RegisterAllEngines registers all engines from the manager with a consensus
-// engine
-func (m *ExecutionEngineManager) RegisterAllEngines(
-	registerFunc func(execution.ShardExecutionEngine, uint64) <-chan error,
-) error {
-	m.enginesMu.RLock()
-	defer m.enginesMu.RUnlock()
-
-	for name, engine := range m.engines {
-		errChan := registerFunc(engine, 0) // frame 0 for initial registration
-		select {
-		case err := <-errChan:
-			if err != nil {
-				return errors.Wrapf(err, "failed to register engine: %s", name)
-			}
-			m.logger.Info(
-				"registered engine with consensus",
-				zap.String("engine", name),
-			)
-		default:
-			// Non-blocking, registration initiated
 		}
 	}
 

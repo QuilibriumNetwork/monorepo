@@ -83,60 +83,20 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		proposalValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 
-	case protobufs.ProverLivenessCheckType:
-		timer := prometheus.NewTimer(
-			livenessCheckValidationDuration.WithLabelValues(e.appAddressHex),
-		)
-		defer timer.ObserveDuration()
-
-		livenessCheck := &protobufs.ProverLivenessCheck{}
-		if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
-			livenessCheckValidationTotal.WithLabelValues(
-				e.appAddressHex,
-				"reject",
-			).Inc()
-			return p2p.ValidationResultReject
-		}
-
-		now := time.Now().UnixMilli()
-		if livenessCheck.Timestamp > now+500 ||
-			livenessCheck.Timestamp < now-1000 {
-			livenessCheckValidationTotal.WithLabelValues(
-				e.appAddressHex,
-				"ignore",
-			).Inc()
-			return p2p.ValidationResultIgnore
-		}
-
-		if err := livenessCheck.Validate(); err != nil {
-			e.logger.Debug("failed to validate liveness check", zap.Error(err))
-			livenessCheckValidationTotal.WithLabelValues(
-				e.appAddressHex,
-				"reject",
-			).Inc()
-			return p2p.ValidationResultReject
-		}
-
-		livenessCheckValidationTotal.WithLabelValues(
-			e.appAddressHex,
-			"accept",
-		).Inc()
-
-	case protobufs.FrameVoteType:
+	case protobufs.ProposalVoteType:
 		timer := prometheus.NewTimer(
 			voteValidationDuration.WithLabelValues(e.appAddressHex),
 		)
 		defer timer.ObserveDuration()
 
-		vote := &protobufs.FrameVote{}
+		vote := &protobufs.ProposalVote{}
 		if err := vote.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal vote", zap.Error(err))
 			voteValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
-		now := time.Now().UnixMilli()
+		now := uint64(time.Now().UnixMilli())
 		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
 			voteValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
@@ -150,41 +110,41 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		voteValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 
-	case protobufs.FrameConfirmationType:
+	case protobufs.TimeoutStateType:
 		timer := prometheus.NewTimer(
-			confirmationValidationDuration.WithLabelValues(e.appAddressHex),
+			timeoutStateValidationDuration.WithLabelValues(e.appAddressHex),
 		)
 		defer timer.ObserveDuration()
 
-		confirmation := &protobufs.FrameConfirmation{}
-		if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
-			confirmationValidationTotal.WithLabelValues(
+		timeoutState := &protobufs.TimeoutState{}
+		if err := timeoutState.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal timeout state", zap.Error(err))
+			timeoutStateValidationTotal.WithLabelValues(
 				e.appAddressHex,
 				"reject",
 			).Inc()
 			return p2p.ValidationResultReject
 		}
 
-		now := time.Now().UnixMilli()
-		if confirmation.Timestamp > now+5000 || confirmation.Timestamp < now-5000 {
-			confirmationValidationTotal.WithLabelValues(
+		now := uint64(time.Now().UnixMilli())
+		if timeoutState.Timestamp > now+5000 || timeoutState.Timestamp < now-5000 {
+			timeoutStateValidationTotal.WithLabelValues(
 				e.appAddressHex,
 				"ignore",
 			).Inc()
 			return p2p.ValidationResultIgnore
 		}
 
-		if err := confirmation.Validate(); err != nil {
-			e.logger.Debug("failed to validate confirmation", zap.Error(err))
-			confirmationValidationTotal.WithLabelValues(
+		if err := timeoutState.Validate(); err != nil {
+			e.logger.Debug("failed to validate timeout state", zap.Error(err))
+			timeoutStateValidationTotal.WithLabelValues(
 				e.appAddressHex,
 				"reject",
 			).Inc()
 			return p2p.ValidationResultReject
 		}
 
-		confirmationValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
+		timeoutStateValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 
 	default:
 		return p2p.ValidationResultReject
