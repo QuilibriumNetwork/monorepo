@@ -11,7 +11,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus/validator"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/voteaggregator"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/votecollector"
-	"source.quilibrium.com/quilibrium/monorepo/node/consensus/global"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
 
@@ -25,7 +24,7 @@ func NewAppShardVoteAggregationDistributor() *pubsub.VoteAggregationDistributor[
 	]()
 }
 
-func NewAppShardVoteAggregator(
+func NewAppShardVoteAggregator[PeerIDT models.Unique](
 	logger consensus.TraceLogger,
 	committee consensus.DynamicCommittee,
 	voteAggregationDistributor *pubsub.VoteAggregationDistributor[
@@ -36,7 +35,7 @@ func NewAppShardVoteAggregator(
 	votingProvider consensus.VotingProvider[
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
-		global.GlobalPeerID,
+		PeerIDT,
 	],
 	currentRank uint64,
 ) (
@@ -46,7 +45,7 @@ func NewAppShardVoteAggregator(
 	voteProcessorFactory := votecollector.NewVoteProcessorFactory[
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
-		global.GlobalPeerID,
+		PeerIDT,
 	](committee, func(qc models.QuorumCertificate) {})
 
 	createCollectorFactoryMethod := votecollector.NewStateMachineFactory(
@@ -55,7 +54,7 @@ func NewAppShardVoteAggregator(
 		votecollector.VerifyingVoteProcessorFactory[
 			*protobufs.AppShardFrame,
 			*protobufs.ProposalVote,
-			global.GlobalPeerID,
+			PeerIDT,
 		](
 			voteProcessorFactory.Create,
 		),
@@ -85,7 +84,7 @@ func NewAppShardTimeoutAggregationDistributor() *pubsub.TimeoutAggregationDistri
 	return pubsub.NewTimeoutAggregationDistributor[*protobufs.ProposalVote]()
 }
 
-func NewAppShardTimeoutAggregator(
+func NewAppShardTimeoutAggregator[PeerIDT models.Unique](
 	logger consensus.TraceLogger,
 	committee consensus.DynamicCommittee,
 	consensusVerifier consensus.Verifier[*protobufs.ProposalVote],
@@ -102,7 +101,7 @@ func NewAppShardTimeoutAggregator(
 	timeoutProcessorFactory := timeoutcollector.NewTimeoutProcessorFactory[
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
-		global.GlobalPeerID,
+		PeerIDT,
 	](
 		logger,
 		signatureAggregator,
@@ -143,7 +142,7 @@ func NewGlobalVoteAggregationDistributor() *pubsub.VoteAggregationDistributor[
 	]()
 }
 
-func NewGlobalVoteAggregator(
+func NewGlobalVoteAggregator[PeerIDT models.Unique](
 	logger consensus.TraceLogger,
 	committee consensus.DynamicCommittee,
 	voteAggregationDistributor *pubsub.VoteAggregationDistributor[
@@ -154,7 +153,7 @@ func NewGlobalVoteAggregator(
 	votingProvider consensus.VotingProvider[
 		*protobufs.GlobalFrame,
 		*protobufs.ProposalVote,
-		global.GlobalPeerID,
+		PeerIDT,
 	],
 	currentRank uint64,
 ) (
@@ -164,7 +163,7 @@ func NewGlobalVoteAggregator(
 	voteProcessorFactory := votecollector.NewVoteProcessorFactory[
 		*protobufs.GlobalFrame,
 		*protobufs.ProposalVote,
-		global.GlobalPeerID,
+		PeerIDT,
 	](committee, func(qc models.QuorumCertificate) {})
 
 	createCollectorFactoryMethod := votecollector.NewStateMachineFactory(
@@ -173,7 +172,7 @@ func NewGlobalVoteAggregator(
 		votecollector.VerifyingVoteProcessorFactory[
 			*protobufs.GlobalFrame,
 			*protobufs.ProposalVote,
-			global.GlobalPeerID,
+			PeerIDT,
 		](
 			voteProcessorFactory.Create,
 		),
@@ -203,7 +202,7 @@ func NewGlobalTimeoutAggregationDistributor() *pubsub.TimeoutAggregationDistribu
 	return pubsub.NewTimeoutAggregationDistributor[*protobufs.ProposalVote]()
 }
 
-func NewGlobalTimeoutAggregator(
+func NewGlobalTimeoutAggregator[PeerIDT models.Unique](
 	logger consensus.TraceLogger,
 	committee consensus.DynamicCommittee,
 	consensusVerifier consensus.Verifier[*protobufs.ProposalVote],
@@ -220,7 +219,7 @@ func NewGlobalTimeoutAggregator(
 	timeoutProcessorFactory := timeoutcollector.NewTimeoutProcessorFactory[
 		*protobufs.GlobalFrame,
 		*protobufs.ProposalVote,
-		global.GlobalPeerID,
+		PeerIDT,
 	](
 		logger,
 		signatureAggregator,

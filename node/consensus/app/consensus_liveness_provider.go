@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"slices"
-	"time"
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -91,7 +90,7 @@ func (p *AppLivenessProvider) Collect(
 	}
 
 	p.engine.collectedMessagesMu.Lock()
-	p.engine.collectedMessages[string(commitment[:32])] = finalizedMessages
+	p.engine.collectedMessages = finalizedMessages
 	p.engine.collectedMessagesMu.Unlock()
 
 	return CollectedCommitments{
@@ -99,77 +98,6 @@ func (p *AppLivenessProvider) Collect(
 		commitmentHash: commitment,
 		prover:         p.engine.getProverAddress(),
 	}, nil
-}
-
-func (p *AppLivenessProvider) SendLiveness(
-	prior **protobufs.AppShardFrame,
-	collected CollectedCommitments,
-	ctx context.Context,
-) error {
-	// Get prover key
-	signer, _, publicKey, _ := p.engine.GetProvingKey(p.engine.config.Engine)
-	if publicKey == nil {
-		return errors.New("no proving key available for liveness check")
-	}
-
-	frameNumber := uint64(0)
-	if prior != nil && (*prior).Header != nil {
-		frameNumber = (*prior).Header.FrameNumber + 1
-	}
-
-	lastProcessed := p.engine.GetFrame()
-	if lastProcessed != nil && lastProcessed.Header.FrameNumber > frameNumber {
-		return errors.New("out of sync, forcing resync")
-	}
-
-	// Create liveness check message
-	livenessCheck := &protobufs.ProverLivenessCheck{
-		Filter:         p.engine.appAddress,
-		FrameNumber:    frameNumber,
-		Timestamp:      time.Now().UnixMilli(),
-		CommitmentHash: collected.commitmentHash,
-	}
-
-	// Sign the message
-	signatureData, err := livenessCheck.ConstructSignaturePayload()
-	if err != nil {
-		return errors.Wrap(err, "send liveness")
-	}
-
-	sig, err := signer.SignWithDomain(
-		signatureData,
-		livenessCheck.GetSignatureDomain(),
-	)
-	if err != nil {
-		return errors.Wrap(err, "send liveness")
-	}
-
-	proverAddress := p.engine.getAddressFromPublicKey(publicKey)
-	livenessCheck.PublicKeySignatureBls48581 =
-		&protobufs.BLS48581AddressedSignature{
-			Address:   proverAddress,
-			Signature: sig,
-		}
-
-	// Serialize using canonical bytes
-	data, err := livenessCheck.ToCanonicalBytes()
-	if err != nil {
-		return errors.Wrap(err, "serialize liveness check")
-	}
-
-	if err := p.engine.pubsub.PublishToBitmask(
-		p.engine.getConsensusMessageBitmask(),
-		data,
-	); err != nil {
-		return errors.Wrap(err, "send liveness")
-	}
-
-	p.engine.logger.Info(
-		"sent liveness check",
-		zap.Uint64("frame_number", frameNumber),
-	)
-
-	return nil
 }
 
 func (p *AppLivenessProvider) validateAndLockMessage(

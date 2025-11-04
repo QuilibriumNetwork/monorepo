@@ -21,9 +21,12 @@ import (
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/forks"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/notifications/pubsub"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/participant"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/validator"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/verification"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/aggregator"
@@ -31,6 +34,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/tracing"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/voting"
 	"source.quilibrium.com/quilibrium/monorepo/node/dispatch"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/manager"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
@@ -97,7 +101,7 @@ type AppConsensusEngine struct {
 	currentDifficultyMu   sync.RWMutex
 	pendingMessages       []*protobufs.Message
 	pendingMessagesMu     sync.RWMutex
-	collectedMessages     map[string][]*protobufs.Message
+	collectedMessages     []*protobufs.Message
 	collectedMessagesMu   sync.RWMutex
 	lastProvenFrameTime   time.Time
 	lastProvenFrameTimeMu sync.RWMutex
@@ -130,12 +134,11 @@ type AppConsensusEngine struct {
 	]
 
 	// Consensus plugins
-	signatureAggregator        consensus.SignatureAggregator
-	voteAggregationDistributor *pubsub.VoteAggregationDistributor[
-		*protobufs.AppShardFrame,
-		*protobufs.ProposalVote,
-	]
+	signatureAggregator         consensus.SignatureAggregator
+	voteCollectorDistributor    *pubsub.VoteCollectorDistributor[*protobufs.ProposalVote]
 	timeoutCollectorDistributor *pubsub.TimeoutCollectorDistributor[*protobufs.ProposalVote]
+	voteAggregator              consensus.VoteAggregator[*protobufs.AppShardFrame, *protobufs.ProposalVote]
+	timeoutAggregator           consensus.TimeoutAggregator[*protobufs.ProposalVote]
 
 	// Provider implementations
 	syncProvider     *AppSyncProvider
@@ -227,7 +230,7 @@ func NewAppConsensusEngine(
 		peerInfoManager:            peerInfoManager,
 		executors:                  make(map[string]execution.ShardExecutionEngine),
 		frameStore:                 make(map[string]*protobufs.AppShardFrame),
-		collectedMessages:          make(map[string][]*protobufs.Message),
+		collectedMessages:          []*protobufs.Message{},
 		consensusMessageQueue:      make(chan *pb.Message, 1000),
 		proverMessageQueue:         make(chan *pb.Message, 1000),
 		frameMessageQueue:          make(chan *pb.Message, 100),
@@ -240,16 +243,22 @@ func NewAppConsensusEngine(
 		alertPublicKey:             []byte{},
 	}
 
+	engine.syncProvider = &AppSyncProvider{engine: engine}
+	engine.votingProvider = &AppVotingProvider{engine: engine}
+	engine.leaderProvider = &AppLeaderProvider{engine: engine}
+	engine.livenessProvider = &AppLivenessProvider{engine: engine}
 	engine.signatureAggregator = aggregator.WrapSignatureAggregator(
 		engine.blsConstructor,
 		engine.proverRegistry,
 		nil,
 	)
-	engine.voteAggregationDistributor = pubsub.NewVoteAggregationDistributor[
-		*protobufs.AppShardFrame,
-		*protobufs.ProposalVote,
-	]()
-	engine.timeoutCollectorDistributor = pubsub.NewTimeoutCollectorDistributor[*protobufs.ProposalVote]()
+	voteAggregationDistributor := voting.NewAppShardVoteAggregationDistributor()
+	engine.voteCollectorDistributor =
+		voteAggregationDistributor.VoteCollectorDistributor
+	timeoutAggregationDistributor :=
+		voting.NewAppShardTimeoutAggregationDistributor()
+	engine.timeoutCollectorDistributor =
+		timeoutAggregationDistributor.TimeoutCollectorDistributor
 
 	if config.Engine.AlertKey != "" {
 		alertPublicKey, err := hex.DecodeString(config.Engine.AlertKey)
@@ -352,11 +361,6 @@ func NewAppConsensusEngine(
 		return nil, errors.Wrap(err, "failed to initialize execution engines")
 	}
 
-	engine.syncProvider = &AppSyncProvider{engine: engine}
-	engine.votingProvider = &AppVotingProvider{engine: engine}
-	engine.leaderProvider = &AppLeaderProvider{engine: engine}
-	engine.livenessProvider = &AppLivenessProvider{engine: engine}
-
 	appTimeReel.SetMaterializeFunc(engine.materialize)
 	appTimeReel.SetRevertFunc(engine.revert)
 
@@ -433,6 +437,26 @@ func NewAppConsensusEngine(
 	if frame != nil {
 		initialState = &frame
 	}
+
+	engine.voteAggregator, err = voting.NewAppShardVoteAggregator[PeerID](
+		tracing.NewZapTracer(logger),
+		engine,
+		voteAggregationDistributor,
+		engine.signatureAggregator,
+		engine.votingProvider,
+		(*initialState).GetRank(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	engine.timeoutAggregator, err = voting.NewAppShardTimeoutAggregator[PeerID](
+		tracing.NewZapTracer(logger),
+		engine,
+		engine,
+		engine.signatureAggregator,
+		timeoutAggregationDistributor,
+		(*initialState).GetRank(),
+	)
 
 	componentBuilder.AddWorker(func(
 		ctx lifecycle.SignalerContext,
@@ -1418,7 +1442,21 @@ func (e *AppConsensusEngine) startConsensus(
 	ctx lifecycle.SignalerContext,
 	ready lifecycle.ReadyFunc,
 ) error {
-	var err error
+	trustedRoot := &models.CertifiedState[*protobufs.AppShardFrame]{
+		State: &models.State[*protobufs.AppShardFrame]{
+			State: initialFrame,
+		},
+	}
+	notifier := pubsub.NewDistributor[
+		*protobufs.AppShardFrame,
+		*protobufs.ProposalVote,
+	]()
+
+	forks, err := forks.NewForks(trustedRoot, e, notifier)
+	if err != nil {
+		return err
+	}
+
 	e.consensusParticipant, err = participant.NewParticipant[
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
@@ -1427,21 +1465,29 @@ func (e *AppConsensusEngine) startConsensus(
 	](
 		tracing.NewZapTracer(e.logger), // logger
 		e,                              // committee
-		e.leaderProvider,               // prover
-		e.votingProvider,               // voter
-		e.consensusStore,               // consensusStore
-		e.signatureAggregator,          // signatureAggregator
-		e,                              // consensusVerifier
-		e.voteAggregationDistributor,   // voteNotifier
-		e.timeoutCollectorDistributor,  // timeoutNotifier
-		e,                              // consumer
-		e,                              // finalizer
-		nil,                            // filter
-		&models.CertifiedState[*protobufs.AppShardFrame]{ // trustedRoot
-			State: &models.State[*protobufs.AppShardFrame]{
-				State: initialFrame,
-			},
-		},
+		verification.NewSigner[
+			*protobufs.AppShardFrame,
+			*protobufs.ProposalVote,
+			PeerID,
+		](e.votingProvider), // signer
+		e.leaderProvider,              // prover
+		e.votingProvider,              // voter
+		notifier,                      // notifier
+		e.consensusStore,              // consensusStore
+		e.signatureAggregator,         // signatureAggregator
+		e,                             // consensusVerifier
+		e.voteCollectorDistributor,    // voteCollectorDistributor
+		e.timeoutCollectorDistributor, // timeoutCollectorDistributor
+		forks,                         // forks
+		validator.NewValidator[
+			*protobufs.AppShardFrame,
+			*protobufs.ProposalVote,
+		](e, e), // validator
+		e.voteAggregator,    // voteAggregator
+		e.timeoutAggregator, // timeoutAggregator
+		e,                   // finalizer
+		nil,                 // filter
+		trustedRoot,
 	)
 	if err != nil {
 		return err
@@ -1751,6 +1797,46 @@ func (e *AppConsensusEngine) VerifyTimeoutCertificate(
 func (e *AppConsensusEngine) VerifyVote(
 	vote **protobufs.ProposalVote,
 ) error {
+	panic("unimplemented")
+}
+
+// IdentitiesByRank implements consensus.DynamicCommittee.
+func (e *AppConsensusEngine) IdentitiesByRank(rank uint64) ([]models.WeightedIdentity, error) {
+	panic("unimplemented")
+}
+
+// IdentitiesByState implements consensus.DynamicCommittee.
+func (e *AppConsensusEngine) IdentitiesByState(stateID models.Identity) ([]models.WeightedIdentity, error) {
+	panic("unimplemented")
+}
+
+// IdentityByRank implements consensus.DynamicCommittee.
+func (e *AppConsensusEngine) IdentityByRank(rank uint64, participantID models.Identity) (models.WeightedIdentity, error) {
+	panic("unimplemented")
+}
+
+// IdentityByState implements consensus.DynamicCommittee.
+func (e *AppConsensusEngine) IdentityByState(stateID models.Identity, participantID models.Identity) (models.WeightedIdentity, error) {
+	panic("unimplemented")
+}
+
+// LeaderForRank implements consensus.DynamicCommittee.
+func (e *AppConsensusEngine) LeaderForRank(rank uint64) (models.Identity, error) {
+	panic("unimplemented")
+}
+
+// QuorumThresholdForRank implements consensus.DynamicCommittee.
+func (e *AppConsensusEngine) QuorumThresholdForRank(rank uint64) (uint64, error) {
+	panic("unimplemented")
+}
+
+// Self implements consensus.DynamicCommittee.
+func (e *AppConsensusEngine) Self() models.Identity {
+	panic("unimplemented")
+}
+
+// TimeoutThresholdForRank implements consensus.DynamicCommittee.
+func (e *AppConsensusEngine) TimeoutThresholdForRank(rank uint64) (uint64, error) {
 	panic("unimplemented")
 }
 

@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -193,7 +194,7 @@ func (e *AppConsensusEngine) handleFrameMessage(message *pb.Message) {
 		e.frameStore[string(frameID)] = frame
 		e.frameStoreMu.Unlock()
 
-		if err := e.appTimeReel.Insert(ctx, frame); err != nil {
+		if err := e.appTimeReel.Insert(e.ctx, frame); err != nil {
 			// Success metric recorded at the end of processing
 			framesProcessedTotal.WithLabelValues("error").Inc()
 			return
@@ -273,7 +274,7 @@ func (e *AppConsensusEngine) handleGlobalFrameMessage(message *pb.Message) {
 			return
 		}
 
-		if err := e.globalTimeReel.Insert(ctx, frame); err != nil {
+		if err := e.globalTimeReel.Insert(e.ctx, frame); err != nil {
 			// Success metric recorded at the end of processing
 			globalFramesProcessedTotal.WithLabelValues("error").Inc()
 			return
@@ -379,7 +380,7 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 		}
 
 		if err := e.dispatchService.AddInboxMessage(
-			ctx,
+			e.ctx,
 			envelope,
 		); err != nil {
 			e.logger.Debug("failed to add inbox message", zap.Error(err))
@@ -392,7 +393,7 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 		}
 
 		if err := e.dispatchService.AddHubInboxAssociation(
-			ctx,
+			e.ctx,
 			envelope,
 		); err != nil {
 			e.logger.Debug("failed to add inbox message", zap.Error(err))
@@ -405,7 +406,7 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 		}
 
 		if err := e.dispatchService.DeleteHubInboxAssociation(
-			ctx,
+			e.ctx,
 			envelope,
 		); err != nil {
 			e.logger.Debug("failed to add inbox message", zap.Error(err))
@@ -449,10 +450,7 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 		e.frameStore[string(frameID)] = frame.Clone().(*protobufs.AppShardFrame)
 		e.frameStoreMu.Unlock()
 
-		e.stateMachine.ReceiveProposal(
-			PeerID{ID: frame.Header.Prover},
-			&frame,
-		)
+		e.consensusParticipant.SubmitProposal()
 		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 	}
 }
@@ -506,64 +504,17 @@ func (e *AppConsensusEngine) handleTimeoutState(message *pb.Message) {
 		return
 	}
 
-	if !bytes.Equal(timeoutState.Filter, e.appAddress) {
+	if !bytes.Equal(timeoutState.Vote.Filter, e.appAddress) {
 		return
 	}
 
-	e.frameStoreMu.RLock()
-	var matchingFrame *protobufs.AppShardFrame
-	for _, frame := range e.frameStore {
-		if frame.Header != nil &&
-			frame.Header.FrameNumber == timeoutState.FrameNumber {
-			frameSelector := e.calculateFrameSelector(frame.Header)
-			if bytes.Equal(frameSelector, timeoutState.Selector) {
-				matchingFrame = frame
-				break
-			}
-		}
-	}
-
-	if matchingFrame == nil {
-		e.frameStoreMu.RUnlock()
-		return
-	}
-
-	e.frameStoreMu.RUnlock()
-	e.frameStoreMu.Lock()
-	defer e.frameStoreMu.Unlock()
-
-	matchingFrame.Header.PublicKeySignatureBls48581 =
-		timeoutState.AggregateSignature
-	valid, err := e.frameValidator.Validate(matchingFrame)
-	if !valid || err != nil {
-		e.logger.Error("received invalid timeoutState", zap.Error(err))
-		timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	if matchingFrame.Header.Prover == nil {
-		e.logger.Error("timeoutState with no matched prover")
-		timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	if err := e.stateMachine.ReceivetimeoutState(
-		PeerID{ID: matchingFrame.Header.Prover},
-		&matchingFrame,
-	); err != nil {
-		e.logger.Error("could not receive timeoutState", zap.Error(err))
-		timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
-
-	if err := e.appTimeReel.Insert(ctx, matchingFrame); err != nil {
-		e.logger.Error(
-			"could not insert into time reel",
-			zap.Error(err),
-		)
-		timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
+	e.timeoutAggregator.AddTimeout(&models.TimeoutState[*protobufs.ProposalVote]{
+		Rank:                        timeoutState.Vote.Rank,
+		LatestQuorumCertificate:     timeoutState.LatestQuorumCertificate,
+		PriorRankTimeoutCertificate: timeoutState.PriorRankTimeoutCertificate,
+		Vote:                        &timeoutState.Vote,
+		TimeoutTick:                 timeoutState.TimeoutTick,
+	})
 
 	timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }

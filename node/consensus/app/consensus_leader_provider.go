@@ -10,6 +10,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
@@ -20,8 +21,8 @@ type AppLeaderProvider struct {
 }
 
 func (p *AppLeaderProvider) GetNextLeaders(
-	prior **protobufs.AppShardFrame,
 	ctx context.Context,
+	prior **protobufs.AppShardFrame,
 ) ([]PeerID, error) {
 	// Get the parent selector for next prover calculation
 	var parentSelector []byte
@@ -60,16 +61,22 @@ func (p *AppLeaderProvider) GetNextLeaders(
 }
 
 func (p *AppLeaderProvider) ProveNextState(
-	prior **protobufs.AppShardFrame,
-	collected CollectedCommitments,
 	ctx context.Context,
+	rank uint64,
+	filter []byte,
+	priorState models.Identity,
 ) (**protobufs.AppShardFrame, error) {
 	timer := prometheus.NewTimer(frameProvingDuration.WithLabelValues(
 		p.engine.appAddressHex,
 	))
 	defer timer.ObserveDuration()
 
-	if prior == nil || *prior == nil {
+	prior, err := p.engine.appTimeReel.GetFrame(priorState)
+	if err != nil {
+		return nil, errors.Wrap(err, "prove next state")
+	}
+
+	if prior == nil {
 		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
 		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
 	}
@@ -97,20 +104,10 @@ func (p *AppLeaderProvider) ProveNextState(
 	}
 
 	// Get collected messages to include in frame
-	p.engine.pendingMessagesMu.RLock()
-	messages := make([]*protobufs.Message, len(p.engine.collectedMessages[string(
-		collected.commitmentHash[:32],
-	)]))
-	copy(messages, p.engine.collectedMessages[string(
-		collected.commitmentHash[:32],
-	)])
-	p.engine.pendingMessagesMu.RUnlock()
-
-	// Clear collected messages after copying
 	p.engine.collectedMessagesMu.Lock()
-	p.engine.collectedMessages[string(
-		collected.commitmentHash[:32],
-	)] = []*protobufs.Message{}
+	messages := make([]*protobufs.Message, len(p.engine.collectedMessages))
+	copy(messages, p.engine.collectedMessages)
+	p.engine.collectedMessages = []*protobufs.Message{}
 	p.engine.collectedMessagesMu.Unlock()
 
 	// Update pending messages metric
@@ -123,7 +120,7 @@ func (p *AppLeaderProvider) ProveNextState(
 	)
 
 	// Prove the frame
-	newFrame, err := p.engine.internalProveFrame(messages, (*prior))
+	newFrame, err := p.engine.internalProveFrame(messages, prior)
 	if err != nil {
 		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
 		return nil, errors.Wrap(err, "prove frame")
@@ -146,3 +143,9 @@ func (p *AppLeaderProvider) ProveNextState(
 
 	return &newFrame, nil
 }
+
+var _ consensus.LeaderProvider[
+	*protobufs.AppShardFrame,
+	PeerID,
+	CollectedCommitments,
+] = (*AppLeaderProvider)(nil)

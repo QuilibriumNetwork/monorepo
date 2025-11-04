@@ -27,9 +27,12 @@ import (
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/forks"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/notifications/pubsub"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/participant"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/validator"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/verification"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/aggregator"
@@ -37,6 +40,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/tracing"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/voting"
 	"source.quilibrium.com/quilibrium/monorepo/node/dispatch"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
@@ -165,12 +169,11 @@ type GlobalConsensusEngine struct {
 	]
 
 	// Consensus plugins
-	signatureAggregator        consensus.SignatureAggregator
-	voteAggregationDistributor *pubsub.VoteAggregationDistributor[
-		*protobufs.GlobalFrame,
-		*protobufs.ProposalVote,
-	]
+	signatureAggregator         consensus.SignatureAggregator
+	voteCollectorDistributor    *pubsub.VoteCollectorDistributor[*protobufs.ProposalVote]
 	timeoutCollectorDistributor *pubsub.TimeoutCollectorDistributor[*protobufs.ProposalVote]
+	voteAggregator              consensus.VoteAggregator[*protobufs.GlobalFrame, *protobufs.ProposalVote]
+	timeoutAggregator           consensus.TimeoutAggregator[*protobufs.ProposalVote]
 
 	// Provider implementations
 	syncProvider     *GlobalSyncProvider
@@ -311,16 +314,23 @@ func NewGlobalConsensusEngine(
 		}
 	}
 
+	// Create provider implementations
+	engine.syncProvider = &GlobalSyncProvider{engine: engine}
+	engine.votingProvider = &GlobalVotingProvider{engine: engine}
+	engine.leaderProvider = &GlobalLeaderProvider{engine: engine}
+	engine.livenessProvider = &GlobalLivenessProvider{engine: engine}
 	engine.signatureAggregator = aggregator.WrapSignatureAggregator(
 		engine.blsConstructor,
 		engine.proverRegistry,
 		nil,
 	)
-	engine.voteAggregationDistributor = pubsub.NewVoteAggregationDistributor[
-		*protobufs.GlobalFrame,
-		*protobufs.ProposalVote,
-	]()
-	engine.timeoutCollectorDistributor = pubsub.NewTimeoutCollectorDistributor[*protobufs.ProposalVote]()
+	voteAggregationDistributor := voting.NewGlobalVoteAggregationDistributor()
+	engine.voteCollectorDistributor =
+		voteAggregationDistributor.VoteCollectorDistributor
+	timeoutAggregationDistributor :=
+		voting.NewGlobalTimeoutAggregationDistributor()
+	engine.timeoutCollectorDistributor =
+		timeoutAggregationDistributor.TimeoutCollectorDistributor
 
 	// Create the worker manager
 	engine.workerManager = mgr.NewWorkerManager(
@@ -378,12 +388,6 @@ func NewGlobalConsensusEngine(
 
 	// Establish alert halt context
 	engine.haltCtx, engine.halt = context.WithCancel(context.Background())
-
-	// Create provider implementations
-	engine.syncProvider = &GlobalSyncProvider{engine: engine}
-	engine.votingProvider = &GlobalVotingProvider{engine: engine}
-	engine.leaderProvider = &GlobalLeaderProvider{engine: engine}
-	engine.livenessProvider = &GlobalLivenessProvider{engine: engine}
 
 	// Create dispatch service
 	engine.dispatchService = dispatch.NewDispatchService(
@@ -488,6 +492,26 @@ func NewGlobalConsensusEngine(
 	if frame != nil {
 		initialState = &frame
 	}
+
+	engine.voteAggregator, err = voting.NewGlobalVoteAggregator[GlobalPeerID](
+		tracing.NewZapTracer(logger),
+		engine,
+		voteAggregationDistributor,
+		engine.signatureAggregator,
+		engine.votingProvider,
+		(*initialState).GetRank(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	engine.timeoutAggregator, err = voting.NewAppShardTimeoutAggregator[GlobalPeerID](
+		tracing.NewZapTracer(logger),
+		engine,
+		engine,
+		engine.signatureAggregator,
+		timeoutAggregationDistributor,
+		(*initialState).GetRank(),
+	)
 
 	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
 		componentBuilder.AddWorker(func(
@@ -2308,7 +2332,21 @@ func (e *GlobalConsensusEngine) startConsensus(
 	ctx lifecycle.SignalerContext,
 	ready lifecycle.ReadyFunc,
 ) error {
-	var err error
+	trustedRoot := &models.CertifiedState[*protobufs.GlobalFrame]{
+		State: &models.State[*protobufs.GlobalFrame]{
+			State: initialFrame,
+		},
+	}
+	notifier := pubsub.NewDistributor[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]()
+
+	forks, err := forks.NewForks(trustedRoot, e, notifier)
+	if err != nil {
+		return err
+	}
+
 	e.consensusParticipant, err = participant.NewParticipant[
 		*protobufs.GlobalFrame,
 		*protobufs.ProposalVote,
@@ -2317,27 +2355,36 @@ func (e *GlobalConsensusEngine) startConsensus(
 	](
 		tracing.NewZapTracer(e.logger), // logger
 		e,                              // committee
-		e.leaderProvider,               // prover
-		e.votingProvider,               // voter
-		e.consensusStore,               // consensusStore
-		e.signatureAggregator,          // signatureAggregator
-		e,                              // consensusVerifier
-		e.voteAggregationDistributor,   // voteNotifier
-		e.timeoutCollectorDistributor,  // timeoutNotifier
-		e,                              // consumer
-		e,                              // finalizer
-		nil,                            // filter
-		&models.CertifiedState[*protobufs.GlobalFrame]{ // trustedRoot
-			State: &models.State[*protobufs.GlobalFrame]{
-				State: initialFrame,
-			},
-		},
+		verification.NewSigner[
+			*protobufs.GlobalFrame,
+			*protobufs.ProposalVote,
+			GlobalPeerID,
+		](e.votingProvider), // signer
+		e.leaderProvider,              // prover
+		e.votingProvider,              // voter
+		notifier,                      // notifier
+		e.consensusStore,              // consensusStore
+		e.signatureAggregator,         // signatureAggregator
+		e,                             // consensusVerifier
+		e.voteCollectorDistributor,    // voteCollectorDistributor
+		e.timeoutCollectorDistributor, // timeoutCollectorDistributor
+		forks,                         // forks
+		validator.NewValidator[
+			*protobufs.GlobalFrame,
+			*protobufs.ProposalVote,
+		](e, e), // validator
+		e.voteAggregator,    // voteAggregator
+		e.timeoutAggregator, // timeoutAggregator
+		e,                   // finalizer
+		nil,                 // filter
+		trustedRoot,
 	)
 	if err != nil {
 		return err
 	}
 
-	e.consensusParticipant.Start(e.ctx)
+	ready()
+	e.consensusParticipant.Start(ctx)
 	return nil
 }
 
