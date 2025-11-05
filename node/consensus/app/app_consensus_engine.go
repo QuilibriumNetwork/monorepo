@@ -356,11 +356,6 @@ func NewAppConsensusEngine(
 		ps,
 	)
 
-	// Initialize execution engines
-	if err := engine.executionManager.InitializeEngines(); err != nil {
-		return nil, errors.Wrap(err, "failed to initialize execution engines")
-	}
-
 	appTimeReel.SetMaterializeFunc(engine.materialize)
 	appTimeReel.SetRevertFunc(engine.revert)
 

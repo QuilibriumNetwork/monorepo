@@ -34,6 +34,11 @@ func NewForks[StateT models.Unique, VoteT models.Unique](
 	finalizationCallback consensus.Finalizer,
 	notifier consensus.FollowerConsumer[StateT, VoteT],
 ) (*Forks[StateT, VoteT], error) {
+	if trustedRoot == nil {
+		return nil,
+			models.NewConfigurationErrorf("invalid root: root is nil")
+	}
+
 	if (trustedRoot.State.Identifier != trustedRoot.CertifyingQuorumCertificate.Identity()) ||
 		(trustedRoot.State.Rank != trustedRoot.CertifyingQuorumCertificate.GetRank()) {
 		return nil,

@@ -380,11 +380,11 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 		LatestQuorumCertificate: rootQC,
 	}
 
-	in.persist.On("GetLivenessState").Return(livenessData, nil).Once()
+	in.persist.On("GetLivenessState", mock.Anything).Return(livenessData, nil).Once()
 
 	// initialize the pacemaker
 	controller := timeout.NewController(cfg.Timeouts)
-	in.pacemaker, err = pacemaker.NewPacemaker[*helper.TestState, *helper.TestVote](controller, pacemaker.NoProposalDelay(), notifier, in.persist, in.logger)
+	in.pacemaker, err = pacemaker.NewPacemaker[*helper.TestState, *helper.TestVote](nil, controller, pacemaker.NoProposalDelay(), notifier, in.persist, in.logger)
 	require.NoError(t, err)
 
 	// initialize the forks handler
@@ -580,7 +580,7 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 	in.persist.On("GetConsensusState", mock.Anything).Return(safetyData, nil).Once()
 
 	// initialize the safety rules
-	in.safetyRules, err = safetyrules.NewSafetyRules(in.signer, in.persist, in.committee)
+	in.safetyRules, err = safetyrules.NewSafetyRules(nil, in.signer, in.persist, in.committee)
 	require.NoError(t, err)
 
 	// initialize the state producer

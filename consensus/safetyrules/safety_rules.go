@@ -42,12 +42,13 @@ var _ consensus.SafetyRules[*nilUnique, *nilUnique] = (*SafetyRules[*nilUnique, 
 
 // NewSafetyRules creates a new SafetyRules instance
 func NewSafetyRules[StateT models.Unique, VoteT models.Unique](
+	filter []byte,
 	signer consensus.Signer[StateT, VoteT],
 	store consensus.ConsensusStore[VoteT],
 	committee consensus.DynamicCommittee,
 ) (*SafetyRules[StateT, VoteT], error) {
 	// get the last stored safety data
-	consensusState, err := store.GetConsensusState()
+	consensusState, err := store.GetConsensusState(filter)
 	if err != nil {
 		return nil, fmt.Errorf("could not load safety data: %w", err)
 	}
@@ -330,7 +331,11 @@ func (r *SafetyRules[StateT, VoteT]) SignOwnProposal(
 ) (*VoteT, error) {
 	// check that the state is created by us
 	if unsignedProposal.State.ProposerID != r.committee.Self() {
-		return nil, fmt.Errorf("can't sign proposal for someone else's state")
+		return nil, fmt.Errorf(
+			"can't sign proposal for someone else's state, proposer: %x, self: %x",
+			unsignedProposal.State.ProposerID,
+			r.committee.Self(),
+		)
 	}
 
 	return r.produceVote(unsignedProposal, unsignedProposal.State.Rank)
@@ -480,7 +485,9 @@ func (r *SafetyRules[StateT, VoteT]) validateEvidenceForEnteringRank(
 	// Condition 4:
 	if previousRankTimeoutCert == nil {
 		return fmt.Errorf(
-			"expecting TC because QC is not for prior rank; but didn't get any TC",
+			"expecting TC because QC (%d) is not for prior rank (%d - 1); but didn't get any TC",
+			newestQC.GetRank(),
+			rank,
 		)
 	}
 	if previousRankTimeoutCert.GetRank()+1 != rank {

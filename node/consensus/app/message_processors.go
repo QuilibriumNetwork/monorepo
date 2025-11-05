@@ -140,7 +140,7 @@ func (e *AppConsensusEngine) handleConsensusMessage(message *pb.Message) {
 
 	typePrefix := e.peekMessageType(message)
 	switch typePrefix {
-	case protobufs.AppShardFrameType:
+	case protobufs.AppShardProposalType:
 		e.handleProposal(message)
 
 	case protobufs.ProposalVoteType:
@@ -426,15 +426,16 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 	)
 	defer timer.ObserveDuration()
 
-	frame := &protobufs.AppShardFrame{}
-	if err := frame.FromCanonicalBytes(message.Data); err != nil {
-		e.logger.Debug("failed to unmarshal frame", zap.Error(err))
+	proposal := &protobufs.AppShardProposal{}
+	if err := proposal.FromCanonicalBytes(message.Data); err != nil {
+		e.logger.Debug("failed to unmarshal proposal", zap.Error(err))
 		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if frame.Header != nil && frame.Header.Prover != nil {
-		valid, err := e.frameValidator.Validate(frame)
+	if proposal.State != nil && proposal.State.Header != nil &&
+		proposal.State.Header.Prover != nil {
+		valid, err := e.frameValidator.Validate(proposal.State)
 		if !valid || err != nil {
 			e.logger.Error("received invalid frame", zap.Error(err))
 			proposalProcessedTotal.WithLabelValues(
@@ -444,13 +445,29 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 			return
 		}
 
-		frameIDBI, _ := poseidon.HashBytes(frame.Header.Output)
+		frameIDBI, _ := poseidon.HashBytes(proposal.State.Header.Output)
 		frameID := frameIDBI.FillBytes(make([]byte, 32))
 		e.frameStoreMu.Lock()
-		e.frameStore[string(frameID)] = frame.Clone().(*protobufs.AppShardFrame)
+		e.frameStore[string(frameID)] =
+			proposal.State.Clone().(*protobufs.AppShardFrame)
 		e.frameStoreMu.Unlock()
 
-		e.consensusParticipant.SubmitProposal()
+		e.consensusParticipant.SubmitProposal(
+			&models.SignedProposal[*protobufs.AppShardFrame, *protobufs.ProposalVote]{
+				Proposal: models.Proposal[*protobufs.AppShardFrame]{
+					State: &models.State[*protobufs.AppShardFrame]{
+						Rank:                    proposal.State.GetRank(),
+						Identifier:              proposal.State.Identity(),
+						ProposerID:              proposal.Vote.Identity(),
+						ParentQuorumCertificate: proposal.ParentQuorumCertificate,
+						Timestamp:               proposal.State.GetTimestamp(),
+						State:                   &proposal.State,
+					},
+					PreviousRankTimeoutCertificate: proposal.PriorRankTimeoutCertificate,
+				},
+				Vote: &proposal.Vote,
+			},
+		)
 		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 	}
 }
@@ -478,15 +495,7 @@ func (e *AppConsensusEngine) handleVote(message *pb.Message) {
 		return
 	}
 
-	if err := e.stateMachine.ReceiveVote(
-		PeerID{ID: vote.Proposer},
-		PeerID{ID: vote.PublicKeySignatureBls48581.Address},
-		&vote,
-	); err != nil {
-		e.logger.Error("could not receive vote", zap.Error(err))
-		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		return
-	}
+	e.voteAggregator.AddVote(&vote)
 
 	voteProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }

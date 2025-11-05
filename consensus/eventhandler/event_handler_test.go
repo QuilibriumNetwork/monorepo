@@ -49,7 +49,7 @@ func NewTestPacemaker[
 	notifier consensus.Consumer[StateT, VoteT],
 	store consensus.ConsensusStore[VoteT],
 ) *TestPacemaker[StateT, VoteT, PeerIDT, CollectedT] {
-	p, err := pacemaker.NewPacemaker[StateT, VoteT](timeoutController, proposalDelayProvider, notifier, store, helper.Logger())
+	p, err := pacemaker.NewPacemaker[StateT, VoteT](nil, timeoutController, proposalDelayProvider, notifier, store, helper.Logger())
 	if err != nil {
 		panic(err)
 	}
@@ -114,7 +114,7 @@ func initPacemaker(t require.TestingT, ctx context.Context, livenessData *models
 	require.NoError(t, err)
 	persist := &mocks.ConsensusStore[*helper.TestVote]{}
 	persist.On("PutLivenessState", mock.Anything).Return(nil).Maybe()
-	persist.On("GetLivenessState").Return(livenessData, nil).Once()
+	persist.On("GetLivenessState", mock.Anything).Return(livenessData, nil).Once()
 	pm := NewTestPacemaker[*helper.TestState, *helper.TestVote, *helper.TestPeer, *helper.TestCollected](timeout.NewController(tc), pacemaker.NoProposalDelay(), notifier, persist)
 	notifier.On("OnStartingTimeout", mock.Anything, mock.Anything).Return()
 	notifier.On("OnQuorumCertificateTriggeredRankChange", mock.Anything, mock.Anything, mock.Anything).Return()

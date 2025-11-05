@@ -215,6 +215,28 @@ message ProverLivenessCheck {
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 6;
 }
 
+message AppShardProposal {
+  // The associated state for the proposal
+  AppShardFrame state = 1;
+  // The parent quorum certificate to this state
+  QuorumCertificate parent_quorum_certificate = 2;
+  // The previous rank's timeout certificate, if applicable
+  TimeoutCertificate prior_rank_timeout_certificate = 3;
+  // The proposer's vote
+  ProposalVote vote = 4;
+}
+
+message GlobalProposal {
+  // The associated state for the proposal
+  GlobalFrame state = 1;
+  // The parent quorum certificate to this state
+  QuorumCertificate parent_quorum_certificate = 2;
+  // The previous rank's timeout certificate, if applicable
+  TimeoutCertificate prior_rank_timeout_certificate = 3;
+  // The proposer's vote
+  ProposalVote vote = 4;
+}
+
 message ProposalVote {
   // The filter for the prover's commitment in the trie
   bytes filter = 1;

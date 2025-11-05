@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"math/big"
+	"slices"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/pkg/errors"
@@ -28,12 +29,48 @@ type PebbleGlobalClockIterator struct {
 }
 
 type PebbleClockIterator struct {
+	filter []byte
+	start  uint64
+	end    uint64
+	cur    uint64
+	db     *PebbleClockStore
+}
+
+type PebbleGlobalStateIterator struct {
 	i  store.Iterator
 	db *PebbleClockStore
 }
 
+type PebbleAppShardStateIterator struct {
+	filter []byte
+	start  uint64
+	end    uint64
+	cur    uint64
+	db     *PebbleClockStore
+}
+
+type PebbleQuorumCertificateIterator struct {
+	filter []byte
+	start  uint64
+	end    uint64
+	cur    uint64
+	db     *PebbleClockStore
+}
+
+type PebbleTimeoutCertificateIterator struct {
+	filter []byte
+	start  uint64
+	end    uint64
+	cur    uint64
+	db     *PebbleClockStore
+}
+
 var _ store.TypedIterator[*protobufs.GlobalFrame] = (*PebbleGlobalClockIterator)(nil)
 var _ store.TypedIterator[*protobufs.AppShardFrame] = (*PebbleClockIterator)(nil)
+var _ store.TypedIterator[*protobufs.GlobalProposal] = (*PebbleGlobalStateIterator)(nil)
+var _ store.TypedIterator[*protobufs.AppShardProposal] = (*PebbleAppShardStateIterator)(nil)
+var _ store.TypedIterator[*protobufs.QuorumCertificate] = (*PebbleQuorumCertificateIterator)(nil)
+var _ store.TypedIterator[*protobufs.TimeoutCertificate] = (*PebbleTimeoutCertificateIterator)(nil)
 
 func (p *PebbleGlobalClockIterator) First() bool {
 	return p.i.First()
@@ -129,71 +166,265 @@ func (p *PebbleGlobalClockIterator) Close() error {
 }
 
 func (p *PebbleClockIterator) First() bool {
-	return p.i.First()
+	p.cur = p.start
+	return true
 }
 
 func (p *PebbleClockIterator) Next() bool {
-	return p.i.Next()
+	p.cur++
+	return p.cur < p.end
 }
 
 func (p *PebbleClockIterator) Prev() bool {
-	return p.i.Prev()
+	p.cur--
+	return p.cur >= p.start
 }
 
 func (p *PebbleClockIterator) Valid() bool {
-	return p.i.Valid()
+	return p.cur >= p.start && p.cur < p.end
 }
 
 func (p *PebbleClockIterator) TruncatedValue() (
 	*protobufs.AppShardFrame,
 	error,
 ) {
-	if !p.i.Valid() {
+	if !p.Valid() {
 		return nil, store.ErrNotFound
 	}
 
-	value := p.i.Value()
-	frame := &protobufs.AppShardFrame{}
-	frameValue, frameCloser, err := p.db.db.Get(value)
-	if err != nil {
-		return nil, errors.Wrap(err, "get truncated clock frame iterator value")
-	}
-	defer frameCloser.Close()
-	if err := proto.Unmarshal(frameValue, frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, store.ErrInvalidData.Error()),
-			"get truncated clock frame iterator value",
-		)
-	}
-
-	return frame, nil
+	return p.Value()
 }
 
 func (p *PebbleClockIterator) Value() (*protobufs.AppShardFrame, error) {
-	if !p.i.Valid() {
+	if !p.Valid() {
 		return nil, store.ErrNotFound
 	}
 
-	value := p.i.Value()
-	frame := &protobufs.AppShardFrame{}
-
-	frameValue, frameCloser, err := p.db.db.Get(value)
+	frame, _, err := p.db.GetShardClockFrame(p.filter, p.cur, false)
 	if err != nil {
 		return nil, errors.Wrap(err, "get clock frame iterator value")
-	}
-	defer frameCloser.Close()
-	if err := proto.Unmarshal(frameValue, frame); err != nil {
-		return nil, errors.Wrap(
-			errors.Wrap(err, store.ErrInvalidData.Error()),
-			"get clock frame iterator value",
-		)
 	}
 
 	return frame, nil
 }
 
 func (p *PebbleClockIterator) Close() error {
-	return errors.Wrap(p.i.Close(), "closing clock frame iterator")
+	return nil
+}
+
+func (p *PebbleGlobalStateIterator) First() bool {
+	return p.i.First()
+}
+
+func (p *PebbleGlobalStateIterator) Next() bool {
+	return p.i.Next()
+}
+
+func (p *PebbleGlobalStateIterator) Prev() bool {
+	return p.i.Prev()
+}
+
+func (p *PebbleGlobalStateIterator) Valid() bool {
+	return p.i.Valid()
+}
+
+func (p *PebbleGlobalStateIterator) Value() (
+	*protobufs.GlobalProposal,
+	error,
+) {
+	if !p.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	value := p.i.Value()
+	if len(value) != 24 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get certified global state",
+		)
+	}
+
+	frameNumber := binary.BigEndian.Uint64(value[:8])
+	qcRank := binary.BigEndian.Uint64(value[8:16])
+	tcRank := binary.BigEndian.Uint64(value[16:])
+
+	frame, err := p.db.GetGlobalClockFrame(frameNumber)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified global state")
+	}
+
+	qc, err := p.db.GetQuorumCertificate(nil, qcRank)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified global state")
+	}
+
+	tc, err := p.db.GetTimeoutCertificate(nil, tcRank)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified global state")
+	}
+
+	return &protobufs.GlobalProposal{
+		State:                       frame,
+		ParentQuorumCertificate:     qc,
+		PriorRankTimeoutCertificate: tc,
+	}, nil
+}
+
+func (p *PebbleGlobalStateIterator) TruncatedValue() (
+	*protobufs.GlobalProposal,
+	error,
+) {
+	return p.Value()
+}
+
+func (p *PebbleGlobalStateIterator) Close() error {
+	return p.i.Close()
+}
+
+func (p *PebbleAppShardStateIterator) First() bool {
+	p.cur = p.start
+	return true
+}
+
+func (p *PebbleAppShardStateIterator) Next() bool {
+	p.cur++
+	return p.cur < p.end
+}
+
+func (p *PebbleAppShardStateIterator) Prev() bool {
+	p.cur--
+	return p.cur >= p.start
+}
+
+func (p *PebbleAppShardStateIterator) Valid() bool {
+	return p.cur >= p.start && p.cur < p.end
+}
+
+func (p *PebbleAppShardStateIterator) Close() error {
+	return nil
+}
+
+func (p *PebbleAppShardStateIterator) Value() (
+	*protobufs.AppShardProposal,
+	error,
+) {
+	if !p.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	state, err := p.db.GetCertifiedAppShardState(p.filter, p.cur)
+	if err != nil {
+		return nil, errors.Wrap(err, "get app shard state iterator value")
+	}
+
+	return state, nil
+}
+
+func (p *PebbleAppShardStateIterator) TruncatedValue() (
+	*protobufs.AppShardProposal,
+	error,
+) {
+	if !p.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	return p.Value()
+}
+
+func (p *PebbleQuorumCertificateIterator) First() bool {
+	p.cur = p.start
+	return true
+}
+
+func (p *PebbleQuorumCertificateIterator) Next() bool {
+	p.cur++
+	return p.cur < p.end
+}
+
+func (p *PebbleQuorumCertificateIterator) Prev() bool {
+	p.cur--
+	return p.cur >= p.start
+}
+
+func (p *PebbleQuorumCertificateIterator) Valid() bool {
+	return p.cur >= p.start && p.cur < p.end
+}
+
+func (p *PebbleQuorumCertificateIterator) Close() error {
+	return nil
+}
+
+func (p *PebbleQuorumCertificateIterator) Value() (
+	*protobufs.QuorumCertificate,
+	error,
+) {
+	if !p.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	qc, err := p.db.GetQuorumCertificate(p.filter, p.cur)
+	if err != nil {
+		return nil, errors.Wrap(err, "get quorum certificate iterator value")
+	}
+
+	return qc, nil
+}
+
+func (p *PebbleQuorumCertificateIterator) TruncatedValue() (
+	*protobufs.QuorumCertificate,
+	error,
+) {
+	return p.Value()
+}
+
+func (p *PebbleTimeoutCertificateIterator) First() bool {
+	p.cur = p.start
+	return true
+}
+
+func (p *PebbleTimeoutCertificateIterator) Next() bool {
+	p.cur++
+	return p.cur < p.end
+}
+
+func (p *PebbleTimeoutCertificateIterator) Prev() bool {
+	p.cur--
+	return p.cur >= p.start
+}
+
+func (p *PebbleTimeoutCertificateIterator) Valid() bool {
+	return p.cur >= p.start && p.cur < p.end
+}
+
+func (p *PebbleTimeoutCertificateIterator) Close() error {
+	return nil
+}
+
+func (p *PebbleTimeoutCertificateIterator) Value() (
+	*protobufs.TimeoutCertificate,
+	error,
+) {
+	if !p.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	tc, err := p.db.GetTimeoutCertificate(p.filter, p.cur)
+	if err != nil {
+		return nil, errors.Wrap(err, "get timeout certificate iterator value")
+	}
+
+	return tc, nil
+}
+
+func (p *PebbleTimeoutCertificateIterator) TruncatedValue() (
+	*protobufs.TimeoutCertificate,
+	error,
+) {
+	if !p.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	return p.Value()
 }
 
 func NewPebbleClockStore(db store.KVDB, logger *zap.Logger) *PebbleClockStore {
@@ -201,6 +432,50 @@ func NewPebbleClockStore(db store.KVDB, logger *zap.Logger) *PebbleClockStore {
 		db,
 		logger,
 	}
+}
+
+func (p *PebbleClockStore) updateEarliestIndex(
+	txn store.Transaction,
+	key []byte,
+	rank uint64,
+) error {
+	existing, closer, err := p.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return txn.Set(
+				key,
+				binary.BigEndian.AppendUint64(nil, rank),
+			)
+		}
+		return err
+	}
+	defer closer.Close()
+
+	if len(existing) != 8 {
+		return errors.Wrap(
+			store.ErrInvalidData,
+			"earliest index contained unexpected length",
+		)
+	}
+
+	if binary.BigEndian.Uint64(existing) > rank {
+		return txn.Set(
+			key,
+			binary.BigEndian.AppendUint64(nil, rank),
+		)
+	}
+
+	return nil
+}
+
+func deleteIfExists(txn store.Transaction, key []byte) error {
+	if err := txn.Delete(key); err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 //
@@ -211,9 +486,6 @@ func NewPebbleClockStore(db store.KVDB, logger *zap.Logger) *PebbleClockStore {
 // Increment necessarily must be full width – elsewise the frame number would
 // easily produce conflicts if filters are stepped by byte:
 // 0x01 || 0xffff == 0x01ff || 0xff
-//
-// Global frames are serialized as output data only, Data frames are raw
-// protobufs for fast disk-to-network output.
 
 func clockFrameKey(filter []byte, frameNumber uint64, frameType byte) []byte {
 	key := []byte{CLOCK_FRAME, frameType}
@@ -276,6 +548,82 @@ func clockDataEarliestIndex(filter []byte) []byte {
 	return clockEarliestIndex(filter, CLOCK_SHARD_FRAME_INDEX_EARLIEST)
 }
 
+func clockGlobalCertifiedStateEarliestIndex() []byte {
+	return []byte{CLOCK_FRAME, CLOCK_GLOBAL_CERTIFIED_STATE_INDEX_EARLIEST}
+}
+
+func clockShardCertifiedStateEarliestIndex(filter []byte) []byte {
+	return slices.Concat(
+		[]byte{CLOCK_FRAME, CLOCK_SHARD_CERTIFIED_STATE_INDEX_EARLIEST},
+		filter,
+	)
+}
+
+func clockGlobalCertifiedStateLatestIndex() []byte {
+	return []byte{CLOCK_FRAME, CLOCK_GLOBAL_CERTIFIED_STATE_INDEX_LATEST}
+}
+
+func clockShardCertifiedStateLatestIndex(filter []byte) []byte {
+	return slices.Concat(
+		[]byte{CLOCK_FRAME, CLOCK_SHARD_CERTIFIED_STATE_INDEX_LATEST},
+		filter,
+	)
+}
+
+func clockGlobalCertifiedStateKey(rank uint64) []byte {
+	key := []byte{CLOCK_FRAME, CLOCK_GLOBAL_CERTIFIED_STATE}
+	key = binary.BigEndian.AppendUint64(key, rank)
+	return key
+}
+
+func clockShardCertifiedStateKey(rank uint64, filter []byte) []byte {
+	key := []byte{CLOCK_FRAME, CLOCK_SHARD_CERTIFIED_STATE}
+	key = binary.BigEndian.AppendUint64(key, rank)
+	key = append(key, filter...)
+	return key
+}
+
+func clockQuorumCertificateKey(rank uint64, filter []byte) []byte {
+	key := []byte{CLOCK_FRAME, CLOCK_QUORUM_CERTIFICATE}
+	key = binary.BigEndian.AppendUint64(key, rank)
+	return key
+}
+
+func clockQuorumCertificateEarliestIndex(filter []byte) []byte {
+	return slices.Concat(
+		[]byte{CLOCK_FRAME, CLOCK_QUORUM_CERTIFICATE_INDEX_EARLIEST},
+		filter,
+	)
+}
+
+func clockQuorumCertificateLatestIndex(filter []byte) []byte {
+	return slices.Concat(
+		[]byte{CLOCK_FRAME, CLOCK_QUORUM_CERTIFICATE_INDEX_LATEST},
+		filter,
+	)
+}
+
+func clockTimeoutCertificateKey(rank uint64, filter []byte) []byte {
+	key := []byte{CLOCK_FRAME, CLOCK_TIMEOUT_CERTIFICATE}
+	key = binary.BigEndian.AppendUint64(key, rank)
+	key = append(key, filter...)
+	return key
+}
+
+func clockTimeoutCertificateEarliestIndex(filter []byte) []byte {
+	return slices.Concat(
+		[]byte{CLOCK_FRAME, CLOCK_TIMEOUT_CERTIFICATE_INDEX_EARLIEST},
+		filter,
+	)
+}
+
+func clockTimeoutCertificateLatestIndex(filter []byte) []byte {
+	return slices.Concat(
+		[]byte{CLOCK_FRAME, CLOCK_TIMEOUT_CERTIFICATE_INDEX_LATEST},
+		filter,
+	)
+}
+
 // Produces an index key of size: len(filter) + 42
 func clockParentIndexKey(
 	filter []byte,
@@ -302,20 +650,6 @@ func clockShardParentIndexKey(
 		CLOCK_SHARD_FRAME_INDEX_PARENT,
 	)
 }
-
-// func clockShardCandidateFrameKey(
-// 	address []byte,
-// 	frameNumber uint64,
-// 	parent []byte,
-// 	distance []byte,
-// ) []byte {
-// 	key := []byte{CLOCK_FRAME, CLOCK_SHARD_FRAME_CANDIDATE_SHARD}
-// 	key = binary.BigEndian.AppendUint64(key, frameNumber)
-// 	key = append(key, address...)
-// 	key = append(key, rightAlign(parent, 32)...)
-// 	key = append(key, rightAlign(distance, 32)...)
-// 	return key
-// }
 
 func clockProverTrieKey(filter []byte, ring uint16, frameNumber uint64) []byte {
 	key := []byte{CLOCK_FRAME, CLOCK_SHARD_FRAME_FRECENCY_SHARD}
@@ -858,15 +1192,13 @@ func (p *PebbleClockStore) RangeShardClockFrames(
 		startFrameNumber = temp
 	}
 
-	iter, err := p.db.NewIter(
-		clockShardFrameKey(filter, startFrameNumber),
-		clockShardFrameKey(filter, endFrameNumber+1),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "get shard clock frames")
-	}
-
-	return &PebbleClockIterator{i: iter, db: p}, nil
+	return &PebbleClockIterator{
+		filter: filter,
+		start:  startFrameNumber,
+		end:    endFrameNumber + 1,
+		cur:    startFrameNumber,
+		db:     p,
+	}, nil
 }
 
 func (p *PebbleClockStore) SetLatestShardClockFrameNumber(
@@ -1215,4 +1547,698 @@ func (p *PebbleClockStore) SetShardStateTree(
 		txn.Set(clockShardStateTreeKey(filter), b.Bytes()),
 		"set data state tree",
 	)
+}
+
+func (p *PebbleClockStore) GetLatestCertifiedGlobalState() (
+	*protobufs.GlobalProposal,
+	error,
+) {
+	idxValue, closer, err := p.db.Get(clockGlobalCertifiedStateLatestIndex())
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get latest certified global state")
+	}
+	defer closer.Close()
+
+	if len(idxValue) != 8 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get latest certified global state",
+		)
+	}
+
+	rank := binary.BigEndian.Uint64(idxValue)
+	return p.GetCertifiedGlobalState(rank)
+}
+
+func (p *PebbleClockStore) GetEarliestCertifiedGlobalState() (
+	*protobufs.GlobalProposal,
+	error,
+) {
+	idxValue, closer, err := p.db.Get(clockGlobalCertifiedStateEarliestIndex())
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get earliest certified global state")
+	}
+	defer closer.Close()
+
+	if len(idxValue) != 8 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get earliest certified global state",
+		)
+	}
+
+	rank := binary.BigEndian.Uint64(idxValue)
+	return p.GetCertifiedGlobalState(rank)
+}
+
+func (p *PebbleClockStore) GetCertifiedGlobalState(rank uint64) (
+	*protobufs.GlobalProposal,
+	error,
+) {
+	key := clockGlobalCertifiedStateKey(rank)
+	value, closer, err := p.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get certified global state")
+	}
+	defer closer.Close()
+
+	if len(value) != 24 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get certified global state",
+		)
+	}
+
+	frameNumber := binary.BigEndian.Uint64(value[:8])
+	qcRank := binary.BigEndian.Uint64(value[8:16])
+	tcRank := binary.BigEndian.Uint64(value[16:])
+
+	frame, err := p.GetGlobalClockFrame(frameNumber)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified global state")
+	}
+
+	qc, err := p.GetQuorumCertificate(nil, qcRank)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified global state")
+	}
+
+	tc, err := p.GetTimeoutCertificate(nil, tcRank)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified global state")
+	}
+
+	return &protobufs.GlobalProposal{
+		State:                       frame,
+		ParentQuorumCertificate:     qc,
+		PriorRankTimeoutCertificate: tc,
+	}, nil
+}
+
+func (p *PebbleClockStore) RangeCertifiedGlobalStates(
+	startRank uint64,
+	endRank uint64,
+) (store.TypedIterator[*protobufs.GlobalProposal], error) {
+	if startRank > endRank {
+		startRank, endRank = endRank, startRank
+	}
+
+	iter, err := p.db.NewIter(
+		clockGlobalCertifiedStateKey(startRank),
+		clockGlobalCertifiedStateKey(endRank+1),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "range certified global states")
+	}
+
+	return &PebbleGlobalStateIterator{i: iter, db: p}, nil
+}
+
+func (p *PebbleClockStore) PutCertifiedGlobalState(
+	state *protobufs.GlobalProposal,
+	txn store.Transaction,
+) error {
+	if state == nil {
+		return errors.Wrap(
+			errors.New("proposal is required"),
+			"put certified global state",
+		)
+	}
+
+	rank := uint64(0)
+	frameNumber := uint64(0xffffffffffffffff)
+	qcRank := uint64(0xffffffffffffffff)
+	tcRank := uint64(0xffffffffffffffff)
+	if state.State != nil {
+		if state.State.Header.Rank > rank {
+			rank = state.State.Header.Rank
+		}
+		frameNumber = state.State.Header.FrameNumber
+		if err := p.PutGlobalClockFrame(state.State, txn); err != nil {
+			return errors.Wrap(err, "put certified global state")
+		}
+	}
+	if state.ParentQuorumCertificate != nil {
+		if state.ParentQuorumCertificate.Rank > rank {
+			rank = state.ParentQuorumCertificate.Rank
+		}
+		qcRank = state.ParentQuorumCertificate.Rank
+		if err := p.PutQuorumCertificate(
+			state.ParentQuorumCertificate,
+			txn,
+		); err != nil {
+			return errors.Wrap(err, "put certified global state")
+		}
+	}
+	if state.PriorRankTimeoutCertificate != nil {
+		if state.PriorRankTimeoutCertificate.Rank > rank {
+			rank = state.PriorRankTimeoutCertificate.Rank
+		}
+		tcRank = state.PriorRankTimeoutCertificate.Rank
+		if err := p.PutTimeoutCertificate(
+			state.PriorRankTimeoutCertificate,
+			txn,
+		); err != nil {
+			return errors.Wrap(err, "put certified global state")
+		}
+	}
+
+	key := clockGlobalCertifiedStateKey(rank)
+	value := []byte{}
+	value = binary.BigEndian.AppendUint64(value, frameNumber)
+	value = binary.BigEndian.AppendUint64(value, qcRank)
+	value = binary.BigEndian.AppendUint64(value, tcRank)
+
+	if err := txn.Set(key, value); err != nil {
+		return errors.Wrap(err, "put certified global state")
+	}
+
+	if err := p.updateEarliestIndex(
+		txn,
+		clockGlobalCertifiedStateEarliestIndex(),
+		rank,
+	); err != nil {
+		return errors.Wrap(err, "put certified global state")
+	}
+
+	if err := txn.Set(
+		clockGlobalCertifiedStateLatestIndex(),
+		binary.BigEndian.AppendUint64(nil, rank),
+	); err != nil {
+		return errors.Wrap(err, "put certified global state")
+	}
+
+	return nil
+}
+
+func (p *PebbleClockStore) GetLatestCertifiedAppShardState(
+	filter []byte,
+) (
+	*protobufs.AppShardProposal,
+	error,
+) {
+	idxValue, closer, err := p.db.Get(
+		clockShardCertifiedStateLatestIndex([]byte{}),
+	)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get latest certified app shard state")
+	}
+	defer closer.Close()
+
+	if len(idxValue) != 8 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get latest certified app shard state",
+		)
+	}
+
+	rank := binary.BigEndian.Uint64(idxValue)
+	return p.GetCertifiedAppShardState(filter, rank)
+}
+
+func (p *PebbleClockStore) GetEarliestCertifiedAppShardState(
+	filter []byte,
+) (
+	*protobufs.AppShardProposal,
+	error,
+) {
+	idxValue, closer, err := p.db.Get(
+		clockShardCertifiedStateEarliestIndex([]byte{}),
+	)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get earliest certified app shard state")
+	}
+	defer closer.Close()
+
+	if len(idxValue) != 8 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get earliest certified app shard state",
+		)
+	}
+
+	rank := binary.BigEndian.Uint64(idxValue)
+	return p.GetCertifiedAppShardState(filter, rank)
+}
+
+func (p *PebbleClockStore) GetCertifiedAppShardState(
+	filter []byte,
+	rank uint64,
+) (
+	*protobufs.AppShardProposal,
+	error,
+) {
+	key := clockShardCertifiedStateKey(rank, filter)
+	value, closer, err := p.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get certified app shard state")
+	}
+	defer closer.Close()
+
+	if len(value) != 24 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get certified app shard state",
+		)
+	}
+
+	frameNumber := binary.BigEndian.Uint64(value[:8])
+	qcRank := binary.BigEndian.Uint64(value[8:16])
+	tcRank := binary.BigEndian.Uint64(value[16:])
+
+	frame, _, err := p.GetShardClockFrame(filter, frameNumber, false)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified app shard state")
+	}
+
+	qc, err := p.GetQuorumCertificate(filter, qcRank)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified app shard state")
+	}
+
+	tc, err := p.GetTimeoutCertificate(filter, tcRank)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified app shard state")
+	}
+
+	return &protobufs.AppShardProposal{
+		State:                       frame,
+		ParentQuorumCertificate:     qc,
+		PriorRankTimeoutCertificate: tc,
+	}, nil
+}
+
+func (p *PebbleClockStore) RangeCertifiedAppShardStates(
+	filter []byte,
+	startRank uint64,
+	endRank uint64,
+) (store.TypedIterator[*protobufs.AppShardProposal], error) {
+	if startRank > endRank {
+		startRank, endRank = endRank, startRank
+	}
+
+	return &PebbleAppShardStateIterator{
+		filter: filter,
+		start:  startRank,
+		end:    endRank + 1,
+		cur:    startRank,
+		db:     p,
+	}, nil
+}
+
+func (p *PebbleClockStore) PutCertifiedAppShardState(
+	state *protobufs.AppShardProposal,
+	txn store.Transaction,
+) error {
+	if state == nil {
+		return errors.Wrap(
+			errors.New("proposal is required"),
+			"put certified app shard state",
+		)
+	}
+
+	rank := uint64(0)
+	filter := []byte{}
+	frameNumber := uint64(0xffffffffffffffff)
+	qcRank := uint64(0xffffffffffffffff)
+	tcRank := uint64(0xffffffffffffffff)
+	if state.State != nil {
+		if state.State.Header.Rank > rank {
+			rank = state.State.Header.Rank
+		}
+		frameNumber = state.State.Header.FrameNumber
+		if err := p.StageShardClockFrame(
+			[]byte(state.State.Identity()),
+			state.State,
+			txn,
+		); err != nil {
+			return errors.Wrap(err, "put certified app shard state")
+		}
+		if err := p.CommitShardClockFrame(
+			state.State.Header.Address,
+			frameNumber,
+			[]byte(state.State.Identity()),
+			nil,
+			txn,
+			false,
+		); err != nil {
+			return errors.Wrap(err, "put certified app shard state")
+		}
+		filter = state.State.Header.Address
+	}
+	if state.ParentQuorumCertificate != nil {
+		if state.ParentQuorumCertificate.Rank > rank {
+			rank = state.ParentQuorumCertificate.Rank
+		}
+		qcRank = state.ParentQuorumCertificate.Rank
+		if err := p.PutQuorumCertificate(
+			state.ParentQuorumCertificate,
+			txn,
+		); err != nil {
+			return errors.Wrap(err, "put certified app shard state")
+		}
+		filter = state.ParentQuorumCertificate.Filter
+	}
+	if state.PriorRankTimeoutCertificate != nil {
+		if state.PriorRankTimeoutCertificate.Rank > rank {
+			rank = state.PriorRankTimeoutCertificate.Rank
+		}
+		tcRank = state.PriorRankTimeoutCertificate.Rank
+		if err := p.PutTimeoutCertificate(
+			state.PriorRankTimeoutCertificate,
+			txn,
+		); err != nil {
+			return errors.Wrap(err, "put certified app shard state")
+		}
+		filter = state.PriorRankTimeoutCertificate.Filter
+	}
+
+	if bytes.Equal(filter, []byte{}) {
+		return errors.Wrap(
+			errors.New("invalid filter"),
+			"put certified app shard state",
+		)
+	}
+
+	key := clockShardCertifiedStateKey(rank, filter)
+	value := []byte{}
+	value = binary.BigEndian.AppendUint64(value, frameNumber)
+	value = binary.BigEndian.AppendUint64(value, qcRank)
+	value = binary.BigEndian.AppendUint64(value, tcRank)
+
+	if err := txn.Set(key, value); err != nil {
+		return errors.Wrap(err, "put certified app shard state")
+	}
+
+	if err := p.updateEarliestIndex(
+		txn,
+		clockShardCertifiedStateEarliestIndex(filter),
+		rank,
+	); err != nil {
+		return errors.Wrap(err, "put certified app shard state")
+	}
+
+	if err := txn.Set(
+		clockShardCertifiedStateLatestIndex(filter),
+		binary.BigEndian.AppendUint64(nil, rank),
+	); err != nil {
+		return errors.Wrap(err, "put certified app shard state")
+	}
+
+	return nil
+}
+
+func (p *PebbleClockStore) GetLatestQuorumCertificate(
+	filter []byte,
+) (*protobufs.QuorumCertificate, error) {
+	idxValue, closer, err := p.db.Get(
+		clockQuorumCertificateLatestIndex(filter),
+	)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get latest quorum certificate")
+	}
+	defer closer.Close()
+
+	if len(idxValue) != 8 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get latest quorum certificate",
+		)
+	}
+
+	rank := binary.BigEndian.Uint64(idxValue)
+	return p.GetQuorumCertificate(filter, rank)
+}
+
+func (p *PebbleClockStore) GetEarliestQuorumCertificate(
+	filter []byte,
+) (*protobufs.QuorumCertificate, error) {
+	idxValue, closer, err := p.db.Get(
+		clockQuorumCertificateEarliestIndex(filter),
+	)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get earliest quorum certificate")
+	}
+	defer closer.Close()
+
+	if len(idxValue) != 8 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get earliest quorum certificate",
+		)
+	}
+
+	rank := binary.BigEndian.Uint64(idxValue)
+	return p.GetQuorumCertificate(filter, rank)
+}
+
+func (p *PebbleClockStore) GetQuorumCertificate(
+	filter []byte,
+	rank uint64,
+) (*protobufs.QuorumCertificate, error) {
+	key := clockQuorumCertificateKey(rank, filter)
+	value, closer, err := p.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get quorum certificate")
+	}
+	defer closer.Close()
+
+	qc := &protobufs.QuorumCertificate{}
+	if err := qc.FromCanonicalBytes(slices.Clone(value)); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"get quorum certificate",
+		)
+	}
+
+	return qc, nil
+}
+
+func (p *PebbleClockStore) RangeQuorumCertificates(
+	filter []byte,
+	startRank uint64,
+	endRank uint64,
+) (store.TypedIterator[*protobufs.QuorumCertificate], error) {
+	if startRank > endRank {
+		startRank, endRank = endRank, startRank
+	}
+
+	return &PebbleQuorumCertificateIterator{
+		filter: filter,
+		start:  startRank,
+		end:    endRank + 1,
+		cur:    startRank,
+		db:     p,
+	}, nil
+}
+
+func (p *PebbleClockStore) PutQuorumCertificate(
+	qc *protobufs.QuorumCertificate,
+	txn store.Transaction,
+) error {
+	if qc == nil {
+		return errors.Wrap(
+			errors.New("quorum certificate is required"),
+			"put quorum certificate",
+		)
+	}
+
+	rank := qc.Rank
+	filter := qc.Filter
+	data, err := qc.ToCanonicalBytes()
+	if err != nil {
+		return errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"put quorum certificate",
+		)
+	}
+
+	key := clockQuorumCertificateKey(rank, filter)
+	if err := txn.Set(key, data); err != nil {
+		return errors.Wrap(err, "put quorum certificate")
+	}
+
+	if err := p.updateEarliestIndex(
+		txn,
+		clockQuorumCertificateEarliestIndex(filter),
+		rank,
+	); err != nil {
+		return errors.Wrap(err, "put quorum certificate")
+	}
+
+	if err := txn.Set(
+		clockQuorumCertificateLatestIndex(filter),
+		binary.BigEndian.AppendUint64(nil, rank),
+	); err != nil {
+		return errors.Wrap(err, "put quorum certificate")
+	}
+
+	return nil
+}
+
+func (p *PebbleClockStore) GetLatestTimeoutCertificate(
+	filter []byte,
+) (*protobufs.TimeoutCertificate, error) {
+	idxValue, closer, err := p.db.Get(
+		clockTimeoutCertificateLatestIndex(filter),
+	)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get latest timeout certificate")
+	}
+	defer closer.Close()
+
+	if len(idxValue) != 8 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get latest timeout certificate",
+		)
+	}
+
+	rank := binary.BigEndian.Uint64(idxValue)
+	return p.GetTimeoutCertificate(filter, rank)
+}
+
+func (p *PebbleClockStore) GetEarliestTimeoutCertificate(
+	filter []byte,
+) (*protobufs.TimeoutCertificate, error) {
+	idxValue, closer, err := p.db.Get(
+		clockTimeoutCertificateEarliestIndex(filter),
+	)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get earliest timeout certificate")
+	}
+	defer closer.Close()
+
+	if len(idxValue) != 8 {
+		return nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get earliest timeout certificate",
+		)
+	}
+
+	rank := binary.BigEndian.Uint64(idxValue)
+	return p.GetTimeoutCertificate(filter, rank)
+}
+
+func (p *PebbleClockStore) GetTimeoutCertificate(
+	filter []byte,
+	rank uint64,
+) (*protobufs.TimeoutCertificate, error) {
+	key := clockTimeoutCertificateKey(rank, filter)
+	value, closer, err := p.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get timeout certificate")
+	}
+	defer closer.Close()
+
+	tc := &protobufs.TimeoutCertificate{}
+	if err := tc.FromCanonicalBytes(slices.Clone(value)); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"get timeout certificate",
+		)
+	}
+
+	return tc, nil
+}
+
+func (p *PebbleClockStore) RangeTimeoutCertificates(
+	filter []byte,
+	startRank uint64,
+	endRank uint64,
+) (store.TypedIterator[*protobufs.TimeoutCertificate], error) {
+	if startRank > endRank {
+		startRank, endRank = endRank, startRank
+	}
+
+	return &PebbleTimeoutCertificateIterator{
+		filter: filter,
+		start:  startRank,
+		end:    endRank + 1,
+		cur:    startRank,
+		db:     p,
+	}, nil
+}
+
+func (p *PebbleClockStore) PutTimeoutCertificate(
+	tc *protobufs.TimeoutCertificate,
+	txn store.Transaction,
+) error {
+	if tc == nil {
+		return errors.Wrap(
+			errors.New("timeout certificate is required"),
+			"put timeout certificate",
+		)
+	}
+
+	rank := tc.Rank
+	filter := tc.Filter
+
+	data, err := tc.ToCanonicalBytes()
+	if err != nil {
+		return errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"put timeout certificate",
+		)
+	}
+
+	key := clockTimeoutCertificateKey(rank, filter)
+	if err := txn.Set(key, data); err != nil {
+		return errors.Wrap(err, "put timeout certificate")
+	}
+
+	if err := p.updateEarliestIndex(
+		txn,
+		clockTimeoutCertificateEarliestIndex(filter),
+		rank,
+	); err != nil {
+		return errors.Wrap(err, "put timeout certificate")
+	}
+
+	rankBytes := binary.BigEndian.AppendUint64(nil, rank)
+
+	if err := txn.Set(
+		clockTimeoutCertificateLatestIndex(filter),
+		rankBytes,
+	); err != nil {
+		return errors.Wrap(err, "put timeout certificate")
+	}
+
+	return nil
 }

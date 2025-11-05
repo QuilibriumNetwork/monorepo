@@ -28,9 +28,10 @@ type rankTracker[StateT models.Unique, VoteT models.Unique] struct {
 
 // newRankTracker instantiates a rankTracker.
 func newRankTracker[StateT models.Unique, VoteT models.Unique](
+	filter []byte,
 	store consensus.ConsensusStore[VoteT],
 ) (rankTracker[StateT, VoteT], error) {
-	livenessState, err := store.GetLivenessState()
+	livenessState, err := store.GetLivenessState(filter)
 	if err != nil {
 		return rankTracker[StateT, VoteT]{},
 			fmt.Errorf("could not load liveness data: %w", err)

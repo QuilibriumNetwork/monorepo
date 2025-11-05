@@ -71,7 +71,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	timer := prometheus.NewTimer(frameProvingDuration)
 	defer timer.ObserveDuration()
 
-	prior, err := p.engine.globalTimeReel.GetFrame(priorState)
+	prior, err := p.engine.clockStore.GetLatestGlobalClockFrame()
 	if err != nil {
 		return nil, errors.Wrap(err, "prove next state")
 	}
@@ -79,6 +79,13 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	if prior == nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
+	}
+
+	if prior.Identity() != priorState {
+		return nil, errors.Wrap(
+			errors.New("missing prior frame"),
+			"prove next state",
+		)
 	}
 
 	// Get prover index
@@ -150,6 +157,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return nil, errors.Wrap(err, "prove next state")
 	}
+	newHeader.Rank = rank
 
 	// Convert collected messages to MessageBundles
 	requests := make(

@@ -18,6 +18,7 @@ import (
 	health "google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/registration"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
@@ -276,7 +277,7 @@ func TestOnionGRPC_RealRelayAndKeys(t *testing.T) {
 	logger := zap.NewNop()
 
 	// 1) Spin up a real gRPC health server (ephemeral port)
-	lis, err := net.Listen("tcp", "127.0.0.1:8080")
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	s := grpc.NewServer()
 	hs := health.NewServer()
@@ -345,8 +346,10 @@ func TestOnionGRPC_RealRelayAndKeys(t *testing.T) {
 
 	// 6) PeerInfoManager ordering (entry->middle->exit)
 	pm := p2p.NewInMemoryPeerInfoManager(logger)
-	pm.Start()
-	defer pm.Stop()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go pm.Start(ctx, func() {})
+	time.Sleep(100 * time.Millisecond)
+	defer cancel()
 	pm.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relay1"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	pm.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relay2"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	pm.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relay3"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
@@ -372,9 +375,9 @@ func TestOnionGRPC_RealRelayAndKeys(t *testing.T) {
 	)
 
 	// 8) Build a 3-hop circuit
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	circ, err := or.BuildCircuit(ctx, 3)
+	hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer hcancel()
+	circ, err := or.BuildCircuit(hctx, 3)
 	require.NoError(t, err)
 
 	// 9) gRPC dial through onion using MULTIADDR as "addr" (relay expects MA bytes in BEGIN)
@@ -458,15 +461,16 @@ func TestHiddenService_RemoteRendezvous(t *testing.T) {
 
 	// Peer managers (client knows R, service knows A then R)
 	pmClient := p2p.NewInMemoryPeerInfoManager(logger)
-	pmClient.Start()
-	defer pmClient.Stop()
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	go pmClient.Start(ctx, func() {})
+	defer cancel()
 	// client knows three rendezvous relays
 	for _, id := range [][]byte{[]byte("relayR1"), []byte("relayR2"), []byte("relayR3")} {
 		pmClient.AddPeerInfo(&protobufs.PeerInfo{PeerId: id, Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	}
 	pmService := p2p.NewInMemoryPeerInfoManager(logger)
-	pmService.Start()
-	defer pmService.Stop()
+	go pmService.Start(ctx, func() {})
+
 	// service knows three intro relays
 	for _, id := range [][]byte{[]byte("relayA1"), []byte("relayA2"), []byte("relayA3")} {
 		pmService.AddPeerInfo(&protobufs.PeerInfo{PeerId: id, Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
@@ -487,17 +491,17 @@ func TestHiddenService_RemoteRendezvous(t *testing.T) {
 		onion.WithKeyConstructor(func() ([]byte, []byte, error) { k := keys.NewX448Key(); return k.Public(), k.Private(), nil }),
 		onion.WithSharedSecret(func(priv, pub []byte) ([]byte, error) { e, _ := keys.X448KeyFromBytes(priv); return e.AgreeWith(pub) }),
 	)
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	defer cancel()
+	hctx, hcancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer hcancel()
 
 	var serviceID [32]byte
 	copy(serviceID[:], []byte("service-id-32-bytes-------------")[:32])
 
-	_, err = orService.RegisterIntro(ctx, []byte("relayA1"), serviceID)
+	_, err = orService.RegisterIntro(hctx, []byte("relayA1"), serviceID)
 	require.NoError(t, err)
 
 	// CLIENT: build circuit to rendezvous relay and send REND1
-	cR, err := orClient.BuildCircuitToExit(ctx, 3, []byte("relayR1"))
+	cR, err := orClient.BuildCircuitToExit(hctx, 3, []byte("relayR1"))
 	require.NoError(t, err)
 	var cookie [16]byte
 	_, _ = rand.Read(cookie[:])
@@ -506,8 +510,7 @@ func TestHiddenService_RemoteRendezvous(t *testing.T) {
 
 	// CLIENT: build circuit to intro relay and send INTRODUCE(serviceID, "relayR", cookie, clientSid)
 	pmIntro := p2p.NewInMemoryPeerInfoManager(logger)
-	pmIntro.Start()
-	defer pmIntro.Stop()
+	go pmIntro.Start(ctx, func() {})
 	pmIntro.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relayA1"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	pmIntro.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relayA2"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	pmIntro.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relayA3"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
@@ -518,7 +521,7 @@ func TestHiddenService_RemoteRendezvous(t *testing.T) {
 		onion.WithSharedSecret(func(priv, pub []byte) ([]byte, error) { e, _ := keys.X448KeyFromBytes(priv); return e.AgreeWith(pub) }),
 	)
 
-	cI, err := orIntro.BuildCircuit(ctx, 3)
+	cI, err := orIntro.BuildCircuit(hctx, 3)
 	require.NoError(t, err)
 	require.NoError(t, orClient.ClientIntroduce(cI, serviceID, "relayR1", cookie, clientSid))
 
@@ -527,7 +530,7 @@ func TestHiddenService_RemoteRendezvous(t *testing.T) {
 	pmService.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relayR2"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	pmService.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relayR3"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	time.Sleep(150 * time.Millisecond)
-	cRS, err := orService.BuildCircuitToExit(ctx, 3, []byte("relayR1"))
+	cRS, err := orService.BuildCircuitToExit(hctx, 3, []byte("relayR1"))
 	require.NoError(t, err)
 	serviceSid := uint16(0xD777)
 	require.NoError(t, orService.ServiceCompleteRendezvous(cRS, cookie, serviceSid))

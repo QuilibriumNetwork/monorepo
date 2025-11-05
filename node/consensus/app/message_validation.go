@@ -33,42 +33,42 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 	typePrefix := binary.BigEndian.Uint32(message.Data[:4])
 
 	switch typePrefix {
-	case protobufs.AppShardFrameType:
+	case protobufs.AppShardProposalType:
 		timer := prometheus.NewTimer(
 			proposalValidationDuration.WithLabelValues(e.appAddressHex),
 		)
 		defer timer.ObserveDuration()
 
-		frame := &protobufs.AppShardFrame{}
-		if err := frame.FromCanonicalBytes(message.Data); err != nil {
+		proposal := &protobufs.AppShardProposal{}
+		if err := proposal.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
-		if frame.Header == nil {
-			e.logger.Debug("frame has no header")
+		if err := proposal.Validate(); err != nil {
+			e.logger.Error("invalid proposal", zap.Error(err))
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
-		if !bytes.Equal(frame.Header.Address, e.appAddress) {
+		if !bytes.Equal(proposal.State.Header.Address, e.appAddress) {
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}
 
-		if frametime.AppFrameSince(frame) > 20*time.Second {
+		if frametime.AppFrameSince(proposal.State) > 20*time.Second {
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}
 
-		if frame.Header.PublicKeySignatureBls48581 != nil {
+		if proposal.State.Header.PublicKeySignatureBls48581 != nil {
 			e.logger.Debug("frame validation has signature")
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
-		valid, err := e.frameValidator.Validate(frame)
+		valid, err := e.frameValidator.Validate(proposal.State)
 		if err != nil {
 			e.logger.Debug("frame validation error", zap.Error(err))
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()

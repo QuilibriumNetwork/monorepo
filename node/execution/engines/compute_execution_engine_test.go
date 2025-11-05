@@ -418,6 +418,7 @@ func createTestGlobalConsensusEngine(t *testing.T) (
 		nil,
 		nil,
 		nil,
+		nil,
 		&mockEncryptedChannel{},
 		&mocks.MockBulletproofProver{},
 		&mocks.MockVerifiableEncryptor{},

@@ -66,9 +66,9 @@ func (s *SafetyRulesTestSuite) SetupTest() {
 		LatestAcknowledgedRank: s.bootstrapState.Rank,
 	}
 
-	s.persister.On("GetConsensusState").Return(s.safetyData, nil).Once()
+	s.persister.On("GetConsensusState", mock.Anything).Return(s.safetyData, nil).Once()
 	var err error
-	s.safety, err = NewSafetyRules(s.signer, s.persister, s.committee)
+	s.safety, err = NewSafetyRules(nil, s.signer, s.persister, s.committee)
 	require.NoError(s.T(), err)
 }
 

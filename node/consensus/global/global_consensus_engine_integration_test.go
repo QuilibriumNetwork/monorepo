@@ -33,9 +33,9 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
 	"source.quilibrium.com/quilibrium/monorepo/channel"
 	"source.quilibrium.com/quilibrium/monorepo/config"
-	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/difficulty"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/events"
@@ -60,16 +60,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/verenc"
 )
-
-type testTransitionListener struct {
-	onTransition func(from, to consensus.State, event consensus.Event)
-}
-
-func (l *testTransitionListener) OnTransition(from, to consensus.State, event consensus.Event) {
-	if l.onTransition != nil {
-		l.onTransition(from, to, event)
-	}
-}
 
 // mockIntegrationPubSub is a pubsub mock for integration testing
 type mockIntegrationPubSub struct {
@@ -548,6 +538,7 @@ func createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(
 		nil, // inboxStore
 		nil, // hypergraphStore
 		store.NewPebbleShardsStore(pebbleDB, logger),
+		store.NewPebbleConsensusStore(pebbleDB, logger),
 		store.NewPebbleWorkerStore(pebbleDB, logger),
 		channel.NewDoubleRatchetEncryptedChannel(), // encryptedChannel
 		&bulletproofs.Decaf448BulletproofProver{},  // bulletproofProver
@@ -595,8 +586,9 @@ func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	}
 
 	// Start the engine
-	quit := make(chan struct{})
-	errChan := engine.Start(quit)
+	ctx, _, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+	err := engine.Start(ctx)
+	require.NoError(t, err)
 
 	// Check for startup errors
 	select {
@@ -607,7 +599,7 @@ func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	}
 
 	// Wait for state transitions
-	time.Sleep(2 * time.Second)
+	time.Sleep(20 * time.Second)
 
 	// Verify engine is in an active state
 	state := engine.GetState()
@@ -626,7 +618,6 @@ func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	t.Logf("Published %d frames", frameCount)
 
 	// Stop the engine
-	close(quit)
 	<-engine.Stop(false)
 }
 
@@ -641,19 +632,10 @@ func TestGlobalConsensusEngine_Integration_StateTransitions(t *testing.T) {
 	transitions := make([]string, 0)
 	var mu sync.Mutex
 
-	listener := &testTransitionListener{
-		onTransition: func(from, to consensus.State, event consensus.Event) {
-			mu.Lock()
-			transitions = append(transitions, fmt.Sprintf("%s->%s", from, to))
-			mu.Unlock()
-			t.Logf("State transition: %s -> %s (event: %s)", from, to, event)
-		},
-	}
-
 	// Start the engine
-	quit := make(chan struct{})
-	errChan := engine.Start(quit)
-	engine.stateMachine.AddListener(listener)
+	ctx, _, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+	err := engine.Start(ctx)
+	require.NoError(t, err)
 
 	// Check for startup errors
 	select {
@@ -674,7 +656,6 @@ func TestGlobalConsensusEngine_Integration_StateTransitions(t *testing.T) {
 	assert.Greater(t, transitionCount, 0, "Expected at least one state transition")
 
 	// Stop the engine
-	close(quit)
 	<-engine.Stop(false)
 }
 
@@ -790,9 +771,9 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				switch typePrefix {
-				case protobufs.GlobalFrameType:
+				case protobufs.GlobalProposalType:
 					proposalCount[nodeIdx]++
-				case protobufs.FrameVoteType:
+				case protobufs.ProposalVoteType:
 					voteCount[nodeIdx]++
 				case protobufs.ProverLivenessCheckType:
 					livenessCount[nodeIdx]++
@@ -803,10 +784,10 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 	}
 
 	// Start all engines
-	quits := make([]chan struct{}, 6)
 	for i := 0; i < 6; i++ {
-		quits[i] = make(chan struct{})
-		errChan := engines[i].Start(quits[i])
+		ctx, _, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+		err := engines[i].Start(ctx)
+		require.NoError(t, err)
 
 		// Check for startup errors
 		select {
@@ -888,7 +869,6 @@ loop:
 
 	// Stop all engines
 	for i := 0; i < 6; i++ {
-		close(quits[i])
 		<-engines[i].Stop(false)
 	}
 }
@@ -947,10 +927,12 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 	engine.eventDistributor = eventDistributor
 
 	// Start the event distributor
-	engine.Start(make(chan struct{}))
+	ctx, _, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	err := engine.Start(ctx)
+	require.NoError(t, err)
 
 	// Run shard coverage check
-	err := engine.checkShardCoverage(1)
+	err = engine.checkShardCoverage(1)
 	require.NoError(t, err)
 
 	// Wait for event processing and possible new app shard head
@@ -972,7 +954,7 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 	require.False(t, newHeadAfter)
 
 	// Stop the event distributor
-	eventDistributor.Stop()
+	engine.Stop(false)
 }
 
 // TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying tests that engines
@@ -1094,6 +1076,7 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 			nil, // inboxStore
 			nil, // hypergraphStore
 			store.NewPebbleShardsStore(pebbleDB, logger),
+			store.NewPebbleConsensusStore(pebbleDB, logger),
 			store.NewPebbleWorkerStore(pebbleDB, logger),
 			channel.NewDoubleRatchetEncryptedChannel(),
 			&bulletproofs.Decaf448BulletproofProver{}, // bulletproofProver
@@ -1120,7 +1103,9 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 
 	// Start all engines
 	for i := 0; i < numNodes; i++ {
-		errChan := engines[i].Start(quits[i])
+		ctx, _, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+		err := engines[i].Start(ctx)
+		require.NoError(t, err)
 		select {
 		case err := <-errChan:
 			require.NoError(t, err)
@@ -1190,8 +1175,9 @@ func TestGlobalConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 	}
 
 	// Start the engine
-	quit := make(chan struct{})
-	errChan := engine.Start(quit)
+	ctx, _, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+	err := engine.Start(ctx)
+	require.NoError(t, err)
 
 	// Check for startup errors
 	select {
@@ -1250,7 +1236,6 @@ func TestGlobalConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 	require.Equal(t, 0, afterAlertCount)
 
 	// Stop the engine
-	close(quit)
 	<-engine.Stop(false)
 }
 

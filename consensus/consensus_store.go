@@ -13,6 +13,6 @@ type ConsensusStore[VoteT models.Unique] interface {
 // ReadOnlyConsensusStore defines the methods required for reading internal
 // state persisted between restarts of the consensus engine.
 type ReadOnlyConsensusStore[VoteT models.Unique] interface {
-	GetConsensusState() (*models.ConsensusState[VoteT], error)
-	GetLivenessState() (*models.LivenessState, error)
+	GetConsensusState(filter []byte) (*models.ConsensusState[VoteT], error)
+	GetLivenessState(filter []byte) (*models.LivenessState, error)
 }

@@ -13,8 +13,8 @@ type ConsensusStore[VoteT models.Unique] struct {
 }
 
 // GetConsensusState provides a mock function with no fields
-func (_m *ConsensusStore[VoteT]) GetConsensusState() (*models.ConsensusState[VoteT], error) {
-	ret := _m.Called()
+func (_m *ConsensusStore[VoteT]) GetConsensusState(filter []byte) (*models.ConsensusState[VoteT], error) {
+	ret := _m.Called(filter)
 
 	if len(ret) == 0 {
 		panic("no return value specified for GetConsensusState")
@@ -22,19 +22,19 @@ func (_m *ConsensusStore[VoteT]) GetConsensusState() (*models.ConsensusState[Vot
 
 	var r0 *models.ConsensusState[VoteT]
 	var r1 error
-	if rf, ok := ret.Get(0).(func() (*models.ConsensusState[VoteT], error)); ok {
-		return rf()
+	if rf, ok := ret.Get(0).(func(filter []byte) (*models.ConsensusState[VoteT], error)); ok {
+		return rf(filter)
 	}
-	if rf, ok := ret.Get(0).(func() *models.ConsensusState[VoteT]); ok {
-		r0 = rf()
+	if rf, ok := ret.Get(0).(func(filter []byte) *models.ConsensusState[VoteT]); ok {
+		r0 = rf(filter)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(*models.ConsensusState[VoteT])
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func() error); ok {
-		r1 = rf()
+	if rf, ok := ret.Get(1).(func(filter []byte) error); ok {
+		r1 = rf(filter)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -43,8 +43,8 @@ func (_m *ConsensusStore[VoteT]) GetConsensusState() (*models.ConsensusState[Vot
 }
 
 // GetLivenessState provides a mock function with no fields
-func (_m *ConsensusStore[VoteT]) GetLivenessState() (*models.LivenessState, error) {
-	ret := _m.Called()
+func (_m *ConsensusStore[VoteT]) GetLivenessState(filter []byte) (*models.LivenessState, error) {
+	ret := _m.Called(filter)
 
 	if len(ret) == 0 {
 		panic("no return value specified for GetLivenessState")
@@ -52,19 +52,19 @@ func (_m *ConsensusStore[VoteT]) GetLivenessState() (*models.LivenessState, erro
 
 	var r0 *models.LivenessState
 	var r1 error
-	if rf, ok := ret.Get(0).(func() (*models.LivenessState, error)); ok {
-		return rf()
+	if rf, ok := ret.Get(0).(func(filter []byte) (*models.LivenessState, error)); ok {
+		return rf(filter)
 	}
-	if rf, ok := ret.Get(0).(func() *models.LivenessState); ok {
-		r0 = rf()
+	if rf, ok := ret.Get(0).(func(filter []byte) *models.LivenessState); ok {
+		r0 = rf(filter)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(*models.LivenessState)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func() error); ok {
-		r1 = rf()
+	if rf, ok := ret.Get(1).(func(filter []byte) error); ok {
+		r1 = rf(filter)
 	} else {
 		r1 = ret.Error(1)
 	}

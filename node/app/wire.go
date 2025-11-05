@@ -10,6 +10,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
 	"source.quilibrium.com/quilibrium/monorepo/channel"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	qconsensus "source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/app"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/difficulty"
@@ -26,6 +27,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	tchannel "source.quilibrium.com/quilibrium/monorepo/types/channel"
 	tcompiler "source.quilibrium.com/quilibrium/monorepo/types/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -90,6 +92,7 @@ var storeSet = wire.NewSet(
 	store.NewPeerstoreDatastore,
 	store.NewPebbleShardsStore,
 	store.NewPebbleWorkerStore,
+	store.NewPebbleConsensusStore,
 	wire.Bind(new(tstore.ClockStore), new(*store.PebbleClockStore)),
 	wire.Bind(new(tstore.TokenStore), new(*store.PebbleTokenStore)),
 	wire.Bind(new(tstore.DataProofStore), new(*store.PebbleDataProofStore)),
@@ -99,6 +102,10 @@ var storeSet = wire.NewSet(
 	wire.Bind(new(tries.TreeBackingStore), new(*store.PebbleHypergraphStore)),
 	wire.Bind(new(tstore.ShardsStore), new(*store.PebbleShardsStore)),
 	wire.Bind(new(tstore.WorkerStore), new(*store.PebbleWorkerStore)),
+	wire.Bind(
+		new(qconsensus.ConsensusStore[*protobufs.ProposalVote]),
+		new(*store.PebbleConsensusStore),
+	),
 )
 
 var pubSubSet = wire.NewSet(

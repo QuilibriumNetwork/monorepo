@@ -40,10 +40,10 @@ func (s *RankTrackerTestSuite) SetupTest() {
 		CurrentRank:                 s.initialRank, // we entered rank 5 by observing a QC for rank 4
 	}
 	s.store = mocks.NewConsensusStore[*helper.TestVote](s.T())
-	s.store.On("GetLivenessState").Return(s.livenessState, nil).Once()
+	s.store.On("GetLivenessState", mock.Anything).Return(s.livenessState, nil).Once()
 
 	var err error
-	s.tracker, err = newRankTracker[*helper.TestState, *helper.TestVote](s.store)
+	s.tracker, err = newRankTracker[*helper.TestState, *helper.TestVote](nil, s.store)
 	require.NoError(s.T(), err)
 }
 

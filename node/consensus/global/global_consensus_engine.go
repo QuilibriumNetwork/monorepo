@@ -227,6 +227,7 @@ func NewGlobalConsensusEngine(
 	inboxStore store.InboxStore,
 	hypergraphStore store.HypergraphStore,
 	shardsStore store.ShardsStore,
+	consensusStore consensus.ConsensusStore[*protobufs.ProposalVote],
 	workerStore store.WorkerStore,
 	encryptedChannel channel.EncryptedChannel,
 	bulletproofProver crypto.BulletproofProver,
@@ -245,6 +246,7 @@ func NewGlobalConsensusEngine(
 		keyStore:                    keyStore,
 		clockStore:                  clockStore,
 		shardsStore:                 shardsStore,
+		consensusStore:              consensusStore,
 		frameProver:                 frameProver,
 		inclusionProver:             inclusionProver,
 		signerRegistry:              signerRegistry,
@@ -421,11 +423,6 @@ func NewGlobalConsensusEngine(
 	}
 	engine.executionManager = executionManager
 
-	// Initialize execution engines
-	if err := engine.executionManager.InitializeEngines(); err != nil {
-		return nil, errors.Wrap(err, "new global consensus engine")
-	}
-
 	// Initialize metrics
 	engineState.Set(0) // EngineStateStopped
 	currentDifficulty.Set(float64(config.Engine.Difficulty))
@@ -483,14 +480,34 @@ func NewGlobalConsensusEngine(
 	componentBuilder.AddWorker(engine.eventDistributor.Start)
 	componentBuilder.AddWorker(engine.globalTimeReel.Start)
 
-	frame, err := engine.clockStore.GetLatestGlobalClockFrame()
+	latest, err := engine.clockStore.GetLatestCertifiedGlobalState()
+	var state *models.CertifiedState[*protobufs.GlobalFrame]
 	if err != nil {
-		frame = engine.initializeGenesis()
-	}
-
-	var initialState **protobufs.GlobalFrame = nil
-	if frame != nil {
-		initialState = &frame
+		frame, qc := engine.initializeGenesis()
+		state = &models.CertifiedState[*protobufs.GlobalFrame]{
+			State: &models.State[*protobufs.GlobalFrame]{
+				Rank:       0,
+				Identifier: frame.Identity(),
+				State:      &frame,
+			},
+			CertifyingQuorumCertificate: qc,
+		}
+	} else {
+		qc, err := engine.clockStore.GetLatestQuorumCertificate(nil)
+		if err != nil {
+			panic(err)
+		}
+		state = &models.CertifiedState[*protobufs.GlobalFrame]{
+			State: &models.State[*protobufs.GlobalFrame]{
+				Rank:                    latest.GetRank(),
+				Identifier:              latest.State.Identity(),
+				ProposerID:              qc.Source(),
+				ParentQuorumCertificate: latest.ParentQuorumCertificate,
+				Timestamp:               latest.State.GetTimestamp(),
+				State:                   &latest.State,
+			},
+			CertifyingQuorumCertificate: qc,
+		}
 	}
 
 	engine.voteAggregator, err = voting.NewGlobalVoteAggregator[GlobalPeerID](
@@ -499,7 +516,7 @@ func NewGlobalConsensusEngine(
 		voteAggregationDistributor,
 		engine.signatureAggregator,
 		engine.votingProvider,
-		(*initialState).GetRank(),
+		state.Rank(),
 	)
 	if err != nil {
 		return nil, err
@@ -510,7 +527,7 @@ func NewGlobalConsensusEngine(
 		engine,
 		engine.signatureAggregator,
 		timeoutAggregationDistributor,
-		(*initialState).GetRank(),
+		state.Rank(),
 	)
 
 	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
@@ -518,7 +535,7 @@ func NewGlobalConsensusEngine(
 			ctx lifecycle.SignalerContext,
 			ready lifecycle.ReadyFunc,
 		) {
-			if err := engine.startConsensus(initialState, ctx, ready); err != nil {
+			if err := engine.startConsensus(state, ctx, ready); err != nil {
 				ctx.Throw(err)
 				return
 			}
@@ -689,6 +706,7 @@ func NewGlobalConsensusEngine(
 	}
 
 	engine.ComponentManager = componentBuilder.Build()
+
 	return engine, nil
 }
 
@@ -793,11 +811,6 @@ func (e *GlobalConsensusEngine) getAddressFromPublicKey(
 func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	errChan := make(chan error, 1)
 
-	// Cancel context
-	if e.cancel != nil {
-		e.cancel()
-	}
-
 	// Unsubscribe from pubsub
 	if e.config.Engine.ArchiveMode || e.config.P2P.Network == 99 {
 		e.pubsub.Unsubscribe(GLOBAL_CONSENSUS_BITMASK, false)
@@ -824,7 +837,7 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.UnregisterValidator(GLOBAL_ALERT_BITMASK)
 
 	select {
-	case <-e.ctx.Done():
+	case <-e.Done():
 		// Clean shutdown
 	case <-time.After(30 * time.Second):
 		if !force {
@@ -2328,19 +2341,15 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 }
 
 func (e *GlobalConsensusEngine) startConsensus(
-	initialFrame **protobufs.GlobalFrame,
+	trustedRoot *models.CertifiedState[*protobufs.GlobalFrame],
 	ctx lifecycle.SignalerContext,
 	ready lifecycle.ReadyFunc,
 ) error {
-	trustedRoot := &models.CertifiedState[*protobufs.GlobalFrame]{
-		State: &models.State[*protobufs.GlobalFrame]{
-			State: initialFrame,
-		},
-	}
 	notifier := pubsub.NewDistributor[
 		*protobufs.GlobalFrame,
 		*protobufs.ProposalVote,
 	]()
+	notifier.AddConsumer(e)
 
 	forks, err := forks.NewForks(trustedRoot, e, notifier)
 	if err != nil {
@@ -2458,12 +2467,65 @@ func (e *GlobalConsensusEngine) OnOwnProposal(
 	],
 	targetPublicationTime time.Time,
 ) {
+	var priorTC *protobufs.TimeoutCertificate
+	if proposal.PreviousRankTimeoutCertificate != nil {
+		priorTC =
+			proposal.PreviousRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
+	}
+
+	pbProposal := &protobufs.GlobalProposal{
+		State:                       *proposal.State.State,
+		ParentQuorumCertificate:     proposal.Proposal.State.ParentQuorumCertificate.(*protobufs.QuorumCertificate),
+		PriorRankTimeoutCertificate: priorTC,
+		Vote:                        *proposal.Vote,
+	}
+	data, err := pbProposal.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize proposal", zap.Error(err))
+		return
+	}
+
+	e.consensusParticipant.SubmitProposal(proposal)
+
+	if err := e.pubsub.PublishToBitmask(
+		GLOBAL_CONSENSUS_BITMASK,
+		data,
+	); err != nil {
+		e.logger.Error("could not publish", zap.Error(err))
+	}
 }
 
 // OnOwnTimeout implements consensus.Consumer.
 func (e *GlobalConsensusEngine) OnOwnTimeout(
 	timeout *models.TimeoutState[*protobufs.ProposalVote],
 ) {
+	var priorTC *protobufs.TimeoutCertificate
+	if timeout.PriorRankTimeoutCertificate != nil {
+		priorTC =
+			timeout.PriorRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
+	}
+
+	pbTimeout := &protobufs.TimeoutState{
+		LatestQuorumCertificate:     timeout.LatestQuorumCertificate.(*protobufs.QuorumCertificate),
+		PriorRankTimeoutCertificate: priorTC,
+		Vote:                        *timeout.Vote,
+		TimeoutTick:                 timeout.TimeoutTick,
+		Timestamp:                   uint64(time.Now().UnixMilli()),
+	}
+	data, err := pbTimeout.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize timeout", zap.Error(err))
+		return
+	}
+
+	e.timeoutAggregator.AddTimeout(timeout)
+
+	if err := e.pubsub.PublishToBitmask(
+		GLOBAL_CONSENSUS_BITMASK,
+		data,
+	); err != nil {
+		e.logger.Error("could not publish", zap.Error(err))
+	}
 }
 
 // OnOwnVote implements consensus.Consumer.
@@ -2471,6 +2533,20 @@ func (e *GlobalConsensusEngine) OnOwnVote(
 	vote **protobufs.ProposalVote,
 	recipientID models.Identity,
 ) {
+	data, err := (*vote).ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize timeout", zap.Error(err))
+		return
+	}
+
+	e.voteAggregator.AddVote(vote)
+
+	if err := e.pubsub.PublishToBitmask(
+		GLOBAL_CONSENSUS_BITMASK,
+		data,
+	); err != nil {
+		e.logger.Error("could not publish", zap.Error(err))
+	}
 }
 
 // OnPartialTimeoutCertificate implements consensus.Consumer.

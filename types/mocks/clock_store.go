@@ -16,6 +16,242 @@ type MockClockStore struct {
 	mock.Mock
 }
 
+// GetCertifiedAppShardState implements store.ClockStore.
+func (m *MockClockStore) GetCertifiedAppShardState(
+	filter []byte,
+	rank uint64,
+) (*protobufs.AppShardProposal, error) {
+	args := m.Called(
+		filter,
+		rank,
+	)
+	return args.Get(0).(*protobufs.AppShardProposal), args.Error(1)
+}
+
+// GetCertifiedGlobalState implements store.ClockStore.
+func (m *MockClockStore) GetCertifiedGlobalState(rank uint64) (
+	*protobufs.GlobalProposal,
+	error,
+) {
+	args := m.Called(
+		rank,
+	)
+	return args.Get(0).(*protobufs.GlobalProposal), args.Error(1)
+}
+
+// GetEarliestCertifiedAppShardState implements store.ClockStore.
+func (m *MockClockStore) GetEarliestCertifiedAppShardState(
+	filter []byte,
+) (*protobufs.AppShardProposal, error) {
+	args := m.Called(
+		filter,
+	)
+	return args.Get(0).(*protobufs.AppShardProposal), args.Error(1)
+}
+
+// GetEarliestCertifiedGlobalState implements store.ClockStore.
+func (m *MockClockStore) GetEarliestCertifiedGlobalState() (
+	*protobufs.GlobalProposal,
+	error,
+) {
+	args := m.Called()
+	return args.Get(0).(*protobufs.GlobalProposal), args.Error(1)
+}
+
+// GetEarliestQuorumCertificate implements store.ClockStore.
+func (m *MockClockStore) GetEarliestQuorumCertificate(filter []byte) (
+	*protobufs.QuorumCertificate,
+	error,
+) {
+	args := m.Called(
+		filter,
+	)
+	return args.Get(0).(*protobufs.QuorumCertificate), args.Error(1)
+}
+
+// GetEarliestTimeoutCertificate implements store.ClockStore.
+func (m *MockClockStore) GetEarliestTimeoutCertificate(filter []byte) (
+	*protobufs.TimeoutCertificate,
+	error,
+) {
+	args := m.Called(
+		filter,
+	)
+	return args.Get(0).(*protobufs.TimeoutCertificate), args.Error(1)
+}
+
+// GetLatestCertifiedAppShardState implements store.ClockStore.
+func (m *MockClockStore) GetLatestCertifiedAppShardState(filter []byte) (
+	*protobufs.AppShardProposal,
+	error,
+) {
+	args := m.Called(
+		filter,
+	)
+	return args.Get(0).(*protobufs.AppShardProposal), args.Error(1)
+}
+
+// GetLatestCertifiedGlobalState implements store.ClockStore.
+func (m *MockClockStore) GetLatestCertifiedGlobalState() (
+	*protobufs.GlobalProposal,
+	error,
+) {
+	args := m.Called()
+	return args.Get(0).(*protobufs.GlobalProposal), args.Error(1)
+}
+
+// GetLatestQuorumCertificate implements store.ClockStore.
+func (m *MockClockStore) GetLatestQuorumCertificate(filter []byte) (
+	*protobufs.QuorumCertificate,
+	error,
+) {
+	args := m.Called(
+		filter,
+	)
+	return args.Get(0).(*protobufs.QuorumCertificate), args.Error(1)
+}
+
+// GetLatestTimeoutCertificate implements store.ClockStore.
+func (m *MockClockStore) GetLatestTimeoutCertificate(filter []byte) (
+	*protobufs.TimeoutCertificate,
+	error,
+) {
+	args := m.Called(
+		filter,
+	)
+	return args.Get(0).(*protobufs.TimeoutCertificate), args.Error(1)
+}
+
+// GetQuorumCertificate implements store.ClockStore.
+func (m *MockClockStore) GetQuorumCertificate(filter []byte, rank uint64) (
+	*protobufs.QuorumCertificate,
+	error,
+) {
+	args := m.Called(
+		filter,
+		rank,
+	)
+	return args.Get(0).(*protobufs.QuorumCertificate), args.Error(1)
+}
+
+// GetTimeoutCertificate implements store.ClockStore.
+func (m *MockClockStore) GetTimeoutCertificate(filter []byte, rank uint64) (
+	*protobufs.TimeoutCertificate,
+	error,
+) {
+	args := m.Called(
+		filter,
+		rank,
+	)
+	return args.Get(0).(*protobufs.TimeoutCertificate), args.Error(1)
+}
+
+// PutCertifiedAppShardState implements store.ClockStore.
+func (m *MockClockStore) PutCertifiedAppShardState(
+	state *protobufs.AppShardProposal,
+	txn store.Transaction,
+) error {
+	args := m.Called(
+		state,
+		txn,
+	)
+	return args.Error(0)
+}
+
+// PutCertifiedGlobalState implements store.ClockStore.
+func (m *MockClockStore) PutCertifiedGlobalState(
+	state *protobufs.GlobalProposal,
+	txn store.Transaction,
+) error {
+	args := m.Called(
+		state,
+		txn,
+	)
+	return args.Error(0)
+}
+
+// PutQuorumCertificate implements store.ClockStore.
+func (m *MockClockStore) PutQuorumCertificate(
+	qc *protobufs.QuorumCertificate,
+	txn store.Transaction,
+) error {
+	args := m.Called(
+		qc,
+		txn,
+	)
+	return args.Error(0)
+}
+
+// PutTimeoutCertificate implements store.ClockStore.
+func (m *MockClockStore) PutTimeoutCertificate(
+	timeoutCertificate *protobufs.TimeoutCertificate,
+	txn store.Transaction,
+) error {
+	args := m.Called(
+		timeoutCertificate,
+		txn,
+	)
+	return args.Error(0)
+}
+
+// RangeCertifiedAppShardStates implements store.ClockStore.
+func (m *MockClockStore) RangeCertifiedAppShardStates(
+	filter []byte,
+	startRank uint64,
+	endRank uint64,
+) (store.TypedIterator[*protobufs.AppShardProposal], error) {
+	args := m.Called(
+		filter,
+		startRank,
+		endRank,
+	)
+	return args.Get(0).(store.TypedIterator[*protobufs.AppShardProposal]),
+		args.Error(1)
+}
+
+// RangeCertifiedGlobalStates implements store.ClockStore.
+func (m *MockClockStore) RangeCertifiedGlobalStates(
+	startRank uint64,
+	endRank uint64,
+) (store.TypedIterator[*protobufs.GlobalProposal], error) {
+	args := m.Called(
+		startRank,
+		endRank,
+	)
+	return args.Get(0).(store.TypedIterator[*protobufs.GlobalProposal]),
+		args.Error(1)
+}
+
+// RangeQuorumCertificates implements store.ClockStore.
+func (m *MockClockStore) RangeQuorumCertificates(
+	filter []byte,
+	startRank uint64,
+	endRank uint64,
+) (store.TypedIterator[*protobufs.QuorumCertificate], error) {
+	args := m.Called(
+		filter,
+		startRank,
+		endRank,
+	)
+	return args.Get(0).(store.TypedIterator[*protobufs.QuorumCertificate]),
+		args.Error(1)
+}
+
+// RangeTimeoutCertificates implements store.ClockStore.
+func (m *MockClockStore) RangeTimeoutCertificates(
+	filter []byte,
+	startRank uint64,
+	endRank uint64,
+) (store.TypedIterator[*protobufs.TimeoutCertificate], error) {
+	args := m.Called(
+		filter,
+		startRank,
+		endRank,
+	)
+	return args.Get(0).(store.TypedIterator[*protobufs.TimeoutCertificate]),
+		args.Error(1)
+}
+
 // CommitShardClockFrame implements store.ClockStore.
 func (m *MockClockStore) CommitShardClockFrame(
 	filter []byte,

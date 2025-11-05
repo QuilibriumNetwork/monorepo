@@ -119,7 +119,13 @@ func (e *GlobalConsensusEngine) LeaderForRank(
 		}
 	}
 
-	selector := found.Identity()
+	var selector models.Identity
+	if found == nil {
+		selector = models.Identity(make([]byte, 32))
+	} else {
+		selector = found.Identity()
+	}
+
 	prover, err := e.proverRegistry.GetNextProver([32]byte([]byte(selector)), nil)
 	if err != nil {
 		return "", errors.Wrap(err, "leader for rank")

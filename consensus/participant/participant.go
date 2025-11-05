@@ -42,8 +42,8 @@ func NewParticipant[
 	trustedRoot *models.CertifiedState[StateT],
 ) (*eventloop.EventLoop[StateT, VoteT], error) {
 	cfg, err := timeout.NewConfig(
-		1*time.Second,
-		3*time.Second,
+		10*time.Second,
+		30*time.Second,
 		1.2,
 		6,
 		10*time.Second,
@@ -52,7 +52,7 @@ func NewParticipant[
 		return nil, err
 	}
 
-	livenessState, err := consensusStore.GetLivenessState()
+	livenessState, err := consensusStore.GetLivenessState(filter)
 	if err != nil {
 		livenessState = &models.LivenessState{
 			Filter:                      filter,
@@ -66,7 +66,7 @@ func NewParticipant[
 		}
 	}
 
-	consensusState, err := consensusStore.GetConsensusState()
+	consensusState, err := consensusStore.GetConsensusState(filter)
 	if err != nil {
 		consensusState = &models.ConsensusState[VoteT]{
 			FinalizedRank:          trustedRoot.Rank(),
@@ -82,21 +82,10 @@ func NewParticipant[
 	voteAggregator.PruneUpToRank(trustedRoot.Rank())
 	timeoutAggregator.PruneUpToRank(trustedRoot.Rank())
 
-	// initialize dynamically updatable timeout config
-	timeoutConfig, err := timeout.NewConfig(
-		time.Duration(cfg.MinReplicaTimeout),
-		time.Duration(cfg.MaxReplicaTimeout),
-		cfg.TimeoutAdjustmentFactor,
-		cfg.HappyPathMaxRoundFailures,
-		time.Duration(cfg.MaxTimeoutStateRebroadcastInterval),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("could not initialize timeout config: %w", err)
-	}
-
 	// initialize the pacemaker
-	controller := timeout.NewController(timeoutConfig)
-	pacemaker, err := pacemaker.NewPacemaker(
+	controller := timeout.NewController(cfg)
+	pacemaker, err := pacemaker.NewPacemaker[StateT, VoteT](
+		filter,
 		controller,
 		pacemaker.NoProposalDelay(),
 		notifier,
@@ -108,7 +97,8 @@ func NewParticipant[
 	}
 
 	// initialize the safetyRules
-	safetyRules, err := safetyrules.NewSafetyRules(
+	safetyRules, err := safetyrules.NewSafetyRules[StateT, VoteT](
+		filter,
 		signer,
 		consensusStore,
 		committee,

@@ -163,6 +163,7 @@ func (f *ConsensusEngineFactory) CreateGlobalConsensusEngine(
 		f.inboxStore,
 		f.hypergraphStore,
 		f.shardsStore,
+		f.consensusStore,
 		f.workerStore,
 		f.encryptedChannel,
 		f.bulletproofProver,

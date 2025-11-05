@@ -48,6 +48,7 @@ var _ consensus.ProposalDurationProvider = (*Pacemaker[*nilUnique, *nilUnique])(
 // Expected error conditions:
 // * models.ConfigurationError if initial LivenessState is invalid
 func NewPacemaker[StateT models.Unique, VoteT models.Unique](
+	filter []byte,
 	timeoutController *timeout.Controller,
 	proposalDurationProvider consensus.ProposalDurationProvider,
 	notifier consensus.Consumer[StateT, VoteT],
@@ -55,7 +56,7 @@ func NewPacemaker[StateT models.Unique, VoteT models.Unique](
 	tracer consensus.TraceLogger,
 	recovery ...recoveryInformation[StateT, VoteT],
 ) (*Pacemaker[StateT, VoteT], error) {
-	vt, err := newRankTracker[StateT, VoteT](store)
+	vt, err := newRankTracker[StateT, VoteT](filter, store)
 	if err != nil {
 		return nil, fmt.Errorf("initializing rank tracker failed: %w", err)
 	}

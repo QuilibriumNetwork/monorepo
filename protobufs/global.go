@@ -142,7 +142,14 @@ func (g *GlobalFrame) Identity() models.Identity {
 
 // Source implements models.Unique.
 func (g *GlobalFrame) Source() models.Identity {
-	return g.Header.PublicKeySignatureBls48581.Identity()
+	id, err := poseidon.HashBytes(
+		g.Header.PublicKeySignatureBls48581.PublicKey.KeyValue,
+	)
+	if err != nil {
+		return ""
+	}
+
+	return models.Identity(id.FillBytes(make([]byte, 32)))
 }
 
 func (a *AppShardFrame) Clone() models.Unique {
@@ -176,7 +183,391 @@ func (a *AppShardFrame) Identity() models.Identity {
 
 // Source implements models.Unique.
 func (a *AppShardFrame) Source() models.Identity {
-	return a.Header.PublicKeySignatureBls48581.Identity()
+	return models.Identity(a.Header.Prover)
+}
+
+func (s *AppShardProposal) GetRank() uint64 {
+	rank := uint64(0)
+	if s.State != nil && s.State.GetRank() > rank {
+		rank = s.State.GetRank()
+	}
+	if s.ParentQuorumCertificate != nil &&
+		s.ParentQuorumCertificate.GetRank() > rank {
+		rank = s.ParentQuorumCertificate.GetRank()
+	}
+	if s.PriorRankTimeoutCertificate != nil &&
+		s.PriorRankTimeoutCertificate.GetRank() > rank {
+		rank = s.PriorRankTimeoutCertificate.GetRank()
+	}
+	return rank
+}
+
+func (s *AppShardProposal) ToCanonicalBytes() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Write type prefix
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		AppShardProposalType,
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write state
+	stateBytes, err := s.State.ToCanonicalBytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(stateBytes)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(stateBytes); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write parent_quorum_certificate
+	parentQCBytes, err := s.ParentQuorumCertificate.ToCanonicalBytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(parentQCBytes)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(parentQCBytes); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write prior_rank_timeout_certificate
+	if s.PriorRankTimeoutCertificate == nil {
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(0),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	} else {
+		priorTCBytes, err := s.PriorRankTimeoutCertificate.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(priorTCBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(priorTCBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write vote
+	voteBytes, err := s.Vote.ToCanonicalBytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(voteBytes)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(voteBytes); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (s *AppShardProposal) FromCanonicalBytes(data []byte) error {
+	buf := bytes.NewBuffer(data)
+
+	// Read and verify type prefix
+	var typePrefix uint32
+	if err := binary.Read(buf, binary.BigEndian, &typePrefix); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if typePrefix != AppShardProposalType {
+		return errors.Wrap(
+			errors.New("invalid type prefix"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read state
+	var stateLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &stateLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	stateBytes := make([]byte, stateLen)
+	if _, err := buf.Read(stateBytes); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	s.State = &AppShardFrame{}
+	if err := s.State.FromCanonicalBytes(stateBytes); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read parent_quorum_certificate
+	var parentQCLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &parentQCLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	parentQCBytes := make([]byte, parentQCLen)
+	if _, err := buf.Read(parentQCBytes); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	s.ParentQuorumCertificate = &QuorumCertificate{}
+	if err := s.ParentQuorumCertificate.FromCanonicalBytes(
+		parentQCBytes,
+	); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read prior_rank_timeout_certificate
+	var priorRankTCLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &priorRankTCLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	if priorRankTCLen != 0 {
+		priorRankTCBytes := make([]byte, priorRankTCLen)
+		if _, err := buf.Read(priorRankTCBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+
+		s.PriorRankTimeoutCertificate = &TimeoutCertificate{}
+		if err := s.PriorRankTimeoutCertificate.FromCanonicalBytes(
+			priorRankTCBytes,
+		); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	// Read vote
+	var voteLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &voteLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	voteBytes := make([]byte, voteLen)
+	if _, err := buf.Read(voteBytes); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	s.Vote = &ProposalVote{}
+	if err := s.Vote.FromCanonicalBytes(
+		voteBytes,
+	); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	return nil
+}
+
+func (s *GlobalProposal) GetRank() uint64 {
+	rank := uint64(0)
+	if s.State != nil && s.State.GetRank() > rank {
+		rank = s.State.GetRank()
+	}
+	if s.ParentQuorumCertificate != nil &&
+		s.ParentQuorumCertificate.GetRank() > rank {
+		rank = s.ParentQuorumCertificate.GetRank()
+	}
+	if s.PriorRankTimeoutCertificate != nil &&
+		s.PriorRankTimeoutCertificate.GetRank() > rank {
+		rank = s.PriorRankTimeoutCertificate.GetRank()
+	}
+	return rank
+}
+
+func (s *GlobalProposal) ToCanonicalBytes() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Write type prefix
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		GlobalProposalType,
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write state
+	stateBytes, err := s.State.ToCanonicalBytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(stateBytes)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(stateBytes); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write parent_quorum_certificate
+	parentQCBytes, err := s.ParentQuorumCertificate.ToCanonicalBytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(parentQCBytes)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(parentQCBytes); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write prior_rank_timeout_certificate
+	if s.PriorRankTimeoutCertificate == nil {
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(0),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	} else {
+		priorTCBytes, err := s.PriorRankTimeoutCertificate.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(priorTCBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(priorTCBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write vote
+	voteBytes, err := s.Vote.ToCanonicalBytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(voteBytes)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(voteBytes); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (s *GlobalProposal) FromCanonicalBytes(data []byte) error {
+	buf := bytes.NewBuffer(data)
+
+	// Read and verify type prefix
+	var typePrefix uint32
+	if err := binary.Read(buf, binary.BigEndian, &typePrefix); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if typePrefix != GlobalProposalType {
+		return errors.Wrap(
+			errors.New("invalid type prefix"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read state
+	var stateLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &stateLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	stateBytes := make([]byte, stateLen)
+	if _, err := buf.Read(stateBytes); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	s.State = &GlobalFrame{}
+	if err := s.State.FromCanonicalBytes(stateBytes); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read parent_quorum_certificate
+	var parentQCLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &parentQCLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	parentQCBytes := make([]byte, parentQCLen)
+	if _, err := buf.Read(parentQCBytes); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	s.ParentQuorumCertificate = &QuorumCertificate{}
+	if err := s.ParentQuorumCertificate.FromCanonicalBytes(
+		parentQCBytes,
+	); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read prior_rank_timeout_certificate
+	var priorRankTCLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &priorRankTCLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	if priorRankTCLen != 0 {
+		priorRankTCBytes := make([]byte, priorRankTCLen)
+		if _, err := buf.Read(priorRankTCBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+
+		s.PriorRankTimeoutCertificate = &TimeoutCertificate{}
+		if err := s.PriorRankTimeoutCertificate.FromCanonicalBytes(
+			priorRankTCBytes,
+		); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	// Read vote
+	var voteLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &voteLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	voteBytes := make([]byte, voteLen)
+	if _, err := buf.Read(voteBytes); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	s.Vote = &ProposalVote{}
+	if err := s.Vote.FromCanonicalBytes(
+		voteBytes,
+	); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	return nil
 }
 
 func (s *SeniorityMerge) ToCanonicalBytes() ([]byte, error) {
@@ -4398,11 +4789,103 @@ func (f *ProposalVote) Validate() error {
 	return nil
 }
 
+var _ ValidatableMessage = (*AppShardProposal)(nil)
+
+func (f *AppShardProposal) Validate() error {
+	if f == nil {
+		return errors.Wrap(errors.New("nil proposal"), "validate")
+	}
+
+	if f.State == nil {
+		return errors.Wrap(
+			errors.New("missing state"),
+			"validate",
+		)
+	}
+
+	if err := f.State.Validate(); err != nil {
+		return err
+	}
+
+	if f.ParentQuorumCertificate == nil {
+		return errors.Wrap(
+			errors.New("missing parent quorum certificate"),
+			"validate",
+		)
+	}
+
+	if err := f.ParentQuorumCertificate.Validate(); err != nil {
+		return err
+	}
+
+	if f.PriorRankTimeoutCertificate != nil {
+		if err := f.PriorRankTimeoutCertificate.Validate(); err != nil {
+			return err
+		}
+	}
+
+	if f.Vote == nil {
+		return errors.Wrap(errors.New("missing vote"), "validate")
+	}
+
+	if err := f.Vote.Validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+var _ ValidatableMessage = (*GlobalProposal)(nil)
+
+func (f *GlobalProposal) Validate() error {
+	if f == nil {
+		return errors.Wrap(errors.New("nil proposal"), "validate")
+	}
+
+	if f.State == nil {
+		return errors.Wrap(
+			errors.New("missing state"),
+			"validate",
+		)
+	}
+
+	if err := f.State.Validate(); err != nil {
+		return err
+	}
+
+	if f.ParentQuorumCertificate == nil {
+		return errors.Wrap(
+			errors.New("missing parent quorum certificate"),
+			"validate",
+		)
+	}
+
+	if err := f.ParentQuorumCertificate.Validate(); err != nil {
+		return err
+	}
+
+	if f.PriorRankTimeoutCertificate != nil {
+		if err := f.PriorRankTimeoutCertificate.Validate(); err != nil {
+			return err
+		}
+	}
+
+	if f.Vote == nil {
+		return errors.Wrap(errors.New("missing vote"), "validate")
+	}
+
+	if err := f.Vote.Validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 var _ ValidatableMessage = (*TimeoutState)(nil)
 
 func (f *TimeoutState) Validate() error {
 	if f == nil {
-		return errors.Wrap(errors.New("nil vote"), "validate")
+		return errors.Wrap(errors.New("nil timeout state"), "validate")
 	}
 
 	if f.LatestQuorumCertificate != nil {

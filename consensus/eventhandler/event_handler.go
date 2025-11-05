@@ -491,6 +491,11 @@ func (e *EventHandler[
 ]) proposeForNewRankIfPrimary() error {
 	start := time.Now() // track the start time
 	curRank := e.paceMaker.CurrentRank()
+	e.tracer.Trace(
+		"deciding to propose",
+		consensus.Uint64Param("current_rank", curRank),
+		consensus.IdentityParam("self", e.committee.Self()),
+	)
 	currentLeader, err := e.committee.LeaderForRank(curRank)
 	if err != nil {
 		return fmt.Errorf(

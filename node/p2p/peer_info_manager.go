@@ -36,6 +36,7 @@ func (m *InMemoryPeerInfoManager) Start(
 	ctx lifecycle.SignalerContext,
 	ready lifecycle.ReadyFunc,
 ) {
+	m.ctx = ctx
 	ready()
 	for {
 		select {
@@ -74,7 +75,7 @@ func (m *InMemoryPeerInfoManager) Start(
 				LastSeen:     seen,
 			})
 			m.peerInfoMx.Unlock()
-		case <-m.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}

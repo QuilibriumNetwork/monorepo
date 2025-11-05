@@ -80,10 +80,7 @@ func (p *GlobalSyncProvider) Synchronize(
 		}
 
 		if !hasFrame {
-			p.engine.logger.Info("initializing genesis")
-			genesis := p.engine.initializeGenesis()
-			dataCh <- &genesis
-			errCh <- nil
+			errCh <- errors.New("no frame")
 			return
 		}
 

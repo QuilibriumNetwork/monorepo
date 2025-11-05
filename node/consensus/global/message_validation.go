@@ -30,33 +30,25 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 	typePrefix := binary.BigEndian.Uint32(message.Data[:4])
 
 	switch typePrefix {
-	case protobufs.GlobalFrameType:
+	case protobufs.GlobalProposalType:
 		start := time.Now()
 		defer func() {
 			proposalValidationDuration.Observe(time.Since(start).Seconds())
 		}()
 
-		frame := &protobufs.GlobalFrame{}
-		if err := frame.FromCanonicalBytes(message.Data); err != nil {
+		proposal := &protobufs.GlobalProposal{}
+		if err := proposal.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
 			proposalValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
-		if frametime.GlobalFrameSince(frame) > 20*time.Second {
+		if frametime.GlobalFrameSince(proposal.State) > 20*time.Second {
 			proposalValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultIgnore
 		}
 
-		if frame.Header.PublicKeySignatureBls48581 == nil ||
-			frame.Header.PublicKeySignatureBls48581.PublicKey == nil ||
-			frame.Header.PublicKeySignatureBls48581.PublicKey.KeyValue == nil {
-			e.logger.Debug("global frame validation missing signature")
-			proposalValidationTotal.WithLabelValues("reject").Inc()
-			return tp2p.ValidationResultReject
-		}
-
-		valid, err := e.frameValidator.Validate(frame)
+		valid, err := e.frameValidator.Validate(proposal.State)
 		if err != nil {
 			e.logger.Debug("global frame validation error", zap.Error(err))
 			proposalValidationTotal.WithLabelValues("reject").Inc()
@@ -104,7 +96,7 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			timeoutStateValidationDuration.Observe(time.Since(start).Seconds())
 		}()
 
-		timeoutState := &protobufs.QuorumCertificate{}
+		timeoutState := &protobufs.TimeoutState{}
 		if err := timeoutState.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal timeoutState", zap.Error(err))
 			timeoutStateValidationTotal.WithLabelValues("reject").Inc()

@@ -15,6 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
@@ -54,7 +55,10 @@ func (e *GlobalConsensusEngine) getMainnetGenesisJSON() *GenesisJson {
 }
 
 // TODO[2.1.1+]: Refactor out direct hypergraph access
-func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
+func (e *GlobalConsensusEngine) initializeGenesis() (
+	*protobufs.GlobalFrame,
+	*protobufs.QuorumCertificate,
+) {
 	e.logger.Info("initializing genesis frame for global consensus")
 
 	var genesisFrame *protobufs.GlobalFrame
@@ -63,7 +67,7 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 	if e.config.P2P.Network == 0 {
 		genesisData := e.getMainnetGenesisJSON()
 		if genesisData == nil {
-			return nil
+			return nil, nil
 		}
 
 		// Decode base64 encoded fields
@@ -72,13 +76,13 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 		)
 		if err != nil {
 			e.logger.Error("failed to decode parent selector", zap.Error(err))
-			return nil
+			return nil, nil
 		}
 
 		output, err := base64.StdEncoding.DecodeString(genesisData.Output)
 		if err != nil {
 			e.logger.Error("failed to decode output", zap.Error(err))
-			return nil
+			return nil, nil
 		}
 
 		// Create genesis header with actual data
@@ -124,7 +128,7 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 					zap.String("value", base64Value),
 					zap.Error(err),
 				)
-				return nil
+				return nil, nil
 			}
 
 			l1 := up2p.GetBloomFilterIndices(keyBytes, 256, 3)
@@ -148,7 +152,7 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 							zap.Error(err),
 						)
 						txn.Abort()
-						return nil
+						return nil, nil
 					}
 				}
 			}
@@ -169,19 +173,19 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 		err = e.establishMainnetGenesisProvers(state, genesisData)
 		if err != nil {
 			e.logger.Error("failed to establish provers", zap.Error(err))
-			return nil
+			return nil, nil
 		}
 
 		err = state.Commit()
 		if err != nil {
 			e.logger.Error("failed to commit", zap.Error(err))
-			return nil
+			return nil, nil
 		}
 
 		roots, err := e.hypergraph.Commit(0)
 		if err != nil {
 			e.logger.Error("could not commit", zap.Error(err))
-			return nil
+			return nil, nil
 		}
 
 		proverRoots := roots[tries.ShardKey{
@@ -224,7 +228,7 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 				"failed to place app shard",
 				zap.Error(err),
 			)
-			return nil
+			return nil, nil
 		}
 
 		l1 := up2p.GetBloomFilterIndices(token.QUIL_TOKEN_ADDRESS, 256, 3)
@@ -240,7 +244,7 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 				zap.Error(err),
 			)
 			txn.Abort()
-			return nil
+			return nil, nil
 		}
 		if err = txn.Commit(); err != nil {
 			e.logger.Error(
@@ -248,7 +252,7 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 				zap.Error(err),
 			)
 			txn.Abort()
-			return nil
+			return nil, nil
 		}
 	}
 
@@ -260,18 +264,61 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 	e.frameStoreMu.Unlock()
 
 	// Add to time reel
-	if err := e.globalTimeReel.Insert(e.ctx, genesisFrame); err != nil {
-		e.logger.Error("failed to add genesis frame to time reel", zap.Error(err))
-		// Clean up on error
-		e.frameStoreMu.Lock()
-		delete(e.frameStore, string(frameID))
-		e.frameStoreMu.Unlock()
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		panic(err)
+	}
+	if err := e.clockStore.PutGlobalClockFrame(genesisFrame, txn); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add frame", zap.Error(err))
+		e.ctx.Throw(err)
+		return nil, nil
+	}
+	genesisQC := &protobufs.QuorumCertificate{
+		Rank:               0,
+		Filter:             []byte{},
+		FrameNumber:        genesisFrame.Header.FrameNumber,
+		Selector:           []byte(genesisFrame.Identity()),
+		Timestamp:          0,
+		AggregateSignature: &protobufs.BLS48581AggregateSignature{},
+	}
+	if err := e.clockStore.PutQuorumCertificate(genesisQC, txn); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add quorum certificate", zap.Error(err))
+		e.ctx.Throw(err)
+		return nil, nil
+	}
+	if err := txn.Commit(); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add frame", zap.Error(err))
+		e.ctx.Throw(err)
+		return nil, nil
+	}
+	if err = e.consensusStore.PutLivenessState(
+		&models.LivenessState{
+			CurrentRank:             1,
+			LatestQuorumCertificate: genesisQC,
+		},
+	); err != nil {
+		e.logger.Error("could not add liveness state", zap.Error(err))
+		e.ctx.Throw(err)
+		return nil, nil
+	}
+	if err = e.consensusStore.PutConsensusState(
+		&models.ConsensusState[*protobufs.ProposalVote]{
+			FinalizedRank:          0,
+			LatestAcknowledgedRank: 0,
+		},
+	); err != nil {
+		e.logger.Error("could not add consensus state", zap.Error(err))
+		e.ctx.Throw(err)
+		return nil, nil
 	}
 
 	e.proverRegistry.Refresh()
 
 	e.logger.Info("initialized genesis frame for global consensus")
-	return genesisFrame
+	return genesisFrame, genesisQC
 }
 
 // createStubGenesis creates a stub genesis frame for non-mainnet networks
@@ -468,12 +515,21 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 	e.frameStoreMu.Unlock()
 
 	// Add to time reel
-	if err := e.globalTimeReel.Insert(e.ctx, genesisFrame); err != nil {
-		e.logger.Error("failed to add genesis frame to time reel", zap.Error(err))
-		// Clean up on error
-		e.frameStoreMu.Lock()
-		delete(e.frameStore, string(frameID))
-		e.frameStoreMu.Unlock()
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		panic(err)
+	}
+	if err := e.clockStore.PutGlobalClockFrame(genesisFrame, txn); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add frame", zap.Error(err))
+		e.ctx.Throw(err)
+		return nil
+	}
+	if err := txn.Commit(); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add frame", zap.Error(err))
+		e.ctx.Throw(err)
+		return nil
 	}
 
 	return genesisFrame

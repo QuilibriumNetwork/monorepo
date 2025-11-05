@@ -67,10 +67,10 @@ func (s *PacemakerTestSuite) SetupTest() {
 		PriorRankTimeoutCertificate: nil,
 		LatestQuorumCertificate:     s.initialQC,
 	}
-	s.store.On("GetLivenessState").Return(livenessState, nil)
+	s.store.On("GetLivenessState", mock.Anything).Return(livenessState, nil)
 
 	// init Pacemaker and start
-	s.pacemaker, err = NewPacemaker(timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger())
+	s.pacemaker, err = NewPacemaker(nil, timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger())
 	require.NoError(s.T(), err)
 
 	var ctx context.Context
@@ -335,6 +335,7 @@ func (s *PacemakerTestSuite) Test_Initialization() {
 	// test that the constructor finds the newest QC and TC
 	s.Run("Random TCs and QCs combined", func() {
 		pm, err := NewPacemaker(
+			nil,
 			timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(),
 			WithQCs[*helper.TestState, *helper.TestVote](qcs...), WithTCs[*helper.TestState, *helper.TestVote](tcs...),
 		)
@@ -355,6 +356,7 @@ func (s *PacemakerTestSuite) Test_Initialization() {
 		tcs[45] = helper.MakeTC(helper.WithTCRank(highestRank+15), helper.WithTCNewestQC(QC(highestRank+12)))
 
 		pm, err := NewPacemaker(
+			nil,
 			timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(),
 			WithTCs[*helper.TestState, *helper.TestVote](tcs...), WithQCs[*helper.TestState, *helper.TestVote](qcs...),
 		)
@@ -375,6 +377,7 @@ func (s *PacemakerTestSuite) Test_Initialization() {
 		tcs[45] = helper.MakeTC(helper.WithTCRank(highestRank+15), helper.WithTCNewestQC(QC(highestRank+15)))
 
 		pm, err := NewPacemaker(
+			nil,
 			timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(),
 			WithTCs[*helper.TestState, *helper.TestVote](tcs...), WithQCs[*helper.TestState, *helper.TestVote](qcs...),
 		)
@@ -391,11 +394,11 @@ func (s *PacemakerTestSuite) Test_Initialization() {
 	// Verify that WithTCs still works correctly if no TCs are given:
 	// the list of TCs is empty or all contained TCs are nil
 	s.Run("Only nil TCs", func() {
-		pm, err := NewPacemaker(timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(), WithTCs[*helper.TestState, *helper.TestVote]())
+		pm, err := NewPacemaker(nil, timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(), WithTCs[*helper.TestState, *helper.TestVote]())
 		require.NoError(s.T(), err)
 		require.Equal(s.T(), s.initialRank, pm.CurrentRank())
 
-		pm, err = NewPacemaker(timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(), WithTCs[*helper.TestState, *helper.TestVote](nil, nil, nil))
+		pm, err = NewPacemaker(nil, timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(), WithTCs[*helper.TestState, *helper.TestVote](nil, nil, nil))
 		require.NoError(s.T(), err)
 		require.Equal(s.T(), s.initialRank, pm.CurrentRank())
 	})
@@ -403,11 +406,11 @@ func (s *PacemakerTestSuite) Test_Initialization() {
 	// Verify that WithQCs still works correctly if no QCs are given:
 	// the list of QCs is empty or all contained QCs are nil
 	s.Run("Only nil QCs", func() {
-		pm, err := NewPacemaker(timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(), WithQCs[*helper.TestState, *helper.TestVote]())
+		pm, err := NewPacemaker(nil, timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(), WithQCs[*helper.TestState, *helper.TestVote]())
 		require.NoError(s.T(), err)
 		require.Equal(s.T(), s.initialRank, pm.CurrentRank())
 
-		pm, err = NewPacemaker(timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(), WithQCs[*helper.TestState, *helper.TestVote](nil, nil, nil))
+		pm, err = NewPacemaker(nil, timeout.NewController(s.timeoutConf), NoProposalDelay(), s.notifier, s.store, helper.Logger(), WithQCs[*helper.TestState, *helper.TestVote](nil, nil, nil))
 		require.NoError(s.T(), err)
 		require.Equal(s.T(), s.initialRank, pm.CurrentRank())
 	})
@@ -417,7 +420,7 @@ func (s *PacemakerTestSuite) Test_Initialization() {
 // TestProposalDuration tests that the active pacemaker forwards proposal duration values from the provider.
 func (s *PacemakerTestSuite) TestProposalDuration() {
 	proposalDurationProvider := NewStaticProposalDurationProvider(time.Millisecond * 500)
-	pm, err := NewPacemaker(timeout.NewController(s.timeoutConf), &proposalDurationProvider, s.notifier, s.store, helper.Logger())
+	pm, err := NewPacemaker(nil, timeout.NewController(s.timeoutConf), &proposalDurationProvider, s.notifier, s.store, helper.Logger())
 	require.NoError(s.T(), err)
 
 	now := time.Now().UTC()
