@@ -4712,11 +4712,6 @@ func (h *FrameHeader) Validate() error {
 
 	// Fee multiplier vote is uint64, any value is valid
 
-	// Signature must be present
-	if h.PublicKeySignatureBls48581 == nil {
-		return errors.Wrap(errors.New("missing signature"), "validate")
-	}
-
 	return nil
 }
 
@@ -4771,9 +4766,12 @@ func (f *ProposalVote) Validate() error {
 
 	// Rank and frame number is uint64, any value is valid
 
-	// Selector should be 32 bytes
-	if len(f.Selector) != 32 {
-		return errors.Wrap(errors.New("invalid selector length"), "validate")
+	// Selector should be 32 bytes (proposal) or zero (timeout)
+	if len(f.Selector) != 32 && len(f.Selector) != 0 {
+		return errors.Wrap(
+			errors.Errorf("invalid selector length: %d", len(f.Selector)),
+			"validate",
+		)
 	}
 
 	// Signature must be present
@@ -4888,10 +4886,12 @@ func (f *TimeoutState) Validate() error {
 		return errors.Wrap(errors.New("nil timeout state"), "validate")
 	}
 
-	if f.LatestQuorumCertificate != nil {
-		if err := f.LatestQuorumCertificate.Validate(); err != nil {
-			return err
-		}
+	if f.LatestQuorumCertificate == nil {
+		return errors.Wrap(errors.New("nil latest quorum certificate"), "validate")
+	}
+
+	if err := f.LatestQuorumCertificate.Validate(); err != nil {
+		return err
 	}
 
 	if f.PriorRankTimeoutCertificate != nil {
@@ -5000,8 +5000,19 @@ func (a *AppShardFrame) Validate() error {
 		return errors.Wrap(err, "validate")
 	}
 
-	// Requests are raw bytes, no specific validation needed
-	// Each request will be validated when deserialized
+	// Validate each request
+	for i, request := range a.Requests {
+		if request == nil {
+			return errors.Wrapf(
+				errors.New("nil request"),
+				"validate: request %d",
+				i,
+			)
+		}
+		if err := request.Validate(); err != nil {
+			return errors.Wrapf(err, "validate: request %d", i)
+		}
+	}
 
 	return nil
 }

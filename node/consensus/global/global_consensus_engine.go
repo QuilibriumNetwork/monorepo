@@ -2663,6 +2663,18 @@ func (e *GlobalConsensusEngine) VerifyQuorumCertificate(
 		return errors.Wrap(err, "verify quorum certificate")
 	}
 
+	// genesis qc is special:
+	if quorumCertificate.GetRank() == 0 {
+		genqc, err := e.clockStore.GetQuorumCertificate(nil, 0)
+		if err != nil {
+			return errors.Wrap(err, "verify quorum certificate")
+		}
+
+		if genqc.Equals(quorumCertificate) {
+			return nil
+		}
+	}
+
 	provers, err := e.proverRegistry.GetActiveProvers(nil)
 	if err != nil {
 		return errors.Wrap(err, "verify quorum certificate")

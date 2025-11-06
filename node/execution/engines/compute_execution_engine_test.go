@@ -492,6 +492,7 @@ func createTestAppConsensusEngine(
 	clockStore := pstore.NewPebbleClockStore(pebbleDB, logger)
 	inboxStore := pstore.NewPebbleInboxStore(pebbleDB, logger)
 	shardStore := pstore.NewPebbleShardsStore(pebbleDB, logger)
+	consensusStore := pstore.NewPebbleConsensusStore(pebbleDB, logger)
 	hypergraphStore := pstore.NewPebbleHypergraphStore(config.DB, pebbleDB, logger, &mocks.MockVerifiableEncryptor{}, mockInclusionProver)
 	appTimeReel := createTestAppTimeReel(t, appAddress, clockStore)
 	mockProverRegistry := createTestProverRegistry()
@@ -549,6 +550,7 @@ func createTestAppConsensusEngine(
 		inboxStore,
 		shardStore,
 		hypergraphStore,
+		consensusStore,
 		mockFrameProver,
 		mockInclusionProver,
 		&mocks.MockBulletproofProver{},   // bulletproofProver

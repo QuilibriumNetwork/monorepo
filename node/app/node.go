@@ -109,6 +109,8 @@ func (m *MasterNode) Start(quitCh chan struct{}) error {
 		errChan <- supervisor.Start(context.Background())
 	}()
 
+	m.logger.Info("master node started", zap.Uint("core_id", m.coreId))
+
 	select {
 	case err := <-errChan:
 		if err != nil {
@@ -116,10 +118,6 @@ func (m *MasterNode) Start(quitCh chan struct{}) error {
 		}
 	}
 
-	m.logger.Info("master node started", zap.Uint("core_id", m.coreId))
-
-	// Wait for shutdown signal
-	<-m.quit
 	return nil
 }
 

@@ -66,19 +66,33 @@ func (p *AppLeaderProvider) ProveNextState(
 	filter []byte,
 	priorState models.Identity,
 ) (**protobufs.AppShardFrame, error) {
+	_, err := p.engine.livenessProvider.Collect(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "prove next state")
+	}
+
 	timer := prometheus.NewTimer(frameProvingDuration.WithLabelValues(
 		p.engine.appAddressHex,
 	))
 	defer timer.ObserveDuration()
 
-	prior, err := p.engine.appTimeReel.GetFrame(priorState)
+	prior, _, err := p.engine.clockStore.GetLatestShardClockFrame(
+		p.engine.appAddress,
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "prove next state")
 	}
 
 	if prior == nil {
-		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
+		frameProvingTotal.WithLabelValues("error").Inc()
 		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
+	}
+
+	if prior.Identity() != priorState {
+		return nil, errors.Wrap(
+			errors.New("missing prior frame"),
+			"prove next state",
+		)
 	}
 
 	// Get prover index
@@ -120,7 +134,7 @@ func (p *AppLeaderProvider) ProveNextState(
 	)
 
 	// Prove the frame
-	newFrame, err := p.engine.internalProveFrame(messages, prior)
+	newFrame, err := p.engine.internalProveFrame(rank, messages, prior)
 	if err != nil {
 		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
 		return nil, errors.Wrap(err, "prove frame")

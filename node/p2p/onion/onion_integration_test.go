@@ -347,8 +347,9 @@ func TestOnionGRPC_RealRelayAndKeys(t *testing.T) {
 	// 6) PeerInfoManager ordering (entry->middle->exit)
 	pm := p2p.NewInMemoryPeerInfoManager(logger)
 	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
-	go pm.Start(ctx, func() {})
-	time.Sleep(100 * time.Millisecond)
+	readyWait := make(chan struct{})
+	go pm.Start(ctx, func() { close(readyWait) })
+	<-readyWait
 	defer cancel()
 	pm.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relay1"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	pm.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relay2"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
@@ -462,14 +463,18 @@ func TestHiddenService_RemoteRendezvous(t *testing.T) {
 	// Peer managers (client knows R, service knows A then R)
 	pmClient := p2p.NewInMemoryPeerInfoManager(logger)
 	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
-	go pmClient.Start(ctx, func() {})
+	readyWait := make(chan struct{})
+	go pmClient.Start(ctx, func() { close(readyWait) })
+	<-readyWait
 	defer cancel()
 	// client knows three rendezvous relays
 	for _, id := range [][]byte{[]byte("relayR1"), []byte("relayR2"), []byte("relayR3")} {
 		pmClient.AddPeerInfo(&protobufs.PeerInfo{PeerId: id, Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	}
 	pmService := p2p.NewInMemoryPeerInfoManager(logger)
-	go pmService.Start(ctx, func() {})
+	readyWait = make(chan struct{})
+	go pmService.Start(ctx, func() { close(readyWait) })
+	<-readyWait
 
 	// service knows three intro relays
 	for _, id := range [][]byte{[]byte("relayA1"), []byte("relayA2"), []byte("relayA3")} {
@@ -510,7 +515,9 @@ func TestHiddenService_RemoteRendezvous(t *testing.T) {
 
 	// CLIENT: build circuit to intro relay and send INTRODUCE(serviceID, "relayR", cookie, clientSid)
 	pmIntro := p2p.NewInMemoryPeerInfoManager(logger)
-	go pmIntro.Start(ctx, func() {})
+	readyWait = make(chan struct{})
+	go pmIntro.Start(ctx, func() { close(readyWait) })
+	<-readyWait
 	pmIntro.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relayA1"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	pmIntro.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relayA2"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})
 	pmIntro.AddPeerInfo(&protobufs.PeerInfo{PeerId: []byte("relayA3"), Capabilities: []*protobufs.Capability{{ProtocolIdentifier: onion.ProtocolRouting}}})

@@ -546,9 +546,6 @@ func main() {
 
 	logger.Info("starting node...")
 
-	done := make(chan os.Signal, 1)
-	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
-
 	// Create MasterNode for core 0
 	masterNode, err := app.NewMasterNode(logger, nodeConfig, uint(*core))
 	if err != nil {
@@ -598,7 +595,6 @@ func main() {
 	monitor.Start(ctx)
 
 	select {
-	case <-done:
 	case <-diskFullCh:
 	case <-quitCh:
 	}

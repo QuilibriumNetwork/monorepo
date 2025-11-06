@@ -58,12 +58,7 @@ func (p *AppSyncProvider) Synchronize(
 		p.engine.frameStoreMu.RUnlock()
 
 		if !hasFrame {
-			// No peers and no frame - we're the first node, initialize genesis
-			p.engine.logger.Info("no frame detected, initializing with genesis")
-			syncStatusCheck.WithLabelValues(p.engine.appAddressHex, "synced").Inc()
-			genesis := p.engine.initializeGenesis()
-			dataCh <- &genesis
-			errCh <- nil
+			errCh <- errors.New("no frame")
 			return
 		}
 

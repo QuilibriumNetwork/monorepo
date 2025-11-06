@@ -27,6 +27,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/difficulty"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/fees"
@@ -219,6 +220,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		nodeClockStore := store.NewPebbleClockStore(nodeDB, logger)
 		nodeInboxStore := store.NewPebbleInboxStore(nodeDB, logger)
 		nodeShardsStore := store.NewPebbleShardsStore(nodeDB, logger)
+		nodeConsensusStore := store.NewPebbleConsensusStore(nodeDB, logger)
 		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{})
 
 		// Create mock pubsub for network simulation
@@ -261,6 +263,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 			nodeInboxStore,
 			nodeShardsStore,
 			nodeHypergraphStore,
+			nodeConsensusStore,
 			frameProver,
 			nodeInclusionProver,
 			bulletproofs.NewBulletproofProver(),
@@ -350,8 +353,12 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 	// Start all nodes
 	t.Log("Step 4: Starting all nodes")
+	cancels := []func(){}
 	for _, node := range nodes {
-		node.engine.Start(node.quit)
+		ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+		err := node.engine.Start(ctx)
+		require.NoError(t, err)
+		cancels = append(cancels, cancel)
 	}
 
 	// Wait for genesis

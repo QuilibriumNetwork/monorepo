@@ -3,7 +3,6 @@ package app
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -175,6 +174,7 @@ func NewAppConsensusEngine(
 	inboxStore store.InboxStore,
 	shardsStore store.ShardsStore,
 	hypergraphStore store.HypergraphStore,
+	consensusStore consensus.ConsensusStore[*protobufs.ProposalVote],
 	frameProver crypto.FrameProver,
 	inclusionProver crypto.InclusionProver,
 	bulletproofProver crypto.BulletproofProver,
@@ -212,6 +212,7 @@ func NewAppConsensusEngine(
 		inboxStore:                 inboxStore,
 		shardsStore:                shardsStore,
 		hypergraphStore:            hypergraphStore,
+		consensusStore:             consensusStore,
 		frameProver:                frameProver,
 		inclusionProver:            inclusionProver,
 		signerRegistry:             signerRegistry,
@@ -250,7 +251,7 @@ func NewAppConsensusEngine(
 	engine.signatureAggregator = aggregator.WrapSignatureAggregator(
 		engine.blsConstructor,
 		engine.proverRegistry,
-		nil,
+		appAddress,
 	)
 	voteAggregationDistributor := voting.NewAppShardVoteAggregationDistributor()
 	engine.voteCollectorDistributor =
@@ -412,25 +413,41 @@ func NewAppConsensusEngine(
 	executorsRegistered.WithLabelValues(engine.appAddressHex).Set(0)
 	pendingMessagesCount.WithLabelValues(engine.appAddressHex).Set(0)
 
-	engine.ctx, engine.cancel, _ = lifecycle.WithSignallerAndCancel(
-		context.Background(),
-	)
 	componentBuilder := lifecycle.NewComponentManagerBuilder()
 	// Add execution engines
 	componentBuilder.AddWorker(engine.executionManager.Start)
 	componentBuilder.AddWorker(engine.eventDistributor.Start)
 	componentBuilder.AddWorker(engine.appTimeReel.Start)
-	frame, _, err := engine.clockStore.GetLatestShardClockFrame(engine.appAddress)
+	latest, err := engine.clockStore.GetLatestCertifiedAppShardState(
+		engine.appAddress,
+	)
+	var state *models.CertifiedState[*protobufs.AppShardFrame]
 	if err != nil {
-		engine.logger.Warn(
-			"invalid frame retrieved, will resync",
-			zap.Error(err),
-		)
-	}
-
-	var initialState **protobufs.AppShardFrame = nil
-	if frame != nil {
-		initialState = &frame
+		frame, qc := engine.initializeGenesis()
+		state = &models.CertifiedState[*protobufs.AppShardFrame]{
+			State: &models.State[*protobufs.AppShardFrame]{
+				Rank:       0,
+				Identifier: frame.Identity(),
+				State:      &frame,
+			},
+			CertifyingQuorumCertificate: qc,
+		}
+	} else {
+		qc, err := engine.clockStore.GetLatestQuorumCertificate(nil)
+		if err != nil {
+			panic(err)
+		}
+		state = &models.CertifiedState[*protobufs.AppShardFrame]{
+			State: &models.State[*protobufs.AppShardFrame]{
+				Rank:                    latest.GetRank(),
+				Identifier:              latest.State.Identity(),
+				ProposerID:              qc.Source(),
+				ParentQuorumCertificate: latest.ParentQuorumCertificate,
+				Timestamp:               latest.State.GetTimestamp(),
+				State:                   &latest.State,
+			},
+			CertifyingQuorumCertificate: qc,
+		}
 	}
 
 	engine.voteAggregator, err = voting.NewAppShardVoteAggregator[PeerID](
@@ -443,7 +460,7 @@ func NewAppConsensusEngine(
 		func(qc models.QuorumCertificate) {
 			engine.consensusParticipant.OnQuorumCertificateConstructedFromVotes(qc)
 		},
-		(*initialState).GetRank(),
+		state.Rank(),
 	)
 	if err != nil {
 		return nil, err
@@ -456,14 +473,14 @@ func NewAppConsensusEngine(
 		engine.signatureAggregator,
 		timeoutAggregationDistributor,
 		engine.votingProvider,
-		(*initialState).GetRank(),
+		state.Rank(),
 	)
 
 	componentBuilder.AddWorker(func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
-		if err := engine.startConsensus(initialState, ctx, ready); err != nil {
+		if err := engine.startConsensus(state, ctx, ready); err != nil {
 			ctx.Throw(err)
 			return
 		}
@@ -473,49 +490,41 @@ func NewAppConsensusEngine(
 
 	err = engine.subscribeToConsensusMessages()
 	if err != nil {
-		engine.ctx.Throw(errors.Wrap(err, "start"))
 		return nil, err
 	}
 
 	err = engine.subscribeToProverMessages()
 	if err != nil {
-		engine.ctx.Throw(errors.Wrap(err, "start"))
 		return nil, err
 	}
 
 	err = engine.subscribeToFrameMessages()
 	if err != nil {
-		engine.ctx.Throw(errors.Wrap(err, "start"))
 		return nil, err
 	}
 
 	err = engine.subscribeToGlobalFrameMessages()
 	if err != nil {
-		engine.ctx.Throw(errors.Wrap(err, "start"))
 		return nil, err
 	}
 
 	err = engine.subscribeToGlobalProverMessages()
 	if err != nil {
-		engine.ctx.Throw(errors.Wrap(err, "start"))
 		return nil, err
 	}
 
 	err = engine.subscribeToGlobalAlertMessages()
 	if err != nil {
-		engine.ctx.Throw(errors.Wrap(err, "start"))
 		return nil, err
 	}
 
 	err = engine.subscribeToPeerInfoMessages()
 	if err != nil {
-		engine.ctx.Throw(errors.Wrap(err, "start"))
 		return nil, err
 	}
 
 	err = engine.subscribeToDispatchMessages()
 	if err != nil {
-		engine.ctx.Throw(errors.Wrap(err, "start"))
 		return nil, err
 	}
 
@@ -594,25 +603,9 @@ func NewAppConsensusEngine(
 		engine.updateMetricsLoop(ctx)
 	})
 
+	engine.ComponentManager = componentBuilder.Build()
+
 	return engine, nil
-}
-
-func (e *AppConsensusEngine) Start(quit chan struct{}) <-chan error {
-	errChan := make(chan error, 1)
-
-	e.quit = quit
-
-	e.logger.Info(
-		"app consensus engine started",
-		zap.String("app_address", hex.EncodeToString(e.appAddress)),
-	)
-
-	if e.grpcServer != nil {
-		e.RegisterServices(e.grpcServer)
-	}
-
-	close(errChan)
-	return errChan
 }
 
 func (e *AppConsensusEngine) Stop(force bool) <-chan error {
@@ -1085,7 +1078,10 @@ func (e *AppConsensusEngine) updateMetricsLoop(
 	}
 }
 
-func (e *AppConsensusEngine) initializeGenesis() *protobufs.AppShardFrame {
+func (e *AppConsensusEngine) initializeGenesis() (
+	*protobufs.AppShardFrame,
+	*protobufs.QuorumCertificate,
+) {
 	// Initialize state roots for hypergraph
 	stateRoots := make([][]byte, 4)
 	for i := range stateRoots {
@@ -1118,11 +1114,74 @@ func (e *AppConsensusEngine) initializeGenesis() *protobufs.AppShardFrame {
 	e.frameStore[string(frameID)] = genesisFrame
 	e.frameStoreMu.Unlock()
 
-	if err := e.appTimeReel.Insert(genesisFrame); err != nil {
-		e.logger.Error("failed to add genesis frame to time reel", zap.Error(err))
-		e.frameStoreMu.Lock()
-		delete(e.frameStore, string(frameID))
-		e.frameStoreMu.Unlock()
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		panic(err)
+	}
+	if err := e.clockStore.StageShardClockFrame(
+		[]byte(genesisFrame.Identity()),
+		genesisFrame,
+		txn,
+	); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add frame", zap.Error(err))
+		return nil, nil
+	}
+	if err := e.clockStore.CommitShardClockFrame(
+		e.appAddress,
+		genesisHeader.FrameNumber,
+		[]byte(genesisFrame.Identity()),
+		nil,
+		txn,
+		false,
+	); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add frame", zap.Error(err))
+		return nil, nil
+	}
+	genesisQC := &protobufs.QuorumCertificate{
+		Rank:        0,
+		Filter:      e.appFilter,
+		FrameNumber: genesisFrame.Header.FrameNumber,
+		Selector:    []byte(genesisFrame.Identity()),
+		Timestamp:   0,
+		AggregateSignature: &protobufs.BLS48581AggregateSignature{
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: make([]byte, 585),
+			},
+			Signature: make([]byte, 74),
+			Bitmask:   bytes.Repeat([]byte{0xff}, 32),
+		},
+	}
+	if err := e.clockStore.PutQuorumCertificate(genesisQC, txn); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add quorum certificate", zap.Error(err))
+		return nil, nil
+	}
+	if err := txn.Commit(); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add frame", zap.Error(err))
+		return nil, nil
+	}
+	if err = e.consensusStore.PutLivenessState(
+		&models.LivenessState{
+			Filter:                  e.appAddress,
+			CurrentRank:             1,
+			LatestQuorumCertificate: genesisQC,
+		},
+	); err != nil {
+		e.logger.Error("could not add liveness state", zap.Error(err))
+		return nil, nil
+	}
+	if err = e.consensusStore.PutConsensusState(
+		&models.ConsensusState[*protobufs.ProposalVote]{
+			Filter:                 e.appAddress,
+			FinalizedRank:          0,
+			LatestAcknowledgedRank: 0,
+		},
+	); err != nil {
+		e.logger.Error("could not add consensus state", zap.Error(err))
+		return nil, nil
 	}
 
 	e.logger.Info(
@@ -1130,7 +1189,7 @@ func (e *AppConsensusEngine) initializeGenesis() *protobufs.AppShardFrame {
 		zap.String("shard_address", hex.EncodeToString(e.appAddress)),
 	)
 
-	return genesisFrame
+	return genesisFrame, genesisQC
 }
 
 // adjustFeeForTraffic calculates a traffic-adjusted fee multiplier based on
@@ -1237,6 +1296,7 @@ func (e *AppConsensusEngine) adjustFeeForTraffic(baseFee uint64) uint64 {
 }
 
 func (e *AppConsensusEngine) internalProveFrame(
+	rank uint64,
 	messages []*protobufs.Message,
 	previousFrame *protobufs.AppShardFrame,
 ) (*protobufs.AppShardFrame, error) {
@@ -1364,7 +1424,7 @@ func (e *AppConsensusEngine) internalProveFrame(
 	if err != nil {
 		return nil, err
 	}
-
+	newHeader.Rank = rank
 	newHeader.PublicKeySignatureBls48581 = nil
 
 	newFrame := &protobufs.AppShardFrame{
@@ -1439,19 +1499,15 @@ func (e *AppConsensusEngine) ensureGlobalClient() error {
 }
 
 func (e *AppConsensusEngine) startConsensus(
-	initialFrame **protobufs.AppShardFrame,
+	trustedRoot *models.CertifiedState[*protobufs.AppShardFrame],
 	ctx lifecycle.SignalerContext,
 	ready lifecycle.ReadyFunc,
 ) error {
-	trustedRoot := &models.CertifiedState[*protobufs.AppShardFrame]{
-		State: &models.State[*protobufs.AppShardFrame]{
-			State: initialFrame,
-		},
-	}
 	notifier := pubsub.NewDistributor[
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
 	]()
+	notifier.AddConsumer(e)
 
 	forks, err := forks.NewForks(trustedRoot, e, notifier)
 	if err != nil {
@@ -1487,7 +1543,7 @@ func (e *AppConsensusEngine) startConsensus(
 		e.voteAggregator,    // voteAggregator
 		e.timeoutAggregator, // timeoutAggregator
 		e,                   // finalizer
-		nil,                 // filter
+		e.appAddress,        // filter
 		trustedRoot,
 	)
 	if err != nil {
@@ -1495,6 +1551,9 @@ func (e *AppConsensusEngine) startConsensus(
 	}
 
 	ready()
+	e.voteAggregator.Start(ctx)
+	e.timeoutAggregator.Start(ctx)
+	<-lifecycle.AllReady(e.voteAggregator, e.timeoutAggregator)
 	e.consensusParticipant.Start(ctx)
 	return nil
 }
@@ -1526,6 +1585,11 @@ func (e *AppConsensusEngine) OnDoubleProposeDetected(
 	proposal1 *models.State[*protobufs.AppShardFrame],
 	proposal2 *models.State[*protobufs.AppShardFrame],
 ) {
+	select {
+	case <-e.haltCtx.Done():
+		return
+	default:
+	}
 	e.eventDistributor.Publish(typesconsensus.ControlEvent{
 		Type: typesconsensus.ControlEventAppEquivocation,
 		Data: &consensustime.AppEvent{
@@ -1569,12 +1633,77 @@ func (e *AppConsensusEngine) OnOwnProposal(
 	],
 	targetPublicationTime time.Time,
 ) {
+	select {
+	case <-e.haltCtx.Done():
+		return
+	default:
+	}
+	var priorTC *protobufs.TimeoutCertificate = nil
+	if proposal.PreviousRankTimeoutCertificate != nil {
+		priorTC =
+			proposal.PreviousRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
+	}
+
+	pbProposal := &protobufs.AppShardProposal{
+		State:                       *proposal.State.State,
+		ParentQuorumCertificate:     proposal.Proposal.State.ParentQuorumCertificate.(*protobufs.QuorumCertificate),
+		PriorRankTimeoutCertificate: priorTC,
+		Vote:                        *proposal.Vote,
+	}
+	data, err := pbProposal.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize proposal", zap.Error(err))
+		return
+	}
+
+	e.voteAggregator.AddState(proposal)
+	e.consensusParticipant.SubmitProposal(proposal)
+
+	if err := e.pubsub.PublishToBitmask(
+		e.getConsensusMessageBitmask(),
+		data,
+	); err != nil {
+		e.logger.Error("could not publish", zap.Error(err))
+	}
 }
 
 // OnOwnTimeout implements consensus.Consumer.
 func (e *AppConsensusEngine) OnOwnTimeout(
 	timeout *models.TimeoutState[*protobufs.ProposalVote],
 ) {
+	select {
+	case <-e.haltCtx.Done():
+		return
+	default:
+	}
+
+	var priorTC *protobufs.TimeoutCertificate
+	if timeout.PriorRankTimeoutCertificate != nil {
+		priorTC =
+			timeout.PriorRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
+	}
+
+	pbTimeout := &protobufs.TimeoutState{
+		LatestQuorumCertificate:     timeout.LatestQuorumCertificate.(*protobufs.QuorumCertificate),
+		PriorRankTimeoutCertificate: priorTC,
+		Vote:                        *timeout.Vote,
+		TimeoutTick:                 timeout.TimeoutTick,
+		Timestamp:                   uint64(time.Now().UnixMilli()),
+	}
+	data, err := pbTimeout.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize timeout", zap.Error(err))
+		return
+	}
+
+	e.timeoutAggregator.AddTimeout(timeout)
+
+	if err := e.pubsub.PublishToBitmask(
+		e.getConsensusMessageBitmask(),
+		data,
+	); err != nil {
+		e.logger.Error("could not publish", zap.Error(err))
+	}
 }
 
 // OnOwnVote implements consensus.Consumer.
@@ -1582,6 +1711,26 @@ func (e *AppConsensusEngine) OnOwnVote(
 	vote **protobufs.ProposalVote,
 	recipientID models.Identity,
 ) {
+	select {
+	case <-e.haltCtx.Done():
+		return
+	default:
+	}
+
+	data, err := (*vote).ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize timeout", zap.Error(err))
+		return
+	}
+
+	e.voteAggregator.AddVote(vote)
+
+	if err := e.pubsub.PublishToBitmask(
+		e.getConsensusMessageBitmask(),
+		data,
+	); err != nil {
+		e.logger.Error("could not publish", zap.Error(err))
+	}
 }
 
 // OnPartialTimeoutCertificate implements consensus.Consumer.
@@ -1640,6 +1789,9 @@ func (e *AppConsensusEngine) OnStartingTimeout(
 func (e *AppConsensusEngine) OnStateIncorporated(
 	state *models.State[*protobufs.AppShardFrame],
 ) {
+	if err := e.appTimeReel.Insert(*state.State); err != nil {
+		e.logger.Error("unable to insert frame into time reel", zap.Error(err))
+	}
 }
 
 // OnTimeoutCertificateTriggeredRankChange implements consensus.Consumer.
@@ -1666,7 +1818,7 @@ func (e *AppConsensusEngine) VerifyQuorumCertificate(
 		return errors.Wrap(err, "verify quorum certificate")
 	}
 
-	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	provers, err := e.proverRegistry.GetActiveProvers(e.appAddress)
 	if err != nil {
 		return errors.Wrap(err, "verify quorum certificate")
 	}
@@ -1708,13 +1860,7 @@ func (e *AppConsensusEngine) VerifyQuorumCertificate(
 	if valid := e.blsConstructor.VerifySignatureRaw(
 		qc.AggregateSignature.GetPubKey(),
 		qc.AggregateSignature.GetSignature(),
-		binary.BigEndian.AppendUint64(
-			binary.BigEndian.AppendUint64(
-				slices.Concat(qc.Filter, qc.Selector),
-				qc.Rank,
-			),
-			qc.FrameNumber,
-		),
+		verification.MakeVoteMessage(e.appAddress, qc.Rank, qc.Identity()),
 		[]byte("appshard"),
 	); !valid {
 		return errors.Wrap(
@@ -1742,7 +1888,7 @@ func (e *AppConsensusEngine) VerifyTimeoutCertificate(
 		return errors.Wrap(err, "verify timeout certificate")
 	}
 
-	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	provers, err := e.proverRegistry.GetActiveProvers(e.appAddress)
 	if err != nil {
 		return errors.Wrap(err, "verify timeout certificate")
 	}
@@ -1784,12 +1930,10 @@ func (e *AppConsensusEngine) VerifyTimeoutCertificate(
 	if valid := e.blsConstructor.VerifySignatureRaw(
 		tc.AggregateSignature.GetPubKey(),
 		tc.AggregateSignature.GetSignature(),
-		binary.BigEndian.AppendUint64(
-			binary.BigEndian.AppendUint64(
-				slices.Clone(tc.Filter),
-				tc.Rank,
-			),
-			tc.LatestQuorumCertificate.GetRank(),
+		verification.MakeTimeoutMessage(
+			e.appAddress,
+			tc.Rank,
+			tc.LatestQuorumCertificate.Rank,
 		),
 		[]byte("appshardtimeout"),
 	); !valid {
@@ -1806,47 +1950,44 @@ func (e *AppConsensusEngine) VerifyTimeoutCertificate(
 func (e *AppConsensusEngine) VerifyVote(
 	vote **protobufs.ProposalVote,
 ) error {
-	panic("unimplemented")
-}
+	if vote == nil || *vote == nil {
+		return errors.Wrap(errors.New("nil vote"), "verify vote")
+	}
 
-// IdentitiesByRank implements consensus.DynamicCommittee.
-func (e *AppConsensusEngine) IdentitiesByRank(rank uint64) ([]models.WeightedIdentity, error) {
-	panic("unimplemented")
-}
+	if err := (*vote).Validate(); err != nil {
+		return errors.Wrap(err, "verify vote")
+	}
 
-// IdentitiesByState implements consensus.DynamicCommittee.
-func (e *AppConsensusEngine) IdentitiesByState(stateID models.Identity) ([]models.WeightedIdentity, error) {
-	panic("unimplemented")
-}
+	provers, err := e.proverRegistry.GetActiveProvers(e.appAddress)
+	if err != nil {
+		return errors.Wrap(err, "verify vote")
+	}
 
-// IdentityByRank implements consensus.DynamicCommittee.
-func (e *AppConsensusEngine) IdentityByRank(rank uint64, participantID models.Identity) (models.WeightedIdentity, error) {
-	panic("unimplemented")
-}
+	var pubkey []byte
+	for _, p := range provers {
+		if bytes.Equal(p.Address, (*vote).PublicKeySignatureBls48581.Address) {
+			pubkey = p.PublicKey
+			break
+		}
+	}
 
-// IdentityByState implements consensus.DynamicCommittee.
-func (e *AppConsensusEngine) IdentityByState(stateID models.Identity, participantID models.Identity) (models.WeightedIdentity, error) {
-	panic("unimplemented")
-}
+	if bytes.Equal(pubkey, []byte{}) {
+		return errors.Wrap(errors.New("invalid prover"), "verify vote")
+	}
 
-// LeaderForRank implements consensus.DynamicCommittee.
-func (e *AppConsensusEngine) LeaderForRank(rank uint64) (models.Identity, error) {
-	panic("unimplemented")
-}
+	if valid := e.blsConstructor.VerifySignatureRaw(
+		pubkey,
+		(*vote).PublicKeySignatureBls48581.Signature,
+		verification.MakeVoteMessage(e.appAddress, (*vote).Rank, (*vote).Source()),
+		[]byte("appshard"),
+	); !valid {
+		return errors.Wrap(
+			errors.New("invalid signature"),
+			"verify vote",
+		)
+	}
 
-// QuorumThresholdForRank implements consensus.DynamicCommittee.
-func (e *AppConsensusEngine) QuorumThresholdForRank(rank uint64) (uint64, error) {
-	panic("unimplemented")
-}
-
-// Self implements consensus.DynamicCommittee.
-func (e *AppConsensusEngine) Self() models.Identity {
-	panic("unimplemented")
-}
-
-// TimeoutThresholdForRank implements consensus.DynamicCommittee.
-func (e *AppConsensusEngine) TimeoutThresholdForRank(rank uint64) (uint64, error) {
-	panic("unimplemented")
+	return nil
 }
 
 var _ consensus.DynamicCommittee = (*AppConsensusEngine)(nil)

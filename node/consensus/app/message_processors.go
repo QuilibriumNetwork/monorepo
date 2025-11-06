@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -452,22 +453,34 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 			proposal.State.Clone().(*protobufs.AppShardFrame)
 		e.frameStoreMu.Unlock()
 
-		e.consensusParticipant.SubmitProposal(
-			&models.SignedProposal[*protobufs.AppShardFrame, *protobufs.ProposalVote]{
-				Proposal: models.Proposal[*protobufs.AppShardFrame]{
-					State: &models.State[*protobufs.AppShardFrame]{
-						Rank:                    proposal.State.GetRank(),
-						Identifier:              proposal.State.Identity(),
-						ProposerID:              proposal.Vote.Identity(),
-						ParentQuorumCertificate: proposal.ParentQuorumCertificate,
-						Timestamp:               proposal.State.GetTimestamp(),
-						State:                   &proposal.State,
-					},
-					PreviousRankTimeoutCertificate: proposal.PriorRankTimeoutCertificate,
+		// Small gotcha: the proposal structure uses interfaces, so we can't assign
+		// directly, otherwise the nil values for the structs will fail the nil
+		// check on the interfaces (and would incur costly reflection if we wanted
+		// to check it directly)
+		pqc := proposal.ParentQuorumCertificate
+		prtc := proposal.PriorRankTimeoutCertificate
+		signedProposal := &models.SignedProposal[*protobufs.AppShardFrame, *protobufs.ProposalVote]{
+			Proposal: models.Proposal[*protobufs.AppShardFrame]{
+				State: &models.State[*protobufs.AppShardFrame]{
+					Rank:       proposal.State.GetRank(),
+					Identifier: proposal.State.Identity(),
+					ProposerID: proposal.Vote.Identity(),
+					Timestamp:  proposal.State.GetTimestamp(),
+					State:      &proposal.State,
 				},
-				Vote: &proposal.Vote,
 			},
-		)
+			Vote: &proposal.Vote,
+		}
+
+		if pqc != nil {
+			signedProposal.Proposal.State.ParentQuorumCertificate = pqc
+		}
+
+		if prtc != nil {
+			signedProposal.PreviousRankTimeoutCertificate = prtc
+		}
+
+		e.consensusParticipant.SubmitProposal(signedProposal)
 		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 	}
 }
@@ -495,6 +508,39 @@ func (e *AppConsensusEngine) handleVote(message *pb.Message) {
 		return
 	}
 
+	proverSet, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		e.logger.Error("could not get active provers", zap.Error(err))
+		voteProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Find the voter's public key
+	var voterPublicKey []byte = nil
+	for _, prover := range proverSet {
+		if bytes.Equal(
+			prover.Address,
+			vote.PublicKeySignatureBls48581.Address,
+		) {
+			voterPublicKey = prover.PublicKey
+			break
+		}
+	}
+
+	if voterPublicKey == nil {
+		e.logger.Warn(
+			"invalid vote - voter not found",
+			zap.String(
+				"voter",
+				hex.EncodeToString(
+					vote.PublicKeySignatureBls48581.Address,
+				),
+			),
+		)
+		voteProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
 	e.voteAggregator.AddVote(&vote)
 
 	voteProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
@@ -517,13 +563,25 @@ func (e *AppConsensusEngine) handleTimeoutState(message *pb.Message) {
 		return
 	}
 
-	e.timeoutAggregator.AddTimeout(&models.TimeoutState[*protobufs.ProposalVote]{
-		Rank:                        timeoutState.Vote.Rank,
-		LatestQuorumCertificate:     timeoutState.LatestQuorumCertificate,
-		PriorRankTimeoutCertificate: timeoutState.PriorRankTimeoutCertificate,
-		Vote:                        &timeoutState.Vote,
-		TimeoutTick:                 timeoutState.TimeoutTick,
-	})
+	// Small gotcha: the timeout structure uses interfaces, so we can't assign
+	// directly, otherwise the nil values for the structs will fail the nil
+	// check on the interfaces (and would incur costly reflection if we wanted
+	// to check it directly)
+	lqc := timeoutState.LatestQuorumCertificate
+	prtc := timeoutState.PriorRankTimeoutCertificate
+	timeout := &models.TimeoutState[*protobufs.ProposalVote]{
+		Rank:        timeoutState.Vote.Rank,
+		Vote:        &timeoutState.Vote,
+		TimeoutTick: timeoutState.TimeoutTick,
+	}
+	if lqc != nil {
+		timeout.LatestQuorumCertificate = lqc
+	}
+	if prtc != nil {
+		timeout.PriorRankTimeoutCertificate = prtc
+	}
+
+	e.timeoutAggregator.AddTimeout(timeout)
 
 	timeoutStateProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }

@@ -3,10 +3,13 @@ package app
 import (
 	"context"
 	"slices"
-	"sync"
+	"time"
 
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/verification"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
@@ -14,29 +17,146 @@ import (
 
 // AppVotingProvider implements VotingProvider
 type AppVotingProvider struct {
-	engine        *AppConsensusEngine
-	proposalVotes map[models.Identity]map[models.Identity]**protobufs.ProposalVote
-	mu            sync.Mutex
+	engine *AppConsensusEngine
 }
 
 // FinalizeQuorumCertificate implements consensus.VotingProvider.
-func (p *AppVotingProvider) FinalizeQuorumCertificate(ctx context.Context, state *models.State[*protobufs.AppShardFrame], aggregatedSignature models.AggregatedSignature) (models.QuorumCertificate, error) {
-	panic("unimplemented")
+func (p *AppVotingProvider) FinalizeQuorumCertificate(
+	ctx context.Context,
+	state *models.State[*protobufs.AppShardFrame],
+	aggregatedSignature models.AggregatedSignature,
+) (models.QuorumCertificate, error) {
+	return &protobufs.QuorumCertificate{
+		Filter:      (*state.State).Header.Address,
+		Rank:        (*state.State).GetRank(),
+		FrameNumber: (*state.State).Header.FrameNumber,
+		Selector:    []byte((*state.State).Identity()),
+		Timestamp:   uint64(time.Now().UnixMilli()),
+		AggregateSignature: &protobufs.BLS48581AggregateSignature{
+			Signature: aggregatedSignature.GetSignature(),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: aggregatedSignature.GetPubKey(),
+			},
+			Bitmask: aggregatedSignature.GetBitmask(),
+		},
+	}, nil
 }
 
 // FinalizeTimeout implements consensus.VotingProvider.
-func (p *AppVotingProvider) FinalizeTimeout(ctx context.Context, rank uint64, latestQuorumCertificate models.QuorumCertificate, latestQuorumCertificateRanks []uint64, aggregatedSignature models.AggregatedSignature) (models.TimeoutCertificate, error) {
-	panic("unimplemented")
+func (p *AppVotingProvider) FinalizeTimeout(
+	ctx context.Context,
+	rank uint64,
+	latestQuorumCertificate models.QuorumCertificate,
+	latestQuorumCertificateRanks []uint64,
+	aggregatedSignature models.AggregatedSignature,
+) (models.TimeoutCertificate, error) {
+	return &protobufs.TimeoutCertificate{
+		Filter:                  p.engine.appAddress,
+		Rank:                    rank,
+		LatestRanks:             latestQuorumCertificateRanks,
+		LatestQuorumCertificate: latestQuorumCertificate.(*protobufs.QuorumCertificate),
+		Timestamp:               uint64(time.Now().UnixMilli()),
+		AggregateSignature: &protobufs.BLS48581AggregateSignature{
+			Signature: aggregatedSignature.GetSignature(),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: aggregatedSignature.GetPubKey(),
+			},
+			Bitmask: aggregatedSignature.GetBitmask(),
+		},
+	}, nil
 }
 
 // SignTimeoutVote implements consensus.VotingProvider.
-func (p *AppVotingProvider) SignTimeoutVote(ctx context.Context, filter []byte, currentRank uint64, newestQuorumCertificateRank uint64) (**protobufs.ProposalVote, error) {
-	panic("unimplemented")
+func (p *AppVotingProvider) SignTimeoutVote(
+	ctx context.Context,
+	filter []byte,
+	currentRank uint64,
+	newestQuorumCertificateRank uint64,
+) (**protobufs.ProposalVote, error) {
+	// Get signing key
+	signer, _, publicKey, _ := p.engine.GetProvingKey(p.engine.config.Engine)
+	if publicKey == nil {
+		p.engine.logger.Error("no proving key available")
+		return nil, errors.Wrap(
+			errors.New("no proving key available for voting"),
+			"sign vote",
+		)
+	}
+
+	// Create vote (signature)
+	signatureData := verification.MakeTimeoutMessage(
+		filter,
+		currentRank,
+		newestQuorumCertificateRank,
+	)
+
+	sig, err := signer.SignWithDomain(signatureData, []byte("appshardtimeout"))
+	if err != nil {
+		p.engine.logger.Error("could not sign vote", zap.Error(err))
+		return nil, errors.Wrap(err, "sign vote")
+	}
+
+	voterAddress := p.engine.getAddressFromPublicKey(publicKey)
+
+	// Create vote message
+	vote := &protobufs.ProposalVote{
+		Filter:      filter,
+		FrameNumber: 0,
+		Rank:        currentRank,
+		Selector:    nil,
+		Timestamp:   uint64(time.Now().UnixMilli()),
+		PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
+			Address:   voterAddress,
+			Signature: sig,
+		},
+	}
+
+	return &vote, nil
 }
 
 // SignVote implements consensus.VotingProvider.
-func (p *AppVotingProvider) SignVote(ctx context.Context, state *models.State[*protobufs.AppShardFrame]) (**protobufs.ProposalVote, error) {
-	panic("unimplemented")
+func (p *AppVotingProvider) SignVote(
+	ctx context.Context,
+	state *models.State[*protobufs.AppShardFrame],
+) (**protobufs.ProposalVote, error) {
+	// Get signing key
+	signer, _, publicKey, _ := p.engine.GetProvingKey(p.engine.config.Engine)
+	if publicKey == nil {
+		p.engine.logger.Error("no proving key available")
+		return nil, errors.Wrap(
+			errors.New("no proving key available for voting"),
+			"sign vote",
+		)
+	}
+
+	// Create vote (signature)
+	signatureData := verification.MakeVoteMessage(
+		(*state.State).Header.Address,
+		state.Rank,
+		state.Identifier,
+	)
+	sig, err := signer.SignWithDomain(signatureData, []byte("appshard"))
+	if err != nil {
+		p.engine.logger.Error("could not sign vote", zap.Error(err))
+		return nil, errors.Wrap(err, "sign vote")
+	}
+
+	voterAddress := p.engine.getAddressFromPublicKey(publicKey)
+
+	// Create vote message
+	vote := &protobufs.ProposalVote{
+		Filter:      (*state.State).Header.Address,
+		FrameNumber: (*state.State).Header.FrameNumber,
+		Rank:        (*state.State).Header.Rank,
+		Selector:    []byte((*state.State).Identity()),
+		Timestamp:   uint64(time.Now().UnixMilli()),
+		PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
+			Address:   voterAddress,
+			Signature: sig,
+		},
+	}
+
+	return &vote, nil
 }
 
 // GetFullPath converts a key to its path representation using 6-bit nibbles
