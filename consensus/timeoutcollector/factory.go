@@ -60,6 +60,7 @@ type TimeoutProcessorFactory[
 	PeerIDT models.Unique,
 ] struct {
 	tracer              consensus.TraceLogger
+	filter              []byte
 	aggregator          consensus.SignatureAggregator
 	committee           consensus.Replicas
 	notifier            consensus.TimeoutCollectorConsumer[VoteT]
@@ -78,18 +79,22 @@ func NewTimeoutProcessorFactory[
 	PeerIDT models.Unique,
 ](
 	tracer consensus.TraceLogger,
+	filter []byte,
 	aggregator consensus.SignatureAggregator,
 	notifier consensus.TimeoutCollectorConsumer[VoteT],
 	committee consensus.Replicas,
 	validator consensus.Validator[StateT, VoteT],
+	voting consensus.VotingProvider[StateT, VoteT, PeerIDT],
 	domainSeparationTag []byte,
 ) *TimeoutProcessorFactory[StateT, VoteT, PeerIDT] {
 	return &TimeoutProcessorFactory[StateT, VoteT, PeerIDT]{
 		tracer:              tracer,
+		filter:              filter,
 		aggregator:          aggregator,
 		committee:           committee,
 		notifier:            notifier,
 		validator:           validator,
+		voting:              voting,
 		domainSeparationTag: domainSeparationTag,
 	}
 }
@@ -110,6 +115,7 @@ func (f *TimeoutProcessorFactory[StateT, VoteT, PeerIDT]) Create(rank uint64) (
 
 	sigAggregator, err := NewTimeoutSignatureAggregator(
 		f.aggregator,
+		f.filter,
 		rank,
 		allParticipants,
 		f.domainSeparationTag,

@@ -60,8 +60,8 @@ func (c *ConsensusSignatureAggregatorWrapper) Aggregate(
 
 	bitmask := make([]byte, (len(provers)+7)/8)
 	for i, p := range provers {
-		if _, ok := pubs[string(p.PublicKey)]; !ok {
-			bitmask[i/8] |= 1 << (i % 8)
+		if _, ok := pubs[string(p.PublicKey)]; ok {
+			bitmask[i/8] |= (1 << (i % 8))
 		}
 	}
 

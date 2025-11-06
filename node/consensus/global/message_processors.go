@@ -2,6 +2,7 @@ package global
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -87,7 +88,7 @@ func (e *GlobalConsensusEngine) processFrameMessageQueue(
 		case <-ctx.Done():
 			return
 		case message := <-e.globalFrameMessageQueue:
-			e.handleFrameMessage(message)
+			e.handleFrameMessage(ctx, message)
 		}
 	}
 }
@@ -217,7 +218,10 @@ func (e *GlobalConsensusEngine) handleProverMessage(message *pb.Message) {
 	}
 }
 
-func (e *GlobalConsensusEngine) handleFrameMessage(message *pb.Message) {
+func (e *GlobalConsensusEngine) handleFrameMessage(
+	ctx context.Context,
+	message *pb.Message,
+) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.logger.Error(
@@ -249,7 +253,7 @@ func (e *GlobalConsensusEngine) handleFrameMessage(message *pb.Message) {
 		clone := frame.Clone().(*protobufs.GlobalFrame)
 		e.frameStoreMu.Unlock()
 
-		if err := e.globalTimeReel.Insert(e.ctx, clone); err != nil {
+		if err := e.globalTimeReel.Insert(clone); err != nil {
 			// Success metric recorded at the end of processing
 			framesProcessedTotal.WithLabelValues("error").Inc()
 			return
@@ -799,6 +803,11 @@ func (e *GlobalConsensusEngine) handleAlertMessage(message *pb.Message) {
 }
 
 func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {
+	// Skip our own messages
+	if bytes.Equal(message.From, e.pubsub.GetPeerID()) {
+		return
+	}
+
 	timer := prometheus.NewTimer(proposalProcessingDuration)
 	defer timer.ObserveDuration()
 
@@ -815,28 +824,46 @@ func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {
 	e.frameStore[string(frameID)] = proposal.State
 	e.frameStoreMu.Unlock()
 
-	e.consensusParticipant.SubmitProposal(
-		&models.SignedProposal[*protobufs.GlobalFrame, *protobufs.ProposalVote]{
-			Proposal: models.Proposal[*protobufs.GlobalFrame]{
-				State: &models.State[*protobufs.GlobalFrame]{
-					Rank:                    proposal.State.GetRank(),
-					Identifier:              proposal.State.Identity(),
-					ProposerID:              proposal.Vote.Identity(),
-					ParentQuorumCertificate: proposal.ParentQuorumCertificate,
-					Timestamp:               proposal.State.GetTimestamp(),
-					State:                   &proposal.State,
-				},
-				PreviousRankTimeoutCertificate: proposal.PriorRankTimeoutCertificate,
+	// Small gotcha: the proposal structure uses interfaces, so we can't assign
+	// directly, otherwise the nil values for the structs will fail the nil
+	// check on the interfaces (and would incur costly reflection if we wanted
+	// to check it directly)
+	pqc := proposal.ParentQuorumCertificate
+	prtc := proposal.PriorRankTimeoutCertificate
+	signedProposal := &models.SignedProposal[*protobufs.GlobalFrame, *protobufs.ProposalVote]{
+		Proposal: models.Proposal[*protobufs.GlobalFrame]{
+			State: &models.State[*protobufs.GlobalFrame]{
+				Rank:       proposal.State.GetRank(),
+				Identifier: proposal.State.Identity(),
+				ProposerID: proposal.Vote.Identity(),
+				Timestamp:  proposal.State.GetTimestamp(),
+				State:      &proposal.State,
 			},
-			Vote: &proposal.Vote,
 		},
-	)
+		Vote: &proposal.Vote,
+	}
+
+	if pqc != nil {
+		signedProposal.Proposal.State.ParentQuorumCertificate = pqc
+	}
+
+	if prtc != nil {
+		signedProposal.PreviousRankTimeoutCertificate = prtc
+	}
+
+	e.voteAggregator.AddState(signedProposal)
+	e.consensusParticipant.SubmitProposal(signedProposal)
 
 	// Success metric recorded at the end of processing
 	proposalProcessedTotal.WithLabelValues("success").Inc()
 }
 
 func (e *GlobalConsensusEngine) handleVote(message *pb.Message) {
+	// Skip our own messages
+	if bytes.Equal(message.From, e.pubsub.GetPeerID()) {
+		return
+	}
+
 	timer := prometheus.NewTimer(voteProcessingDuration)
 	defer timer.ObserveDuration()
 
@@ -859,7 +886,6 @@ func (e *GlobalConsensusEngine) handleVote(message *pb.Message) {
 		voteProcessedTotal.WithLabelValues("error").Inc()
 	}
 
-	// Validate the voter's signature
 	proverSet, err := e.proverRegistry.GetActiveProvers(nil)
 	if err != nil {
 		e.logger.Error("could not get active provers", zap.Error(err))
@@ -893,65 +919,17 @@ func (e *GlobalConsensusEngine) handleVote(message *pb.Message) {
 		return
 	}
 
-	// Find the proposal frame for this vote
-	e.frameStoreMu.RLock()
-	var proposalFrame *protobufs.GlobalFrame = nil
-	for _, frame := range e.frameStore {
-		if frame.Header != nil &&
-			frame.Header.FrameNumber == vote.FrameNumber &&
-			bytes.Equal(
-				e.getAddressFromPublicKey(
-					frame.Header.PublicKeySignatureBls48581.PublicKey.KeyValue,
-				),
-				[]byte(vote.Identity()),
-			) {
-			proposalFrame = frame
-			break
-		}
-	}
-	e.frameStoreMu.RUnlock()
-
-	if proposalFrame == nil {
-		e.logger.Warn(
-			"vote for unknown proposal",
-			zap.Uint64("frame_number", vote.FrameNumber),
-			zap.String("proposer", hex.EncodeToString([]byte(vote.Identity()))),
-		)
-		voteProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Get the signature payload for the proposal
-	signatureData, err := e.frameProver.GetGlobalFrameSignaturePayload(
-		proposalFrame.Header,
-	)
-	if err != nil {
-		e.logger.Error("could not get signature payload", zap.Error(err))
-		voteProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Validate the vote signature
-	valid, err := e.keyManager.ValidateSignature(
-		crypto.KeyTypeBLS48581G1,
-		voterPublicKey,
-		signatureData,
-		vote.PublicKeySignatureBls48581.Signature,
-		[]byte("global"),
-	)
-
-	if err != nil || !valid {
-		e.logger.Error("invalid vote signature", zap.Error(err))
-		voteProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
-
 	e.voteAggregator.AddVote(&vote)
 
 	voteProcessedTotal.WithLabelValues("success").Inc()
 }
 
 func (e *GlobalConsensusEngine) handleTimeoutState(message *pb.Message) {
+	// Skip our own messages
+	if bytes.Equal(message.From, e.pubsub.GetPeerID()) {
+		return
+	}
+
 	timer := prometheus.NewTimer(voteProcessingDuration)
 	defer timer.ObserveDuration()
 
@@ -969,13 +947,25 @@ func (e *GlobalConsensusEngine) handleTimeoutState(message *pb.Message) {
 		return
 	}
 
-	e.timeoutAggregator.AddTimeout(&models.TimeoutState[*protobufs.ProposalVote]{
-		Rank:                        timeoutState.Vote.Rank,
-		LatestQuorumCertificate:     timeoutState.LatestQuorumCertificate,
-		PriorRankTimeoutCertificate: timeoutState.PriorRankTimeoutCertificate,
-		Vote:                        &timeoutState.Vote,
-		TimeoutTick:                 timeoutState.TimeoutTick,
-	})
+	// Small gotcha: the timeout structure uses interfaces, so we can't assign
+	// directly, otherwise the nil values for the structs will fail the nil
+	// check on the interfaces (and would incur costly reflection if we wanted
+	// to check it directly)
+	lqc := timeoutState.LatestQuorumCertificate
+	prtc := timeoutState.PriorRankTimeoutCertificate
+	timeout := &models.TimeoutState[*protobufs.ProposalVote]{
+		Rank:        timeoutState.Vote.Rank,
+		Vote:        &timeoutState.Vote,
+		TimeoutTick: timeoutState.TimeoutTick,
+	}
+	if lqc != nil {
+		timeout.LatestQuorumCertificate = lqc
+	}
+	if prtc != nil {
+		timeout.PriorRankTimeoutCertificate = prtc
+	}
+
+	e.timeoutAggregator.AddTimeout(timeout)
 
 	voteProcessedTotal.WithLabelValues("success").Inc()
 }

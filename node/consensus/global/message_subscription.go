@@ -28,7 +28,7 @@ func (e *GlobalConsensusEngine) subscribeToGlobalConsensus() error {
 				return nil
 			case e.globalConsensusMessageQueue <- message:
 				return nil
-			case <-e.ctx.Done():
+			case <-e.ShutdownSignal():
 				return errors.New("context cancelled")
 			default:
 				e.logger.Warn("global message queue full, dropping message")
@@ -59,7 +59,7 @@ func (e *GlobalConsensusEngine) subscribeToGlobalConsensus() error {
 				return nil
 			case e.appFramesMessageQueue <- message:
 				return nil
-			case <-e.ctx.Done():
+			case <-e.ShutdownSignal():
 				return errors.New("context cancelled")
 			default:
 				e.logger.Warn("app frames message queue full, dropping message")
@@ -100,7 +100,7 @@ func (e *GlobalConsensusEngine) subscribeToShardConsensusMessages() error {
 				return nil
 			case e.shardConsensusMessageQueue <- message:
 				return nil
-			case <-e.ctx.Done():
+			case <-e.ShutdownSignal():
 				return errors.New("context cancelled")
 			default:
 				e.logger.Warn("shard consensus queue full, dropping message")
@@ -137,7 +137,7 @@ func (e *GlobalConsensusEngine) subscribeToFrameMessages() error {
 				return nil
 			case e.globalFrameMessageQueue <- message:
 				return nil
-			case <-e.ctx.Done():
+			case <-e.ShutdownSignal():
 				return errors.New("context cancelled")
 			default:
 				e.logger.Warn("global frame queue full, dropping message")
@@ -177,7 +177,7 @@ func (e *GlobalConsensusEngine) subscribeToProverMessages() error {
 			case e.globalProverMessageQueue <- message:
 				e.logger.Debug("received prover message")
 				return nil
-			case <-e.ctx.Done():
+			case <-e.ShutdownSignal():
 				return errors.New("context cancelled")
 			default:
 				e.logger.Warn("global prover message queue full, dropping message")
@@ -211,7 +211,7 @@ func (e *GlobalConsensusEngine) subscribeToPeerInfoMessages() error {
 				return nil
 			case e.globalPeerInfoMessageQueue <- message:
 				return nil
-			case <-e.ctx.Done():
+			case <-e.ShutdownSignal():
 				return errors.New("context cancelled")
 			default:
 				e.logger.Warn("peer info message queue full, dropping message")
@@ -243,7 +243,7 @@ func (e *GlobalConsensusEngine) subscribeToAlertMessages() error {
 			select {
 			case e.globalAlertMessageQueue <- message:
 				return nil
-			case <-e.ctx.Done():
+			case <-e.ShutdownSignal():
 				return errors.New("context cancelled")
 			default:
 				e.logger.Warn("alert message queue full, dropping message")

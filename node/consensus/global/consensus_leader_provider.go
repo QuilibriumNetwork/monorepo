@@ -68,6 +68,11 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	filter []byte,
 	priorState models.Identity,
 ) (**protobufs.GlobalFrame, error) {
+	_, err := p.engine.livenessProvider.Collect(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "prove next state")
+	}
+
 	timer := prometheus.NewTimer(frameProvingDuration)
 	defer timer.ObserveDuration()
 

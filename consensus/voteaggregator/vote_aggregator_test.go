@@ -101,7 +101,7 @@ func (s *VoteAggregatorTestSuite) TestProcessInvalidState() {
 	select {
 	case err := <-s.errs:
 		require.Error(s.T(), err)
-		require.False(s.T(), models.IsInvalidProposalError[*helper.TestState, *helper.TestVote](err))
+		require.True(s.T(), models.IsInvalidProposalError[*helper.TestState, *helper.TestVote](err))
 	case <-time.After(100 * time.Millisecond):
 		s.T().Fatalf("expected error but haven't received anything")
 	}

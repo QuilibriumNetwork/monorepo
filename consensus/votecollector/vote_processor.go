@@ -36,6 +36,7 @@ type provingVoteProcessorFactoryBase[
 // Caller must treat all errors as exceptions
 func (f *provingVoteProcessorFactoryBase[StateT, VoteT, PeerIDT]) Create(
 	tracer consensus.TraceLogger,
+	filter []byte,
 	state *models.State[StateT],
 	dsTag []byte,
 	aggregator consensus.SignatureAggregator,
@@ -47,7 +48,7 @@ func (f *provingVoteProcessorFactoryBase[StateT, VoteT, PeerIDT]) Create(
 	}
 
 	// message that has to be verified against aggregated signature
-	msg := verification.MakeVoteMessage(state.Rank, state.Identifier)
+	msg := verification.MakeVoteMessage(filter, state.Rank, state.Identifier)
 
 	// prepare the proving public keys of participants
 	provingKeys := make([][]byte, 0, len(allParticipants))

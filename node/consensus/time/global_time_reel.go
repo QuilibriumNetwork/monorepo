@@ -204,6 +204,7 @@ func (g *GlobalTimeReel) Start(
 
 	// Warm the in-memory tree/cache from store.
 	if err := g.bootstrapFromStore(); err != nil {
+		g.logger.Error("could not bootstrap from store", zap.Error(err))
 		ctx.Throw(err)
 		return
 	}
@@ -234,7 +235,6 @@ func (g *GlobalTimeReel) sendEvent(event GlobalEvent) {
 
 // Insert inserts a global frame header into the tree structure (non-blocking)
 func (g *GlobalTimeReel) Insert(
-	ctx context.Context,
 	frame *protobufs.GlobalFrame,
 ) error {
 	// Start timing

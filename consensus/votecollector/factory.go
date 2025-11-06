@@ -23,6 +23,7 @@ type baseFactory[
 	PeerIDT models.Unique,
 ] func(
 	tracer consensus.TraceLogger,
+	filter []byte,
 	state *models.State[StateT],
 	dsTag []byte,
 	aggregator consensus.SignatureAggregator,
@@ -54,6 +55,7 @@ var _ consensus.VoteProcessorFactory[*nilUnique, *nilUnique, *nilUnique] = (*Vot
 // * models.InvalidProposalError - proposal has invalid proposer vote
 func (f *VoteProcessorFactory[StateT, VoteT, PeerIDT]) Create(
 	tracer consensus.TraceLogger,
+	filter []byte,
 	proposal *models.SignedProposal[StateT, VoteT],
 	dsTag []byte,
 	aggregator consensus.SignatureAggregator,
@@ -61,6 +63,7 @@ func (f *VoteProcessorFactory[StateT, VoteT, PeerIDT]) Create(
 ) (consensus.VerifyingVoteProcessor[StateT, VoteT], error) {
 	processor, err := f.baseFactory(
 		tracer,
+		filter,
 		proposal.State,
 		dsTag,
 		aggregator,
@@ -127,6 +130,7 @@ func NewBootstrapVoteProcessor[
 	PeerIDT models.Unique,
 ](
 	tracer consensus.TraceLogger,
+	filter []byte,
 	committee consensus.DynamicCommittee,
 	state *models.State[StateT],
 	onQCCreated consensus.OnQuorumCertificateCreated,
@@ -138,7 +142,7 @@ func NewBootstrapVoteProcessor[
 		committee:   committee,
 		onQCCreated: onQCCreated,
 	}
-	return factory.Create(tracer, state, dsTag, aggregator, votingProvider)
+	return factory.Create(tracer, filter, state, dsTag, aggregator, votingProvider)
 }
 
 // Type used to satisfy generic arguments in compiler time type assertion check

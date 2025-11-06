@@ -134,6 +134,7 @@ type VoteProcessorFactory[
 	// * models.InvalidProposalError - proposal has invalid proposer vote
 	Create(
 		tracer TraceLogger,
+		filter []byte,
 		proposal *models.SignedProposal[StateT, VoteT],
 		dsTag []byte,
 		aggregator SignatureAggregator,

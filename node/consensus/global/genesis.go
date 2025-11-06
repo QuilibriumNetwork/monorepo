@@ -1,6 +1,7 @@
 package global
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
@@ -271,27 +272,30 @@ func (e *GlobalConsensusEngine) initializeGenesis() (
 	if err := e.clockStore.PutGlobalClockFrame(genesisFrame, txn); err != nil {
 		txn.Abort()
 		e.logger.Error("could not add frame", zap.Error(err))
-		e.ctx.Throw(err)
 		return nil, nil
 	}
 	genesisQC := &protobufs.QuorumCertificate{
-		Rank:               0,
-		Filter:             []byte{},
-		FrameNumber:        genesisFrame.Header.FrameNumber,
-		Selector:           []byte(genesisFrame.Identity()),
-		Timestamp:          0,
-		AggregateSignature: &protobufs.BLS48581AggregateSignature{},
+		Rank:        0,
+		Filter:      []byte{},
+		FrameNumber: genesisFrame.Header.FrameNumber,
+		Selector:    []byte(genesisFrame.Identity()),
+		Timestamp:   0,
+		AggregateSignature: &protobufs.BLS48581AggregateSignature{
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: make([]byte, 585),
+			},
+			Signature: make([]byte, 74),
+			Bitmask:   bytes.Repeat([]byte{0xff}, 32),
+		},
 	}
 	if err := e.clockStore.PutQuorumCertificate(genesisQC, txn); err != nil {
 		txn.Abort()
 		e.logger.Error("could not add quorum certificate", zap.Error(err))
-		e.ctx.Throw(err)
 		return nil, nil
 	}
 	if err := txn.Commit(); err != nil {
 		txn.Abort()
 		e.logger.Error("could not add frame", zap.Error(err))
-		e.ctx.Throw(err)
 		return nil, nil
 	}
 	if err = e.consensusStore.PutLivenessState(
@@ -301,7 +305,6 @@ func (e *GlobalConsensusEngine) initializeGenesis() (
 		},
 	); err != nil {
 		e.logger.Error("could not add liveness state", zap.Error(err))
-		e.ctx.Throw(err)
 		return nil, nil
 	}
 	if err = e.consensusStore.PutConsensusState(
@@ -311,7 +314,6 @@ func (e *GlobalConsensusEngine) initializeGenesis() (
 		},
 	); err != nil {
 		e.logger.Error("could not add consensus state", zap.Error(err))
-		e.ctx.Throw(err)
 		return nil, nil
 	}
 
@@ -444,7 +446,7 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 	state = hgstate.NewHypergraphState(e.hypergraph)
 
 	for _, pubkey := range proverPubKeys {
-		err = e.addGenesisProver(rdfMultiprover, state, pubkey, 0, 0)
+		err = e.addGenesisProver(rdfMultiprover, state, pubkey, 1000, 0)
 		if err != nil {
 			e.logger.Error("error adding prover", zap.Error(err))
 			return nil
@@ -522,13 +524,11 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 	if err := e.clockStore.PutGlobalClockFrame(genesisFrame, txn); err != nil {
 		txn.Abort()
 		e.logger.Error("could not add frame", zap.Error(err))
-		e.ctx.Throw(err)
 		return nil
 	}
 	if err := txn.Commit(); err != nil {
 		txn.Abort()
 		e.logger.Error("could not add frame", zap.Error(err))
-		e.ctx.Throw(err)
 		return nil
 	}
 

@@ -15,8 +15,8 @@ type VoteProcessorFactory[StateT models.Unique, VoteT models.Unique, PeerIDT mod
 }
 
 // Create provides a mock function with given fields: tracer, proposal, dsTag, aggregator
-func (_m *VoteProcessorFactory[StateT, VoteT, PeerIDT]) Create(tracer consensus.TraceLogger, proposal *models.SignedProposal[StateT, VoteT], dsTag []byte, aggregator consensus.SignatureAggregator, voter consensus.VotingProvider[StateT, VoteT, PeerIDT]) (consensus.VerifyingVoteProcessor[StateT, VoteT], error) {
-	ret := _m.Called(tracer, proposal, dsTag, aggregator, voter)
+func (_m *VoteProcessorFactory[StateT, VoteT, PeerIDT]) Create(tracer consensus.TraceLogger, filter []byte, proposal *models.SignedProposal[StateT, VoteT], dsTag []byte, aggregator consensus.SignatureAggregator, voter consensus.VotingProvider[StateT, VoteT, PeerIDT]) (consensus.VerifyingVoteProcessor[StateT, VoteT], error) {
+	ret := _m.Called(tracer, filter, proposal, dsTag, aggregator, voter)
 
 	if len(ret) == 0 {
 		panic("no return value specified for Create")
@@ -24,19 +24,19 @@ func (_m *VoteProcessorFactory[StateT, VoteT, PeerIDT]) Create(tracer consensus.
 
 	var r0 consensus.VerifyingVoteProcessor[StateT, VoteT]
 	var r1 error
-	if rf, ok := ret.Get(0).(func(consensus.TraceLogger, *models.SignedProposal[StateT, VoteT], []byte, consensus.SignatureAggregator, consensus.VotingProvider[StateT, VoteT, PeerIDT]) (consensus.VerifyingVoteProcessor[StateT, VoteT], error)); ok {
-		return rf(tracer, proposal, dsTag, aggregator, voter)
+	if rf, ok := ret.Get(0).(func(consensus.TraceLogger, []byte, *models.SignedProposal[StateT, VoteT], []byte, consensus.SignatureAggregator, consensus.VotingProvider[StateT, VoteT, PeerIDT]) (consensus.VerifyingVoteProcessor[StateT, VoteT], error)); ok {
+		return rf(tracer, filter, proposal, dsTag, aggregator, voter)
 	}
-	if rf, ok := ret.Get(0).(func(consensus.TraceLogger, *models.SignedProposal[StateT, VoteT], []byte, consensus.SignatureAggregator, consensus.VotingProvider[StateT, VoteT, PeerIDT]) consensus.VerifyingVoteProcessor[StateT, VoteT]); ok {
-		r0 = rf(tracer, proposal, dsTag, aggregator, voter)
+	if rf, ok := ret.Get(0).(func(consensus.TraceLogger, []byte, *models.SignedProposal[StateT, VoteT], []byte, consensus.SignatureAggregator, consensus.VotingProvider[StateT, VoteT, PeerIDT]) consensus.VerifyingVoteProcessor[StateT, VoteT]); ok {
+		r0 = rf(tracer, filter, proposal, dsTag, aggregator, voter)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(consensus.VerifyingVoteProcessor[StateT, VoteT])
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(consensus.TraceLogger, *models.SignedProposal[StateT, VoteT], []byte, consensus.SignatureAggregator, consensus.VotingProvider[StateT, VoteT, PeerIDT]) error); ok {
-		r1 = rf(tracer, proposal, dsTag, aggregator, voter)
+	if rf, ok := ret.Get(1).(func(consensus.TraceLogger, []byte, *models.SignedProposal[StateT, VoteT], []byte, consensus.SignatureAggregator, consensus.VotingProvider[StateT, VoteT, PeerIDT]) error); ok {
+		r1 = rf(tracer, filter, proposal, dsTag, aggregator, voter)
 	} else {
 		r1 = ret.Error(1)
 	}

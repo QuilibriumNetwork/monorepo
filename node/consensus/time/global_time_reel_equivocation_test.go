@@ -66,7 +66,7 @@ func TestGlobalTimeReel_MassiveEquivocationForkChoice(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Build chain A: 200 frames with bitmask 0b11100011 (signers 0,1,5,6,7)
@@ -85,7 +85,7 @@ func TestGlobalTimeReel_MassiveEquivocationForkChoice(t *testing.T) {
 			},
 		}
 
-		err = atr.Insert(ctx, frameA)
+		err = atr.Insert(frameA)
 		require.NoError(t, err)
 		prevOutput = frameA.Header.Output
 	}
@@ -114,7 +114,7 @@ func TestGlobalTimeReel_MassiveEquivocationForkChoice(t *testing.T) {
 			},
 		}
 
-		err = atr.Insert(ctx, frameB)
+		err = atr.Insert(frameB)
 		// Should now succeed even with equivocation
 		assert.NoError(t, err, "Should accept frame despite equivocation at frame %d", i)
 		prevOutput = frameB.Header.Output
@@ -175,7 +175,7 @@ func TestGlobalTimeReel_EquivocationWithForkChoice(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Drain genesis event
@@ -198,7 +198,7 @@ func TestGlobalTimeReel_EquivocationWithForkChoice(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1A)
+	err = atr.Insert(frame1A)
 	require.NoError(t, err)
 
 	// Drain new head event
@@ -222,7 +222,7 @@ func TestGlobalTimeReel_EquivocationWithForkChoice(t *testing.T) {
 	}
 
 	// This should succeed now, but generate an equivocation event
-	err = atr.Insert(ctx, frame1B)
+	err = atr.Insert(frame1B)
 	assert.NoError(t, err)
 
 	// Wait for equivocation event
@@ -267,7 +267,7 @@ func TestGlobalTimeReel_NonOverlappingForks(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Build two non-overlapping chains
@@ -289,7 +289,7 @@ func TestGlobalTimeReel_NonOverlappingForks(t *testing.T) {
 				},
 			},
 		}
-		err = atr.Insert(ctx, frameA)
+		err = atr.Insert(frameA)
 		require.NoError(t, err)
 		prevOutputA = frameA.Header.Output
 	}
@@ -309,7 +309,7 @@ func TestGlobalTimeReel_NonOverlappingForks(t *testing.T) {
 				},
 			},
 		}
-		err = atr.Insert(ctx, frameB)
+		err = atr.Insert(frameB)
 		require.NoError(t, err, "non-overlapping fork should be allowed")
 		prevOutputB = frameB.Header.Output
 	}

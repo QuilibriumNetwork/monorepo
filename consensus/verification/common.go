@@ -3,6 +3,7 @@ package verification
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
@@ -13,21 +14,33 @@ import (
 // structure that is signed contains the sometimes redundant rank number and
 // state ID; this allows us to create the signed message and verify the signed
 // message without having the full state contents.
-func MakeVoteMessage(rank uint64, stateID models.Identity) []byte {
-	msg := []byte{}
-	binary.BigEndian.AppendUint64(msg, rank)
-	msg = append(msg, stateID[:]...)
-	return msg
+func MakeVoteMessage(
+	filter []byte,
+	rank uint64,
+	stateID models.Identity,
+) []byte {
+	return slices.Concat(
+		filter,
+		binary.BigEndian.AppendUint64(
+			slices.Clone([]byte(stateID)),
+			rank,
+		),
+	)
 }
 
 // MakeTimeoutMessage generates the message we have to sign in order to be able
 // to contribute to Active Pacemaker protocol. Each replica signs with the
 // highest QC rank known to that replica.
-func MakeTimeoutMessage(rank uint64, newestQCRank uint64) []byte {
+func MakeTimeoutMessage(
+	filter []byte,
+	rank uint64,
+	newestQCRank uint64,
+) []byte {
 	msg := make([]byte, 16)
 	binary.BigEndian.PutUint64(msg[:8], rank)
 	binary.BigEndian.PutUint64(msg[8:], newestQCRank)
-	return msg
+
+	return slices.Concat(filter, msg)
 }
 
 // verifyAggregatedSignatureOneMessage encapsulates the logic of verifying an
@@ -79,6 +92,7 @@ func verifyAggregatedSignatureOneMessage(
 //     edge cases in the logic (i.e. as fatal)
 func verifyTCSignatureManyMessages(
 	validator consensus.SignatureAggregator,
+	filter []byte,
 	pks [][]byte,
 	sigData []byte,
 	rank uint64,
@@ -91,7 +105,10 @@ func verifyTCSignatureManyMessages(
 
 	messages := make([][]byte, 0, len(pks))
 	for i := 0; i < len(pks); i++ {
-		messages = append(messages, MakeTimeoutMessage(rank, highQCRanks[i]))
+		messages = append(
+			messages,
+			MakeTimeoutMessage(filter, rank, highQCRanks[i]),
+		)
 	}
 
 	valid := validator.VerifySignatureMultiMessage(

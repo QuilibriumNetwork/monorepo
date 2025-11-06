@@ -2,7 +2,6 @@ package global
 
 import (
 	"context"
-	"encoding/binary"
 	"time"
 
 	"github.com/pkg/errors"
@@ -25,11 +24,17 @@ func (p *GlobalVotingProvider) FinalizeQuorumCertificate(
 	aggregatedSignature models.AggregatedSignature,
 ) (models.QuorumCertificate, error) {
 	return &protobufs.QuorumCertificate{
-		Rank:               (*state.State).GetRank(),
-		FrameNumber:        (*state.State).Header.FrameNumber,
-		Selector:           []byte((*state.State).Identity()),
-		Timestamp:          uint64(time.Now().UnixMilli()),
-		AggregateSignature: aggregatedSignature.(*protobufs.BLS48581AggregateSignature),
+		Rank:        (*state.State).GetRank(),
+		FrameNumber: (*state.State).Header.FrameNumber,
+		Selector:    []byte((*state.State).Identity()),
+		Timestamp:   uint64(time.Now().UnixMilli()),
+		AggregateSignature: &protobufs.BLS48581AggregateSignature{
+			Signature: aggregatedSignature.GetSignature(),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: aggregatedSignature.GetPubKey(),
+			},
+			Bitmask: aggregatedSignature.GetBitmask(),
+		},
 	}, nil
 }
 
@@ -46,7 +51,13 @@ func (p *GlobalVotingProvider) FinalizeTimeout(
 		LatestRanks:             latestQuorumCertificateRanks,
 		LatestQuorumCertificate: latestQuorumCertificate.(*protobufs.QuorumCertificate),
 		Timestamp:               uint64(time.Now().UnixMilli()),
-		AggregateSignature:      aggregatedSignature.(*protobufs.BLS48581AggregateSignature),
+		AggregateSignature: &protobufs.BLS48581AggregateSignature{
+			Signature: aggregatedSignature.GetSignature(),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: aggregatedSignature.GetPubKey(),
+			},
+			Bitmask: aggregatedSignature.GetBitmask(),
+		},
 	}, nil
 }
 
@@ -69,6 +80,7 @@ func (p *GlobalVotingProvider) SignTimeoutVote(
 
 	// Create vote (signature)
 	signatureData := verification.MakeTimeoutMessage(
+		nil,
 		currentRank,
 		newestQuorumCertificateRank,
 	)
@@ -85,7 +97,7 @@ func (p *GlobalVotingProvider) SignTimeoutVote(
 	vote := &protobufs.ProposalVote{
 		FrameNumber: 0,
 		Rank:        currentRank,
-		Selector:    binary.BigEndian.AppendUint64(nil, currentRank),
+		Selector:    nil,
 		Timestamp:   uint64(time.Now().UnixMilli()),
 		PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
 			Address:   voterAddress,
@@ -112,14 +124,11 @@ func (p *GlobalVotingProvider) SignVote(
 	}
 
 	// Create vote (signature)
-	signatureData, err := p.engine.frameProver.GetGlobalFrameSignaturePayload(
-		(*state.State).Header,
+	signatureData := verification.MakeVoteMessage(
+		nil,
+		state.Rank,
+		state.Identifier,
 	)
-	if err != nil {
-		p.engine.logger.Error("could not get signature payload", zap.Error(err))
-		return nil, errors.Wrap(err, "sign vote")
-	}
-
 	sig, err := signer.SignWithDomain(signatureData, []byte("global"))
 	if err != nil {
 		p.engine.logger.Error("could not sign vote", zap.Error(err))

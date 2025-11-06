@@ -24,6 +24,7 @@ type VerifyingVoteProcessorFactory[
 	PeerIDT models.Unique,
 ] = func(
 	tracer consensus.TraceLogger,
+	filter []byte,
 	proposal *models.SignedProposal[StateT, VoteT],
 	dsTag []byte,
 	aggregator consensus.SignatureAggregator,
@@ -39,6 +40,7 @@ type VoteCollector[
 ] struct {
 	sync.Mutex
 	tracer                   consensus.TraceLogger
+	filter                   []byte
 	workers                  consensus.Workers
 	notifier                 consensus.VoteAggregationConsumer[StateT, VoteT]
 	createVerifyingProcessor VerifyingVoteProcessorFactory[StateT, VoteT, PeerIDT]
@@ -72,6 +74,7 @@ func NewStateMachineFactory[
 	PeerIDT models.Unique,
 ](
 	tracer consensus.TraceLogger,
+	filter []byte,
 	notifier consensus.VoteAggregationConsumer[StateT, VoteT],
 	verifyingVoteProcessorFactory VerifyingVoteProcessorFactory[
 		StateT,
@@ -88,6 +91,7 @@ func NewStateMachineFactory[
 	) {
 		return NewStateMachine[StateT, VoteT](
 			rank,
+			filter,
 			tracer,
 			workers,
 			notifier,
@@ -105,6 +109,7 @@ func NewStateMachine[
 	PeerIDT models.Unique,
 ](
 	rank uint64,
+	filter []byte,
 	tracer consensus.TraceLogger,
 	workers consensus.Workers,
 	notifier consensus.VoteAggregationConsumer[StateT, VoteT],
@@ -119,6 +124,7 @@ func NewStateMachine[
 ) *VoteCollector[StateT, VoteT, PeerIDT] {
 	sm := &VoteCollector[StateT, VoteT, PeerIDT]{
 		tracer:                   tracer,
+		filter:                   filter,
 		workers:                  workers,
 		notifier:                 notifier,
 		createVerifyingProcessor: verifyingVoteProcessorFactory,
@@ -346,6 +352,7 @@ func (m *VoteCollector[StateT, VoteT, PeerIDT]) caching2Verifying(
 	stateID := proposal.State.Identifier
 	newProc, err := m.createVerifyingProcessor(
 		m.tracer,
+		m.filter,
 		proposal,
 		m.dsTag,
 		m.aggregator,

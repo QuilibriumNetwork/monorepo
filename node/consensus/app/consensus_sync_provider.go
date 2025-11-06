@@ -317,7 +317,7 @@ func (p *AppSyncProvider) syncWithPeer(
 			return latest, errors.Wrap(err, "sync")
 		}
 
-		err = p.engine.appTimeReel.Insert(p.engine.ctx, response.Frame)
+		err = p.engine.appTimeReel.Insert(response.Frame)
 		if err != nil {
 			return latest, errors.Wrap(err, "sync")
 		}

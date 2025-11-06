@@ -252,30 +252,24 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 		typePrefix := binary.BigEndian.Uint32(message.Data[:4])
 
 		switch typePrefix {
-		case protobufs.AppShardFrameType:
-			frame := &protobufs.AppShardFrame{}
+		case protobufs.AppShardProposalType:
+			frame := &protobufs.AppShardProposal{}
 			if err := frame.FromCanonicalBytes(message.Data); err != nil {
 				return errors.New("error")
 			}
 			framesMu.Lock()
-			frameHistory = append(frameHistory, frame)
+			frameHistory = append(frameHistory, frame.State)
 			framesMu.Unlock()
 
-		case protobufs.ProverLivenessCheckType:
-			livenessCheck := &protobufs.ProverLivenessCheck{}
-			if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
-				return errors.New("error")
-			}
-
-		case protobufs.FrameVoteType:
-			vote := &protobufs.FrameVote{}
+		case protobufs.ProposalVoteType:
+			vote := &protobufs.ProposalVote{}
 			if err := vote.FromCanonicalBytes(message.Data); err != nil {
 				return errors.New("error")
 			}
 
-		case protobufs.FrameConfirmationType:
-			confirmation := &protobufs.FrameConfirmation{}
-			if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
+		case protobufs.TimeoutStateType:
+			state := &protobufs.TimeoutState{}
+			if err := state.FromCanonicalBytes(message.Data); err != nil {
 				return errors.New("error")
 			}
 
@@ -359,7 +353,6 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 
 	// Stop
 	t.Log("Step 8: Cleaning up")
-	engine.UnregisterExecutor("test-executor", 0, false)
 	engine.Stop(false)
 }
 
@@ -1253,10 +1246,6 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 		}
 	}()
 
-	// Start event distributor
-	err = eventDistributor.Start(ctx)
-	require.NoError(t, err)
-
 	// Don't add initial frame - let the time reel initialize itself
 
 	// Create app engine
@@ -1374,7 +1363,6 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 	eventsMu.Unlock()
 
 	eventDistributor.Unsubscribe("test-tracker")
-	eventDistributor.Stop()
 	engine.Stop(false)
 }
 
@@ -3203,14 +3191,14 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 			typePrefix := binary.BigEndian.Uint32(data[:4])
 
 			// Check if it's a GlobalFrame
-			if typePrefix == protobufs.AppShardFrameType {
-				frame := &protobufs.AppShardFrame{}
+			if typePrefix == protobufs.AppShardProposalType {
+				frame := &protobufs.AppShardProposal{}
 				if err := frame.FromCanonicalBytes(data); err == nil {
 					mu.Lock()
 					if afterAlert {
-						afterAlertFrames = append(afterAlertFrames, frame)
+						afterAlertFrames = append(afterAlertFrames, frame.State)
 					} else {
-						publishedFrames = append(publishedFrames, frame)
+						publishedFrames = append(publishedFrames, frame.State)
 					}
 					mu.Unlock()
 				}
@@ -3258,6 +3246,5 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 	require.Equal(t, 0, afterAlertCount)
 
 	// Stop
-	engine.UnregisterExecutor("test-executor", 0, false)
 	engine.Stop(false)
 }

@@ -108,8 +108,12 @@ func (w *WeightedSignatureAggregator) Verify(
 	ok = w.aggregator.VerifySignatureRaw(info.pk, sig, w.message, w.dsTag)
 	if !ok {
 		return fmt.Errorf(
-			"invalid signature from %s: %w",
+			"invalid signature %x from %x (pk: %x, msg: %x, dsTag: %x): %w",
+			sig,
 			signerID,
+			info.pk,
+			w.message,
+			w.dsTag,
 			models.ErrInvalidSignature,
 		)
 	}

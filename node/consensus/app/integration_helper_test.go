@@ -497,6 +497,9 @@ func registerProverInHypergraphWithFilter(t *testing.T, hg thypergraph.Hypergrap
 		t.Fatalf("Failed to insert status: %v", err)
 	}
 
+	err = tree.Insert([]byte{3 << 2}, []byte{0, 0, 0, 0, 0, 0, 3, 232}, nil, big.NewInt(0)) // seniority = 1000
+	require.NoError(t, err)
+
 	// Type Index:
 	typeBI, _ := poseidon.HashBytes(
 		slices.Concat(bytes.Repeat([]byte{0xff}, 32), []byte("prover:Prover")),

@@ -293,9 +293,10 @@ func (va *VoteAggregator[StateT, VoteT]) processQueuedState(
 			// VoteAggregator needs to make sure that it's submitting for processing
 			// ONLY valid states.
 			return fmt.Errorf(
-				"received invalid state for processing %x at rank %d",
+				"received invalid state for processing %x at rank %d: %+w",
 				state.State.Identifier,
 				state.State.Rank,
+				err,
 			)
 		}
 		return fmt.Errorf(

@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"math/bits"
 	"net"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1018,6 +1019,7 @@ func (b *BlossomSub) subscribeHandler(
 			b.logger.Error(
 				"message handler panicked, recovering",
 				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())),
 			)
 		}
 	}()

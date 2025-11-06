@@ -72,7 +72,7 @@ func TestAppTimeReel_BasicOperations(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	assert.NoError(t, err)
 
 	// Check that genesis became head
@@ -93,7 +93,7 @@ func TestAppTimeReel_BasicOperations(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1)
+	err = atr.Insert(frame1)
 	assert.NoError(t, err)
 
 	// Check new head
@@ -152,7 +152,7 @@ func TestAppTimeReel_WrongAddress(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, wrongFrame)
+	err = atr.Insert(wrongFrame)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "frame address does not match reel address")
 }
@@ -191,7 +191,7 @@ func TestAppTimeReel_Equivocation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	assert.NoError(t, err)
 
 	// Drain any events
@@ -216,7 +216,7 @@ func TestAppTimeReel_Equivocation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1)
+	err = atr.Insert(frame1)
 	assert.NoError(t, err)
 
 	// Drain any events
@@ -241,7 +241,7 @@ func TestAppTimeReel_Equivocation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1Equivocation)
+	err = atr.Insert(frame1Equivocation)
 	assert.NoError(t, err)
 
 	// Give the goroutine time to send the event
@@ -283,7 +283,7 @@ func TestAppTimeReel_Fork(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	assert.NoError(t, err)
 
 	// Insert valid frame 1 with BLS signature
@@ -302,7 +302,7 @@ func TestAppTimeReel_Fork(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1)
+	err = atr.Insert(frame1)
 	assert.NoError(t, err)
 
 	// Try to insert forking frame 1 with non-overlapping bitmask (different signers)
@@ -322,7 +322,7 @@ func TestAppTimeReel_Fork(t *testing.T) {
 	}
 
 	// This should succeed - it's a fork, not equivocation
-	err = atr.Insert(ctx, frame1Fork)
+	err = atr.Insert(frame1Fork)
 	assert.NoError(t, err)
 
 	// Head should still be the original frame1
@@ -356,7 +356,7 @@ func TestAppTimeReel_ParentValidation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	assert.NoError(t, err)
 
 	// Insert valid frame 1
@@ -372,7 +372,7 @@ func TestAppTimeReel_ParentValidation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1)
+	err = atr.Insert(frame1)
 	assert.NoError(t, err)
 
 	// Try to insert frame with a completely invalid parent selector that doesn't match any existing frame
@@ -389,7 +389,7 @@ func TestAppTimeReel_ParentValidation(t *testing.T) {
 	}
 
 	// This should succeed (goes to pending since parent not found)
-	err = atr.Insert(ctx, badFrame)
+	err = atr.Insert(badFrame)
 	assert.NoError(t, err)
 
 	// Check that it's in pending frames
@@ -462,7 +462,7 @@ func TestAppTimeReel_ForkDetection(t *testing.T) {
 
 	// Insert chain
 	for _, frame := range frames {
-		err := atr.Insert(ctx, frame)
+		err := atr.Insert(frame)
 		require.NoError(t, err)
 	}
 
@@ -511,7 +511,7 @@ func TestAppTimeReel_ForkChoice_MoreSignatures(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Drain genesis event
@@ -536,7 +536,7 @@ func TestAppTimeReel_ForkChoice_MoreSignatures(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1Weak)
+	err = atr.Insert(frame1Weak)
 	require.NoError(t, err)
 
 	// Verify weak frame is initially head
@@ -567,7 +567,7 @@ func TestAppTimeReel_ForkChoice_MoreSignatures(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1Strong)
+	err = atr.Insert(frame1Strong)
 	require.NoError(t, err)
 
 	// Give the goroutine time to send the event
@@ -621,7 +621,7 @@ func TestAppTimeReel_ForkChoice_NoReplacement(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Drain genesis event
@@ -646,7 +646,7 @@ func TestAppTimeReel_ForkChoice_NoReplacement(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1Strong)
+	err = atr.Insert(frame1Strong)
 	require.NoError(t, err)
 
 	// Verify strong frame is head
@@ -677,7 +677,7 @@ func TestAppTimeReel_ForkChoice_NoReplacement(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1Weak)
+	err = atr.Insert(frame1Weak)
 	require.NoError(t, err)
 
 	// Give some time for any potential events
@@ -743,7 +743,7 @@ func TestAppTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 		[]byte("prover8"),
 	}, nil)
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Drain genesis event
@@ -780,7 +780,7 @@ func TestAppTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 		[]byte("prover8"),
 	}, nil)
 
-	err = atr.Insert(ctx, frame1)
+	err = atr.Insert(frame1)
 	require.NoError(t, err)
 	select {
 	case <-eventCh:
@@ -870,21 +870,21 @@ func TestAppTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 	}, nil)
 
 	// Insert chain A frames in order: 2A, 3A, 4A
-	err = atr.Insert(ctx, frame2A)
+	err = atr.Insert(frame2A)
 	require.NoError(t, err)
 	select {
 	case <-eventCh:
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	err = atr.Insert(ctx, frame3A)
+	err = atr.Insert(frame3A)
 	require.NoError(t, err)
 	select {
 	case <-eventCh:
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	err = atr.Insert(ctx, frame4A)
+	err = atr.Insert(frame4A)
 	require.NoError(t, err)
 	select {
 	case <-eventCh:
@@ -971,7 +971,7 @@ func TestAppTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 	// This should work because the time reel should handle out-of-order insertion
 
 	// Insert frame 4B first
-	err = atr.Insert(ctx, frame4B)
+	err = atr.Insert(frame4B)
 	require.NoError(t, err, "inserting 4B should succeed even without its parents")
 	select {
 	case <-eventCh:
@@ -985,7 +985,7 @@ func TestAppTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 	assert.Equal(t, []byte("frame4A_output"), head.Header.Output, "should still be chain A")
 
 	// Insert frame 3B
-	err = atr.Insert(ctx, frame3B)
+	err = atr.Insert(frame3B)
 	require.NoError(t, err, "inserting 3B should succeed")
 	select {
 	case <-eventCh:
@@ -999,7 +999,7 @@ func TestAppTimeReel_DeepForkChoice_ReverseInsertion(t *testing.T) {
 	assert.Equal(t, []byte("frame4A_output"), head.Header.Output, "should still be chain A")
 
 	// Insert frame 2B - this completes the chain B lineage
-	err = atr.Insert(ctx, frame2B)
+	err = atr.Insert(frame2B)
 	require.NoError(t, err, "inserting 2B should succeed and complete chain B")
 
 	// Give time for reorganization
@@ -1063,7 +1063,7 @@ func TestAppTimeReel_MultipleProvers(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Build chain with alternating provers
@@ -1081,7 +1081,7 @@ func TestAppTimeReel_MultipleProvers(t *testing.T) {
 			},
 		}
 
-		err = atr.Insert(ctx, frame)
+		err = atr.Insert(frame)
 		require.NoError(t, err)
 
 		prevOutput = frame.Header.Output
@@ -1292,19 +1292,19 @@ func TestAppTimeReel_ComplexForkWithOutOfOrderInsertion(t *testing.T) {
 	// Now insert in the specified order: 1, 3', 3, 2, 3'', 2'
 
 	// Step 1: Insert genesis first (needed as base)
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 
 	// Step 2: Insert frame 1
 	t.Log("Inserting frame 1")
-	err = atr.Insert(ctx, frame1)
+	err = atr.Insert(frame1)
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 
 	// Step 3: Insert frame 3' (should go to pending since 2' doesn't exist yet)
 	t.Log("Inserting frame 3'")
-	err = atr.Insert(ctx, frame3Prime)
+	err = atr.Insert(frame3Prime)
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 
@@ -1314,13 +1314,13 @@ func TestAppTimeReel_ComplexForkWithOutOfOrderInsertion(t *testing.T) {
 
 	// Step 4: Insert frame 3 (should also go to pending since 2 doesn't exist yet)
 	t.Log("Inserting frame 3")
-	err = atr.Insert(ctx, frame3)
+	err = atr.Insert(frame3)
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 
 	// Step 5: Insert frame 2 (this should complete the 1->2->3 chain)
 	t.Log("Inserting frame 2")
-	err = atr.Insert(ctx, frame2)
+	err = atr.Insert(frame2)
 	require.NoError(t, err)
 	time.Sleep(100 * time.Millisecond) // Give more time for processing
 
@@ -1332,13 +1332,13 @@ func TestAppTimeReel_ComplexForkWithOutOfOrderInsertion(t *testing.T) {
 
 	// Step 6: Insert frame 3'' (another competing frame on 2')
 	t.Log("Inserting frame 3''")
-	err = atr.Insert(ctx, frame3DoublePrime)
+	err = atr.Insert(frame3DoublePrime)
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 
 	// Step 7: Insert frame 2' (this completes the 1->2'->3' and 1->2'->3'' chains)
 	t.Log("Inserting frame 2'")
-	err = atr.Insert(ctx, frame2Prime)
+	err = atr.Insert(frame2Prime)
 	require.NoError(t, err)
 	time.Sleep(200 * time.Millisecond) // Give ample time for fork choice evaluation
 
@@ -1399,7 +1399,7 @@ func TestAppTimeReel_TreePruning(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Build a long chain that will trigger pruning (370 frames total)
@@ -1417,7 +1417,7 @@ func TestAppTimeReel_TreePruning(t *testing.T) {
 			},
 		}
 
-		err = atr.Insert(ctx, frame)
+		err = atr.Insert(frame)
 		require.NoError(t, err)
 
 		prevOutput = frame.Header.Output
@@ -1487,7 +1487,7 @@ func TestAppTimeReel_TreePruningWithForks(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Build main chain for 365 frames
@@ -1506,7 +1506,7 @@ func TestAppTimeReel_TreePruningWithForks(t *testing.T) {
 			},
 		}
 
-		err = atr.Insert(ctx, frame)
+		err = atr.Insert(frame)
 		require.NoError(t, err)
 
 		if i == 5 {
@@ -1533,7 +1533,7 @@ func TestAppTimeReel_TreePruningWithForks(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, forkFrame)
+	err = atr.Insert(forkFrame)
 	require.NoError(t, err)
 
 	// Continue main chain for 375 more frames to trigger deep pruning
@@ -1550,7 +1550,7 @@ func TestAppTimeReel_TreePruningWithForks(t *testing.T) {
 			},
 		}
 
-		err = atr.Insert(ctx, frame)
+		err = atr.Insert(frame)
 		require.NoError(t, err)
 
 		prevOutput = frame.Header.Output
@@ -1628,7 +1628,7 @@ drained:
 		[]byte("prover8"),
 	}, nil)
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Drain genesis event
@@ -1712,14 +1712,14 @@ drained:
 	}, nil)
 
 	// Insert weak branch first
-	err = atr.Insert(ctx, frame1A)
+	err = atr.Insert(frame1A)
 	require.NoError(t, err)
 	select {
 	case <-eventCh:
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	err = atr.Insert(ctx, frame2A)
+	err = atr.Insert(frame2A)
 	require.NoError(t, err)
 	select {
 	case <-eventCh:
@@ -1763,7 +1763,7 @@ drained:
 	}, nil)
 
 	// Insert stronger branch out of order: first 2B (goes to pending), then 1B
-	err = atr.Insert(ctx, frame2B)
+	err = atr.Insert(frame2B)
 	require.NoError(t, err, "should accept frame 2B into pending")
 
 	// Head should still be weak branch
@@ -1772,7 +1772,7 @@ drained:
 	assert.Equal(t, []byte("frame2A_output"), head.Header.Output, "head should still be weak branch")
 
 	// Now insert 1B, which should complete the strong branch and trigger fork choice
-	err = atr.Insert(ctx, frame1B)
+	err = atr.Insert(frame1B)
 	require.NoError(t, err)
 
 	// Give time for fork choice to process
@@ -1871,7 +1871,7 @@ func TestAppTimeReel_ForkEventsWithReplay(t *testing.T) {
 
 	// Insert initial chain
 	for _, frame := range []*protobufs.AppShardFrame{genesis, frame1, frame2, frame3} {
-		err = atr.Insert(ctx, frame)
+		err = atr.Insert(frame)
 		require.NoError(t, err)
 		time.Sleep(10 * time.Millisecond) // Allow events to be sent
 	}
@@ -1930,7 +1930,7 @@ func TestAppTimeReel_ForkEventsWithReplay(t *testing.T) {
 
 	// Insert stronger fork - this should trigger a reorganization
 	for _, frame := range []*protobufs.AppShardFrame{frame2Prime, frame3Prime, frame4Prime} {
-		err = atr.Insert(ctx, frame)
+		err = atr.Insert(frame)
 		require.NoError(t, err)
 		time.Sleep(50 * time.Millisecond) // Allow events to propagate
 	}
@@ -2017,7 +2017,7 @@ func TestAppTimeReel_ComprehensiveEquivocation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Insert valid frame 1
@@ -2036,7 +2036,7 @@ func TestAppTimeReel_ComprehensiveEquivocation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1Valid)
+	err = atr.Insert(frame1Valid)
 	require.NoError(t, err)
 
 	// Test Case 1: Complete overlap - same signers, different content
@@ -2055,7 +2055,7 @@ func TestAppTimeReel_ComprehensiveEquivocation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1Equivocation1)
+	err = atr.Insert(frame1Equivocation1)
 	assert.NoError(t, err)
 
 	// Test Case 2: Partial overlap - some same signers
@@ -2074,7 +2074,7 @@ func TestAppTimeReel_ComprehensiveEquivocation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1Equivocation2)
+	err = atr.Insert(frame1Equivocation2)
 	assert.NoError(t, err)
 
 	// Test Case 3: No overlap - should be allowed (fork)
@@ -2093,7 +2093,7 @@ func TestAppTimeReel_ComprehensiveEquivocation(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, frame1Fork)
+	err = atr.Insert(frame1Fork)
 	assert.NoError(t, err, "should allow fork with no overlapping signers")
 
 	// Wait for events to be processed
@@ -2163,7 +2163,7 @@ func TestAppTimeReel_ProverRegistryForkChoice(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Drain genesis event
@@ -2213,7 +2213,7 @@ func TestAppTimeReel_ProverRegistryForkChoice(t *testing.T) {
 	}
 
 	// Insert frame with wrong prover first
-	err = atr.Insert(ctx, frame1b)
+	err = atr.Insert(frame1b)
 	require.NoError(t, err)
 
 	// Should become head initially
@@ -2226,7 +2226,7 @@ func TestAppTimeReel_ProverRegistryForkChoice(t *testing.T) {
 	}
 
 	// Insert frame with correct prover
-	err = atr.Insert(ctx, frame1a)
+	err = atr.Insert(frame1a)
 	require.NoError(t, err)
 
 	// Should trigger fork choice and frame1a should win
@@ -2292,7 +2292,7 @@ func TestAppTimeReel_ProverRegistryWithOrderedProvers(t *testing.T) {
 		},
 	}
 
-	err = atr.Insert(ctx, genesis)
+	err = atr.Insert(genesis)
 	require.NoError(t, err)
 
 	// Create three competing frames with different provers from the ordered list
@@ -2358,7 +2358,7 @@ func TestAppTimeReel_ProverRegistryWithOrderedProvers(t *testing.T) {
 
 	// Insert in reverse order of preference
 	t.Logf("Inserting frame1a with prover: %s", frame1a.Header.Prover)
-	err = atr.Insert(ctx, frame1a)
+	err = atr.Insert(frame1a)
 	require.NoError(t, err)
 
 	// Drain events for frame1a
@@ -2381,7 +2381,7 @@ func TestAppTimeReel_ProverRegistryWithOrderedProvers(t *testing.T) {
 	t.Logf("Head after frame1a: %s", head1.Header.Output)
 
 	t.Logf("Inserting frame1b with prover: %s", frame1b.Header.Prover)
-	err = atr.Insert(ctx, frame1b)
+	err = atr.Insert(frame1b)
 	require.NoError(t, err)
 
 	drainEvents("frame1b")
@@ -2391,7 +2391,7 @@ func TestAppTimeReel_ProverRegistryWithOrderedProvers(t *testing.T) {
 	t.Logf("Head after frame1b: %s", head2.Header.Output)
 
 	t.Logf("Inserting frame1c with prover: %s", frame1c.Header.Prover)
-	err = atr.Insert(ctx, frame1c)
+	err = atr.Insert(frame1c)
 	require.NoError(t, err)
 
 	drainEvents("frame1c")

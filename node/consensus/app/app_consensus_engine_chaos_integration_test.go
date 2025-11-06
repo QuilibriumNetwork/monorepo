@@ -327,10 +327,10 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 		// Subscribe to frames
 		pubsub.Subscribe(engine.getConsensusMessageBitmask(), func(message *pb.Message) error {
-			frame := &protobufs.AppShardFrame{}
+			frame := &protobufs.AppShardProposal{}
 			if err := frame.FromCanonicalBytes(message.Data); err == nil {
 				node.mu.Lock()
-				node.frameHistory = append(node.frameHistory, frame)
+				node.frameHistory = append(node.frameHistory, frame.State)
 				node.mu.Unlock()
 			}
 			return nil
@@ -657,14 +657,16 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 						voterAddress := nodes[nodeIdx].engine.getAddressFromPublicKey(publicKey)
 
 						// Create vote message
-						vote := &protobufs.FrameVote{
+						vote := &protobufs.ProposalVote{
 							FrameNumber: frame.Header.FrameNumber,
-							Proposer:    frame.Header.Prover,
-							Approve:     true,
+							Filter:      frame.Header.Address,
+							Rank:        frame.GetRank(),
+							Selector:    []byte(frame.Identity()),
 							PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
 								Address:   voterAddress,
 								Signature: sig,
 							},
+							Timestamp: uint64(time.Now().UnixMilli()),
 						}
 
 						// Serialize and publish
@@ -979,13 +981,6 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 	// Stop all nodes
 	t.Log("\nStep 8: Cleanup")
 	for i, node := range nodes {
-		// Unregister executors
-		node.mu.RLock()
-		for name := range node.executors {
-			node.engine.UnregisterExecutor(name, 0, true)
-		}
-		node.mu.RUnlock()
-
 		// Stop engine
 		node.engine.Stop(true)
 		close(node.quit)

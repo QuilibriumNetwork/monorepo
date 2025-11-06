@@ -23,15 +23,15 @@ func TestVoteProcessorFactory_CreateWithValidProposal(t *testing.T) {
 	vote, err := proposal.ProposerVote()
 	require.NoError(t, err)
 	mockedProcessor.On("Process", vote).Return(nil).Once()
-	mockedFactory.On("Create", helper.Logger(), proposal, mock.Anything, mock.Anything, mock.Anything).Return(mockedProcessor, nil).Once()
+	mockedFactory.On("Create", helper.Logger(), []byte{}, proposal, mock.Anything, mock.Anything, mock.Anything).Return(mockedProcessor, nil).Once()
 
 	voteProcessorFactory := &VoteProcessorFactory[*helper.TestState, *helper.TestVote, *helper.TestPeer]{
-		baseFactory: func(log consensus.TraceLogger, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
-			return mockedFactory.Create(log, proposal, dsTag, aggregator, votingProvider)
+		baseFactory: func(log consensus.TraceLogger, filter []byte, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+			return mockedFactory.Create(log, filter, proposal, dsTag, aggregator, votingProvider)
 		},
 	}
 
-	processor, err := voteProcessorFactory.Create(helper.Logger(), proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
+	processor, err := voteProcessorFactory.Create(helper.Logger(), []byte{}, proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
 	require.NoError(t, err)
 	require.NotNil(t, processor)
 
@@ -50,15 +50,15 @@ func TestVoteProcessorFactory_CreateWithInvalidVote(t *testing.T) {
 		vote, err := proposal.ProposerVote()
 		require.NoError(t, err)
 		mockedProcessor.On("Process", vote).Return(models.NewInvalidVoteErrorf(vote, "")).Once()
-		mockedFactory.On("Create", helper.Logger(), proposal, mock.Anything, mock.Anything, mock.Anything).Return(mockedProcessor, nil).Once()
+		mockedFactory.On("Create", helper.Logger(), []byte{}, proposal, mock.Anything, mock.Anything, mock.Anything).Return(mockedProcessor, nil).Once()
 
 		voteProcessorFactory := &VoteProcessorFactory[*helper.TestState, *helper.TestVote, *helper.TestPeer]{
-			baseFactory: func(log consensus.TraceLogger, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
-				return mockedFactory.Create(log, proposal, dsTag, aggregator, votingProvider)
+			baseFactory: func(log consensus.TraceLogger, filter []byte, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+				return mockedFactory.Create(log, filter, proposal, dsTag, aggregator, votingProvider)
 			},
 		}
 
-		processor, err := voteProcessorFactory.Create(helper.Logger(), proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
+		processor, err := voteProcessorFactory.Create(helper.Logger(), []byte{}, proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
 		require.Error(t, err)
 		require.Nil(t, processor)
 		require.True(t, models.IsInvalidProposalError[*helper.TestState, *helper.TestVote](err))
@@ -73,15 +73,15 @@ func TestVoteProcessorFactory_CreateWithInvalidVote(t *testing.T) {
 		require.NoError(t, err)
 		mockedProcessor.On("Process", vote).Return(exception).Once()
 
-		mockedFactory.On("Create", helper.Logger(), proposal, mock.Anything, mock.Anything, mock.Anything).Return(mockedProcessor, nil).Once()
+		mockedFactory.On("Create", helper.Logger(), []byte{}, proposal, mock.Anything, mock.Anything, mock.Anything).Return(mockedProcessor, nil).Once()
 
 		voteProcessorFactory := &VoteProcessorFactory[*helper.TestState, *helper.TestVote, *helper.TestPeer]{
-			baseFactory: func(log consensus.TraceLogger, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
-				return mockedFactory.Create(log, proposal, dsTag, aggregator, votingProvider)
+			baseFactory: func(log consensus.TraceLogger, filter []byte, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+				return mockedFactory.Create(log, filter, proposal, dsTag, aggregator, votingProvider)
 			},
 		}
 
-		processor, err := voteProcessorFactory.Create(helper.Logger(), proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
+		processor, err := voteProcessorFactory.Create(helper.Logger(), []byte{}, proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
 		require.ErrorIs(t, err, exception)
 		require.Nil(t, processor)
 		// an unexpected exception should _not_ be interpreted as the state being invalid
@@ -101,14 +101,14 @@ func TestVoteProcessorFactory_CreateProcessException(t *testing.T) {
 	proposal := helper.MakeSignedProposal[*helper.TestState, *helper.TestVote]()
 	exception := errors.New("create-exception")
 
-	mockedFactory.On("Create", helper.Logger(), proposal, mock.Anything, mock.Anything, mock.Anything).Return(nil, exception).Once()
+	mockedFactory.On("Create", helper.Logger(), []byte{}, proposal, mock.Anything, mock.Anything, mock.Anything).Return(nil, exception).Once()
 	voteProcessorFactory := &VoteProcessorFactory[*helper.TestState, *helper.TestVote, *helper.TestPeer]{
-		baseFactory: func(log consensus.TraceLogger, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
-			return mockedFactory.Create(log, proposal, dsTag, aggregator, votingProvider)
+		baseFactory: func(log consensus.TraceLogger, filter []byte, state *models.State[*helper.TestState], dsTag []byte, aggregator consensus.SignatureAggregator, votingProvider consensus.VotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer]) (consensus.VerifyingVoteProcessor[*helper.TestState, *helper.TestVote], error) {
+			return mockedFactory.Create(log, filter, proposal, dsTag, aggregator, votingProvider)
 		},
 	}
 
-	processor, err := voteProcessorFactory.Create(helper.Logger(), proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
+	processor, err := voteProcessorFactory.Create(helper.Logger(), []byte{}, proposal, []byte{}, mocks.NewSignatureAggregator(t), mocks.NewVotingProvider[*helper.TestState, *helper.TestVote, *helper.TestPeer](t))
 	require.ErrorIs(t, err, exception)
 	require.Nil(t, processor)
 	// an unexpected exception should _not_ be interpreted as the state being invalid

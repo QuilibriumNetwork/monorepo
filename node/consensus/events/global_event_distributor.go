@@ -52,6 +52,7 @@ func (g *GlobalEventDistributor) Start(
 	go g.trackUptime()
 
 	<-ctx.Done()
+	g.wg.Wait()
 	g.mu.Lock()
 	g.running = false
 	for _, ch := range g.subscribers {

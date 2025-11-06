@@ -33,7 +33,7 @@ func TestGlobalTimeReel_SimpleEquivocation(t *testing.T) {
 		},
 	}
 
-	err = globalReel.Insert(context.Background(), genesis)
+	err = globalReel.Insert(genesis)
 	require.NoError(t, err)
 
 	parentSelector := computeGlobalPoseidonHash(genesis.Header.Output)
@@ -50,7 +50,7 @@ func TestGlobalTimeReel_SimpleEquivocation(t *testing.T) {
 		},
 	}
 
-	err = globalReel.Insert(context.Background(), frame1A)
+	err = globalReel.Insert(frame1A)
 	require.NoError(t, err)
 
 	// Insert frame 1B with signers 2,3,4,5,6,7 (bitmask 0b11111100)
@@ -66,7 +66,7 @@ func TestGlobalTimeReel_SimpleEquivocation(t *testing.T) {
 		},
 	}
 
-	err = globalReel.Insert(context.Background(), frame1B)
+	err = globalReel.Insert(frame1B)
 	require.NoError(t, err, "Should accept frame despite equivocation")
 
 	// Check equivocators are tracked

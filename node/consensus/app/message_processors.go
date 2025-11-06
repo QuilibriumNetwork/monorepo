@@ -194,7 +194,7 @@ func (e *AppConsensusEngine) handleFrameMessage(message *pb.Message) {
 		e.frameStore[string(frameID)] = frame
 		e.frameStoreMu.Unlock()
 
-		if err := e.appTimeReel.Insert(e.ctx, frame); err != nil {
+		if err := e.appTimeReel.Insert(frame); err != nil {
 			// Success metric recorded at the end of processing
 			framesProcessedTotal.WithLabelValues("error").Inc()
 			return
@@ -274,7 +274,7 @@ func (e *AppConsensusEngine) handleGlobalFrameMessage(message *pb.Message) {
 			return
 		}
 
-		if err := e.globalTimeReel.Insert(e.ctx, frame); err != nil {
+		if err := e.globalTimeReel.Insert(frame); err != nil {
 			// Success metric recorded at the end of processing
 			globalFramesProcessedTotal.WithLabelValues("error").Inc()
 			return

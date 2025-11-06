@@ -435,10 +435,14 @@ func NewAppConsensusEngine(
 
 	engine.voteAggregator, err = voting.NewAppShardVoteAggregator[PeerID](
 		tracing.NewZapTracer(logger),
+		appAddress,
 		engine,
 		voteAggregationDistributor,
 		engine.signatureAggregator,
 		engine.votingProvider,
+		func(qc models.QuorumCertificate) {
+			engine.consensusParticipant.OnQuorumCertificateConstructedFromVotes(qc)
+		},
 		(*initialState).GetRank(),
 	)
 	if err != nil {
@@ -446,10 +450,12 @@ func NewAppConsensusEngine(
 	}
 	engine.timeoutAggregator, err = voting.NewAppShardTimeoutAggregator[PeerID](
 		tracing.NewZapTracer(logger),
+		appAddress,
 		engine,
 		engine,
 		engine.signatureAggregator,
 		timeoutAggregationDistributor,
+		engine.votingProvider,
 		(*initialState).GetRank(),
 	)
 
@@ -1112,7 +1118,7 @@ func (e *AppConsensusEngine) initializeGenesis() *protobufs.AppShardFrame {
 	e.frameStore[string(frameID)] = genesisFrame
 	e.frameStoreMu.Unlock()
 
-	if err := e.appTimeReel.Insert(e.ctx, genesisFrame); err != nil {
+	if err := e.appTimeReel.Insert(genesisFrame); err != nil {
 		e.logger.Error("failed to add genesis frame to time reel", zap.Error(err))
 		e.frameStoreMu.Lock()
 		delete(e.frameStore, string(frameID))
@@ -1667,9 +1673,13 @@ func (e *AppConsensusEngine) VerifyQuorumCertificate(
 
 	pubkeys := [][]byte{}
 	signatures := [][]byte{}
-	if (len(provers) + 7/8) > len(qc.AggregateSignature.Bitmask) {
+	if ((len(provers) + 7) / 8) > len(qc.AggregateSignature.Bitmask) {
 		return errors.Wrap(
-			errors.New("bitmask invalid for prover set"),
+			errors.Errorf(
+				"bitmask invalid for prover set, expected: %d, actual: %d",
+				((len(provers)+7)/8),
+				len(qc.AggregateSignature.Bitmask),
+			),
 			"verify quorum certificate",
 		)
 	}
@@ -1739,9 +1749,13 @@ func (e *AppConsensusEngine) VerifyTimeoutCertificate(
 
 	pubkeys := [][]byte{}
 	signatures := [][]byte{}
-	if (len(provers) + 7/8) > len(tc.AggregateSignature.Bitmask) {
+	if ((len(provers) + 7) / 8) > len(tc.AggregateSignature.Bitmask) {
 		return errors.Wrap(
-			errors.New("bitmask invalid for prover set"),
+			errors.Errorf(
+				"bitmask invalid for prover set, expected: %d, actual: %d",
+				((len(provers)+7)/8),
+				len(tc.AggregateSignature.Bitmask),
+			),
 			"verify timeout certificate",
 		)
 	}

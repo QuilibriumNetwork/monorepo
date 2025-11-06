@@ -219,7 +219,6 @@ func (a *AppTimeReel) sendEvent(event AppEvent) {
 
 // Insert inserts an app frame header into the tree structure
 func (a *AppTimeReel) Insert(
-	ctx context.Context,
 	frame *protobufs.AppShardFrame,
 ) error {
 	// Start timing

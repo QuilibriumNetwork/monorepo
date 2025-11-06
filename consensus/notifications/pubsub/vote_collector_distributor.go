@@ -8,8 +8,8 @@ import (
 )
 
 // VoteCollectorDistributor ingests notifications about vote aggregation and
-// distributes them to consumers. Such notifications are produced by the vote aggregation logic.
-// Concurrency safe.
+// distributes them to consumers. Such notifications are produced by the vote
+// aggregation logic. Concurrency safe.
 type VoteCollectorDistributor[VoteT models.Unique] struct {
 	consumers []consensus.VoteCollectorConsumer[VoteT]
 	lock      sync.RWMutex

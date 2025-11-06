@@ -68,12 +68,11 @@ func (v *Validator[StateT, VoteT]) ValidateTimeoutCertificate(
 	signerIDs := []models.WeightedIdentity{}
 	sigIndices := tc.GetAggregatedSignature().GetBitmask()
 	totalWeight := uint64(0)
+	if len(sigIndices) < (len(allParticipants)+7)/8 {
+		return models.NewInsufficientSignaturesErrorf("insufficient signatures")
+	}
 	for i, member := range allParticipants {
-		if len(sigIndices) < (i/8)+1 {
-			return models.NewInsufficientSignaturesErrorf("insufficient signatures")
-		}
-
-		if sigIndices[i/8]>>i%8&1 == 1 {
+		if sigIndices[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
 			signerIDs = append(signerIDs, member)
 			totalWeight += member.Weight()
 		}
@@ -217,14 +216,14 @@ func (v *Validator[StateT, VoteT]) ValidateQuorumCertificate(
 	signerIDs := []models.WeightedIdentity{}
 	sigIndices := qc.GetAggregatedSignature().GetBitmask()
 	totalWeight := uint64(0)
+	if len(sigIndices) < (len(allParticipants)+7)/8 {
+		return newInvalidQuorumCertificateError(
+			qc,
+			models.NewInsufficientSignaturesErrorf("insufficient signatures"),
+		)
+	}
 	for i, member := range allParticipants {
-		if len(sigIndices) < (i/8)+1 {
-			return newInvalidQuorumCertificateError(
-				qc,
-				models.NewInsufficientSignaturesErrorf("insufficient signatures"),
-			)
-		}
-		if sigIndices[i/8]>>i%8&1 == 1 {
+		if sigIndices[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
 			signerIDs = append(signerIDs, member)
 			totalWeight += member.Weight()
 		}

@@ -36,6 +36,7 @@ type sigInfo struct {
 // verification was done outside the module. Implementation is thread-safe.
 type TimeoutSignatureAggregator struct {
 	lock          sync.RWMutex
+	filter        []byte
 	dsTag         []byte
 	aggregator    consensus.SignatureAggregator
 	idToInfo      map[models.Identity]signerInfo // auxiliary map to lookup signer weight and public key (only gets updated by constructor)
@@ -61,6 +62,7 @@ var _ consensus.TimeoutSignatureAggregator = (*TimeoutSignatureAggregator)(nil)
 // in the protocol.
 func NewTimeoutSignatureAggregator(
 	aggregator consensus.SignatureAggregator,
+	filter []byte,
 	rank uint64, // rank for which we are aggregating signatures
 	ids []models.WeightedIdentity, // list of all authorized signers
 	dsTag []byte, // domain separation tag used by the signature
@@ -83,6 +85,7 @@ func NewTimeoutSignatureAggregator(
 
 	return &TimeoutSignatureAggregator{
 		aggregator:    aggregator,
+		filter:        filter,
 		dsTag:         dsTag,
 		idToInfo:      idToInfo,
 		idToSignature: make(map[models.Identity]sigInfo),
@@ -125,7 +128,7 @@ func (a *TimeoutSignatureAggregator) VerifyAndAdd(
 		)
 	}
 
-	msg := verification.MakeTimeoutMessage(a.rank, newestQCRank)
+	msg := verification.MakeTimeoutMessage(a.filter, a.rank, newestQCRank)
 	valid := a.aggregator.VerifySignatureRaw(info.pk, sig, msg, a.dsTag)
 	if !valid {
 		return a.TotalWeight(), fmt.Errorf(

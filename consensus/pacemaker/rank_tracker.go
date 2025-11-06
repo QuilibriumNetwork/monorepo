@@ -108,6 +108,7 @@ func (vt *rankTracker[StateT, VoteT]) ReceiveTimeoutCertificate(
 	tc models.TimeoutCertificate,
 ) (uint64, error) {
 	rank := vt.livenessState.CurrentRank
+
 	if tc == nil {
 		return rank, nil
 	}

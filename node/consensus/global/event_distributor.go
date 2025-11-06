@@ -2,6 +2,7 @@ package global
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math/rand"
@@ -91,7 +92,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 								allocated = allocated && w.Allocated
 							}
 							if !allocated {
-								e.evaluateForProposals(data)
+								e.evaluateForProposals(ctx, data)
 							}
 						}
 					}
@@ -204,7 +205,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 					go func() {
 						for {
 							select {
-							case <-e.ctx.Done():
+							case <-ctx.Done():
 								return
 							case <-time.After(10 * time.Second):
 								e.logger.Error(
@@ -226,7 +227,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 					go func() {
 						for {
 							select {
-							case <-e.ctx.Done():
+							case <-ctx.Done():
 								return
 							case <-time.After(10 * time.Second):
 								e.logger.Error(
@@ -357,6 +358,7 @@ func (e *GlobalConsensusEngine) estimateSeniorityFromConfig() uint64 {
 }
 
 func (e *GlobalConsensusEngine) evaluateForProposals(
+	ctx context.Context,
 	data *consensustime.GlobalEvent,
 ) {
 	self, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
@@ -393,7 +395,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		}
 
 		idx := rand.Int63n(int64(len(ps)))
-		e.syncProvider.hyperSyncWithProver(ps[idx].Address, key)
+		e.syncProvider.hyperSyncWithProver(ctx, ps[idx].Address, key)
 
 		for _, shard := range shards {
 			path := []int{}
@@ -442,7 +444,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 
 			size := e.hypergraph.GetSize(&key, path)
 			resp, err := e.hypergraph.GetChildrenForPath(
-				e.ctx,
+				ctx,
 				&protobufs.GetChildrenForPathRequest{
 					ShardKey: slices.Concat(key.L1[:], key.L2[:]),
 					Path:     shard.Path,

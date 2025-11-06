@@ -142,7 +142,7 @@ func NewParticipant[
 	loop, err := eventloop.NewEventLoop(
 		logger,
 		eventHandler,
-		time.Now().Add(10*time.Second),
+		time.Now(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize event loop: %w", err)

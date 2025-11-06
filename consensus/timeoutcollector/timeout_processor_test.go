@@ -580,7 +580,7 @@ func TestTimeoutProcessor_BuildVerifyTC(t *testing.T) {
 	sigagg.On("VerifySignatureRaw", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true)
 	sigagg.On("Aggregate", mock.Anything, mock.Anything).Return(&helper.TestAggregatedSignature{PublicKey: make([]byte, 585), Signature: make([]byte, 74), Bitmask: []byte{0b11111111, 0b00000111}}, nil)
 
-	aggregator, err := NewTimeoutSignatureAggregator(sigagg, rank, provingSignersSkeleton, []byte{})
+	aggregator, err := NewTimeoutSignatureAggregator(sigagg, []byte{}, rank, provingSignersSkeleton, []byte{})
 	require.NoError(t, err)
 
 	notifier := mocks.NewTimeoutCollectorConsumer[*helper.TestVote](t)
@@ -609,7 +609,7 @@ func TestTimeoutProcessor_BuildVerifyTC(t *testing.T) {
 	// at this point we have created QCs for rank N-1 and N additionally a TC for rank N, we can create TC for rank N+1
 	// with timeout states containing both QC and TC for rank N
 
-	aggregator, err = NewTimeoutSignatureAggregator(sigagg, rank+1, provingSignersSkeleton, []byte{})
+	aggregator, err = NewTimeoutSignatureAggregator(sigagg, []byte{}, rank+1, provingSignersSkeleton, []byte{})
 	require.NoError(t, err)
 
 	notifier = mocks.NewTimeoutCollectorConsumer[*helper.TestVote](t)
@@ -663,7 +663,7 @@ func createRealQC(
 		Timestamp:           uint64(time.Now().UnixMilli()),
 		AggregatedSignature: &helper.TestAggregatedSignature{PublicKey: make([]byte, 585), Signature: make([]byte, 74), Bitmask: []byte{0b11111111, 0b00000111}},
 	}, nil)
-	voteProcessor, err := voteProcessorFactory.Create(helper.Logger(), proposal, []byte{}, sigagg, votingProvider)
+	voteProcessor, err := voteProcessorFactory.Create(helper.Logger(), []byte{}, proposal, []byte{}, sigagg, votingProvider)
 	require.NoError(t, err)
 
 	for _, signer := range signers[1:] {

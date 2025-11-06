@@ -26,6 +26,7 @@ func NewAppShardVoteAggregationDistributor() *pubsub.VoteAggregationDistributor[
 
 func NewAppShardVoteAggregator[PeerIDT models.Unique](
 	logger consensus.TraceLogger,
+	filter []byte,
 	committee consensus.DynamicCommittee,
 	voteAggregationDistributor *pubsub.VoteAggregationDistributor[
 		*protobufs.AppShardFrame,
@@ -37,6 +38,7 @@ func NewAppShardVoteAggregator[PeerIDT models.Unique](
 		*protobufs.ProposalVote,
 		PeerIDT,
 	],
+	onQCCreated consensus.OnQuorumCertificateCreated,
 	currentRank uint64,
 ) (
 	consensus.VoteAggregator[*protobufs.AppShardFrame, *protobufs.ProposalVote],
@@ -46,10 +48,11 @@ func NewAppShardVoteAggregator[PeerIDT models.Unique](
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
 		PeerIDT,
-	](committee, func(qc models.QuorumCertificate) {})
+	](committee, onQCCreated)
 
 	createCollectorFactoryMethod := votecollector.NewStateMachineFactory(
 		logger,
+		filter,
 		voteAggregationDistributor,
 		votecollector.VerifyingVoteProcessorFactory[
 			*protobufs.AppShardFrame,
@@ -86,10 +89,16 @@ func NewAppShardTimeoutAggregationDistributor() *pubsub.TimeoutAggregationDistri
 
 func NewAppShardTimeoutAggregator[PeerIDT models.Unique](
 	logger consensus.TraceLogger,
+	filter []byte,
 	committee consensus.DynamicCommittee,
 	consensusVerifier consensus.Verifier[*protobufs.ProposalVote],
 	signatureAggregator consensus.SignatureAggregator,
 	timeoutAggregationDistributor *pubsub.TimeoutAggregationDistributor[*protobufs.ProposalVote],
+	votingProvider consensus.VotingProvider[
+		*protobufs.AppShardFrame,
+		*protobufs.ProposalVote,
+		PeerIDT,
+	],
 	currentRank uint64,
 ) (consensus.TimeoutAggregator[*protobufs.ProposalVote], error) {
 	// initialize the Validator
@@ -104,10 +113,12 @@ func NewAppShardTimeoutAggregator[PeerIDT models.Unique](
 		PeerIDT,
 	](
 		logger,
+		filter,
 		signatureAggregator,
 		timeoutAggregationDistributor,
 		committee,
 		validator,
+		votingProvider,
 		[]byte("appshardtimeout"),
 	)
 
@@ -155,6 +166,7 @@ func NewGlobalVoteAggregator[PeerIDT models.Unique](
 		*protobufs.ProposalVote,
 		PeerIDT,
 	],
+	onQCCreated consensus.OnQuorumCertificateCreated,
 	currentRank uint64,
 ) (
 	consensus.VoteAggregator[*protobufs.GlobalFrame, *protobufs.ProposalVote],
@@ -164,10 +176,11 @@ func NewGlobalVoteAggregator[PeerIDT models.Unique](
 		*protobufs.GlobalFrame,
 		*protobufs.ProposalVote,
 		PeerIDT,
-	](committee, func(qc models.QuorumCertificate) {})
+	](committee, onQCCreated)
 
 	createCollectorFactoryMethod := votecollector.NewStateMachineFactory(
 		logger,
+		nil,
 		voteAggregationDistributor,
 		votecollector.VerifyingVoteProcessorFactory[
 			*protobufs.GlobalFrame,
@@ -208,6 +221,11 @@ func NewGlobalTimeoutAggregator[PeerIDT models.Unique](
 	consensusVerifier consensus.Verifier[*protobufs.ProposalVote],
 	signatureAggregator consensus.SignatureAggregator,
 	timeoutAggregationDistributor *pubsub.TimeoutAggregationDistributor[*protobufs.ProposalVote],
+	votingProvider consensus.VotingProvider[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+		PeerIDT,
+	],
 	currentRank uint64,
 ) (consensus.TimeoutAggregator[*protobufs.ProposalVote], error) {
 	// initialize the Validator
@@ -222,10 +240,12 @@ func NewGlobalTimeoutAggregator[PeerIDT models.Unique](
 		PeerIDT,
 	](
 		logger,
+		nil,
 		signatureAggregator,
 		timeoutAggregationDistributor,
 		committee,
 		validator,
+		votingProvider,
 		[]byte("globaltimeout"),
 	)
 

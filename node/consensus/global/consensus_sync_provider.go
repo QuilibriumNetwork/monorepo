@@ -84,7 +84,7 @@ func (p *GlobalSyncProvider) Synchronize(
 			return
 		}
 
-		err = p.syncWithMesh()
+		err = p.syncWithMesh(ctx)
 		if err != nil {
 			dataCh <- existing
 			errCh <- err
@@ -112,7 +112,7 @@ func (p *GlobalSyncProvider) Synchronize(
 	return dataCh, errCh
 }
 
-func (p *GlobalSyncProvider) syncWithMesh() error {
+func (p *GlobalSyncProvider) syncWithMesh(ctx context.Context) error {
 	p.engine.logger.Info("synchronizing with peers")
 
 	latest, err := p.engine.globalTimeReel.GetHead()
@@ -162,7 +162,7 @@ func (p *GlobalSyncProvider) syncWithMesh() error {
 			latest = head
 		}
 
-		latest, err = p.syncWithPeer(latest, []byte(peerID))
+		latest, err = p.syncWithPeer(ctx, latest, []byte(peerID))
 		if err != nil {
 			p.engine.logger.Debug("error syncing frame", zap.Error(err))
 		}
@@ -178,6 +178,7 @@ func (p *GlobalSyncProvider) syncWithMesh() error {
 }
 
 func (p *GlobalSyncProvider) syncWithPeer(
+	ctx context.Context,
 	latest *protobufs.GlobalFrame,
 	peerId []byte,
 ) (*protobufs.GlobalFrame, error) {
@@ -188,7 +189,7 @@ func (p *GlobalSyncProvider) syncWithPeer(
 	)
 
 	syncTimeout := p.engine.config.Engine.SyncTimeout
-	dialCtx, cancelDial := context.WithTimeout(p.engine.ctx, syncTimeout)
+	dialCtx, cancelDial := context.WithTimeout(ctx, syncTimeout)
 	defer cancelDial()
 	cc, err := p.engine.pubsub.GetDirectChannel(dialCtx, peerId, "sync")
 	if err != nil {
@@ -206,7 +207,7 @@ func (p *GlobalSyncProvider) syncWithPeer(
 
 	client := protobufs.NewGlobalServiceClient(cc)
 	for {
-		getCtx, cancelGet := context.WithTimeout(p.engine.ctx, syncTimeout)
+		getCtx, cancelGet := context.WithTimeout(ctx, syncTimeout)
 		response, err := client.GetGlobalFrame(
 			getCtx,
 			&protobufs.GetGlobalFrameRequest{
@@ -254,7 +255,7 @@ func (p *GlobalSyncProvider) syncWithPeer(
 			return latest, errors.Wrap(err, "sync")
 		}
 
-		err = p.engine.globalTimeReel.Insert(p.engine.ctx, response.Frame)
+		err = p.engine.globalTimeReel.Insert(response.Frame)
 		if err != nil {
 			return latest, errors.Wrap(err, "sync")
 		}
@@ -264,6 +265,7 @@ func (p *GlobalSyncProvider) syncWithPeer(
 }
 
 func (p *GlobalSyncProvider) hyperSyncWithProver(
+	ctx context.Context,
 	prover []byte,
 	shardKey tries.ShardKey,
 ) {
@@ -275,7 +277,7 @@ func (p *GlobalSyncProvider) hyperSyncWithProver(
 			peerId, err := peer.IDFromPublicKey(pubKey)
 			if err == nil {
 				ch, err := p.engine.pubsub.GetDirectChannel(
-					p.engine.ctx,
+					ctx,
 					[]byte(peerId),
 					"sync",
 				)
@@ -283,7 +285,7 @@ func (p *GlobalSyncProvider) hyperSyncWithProver(
 				if err == nil {
 					defer ch.Close()
 					client := protobufs.NewHypergraphComparisonServiceClient(ch)
-					str, err := client.HyperStream(p.engine.ctx)
+					str, err := client.HyperStream(ctx)
 					if err != nil {
 						p.engine.logger.Error("error from sync", zap.Error(err))
 					} else {
