@@ -3469,12 +3469,10 @@ func TestBloomRouting(t *testing.T) {
 			}
 
 			go func() {
-				for _ = range sub {
-					select {
-					case err := <-errch:
-						if err != nil {
-							errs = append(errs, err)
-						}
+				for range sub {
+					err := <-errch
+					if err != nil {
+						errs = append(errs, err)
 					}
 				}
 				g.Done()
@@ -3573,13 +3571,12 @@ func TestBloomPropagationOverSubTreeTopology(t *testing.T) {
 
 			var msg *struct{} = nil
 			go func() {
-				for i := 0; i < len(subs); i++ {
-					select {
-					case m := <-msgch:
-						msg = &m
-						cancel()
-					}
+				for range subs {
+					m := <-msgch
+					msg = &m
+					cancel()
 				}
+
 			}()
 			g.Wait()
 			if msg == nil {
@@ -3796,12 +3793,10 @@ func assertReceivedBitmaskSubgroup(t *testing.T, ctx context.Context, subs [][]*
 
 		var msg *struct{} = nil
 		go func() {
-			for i := 0; i < len(subs); i++ {
-				select {
-				case m := <-msgch:
-					msg = &m
-					cancel()
-				}
+			for range subs {
+				m := <-msgch
+				msg = &m
+				cancel()
 			}
 		}()
 		g.Wait()
