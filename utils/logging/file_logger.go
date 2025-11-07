@@ -59,7 +59,13 @@ func NewRotatingFileLogger(
 	enc := zapcore.NewConsoleEncoder(encCfg)
 
 	ws := zapcore.AddSync(rot)
-	core := zapcore.NewCore(enc, ws, zap.DebugLevel)
+
+	logLevel := zap.InfoLevel
+	if debug {
+		logLevel = zap.DebugLevel
+	}
+
+	core := zapcore.NewCore(enc, ws, logLevel)
 	logger := zap.New(core, zap.AddCaller(), zap.Fields(
 		zap.Uint("coreId", coreId),
 	))
