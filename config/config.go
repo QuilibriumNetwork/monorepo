@@ -293,7 +293,6 @@ func LoadConfig(configPath string, proverKey string, skipGenesisCheck bool) (
 			ProvingKeyId:         "default-proving-key",
 			Filter:               "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 			GenesisSeed:          genesisSeed,
-			MaxFrames:            -1,
 			PendingCommitWorkers: 4,
 		},
 	}
