@@ -21,18 +21,15 @@ func (c *Config) CreateLogger(coreId uint, debug bool) (
 	io.Closer,
 	error,
 ) {
-	filename := c.LogFile
-	if filename != "" || c.Logger != nil {
-		dir := ""
-		if c.Logger != nil {
-			dir = c.Logger.Path
-		}
-
+	if c.Logger != nil {
 		logger, closer, err := logging.NewRotatingFileLogger(
 			debug,
 			coreId,
-			dir,
-			filename,
+			c.Logger.Path,
+			c.Logger.MaxSize,
+			c.Logger.MaxBackups,
+			c.Logger.MaxAge,
+			c.Logger.Compress,
 		)
 		return logger, closer, errors.Wrap(err, "create logger")
 	}
