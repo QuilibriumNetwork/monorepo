@@ -73,10 +73,17 @@ func NewFileKeyManager(
 
 	defer file.Close()
 
-	d := yaml.NewDecoder(file)
+	fileInfo, err := file.Stat()
 
-	if err := d.Decode(store); err != nil {
-		logger.Panic("could not decode store", zap.Error(err))
+	if err != nil {
+		logger.Panic("could not get key file info", zap.Error(err))
+	}
+
+	if fileInfo.Size() != 0 {
+		d := yaml.NewDecoder(file)
+		if err := d.Decode(store); err != nil {
+			logger.Panic("could not decode store", zap.Error(err))
+		}
 	}
 
 	keyManager := &FileKeyManager{
