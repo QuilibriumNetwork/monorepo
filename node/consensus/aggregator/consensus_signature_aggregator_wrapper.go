@@ -40,9 +40,18 @@ func (c *ConsensusSignatureAggregatorWrapper) Aggregate(
 	publicKeys [][]byte,
 	signatures [][]byte,
 ) (models.AggregatedSignature, error) {
+	noextSigs := [][]byte{}
+	if len(c.filter) != 0 {
+		for _, s := range signatures {
+			noextSigs = append(noextSigs, s[:74])
+		}
+	} else {
+		noextSigs = signatures
+	}
+
 	output, err := c.blsConstructor.Aggregate(
 		publicKeys,
-		signatures,
+		noextSigs,
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "aggregate")

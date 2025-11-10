@@ -468,6 +468,40 @@ func (p *PebbleClockStore) updateEarliestIndex(
 	return nil
 }
 
+func (p *PebbleClockStore) updateLatestIndex(
+	txn store.Transaction,
+	key []byte,
+	rank uint64,
+) error {
+	existing, closer, err := p.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return txn.Set(
+				key,
+				binary.BigEndian.AppendUint64(nil, rank),
+			)
+		}
+		return err
+	}
+	defer closer.Close()
+
+	if len(existing) != 8 {
+		return errors.Wrap(
+			store.ErrInvalidData,
+			"latest index contained unexpected length",
+		)
+	}
+
+	if binary.BigEndian.Uint64(existing) < rank {
+		return txn.Set(
+			key,
+			binary.BigEndian.AppendUint64(nil, rank),
+		)
+	}
+
+	return nil
+}
+
 func deleteIfExists(txn store.Transaction, key []byte) error {
 	if err := txn.Delete(key); err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
@@ -2093,9 +2127,10 @@ func (p *PebbleClockStore) PutQuorumCertificate(
 		return errors.Wrap(err, "put quorum certificate")
 	}
 
-	if err := txn.Set(
+	if err := p.updateLatestIndex(
+		txn,
 		clockQuorumCertificateLatestIndex(filter),
-		binary.BigEndian.AppendUint64(nil, rank),
+		rank,
 	); err != nil {
 		return errors.Wrap(err, "put quorum certificate")
 	}
@@ -2231,11 +2266,10 @@ func (p *PebbleClockStore) PutTimeoutCertificate(
 		return errors.Wrap(err, "put timeout certificate")
 	}
 
-	rankBytes := binary.BigEndian.AppendUint64(nil, rank)
-
-	if err := txn.Set(
+	if err := p.updateLatestIndex(
+		txn,
 		clockTimeoutCertificateLatestIndex(filter),
-		rankBytes,
+		rank,
 	); err != nil {
 		return errors.Wrap(err, "put timeout certificate")
 	}

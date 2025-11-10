@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/verification"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -117,6 +118,19 @@ func (e *GlobalConsensusEngine) processAlertMessageQueue(
 			return
 		case message := <-e.globalAlertMessageQueue:
 			e.handleAlertMessage(message)
+		}
+	}
+}
+
+func (e *GlobalConsensusEngine) processGlobalProposalQueue(
+	ctx lifecycle.SignalerContext,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case proposal := <-e.globalProposalQueue:
+			e.handleGlobalProposal(proposal)
 		}
 	}
 }
@@ -539,7 +553,7 @@ func (e *GlobalConsensusEngine) validateKeyRegistry(
 	if err != nil {
 		return nil, fmt.Errorf("failed to derive identity peer id: %w", err)
 	}
-	identityPeerID := []byte(peerID.String())
+	identityPeerID := []byte(peerID)
 
 	if keyRegistry.ProverKey == nil ||
 		len(keyRegistry.ProverKey.KeyValue) == 0 {
@@ -802,6 +816,215 @@ func (e *GlobalConsensusEngine) handleAlertMessage(message *pb.Message) {
 	}
 }
 
+func (e *GlobalConsensusEngine) handleGlobalProposal(
+	proposal *protobufs.GlobalProposal,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.logger.Error(
+				"panic recovered from proposal",
+				zap.Any("panic", r),
+				zap.Stack("stacktrace"),
+			)
+		}
+	}()
+
+	e.logger.Debug(
+		"handling global proposal",
+		zap.String("id", hex.EncodeToString([]byte(proposal.State.Identity()))),
+	)
+
+	// Small gotcha: the proposal structure uses interfaces, so we can't assign
+	// directly, otherwise the nil values for the structs will fail the nil
+	// check on the interfaces (and would incur costly reflection if we wanted
+	// to check it directly)
+	pqc := proposal.ParentQuorumCertificate
+	prtc := proposal.PriorRankTimeoutCertificate
+	vote := proposal.Vote
+	proposer := models.Identity("")
+	if vote != nil {
+		proposer = vote.Identity()
+	}
+	signedProposal := &models.SignedProposal[*protobufs.GlobalFrame, *protobufs.ProposalVote]{
+		Proposal: models.Proposal[*protobufs.GlobalFrame]{
+			State: &models.State[*protobufs.GlobalFrame]{
+				Rank:       proposal.State.GetRank(),
+				Identifier: proposal.State.Identity(),
+				ProposerID: proposer,
+				Timestamp:  proposal.State.GetTimestamp(),
+				State:      &proposal.State,
+			},
+		},
+		Vote: &vote,
+	}
+
+	if pqc != nil {
+		signedProposal.Proposal.State.ParentQuorumCertificate = pqc
+	}
+
+	if prtc != nil {
+		signedProposal.PreviousRankTimeoutCertificate = prtc
+	}
+
+	finalized := e.forks.FinalizedState()
+	finalizedRank := finalized.Rank
+	finalizedFrameNumber := (*finalized.State).Header.FrameNumber
+
+	// drop proposals if we already processed them
+	if proposal.State.Header.FrameNumber <= finalizedFrameNumber ||
+		proposal.State.Header.Rank <= finalizedRank {
+		e.logger.Debug("dropping stale proposal")
+		return
+	}
+
+	_, err := e.clockStore.GetGlobalClockFrame(proposal.State.Header.FrameNumber)
+	if err == nil {
+		e.logger.Debug("dropping stale proposal")
+		return
+	}
+
+	// if we have a parent, cache and move on
+	e.proposalCacheMu.RLock()
+	_, ok := e.proposalCache[string(proposal.State.Header.ParentSelector)]
+	e.proposalCacheMu.RUnlock()
+	if ok {
+		e.proposalCacheMu.Lock()
+		e.proposalCache[proposal.State.Identity()] = proposal
+		e.proposalCacheMu.Unlock()
+		return
+	}
+
+	if proposal.State.Header.FrameNumber != 0 {
+		// also check with persistence layer
+		parent, err := e.clockStore.GetGlobalClockFrame(
+			proposal.State.Header.FrameNumber - 1,
+		)
+		if err != nil || !bytes.Equal(
+			[]byte(parent.Identity()),
+			proposal.State.Header.ParentSelector,
+		) {
+			e.logger.Debug(
+				"parent frame not stored, requesting sync",
+				zap.Uint64("frame_number", proposal.State.Header.FrameNumber-1),
+			)
+			e.proposalCacheMu.Lock()
+			e.proposalCache[proposal.State.Identity()] = proposal
+			e.proposalCacheMu.Unlock()
+			var peerId []byte
+			if proposal.Vote != nil {
+				peerId = []byte(proposal.Vote.Identity())
+			} else {
+				id, err := e.getRandomProverPeerId()
+				if err != nil {
+					e.logger.Debug("could not get random peer", zap.Error(err))
+					return
+				}
+				peerId = []byte(id)
+			}
+			e.syncProvider.AddState(peerId, proposal.State.Header.FrameNumber-1)
+			return
+		}
+	}
+
+	e.processProposal(proposal)
+}
+
+func (e *GlobalConsensusEngine) processProposal(
+	proposal *protobufs.GlobalProposal,
+) {
+	e.logger.Debug(
+		"processing proposal",
+		zap.String("id", hex.EncodeToString([]byte(proposal.State.Identity()))),
+	)
+
+	err := e.VerifyQuorumCertificate(proposal.ParentQuorumCertificate)
+	if err != nil {
+		e.logger.Debug("proposal has invalid qc", zap.Error(err))
+		return
+	}
+
+	if proposal.PriorRankTimeoutCertificate != nil {
+		err := e.VerifyTimeoutCertificate(proposal.PriorRankTimeoutCertificate)
+		if err != nil {
+			e.logger.Debug("proposal has invalid tc", zap.Error(err))
+			return
+		}
+	}
+
+	if proposal.Vote != nil {
+		err := e.VerifyVote(&proposal.Vote)
+		if err != nil {
+			e.logger.Debug("proposal has invalid vote", zap.Error(err))
+			return
+		}
+	}
+
+	err = proposal.State.Validate()
+	if err != nil {
+		e.logger.Debug("proposal is not valid", zap.Error(err))
+		return
+	}
+
+	valid, err := e.frameValidator.Validate(proposal.State)
+	if !valid || err != nil {
+		e.logger.Debug("invalid frame in proposal", zap.Error(err))
+		return
+	}
+
+	// Small gotcha: the proposal structure uses interfaces, so we can't assign
+	// directly, otherwise the nil values for the structs will fail the nil
+	// check on the interfaces (and would incur costly reflection if we wanted
+	// to check it directly)
+	pqc := proposal.ParentQuorumCertificate
+	prtc := proposal.PriorRankTimeoutCertificate
+	vote := proposal.Vote
+	signedProposal := &models.SignedProposal[*protobufs.GlobalFrame, *protobufs.ProposalVote]{
+		Proposal: models.Proposal[*protobufs.GlobalFrame]{
+			State: &models.State[*protobufs.GlobalFrame]{
+				Rank:       proposal.State.GetRank(),
+				Identifier: proposal.State.Identity(),
+				ProposerID: proposal.Vote.Identity(),
+				Timestamp:  proposal.State.GetTimestamp(),
+				State:      &proposal.State,
+			},
+		},
+		Vote: &vote,
+	}
+
+	if pqc != nil {
+		signedProposal.Proposal.State.ParentQuorumCertificate = pqc
+	}
+
+	if prtc != nil {
+		signedProposal.PreviousRankTimeoutCertificate = prtc
+	}
+	e.voteAggregator.AddState(signedProposal)
+	e.consensusParticipant.SubmitProposal(signedProposal)
+
+	e.proposalCacheMu.RLock()
+	props := []*protobufs.GlobalProposal{}
+	removes := []string{}
+	for id, prop := range e.proposalCache {
+		if bytes.Equal(
+			prop.State.Header.ParentSelector,
+			[]byte(proposal.State.Identity()),
+		) {
+			props = append(props, prop)
+			removes = append(removes, id)
+		}
+	}
+	e.proposalCacheMu.RUnlock()
+
+	for i := range props {
+		prop := props[i]
+		remove := removes[i]
+		e.processProposal(prop)
+		e.proposalCacheMu.Lock()
+		delete(e.proposalCache, remove)
+		e.proposalCacheMu.Unlock()
+	}
+}
+
 func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {
 	// Skip our own messages
 	if bytes.Equal(message.From, e.pubsub.GetPeerID()) {
@@ -824,35 +1047,7 @@ func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {
 	e.frameStore[string(frameID)] = proposal.State
 	e.frameStoreMu.Unlock()
 
-	// Small gotcha: the proposal structure uses interfaces, so we can't assign
-	// directly, otherwise the nil values for the structs will fail the nil
-	// check on the interfaces (and would incur costly reflection if we wanted
-	// to check it directly)
-	pqc := proposal.ParentQuorumCertificate
-	prtc := proposal.PriorRankTimeoutCertificate
-	signedProposal := &models.SignedProposal[*protobufs.GlobalFrame, *protobufs.ProposalVote]{
-		Proposal: models.Proposal[*protobufs.GlobalFrame]{
-			State: &models.State[*protobufs.GlobalFrame]{
-				Rank:       proposal.State.GetRank(),
-				Identifier: proposal.State.Identity(),
-				ProposerID: proposal.Vote.Identity(),
-				Timestamp:  proposal.State.GetTimestamp(),
-				State:      &proposal.State,
-			},
-		},
-		Vote: &proposal.Vote,
-	}
-
-	if pqc != nil {
-		signedProposal.Proposal.State.ParentQuorumCertificate = pqc
-	}
-
-	if prtc != nil {
-		signedProposal.PreviousRankTimeoutCertificate = prtc
-	}
-
-	e.voteAggregator.AddState(signedProposal)
-	e.consensusParticipant.SubmitProposal(signedProposal)
+	e.globalProposalQueue <- proposal
 
 	// Success metric recorded at the end of processing
 	proposalProcessedTotal.WithLabelValues("success").Inc()
@@ -1107,14 +1302,11 @@ func (e *GlobalConsensusEngine) handleShardVote(message *pb.Message) {
 	}
 
 	// Get the signature payload for the proposal
-	signatureData, err := e.frameProver.GetFrameSignaturePayload(
-		proposalFrame.Header,
+	signatureData := verification.MakeVoteMessage(
+		proposalFrame.Header.Address,
+		proposalFrame.GetRank(),
+		proposalFrame.Source(),
 	)
-	if err != nil {
-		e.logger.Error("could not get signature payload", zap.Error(err))
-		shardVoteProcessedTotal.WithLabelValues("error").Inc()
-		return
-	}
 
 	// Validate the vote signature
 	valid, err := e.keyManager.ValidateSignature(

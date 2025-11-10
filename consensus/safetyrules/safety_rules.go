@@ -475,7 +475,11 @@ func (r *SafetyRules[StateT, VoteT]) validateEvidenceForEnteringRank(
 	// Condition 2:
 	if newestQC.GetRank()+1 == rank {
 		if previousRankTimeoutCert != nil {
-			return fmt.Errorf("when QC is for prior round, no TC should be provided")
+			return fmt.Errorf(
+				"when QC is for prior round (%d), no TC should be provided (%d)",
+				newestQC.GetRank(),
+				previousRankTimeoutCert.GetRank(),
+			)
 		}
 		return nil
 	}

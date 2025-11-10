@@ -43,7 +43,7 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		if frametime.GlobalFrameSince(proposal.State) > 20*time.Second {
+		if e.forks.FinalizedRank() > proposal.GetRank() {
 			proposalValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultIgnore
 		}

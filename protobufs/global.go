@@ -4780,8 +4780,19 @@ func (f *ProposalVote) Validate() error {
 	}
 
 	// Validate the signature
-	if err := f.PublicKeySignatureBls48581.Validate(); err != nil {
-		return errors.Wrap(err, "validate")
+	if len(f.Filter) == 0 {
+		if err := f.PublicKeySignatureBls48581.Validate(); err != nil {
+			return errors.Wrap(err, "validate")
+		}
+	} else {
+		if len(f.PublicKeySignatureBls48581.Address) != 32 {
+			return errors.Wrap(errors.New("invalid address"), "validate")
+		}
+		// handle extended sig
+		if len(f.PublicKeySignatureBls48581.Signature) != 74 &&
+			len(f.PublicKeySignatureBls48581.Signature) != 590 {
+			return errors.Wrap(errors.New("invalid bls48581 signature"), "validate")
+		}
 	}
 
 	return nil

@@ -553,13 +553,8 @@ func main() {
 	}
 
 	// Start the master node
-	quitCh := make(chan struct{})
-	go func() {
-		if err := masterNode.Start(quitCh); err != nil {
-			logger.Error("master node start error", zap.Error(err))
-			close(quitCh)
-		}
-	}()
+	ctx, quit := context.WithCancel(context.Background())
+	errCh := masterNode.Start(ctx)
 	defer masterNode.Stop()
 
 	if nodeConfig.ListenGRPCMultiaddr != "" {
@@ -590,13 +585,16 @@ func main() {
 		diskFullCh,
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	monitor.Start(ctx)
 
 	select {
 	case <-diskFullCh:
-	case <-quitCh:
+		quit()
+	case err := <-errCh:
+		if err != nil {
+			logger.Error("master node error", zap.Error(err))
+		}
+		quit()
 	}
 }
 

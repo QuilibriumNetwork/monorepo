@@ -2,7 +2,10 @@ package global
 
 import (
 	"bytes"
+	"encoding/binary"
+	"slices"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -126,7 +129,16 @@ func (e *GlobalConsensusEngine) LeaderForRank(
 		selector = found.Identity()
 	}
 
-	prover, err := e.proverRegistry.GetNextProver([32]byte([]byte(selector)), nil)
+	inputBI, err := poseidon.HashBytes(slices.Concat(
+		[]byte(selector),
+		binary.BigEndian.AppendUint64(nil, rank),
+	))
+	if err != nil {
+		return "", errors.Wrap(err, "leader for rank")
+	}
+
+	input := inputBI.FillBytes(make([]byte, 32))
+	prover, err := e.proverRegistry.GetNextProver([32]byte(input), nil)
 	if err != nil {
 		return "", errors.Wrap(err, "leader for rank")
 	}

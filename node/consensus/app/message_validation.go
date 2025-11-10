@@ -57,7 +57,7 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 			return p2p.ValidationResultIgnore
 		}
 
-		if frametime.AppFrameSince(proposal.State) > 20*time.Second {
+		if e.forks.FinalizedRank() > proposal.GetRank() {
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}

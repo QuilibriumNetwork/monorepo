@@ -42,6 +42,13 @@ func (t *TimeoutState[VoteT]) Equals(other *TimeoutState[VoteT]) bool {
 		return false
 	}
 
+	if (t.PriorRankTimeoutCertificate != nil &&
+		other.PriorRankTimeoutCertificate == nil) ||
+		(t.PriorRankTimeoutCertificate == nil &&
+			other.PriorRankTimeoutCertificate != nil) {
+		return false
+	}
+
 	// both are not nil, so we can compare the fields
 	return t.Rank == other.Rank &&
 		((t.LatestQuorumCertificate == nil &&

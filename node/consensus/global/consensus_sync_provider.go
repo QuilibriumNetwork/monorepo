@@ -8,17 +8,99 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
+const defaultStateQueueCapacity = 10
+
+type syncRequest struct {
+	frameNumber uint64
+	peerId      []byte
+}
+
 // GlobalSyncProvider implements SyncProvider
 type GlobalSyncProvider struct {
-	engine *GlobalConsensusEngine
+	// TODO(2.1.1+): Refactor out direct use of engine
+	engine       *GlobalConsensusEngine
+	queuedStates chan syncRequest
+}
+
+func NewGlobalSyncProvider(
+	engine *GlobalConsensusEngine,
+) *GlobalSyncProvider {
+	return &GlobalSyncProvider{
+		engine:       engine,
+		queuedStates: make(chan syncRequest, defaultStateQueueCapacity),
+	}
+}
+
+func (p *GlobalSyncProvider) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	ready()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case request := <-p.queuedStates:
+			finalized := p.engine.forks.FinalizedState()
+			if request.frameNumber <=
+				(*p.engine.forks.FinalizedState().State).Header.FrameNumber {
+				continue
+			}
+			p.engine.logger.Info(
+				"synchronizing with peer",
+				zap.String("peer", peer.ID(request.peerId).String()),
+				zap.Uint64("finalized_rank", finalized.Rank),
+				zap.Uint64("peer_frame", request.frameNumber),
+			)
+			p.processState(
+				ctx,
+				request.frameNumber,
+				request.peerId,
+			)
+		case <-time.After(6 * time.Minute):
+			finalized := p.engine.forks.FinalizedState()
+
+			id, err := p.engine.getRandomProverPeerId()
+			if err != nil {
+				p.engine.logger.Debug("could not get random prover", zap.Error(err))
+			}
+
+			p.engine.logger.Info(
+				"synchronizing with peer",
+				zap.String("peer", id.String()),
+				zap.Uint64("finalized_rank", finalized.Rank),
+			)
+			p.processState(ctx, (*finalized.State).Header.FrameNumber, []byte(id))
+		}
+	}
+}
+
+func (p *GlobalSyncProvider) processState(
+	ctx context.Context,
+	frameNumber uint64,
+	peerID []byte,
+) {
+	err := p.syncWithPeer(
+		ctx,
+		frameNumber,
+		peerID,
+	)
+	if err != nil {
+		p.engine.logger.Error("could not sync with peer", zap.Error(err))
+	}
 }
 
 func (p *GlobalSyncProvider) Synchronize(
@@ -162,7 +244,7 @@ func (p *GlobalSyncProvider) syncWithMesh(ctx context.Context) error {
 			latest = head
 		}
 
-		latest, err = p.syncWithPeer(ctx, latest, []byte(peerID))
+		err = p.syncWithPeer(ctx, latest.Header.FrameNumber, []byte(peerID))
 		if err != nil {
 			p.engine.logger.Debug("error syncing frame", zap.Error(err))
 		}
@@ -179,89 +261,149 @@ func (p *GlobalSyncProvider) syncWithMesh(ctx context.Context) error {
 
 func (p *GlobalSyncProvider) syncWithPeer(
 	ctx context.Context,
-	latest *protobufs.GlobalFrame,
+	frameNumber uint64,
 	peerId []byte,
-) (*protobufs.GlobalFrame, error) {
+) error {
 	p.engine.logger.Info(
 		"polling peer for new frames",
 		zap.String("peer_id", peer.ID(peerId).String()),
-		zap.Uint64("current_frame", latest.Header.FrameNumber),
+		zap.Uint64("current_frame", frameNumber),
 	)
 
-	syncTimeout := p.engine.config.Engine.SyncTimeout
-	dialCtx, cancelDial := context.WithTimeout(ctx, syncTimeout)
-	defer cancelDial()
-	cc, err := p.engine.pubsub.GetDirectChannel(dialCtx, peerId, "sync")
-	if err != nil {
-		p.engine.logger.Debug(
-			"could not establish direct channel",
-			zap.Error(err),
+	info := p.engine.peerInfoManager.GetPeerInfo(peerId)
+	if info == nil {
+		p.engine.logger.Info(
+			"no peer info known yet, skipping sync",
+			zap.String("peer", peer.ID(peerId).String()),
 		)
-		return latest, errors.Wrap(err, "sync")
+		return nil
 	}
-	defer func() {
-		if err := cc.Close(); err != nil {
-			p.engine.logger.Error("error while closing connection", zap.Error(err))
-		}
-	}()
 
-	client := protobufs.NewGlobalServiceClient(cc)
-	for {
-		getCtx, cancelGet := context.WithTimeout(ctx, syncTimeout)
-		response, err := client.GetGlobalFrame(
-			getCtx,
-			&protobufs.GetGlobalFrameRequest{
-				FrameNumber: latest.Header.FrameNumber + 1,
-			},
-			// The message size limits are swapped because the server is the one
-			// sending the data.
-			grpc.MaxCallRecvMsgSize(
-				p.engine.config.Engine.SyncMessageLimits.MaxSendMsgSize,
-			),
-			grpc.MaxCallSendMsgSize(
-				p.engine.config.Engine.SyncMessageLimits.MaxRecvMsgSize,
-			),
+	if len(info.Reachability) == 0 {
+		p.engine.logger.Info(
+			"no reachability info known yet, skipping sync",
+			zap.String("peer", peer.ID(peerId).String()),
 		)
-		cancelGet()
+		return nil
+	}
+
+	syncTimeout := p.engine.config.Engine.SyncTimeout
+	for _, s := range info.Reachability[0].StreamMultiaddrs {
+		creds, err := p2p.NewPeerAuthenticator(
+			p.engine.logger,
+			p.engine.config.P2P,
+			nil,
+			nil,
+			nil,
+			nil,
+			[][]byte{[]byte(peerId)},
+			map[string]channel.AllowedPeerPolicyType{},
+			map[string]channel.AllowedPeerPolicyType{},
+		).CreateClientTLSCredentials([]byte(peerId))
+		if err != nil {
+			return errors.Wrap(err, "sync")
+		}
+
+		ma, err := multiaddr.StringCast(s)
+		if err != nil {
+			return errors.Wrap(err, "sync")
+		}
+
+		mga, err := mn.ToNetAddr(ma)
+		if err != nil {
+			return errors.Wrap(err, "sync")
+		}
+
+		cc, err := grpc.NewClient(
+			mga.String(),
+			grpc.WithTransportCredentials(creds),
+		)
 		if err != nil {
 			p.engine.logger.Debug(
-				"could not get frame",
+				"could not establish direct channel, trying next multiaddr",
+				zap.String("peer", peer.ID(peerId).String()),
+				zap.String("multiaddr", ma.String()),
 				zap.Error(err),
 			)
-			return latest, errors.Wrap(err, "sync")
+			continue
 		}
+		defer func() {
+			if err := cc.Close(); err != nil {
+				p.engine.logger.Error("error while closing connection", zap.Error(err))
+			}
+		}()
 
-		if response == nil {
-			p.engine.logger.Debug("received no response from peer")
-			return latest, nil
+		client := protobufs.NewGlobalServiceClient(cc)
+	inner:
+		for {
+			getCtx, cancelGet := context.WithTimeout(ctx, syncTimeout)
+			response, err := client.GetGlobalProposal(
+				getCtx,
+				&protobufs.GetGlobalProposalRequest{
+					FrameNumber: frameNumber + 1,
+				},
+				// The message size limits are swapped because the server is the one
+				// sending the data.
+				grpc.MaxCallRecvMsgSize(
+					p.engine.config.Engine.SyncMessageLimits.MaxSendMsgSize,
+				),
+				grpc.MaxCallSendMsgSize(
+					p.engine.config.Engine.SyncMessageLimits.MaxRecvMsgSize,
+				),
+			)
+			cancelGet()
+			if err != nil {
+				p.engine.logger.Debug(
+					"could not get frame, trying next multiaddr",
+					zap.String("peer", peer.ID(peerId).String()),
+					zap.String("multiaddr", ma.String()),
+					zap.Error(err),
+				)
+				break inner
+			}
+
+			if response == nil {
+				p.engine.logger.Debug(
+					"received no response from peer",
+					zap.String("peer", peer.ID(peerId).String()),
+					zap.String("multiaddr", ma.String()),
+					zap.Error(err),
+				)
+				break inner
+			}
+
+			if response.Proposal == nil || response.Proposal.State == nil ||
+				response.Proposal.State.Header == nil ||
+				response.Proposal.State.Header.FrameNumber != frameNumber+1 {
+				p.engine.logger.Debug("received empty response from peer")
+				return nil
+			}
+			p.engine.logger.Info(
+				"received new leading frame",
+				zap.Uint64("frame_number", response.Proposal.State.Header.FrameNumber),
+				zap.Duration(
+					"frame_age",
+					frametime.GlobalFrameSince(response.Proposal.State),
+				),
+			)
+
+			if _, err := p.engine.frameProver.VerifyGlobalFrameHeader(
+				response.Proposal.State.Header,
+				p.engine.blsConstructor,
+			); err != nil {
+				return errors.Wrap(err, "sync")
+			}
+
+			p.engine.globalProposalQueue <- response.Proposal
+			frameNumber = frameNumber + 1
 		}
-
-		if response.Frame == nil || response.Frame.Header == nil ||
-			response.Frame.Header.FrameNumber != latest.Header.FrameNumber+1 ||
-			response.Frame.Header.Timestamp < latest.Header.Timestamp {
-			p.engine.logger.Debug("received invalid response from peer")
-			return latest, nil
-		}
-		p.engine.logger.Info(
-			"received new leading frame",
-			zap.Uint64("frame_number", response.Frame.Header.FrameNumber),
-			zap.Duration("frame_age", frametime.GlobalFrameSince(response.Frame)),
-		)
-
-		if _, err := p.engine.frameProver.VerifyGlobalFrameHeader(
-			response.Frame.Header,
-			p.engine.blsConstructor,
-		); err != nil {
-			return latest, errors.Wrap(err, "sync")
-		}
-
-		err = p.engine.globalTimeReel.Insert(response.Frame)
-		if err != nil {
-			return latest, errors.Wrap(err, "sync")
-		}
-
-		latest = response.Frame
 	}
+
+	p.engine.logger.Debug(
+		"failed to complete sync for all known multiaddrs",
+		zap.String("peer", peer.ID(peerId).String()),
+	)
+	return nil
 }
 
 func (p *GlobalSyncProvider) hyperSyncWithProver(
@@ -358,4 +500,31 @@ func (p *GlobalSyncProvider) hyperSyncHyperedgeRemoves(
 		p.engine.logger.Error("error from sync", zap.Error(err))
 	}
 	str.CloseSend()
+}
+
+func (p *GlobalSyncProvider) AddState(
+	sourcePeerID []byte,
+	frameNumber uint64,
+) {
+	// Drop if we're within the threshold
+	if frameNumber <=
+		(*p.engine.forks.FinalizedState().State).Header.FrameNumber {
+		p.engine.logger.Debug("dropping stale state for sync")
+		return
+	}
+
+	// Enqueue if we can, otherwise drop it because we'll catch up
+	select {
+	case p.queuedStates <- syncRequest{
+		frameNumber: frameNumber,
+		peerId:      sourcePeerID,
+	}:
+		p.engine.logger.Debug(
+			"enqueued sync request",
+			zap.String("peer", peer.ID(sourcePeerID).String()),
+			zap.Uint64("enqueued_frame_number", frameNumber),
+		)
+	default:
+		p.engine.logger.Debug("no queue capacity, dropping state for sync")
+	}
 }

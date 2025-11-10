@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"net"
 	"net/netip"
 	"slices"
@@ -116,14 +117,19 @@ type GlobalConsensusEngine struct {
 	eventDistributor   typesconsensus.EventDistributor
 	dispatchService    typesdispatch.DispatchService
 	globalTimeReel     *consensustime.GlobalTimeReel
-	blsConstructor     crypto.BlsConstructor
-	executionManager   *manager.ExecutionEngineManager
-	mixnet             typesconsensus.Mixnet
-	peerInfoManager    tp2p.PeerInfoManager
-	workerManager      worker.WorkerManager
-	proposer           *provers.Manager
-	alertPublicKey     []byte
-	hasSentKeyBundle   bool
+	forks              consensus.Forks[*protobufs.GlobalFrame]
+	notifier           consensus.Consumer[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]
+	blsConstructor   crypto.BlsConstructor
+	executionManager *manager.ExecutionEngineManager
+	mixnet           typesconsensus.Mixnet
+	peerInfoManager  tp2p.PeerInfoManager
+	workerManager    worker.WorkerManager
+	proposer         *provers.Manager
+	alertPublicKey   []byte
+	hasSentKeyBundle bool
 
 	// Message queues
 	globalConsensusMessageQueue chan *pb.Message
@@ -133,6 +139,7 @@ type GlobalConsensusEngine struct {
 	globalAlertMessageQueue     chan *pb.Message
 	appFramesMessageQueue       chan *pb.Message
 	shardConsensusMessageQueue  chan *pb.Message
+	globalProposalQueue         chan *protobufs.GlobalProposal
 
 	// Emergency halt
 	haltCtx context.Context
@@ -152,6 +159,8 @@ type GlobalConsensusEngine struct {
 	lastProvenFrameTimeMu sync.RWMutex
 	frameStore            map[string]*protobufs.GlobalFrame
 	frameStoreMu          sync.RWMutex
+	proposalCache         map[string]*protobufs.GlobalProposal
+	proposalCacheMu       sync.RWMutex
 	appFrameStore         map[string]*protobufs.AppShardFrame
 	appFrameStoreMu       sync.RWMutex
 	lowCoverageStreak     map[string]*coverageStreak
@@ -260,6 +269,7 @@ func NewGlobalConsensusEngine(
 		peerInfoManager:             peerInfoManager,
 		frameStore:                  make(map[string]*protobufs.GlobalFrame),
 		appFrameStore:               make(map[string]*protobufs.AppShardFrame),
+		proposalCache:               make(map[string]*protobufs.GlobalProposal),
 		globalConsensusMessageQueue: make(chan *pb.Message, 1000),
 		globalFrameMessageQueue:     make(chan *pb.Message, 100),
 		globalProverMessageQueue:    make(chan *pb.Message, 1000),
@@ -267,6 +277,7 @@ func NewGlobalConsensusEngine(
 		globalPeerInfoMessageQueue:  make(chan *pb.Message, 1000),
 		globalAlertMessageQueue:     make(chan *pb.Message, 100),
 		shardConsensusMessageQueue:  make(chan *pb.Message, 10000),
+		globalProposalQueue:         make(chan *protobufs.GlobalProposal, 1000),
 		currentDifficulty:           config.Engine.Difficulty,
 		lastProvenFrameTime:         time.Now(),
 		blacklistMap:                make(map[string]bool),
@@ -315,7 +326,7 @@ func NewGlobalConsensusEngine(
 	}
 
 	// Create provider implementations
-	engine.syncProvider = &GlobalSyncProvider{engine: engine}
+	engine.syncProvider = NewGlobalSyncProvider(engine)
 	engine.votingProvider = &GlobalVotingProvider{engine: engine}
 	engine.leaderProvider = &GlobalLeaderProvider{engine: engine}
 	engine.livenessProvider = &GlobalLivenessProvider{engine: engine}
@@ -474,13 +485,20 @@ func NewGlobalConsensusEngine(
 		})
 	}
 
+	// Add sync provider
+	componentBuilder.AddWorker(engine.syncProvider.Start)
+
 	// Add execution engines
 	componentBuilder.AddWorker(engine.executionManager.Start)
 	componentBuilder.AddWorker(engine.eventDistributor.Start)
 	componentBuilder.AddWorker(engine.globalTimeReel.Start)
 
-	latest, err := engine.clockStore.GetLatestCertifiedGlobalState()
+	latest, err := engine.consensusStore.GetConsensusState(nil)
 	var state *models.CertifiedState[*protobufs.GlobalFrame]
+	var pending []*models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]
 	if err != nil {
 		frame, qc := engine.initializeGenesis()
 		state = &models.CertifiedState[*protobufs.GlobalFrame]{
@@ -491,22 +509,46 @@ func NewGlobalConsensusEngine(
 			},
 			CertifyingQuorumCertificate: qc,
 		}
+		pending = []*models.SignedProposal[
+			*protobufs.GlobalFrame,
+			*protobufs.ProposalVote,
+		]{}
 	} else {
-		qc, err := engine.clockStore.GetLatestQuorumCertificate(nil)
+		qc, err := engine.clockStore.GetQuorumCertificate(nil, latest.FinalizedRank)
+		if err != nil {
+			panic(err)
+		}
+		frame, err := engine.clockStore.GetGlobalClockFrame(
+			qc.GetFrameNumber(),
+		)
+		if err != nil {
+			panic(err)
+		}
+		parentFrame, err := engine.clockStore.GetGlobalClockFrame(
+			qc.GetFrameNumber() - 1,
+		)
+		if err != nil {
+			panic(err)
+		}
+		parentQC, err := engine.clockStore.GetQuorumCertificate(
+			nil,
+			parentFrame.GetRank(),
+		)
 		if err != nil {
 			panic(err)
 		}
 		state = &models.CertifiedState[*protobufs.GlobalFrame]{
 			State: &models.State[*protobufs.GlobalFrame]{
-				Rank:                    latest.GetRank(),
-				Identifier:              latest.State.Identity(),
-				ProposerID:              qc.Source(),
-				ParentQuorumCertificate: latest.ParentQuorumCertificate,
-				Timestamp:               latest.State.GetTimestamp(),
-				State:                   &latest.State,
+				Rank:                    frame.GetRank(),
+				Identifier:              frame.Identity(),
+				ProposerID:              frame.Source(),
+				ParentQuorumCertificate: parentQC,
+				Timestamp:               frame.GetTimestamp(),
+				State:                   &frame,
 			},
 			CertifyingQuorumCertificate: qc,
 		}
+		pending = engine.getPendingProposals(frame.Header.FrameNumber)
 	}
 
 	engine.voteAggregator, err = voting.NewGlobalVoteAggregator[GlobalPeerID](
@@ -523,7 +565,7 @@ func NewGlobalConsensusEngine(
 			}
 			engine.consensusParticipant.OnQuorumCertificateConstructedFromVotes(qc)
 		},
-		state.Rank(),
+		state.Rank()+1,
 	)
 	if err != nil {
 		return nil, err
@@ -535,21 +577,36 @@ func NewGlobalConsensusEngine(
 		engine.signatureAggregator,
 		timeoutAggregationDistributor,
 		engine.votingProvider,
-		state.Rank(),
+		state.Rank()+1,
 	)
+
+	notifier := pubsub.NewDistributor[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]()
+	notifier.AddConsumer(engine)
+	engine.notifier = notifier
+
+	forks, err := forks.NewForks(state, engine, notifier)
+	if err != nil {
+		return nil, err
+	}
+
+	engine.forks = forks
 
 	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
 		componentBuilder.AddWorker(func(
 			ctx lifecycle.SignalerContext,
 			ready lifecycle.ReadyFunc,
 		) {
-			if err := engine.startConsensus(state, ctx, ready); err != nil {
+			if err := engine.startConsensus(state, pending, ctx, ready); err != nil {
 				engine.logger.Error("could not start consensus", zap.Error(err))
 				ctx.Throw(err)
 				return
 			}
 
 			<-ctx.Done()
+			<-lifecycle.AllDone(engine.voteAggregator, engine.timeoutAggregator)
 		})
 	}
 
@@ -643,6 +700,15 @@ func NewGlobalConsensusEngine(
 	) {
 		ready()
 		engine.processAlertMessageQueue(ctx)
+	})
+
+	// Start global proposal queue processor
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processGlobalProposalQueue(ctx)
 	})
 
 	// Start periodic peer info reporting
@@ -2345,20 +2411,14 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 
 func (e *GlobalConsensusEngine) startConsensus(
 	trustedRoot *models.CertifiedState[*protobufs.GlobalFrame],
+	pending []*models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	],
 	ctx lifecycle.SignalerContext,
 	ready lifecycle.ReadyFunc,
 ) error {
-	notifier := pubsub.NewDistributor[
-		*protobufs.GlobalFrame,
-		*protobufs.ProposalVote,
-	]()
-	notifier.AddConsumer(e)
-
-	forks, err := forks.NewForks(trustedRoot, e, notifier)
-	if err != nil {
-		return err
-	}
-
+	var err error
 	e.consensusParticipant, err = participant.NewParticipant[
 		*protobufs.GlobalFrame,
 		*protobufs.ProposalVote,
@@ -2374,13 +2434,13 @@ func (e *GlobalConsensusEngine) startConsensus(
 		](e.votingProvider), // signer
 		e.leaderProvider,              // prover
 		e.votingProvider,              // voter
-		notifier,                      // notifier
+		e.notifier,                    // notifier
 		e.consensusStore,              // consensusStore
 		e.signatureAggregator,         // signatureAggregator
 		e,                             // consensusVerifier
 		e.voteCollectorDistributor,    // voteCollectorDistributor
 		e.timeoutCollectorDistributor, // timeoutCollectorDistributor
-		forks,                         // forks
+		e.forks,                       // forks
 		validator.NewValidator[
 			*protobufs.GlobalFrame,
 			*protobufs.ProposalVote,
@@ -2390,6 +2450,7 @@ func (e *GlobalConsensusEngine) startConsensus(
 		e,                   // finalizer
 		nil,                 // filter
 		trustedRoot,
+		pending,
 	)
 	if err != nil {
 		return err
@@ -2488,6 +2549,10 @@ func (e *GlobalConsensusEngine) OnOwnProposal(
 		priorTC =
 			proposal.PreviousRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
 	}
+
+	// Manually override the signature as the vdf prover's signature is invalid
+	(*proposal.State.State).Header.PublicKeySignatureBls48581.Signature =
+		(*proposal.Vote).PublicKeySignatureBls48581.Signature
 
 	pbProposal := &protobufs.GlobalProposal{
 		State:                       *proposal.State.State,
@@ -2591,6 +2656,112 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 	newRank uint64,
 	qc models.QuorumCertificate,
 ) {
+	e.logger.Debug("adding certified state", zap.Uint64("rank", newRank-1))
+
+	parentQC, err := e.clockStore.GetLatestQuorumCertificate(nil)
+	if err != nil {
+		e.logger.Error("no latest quorum certificate", zap.Error(err))
+		return
+	}
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	aggregateSig := &protobufs.BLS48581AggregateSignature{
+		Signature: qc.GetAggregatedSignature().GetSignature(),
+		PublicKey: &protobufs.BLS48581G2PublicKey{
+			KeyValue: qc.GetAggregatedSignature().GetPubKey(),
+		},
+		Bitmask: qc.GetAggregatedSignature().GetBitmask(),
+	}
+	if err := e.clockStore.PutQuorumCertificate(
+		&protobufs.QuorumCertificate{
+			Rank:               qc.GetRank(),
+			FrameNumber:        qc.GetFrameNumber(),
+			Selector:           []byte(qc.Identity()),
+			AggregateSignature: aggregateSig,
+		},
+		txn,
+	); err != nil {
+		e.logger.Error("could not insert quorum certificate", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	e.frameStoreMu.RLock()
+	frame, ok := e.frameStore[qc.Identity()]
+	e.frameStoreMu.RUnlock()
+
+	if !ok {
+		e.logger.Error(
+			"no frame for quorum certificate",
+			zap.Uint64("rank", newRank-1),
+			zap.Uint64("frame_number", qc.GetFrameNumber()),
+		)
+		return
+	}
+
+	frame.Header.PublicKeySignatureBls48581 = aggregateSig
+
+	err = e.globalTimeReel.Insert(frame)
+	if err != nil {
+		e.logger.Error("could not insert frame into time reel", zap.Error(err))
+		return
+	}
+
+	if !bytes.Equal(frame.Header.ParentSelector, parentQC.Selector) {
+		e.logger.Error(
+			"quorum certificate does not match frame parent",
+			zap.String(
+				"frame_parent_selector",
+				hex.EncodeToString(frame.Header.ParentSelector),
+			),
+			zap.String(
+				"parent_qc_selector",
+				hex.EncodeToString(parentQC.Selector),
+			),
+			zap.Uint64("parent_qc_rank", parentQC.Rank),
+		)
+		return
+	}
+
+	priorRankTC, err := e.clockStore.GetTimeoutCertificate(nil, qc.GetRank()-1)
+	if err != nil {
+		e.logger.Debug("no prior rank TC to include", zap.Uint64("rank", newRank-1))
+	}
+
+	txn, err = e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutCertifiedGlobalState(
+		&protobufs.GlobalProposal{
+			State:                       frame,
+			ParentQuorumCertificate:     parentQC,
+			PriorRankTimeoutCertificate: priorRankTC,
+		},
+		txn,
+	); err != nil {
+		e.logger.Error("could not insert certified state", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+	}
 }
 
 // OnRankChange implements consensus.Consumer.
@@ -2634,9 +2805,9 @@ func (e *GlobalConsensusEngine) OnStartingTimeout(
 func (e *GlobalConsensusEngine) OnStateIncorporated(
 	state *models.State[*protobufs.GlobalFrame],
 ) {
-	if err := e.globalTimeReel.Insert(*state.State); err != nil {
-		e.logger.Error("unable to insert frame into time reel", zap.Error(err))
-	}
+	e.frameStoreMu.Lock()
+	e.frameStore[state.Identifier] = *state.State
+	e.frameStoreMu.Unlock()
 }
 
 // OnTimeoutCertificateTriggeredRankChange implements consensus.Consumer.
@@ -2645,6 +2816,44 @@ func (e *GlobalConsensusEngine) OnTimeoutCertificateTriggeredRankChange(
 	newRank uint64,
 	tc models.TimeoutCertificate,
 ) {
+	e.logger.Debug(
+		"inserting timeout certificate",
+		zap.Uint64("rank", tc.GetRank()),
+	)
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	qc := tc.GetLatestQuorumCert()
+	err = e.clockStore.PutTimeoutCertificate(&protobufs.TimeoutCertificate{
+		Rank:        tc.GetRank(),
+		LatestRanks: tc.GetLatestRanks(),
+		LatestQuorumCertificate: &protobufs.QuorumCertificate{
+			Rank:        qc.GetRank(),
+			FrameNumber: qc.GetFrameNumber(),
+			Selector:    []byte(qc.Identity()),
+			AggregateSignature: &protobufs.BLS48581AggregateSignature{
+				Signature: qc.GetAggregatedSignature().GetSignature(),
+				PublicKey: &protobufs.BLS48581G2PublicKey{
+					KeyValue: qc.GetAggregatedSignature().GetPubKey(),
+				},
+				Bitmask: qc.GetAggregatedSignature().GetBitmask(),
+			},
+		},
+	}, txn)
+	if err != nil {
+		txn.Abort()
+		e.logger.Error("could not insert timeout certificate")
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		txn.Abort()
+		e.logger.Error("could not commit transaction", zap.Error(err))
+	}
 }
 
 // VerifyQuorumCertificate implements consensus.Verifier.
@@ -2660,7 +2869,9 @@ func (e *GlobalConsensusEngine) VerifyQuorumCertificate(
 	}
 
 	if err := qc.Validate(); err != nil {
-		return errors.Wrap(err, "verify quorum certificate")
+		return models.NewInvalidFormatError(
+			errors.Wrap(err, "verify quorum certificate"),
+		)
 	}
 
 	// genesis qc is special:
@@ -2683,14 +2894,7 @@ func (e *GlobalConsensusEngine) VerifyQuorumCertificate(
 	pubkeys := [][]byte{}
 	signatures := [][]byte{}
 	if ((len(provers) + 7) / 8) > len(qc.AggregateSignature.Bitmask) {
-		return errors.Wrap(
-			errors.Errorf(
-				"bitmask invalid for prover set, expected: %d, actual: %d",
-				((len(provers)+7)/8),
-				len(qc.AggregateSignature.Bitmask),
-			),
-			"verify quorum certificate",
-		)
+		return models.ErrInvalidSignature
 	}
 	for i, prover := range provers {
 		if qc.AggregateSignature.Bitmask[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
@@ -2701,17 +2905,14 @@ func (e *GlobalConsensusEngine) VerifyQuorumCertificate(
 
 	aggregationCheck, err := e.blsConstructor.Aggregate(pubkeys, signatures)
 	if err != nil {
-		return errors.Wrap(err, "verify quorum certificate")
+		return models.ErrInvalidSignature
 	}
 
 	if !bytes.Equal(
 		qc.AggregateSignature.GetPubKey(),
 		aggregationCheck.GetAggregatePublicKey(),
 	) {
-		return errors.Wrap(
-			errors.New("pubkey does not match prover set"),
-			"verify quorum certificate",
-		)
+		return models.ErrInvalidSignature
 	}
 
 	if valid := e.blsConstructor.VerifySignatureRaw(
@@ -2720,10 +2921,7 @@ func (e *GlobalConsensusEngine) VerifyQuorumCertificate(
 		verification.MakeVoteMessage(nil, qc.Rank, qc.Identity()),
 		[]byte("global"),
 	); !valid {
-		return errors.Wrap(
-			errors.New("invalid signature"),
-			"verify quorum certificate",
-		)
+		return models.ErrInvalidSignature
 	}
 
 	return nil
@@ -2742,7 +2940,9 @@ func (e *GlobalConsensusEngine) VerifyTimeoutCertificate(
 	}
 
 	if err := tc.Validate(); err != nil {
-		return errors.Wrap(err, "verify timeout certificate")
+		return models.NewInvalidFormatError(
+			errors.Wrap(err, "verify timeout certificate"),
+		)
 	}
 
 	provers, err := e.proverRegistry.GetActiveProvers(nil)
@@ -2753,14 +2953,7 @@ func (e *GlobalConsensusEngine) VerifyTimeoutCertificate(
 	pubkeys := [][]byte{}
 	signatures := [][]byte{}
 	if ((len(provers) + 7) / 8) > len(tc.AggregateSignature.Bitmask) {
-		return errors.Wrap(
-			errors.Errorf(
-				"bitmask invalid for prover set, expected: %d, actual: %d",
-				((len(provers)+7)/8),
-				len(tc.AggregateSignature.Bitmask),
-			),
-			"verify timeout certificate",
-		)
+		return models.ErrInvalidSignature
 	}
 	for i, prover := range provers {
 		if tc.AggregateSignature.Bitmask[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
@@ -2771,17 +2964,14 @@ func (e *GlobalConsensusEngine) VerifyTimeoutCertificate(
 
 	aggregationCheck, err := e.blsConstructor.Aggregate(pubkeys, signatures)
 	if err != nil {
-		return errors.Wrap(err, "verify timeout certificate")
+		return models.ErrInvalidSignature
 	}
 
 	if !bytes.Equal(
 		tc.AggregateSignature.GetPubKey(),
 		aggregationCheck.GetAggregatePublicKey(),
 	) {
-		return errors.Wrap(
-			errors.New("pubkey does not match prover set"),
-			"verify timeout certificate",
-		)
+		return models.ErrInvalidSignature
 	}
 
 	if valid := e.blsConstructor.VerifySignatureRaw(
@@ -2794,10 +2984,7 @@ func (e *GlobalConsensusEngine) VerifyTimeoutCertificate(
 		),
 		[]byte("globaltimeout"),
 	); !valid {
-		return errors.Wrap(
-			errors.New("invalid signature"),
-			"verify timeout certificate",
-		)
+		return models.ErrInvalidSignature
 	}
 
 	return nil
@@ -2812,7 +2999,9 @@ func (e *GlobalConsensusEngine) VerifyVote(
 	}
 
 	if err := (*vote).Validate(); err != nil {
-		return errors.Wrap(err, "verify vote")
+		return models.NewInvalidFormatError(
+			errors.Wrap(err, "verify vote"),
+		)
 	}
 
 	provers, err := e.proverRegistry.GetActiveProvers(nil)
@@ -2829,7 +3018,7 @@ func (e *GlobalConsensusEngine) VerifyVote(
 	}
 
 	if bytes.Equal(pubkey, []byte{}) {
-		return errors.Wrap(errors.New("invalid prover"), "verify vote")
+		return models.ErrInvalidSignature
 	}
 
 	if valid := e.blsConstructor.VerifySignatureRaw(
@@ -2838,13 +3027,140 @@ func (e *GlobalConsensusEngine) VerifyVote(
 		verification.MakeVoteMessage(nil, (*vote).Rank, (*vote).Source()),
 		[]byte("global"),
 	); !valid {
-		return errors.Wrap(
-			errors.New("invalid signature"),
-			"verify vote",
-		)
+		return models.ErrInvalidSignature
 	}
 
 	return nil
+}
+
+func (e *GlobalConsensusEngine) getPendingProposals(
+	frameNumber uint64,
+) []*models.SignedProposal[
+	*protobufs.GlobalFrame,
+	*protobufs.ProposalVote,
+] {
+	pendingFrames, err := e.clockStore.RangeGlobalClockFrames(
+		frameNumber,
+		0xfffffffffffffffe,
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer pendingFrames.Close()
+
+	result := []*models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]{}
+
+	e.logger.Debug("getting pending proposals", zap.Uint64("start", frameNumber))
+	pendingFrames.First()
+	if !pendingFrames.Valid() {
+		e.logger.Debug("no valid frame")
+		return result
+	}
+	value, err := pendingFrames.Value()
+	if err != nil || value == nil {
+		e.logger.Debug("value was invalid", zap.Error(err))
+		return result
+	}
+
+	previous := value
+	for pendingFrames.Next(); pendingFrames.Valid(); pendingFrames.Next() {
+		value, err := pendingFrames.Value()
+		if err != nil || value == nil {
+			e.logger.Debug("iter value was invalid or empty", zap.Error(err))
+			break
+		}
+
+		parent, err := e.clockStore.GetQuorumCertificate(nil, previous.GetRank())
+		if err != nil {
+			panic(err)
+		}
+
+		priorTC, _ := e.clockStore.GetTimeoutCertificate(nil, value.GetRank()-1)
+		var priorTCModel models.TimeoutCertificate = nil
+		if priorTC != nil {
+			priorTCModel = priorTC
+		}
+
+		vote := &protobufs.ProposalVote{
+			Rank:        value.GetRank(),
+			FrameNumber: value.Header.FrameNumber,
+			Selector:    []byte(value.Identity()),
+			PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
+				Signature: value.Header.PublicKeySignatureBls48581.Signature,
+				Address:   []byte(value.Source()),
+			},
+		}
+		result = append(result, &models.SignedProposal[
+			*protobufs.GlobalFrame,
+			*protobufs.ProposalVote,
+		]{
+			Proposal: models.Proposal[*protobufs.GlobalFrame]{
+				State: &models.State[*protobufs.GlobalFrame]{
+					Rank:                    value.GetRank(),
+					Identifier:              value.Identity(),
+					ProposerID:              value.Source(),
+					ParentQuorumCertificate: parent,
+					State:                   &value,
+				},
+				PreviousRankTimeoutCertificate: priorTCModel,
+			},
+			Vote: &vote,
+		})
+		previous = value
+	}
+	return result
+}
+
+func (e *GlobalConsensusEngine) getRandomProverPeerId() (peer.ID, error) {
+	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		e.logger.Error(
+			"could not get active provers for sync",
+			zap.Error(err),
+		)
+	}
+	if len(provers) == 0 {
+		return "", err
+	}
+	index := rand.Intn(len(provers))
+	registry, err := e.signerRegistry.GetKeyRegistryByProver(
+		provers[index].Address,
+	)
+	if err != nil {
+		e.logger.Debug(
+			"could not get registry for prover",
+			zap.Error(err),
+		)
+		return "", err
+	}
+
+	if registry == nil || registry.IdentityKey == nil {
+		e.logger.Debug("registry for prover not found")
+		return "", err
+	}
+
+	pk, err := pcrypto.UnmarshalEd448PublicKey(registry.IdentityKey.KeyValue)
+	if err != nil {
+		e.logger.Debug(
+			"could not parse pub key",
+			zap.Error(err),
+		)
+		return "", err
+	}
+
+	id, err := peer.IDFromPublicKey(pk)
+	if err != nil {
+		e.logger.Debug(
+			"could not derive peer id",
+			zap.Error(err),
+		)
+		return "", err
+	}
+
+	return id, nil
 }
 
 var _ consensus.DynamicCommittee = (*GlobalConsensusEngine)(nil)

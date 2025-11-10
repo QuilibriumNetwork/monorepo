@@ -327,6 +327,14 @@ message GlobalFrameResponse {
   bytes proof = 2;
 }
 
+message GetGlobalProposalRequest {
+  uint64 frame_number = 1;
+}
+
+message GlobalProposalResponse {
+  GlobalProposal proposal = 1;
+}
+
 message GetAppShardFrameRequest {
   bytes filter = 1;
   uint64 frame_number = 2;
@@ -336,6 +344,16 @@ message AppShardFrameResponse {
   AppShardFrame frame = 1;
   bytes proof = 2;
 }
+
+message GetAppShardProposalRequest {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+}
+
+message AppShardProposalResponse {
+  AppShardProposal proposal = 1;
+}
+
 
 message GetAppShardsRequest {
   bytes shard_key = 1;
@@ -404,6 +422,7 @@ message GlobalGetWorkerInfoResponse {
 
 service GlobalService {
   rpc GetGlobalFrame (GetGlobalFrameRequest) returns (GlobalFrameResponse);
+  rpc GetGlobalProposal (GetGlobalProposalRequest) returns (GlobalProposalResponse);
   rpc GetAppShards(GetAppShardsRequest) returns (GetAppShardsResponse);
   rpc GetGlobalShards(GetGlobalShardsRequest) returns (GetGlobalShardsResponse);
   rpc GetLockedAddresses(GetLockedAddressesRequest) returns (GetLockedAddressesResponse);
@@ -412,6 +431,7 @@ service GlobalService {
 
 service AppShardService {
   rpc GetAppShardFrame (GetAppShardFrameRequest) returns (AppShardFrameResponse);
+  rpc GetAppShardProposal (GetAppShardProposalRequest) returns (AppShardProposalResponse);
 }
 
 message SendMessage {

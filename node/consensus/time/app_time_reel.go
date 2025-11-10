@@ -203,8 +203,17 @@ func (a *AppTimeReel) Start(
 
 // sendEvent sends an event with guaranteed delivery
 func (a *AppTimeReel) sendEvent(event AppEvent) {
-	// This blocks until the event is delivered, guaranteeing order
+	// prioritize halts
 	select {
+	case <-a.ctx.Done():
+		return
+	default:
+	}
+
+	// This blocks until the event is delivered or halted, guaranteeing order
+	select {
+	case <-a.ctx.Done():
+		return
 	case a.eventCh <- event:
 		a.logger.Debug(
 			"sent event",
@@ -212,8 +221,6 @@ func (a *AppTimeReel) sendEvent(event AppEvent) {
 			zap.Uint64("frame_number", event.Frame.Header.FrameNumber),
 			zap.String("id", a.ComputeFrameID(event.Frame)),
 		)
-	case <-a.ctx.Done():
-		return
 	}
 }
 

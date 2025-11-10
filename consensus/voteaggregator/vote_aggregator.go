@@ -324,7 +324,10 @@ func (va *VoteAggregator[StateT, VoteT]) AddVote(vote *VoteT) {
 	// It means that we are probably catching up.
 	select {
 	case va.queuedVotes <- vote:
-		va.queuedMessagesNotifier <- struct{}{}
+		select {
+		case va.queuedMessagesNotifier <- struct{}{}:
+		default:
+		}
 	default:
 		va.tracer.Trace("no queue capacity, dropping vote")
 	}
@@ -344,7 +347,10 @@ func (va *VoteAggregator[StateT, VoteT]) AddState(
 	// It means that we are probably catching up.
 	select {
 	case va.queuedStates <- state:
-		va.queuedMessagesNotifier <- struct{}{}
+		select {
+		case va.queuedMessagesNotifier <- struct{}{}:
+		default:
+		}
 	default:
 		va.tracer.Trace(fmt.Sprintf(
 			"dropping state %x because queue is full",
@@ -409,7 +415,10 @@ func (va *VoteAggregator[StateT, VoteT]) OnFinalizedState(
 	state *models.State[StateT],
 ) {
 	if va.finalizedRank.Set(state.Rank) {
-		va.finalizationEventsNotifier <- struct{}{}
+		select {
+		case va.finalizationEventsNotifier <- struct{}{}:
+		default:
+		}
 	}
 }
 

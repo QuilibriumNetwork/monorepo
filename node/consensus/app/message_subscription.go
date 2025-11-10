@@ -113,6 +113,10 @@ func (e *AppConsensusEngine) subscribeToFrameMessages() error {
 	if err := e.pubsub.Subscribe(
 		e.getFrameMessageBitmask(),
 		func(message *pb.Message) error {
+			if e.IsInProverTrie(e.getProverAddress()) {
+				return nil
+			}
+
 			select {
 			case <-e.haltCtx.Done():
 				return nil

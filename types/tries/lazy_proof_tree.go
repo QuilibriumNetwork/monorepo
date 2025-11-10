@@ -1666,6 +1666,10 @@ func (t *LazyVectorCommitmentTree) ProveMultiple(
 	for _, key := range keys {
 		pathIndices := [][]uint64{}
 		polys, commits, ys, ps := prove(t.Root, key, 0)
+		if len(commits) == 0 {
+			return nil
+		}
+
 		for _, p := range ps {
 			index := []uint64{}
 			for _, i := range p {

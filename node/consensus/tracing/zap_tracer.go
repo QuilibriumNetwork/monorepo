@@ -22,14 +22,14 @@ func (z *ZapTracer) Error(
 	combined := logParamsToZap(z.params)
 	combined = append(combined, logParamsToZap(params)...)
 	combined = append(combined, zap.Error(err))
-	z.logger.Error(message, combined...)
+	z.logger.WithOptions(zap.AddCallerSkip(1)).Error(message, combined...)
 }
 
 // Trace implements consensus.TraceLogger.
 func (z *ZapTracer) Trace(message string, params ...consensus.LogParam) {
 	combined := logParamsToZap(z.params)
 	combined = append(combined, logParamsToZap(params)...)
-	z.logger.Debug(message, combined...)
+	z.logger.WithOptions(zap.AddCallerSkip(1)).Info(message, combined...)
 }
 
 // With implements consensus.TraceLogger.

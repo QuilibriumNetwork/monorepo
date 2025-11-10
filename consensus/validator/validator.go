@@ -267,7 +267,7 @@ func (v *Validator[StateT, VoteT]) ValidateQuorumCertificate(
 		case models.IsInvalidFormatError(err):
 			return newInvalidQuorumCertificateError(
 				qc,
-				fmt.Errorf("QC's  signature data has an invalid structure: %w", err),
+				fmt.Errorf("QC's signature data has an invalid structure: %w", err),
 			)
 		case errors.Is(err, models.ErrInvalidSignature):
 			return newInvalidQuorumCertificateError(

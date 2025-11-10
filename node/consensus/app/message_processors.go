@@ -96,6 +96,19 @@ func (e *AppConsensusEngine) processAlertMessageQueue(
 	}
 }
 
+func (e *AppConsensusEngine) processAppShardProposalQueue(
+	ctx lifecycle.SignalerContext,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case proposal := <-e.appShardProposalQueue:
+			e.handleAppShardProposal(proposal)
+		}
+	}
+}
+
 func (e *AppConsensusEngine) processPeerInfoMessageQueue(
 	ctx lifecycle.SignalerContext,
 ) {
@@ -125,6 +138,217 @@ func (e *AppConsensusEngine) processDispatchMessageQueue(
 		case message := <-e.dispatchMessageQueue:
 			e.handleDispatchMessage(message)
 		}
+	}
+}
+
+func (e *AppConsensusEngine) handleAppShardProposal(
+	proposal *protobufs.AppShardProposal,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.logger.Error(
+				"panic recovered from proposal",
+				zap.Any("panic", r),
+				zap.Stack("stacktrace"),
+			)
+		}
+	}()
+
+	e.logger.Debug(
+		"handling global proposal",
+		zap.String("id", hex.EncodeToString([]byte(proposal.State.Identity()))),
+	)
+
+	// Small gotcha: the proposal structure uses interfaces, so we can't assign
+	// directly, otherwise the nil values for the structs will fail the nil
+	// check on the interfaces (and would incur costly reflection if we wanted
+	// to check it directly)
+	pqc := proposal.ParentQuorumCertificate
+	prtc := proposal.PriorRankTimeoutCertificate
+	vote := proposal.Vote
+	proposer := models.Identity("")
+	if vote != nil {
+		proposer = vote.Identity()
+	}
+	signedProposal := &models.SignedProposal[*protobufs.AppShardFrame, *protobufs.ProposalVote]{
+		Proposal: models.Proposal[*protobufs.AppShardFrame]{
+			State: &models.State[*protobufs.AppShardFrame]{
+				Rank:       proposal.State.GetRank(),
+				Identifier: proposal.State.Identity(),
+				ProposerID: proposer,
+				Timestamp:  proposal.State.GetTimestamp(),
+				State:      &proposal.State,
+			},
+		},
+		Vote: &vote,
+	}
+
+	if pqc != nil {
+		signedProposal.Proposal.State.ParentQuorumCertificate = pqc
+	}
+
+	if prtc != nil {
+		signedProposal.PreviousRankTimeoutCertificate = prtc
+	}
+
+	finalized := e.forks.FinalizedState()
+	finalizedRank := finalized.Rank
+	finalizedFrameNumber := (*finalized.State).Header.FrameNumber
+
+	// drop proposals if we already processed them
+	if proposal.State.Header.FrameNumber <= finalizedFrameNumber ||
+		proposal.State.Header.Rank <= finalizedRank {
+		e.logger.Debug("dropping stale proposal")
+		return
+	}
+	_, _, err := e.clockStore.GetShardClockFrame(
+		proposal.State.Header.Address,
+		proposal.State.Header.FrameNumber,
+		false,
+	)
+	if err == nil {
+		e.logger.Debug("dropping stale proposal")
+		return
+	}
+	// if we have a parent, cache and move on
+	e.proposalCacheMu.RLock()
+	_, ok := e.proposalCache[string(proposal.State.Header.ParentSelector)]
+	e.proposalCacheMu.RUnlock()
+	if ok {
+		e.proposalCacheMu.Lock()
+		e.proposalCache[proposal.State.Identity()] = proposal
+		e.proposalCacheMu.Unlock()
+		return
+	}
+	if proposal.State.Header.FrameNumber != 0 {
+		// also check with persistence layer
+		parent, _, err := e.clockStore.GetShardClockFrame(
+			proposal.State.Header.Address,
+			proposal.State.Header.FrameNumber-1,
+			false,
+		)
+		if err != nil || !bytes.Equal(
+			[]byte(parent.Identity()),
+			proposal.State.Header.ParentSelector,
+		) {
+			e.logger.Debug(
+				"parent frame not stored, requesting sync",
+				zap.Uint64("frame_number", proposal.State.Header.FrameNumber-1),
+			)
+			e.proposalCacheMu.Lock()
+			e.proposalCache[proposal.State.Identity()] = proposal
+			e.proposalCacheMu.Unlock()
+			var peerId []byte
+			if proposal.Vote != nil {
+				peerId = []byte(proposal.Vote.Identity())
+			} else {
+				id, err := e.getRandomProverPeerId()
+				if err != nil {
+					e.logger.Debug("could not get random peer", zap.Error(err))
+					return
+				}
+				peerId = []byte(id)
+			}
+			e.syncProvider.AddState(peerId, proposal.State.Header.FrameNumber-1)
+			return
+		}
+	}
+
+	e.processProposal(proposal)
+}
+
+func (e *AppConsensusEngine) processProposal(
+	proposal *protobufs.AppShardProposal,
+) {
+	e.logger.Debug(
+		"processing proposal",
+		zap.String("id", hex.EncodeToString([]byte(proposal.State.Identity()))),
+	)
+
+	err := e.VerifyQuorumCertificate(proposal.ParentQuorumCertificate)
+	if err != nil {
+		e.logger.Debug("proposal has invalid qc", zap.Error(err))
+		return
+	}
+
+	if proposal.PriorRankTimeoutCertificate != nil {
+		err := e.VerifyTimeoutCertificate(proposal.PriorRankTimeoutCertificate)
+		if err != nil {
+			e.logger.Debug("proposal has invalid tc", zap.Error(err))
+			return
+		}
+	}
+
+	if proposal.Vote != nil {
+		err := e.VerifyVote(&proposal.Vote)
+		if err != nil {
+			e.logger.Debug("proposal has invalid vote", zap.Error(err))
+			return
+		}
+	}
+
+	err = proposal.State.Validate()
+	if err != nil {
+		e.logger.Debug("proposal is not valid", zap.Error(err))
+		return
+	}
+
+	valid, err := e.frameValidator.Validate(proposal.State)
+	if !valid || err != nil {
+		e.logger.Debug("invalid frame in proposal", zap.Error(err))
+		return
+	}
+
+	// Small gotcha: the proposal structure uses interfaces, so we can't assign
+	// directly, otherwise the nil values for the structs will fail the nil
+	// check on the interfaces (and would incur costly reflection if we wanted
+	// to check it directly)
+	pqc := proposal.ParentQuorumCertificate
+	prtc := proposal.PriorRankTimeoutCertificate
+	vote := proposal.Vote
+	signedProposal := &models.SignedProposal[*protobufs.AppShardFrame, *protobufs.ProposalVote]{
+		Proposal: models.Proposal[*protobufs.AppShardFrame]{
+			State: &models.State[*protobufs.AppShardFrame]{
+				Rank:       proposal.State.GetRank(),
+				Identifier: proposal.State.Identity(),
+				ProposerID: proposal.Vote.Identity(),
+				Timestamp:  proposal.State.GetTimestamp(),
+				State:      &proposal.State,
+			},
+		},
+		Vote: &vote,
+	}
+
+	if pqc != nil {
+		signedProposal.Proposal.State.ParentQuorumCertificate = pqc
+	}
+
+	if prtc != nil {
+		signedProposal.PreviousRankTimeoutCertificate = prtc
+	}
+
+	e.consensusParticipant.SubmitProposal(signedProposal)
+	proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
+	e.proposalCacheMu.RLock()
+	props := []*protobufs.AppShardProposal{}
+	removes := []string{}
+	for id, prop := range e.proposalCache {
+		if bytes.Equal(
+			prop.State.Header.ParentSelector,
+			[]byte(proposal.State.Identity()),
+		) {
+			props = append(props, prop)
+			removes = append(removes, id)
+		}
+	}
+	e.proposalCacheMu.RUnlock()
+	for i := range props {
+		prop := props[i]
+		remove := removes[i]
+		e.processProposal(prop)
+		e.proposalCacheMu.Lock()
+		delete(e.proposalCache, remove)
+		e.proposalCacheMu.Unlock()
 	}
 }
 
@@ -422,6 +646,11 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 }
 
 func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
+	// Skip our own messages
+	if bytes.Equal(message.From, e.pubsub.GetPeerID()) {
+		return
+	}
+
 	timer := prometheus.NewTimer(
 		proposalProcessingDuration.WithLabelValues(e.appAddressHex),
 	)
@@ -430,59 +659,19 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 	proposal := &protobufs.AppShardProposal{}
 	if err := proposal.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal proposal", zap.Error(err))
-		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		proposalProcessedTotal.WithLabelValues("error").Inc()
 		return
 	}
 
-	if proposal.State != nil && proposal.State.Header != nil &&
-		proposal.State.Header.Prover != nil {
-		valid, err := e.frameValidator.Validate(proposal.State)
-		if !valid || err != nil {
-			e.logger.Error("received invalid frame", zap.Error(err))
-			proposalProcessedTotal.WithLabelValues(
-				e.appAddressHex,
-				"invalid",
-			).Inc()
-			return
-		}
+	frameIDBI, _ := poseidon.HashBytes(proposal.State.Header.Output)
+	frameID := frameIDBI.FillBytes(make([]byte, 32))
+	e.frameStoreMu.Lock()
+	e.frameStore[string(frameID)] = proposal.State
+	e.frameStoreMu.Unlock()
 
-		frameIDBI, _ := poseidon.HashBytes(proposal.State.Header.Output)
-		frameID := frameIDBI.FillBytes(make([]byte, 32))
-		e.frameStoreMu.Lock()
-		e.frameStore[string(frameID)] =
-			proposal.State.Clone().(*protobufs.AppShardFrame)
-		e.frameStoreMu.Unlock()
+	e.appShardProposalQueue <- proposal
 
-		// Small gotcha: the proposal structure uses interfaces, so we can't assign
-		// directly, otherwise the nil values for the structs will fail the nil
-		// check on the interfaces (and would incur costly reflection if we wanted
-		// to check it directly)
-		pqc := proposal.ParentQuorumCertificate
-		prtc := proposal.PriorRankTimeoutCertificate
-		signedProposal := &models.SignedProposal[*protobufs.AppShardFrame, *protobufs.ProposalVote]{
-			Proposal: models.Proposal[*protobufs.AppShardFrame]{
-				State: &models.State[*protobufs.AppShardFrame]{
-					Rank:       proposal.State.GetRank(),
-					Identifier: proposal.State.Identity(),
-					ProposerID: proposal.Vote.Identity(),
-					Timestamp:  proposal.State.GetTimestamp(),
-					State:      &proposal.State,
-				},
-			},
-			Vote: &proposal.Vote,
-		}
-
-		if pqc != nil {
-			signedProposal.Proposal.State.ParentQuorumCertificate = pqc
-		}
-
-		if prtc != nil {
-			signedProposal.PreviousRankTimeoutCertificate = prtc
-		}
-
-		e.consensusParticipant.SubmitProposal(signedProposal)
-		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
-	}
+	proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }
 
 func (e *AppConsensusEngine) handleVote(message *pb.Message) {

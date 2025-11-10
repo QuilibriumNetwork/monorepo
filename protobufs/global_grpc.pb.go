@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion7
 
 const (
 	GlobalService_GetGlobalFrame_FullMethodName     = "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame"
+	GlobalService_GetGlobalProposal_FullMethodName  = "/quilibrium.node.global.pb.GlobalService/GetGlobalProposal"
 	GlobalService_GetAppShards_FullMethodName       = "/quilibrium.node.global.pb.GlobalService/GetAppShards"
 	GlobalService_GetGlobalShards_FullMethodName    = "/quilibrium.node.global.pb.GlobalService/GetGlobalShards"
 	GlobalService_GetLockedAddresses_FullMethodName = "/quilibrium.node.global.pb.GlobalService/GetLockedAddresses"
@@ -32,6 +33,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type GlobalServiceClient interface {
 	GetGlobalFrame(ctx context.Context, in *GetGlobalFrameRequest, opts ...grpc.CallOption) (*GlobalFrameResponse, error)
+	GetGlobalProposal(ctx context.Context, in *GetGlobalProposalRequest, opts ...grpc.CallOption) (*GlobalProposalResponse, error)
 	GetAppShards(ctx context.Context, in *GetAppShardsRequest, opts ...grpc.CallOption) (*GetAppShardsResponse, error)
 	GetGlobalShards(ctx context.Context, in *GetGlobalShardsRequest, opts ...grpc.CallOption) (*GetGlobalShardsResponse, error)
 	GetLockedAddresses(ctx context.Context, in *GetLockedAddressesRequest, opts ...grpc.CallOption) (*GetLockedAddressesResponse, error)
@@ -49,6 +51,15 @@ func NewGlobalServiceClient(cc grpc.ClientConnInterface) GlobalServiceClient {
 func (c *globalServiceClient) GetGlobalFrame(ctx context.Context, in *GetGlobalFrameRequest, opts ...grpc.CallOption) (*GlobalFrameResponse, error) {
 	out := new(GlobalFrameResponse)
 	err := c.cc.Invoke(ctx, GlobalService_GetGlobalFrame_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *globalServiceClient) GetGlobalProposal(ctx context.Context, in *GetGlobalProposalRequest, opts ...grpc.CallOption) (*GlobalProposalResponse, error) {
+	out := new(GlobalProposalResponse)
+	err := c.cc.Invoke(ctx, GlobalService_GetGlobalProposal_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +107,7 @@ func (c *globalServiceClient) GetWorkerInfo(ctx context.Context, in *GlobalGetWo
 // for forward compatibility
 type GlobalServiceServer interface {
 	GetGlobalFrame(context.Context, *GetGlobalFrameRequest) (*GlobalFrameResponse, error)
+	GetGlobalProposal(context.Context, *GetGlobalProposalRequest) (*GlobalProposalResponse, error)
 	GetAppShards(context.Context, *GetAppShardsRequest) (*GetAppShardsResponse, error)
 	GetGlobalShards(context.Context, *GetGlobalShardsRequest) (*GetGlobalShardsResponse, error)
 	GetLockedAddresses(context.Context, *GetLockedAddressesRequest) (*GetLockedAddressesResponse, error)
@@ -109,6 +121,9 @@ type UnimplementedGlobalServiceServer struct {
 
 func (UnimplementedGlobalServiceServer) GetGlobalFrame(context.Context, *GetGlobalFrameRequest) (*GlobalFrameResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetGlobalFrame not implemented")
+}
+func (UnimplementedGlobalServiceServer) GetGlobalProposal(context.Context, *GetGlobalProposalRequest) (*GlobalProposalResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetGlobalProposal not implemented")
 }
 func (UnimplementedGlobalServiceServer) GetAppShards(context.Context, *GetAppShardsRequest) (*GetAppShardsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetAppShards not implemented")
@@ -149,6 +164,24 @@ func _GlobalService_GetGlobalFrame_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(GlobalServiceServer).GetGlobalFrame(ctx, req.(*GetGlobalFrameRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GlobalService_GetGlobalProposal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetGlobalProposalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GlobalServiceServer).GetGlobalProposal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GlobalService_GetGlobalProposal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GlobalServiceServer).GetGlobalProposal(ctx, req.(*GetGlobalProposalRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -237,6 +270,10 @@ var GlobalService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _GlobalService_GetGlobalFrame_Handler,
 		},
 		{
+			MethodName: "GetGlobalProposal",
+			Handler:    _GlobalService_GetGlobalProposal_Handler,
+		},
+		{
 			MethodName: "GetAppShards",
 			Handler:    _GlobalService_GetAppShards_Handler,
 		},
@@ -258,7 +295,8 @@ var GlobalService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	AppShardService_GetAppShardFrame_FullMethodName = "/quilibrium.node.global.pb.AppShardService/GetAppShardFrame"
+	AppShardService_GetAppShardFrame_FullMethodName    = "/quilibrium.node.global.pb.AppShardService/GetAppShardFrame"
+	AppShardService_GetAppShardProposal_FullMethodName = "/quilibrium.node.global.pb.AppShardService/GetAppShardProposal"
 )
 
 // AppShardServiceClient is the client API for AppShardService service.
@@ -266,6 +304,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type AppShardServiceClient interface {
 	GetAppShardFrame(ctx context.Context, in *GetAppShardFrameRequest, opts ...grpc.CallOption) (*AppShardFrameResponse, error)
+	GetAppShardProposal(ctx context.Context, in *GetAppShardProposalRequest, opts ...grpc.CallOption) (*AppShardProposalResponse, error)
 }
 
 type appShardServiceClient struct {
@@ -285,11 +324,21 @@ func (c *appShardServiceClient) GetAppShardFrame(ctx context.Context, in *GetApp
 	return out, nil
 }
 
+func (c *appShardServiceClient) GetAppShardProposal(ctx context.Context, in *GetAppShardProposalRequest, opts ...grpc.CallOption) (*AppShardProposalResponse, error) {
+	out := new(AppShardProposalResponse)
+	err := c.cc.Invoke(ctx, AppShardService_GetAppShardProposal_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AppShardServiceServer is the server API for AppShardService service.
 // All implementations must embed UnimplementedAppShardServiceServer
 // for forward compatibility
 type AppShardServiceServer interface {
 	GetAppShardFrame(context.Context, *GetAppShardFrameRequest) (*AppShardFrameResponse, error)
+	GetAppShardProposal(context.Context, *GetAppShardProposalRequest) (*AppShardProposalResponse, error)
 	mustEmbedUnimplementedAppShardServiceServer()
 }
 
@@ -299,6 +348,9 @@ type UnimplementedAppShardServiceServer struct {
 
 func (UnimplementedAppShardServiceServer) GetAppShardFrame(context.Context, *GetAppShardFrameRequest) (*AppShardFrameResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetAppShardFrame not implemented")
+}
+func (UnimplementedAppShardServiceServer) GetAppShardProposal(context.Context, *GetAppShardProposalRequest) (*AppShardProposalResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetAppShardProposal not implemented")
 }
 func (UnimplementedAppShardServiceServer) mustEmbedUnimplementedAppShardServiceServer() {}
 
@@ -331,6 +383,24 @@ func _AppShardService_GetAppShardFrame_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AppShardService_GetAppShardProposal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetAppShardProposalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AppShardServiceServer).GetAppShardProposal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AppShardService_GetAppShardProposal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AppShardServiceServer).GetAppShardProposal(ctx, req.(*GetAppShardProposalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AppShardService_ServiceDesc is the grpc.ServiceDesc for AppShardService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -341,6 +411,10 @@ var AppShardService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetAppShardFrame",
 			Handler:    _AppShardService_GetAppShardFrame_Handler,
+		},
+		{
+			MethodName: "GetAppShardProposal",
+			Handler:    _AppShardService_GetAppShardProposal_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

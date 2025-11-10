@@ -28,8 +28,8 @@ type Forks[StateT models.Unique] interface {
 	// GetStatesForRank returns all known states for the given rank
 	GetStatesForRank(rank uint64) []*models.State[StateT]
 
-	// GetState returns (*models.State[*helper.TestState], true) if the state with the specified
-	// id was found and (nil, false) otherwise.
+	// GetState returns (*models.State[StateT], true) if the state with the
+	// specified id was found and (nil, false) otherwise.
 	GetState(stateID models.Identity) (*models.State[StateT], bool)
 
 	// FinalizedRank returns the largest rank number where a finalized state is

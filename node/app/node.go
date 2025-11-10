@@ -84,9 +84,10 @@ func (d *DHTNode) Stop() {
 	}()
 }
 
-func (m *MasterNode) Start(quitCh chan struct{}) error {
+func (m *MasterNode) Start(ctx context.Context) <-chan error {
+	errChan := make(chan error)
+
 	// Start the global consensus engine
-	m.quit = quitCh
 	supervisor, err := lifecycle.NewSupervisor(
 		[]*lifecycle.Node{
 			&lifecycle.Node{
@@ -101,24 +102,19 @@ func (m *MasterNode) Start(quitCh chan struct{}) error {
 		},
 	)
 	if err != nil {
-		return err
+		go func() {
+			errChan <- err
+		}()
+		return errChan
 	}
 
-	errChan := make(chan error)
 	go func() {
-		errChan <- supervisor.Start(context.Background())
+		errChan <- supervisor.Start(ctx)
 	}()
 
 	m.logger.Info("master node started", zap.Uint("core_id", m.coreId))
 
-	select {
-	case err := <-errChan:
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return errChan
 }
 
 func (m *MasterNode) Stop() {

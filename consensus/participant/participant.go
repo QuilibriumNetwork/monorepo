@@ -11,6 +11,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus/notifications/pubsub"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/pacemaker/timeout"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/recovery"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/safetyrules"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/stateproducer"
 )
@@ -27,7 +28,7 @@ func NewParticipant[
 	signer consensus.Signer[StateT, VoteT],
 	prover consensus.LeaderProvider[StateT, PeerIDT, CollectedT],
 	voter consensus.VotingProvider[StateT, VoteT, PeerIDT],
-	notifier *pubsub.Distributor[StateT, VoteT],
+	notifier consensus.Consumer[StateT, VoteT],
 	consensusStore consensus.ConsensusStore[VoteT],
 	signatureAggregator consensus.SignatureAggregator,
 	consensusVerifier consensus.Verifier[VoteT],
@@ -40,6 +41,7 @@ func NewParticipant[
 	finalizer consensus.Finalizer,
 	filter []byte,
 	trustedRoot *models.CertifiedState[StateT],
+	pending []*models.SignedProposal[StateT, VoteT],
 ) (*eventloop.EventLoop[StateT, VoteT], error) {
 	cfg, err := timeout.NewConfig(
 		10*time.Second,
@@ -82,6 +84,20 @@ func NewParticipant[
 	voteAggregator.PruneUpToRank(trustedRoot.Rank())
 	timeoutAggregator.PruneUpToRank(trustedRoot.Rank())
 
+	// recover HotStuff state from all pending states
+	qcCollector := recovery.NewCollector[models.QuorumCertificate]()
+	tcCollector := recovery.NewCollector[models.TimeoutCertificate]()
+	err = recovery.Recover(
+		logger,
+		pending,
+		recovery.ForksState[StateT, VoteT](forks),             // add pending states to Forks
+		recovery.CollectParentQCs[StateT, VoteT](qcCollector), // collect QCs from all pending state to initialize PaceMaker (below)
+		recovery.CollectTCs[StateT, VoteT](tcCollector),       // collect TCs from all pending state to initialize PaceMaker (below)
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan tree of pending states: %w", err)
+	}
+
 	// initialize the pacemaker
 	controller := timeout.NewController(cfg)
 	pacemaker, err := pacemaker.NewPacemaker[StateT, VoteT](
@@ -91,6 +107,8 @@ func NewParticipant[
 		notifier,
 		consensusStore,
 		logger,
+		pacemaker.WithQCs[StateT, VoteT](qcCollector.Retrieve()...),
+		pacemaker.WithTCs[StateT, VoteT](tcCollector.Retrieve()...),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize flow pacemaker: %w", err)

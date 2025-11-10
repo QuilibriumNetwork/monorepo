@@ -26,6 +26,25 @@ func (p *AppVotingProvider) FinalizeQuorumCertificate(
 	state *models.State[*protobufs.AppShardFrame],
 	aggregatedSignature models.AggregatedSignature,
 ) (models.QuorumCertificate, error) {
+	cloned := (*state.State).Clone().(*protobufs.AppShardFrame)
+	cloned.Header.PublicKeySignatureBls48581 =
+		&protobufs.BLS48581AggregateSignature{
+			Signature: aggregatedSignature.GetSignature(),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: aggregatedSignature.GetPubKey(),
+			},
+			Bitmask: aggregatedSignature.GetBitmask(),
+		}
+	frameBytes, err := cloned.ToCanonicalBytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "finalize quorum certificate")
+	}
+
+	p.engine.pubsub.PublishToBitmask(
+		p.engine.getFrameMessageBitmask(),
+		frameBytes,
+	)
+
 	return &protobufs.QuorumCertificate{
 		Filter:      (*state.State).Header.Address,
 		Rank:        (*state.State).GetRank(),
@@ -129,6 +148,27 @@ func (p *AppVotingProvider) SignVote(
 		)
 	}
 
+	nextLeader, err := p.engine.LeaderForRank(state.Rank)
+	if err != nil {
+		p.engine.logger.Error("could not determine next prover", zap.Error(err))
+		return nil, errors.Wrap(
+			errors.New("could not determine next prover"),
+			"sign vote",
+		)
+	}
+
+	var extProof []byte
+	if nextLeader != p.engine.Self() {
+		p.engine.proofCacheMu.RLock()
+		proof, ok := p.engine.proofCache[state.Rank]
+		p.engine.proofCacheMu.RUnlock()
+
+		if !ok {
+			return nil, errors.Wrap(errors.New("no proof ready for vote"), "sign vote")
+		}
+		extProof = proof[:]
+	}
+
 	// Create vote (signature)
 	signatureData := verification.MakeVoteMessage(
 		(*state.State).Header.Address,
@@ -152,7 +192,7 @@ func (p *AppVotingProvider) SignVote(
 		Timestamp:   uint64(time.Now().UnixMilli()),
 		PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
 			Address:   voterAddress,
-			Signature: sig,
+			Signature: slices.Concat(sig, extProof),
 		},
 	}
 

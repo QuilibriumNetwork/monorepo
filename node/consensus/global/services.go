@@ -7,6 +7,7 @@ import (
 	"slices"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -22,60 +23,9 @@ func (e *GlobalConsensusEngine) GetGlobalFrame(
 	ctx context.Context,
 	request *protobufs.GetGlobalFrameRequest,
 ) (*protobufs.GlobalFrameResponse, error) {
-	peerID, ok := qgrpc.PeerIDFromContext(ctx)
-	if !ok {
-		return nil, status.Error(codes.Internal, "remote peer ID not found")
-	}
-
-	if !bytes.Equal(e.pubsub.GetPeerID(), []byte(peerID)) {
-		registry, err := e.keyStore.GetKeyRegistry(
-			[]byte(peerID),
-		)
-		if err != nil {
-			return nil, status.Error(
-				codes.PermissionDenied,
-				"could not identify peer",
-			)
-		}
-
-		if registry.ProverKey == nil || registry.ProverKey.KeyValue == nil {
-			return nil, status.Error(
-				codes.PermissionDenied,
-				"could not identify peer (no prover)",
-			)
-		}
-
-		addrBI, err := poseidon.HashBytes(registry.ProverKey.KeyValue)
-		if err != nil {
-			return nil, status.Error(
-				codes.PermissionDenied,
-				"could not identify peer (invalid address)",
-			)
-		}
-
-		addr := addrBI.FillBytes(make([]byte, 32))
-		info, err := e.proverRegistry.GetActiveProvers(nil)
-		if err != nil {
-			return nil, status.Error(
-				codes.PermissionDenied,
-				"could not identify peer (no prover registry)",
-			)
-		}
-
-		found := false
-		for _, prover := range info {
-			if bytes.Equal(prover.Address, addr) {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			return nil, status.Error(
-				codes.PermissionDenied,
-				"invalid peer",
-			)
-		}
+	peerID, err := e.authenticateProverFromContext(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	e.logger.Debug(
@@ -84,7 +34,6 @@ func (e *GlobalConsensusEngine) GetGlobalFrame(
 		zap.String("peer_id", peerID.String()),
 	)
 	var frame *protobufs.GlobalFrame
-	var err error
 	if request.FrameNumber == 0 {
 		frame, err = e.globalTimeReel.GetHead()
 		if frame.Header.FrameNumber == 0 {
@@ -109,6 +58,80 @@ func (e *GlobalConsensusEngine) GetGlobalFrame(
 
 	return &protobufs.GlobalFrameResponse{
 		Frame: frame,
+	}, nil
+}
+
+func (e *GlobalConsensusEngine) GetGlobalProposal(
+	ctx context.Context,
+	request *protobufs.GetGlobalProposalRequest,
+) (*protobufs.GlobalProposalResponse, error) {
+	peerID, err := e.authenticateProverFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Genesis does not have a parent cert, treat special:
+	if request.FrameNumber == 0 {
+		frame, err := e.clockStore.GetGlobalClockFrame(request.FrameNumber)
+		if err != nil {
+			e.logger.Debug(
+				"received error while fetching global frame",
+				zap.String("peer_id", peerID.String()),
+				zap.Uint64("frame_number", request.FrameNumber),
+				zap.Error(err),
+			)
+			return nil, errors.Wrap(err, "get global proposal")
+		}
+		return &protobufs.GlobalProposalResponse{
+			Proposal: &protobufs.GlobalProposal{
+				State: frame,
+			},
+		}, nil
+	}
+
+	e.logger.Debug(
+		"received proposal request",
+		zap.Uint64("frame_number", request.FrameNumber),
+		zap.String("peer_id", peerID.String()),
+	)
+	frame, err := e.clockStore.GetGlobalClockFrame(request.FrameNumber)
+	if err != nil {
+		return &protobufs.GlobalProposalResponse{}, nil
+	}
+
+	parent, err := e.clockStore.GetGlobalClockFrame(request.FrameNumber - 1)
+	if err != nil {
+		e.logger.Debug(
+			"received error while fetching global frame parent",
+			zap.String("peer_id", peerID.String()),
+			zap.Uint64("frame_number", request.FrameNumber),
+			zap.Error(err),
+		)
+		return nil, errors.Wrap(err, "get global proposal")
+	}
+
+	parentQC, err := e.clockStore.GetQuorumCertificate(nil, parent.GetRank())
+	if err != nil {
+		e.logger.Debug(
+			"received error while fetching QC parent",
+			zap.String("peer_id", peerID.String()),
+			zap.Uint64("frame_number", request.FrameNumber),
+			zap.Error(err),
+		)
+		return nil, errors.Wrap(err, "get global proposal")
+	}
+
+	// no tc is fine, pass the nil along
+	priorRankTC, _ := e.clockStore.GetTimeoutCertificate(nil, frame.GetRank()-1)
+
+	proposal := &protobufs.GlobalProposal{
+		State:                       frame,
+		ParentQuorumCertificate:     parentQC,
+		PriorRankTimeoutCertificate: priorRankTC,
+	}
+
+	return &protobufs.GlobalProposalResponse{
+		Proposal: proposal,
 	}, nil
 }
 
@@ -335,4 +358,66 @@ func (e *GlobalConsensusEngine) RegisterServices(server *grpc.Server) {
 		proxyServer := rpc.NewPubSubProxyServer(e.pubsub, e.logger)
 		protobufs.RegisterPubSubProxyServer(server, proxyServer)
 	}
+}
+
+func (e *GlobalConsensusEngine) authenticateProverFromContext(
+	ctx context.Context,
+) (peer.ID, error) {
+	peerID, ok := qgrpc.PeerIDFromContext(ctx)
+	if !ok {
+		return peerID, status.Error(codes.Internal, "remote peer ID not found")
+	}
+
+	if !bytes.Equal(e.pubsub.GetPeerID(), []byte(peerID)) {
+		registry, err := e.keyStore.GetKeyRegistry(
+			[]byte(peerID),
+		)
+		if err != nil {
+			return peerID, status.Error(
+				codes.PermissionDenied,
+				"could not identify peer",
+			)
+		}
+
+		if registry.ProverKey == nil || registry.ProverKey.KeyValue == nil {
+			return peerID, status.Error(
+				codes.PermissionDenied,
+				"could not identify peer (no prover)",
+			)
+		}
+
+		addrBI, err := poseidon.HashBytes(registry.ProverKey.KeyValue)
+		if err != nil {
+			return peerID, status.Error(
+				codes.PermissionDenied,
+				"could not identify peer (invalid address)",
+			)
+		}
+
+		addr := addrBI.FillBytes(make([]byte, 32))
+		info, err := e.proverRegistry.GetActiveProvers(nil)
+		if err != nil {
+			return peerID, status.Error(
+				codes.PermissionDenied,
+				"could not identify peer (no prover registry)",
+			)
+		}
+
+		found := false
+		for _, prover := range info {
+			if bytes.Equal(prover.Address, addr) {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return peerID, status.Error(
+				codes.PermissionDenied,
+				"invalid peer",
+			)
+		}
+	}
+
+	return peerID, nil
 }

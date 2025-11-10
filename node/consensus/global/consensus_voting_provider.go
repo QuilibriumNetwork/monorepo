@@ -23,6 +23,22 @@ func (p *GlobalVotingProvider) FinalizeQuorumCertificate(
 	state *models.State[*protobufs.GlobalFrame],
 	aggregatedSignature models.AggregatedSignature,
 ) (models.QuorumCertificate, error) {
+	cloned := (*state.State).Clone().(*protobufs.GlobalFrame)
+	cloned.Header.PublicKeySignatureBls48581 =
+		&protobufs.BLS48581AggregateSignature{
+			Signature: aggregatedSignature.GetSignature(),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: aggregatedSignature.GetPubKey(),
+			},
+			Bitmask: aggregatedSignature.GetBitmask(),
+		}
+	frameBytes, err := cloned.ToCanonicalBytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "finalize quorum certificate")
+	}
+
+	p.engine.pubsub.PublishToBitmask(GLOBAL_FRAME_BITMASK, frameBytes)
+
 	return &protobufs.QuorumCertificate{
 		Rank:        (*state.State).GetRank(),
 		FrameNumber: (*state.State).Header.FrameNumber,

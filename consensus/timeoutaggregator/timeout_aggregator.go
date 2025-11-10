@@ -184,7 +184,10 @@ func (t *TimeoutAggregator[VoteT]) AddTimeout(
 
 	select {
 	case t.queuedTimeouts <- timeoutState:
-		t.queuedTimeoutsNotifier <- struct{}{}
+		select {
+		case t.queuedTimeoutsNotifier <- struct{}{}:
+		default:
+		}
 	default:
 		// processing pipeline `queuedTimeouts` is full
 		// It's ok to silently drop timeouts, because we are probably catching up.
@@ -208,7 +211,10 @@ func (t *TimeoutAggregator[VoteT]) PruneUpToRank(lowestRetainedRank uint64) {
 // nodes cannot be considered as inputs to this function
 func (t *TimeoutAggregator[VoteT]) OnRankChange(oldRank, newRank uint64) {
 	if t.lowestRetainedRank.Set(newRank) {
-		t.enteringRankNotifier <- struct{}{}
+		select {
+		case t.enteringRankNotifier <- struct{}{}:
+		default:
+		}
 	}
 }
 

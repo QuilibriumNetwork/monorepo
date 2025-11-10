@@ -659,6 +659,7 @@ func (e *GlobalConsensusEngine) publishKeyRegistry() {
 		return
 	}
 	registry := &protobufs.KeyRegistry{
+		LastUpdated: uint64(time.Now().UnixMilli()),
 		IdentityKey: &protobufs.Ed448PublicKey{
 			KeyValue: e.pubsub.GetPublicKey(),
 		},

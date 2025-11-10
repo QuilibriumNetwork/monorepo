@@ -70,7 +70,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 ) (**protobufs.GlobalFrame, error) {
 	_, err := p.engine.livenessProvider.Collect(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "prove next state")
+		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
 	}
 
 	timer := prometheus.NewTimer(frameProvingDuration)
@@ -78,18 +78,24 @@ func (p *GlobalLeaderProvider) ProveNextState(
 
 	prior, err := p.engine.clockStore.GetLatestGlobalClockFrame()
 	if err != nil {
-		return nil, errors.Wrap(err, "prove next state")
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
 	}
 
 	if prior == nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
+		return nil, models.NewNoVoteErrorf("missing prior frame")
 	}
 
 	if prior.Identity() != priorState {
-		return nil, errors.Wrap(
-			errors.New("missing prior frame"),
-			"prove next state",
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf(
+			"building on fork or needs sync: frame %d, rank %d, parent_id: %x, asked: rank %d, id: %x",
+			prior.Header.FrameNumber,
+			prior.Header.Rank,
+			prior.Header.ParentSelector,
+			rank,
+			priorState,
 		)
 	}
 
@@ -111,10 +117,8 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	}
 
 	if !found {
-		return nil, errors.Wrap(
-			models.NewNoVoteErrorf("not a prover"),
-			"prove next state",
-		)
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("not a prover")
 	}
 
 	p.engine.logger.Info(
@@ -126,14 +130,11 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	signer, _, _, _ := p.engine.GetProvingKey(p.engine.config.Engine)
 	if signer == nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(
-			errors.New("no proving key available"),
-			"prove next state",
-		)
+		return nil, models.NewNoVoteErrorf("not a prover")
 	}
 
 	// Get current timestamp and difficulty
-	timestamp := time.Now().UnixMilli() + 30000
+	timestamp := time.Now().UnixMilli()
 	difficulty := p.engine.difficultyAdjuster.GetNextDifficulty(
 		rank,
 		timestamp,

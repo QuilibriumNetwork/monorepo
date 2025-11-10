@@ -132,6 +132,11 @@ func (e *GlobalConsensusEngine) subscribeToFrameMessages() error {
 	if err := e.pubsub.Subscribe(
 		GLOBAL_FRAME_BITMASK,
 		func(message *pb.Message) error {
+			// Don't subscribe if running in consensus, the time reel shouldn't have
+			// the frame ahead of time
+			if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
+				return nil
+			}
 			select {
 			case <-e.haltCtx.Done():
 				return nil

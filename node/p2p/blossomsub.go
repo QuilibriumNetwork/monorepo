@@ -1510,8 +1510,18 @@ func (b *BlossomSub) GetDirectChannel(
 	var lastError error
 	for _, addr := range pi.Addrs {
 		var mga net.Addr
+		b.logger.Debug(
+			"attempting to get direct channel with peer",
+			zap.String("peer", peer.ID(peerID).String()),
+			zap.String("addr", addr.String()),
+		)
 		mga, lastError = mn.ToNetAddr(addr)
 		if lastError != nil {
+			b.logger.Debug(
+				"skipping address",
+				zap.String("addr", addr.String()),
+				zap.Error(lastError),
+			)
 			continue
 		}
 
@@ -1521,6 +1531,11 @@ func (b *BlossomSub) GetDirectChannel(
 			grpc.WithTransportCredentials(creds),
 		)
 		if lastError != nil {
+			b.logger.Debug(
+				"could not connect",
+				zap.String("addr", addr.String()),
+				zap.Error(lastError),
+			)
 			continue
 		}
 

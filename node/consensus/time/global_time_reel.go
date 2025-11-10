@@ -219,8 +219,17 @@ func (g *GlobalTimeReel) Start(
 
 // sendEvent sends an event with guaranteed delivery
 func (g *GlobalTimeReel) sendEvent(event GlobalEvent) {
-	// This blocks until the event is delivered, guaranteeing order
+	// prioritize halts
 	select {
+	case <-g.ctx.Done():
+		return
+	default:
+	}
+
+	// This blocks until the event is delivered or halted, guaranteeing order
+	select {
+	case <-g.ctx.Done():
+		return
 	case g.eventCh <- event:
 		g.logger.Debug(
 			"sent event",
@@ -228,8 +237,6 @@ func (g *GlobalTimeReel) sendEvent(event GlobalEvent) {
 			zap.Uint64("frame_number", event.Frame.Header.FrameNumber),
 			zap.String("id", g.ComputeFrameID(event.Frame)),
 		)
-	case <-g.ctx.Done():
-		return
 	}
 }
 

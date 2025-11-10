@@ -252,7 +252,10 @@ func (el *EventLoop[StateT, VoteT]) SubmitProposal(
 // quorumCertificates channel
 func (el *EventLoop[StateT, VoteT]) onTrustedQC(qc *models.QuorumCertificate) {
 	if el.newestSubmittedQc.Track(qc) {
-		el.qcSubmittedNotifier <- struct{}{}
+		select {
+		case el.qcSubmittedNotifier <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -260,11 +263,17 @@ func (el *EventLoop[StateT, VoteT]) onTrustedQC(qc *models.QuorumCertificate) {
 // timeoutCertificates channel
 func (el *EventLoop[StateT, VoteT]) onTrustedTC(tc *models.TimeoutCertificate) {
 	if el.newestSubmittedTimeoutCertificate.Track(tc) {
-		el.tcSubmittedNotifier <- struct{}{}
+		select {
+		case el.tcSubmittedNotifier <- struct{}{}:
+		default:
+		}
 	} else {
 		qc := (*tc).GetLatestQuorumCert()
 		if el.newestSubmittedQc.Track(&qc) {
-			el.qcSubmittedNotifier <- struct{}{}
+			select {
+			case el.qcSubmittedNotifier <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
@@ -293,7 +302,10 @@ func (el *EventLoop[StateT, VoteT]) OnPartialTimeoutCertificateCreated(
 		PriorRankTimeoutCertificate: previousRankTimeoutCert,
 	}
 	if el.newestSubmittedPartialTimeoutCertificate.Track(event) {
-		el.partialTimeoutCertificateCreatedNotifier <- struct{}{}
+		select {
+		case el.partialTimeoutCertificateCreatedNotifier <- struct{}{}:
+		default:
+		}
 	}
 }
 

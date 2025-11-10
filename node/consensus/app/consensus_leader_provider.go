@@ -68,7 +68,7 @@ func (p *AppLeaderProvider) ProveNextState(
 ) (**protobufs.AppShardFrame, error) {
 	_, err := p.engine.livenessProvider.Collect(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "prove next state")
+		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
 	}
 
 	timer := prometheus.NewTimer(frameProvingDuration.WithLabelValues(
@@ -80,18 +80,24 @@ func (p *AppLeaderProvider) ProveNextState(
 		p.engine.appAddress,
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "prove next state")
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
 	}
 
 	if prior == nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
+		return nil, models.NewNoVoteErrorf("missing prior frame")
 	}
 
 	if prior.Identity() != priorState {
-		return nil, errors.Wrap(
-			errors.New("missing prior frame"),
-			"prove next state",
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf(
+			"building on fork or needs sync: frame %d, rank %d, parent_id: %x, asked: rank %d, id: %x",
+			prior.Header.FrameNumber,
+			prior.Header.Rank,
+			prior.Header.ParentSelector,
+			rank,
+			priorState,
 		)
 	}
 
@@ -111,10 +117,8 @@ func (p *AppLeaderProvider) ProveNextState(
 	}
 
 	if !found {
-		return nil, errors.Wrap(
-			models.NewNoVoteErrorf("not a prover"),
-			"prove next state",
-		)
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("not a prover")
 	}
 
 	// Get collected messages to include in frame
