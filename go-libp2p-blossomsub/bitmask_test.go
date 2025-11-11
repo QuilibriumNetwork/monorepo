@@ -710,7 +710,7 @@ func notifSubThenUnSub(ctx context.Context, t *testing.T, bitmasks []*Bitmask) {
 	}
 
 	// Wait for the unsubscribe messages to reach the primary peer
-	for len(primaryBitmask.ListPeers()) < 0 {
+	for len(primaryBitmask.ListPeers()) != 0 {
 		time.Sleep(time.Millisecond * 100)
 	}
 

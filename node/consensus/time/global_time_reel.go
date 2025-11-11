@@ -14,6 +14,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
@@ -110,8 +111,7 @@ type GlobalTimeReel struct {
 	) error
 
 	// Control
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx context.Context
 
 	// Network-specific consensus toggles
 	genesisFrameNumber uint64
@@ -134,8 +134,6 @@ func NewGlobalTimeReel(
 	if err != nil {
 		return nil, errors.Wrap(err, "new global time reel")
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 
 	genesisFrameNumber := uint64(0)
 
@@ -169,8 +167,6 @@ func NewGlobalTimeReel(
 		) error {
 			return nil
 		},
-		ctx:                ctx,
-		cancel:             cancel,
 		genesisFrameNumber: genesisFrameNumber,
 		archiveMode:        archiveMode,
 	}, nil
@@ -199,29 +195,41 @@ func (g *GlobalTimeReel) SetRevertFunc(
 }
 
 // Start starts the global time reel
-func (g *GlobalTimeReel) Start() error {
+func (g *GlobalTimeReel) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	g.ctx = ctx
 	g.logger.Info("starting global time reel")
 
 	// Warm the in-memory tree/cache from store.
 	if err := g.bootstrapFromStore(); err != nil {
-		return errors.Wrap(err, "start")
+		g.logger.Error("could not bootstrap from store", zap.Error(err))
+		ctx.Throw(err)
+		return
 	}
 
-	return nil
-}
+	ready()
+	<-ctx.Done()
 
-// Stop stops the global time reel
-func (g *GlobalTimeReel) Stop() {
 	g.logger.Info("stopping global time reel")
-	g.cancel()
 	close(g.eventCh)
 	close(g.eventDone)
 }
 
 // sendEvent sends an event with guaranteed delivery
 func (g *GlobalTimeReel) sendEvent(event GlobalEvent) {
-	// This blocks until the event is delivered, guaranteeing order
+	// prioritize halts
 	select {
+	case <-g.ctx.Done():
+		return
+	default:
+	}
+
+	// This blocks until the event is delivered or halted, guaranteeing order
+	select {
+	case <-g.ctx.Done():
+		return
 	case g.eventCh <- event:
 		g.logger.Debug(
 			"sent event",
@@ -229,14 +237,11 @@ func (g *GlobalTimeReel) sendEvent(event GlobalEvent) {
 			zap.Uint64("frame_number", event.Frame.Header.FrameNumber),
 			zap.String("id", g.ComputeFrameID(event.Frame)),
 		)
-	case <-g.ctx.Done():
-		return
 	}
 }
 
 // Insert inserts a global frame header into the tree structure (non-blocking)
 func (g *GlobalTimeReel) Insert(
-	ctx context.Context,
 	frame *protobufs.GlobalFrame,
 ) error {
 	// Start timing

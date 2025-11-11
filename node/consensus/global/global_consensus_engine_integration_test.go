@@ -33,9 +33,9 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
 	"source.quilibrium.com/quilibrium/monorepo/channel"
 	"source.quilibrium.com/quilibrium/monorepo/config"
-	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/difficulty"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/events"
@@ -60,16 +60,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/verenc"
 )
-
-type testTransitionListener struct {
-	onTransition func(from, to consensus.State, event consensus.Event)
-}
-
-func (l *testTransitionListener) OnTransition(from, to consensus.State, event consensus.Event) {
-	if l.onTransition != nil {
-		l.onTransition(from, to, event)
-	}
-}
 
 // mockIntegrationPubSub is a pubsub mock for integration testing
 type mockIntegrationPubSub struct {
@@ -129,11 +119,11 @@ func (m *mockIntegrationPubSub) PublishToBitmask(bitmask []byte, data []byte) er
 		typePrefix := binary.BigEndian.Uint32(data[:4])
 
 		// Check if it's a GlobalFrame
-		if typePrefix == protobufs.GlobalFrameType {
-			frame := &protobufs.GlobalFrame{}
+		if typePrefix == protobufs.GlobalProposalType {
+			frame := &protobufs.GlobalProposal{}
 			if err := frame.FromCanonicalBytes(data); err == nil {
 				m.mu.Lock()
-				m.frames = append(m.frames, frame)
+				m.frames = append(m.frames, frame.State)
 				m.mu.Unlock()
 			}
 		}
@@ -285,6 +275,9 @@ func registerProverInHypergraph(t *testing.T, hg thypergraph.Hypergraph, publicK
 	if err != nil {
 		t.Fatalf("Failed to insert status: %v", err)
 	}
+
+	err = tree.Insert([]byte{3 << 2}, []byte{0, 0, 0, 0, 0, 0, 3, 232}, nil, big.NewInt(0)) // seniority = 1000
+	require.NoError(t, err)
 
 	// Type Index:
 	typeBI, _ := poseidon.HashBytes(
@@ -548,13 +541,14 @@ func createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(
 		nil, // inboxStore
 		nil, // hypergraphStore
 		store.NewPebbleShardsStore(pebbleDB, logger),
+		store.NewPebbleConsensusStore(pebbleDB, logger),
 		store.NewPebbleWorkerStore(pebbleDB, logger),
 		channel.NewDoubleRatchetEncryptedChannel(), // encryptedChannel
 		&bulletproofs.Decaf448BulletproofProver{},  // bulletproofProver
 		&verenc.MPCitHVerifiableEncryptor{},        // verEnc
 		&bulletproofs.Decaf448KeyConstructor{},     // decafConstructor
 		compiler.NewBedlamCompiler(),
-		nil,
+		bc,
 		qp2p.NewInMemoryPeerInfoManager(logger),
 	)
 	require.NoError(t, err)
@@ -583,11 +577,11 @@ func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 			typePrefix := binary.BigEndian.Uint32(data[:4])
 
 			// Check if it's a GlobalFrame
-			if typePrefix == protobufs.GlobalFrameType {
-				frame := &protobufs.GlobalFrame{}
+			if typePrefix == protobufs.GlobalProposalType {
+				frame := &protobufs.GlobalProposal{}
 				if err := frame.FromCanonicalBytes(data); err == nil {
 					mu.Lock()
-					publishedFrames = append(publishedFrames, frame)
+					publishedFrames = append(publishedFrames, frame.State)
 					mu.Unlock()
 				}
 			}
@@ -595,8 +589,9 @@ func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	}
 
 	// Start the engine
-	quit := make(chan struct{})
-	errChan := engine.Start(quit)
+	ctx, cancel, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+	err := engine.Start(ctx)
+	require.NoError(t, err)
 
 	// Check for startup errors
 	select {
@@ -607,7 +602,7 @@ func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	}
 
 	// Wait for state transitions
-	time.Sleep(2 * time.Second)
+	time.Sleep(20 * time.Second)
 
 	// Verify engine is in an active state
 	state := engine.GetState()
@@ -626,55 +621,7 @@ func TestGlobalConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	t.Logf("Published %d frames", frameCount)
 
 	// Stop the engine
-	close(quit)
-	<-engine.Stop(false)
-}
-
-func TestGlobalConsensusEngine_Integration_StateTransitions(t *testing.T) {
-	// Generate hosts for testing
-	_, m, cleanupHosts := tests.GenerateSimnetHosts(t, 1, []libp2p.Option{})
-	defer cleanupHosts()
-
-	engine, _, _, _ := createIntegrationTestGlobalConsensusEngine(t, []byte(m.Nodes[0].ID()), 99, m.Nodes[0], m.Keys[0], m.Nodes)
-
-	// Track state transitions
-	transitions := make([]string, 0)
-	var mu sync.Mutex
-
-	listener := &testTransitionListener{
-		onTransition: func(from, to consensus.State, event consensus.Event) {
-			mu.Lock()
-			transitions = append(transitions, fmt.Sprintf("%s->%s", from, to))
-			mu.Unlock()
-			t.Logf("State transition: %s -> %s (event: %s)", from, to, event)
-		},
-	}
-
-	// Start the engine
-	quit := make(chan struct{})
-	errChan := engine.Start(quit)
-	engine.stateMachine.AddListener(listener)
-
-	// Check for startup errors
-	select {
-	case err := <-errChan:
-		require.NoError(t, err)
-	case <-time.After(100 * time.Millisecond):
-		// No error is good
-	}
-
-	// Wait for state transitions
-	time.Sleep(10 * time.Second)
-
-	// Verify we had some state transitions
-	mu.Lock()
-	transitionCount := len(transitions)
-	mu.Unlock()
-
-	assert.Greater(t, transitionCount, 0, "Expected at least one state transition")
-
-	// Stop the engine
-	close(quit)
+	cancel()
 	<-engine.Stop(false)
 }
 
@@ -768,13 +715,13 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 				typePrefix := binary.BigEndian.Uint32(data[:4])
 
 				// Check if it's a GlobalFrame
-				if typePrefix == protobufs.GlobalFrameType {
-					frame := &protobufs.GlobalFrame{}
+				if typePrefix == protobufs.GlobalProposalType {
+					frame := &protobufs.GlobalProposal{}
 					if err := frame.FromCanonicalBytes(data); err == nil {
 						mu.Lock()
-						allFrames[nodeIdx] = append(allFrames[nodeIdx], frame)
+						allFrames[nodeIdx] = append(allFrames[nodeIdx], frame.State)
 						mu.Unlock()
-						t.Logf("Node %d published frame %d", nodeIdx+1, frame.Header.FrameNumber)
+						t.Logf("Node %d published frame %d", nodeIdx+1, frame.State.Header.FrameNumber)
 					}
 				}
 			}
@@ -790,9 +737,9 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				switch typePrefix {
-				case protobufs.GlobalFrameType:
+				case protobufs.GlobalProposalType:
 					proposalCount[nodeIdx]++
-				case protobufs.FrameVoteType:
+				case protobufs.ProposalVoteType:
 					voteCount[nodeIdx]++
 				case protobufs.ProverLivenessCheckType:
 					livenessCount[nodeIdx]++
@@ -802,11 +749,13 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 		})
 	}
 
+	cancels := []func(){}
 	// Start all engines
-	quits := make([]chan struct{}, 6)
 	for i := 0; i < 6; i++ {
-		quits[i] = make(chan struct{})
-		errChan := engines[i].Start(quits[i])
+		ctx, cancel, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+		err := engines[i].Start(ctx)
+		require.NoError(t, err)
+		cancels = append(cancels, cancel)
 
 		// Check for startup errors
 		select {
@@ -888,7 +837,7 @@ loop:
 
 	// Stop all engines
 	for i := 0; i < 6; i++ {
-		close(quits[i])
+		cancels[i]()
 		<-engines[i].Stop(false)
 	}
 }
@@ -947,10 +896,12 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 	engine.eventDistributor = eventDistributor
 
 	// Start the event distributor
-	engine.Start(make(chan struct{}))
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	err := engine.Start(ctx)
+	require.NoError(t, err)
 
 	// Run shard coverage check
-	err := engine.checkShardCoverage(1)
+	err = engine.checkShardCoverage(1)
 	require.NoError(t, err)
 
 	// Wait for event processing and possible new app shard head
@@ -972,7 +923,8 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 	require.False(t, newHeadAfter)
 
 	// Stop the event distributor
-	eventDistributor.Stop()
+	cancel()
+	<-engine.Stop(false)
 }
 
 // TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying tests that engines
@@ -992,7 +944,7 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 
 	engines := make([]*GlobalConsensusEngine, numNodes)
 	pubsubs := make([]*mockIntegrationPubSub, numNodes)
-	quits := make([]chan struct{}, numNodes)
+	cancels := make([]func(), numNodes)
 
 	// Create shared hypergraph with NO provers registered
 	inclusionProver := bls48581.NewKZGInclusionProver(logger)
@@ -1094,19 +1046,19 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 			nil, // inboxStore
 			nil, // hypergraphStore
 			store.NewPebbleShardsStore(pebbleDB, logger),
+			store.NewPebbleConsensusStore(pebbleDB, logger),
 			store.NewPebbleWorkerStore(pebbleDB, logger),
 			channel.NewDoubleRatchetEncryptedChannel(),
 			&bulletproofs.Decaf448BulletproofProver{}, // bulletproofProver
 			&verenc.MPCitHVerifiableEncryptor{},       // verEnc
 			&bulletproofs.Decaf448KeyConstructor{},    // decafConstructor
 			compiler.NewBedlamCompiler(),
-			nil, // blsConstructor
+			bc, // blsConstructor
 			qp2p.NewInMemoryPeerInfoManager(logger),
 		)
 		require.NoError(t, err)
 
 		engines[i] = engine
-		quits[i] = make(chan struct{})
 	}
 
 	// Wire up all pubsubs to each other
@@ -1120,7 +1072,11 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 
 	// Start all engines
 	for i := 0; i < numNodes; i++ {
-		errChan := engines[i].Start(quits[i])
+		ctx, cancel, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+		err := engines[i].Start(ctx)
+		require.NoError(t, err)
+		cancels[i] = cancel
+
 		select {
 		case err := <-errChan:
 			require.NoError(t, err)
@@ -1145,7 +1101,7 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 
 	// Stop all engines
 	for i := 0; i < numNodes; i++ {
-		close(quits[i])
+		cancels[i]()
 		<-engines[i].Stop(false)
 	}
 
@@ -1174,14 +1130,14 @@ func TestGlobalConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 			typePrefix := binary.BigEndian.Uint32(data[:4])
 
 			// Check if it's a GlobalFrame
-			if typePrefix == protobufs.GlobalFrameType {
-				frame := &protobufs.GlobalFrame{}
+			if typePrefix == protobufs.GlobalProposalType {
+				frame := &protobufs.GlobalProposal{}
 				if err := frame.FromCanonicalBytes(data); err == nil {
 					mu.Lock()
 					if afterAlert {
-						afterAlertFrames = append(afterAlertFrames, frame)
+						afterAlertFrames = append(afterAlertFrames, frame.State)
 					} else {
-						publishedFrames = append(publishedFrames, frame)
+						publishedFrames = append(publishedFrames, frame.State)
 					}
 					mu.Unlock()
 				}
@@ -1190,8 +1146,9 @@ func TestGlobalConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 	}
 
 	// Start the engine
-	quit := make(chan struct{})
-	errChan := engine.Start(quit)
+	ctx, cancel, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+	err := engine.Start(ctx)
+	require.NoError(t, err)
 
 	// Check for startup errors
 	select {
@@ -1250,7 +1207,7 @@ func TestGlobalConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 	require.Equal(t, 0, afterAlertCount)
 
 	// Stop the engine
-	close(quit)
+	cancel()
 	<-engine.Stop(false)
 }
 
@@ -1275,6 +1232,9 @@ func registerProverInHypergraphWithFilter(t *testing.T, hg thypergraph.Hypergrap
 	if err != nil {
 		t.Fatalf("Failed to insert status: %v", err)
 	}
+
+	err = tree.Insert([]byte{3 << 2}, []byte{0, 0, 0, 0, 0, 0, 3, 232}, nil, big.NewInt(0)) // seniority = 1000
+	require.NoError(t, err)
 
 	// Type Index:
 	typeBI, _ := poseidon.HashBytes(

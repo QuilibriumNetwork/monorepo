@@ -1,0 +1,18 @@
+dir: "{{.InterfaceDir}}/mock"
+outpkg: "mock"
+filename: "{{.InterfaceName | snakecase}}.go"
+mockname: "{{.InterfaceName}}"
+
+all: True
+with-expecter: False
+include-auto-generated: False
+disable-func-mocks: True
+fail-on-missing: True
+disable-version-string: True
+resolve-type-alias: False
+
+packages:
+  source.quilibrium.com/quilibrium/monorepo/consensus:
+    config:
+      dir: "mocks"
+      outpkg: "mocks"

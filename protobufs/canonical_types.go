@@ -49,8 +49,8 @@ const (
 	GlobalFrameHeaderType   uint32 = 0x0309
 	FrameHeaderType         uint32 = 0x030A
 	ProverLivenessCheckType uint32 = 0x030B
-	FrameVoteType           uint32 = 0x030C
-	FrameConfirmationType   uint32 = 0x030D
+	ProposalVoteType        uint32 = 0x030C
+	QuorumCertificateType   uint32 = 0x030D
 	GlobalFrameType         uint32 = 0x030E
 	AppShardFrameType       uint32 = 0x030F
 	SeniorityMergeType      uint32 = 0x0310
@@ -60,6 +60,10 @@ const (
 	PathType                uint32 = 0x0314
 	TraversalSubProofType   uint32 = 0x0315
 	TraversalProofType      uint32 = 0x0316
+	GlobalProposalType      uint32 = 0x0317
+	AppShardProposalType    uint32 = 0x0318
+	TimeoutStateType        uint32 = 0x031C
+	TimeoutCertificateType  uint32 = 0x031D
 
 	// Hypergraph types (0x0400 - 0x04FF)
 	HypergraphConfigurationType uint32 = 0x0401

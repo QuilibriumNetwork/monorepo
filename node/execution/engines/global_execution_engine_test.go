@@ -2,6 +2,7 @@ package engines_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"math/big"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/engines"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
@@ -56,7 +58,8 @@ func TestGlobalExecutionEngine_Start(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test starting and stopping the engine
-	errChan := engine.Start()
+	ctx, cancel, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+	engine.Start(ctx, func() {})
 
 	// Engine should start without errors
 	select {
@@ -67,7 +70,8 @@ func TestGlobalExecutionEngine_Start(t *testing.T) {
 	}
 
 	// Stop the engine
-	<-engine.Stop(false)
+	cancel()
+	<-ctx.Done()
 }
 
 func TestGlobalExecutionEngine_ProcessMessage(t *testing.T) {

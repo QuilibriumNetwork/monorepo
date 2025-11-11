@@ -31,6 +31,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/difficulty"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/events"
@@ -51,7 +52,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	thypergraph "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
-	"source.quilibrium.com/quilibrium/monorepo/types/mocks"
 	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 	tstore "source.quilibrium.com/quilibrium/monorepo/types/store"
@@ -121,6 +121,9 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	// Create hypergraph
 	hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_basic"}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
 	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+
+	// Create consensus store
+	consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
 
 	// Create key store
 	keyStore := store.NewPebbleKeyStore(pebbleDB, logger)
@@ -209,6 +212,7 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 		inboxStore,
 		shardsStore,
 		hypergraphStore,
+		consensusStore,
 		frameProver,
 		inclusionProver,
 		bulletproof,
@@ -223,7 +227,7 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 		globalFrameValidator,
 		difficultyAdjuster,
 		rewardIssuance,
-		&mocks.MockBlsConstructor{},
+		bc,
 		channel.NewDoubleRatchetEncryptedChannel(),
 	)
 
@@ -252,30 +256,24 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 		typePrefix := binary.BigEndian.Uint32(message.Data[:4])
 
 		switch typePrefix {
-		case protobufs.AppShardFrameType:
-			frame := &protobufs.AppShardFrame{}
+		case protobufs.AppShardProposalType:
+			frame := &protobufs.AppShardProposal{}
 			if err := frame.FromCanonicalBytes(message.Data); err != nil {
 				return errors.New("error")
 			}
 			framesMu.Lock()
-			frameHistory = append(frameHistory, frame)
+			frameHistory = append(frameHistory, frame.State)
 			framesMu.Unlock()
 
-		case protobufs.ProverLivenessCheckType:
-			livenessCheck := &protobufs.ProverLivenessCheck{}
-			if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
-				return errors.New("error")
-			}
-
-		case protobufs.FrameVoteType:
-			vote := &protobufs.FrameVote{}
+		case protobufs.ProposalVoteType:
+			vote := &protobufs.ProposalVote{}
 			if err := vote.FromCanonicalBytes(message.Data); err != nil {
 				return errors.New("error")
 			}
 
-		case protobufs.FrameConfirmationType:
-			confirmation := &protobufs.FrameConfirmation{}
-			if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
+		case protobufs.TimeoutStateType:
+			state := &protobufs.TimeoutState{}
+			if err := state.FromCanonicalBytes(message.Data); err != nil {
 				return errors.New("error")
 			}
 
@@ -287,8 +285,9 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 
 	// Start engine
 	t.Log("Step 2: Starting consensus engine")
-	quit := make(chan struct{})
-	errChan := engine.Start(quit)
+	ctx, cancel, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+	err = engine.Start(ctx)
+	require.NoError(t, err)
 
 	select {
 	case err := <-errChan:
@@ -357,9 +356,14 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	}
 	framesMu.Unlock()
 
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-time.After(100 * time.Millisecond):
+	}
 	// Stop
 	t.Log("Step 8: Cleaning up")
-	engine.UnregisterExecutor("test-executor", 0, false)
+	cancel()
 	engine.Stop(false)
 }
 
@@ -443,16 +447,16 @@ func TestAppConsensusEngine_Integration_FeeVotingMechanics(t *testing.T) {
 	tempVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	tempHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_fee_temp"}, tempDB, logger, tempVerifiableEncryptor, tempInclusionProver)
 
-	tempClockStore := store.NewPebbleClockStore(tempDB, logger)
-	tempInboxStore := store.NewPebbleInboxStore(tempDB, logger)
-	tempShardsStore := store.NewPebbleShardsStore(tempDB, logger)
-
 	// Create engines with different fee voting strategies
 	t.Log("Step 4: Creating consensus engines for each node")
 	for i := 0; i < numNodes; i++ {
 		verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 		pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_fee_%d", i)}, 0)
 		hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_fee_%d", i)}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
+		consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
+		tempClockStore := store.NewPebbleClockStore(tempDB, logger)
+		tempInboxStore := store.NewPebbleInboxStore(tempDB, logger)
+		tempShardsStore := store.NewPebbleShardsStore(tempDB, logger)
 		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
 		proverRegistry, err := provers.NewProverRegistry(zap.NewNop(), hg)
 		require.NoError(t, err)
@@ -518,6 +522,7 @@ func TestAppConsensusEngine_Integration_FeeVotingMechanics(t *testing.T) {
 			tempInboxStore,
 			tempShardsStore,
 			tempHypergraphStore,
+			consensusStore,
 			frameProver,
 			inclusionProver,
 			bulletproof,
@@ -532,7 +537,7 @@ func TestAppConsensusEngine_Integration_FeeVotingMechanics(t *testing.T) {
 			globalFrameValidator,
 			difficultyAdjuster,
 			rewardIssuance,
-			&mocks.MockBlsConstructor{},
+			bc,
 			channel.NewDoubleRatchetEncryptedChannel(),
 		)
 
@@ -552,13 +557,15 @@ func TestAppConsensusEngine_Integration_FeeVotingMechanics(t *testing.T) {
 
 	// Start all engines
 	t.Log("Step 5: Starting all consensus engines")
-	quits := make([]chan struct{}, numNodes)
+	cancels := []func(){}
 
 	// Start remaining nodes one at a time to ensure proper sync
 	for i := 0; i < numNodes; i++ {
 		pubsubs[i].peerCount = numNodes - 1
-		quits[i] = make(chan struct{})
-		engines[i].Start(quits[i])
+		ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+		err := engines[i].Start(ctx)
+		require.NoError(t, err)
+		cancels = append(cancels, cancel)
 		t.Logf("  - Started engine %d with %d peers", i, pubsubs[i].peerCount)
 	}
 
@@ -661,6 +668,7 @@ func TestAppConsensusEngine_Integration_FeeVotingMechanics(t *testing.T) {
 	// Stop all
 	t.Log("Step 11: Stopping all nodes")
 	for i := 0; i < numNodes; i++ {
+		cancels[i]()
 		engines[i].Stop(false)
 		t.Logf("  - Stopped node %d", i)
 	}
@@ -744,7 +752,6 @@ func TestAppConsensusEngine_Integration_ReconnectCatchup(t *testing.T) {
 	}
 
 	engines := make([]*AppConsensusEngine, numNodes)
-	quits := make([]chan struct{}, numNodes)
 
 	for i := 0; i < numNodes; i++ {
 		// Shared backing stores used by the factories
@@ -756,6 +763,7 @@ func TestAppConsensusEngine_Integration_ReconnectCatchup(t *testing.T) {
 		tempClockStore := store.NewPebbleClockStore(tempDB, baseLogger)
 		tempInboxStore := store.NewPebbleInboxStore(tempDB, baseLogger)
 		tempShardsStore := store.NewPebbleShardsStore(tempDB, baseLogger)
+		tempConsensusStore := store.NewPebbleConsensusStore(tempDB, baseLogger)
 		cfg := zap.NewDevelopmentConfig()
 		adBI, _ := poseidon.HashBytes(proverKeys[i])
 		addr := adBI.FillBytes(make([]byte, 32))
@@ -827,6 +835,7 @@ func TestAppConsensusEngine_Integration_ReconnectCatchup(t *testing.T) {
 			tempInboxStore,
 			tempShardsStore,
 			tempHypergraphStore,
+			tempConsensusStore,
 			frameProver,
 			inclusionProver,
 			bulletproof,
@@ -841,7 +850,7 @@ func TestAppConsensusEngine_Integration_ReconnectCatchup(t *testing.T) {
 			globalFrameValidator,
 			difficultyAdjuster,
 			rewardIssuance,
-			&mocks.MockBlsConstructor{},
+			nodeBC,
 			channel.NewDoubleRatchetEncryptedChannel(),
 		)
 
@@ -862,10 +871,14 @@ func TestAppConsensusEngine_Integration_ReconnectCatchup(t *testing.T) {
 		engines[i] = engine
 	}
 
+	cancels := []func(){}
+
 	// Start all engines
 	for i := 0; i < numNodes; i++ {
-		quits[i] = make(chan struct{})
-		engines[i].Start(quits[i])
+		ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+		err := engines[i].Start(ctx)
+		require.NoError(t, err)
+		cancels = append(cancels, cancel)
 	}
 
 	// Let connected nodes advance while the detached node remains isolated
@@ -968,6 +981,7 @@ func TestAppConsensusEngine_Integration_ReconnectCatchup(t *testing.T) {
 
 	// Stop all engines
 	for i := 0; i < numNodes; i++ {
+		cancels[i]()
 		engines[i].Stop(false)
 	}
 }
@@ -997,7 +1011,6 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 	// Create key managers and prover keys for all shards
 	keyManagers := make([]tkeys.KeyManager, numShards)
 	proverKeys := make([][]byte, numShards)
-	var err error
 	for i := 0; i < numShards; i++ {
 		bc := &bls48581.Bls48581KeyConstructor{}
 		dc := &bulletproofs.Decaf448KeyConstructor{}
@@ -1013,23 +1026,6 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 	tempInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	tempVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	tempHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_multi_temp"}, tempDB, logger, tempVerifiableEncryptor, tempInclusionProver)
-	tempHg := hypergraph.NewHypergraph(logger, tempHypergraphStore, tempInclusionProver, []int{}, &tests.Nopthenticator{})
-	tempClockStore := store.NewPebbleClockStore(tempDB, logger)
-	tempInboxStore := store.NewPebbleInboxStore(tempDB, logger)
-	tempShardsStore := store.NewPebbleShardsStore(tempDB, logger)
-	proverRegistry, err := provers.NewProverRegistry(zap.NewNop(), tempHg)
-	require.NoError(t, err)
-
-	// Register all provers
-	for i, proverKey := range proverKeys {
-		proverAddress := calculateProverAddress(proverKey)
-		registerProverInHypergraphWithFilter(t, tempHg, proverKey, proverAddress, shardAddresses[i])
-		t.Logf("  - Registered prover %d with address: %x", i, proverAddress)
-	}
-	globalTimeReel, err := consensustime.NewGlobalTimeReel(logger, proverRegistry, tempClockStore, 1, true)
-	require.NoError(t, err)
-
-	proverRegistry.Refresh()
 
 	_, m, cleanup := tests.GenerateSimnetHosts(t, numShards, []libp2p.Option{})
 	defer cleanup()
@@ -1062,9 +1058,26 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 		bulletproof := bulletproofs.NewBulletproofProver()
 		decafConstructor := &bulletproofs.Decaf448KeyConstructor{}
 		compiler := compiler.NewBedlamCompiler()
+		tempConsensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
 
 		hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_multi_%d", i)}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
 		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+		tempHg := hypergraph.NewHypergraph(logger, tempHypergraphStore, tempInclusionProver, []int{}, &tests.Nopthenticator{})
+		tempClockStore := store.NewPebbleClockStore(tempDB, logger)
+		tempInboxStore := store.NewPebbleInboxStore(tempDB, logger)
+		tempShardsStore := store.NewPebbleShardsStore(tempDB, logger)
+		proverRegistry, err := provers.NewProverRegistry(zap.NewNop(), tempHg)
+		require.NoError(t, err)
+		// Register all provers
+		for i, proverKey := range proverKeys {
+			proverAddress := calculateProverAddress(proverKey)
+			registerProverInHypergraphWithFilter(t, tempHg, proverKey, proverAddress, shardAddresses[i])
+			t.Logf("  - Registered prover %d with address: %x", i, proverAddress)
+		}
+		globalTimeReel, err := consensustime.NewGlobalTimeReel(logger, proverRegistry, tempClockStore, 1, true)
+		require.NoError(t, err)
+
+		proverRegistry.Refresh()
 
 		keyStore := store.NewPebbleKeyStore(pebbleDB, logger)
 
@@ -1099,6 +1112,7 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 			tempInboxStore,
 			tempShardsStore,
 			tempHypergraphStore,
+			tempConsensusStore,
 			frameProver,
 			inclusionProver,
 			bulletproof,
@@ -1113,7 +1127,7 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 			globalFrameValidator,
 			difficultyAdjuster,
 			rewardIssuance,
-			&mocks.MockBlsConstructor{},
+			bc,
 			channel.NewDoubleRatchetEncryptedChannel(),
 		)
 
@@ -1133,10 +1147,12 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 
 	// Start all shards
 	t.Log("Step 4: Starting all shard engines")
-	quits := make([]chan struct{}, numShards)
+	cancels := []func(){}
 	for i := 0; i < numShards; i++ {
-		quits[i] = make(chan struct{})
-		engines[i].Start(quits[i])
+		ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+		err := engines[i].Start(ctx)
+		require.NoError(t, err)
+		cancels = append(cancels, cancel)
 		t.Logf("  - Started shard %d", i)
 	}
 
@@ -1179,6 +1195,7 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 	// Stop all
 	t.Log("Step 8: Stopping all shards")
 	for i := 0; i < numShards; i++ {
+		cancels[i]()
 		engines[i].Stop(false)
 		t.Logf("  - Stopped shard %d", i)
 	}
@@ -1187,9 +1204,6 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 // Scenario: App consensus coordinates with global consensus events
 // Expected: App reacts to global new head events appropriately
 func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	logger, _ := zap.NewDevelopment()
 	appAddress := []byte{0xAA, 0x01, 0x02, 0x03}
 
@@ -1243,8 +1257,6 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
-				return
 			case event := <-eventCh:
 				eventsMu.Lock()
 				receivedEvents = append(receivedEvents, event)
@@ -1252,10 +1264,6 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 			}
 		}
 	}()
-
-	// Start event distributor
-	err = eventDistributor.Start(ctx)
-	require.NoError(t, err)
 
 	// Don't add initial frame - let the time reel initialize itself
 
@@ -1266,6 +1274,7 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 	verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	shardsStore := store.NewPebbleShardsStore(pebbleDB, logger)
 	hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_coordination"}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
+	consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
 	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
 
 	keyStore := store.NewPebbleKeyStore(pebbleDB, logger)
@@ -1321,6 +1330,7 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 		tempInboxStore,
 		shardsStore,
 		hypergraphStore,
+		consensusStore,
 		frameProver,
 		inclusionProver,
 		bulletproofs.NewBulletproofProver(),    // bulletproofProver
@@ -1338,7 +1348,7 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 		qp2p.NewInMemoryPeerInfoManager(logger),
 		appTimeReel,
 		globalTimeReel,
-		&mocks.MockBlsConstructor{},
+		bc,
 		channel.NewDoubleRatchetEncryptedChannel(),
 		nil,
 	)
@@ -1347,8 +1357,9 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 	engine.SetGlobalClient(mockGSC)
 
 	// Start engine
-	quit := make(chan struct{})
-	engine.Start(quit)
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	err = engine.Start(ctx)
+	require.NoError(t, err)
 
 	// Wait for genesis initialization
 	time.Sleep(2 * time.Second)
@@ -1374,16 +1385,13 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 	eventsMu.Unlock()
 
 	eventDistributor.Unsubscribe("test-tracker")
-	eventDistributor.Stop()
+	cancel()
 	engine.Stop(false)
 }
 
 // Scenario: Test prover trie membership and rotation
 // Expected: Only valid provers can prove frames
 func TestAppConsensusEngine_Integration_ProverTrieMembership(t *testing.T) {
-	_, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	logger, _ := zap.NewDevelopment()
 	appAddress := []byte{0xAA, 0x01, 0x02, 0x03}
 
@@ -1441,6 +1449,7 @@ func TestAppConsensusEngine_Integration_ProverTrieMembership(t *testing.T) {
 		keyStore := store.NewPebbleKeyStore(pebbleDB, logger)
 		clockStore := store.NewPebbleClockStore(pebbleDB, logger)
 		inboxStore := store.NewPebbleInboxStore(pebbleDB, logger)
+		consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
 
 		frameProver := vdf.NewWesolowskiFrameProver(logger)
 		signerRegistry, err := registration.NewCachedSignerRegistry(keyStore, keyManager, bc, bulletproofs.NewBulletproofProver(), logger)
@@ -1493,6 +1502,7 @@ func TestAppConsensusEngine_Integration_ProverTrieMembership(t *testing.T) {
 			inboxStore,
 			shardsStore,
 			hypergraphStore,
+			consensusStore,
 			frameProver,
 			inclusionProver,
 			tempBulletproof,
@@ -1507,7 +1517,7 @@ func TestAppConsensusEngine_Integration_ProverTrieMembership(t *testing.T) {
 			globalFrameValidator,
 			difficultyAdjuster,
 			rewardIssuance,
-			&mocks.MockBlsConstructor{},
+			bc,
 			channel.NewDoubleRatchetEncryptedChannel(),
 		)
 
@@ -1530,207 +1540,11 @@ func TestAppConsensusEngine_Integration_ProverTrieMembership(t *testing.T) {
 	}
 }
 
-// Scenario: Detailed state transition testing with various triggers
-// Expected: Proper transitions through all states
-func TestAppConsensusEngine_Integration_StateTransitions(t *testing.T) {
-	t.Log("Testing engine state transitions")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	t.Log("Step 1: Setting up test components")
-	logger, _ := zap.NewDevelopment()
-	appAddress := []byte{0xAA, 0x01, 0x02, 0x03}
-	peerID := []byte{0x01, 0x02, 0x03, 0x04}
-	t.Logf("  - App shard address: %x", appAddress)
-	t.Logf("  - Peer ID: %x", peerID)
-
-	// Create engine with controlled components
-	bc := &bls48581.Bls48581KeyConstructor{}
-	dc := &bulletproofs.Decaf448KeyConstructor{}
-	keyManager := keys.NewInMemoryKeyManager(bc, dc)
-	pk, _, err := keyManager.CreateSigningKey("q-prover-key", crypto.KeyTypeBLS48581G1)
-	require.NoError(t, err)
-	proverKey := pk.Public().([]byte)
-
-	// Create stores
-	pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_state_transitions"}, 0)
-
-	// Create inclusion prover and verifiable encryptor
-	inclusionProver := bls48581.NewKZGInclusionProver(logger)
-	verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
-	bulletproof := bulletproofs.NewBulletproofProver()
-	decafConstructor := &bulletproofs.Decaf448KeyConstructor{}
-	compiler := compiler.NewBedlamCompiler()
-
-	// Create hypergraph
-	hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_state_transitions"}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
-
-	// Create key store
-	keyStore := store.NewPebbleKeyStore(pebbleDB, logger)
-
-	// Create clock store
-	clockStore := store.NewPebbleClockStore(pebbleDB, logger)
-
-	// Create inbox store
-	inboxStore := store.NewPebbleInboxStore(pebbleDB, logger)
-
-	// Create shards store
-	shardsStore := store.NewPebbleShardsStore(pebbleDB, logger)
-
-	frameProver := vdf.NewWesolowskiFrameProver(logger)
-	signerRegistry, err := registration.NewCachedSignerRegistry(keyStore, keyManager, bc, bulletproofs.NewBulletproofProver(), logger)
-	require.NoError(t, err)
-	proverRegistry, err := provers.NewProverRegistry(zap.NewNop(), hg)
-	require.NoError(t, err)
-
-	// Register the prover
-	proverAddress := calculateProverAddress(proverKey)
-	registerProverInHypergraphWithFilter(t, hg, proverKey, proverAddress, appAddress)
-
-	proverRegistry.Refresh()
-
-	dynamicFeeManager := fees.NewDynamicFeeManager(logger, inclusionProver)
-
-	frameValidator := validator.NewBLSAppFrameValidator(proverRegistry, bc, frameProver, logger)
-	globalFrameValidator := validator.NewBLSGlobalFrameValidator(proverRegistry, bc, frameProver, logger)
-	difficultyAdjuster := difficulty.NewAsertDifficultyAdjuster(0, time.Now().UnixMilli(), 80000)
-	rewardIssuance := reward.NewOptRewardIssuance()
-
-	// Create pubsub with controlled peer count
-	_, m, cleanup := tests.GenerateSimnetHosts(t, 1, []libp2p.Option{})
-	defer cleanup()
-	p2pcfg := config.P2PConfig{}.WithDefaults()
-	p2pcfg.Network = 1
-	p2pcfg.StreamListenMultiaddr = "/ip4/0.0.0.0/tcp/0"
-	p2pcfg.MinBootstrapPeers = 0
-	p2pcfg.DiscoveryPeerLookupLimit = 0
-	c := &config.Config{
-		Engine: &config.EngineConfig{
-			Difficulty:   80000,
-			ProvingKeyId: "q-prover-key",
-		},
-		P2P: &p2pcfg,
-	}
-	pubsub := newMockAppIntegrationPubSub(c, logger, []byte(m.Nodes[0].ID()), m.Nodes[0], m.Keys[0], m.Nodes)
-	pubsub.peerCount = 0 // Start with 0 peers to trigger genesis
-
-	globalTimeReel, _ := consensustime.NewGlobalTimeReel(logger, proverRegistry, clockStore, 1, true)
-
-	factory := NewAppConsensusEngineFactory(
-		logger,
-		&config.Config{
-			Engine: &config.EngineConfig{
-				Difficulty:   80000,
-				ProvingKeyId: "q-prover-key",
-			},
-			P2P: &config.P2PConfig{
-				Network:               1,
-				StreamListenMultiaddr: "/ip4/0.0.0.0/tcp/0",
-			},
-		},
-		pubsub,
-		hg,
-		keyManager,
-		keyStore,
-		clockStore,
-		inboxStore,
-		shardsStore,
-		hypergraphStore,
-		frameProver,
-		inclusionProver,
-		bulletproof,
-		verifiableEncryptor,
-		decafConstructor,
-		compiler,
-		signerRegistry,
-		proverRegistry,
-		qp2p.NewInMemoryPeerInfoManager(logger),
-		dynamicFeeManager,
-		frameValidator,
-		globalFrameValidator,
-		difficultyAdjuster,
-		rewardIssuance,
-		&mocks.MockBlsConstructor{},
-		channel.NewDoubleRatchetEncryptedChannel(),
-	)
-
-	engine, err := factory.CreateAppConsensusEngine(
-		appAddress,
-		0, // coreId
-		globalTimeReel,
-		nil,
-	)
-	require.NoError(t, err)
-	mockGSC := &mockGlobalClientLocks{}
-	engine.SetGlobalClient(mockGSC)
-
-	// Track state transitions
-	t.Log("Step 2: Setting up state transition tracking")
-	stateHistory := make([]consensus.EngineState, 0)
-	var statesMu sync.Mutex
-
-	go func() {
-		ticker := time.NewTicker(1 * time.Millisecond)
-		defer ticker.Stop()
-
-		lastState := consensus.EngineStateStopped
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				state := engine.GetState()
-				if state != lastState {
-					statesMu.Lock()
-					stateHistory = append(stateHistory, state)
-					statesMu.Unlock()
-					lastState = state
-					t.Logf("  [State Change] %v → %v", lastState, state)
-				}
-			}
-		}
-	}()
-
-	// Start engine
-	t.Log("Step 3: Starting consensus engine")
-	quit := make(chan struct{})
-	engine.Start(quit)
-
-	// Should go through genesis initialization and reach collecting
-	t.Log("Step 4: Waiting for genesis initialization (0 peers)")
-	time.Sleep(10 * time.Second)
-
-	// Increase peers to allow normal operation
-	t.Log("Step 5: Increasing peer count to allow normal operation")
-	pubsub.peerCount = 5
-	t.Log("  - Set peer count to 5")
-	time.Sleep(10 * time.Second)
-
-	// Should transition through states
-	t.Log("Step 6: Verifying state transitions")
-	statesMu.Lock()
-	t.Logf("  - Total state transitions: %d", len(stateHistory))
-	assert.Contains(t, stateHistory, consensus.EngineStateLoading)
-	assert.Contains(t, stateHistory, consensus.EngineStateProving)
-
-	// May also see Proving/Publishing if frames were produced
-	t.Logf("  - Complete state history: %v", stateHistory)
-	statesMu.Unlock()
-
-	t.Log("Step 7: Stopping engine")
-	engine.Stop(false)
-}
-
 // Scenario: Invalid frames are rejected by the network
 // Expected: Only valid frames are accepted and processed
 func TestAppConsensusEngine_Integration_InvalidFrameRejection(t *testing.T) {
 	t.Skip("retrofit for test pubsub")
 	t.Log("Testing invalid frame rejection")
-
-	_, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	t.Log("Step 1: Setting up test components")
 	logger, _ := zap.NewDevelopment()
@@ -1765,6 +1579,7 @@ func TestAppConsensusEngine_Integration_InvalidFrameRejection(t *testing.T) {
 	clockStore := store.NewPebbleClockStore(pebbleDB, logger)
 	inboxStore := store.NewPebbleInboxStore(pebbleDB, logger)
 	shardsStore := store.NewPebbleShardsStore(pebbleDB, logger)
+	consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
 	frameProver := vdf.NewWesolowskiFrameProver(logger)
 	signerRegistry, err := registration.NewCachedSignerRegistry(keyStore, keyManager, bc, bulletproofs.NewBulletproofProver(), logger)
 	require.NoError(t, err)
@@ -1822,6 +1637,7 @@ func TestAppConsensusEngine_Integration_InvalidFrameRejection(t *testing.T) {
 		inboxStore,
 		shardsStore,
 		hypergraphStore,
+		consensusStore,
 		frameProver,
 		inclusionProver,
 		bulletproof,
@@ -1836,7 +1652,7 @@ func TestAppConsensusEngine_Integration_InvalidFrameRejection(t *testing.T) {
 		globalFrameValidator,
 		difficultyAdjuster,
 		rewardIssuance,
-		&mocks.MockBlsConstructor{},
+		bc,
 		channel.NewDoubleRatchetEncryptedChannel(),
 	)
 
@@ -1856,8 +1672,9 @@ func TestAppConsensusEngine_Integration_InvalidFrameRejection(t *testing.T) {
 
 	// Start engine
 	t.Log("Step 2: Starting consensus engine")
-	quit := make(chan struct{})
-	engine.Start(quit)
+	ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+	err = engine.Start(ctx)
+	require.NoError(t, err)
 
 	// Wait a bit for engine to register validator
 	time.Sleep(500 * time.Millisecond)
@@ -1951,6 +1768,7 @@ func TestAppConsensusEngine_Integration_InvalidFrameRejection(t *testing.T) {
 	validationMu.Unlock()
 
 	t.Log("Step 6: Cleaning up")
+	cancel()
 	engine.Stop(false)
 }
 
@@ -2077,6 +1895,7 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 		nodeClockStore := store.NewPebbleClockStore(nodeDB, logger)
 		nodeInboxStore := store.NewPebbleInboxStore(nodeDB, logger)
 		nodeShardsStore := store.NewPebbleShardsStore(nodeDB, logger)
+		nodeConsensusStore := store.NewPebbleConsensusStore(nodeDB, logger)
 		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{})
 		nodeProverRegistry, err := provers.NewProverRegistry(zap.NewNop(), nodeHg)
 		nodeBulletproof := bulletproofs.NewBulletproofProver()
@@ -2127,6 +1946,7 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 			nodeInboxStore,
 			nodeShardsStore,
 			nodeHypergraphStore,
+			nodeConsensusStore,
 			frameProver,
 			nodeInclusionProver,
 			nodeBulletproof,
@@ -2141,7 +1961,7 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 			globalFrameValidator,
 			difficultyAdjuster,
 			rewardIssuance,
-			&mocks.MockBlsConstructor{},
+			bc,
 			channel.NewDoubleRatchetEncryptedChannel(),
 		)
 
@@ -2281,14 +2101,16 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 	}
 
 	// Start all nodes
-	quits := make([][]chan struct{}, numShards)
+	cancels := make([][]func(), numShards)
 	for shardIdx := 0; shardIdx < numShards; shardIdx++ {
-		quits[shardIdx] = make([]chan struct{}, numNodesPerShard)
+		cancels[shardIdx] = make([]func(), numNodesPerShard)
 
 		// Start first node in each shard to create genesis
-		quits[shardIdx][0] = make(chan struct{})
 		node := shards[shardIdx][0]
-		node.engine.Start(quits[shardIdx][0])
+		ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+		err := node.engine.Start(ctx)
+		require.NoError(t, err)
+		cancels[shardIdx][0] = cancel
 
 		// Set peer count for first node
 		shards[shardIdx][0].pubsub.peerCount = numNodesPerShard - 1
@@ -2296,7 +2118,6 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 		// Start remaining nodes in shard one at a time
 		for nodeIdx := 1; nodeIdx < numNodesPerShard; nodeIdx++ {
 			shards[shardIdx][nodeIdx].pubsub.peerCount = numNodesPerShard - 1
-			quits[shardIdx][nodeIdx] = make(chan struct{})
 		}
 	}
 
@@ -2356,7 +2177,11 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 	for shardIdx := 0; shardIdx < numShards; shardIdx++ {
 		for nodeIdx := 0; nodeIdx < numNodesPerShard; nodeIdx++ {
 			// Start engine
-			shards[shardIdx][nodeIdx].engine.Start(quits[shardIdx][nodeIdx])
+			ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+
+			err := shards[shardIdx][nodeIdx].engine.Start(ctx)
+			require.NoError(t, err)
+			cancels[shardIdx][nodeIdx] = cancel
 		}
 	}
 
@@ -2488,7 +2313,7 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 	for shardIdx := 0; shardIdx < numShards; shardIdx++ {
 		for nodeIdx := 0; nodeIdx < numNodesPerShard; nodeIdx++ {
 			node := shards[shardIdx][nodeIdx]
-
+			cancels[shardIdx][nodeIdx]()
 			// Stop engine
 			node.engine.Stop(false)
 			// Frame number is likely wrong, but irrelevant for the test
@@ -2875,6 +2700,7 @@ func TestAppConsensusEngine_Integration_NoProversStaysInLoading(t *testing.T) {
 		clockStore := store.NewPebbleClockStore(pebbleDB, logger)
 		inboxStore := store.NewPebbleInboxStore(pebbleDB, logger)
 		shardsStore := store.NewPebbleShardsStore(pebbleDB, logger)
+		consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
 
 		// Create prover registry - but don't register any provers
 		proverRegistry, err := provers.NewProverRegistry(zap.NewNop(), hg)
@@ -2950,6 +2776,7 @@ func TestAppConsensusEngine_Integration_NoProversStaysInLoading(t *testing.T) {
 			inboxStore,
 			shardsStore,
 			hypergraphStore,
+			consensusStore,
 			frameProver,
 			inclusionProver,
 			bulletproofs.NewBulletproofProver(), // bulletproofProver
@@ -2967,7 +2794,7 @@ func TestAppConsensusEngine_Integration_NoProversStaysInLoading(t *testing.T) {
 			qp2p.NewInMemoryPeerInfoManager(logger),
 			appTimeReel,
 			globalTimeReel,
-			&mocks.MockBlsConstructor{},
+			bc,
 			channel.NewDoubleRatchetEncryptedChannel(),
 			nil,
 		)
@@ -2991,9 +2818,13 @@ func TestAppConsensusEngine_Integration_NoProversStaysInLoading(t *testing.T) {
 		pubsubs[i].mu.Unlock()
 	}
 
+	cancels := []func(){}
 	// Start all engines
 	for i := 0; i < numNodes; i++ {
-		errChan := engines[i].Start(quits[i])
+		ctx, cancel, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+		err := engines[i].Start(ctx)
+		require.NoError(t, err)
+		cancels = append(cancels, cancel)
 		select {
 		case err := <-errChan:
 			require.NoError(t, err)
@@ -3018,6 +2849,7 @@ func TestAppConsensusEngine_Integration_NoProversStaysInLoading(t *testing.T) {
 
 	// Stop all engines
 	for i := 0; i < numNodes; i++ {
+		cancels[i]()
 		<-engines[i].Stop(false)
 	}
 
@@ -3077,6 +2909,9 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 
 	// Create shards store
 	shardsStore := store.NewPebbleShardsStore(pebbleDB, logger)
+
+	// Create consensus store
+	consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
 
 	// Create concrete components
 	frameProver := vdf.NewWesolowskiFrameProver(logger)
@@ -3151,6 +2986,7 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 		inboxStore,
 		shardsStore,
 		hypergraphStore,
+		consensusStore,
 		frameProver,
 		inclusionProver,
 		bulletproof,
@@ -3165,7 +3001,7 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 		globalFrameValidator,
 		difficultyAdjuster,
 		rewardIssuance,
-		&mocks.MockBlsConstructor{},
+		bc,
 		channel.NewDoubleRatchetEncryptedChannel(),
 	)
 
@@ -3179,8 +3015,9 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 	mockGSC := &mockGlobalClientLocks{}
 	engine.SetGlobalClient(mockGSC)
 
-	quit := make(chan struct{})
-	errChan := engine.Start(quit)
+	ctx, cancel, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+	err = engine.Start(ctx)
+	require.NoError(t, err)
 
 	select {
 	case err := <-errChan:
@@ -3203,14 +3040,14 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 			typePrefix := binary.BigEndian.Uint32(data[:4])
 
 			// Check if it's a GlobalFrame
-			if typePrefix == protobufs.AppShardFrameType {
-				frame := &protobufs.AppShardFrame{}
+			if typePrefix == protobufs.AppShardProposalType {
+				frame := &protobufs.AppShardProposal{}
 				if err := frame.FromCanonicalBytes(data); err == nil {
 					mu.Lock()
 					if afterAlert {
-						afterAlertFrames = append(afterAlertFrames, frame)
+						afterAlertFrames = append(afterAlertFrames, frame.State)
 					} else {
-						publishedFrames = append(publishedFrames, frame)
+						publishedFrames = append(publishedFrames, frame.State)
 					}
 					mu.Unlock()
 				}
@@ -3258,6 +3095,6 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 	require.Equal(t, 0, afterAlertCount)
 
 	// Stop
-	engine.UnregisterExecutor("test-executor", 0, false)
+	cancel()
 	engine.Stop(false)
 }

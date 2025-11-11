@@ -1,7 +1,10 @@
 package app
 
 import (
+	"context"
+
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/global"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/manager"
@@ -81,22 +84,37 @@ func (d *DHTNode) Stop() {
 	}()
 }
 
-func (m *MasterNode) Start(quitCh chan struct{}) error {
+func (m *MasterNode) Start(ctx context.Context) <-chan error {
+	errChan := make(chan error)
+
 	// Start the global consensus engine
-	m.quit = quitCh
-	errChan := m.globalConsensus.Start(quitCh)
-	select {
-	case err := <-errChan:
-		if err != nil {
-			return err
-		}
+	supervisor, err := lifecycle.NewSupervisor(
+		[]*lifecycle.Node{
+			&lifecycle.Node{
+				Name: "master node",
+				Factory: func() (lifecycle.Component, error) {
+					return m.globalConsensus, nil
+				},
+				OnError: func(err error) lifecycle.ErrorHandlingBehavior {
+					return lifecycle.ErrorShouldShutdown
+				},
+			},
+		},
+	)
+	if err != nil {
+		go func() {
+			errChan <- err
+		}()
+		return errChan
 	}
+
+	go func() {
+		errChan <- supervisor.Start(ctx)
+	}()
 
 	m.logger.Info("master node started", zap.Uint("core_id", m.coreId))
 
-	// Wait for shutdown signal
-	<-m.quit
-	return nil
+	return errChan
 }
 
 func (m *MasterNode) Stop() {

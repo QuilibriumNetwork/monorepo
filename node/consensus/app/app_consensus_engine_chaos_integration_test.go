@@ -27,6 +27,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/difficulty"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/fees"
@@ -219,6 +220,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		nodeClockStore := store.NewPebbleClockStore(nodeDB, logger)
 		nodeInboxStore := store.NewPebbleInboxStore(nodeDB, logger)
 		nodeShardsStore := store.NewPebbleShardsStore(nodeDB, logger)
+		nodeConsensusStore := store.NewPebbleConsensusStore(nodeDB, logger)
 		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{})
 
 		// Create mock pubsub for network simulation
@@ -261,6 +263,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 			nodeInboxStore,
 			nodeShardsStore,
 			nodeHypergraphStore,
+			nodeConsensusStore,
 			frameProver,
 			nodeInclusionProver,
 			bulletproofs.NewBulletproofProver(),
@@ -327,10 +330,10 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 		// Subscribe to frames
 		pubsub.Subscribe(engine.getConsensusMessageBitmask(), func(message *pb.Message) error {
-			frame := &protobufs.AppShardFrame{}
+			frame := &protobufs.AppShardProposal{}
 			if err := frame.FromCanonicalBytes(message.Data); err == nil {
 				node.mu.Lock()
-				node.frameHistory = append(node.frameHistory, frame)
+				node.frameHistory = append(node.frameHistory, frame.State)
 				node.mu.Unlock()
 			}
 			return nil
@@ -350,8 +353,12 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 	// Start all nodes
 	t.Log("Step 4: Starting all nodes")
+	cancels := []func(){}
 	for _, node := range nodes {
-		node.engine.Start(node.quit)
+		ctx, cancel, _ := lifecycle.WithSignallerAndCancel(context.Background())
+		err := node.engine.Start(ctx)
+		require.NoError(t, err)
+		cancels = append(cancels, cancel)
 	}
 
 	// Wait for genesis
@@ -657,14 +664,16 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 						voterAddress := nodes[nodeIdx].engine.getAddressFromPublicKey(publicKey)
 
 						// Create vote message
-						vote := &protobufs.FrameVote{
+						vote := &protobufs.ProposalVote{
 							FrameNumber: frame.Header.FrameNumber,
-							Proposer:    frame.Header.Prover,
-							Approve:     true,
+							Filter:      frame.Header.Address,
+							Rank:        frame.GetRank(),
+							Selector:    []byte(frame.Identity()),
 							PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
 								Address:   voterAddress,
 								Signature: sig,
 							},
+							Timestamp: uint64(time.Now().UnixMilli()),
 						}
 
 						// Serialize and publish
@@ -979,13 +988,6 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 	// Stop all nodes
 	t.Log("\nStep 8: Cleanup")
 	for i, node := range nodes {
-		// Unregister executors
-		node.mu.RLock()
-		for name := range node.executors {
-			node.engine.UnregisterExecutor(name, 0, true)
-		}
-		node.mu.RUnlock()
-
 		// Stop engine
 		node.engine.Stop(true)
 		close(node.quit)

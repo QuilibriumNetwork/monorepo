@@ -4,12 +4,14 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/events"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/compiler"
-	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
+	tconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
@@ -28,18 +30,19 @@ type ConsensusEngineFactory struct {
 	keyStore           store.KeyStore
 	frameProver        crypto.FrameProver
 	inclusionProver    crypto.InclusionProver
-	signerRegistry     consensus.SignerRegistry
-	proverRegistry     consensus.ProverRegistry
-	dynamicFeeManager  consensus.DynamicFeeManager
-	appFrameValidator  consensus.AppFrameValidator
-	frameValidator     consensus.GlobalFrameValidator
-	difficultyAdjuster consensus.DifficultyAdjuster
-	rewardIssuance     consensus.RewardIssuance
+	signerRegistry     tconsensus.SignerRegistry
+	proverRegistry     tconsensus.ProverRegistry
+	dynamicFeeManager  tconsensus.DynamicFeeManager
+	appFrameValidator  tconsensus.AppFrameValidator
+	frameValidator     tconsensus.GlobalFrameValidator
+	difficultyAdjuster tconsensus.DifficultyAdjuster
+	rewardIssuance     tconsensus.RewardIssuance
 	clockStore         store.ClockStore
 	inboxStore         store.InboxStore
 	hypergraphStore    store.HypergraphStore
 	shardsStore        store.ShardsStore
 	workerStore        store.WorkerStore
+	consensusStore     consensus.ConsensusStore[*protobufs.ProposalVote]
 	encryptedChannel   channel.EncryptedChannel
 	bulletproofProver  crypto.BulletproofProver
 	verEnc             crypto.VerifiableEncryptor
@@ -59,18 +62,19 @@ func NewConsensusEngineFactory(
 	keyStore store.KeyStore,
 	frameProver crypto.FrameProver,
 	inclusionProver crypto.InclusionProver,
-	signerRegistry consensus.SignerRegistry,
-	proverRegistry consensus.ProverRegistry,
-	dynamicFeeManager consensus.DynamicFeeManager,
-	appFrameValidator consensus.AppFrameValidator,
-	frameValidator consensus.GlobalFrameValidator,
-	difficultyAdjuster consensus.DifficultyAdjuster,
-	rewardIssuance consensus.RewardIssuance,
+	signerRegistry tconsensus.SignerRegistry,
+	proverRegistry tconsensus.ProverRegistry,
+	dynamicFeeManager tconsensus.DynamicFeeManager,
+	appFrameValidator tconsensus.AppFrameValidator,
+	frameValidator tconsensus.GlobalFrameValidator,
+	difficultyAdjuster tconsensus.DifficultyAdjuster,
+	rewardIssuance tconsensus.RewardIssuance,
 	clockStore store.ClockStore,
 	inboxStore store.InboxStore,
 	hypergraphStore store.HypergraphStore,
 	shardsStore store.ShardsStore,
 	workerStore store.WorkerStore,
+	consensusStore consensus.ConsensusStore[*protobufs.ProposalVote],
 	encryptedChannel channel.EncryptedChannel,
 	bulletproofProver crypto.BulletproofProver,
 	verEnc crypto.VerifiableEncryptor,
@@ -103,6 +107,7 @@ func NewConsensusEngineFactory(
 		hypergraphStore:    hypergraphStore,
 		shardsStore:        shardsStore,
 		workerStore:        workerStore,
+		consensusStore:     consensusStore,
 		encryptedChannel:   encryptedChannel,
 		bulletproofProver:  bulletproofProver,
 		verEnc:             verEnc,
@@ -158,6 +163,7 @@ func (f *ConsensusEngineFactory) CreateGlobalConsensusEngine(
 		f.inboxStore,
 		f.hypergraphStore,
 		f.shardsStore,
+		f.consensusStore,
 		f.workerStore,
 		f.encryptedChannel,
 		f.bulletproofProver,

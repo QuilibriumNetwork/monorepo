@@ -33,42 +33,42 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 	typePrefix := binary.BigEndian.Uint32(message.Data[:4])
 
 	switch typePrefix {
-	case protobufs.AppShardFrameType:
+	case protobufs.AppShardProposalType:
 		timer := prometheus.NewTimer(
 			proposalValidationDuration.WithLabelValues(e.appAddressHex),
 		)
 		defer timer.ObserveDuration()
 
-		frame := &protobufs.AppShardFrame{}
-		if err := frame.FromCanonicalBytes(message.Data); err != nil {
+		proposal := &protobufs.AppShardProposal{}
+		if err := proposal.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
-		if frame.Header == nil {
-			e.logger.Debug("frame has no header")
+		if err := proposal.Validate(); err != nil {
+			e.logger.Error("invalid proposal", zap.Error(err))
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
-		if !bytes.Equal(frame.Header.Address, e.appAddress) {
+		if !bytes.Equal(proposal.State.Header.Address, e.appAddress) {
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}
 
-		if frametime.AppFrameSince(frame) > 20*time.Second {
+		if e.forks.FinalizedRank() > proposal.GetRank() {
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}
 
-		if frame.Header.PublicKeySignatureBls48581 != nil {
+		if proposal.State.Header.PublicKeySignatureBls48581 != nil {
 			e.logger.Debug("frame validation has signature")
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
-		valid, err := e.frameValidator.Validate(frame)
+		valid, err := e.frameValidator.Validate(proposal.State)
 		if err != nil {
 			e.logger.Debug("frame validation error", zap.Error(err))
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
@@ -83,60 +83,20 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		proposalValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 
-	case protobufs.ProverLivenessCheckType:
-		timer := prometheus.NewTimer(
-			livenessCheckValidationDuration.WithLabelValues(e.appAddressHex),
-		)
-		defer timer.ObserveDuration()
-
-		livenessCheck := &protobufs.ProverLivenessCheck{}
-		if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
-			livenessCheckValidationTotal.WithLabelValues(
-				e.appAddressHex,
-				"reject",
-			).Inc()
-			return p2p.ValidationResultReject
-		}
-
-		now := time.Now().UnixMilli()
-		if livenessCheck.Timestamp > now+500 ||
-			livenessCheck.Timestamp < now-1000 {
-			livenessCheckValidationTotal.WithLabelValues(
-				e.appAddressHex,
-				"ignore",
-			).Inc()
-			return p2p.ValidationResultIgnore
-		}
-
-		if err := livenessCheck.Validate(); err != nil {
-			e.logger.Debug("failed to validate liveness check", zap.Error(err))
-			livenessCheckValidationTotal.WithLabelValues(
-				e.appAddressHex,
-				"reject",
-			).Inc()
-			return p2p.ValidationResultReject
-		}
-
-		livenessCheckValidationTotal.WithLabelValues(
-			e.appAddressHex,
-			"accept",
-		).Inc()
-
-	case protobufs.FrameVoteType:
+	case protobufs.ProposalVoteType:
 		timer := prometheus.NewTimer(
 			voteValidationDuration.WithLabelValues(e.appAddressHex),
 		)
 		defer timer.ObserveDuration()
 
-		vote := &protobufs.FrameVote{}
+		vote := &protobufs.ProposalVote{}
 		if err := vote.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal vote", zap.Error(err))
 			voteValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
-		now := time.Now().UnixMilli()
+		now := uint64(time.Now().UnixMilli())
 		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
 			voteValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
@@ -150,41 +110,57 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		voteValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 
-	case protobufs.FrameConfirmationType:
+	case protobufs.TimeoutStateType:
 		timer := prometheus.NewTimer(
-			confirmationValidationDuration.WithLabelValues(e.appAddressHex),
+			timeoutStateValidationDuration.WithLabelValues(e.appAddressHex),
 		)
 		defer timer.ObserveDuration()
 
-		confirmation := &protobufs.FrameConfirmation{}
-		if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
-			confirmationValidationTotal.WithLabelValues(
+		timeoutState := &protobufs.TimeoutState{}
+		if err := timeoutState.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal timeout state", zap.Error(err))
+			timeoutStateValidationTotal.WithLabelValues(
 				e.appAddressHex,
 				"reject",
 			).Inc()
 			return p2p.ValidationResultReject
 		}
 
-		now := time.Now().UnixMilli()
-		if confirmation.Timestamp > now+5000 || confirmation.Timestamp < now-5000 {
-			confirmationValidationTotal.WithLabelValues(
+		now := uint64(time.Now().UnixMilli())
+		if timeoutState.Timestamp > now+5000 || timeoutState.Timestamp < now-5000 {
+			timeoutStateValidationTotal.WithLabelValues(
 				e.appAddressHex,
 				"ignore",
 			).Inc()
 			return p2p.ValidationResultIgnore
 		}
 
-		if err := confirmation.Validate(); err != nil {
-			e.logger.Debug("failed to validate confirmation", zap.Error(err))
-			confirmationValidationTotal.WithLabelValues(
+		if err := timeoutState.Validate(); err != nil {
+			e.logger.Debug("failed to validate timeout state", zap.Error(err))
+			timeoutStateValidationTotal.WithLabelValues(
 				e.appAddressHex,
 				"reject",
 			).Inc()
 			return p2p.ValidationResultReject
 		}
 
-		confirmationValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
+		timeoutStateValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
+
+	case protobufs.ProverLivenessCheckType:
+		check := &protobufs.ProverLivenessCheck{}
+		if err := check.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
+			return p2p.ValidationResultReject
+		}
+
+		if err := check.Validate(); err != nil {
+			e.logger.Debug("invalid liveness check", zap.Error(err))
+			return p2p.ValidationResultReject
+		}
+
+		if len(check.Filter) != 0 && !bytes.Equal(check.Filter, e.appAddress) {
+			return p2p.ValidationResultIgnore
+		}
 
 	default:
 		return p2p.ValidationResultReject

@@ -23,31 +23,29 @@ func NewRotatingFileLogger(
 	debug bool,
 	coreId uint,
 	dir string,
-	filename string,
+	maxSize int,
+	maxBackups int,
+	maxAge int,
+	compress bool,
 ) (
 	*zap.Logger,
 	io.Closer,
 	error,
 ) {
-	if dir == "" {
-		dir = "./logs"
-	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, nil, err
 	}
 
-	if filename == "" {
-		filename = filenameForCore(coreId)
-	}
+	filename := filenameForCore(coreId)
 
-	path := filepath.Join(dir, filename)
+	logFilePath := filepath.Join(dir, filename)
 
 	rot := &lumberjack.Logger{
-		Filename:   path,
-		MaxSize:    50,   // megabytes per file before rotation
-		MaxBackups: 5,    // number of old files to keep
-		MaxAge:     14,   // days
-		Compress:   true, // gzip old files
+		Filename:   logFilePath,
+		MaxSize:    maxSize,
+		MaxBackups: maxBackups,
+		MaxAge:     maxAge,
+		Compress:   compress,
 	}
 
 	encCfg := zap.NewProductionEncoderConfig()
@@ -59,7 +57,13 @@ func NewRotatingFileLogger(
 	enc := zapcore.NewConsoleEncoder(encCfg)
 
 	ws := zapcore.AddSync(rot)
-	core := zapcore.NewCore(enc, ws, zap.DebugLevel)
+
+	logLevel := zap.InfoLevel
+	if debug {
+		logLevel = zap.DebugLevel
+	}
+
+	core := zapcore.NewCore(enc, ws, logLevel)
 	logger := zap.New(core, zap.AddCaller(), zap.Fields(
 		zap.Uint("coreId", coreId),
 	))

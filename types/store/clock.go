@@ -17,6 +17,55 @@ type ClockStore interface {
 		endFrameNumber uint64,
 	) (TypedIterator[*protobufs.GlobalFrame], error)
 	PutGlobalClockFrame(frame *protobufs.GlobalFrame, txn Transaction) error
+	GetLatestCertifiedGlobalState() (*protobufs.GlobalProposal, error)
+	GetEarliestCertifiedGlobalState() (*protobufs.GlobalProposal, error)
+	GetCertifiedGlobalState(rank uint64) (*protobufs.GlobalProposal, error)
+	RangeCertifiedGlobalStates(
+		startRank uint64,
+		endRank uint64,
+	) (TypedIterator[*protobufs.GlobalProposal], error)
+	PutCertifiedGlobalState(
+		state *protobufs.GlobalProposal,
+		txn Transaction,
+	) error
+	GetLatestQuorumCertificate(
+		filter []byte,
+	) (*protobufs.QuorumCertificate, error)
+	GetEarliestQuorumCertificate(
+		filter []byte,
+	) (*protobufs.QuorumCertificate, error)
+	GetQuorumCertificate(
+		filter []byte,
+		rank uint64,
+	) (*protobufs.QuorumCertificate, error)
+	RangeQuorumCertificates(
+		filter []byte,
+		startRank uint64,
+		endRank uint64,
+	) (TypedIterator[*protobufs.QuorumCertificate], error)
+	PutQuorumCertificate(
+		qc *protobufs.QuorumCertificate,
+		txn Transaction,
+	) error
+	GetLatestTimeoutCertificate(
+		filter []byte,
+	) (*protobufs.TimeoutCertificate, error)
+	GetEarliestTimeoutCertificate(
+		filter []byte,
+	) (*protobufs.TimeoutCertificate, error)
+	GetTimeoutCertificate(
+		filter []byte,
+		rank uint64,
+	) (*protobufs.TimeoutCertificate, error)
+	RangeTimeoutCertificates(
+		filter []byte,
+		startRank uint64,
+		endRank uint64,
+	) (TypedIterator[*protobufs.TimeoutCertificate], error)
+	PutTimeoutCertificate(
+		timeoutCertificate *protobufs.TimeoutCertificate,
+		txn Transaction,
+	) error
 	GetLatestShardClockFrame(
 		filter []byte,
 	) (*protobufs.AppShardFrame, []*tries.RollingFrecencyCritbitTrie, error)
@@ -57,6 +106,25 @@ type ClockStore interface {
 	SetLatestShardClockFrameNumber(
 		filter []byte,
 		frameNumber uint64,
+	) error
+	GetLatestCertifiedAppShardState(
+		filter []byte,
+	) (*protobufs.AppShardProposal, error)
+	GetEarliestCertifiedAppShardState(
+		filter []byte,
+	) (*protobufs.AppShardProposal, error)
+	GetCertifiedAppShardState(
+		filter []byte,
+		rank uint64,
+	) (*protobufs.AppShardProposal, error)
+	RangeCertifiedAppShardStates(
+		filter []byte,
+		startRank uint64,
+		endRank uint64,
+	) (TypedIterator[*protobufs.AppShardProposal], error)
+	PutCertifiedAppShardState(
+		state *protobufs.AppShardProposal,
+		txn Transaction,
 	) error
 	ResetGlobalClockFrames() error
 	ResetShardClockFrames(filter []byte) error
@@ -103,4 +171,22 @@ type ClockStore interface {
 		filter []byte,
 		tree *tries.VectorCommitmentTree,
 	) error
+	PutProposalVote(txn Transaction, vote *protobufs.ProposalVote) error
+	GetProposalVote(filter []byte, rank uint64, identity []byte) (
+		*protobufs.ProposalVote,
+		error,
+	)
+	GetProposalVotes(filter []byte, rank uint64) (
+		[]*protobufs.ProposalVote,
+		error,
+	)
+	PutTimeoutVote(txn Transaction, vote *protobufs.TimeoutState) error
+	GetTimeoutVote(filter []byte, rank uint64, identity []byte) (
+		*protobufs.TimeoutState,
+		error,
+	)
+	GetTimeoutVotes(filter []byte, rank uint64) (
+		[]*protobufs.TimeoutState,
+		error,
+	)
 }

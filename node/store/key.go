@@ -1090,8 +1090,8 @@ func (p *PebbleKeyStore) GetKeyRegistryByProver(
 
 	// Find identity key via cross signatures
 	crossSigData, err := p.GetCrossSignatureByProvingKey(proverKeyAddress)
-	if err == nil && len(crossSigData) > 0 {
-		identityKeyAddress := crossSigData[:32]
+	if err == nil && len(crossSigData) > 74 {
+		identityKeyAddress := crossSigData[:len(crossSigData)-74]
 
 		// Get the identity key
 		identityKey, err := p.GetIdentityKey(identityKeyAddress)
@@ -1099,14 +1099,14 @@ func (p *PebbleKeyStore) GetKeyRegistryByProver(
 			registry.IdentityKey = identityKey
 
 			// Get the signatures
-			registry.IdentityToProver = &protobufs.Ed448Signature{
-				Signature: crossSigData[32:],
-			}
 
+			registry.ProverToIdentity = &protobufs.BLS48581Signature{
+				Signature: crossSigData[len(crossSigData)-74:],
+			}
 			// Get reverse signature
-			proverSigData, err := p.GetCrossSignatureByProvingKey(proverKeyAddress)
+			proverSigData, err := p.GetCrossSignatureByProvingKey(identityKeyAddress)
 			if err == nil {
-				registry.ProverToIdentity = &protobufs.BLS48581Signature{
+				registry.IdentityToProver = &protobufs.Ed448Signature{
 					Signature: proverSigData[32:],
 				}
 			}

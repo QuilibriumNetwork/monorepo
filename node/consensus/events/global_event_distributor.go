@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 )
@@ -34,52 +35,33 @@ func NewGlobalEventDistributor(
 }
 
 // Start begins the event processing loop
-func (g *GlobalEventDistributor) Start(ctx context.Context) error {
+func (g *GlobalEventDistributor) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if g.running {
-		return nil
-	}
-
-	g.ctx, g.cancel = context.WithCancel(ctx)
+	g.ctx = ctx
 	g.running = true
 	g.startTime = time.Now()
 
 	distributorStartsTotal.WithLabelValues("global").Inc()
-
-	g.wg.Add(1)
+	g.mu.Unlock()
+	ready()
+	g.wg.Add(2)
 	go g.processEvents()
-
 	go g.trackUptime()
 
-	return nil
-}
-
-// Stop gracefully shuts down the distributor
-func (g *GlobalEventDistributor) Stop() error {
-	g.mu.Lock()
-	if !g.running {
-		g.mu.Unlock()
-		return nil
-	}
-	g.running = false
-	g.mu.Unlock()
-
-	g.cancel()
+	<-ctx.Done()
 	g.wg.Wait()
-
 	g.mu.Lock()
+	g.running = false
 	for _, ch := range g.subscribers {
 		close(ch)
 	}
 	g.subscribers = make(map[string]chan consensus.ControlEvent)
-	g.mu.Unlock()
-
 	distributorStopsTotal.WithLabelValues("global").Inc()
 	distributorUptime.WithLabelValues("global").Set(0)
-
-	return nil
+	g.mu.Unlock()
 }
 
 // Subscribe registers a new subscriber
@@ -194,6 +176,7 @@ func (g *GlobalEventDistributor) broadcast(event consensus.ControlEvent) {
 
 // trackUptime periodically updates the uptime metric
 func (g *GlobalEventDistributor) trackUptime() {
+	defer g.wg.Done()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 

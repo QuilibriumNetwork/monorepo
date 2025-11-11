@@ -4,6 +4,7 @@ import (
 	"math/big"
 
 	"github.com/stretchr/testify/mock"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution"
@@ -117,15 +118,11 @@ func (m *MockShardExecutionEngine) ProcessMessage(
 }
 
 // Start implements execution.ShardExecutionEngine.
-func (m *MockShardExecutionEngine) Start() <-chan error {
-	args := m.Called()
-	return args.Get(0).(chan error)
-}
-
-// Stop implements execution.ShardExecutionEngine.
-func (m *MockShardExecutionEngine) Stop(force bool) <-chan error {
-	args := m.Called(force)
-	return args.Get(0).(chan error)
+func (m *MockShardExecutionEngine) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	m.Called(ctx, ready)
 }
 
 var _ execution.ShardExecutionEngine = (*MockShardExecutionEngine)(nil)

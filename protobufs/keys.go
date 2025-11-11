@@ -103,10 +103,10 @@ func (s *SignedX448Key) Validate() error {
 				"validate",
 			)
 		}
-		// Ed448Signature has its own Validate method
-		if err := sig.Ed448Signature.Validate(); err != nil {
+
+		if len(sig.Ed448Signature.Signature) != 114 {
 			return errors.Wrap(
-				errors.Wrap(err, "ed448 signature"),
+				errors.New("invalid ed448 signature"),
 				"validate",
 			)
 		}
@@ -124,13 +124,6 @@ func (s *SignedX448Key) Validate() error {
 				"validate",
 			)
 		}
-		if sig.BlsSignature.PublicKey != nil &&
-			len(sig.BlsSignature.PublicKey.KeyValue) != 585 {
-			return errors.Wrap(
-				errors.New("invalid bls public key length"),
-				"validate",
-			)
-		}
 	case *SignedX448Key_DecafSignature:
 		if sig.DecafSignature == nil {
 			return errors.Wrap(
@@ -142,13 +135,6 @@ func (s *SignedX448Key) Validate() error {
 		if len(sig.DecafSignature.Signature) != 112 {
 			return errors.Wrap(
 				errors.New("invalid decaf signature length"),
-				"validate",
-			)
-		}
-		if sig.DecafSignature.PublicKey != nil &&
-			len(sig.DecafSignature.PublicKey.KeyValue) != 56 {
-			return errors.Wrap(
-				errors.New("invalid decaf public key length"),
 				"validate",
 			)
 		}
@@ -203,10 +189,10 @@ func (s *SignedDecaf448Key) Validate() error {
 				"validate",
 			)
 		}
-		// Ed448Signature has its own Validate method
-		if err := sig.Ed448Signature.Validate(); err != nil {
+
+		if len(sig.Ed448Signature.Signature) != 114 {
 			return errors.Wrap(
-				errors.Wrap(err, "ed448 signature"),
+				errors.New("invalid ed448 signature"),
 				"validate",
 			)
 		}
@@ -224,13 +210,6 @@ func (s *SignedDecaf448Key) Validate() error {
 				"validate",
 			)
 		}
-		if sig.BlsSignature.PublicKey != nil &&
-			len(sig.BlsSignature.PublicKey.KeyValue) != 585 {
-			return errors.Wrap(
-				errors.New("invalid bls public key length"),
-				"validate",
-			)
-		}
 	case *SignedDecaf448Key_DecafSignature:
 		if sig.DecafSignature == nil {
 			return errors.Wrap(
@@ -242,13 +221,6 @@ func (s *SignedDecaf448Key) Validate() error {
 		if len(sig.DecafSignature.Signature) != 112 {
 			return errors.Wrap(
 				errors.New("invalid decaf signature length"),
-				"validate",
-			)
-		}
-		if sig.DecafSignature.PublicKey != nil &&
-			len(sig.DecafSignature.PublicKey.KeyValue) != 56 {
-			return errors.Wrap(
-				errors.New("invalid decaf public key length"),
 				"validate",
 			)
 		}
@@ -317,6 +289,10 @@ func (k *KeyRegistry) Validate() error {
 
 func (s *BLS48581AggregateSignature) Identity() string {
 	return string(s.GetPublicKey().GetKeyValue())
+}
+
+func (s *BLS48581AggregateSignature) GetPubKey() []byte {
+	return s.PublicKey.KeyValue
 }
 
 func (s *BLS48581Signature) Verify(

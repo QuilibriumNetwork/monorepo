@@ -2,6 +2,7 @@ package global
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math/rand"
@@ -14,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
@@ -24,19 +26,15 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 )
 
-func (e *GlobalConsensusEngine) eventDistributorLoop() {
+func (e *GlobalConsensusEngine) eventDistributorLoop(
+	ctx lifecycle.SignalerContext,
+) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.logger.Error("fatal error encountered", zap.Any("panic", r))
-			if e.cancel != nil {
-				e.cancel()
-			}
-			go func() {
-				e.Stop(false)
-			}()
+			ctx.Throw(errors.Errorf("fatal unhandled error encountered: %v", r))
 		}
 	}()
-	defer e.wg.Done()
 
 	// Subscribe to events from the event distributor
 	eventCh := e.eventDistributor.Subscribe("global")
@@ -44,7 +42,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -94,7 +92,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 								allocated = allocated && w.Allocated
 							}
 							if !allocated {
-								e.evaluateForProposals(data)
+								e.evaluateForProposals(ctx, data)
 							}
 						}
 					}
@@ -204,18 +202,10 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 				if ok && data.Message != "" {
 					e.logger.Error(data.Message)
 					e.halt()
-					if e.stateMachine != nil {
-						if err := e.stateMachine.Stop(); err != nil {
-							e.logger.Error(
-								"error occurred while halting consensus",
-								zap.Error(err),
-							)
-						}
-					}
 					go func() {
 						for {
 							select {
-							case <-e.ctx.Done():
+							case <-ctx.Done():
 								return
 							case <-time.After(10 * time.Second):
 								e.logger.Error(
@@ -234,18 +224,10 @@ func (e *GlobalConsensusEngine) eventDistributorLoop() {
 						zap.Error(data.Error),
 					)
 					e.halt()
-					if e.stateMachine != nil {
-						if err := e.stateMachine.Stop(); err != nil {
-							e.logger.Error(
-								"error occurred while halting consensus",
-								zap.Error(err),
-							)
-						}
-					}
 					go func() {
 						for {
 							select {
-							case <-e.ctx.Done():
+							case <-ctx.Done():
 								return
 							case <-time.After(10 * time.Second):
 								e.logger.Error(
@@ -376,6 +358,7 @@ func (e *GlobalConsensusEngine) estimateSeniorityFromConfig() uint64 {
 }
 
 func (e *GlobalConsensusEngine) evaluateForProposals(
+	ctx context.Context,
 	data *consensustime.GlobalEvent,
 ) {
 	self, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
@@ -412,7 +395,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		}
 
 		idx := rand.Int63n(int64(len(ps)))
-		e.syncProvider.hyperSyncWithProver(ps[idx].Address, key)
+		e.syncProvider.hyperSyncWithProver(ctx, ps[idx].Address, key)
 
 		for _, shard := range shards {
 			path := []int{}
@@ -461,7 +444,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 
 			size := e.hypergraph.GetSize(&key, path)
 			resp, err := e.hypergraph.GetChildrenForPath(
-				e.ctx,
+				ctx,
 				&protobufs.GetChildrenForPathRequest{
 					ShardKey: slices.Concat(key.L1[:], key.L2[:]),
 					Path:     shard.Path,
@@ -676,6 +659,7 @@ func (e *GlobalConsensusEngine) publishKeyRegistry() {
 		return
 	}
 	registry := &protobufs.KeyRegistry{
+		LastUpdated: uint64(time.Now().UnixMilli()),
 		IdentityKey: &protobufs.Ed448PublicKey{
 			KeyValue: e.pubsub.GetPublicKey(),
 		},

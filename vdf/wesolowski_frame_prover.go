@@ -374,6 +374,7 @@ func (w *WesolowskiFrameProver) ProveGlobalFrameHeader(
 	previousFrame *protobufs.GlobalFrameHeader,
 	commitments [][]byte,
 	proverRoot []byte,
+	requestRoot []byte,
 	provingKey qcrypto.Signer,
 	timestamp int64,
 	difficulty uint32,
@@ -410,6 +411,7 @@ func (w *WesolowskiFrameProver) ProveGlobalFrameHeader(
 	}
 
 	input = append(input, proverRoot...)
+	input = append(input, requestRoot...)
 
 	b := sha3.Sum256(input)
 	o := WesolowskiSolve(b, difficulty)
@@ -433,6 +435,7 @@ func (w *WesolowskiFrameProver) ProveGlobalFrameHeader(
 		ParentSelector:       parent.FillBytes(make([]byte, 32)),
 		GlobalCommitments:    commitments,
 		ProverTreeCommitment: proverRoot,
+		RequestsRoot:         requestRoot,
 	}
 
 	switch pubkeyType {
@@ -489,6 +492,7 @@ func (w *WesolowskiFrameProver) GetGlobalFrameSignaturePayload(
 	}
 
 	input = append(input, frame.ProverTreeCommitment...)
+	input = append(input, frame.RequestsRoot...)
 
 	b := sha3.Sum256(input)
 	proof := [516]byte{}

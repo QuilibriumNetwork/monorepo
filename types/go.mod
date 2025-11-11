@@ -12,6 +12,8 @@ replace source.quilibrium.com/quilibrium/monorepo/config => ../config
 
 replace source.quilibrium.com/quilibrium/monorepo/utils => ../utils
 
+replace source.quilibrium.com/quilibrium/monorepo/lifecycle => ../lifecycle
+
 replace github.com/multiformats/go-multiaddr => ../go-multiaddr
 
 replace github.com/multiformats/go-multiaddr-dns => ../go-multiaddr-dns

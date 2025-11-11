@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"time"
@@ -9,6 +10,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
 
@@ -18,8 +21,8 @@ type AppLeaderProvider struct {
 }
 
 func (p *AppLeaderProvider) GetNextLeaders(
-	prior **protobufs.AppShardFrame,
 	ctx context.Context,
+	prior **protobufs.AppShardFrame,
 ) ([]PeerID, error) {
 	// Get the parent selector for next prover calculation
 	var parentSelector []byte
@@ -58,36 +61,77 @@ func (p *AppLeaderProvider) GetNextLeaders(
 }
 
 func (p *AppLeaderProvider) ProveNextState(
-	prior **protobufs.AppShardFrame,
-	collected CollectedCommitments,
 	ctx context.Context,
+	rank uint64,
+	filter []byte,
+	priorState models.Identity,
 ) (**protobufs.AppShardFrame, error) {
 	timer := prometheus.NewTimer(frameProvingDuration.WithLabelValues(
 		p.engine.appAddressHex,
 	))
 	defer timer.ObserveDuration()
 
-	if prior == nil || *prior == nil {
-		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
-		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
+	prior, _, err := p.engine.clockStore.GetLatestShardClockFrame(
+		p.engine.appAddress,
+	)
+	if err != nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
+	}
+
+	if prior == nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("missing prior frame")
+	}
+
+	if prior.Identity() != priorState {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf(
+			"building on fork or needs sync: frame %d, rank %d, parent_id: %x, asked: rank %d, id: %x",
+			prior.Header.FrameNumber,
+			prior.Header.Rank,
+			prior.Header.ParentSelector,
+			rank,
+			priorState,
+		)
+	}
+
+	// Get prover index
+	provers, err := p.engine.proverRegistry.GetActiveProvers(p.engine.appAddress)
+	if err != nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, errors.Wrap(err, "prove next state")
+	}
+
+	found := false
+	for _, prover := range provers {
+		if bytes.Equal(prover.Address, p.engine.getProverAddress()) {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("not a prover")
 	}
 
 	// Get collected messages to include in frame
-	p.engine.pendingMessagesMu.RLock()
-	messages := make([]*protobufs.Message, len(p.engine.collectedMessages[string(
-		collected.commitmentHash[:32],
-	)]))
-	copy(messages, p.engine.collectedMessages[string(
-		collected.commitmentHash[:32],
-	)])
-	p.engine.pendingMessagesMu.RUnlock()
+	p.engine.provingMessagesMu.Lock()
+	messages := make([]*protobufs.Message, len(p.engine.provingMessages))
+	copy(messages, p.engine.provingMessages)
+	p.engine.provingMessages = []*protobufs.Message{}
+	p.engine.provingMessagesMu.Unlock()
 
-	// Clear collected messages after copying
-	p.engine.collectedMessagesMu.Lock()
-	p.engine.collectedMessages[string(
-		collected.commitmentHash[:32],
-	)] = []*protobufs.Message{}
-	p.engine.collectedMessagesMu.Unlock()
+	if len(messages) == 0 {
+		p.engine.collectedMessagesMu.Lock()
+		if len(p.engine.collectedMessages) > 0 {
+			messages = make([]*protobufs.Message, len(p.engine.collectedMessages))
+			copy(messages, p.engine.collectedMessages)
+			p.engine.collectedMessages = []*protobufs.Message{}
+		}
+		p.engine.collectedMessagesMu.Unlock()
+	}
 
 	// Update pending messages metric
 	pendingMessagesCount.WithLabelValues(p.engine.appAddressHex).Set(0)
@@ -99,7 +143,7 @@ func (p *AppLeaderProvider) ProveNextState(
 	)
 
 	// Prove the frame
-	newFrame, err := p.engine.internalProveFrame(messages, (*prior))
+	newFrame, err := p.engine.internalProveFrame(rank, messages, prior)
 	if err != nil {
 		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
 		return nil, errors.Wrap(err, "prove frame")
@@ -122,3 +166,9 @@ func (p *AppLeaderProvider) ProveNextState(
 
 	return &newFrame, nil
 }
+
+var _ consensus.LeaderProvider[
+	*protobufs.AppShardFrame,
+	PeerID,
+	CollectedCommitments,
+] = (*AppLeaderProvider)(nil)

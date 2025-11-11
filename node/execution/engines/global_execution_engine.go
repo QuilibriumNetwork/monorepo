@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -46,7 +47,7 @@ type GlobalExecutionEngine struct {
 	intrinsics      map[string]intrinsics.Intrinsic
 	intrinsicsMutex sync.RWMutex
 	mu              sync.RWMutex
-	stopChan        chan struct{}
+	ctx             lifecycle.SignalerContext
 }
 
 func NewGlobalExecutionEngine(
@@ -119,45 +120,15 @@ func (e *GlobalExecutionEngine) GetCapabilities() []*protobufs.Capability {
 	}
 }
 
-func (e *GlobalExecutionEngine) Start() <-chan error {
-	errChan := make(chan error, 1)
-
-	e.mu.Lock()
-	e.stopChan = make(chan struct{}, 1)
-	e.mu.Unlock()
-
-	go func() {
-		e.logger.Info("starting global execution engine")
-
-		<-e.stopChan
-		e.logger.Info("stopping global execution engine")
-	}()
-
-	return errChan
-}
-
-func (e *GlobalExecutionEngine) Stop(force bool) <-chan error {
-	errChan := make(chan error, 1)
-
-	go func() {
-		e.logger.Info("stopping global execution engine", zap.Bool("force", force))
-
-		// Signal stop if we have a stopChan
-		e.mu.RLock()
-		if e.stopChan != nil {
-			select {
-			case <-e.stopChan:
-				// Already closed
-			default:
-				close(e.stopChan)
-			}
-		}
-		e.mu.RUnlock()
-
-		close(errChan)
-	}()
-
-	return errChan
+func (e *GlobalExecutionEngine) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	e.ctx = ctx
+	e.logger.Info("starting global execution engine")
+	ready()
+	<-e.ctx.Done()
+	e.logger.Info("stopping global execution engine")
 }
 
 func (e *GlobalExecutionEngine) ValidateMessage(
@@ -217,49 +188,54 @@ func (e *GlobalExecutionEngine) validateBundle(
 
 	// Validate each operation in the bundle sequentially
 	for i, op := range bundle.Requests {
-		e.logger.Debug(
-			"validating bundled operation",
-			zap.Int("operation", i),
-			zap.String("address", hex.EncodeToString(address)),
-		)
-
-		// Check if this is a global operation type
-		isGlobalOp := op.GetJoin() != nil ||
-			op.GetLeave() != nil ||
-			op.GetPause() != nil ||
-			op.GetResume() != nil ||
-			op.GetConfirm() != nil ||
-			op.GetReject() != nil ||
-			op.GetKick() != nil ||
-			op.GetUpdate() != nil ||
-			op.GetShard() != nil
-
-		if !isGlobalOp {
-			if e.config.Network == 0 &&
-				frameNumber <= token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END {
-				return errors.Wrap(
-					errors.New("enrollment period has not ended"),
-					"validate bundle",
-				)
-			}
-			// Skip non-global operations (e.g., token payments, compute ops)
-			// They are retained in the bundle for reference but not validated here
+		select {
+		case <-e.ctx.Done():
+			return errors.Wrap(errors.New("context canceled"), "validate bundle")
+		default:
 			e.logger.Debug(
-				"skipping non-global operation in bundle",
+				"validating bundled operation",
 				zap.Int("operation", i),
+				zap.String("address", hex.EncodeToString(address)),
 			)
-			continue
-		}
 
-		// Validate this operation individually
-		err := e.validateIndividualMessage(
-			frameNumber,
-			address,
-			op,
-			true,
-		)
-		if err != nil {
-			return errors.Wrap(err, "validate bundle")
+			// Check if this is a global operation type
+			isGlobalOp := op.GetJoin() != nil ||
+				op.GetLeave() != nil ||
+				op.GetPause() != nil ||
+				op.GetResume() != nil ||
+				op.GetConfirm() != nil ||
+				op.GetReject() != nil ||
+				op.GetKick() != nil ||
+				op.GetUpdate() != nil ||
+				op.GetShard() != nil
+
+			if !isGlobalOp {
+				if e.config.Network == 0 &&
+					frameNumber <= token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END {
+					return errors.Wrap(
+						errors.New("enrollment period has not ended"),
+						"validate bundle",
+					)
+				}
+				// Skip non-global operations (e.g., token payments, compute ops)
+				// They are retained in the bundle for reference but not validated here
+				e.logger.Debug(
+					"skipping non-global operation in bundle",
+					zap.Int("operation", i),
+				)
+				continue
+			}
+
+			// Validate this operation individually
+			err := e.validateIndividualMessage(
+				frameNumber,
+				address,
+				op,
+				true,
+			)
+			if err != nil {
+				return errors.Wrap(err, "validate bundle")
+			}
 		}
 	}
 

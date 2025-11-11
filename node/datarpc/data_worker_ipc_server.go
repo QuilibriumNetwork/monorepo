@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/app"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
@@ -26,6 +27,8 @@ import (
 type DataWorkerIPCServer struct {
 	protobufs.UnimplementedDataIPCServiceServer
 
+	ctx                       lifecycle.SignalerContext
+	cancel                    func()
 	listenAddrGRPC            string
 	config                    *config.Config
 	logger                    *zap.Logger
@@ -130,6 +133,9 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 		r.server = nil
 	}
 	if r.appConsensusEngine != nil {
+		if r.cancel != nil {
+			r.cancel()
+		}
 		<-r.appConsensusEngine.Stop(false)
 		r.appConsensusEngine = nil
 	}
@@ -206,6 +212,12 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 			globalTimeReel,
 			r.server,
 		)
+		r.ctx, r.cancel, _ = lifecycle.WithSignallerAndCancel(context.Background())
+		go func() {
+			if err = r.appConsensusEngine.Start(r.ctx); err != nil {
+				r.logger.Error("error while running", zap.Error(err))
+			}
+		}()
 	}
 	go func() {
 		protobufs.RegisterDataIPCServiceServer(r.server, r)

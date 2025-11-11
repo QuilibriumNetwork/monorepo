@@ -5,23 +5,29 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"math/big"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 // GlobalLeaderProvider implements LeaderProvider
 type GlobalLeaderProvider struct {
-	engine *GlobalConsensusEngine
+	engine    *GlobalConsensusEngine
+	collected GlobalCollectedCommitments
 }
 
 func (p *GlobalLeaderProvider) GetNextLeaders(
-	prior **protobufs.GlobalFrame,
 	ctx context.Context,
+	prior **protobufs.GlobalFrame,
 ) ([]GlobalPeerID, error) {
 	// Get the parent selector for next prover calculation
 	if prior == nil || *prior == nil || (*prior).Header == nil ||
@@ -60,16 +66,62 @@ func (p *GlobalLeaderProvider) GetNextLeaders(
 }
 
 func (p *GlobalLeaderProvider) ProveNextState(
-	prior **protobufs.GlobalFrame,
-	collected GlobalCollectedCommitments,
 	ctx context.Context,
+	rank uint64,
+	filter []byte,
+	priorState models.Identity,
 ) (**protobufs.GlobalFrame, error) {
+	_, err := p.engine.livenessProvider.Collect(ctx)
+	if err != nil {
+		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
+	}
+
 	timer := prometheus.NewTimer(frameProvingDuration)
 	defer timer.ObserveDuration()
 
-	if prior == nil || *prior == nil {
+	prior, err := p.engine.clockStore.GetLatestGlobalClockFrame()
+	if err != nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(errors.New("nil prior frame"), "prove next state")
+		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
+	}
+
+	if prior == nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("missing prior frame")
+	}
+
+	if prior.Identity() != priorState {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf(
+			"building on fork or needs sync: frame %d, rank %d, parent_id: %x, asked: rank %d, id: %x",
+			prior.Header.FrameNumber,
+			prior.Header.Rank,
+			prior.Header.ParentSelector,
+			rank,
+			priorState,
+		)
+	}
+
+	// Get prover index
+	provers, err := p.engine.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, errors.Wrap(err, "prove next state")
+	}
+
+	proverIndex := uint8(0)
+	found := false
+	for i, prover := range provers {
+		if bytes.Equal(prover.Address, p.engine.getProverAddress()) {
+			proverIndex = uint8(i)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("not a prover")
 	}
 
 	p.engine.logger.Info(
@@ -81,16 +133,13 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	signer, _, _, _ := p.engine.GetProvingKey(p.engine.config.Engine)
 	if signer == nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(
-			errors.New("no proving key available"),
-			"prove next state",
-		)
+		return nil, models.NewNoVoteErrorf("not a prover")
 	}
 
 	// Get current timestamp and difficulty
-	timestamp := time.Now().UnixMilli() + 30000
+	timestamp := time.Now().UnixMilli()
 	difficulty := p.engine.difficultyAdjuster.GetNextDifficulty(
-		(*prior).Rank()+1,
+		rank,
 		timestamp,
 	)
 
@@ -103,36 +152,6 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	p.engine.currentDifficulty = uint32(difficulty)
 	p.engine.currentDifficultyMu.Unlock()
 
-	// Get prover index
-	provers, err := p.engine.proverRegistry.GetActiveProvers(nil)
-	if err != nil {
-		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(err, "prove next state")
-	}
-
-	proverIndex := uint8(0)
-	for i, prover := range provers {
-		if bytes.Equal(prover.Address, p.engine.getProverAddress()) {
-			proverIndex = uint8(i)
-			break
-		}
-	}
-
-	// Prove the global frame header
-	newHeader, err := p.engine.frameProver.ProveGlobalFrameHeader(
-		(*prior).Header,
-		p.engine.shardCommitments,
-		p.engine.proverRoot,
-		signer,
-		timestamp,
-		uint32(difficulty),
-		proverIndex,
-	)
-	if err != nil {
-		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(err, "prove next state")
-	}
-
 	// Convert collected messages to MessageBundles
 	requests := make(
 		[]*protobufs.MessageBundle,
@@ -143,6 +162,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		"including messages",
 		zap.Int("message_count", len(p.engine.collectedMessages)),
 	)
+	requestTree := &tries.VectorCommitmentTree{}
 	for _, msgData := range p.engine.collectedMessages {
 		// Check if data is long enough to contain type prefix
 		if len(msgData) < 4 {
@@ -179,8 +199,39 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		if messageBundle.Timestamp == 0 {
 			messageBundle.Timestamp = time.Now().UnixMilli()
 		}
+
+		id := sha3.Sum256(msgData)
+		err := requestTree.Insert(id[:], msgData, nil, big.NewInt(0))
+		if err != nil {
+			p.engine.logger.Warn(
+				"failed to add global request",
+				zap.Error(err),
+			)
+			continue
+		}
+
 		requests = append(requests, messageBundle)
 	}
+
+	requestRoot := requestTree.Commit(p.engine.inclusionProver, false)
+
+	// Prove the global frame header
+	newHeader, err := p.engine.frameProver.ProveGlobalFrameHeader(
+		(*prior).Header,
+		p.engine.shardCommitments,
+		p.engine.proverRoot,
+		requestRoot,
+		signer,
+		timestamp,
+		uint32(difficulty),
+		proverIndex,
+	)
+	if err != nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, errors.Wrap(err, "prove next state")
+	}
+	newHeader.Prover = p.engine.getProverAddress()
+	newHeader.Rank = rank
 
 	// Create the new global frame with requests
 	newFrame := &protobufs.GlobalFrame{
@@ -202,3 +253,5 @@ func (p *GlobalLeaderProvider) ProveNextState(
 
 	return &newFrame, nil
 }
+
+var _ consensus.LeaderProvider[*protobufs.GlobalFrame, GlobalPeerID, GlobalCollectedCommitments] = (*GlobalLeaderProvider)(nil)

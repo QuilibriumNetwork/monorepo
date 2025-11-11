@@ -32,6 +32,8 @@ replace source.quilibrium.com/quilibrium/monorepo/hypergraph => ../hypergraph
 
 replace source.quilibrium.com/quilibrium/monorepo/consensus => ../consensus
 
+replace source.quilibrium.com/quilibrium/monorepo/lifecycle => ../lifecycle
+
 replace source.quilibrium.com/quilibrium/monorepo/rpm => ../rpm
 
 replace github.com/multiformats/go-multiaddr => ../go-multiaddr
@@ -53,6 +55,7 @@ require (
 	github.com/libp2p/go-libp2p v0.41.1
 	github.com/libp2p/go-libp2p-kad-dht v0.23.0
 	github.com/marcopolo/simnet v0.0.1
+	github.com/muesli/reflow v0.3.0
 	github.com/shopspring/decimal v1.4.0
 	google.golang.org/protobuf v1.36.6
 	gopkg.in/yaml.v2 v2.4.0
@@ -84,6 +87,7 @@ require (
 	github.com/deiu/gon3 v0.0.0-20241212124032-93153c038193 // indirect
 	github.com/deiu/rdf2go v0.0.0-20241212211204-b661ba0dfd25 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
+	github.com/gammazero/deque v0.2.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.1.0 // indirect
 	github.com/libp2p/go-libp2p-routing-helpers v0.7.2 // indirect
 	github.com/libp2p/go-yamux/v5 v5.0.1 // indirect
@@ -94,7 +98,6 @@ require (
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
-	github.com/muesli/reflow v0.3.0 // indirect
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
@@ -125,10 +128,12 @@ require (
 	go.opentelemetry.io/otel v1.34.0 // indirect
 	go.opentelemetry.io/otel/metric v1.34.0 // indirect
 	go.opentelemetry.io/otel/trace v1.34.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/mock v0.5.2 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	source.quilibrium.com/quilibrium/monorepo/ferret v0.0.0-00010101000000-000000000000 // indirect
+	source.quilibrium.com/quilibrium/monorepo/lifecycle v0.0.0-00010101000000-000000000000 // indirect
 )
 
 require (
@@ -163,6 +168,7 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/flynn/noise v1.1.0 // indirect
 	github.com/francoispqt/gojay v1.2.13 // indirect
+	github.com/gammazero/workerpool v1.1.3
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
@@ -224,7 +230,7 @@ require (
 	github.com/quic-go/webtransport-go v0.9.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 	github.com/whyrusleeping/go-keyspace v0.0.0-20160322163242-5b898ac5add1 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.uber.org/dig v1.19.0 // indirect
@@ -235,7 +241,7 @@ require (
 	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476
 	golang.org/x/mod v0.25.0 // indirect
 	golang.org/x/net v0.41.0 // indirect
-	golang.org/x/sync v0.15.0
+	golang.org/x/sync v0.17.0
 	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/text v0.26.0 // indirect
 	golang.org/x/tools v0.34.0 // indirect

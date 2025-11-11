@@ -1,6 +1,7 @@
 package engines_test
 
 import (
+	"context"
 	"crypto/rand"
 	"math/big"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/engines"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/hypergraph"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
@@ -48,7 +50,8 @@ func TestHypergraphExecutionEngine_Start(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test starting and stopping the engine
-	errChan := engine.Start()
+	ctx, cancel, errChan := lifecycle.WithSignallerAndCancel(context.Background())
+	engine.Start(ctx, func() {})
 
 	// Engine should start without errors
 	select {
@@ -59,7 +62,8 @@ func TestHypergraphExecutionEngine_Start(t *testing.T) {
 	}
 
 	// Stop the engine
-	<-engine.Stop(false)
+	cancel()
+	<-ctx.Done()
 }
 
 func TestHypergraphExecutionEngine_ProcessMessage_Deploy(t *testing.T) {

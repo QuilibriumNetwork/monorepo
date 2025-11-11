@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"net"
 	"net/netip"
 	"slices"
@@ -27,10 +28,20 @@ import (
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/forks"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/notifications/pubsub"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/participant"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/validator"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/verification"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/aggregator"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/tracing"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/voting"
 	"source.quilibrium.com/quilibrium/monorepo/node/dispatch"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
@@ -47,7 +58,6 @@ import (
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	typesdispatch "source.quilibrium.com/quilibrium/monorepo/types/dispatch"
-	"source.quilibrium.com/quilibrium/monorepo/types/execution"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
@@ -83,6 +93,7 @@ type LockedTransaction struct {
 
 // GlobalConsensusEngine  uses the generic state machine for consensus
 type GlobalConsensusEngine struct {
+	*lifecycle.ComponentManager
 	protobufs.GlobalServiceServer
 
 	logger             *zap.Logger
@@ -93,6 +104,7 @@ type GlobalConsensusEngine struct {
 	keyStore           store.KeyStore
 	clockStore         store.ClockStore
 	shardsStore        store.ShardsStore
+	consensusStore     consensus.ConsensusStore[*protobufs.ProposalVote]
 	frameProver        crypto.FrameProver
 	inclusionProver    crypto.InclusionProver
 	signerRegistry     typesconsensus.SignerRegistry
@@ -105,16 +117,20 @@ type GlobalConsensusEngine struct {
 	eventDistributor   typesconsensus.EventDistributor
 	dispatchService    typesdispatch.DispatchService
 	globalTimeReel     *consensustime.GlobalTimeReel
-	blsConstructor     crypto.BlsConstructor
-	executors          map[string]execution.ShardExecutionEngine
-	executorsMu        sync.RWMutex
-	executionManager   *manager.ExecutionEngineManager
-	mixnet             typesconsensus.Mixnet
-	peerInfoManager    tp2p.PeerInfoManager
-	workerManager      worker.WorkerManager
-	proposer           *provers.Manager
-	alertPublicKey     []byte
-	hasSentKeyBundle   bool
+	forks              consensus.Forks[*protobufs.GlobalFrame]
+	notifier           consensus.Consumer[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]
+	blsConstructor   crypto.BlsConstructor
+	executionManager *manager.ExecutionEngineManager
+	mixnet           typesconsensus.Mixnet
+	peerInfoManager  tp2p.PeerInfoManager
+	workerManager    worker.WorkerManager
+	proposer         *provers.Manager
+	currentRank      uint64
+	alertPublicKey   []byte
+	hasSentKeyBundle bool
 
 	// Message queues
 	globalConsensusMessageQueue chan *pb.Message
@@ -124,42 +140,50 @@ type GlobalConsensusEngine struct {
 	globalAlertMessageQueue     chan *pb.Message
 	appFramesMessageQueue       chan *pb.Message
 	shardConsensusMessageQueue  chan *pb.Message
+	globalProposalQueue         chan *protobufs.GlobalProposal
 
 	// Emergency halt
 	haltCtx context.Context
 	halt    context.CancelFunc
 
 	// Internal state
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	quit                  chan struct{}
-	wg                    sync.WaitGroup
-	minimumProvers        func() uint64
-	blacklistMap          map[string]bool
-	blacklistMu           sync.RWMutex
-	pendingMessages       [][]byte
-	pendingMessagesMu     sync.RWMutex
-	currentDifficulty     uint32
-	currentDifficultyMu   sync.RWMutex
-	lastProvenFrameTime   time.Time
-	lastProvenFrameTimeMu sync.RWMutex
-	frameStore            map[string]*protobufs.GlobalFrame
-	frameStoreMu          sync.RWMutex
-	appFrameStore         map[string]*protobufs.AppShardFrame
-	appFrameStoreMu       sync.RWMutex
-	lowCoverageStreak     map[string]*coverageStreak
+	quit                      chan struct{}
+	wg                        sync.WaitGroup
+	minimumProvers            func() uint64
+	blacklistMap              map[string]bool
+	blacklistMu               sync.RWMutex
+	pendingMessages           [][]byte
+	pendingMessagesMu         sync.RWMutex
+	currentDifficulty         uint32
+	currentDifficultyMu       sync.RWMutex
+	lastProvenFrameTime       time.Time
+	lastProvenFrameTimeMu     sync.RWMutex
+	frameStore                map[string]*protobufs.GlobalFrame
+	frameStoreMu              sync.RWMutex
+	proposalCache             map[uint64]*protobufs.GlobalProposal
+	proposalCacheMu           sync.RWMutex
+	pendingCertifiedParents   map[uint64]*protobufs.GlobalProposal
+	pendingCertifiedParentsMu sync.RWMutex
+	appFrameStore             map[string]*protobufs.AppShardFrame
+	appFrameStoreMu           sync.RWMutex
+	lowCoverageStreak         map[string]*coverageStreak
 
 	// Transaction cross-shard lock tracking
 	txLockMap map[uint64]map[string]map[string]*LockedTransaction
 	txLockMu  sync.RWMutex
 
-	// Generic state machine
-	stateMachine *consensus.StateMachine[
+	// Consensus participant instance
+	consensusParticipant consensus.EventLoop[
 		*protobufs.GlobalFrame,
-		*protobufs.FrameVote,
-		GlobalPeerID,
-		GlobalCollectedCommitments,
+		*protobufs.ProposalVote,
 	]
+
+	// Consensus plugins
+	signatureAggregator         consensus.SignatureAggregator
+	voteCollectorDistributor    *pubsub.VoteCollectorDistributor[*protobufs.ProposalVote]
+	timeoutCollectorDistributor *pubsub.TimeoutCollectorDistributor[*protobufs.ProposalVote]
+	voteAggregator              consensus.VoteAggregator[*protobufs.GlobalFrame, *protobufs.ProposalVote]
+	timeoutAggregator           consensus.TimeoutAggregator[*protobufs.ProposalVote]
 
 	// Provider implementations
 	syncProvider     *GlobalSyncProvider
@@ -194,7 +218,7 @@ func NewGlobalConsensusEngine(
 	logger *zap.Logger,
 	config *config.Config,
 	frameTimeMillis int64,
-	pubsub tp2p.PubSub,
+	ps tp2p.PubSub,
 	hypergraph hypergraph.Hypergraph,
 	keyManager typeskeys.KeyManager,
 	keyStore store.KeyStore,
@@ -213,6 +237,7 @@ func NewGlobalConsensusEngine(
 	inboxStore store.InboxStore,
 	hypergraphStore store.HypergraphStore,
 	shardsStore store.ShardsStore,
+	consensusStore consensus.ConsensusStore[*protobufs.ProposalVote],
 	workerStore store.WorkerStore,
 	encryptedChannel channel.EncryptedChannel,
 	bulletproofProver crypto.BulletproofProver,
@@ -225,12 +250,13 @@ func NewGlobalConsensusEngine(
 	engine := &GlobalConsensusEngine{
 		logger:                      logger,
 		config:                      config,
-		pubsub:                      pubsub,
+		pubsub:                      ps,
 		hypergraph:                  hypergraph,
 		keyManager:                  keyManager,
 		keyStore:                    keyStore,
 		clockStore:                  clockStore,
 		shardsStore:                 shardsStore,
+		consensusStore:              consensusStore,
 		frameProver:                 frameProver,
 		inclusionProver:             inclusionProver,
 		signerRegistry:              signerRegistry,
@@ -244,9 +270,10 @@ func NewGlobalConsensusEngine(
 		eventDistributor:            eventDistributor,
 		globalTimeReel:              globalTimeReel,
 		peerInfoManager:             peerInfoManager,
-		executors:                   make(map[string]execution.ShardExecutionEngine),
 		frameStore:                  make(map[string]*protobufs.GlobalFrame),
 		appFrameStore:               make(map[string]*protobufs.AppShardFrame),
+		proposalCache:               make(map[uint64]*protobufs.GlobalProposal),
+		pendingCertifiedParents:     make(map[uint64]*protobufs.GlobalProposal),
 		globalConsensusMessageQueue: make(chan *pb.Message, 1000),
 		globalFrameMessageQueue:     make(chan *pb.Message, 100),
 		globalProverMessageQueue:    make(chan *pb.Message, 1000),
@@ -254,6 +281,7 @@ func NewGlobalConsensusEngine(
 		globalPeerInfoMessageQueue:  make(chan *pb.Message, 1000),
 		globalAlertMessageQueue:     make(chan *pb.Message, 100),
 		shardConsensusMessageQueue:  make(chan *pb.Message, 10000),
+		globalProposalQueue:         make(chan *protobufs.GlobalProposal, 1000),
 		currentDifficulty:           config.Engine.Difficulty,
 		lastProvenFrameTime:         time.Now(),
 		blacklistMap:                make(map[string]bool),
@@ -300,6 +328,24 @@ func NewGlobalConsensusEngine(
 			return uint64(len(currentSet)) * 2 / 3
 		}
 	}
+
+	// Create provider implementations
+	engine.syncProvider = NewGlobalSyncProvider(engine)
+	engine.votingProvider = &GlobalVotingProvider{engine: engine}
+	engine.leaderProvider = &GlobalLeaderProvider{engine: engine}
+	engine.livenessProvider = &GlobalLivenessProvider{engine: engine}
+	engine.signatureAggregator = aggregator.WrapSignatureAggregator(
+		engine.blsConstructor,
+		engine.proverRegistry,
+		nil,
+	)
+	voteAggregationDistributor := voting.NewGlobalVoteAggregationDistributor()
+	engine.voteCollectorDistributor =
+		voteAggregationDistributor.VoteCollectorDistributor
+	timeoutAggregationDistributor :=
+		voting.NewGlobalTimeoutAggregationDistributor()
+	engine.timeoutCollectorDistributor =
+		timeoutAggregationDistributor.TimeoutCollectorDistributor
 
 	// Create the worker manager
 	engine.workerManager = mgr.NewWorkerManager(
@@ -358,23 +404,12 @@ func NewGlobalConsensusEngine(
 	// Establish alert halt context
 	engine.haltCtx, engine.halt = context.WithCancel(context.Background())
 
-	// Create provider implementations
-	engine.syncProvider = &GlobalSyncProvider{engine: engine}
-	engine.votingProvider = &GlobalVotingProvider{
-		engine: engine,
-		proposalVotes: make(
-			map[consensus.Identity]map[consensus.Identity]**protobufs.FrameVote,
-		),
-	}
-	engine.leaderProvider = &GlobalLeaderProvider{engine: engine}
-	engine.livenessProvider = &GlobalLivenessProvider{engine: engine}
-
 	// Create dispatch service
 	engine.dispatchService = dispatch.NewDispatchService(
 		inboxStore,
 		logger,
 		keyManager,
-		pubsub,
+		ps,
 	)
 
 	// Create execution engine manager
@@ -401,17 +436,6 @@ func NewGlobalConsensusEngine(
 	}
 	engine.executionManager = executionManager
 
-	// Initialize execution engines
-	if err := engine.executionManager.InitializeEngines(); err != nil {
-		return nil, errors.Wrap(err, "new global consensus engine")
-	}
-
-	// Register all execution engines with the consensus engine
-	err = engine.executionManager.RegisterAllEngines(engine.RegisterExecutor)
-	if err != nil {
-		return nil, errors.Wrap(err, "new global consensus engine")
-	}
-
 	// Initialize metrics
 	engineState.Set(0) // EngineStateStopped
 	currentDifficulty.Set(float64(config.Engine.Difficulty))
@@ -422,7 +446,7 @@ func NewGlobalConsensusEngine(
 	engine.hyperSync = hypergraph
 	engine.onionService = onion.NewGRPCTransport(
 		logger,
-		pubsub.GetPeerID(),
+		ps.GetPeerID(),
 		peerInfoManager,
 		signerRegistry,
 	)
@@ -444,211 +468,324 @@ func NewGlobalConsensusEngine(
 
 	// Set up gRPC server with TLS credentials
 	if err := engine.setupGRPCServer(); err != nil {
-		panic(errors.Wrap(err, "failed to setup gRPC server"))
+		return nil, errors.Wrap(err, "failed to setup gRPC server")
 	}
 
-	return engine, nil
-}
+	componentBuilder := lifecycle.NewComponentManagerBuilder()
 
-func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
-	errChan := make(chan error, 1)
-
-	e.quit = quit
-	e.ctx, e.cancel = context.WithCancel(context.Background())
-
-	// Start worker manager background process (if applicable)
-	if !e.config.Engine.ArchiveMode {
-		if err := e.workerManager.Start(e.ctx); err != nil {
-			errChan <- errors.Wrap(err, "start")
-			close(errChan)
-			return errChan
-		}
-	}
-
-	// Start execution engines
-	if err := e.executionManager.StartAll(e.quit); err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	// Start the event distributor
-	if err := e.eventDistributor.Start(e.ctx); err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	err := e.globalTimeReel.Start()
-	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
-	}
-
-	frame, err := e.clockStore.GetLatestGlobalClockFrame()
-	if err != nil {
-		e.logger.Warn(
-			"invalid frame retrieved, will resync",
-			zap.Error(err),
-		)
-	}
-
-	var initialState **protobufs.GlobalFrame = nil
-	if frame != nil {
-		initialState = &frame
-	}
-
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		// Create the generic state machine
-		e.stateMachine = consensus.NewStateMachine(
-			e.getPeerID(),
-			initialState,
-			true,
-			e.minimumProvers,
-			e.syncProvider,
-			e.votingProvider,
-			e.leaderProvider,
-			e.livenessProvider,
-			&GlobalTracer{
-				logger: e.logger.Named("state_machine"),
-			},
-		)
-
-		// Add transition listener
-		e.stateMachine.AddListener(&GlobalTransitionListener{
-			engine: e,
-			logger: e.logger.Named("transitions"),
+	// Add worker manager background process (if applicable)
+	if !engine.config.Engine.ArchiveMode {
+		componentBuilder.AddWorker(func(
+			ctx lifecycle.SignalerContext,
+			ready lifecycle.ReadyFunc,
+		) {
+			if err := engine.workerManager.Start(ctx); err != nil {
+				engine.logger.Error("could not start worker manager", zap.Error(err))
+				ctx.Throw(err)
+				return
+			}
+			ready()
+			<-ctx.Done()
 		})
 	}
 
-	// Confirm initial state
-	if !e.config.Engine.ArchiveMode {
-		latest, err := e.clockStore.GetLatestGlobalClockFrame()
-		if err != nil || latest == nil {
-			e.logger.Info("initializing genesis")
-			e.initializeGenesis()
+	// Add sync provider
+	componentBuilder.AddWorker(engine.syncProvider.Start)
+
+	// Add execution engines
+	componentBuilder.AddWorker(engine.executionManager.Start)
+	componentBuilder.AddWorker(engine.eventDistributor.Start)
+	componentBuilder.AddWorker(engine.globalTimeReel.Start)
+
+	latest, err := engine.consensusStore.GetConsensusState(nil)
+	var state *models.CertifiedState[*protobufs.GlobalFrame]
+	var pending []*models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]
+	if err != nil {
+		frame, qc := engine.initializeGenesis()
+		state = &models.CertifiedState[*protobufs.GlobalFrame]{
+			State: &models.State[*protobufs.GlobalFrame]{
+				Rank:       0,
+				Identifier: frame.Identity(),
+				State:      &frame,
+			},
+			CertifyingQuorumCertificate: qc,
 		}
+		pending = []*models.SignedProposal[
+			*protobufs.GlobalFrame,
+			*protobufs.ProposalVote,
+		]{}
+	} else {
+		qc, err := engine.clockStore.GetQuorumCertificate(nil, latest.FinalizedRank)
+		if err != nil {
+			panic(err)
+		}
+		frame, err := engine.clockStore.GetGlobalClockFrame(
+			qc.GetFrameNumber(),
+		)
+		if err != nil {
+			panic(err)
+		}
+		parentFrame, err := engine.clockStore.GetGlobalClockFrame(
+			qc.GetFrameNumber() - 1,
+		)
+		if err != nil {
+			panic(err)
+		}
+		parentQC, err := engine.clockStore.GetQuorumCertificate(
+			nil,
+			parentFrame.GetRank(),
+		)
+		if err != nil {
+			panic(err)
+		}
+		state = &models.CertifiedState[*protobufs.GlobalFrame]{
+			State: &models.State[*protobufs.GlobalFrame]{
+				Rank:                    frame.GetRank(),
+				Identifier:              frame.Identity(),
+				ProposerID:              frame.Source(),
+				ParentQuorumCertificate: parentQC,
+				Timestamp:               frame.GetTimestamp(),
+				State:                   &frame,
+			},
+			CertifyingQuorumCertificate: qc,
+		}
+		pending = engine.getPendingProposals(frame.Header.FrameNumber)
 	}
 
-	// Subscribe to global consensus if participating
-	err = e.subscribeToGlobalConsensus()
+	liveness, err := engine.consensusStore.GetLivenessState(nil)
+	if err == nil {
+		engine.currentRank = liveness.CurrentRank
+	}
+
+	engine.voteAggregator, err = voting.NewGlobalVoteAggregator[GlobalPeerID](
+		tracing.NewZapTracer(logger),
+		engine,
+		voteAggregationDistributor,
+		engine.signatureAggregator,
+		engine.votingProvider,
+		func(qc models.QuorumCertificate) {
+			select {
+			case <-engine.haltCtx.Done():
+				return
+			default:
+			}
+			engine.consensusParticipant.OnQuorumCertificateConstructedFromVotes(qc)
+		},
+		state.Rank()+1,
+	)
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		return nil, err
+	}
+	engine.timeoutAggregator, err = voting.NewGlobalTimeoutAggregator[GlobalPeerID](
+		tracing.NewZapTracer(logger),
+		engine,
+		engine,
+		engine.signatureAggregator,
+		timeoutAggregationDistributor,
+		engine.votingProvider,
+		state.Rank()+1,
+	)
+
+	notifier := pubsub.NewDistributor[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]()
+	notifier.AddConsumer(engine)
+	engine.notifier = notifier
+
+	forks, err := forks.NewForks(state, engine, notifier)
+	if err != nil {
+		return nil, err
+	}
+
+	engine.forks = forks
+
+	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
+		componentBuilder.AddWorker(func(
+			ctx lifecycle.SignalerContext,
+			ready lifecycle.ReadyFunc,
+		) {
+			if err := engine.startConsensus(state, pending, ctx, ready); err != nil {
+				engine.logger.Error("could not start consensus", zap.Error(err))
+				ctx.Throw(err)
+				return
+			}
+
+			<-ctx.Done()
+			<-lifecycle.AllDone(engine.voteAggregator, engine.timeoutAggregator)
+		})
+	}
+
+	componentBuilder.AddWorker(engine.peerInfoManager.Start)
+
+	// Subscribe to global consensus if participating
+	err = engine.subscribeToGlobalConsensus()
+	if err != nil {
+		return nil, err
 	}
 
 	// Subscribe to shard consensus messages to broker lock agreement
-	err = e.subscribeToShardConsensusMessages()
+	err = engine.subscribeToShardConsensusMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		return nil, errors.Wrap(err, "start")
 	}
 
 	// Subscribe to frames
-	err = e.subscribeToFrameMessages()
+	err = engine.subscribeToFrameMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		return nil, errors.Wrap(err, "start")
 	}
 
 	// Subscribe to prover messages
-	err = e.subscribeToProverMessages()
+	err = engine.subscribeToProverMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		return nil, errors.Wrap(err, "start")
 	}
 
 	// Subscribe to peer info messages
-	err = e.subscribeToPeerInfoMessages()
+	err = engine.subscribeToPeerInfoMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		return nil, errors.Wrap(err, "start")
 	}
 
 	// Subscribe to alert messages
-	err = e.subscribeToAlertMessages()
+	err = engine.subscribeToAlertMessages()
 	if err != nil {
-		errChan <- errors.Wrap(err, "start")
-		close(errChan)
-		return errChan
+		return nil, errors.Wrap(err, "start")
 	}
-
-	e.peerInfoManager.Start()
 
 	// Start consensus message queue processor
-	e.wg.Add(1)
-	go e.processGlobalConsensusMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processGlobalConsensusMessageQueue(ctx)
+	})
 
 	// Start shard consensus message queue processor
-	e.wg.Add(1)
-	go e.processShardConsensusMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processShardConsensusMessageQueue(ctx)
+	})
 
 	// Start frame message queue processor
-	e.wg.Add(1)
-	go e.processFrameMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processFrameMessageQueue(ctx)
+	})
 
 	// Start prover message queue processor
-	e.wg.Add(1)
-	go e.processProverMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processProverMessageQueue(ctx)
+	})
 
 	// Start peer info message queue processor
-	e.wg.Add(1)
-	go e.processPeerInfoMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processPeerInfoMessageQueue(ctx)
+	})
 
 	// Start alert message queue processor
-	e.wg.Add(1)
-	go e.processAlertMessageQueue()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processAlertMessageQueue(ctx)
+	})
+
+	// Start global proposal queue processor
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processGlobalProposalQueue(ctx)
+	})
 
 	// Start periodic peer info reporting
-	e.wg.Add(1)
-	go e.reportPeerInfoPeriodically()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.reportPeerInfoPeriodically(ctx)
+	})
 
 	// Start event distributor event loop
-	e.wg.Add(1)
-	go e.eventDistributorLoop()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.eventDistributorLoop(ctx)
+	})
 
 	// Start periodic metrics update
-	e.wg.Add(1)
-	go e.updateMetrics()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.updateMetrics(ctx)
+	})
 
 	// Start periodic tx lock pruning
-	e.wg.Add(1)
-	go e.pruneTxLocksPeriodically()
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.pruneTxLocksPeriodically(ctx)
+	})
 
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		// Start the state machine
-		if err := e.stateMachine.Start(); err != nil {
-			errChan <- errors.Wrap(err, "start state machine")
-			close(errChan)
-			return errChan
-		}
-	}
-
-	if e.grpcServer != nil {
+	if engine.grpcServer != nil {
 		// Register all services with the gRPC server
-		e.RegisterServices(e.grpcServer)
+		engine.RegisterServices(engine.grpcServer)
 
 		// Start serving the gRPC server
-		go func() {
-			if err := e.grpcServer.Serve(e.grpcListener); err != nil {
-				e.logger.Error("gRPC server error", zap.Error(err))
+		componentBuilder.AddWorker(func(
+			ctx lifecycle.SignalerContext,
+			ready lifecycle.ReadyFunc,
+		) {
+			go func() {
+				if err := engine.grpcServer.Serve(engine.grpcListener); err != nil {
+					engine.logger.Error("gRPC server error", zap.Error(err))
+					ctx.Throw(err)
+				}
+			}()
+			ready()
+			engine.logger.Info("started gRPC server",
+				zap.String("address", engine.grpcListener.Addr().String()))
+			<-ctx.Done()
+			engine.logger.Info("stopping gRPC server")
+			engine.grpcServer.GracefulStop()
+			if engine.grpcListener != nil {
+				engine.grpcListener.Close()
 			}
-		}()
-
-		e.logger.Info("started gRPC server",
-			zap.String("address", e.grpcListener.Addr().String()))
+		})
 	}
 
-	e.logger.Info("global consensus engine started")
+	engine.ComponentManager = componentBuilder.Build()
 
-	close(errChan)
-	return errChan
+	return engine, nil
 }
 
 func (e *GlobalConsensusEngine) setupGRPCServer() error {
@@ -752,47 +889,6 @@ func (e *GlobalConsensusEngine) getAddressFromPublicKey(
 func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	errChan := make(chan error, 1)
 
-	// Stop worker manager background process (if applicable)
-	if !e.config.Engine.ArchiveMode {
-		if err := e.workerManager.Stop(); err != nil {
-			errChan <- errors.Wrap(err, "stop")
-			close(errChan)
-			return errChan
-		}
-	}
-
-	if e.grpcServer != nil {
-		e.logger.Info("stopping gRPC server")
-		e.grpcServer.GracefulStop()
-		if e.grpcListener != nil {
-			e.grpcListener.Close()
-		}
-	}
-
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		// Stop the state machine
-		if err := e.stateMachine.Stop(); err != nil && !force {
-			errChan <- errors.Wrap(err, "stop")
-		}
-	}
-
-	// Stop execution engines
-	if e.executionManager != nil {
-		if err := e.executionManager.StopAll(force); err != nil && !force {
-			errChan <- errors.Wrap(err, "stop")
-		}
-	}
-
-	// Cancel context
-	if e.cancel != nil {
-		e.cancel()
-	}
-
-	// Stop event distributor
-	if err := e.eventDistributor.Stop(); err != nil && !force {
-		errChan <- errors.Wrap(err, "stop")
-	}
-
 	// Unsubscribe from pubsub
 	if e.config.Engine.ArchiveMode || e.config.P2P.Network == 99 {
 		e.pubsub.Unsubscribe(GLOBAL_CONSENSUS_BITMASK, false)
@@ -818,27 +914,13 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.Unsubscribe(GLOBAL_ALERT_BITMASK, false)
 	e.pubsub.UnregisterValidator(GLOBAL_ALERT_BITMASK)
 
-	e.peerInfoManager.Stop()
-
-	// Wait for goroutines to finish
-	done := make(chan struct{})
-	go func() {
-		e.wg.Wait()
-		close(done)
-	}()
-
 	select {
-	case <-done:
+	case <-e.Done():
 		// Clean shutdown
 	case <-time.After(30 * time.Second):
 		if !force {
 			errChan <- errors.New("timeout waiting for graceful shutdown")
 		}
-	}
-
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		// Close the state machine
-		e.stateMachine.Close()
 	}
 
 	close(errChan)
@@ -868,103 +950,14 @@ func (e *GlobalConsensusEngine) GetState() typesconsensus.EngineState {
 	}
 
 	// Map the generic state machine state to engine state
-	if e.stateMachine == nil {
-		return typesconsensus.EngineStateStopped
-	}
-	smState := e.stateMachine.GetState()
-	switch smState {
-	case consensus.StateStopped:
-		return typesconsensus.EngineStateStopped
-	case consensus.StateStarting:
-		return typesconsensus.EngineStateStarting
-	case consensus.StateLoading:
-		return typesconsensus.EngineStateLoading
-	case consensus.StateCollecting:
-		return typesconsensus.EngineStateCollecting
-	case consensus.StateLivenessCheck:
-		return typesconsensus.EngineStateLivenessCheck
-	case consensus.StateProving:
+	select {
+	case <-e.consensusParticipant.Ready():
 		return typesconsensus.EngineStateProving
-	case consensus.StatePublishing:
-		return typesconsensus.EngineStatePublishing
-	case consensus.StateVoting:
-		return typesconsensus.EngineStateVoting
-	case consensus.StateFinalizing:
-		return typesconsensus.EngineStateFinalizing
-	default:
+	case <-e.consensusParticipant.Done():
 		return typesconsensus.EngineStateStopped
+	default:
+		return typesconsensus.EngineStateStarting
 	}
-}
-
-func (e *GlobalConsensusEngine) RegisterExecutor(
-	exec execution.ShardExecutionEngine,
-	frame uint64,
-) <-chan error {
-	errChan := make(chan error, 1)
-
-	e.executorsMu.Lock()
-	defer e.executorsMu.Unlock()
-
-	name := exec.GetName()
-	if _, exists := e.executors[name]; exists {
-		errChan <- errors.New("executor already registered")
-		close(errChan)
-		return errChan
-	}
-
-	e.executors[name] = exec
-
-	// Update metrics
-	executorRegistrationTotal.WithLabelValues("register").Inc()
-	executorsRegistered.Set(float64(len(e.executors)))
-
-	close(errChan)
-	return errChan
-}
-
-func (e *GlobalConsensusEngine) UnregisterExecutor(
-	name string,
-	frame uint64,
-	force bool,
-) <-chan error {
-	errChan := make(chan error, 1)
-
-	e.executorsMu.Lock()
-	defer e.executorsMu.Unlock()
-
-	if _, exists := e.executors[name]; !exists {
-		errChan <- errors.New("executor not registered")
-		close(errChan)
-		return errChan
-	}
-
-	// Stop the executor
-	if exec, ok := e.executors[name]; ok {
-		stopErrChan := exec.Stop(force)
-		select {
-		case err := <-stopErrChan:
-			if err != nil && !force {
-				errChan <- errors.Wrap(err, "stop executor")
-				close(errChan)
-				return errChan
-			}
-		case <-time.After(5 * time.Second):
-			if !force {
-				errChan <- errors.New("timeout stopping executor")
-				close(errChan)
-				return errChan
-			}
-		}
-	}
-
-	delete(e.executors, name)
-
-	// Update metrics
-	executorRegistrationTotal.WithLabelValues("unregister").Inc()
-	executorsRegistered.Set(float64(len(e.executors)))
-
-	close(errChan)
-	return errChan
 }
 
 func (e *GlobalConsensusEngine) GetProvingKey(
@@ -1360,24 +1353,22 @@ func (e *GlobalConsensusEngine) getProverAddress() []byte {
 	return addressBI.FillBytes(make([]byte, 32))
 }
 
-func (e *GlobalConsensusEngine) updateMetrics() {
+func (e *GlobalConsensusEngine) updateMetrics(
+	ctx lifecycle.SignalerContext,
+) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.logger.Error("fatal error encountered", zap.Any("panic", r))
-			if e.cancel != nil {
-				e.cancel()
-			}
-			e.quit <- struct{}{}
+			ctx.Throw(errors.Errorf("fatal unhandled error encountered: %v", r))
 		}
 	}()
-	defer e.wg.Done()
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -1387,12 +1378,6 @@ func (e *GlobalConsensusEngine) updateMetrics() {
 			timeSince := time.Since(e.lastProvenFrameTime).Seconds()
 			e.lastProvenFrameTimeMu.RUnlock()
 			timeSinceLastProvenFrame.Set(timeSince)
-
-			// Update executor count
-			e.executorsMu.RLock()
-			execCount := len(e.executors)
-			e.executorsMu.RUnlock()
-			executorsRegistered.Set(float64(execCount))
 
 			// Update current frame number
 			if frame := e.GetFrame(); frame != nil && frame.Header != nil {
@@ -1863,16 +1848,16 @@ func (e *GlobalConsensusEngine) signPeerInfo(
 
 // reportPeerInfoPeriodically sends peer info over the peer info bitmask every
 // 5 minutes
-func (e *GlobalConsensusEngine) reportPeerInfoPeriodically() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) reportPeerInfoPeriodically(
+	ctx lifecycle.SignalerContext,
+) {
 	e.logger.Info("starting periodic peer info reporting")
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			e.logger.Info("stopping periodic peer info reporting")
 			return
 		case <-ticker.C:
@@ -1902,9 +1887,9 @@ func (e *GlobalConsensusEngine) reportPeerInfoPeriodically() {
 	}
 }
 
-func (e *GlobalConsensusEngine) pruneTxLocksPeriodically() {
-	defer e.wg.Done()
-
+func (e *GlobalConsensusEngine) pruneTxLocksPeriodically(
+	ctx lifecycle.SignalerContext,
+) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -1912,7 +1897,7 @@ func (e *GlobalConsensusEngine) pruneTxLocksPeriodically() {
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			e.pruneTxLocks()
@@ -2253,7 +2238,7 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		wg.Go(func() error {
 			client := protobufs.NewDataIPCServiceClient(svc)
 			resp, err := client.CreateJoinProof(
-				e.ctx,
+				context.TODO(),
 				&protobufs.CreateJoinProofRequest{
 					Challenge:   challenge[:],
 					Difficulty:  frame.Header.Difficulty,
@@ -2432,3 +2417,900 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 
 	return nil
 }
+
+func (e *GlobalConsensusEngine) startConsensus(
+	trustedRoot *models.CertifiedState[*protobufs.GlobalFrame],
+	pending []*models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	],
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) error {
+	var err error
+	e.consensusParticipant, err = participant.NewParticipant[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+		GlobalPeerID,
+		GlobalCollectedCommitments,
+	](
+		tracing.NewZapTracer(e.logger), // logger
+		e,                              // committee
+		verification.NewSigner[
+			*protobufs.GlobalFrame,
+			*protobufs.ProposalVote,
+			GlobalPeerID,
+		](e.votingProvider), // signer
+		e.leaderProvider,              // prover
+		e.votingProvider,              // voter
+		e.notifier,                    // notifier
+		e.consensusStore,              // consensusStore
+		e.signatureAggregator,         // signatureAggregator
+		e,                             // consensusVerifier
+		e.voteCollectorDistributor,    // voteCollectorDistributor
+		e.timeoutCollectorDistributor, // timeoutCollectorDistributor
+		e.forks,                       // forks
+		validator.NewValidator[
+			*protobufs.GlobalFrame,
+			*protobufs.ProposalVote,
+		](e, e), // validator
+		e.voteAggregator,    // voteAggregator
+		e.timeoutAggregator, // timeoutAggregator
+		e,                   // finalizer
+		nil,                 // filter
+		trustedRoot,
+		pending,
+	)
+	if err != nil {
+		return err
+	}
+
+	ready()
+	e.voteAggregator.Start(ctx)
+	e.timeoutAggregator.Start(ctx)
+	<-lifecycle.AllReady(e.voteAggregator, e.timeoutAggregator)
+	e.consensusParticipant.Start(ctx)
+	return nil
+}
+
+// MakeFinal implements consensus.Finalizer.
+func (e *GlobalConsensusEngine) MakeFinal(stateID models.Identity) error {
+	// In a standard BFT-only approach, this would be how frames are finalized on
+	// the time reel. But we're PoMW, so we don't rely on BFT for anything outside
+	// of basic coordination. If the protocol were ever to move to something like
+	// PoS, this would be one of the touch points to revisit.
+	return nil
+}
+
+// OnCurrentRankDetails implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnCurrentRankDetails(
+	currentRank uint64,
+	finalizedRank uint64,
+	currentLeader models.Identity,
+) {
+	e.logger.Info(
+		"entered new rank",
+		zap.Uint64("current_rank", currentRank),
+		zap.String("current_leader", hex.EncodeToString([]byte(currentLeader))),
+	)
+}
+
+// OnDoubleProposeDetected implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnDoubleProposeDetected(
+	proposal1 *models.State[*protobufs.GlobalFrame],
+	proposal2 *models.State[*protobufs.GlobalFrame],
+) {
+	select {
+	case <-e.haltCtx.Done():
+		return
+	default:
+	}
+	e.eventDistributor.Publish(typesconsensus.ControlEvent{
+		Type: typesconsensus.ControlEventGlobalEquivocation,
+		Data: &consensustime.GlobalEvent{
+			Type:    consensustime.TimeReelEventEquivocationDetected,
+			Frame:   *proposal2.State,
+			OldHead: *proposal1.State,
+			Message: fmt.Sprintf(
+				"equivocation at rank %d",
+				proposal1.Rank,
+			),
+		},
+	})
+}
+
+// OnEventProcessed implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnEventProcessed() {}
+
+// OnFinalizedState implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnFinalizedState(
+	state *models.State[*protobufs.GlobalFrame],
+) {
+}
+
+// OnInvalidStateDetected implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnInvalidStateDetected(
+	err *models.InvalidProposalError[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	],
+) {
+} // Presently a no-op, up for reconsideration
+
+// OnLocalTimeout implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnLocalTimeout(currentRank uint64) {}
+
+// OnOwnProposal implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnOwnProposal(
+	proposal *models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	],
+	targetPublicationTime time.Time,
+) {
+	go func() {
+		select {
+		case <-time.After(time.Until(targetPublicationTime)):
+		case <-e.ShutdownSignal():
+			return
+		}
+		var priorTC *protobufs.TimeoutCertificate = nil
+		if proposal.PreviousRankTimeoutCertificate != nil {
+			priorTC =
+				proposal.PreviousRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
+		}
+
+		// Manually override the signature as the vdf prover's signature is invalid
+		(*proposal.State.State).Header.PublicKeySignatureBls48581.Signature =
+			(*proposal.Vote).PublicKeySignatureBls48581.Signature
+
+		pbProposal := &protobufs.GlobalProposal{
+			State:                       *proposal.State.State,
+			ParentQuorumCertificate:     proposal.Proposal.State.ParentQuorumCertificate.(*protobufs.QuorumCertificate),
+			PriorRankTimeoutCertificate: priorTC,
+			Vote:                        *proposal.Vote,
+		}
+		data, err := pbProposal.ToCanonicalBytes()
+		if err != nil {
+			e.logger.Error("could not serialize proposal", zap.Error(err))
+			return
+		}
+
+		txn, err := e.clockStore.NewTransaction(false)
+		if err != nil {
+			e.logger.Error("could not create transaction", zap.Error(err))
+			return
+		}
+
+		if err := e.clockStore.PutProposalVote(txn, *proposal.Vote); err != nil {
+			e.logger.Error("could not put vote", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
+		if err := txn.Commit(); err != nil {
+			e.logger.Error("could not commit transaction", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
+		e.voteAggregator.AddState(proposal)
+		e.consensusParticipant.SubmitProposal(proposal)
+
+		if err := e.pubsub.PublishToBitmask(
+			GLOBAL_CONSENSUS_BITMASK,
+			data,
+		); err != nil {
+			e.logger.Error("could not publish", zap.Error(err))
+		}
+	}()
+}
+
+// OnOwnTimeout implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnOwnTimeout(
+	timeout *models.TimeoutState[*protobufs.ProposalVote],
+) {
+	select {
+	case <-e.haltCtx.Done():
+		return
+	default:
+	}
+
+	var priorTC *protobufs.TimeoutCertificate
+	if timeout.PriorRankTimeoutCertificate != nil {
+		priorTC =
+			timeout.PriorRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
+	}
+
+	pbTimeout := &protobufs.TimeoutState{
+		LatestQuorumCertificate:     timeout.LatestQuorumCertificate.(*protobufs.QuorumCertificate),
+		PriorRankTimeoutCertificate: priorTC,
+		Vote:                        *timeout.Vote,
+		TimeoutTick:                 timeout.TimeoutTick,
+		Timestamp:                   uint64(time.Now().UnixMilli()),
+	}
+	data, err := pbTimeout.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize timeout", zap.Error(err))
+		return
+	}
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutTimeoutVote(txn, pbTimeout); err != nil {
+		e.logger.Error("could not put vote", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	e.timeoutAggregator.AddTimeout(timeout)
+
+	if err := e.pubsub.PublishToBitmask(
+		GLOBAL_CONSENSUS_BITMASK,
+		data,
+	); err != nil {
+		e.logger.Error("could not publish", zap.Error(err))
+	}
+}
+
+// OnOwnVote implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnOwnVote(
+	vote **protobufs.ProposalVote,
+	recipientID models.Identity,
+) {
+	select {
+	case <-e.haltCtx.Done():
+		return
+	default:
+	}
+
+	data, err := (*vote).ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize timeout", zap.Error(err))
+		return
+	}
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutProposalVote(txn, *vote); err != nil {
+		e.logger.Error("could not put vote", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	e.voteAggregator.AddVote(vote)
+
+	if err := e.pubsub.PublishToBitmask(
+		GLOBAL_CONSENSUS_BITMASK,
+		data,
+	); err != nil {
+		e.logger.Error("could not publish", zap.Error(err))
+	}
+}
+
+// OnPartialTimeoutCertificate implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnPartialTimeoutCertificate(
+	currentRank uint64,
+	partialTimeoutCertificate *consensus.PartialTimeoutCertificateCreated,
+) {
+}
+
+// OnQuorumCertificateTriggeredRankChange implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
+	oldRank uint64,
+	newRank uint64,
+	qc models.QuorumCertificate,
+) {
+	e.logger.Debug("adding certified state", zap.Uint64("rank", newRank-1))
+
+	parentQC, err := e.clockStore.GetLatestQuorumCertificate(nil)
+	if err != nil {
+		e.logger.Error("no latest quorum certificate", zap.Error(err))
+		return
+	}
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	aggregateSig := &protobufs.BLS48581AggregateSignature{
+		Signature: qc.GetAggregatedSignature().GetSignature(),
+		PublicKey: &protobufs.BLS48581G2PublicKey{
+			KeyValue: qc.GetAggregatedSignature().GetPubKey(),
+		},
+		Bitmask: qc.GetAggregatedSignature().GetBitmask(),
+	}
+	if err := e.clockStore.PutQuorumCertificate(
+		&protobufs.QuorumCertificate{
+			Rank:               qc.GetRank(),
+			FrameNumber:        qc.GetFrameNumber(),
+			Selector:           []byte(qc.Identity()),
+			AggregateSignature: aggregateSig,
+		},
+		txn,
+	); err != nil {
+		e.logger.Error("could not insert quorum certificate", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	e.frameStoreMu.RLock()
+	frame, ok := e.frameStore[qc.Identity()]
+	e.frameStoreMu.RUnlock()
+
+	if !ok {
+		e.logger.Error(
+			"no frame for quorum certificate",
+			zap.Uint64("rank", newRank-1),
+			zap.Uint64("frame_number", qc.GetFrameNumber()),
+		)
+		current, err := e.globalTimeReel.GetHead()
+		if err != nil {
+			e.logger.Error("could not get time reel head", zap.Error(err))
+			return
+		}
+		peer, err := e.getRandomProverPeerId()
+		if err != nil {
+			e.logger.Error("could not get random peer", zap.Error(err))
+			return
+		}
+		e.syncProvider.AddState(
+			[]byte(peer),
+			current.Header.FrameNumber,
+		)
+		return
+	}
+
+	frame.Header.PublicKeySignatureBls48581 = aggregateSig
+
+	err = e.globalTimeReel.Insert(frame)
+	if err != nil {
+		e.logger.Error("could not insert frame into time reel", zap.Error(err))
+		return
+	}
+
+	current, err := e.globalTimeReel.GetHead()
+	if err != nil {
+		e.logger.Error("could not get time reel head", zap.Error(err))
+		return
+	}
+
+	if !bytes.Equal(frame.Header.Output, current.Header.Output) {
+		e.logger.Error(
+			"frames not aligned, might need sync",
+			zap.Uint64("new_frame_number", frame.Header.FrameNumber),
+			zap.Uint64("reel_frame_number", current.Header.FrameNumber),
+			zap.Uint64("new_frame_rank", frame.Header.Rank),
+			zap.Uint64("reel_frame_rank", current.Header.Rank),
+			zap.String("new_frame_id", hex.EncodeToString([]byte(frame.Identity()))),
+			zap.String(
+				"reel_frame_id",
+				hex.EncodeToString([]byte(current.Identity())),
+			),
+		)
+
+		peerID, err := e.getPeerIDOfProver(frame.Header.Prover)
+		if err != nil {
+			return
+		}
+
+		e.syncProvider.AddState(
+			[]byte(peerID),
+			current.Header.FrameNumber,
+		)
+		return
+	}
+
+	if !bytes.Equal(frame.Header.ParentSelector, parentQC.Selector) {
+		e.logger.Error(
+			"quorum certificate does not match frame parent",
+			zap.String(
+				"frame_parent_selector",
+				hex.EncodeToString(frame.Header.ParentSelector),
+			),
+			zap.String(
+				"parent_qc_selector",
+				hex.EncodeToString(parentQC.Selector),
+			),
+			zap.Uint64("parent_qc_rank", parentQC.Rank),
+		)
+		return
+	}
+
+	priorRankTC, err := e.clockStore.GetTimeoutCertificate(nil, qc.GetRank()-1)
+	if err != nil {
+		e.logger.Debug("no prior rank TC to include", zap.Uint64("rank", newRank-1))
+	}
+
+	vote, err := e.clockStore.GetProposalVote(
+		nil,
+		frame.GetRank(),
+		[]byte(frame.Source()),
+	)
+	if err != nil {
+		e.logger.Error(
+			"cannot find proposer's vote",
+			zap.Uint64("rank", newRank-1),
+			zap.String("proposer", hex.EncodeToString([]byte(frame.Source()))),
+		)
+		return
+	}
+
+	txn, err = e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutCertifiedGlobalState(
+		&protobufs.GlobalProposal{
+			State:                       frame,
+			ParentQuorumCertificate:     parentQC,
+			PriorRankTimeoutCertificate: priorRankTC,
+			Vote:                        vote,
+		},
+		txn,
+	); err != nil {
+		e.logger.Error("could not insert certified state", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+	}
+}
+
+// OnRankChange implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
+	e.currentRank = newRank
+}
+
+// OnReceiveProposal implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnReceiveProposal(
+	currentRank uint64,
+	proposal *models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	],
+) {
+}
+
+// OnReceiveQuorumCertificate implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnReceiveQuorumCertificate(
+	currentRank uint64,
+	qc models.QuorumCertificate,
+) {
+}
+
+// OnReceiveTimeoutCertificate implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnReceiveTimeoutCertificate(
+	currentRank uint64,
+	tc models.TimeoutCertificate,
+) {
+}
+
+// OnStart implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnStart(currentRank uint64) {}
+
+// OnStartingTimeout implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnStartingTimeout(
+	startTime time.Time,
+	endTime time.Time,
+) {
+}
+
+// OnStateIncorporated implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnStateIncorporated(
+	state *models.State[*protobufs.GlobalFrame],
+) {
+	e.frameStoreMu.Lock()
+	e.frameStore[state.Identifier] = *state.State
+	e.frameStoreMu.Unlock()
+}
+
+// OnTimeoutCertificateTriggeredRankChange implements consensus.Consumer.
+func (e *GlobalConsensusEngine) OnTimeoutCertificateTriggeredRankChange(
+	oldRank uint64,
+	newRank uint64,
+	tc models.TimeoutCertificate,
+) {
+	e.logger.Debug(
+		"inserting timeout certificate",
+		zap.Uint64("rank", tc.GetRank()),
+	)
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	qc := tc.GetLatestQuorumCert()
+	err = e.clockStore.PutTimeoutCertificate(&protobufs.TimeoutCertificate{
+		Rank:        tc.GetRank(),
+		LatestRanks: tc.GetLatestRanks(),
+		LatestQuorumCertificate: &protobufs.QuorumCertificate{
+			Rank:        qc.GetRank(),
+			FrameNumber: qc.GetFrameNumber(),
+			Selector:    []byte(qc.Identity()),
+			AggregateSignature: &protobufs.BLS48581AggregateSignature{
+				Signature: qc.GetAggregatedSignature().GetSignature(),
+				PublicKey: &protobufs.BLS48581G2PublicKey{
+					KeyValue: qc.GetAggregatedSignature().GetPubKey(),
+				},
+				Bitmask: qc.GetAggregatedSignature().GetBitmask(),
+			},
+		},
+		AggregateSignature: &protobufs.BLS48581AggregateSignature{
+			Signature: tc.GetAggregatedSignature().GetSignature(),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: tc.GetAggregatedSignature().GetPubKey(),
+			},
+			Bitmask: tc.GetAggregatedSignature().GetBitmask(),
+		},
+	}, txn)
+	if err != nil {
+		txn.Abort()
+		e.logger.Error("could not insert timeout certificate")
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		txn.Abort()
+		e.logger.Error("could not commit transaction", zap.Error(err))
+	}
+}
+
+// VerifyQuorumCertificate implements consensus.Verifier.
+func (e *GlobalConsensusEngine) VerifyQuorumCertificate(
+	quorumCertificate models.QuorumCertificate,
+) error {
+	qc, ok := quorumCertificate.(*protobufs.QuorumCertificate)
+	if !ok {
+		return errors.Wrap(
+			errors.New("invalid quorum certificate"),
+			"verify quorum certificate",
+		)
+	}
+
+	if err := qc.Validate(); err != nil {
+		return models.NewInvalidFormatError(
+			errors.Wrap(err, "verify quorum certificate"),
+		)
+	}
+
+	// genesis qc is special:
+	if quorumCertificate.GetRank() == 0 {
+		genqc, err := e.clockStore.GetQuorumCertificate(nil, 0)
+		if err != nil {
+			return errors.Wrap(err, "verify quorum certificate")
+		}
+
+		if genqc.Equals(quorumCertificate) {
+			return nil
+		}
+	}
+
+	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		return errors.Wrap(err, "verify quorum certificate")
+	}
+
+	pubkeys := [][]byte{}
+	signatures := [][]byte{}
+	if ((len(provers) + 7) / 8) > len(qc.AggregateSignature.Bitmask) {
+		return models.ErrInvalidSignature
+	}
+	for i, prover := range provers {
+		if qc.AggregateSignature.Bitmask[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
+			pubkeys = append(pubkeys, prover.PublicKey)
+			signatures = append(signatures, qc.AggregateSignature.GetSignature())
+		}
+	}
+
+	aggregationCheck, err := e.blsConstructor.Aggregate(pubkeys, signatures)
+	if err != nil {
+		return models.ErrInvalidSignature
+	}
+
+	if !bytes.Equal(
+		qc.AggregateSignature.GetPubKey(),
+		aggregationCheck.GetAggregatePublicKey(),
+	) {
+		return models.ErrInvalidSignature
+	}
+
+	if valid := e.blsConstructor.VerifySignatureRaw(
+		qc.AggregateSignature.GetPubKey(),
+		qc.AggregateSignature.GetSignature(),
+		verification.MakeVoteMessage(nil, qc.Rank, qc.Identity()),
+		[]byte("global"),
+	); !valid {
+		return models.ErrInvalidSignature
+	}
+
+	return nil
+}
+
+// VerifyTimeoutCertificate implements consensus.Verifier.
+func (e *GlobalConsensusEngine) VerifyTimeoutCertificate(
+	timeoutCertificate models.TimeoutCertificate,
+) error {
+	tc, ok := timeoutCertificate.(*protobufs.TimeoutCertificate)
+	if !ok {
+		return errors.Wrap(
+			errors.New("invalid timeout certificate"),
+			"verify timeout certificate",
+		)
+	}
+
+	if err := tc.Validate(); err != nil {
+		return models.NewInvalidFormatError(
+			errors.Wrap(err, "verify timeout certificate"),
+		)
+	}
+
+	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		return errors.Wrap(err, "verify timeout certificate")
+	}
+
+	pubkeys := [][]byte{}
+	signatures := [][]byte{}
+	if ((len(provers) + 7) / 8) > len(tc.AggregateSignature.Bitmask) {
+		return models.ErrInvalidSignature
+	}
+	for i, prover := range provers {
+		if tc.AggregateSignature.Bitmask[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
+			pubkeys = append(pubkeys, prover.PublicKey)
+			signatures = append(signatures, tc.AggregateSignature.GetSignature())
+		}
+	}
+
+	aggregationCheck, err := e.blsConstructor.Aggregate(pubkeys, signatures)
+	if err != nil {
+		return models.ErrInvalidSignature
+	}
+
+	if !bytes.Equal(
+		tc.AggregateSignature.GetPubKey(),
+		aggregationCheck.GetAggregatePublicKey(),
+	) {
+		return models.ErrInvalidSignature
+	}
+
+	if valid := e.blsConstructor.VerifySignatureRaw(
+		tc.AggregateSignature.GetPubKey(),
+		tc.AggregateSignature.GetSignature(),
+		verification.MakeTimeoutMessage(
+			nil,
+			tc.Rank,
+			tc.LatestQuorumCertificate.Rank,
+		),
+		[]byte("globaltimeout"),
+	); !valid {
+		return models.ErrInvalidSignature
+	}
+
+	return nil
+}
+
+// VerifyVote implements consensus.Verifier.
+func (e *GlobalConsensusEngine) VerifyVote(
+	vote **protobufs.ProposalVote,
+) error {
+	if vote == nil || *vote == nil {
+		return errors.Wrap(errors.New("nil vote"), "verify vote")
+	}
+
+	if err := (*vote).Validate(); err != nil {
+		return models.NewInvalidFormatError(
+			errors.Wrap(err, "verify vote"),
+		)
+	}
+
+	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		return errors.Wrap(err, "verify vote")
+	}
+
+	var pubkey []byte
+	for _, p := range provers {
+		if bytes.Equal(p.Address, (*vote).PublicKeySignatureBls48581.Address) {
+			pubkey = p.PublicKey
+			break
+		}
+	}
+
+	if bytes.Equal(pubkey, []byte{}) {
+		return models.ErrInvalidSignature
+	}
+
+	if valid := e.blsConstructor.VerifySignatureRaw(
+		pubkey,
+		(*vote).PublicKeySignatureBls48581.Signature,
+		verification.MakeVoteMessage(nil, (*vote).Rank, (*vote).Source()),
+		[]byte("global"),
+	); !valid {
+		return models.ErrInvalidSignature
+	}
+
+	return nil
+}
+
+func (e *GlobalConsensusEngine) getPendingProposals(
+	frameNumber uint64,
+) []*models.SignedProposal[
+	*protobufs.GlobalFrame,
+	*protobufs.ProposalVote,
+] {
+	pendingFrames, err := e.clockStore.RangeGlobalClockFrames(
+		frameNumber,
+		0xfffffffffffffffe,
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer pendingFrames.Close()
+
+	result := []*models.SignedProposal[
+		*protobufs.GlobalFrame,
+		*protobufs.ProposalVote,
+	]{}
+
+	e.logger.Debug("getting pending proposals", zap.Uint64("start", frameNumber))
+	pendingFrames.First()
+	if !pendingFrames.Valid() {
+		e.logger.Debug("no valid frame")
+		return result
+	}
+	value, err := pendingFrames.Value()
+	if err != nil || value == nil {
+		e.logger.Debug("value was invalid", zap.Error(err))
+		return result
+	}
+
+	previous := value
+	for pendingFrames.Next(); pendingFrames.Valid(); pendingFrames.Next() {
+		value, err := pendingFrames.Value()
+		if err != nil || value == nil {
+			e.logger.Debug("iter value was invalid or empty", zap.Error(err))
+			break
+		}
+
+		parent, err := e.clockStore.GetQuorumCertificate(nil, previous.GetRank())
+		if err != nil {
+			panic(err)
+		}
+
+		priorTC, _ := e.clockStore.GetTimeoutCertificate(nil, value.GetRank()-1)
+		var priorTCModel models.TimeoutCertificate = nil
+		if priorTC != nil {
+			priorTCModel = priorTC
+		}
+
+		vote := &protobufs.ProposalVote{
+			Rank:        value.GetRank(),
+			FrameNumber: value.Header.FrameNumber,
+			Selector:    []byte(value.Identity()),
+			PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
+				Signature: value.Header.PublicKeySignatureBls48581.Signature,
+				Address:   []byte(value.Source()),
+			},
+		}
+		result = append(result, &models.SignedProposal[
+			*protobufs.GlobalFrame,
+			*protobufs.ProposalVote,
+		]{
+			Proposal: models.Proposal[*protobufs.GlobalFrame]{
+				State: &models.State[*protobufs.GlobalFrame]{
+					Rank:                    value.GetRank(),
+					Identifier:              value.Identity(),
+					ProposerID:              value.Source(),
+					ParentQuorumCertificate: parent,
+					State:                   &value,
+				},
+				PreviousRankTimeoutCertificate: priorTCModel,
+			},
+			Vote: &vote,
+		})
+		previous = value
+	}
+	return result
+}
+
+func (e *GlobalConsensusEngine) getPeerIDOfProver(
+	prover []byte,
+) (peer.ID, error) {
+	registry, err := e.signerRegistry.GetKeyRegistryByProver(
+		prover,
+	)
+	if err != nil {
+		e.logger.Debug(
+			"could not get registry for prover",
+			zap.Error(err),
+		)
+		return "", err
+	}
+
+	if registry == nil || registry.IdentityKey == nil {
+		e.logger.Debug("registry for prover not found")
+		return "", err
+	}
+
+	pk, err := pcrypto.UnmarshalEd448PublicKey(registry.IdentityKey.KeyValue)
+	if err != nil {
+		e.logger.Debug(
+			"could not parse pub key",
+			zap.Error(err),
+		)
+		return "", err
+	}
+
+	id, err := peer.IDFromPublicKey(pk)
+	if err != nil {
+		e.logger.Debug(
+			"could not derive peer id",
+			zap.Error(err),
+		)
+		return "", err
+	}
+
+	return id, nil
+}
+
+func (e *GlobalConsensusEngine) getRandomProverPeerId() (peer.ID, error) {
+	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		e.logger.Error(
+			"could not get active provers for sync",
+			zap.Error(err),
+		)
+	}
+	if len(provers) == 0 {
+		return "", err
+	}
+
+	otherProvers := []*typesconsensus.ProverInfo{}
+	for _, p := range provers {
+		if bytes.Equal(p.Address, e.getProverAddress()) {
+			continue
+		}
+		otherProvers = append(otherProvers, p)
+	}
+
+	index := rand.Intn(len(otherProvers))
+	return e.getPeerIDOfProver(otherProvers[index].Address)
+}
+
+var _ consensus.DynamicCommittee = (*GlobalConsensusEngine)(nil)

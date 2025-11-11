@@ -1,7 +1,7 @@
 package consensus
 
 import (
-	"context"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 )
 
 type ControlEventType int
@@ -126,10 +126,7 @@ func (s *ShardSplitEventData) ControlEventData() {}
 // EventDistributor defines the interface for event distribution systems
 type EventDistributor interface {
 	// Start begins the event processing loop with a cancelable context
-	Start(ctx context.Context) error
-
-	// Stop gracefully shuts down the event distributor
-	Stop() error
+	Start(ctx lifecycle.SignalerContext, ready lifecycle.ReadyFunc)
 
 	// Subscribe registers a new subscriber with a unique ID and returns their
 	// control event channel

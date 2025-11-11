@@ -1,10 +1,12 @@
 package p2p
 
-import "source.quilibrium.com/quilibrium/monorepo/protobufs"
+import (
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+)
 
 type PeerInfoManager interface {
-	Start()
-	Stop()
+	Start(context lifecycle.SignalerContext, ready lifecycle.ReadyFunc)
 	AddPeerInfo(info *protobufs.PeerInfo)
 	GetPeerInfo(peerId []byte) *PeerInfo
 	GetPeerMap() map[string]*PeerInfo

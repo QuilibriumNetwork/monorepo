@@ -6,6 +6,7 @@ import (
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/global"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
@@ -13,21 +14,15 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 )
 
-func (e *AppConsensusEngine) eventDistributorLoop() {
+func (e *AppConsensusEngine) eventDistributorLoop(
+	ctx lifecycle.SignalerContext,
+) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.logger.Error("fatal error encountered", zap.Any("panic", r))
-			if e.cancel != nil {
-				e.cancel()
-			}
-			// Avoid blocking on quit channel during panic recovery
-			select {
-			case e.quit <- struct{}{}:
-			default:
-			}
+			ctx.Throw(errors.Errorf("fatal unhandled error encountered: %v", r))
 		}
 	}()
-	defer e.wg.Done()
 
 	// Subscribe to events from the event distributor
 	eventCh := e.eventDistributor.Subscribe(hex.EncodeToString(e.appAddress))
@@ -35,7 +30,7 @@ func (e *AppConsensusEngine) eventDistributorLoop() {
 
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-e.quit:
 			return
@@ -172,16 +167,10 @@ func (e *AppConsensusEngine) eventDistributorLoop() {
 				if ok && data.Message != "" {
 					e.logger.Error(data.Message)
 					e.halt()
-					if err := e.stateMachine.Stop(); err != nil {
-						e.logger.Error(
-							"error occurred while halting consensus",
-							zap.Error(err),
-						)
-					}
 					go func() {
 						for {
 							select {
-							case <-e.ctx.Done():
+							case <-ctx.Done():
 								return
 							case <-time.After(10 * time.Second):
 								e.logger.Error(
@@ -200,16 +189,10 @@ func (e *AppConsensusEngine) eventDistributorLoop() {
 						zap.Error(data.Error),
 					)
 					e.halt()
-					if err := e.stateMachine.Stop(); err != nil {
-						e.logger.Error(
-							"error occurred while halting consensus",
-							zap.Error(err),
-						)
-					}
 					go func() {
 						for {
 							select {
-							case <-e.ctx.Done():
+							case <-ctx.Done():
 								return
 							case <-time.After(10 * time.Second):
 								e.logger.Error(

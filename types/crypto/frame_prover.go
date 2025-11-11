@@ -38,6 +38,7 @@ type FrameProver interface {
 		previousFrame *protobufs.GlobalFrameHeader,
 		commitments [][]byte,
 		proverRoot []byte,
+		requestRoot []byte,
 		provingKey Signer,
 		timestamp int64,
 		difficulty uint32,

@@ -11,6 +11,7 @@ import (
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/fees"
 	hypergraphintrinsic "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -38,7 +39,7 @@ type HypergraphExecutionEngine struct {
 	intrinsicsMutex sync.RWMutex
 	mode            ExecutionMode
 	mu              sync.RWMutex
-	stopChan        chan struct{}
+	ctx             lifecycle.SignalerContext
 }
 
 func NewHypergraphExecutionEngine(
@@ -204,48 +205,15 @@ func (e *HypergraphExecutionEngine) GetCapabilities() []*protobufs.Capability {
 	}
 }
 
-func (e *HypergraphExecutionEngine) Start() <-chan error {
-	errChan := make(chan error, 1)
-
-	e.mu.Lock()
-	e.stopChan = make(chan struct{}, 1)
-	e.mu.Unlock()
-
-	go func() {
-		e.logger.Info("starting hypergraph execution engine")
-
-		<-e.stopChan
-		e.logger.Info("stopping hypergraph execution engine")
-	}()
-
-	return errChan
-}
-
-func (e *HypergraphExecutionEngine) Stop(force bool) <-chan error {
-	errChan := make(chan error, 1)
-
-	go func() {
-		e.logger.Info(
-			"stopping hypergraph execution engine",
-			zap.Bool("force", force),
-		)
-
-		// Signal stop if we have a stopChan
-		e.mu.RLock()
-		if e.stopChan != nil {
-			select {
-			case <-e.stopChan:
-				// Already closed
-			default:
-				close(e.stopChan)
-			}
-		}
-		e.mu.RUnlock()
-
-		close(errChan)
-	}()
-
-	return errChan
+func (e *HypergraphExecutionEngine) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	e.ctx = ctx
+	e.logger.Info("starting hypergraph execution engine")
+	ready()
+	<-e.ctx.Done()
+	e.logger.Info("stopping hypergraph execution engine")
 }
 
 func (e *HypergraphExecutionEngine) ValidateMessage(
@@ -310,38 +278,43 @@ func (e *HypergraphExecutionEngine) validateBundle(
 
 	// Validate each operation in the bundle sequentially
 	for i, op := range bundle.Requests {
-		e.logger.Debug(
-			"validating bundled operation",
-			zap.Int("operation", i),
-			zap.String("address", hex.EncodeToString(address)),
-		)
-
-		// Check if this is a hypergraph operation type
-		isHypergraphOp := op.GetHypergraphDeploy() != nil ||
-			op.GetHypergraphUpdate() != nil ||
-			op.GetVertexAdd() != nil ||
-			op.GetVertexRemove() != nil ||
-			op.GetHyperedgeAdd() != nil ||
-			op.GetHyperedgeRemove() != nil
-
-		if !isHypergraphOp {
-			// Skip non-hypergraph operations
+		select {
+		case <-e.ctx.Done():
+			return errors.Wrap(errors.New("context canceled"), "validate bundle")
+		default:
 			e.logger.Debug(
-				"skipping non-hypergraph operation in bundle",
+				"validating bundled operation",
 				zap.Int("operation", i),
+				zap.String("address", hex.EncodeToString(address)),
 			)
-			continue
-		}
 
-		// Validate this operation individually
-		err := e.validateIndividualMessage(
-			frameNumber,
-			address,
-			op,
-			true,
-		)
-		if err != nil {
-			return errors.Wrap(err, "validate bundle")
+			// Check if this is a hypergraph operation type
+			isHypergraphOp := op.GetHypergraphDeploy() != nil ||
+				op.GetHypergraphUpdate() != nil ||
+				op.GetVertexAdd() != nil ||
+				op.GetVertexRemove() != nil ||
+				op.GetHyperedgeAdd() != nil ||
+				op.GetHyperedgeRemove() != nil
+
+			if !isHypergraphOp {
+				// Skip non-hypergraph operations
+				e.logger.Debug(
+					"skipping non-hypergraph operation in bundle",
+					zap.Int("operation", i),
+				)
+				continue
+			}
+
+			// Validate this operation individually
+			err := e.validateIndividualMessage(
+				frameNumber,
+				address,
+				op,
+				true,
+			)
+			if err != nil {
+				return errors.Wrap(err, "validate bundle")
+			}
 		}
 	}
 

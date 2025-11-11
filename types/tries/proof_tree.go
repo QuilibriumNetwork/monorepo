@@ -599,6 +599,10 @@ func (t *VectorCommitmentTree) Prove(
 	}
 
 	polynomials, commits, ys, paths := prove(t.Root, 0)
+	if len(commits) == 0 {
+		return nil
+	}
+
 	pathIndices := [][]uint64{}
 	indices := []uint64{}
 	for _, p := range paths {

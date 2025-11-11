@@ -5,7 +5,6 @@ import (
 	"context"
 	"math/big"
 	"slices"
-	"time"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -184,68 +183,6 @@ func (p *GlobalLivenessProvider) Collect(
 		commitmentHash: commitmentHash[:],
 		prover:         p.engine.getProverAddress(),
 	}, nil
-}
-
-func (p *GlobalLivenessProvider) SendLiveness(
-	prior **protobufs.GlobalFrame,
-	collected GlobalCollectedCommitments,
-	ctx context.Context,
-) error {
-	// Get prover key
-	signer, _, publicKey, _ := p.engine.GetProvingKey(p.engine.config.Engine)
-	if publicKey == nil {
-		return errors.Wrap(
-			errors.New("no proving key available for liveness check"),
-			"send liveness",
-		)
-	}
-
-	// Create liveness check message
-	livenessCheck := &protobufs.ProverLivenessCheck{
-		FrameNumber:    collected.frameNumber,
-		Timestamp:      time.Now().UnixMilli(),
-		CommitmentHash: collected.commitmentHash,
-	}
-
-	// Sign the message
-	signatureData, err := livenessCheck.ConstructSignaturePayload()
-	if err != nil {
-		return errors.Wrap(err, "send liveness")
-	}
-
-	sig, err := signer.SignWithDomain(
-		signatureData,
-		livenessCheck.GetSignatureDomain(),
-	)
-	if err != nil {
-		return errors.Wrap(err, "send liveness")
-	}
-
-	proverAddress := p.engine.getAddressFromPublicKey(publicKey)
-	livenessCheck.PublicKeySignatureBls48581 = &protobufs.BLS48581AddressedSignature{
-		Address:   proverAddress,
-		Signature: sig,
-	}
-
-	data, err := livenessCheck.ToCanonicalBytes()
-	if err != nil {
-		return errors.Wrap(err, "send liveness")
-	}
-
-	if err := p.engine.pubsub.PublishToBitmask(
-		GLOBAL_CONSENSUS_BITMASK,
-		data,
-	); err != nil {
-		p.engine.logger.Error("could not publish", zap.Error(err))
-		return errors.Wrap(err, "send liveness")
-	}
-
-	p.engine.logger.Info(
-		"sent liveness check",
-		zap.Uint64("frame_number", collected.frameNumber),
-	)
-
-	return nil
 }
 
 func (p *GlobalLivenessProvider) validateAndLockMessage(

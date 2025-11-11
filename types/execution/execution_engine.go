@@ -3,6 +3,7 @@ package execution
 import (
 	"math/big"
 
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 )
@@ -14,8 +15,7 @@ type ProcessMessageResult struct {
 
 type ShardExecutionEngine interface {
 	GetName() string
-	Start() <-chan error
-	Stop(force bool) <-chan error
+	Start(ctx lifecycle.SignalerContext, ready lifecycle.ReadyFunc)
 	ValidateMessage(frameNumber uint64, address []byte, message []byte) error
 	ProcessMessage(
 		frameNumber uint64,

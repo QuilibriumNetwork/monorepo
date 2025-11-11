@@ -5,8 +5,10 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	qconsensus "source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/events"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/compiler"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -30,6 +32,7 @@ type AppConsensusEngineFactory struct {
 	inboxStore           store.InboxStore
 	shardsStore          store.ShardsStore
 	hypergraphStore      store.HypergraphStore
+	consensusStore       qconsensus.ConsensusStore[*protobufs.ProposalVote]
 	frameProver          crypto.FrameProver
 	inclusionProver      crypto.InclusionProver
 	bulletproofProver    crypto.BulletproofProver
@@ -60,6 +63,7 @@ func NewAppConsensusEngineFactory(
 	inboxStore store.InboxStore,
 	shardsStore store.ShardsStore,
 	hypergraphStore store.HypergraphStore,
+	consensusStore qconsensus.ConsensusStore[*protobufs.ProposalVote],
 	frameProver crypto.FrameProver,
 	inclusionProver crypto.InclusionProver,
 	bulletproofProver crypto.BulletproofProver,
@@ -88,6 +92,7 @@ func NewAppConsensusEngineFactory(
 		inboxStore:           inboxStore,
 		shardsStore:          shardsStore,
 		hypergraphStore:      hypergraphStore,
+		consensusStore:       consensusStore,
 		frameProver:          frameProver,
 		inclusionProver:      inclusionProver,
 		bulletproofProver:    bulletproofProver,
@@ -145,6 +150,7 @@ func (f *AppConsensusEngineFactory) CreateAppConsensusEngine(
 		f.inboxStore,
 		f.shardsStore,
 		f.hypergraphStore,
+		f.consensusStore,
 		f.frameProver,
 		f.inclusionProver,
 		f.bulletproofProver,

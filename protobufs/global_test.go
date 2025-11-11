@@ -732,32 +732,20 @@ func TestProverLivenessCheck_Serialization(t *testing.T) {
 	}
 }
 
-func TestFrameVote_Serialization(t *testing.T) {
+func TestProposalVote_Serialization(t *testing.T) {
 	tests := []struct {
 		name string
-		vote *FrameVote
+		vote *ProposalVote
 	}{
 		{
 			name: "complete frame vote approve",
-			vote: &FrameVote{
+			vote: &ProposalVote{
 				FrameNumber: 77777,
-				Proposer:    make([]byte, 32),
-				Approve:     true,
+				Rank:        77777,
+				Selector:    make([]byte, 32),
 				PublicKeySignatureBls48581: &BLS48581AddressedSignature{
 					Signature: make([]byte, 74),
 					Address:   make([]byte, 32),
-				},
-			},
-		},
-		{
-			name: "frame vote reject",
-			vote: &FrameVote{
-				FrameNumber: 88888,
-				Proposer:    append([]byte{0xFF}, make([]byte, 31)...),
-				Approve:     false,
-				PublicKeySignatureBls48581: &BLS48581AddressedSignature{
-					Signature: append([]byte{0xAA}, make([]byte, 73)...),
-					Address:   append([]byte{0xCC}, make([]byte, 31)...),
 				},
 			},
 		},
@@ -769,13 +757,13 @@ func TestFrameVote_Serialization(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, data)
 
-			vote2 := &FrameVote{}
+			vote2 := &ProposalVote{}
 			err = vote2.FromCanonicalBytes(data)
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.vote.FrameNumber, vote2.FrameNumber)
-			assert.Equal(t, tt.vote.Proposer, vote2.Proposer)
-			assert.Equal(t, tt.vote.Approve, vote2.Approve)
+			assert.Equal(t, tt.vote.Rank, vote2.Rank)
+			assert.Equal(t, tt.vote.Selector, vote2.Selector)
 			assert.NotNil(t, vote2.PublicKeySignatureBls48581)
 			assert.Equal(t, tt.vote.PublicKeySignatureBls48581.Signature, vote2.PublicKeySignatureBls48581.Signature)
 			assert.Equal(t, tt.vote.PublicKeySignatureBls48581.Address, vote2.PublicKeySignatureBls48581.Address)
@@ -783,15 +771,16 @@ func TestFrameVote_Serialization(t *testing.T) {
 	}
 }
 
-func TestFrameConfirmation_Serialization(t *testing.T) {
+func TestQuorumCertificate_Serialization(t *testing.T) {
 	tests := []struct {
 		name string
-		conf *FrameConfirmation
+		conf *QuorumCertificate
 	}{
 		{
-			name: "complete frame confirmation",
-			conf: &FrameConfirmation{
+			name: "complete confirmation",
+			conf: &QuorumCertificate{
 				FrameNumber: 12345,
+				Rank:        12345,
 				Selector:    make([]byte, 32),
 				AggregateSignature: &BLS48581AggregateSignature{
 					Signature: make([]byte, 74),
@@ -803,9 +792,10 @@ func TestFrameConfirmation_Serialization(t *testing.T) {
 			},
 		},
 		{
-			name: "minimal frame confirmation",
-			conf: &FrameConfirmation{
+			name: "minimal confirmation",
+			conf: &QuorumCertificate{
 				FrameNumber:        0,
+				Rank:               0,
 				Selector:           []byte{},
 				AggregateSignature: nil,
 			},
@@ -818,11 +808,12 @@ func TestFrameConfirmation_Serialization(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, data)
 
-			conf2 := &FrameConfirmation{}
+			conf2 := &QuorumCertificate{}
 			err = conf2.FromCanonicalBytes(data)
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.conf.FrameNumber, conf2.FrameNumber)
+			assert.Equal(t, tt.conf.Rank, conf2.Rank)
 			assert.Equal(t, tt.conf.Selector, conf2.Selector)
 			if tt.conf.AggregateSignature != nil {
 				assert.NotNil(t, conf2.AggregateSignature)

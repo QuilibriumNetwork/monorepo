@@ -15,6 +15,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
@@ -105,9 +106,7 @@ type AppTimeReel struct {
 	) error
 
 	// Control
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx context.Context
 
 	// Archive mode: whether to hold historic frame data
 	archiveMode bool
@@ -125,8 +124,6 @@ func NewAppTimeReel(
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create LRU cache")
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 
 	return &AppTimeReel{
 		logger:           logger,
@@ -153,8 +150,6 @@ func NewAppTimeReel(
 			return nil
 		},
 		store:       clockStore,
-		ctx:         ctx,
-		cancel:      cancel,
 		archiveMode: archiveMode,
 	}, nil
 }
@@ -180,35 +175,45 @@ func (a *AppTimeReel) SetRevertFunc(
 }
 
 // Start starts the app time reel
-func (a *AppTimeReel) Start() error {
+func (a *AppTimeReel) Start(
+	ctx lifecycle.SignalerContext,
+	ready lifecycle.ReadyFunc,
+) {
+	a.ctx = ctx
 	a.logger.Info(
 		"starting app time reel",
 		zap.String("address", fmt.Sprintf("%x", a.address)),
 	)
 
 	if err := a.bootstrapFromStore(); err != nil {
-		return errors.Wrap(err, "start app time reel")
+		ctx.Throw(errors.Wrap(err, "start app time reel"))
+		return
 	}
 
-	return nil
-}
+	ready()
+	<-ctx.Done()
 
-// Stop stops the app time reel
-func (a *AppTimeReel) Stop() {
 	a.logger.Info(
 		"stopping app time reel",
 		zap.String("address", fmt.Sprintf("%x", a.address)),
 	)
-	a.cancel()
-	a.wg.Wait()
 	close(a.eventCh)
 	close(a.eventDone)
 }
 
 // sendEvent sends an event with guaranteed delivery
 func (a *AppTimeReel) sendEvent(event AppEvent) {
-	// This blocks until the event is delivered, guaranteeing order
+	// prioritize halts
 	select {
+	case <-a.ctx.Done():
+		return
+	default:
+	}
+
+	// This blocks until the event is delivered or halted, guaranteeing order
+	select {
+	case <-a.ctx.Done():
+		return
 	case a.eventCh <- event:
 		a.logger.Debug(
 			"sent event",
@@ -216,14 +221,11 @@ func (a *AppTimeReel) sendEvent(event AppEvent) {
 			zap.Uint64("frame_number", event.Frame.Header.FrameNumber),
 			zap.String("id", a.ComputeFrameID(event.Frame)),
 		)
-	case <-a.ctx.Done():
-		return
 	}
 }
 
 // Insert inserts an app frame header into the tree structure
 func (a *AppTimeReel) Insert(
-	ctx context.Context,
 	frame *protobufs.AppShardFrame,
 ) error {
 	// Start timing
