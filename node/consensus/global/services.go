@@ -99,6 +99,15 @@ func (e *GlobalConsensusEngine) GetGlobalProposal(
 		return &protobufs.GlobalProposalResponse{}, nil
 	}
 
+	vote, err := e.clockStore.GetProposalVote(
+		nil,
+		frame.GetRank(),
+		[]byte(frame.Source()),
+	)
+	if err != nil {
+		return &protobufs.GlobalProposalResponse{}, nil
+	}
+
 	parent, err := e.clockStore.GetGlobalClockFrame(request.FrameNumber - 1)
 	if err != nil {
 		e.logger.Debug(
@@ -128,6 +137,7 @@ func (e *GlobalConsensusEngine) GetGlobalProposal(
 		State:                       frame,
 		ParentQuorumCertificate:     parentQC,
 		PriorRankTimeoutCertificate: priorRankTC,
+		Vote:                        vote,
 	}
 
 	return &protobufs.GlobalProposalResponse{

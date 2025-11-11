@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -279,6 +281,11 @@ func decodeValue(key []byte, value []byte) string {
 			return shortHex(value)
 		}
 		return decodeDataProofValue(key[0], key[1], value)
+	case store.CONSENSUS:
+		if len(key) < 2 {
+			return shortHex(value)
+		}
+		return decodeConsensusValue(key, value)
 	case store.INBOX:
 		if len(key) < 2 {
 			return shortHex(value)
@@ -286,6 +293,8 @@ func decodeValue(key []byte, value []byte) string {
 		return decodeInboxValue(key[1], value)
 	case store.HYPERGRAPH_SHARD:
 		return decodeHypergraphValue(key, value)
+	case store.MIGRATION:
+		return decodeMigrationValue(value)
 	default:
 		return shortHex(value)
 	}
@@ -327,9 +336,96 @@ func decodeClockValue(key []byte, value []byte) string {
 			return fmt.Sprintf("frame=%d", frame)
 		}
 		return shortHex(value)
+	case store.CLOCK_GLOBAL_CERTIFIED_STATE,
+		store.CLOCK_SHARD_CERTIFIED_STATE:
+		return decodeCertifiedStateValue(value)
+	case store.CLOCK_GLOBAL_CERTIFIED_STATE_INDEX_EARLIEST,
+		store.CLOCK_GLOBAL_CERTIFIED_STATE_INDEX_LATEST,
+		store.CLOCK_SHARD_CERTIFIED_STATE_INDEX_EARLIEST,
+		store.CLOCK_SHARD_CERTIFIED_STATE_INDEX_LATEST,
+		store.CLOCK_QUORUM_CERTIFICATE_INDEX_EARLIEST,
+		store.CLOCK_QUORUM_CERTIFICATE_INDEX_LATEST,
+		store.CLOCK_TIMEOUT_CERTIFICATE_INDEX_EARLIEST,
+		store.CLOCK_TIMEOUT_CERTIFICATE_INDEX_LATEST:
+		if len(value) == 8 {
+			rank := binary.BigEndian.Uint64(value)
+			return fmt.Sprintf("rank=%d", rank)
+		}
+		return shortHex(value)
+	case store.CLOCK_QUORUM_CERTIFICATE:
+		return decodeQuorumCertificateValue(value)
+	case store.CLOCK_TIMEOUT_CERTIFICATE:
+		return decodeTimeoutCertificateValue(value)
 	default:
 		return shortHex(value)
 	}
+}
+
+func decodeCertifiedStateValue(value []byte) string {
+	if len(value) != 24 {
+		return shortHex(value)
+	}
+
+	frameNumber := binary.BigEndian.Uint64(value[:8])
+	qcRank := binary.BigEndian.Uint64(value[8:16])
+	tcRank := binary.BigEndian.Uint64(value[16:])
+	return fmt.Sprintf(
+		"frame=%d quorum_rank=%d timeout_rank=%d",
+		frameNumber,
+		qcRank,
+		tcRank,
+	)
+}
+
+func decodeQuorumCertificateValue(value []byte) string {
+	qc := &protobufs.QuorumCertificate{}
+	if err := qc.FromCanonicalBytes(slices.Clone(value)); err != nil {
+		return fmt.Sprintf(
+			"quorum_certificate decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	if s, err := jsonMarshaler.Marshal(qc); err == nil {
+		return string(s)
+	}
+
+	return shortHex(value)
+}
+
+func decodeTimeoutCertificateValue(value []byte) string {
+	tc := &protobufs.TimeoutCertificate{}
+	if err := tc.FromCanonicalBytes(slices.Clone(value)); err != nil {
+		return fmt.Sprintf(
+			"timeout_certificate decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	if s, err := jsonMarshaler.Marshal(tc); err == nil {
+		return string(s)
+	}
+
+	return shortHex(value)
+}
+
+func decodeTimeoutStateValue(value []byte) string {
+	state := &protobufs.TimeoutState{}
+	if err := state.FromCanonicalBytes(slices.Clone(value)); err != nil {
+		return fmt.Sprintf(
+			"timeout_state decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	if s, err := jsonMarshaler.Marshal(state); err == nil {
+		return string(s)
+	}
+
+	return shortHex(value)
 }
 
 func decodeKeyBundleValue(sub byte, value []byte) string {
@@ -407,6 +503,151 @@ func decodeDataProofValue(prefix byte, sub byte, value []byte) string {
 		}
 	}
 	return shortHex(value)
+}
+
+func decodeConsensusValue(key []byte, value []byte) string {
+	switch key[1] {
+	case store.CONSENSUS_STATE:
+		return decodeConsensusStateValue(value)
+	case store.CONSENSUS_LIVENESS:
+		return decodeConsensusLivenessValue(value)
+	default:
+		return shortHex(value)
+	}
+}
+
+func decodeConsensusStateValue(value []byte) string {
+	buf := bytes.NewReader(value)
+
+	filter, err := readUint32PrefixedBytes(buf)
+	if err != nil {
+		return fmt.Sprintf(
+			"consensus_state decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	var finalizedRank uint64
+	if err := binary.Read(buf, binary.BigEndian, &finalizedRank); err != nil {
+		return fmt.Sprintf(
+			"consensus_state decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	var latestAckRank uint64
+	if err := binary.Read(buf, binary.BigEndian, &latestAckRank); err != nil {
+		return fmt.Sprintf(
+			"consensus_state decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	latestTimeoutBytes, err := readUint32PrefixedBytes(buf)
+	if err != nil {
+		return fmt.Sprintf(
+			"consensus_state decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "filter=%s\n", shortHex(filter))
+	fmt.Fprintf(&builder, "finalized_rank=%d\n", finalizedRank)
+	fmt.Fprintf(&builder, "latest_ack_rank=%d", latestAckRank)
+
+	if len(latestTimeoutBytes) > 0 {
+		builder.WriteString("\nlatest_timeout_state=\n")
+		builder.WriteString(indent(decodeTimeoutStateValue(latestTimeoutBytes)))
+	}
+
+	return builder.String()
+}
+
+func decodeConsensusLivenessValue(value []byte) string {
+	buf := bytes.NewReader(value)
+
+	filter, err := readUint32PrefixedBytes(buf)
+	if err != nil {
+		return fmt.Sprintf(
+			"consensus_liveness decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	var currentRank uint64
+	if err := binary.Read(buf, binary.BigEndian, &currentRank); err != nil {
+		return fmt.Sprintf(
+			"consensus_liveness decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	latestQCBytes, err := readUint32PrefixedBytes(buf)
+	if err != nil {
+		return fmt.Sprintf(
+			"consensus_liveness decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	priorTCBytes, err := readUint32PrefixedBytes(buf)
+	if err != nil {
+		return fmt.Sprintf(
+			"consensus_liveness decode_error=%v raw=%s",
+			err,
+			shortHex(value),
+		)
+	}
+
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "filter=%s\n", shortHex(filter))
+	fmt.Fprintf(&builder, "current_rank=%d", currentRank)
+
+	if len(latestQCBytes) > 0 {
+		builder.WriteString("\nlatest_quorum_certificate=\n")
+		builder.WriteString(indent(decodeQuorumCertificateValue(latestQCBytes)))
+	}
+
+	if len(priorTCBytes) > 0 {
+		builder.WriteString("\nprior_timeout_certificate=\n")
+		builder.WriteString(indent(decodeTimeoutCertificateValue(priorTCBytes)))
+	}
+
+	return builder.String()
+}
+
+func decodeMigrationValue(value []byte) string {
+	if len(value) == 8 {
+		version := binary.BigEndian.Uint64(value)
+		return fmt.Sprintf("migration_version=%d", version)
+	}
+	return shortHex(value)
+}
+
+func readUint32PrefixedBytes(r io.Reader) ([]byte, error) {
+	var length uint32
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return nil, err
+	}
+
+	if length == 0 {
+		return nil, nil
+	}
+
+	data := make([]byte, length)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
+
+	return data, nil
 }
 
 func decodeInboxValue(sub byte, value []byte) string {
@@ -761,6 +1002,10 @@ func describeKey(key []byte) string {
 		return describeInboxKey(key)
 	case store.WORKER:
 		return describeWorkerKey(key)
+	case store.CONSENSUS:
+		return describeConsensusKey(key)
+	case store.MIGRATION:
+		return "pebble store migration version"
 	default:
 		return fmt.Sprintf("unknown prefix 0x%02x (len=%d)", key[0], len(key))
 	}
@@ -826,6 +1071,37 @@ func describeClockKey(key []byte) string {
 			"clock shard frame latest index shard=%s",
 			shortHex(key[2:]),
 		)
+	case store.CLOCK_GLOBAL_CERTIFIED_STATE:
+		if len(key) >= 10 {
+			rank := binary.BigEndian.Uint64(key[2:10])
+			return fmt.Sprintf("clock global certified state rank=%d", rank)
+		}
+		return "clock global certified state (invalid length)"
+	case store.CLOCK_GLOBAL_CERTIFIED_STATE_INDEX_EARLIEST:
+		return "clock global certified state earliest index"
+	case store.CLOCK_GLOBAL_CERTIFIED_STATE_INDEX_LATEST:
+		return "clock global certified state latest index"
+	case store.CLOCK_SHARD_CERTIFIED_STATE:
+		if len(key) >= 10 {
+			rank := binary.BigEndian.Uint64(key[2:10])
+			filter := key[10:]
+			return fmt.Sprintf(
+				"clock shard certified state rank=%d shard=%s",
+				rank,
+				shortHex(filter),
+			)
+		}
+		return "clock shard certified state (invalid length)"
+	case store.CLOCK_SHARD_CERTIFIED_STATE_INDEX_EARLIEST:
+		return fmt.Sprintf(
+			"clock shard certified state earliest index shard=%s",
+			shortHex(key[2:]),
+		)
+	case store.CLOCK_SHARD_CERTIFIED_STATE_INDEX_LATEST:
+		return fmt.Sprintf(
+			"clock shard certified state latest index shard=%s",
+			shortHex(key[2:]),
+		)
 	case store.CLOCK_SHARD_FRAME_INDEX_PARENT:
 		if len(key) >= 42 {
 			frame := binary.BigEndian.Uint64(key[2:10])
@@ -878,6 +1154,51 @@ func describeClockKey(key []byte) string {
 	case store.CLOCK_COMPACTION_SHARD:
 		return fmt.Sprintf(
 			"clock compaction marker shard=%s",
+			shortHex(key[2:]),
+		)
+	case store.CLOCK_QUORUM_CERTIFICATE:
+		if len(key) >= 10 {
+			rank := binary.BigEndian.Uint64(key[2:10])
+			filter := key[10:]
+			if len(filter) > 0 {
+				return fmt.Sprintf(
+					"clock quorum certificate rank=%d filter=%s",
+					rank,
+					shortHex(filter),
+				)
+			}
+			return fmt.Sprintf("clock quorum certificate rank=%d", rank)
+		}
+		return "clock quorum certificate (invalid length)"
+	case store.CLOCK_QUORUM_CERTIFICATE_INDEX_EARLIEST:
+		return fmt.Sprintf(
+			"clock quorum certificate earliest index filter=%s",
+			shortHex(key[2:]),
+		)
+	case store.CLOCK_QUORUM_CERTIFICATE_INDEX_LATEST:
+		return fmt.Sprintf(
+			"clock quorum certificate latest index filter=%s",
+			shortHex(key[2:]),
+		)
+	case store.CLOCK_TIMEOUT_CERTIFICATE:
+		if len(key) >= 10 {
+			rank := binary.BigEndian.Uint64(key[2:10])
+			filter := key[10:]
+			return fmt.Sprintf(
+				"clock timeout certificate rank=%d filter=%s",
+				rank,
+				shortHex(filter),
+			)
+		}
+		return "clock timeout certificate (invalid length)"
+	case store.CLOCK_TIMEOUT_CERTIFICATE_INDEX_EARLIEST:
+		return fmt.Sprintf(
+			"clock timeout certificate earliest index filter=%s",
+			shortHex(key[2:]),
+		)
+	case store.CLOCK_TIMEOUT_CERTIFICATE_INDEX_LATEST:
+		return fmt.Sprintf(
+			"clock timeout certificate latest index filter=%s",
 			shortHex(key[2:]),
 		)
 	case store.CLOCK_SHARD_FRAME_CANDIDATE_SHARD:
@@ -1429,6 +1750,27 @@ func describeWorkerKey(key []byte) string {
 			"worker store unknown subtype 0x%02x raw=%s",
 			sub,
 			shortHex(payload),
+		)
+	}
+}
+
+func describeConsensusKey(key []byte) string {
+	if len(key) < 2 {
+		return "consensus store: invalid key length"
+	}
+
+	sub := key[1]
+	filter := key[2:]
+	switch sub {
+	case store.CONSENSUS_STATE:
+		return fmt.Sprintf("consensus state filter=%s", shortHex(filter))
+	case store.CONSENSUS_LIVENESS:
+		return fmt.Sprintf("consensus liveness filter=%s", shortHex(filter))
+	default:
+		return fmt.Sprintf(
+			"consensus store unknown subtype 0x%02x raw=%s",
+			sub,
+			shortHex(filter),
 		)
 	}
 }

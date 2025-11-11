@@ -128,6 +128,7 @@ type GlobalConsensusEngine struct {
 	peerInfoManager  tp2p.PeerInfoManager
 	workerManager    worker.WorkerManager
 	proposer         *provers.Manager
+	currentRank      uint64
 	alertPublicKey   []byte
 	hasSentKeyBundle bool
 
@@ -146,24 +147,26 @@ type GlobalConsensusEngine struct {
 	halt    context.CancelFunc
 
 	// Internal state
-	quit                  chan struct{}
-	wg                    sync.WaitGroup
-	minimumProvers        func() uint64
-	blacklistMap          map[string]bool
-	blacklistMu           sync.RWMutex
-	pendingMessages       [][]byte
-	pendingMessagesMu     sync.RWMutex
-	currentDifficulty     uint32
-	currentDifficultyMu   sync.RWMutex
-	lastProvenFrameTime   time.Time
-	lastProvenFrameTimeMu sync.RWMutex
-	frameStore            map[string]*protobufs.GlobalFrame
-	frameStoreMu          sync.RWMutex
-	proposalCache         map[string]*protobufs.GlobalProposal
-	proposalCacheMu       sync.RWMutex
-	appFrameStore         map[string]*protobufs.AppShardFrame
-	appFrameStoreMu       sync.RWMutex
-	lowCoverageStreak     map[string]*coverageStreak
+	quit                      chan struct{}
+	wg                        sync.WaitGroup
+	minimumProvers            func() uint64
+	blacklistMap              map[string]bool
+	blacklistMu               sync.RWMutex
+	pendingMessages           [][]byte
+	pendingMessagesMu         sync.RWMutex
+	currentDifficulty         uint32
+	currentDifficultyMu       sync.RWMutex
+	lastProvenFrameTime       time.Time
+	lastProvenFrameTimeMu     sync.RWMutex
+	frameStore                map[string]*protobufs.GlobalFrame
+	frameStoreMu              sync.RWMutex
+	proposalCache             map[uint64]*protobufs.GlobalProposal
+	proposalCacheMu           sync.RWMutex
+	pendingCertifiedParents   map[uint64]*protobufs.GlobalProposal
+	pendingCertifiedParentsMu sync.RWMutex
+	appFrameStore             map[string]*protobufs.AppShardFrame
+	appFrameStoreMu           sync.RWMutex
+	lowCoverageStreak         map[string]*coverageStreak
 
 	// Transaction cross-shard lock tracking
 	txLockMap map[uint64]map[string]map[string]*LockedTransaction
@@ -269,7 +272,8 @@ func NewGlobalConsensusEngine(
 		peerInfoManager:             peerInfoManager,
 		frameStore:                  make(map[string]*protobufs.GlobalFrame),
 		appFrameStore:               make(map[string]*protobufs.AppShardFrame),
-		proposalCache:               make(map[string]*protobufs.GlobalProposal),
+		proposalCache:               make(map[uint64]*protobufs.GlobalProposal),
+		pendingCertifiedParents:     make(map[uint64]*protobufs.GlobalProposal),
 		globalConsensusMessageQueue: make(chan *pb.Message, 1000),
 		globalFrameMessageQueue:     make(chan *pb.Message, 100),
 		globalProverMessageQueue:    make(chan *pb.Message, 1000),
@@ -549,6 +553,11 @@ func NewGlobalConsensusEngine(
 			CertifyingQuorumCertificate: qc,
 		}
 		pending = engine.getPendingProposals(frame.Header.FrameNumber)
+	}
+
+	liveness, err := engine.consensusStore.GetLivenessState(nil)
+	if err == nil {
+		engine.currentRank = liveness.CurrentRank
 	}
 
 	engine.voteAggregator, err = voting.NewGlobalVoteAggregator[GlobalPeerID](
@@ -2539,42 +2548,62 @@ func (e *GlobalConsensusEngine) OnOwnProposal(
 	],
 	targetPublicationTime time.Time,
 ) {
-	select {
-	case <-e.haltCtx.Done():
-		return
-	default:
-	}
-	var priorTC *protobufs.TimeoutCertificate = nil
-	if proposal.PreviousRankTimeoutCertificate != nil {
-		priorTC =
-			proposal.PreviousRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
-	}
+	go func() {
+		select {
+		case <-time.After(time.Until(targetPublicationTime)):
+		case <-e.ShutdownSignal():
+			return
+		}
+		var priorTC *protobufs.TimeoutCertificate = nil
+		if proposal.PreviousRankTimeoutCertificate != nil {
+			priorTC =
+				proposal.PreviousRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
+		}
 
-	// Manually override the signature as the vdf prover's signature is invalid
-	(*proposal.State.State).Header.PublicKeySignatureBls48581.Signature =
-		(*proposal.Vote).PublicKeySignatureBls48581.Signature
+		// Manually override the signature as the vdf prover's signature is invalid
+		(*proposal.State.State).Header.PublicKeySignatureBls48581.Signature =
+			(*proposal.Vote).PublicKeySignatureBls48581.Signature
 
-	pbProposal := &protobufs.GlobalProposal{
-		State:                       *proposal.State.State,
-		ParentQuorumCertificate:     proposal.Proposal.State.ParentQuorumCertificate.(*protobufs.QuorumCertificate),
-		PriorRankTimeoutCertificate: priorTC,
-		Vote:                        *proposal.Vote,
-	}
-	data, err := pbProposal.ToCanonicalBytes()
-	if err != nil {
-		e.logger.Error("could not serialize proposal", zap.Error(err))
-		return
-	}
+		pbProposal := &protobufs.GlobalProposal{
+			State:                       *proposal.State.State,
+			ParentQuorumCertificate:     proposal.Proposal.State.ParentQuorumCertificate.(*protobufs.QuorumCertificate),
+			PriorRankTimeoutCertificate: priorTC,
+			Vote:                        *proposal.Vote,
+		}
+		data, err := pbProposal.ToCanonicalBytes()
+		if err != nil {
+			e.logger.Error("could not serialize proposal", zap.Error(err))
+			return
+		}
 
-	e.voteAggregator.AddState(proposal)
-	e.consensusParticipant.SubmitProposal(proposal)
+		txn, err := e.clockStore.NewTransaction(false)
+		if err != nil {
+			e.logger.Error("could not create transaction", zap.Error(err))
+			return
+		}
 
-	if err := e.pubsub.PublishToBitmask(
-		GLOBAL_CONSENSUS_BITMASK,
-		data,
-	); err != nil {
-		e.logger.Error("could not publish", zap.Error(err))
-	}
+		if err := e.clockStore.PutProposalVote(txn, *proposal.Vote); err != nil {
+			e.logger.Error("could not put vote", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
+		if err := txn.Commit(); err != nil {
+			e.logger.Error("could not commit transaction", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
+		e.voteAggregator.AddState(proposal)
+		e.consensusParticipant.SubmitProposal(proposal)
+
+		if err := e.pubsub.PublishToBitmask(
+			GLOBAL_CONSENSUS_BITMASK,
+			data,
+		); err != nil {
+			e.logger.Error("could not publish", zap.Error(err))
+		}
+	}()
 }
 
 // OnOwnTimeout implements consensus.Consumer.
@@ -2606,6 +2635,24 @@ func (e *GlobalConsensusEngine) OnOwnTimeout(
 		return
 	}
 
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutTimeoutVote(txn, pbTimeout); err != nil {
+		e.logger.Error("could not put vote", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
 	e.timeoutAggregator.AddTimeout(timeout)
 
 	if err := e.pubsub.PublishToBitmask(
@@ -2630,6 +2677,24 @@ func (e *GlobalConsensusEngine) OnOwnVote(
 	data, err := (*vote).ToCanonicalBytes()
 	if err != nil {
 		e.logger.Error("could not serialize timeout", zap.Error(err))
+		return
+	}
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutProposalVote(txn, *vote); err != nil {
+		e.logger.Error("could not put vote", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
 		return
 	}
 
@@ -2707,6 +2772,20 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 			zap.Uint64("rank", newRank-1),
 			zap.Uint64("frame_number", qc.GetFrameNumber()),
 		)
+		current, err := e.globalTimeReel.GetHead()
+		if err != nil {
+			e.logger.Error("could not get time reel head", zap.Error(err))
+			return
+		}
+		peer, err := e.getRandomProverPeerId()
+		if err != nil {
+			e.logger.Error("could not get random peer", zap.Error(err))
+			return
+		}
+		e.syncProvider.AddState(
+			[]byte(peer),
+			current.Header.FrameNumber,
+		)
 		return
 	}
 
@@ -2715,6 +2794,38 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 	err = e.globalTimeReel.Insert(frame)
 	if err != nil {
 		e.logger.Error("could not insert frame into time reel", zap.Error(err))
+		return
+	}
+
+	current, err := e.globalTimeReel.GetHead()
+	if err != nil {
+		e.logger.Error("could not get time reel head", zap.Error(err))
+		return
+	}
+
+	if !bytes.Equal(frame.Header.Output, current.Header.Output) {
+		e.logger.Error(
+			"frames not aligned, might need sync",
+			zap.Uint64("new_frame_number", frame.Header.FrameNumber),
+			zap.Uint64("reel_frame_number", current.Header.FrameNumber),
+			zap.Uint64("new_frame_rank", frame.Header.Rank),
+			zap.Uint64("reel_frame_rank", current.Header.Rank),
+			zap.String("new_frame_id", hex.EncodeToString([]byte(frame.Identity()))),
+			zap.String(
+				"reel_frame_id",
+				hex.EncodeToString([]byte(current.Identity())),
+			),
+		)
+
+		peerID, err := e.getPeerIDOfProver(frame.Header.Prover)
+		if err != nil {
+			return
+		}
+
+		e.syncProvider.AddState(
+			[]byte(peerID),
+			current.Header.FrameNumber,
+		)
 		return
 	}
 
@@ -2739,6 +2850,20 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 		e.logger.Debug("no prior rank TC to include", zap.Uint64("rank", newRank-1))
 	}
 
+	vote, err := e.clockStore.GetProposalVote(
+		nil,
+		frame.GetRank(),
+		[]byte(frame.Source()),
+	)
+	if err != nil {
+		e.logger.Error(
+			"cannot find proposer's vote",
+			zap.Uint64("rank", newRank-1),
+			zap.String("proposer", hex.EncodeToString([]byte(frame.Source()))),
+		)
+		return
+	}
+
 	txn, err = e.clockStore.NewTransaction(false)
 	if err != nil {
 		e.logger.Error("could not create transaction", zap.Error(err))
@@ -2750,6 +2875,7 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 			State:                       frame,
 			ParentQuorumCertificate:     parentQC,
 			PriorRankTimeoutCertificate: priorRankTC,
+			Vote:                        vote,
 		},
 		txn,
 	); err != nil {
@@ -2765,7 +2891,9 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 }
 
 // OnRankChange implements consensus.Consumer.
-func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {}
+func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
+	e.currentRank = newRank
+}
 
 // OnReceiveProposal implements consensus.Consumer.
 func (e *GlobalConsensusEngine) OnReceiveProposal(
@@ -2842,6 +2970,13 @@ func (e *GlobalConsensusEngine) OnTimeoutCertificateTriggeredRankChange(
 				},
 				Bitmask: qc.GetAggregatedSignature().GetBitmask(),
 			},
+		},
+		AggregateSignature: &protobufs.BLS48581AggregateSignature{
+			Signature: tc.GetAggregatedSignature().GetSignature(),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: tc.GetAggregatedSignature().GetPubKey(),
+			},
+			Bitmask: tc.GetAggregatedSignature().GetBitmask(),
 		},
 	}, txn)
 	if err != nil {
@@ -3114,20 +3249,11 @@ func (e *GlobalConsensusEngine) getPendingProposals(
 	return result
 }
 
-func (e *GlobalConsensusEngine) getRandomProverPeerId() (peer.ID, error) {
-	provers, err := e.proverRegistry.GetActiveProvers(nil)
-	if err != nil {
-		e.logger.Error(
-			"could not get active provers for sync",
-			zap.Error(err),
-		)
-	}
-	if len(provers) == 0 {
-		return "", err
-	}
-	index := rand.Intn(len(provers))
+func (e *GlobalConsensusEngine) getPeerIDOfProver(
+	prover []byte,
+) (peer.ID, error) {
 	registry, err := e.signerRegistry.GetKeyRegistryByProver(
-		provers[index].Address,
+		prover,
 	)
 	if err != nil {
 		e.logger.Debug(
@@ -3161,6 +3287,30 @@ func (e *GlobalConsensusEngine) getRandomProverPeerId() (peer.ID, error) {
 	}
 
 	return id, nil
+}
+
+func (e *GlobalConsensusEngine) getRandomProverPeerId() (peer.ID, error) {
+	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		e.logger.Error(
+			"could not get active provers for sync",
+			zap.Error(err),
+		)
+	}
+	if len(provers) == 0 {
+		return "", err
+	}
+
+	otherProvers := []*typesconsensus.ProverInfo{}
+	for _, p := range provers {
+		if bytes.Equal(p.Address, e.getProverAddress()) {
+			continue
+		}
+		otherProvers = append(otherProvers, p)
+	}
+
+	index := rand.Intn(len(otherProvers))
+	return e.getPeerIDOfProver(otherProvers[index].Address)
 }
 
 var _ consensus.DynamicCommittee = (*GlobalConsensusEngine)(nil)

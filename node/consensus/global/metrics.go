@@ -95,6 +95,27 @@ var (
 		},
 	)
 
+	// Shard liveness check processing metrics
+	shardLivenessCheckProcessedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_liveness_check_processed_total",
+			Help:      "Total number of shard liveness checks processed by the global consensus engine",
+		},
+		[]string{"status"}, // status: "success", "error", "invalid"
+	)
+
+	shardLivenessCheckProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "shard_liveness_check_processing_duration_seconds",
+			Help:      "Time taken to process a shard liveness check",
+			Buckets:   prometheus.DefBuckets,
+		},
+	)
+
 	// Global vote processing metrics
 	voteProcessedTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{

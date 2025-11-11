@@ -43,7 +43,14 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		if e.forks.FinalizedRank() > proposal.GetRank() {
+		if err := proposal.Validate(); err != nil {
+			e.logger.Debug("invalid proposal", zap.Error(err))
+			proposalValidationTotal.WithLabelValues("reject").Inc()
+			return tp2p.ValidationResultIgnore
+		}
+
+		if e.currentRank > proposal.GetRank() {
+			e.logger.Debug("proposal is stale")
 			proposalValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultIgnore
 		}
@@ -76,8 +83,8 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		now := uint64(time.Now().UnixMilli())
-		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
+		if e.currentRank > vote.Rank {
+			e.logger.Debug("vote is stale")
 			return tp2p.ValidationResultIgnore
 		}
 
@@ -103,9 +110,8 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		now := uint64(time.Now().UnixMilli())
-		if timeoutState.Timestamp > now+5000 ||
-			timeoutState.Timestamp < now-5000 {
+		if e.currentRank > timeoutState.Vote.Rank {
+			e.logger.Debug("timeout is stale")
 			return tp2p.ValidationResultIgnore
 		}
 
@@ -241,6 +247,18 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 		}
 
 		shardTimeoutStateValidationTotal.WithLabelValues("accept").Inc()
+
+	case protobufs.ProverLivenessCheckType:
+		check := &protobufs.ProverLivenessCheck{}
+		if err := check.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
+
+		if err := check.Validate(); err != nil {
+			e.logger.Debug("invalid liveness check", zap.Error(err))
+			return tp2p.ValidationResultReject
+		}
 
 	default:
 		return tp2p.ValidationResultReject

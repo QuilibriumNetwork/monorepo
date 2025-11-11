@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 
@@ -166,16 +167,12 @@ func (e *AppConsensusEngine) handleAppShardProposal(
 	pqc := proposal.ParentQuorumCertificate
 	prtc := proposal.PriorRankTimeoutCertificate
 	vote := proposal.Vote
-	proposer := models.Identity("")
-	if vote != nil {
-		proposer = vote.Identity()
-	}
 	signedProposal := &models.SignedProposal[*protobufs.AppShardFrame, *protobufs.ProposalVote]{
 		Proposal: models.Proposal[*protobufs.AppShardFrame]{
 			State: &models.State[*protobufs.AppShardFrame]{
 				Rank:       proposal.State.GetRank(),
 				Identifier: proposal.State.Identity(),
-				ProposerID: proposer,
+				ProposerID: proposal.State.Source(),
 				Timestamp:  proposal.State.GetTimestamp(),
 				State:      &proposal.State,
 			},
@@ -210,24 +207,14 @@ func (e *AppConsensusEngine) handleAppShardProposal(
 		e.logger.Debug("dropping stale proposal")
 		return
 	}
-	// if we have a parent, cache and move on
-	e.proposalCacheMu.RLock()
-	_, ok := e.proposalCache[string(proposal.State.Header.ParentSelector)]
-	e.proposalCacheMu.RUnlock()
-	if ok {
-		e.proposalCacheMu.Lock()
-		e.proposalCache[proposal.State.Identity()] = proposal
-		e.proposalCacheMu.Unlock()
-		return
-	}
+
 	if proposal.State.Header.FrameNumber != 0 {
-		// also check with persistence layer
 		parent, _, err := e.clockStore.GetShardClockFrame(
 			proposal.State.Header.Address,
 			proposal.State.Header.FrameNumber-1,
 			false,
 		)
-		if err != nil || !bytes.Equal(
+		if err != nil || parent == nil || !bytes.Equal(
 			[]byte(parent.Identity()),
 			proposal.State.Header.ParentSelector,
 		) {
@@ -235,31 +222,68 @@ func (e *AppConsensusEngine) handleAppShardProposal(
 				"parent frame not stored, requesting sync",
 				zap.Uint64("frame_number", proposal.State.Header.FrameNumber-1),
 			)
-			e.proposalCacheMu.Lock()
-			e.proposalCache[proposal.State.Identity()] = proposal
-			e.proposalCacheMu.Unlock()
-			var peerId []byte
-			if proposal.Vote != nil {
-				peerId = []byte(proposal.Vote.Identity())
-			} else {
-				id, err := e.getRandomProverPeerId()
+			e.cacheProposal(proposal)
+
+			peerID, err := e.getPeerIDOfProver(proposal.State.Header.Prover)
+			if err != nil {
+				peerID, err = e.getRandomProverPeerId()
 				if err != nil {
-					e.logger.Debug("could not get random peer", zap.Error(err))
+					e.logger.Debug("could not get peer id for sync", zap.Error(err))
 					return
 				}
-				peerId = []byte(id)
 			}
-			e.syncProvider.AddState(peerId, proposal.State.Header.FrameNumber-1)
+
+			head, err := e.appTimeReel.GetHead()
+			if err != nil || head == nil || head.Header == nil {
+				e.logger.Debug("could not get shard time reel head", zap.Error(err))
+				return
+			}
+
+			e.syncProvider.AddState([]byte(peerID), head.Header.FrameNumber)
 			return
 		}
 	}
 
-	e.processProposal(proposal)
+	frameNumber := proposal.State.Header.FrameNumber
+	expectedFrame, err := e.appTimeReel.GetHead()
+	if err != nil {
+		e.logger.Error("could not obtain app time reel head", zap.Error(err))
+		return
+	}
+
+	expectedFrameNumber := uint64(0)
+	if expectedFrame != nil && expectedFrame.Header != nil {
+		expectedFrameNumber = expectedFrame.Header.FrameNumber + 1
+	}
+
+	if frameNumber < expectedFrameNumber {
+		e.logger.Debug(
+			"dropping proposal behind expected frame",
+			zap.Uint64("frame_number", frameNumber),
+			zap.Uint64("expected_frame_number", expectedFrameNumber),
+		)
+		return
+	}
+
+	if frameNumber == expectedFrameNumber {
+		e.deleteCachedProposal(frameNumber)
+		if e.processProposal(proposal) {
+			e.drainProposalCache(frameNumber + 1)
+			return
+		}
+
+		e.logger.Debug("failed to process expected proposal, caching")
+		e.cacheProposal(proposal)
+		return
+	}
+
+	e.cacheProposal(proposal)
+	e.drainProposalCache(expectedFrameNumber)
 }
 
 func (e *AppConsensusEngine) processProposal(
 	proposal *protobufs.AppShardProposal,
-) {
+) bool {
 	e.logger.Debug(
 		"processing proposal",
 		zap.String("id", hex.EncodeToString([]byte(proposal.State.Identity()))),
@@ -268,14 +292,14 @@ func (e *AppConsensusEngine) processProposal(
 	err := e.VerifyQuorumCertificate(proposal.ParentQuorumCertificate)
 	if err != nil {
 		e.logger.Debug("proposal has invalid qc", zap.Error(err))
-		return
+		return false
 	}
 
 	if proposal.PriorRankTimeoutCertificate != nil {
 		err := e.VerifyTimeoutCertificate(proposal.PriorRankTimeoutCertificate)
 		if err != nil {
 			e.logger.Debug("proposal has invalid tc", zap.Error(err))
-			return
+			return false
 		}
 	}
 
@@ -283,20 +307,20 @@ func (e *AppConsensusEngine) processProposal(
 		err := e.VerifyVote(&proposal.Vote)
 		if err != nil {
 			e.logger.Debug("proposal has invalid vote", zap.Error(err))
-			return
+			return false
 		}
 	}
 
 	err = proposal.State.Validate()
 	if err != nil {
 		e.logger.Debug("proposal is not valid", zap.Error(err))
-		return
+		return false
 	}
 
 	valid, err := e.frameValidator.Validate(proposal.State)
 	if !valid || err != nil {
 		e.logger.Debug("invalid frame in proposal", zap.Error(err))
-		return
+		return false
 	}
 
 	// Small gotcha: the proposal structure uses interfaces, so we can't assign
@@ -327,28 +351,243 @@ func (e *AppConsensusEngine) processProposal(
 		signedProposal.PreviousRankTimeoutCertificate = prtc
 	}
 
+	e.voteAggregator.AddState(signedProposal)
 	e.consensusParticipant.SubmitProposal(signedProposal)
 	proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
-	e.proposalCacheMu.RLock()
-	props := []*protobufs.AppShardProposal{}
-	removes := []string{}
-	for id, prop := range e.proposalCache {
-		if bytes.Equal(
-			prop.State.Header.ParentSelector,
-			[]byte(proposal.State.Identity()),
-		) {
-			props = append(props, prop)
-			removes = append(removes, id)
-		}
+
+	e.trySealParentWithChild(proposal)
+	e.registerPendingCertifiedParent(proposal)
+
+	return true
+}
+
+func (e *AppConsensusEngine) cacheProposal(
+	proposal *protobufs.AppShardProposal,
+) {
+	if proposal == nil || proposal.State == nil || proposal.State.Header == nil {
+		return
 	}
-	e.proposalCacheMu.RUnlock()
-	for i := range props {
-		prop := props[i]
-		remove := removes[i]
-		e.processProposal(prop)
-		e.proposalCacheMu.Lock()
-		delete(e.proposalCache, remove)
-		e.proposalCacheMu.Unlock()
+
+	frameNumber := proposal.State.Header.FrameNumber
+	e.proposalCacheMu.Lock()
+	e.proposalCache[frameNumber] = proposal
+	e.proposalCacheMu.Unlock()
+
+	e.logger.Debug(
+		"cached out-of-order proposal",
+		zap.String("address", e.appAddressHex),
+		zap.Uint64("frame_number", frameNumber),
+	)
+}
+
+func (e *AppConsensusEngine) deleteCachedProposal(frameNumber uint64) {
+	e.proposalCacheMu.Lock()
+	delete(e.proposalCache, frameNumber)
+	e.proposalCacheMu.Unlock()
+}
+
+func (e *AppConsensusEngine) popCachedProposal(
+	frameNumber uint64,
+) *protobufs.AppShardProposal {
+	e.proposalCacheMu.Lock()
+	defer e.proposalCacheMu.Unlock()
+
+	proposal, ok := e.proposalCache[frameNumber]
+	if ok {
+		delete(e.proposalCache, frameNumber)
+	}
+
+	return proposal
+}
+
+func (e *AppConsensusEngine) drainProposalCache(startFrame uint64) {
+	next := startFrame
+	for {
+		prop := e.popCachedProposal(next)
+		if prop == nil {
+			return
+		}
+
+		if !e.processProposal(prop) {
+			e.logger.Debug(
+				"cached proposal failed processing, retaining for retry",
+				zap.String("address", e.appAddressHex),
+				zap.Uint64("frame_number", next),
+			)
+			e.cacheProposal(prop)
+			return
+		}
+
+		next++
+	}
+}
+
+func (e *AppConsensusEngine) registerPendingCertifiedParent(
+	proposal *protobufs.AppShardProposal,
+) {
+	if proposal == nil || proposal.State == nil || proposal.State.Header == nil {
+		return
+	}
+
+	frameNumber := proposal.State.Header.FrameNumber
+	e.pendingCertifiedParentsMu.Lock()
+	e.pendingCertifiedParents[frameNumber] = proposal
+	e.pendingCertifiedParentsMu.Unlock()
+}
+
+func (e *AppConsensusEngine) trySealParentWithChild(
+	child *protobufs.AppShardProposal,
+) {
+	if child == nil || child.State == nil || child.State.Header == nil {
+		return
+	}
+
+	header := child.State.Header
+	if header.FrameNumber == 0 {
+		return
+	}
+
+	parentFrame := header.FrameNumber - 1
+
+	e.pendingCertifiedParentsMu.RLock()
+	parent, ok := e.pendingCertifiedParents[parentFrame]
+	e.pendingCertifiedParentsMu.RUnlock()
+	if !ok || parent == nil || parent.State == nil || parent.State.Header == nil {
+		return
+	}
+
+	if !bytes.Equal(
+		header.ParentSelector,
+		[]byte(parent.State.Identity()),
+	) {
+		e.logger.Debug(
+			"pending parent selector mismatch, dropping entry",
+			zap.String("address", e.appAddressHex),
+			zap.Uint64("parent_frame", parent.State.Header.FrameNumber),
+			zap.Uint64("child_frame", header.FrameNumber),
+		)
+		e.pendingCertifiedParentsMu.Lock()
+		delete(e.pendingCertifiedParents, parentFrame)
+		e.pendingCertifiedParentsMu.Unlock()
+		return
+	}
+
+	head, err := e.appTimeReel.GetHead()
+	if err != nil {
+		e.logger.Error("error fetching app time reel head", zap.Error(err))
+		return
+	}
+
+	if head != nil && head.Header != nil &&
+		head.Header.FrameNumber+1 == parent.State.Header.FrameNumber {
+		e.logger.Debug(
+			"sealing parent with descendant proposal",
+			zap.String("address", e.appAddressHex),
+			zap.Uint64("parent_frame", parent.State.Header.FrameNumber),
+			zap.Uint64("child_frame", header.FrameNumber),
+		)
+		e.addCertifiedState(parent, child)
+	}
+
+	e.pendingCertifiedParentsMu.Lock()
+	delete(e.pendingCertifiedParents, parentFrame)
+	e.pendingCertifiedParentsMu.Unlock()
+}
+
+func (e *AppConsensusEngine) addCertifiedState(
+	parent, child *protobufs.AppShardProposal,
+) {
+	if parent == nil || parent.State == nil || parent.State.Header == nil ||
+		child == nil || child.State == nil || child.State.Header == nil {
+		e.logger.Error("cannot seal certified state: missing parent or child data")
+		return
+	}
+
+	qc := child.ParentQuorumCertificate
+	if qc == nil {
+		e.logger.Error(
+			"child missing parent quorum certificate",
+			zap.Uint64("child_frame_number", child.State.Header.FrameNumber),
+		)
+		return
+	}
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	aggregateSig := &protobufs.BLS48581AggregateSignature{
+		Signature: qc.GetAggregatedSignature().GetSignature(),
+		PublicKey: &protobufs.BLS48581G2PublicKey{
+			KeyValue: qc.GetAggregatedSignature().GetPubKey(),
+		},
+		Bitmask: qc.GetAggregatedSignature().GetBitmask(),
+	}
+	if err := e.clockStore.PutQuorumCertificate(
+		&protobufs.QuorumCertificate{
+			Filter:             e.appAddress,
+			Rank:               qc.GetRank(),
+			FrameNumber:        qc.GetFrameNumber(),
+			Selector:           []byte(qc.Identity()),
+			AggregateSignature: aggregateSig,
+		},
+		txn,
+	); err != nil {
+		e.logger.Error("could not insert quorum certificate", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	child.State.Header.PublicKeySignatureBls48581 = aggregateSig
+
+	if err := e.appTimeReel.Insert(child.State); err != nil {
+		e.logger.Error("could not insert frame into app time reel", zap.Error(err))
+		return
+	}
+
+	head, err := e.appTimeReel.GetHead()
+	if err != nil {
+		e.logger.Error("could not get app time reel head", zap.Error(err))
+		return
+	}
+
+	if head == nil || head.Header == nil ||
+		!bytes.Equal(child.State.Header.Output, head.Header.Output) {
+		e.logger.Error(
+			"app frames not aligned",
+			zap.String("address", e.appAddressHex),
+			zap.Uint64("new_frame_number", child.State.Header.FrameNumber),
+		)
+		return
+	}
+
+	txn, err = e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutCertifiedAppShardState(
+		child,
+		txn,
+	); err != nil {
+		e.logger.Error("could not insert certified state", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
 	}
 }
 
@@ -373,6 +612,9 @@ func (e *AppConsensusEngine) handleConsensusMessage(message *pb.Message) {
 
 	case protobufs.TimeoutStateType:
 		e.handleTimeoutState(message)
+
+	case protobufs.ProverLivenessCheckType:
+		// Liveness checks are processed globally; nothing to do here.
 
 	default:
 		e.logger.Debug(
@@ -448,7 +690,10 @@ func (e *AppConsensusEngine) handleProverMessage(message *pb.Message) {
 
 	typePrefix := e.peekMessageType(message)
 
-	e.logger.Debug("handling prover message", zap.Uint32("type_prefix", typePrefix))
+	e.logger.Debug(
+		"handling prover message",
+		zap.Uint32("type_prefix", typePrefix),
+	)
 	switch typePrefix {
 	case protobufs.MessageBundleType:
 		// MessageBundle messages need to be collected for execution
@@ -605,7 +850,7 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 		}
 
 		if err := e.dispatchService.AddInboxMessage(
-			e.ctx,
+			context.Background(),
 			envelope,
 		); err != nil {
 			e.logger.Debug("failed to add inbox message", zap.Error(err))
@@ -618,7 +863,7 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 		}
 
 		if err := e.dispatchService.AddHubInboxAssociation(
-			e.ctx,
+			context.Background(),
 			envelope,
 		); err != nil {
 			e.logger.Debug("failed to add inbox message", zap.Error(err))
@@ -631,7 +876,7 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 		}
 
 		if err := e.dispatchService.DeleteHubInboxAssociation(
-			e.ctx,
+			context.Background(),
 			envelope,
 		); err != nil {
 			e.logger.Debug("failed to add inbox message", zap.Error(err))
@@ -663,11 +908,33 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 		return
 	}
 
+	if !bytes.Equal(proposal.State.Header.Address, e.appAddress) {
+		return
+	}
+
 	frameIDBI, _ := poseidon.HashBytes(proposal.State.Header.Output)
 	frameID := frameIDBI.FillBytes(make([]byte, 32))
 	e.frameStoreMu.Lock()
 	e.frameStore[string(frameID)] = proposal.State
 	e.frameStoreMu.Unlock()
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutProposalVote(txn, proposal.Vote); err != nil {
+		e.logger.Error("could not put vote", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
+	}
 
 	e.appShardProposalQueue <- proposal
 
@@ -697,10 +964,10 @@ func (e *AppConsensusEngine) handleVote(message *pb.Message) {
 		return
 	}
 
-	proverSet, err := e.proverRegistry.GetActiveProvers(nil)
+	proverSet, err := e.proverRegistry.GetActiveProvers(e.appAddress)
 	if err != nil {
 		e.logger.Error("could not get active provers", zap.Error(err))
-		voteProcessedTotal.WithLabelValues("error").Inc()
+		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
@@ -726,7 +993,25 @@ func (e *AppConsensusEngine) handleVote(message *pb.Message) {
 				),
 			),
 		)
-		voteProcessedTotal.WithLabelValues("error").Inc()
+		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutProposalVote(txn, vote); err != nil {
+		e.logger.Error("could not put vote", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
 		return
 	}
 
@@ -768,6 +1053,24 @@ func (e *AppConsensusEngine) handleTimeoutState(message *pb.Message) {
 	}
 	if prtc != nil {
 		timeout.PriorRankTimeoutCertificate = prtc
+	}
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.clockStore.PutTimeoutVote(txn, timeoutState); err != nil {
+		e.logger.Error("could not put vote", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
 	}
 
 	e.timeoutAggregator.AddTimeout(timeout)

@@ -70,20 +70,6 @@ func (p *GlobalSyncProvider) Start(
 				request.frameNumber,
 				request.peerId,
 			)
-		case <-time.After(6 * time.Minute):
-			finalized := p.engine.forks.FinalizedState()
-
-			id, err := p.engine.getRandomProverPeerId()
-			if err != nil {
-				p.engine.logger.Debug("could not get random prover", zap.Error(err))
-			}
-
-			p.engine.logger.Info(
-				"synchronizing with peer",
-				zap.String("peer", id.String()),
-				zap.Uint64("finalized_rank", finalized.Rank),
-			)
-			p.processState(ctx, (*finalized.State).Header.FrameNumber, []byte(id))
 		}
 	}
 }
@@ -340,7 +326,7 @@ func (p *GlobalSyncProvider) syncWithPeer(
 			response, err := client.GetGlobalProposal(
 				getCtx,
 				&protobufs.GetGlobalProposalRequest{
-					FrameNumber: frameNumber + 1,
+					FrameNumber: frameNumber,
 				},
 				// The message size limits are swapped because the server is the one
 				// sending the data.
@@ -374,10 +360,18 @@ func (p *GlobalSyncProvider) syncWithPeer(
 
 			if response.Proposal == nil || response.Proposal.State == nil ||
 				response.Proposal.State.Header == nil ||
-				response.Proposal.State.Header.FrameNumber != frameNumber+1 {
+				response.Proposal.State.Header.FrameNumber != frameNumber {
 				p.engine.logger.Debug("received empty response from peer")
 				return nil
 			}
+			if err := response.Proposal.Validate(); err != nil {
+				p.engine.logger.Debug(
+					"received invalid response from peer",
+					zap.Error(err),
+				)
+				return nil
+			}
+
 			p.engine.logger.Info(
 				"received new leading frame",
 				zap.Uint64("frame_number", response.Proposal.State.Header.FrameNumber),

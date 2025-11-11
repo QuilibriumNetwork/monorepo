@@ -199,7 +199,10 @@ func (el *EventLoop[StateT, VoteT]) loop(ctx context.Context) error {
 				)
 			}
 
-			el.tracer.Trace("state proposal has been processed successfully")
+			el.tracer.Trace(
+				"state proposal has been processed successfully",
+				consensus.Uint64Param("rank", proposal.State.Rank),
+			)
 
 		// if we have a new QC, process it
 		case <-quorumCertificates:

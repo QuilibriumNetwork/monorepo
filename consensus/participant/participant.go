@@ -44,11 +44,11 @@ func NewParticipant[
 	pending []*models.SignedProposal[StateT, VoteT],
 ) (*eventloop.EventLoop[StateT, VoteT], error) {
 	cfg, err := timeout.NewConfig(
-		10*time.Second,
-		30*time.Second,
+		20*time.Second,
+		3*time.Minute,
 		1.2,
 		6,
-		10*time.Second,
+		28*time.Second,
 	)
 	if err != nil {
 		return nil, err
@@ -103,7 +103,7 @@ func NewParticipant[
 	pacemaker, err := pacemaker.NewPacemaker[StateT, VoteT](
 		filter,
 		controller,
-		pacemaker.NoProposalDelay(),
+		pacemaker.NewStaticProposalDurationProvider(8*time.Second),
 		notifier,
 		consensusStore,
 		logger,

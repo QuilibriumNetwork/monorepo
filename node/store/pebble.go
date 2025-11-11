@@ -23,6 +23,7 @@ type PebbleDB struct {
 // the end.
 var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_4,
+	migration_2_1_0_5,
 }
 
 func NewPebbleDB(
@@ -436,4 +437,9 @@ func migration_2_1_0_4(b *pebble.Batch) error {
 	}
 
 	return nil
+}
+
+func migration_2_1_0_5(b *pebble.Batch) error {
+	// We just re-run it again
+	return migration_2_1_0_4(b)
 }

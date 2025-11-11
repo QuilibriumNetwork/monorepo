@@ -66,11 +66,6 @@ func (p *AppLeaderProvider) ProveNextState(
 	filter []byte,
 	priorState models.Identity,
 ) (**protobufs.AppShardFrame, error) {
-	_, err := p.engine.livenessProvider.Collect(ctx)
-	if err != nil {
-		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
-	}
-
 	timer := prometheus.NewTimer(frameProvingDuration.WithLabelValues(
 		p.engine.appAddressHex,
 	))
@@ -122,11 +117,21 @@ func (p *AppLeaderProvider) ProveNextState(
 	}
 
 	// Get collected messages to include in frame
-	p.engine.collectedMessagesMu.Lock()
-	messages := make([]*protobufs.Message, len(p.engine.collectedMessages))
-	copy(messages, p.engine.collectedMessages)
-	p.engine.collectedMessages = []*protobufs.Message{}
-	p.engine.collectedMessagesMu.Unlock()
+	p.engine.provingMessagesMu.Lock()
+	messages := make([]*protobufs.Message, len(p.engine.provingMessages))
+	copy(messages, p.engine.provingMessages)
+	p.engine.provingMessages = []*protobufs.Message{}
+	p.engine.provingMessagesMu.Unlock()
+
+	if len(messages) == 0 {
+		p.engine.collectedMessagesMu.Lock()
+		if len(p.engine.collectedMessages) > 0 {
+			messages = make([]*protobufs.Message, len(p.engine.collectedMessages))
+			copy(messages, p.engine.collectedMessages)
+			p.engine.collectedMessages = []*protobufs.Message{}
+		}
+		p.engine.collectedMessagesMu.Unlock()
+	}
 
 	// Update pending messages metric
 	pendingMessagesCount.WithLabelValues(p.engine.appAddressHex).Set(0)

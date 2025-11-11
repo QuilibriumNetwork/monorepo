@@ -107,6 +107,15 @@ func (e *AppConsensusEngine) GetAppShardProposal(
 		return &protobufs.AppShardProposalResponse{}, nil
 	}
 
+	vote, err := e.clockStore.GetProposalVote(
+		request.Filter,
+		frame.GetRank(),
+		[]byte(frame.Source()),
+	)
+	if err != nil {
+		return &protobufs.AppShardProposalResponse{}, nil
+	}
+
 	parent, _, err := e.clockStore.GetShardClockFrame(
 		request.Filter,
 		request.FrameNumber-1,
@@ -144,6 +153,7 @@ func (e *AppConsensusEngine) GetAppShardProposal(
 		State:                       frame,
 		ParentQuorumCertificate:     parentQC,
 		PriorRankTimeoutCertificate: priorRankTC,
+		Vote:                        vote,
 	}
 	return &protobufs.AppShardProposalResponse{
 		Proposal: proposal,

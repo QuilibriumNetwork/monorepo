@@ -731,6 +731,22 @@ func clockGlobalFrameRequestKey(
 	return key
 }
 
+func clockProposalVoteKey(rank uint64, filter []byte, identity []byte) []byte {
+	key := []byte{CLOCK_FRAME, CLOCK_PROPOSAL_VOTE}
+	key = binary.BigEndian.AppendUint64(key, rank)
+	key = append(key, filter...)
+	key = append(key, identity...)
+	return key
+}
+
+func clockTimeoutVoteKey(rank uint64, filter []byte, identity []byte) []byte {
+	key := []byte{CLOCK_FRAME, CLOCK_TIMEOUT_VOTE}
+	key = binary.BigEndian.AppendUint64(key, rank)
+	key = append(key, filter...)
+	key = append(key, identity...)
+	return key
+}
+
 func (p *PebbleClockStore) NewTransaction(indexed bool) (
 	store.Transaction,
 	error,
@@ -1661,6 +1677,11 @@ func (p *PebbleClockStore) GetCertifiedGlobalState(rank uint64) (
 		return nil, errors.Wrap(err, "get certified global state")
 	}
 
+	vote, err := p.GetProposalVote(nil, frame.GetRank(), frame.Header.Prover)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified app shard state")
+	}
+
 	qc, err := p.GetQuorumCertificate(nil, qcRank)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, errors.Wrap(err, "get certified global state")
@@ -1675,6 +1696,7 @@ func (p *PebbleClockStore) GetCertifiedGlobalState(rank uint64) (
 		State:                       frame,
 		ParentQuorumCertificate:     qc,
 		PriorRankTimeoutCertificate: tc,
+		Vote:                        vote,
 	}, nil
 }
 
@@ -1718,6 +1740,9 @@ func (p *PebbleClockStore) PutCertifiedGlobalState(
 		}
 		frameNumber = state.State.Header.FrameNumber
 		if err := p.PutGlobalClockFrame(state.State, txn); err != nil {
+			return errors.Wrap(err, "put certified global state")
+		}
+		if err := p.PutProposalVote(txn, state.Vote); err != nil {
 			return errors.Wrap(err, "put certified global state")
 		}
 	}
@@ -1863,6 +1888,11 @@ func (p *PebbleClockStore) GetCertifiedAppShardState(
 		return nil, errors.Wrap(err, "get certified app shard state")
 	}
 
+	vote, err := p.GetProposalVote(filter, frame.GetRank(), frame.Header.Prover)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, errors.Wrap(err, "get certified app shard state")
+	}
+
 	qc, err := p.GetQuorumCertificate(filter, qcRank)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, errors.Wrap(err, "get certified app shard state")
@@ -1877,6 +1907,7 @@ func (p *PebbleClockStore) GetCertifiedAppShardState(
 		State:                       frame,
 		ParentQuorumCertificate:     qc,
 		PriorRankTimeoutCertificate: tc,
+		Vote:                        vote,
 	}, nil
 }
 
@@ -1934,6 +1965,9 @@ func (p *PebbleClockStore) PutCertifiedAppShardState(
 			txn,
 			false,
 		); err != nil {
+			return errors.Wrap(err, "put certified app shard state")
+		}
+		if err := p.PutProposalVote(txn, state.Vote); err != nil {
 			return errors.Wrap(err, "put certified app shard state")
 		}
 		filter = state.State.Header.Address
@@ -2275,4 +2309,184 @@ func (p *PebbleClockStore) PutTimeoutCertificate(
 	}
 
 	return nil
+}
+
+func (p *PebbleClockStore) PutProposalVote(
+	txn store.Transaction,
+	vote *protobufs.ProposalVote,
+) error {
+	if vote == nil {
+		return errors.Wrap(
+			errors.New("proposal vote is required"),
+			"put proposal vote",
+		)
+	}
+
+	rank := vote.Rank
+	filter := vote.Filter
+	identity := vote.Identity()
+
+	data, err := vote.ToCanonicalBytes()
+	if err != nil {
+		return errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"put proposal vote",
+		)
+	}
+
+	key := clockProposalVoteKey(rank, filter, []byte(identity))
+	err = txn.Set(key, data)
+	return errors.Wrap(err, "put proposal vote")
+}
+
+func (p *PebbleClockStore) GetProposalVote(
+	filter []byte,
+	rank uint64,
+	identity []byte,
+) (
+	*protobufs.ProposalVote,
+	error,
+) {
+	key := clockProposalVoteKey(rank, filter, []byte(identity))
+	value, closer, err := p.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get proposal vote")
+	}
+	defer closer.Close()
+
+	vote := &protobufs.ProposalVote{}
+	if err := vote.FromCanonicalBytes(slices.Clone(value)); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"get proposal vote",
+		)
+	}
+
+	return vote, nil
+}
+
+func (p *PebbleClockStore) GetProposalVotes(filter []byte, rank uint64) (
+	[]*protobufs.ProposalVote,
+	error,
+) {
+	results := []*protobufs.ProposalVote{}
+	startKey := clockProposalVoteKey(rank, filter, nil)
+	endKey := clockProposalVoteKey(rank+1, filter, nil)
+	iterator, err := p.db.NewIter(startKey, endKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "get proposal votes")
+	}
+	defer iterator.Close()
+
+	for iterator.First(); iterator.Valid(); iterator.Next() {
+		key := iterator.Key()
+		if len(key) != len(startKey)+32 {
+			continue
+		}
+
+		value := iterator.Value()
+		vote := &protobufs.ProposalVote{}
+		if err := vote.FromCanonicalBytes(slices.Clone(value)); err != nil {
+			return nil, errors.Wrap(
+				errors.Wrap(err, store.ErrInvalidData.Error()),
+				"get proposal votes",
+			)
+		}
+		results = append(results, vote)
+	}
+
+	return results, nil
+}
+
+func (p *PebbleClockStore) PutTimeoutVote(
+	txn store.Transaction,
+	vote *protobufs.TimeoutState,
+) error {
+	if vote == nil {
+		return errors.Wrap(
+			errors.New("timeout vote is required"),
+			"put timeout vote",
+		)
+	}
+
+	rank := vote.Vote.Rank
+	filter := vote.Vote.Filter
+	identity := vote.Vote.Identity()
+
+	data, err := vote.ToCanonicalBytes()
+	if err != nil {
+		return errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"put timeout vote",
+		)
+	}
+
+	key := clockTimeoutVoteKey(rank, filter, []byte(identity))
+	err = txn.Set(key, data)
+	return errors.Wrap(err, "put timeout vote")
+}
+
+func (p *PebbleClockStore) GetTimeoutVote(
+	filter []byte,
+	rank uint64,
+	identity []byte,
+) (
+	*protobufs.TimeoutState,
+	error,
+) {
+	key := clockTimeoutVoteKey(rank, filter, []byte(identity))
+	value, closer, err := p.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "get proposal vote")
+	}
+	defer closer.Close()
+
+	vote := &protobufs.TimeoutState{}
+	if err := vote.FromCanonicalBytes(slices.Clone(value)); err != nil {
+		return nil, errors.Wrap(
+			errors.Wrap(err, store.ErrInvalidData.Error()),
+			"get proposal vote",
+		)
+	}
+
+	return vote, nil
+}
+
+func (p *PebbleClockStore) GetTimeoutVotes(filter []byte, rank uint64) (
+	[]*protobufs.TimeoutState,
+	error,
+) {
+	results := []*protobufs.TimeoutState{}
+	startKey := clockTimeoutVoteKey(rank, filter, nil)
+	endKey := clockTimeoutVoteKey(rank+1, filter, nil)
+	iterator, err := p.db.NewIter(startKey, endKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "get timeout votes")
+	}
+	defer iterator.Close()
+
+	for iterator.First(); iterator.Valid(); iterator.Next() {
+		key := iterator.Key()
+		if len(key) != len(startKey)+32 {
+			continue
+		}
+
+		value := iterator.Value()
+		vote := &protobufs.TimeoutState{}
+		if err := vote.FromCanonicalBytes(slices.Clone(value)); err != nil {
+			return nil, errors.Wrap(
+				errors.Wrap(err, store.ErrInvalidData.Error()),
+				"get timeout votes",
+			)
+		}
+		results = append(results, vote)
+	}
+
+	return results, nil
 }

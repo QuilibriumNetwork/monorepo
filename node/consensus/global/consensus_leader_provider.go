@@ -5,15 +5,18 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"math/big"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 // GlobalLeaderProvider implements LeaderProvider
@@ -149,22 +152,6 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	p.engine.currentDifficulty = uint32(difficulty)
 	p.engine.currentDifficultyMu.Unlock()
 
-	// Prove the global frame header
-	newHeader, err := p.engine.frameProver.ProveGlobalFrameHeader(
-		(*prior).Header,
-		p.engine.shardCommitments,
-		p.engine.proverRoot,
-		signer,
-		timestamp,
-		uint32(difficulty),
-		proverIndex,
-	)
-	if err != nil {
-		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(err, "prove next state")
-	}
-	newHeader.Rank = rank
-
 	// Convert collected messages to MessageBundles
 	requests := make(
 		[]*protobufs.MessageBundle,
@@ -175,6 +162,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		"including messages",
 		zap.Int("message_count", len(p.engine.collectedMessages)),
 	)
+	requestTree := &tries.VectorCommitmentTree{}
 	for _, msgData := range p.engine.collectedMessages {
 		// Check if data is long enough to contain type prefix
 		if len(msgData) < 4 {
@@ -211,8 +199,39 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		if messageBundle.Timestamp == 0 {
 			messageBundle.Timestamp = time.Now().UnixMilli()
 		}
+
+		id := sha3.Sum256(msgData)
+		err := requestTree.Insert(id[:], msgData, nil, big.NewInt(0))
+		if err != nil {
+			p.engine.logger.Warn(
+				"failed to add global request",
+				zap.Error(err),
+			)
+			continue
+		}
+
 		requests = append(requests, messageBundle)
 	}
+
+	requestRoot := requestTree.Commit(p.engine.inclusionProver, false)
+
+	// Prove the global frame header
+	newHeader, err := p.engine.frameProver.ProveGlobalFrameHeader(
+		(*prior).Header,
+		p.engine.shardCommitments,
+		p.engine.proverRoot,
+		requestRoot,
+		signer,
+		timestamp,
+		uint32(difficulty),
+		proverIndex,
+	)
+	if err != nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, errors.Wrap(err, "prove next state")
+	}
+	newHeader.Prover = p.engine.getProverAddress()
+	newHeader.Rank = rank
 
 	// Create the new global frame with requests
 	newFrame := &protobufs.GlobalFrame{

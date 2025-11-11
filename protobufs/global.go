@@ -142,14 +142,7 @@ func (g *GlobalFrame) Identity() models.Identity {
 
 // Source implements models.Unique.
 func (g *GlobalFrame) Source() models.Identity {
-	id, err := poseidon.HashBytes(
-		g.Header.PublicKeySignatureBls48581.PublicKey.KeyValue,
-	)
-	if err != nil {
-		return ""
-	}
-
-	return models.Identity(id.FillBytes(make([]byte, 32)))
+	return models.Identity(g.Header.Prover)
 }
 
 func (a *AppShardFrame) Clone() models.Unique {
@@ -2080,6 +2073,30 @@ func (g *GlobalFrameHeader) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
+	// Write requests_root
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(g.RequestsRoot)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(g.RequestsRoot); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write prover
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(g.Prover)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(g.Prover); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
 	// Write public_key_signature_bls48581
 	if g.PublicKeySignatureBls48581 != nil {
 		sigBytes, err := g.PublicKeySignatureBls48581.ToCanonicalBytes()
@@ -2188,6 +2205,34 @@ func (g *GlobalFrameHeader) FromCanonicalBytes(data []byte) error {
 	}
 	g.ProverTreeCommitment = make([]byte, proverTreeCommitmentLen)
 	if _, err := buf.Read(g.ProverTreeCommitment); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read requests_root
+	var requestsRootLen uint32
+	if err := binary.Read(
+		buf,
+		binary.BigEndian,
+		&requestsRootLen,
+	); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	g.RequestsRoot = make([]byte, requestsRootLen)
+	if _, err := buf.Read(g.RequestsRoot); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read prover
+	var proverLen uint32
+	if err := binary.Read(
+		buf,
+		binary.BigEndian,
+		&proverLen,
+	); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	g.Prover = make([]byte, proverLen)
+	if _, err := buf.Read(g.Prover); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
 
@@ -4638,6 +4683,22 @@ func (h *GlobalFrameHeader) Validate() error {
 	if len(h.ProverTreeCommitment) != 64 && len(h.ProverTreeCommitment) != 74 {
 		return errors.Wrap(
 			errors.New("invalid prover tree commitment length"),
+			"validate",
+		)
+	}
+
+	// Requests root commitment should be 64 or 74 bytes
+	if len(h.RequestsRoot) != 64 && len(h.RequestsRoot) != 74 {
+		return errors.Wrap(
+			errors.New("invalid request root commitment length"),
+			"validate",
+		)
+	}
+
+	// Prover must be set
+	if len(h.Prover) != 32 {
+		return errors.Wrap(
+			errors.New("invalid prover length"),
 			"validate",
 		)
 	}

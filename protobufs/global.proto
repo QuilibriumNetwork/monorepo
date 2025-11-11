@@ -149,8 +149,12 @@ message GlobalFrameHeader {
   repeated bytes global_commitments = 7;
   // The prover tree root commitment
   bytes prover_tree_commitment = 8;
+  // The request root commitment
+  bytes requests_root = 9;
+  // The prover of the frame
+  bytes prover = 10;
   // The confirmation signatures of the frame
-  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 9;
+  quilibrium.node.keys.pb.BLS48581AggregateSignature public_key_signature_bls48581 = 11;
 }
 
 message FrameHeader {

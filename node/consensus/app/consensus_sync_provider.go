@@ -82,20 +82,6 @@ func (p *AppSyncProvider) Start(
 				request.frameNumber,
 				request.peerId,
 			)
-		case <-time.After(6 * time.Minute):
-			finalized := p.engine.forks.FinalizedState()
-
-			id, err := p.engine.getRandomProverPeerId()
-			if err != nil {
-				p.engine.logger.Debug("could not get random prover", zap.Error(err))
-			}
-
-			p.engine.logger.Info(
-				"synchronizing with peer",
-				zap.String("peer", id.String()),
-				zap.Uint64("finalized_rank", finalized.Rank),
-			)
-			p.processState(ctx, (*finalized.State).Header.FrameNumber, []byte(id))
 		}
 	}
 }
@@ -145,6 +131,39 @@ func (p *AppSyncProvider) Synchronize(
 		}
 
 		peerCount := p.engine.pubsub.GetPeerstoreCount()
+		requiredPeers := p.engine.config.Engine.MinimumPeersRequired
+		if peerCount < requiredPeers {
+			p.engine.logger.Info(
+				"waiting for minimum peers",
+				zap.Int("current", peerCount),
+				zap.Int("required", requiredPeers),
+			)
+
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+
+		waitPeers:
+			for {
+				select {
+				case <-ctx.Done():
+					errCh <- errors.Wrap(
+						ctx.Err(),
+						"synchronize cancelled while waiting for peers",
+					)
+					return
+				case <-ticker.C:
+					peerCount = p.engine.pubsub.GetPeerstoreCount()
+					if peerCount >= requiredPeers {
+						p.engine.logger.Info(
+							"minimum peers reached",
+							zap.Int("peers", peerCount),
+						)
+						break waitPeers
+					}
+				}
+			}
+		}
+
 		if peerCount < int(p.engine.minimumProvers()) {
 			errCh <- errors.Wrap(
 				errors.New("minimum provers not reached"),
@@ -389,7 +408,10 @@ func (p *AppSyncProvider) syncWithPeer(
 
 			defer func() {
 				if err := cc.Close(); err != nil {
-					p.engine.logger.Error("error while closing connection", zap.Error(err))
+					p.engine.logger.Error(
+						"error while closing connection",
+						zap.Error(err),
+					)
 				}
 			}()
 
@@ -402,7 +424,7 @@ func (p *AppSyncProvider) syncWithPeer(
 					getCtx,
 					&protobufs.GetAppShardProposalRequest{
 						Filter:      p.engine.appAddress,
-						FrameNumber: frameNumber + 1,
+						FrameNumber: frameNumber,
 					},
 					// The message size limits are swapped because the server is the one
 					// sending the data.
@@ -435,13 +457,20 @@ func (p *AppSyncProvider) syncWithPeer(
 				}
 				if response.Proposal == nil || response.Proposal.State == nil ||
 					response.Proposal.State.Header == nil ||
-					response.Proposal.State.Header.FrameNumber != frameNumber+1 {
+					response.Proposal.State.Header.FrameNumber != frameNumber {
 					p.engine.logger.Debug("received empty response from peer")
+					return nil
+				}
+				if err := response.Proposal.Validate(); err != nil {
+					p.engine.logger.Debug("received invalid response from peer")
 					return nil
 				}
 				p.engine.logger.Info(
 					"received new leading frame",
-					zap.Uint64("frame_number", response.Proposal.State.Header.FrameNumber),
+					zap.Uint64(
+						"frame_number",
+						response.Proposal.State.Header.FrameNumber,
+					),
 					zap.Duration(
 						"frame_age",
 						frametime.AppFrameSince(response.Proposal.State),
@@ -666,7 +695,7 @@ func (p *AppSyncProvider) hyperSyncWithProver(
 			peerId, err := peer.IDFromPublicKey(pubKey)
 			if err == nil {
 				ch, err := p.engine.pubsub.GetDirectChannel(
-					p.engine.ctx,
+					context.Background(),
 					[]byte(peerId),
 					"sync",
 				)
@@ -674,7 +703,7 @@ func (p *AppSyncProvider) hyperSyncWithProver(
 				if err == nil {
 					defer ch.Close()
 					client := protobufs.NewHypergraphComparisonServiceClient(ch)
-					str, err := client.HyperStream(p.engine.ctx)
+					str, err := client.HyperStream(context.Background())
 					if err != nil {
 						p.engine.logger.Error("error from sync", zap.Error(err))
 					} else {

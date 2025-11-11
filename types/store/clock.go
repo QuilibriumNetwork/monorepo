@@ -171,4 +171,22 @@ type ClockStore interface {
 		filter []byte,
 		tree *tries.VectorCommitmentTree,
 	) error
+	PutProposalVote(txn Transaction, vote *protobufs.ProposalVote) error
+	GetProposalVote(filter []byte, rank uint64, identity []byte) (
+		*protobufs.ProposalVote,
+		error,
+	)
+	GetProposalVotes(filter []byte, rank uint64) (
+		[]*protobufs.ProposalVote,
+		error,
+	)
+	PutTimeoutVote(txn Transaction, vote *protobufs.TimeoutState) error
+	GetTimeoutVote(filter []byte, rank uint64, identity []byte) (
+		*protobufs.TimeoutState,
+		error,
+	)
+	GetTimeoutVotes(filter []byte, rank uint64) (
+		[]*protobufs.TimeoutState,
+		error,
+	)
 }

@@ -146,6 +146,22 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		timeoutStateValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 
+	case protobufs.ProverLivenessCheckType:
+		check := &protobufs.ProverLivenessCheck{}
+		if err := check.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
+			return p2p.ValidationResultReject
+		}
+
+		if err := check.Validate(); err != nil {
+			e.logger.Debug("invalid liveness check", zap.Error(err))
+			return p2p.ValidationResultReject
+		}
+
+		if len(check.Filter) != 0 && !bytes.Equal(check.Filter, e.appAddress) {
+			return p2p.ValidationResultIgnore
+		}
+
 	default:
 		return p2p.ValidationResultReject
 	}

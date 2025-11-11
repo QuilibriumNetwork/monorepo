@@ -16,6 +16,82 @@ type MockClockStore struct {
 	mock.Mock
 }
 
+// GetProposalVote implements store.ClockStore.
+func (m *MockClockStore) GetProposalVote(
+	filter []byte,
+	rank uint64,
+	identity []byte,
+) (*protobufs.ProposalVote, error) {
+	args := m.Called(
+		filter,
+		rank,
+		identity,
+	)
+	return args.Get(0).(*protobufs.ProposalVote), args.Error(1)
+}
+
+// GetProposalVotes implements store.ClockStore.
+func (m *MockClockStore) GetProposalVotes(
+	filter []byte,
+	rank uint64,
+) ([]*protobufs.ProposalVote, error) {
+	args := m.Called(
+		filter,
+		rank,
+	)
+	return args.Get(0).([]*protobufs.ProposalVote), args.Error(1)
+}
+
+// GetTimeoutVote implements store.ClockStore.
+func (m *MockClockStore) GetTimeoutVote(
+	filter []byte,
+	rank uint64,
+	identity []byte,
+) (*protobufs.TimeoutState, error) {
+	args := m.Called(
+		filter,
+		rank,
+		identity,
+	)
+	return args.Get(0).(*protobufs.TimeoutState), args.Error(1)
+}
+
+// GetTimeoutVotes implements store.ClockStore.
+func (m *MockClockStore) GetTimeoutVotes(
+	filter []byte,
+	rank uint64,
+) ([]*protobufs.TimeoutState, error) {
+	args := m.Called(
+		filter,
+		rank,
+	)
+	return args.Get(0).([]*protobufs.TimeoutState), args.Error(1)
+}
+
+// PutProposalVote implements store.ClockStore.
+func (m *MockClockStore) PutProposalVote(
+	txn store.Transaction,
+	vote *protobufs.ProposalVote,
+) error {
+	args := m.Called(
+		txn,
+		vote,
+	)
+	return args.Error(0)
+}
+
+// PutTimeoutVote implements store.ClockStore.
+func (m *MockClockStore) PutTimeoutVote(
+	txn store.Transaction,
+	vote *protobufs.TimeoutState,
+) error {
+	args := m.Called(
+		txn,
+		vote,
+	)
+	return args.Error(0)
+}
+
 // GetCertifiedAppShardState implements store.ClockStore.
 func (m *MockClockStore) GetCertifiedAppShardState(
 	filter []byte,
