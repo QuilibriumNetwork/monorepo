@@ -494,116 +494,128 @@ func NewGlobalConsensusEngine(
 
 	// Add execution engines
 	componentBuilder.AddWorker(engine.executionManager.Start)
-	componentBuilder.AddWorker(engine.eventDistributor.Start)
 	componentBuilder.AddWorker(engine.globalTimeReel.Start)
 
-	latest, err := engine.consensusStore.GetConsensusState(nil)
-	var state *models.CertifiedState[*protobufs.GlobalFrame]
-	var pending []*models.SignedProposal[
-		*protobufs.GlobalFrame,
-		*protobufs.ProposalVote,
-	]
-	if err != nil {
-		frame, qc := engine.initializeGenesis()
-		state = &models.CertifiedState[*protobufs.GlobalFrame]{
-			State: &models.State[*protobufs.GlobalFrame]{
-				Rank:       0,
-				Identifier: frame.Identity(),
-				State:      &frame,
-			},
-			CertifyingQuorumCertificate: qc,
-		}
-		pending = []*models.SignedProposal[
+	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
+		latest, err := engine.consensusStore.GetConsensusState(nil)
+		var state *models.CertifiedState[*protobufs.GlobalFrame]
+		var pending []*models.SignedProposal[
 			*protobufs.GlobalFrame,
 			*protobufs.ProposalVote,
-		]{}
-	} else {
-		qc, err := engine.clockStore.GetQuorumCertificate(nil, latest.FinalizedRank)
-		if err != nil {
-			panic(err)
-		}
-		frame, err := engine.clockStore.GetGlobalClockFrame(
-			qc.GetFrameNumber(),
-		)
-		if err != nil {
-			panic(err)
-		}
-		parentFrame, err := engine.clockStore.GetGlobalClockFrame(
-			qc.GetFrameNumber() - 1,
-		)
-		if err != nil {
-			panic(err)
-		}
-		parentQC, err := engine.clockStore.GetQuorumCertificate(
-			nil,
-			parentFrame.GetRank(),
-		)
-		if err != nil {
-			panic(err)
-		}
-		state = &models.CertifiedState[*protobufs.GlobalFrame]{
-			State: &models.State[*protobufs.GlobalFrame]{
-				Rank:                    frame.GetRank(),
-				Identifier:              frame.Identity(),
-				ProposerID:              frame.Source(),
-				ParentQuorumCertificate: parentQC,
-				Timestamp:               frame.GetTimestamp(),
-				State:                   &frame,
-			},
-			CertifyingQuorumCertificate: qc,
-		}
-		pending = engine.getPendingProposals(frame.Header.FrameNumber)
-	}
-
-	liveness, err := engine.consensusStore.GetLivenessState(nil)
-	if err == nil {
-		engine.currentRank = liveness.CurrentRank
-	}
-
-	engine.voteAggregator, err = voting.NewGlobalVoteAggregator[GlobalPeerID](
-		tracing.NewZapTracer(logger),
-		engine,
-		voteAggregationDistributor,
-		engine.signatureAggregator,
-		engine.votingProvider,
-		func(qc models.QuorumCertificate) {
-			select {
-			case <-engine.haltCtx.Done():
-				return
-			default:
+		]
+		establishGenesis := func() {
+			frame, qc := engine.initializeGenesis()
+			state = &models.CertifiedState[*protobufs.GlobalFrame]{
+				State: &models.State[*protobufs.GlobalFrame]{
+					Rank:       0,
+					Identifier: frame.Identity(),
+					State:      &frame,
+				},
+				CertifyingQuorumCertificate: qc,
 			}
-			engine.consensusParticipant.OnQuorumCertificateConstructedFromVotes(qc)
-		},
-		state.Rank()+1,
-	)
-	if err != nil {
-		return nil, err
-	}
-	engine.timeoutAggregator, err = voting.NewGlobalTimeoutAggregator[GlobalPeerID](
-		tracing.NewZapTracer(logger),
-		engine,
-		engine,
-		engine.signatureAggregator,
-		timeoutAggregationDistributor,
-		engine.votingProvider,
-		state.Rank()+1,
-	)
+			pending = []*models.SignedProposal[
+				*protobufs.GlobalFrame,
+				*protobufs.ProposalVote,
+			]{}
+		}
+		if err != nil {
+			establishGenesis()
+		} else {
+			qc, err := engine.clockStore.GetQuorumCertificate(
+				nil,
+				latest.FinalizedRank,
+			)
+			if err != nil {
+				establishGenesis()
+			} else {
+				frame, err := engine.clockStore.GetGlobalClockFrame(
+					qc.GetFrameNumber(),
+				)
+				if err != nil {
+					establishGenesis()
+				} else {
+					parentFrame, err := engine.clockStore.GetGlobalClockFrame(
+						qc.GetFrameNumber() - 1,
+					)
+					if err != nil {
+						establishGenesis()
+					} else {
+						parentQC, err := engine.clockStore.GetQuorumCertificate(
+							nil,
+							parentFrame.GetRank(),
+						)
+						if err != nil {
+							establishGenesis()
+						} else {
+							state = &models.CertifiedState[*protobufs.GlobalFrame]{
+								State: &models.State[*protobufs.GlobalFrame]{
+									Rank:                    frame.GetRank(),
+									Identifier:              frame.Identity(),
+									ProposerID:              frame.Source(),
+									ParentQuorumCertificate: parentQC,
+									Timestamp:               frame.GetTimestamp(),
+									State:                   &frame,
+								},
+								CertifyingQuorumCertificate: qc,
+							}
+							pending = engine.getPendingProposals(frame.Header.FrameNumber)
+						}
+					}
+				}
+			}
+			as, err := engine.shardsStore.RangeAppShards()
+			engine.logger.Info("verifying app shard information")
+			if err != nil || len(as) == 0 {
+				engine.initializeGenesis()
+			}
+		}
+		liveness, err := engine.consensusStore.GetLivenessState(nil)
+		if err == nil {
+			engine.currentRank = liveness.CurrentRank
+		}
+		engine.voteAggregator, err = voting.NewGlobalVoteAggregator[GlobalPeerID](
+			tracing.NewZapTracer(logger),
+			engine,
+			voteAggregationDistributor,
+			engine.signatureAggregator,
+			engine.votingProvider,
+			func(qc models.QuorumCertificate) {
+				select {
+				case <-engine.haltCtx.Done():
+					return
+				default:
+				}
+				engine.consensusParticipant.OnQuorumCertificateConstructedFromVotes(qc)
+			},
+			state.Rank()+1,
+		)
+		if err != nil {
+			return nil, err
+		}
+		engine.timeoutAggregator, err = voting.NewGlobalTimeoutAggregator[GlobalPeerID](
+			tracing.NewZapTracer(logger),
+			engine,
+			engine,
+			engine.signatureAggregator,
+			timeoutAggregationDistributor,
+			engine.votingProvider,
+			state.Rank()+1,
+		)
 
-	notifier := pubsub.NewDistributor[
-		*protobufs.GlobalFrame,
-		*protobufs.ProposalVote,
-	]()
-	notifier.AddConsumer(engine)
-	engine.notifier = notifier
+		notifier := pubsub.NewDistributor[
+			*protobufs.GlobalFrame,
+			*protobufs.ProposalVote,
+		]()
+		notifier.AddConsumer(engine)
+		engine.notifier = notifier
 
-	forks, err := forks.NewForks(state, engine, notifier)
-	if err != nil {
-		return nil, err
-	}
+		forks, err := forks.NewForks(state, engine, notifier)
+		if err != nil {
+			return nil, err
+		}
 
-	engine.forks = forks
+		engine.forks = forks
 
-	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
 		componentBuilder.AddWorker(func(
 			ctx lifecycle.SignalerContext,
 			ready lifecycle.ReadyFunc,
@@ -617,6 +629,12 @@ func NewGlobalConsensusEngine(
 			<-ctx.Done()
 			<-lifecycle.AllDone(engine.voteAggregator, engine.timeoutAggregator)
 		})
+	} else {
+		as, err := engine.shardsStore.RangeAppShards()
+		engine.logger.Info("verifying app shard information")
+		if err != nil || len(as) == 0 {
+			engine.initializeGenesis()
+		}
 	}
 
 	componentBuilder.AddWorker(engine.peerInfoManager.Start)
@@ -730,6 +748,7 @@ func NewGlobalConsensusEngine(
 	})
 
 	// Start event distributor event loop
+	componentBuilder.AddWorker(engine.eventDistributor.Start)
 	componentBuilder.AddWorker(func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
@@ -1883,6 +1902,8 @@ func (e *GlobalConsensusEngine) reportPeerInfoPeriodically(
 					zap.Int("capabilities_count", len(peerInfo.Capabilities)),
 				)
 			}
+
+			e.publishKeyRegistry()
 		}
 	}
 }

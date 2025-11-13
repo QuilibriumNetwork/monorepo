@@ -91,12 +91,6 @@ func (b *BLSGlobalFrameValidator) Validate(
 		return false, err
 	}
 
-	throwaway, _, err := b.blsConstructor.New()
-	if err != nil {
-		b.logger.Error("could not generate key", zap.Error(err))
-		return false, errors.Wrap(err, "validate")
-	}
-
 	provers, err := b.proverRegistry.GetActiveProvers(nil)
 	if err != nil {
 		b.logger.Error("could not get active provers", zap.Error(err))
@@ -113,7 +107,10 @@ func (b *BLSGlobalFrameValidator) Validate(
 				return false, errors.Wrap(err, "validate")
 			}
 			activeProverSet = append(activeProverSet, info.PublicKey)
-			throwawaySet = append(throwawaySet, throwaway.Public().([]byte))
+			throwawaySet = append(
+				throwawaySet,
+				frame.Header.PublicKeySignatureBls48581.Signature,
+			)
 		}
 	}
 

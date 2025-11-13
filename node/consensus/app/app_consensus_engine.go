@@ -1948,9 +1948,9 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 		return
 	}
 
-	nextLeader, err := e.LeaderForRank(newRank)
+	nextLeader, err := e.LeaderForRank(newRank, frame.Identity())
 	if err != nil {
-		e.logger.Error("could nto determine next prover", zap.Error(err))
+		e.logger.Error("could not determine next prover", zap.Error(err))
 		return
 	}
 

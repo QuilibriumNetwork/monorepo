@@ -17,6 +17,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 func (e *GlobalConsensusEngine) GetGlobalFrame(
@@ -175,6 +176,12 @@ func (e *GlobalConsensusEngine) GetAppShards(
 		Info: []*protobufs.AppShardInfo{},
 	}
 
+	fullPrefix := []uint32{}
+	for _, p := range tries.GetFullPath(req.ShardKey[3:]) {
+		fullPrefix = append(fullPrefix, uint32(p))
+	}
+	fullPrefix = slices.Concat(fullPrefix, req.Prefix)
+
 	for _, shard := range shards {
 		size := big.NewInt(0)
 		commitment := [][]byte{}
@@ -198,21 +205,22 @@ func (e *GlobalConsensusEngine) GetAppShards(
 				continue
 			}
 
-			s := c.PathSegments[len(c.PathSegments)-1]
-			if len(s.Segments) > 1 {
-				return nil, errors.Wrap(errors.New("no shard found"), "get app shards")
+			branch, leaf := selectPathSegmentForPrefix(c.PathSegments, fullPrefix)
+			if branch == nil && leaf == nil {
+				commitment = append(commitment, make([]byte, 64))
+				continue
 			}
 
-			switch t := s.Segments[0].Segment.(type) {
-			case *protobufs.TreePathSegment_Branch:
-				size = size.Add(size, new(big.Int).SetBytes(t.Branch.Size))
-				commitment = append(commitment, t.Branch.Commitment)
-				dataShards += t.Branch.LeafCount
-			case *protobufs.TreePathSegment_Leaf:
-				size = size.Add(size, new(big.Int).SetBytes(t.Leaf.Size))
-				commitment = append(commitment, t.Leaf.Commitment)
-				dataShards += 1
+			if branch != nil {
+				size = size.Add(size, new(big.Int).SetBytes(branch.Size))
+				commitment = append(commitment, branch.Commitment)
+				dataShards += branch.LeafCount
+				continue
 			}
+
+			size = size.Add(size, new(big.Int).SetBytes(leaf.Size))
+			commitment = append(commitment, leaf.Commitment)
+			dataShards += 1
 		}
 
 		shardKey := []byte{}
@@ -230,6 +238,49 @@ func (e *GlobalConsensusEngine) GetAppShards(
 	}
 
 	return response, nil
+}
+
+// selectPathSegmentForPrefix walks the returned path segments and prioritizes
+// an exact match to the provided fullPrefix. If no exact match exists, it falls
+// back to the first branch whose full prefix extends the requested prefix,
+// otherwise it returns the first leaf encountered.
+func selectPathSegmentForPrefix(
+	pathSegments []*protobufs.TreePathSegments,
+	fullPrefix []uint32,
+) (*protobufs.TreePathBranch, *protobufs.TreePathLeaf) {
+	var fallbackBranch *protobufs.TreePathBranch
+	for _, ps := range pathSegments {
+		for _, segment := range ps.Segments {
+			switch node := segment.Segment.(type) {
+			case *protobufs.TreePathSegment_Branch:
+				if slices.Equal(node.Branch.FullPrefix, fullPrefix) {
+					return node.Branch, nil
+				}
+
+				if len(node.Branch.FullPrefix) >= len(fullPrefix) &&
+					len(fullPrefix) > 0 &&
+					slices.Equal(
+						node.Branch.FullPrefix[:len(fullPrefix)],
+						fullPrefix,
+					) &&
+					fallbackBranch == nil {
+					fallbackBranch = node.Branch
+				}
+
+				if len(fullPrefix) == 0 && fallbackBranch == nil {
+					fallbackBranch = node.Branch
+				}
+			case *protobufs.TreePathSegment_Leaf:
+				return nil, node.Leaf
+			}
+		}
+	}
+
+	if fallbackBranch != nil {
+		return fallbackBranch, nil
+	}
+
+	return nil, nil
 }
 
 func (e *GlobalConsensusEngine) GetGlobalShards(

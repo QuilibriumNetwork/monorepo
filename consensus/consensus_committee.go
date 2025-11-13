@@ -38,7 +38,10 @@ type Replicas interface {
 	// Returns the following expected errors for invalid inputs:
 	//   - model.ErrRankUnknown if no rank containing the given rank is
 	//     known
-	LeaderForRank(rank uint64) (models.Identity, error)
+	LeaderForRank(
+		rank uint64,
+		selector models.Identity,
+	) (models.Identity, error)
 
 	// QuorumThresholdForRank returns the minimum total weight for a supermajority
 	// at the given rank. This weight threshold is computed using the total weight
@@ -78,7 +81,9 @@ type Replicas interface {
 	//   - model.ErrRankUnknown if no rank containing the given rank is
 	//     known
 	//
-	IdentitiesByRank(rank uint64) ([]models.WeightedIdentity, error)
+	IdentitiesByRank(
+		rank uint64,
+	) ([]models.WeightedIdentity, error)
 
 	// IdentityByRank returns the full Identity for specified HotStuff
 	// participant. The node must be a legitimate HotStuff participant with

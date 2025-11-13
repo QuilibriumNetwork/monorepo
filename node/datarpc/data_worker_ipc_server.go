@@ -95,11 +95,11 @@ func NewDataWorkerIPCServer(
 		proverRegistry:            proverRegistry,
 		frameProver:               frameProver,
 		peerInfoManager:           peerInfoManager,
+		quit:                      make(chan struct{}),
 	}, nil
 }
 
 func (r *DataWorkerIPCServer) Start() error {
-	r.quit = make(chan struct{})
 	r.RespawnServer(nil)
 
 	<-r.quit
@@ -108,7 +108,9 @@ func (r *DataWorkerIPCServer) Start() error {
 
 func (r *DataWorkerIPCServer) Stop() error {
 	r.logger.Info("stopping server gracefully")
-	r.server.GracefulStop()
+	if r.server != nil {
+		r.server.GracefulStop()
+	}
 	go func() {
 		r.quit <- struct{}{}
 	}()

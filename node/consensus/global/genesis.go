@@ -158,6 +158,11 @@ func (e *GlobalConsensusEngine) initializeGenesis() (
 				}
 			}
 
+			if err := txn.Commit(); err != nil {
+				txn.Abort()
+				panic(err)
+			}
+
 			for i := 0; i < 3; i++ {
 				commitments[l1[i]].Insert(
 					keyBytes,
