@@ -5,22 +5,28 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"math/rand"
+	"math/big"
 	"slices"
 	"time"
 
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
@@ -35,6 +41,8 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 			ctx.Throw(errors.Errorf("fatal unhandled error encountered: %v", r))
 		}
 	}()
+
+	e.logger.Debug("starting event distributor")
 
 	// Subscribe to events from the event distributor
 	eventCh := e.eventDistributor.Subscribe("global")
@@ -52,6 +60,8 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 				return
 			}
 
+			e.logger.Debug("received event", zap.Int("event_type", int(event.Type)))
+
 			// Handle the event based on its type
 			switch event.Type {
 			case typesconsensus.ControlEventGlobalNewHead:
@@ -60,7 +70,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 				// New global frame has been selected as the head by the time reel
 				if data, ok := event.Data.(*consensustime.GlobalEvent); ok &&
 					data.Frame != nil {
-					e.logger.Debug(
+					e.logger.Info(
 						"received new global head event",
 						zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
 					)
@@ -82,11 +92,14 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 						e.publishKeyRegistry()
 					}
 
-					if e.proposer != nil {
+					if e.proposer != nil && !e.config.Engine.ArchiveMode {
 						workers, err := e.workerManager.RangeWorkers()
 						if err != nil {
 							e.logger.Error("could not retrieve workers", zap.Error(err))
 						} else {
+							if len(workers) == 0 {
+								e.logger.Error("no workers detected for allocation")
+							}
 							allocated := true
 							for _, w := range workers {
 								allocated = allocated && w.Allocated
@@ -372,41 +385,132 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	pendingFilters := [][]byte{}
 	proposalDescriptors := []provers.ShardDescriptor{}
 	decideDescriptors := []provers.ShardDescriptor{}
-	shardKeys, err := e.hypergraph.Commit(data.Frame.Header.FrameNumber)
+	shards, err := e.shardsStore.RangeAppShards()
 	if err != nil {
-		e.logger.Error("could not commit", zap.Error(err))
+		e.logger.Error("could not obtain app shard info", zap.Error(err))
 		return
 	}
 
-	for key := range shardKeys {
-		shards, err := e.shardsStore.GetAppShards(
-			slices.Concat(key.L1[:], key.L2[:]),
-			[]uint32{},
+	registry, err := e.keyStore.GetKeyRegistryByProver(data.Frame.Header.Prover)
+	if err != nil {
+		e.logger.Info(
+			"awaiting key registry info for prover",
+			zap.String(
+				"prover_address",
+				hex.EncodeToString(data.Frame.Header.Prover),
+			),
+		)
+		return
+	}
+
+	if registry.IdentityKey == nil || registry.IdentityKey.KeyValue == nil {
+		e.logger.Info("key registry info missing identity of prover")
+		return
+	}
+
+	pub, err := pcrypto.UnmarshalEd448PublicKey(registry.IdentityKey.KeyValue)
+	if err != nil {
+		e.logger.Warn("error unmarshaling identity key", zap.Error(err))
+		return
+	}
+
+	peerId, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		e.logger.Warn("error deriving peer id", zap.Error(err))
+		return
+	}
+
+	info := e.peerInfoManager.GetPeerInfo([]byte(peerId))
+	if info == nil {
+		e.logger.Info(
+			"no peer info known yet",
+			zap.String("peer", peer.ID(peerId).String()),
+		)
+		return
+	}
+
+	if len(info.Reachability) == 0 {
+		e.logger.Info(
+			"no reachability info known yet",
+			zap.String("peer", peer.ID(peerId).String()),
+		)
+		return
+	}
+
+	var client protobufs.GlobalServiceClient = nil
+	for _, s := range info.Reachability[0].StreamMultiaddrs {
+		creds, err := p2p.NewPeerAuthenticator(
+			e.logger,
+			e.config.P2P,
+			nil,
+			nil,
+			nil,
+			nil,
+			[][]byte{[]byte(peerId)},
+			map[string]channel.AllowedPeerPolicyType{},
+			map[string]channel.AllowedPeerPolicyType{},
+		).CreateClientTLSCredentials([]byte(peerId))
+		if err != nil {
+			return
+		}
+
+		ma, err := multiaddr.StringCast(s)
+		if err != nil {
+			return
+		}
+
+		mga, err := mn.ToNetAddr(ma)
+		if err != nil {
+			return
+		}
+
+		cc, err := grpc.NewClient(
+			mga.String(),
+			grpc.WithTransportCredentials(creds),
 		)
 		if err != nil {
-			e.logger.Error("failed to retrieve shards", zap.Error(err))
-			continue
+			e.logger.Debug(
+				"could not establish direct channel, trying next multiaddr",
+				zap.String("peer", peer.ID(peerId).String()),
+				zap.String("multiaddr", ma.String()),
+				zap.Error(err),
+			)
+			return
 		}
+		defer func() {
+			if err := cc.Close(); err != nil {
+				e.logger.Error("error while closing connection", zap.Error(err))
+			}
+		}()
 
-		ps, err := e.proverRegistry.GetActiveProvers(nil)
+		client = protobufs.NewGlobalServiceClient(cc)
+		break
+	}
+
+	if client == nil {
+		e.logger.Debug("could not get app shards from prover")
+		return
+	}
+
+	for _, info := range shards {
+		resp, err := e.getAppShardsFromProver(
+			client,
+			slices.Concat(info.L1, info.L2),
+			info.Path,
+			data.Frame.Header.Prover,
+		)
 		if err != nil {
-			e.logger.Error("could not find global provers", zap.Error(err))
-			continue
+			e.logger.Debug("could not get app shards from prover", zap.Error(err))
+			return
 		}
 
-		idx := rand.Int63n(int64(len(ps)))
-		e.syncProvider.hyperSyncWithProver(ctx, ps[idx].Address, key)
-
-		for _, shard := range shards {
-			path := []int{}
-			bp := []byte{}
-			for _, p := range shard.Path {
-				path = append(path, int(p))
+		for _, shard := range resp.Info {
+			bp := slices.Clone(info.L2)
+			for _, p := range shard.Prefix {
 				bp = append(bp, byte(p))
 			}
 
-			filter := slices.Concat(key.L2[:], bp)
-			info, err := e.proverRegistry.GetProvers(filter)
+			prs, err := e.proverRegistry.GetProvers(bp)
 			if err != nil {
 				e.logger.Error("failed to get provers", zap.Error(err))
 				continue
@@ -424,11 +528,11 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 							hex.EncodeToString(allocation.ConfirmationFilter),
 						),
 					)
-					if bytes.Equal(allocation.ConfirmationFilter, filter) {
+					if bytes.Equal(allocation.ConfirmationFilter, bp) {
 						allocated = allocation.Status != 4
 						if e.config.P2P.Network != 0 ||
 							data.Frame.Header.FrameNumber > 252840 {
-							e.logger.Debug(
+							e.logger.Info(
 								"checking pending status of allocation",
 								zap.Int("status", int(allocation.Status)),
 								zap.Uint64("join_frame_number", allocation.JoinFrameNumber),
@@ -442,55 +546,27 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				}
 			}
 
-			size := e.hypergraph.GetSize(&key, path)
-			resp, err := e.hypergraph.GetChildrenForPath(
-				ctx,
-				&protobufs.GetChildrenForPathRequest{
-					ShardKey: slices.Concat(key.L1[:], key.L2[:]),
-					Path:     shard.Path,
-				},
-			)
-			if err != nil {
-				e.logger.Error("failed to get shard info", zap.Error(err))
-				continue
-			}
-
 			e.logger.Debug(
 				"checking descriptor for eligibility",
-				zap.String("shard_key", hex.EncodeToString(filter)),
+				zap.String("shard_key", hex.EncodeToString(bp)),
 			)
-			if len(resp.PathSegments) == 0 {
-				e.logger.Debug("no path segments")
-				continue
-			}
 
-			if len(
-				resp.PathSegments[len(resp.PathSegments)-1].Segments,
-			) != 1 {
+			size := new(big.Int).SetBytes(shard.Size)
+			if size.Cmp(big.NewInt(0)) == 0 {
 				e.logger.Debug(
-					"path segment length mismatch",
-					zap.Int(
-						"length",
-						len(resp.PathSegments[len(resp.PathSegments)-1].Segments),
-					),
+					"no data in shard",
+					zap.String("shard_key", hex.EncodeToString(bp)),
 				)
 				continue
 			}
 
-			shardCount := uint64(0)
-			if resp.PathSegments[len(resp.PathSegments)-1].Segments[0].GetBranch() != nil {
-				shardCount = resp.PathSegments[len(resp.PathSegments)-1].Segments[0].GetBranch().LeafCount
-			} else {
-				shardCount = 1
-			}
-
 			e.logger.Debug(
 				"logical shard count",
-				zap.Int("shard_count", int(shardCount)),
+				zap.Int("shard_count", int(shard.DataShards)),
 			)
 
 			above := []*typesconsensus.ProverInfo{}
-			for _, i := range info {
+			for _, i := range prs {
 				if i.Seniority >= effectiveSeniority {
 					above = append(above, i)
 				}
@@ -498,33 +574,33 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 
 			e.logger.Debug(
 				"appending descriptor for allocation planning",
-				zap.String("shard_key", hex.EncodeToString(filter)),
+				zap.String("shard_key", hex.EncodeToString(bp)),
 				zap.Uint64("size", size.Uint64()),
 				zap.Int("ring", len(above)/8),
-				zap.Int("shard_count", int(shardCount)),
+				zap.Int("shard_count", int(shard.DataShards)),
 			)
 
 			if allocated && pending {
-				pendingFilters = append(pendingFilters, filter)
+				pendingFilters = append(pendingFilters, bp)
 			}
 			if !allocated {
 				proposalDescriptors = append(
 					proposalDescriptors,
 					provers.ShardDescriptor{
-						Filter: filter,
+						Filter: bp,
 						Size:   size.Uint64(),
 						Ring:   uint8(len(above) / 8),
-						Shards: shardCount,
+						Shards: shard.DataShards,
 					},
 				)
 			}
 			decideDescriptors = append(
 				decideDescriptors,
 				provers.ShardDescriptor{
-					Filter: filter,
+					Filter: bp,
 					Size:   size.Uint64(),
 					Ring:   uint8(len(above) / 8),
-					Shards: shardCount,
+					Shards: shard.DataShards,
 				},
 			)
 		}
@@ -538,9 +614,26 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		if err != nil {
 			e.logger.Error("could not plan shard allocations", zap.Error(err))
 		} else {
+			expectedRewardSum := big.NewInt(0)
+			for _, p := range proposals {
+				expectedRewardSum.Add(expectedRewardSum, p.ExpectedReward)
+			}
+			raw := decimal.NewFromBigInt(expectedRewardSum, 0)
+			rewardInQuilPerInterval := raw.Div(decimal.NewFromInt(8000000000))
+			rewardInQuilPerDay := rewardInQuilPerInterval.Mul(
+				decimal.NewFromInt(24 * 60 * 6),
+			)
 			e.logger.Info(
 				"proposed joins",
 				zap.Int("proposals", len(proposals)),
+				zap.String(
+					"estimated_reward_per_interval",
+					rewardInQuilPerInterval.String(),
+				),
+				zap.String(
+					"estimated_reward_per_day",
+					rewardInQuilPerDay.String(),
+				),
 			)
 		}
 	}
@@ -726,4 +819,44 @@ func (e *GlobalConsensusEngine) publishKeyRegistry() {
 		GLOBAL_PEER_INFO_BITMASK,
 		kr,
 	)
+}
+
+func (e *GlobalConsensusEngine) getAppShardsFromProver(
+	client protobufs.GlobalServiceClient,
+	shardKey []byte,
+	path []uint32,
+	prover []byte,
+) (
+	*protobufs.GetAppShardsResponse,
+	error,
+) {
+	getCtx, cancelGet := context.WithTimeout(
+		context.Background(),
+		e.config.Engine.SyncTimeout,
+	)
+	response, err := client.GetAppShards(
+		getCtx,
+		&protobufs.GetAppShardsRequest{
+			ShardKey: shardKey,
+		},
+		// The message size limits are swapped because the server is the one
+		// sending the data.
+		grpc.MaxCallRecvMsgSize(
+			e.config.Engine.SyncMessageLimits.MaxSendMsgSize,
+		),
+		grpc.MaxCallSendMsgSize(
+			e.config.Engine.SyncMessageLimits.MaxRecvMsgSize,
+		),
+	)
+	cancelGet()
+	if err != nil {
+		return nil, err
+	}
+
+	if response == nil {
+		return nil, err
+	}
+
+	return response, nil
+
 }

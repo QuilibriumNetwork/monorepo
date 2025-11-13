@@ -10,6 +10,7 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -33,6 +34,7 @@ type ProverShardUpdate struct {
 	FrameHeader *protobufs.FrameHeader
 
 	// Private dependencies
+	logger         *zap.Logger
 	keyManager     keys.KeyManager
 	hypergraph     hypergraph.Hypergraph
 	rdfMultiprover *schema.RDFMultiprover
@@ -40,9 +42,13 @@ type ProverShardUpdate struct {
 	rewardIssuance consensus.RewardIssuance
 	proverRegistry consensus.ProverRegistry
 	blsConstructor crypto.BlsConstructor
+
+	// Internal
+	selfProverAddress []byte
 }
 
 func NewProverShardUpdate(
+	logger *zap.Logger,
 	frameHeader *protobufs.FrameHeader,
 	keyManager keys.KeyManager,
 	hypergraph hypergraph.Hypergraph,
@@ -52,15 +58,28 @@ func NewProverShardUpdate(
 	proverRegistry consensus.ProverRegistry,
 	blsConstructor crypto.BlsConstructor,
 ) (*ProverShardUpdate, error) {
+	selfProverAddress := []byte{}
+	if keyManager != nil {
+		p, err := keyManager.GetSigningKey("q-prover-key")
+		if err == nil {
+			pub := p.Public().([]byte)
+			addrBI, err := poseidon.HashBytes(pub)
+			if err == nil {
+				selfProverAddress = addrBI.FillBytes(make([]byte, 32))
+			}
+		}
+	}
 	return &ProverShardUpdate{
-		FrameHeader:    frameHeader,
-		keyManager:     keyManager,
-		hypergraph:     hypergraph,
-		rdfMultiprover: rdfMultiprover,
-		frameProver:    frameProver,
-		rewardIssuance: rewardIssuance,
-		proverRegistry: proverRegistry,
-		blsConstructor: blsConstructor,
+		logger:            logger,
+		FrameHeader:       frameHeader,
+		keyManager:        keyManager,
+		hypergraph:        hypergraph,
+		rdfMultiprover:    rdfMultiprover,
+		frameProver:       frameProver,
+		rewardIssuance:    rewardIssuance,
+		proverRegistry:    proverRegistry,
+		blsConstructor:    blsConstructor,
+		selfProverAddress: selfProverAddress,
 	}, nil
 }
 
@@ -441,6 +460,13 @@ func (p *ProverShardUpdate) applyReward(
 
 	balanceBytes := make([]byte, 32)
 	currentBalance.FillBytes(balanceBytes)
+
+	if bytes.Equal(rewardAddress, p.selfProverAddress) {
+		p.logger.Info("reward updated", zap.String(
+			"raw_unit_balance",
+			currentBalance.String(),
+		))
+	}
 
 	if err := p.rdfMultiprover.Set(
 		GLOBAL_RDF_SCHEMA,

@@ -525,6 +525,7 @@ func (e *GlobalExecutionEngine) tryGetIntrinsic(address []byte) (
 	if !exists {
 		// Load the global intrinsic
 		loaded, err := global.LoadGlobalIntrinsic(
+			e.logger,
 			address,
 			e.hypergraph,
 			e.inclusionProver,

@@ -148,7 +148,10 @@ func (p *AppVotingProvider) SignVote(
 		)
 	}
 
-	nextLeader, err := p.engine.LeaderForRank(state.Rank)
+	nextLeader, err := p.engine.LeaderForRank(
+		state.Rank,
+		state.ParentQuorumCertificate.Identity(),
+	)
 	if err != nil {
 		p.engine.logger.Error("could not determine next prover", zap.Error(err))
 		return nil, errors.Wrap(

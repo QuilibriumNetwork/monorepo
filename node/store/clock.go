@@ -919,28 +919,18 @@ func (p *PebbleClockStore) PutGlobalClockFrame(
 		}
 	}
 
-	frameNumberBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(frameNumberBytes, frameNumber)
-
-	_, closer, err := p.db.Get(clockGlobalEarliestIndex())
-	if err != nil {
-		if !errors.Is(err, pebble.ErrNotFound) {
-			return errors.Wrap(err, "put global clock frame")
-		}
-
-		if err = txn.Set(
-			clockGlobalEarliestIndex(),
-			frameNumberBytes,
-		); err != nil {
-			return errors.Wrap(err, "put global clock frame")
-		}
-	} else {
-		_ = closer.Close()
+	if err = p.updateEarliestIndex(
+		txn,
+		clockGlobalEarliestIndex(),
+		frameNumber,
+	); err != nil {
+		return errors.Wrap(err, "put global clock frame")
 	}
 
-	if err = txn.Set(
+	if err = p.updateLatestIndex(
+		txn,
 		clockGlobalLatestIndex(),
-		frameNumberBytes,
+		frameNumber,
 	); err != nil {
 		return errors.Wrap(err, "put global clock frame")
 	}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 	observability "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -22,6 +23,7 @@ import (
 )
 
 type GlobalIntrinsic struct {
+	logger              *zap.Logger
 	lockedWrites        map[string]struct{}
 	lockedReads         map[string]int
 	lockedWritesMx      sync.RWMutex
@@ -623,7 +625,6 @@ func (a *GlobalIntrinsic) Validate(
 		return nil
 
 	case protobufs.FrameHeaderType:
-		// Parse ProverKick directly from input
 		pbHeader := &protobufs.FrameHeader{}
 		if err := pbHeader.FromCanonicalBytes(input); err != nil {
 			observability.ValidateErrors.WithLabelValues(
@@ -634,6 +635,7 @@ func (a *GlobalIntrinsic) Validate(
 		}
 
 		op, err := NewProverShardUpdate(
+			a.logger,
 			pbHeader,
 			a.keyManager,
 			a.hypergraph,
@@ -1236,6 +1238,75 @@ func (a *GlobalIntrinsic) InvokeStep(
 		observability.InvokeStepTotal.WithLabelValues("global", "prover_kick").Inc()
 		return a.state, nil
 
+	case protobufs.FrameHeaderType:
+		opTimer := prometheus.NewTimer(
+			observability.OperationDuration.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			),
+		)
+		defer opTimer.ObserveDuration()
+
+		pbHeader := &protobufs.FrameHeader{}
+		if err := pbHeader.FromCanonicalBytes(input); err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		op, err := NewProverShardUpdate(
+			a.logger,
+			pbHeader,
+			a.keyManager,
+			a.hypergraph,
+			a.rdfMultiprover,
+			a.frameProver,
+			a.rewardIssuance,
+			a.proverRegistry,
+			a.blsConstructor,
+		)
+
+		valid, err := op.Verify(frameNumber)
+		if err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		if !valid {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			).Inc()
+			return nil, errors.Wrap(
+				errors.New("invalid prover shard update"),
+				"invoke step",
+			)
+		}
+
+		matTimer := prometheus.NewTimer(
+			observability.MaterializeDuration.WithLabelValues("global"),
+		)
+		a.state, err = op.Materialize(frameNumber, state)
+		matTimer.ObserveDuration()
+		if err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		observability.InvokeStepTotal.WithLabelValues(
+			"global",
+			"prover_shard_update",
+		).Inc()
+		return a.state, nil
+
 	default:
 		observability.InvokeStepErrors.WithLabelValues(
 			"global",
@@ -1821,6 +1892,7 @@ func (a *GlobalIntrinsic) tryLockKick(frameNumber uint64, input []byte) (
 // address. The global intrinsic is implicitly deployed and always exists at the
 // global address.
 func LoadGlobalIntrinsic(
+	logger *zap.Logger,
 	address []byte,
 	hypergraph hypergraph.Hypergraph,
 	inclusionProver crypto.InclusionProver,
@@ -1845,6 +1917,7 @@ func LoadGlobalIntrinsic(
 	// The global intrinsic doesn't need any initialization since it's implicitly
 	// deployed
 	return &GlobalIntrinsic{
+		logger:              logger,
 		lockedWrites:        make(map[string]struct{}),
 		lockedReads:         make(map[string]int),
 		state:               nil,

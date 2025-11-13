@@ -36,7 +36,6 @@ func (pm *peerMonitor) pingOnce(
 		return false
 	case res := <-pm.ps.Ping(pingCtx, peer):
 		if res.Error != nil {
-			logger.Debug("ping error", zap.Error(res.Error))
 			return false
 		}
 	}

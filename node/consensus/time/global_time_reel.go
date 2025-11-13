@@ -602,7 +602,8 @@ func (g *GlobalTimeReel) findNodeBySelector(selector []byte) *GlobalFrameNode {
 func (g *GlobalTimeReel) evaluateForkChoice(newNode *GlobalFrameNode) {
 	if g.head == nil || (!g.archiveMode &&
 		newNode.Frame.Header.FrameNumber > g.head.Frame.Header.FrameNumber &&
-		newNode.Frame.Header.FrameNumber-g.head.Frame.Header.FrameNumber > 360) {
+		newNode.Frame.Header.FrameNumber-g.head.Frame.Header.FrameNumber >
+			maxGlobalTreeDepth) {
 		oldHead := g.head
 		g.head = newNode
 		g.sendHeadEvent(newNode, oldHead)

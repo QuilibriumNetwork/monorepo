@@ -8,7 +8,6 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
-	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	tconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 )
 
@@ -108,27 +107,8 @@ func (e *GlobalConsensusEngine) IdentityByState(
 // LeaderForRank implements consensus.DynamicCommittee.
 func (e *GlobalConsensusEngine) LeaderForRank(
 	rank uint64,
+	selector models.Identity,
 ) (models.Identity, error) {
-	lineage, err := e.globalTimeReel.GetLineage()
-	if err != nil {
-		return "", errors.Wrap(err, "leader for rank")
-	}
-
-	var found *protobufs.GlobalFrame
-	for _, l := range lineage {
-		if l.GetRank() == (rank - 1) {
-			found = l
-			break
-		}
-	}
-
-	var selector models.Identity
-	if found == nil {
-		selector = models.Identity(make([]byte, 32))
-	} else {
-		selector = found.Identity()
-	}
-
 	inputBI, err := poseidon.HashBytes(slices.Concat(
 		[]byte(selector),
 		binary.BigEndian.AppendUint64(nil, rank),
@@ -174,22 +154,12 @@ func (e *GlobalConsensusEngine) TimeoutThresholdForRank(
 ) (uint64, error) {
 	proverInfo, err := e.proverRegistry.GetActiveProvers(nil)
 	if err != nil {
-		return 0, errors.Wrap(err, "timeout threshold for rank")
-	}
-
-	leader, err := e.LeaderForRank(rank)
-	if err != nil {
-		return 0, errors.Wrap(err, "timeout threshold for rank")
+		return 0, errors.Wrap(err, "quorum threshold for rank")
 	}
 
 	total := uint64(0)
-	// 2/3 majority doesn't quite work in this scenario, because if the timing out
-	// prover has a high enough seniority it could get things stuck where no
-	// timeout can occur
 	for _, p := range proverInfo {
-		if !bytes.Equal(p.Address, []byte(leader)) {
-			total += p.Seniority
-		}
+		total += p.Seniority
 	}
 
 	return (total * 2) / 3, nil

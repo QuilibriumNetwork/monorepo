@@ -4328,7 +4328,7 @@ func (t *ProverJoin) Validate() error {
 		return errors.Wrap(errors.New("no filters provided"), "validate")
 	}
 	for _, filter := range t.Filters {
-		if len(filter) != 32 && len(filter) != 64 {
+		if len(filter) < 32 || len(filter) > 64 {
 			return errors.Wrap(errors.New("invalid filter"), "validate")
 		}
 	}
@@ -4352,7 +4352,7 @@ func (t *ProverLeave) Validate() error {
 		return errors.Wrap(errors.New("no filters provided"), "validate")
 	}
 	for _, filter := range t.Filters {
-		if len(filter) != 32 && len(filter) != 64 {
+		if len(filter) < 32 || len(filter) > 64 {
 			return errors.Wrap(errors.New("invalid filter"), "validate")
 		}
 	}
@@ -4370,7 +4370,7 @@ func (t *ProverPause) Validate() error {
 	if t == nil {
 		return errors.Wrap(errors.New("nil announce prover pause"), "validate")
 	}
-	if len(t.Filter) != 32 {
+	if len(t.Filter) < 32 || len(t.Filter) > 64 {
 		return errors.Wrap(errors.New("invalid filter"), "validate")
 	}
 	if err := t.PublicKeySignatureBls48581.Validate(); err != nil {
@@ -4387,7 +4387,7 @@ func (t *ProverResume) Validate() error {
 	if t == nil {
 		return errors.Wrap(errors.New("nil announce prover resume"), "validate")
 	}
-	if len(t.Filter) != 32 {
+	if len(t.Filter) < 32 || len(t.Filter) > 64 {
 		return errors.Wrap(errors.New("invalid filter"), "validate")
 	}
 	if err := t.PublicKeySignatureBls48581.Validate(); err != nil {
@@ -4455,7 +4455,7 @@ func (t *ProverConfirm) Validate() error {
 	if t == nil {
 		return errors.Wrap(errors.New("nil prover confirm"), "validate")
 	}
-	if len(t.Filter) != 32 && len(t.Filter) != 64 {
+	if len(t.Filter) < 32 || len(t.Filter) > 64 {
 		return errors.Wrap(errors.New("invalid filter"), "validate")
 	}
 	if err := t.PublicKeySignatureBls48581.Validate(); err != nil {
@@ -4471,7 +4471,7 @@ func (t *ProverReject) Validate() error {
 	if t == nil {
 		return errors.Wrap(errors.New("nil prover reject"), "validate")
 	}
-	if len(t.Filter) != 32 && len(t.Filter) != 64 {
+	if len(t.Filter) < 32 || len(t.Filter) > 64 {
 		return errors.Wrap(errors.New("invalid filter"), "validate")
 	}
 	if err := t.PublicKeySignatureBls48581.Validate(); err != nil {
@@ -4784,13 +4784,12 @@ func (p *ProverLivenessCheck) Validate() error {
 	}
 
 	// Filter should be 64 bytes or fewer
-	if len(p.Filter) > 64 {
+	if len(p.Filter) < 32 || len(p.Filter) > 64 {
 		return errors.Wrap(errors.New("invalid filter length"), "validate")
 	}
 
-	// Commitment hash should be 32 bytes if global, at least 32 if not
-	if (len(p.Filter) == 0 && len(p.CommitmentHash) != 32) ||
-		(len(p.Filter) != 0 && len(p.CommitmentHash) < 32) {
+	// Commitment hash should be at least 32 bytes
+	if len(p.Filter) != 0 && len(p.CommitmentHash) < 32 {
 		return errors.Wrap(errors.New("invalid commitment hash length"), "validate")
 	}
 
