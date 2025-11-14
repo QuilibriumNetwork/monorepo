@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,6 +39,7 @@ const defaultStateQueueCapacity = 10
 type syncRequest struct {
 	frameNumber uint64
 	peerId      []byte
+	identity    []byte
 }
 
 // AppSyncProvider implements SyncProvider
@@ -81,7 +83,36 @@ func (p *AppSyncProvider) Start(
 				ctx,
 				request.frameNumber,
 				request.peerId,
+				request.identity,
 			)
+		case <-time.After(10 * time.Minute):
+			// If we got here, it means we hit a pretty strong halt. This is an act of
+			// last resort to get everyone re-aligned:
+			head, err := p.engine.appTimeReel.GetHead()
+			if err != nil {
+				p.engine.logger.Error(
+					"head frame not found for time reel",
+					zap.Error(err),
+				)
+				continue
+			}
+
+			if time.UnixMilli(head.Header.Timestamp).Before(
+				time.Now().Add(-10 * time.Minute),
+			) {
+				peer, err := p.engine.getRandomProverPeerId()
+				if err != nil {
+					p.engine.logger.Error("could not get random prover", zap.Error(err))
+					continue
+				}
+
+				p.processState(
+					ctx,
+					head.Header.FrameNumber,
+					[]byte(peer),
+					[]byte(head.Identity()),
+				)
+			}
 		}
 	}
 }
@@ -90,11 +121,13 @@ func (p *AppSyncProvider) processState(
 	ctx context.Context,
 	frameNumber uint64,
 	peerID []byte,
+	identity []byte,
 ) {
 	err := p.syncWithPeer(
 		ctx,
 		frameNumber,
 		peerID,
+		identity,
 	)
 	if err != nil {
 		p.engine.logger.Error("could not sync with peer", zap.Error(err))
@@ -320,7 +353,12 @@ func (p *AppSyncProvider) syncWithMesh(ctx context.Context) error {
 			latest = head
 		}
 
-		err = p.syncWithPeer(ctx, latest.Header.FrameNumber, []byte(peerID))
+		err = p.syncWithPeer(
+			ctx,
+			latest.Header.FrameNumber,
+			[]byte(peerID),
+			[]byte(latest.Identity()),
+		)
 		if err != nil {
 			p.engine.logger.Debug("error syncing frame", zap.Error(err))
 		}
@@ -339,6 +377,7 @@ func (p *AppSyncProvider) syncWithPeer(
 	ctx context.Context,
 	frameNumber uint64,
 	peerId []byte,
+	expectedIdentity []byte,
 ) error {
 	p.engine.logger.Info(
 		"polling peer for new frames",
@@ -465,6 +504,29 @@ func (p *AppSyncProvider) syncWithPeer(
 					p.engine.logger.Debug("received invalid response from peer")
 					return nil
 				}
+				if len(expectedIdentity) != 0 {
+					if !bytes.Equal(
+						[]byte(response.Proposal.State.Identity()),
+						expectedIdentity,
+					) {
+						p.engine.logger.Warn(
+							"aborting sync due to unexpected frame identity",
+							zap.Uint64("frame_number", frameNumber),
+							zap.String(
+								"expected",
+								hex.EncodeToString(expectedIdentity),
+							),
+							zap.String(
+								"received",
+								hex.EncodeToString(
+									[]byte(response.Proposal.State.Identity()),
+								),
+							),
+						)
+						return errors.New("sync frame identity mismatch")
+					}
+					expectedIdentity = nil
+				}
 				p.engine.logger.Info(
 					"received new leading frame",
 					zap.Uint64(
@@ -476,9 +538,25 @@ func (p *AppSyncProvider) syncWithPeer(
 						frametime.AppFrameSince(response.Proposal.State),
 					),
 				)
+				provers, err := p.engine.proverRegistry.GetActiveProvers(
+					p.engine.appAddress,
+				)
+				if err != nil {
+					p.engine.logger.Error(
+						"could not obtain active provers",
+						zap.Error(err),
+					)
+					return err
+				}
+
+				ids := [][]byte{}
+				for _, p := range provers {
+					ids = append(ids, p.Address)
+				}
 				if _, err := p.engine.frameProver.VerifyFrameHeader(
 					response.Proposal.State.Header,
 					p.engine.blsConstructor,
+					ids,
 				); err != nil {
 					return errors.Wrap(err, "sync")
 				}
@@ -499,19 +577,35 @@ func (p *AppSyncProvider) syncWithPeer(
 func (p *AppSyncProvider) AddState(
 	sourcePeerID []byte,
 	frameNumber uint64,
+	expectedIdentity []byte,
 ) {
 	// Drop if we're within the threshold
 	if frameNumber <=
-		(*p.engine.forks.FinalizedState().State).Header.FrameNumber {
-		p.engine.logger.Debug("dropping stale state for sync")
+		(*p.engine.forks.FinalizedState().State).Header.FrameNumber &&
+		frameNumber != 0 {
+		p.engine.logger.Debug(
+			"dropping stale state for sync",
+			zap.Uint64("frame_requested", frameNumber),
+			zap.Uint64(
+				"finalized_frame",
+				(*p.engine.forks.FinalizedState().State).Header.FrameNumber,
+			),
+		)
 		return
+	}
+
+	// Handle special case: we're at genesis frame on time reel
+	if frameNumber == 0 {
+		frameNumber = 1
+		expectedIdentity = []byte{}
 	}
 
 	// Enqueue if we can, otherwise drop it because we'll catch up
 	select {
 	case p.queuedStates <- syncRequest{
 		frameNumber: frameNumber,
-		peerId:      sourcePeerID,
+		peerId:      slices.Clone(sourcePeerID),
+		identity:    slices.Clone(expectedIdentity),
 	}:
 		p.engine.logger.Debug(
 			"enqueued sync request",

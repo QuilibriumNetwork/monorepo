@@ -2806,6 +2806,7 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 		e.syncProvider.AddState(
 			[]byte(peer),
 			current.Header.FrameNumber,
+			[]byte(current.Identity()),
 		)
 		return
 	}
@@ -2846,6 +2847,7 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 		e.syncProvider.AddState(
 			[]byte(peerID),
 			current.Header.FrameNumber,
+			[]byte(current.Identity()),
 		)
 		return
 	}

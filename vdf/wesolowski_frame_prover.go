@@ -10,6 +10,8 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 
+	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/consensus/verification"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/crypto"
 )
@@ -264,6 +266,7 @@ func (w *WesolowskiFrameProver) GetFrameSignaturePayload(
 func (w *WesolowskiFrameProver) VerifyFrameHeader(
 	frame *protobufs.FrameHeader,
 	bls qcrypto.BlsConstructor,
+	ids [][]byte,
 ) ([]uint8, error) {
 	if len(frame.Address) == 0 {
 		return nil, errors.Wrap(
@@ -329,7 +332,7 @@ func (w *WesolowskiFrameProver) VerifyFrameHeader(
 		return nil, nil
 	}
 
-	valid, err := w.VerifyFrameHeaderSignature(frame, bls)
+	valid, err := w.VerifyFrameHeaderSignature(frame, bls, ids)
 	if err != nil {
 		return nil, errors.Wrap(err, "verify frame header")
 	}
@@ -347,17 +350,23 @@ func (w *WesolowskiFrameProver) VerifyFrameHeader(
 func (w *WesolowskiFrameProver) VerifyFrameHeaderSignature(
 	frame *protobufs.FrameHeader,
 	bls qcrypto.BlsConstructor,
+	ids [][]byte,
 ) (bool, error) {
 	// Get the signature payload
-	signaturePayload, err := w.GetFrameSignaturePayload(frame)
+	selectorBI, err := poseidon.HashBytes(frame.Output)
 	if err != nil {
 		return false, errors.Wrap(err, "verify frame header signature")
 	}
+	signaturePayload := verification.MakeVoteMessage(
+		frame.Address,
+		frame.Rank,
+		models.Identity(selectorBI.FillBytes(make([]byte, 32))),
+	)
 
-	domain := append([]byte("shard"), frame.Address...)
+	domain := append([]byte("appshard"), frame.Address...)
 	if !bls.VerifySignatureRaw(
 		frame.PublicKeySignatureBls48581.PublicKey.KeyValue,
-		frame.PublicKeySignatureBls48581.Signature,
+		frame.PublicKeySignatureBls48581.Signature[:74],
 		signaturePayload,
 		domain,
 	) {
@@ -367,7 +376,45 @@ func (w *WesolowskiFrameProver) VerifyFrameHeaderSignature(
 		)
 	}
 
-	return true, nil
+	indices := GetSetBitIndices(frame.PublicKeySignatureBls48581.Bitmask)
+	if len(frame.PublicKeySignatureBls48581.Signature) == 74 &&
+		len(indices) != 1 {
+		return false, errors.Wrap(
+			errors.New("signature missing multiproof"),
+			"verify frame header signature",
+		)
+	}
+
+	if len(frame.PublicKeySignatureBls48581.Signature) == 74 && ids == nil {
+		return true, nil
+	}
+
+	buf := bytes.NewBuffer(frame.PublicKeySignatureBls48581.Signature[74:])
+
+	var multiproofCount uint32
+	if err := binary.Read(buf, binary.BigEndian, &multiproofCount); err != nil {
+		return false, errors.Wrap(err, "verify frame header signature")
+	}
+
+	multiproofs := [][516]byte{}
+	for i := uint32(0); i < multiproofCount; i++ {
+		multiproof := [516]byte{}
+		if _, err := buf.Read(multiproof[:]); err != nil {
+			return false, errors.Wrap(err, "verify frame header signature")
+		}
+		multiproofs = append(multiproofs, multiproof)
+	}
+
+	challenge := sha3.Sum256(frame.ParentSelector)
+
+	valid, err := w.VerifyMultiProof(
+		challenge,
+		frame.Difficulty,
+		ids,
+		multiproofs,
+	)
+
+	return valid, errors.Wrap(err, "verify frame header signature")
 }
 
 func (w *WesolowskiFrameProver) ProveGlobalFrameHeader(
@@ -576,10 +623,15 @@ func (w *WesolowskiFrameProver) VerifyGlobalHeaderSignature(
 	bls qcrypto.BlsConstructor,
 ) (bool, error) {
 	// Get the signature payload
-	signaturePayload, err := w.GetGlobalFrameSignaturePayload(frame)
+	selectorBI, err := poseidon.HashBytes(frame.Output)
 	if err != nil {
-		return false, errors.Wrap(err, "verify global frame header")
+		return false, errors.Wrap(err, "verify frame header signature")
 	}
+	signaturePayload := verification.MakeVoteMessage(
+		nil,
+		frame.Rank,
+		models.Identity(selectorBI.FillBytes(make([]byte, 32))),
+	)
 
 	if !bls.VerifySignatureRaw(
 		frame.PublicKeySignatureBls48581.PublicKey.KeyValue,

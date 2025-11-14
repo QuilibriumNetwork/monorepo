@@ -496,10 +496,7 @@ func (e *EventHandler[
 		consensus.Uint64Param("current_rank", curRank),
 		consensus.IdentityParam("self", e.committee.Self()),
 	)
-	currentLeader, err := e.committee.LeaderForRank(
-		curRank,
-		e.paceMaker.LatestQuorumCertificate().Identity(),
-	)
+	currentLeader, err := e.committee.LeaderForRank(curRank)
 	if err != nil {
 		return fmt.Errorf(
 			"failed to determine primary for new rank %d: %w",
@@ -694,10 +691,7 @@ func (e *EventHandler[
 		return nil
 	}
 	// leader (node ID) for next rank
-	nextLeader, err := e.committee.LeaderForRank(
-		curRank+1,
-		proposal.State.Identifier,
-	)
+	nextLeader, err := e.committee.LeaderForRank(curRank + 1)
 	if errors.Is(err, models.ErrRankUnknown) {
 		// We are attempting process a state in an unknown rank
 		// This should never happen, because:

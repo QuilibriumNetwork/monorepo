@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/binary"
+	"math/big"
 	"slices"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -105,28 +106,26 @@ func (e *AppConsensusEngine) IdentityByState(
 }
 
 // LeaderForRank implements consensus.DynamicCommittee.
-func (e *AppConsensusEngine) LeaderForRank(
-	rank uint64,
-	selector models.Identity,
-) (models.Identity, error) {
+func (e *AppConsensusEngine) LeaderForRank(rank uint64) (
+	models.Identity,
+	error,
+) {
+	// TODO(2.2): revisit this
 	inputBI, err := poseidon.HashBytes(slices.Concat(
-		[]byte(selector),
-		binary.BigEndian.AppendUint64(nil, rank),
+		binary.BigEndian.AppendUint64(slices.Clone(e.appAddress), rank),
 	))
 	if err != nil {
 		return "", errors.Wrap(err, "leader for rank")
 	}
 
-	input := inputBI.FillBytes(make([]byte, 32))
-	prover, err := e.proverRegistry.GetNextProver(
-		[32]byte(input),
-		e.appAddress,
-	)
+	proverSet, err := e.proverRegistry.GetActiveProvers(e.appAddress)
 	if err != nil {
 		return "", errors.Wrap(err, "leader for rank")
 	}
 
-	return models.Identity(prover), nil
+	inputBI.Mod(inputBI, big.NewInt(int64(len(proverSet))))
+	index := inputBI.Int64()
+	return models.Identity(proverSet[int(index)].Address), nil
 }
 
 // QuorumThresholdForRank implements consensus.DynamicCommittee.

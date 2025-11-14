@@ -26,10 +26,12 @@ type FrameProver interface {
 	VerifyFrameHeader(
 		frame *protobufs.FrameHeader,
 		bls BlsConstructor,
+		ids [][]byte,
 	) ([]uint8, error)
 	VerifyFrameHeaderSignature(
 		frame *protobufs.FrameHeader,
 		bls BlsConstructor,
+		ids [][]byte,
 	) (bool, error)
 	GetFrameSignaturePayload(
 		frame *protobufs.FrameHeader,

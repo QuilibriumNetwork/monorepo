@@ -128,10 +128,7 @@ func (r *SafetyRules[StateT, VoteT]) produceVote(
 		)
 	}
 
-	currentLeader, err := r.committee.LeaderForRank(
-		state.Rank,
-		state.ParentQuorumCertificate.Identity(),
-	)
+	currentLeader, err := r.committee.LeaderForRank(state.Rank)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"expect to have a valid leader for rank %d: %w",

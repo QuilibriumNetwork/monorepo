@@ -3,7 +3,9 @@ package global
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -26,6 +28,7 @@ const defaultStateQueueCapacity = 10
 type syncRequest struct {
 	frameNumber uint64
 	peerId      []byte
+	identity    []byte
 }
 
 // GlobalSyncProvider implements SyncProvider
@@ -69,6 +72,7 @@ func (p *GlobalSyncProvider) Start(
 				ctx,
 				request.frameNumber,
 				request.peerId,
+				request.identity,
 			)
 		}
 	}
@@ -78,11 +82,13 @@ func (p *GlobalSyncProvider) processState(
 	ctx context.Context,
 	frameNumber uint64,
 	peerID []byte,
+	identity []byte,
 ) {
 	err := p.syncWithPeer(
 		ctx,
 		frameNumber,
 		peerID,
+		identity,
 	)
 	if err != nil {
 		p.engine.logger.Error("could not sync with peer", zap.Error(err))
@@ -230,7 +236,12 @@ func (p *GlobalSyncProvider) syncWithMesh(ctx context.Context) error {
 			latest = head
 		}
 
-		err = p.syncWithPeer(ctx, latest.Header.FrameNumber, []byte(peerID))
+		err = p.syncWithPeer(
+			ctx,
+			latest.Header.FrameNumber,
+			[]byte(peerID),
+			nil,
+		)
 		if err != nil {
 			p.engine.logger.Debug("error syncing frame", zap.Error(err))
 		}
@@ -249,6 +260,7 @@ func (p *GlobalSyncProvider) syncWithPeer(
 	ctx context.Context,
 	frameNumber uint64,
 	peerId []byte,
+	expectedIdentity []byte,
 ) error {
 	p.engine.logger.Info(
 		"polling peer for new frames",
@@ -370,6 +382,30 @@ func (p *GlobalSyncProvider) syncWithPeer(
 					zap.Error(err),
 				)
 				return nil
+			}
+
+			if len(expectedIdentity) != 0 {
+				if !bytes.Equal(
+					[]byte(response.Proposal.State.Identity()),
+					expectedIdentity,
+				) {
+					p.engine.logger.Warn(
+						"aborting sync due to unexpected frame identity",
+						zap.Uint64("frame_number", frameNumber),
+						zap.String(
+							"expected",
+							hex.EncodeToString(expectedIdentity),
+						),
+						zap.String(
+							"received",
+							hex.EncodeToString(
+								[]byte(response.Proposal.State.Identity()),
+							),
+						),
+					)
+					return errors.New("sync frame identity mismatch")
+				}
+				expectedIdentity = nil
 			}
 
 			p.engine.logger.Info(
@@ -499,19 +535,35 @@ func (p *GlobalSyncProvider) hyperSyncHyperedgeRemoves(
 func (p *GlobalSyncProvider) AddState(
 	sourcePeerID []byte,
 	frameNumber uint64,
+	expectedIdentity []byte,
 ) {
 	// Drop if we're within the threshold
 	if frameNumber <=
-		(*p.engine.forks.FinalizedState().State).Header.FrameNumber {
-		p.engine.logger.Debug("dropping stale state for sync")
+		(*p.engine.forks.FinalizedState().State).Header.FrameNumber &&
+		frameNumber != 0 {
+		p.engine.logger.Debug(
+			"dropping stale state for sync",
+			zap.Uint64("frame_requested", frameNumber),
+			zap.Uint64(
+				"finalized_frame",
+				(*p.engine.forks.FinalizedState().State).Header.FrameNumber,
+			),
+		)
 		return
+	}
+
+	// Handle special case: we're at genesis frame on time reel
+	if frameNumber == 0 {
+		frameNumber = 1
+		expectedIdentity = []byte{}
 	}
 
 	// Enqueue if we can, otherwise drop it because we'll catch up
 	select {
 	case p.queuedStates <- syncRequest{
 		frameNumber: frameNumber,
-		peerId:      sourcePeerID,
+		peerId:      slices.Clone(sourcePeerID),
+		identity:    slices.Clone(expectedIdentity),
 	}:
 		p.engine.logger.Debug(
 			"enqueued sync request",

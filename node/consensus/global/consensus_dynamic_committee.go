@@ -3,6 +3,7 @@ package global
 import (
 	"bytes"
 	"encoding/binary"
+	"math/big"
 	"slices"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -107,23 +108,23 @@ func (e *GlobalConsensusEngine) IdentityByState(
 // LeaderForRank implements consensus.DynamicCommittee.
 func (e *GlobalConsensusEngine) LeaderForRank(
 	rank uint64,
-	selector models.Identity,
 ) (models.Identity, error) {
+	// TODO(2.2): revisit this
 	inputBI, err := poseidon.HashBytes(slices.Concat(
-		[]byte(selector),
 		binary.BigEndian.AppendUint64(nil, rank),
 	))
 	if err != nil {
 		return "", errors.Wrap(err, "leader for rank")
 	}
 
-	input := inputBI.FillBytes(make([]byte, 32))
-	prover, err := e.proverRegistry.GetNextProver([32]byte(input), nil)
+	proverSet, err := e.proverRegistry.GetActiveProvers(nil)
 	if err != nil {
 		return "", errors.Wrap(err, "leader for rank")
 	}
 
-	return models.Identity(prover), nil
+	inputBI.Mod(inputBI, big.NewInt(int64(len(proverSet))))
+	index := inputBI.Int64()
+	return models.Identity(proverSet[int(index)].Address), nil
 }
 
 // QuorumThresholdForRank implements consensus.DynamicCommittee.

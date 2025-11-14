@@ -572,18 +572,18 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				}
 			}
 
-			e.logger.Debug(
-				"appending descriptor for allocation planning",
-				zap.String("shard_key", hex.EncodeToString(bp)),
-				zap.Uint64("size", size.Uint64()),
-				zap.Int("ring", len(above)/8),
-				zap.Int("shard_count", int(shard.DataShards)),
-			)
-
 			if allocated && pending {
 				pendingFilters = append(pendingFilters, bp)
 			}
 			if !allocated {
+				e.logger.Debug(
+					"appending descriptor for allocation planning",
+					zap.String("shard_key", hex.EncodeToString(bp)),
+					zap.Uint64("size", size.Uint64()),
+					zap.Int("ring", len(above)/8),
+					zap.Int("shard_count", int(shard.DataShards)),
+				)
+
 				proposalDescriptors = append(
 					proposalDescriptors,
 					provers.ShardDescriptor{

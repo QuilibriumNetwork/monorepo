@@ -96,8 +96,9 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 			return p2p.ValidationResultReject
 		}
 
-		now := uint64(time.Now().UnixMilli())
-		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
+		// We should still accept votes for the past rank – either because a peer
+		// needs it, or because we need it to trump a TC
+		if e.currentRank > vote.Rank+1 {
 			voteValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}
@@ -126,8 +127,8 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 			return p2p.ValidationResultReject
 		}
 
-		now := uint64(time.Now().UnixMilli())
-		if timeoutState.Timestamp > now+5000 || timeoutState.Timestamp < now-5000 {
+		// We should still accept votes for the past rank in case a peer needs it
+		if e.currentRank > timeoutState.Vote.Rank+1 {
 			timeoutStateValidationTotal.WithLabelValues(
 				e.appAddressHex,
 				"ignore",

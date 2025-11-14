@@ -73,8 +73,8 @@ func (_m *Replicas) IdentityByRank(rank uint64, participantID models.Identity) (
 }
 
 // LeaderForRank provides a mock function with given fields: rank
-func (_m *Replicas) LeaderForRank(rank uint64, selector models.Identity) (models.Identity, error) {
-	ret := _m.Called(rank, selector)
+func (_m *Replicas) LeaderForRank(rank uint64) (models.Identity, error) {
+	ret := _m.Called(rank)
 
 	if len(ret) == 0 {
 		panic("no return value specified for LeaderForRank")
@@ -82,17 +82,17 @@ func (_m *Replicas) LeaderForRank(rank uint64, selector models.Identity) (models
 
 	var r0 models.Identity
 	var r1 error
-	if rf, ok := ret.Get(0).(func(uint64, models.Identity) (models.Identity, error)); ok {
-		return rf(rank, selector)
+	if rf, ok := ret.Get(0).(func(uint64) (models.Identity, error)); ok {
+		return rf(rank)
 	}
-	if rf, ok := ret.Get(0).(func(uint64, models.Identity) models.Identity); ok {
-		r0 = rf(rank, selector)
+	if rf, ok := ret.Get(0).(func(uint64) models.Identity); ok {
+		r0 = rf(rank)
 	} else {
 		r0 = ret.Get(0).(models.Identity)
 	}
 
-	if rf, ok := ret.Get(1).(func(uint64, models.Identity) error); ok {
-		r1 = rf(rank, selector)
+	if rf, ok := ret.Get(1).(func(uint64) error); ok {
+		r1 = rf(rank)
 	} else {
 		r1 = ret.Error(1)
 	}

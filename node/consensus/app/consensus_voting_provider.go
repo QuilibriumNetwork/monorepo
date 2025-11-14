@@ -109,7 +109,10 @@ func (p *AppVotingProvider) SignTimeoutVote(
 		newestQuorumCertificateRank,
 	)
 
-	sig, err := signer.SignWithDomain(signatureData, []byte("appshardtimeout"))
+	sig, err := signer.SignWithDomain(
+		signatureData,
+		slices.Concat([]byte("appshardtimeout"), p.engine.appAddress),
+	)
 	if err != nil {
 		p.engine.logger.Error("could not sign vote", zap.Error(err))
 		return nil, errors.Wrap(err, "sign vote")
@@ -148,10 +151,7 @@ func (p *AppVotingProvider) SignVote(
 		)
 	}
 
-	nextLeader, err := p.engine.LeaderForRank(
-		state.Rank,
-		state.ParentQuorumCertificate.Identity(),
-	)
+	nextLeader, err := p.engine.LeaderForRank(state.Rank)
 	if err != nil {
 		p.engine.logger.Error("could not determine next prover", zap.Error(err))
 		return nil, errors.Wrap(
@@ -167,7 +167,10 @@ func (p *AppVotingProvider) SignVote(
 		p.engine.proofCacheMu.RUnlock()
 
 		if !ok {
-			return nil, errors.Wrap(errors.New("no proof ready for vote"), "sign vote")
+			return nil, errors.Wrap(
+				errors.New("no proof ready for vote"),
+				"sign vote",
+			)
 		}
 		extProof = proof[:]
 	}
@@ -178,7 +181,10 @@ func (p *AppVotingProvider) SignVote(
 		state.Rank,
 		state.Identifier,
 	)
-	sig, err := signer.SignWithDomain(signatureData, []byte("appshard"))
+	sig, err := signer.SignWithDomain(
+		signatureData,
+		slices.Concat([]byte("appshard"), p.engine.appAddress),
+	)
 	if err != nil {
 		p.engine.logger.Error("could not sign vote", zap.Error(err))
 		return nil, errors.Wrap(err, "sign vote")

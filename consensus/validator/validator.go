@@ -333,10 +333,7 @@ func (v *Validator[StateT, VoteT]) ValidateProposal(
 	}
 
 	// check the proposer is the leader for the proposed state's rank
-	leader, err := v.committee.LeaderForRank(
-		state.Rank,
-		state.ParentQuorumCertificate.Identity(),
-	)
+	leader, err := v.committee.LeaderForRank(state.Rank)
 	if err != nil {
 		return fmt.Errorf(
 			"error determining leader for state %x: %w",
