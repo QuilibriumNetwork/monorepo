@@ -5474,7 +5474,7 @@ req:A a rdfs:Property;
 	}
 
 	// Create code execution payload (if operations provided)
-	if operations != nil && len(operations) > 0 {
+	if len(operations) > 0 {
 		var domain [32]byte
 		rand.Read(domain[:])
 		var rendezvous [32]byte
