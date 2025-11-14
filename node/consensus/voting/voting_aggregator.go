@@ -1,6 +1,8 @@
 package voting
 
 import (
+	"slices"
+
 	"github.com/gammazero/workerpool"
 	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
@@ -61,7 +63,7 @@ func NewAppShardVoteAggregator[PeerIDT models.Unique](
 		](
 			voteProcessorFactory.Create,
 		),
-		[]byte("appshard"),
+		slices.Concat([]byte("appshard"), filter),
 		signatureAggregator,
 		votingProvider,
 	)
@@ -119,7 +121,7 @@ func NewAppShardTimeoutAggregator[PeerIDT models.Unique](
 		committee,
 		validator,
 		votingProvider,
-		[]byte("appshardtimeout"),
+		slices.Concat([]byte("appshardtimeout"), filter),
 	)
 
 	timeoutCollectorFactory := timeoutcollector.NewTimeoutCollectorFactory(

@@ -66,7 +66,11 @@ func (b *BLSAppFrameValidator) Validate(
 		}
 	}
 
-	bits, err := b.frameProver.VerifyFrameHeader(frame.Header, b.blsConstructor)
+	bits, err := b.frameProver.VerifyFrameHeader(
+		frame.Header,
+		b.blsConstructor,
+		nil,
+	)
 	isValid := err == nil
 
 	if !isValid {

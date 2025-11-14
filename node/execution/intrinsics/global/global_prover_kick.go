@@ -496,6 +496,7 @@ func (p *ProverKick) verifyEquivocation(kickedPublicKey []byte) bool {
 		valid, err := p.frameProver.VerifyFrameHeaderSignature(
 			frame1,
 			p.blsConstructor,
+			nil,
 		)
 		if !valid || err != nil {
 			return false
@@ -504,6 +505,7 @@ func (p *ProverKick) verifyEquivocation(kickedPublicKey []byte) bool {
 		valid, err = p.frameProver.VerifyFrameHeaderSignature(
 			frame2,
 			p.blsConstructor,
+			nil,
 		)
 		if !valid || err != nil {
 			return false

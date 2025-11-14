@@ -3,6 +3,7 @@ package aggregator
 import (
 	"github.com/pkg/errors"
 
+	"source.quilibrium.com/quilibrium/monorepo/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -62,16 +63,30 @@ func (c *ConsensusSignatureAggregatorWrapper) Aggregate(
 		return nil, errors.Wrap(err, "aggregate")
 	}
 
-	pubs := map[string]struct{}{}
-	for _, p := range publicKeys {
-		pubs[string(p)] = struct{}{}
+	pubs := map[string]int{}
+	for i, p := range publicKeys {
+		pubs[string(p)] = i
 	}
 
 	bitmask := make([]byte, (len(provers)+7)/8)
+	extra := []byte{}
+	if len(c.filter) != 0 {
+		extra = make([]byte, 516*len(provers))
+	}
 	for i, p := range provers {
-		if _, ok := pubs[string(p.PublicKey)]; ok {
+		if j, ok := pubs[string(p.PublicKey)]; ok {
 			bitmask[i/8] |= (1 << (i % 8))
+
+			if len(c.filter) != 0 {
+				copy(extra[516*i:516*(i+1)], signatures[j][74:])
+			}
 		}
+	}
+
+	// TODO: remove direct reference
+	if len(c.filter) != 0 {
+		output.(*bls48581.BlsAggregateOutput).AggregateSignature =
+			append(output.(*bls48581.BlsAggregateOutput).AggregateSignature, extra...)
 	}
 
 	return &ConsensusAggregatedSignature{output, bitmask}, nil

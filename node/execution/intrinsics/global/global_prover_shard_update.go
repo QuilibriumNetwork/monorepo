@@ -103,11 +103,6 @@ func (p *ProverShardUpdate) Verify(frameNumber uint64) (bool, error) {
 		return false, errors.Wrap(errors.New("invalid update"), "verify")
 	}
 
-	_, err = p.frameProver.VerifyFrameHeader(p.FrameHeader, p.blsConstructor)
-	if err != nil {
-		return false, errors.Wrap(err, "verify")
-	}
-
 	return true, nil
 }
 
@@ -267,9 +262,20 @@ func (p *ProverShardUpdate) buildContext() (*shardUpdateContext, error) {
 		return nil, errors.New("frame header missing address")
 	}
 
+	info, err := p.proverRegistry.GetActiveProvers(p.FrameHeader.Address)
+	if err != nil {
+		return nil, errors.Wrap(err, "get active provers")
+	}
+
+	ids := [][]byte{}
+	for _, p := range info {
+		ids = append(ids, p.Address)
+	}
+
 	setIndices, err := p.frameProver.VerifyFrameHeader(
 		p.FrameHeader,
 		p.blsConstructor,
+		ids,
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "verify frame header")

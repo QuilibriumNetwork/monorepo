@@ -869,18 +869,27 @@ func (e *GlobalConsensusEngine) handleGlobalProposal(
 	finalized := e.forks.FinalizedState()
 	finalizedRank := finalized.Rank
 	finalizedFrameNumber := (*finalized.State).Header.FrameNumber
+	frameNumber := proposal.State.Header.FrameNumber
 
 	// drop proposals if we already processed them
-	if proposal.State.Header.FrameNumber <= finalizedFrameNumber ||
+	if frameNumber <= finalizedFrameNumber ||
 		proposal.State.Header.Rank <= finalizedRank {
 		e.logger.Debug("dropping stale proposal")
 		return
 	}
 
-	_, err := e.clockStore.GetGlobalClockFrame(proposal.State.Header.FrameNumber)
-	if err == nil {
-		e.logger.Debug("dropping stale proposal")
-		return
+	existingFrame, err := e.clockStore.GetGlobalClockFrame(frameNumber)
+	if err == nil && existingFrame != nil {
+		qc, qcErr := e.clockStore.GetQuorumCertificate(
+			nil,
+			proposal.State.GetRank(),
+		)
+		if qcErr == nil && qc != nil &&
+			qc.GetFrameNumber() == frameNumber &&
+			qc.Identity() == proposal.State.Identity() {
+			e.logger.Debug("dropping stale proposal")
+			return
+		}
 	}
 
 	// if we have a parent, cache and move on
@@ -915,12 +924,12 @@ func (e *GlobalConsensusEngine) handleGlobalProposal(
 			e.syncProvider.AddState(
 				[]byte(peerID),
 				head.Header.FrameNumber,
+				[]byte(head.Identity()),
 			)
 			return
 		}
 	}
 
-	frameNumber := proposal.State.Header.FrameNumber
 	expectedFrame, err := e.globalTimeReel.GetHead()
 	if err != nil {
 		e.logger.Error("could not obtain time reel head", zap.Error(err))
@@ -1021,7 +1030,14 @@ func (e *GlobalConsensusEngine) processProposal(
 	if prtc != nil {
 		signedProposal.PreviousRankTimeoutCertificate = prtc
 	}
-	e.voteAggregator.AddState(signedProposal)
+
+	// IMPORTANT: we do not want to send old proposals to the vote aggregator or
+	// we risk engine shutdown if the leader selection method changed – frame
+	// validation ensures that the proposer is valid for the proposal per time
+	// reel rules.
+	if signedProposal.State.Rank >= e.currentRank {
+		e.voteAggregator.AddState(signedProposal)
+	}
 	e.consensusParticipant.SubmitProposal(signedProposal)
 
 	e.trySealParentWithChild(proposal)
@@ -1732,7 +1748,7 @@ func (e *GlobalConsensusEngine) handleShardVote(message *pb.Message) {
 		voterPublicKey,
 		signatureData,
 		vote.PublicKeySignatureBls48581.Signature,
-		[]byte("appshard"),
+		slices.Concat([]byte("appshard"), vote.Filter),
 	)
 
 	if err != nil || !valid {

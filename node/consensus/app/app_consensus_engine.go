@@ -127,6 +127,7 @@ type AppConsensusEngine struct {
 	quit                      chan struct{}
 	canRunStandalone          bool
 	blacklistMap              map[string]bool
+	currentRank               uint64
 	alertPublicKey            []byte
 
 	// Message queues
@@ -496,6 +497,10 @@ func NewAppConsensusEngine(
 			CertifyingQuorumCertificate: qc,
 		}
 		pending = engine.getPendingProposals(frame.Header.FrameNumber)
+	}
+	liveness, err := engine.consensusStore.GetLivenessState(appAddress)
+	if err == nil {
+		engine.currentRank = liveness.CurrentRank
 	}
 
 	engine.voteAggregator, err = voting.NewAppShardVoteAggregator[PeerID](
@@ -1948,7 +1953,7 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 		return
 	}
 
-	nextLeader, err := e.LeaderForRank(newRank, frame.Identity())
+	nextLeader, err := e.LeaderForRank(newRank)
 	if err != nil {
 		e.logger.Error("could not determine next prover", zap.Error(err))
 		return
@@ -1974,8 +1979,9 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 				return
 			}
 
+			challenge := sha3.Sum256([]byte(frame.Identity()))
 			proof := e.frameProver.CalculateMultiProof(
-				[32]byte([]byte(frame.Identity())),
+				challenge,
 				frame.Header.Difficulty,
 				ids,
 				uint32(myIndex),
@@ -1989,6 +1995,7 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 
 // OnRankChange implements consensus.Consumer.
 func (e *AppConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
+	e.currentRank = newRank
 	err := e.ensureGlobalClient()
 	if err != nil {
 		e.logger.Error("cannot confirm cross-shard locks", zap.Error(err))
@@ -2363,7 +2370,7 @@ func (e *AppConsensusEngine) VerifyQuorumCertificate(
 		qc.AggregateSignature.GetPubKey(),
 		qc.AggregateSignature.GetSignature(),
 		verification.MakeVoteMessage(nil, qc.Rank, qc.Identity()),
-		[]byte("appshard"),
+		slices.Concat([]byte("appshard"), e.appAddress),
 	); !valid {
 		return models.ErrInvalidSignature
 	}
@@ -2426,7 +2433,7 @@ func (e *AppConsensusEngine) VerifyTimeoutCertificate(
 			tc.Rank,
 			tc.LatestQuorumCertificate.Rank,
 		),
-		[]byte("appshardtimeout"),
+		slices.Concat([]byte("appshardtimeout"), e.appAddress),
 	); !valid {
 		return models.ErrInvalidSignature
 	}
@@ -2469,7 +2476,7 @@ func (e *AppConsensusEngine) VerifyVote(
 		pubkey,
 		(*vote).PublicKeySignatureBls48581.Signature[:74],
 		verification.MakeVoteMessage(nil, (*vote).Rank, (*vote).Source()),
-		[]byte("appshard"),
+		slices.Concat([]byte("appshard"), e.appAddress),
 	); !valid {
 		return models.ErrInvalidSignature
 	}

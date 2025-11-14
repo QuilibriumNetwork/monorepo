@@ -191,21 +191,30 @@ func (e *AppConsensusEngine) handleAppShardProposal(
 	finalized := e.forks.FinalizedState()
 	finalizedRank := finalized.Rank
 	finalizedFrameNumber := (*finalized.State).Header.FrameNumber
+	frameNumber := proposal.State.Header.FrameNumber
 
 	// drop proposals if we already processed them
-	if proposal.State.Header.FrameNumber <= finalizedFrameNumber ||
+	if frameNumber <= finalizedFrameNumber ||
 		proposal.State.Header.Rank <= finalizedRank {
 		e.logger.Debug("dropping stale proposal")
 		return
 	}
-	_, _, err := e.clockStore.GetShardClockFrame(
+	existingFrame, _, err := e.clockStore.GetShardClockFrame(
 		proposal.State.Header.Address,
-		proposal.State.Header.FrameNumber,
+		frameNumber,
 		false,
 	)
-	if err == nil {
-		e.logger.Debug("dropping stale proposal")
-		return
+	if err == nil && existingFrame != nil {
+		qc, qcErr := e.clockStore.GetQuorumCertificate(
+			proposal.State.Header.Address,
+			proposal.State.GetRank(),
+		)
+		if qcErr == nil && qc != nil &&
+			qc.GetFrameNumber() == frameNumber &&
+			qc.Identity() == proposal.State.Identity() {
+			e.logger.Debug("dropping stale proposal")
+			return
+		}
 	}
 
 	if proposal.State.Header.FrameNumber != 0 {
@@ -239,12 +248,14 @@ func (e *AppConsensusEngine) handleAppShardProposal(
 				return
 			}
 
-			e.syncProvider.AddState([]byte(peerID), head.Header.FrameNumber)
+			e.syncProvider.AddState(
+				[]byte(peerID),
+				head.Header.FrameNumber,
+				[]byte(head.Identity()),
+			)
 			return
 		}
 	}
-
-	frameNumber := proposal.State.Header.FrameNumber
 	expectedFrame, err := e.appTimeReel.GetHead()
 	if err != nil {
 		e.logger.Error("could not obtain app time reel head", zap.Error(err))
@@ -351,7 +362,13 @@ func (e *AppConsensusEngine) processProposal(
 		signedProposal.PreviousRankTimeoutCertificate = prtc
 	}
 
-	e.voteAggregator.AddState(signedProposal)
+	// IMPORTANT: we do not want to send old proposals to the vote aggregator or
+	// we risk engine shutdown if the leader selection method changed – frame
+	// validation ensures that the proposer is valid for the proposal per time
+	// reel rules.
+	if signedProposal.State.Rank >= e.currentRank {
+		e.voteAggregator.AddState(signedProposal)
+	}
 	e.consensusParticipant.SubmitProposal(signedProposal)
 	proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 

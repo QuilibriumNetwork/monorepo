@@ -90,8 +90,55 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		return nil, models.NewNoVoteErrorf("missing prior frame")
 	}
 
+	latestQC, qcErr := p.engine.clockStore.GetLatestQuorumCertificate(nil)
+	if qcErr != nil {
+		p.engine.logger.Debug(
+			"could not fetch latest quorum certificate",
+			zap.Error(qcErr),
+		)
+	}
+
 	if prior.Identity() != priorState {
 		frameProvingTotal.WithLabelValues("error").Inc()
+
+		if latestQC != nil && latestQC.Identity() == priorState {
+			switch {
+			case prior.Header.Rank < latestQC.GetRank():
+				return nil, models.NewNoVoteErrorf(
+					"needs sync: prior rank %d behind latest qc rank %d",
+					prior.Header.Rank,
+					latestQC.GetRank(),
+				)
+			case prior.Header.Rank == latestQC.GetRank() &&
+				latestQC.Identity() != prior.Identity():
+				peerID, peerErr := p.engine.getRandomProverPeerId()
+				if peerErr != nil {
+					p.engine.logger.Warn(
+						"could not determine peer for fork sync",
+						zap.Error(peerErr),
+					)
+				} else {
+					p.engine.logger.Warn(
+						"detected fork, scheduling sync",
+						zap.Uint64("frame_number", latestQC.GetFrameNumber()),
+						zap.String("peer_id", peerID.String()),
+					)
+					p.engine.syncProvider.AddState(
+						[]byte(peerID),
+						latestQC.GetFrameNumber(),
+						[]byte(latestQC.Identity()),
+					)
+				}
+
+				return nil, models.NewNoVoteErrorf(
+					"fork detected at rank %d (local: %x, qc: %x)",
+					latestQC.GetRank(),
+					prior.Identity(),
+					latestQC.Identity(),
+				)
+			}
+		}
+
 		return nil, models.NewNoVoteErrorf(
 			"building on fork or needs sync: frame %d, rank %d, parent_id: %x, asked: rank %d, id: %x",
 			prior.Header.FrameNumber,

@@ -83,7 +83,9 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		if e.currentRank > vote.Rank {
+		// We should still accept votes for the past rank – either because a peer
+		// needs it, or because we need it to trump a TC
+		if e.currentRank > vote.Rank+1 {
 			e.logger.Debug("vote is stale")
 			return tp2p.ValidationResultIgnore
 		}
@@ -110,7 +112,8 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		if e.currentRank > timeoutState.Vote.Rank {
+		// We should still accept votes for the past rank in case a peer needs it
+		if e.currentRank > timeoutState.Vote.Rank+1 {
 			e.logger.Debug("timeout is stale")
 			return tp2p.ValidationResultIgnore
 		}
