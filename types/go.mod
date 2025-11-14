@@ -1,8 +1,6 @@
 module source.quilibrium.com/quilibrium/monorepo/types
 
-go 1.23.2
-
-toolchain go1.23.4
+go 1.24.0
 
 replace source.quilibrium.com/quilibrium/monorepo/protobufs => ../protobufs
 
@@ -30,6 +28,7 @@ require (
 	go.uber.org/zap v1.27.0
 	source.quilibrium.com/quilibrium/monorepo/config v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub v0.0.0-00010101000000-000000000000
+	source.quilibrium.com/quilibrium/monorepo/lifecycle v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/protobufs v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/utils v0.0.0-00010101000000-000000000000
 )
@@ -48,8 +47,9 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rychipman/easylex v0.0.0-20160129204217-49ee7767142f // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/sync v0.15.0 // indirect
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	source.quilibrium.com/quilibrium/monorepo/consensus v0.0.0-00010101000000-000000000000 // indirect
@@ -75,8 +75,7 @@ require (
 	github.com/multiformats/go-varint v0.0.7 // indirect
 	github.com/pkg/errors v0.9.1
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
-	github.com/stretchr/testify v1.10.0
-	github.com/txaty/go-merkletree v0.2.2
+	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.39.0
 	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476 // indirect
 	golang.org/x/net v0.41.0 // indirect
