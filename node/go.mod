@@ -67,6 +67,7 @@ require (
 	source.quilibrium.com/quilibrium/monorepo/consensus v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/hypergraph v0.0.0-00010101000000-000000000000
+	source.quilibrium.com/quilibrium/monorepo/lifecycle v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/nekryptology v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/protobufs v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/rpm v0.0.0-00010101000000-000000000000
@@ -133,7 +134,6 @@ require (
 	golang.org/x/time v0.12.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	source.quilibrium.com/quilibrium/monorepo/ferret v0.0.0-00010101000000-000000000000 // indirect
-	source.quilibrium.com/quilibrium/monorepo/lifecycle v0.0.0-00010101000000-000000000000 // indirect
 )
 
 require (
