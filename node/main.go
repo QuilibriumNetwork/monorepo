@@ -693,11 +693,11 @@ func printPeerInfo(logger *zap.Logger, cfg *config.Config) {
 		}
 
 		if len(p.Version) >= 3 {
-			fmt.Println("  Version:", config.FormatVersion(p.Version))
-		}
-
-		if patch := formatPatchVersion(p.PatchVersion); patch != "" {
-			fmt.Println("  Patch Version:", patch)
+			if patch := formatPatchVersion(p.PatchVersion); patch != "" {
+				fmt.Println("  Version:", config.FormatVersion(p.Version)+"."+patch)
+			} else {
+				fmt.Println("  Version:", config.FormatVersion(p.Version))
+			}
 		}
 
 		if p.Timestamp != 0 {
