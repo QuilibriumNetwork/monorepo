@@ -778,20 +778,20 @@ func printReachability(reach []*protobufs.Reachability) {
 			fmt.Println("  Reachability:")
 			printed = true
 		}
-		fmt.Println("    -")
+		//fmt.Println("    -")
 		if filter != "" {
-			fmt.Println("      Filter:", filter)
+			fmt.Println("    - Filter:", filter)
 		}
 		if len(pubsub) > 0 {
-			fmt.Println("      Pubsub Multiaddrs:")
+			fmt.Println("    - Pubsub Multiaddrs:")
 			for _, addr := range pubsub {
-				fmt.Println("        " + addr)
+				fmt.Println("      - " + addr)
 			}
 		}
 		if len(stream) > 0 {
-			fmt.Println("      Stream Multiaddrs:")
+			fmt.Println("    - Stream Multiaddrs:")
 			for _, addr := range stream {
-				fmt.Println("        " + addr)
+				fmt.Println("      - " + addr)
 			}
 		}
 	}
