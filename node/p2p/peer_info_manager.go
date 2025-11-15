@@ -65,6 +65,8 @@ func (m *InMemoryPeerInfoManager) Start(
 				Reachability: reachability,
 				Cores:        uint32(len(reachability)),
 				LastSeen:     seen,
+				Version:      info.Version,
+				PatchNumber:  info.PatchVersion,
 			}
 			m.searchAndInsertPeer(&p2p.PeerInfo{
 				PeerId:       info.PeerId,
@@ -73,6 +75,8 @@ func (m *InMemoryPeerInfoManager) Start(
 				Reachability: reachability,
 				Cores:        uint32(len(reachability)),
 				LastSeen:     seen,
+				Version:      info.Version,
+				PatchNumber:  info.PatchVersion,
 			})
 			m.peerInfoMx.Unlock()
 		case <-ctx.Done():
