@@ -1312,6 +1312,15 @@ func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {
 		return
 	}
 
+	if err := e.clockStore.PutGlobalClockFrameCandidate(
+		proposal.State,
+		txn,
+	); err != nil {
+		e.logger.Error("could not put frame", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
 	if err := txn.Commit(); err != nil {
 		e.logger.Error("could not commit transaction", zap.Error(err))
 		txn.Abort()
