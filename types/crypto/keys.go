@@ -28,6 +28,12 @@ type BlsConstructor interface {
 		message []byte,
 		context []byte,
 	) bool
+	VerifyMultiMessageSignatureRaw(
+		publicKeysG2 [][]byte,
+		signatureG1 []byte,
+		messages [][]byte,
+		context []byte,
+	) bool
 	Aggregate(
 		publicKeys [][]byte,
 		signatures [][]byte,

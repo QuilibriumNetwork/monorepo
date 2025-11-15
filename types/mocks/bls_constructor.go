@@ -23,6 +23,17 @@ func (m *MockBlsConstructor) VerifySignatureRaw(
 	return args.Bool(0)
 }
 
+// VerifyMultiMessageSignatureRaw implements crypto.BlsConstructor.
+func (m *MockBlsConstructor) VerifyMultiMessageSignatureRaw(
+	publicKeysG2 [][]byte,
+	signatureG1 []byte,
+	messages [][]byte,
+	context []byte,
+) bool {
+	args := m.Called(publicKeysG2, signatureG1, messages, context)
+	return args.Bool(0)
+}
+
 func (m *MockBlsConstructor) New() (qcrypto.Signer, []byte, error) {
 	args := m.Called()
 	return args.Get(0).(qcrypto.Signer), args.Get(1).([]byte), args.Error(2)

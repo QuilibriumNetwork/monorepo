@@ -532,6 +532,13 @@ func clockGlobalFrameKey(frameNumber uint64) []byte {
 	return clockFrameKey([]byte{}, frameNumber, CLOCK_GLOBAL_FRAME)
 }
 
+func clockGlobalFrameCandidateKey(frameNumber uint64, selector []byte) []byte {
+	key := []byte{CLOCK_FRAME, CLOCK_GLOBAL_FRAME_CANDIDATE}
+	key = binary.BigEndian.AppendUint64(key, frameNumber)
+	key = append(key, selector...)
+	return key
+}
+
 func extractFrameNumberFromGlobalFrameKey(
 	key []byte,
 ) (uint64, error) {
@@ -726,6 +733,18 @@ func clockGlobalFrameRequestKey(
 	requestIndex uint16,
 ) []byte {
 	key := []byte{CLOCK_FRAME, CLOCK_GLOBAL_FRAME_REQUEST}
+	key = binary.BigEndian.AppendUint64(key, frameNumber)
+	key = binary.BigEndian.AppendUint16(key, requestIndex)
+	return key
+}
+
+func clockGlobalFrameRequestCandidateKey(
+	selector []byte,
+	frameNumber uint64,
+	requestIndex uint16,
+) []byte {
+	key := []byte{CLOCK_FRAME, CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE}
+	key = append(key, selector...)
 	key = binary.BigEndian.AppendUint64(key, frameNumber)
 	key = binary.BigEndian.AppendUint16(key, requestIndex)
 	return key
@@ -936,6 +955,116 @@ func (p *PebbleClockStore) PutGlobalClockFrame(
 	}
 
 	return nil
+}
+
+// PutGlobalClockFrameCandidate implements ClockStore.
+func (p *PebbleClockStore) PutGlobalClockFrameCandidate(
+	frame *protobufs.GlobalFrame,
+	txn store.Transaction,
+) error {
+	if frame.Header == nil {
+		return errors.Wrap(
+			errors.New("frame header is required"),
+			"put global clock frame candidate",
+		)
+	}
+
+	frameNumber := frame.Header.FrameNumber
+
+	// Serialize the full header using protobuf
+	headerData, err := proto.Marshal(frame.Header)
+	if err != nil {
+		return errors.Wrap(err, "put global clock frame candidate")
+	}
+
+	if err := txn.Set(
+		clockGlobalFrameCandidateKey(frameNumber, []byte(frame.Identity())),
+		headerData,
+	); err != nil {
+		return errors.Wrap(err, "put global clock frame candidate")
+	}
+
+	// Store requests separately with iterative keys
+	for i, request := range frame.Requests {
+		requestData, err := proto.Marshal(request)
+		if err != nil {
+			return errors.Wrap(err, "put global clock frame candidate request")
+		}
+
+		if err := txn.Set(
+			clockGlobalFrameRequestCandidateKey(
+				[]byte(frame.Identity()),
+				frameNumber,
+				uint16(i),
+			),
+			requestData,
+		); err != nil {
+			return errors.Wrap(err, "put global clock frame candidate request")
+		}
+	}
+
+	return nil
+}
+
+// GetGlobalClockFrameCandidate implements ClockStore.
+func (p *PebbleClockStore) GetGlobalClockFrameCandidate(
+	frameNumber uint64,
+	selector []byte,
+) (*protobufs.GlobalFrame, error) {
+	value, closer, err := p.db.Get(clockGlobalFrameCandidateKey(
+		frameNumber,
+		selector,
+	))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, store.ErrNotFound
+		}
+
+		return nil, errors.Wrap(err, "get global clock frame candidate")
+	}
+	defer closer.Close()
+
+	// Deserialize the GlobalFrameHeader
+	header := &protobufs.GlobalFrameHeader{}
+	if err := proto.Unmarshal(value, header); err != nil {
+		return nil, errors.Wrap(err, "get global clock frame candidate")
+	}
+
+	frame := &protobufs.GlobalFrame{
+		Header: header,
+	}
+
+	// Retrieve all requests for this frame
+	var requests []*protobufs.MessageBundle
+	requestIndex := uint16(0)
+	for {
+		requestKey := clockGlobalFrameRequestCandidateKey(
+			selector,
+			frameNumber,
+			requestIndex,
+		)
+		requestData, closer, err := p.db.Get(requestKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				// No more requests
+				break
+			}
+			return nil, errors.Wrap(err, "get global clock frame candidate")
+		}
+		defer closer.Close()
+
+		request := &protobufs.MessageBundle{}
+		if err := proto.Unmarshal(requestData, request); err != nil {
+			return nil, errors.Wrap(err, "get global clock frame candidate")
+		}
+
+		requests = append(requests, request)
+		requestIndex++
+	}
+
+	frame.Requests = requests
+
+	return frame, nil
 }
 
 // GetShardClockFrame implements ClockStore.

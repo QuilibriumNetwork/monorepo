@@ -154,7 +154,7 @@ func (p *PebbleDB) migrate(logger *zap.Logger) error {
 		return nil
 	}
 
-	batch := p.db.NewBatch()
+	batch := p.db.NewIndexedBatch()
 	for i := int(storedVersion); i < len(pebbleMigrations); i++ {
 		logger.Warn(
 			"performing pebble store migration",

@@ -521,6 +521,25 @@ func NewGlobalConsensusEngine(
 		if err != nil {
 			establishGenesis()
 		} else {
+			if latest.LatestTimeout != nil {
+				logger.Info(
+					"obtained latest consensus state",
+					zap.Uint64("finalized_rank", latest.FinalizedRank),
+					zap.Uint64("latest_acknowledged_rank", latest.LatestAcknowledgedRank),
+					zap.Uint64("latest_timeout_rank", latest.LatestTimeout.Rank),
+					zap.Uint64("latest_timeout_tick", latest.LatestTimeout.TimeoutTick),
+					zap.Uint64(
+						"latest_timeout_qc_rank",
+						latest.LatestTimeout.LatestQuorumCertificate.GetRank(),
+					),
+				)
+			} else {
+				logger.Info(
+					"obtained latest consensus state",
+					zap.Uint64("finalized_rank", latest.FinalizedRank),
+					zap.Uint64("latest_acknowledged_rank", latest.LatestAcknowledgedRank),
+				)
+			}
 			qc, err := engine.clockStore.GetQuorumCertificate(
 				nil,
 				latest.FinalizedRank,
@@ -2609,6 +2628,13 @@ func (e *GlobalConsensusEngine) OnOwnProposal(
 			return
 		}
 
+		err = e.clockStore.PutGlobalClockFrameCandidate(*proposal.State.State, txn)
+		if err != nil {
+			e.logger.Error("could not put frame candidate", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
 		if err := txn.Commit(); err != nil {
 			e.logger.Error("could not commit transaction", zap.Error(err))
 			txn.Abort()
@@ -2674,6 +2700,11 @@ func (e *GlobalConsensusEngine) OnOwnTimeout(
 		return
 	}
 
+	e.logger.Debug(
+		"aggregating own timeout",
+		zap.Uint64("timeout_rank", timeout.Rank),
+		zap.Uint64("vote_rank", (*timeout.Vote).Rank),
+	)
 	e.timeoutAggregator.AddTimeout(timeout)
 
 	if err := e.pubsub.PublishToBitmask(
@@ -2786,6 +2817,16 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 	e.frameStoreMu.RLock()
 	frame, ok := e.frameStore[qc.Identity()]
 	e.frameStoreMu.RUnlock()
+
+	if !ok {
+		frame, err = e.clockStore.GetGlobalClockFrameCandidate(
+			qc.GetFrameNumber(),
+			[]byte(qc.Identity()),
+		)
+		if err == nil {
+			ok = true
+		}
+	}
 
 	if !ok {
 		e.logger.Error(
@@ -3110,13 +3151,22 @@ func (e *GlobalConsensusEngine) VerifyTimeoutCertificate(
 
 	pubkeys := [][]byte{}
 	signatures := [][]byte{}
+	messages := [][]byte{}
 	if ((len(provers) + 7) / 8) > len(tc.AggregateSignature.Bitmask) {
 		return models.ErrInvalidSignature
 	}
+
+	idx := 0
 	for i, prover := range provers {
 		if tc.AggregateSignature.Bitmask[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
 			pubkeys = append(pubkeys, prover.PublicKey)
 			signatures = append(signatures, tc.AggregateSignature.GetSignature())
+			messages = append(messages, verification.MakeTimeoutMessage(
+				nil,
+				tc.Rank,
+				tc.LatestRanks[idx],
+			))
+			idx++
 		}
 	}
 
@@ -3132,14 +3182,10 @@ func (e *GlobalConsensusEngine) VerifyTimeoutCertificate(
 		return models.ErrInvalidSignature
 	}
 
-	if valid := e.blsConstructor.VerifySignatureRaw(
-		tc.AggregateSignature.GetPubKey(),
+	if valid := e.blsConstructor.VerifyMultiMessageSignatureRaw(
+		pubkeys,
 		tc.AggregateSignature.GetSignature(),
-		verification.MakeTimeoutMessage(
-			nil,
-			tc.Rank,
-			tc.LatestQuorumCertificate.Rank,
-		),
+		messages,
 		[]byte("globaltimeout"),
 	); !valid {
 		return models.ErrInvalidSignature

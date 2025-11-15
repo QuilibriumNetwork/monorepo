@@ -2,6 +2,8 @@ package global
 
 import (
 	"context"
+	"slices"
+	"sort"
 	"time"
 
 	"github.com/pkg/errors"
@@ -59,12 +61,33 @@ func (p *GlobalVotingProvider) FinalizeTimeout(
 	ctx context.Context,
 	rank uint64,
 	latestQuorumCertificate models.QuorumCertificate,
-	latestQuorumCertificateRanks []uint64,
+	latestQuorumCertificateRanks []consensus.TimeoutSignerInfo,
 	aggregatedSignature models.AggregatedSignature,
 ) (models.TimeoutCertificate, error) {
+	ranksInProverOrder := slices.Clone(latestQuorumCertificateRanks)
+	provers, err := p.engine.proverRegistry.GetActiveProvers(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	proverIndexes := map[models.Identity]int{}
+	for i, p := range provers {
+		proverIndexes[models.Identity(p.Address)] = i
+	}
+
+	sort.Slice(ranksInProverOrder, func(i, j int) bool {
+		return proverIndexes[ranksInProverOrder[i].Signer]-
+			proverIndexes[ranksInProverOrder[j].Signer] < 0
+	})
+
+	ranks := []uint64{}
+	for _, r := range ranksInProverOrder {
+		ranks = append(ranks, r.NewestQCRank)
+	}
+
 	return &protobufs.TimeoutCertificate{
 		Rank:                    rank,
-		LatestRanks:             latestQuorumCertificateRanks,
+		LatestRanks:             ranks,
 		LatestQuorumCertificate: latestQuorumCertificate.(*protobufs.QuorumCertificate),
 		Timestamp:               uint64(time.Now().UnixMilli()),
 		AggregateSignature: &protobufs.BLS48581AggregateSignature{

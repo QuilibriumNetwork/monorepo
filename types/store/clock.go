@@ -17,6 +17,14 @@ type ClockStore interface {
 		endFrameNumber uint64,
 	) (TypedIterator[*protobufs.GlobalFrame], error)
 	PutGlobalClockFrame(frame *protobufs.GlobalFrame, txn Transaction) error
+	PutGlobalClockFrameCandidate(
+		frame *protobufs.GlobalFrame,
+		txn Transaction,
+	) error
+	GetGlobalClockFrameCandidate(
+		frameNumber uint64,
+		selector []byte,
+	) (*protobufs.GlobalFrame, error)
 	GetLatestCertifiedGlobalState() (*protobufs.GlobalProposal, error)
 	GetEarliestCertifiedGlobalState() (*protobufs.GlobalProposal, error)
 	GetCertifiedGlobalState(rank uint64) (*protobufs.GlobalProposal, error)
