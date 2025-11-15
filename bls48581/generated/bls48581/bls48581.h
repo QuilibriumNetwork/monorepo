@@ -399,6 +399,11 @@ RustBuffer uniffi_bls48581_fn_func_bls_sign(RustBuffer sk, RustBuffer msg, RustB
 int8_t uniffi_bls48581_fn_func_bls_verify(RustBuffer pk, RustBuffer sig, RustBuffer msg, RustBuffer domain, RustCallStatus *out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BLS48581_FN_FUNC_BLS_VERIFY_MSIG_MMSG
+#define UNIFFI_FFIDEF_UNIFFI_BLS48581_FN_FUNC_BLS_VERIFY_MSIG_MMSG
+int8_t uniffi_bls48581_fn_func_bls_verify_msig_mmsg(RustBuffer pks, RustBuffer sig, RustBuffer msgs, RustBuffer domain, RustCallStatus *out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_BLS48581_FN_FUNC_COMMIT_RAW
 #define UNIFFI_FFIDEF_UNIFFI_BLS48581_FN_FUNC_COMMIT_RAW
 RustBuffer uniffi_bls48581_fn_func_commit_raw(RustBuffer data, uint64_t poly_size, RustCallStatus *out_status
@@ -731,6 +736,12 @@ uint16_t uniffi_bls48581_checksum_func_bls_sign(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_BLS48581_CHECKSUM_FUNC_BLS_VERIFY
 #define UNIFFI_FFIDEF_UNIFFI_BLS48581_CHECKSUM_FUNC_BLS_VERIFY
 uint16_t uniffi_bls48581_checksum_func_bls_verify(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_BLS48581_CHECKSUM_FUNC_BLS_VERIFY_MSIG_MMSG
+#define UNIFFI_FFIDEF_UNIFFI_BLS48581_CHECKSUM_FUNC_BLS_VERIFY_MSIG_MMSG
+uint16_t uniffi_bls48581_checksum_func_bls_verify_msig_mmsg(void
     
 );
 #endif

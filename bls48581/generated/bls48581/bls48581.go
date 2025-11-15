@@ -382,6 +382,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_bls48581_checksum_func_bls_verify_msig_mmsg()
+		})
+		if checksum != 55801 {
+			// If this happens try cleaning and rebuilding your project
+			panic("bls48581: uniffi_bls48581_checksum_func_bls_verify_msig_mmsg: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_bls48581_checksum_func_commit_raw()
 		})
 		if checksum != 14479 {
@@ -845,6 +854,12 @@ func BlsSign(sk []uint8, msg []uint8, domain []uint8) []uint8 {
 func BlsVerify(pk []uint8, sig []uint8, msg []uint8, domain []uint8) bool {
 	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
 		return C.uniffi_bls48581_fn_func_bls_verify(FfiConverterSequenceUint8INSTANCE.Lower(pk), FfiConverterSequenceUint8INSTANCE.Lower(sig), FfiConverterSequenceUint8INSTANCE.Lower(msg), FfiConverterSequenceUint8INSTANCE.Lower(domain), _uniffiStatus)
+	}))
+}
+
+func BlsVerifyMsigMmsg(pks [][]uint8, sig []uint8, msgs [][]uint8, domain []uint8) bool {
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_bls48581_fn_func_bls_verify_msig_mmsg(FfiConverterSequenceSequenceUint8INSTANCE.Lower(pks), FfiConverterSequenceUint8INSTANCE.Lower(sig), FfiConverterSequenceSequenceUint8INSTANCE.Lower(msgs), FfiConverterSequenceUint8INSTANCE.Lower(domain), _uniffiStatus)
 	}))
 }
 

@@ -372,6 +372,30 @@ func (b *Bls48581KeyConstructor) VerifySignatureRaw(
 	return generated.BlsVerify(publicKeyG2, signatureG1, message, context)
 }
 
+func (b *Bls48581KeyConstructor) VerifyMultiMessageSignatureRaw(
+	publicKeysG2 [][]byte,
+	signatureG1 []byte,
+	messages [][]byte,
+	context []byte,
+) bool {
+	if len(publicKeysG2) != len(messages) || len(publicKeysG2) == 0 {
+		return false
+	}
+
+	for _, pk := range publicKeysG2 {
+		if len(pk) != 585 {
+			return false
+		}
+	}
+
+	return generated.BlsVerifyMsigMmsg(
+		publicKeysG2,
+		signatureG1,
+		messages,
+		context,
+	)
+}
+
 type Bls48581Key struct {
 	privateKey []byte
 	publicKey  []byte
