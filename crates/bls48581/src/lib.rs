@@ -551,6 +551,18 @@ pub fn bls_verify(pk: &[u8], sig: &[u8], msg: &[u8], domain: &[u8]) -> bool {
   is_sig_ok == bls48581::bls256::BLS_OK
 }
 
+pub fn bls_verify_msig_mmsg(pks: &Vec<Vec<u8>>, sig: &[u8], msgs: &Vec<Vec<u8>>, domain: &[u8]) -> bool {
+  let mut fullmsgs = Vec::<Vec::<u8>>::new();
+  for msg in msgs {
+    let mut fullmsg = domain.to_vec();
+    fullmsg.extend_from_slice(&msg);
+    fullmsgs.push(fullmsg);
+  }
+
+  let is_sig_ok = bls48581::bls256::core_msig_verify(&sig, &fullmsgs, &pks);
+  is_sig_ok == bls48581::bls256::BLS_OK
+}
+
 pub fn bls_aggregate(pks: &Vec<Vec<u8>>, sigs: &Vec<Vec<u8>>) -> BlsAggregateOutput {
   if pks.len() != sigs.len() {
     return BlsAggregateOutput{
@@ -910,6 +922,28 @@ mod tests {
           &sigs,
         );
         assert!(bls_verify(&blsAggregateOutput.aggregate_public_key, &blsAggregateOutput.aggregate_signature, b"test msg", b"test domain"));
+    }
+
+    #[test]
+    fn bls_multi_message_sign() {
+        init();
+        let outs: Vec<BlsKeygenOutput> = (0..20).into_iter().map(|_| bls_keygen()).collect();
+        let mut pks = Vec::<Vec::<u8>>::new();
+        let mut messages = Vec::<Vec::<u8>>::new();
+        let mut sigs = Vec::<Vec::<u8>>::new();
+        for (i, out) in outs.clone().iter().enumerate() {
+          assert!(bls_verify(&out.public_key.clone(), &out.proof_of_possession_sig, &out.public_key, b"BLS48_POP_SK"));
+          let msg = format!("test msg {i}");
+          let sig = bls_sign(&out.secret_key, msg.as_bytes(), b"test domain");
+          pks.push(out.public_key.clone());
+          messages.push(msg.as_bytes().to_vec());
+          sigs.push(sig);
+        }
+        let blsAggregateOutput = bls_aggregate(
+          &outs.iter().map(|out| out.public_key.clone()).collect::<Vec<Vec<u8>>>(),
+          &sigs,
+        );
+        assert!(bls_verify_msig_mmsg(&pks, &blsAggregateOutput.aggregate_signature, &messages, b"test domain"));
     }
 
     #[test]

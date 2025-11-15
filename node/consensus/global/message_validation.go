@@ -50,7 +50,11 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 		}
 
 		if e.currentRank > proposal.GetRank() {
-			e.logger.Debug("proposal is stale")
+			e.logger.Debug(
+				"proposal is stale",
+				zap.Uint64("current_rank", e.currentRank),
+				zap.Uint64("timeout_rank", proposal.GetRank()),
+			)
 			proposalValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultIgnore
 		}
@@ -86,7 +90,11 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 		// We should still accept votes for the past rank – either because a peer
 		// needs it, or because we need it to trump a TC
 		if e.currentRank > vote.Rank+1 {
-			e.logger.Debug("vote is stale")
+			e.logger.Debug(
+				"vote is stale",
+				zap.Uint64("current_rank", e.currentRank),
+				zap.Uint64("timeout_rank", vote.Rank),
+			)
 			return tp2p.ValidationResultIgnore
 		}
 
@@ -112,17 +120,21 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		// We should still accept votes for the past rank in case a peer needs it
-		if e.currentRank > timeoutState.Vote.Rank+1 {
-			e.logger.Debug("timeout is stale")
-			return tp2p.ValidationResultIgnore
-		}
-
 		// Validate the timeoutState
 		if err := timeoutState.Validate(); err != nil {
 			e.logger.Debug("invalid timeoutState", zap.Error(err))
 			timeoutStateValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
+		}
+
+		// We should still accept votes for the past rank in case a peer needs it
+		if e.currentRank > timeoutState.Vote.Rank+1 {
+			e.logger.Debug(
+				"timeout is stale",
+				zap.Uint64("current_rank", e.currentRank),
+				zap.Uint64("timeout_rank", timeoutState.Vote.Rank),
+			)
+			return tp2p.ValidationResultIgnore
 		}
 
 		timeoutStateValidationTotal.WithLabelValues("accept").Inc()

@@ -2402,14 +2402,23 @@ func (e *AppConsensusEngine) VerifyTimeoutCertificate(
 	}
 
 	pubkeys := [][]byte{}
+	messages := [][]byte{}
 	signatures := [][]byte{}
 	if ((len(provers) + 7) / 8) > len(tc.AggregateSignature.Bitmask) {
 		return models.ErrInvalidSignature
 	}
+
+	idx := 0
 	for i, prover := range provers {
 		if tc.AggregateSignature.Bitmask[i/8]&(1<<(i%8)) == (1 << (i % 8)) {
 			pubkeys = append(pubkeys, prover.PublicKey)
 			signatures = append(signatures, tc.AggregateSignature.GetSignature())
+			messages = append(messages, verification.MakeTimeoutMessage(
+				nil,
+				tc.Rank,
+				tc.LatestRanks[idx],
+			))
+			idx++
 		}
 	}
 
@@ -2425,14 +2434,10 @@ func (e *AppConsensusEngine) VerifyTimeoutCertificate(
 		return models.ErrInvalidSignature
 	}
 
-	if valid := e.blsConstructor.VerifySignatureRaw(
-		tc.AggregateSignature.GetPubKey(),
+	if valid := e.blsConstructor.VerifyMultiMessageSignatureRaw(
+		pubkeys,
 		tc.AggregateSignature.GetSignature(),
-		verification.MakeTimeoutMessage(
-			nil,
-			tc.Rank,
-			tc.LatestQuorumCertificate.Rank,
-		),
+		messages,
 		slices.Concat([]byte("appshardtimeout"), e.appAddress),
 	); !valid {
 		return models.ErrInvalidSignature

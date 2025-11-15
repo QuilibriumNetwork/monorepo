@@ -97,6 +97,12 @@ func (c *TimeoutCollector[VoteT]) processTimeout(
 	err := c.processor.Process(timeout)
 	if err != nil {
 		if invalidTimeoutErr, ok := models.AsInvalidTimeoutError[VoteT](err); ok {
+			c.tracer.Error(
+				"invalid timeout detected",
+				err,
+				consensus.Uint64Param("timeout_rank", timeout.Rank),
+				consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
+			)
 			c.notifier.OnInvalidTimeoutDetected(*invalidTimeoutErr)
 			return nil
 		}

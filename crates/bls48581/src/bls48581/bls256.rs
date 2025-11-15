@@ -168,3 +168,47 @@ pub fn core_verify(sig: &[u8], m: &[u8], w: &[u8]) -> isize {
     }
     BLS_FAIL
 }
+
+pub fn core_msig_verify(sig: &[u8], ms: &Vec<Vec<u8>>, ws: &Vec<Vec<u8>>) -> isize {
+    let mut d = ECP::frombytes(&sig);
+    if !pair8::g1member(&d) {
+        return BLS_FAIL;
+    }
+    d.neg();
+
+    let mut pks = Vec::<ECP8>::new();
+    for kw in ws {
+      let pk = ECP8::frombytes(&kw);
+      if !pair8::g2member(&pk) {
+          return BLS_FAIL;
+      }
+      pks.push(pk);
+    }
+
+    let mut hms = Vec::<ECP>::new();
+    for m in ms {
+      let hm = bls_hash_to_point(m);
+      hms.push(hm);
+    }
+
+    // Use new multi-pairing mechanism
+    let mut r = pair8::initmp();
+    //    pair8::another(&mut r,&g,&d);
+    unsafe {
+        pair8::another_pc(&mut r, &G2_TAB, &d);
+    }
+    for (pk, hm) in pks.iter().zip(hms) {
+      pair8::another(&mut r, &pk, &hm);
+    }
+    let mut v = pair8::miller(&mut r);
+
+    //.. or alternatively
+    //    let g = ECP8::generator();
+    //    let mut v = pair8::ate2(&g, &d, &pk, &hm);
+
+    v = pair8::fexp(&v);
+    if v.isunity() {
+        return BLS_OK;
+    }
+    BLS_FAIL
+}

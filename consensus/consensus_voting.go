@@ -32,12 +32,13 @@ type VotingProvider[
 		state *models.State[StateT],
 		aggregatedSignature models.AggregatedSignature,
 	) (models.QuorumCertificate, error)
-	// Produces a timeout certificate
+	// Produces a timeout certificate. Assumes VotingProvider will reorganize
+	// latestQuorumCertificateRanks in signer order.
 	FinalizeTimeout(
 		ctx context.Context,
 		rank uint64,
 		latestQuorumCertificate models.QuorumCertificate,
-		latestQuorumCertificateRanks []uint64,
+		latestQuorumCertificateRanks []TimeoutSignerInfo,
 		aggregatedSignature models.AggregatedSignature,
 	) (models.TimeoutCertificate, error)
 }

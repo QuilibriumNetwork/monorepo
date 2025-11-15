@@ -16,6 +16,32 @@ type MockClockStore struct {
 	mock.Mock
 }
 
+// GetGlobalClockFrameCandidate implements store.ClockStore.
+func (m *MockClockStore) GetGlobalClockFrameCandidate(
+	frameNumber uint64,
+	selector []byte,
+) (*protobufs.GlobalFrame, error) {
+	args := m.Called(
+		frameNumber,
+		selector,
+	)
+
+	return args.Get(0).(*protobufs.GlobalFrame), args.Error(1)
+}
+
+// PutGlobalClockFrameCandidate implements store.ClockStore.
+func (m *MockClockStore) PutGlobalClockFrameCandidate(
+	frame *protobufs.GlobalFrame,
+	txn store.Transaction,
+) error {
+	args := m.Called(
+		frame,
+		txn,
+	)
+
+	return args.Error(0)
+}
+
 // GetProposalVote implements store.ClockStore.
 func (m *MockClockStore) GetProposalVote(
 	filter []byte,

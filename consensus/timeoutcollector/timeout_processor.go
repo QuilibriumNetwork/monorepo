@@ -128,6 +128,12 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) Process(
 	timeout *models.TimeoutState[VoteT],
 ) error {
 	if p.rank != timeout.Rank {
+		p.tracer.Trace(
+			"received incompatible timeout",
+			consensus.Uint64Param("processor_rank", p.rank),
+			consensus.Uint64Param("timeout_rank", timeout.Rank),
+			consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
+		)
 		return fmt.Errorf(
 			"received incompatible timeout, expected %d got %d: %w",
 			p.rank,
@@ -137,16 +143,42 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) Process(
 	}
 
 	if p.tcTracker.Done() {
+		p.tracer.Trace(
+			"timeout tracker done",
+			consensus.Uint64Param("processor_rank", p.rank),
+			consensus.Uint64Param("timeout_rank", timeout.Rank),
+			consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
+		)
 		return nil
 	}
 
 	err := p.validateTimeout(timeout)
 	if err != nil {
+		p.tracer.Error(
+			"timeout validation failed",
+			err,
+			consensus.Uint64Param("processor_rank", p.rank),
+			consensus.Uint64Param("timeout_rank", timeout.Rank),
+			consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
+		)
 		return fmt.Errorf("validating timeout failed: %w", err)
 	}
 	if p.tcTracker.Done() {
+		p.tracer.Trace(
+			"timeout tracker done",
+			consensus.Uint64Param("processor_rank", p.rank),
+			consensus.Uint64Param("timeout_rank", timeout.Rank),
+			consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
+		)
 		return nil
 	}
+
+	p.tracer.Trace(
+		"adding timeout to signature aggregator",
+		consensus.Uint64Param("processor_rank", p.rank),
+		consensus.Uint64Param("timeout_rank", timeout.Rank),
+		consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
+	)
 
 	// CAUTION: for correctness it is critical that we update the
 	// `newestQCTracker` first, _before_ we add the TO's signature to
@@ -166,6 +198,13 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) Process(
 		timeout.LatestQuorumCertificate.GetRank(),
 	)
 	if err != nil {
+		p.tracer.Error(
+			"timeout signature could not be added",
+			err,
+			consensus.Uint64Param("processor_rank", p.rank),
+			consensus.Uint64Param("timeout_rank", timeout.Rank),
+			consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
+		)
 		if models.IsInvalidSignerError(err) {
 			return models.NewInvalidTimeoutErrorf(
 				timeout,
@@ -361,11 +400,6 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) buildTC() (
 		)
 	}
 
-	newestQCRanks := make([]uint64, 0, len(signersData))
-	for _, data := range signersData {
-		newestQCRanks = append(newestQCRanks, data.NewestQCRank)
-	}
-
 	// Note that `newestQC` can have a larger rank than any of the ranks included
 	// in `newestQCRanks`. This is because for a TO currently being processes
 	// following two operations are executed in separate steps:
@@ -378,7 +412,7 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) buildTC() (
 		context.TODO(),
 		p.rank,
 		*newestQC,
-		newestQCRanks,
+		signersData,
 		aggregatedSig,
 	)
 	if err != nil {
