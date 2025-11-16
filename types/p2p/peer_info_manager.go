@@ -31,4 +31,6 @@ type PeerInfo struct {
 	Reachability []Reachability
 	Bandwidth    uint64
 	LastSeen     int64
+	Version      []byte
+	PatchNumber  []byte
 }

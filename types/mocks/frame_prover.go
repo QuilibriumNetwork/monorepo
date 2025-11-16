@@ -52,8 +52,9 @@ func (m *MockFrameProver) GetFrameSignaturePayload(
 func (m *MockFrameProver) VerifyFrameHeaderSignature(
 	frame *protobufs.FrameHeader,
 	bls crypto.BlsConstructor,
+	ba [][]byte,
 ) (bool, error) {
-	args := m.Called(frame, bls)
+	args := m.Called(frame, bls, ba)
 	return args.Bool(0), args.Error(1)
 }
 
@@ -106,8 +107,9 @@ func (m *MockFrameProver) ProveFrameHeader(
 func (m *MockFrameProver) VerifyFrameHeader(
 	frame *protobufs.FrameHeader,
 	bls crypto.BlsConstructor,
+	ba [][]byte,
 ) ([]uint8, error) {
-	args := m.Called(frame, bls)
+	args := m.Called(frame, bls, ba)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
