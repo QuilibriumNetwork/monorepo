@@ -547,6 +547,13 @@ func NewPubSubProxyClient(
 		bitmaskValidators: make(map[string]string),
 	}
 
+	// HACK: Kludgy, but the master process spawns the workers almost certainly
+	// in proxy mode (because manually clustering shouldn't use the proxy feature)
+	// so we should give it time to start listening before proceeding. Adding
+	// this buffer gives us a far better chance of not erroring out on the first
+	// attempt.
+	time.Sleep(10 * time.Second)
+
 	// Initialize validator stream
 	if err := client.initValidatorStream(); err != nil {
 		logger.Error("failed to initialize validator stream", zap.Error(err))
@@ -556,20 +563,35 @@ func NewPubSubProxyClient(
 }
 
 func (c *PubSubProxyClient) initValidatorStream() error {
-	c.validatorStreamMu.Lock()
-	defer c.validatorStreamMu.Unlock()
+	backoff := time.Second
 
-	stream, err := c.client.ValidatorStream(context.Background())
-	if err != nil {
-		return err
+	for {
+		stream, err := c.client.ValidatorStream(context.Background())
+		if err != nil {
+			c.logger.Error(
+				"validator stream connect failed, retrying",
+				zap.Error(err),
+				zap.Duration("retry_in", backoff),
+			)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+			}
+			continue
+		}
+
+		c.validatorStreamMu.Lock()
+		c.validatorStream = stream
+		c.validatorStreamMu.Unlock()
+
+		// Start goroutine to handle incoming validation requests
+		go c.handleValidationRequests()
+
+		return nil
 	}
-
-	c.validatorStream = stream
-
-	// Start goroutine to handle incoming validation requests
-	go c.handleValidationRequests()
-
-	return nil
 }
 
 func (c *PubSubProxyClient) handleValidationRequests() {
@@ -577,6 +599,9 @@ func (c *PubSubProxyClient) handleValidationRequests() {
 		msg, err := c.validatorStream.Recv()
 		if err != nil {
 			c.logger.Error("validator stream recv error", zap.Error(err))
+			c.validatorStreamMu.Lock()
+			c.validatorStream = nil
+			c.validatorStreamMu.Unlock()
 			// Try to reconnect
 			time.Sleep(1 * time.Second)
 			if err := c.initValidatorStream(); err != nil {
@@ -791,9 +816,8 @@ func (c *PubSubProxyClient) RegisterValidator(
 	}
 
 	c.validatorStreamMu.Lock()
-	defer c.validatorStreamMu.Unlock()
-
 	if c.validatorStream == nil {
+		c.validatorStreamMu.Unlock()
 		// Try to initialize stream if not already done
 		if err := c.initValidatorStream(); err != nil {
 			c.mu.Lock()
@@ -802,7 +826,9 @@ func (c *PubSubProxyClient) RegisterValidator(
 			c.mu.Unlock()
 			return err
 		}
+		c.validatorStreamMu.Lock()
 	}
+	defer c.validatorStreamMu.Unlock()
 
 	if err := c.validatorStream.Send(req); err != nil {
 		c.mu.Lock()

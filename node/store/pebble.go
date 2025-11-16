@@ -24,6 +24,8 @@ type PebbleDB struct {
 var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_4,
 	migration_2_1_0_5,
+	migration_2_1_0_8,
+	migration_2_1_0_81,
 }
 
 func NewPebbleDB(
@@ -442,4 +444,16 @@ func migration_2_1_0_4(b *pebble.Batch) error {
 func migration_2_1_0_5(b *pebble.Batch) error {
 	// We just re-run it again
 	return migration_2_1_0_4(b)
+}
+
+func migration_2_1_0_8(b *pebble.Batch) error {
+	// these migration entries exist solely to advance migration number so all
+	// nodes are consistent
+	return nil
+}
+
+func migration_2_1_0_81(b *pebble.Batch) error {
+	// these migration entries exist solely to advance migration number so all
+	// nodes are consistent
+	return nil
 }

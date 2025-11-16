@@ -16,6 +16,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 func (e *AppConsensusEngine) processConsensusMessageQueue(
@@ -242,7 +243,7 @@ func (e *AppConsensusEngine) handleAppShardProposal(
 				}
 			}
 
-			head, err := e.appTimeReel.GetHead()
+			head, _, err := e.clockStore.GetLatestShardClockFrame(e.appAddress)
 			if err != nil || head == nil || head.Header == nil {
 				e.logger.Debug("could not get shard time reel head", zap.Error(err))
 				return
@@ -256,7 +257,7 @@ func (e *AppConsensusEngine) handleAppShardProposal(
 			return
 		}
 	}
-	expectedFrame, err := e.appTimeReel.GetHead()
+	expectedFrame, _, err := e.clockStore.GetLatestShardClockFrame(e.appAddress)
 	if err != nil {
 		e.logger.Error("could not obtain app time reel head", zap.Error(err))
 		return
@@ -489,7 +490,7 @@ func (e *AppConsensusEngine) trySealParentWithChild(
 		return
 	}
 
-	head, err := e.appTimeReel.GetHead()
+	head, _, err := e.clockStore.GetLatestShardClockFrame(e.appAddress)
 	if err != nil {
 		e.logger.Error("error fetching app time reel head", zap.Error(err))
 		return
@@ -563,28 +564,7 @@ func (e *AppConsensusEngine) addCertifiedState(
 		return
 	}
 
-	child.State.Header.PublicKeySignatureBls48581 = aggregateSig
-
-	if err := e.appTimeReel.Insert(child.State); err != nil {
-		e.logger.Error("could not insert frame into app time reel", zap.Error(err))
-		return
-	}
-
-	head, err := e.appTimeReel.GetHead()
-	if err != nil {
-		e.logger.Error("could not get app time reel head", zap.Error(err))
-		return
-	}
-
-	if head == nil || head.Header == nil ||
-		!bytes.Equal(child.State.Header.Output, head.Header.Output) {
-		e.logger.Error(
-			"app frames not aligned",
-			zap.String("address", e.appAddressHex),
-			zap.Uint64("new_frame_number", child.State.Header.FrameNumber),
-		)
-		return
-	}
+	parent.State.Header.PublicKeySignatureBls48581 = aggregateSig
 
 	txn, err = e.clockStore.NewTransaction(false)
 	if err != nil {
@@ -592,8 +572,29 @@ func (e *AppConsensusEngine) addCertifiedState(
 		return
 	}
 
+	if err := e.materialize(
+		txn,
+		parent.State,
+	); err != nil {
+		_ = txn.Abort()
+		e.logger.Error("could not materialize frame requests", zap.Error(err))
+		return
+	}
+	if err := e.clockStore.CommitShardClockFrame(
+		e.appAddress,
+		parent.State.GetFrameNumber(),
+		[]byte(parent.State.Identity()),
+		[]*tries.RollingFrecencyCritbitTrie{},
+		txn,
+		false,
+	); err != nil {
+		_ = txn.Abort()
+		e.logger.Error("could not put global frame", zap.Error(err))
+		return
+	}
+
 	if err := e.clockStore.PutCertifiedAppShardState(
-		child,
+		parent,
 		txn,
 	); err != nil {
 		e.logger.Error("could not insert certified state", zap.Error(err))
@@ -947,6 +948,16 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 		return
 	}
 
+	if err := e.clockStore.StageShardClockFrame(
+		[]byte(proposal.State.Identity()),
+		proposal.State,
+		txn,
+	); err != nil {
+		e.logger.Error("could not stage clock frame", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
 	if err := txn.Commit(); err != nil {
 		e.logger.Error("could not commit transaction", zap.Error(err))
 		txn.Abort()
@@ -956,6 +967,10 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 	e.appShardProposalQueue <- proposal
 
 	proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
+}
+
+func (e *AppConsensusEngine) AddProposal(proposal *protobufs.AppShardProposal) {
+	e.appShardProposalQueue <- proposal
 }
 
 func (e *AppConsensusEngine) handleVote(message *pb.Message) {

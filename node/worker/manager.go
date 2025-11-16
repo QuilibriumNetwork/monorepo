@@ -477,7 +477,34 @@ func (w *WorkerManager) GetFilterByWorkerId(coreId uint) ([]byte, error) {
 }
 
 func (w *WorkerManager) RangeWorkers() ([]*typesStore.WorkerInfo, error) {
-	return w.store.RangeWorkers()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	workers, err := w.store.RangeWorkers()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(workers) != int(w.config.Engine.DataWorkerCount) {
+		for i := uint(1); i <= uint(w.config.Engine.DataWorkerCount); i++ {
+			if _, ok := w.serviceClients[i]; ok {
+				continue
+			}
+			if _, err := w.getIPCOfWorker(i); err != nil {
+				w.logger.Error(
+					"could not initialize worker for range",
+					zap.Uint("core_id", i),
+					zap.Error(err),
+				)
+			}
+		}
+		workers, err = w.store.RangeWorkers()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return workers, nil
 }
 
 // ProposeAllocations invokes a proposal function set by the parent of the

@@ -16,6 +16,7 @@ type AppLivenessProvider struct {
 
 func (p *AppLivenessProvider) Collect(
 	ctx context.Context,
+	frameNumber uint64,
 ) (CollectedCommitments, error) {
 	if p.engine.GetFrame() == nil {
 		return CollectedCommitments{}, errors.Wrap(
@@ -47,8 +48,6 @@ func (p *AppLivenessProvider) Collect(
 	pendingMessages := p.engine.pendingMessages
 	p.engine.pendingMessages = []*protobufs.Message{}
 	p.engine.pendingMessagesMu.Unlock()
-
-	frameNumber := uint64(p.engine.GetFrame().Header.FrameNumber) + 1
 
 	txMap := map[string][][]byte{}
 	for i, message := range slices.Concat(mixnetMessages, pendingMessages) {

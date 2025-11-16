@@ -41,7 +41,6 @@ func (m *InMemoryPeerInfoManager) Start(
 	for {
 		select {
 		case info := <-m.peerInfoCh:
-			m.peerInfoMx.Lock()
 			reachability := []p2p.Reachability{}
 			for _, r := range info.Reachability {
 				reachability = append(reachability, p2p.Reachability{
@@ -58,6 +57,7 @@ func (m *InMemoryPeerInfoManager) Start(
 				})
 			}
 			seen := time.Now().UnixMilli()
+			m.peerInfoMx.Lock()
 			m.peerMap[string(info.PeerId)] = &p2p.PeerInfo{
 				PeerId:       info.PeerId,
 				Bandwidth:    100,
