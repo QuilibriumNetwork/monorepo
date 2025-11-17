@@ -572,7 +572,7 @@ func TestTLSXSignConnection(t *testing.T) {
 
 	defer conn.Close()
 	// Create the proxy client
-	client := rpc.NewPubSubProxyClient(conn, zap.NewNop())
+	client := rpc.NewPubSubProxyClient(context.TODO(), conn, zap.NewNop())
 
 	// Test that we can actually use the TLS connection
 	testBitmask := []byte("tls-test")
