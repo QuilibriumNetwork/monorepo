@@ -30,7 +30,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	application "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
-	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	crypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 	"source.quilibrium.com/quilibrium/monorepo/verenc"
 )
@@ -583,7 +582,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 			case *protobufs.TreePathSegment_Leaf:
 				err := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().InsertLeafSkeleton(
 					nil,
-					&tries.LazyVectorCommitmentLeafNode{
+					&crypto.LazyVectorCommitmentLeafNode{
 						Key:        seg.Leaf.Key,
 						Value:      seg.Leaf.Value,
 						HashTarget: seg.Leaf.HashTarget,
@@ -603,7 +602,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 				if !slices.Equal(toIntSlice(seg.Branch.FullPrefix), toIntSlice(toUint32Slice(branchfork))) {
 					err := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().InsertBranchSkeleton(
 						nil,
-						&tries.LazyVectorCommitmentBranchNode{
+						&crypto.LazyVectorCommitmentBranchNode{
 							Prefix:        toIntSlice(seg.Branch.Prefix),
 							Commitment:    seg.Branch.Commitment,
 							Size:          new(big.Int).SetBytes(seg.Branch.Size),
@@ -638,7 +637,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 
 	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.GetSize().Int64(), crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.GetSize().Int64())
-	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*tries.LazyVectorCommitmentBranchNode).LeafCount, crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*tries.LazyVectorCommitmentBranchNode).LeafCount)
+	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*crypto.LazyVectorCommitmentBranchNode).LeafCount, crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*crypto.LazyVectorCommitmentBranchNode).LeafCount)
 	require.NoError(t, crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().PruneUncoveredBranches())
 
 	now = time.Now()
@@ -670,7 +669,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 					seg.Branch.Commitment = nil
 					branchSize := new(big.Int).SetBytes(seg.Branch.Size)
 					if sum == 0xffffffffffffffff {
-						sum = seg.Branch.LeafCount - uint64(ourNode.(*tries.LazyVectorCommitmentBranchNode).LeafCount)
+						sum = seg.Branch.LeafCount - uint64(ourNode.(*crypto.LazyVectorCommitmentBranchNode).LeafCount)
 						size.Add(size, branchSize)
 						size.Sub(size, ourNode.GetSize())
 						longest = seg.Branch.LongestBranch
@@ -690,7 +689,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 			case *protobufs.TreePathSegment_Leaf:
 				err := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().InsertLeafSkeleton(
 					nil,
-					&tries.LazyVectorCommitmentLeafNode{
+					&crypto.LazyVectorCommitmentLeafNode{
 						Key:        seg.Leaf.Key,
 						Value:      seg.Leaf.Value,
 						HashTarget: seg.Leaf.HashTarget,
@@ -711,7 +710,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 
 					err := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().InsertBranchSkeleton(
 						nil,
-						&tries.LazyVectorCommitmentBranchNode{
+						&crypto.LazyVectorCommitmentBranchNode{
 							Prefix:        toIntSlice(seg.Branch.Prefix),
 							Commitment:    seg.Branch.Commitment,
 							Size:          new(big.Int).SetBytes(seg.Branch.Size),
@@ -746,7 +745,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 
 	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.GetSize().Int64(), crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.GetSize().Int64())
-	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*tries.LazyVectorCommitmentBranchNode).LeafCount, crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*tries.LazyVectorCommitmentBranchNode).LeafCount)
+	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*crypto.LazyVectorCommitmentBranchNode).LeafCount, crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*crypto.LazyVectorCommitmentBranchNode).LeafCount)
 	if !bytes.Equal(
 		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
 		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
@@ -811,7 +810,7 @@ func GetFullPath(key []byte) []int32 {
 			break
 		}
 		nibbles = append(nibbles, n1)
-		depth += tries.BranchBits
+		depth += crypto.BranchBits
 	}
 
 	return nibbles
@@ -830,19 +829,19 @@ func getNextNibble(key []byte, pos int) int32 {
 
 	result := int(key[startByte] & ((1 << bitsFromCurrentByte) - 1))
 
-	if bitsFromCurrentByte >= tries.BranchBits {
+	if bitsFromCurrentByte >= crypto.BranchBits {
 		// We have enough bits in the current byte
-		return int32((result >> (bitsFromCurrentByte - tries.BranchBits)) &
-			tries.BranchMask)
+		return int32((result >> (bitsFromCurrentByte - crypto.BranchBits)) &
+			crypto.BranchMask)
 	}
 
 	// We need bits from the next byte
-	result = result << (tries.BranchBits - bitsFromCurrentByte)
+	result = result << (crypto.BranchBits - bitsFromCurrentByte)
 	if startByte+1 < len(key) {
-		remainingBits := tries.BranchBits - bitsFromCurrentByte
+		remainingBits := crypto.BranchBits - bitsFromCurrentByte
 		nextByte := int(key[startByte+1])
 		result |= (nextByte >> (8 - remainingBits))
 	}
 
-	return int32(result & tries.BranchMask)
+	return int32(result & crypto.BranchMask)
 }
