@@ -177,6 +177,7 @@ func (m *mockPubSub) DiscoverPeers(ctx context.Context) error      { return nil 
 func (m *mockPubSub) GetNetwork() uint                             { return 0 }
 func (m *mockPubSub) IsPeerConnected(peerId []byte) bool           { return true }
 func (m *mockPubSub) Reachability() *wrapperspb.BoolValue          { return wrapperspb.Bool(true) }
+func (m *mockPubSub) Close() error                                 { return nil }
 
 // Test helper functions
 func createTestConfigs() (*config.P2PConfig, *config.EngineConfig, error) {
