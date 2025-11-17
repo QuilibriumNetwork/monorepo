@@ -94,8 +94,6 @@ RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(
 
 RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
 
-RUN go mod download
-    
 ## Generate Rust bindings for channel
 WORKDIR /opt/ceremonyclient/channel
 

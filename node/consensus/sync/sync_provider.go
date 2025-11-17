@@ -29,7 +29,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
-const defaultStateQueueCapacity = 10
+const defaultStateQueueCapacity = 1
 
 type syncRequest struct {
 	frameNumber uint64

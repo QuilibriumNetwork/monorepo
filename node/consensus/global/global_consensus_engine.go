@@ -2914,6 +2914,30 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 
 	frame.Header.PublicKeySignatureBls48581 = aggregateSig
 
+	latest, err := e.clockStore.GetLatestGlobalClockFrame()
+	if err != nil {
+		e.logger.Error("could not obtain latest frame", zap.Error(err))
+		return
+	}
+
+	if latest.Header.FrameNumber+1 != frame.Header.FrameNumber ||
+		!bytes.Equal([]byte(latest.Identity()), frame.Header.ParentSelector) {
+		e.logger.Debug(
+			"not next frame, cannot advance",
+			zap.Uint64("latest_frame_number", latest.Header.FrameNumber),
+			zap.Uint64("new_frame_number", frame.Header.FrameNumber),
+			zap.String(
+				"latest_frame_selector",
+				hex.EncodeToString([]byte(latest.Identity())),
+			),
+			zap.String(
+				"new_frame_number",
+				hex.EncodeToString(frame.Header.ParentSelector),
+			),
+		)
+		return
+	}
+
 	txn, err = e.clockStore.NewTransaction(false)
 	if err != nil {
 		e.logger.Error("could not create transaction", zap.Error(err))
@@ -3249,14 +3273,10 @@ func (e *GlobalConsensusEngine) getPendingProposals(
 	*protobufs.GlobalFrame,
 	*protobufs.ProposalVote,
 ] {
-	pendingFrames, err := e.clockStore.RangeGlobalClockFrames(
-		frameNumber,
-		0xfffffffffffffffe,
-	)
+	root, err := e.clockStore.GetGlobalClockFrame(frameNumber)
 	if err != nil {
 		panic(err)
 	}
-	defer pendingFrames.Close()
 
 	result := []*models.SignedProposal[
 		*protobufs.GlobalFrame,
@@ -3264,34 +3284,42 @@ func (e *GlobalConsensusEngine) getPendingProposals(
 	]{}
 
 	e.logger.Debug("getting pending proposals", zap.Uint64("start", frameNumber))
-	pendingFrames.First()
-	if !pendingFrames.Valid() {
-		e.logger.Debug("no valid frame")
-		return result
+
+	startRank := root.Header.Rank
+	latestQC, err := e.clockStore.GetLatestQuorumCertificate(nil)
+	if err != nil {
+		panic(err)
 	}
-	value, err := pendingFrames.Value()
-	if err != nil || value == nil {
-		e.logger.Debug("value was invalid", zap.Error(err))
-		return result
+	endRank := latestQC.Rank
+
+	parent, err := e.clockStore.GetQuorumCertificate(nil, startRank)
+	if err != nil {
+		panic(err)
 	}
 
-	previous := value
-	for pendingFrames.Next(); pendingFrames.Valid(); pendingFrames.Next() {
-		value, err := pendingFrames.Value()
-		if err != nil || value == nil {
-			e.logger.Debug("iter value was invalid or empty", zap.Error(err))
-			break
-		}
-
-		parent, err := e.clockStore.GetQuorumCertificate(nil, previous.GetRank())
+	for rank := startRank + 1; rank <= endRank; rank++ {
+		nextQC, err := e.clockStore.GetQuorumCertificate(nil, rank)
 		if err != nil {
-			panic(err)
+			e.logger.Debug("no qc for rank", zap.Error(err))
+			continue
 		}
 
-		priorTC, _ := e.clockStore.GetTimeoutCertificate(nil, value.GetRank()-1)
+		value, err := e.clockStore.GetGlobalClockFrameCandidate(
+			nextQC.FrameNumber,
+			[]byte(nextQC.Identity()),
+		)
+		if err != nil {
+			e.logger.Debug("no frame for qc", zap.Error(err))
+			parent = nextQC
+			continue
+		}
+
 		var priorTCModel models.TimeoutCertificate = nil
-		if priorTC != nil {
-			priorTCModel = priorTC
+		if parent.Rank != rank-1 {
+			priorTC, _ := e.clockStore.GetTimeoutCertificate(nil, rank-1)
+			if priorTC != nil {
+				priorTCModel = priorTC
+			}
 		}
 
 		vote := &protobufs.ProposalVote{
@@ -3319,7 +3347,7 @@ func (e *GlobalConsensusEngine) getPendingProposals(
 			},
 			Vote: &vote,
 		})
-		previous = value
+		parent = nextQC
 	}
 	return result
 }

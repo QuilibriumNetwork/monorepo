@@ -20,6 +20,7 @@ const (
 )
 
 type PubSub interface {
+	Close() error
 	PublishToBitmask(bitmask []byte, data []byte) error
 	Publish(address []byte, data []byte) error
 	Subscribe(bitmask []byte, handler func(message *pb.Message) error) error

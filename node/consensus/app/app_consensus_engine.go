@@ -1767,6 +1767,35 @@ func (e *AppConsensusEngine) OnOwnProposal(
 			return
 		}
 
+		txn, err := e.clockStore.NewTransaction(false)
+		if err != nil {
+			e.logger.Error("could not create transaction", zap.Error(err))
+			return
+		}
+
+		if err := e.clockStore.PutProposalVote(txn, *proposal.Vote); err != nil {
+			e.logger.Error("could not put vote", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
+		err = e.clockStore.StageShardClockFrame(
+			[]byte(proposal.State.Identifier),
+			*proposal.State.State,
+			txn,
+		)
+		if err != nil {
+			e.logger.Error("could not put frame candidate", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
+		if err := txn.Commit(); err != nil {
+			e.logger.Error("could not commit transaction", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
 		e.voteAggregator.AddState(proposal)
 		e.consensusParticipant.SubmitProposal(proposal)
 
@@ -1975,6 +2004,29 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 	}
 
 	frame.Header.PublicKeySignatureBls48581 = aggregateSig
+
+	latest, _, err := e.clockStore.GetLatestShardClockFrame(e.appAddress)
+	if err != nil {
+		e.logger.Error("could not obtain latest frame", zap.Error(err))
+		return
+	}
+	if latest.Header.FrameNumber+1 != frame.Header.FrameNumber ||
+		!bytes.Equal([]byte(latest.Identity()), frame.Header.ParentSelector) {
+		e.logger.Debug(
+			"not next frame, cannot advance",
+			zap.Uint64("latest_frame_number", latest.Header.FrameNumber),
+			zap.Uint64("new_frame_number", frame.Header.FrameNumber),
+			zap.String(
+				"latest_frame_selector",
+				hex.EncodeToString([]byte(latest.Identity())),
+			),
+			zap.String(
+				"new_frame_number",
+				hex.EncodeToString(frame.Header.ParentSelector),
+			),
+		)
+		return
+	}
 
 	txn, err = e.clockStore.NewTransaction(false)
 	if err != nil {
@@ -2568,52 +2620,55 @@ func (e *AppConsensusEngine) getPendingProposals(
 	*protobufs.AppShardFrame,
 	*protobufs.ProposalVote,
 ] {
-	pendingFrames, err := e.clockStore.RangeShardClockFrames(
-		e.appAddress,
-		frameNumber,
-		0xfffffffffffffffe,
-	)
+	root, _, err := e.clockStore.GetShardClockFrame(e.appAddress, frameNumber, false)
 	if err != nil {
 		panic(err)
 	}
-	defer pendingFrames.Close()
 
 	result := []*models.SignedProposal[
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
 	]{}
 
-	pendingFrames.First()
-	if !pendingFrames.Valid() {
-		return result
+	e.logger.Debug("getting pending proposals", zap.Uint64("start", frameNumber))
+
+	startRank := root.Header.Rank
+	latestQC, err := e.clockStore.GetLatestQuorumCertificate(e.appAddress)
+	if err != nil {
+		panic(err)
 	}
-	value, err := pendingFrames.Value()
-	if err != nil || value == nil {
-		return result
+	endRank := latestQC.Rank
+
+	parent, err := e.clockStore.GetQuorumCertificate(e.appAddress, startRank)
+	if err != nil {
+		panic(err)
 	}
 
-	previous := value
-	for pendingFrames.First(); pendingFrames.Valid(); pendingFrames.Next() {
-		value, err := pendingFrames.Value()
-		if err != nil || value == nil {
-			break
+	for rank := startRank + 1; rank <= endRank; rank++ {
+		nextQC, err := e.clockStore.GetQuorumCertificate(e.appAddress, rank)
+		if err != nil {
+			e.logger.Debug("no qc for rank", zap.Error(err))
+			continue
 		}
 
-		parent, err := e.clockStore.GetQuorumCertificate(
+		value, err := e.clockStore.GetStagedShardClockFrame(
 			e.appAddress,
-			previous.GetRank(),
+			nextQC.FrameNumber,
+			[]byte(nextQC.Identity()),
+			false,
 		)
 		if err != nil {
-			panic(err)
+			e.logger.Debug("no frame for qc", zap.Error(err))
+			parent = nextQC
+			continue
 		}
 
-		priorTC, _ := e.clockStore.GetTimeoutCertificate(
-			e.appAddress,
-			value.GetRank()-1,
-		)
 		var priorTCModel models.TimeoutCertificate = nil
-		if priorTC != nil {
-			priorTCModel = priorTC
+		if parent.Rank != rank-1 {
+			priorTC, _ := e.clockStore.GetTimeoutCertificate(e.appAddress, rank-1)
+			if priorTC != nil {
+				priorTCModel = priorTC
+			}
 		}
 
 		vote := &protobufs.ProposalVote{
@@ -2642,7 +2697,7 @@ func (e *AppConsensusEngine) getPendingProposals(
 			},
 			Vote: &vote,
 		})
-		previous = value
+		parent = nextQC
 	}
 	return result
 }
