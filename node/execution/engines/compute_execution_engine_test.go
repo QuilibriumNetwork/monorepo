@@ -827,6 +827,10 @@ func (m *mockPubSub) GetNetworkInfo() *protobufs.NetworkInfoResponse {
 	return &protobufs.NetworkInfoResponse{}
 }
 
+func (m *mockPubSub) Close() error {
+	return nil
+}
+
 type mockTransaction struct{}
 
 // Abort implements store.Transaction.
