@@ -431,6 +431,10 @@ func main() {
 		nodeConfig.Engine.DataWorkerCount = qruntime.WorkerCount(
 			nodeConfig.Engine.DataWorkerCount, true, true,
 		)
+	} else {
+		nodeConfig.Engine.DataWorkerCount = len(
+			nodeConfig.Engine.DataWorkerP2PMultiaddrs,
+		)
 	}
 
 	if len(nodeConfig.Engine.DataWorkerP2PMultiaddrs) !=

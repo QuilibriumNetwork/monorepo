@@ -14,6 +14,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudflare/circl/sign/ed448"
@@ -61,7 +62,14 @@ type PeerAuthenticator struct {
 	//   method:  "/package.Service/Method"
 	servicePolicies map[string]channel.AllowedPeerPolicyType
 	methodPolicies  map[string]channel.AllowedPeerPolicyType
+
+	cacheMu           sync.RWMutex
+	anyProverCache    map[string]time.Time
+	globalProverCache map[string]time.Time
+	shardProverCache  map[string]time.Time
 }
+
+const authCacheTTL = 10 * time.Second
 
 func NewPeerAuthenticator(
 	logger *zap.Logger,
@@ -119,6 +127,10 @@ func NewPeerAuthenticator(
 		selfPeerId,
 		servicePolicies,
 		methodPolicies,
+		sync.RWMutex{},
+		make(map[string]time.Time),
+		make(map[string]time.Time),
+		make(map[string]time.Time),
 	}
 }
 
@@ -531,6 +543,11 @@ func (p *PeerAuthenticator) isSelf(id []byte) bool {
 }
 
 func (p *PeerAuthenticator) isAnyProver(id []byte) bool {
+	key := string(id)
+	if p.cacheAllows(key, p.anyProverCache) {
+		return true
+	}
+
 	if p.proverRegistry == nil {
 		p.logger.Error(
 			"request authentication for any prover failed",
@@ -574,10 +591,16 @@ func (p *PeerAuthenticator) isAnyProver(id []byte) bool {
 		return false
 	}
 
+	p.markCache(key, p.anyProverCache)
 	return true
 }
 
 func (p *PeerAuthenticator) isGlobalProver(id []byte) bool {
+	key := string(id)
+	if p.cacheAllows(key, p.globalProverCache) {
+		return true
+	}
+
 	if p.proverRegistry == nil {
 		p.logger.Error(
 			"request authenticated for global prover failed",
@@ -626,6 +649,7 @@ func (p *PeerAuthenticator) isGlobalProver(id []byte) bool {
 
 	for _, alloc := range info.Allocations {
 		if len(alloc.ConfirmationFilter) == 0 {
+			p.markCache(key, p.globalProverCache)
 			return true
 		}
 	}
@@ -638,6 +662,11 @@ func (p *PeerAuthenticator) isGlobalProver(id []byte) bool {
 }
 
 func (p *PeerAuthenticator) isShardProver(id []byte) bool {
+	key := string(id)
+	if p.cacheAllows(key, p.shardProverCache) {
+		return true
+	}
+
 	if p.proverRegistry == nil {
 		p.logger.Error(
 			"request authentication for shard prover failed",
@@ -686,6 +715,7 @@ func (p *PeerAuthenticator) isShardProver(id []byte) bool {
 
 	for _, alloc := range info.Allocations {
 		if bytes.Equal(alloc.ConfirmationFilter, p.filter) {
+			p.markCache(key, p.shardProverCache)
 			return true
 		}
 	}
@@ -695,6 +725,40 @@ func (p *PeerAuthenticator) isShardProver(id []byte) bool {
 		zap.Error(errors.New("not shard prover")),
 	)
 	return false
+}
+
+func (p *PeerAuthenticator) cacheAllows(
+	key string,
+	cache map[string]time.Time,
+) bool {
+	p.cacheMu.RLock()
+	expiry, ok := cache[key]
+	p.cacheMu.RUnlock()
+
+	if !ok {
+		return false
+	}
+
+	if time.Now().After(expiry) {
+		p.cacheMu.Lock()
+		// verify entry still matches before deleting
+		if current, exists := cache[key]; exists && current == expiry {
+			delete(cache, key)
+		}
+		p.cacheMu.Unlock()
+		return false
+	}
+
+	return true
+}
+
+func (p *PeerAuthenticator) markCache(
+	key string,
+	cache map[string]time.Time,
+) {
+	p.cacheMu.Lock()
+	cache[key] = time.Now().Add(authCacheTTL)
+	p.cacheMu.Unlock()
 }
 
 func (p *PeerAuthenticator) policyFor(

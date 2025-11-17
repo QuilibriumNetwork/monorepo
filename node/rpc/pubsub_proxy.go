@@ -520,6 +520,7 @@ type PubSubProxyClient struct {
 	client protobufs.PubSubProxyClient
 	conn   *grpc.ClientConn
 	logger *zap.Logger
+	ctx    context.Context
 
 	// Track active subscriptions and validators
 	subscriptions     map[string]context.CancelFunc
@@ -530,8 +531,14 @@ type PubSubProxyClient struct {
 	mu                sync.RWMutex
 }
 
+// Close implements p2p.PubSub.
+func (c *PubSubProxyClient) Close() error {
+	return nil
+}
+
 // NewPubSubProxyClient creates a new proxy client
 func NewPubSubProxyClient(
+	ctx context.Context,
 	conn *grpc.ClientConn,
 	logger *zap.Logger,
 ) *PubSubProxyClient {
@@ -539,6 +546,7 @@ func NewPubSubProxyClient(
 		client:        protobufs.NewPubSubProxyClient(conn),
 		conn:          conn,
 		logger:        logger,
+		ctx:           ctx,
 		subscriptions: make(map[string]context.CancelFunc),
 		validators: make(map[string]func(
 			peer.ID,
@@ -547,99 +555,139 @@ func NewPubSubProxyClient(
 		bitmaskValidators: make(map[string]string),
 	}
 
+	// HACK: Kludgy, but the master process spawns the workers almost certainly
+	// in proxy mode (because manually clustering shouldn't use the proxy feature)
+	// so we should give it time to start listening before proceeding. Adding
+	// this buffer gives us a far better chance of not erroring out on the first
+	// attempt.
+	time.Sleep(10 * time.Second)
+
 	// Initialize validator stream
-	if err := client.initValidatorStream(); err != nil {
+	if err := client.initValidatorStream(ctx); err != nil {
 		logger.Error("failed to initialize validator stream", zap.Error(err))
 	}
 
 	return client
 }
 
-func (c *PubSubProxyClient) initValidatorStream() error {
-	c.validatorStreamMu.Lock()
-	defer c.validatorStreamMu.Unlock()
+func (c *PubSubProxyClient) initValidatorStream(ctx context.Context) error {
+	backoff := time.Second
 
-	stream, err := c.client.ValidatorStream(context.Background())
-	if err != nil {
-		return err
-	}
-
-	c.validatorStream = stream
-
-	// Start goroutine to handle incoming validation requests
-	go c.handleValidationRequests()
-
-	return nil
-}
-
-func (c *PubSubProxyClient) handleValidationRequests() {
 	for {
-		msg, err := c.validatorStream.Recv()
-		if err != nil {
-			c.logger.Error("validator stream recv error", zap.Error(err))
-			// Try to reconnect
-			time.Sleep(1 * time.Second)
-			if err := c.initValidatorStream(); err != nil {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			stream, err := c.client.ValidatorStream(ctx)
+			if err != nil {
 				c.logger.Error(
-					"failed to reinitialize validator stream",
+					"validator stream connect failed, retrying",
 					zap.Error(err),
+					zap.Duration("retry_in", backoff),
 				)
-			}
-			return
-		}
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(backoff):
+					if backoff < 30*time.Second {
+						backoff *= 2
+						if backoff > 30*time.Second {
+							backoff = 30 * time.Second
+						}
+					}
+				}
 
-		switch m := msg.Message.(type) {
-		case *protobufs.ValidationStreamMessage_ValidationRequest:
-			req := m.ValidationRequest
-
-			// Look up the validator function
-			c.mu.RLock()
-			validator, exists := c.validators[req.ValidatorId]
-			c.mu.RUnlock()
-
-			if !exists {
-				c.logger.Warn("received validation request for unknown validator",
-					zap.String("validator_id", req.ValidatorId))
 				continue
 			}
 
-			// Convert message and call validator
-			pbMsg := &pb.Message{
-				Data:      req.Message.Data,
-				From:      req.Message.From,
-				Seqno:     req.Message.Seqno,
-				Bitmask:   req.Message.Bitmask,
-				Signature: req.Message.Signature,
-				Key:       req.Message.Key,
-			}
-
-			result := validator(peer.ID(req.PeerId), pbMsg)
-
-			// Send response
-			var protoResult protobufs.ValidationResponse_ValidationResult
-			switch result {
-			case p2p.ValidationResultAccept:
-				protoResult = protobufs.ValidationResponse_ACCEPT
-			case p2p.ValidationResultReject:
-				protoResult = protobufs.ValidationResponse_REJECT
-			default:
-				protoResult = protobufs.ValidationResponse_IGNORE
-			}
-
-			resp := &protobufs.ValidationStreamMessage{
-				Message: &protobufs.ValidationStreamMessage_ValidationResponse{
-					ValidationResponse: &protobufs.ValidationResponse{
-						ValidatorId: req.ValidatorId,
-						Result:      protoResult,
-					},
-				},
-			}
-
 			c.validatorStreamMu.Lock()
-			if err := c.validatorStream.Send(resp); err != nil {
-				c.logger.Error("failed to send validation response", zap.Error(err))
-			}
+			c.validatorStream = stream
 			c.validatorStreamMu.Unlock()
+
+			// Start goroutine to handle incoming validation requests
+			go c.handleValidationRequests(ctx)
+
+			return nil
+		}
+	}
+}
+
+func (c *PubSubProxyClient) handleValidationRequests(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			msg, err := c.validatorStream.Recv()
+			if err != nil {
+				c.logger.Error("validator stream recv error", zap.Error(err))
+				c.validatorStreamMu.Lock()
+				c.validatorStream = nil
+				c.validatorStreamMu.Unlock()
+				// Try to reconnect
+				time.Sleep(1 * time.Second)
+				if err := c.initValidatorStream(ctx); err != nil {
+					c.logger.Error(
+						"failed to reinitialize validator stream",
+						zap.Error(err),
+					)
+				}
+				return
+			}
+
+			switch m := msg.Message.(type) {
+			case *protobufs.ValidationStreamMessage_ValidationRequest:
+				req := m.ValidationRequest
+
+				// Look up the validator function
+				c.mu.RLock()
+				validator, exists := c.validators[req.ValidatorId]
+				c.mu.RUnlock()
+
+				if !exists {
+					c.logger.Warn("received validation request for unknown validator",
+						zap.String("validator_id", req.ValidatorId))
+					continue
+				}
+
+				// Convert message and call validator
+				pbMsg := &pb.Message{
+					Data:      req.Message.Data,
+					From:      req.Message.From,
+					Seqno:     req.Message.Seqno,
+					Bitmask:   req.Message.Bitmask,
+					Signature: req.Message.Signature,
+					Key:       req.Message.Key,
+				}
+
+				result := validator(peer.ID(req.PeerId), pbMsg)
+
+				// Send response
+				var protoResult protobufs.ValidationResponse_ValidationResult
+				switch result {
+				case p2p.ValidationResultAccept:
+					protoResult = protobufs.ValidationResponse_ACCEPT
+				case p2p.ValidationResultReject:
+					protoResult = protobufs.ValidationResponse_REJECT
+				default:
+					protoResult = protobufs.ValidationResponse_IGNORE
+				}
+
+				resp := &protobufs.ValidationStreamMessage{
+					Message: &protobufs.ValidationStreamMessage_ValidationResponse{
+						ValidationResponse: &protobufs.ValidationResponse{
+							ValidatorId: req.ValidatorId,
+							Result:      protoResult,
+						},
+					},
+				}
+
+				c.validatorStreamMu.Lock()
+				if err := c.validatorStream.Send(resp); err != nil {
+					c.logger.Error("failed to send validation response", zap.Error(err))
+				}
+				c.validatorStreamMu.Unlock()
+			}
 		}
 	}
 }
@@ -791,18 +839,19 @@ func (c *PubSubProxyClient) RegisterValidator(
 	}
 
 	c.validatorStreamMu.Lock()
-	defer c.validatorStreamMu.Unlock()
-
 	if c.validatorStream == nil {
+		c.validatorStreamMu.Unlock()
 		// Try to initialize stream if not already done
-		if err := c.initValidatorStream(); err != nil {
+		if err := c.initValidatorStream(c.ctx); err != nil {
 			c.mu.Lock()
 			delete(c.validators, validatorID)
 			delete(c.bitmaskValidators, bitmaskKey)
 			c.mu.Unlock()
 			return err
 		}
+		c.validatorStreamMu.Lock()
 	}
+	defer c.validatorStreamMu.Unlock()
 
 	if err := c.validatorStream.Send(req); err != nil {
 		c.mu.Lock()

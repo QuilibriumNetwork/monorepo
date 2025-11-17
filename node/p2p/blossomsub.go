@@ -1606,3 +1606,8 @@ func getNetworkNamespace(network uint8) string {
 
 	return ANNOUNCE_PREFIX + network_name
 }
+
+// Close implements p2p.PubSub.
+func (b *BlossomSub) Close() error {
+	return nil
+}

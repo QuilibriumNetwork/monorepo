@@ -120,7 +120,7 @@ func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config
 	optimizedProofOfMeaningfulWorkRewardIssuance := reward.NewOptRewardIssuance()
 	doubleRatchetEncryptedChannel := channel.NewDoubleRatchetEncryptedChannel()
 	appConsensusEngineFactory := app.NewAppConsensusEngineFactory(logger, config2, proxyBlossomSub, hypergraph, fileKeyManager, pebbleKeyStore, pebbleClockStore, pebbleInboxStore, pebbleShardsStore, pebbleHypergraphStore, pebbleConsensusStore, frameProver, kzgInclusionProver, decaf448BulletproofProver, mpCitHVerifiableEncryptor, decaf448KeyConstructor, bedlamCompiler, cachedSignerRegistry, proverRegistry, inMemoryPeerInfoManager, dynamicFeeManager, blsAppFrameValidator, blsGlobalFrameValidator, asertDifficultyAdjuster, optimizedProofOfMeaningfulWorkRewardIssuance, bls48581KeyConstructor, doubleRatchetEncryptedChannel)
-	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, frameProver, logger, coreId, parentProcess)
+	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, proxyBlossomSub, frameProver, logger, coreId, parentProcess)
 	globalTimeReel, err := provideGlobalTimeReel(appConsensusEngineFactory)
 	if err != nil {
 		return nil, err
@@ -177,7 +177,7 @@ func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Con
 	optimizedProofOfMeaningfulWorkRewardIssuance := reward.NewOptRewardIssuance()
 	doubleRatchetEncryptedChannel := channel.NewDoubleRatchetEncryptedChannel()
 	appConsensusEngineFactory := app.NewAppConsensusEngineFactory(logger, config2, blossomSub, hypergraph, fileKeyManager, pebbleKeyStore, pebbleClockStore, pebbleInboxStore, pebbleShardsStore, pebbleHypergraphStore, pebbleConsensusStore, frameProver, kzgInclusionProver, decaf448BulletproofProver, mpCitHVerifiableEncryptor, decaf448KeyConstructor, bedlamCompiler, cachedSignerRegistry, proverRegistry, inMemoryPeerInfoManager, dynamicFeeManager, blsAppFrameValidator, blsGlobalFrameValidator, asertDifficultyAdjuster, optimizedProofOfMeaningfulWorkRewardIssuance, bls48581KeyConstructor, doubleRatchetEncryptedChannel)
-	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, frameProver, logger, coreId, parentProcess)
+	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, blossomSub, frameProver, logger, coreId, parentProcess)
 	globalTimeReel, err := provideGlobalTimeReel(appConsensusEngineFactory)
 	if err != nil {
 		return nil, err
@@ -361,6 +361,7 @@ func provideDataWorkerIPC(
 	proverRegistry consensus2.ProverRegistry,
 	appConsensusEngineFactory *app.AppConsensusEngineFactory,
 	peerInfoManager p2p2.PeerInfoManager,
+	pubsub p2p2.PubSub,
 	frameProver crypto.FrameProver,
 	logger *zap.Logger,
 	coreId uint,
@@ -370,6 +371,7 @@ func provideDataWorkerIPC(
 		rpcMultiaddr, config2, signerRegistry,
 		proverRegistry,
 		peerInfoManager,
+		pubsub,
 		frameProver,
 		appConsensusEngineFactory,
 		logger,

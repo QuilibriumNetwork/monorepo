@@ -34,6 +34,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/aggregator"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
+	qsync "source.quilibrium.com/quilibrium/monorepo/node/consensus/sync"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/tracing"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/voting"
@@ -129,6 +130,9 @@ type AppConsensusEngine struct {
 	blacklistMap              map[string]bool
 	currentRank               uint64
 	alertPublicKey            []byte
+	peerAuthCache             map[string]time.Time
+	peerAuthCacheMu           sync.RWMutex
+	proverAddress             []byte
 
 	// Message queues
 	consensusMessageQueue      chan *pb.Message
@@ -158,7 +162,7 @@ type AppConsensusEngine struct {
 	timeoutAggregator           consensus.TimeoutAggregator[*protobufs.ProposalVote]
 
 	// Provider implementations
-	syncProvider     *AppSyncProvider
+	syncProvider     *qsync.SyncProvider[*protobufs.AppShardFrame, *protobufs.AppShardProposal]
 	votingProvider   *AppVotingProvider
 	leaderProvider   *AppLeaderProvider
 	livenessProvider *AppLivenessProvider
@@ -266,9 +270,25 @@ func NewAppConsensusEngine(
 		currentDifficulty:          config.Engine.Difficulty,
 		blacklistMap:               make(map[string]bool),
 		alertPublicKey:             []byte{},
+		peerAuthCache:              make(map[string]time.Time),
 	}
 
-	engine.syncProvider = NewAppSyncProvider(engine)
+	keyId := "q-prover-key"
+
+	key, err := keyManager.GetSigningKey(keyId)
+	if err != nil {
+		logger.Error("failed to get key for prover address", zap.Error(err))
+		panic(err)
+	}
+
+	addressBI, err := poseidon.HashBytes(key.Public().([]byte))
+	if err != nil {
+		logger.Error("failed to calculate prover address", zap.Error(err))
+		panic(err)
+	}
+
+	engine.proverAddress = addressBI.FillBytes(make([]byte, 32))
+
 	engine.votingProvider = &AppVotingProvider{engine: engine}
 	engine.leaderProvider = &AppLeaderProvider{engine: engine}
 	engine.livenessProvider = &AppLivenessProvider{engine: engine}
@@ -542,6 +562,33 @@ func NewAppConsensusEngine(
 	}
 	engine.forks = forks
 
+	engine.syncProvider = qsync.NewSyncProvider[
+		*protobufs.AppShardFrame,
+		*protobufs.AppShardProposal,
+	](
+		logger,
+		forks,
+		proverRegistry,
+		signerRegistry,
+		peerInfoManager,
+		qsync.NewAppSyncClient(
+			frameProver,
+			proverRegistry,
+			blsConstructor,
+			engine,
+			config,
+			appAddress,
+		),
+		hypergraph,
+		config,
+		appAddress,
+		engine.proverAddress,
+	)
+
+	// Add sync provider
+	componentBuilder.AddWorker(engine.syncProvider.Start)
+
+	// Add consensus
 	componentBuilder.AddWorker(func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
@@ -716,14 +763,8 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 }
 
 func (e *AppConsensusEngine) GetFrame() *protobufs.AppShardFrame {
-	// Get the current state from the state machine
-	frame, _ := e.appTimeReel.GetHead()
-
-	if frame == nil {
-		return nil
-	}
-
-	return frame.Clone().(*protobufs.AppShardFrame)
+	frame, _, _ := e.clockStore.GetLatestShardClockFrame(e.appAddress)
+	return frame
 }
 
 func (e *AppConsensusEngine) GetDifficulty() uint32 {
@@ -940,16 +981,7 @@ func (e *AppConsensusEngine) getPeerID() PeerID {
 }
 
 func (e *AppConsensusEngine) getProverAddress() []byte {
-	keyId := "q-prover-key"
-
-	key, err := e.keyManager.GetSigningKey(keyId)
-	if err != nil {
-		e.logger.Error("failed to get key for prover address", zap.Error(err))
-		return []byte{}
-	}
-
-	addressBI, _ := poseidon.HashBytes(key.Public().([]byte))
-	return addressBI.FillBytes(make([]byte, 32))
+	return e.proverAddress
 }
 
 func (e *AppConsensusEngine) getAddressFromPublicKey(publicKey []byte) []byte {
@@ -1280,7 +1312,7 @@ func (e *AppConsensusEngine) adjustFeeForTraffic(baseFee uint64) uint64 {
 	}
 
 	// Get the current frame
-	currentFrame, err := e.appTimeReel.GetHead()
+	currentFrame, _, err := e.clockStore.GetLatestShardClockFrame(e.appAddress)
 	if err != nil || currentFrame == nil || currentFrame.Header == nil {
 		e.logger.Debug("could not get latest frame for fee adjustment")
 		return baseFee
@@ -1293,18 +1325,18 @@ func (e *AppConsensusEngine) adjustFeeForTraffic(baseFee uint64) uint64 {
 	}
 
 	previousFrameNum := currentFrame.Header.FrameNumber - 1
-	var previousFrame *protobufs.AppShardFrame
 
 	// Try to get the previous frame
-	frames, err := e.appTimeReel.GetFramesByNumber(previousFrameNum)
+	previousFrame, _, err := e.clockStore.GetShardClockFrame(
+		e.appAddress,
+		previousFrameNum,
+		false,
+	)
 	if err != nil {
 		e.logger.Debug(
 			"could not get prior frame for fee adjustment",
 			zap.Error(err),
 		)
-	}
-	if len(frames) > 0 {
-		previousFrame = frames[0]
 	}
 
 	if previousFrame == nil || previousFrame.Header == nil {
@@ -1735,6 +1767,35 @@ func (e *AppConsensusEngine) OnOwnProposal(
 			return
 		}
 
+		txn, err := e.clockStore.NewTransaction(false)
+		if err != nil {
+			e.logger.Error("could not create transaction", zap.Error(err))
+			return
+		}
+
+		if err := e.clockStore.PutProposalVote(txn, *proposal.Vote); err != nil {
+			e.logger.Error("could not put vote", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
+		err = e.clockStore.StageShardClockFrame(
+			[]byte(proposal.State.Identifier),
+			*proposal.State.State,
+			txn,
+		)
+		if err != nil {
+			e.logger.Error("could not put frame candidate", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
+		if err := txn.Commit(); err != nil {
+			e.logger.Error("could not commit transaction", zap.Error(err))
+			txn.Abort()
+			return
+		}
+
 		e.voteAggregator.AddState(proposal)
 		e.consensusParticipant.SubmitProposal(proposal)
 
@@ -1873,19 +1934,34 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 	e.frameStoreMu.RUnlock()
 
 	if !ok {
+		frame, err = e.clockStore.GetStagedShardClockFrame(
+			e.appAddress,
+			qc.GetFrameNumber(),
+			[]byte(qc.Identity()),
+			false,
+		)
+		if err == nil {
+			ok = true
+		}
+	}
+
+	if !ok {
 		e.logger.Error(
 			"no frame for quorum certificate",
 			zap.Uint64("rank", newRank-1),
 			zap.Uint64("frame_number", qc.GetFrameNumber()),
 		)
-		return
-	}
-
-	frame.Header.PublicKeySignatureBls48581 = aggregateSig
-
-	err = e.appTimeReel.Insert(frame)
-	if err != nil {
-		e.logger.Error("could not insert frame into time reel", zap.Error(err))
+		current := (*e.forks.FinalizedState().State)
+		peer, err := e.getRandomProverPeerId()
+		if err != nil {
+			e.logger.Error("could not get random peer", zap.Error(err))
+			return
+		}
+		e.syncProvider.AddState(
+			[]byte(peer),
+			current.Header.FrameNumber,
+			[]byte(current.Identity()),
+		)
 		return
 	}
 
@@ -1927,9 +2003,55 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 		return
 	}
 
+	frame.Header.PublicKeySignatureBls48581 = aggregateSig
+
+	latest, _, err := e.clockStore.GetLatestShardClockFrame(e.appAddress)
+	if err != nil {
+		e.logger.Error("could not obtain latest frame", zap.Error(err))
+		return
+	}
+	if latest.Header.FrameNumber+1 != frame.Header.FrameNumber ||
+		!bytes.Equal([]byte(latest.Identity()), frame.Header.ParentSelector) {
+		e.logger.Debug(
+			"not next frame, cannot advance",
+			zap.Uint64("latest_frame_number", latest.Header.FrameNumber),
+			zap.Uint64("new_frame_number", frame.Header.FrameNumber),
+			zap.String(
+				"latest_frame_selector",
+				hex.EncodeToString([]byte(latest.Identity())),
+			),
+			zap.String(
+				"new_frame_number",
+				hex.EncodeToString(frame.Header.ParentSelector),
+			),
+		)
+		return
+	}
+
 	txn, err = e.clockStore.NewTransaction(false)
 	if err != nil {
 		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+
+	if err := e.materialize(
+		txn,
+		frame,
+	); err != nil {
+		_ = txn.Abort()
+		e.logger.Error("could not materialize frame requests", zap.Error(err))
+		return
+	}
+	if err := e.clockStore.CommitShardClockFrame(
+		e.appAddress,
+		frame.GetFrameNumber(),
+		[]byte(frame.Identity()),
+		[]*tries.RollingFrecencyCritbitTrie{},
+		txn,
+		false,
+	); err != nil {
+		_ = txn.Abort()
+		e.logger.Error("could not put global frame", zap.Error(err))
 		return
 	}
 
@@ -2149,7 +2271,10 @@ func (e *AppConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
 	}
 	e.provingMessagesMu.Unlock()
 
-	commitments, err := e.livenessProvider.Collect(context.Background())
+	commitments, err := e.livenessProvider.Collect(
+		context.Background(),
+		frame.Header.FrameNumber,
+	)
 	if err != nil {
 		e.logger.Error("could not collect commitments", zap.Error(err))
 		return
@@ -2495,52 +2620,55 @@ func (e *AppConsensusEngine) getPendingProposals(
 	*protobufs.AppShardFrame,
 	*protobufs.ProposalVote,
 ] {
-	pendingFrames, err := e.clockStore.RangeShardClockFrames(
-		e.appAddress,
-		frameNumber,
-		0xfffffffffffffffe,
-	)
+	root, _, err := e.clockStore.GetShardClockFrame(e.appAddress, frameNumber, false)
 	if err != nil {
 		panic(err)
 	}
-	defer pendingFrames.Close()
 
 	result := []*models.SignedProposal[
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
 	]{}
 
-	pendingFrames.First()
-	if !pendingFrames.Valid() {
-		return result
+	e.logger.Debug("getting pending proposals", zap.Uint64("start", frameNumber))
+
+	startRank := root.Header.Rank
+	latestQC, err := e.clockStore.GetLatestQuorumCertificate(e.appAddress)
+	if err != nil {
+		panic(err)
 	}
-	value, err := pendingFrames.Value()
-	if err != nil || value == nil {
-		return result
+	endRank := latestQC.Rank
+
+	parent, err := e.clockStore.GetQuorumCertificate(e.appAddress, startRank)
+	if err != nil {
+		panic(err)
 	}
 
-	previous := value
-	for pendingFrames.First(); pendingFrames.Valid(); pendingFrames.Next() {
-		value, err := pendingFrames.Value()
-		if err != nil || value == nil {
-			break
+	for rank := startRank + 1; rank <= endRank; rank++ {
+		nextQC, err := e.clockStore.GetQuorumCertificate(e.appAddress, rank)
+		if err != nil {
+			e.logger.Debug("no qc for rank", zap.Error(err))
+			continue
 		}
 
-		parent, err := e.clockStore.GetQuorumCertificate(
+		value, err := e.clockStore.GetStagedShardClockFrame(
 			e.appAddress,
-			previous.GetRank(),
+			nextQC.FrameNumber,
+			[]byte(nextQC.Identity()),
+			false,
 		)
 		if err != nil {
-			panic(err)
+			e.logger.Debug("no frame for qc", zap.Error(err))
+			parent = nextQC
+			continue
 		}
 
-		priorTC, _ := e.clockStore.GetTimeoutCertificate(
-			e.appAddress,
-			value.GetRank()-1,
-		)
 		var priorTCModel models.TimeoutCertificate = nil
-		if priorTC != nil {
-			priorTCModel = priorTC
+		if parent.Rank != rank-1 {
+			priorTC, _ := e.clockStore.GetTimeoutCertificate(e.appAddress, rank-1)
+			if priorTC != nil {
+				priorTCModel = priorTC
+			}
 		}
 
 		vote := &protobufs.ProposalVote{
@@ -2569,7 +2697,7 @@ func (e *AppConsensusEngine) getPendingProposals(
 			},
 			Vote: &vote,
 		})
-		previous = value
+		parent = nextQC
 	}
 	return result
 }

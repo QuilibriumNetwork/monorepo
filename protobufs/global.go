@@ -145,6 +145,10 @@ func (g *GlobalFrame) Source() models.Identity {
 	return models.Identity(g.Header.Prover)
 }
 
+func (g *GlobalFrame) GetFrameNumber() uint64 {
+	return g.Header.FrameNumber
+}
+
 func (a *AppShardFrame) Clone() models.Unique {
 	return proto.Clone(a).(*AppShardFrame)
 }
@@ -177,6 +181,10 @@ func (a *AppShardFrame) Identity() models.Identity {
 // Source implements models.Unique.
 func (a *AppShardFrame) Source() models.Identity {
 	return models.Identity(a.Header.Prover)
+}
+
+func (a *AppShardFrame) GetFrameNumber() uint64 {
+	return a.Header.FrameNumber
 }
 
 func (s *AppShardProposal) GetRank() uint64 {

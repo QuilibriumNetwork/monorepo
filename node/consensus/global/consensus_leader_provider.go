@@ -71,14 +71,6 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	filter []byte,
 	priorState models.Identity,
 ) (**protobufs.GlobalFrame, error) {
-	_, err := p.engine.livenessProvider.Collect(ctx)
-	if err != nil {
-		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
-	}
-
-	timer := prometheus.NewTimer(frameProvingDuration)
-	defer timer.ObserveDuration()
-
 	prior, err := p.engine.clockStore.GetLatestGlobalClockFrame()
 	if err != nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
@@ -104,12 +96,16 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		if latestQC != nil && latestQC.Identity() == priorState {
 			switch {
 			case prior.Header.Rank < latestQC.GetRank():
+				// We should never be in this scenario because the consensus
+				// implementation's safety rules should forbid it, it'll demand sync
+				// happen out of band. Nevertheless, we note it so we can find it in
+				// logs if it _did_ happen.
 				return nil, models.NewNoVoteErrorf(
 					"needs sync: prior rank %d behind latest qc rank %d",
 					prior.Header.Rank,
 					latestQC.GetRank(),
 				)
-			case prior.Header.Rank == latestQC.GetRank() &&
+			case prior.Header.FrameNumber == latestQC.GetFrameNumber() &&
 				latestQC.Identity() != prior.Identity():
 				peerID, peerErr := p.engine.getRandomProverPeerId()
 				if peerErr != nil {
@@ -148,6 +144,14 @@ func (p *GlobalLeaderProvider) ProveNextState(
 			priorState,
 		)
 	}
+
+	_, err = p.engine.livenessProvider.Collect(ctx, prior.Header.FrameNumber+1)
+	if err != nil {
+		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
+	}
+
+	timer := prometheus.NewTimer(frameProvingDuration)
+	defer timer.ObserveDuration()
 
 	// Get prover index
 	provers, err := p.engine.proverRegistry.GetActiveProvers(nil)

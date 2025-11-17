@@ -18,6 +18,11 @@ type MockPubSub struct {
 	mock.Mock
 }
 
+// Close implements p2p.PubSub.
+func (m *MockPubSub) Close() error {
+	return nil
+}
+
 // GetOwnMultiaddrs implements p2p.PubSub.
 func (m *MockPubSub) GetOwnMultiaddrs() []multiaddr.Multiaddr {
 	args := m.Called()

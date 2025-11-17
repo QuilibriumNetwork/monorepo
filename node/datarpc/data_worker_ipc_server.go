@@ -38,6 +38,7 @@ type DataWorkerIPCServer struct {
 	signerRegistry            consensus.SignerRegistry
 	proverRegistry            consensus.ProverRegistry
 	peerInfoManager           tp2p.PeerInfoManager
+	pubsub                    tp2p.PubSub
 	authProvider              channel.AuthenticationProvider
 	appConsensusEngineFactory *app.AppConsensusEngineFactory
 	appConsensusEngine        *app.AppConsensusEngine
@@ -52,6 +53,7 @@ func NewDataWorkerIPCServer(
 	signerRegistry consensus.SignerRegistry,
 	proverRegistry consensus.ProverRegistry,
 	peerInfoManager tp2p.PeerInfoManager,
+	pubsub tp2p.PubSub,
 	frameProver crypto.FrameProver,
 	appConsensusEngineFactory *app.AppConsensusEngineFactory,
 	logger *zap.Logger,
@@ -89,6 +91,7 @@ func NewDataWorkerIPCServer(
 		logger:                    logger,
 		coreId:                    coreId,
 		parentProcessId:           parentProcessId,
+		pubsub:                    pubsub,
 		signer:                    signer,
 		appConsensusEngineFactory: appConsensusEngineFactory,
 		signerRegistry:            signerRegistry,
@@ -108,6 +111,7 @@ func (r *DataWorkerIPCServer) Start() error {
 
 func (r *DataWorkerIPCServer) Stop() error {
 	r.logger.Info("stopping server gracefully")
+	r.pubsub.Close()
 	if r.server != nil {
 		r.server.GracefulStop()
 	}

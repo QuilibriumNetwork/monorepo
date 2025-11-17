@@ -315,17 +315,6 @@ var (
 		[]string{"app_address", "action"}, // action: "register", "unregister"
 	)
 
-	// Sync status metrics
-	syncStatusCheck = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: subsystem,
-			Name:      "sync_status_check_total",
-			Help:      "Total number of sync status checks",
-		},
-		[]string{"app_address", "result"}, // result: "synced", "syncing"
-	)
-
 	// Engine state metrics
 	engineState = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{

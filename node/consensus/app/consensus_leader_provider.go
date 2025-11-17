@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"time"
@@ -66,11 +65,6 @@ func (p *AppLeaderProvider) ProveNextState(
 	filter []byte,
 	priorState models.Identity,
 ) (**protobufs.AppShardFrame, error) {
-	timer := prometheus.NewTimer(frameProvingDuration.WithLabelValues(
-		p.engine.appAddressHex,
-	))
-	defer timer.ObserveDuration()
-
 	prior, _, err := p.engine.clockStore.GetLatestShardClockFrame(
 		p.engine.appAddress,
 	)
@@ -100,12 +94,16 @@ func (p *AppLeaderProvider) ProveNextState(
 		if latestQC != nil && latestQC.Identity() == priorState {
 			switch {
 			case prior.Header.Rank < latestQC.GetRank():
+				// We should never be in this scenario because the consensus
+				// implementation's safety rules should forbid it, it'll demand sync
+				// happen out of band. Nevertheless, we note it so we can find it in
+				// logs if it _did_ happen.
 				return nil, models.NewNoVoteErrorf(
 					"needs sync: prior rank %d behind latest qc rank %d",
 					prior.Header.Rank,
 					latestQC.GetRank(),
 				)
-			case prior.Header.Rank == latestQC.GetRank() &&
+			case prior.Header.FrameNumber == latestQC.GetFrameNumber() &&
 				latestQC.Identity() != prior.Identity():
 				peerID, peerErr := p.engine.getRandomProverPeerId()
 				if peerErr != nil {
@@ -145,25 +143,10 @@ func (p *AppLeaderProvider) ProveNextState(
 		)
 	}
 
-	// Get prover index
-	provers, err := p.engine.proverRegistry.GetActiveProvers(p.engine.appAddress)
-	if err != nil {
-		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, errors.Wrap(err, "prove next state")
-	}
-
-	found := false
-	for _, prover := range provers {
-		if bytes.Equal(prover.Address, p.engine.getProverAddress()) {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		frameProvingTotal.WithLabelValues("error").Inc()
-		return nil, models.NewNoVoteErrorf("not a prover")
-	}
+	timer := prometheus.NewTimer(frameProvingDuration.WithLabelValues(
+		p.engine.appAddressHex,
+	))
+	defer timer.ObserveDuration()
 
 	// Get collected messages to include in frame
 	p.engine.provingMessagesMu.Lock()

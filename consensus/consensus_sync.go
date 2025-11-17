@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 // SyncProvider handles synchronization management
@@ -17,4 +18,20 @@ type SyncProvider[StateT models.Unique] interface {
 		ctx context.Context,
 		existing *StateT,
 	) (<-chan *StateT, <-chan error)
+
+	// Initiates hypersync with a prover.
+	HyperSync(
+		ctx context.Context,
+		prover []byte,
+		shardKey tries.ShardKey,
+	)
+
+	// Enqueues state information to begin synchronization with a given peer. If
+	// expectedIdentity is provided, may use this to determine if the initial
+	// frameNumber for which synchronization begins is the correct fork.
+	AddState(
+		sourcePeerID []byte,
+		frameNumber uint64,
+		expectedIdentity []byte,
+	)
 }

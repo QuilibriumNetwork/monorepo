@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -31,7 +32,7 @@ func (e *AppConsensusEngine) GetAppShardFrame(
 	)
 	var frame *protobufs.AppShardFrame
 	if request.FrameNumber == 0 {
-		frame, err = e.appTimeReel.GetHead()
+		frame = *e.forks.FinalizedState().State
 		if frame.Header.FrameNumber == 0 {
 			return nil, errors.Wrap(
 				errors.New("not currently syncable"),
@@ -176,6 +177,10 @@ func (e *AppConsensusEngine) authenticateProverFromContext(
 	}
 
 	if !bytes.Equal(e.pubsub.GetPeerID(), []byte(peerID)) {
+		if e.peerAuthCacheAllows(peerID) {
+			return peerID, nil
+		}
+
 		registry, err := e.keyStore.GetKeyRegistry(
 			[]byte(peerID),
 		)
@@ -224,7 +229,39 @@ func (e *AppConsensusEngine) authenticateProverFromContext(
 				"invalid peer",
 			)
 		}
+
+		e.markPeerAuthCache(peerID)
 	}
 
 	return peerID, nil
+}
+
+const appPeerAuthCacheTTL = 10 * time.Second
+
+func (e *AppConsensusEngine) peerAuthCacheAllows(id peer.ID) bool {
+	e.peerAuthCacheMu.RLock()
+	expiry, ok := e.peerAuthCache[string(id)]
+	e.peerAuthCacheMu.RUnlock()
+
+	if !ok {
+		return false
+	}
+
+	if time.Now().After(expiry) {
+		e.peerAuthCacheMu.Lock()
+		if current, exists := e.peerAuthCache[string(id)]; exists &&
+			current == expiry {
+			delete(e.peerAuthCache, string(id))
+		}
+		e.peerAuthCacheMu.Unlock()
+		return false
+	}
+
+	return true
+}
+
+func (e *AppConsensusEngine) markPeerAuthCache(id peer.ID) {
+	e.peerAuthCacheMu.Lock()
+	e.peerAuthCache[string(id)] = time.Now().Add(appPeerAuthCacheTTL)
+	e.peerAuthCacheMu.Unlock()
 }

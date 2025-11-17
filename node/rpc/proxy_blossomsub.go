@@ -26,6 +26,7 @@ type ProxyBlossomSub struct {
 	client *PubSubProxyClient
 	conn   *grpc.ClientConn
 	logger *zap.Logger
+	cancel context.CancelFunc
 	coreId uint
 }
 
@@ -144,10 +145,13 @@ func NewProxyBlossomSub(
 		return nil, errors.Wrap(err, "new proxy blossom sub")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Create the proxy client
-	client := NewPubSubProxyClient(conn, logger)
+	client := NewPubSubProxyClient(ctx, conn, logger)
 
 	return &ProxyBlossomSub{
+		cancel: cancel,
 		client: client,
 		conn:   conn,
 		logger: logger,
@@ -157,6 +161,7 @@ func NewProxyBlossomSub(
 
 // Close closes the proxy connection
 func (p *ProxyBlossomSub) Close() error {
+	p.cancel()
 	if p.conn != nil {
 		return p.conn.Close()
 	}

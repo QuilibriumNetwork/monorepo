@@ -21,6 +21,7 @@ type GlobalLivenessProvider struct {
 
 func (p *GlobalLivenessProvider) Collect(
 	ctx context.Context,
+	frameNumber uint64,
 ) (GlobalCollectedCommitments, error) {
 	timer := prometheus.NewTimer(shardCommitmentCollectionDuration)
 	defer timer.ObserveDuration()
@@ -67,14 +68,6 @@ func (p *GlobalLivenessProvider) Collect(
 	}
 
 	acceptedMessages := []*protobufs.Message{}
-
-	frameNumber := uint64(0)
-	currentFrame, _ := p.engine.globalTimeReel.GetHead()
-	if currentFrame != nil && currentFrame.Header != nil {
-		frameNumber = currentFrame.Header.FrameNumber
-	}
-
-	frameNumber++
 
 	p.engine.logger.Debug(
 		"collected messages, validating",

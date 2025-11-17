@@ -477,7 +477,34 @@ func (w *WorkerManager) GetFilterByWorkerId(coreId uint) ([]byte, error) {
 }
 
 func (w *WorkerManager) RangeWorkers() ([]*typesStore.WorkerInfo, error) {
-	return w.store.RangeWorkers()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	workers, err := w.store.RangeWorkers()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(workers) != int(w.config.Engine.DataWorkerCount) {
+		for i := uint(1); i <= uint(w.config.Engine.DataWorkerCount); i++ {
+			if _, ok := w.serviceClients[i]; ok {
+				continue
+			}
+			if _, err := w.getIPCOfWorker(i); err != nil {
+				w.logger.Error(
+					"could not initialize worker for range",
+					zap.Uint("core_id", i),
+					zap.Error(err),
+				)
+			}
+		}
+		workers, err = w.store.RangeWorkers()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return workers, nil
 }
 
 // ProposeAllocations invokes a proposal function set by the parent of the
@@ -512,14 +539,70 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 		return errors.Wrap(err, "load workers from store")
 	}
 
-	if len(workers) != w.config.Engine.DataWorkerCount {
-		for i := range w.config.Engine.DataWorkerCount {
-			_, err := w.getIPCOfWorker(uint(i + 1))
-			if err != nil {
-				w.logger.Error("could not obtain IPC for worker", zap.Error(err))
+	if len(workers) != int(w.config.Engine.DataWorkerCount) {
+		existingWorkers := make(map[uint]*typesStore.WorkerInfo, len(workers))
+		for _, worker := range workers {
+			existingWorkers[worker.CoreId] = worker
+		}
+
+		// Ensure all configured workers exist
+		for i := uint(1); i <= uint(w.config.Engine.DataWorkerCount); i++ {
+			if _, ok := existingWorkers[i]; ok {
 				continue
 			}
+			if _, err := w.getIPCOfWorker(i); err != nil {
+				w.logger.Error(
+					"could not obtain IPC for worker",
+					zap.Uint("core_id", i),
+					zap.Error(err),
+				)
+			}
 		}
+
+		// Remove workers beyond configured count
+		for _, worker := range workers {
+			if worker.CoreId <= uint(w.config.Engine.DataWorkerCount) {
+				continue
+			}
+
+			txn, err := w.store.NewTransaction(false)
+			if err != nil {
+				w.logger.Error(
+					"could not create txn to delete worker",
+					zap.Uint("core_id", worker.CoreId),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			if err := w.store.DeleteWorker(txn, worker.CoreId); err != nil {
+				_ = txn.Abort()
+				w.logger.Error(
+					"could not delete worker",
+					zap.Uint("core_id", worker.CoreId),
+					zap.Error(err),
+				)
+			}
+			if err := txn.Commit(); err != nil {
+				_ = txn.Abort()
+				w.logger.Error(
+					"could not commit worker delete",
+					zap.Uint("core_id", worker.CoreId),
+					zap.Error(err),
+				)
+			}
+
+			if client, ok := w.serviceClients[worker.CoreId]; ok {
+				_ = client.Close()
+				delete(w.serviceClients, worker.CoreId)
+			}
+			delete(w.filtersByWorker, worker.CoreId)
+			delete(w.allocatedWorkers, worker.CoreId)
+			if len(worker.Filter) > 0 {
+				delete(w.workersByFilter, string(worker.Filter))
+			}
+		}
+
 		workers, err = w.store.RangeWorkers()
 		if err != nil {
 			return errors.Wrap(err, "load workers from store")

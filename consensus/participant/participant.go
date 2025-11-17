@@ -44,7 +44,7 @@ func NewParticipant[
 	pending []*models.SignedProposal[StateT, VoteT],
 ) (*eventloop.EventLoop[StateT, VoteT], error) {
 	cfg, err := timeout.NewConfig(
-		20*time.Second,
+		24*time.Second,
 		3*time.Minute,
 		1.2,
 		6,
