@@ -22,6 +22,7 @@ type GlobalLivenessProvider struct {
 func (p *GlobalLivenessProvider) Collect(
 	ctx context.Context,
 	frameNumber uint64,
+	rank uint64,
 ) (GlobalCollectedCommitments, error) {
 	timer := prometheus.NewTimer(shardCommitmentCollectionDuration)
 	defer timer.ObserveDuration()
@@ -98,7 +99,6 @@ func (p *GlobalLivenessProvider) Collect(
 
 	proverRoot := make([]byte, 64)
 
-	// TODO(2.1.1+): Refactor this with caching
 	commitSet, err := p.engine.hypergraph.Commit(frameNumber)
 	if err != nil {
 		p.engine.logger.Error(
@@ -108,6 +108,14 @@ func (p *GlobalLivenessProvider) Collect(
 		return GlobalCollectedCommitments{}, errors.Wrap(err, "collect")
 	}
 	collected := 0
+
+	if err := p.engine.rebuildAppShardCache(rank); err != nil {
+		p.engine.logger.Warn(
+			"could not rebuild app shard cache",
+			zap.Uint64("rank", rank),
+			zap.Error(err),
+		)
+	}
 
 	// The poseidon hash's field is < 0x3fff...ffff, so we use the upper two bits
 	// to fold the four hypergraph phase/sets into the three different tree

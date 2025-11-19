@@ -175,6 +175,9 @@ type GlobalConsensusEngine struct {
 	keyRegistryDigestCacheMu  sync.Mutex
 	peerAuthCache             map[string]time.Time
 	peerAuthCacheMu           sync.RWMutex
+	appShardCache             map[string]*appShardCacheEntry
+	appShardCacheMu           sync.RWMutex
+	appShardCacheRank         uint64
 
 	// Transaction cross-shard lock tracking
 	txLockMap map[uint64]map[string]map[string]*LockedTransaction
@@ -299,6 +302,7 @@ func NewGlobalConsensusEngine(
 		peerAuthCache:               make(map[string]time.Time),
 		alertPublicKey:              []byte{},
 		txLockMap:                   make(map[uint64]map[string]map[string]*LockedTransaction),
+		appShardCache:               make(map[string]*appShardCacheEntry),
 	}
 
 	if config.Engine.AlertKey != "" {
@@ -633,6 +637,16 @@ func NewGlobalConsensusEngine(
 		)
 		if err != nil {
 			return nil, err
+		}
+
+		if latest == nil {
+			if err := engine.rebuildAppShardCache(0); err != nil {
+				logger.Warn("could not prime app shard cache", zap.Error(err))
+			}
+		} else {
+			if err := engine.rebuildAppShardCache(latest.FinalizedRank); err != nil {
+				logger.Warn("could not prime app shard cache", zap.Error(err))
+			}
 		}
 		engine.timeoutAggregator, err = voting.NewGlobalTimeoutAggregator[GlobalPeerID](
 			tracing.NewZapTracer(logger),

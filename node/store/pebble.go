@@ -26,6 +26,7 @@ var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_5,
 	migration_2_1_0_8,
 	migration_2_1_0_81,
+	migration_2_1_0_10,
 }
 
 func NewPebbleDB(
@@ -453,6 +454,12 @@ func migration_2_1_0_8(b *pebble.Batch) error {
 }
 
 func migration_2_1_0_81(b *pebble.Batch) error {
+	// these migration entries exist solely to advance migration number so all
+	// nodes are consistent
+	return nil
+}
+
+func migration_2_1_0_10(b *pebble.Batch) error {
 	// these migration entries exist solely to advance migration number so all
 	// nodes are consistent
 	return nil

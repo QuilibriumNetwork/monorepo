@@ -397,7 +397,7 @@ func TestGlobalExecutionEngine_AllOperationTypes(t *testing.T) {
 
 			// Process message
 			state := hgstate.NewHypergraphState(mockHG)
-			responses, err := engine.ProcessMessage(252840, big.NewInt(1), intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], msg.Payload, state)
+			responses, err := engine.ProcessMessage(255840, big.NewInt(1), intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], msg.Payload, state)
 
 			assert.NoError(t, err)
 			assert.NotNil(t, responses)

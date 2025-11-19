@@ -115,9 +115,9 @@ func TestProverJoinConfirmFlow(t *testing.T) {
 	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
-	// Test 1: Join at frame 252840
+	// Test 1: Join at frame 255840
 	t.Run("Join and confirm after 360 frames", func(t *testing.T) {
-		joinFrame := uint64(252840)
+		joinFrame := uint64(255840)
 
 		// Create and prove join
 		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
@@ -171,7 +171,7 @@ func TestProverJoinRejectFlow(t *testing.T) {
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	t.Run("Join and reject immediately", func(t *testing.T) {
-		joinFrame := uint64(252840)
+		joinFrame := uint64(255840)
 
 		// Create and prove join
 		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
@@ -213,7 +213,7 @@ func TestProverPauseResumeFlow(t *testing.T) {
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// First join and confirm to get to active state
-	joinFrame := uint64(252840)
+	joinFrame := uint64(255840)
 	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 	require.NoError(t, err)
 	err = proverJoin.Prove(joinFrame)
@@ -275,7 +275,7 @@ func TestProverLeaveFlow(t *testing.T) {
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// First join and confirm to get to active state
-	joinFrame := uint64(252840)
+	joinFrame := uint64(255840)
 	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 	require.NoError(t, err)
 	err = proverJoin.Prove(joinFrame)
@@ -348,7 +348,7 @@ func TestProverLeaveRejectFlow(t *testing.T) {
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// First join and confirm to get to active state
-	joinFrame := uint64(252840)
+	joinFrame := uint64(255840)
 	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 	require.NoError(t, err)
 	err = proverJoin.Prove(joinFrame)
@@ -401,7 +401,7 @@ func TestProverTimingEdgeCases(t *testing.T) {
 	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
-	t.Run("Join before 252840 with special confirmation rules", func(t *testing.T) {
+	t.Run("Join before 255840 with special confirmation rules", func(t *testing.T) {
 		joinFrame := uint64(252000)
 
 		// Create and prove join
@@ -413,7 +413,7 @@ func TestProverTimingEdgeCases(t *testing.T) {
 		// Materialize join
 		state = materializeAndCommit(t, proverJoin, joinFrame, state, hg)
 
-		// Try to confirm before frame 252840 (should fail)
+		// Try to confirm before frame 255840 (should fail)
 		confirmFrame := uint64(252839)
 		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
@@ -423,10 +423,10 @@ func TestProverTimingEdgeCases(t *testing.T) {
 		valid, err := proverConfirm.Verify(confirmFrame)
 		assert.False(t, valid)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "cannot confirm before frame 252840")
+		assert.Contains(t, err.Error(), "cannot confirm before frame 255840")
 
-		// Confirm at frame 252840 (should succeed even though less than 360 frames)
-		confirmFrame = uint64(252840)
+		// Confirm at frame 255840 (should succeed even though less than 360 frames)
+		confirmFrame = uint64(255840)
 		proverConfirm, err = global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverConfirm.Prove(confirmFrame)
@@ -439,7 +439,7 @@ func TestProverTimingEdgeCases(t *testing.T) {
 
 	t.Run("Pause timeout causes implicit leave", func(t *testing.T) {
 		// First get to active state
-		joinFrame := uint64(252840)
+		joinFrame := uint64(255840)
 		proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 		require.NoError(t, err)
 		err = proverJoin.Prove(joinFrame)
@@ -483,7 +483,7 @@ func TestProverInvalidStateTransitions(t *testing.T) {
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// Join first
-	joinFrame := uint64(252840)
+	joinFrame := uint64(255840)
 	proverJoin, err := global.NewProverJoin([][]byte{filter}, joinFrame, nil, nil, keyManager, hg, rdfMultiprover, vdf.NewWesolowskiFrameProver(zap.L()), frameStore)
 	require.NoError(t, err)
 	err = proverJoin.Prove(joinFrame)

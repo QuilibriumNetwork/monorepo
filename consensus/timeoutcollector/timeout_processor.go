@@ -143,12 +143,6 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) Process(
 	}
 
 	if p.tcTracker.Done() {
-		p.tracer.Trace(
-			"timeout tracker done",
-			consensus.Uint64Param("processor_rank", p.rank),
-			consensus.Uint64Param("timeout_rank", timeout.Rank),
-			consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
-		)
 		return nil
 	}
 
@@ -164,21 +158,8 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) Process(
 		return fmt.Errorf("validating timeout failed: %w", err)
 	}
 	if p.tcTracker.Done() {
-		p.tracer.Trace(
-			"timeout tracker done",
-			consensus.Uint64Param("processor_rank", p.rank),
-			consensus.Uint64Param("timeout_rank", timeout.Rank),
-			consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
-		)
 		return nil
 	}
-
-	p.tracer.Trace(
-		"adding timeout to signature aggregator",
-		consensus.Uint64Param("processor_rank", p.rank),
-		consensus.Uint64Param("timeout_rank", timeout.Rank),
-		consensus.IdentityParam("timeout_voter", (*timeout.Vote).Identity()),
-	)
 
 	// CAUTION: for correctness it is critical that we update the
 	// `newestQCTracker` first, _before_ we add the TO's signature to
@@ -245,10 +226,6 @@ func (p *TimeoutProcessor[StateT, VoteT, PeerIDT]) Process(
 	// true only once.
 	willBuildTC := p.tcTracker.Track(totalWeight)
 	if !willBuildTC {
-		p.tracer.Trace(
-			"insufficient weight to build tc",
-			consensus.Uint64Param("total_weight", totalWeight),
-		)
 		// either we do not have enough timeouts to build a TC, or another thread
 		// has already passed this gate and created a TC
 		return nil

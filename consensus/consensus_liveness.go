@@ -17,7 +17,11 @@ type LivenessProvider[
 ] interface {
 	// Collect returns the collected mutation operations ahead of liveness
 	// announcements.
-	Collect(ctx context.Context) (CollectedT, error)
+	Collect(
+		ctx context.Context,
+		frameNumber uint64,
+		rank uint64,
+	) (CollectedT, error)
 	// SendLiveness announces liveness ahead of the next prover deterimination and
 	// subsequent proving. Provides prior state and collected mutation operations
 	// if relevant.

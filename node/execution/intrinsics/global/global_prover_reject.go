@@ -475,8 +475,8 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 		}
 		joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
 
-		// Special case: if join was before frame 252840, can reject any time
-		if joinFrame >= 252840 {
+		// Special case: if join was before frame 255840, can reject any time
+		if joinFrame >= 255840 {
 			// Otherwise same timing constraints as confirm
 			framesSinceJoin := frameNumber - joinFrame
 			if framesSinceJoin > 720 {

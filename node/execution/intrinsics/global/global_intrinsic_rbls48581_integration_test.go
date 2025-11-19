@@ -356,7 +356,7 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 		err = rm.Set(global.GLOBAL_RDF_SCHEMA, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], "allocation:ProverAllocation", "Status", []byte{0}, allocationTree) // joining
 		require.NoError(t, err)
 		joinFrameBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(joinFrameBytes, 252840)
+		binary.BigEndian.PutUint64(joinFrameBytes, 255840)
 		err = rm.Set(global.GLOBAL_RDF_SCHEMA, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], "allocation:ProverAllocation", "JoinFrameNumber", joinFrameBytes, allocationTree)
 		require.NoError(t, err)
 
@@ -373,8 +373,8 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 		hg.SetVertexData(txn, [64]byte(slices.Concat(intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], allocationAddress)), allocationTree)
 		txn.Commit()
 
-		// Try to confirm at frame 252840 + 360
-		confirmFrame := uint64(252840 + 360)
+		// Try to confirm at frame 255840 + 360
+		confirmFrame := uint64(255840 + 360)
 		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rm)
 		require.NoError(t, err)
 

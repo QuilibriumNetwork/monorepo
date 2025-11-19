@@ -450,11 +450,15 @@ func NewInstance(t *testing.T, options ...Option) *Instance {
 		},
 	)
 	in.voting.On("FinalizeTimeout", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(
-		func(ctx context.Context, rank uint64, latestQuorumCertificate models.QuorumCertificate, latestQuorumCertificateRanks []uint64, aggregatedSignature models.AggregatedSignature) (models.TimeoutCertificate, error) {
+		func(ctx context.Context, rank uint64, latestQuorumCertificate models.QuorumCertificate, latestQuorumCertificateRanks []consensus.TimeoutSignerInfo, aggregatedSignature models.AggregatedSignature) (models.TimeoutCertificate, error) {
+			ranks := []uint64{}
+			for _, i := range latestQuorumCertificateRanks {
+				ranks = append(ranks, i.NewestQCRank)
+			}
 			return &helper.TestTimeoutCertificate{
 				Filter:              nil,
 				Rank:                rank,
-				LatestRanks:         latestQuorumCertificateRanks,
+				LatestRanks:         ranks,
 				LatestQuorumCert:    latestQuorumCertificate,
 				AggregatedSignature: aggregatedSignature,
 			}, nil

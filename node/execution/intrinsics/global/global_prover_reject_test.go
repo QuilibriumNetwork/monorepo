@@ -84,7 +84,7 @@ func TestProverReject_Verify(t *testing.T) {
 
 		// Test data
 		filter := []byte("testfilter")
-		joinFrame := uint64(252840)
+		joinFrame := uint64(255840)
 		rejectFrame := joinFrame + 100 // Before confirmation window
 		address := make([]byte, 32)
 		for i := range address {
@@ -321,7 +321,7 @@ func TestProverReject_Verify(t *testing.T) {
 
 		// Test data
 		filter := []byte("testfilter")
-		joinFrame := uint64(252840)
+		joinFrame := uint64(255840)
 		rejectFrame := joinFrame + 100
 		address := make([]byte, 32)
 		for i := range address {

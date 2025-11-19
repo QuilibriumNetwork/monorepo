@@ -147,7 +147,7 @@ func TestProverConfirm_Verify(t *testing.T) {
 
 		// Test data
 		filter := []byte("testfilter")
-		joinFrame := uint64(252840)
+		joinFrame := uint64(255840)
 		confirmFrame := joinFrame + 360
 		address := make([]byte, 32)
 		for i := range address {
@@ -219,7 +219,7 @@ func TestProverConfirm_Verify(t *testing.T) {
 
 		// Test data
 		filter := []byte("testfilter")
-		joinFrame := uint64(252840)
+		joinFrame := uint64(255840)
 		confirmFrame := joinFrame + 359 // Too early
 		address := make([]byte, 32)
 		for i := range address {
@@ -260,7 +260,7 @@ func TestProverConfirm_Verify(t *testing.T) {
 		assert.False(t, valid)
 	})
 
-	t.Run("Cannot confirm join before frame 252840", func(t *testing.T) {
+	t.Run("Cannot confirm join before frame 255840", func(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
@@ -269,7 +269,7 @@ func TestProverConfirm_Verify(t *testing.T) {
 		// Test data
 		filter := []byte("testfilter")
 		joinFrame := uint64(252000)
-		confirmFrame := uint64(252839) // Before 252840
+		confirmFrame := uint64(252839) // Before 255840
 		address := make([]byte, 32)
 		for i := range address {
 			address[i] = byte(i % 256)
@@ -305,7 +305,7 @@ func TestProverConfirm_Verify(t *testing.T) {
 		// Call the verify function
 		valid, err := proverConfirm.Verify(confirmFrame)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "cannot confirm before frame 252840")
+		assert.Contains(t, err.Error(), "cannot confirm before frame 255840")
 		assert.False(t, valid)
 	})
 

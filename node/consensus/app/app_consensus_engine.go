@@ -2274,6 +2274,7 @@ func (e *AppConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
 	commitments, err := e.livenessProvider.Collect(
 		context.Background(),
 		frame.Header.FrameNumber,
+		newRank,
 	)
 	if err != nil {
 		e.logger.Error("could not collect commitments", zap.Error(err))
