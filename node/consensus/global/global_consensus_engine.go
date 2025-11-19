@@ -392,7 +392,6 @@ func NewGlobalConsensusEngine(
 		}
 		engine.proposer = provers.NewManager(
 			logger,
-			hypergraph,
 			workerStore,
 			engine.workerManager,
 			8000000000,

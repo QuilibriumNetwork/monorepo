@@ -203,12 +203,20 @@ func (r *RPCServer) GetNodeInfo(
 		seniority = seniority.SetUint64(proverInfo.Seniority)
 	}
 
+	allocated := uint32(0)
+	for _, w := range workers {
+		if w.Allocated {
+			allocated++
+		}
+	}
+
 	return &protobufs.NodeInfoResponse{
-		PeerId:        peer.ID(peerID).String(),
-		PeerScore:     uint64(r.pubSub.GetPeerScore(peerID)),
-		Version:       append([]byte{}, config.GetVersion()...),
-		PeerSeniority: seniority.FillBytes(make([]byte, 8)),
-		Workers:       uint32(len(workers)),
+		PeerId:           peer.ID(peerID).String(),
+		PeerScore:        uint64(r.pubSub.GetPeerScore(peerID)),
+		Version:          append([]byte{}, config.GetVersion()...),
+		PeerSeniority:    seniority.FillBytes(make([]byte, 8)),
+		RunningWorkers:   uint32(len(workers)),
+		AllocatedWorkers: allocated,
 	}, nil
 }
 

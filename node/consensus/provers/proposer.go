@@ -14,7 +14,6 @@ import (
 
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
-	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	"source.quilibrium.com/quilibrium/monorepo/types/worker"
 )
 
@@ -24,12 +23,6 @@ const (
 	RewardGreedy Strategy = iota
 	DataGreedy
 )
-
-// WorldSizer provides the total world-state size (bytes).
-type WorldSizer interface {
-	// GetSize returns the total world state size in bytes.
-	GetSize(key *tries.ShardKey, path []int) *big.Int
-}
 
 // ShardDescriptor describes a candidate shard allocation target.
 type ShardDescriptor struct {
@@ -65,7 +58,6 @@ type scored struct {
 // Manager ranks shards and assigns free workers to the best ones.
 type Manager struct {
 	logger    *zap.Logger
-	world     WorldSizer
 	store     store.WorkerStore
 	workerMgr worker.WorkerManager
 
@@ -80,7 +72,6 @@ type Manager struct {
 // NewManager wires up a planning manager
 func NewManager(
 	logger *zap.Logger,
-	world WorldSizer,
 	ws store.WorkerStore,
 	wm worker.WorkerManager,
 	units uint64,
@@ -88,7 +79,6 @@ func NewManager(
 ) *Manager {
 	return &Manager{
 		logger:    logger.Named("allocation_manager"),
-		world:     world,
 		store:     ws,
 		workerMgr: wm,
 		Units:     units,
@@ -103,6 +93,7 @@ func (m *Manager) PlanAndAllocate(
 	difficulty uint64,
 	shards []ShardDescriptor,
 	maxAllocations int,
+	worldBytes *big.Int,
 ) ([]Proposal, error) {
 	m.mu.Lock()
 	isPlanning := m.isPlanning
@@ -142,7 +133,6 @@ func (m *Manager) PlanAndAllocate(
 		return nil, nil
 	}
 
-	worldBytes := m.world.GetSize(nil, nil)
 	if worldBytes.Cmp(big.NewInt(0)) == 0 {
 		return nil, errors.Wrap(
 			errors.New("world size is zero"),
@@ -269,11 +259,6 @@ func (m *Manager) scoreShards(
 	scores := make([]scored, 0, len(shards))
 	for i, s := range shards {
 		if len(s.Filter) == 0 || s.Size == 0 {
-			m.logger.Debug(
-				"filtering out empty shard",
-				zap.String("filter", hex.EncodeToString(s.Filter)),
-				zap.Uint64("size", s.Size),
-			)
 			continue
 		}
 
@@ -312,26 +297,11 @@ func (m *Manager) scoreShards(
 				return nil, errors.New("score shards")
 			}
 
-			m.logger.Debug(
-				"calculating score",
-				zap.Int("index", i),
-				zap.String("basis", basis.String()),
-				zap.String("size", big.NewInt(int64(s.Size)).String()),
-				zap.String("worldBytes", worldBytes.String()),
-				zap.String("factor", factor.String()),
-				zap.String("divisor", ringDiv.String()),
-				zap.String("shardsSqrt", shardsSqrt.String()),
-			)
 			factor = factor.Div(ringDiv)
 			factor = factor.Div(shardsSqrt)
 			score = factor.BigInt()
 		}
 
-		m.logger.Debug(
-			"adding score proposal",
-			zap.Int("index", i),
-			zap.String("score", score.String()),
-		)
 		scores = append(scores, scored{idx: i, score: score})
 	}
 	return scores, nil
@@ -346,6 +316,7 @@ func (m *Manager) DecideJoins(
 	difficulty uint64,
 	shards []ShardDescriptor,
 	pending [][]byte,
+	worldBytes *big.Int,
 ) error {
 	if len(pending) == 0 {
 		return nil
@@ -356,8 +327,6 @@ func (m *Manager) DecideJoins(
 		m.logger.Warn("no shards available to decide")
 		return nil
 	}
-
-	worldBytes := m.world.GetSize(nil, nil)
 
 	basis := reward.PomwBasis(difficulty, worldBytes.Uint64(), m.Units)
 
