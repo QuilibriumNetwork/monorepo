@@ -279,6 +279,11 @@ func (e *GlobalConsensusEngine) handleFrameMessage(
 			return
 		}
 
+		frame, err := e.globalTimeReel.GetHead()
+		if err == nil && frame != nil {
+			e.currentRank = frame.GetRank()
+		}
+
 		// Success metric recorded at the end of processing
 		framesProcessedTotal.WithLabelValues("success").Inc()
 	default:

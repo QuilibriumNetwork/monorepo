@@ -89,7 +89,6 @@ func (t *TimeoutCollectors[VoteT]) GetOrCreateCollector(rank uint64) (
 	}
 	t.lock.Unlock()
 
-	t.tracer.Trace("timeout collector has been created")
 	return collector, true, nil
 }
 
@@ -151,6 +150,4 @@ func (t *TimeoutCollectors[VoteT]) PruneUpToRank(lowestRetainedRank uint64) {
 	}
 	t.lowestRetainedRank = lowestRetainedRank
 	t.lock.Unlock()
-
-	t.tracer.Trace("pruned timeout collectors")
 }

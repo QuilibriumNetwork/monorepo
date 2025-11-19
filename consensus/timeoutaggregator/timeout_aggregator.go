@@ -161,11 +161,6 @@ func (t *TimeoutAggregator[VoteT]) processQueuedTimeout(
 			timeoutState.Rank, err)
 	}
 
-	t.tracer.Trace(
-		"adding timeout to collector",
-		consensus.Uint64Param("timeout_rank", timeoutState.Rank),
-		consensus.IdentityParam("timeout_voter", (*timeoutState.Vote).Identity()),
-	)
 	err = collector.AddTimeout(timeoutState)
 	if err != nil {
 		return fmt.Errorf("could not process TO for rank %d: %w",
@@ -182,7 +177,6 @@ func (t *TimeoutAggregator[VoteT]) AddTimeout(
 ) {
 	// drop stale objects
 	if timeoutState.Rank < t.lowestRetainedRank.Value() {
-		t.tracer.Trace("drop stale timeouts")
 		return
 	}
 

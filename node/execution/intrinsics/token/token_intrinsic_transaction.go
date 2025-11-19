@@ -23,7 +23,7 @@ import (
 )
 
 const FRAME_2_1_CUTOVER = 244200
-const FRAME_2_1_EXTENDED_ENROLL_END = 252840
+const FRAME_2_1_EXTENDED_ENROLL_END = 255840
 const FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END = FRAME_2_1_EXTENDED_ENROLL_END + 360
 
 // used to skip frame-based checks, for tests

@@ -145,7 +145,11 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		)
 	}
 
-	_, err = p.engine.livenessProvider.Collect(ctx, prior.Header.FrameNumber+1)
+	_, err = p.engine.livenessProvider.Collect(
+		ctx,
+		prior.Header.FrameNumber+1,
+		rank,
+	)
 	if err != nil {
 		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
 	}
@@ -188,7 +192,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	}
 
 	// Get current timestamp and difficulty
-	timestamp := time.Now().UnixMilli()
+	timestamp := time.Now().Add(10 * time.Second).UnixMilli()
 	difficulty := p.engine.difficultyAdjuster.GetNextDifficulty(
 		rank,
 		timestamp,

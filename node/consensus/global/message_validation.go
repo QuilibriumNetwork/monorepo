@@ -452,7 +452,7 @@ func (e *GlobalConsensusEngine) validateFrameMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		if frametime.GlobalFrameSince(frame) > 20*time.Second {
+		if e.currentRank > frame.GetRank()+2 {
 			frameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}

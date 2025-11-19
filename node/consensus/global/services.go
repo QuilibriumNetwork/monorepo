@@ -14,11 +14,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
-	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 func (e *GlobalConsensusEngine) GetGlobalFrame(
@@ -177,65 +177,15 @@ func (e *GlobalConsensusEngine) GetAppShards(
 		Info: []*protobufs.AppShardInfo{},
 	}
 
-	fullPrefix := []uint32{}
-	for _, p := range tries.GetFullPath(req.ShardKey[3:]) {
-		fullPrefix = append(fullPrefix, uint32(p))
+	hg, ok := e.hypergraph.(*hypergraph.HypergraphCRDT)
+	if !ok {
+		return nil, errors.New("hypergraph does not support caching")
 	}
-	fullPrefix = slices.Concat(fullPrefix, req.Prefix)
 
+	includeShardKey := len(req.ShardKey) != 35
 	for _, shard := range shards {
-		size := big.NewInt(0)
-		commitment := [][]byte{}
-		dataShards := uint64(0)
-		for _, ps := range []protobufs.HypergraphPhaseSet{0, 1, 2, 3} {
-			c, err := e.hypergraph.GetChildrenForPath(
-				ctx,
-				&protobufs.GetChildrenForPathRequest{
-					ShardKey: req.ShardKey,
-					Path:     shard.Path,
-					PhaseSet: protobufs.HypergraphPhaseSet(ps),
-				},
-			)
-			if err != nil {
-				commitment = append(commitment, make([]byte, 64))
-				continue
-			}
-
-			if len(c.PathSegments) == 0 {
-				commitment = append(commitment, make([]byte, 64))
-				continue
-			}
-
-			branch, leaf := selectPathSegmentForPrefix(c.PathSegments, fullPrefix)
-			if branch == nil && leaf == nil {
-				commitment = append(commitment, make([]byte, 64))
-				continue
-			}
-
-			if branch != nil {
-				size = size.Add(size, new(big.Int).SetBytes(branch.Size))
-				commitment = append(commitment, branch.Commitment)
-				dataShards += branch.LeafCount
-				continue
-			}
-
-			size = size.Add(size, new(big.Int).SetBytes(leaf.Size))
-			commitment = append(commitment, leaf.Commitment)
-			dataShards += 1
-		}
-
-		shardKey := []byte{}
-		if len(req.ShardKey) != 35 {
-			shardKey = slices.Concat(shard.L1, shard.L2)
-		}
-
-		response.Info = append(response.Info, &protobufs.AppShardInfo{
-			Prefix:     shard.Path,
-			Size:       size.Bytes(),
-			Commitment: commitment,
-			DataShards: dataShards,
-			ShardKey:   shardKey,
-		})
+		info := e.getAppShardInfoForShard(hg, shard, includeShardKey)
+		response.Info = append(response.Info, info)
 	}
 
 	return response, nil

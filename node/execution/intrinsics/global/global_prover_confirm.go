@@ -498,16 +498,16 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
 
 		// Check timing constraints
-		if joinFrame < 252840 && joinFrame >= 244100 {
-			if frameNumber < 252840 {
-				// If joined before frame 252840, cannot confirm until frame 252840
+		if joinFrame < 255840 && joinFrame >= 244100 {
+			if frameNumber < 255840 {
+				// If joined before frame 255840, cannot confirm until frame 255840
 				return false, errors.Wrap(
-					errors.New("cannot confirm before frame 252840"),
+					errors.New("cannot confirm before frame 255840"),
 					"verify",
 				)
 			}
 
-			// Set this to either 252840 - 360 or the raw join frame if higher than it
+			// Set this to either 255840 - 360 or the raw join frame if higher than it
 			// so the provers before can immeidately join after the wait, those after
 			// still have the full 360.
 			if joinFrame < 252480 {
@@ -515,8 +515,8 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 			}
 		}
 
-		// For joins before 252840, once we reach frame 252840, they can confirm
-		// immediately, for joins after 252840, normal 360 frame wait applies.
+		// For joins before 255840, once we reach frame 255840, they can confirm
+		// immediately, for joins after 255840, normal 360 frame wait applies.
 		// If the join frame precedes the genesis frame (e.g. not mainnet), we
 		// ignore the topic altogether
 		if joinFrame >= 252480 || joinFrame <= 244100 {

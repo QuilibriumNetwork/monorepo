@@ -30,6 +30,7 @@ import (
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
 func (e *GlobalConsensusEngine) eventDistributorLoop(
@@ -385,10 +386,24 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	pendingFilters := [][]byte{}
 	proposalDescriptors := []provers.ShardDescriptor{}
 	decideDescriptors := []provers.ShardDescriptor{}
-	shards, err := e.shardsStore.RangeAppShards()
+	appShards, err := e.shardsStore.RangeAppShards()
 	if err != nil {
 		e.logger.Error("could not obtain app shard info", zap.Error(err))
 		return
+	}
+
+	// consolidate into high level L2 shards:
+	shardMap := map[string]store.ShardInfo{}
+	for _, s := range appShards {
+		shardMap[string(s.L2)] = s
+	}
+
+	shards := []store.ShardInfo{}
+	for _, s := range shardMap {
+		shards = append(shards, store.ShardInfo{
+			L1: s.L1,
+			L2: s.L2,
+		})
 	}
 
 	registry, err := e.keyStore.GetKeyRegistryByProver(data.Frame.Header.Prover)
@@ -496,8 +511,6 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		resp, err := e.getAppShardsFromProver(
 			client,
 			slices.Concat(info.L1, info.L2),
-			info.Path,
-			data.Frame.Header.Prover,
 		)
 		if err != nil {
 			e.logger.Debug("could not get app shards from prover", zap.Error(err))
@@ -531,7 +544,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 					if bytes.Equal(allocation.ConfirmationFilter, bp) {
 						allocated = allocation.Status != 4
 						if e.config.P2P.Network != 0 ||
-							data.Frame.Header.FrameNumber > 252840 {
+							data.Frame.Header.FrameNumber > 255840 {
 							e.logger.Info(
 								"checking pending status of allocation",
 								zap.Int("status", int(allocation.Status)),
@@ -824,8 +837,6 @@ func (e *GlobalConsensusEngine) publishKeyRegistry() {
 func (e *GlobalConsensusEngine) getAppShardsFromProver(
 	client protobufs.GlobalServiceClient,
 	shardKey []byte,
-	path []uint32,
-	prover []byte,
 ) (
 	*protobufs.GetAppShardsResponse,
 	error,
@@ -858,5 +869,4 @@ func (e *GlobalConsensusEngine) getAppShardsFromProver(
 	}
 
 	return response, nil
-
 }

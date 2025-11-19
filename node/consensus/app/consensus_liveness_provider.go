@@ -17,6 +17,7 @@ type AppLivenessProvider struct {
 func (p *AppLivenessProvider) Collect(
 	ctx context.Context,
 	frameNumber uint64,
+	rank uint64,
 ) (CollectedCommitments, error) {
 	if p.engine.GetFrame() == nil {
 		return CollectedCommitments{}, errors.Wrap(

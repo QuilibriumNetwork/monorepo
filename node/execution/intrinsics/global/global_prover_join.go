@@ -759,32 +759,70 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		}
 	}
 
-	// Create composite address: GLOBAL_INTRINSIC_ADDRESS + prover address
-	fullAddress := [64]byte{}
-	copy(fullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-	copy(fullAddress[32:], address)
-
 	// Get the existing prover vertex data
-	vertexData, err := p.hypergraph.GetVertexData(fullAddress)
-	if err == nil && vertexData != nil {
-		// Prover exists, check if they're in left state (4)
-		tree := vertexData
-
-		// Check if prover is in left state (4)
-		statusData, err := p.rdfMultiprover.Get(
+	proverAddress := [64]byte{}
+	copy(proverAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(proverAddress[32:], address)
+	proverVertexData, err := p.hypergraph.GetVertexData(proverAddress)
+	if err == nil && proverVertexData != nil {
+		tree := proverVertexData
+		kickedFrame, err := p.rdfMultiprover.Get(
 			GLOBAL_RDF_SCHEMA,
-			"prover:Prover",
-			"Status",
+			"allocation:ProverAllocation",
+			"KickFrameNumber",
 			tree,
 		)
-		if err == nil && len(statusData) > 0 {
-			status := statusData[0]
-			if status != 4 {
-				// Prover is in some other state - cannot join
+		if err == nil && len(kickedFrame) == 8 {
+			kickedFrame := binary.BigEndian.Uint64(kickedFrame)
+			if kickedFrame != 0 {
+				// Prover has been kicked for malicious behavior
 				return false, errors.Wrap(
-					errors.New("prover already exists in non-left state"),
+					errors.New("prover has been previously kicked"),
 					"verify",
 				)
+			}
+		}
+	}
+
+	for _, f := range p.Filters {
+		allocationAddressBI, err := poseidon.HashBytes(
+			slices.Concat(
+				[]byte("PROVER_ALLOCATION"),
+				p.PublicKeySignatureBLS48581.PublicKey,
+				f,
+			),
+		)
+		if err != nil {
+			return false, errors.Wrap(err, "verify")
+		}
+		allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
+		// Create composite address: GLOBAL_INTRINSIC_ADDRESS + prover address
+		fullAddress := [64]byte{}
+		copy(fullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(fullAddress[32:], allocationAddress)
+
+		// Get the existing prover allocation vertex data
+		vertexData, err := p.hypergraph.GetVertexData(fullAddress)
+		if err == nil && vertexData != nil {
+			// Prover exists, check if they're in left state (4)
+			tree := vertexData
+
+			// Check if prover is in left state (4)
+			statusData, err := p.rdfMultiprover.Get(
+				GLOBAL_RDF_SCHEMA,
+				"allocation:ProverAllocation",
+				"Status",
+				tree,
+			)
+			if err == nil && len(statusData) > 0 {
+				status := statusData[0]
+				if status != 4 {
+					// Prover is in some other state - cannot join
+					return false, errors.Wrap(
+						errors.New("prover already exists in non-left state"),
+						"verify",
+					)
+				}
 			}
 		}
 	}
