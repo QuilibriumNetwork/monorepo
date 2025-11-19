@@ -52,7 +52,8 @@ message NodeInfoResponse {
   uint64 peer_score = 2;
   bytes version = 3;
   bytes peer_seniority = 4;
-  uint32 workers = 5;
+  uint32 running_workers = 5;
+  uint32 allocated_workers = 6;
 }
 
 message WorkerInfo {

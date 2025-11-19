@@ -11,16 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
-	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
-
-type mockSizer struct {
-	n *big.Int
-}
-
-func (m *mockSizer) GetSize(_ *tries.ShardKey, _ []int) *big.Int {
-	return new(big.Int).Set(m.n)
-}
 
 type mockWorkerManager struct {
 	workers        []*store.WorkerInfo
@@ -82,10 +73,9 @@ func (m *mockWorkerManager) ProposeAllocations(workerIds []uint, filters [][]byt
 func newTestManager(t *testing.T, strategy Strategy, wm *mockWorkerManager) *Manager {
 	t.Helper()
 	logger := zap.NewNop()
-	world := &mockSizer{n: big.NewInt(1 << 30)} // 1 GB
 	const units = 8000000000
 
-	return NewManager(logger, world, nil, wm, units, strategy)
+	return NewManager(logger, nil, wm, units, strategy)
 }
 
 func createWorkers(n int) []*store.WorkerInfo {
@@ -130,7 +120,7 @@ func TestPlanAndAllocate_EqualScores_RandomizedWhenNotDataGreedy(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 
 		wm.lastFiltersHex = nil
-		_, err := m.PlanAndAllocate(100, shards, 1)
+		_, err := m.PlanAndAllocate(100, shards, 1, big.NewInt(40000))
 		if err != nil {
 			t.Fatalf("PlanAndAllocate failed: %v", err)
 		}
@@ -165,7 +155,7 @@ func TestPlanAndAllocate_EqualSizes_DeterministicWhenDataGreedy(t *testing.T) {
 	const runs = 16
 	for i := 0; i < runs; i++ {
 		wm.lastFiltersHex = nil
-		_, err := m.PlanAndAllocate(100, shards, 1)
+		_, err := m.PlanAndAllocate(100, shards, 1, big.NewInt(40000))
 		if err != nil {
 			t.Fatalf("PlanAndAllocate failed: %v", err)
 		}
@@ -188,7 +178,7 @@ func TestPlanAndAllocate_UnequalScores_PicksMax(t *testing.T) {
 	other2 := createShard([]byte{0x02}, 50_000, 0, 1)
 	shards := []ShardDescriptor{other1, other2, best}
 
-	_, err := m.PlanAndAllocate(100, shards, 1)
+	_, err := m.PlanAndAllocate(100, shards, 1, big.NewInt(300000))
 	if err != nil {
 		t.Fatalf("PlanAndAllocate failed: %v", err)
 	}
@@ -211,7 +201,7 @@ func TestDecideJoins_ConfirmWhenBest_RewardGreedy(t *testing.T) {
 	}
 	pending := [][]byte{mustDecodeHex(t, "02")}
 
-	err := m.DecideJoins(100, shards, pending)
+	err := m.DecideJoins(100, shards, pending, big.NewInt(300000))
 	if err != nil {
 		t.Fatalf("DecideJoins error: %v", err)
 	}
@@ -230,7 +220,7 @@ func TestDecideJoins_RejectWhenBetterExists_RewardGreedy(t *testing.T) {
 	}
 	pending := [][]byte{mustDecodeHex(t, "01")}
 
-	err := m.DecideJoins(100, shards, pending)
+	err := m.DecideJoins(100, shards, pending, big.NewInt(250000))
 	if err != nil {
 		t.Fatalf("DecideJoins error: %v", err)
 	}
@@ -251,7 +241,7 @@ func TestDecideJoins_TieConfirms_RewardGreedy(t *testing.T) {
 	}
 	pending := [][]byte{mustDecodeHex(t, "02")}
 
-	err := m.DecideJoins(100, shards, pending)
+	err := m.DecideJoins(100, shards, pending, big.NewInt(200000))
 	if err != nil {
 		t.Fatalf("DecideJoins error: %v", err)
 	}
@@ -270,7 +260,7 @@ func TestDecideJoins_DataGreedy_SizeOnly(t *testing.T) {
 	}
 	// Pending on aa (worse), bb (best), cc (tie-best)
 	pending := [][]byte{mustDecodeHex(t, "aa"), mustDecodeHex(t, "bb"), mustDecodeHex(t, "cc")}
-	err := m.DecideJoins(100, shards, pending)
+	err := m.DecideJoins(100, shards, pending, big.NewInt(170000))
 	if err != nil {
 		t.Fatalf("DecideJoins error: %v", err)
 	}
@@ -290,7 +280,7 @@ func TestDecideJoins_PendingMissingOrInvalid_Reject(t *testing.T) {
 	}
 	pending := [][]byte{mustDecodeHex(t, "deadbeef"), nil, {}}
 
-	err := m.DecideJoins(100, shards, pending)
+	err := m.DecideJoins(100, shards, pending, big.NewInt(100000))
 	if err != nil {
 		t.Fatalf("DecideJoins error: %v", err)
 	}

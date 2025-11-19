@@ -657,7 +657,8 @@ func printNodeInfo(logger *zap.Logger, cfg *config.Config) {
 	fmt.Println("Seniority: " + new(big.Int).SetBytes(
 		nodeInfo.PeerSeniority,
 	).String())
-	fmt.Println("Active Workers:", nodeInfo.Workers)
+	fmt.Println("Running Workers:", nodeInfo.RunningWorkers)
+	fmt.Println("Active Workers:", nodeInfo.AllocatedWorkers)
 }
 
 func printPeerInfo(logger *zap.Logger, cfg *config.Config) {

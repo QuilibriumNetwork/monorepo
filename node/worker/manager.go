@@ -87,19 +87,163 @@ func NewWorkerManager(
 	}
 }
 
+func (w *WorkerManager) isStarted() bool {
+	w.mu.RLock()
+	started := w.started
+	w.mu.RUnlock()
+	return started
+}
+
+func (w *WorkerManager) resetWorkerCaches() {
+	w.mu.Lock()
+	w.workersByFilter = make(map[string]uint)
+	w.filtersByWorker = make(map[uint][]byte)
+	w.allocatedWorkers = make(map[uint]bool)
+	w.mu.Unlock()
+}
+
+func (w *WorkerManager) setWorkerFilterMapping(
+	coreID uint,
+	filter []byte,
+) {
+	w.mu.Lock()
+	if previous, ok := w.filtersByWorker[coreID]; ok {
+		if len(previous) > 0 {
+			delete(w.workersByFilter, string(previous))
+		}
+	}
+	if len(filter) > 0 {
+		w.workersByFilter[string(filter)] = coreID
+	}
+	w.filtersByWorker[coreID] = filter
+	w.mu.Unlock()
+}
+
+func (w *WorkerManager) setWorkerAllocation(coreID uint, allocated bool) {
+	w.mu.Lock()
+	if allocated {
+		w.allocatedWorkers[coreID] = true
+	} else {
+		delete(w.allocatedWorkers, coreID)
+	}
+	w.mu.Unlock()
+}
+
+func (w *WorkerManager) getServiceClient(coreID uint) (
+	*grpc.ClientConn,
+	bool,
+) {
+	w.mu.RLock()
+	client, ok := w.serviceClients[coreID]
+	w.mu.RUnlock()
+	return client, ok
+}
+
+func (w *WorkerManager) setServiceClient(
+	coreID uint,
+	client *grpc.ClientConn,
+) {
+	w.mu.Lock()
+	w.serviceClients[coreID] = client
+	w.mu.Unlock()
+}
+
+func (w *WorkerManager) deleteServiceClient(coreID uint) {
+	w.mu.Lock()
+	delete(w.serviceClients, coreID)
+	w.mu.Unlock()
+}
+
+func (w *WorkerManager) copyServiceClients() map[uint]*grpc.ClientConn {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	out := make(map[uint]*grpc.ClientConn, len(w.serviceClients))
+	for id, client := range w.serviceClients {
+		out[id] = client
+	}
+	return out
+}
+
+func (w *WorkerManager) currentContext() context.Context {
+	w.mu.RLock()
+	ctx := w.ctx
+	w.mu.RUnlock()
+	return ctx
+}
+
+func (w *WorkerManager) purgeWorkerFromCache(
+	coreID uint,
+	filter []byte,
+) {
+	w.mu.Lock()
+	delete(w.filtersByWorker, coreID)
+	delete(w.allocatedWorkers, coreID)
+	if len(filter) > 0 {
+		delete(w.workersByFilter, string(filter))
+	}
+	w.mu.Unlock()
+}
+
+func (w *WorkerManager) closeServiceClient(coreID uint) {
+	client, ok := w.getServiceClient(coreID)
+	if !ok {
+		return
+	}
+	_ = client.Close()
+	w.deleteServiceClient(coreID)
+}
+
+func (w *WorkerManager) setDataWorkers(size int) {
+	w.mu.Lock()
+	w.dataWorkers = make([]*exec.Cmd, size)
+	w.mu.Unlock()
+}
+
+func (w *WorkerManager) updateDataWorker(
+	index int,
+	cmd *exec.Cmd,
+) {
+	w.mu.Lock()
+	if index >= 0 && index < len(w.dataWorkers) {
+		w.dataWorkers[index] = cmd
+	}
+	w.mu.Unlock()
+}
+
+func (w *WorkerManager) getDataWorker(index int) *exec.Cmd {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if index >= 0 && index < len(w.dataWorkers) {
+		return w.dataWorkers[index]
+	}
+	return nil
+}
+
+func (w *WorkerManager) dataWorkerLen() int {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return len(w.dataWorkers)
+}
+
+func (w *WorkerManager) hasWorkerFilter(coreID uint) bool {
+	w.mu.RLock()
+	_, ok := w.filtersByWorker[coreID]
+	w.mu.RUnlock()
+	return ok
+}
+
 func (w *WorkerManager) Start(ctx context.Context) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
 	if w.started {
+		w.mu.Unlock()
 		return errors.New("worker manager already started")
 	}
 
 	w.logger.Info("starting worker manager")
 
 	w.ctx, w.cancel = context.WithCancel(ctx)
-
 	w.started = true
+	w.mu.Unlock()
 
 	go w.spawnDataWorkers()
 
@@ -115,26 +259,28 @@ func (w *WorkerManager) Start(ctx context.Context) error {
 
 func (w *WorkerManager) Stop() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	if !w.started {
+		w.mu.Unlock()
 		return errors.New("worker manager not started")
 	}
 
 	w.logger.Info("stopping worker manager")
 
-	if w.cancel != nil {
-		w.cancel()
+	cancel := w.cancel
+	w.cancel = nil
+	w.ctx = nil
+	w.started = false
+	w.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
 	}
 
 	w.stopDataWorkers()
 
 	// Clear in-memory caches
-	w.workersByFilter = make(map[string]uint)
-	w.filtersByWorker = make(map[uint][]byte)
-	w.allocatedWorkers = make(map[uint]bool)
-
-	w.started = false
+	w.resetWorkerCaches()
 
 	// Reset metrics
 	activeWorkersGauge.Set(0)
@@ -151,14 +297,11 @@ func (w *WorkerManager) RegisterWorker(info *typesStore.WorkerInfo) error {
 	)
 	defer timer.ObserveDuration()
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
 	return w.registerWorker(info)
 }
 
 func (w *WorkerManager) registerWorker(info *typesStore.WorkerInfo) error {
-	if !w.started {
+	if !w.isStarted() {
 		workerOperationsTotal.WithLabelValues("register", "error").Inc()
 		return errors.New("worker manager not started")
 	}
@@ -189,11 +332,7 @@ func (w *WorkerManager) registerWorker(info *typesStore.WorkerInfo) error {
 	}
 
 	// Update in-memory cache
-	if len(info.Filter) > 0 {
-		filterKey := string(info.Filter)
-		w.workersByFilter[filterKey] = info.CoreId
-	}
-	w.filtersByWorker[info.CoreId] = info.Filter
+	w.setWorkerFilterMapping(info.CoreId, info.Filter)
 
 	// Update metrics
 	activeWorkersGauge.Inc()
@@ -214,10 +353,7 @@ func (w *WorkerManager) AllocateWorker(coreId uint, filter []byte) error {
 	)
 	defer timer.ObserveDuration()
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if !w.started {
+	if !w.isStarted() {
 		workerOperationsTotal.WithLabelValues("allocate", "error").Inc()
 		return errors.Wrap(
 			errors.New("worker manager not started"),
@@ -251,10 +387,6 @@ func (w *WorkerManager) AllocateWorker(coreId uint, filter []byte) error {
 
 	// Update worker filter if provided
 	if len(filter) > 0 && string(worker.Filter) != string(filter) {
-		// Remove old filter mapping from cache
-		if len(worker.Filter) > 0 {
-			delete(w.workersByFilter, string(worker.Filter))
-		}
 		worker.Filter = filter
 	}
 
@@ -280,10 +412,8 @@ func (w *WorkerManager) AllocateWorker(coreId uint, filter []byte) error {
 	}
 
 	// Update cache
-	if len(worker.Filter) > 0 {
-		filterKey := string(worker.Filter)
-		w.workersByFilter[filterKey] = coreId
-	}
+	w.setWorkerFilterMapping(coreId, worker.Filter)
+	w.setWorkerAllocation(coreId, true)
 
 	// Refresh worker
 	svc, err := w.getIPCOfWorker(coreId)
@@ -292,16 +422,14 @@ func (w *WorkerManager) AllocateWorker(coreId uint, filter []byte) error {
 		return errors.Wrap(err, "allocate worker")
 	}
 
-	_, err = svc.Respawn(w.ctx, &protobufs.RespawnRequest{
+	ctx := w.currentContext()
+	_, err = svc.Respawn(ctx, &protobufs.RespawnRequest{
 		Filter: worker.Filter,
 	})
 	if err != nil {
 		w.logger.Error("could not respawn worker", zap.Error(err))
 		return errors.Wrap(err, "allocate worker")
 	}
-
-	w.filtersByWorker[coreId] = worker.Filter
-	w.allocatedWorkers[coreId] = true
 
 	// Update metrics
 	allocatedWorkersGauge.Inc()
@@ -317,10 +445,7 @@ func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 	)
 	defer timer.ObserveDuration()
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if !w.started {
+	if !w.isStarted() {
 		workerOperationsTotal.WithLabelValues("deallocate", "error").Inc()
 		return errors.Wrap(
 			errors.New("worker manager not started"),
@@ -377,7 +502,8 @@ func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 		return errors.Wrap(err, "allocate worker")
 	}
 
-	_, err = svc.Respawn(w.ctx, &protobufs.RespawnRequest{
+	ctx := w.currentContext()
+	_, err = svc.Respawn(ctx, &protobufs.RespawnRequest{
 		Filter: []byte{},
 	})
 	if err != nil {
@@ -386,7 +512,7 @@ func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 	}
 
 	// Mark as deallocated in cache
-	delete(w.allocatedWorkers, coreId)
+	w.setWorkerAllocation(coreId, false)
 
 	// Update metrics
 	allocatedWorkersGauge.Dec()
@@ -402,10 +528,7 @@ func (w *WorkerManager) GetWorkerIdByFilter(filter []byte) (uint, error) {
 	)
 	defer timer.ObserveDuration()
 
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
-	if !w.started {
+	if !w.isStarted() {
 		return 0, errors.Wrap(
 			errors.New("worker manager not started"),
 			"get worker id by filter",
@@ -421,7 +544,10 @@ func (w *WorkerManager) GetWorkerIdByFilter(filter []byte) (uint, error) {
 
 	// Check in-memory cache first
 	filterKey := string(filter)
-	if coreId, exists := w.workersByFilter[filterKey]; exists {
+	w.mu.RLock()
+	coreId, exists := w.workersByFilter[filterKey]
+	w.mu.RUnlock()
+	if exists {
 		return coreId, nil
 	}
 
@@ -446,10 +572,7 @@ func (w *WorkerManager) GetFilterByWorkerId(coreId uint) ([]byte, error) {
 	)
 	defer timer.ObserveDuration()
 
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
-	if !w.started {
+	if !w.isStarted() {
 		return nil, errors.Wrap(
 			errors.New("worker manager not started"),
 			"get filter by worker id",
@@ -457,7 +580,10 @@ func (w *WorkerManager) GetFilterByWorkerId(coreId uint) ([]byte, error) {
 	}
 
 	// Check in-memory cache first
-	if filter, exists := w.filtersByWorker[coreId]; exists {
+	w.mu.RLock()
+	filter, exists := w.filtersByWorker[coreId]
+	w.mu.RUnlock()
+	if exists {
 		return filter, nil
 	}
 
@@ -477,9 +603,6 @@ func (w *WorkerManager) GetFilterByWorkerId(coreId uint) ([]byte, error) {
 }
 
 func (w *WorkerManager) RangeWorkers() ([]*typesStore.WorkerInfo, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
 	workers, err := w.store.RangeWorkers()
 	if err != nil {
 		return nil, err
@@ -487,7 +610,7 @@ func (w *WorkerManager) RangeWorkers() ([]*typesStore.WorkerInfo, error) {
 
 	if len(workers) != int(w.config.Engine.DataWorkerCount) {
 		for i := uint(1); i <= uint(w.config.Engine.DataWorkerCount); i++ {
-			if _, ok := w.serviceClients[i]; ok {
+			if _, ok := w.getServiceClient(i); ok {
 				continue
 			}
 			if _, err := w.getIPCOfWorker(i); err != nil {
@@ -520,7 +643,7 @@ func (w *WorkerManager) ProposeAllocations(
 			return errors.Wrap(err, "allocate worker")
 		}
 	}
-	return w.proposeFunc(coreIds, filters, w.serviceClients)
+	return w.proposeFunc(coreIds, filters, w.copyServiceClients())
 }
 
 // DecideAllocations invokes a deciding function set by the parent of the
@@ -592,15 +715,8 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 				)
 			}
 
-			if client, ok := w.serviceClients[worker.CoreId]; ok {
-				_ = client.Close()
-				delete(w.serviceClients, worker.CoreId)
-			}
-			delete(w.filtersByWorker, worker.CoreId)
-			delete(w.allocatedWorkers, worker.CoreId)
-			if len(worker.Filter) > 0 {
-				delete(w.workersByFilter, string(worker.Filter))
-			}
+			w.closeServiceClient(worker.CoreId)
+			w.purgeWorkerFromCache(worker.CoreId, worker.Filter)
 		}
 
 		workers, err = w.store.RangeWorkers()
@@ -613,14 +729,12 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 	var allocatedCount int
 	for _, worker := range workers {
 		// Update cache
-		if len(worker.Filter) > 0 {
-			filterKey := string(worker.Filter)
-			w.workersByFilter[filterKey] = worker.CoreId
-		}
-		w.filtersByWorker[worker.CoreId] = worker.Filter
+		w.setWorkerFilterMapping(worker.CoreId, worker.Filter)
 		if worker.Allocated {
-			w.allocatedWorkers[worker.CoreId] = true
+			w.setWorkerAllocation(worker.CoreId, true)
 			allocatedCount++
+		} else {
+			w.setWorkerAllocation(worker.CoreId, false)
 		}
 		totalStorage += uint64(worker.TotalStorage)
 		svc, err := w.getIPCOfWorker(worker.CoreId)
@@ -629,7 +743,8 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 			continue
 		}
 
-		_, err = svc.Respawn(w.ctx, &protobufs.RespawnRequest{
+		ctx := w.currentContext()
+		_, err = svc.Respawn(ctx, &protobufs.RespawnRequest{
 			Filter: worker.Filter,
 		})
 		if err != nil {
@@ -689,86 +804,85 @@ func (w *WorkerManager) getIPCOfWorker(coreId uint) (
 	protobufs.DataIPCServiceClient,
 	error,
 ) {
-	client, ok := w.serviceClients[coreId]
-	if !ok {
-		w.logger.Info("reconnecting to worker", zap.Uint("core_id", coreId))
-		addr, err := w.getMultiaddrOfWorker(coreId)
-		if err != nil {
-			return nil, errors.Wrap(err, "get ipc of worker")
-		}
-
-		mga, err := mn.ToNetAddr(addr)
-		if err != nil {
-			return nil, errors.Wrap(err, "get ipc of worker")
-		}
-
-		peerPrivKey, err := hex.DecodeString(w.config.P2P.PeerPrivKey)
-		if err != nil {
-			w.logger.Error("error unmarshaling peerkey", zap.Error(err))
-			return nil, errors.Wrap(err, "get ipc of worker")
-		}
-
-		if _, ok := w.filtersByWorker[coreId]; !ok {
-			p2pAddr, err := w.getP2PMultiaddrOfWorker(coreId)
-			if err != nil {
-				return nil, errors.Wrap(err, "get ipc of worker")
-			}
-			err = w.registerWorker(&typesStore.WorkerInfo{
-				CoreId:                coreId,
-				ListenMultiaddr:       p2pAddr.String(),
-				StreamListenMultiaddr: addr.String(),
-				Filter:                nil,
-				TotalStorage:          0,
-				Automatic:             len(w.config.Engine.DataWorkerP2PMultiaddrs) == 0,
-				Allocated:             false,
-			})
-			if err != nil {
-				return nil, errors.Wrap(err, "get ipc of worker")
-			}
-		}
-
-		privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)
-		if err != nil {
-			w.logger.Error("error unmarshaling peerkey", zap.Error(err))
-			return nil, errors.Wrap(err, "get ipc of worker")
-		}
-
-		pub := privKey.GetPublic()
-		id, err := peer.IDFromPublicKey(pub)
-		if err != nil {
-			w.logger.Error("error unmarshaling peerkey", zap.Error(err))
-			return nil, errors.Wrap(err, "get ipc of worker")
-		}
-
-		creds, err := p2p.NewPeerAuthenticator(
-			w.logger,
-			w.config.P2P,
-			nil,
-			nil,
-			nil,
-			nil,
-			[][]byte{[]byte(id)},
-			map[string]channel.AllowedPeerPolicyType{
-				"quilibrium.node.node.pb.DataIPCService": channel.OnlySelfPeer,
-			},
-			map[string]channel.AllowedPeerPolicyType{},
-		).CreateClientTLSCredentials([]byte(id))
-		if err != nil {
-			return nil, errors.Wrap(err, "get ipc of worker")
-		}
-
-		client, err = grpc.NewClient(
-			mga.String(),
-			grpc.WithTransportCredentials(creds),
-		)
-		if err != nil {
-
-			return nil, errors.Wrap(err, "get ipc of worker")
-		}
-
-		w.serviceClients[coreId] = client
+	if client, ok := w.getServiceClient(coreId); ok {
+		return protobufs.NewDataIPCServiceClient(client), nil
 	}
 
+	w.logger.Info("reconnecting to worker", zap.Uint("core_id", coreId))
+	addr, err := w.getMultiaddrOfWorker(coreId)
+	if err != nil {
+		return nil, errors.Wrap(err, "get ipc of worker")
+	}
+
+	mga, err := mn.ToNetAddr(addr)
+	if err != nil {
+		return nil, errors.Wrap(err, "get ipc of worker")
+	}
+
+	peerPrivKey, err := hex.DecodeString(w.config.P2P.PeerPrivKey)
+	if err != nil {
+		w.logger.Error("error unmarshaling peerkey", zap.Error(err))
+		return nil, errors.Wrap(err, "get ipc of worker")
+	}
+
+	if !w.hasWorkerFilter(coreId) {
+		p2pAddr, err := w.getP2PMultiaddrOfWorker(coreId)
+		if err != nil {
+			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+		err = w.registerWorker(&typesStore.WorkerInfo{
+			CoreId:                coreId,
+			ListenMultiaddr:       p2pAddr.String(),
+			StreamListenMultiaddr: addr.String(),
+			Filter:                nil,
+			TotalStorage:          0,
+			Automatic:             len(w.config.Engine.DataWorkerP2PMultiaddrs) == 0,
+			Allocated:             false,
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+	}
+
+	privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)
+	if err != nil {
+		w.logger.Error("error unmarshaling peerkey", zap.Error(err))
+		return nil, errors.Wrap(err, "get ipc of worker")
+	}
+
+	pub := privKey.GetPublic()
+	id, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		w.logger.Error("error unmarshaling peerkey", zap.Error(err))
+		return nil, errors.Wrap(err, "get ipc of worker")
+	}
+
+	creds, err := p2p.NewPeerAuthenticator(
+		w.logger,
+		w.config.P2P,
+		nil,
+		nil,
+		nil,
+		nil,
+		[][]byte{[]byte(id)},
+		map[string]channel.AllowedPeerPolicyType{
+			"quilibrium.node.node.pb.DataIPCService": channel.OnlySelfPeer,
+		},
+		map[string]channel.AllowedPeerPolicyType{},
+	).CreateClientTLSCredentials([]byte(id))
+	if err != nil {
+		return nil, errors.Wrap(err, "get ipc of worker")
+	}
+
+	client, err := grpc.NewClient(
+		mga.String(),
+		grpc.WithTransportCredentials(creds),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get ipc of worker")
+	}
+
+	w.setServiceClient(coreId, client)
 	return protobufs.NewDataIPCServiceClient(client), nil
 }
 
@@ -785,7 +899,7 @@ func (w *WorkerManager) spawnDataWorkers() {
 		w.logger.Panic("failed to get executable path", zap.Error(err))
 	}
 
-	w.dataWorkers = make([]*exec.Cmd, w.config.Engine.DataWorkerCount)
+	w.setDataWorkers(w.config.Engine.DataWorkerCount)
 	w.logger.Info(
 		"spawning data workers",
 		zap.Int("count", w.config.Engine.DataWorkerCount),
@@ -794,7 +908,7 @@ func (w *WorkerManager) spawnDataWorkers() {
 	for i := 1; i <= w.config.Engine.DataWorkerCount; i++ {
 		i := i
 		go func() {
-			for w.started {
+			for w.isStarted() {
 				args := []string{
 					fmt.Sprintf("--core=%d", i),
 					fmt.Sprintf("--parent-process=%d", os.Getpid()),
@@ -812,7 +926,7 @@ func (w *WorkerManager) spawnDataWorkers() {
 					)
 				}
 
-				w.dataWorkers[i-1] = cmd
+				w.updateDataWorker(i-1, cmd)
 				cmd.Wait()
 				time.Sleep(25 * time.Millisecond)
 				w.logger.Info(
@@ -825,12 +939,16 @@ func (w *WorkerManager) spawnDataWorkers() {
 }
 
 func (w *WorkerManager) stopDataWorkers() {
-	for i := 0; i < len(w.dataWorkers); i++ {
-		err := w.dataWorkers[i].Process.Signal(syscall.SIGTERM)
+	for i := 0; i < w.dataWorkerLen(); i++ {
+		cmd := w.getDataWorker(i)
+		if cmd == nil || cmd.Process == nil {
+			continue
+		}
+		err := cmd.Process.Signal(syscall.SIGTERM)
 		if err != nil {
 			w.logger.Info(
 				"unable to stop worker",
-				zap.Int("pid", w.dataWorkers[i].Process.Pid),
+				zap.Int("pid", cmd.Process.Pid),
 				zap.Error(err),
 			)
 		}

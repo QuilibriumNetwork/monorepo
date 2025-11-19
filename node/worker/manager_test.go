@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -29,6 +30,7 @@ type mockWorkerStore struct {
 	workers         map[uint]*typesStore.WorkerInfo
 	workersByFilter map[string]*typesStore.WorkerInfo
 	transactions    []mockTransaction
+	mu              sync.Mutex
 }
 
 type mockTransaction struct {
@@ -57,6 +59,8 @@ func (m *mockWorkerStore) NewTransaction(indexed bool) (typesStore.Transaction, 
 }
 
 func (m *mockWorkerStore) GetWorker(coreId uint) (*typesStore.WorkerInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	worker, exists := m.workers[coreId]
 	if !exists {
 		return nil, store.ErrNotFound
@@ -67,6 +71,8 @@ func (m *mockWorkerStore) GetWorker(coreId uint) (*typesStore.WorkerInfo, error)
 }
 
 func (m *mockWorkerStore) GetWorkerByFilter(filter []byte) (*typesStore.WorkerInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if len(filter) == 0 {
 		return nil, errors.New("filter cannot be empty")
 	}
@@ -78,6 +84,8 @@ func (m *mockWorkerStore) GetWorkerByFilter(filter []byte) (*typesStore.WorkerIn
 }
 
 func (m *mockWorkerStore) PutWorker(txn typesStore.Transaction, worker *typesStore.WorkerInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	// Check if worker already exists to clean up old filter index
 	if existingWorker, exists := m.workers[worker.CoreId]; exists {
 		if len(existingWorker.Filter) > 0 &&
@@ -94,6 +102,8 @@ func (m *mockWorkerStore) PutWorker(txn typesStore.Transaction, worker *typesSto
 }
 
 func (m *mockWorkerStore) DeleteWorker(txn typesStore.Transaction, coreId uint) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	worker, exists := m.workers[coreId]
 	if !exists {
 		return store.ErrNotFound
@@ -106,6 +116,8 @@ func (m *mockWorkerStore) DeleteWorker(txn typesStore.Transaction, coreId uint) 
 }
 
 func (m *mockWorkerStore) RangeWorkers() ([]*typesStore.WorkerInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var workers []*typesStore.WorkerInfo
 	for _, worker := range m.workers {
 		workers = append(workers, worker)
@@ -455,7 +467,7 @@ func TestWorkerManager_LoadWorkersOnStart(t *testing.T) {
 	store.workersByFilter[string(worker2.Filter)] = worker2
 
 	// Create manager and start it
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{DataWorkerCount: 2}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 	ctx := context.Background()
 	err := manager.Start(ctx)
 	require.NoError(t, err)
