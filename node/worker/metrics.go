@@ -55,4 +55,13 @@ var (
 		},
 		[]string{"operation"}, // operation: register/allocate/deallocate/lookup
 	)
+
+	availableStorageGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "quilibrium",
+			Subsystem: "worker_manager",
+			Name:      "available_storage_bytes",
+			Help:      "Aggregated available storage (bytes) across workers as estimated by the manager",
+		},
+	)
 )

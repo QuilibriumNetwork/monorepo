@@ -6,6 +6,7 @@ type WorkerInfo struct {
 	StreamListenMultiaddr string
 	Filter                []byte
 	TotalStorage          uint
+	AvailableStorage      uint
 	Automatic             bool
 	Allocated             bool
 }

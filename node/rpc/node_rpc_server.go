@@ -224,10 +224,9 @@ func (r *RPCServer) GetWorkerInfo(
 	info := []*protobufs.WorkerInfo{}
 	for _, worker := range workers {
 		info = append(info, &protobufs.WorkerInfo{
-			CoreId: uint32(worker.CoreId),
-			Filter: worker.Filter,
-			// TODO(2.1.1+): Expose available storage
-			AvailableStorage: uint64(worker.TotalStorage),
+			CoreId:           uint32(worker.CoreId),
+			Filter:           worker.Filter,
+			AvailableStorage: uint64(worker.AvailableStorage),
 			TotalStorage:     uint64(worker.TotalStorage),
 		})
 	}

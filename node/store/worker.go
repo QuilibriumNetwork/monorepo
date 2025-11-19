@@ -190,9 +190,9 @@ func encodeWorkerInfo(worker *store.WorkerInfo) ([]byte, error) {
 	streamListenMultiaddrLen := uint16(len(worker.StreamListenMultiaddr))
 	filterLen := uint16(len(worker.Filter))
 
-	// totalLen = coreId(8) + totalStorage(8) + automatic(1) + allocated(1)
+	// totalLen = coreId(8) + totalStorage(8) + availableStorage(8) + automatic(1) + allocated(1)
 	//   + 2 + listen + 2 + stream + 2 + filter
-	totalLen := 8 + 8 + 1 + 1 + 2 + int(listenMultiaddrLen) + 2 +
+	totalLen := 8 + 8 + 8 + 1 + 1 + 2 + int(listenMultiaddrLen) + 2 +
 		int(streamListenMultiaddrLen) + 2 + int(filterLen)
 	data := make([]byte, totalLen)
 
@@ -201,6 +201,9 @@ func encodeWorkerInfo(worker *store.WorkerInfo) ([]byte, error) {
 	offset += 8
 
 	binary.BigEndian.PutUint64(data[offset:], uint64(worker.TotalStorage))
+	offset += 8
+
+	binary.BigEndian.PutUint64(data[offset:], uint64(worker.AvailableStorage))
 	offset += 8
 
 	if worker.Automatic {
@@ -251,6 +254,15 @@ func decodeWorkerInfo(data []byte) (*store.WorkerInfo, error) {
 	}
 	totalStorage := binary.BigEndian.Uint64(data[offset:])
 	offset += 8
+
+	var availableStorage uint64
+	// Backwards compatibility
+	if offset+8 <= len(data) {
+		availableStorage = binary.BigEndian.Uint64(data[offset:])
+		offset += 8
+	} else {
+		availableStorage = totalStorage
+	}
 
 	if offset+1 > len(data) {
 		return nil, errors.New("truncated automatic flag")
@@ -312,6 +324,7 @@ func decodeWorkerInfo(data []byte) (*store.WorkerInfo, error) {
 		StreamListenMultiaddr: streamListenMultiaddr,
 		Filter:                filter,
 		TotalStorage:          uint(totalStorage),
+		AvailableStorage:      uint(availableStorage),
 		Automatic:             automatic,
 		Allocated:             allocated,
 	}, nil

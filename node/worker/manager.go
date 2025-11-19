@@ -52,6 +52,12 @@ type WorkerManager struct {
 	// IPC service clients
 	serviceClients map[uint]*grpc.ClientConn
 
+	// Reconciler configuration (partition estimate)
+	reconcilerInterval      time.Duration
+	reconcilerBufferBytes   uint64
+	reconcilerBufferPercent float64
+	reconcilerStatPath      string
+
 	// In-memory cache for quick lookups
 	workersByFilter  map[string]uint // filter hash -> worker id
 	filtersByWorker  map[uint][]byte // worker id -> filter
@@ -75,15 +81,16 @@ func NewWorkerManager(
 	) error,
 ) typesWorker.WorkerManager {
 	return &WorkerManager{
-		store:            store,
-		logger:           logger.Named("worker_manager"),
-		workersByFilter:  make(map[string]uint),
-		filtersByWorker:  make(map[uint][]byte),
-		allocatedWorkers: make(map[uint]bool),
-		serviceClients:   make(map[uint]*grpc.ClientConn),
-		config:           config,
-		proposeFunc:      proposeFunc,
-		decideFunc:       decideFunc,
+		store:              store,
+		logger:             logger.Named("worker_manager"),
+		workersByFilter:    make(map[string]uint),
+		filtersByWorker:    make(map[uint][]byte),
+		allocatedWorkers:   make(map[uint]bool),
+		serviceClients:     make(map[uint]*grpc.ClientConn),
+		config:             config,
+		proposeFunc:        proposeFunc,
+		decideFunc:         decideFunc,
+		reconcilerStatPath: config.DB.Path,
 	}
 }
 
@@ -108,6 +115,8 @@ func (w *WorkerManager) Start(ctx context.Context) error {
 		w.logger.Error("failed to load workers from store", zap.Error(err))
 		return errors.Wrap(err, "start")
 	}
+
+	w.startPartitionReconciler()
 
 	w.logger.Info("worker manager started successfully")
 	return nil
@@ -140,6 +149,7 @@ func (w *WorkerManager) Stop() error {
 	activeWorkersGauge.Set(0)
 	allocatedWorkersGauge.Set(0)
 	totalStorageGauge.Set(0)
+	availableStorageGauge.Set(0)
 
 	w.logger.Info("worker manager stopped")
 	return nil
@@ -719,6 +729,7 @@ func (w *WorkerManager) getIPCOfWorker(coreId uint) (
 				StreamListenMultiaddr: addr.String(),
 				Filter:                nil,
 				TotalStorage:          0,
+				AvailableStorage:      0,
 				Automatic:             len(w.config.Engine.DataWorkerP2PMultiaddrs) == 0,
 				Allocated:             false,
 			})
