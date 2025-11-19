@@ -24,6 +24,7 @@ import (
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
@@ -544,7 +545,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 					if bytes.Equal(allocation.ConfirmationFilter, bp) {
 						allocated = allocation.Status != 4
 						if e.config.P2P.Network != 0 ||
-							data.Frame.Header.FrameNumber > 255840 {
+							data.Frame.Header.FrameNumber > token.FRAME_2_1_EXTENDED_ENROLL_END {
 							e.logger.Info(
 								"checking pending status of allocation",
 								zap.Int("status", int(allocation.Status)),

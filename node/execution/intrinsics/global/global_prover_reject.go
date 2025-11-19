@@ -8,6 +8,7 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
@@ -476,7 +477,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 		joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
 
 		// Special case: if join was before frame 255840, can reject any time
-		if joinFrame >= 255840 {
+		if joinFrame >= token.FRAME_2_1_EXTENDED_ENROLL_END {
 			// Otherwise same timing constraints as confirm
 			framesSinceJoin := frameNumber - joinFrame
 			if framesSinceJoin > 720 {

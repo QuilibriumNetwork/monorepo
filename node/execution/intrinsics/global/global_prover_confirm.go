@@ -9,6 +9,7 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
@@ -498,8 +499,8 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
 
 		// Check timing constraints
-		if joinFrame < 255840 && joinFrame >= 244100 {
-			if frameNumber < 255840 {
+		if joinFrame < token.FRAME_2_1_EXTENDED_ENROLL_END && joinFrame >= 244100 {
+			if frameNumber < token.FRAME_2_1_EXTENDED_ENROLL_END {
 				// If joined before frame 255840, cannot confirm until frame 255840
 				return false, errors.Wrap(
 					errors.New("cannot confirm before frame 255840"),
@@ -510,8 +511,8 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 			// Set this to either 255840 - 360 or the raw join frame if higher than it
 			// so the provers before can immeidately join after the wait, those after
 			// still have the full 360.
-			if joinFrame < 252480 {
-				joinFrame = 252480
+			if joinFrame < (token.FRAME_2_1_EXTENDED_ENROLL_END - 360) {
+				joinFrame = (token.FRAME_2_1_EXTENDED_ENROLL_END - 360)
 			}
 		}
 
@@ -519,7 +520,8 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		// immediately, for joins after 255840, normal 360 frame wait applies.
 		// If the join frame precedes the genesis frame (e.g. not mainnet), we
 		// ignore the topic altogether
-		if joinFrame >= 252480 || joinFrame <= 244100 {
+		if joinFrame >= (token.FRAME_2_1_EXTENDED_ENROLL_END-360) ||
+			joinFrame <= 244100 {
 			framesSinceJoin := frameNumber - joinFrame
 			if framesSinceJoin < 360 {
 				return false, errors.Wrap(
