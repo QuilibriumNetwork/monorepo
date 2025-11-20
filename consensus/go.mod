@@ -14,17 +14,12 @@ replace github.com/libp2p/go-libp2p-kad-dht => ../go-libp2p-kad-dht
 
 replace source.quilibrium.com/quilibrium/monorepo/lifecycle => ../lifecycle
 
-require (
-	github.com/gammazero/workerpool v1.1.3
-	github.com/rs/zerolog v1.34.0
-)
+require github.com/gammazero/workerpool v1.1.3
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/gammazero/deque v0.2.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
-	github.com/mattn/go-colorable v0.1.13 // indirect
-	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	go.uber.org/goleak v1.3.0 // indirect
@@ -33,10 +28,8 @@ require (
 )
 
 require (
-	github.com/pkg/errors v0.9.1
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/atomic v1.11.0
 	golang.org/x/sync v0.17.0
-	golang.org/x/sys v0.33.0 // indirect
 	source.quilibrium.com/quilibrium/monorepo/lifecycle v0.0.0-00010101000000-000000000000
 )
