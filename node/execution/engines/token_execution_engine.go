@@ -578,6 +578,7 @@ func (e *TokenExecutionEngine) handleBundle(
 	}
 
 	responses := &execution.ProcessMessageResult{}
+	responses.State = state
 
 	// Process each operation in the bundle sequentially
 	for i, op := range bundle.Requests {
@@ -630,7 +631,7 @@ func (e *TokenExecutionEngine) handleBundle(
 			address,
 			op,
 			true,
-			state,
+			responses.State,
 		)
 		if err != nil {
 			return nil, errors.Wrapf(err, "handle bundle: operation %d failed", i)
@@ -638,7 +639,7 @@ func (e *TokenExecutionEngine) handleBundle(
 
 		// Collect responses
 		responses.Messages = append(responses.Messages, opResponses.Messages...)
-		responses.State = state
+		responses.State = opResponses.State
 	}
 
 	e.logger.Info(

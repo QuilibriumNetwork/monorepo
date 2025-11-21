@@ -346,6 +346,7 @@ func (e *GlobalExecutionEngine) handleBundle(
 	}
 
 	responses := &execution.ProcessMessageResult{}
+	responses.State = state
 
 	// Process each operation in the bundle sequentially
 	for i, op := range bundle.Requests {
@@ -356,7 +357,7 @@ func (e *GlobalExecutionEngine) handleBundle(
 			address,
 			op,
 			true,
-			state,
+			responses.State,
 		)
 		if err != nil {
 			// Skip non-global operations (e.g., token payments, compute ops)
@@ -370,7 +371,7 @@ func (e *GlobalExecutionEngine) handleBundle(
 
 		// Collect responses
 		responses.Messages = append(responses.Messages, opResponses.Messages...)
-		responses.State = state
+		responses.State = opResponses.State
 	}
 
 	e.logger.Info(

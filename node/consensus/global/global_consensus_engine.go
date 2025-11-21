@@ -22,6 +22,7 @@ import (
 	"github.com/mr-tron/base58"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
+	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	"golang.org/x/sync/errgroup"
@@ -46,9 +47,11 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/dispatch"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
+	tokenintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/manager"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
+	keyedaggregator "source.quilibrium.com/quilibrium/monorepo/node/keyedaggregator"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p/onion"
@@ -154,8 +157,8 @@ type GlobalConsensusEngine struct {
 	minimumProvers            func() uint64
 	blacklistMap              map[string]bool
 	blacklistMu               sync.RWMutex
-	pendingMessages           [][]byte
-	pendingMessagesMu         sync.RWMutex
+	messageCollectors         *keyedaggregator.SequencedCollectors[sequencedGlobalMessage]
+	messageAggregator         *keyedaggregator.SequencedAggregator[sequencedGlobalMessage]
 	currentDifficulty         uint32
 	currentDifficultyMu       sync.RWMutex
 	lastProvenFrameTime       time.Time
@@ -296,13 +299,16 @@ func NewGlobalConsensusEngine(
 		currentDifficulty:           config.Engine.Difficulty,
 		lastProvenFrameTime:         time.Now(),
 		blacklistMap:                make(map[string]bool),
-		pendingMessages:             [][]byte{},
 		peerInfoDigestCache:         make(map[string]struct{}),
 		keyRegistryDigestCache:      make(map[string]struct{}),
 		peerAuthCache:               make(map[string]time.Time),
 		alertPublicKey:              []byte{},
 		txLockMap:                   make(map[uint64]map[string]map[string]*LockedTransaction),
 		appShardCache:               make(map[string]*appShardCacheEntry),
+	}
+
+	if err := engine.initGlobalMessageAggregator(); err != nil {
+		return nil, err
 	}
 
 	if config.Engine.AlertKey != "" {
@@ -521,6 +527,7 @@ func NewGlobalConsensusEngine(
 	// Add execution engines
 	componentBuilder.AddWorker(engine.executionManager.Start)
 	componentBuilder.AddWorker(engine.globalTimeReel.Start)
+	componentBuilder.AddWorker(engine.startGlobalMessageAggregator)
 
 	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
 		latest, err := engine.consensusStore.GetConsensusState(nil)
@@ -845,6 +852,16 @@ func NewGlobalConsensusEngine(
 		ready()
 		engine.updateMetrics(ctx)
 	})
+
+	if !engine.config.Engine.ArchiveMode {
+		componentBuilder.AddWorker(func(
+			ctx lifecycle.SignalerContext,
+			ready lifecycle.ReadyFunc,
+		) {
+			ready()
+			engine.monitorNodeHealth(ctx)
+		})
+	}
 
 	// Start periodic tx lock pruning
 	componentBuilder.AddWorker(func(
@@ -2037,6 +2054,177 @@ func (e *GlobalConsensusEngine) pruneTxLocks() {
 	}
 }
 
+func (e *GlobalConsensusEngine) monitorNodeHealth(
+	ctx lifecycle.SignalerContext,
+) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	e.runNodeHealthCheck()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.runNodeHealthCheck()
+		}
+	}
+}
+
+func (e *GlobalConsensusEngine) runNodeHealthCheck() {
+	if e.workerManager == nil {
+		return
+	}
+
+	workers, err := e.workerManager.RangeWorkers()
+	if err != nil {
+		e.logger.Warn("node health check failed to load workers", zap.Error(err))
+		return
+	}
+
+	allocated := 0
+	for _, worker := range workers {
+		if worker.Allocated {
+			allocated++
+		}
+	}
+
+	baseFields := []zap.Field{
+		zap.Int("total_workers", len(workers)),
+		zap.Int("allocated_workers", allocated),
+	}
+
+	unreachable, err := e.workerManager.CheckWorkersConnected()
+	if err != nil {
+		e.logger.Warn(
+			"node health check could not verify worker connectivity",
+			append(baseFields, zap.Error(err))...,
+		)
+		return
+	}
+
+	if len(unreachable) != 0 {
+		unreachable64 := make([]uint64, len(unreachable))
+		for i, id := range unreachable {
+			unreachable64[i] = uint64(id)
+		}
+		e.logger.Warn(
+			"workers unreachable",
+			append(
+				baseFields,
+				zap.Uint64s("unreachable_workers", unreachable64),
+			)...,
+		)
+		return
+	}
+
+	headFrame, err := e.globalTimeReel.GetHead()
+	if err != nil {
+		e.logger.Warn(
+			"global head not yet available",
+			append(baseFields, zap.Error(err))...,
+		)
+		return
+	}
+	if headFrame == nil || headFrame.Header == nil {
+		e.logger.Warn("global head not yet available", baseFields...)
+		return
+	}
+
+	headTime := time.UnixMilli(headFrame.Header.Timestamp)
+	if time.Since(headTime) > time.Minute {
+		e.logger.Warn(
+			"latest frame is older than 60 seconds; node may still be synchronizing",
+			append(
+				baseFields,
+				zap.Uint64("head_frame_number", headFrame.Header.FrameNumber),
+				zap.Time("head_frame_time", headTime),
+			)...,
+		)
+		return
+	}
+
+	units, readable, err := e.getUnmintedRewardBalance()
+	if err != nil {
+		e.logger.Warn(
+			"unable to read prover reward balance",
+			append(baseFields, zap.Error(err))...,
+		)
+		return
+	}
+
+	e.logger.Info(
+		"node health check passed",
+		append(
+			baseFields,
+			zap.Uint64("head_frame_number", headFrame.Header.FrameNumber),
+			zap.Time("head_frame_time", headTime),
+			zap.String("unminted_reward_quil", readable),
+			zap.String("unminted_reward_raw_units", units.String()),
+		)...,
+	)
+}
+
+const rewardUnitsPerInterval int64 = 8_000_000_000
+
+func (e *GlobalConsensusEngine) getUnmintedRewardBalance() (
+	*big.Int,
+	string,
+	error,
+) {
+	rewardAddress, err := e.deriveRewardAddress()
+	if err != nil {
+		return nil, "", errors.Wrap(err, "derive reward address")
+	}
+
+	var vertexID [64]byte
+	copy(vertexID[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(vertexID[32:], rewardAddress)
+
+	tree, err := e.hypergraph.GetVertexData(vertexID)
+	if err != nil {
+		return big.NewInt(0), "0", nil
+	}
+	if tree == nil {
+		return big.NewInt(0), "0", nil
+	}
+
+	rdf := schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver)
+	balanceBytes, err := rdf.Get(
+		global.GLOBAL_RDF_SCHEMA,
+		"reward:ProverReward",
+		"Balance",
+		tree,
+	)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "read reward balance")
+	}
+
+	units := new(big.Int).SetBytes(balanceBytes)
+	rewardReadable := decimal.NewFromBigInt(units, 0).Div(
+		decimal.NewFromInt(rewardUnitsPerInterval),
+	).String()
+
+	return units, rewardReadable, nil
+}
+
+func (e *GlobalConsensusEngine) deriveRewardAddress() ([]byte, error) {
+	proverAddr := e.getProverAddress()
+	if len(proverAddr) == 0 {
+		return nil, errors.New("missing prover address")
+	}
+
+	hash, err := poseidon.HashBytes(
+		slices.Concat(tokenintrinsics.QUIL_TOKEN_ADDRESS[:], proverAddr),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return hash.FillBytes(make([]byte, 32)), nil
+}
+
 // validatePeerInfoSignature validates the signature of a peer info message
 func (e *GlobalConsensusEngine) validatePeerInfoSignature(
 	peerInfo *protobufs.PeerInfo,
@@ -3000,6 +3188,20 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 // OnRankChange implements consensus.Consumer.
 func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
 	e.currentRank = newRank
+
+	prior, err := e.clockStore.GetLatestGlobalClockFrame()
+	if err != nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return
+	}
+	_, err = e.livenessProvider.Collect(
+		context.TODO(),
+		prior.Header.FrameNumber+1,
+		newRank,
+	)
+	if err != nil {
+		return
+	}
 }
 
 // OnReceiveProposal implements consensus.Consumer.

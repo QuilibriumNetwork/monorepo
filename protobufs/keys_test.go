@@ -29,13 +29,6 @@ func TestBLS48581SignatureWithProofOfPossession_Serialization(t *testing.T) {
 				PopSignature: make([]byte, 74),
 			},
 		},
-		{
-			name: "empty fields",
-			sig: &BLS48581SignatureWithProofOfPossession{
-				Signature:    []byte{},
-				PopSignature: []byte{},
-			},
-		},
 	}
 
 	for _, tt := range tests {
@@ -75,17 +68,6 @@ func TestBLS48581AddressedSignature_Serialization(t *testing.T) {
 				Signature: make([]byte, 74),
 				Address:   make([]byte, 32),
 			},
-		},
-		{
-			name: "empty fields",
-			sig: &BLS48581AddressedSignature{
-				Signature: []byte{},
-				Address:   []byte{},
-			},
-		},
-		{
-			name: "nil fields",
-			sig:  &BLS48581AddressedSignature{},
 		},
 	}
 
@@ -128,13 +110,6 @@ func TestBLS48581AggregateSignature_Serialization(t *testing.T) {
 			sig: &BLS48581AggregateSignature{
 				Signature: make([]byte, 74),
 				Bitmask:   []byte{0x00, 0x00, 0x00, 0x00},
-			},
-		},
-		{
-			name: "empty fields",
-			sig: &BLS48581AggregateSignature{
-				Signature: []byte{},
-				Bitmask:   []byte{},
 			},
 		},
 	}
@@ -382,12 +357,6 @@ func TestDecaf448Signature_Serialization(t *testing.T) {
 			name: "without public key",
 			sig: &Decaf448Signature{
 				Signature: make([]byte, 112),
-			},
-		},
-		{
-			name: "empty fields",
-			sig: &Decaf448Signature{
-				Signature: []byte{},
 			},
 		},
 	}

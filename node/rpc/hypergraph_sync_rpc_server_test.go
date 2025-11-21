@@ -31,6 +31,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	application "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
+	crypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 	"source.quilibrium.com/quilibrium/monorepo/verenc"
 )
 
@@ -58,7 +59,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	data1 := enc.Encrypt(make([]byte, 20), pub)
 	verenc1 := data1[0].Compress()
 	vertices1 := make([]application.Vertex, numOperations)
-	dataTree1 := &tries.VectorCommitmentTree{}
+	dataTree1 := &crypto.VectorCommitmentTree{}
 	logger, _ := zap.NewDevelopment()
 	inclusionProver := bls48581.NewKZGInclusionProver(logger)
 	for _, d := range []application.Encrypted{verenc1} {
@@ -272,7 +273,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	}
 	time.Sleep(10 * time.Second)
 	str.CloseSend()
-	leaves := tries.CompareLeaves(
+	leaves := crypto.CompareLeaves(
 		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 	)
@@ -297,7 +298,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
 		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
 	) {
-		leaves := tries.CompareLeaves(
+		leaves := crypto.CompareLeaves(
 			crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 			crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 		)
@@ -330,7 +331,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 	data1 := enc.Encrypt(make([]byte, 20), pub)
 	verenc1 := data1[0].Compress()
 	vertices1 := make([]application.Vertex, numOperations)
-	dataTree1 := &tries.VectorCommitmentTree{}
+	dataTree1 := &crypto.VectorCommitmentTree{}
 	logger, _ := zap.NewDevelopment()
 	inclusionProver := bls48581.NewKZGInclusionProver(logger)
 	domain := make([]byte, 32)
@@ -627,7 +628,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
 	str.CloseSend()
-	leaves := tries.CompareLeaves(
+	leaves := crypto.CompareLeaves(
 		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 	)
@@ -750,7 +751,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
 		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
 	) {
-		leaves := tries.CompareLeaves(
+		leaves := crypto.CompareLeaves(
 			crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 			crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 		)

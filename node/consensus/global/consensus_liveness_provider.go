@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
+	keyedaggregator "source.quilibrium.com/quilibrium/monorepo/node/keyedaggregator"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
@@ -42,37 +43,55 @@ func (p *GlobalLivenessProvider) Collect(
 		mixnetMessages = p.engine.mixnet.GetMessages()
 	}
 
-	// Get and clear pending prover messages
-	p.engine.pendingMessagesMu.Lock()
-	pendingMessages := p.engine.pendingMessages
-	p.engine.pendingMessages = [][]byte{}
-	p.engine.pendingMessagesMu.Unlock()
-
-	// Convert pending messages to protobuf.Message format
-	globalAddress := make([]byte, 32)
-	for i := range globalAddress {
-		globalAddress[i] = 0xff
+	var collector keyedaggregator.Collector[sequencedGlobalMessage]
+	var collectorRecords []*sequencedGlobalMessage
+	if p.engine.messageCollectors != nil {
+		var err error
+		var found bool
+		collector, found, err = p.engine.getMessageCollector(rank)
+		if err != nil && !errors.Is(err, keyedaggregator.ErrSequenceBelowRetention) {
+			p.engine.logger.Warn(
+				"could not fetch collector for rank",
+				zap.Uint64("rank", rank),
+				zap.Error(err),
+			)
+		} else if found {
+			collectorRecords = collector.Records()
+		}
 	}
 
-	messages := make(
+	acceptedMessages := make(
 		[]*protobufs.Message,
 		0,
-		len(mixnetMessages)+len(pendingMessages),
+		len(collectorRecords)+len(mixnetMessages),
 	)
-	messages = append(messages, mixnetMessages...)
 
-	for _, msgData := range pendingMessages {
-		messages = append(messages, &protobufs.Message{
-			Address: globalAddress,
-			Payload: msgData,
-		})
+	if collector != nil {
+		for _, record := range collectorRecords {
+			if record == nil || record.message == nil {
+				continue
+			}
+			if err := p.lockCollectorMessage(
+				frameNumber,
+				record.message,
+			); err != nil {
+				p.engine.logger.Debug(
+					"message failed lock",
+					zap.Uint64("frame_number", frameNumber),
+					zap.Error(err),
+				)
+				collector.Remove(record)
+				continue
+			}
+			acceptedMessages = append(acceptedMessages, record.message)
+		}
 	}
 
-	acceptedMessages := []*protobufs.Message{}
+	messages := append([]*protobufs.Message{}, mixnetMessages...)
 
 	p.engine.logger.Debug(
 		"collected messages, validating",
-		zap.Int("message_count", len(messages)),
+		zap.Int("message_count", len(messages)+len(collectorRecords)),
 	)
 
 	for i, message := range messages {
@@ -82,6 +101,10 @@ func (p *GlobalLivenessProvider) Collect(
 		}
 
 		acceptedMessages = append(acceptedMessages, message)
+	}
+
+	if p.engine.messageAggregator != nil {
+		p.engine.messageAggregator.OnSequenceChange(rank, rank+1)
 	}
 
 	err := p.engine.executionManager.Unlock()
@@ -231,4 +254,19 @@ func (p *GlobalLivenessProvider) validateAndLockMessage(
 	}
 
 	return nil
+}
+
+func (p *GlobalLivenessProvider) lockCollectorMessage(
+	frameNumber uint64,
+	message *protobufs.Message,
+) error {
+	if message == nil {
+		return errors.New("nil message")
+	}
+	_, err := p.engine.executionManager.Lock(
+		frameNumber,
+		message.Address,
+		message.Payload,
+	)
+	return err
 }

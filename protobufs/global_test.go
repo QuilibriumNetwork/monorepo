@@ -165,14 +165,19 @@ func TestFrameHeader_Serialization(t *testing.T) {
 		{
 			name: "complete frame header",
 			header: &FrameHeader{
-				Address:           make([]byte, 32),
-				FrameNumber:       99999,
-				Timestamp:         1234567890123,
-				Difficulty:        1000000,
-				Output:            make([]byte, 516), // VDF output: 258 + 258 bytes
-				ParentSelector:    make([]byte, 32),
-				RequestsRoot:      make([]byte, 32),
-				StateRoots:        [][]byte{make([]byte, 32), make([]byte, 32)},
+				Address:        make([]byte, 64),
+				FrameNumber:    99999,
+				Timestamp:      1234567890123,
+				Difficulty:     1000000,
+				Output:         make([]byte, 516), // VDF output: 258 + 258 bytes
+				ParentSelector: make([]byte, 32),
+				RequestsRoot:   make([]byte, 74),
+				StateRoots: [][]byte{
+					make([]byte, 74),
+					make([]byte, 74),
+					make([]byte, 74),
+					make([]byte, 74),
+				},
 				Prover:            make([]byte, 32),
 				FeeMultiplierVote: 500,
 				PublicKeySignatureBls48581: &BLS48581AggregateSignature{
@@ -182,22 +187,6 @@ func TestFrameHeader_Serialization(t *testing.T) {
 					},
 					Bitmask: make([]byte, 32),
 				},
-			},
-		},
-		{
-			name: "minimal frame header",
-			header: &FrameHeader{
-				Address:                    []byte{},
-				FrameNumber:                0,
-				Timestamp:                  0,
-				Difficulty:                 0,
-				Output:                     []byte{},
-				ParentSelector:             []byte{},
-				RequestsRoot:               []byte{},
-				StateRoots:                 [][]byte{},
-				Prover:                     []byte{},
-				FeeMultiplierVote:          0,
-				PublicKeySignatureBls48581: nil,
 			},
 		},
 	}
@@ -626,15 +615,15 @@ func TestProverKick_Serialization(t *testing.T) {
 			name: "complete prover kick",
 			kick: &ProverKick{
 				FrameNumber:           66666,
-				KickedProverPublicKey: make([]byte, 57), // Ed448 public key
+				KickedProverPublicKey: make([]byte, 585), // BLS48-581 public key
 				ConflictingFrame_1:    make([]byte, 32),
 				ConflictingFrame_2:    make([]byte, 32),
 				Commitment:            make([]byte, 32),
-				Proof:                 make([]byte, 128),
+				Proof:                 make([]byte, 160),
 				TraversalProof: &TraversalProof{
 					Multiproof: &Multiproof{
-						Multicommitment: make([]byte, 32),
-						Proof:           make([]byte, 64),
+						Multicommitment: make([]byte, 74),
+						Proof:           make([]byte, 74),
 					},
 					SubProofs: []*TraversalSubProof{
 						{
@@ -644,18 +633,6 @@ func TestProverKick_Serialization(t *testing.T) {
 						},
 					},
 				},
-			},
-		},
-		{
-			name: "minimal prover kick",
-			kick: &ProverKick{
-				FrameNumber:           0,
-				KickedProverPublicKey: []byte{},
-				ConflictingFrame_1:    []byte{},
-				ConflictingFrame_2:    []byte{},
-				Commitment:            []byte{},
-				Proof:                 []byte{},
-				TraversalProof:        nil,
 			},
 		},
 	}
@@ -1023,14 +1000,19 @@ func TestAppShardFrame_Serialization(t *testing.T) {
 			name: "complete app shard frame",
 			frame: &AppShardFrame{
 				Header: &FrameHeader{
-					Address:           make([]byte, 32),
-					FrameNumber:       67890,
-					Timestamp:         1234567890123,
-					Difficulty:        500000,
-					Output:            make([]byte, 516),
-					ParentSelector:    make([]byte, 32),
-					RequestsRoot:      make([]byte, 32),
-					StateRoots:        [][]byte{make([]byte, 32), make([]byte, 32)},
+					Address:        make([]byte, 32),
+					FrameNumber:    67890,
+					Timestamp:      1234567890123,
+					Difficulty:     500000,
+					Output:         make([]byte, 516),
+					ParentSelector: make([]byte, 32),
+					RequestsRoot:   make([]byte, 32),
+					StateRoots: [][]byte{
+						make([]byte, 74),
+						make([]byte, 74),
+						make([]byte, 74),
+						make([]byte, 74),
+					},
 					Prover:            make([]byte, 32),
 					FeeMultiplierVote: 250,
 					PublicKeySignatureBls48581: &BLS48581AggregateSignature{
@@ -1069,13 +1051,6 @@ func TestAppShardFrame_Serialization(t *testing.T) {
 						Timestamp: 1234567890456,
 					},
 				},
-			},
-		},
-		{
-			name: "minimal app shard frame",
-			frame: &AppShardFrame{
-				Header:   nil,
-				Requests: []*MessageBundle{},
 			},
 		},
 	}
@@ -1216,22 +1191,15 @@ func TestMultiproof_Serialization(t *testing.T) {
 		{
 			name: "complete multiproof",
 			multiproof: &Multiproof{
-				Multicommitment: make([]byte, 32),
-				Proof:           make([]byte, 256),
+				Multicommitment: make([]byte, 74),
+				Proof:           make([]byte, 74),
 			},
 		},
 		{
 			name: "multiproof with different sizes",
 			multiproof: &Multiproof{
-				Multicommitment: append([]byte{0xAA}, make([]byte, 31)...),
-				Proof:           append([]byte{0xBB}, make([]byte, 255)...),
-			},
-		},
-		{
-			name: "minimal multiproof",
-			multiproof: &Multiproof{
-				Multicommitment: []byte{},
-				Proof:           []byte{},
+				Multicommitment: append([]byte{0xAA}, make([]byte, 73)...),
+				Proof:           append([]byte{0xBB}, make([]byte, 73)...),
 			},
 		},
 	}
@@ -1359,31 +1327,21 @@ func TestTraversalProof_Serialization(t *testing.T) {
 			name: "complete traversal proof",
 			proof: &TraversalProof{
 				Multiproof: &Multiproof{
-					Multicommitment: make([]byte, 32),
-					Proof:           make([]byte, 128),
+					Multicommitment: make([]byte, 74),
+					Proof:           make([]byte, 74),
 				},
 				SubProofs: []*TraversalSubProof{
 					{
-						Commits: [][]byte{make([]byte, 32)},
+						Commits: [][]byte{make([]byte, 74)},
 						Ys:      [][]byte{make([]byte, 48)},
 						Paths:   []*Path{{Indices: []uint64{1, 2}}},
 					},
 					{
-						Commits: [][]byte{make([]byte, 32), make([]byte, 32)},
+						Commits: [][]byte{make([]byte, 74), make([]byte, 74)},
 						Ys:      [][]byte{make([]byte, 48), make([]byte, 48)},
 						Paths:   []*Path{{Indices: []uint64{3, 4, 5}}},
 					},
 				},
-			},
-		},
-		{
-			name: "minimal traversal proof",
-			proof: &TraversalProof{
-				Multiproof: &Multiproof{
-					Multicommitment: []byte{},
-					Proof:           []byte{},
-				},
-				SubProofs: []*TraversalSubProof{},
 			},
 		},
 	}

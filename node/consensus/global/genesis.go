@@ -386,7 +386,14 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 	)
 
 	for _, prover := range proverPubKeys {
-		addrbi, err := poseidon.HashBytes(prover)
+		proverAddrBI, err := poseidon.HashBytes(prover)
+		if err != nil {
+			panic(err)
+		}
+		addrbi, err := poseidon.HashBytes(slices.Concat(
+			token.QUIL_TOKEN_ADDRESS,
+			proverAddrBI.FillBytes(make([]byte, 32)),
+		))
 		if err != nil {
 			panic(err)
 		}
@@ -396,7 +403,7 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 
 		err = rdfMultiprover.Set(
 			globalintrinsics.GLOBAL_RDF_SCHEMA,
-			token.QUIL_TOKEN_ADDRESS,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 			"reward:ProverReward",
 			"DelegateAddress",
 			addrbi.FillBytes(make([]byte, 32)),
@@ -412,7 +419,7 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 		balance = balanceBI.FillBytes(balance)
 		err = rdfMultiprover.Set(
 			globalintrinsics.GLOBAL_RDF_SCHEMA,
-			token.QUIL_TOKEN_ADDRESS,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 			"reward:ProverReward",
 			"Balance",
 			balance,

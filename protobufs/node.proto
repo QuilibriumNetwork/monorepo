@@ -54,6 +54,7 @@ message NodeInfoResponse {
   bytes peer_seniority = 4;
   uint32 running_workers = 5;
   uint32 allocated_workers = 6;
+  bytes patch_version = 7;
 }
 
 message WorkerInfo {

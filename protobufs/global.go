@@ -312,6 +312,12 @@ func (s *AppShardProposal) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &stateLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if stateLen > 7500000 {
+		return errors.Wrap(
+			errors.New("invalid state length"),
+			"from canonical bytes",
+		)
+	}
 	stateBytes := make([]byte, stateLen)
 	if _, err := buf.Read(stateBytes); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -326,6 +332,12 @@ func (s *AppShardProposal) FromCanonicalBytes(data []byte) error {
 	var parentQCLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &parentQCLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if parentQCLen > 33871 {
+		return errors.Wrap(
+			errors.New("invalid quorum certificate length"),
+			"from canonical bytes",
+		)
 	}
 	parentQCBytes := make([]byte, parentQCLen)
 	if _, err := buf.Read(parentQCBytes); err != nil {
@@ -344,7 +356,12 @@ func (s *AppShardProposal) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &priorRankTCLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
-
+	if priorRankTCLen > 35194 {
+		return errors.Wrap(
+			errors.New("invalid prior rank timeout certificate length"),
+			"from canonical bytes",
+		)
+	}
 	if priorRankTCLen != 0 {
 		priorRankTCBytes := make([]byte, priorRankTCLen)
 		if _, err := buf.Read(priorRankTCBytes); err != nil {
@@ -363,6 +380,12 @@ func (s *AppShardProposal) FromCanonicalBytes(data []byte) error {
 	var voteLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &voteLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if voteLen > 770 {
+		return errors.Wrap(
+			errors.New("invalid vote length"),
+			"from canonical bytes",
+		)
 	}
 	voteBytes := make([]byte, voteLen)
 	if _, err := buf.Read(voteBytes); err != nil {
@@ -504,6 +527,12 @@ func (s *GlobalProposal) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &stateLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if stateLen > 7800000 {
+		return errors.Wrap(
+			errors.New("invalid state length"),
+			"from canonical bytes",
+		)
+	}
 	stateBytes := make([]byte, stateLen)
 	if _, err := buf.Read(stateBytes); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -518,6 +547,12 @@ func (s *GlobalProposal) FromCanonicalBytes(data []byte) error {
 	var parentQCLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &parentQCLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if parentQCLen > 847 {
+		return errors.Wrap(
+			errors.New("invalid parent quorum certificate length"),
+			"from canonical bytes",
+		)
 	}
 	parentQCBytes := make([]byte, parentQCLen)
 	if _, err := buf.Read(parentQCBytes); err != nil {
@@ -536,7 +571,12 @@ func (s *GlobalProposal) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &priorRankTCLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
-
+	if priorRankTCLen > 2170 {
+		return errors.Wrap(
+			errors.New("invalid prior rank timeout certificate length"),
+			"from canonical bytes",
+		)
+	}
 	if priorRankTCLen != 0 {
 		priorRankTCBytes := make([]byte, priorRankTCLen)
 		if _, err := buf.Read(priorRankTCBytes); err != nil {
@@ -555,6 +595,12 @@ func (s *GlobalProposal) FromCanonicalBytes(data []byte) error {
 	var voteLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &voteLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if voteLen > 770 {
+		return errors.Wrap(
+			errors.New("invalid vote length"),
+			"from canonical bytes",
+		)
 	}
 	voteBytes := make([]byte, voteLen)
 	if _, err := buf.Read(voteBytes); err != nil {
@@ -631,11 +677,17 @@ func (s *SeniorityMerge) FromCanonicalBytes(data []byte) error {
 	}
 
 	// Read signature
-	var commitmentLen uint32
-	if err := binary.Read(buf, binary.BigEndian, &commitmentLen); err != nil {
+	var signatureLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &signatureLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
-	s.Signature = make([]byte, commitmentLen)
+	if signatureLen > 114 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
+	}
+	s.Signature = make([]byte, signatureLen)
 	if _, err := buf.Read(s.Signature); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
@@ -649,6 +701,12 @@ func (s *SeniorityMerge) FromCanonicalBytes(data []byte) error {
 	var keyLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if keyLen > 585 {
+		return errors.Wrap(
+			errors.New("invalid key length"),
+			"from canonical bytes",
+		)
 	}
 	s.ProverPublicKey = make([]byte, keyLen)
 	if _, err := buf.Read(s.ProverPublicKey); err != nil {
@@ -718,11 +776,23 @@ func (l *LegacyProverRequest) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &sigCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if sigCount > 100 {
+		return errors.Wrap(
+			errors.New("invalid signature count"),
+			"from canonical bytes",
+		)
+	}
 	l.PublicKeySignaturesEd448 = make([]*Ed448Signature, sigCount)
 	for i := uint32(0); i < sigCount; i++ {
 		var sigLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if sigLen > 187 {
+			return errors.Wrap(
+				errors.New("invalid signature length"),
+				"from canonical bytes",
+			)
 		}
 		sigBytes := make([]byte, sigLen)
 		if _, err := buf.Read(sigBytes); err != nil {
@@ -871,12 +941,26 @@ func (p *ProverJoin) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filtersCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+
+	if filtersCount > 100 {
+		return errors.Wrap(
+			errors.New("invalid filter count"),
+			"from canonical bytes",
+		)
+	}
+
 	p.Filters = make([][]byte, filtersCount)
 	// Read each filter
 	for i := uint32(0); i < filtersCount; i++ {
 		var filterLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if filterLen > 64 {
+			return errors.Wrap(
+				errors.New("invalid filter length"),
+				"from canonical bytes",
+			)
 		}
 		p.Filters[i] = make([]byte, filterLen)
 		if _, err := buf.Read(p.Filters[i]); err != nil {
@@ -893,6 +977,12 @@ func (p *ProverJoin) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 753 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -912,6 +1002,12 @@ func (p *ProverJoin) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &delegateAddressLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if delegateAddressLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid delegate address length"),
+			"from canonical bytes",
+		)
+	}
 	p.DelegateAddress = make([]byte, delegateAddressLen)
 	if _, err := buf.Read(p.DelegateAddress); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -929,6 +1025,12 @@ func (p *ProverJoin) FromCanonicalBytes(data []byte) error {
 		if err := binary.Read(buf, binary.BigEndian, &targetLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
 		}
+		if targetLen > 675 {
+			return errors.Wrap(
+				errors.New("invalid merge target length"),
+				"from canonical bytes",
+			)
+		}
 		targetBytes := make([]byte, targetLen)
 		if _, err := buf.Read(targetBytes); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
@@ -945,6 +1047,12 @@ func (p *ProverJoin) FromCanonicalBytes(data []byte) error {
 	var proofLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &proofLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if proofLen > 51600 {
+		return errors.Wrap(
+			errors.New("invalid proof length"),
+			"from canonical bytes",
+		)
 	}
 	p.Proof = make([]byte, proofLen)
 	if _, err := buf.Read(p.Proof); err != nil {
@@ -1034,12 +1142,24 @@ func (p *ProverLeave) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filtersCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if filtersCount > 100 {
+		return errors.Wrap(
+			errors.New("invalid filters count"),
+			"from canonical byte",
+		)
+	}
 	p.Filters = make([][]byte, filtersCount)
 	// Read each filter
 	for i := uint32(0); i < filtersCount; i++ {
 		var filterLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if filterLen > 64 {
+			return errors.Wrap(
+				errors.New("invalid filter length"),
+				"from canonical bytes",
+			)
 		}
 		p.Filters[i] = make([]byte, filterLen)
 		if _, err := buf.Read(p.Filters[i]); err != nil {
@@ -1056,6 +1176,12 @@ func (p *ProverLeave) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 118 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -1143,6 +1269,12 @@ func (p *ProverPause) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if filterLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid filter length"),
+			"from canonical bytes",
+		)
+	}
 	p.Filter = make([]byte, filterLen)
 	if _, err := buf.Read(p.Filter); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1157,6 +1289,12 @@ func (p *ProverPause) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 118 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -1244,6 +1382,12 @@ func (p *ProverResume) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if filterLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid filter length"),
+			"from canonical bytes",
+		)
+	}
 	p.Filter = make([]byte, filterLen)
 	if _, err := buf.Read(p.Filter); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1258,6 +1402,12 @@ func (p *ProverResume) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 118 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -1345,6 +1495,12 @@ func (p *ProverConfirm) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if filterLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid filter length"),
+			"from canonical bytes",
+		)
+	}
 	p.Filter = make([]byte, filterLen)
 	if _, err := buf.Read(p.Filter); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1359,6 +1515,12 @@ func (p *ProverConfirm) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 118 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -1446,6 +1608,12 @@ func (p *ProverReject) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if filterLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid filter length"),
+			"from canonical bytes",
+		)
+	}
 	p.Filter = make([]byte, filterLen)
 	if _, err := buf.Read(p.Filter); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1460,6 +1628,12 @@ func (p *ProverReject) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 118 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -1542,6 +1716,12 @@ func (p *ProverUpdate) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &addressLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if addressLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid address length"),
+			"from canonical bytes",
+		)
+	}
 	p.DelegateAddress = make([]byte, addressLen)
 	if _, err := buf.Read(p.DelegateAddress); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1551,6 +1731,12 @@ func (p *ProverUpdate) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 118 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -2170,6 +2356,12 @@ func (g *GlobalFrameHeader) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &outputLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if outputLen > 516 {
+		return errors.Wrap(
+			errors.New("invalid output length"),
+			"from canonical bytes",
+		)
+	}
 	g.Output = make([]byte, outputLen)
 	if _, err := buf.Read(g.Output); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2179,6 +2371,12 @@ func (g *GlobalFrameHeader) FromCanonicalBytes(data []byte) error {
 	var parentSelectorLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &parentSelectorLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if parentSelectorLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid parent selector length"),
+			"from canonical bytes",
+		)
 	}
 	g.ParentSelector = make([]byte, parentSelectorLen)
 	if _, err := buf.Read(g.ParentSelector); err != nil {
@@ -2190,11 +2388,23 @@ func (g *GlobalFrameHeader) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &commitmentsCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if commitmentsCount > 256 {
+		return errors.Wrap(
+			errors.New("invalid commitments count"),
+			"from canonical bytes",
+		)
+	}
 	g.GlobalCommitments = make([][]byte, commitmentsCount)
 	for i := uint32(0); i < commitmentsCount; i++ {
 		var commitmentLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &commitmentLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if commitmentLen > 74 {
+			return errors.Wrap(
+				errors.New("invalid commitment length"),
+				"from canonical bytes",
+			)
 		}
 		g.GlobalCommitments[i] = make([]byte, commitmentLen)
 		if _, err := buf.Read(g.GlobalCommitments[i]); err != nil {
@@ -2211,6 +2421,12 @@ func (g *GlobalFrameHeader) FromCanonicalBytes(data []byte) error {
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if proverTreeCommitmentLen > 74 {
+		return errors.Wrap(
+			errors.New("invalid prover tree commitment length"),
+			"from canonical bytes",
+		)
+	}
 	g.ProverTreeCommitment = make([]byte, proverTreeCommitmentLen)
 	if _, err := buf.Read(g.ProverTreeCommitment); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2224,6 +2440,12 @@ func (g *GlobalFrameHeader) FromCanonicalBytes(data []byte) error {
 		&requestsRootLen,
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if requestsRootLen > 74 {
+		return errors.Wrap(
+			errors.New("invalid requests root length"),
+			"from canonical bytes",
+		)
 	}
 	g.RequestsRoot = make([]byte, requestsRootLen)
 	if _, err := buf.Read(g.RequestsRoot); err != nil {
@@ -2239,6 +2461,12 @@ func (g *GlobalFrameHeader) FromCanonicalBytes(data []byte) error {
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if proverLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid prover length"),
+			"from canonical bytes",
+		)
+	}
 	g.Prover = make([]byte, proverLen)
 	if _, err := buf.Read(g.Prover); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2248,6 +2476,12 @@ func (g *GlobalFrameHeader) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 711 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -2423,6 +2657,12 @@ func (f *FrameHeader) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &addressLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if addressLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid address length"),
+			"from canonical bytes",
+		)
+	}
 	f.Address = make([]byte, addressLen)
 	if _, err := buf.Read(f.Address); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2448,6 +2688,12 @@ func (f *FrameHeader) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &outputLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if outputLen != 516 {
+		return errors.Wrap(
+			errors.New("invalid output length"),
+			"from canonical bytes",
+		)
+	}
 	f.Output = make([]byte, outputLen)
 	if _, err := buf.Read(f.Output); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2457,6 +2703,12 @@ func (f *FrameHeader) FromCanonicalBytes(data []byte) error {
 	var parentSelectorLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &parentSelectorLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if parentSelectorLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid selector length"),
+			"from canonical bytes",
+		)
 	}
 	f.ParentSelector = make([]byte, parentSelectorLen)
 	if _, err := buf.Read(f.ParentSelector); err != nil {
@@ -2468,6 +2720,12 @@ func (f *FrameHeader) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &requestsRootLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if requestsRootLen > 74 {
+		return errors.Wrap(
+			errors.New("invalid requests root length"),
+			"from canonical bytes",
+		)
+	}
 	f.RequestsRoot = make([]byte, requestsRootLen)
 	if _, err := buf.Read(f.RequestsRoot); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2478,11 +2736,23 @@ func (f *FrameHeader) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &stateRootsCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if stateRootsCount != 4 {
+		return errors.Wrap(
+			errors.New("invalid state roots length"),
+			"from canonical bytes",
+		)
+	}
 	f.StateRoots = make([][]byte, stateRootsCount)
 	for i := uint32(0); i < stateRootsCount; i++ {
 		var rootLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &rootLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if rootLen > 74 {
+			return errors.Wrap(
+				errors.New("invalid state root length"),
+				"from canonical bytes",
+			)
 		}
 		f.StateRoots[i] = make([]byte, rootLen)
 		if _, err := buf.Read(f.StateRoots[i]); err != nil {
@@ -2494,6 +2764,12 @@ func (f *FrameHeader) FromCanonicalBytes(data []byte) error {
 	var proverLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &proverLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if proverLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid prover length"),
+			"from canonical bytes",
+		)
 	}
 	f.Prover = make([]byte, proverLen)
 	if _, err := buf.Read(f.Prover); err != nil {
@@ -2513,6 +2789,12 @@ func (f *FrameHeader) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 33735 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -2621,6 +2903,12 @@ func (p *ProverLivenessCheck) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if filterLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
+	}
 	p.Filter = make([]byte, filterLen)
 	if _, err := buf.Read(p.Filter); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2641,6 +2929,12 @@ func (p *ProverLivenessCheck) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &commitmentHashLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if commitmentHashLen > 20000 {
+		return errors.Wrap(
+			errors.New("invalid commitment hash length"),
+			"from canonical bytes",
+		)
+	}
 	p.CommitmentHash = make([]byte, commitmentHashLen)
 	if _, err := buf.Read(p.CommitmentHash); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2651,7 +2945,12 @@ func (p *ProverLivenessCheck) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
-
+	if sigLen > 118 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
+	}
 	if sigLen == 0 {
 		return errors.Wrap(errors.New("invalid signature"), "from canonical bytes")
 	}
@@ -2762,6 +3061,12 @@ func (f *ProposalVote) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if filterLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid filter length"),
+			"from canonical bytes",
+		)
+	}
 	f.Filter = make([]byte, filterLen)
 	if _, err := buf.Read(f.Filter); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2782,6 +3087,12 @@ func (f *ProposalVote) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &selectorLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if selectorLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid selector length"),
+			"from canonical bytes",
+		)
+	}
 	f.Selector = make([]byte, selectorLen)
 	if _, err := buf.Read(f.Selector); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2796,6 +3107,12 @@ func (f *ProposalVote) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 634 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -2918,6 +3235,12 @@ func (f *TimeoutState) FromCanonicalBytes(data []byte) error {
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if latestQuorumCertLen > 33871 {
+		return errors.Wrap(
+			errors.New("invalid latest quorum certificate length"),
+			"from canonical bytes",
+		)
+	}
 	if latestQuorumCertLen > 0 {
 		latestQuorumCertBytes := make([]byte, latestQuorumCertLen)
 		if _, err := buf.Read(latestQuorumCertBytes); err != nil {
@@ -2940,6 +3263,12 @@ func (f *TimeoutState) FromCanonicalBytes(data []byte) error {
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if priorRankTimeoutCertLen > 35194 {
+		return errors.Wrap(
+			errors.New("invalid prior rank timeout certificate length"),
+			"from canonical bytes",
+		)
+	}
 	if priorRankTimeoutCertLen > 0 {
 		priorRankTimeoutBytes := make([]byte, priorRankTimeoutCertLen)
 		if _, err := buf.Read(priorRankTimeoutBytes); err != nil {
@@ -2957,6 +3286,12 @@ func (f *TimeoutState) FromCanonicalBytes(data []byte) error {
 	var voteLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &voteLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if voteLen > 770 {
+		return errors.Wrap(
+			errors.New("invalid vote length"),
+			"from canonical bytes",
+		)
 	}
 	if voteLen > 0 {
 		voteBytes := make([]byte, voteLen)
@@ -3077,6 +3412,12 @@ func (f *QuorumCertificate) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if filterLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid filter length"),
+			"from canonical bytes",
+		)
+	}
 	f.Filter = make([]byte, filterLen)
 	if _, err := buf.Read(f.Filter); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -3097,6 +3438,12 @@ func (f *QuorumCertificate) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &selectorLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if selectorLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid selector length"),
+			"from canonical bytes",
+		)
+	}
 	f.Selector = make([]byte, selectorLen)
 	if _, err := buf.Read(f.Selector); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -3111,6 +3458,12 @@ func (f *QuorumCertificate) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 33735 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -3241,6 +3594,12 @@ func (t *TimeoutCertificate) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if filterLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid filter length"),
+			"from canonical bytes",
+		)
+	}
 	t.Filter = make([]byte, filterLen)
 	if _, err := buf.Read(t.Filter); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -3256,6 +3615,12 @@ func (t *TimeoutCertificate) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &latestRanksCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if latestRanksCount > 64 {
+		return errors.Wrap(
+			errors.New("invalid latest ranks count"),
+			"from canonical bytes",
+		)
+	}
 	t.LatestRanks = make([]uint64, latestRanksCount)
 	if err := binary.Read(buf, binary.BigEndian, &t.LatestRanks); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -3269,6 +3634,12 @@ func (t *TimeoutCertificate) FromCanonicalBytes(data []byte) error {
 		&latestQuorumCertLen,
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if latestQuorumCertLen > 33871 {
+		return errors.Wrap(
+			errors.New("invalid latest quorum certificate length"),
+			"from canonical bytes",
+		)
 	}
 	if latestQuorumCertLen > 0 {
 		latestQuorumCertBytes := make([]byte, latestQuorumCertLen)
@@ -3292,6 +3663,12 @@ func (t *TimeoutCertificate) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 711 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	if sigLen > 0 {
 		sigBytes := make([]byte, sigLen)
@@ -3385,6 +3762,12 @@ func (g *GlobalFrame) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &headerLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if headerLen > 21467 {
+		return errors.Wrap(
+			errors.New("invalid header length"),
+			"from canonical bytes",
+		)
+	}
 	if headerLen > 0 {
 		headerBytes := make([]byte, headerLen)
 		if _, err := buf.Read(headerBytes); err != nil {
@@ -3401,11 +3784,23 @@ func (g *GlobalFrame) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &requestsCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if requestsCount > 100 {
+		return errors.Wrap(
+			errors.New("invalid requests count"),
+			"from canonical bytes",
+		)
+	}
 	g.Requests = make([]*MessageBundle, requestsCount)
 	for i := uint32(0); i < requestsCount; i++ {
 		var requestLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &requestLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if requestLen > 75000 {
+			return errors.Wrap(
+				errors.New("invalid request length"),
+				"from canonical bytes",
+			)
 		}
 		requestBytes := make([]byte, requestLen)
 		if _, err := buf.Read(requestBytes); err != nil {
@@ -3498,6 +3893,12 @@ func (a *AppShardFrame) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &headerLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if headerLen > 34829 {
+		return errors.Wrap(
+			errors.New("invalid header length"),
+			"from canonical bytes",
+		)
+	}
 	if headerLen > 0 {
 		headerBytes := make([]byte, headerLen)
 		if _, err := buf.Read(headerBytes); err != nil {
@@ -3514,11 +3915,23 @@ func (a *AppShardFrame) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &requestsCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if requestsCount > 100 {
+		return errors.Wrap(
+			errors.New("invalid requests length"),
+			"from canonical bytes",
+		)
+	}
 	a.Requests = make([]*MessageBundle, requestsCount)
 	for i := uint32(0); i < requestsCount; i++ {
 		var requestLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &requestLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if requestLen > 74000 {
+			return errors.Wrap(
+				errors.New("invalid request size"),
+				"from canonical bytes",
+			)
 		}
 		requestBytes := make([]byte, requestLen)
 		if _, err := buf.Read(requestBytes); err != nil {
@@ -3589,6 +4002,12 @@ func (m *Multiproof) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &commitLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if commitLen != 74 {
+		return errors.Wrap(
+			errors.New("invalid multicommitment length"),
+			"from canonical bytes",
+		)
+	}
 	m.Multicommitment = make([]byte, commitLen)
 	if _, err := buf.Read(m.Multicommitment); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -3598,6 +4017,12 @@ func (m *Multiproof) FromCanonicalBytes(data []byte) error {
 	var proofLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &proofLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if proofLen != 74 {
+		return errors.Wrap(
+			errors.New("invalid proof length"),
+			"from canonical bytes",
+		)
 	}
 	m.Proof = make([]byte, proofLen)
 	if _, err := buf.Read(m.Proof); err != nil {
@@ -3653,6 +4078,12 @@ func (p *Path) FromCanonicalBytes(data []byte) error {
 	var indicesCount uint32
 	if err := binary.Read(buf, binary.BigEndian, &indicesCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if indicesCount > 64 {
+		return errors.Wrap(
+			errors.New("invalid indices count"),
+			"from canonical bytes",
+		)
 	}
 	p.Indices = make([]uint64, indicesCount)
 	// Read each index
@@ -3767,12 +4198,24 @@ func (t *TraversalSubProof) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &commitsCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if commitsCount > 64 {
+		return errors.Wrap(
+			errors.New("invalid commits length"),
+			"from canonical bytes",
+		)
+	}
 	t.Commits = make([][]byte, commitsCount)
 	// Read each commit
 	for i := uint32(0); i < commitsCount; i++ {
 		var commitLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &commitLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if commitLen > 74 {
+			return errors.Wrap(
+				errors.New("invalid commitment length"),
+				"from canonical bytes",
+			)
 		}
 		t.Commits[i] = make([]byte, commitLen)
 		if _, err := buf.Read(t.Commits[i]); err != nil {
@@ -3785,12 +4228,26 @@ func (t *TraversalSubProof) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &ysCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if ysCount > 64 {
+		return errors.Wrap(
+			errors.New("invalid multicommitment length"),
+			"from canonical bytes",
+		)
+	}
 	t.Ys = make([][]byte, ysCount)
 	// Read each y
 	for i := uint32(0); i < ysCount; i++ {
 		var yLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &yLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		// Not a normal length, but we're accounting for unusual scenarios, the
+		// parent caller will be more limiting
+		if yLen > 2000 {
+			return errors.Wrap(
+				errors.New("invalid y length"),
+				"from canonical bytes",
+			)
 		}
 		t.Ys[i] = make([]byte, yLen)
 		if _, err := buf.Read(t.Ys[i]); err != nil {
@@ -3803,12 +4260,24 @@ func (t *TraversalSubProof) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &pathsCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if pathsCount > 64 {
+		return errors.Wrap(
+			errors.New("invalid paths count"),
+			"from canonical bytes",
+		)
+	}
 	t.Paths = make([]*Path, pathsCount)
 	// Read each path
 	for i := uint32(0); i < pathsCount; i++ {
 		var pathLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &pathLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if pathLen > 4104 {
+			return errors.Wrap(
+				errors.New("invalid path length"),
+				"from canonical bytes",
+			)
 		}
 		pathBytes := make([]byte, pathLen)
 		if _, err := buf.Read(pathBytes); err != nil {
@@ -3903,6 +4372,12 @@ func (t *TraversalProof) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &multiproofLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if multiproofLen > 160 {
+		return errors.Wrap(
+			errors.New("invalid multiproof length"),
+			"from canonical bytes",
+		)
+	}
 	if multiproofLen > 0 {
 		multiproofBytes := make([]byte, multiproofLen)
 		if _, err := buf.Read(multiproofBytes); err != nil {
@@ -3919,12 +4394,24 @@ func (t *TraversalProof) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &subProofsCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if subProofsCount > 100 {
+		return errors.Wrap(
+			errors.New("invalid subproofs count"),
+			"from canonical bytes",
+		)
+	}
 	t.SubProofs = make([]*TraversalSubProof, subProofsCount)
 	// Read each sub proof
 	for i := uint32(0); i < subProofsCount; i++ {
 		var subProofLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &subProofLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if subProofLen > 43000 {
+			return errors.Wrap(
+				errors.New("invalid subproof length"),
+				"from canonical bytes",
+			)
 		}
 		subProofBytes := make([]byte, subProofLen)
 		if _, err := buf.Read(subProofBytes); err != nil {
@@ -4063,6 +4550,12 @@ func (p *ProverKick) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if keyLen != 585 {
+		return errors.Wrap(
+			errors.New("invalid key length"),
+			"from canonical bytes",
+		)
+	}
 	p.KickedProverPublicKey = make([]byte, keyLen)
 	if _, err := buf.Read(p.KickedProverPublicKey); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -4072,6 +4565,12 @@ func (p *ProverKick) FromCanonicalBytes(data []byte) error {
 	var frame1Len uint32
 	if err := binary.Read(buf, binary.BigEndian, &frame1Len); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if frame1Len > 34825 {
+		return errors.Wrap(
+			errors.New("invalid frame1 length"),
+			"from canonical bytes",
+		)
 	}
 	p.ConflictingFrame_1 = make([]byte, frame1Len)
 	if _, err := buf.Read(p.ConflictingFrame_1); err != nil {
@@ -4083,6 +4582,12 @@ func (p *ProverKick) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &frame2Len); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if frame2Len > 34825 {
+		return errors.Wrap(
+			errors.New("invalid frame1 length"),
+			"from canonical bytes",
+		)
+	}
 	p.ConflictingFrame_2 = make([]byte, frame2Len)
 	if _, err := buf.Read(p.ConflictingFrame_2); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -4092,6 +4597,12 @@ func (p *ProverKick) FromCanonicalBytes(data []byte) error {
 	var commitmentLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &commitmentLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if commitmentLen > 74 {
+		return errors.Wrap(
+			errors.New("invalid commitment length"),
+			"from canonical bytes",
+		)
 	}
 	p.Commitment = make([]byte, commitmentLen)
 	if _, err := buf.Read(p.Commitment); err != nil {
@@ -4103,6 +4614,12 @@ func (p *ProverKick) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &proofLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if proofLen > 160 {
+		return errors.Wrap(
+			errors.New("invalid proof length"),
+			"from canonical bytes",
+		)
+	}
 	p.Proof = make([]byte, proofLen)
 	if _, err := buf.Read(p.Proof); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -4112,6 +4629,12 @@ func (p *ProverKick) FromCanonicalBytes(data []byte) error {
 	var traversalLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &traversalLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if traversalLen > 4000 {
+		return errors.Wrap(
+			errors.New("invalid traversal proof length"),
+			"from canonical bytes",
+		)
 	}
 	if traversalLen > 0 {
 		traversalBytes := make([]byte, traversalLen)
@@ -4183,6 +4706,12 @@ func (g *GlobalAlert) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &msgLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if msgLen > 1000 {
+		return errors.Wrap(
+			errors.New("invalid message length"),
+			"from canonical bytes",
+		)
+	}
 	msgBytes := make([]byte, msgLen)
 	if _, err := buf.Read(msgBytes); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -4193,6 +4722,12 @@ func (g *GlobalAlert) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 114 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	g.Signature = make([]byte, sigLen)
 	if _, err := buf.Read(g.Signature); err != nil {
@@ -4334,6 +4869,9 @@ func (t *ProverJoin) Validate() error {
 	}
 	if len(t.Filters) == 0 {
 		return errors.Wrap(errors.New("no filters provided"), "validate")
+	}
+	if len(t.Filters) > 100 {
+		return errors.Wrap(errors.New("too many filters provided"), "validate")
 	}
 	for _, filter := range t.Filters {
 		if len(filter) < 32 || len(filter) > 64 {

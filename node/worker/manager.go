@@ -416,18 +416,7 @@ func (w *WorkerManager) AllocateWorker(coreId uint, filter []byte) error {
 	w.setWorkerAllocation(coreId, true)
 
 	// Refresh worker
-	svc, err := w.getIPCOfWorker(coreId)
-	if err != nil {
-		w.logger.Error("could not get ipc of worker", zap.Error(err))
-		return errors.Wrap(err, "allocate worker")
-	}
-
-	ctx := w.currentContext()
-	_, err = svc.Respawn(ctx, &protobufs.RespawnRequest{
-		Filter: worker.Filter,
-	})
-	if err != nil {
-		w.logger.Error("could not respawn worker", zap.Error(err))
+	if err := w.respawnWorker(coreId, worker.Filter); err != nil {
 		return errors.Wrap(err, "allocate worker")
 	}
 
@@ -496,18 +485,7 @@ func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 	}
 
 	// Refresh worker
-	svc, err := w.getIPCOfWorker(coreId)
-	if err != nil {
-		w.logger.Error("could not get ipc of worker", zap.Error(err))
-		return errors.Wrap(err, "allocate worker")
-	}
-
-	ctx := w.currentContext()
-	_, err = svc.Respawn(ctx, &protobufs.RespawnRequest{
-		Filter: []byte{},
-	})
-	if err != nil {
-		w.logger.Error("could not respawn worker", zap.Error(err))
+	if err := w.respawnWorker(coreId, []byte{}); err != nil {
 		return errors.Wrap(err, "allocate worker")
 	}
 
@@ -630,6 +608,34 @@ func (w *WorkerManager) RangeWorkers() ([]*typesStore.WorkerInfo, error) {
 	return workers, nil
 }
 
+const workerConnectivityTimeout = 5 * time.Second
+
+func (w *WorkerManager) CheckWorkersConnected() ([]uint, error) {
+	workers, err := w.store.RangeWorkers()
+	if err != nil {
+		return nil, errors.Wrap(err, "check worker connectivity")
+	}
+
+	unreachable := make([]uint, 0)
+	for _, worker := range workers {
+		_, err := w.getIPCOfWorkerWithTimeout(
+			worker.CoreId,
+			workerConnectivityTimeout,
+		)
+		if err != nil {
+			w.logger.Debug(
+				"worker unreachable during connectivity check",
+				zap.Uint("core_id", worker.CoreId),
+				zap.Error(err),
+			)
+			w.closeServiceClient(worker.CoreId)
+			unreachable = append(unreachable, worker.CoreId)
+		}
+	}
+
+	return unreachable, nil
+}
+
 // ProposeAllocations invokes a proposal function set by the parent of the
 // manager.
 func (w *WorkerManager) ProposeAllocations(
@@ -737,18 +743,12 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 			w.setWorkerAllocation(worker.CoreId, false)
 		}
 		totalStorage += uint64(worker.TotalStorage)
-		svc, err := w.getIPCOfWorker(worker.CoreId)
-		if err != nil {
-			w.logger.Error("could not obtain IPC for worker", zap.Error(err))
-			continue
-		}
-
-		ctx := w.currentContext()
-		_, err = svc.Respawn(ctx, &protobufs.RespawnRequest{
-			Filter: worker.Filter,
-		})
-		if err != nil {
-			w.logger.Error("could not respawn worker", zap.Error(err))
+		if err := w.respawnWorker(worker.CoreId, worker.Filter); err != nil {
+			w.logger.Error(
+				"could not respawn worker",
+				zap.Uint("core_id", worker.CoreId),
+				zap.Error(err),
+			)
 			continue
 		}
 	}
@@ -800,7 +800,61 @@ func (w *WorkerManager) getP2PMultiaddrOfWorker(coreId uint) (
 	return ma, errors.Wrap(err, "get p2p multiaddr of worker")
 }
 
+func (w *WorkerManager) ensureWorkerRegistered(
+	coreId uint,
+	p2pAddr multiaddr.Multiaddr,
+	streamAddr multiaddr.Multiaddr,
+) error {
+	_, err := w.store.GetWorker(coreId)
+	if err == nil {
+		return nil
+	}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+
+	return w.registerWorker(&typesStore.WorkerInfo{
+		CoreId:                coreId,
+		ListenMultiaddr:       p2pAddr.String(),
+		StreamListenMultiaddr: streamAddr.String(),
+		Filter:                nil,
+		TotalStorage:          0,
+		Automatic:             len(w.config.Engine.DataWorkerP2PMultiaddrs) == 0,
+		Allocated:             false,
+	})
+}
+
 func (w *WorkerManager) getIPCOfWorker(coreId uint) (
+	protobufs.DataIPCServiceClient,
+	error,
+) {
+	ctx := w.currentContext()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return w.getIPCOfWorkerWithContext(ctx, coreId)
+}
+
+func (w *WorkerManager) getIPCOfWorkerWithTimeout(
+	coreId uint,
+	timeout time.Duration,
+) (protobufs.DataIPCServiceClient, error) {
+	ctx := w.currentContext()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	return w.getIPCOfWorkerWithContext(ctx, coreId)
+}
+
+func (w *WorkerManager) getIPCOfWorkerWithContext(
+	ctx context.Context,
+	coreId uint,
+) (
 	protobufs.DataIPCServiceClient,
 	error,
 ) {
@@ -809,12 +863,21 @@ func (w *WorkerManager) getIPCOfWorker(coreId uint) (
 	}
 
 	w.logger.Info("reconnecting to worker", zap.Uint("core_id", coreId))
-	addr, err := w.getMultiaddrOfWorker(coreId)
+	streamAddr, err := w.getMultiaddrOfWorker(coreId)
 	if err != nil {
 		return nil, errors.Wrap(err, "get ipc of worker")
 	}
 
-	mga, err := mn.ToNetAddr(addr)
+	p2pAddr, err := w.getP2PMultiaddrOfWorker(coreId)
+	if err != nil {
+		return nil, errors.Wrap(err, "get ipc of worker")
+	}
+
+	if err := w.ensureWorkerRegistered(coreId, p2pAddr, streamAddr); err != nil {
+		return nil, errors.Wrap(err, "get ipc of worker")
+	}
+
+	mga, err := mn.ToNetAddr(streamAddr)
 	if err != nil {
 		return nil, errors.Wrap(err, "get ipc of worker")
 	}
@@ -823,25 +886,6 @@ func (w *WorkerManager) getIPCOfWorker(coreId uint) (
 	if err != nil {
 		w.logger.Error("error unmarshaling peerkey", zap.Error(err))
 		return nil, errors.Wrap(err, "get ipc of worker")
-	}
-
-	if !w.hasWorkerFilter(coreId) {
-		p2pAddr, err := w.getP2PMultiaddrOfWorker(coreId)
-		if err != nil {
-			return nil, errors.Wrap(err, "get ipc of worker")
-		}
-		err = w.registerWorker(&typesStore.WorkerInfo{
-			CoreId:                coreId,
-			ListenMultiaddr:       p2pAddr.String(),
-			StreamListenMultiaddr: addr.String(),
-			Filter:                nil,
-			TotalStorage:          0,
-			Automatic:             len(w.config.Engine.DataWorkerP2PMultiaddrs) == 0,
-			Allocated:             false,
-		})
-		if err != nil {
-			return nil, errors.Wrap(err, "get ipc of worker")
-		}
 	}
 
 	privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)
@@ -874,16 +918,120 @@ func (w *WorkerManager) getIPCOfWorker(coreId uint) (
 		return nil, errors.Wrap(err, "get ipc of worker")
 	}
 
-	client, err := grpc.NewClient(
+	return w.dialWorkerWithRetry(
+		ctx,
+		coreId,
 		mga.String(),
 		grpc.WithTransportCredentials(creds),
 	)
-	if err != nil {
-		return nil, errors.Wrap(err, "get ipc of worker")
+}
+
+func (w *WorkerManager) dialWorkerWithRetry(
+	ctx context.Context,
+	coreId uint,
+	target string,
+	opts ...grpc.DialOption,
+) (protobufs.DataIPCServiceClient, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	w.setServiceClient(coreId, client)
-	return protobufs.NewDataIPCServiceClient(client), nil
+	const (
+		initialBackoff = 50 * time.Millisecond
+		maxBackoff     = 5 * time.Second
+	)
+
+	backoff := initialBackoff
+	for {
+		client, err := grpc.NewClient(target, opts...)
+		if err == nil {
+			w.setServiceClient(coreId, client)
+			return protobufs.NewDataIPCServiceClient(client), nil
+		}
+
+		w.logger.Info(
+			"worker dial failed, retrying",
+			zap.Uint("core_id", coreId),
+			zap.String("target", target),
+			zap.Duration("backoff", backoff),
+			zap.Error(err),
+		)
+
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, errors.Wrap(ctx.Err(), "get ipc of worker")
+		}
+
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func (w *WorkerManager) respawnWorker(
+	coreId uint,
+	filter []byte,
+) error {
+	const (
+		respawnTimeout    = 5 * time.Second
+		initialBackoff    = 50 * time.Millisecond
+		maxRespawnBackoff = 2 * time.Second
+	)
+
+	managerCtx := w.currentContext()
+	if managerCtx == nil {
+		managerCtx = context.Background()
+	}
+
+	backoff := initialBackoff
+	for {
+		svc, err := w.getIPCOfWorker(coreId)
+		if err != nil {
+			w.logger.Error(
+				"could not get ipc of worker",
+				zap.Uint("core_id", coreId),
+				zap.Error(err),
+			)
+			select {
+			case <-time.After(backoff):
+			case <-managerCtx.Done():
+				return errors.Wrap(managerCtx.Err(), "respawn worker")
+			}
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(managerCtx, respawnTimeout)
+		_, err = svc.Respawn(ctx, &protobufs.RespawnRequest{Filter: filter})
+		cancel()
+		if err == nil {
+			return nil
+		}
+
+		w.logger.Warn(
+			"worker respawn failed, retrying",
+			zap.Uint("core_id", coreId),
+			zap.Duration("backoff", backoff),
+			zap.Error(err),
+		)
+		w.closeServiceClient(coreId)
+
+		select {
+		case <-time.After(backoff):
+		case <-managerCtx.Done():
+			return errors.Wrap(managerCtx.Err(), "respawn worker")
+		}
+
+		if backoff < maxRespawnBackoff {
+			backoff *= 2
+			if backoff > maxRespawnBackoff {
+				backoff = maxRespawnBackoff
+			}
+		}
+	}
 }
 
 func (w *WorkerManager) spawnDataWorkers() {

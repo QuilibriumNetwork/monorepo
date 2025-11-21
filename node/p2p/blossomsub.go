@@ -13,6 +13,7 @@ import (
 	"math/bits"
 	"net"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +56,7 @@ import (
 )
 
 const (
-	DecayInterval = 10 * time.Second
+	DecayInterval = 10 * time.Minute
 	AppDecay      = .9
 )
 
@@ -309,11 +310,11 @@ func NewBlossomSubWithHost(
 		},
 		&blossomsub.PeerScoreThresholds{
 			SkipAtomicValidation:        false,
-			GossipThreshold:             -2000,
-			PublishThreshold:            -5000,
-			GraylistThreshold:           -10000,
-			AcceptPXThreshold:           1,
-			OpportunisticGraftThreshold: 2,
+			GossipThreshold:             -500,
+			PublishThreshold:            -1000,
+			GraylistThreshold:           -2500,
+			AcceptPXThreshold:           1000,
+			OpportunisticGraftThreshold: 3.5,
 		},
 	))
 	blossomOpts = append(blossomOpts, observability.WithPrometheusRawTracer())
@@ -711,32 +712,111 @@ func NewBlossomSub(
 	if tracer != nil {
 		blossomOpts = append(blossomOpts, blossomsub.WithEventTracer(tracer))
 	}
-	blossomOpts = append(blossomOpts, blossomsub.WithPeerScore(
-		&blossomsub.PeerScoreParams{
-			SkipAtomicValidation:        false,
-			BitmaskScoreCap:             0,
-			IPColocationFactorWeight:    0,
-			IPColocationFactorThreshold: 6,
-			BehaviourPenaltyWeight:      -10,
-			BehaviourPenaltyThreshold:   100,
-			BehaviourPenaltyDecay:       .5,
-			DecayInterval:               DecayInterval,
-			DecayToZero:                 .1,
-			RetainScore:                 60 * time.Minute,
-			AppSpecificScore: func(p peer.ID) float64 {
-				return float64(bs.GetPeerScore([]byte(p)))
+
+	GLOBAL_CONSENSUS_BITMASK := []byte{0x00}
+	GLOBAL_FRAME_BITMASK := []byte{0x00, 0x00}
+	GLOBAL_PROVER_BITMASK := []byte{0x00, 0x00, 0x00}
+	GLOBAL_PEER_INFO_BITMASK := []byte{0x00, 0x00, 0x00, 0x00}
+	GLOBAL_ALERT_BITMASK := bytes.Repeat([]byte{0x00}, 16)
+	sets := getBitmaskSets(bytes.Repeat([]byte{0xff}, 32))
+	sets = slices.Concat([][]byte{
+		GLOBAL_CONSENSUS_BITMASK,
+		GLOBAL_FRAME_BITMASK,
+		GLOBAL_PROVER_BITMASK,
+		GLOBAL_PEER_INFO_BITMASK,
+		GLOBAL_ALERT_BITMASK,
+	}, sets)
+	bitmasksScoring := map[string]*blossomsub.BitmaskScoreParams{}
+	for _, set := range sets {
+		bitmasksScoring[string(set)] = &blossomsub.BitmaskScoreParams{
+			SkipAtomicValidation:         false,
+			BitmaskWeight:                0.1,
+			TimeInMeshWeight:             0.00027,
+			TimeInMeshQuantum:            time.Second,
+			TimeInMeshCap:                1,
+			FirstMessageDeliveriesWeight: 5,
+			FirstMessageDeliveriesDecay: blossomsub.ScoreParameterDecay(
+				10 * time.Minute,
+			),
+			FirstMessageDeliveriesCap:      10000,
+			InvalidMessageDeliveriesWeight: -1000,
+			InvalidMessageDeliveriesDecay:  blossomsub.ScoreParameterDecay(time.Hour),
+		}
+	}
+
+	if p2pConfig.Network != 0 {
+		blossomOpts = append(blossomOpts, blossomsub.WithPeerScore(
+			&blossomsub.PeerScoreParams{
+				SkipAtomicValidation:        false,
+				Bitmasks:                    bitmasksScoring,
+				BitmaskScoreCap:             0,
+				IPColocationFactorWeight:    0,
+				IPColocationFactorThreshold: 6,
+				BehaviourPenaltyWeight:      -10,
+				BehaviourPenaltyThreshold:   6,
+				BehaviourPenaltyDecay:       .5,
+				DecayInterval:               DecayInterval,
+				DecayToZero:                 .1,
+				RetainScore:                 60 * time.Minute,
+				AppSpecificScore: func(p peer.ID) float64 {
+					return float64(bs.GetPeerScore([]byte(p)))
+				},
+				AppSpecificWeight: 10.0,
 			},
-			AppSpecificWeight: 10.0,
-		},
-		&blossomsub.PeerScoreThresholds{
-			SkipAtomicValidation:        false,
-			GossipThreshold:             -2000,
-			PublishThreshold:            -5000,
-			GraylistThreshold:           -10000,
-			AcceptPXThreshold:           1,
-			OpportunisticGraftThreshold: 2,
-		},
-	))
+			&blossomsub.PeerScoreThresholds{
+				SkipAtomicValidation:        false,
+				GossipThreshold:             -500,
+				PublishThreshold:            -1000,
+				GraylistThreshold:           -2500,
+				AcceptPXThreshold:           1000,
+				OpportunisticGraftThreshold: 3.5,
+			},
+		))
+
+	} else {
+		whitelist := []*net.IPNet{}
+		for _, p := range directPeers {
+			for _, i := range p.Addrs {
+				ipnet, err := MultiaddrToIPNet(i)
+				if err != nil {
+					logger.Error(
+						"could not convert direct peer for ip colocation whitelist",
+						zap.String("peer_addr", i.String()),
+						zap.Error(err),
+					)
+				}
+				whitelist = append(whitelist, ipnet)
+			}
+		}
+		blossomOpts = append(blossomOpts, blossomsub.WithPeerScore(
+			&blossomsub.PeerScoreParams{
+				SkipAtomicValidation:        false,
+				Bitmasks:                    bitmasksScoring,
+				BitmaskScoreCap:             0,
+				IPColocationFactorWeight:    -100,
+				IPColocationFactorThreshold: 6,
+				IPColocationFactorWhitelist: whitelist,
+				BehaviourPenaltyWeight:      -10,
+				BehaviourPenaltyThreshold:   6,
+				BehaviourPenaltyDecay:       .5,
+				DecayInterval:               DecayInterval,
+				DecayToZero:                 .1,
+				RetainScore:                 60 * time.Minute,
+				AppSpecificScore: func(p peer.ID) float64 {
+					return float64(bs.GetPeerScore([]byte(p)))
+				},
+				AppSpecificWeight: 10.0,
+			},
+			&blossomsub.PeerScoreThresholds{
+				SkipAtomicValidation:        false,
+				GossipThreshold:             -500,
+				PublishThreshold:            -1000,
+				GraylistThreshold:           -2500,
+				AcceptPXThreshold:           1000,
+				OpportunisticGraftThreshold: 3.5,
+			},
+		))
+	}
 	blossomOpts = append(blossomOpts,
 		blossomsub.WithValidateQueueSize(p2pConfig.ValidateQueueSize),
 		blossomsub.WithValidateWorkers(p2pConfig.ValidateWorkers),
@@ -1610,4 +1690,84 @@ func getNetworkNamespace(network uint8) string {
 // Close implements p2p.PubSub.
 func (b *BlossomSub) Close() error {
 	return nil
+}
+
+// MultiaddrToIPNet converts a multiaddr containing /ip4 or /ip6
+// into a *net.IPNet with a host mask (/32 or /128).
+func MultiaddrToIPNet(m ma.Multiaddr) (*net.IPNet, error) {
+	var (
+		ip     net.IP
+		ipBits int
+	)
+
+	// Walk components and grab the first IP we see.
+	ma.ForEach(m, func(c ma.Component, err error) bool {
+		if err != nil {
+			return false
+		}
+		switch c.Protocol().Code {
+		case ma.P_IP4:
+			if ip == nil {
+				ip = net.IP(c.RawValue()).To4()
+				ipBits = 32
+			}
+			return false
+
+		case ma.P_IP6:
+			if ip == nil {
+				ip = net.IP(c.RawValue()).To16()
+				ipBits = 128
+			}
+			return false
+		}
+		return true
+	})
+
+	if ip == nil {
+		return nil, fmt.Errorf("multiaddr has no ip4/ip6 component: %s", m)
+	}
+
+	mask := net.CIDRMask(ipBits, ipBits)
+
+	return &net.IPNet{
+		IP:   ip.Mask(mask),
+		Mask: mask,
+	}, nil
+}
+
+func getBitmaskSets(bitmask []byte) [][]byte {
+	sliced := [][]byte{}
+	if bytes.Equal(bitmask, make([]byte, len(bitmask))) {
+		sliced = append(sliced, bitmask)
+	} else {
+		for i, b := range bitmask {
+			if b == 0 {
+				continue
+			}
+
+			// fast: one bit in byte
+			if b&(b-1) == 0 {
+				slice := make([]byte, len(bitmask))
+				slice[i] = b
+				sliced = append(sliced, slice)
+				sliced = append(sliced, slices.Concat([]byte{0}, slice))
+				sliced = append(sliced, slices.Concat([]byte{0, 0}, slice))
+				sliced = append(sliced, slices.Concat([]byte{0, 0, 0}, slice))
+				continue
+			}
+
+			for j := 7; j >= 0; j-- {
+				if (b>>j)&1 == 1 {
+					slice := make([]byte, len(bitmask))
+					slice[i] = 1 << j
+					sliced = append(sliced, slice)
+					sliced = append(sliced, slices.Concat([]byte{0}, slice))
+					sliced = append(sliced, slices.Concat([]byte{0, 0}, slice))
+					sliced = append(sliced, slices.Concat([]byte{0, 0, 0}, slice))
+				}
+			}
+		}
+	}
+
+	return sliced
 }
