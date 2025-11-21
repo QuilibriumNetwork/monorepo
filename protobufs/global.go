@@ -5157,7 +5157,7 @@ func (p *PeerInfo) Validate() error {
 	}
 
 	// Validate patch version
-	if len(p.PatchVersion) == 0 {
+	if len(p.PatchNumber) == 0 {
 		return errors.Wrap(errors.New("missing patch version"), "validate")
 	}
 

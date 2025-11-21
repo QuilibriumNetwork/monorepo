@@ -34,7 +34,7 @@ message PeerInfo {
   // [byte 0].[byte 1].[byte 2]
   bytes version = 4;
   // The patch version of the node
-  bytes patch_version = 5;
+  bytes patch_number = 5;
   // The list of supported capabilities.
   repeated Capability capabilities = 6;
   // The public key of the node.
@@ -54,7 +54,7 @@ message NodeInfoResponse {
   bytes peer_seniority = 4;
   uint32 running_workers = 5;
   uint32 allocated_workers = 6;
-  bytes patchNumber = 7;
+  bytes patch_number = 7;
 }
 
 message WorkerInfo {

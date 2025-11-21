@@ -12,7 +12,7 @@ func GetMinimumVersionCutoff() time.Time {
 // Gets the minimum patch version – This should only be set in a release series
 // if there is something in the patch update that is needed to cut off
 // unupgraded peers. Be sure to update this to 0x00 for any new minor release.
-func GetMinimumPatchVersion() byte {
+func GetMinimumPatchNumber() byte {
 	return 0x04
 }
 

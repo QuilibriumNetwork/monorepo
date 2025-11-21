@@ -28,9 +28,9 @@ func TestPeerInfo_Serialization(t *testing.T) {
 						StreamMultiaddrs: []string{"/ip4/192.168.1.1/tcp/9091"},
 					},
 				},
-				Timestamp:    1234567890,
-				Version:      []byte{1, 0, 0}, // semantic version bytes
-				PatchVersion: []byte("patch-123"),
+				Timestamp:   1234567890,
+				Version:     []byte{1, 0, 0}, // semantic version bytes
+				PatchNumber: []byte("patch-123"),
 				Capabilities: []*Capability{
 					{
 						ProtocolIdentifier: 0x12345678,
@@ -56,9 +56,9 @@ func TestPeerInfo_Serialization(t *testing.T) {
 						StreamMultiaddrs: []string{"/ip4/10.0.0.1/tcp/7071"},
 					},
 				},
-				Timestamp:    9876543210,
-				Version:      []byte{2, 1, 3},
-				PatchVersion: []byte("patch-456"),
+				Timestamp:   9876543210,
+				Version:     []byte{2, 1, 3},
+				PatchNumber: []byte("patch-456"),
 				Capabilities: []*Capability{
 					{
 						ProtocolIdentifier: 0xABCDEF12,
@@ -76,7 +76,7 @@ func TestPeerInfo_Serialization(t *testing.T) {
 				Reachability: []*Reachability{},
 				Timestamp:    0,
 				Version:      []byte{},
-				PatchVersion: []byte{},
+				PatchNumber:  []byte{},
 				Capabilities: []*Capability{},
 				PublicKey:    []byte{},
 				Signature:    []byte{},
@@ -100,7 +100,7 @@ func TestPeerInfo_Serialization(t *testing.T) {
 			assert.Equal(t, tt.peer.PeerId, peer2.PeerId)
 			assert.Equal(t, tt.peer.Timestamp, peer2.Timestamp)
 			assert.Equal(t, tt.peer.Version, peer2.Version)
-			assert.Equal(t, tt.peer.PatchVersion, peer2.PatchVersion)
+			assert.Equal(t, tt.peer.PatchNumber, peer2.PatchNumber)
 			assert.Equal(t, tt.peer.PublicKey, peer2.PublicKey)
 			assert.Equal(t, tt.peer.Signature, peer2.Signature)
 

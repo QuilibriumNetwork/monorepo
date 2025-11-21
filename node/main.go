@@ -653,7 +653,7 @@ func printNodeInfo(logger *zap.Logger, cfg *config.Config) {
 		logger.Panic("failed to fetch node info", zap.Error(err))
 	}
 
-	if patch := formatPatchVersion(nodeInfo.PatchNumber); patch != "" {
+	if patch := formatPatchNumber(nodeInfo.PatchNumber); patch != "" {
 		fmt.Println("Version:", config.FormatVersion(nodeInfo.Version)+"."+patch)
 	} else {
 		fmt.Println("Version:", config.FormatVersion(nodeInfo.Version))
@@ -703,7 +703,7 @@ func printPeerInfo(logger *zap.Logger, cfg *config.Config) {
 		}
 
 		if len(p.Version) >= 3 {
-			if patch := formatPatchVersion(p.PatchVersion); patch != "" {
+			if patch := formatPatchNumber(p.PatchNumber); patch != "" {
 				fmt.Println("  Version:", config.FormatVersion(p.Version)+"."+patch)
 			} else {
 				fmt.Println("  Version:", config.FormatVersion(p.Version))
@@ -752,7 +752,7 @@ func capabilityDescription(id uint32) string {
 	return fmt.Sprintf("0x%08X", id)
 }
 
-func formatPatchVersion(raw []byte) string {
+func formatPatchNumber(raw []byte) string {
 	if len(raw) == 0 {
 		return ""
 	}

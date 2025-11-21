@@ -165,7 +165,7 @@ func (r *RPCServer) GetPeerInfo(
 			Timestamp:    pi.LastSeen,
 			Capabilities: cs,
 			Version:      pi.Version,
-			PatchVersion: pi.PatchNumber,
+			PatchNumber:  pi.PatchNumber,
 		})
 	}
 
