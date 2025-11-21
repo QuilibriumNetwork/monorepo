@@ -387,7 +387,7 @@ func (e *GlobalConsensusEngine) validateAppFrameMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		if frametime.AppFrameSince(frame) > 20*time.Second {
+		if frametime.AppFrameSince(frame) > 120*time.Second {
 			shardFrameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
@@ -453,6 +453,11 @@ func (e *GlobalConsensusEngine) validateFrameMessage(
 		}
 
 		if e.currentRank > frame.GetRank()+2 {
+			frameValidationTotal.WithLabelValues("ignore").Inc()
+			return tp2p.ValidationResultIgnore
+		}
+
+		if frametime.GlobalFrameSince(frame) > 120*time.Second {
 			frameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}

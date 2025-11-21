@@ -37,7 +37,7 @@ func TestInboxMessage_Serialization(t *testing.T) {
 			msg: &InboxMessage{
 				Address:            []byte{0xAA, 0xBB, 0xCC},
 				Timestamp:          uint64(time.Now().UnixMilli()),
-				EphemeralPublicKey: randomBytesDispatch(t, 64),
+				EphemeralPublicKey: randomBytesDispatch(t, 57),
 				Message:            randomBytesDispatch(t, 1024),
 			},
 		},

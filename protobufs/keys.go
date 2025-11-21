@@ -87,7 +87,7 @@ func (s *SignedX448Key) Validate() error {
 	}
 
 	// Parent key address should be non-zero bytes
-	if len(s.ParentKeyAddress) == 0 {
+	if len(s.ParentKeyAddress) == 0 || len(s.ParentKeyAddress) > 64 {
 		return errors.Wrap(
 			errors.New("invalid parent key address length"),
 			"validate",
@@ -173,7 +173,7 @@ func (s *SignedDecaf448Key) Validate() error {
 	}
 
 	// Parent key address should be non-zero bytes
-	if len(s.ParentKeyAddress) == 0 {
+	if len(s.ParentKeyAddress) == 0 || len(s.ParentKeyAddress) > 64 {
 		return errors.Wrap(
 			errors.New("invalid parent key address length"),
 			"validate",
@@ -245,8 +245,12 @@ func (k *KeyCollection) Validate() error {
 	}
 
 	// KeyPurpose should not be empty
-	if k.KeyPurpose == "" {
-		return errors.Wrap(errors.New("empty key purpose"), "validate")
+	if k.KeyPurpose == "" || len(k.KeyPurpose) > 32 {
+		return errors.Wrap(errors.New("invalid key purpose length"), "validate")
+	}
+
+	if len(k.X448Keys) > 20 {
+		return errors.Wrap(errors.New("invalid key collection length"), "validate")
 	}
 
 	// Validate all x448 keys
@@ -254,6 +258,10 @@ func (k *KeyCollection) Validate() error {
 		if err := key.Validate(); err != nil {
 			return errors.Wrap(errors.Wrapf(err, "key %d", i), "validate")
 		}
+	}
+
+	if len(k.Decaf448Keys) > 20 {
+		return errors.Wrap(errors.New("invalid key collection length"), "validate")
 	}
 
 	// Validate all decaf448 keys
@@ -272,6 +280,10 @@ func (k *KeyRegistry) Validate() error {
 			errors.New("nil key registry"),
 			"validate",
 		)
+	}
+
+	if len(k.KeysByPurpose) > 20 {
+		return errors.Wrap(errors.New("invalid purpose set length"), "validate")
 	}
 
 	// Validate keys by purpose map
@@ -389,8 +401,11 @@ func (s *SignedX448Key) Verify(
 		return errors.Wrap(errors.New("invalid length for key"), "verify")
 	}
 
-	if len(s.ParentKeyAddress) == 0 {
-		return errors.Wrap(errors.New("parent key address required"), "verify")
+	if len(s.ParentKeyAddress) == 0 || len(s.ParentKeyAddress) > 64 {
+		return errors.Wrap(
+			errors.New("invalid parent key address length"),
+			"verify",
+		)
 	}
 
 	// Verify signature and check that parent key address matches
@@ -515,8 +530,11 @@ func (s *SignedDecaf448Key) Verify(
 		return errors.Wrap(errors.New("invalid length for key"), "verify")
 	}
 
-	if len(s.ParentKeyAddress) == 0 {
-		return errors.Wrap(errors.New("parent key address required"), "verify")
+	if len(s.ParentKeyAddress) == 0 || len(s.ParentKeyAddress) > 64 {
+		return errors.Wrap(
+			errors.New("invalid parent key address length"),
+			"verify",
+		)
 	}
 
 	// Verify signature and check that parent key address matches
@@ -746,6 +764,9 @@ func (e *Ed448Signature) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if keyLen > 61 {
+		return errors.Wrap(errors.New("invalid key length"), "from canonical bytes")
+	}
 	if keyLen > 0 {
 		keyBytes := make([]byte, keyLen)
 		if _, err := buf.Read(keyBytes); err != nil {
@@ -761,6 +782,12 @@ func (e *Ed448Signature) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 114 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	e.Signature = make([]byte, sigLen)
 	if _, err := buf.Read(e.Signature); err != nil {
@@ -893,6 +920,9 @@ func (b *BLS48581Signature) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if keyLen > 589 {
+		return errors.Wrap(errors.New("invalid key length"), "from canonical bytes")
+	}
 	if keyLen > 0 {
 		keyBytes := make([]byte, keyLen)
 		if _, err := buf.Read(keyBytes); err != nil {
@@ -908,6 +938,12 @@ func (b *BLS48581Signature) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 74 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	b.Signature = make([]byte, sigLen)
 	if _, err := buf.Read(b.Signature); err != nil {
@@ -1007,6 +1043,12 @@ func (b *BLS48581SignatureWithProofOfPossession) FromCanonicalBytes(
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if sigLen != 74 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
+	}
 	b.Signature = make([]byte, sigLen)
 	if _, err := buf.Read(b.Signature); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1018,6 +1060,12 @@ func (b *BLS48581SignatureWithProofOfPossession) FromCanonicalBytes(
 		return errors.Wrap(err, "from canonical bytes")
 	}
 	if pubKeyLen > 0 {
+		if pubKeyLen != 589 {
+			return errors.Wrap(
+				errors.New("invalid pubkey length"),
+				"from canonical bytes",
+			)
+		}
 		pubKeyBytes := make([]byte, pubKeyLen)
 		if _, err := buf.Read(pubKeyBytes); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
@@ -1032,6 +1080,12 @@ func (b *BLS48581SignatureWithProofOfPossession) FromCanonicalBytes(
 	var popSigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &popSigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if popSigLen != 74 {
+		return errors.Wrap(
+			errors.New("invalid pop length"),
+			"from canonical bytes",
+		)
 	}
 	b.PopSignature = make([]byte, popSigLen)
 	if _, err := buf.Read(b.PopSignature); err != nil {
@@ -1103,6 +1157,12 @@ func (b *BLS48581AddressedSignature) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if sigLen != 74 && sigLen != (74+516) {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
+	}
 	b.Signature = make([]byte, sigLen)
 	if _, err := buf.Read(b.Signature); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1112,6 +1172,12 @@ func (b *BLS48581AddressedSignature) FromCanonicalBytes(data []byte) error {
 	var addrLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &addrLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if addrLen != 32 {
+		return errors.Wrap(
+			errors.New("invalid address length"),
+			"from canonical bytes",
+		)
 	}
 	b.Address = make([]byte, addrLen)
 	if _, err := buf.Read(b.Address); err != nil {
@@ -1205,6 +1271,12 @@ func (b *BLS48581AggregateSignature) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if sigLen != 74 && (sigLen > 74+(516*64) || ((sigLen-74)%516) != 0) {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
+	}
 	b.Signature = make([]byte, sigLen)
 	if _, err := buf.Read(b.Signature); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1214,6 +1286,12 @@ func (b *BLS48581AggregateSignature) FromCanonicalBytes(data []byte) error {
 	var pubKeyLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &pubKeyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if pubKeyLen != 0 && pubKeyLen != 589 {
+		return errors.Wrap(
+			errors.New("invalid pubkey length"),
+			"from canonical bytes",
+		)
 	}
 	if pubKeyLen > 0 {
 		pubKeyBytes := make([]byte, pubKeyLen)
@@ -1230,6 +1308,12 @@ func (b *BLS48581AggregateSignature) FromCanonicalBytes(data []byte) error {
 	var bitmaskLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &bitmaskLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if bitmaskLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid bitmask length"),
+			"from canonical bytes",
+		)
 	}
 	b.Bitmask = make([]byte, bitmaskLen)
 	if _, err := buf.Read(b.Bitmask); err != nil {
@@ -1414,6 +1498,12 @@ func (d *Decaf448Signature) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if keyLen != 60 && keyLen != 0 {
+		return errors.Wrap(
+			errors.New("invalid pubkey length"),
+			"from canonical bytes",
+		)
+	}
 	if keyLen > 0 {
 		keyBytes := make([]byte, keyLen)
 		if _, err := buf.Read(keyBytes); err != nil {
@@ -1429,6 +1519,12 @@ func (d *Decaf448Signature) FromCanonicalBytes(data []byte) error {
 	var sigLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 336 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
 	}
 	d.Signature = make([]byte, sigLen)
 	if _, err := buf.Read(d.Signature); err != nil {
@@ -1598,6 +1694,12 @@ func (s *SignedX448Key) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if keyLen > 61 {
+		return errors.Wrap(
+			errors.New("invalid pubkey length"),
+			"from canonical bytes",
+		)
+	}
 	if keyLen > 0 {
 		keyBytes := make([]byte, keyLen)
 		if _, err := buf.Read(keyBytes); err != nil {
@@ -1618,6 +1720,12 @@ func (s *SignedX448Key) FromCanonicalBytes(data []byte) error {
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if parentKeyAddressLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid address length"),
+			"from canonical bytes",
+		)
+	}
 	s.ParentKeyAddress = make([]byte, parentKeyAddressLen)
 	if _, err := buf.Read(s.ParentKeyAddress); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1634,6 +1742,13 @@ func (s *SignedX448Key) FromCanonicalBytes(data []byte) error {
 		var sigLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		// largest possible signature size
+		if sigLen > 675 {
+			return errors.Wrap(
+				errors.New("invalid signature length"),
+				"from canonical bytes",
+			)
 		}
 		sigBytes := make([]byte, sigLen)
 		if _, err := buf.Read(sigBytes); err != nil {
@@ -1678,6 +1793,12 @@ func (s *SignedX448Key) FromCanonicalBytes(data []byte) error {
 	var purposeLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &purposeLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if purposeLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid purpose length"),
+			"from canonical bytes",
+		)
 	}
 	purposeBytes := make([]byte, purposeLen)
 	if _, err := buf.Read(purposeBytes); err != nil {
@@ -1848,6 +1969,12 @@ func (s *SignedDecaf448Key) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if keyLen > 60 {
+		return errors.Wrap(
+			errors.New("invalid pubkey length"),
+			"from canonical bytes",
+		)
+	}
 	if keyLen > 0 {
 		keyBytes := make([]byte, keyLen)
 		if _, err := buf.Read(keyBytes); err != nil {
@@ -1868,6 +1995,12 @@ func (s *SignedDecaf448Key) FromCanonicalBytes(data []byte) error {
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if parentKeyAddressLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid address length"),
+			"from canonical bytes",
+		)
+	}
 	s.ParentKeyAddress = make([]byte, parentKeyAddressLen)
 	if _, err := buf.Read(s.ParentKeyAddress); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -1884,6 +2017,13 @@ func (s *SignedDecaf448Key) FromCanonicalBytes(data []byte) error {
 		var sigLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		// longest possible signature length
+		if sigLen > 675 {
+			return errors.Wrap(
+				errors.New("invalid signature length"),
+				"from canonical bytes",
+			)
 		}
 		sigBytes := make([]byte, sigLen)
 		if _, err := buf.Read(sigBytes); err != nil {
@@ -1928,6 +2068,12 @@ func (s *SignedDecaf448Key) FromCanonicalBytes(data []byte) error {
 	var purposeLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &purposeLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if purposeLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid purpose length"),
+			"from canonical bytes",
+		)
 	}
 	purposeBytes := make([]byte, purposeLen)
 	if _, err := buf.Read(purposeBytes); err != nil {
@@ -2113,7 +2259,13 @@ func (b *BLS48581AggregateSignature) Validate() error {
 		}
 	}
 
-	// Bitmask can be variable length
+	// Bitmask can be variable length, but should not exceed 32
+	if len(b.Bitmask) > 32 {
+		return errors.Wrap(
+			errors.New("invalid bitmask length"),
+			"validate",
+		)
+	}
 
 	return nil
 }
@@ -2316,6 +2468,12 @@ func (k *KeyCollection) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &purposeLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if purposeLen > 32 {
+		return errors.Wrap(
+			errors.New("invalid purpose length"),
+			"from canonical bytes",
+		)
+	}
 	purposeBytes := make([]byte, purposeLen)
 	if _, err := buf.Read(purposeBytes); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2327,13 +2485,24 @@ func (k *KeyCollection) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &x448KeysCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
-
+	if x448KeysCount > 20 {
+		return errors.Wrap(
+			errors.New("invalid x448 keys length"),
+			"from canonical bytes",
+		)
+	}
 	// Read each key
 	k.X448Keys = make([]*SignedX448Key, x448KeysCount)
 	for i := uint32(0); i < x448KeysCount; i++ {
 		var keyLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if keyLen > 869 {
+			return errors.Wrap(
+				errors.New("invalid key length"),
+				"from canonical bytes",
+			)
 		}
 		keyBytes := make([]byte, keyLen)
 		if _, err := buf.Read(keyBytes); err != nil {
@@ -2350,13 +2519,24 @@ func (k *KeyCollection) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &decaf448KeysCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
-
+	if decaf448KeysCount > 20 {
+		return errors.Wrap(
+			errors.New("invalid decaf448 keys length"),
+			"from canonical bytes",
+		)
+	}
 	// Read each key
 	k.Decaf448Keys = make([]*SignedDecaf448Key, decaf448KeysCount)
 	for i := uint32(0); i < decaf448KeysCount; i++ {
 		var keyLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &keyLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if keyLen > 869 {
+			return errors.Wrap(
+				errors.New("invalid key length"),
+				"from canonical bytes",
+			)
 		}
 		keyBytes := make([]byte, keyLen)
 		if _, err := buf.Read(keyBytes); err != nil {
@@ -2542,6 +2722,12 @@ func (k *KeyRegistry) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &identityKeyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if identityKeyLen > 61 {
+		return errors.Wrap(
+			errors.New("invalid identity key length"),
+			"from canonical bytes",
+		)
+	}
 	if identityKeyLen > 0 {
 		keyBytes := make([]byte, identityKeyLen)
 		if _, err := buf.Read(keyBytes); err != nil {
@@ -2557,6 +2743,12 @@ func (k *KeyRegistry) FromCanonicalBytes(data []byte) error {
 	var proverKeyLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &proverKeyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if proverKeyLen > 589 {
+		return errors.Wrap(
+			errors.New("invalid prover key length"),
+			"from canonical bytes",
+		)
 	}
 	if proverKeyLen > 0 {
 		keyBytes := make([]byte, proverKeyLen)
@@ -2578,6 +2770,12 @@ func (k *KeyRegistry) FromCanonicalBytes(data []byte) error {
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if identityToProverLen > 187 {
+		return errors.Wrap(
+			errors.New("invalid key length"),
+			"from canonical bytes",
+		)
+	}
 	if identityToProverLen > 0 {
 		sigBytes := make([]byte, identityToProverLen)
 		if _, err := buf.Read(sigBytes); err != nil {
@@ -2598,6 +2796,12 @@ func (k *KeyRegistry) FromCanonicalBytes(data []byte) error {
 	); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if proverToIdentityLen > 675 {
+		return errors.Wrap(
+			errors.New("invalid key length"),
+			"from canonical bytes",
+		)
+	}
 	if proverToIdentityLen > 0 {
 		sigBytes := make([]byte, proverToIdentityLen)
 		if _, err := buf.Read(sigBytes); err != nil {
@@ -2614,6 +2818,12 @@ func (k *KeyRegistry) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &mapCount); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if mapCount > 20 {
+		return errors.Wrap(
+			errors.New("invalid key map length"),
+			"from canonical bytes",
+		)
+	}
 
 	// Read each key collection in the map
 	k.KeysByPurpose = make(map[string]*KeyCollection)
@@ -2622,6 +2832,12 @@ func (k *KeyRegistry) FromCanonicalBytes(data []byte) error {
 		var purposeLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &purposeLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if purposeLen > 32 {
+			return errors.Wrap(
+				errors.New("invalid purpose length"),
+				"from canonical bytes",
+			)
 		}
 		purposeBytes := make([]byte, purposeLen)
 		if _, err := buf.Read(purposeBytes); err != nil {
@@ -2633,6 +2849,12 @@ func (k *KeyRegistry) FromCanonicalBytes(data []byte) error {
 		var collectionLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &collectionLen); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
+		}
+		if collectionLen > 27604 {
+			return errors.Wrap(
+				errors.New("invalid collection length"),
+				"from canonical bytes",
+			)
 		}
 		collectionBytes := make([]byte, collectionLen)
 		if _, err := buf.Read(collectionBytes); err != nil {

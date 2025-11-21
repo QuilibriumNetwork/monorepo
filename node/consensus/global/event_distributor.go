@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"slices"
+	"strings"
 	"time"
 
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -515,6 +516,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	shardsPaused := 0
 	logicalShards := 0
 	shardDivisions := 0
+	awaitingFrame := map[uint64]struct{}{}
 	for _, info := range shards {
 		resp, err := e.getAppShardsFromProver(
 			client,
@@ -547,6 +549,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 						allocated = allocation.Status != 4
 						if allocation.Status == typesconsensus.ProverStatusJoining {
 							shardsPending++
+							awaitingFrame[allocation.JoinFrameNumber+360] = struct{}{}
 						}
 						if allocation.Status == typesconsensus.ProverStatusActive {
 							shardsActive++
@@ -607,9 +610,15 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		}
 	}
 
+	awaitingFrames := []string{}
+	for frame := range awaitingFrame {
+		awaitingFrames = append(awaitingFrames, fmt.Sprintf("%d", frame))
+	}
+
 	e.logger.Info(
 		"status for allocations",
 		zap.Int("pending_joins", shardsPending),
+		zap.String("pending_join_frames", strings.Join(awaitingFrames, ", ")),
 		zap.Int("pending_leaves", shardsLeaving),
 		zap.Int("active", shardsActive),
 		zap.Int("paused", shardsPaused),
@@ -621,7 +630,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		proposals, err := e.proposer.PlanAndAllocate(
 			uint64(data.Frame.Header.Difficulty),
 			proposalDescriptors,
-			0,
+			100,
 			worldBytes,
 		)
 		if err != nil {

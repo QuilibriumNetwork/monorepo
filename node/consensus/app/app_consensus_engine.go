@@ -41,6 +41,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/dispatch"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/manager"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
+	keyedaggregator "source.quilibrium.com/quilibrium/monorepo/node/keyedaggregator"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p/onion"
@@ -107,8 +108,10 @@ type AppConsensusEngine struct {
 	peerInfoManager           tp2p.PeerInfoManager
 	currentDifficulty         uint32
 	currentDifficultyMu       sync.RWMutex
-	pendingMessages           []*protobufs.Message
-	pendingMessagesMu         sync.RWMutex
+	messageCollectors         *keyedaggregator.SequencedCollectors[sequencedAppMessage]
+	messageAggregator         *keyedaggregator.SequencedAggregator[sequencedAppMessage]
+	lastProposalRank          uint64
+	lastProposalRankMu        sync.RWMutex
 	collectedMessages         []*protobufs.Message
 	collectedMessagesMu       sync.RWMutex
 	provingMessages           []*protobufs.Message
@@ -256,7 +259,6 @@ func NewAppConsensusEngine(
 		proposalCache:              make(map[uint64]*protobufs.AppShardProposal),
 		pendingCertifiedParents:    make(map[uint64]*protobufs.AppShardProposal),
 		proofCache:                 make(map[uint64][516]byte),
-		pendingMessages:            []*protobufs.Message{},
 		collectedMessages:          []*protobufs.Message{},
 		provingMessages:            []*protobufs.Message{},
 		consensusMessageQueue:      make(chan *pb.Message, 1000),
@@ -457,11 +459,16 @@ func NewAppConsensusEngine(
 	executorsRegistered.WithLabelValues(engine.appAddressHex).Set(0)
 	pendingMessagesCount.WithLabelValues(engine.appAddressHex).Set(0)
 
+	if err := engine.initAppMessageAggregator(); err != nil {
+		return nil, errors.Wrap(err, "new app consensus engine")
+	}
+
 	componentBuilder := lifecycle.NewComponentManagerBuilder()
 	// Add execution engines
 	componentBuilder.AddWorker(engine.executionManager.Start)
 	componentBuilder.AddWorker(engine.eventDistributor.Start)
 	componentBuilder.AddWorker(engine.appTimeReel.Start)
+	componentBuilder.AddWorker(engine.startAppMessageAggregator)
 
 	latest, err := engine.consensusStore.GetConsensusState(engine.appAddress)
 	var state *models.CertifiedState[*protobufs.AppShardFrame]
@@ -518,6 +525,8 @@ func NewAppConsensusEngine(
 		}
 		pending = engine.getPendingProposals(frame.Header.FrameNumber)
 	}
+
+	engine.recordProposalRank(state.Rank())
 	liveness, err := engine.consensusStore.GetLivenessState(appAddress)
 	if err == nil {
 		engine.currentRank = liveness.CurrentRank

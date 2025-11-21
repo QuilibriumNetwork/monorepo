@@ -145,15 +145,6 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		)
 	}
 
-	_, err = p.engine.livenessProvider.Collect(
-		ctx,
-		prior.Header.FrameNumber+1,
-		rank,
-	)
-	if err != nil {
-		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
-	}
-
 	timer := prometheus.NewTimer(frameProvingDuration)
 	defer timer.ObserveDuration()
 

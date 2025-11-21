@@ -2,10 +2,10 @@ package app
 
 import (
 	"context"
-	"slices"
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	keyedaggregator "source.quilibrium.com/quilibrium/monorepo/node/keyedaggregator"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 )
 
@@ -42,23 +42,62 @@ func (p *AppLivenessProvider) Collect(
 		mixnetMessages = p.engine.mixnet.GetMessages()
 	}
 
-	finalizedMessages := []*protobufs.Message{}
-
-	// Get and clear pending messages
-	p.engine.pendingMessagesMu.Lock()
-	pendingMessages := p.engine.pendingMessages
-	p.engine.pendingMessages = []*protobufs.Message{}
-	p.engine.pendingMessagesMu.Unlock()
+	var collectorRecords []*sequencedAppMessage
+	var collector keyedaggregator.Collector[sequencedAppMessage]
+	if p.engine.messageCollectors != nil {
+		var err error
+		var found bool
+		collector, found, err = p.engine.getAppMessageCollector(rank)
+		if err != nil && !errors.Is(err, keyedaggregator.ErrSequenceBelowRetention) {
+			p.engine.logger.Warn(
+				"could not fetch collector for rank",
+				zap.Uint64("rank", rank),
+				zap.Error(err),
+			)
+		} else if found {
+			collectorRecords = collector.Records()
+		}
+	}
 
 	txMap := map[string][][]byte{}
-	for i, message := range slices.Concat(mixnetMessages, pendingMessages) {
+	finalizedMessages := make(
+		[]*protobufs.Message,
+		0,
+		len(collectorRecords)+len(mixnetMessages),
+	)
+
+	for _, record := range collectorRecords {
+		if record == nil || record.message == nil {
+			continue
+		}
+		lockedAddrs, err := p.engine.executionManager.Lock(
+			record.frameNumber,
+			record.message.Address,
+			record.message.Payload,
+		)
+		if err != nil {
+			p.engine.logger.Debug(
+				"message failed lock",
+				zap.Uint64("rank", rank),
+				zap.Error(err),
+			)
+			if collector != nil {
+				collector.Remove(record)
+			}
+			continue
+		}
+
+		txMap[string(record.message.Hash)] = lockedAddrs
+		finalizedMessages = append(finalizedMessages, record.message)
+	}
+
+	for i, message := range mixnetMessages {
 		lockedAddrs, err := p.validateAndLockMessage(frameNumber, i, message)
 		if err != nil {
 			continue
 		}
 
 		txMap[string(message.Hash)] = lockedAddrs
-
 		finalizedMessages = append(finalizedMessages, message)
 	}
 
@@ -71,7 +110,7 @@ func (p *AppLivenessProvider) Collect(
 		"collected messages",
 		zap.Int(
 			"total_message_count",
-			len(mixnetMessages)+len(pendingMessages),
+			len(mixnetMessages)+len(collectorRecords),
 		),
 		zap.Int("valid_message_count", len(finalizedMessages)),
 		zap.Uint64(
@@ -88,6 +127,11 @@ func (p *AppLivenessProvider) Collect(
 	if err != nil {
 		return CollectedCommitments{}, errors.Wrap(err, "collect")
 	}
+
+	if p.engine.messageAggregator != nil {
+		p.engine.messageAggregator.OnSequenceChange(rank, rank+1)
+	}
+	pendingMessagesCount.WithLabelValues(p.engine.appAddressHex).Set(0)
 
 	p.engine.collectedMessagesMu.Lock()
 	p.engine.collectedMessages = finalizedMessages

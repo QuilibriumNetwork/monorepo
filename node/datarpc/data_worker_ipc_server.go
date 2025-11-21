@@ -125,10 +125,7 @@ func (r *DataWorkerIPCServer) Respawn(
 	ctx context.Context,
 	req *protobufs.RespawnRequest,
 ) (*protobufs.RespawnResponse, error) {
-	err := r.RespawnServer(req.Filter)
-	if err != nil {
-		return nil, err
-	}
+	go r.RespawnServer(req.Filter)
 	return &protobufs.RespawnResponse{}, nil
 }
 

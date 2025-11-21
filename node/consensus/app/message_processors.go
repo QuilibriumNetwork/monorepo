@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"slices"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -376,6 +377,10 @@ func (e *AppConsensusEngine) processProposal(
 	e.trySealParentWithChild(proposal)
 	e.registerPendingCertifiedParent(proposal)
 
+	if proposal.State != nil {
+		e.recordProposalRank(proposal.State.GetRank())
+	}
+
 	return true
 }
 
@@ -714,17 +719,12 @@ func (e *AppConsensusEngine) handleProverMessage(message *pb.Message) {
 	)
 	switch typePrefix {
 	case protobufs.MessageBundleType:
-		// MessageBundle messages need to be collected for execution
-		// Store them in pendingMessages to be processed during Collect
 		hash := sha3.Sum256(message.Data)
-		e.pendingMessagesMu.Lock()
-		e.pendingMessages = append(e.pendingMessages, &protobufs.Message{
+		e.addAppMessage(&protobufs.Message{
 			Address: e.appAddress[:32],
 			Hash:    hash[:],
-			Payload: message.Data,
+			Payload: slices.Clone(message.Data),
 		})
-		e.pendingMessagesMu.Unlock()
-
 		e.logger.Debug(
 			"collected app request for execution",
 			zap.Uint32("type", typePrefix),

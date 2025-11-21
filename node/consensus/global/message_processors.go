@@ -219,11 +219,7 @@ func (e *GlobalConsensusEngine) handleProverMessage(message *pb.Message) {
 
 	switch typePrefix {
 	case protobufs.MessageBundleType:
-		// MessageBundle messages need to be collected for execution
-		// Store them in pendingMessages to be processed during Collect
-		e.pendingMessagesMu.Lock()
-		e.pendingMessages = append(e.pendingMessages, message.Data)
-		e.pendingMessagesMu.Unlock()
+		e.addGlobalMessage(message.Data)
 
 		e.logger.Debug(
 			"collected global request for execution",
@@ -338,7 +334,6 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 			shardFramesProcessedTotal.WithLabelValues("error").Inc()
 		}
 
-		e.pendingMessagesMu.Lock()
 		bundle := &protobufs.MessageBundle{
 			Requests: []*protobufs.MessageRequest{
 				&protobufs.MessageRequest{
@@ -353,12 +348,10 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 		bundleBytes, err := bundle.ToCanonicalBytes()
 		if err != nil {
 			e.logger.Error("failed to add shard bundle", zap.Error(err))
-			e.pendingMessagesMu.Unlock()
 			return
 		}
 
-		e.pendingMessages = append(e.pendingMessages, bundleBytes)
-		e.pendingMessagesMu.Unlock()
+		e.addGlobalMessage(bundleBytes)
 		e.frameStoreMu.Lock()
 		defer e.frameStoreMu.Unlock()
 		e.appFrameStore[string(frame.Header.Address)] = frame
@@ -1528,6 +1521,7 @@ func (e *GlobalConsensusEngine) handleVote(message *pb.Message) {
 	}
 
 	e.voteAggregator.AddVote(&vote)
+
 	voteProcessedTotal.WithLabelValues("success").Inc()
 }
 
@@ -1596,12 +1590,7 @@ func (e *GlobalConsensusEngine) handleTimeoutState(message *pb.Message) {
 }
 
 func (e *GlobalConsensusEngine) handleMessageBundle(message *pb.Message) {
-	// MessageBundle messages need to be collected for execution
-	// Store them in pendingMessages to be processed during Collect
-	e.pendingMessagesMu.Lock()
-	e.pendingMessages = append(e.pendingMessages, message.Data)
-	e.pendingMessagesMu.Unlock()
-
+	e.addGlobalMessage(message.Data)
 	e.logger.Debug("collected global request for execution")
 }
 

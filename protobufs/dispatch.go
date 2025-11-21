@@ -80,6 +80,12 @@ func (m *InboxMessage) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &addressLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if addressLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid address length"),
+			"from canonical bytes",
+		)
+	}
 	m.Address = make([]byte, addressLen)
 	if _, err := buf.Read(m.Address); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -95,6 +101,12 @@ func (m *InboxMessage) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &ephemeralKeyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if ephemeralKeyLen > 57 {
+		return errors.Wrap(
+			errors.New("invalid ephemeral key length"),
+			"from canonical bytes",
+		)
+	}
 	m.EphemeralPublicKey = make([]byte, ephemeralKeyLen)
 	if _, err := buf.Read(m.EphemeralPublicKey); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -104,6 +116,12 @@ func (m *InboxMessage) FromCanonicalBytes(data []byte) error {
 	var messageLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &messageLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if messageLen > 5*1024*1024 {
+		return errors.Wrap(
+			errors.New("invalid message length"),
+			"from canonical bytes",
+		)
 	}
 	m.Message = make([]byte, messageLen)
 	if _, err := buf.Read(m.Message); err != nil {
@@ -224,6 +242,12 @@ func (m *HubAddInboxMessage) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &addressLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if addressLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid address length"),
+			"from canonical bytes",
+		)
+	}
 	m.Address = make([]byte, addressLen)
 	if _, err := buf.Read(m.Address); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -233,6 +257,12 @@ func (m *HubAddInboxMessage) FromCanonicalBytes(data []byte) error {
 	var inboxKeyLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &inboxKeyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if inboxKeyLen > 57 {
+		return errors.Wrap(
+			errors.New("invalid inbox key length"),
+			"from canonical bytes",
+		)
 	}
 	m.InboxPublicKey = make([]byte, inboxKeyLen)
 	if _, err := buf.Read(m.InboxPublicKey); err != nil {
@@ -244,6 +274,12 @@ func (m *HubAddInboxMessage) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &hubKeyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if hubKeyLen > 57 {
+		return errors.Wrap(
+			errors.New("invalid hub key length"),
+			"from canonical bytes",
+		)
+	}
 	m.HubPublicKey = make([]byte, hubKeyLen)
 	if _, err := buf.Read(m.HubPublicKey); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -254,6 +290,12 @@ func (m *HubAddInboxMessage) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &inboxSignatureLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if inboxSignatureLen > 114 {
+		return errors.Wrap(
+			errors.New("invalid inbox signature length"),
+			"from canonical bytes",
+		)
+	}
 	m.InboxSignature = make([]byte, inboxSignatureLen)
 	if _, err := buf.Read(m.InboxSignature); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -263,6 +305,12 @@ func (m *HubAddInboxMessage) FromCanonicalBytes(data []byte) error {
 	var hubSignatureLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &hubSignatureLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if hubSignatureLen > 114 {
+		return errors.Wrap(
+			errors.New("invalid hub signature length"),
+			"from canonical bytes",
+		)
 	}
 	m.HubSignature = make([]byte, hubSignatureLen)
 	if _, err := buf.Read(m.HubSignature); err != nil {
@@ -386,6 +434,12 @@ func (m *HubDeleteInboxMessage) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &addressLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if addressLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid address length"),
+			"from canonical bytes",
+		)
+	}
 	m.Address = make([]byte, addressLen)
 	if _, err := buf.Read(m.Address); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -395,6 +449,12 @@ func (m *HubDeleteInboxMessage) FromCanonicalBytes(data []byte) error {
 	var inboxKeyLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &inboxKeyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if inboxKeyLen > 57 {
+		return errors.Wrap(
+			errors.New("invalid inbox key length"),
+			"from canonical bytes",
+		)
 	}
 	m.InboxPublicKey = make([]byte, inboxKeyLen)
 	if _, err := buf.Read(m.InboxPublicKey); err != nil {
@@ -406,6 +466,12 @@ func (m *HubDeleteInboxMessage) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &hubKeyLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if hubKeyLen > 57 {
+		return errors.Wrap(
+			errors.New("invalid hub key length"),
+			"from canonical bytes",
+		)
+	}
 	m.HubPublicKey = make([]byte, hubKeyLen)
 	if _, err := buf.Read(m.HubPublicKey); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -416,6 +482,12 @@ func (m *HubDeleteInboxMessage) FromCanonicalBytes(data []byte) error {
 	if err := binary.Read(buf, binary.BigEndian, &inboxSignatureLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
+	if inboxSignatureLen > 114 {
+		return errors.Wrap(
+			errors.New("invalid inbox signature length"),
+			"from canonical bytes",
+		)
+	}
 	m.InboxSignature = make([]byte, inboxSignatureLen)
 	if _, err := buf.Read(m.InboxSignature); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -425,6 +497,12 @@ func (m *HubDeleteInboxMessage) FromCanonicalBytes(data []byte) error {
 	var hubSignatureLen uint32
 	if err := binary.Read(buf, binary.BigEndian, &hubSignatureLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+	if hubSignatureLen > 114 {
+		return errors.Wrap(
+			errors.New("invalid hub signature length"),
+			"from canonical bytes",
+		)
 	}
 	m.HubSignature = make([]byte, hubSignatureLen)
 	if _, err := buf.Read(m.HubSignature); err != nil {

@@ -11,6 +11,7 @@ type WorkerManager interface {
 	Stop() error
 	AllocateWorker(coreId uint, filter []byte) error
 	DeallocateWorker(coreId uint) error
+	CheckWorkersConnected() ([]uint, error)
 	GetWorkerIdByFilter(filter []byte) (uint, error)
 	GetFilterByWorkerId(coreId uint) ([]byte, error)
 	RegisterWorker(info *store.WorkerInfo) error

@@ -735,6 +735,7 @@ func (e *ComputeExecutionEngine) handleBundle(
 	if err := fees.SanityCheck(feeQueue, consumers); err != nil {
 		return nil, errors.Wrap(err, "handle bundle")
 	}
+	responses.State = state
 
 	// Process each operation in the bundle sequentially
 	for i, op := range bundle.Requests {
@@ -787,7 +788,7 @@ func (e *ComputeExecutionEngine) handleBundle(
 			movingAddress,
 			op,
 			true,
-			state,
+			responses.State,
 		)
 		if err != nil {
 			return nil, errors.Wrapf(err, "handle bundle: operation %d failed", i)
@@ -807,7 +808,7 @@ func (e *ComputeExecutionEngine) handleBundle(
 
 		// Collect responses
 		responses.Messages = append(responses.Messages, opResponses.Messages...)
-		responses.State = state
+		responses.State = opResponses.State
 	}
 
 	e.logger.Info(
