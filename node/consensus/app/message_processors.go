@@ -1138,7 +1138,7 @@ func (e *AppConsensusEngine) validatePeerInfoSignature(
 		Reachability: peerInfo.Reachability,
 		Timestamp:    peerInfo.Timestamp,
 		Version:      peerInfo.Version,
-		PatchVersion: peerInfo.PatchVersion,
+		PatchNumber:  peerInfo.PatchNumber,
 		Capabilities: peerInfo.Capabilities,
 		PublicKey:    peerInfo.PublicKey,
 		// Exclude Signature field

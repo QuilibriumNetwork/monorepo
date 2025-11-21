@@ -112,11 +112,11 @@ func (p *PeerInfo) ToCanonicalBytes() ([]byte, error) {
 	if err := binary.Write(
 		buf,
 		binary.BigEndian,
-		uint32(len(p.PatchVersion)),
+		uint32(len(p.PatchNumber)),
 	); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
-	if _, err := buf.Write(p.PatchVersion); err != nil {
+	if _, err := buf.Write(p.PatchNumber); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
@@ -276,12 +276,12 @@ func (p *PeerInfo) FromCanonicalBytes(data []byte) error {
 	}
 
 	// Read patch_version
-	var patchVersionLen uint32
-	if err := binary.Read(buf, binary.BigEndian, &patchVersionLen); err != nil {
+	var patchNumberLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &patchNumberLen); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
-	p.PatchVersion = make([]byte, patchVersionLen)
-	if _, err := buf.Read(p.PatchVersion); err != nil {
+	p.PatchNumber = make([]byte, patchNumberLen)
+	if _, err := buf.Read(p.PatchNumber); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
 

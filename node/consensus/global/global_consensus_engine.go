@@ -1203,7 +1203,7 @@ func (e *GlobalConsensusEngine) GetPeerInfo() *protobufs.PeerInfo {
 		Reachability: reachability,
 		Timestamp:    time.Now().UnixMilli(),
 		Version:      config.GetVersion(),
-		PatchVersion: []byte{config.GetPatchNumber()},
+		PatchNumber:  []byte{config.GetPatchNumber()},
 		Capabilities: capabilities,
 		PublicKey:    e.pubsub.GetPublicKey(),
 	}
@@ -1911,7 +1911,7 @@ func (e *GlobalConsensusEngine) signPeerInfo(
 		Reachability: info.Reachability,
 		Timestamp:    info.Timestamp,
 		Version:      info.Version,
-		PatchVersion: info.PatchVersion,
+		PatchNumber:  info.PatchNumber,
 		Capabilities: info.Capabilities,
 		PublicKey:    info.PublicKey,
 		// Exclude Signature field
@@ -2051,7 +2051,7 @@ func (e *GlobalConsensusEngine) validatePeerInfoSignature(
 		Reachability: peerInfo.Reachability,
 		Timestamp:    peerInfo.Timestamp,
 		Version:      peerInfo.Version,
-		PatchVersion: peerInfo.PatchVersion,
+		PatchNumber:  peerInfo.PatchNumber,
 		Capabilities: peerInfo.Capabilities,
 		PublicKey:    peerInfo.PublicKey,
 		// Exclude Signature field

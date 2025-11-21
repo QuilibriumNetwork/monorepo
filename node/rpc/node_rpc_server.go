@@ -165,7 +165,7 @@ func (r *RPCServer) GetPeerInfo(
 			Timestamp:    pi.LastSeen,
 			Capabilities: cs,
 			Version:      pi.Version,
-			PatchVersion: pi.PatchNumber,
+			PatchNumber:  pi.PatchNumber,
 		})
 	}
 
@@ -217,6 +217,7 @@ func (r *RPCServer) GetNodeInfo(
 		PeerSeniority:    seniority.FillBytes(make([]byte, 8)),
 		RunningWorkers:   uint32(len(workers)),
 		AllocatedWorkers: allocated,
+		PatchNumber:      append([]byte{}, config.GetPatchNumber()),
 	}, nil
 }
 
