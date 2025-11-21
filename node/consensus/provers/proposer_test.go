@@ -21,6 +21,10 @@ type mockWorkerManager struct {
 	confirmed      [][]byte
 }
 
+func (m *mockWorkerManager) CheckWorkersConnected() ([]uint, error) {
+	panic("unimplemented")
+}
+
 func (m *mockWorkerManager) DecideAllocations(reject [][]byte, confirm [][]byte) error {
 	m.rejected = reject
 	m.confirmed = confirm
