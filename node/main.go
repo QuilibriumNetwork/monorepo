@@ -653,7 +653,12 @@ func printNodeInfo(logger *zap.Logger, cfg *config.Config) {
 		logger.Panic("failed to fetch node info", zap.Error(err))
 	}
 
-	fmt.Println("Version: " + config.FormatVersion(nodeInfo.Version))
+	if patch := formatPatchVersion(nodeInfo.PatchNumber); patch != "" {
+		fmt.Println("Version:", config.FormatVersion(nodeInfo.Version)+"."+patch)
+	} else {
+		fmt.Println("Version:", config.FormatVersion(nodeInfo.Version))
+	}
+
 	fmt.Println("Seniority: " + new(big.Int).SetBytes(
 		nodeInfo.PeerSeniority,
 	).String())
