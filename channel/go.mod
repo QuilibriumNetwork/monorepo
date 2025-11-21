@@ -1,6 +1,6 @@
 module source.quilibrium.com/quilibrium/monorepo/channel
 
-go 1.23.2
+go 1.24.0
 
 // A necessary hack until source.quilibrium.com is open to all
 replace source.quilibrium.com/quilibrium/monorepo/nekryptology => ../nekryptology
@@ -21,7 +21,7 @@ replace source.quilibrium.com/quilibrium/monorepo/utils => ../utils
 
 require (
 	github.com/pkg/errors v0.9.1
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 	source.quilibrium.com/quilibrium/monorepo/types v0.0.0-00010101000000-000000000000
 )
 
@@ -57,7 +57,6 @@ require (
 	lukechampine.com/blake3 v1.4.1 // indirect
 	source.quilibrium.com/quilibrium/monorepo/consensus v0.0.0-00010101000000-000000000000 // indirect
 	source.quilibrium.com/quilibrium/monorepo/protobufs v0.0.0-00010101000000-000000000000 // indirect
-
 )
 
 require (

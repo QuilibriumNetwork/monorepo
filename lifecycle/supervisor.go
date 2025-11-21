@@ -171,7 +171,7 @@ func topoOrder(
 		indeg[name] = 0
 	}
 	for name := range nodes {
-		for _ = range parents[name] {
+		for range parents[name] {
 			indeg[name]++
 		}
 	}

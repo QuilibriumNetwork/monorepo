@@ -1,8 +1,6 @@
 module source.quilibrium.com/quilibrium/monorepo/rpm
 
-go 1.23.2
-
-toolchain go1.23.4
+go 1.24.0
 
 // A necessary hack until source.quilibrium.com is open to all
 replace source.quilibrium.com/quilibrium/monorepo/nekryptology => ../nekryptology
@@ -26,6 +24,8 @@ replace source.quilibrium.com/quilibrium/monorepo/consensus => ../consensus
 replace github.com/multiformats/go-multiaddr => ../go-multiaddr
 
 replace github.com/multiformats/go-multiaddr-dns => ../go-multiaddr-dns
+
+replace source.quilibrium.com/quilibrium/monorepo/lifecycle => ../lifecycle
 
 require source.quilibrium.com/quilibrium/monorepo/nekryptology v0.0.0-00010101000000-000000000000
 
@@ -69,6 +69,7 @@ require (
 	github.com/multiformats/go-varint v0.0.7 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476 // indirect
 	golang.org/x/net v0.41.0 // indirect
@@ -83,5 +84,6 @@ require (
 	source.quilibrium.com/quilibrium/monorepo/config v0.0.0-00010101000000-000000000000 // indirect
 	source.quilibrium.com/quilibrium/monorepo/consensus v0.0.0-00010101000000-000000000000 // indirect
 	source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub v0.0.0-00010101000000-000000000000 // indirect
+	source.quilibrium.com/quilibrium/monorepo/lifecycle v0.0.0-00010101000000-000000000000 // indirect
 	source.quilibrium.com/quilibrium/monorepo/utils v0.0.0-00010101000000-000000000000 // indirect
 )

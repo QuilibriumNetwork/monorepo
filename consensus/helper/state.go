@@ -305,7 +305,7 @@ func WithPreviousRankTimeoutCertificate[StateT models.Unique](previousRankTimeou
 
 func WithWeightedIdentityList(count int) []models.WeightedIdentity {
 	wi := []models.WeightedIdentity{}
-	for _ = range count {
+	for range count {
 		wi = append(wi, &TestWeightedIdentity{
 			ID: MakeIdentity(),
 		})
