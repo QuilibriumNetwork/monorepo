@@ -214,7 +214,6 @@ func (r *RPCServer) GetNodeInfo(
 		PeerId:           peer.ID(peerID).String(),
 		PeerScore:        uint64(r.pubSub.GetPeerScore(peerID)),
 		Version:          append([]byte{}, config.GetVersion()...),
-		PatchNumber:     []byte{config.GetPatchNumber()},
 		PeerSeniority:    seniority.FillBytes(make([]byte, 8)),
 		RunningWorkers:   uint32(len(workers)),
 		AllocatedWorkers: allocated,
