@@ -1,6 +1,6 @@
 module source.quilibrium.com/quilibrium/monorepo/conntest
 
-go 1.23.2
+go 1.24.0
 
 replace source.quilibrium.com/quilibrium/monorepo/nekryptology => ../nekryptology
 
@@ -43,6 +43,8 @@ replace github.com/libp2p/go-libp2p => ../go-libp2p
 replace github.com/libp2p/go-libp2p-kad-dht => ../go-libp2p-kad-dht
 
 replace source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub => ../go-libp2p-blossomsub
+
+replace source.quilibrium.com/quilibrium/monorepo/lifecycle => ../lifecycle
 
 require (
 	github.com/libp2p/go-libp2p v0.41.1
@@ -96,8 +98,11 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.3 // indirect
 	github.com/multiformats/go-multiaddr v0.16.1 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250303144028-a0af3efb3deb // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250303144028-a0af3efb3deb // indirect
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
+	source.quilibrium.com/quilibrium/monorepo/lifecycle v0.0.0-00010101000000-000000000000 // indirect
 )
 
 require (
@@ -178,8 +183,8 @@ require (
 	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476 // indirect
 	golang.org/x/mod v0.25.0 // indirect
 	golang.org/x/net v0.41.0 // indirect
-	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
+	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/text v0.26.0 // indirect
 	golang.org/x/tools v0.34.0 // indirect
 	gonum.org/v1/gonum v0.13.0 // indirect
