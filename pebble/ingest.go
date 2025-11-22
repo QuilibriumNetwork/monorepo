@@ -1252,9 +1252,6 @@ func (d *DB) handleIngestAsFlushable(meta []*fileMetadata, seqNum uint64) error 
 		// ingestedFlushable in the flushable queue. The mutable memtable
 		// will be created below.
 		newLogNum, _ = d.recycleWAL()
-		if err != nil {
-			return err
-		}
 	}
 
 	currMem := d.mu.mem.mutable

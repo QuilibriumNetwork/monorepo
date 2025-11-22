@@ -6,9 +6,8 @@ package metamorphic
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"sort"
-
-	"golang.org/x/exp/rand"
 )
 
 // objTag identifies the type for an object: DB, Batch, Iter, or Snapshot.
@@ -77,7 +76,7 @@ func (s *objIDSlice) remove(id objID) {
 }
 
 func (s *objIDSlice) rand(rng *rand.Rand) objID {
-	return (*s)[rng.Intn(len(*s))]
+	return (*s)[rng.IntN(len(*s))]
 }
 
 // objIDSet is an unordered set of object IDs.

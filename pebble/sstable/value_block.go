@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"math/rand/v2"
 	"sync"
 	"unsafe"
 
@@ -15,7 +16,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
-	"golang.org/x/exp/rand"
 )
 
 // Value blocks are supported in TableFormatPebblev3.
@@ -445,7 +445,9 @@ func releaseToValueBlockBufPool(pool *sync.Pool, b *blockBuffer) {
 			length = 1000
 		}
 		b.b = b.b[:length:length]
-		rand.Read(b.b)
+		for j := range b.b {
+			b.b[j] = byte(rand.Uint32())
+		}
 	}
 	pool.Put(b)
 }
@@ -889,7 +891,7 @@ func (r *valueBlockReader) doValueMangling(v []byte) []byte {
 	// Randomly set the bytes in the previous retrieved value to 0, since
 	// property P1 only requires the valueBlockReader to maintain the memory of
 	// one fetched value.
-	if rand.Intn(2) == 0 {
+	if rand.IntN(2) == 0 {
 		for i := range r.bufToMangle {
 			r.bufToMangle[i] = 0
 		}

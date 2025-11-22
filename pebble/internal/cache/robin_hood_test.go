@@ -7,23 +7,23 @@ package cache
 import (
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"runtime"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/pebble/internal/base"
-	"golang.org/x/exp/rand"
 )
 
 func TestRobinHoodMap(t *testing.T) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	rhMap := newRobinHoodMap(0)
 	defer rhMap.free()
 
 	goMap := make(map[key]*entry)
 
 	randomKey := func() key {
-		n := rng.Intn(len(goMap))
+		n := rng.IntN(len(goMap))
 		for k := range goMap {
 			if n == 0 {
 				return k
@@ -33,7 +33,7 @@ func TestRobinHoodMap(t *testing.T) {
 		return key{}
 	}
 
-	ops := 10000 + rng.Intn(10000)
+	ops := 10000 + rng.IntN(10000)
 	for i := 0; i < ops; i++ {
 		var which float64
 		if len(goMap) > 0 {
@@ -90,11 +90,11 @@ func TestRobinHoodMap(t *testing.T) {
 const benchSize = 1 << 20
 
 func BenchmarkGoMapInsert(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	keys := make([]key, benchSize)
 	for i := range keys {
-		keys[i].fileNum = base.FileNum(rng.Uint64n(1 << 20)).DiskFileNum()
-		keys[i].offset = uint64(rng.Intn(1 << 20))
+		keys[i].fileNum = base.FileNum(rng.Uint64N(1 << 20)).DiskFileNum()
+		keys[i].offset = uint64(rng.IntN(1 << 20))
 	}
 	b.ResetTimer()
 
@@ -111,11 +111,11 @@ func BenchmarkGoMapInsert(b *testing.B) {
 }
 
 func BenchmarkRobinHoodInsert(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	keys := make([]key, benchSize)
 	for i := range keys {
-		keys[i].fileNum = base.FileNum(rng.Uint64n(1 << 20)).DiskFileNum()
-		keys[i].offset = uint64(rng.Intn(1 << 20))
+		keys[i].fileNum = base.FileNum(rng.Uint64N(1 << 20)).DiskFileNum()
+		keys[i].offset = uint64(rng.IntN(1 << 20))
 	}
 	e := &entry{}
 	b.ResetTimer()
@@ -135,13 +135,13 @@ func BenchmarkRobinHoodInsert(b *testing.B) {
 }
 
 func BenchmarkGoMapLookupHit(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	keys := make([]key, benchSize)
 	m := make(map[key]*entry, len(keys))
 	e := &entry{}
 	for i := range keys {
-		keys[i].fileNum = base.FileNum(rng.Uint64n(1 << 20)).DiskFileNum()
-		keys[i].offset = uint64(rng.Intn(1 << 20))
+		keys[i].fileNum = base.FileNum(rng.Uint64N(1 << 20)).DiskFileNum()
+		keys[i].offset = uint64(rng.IntN(1 << 20))
 		m[keys[i]] = e
 	}
 	b.ResetTimer()
@@ -160,13 +160,13 @@ func BenchmarkGoMapLookupHit(b *testing.B) {
 }
 
 func BenchmarkRobinHoodLookupHit(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	keys := make([]key, benchSize)
 	m := newRobinHoodMap(len(keys))
 	e := &entry{}
 	for i := range keys {
-		keys[i].fileNum = base.FileNum(rng.Uint64n(1 << 20)).DiskFileNum()
-		keys[i].offset = uint64(rng.Intn(1 << 20))
+		keys[i].fileNum = base.FileNum(rng.Uint64N(1 << 20)).DiskFileNum()
+		keys[i].offset = uint64(rng.IntN(1 << 20))
 		m.Put(keys[i], e)
 	}
 	b.ResetTimer()
@@ -186,14 +186,14 @@ func BenchmarkRobinHoodLookupHit(b *testing.B) {
 }
 
 func BenchmarkGoMapLookupMiss(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	keys := make([]key, benchSize)
 	m := make(map[key]*entry, len(keys))
 	e := &entry{}
 	for i := range keys {
 		keys[i].id = 1
-		keys[i].fileNum = base.FileNum(rng.Uint64n(1 << 20)).DiskFileNum()
-		keys[i].offset = uint64(rng.Intn(1 << 20))
+		keys[i].fileNum = base.FileNum(rng.Uint64N(1 << 20)).DiskFileNum()
+		keys[i].offset = uint64(rng.IntN(1 << 20))
 		m[keys[i]] = e
 		keys[i].id = 2
 	}
@@ -213,14 +213,14 @@ func BenchmarkGoMapLookupMiss(b *testing.B) {
 }
 
 func BenchmarkRobinHoodLookupMiss(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	keys := make([]key, benchSize)
 	m := newRobinHoodMap(len(keys))
 	e := &entry{}
 	for i := range keys {
 		keys[i].id = 1
-		keys[i].fileNum = base.FileNum(rng.Uint64n(1 << 20)).DiskFileNum()
-		keys[i].offset = uint64(rng.Intn(1 << 20))
+		keys[i].fileNum = base.FileNum(rng.Uint64N(1 << 20)).DiskFileNum()
+		keys[i].offset = uint64(rng.IntN(1 << 20))
 		m.Put(keys[i], e)
 		keys[i].id = 2
 	}

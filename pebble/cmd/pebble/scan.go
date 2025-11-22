@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	rand "math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,7 +16,6 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/spf13/cobra"
-	"golang.org/x/exp/rand"
 )
 
 var scanConfig struct {
@@ -65,7 +65,7 @@ func runScan(cmd *cobra.Command, args []string) {
 			const count = 100000
 			const batch = 1000
 
-			rng := rand.New(rand.NewSource(1449168817))
+			rng := rand.New(rand.NewPCG(0, 1449168817))
 			keys := make([][]byte, count)
 
 			for i := 0; i < count; {
@@ -94,7 +94,7 @@ func runScan(cmd *cobra.Command, args []string) {
 				go func(i int) {
 					defer wg.Done()
 
-					rng := rand.New(rand.NewSource(uint64(i)))
+					rng := rand.New(rand.NewPCG(0, uint64(i)))
 					startKeyBuf := append(make([]byte, 0, 64), []byte("key-")...)
 					endKeyBuf := append(make([]byte, 0, 64), []byte("key-")...)
 					minTS := encodeUint64Ascending(nil, math.MaxUint64)
@@ -103,7 +103,7 @@ func runScan(cmd *cobra.Command, args []string) {
 						wait(limiter)
 
 						rows := int(rowDist.Uint64(rng))
-						startIdx := rng.Int31n(int32(len(keys) - rows))
+						startIdx := rng.Int32N(int32(len(keys) - rows))
 						startKey := encodeUint32Ascending(startKeyBuf[:4], uint32(startIdx))
 						endKey := encodeUint32Ascending(endKeyBuf[:4], uint32(startIdx+int32(rows)))
 

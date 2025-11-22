@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"log"
+	rand "math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +15,6 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/spf13/cobra"
-	"golang.org/x/exp/rand"
 )
 
 var syncConfig struct {
@@ -66,7 +66,7 @@ func runSync(cmd *cobra.Command, args []string) {
 				go func() {
 					defer wg.Done()
 
-					rand := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+					rand := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 					var raw []byte
 					var buf []byte
 					var block []byte

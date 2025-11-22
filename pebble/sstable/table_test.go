@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,7 +27,6 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 // nonsenseWords are words that aren't in testdata/h.txt.
@@ -252,16 +252,16 @@ func check(f vfs.File, comparer *Comparer, fp FilterPolicy) error {
 
 	// Check lower/upper bounds behavior. Randomly choose a lower and upper bound
 	// and then guarantee that iteration finds the expected number if entries.
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	sort.Strings(words)
 	for i := 0; i < 10; i++ {
 		lowerIdx := -1
 		upperIdx := len(words)
-		if rng.Intn(5) != 0 {
-			lowerIdx = rng.Intn(len(words))
+		if rng.IntN(5) != 0 {
+			lowerIdx = rng.IntN(len(words))
 		}
-		if rng.Intn(5) != 0 {
-			upperIdx = rng.Intn(len(words))
+		if rng.IntN(5) != 0 {
+			upperIdx = rng.IntN(len(words))
 		}
 		if lowerIdx > upperIdx {
 			lowerIdx, upperIdx = upperIdx, lowerIdx

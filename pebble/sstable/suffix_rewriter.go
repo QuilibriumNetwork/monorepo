@@ -501,7 +501,7 @@ func RewriteKeySuffixesViaWriter(
 		if err != nil {
 			return nil, err
 		}
-		if w.addPoint(scratch, val, false); err != nil {
+		if err = w.addPoint(scratch, val, false); err != nil {
 			return nil, err
 		}
 		k, v = i.Next()

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -21,7 +22,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/itertest"
 	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -193,9 +193,9 @@ func TestMemTable1000Entries(t *testing.T) {
 		t.Fatalf("count: got %v, want %v", got, want)
 	}
 	// Check random-access lookup.
-	r := rand.New(rand.NewSource(0))
+	r := rand.New(rand.NewPCG(0, 0))
 	for i := 0; i < 3*N; i++ {
-		j := r.Intn(N)
+		j := r.IntN(N)
 		k := []byte(strconv.Itoa(j))
 		v, err := m0.get(k)
 		require.NoError(t, err)
@@ -418,11 +418,11 @@ func buildMemTable(b *testing.B) (*memTable, [][]byte) {
 func BenchmarkMemTableIterSeekGE(b *testing.B) {
 	m, keys := buildMemTable(b)
 	iter := m.newIter(nil)
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		iter.SeekGE(keys[rng.Intn(len(keys))], base.SeekGEFlagsNone)
+		iter.SeekGE(keys[rng.IntN(len(keys))], base.SeekGEFlagsNone)
 	}
 }
 

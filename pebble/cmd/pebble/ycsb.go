@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,7 +20,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/cockroachdb/pebble/internal/rate"
 	"github.com/spf13/cobra"
-	"golang.org/x/exp/rand"
 )
 
 const (
@@ -225,9 +225,6 @@ func runYcsb(cmd *cobra.Command, args []string) error {
 
 	batchDist := ycsbConfig.batch
 	scanDist := ycsbConfig.scans
-	if err != nil {
-		return err
-	}
 
 	valueDist := ycsbConfig.values
 	y := newYcsb(weights, keyDist, batchDist, scanDist, valueDist)

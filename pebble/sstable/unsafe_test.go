@@ -8,12 +8,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"testing"
 	"time"
 	"unsafe"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestGetBytes(t *testing.T) {
@@ -50,7 +50,7 @@ func TestDecodeVarint(t *testing.T) {
 }
 
 func BenchmarkDecodeVarint(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	vals := make([]unsafe.Pointer, 10000)
 	for i := range vals {
 		buf := make([]byte, 5)

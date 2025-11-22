@@ -313,8 +313,8 @@ func order2CmpFunc[E any](data []E, a, b int, swaps *int, cmp func(a, b E) int) 
 // medianCmpFunc returns x where data[x] is the median of data[a],data[b],data[c], where x is a, b, or c.
 func medianCmpFunc[E any](data []E, a, b, c int, swaps *int, cmp func(a, b E) int) int {
 	a, b = order2CmpFunc(data, a, b, swaps, cmp)
-	b, c = order2CmpFunc(data, b, c, swaps, cmp)
-	a, b = order2CmpFunc(data, a, b, swaps, cmp)
+	b, _ = order2CmpFunc(data, b, c, swaps, cmp)
+	_, b = order2CmpFunc(data, a, b, swaps, cmp)
 	return b
 }
 

@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"log"
+	rand "math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +15,6 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/spf13/cobra"
-	"golang.org/x/exp/rand"
 )
 
 var queueConfig struct {
@@ -42,7 +42,7 @@ func queueTest() (test, *atomic.Int64) {
 		init: func(d DB, wg *sync.WaitGroup) {
 			var (
 				value []byte
-				rng   = rand.New(rand.NewSource(1449168817))
+				rng   = rand.New(rand.NewPCG(0, 1449168817))
 				queue = make([][]byte, queueConfig.size)
 			)
 			for i := 0; i < queueConfig.size; i++ {

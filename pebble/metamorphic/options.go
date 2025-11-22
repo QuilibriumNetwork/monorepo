@@ -7,6 +7,7 @@ package metamorphic
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,7 +23,6 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
-	"golang.org/x/exp/rand"
 )
 
 const (
@@ -439,13 +439,13 @@ func randomOptions(
 	{
 		var privateOpts bytes.Buffer
 		fmt.Fprintln(&privateOpts, `[Options]`)
-		if rng.Intn(3) == 0 /* 33% */ {
+		if rng.IntN(3) == 0 /* 33% */ {
 			fmt.Fprintln(&privateOpts, `  disable_delete_only_compactions=true`)
 		}
-		if rng.Intn(3) == 0 /* 33% */ {
+		if rng.IntN(3) == 0 /* 33% */ {
 			fmt.Fprintln(&privateOpts, `  disable_elision_only_compactions=true`)
 		}
-		if rng.Intn(5) == 0 /* 20% */ {
+		if rng.IntN(5) == 0 /* 20% */ {
 			fmt.Fprintln(&privateOpts, `  disable_lazy_combined_iteration=true`)
 		}
 		if privateOptsStr := privateOpts.String(); privateOptsStr != `[Options]\n` {
@@ -453,68 +453,68 @@ func randomOptions(
 		}
 	}
 
-	opts.BytesPerSync = 1 << uint(rng.Intn(28))     // 1B - 256MB
-	opts.Cache = cache.New(1 << uint(rng.Intn(30))) // 1B - 1GB
-	opts.DisableWAL = rng.Intn(2) == 0
-	opts.FlushDelayDeleteRange = time.Millisecond * time.Duration(5*rng.Intn(245)) // 5-250ms
-	opts.FlushDelayRangeKey = time.Millisecond * time.Duration(5*rng.Intn(245))    // 5-250ms
-	opts.FlushSplitBytes = 1 << rng.Intn(20)                                       // 1B - 1MB
+	opts.BytesPerSync = 1 << uint(rng.IntN(28))     // 1B - 256MB
+	opts.Cache = cache.New(1 << uint(rng.IntN(30))) // 1B - 1GB
+	opts.DisableWAL = rng.IntN(2) == 0
+	opts.FlushDelayDeleteRange = time.Millisecond * time.Duration(5*rng.IntN(245)) // 5-250ms
+	opts.FlushDelayRangeKey = time.Millisecond * time.Duration(5*rng.IntN(245))    // 5-250ms
+	opts.FlushSplitBytes = 1 << rng.IntN(20)                                       // 1B - 1MB
 	opts.FormatMajorVersion = minimumFormatMajorVersion
 	n := int(newestFormatMajorVersionToTest - opts.FormatMajorVersion)
-	opts.FormatMajorVersion += pebble.FormatMajorVersion(rng.Intn(n + 1))
-	opts.Experimental.L0CompactionConcurrency = 1 + rng.Intn(4) // 1-4
-	opts.Experimental.LevelMultiplier = 5 << rng.Intn(7)        // 5 - 320
-	opts.TargetByteDeletionRate = 1 << uint(20+rng.Intn(10))    // 1MB - 1GB
-	opts.Experimental.ValidateOnIngest = rng.Intn(2) != 0
-	opts.L0CompactionThreshold = 1 + rng.Intn(100)     // 1 - 100
-	opts.L0CompactionFileThreshold = 1 << rng.Intn(11) // 1 - 1024
-	opts.L0StopWritesThreshold = 1 + rng.Intn(100)     // 1 - 100
+	opts.FormatMajorVersion += pebble.FormatMajorVersion(rng.IntN(n + 1))
+	opts.Experimental.L0CompactionConcurrency = 1 + rng.IntN(4) // 1-4
+	opts.Experimental.LevelMultiplier = 5 << rng.IntN(7)        // 5 - 320
+	opts.TargetByteDeletionRate = 1 << uint(20+rng.IntN(10))    // 1MB - 1GB
+	opts.Experimental.ValidateOnIngest = rng.IntN(2) != 0
+	opts.L0CompactionThreshold = 1 + rng.IntN(100)     // 1 - 100
+	opts.L0CompactionFileThreshold = 1 << rng.IntN(11) // 1 - 1024
+	opts.L0StopWritesThreshold = 1 + rng.IntN(100)     // 1 - 100
 	if opts.L0StopWritesThreshold < opts.L0CompactionThreshold {
 		opts.L0StopWritesThreshold = opts.L0CompactionThreshold
 	}
-	opts.LBaseMaxBytes = 1 << uint(rng.Intn(30)) // 1B - 1GB
-	maxConcurrentCompactions := rng.Intn(3) + 1  // 1-3
+	opts.LBaseMaxBytes = 1 << uint(rng.IntN(30)) // 1B - 1GB
+	maxConcurrentCompactions := rng.IntN(3) + 1  // 1-3
 	opts.MaxConcurrentCompactions = func() int {
 		return maxConcurrentCompactions
 	}
-	opts.MaxManifestFileSize = 1 << uint(rng.Intn(30)) // 1B  - 1GB
-	opts.MemTableSize = 2 << (10 + uint(rng.Intn(16))) // 2KB - 256MB
-	opts.MemTableStopWritesThreshold = 2 + rng.Intn(5) // 2 - 5
-	if rng.Intn(2) == 0 {
+	opts.MaxManifestFileSize = 1 << uint(rng.IntN(30)) // 1B  - 1GB
+	opts.MemTableSize = 2 << (10 + uint(rng.IntN(16))) // 2KB - 256MB
+	opts.MemTableStopWritesThreshold = 2 + rng.IntN(5) // 2 - 5
+	if rng.IntN(2) == 0 {
 		opts.WALDir = "data/wal"
 	}
-	if rng.Intn(4) == 0 {
+	if rng.IntN(4) == 0 {
 		// Enable Writer parallelism for 25% of the random options. Setting
 		// MaxWriterConcurrency to any value greater than or equal to 1 has the
 		// same effect currently.
 		opts.Experimental.MaxWriterConcurrency = 2
 		opts.Experimental.ForceWriterParallelism = true
 	}
-	if rng.Intn(2) == 0 {
+	if rng.IntN(2) == 0 {
 		opts.Experimental.DisableIngestAsFlushable = func() bool { return true }
 	}
 	var lopts pebble.LevelOptions
-	lopts.BlockRestartInterval = 1 + rng.Intn(64)  // 1 - 64
-	lopts.BlockSize = 1 << uint(rng.Intn(24))      // 1 - 16MB
-	lopts.BlockSizeThreshold = 50 + rng.Intn(50)   // 50 - 100
-	lopts.IndexBlockSize = 1 << uint(rng.Intn(24)) // 1 - 16MB
-	lopts.TargetFileSize = 1 << uint(rng.Intn(28)) // 1 - 256MB
+	lopts.BlockRestartInterval = 1 + rng.IntN(64)  // 1 - 64
+	lopts.BlockSize = 1 << uint(rng.IntN(24))      // 1 - 16MB
+	lopts.BlockSizeThreshold = 50 + rng.IntN(50)   // 50 - 100
+	lopts.IndexBlockSize = 1 << uint(rng.IntN(24)) // 1 - 16MB
+	lopts.TargetFileSize = 1 << uint(rng.IntN(28)) // 1 - 256MB
 
 	// We either use no bloom filter, the default filter, or a filter with
 	// randomized bits-per-key setting. We zero out the Filters map. It'll get
 	// repopulated on EnsureDefaults accordingly.
 	opts.Filters = nil
-	switch rng.Intn(3) {
+	switch rng.IntN(3) {
 	case 0:
 		lopts.FilterPolicy = nil
 	case 1:
 		lopts.FilterPolicy = bloom.FilterPolicy(10)
 	default:
-		lopts.FilterPolicy = newTestingFilterPolicy(1 << rng.Intn(5))
+		lopts.FilterPolicy = newTestingFilterPolicy(1 << rng.IntN(5))
 	}
 
 	// We use either no compression, snappy compression or zstd compression.
-	switch rng.Intn(3) {
+	switch rng.IntN(3) {
 	case 0:
 		lopts.Compression = pebble.NoCompression
 	case 1:
@@ -528,26 +528,26 @@ func randomOptions(
 	// single standard test configuration that uses a disk-backed FS is
 	// sufficient.
 	testOpts.useDisk = false
-	testOpts.strictFS = rng.Intn(2) != 0 // Only relevant for MemFS.
-	testOpts.threads = rng.Intn(runtime.GOMAXPROCS(0)) + 1
+	testOpts.strictFS = rng.IntN(2) != 0 // Only relevant for MemFS.
+	testOpts.threads = rng.IntN(runtime.GOMAXPROCS(0)) + 1
 	if testOpts.strictFS {
 		opts.DisableWAL = false
 	}
-	testOpts.ingestUsingApply = rng.Intn(2) != 0
-	testOpts.deleteSized = rng.Intn(2) != 0
-	testOpts.replaceSingleDelete = rng.Intn(2) != 0
-	testOpts.disableBlockPropertyCollector = rng.Intn(2) == 1
+	testOpts.ingestUsingApply = rng.IntN(2) != 0
+	testOpts.deleteSized = rng.IntN(2) != 0
+	testOpts.replaceSingleDelete = rng.IntN(2) != 0
+	testOpts.disableBlockPropertyCollector = rng.IntN(2) == 1
 	if testOpts.disableBlockPropertyCollector {
 		testOpts.Opts.BlockPropertyCollectors = nil
 	}
 	testOpts.enableValueBlocks = opts.FormatMajorVersion >= pebble.FormatSSTableValueBlocks &&
-		rng.Intn(2) != 0
+		rng.IntN(2) != 0
 	if testOpts.enableValueBlocks {
 		testOpts.Opts.Experimental.EnableValueBlocks = func() bool { return true }
 	}
-	testOpts.asyncApplyToDB = rng.Intn(2) != 0
+	testOpts.asyncApplyToDB = rng.IntN(2) != 0
 	// 20% of time, enable shared storage.
-	if rng.Intn(5) == 0 {
+	if rng.IntN(5) == 0 {
 		testOpts.sharedStorageEnabled = true
 		inMemShared := remote.NewInMem()
 		testOpts.Opts.Experimental.RemoteStorage = remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
@@ -556,20 +556,20 @@ func randomOptions(
 		// If shared storage is enabled, pick between writing all files on shared
 		// vs. lower levels only, 50% of the time.
 		testOpts.Opts.Experimental.CreateOnShared = remote.CreateOnSharedAll
-		if rng.Intn(2) == 0 {
+		if rng.IntN(2) == 0 {
 			testOpts.Opts.Experimental.CreateOnShared = remote.CreateOnSharedLower
 		}
 		// If shared storage is enabled, enable secondary cache 50% of time.
-		if rng.Intn(2) == 0 {
+		if rng.IntN(2) == 0 {
 			testOpts.secondaryCacheEnabled = true
 			// TODO(josh): Randomize various secondary cache settings.
 			testOpts.Opts.Experimental.SecondaryCacheSizeBytes = 1024 * 1024 * 32 // 32 MBs
 		}
 		// 50% of the time, enable shared replication.
-		testOpts.useSharedReplicate = rng.Intn(2) == 0
+		testOpts.useSharedReplicate = rng.IntN(2) == 0
 	}
 	testOpts.seedEFOS = rng.Uint64()
-	testOpts.ingestSplit = rng.Intn(2) == 0
+	testOpts.ingestSplit = rng.IntN(2) == 0
 	opts.Experimental.IngestSplit = func() bool { return testOpts.ingestSplit }
 	testOpts.Opts.EnsureDefaults()
 	return testOpts

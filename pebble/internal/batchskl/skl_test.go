@@ -21,13 +21,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math/rand/v2"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 // iterAdapter adapts the new Iterator API which returns the key and value from
@@ -456,7 +456,7 @@ func BenchmarkReadWrite(b *testing.B) {
 			}
 			l := newTestSkiplist(d)
 			it := l.NewIter(nil, nil)
-			rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+			rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
@@ -495,7 +495,7 @@ func BenchmarkIterNext(b *testing.B) {
 	}
 	l := newTestSkiplist(d)
 
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	for len(d.data)+20 < cap(d.data) {
 		key := randomKey(rng, buf[:])
 		offset := d.addBytes(key)
@@ -520,7 +520,7 @@ func BenchmarkIterPrev(b *testing.B) {
 	}
 	l := newTestSkiplist(d)
 
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	for len(d.data)+20 < cap(d.data) {
 		key := randomKey(rng, buf[:])
 		offset := d.addBytes(key)

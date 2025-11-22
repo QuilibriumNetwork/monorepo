@@ -16,12 +16,12 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/shims/cmp"
-	"golang.org/x/exp/rand"
 )
 
 const alpha = "abcdefghijklmnopqrstuvwxyz"
@@ -458,9 +458,9 @@ func RandomSeparator(dst, a, b []byte, suffix int64, maxLength int, rng *rand.Ra
 		}
 		// If we can generate a key which is actually in the middle of apIdx
 		// and bpIdx use it so that we don't have to bother about timestamps.
-		generatedIdx = rng.Int63n(add) + start
+		generatedIdx = rng.Int64N(add) + start
 		for diff > 1 && generatedIdx == apIdx || generatedIdx == bpIdx {
-			generatedIdx = rng.Int63n(add) + start
+			generatedIdx = rng.Int64N(add) + start
 		}
 	}
 
@@ -478,11 +478,11 @@ func RandomSeparator(dst, a, b []byte, suffix int64, maxLength int, rng *rand.Ra
 		// any suffix we generate will be greater than it.
 		if as == 0 {
 			// bs > as
-			suffix = bs + rng.Int63n(10) + 1
+			suffix = bs + rng.Int64N(10) + 1
 		} else {
 			// bs < as.
 			// Generate suffix in range [bs + 1, as - 1]
-			suffix = bs + 1 + rng.Int63n(as-bs-1)
+			suffix = bs + 1 + rng.Int64N(as-bs-1)
 		}
 	case generatedIdx == apIdx:
 		// NB: The zero suffix (suffix-less) sorts before all other suffixes, so
@@ -490,11 +490,11 @@ func RandomSeparator(dst, a, b []byte, suffix int64, maxLength int, rng *rand.Ra
 		if as == 0 && suffix == 0 {
 			suffix++
 		} else if as != 0 && suffix >= as {
-			suffix = rng.Int63n(as)
+			suffix = rng.Int64N(as)
 		}
 	case generatedIdx == bpIdx:
 		if suffix <= bs {
-			suffix = bs + rng.Int63n(10) + 1
+			suffix = bs + rng.Int64N(10) + 1
 		}
 	}
 	if sz := maxLength + SuffixLen(suffix); cap(dst) < sz {

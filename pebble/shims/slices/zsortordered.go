@@ -313,8 +313,8 @@ func order2Ordered[E cmp.Ordered](data []E, a, b int, swaps *int) (int, int) {
 // medianOrdered returns x where data[x] is the median of data[a],data[b],data[c], where x is a, b, or c.
 func medianOrdered[E cmp.Ordered](data []E, a, b, c int, swaps *int) int {
 	a, b = order2Ordered(data, a, b, swaps)
-	b, c = order2Ordered(data, b, c, swaps)
-	a, b = order2Ordered(data, a, b, swaps)
+	b, _ = order2Ordered(data, b, c, swaps)
+	_, b = order2Ordered(data, a, b, swaps)
 	return b
 }
 

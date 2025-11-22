@@ -7,6 +7,7 @@ package pebble
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"runtime"
 	"strings"
 	"sync"
@@ -20,7 +21,6 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestRangeDel(t *testing.T) {
@@ -189,12 +189,12 @@ func TestFlushDelay(t *testing.T) {
 }
 
 func TestFlushDelayStress(t *testing.T) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	opts := &Options{
 		FS:                    vfs.NewMem(),
 		Comparer:              testkeys.Comparer,
-		FlushDelayDeleteRange: time.Duration(rng.Intn(10)+1) * time.Millisecond,
-		FlushDelayRangeKey:    time.Duration(rng.Intn(10)+1) * time.Millisecond,
+		FlushDelayDeleteRange: time.Duration(rng.IntN(10)+1) * time.Millisecond,
+		FlushDelayRangeKey:    time.Duration(rng.IntN(10)+1) * time.Millisecond,
 		FormatMajorVersion:    internalFormatNewest,
 		MemTableSize:          8192,
 	}
@@ -209,14 +209,14 @@ func TestFlushDelayStress(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(writers)
 		for i := 0; i < writers; i++ {
-			rng := rand.New(rand.NewSource(uint64(now) + uint64(i)))
+			rng := rand.New(rand.NewPCG(0, uint64(now)+uint64(i)))
 			go func() {
 				const ops = 100
 				defer wg.Done()
 
 				var k1, k2 [32]byte
 				for j := 0; j < ops; j++ {
-					switch rng.Intn(3) {
+					switch rng.IntN(3) {
 					case 0:
 						randStr(k1[:], rng)
 						randStr(k2[:], rng)
@@ -236,7 +236,7 @@ func TestFlushDelayStress(t *testing.T) {
 			}()
 		}
 		wg.Wait()
-		time.Sleep(time.Duration(rng.Intn(10)+1) * time.Millisecond)
+		time.Sleep(time.Duration(rng.IntN(10)+1) * time.Millisecond)
 		require.NoError(t, d.Close())
 	}
 }

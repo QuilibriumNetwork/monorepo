@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -21,7 +22,6 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestExternalIterator(t *testing.T) {
@@ -151,13 +151,13 @@ func TestIterRandomizedMaybeFilteredKeys(t *testing.T) {
 		seed = uint64(time.Now().UnixNano())
 		t.Logf("seed: %d", seed)
 	}
-	rng := rand.New(rand.NewSource(seed))
-	numKeys := 100 + rng.Intn(5000)
+	rng := rand.New(rand.NewPCG(0, seed))
+	numKeys := 100 + rng.IntN(5000)
 	// The block property filter will exclude keys with suffixes [0, tsSeparator-1].
 	// We use the first "part" of the keyspace below to write keys >= tsSeparator,
 	// and the second part to write keys < tsSeparator. Successive parts (if any)
 	// will contain keys at random before or after the separator.
-	tsSeparator := 10 + rng.Int63n(5000)
+	tsSeparator := 10 + rng.Int64N(5000)
 	const keyLen = 5
 
 	// We split the keyspace into logical "parts" which are disjoint slices of the
@@ -166,8 +166,8 @@ func TestIterRandomizedMaybeFilteredKeys(t *testing.T) {
 	// predictable clustering of timestamps in sstable blocks, however it is not
 	// strictly necessary for this test.
 	alpha := testkeys.Alpha(keyLen)
-	numParts := rng.Intn(3) + 2
-	blockSize := 16 + rng.Intn(64)
+	numParts := rng.IntN(3) + 2
+	blockSize := 16 + rng.IntN(64)
 
 	c := cache.New(128 << 20)
 	defer c.Unref()
@@ -207,11 +207,11 @@ func TestIterRandomizedMaybeFilteredKeys(t *testing.T) {
 				for j := 0; j < maxKeysPerPart; j++ {
 					var ts int64
 					if i == 0 {
-						ts = rng.Int63n(5000) + tsSeparator
+						ts = rng.Int64N(5000) + tsSeparator
 					} else if i == 1 {
-						ts = rng.Int63n(tsSeparator)
+						ts = rng.Int64N(tsSeparator)
 					} else {
-						ts = rng.Int63n(tsSeparator + 5000)
+						ts = rng.Int64N(tsSeparator + 5000)
 					}
 					n := testkeys.WriteKeyAt(buf, alpha, keyIdx*alpha.Count()/int64(numKeys), ts)
 					keys = append(keys, append([]byte(nil), buf[:n]...))
@@ -251,7 +251,7 @@ func TestIterRandomizedMaybeFilteredKeys(t *testing.T) {
 			narrowBoundsMode := false
 
 			for i := 0; i < 10000; i++ {
-				if rng.Intn(8) == 0 {
+				if rng.IntN(8) == 0 {
 					// Toggle narrow bounds mode.
 					if narrowBoundsMode {
 						// Reset bounds.
@@ -260,7 +260,7 @@ func TestIterRandomizedMaybeFilteredKeys(t *testing.T) {
 					}
 					narrowBoundsMode = !narrowBoundsMode
 				}
-				keyIdx := rng.Intn(len(keys))
+				keyIdx := rng.IntN(len(keys))
 				seekKey := keys[keyIdx]
 				if narrowBoundsMode {
 					// Case 1: We just entered narrow bounds mode, and both bounds

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"runtime"
 	"sort"
 	"strconv"
@@ -29,7 +30,6 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 var testKeyValuePairs = []string{
@@ -295,7 +295,7 @@ func testIterator(
 	}
 
 	// Test randomly generated sub-iterators.
-	r := rand.New(rand.NewSource(0))
+	r := rand.New(rand.NewPCG(0, 0))
 	for i, nBad := 0, 0; i < 1000; i++ {
 		bad := false
 
@@ -1245,7 +1245,7 @@ func randStr(fill []byte, rng *rand.Rand) {
 	const letters = "abcdefghijklmnopqrstuvwxyz"
 	const lettersLen = len(letters)
 	for i := 0; i < len(fill); i++ {
-		fill[i] = letters[rng.Intn(lettersLen)]
+		fill[i] = letters[rng.IntN(lettersLen)]
 	}
 }
 
@@ -1257,7 +1257,7 @@ func randValue(n int, rng *rand.Rand) []byte {
 
 func randKey(n int, rng *rand.Rand) ([]byte, int) {
 	keyPrefix := randValue(n, rng)
-	suffix := rng.Intn(100)
+	suffix := rng.IntN(100)
 	return append(keyPrefix, []byte(fmt.Sprintf("%02d", suffix))...), suffix
 }
 
@@ -1279,15 +1279,15 @@ func TestIteratorRandomizedBlockIntervalFilter(t *testing.T) {
 		seed = uint64(time.Now().UnixNano())
 		t.Logf("seed: %d", seed)
 	}
-	rng := rand.New(rand.NewSource(seed))
-	opts.FlushSplitBytes = 1 << rng.Intn(8)            // 1B - 256B
-	opts.L0CompactionThreshold = 1 << rng.Intn(2)      // 1-2
-	opts.L0CompactionFileThreshold = 1 << rng.Intn(11) // 1-1024
-	opts.LBaseMaxBytes = 1 << rng.Intn(11)             // 1B - 1KB
+	rng := rand.New(rand.NewPCG(0, seed))
+	opts.FlushSplitBytes = 1 << rng.IntN(8)            // 1B - 256B
+	opts.L0CompactionThreshold = 1 << rng.IntN(2)      // 1-2
+	opts.L0CompactionFileThreshold = 1 << rng.IntN(11) // 1-1024
+	opts.LBaseMaxBytes = 1 << rng.IntN(11)             // 1B - 1KB
 	opts.MemTableSize = 2 << 10                        // 2KB
 	var lopts LevelOptions
-	lopts.BlockSize = 1 << rng.Intn(8)      // 1B - 256B
-	lopts.IndexBlockSize = 1 << rng.Intn(8) // 1B - 256B
+	lopts.BlockSize = 1 << rng.IntN(8)      // 1B - 256B
+	lopts.IndexBlockSize = 1 << rng.IntN(8) // 1B - 256B
 	opts.Levels = []LevelOptions{lopts}
 
 	d, err := Open("", opts)
@@ -1296,14 +1296,14 @@ func TestIteratorRandomizedBlockIntervalFilter(t *testing.T) {
 		require.NoError(t, d.Close())
 	}()
 	matchingKeyValues := make(map[string]string)
-	lower := rng.Intn(100)
-	upper := rng.Intn(100)
+	lower := rng.IntN(100)
+	upper := rng.IntN(100)
 	if lower > upper {
 		lower, upper = upper, lower
 	}
 	n := 2000
 	for i := 0; i < n; i++ {
-		key, suffix := randKey(20+rng.Intn(5), rng)
+		key, suffix := randKey(20+rng.IntN(5), rng)
 		value := randValue(50, rng)
 		if lower <= suffix && suffix < upper {
 			matchingKeyValues[string(key)] = string(value)
@@ -1378,7 +1378,7 @@ func TestIteratorGuaranteedDurable(t *testing.T) {
 }
 
 func TestIteratorBoundsLifetimes(t *testing.T) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	d := newPointTestkeysDatabase(t, testkeys.Alpha(2))
 	defer func() { require.NoError(t, d.Close()) }()
 
@@ -1419,7 +1419,9 @@ func TestIteratorBoundsLifetimes(t *testing.T) {
 	}
 	trashBounds := func(bounds ...[]byte) {
 		for _, bound := range bounds {
-			rng.Read(bound[:])
+			for j := range bound {
+				bound[j] = byte(rng.Uint32())
+			}
 		}
 	}
 
@@ -1601,7 +1603,7 @@ func TestSetOptionsEquivalence(t *testing.T) {
 }
 
 func testSetOptionsEquivalence(t *testing.T, seed uint64) {
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(0, seed))
 	ks := testkeys.Alpha(2)
 	d := newTestkeysDatabase(t, ks, rng)
 	defer func() { require.NoError(t, d.Close()) }()
@@ -1609,20 +1611,20 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 	var o IterOptions
 	generateNewOptions := func() {
 		// TODO(jackson): Include test coverage for block property filters, etc.
-		if rng.Intn(2) == 1 {
-			o.KeyTypes = IterKeyType(rng.Intn(3))
+		if rng.IntN(2) == 1 {
+			o.KeyTypes = IterKeyType(rng.IntN(3))
 		}
-		if rng.Intn(2) == 1 {
-			if rng.Intn(2) == 1 {
+		if rng.IntN(2) == 1 {
+			if rng.IntN(2) == 1 {
 				o.LowerBound = nil
-				if rng.Intn(2) == 1 {
-					o.LowerBound = testkeys.KeyAt(ks, rng.Int63n(ks.Count()), rng.Int63n(ks.Count()))
+				if rng.IntN(2) == 1 {
+					o.LowerBound = testkeys.KeyAt(ks, rng.Int64N(ks.Count()), rng.Int64N(ks.Count()))
 				}
 			}
-			if rng.Intn(2) == 1 {
+			if rng.IntN(2) == 1 {
 				o.UpperBound = nil
-				if rng.Intn(2) == 1 {
-					o.UpperBound = testkeys.KeyAt(ks, rng.Int63n(ks.Count()), rng.Int63n(ks.Count()))
+				if rng.IntN(2) == 1 {
+					o.UpperBound = testkeys.KeyAt(ks, rng.Int64N(ks.Count()), rng.Int64N(ks.Count()))
 				}
 			}
 			if testkeys.Comparer.Compare(o.LowerBound, o.UpperBound) > 0 {
@@ -1630,8 +1632,8 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 			}
 		}
 		o.RangeKeyMasking.Suffix = nil
-		if o.KeyTypes == IterKeyTypePointsAndRanges && rng.Intn(2) == 1 {
-			o.RangeKeyMasking.Suffix = testkeys.Suffix(rng.Int63n(ks.Count()))
+		if o.KeyTypes == IterKeyTypePointsAndRanges && rng.IntN(2) == 1 {
+			o.RangeKeyMasking.Suffix = testkeys.Suffix(rng.Int64N(ks.Count()))
 		}
 	}
 
@@ -1659,7 +1661,7 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 	positioningOps := []func() positioningOp{
 		// SeekGE
 		func() positioningOp {
-			k := testkeys.Key(ks, rng.Int63n(ks.Count()))
+			k := testkeys.Key(ks, rng.Int64N(ks.Count()))
 			return positioningOp{
 				desc: fmt.Sprintf("SeekGE(%q)", k),
 				run: func(it *Iterator) IterValidityState {
@@ -1669,7 +1671,7 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 		},
 		// SeekLT
 		func() positioningOp {
-			k := testkeys.Key(ks, rng.Int63n(ks.Count()))
+			k := testkeys.Key(ks, rng.Int64N(ks.Count()))
 			return positioningOp{
 				desc: fmt.Sprintf("SeekLT(%q)", k),
 				run: func(it *Iterator) IterValidityState {
@@ -1679,7 +1681,7 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 		},
 		// SeekPrefixGE
 		func() positioningOp {
-			k := testkeys.Key(ks, rng.Int63n(ks.Count()))
+			k := testkeys.Key(ks, rng.Int64N(ks.Count()))
 			return positioningOp{
 				desc: fmt.Sprintf("SeekPrefixGE(%q)", k),
 				run: func(it *Iterator) IterValidityState {
@@ -1705,7 +1707,7 @@ func testSetOptionsEquivalence(t *testing.T, seed uint64) {
 		}
 
 		// Apply the same operation to both keys.
-		iterOp := positioningOps[rng.Intn(len(positioningOps))]()
+		iterOp := positioningOps[rng.IntN(len(positioningOps))]()
 		newIterValidity := iterOp.run(newIter)
 		longLivedValidity := iterOp.run(longLivedIter)
 
@@ -1767,18 +1769,18 @@ func newTestkeysDatabase(t *testing.T, ks testkeys.Keyspace, rng *rand.Rand) *DB
 	for i := 0; i < len(order); i++ {
 		const maxVersionsPerKey = 10
 		keyIndex := order[i]
-		for versions := rng.Intn(maxVersionsPerKey); versions > 0; versions-- {
-			n := testkeys.WriteKeyAt(keyBuf, ks, int64(keyIndex), rng.Int63n(maxVersionsPerKey))
+		for versions := rng.IntN(maxVersionsPerKey); versions > 0; versions-- {
+			n := testkeys.WriteKeyAt(keyBuf, ks, int64(keyIndex), rng.Int64N(maxVersionsPerKey))
 			b.Set(keyBuf[:n], keyBuf[:n], nil)
 		}
 
 		// Sometimes add a range key too.
-		if rng.Intn(100) == 1 {
-			startIdx := rng.Int63n(ks.Count())
-			endIdx := rng.Int63n(ks.Count())
+		if rng.IntN(100) == 1 {
+			startIdx := rng.Int64N(ks.Count())
+			endIdx := rng.Int64N(ks.Count())
 			startLen := testkeys.WriteKey(keyBuf, ks, startIdx)
 			endLen := testkeys.WriteKey(keyBuf2, ks, endIdx)
-			suffixInt := rng.Int63n(maxVersionsPerKey)
+			suffixInt := rng.Int64N(maxVersionsPerKey)
 			require.NoError(t, b.RangeKeySet(
 				keyBuf[:startLen],
 				keyBuf2[:endLen],
@@ -1788,7 +1790,7 @@ func newTestkeysDatabase(t *testing.T, ks testkeys.Keyspace, rng *rand.Rand) *DB
 		}
 
 		// Randomize the flush points.
-		if !b.Empty() && rng.Intn(10) == 1 {
+		if !b.Empty() && rng.IntN(10) == 1 {
 			require.NoError(t, b.Commit(nil))
 			require.NoError(t, d.Flush())
 			b = d.NewBatch()
@@ -1825,11 +1827,11 @@ func BenchmarkIteratorSeekGE(b *testing.B) {
 		comparer: *DefaultComparer,
 		iter:     m.newIter(nil),
 	}
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := keys[rng.Intn(len(keys))]
+		key := keys[rng.IntN(len(keys))]
 		iter.SeekGE(key)
 	}
 }
@@ -2090,7 +2092,7 @@ func BenchmarkIteratorSeqSeekGEWithBounds(b *testing.B) {
 						valid = iter.Next()
 					}
 					if iter.Error() != nil {
-						b.Fatalf(iter.Error().Error())
+						b.Fatalf("%s", iter.Error().Error())
 					}
 				}
 				iter.Close()
@@ -2146,7 +2148,7 @@ func BenchmarkIteratorSeekGENoop(b *testing.B) {
 }
 
 func BenchmarkBlockPropertyFilter(b *testing.B) {
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 	for _, matchInterval := range []int{1, 10, 100, 1000} {
 		b.Run(fmt.Sprintf("match-interval=%d", matchInterval), func(b *testing.B) {
 			mem := vfs.NewMem()
@@ -2209,27 +2211,27 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 		seed = uint64(time.Now().UnixNano())
 		t.Logf("seed: %d", seed)
 	}
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(0, seed))
 
 	// Generate keyspace with point keys, and range keys which will
 	// mask the point keys.
 	var timestamps []int64
 	for i := 0; i <= 100; i++ {
-		timestamps = append(timestamps, rng.Int63n(1000))
+		timestamps = append(timestamps, rng.Int64N(1000))
 	}
 
 	ks := testkeys.Alpha(5)
-	numKeys := 1000 + rng.Intn(9000)
+	numKeys := 1000 + rng.IntN(9000)
 	keys := make([][]byte, numKeys)
 	keyTimeStamps := make([]int64, numKeys) // ts associated with the keys.
 	for i := 0; i < numKeys; i++ {
 		keys[i] = make([]byte, 5+testkeys.MaxSuffixLen)
-		keyTimeStamps[i] = timestamps[rng.Intn(len(timestamps))]
-		n := testkeys.WriteKeyAt(keys[i], ks, rng.Int63n(ks.Count()), keyTimeStamps[i])
+		keyTimeStamps[i] = timestamps[rng.IntN(len(timestamps))]
+		n := testkeys.WriteKeyAt(keys[i], ks, rng.Int64N(ks.Count()), keyTimeStamps[i])
 		keys[i] = keys[i][:n]
 	}
 
-	numRangeKeys := rng.Intn(20)
+	numRangeKeys := rng.IntN(20)
 	type rkey struct {
 		start  []byte
 		end    []byte
@@ -2241,18 +2243,18 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 		rkeys[i].start = make([]byte, 5)
 		rkeys[i].end = make([]byte, 5)
 
-		testkeys.WriteKey(rkeys[i].start[:5], ks, rng.Int63n(ks.Count()))
-		testkeys.WriteKey(rkeys[i].end[:5], ks, rng.Int63n(ks.Count()))
+		testkeys.WriteKey(rkeys[i].start[:5], ks, rng.Int64N(ks.Count()))
+		testkeys.WriteKey(rkeys[i].end[:5], ks, rng.Int64N(ks.Count()))
 
 		for bytes.Equal(rkeys[i].start[:5], rkeys[i].end[:5]) {
-			testkeys.WriteKey(rkeys[i].end[:5], ks, rng.Int63n(ks.Count()))
+			testkeys.WriteKey(rkeys[i].end[:5], ks, rng.Int64N(ks.Count()))
 		}
 
 		if bytes.Compare(rkeys[i].start[:5], rkeys[i].end[:5]) > 0 {
 			rkeys[i].start, rkeys[i].end = rkeys[i].end, rkeys[i].start
 		}
 
-		rkeyTimestamp := timestamps[rng.Intn(len(timestamps))]
+		rkeyTimestamp := timestamps[rng.IntN(len(timestamps))]
 		rkeys[i].suffix = []byte("@" + strconv.FormatInt(rkeyTimestamp, 10))
 
 		// Each time we create a range key, check if the range key masks any
@@ -2291,12 +2293,12 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 	randomOpts := testOpts{
 		levelOpts: []LevelOptions{
 			{
-				TargetFileSize: int64(1 + rng.Intn(2<<20)), // Vary the L0 file size.
-				BlockSize:      1 + rng.Intn(32<<10),
+				TargetFileSize: int64(1 + rng.IntN(2<<20)), // Vary the L0 file size.
+				BlockSize:      1 + rng.IntN(32<<10),
 			},
 		},
 	}
-	if rng.Intn(2) == 0 {
+	if rng.IntN(2) == 0 {
 		randomOpts.filter = func() BlockPropertyFilterMask {
 			return sstable.NewTestKeysMaskingFilter()
 		}
@@ -2401,14 +2403,14 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 			t.Fatalf("iteration didn't produce identical results")
 		}
 		if hasP1 && !bytes.Equal(iter1.Key(), iter2.Key()) {
-			t.Fatalf(fmt.Sprintf("iteration didn't produce identical point keys: %s, %s", iter1.Key(), iter2.Key()))
+			t.Fatalf("%s", fmt.Sprintf("iteration didn't produce identical point keys: %s, %s", iter1.Key(), iter2.Key()))
 		}
 		if hasR1 {
 			// Confirm that the range key is the same.
 			b1, e1 := iter1.RangeBounds()
 			b2, e2 := iter2.RangeBounds()
 			if !bytes.Equal(b1, b2) || !bytes.Equal(e1, e2) {
-				t.Fatalf(fmt.Sprintf(
+				t.Fatalf("%s", fmt.Sprintf(
 					"iteration didn't produce identical range keys: [%s, %s], [%s, %s]",
 					b1, e1, b2, e2,
 				))
@@ -2419,7 +2421,7 @@ func TestRangeKeyMaskingRandomized(t *testing.T) {
 		// Confirm that the returned point key wasn't hidden.
 		for j, pkey := range keys {
 			if bytes.Equal(iter1.Key(), pkey) && pointKeyHidden[j] {
-				t.Fatalf(fmt.Sprintf("hidden point key was exposed %s %d", pkey, keyTimeStamps[j]))
+				t.Fatalf("%s", fmt.Sprintf("hidden point key was exposed %s %d", pkey, keyTimeStamps[j]))
 			}
 		}
 	}
@@ -2439,7 +2441,7 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 		keysPerBatch = 50
 	)
 	var alloc bytealloc.A
-	rng := rand.New(rand.NewSource(uint64(1658872515083979000)))
+	rng := rand.New(rand.NewPCG(0, uint64(1658872515083979000)))
 	keyBuf := make([]byte, prefixLen+testkeys.MaxSuffixLen)
 	valBuf := make([]byte, valueSize)
 
@@ -2462,7 +2464,7 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 		batch := d.NewBatch()
 		for k := 0; k < keysPerBatch; k++ {
 			randStr(keyBuf[:prefixLen], rng)
-			suffix := rng.Int63n(100)
+			suffix := rng.Int64N(100)
 			suffixLen := testkeys.WriteSuffix(keyBuf[prefixLen:], suffix)
 			randStr(valBuf[:], rng)
 
@@ -2574,7 +2576,7 @@ func BenchmarkIterator_RangeKeyMasking(b *testing.B) {
 func BenchmarkIteratorScan(b *testing.B) {
 	const maxPrefixLen = 8
 	keyBuf := make([]byte, maxPrefixLen+testkeys.MaxSuffixLen)
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 	for _, keyCount := range []int64{100, 1000, 10000} {
 		for _, readAmp := range []int{1, 3, 7, 10} {
@@ -2601,7 +2603,7 @@ func BenchmarkIteratorScan(b *testing.B) {
 				for _, ks := range testkeys.Divvy(keys, int64(readAmp)) {
 					batch := d.NewBatch()
 					for i := int64(0); i < ks.Count(); i++ {
-						n := testkeys.WriteKeyAt(keyBuf[:], ks, i, rng.Int63n(100))
+						n := testkeys.WriteKeyAt(keyBuf[:], ks, i, rng.Int64N(100))
 						batch.Set(keyBuf[:n], keyBuf[:n], nil)
 					}
 					require.NoError(b, batch.Commit(nil))
@@ -2722,7 +2724,7 @@ func BenchmarkIteratorScanNextPrefix(b *testing.B) {
 func BenchmarkCombinedIteratorSeek(b *testing.B) {
 	for _, withRangeKey := range []bool{false, true} {
 		b.Run(fmt.Sprintf("range-key=%t", withRangeKey), func(b *testing.B) {
-			rng := rand.New(rand.NewSource(uint64(1658872515083979000)))
+			rng := rand.New(rand.NewPCG(0, uint64(1658872515083979000)))
 			ks := testkeys.Alpha(1)
 			opts := &Options{
 				FS:                 vfs.NewMem(),
@@ -2737,7 +2739,9 @@ func BenchmarkCombinedIteratorSeek(b *testing.B) {
 			for i := int64(0); i < ks.Count(); i++ {
 				keys[i] = testkeys.Key(ks, i)
 				var val [40]byte
-				rng.Read(val[:])
+				for j := range val {
+					val[j] = byte(rng.Uint32())
+				}
 				require.NoError(b, d.Set(keys[i], val[:], nil))
 			}
 			if withRangeKey {
@@ -2821,7 +2825,7 @@ func BenchmarkCombinedIteratorSeekPrefix(b *testing.B) {
 }
 
 func buildFragmentedRangeKey(b testing.TB, seed uint64) (d *DB, keys [][]byte) {
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(0, seed))
 	ks := testkeys.Alpha(2)
 	opts := &Options{
 		FS:                        vfs.NewMem(),
@@ -2843,7 +2847,9 @@ func buildFragmentedRangeKey(b testing.TB, seed uint64) (d *DB, keys [][]byte) {
 	}
 	for i := 0; i < len(keys); i++ {
 		var val [40]byte
-		rng.Read(val[:])
+		for j := range val {
+			val[j] = byte(rng.Uint32())
+		}
 		require.NoError(b, d.Set(keys[i], val[:], nil))
 		if i < len(keys)-1 {
 			require.NoError(b, d.RangeKeySet(keys[i], keys[i+1], []byte("@5"), nil, nil))

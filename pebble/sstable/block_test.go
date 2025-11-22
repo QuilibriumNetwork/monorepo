@@ -7,6 +7,7 @@ package sstable
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,7 +18,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/itertest"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func ikey(s string) InternalKey {
@@ -380,11 +380,11 @@ func BenchmarkBlockIterSeekGE(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+				rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					k := keys[rng.Intn(len(keys))]
+					k := keys[rng.IntN(len(keys))]
 					it.SeekGE(k, base.SeekGEFlagsNone)
 					if testing.Verbose() {
 						if !it.valid() {
@@ -422,11 +422,11 @@ func BenchmarkBlockIterSeekLT(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+				rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					j := rng.Intn(len(keys))
+					j := rng.IntN(len(keys))
 					it.SeekLT(keys[j], base.SeekLTFlagsNone)
 					if testing.Verbose() {
 						if j == 0 {

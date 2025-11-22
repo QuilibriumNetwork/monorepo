@@ -7,12 +7,12 @@ package testkeys
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"testing"
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestGenerateAlphabetKey(t *testing.T) {
@@ -220,13 +220,13 @@ func keyspaceToString(ks Keyspace) string {
 }
 
 func TestRandomSeparator(t *testing.T) {
-	rng := rand.New(rand.NewSource(0))
+	rng := rand.New(rand.NewPCG(0, 0))
 	keys := [][]byte{[]byte("a"), []byte("zzz@9")}
 	for n := 0; n < 1000; n++ {
-		i := rng.Intn(len(keys))
-		j := rng.Intn(len(keys))
+		i := rng.IntN(len(keys))
+		j := rng.IntN(len(keys))
 		for i == j {
-			j = rng.Intn(len(keys))
+			j = rng.IntN(len(keys))
 		}
 		if i > j {
 			i, j = j, i
@@ -234,7 +234,7 @@ func TestRandomSeparator(t *testing.T) {
 
 		a := keys[i]
 		b := keys[j]
-		suffix := rng.Int63n(10)
+		suffix := rng.Int64N(10)
 		sep := RandomSeparator(nil, a, b, suffix, 3, rng)
 		t.Logf("RandomSeparator(%q, %q, %d) = %q\n", a, b, suffix, sep)
 		if sep == nil {

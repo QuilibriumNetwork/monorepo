@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +25,6 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 const (
@@ -532,11 +532,11 @@ func BenchmarkLevelIterSeekGE(b *testing.B) {
 								return iter, nil, err
 							}
 							l := newLevelIter(context.Background(), IterOptions{}, DefaultComparer, newIters, metas.Iter(), manifest.Level(level), internalIterOpts{})
-							rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+							rng := rand.New(rand.NewPCG(0, uint64(time.Now().UnixNano())))
 
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
-								l.SeekGE(keys[rng.Intn(len(keys))], base.SeekGEFlagsNone)
+								l.SeekGE(keys[rng.IntN(len(keys))], base.SeekGEFlagsNone)
 							}
 							l.Close()
 						})

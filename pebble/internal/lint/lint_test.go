@@ -22,9 +22,9 @@ import (
 
 const (
 	cmdGo       = "go"
-	golint      = "golang.org/x/lint/golint@6edffad5e6160f5949cdefc81710b2706fbcd4f6"
-	staticcheck = "honnef.co/go/tools/cmd/staticcheck@2023.1"
-	crlfmt      = "github.com/cockroachdb/crlfmt@44a36ec7"
+	golint      = "golang.org/x/lint/golint"
+	staticcheck = "honnef.co/go/tools/cmd/staticcheck"
+	crlfmt      = "github.com/cockroachdb/crlfmt"
 )
 
 func dirCmd(t *testing.T, dir string, name string, args ...string) stream.Filter {
@@ -45,6 +45,23 @@ func ignoreGoMod() stream.Filter {
 	return stream.GrepNot(`^go: (finding|extracting|downloading)`)
 }
 
+func getTool(t *testing.T, path string) {
+	cmd := exec.Command("go", "get", path)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cannot get %q: %v\n%s\n", path, err, out)
+	}
+}
+
+func installTool(t *testing.T, path string) {
+	getTool(t, path)
+	cmd := exec.Command("go", "install", path)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cannot install %q: %v\n%s\n", path, err, out)
+	}
+}
+
 func TestLint(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("lint checks skipped on Windows")
@@ -54,7 +71,7 @@ func TestLint(t *testing.T) {
 		t.Skip("lint checks skipped on race builds")
 	}
 
-	const root = "github.com/cockroachdb/pebble"
+	const root = "./"
 
 	pkg, err := build.Import(root, "../..", 0)
 	require.NoError(t, err)
@@ -71,6 +88,7 @@ func TestLint(t *testing.T) {
 	}
 
 	t.Run("TestGolint", func(t *testing.T) {
+		installTool(t, golint)
 		t.Parallel()
 
 		args := []string{"run", golint}
@@ -90,6 +108,7 @@ func TestLint(t *testing.T) {
 	})
 
 	t.Run("TestStaticcheck", func(t *testing.T) {
+		installTool(t, staticcheck)
 		t.Parallel()
 
 		args := []string{"run", staticcheck}
@@ -240,6 +259,7 @@ func TestLint(t *testing.T) {
 	})
 
 	t.Run("TestCrlfmt", func(t *testing.T) {
+		installTool(t, crlfmt)
 		t.Parallel()
 
 		args := []string{"run", crlfmt, "-fast", "-tab", "2", "."}

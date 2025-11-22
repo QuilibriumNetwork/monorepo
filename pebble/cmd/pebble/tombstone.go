@@ -67,9 +67,6 @@ func runTombstoneCmd(cmd *cobra.Command, args []string) error {
 
 	batchDist := ycsbConfig.batch
 	scanDist := ycsbConfig.scans
-	if err != nil {
-		return err
-	}
 
 	valueDist := ycsbConfig.values
 	y := newYcsb(weights, keyDist, batchDist, scanDist, valueDist)
