@@ -8,9 +8,9 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/redact"
 	"github.com/cockroachdb/pebble/shims/cmp"
 	"github.com/cockroachdb/pebble/shims/slices"
+	"github.com/cockroachdb/redact"
 )
 
 // Category is a user-understandable string, where stats are aggregated for

@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/redact"
 	"github.com/cockroachdb/pebble/shims/cmp"
+	"github.com/cockroachdb/redact"
 )
 
 const (

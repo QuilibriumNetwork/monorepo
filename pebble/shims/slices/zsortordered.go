@@ -137,7 +137,9 @@ func pdqsortOrdered[E cmp.Ordered](data []E, a, b, limit int) {
 // Let p = data[pivot]
 // Moves elements in data[a:b] around, so that data[i]<p and data[j]>=p for i<newpivot and j>newpivot.
 // On return, data[newpivot] = p
-func partitionOrdered[E cmp.Ordered](data []E, a, b, pivot int) (newpivot int, alreadyPartitioned bool) {
+func partitionOrdered[E cmp.Ordered](
+	data []E, a, b, pivot int,
+) (newpivot int, alreadyPartitioned bool) {
 	data[a], data[pivot] = data[pivot], data[a]
 	i, j := a+1, b-1 // i and j are inclusive of the elements remaining to be partitioned
 

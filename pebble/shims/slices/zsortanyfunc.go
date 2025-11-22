@@ -135,7 +135,9 @@ func pdqsortCmpFunc[E any](data []E, a, b, limit int, cmp func(a, b E) int) {
 // Let p = data[pivot]
 // Moves elements in data[a:b] around, so that data[i]<p and data[j]>=p for i<newpivot and j>newpivot.
 // On return, data[newpivot] = p
-func partitionCmpFunc[E any](data []E, a, b, pivot int, cmp func(a, b E) int) (newpivot int, alreadyPartitioned bool) {
+func partitionCmpFunc[E any](
+	data []E, a, b, pivot int, cmp func(a, b E) int,
+) (newpivot int, alreadyPartitioned bool) {
 	data[a], data[pivot] = data[pivot], data[a]
 	i, j := a+1, b-1 // i and j are inclusive of the elements remaining to be partitioned
 
@@ -261,7 +263,9 @@ func breakPatternsCmpFunc[E any](data []E, a, b int, cmp func(a, b E) int) {
 // [0,8): chooses a static pivot.
 // [8,shortestNinther): uses the simple median-of-three method.
 // [shortestNinther,∞): uses the Tukey ninther method.
-func choosePivotCmpFunc[E any](data []E, a, b int, cmp func(a, b E) int) (pivot int, hint sortedHint) {
+func choosePivotCmpFunc[E any](
+	data []E, a, b int, cmp func(a, b E) int,
+) (pivot int, hint sortedHint) {
 	const (
 		shortestNinther = 50
 		maxSwaps        = 4 * 3
