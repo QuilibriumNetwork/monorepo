@@ -357,7 +357,7 @@ func (e *GlobalExecutionEngine) handleBundle(
 			address,
 			op,
 			true,
-			responses.State,
+			state,
 		)
 		if err != nil {
 			// Skip non-global operations (e.g., token payments, compute ops)
@@ -371,7 +371,6 @@ func (e *GlobalExecutionEngine) handleBundle(
 
 		// Collect responses
 		responses.Messages = append(responses.Messages, opResponses.Messages...)
-		responses.State = opResponses.State
 	}
 
 	e.logger.Info(
@@ -404,11 +403,6 @@ func (e *GlobalExecutionEngine) processIndividualMessage(
 		return nil, errors.Wrap(err, "process individual message")
 	}
 
-	err = e.validateIndividualMessage(frameNumber, address, message, fromBundle)
-	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
-	}
-
 	// Process the operation
 	_, err = intrinsic.InvokeStep(
 		frameNumber,
@@ -421,11 +415,6 @@ func (e *GlobalExecutionEngine) processIndividualMessage(
 		return nil, errors.Wrap(err, "process individual message")
 	}
 
-	newState, err := intrinsic.Commit()
-	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
-	}
-
 	e.logger.Debug(
 		"processed individual message",
 		zap.String("address", hex.EncodeToString(address)),
@@ -433,7 +422,7 @@ func (e *GlobalExecutionEngine) processIndividualMessage(
 
 	return &execution.ProcessMessageResult{
 		Messages: []*protobufs.Message{},
-		State:    newState,
+		State:    state,
 	}, nil
 }
 

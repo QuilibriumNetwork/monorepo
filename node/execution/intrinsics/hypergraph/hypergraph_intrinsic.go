@@ -491,7 +491,7 @@ func (h *HypergraphIntrinsic) Deploy(
 	contextData []byte,
 	frameNumber uint64,
 	hgstate state.State,
-) (state.State, error) {
+) (state.State, []byte, error) {
 	if !bytes.Equal(domain[:], HYPERGRAPH_BASE_DOMAIN[:]) {
 		vert, err := hgstate.Get(
 			domain[:],
@@ -499,14 +499,14 @@ func (h *HypergraphIntrinsic) Deploy(
 			hg.VertexAddsDiscriminator,
 		)
 		if err != nil {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				state.ErrInvalidDomain,
 				"deploy",
 			)
 		}
 
 		if vert == nil {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				state.ErrInvalidDomain,
 				"deploy",
 			)
@@ -516,16 +516,16 @@ func (h *HypergraphIntrinsic) Deploy(
 		updatePb := &protobufs.HypergraphUpdate{}
 		err = updatePb.FromCanonicalBytes(contextData)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		if err := updatePb.Validate(); err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		deployArgs, err := HypergraphUpdateFromProtobuf(updatePb)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		updateWithoutSignature := proto.Clone(updatePb).(*protobufs.HypergraphUpdate)
@@ -533,7 +533,7 @@ func (h *HypergraphIntrinsic) Deploy(
 		updateWithoutSignature.PublicKeySignatureBls48581 = nil
 		message, err := updateWithoutSignature.ToCanonicalBytes()
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		validSig, err := h.keyManager.ValidateSignature(
@@ -544,7 +544,7 @@ func (h *HypergraphIntrinsic) Deploy(
 			slices.Concat(domain[:], []byte("HYPERGRAPH_UPDATE")),
 		)
 		if err != nil || !validSig {
-			return nil, errors.Wrap(errors.New("invalid signature"), "deploy")
+			return nil, nil, errors.Wrap(errors.New("invalid signature"), "deploy")
 		}
 
 		vertexAddress := slices.Concat(
@@ -555,17 +555,17 @@ func (h *HypergraphIntrinsic) Deploy(
 		// Ensure the vertex is present and has not been removed
 		_, err = h.hypergraph.GetVertex([64]byte(vertexAddress))
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		prior, err := h.hypergraph.GetVertexData([64]byte(vertexAddress))
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		tree, err := h.hypergraph.GetVertexData([64]byte(vertexAddress))
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		// Retrieve the existing RDF schema from the tree
@@ -581,19 +581,19 @@ func (h *HypergraphIntrinsic) Deploy(
 				deployArgs.Config,
 			)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			commit := configTree.Commit(h.inclusionProver, false)
 
 			out, err := qcrypto.SerializeNonLazyTree(configTree)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			err = tree.Insert([]byte{16 << 2}, out, commit, configTree.GetSize())
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 		}
 
@@ -604,7 +604,7 @@ func (h *HypergraphIntrinsic) Deploy(
 			// Validate that the new schema is valid
 			_, err := h.rdfMultiprover.GetSchemaMap(newSchemaDoc)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			// Validate that the update only adds new classes/properties, never
@@ -612,7 +612,7 @@ func (h *HypergraphIntrinsic) Deploy(
 			if existingRDFSchema != "" {
 				err = h.validateRDFSchemaUpdate(existingRDFSchema, newSchemaDoc)
 				if err != nil {
-					return nil, errors.Wrap(err, "deploy")
+					return nil, nil, errors.Wrap(err, "deploy")
 				}
 			}
 
@@ -624,7 +624,7 @@ func (h *HypergraphIntrinsic) Deploy(
 				big.NewInt(int64(len(deployArgs.RDFSchema))),
 			)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			h.rdfHypergraphSchema = newSchemaDoc
@@ -647,24 +647,24 @@ func (h *HypergraphIntrinsic) Deploy(
 			),
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		h.state = hgstate
 
-		return hgstate, nil
+		return hgstate, slices.Clone(h.Address()), nil
 	}
 
 	initialConsensusMetadata, err := newHypergraphConsensusMetadata(
 		provers,
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	initialSumcheckInfo, err := newHypergraphSumcheckInfo()
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	additionalData := make([]*qcrypto.VectorCommitmentTree, 14)
@@ -672,7 +672,7 @@ func (h *HypergraphIntrinsic) Deploy(
 		h.config,
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	hypergraphDomainBI, err := poseidon.HashBytes(
@@ -682,14 +682,14 @@ func (h *HypergraphIntrinsic) Deploy(
 		),
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	hypergraphDomain := hypergraphDomainBI.FillBytes(make([]byte, 32))
 
 	rdfHypergraphSchema, err := h.newHypergraphRDFHypergraphSchema(contextData)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	h.domain = hypergraphDomain
@@ -702,12 +702,12 @@ func (h *HypergraphIntrinsic) Deploy(
 		additionalData,
 		HYPERGRAPH_BASE_DOMAIN[:],
 	); err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	h.state = hgstate
 
-	return h.state, nil
+	return h.state, slices.Clone(hypergraphDomain), nil
 }
 
 // Validate implements intrinsics.Intrinsic.

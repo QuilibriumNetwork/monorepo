@@ -250,7 +250,7 @@ func (e *AppConsensusEngine) peerAuthCacheAllows(id peer.ID) bool {
 	if time.Now().After(expiry) {
 		e.peerAuthCacheMu.Lock()
 		if current, exists := e.peerAuthCache[string(id)]; exists &&
-			current == expiry {
+			current.Equal(expiry) {
 			delete(e.peerAuthCache, string(id))
 		}
 		e.peerAuthCacheMu.Unlock()

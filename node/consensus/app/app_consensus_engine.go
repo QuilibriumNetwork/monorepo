@@ -20,6 +20,7 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
@@ -110,6 +111,8 @@ type AppConsensusEngine struct {
 	currentDifficultyMu       sync.RWMutex
 	messageCollectors         *keyedaggregator.SequencedCollectors[sequencedAppMessage]
 	messageAggregator         *keyedaggregator.SequencedAggregator[sequencedAppMessage]
+	appMessageSpillover       map[uint64][]*protobufs.Message
+	appSpilloverMu            sync.Mutex
 	lastProposalRank          uint64
 	lastProposalRankMu        sync.RWMutex
 	collectedMessages         []*protobufs.Message
@@ -261,6 +264,7 @@ func NewAppConsensusEngine(
 		proofCache:                 make(map[uint64][516]byte),
 		collectedMessages:          []*protobufs.Message{},
 		provingMessages:            []*protobufs.Message{},
+		appMessageSpillover:       make(map[uint64][]*protobufs.Message),
 		consensusMessageQueue:      make(chan *pb.Message, 1000),
 		proverMessageQueue:         make(chan *pb.Message, 1000),
 		frameMessageQueue:          make(chan *pb.Message, 100),
@@ -900,77 +904,86 @@ func (e *AppConsensusEngine) materialize(
 	var state state.State
 	state = hgstate.NewHypergraphState(e.hypergraph)
 
+	eg := errgroup.Group{}
+	eg.SetLimit(len(frame.Requests))
+
 	for i, request := range frame.Requests {
-		e.logger.Debug(
-			"processing request",
-			zap.Int("message_index", i),
-		)
-
-		requestBytes, err := request.ToCanonicalBytes()
-
-		if err != nil {
-			e.logger.Error(
-				"error serializing request",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
-			return errors.Wrap(err, "materialize")
-		}
-
-		if len(requestBytes) == 0 {
-			e.logger.Error(
-				"empty request bytes",
+		eg.Go(func() error {
+			e.logger.Debug(
+				"processing request",
 				zap.Int("message_index", i),
 			)
-			return errors.Wrap(errors.New("empty request"), "materialize")
-		}
 
-		costBasis, err := e.executionManager.GetCost(requestBytes)
-		if err != nil {
-			e.logger.Error(
-				"invalid message",
-				zap.Int("message_index", i),
-				zap.Error(err),
+			requestBytes, err := request.ToCanonicalBytes()
+
+			if err != nil {
+				e.logger.Error(
+					"error serializing request",
+					zap.Int("message_index", i),
+					zap.Error(err),
+				)
+				return errors.Wrap(err, "materialize")
+			}
+
+			if len(requestBytes) == 0 {
+				e.logger.Error(
+					"empty request bytes",
+					zap.Int("message_index", i),
+				)
+				return errors.Wrap(errors.New("empty request"), "materialize")
+			}
+
+			costBasis, err := e.executionManager.GetCost(requestBytes)
+			if err != nil {
+				e.logger.Error(
+					"invalid message",
+					zap.Int("message_index", i),
+					zap.Error(err),
+				)
+				return errors.Wrap(err, "materialize")
+			}
+
+			e.currentDifficultyMu.RLock()
+			difficulty := uint64(e.currentDifficulty)
+			e.currentDifficultyMu.RUnlock()
+			var baseline *big.Int
+			if costBasis.Cmp(big.NewInt(0)) == 0 {
+				baseline = big.NewInt(0)
+			} else {
+				baseline = reward.GetBaselineFee(
+					difficulty,
+					e.hypergraph.GetSize(nil, nil).Uint64(),
+					costBasis.Uint64(),
+					8000000000,
+				)
+				baseline.Quo(baseline, costBasis)
+			}
+
+			_, err = e.executionManager.ProcessMessage(
+				frame.Header.FrameNumber,
+				new(big.Int).Mul(
+					baseline,
+					big.NewInt(int64(frame.Header.FeeMultiplierVote)),
+				),
+				e.appAddress[:32],
+				requestBytes,
+				state,
 			)
-			return errors.Wrap(err, "materialize")
-		}
+			if err != nil {
+				e.logger.Error(
+					"error processing message",
+					zap.Int("message_index", i),
+					zap.Error(err),
+				)
+				return errors.Wrap(err, "materialize")
+			}
 
-		e.currentDifficultyMu.RLock()
-		difficulty := uint64(e.currentDifficulty)
-		e.currentDifficultyMu.RUnlock()
-		var baseline *big.Int
-		if costBasis.Cmp(big.NewInt(0)) == 0 {
-			baseline = big.NewInt(0)
-		} else {
-			baseline = reward.GetBaselineFee(
-				difficulty,
-				e.hypergraph.GetSize(nil, nil).Uint64(),
-				costBasis.Uint64(),
-				8000000000,
-			)
-			baseline.Quo(baseline, costBasis)
-		}
+			return nil
+		})
+	}
 
-		result, err := e.executionManager.ProcessMessage(
-			frame.Header.FrameNumber,
-			new(big.Int).Mul(
-				baseline,
-				big.NewInt(int64(frame.Header.FeeMultiplierVote)),
-			),
-			e.appAddress[:32],
-			requestBytes,
-			state,
-		)
-		if err != nil {
-			e.logger.Error(
-				"error processing message",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
-			return errors.Wrap(err, "materialize")
-		}
-
-		state = result.State
+	if err := eg.Wait(); err != nil {
+		return err
 	}
 
 	e.logger.Debug(
@@ -1760,9 +1773,37 @@ func (e *AppConsensusEngine) OnOwnProposal(
 				proposal.PreviousRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
 		}
 
+		provers, err := e.proverRegistry.GetActiveProvers(e.appAddress)
+		if err != nil {
+			e.logger.Error("could not get provers", zap.Error(err))
+			return
+		}
+
+		var signingProverPubKey []byte
+		var signingProverIndex int
+		for i, prover := range provers {
+			if bytes.Equal(
+				prover.Address,
+				(*proposal.Vote).PublicKeySignatureBls48581.Address,
+			) {
+				signingProverIndex = i
+				signingProverPubKey = prover.PublicKey
+				break
+			}
+		}
+
+		bitmask := make([]byte, (len(provers)+7)/8)
+		bitmask[signingProverIndex/8] = 1 << (signingProverIndex % 8)
+
 		// Manually override the signature as the vdf prover's signature is invalid
-		(*proposal.State.State).Header.PublicKeySignatureBls48581.Signature =
-			(*proposal.Vote).PublicKeySignatureBls48581.Signature
+		(*proposal.State.State).Header.PublicKeySignatureBls48581 =
+			&protobufs.BLS48581AggregateSignature{
+				PublicKey: &protobufs.BLS48581G2PublicKey{
+					KeyValue: signingProverPubKey,
+				},
+				Signature: (*proposal.Vote).PublicKeySignatureBls48581.Signature,
+				Bitmask:   bitmask,
+			}
 
 		pbProposal := &protobufs.AppShardProposal{
 			State:                       *proposal.State.State,

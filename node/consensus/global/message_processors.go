@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -262,6 +263,10 @@ func (e *GlobalConsensusEngine) handleFrameMessage(
 			return
 		}
 
+		if frame.Header != nil {
+			e.recordFrameMessageFrameNumber(frame.Header.FrameNumber)
+		}
+
 		frameIDBI, _ := poseidon.HashBytes(frame.Header.Output)
 		frameID := frameIDBI.FillBytes(make([]byte, 32))
 		e.frameStoreMu.Lock()
@@ -336,7 +341,7 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 
 		bundle := &protobufs.MessageBundle{
 			Requests: []*protobufs.MessageRequest{
-				&protobufs.MessageRequest{
+				{
 					Request: &protobufs.MessageRequest_Shard{
 						Shard: frame.Header,
 					},
@@ -386,6 +391,8 @@ func (e *GlobalConsensusEngine) handlePeerInfoMessage(message *pb.Message) {
 		}
 
 		if e.isDuplicatePeerInfo(peerInfo) {
+			e.peerInfoManager.GetPeerInfo(peerInfo.PeerId).LastSeen =
+				time.Now().UnixMilli()
 			return
 		}
 
@@ -1344,11 +1351,7 @@ func (e *GlobalConsensusEngine) addCertifiedState(
 		return
 	}
 
-	if err := e.materialize(
-		txn,
-		parent.State.Header.FrameNumber,
-		parent.State.Requests,
-	); err != nil {
+	if err := e.materialize(txn, parent.State); err != nil {
 		_ = txn.Abort()
 		e.logger.Error("could not materialize frame requests", zap.Error(err))
 		return
@@ -1394,6 +1397,10 @@ func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {
 		e.logger.Debug("failed to unmarshal proposal", zap.Error(err))
 		proposalProcessedTotal.WithLabelValues("error").Inc()
 		return
+	}
+
+	if proposal.State != nil && proposal.State.Header != nil {
+		e.recordProposalFrameNumber(proposal.State.Header.FrameNumber)
 	}
 
 	frameIDBI, _ := poseidon.HashBytes(proposal.State.Header.Output)
@@ -1885,25 +1892,4 @@ func (e *GlobalConsensusEngine) peekMessageType(message *pb.Message) uint32 {
 
 	// Read type prefix from first 4 bytes
 	return binary.BigEndian.Uint32(message.Data[:4])
-}
-
-func compareBits(b1, b2 []byte) int {
-	bitCount1 := 0
-	bitCount2 := 0
-
-	for i := 0; i < len(b1); i++ {
-		for bit := 0; bit < 8; bit++ {
-			if b1[i]&(1<<bit) != 0 {
-				bitCount1++
-			}
-		}
-	}
-	for i := 0; i < len(b2); i++ {
-		for bit := 0; bit < 8; bit++ {
-			if b2[i]&(1<<bit) != 0 {
-				bitCount2++
-			}
-		}
-	}
-	return bitCount1 - bitCount2
 }

@@ -107,6 +107,11 @@ type EngineConfig struct {
 	DataWorkerP2PMultiaddrs []string `yaml:"dataWorkerP2PMultiaddrs"`
 	// Configuration to specify data worker stream multiaddrs
 	DataWorkerStreamMultiaddrs []string `yaml:"dataWorkerStreamMultiaddrs"`
+	// Configuration to manually override data worker p2p multiaddrs in peer info
+	DataWorkerAnnounceP2PMultiaddrs []string `yaml:"dataWorkerAnnounceP2PMultiaddrs"`
+	// Configuration to manually override data worker stream multiaddrs in peer
+	// info
+	DataWorkerAnnounceStreamMultiaddrs []string `yaml:"dataWorkerAnnounceStreamMultiaddrs"`
 	// Number of data worker processes to spawn.
 	DataWorkerCount int `yaml:"dataWorkerCount"`
 	// Specific shard filters for the data workers.

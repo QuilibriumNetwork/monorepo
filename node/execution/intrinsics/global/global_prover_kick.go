@@ -197,7 +197,7 @@ func (p *ProverKick) Materialize(
 			)
 		}
 		vertices := tries.GetAllPreloadedLeaves(he.GetExtrinsicTree().Root)
-		if err == nil && len(vertices) > 0 {
+		if len(vertices) > 0 {
 			for _, vertex := range vertices {
 				allocationFullAddress := vertex.Key
 
@@ -372,7 +372,7 @@ func (p *ProverKick) GetWriteAddresses(frameNumber uint64) ([][]byte, error) {
 	addresses[string(hyperedgeAddress[:])] = struct{}{}
 
 	vertices := tries.GetAllPreloadedLeaves(hyperedge.GetExtrinsicTree().Root)
-	if err == nil && len(vertices) > 0 {
+	if len(vertices) > 0 {
 		for _, vertex := range vertices {
 			addresses[string(vertex.Key)] = struct{}{}
 		}
@@ -520,10 +520,6 @@ func (p *ProverKick) verifyEquivocation(kickedPublicKey []byte) bool {
 			return false
 		}
 		if err := frame2.FromCanonicalBytes(p.ConflictingFrame2); err != nil {
-			return false
-		}
-
-		if frame1 == nil || frame2 == nil {
 			return false
 		}
 

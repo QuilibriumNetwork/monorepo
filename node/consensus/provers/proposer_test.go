@@ -21,6 +21,11 @@ type mockWorkerManager struct {
 	confirmed      [][]byte
 }
 
+// CheckWorkersConnected implements worker.WorkerManager.
+func (m *mockWorkerManager) CheckWorkersConnected() ([]uint, error) {
+	panic("unimplemented")
+}
+
 func (m *mockWorkerManager) DecideAllocations(reject [][]byte, confirm [][]byte) error {
 	m.rejected = reject
 	m.confirmed = confirm
@@ -44,7 +49,14 @@ func (m *mockWorkerManager) GetWorkerIdByFilter(filter []byte) (uint, error) {
 }
 
 func (m *mockWorkerManager) RegisterWorker(info *store.WorkerInfo) error {
-	panic("unimplemented")
+	for i, worker := range m.workers {
+		if worker.CoreId == info.CoreId {
+			m.workers[i] = info
+			return nil
+		}
+	}
+	m.workers = append(m.workers, info)
+	return nil
 }
 
 func (m *mockWorkerManager) Start(ctx context.Context) error {
@@ -128,6 +140,11 @@ func TestPlanAndAllocate_EqualScores_RandomizedWhenNotDataGreedy(t *testing.T) {
 			t.Fatalf("expected one allocation, got %d", len(wm.lastFiltersHex))
 		}
 		firstPickCounts[wm.lastFiltersHex[0]]++
+
+		// Reset worker filter to simulate completion
+		for _, worker := range wm.workers {
+			worker.Filter = nil
+		}
 	}
 
 	distinct := 0

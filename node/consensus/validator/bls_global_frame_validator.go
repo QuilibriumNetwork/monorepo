@@ -102,10 +102,6 @@ func (b *BLSGlobalFrameValidator) Validate(
 	for i, prover := range provers {
 		if slices.Contains(bits, uint8(i)) {
 			info := prover
-			if err != nil {
-				b.logger.Error("could not get prover info", zap.Error(err))
-				return false, errors.Wrap(err, "validate")
-			}
 			activeProverSet = append(activeProverSet, info.PublicKey)
 			throwawaySet = append(
 				throwawaySet,

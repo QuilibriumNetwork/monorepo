@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 
+	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
@@ -144,6 +145,7 @@ func (p *globalMessageProcessor) enforceCollectorLimit(
 
 	if len(collector.Records()) >= maxGlobalMessagesPerFrame {
 		collector.Remove(record)
+		p.engine.deferGlobalMessage(record.sequence+1, record.payload)
 		return keyedcollector.NewInvalidRecordError(
 			record,
 			fmt.Errorf("message limit reached for frame %d", p.sequence),
@@ -166,13 +168,13 @@ func (e *GlobalConsensusEngine) initGlobalMessageAggregator() error {
 		return fmt.Errorf("global message collector factory: %w", err)
 	}
 
-	e.messageCollectors = keyedaggregator.NewSequencedCollectors[sequencedGlobalMessage](
+	e.messageCollectors = keyedaggregator.NewSequencedCollectors(
 		tracer,
 		0,
 		collectorFactory,
 	)
 
-	aggregator, err := keyedaggregator.NewSequencedAggregator[sequencedGlobalMessage](
+	aggregator, err := keyedaggregator.NewSequencedAggregator(
 		tracer,
 		0,
 		e.messageCollectors,
@@ -227,4 +229,61 @@ func (e *GlobalConsensusEngine) getMessageCollector(
 		return nil, false, nil
 	}
 	return e.messageCollectors.GetCollector(rank)
+}
+
+func (e *GlobalConsensusEngine) deferGlobalMessage(
+	targetRank uint64,
+	payload []byte,
+) {
+	if e == nil || len(payload) == 0 || targetRank == 0 {
+		return
+	}
+
+	cloned := slices.Clone(payload)
+	e.globalSpilloverMu.Lock()
+	e.globalMessageSpillover[targetRank] = append(
+		e.globalMessageSpillover[targetRank],
+		cloned,
+	)
+	pending := len(e.globalMessageSpillover[targetRank])
+	e.globalSpilloverMu.Unlock()
+
+	if e.logger != nil {
+		e.logger.Debug(
+			"deferred global message due to collector limit",
+			zap.Uint64("target_rank", targetRank),
+			zap.Int("pending", pending),
+		)
+	}
+}
+
+func (e *GlobalConsensusEngine) flushDeferredGlobalMessages(targetRank uint64) {
+	if e == nil || e.messageAggregator == nil || targetRank == 0 {
+		return
+	}
+
+	e.globalSpilloverMu.Lock()
+	payloads := e.globalMessageSpillover[targetRank]
+	if len(payloads) > 0 {
+		delete(e.globalMessageSpillover, targetRank)
+	}
+	e.globalSpilloverMu.Unlock()
+
+	if len(payloads) == 0 {
+		return
+	}
+
+	for _, payload := range payloads {
+		e.messageAggregator.Add(
+			newSequencedGlobalMessage(targetRank, payload),
+		)
+	}
+
+	if e.logger != nil {
+		e.logger.Debug(
+			"replayed deferred global messages",
+			zap.Uint64("target_rank", targetRank),
+			zap.Int("count", len(payloads)),
+		)
+	}
 }

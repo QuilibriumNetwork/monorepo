@@ -111,8 +111,8 @@ func (hg *HypergraphCRDT) GetHyperedge(id [64]byte) (
 	hypergraph.Hyperedge,
 	error,
 ) {
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 
 	return hg.getHyperedge(id)
 }
@@ -346,8 +346,8 @@ func (hg *HypergraphCRDT) RevertRemoveHyperedge(
 // LookupHyperedge checks if a hyperedge exists in the hypergraph. Returns true
 // if the hyperedge is in the add set and not in the remove set.
 func (hg *HypergraphCRDT) LookupHyperedge(h hypergraph.Hyperedge) bool {
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 	return hg.lookupHyperedge(h)
 }
 

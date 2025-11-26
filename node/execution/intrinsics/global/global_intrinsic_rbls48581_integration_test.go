@@ -5,9 +5,12 @@ package global_test
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/stretchr/testify/assert"
@@ -18,7 +21,10 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
+	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
@@ -47,6 +53,152 @@ func createHypergraph(t *testing.T) (hypergraph.Hypergraph, *bls48581.KZGInclusi
 	)
 	rm := schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, ip)
 	return hg, ip, rm
+}
+
+func TestGlobalIntrinsicProverJoinFlow(t *testing.T) {
+	logger := zap.NewNop()
+	blsConstructor := &bls48581.Bls48581KeyConstructor{}
+	keyManager := keys.NewInMemoryKeyManager(blsConstructor, &bulletproofs.Decaf448KeyConstructor{})
+	signer, _, err := keyManager.CreateSigningKey("q-prover-key", crypto.KeyTypeBLS48581G1)
+	require.NoError(t, err)
+	require.NotNil(t, signer)
+
+	frameNumber := uint64(100)
+	hg, inclusionProver, rdfMultiprover := createHypergraph(t)
+	frameProver := vdf.NewWesolowskiFrameProver(logger)
+
+	pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global_intrinsic"}, 0)
+	frameStore := store.NewPebbleClockStore(pebbleDB, logger)
+	txn, err := frameStore.NewTransaction(false)
+	require.NoError(t, err)
+	err = frameStore.PutGlobalClockFrame(&protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber: frameNumber,
+			Output:      make([]byte, 516),
+			Difficulty:  50000,
+		},
+	}, txn)
+	require.NoError(t, err)
+	require.NoError(t, txn.Commit())
+
+	rewardIssuance := reward.NewOptRewardIssuance()
+	proverRegistry, err := provers.NewProverRegistry(logger, hg)
+	require.NoError(t, err)
+
+	intrinsic, err := global.LoadGlobalIntrinsic(
+		logger,
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+		hg,
+		inclusionProver,
+		keyManager,
+		frameProver,
+		frameStore,
+		rewardIssuance,
+		proverRegistry,
+		blsConstructor,
+	)
+	require.NoError(t, err)
+	addresses := make([][]byte, 100)
+	payloads := make([][]byte, 100)
+
+	wg := sync.WaitGroup{}
+	initialState := hgstate.NewHypergraphState(hg)
+	now := time.Now()
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			filter := slices.Concat([]byte("integration-test-filter000000000000000"), []byte{byte(i)})
+			keyManager := keys.NewInMemoryKeyManager(blsConstructor, &bulletproofs.Decaf448KeyConstructor{})
+			signer, _, err := keyManager.CreateSigningKey("q-prover-key", crypto.KeyTypeBLS48581G1)
+
+			addressBI, err := poseidon.HashBytes(signer.Public().([]byte))
+			require.NoError(t, err)
+			proverAddress := addressBI.FillBytes(make([]byte, 32))
+			addresses[i] = proverAddress
+			proverJoin, err := global.NewProverJoin(
+				[][]byte{filter},
+				frameNumber,
+				nil,
+				nil,
+				keyManager,
+				hg,
+				rdfMultiprover,
+				frameProver,
+				frameStore,
+			)
+			require.NoError(t, err)
+
+			challenge := sha3.Sum256(make([]byte, 516))
+			proof := frameProver.CalculateMultiProof(
+				challenge,
+				50000,
+				[][]byte{slices.Concat(proverAddress, filter, binary.BigEndian.AppendUint32(nil, 0))},
+				0,
+			)
+			proverJoin.Proof = proof[:]
+
+			err = proverJoin.Prove(frameNumber)
+			require.NoError(t, err)
+
+			payload, err := proverJoin.ToBytes()
+			require.NoError(t, err)
+			payloads[i] = payload
+		}()
+	}
+	wg.Wait()
+	fmt.Println("prove", time.Since(now))
+
+	now = time.Now()
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resultState, err := intrinsic.InvokeStep(
+				frameNumber,
+				payloads[i],
+				big.NewInt(0),
+				big.NewInt(1),
+				initialState,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, resultState)
+		}()
+	}
+
+	wg.Wait()
+	fmt.Println(len(initialState.Changeset()))
+	fmt.Println("invoke", time.Since(now))
+	now = time.Now()
+	_, err = intrinsic.Commit()
+	fmt.Println("commit", time.Since(now))
+	require.NoError(t, err)
+	for i := 0; i < 100; i++ {
+		fullAddress := [64]byte{}
+		copy(fullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(fullAddress[32:], addresses[i])
+		proverTree, err := hg.GetVertexData(fullAddress)
+		require.NoError(t, err)
+		require.NotNil(t, proverTree)
+
+		statusBytes, err := rdfMultiprover.Get(
+			global.GLOBAL_RDF_SCHEMA,
+			"prover:Prover",
+			"Status",
+			proverTree,
+		)
+		require.NoError(t, err)
+		require.Equal(t, []byte{0}, statusBytes)
+
+		_, err = rdfMultiprover.Get(
+			global.GLOBAL_RDF_SCHEMA,
+			"prover:Prover",
+			"PublicKey",
+			proverTree,
+		)
+		require.NoError(t, err)
+	}
 }
 
 // Helper function to create an active prover with allocations in the hypergraph
@@ -373,8 +525,8 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 		hg.SetVertexData(txn, [64]byte(slices.Concat(intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], allocationAddress)), allocationTree)
 		txn.Commit()
 
-		// Try to confirm at frame 255840 + 360
-		confirmFrame := uint64(255840 + 360)
+		// Try to confirm at frame 255840 + 1080
+		confirmFrame := uint64(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END)
 		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rm)
 		require.NoError(t, err)
 

@@ -1134,13 +1134,15 @@ func (e *AppConsensusEngine) validatePeerInfoSignature(
 
 	// Create a copy of the peer info without the signature for validation
 	infoCopy := &protobufs.PeerInfo{
-		PeerId:       peerInfo.PeerId,
-		Reachability: peerInfo.Reachability,
-		Timestamp:    peerInfo.Timestamp,
-		Version:      peerInfo.Version,
-		PatchNumber:  peerInfo.PatchNumber,
-		Capabilities: peerInfo.Capabilities,
-		PublicKey:    peerInfo.PublicKey,
+		PeerId:              peerInfo.PeerId,
+		Reachability:        peerInfo.Reachability,
+		Timestamp:           peerInfo.Timestamp,
+		Version:             peerInfo.Version,
+		PatchNumber:         peerInfo.PatchNumber,
+		Capabilities:        peerInfo.Capabilities,
+		PublicKey:           peerInfo.PublicKey,
+		LastReceivedFrame:   peerInfo.LastReceivedFrame,
+		LastGlobalHeadFrame: peerInfo.LastGlobalHeadFrame,
 		// Exclude Signature field
 	}
 

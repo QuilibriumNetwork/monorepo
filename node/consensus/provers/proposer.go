@@ -87,7 +87,7 @@ func NewManager(
 }
 
 // PlanAndAllocate picks up to maxAllocations of the best shard filters and
-// calls WorkerManager.AllocateWorker for each selected free worker.
+// updates the filter in the worker manager for each selected free worker.
 // If maxAllocations == 0, it will use as many free workers as available.
 func (m *Manager) PlanAndAllocate(
 	difficulty uint64,
@@ -123,7 +123,7 @@ func (m *Manager) PlanAndAllocate(
 	}
 	free := make([]uint, 0, len(all))
 	for _, w := range all {
-		if !w.Allocated {
+		if len(w.Filter) == 0 {
 			free = append(free, w.CoreId)
 		}
 	}
@@ -231,6 +231,15 @@ func (m *Manager) PlanAndAllocate(
 		})
 	}
 
+	workerLookup := make(map[uint]*store.WorkerInfo, len(all))
+	for _, w := range all {
+		workerLookup[w.CoreId] = w
+	}
+
+	if len(proposals) > 0 {
+		m.persistPlannedFilters(proposals, workerLookup)
+	}
+
 	// Perform allocations
 	workerIds := []uint{}
 	filters := [][]byte{}
@@ -249,6 +258,45 @@ func (m *Manager) PlanAndAllocate(
 	}
 
 	return proposals, errors.Wrap(err, "plan and allocate")
+}
+
+func (m *Manager) persistPlannedFilters(
+	proposals []Proposal,
+	workers map[uint]*store.WorkerInfo,
+) {
+	for _, proposal := range proposals {
+		info, ok := workers[proposal.WorkerId]
+		if !ok {
+			var err error
+			info, err = m.store.GetWorker(proposal.WorkerId)
+			if err != nil {
+				m.logger.Warn(
+					"failed to load worker for planned allocation",
+					zap.Uint("core_id", proposal.WorkerId),
+					zap.Error(err),
+				)
+				continue
+			}
+			workers[proposal.WorkerId] = info
+		}
+
+		if bytes.Equal(info.Filter, proposal.Filter) {
+			continue
+		}
+
+		filterCopy := make([]byte, len(proposal.Filter))
+		copy(filterCopy, proposal.Filter)
+		info.Filter = filterCopy
+		info.Allocated = false
+
+		if err := m.workerMgr.RegisterWorker(info); err != nil {
+			m.logger.Warn(
+				"failed to persist worker filter",
+				zap.Uint("core_id", info.CoreId),
+				zap.Error(err),
+			)
+		}
+	}
 }
 
 func (m *Manager) scoreShards(
@@ -296,6 +344,9 @@ func (m *Manager) scoreShards(
 			if shardsSqrt.IsZero() {
 				return nil, errors.New("score shards")
 			}
+			if ringDiv.IsZero() {
+				return nil, errors.New("score shards")
+			}
 
 			factor = factor.Div(ringDiv)
 			factor = factor.Div(shardsSqrt)
@@ -320,6 +371,11 @@ func (m *Manager) DecideJoins(
 ) error {
 	if len(pending) == 0 {
 		return nil
+	}
+
+	availableWorkers, err := m.unallocatedWorkerCount()
+	if err != nil {
+		return errors.Wrap(err, "decide joins")
 	}
 
 	// If no shards remain, we should warn
@@ -396,5 +452,38 @@ func (m *Manager) DecideJoins(
 		}
 	}
 
+	if availableWorkers == 0 && len(confirm) > 0 {
+		m.logger.Info(
+			"skipping confirmations due to lack of available workers",
+			zap.Int("pending_confirmations", len(confirm)),
+		)
+		confirm = nil
+	} else if availableWorkers > 0 && len(confirm) > availableWorkers {
+		m.logger.Warn(
+			"limiting confirmations due to worker capacity",
+			zap.Int("pending_confirmations", len(confirm)),
+			zap.Int("available_workers", availableWorkers),
+		)
+		confirm = confirm[:availableWorkers]
+	}
+
 	return m.workerMgr.DecideAllocations(reject, confirm)
+}
+
+func (m *Manager) unallocatedWorkerCount() (int, error) {
+	workers, err := m.workerMgr.RangeWorkers()
+	if err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for _, worker := range workers {
+		if worker == nil {
+			continue
+		}
+		if !worker.Allocated {
+			count++
+		}
+	}
+	return count, nil
 }

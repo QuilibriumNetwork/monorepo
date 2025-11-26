@@ -174,6 +174,28 @@ func (p *PeerInfo) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
+	// Write last_received_frame
+	if p.LastReceivedFrame != 0 {
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			p.LastReceivedFrame,
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write last_global_head_frame
+	if p.LastGlobalHeadFrame != 0 {
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			p.LastGlobalHeadFrame,
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
 	return buf.Bytes(), nil
 }
 
@@ -334,6 +356,24 @@ func (p *PeerInfo) FromCanonicalBytes(data []byte) error {
 	p.Signature = make([]byte, signatureLen)
 	if _, err := buf.Read(p.Signature); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read last_received_frame
+	if err := binary.Read(
+		buf,
+		binary.BigEndian,
+		&p.LastReceivedFrame,
+	); err != nil {
+		return nil
+	}
+
+	// Read last_global_head_frame
+	if err := binary.Read(
+		buf,
+		binary.BigEndian,
+		&p.LastGlobalHeadFrame,
+	); err != nil {
+		return nil
 	}
 
 	return nil

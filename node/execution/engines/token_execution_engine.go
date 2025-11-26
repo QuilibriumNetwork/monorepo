@@ -481,7 +481,7 @@ func (e *TokenExecutionEngine) ProcessMessage(
 	}
 
 	// Otherwise, delegate to individual message processing
-	result, err := e.processIndividualMessage(
+	result, _, err := e.processIndividualMessage(
 		frameNumber,
 		big.NewInt(0),
 		feeMultiplier,
@@ -624,14 +624,14 @@ func (e *TokenExecutionEngine) handleBundle(
 
 		// Process the individual operation by calling ProcessMessage recursively
 		// but with the individual operation payload
-		opResponses, err := e.processIndividualMessage(
+		opResponses, _, err := e.processIndividualMessage(
 			frameNumber,
 			feeForOp,
 			feeMultiplier,
 			address,
 			op,
 			true,
-			responses.State,
+			state,
 		)
 		if err != nil {
 			return nil, errors.Wrapf(err, "handle bundle: operation %d failed", i)
@@ -639,7 +639,6 @@ func (e *TokenExecutionEngine) handleBundle(
 
 		// Collect responses
 		responses.Messages = append(responses.Messages, opResponses.Messages...)
-		responses.State = opResponses.State
 	}
 
 	e.logger.Info(
@@ -661,7 +660,7 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 	message *protobufs.MessageRequest,
 	fromBundle bool,
 	state state.State,
-) (*execution.ProcessMessageResult, error) {
+) (*execution.ProcessMessageResult, []byte, error) {
 	payload := []byte{}
 	var err error
 	domain := address
@@ -683,7 +682,7 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 		err = errors.New("unsupported message type")
 	}
 	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
+		return nil, nil, errors.Wrap(err, "process individual message")
 	}
 
 	// Read the type prefix to determine if it's a deploy or operation
@@ -695,7 +694,7 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 		if fromBundle {
 			return e.handleDeploy(domain, payload, frameNumber, feePaid, state)
 		} else {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				errors.New("deploy or update messages must be bundled"),
 				"process individual message",
 			)
@@ -709,7 +708,7 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 			[64]byte(slices.Concat(domain, bytes.Repeat([]byte{0xff}, 32))),
 		)
 		if err == nil || !fromBundle {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				errors.New("non-deploy messages not allowed in global mode"),
 				"process individual message",
 			)
@@ -719,12 +718,7 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 	// Otherwise, try to handle it as an operation on existing intrinsic
 	intrinsic, err := e.tryGetIntrinsic(domain)
 	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
-	}
-
-	err = e.validateIndividualMessage(frameNumber, domain, message, fromBundle)
-	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
+		return nil, nil, errors.Wrap(err, "process individual message")
 	}
 
 	// Process the operation
@@ -736,7 +730,7 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 		state,
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
+		return nil, nil, errors.Wrap(err, "process individual message")
 	}
 
 	e.logger.Debug(
@@ -747,7 +741,7 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 	return &execution.ProcessMessageResult{
 		Messages: []*protobufs.Message{},
 		State:    newState,
-	}, nil
+	}, nil, nil
 }
 
 func (e *TokenExecutionEngine) handleDeploy(
@@ -756,9 +750,10 @@ func (e *TokenExecutionEngine) handleDeploy(
 	frameNumber uint64,
 	feePaid *big.Int,
 	state state.State,
-) (*execution.ProcessMessageResult, error) {
+) (*execution.ProcessMessageResult, []byte, error) {
+	var applicableDeploy []byte
 	if bytes.Equal(address, token.QUIL_TOKEN_ADDRESS) {
-		return nil, errors.Wrap(errors.New("reserved"), "handle deploy")
+		return nil, nil, errors.Wrap(errors.New("reserved"), "handle deploy")
 	}
 
 	var intrinsic *token.TokenIntrinsic
@@ -767,12 +762,12 @@ func (e *TokenExecutionEngine) handleDeploy(
 		deployPb := &protobufs.TokenDeploy{}
 		err := deployPb.FromCanonicalBytes(payload)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		deployArgs, err := token.TokenDeployFromProtobuf(deployPb)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		// Create new token intrinsic
@@ -786,11 +781,11 @@ func (e *TokenExecutionEngine) handleDeploy(
 			e.keyManager,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		// Deploy the intrinsic
-		state, err = intrinsic.Deploy(
+		state, applicableDeploy, err = intrinsic.Deploy(
 			token.TOKEN_BASE_DOMAIN,
 			nil, // provers
 			nil, // creator
@@ -800,20 +795,17 @@ func (e *TokenExecutionEngine) handleDeploy(
 			state,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
-
-		// Get the deployed address
-		deployedAddress := intrinsic.Address()
 
 		// Store the intrinsic
 		e.intrinsicsMutex.Lock()
-		e.intrinsics[string(deployedAddress)] = intrinsic
+		e.intrinsics[string(applicableDeploy)] = intrinsic
 		e.intrinsicsMutex.Unlock()
 
 		e.logger.Info(
 			"deployed token intrinsic",
-			zap.String("address", hex.EncodeToString(deployedAddress)),
+			zap.String("address", hex.EncodeToString(applicableDeploy)),
 			zap.String("name", deployArgs.Config.Name),
 			zap.String("symbol", deployArgs.Config.Symbol),
 		)
@@ -822,12 +814,12 @@ func (e *TokenExecutionEngine) handleDeploy(
 		updatePb := &protobufs.TokenUpdate{}
 		err := updatePb.FromCanonicalBytes(payload)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		deployArgs, err := token.TokenUpdateFromProtobuf(updatePb)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		// Load existing token intrinsic
@@ -842,11 +834,11 @@ func (e *TokenExecutionEngine) handleDeploy(
 			e.clockStore,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		// Update the intrinsic
-		state, err = intrinsic.Deploy(
+		state, applicableDeploy, err = intrinsic.Deploy(
 			[32]byte(address),
 			nil, // provers
 			nil, // creator
@@ -856,20 +848,17 @@ func (e *TokenExecutionEngine) handleDeploy(
 			state,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
-
-		// Get the deployed address
-		deployedAddress := intrinsic.Address()
 
 		// Store the intrinsic
 		e.intrinsicsMutex.Lock()
-		e.intrinsics[string(deployedAddress)] = intrinsic
+		e.intrinsics[string(applicableDeploy)] = intrinsic
 		e.intrinsicsMutex.Unlock()
 
 		e.logger.Info(
 			"updated token intrinsic",
-			zap.String("address", hex.EncodeToString(deployedAddress)),
+			zap.String("address", hex.EncodeToString(applicableDeploy)),
 			zap.String("name", deployArgs.Config.Name),
 			zap.String("symbol", deployArgs.Config.Symbol),
 		)
@@ -878,7 +867,7 @@ func (e *TokenExecutionEngine) handleDeploy(
 	return &execution.ProcessMessageResult{
 		Messages: []*protobufs.Message{},
 		State:    state,
-	}, nil
+	}, applicableDeploy, nil
 }
 
 func (e *TokenExecutionEngine) tryGetIntrinsic(

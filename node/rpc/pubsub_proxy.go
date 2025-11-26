@@ -695,7 +695,10 @@ func (c *PubSubProxyClient) handleValidationRequests(ctx context.Context) {
 // Ensure PubSubProxyClient implements p2p.PubSub
 var _ p2p.PubSub = (*PubSubProxyClient)(nil)
 
-func (c *PubSubProxyClient) PublishToBitmask(bitmask []byte, data []byte) error {
+func (c *PubSubProxyClient) PublishToBitmask(
+	bitmask []byte,
+	data []byte,
+) error {
 	_, err := c.client.PublishToBitmask(
 		context.Background(),
 		&protobufs.PublishToBitmaskRequest{

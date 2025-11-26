@@ -25,12 +25,13 @@ type Capability struct {
 }
 
 type PeerInfo struct {
-	PeerId       []byte
-	Cores        uint32
-	Capabilities []Capability
-	Reachability []Reachability
-	Bandwidth    uint64
-	LastSeen     int64
-	Version      []byte
-	PatchNumber  []byte
+	PeerId              []byte
+	Cores               uint32
+	Capabilities        []Capability
+	Reachability        []Reachability
+	LastSeen            int64
+	Version             []byte
+	PatchNumber         []byte
+	LastReceivedFrame   uint64
+	LastGlobalHeadFrame uint64
 }

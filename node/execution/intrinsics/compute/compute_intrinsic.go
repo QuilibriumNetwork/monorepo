@@ -356,7 +356,7 @@ func (c *ComputeIntrinsic) Deploy(
 	contextData []byte,
 	frameNumber uint64,
 	hgstate state.State,
-) (state.State, error) {
+) (state.State, []byte, error) {
 	if !bytes.Equal(domain[:], COMPUTE_INTRINSIC_DOMAIN[:]) {
 		vert, err := hgstate.Get(
 			domain[:],
@@ -364,14 +364,14 @@ func (c *ComputeIntrinsic) Deploy(
 			hg.VertexAddsDiscriminator,
 		)
 		if err != nil {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				state.ErrInvalidDomain,
 				"deploy",
 			)
 		}
 
 		if vert == nil {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				state.ErrInvalidDomain,
 				"deploy",
 			)
@@ -381,16 +381,16 @@ func (c *ComputeIntrinsic) Deploy(
 		updatePb := &protobufs.ComputeUpdate{}
 		err = updatePb.FromCanonicalBytes(contextData)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		deployArgs, err := ComputeUpdateFromProtobuf(updatePb)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		if err := updatePb.Validate(); err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		updateWithoutSignature := proto.Clone(updatePb).(*protobufs.ComputeUpdate)
@@ -398,7 +398,7 @@ func (c *ComputeIntrinsic) Deploy(
 		updateWithoutSignature.PublicKeySignatureBls48581 = nil
 		message, err := updateWithoutSignature.ToCanonicalBytes()
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		validSig, err := c.keyManager.ValidateSignature(
@@ -409,7 +409,7 @@ func (c *ComputeIntrinsic) Deploy(
 			slices.Concat(domain[:], []byte("COMPUTE_UPDATE")),
 		)
 		if err != nil || !validSig {
-			return nil, errors.Wrap(errors.New("invalid signature"), "deploy")
+			return nil, nil, errors.Wrap(errors.New("invalid signature"), "deploy")
 		}
 
 		vertexAddress := slices.Concat(
@@ -420,17 +420,17 @@ func (c *ComputeIntrinsic) Deploy(
 		// Ensure the vertex is present and has not been removed
 		_, err = c.hypergraph.GetVertex([64]byte(vertexAddress))
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		prior, err := c.hypergraph.GetVertexData([64]byte(vertexAddress))
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		tree, err := c.hypergraph.GetVertexData([64]byte(vertexAddress))
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		// Retrieve the existing RDF schema from the tree
@@ -446,19 +446,19 @@ func (c *ComputeIntrinsic) Deploy(
 				deployArgs.Config,
 			)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			commit := configTree.Commit(c.inclusionProver, false)
 
 			out, err := tries.SerializeNonLazyTree(configTree)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			err = tree.Insert([]byte{16 << 2}, out, commit, configTree.GetSize())
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 		}
 
@@ -469,7 +469,7 @@ func (c *ComputeIntrinsic) Deploy(
 			// Validate that the new schema is valid
 			_, err := c.rdfMultiprover.GetSchemaMap(newSchemaDoc)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			// Validate that the update only adds new classes/properties, never
@@ -477,7 +477,7 @@ func (c *ComputeIntrinsic) Deploy(
 			if existingRDFSchema != "" {
 				err = c.validateRDFSchemaUpdate(existingRDFSchema, newSchemaDoc)
 				if err != nil {
-					return nil, errors.Wrap(err, "deploy")
+					return nil, nil, errors.Wrap(err, "deploy")
 				}
 			}
 
@@ -489,7 +489,7 @@ func (c *ComputeIntrinsic) Deploy(
 				big.NewInt(int64(len(deployArgs.RDFSchema))),
 			)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			c.rdfHypergraphSchema = newSchemaDoc
@@ -512,12 +512,12 @@ func (c *ComputeIntrinsic) Deploy(
 			),
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		c.state = hgstate
 
-		return hgstate, nil
+		return hgstate, slices.Clone(c.Address()), nil
 	}
 
 	// Initialize consensus metadata
@@ -531,7 +531,7 @@ func (c *ComputeIntrinsic) Deploy(
 	var err error
 	additionalData[13], err = newComputeConfigurationMetadata(c.config)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	// Generate compute domain - include config commitment in domain generation
@@ -542,14 +542,14 @@ func (c *ComputeIntrinsic) Deploy(
 		),
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	computeDomain := computeDomainBI.FillBytes(make([]byte, 32))
 
 	rdfHypergraphSchema, err := c.newComputeRDFHypergraphSchema(contextData)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	// Initialize the state
@@ -561,7 +561,7 @@ func (c *ComputeIntrinsic) Deploy(
 		additionalData,
 		COMPUTE_INTRINSIC_DOMAIN[:],
 	); err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	c.state = hgstate
@@ -571,7 +571,7 @@ func (c *ComputeIntrinsic) Deploy(
 	c.sumcheckInfo = sumcheckInfo
 	c.rdfHypergraphSchema = rdfHypergraphSchema
 
-	return c.state, nil
+	return c.state, slices.Clone(c.Address()), nil
 }
 
 // Validate implements intrinsics.Intrinsic.

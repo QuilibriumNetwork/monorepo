@@ -49,6 +49,8 @@ func (e *AppConsensusEngine) eventDistributorLoop(
 						zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
 					)
 
+					e.flushDeferredAppMessages(data.Frame.GetRank() + 1)
+
 					// Record the fee vote from the accepted frame
 					if err := e.dynamicFeeManager.AddFrameFeeVote(
 						e.appAddress,

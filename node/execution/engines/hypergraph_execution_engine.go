@@ -565,7 +565,7 @@ func (e *HypergraphExecutionEngine) handleBundle(
 			address,
 			op,
 			true,
-			responses.State,
+			state,
 		)
 		if err != nil {
 			return nil, errors.Wrapf(err, "handle bundle: operation %d failed", i)
@@ -573,7 +573,6 @@ func (e *HypergraphExecutionEngine) handleBundle(
 
 		// Collect responses
 		responses.Messages = append(responses.Messages, opResponses.Messages...)
-		responses.State = opResponses.State
 	}
 
 	e.logger.Info(
@@ -654,11 +653,6 @@ func (e *HypergraphExecutionEngine) processIndividualMessage(
 		return nil, errors.Wrap(err, "process individual message")
 	}
 
-	err = e.validateIndividualMessage(frameNumber, address, message, fromBundle)
-	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
-	}
-
 	// Process the operation
 	_, err = intrinsic.InvokeStep(
 		frameNumber,
@@ -694,6 +688,7 @@ func (e *HypergraphExecutionEngine) handleDeploy(
 	feePaid *big.Int,
 	state state.State,
 ) (*execution.ProcessMessageResult, error) {
+	var applicableDeploy []byte
 	var intrinsic *hypergraphintrinsic.HypergraphIntrinsic
 	if bytes.Equal(address, hypergraphintrinsic.HYPERGRAPH_BASE_DOMAIN[:]) {
 		// Deserialize the deploy arguments
@@ -721,7 +716,7 @@ func (e *HypergraphExecutionEngine) handleDeploy(
 		)
 
 		// Deploy the intrinsic
-		state, err = intrinsic.Deploy(
+		state, applicableDeploy, err = intrinsic.Deploy(
 			hypergraphintrinsic.HYPERGRAPH_BASE_DOMAIN,
 			nil, // provers
 			nil, // creator
@@ -734,17 +729,14 @@ func (e *HypergraphExecutionEngine) handleDeploy(
 			return nil, errors.Wrap(err, "handle deploy")
 		}
 
-		// Get the deployed address
-		deployedAddress := intrinsic.Address()
-
 		// Store the intrinsic
 		e.intrinsicsMutex.Lock()
-		e.intrinsics[string(deployedAddress)] = intrinsic
+		e.intrinsics[string(applicableDeploy)] = intrinsic
 		e.intrinsicsMutex.Unlock()
 
 		e.logger.Info(
 			"deployed hypergraph intrinsic",
-			zap.String("address", hex.EncodeToString(deployedAddress)),
+			zap.String("address", hex.EncodeToString(applicableDeploy)),
 		)
 	} else {
 		// Deserialize the update arguments
@@ -770,7 +762,7 @@ func (e *HypergraphExecutionEngine) handleDeploy(
 		// Deploy (update) the intrinsic
 		var domain [32]byte
 		copy(domain[:], address)
-		state, err = intrinsic.Deploy(
+		state, applicableDeploy, err = intrinsic.Deploy(
 			domain,
 			nil, // provers
 			nil, // creator
@@ -785,12 +777,12 @@ func (e *HypergraphExecutionEngine) handleDeploy(
 
 		// Store the intrinsic
 		e.intrinsicsMutex.Lock()
-		e.intrinsics[string(address)] = intrinsic
+		e.intrinsics[string(applicableDeploy)] = intrinsic
 		e.intrinsicsMutex.Unlock()
 
 		e.logger.Info(
 			"updated hypergraph intrinsic",
-			zap.String("address", hex.EncodeToString(address)),
+			zap.String("address", hex.EncodeToString(applicableDeploy)),
 		)
 	}
 
