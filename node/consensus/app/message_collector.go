@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 
+	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	"google.golang.org/protobuf/proto"
 
@@ -141,6 +142,7 @@ func (p *appMessageProcessor) enforceCollectorLimit(
 
 	if len(collector.Records()) >= maxAppMessagesPerRank {
 		collector.Remove(record)
+		p.engine.deferAppMessage(p.rank+1, record.message)
 		return keyedcollector.NewInvalidRecordError(
 			record,
 			fmt.Errorf("message limit reached for rank %d", p.rank),
@@ -163,13 +165,13 @@ func (e *AppConsensusEngine) initAppMessageAggregator() error {
 		return err
 	}
 
-	e.messageCollectors = keyedaggregator.NewSequencedCollectors[sequencedAppMessage](
+	e.messageCollectors = keyedaggregator.NewSequencedCollectors(
 		tracer,
 		0,
 		collectorFactory,
 	)
 
-	aggregator, err := keyedaggregator.NewSequencedAggregator[sequencedAppMessage](
+	aggregator, err := keyedaggregator.NewSequencedAggregator(
 		tracer,
 		0,
 		e.messageCollectors,
@@ -266,4 +268,61 @@ func (e *AppConsensusEngine) updatePendingMessagesGauge(rank uint64) {
 	pendingMessagesCount.WithLabelValues(e.appAddressHex).Set(
 		float64(len(collector.Records())),
 	)
+}
+
+func (e *AppConsensusEngine) deferAppMessage(
+	targetRank uint64,
+	message *protobufs.Message,
+) {
+	if e == nil || message == nil || targetRank == 0 {
+		return
+	}
+
+	cloned := proto.Clone(message).(*protobufs.Message)
+	e.appSpilloverMu.Lock()
+	e.appMessageSpillover[targetRank] = append(
+		e.appMessageSpillover[targetRank],
+		cloned,
+	)
+	pending := len(e.appMessageSpillover[targetRank])
+	e.appSpilloverMu.Unlock()
+
+	if e.logger != nil {
+		e.logger.Debug(
+			"deferred app message due to collector limit",
+			zap.String("app_address", e.appAddressHex),
+			zap.Uint64("target_rank", targetRank),
+			zap.Int("pending", pending),
+		)
+	}
+}
+
+func (e *AppConsensusEngine) flushDeferredAppMessages(targetRank uint64) {
+	if e == nil || e.messageAggregator == nil || targetRank == 0 {
+		return
+	}
+
+	e.appSpilloverMu.Lock()
+	messages := e.appMessageSpillover[targetRank]
+	if len(messages) > 0 {
+		delete(e.appMessageSpillover, targetRank)
+	}
+	e.appSpilloverMu.Unlock()
+
+	if len(messages) == 0 {
+		return
+	}
+
+	for _, msg := range messages {
+		e.messageAggregator.Add(newSequencedAppMessage(targetRank, msg))
+	}
+
+	if e.logger != nil {
+		e.logger.Debug(
+			"replayed deferred app messages",
+			zap.String("app_address", e.appAddressHex),
+			zap.Uint64("target_rank", targetRank),
+			zap.Int("count", len(messages)),
+		)
+	}
 }

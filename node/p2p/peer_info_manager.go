@@ -1,7 +1,6 @@
 package p2p
 
 import (
-	"bytes"
 	"sync"
 	"time"
 
@@ -16,19 +15,17 @@ type InMemoryPeerInfoManager struct {
 	peerInfoCh chan *protobufs.PeerInfo
 	peerInfoMx sync.RWMutex
 
-	peerMap      map[string]*p2p.PeerInfo
-	fastestPeers []*p2p.PeerInfo
-	ctx          lifecycle.SignalerContext
+	peerMap map[string]*p2p.PeerInfo
+	ctx     lifecycle.SignalerContext
 }
 
 var _ p2p.PeerInfoManager = (*InMemoryPeerInfoManager)(nil)
 
 func NewInMemoryPeerInfoManager(logger *zap.Logger) *InMemoryPeerInfoManager {
 	return &InMemoryPeerInfoManager{
-		logger:       logger,
-		peerInfoCh:   make(chan *protobufs.PeerInfo, 1000),
-		fastestPeers: []*p2p.PeerInfo{},
-		peerMap:      make(map[string]*p2p.PeerInfo),
+		logger:     logger,
+		peerInfoCh: make(chan *protobufs.PeerInfo, 1000),
+		peerMap:    make(map[string]*p2p.PeerInfo),
 	}
 }
 
@@ -59,25 +56,16 @@ func (m *InMemoryPeerInfoManager) Start(
 			seen := time.Now().UnixMilli()
 			m.peerInfoMx.Lock()
 			m.peerMap[string(info.PeerId)] = &p2p.PeerInfo{
-				PeerId:       info.PeerId,
-				Bandwidth:    100,
-				Capabilities: capabilities,
-				Reachability: reachability,
-				Cores:        uint32(len(reachability)),
-				LastSeen:     seen,
-				Version:      info.Version,
-				PatchNumber:  info.PatchNumber,
+				PeerId:              info.PeerId,
+				Capabilities:        capabilities,
+				Reachability:        reachability,
+				Cores:               uint32(len(reachability)),
+				LastSeen:            seen,
+				Version:             info.Version,
+				PatchNumber:         info.PatchNumber,
+				LastReceivedFrame:   info.LastReceivedFrame,
+				LastGlobalHeadFrame: info.LastGlobalHeadFrame,
 			}
-			m.searchAndInsertPeer(&p2p.PeerInfo{
-				PeerId:       info.PeerId,
-				Bandwidth:    100,
-				Capabilities: capabilities,
-				Reachability: reachability,
-				Cores:        uint32(len(reachability)),
-				LastSeen:     seen,
-				Version:      info.Version,
-				PatchNumber:  info.PatchNumber,
-			})
 			m.peerInfoMx.Unlock()
 		case <-ctx.Done():
 			return
@@ -116,33 +104,9 @@ func (m *InMemoryPeerInfoManager) GetPeerMap() map[string]*p2p.PeerInfo {
 func (m *InMemoryPeerInfoManager) GetPeersBySpeed() [][]byte {
 	result := [][]byte{}
 	m.peerInfoMx.RLock()
-	for _, info := range m.fastestPeers {
+	for _, info := range m.peerMap {
 		result = append(result, info.PeerId)
 	}
 	m.peerInfoMx.RUnlock()
 	return result
-}
-
-// blatantly lifted from slices.BinarySearchFunc, optimized for direct insertion
-// and uint64 comparison without overflow
-func (m *InMemoryPeerInfoManager) searchAndInsertPeer(info *p2p.PeerInfo) {
-	n := len(m.fastestPeers)
-	i, j := 0, n
-	for i < j {
-		h := int(uint(i+j) >> 1)
-		if m.fastestPeers[h].Bandwidth > info.Bandwidth {
-			i = h + 1
-		} else {
-			j = h
-		}
-	}
-
-	if i < n && m.fastestPeers[i].Bandwidth == info.Bandwidth &&
-		bytes.Equal(m.fastestPeers[i].PeerId, info.PeerId) {
-		m.fastestPeers[i] = info
-	} else {
-		m.fastestPeers = append(m.fastestPeers, new(p2p.PeerInfo))
-		copy(m.fastestPeers[i+1:], m.fastestPeers[i:])
-		m.fastestPeers[i] = info
-	}
 }

@@ -502,8 +502,8 @@ func (hg *HypergraphCRDT) CreateTraversalProof(
 	phaseType hypergraph.PhaseType,
 	keys [][]byte,
 ) (*tries.TraversalProof, error) {
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 
 	timer := prometheus.NewTimer(TraversalProofDuration.WithLabelValues("create"))
 	defer timer.ObserveDuration()
@@ -564,8 +564,8 @@ func (hg *HypergraphCRDT) VerifyTraversalProof(
 	root []byte,
 	traversalProof *tries.TraversalProof,
 ) (bool, error) {
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 
 	timer := prometheus.NewTimer(TraversalProofDuration.WithLabelValues("verify"))
 	defer timer.ObserveDuration()

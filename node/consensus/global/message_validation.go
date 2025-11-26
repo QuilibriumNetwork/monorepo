@@ -288,7 +288,7 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 ) tp2p.ValidationResult {
 	e.logger.Debug(
 		"validating prover message from peer",
-		zap.String("peer_id", peerID.String()),
+		zap.String("peer_id", peer.ID(message.From).String()),
 	)
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
@@ -307,7 +307,7 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 	case protobufs.MessageBundleType:
 		e.logger.Debug(
 			"validating message bundle from peer",
-			zap.String("peer_id", peerID.String()),
+			zap.String("peer_id", peer.ID(message.From).String()),
 		)
 		// Prover messages come wrapped in MessageBundle
 		messageBundle := &protobufs.MessageBundle{}

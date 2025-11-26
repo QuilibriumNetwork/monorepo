@@ -160,12 +160,14 @@ func (r *RPCServer) GetPeerInfo(
 			})
 		}
 		out = append(out, &protobufs.PeerInfo{
-			PeerId:       pi.PeerId,
-			Reachability: re,
-			Timestamp:    pi.LastSeen,
-			Capabilities: cs,
-			Version:      pi.Version,
-			PatchNumber:  pi.PatchNumber,
+			PeerId:              pi.PeerId,
+			Reachability:        re,
+			Timestamp:           pi.LastSeen,
+			Capabilities:        cs,
+			Version:             pi.Version,
+			PatchNumber:         pi.PatchNumber,
+			LastReceivedFrame:   pi.LastReceivedFrame,
+			LastGlobalHeadFrame: pi.LastGlobalHeadFrame,
 		})
 	}
 

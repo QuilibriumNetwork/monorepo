@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -27,6 +28,7 @@ const VERTEX_DATA_DELETION_INTERVAL = 10 * 60 * 1000
 var HYPERGRAPH_METADATA_ADDRESS = bytes.Repeat([]byte{0xff}, 32)
 
 type HypergraphState struct {
+	mu         sync.Mutex
 	hypergraph hypergraph.Hypergraph
 	changeset  []state.StateChange
 }
@@ -47,6 +49,12 @@ func (h *HypergraphState) NewVertexAddMaterializedState(
 	prior *tries.VectorCommitmentTree,
 	data *tries.VectorCommitmentTree,
 ) *VertexAddMaterializedState {
+	if prior != nil {
+		prior.Commit(h.GetProver(), false)
+	}
+	if data != nil {
+		data.Commit(h.GetProver(), false)
+	}
 	return &VertexAddMaterializedState{
 		h,
 		appAddress,
@@ -137,6 +145,9 @@ func (h *HypergraphState) NewVertexRemoveMaterializedState(
 	commitment []byte,
 	originalSize *big.Int,
 ) *VertexRemoveMaterializedState {
+	if prior != nil {
+		prior.Commit(h.GetProver(), false)
+	}
 	return &VertexRemoveMaterializedState{
 		h,
 		appAddress,
@@ -211,6 +222,12 @@ func (h *HypergraphState) NewHyperedgeAddMaterializedState(
 	prior *tries.VectorCommitmentTree,
 	value hypergraph.Hyperedge,
 ) *HyperedgeAddMaterializedState {
+	if prior != nil {
+		prior.Commit(h.GetProver(), false)
+	}
+	if value != nil {
+		value.Commit(h.GetProver())
+	}
 	return &HyperedgeAddMaterializedState{
 		h,
 		frameNumber,
@@ -275,6 +292,12 @@ func (h *HypergraphState) NewHyperedgeRemoveMaterializedState(
 	prior *tries.VectorCommitmentTree,
 	value hypergraph.Hyperedge,
 ) *HyperedgeRemoveMaterializedState {
+	if prior != nil {
+		prior.Commit(h.GetProver(), false)
+	}
+	if value != nil {
+		value.Commit(h.GetProver())
+	}
 	return &HyperedgeRemoveMaterializedState{
 		h,
 		frameNumber,
@@ -588,7 +611,7 @@ func (h *HypergraphState) Init(
 
 	initializedDomain := make([]byte, 32)
 	copy(initializedDomain, domain)
-
+	h.mu.Lock()
 	h.changeset = append(h.changeset, state.StateChange{
 		Domain:        initializedDomain,
 		Address:       HYPERGRAPH_METADATA_ADDRESS,
@@ -601,6 +624,7 @@ func (h *HypergraphState) Init(
 			data:        publicStateInformation,
 		},
 	})
+	h.mu.Unlock()
 
 	return nil
 }
@@ -659,6 +683,7 @@ func (h *HypergraphState) Delete(
 		return errors.Wrap(state.ErrInvalidDiscriminator, "delete")
 	}
 
+	h.mu.Lock()
 	h.changeset = append(h.changeset, state.StateChange{
 		Domain:        domain,
 		Address:       address,
@@ -666,6 +691,7 @@ func (h *HypergraphState) Delete(
 		StateChange:   state.DeleteStateChangeEvent,
 		Value:         value,
 	})
+	h.mu.Unlock()
 
 	return nil
 }
@@ -677,12 +703,16 @@ func (h *HypergraphState) Get(
 	address []byte,
 	discriminator []byte,
 ) (interface{}, error) {
+	h.mu.Lock()
 	for _, c := range slices.Backward(h.changeset) {
 		if bytes.Equal(c.Address, address) && bytes.Equal(c.Domain, domain) &&
 			bytes.Equal(c.Discriminator, discriminator) {
+			h.mu.Unlock()
+
 			return c.Value.DataValue(), nil
 		}
 	}
+	h.mu.Unlock()
 
 	id := [64]byte{}
 	copy(id[:32], domain)
@@ -755,6 +785,7 @@ func (h *HypergraphState) Set(
 		stateChange = state.UpdateStateChangeEvent
 	}
 
+	h.mu.Lock()
 	h.changeset = append(h.changeset, state.StateChange{
 		Domain:        domain,
 		Address:       address,
@@ -762,6 +793,7 @@ func (h *HypergraphState) Set(
 		StateChange:   stateChange,
 		Value:         value,
 	})
+	h.mu.Unlock()
 
 	return nil
 }
@@ -773,6 +805,8 @@ func (h *HypergraphState) Commit() error {
 		return errors.Wrap(err, "commit")
 	}
 
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	for _, change := range h.changeset {
 		if err := change.Value.Commit(txn); err != nil {
 			if err := txn.Abort(); err != nil {
@@ -792,7 +826,9 @@ func (h *HypergraphState) Commit() error {
 
 // Abort implements state.State, aborting the (db-level) transaction set.
 func (h *HypergraphState) Abort() error {
+	h.mu.Lock()
 	h.changeset = []state.StateChange{}
+	h.mu.Unlock()
 	return nil
 }
 

@@ -90,6 +90,7 @@ func (t *TokenIntrinsic) Deploy(
 	hgstate state.State,
 ) (
 	state.State,
+	[]byte,
 	error,
 ) {
 	timer := prometheus.NewTimer(
@@ -104,14 +105,14 @@ func (t *TokenIntrinsic) Deploy(
 			hg.VertexAddsDiscriminator,
 		)
 		if err != nil {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				state.ErrInvalidDomain,
 				"deploy",
 			)
 		}
 
 		if vert == nil {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				state.ErrInvalidDomain,
 				"deploy",
 			)
@@ -121,16 +122,16 @@ func (t *TokenIntrinsic) Deploy(
 		updatePb := &protobufs.TokenUpdate{}
 		err = updatePb.FromCanonicalBytes(contextData)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		deployArgs, err := TokenUpdateFromProtobuf(updatePb)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		if err := updatePb.Validate(); err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		updateWithoutSignature := proto.Clone(updatePb).(*protobufs.TokenUpdate)
@@ -138,7 +139,7 @@ func (t *TokenIntrinsic) Deploy(
 		updateWithoutSignature.PublicKeySignatureBls48581 = nil
 		message, err := updateWithoutSignature.ToCanonicalBytes()
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		validSig, err := t.keyManager.ValidateSignature(
@@ -149,11 +150,11 @@ func (t *TokenIntrinsic) Deploy(
 			slices.Concat(domain[:], []byte("TOKEN_UPDATE")),
 		)
 		if err != nil || !validSig {
-			return nil, errors.Wrap(errors.New("invalid signature"), "deploy")
+			return nil, nil, errors.Wrap(errors.New("invalid signature"), "deploy")
 		}
 
 		if t.config.Behavior != deployArgs.Config.Behavior {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				errors.New("behavior cannot be updated"),
 				"deploy",
 			)
@@ -161,7 +162,7 @@ func (t *TokenIntrinsic) Deploy(
 
 		if t.config.MintStrategy != nil {
 			if deployArgs.Config.MintStrategy == nil {
-				return nil, errors.Wrap(
+				return nil, nil, errors.Wrap(
 					errors.New("mint strategy missing"),
 					"deploy",
 				)
@@ -169,11 +170,11 @@ func (t *TokenIntrinsic) Deploy(
 
 			err := validateTokenConfiguration(deployArgs.Config)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			if deployArgs.Config.Supply.Cmp(t.config.Supply) < 0 {
-				return nil, errors.Wrap(
+				return nil, nil, errors.Wrap(
 					errors.New("supply cannot be reduced"),
 					"deploy",
 				)
@@ -181,7 +182,7 @@ func (t *TokenIntrinsic) Deploy(
 
 			if deployArgs.Config.Units != nil &&
 				deployArgs.Config.Units.Cmp(t.config.Units) != 0 {
-				return nil, errors.Wrap(
+				return nil, nil, errors.Wrap(
 					errors.New("supply cannot be reduced"),
 					"deploy",
 				)
@@ -196,17 +197,17 @@ func (t *TokenIntrinsic) Deploy(
 		// Ensure the vertex is present and has not been removed
 		_, err = t.hypergraph.GetVertex([64]byte(vertexAddress))
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		prior, err := t.hypergraph.GetVertexData([64]byte(vertexAddress))
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		tree, err := t.hypergraph.GetVertexData([64]byte(vertexAddress))
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		configTree, err := NewTokenConfigurationMetadata(
@@ -214,19 +215,19 @@ func (t *TokenIntrinsic) Deploy(
 			t.rdfMultiprover,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		commit := configTree.Commit(t.inclusionProver, false)
 
 		out, err := tries.SerializeNonLazyTree(configTree)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		err = tree.Insert([]byte{16 << 2}, out, commit, configTree.GetSize())
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		err = hgstate.Set(
@@ -243,24 +244,24 @@ func (t *TokenIntrinsic) Deploy(
 			),
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 
 		t.state = hgstate
 
-		return hgstate, nil
+		return hgstate, slices.Clone(t.Address()), nil
 	}
 
 	initialConsensusMetadata, err := newTokenConsensusMetadata(
 		provers,
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	initialSumcheckInfo, err := newTokenSumcheckInfo()
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	additionalData := make([]*qcrypto.VectorCommitmentTree, 14)
@@ -269,7 +270,7 @@ func (t *TokenIntrinsic) Deploy(
 		t.rdfMultiprover,
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	tokenDomainBI, err := poseidon.HashBytes(
@@ -279,7 +280,7 @@ func (t *TokenIntrinsic) Deploy(
 		),
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	tokenDomain := tokenDomainBI.FillBytes(make([]byte, 32))
@@ -291,7 +292,7 @@ func (t *TokenIntrinsic) Deploy(
 		t.config,
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	if err := hgstate.Init(
@@ -302,12 +303,12 @@ func (t *TokenIntrinsic) Deploy(
 		additionalData,
 		TOKEN_BASE_DOMAIN[:],
 	); err != nil {
-		return nil, errors.Wrap(err, "deploy")
+		return nil, nil, errors.Wrap(err, "deploy")
 	}
 
 	if (t.config.Behavior & Divisible) == 0 {
 		if len(contextData)%120 != 0 {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				errors.New("non-divisible token must have correct context data"),
 				"deploy",
 			)
@@ -322,7 +323,7 @@ func (t *TokenIntrinsic) Deploy(
 				big.NewInt(64),
 			)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 
 			err = additionalReferenceTree.Insert(
@@ -332,7 +333,7 @@ func (t *TokenIntrinsic) Deploy(
 				big.NewInt(56),
 			)
 			if err != nil {
-				return nil, errors.Wrap(err, "deploy")
+				return nil, nil, errors.Wrap(err, "deploy")
 			}
 		}
 
@@ -350,13 +351,13 @@ func (t *TokenIntrinsic) Deploy(
 			),
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "deploy")
+			return nil, nil, errors.Wrap(err, "deploy")
 		}
 	}
 	t.state = hgstate
 	t.rdfHypergraphSchema = rdfHypergraphSchema
 
-	return t.state, nil
+	return t.state, slices.Clone(tokenDomain), nil
 }
 
 // Validate implements intrinsics.Intrinsic.

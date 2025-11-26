@@ -171,8 +171,8 @@ func (hg *HypergraphCRDT) GetSize(
 	shardKey *tries.ShardKey,
 	path []int,
 ) *big.Int {
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 	if shardKey == nil {
 		sk := tries.ShardKey{
 			L1: [3]byte{0, 0, 0},

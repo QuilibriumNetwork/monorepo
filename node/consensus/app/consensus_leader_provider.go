@@ -69,12 +69,12 @@ func (p *AppLeaderProvider) ProveNextState(
 		p.engine.appAddress,
 	)
 	if err != nil {
-		frameProvingTotal.WithLabelValues("error").Inc()
+		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
 		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
 	}
 
 	if prior == nil {
-		frameProvingTotal.WithLabelValues("error").Inc()
+		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
 		return nil, models.NewNoVoteErrorf("missing prior frame")
 	}
 
@@ -89,7 +89,7 @@ func (p *AppLeaderProvider) ProveNextState(
 	}
 
 	if prior.Identity() != priorState {
-		frameProvingTotal.WithLabelValues("error").Inc()
+		frameProvingTotal.WithLabelValues(p.engine.appAddressHex, "error").Inc()
 
 		if latestQC != nil && latestQC.Identity() == priorState {
 			switch {

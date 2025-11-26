@@ -387,6 +387,7 @@ func TestProverConfirm_Materialize(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockInclusionProver := new(mocks.MockInclusionProver)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 
@@ -438,6 +439,7 @@ func TestProverConfirm_Materialize(t *testing.T) {
 
 		// Mock allocation vertex data
 		mockHypergraph.On("GetVertex", allocFullAddr).Return(nil, nil).Maybe()
+		mockHypergraph.On("GetProver").Return(mockInclusionProver).Maybe()
 		mockHypergraph.On("GetVertexData", allocFullAddr).Return(allocTrie, nil).Maybe()
 		mockHypergraph.On("GetHyperedge", mock.Anything).Return(&mockHyperedge{}, nil)
 

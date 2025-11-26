@@ -65,6 +65,11 @@ type mockAppIntegrationPubSub struct {
 	underlyingBlossomSub *qp2p.BlossomSub
 }
 
+// Close implements p2p.PubSub.
+func (m *mockAppIntegrationPubSub) Close() error {
+	panic("unimplemented")
+}
+
 // GetOwnMultiaddrs implements p2p.PubSub.
 func (m *mockAppIntegrationPubSub) GetOwnMultiaddrs() []multiaddr.Multiaddr {
 	panic("unimplemented")
@@ -574,6 +579,9 @@ func (m *mockGlobalClientLocks) GetAppShards(ctx context.Context, in *protobufs.
 	return nil, errors.New("not used in this test")
 }
 func (m *mockGlobalClientLocks) GetGlobalShards(ctx context.Context, in *protobufs.GetGlobalShardsRequest, opts ...grpc.CallOption) (*protobufs.GetGlobalShardsResponse, error) {
+	return nil, errors.New("not used in this test")
+}
+func (m *mockGlobalClientLocks) GetGlobalProposal(ctx context.Context, in *protobufs.GetGlobalProposalRequest, opts ...grpc.CallOption) (*protobufs.GlobalProposalResponse, error) {
 	return nil, errors.New("not used in this test")
 }
 func (m *mockGlobalClientLocks) GetWorkerInfo(ctx context.Context, in *protobufs.GlobalGetWorkerInfoRequest, opts ...grpc.CallOption) (*protobufs.GlobalGetWorkerInfoResponse, error) {

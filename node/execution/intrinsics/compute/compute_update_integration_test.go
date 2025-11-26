@@ -99,7 +99,7 @@ compute:Output a rdfs:Property;
 `
 
 	// Deploy the compute intrinsic
-	deployState, err = computeIntrinsic.Deploy(
+	deployState, _, err = computeIntrinsic.Deploy(
 		compute.COMPUTE_INTRINSIC_DOMAIN,
 		nil,
 		[]byte("creator"),
@@ -163,7 +163,7 @@ compute:Output a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], computeAddress)
 
-		updateState, err := computeIntrinsic.Deploy(
+		updateState, _, err := computeIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("updater"),
@@ -236,7 +236,7 @@ compute:Value a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], computeAddress)
 
-		updateState, err := computeIntrinsic.Deploy(
+		updateState, _, err := computeIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("updater"),
@@ -293,7 +293,7 @@ compute:Input a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], computeAddress)
 
-		updateState, err := computeIntrinsic.Deploy(
+		updateState, _, err := computeIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("updater"),
@@ -357,7 +357,7 @@ compute:Output a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], computeAddress)
 
-		updateState, err := computeIntrinsic.Deploy(
+		updateState, _, err := computeIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("updater"),
@@ -396,7 +396,7 @@ compute:Output a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], computeAddress)
 
-		updateState, err := computeIntrinsic.Deploy(
+		updateState, _, err := computeIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("unauthorized"),
@@ -453,7 +453,7 @@ compute:Output a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], computeAddress)
 
-		updateState, err := computeIntrinsic.Deploy(
+		updateState, _, err := computeIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("wrong-owner"),

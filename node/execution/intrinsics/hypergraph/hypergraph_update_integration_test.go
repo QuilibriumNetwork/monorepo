@@ -88,7 +88,7 @@ test:Value a rdfs:Property;
 `
 
 	// Deploy the hypergraph
-	deployState, err = hypergraphIntrinsic.Deploy(
+	deployState, _, err = hypergraphIntrinsic.Deploy(
 		hgi.HYPERGRAPH_BASE_DOMAIN,
 		nil,
 		[]byte("creator"),
@@ -170,7 +170,7 @@ test:Description a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], hypergraphAddress)
 
-		updateState, err := hypergraphIntrinsic.Deploy(
+		updateState, _, err := hypergraphIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("updater"),
@@ -231,7 +231,7 @@ test:Name a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], hypergraphAddress)
 
-		updateState, err := hypergraphIntrinsic.Deploy(
+		updateState, _, err := hypergraphIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("updater"),
@@ -299,7 +299,7 @@ test:Value a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], hypergraphAddress)
 
-		updateState, err := hypergraphIntrinsic.Deploy(
+		updateState, _, err := hypergraphIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("updater"),
@@ -332,7 +332,7 @@ test:Value a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], hypergraphAddress)
 
-		updateState, err := hypergraphIntrinsic.Deploy(
+		updateState, _, err := hypergraphIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("unauthorized"),
@@ -383,7 +383,7 @@ test:Value a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], hypergraphAddress)
 
-		updateState, err := hypergraphIntrinsic.Deploy(
+		updateState, _, err := hypergraphIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("wrong-owner"),

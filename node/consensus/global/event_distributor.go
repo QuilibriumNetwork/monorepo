@@ -73,10 +73,13 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 				// New global frame has been selected as the head by the time reel
 				if data, ok := event.Data.(*consensustime.GlobalEvent); ok &&
 					data.Frame != nil {
+					e.lastObservedFrame.Store(data.Frame.Header.FrameNumber)
 					e.logger.Info(
 						"received new global head event",
 						zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
 					)
+
+					e.flushDeferredGlobalMessages(data.Frame.GetRank() + 1)
 
 					// Check shard coverage
 					if err := e.checkShardCoverage(
@@ -103,12 +106,20 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 							if len(workers) == 0 {
 								e.logger.Error("no workers detected for allocation")
 							}
-							allocated := true
+							allAllocated := true
+							needsProposals := false
 							for _, w := range workers {
-								allocated = allocated && w.Allocated
+								allAllocated = allAllocated && w.Allocated
+								if len(w.Filter) == 0 {
+									needsProposals = true
+								}
 							}
-							if !allocated {
-								e.evaluateForProposals(ctx, data)
+							if needsProposals || !allAllocated {
+								e.evaluateForProposals(ctx, data, needsProposals)
+							} else {
+								self, effectiveSeniority := e.allocationContext()
+								e.checkExcessPendingJoins(self, data.Frame.Header.FrameNumber)
+								e.logAllocationStatusOnly(ctx, data, self, effectiveSeniority)
 							}
 						}
 					}
@@ -376,22 +387,147 @@ func (e *GlobalConsensusEngine) estimateSeniorityFromConfig() uint64 {
 func (e *GlobalConsensusEngine) evaluateForProposals(
 	ctx context.Context,
 	data *consensustime.GlobalEvent,
+	allowProposals bool,
 ) {
-	self, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
-	var effectiveSeniority uint64
-	if err != nil || self == nil {
-		effectiveSeniority = e.estimateSeniorityFromConfig()
-	} else {
-		effectiveSeniority = self.Seniority
+	self, effectiveSeniority := e.allocationContext()
+	e.checkExcessPendingJoins(self, data.Frame.Header.FrameNumber)
+	canPropose, skipReason := e.joinProposalReady(data.Frame.Header.FrameNumber)
+
+	snapshot, ok := e.collectAllocationSnapshot(
+		ctx,
+		data,
+		self,
+		effectiveSeniority,
+	)
+	if !ok {
+		return
 	}
 
-	pendingFilters := [][]byte{}
-	proposalDescriptors := []provers.ShardDescriptor{}
-	decideDescriptors := []provers.ShardDescriptor{}
+	e.logAllocationStatus(snapshot)
+	pendingFilters := snapshot.pendingFilters
+	proposalDescriptors := snapshot.proposalDescriptors
+	decideDescriptors := snapshot.decideDescriptors
+	worldBytes := snapshot.worldBytes
+
+	if len(proposalDescriptors) != 0 && allowProposals {
+		if canPropose {
+			proposals, err := e.proposer.PlanAndAllocate(
+				uint64(data.Frame.Header.Difficulty),
+				proposalDescriptors,
+				100,
+				worldBytes,
+			)
+			if err != nil {
+				e.logger.Error("could not plan shard allocations", zap.Error(err))
+			} else {
+				if len(proposals) > 0 {
+					e.lastJoinAttemptFrame.Store(data.Frame.Header.FrameNumber)
+				}
+				expectedRewardSum := big.NewInt(0)
+				for _, p := range proposals {
+					expectedRewardSum.Add(expectedRewardSum, p.ExpectedReward)
+				}
+				raw := decimal.NewFromBigInt(expectedRewardSum, 0)
+				rewardInQuilPerInterval := raw.Div(decimal.NewFromInt(8000000000))
+				rewardInQuilPerDay := rewardInQuilPerInterval.Mul(
+					decimal.NewFromInt(24 * 60 * 6),
+				)
+				e.logger.Info(
+					"proposed joins",
+					zap.Int("shard_proposals", len(proposals)),
+					zap.String(
+						"estimated_reward_per_interval",
+						rewardInQuilPerInterval.String(),
+					),
+					zap.String(
+						"estimated_reward_per_day",
+						rewardInQuilPerDay.String(),
+					),
+				)
+			}
+		} else {
+			e.logger.Info(
+				"skipping join proposals",
+				zap.String("reason", skipReason),
+				zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
+			)
+		}
+	} else if len(proposalDescriptors) != 0 && !allowProposals {
+		e.logger.Info(
+			"skipping join proposals",
+			zap.String("reason", "all workers already assigned filters"),
+			zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
+		)
+	}
+	if len(pendingFilters) != 0 {
+		if err := e.proposer.DecideJoins(
+			uint64(data.Frame.Header.Difficulty),
+			decideDescriptors,
+			pendingFilters,
+			worldBytes,
+		); err != nil {
+			e.logger.Error("could not decide shard allocations", zap.Error(err))
+		} else {
+			e.logger.Info(
+				"decided on joins",
+				zap.Int("joins", len(pendingFilters)),
+			)
+		}
+	}
+}
+
+type allocationSnapshot struct {
+	shardsPending       int
+	awaitingFrames      []string
+	shardsLeaving       int
+	shardsActive        int
+	shardsPaused        int
+	shardDivisions      int
+	logicalShards       int
+	pendingFilters      [][]byte
+	proposalDescriptors []provers.ShardDescriptor
+	decideDescriptors   []provers.ShardDescriptor
+	worldBytes          *big.Int
+}
+
+func (s *allocationSnapshot) statusFields() []zap.Field {
+	if s == nil {
+		return nil
+	}
+
+	return []zap.Field{
+		zap.Int("pending_joins", s.shardsPending),
+		zap.String("pending_join_frames", strings.Join(s.awaitingFrames, ", ")),
+		zap.Int("pending_leaves", s.shardsLeaving),
+		zap.Int("active", s.shardsActive),
+		zap.Int("paused", s.shardsPaused),
+		zap.Int("network_shards", s.shardDivisions),
+		zap.Int("network_logical_shards", s.logicalShards),
+	}
+}
+
+func (s *allocationSnapshot) proposalSnapshotFields() []zap.Field {
+	if s == nil {
+		return nil
+	}
+
+	return []zap.Field{
+		zap.Int("proposal_candidates", len(s.proposalDescriptors)),
+		zap.Int("pending_confirmations", len(s.pendingFilters)),
+		zap.Int("decide_descriptors", len(s.decideDescriptors)),
+	}
+}
+
+func (e *GlobalConsensusEngine) collectAllocationSnapshot(
+	ctx context.Context,
+	data *consensustime.GlobalEvent,
+	self *typesconsensus.ProverInfo,
+	effectiveSeniority uint64,
+) (*allocationSnapshot, bool) {
 	appShards, err := e.shardsStore.RangeAppShards()
 	if err != nil {
 		e.logger.Error("could not obtain app shard info", zap.Error(err))
-		return
+		return nil, false
 	}
 
 	// consolidate into high level L2 shards:
@@ -417,24 +553,24 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				hex.EncodeToString(data.Frame.Header.Prover),
 			),
 		)
-		return
+		return nil, false
 	}
 
 	if registry.IdentityKey == nil || registry.IdentityKey.KeyValue == nil {
 		e.logger.Info("key registry info missing identity of prover")
-		return
+		return nil, false
 	}
 
 	pub, err := pcrypto.UnmarshalEd448PublicKey(registry.IdentityKey.KeyValue)
 	if err != nil {
 		e.logger.Warn("error unmarshaling identity key", zap.Error(err))
-		return
+		return nil, false
 	}
 
 	peerId, err := peer.IDFromPublicKey(pub)
 	if err != nil {
 		e.logger.Warn("error deriving peer id", zap.Error(err))
-		return
+		return nil, false
 	}
 
 	info := e.peerInfoManager.GetPeerInfo([]byte(peerId))
@@ -443,7 +579,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			"no peer info known yet",
 			zap.String("peer", peer.ID(peerId).String()),
 		)
-		return
+		return nil, false
 	}
 
 	if len(info.Reachability) == 0 {
@@ -451,11 +587,12 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			"no reachability info known yet",
 			zap.String("peer", peer.ID(peerId).String()),
 		)
-		return
+		return nil, false
 	}
 
 	var client protobufs.GlobalServiceClient = nil
-	for _, s := range info.Reachability[0].StreamMultiaddrs {
+	if len(info.Reachability[0].StreamMultiaddrs) > 0 {
+		s := info.Reachability[0].StreamMultiaddrs[0]
 		creds, err := p2p.NewPeerAuthenticator(
 			e.logger,
 			e.config.P2P,
@@ -468,17 +605,17 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			map[string]channel.AllowedPeerPolicyType{},
 		).CreateClientTLSCredentials([]byte(peerId))
 		if err != nil {
-			return
+			return nil, false
 		}
 
 		ma, err := multiaddr.StringCast(s)
 		if err != nil {
-			return
+			return nil, false
 		}
 
 		mga, err := mn.ToNetAddr(ma)
 		if err != nil {
-			return
+			return nil, false
 		}
 
 		cc, err := grpc.NewClient(
@@ -492,7 +629,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				zap.String("multiaddr", ma.String()),
 				zap.Error(err),
 			)
-			return
+			return nil, false
 		}
 		defer func() {
 			if err := cc.Close(); err != nil {
@@ -501,12 +638,11 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		}()
 
 		client = protobufs.NewGlobalServiceClient(cc)
-		break
 	}
 
 	if client == nil {
 		e.logger.Debug("could not get app shards from prover")
-		return
+		return nil, false
 	}
 
 	worldBytes := big.NewInt(0)
@@ -517,20 +653,24 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	logicalShards := 0
 	shardDivisions := 0
 	awaitingFrame := map[uint64]struct{}{}
-	for _, info := range shards {
+	pendingFilters := [][]byte{}
+	proposalDescriptors := []provers.ShardDescriptor{}
+	decideDescriptors := []provers.ShardDescriptor{}
+
+	for _, shardInfo := range shards {
 		resp, err := e.getAppShardsFromProver(
 			client,
-			slices.Concat(info.L1, info.L2),
+			slices.Concat(shardInfo.L1, shardInfo.L2),
 		)
 		if err != nil {
 			e.logger.Debug("could not get app shards from prover", zap.Error(err))
-			return
+			return nil, false
 		}
 
 		for _, shard := range resp.Info {
 			shardDivisions++
 			worldBytes = worldBytes.Add(worldBytes, new(big.Int).SetBytes(shard.Size))
-			bp := slices.Clone(info.L2)
+			bp := slices.Clone(shardInfo.L2)
 			for _, p := range shard.Prefix {
 				bp = append(bp, byte(p))
 			}
@@ -615,66 +755,95 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		awaitingFrames = append(awaitingFrames, fmt.Sprintf("%d", frame))
 	}
 
+	return &allocationSnapshot{
+		shardsPending:       shardsPending,
+		awaitingFrames:      awaitingFrames,
+		shardsLeaving:       shardsLeaving,
+		shardsActive:        shardsActive,
+		shardsPaused:        shardsPaused,
+		shardDivisions:      shardDivisions,
+		logicalShards:       logicalShards,
+		pendingFilters:      pendingFilters,
+		proposalDescriptors: proposalDescriptors,
+		decideDescriptors:   decideDescriptors,
+		worldBytes:          worldBytes,
+	}, true
+}
+
+func (e *GlobalConsensusEngine) logAllocationStatus(
+	snapshot *allocationSnapshot,
+) {
+	if snapshot == nil {
+		return
+	}
+
 	e.logger.Info(
 		"status for allocations",
-		zap.Int("pending_joins", shardsPending),
-		zap.String("pending_join_frames", strings.Join(awaitingFrames, ", ")),
-		zap.Int("pending_leaves", shardsLeaving),
-		zap.Int("active", shardsActive),
-		zap.Int("paused", shardsPaused),
-		zap.Int("network_shards", shardDivisions),
-		zap.Int("network_logical_shards", logicalShards),
+		snapshot.statusFields()...,
 	)
 
-	if len(proposalDescriptors) != 0 {
-		proposals, err := e.proposer.PlanAndAllocate(
-			uint64(data.Frame.Header.Difficulty),
-			proposalDescriptors,
-			100,
-			worldBytes,
+	e.logger.Debug(
+		"proposal evaluation snapshot",
+		snapshot.proposalSnapshotFields()...,
+	)
+}
+
+func (e *GlobalConsensusEngine) logAllocationStatusOnly(
+	ctx context.Context,
+	data *consensustime.GlobalEvent,
+	self *typesconsensus.ProverInfo,
+	effectiveSeniority uint64,
+) {
+	snapshot, ok := e.collectAllocationSnapshot(
+		ctx,
+		data,
+		self,
+		effectiveSeniority,
+	)
+	if !ok || snapshot == nil {
+		e.logger.Info(
+			"all workers already allocated or pending; skipping proposal cycle",
 		)
-		if err != nil {
-			e.logger.Error("could not plan shard allocations", zap.Error(err))
-		} else {
-			expectedRewardSum := big.NewInt(0)
-			for _, p := range proposals {
-				expectedRewardSum.Add(expectedRewardSum, p.ExpectedReward)
-			}
-			raw := decimal.NewFromBigInt(expectedRewardSum, 0)
-			rewardInQuilPerInterval := raw.Div(decimal.NewFromInt(8000000000))
-			rewardInQuilPerDay := rewardInQuilPerInterval.Mul(
-				decimal.NewFromInt(24 * 60 * 6),
-			)
-			e.logger.Info(
-				"proposed joins",
-				zap.Int("shard_proposals", len(proposals)),
-				zap.String(
-					"estimated_reward_per_interval",
-					rewardInQuilPerInterval.String(),
-				),
-				zap.String(
-					"estimated_reward_per_day",
-					rewardInQuilPerDay.String(),
-				),
-			)
-		}
+		return
 	}
-	if len(pendingFilters) != 0 {
-		err = e.proposer.DecideJoins(
-			uint64(data.Frame.Header.Difficulty),
-			decideDescriptors,
-			pendingFilters,
-			worldBytes,
+
+	e.logger.Info(
+		"all workers already allocated or pending; skipping proposal cycle",
+		snapshot.statusFields()...,
+	)
+	e.logAllocationStatus(snapshot)
+}
+
+func (e *GlobalConsensusEngine) allocationContext() (
+	*typesconsensus.ProverInfo,
+	uint64,
+) {
+	self, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
+	if err != nil || self == nil {
+		return nil, e.estimateSeniorityFromConfig()
+	}
+	return self, self.Seniority
+}
+
+func (e *GlobalConsensusEngine) checkExcessPendingJoins(
+	self *typesconsensus.ProverInfo,
+	frameNumber uint64,
+) {
+	excessFilters := e.selectExcessPendingFilters(self)
+	if len(excessFilters) != 0 {
+		e.logger.Debug(
+			"identified excess pending joins",
+			zap.Int("excess_count", len(excessFilters)),
+			zap.Uint64("frame_number", frameNumber),
 		)
-		if err != nil {
-			e.logger.Error("could not decide shard allocations", zap.Error(err))
-		} else {
-			e.logger.Info(
-				"decided on joins",
-				zap.Int("joins", len(pendingFilters)),
-			)
-		}
+		e.rejectExcessPending(excessFilters, frameNumber)
+		return
 	}
+
+	e.logger.Debug(
+		"no excess pending joins detected",
+		zap.Uint64("frame_number", frameNumber),
+	)
 }
 
 func (e *GlobalConsensusEngine) publishKeyRegistry() {

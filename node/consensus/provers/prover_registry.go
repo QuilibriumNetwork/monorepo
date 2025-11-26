@@ -112,12 +112,6 @@ func (r *ProverRegistry) ProcessStateTransition(
 			change.Domain,
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 		) {
-			r.logger.Debug(
-				"processing prover change",
-				zap.String("address", fmt.Sprintf("%x", change.Address)),
-				zap.Uint8("change_type", uint8(change.StateChange)),
-			)
-
 			if err := r.processProverChange(change, frameNumber); err != nil {
 				r.logger.Debug(
 					"failed to process prover change",
@@ -680,12 +674,6 @@ func (r *ProverRegistry) extractGlobalState() error {
 				mappedStatus = consensus.ProverStatusUnknown
 			}
 
-			r.logger.Debug(
-				"processing prover vertex",
-				zap.String("address", fmt.Sprintf("%x", proverAddress)),
-				zap.Uint8("status", uint8(mappedStatus)),
-			)
-
 			// Extract available storage
 			var availableStorage uint64
 			storageBytes, err := r.rdfMultiprover.Get(
@@ -1000,13 +988,6 @@ func (r *ProverRegistry) extractGlobalState() error {
 				}
 			}
 
-			r.logger.Debug(
-				"processing allocation vertex",
-				zap.String("prover_ref", fmt.Sprintf("%x", proverRef)),
-				zap.String("filter", fmt.Sprintf("%x", confirmationFilter)),
-				zap.Uint8("status", uint8(mappedStatus)),
-			)
-
 			// If allocation is active and we can identify them, add to
 			// filter-specific trie
 			if mappedStatus == consensus.ProverStatusActive &&
@@ -1128,7 +1109,6 @@ func (r *ProverRegistry) processProverChange(
 			// Check if this is a Prover or ProverAllocation
 			switch t {
 			case "prover:Prover":
-				r.logger.Debug("processing prover change")
 				publicKey, err := r.rdfMultiprover.Get(
 					global.GLOBAL_RDF_SCHEMA,
 					"prover:Prover",
@@ -1151,7 +1131,6 @@ func (r *ProverRegistry) processProverChange(
 					return nil // Skip if no status
 				}
 				status := statusBytes[0]
-				r.logger.Debug("status of prover change", zap.Int("status", int(status)))
 
 				// Map internal status to our ProverStatus enum
 				var mappedStatus consensus.ProverStatus
@@ -1238,7 +1217,6 @@ func (r *ProverRegistry) processProverChange(
 					proverInfo.KickFrameNumber = kickFrameNumber
 				}
 			case "allocation:ProverAllocation":
-				r.logger.Debug("processing prover allocation change")
 				proverRef, err := r.rdfMultiprover.Get(
 					global.GLOBAL_RDF_SCHEMA,
 					"allocation:ProverAllocation",
@@ -1281,12 +1259,6 @@ func (r *ProverRegistry) processProverChange(
 				default:
 					mappedStatus = consensus.ProverStatusUnknown
 				}
-
-				r.logger.Debug(
-					"processing allocation update",
-					zap.String("prover_ref", fmt.Sprintf("%x", proverRef)),
-					zap.Uint8("status", uint8(mappedStatus)),
-				)
 
 				// Extract data
 				confirmationFilter, err := r.rdfMultiprover.Get(
@@ -1727,12 +1699,6 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 		// Check if this prover has any active allocations (app shard provers)
 		hasActiveAllocation := false
 		for _, allocation := range proverInfo.Allocations {
-			r.logger.Debug(
-				"checking allocation status",
-				zap.String("address", hex.EncodeToString(proverInfo.Address)),
-				zap.String("filter", hex.EncodeToString(allocation.ConfirmationFilter)),
-				zap.Uint32("status", uint32(allocation.Status)),
-			)
 			if allocation.Status == consensus.ProverStatusActive &&
 				len(allocation.ConfirmationFilter) > 0 {
 				hasActiveAllocation = true

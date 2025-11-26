@@ -104,10 +104,10 @@ func NewAppShardTimeoutAggregator[PeerIDT models.Unique](
 	currentRank uint64,
 ) (consensus.TimeoutAggregator[*protobufs.ProposalVote], error) {
 	// initialize the Validator
-	validator := validator.NewValidator[
-		*protobufs.AppShardFrame,
-		*protobufs.ProposalVote,
-	](committee, consensusVerifier)
+	validator := validator.NewValidator[*protobufs.AppShardFrame](
+		committee,
+		consensusVerifier,
+	)
 
 	timeoutProcessorFactory := timeoutcollector.NewTimeoutProcessorFactory[
 		*protobufs.AppShardFrame,

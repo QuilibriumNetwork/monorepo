@@ -169,11 +169,10 @@ func signatureCheckDefault() bool {
 	return true
 }
 
-// monitorParentProcess watches parent process and signals quit channel if
-// parent dies
+// monitorParentProcess watches parent process and stops the worker if parent dies
 func monitorParentProcess(
 	parentProcessId int,
-	quitCh chan struct{},
+	stopFunc func(),
 	logger *zap.Logger,
 ) {
 	for {
@@ -181,7 +180,9 @@ func monitorParentProcess(
 		proc, err := os.FindProcess(parentProcessId)
 		if err != nil {
 			logger.Error("parent process not found, terminating")
-			close(quitCh)
+			if stopFunc != nil {
+				stopFunc()
+			}
 			return
 		}
 
@@ -190,7 +191,9 @@ func monitorParentProcess(
 			err := proc.Signal(syscall.Signal(0))
 			if err != nil {
 				logger.Error("parent process not found, terminating")
-				close(quitCh)
+				if stopFunc != nil {
+					stopFunc()
+				}
 				return
 			}
 		}
@@ -471,11 +474,7 @@ func main() {
 		}
 
 		if *parentProcess != 0 {
-			go monitorParentProcess(
-				*parentProcess,
-				dataWorkerNode.GetQuitChannel(),
-				logger,
-			)
+			go monitorParentProcess(*parentProcess, dataWorkerNode.Stop, logger)
 		}
 
 		done := make(chan os.Signal, 1)
@@ -719,6 +718,20 @@ func printPeerInfo(logger *zap.Logger, cfg *config.Config) {
 
 		printReachability(p.Reachability)
 		printCapabilities(p.Capabilities)
+
+		if p.LastReceivedFrame != 0 {
+			fmt.Printf(
+				"  Last Received Global Frame: %d\n",
+				p.LastReceivedFrame,
+			)
+		}
+
+		if p.LastGlobalHeadFrame != 0 {
+			fmt.Printf(
+				"  Last Global Head Frame: %d\n",
+				p.LastGlobalHeadFrame,
+			)
+		}
 
 		if len(p.PublicKey) > 0 {
 			fmt.Println("  Public Key:", hex.EncodeToString(p.PublicKey))

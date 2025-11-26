@@ -26,8 +26,8 @@ func (hg *HypergraphCRDT) HyperStream(
 		return errors.New("unavailable")
 	}
 
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 	defer hg.syncController.EndSyncSession()
 
 	peerId, err := hg.authenticationProvider.Identify(stream.Context())
@@ -63,8 +63,8 @@ func (hg *HypergraphCRDT) Sync(
 		return errors.New("unavailable")
 	}
 
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 	defer hg.syncController.EndSyncSession()
 
 	hg.logger.Info(

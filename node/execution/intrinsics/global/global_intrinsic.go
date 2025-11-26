@@ -208,8 +208,8 @@ func (a *GlobalIntrinsic) Deploy(
 	contextData []byte,
 	frameNumber uint64,
 	state state.State,
-) (state.State, error) {
-	return nil, errors.Wrap(
+) (state.State, []byte, error) {
+	return nil, nil, errors.Wrap(
 		errors.New("global intrinsic cannot be deployed"),
 		"deploy",
 	)
@@ -756,23 +756,6 @@ func (a *GlobalIntrinsic) InvokeStep(
 		op.hypergraph = a.hypergraph
 		op.keyManager = a.keyManager
 
-		valid, err := op.Verify(frameNumber)
-		if err != nil {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_join",
-			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
-		}
-
-		if !valid {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_join",
-			).Inc()
-			return nil, errors.Wrap(errors.New("invalid prover join"), "invoke step")
-		}
-
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
@@ -825,23 +808,6 @@ func (a *GlobalIntrinsic) InvokeStep(
 		op.rdfMultiprover = a.rdfMultiprover
 		op.hypergraph = a.hypergraph
 		op.keyManager = a.keyManager
-
-		valid, err := op.Verify(frameNumber)
-		if err != nil {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_leave",
-			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
-		}
-
-		if !valid {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_leave",
-			).Inc()
-			return nil, errors.Wrap(errors.New("invalid prover leave"), "invoke step")
-		}
 
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
@@ -898,23 +864,6 @@ func (a *GlobalIntrinsic) InvokeStep(
 		op.rdfMultiprover = a.rdfMultiprover
 		op.hypergraph = a.hypergraph
 		op.keyManager = a.keyManager
-
-		valid, err := op.Verify(frameNumber)
-		if err != nil {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_pause",
-			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
-		}
-
-		if !valid {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_pause",
-			).Inc()
-			return nil, errors.Wrap(errors.New("invalid prover pause"), "invoke step")
-		}
 
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
@@ -975,26 +924,6 @@ func (a *GlobalIntrinsic) InvokeStep(
 		op.hypergraph = a.hypergraph
 		op.keyManager = a.keyManager
 
-		valid, err := op.Verify(frameNumber)
-		if err != nil {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_resume",
-			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
-		}
-
-		if !valid {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_resume",
-			).Inc()
-			return nil, errors.Wrap(
-				errors.New("invalid prover resume"),
-				"invoke step",
-			)
-		}
-
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
@@ -1053,26 +982,6 @@ func (a *GlobalIntrinsic) InvokeStep(
 		op.rdfMultiprover = a.rdfMultiprover
 		op.hypergraph = a.hypergraph
 		op.keyManager = a.keyManager
-
-		valid, err := op.Verify(frameNumber)
-		if err != nil {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_confirm",
-			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
-		}
-
-		if !valid {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_confirm",
-			).Inc()
-			return nil, errors.Wrap(
-				errors.New("invalid prover confirm"),
-				"invoke step",
-			)
-		}
 
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
@@ -1133,26 +1042,6 @@ func (a *GlobalIntrinsic) InvokeStep(
 		op.hypergraph = a.hypergraph
 		op.keyManager = a.keyManager
 
-		valid, err := op.Verify(frameNumber)
-		if err != nil {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_reject",
-			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
-		}
-
-		if !valid {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_reject",
-			).Inc()
-			return nil, errors.Wrap(
-				errors.New("invalid prover reject"),
-				"invoke step",
-			)
-		}
-
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
@@ -1202,26 +1091,6 @@ func (a *GlobalIntrinsic) InvokeStep(
 		op.rdfMultiprover = a.rdfMultiprover
 		op.hypergraph = a.hypergraph
 
-		valid, err := op.Verify(frameNumber)
-		if err != nil {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_kick",
-			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
-		}
-
-		if !valid {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_kick",
-			).Inc()
-			return nil, errors.Wrap(
-				errors.New("invalid prover kick"),
-				"invoke step",
-			)
-		}
-
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
@@ -1267,26 +1136,6 @@ func (a *GlobalIntrinsic) InvokeStep(
 			a.proverRegistry,
 			a.blsConstructor,
 		)
-
-		valid, err := op.Verify(frameNumber)
-		if err != nil {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_shard_update",
-			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
-		}
-
-		if !valid {
-			observability.InvokeStepErrors.WithLabelValues(
-				"global",
-				"prover_shard_update",
-			).Inc()
-			return nil, errors.Wrap(
-				errors.New("invalid prover shard update"),
-				"invoke step",
-			)
-		}
 
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),

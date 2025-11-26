@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -126,15 +127,24 @@ type GlobalConsensusEngine struct {
 		*protobufs.GlobalFrame,
 		*protobufs.ProposalVote,
 	]
-	blsConstructor   crypto.BlsConstructor
-	executionManager *manager.ExecutionEngineManager
-	mixnet           typesconsensus.Mixnet
-	peerInfoManager  tp2p.PeerInfoManager
-	workerManager    worker.WorkerManager
-	proposer         *provers.Manager
-	currentRank      uint64
-	alertPublicKey   []byte
-	hasSentKeyBundle bool
+	blsConstructor          crypto.BlsConstructor
+	executionManager        *manager.ExecutionEngineManager
+	mixnet                  typesconsensus.Mixnet
+	peerInfoManager         tp2p.PeerInfoManager
+	workerManager           worker.WorkerManager
+	proposer                *provers.Manager
+	currentRank             uint64
+	alertPublicKey          []byte
+	hasSentKeyBundle        bool
+	proverSyncInProgress    atomic.Bool
+	lastJoinAttemptFrame    atomic.Uint64
+	lastObservedFrame       atomic.Uint64
+	lastRejectFrame         atomic.Uint64
+	proverRootVerifiedFrame atomic.Uint64
+	proverRootSynced        atomic.Bool
+
+	lastProposalFrameNumber     atomic.Uint64
+	lastFrameMessageFrameNumber atomic.Uint64
 
 	// Message queues
 	globalConsensusMessageQueue chan *pb.Message
@@ -159,6 +169,8 @@ type GlobalConsensusEngine struct {
 	blacklistMu               sync.RWMutex
 	messageCollectors         *keyedaggregator.SequencedCollectors[sequencedGlobalMessage]
 	messageAggregator         *keyedaggregator.SequencedAggregator[sequencedGlobalMessage]
+	globalMessageSpillover    map[uint64][][]byte
+	globalSpilloverMu         sync.Mutex
 	currentDifficulty         uint32
 	currentDifficultyMu       sync.RWMutex
 	lastProvenFrameTime       time.Time
@@ -305,6 +317,7 @@ func NewGlobalConsensusEngine(
 		alertPublicKey:              []byte{},
 		txLockMap:                   make(map[uint64]map[string]map[string]*LockedTransaction),
 		appShardCache:               make(map[string]*appShardCacheEntry),
+		globalMessageSpillover:      make(map[uint64][][]byte),
 	}
 
 	if err := engine.initGlobalMessageAggregator(); err != nil {
@@ -722,6 +735,27 @@ func NewGlobalConsensusEngine(
 		if err != nil || len(as) == 0 {
 			engine.initializeGenesis()
 		}
+
+		engine.syncProvider = qsync.NewSyncProvider[
+			*protobufs.GlobalFrame,
+			*protobufs.GlobalProposal,
+		](
+			logger,
+			nil,
+			proverRegistry,
+			signerRegistry,
+			peerInfoManager,
+			qsync.NewGlobalSyncClient(
+				frameProver,
+				blsConstructor,
+				engine,
+				config,
+			),
+			hypergraph,
+			config,
+			nil,
+			engine.proverAddress,
+		)
 	}
 
 	componentBuilder.AddWorker(engine.peerInfoManager.Start)
@@ -1124,6 +1158,32 @@ func (e *GlobalConsensusEngine) GetPeerInfo() *protobufs.PeerInfo {
 	// Observed addresses are what other peers have told us they see us as
 	ownAddrs := e.pubsub.GetOwnMultiaddrs()
 
+	archiveMode := e.config.Engine != nil && e.config.Engine.ArchiveMode
+
+	var lastReceivedFrame uint64
+	if archiveMode {
+		lastReceivedFrame = e.lastProposalFrameNumber.Load()
+	} else {
+		lastReceivedFrame = e.lastFrameMessageFrameNumber.Load()
+	}
+
+	var lastGlobalHeadFrame uint64
+	if archiveMode {
+		if e.clockStore != nil {
+			if frame, err := e.clockStore.GetLatestGlobalClockFrame(); err == nil &&
+				frame != nil &&
+				frame.Header != nil {
+				lastGlobalHeadFrame = frame.Header.FrameNumber
+			}
+		}
+	} else if e.globalTimeReel != nil {
+		if frame, err := e.globalTimeReel.GetHead(); err == nil &&
+			frame != nil &&
+			frame.Header != nil {
+			lastGlobalHeadFrame = frame.Header.FrameNumber
+		}
+	}
+
 	// Get supported capabilities from execution manager
 	capabilities := e.executionManager.GetSupportedCapabilities()
 
@@ -1132,25 +1192,47 @@ func (e *GlobalConsensusEngine) GetPeerInfo() *protobufs.PeerInfo {
 	// master node process:
 	{
 		var pubsubAddrs, streamAddrs []string
-		if e.config.Engine.EnableMasterProxy {
-			pubsubAddrs = e.findObservedAddressesForProxy(
-				ownAddrs,
-				e.config.P2P.ListenMultiaddr,
-				e.config.P2P.ListenMultiaddr,
-			)
-			if e.config.P2P.StreamListenMultiaddr != "" {
-				streamAddrs = e.buildStreamAddressesFromPubsub(
-					pubsubAddrs, e.config.P2P.StreamListenMultiaddr,
+		if e.config.P2P.AnnounceListenMultiaddr != "" {
+			if e.config.P2P.AnnounceStreamListenMultiaddr == "" {
+				e.logger.Error(
+					"p2p announce address is configured while stream announce " +
+						"address is not, please fix",
 				)
 			}
+			_, err := ma.StringCast(e.config.P2P.AnnounceListenMultiaddr)
+			if err == nil {
+				pubsubAddrs = append(pubsubAddrs, e.config.P2P.AnnounceListenMultiaddr)
+			}
+			if e.config.P2P.AnnounceStreamListenMultiaddr != "" {
+				_, err = ma.StringCast(e.config.P2P.AnnounceStreamListenMultiaddr)
+				if err == nil {
+					streamAddrs = append(
+						streamAddrs,
+						e.config.P2P.AnnounceStreamListenMultiaddr,
+					)
+				}
+			}
 		} else {
-			pubsubAddrs = e.findObservedAddressesForConfig(
-				ownAddrs, e.config.P2P.ListenMultiaddr,
-			)
-			if e.config.P2P.StreamListenMultiaddr != "" {
-				streamAddrs = e.buildStreamAddressesFromPubsub(
-					pubsubAddrs, e.config.P2P.StreamListenMultiaddr,
+			if e.config.Engine.EnableMasterProxy {
+				pubsubAddrs = e.findObservedAddressesForProxy(
+					ownAddrs,
+					e.config.P2P.ListenMultiaddr,
+					e.config.P2P.ListenMultiaddr,
 				)
+				if e.config.P2P.StreamListenMultiaddr != "" {
+					streamAddrs = e.buildStreamAddressesFromPubsub(
+						pubsubAddrs, e.config.P2P.StreamListenMultiaddr,
+					)
+				}
+			} else {
+				pubsubAddrs = e.findObservedAddressesForConfig(
+					ownAddrs, e.config.P2P.ListenMultiaddr,
+				)
+				if e.config.P2P.StreamListenMultiaddr != "" {
+					streamAddrs = e.buildStreamAddressesFromPubsub(
+						pubsubAddrs, e.config.P2P.StreamListenMultiaddr,
+					)
+				}
 			}
 		}
 		reachability = append(reachability, &protobufs.Reachability{
@@ -1162,34 +1244,33 @@ func (e *GlobalConsensusEngine) GetPeerInfo() *protobufs.PeerInfo {
 
 	// worker processes
 	{
+		announceP2P, announceStream, ok := e.workerAnnounceAddrs()
 		p2pPatterns, streamPatterns, filters := e.workerPatterns()
 		for i := range p2pPatterns {
 			if p2pPatterns[i] == "" {
 				continue
 			}
 
-			// find observed P2P addrs for this worker
-			// (prefer public > local/reserved)
-			pubsubAddrs := e.findObservedAddressesForConfig(ownAddrs, p2pPatterns[i])
+			var pubsubAddrs []string
+			if ok && i < len(announceP2P) && announceP2P[i] != "" {
+				pubsubAddrs = append(pubsubAddrs, announceP2P[i])
+			} else {
+				pubsubAddrs = e.findObservedAddressesForConfig(ownAddrs, p2pPatterns[i])
+			}
 
-			// stream pattern: explicit for this worker or synthesized from P2P IPs
 			var streamAddrs []string
-			if i < len(streamPatterns) && streamPatterns[i] != "" {
-				// Build using the declared worker stream pattern’s port/protocols.
-				// Reuse the pubsub IPs so P2P/stream align on the same interface.
+			if ok && i < len(announceStream) && announceStream[i] != "" {
+				streamAddrs = append(streamAddrs, announceStream[i])
+			} else if i < len(streamPatterns) && streamPatterns[i] != "" {
 				streamAddrs = e.buildStreamAddressesFromPubsub(
 					pubsubAddrs,
 					streamPatterns[i],
 				)
-			} else {
-				// No explicit worker stream pattern; if master stream is set, use its
-				// structure
-				if e.config.P2P.StreamListenMultiaddr != "" {
-					streamAddrs = e.buildStreamAddressesFromPubsub(
-						pubsubAddrs,
-						e.config.P2P.StreamListenMultiaddr,
-					)
-				}
+			} else if e.config.P2P.StreamListenMultiaddr != "" {
+				streamAddrs = e.buildStreamAddressesFromPubsub(
+					pubsubAddrs,
+					e.config.P2P.StreamListenMultiaddr,
+				)
 			}
 
 			var filter []byte
@@ -1203,7 +1284,6 @@ func (e *GlobalConsensusEngine) GetPeerInfo() *protobufs.PeerInfo {
 				}
 			}
 
-			// Only append a worker entry if we have at least one P2P addr and filter
 			if len(pubsubAddrs) > 0 && len(filter) != 0 {
 				reachability = append(reachability, &protobufs.Reachability{
 					Filter:           filter,
@@ -1216,13 +1296,15 @@ func (e *GlobalConsensusEngine) GetPeerInfo() *protobufs.PeerInfo {
 
 	// Create our peer info
 	ourInfo := &protobufs.PeerInfo{
-		PeerId:       e.pubsub.GetPeerID(),
-		Reachability: reachability,
-		Timestamp:    time.Now().UnixMilli(),
-		Version:      config.GetVersion(),
-		PatchNumber:  []byte{config.GetPatchNumber()},
-		Capabilities: capabilities,
-		PublicKey:    e.pubsub.GetPublicKey(),
+		PeerId:              e.pubsub.GetPeerID(),
+		Reachability:        reachability,
+		Timestamp:           time.Now().UnixMilli(),
+		Version:             config.GetVersion(),
+		PatchNumber:         []byte{config.GetPatchNumber()},
+		Capabilities:        capabilities,
+		PublicKey:           e.pubsub.GetPublicKey(),
+		LastReceivedFrame:   lastReceivedFrame,
+		LastGlobalHeadFrame: lastGlobalHeadFrame,
 	}
 
 	// Sign the peer info
@@ -1234,6 +1316,26 @@ func (e *GlobalConsensusEngine) GetPeerInfo() *protobufs.PeerInfo {
 	}
 
 	return ourInfo
+}
+
+func (e *GlobalConsensusEngine) recordProposalFrameNumber(
+	frameNumber uint64,
+) {
+	e.lastProposalFrameNumber.Store(frameNumber)
+}
+
+func (e *GlobalConsensusEngine) recordFrameMessageFrameNumber(
+	frameNumber uint64,
+) {
+	for {
+		current := e.lastFrameMessageFrameNumber.Load()
+		if frameNumber <= current {
+			return
+		}
+		if e.lastFrameMessageFrameNumber.CompareAndSwap(current, frameNumber) {
+			return
+		}
+	}
 }
 
 func (e *GlobalConsensusEngine) GetWorkerManager() worker.WorkerManager {
@@ -1316,11 +1418,91 @@ func (e *GlobalConsensusEngine) workerPatterns() (
 	return p2p, stream, filters
 }
 
+func (e *GlobalConsensusEngine) workerAnnounceAddrs() (
+	[]string,
+	[]string,
+	bool,
+) {
+	ec := e.config.Engine
+	if ec == nil {
+		return nil, nil, false
+	}
+
+	count := ec.DataWorkerCount
+	if count <= 0 {
+		return nil, nil, false
+	}
+
+	if len(ec.DataWorkerAnnounceP2PMultiaddrs) == 0 &&
+		len(ec.DataWorkerAnnounceStreamMultiaddrs) == 0 {
+		return nil, nil, false
+	}
+
+	if len(ec.DataWorkerAnnounceP2PMultiaddrs) !=
+		len(ec.DataWorkerAnnounceStreamMultiaddrs) ||
+		len(ec.DataWorkerAnnounceP2PMultiaddrs) != count {
+		e.logger.Error(
+			"data worker announce multiaddr counts do not match",
+			zap.Int("announce_p2p", len(ec.DataWorkerAnnounceP2PMultiaddrs)),
+			zap.Int("announce_stream", len(ec.DataWorkerAnnounceStreamMultiaddrs)),
+			zap.Int("worker_count", count),
+		)
+		return nil, nil, false
+	}
+
+	p2p := make([]string, count)
+	stream := make([]string, count)
+	valid := true
+	for i := 0; i < count; i++ {
+		p := ec.DataWorkerAnnounceP2PMultiaddrs[i]
+		s := ec.DataWorkerAnnounceStreamMultiaddrs[i]
+		if p == "" || s == "" {
+			valid = false
+			break
+		}
+		if _, err := ma.StringCast(p); err != nil {
+			e.logger.Error(
+				"invalid worker announce p2p multiaddr",
+				zap.Int("index", i),
+				zap.Error(err),
+			)
+			valid = false
+			break
+		}
+		if _, err := ma.StringCast(s); err != nil {
+			e.logger.Error(
+				"invalid worker announce stream multiaddr",
+				zap.Int("index", i),
+				zap.Error(err),
+			)
+			valid = false
+			break
+		}
+		p2p[i] = p
+		stream[i] = s
+	}
+
+	if !valid {
+		return nil, nil, false
+	}
+
+	return p2p, stream, true
+}
+
 func (e *GlobalConsensusEngine) materialize(
 	txn store.Transaction,
-	frameNumber uint64,
-	requests []*protobufs.MessageBundle,
+	frame *protobufs.GlobalFrame,
 ) error {
+	frameNumber := frame.Header.FrameNumber
+	requests := frame.Requests
+	expectedProverRoot := frame.Header.ProverTreeCommitment
+	proposer := frame.Header.Prover
+	_, err := e.hypergraph.Commit(frameNumber)
+	if err != nil {
+		e.logger.Error("error committing hypergraph", zap.Error(err))
+		return errors.Wrap(err, "materialize")
+	}
+
 	var state state.State
 	state = hgstate.NewHypergraphState(e.hypergraph)
 
@@ -1328,81 +1510,421 @@ func (e *GlobalConsensusEngine) materialize(
 		"materializing messages",
 		zap.Int("message_count", len(requests)),
 	)
+	worldSize := e.hypergraph.GetSize(nil, nil).Uint64()
+	e.currentDifficultyMu.RLock()
+	difficulty := uint64(e.currentDifficulty)
+	e.currentDifficultyMu.RUnlock()
+
+	eg := errgroup.Group{}
+	eg.SetLimit(len(requests))
+
 	for i, request := range requests {
-		requestBytes, err := request.ToCanonicalBytes()
+		eg.Go(func() error {
+			requestBytes, err := request.ToCanonicalBytes()
 
-		if err != nil {
-			e.logger.Error(
-				"error serializing request",
-				zap.Int("message_index", i),
-				zap.Error(err),
+			if err != nil {
+				e.logger.Error(
+					"error serializing request",
+					zap.Int("message_index", i),
+					zap.Error(err),
+				)
+				return errors.Wrap(err, "materialize")
+			}
+
+			if len(requestBytes) == 0 {
+				e.logger.Error(
+					"empty request bytes",
+					zap.Int("message_index", i),
+				)
+				return errors.Wrap(errors.New("empty request"), "materialize")
+			}
+
+			costBasis, err := e.executionManager.GetCost(requestBytes)
+			if err != nil {
+				e.logger.Error(
+					"invalid message",
+					zap.Int("message_index", i),
+					zap.Error(err),
+				)
+				return nil
+			}
+
+			var baseline *big.Int
+			if costBasis.Cmp(big.NewInt(0)) == 0 {
+				baseline = big.NewInt(0)
+			} else {
+				baseline = reward.GetBaselineFee(
+					difficulty,
+					worldSize,
+					costBasis.Uint64(),
+					8000000000,
+				)
+				baseline.Quo(baseline, costBasis)
+			}
+
+			_, err = e.executionManager.ProcessMessage(
+				frameNumber,
+				baseline,
+				bytes.Repeat([]byte{0xff}, 32),
+				requestBytes,
+				state,
 			)
-			return errors.Wrap(err, "materialize")
-		}
+			if err != nil {
+				e.logger.Error(
+					"error processing message",
+					zap.Int("message_index", i),
+					zap.Error(err),
+				)
+				return nil
+			}
 
-		if len(requestBytes) == 0 {
-			e.logger.Error(
-				"empty request bytes",
-				zap.Int("message_index", i),
-			)
-			return errors.Wrap(errors.New("empty request"), "materialize")
-		}
+			return nil
+		})
+	}
 
-		costBasis, err := e.executionManager.GetCost(requestBytes)
-		if err != nil {
-			e.logger.Error(
-				"invalid message",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		e.currentDifficultyMu.RLock()
-		difficulty := uint64(e.currentDifficulty)
-		e.currentDifficultyMu.RUnlock()
-		var baseline *big.Int
-		if costBasis.Cmp(big.NewInt(0)) == 0 {
-			baseline = big.NewInt(0)
-		} else {
-			baseline = reward.GetBaselineFee(
-				difficulty,
-				e.hypergraph.GetSize(nil, nil).Uint64(),
-				costBasis.Uint64(),
-				8000000000,
-			)
-			baseline.Quo(baseline, costBasis)
-		}
-
-		result, err := e.executionManager.ProcessMessage(
-			frameNumber,
-			baseline,
-			bytes.Repeat([]byte{0xff}, 32),
-			requestBytes,
-			state,
-		)
-		if err != nil {
-			e.logger.Error(
-				"error processing message",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		state = result.State
+	if err := eg.Wait(); err != nil {
+		return err
 	}
 
 	if err := state.Commit(); err != nil {
 		return errors.Wrap(err, "materialize")
 	}
 
-	err := e.proverRegistry.ProcessStateTransition(state, frameNumber)
+	err = e.proverRegistry.ProcessStateTransition(state, frameNumber)
 	if err != nil {
 		return errors.Wrap(err, "materialize")
 	}
 
+	if e.verifyProverRoot(frameNumber, expectedProverRoot, proposer) {
+		e.reconcileLocalWorkerAllocations()
+	}
+
 	return nil
+}
+
+func (e *GlobalConsensusEngine) verifyProverRoot(
+	frameNumber uint64,
+	expected []byte,
+	proposer []byte,
+) bool {
+	if len(expected) == 0 || e.hypergraph == nil {
+		return true
+	}
+
+	roots, err := e.hypergraph.GetShardCommits(
+		frameNumber,
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+	)
+	if err != nil || len(roots) == 0 || len(roots[0]) == 0 {
+		if err != nil {
+			e.logger.Warn(
+				"failed to load local prover root",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Error(err),
+			)
+		} else {
+			e.logger.Warn(
+				"local prover root missing",
+				zap.Uint64("frame_number", frameNumber),
+			)
+		}
+		return false
+	}
+
+	localRoot := roots[0]
+	if !bytes.Equal(localRoot, expected) {
+		e.logger.Debug(
+			"prover root mismatch",
+			zap.Uint64("frame_number", frameNumber),
+			zap.String("expected_root", hex.EncodeToString(expected)),
+			zap.String("local_root", hex.EncodeToString(localRoot)),
+		)
+		e.proverRootSynced.Store(false)
+		e.proverRootVerifiedFrame.Store(0)
+		e.triggerProverHypersync(proposer)
+		return false
+	}
+
+	e.proverRootSynced.Store(true)
+	e.proverRootVerifiedFrame.Store(frameNumber)
+	return true
+}
+
+func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte) {
+	if e.syncProvider == nil || len(proposer) == 0 {
+		e.logger.Debug("no sync provider or proposer")
+		return
+	}
+	if bytes.Equal(proposer, e.getProverAddress()) {
+		e.logger.Debug("we are the proposer")
+		return
+	}
+	if !e.proverSyncInProgress.CompareAndSwap(false, true) {
+		e.logger.Debug("already syncing")
+		return
+	}
+
+	go func() {
+		defer e.proverSyncInProgress.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		shardKey := tries.ShardKey{
+			L1: [3]byte{0x00, 0x00, 0x00},
+			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+		}
+		e.syncProvider.HyperSync(ctx, proposer, shardKey)
+		if err := e.proverRegistry.Refresh(); err != nil {
+			e.logger.Warn(
+				"failed to refresh prover registry after hypersync",
+				zap.Error(err),
+			)
+		}
+	}()
+}
+
+func (e *GlobalConsensusEngine) reconcileLocalWorkerAllocations() {
+	if e.workerManager == nil || e.proverRegistry == nil {
+		return
+	}
+	workers, err := e.workerManager.RangeWorkers()
+	if err != nil || len(workers) == 0 {
+		if err != nil {
+			e.logger.Warn(
+				"failed to range workers for reconciliation",
+				zap.Error(err),
+			)
+		}
+		return
+	}
+
+	info, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
+	if err != nil || info == nil {
+		if err != nil {
+			e.logger.Warn(
+				"failed to load prover info for reconciliation",
+				zap.Error(err),
+			)
+		}
+		return
+	}
+
+	statusByFilter := make(
+		map[string]typesconsensus.ProverStatus,
+		len(info.Allocations),
+	)
+	for _, alloc := range info.Allocations {
+		if len(alloc.ConfirmationFilter) == 0 {
+			continue
+		}
+		statusByFilter[hex.EncodeToString(alloc.ConfirmationFilter)] = alloc.Status
+	}
+
+	for _, worker := range workers {
+		if len(worker.Filter) == 0 {
+			continue
+		}
+		key := hex.EncodeToString(worker.Filter)
+		status, ok := statusByFilter[key]
+		if !ok {
+			if worker.Allocated {
+				if err := e.workerManager.DeallocateWorker(worker.CoreId); err != nil {
+					e.logger.Warn(
+						"failed to deallocate worker for missing allocation",
+						zap.Uint("core_id", worker.CoreId),
+						zap.Error(err),
+					)
+				}
+			}
+			continue
+		}
+
+		switch status {
+		case typesconsensus.ProverStatusActive:
+			if !worker.Allocated {
+				if err := e.workerManager.AllocateWorker(
+					worker.CoreId,
+					worker.Filter,
+				); err != nil {
+					e.logger.Warn(
+						"failed to allocate worker after confirmation",
+						zap.Uint("core_id", worker.CoreId),
+						zap.Error(err),
+					)
+				}
+			}
+		case typesconsensus.ProverStatusLeaving,
+			typesconsensus.ProverStatusRejected,
+			typesconsensus.ProverStatusKicked:
+			if worker.Allocated {
+				if err := e.workerManager.DeallocateWorker(worker.CoreId); err != nil {
+					e.logger.Warn(
+						"failed to deallocate worker after status change",
+						zap.Uint("core_id", worker.CoreId),
+						zap.Error(err),
+					)
+				}
+			}
+		}
+	}
+}
+
+func (e *GlobalConsensusEngine) joinProposalReady(
+	frameNumber uint64,
+) (bool, string) {
+	if e.lastObservedFrame.Load() == 0 {
+		e.logger.Debug("join proposal blocked: no observed frame")
+		return false, "awaiting initial frame"
+	}
+
+	if !e.proverRootSynced.Load() {
+		e.logger.Debug("join proposal blocked: prover root not synced")
+		return false, "awaiting prover root sync"
+	}
+
+	verified := e.proverRootVerifiedFrame.Load()
+	if verified == 0 || verified < frameNumber {
+		e.logger.Debug(
+			"join proposal blocked: frame not verified",
+			zap.Uint64("verified_frame", verified),
+			zap.Uint64("current_frame", frameNumber),
+		)
+		return false, "latest frame not yet verified"
+	}
+
+	lastAttempt := e.lastJoinAttemptFrame.Load()
+	if lastAttempt != 0 {
+		if frameNumber <= lastAttempt {
+			e.logger.Debug(
+				"join proposal blocked: waiting for newer frame",
+				zap.Uint64("last_attempt", lastAttempt),
+				zap.Uint64("current_frame", frameNumber),
+			)
+			return false, "waiting for newer frame"
+		}
+		if frameNumber-lastAttempt < 4 {
+			e.logger.Debug(
+				"join proposal blocked: cooling down between attempts",
+				zap.Uint64("last_attempt", lastAttempt),
+				zap.Uint64("current_frame", frameNumber),
+			)
+			return false, "cooldown between join attempts"
+		}
+	}
+
+	return true, ""
+}
+
+func (e *GlobalConsensusEngine) selectExcessPendingFilters(
+	self *typesconsensus.ProverInfo,
+) [][]byte {
+	if self == nil || e.config == nil || e.config.Engine == nil {
+		e.logger.Debug("excess pending evaluation skipped: missing config or prover info")
+		return nil
+	}
+
+	capacity := e.config.Engine.DataWorkerCount
+	if capacity <= 0 {
+		return nil
+	}
+
+	active := 0
+	pending := make([][]byte, 0, len(self.Allocations))
+
+	for _, allocation := range self.Allocations {
+		if len(allocation.ConfirmationFilter) == 0 {
+			continue
+		}
+
+		switch allocation.Status {
+		case typesconsensus.ProverStatusActive:
+			active++
+		case typesconsensus.ProverStatusJoining:
+			filterCopy := make([]byte, len(allocation.ConfirmationFilter))
+			copy(filterCopy, allocation.ConfirmationFilter)
+			pending = append(pending, filterCopy)
+		}
+	}
+
+	allowedPending := capacity - active
+	if allowedPending < 0 {
+		allowedPending = 0
+	}
+
+	if len(pending) <= allowedPending {
+		e.logger.Debug(
+			"pending joins within limit",
+			zap.Int("active_allocations", active),
+			zap.Int("pending_allocations", len(pending)),
+			zap.Int("capacity", capacity),
+		)
+		return nil
+	}
+
+	excess := len(pending) - allowedPending
+	e.logger.Debug(
+		"pending joins exceed limit",
+		zap.Int("active_allocations", active),
+		zap.Int("pending_allocations", len(pending)),
+		zap.Int("capacity", capacity),
+		zap.Int("excess", excess),
+	)
+	rand.Shuffle(len(pending), func(i, j int) {
+		pending[i], pending[j] = pending[j], pending[i]
+	})
+
+	return pending[:excess]
+}
+
+func (e *GlobalConsensusEngine) rejectExcessPending(
+	filters [][]byte,
+	frameNumber uint64,
+) {
+	if e.workerManager == nil || len(filters) == 0 {
+		return
+	}
+
+	last := e.lastRejectFrame.Load()
+	if last != 0 {
+		if frameNumber <= last {
+			e.logger.Debug(
+				"forced rejection skipped: awaiting newer frame",
+				zap.Uint64("last_reject_frame", last),
+				zap.Uint64("current_frame", frameNumber),
+			)
+			return
+		}
+		if frameNumber-last < 4 {
+			e.logger.Debug(
+				"deferring forced join rejections",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Uint64("last_reject_frame", last),
+			)
+			return
+		}
+	}
+
+	limit := len(filters)
+	if limit > 100 {
+		limit = 100
+	}
+
+	rejects := make([][]byte, limit)
+	for i := 0; i < limit; i++ {
+		rejects[i] = filters[i]
+	}
+
+	if err := e.workerManager.DecideAllocations(rejects, nil); err != nil {
+		e.logger.Warn("failed to reject excess joins", zap.Error(err))
+		return
+	}
+
+	e.lastRejectFrame.Store(frameNumber)
+	e.logger.Info(
+		"submitted forced join rejections",
+		zap.Int("rejections", len(rejects)),
+		zap.Uint64("frame_number", frameNumber),
+	)
 }
 
 func (e *GlobalConsensusEngine) revert(
@@ -1924,13 +2446,15 @@ func (e *GlobalConsensusEngine) signPeerInfo(
 ) ([]byte, error) {
 	// Create a copy of the peer info without the signature for signing
 	infoCopy := &protobufs.PeerInfo{
-		PeerId:       info.PeerId,
-		Reachability: info.Reachability,
-		Timestamp:    info.Timestamp,
-		Version:      info.Version,
-		PatchNumber:  info.PatchNumber,
-		Capabilities: info.Capabilities,
-		PublicKey:    info.PublicKey,
+		PeerId:              info.PeerId,
+		Reachability:        info.Reachability,
+		Timestamp:           info.Timestamp,
+		Version:             info.Version,
+		PatchNumber:         info.PatchNumber,
+		Capabilities:        info.Capabilities,
+		PublicKey:           info.PublicKey,
+		LastReceivedFrame:   info.LastReceivedFrame,
+		LastGlobalHeadFrame: info.LastGlobalHeadFrame,
 		// Exclude Signature field
 	}
 
@@ -2138,8 +2662,12 @@ func (e *GlobalConsensusEngine) runNodeHealthCheck() {
 			"latest frame is older than 60 seconds; node may still be synchronizing",
 			append(
 				baseFields,
+				zap.Uint64(
+					"latest_frame_received",
+					e.lastFrameMessageFrameNumber.Load(),
+				),
 				zap.Uint64("head_frame_number", headFrame.Header.FrameNumber),
-				zap.Time("head_frame_time", headTime),
+				zap.String("head_frame_time", headTime.String()),
 			)...,
 		)
 		return
@@ -2158,8 +2686,12 @@ func (e *GlobalConsensusEngine) runNodeHealthCheck() {
 		"node health check passed",
 		append(
 			baseFields,
+			zap.Uint64(
+				"latest_frame_received",
+				e.lastFrameMessageFrameNumber.Load(),
+			),
 			zap.Uint64("head_frame_number", headFrame.Header.FrameNumber),
-			zap.Time("head_frame_time", headTime),
+			zap.String("head_frame_time", headTime.String()),
 			zap.String("unminted_reward_quil", readable),
 			zap.String("unminted_reward_raw_units", units.String()),
 		)...,
@@ -2235,13 +2767,15 @@ func (e *GlobalConsensusEngine) validatePeerInfoSignature(
 
 	// Create a copy of the peer info without the signature for validation
 	infoCopy := &protobufs.PeerInfo{
-		PeerId:       peerInfo.PeerId,
-		Reachability: peerInfo.Reachability,
-		Timestamp:    peerInfo.Timestamp,
-		Version:      peerInfo.Version,
-		PatchNumber:  peerInfo.PatchNumber,
-		Capabilities: peerInfo.Capabilities,
-		PublicKey:    peerInfo.PublicKey,
+		PeerId:              peerInfo.PeerId,
+		Reachability:        peerInfo.Reachability,
+		Timestamp:           peerInfo.Timestamp,
+		Version:             peerInfo.Version,
+		PatchNumber:         peerInfo.PatchNumber,
+		Capabilities:        peerInfo.Capabilities,
+		PublicKey:           peerInfo.PublicKey,
+		LastReceivedFrame:   peerInfo.LastReceivedFrame,
+		LastGlobalHeadFrame: peerInfo.LastGlobalHeadFrame,
 		// Exclude Signature field
 	}
 
@@ -2720,10 +3254,7 @@ func (e *GlobalConsensusEngine) startConsensus(
 		e.voteCollectorDistributor,    // voteCollectorDistributor
 		e.timeoutCollectorDistributor, // timeoutCollectorDistributor
 		e.forks,                       // forks
-		validator.NewValidator[
-			*protobufs.GlobalFrame,
-			*protobufs.ProposalVote,
-		](e, e), // validator
+		validator.NewValidator[*protobufs.GlobalFrame](e, e), // validator
 		e.voteAggregator,    // voteAggregator
 		e.timeoutAggregator, // timeoutAggregator
 		e,                   // finalizer
@@ -3147,8 +3678,7 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 
 	if err := e.materialize(
 		txn,
-		frame.Header.FrameNumber,
-		frame.Requests,
+		frame,
 	); err != nil {
 		_ = txn.Abort()
 		e.logger.Error("could not materialize frame requests", zap.Error(err))

@@ -238,11 +238,159 @@ func (e *GlobalConsensusEngine) initializeGenesis() (
 		}
 
 		l1 := up2p.GetBloomFilterIndices(token.QUIL_TOKEN_ADDRESS, 256, 3)
-
+		err = e.hypergraph.AddVertex(txn, hgcrdt.NewVertex(
+			[32]byte(token.QUIL_TOKEN_ADDRESS),
+			[32]byte{0b00000000},
+			make([]byte, 64),
+			big.NewInt(100),
+		))
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.hypergraph.AddVertex(txn, hgcrdt.NewVertex(
+			[32]byte(token.QUIL_TOKEN_ADDRESS),
+			[32]byte{0b00000001},
+			make([]byte, 64),
+			big.NewInt(100),
+		))
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.hypergraph.AddVertex(txn, hgcrdt.NewVertex(
+			[32]byte(token.QUIL_TOKEN_ADDRESS),
+			[32]byte{0b00000010},
+			make([]byte, 64),
+			big.NewInt(100),
+		))
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.hypergraph.AddVertex(txn, hgcrdt.NewVertex(
+			[32]byte(token.QUIL_TOKEN_ADDRESS),
+			[32]byte{0b00000011},
+			make([]byte, 64),
+			big.NewInt(100),
+		))
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.hypergraph.AddVertex(txn, hgcrdt.NewVertex(
+			[32]byte(token.QUIL_TOKEN_ADDRESS),
+			[32]byte{0b00000100},
+			make([]byte, 64),
+			big.NewInt(100),
+		))
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.hypergraph.AddVertex(txn, hgcrdt.NewVertex(
+			[32]byte(token.QUIL_TOKEN_ADDRESS),
+			[32]byte{0b00000101},
+			make([]byte, 64),
+			big.NewInt(100),
+		))
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
 		err = e.shardsStore.PutAppShard(txn, store.ShardInfo{
 			L1:   l1,
 			L2:   token.QUIL_TOKEN_ADDRESS,
-			Path: []uint32{},
+			Path: []uint32{0},
+		})
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.shardsStore.PutAppShard(txn, store.ShardInfo{
+			L1:   l1,
+			L2:   token.QUIL_TOKEN_ADDRESS,
+			Path: []uint32{1},
+		})
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.shardsStore.PutAppShard(txn, store.ShardInfo{
+			L1:   l1,
+			L2:   token.QUIL_TOKEN_ADDRESS,
+			Path: []uint32{2},
+		})
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.shardsStore.PutAppShard(txn, store.ShardInfo{
+			L1:   l1,
+			L2:   token.QUIL_TOKEN_ADDRESS,
+			Path: []uint32{3},
+		})
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.shardsStore.PutAppShard(txn, store.ShardInfo{
+			L1:   l1,
+			L2:   token.QUIL_TOKEN_ADDRESS,
+			Path: []uint32{4},
+		})
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil, nil
+		}
+		err = e.shardsStore.PutAppShard(txn, store.ShardInfo{
+			L1:   l1,
+			L2:   token.QUIL_TOKEN_ADDRESS,
+			Path: []uint32{5},
 		})
 		if err != nil {
 			e.logger.Error(

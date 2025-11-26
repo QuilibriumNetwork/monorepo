@@ -41,6 +41,10 @@ message PeerInfo {
   bytes public_key = 7;
   // The signature of the node.
   bytes signature = 8;
+  // The last global frame received by the node.
+  uint64 last_received_frame = 9;
+  // The last global frame advanced to the head of the time reel.
+  uint64 last_global_head_frame = 10;
 }
 
 message PeerInfoResponse {
@@ -55,6 +59,8 @@ message NodeInfoResponse {
   uint32 running_workers = 5;
   uint32 allocated_workers = 6;
   bytes patch_number = 7;
+  uint64 last_received_frame = 8;
+  uint64 last_global_head_frame = 9;
 }
 
 message WorkerInfo {

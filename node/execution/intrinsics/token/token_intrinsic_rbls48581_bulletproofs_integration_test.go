@@ -2233,7 +2233,7 @@ func TestValidAltTransaction(t *testing.T) {
 	assert.NoError(t, err)
 
 	var st state.State = hgstate.NewHypergraphState(hg)
-	st, err = intrinsic.Deploy(token.TOKEN_BASE_DOMAIN, [][]byte{}, []byte{}, big.NewInt(0), nil, 0, st)
+	st, _, err = intrinsic.Deploy(token.TOKEN_BASE_DOMAIN, [][]byte{}, []byte{}, big.NewInt(0), nil, 0, st)
 	assert.NoError(t, err)
 	domain := st.Changeset()[0].Domain
 	err = st.Commit()
@@ -2808,7 +2808,7 @@ func TestFullTokenFlow_MintPendingTransactionNonDivisible(t *testing.T) {
 	)
 	assert.NoError(t, err)
 
-	nhgs, err := intrinsic.Deploy(token.TOKEN_BASE_DOMAIN, [][]byte{}, []byte{}, big.NewInt(0), make([]byte, 120), 0, hgs)
+	nhgs, _, err := intrinsic.Deploy(token.TOKEN_BASE_DOMAIN, [][]byte{}, []byte{}, big.NewInt(0), make([]byte, 120), 0, hgs)
 	assert.NoError(t, err)
 	err = nhgs.Commit()
 	assert.NoError(t, err)

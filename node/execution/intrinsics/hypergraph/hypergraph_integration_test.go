@@ -62,7 +62,7 @@ func TestHypergraphIntrinsicIntegration(t *testing.T) {
 	var deployState state.State = hgstate.NewHypergraphState(hg)
 
 	// Deploy the hypergraph intrinsic
-	deployState, err = hypergraphIntrinsic.Deploy(
+	deployState, _, err = hypergraphIntrinsic.Deploy(
 		hypergraph.HYPERGRAPH_BASE_DOMAIN,
 		[][]byte{}, // No provers for hypergraph intrinsic
 		[]byte("creator"),

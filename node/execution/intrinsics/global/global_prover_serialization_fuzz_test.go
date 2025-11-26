@@ -381,7 +381,7 @@ func FuzzProverKick_Deserialization(f *testing.F) {
 		// We expect errors for malformed data, but shouldn't panic
 		if err == nil {
 			// Verify successful deserialization
-			if pk.KickedProverPublicKey == nil || len(pk.KickedProverPublicKey) == 0 {
+			if len(pk.KickedProverPublicKey) == 0 {
 				t.Errorf("KickedProverPublicKey should not be nil or empty after successful deserialization")
 			}
 		}

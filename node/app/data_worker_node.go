@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"os"
+	"sync"
 
 	"go.uber.org/zap"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -25,6 +26,7 @@ type DataWorkerNode struct {
 	globalTimeReel *consensustime.GlobalTimeReel
 	parentProcess  int
 	quit           chan struct{}
+	stopOnce       sync.Once
 }
 
 func newDataWorkerNode(
@@ -68,7 +70,7 @@ func (n *DataWorkerNode) Start(
 				"error while starting ipc server for core",
 				zap.Uint64("core", uint64(n.coreId)),
 			)
-			n.quit <- struct{}{}
+			n.Stop()
 		}
 	}()
 
@@ -99,11 +101,12 @@ func (n *DataWorkerNode) Start(
 }
 
 func (n *DataWorkerNode) Stop() {
-	n.logger.Info("stopping data worker node")
-
-	if n.quit != nil {
-		close(n.quit)
-	}
+	n.stopOnce.Do(func() {
+		n.logger.Info("stopping data worker node")
+		if n.quit != nil {
+			close(n.quit)
+		}
+	})
 }
 
 // GetQuitChannel returns the quit channel for external signaling

@@ -593,9 +593,11 @@ func (e *ComputeExecutionEngine) handleDeploy(
 	frameNumber uint64,
 	feePaid *big.Int,
 	state state.State,
-) (*execution.ProcessMessageResult, error) {
+) (*execution.ProcessMessageResult, []byte, error) {
+	var deployAddress []byte
+
 	if len(payload) < 4 {
-		return nil, errors.Wrap(errors.New("invalid payload"), "handle deploy")
+		return nil, nil, errors.Wrap(errors.New("invalid payload"), "handle deploy")
 	}
 
 	deployType := binary.BigEndian.Uint32(payload[:4])
@@ -604,7 +606,7 @@ func (e *ComputeExecutionEngine) handleDeploy(
 		args := protobufs.ComputeDeploy{}
 		err := args.FromCanonicalBytes(payload)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		// Create configuration from deploy arguments
@@ -626,11 +628,11 @@ func (e *ComputeExecutionEngine) handleDeploy(
 			e.compiler,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		// Deploy the intrinsic
-		state, err = intrinsic.Deploy(
+		state, deployAddress, err = intrinsic.Deploy(
 			compute.COMPUTE_INTRINSIC_DOMAIN,
 			nil,
 			nil,
@@ -640,7 +642,7 @@ func (e *ComputeExecutionEngine) handleDeploy(
 			state,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		e.logger.Info(
@@ -652,7 +654,7 @@ func (e *ComputeExecutionEngine) handleDeploy(
 		updatePb := &protobufs.ComputeUpdate{}
 		err := updatePb.FromCanonicalBytes(payload)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		// Load existing compute intrinsic
@@ -668,13 +670,13 @@ func (e *ComputeExecutionEngine) handleDeploy(
 			e.compiler,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		// Deploy (update) the intrinsic
 		var domain [32]byte
 		copy(domain[:], address)
-		state, err = intrinsic.Deploy(
+		state, deployAddress, err = intrinsic.Deploy(
 			domain,
 			nil, // provers
 			nil, // creator
@@ -684,7 +686,7 @@ func (e *ComputeExecutionEngine) handleDeploy(
 			state,
 		)
 		if err != nil {
-			return nil, errors.Wrap(err, "handle deploy")
+			return nil, nil, errors.Wrap(err, "handle deploy")
 		}
 
 		e.logger.Info(
@@ -692,24 +694,21 @@ func (e *ComputeExecutionEngine) handleDeploy(
 			zap.String("address", hex.EncodeToString(intrinsic.Address())),
 		)
 	} else {
-		return nil, errors.Wrap(
+		return nil, nil, errors.Wrap(
 			errors.New("invalid deployment type"),
 			"handle deploy",
 		)
 	}
 
-	// Get the deployed address
-	deployedAddress := intrinsic.Address()
-
 	// Store the intrinsic
 	e.intrinsicsMutex.Lock()
-	e.intrinsics[string(deployedAddress)] = intrinsic
+	e.intrinsics[string(deployAddress)] = intrinsic
 	e.intrinsicsMutex.Unlock()
 
 	return &execution.ProcessMessageResult{
 		Messages: []*protobufs.Message{},
 		State:    state,
-	}, nil
+	}, deployAddress, nil
 }
 
 func (e *ComputeExecutionEngine) handleBundle(
@@ -765,7 +764,6 @@ func (e *ComputeExecutionEngine) handleBundle(
 			continue
 		}
 
-		changesetLen := len(state.Changeset())
 		feeForOp := big.NewInt(0)
 		if fees.NeedsOneFee(op, DefaultFeeMarket) {
 			// Pre-checked; defensive guard helpful for future policy changes
@@ -781,34 +779,25 @@ func (e *ComputeExecutionEngine) handleBundle(
 
 		// Process the individual operation by calling ProcessMessage recursively
 		// but with the individual operation payload
-		opResponses, err := e.processIndividualMessage(
+		opResponses, applicableDeploy, err := e.processIndividualMessage(
 			frameNumber,
 			feeForOp,
 			feeMultiplier,
 			movingAddress,
 			op,
 			true,
-			responses.State,
+			state,
 		)
 		if err != nil {
 			return nil, errors.Wrapf(err, "handle bundle: operation %d failed", i)
 		}
 
 		if op.GetComputeDeploy() != nil {
-			if len(state.Changeset()) == changesetLen {
-				return nil, errors.Wrap(
-					errors.New("deploy did not produce changeset"),
-					"handle bundle",
-				)
-			}
-
-			changeset := state.Changeset()
-			movingAddress = changeset[len(changeset)-1].Domain
+			movingAddress = applicableDeploy
 		}
 
 		// Collect responses
 		responses.Messages = append(responses.Messages, opResponses.Messages...)
-		responses.State = opResponses.State
 	}
 
 	e.logger.Info(
@@ -830,10 +819,10 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 	message *protobufs.MessageRequest,
 	fromBundle bool,
 	state state.State,
-) (*execution.ProcessMessageResult, error) {
+) (*execution.ProcessMessageResult, []byte, error) {
 	payload, err := e.tryExtractMessageForIntrinsic(message)
 	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
+		return nil, nil, errors.Wrap(err, "process individual message")
 	}
 
 	// Read the type prefix to determine if it's a deploy or operation
@@ -845,7 +834,7 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 		if fromBundle {
 			return e.handleDeploy(address, payload, frameNumber, feePaid, state)
 		} else {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				errors.New("deploy or update messages must be bundled"),
 				"process individual message",
 			)
@@ -859,7 +848,7 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 			[64]byte(slices.Concat(address, bytes.Repeat([]byte{0xff}, 32))),
 		)
 		if err == nil || !fromBundle {
-			return nil, errors.Wrap(
+			return nil, nil, errors.Wrap(
 				errors.New("non-deploy messages not allowed in global mode"),
 				"process individual message",
 			)
@@ -869,12 +858,7 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 	// Otherwise, try to handle it as an operation on existing intrinsic
 	intrinsic, err := e.tryGetIntrinsic(address)
 	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
-	}
-
-	err = e.validateIndividualMessage(frameNumber, address, message, fromBundle)
-	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
+		return nil, nil, errors.Wrap(err, "process individual message")
 	}
 
 	// Process the operation
@@ -886,7 +870,7 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 		state,
 	)
 	if err != nil {
-		return nil, errors.Wrap(err, "process individual message")
+		return nil, nil, errors.Wrap(err, "process individual message")
 	}
 
 	// Log state changes for debugging
@@ -898,7 +882,7 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 	return &execution.ProcessMessageResult{
 		Messages: []*protobufs.Message{},
 		State:    state,
-	}, nil
+	}, nil, nil
 }
 
 func (e *ComputeExecutionEngine) tryGetIntrinsic(

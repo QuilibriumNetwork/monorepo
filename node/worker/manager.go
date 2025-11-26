@@ -306,7 +306,36 @@ func (w *WorkerManager) registerWorker(info *typesStore.WorkerInfo) error {
 		return errors.New("worker manager not started")
 	}
 
-	w.logger.Info("registering worker",
+	existing, err := w.store.GetWorker(info.CoreId)
+	creating := false
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			creating = true
+		} else {
+			workerOperationsTotal.WithLabelValues("register", "error").Inc()
+			return errors.Wrap(err, "register worker")
+		}
+	}
+
+	if !creating {
+		if info.ListenMultiaddr == "" {
+			info.ListenMultiaddr = existing.ListenMultiaddr
+		}
+		if info.StreamListenMultiaddr == "" {
+			info.StreamListenMultiaddr = existing.StreamListenMultiaddr
+		}
+		if info.TotalStorage == 0 {
+			info.TotalStorage = existing.TotalStorage
+		}
+		info.Automatic = existing.Automatic
+	}
+
+	logMsg := "registering worker"
+	if !creating {
+		logMsg = "updating worker"
+	}
+
+	w.logger.Info(logMsg,
 		zap.Uint("core_id", info.CoreId),
 		zap.String("listen_addr", info.ListenMultiaddr),
 		zap.Uint("total_storage", info.TotalStorage),
@@ -335,12 +364,21 @@ func (w *WorkerManager) registerWorker(info *typesStore.WorkerInfo) error {
 	w.setWorkerFilterMapping(info.CoreId, info.Filter)
 
 	// Update metrics
-	activeWorkersGauge.Inc()
-	totalStorageGauge.Add(float64(info.TotalStorage))
+	if creating {
+		activeWorkersGauge.Inc()
+		totalStorageGauge.Add(float64(info.TotalStorage))
+	} else if existing != nil && info.TotalStorage != existing.TotalStorage {
+		delta := float64(int64(info.TotalStorage) - int64(existing.TotalStorage))
+		totalStorageGauge.Add(delta)
+	}
 	workerOperationsTotal.WithLabelValues("register", "success").Inc()
 
+	msg := "worker registered successfully"
+	if !creating {
+		msg = "worker updated successfully"
+	}
 	w.logger.Info(
-		"worker registered successfully",
+		msg,
 		zap.Uint("core_id", info.CoreId),
 	)
 
@@ -463,8 +501,9 @@ func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 		)
 	}
 
-	// Update allocation status
+	// Update allocation status and clear filter
 	worker.Allocated = false
+	worker.Filter = nil
 
 	// Save to store
 	txn, err := w.store.NewTransaction(false)
@@ -484,13 +523,14 @@ func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 		return errors.Wrap(err, "deallocate worker")
 	}
 
+	// Update cache
+	w.setWorkerFilterMapping(coreId, nil)
+	w.setWorkerAllocation(coreId, false)
+
 	// Refresh worker
 	if err := w.respawnWorker(coreId, []byte{}); err != nil {
 		return errors.Wrap(err, "allocate worker")
 	}
-
-	// Mark as deallocated in cache
-	w.setWorkerAllocation(coreId, false)
 
 	// Update metrics
 	allocatedWorkersGauge.Dec()
@@ -809,7 +849,7 @@ func (w *WorkerManager) ensureWorkerRegistered(
 	if err == nil {
 		return nil
 	}
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
 

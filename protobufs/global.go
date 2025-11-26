@@ -49,6 +49,14 @@ func (g *QuorumCertificate) Identity() models.Identity {
 
 // Source implements models.TimeoutCertificate.
 func (g *TimeoutCertificate) Equals(other models.TimeoutCertificate) bool {
+	if other == nil {
+		return false
+	}
+
+	if t, ok := other.(*TimeoutCertificate); !ok || t == nil {
+		return false
+	}
+
 	return bytes.Equal(g.Filter, other.GetFilter()) &&
 		g.Rank == other.GetRank() &&
 		slices.Equal(g.LatestRanks, other.GetLatestRanks()) &&

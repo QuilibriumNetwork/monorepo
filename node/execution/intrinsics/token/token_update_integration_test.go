@@ -88,7 +88,7 @@ test:Amount a rdfs:Property;
 `
 
 	// Deploy the token
-	deployState, err = tokenIntrinsic.Deploy(
+	deployState, _, err = tokenIntrinsic.Deploy(
 		token.TOKEN_BASE_DOMAIN,
 		nil,
 		[]byte("creator"),
@@ -155,7 +155,7 @@ test:Amount a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], tokenAddress)
 
-		updateState, err := tokenIntrinsic.Deploy(
+		updateState, _, err := tokenIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("updater"),
@@ -214,7 +214,7 @@ test:Amount a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], tokenAddress)
 
-		updateState, err := tokenIntrinsic.Deploy(
+		updateState, _, err := tokenIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("updater"),
@@ -251,7 +251,7 @@ test:Amount a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], tokenAddress)
 
-		updateState, err := tokenIntrinsic.Deploy(
+		updateState, _, err := tokenIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("unauthorized"),
@@ -305,7 +305,7 @@ test:Amount a rdfs:Property;
 		var domain [32]byte
 		copy(domain[:], tokenAddress)
 
-		updateState, err := tokenIntrinsic.Deploy(
+		updateState, _, err := tokenIntrinsic.Deploy(
 			domain,
 			nil,
 			[]byte("wrong-owner"),

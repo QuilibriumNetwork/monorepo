@@ -24,7 +24,7 @@ type Intrinsic interface {
 		contextData []byte,
 		frameNumber uint64,
 		state state.State,
-	) (state.State, error)
+	) (state.State, []byte, error)
 	// Locks addresses for writing or reading
 	Lock(frameNumber uint64, input []byte) ([][]byte, error)
 	// Unlocks addresses for writing or reading

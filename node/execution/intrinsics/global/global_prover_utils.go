@@ -58,7 +58,7 @@ func UpdateAggregateProverStatus(
 	}
 
 	vertices := tries.GetAllPreloadedLeaves(he.GetExtrinsicTree().Root)
-	if err == nil && len(vertices) > 0 {
+	if len(vertices) > 0 {
 		for _, vertex := range vertices {
 			allocationFullAddress := vertex.Key
 

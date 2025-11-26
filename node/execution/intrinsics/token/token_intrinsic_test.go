@@ -186,7 +186,7 @@ func TestDeploy(t *testing.T) {
 		fee := big.NewInt(10)
 
 		var st state.State = hgstate.NewHypergraphState(hypergraph)
-		st, err = intrinsic.Deploy(domain, provers, creator, fee, []byte{}, 1, st)
+		st, _, err = intrinsic.Deploy(domain, provers, creator, fee, []byte{}, 1, st)
 		require.NoError(t, err)
 
 		require.Len(t, st.Changeset(), 1)

@@ -24,7 +24,7 @@ const (
 	// Default cache size for LRU
 	defaultGlobalCacheSize = 10000
 	// Maximum tree depth to prevent unbounded growth
-	maxGlobalTreeDepth = 360
+	maxGlobalTreeDepth = 10
 )
 
 // TimeReelEventType represents different types of events that can occur in a
@@ -99,8 +99,7 @@ type GlobalTimeReel struct {
 	// Materialize side effects
 	materializeFunc func(
 		txn store.Transaction,
-		frameNumber uint64,
-		requests []*protobufs.MessageBundle,
+		frame *protobufs.GlobalFrame,
 	) error
 
 	// Revert side effects
@@ -155,8 +154,7 @@ func NewGlobalTimeReel(
 		equivocators:     make(map[uint64]map[int]bool),
 		materializeFunc: func(
 			txn store.Transaction,
-			frameNumber uint64,
-			requests []*protobufs.MessageBundle,
+			frame *protobufs.GlobalFrame,
 		) error {
 			return nil
 		},
@@ -176,8 +174,7 @@ func NewGlobalTimeReel(
 func (g *GlobalTimeReel) SetMaterializeFunc(
 	materializeFunc func(
 		txn store.Transaction,
-		frameNumber uint64,
-		requests []*protobufs.MessageBundle,
+		frame *protobufs.GlobalFrame,
 	) error,
 ) {
 	g.materializeFunc = materializeFunc
@@ -1567,7 +1564,7 @@ func (g *GlobalTimeReel) bootstrapFromStore() error {
 
 	var start uint64
 	if !g.archiveMode && latestNum+1 > maxGlobalTreeDepth {
-		// Non-archive mode: only load last 360 frames
+		// Non-archive mode: only load last 10 frames
 		start = latestNum - (maxGlobalTreeDepth - 1)
 	} else {
 		// Archive mode or insufficient frames: load all available
@@ -1656,7 +1653,7 @@ func (g *GlobalTimeReel) bootstrapFromStore() error {
 
 		if !g.archiveMode && g.root != nil {
 			g.logger.Info(
-				"non-archive mode: accepting last 360 frames as valid chain",
+				"non-archive mode: accepting last 10 frames as valid chain",
 				zap.Uint64("pseudo_root_frame", g.root.Frame.Header.FrameNumber),
 				zap.Uint64("head_frame", g.head.Frame.Header.FrameNumber),
 			)
@@ -1682,11 +1679,7 @@ func (g *GlobalTimeReel) persistCanonicalFrames(
 	}
 
 	for _, f := range frames {
-		if err := g.materializeFunc(
-			txn,
-			f.Header.FrameNumber,
-			f.Requests,
-		); err != nil {
+		if err := g.materializeFunc(txn, f); err != nil {
 			_ = txn.Abort()
 			return errors.Wrap(err, "persist canonical frames")
 		}

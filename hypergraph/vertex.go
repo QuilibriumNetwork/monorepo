@@ -81,8 +81,8 @@ func (v *vertex) Commit(prover crypto.InclusionProver) []byte {
 // GetVertex retrieves a vertex by its ID. Returns ErrRemoved if the vertex has
 // been removed, or an error if not found.
 func (hg *HypergraphCRDT) GetVertex(id [64]byte) (hypergraph.Vertex, error) {
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 
 	timer := prometheus.NewTimer(GetDuration.WithLabelValues("vertex"))
 	defer timer.ObserveDuration()
@@ -287,8 +287,8 @@ func (hg *HypergraphCRDT) RevertRemoveVertex(
 // LookupVertex checks if a vertex exists in the hypergraph. Returns true if the
 // vertex is in the add set and not in the remove set.
 func (hg *HypergraphCRDT) LookupVertex(v hypergraph.Vertex) bool {
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 	return hg.lookupVertex(v)
 }
 

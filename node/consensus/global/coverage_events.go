@@ -8,6 +8,7 @@ import (
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 )
 
@@ -108,7 +109,12 @@ func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 				return errors.Wrap(err, "check shard coverage")
 			}
 
-			remaining := int(haltGraceFrames - streak.Count)
+			var remaining int
+			if frameNumber < token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+360 {
+				remaining = int(haltGraceFrames + 720 - streak.Count)
+			} else {
+				remaining = int(haltGraceFrames - streak.Count)
+			}
 			if remaining <= 0 {
 				e.logger.Error(
 					"CRITICAL: Shard has insufficient coverage - triggering network halt",

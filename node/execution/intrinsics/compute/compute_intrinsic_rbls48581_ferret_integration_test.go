@@ -248,7 +248,7 @@ func TestComputeIntrinsic_Integration(t *testing.T) {
 	// Test Deploy
 	t.Run("Deploy", func(t *testing.T) {
 		var state state.State = hgstate.NewHypergraphState(hg)
-		state, err = computeIntrinsic.Deploy(
+		state, _, err = computeIntrinsic.Deploy(
 			compute.COMPUTE_INTRINSIC_DOMAIN,
 			[][]byte{creator}, // provers
 			creator,
@@ -396,7 +396,7 @@ func main(a, b int) int {
 	t.Run("LoadComputeIntrinsic", func(t *testing.T) {
 		var state state.State = hgstate.NewHypergraphState(hg)
 		// First deploy a compute intrinsic
-		state, err := computeIntrinsic.Deploy(
+		state, _, err := computeIntrinsic.Deploy(
 			compute.COMPUTE_INTRINSIC_DOMAIN,
 			[][]byte{creator},
 			creator,

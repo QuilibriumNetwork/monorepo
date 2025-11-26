@@ -29,8 +29,8 @@ func (hg *HypergraphCRDT) GetVertexData(id [64]byte) (
 	*tries.VectorCommitmentTree,
 	error,
 ) {
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
 
 	timer := prometheus.NewTimer(GetDuration.WithLabelValues("vertex_data"))
 	defer timer.ObserveDuration()
