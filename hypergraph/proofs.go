@@ -1,7 +1,10 @@
 package hypergraph
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -215,8 +218,11 @@ func (hg *HypergraphCRDT) Commit(
 		return nil, errors.Wrap(err, "commit shard")
 	}
 
+	snapshotRoot := snapshotRootDigest(commits)
+
 	// Update metrics
 	CommitTotal.WithLabelValues("success").Inc()
+	hg.publishSnapshot(snapshotRoot)
 
 	// Update shard count gauges
 	VertexAddsShards.Set(float64(len(hg.vertexAdds)))
@@ -231,6 +237,46 @@ func (hg *HypergraphCRDT) Commit(
 	}
 
 	return commits, nil
+}
+
+func snapshotRootDigest(commits map[tries.ShardKey][][]byte) []byte {
+	hasher := sha256.New()
+	var zero [64]byte
+
+	if len(commits) == 0 {
+		return hasher.Sum(nil)
+	}
+
+	keys := make([]tries.ShardKey, 0, len(commits))
+	for k := range commits {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if cmp := bytes.Compare(keys[i].L1[:], keys[j].L1[:]); cmp != 0 {
+			return cmp < 0
+		}
+		return bytes.Compare(keys[i].L2[:], keys[j].L2[:]) < 0
+	})
+
+	for _, key := range keys {
+		hasher.Write(key.L1[:])
+		hasher.Write(key.L2[:])
+
+		roots := commits[key]
+		for phase := 0; phase < 4; phase++ {
+			var root []byte
+			if phase < len(roots) {
+				root = roots[phase]
+			}
+			if len(root) != len(zero) {
+				hasher.Write(zero[:])
+			} else {
+				hasher.Write(root)
+			}
+		}
+	}
+
+	return hasher.Sum(nil)
 }
 
 // Commit calculates the sub-scoped vector commitments of each phase set and

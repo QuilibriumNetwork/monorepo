@@ -381,16 +381,23 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSync(
 		return
 	}
 
+	phaseSyncs := []func(
+		protobufs.HypergraphComparisonService_HyperStreamClient,
+		tries.ShardKey,
+	){
+		p.hyperSyncVertexAdds,
+		p.hyperSyncVertexRemoves,
+		p.hyperSyncHyperedgeAdds,
+		p.hyperSyncHyperedgeRemoves,
+	}
+
 	for _, reachability := range info.Reachability {
 		if !bytes.Equal(reachability.Filter, p.filter) {
 			continue
 		}
 		for _, s := range reachability.StreamMultiaddrs {
-			if err == nil {
-				ch, err := p.getDirectChannel(
-					[]byte(peerId),
-					s,
-				)
+			for _, syncPhase := range phaseSyncs {
+				ch, err := p.getDirectChannel([]byte(peerId), s)
 				if err != nil {
 					p.logger.Debug(
 						"could not establish direct channel, trying next multiaddr",
@@ -401,18 +408,17 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSync(
 					continue
 				}
 
-				defer ch.Close()
 				client := protobufs.NewHypergraphComparisonServiceClient(ch)
 				str, err := client.HyperStream(ctx)
 				if err != nil {
 					p.logger.Error("error from sync", zap.Error(err))
-				} else {
-					p.hyperSyncVertexAdds(str, shardKey)
-					p.hyperSyncVertexRemoves(str, shardKey)
-					p.hyperSyncHyperedgeAdds(str, shardKey)
-					p.hyperSyncHyperedgeRemoves(str, shardKey)
+					return
 				}
 
+				syncPhase(str, shardKey)
+				if cerr := ch.Close(); cerr != nil {
+					p.logger.Error("error while closing connection", zap.Error(cerr))
+				}
 			}
 		}
 		break

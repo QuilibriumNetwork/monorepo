@@ -330,6 +330,13 @@ func (m *Manager) scoreShards(
 			for j := uint8(0); j < s.Ring+1; j++ {
 				divisor <<= 1
 			}
+
+			// shard is oversubscribed, treat as no rewards
+			if divisor == 0 {
+				scores = append(scores, scored{idx: i, score: big.NewInt(0)})
+				continue
+			}
+
 			ringDiv := decimal.NewFromInt(divisor)
 
 			// shard factor = sqrt(Shards)
@@ -342,9 +349,6 @@ func (m *Manager) scoreShards(
 			}
 
 			if shardsSqrt.IsZero() {
-				return nil, errors.New("score shards")
-			}
-			if ringDiv.IsZero() {
 				return nil, errors.New("score shards")
 			}
 

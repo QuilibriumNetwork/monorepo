@@ -188,7 +188,7 @@ func TestProverResumeSerialization(t *testing.T) {
 // TestProverConfirmSerialization tests serialization and deserialization of ProverConfirm
 func TestProverConfirmSerialization(t *testing.T) {
 	proverConfirm := global.ProverConfirm{
-		Filter:                     []byte("filter-data"),
+		Filters:                    [][]byte{[]byte("filter-data")},
 		FrameNumber:                12345,
 		PublicKeySignatureBLS48581: MockAddressedSignature(),
 	}
@@ -208,7 +208,7 @@ func TestProverConfirmSerialization(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify
-	assert.Equal(t, proverConfirm.Filter, deserializedProverConfirm.Filter)
+	assert.Equal(t, proverConfirm.Filters, deserializedProverConfirm.Filters)
 	assert.Equal(t, proverConfirm.FrameNumber, deserializedProverConfirm.FrameNumber)
 	assert.Equal(t, proverConfirm.PublicKeySignatureBLS48581.Address, deserializedProverConfirm.PublicKeySignatureBLS48581.Address)
 	assert.Equal(t, proverConfirm.PublicKeySignatureBLS48581.Signature, deserializedProverConfirm.PublicKeySignatureBLS48581.Signature)
@@ -217,7 +217,7 @@ func TestProverConfirmSerialization(t *testing.T) {
 // TestProverRejectSerialization tests serialization and deserialization of ProverReject
 func TestProverRejectSerialization(t *testing.T) {
 	proverReject := global.ProverReject{
-		Filter:                     []byte("filter-data"),
+		Filters:                    [][]byte{[]byte("filter-data")},
 		FrameNumber:                12345,
 		PublicKeySignatureBLS48581: MockAddressedSignature(),
 	}
@@ -237,7 +237,7 @@ func TestProverRejectSerialization(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify
-	assert.Equal(t, proverReject.Filter, deserializedProverReject.Filter)
+	assert.Equal(t, proverReject.Filters[0], deserializedProverReject.Filters[0])
 	assert.Equal(t, proverReject.FrameNumber, deserializedProverReject.FrameNumber)
 	assert.Equal(t, proverReject.PublicKeySignatureBLS48581.Address, deserializedProverReject.PublicKeySignatureBLS48581.Address)
 	assert.Equal(t, proverReject.PublicKeySignatureBLS48581.Signature, deserializedProverReject.PublicKeySignatureBLS48581.Signature)
@@ -306,7 +306,7 @@ func TestProverKickSerialization(t *testing.T) {
 	// Verify TraversalProof structure
 	require.NotNil(t, deserializedProverKick.TraversalProof)
 	assert.Equal(t, len(proverKick.TraversalProof.SubProofs), len(deserializedProverKick.TraversalProof.SubProofs))
-	
+
 	// Multiproof will be nil when deserialized without inclusionProver
 	assert.Nil(t, deserializedProverKick.TraversalProof.Multiproof)
 
@@ -316,19 +316,19 @@ func TestProverKickSerialization(t *testing.T) {
 		assert.Equal(t, subProof.Ys, deserializedProverKick.TraversalProof.SubProofs[i].Ys)
 		assert.Equal(t, subProof.Paths, deserializedProverKick.TraversalProof.SubProofs[i].Paths)
 	}
-	
+
 	// Test deserialization with inclusionProver to reconstruct Multiproof
 	newMockMultiproof := &mocks.MockMultiproof{}
 	// The multiproof bytes are stored as multicommitment + proof concatenated
 	multiproofBytes := append([]byte("mock-multicommitment"), []byte("mock-proof")...)
 	newMockMultiproof.On("FromBytes", multiproofBytes).Return(nil)
 	mockInclusionProver.On("NewMultiproof").Return(newMockMultiproof)
-	
+
 	// Deserialize with hypergraph and inclusionProver
 	var deserializedWithDeps global.ProverKick
 	err = deserializedWithDeps.FromBytesWithHypergraph(data, nil, mockInclusionProver, nil)
 	require.NoError(t, err)
-	
+
 	// Now Multiproof should be reconstructed
 	require.NotNil(t, deserializedWithDeps.TraversalProof)
 	assert.NotNil(t, deserializedWithDeps.TraversalProof.Multiproof)
@@ -409,11 +409,11 @@ func TestInvalidLengthErrors(t *testing.T) {
 		var deserializedSig global.BLS48581SignatureWithProofOfPossession
 		err := deserializedSig.FromBytes(invalidData)
 		assert.Error(t, err, "Should error on invalid data")
-		
+
 		// Test with empty data
 		err = deserializedSig.FromBytes([]byte{})
 		assert.Error(t, err, "Should error on empty data")
-		
+
 		// Test with truncated data (type prefix only)
 		err = deserializedSig.FromBytes([]byte{0x00, 0x00, 0x03, 0x08})
 		assert.Error(t, err, "Should error on truncated data")
@@ -425,11 +425,11 @@ func TestInvalidLengthErrors(t *testing.T) {
 		var deserializedSig global.BLS48581AddressedSignature
 		err := deserializedSig.FromBytes(invalidData)
 		assert.Error(t, err, "Should error on invalid data")
-		
+
 		// Test with empty data
 		err = deserializedSig.FromBytes([]byte{})
 		assert.Error(t, err, "Should error on empty data")
-		
+
 		// Test with truncated data (type prefix only)
 		err = deserializedSig.FromBytes([]byte{0x00, 0x00, 0x03, 0x09})
 		assert.Error(t, err, "Should error on truncated data")
@@ -517,7 +517,7 @@ func TestSerializationRoundTrip(t *testing.T) {
 			name: "ProverConfirm",
 			getObj: func() interface{} {
 				return &global.ProverConfirm{
-					Filter:                     []byte("filter-data"),
+					Filters:                    [][]byte{[]byte("filter-data")},
 					FrameNumber:                12345,
 					PublicKeySignatureBLS48581: MockAddressedSignature(),
 				}
@@ -534,7 +534,7 @@ func TestSerializationRoundTrip(t *testing.T) {
 			name: "ProverReject",
 			getObj: func() interface{} {
 				return &global.ProverReject{
-					Filter:                     []byte("filter-data"),
+					Filters:                    [][]byte{[]byte("filter-data")},
 					FrameNumber:                12345,
 					PublicKeySignatureBLS48581: MockAddressedSignature(),
 				}

@@ -47,6 +47,9 @@ type HypergraphCRDT struct {
 	// handles locking scenarios for transactions
 	syncController *hypergraph.SyncController
 	mu             sync.RWMutex
+	setsMu         sync.RWMutex
+	prefixMu       sync.RWMutex
+	snapshotMgr    *snapshotManager
 
 	// provides context-driven info for client identification
 	authenticationProvider channel.AuthenticationProvider
@@ -65,7 +68,7 @@ func NewHypergraph(
 	coveredPrefix []int,
 	authenticationProvider channel.AuthenticationProvider,
 ) *HypergraphCRDT {
-	return &HypergraphCRDT{
+	hg := &HypergraphCRDT{
 		logger:                 logger,
 		size:                   big.NewInt(0),
 		vertexAdds:             make(map[tries.ShardKey]hypergraph.IdSet),
@@ -77,6 +80,108 @@ func NewHypergraph(
 		coveredPrefix:          coveredPrefix,
 		authenticationProvider: authenticationProvider,
 		syncController:         hypergraph.NewSyncController(),
+		snapshotMgr:            newSnapshotManager(logger),
+	}
+
+	hg.publishSnapshot(nil)
+	return hg
+}
+
+func (hg *HypergraphCRDT) publishSnapshot(root []byte) {
+	if hg.store == nil || hg.snapshotMgr == nil {
+		return
+	}
+	hg.logger.Debug("publishing snapshot")
+
+	snapshotStore, release, err := hg.store.NewSnapshot()
+	if err != nil {
+		hg.logger.Warn("unable to create hypergraph snapshot", zap.Error(err))
+		return
+	}
+
+	hg.snapshotMgr.publish(snapshotStore, release, root)
+}
+
+func (hg *HypergraphCRDT) cloneSetWithStore(
+	set hypergraph.IdSet,
+	store tries.TreeBackingStore,
+) hypergraph.IdSet {
+	if store == nil {
+		return set
+	}
+
+	if typed, ok := set.(*idSet); ok {
+		return typed.cloneWithStore(store)
+	}
+	return set
+}
+
+func (hg *HypergraphCRDT) snapshotSet(
+	shardKey tries.ShardKey,
+	targetStore tries.TreeBackingStore,
+	setMap map[tries.ShardKey]hypergraph.IdSet,
+	atomType hypergraph.AtomType,
+	phaseType hypergraph.PhaseType,
+) hypergraph.IdSet {
+	hg.setsMu.RLock()
+	set := setMap[shardKey]
+	hg.setsMu.RUnlock()
+
+	if set == nil {
+		set = NewIdSet(
+			atomType,
+			phaseType,
+			shardKey,
+			hg.store,
+			hg.prover,
+			nil,
+			hg.getCoveredPrefix(),
+		)
+	}
+
+	return hg.cloneSetWithStore(set, targetStore)
+}
+
+func (hg *HypergraphCRDT) snapshotPhaseSet(
+	shardKey tries.ShardKey,
+	phaseSet protobufs.HypergraphPhaseSet,
+	targetStore tries.TreeBackingStore,
+) hypergraph.IdSet {
+	switch phaseSet {
+	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS:
+		return hg.snapshotSet(
+			shardKey,
+			targetStore,
+			hg.vertexAdds,
+			hypergraph.VertexAtomType,
+			hypergraph.AddsPhaseType,
+		)
+	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES:
+		return hg.snapshotSet(
+			shardKey,
+			targetStore,
+			hg.vertexRemoves,
+			hypergraph.VertexAtomType,
+			hypergraph.RemovesPhaseType,
+		)
+	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS:
+		return hg.snapshotSet(
+			shardKey,
+			targetStore,
+			hg.hyperedgeAdds,
+			hypergraph.HyperedgeAtomType,
+			hypergraph.AddsPhaseType,
+		)
+	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES:
+		return hg.snapshotSet(
+			shardKey,
+			targetStore,
+			hg.hyperedgeRemoves,
+			hypergraph.HyperedgeAtomType,
+			hypergraph.RemovesPhaseType,
+		)
+	default:
+		return nil
 	}
 }
 
@@ -139,20 +244,28 @@ func (hg *HypergraphCRDT) ImportTree(
 	case hypergraph.VertexAtomType:
 		switch phaseType {
 		case hypergraph.AddsPhaseType:
+			hg.setsMu.Lock()
 			hg.size.Add(hg.size, treeSize)
 			hg.vertexAdds[shardKey] = set
+			hg.setsMu.Unlock()
 		case hypergraph.RemovesPhaseType:
+			hg.setsMu.Lock()
 			hg.size.Sub(hg.size, treeSize)
 			hg.vertexRemoves[shardKey] = set
+			hg.setsMu.Unlock()
 		}
 	case hypergraph.HyperedgeAtomType:
 		switch phaseType {
 		case hypergraph.AddsPhaseType:
+			hg.setsMu.Lock()
 			hg.size.Add(hg.size, treeSize)
 			hg.hyperedgeAdds[shardKey] = set
+			hg.setsMu.Unlock()
 		case hypergraph.RemovesPhaseType:
+			hg.setsMu.Lock()
 			hg.size.Sub(hg.size, treeSize)
 			hg.hyperedgeRemoves[shardKey] = set
+			hg.setsMu.Unlock()
 		}
 	}
 
@@ -542,19 +655,20 @@ func (hg *HypergraphCRDT) GetMetadataAtKey(pathKey []byte) (
 		L1: [3]byte(l1),
 		L2: [32]byte(pathKey[:32]),
 	}
+	coveredPrefix := hg.getCoveredPrefix()
 	vertexAdds, vertexRemoves := hg.getOrCreateIdSet(
 		shardKey,
 		hg.vertexAdds,
 		hg.vertexRemoves,
 		hypergraph.VertexAtomType,
-		hg.coveredPrefix,
+		coveredPrefix,
 	)
 	hyperedgeAdds, hyperedgeRemoves := hg.getOrCreateIdSet(
 		shardKey,
 		hg.hyperedgeAdds,
 		hg.hyperedgeRemoves,
 		hypergraph.HyperedgeAtomType,
-		hg.coveredPrefix,
+		coveredPrefix,
 	)
 
 	metadata := []hypergraph.ShardMetadata{}

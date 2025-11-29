@@ -1,6 +1,8 @@
 package global
 
 import (
+	"bytes"
+
 	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
@@ -259,10 +261,24 @@ func (p *ProverConfirm) FromBytes(data []byte) error {
 		return errors.Wrap(err, "from bytes")
 	}
 
+	filters := [][]byte{}
+	if len(pb.Filters) > 0 {
+		filters = pb.Filters
+	} else {
+		if bytes.Equal(pb.Filter, bytes.Repeat([]byte("reserved"), 4)) {
+			return errors.Wrap(
+				errors.New("filter cannot be reserved"),
+				"from bytes",
+			)
+		}
+		filters = append(filters, pb.Filter)
+	}
+
 	// Copy only the data fields, runtime dependencies will be set separately
-	p.Filter = converted.Filter
+	p.Filters = filters
 	p.FrameNumber = converted.FrameNumber
 	p.PublicKeySignatureBLS48581 = converted.PublicKeySignatureBLS48581
+	p.Filters = converted.Filters
 
 	return nil
 }
@@ -297,8 +313,21 @@ func (p *ProverReject) FromBytes(data []byte) error {
 		return errors.Wrap(err, "from bytes")
 	}
 
+	filters := [][]byte{}
+	if len(pb.Filters) > 0 {
+		filters = pb.Filters
+	} else {
+		if bytes.Equal(pb.Filter, bytes.Repeat([]byte("reserved"), 4)) {
+			return errors.Wrap(
+				errors.New("filter cannot be reserved"),
+				"from bytes",
+			)
+		}
+		filters = append(filters, pb.Filter)
+	}
+
 	// Copy only the data fields, runtime dependencies will be set separately
-	p.Filter = converted.Filter
+	p.Filters = filters
 	p.FrameNumber = converted.FrameNumber
 	p.PublicKeySignatureBLS48581 = converted.PublicKeySignatureBLS48581
 

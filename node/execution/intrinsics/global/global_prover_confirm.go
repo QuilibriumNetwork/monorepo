@@ -28,8 +28,8 @@ type BLS48581AddressedSignature struct {
 }
 
 type ProverConfirm struct {
-	// The filter representing the confirm request
-	Filter []byte
+	// The filters representing the confirm request
+	Filters [][]byte
 	// The frame number when this request is made
 	FrameNumber uint64
 	// The BLS48581 addressed signature
@@ -42,14 +42,14 @@ type ProverConfirm struct {
 }
 
 func NewProverConfirm(
-	filter []byte,
+	filters [][]byte,
 	frameNumber uint64,
 	keyManager keys.KeyManager,
 	hypergraph hypergraph.Hypergraph,
 	rdfMultiprover *schema.RDFMultiprover,
 ) (*ProverConfirm, error) {
 	return &ProverConfirm{
-		Filter:         filter,
+		Filters:        filters,
 		FrameNumber:    frameNumber,
 		keyManager:     keyManager,
 		hypergraph:     hypergraph,
@@ -110,157 +110,159 @@ func (p *ProverConfirm) Materialize(
 		return nil, errors.Wrap(err, "materialize")
 	}
 
-	// Calculate allocation address:
-	allocationAddressBI, err := poseidon.HashBytes(
-		slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, p.Filter),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "materialize")
-	}
-	allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
-	allocationFullAddress := [64]byte{}
-	copy(allocationFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-	copy(allocationFullAddress[32:], allocationAddress)
-
-	// Get allocation vertex
-	allocationVertex, err := hg.Get(
-		allocationFullAddress[:32],
-		allocationFullAddress[32:],
-		hgstate.VertexAddsDiscriminator,
-	)
-	if err != nil || allocationVertex == nil {
-		return nil, errors.Wrap(
-			errors.New("allocation not found"),
-			"materialize",
+	for _, filter := range p.Filters {
+		// Calculate allocation address:
+		allocationAddressBI, err := poseidon.HashBytes(
+			slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, filter),
 		)
-	}
+		if err != nil {
+			return nil, errors.Wrap(err, "materialize")
+		}
+		allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
+		allocationFullAddress := [64]byte{}
+		copy(allocationFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(allocationFullAddress[32:], allocationAddress)
 
-	var allocationTree *tries.VectorCommitmentTree
-	allocationTree, ok = allocationVertex.(*tries.VectorCommitmentTree)
-	if !ok || allocationTree == nil {
-		return nil, errors.Wrap(
-			errors.New("invalid object returned for vertex"),
-			"materialize",
+		// Get allocation vertex
+		allocationVertex, err := hg.Get(
+			allocationFullAddress[:32],
+			allocationFullAddress[32:],
+			hgstate.VertexAddsDiscriminator,
 		)
-	}
+		if err != nil || allocationVertex == nil {
+			return nil, errors.Wrap(
+				errors.New("allocation not found"),
+				"materialize",
+			)
+		}
 
-	// Check current allocation status
-	statusBytes, err := p.rdfMultiprover.Get(
-		GLOBAL_RDF_SCHEMA,
-		"allocation:ProverAllocation",
-		"Status",
-		allocationTree,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "materialize")
-	}
+		var allocationTree *tries.VectorCommitmentTree
+		allocationTree, ok = allocationVertex.(*tries.VectorCommitmentTree)
+		if !ok || allocationTree == nil {
+			return nil, errors.Wrap(
+				errors.New("invalid object returned for vertex"),
+				"materialize",
+			)
+		}
 
-	status := uint8(0)
-	if len(statusBytes) > 0 {
-		status = statusBytes[0]
-	}
-
-	// Determine what we're confirming based on current status
-	if status == 0 {
-		// Confirming join - update allocation status to active (1)
-		err = p.rdfMultiprover.Set(
+		// Check current allocation status
+		statusBytes, err := p.rdfMultiprover.Get(
 			GLOBAL_RDF_SCHEMA,
-			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 			"allocation:ProverAllocation",
 			"Status",
-			[]byte{1},
 			allocationTree,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "materialize")
 		}
 
-		// Set active frame to current
-		frameNumberBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(frameNumberBytes, p.FrameNumber)
-		err = p.rdfMultiprover.Set(
-			GLOBAL_RDF_SCHEMA,
+		status := uint8(0)
+		if len(statusBytes) > 0 {
+			status = statusBytes[0]
+		}
+
+		// Determine what we're confirming based on current status
+		if status == 0 {
+			// Confirming join - update allocation status to active (1)
+			err = p.rdfMultiprover.Set(
+				GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"allocation:ProverAllocation",
+				"Status",
+				[]byte{1},
+				allocationTree,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
+
+			// Set active frame to current
+			frameNumberBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(frameNumberBytes, p.FrameNumber)
+			err = p.rdfMultiprover.Set(
+				GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"allocation:ProverAllocation",
+				"LastActiveFrameNumber",
+				frameNumberBytes,
+				allocationTree,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
+
+			// Store join confirmation frame number
+			err = p.rdfMultiprover.Set(
+				GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"allocation:ProverAllocation",
+				"JoinConfirmFrameNumber",
+				frameNumberBytes,
+				allocationTree,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
+		} else if status == 3 {
+			// Confirming leave - update allocation status to left (4)
+			err = p.rdfMultiprover.Set(
+				GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"allocation:ProverAllocation",
+				"Status",
+				[]byte{4},
+				allocationTree,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
+
+			// Store leave confirmation frame number
+			frameNumberBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(frameNumberBytes, p.FrameNumber)
+			err = p.rdfMultiprover.Set(
+				GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"allocation:ProverAllocation",
+				"LeaveConfirmFrameNumber",
+				frameNumberBytes,
+				allocationTree,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
+		}
+
+		// Get a copy of the original allocation tree for change tracking
+		var prior *tries.VectorCommitmentTree
+		originalAllocationVertex, err := hg.Get(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			"allocation:ProverAllocation",
-			"LastActiveFrameNumber",
-			frameNumberBytes,
-			allocationTree,
+			allocationAddress,
+			hgstate.VertexAddsDiscriminator,
 		)
-		if err != nil {
-			return nil, errors.Wrap(err, "materialize")
+		if err == nil && originalAllocationVertex != nil {
+			prior = originalAllocationVertex.(*tries.VectorCommitmentTree)
 		}
 
-		// Store join confirmation frame number
-		err = p.rdfMultiprover.Set(
-			GLOBAL_RDF_SCHEMA,
+		// Create allocation vertex
+		allocationVertexState := hg.NewVertexAddMaterializedState(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+			[32]byte(allocationAddress),
+			frameNumber,
+			prior,
+			allocationTree,
+		)
+
+		err = hg.Set(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			"allocation:ProverAllocation",
-			"JoinConfirmFrameNumber",
-			frameNumberBytes,
-			allocationTree,
+			allocationAddress,
+			hgstate.VertexAddsDiscriminator,
+			frameNumber,
+			allocationVertexState,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "materialize")
 		}
-	} else if status == 3 {
-		// Confirming leave - update allocation status to left (4)
-		err = p.rdfMultiprover.Set(
-			GLOBAL_RDF_SCHEMA,
-			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			"allocation:ProverAllocation",
-			"Status",
-			[]byte{4},
-			allocationTree,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "materialize")
-		}
-
-		// Store leave confirmation frame number
-		frameNumberBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(frameNumberBytes, p.FrameNumber)
-		err = p.rdfMultiprover.Set(
-			GLOBAL_RDF_SCHEMA,
-			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			"allocation:ProverAllocation",
-			"LeaveConfirmFrameNumber",
-			frameNumberBytes,
-			allocationTree,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "materialize")
-		}
-	}
-
-	// Get a copy of the original allocation tree for change tracking
-	var prior *tries.VectorCommitmentTree
-	originalAllocationVertex, err := hg.Get(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		allocationAddress,
-		hgstate.VertexAddsDiscriminator,
-	)
-	if err == nil && originalAllocationVertex != nil {
-		prior = originalAllocationVertex.(*tries.VectorCommitmentTree)
-	}
-
-	// Create allocation vertex
-	allocationVertexState := hg.NewVertexAddMaterializedState(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-		[32]byte(allocationAddress),
-		frameNumber,
-		prior,
-		allocationTree,
-	)
-
-	err = hg.Set(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		allocationAddress,
-		hgstate.VertexAddsDiscriminator,
-		frameNumber,
-		allocationVertexState,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "materialize")
 	}
 
 	// Update the prover status to reflect the aggregate allocation status
@@ -300,7 +302,7 @@ func (p *ProverConfirm) Prove(frameNumber uint64) error {
 	confirmMessage := bytes.Buffer{}
 
 	// Add filter
-	confirmMessage.Write(p.Filter)
+	confirmMessage.Write(slices.Concat(p.Filters...))
 
 	// Add frame number
 	frameNumberBytes := make([]byte, 8)
@@ -365,26 +367,28 @@ func (p *ProverConfirm) GetWriteAddresses(frameNumber uint64) ([][]byte, error) 
 		return nil, errors.Wrap(err, "get write addresses")
 	}
 
-	// Calculate allocation address:
-	allocationAddressBI, err := poseidon.HashBytes(
-		slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, p.Filter),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "get write addresses")
-	}
-
-	allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
-	allocationFullAddress := [64]byte{}
-	copy(allocationFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-	copy(allocationFullAddress[32:], allocationAddress)
-
+	result := [][]byte{}
 	addresses := map[string]struct{}{}
 	addresses[string(proverFullAddress[:])] = struct{}{}
-	addresses[string(allocationFullAddress[:])] = struct{}{}
+	for _, filter := range p.Filters {
+		// Calculate allocation address:
+		allocationAddressBI, err := poseidon.HashBytes(
+			slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, filter),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
 
-	result := [][]byte{}
-	for key := range addresses {
-		result = append(result, []byte(key))
+		allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
+		allocationFullAddress := [64]byte{}
+		copy(allocationFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(allocationFullAddress[32:], allocationAddress)
+
+		addresses[string(allocationFullAddress[:])] = struct{}{}
+
+		for key := range addresses {
+			result = append(result, []byte(key))
+		}
 	}
 
 	return result, nil
@@ -396,7 +400,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 	confirmMessage := bytes.Buffer{}
 
 	// Add filter
-	confirmMessage.Write(p.Filter)
+	confirmMessage.Write(slices.Concat(p.Filters...))
 
 	// Add frame number
 	frameNumberBytes := make([]byte, 8)
@@ -439,132 +443,134 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		return false, errors.Wrap(err, "verify")
 	}
 
-	// Calculate allocation address to verify it exists
-	allocationAddressBI, err := poseidon.HashBytes(
-		slices.Concat([]byte("PROVER_ALLOCATION"), pubkey, p.Filter),
-	)
-	if err != nil {
-		return false, errors.Wrap(err, "verify")
-	}
-	allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
-	allocationFullAddress := [64]byte{}
-	copy(allocationFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-	copy(allocationFullAddress[32:], allocationAddress)
-
-	// Get allocation vertex
-	allocationTree, err := p.hypergraph.GetVertexData(allocationFullAddress)
-	if err != nil || allocationTree == nil {
-		return false, errors.Wrap(
-			errors.New("allocation not found"),
-			"verify",
+	for _, filter := range p.Filters {
+		// Calculate allocation address to verify it exists
+		allocationAddressBI, err := poseidon.HashBytes(
+			slices.Concat([]byte("PROVER_ALLOCATION"), pubkey, filter),
 		)
-	}
-
-	// Check current allocation status
-	statusBytes, err := p.rdfMultiprover.Get(
-		GLOBAL_RDF_SCHEMA,
-		"allocation:ProverAllocation",
-		"Status",
-		allocationTree,
-	)
-	if err != nil {
-		return false, errors.Wrap(err, "verify")
-	}
-
-	status := uint8(0)
-	if len(statusBytes) > 0 {
-		status = statusBytes[0]
-	}
-
-	// Can only confirm if allocation is in joining (0) or leaving (3) state
-	if status != 0 && status != 3 {
-		return false, errors.Wrap(
-			errors.New("invalid allocation state for confirmation"),
-			"verify",
-		)
-	}
-
-	if status == 0 {
-		// Confirming join
-		// Get join frame number
-		joinFrameBytes, err := p.rdfMultiprover.Get(
-			GLOBAL_RDF_SCHEMA,
-			"allocation:ProverAllocation",
-			"JoinFrameNumber",
-			allocationTree,
-		)
-		if err != nil || len(joinFrameBytes) != 8 {
-			return false, errors.Wrap(errors.New("missing join frame"), "verify")
+		if err != nil {
+			return false, errors.Wrap(err, "verify")
 		}
-		joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
+		allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
+		allocationFullAddress := [64]byte{}
+		copy(allocationFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(allocationFullAddress[32:], allocationAddress)
 
-		// Check timing constraints
-		if joinFrame < token.FRAME_2_1_EXTENDED_ENROLL_END && joinFrame >= 244100 {
-			if frameNumber < token.FRAME_2_1_EXTENDED_ENROLL_END {
-				// If joined before frame 255840, cannot confirm until frame 255840
-				return false, errors.Wrap(
-					errors.New("cannot confirm before frame 255840"),
-					"verify",
-				)
-			}
-
-			// Set this to either 255840 - 360 or the raw join frame if higher than it
-			// so the provers before can immeidately join after the wait, those after
-			// still have the full 360.
-			if joinFrame < (token.FRAME_2_1_EXTENDED_ENROLL_END - 360) {
-				joinFrame = (token.FRAME_2_1_EXTENDED_ENROLL_END - 360)
-			}
-		}
-
-		// For joins before 255840, once we reach frame 255840, they can confirm
-		// immediately, for joins after 255840, normal 360 frame wait applies.
-		// If the join frame precedes the genesis frame (e.g. not mainnet), we
-		// ignore the topic altogether
-		if joinFrame >= (token.FRAME_2_1_EXTENDED_ENROLL_END-360) ||
-			joinFrame <= 244100 {
-			framesSinceJoin := frameNumber - joinFrame
-			if framesSinceJoin < 360 {
-				return false, errors.Wrap(
-					fmt.Errorf(
-						"must wait 360 frames after join to confirm (%d)",
-						framesSinceJoin,
-					),
-					"verify",
-				)
-			}
-			if framesSinceJoin > 720 {
-				return false, errors.Wrap(
-					errors.New("confirmation window expired (720 frames)"),
-					"verify",
-				)
-			}
-		}
-	} else if status == 3 {
-		// Confirming leave
-		// Get leave frame number
-		leaveFrameBytes, err := p.rdfMultiprover.Get(
-			GLOBAL_RDF_SCHEMA,
-			"allocation:ProverAllocation",
-			"LeaveFrameNumber",
-			allocationTree,
-		)
-		if err != nil || len(leaveFrameBytes) != 8 {
-			return false, errors.Wrap(errors.New("missing leave frame"), "verify")
-		}
-		leaveFrame := binary.BigEndian.Uint64(leaveFrameBytes)
-
-		framesSinceLeave := frameNumber - leaveFrame
-		if framesSinceLeave < 360 {
+		// Get allocation vertex
+		allocationTree, err := p.hypergraph.GetVertexData(allocationFullAddress)
+		if err != nil || allocationTree == nil {
 			return false, errors.Wrap(
-				errors.New("must wait 360 frames after leave to confirm"),
+				errors.New("allocation not found"),
 				"verify",
 			)
 		}
-		if framesSinceLeave > 720 {
+
+		// Check current allocation status
+		statusBytes, err := p.rdfMultiprover.Get(
+			GLOBAL_RDF_SCHEMA,
+			"allocation:ProverAllocation",
+			"Status",
+			allocationTree,
+		)
+		if err != nil {
+			return false, errors.Wrap(err, "verify")
+		}
+
+		status := uint8(0)
+		if len(statusBytes) > 0 {
+			status = statusBytes[0]
+		}
+
+		// Can only confirm if allocation is in joining (0) or leaving (3) state
+		if status != 0 && status != 3 {
 			return false, errors.Wrap(
-				errors.New("leave confirmation window expired (720 frames)"),
+				errors.New("invalid allocation state for confirmation"),
 				"verify",
 			)
+		}
+
+		if status == 0 {
+			// Confirming join
+			// Get join frame number
+			joinFrameBytes, err := p.rdfMultiprover.Get(
+				GLOBAL_RDF_SCHEMA,
+				"allocation:ProverAllocation",
+				"JoinFrameNumber",
+				allocationTree,
+			)
+			if err != nil || len(joinFrameBytes) != 8 {
+				return false, errors.Wrap(errors.New("missing join frame"), "verify")
+			}
+			joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
+
+			// Check timing constraints
+			if joinFrame < token.FRAME_2_1_EXTENDED_ENROLL_END && joinFrame >= 244100 {
+				if frameNumber < token.FRAME_2_1_EXTENDED_ENROLL_END {
+					// If joined before frame 255840, cannot confirm until frame 255840
+					return false, errors.Wrap(
+						errors.New("cannot confirm before frame 255840"),
+						"verify",
+					)
+				}
+
+				// Set this to either 255840 - 360 or the raw join frame if higher than
+				// it so the provers before can immeidately join after the wait, those
+				// after still have the full 360.
+				if joinFrame < (token.FRAME_2_1_EXTENDED_ENROLL_END - 360) {
+					joinFrame = (token.FRAME_2_1_EXTENDED_ENROLL_END - 360)
+				}
+			}
+
+			// For joins before 255840, once we reach frame 255840, they can confirm
+			// immediately, for joins after 255840, normal 360 frame wait applies.
+			// If the join frame precedes the genesis frame (e.g. not mainnet), we
+			// ignore the topic altogether
+			if joinFrame >= (token.FRAME_2_1_EXTENDED_ENROLL_END-360) ||
+				joinFrame <= 244100 {
+				framesSinceJoin := frameNumber - joinFrame
+				if framesSinceJoin < 360 {
+					return false, errors.Wrap(
+						fmt.Errorf(
+							"must wait 360 frames after join to confirm (%d)",
+							framesSinceJoin,
+						),
+						"verify",
+					)
+				}
+				if framesSinceJoin > 720 {
+					return false, errors.Wrap(
+						errors.New("confirmation window expired (720 frames)"),
+						"verify",
+					)
+				}
+			}
+		} else if status == 3 {
+			// Confirming leave
+			// Get leave frame number
+			leaveFrameBytes, err := p.rdfMultiprover.Get(
+				GLOBAL_RDF_SCHEMA,
+				"allocation:ProverAllocation",
+				"LeaveFrameNumber",
+				allocationTree,
+			)
+			if err != nil || len(leaveFrameBytes) != 8 {
+				return false, errors.Wrap(errors.New("missing leave frame"), "verify")
+			}
+			leaveFrame := binary.BigEndian.Uint64(leaveFrameBytes)
+
+			framesSinceLeave := frameNumber - leaveFrame
+			if framesSinceLeave < 360 {
+				return false, errors.Wrap(
+					errors.New("must wait 360 frames after leave to confirm"),
+					"verify",
+				)
+			}
+			if framesSinceLeave > 720 {
+				return false, errors.Wrap(
+					errors.New("leave confirmation window expired (720 frames)"),
+					"verify",
+				)
+			}
 		}
 	}
 

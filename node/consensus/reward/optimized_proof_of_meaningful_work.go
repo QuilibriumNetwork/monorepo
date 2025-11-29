@@ -76,7 +76,12 @@ func (p *OptimizedProofOfMeaningfulWorkRewardIssuance) Calculate(
 				// Divide by 2^s
 				divisor := int64(1)
 				for i := uint8(0); i < alloc.Ring+1; i++ {
-					divisor *= 2
+					divisor <<= 1
+				}
+
+				// shard is oversubscribed, treat as no rewards
+				if divisor == 0 {
+					continue
 				}
 
 				ringScaled := decimal.NewFromInt(divisor)
@@ -207,7 +212,11 @@ func (p *MinimalAllocationOptimizedProofOfMeaningfulWorkRewardIssuance) Calculat
 				factor = factor.Div(worldStateBytesDecimal)
 
 				result := factor.Mul(basisDecimal)
-				result = result.Div(ringDivisors[alloc.Ring+1])
+				divisor := ringDivisors[alloc.Ring+1]
+				if divisor.IsZero() {
+					continue
+				}
+				result = result.Div(divisor)
 
 				p.cacheLock.RLock()
 				shardFactor := p.sqrtCache[alloc.Shards]

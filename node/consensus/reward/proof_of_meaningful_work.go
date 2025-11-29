@@ -37,7 +37,12 @@ func (p *ProofOfMeaningfulWorkRewardIssuance) Calculate(
 				// Divide by 2^s
 				divisor := int64(1)
 				for i := uint8(0); i < alloc.Ring+1; i++ {
-					divisor *= 2
+					divisor <<= 1
+				}
+
+				// shard is oversubscribed, treat as no rewards
+				if divisor == 0 {
+					continue
 				}
 
 				ringScaled := decimal.NewFromInt(divisor)

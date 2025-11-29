@@ -22,30 +22,43 @@ import (
 func (hg *HypergraphCRDT) HyperStream(
 	stream protobufs.HypergraphComparisonService_HyperStreamServer,
 ) error {
-	if !hg.syncController.TryEstablishSyncSession() {
-		return errors.New("unavailable")
-	}
-
-	hg.mu.Lock()
-	defer hg.mu.Unlock()
-	defer hg.syncController.EndSyncSession()
-
 	peerId, err := hg.authenticationProvider.Identify(stream.Context())
 	if err != nil {
 		return errors.Wrap(err, "hyper stream")
 	}
 
-	status, ok := hg.syncController.SyncStatus[peerId.String()]
-	if ok && time.Since(status.LastSynced) < 10*time.Second {
-		return errors.New("peer too recently synced")
+	peerKey := peerId.String()
+	if !hg.syncController.TryEstablishSyncSession(peerKey) {
+		return errors.New("peer already syncing")
+	}
+	defer func() {
+		hg.syncController.EndSyncSession(peerKey)
+	}()
+
+	handle := hg.snapshotMgr.acquire()
+	if handle == nil {
+		return errors.New("hypergraph snapshot unavailable")
+	}
+	defer hg.snapshotMgr.release(handle)
+
+	root := handle.Root()
+	if len(root) != 0 {
+		hg.logger.Debug(
+			"acquired snapshot",
+			zap.String("root", hex.EncodeToString(root)),
+		)
+	} else {
+		hg.logger.Debug("acquired snapshot", zap.String("root", ""))
 	}
 
-	err = hg.syncTreeServer(stream)
+	snapshotStore := handle.Store()
 
-	hg.syncController.SyncStatus[peerId.String()] = &hypergraph.SyncInfo{
+	err = hg.syncTreeServer(stream, snapshotStore, root)
+
+	hg.syncController.SetStatus(peerKey, &hypergraph.SyncInfo{
 		Unreachable: false,
 		LastSynced:  time.Now(),
-	}
+	})
 
 	return err
 }
@@ -59,13 +72,16 @@ func (hg *HypergraphCRDT) Sync(
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
 ) error {
-	if !hg.syncController.TryEstablishSyncSession() {
-		return errors.New("unavailable")
+	const localSyncKey = "local-sync"
+	if !hg.syncController.TryEstablishSyncSession(localSyncKey) {
+		return errors.New("local sync already in progress")
 	}
+	defer func() {
+		hg.syncController.EndSyncSession(localSyncKey)
+	}()
 
 	hg.mu.Lock()
 	defer hg.mu.Unlock()
-	defer hg.syncController.EndSyncSession()
 
 	hg.logger.Info(
 		"sending initialization message",
@@ -76,7 +92,6 @@ func (hg *HypergraphCRDT) Sync(
 		zap.Int("phase_set", int(phaseSet)),
 	)
 
-	// Get the appropriate id set
 	var set hypergraph.IdSet
 	switch phaseSet {
 	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS:
@@ -87,9 +102,11 @@ func (hg *HypergraphCRDT) Sync(
 		set = hg.getHyperedgeAddsSet(shardKey)
 	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES:
 		set = hg.getHyperedgeRemovesSet(shardKey)
+	default:
+		return errors.New("unsupported phase set")
 	}
 
-	path := hg.coveredPrefix
+	path := hg.getCoveredPrefix()
 
 	// Send initial query for path
 	if err := stream.Send(&protobufs.HypergraphComparison{
@@ -106,8 +123,10 @@ func (hg *HypergraphCRDT) Sync(
 		return err
 	}
 
+	// hg.logger.Debug("server waiting for initial query")
 	msg, err := stream.Recv()
 	if err != nil {
+		hg.logger.Info("initial recv failed", zap.Error(err))
 		return err
 	}
 	response := msg.GetResponse()
@@ -158,7 +177,7 @@ func (hg *HypergraphCRDT) Sync(
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
-				hg.logger.Debug("stream closed by sender")
+				// hg.logger.Debug("stream closed by sender")
 				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
@@ -166,7 +185,7 @@ func (hg *HypergraphCRDT) Sync(
 				return
 			}
 			if err != nil {
-				hg.logger.Debug("error from stream", zap.Error(err))
+				// hg.logger.Debug("error from stream", zap.Error(err))
 				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
@@ -216,7 +235,7 @@ func (hg *HypergraphCRDT) Sync(
 			false,
 		)
 		if err != nil {
-			hg.logger.Error("error while syncing", zap.Error(err))
+			hg.logger.Debug("error while syncing", zap.Error(err))
 		}
 	}()
 
@@ -462,10 +481,10 @@ func (s *streamManager) sendLeafData(
 			},
 		}
 
-		s.logger.Info(
-			"sending leaf data",
-			zap.String("key", hex.EncodeToString(leaf.Key)),
-		)
+		// s.logger.Info(
+		// 	"sending leaf data",
+		// 	zap.String("key", hex.EncodeToString(leaf.Key)),
+		// )
 
 		select {
 		case <-s.ctx.Done():
@@ -507,7 +526,7 @@ func (s *streamManager) sendLeafData(
 	}
 
 	if node == nil {
-		s.logger.Info("no node, sending 0 leaves")
+		// s.logger.Info("no node, sending 0 leaves")
 		if err := s.stream.Send(&protobufs.HypergraphComparison{
 			Payload: &protobufs.HypergraphComparison_Metadata{
 				Metadata: &protobufs.HypersyncMetadata{Leaves: 0},
@@ -533,7 +552,7 @@ func (s *streamManager) sendLeafData(
 			}
 			count++
 		}
-		s.logger.Info("sending set of leaves", zap.Uint64("leaf_count", count))
+		// s.logger.Info("sending set of leaves", zap.Uint64("leaf_count", count))
 		if err := s.stream.Send(&protobufs.HypergraphComparison{
 			Payload: &protobufs.HypergraphComparison_Metadata{
 				Metadata: &protobufs.HypersyncMetadata{Leaves: count},
@@ -552,7 +571,7 @@ func (s *streamManager) sendLeafData(
 		}
 	} else {
 		count = 1
-		s.logger.Info("sending one leaf", zap.Uint64("leaf_count", count))
+		// s.logger.Info("sending one leaf", zap.Uint64("leaf_count", count))
 		if err := s.stream.Send(&protobufs.HypergraphComparison{
 			Payload: &protobufs.HypergraphComparison_Metadata{
 				Metadata: &protobufs.HypersyncMetadata{Leaves: count},
@@ -708,22 +727,20 @@ func getBranchInfoFromTree(
 	for _, p := range path {
 		intpath = append(intpath, int(p))
 	}
-	commitment := node.Commit(
-		tree.InclusionProver,
-		nil,
-		tree.SetType,
-		tree.PhaseType,
-		tree.ShardKey,
-		intpath,
-		false,
-	)
+
+	node = ensureCommittedNode(logger, tree, intpath, node)
+
 	branchInfo := &protobufs.HypergraphComparisonResponse{
-		Path:       path,
-		Commitment: commitment,
-		IsRoot:     len(path) == 0,
+		Path:   path,
+		IsRoot: len(path) == 0,
 	}
 
 	if branch, ok := node.(*tries.LazyVectorCommitmentBranchNode); ok {
+		branchInfo.Commitment = branch.Commitment
+		if len(branch.Commitment) == 0 {
+			panic("branch cannot have no commitment")
+		}
+
 		for _, p := range branch.Prefix {
 			branchInfo.Path = append(branchInfo.Path, int32(p))
 		}
@@ -741,16 +758,21 @@ func getBranchInfoFromTree(
 					logger.Panic("failed to get node by path", zap.Error(err))
 				}
 			}
+
+			childPath := slices.Concat(branch.FullPrefix, []int{i})
+			child = ensureCommittedNode(logger, tree, childPath, child)
+
 			if child != nil {
-				childCommit := child.Commit(
-					tree.InclusionProver,
-					nil,
-					tree.SetType,
-					tree.PhaseType,
-					tree.ShardKey,
-					slices.Concat(branch.FullPrefix, []int{i}),
-					false,
-				)
+				var childCommit []byte
+				if childB, ok := child.(*tries.LazyVectorCommitmentBranchNode); ok {
+					childCommit = childB.Commitment
+				} else if childL, ok := child.(*tries.LazyVectorCommitmentLeafNode); ok {
+					childCommit = childL.Commitment
+				}
+
+				if len(childCommit) == 0 {
+					panic("cannot have non-committed child")
+				}
 				branchInfo.Children = append(
 					branchInfo.Children,
 					&protobufs.BranchChild{
@@ -760,8 +782,56 @@ func getBranchInfoFromTree(
 				)
 			}
 		}
+	} else if leaf, ok := node.(*tries.LazyVectorCommitmentLeafNode); ok {
+		branchInfo.Commitment = leaf.Commitment
+		if len(branchInfo.Commitment) == 0 {
+			panic("leaf cannot have no commitment")
+		}
 	}
 	return branchInfo, nil
+}
+
+func ensureCommittedNode(
+	logger *zap.Logger,
+	tree *tries.LazyVectorCommitmentTree,
+	path []int,
+	node tries.LazyVectorCommitmentNode,
+) tries.LazyVectorCommitmentNode {
+	if node == nil {
+		return nil
+	}
+
+	hasCommit := func(commitment []byte) bool {
+		return len(commitment) != 0
+	}
+
+	switch n := node.(type) {
+	case *tries.LazyVectorCommitmentBranchNode:
+		if hasCommit(n.Commitment) {
+			return node
+		}
+	case *tries.LazyVectorCommitmentLeafNode:
+		if hasCommit(n.Commitment) {
+			return node
+		}
+	default:
+		return node
+	}
+
+	reloaded, err := tree.Store.GetNodeByPath(
+		tree.SetType,
+		tree.PhaseType,
+		tree.ShardKey,
+		path,
+	)
+	if err != nil && !strings.Contains(err.Error(), "item not found") {
+		logger.Panic("failed to reload node by path", zap.Error(err))
+	}
+	if reloaded != nil {
+		return reloaded
+	}
+
+	return node
 }
 
 // isLeaf infers whether a HypergraphComparisonResponse message represents a
@@ -847,7 +917,7 @@ func (s *streamManager) handleLeafData(
 		)
 	}
 
-	s.logger.Info("expecting leaves", zap.Uint64("count", expectedLeaves))
+	// s.logger.Info("expecting leaves", zap.Uint64("count", expectedLeaves))
 
 	var txn tries.TreeBackingStoreTransaction
 	var err error
@@ -894,10 +964,10 @@ func (s *streamManager) handleLeafData(
 				remoteUpdate = msg.GetLeafData()
 			}
 
-			s.logger.Info(
-				"received leaf data",
-				zap.String("key", hex.EncodeToString(remoteUpdate.Key)),
-			)
+			// s.logger.Info(
+			// 	"received leaf data",
+			// 	zap.String("key", hex.EncodeToString(remoteUpdate.Key)),
+			// )
 
 			theirs := AtomFromBytes(remoteUpdate.Value)
 			if len(remoteUpdate.UnderlyingData) != 0 {
@@ -1105,11 +1175,11 @@ func (s *streamManager) walk(
 	pathString := zap.String("path", hex.EncodeToString(packPath(path)))
 
 	if bytes.Equal(lnode.Commitment, rnode.Commitment) {
-		s.logger.Info(
-			"commitments match",
-			pathString,
-			zap.String("commitment", hex.EncodeToString(lnode.Commitment)),
-		)
+		// s.logger.Debug(
+		// 	"commitments match",
+		// 	pathString,
+		// 	zap.String("commitment", hex.EncodeToString(lnode.Commitment)),
+		// )
 		return nil
 	}
 
@@ -1118,7 +1188,7 @@ func (s *streamManager) walk(
 	}
 
 	if isLeaf(rnode) || isLeaf(lnode) {
-		s.logger.Info("leaf/branch mismatch at path", pathString)
+		// s.logger.Debug("leaf/branch mismatch at path", pathString)
 		if isServer {
 			err := s.sendLeafData(
 				path,
@@ -1134,22 +1204,22 @@ func (s *streamManager) walk(
 	lpref := lnode.Path
 	rpref := rnode.Path
 	if len(lpref) != len(rpref) {
-		s.logger.Info(
-			"prefix length mismatch",
-			zap.Int("local_prefix", len(lpref)),
-			zap.Int("remote_prefix", len(rpref)),
-			pathString,
-		)
+		// s.logger.Debug(
+		// 	"prefix length mismatch",
+		// 	zap.Int("local_prefix", len(lpref)),
+		// 	zap.Int("remote_prefix", len(rpref)),
+		// 	pathString,
+		// )
 		if len(lpref) > len(rpref) {
-			s.logger.Info("local prefix longer, traversing remote to path", pathString)
+			// s.logger.Debug("local prefix longer, traversing remote to path", pathString)
 			traverse := lpref[len(rpref)-1:]
 			rtrav := rnode
 			traversePath := append([]int32{}, rpref...)
 			for _, nibble := range traverse {
-				s.logger.Info("attempting remote traversal step")
+				// s.logger.Debug("attempting remote traversal step")
 				for _, child := range rtrav.Children {
 					if child.Index == nibble {
-						s.logger.Info("sending query")
+						// s.logger.Debug("sending query")
 						traversePath = append(traversePath, child.Index)
 						var err error
 						rtrav, err = queryNext(
@@ -1168,7 +1238,7 @@ func (s *streamManager) walk(
 				}
 
 				if rtrav == nil {
-					s.logger.Info("traversal could not reach path")
+					// s.logger.Debug("traversal could not reach path")
 					if isServer {
 						err := s.sendLeafData(
 							lpref,
@@ -1181,7 +1251,7 @@ func (s *streamManager) walk(
 					}
 				}
 			}
-			s.logger.Info("traversal completed, performing walk", pathString)
+			// s.logger.Debug("traversal completed, performing walk", pathString)
 			return s.walk(
 				path,
 				lnode,
@@ -1193,19 +1263,19 @@ func (s *streamManager) walk(
 				isServer,
 			)
 		} else {
-			s.logger.Info("remote prefix longer, traversing local to path", pathString)
+			// s.logger.Debug("remote prefix longer, traversing local to path", pathString)
 			traverse := rpref[len(lpref)-1:]
 			ltrav := lnode
 			traversedPath := append([]int32{}, lnode.Path...)
 
 			for _, nibble := range traverse {
-				s.logger.Info("attempting local traversal step")
+				// s.logger.Debug("attempting local traversal step")
 				preTraversal := append([]int32{}, traversedPath...)
 				for _, child := range ltrav.Children {
 					if child.Index == nibble {
 						traversedPath = append(traversedPath, nibble)
 						var err error
-						s.logger.Info("expecting query")
+						// s.logger.Debug("expecting query")
 						ltrav, err = handleQueryNext(
 							s.logger,
 							s.ctx,
@@ -1220,7 +1290,7 @@ func (s *streamManager) walk(
 						}
 
 						if ltrav == nil {
-							s.logger.Info("traversal could not reach path")
+							// s.logger.Debug("traversal could not reach path")
 							if isServer {
 								err := s.sendLeafData(
 									preTraversal,
@@ -1233,17 +1303,17 @@ func (s *streamManager) walk(
 							}
 						}
 					} else {
-						s.logger.Info(
-							"known missing branch",
-							zap.String(
-								"path",
-								hex.EncodeToString(
-									packPath(
-										append(append([]int32{}, preTraversal...), child.Index),
-									),
-								),
-							),
-						)
+						// s.logger.Debug(
+						// 	"known missing branch",
+						// 	zap.String(
+						// 		"path",
+						// 		hex.EncodeToString(
+						// 			packPath(
+						// 				append(append([]int32{}, preTraversal...), child.Index),
+						// 			),
+						// 		),
+						// 	),
+						// )
 						if isServer {
 							if err := s.sendLeafData(
 								append(append([]int32{}, preTraversal...), child.Index),
@@ -1260,7 +1330,7 @@ func (s *streamManager) walk(
 					}
 				}
 			}
-			s.logger.Info("traversal completed, performing walk", pathString)
+			// s.logger.Debug("traversal completed, performing walk", pathString)
 			return s.walk(
 				path,
 				ltrav,
@@ -1274,13 +1344,13 @@ func (s *streamManager) walk(
 		}
 	} else {
 		if slices.Compare(lpref, rpref) == 0 {
-			s.logger.Debug("prefixes match, diffing children")
+			// s.logger.Debug("prefixes match, diffing children")
 			for i := int32(0); i < 64; i++ {
-				s.logger.Debug("checking branch", zap.Int32("branch", i))
+				// s.logger.Debug("checking branch", zap.Int32("branch", i))
 				var lchild *protobufs.BranchChild = nil
 				for _, lc := range lnode.Children {
 					if lc.Index == i {
-						s.logger.Debug("local instance found", zap.Int32("branch", i))
+						// s.logger.Debug("local instance found", zap.Int32("branch", i))
 
 						lchild = lc
 						break
@@ -1289,7 +1359,7 @@ func (s *streamManager) walk(
 				var rchild *protobufs.BranchChild = nil
 				for _, rc := range rnode.Children {
 					if rc.Index == i {
-						s.logger.Debug("remote instance found", zap.Int32("branch", i))
+						// s.logger.Debug("remote instance found", zap.Int32("branch", i))
 
 						rchild = rc
 						break
@@ -1335,7 +1405,7 @@ func (s *streamManager) walk(
 							nextPath,
 						)
 						if err != nil {
-							s.logger.Info("incomplete branch descension", zap.Error(err))
+							// s.logger.Debug("incomplete branch descension", zap.Error(err))
 							if isServer {
 								if err := s.sendLeafData(
 									nextPath,
@@ -1368,7 +1438,7 @@ func (s *streamManager) walk(
 				}
 			}
 		} else {
-			s.logger.Info("prefix mismatch on both sides", pathString)
+			// s.logger.Debug("prefix mismatch on both sides", pathString)
 			if isServer {
 				if err := s.sendLeafData(
 					path,
@@ -1393,7 +1463,18 @@ func (s *streamManager) walk(
 // and queues further queries as differences are detected.
 func (hg *HypergraphCRDT) syncTreeServer(
 	stream protobufs.HypergraphComparisonService_HyperStreamServer,
+	snapshotStore tries.TreeBackingStore,
+	snapshotRoot []byte,
 ) error {
+	if len(snapshotRoot) != 0 {
+		hg.logger.Info(
+			"syncing with snapshot",
+			zap.String("root", hex.EncodeToString(snapshotRoot)),
+		)
+	} else {
+		hg.logger.Info("syncing with snapshot", zap.String("root", ""))
+	}
+
 	msg, err := stream.Recv()
 	if err != nil {
 		return err
@@ -1414,17 +1495,9 @@ func (hg *HypergraphCRDT) syncTreeServer(
 		L2: [32]byte(query.ShardKey[3:]),
 	}
 
-	// Get the appropriate id set
-	var idSet hypergraph.IdSet
-	switch query.PhaseSet {
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS:
-		idSet = hg.getVertexAddsSet(shardKey)
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES:
-		idSet = hg.getVertexRemovesSet(shardKey)
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS:
-		idSet = hg.getHyperedgeAddsSet(shardKey)
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES:
-		idSet = hg.getHyperedgeRemovesSet(shardKey)
+	idSet := hg.snapshotPhaseSet(shardKey, query.PhaseSet, snapshotStore)
+	if idSet == nil {
+		return errors.New("unsupported phase set")
 	}
 
 	branchInfo, err := getBranchInfoFromTree(
@@ -1436,12 +1509,12 @@ func (hg *HypergraphCRDT) syncTreeServer(
 		return err
 	}
 
-	hg.logger.Debug(
-		"returning branch info",
-		zap.String("commitment", hex.EncodeToString(branchInfo.Commitment)),
-		zap.Int("children", len(branchInfo.Children)),
-		zap.Int("path", len(branchInfo.Path)),
-	)
+	// hg.logger.Debug(
+	// 	"returning branch info",
+	// 	zap.String("commitment", hex.EncodeToString(branchInfo.Commitment)),
+	// 	zap.Int("children", len(branchInfo.Children)),
+	// 	zap.Int("path", len(branchInfo.Path)),
+	// )
 
 	resp := &protobufs.HypergraphComparison{
 		Payload: &protobufs.HypergraphComparison_Response{
@@ -1486,14 +1559,14 @@ func (hg *HypergraphCRDT) syncTreeServer(
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
-				hg.logger.Info("received disconnect")
+				hg.logger.Info("server stream recv eof")
 				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
 				return
 			}
 			if err != nil {
-				hg.logger.Info("received error", zap.Error(err))
+				hg.logger.Info("server stream recv error", zap.Error(err))
 				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
@@ -1527,7 +1600,7 @@ func (hg *HypergraphCRDT) syncTreeServer(
 		cancel:          cancel,
 		logger:          hg.logger,
 		stream:          stream,
-		hypergraphStore: hg.store,
+		hypergraphStore: snapshotStore,
 		localTree:       idSet.GetTree(),
 		lastSent:        time.Now(),
 	}

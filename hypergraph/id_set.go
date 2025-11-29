@@ -136,38 +136,58 @@ func (set *idSet) Has(key [64]byte) bool {
 	return err == nil
 }
 
+func (set *idSet) cloneWithStore(
+	store tries.TreeBackingStore,
+) *idSet {
+	if set == nil {
+		return nil
+	}
+
+	return &idSet{
+		dirty:     set.dirty,
+		atomType:  set.atomType,
+		tree:      set.tree.CloneWithStore(store),
+		validator: set.validator,
+	}
+}
+
 func (hg *HypergraphCRDT) GetCoveredPrefix() ([]int, error) {
-	hg.mu.RLock()
-	defer hg.mu.RUnlock()
-	return hg.getCoveredPrefix(), nil
+	hg.prefixMu.RLock()
+	defer hg.prefixMu.RUnlock()
+	return slices.Clone(hg.coveredPrefix), nil
 }
 
 func (hg *HypergraphCRDT) getCoveredPrefix() []int {
+	hg.prefixMu.RLock()
+	defer hg.prefixMu.RUnlock()
 	return slices.Clone(hg.coveredPrefix)
 }
 
 func (hg *HypergraphCRDT) SetCoveredPrefix(prefix []int) error {
-	hg.mu.Lock()
-	defer hg.mu.Unlock()
-	hg.coveredPrefix = slices.Clone(prefix)
+	prefixCopy := slices.Clone(prefix)
+	hg.prefixMu.Lock()
+	hg.coveredPrefix = prefixCopy
+	hg.prefixMu.Unlock()
 
+	hg.setsMu.Lock()
 	for _, s := range hg.hyperedgeAdds {
-		s.GetTree().CoveredPrefix = prefix
+		s.GetTree().CoveredPrefix = prefixCopy
 	}
 
 	for _, s := range hg.hyperedgeRemoves {
-		s.GetTree().CoveredPrefix = prefix
+		s.GetTree().CoveredPrefix = prefixCopy
 	}
 
 	for _, s := range hg.vertexAdds {
-		s.GetTree().CoveredPrefix = prefix
+		s.GetTree().CoveredPrefix = prefixCopy
 	}
 
 	for _, s := range hg.vertexRemoves {
-		s.GetTree().CoveredPrefix = prefix
+		s.GetTree().CoveredPrefix = prefixCopy
 	}
+	hg.setsMu.Unlock()
 
-	return hg.store.SetCoveredPrefix(prefix)
+	return hg.store.SetCoveredPrefix(prefixCopy)
 }
 
 // GetVertexAddsSet returns a specific vertex addition set by shard key.
@@ -283,6 +303,8 @@ func (hg *HypergraphCRDT) getOrCreateIdSet(
 	atomType hypergraph.AtomType,
 	coveredPrefix []int,
 ) (hypergraph.IdSet, hypergraph.IdSet) {
+	hg.setsMu.Lock()
+	defer hg.setsMu.Unlock()
 	if _, ok := addMap[shardAddr]; !ok {
 		addMap[shardAddr] = NewIdSet(
 			atomType,

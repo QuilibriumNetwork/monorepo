@@ -275,7 +275,7 @@ func FuzzProverConfirm(f *testing.F) {
 		}
 
 		pc := &global.ProverConfirm{
-			Filter:      filter,
+			Filters:     [][]byte{filter},
 			FrameNumber: 12345,
 			PublicKeySignatureBLS48581: global.BLS48581AddressedSignature{
 				Address:   make([]byte, 32),
@@ -296,7 +296,7 @@ func FuzzProverConfirm(f *testing.F) {
 			t.Fatalf("FromBytes failed: %v", err)
 		}
 
-		if !bytes.Equal(pc.Filter, decoded.Filter) {
+		if !bytes.Equal(pc.Filters[0], decoded.Filters[0]) {
 			t.Errorf("Filter mismatch")
 		}
 		if pc.FrameNumber != decoded.FrameNumber {
@@ -319,7 +319,7 @@ func FuzzProverReject(f *testing.F) {
 		}
 
 		pr := &global.ProverReject{
-			Filter:      filter,
+			Filters:     [][]byte{filter},
 			FrameNumber: 12345,
 			PublicKeySignatureBLS48581: global.BLS48581AddressedSignature{
 				Address:   make([]byte, 32),
@@ -340,7 +340,7 @@ func FuzzProverReject(f *testing.F) {
 			t.Fatalf("FromBytes failed: %v", err)
 		}
 
-		if !bytes.Equal(pr.Filter, decoded.Filter) {
+		if !bytes.Equal(pr.Filters[0], decoded.Filters[0]) {
 			t.Errorf("Filter mismatch")
 		}
 		if pr.FrameNumber != decoded.FrameNumber {

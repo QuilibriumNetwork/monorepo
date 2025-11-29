@@ -121,7 +121,7 @@ func TestProverConfirm_Prove(t *testing.T) {
 
 	// Create the prover confirm operation
 	rdfMultiprover := createMockRDFMultiprover()
-	proverConfirm, err := global.NewProverConfirm(filter, frameNumber, mockKeyManager, nil, rdfMultiprover)
+	proverConfirm, err := global.NewProverConfirm([][]byte{filter}, frameNumber, mockKeyManager, nil, rdfMultiprover)
 	require.NoError(t, err)
 
 	// Call the prove function
@@ -172,7 +172,7 @@ func TestProverConfirm_Verify(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data manually
@@ -244,7 +244,7 @@ func TestProverConfirm_Verify(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data manually
@@ -293,7 +293,7 @@ func TestProverConfirm_Verify(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data manually
@@ -342,7 +342,7 @@ func TestProverConfirm_Verify(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data manually
@@ -480,7 +480,7 @@ func TestProverConfirm_Materialize(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, frameNumber, mockKeyManager, nil, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, frameNumber, mockKeyManager, nil, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data
@@ -588,7 +588,7 @@ func TestProverConfirm_Materialize(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, frameNumber, mockKeyManager, nil, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, frameNumber, mockKeyManager, nil, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data
@@ -669,7 +669,7 @@ func TestProverConfirm_Materialize(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, frameNumber, mockKeyManager, nil, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, frameNumber, mockKeyManager, nil, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data
@@ -709,7 +709,7 @@ func TestProverConfirm_Materialize(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, frameNumber, mockKeyManager, nil, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, frameNumber, mockKeyManager, nil, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data
@@ -762,7 +762,7 @@ func TestProverConfirm_Materialize(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, frameNumber, mockKeyManager, nil, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, frameNumber, mockKeyManager, nil, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data
@@ -839,7 +839,7 @@ func TestProverConfirm_Materialize(t *testing.T) {
 
 		// Create the prover confirm operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverConfirm, err := global.NewProverConfirm(filter, frameNumber, mockKeyManager, nil, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, frameNumber, mockKeyManager, nil, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data

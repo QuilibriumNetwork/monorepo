@@ -499,7 +499,7 @@ func createProverResumePayload(t *testing.T) *protobufs.MessageRequest {
 
 func createProverConfirmPayload(t *testing.T) *protobufs.MessageRequest {
 	confirm := &global.ProverConfirm{
-		Filter:      []byte("filter1filter1filter1filter1filter1"),
+		Filters:     [][]byte{[]byte("filter1filter1filter1filter1filter1")},
 		FrameNumber: 1,
 		PublicKeySignatureBLS48581: global.BLS48581AddressedSignature{
 			Address:   make([]byte, 32),
@@ -519,7 +519,7 @@ func createProverConfirmPayload(t *testing.T) *protobufs.MessageRequest {
 
 func createProverRejectPayload(t *testing.T) *protobufs.MessageRequest {
 	reject := &global.ProverReject{
-		Filter:      []byte("filter1filter1filter1filter1filter1"),
+		Filters:     [][]byte{[]byte("filter1filter1filter1filter1filter1")},
 		FrameNumber: 1,
 		PublicKeySignatureBLS48581: global.BLS48581AddressedSignature{
 			Address:   make([]byte, 32),

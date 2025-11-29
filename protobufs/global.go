@@ -1441,15 +1441,15 @@ func (p *ProverConfirm) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
-	// Write filter
+	// Write deprecated field for filter
 	if err := binary.Write(
 		buf,
 		binary.BigEndian,
-		uint32(len(p.Filter)),
+		uint32(32),
 	); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
-	if _, err := buf.Write(p.Filter); err != nil {
+	if _, err := buf.Write(bytes.Repeat([]byte("reserved"), 4)); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
@@ -1476,6 +1476,27 @@ func (p *ProverConfirm) ToCanonicalBytes() ([]byte, error) {
 		}
 	} else {
 		if err := binary.Write(buf, binary.BigEndian, uint32(0)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write filters
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(p.Filters)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	for _, f := range p.Filters {
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(f)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(f); err != nil {
 			return nil, errors.Wrap(err, "to canonical bytes")
 		}
 	}
@@ -1543,6 +1564,40 @@ func (p *ProverConfirm) FromCanonicalBytes(data []byte) error {
 		}
 	}
 
+	// Read filters
+	filtersLen := uint32(0)
+	if err := binary.Read(buf, binary.BigEndian, &filtersLen); err != nil {
+		// Skip errors here, can be old messages
+		return nil
+	}
+
+	if filtersLen > 100 {
+		return errors.Wrap(
+			errors.New("invalid filters length"),
+			"from canonical bytes",
+		)
+	}
+
+	p.Filters = make([][]byte, 0, filtersLen)
+	for i := uint32(0); i < filtersLen; i++ {
+		var filterLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		if filterLen > 64 || filterLen < 32 {
+			return errors.Wrap(
+				errors.New("invalid filters length"),
+				"from canonical bytes",
+			)
+		}
+
+		filterBytes := make([]byte, filterLen)
+		if _, err := buf.Read(filterBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		p.Filters = append(p.Filters, filterBytes)
+	}
+
 	return nil
 }
 
@@ -1554,15 +1609,15 @@ func (p *ProverReject) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
-	// Write filter
+	// Write deprecated field for filter
 	if err := binary.Write(
 		buf,
 		binary.BigEndian,
-		uint32(len(p.Filter)),
+		uint32(32),
 	); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
-	if _, err := buf.Write(p.Filter); err != nil {
+	if _, err := buf.Write(bytes.Repeat([]byte("reserved"), 4)); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
@@ -1589,6 +1644,27 @@ func (p *ProverReject) ToCanonicalBytes() ([]byte, error) {
 		}
 	} else {
 		if err := binary.Write(buf, binary.BigEndian, uint32(0)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write filters
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(p.Filters)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	for _, f := range p.Filters {
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(f)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(f); err != nil {
 			return nil, errors.Wrap(err, "to canonical bytes")
 		}
 	}
@@ -1654,6 +1730,40 @@ func (p *ProverReject) FromCanonicalBytes(data []byte) error {
 		); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
 		}
+	}
+
+	// Read filters
+	filtersLen := uint32(0)
+	if err := binary.Read(buf, binary.BigEndian, &filtersLen); err != nil {
+		// Skip errors here, can be old messages
+		return nil
+	}
+
+	if filtersLen > 100 {
+		return errors.Wrap(
+			errors.New("invalid filters length"),
+			"from canonical bytes",
+		)
+	}
+
+	p.Filters = make([][]byte, 0, filtersLen)
+	for i := uint32(0); i < filtersLen; i++ {
+		var filterLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		if filterLen > 64 || filterLen < 32 {
+			return errors.Wrap(
+				errors.New("invalid filters length"),
+				"from canonical bytes",
+			)
+		}
+
+		filterBytes := make([]byte, filterLen)
+		if _, err := buf.Read(filterBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		p.Filters = append(p.Filters, filterBytes)
 	}
 
 	return nil
@@ -5015,6 +5125,11 @@ func (t *ProverConfirm) Validate() error {
 	if err := t.PublicKeySignatureBls48581.Validate(); err != nil {
 		return errors.Wrap(err, "public key signature")
 	}
+	for _, filter := range t.Filters {
+		if len(filter) < 32 || len(filter) > 64 {
+			return errors.Wrap(errors.New("invalid filter"), "validate")
+		}
+	}
 	return nil
 }
 
@@ -5030,6 +5145,11 @@ func (t *ProverReject) Validate() error {
 	}
 	if err := t.PublicKeySignatureBls48581.Validate(); err != nil {
 		return errors.Wrap(err, "public key signature")
+	}
+	for _, filter := range t.Filters {
+		if len(filter) < 32 || len(filter) > 64 {
+			return errors.Wrap(errors.New("invalid filter"), "validate")
+		}
 	}
 	return nil
 }

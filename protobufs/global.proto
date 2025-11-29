@@ -50,9 +50,10 @@ message ProverResume {
 }
 
 message ProverConfirm {
-  bytes filter = 1;
+  bytes filter = 1 [deprecated = true];
   uint64 frame_number = 2;
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
+  repeated bytes filters = 4;
 }
 
 message ProverUpdate {
@@ -70,11 +71,11 @@ message ProverKick {
   quilibrium.node.application.pb.TraversalProof traversal_proof = 7;
 }
 
-// ProverReject remains the same structure as before
 message ProverReject {
-  bytes filter = 1;
+  bytes filter = 1 [deprecated = true];
   uint64 frame_number = 2;
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 3;
+  repeated bytes filters = 4;
 }
 
 message MessageRequest {
