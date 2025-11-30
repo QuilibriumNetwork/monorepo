@@ -126,6 +126,11 @@ var (
 		false,
 		"starts the db console mode (does not run nodes)",
 	)
+	dangerClearPending = flag.Bool(
+		"danger-clear-pending",
+		false,
+		"clears pending states (dangerous action)",
+	)
 
 	// *char flags
 	blockchar         = "█"
@@ -373,6 +378,60 @@ func main() {
 		}
 
 		printPeerInfo(logger, config)
+		return
+	}
+
+	if *dangerClearPending {
+		db := store.NewPebbleDB(logger, nodeConfig.DB, 0)
+		defer db.Close()
+		consensusStore := store.NewPebbleConsensusStore(db, logger)
+		state, err := consensusStore.GetConsensusState(nil)
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+
+		clockStore := store.NewPebbleClockStore(db, logger)
+		qc, err := clockStore.GetQuorumCertificate(nil, state.FinalizedRank)
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+
+		err = clockStore.DeleteGlobalClockFrameRange(
+			qc.FrameNumber+1,
+			qc.FrameNumber+10000,
+		)
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+
+		err = clockStore.DeleteQuorumCertificateRange(
+			nil,
+			qc.Rank+1,
+			qc.Rank+10000,
+		)
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+
+		if state.LatestTimeout != nil {
+			latestTCRank := state.LatestTimeout.Rank
+			err = clockStore.DeleteTimeoutCertificateRange(
+				nil,
+				latestTCRank+1,
+				latestTCRank+10000,
+				latestTCRank,
+			)
+			if err != nil {
+				fmt.Println(err.Error())
+				return
+			}
+		}
+
+		fmt.Println("pending entries cleared")
 		return
 	}
 

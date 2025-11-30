@@ -30,6 +30,7 @@ type PebbleHypergraphStore struct {
 	logger *zap.Logger
 	verenc crypto.VerifiableEncryptor
 	prover crypto.InclusionProver
+	pebble *pebble.DB
 }
 
 func NewPebbleHypergraphStore(
@@ -39,13 +40,48 @@ func NewPebbleHypergraphStore(
 	verenc crypto.VerifiableEncryptor,
 	prover crypto.InclusionProver,
 ) *PebbleHypergraphStore {
+	var pebbleHandle *pebble.DB
+	if pdb, ok := db.(*PebbleDB); ok {
+		pebbleHandle = pdb.DB()
+	}
+
 	return &PebbleHypergraphStore{
 		config,
 		db,
 		logger,
 		verenc,
 		prover,
+		pebbleHandle,
 	}
+}
+
+func (p *PebbleHypergraphStore) NewSnapshot() (
+	tries.TreeBackingStore,
+	func(),
+	error,
+) {
+	if p.pebble == nil {
+		return nil, nil, errors.New("hypergraph store does not support snapshots")
+	}
+
+	snapshot := p.pebble.NewSnapshot()
+	snapshotDB := &pebbleSnapshotDB{snap: snapshot}
+	snapshotStore := NewPebbleHypergraphStore(
+		p.config,
+		snapshotDB,
+		p.logger,
+		p.verenc,
+		p.prover,
+	)
+	snapshotStore.pebble = nil
+
+	release := func() {
+		if err := snapshotDB.Close(); err != nil {
+			p.logger.Warn("failed to close hypergraph snapshot", zap.Error(err))
+		}
+	}
+
+	return snapshotStore, release, nil
 }
 
 type PebbleVertexDataIterator struct {

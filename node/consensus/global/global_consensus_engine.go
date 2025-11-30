@@ -1596,7 +1596,9 @@ func (e *GlobalConsensusEngine) materialize(
 	}
 
 	if e.verifyProverRoot(frameNumber, expectedProverRoot, proposer) {
-		e.reconcileLocalWorkerAllocations()
+		if !e.config.Engine.ArchiveMode || e.config.P2P.Network == 99 {
+			e.reconcileLocalWorkerAllocations()
+		}
 	}
 
 	return nil
@@ -1664,10 +1666,9 @@ func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte) {
 		return
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		defer e.proverSyncInProgress.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
 
 		shardKey := tries.ShardKey{
 			L1: [3]byte{0x00, 0x00, 0x00},
@@ -1679,6 +1680,15 @@ func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte) {
 				"failed to refresh prover registry after hypersync",
 				zap.Error(err),
 			)
+		}
+		cancel()
+	}()
+
+	go func() {
+		select {
+		case <-e.ShutdownSignal():
+			cancel()
+		case <-ctx.Done():
 		}
 	}()
 }
@@ -3145,59 +3155,53 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 	}
 
 	if len(reject) != 0 {
-		for _, r := range reject {
-			rejectMessage, err := global.NewProverReject(
-				r,
-				frame.Header.FrameNumber,
-				e.keyManager,
-				e.hypergraph,
-				schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
-			)
-			if err != nil {
-				e.logger.Error("could not construct reject", zap.Error(err))
-				return errors.Wrap(err, "decide worker joins")
-			}
-
-			err = rejectMessage.Prove(frame.Header.FrameNumber)
-			if err != nil {
-				e.logger.Error("could not construct reject", zap.Error(err))
-				return errors.Wrap(err, "decide worker joins")
-			}
-
-			bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
-				Request: &protobufs.MessageRequest_Reject{
-					Reject: rejectMessage.ToProtobuf(),
-				},
-			})
+		rejectMessage, err := global.NewProverReject(
+			reject,
+			frame.Header.FrameNumber,
+			e.keyManager,
+			e.hypergraph,
+			schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		)
+		if err != nil {
+			e.logger.Error("could not construct reject", zap.Error(err))
+			return errors.Wrap(err, "decide worker joins")
 		}
-	}
 
-	if len(confirm) != 0 {
-		for _, r := range confirm {
-			confirmMessage, err := global.NewProverConfirm(
-				r,
-				frame.Header.FrameNumber,
-				e.keyManager,
-				e.hypergraph,
-				schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
-			)
-			if err != nil {
-				e.logger.Error("could not construct confirm", zap.Error(err))
-				return errors.Wrap(err, "decide worker joins")
-			}
-
-			err = confirmMessage.Prove(frame.Header.FrameNumber)
-			if err != nil {
-				e.logger.Error("could not construct confirm", zap.Error(err))
-				return errors.Wrap(err, "decide worker joins")
-			}
-
-			bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
-				Request: &protobufs.MessageRequest_Confirm{
-					Confirm: confirmMessage.ToProtobuf(),
-				},
-			})
+		err = rejectMessage.Prove(frame.Header.FrameNumber)
+		if err != nil {
+			e.logger.Error("could not construct reject", zap.Error(err))
+			return errors.Wrap(err, "decide worker joins")
 		}
+
+		bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+			Request: &protobufs.MessageRequest_Reject{
+				Reject: rejectMessage.ToProtobuf(),
+			},
+		})
+	} else if len(confirm) != 0 {
+		confirmMessage, err := global.NewProverConfirm(
+			confirm,
+			frame.Header.FrameNumber,
+			e.keyManager,
+			e.hypergraph,
+			schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		)
+		if err != nil {
+			e.logger.Error("could not construct confirm", zap.Error(err))
+			return errors.Wrap(err, "decide worker joins")
+		}
+
+		err = confirmMessage.Prove(frame.Header.FrameNumber)
+		if err != nil {
+			e.logger.Error("could not construct confirm", zap.Error(err))
+			return errors.Wrap(err, "decide worker joins")
+		}
+
+		bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+			Request: &protobufs.MessageRequest_Confirm{
+				Confirm: confirmMessage.ToProtobuf(),
+			},
+		})
 	}
 
 	bundle.Timestamp = time.Now().UnixMilli()

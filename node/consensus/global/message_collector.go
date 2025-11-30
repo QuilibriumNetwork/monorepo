@@ -145,7 +145,7 @@ func (p *globalMessageProcessor) enforceCollectorLimit(
 
 	if len(collector.Records()) >= maxGlobalMessagesPerFrame {
 		collector.Remove(record)
-		p.engine.deferGlobalMessage(record.sequence+1, record.payload)
+		// p.engine.deferGlobalMessage(record.sequence+1, record.payload)
 		return keyedcollector.NewInvalidRecordError(
 			record,
 			fmt.Errorf("message limit reached for frame %d", p.sequence),
@@ -215,10 +215,51 @@ func (e *GlobalConsensusEngine) startGlobalMessageAggregator(
 }
 
 func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
-	if e.messageAggregator == nil {
+	if e.messageAggregator == nil || len(data) == 0 {
 		return
 	}
-	record := newSequencedGlobalMessage(e.currentRank+1, data)
+
+	payload := data
+	if len(data) >= 4 {
+		typePrefix := binary.BigEndian.Uint32(data[:4])
+		if typePrefix == protobufs.MessageBundleType {
+			bundle := &protobufs.MessageBundle{}
+			if err := bundle.FromCanonicalBytes(data); err != nil {
+				if e.logger != nil {
+					e.logger.Debug(
+						"failed to decode message bundle for collector",
+						zap.Error(err),
+					)
+				}
+				return
+			}
+
+			if len(bundle.Requests) > maxGlobalMessagesPerFrame {
+				if e.logger != nil {
+					e.logger.Debug(
+						"truncating message bundle requests for collector",
+						zap.Int("original", len(bundle.Requests)),
+						zap.Int("limit", maxGlobalMessagesPerFrame),
+					)
+				}
+				bundle.Requests = bundle.Requests[:maxGlobalMessagesPerFrame]
+			}
+
+			encoded, err := bundle.ToCanonicalBytes()
+			if err != nil {
+				if e.logger != nil {
+					e.logger.Debug(
+						"failed to re-encode message bundle for collector",
+						zap.Error(err),
+					)
+				}
+				return
+			}
+			payload = encoded
+		}
+	}
+
+	record := newSequencedGlobalMessage(e.currentRank+1, payload)
 	e.messageAggregator.Add(record)
 }
 

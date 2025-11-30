@@ -1394,6 +1394,49 @@ func (p *PebbleClockStore) DeleteGlobalClockFrameRange(
 	return errors.Wrap(err, "delete global clock frame range")
 }
 
+func (p *PebbleClockStore) DeleteQuorumCertificateRange(
+	filter []byte,
+	minRank uint64,
+	maxRank uint64,
+) error {
+	err := p.db.DeleteRange(
+		clockQuorumCertificateKey(minRank, filter),
+		clockQuorumCertificateKey(maxRank, filter),
+	)
+	if err != nil {
+		return errors.Wrap(err, "delete quorum certificate range")
+	}
+
+	err = p.db.Set(
+		clockQuorumCertificateLatestIndex(nil),
+		binary.BigEndian.AppendUint64(nil, minRank-1),
+	)
+
+	return errors.Wrap(err, "delete quorum certificate range")
+}
+
+func (p *PebbleClockStore) DeleteTimeoutCertificateRange(
+	filter []byte,
+	minRank uint64,
+	maxRank uint64,
+	priorLatestRank uint64,
+) error {
+	err := p.db.DeleteRange(
+		clockTimeoutCertificateKey(minRank, filter),
+		clockTimeoutCertificateKey(maxRank, filter),
+	)
+	if err != nil {
+		return errors.Wrap(err, "delete timeout certificate range")
+	}
+
+	err = p.db.Set(
+		clockTimeoutCertificateLatestIndex(nil),
+		binary.BigEndian.AppendUint64(nil, priorLatestRank),
+	)
+
+	return errors.Wrap(err, "delete timeout certificate range")
+}
+
 func (p *PebbleClockStore) DeleteShardClockFrameRange(
 	filter []byte,
 	fromFrameNumber uint64,

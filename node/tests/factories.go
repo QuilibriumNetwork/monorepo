@@ -1396,9 +1396,11 @@ func (n *Nopthenticator) StreamInterceptor(
 	info *grpc.StreamServerInfo,
 	handler grpc.StreamHandler,
 ) error {
+	bytes := make([]byte, 20)
+	rand.Read(bytes)
 	ss = &authenticatedStream{
 		ServerStream: ss,
-		ctx:          qgrpc.NewContextWithPeerID(ss.Context(), peer.ID("peer")),
+		ctx:          qgrpc.NewContextWithPeerID(ss.Context(), peer.ID(bytes)),
 	}
 	return handler(srv, ss)
 }
@@ -1410,12 +1412,16 @@ func (n *Nopthenticator) UnaryInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (any, error) {
-	return handler(qgrpc.NewContextWithPeerID(ctx, peer.ID("peer")), req)
+	bytes := make([]byte, 20)
+	rand.Read(bytes)
+	return handler(qgrpc.NewContextWithPeerID(ctx, peer.ID(bytes)), req)
 }
 
 // Identify implements channel.AuthenticationProvider.
 func (n *Nopthenticator) Identify(ctx context.Context) (peer.ID, error) {
-	return peer.ID("peer"), nil
+	bytes := make([]byte, 20)
+	rand.Read(bytes)
+	return peer.ID(bytes), nil
 }
 
 var _ channel.AuthenticationProvider = (*Nopthenticator)(nil)

@@ -1,6 +1,8 @@
 package global
 
 import (
+	"bytes"
+
 	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
@@ -362,8 +364,21 @@ func ProverConfirmFromProtobuf(
 		return nil, errors.Wrap(err, "converting public key signature")
 	}
 
+	filters := [][]byte{}
+	if len(pb.Filters) > 0 {
+		filters = pb.Filters
+	} else {
+		if bytes.Equal(pb.Filter, bytes.Repeat([]byte("reserved"), 4)) {
+			return nil, errors.Wrap(
+				errors.New("filter cannot be reserved"),
+				"invalid prover confirm",
+			)
+		}
+		filters = append(filters, pb.Filter)
+	}
+
 	return &ProverConfirm{
-		Filter:                     pb.Filter,
+		Filters:                    filters,
 		FrameNumber:                pb.FrameNumber,
 		PublicKeySignatureBLS48581: *pubKeySig,
 		hypergraph:                 hg,
@@ -379,7 +394,7 @@ func (p *ProverConfirm) ToProtobuf() *protobufs.ProverConfirm {
 	}
 
 	return &protobufs.ProverConfirm{
-		Filter:                     p.Filter,
+		Filters:                    p.Filters,
 		FrameNumber:                p.FrameNumber,
 		PublicKeySignatureBls48581: p.PublicKeySignatureBLS48581.ToProtobuf(),
 	}
@@ -405,8 +420,21 @@ func ProverRejectFromProtobuf(
 		return nil, errors.Wrap(err, "converting public key signature")
 	}
 
+	filters := [][]byte{}
+	if len(pb.Filters) > 0 {
+		filters = pb.Filters
+	} else {
+		if bytes.Equal(pb.Filter, bytes.Repeat([]byte("reserved"), 4)) {
+			return nil, errors.Wrap(
+				errors.New("filter cannot be reserved"),
+				"invalid prover confirm",
+			)
+		}
+		filters = append(filters, pb.Filter)
+	}
+
 	return &ProverReject{
-		Filter:                     pb.Filter,
+		Filters:                    filters,
 		FrameNumber:                pb.FrameNumber,
 		PublicKeySignatureBLS48581: *pubKeySig,
 		hypergraph:                 hg,
@@ -422,7 +450,7 @@ func (p *ProverReject) ToProtobuf() *protobufs.ProverReject {
 	}
 
 	return &protobufs.ProverReject{
-		Filter:                     p.Filter,
+		Filters:                    p.Filters,
 		FrameNumber:                p.FrameNumber,
 		PublicKeySignatureBls48581: p.PublicKeySignatureBLS48581.ToProtobuf(),
 	}

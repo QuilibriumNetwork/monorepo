@@ -9,7 +9,9 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
 	"source.quilibrium.com/quilibrium/monorepo/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
@@ -770,6 +773,314 @@ func TestHypergraphPartialSync(t *testing.T) {
 	// Assume variable distribution, but roughly triple is a safe guess. If it fails, just bump it.
 	assert.Greater(t, 40, clientHas, "mismatching vertex data entries")
 	assert.Greater(t, clientHas, 1, "mismatching vertex data entries")
+}
+
+func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	enc := verenc.NewMPCitHVerifiableEncryptor(1)
+	inclusionProver := bls48581.NewKZGInclusionProver(logger)
+
+	dataTree := buildDataTree(t, enc, inclusionProver)
+
+	serverPath := filepath.Join(t.TempDir(), "server")
+	clientBase := filepath.Join(t.TempDir(), "clients")
+
+	serverDB := store.NewPebbleDB(logger, &config.DBConfig{Path: serverPath}, 0)
+	defer serverDB.Close()
+
+	serverStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{Path: serverPath},
+		serverDB,
+		logger,
+		enc,
+		inclusionProver,
+	)
+
+	const clientCount = 100
+	clientDBs := make([]*store.PebbleDB, clientCount)
+	clientStores := make([]*store.PebbleHypergraphStore, clientCount)
+	clientHGs := make([]*hgcrdt.HypergraphCRDT, clientCount)
+
+	serverHG := hgcrdt.NewHypergraph(
+		logger.With(zap.String("side", "server")),
+		serverStore,
+		inclusionProver,
+		[]int{},
+		&tests.Nopthenticator{},
+	)
+	for i := 0; i < clientCount; i++ {
+		clientPath := filepath.Join(clientBase, fmt.Sprintf("client-%d", i))
+		clientDBs[i] = store.NewPebbleDB(logger, &config.DBConfig{Path: clientPath}, 0)
+		clientStores[i] = store.NewPebbleHypergraphStore(
+			&config.DBConfig{Path: clientPath},
+			clientDBs[i],
+			logger,
+			enc,
+			inclusionProver,
+		)
+		clientHGs[i] = hgcrdt.NewHypergraph(
+			logger.With(zap.String("side", fmt.Sprintf("client-%d", i))),
+			clientStores[i],
+			inclusionProver,
+			[]int{},
+			&tests.Nopthenticator{},
+		)
+	}
+	defer func() {
+		for _, db := range clientDBs {
+			if db != nil {
+				db.Close()
+			}
+		}
+	}()
+
+	// Seed both hypergraphs with a baseline vertex so they share the shard key.
+	domain := randomBytes32(t)
+	initialVertex := hgcrdt.NewVertex(
+		domain,
+		randomBytes32(t),
+		dataTree.Commit(inclusionProver, false),
+		dataTree.GetSize(),
+	)
+	addVertices(
+		t,
+		serverStore,
+		serverHG,
+		dataTree,
+		initialVertex,
+	)
+	for i := 0; i < clientCount; i++ {
+		addVertices(
+			t,
+			clientStores[i],
+			clientHGs[i],
+			dataTree,
+			initialVertex,
+		)
+	}
+
+	shardKey := application.GetShardKey(initialVertex)
+
+	// Start gRPC server backed by the server hypergraph.
+	const bufSize = 1 << 20
+	lis := bufconn.Listen(bufSize)
+
+	grpcServer := grpc.NewServer(
+		grpc.ChainStreamInterceptor(func(
+			srv interface{},
+			ss grpc.ServerStream,
+			info *grpc.StreamServerInfo,
+			handler grpc.StreamHandler,
+		) error {
+			_, priv, _ := ed448.GenerateKey(rand.Reader)
+			privKey, err := pcrypto.UnmarshalEd448PrivateKey(priv)
+			require.NoError(t, err)
+
+			pub := privKey.GetPublic()
+			peerID, err := peer.IDFromPublicKey(pub)
+			require.NoError(t, err)
+
+			return handler(srv, &serverStream{
+				ServerStream: ss,
+				ctx:          internal_grpc.NewContextWithPeerID(ss.Context(), peerID),
+			})
+		}),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(
+		grpcServer,
+		serverHG,
+	)
+	defer grpcServer.Stop()
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	dialClient := func() (*grpc.ClientConn, protobufs.HypergraphComparisonServiceClient) {
+		dialer := func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}
+
+		conn, err := grpc.DialContext(
+			context.Background(),
+			"bufnet",
+			grpc.WithContextDialer(dialer),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		require.NoError(t, err)
+		return conn, protobufs.NewHypergraphComparisonServiceClient(conn)
+	}
+
+	const rounds = 3
+	for round := 0; round < rounds; round++ {
+		c, _ := serverHG.Commit(uint64(round))
+		fmt.Printf("svr commitment: %x\n", c[shardKey][0])
+
+		updates := generateVertices(
+			t,
+			domain,
+			dataTree,
+			inclusionProver,
+			5,
+		)
+
+		var syncWG sync.WaitGroup
+		var serverWG sync.WaitGroup
+
+		syncWG.Add(clientCount)
+		serverWG.Add(1)
+
+		for clientIdx := 0; clientIdx < clientCount; clientIdx++ {
+			go func(idx int) {
+				defer syncWG.Done()
+				clientHG := clientHGs[idx]
+				conn, client := dialClient()
+				streamCtx, cancelStream := context.WithTimeout(
+					context.Background(),
+					100*time.Second,
+				)
+				stream, err := client.HyperStream(streamCtx)
+				require.NoError(t, err)
+				clientHG.Sync(
+					stream,
+					shardKey,
+					protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+				)
+				require.NoError(t, stream.CloseSend())
+				cancelStream()
+				conn.Close()
+
+				c, _ := clientHGs[idx].Commit(uint64(round))
+				fmt.Printf("cli commitment: %x\n", c[shardKey][0])
+			}(clientIdx)
+		}
+
+		go func(round int) {
+			defer serverWG.Done()
+			logger.Info("server applying concurrent updates", zap.Int("round", round))
+			addVertices(t, serverStore, serverHG, dataTree, updates...)
+			logger.Info("server commit starting", zap.Int("round", round))
+			_, err := serverHG.Commit(uint64(round + 1))
+			require.NoError(t, err)
+			logger.Info("server commit finished", zap.Int("round", round))
+		}(round)
+
+		syncWG.Wait()
+		serverWG.Wait()
+	}
+
+	// Add additional server-only updates after the concurrent sync rounds.
+	extraUpdates := generateVertices(t, domain, dataTree, inclusionProver, 3)
+	addVertices(t, serverStore, serverHG, dataTree, extraUpdates...)
+
+	_, err := serverHG.Commit(100)
+	require.NoError(t, err)
+
+	_, err = serverHG.Commit(101)
+	require.NoError(t, err)
+	wg := sync.WaitGroup{}
+	wg.Add(100)
+	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	for i := 0; i < len(clientHGs); i++ {
+		go func(idx int) {
+			defer wg.Done()
+
+			_, err = clientHGs[idx].Commit(100)
+			require.NoError(t, err)
+			// Final sync to catch up.
+			conn, client := dialClient()
+			streamCtx, cancelStream := context.WithTimeout(
+				context.Background(),
+				100*time.Second,
+			)
+			stream, err := client.HyperStream(streamCtx)
+			require.NoError(t, err)
+			err = clientHGs[idx].Sync(
+				stream,
+				shardKey,
+				protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+			)
+			require.NoError(t, err)
+			require.NoError(t, stream.CloseSend())
+			cancelStream()
+			conn.Close()
+
+			_, err = clientHGs[idx].Commit(101)
+			require.NoError(t, err)
+			clientRoot := clientHGs[idx].GetVertexAddsSet(shardKey).GetTree().Commit(false)
+			assert.Equal(t, serverRoot, clientRoot, "client should converge to server state")
+		}(i)
+	}
+	wg.Wait()
+}
+
+func buildDataTree(
+	t *testing.T,
+	enc *verenc.MPCitHVerifiableEncryptor,
+	prover *bls48581.KZGInclusionProver,
+) *crypto.VectorCommitmentTree {
+	t.Helper()
+
+	pub, _, _ := ed448.GenerateKey(rand.Reader)
+	data := enc.Encrypt(make([]byte, 20), pub)
+	verenc1 := data[0].Compress()
+	tree := &crypto.VectorCommitmentTree{}
+	for _, encrypted := range []application.Encrypted{verenc1} {
+		bytes := encrypted.ToBytes()
+		id := sha512.Sum512(bytes)
+		tree.Insert(id[:], bytes, encrypted.GetStatement(), big.NewInt(int64(len(bytes))))
+	}
+	tree.Commit(prover, false)
+	return tree
+}
+
+func addVertices(
+	t *testing.T,
+	hStore *store.PebbleHypergraphStore,
+	hg *hgcrdt.HypergraphCRDT,
+	dataTree *crypto.VectorCommitmentTree,
+	vertices ...application.Vertex,
+) {
+	t.Helper()
+
+	txn, err := hStore.NewTransaction(false)
+	require.NoError(t, err)
+	for _, v := range vertices {
+		id := v.GetID()
+		require.NoError(t, hStore.SaveVertexTree(txn, id[:], dataTree))
+		require.NoError(t, hg.AddVertex(txn, v))
+	}
+	require.NoError(t, txn.Commit())
+}
+
+func generateVertices(
+	t *testing.T,
+	appAddress [32]byte,
+	dataTree *crypto.VectorCommitmentTree,
+	prover *bls48581.KZGInclusionProver,
+	count int,
+) []application.Vertex {
+	t.Helper()
+
+	verts := make([]application.Vertex, count)
+	for i := 0; i < count; i++ {
+		addr := randomBytes32(t)
+		verts[i] = hgcrdt.NewVertex(
+			appAddress,
+			addr,
+			dataTree.Commit(prover, false),
+			dataTree.GetSize(),
+		)
+	}
+	return verts
+}
+
+func randomBytes32(t *testing.T) [32]byte {
+	t.Helper()
+	var out [32]byte
+	_, err := rand.Read(out[:])
+	require.NoError(t, err)
+	return out
 }
 
 func toUint32Slice(s []int32) []uint32 {

@@ -58,7 +58,7 @@ func TestProverReject_Prove(t *testing.T) {
 
 	// Create the prover reject operation
 	rdfMultiprover := createMockRDFMultiprover()
-	proverReject, err := global.NewProverReject(filter, frameNumber, mockKeyManager, nil, rdfMultiprover)
+	proverReject, err := global.NewProverReject([][]byte{filter}, frameNumber, mockKeyManager, nil, rdfMultiprover)
 	require.NoError(t, err)
 
 	// Call the prove function
@@ -109,7 +109,7 @@ func TestProverReject_Verify(t *testing.T) {
 
 		// Create the prover reject operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverReject, err := global.NewProverReject(filter, rejectFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
+		proverReject, err := global.NewProverReject([][]byte{filter}, rejectFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data manually
@@ -181,7 +181,7 @@ func TestProverReject_Verify(t *testing.T) {
 
 		// Create the prover reject operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverReject, err := global.NewProverReject(filter, rejectFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
+		proverReject, err := global.NewProverReject([][]byte{filter}, rejectFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data manually
@@ -253,7 +253,7 @@ func TestProverReject_Verify(t *testing.T) {
 
 		// Create the prover reject operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverReject, err := global.NewProverReject(filter, rejectFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
+		proverReject, err := global.NewProverReject([][]byte{filter}, rejectFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data manually
@@ -297,7 +297,7 @@ func TestProverReject_Verify(t *testing.T) {
 
 		// Create the prover reject operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverReject, err := global.NewProverReject(filter, frameNumber, mockKeyManager, mockHypergraph, rdfMultiprover)
+		proverReject, err := global.NewProverReject([][]byte{filter}, frameNumber, mockKeyManager, mockHypergraph, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data manually
@@ -367,7 +367,7 @@ func TestProverReject_Verify(t *testing.T) {
 
 		// Create the prover reject operation
 		rdfMultiprover := createMockRDFMultiprover()
-		proverReject, err := global.NewProverReject(filter, rejectFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
+		proverReject, err := global.NewProverReject([][]byte{filter}, rejectFrame, mockKeyManager, mockHypergraph, rdfMultiprover)
 		require.NoError(t, err)
 
 		// Set up the signature data manually
@@ -398,7 +398,7 @@ func TestProverReject_GetCost(t *testing.T) {
 
 	// Create the prover reject operation
 	rdfMultiprover := createMockRDFMultiprover()
-	proverReject, err := global.NewProverReject(filter, frameNumber, mockKeyManager, nil, rdfMultiprover)
+	proverReject, err := global.NewProverReject([][]byte{filter}, frameNumber, mockKeyManager, nil, rdfMultiprover)
 	require.NoError(t, err)
 
 	// Set up the signature data manually

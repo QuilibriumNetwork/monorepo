@@ -528,6 +528,7 @@ type TreeBackingStore interface {
 		shardAddress []byte,
 	) ([]byte, error)
 	GetRootCommits(frameNumber uint64) (map[ShardKey][][]byte, error)
+	NewSnapshot() (TreeBackingStore, func(), error)
 }
 
 // LazyVectorCommitmentTree is a lazy-loaded (from a TreeBackingStore based
@@ -562,6 +563,74 @@ func (t *LazyVectorCommitmentTree) PruneUncoveredBranches() error {
 		t.ShardKey,
 		t.CoveredPrefix,
 	)
+}
+
+func (t *LazyVectorCommitmentTree) CloneWithStore(
+	store TreeBackingStore,
+) *LazyVectorCommitmentTree {
+	if t == nil {
+		return nil
+	}
+
+	t.treeMx.RLock()
+	defer t.treeMx.RUnlock()
+
+	clone := *t
+	clone.Store = store
+	clone.Root = cloneLazyNode(t.Root, store)
+	return &clone
+}
+
+func cloneLazyNode(
+	node LazyVectorCommitmentNode,
+	store TreeBackingStore,
+) LazyVectorCommitmentNode {
+	if node == nil {
+		return nil
+	}
+
+	switch n := node.(type) {
+	case *LazyVectorCommitmentLeafNode:
+		leaf := *n
+		if n.Key != nil {
+			leaf.Key = slices.Clone(n.Key)
+		}
+		if n.Value != nil {
+			leaf.Value = slices.Clone(n.Value)
+		}
+		if n.HashTarget != nil {
+			leaf.HashTarget = slices.Clone(n.HashTarget)
+		}
+		if n.Commitment != nil {
+			leaf.Commitment = slices.Clone(n.Commitment)
+		}
+		if n.Size != nil {
+			leaf.Size = new(big.Int).Set(n.Size)
+		}
+		leaf.Store = store
+		return &leaf
+	case *LazyVectorCommitmentBranchNode:
+		branch := *n
+		if n.Prefix != nil {
+			branch.Prefix = slices.Clone(n.Prefix)
+		}
+		if n.FullPrefix != nil {
+			branch.FullPrefix = slices.Clone(n.FullPrefix)
+		}
+		if n.Commitment != nil {
+			branch.Commitment = slices.Clone(n.Commitment)
+		}
+		if n.Size != nil {
+			branch.Size = new(big.Int).Set(n.Size)
+		}
+		for i := range branch.Children {
+			branch.Children[i] = cloneLazyNode(n.Children[i], store)
+		}
+		branch.Store = store
+		return &branch
+	default:
+		return nil
+	}
 }
 
 // InsertBranchSkeleton writes a branch node at fullPrefix with the given
