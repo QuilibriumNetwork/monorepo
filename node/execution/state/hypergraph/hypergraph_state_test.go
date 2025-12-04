@@ -47,6 +47,7 @@ func setupTest(t *testing.T) (*hypergraph.HypergraphState, thypergraph.Hypergrap
 		incProver,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	st := hypergraph.NewHypergraphState(hg)
 
@@ -96,6 +97,7 @@ func TestHypergraphState(t *testing.T) {
 			incProver,
 			[]int{},
 			&tests.Nopthenticator{},
+			200,
 		)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()

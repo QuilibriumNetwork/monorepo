@@ -16,6 +16,36 @@ type MockClockStore struct {
 	mock.Mock
 }
 
+// RangeStagedShardClockFrames implements store.ClockStore.
+func (m *MockClockStore) RangeStagedShardClockFrames(
+	filter []byte,
+	startFrameNumber uint64,
+	endFrameNumber uint64,
+) (store.TypedIterator[*protobufs.AppShardFrame], error) {
+	args := m.Called(
+		filter,
+		startFrameNumber,
+		endFrameNumber,
+	)
+
+	return args.Get(0).(store.TypedIterator[*protobufs.AppShardFrame]),
+		args.Error(1)
+}
+
+// RangeGlobalClockFrameCandidates implements store.ClockStore.
+func (m *MockClockStore) RangeGlobalClockFrameCandidates(
+	startFrameNumber uint64,
+	endFrameNumber uint64,
+) (store.TypedIterator[*protobufs.GlobalFrame], error) {
+	args := m.Called(
+		startFrameNumber,
+		endFrameNumber,
+	)
+
+	return args.Get(0).(store.TypedIterator[*protobufs.GlobalFrame]),
+		args.Error(1)
+}
+
 // GetGlobalClockFrameCandidate implements store.ClockStore.
 func (m *MockClockStore) GetGlobalClockFrameCandidate(
 	frameNumber uint64,

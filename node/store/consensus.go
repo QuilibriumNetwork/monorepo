@@ -41,7 +41,7 @@ func (p *PebbleConsensusStore) GetConsensusState(filter []byte) (
 	)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
+			return nil, store.ErrNotFound
 		}
 
 		return nil, errors.Wrap(err, "get consensus state")
@@ -119,7 +119,7 @@ func (p *PebbleConsensusStore) GetLivenessState(filter []byte) (
 	)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
+			return nil, store.ErrNotFound
 		}
 
 		return nil, errors.Wrap(err, "get liveness state")

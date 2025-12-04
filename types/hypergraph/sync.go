@@ -10,6 +10,8 @@ type SyncController struct {
 	globalSync atomic.Bool
 	statusMu   sync.RWMutex
 	syncStatus map[string]*SyncInfo
+	maxActiveSessions int32
+	activeSessions    atomic.Int32
 }
 
 func (s *SyncController) TryEstablishSyncSession(peerID string) bool {
@@ -18,7 +20,16 @@ func (s *SyncController) TryEstablishSyncSession(peerID string) bool {
 	}
 
 	info := s.getOrCreate(peerID)
-	return !info.inProgress.Swap(true)
+	if info.inProgress.Swap(true) {
+		return false
+	}
+
+	if !s.incrementActiveSessions() {
+		info.inProgress.Store(false)
+		return false
+	}
+
+	return true
 }
 
 func (s *SyncController) EndSyncSession(peerID string) {
@@ -31,7 +42,9 @@ func (s *SyncController) EndSyncSession(peerID string) {
 	info := s.syncStatus[peerID]
 	s.statusMu.RUnlock()
 	if info != nil {
-		info.inProgress.Store(false)
+		if info.inProgress.Swap(false) {
+			s.decrementActiveSessions()
+		}
 	}
 }
 
@@ -71,8 +84,45 @@ type SyncInfo struct {
 	inProgress  atomic.Bool
 }
 
-func NewSyncController() *SyncController {
+func NewSyncController(maxActiveSessions int) *SyncController {
+	var max int32
+	if maxActiveSessions > 0 {
+		max = int32(maxActiveSessions)
+	}
 	return &SyncController{
-		syncStatus: map[string]*SyncInfo{},
+		syncStatus:        map[string]*SyncInfo{},
+		maxActiveSessions: max,
+	}
+}
+
+func (s *SyncController) incrementActiveSessions() bool {
+	if s.maxActiveSessions <= 0 {
+		return true
+	}
+
+	for {
+		current := s.activeSessions.Load()
+		if current >= s.maxActiveSessions {
+			return false
+		}
+		if s.activeSessions.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (s *SyncController) decrementActiveSessions() {
+	if s.maxActiveSessions <= 0 {
+		return
+	}
+
+	for {
+		current := s.activeSessions.Load()
+		if current == 0 {
+			return
+		}
+		if s.activeSessions.CompareAndSwap(current, current-1) {
+			return
+		}
 	}
 }

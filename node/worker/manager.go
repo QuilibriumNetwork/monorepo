@@ -21,7 +21,6 @@ import (
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
-	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	typesStore "source.quilibrium.com/quilibrium/monorepo/types/store"
@@ -309,7 +308,7 @@ func (w *WorkerManager) registerWorker(info *typesStore.WorkerInfo) error {
 	existing, err := w.store.GetWorker(info.CoreId)
 	creating := false
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, typesStore.ErrNotFound) {
 			creating = true
 		} else {
 			workerOperationsTotal.WithLabelValues("register", "error").Inc()
@@ -408,7 +407,7 @@ func (w *WorkerManager) AllocateWorker(coreId uint, filter []byte) error {
 	worker, err := w.store.GetWorker(coreId)
 	if err != nil {
 		workerOperationsTotal.WithLabelValues("allocate", "error").Inc()
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, typesStore.ErrNotFound) {
 			return errors.Wrap(
 				errors.New("worker not found"),
 				"allocate worker",
@@ -486,7 +485,7 @@ func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 	worker, err := w.store.GetWorker(coreId)
 	if err != nil {
 		workerOperationsTotal.WithLabelValues("deallocate", "error").Inc()
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, typesStore.ErrNotFound) {
 			return errors.New("worker not found")
 		}
 		return errors.Wrap(err, "deallocate worker")
@@ -572,7 +571,7 @@ func (w *WorkerManager) GetWorkerIdByFilter(filter []byte) (uint, error) {
 	// Fallback to store
 	worker, err := w.store.GetWorkerByFilter(filter)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, typesStore.ErrNotFound) {
 			return 0, errors.Wrap(
 				errors.New("no worker found for filter"),
 				"get worker id by filter",
@@ -608,7 +607,7 @@ func (w *WorkerManager) GetFilterByWorkerId(coreId uint) ([]byte, error) {
 	// Fallback to store
 	worker, err := w.store.GetWorker(coreId)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, typesStore.ErrNotFound) {
 			return nil, errors.Wrap(
 				errors.New("worker not found"),
 				"get filter by worker id",
@@ -849,7 +848,7 @@ func (w *WorkerManager) ensureWorkerRegistered(
 	if err == nil {
 		return nil
 	}
-	if !errors.Is(err, store.ErrNotFound) {
+	if !errors.Is(err, typesStore.ErrNotFound) {
 		return err
 	}
 

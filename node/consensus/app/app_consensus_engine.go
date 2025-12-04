@@ -132,6 +132,7 @@ type AppConsensusEngine struct {
 	ctx                       lifecycle.SignalerContext
 	cancel                    context.CancelFunc
 	quit                      chan struct{}
+	frameChainChecker         *AppFrameChainChecker
 	canRunStandalone          bool
 	blacklistMap              map[string]bool
 	currentRank               uint64
@@ -264,7 +265,7 @@ func NewAppConsensusEngine(
 		proofCache:                 make(map[uint64][516]byte),
 		collectedMessages:          []*protobufs.Message{},
 		provingMessages:            []*protobufs.Message{},
-		appMessageSpillover:       make(map[uint64][]*protobufs.Message),
+		appMessageSpillover:        make(map[uint64][]*protobufs.Message),
 		consensusMessageQueue:      make(chan *pb.Message, 1000),
 		proverMessageQueue:         make(chan *pb.Message, 1000),
 		frameMessageQueue:          make(chan *pb.Message, 100),
@@ -278,6 +279,8 @@ func NewAppConsensusEngine(
 		alertPublicKey:             []byte{},
 		peerAuthCache:              make(map[string]time.Time),
 	}
+
+	engine.frameChainChecker = NewAppFrameChainChecker(clockStore, logger, appAddress)
 
 	keyId := "q-prover-key"
 
@@ -743,6 +746,13 @@ func NewAppConsensusEngine(
 	})
 
 	engine.ComponentManager = componentBuilder.Build()
+	if hgWithShutdown, ok := engine.hyperSync.(interface {
+		SetShutdownContext(context.Context)
+	}); ok {
+		hgWithShutdown.SetShutdownContext(
+			contextFromShutdownSignal(engine.ShutdownSignal()),
+		)
+	}
 
 	return engine, nil
 }
@@ -996,6 +1006,18 @@ func (e *AppConsensusEngine) materialize(
 	}
 
 	return nil
+}
+
+func contextFromShutdownSignal(sig <-chan struct{}) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		if sig == nil {
+			return
+		}
+		<-sig
+		cancel()
+	}()
+	return ctx
 }
 
 func (e *AppConsensusEngine) getPeerID() PeerID {
@@ -2699,7 +2721,7 @@ func (e *AppConsensusEngine) getPendingProposals(
 		nextQC, err := e.clockStore.GetQuorumCertificate(e.appAddress, rank)
 		if err != nil {
 			e.logger.Debug("no qc for rank", zap.Error(err))
-			continue
+			break
 		}
 
 		value, err := e.clockStore.GetStagedShardClockFrame(
@@ -2710,8 +2732,7 @@ func (e *AppConsensusEngine) getPendingProposals(
 		)
 		if err != nil {
 			e.logger.Debug("no frame for qc", zap.Error(err))
-			parent = nextQC
-			continue
+			break
 		}
 
 		var priorTCModel models.TimeoutCertificate = nil

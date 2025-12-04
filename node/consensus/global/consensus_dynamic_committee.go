@@ -141,7 +141,7 @@ func (e *GlobalConsensusEngine) QuorumThresholdForRank(
 		total += p.Seniority
 	}
 
-	return (total * 2) / 3, nil
+	return (total * 4) / 6, nil
 }
 
 // Self implements consensus.DynamicCommittee.
@@ -163,7 +163,7 @@ func (e *GlobalConsensusEngine) TimeoutThresholdForRank(
 		total += p.Seniority
 	}
 
-	return (total * 2) / 3, nil
+	return (total * 4) / 6, nil
 }
 
 func internalProversToWeightedIdentity(

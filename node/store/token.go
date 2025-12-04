@@ -117,7 +117,7 @@ func (p *PebbleTokenStore) GetCoinsForOwner(
 	)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			err = ErrNotFound
+			err = store.ErrNotFound
 			return nil, nil, nil, err
 		}
 		err = errors.Wrap(err, "get coins for owner")
@@ -156,7 +156,7 @@ func (p *PebbleTokenStore) GetCoinByAddress(
 	coinBytes, closer, err := p.db.Get(coinKey(address))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			err = ErrNotFound
+			err = store.ErrNotFound
 			return 0, nil, err
 		}
 		err = errors.Wrap(err, "get coin by address")
@@ -297,7 +297,7 @@ func (p *PebbleTokenStore) GetPendingTransactionByAddress(
 	)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			err = ErrNotFound
+			err = store.ErrNotFound
 			return nil, err
 		}
 		err = errors.Wrap(err, "get pending transaction by address")
@@ -325,7 +325,7 @@ func (p *PebbleTokenStore) GetPendingTransactionsForOwner(
 	)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			err = ErrNotFound
+			err = store.ErrNotFound
 			return nil, err
 		}
 		err = errors.Wrap(err, "get pending transactions for owner")
@@ -355,7 +355,7 @@ func (p *PebbleTokenStore) GetTransactionByAddress(
 	txnBytes, closer, err := p.db.Get(transactionKey(domain, address))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			err = ErrNotFound
+			err = store.ErrNotFound
 			return nil, err
 		}
 		err = errors.Wrap(err, "get transaction by address")
@@ -383,7 +383,7 @@ func (p *PebbleTokenStore) GetTransactionsForOwner(
 	)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			err = ErrNotFound
+			err = store.ErrNotFound
 			return nil, err
 		}
 		err = errors.Wrap(err, "get transactions for owner")

@@ -96,7 +96,10 @@ func (e *GlobalConsensusEngine) GetGlobalProposal(
 		zap.Uint64("frame_number", request.FrameNumber),
 		zap.String("peer_id", peerID.String()),
 	)
-	frame, err := e.clockStore.GetGlobalClockFrame(request.FrameNumber)
+	frame, err := e.loadFrameMatchingSelector(
+		request.FrameNumber,
+		nil,
+	)
 	if err != nil {
 		return &protobufs.GlobalProposalResponse{}, nil
 	}
@@ -110,7 +113,10 @@ func (e *GlobalConsensusEngine) GetGlobalProposal(
 		return &protobufs.GlobalProposalResponse{}, nil
 	}
 
-	parent, err := e.clockStore.GetGlobalClockFrame(request.FrameNumber - 1)
+	parent, err := e.loadFrameMatchingSelector(
+		request.FrameNumber-1,
+		frame.Header.ParentSelector,
+	)
 	if err != nil {
 		e.logger.Debug(
 			"received error while fetching global frame parent",
@@ -145,6 +151,51 @@ func (e *GlobalConsensusEngine) GetGlobalProposal(
 	return &protobufs.GlobalProposalResponse{
 		Proposal: proposal,
 	}, nil
+}
+
+func (e *GlobalConsensusEngine) loadFrameMatchingSelector(
+	frameNumber uint64,
+	expectedSelector []byte,
+) (*protobufs.GlobalFrame, error) {
+	matchesSelector := func(frame *protobufs.GlobalFrame) bool {
+		if frame == nil || frame.Header == nil || len(expectedSelector) == 0 {
+			return true
+		}
+		return bytes.Equal([]byte(frame.Identity()), expectedSelector)
+	}
+
+	frame, err := e.clockStore.GetGlobalClockFrame(frameNumber)
+	if err == nil && matchesSelector(frame) {
+		return frame, nil
+	}
+
+	iter, iterErr := e.clockStore.RangeGlobalClockFrameCandidates(
+		frameNumber,
+		frameNumber,
+	)
+	if iterErr != nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, iterErr
+	}
+	defer iter.Close()
+
+	for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
+		candidate, valErr := iter.Value()
+		if valErr != nil {
+			return nil, valErr
+		}
+		if matchesSelector(candidate) {
+			return candidate, nil
+		}
+	}
+
+	if err == nil && matchesSelector(frame) {
+		return frame, nil
+	}
+
+	return nil, store.ErrNotFound
 }
 
 func (e *GlobalConsensusEngine) GetAppShards(

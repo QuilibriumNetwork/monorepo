@@ -465,6 +465,7 @@ func (p *PebbleHypergraphStore) SetCoveredPrefix(coveredPrefix []int) error {
 
 func (p *PebbleHypergraphStore) LoadHypergraph(
 	authenticationProvider channel.AuthenticationProvider,
+	maxSyncSessions int,
 ) (
 	hypergraph.Hypergraph,
 	error,
@@ -491,6 +492,7 @@ func (p *PebbleHypergraphStore) LoadHypergraph(
 		p.prover,
 		coveredPrefix,
 		authenticationProvider,
+		maxSyncSessions,
 	)
 
 	vertexAddsIter, err := p.db.NewIter(

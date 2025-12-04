@@ -91,7 +91,7 @@ func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config
 	mpCitHVerifiableEncryptor := newVerifiableEncryptor()
 	kzgInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	pebbleHypergraphStore := store2.NewPebbleHypergraphStore(dbConfig, pebbleDB, logger, mpCitHVerifiableEncryptor, kzgInclusionProver)
-	hypergraph, err := provideHypergraph(pebbleHypergraphStore)
+	hypergraph, err := provideHypergraph(pebbleHypergraphStore, config2)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +151,7 @@ func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Con
 	mpCitHVerifiableEncryptor := newVerifiableEncryptor()
 	kzgInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	pebbleHypergraphStore := store2.NewPebbleHypergraphStore(dbConfig, pebbleDB, logger, mpCitHVerifiableEncryptor, kzgInclusionProver)
-	hypergraph, err := provideHypergraph(pebbleHypergraphStore)
+	hypergraph, err := provideHypergraph(pebbleHypergraphStore, config2)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +205,7 @@ func NewMasterNode(logger *zap.Logger, config2 *config.Config, coreId uint) (*Ma
 	mpCitHVerifiableEncryptor := newVerifiableEncryptor()
 	kzgInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	pebbleHypergraphStore := store2.NewPebbleHypergraphStore(dbConfig, pebbleDB, logger, mpCitHVerifiableEncryptor, kzgInclusionProver)
-	hypergraph, err := provideHypergraph(pebbleHypergraphStore)
+	hypergraph, err := provideHypergraph(pebbleHypergraphStore, config2)
 	if err != nil {
 		return nil, err
 	}
@@ -301,9 +301,13 @@ var engineSet = wire.NewSet(vdf.NewCachedWesolowskiFrameProver, bls48581.NewKZGI
 ),
 )
 
-func provideHypergraph(store3 *store2.PebbleHypergraphStore,
+func provideHypergraph(store3 *store2.PebbleHypergraphStore, config *config.Config,
 ) (hypergraph.Hypergraph, error) {
-	return store3.LoadHypergraph(&tests.Nopthenticator{})
+	workers := 1
+	if config.Engine.ArchiveMode {
+		workers = 100
+	}
+	return store3.LoadHypergraph(&tests.Nopthenticator{}, workers)
 }
 
 var hypergraphSet = wire.NewSet(

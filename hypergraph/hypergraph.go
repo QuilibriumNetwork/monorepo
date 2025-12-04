@@ -1,6 +1,7 @@
 package hypergraph
 
 import (
+	"context"
 	"math/big"
 	"sync"
 
@@ -53,6 +54,8 @@ type HypergraphCRDT struct {
 
 	// provides context-driven info for client identification
 	authenticationProvider channel.AuthenticationProvider
+
+	shutdownCtx context.Context
 }
 
 var _ hypergraph.Hypergraph = (*HypergraphCRDT)(nil)
@@ -67,6 +70,7 @@ func NewHypergraph(
 	prover crypto.InclusionProver,
 	coveredPrefix []int,
 	authenticationProvider channel.AuthenticationProvider,
+	maxSyncSessions int,
 ) *HypergraphCRDT {
 	hg := &HypergraphCRDT{
 		logger:                 logger,
@@ -79,7 +83,7 @@ func NewHypergraph(
 		prover:                 prover,
 		coveredPrefix:          coveredPrefix,
 		authenticationProvider: authenticationProvider,
-		syncController:         hypergraph.NewSyncController(),
+		syncController:         hypergraph.NewSyncController(maxSyncSessions),
 		snapshotMgr:            newSnapshotManager(logger),
 	}
 
@@ -114,6 +118,29 @@ func (hg *HypergraphCRDT) cloneSetWithStore(
 		return typed.cloneWithStore(store)
 	}
 	return set
+}
+
+func (hg *HypergraphCRDT) SetShutdownContext(ctx context.Context) {
+	hg.shutdownCtx = ctx
+}
+
+func (hg *HypergraphCRDT) contextWithShutdown(
+	parent context.Context,
+) (context.Context, context.CancelFunc) {
+	if hg.shutdownCtx == nil {
+		return parent, func() {}
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-hg.shutdownCtx.Done():
+			cancel()
+		}
+	}()
+
+	return ctx, cancel
 }
 
 func (hg *HypergraphCRDT) snapshotSet(

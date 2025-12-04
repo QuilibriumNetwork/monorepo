@@ -954,9 +954,14 @@ func (e *GlobalConsensusEngine) handleGlobalProposal(
 	finalizedFrameNumber := (*finalized.State).Header.FrameNumber
 	frameNumber := proposal.State.Header.FrameNumber
 
-	// drop proposals if we already processed them
+	// drop proposals if we already processed them, unless we need to
+	// rehydrate the finalized frame in persistence
 	if frameNumber <= finalizedFrameNumber ||
 		proposal.State.Header.Rank <= finalizedRank {
+		if e.tryRecoverFinalizedFrame(proposal, finalized) {
+			return
+		}
+
 		e.logger.Debug(
 			"dropping stale (lower than finalized) proposal",
 			zap.Uint64("finalized_rank", finalizedRank),
@@ -988,13 +993,11 @@ func (e *GlobalConsensusEngine) handleGlobalProposal(
 	// if we have a parent, cache and move on
 	if proposal.State.Header.FrameNumber != 0 {
 		// also check with persistence layer
-		parent, err := e.clockStore.GetGlobalClockFrame(
-			proposal.State.Header.FrameNumber - 1,
-		)
-		if err != nil || !bytes.Equal(
-			[]byte(parent.Identity()),
+		_, err := e.clockStore.GetGlobalClockFrameCandidate(
+			proposal.State.Header.FrameNumber-1,
 			proposal.State.Header.ParentSelector,
-		) {
+		)
+		if err != nil {
 			e.logger.Debug(
 				"parent frame not stored, requesting sync",
 				zap.Uint64("rank", proposal.GetRank()),
@@ -1022,37 +1025,68 @@ func (e *GlobalConsensusEngine) handleGlobalProposal(
 		}
 	}
 
-	expectedFrame, err := e.clockStore.GetLatestGlobalClockFrame()
-	if err != nil {
-		e.logger.Error("could not obtain latest global frame", zap.Error(err))
-		return
-	}
-
-	expectedFrameNumber := expectedFrame.Header.FrameNumber + 1
-
-	if frameNumber < expectedFrameNumber {
-		e.logger.Debug(
-			"dropping proposal behind expected frame",
-			zap.Uint64("frame_number", frameNumber),
-			zap.Uint64("expected_frame_number", expectedFrameNumber),
-		)
-		return
-	}
-
-	if frameNumber == expectedFrameNumber {
+	if e.frameChainChecker != nil &&
+		e.frameChainChecker.CanProcessSequentialChain(finalized, proposal) {
 		e.deleteCachedProposal(frameNumber)
 		if e.processProposal(proposal) {
 			e.drainProposalCache(frameNumber + 1)
 			return
 		}
 
-		e.logger.Debug("failed to process expected proposal, caching")
+		e.logger.Debug("failed to process sequential proposal, caching")
 		e.cacheProposal(proposal)
 		return
 	}
 
 	e.cacheProposal(proposal)
-	e.drainProposalCache(expectedFrameNumber)
+}
+
+func (e *GlobalConsensusEngine) tryRecoverFinalizedFrame(
+	proposal *protobufs.GlobalProposal,
+	finalized *models.State[*protobufs.GlobalFrame],
+) bool {
+	if proposal == nil ||
+		proposal.State == nil ||
+		proposal.State.Header == nil ||
+		finalized == nil ||
+		finalized.State == nil ||
+		(*finalized.State).Header == nil {
+		return false
+	}
+
+	frameNumber := proposal.State.Header.FrameNumber
+	finalizedFrameNumber := (*finalized.State).Header.FrameNumber
+	if frameNumber != finalizedFrameNumber {
+		return false
+	}
+
+	if !bytes.Equal(
+		[]byte(finalized.Identifier),
+		[]byte(proposal.State.Identity()),
+	) {
+		e.logger.Warn(
+			"received conflicting finalized frame during sync",
+			zap.Uint64("finalized_frame_number", finalizedFrameNumber),
+			zap.String(
+				"expected",
+				hex.EncodeToString([]byte(finalized.Identifier)),
+			),
+			zap.String(
+				"received",
+				hex.EncodeToString([]byte(proposal.State.Identity())),
+			),
+		)
+		return true
+	}
+
+	e.registerPendingCertifiedParent(proposal)
+
+	e.logger.Debug(
+		"cached finalized frame for descendant processing",
+		zap.Uint64("frame_number", frameNumber),
+	)
+
+	return true
 }
 
 func (e *GlobalConsensusEngine) processProposal(
@@ -1265,6 +1299,19 @@ func (e *GlobalConsensusEngine) trySealParentWithChild(
 			"pending parent selector mismatch, dropping entry",
 			zap.Uint64("parent_frame", parent.State.Header.FrameNumber),
 			zap.Uint64("child_frame", header.FrameNumber),
+		)
+		e.pendingCertifiedParentsMu.Lock()
+		delete(e.pendingCertifiedParents, parentFrame)
+		e.pendingCertifiedParentsMu.Unlock()
+		return
+	}
+
+	finalized := e.forks.FinalizedState()
+	if finalized != nil && finalized.State != nil &&
+		parentFrame <= (*finalized.State).Header.FrameNumber {
+		e.logger.Debug(
+			"skipping sealing for already finalized parent",
+			zap.Uint64("parent_frame", parentFrame),
 		)
 		e.pendingCertifiedParentsMu.Lock()
 		delete(e.pendingCertifiedParents, parentFrame)

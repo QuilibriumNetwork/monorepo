@@ -28,7 +28,20 @@ type PebbleGlobalClockIterator struct {
 	db *PebbleClockStore
 }
 
+type PebbleGlobalClockCandidateIterator struct {
+	i  store.Iterator
+	db *PebbleClockStore
+}
+
 type PebbleClockIterator struct {
+	filter []byte
+	start  uint64
+	end    uint64
+	cur    uint64
+	db     *PebbleClockStore
+}
+
+type PebbleStagedShardFrameIterator struct {
 	filter []byte
 	start  uint64
 	end    uint64
@@ -66,7 +79,9 @@ type PebbleTimeoutCertificateIterator struct {
 }
 
 var _ store.TypedIterator[*protobufs.GlobalFrame] = (*PebbleGlobalClockIterator)(nil)
+var _ store.TypedIterator[*protobufs.GlobalFrame] = (*PebbleGlobalClockCandidateIterator)(nil)
 var _ store.TypedIterator[*protobufs.AppShardFrame] = (*PebbleClockIterator)(nil)
+var _ store.TypedIterator[*protobufs.AppShardFrame] = (*PebbleStagedShardFrameIterator)(nil)
 var _ store.TypedIterator[*protobufs.GlobalProposal] = (*PebbleGlobalStateIterator)(nil)
 var _ store.TypedIterator[*protobufs.AppShardProposal] = (*PebbleAppShardStateIterator)(nil)
 var _ store.TypedIterator[*protobufs.QuorumCertificate] = (*PebbleQuorumCertificateIterator)(nil)
@@ -165,6 +180,95 @@ func (p *PebbleGlobalClockIterator) Close() error {
 	return errors.Wrap(p.i.Close(), "closing global clock iterator")
 }
 
+func (p *PebbleGlobalClockCandidateIterator) First() bool {
+	return p.i.First()
+}
+
+func (p *PebbleGlobalClockCandidateIterator) Next() bool {
+	return p.i.Next()
+}
+
+func (p *PebbleGlobalClockCandidateIterator) Valid() bool {
+	return p.i.Valid()
+}
+
+func (p *PebbleGlobalClockCandidateIterator) Value() (
+	*protobufs.GlobalFrame,
+	error,
+) {
+	if !p.i.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	key := p.i.Key()
+	value := p.i.Value()
+
+	frameNumber, selector, err := extractFrameNumberAndSelectorFromCandidateKey(key)
+	if err != nil {
+		return nil, errors.Wrap(err, "get candidate clock frame iterator value")
+	}
+
+	header := &protobufs.GlobalFrameHeader{}
+	if err := proto.Unmarshal(value, header); err != nil {
+		return nil, errors.Wrap(err, "get candidate clock frame iterator value")
+	}
+
+	frame := &protobufs.GlobalFrame{
+		Header: header,
+	}
+
+	var requests []*protobufs.MessageBundle
+	requestIndex := uint16(0)
+	for {
+		requestKey := clockGlobalFrameRequestCandidateKey(
+			selector,
+			frameNumber,
+			requestIndex,
+		)
+		requestData, closer, err := p.db.db.Get(requestKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				break
+			}
+			return nil, errors.Wrap(err, "get candidate clock frame iterator value")
+		}
+		defer closer.Close()
+
+		request := &protobufs.MessageBundle{}
+		if err := proto.Unmarshal(requestData, request); err != nil {
+			return nil, errors.Wrap(err, "get candidate clock frame iterator value")
+		}
+
+		requests = append(requests, request)
+		requestIndex++
+	}
+
+	frame.Requests = requests
+
+	return frame, nil
+}
+
+func (p *PebbleGlobalClockCandidateIterator) TruncatedValue() (
+	*protobufs.GlobalFrame,
+	error,
+) {
+	if !p.i.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	value := p.i.Value()
+	header := &protobufs.GlobalFrameHeader{}
+	if err := proto.Unmarshal(value, header); err != nil {
+		return nil, errors.Wrap(err, "get candidate clock frame iterator value")
+	}
+
+	return &protobufs.GlobalFrame{Header: header}, nil
+}
+
+func (p *PebbleGlobalClockCandidateIterator) Close() error {
+	return errors.Wrap(p.i.Close(), "closing global clock candidate iterator")
+}
+
 func (p *PebbleClockIterator) First() bool {
 	p.cur = p.start
 	return true
@@ -206,6 +310,46 @@ func (p *PebbleClockIterator) Value() (*protobufs.AppShardFrame, error) {
 	}
 
 	return frame, nil
+}
+
+func (p *PebbleStagedShardFrameIterator) First() bool {
+	p.cur = p.start
+	return true
+}
+
+func (p *PebbleStagedShardFrameIterator) Next() bool {
+	p.cur++
+	return p.cur <= p.end
+}
+
+func (p *PebbleStagedShardFrameIterator) Valid() bool {
+	return p.cur >= p.start && p.cur <= p.end
+}
+
+func (p *PebbleStagedShardFrameIterator) Value() (*protobufs.AppShardFrame, error) {
+	if !p.Valid() {
+		return nil, store.ErrNotFound
+	}
+
+	frames, err := p.db.GetStagedShardClockFramesForFrameNumber(p.filter, p.cur)
+	if err != nil {
+		return nil, errors.Wrap(err, "get staged shard clocks")
+	}
+	if len(frames) == 0 {
+		return nil, store.ErrNotFound
+	}
+	return frames[len(frames)-1], nil
+}
+
+func (p *PebbleStagedShardFrameIterator) TruncatedValue() (
+	*protobufs.AppShardFrame,
+	error,
+) {
+	return p.Value()
+}
+
+func (p *PebbleStagedShardFrameIterator) Close() error {
+	return nil
 }
 
 func (p *PebbleClockIterator) Close() error {
@@ -554,6 +698,23 @@ func extractFrameNumberFromGlobalFrameKey(
 	return binary.BigEndian.Uint64(copied[2:10]), nil
 }
 
+func extractFrameNumberAndSelectorFromCandidateKey(
+	key []byte,
+) (uint64, []byte, error) {
+	frameNumber, err := extractFrameNumberFromGlobalFrameKey(key)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(key) < 10 {
+		return 0, nil, errors.Wrap(
+			store.ErrInvalidData,
+			"extract selector from global frame candidate key",
+		)
+	}
+	selector := slices.Clone(key[10:])
+	return frameNumber, selector, nil
+}
+
 func clockShardFrameKey(
 	filter []byte,
 	frameNumber uint64,
@@ -894,6 +1055,28 @@ func (p *PebbleClockStore) RangeGlobalClockFrames(
 	}
 
 	return &PebbleGlobalClockIterator{i: iter, db: p}, nil
+}
+
+// RangeGlobalClockFrameCandidates implements ClockStore.
+func (p *PebbleClockStore) RangeGlobalClockFrameCandidates(
+	startFrameNumber uint64,
+	endFrameNumber uint64,
+) (store.TypedIterator[*protobufs.GlobalFrame], error) {
+	if startFrameNumber > endFrameNumber {
+		temp := endFrameNumber
+		endFrameNumber = startFrameNumber
+		startFrameNumber = temp
+	}
+
+	iter, err := p.db.NewIter(
+		clockGlobalFrameCandidateKey(startFrameNumber, nil),
+		clockGlobalFrameCandidateKey(endFrameNumber+1, nil),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "range global clock frame candidates")
+	}
+
+	return &PebbleGlobalClockCandidateIterator{i: iter, db: p}, nil
 }
 
 // PutGlobalClockFrame implements ClockStore.
@@ -1365,6 +1548,24 @@ func (p *PebbleClockStore) RangeShardClockFrames(
 		filter: filter,
 		start:  startFrameNumber,
 		end:    endFrameNumber + 1,
+		cur:    startFrameNumber,
+		db:     p,
+	}, nil
+}
+
+func (p *PebbleClockStore) RangeStagedShardClockFrames(
+	filter []byte,
+	startFrameNumber uint64,
+	endFrameNumber uint64,
+) (store.TypedIterator[*protobufs.AppShardFrame], error) {
+	if startFrameNumber > endFrameNumber {
+		startFrameNumber, endFrameNumber = endFrameNumber, startFrameNumber
+	}
+
+	return &PebbleStagedShardFrameIterator{
+		filter: filter,
+		start:  startFrameNumber,
+		end:    endFrameNumber,
 		cur:    startFrameNumber,
 		db:     p,
 	}, nil

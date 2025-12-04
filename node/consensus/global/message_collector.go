@@ -245,6 +245,8 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 				bundle.Requests = bundle.Requests[:maxGlobalMessagesPerFrame]
 			}
 
+			e.logBundleRequestTypes(bundle)
+
 			encoded, err := bundle.ToCanonicalBytes()
 			if err != nil {
 				if e.logger != nil {
@@ -261,6 +263,132 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 
 	record := newSequencedGlobalMessage(e.currentRank+1, payload)
 	e.messageAggregator.Add(record)
+}
+
+func (e *GlobalConsensusEngine) logBundleRequestTypes(
+	bundle *protobufs.MessageBundle,
+) {
+	requestTypes := make([]string, 0, len(bundle.Requests))
+	detailFields := make([]zap.Field, 0)
+	for idx, request := range bundle.Requests {
+		typeName, detailField, hasDetail := requestTypeNameAndDetail(idx, request)
+		requestTypes = append(requestTypes, typeName)
+		if hasDetail {
+			detailFields = append(detailFields, detailField)
+		}
+	}
+
+	fields := []zap.Field{
+		zap.Int("request_count", len(bundle.Requests)),
+		zap.Strings("request_types", requestTypes),
+		zap.Int64("bundle_timestamp", bundle.Timestamp),
+	}
+	fields = append(fields, detailFields...)
+
+	e.logger.Debug("collected global request bundle", fields...)
+}
+
+func requestTypeNameAndDetail(
+	idx int,
+	req *protobufs.MessageRequest,
+) (string, zap.Field, bool) {
+	if req == nil || req.GetRequest() == nil {
+		return "nil_request", zap.Field{}, false
+	}
+
+	switch actual := req.GetRequest().(type) {
+	case *protobufs.MessageRequest_Join:
+		return "ProverJoin", zap.Field{}, false
+	case *protobufs.MessageRequest_Leave:
+		return "ProverLeave", zap.Field{}, false
+	case *protobufs.MessageRequest_Pause:
+		return "ProverPause", zap.Field{}, false
+	case *protobufs.MessageRequest_Resume:
+		return "ProverResume", zap.Field{}, false
+	case *protobufs.MessageRequest_Confirm:
+		return "ProverConfirm", zap.Field{}, false
+	case *protobufs.MessageRequest_Reject:
+		return "ProverReject", zap.Field{}, false
+	case *protobufs.MessageRequest_Kick:
+		return "ProverKick", zap.Field{}, false
+	case *protobufs.MessageRequest_Update:
+		return "ProverUpdate",
+			zap.Any(fmt.Sprintf("request_%d_prover_update", idx), actual.Update),
+			true
+	case *protobufs.MessageRequest_TokenDeploy:
+		return "TokenDeploy",
+			zap.Any(fmt.Sprintf("request_%d_token_deploy", idx), actual.TokenDeploy),
+			true
+	case *protobufs.MessageRequest_TokenUpdate:
+		return "TokenUpdate",
+			zap.Any(fmt.Sprintf("request_%d_token_update", idx), actual.TokenUpdate),
+			true
+	case *protobufs.MessageRequest_Transaction:
+		return "Transaction",
+			zap.Any(fmt.Sprintf("request_%d_transaction", idx), actual.Transaction),
+			true
+	case *protobufs.MessageRequest_PendingTransaction:
+		return "PendingTransaction",
+			zap.Any(
+				fmt.Sprintf("request_%d_pending_transaction", idx),
+				actual.PendingTransaction,
+			),
+			true
+	case *protobufs.MessageRequest_MintTransaction:
+		return "MintTransaction",
+			zap.Any(fmt.Sprintf("request_%d_mint_transaction", idx), actual.MintTransaction),
+			true
+	case *protobufs.MessageRequest_HypergraphDeploy:
+		return "HypergraphDeploy",
+			zap.Any(fmt.Sprintf("request_%d_hypergraph_deploy", idx), actual.HypergraphDeploy),
+			true
+	case *protobufs.MessageRequest_HypergraphUpdate:
+		return "HypergraphUpdate",
+			zap.Any(fmt.Sprintf("request_%d_hypergraph_update", idx), actual.HypergraphUpdate),
+			true
+	case *protobufs.MessageRequest_VertexAdd:
+		return "VertexAdd",
+			zap.Any(fmt.Sprintf("request_%d_vertex_add", idx), actual.VertexAdd),
+			true
+	case *protobufs.MessageRequest_VertexRemove:
+		return "VertexRemove",
+			zap.Any(fmt.Sprintf("request_%d_vertex_remove", idx), actual.VertexRemove),
+			true
+	case *protobufs.MessageRequest_HyperedgeAdd:
+		return "HyperedgeAdd",
+			zap.Any(fmt.Sprintf("request_%d_hyperedge_add", idx), actual.HyperedgeAdd),
+			true
+	case *protobufs.MessageRequest_HyperedgeRemove:
+		return "HyperedgeRemove",
+			zap.Any(fmt.Sprintf("request_%d_hyperedge_remove", idx), actual.HyperedgeRemove),
+			true
+	case *protobufs.MessageRequest_ComputeDeploy:
+		return "ComputeDeploy",
+			zap.Any(fmt.Sprintf("request_%d_compute_deploy", idx), actual.ComputeDeploy),
+			true
+	case *protobufs.MessageRequest_ComputeUpdate:
+		return "ComputeUpdate",
+			zap.Any(fmt.Sprintf("request_%d_compute_update", idx), actual.ComputeUpdate),
+			true
+	case *protobufs.MessageRequest_CodeDeploy:
+		return "CodeDeploy",
+			zap.Any(fmt.Sprintf("request_%d_code_deploy", idx), actual.CodeDeploy),
+			true
+	case *protobufs.MessageRequest_CodeExecute:
+		return "CodeExecute",
+			zap.Any(fmt.Sprintf("request_%d_code_execute", idx), actual.CodeExecute),
+			true
+	case *protobufs.MessageRequest_CodeFinalize:
+		return "CodeFinalize",
+			zap.Any(fmt.Sprintf("request_%d_code_finalize", idx), actual.CodeFinalize),
+			true
+	case *protobufs.MessageRequest_Shard:
+		return "ShardFrame",
+			zap.Any(fmt.Sprintf("request_%d_shard_frame", idx), actual.Shard),
+			true
+	default:
+		return "unknown_request", zap.Field{}, false
+	}
 }
 
 func (e *GlobalConsensusEngine) getMessageCollector(

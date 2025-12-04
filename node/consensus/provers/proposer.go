@@ -417,6 +417,9 @@ func (m *Manager) DecideJoins(
 			if len(p) == 0 {
 				continue
 			}
+			if len(reject) > 99 {
+				break
+			}
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			reject = append(reject, pc)
@@ -430,6 +433,12 @@ func (m *Manager) DecideJoins(
 	for _, p := range pending {
 		if len(p) == 0 {
 			continue
+		}
+		if len(reject) > 99 {
+			break
+		}
+		if len(confirm) > 99 {
+			break
 		}
 
 		key := hex.EncodeToString(p)
@@ -456,22 +465,25 @@ func (m *Manager) DecideJoins(
 		}
 	}
 
-	if availableWorkers == 0 && len(confirm) > 0 {
-		m.logger.Info(
-			"skipping confirmations due to lack of available workers",
-			zap.Int("pending_confirmations", len(confirm)),
-		)
-		confirm = nil
-	} else if availableWorkers > 0 && len(confirm) > availableWorkers {
-		m.logger.Warn(
-			"limiting confirmations due to worker capacity",
-			zap.Int("pending_confirmations", len(confirm)),
-			zap.Int("available_workers", availableWorkers),
-		)
-		confirm = confirm[:availableWorkers]
+	if len(reject) > 0 {
+		return m.workerMgr.DecideAllocations(reject, nil)
+	} else {
+		if availableWorkers == 0 && len(confirm) > 0 {
+			m.logger.Info(
+				"skipping confirmations due to lack of available workers",
+				zap.Int("pending_confirmations", len(confirm)),
+			)
+			confirm = nil
+		} else if availableWorkers > 0 && len(confirm) > availableWorkers {
+			m.logger.Warn(
+				"limiting confirmations due to worker capacity",
+				zap.Int("pending_confirmations", len(confirm)),
+				zap.Int("available_workers", availableWorkers),
+			)
+			confirm = confirm[:availableWorkers]
+		}
+		return m.workerMgr.DecideAllocations(nil, confirm)
 	}
-
-	return m.workerMgr.DecideAllocations(reject, confirm)
 }
 
 func (m *Manager) unallocatedWorkerCount() (int, error) {

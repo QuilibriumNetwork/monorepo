@@ -149,8 +149,13 @@ var engineSet = wire.NewSet(
 
 func provideHypergraph(
 	store *store.PebbleHypergraphStore,
+	config *config.Config,
 ) (thypergraph.Hypergraph, error) {
-	return store.LoadHypergraph(&tests.Nopthenticator{})
+	workers := 1
+	if config.Engine.ArchiveMode {
+		workers = 100
+	}
+	return store.LoadHypergraph(&tests.Nopthenticator{}, workers)
 }
 
 var hypergraphSet = wire.NewSet(
