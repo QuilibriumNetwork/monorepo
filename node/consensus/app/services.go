@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
 func (e *AppConsensusEngine) GetAppShardFrame(
@@ -99,10 +100,10 @@ func (e *AppConsensusEngine) GetAppShardProposal(
 		zap.Uint64("frame_number", request.FrameNumber),
 		zap.String("peer_id", peerID.String()),
 	)
-	frame, _, err := e.clockStore.GetShardClockFrame(
+	frame, err := e.loadAppFrameMatchingSelector(
 		request.Filter,
 		request.FrameNumber,
-		false,
+		nil,
 	)
 	if err != nil {
 		return &protobufs.AppShardProposalResponse{}, nil
@@ -117,10 +118,10 @@ func (e *AppConsensusEngine) GetAppShardProposal(
 		return &protobufs.AppShardProposalResponse{}, nil
 	}
 
-	parent, _, err := e.clockStore.GetShardClockFrame(
+	parent, err := e.loadAppFrameMatchingSelector(
 		request.Filter,
 		request.FrameNumber-1,
-		false,
+		frame.Header.ParentSelector,
 	)
 	if err != nil {
 		e.logger.Debug(
@@ -166,6 +167,53 @@ func (e *AppConsensusEngine) RegisterServices(server *grpc.Server) {
 	protobufs.RegisterDispatchServiceServer(server, e.dispatchService)
 	protobufs.RegisterHypergraphComparisonServiceServer(server, e.hyperSync)
 	protobufs.RegisterOnionServiceServer(server, e.onionService)
+}
+
+func (e *AppConsensusEngine) loadAppFrameMatchingSelector(
+	filter []byte,
+	frameNumber uint64,
+	expectedSelector []byte,
+) (*protobufs.AppShardFrame, error) {
+	matchesSelector := func(frame *protobufs.AppShardFrame) bool {
+		if frame == nil || frame.Header == nil || len(expectedSelector) == 0 {
+			return true
+		}
+		return bytes.Equal(frame.Header.ParentSelector, expectedSelector)
+	}
+
+	frame, _, err := e.clockStore.GetShardClockFrame(filter, frameNumber, false)
+	if err == nil && matchesSelector(frame) {
+		return frame, nil
+	}
+
+	iter, iterErr := e.clockStore.RangeStagedShardClockFrames(
+		filter,
+		frameNumber,
+		frameNumber,
+	)
+	if iterErr != nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, iterErr
+	}
+	defer iter.Close()
+
+	for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
+		candidate, valErr := iter.Value()
+		if valErr != nil {
+			return nil, valErr
+		}
+		if matchesSelector(candidate) {
+			return candidate, nil
+		}
+	}
+
+	if err == nil && matchesSelector(frame) {
+		return frame, nil
+	}
+
+	return nil, store.ErrNotFound
 }
 
 func (e *AppConsensusEngine) authenticateProverFromContext(

@@ -23,6 +23,7 @@ type HypergraphStore interface {
 	SetCoveredPrefix(coveredPrefix []int) error
 	LoadHypergraph(
 		authenticationProvider channel.AuthenticationProvider,
+		numSyncWorkers int,
 	) (
 		hypergraph.Hypergraph,
 		error,

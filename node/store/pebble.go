@@ -33,6 +33,15 @@ var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_10,
 	migration_2_1_0_10,
 	migration_2_1_0_11,
+	migration_2_1_0_14,
+	migration_2_1_0_141,
+	migration_2_1_0_142,
+	migration_2_1_0_143,
+	migration_2_1_0_144,
+	migration_2_1_0_145,
+	migration_2_1_0_146,
+	migration_2_1_0_147,
+	migration_2_1_0_148,
 }
 
 func NewPebbleDB(
@@ -167,8 +176,8 @@ func (p *PebbleDB) migrate(logger *zap.Logger) error {
 	for i := int(storedVersion); i < len(pebbleMigrations); i++ {
 		logger.Warn(
 			"performing pebble store migration",
-			zap.Int("from_version", int(i)),
-			zap.Int("to_version", int(i+1)),
+			zap.Int("from_version", int(storedVersion)),
+			zap.Int("to_version", int(storedVersion+1)),
 		)
 		if err := pebbleMigrations[i](batch); err != nil {
 			batch.Close()
@@ -177,8 +186,8 @@ func (p *PebbleDB) migrate(logger *zap.Logger) error {
 		}
 		logger.Info(
 			"migration step completed",
-			zap.Int("from_version", int(i)),
-			zap.Int("to_version", int(i+1)),
+			zap.Int("from_version", int(storedVersion)),
+			zap.Int("to_version", int(storedVersion+1)),
 		)
 	}
 
@@ -329,92 +338,6 @@ func (t *PebbleTransaction) DeleteRange(
 
 var _ store.Transaction = (*PebbleTransaction)(nil)
 
-type pebbleSnapshotDB struct {
-	snap *pebble.Snapshot
-}
-
-func (p *pebbleSnapshotDB) Get(key []byte) ([]byte, io.Closer, error) {
-	return p.snap.Get(key)
-}
-
-func (p *pebbleSnapshotDB) Set(key, value []byte) error {
-	return errors.New("pebble snapshot is read-only")
-}
-
-func (p *pebbleSnapshotDB) Delete(key []byte) error {
-	return errors.New("pebble snapshot is read-only")
-}
-
-func (p *pebbleSnapshotDB) NewBatch(indexed bool) store.Transaction {
-	return &snapshotTransaction{}
-}
-
-func (p *pebbleSnapshotDB) NewIter(lowerBound []byte, upperBound []byte) (
-	store.Iterator,
-	error,
-) {
-	return p.snap.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound,
-		UpperBound: upperBound,
-	})
-}
-
-func (p *pebbleSnapshotDB) Compact(start, end []byte, parallelize bool) error {
-	return errors.New("pebble snapshot is read-only")
-}
-
-func (p *pebbleSnapshotDB) Close() error {
-	return p.snap.Close()
-}
-
-func (p *pebbleSnapshotDB) DeleteRange(start, end []byte) error {
-	return errors.New("pebble snapshot is read-only")
-}
-
-func (p *pebbleSnapshotDB) CompactAll() error {
-	return errors.New("pebble snapshot is read-only")
-}
-
-var _ store.KVDB = (*pebbleSnapshotDB)(nil)
-
-type snapshotTransaction struct{}
-
-func (s *snapshotTransaction) Get(key []byte) ([]byte, io.Closer, error) {
-	return nil, nil, errors.New("pebble snapshot transaction is read-only")
-}
-
-func (s *snapshotTransaction) Set(key []byte, value []byte) error {
-	return errors.New("pebble snapshot transaction is read-only")
-}
-
-func (s *snapshotTransaction) Commit() error {
-	return errors.New("pebble snapshot transaction is read-only")
-}
-
-func (s *snapshotTransaction) Delete(key []byte) error {
-	return errors.New("pebble snapshot transaction is read-only")
-}
-
-func (s *snapshotTransaction) Abort() error {
-	return nil
-}
-
-func (s *snapshotTransaction) NewIter(
-	lowerBound []byte,
-	upperBound []byte,
-) (store.Iterator, error) {
-	return nil, errors.New("pebble snapshot transaction is read-only")
-}
-
-func (s *snapshotTransaction) DeleteRange(
-	lowerBound []byte,
-	upperBound []byte,
-) error {
-	return errors.New("pebble snapshot transaction is read-only")
-}
-
-var _ store.Transaction = (*snapshotTransaction)(nil)
-
 func rightAlign(data []byte, size int) []byte {
 	l := len(data)
 
@@ -560,3 +483,125 @@ func migration_2_1_0_10(b *pebble.Batch) error {
 func migration_2_1_0_11(b *pebble.Batch) error {
 	return nil
 }
+
+func migration_2_1_0_14(b *pebble.Batch) error {
+	return nil
+}
+
+func migration_2_1_0_141(b *pebble.Batch) error {
+	return migration_2_1_0_14(b)
+}
+
+func migration_2_1_0_142(b *pebble.Batch) error {
+	return migration_2_1_0_14(b)
+}
+
+func migration_2_1_0_143(b *pebble.Batch) error {
+	return migration_2_1_0_14(b)
+}
+
+func migration_2_1_0_144(b *pebble.Batch) error {
+	return migration_2_1_0_14(b)
+}
+
+func migration_2_1_0_145(b *pebble.Batch) error {
+	return migration_2_1_0_14(b)
+}
+
+func migration_2_1_0_146(b *pebble.Batch) error {
+	return migration_2_1_0_14(b)
+}
+
+func migration_2_1_0_147(b *pebble.Batch) error {
+	return migration_2_1_0_14(b)
+}
+
+func migration_2_1_0_148(b *pebble.Batch) error {
+	return migration_2_1_0_14(b)
+}
+
+type pebbleSnapshotDB struct {
+	snap *pebble.Snapshot
+}
+
+func (p *pebbleSnapshotDB) Get(key []byte) ([]byte, io.Closer, error) {
+	return p.snap.Get(key)
+}
+
+func (p *pebbleSnapshotDB) Set(key, value []byte) error {
+	return errors.New("pebble snapshot is read-only")
+}
+
+func (p *pebbleSnapshotDB) Delete(key []byte) error {
+	return errors.New("pebble snapshot is read-only")
+}
+
+func (p *pebbleSnapshotDB) NewBatch(indexed bool) store.Transaction {
+	return &snapshotTransaction{}
+}
+
+func (p *pebbleSnapshotDB) NewIter(lowerBound []byte, upperBound []byte) (
+	store.Iterator,
+	error,
+) {
+	return p.snap.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+}
+
+func (p *pebbleSnapshotDB) Compact(start, end []byte, parallelize bool) error {
+	return errors.New("pebble snapshot is read-only")
+}
+
+func (p *pebbleSnapshotDB) Close() error {
+	return p.snap.Close()
+}
+
+func (p *pebbleSnapshotDB) DeleteRange(start, end []byte) error {
+	return errors.New("pebble snapshot is read-only")
+}
+
+func (p *pebbleSnapshotDB) CompactAll() error {
+	return errors.New("pebble snapshot is read-only")
+}
+
+var _ store.KVDB = (*pebbleSnapshotDB)(nil)
+
+type snapshotTransaction struct{}
+
+func (s *snapshotTransaction) Get(key []byte) ([]byte, io.Closer, error) {
+	return nil, nil, errors.New("pebble snapshot transaction is read-only")
+}
+
+func (s *snapshotTransaction) Set(key []byte, value []byte) error {
+	return errors.New("pebble snapshot transaction is read-only")
+}
+
+func (s *snapshotTransaction) Commit() error {
+	return errors.New("pebble snapshot transaction is read-only")
+}
+
+func (s *snapshotTransaction) Delete(key []byte) error {
+	return errors.New("pebble snapshot transaction is read-only")
+}
+
+func (s *snapshotTransaction) Abort() error {
+	return nil
+}
+
+func (s *snapshotTransaction) NewIter(
+	lowerBound []byte,
+	upperBound []byte,
+) (store.Iterator, error) {
+	return nil, errors.New("pebble snapshot transaction is read-only")
+}
+
+func (s *snapshotTransaction) DeleteRange(
+	lowerBound []byte,
+	upperBound []byte,
+) error {
+	return errors.New("pebble snapshot transaction is read-only")
+}
+
+var _ store.Transaction = (*snapshotTransaction)(nil)

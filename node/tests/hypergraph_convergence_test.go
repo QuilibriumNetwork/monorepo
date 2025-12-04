@@ -109,7 +109,7 @@ func TestConvergence(t *testing.T) {
 			store0 = s
 		}
 		hgs := pebblestore.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, s, logger, enc, incProver)
-		crdts[i] = hg.NewHypergraph(logger, hgs, incProver, []int{}, &Nopthenticator{})
+		crdts[i] = hg.NewHypergraph(logger, hgs, incProver, []int{}, &Nopthenticator{}, 200)
 		hgs.MarkHypergraphAsComplete()
 	}
 
@@ -191,7 +191,7 @@ func TestConvergence(t *testing.T) {
 
 	logger, _ := zap.NewDevelopment()
 	hgs := pebblestore.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, store0, logger, enc, incProver)
-	compload, err := hgs.LoadHypergraph(&Nopthenticator{})
+	compload, err := hgs.LoadHypergraph(&Nopthenticator{}, 200)
 	if err != nil {
 		t.Errorf("Could not load hg, %v", err)
 	}

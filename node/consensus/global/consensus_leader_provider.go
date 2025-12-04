@@ -71,7 +71,18 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	filter []byte,
 	priorState models.Identity,
 ) (**protobufs.GlobalFrame, error) {
-	prior, err := p.engine.clockStore.GetLatestGlobalClockFrame()
+	latestQC, qcErr := p.engine.clockStore.GetLatestQuorumCertificate(nil)
+	if qcErr != nil {
+		p.engine.logger.Debug(
+			"could not fetch latest quorum certificate",
+			zap.Error(qcErr),
+		)
+	}
+
+	prior, err := p.engine.clockStore.GetGlobalClockFrameCandidate(
+		latestQC.FrameNumber,
+		[]byte(priorState),
+	)
 	if err != nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)
@@ -80,14 +91,6 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	if prior == nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return nil, models.NewNoVoteErrorf("missing prior frame")
-	}
-
-	latestQC, qcErr := p.engine.clockStore.GetLatestQuorumCertificate(nil)
-	if qcErr != nil {
-		p.engine.logger.Debug(
-			"could not fetch latest quorum certificate",
-			zap.Error(qcErr),
-		)
 	}
 
 	if prior.Identity() != priorState {

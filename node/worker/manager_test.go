@@ -19,7 +19,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
-	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	typesStore "source.quilibrium.com/quilibrium/monorepo/types/store"
@@ -63,7 +62,7 @@ func (m *mockWorkerStore) GetWorker(coreId uint) (*typesStore.WorkerInfo, error)
 	defer m.mu.Unlock()
 	worker, exists := m.workers[coreId]
 	if !exists {
-		return nil, store.ErrNotFound
+		return nil, typesStore.ErrNotFound
 	}
 
 	workerCopy := *worker
@@ -78,7 +77,7 @@ func (m *mockWorkerStore) GetWorkerByFilter(filter []byte) (*typesStore.WorkerIn
 	}
 	worker, exists := m.workersByFilter[string(filter)]
 	if !exists {
-		return nil, store.ErrNotFound
+		return nil, typesStore.ErrNotFound
 	}
 	return worker, nil
 }
@@ -106,7 +105,7 @@ func (m *mockWorkerStore) DeleteWorker(txn typesStore.Transaction, coreId uint) 
 	defer m.mu.Unlock()
 	worker, exists := m.workers[coreId]
 	if !exists {
-		return store.ErrNotFound
+		return typesStore.ErrNotFound
 	}
 	delete(m.workers, coreId)
 	if len(worker.Filter) > 0 {

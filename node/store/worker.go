@@ -11,8 +11,6 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
-var ErrNotFound = errors.New("worker not found")
-
 var _ store.WorkerStore = (*PebbleWorkerStore)(nil)
 
 type PebbleWorkerStore struct {
@@ -55,7 +53,7 @@ func (p *PebbleWorkerStore) GetWorker(coreId uint) (*store.WorkerInfo, error) {
 	data, closer, err := p.db.Get(workerKey(coreId))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
+			return nil, store.ErrNotFound
 		}
 		return nil, errors.Wrap(err, "get worker")
 	}
@@ -80,7 +78,7 @@ func (p *PebbleWorkerStore) GetWorkerByFilter(filter []byte) (
 	data, closer, err := p.db.Get(workerByFilterKey(filter))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
+			return nil, store.ErrNotFound
 		}
 		return nil, errors.Wrap(err, "get worker by filter")
 	}

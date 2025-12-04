@@ -96,6 +96,18 @@ type LockedTransaction struct {
 	Filled          bool
 }
 
+func contextFromShutdownSignal(sig <-chan struct{}) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		if sig == nil {
+			return
+		}
+		<-sig
+		cancel()
+	}()
+	return ctx
+}
+
 // GlobalConsensusEngine  uses the generic state machine for consensus
 type GlobalConsensusEngine struct {
 	*lifecycle.ComponentManager
@@ -133,6 +145,7 @@ type GlobalConsensusEngine struct {
 	peerInfoManager         tp2p.PeerInfoManager
 	workerManager           worker.WorkerManager
 	proposer                *provers.Manager
+	frameChainChecker       *FrameChainChecker
 	currentRank             uint64
 	alertPublicKey          []byte
 	hasSentKeyBundle        bool
@@ -319,6 +332,7 @@ func NewGlobalConsensusEngine(
 		appShardCache:               make(map[string]*appShardCacheEntry),
 		globalMessageSpillover:      make(map[uint64][][]byte),
 	}
+	engine.frameChainChecker = NewFrameChainChecker(clockStore, logger)
 
 	if err := engine.initGlobalMessageAggregator(); err != nil {
 		return nil, err
@@ -934,6 +948,13 @@ func NewGlobalConsensusEngine(
 	}
 
 	engine.ComponentManager = componentBuilder.Build()
+	if hgWithShutdown, ok := engine.hyperSync.(interface {
+		SetShutdownContext(context.Context)
+	}); ok {
+		hgWithShutdown.SetShutdownContext(
+			contextFromShutdownSignal(engine.ShutdownSignal()),
+		)
+	}
 
 	return engine, nil
 }
@@ -1595,8 +1616,8 @@ func (e *GlobalConsensusEngine) materialize(
 		return errors.Wrap(err, "materialize")
 	}
 
-	if e.verifyProverRoot(frameNumber, expectedProverRoot, proposer) {
-		if !e.config.Engine.ArchiveMode || e.config.P2P.Network == 99 {
+	if !e.config.Engine.ArchiveMode || e.config.P2P.Network == 99 {
+		if e.verifyProverRoot(frameNumber, expectedProverRoot, proposer) {
 			e.reconcileLocalWorkerAllocations()
 		}
 	}
@@ -3217,7 +3238,7 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 		msg,
 	)
 	if err != nil {
-		e.logger.Error("could not construct join", zap.Error(err))
+		e.logger.Error("could not construct join decisions", zap.Error(err))
 		return errors.Wrap(err, "decide worker joins")
 	}
 
@@ -3538,7 +3559,7 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 	newRank uint64,
 	qc models.QuorumCertificate,
 ) {
-	e.logger.Debug("adding certified state", zap.Uint64("rank", newRank-1))
+	e.logger.Debug("processing certified state", zap.Uint64("rank", newRank-1))
 
 	parentQC, err := e.clockStore.GetLatestQuorumCertificate(nil)
 	if err != nil {
@@ -3613,6 +3634,20 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 		return
 	}
 
+	cloned := frame.Clone().(*protobufs.GlobalFrame)
+	cloned.Header.PublicKeySignatureBls48581 =
+		&protobufs.BLS48581AggregateSignature{
+			Signature: qc.GetAggregatedSignature().GetSignature(),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: qc.GetAggregatedSignature().GetPubKey(),
+			},
+			Bitmask: qc.GetAggregatedSignature().GetBitmask(),
+		}
+	frameBytes, err := cloned.ToCanonicalBytes()
+	if err == nil {
+		e.pubsub.PublishToBitmask(GLOBAL_FRAME_BITMASK, frameBytes)
+	}
+
 	if !bytes.Equal(frame.Header.ParentSelector, parentQC.Selector) {
 		e.logger.Error(
 			"quorum certificate does not match frame parent",
@@ -3650,73 +3685,14 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 
 	frame.Header.PublicKeySignatureBls48581 = aggregateSig
 
-	latest, err := e.clockStore.GetLatestGlobalClockFrame()
-	if err != nil {
-		e.logger.Error("could not obtain latest frame", zap.Error(err))
-		return
+	proposal := &protobufs.GlobalProposal{
+		State:                       frame,
+		ParentQuorumCertificate:     parentQC,
+		PriorRankTimeoutCertificate: priorRankTC,
+		Vote:                        vote,
 	}
 
-	if latest.Header.FrameNumber+1 != frame.Header.FrameNumber ||
-		!bytes.Equal([]byte(latest.Identity()), frame.Header.ParentSelector) {
-		e.logger.Debug(
-			"not next frame, cannot advance",
-			zap.Uint64("latest_frame_number", latest.Header.FrameNumber),
-			zap.Uint64("new_frame_number", frame.Header.FrameNumber),
-			zap.String(
-				"latest_frame_selector",
-				hex.EncodeToString([]byte(latest.Identity())),
-			),
-			zap.String(
-				"new_frame_number",
-				hex.EncodeToString(frame.Header.ParentSelector),
-			),
-		)
-		return
-	}
-
-	txn, err = e.clockStore.NewTransaction(false)
-	if err != nil {
-		e.logger.Error("could not create transaction", zap.Error(err))
-		return
-	}
-
-	if err := e.materialize(
-		txn,
-		frame,
-	); err != nil {
-		_ = txn.Abort()
-		e.logger.Error("could not materialize frame requests", zap.Error(err))
-		return
-	}
-	if err := e.clockStore.PutGlobalClockFrame(frame, txn); err != nil {
-		_ = txn.Abort()
-		e.logger.Error("could not put global frame", zap.Error(err))
-		return
-	}
-
-	if err := e.clockStore.PutCertifiedGlobalState(
-		&protobufs.GlobalProposal{
-			State:                       frame,
-			ParentQuorumCertificate:     parentQC,
-			PriorRankTimeoutCertificate: priorRankTC,
-			Vote:                        vote,
-		},
-		txn,
-	); err != nil {
-		e.logger.Error("could not insert certified state", zap.Error(err))
-		txn.Abort()
-		return
-	}
-
-	if err := txn.Commit(); err != nil {
-		e.logger.Error("could not commit transaction", zap.Error(err))
-		txn.Abort()
-	}
-
-	if err := e.checkShardCoverage(frame.GetFrameNumber()); err != nil {
-		e.logger.Error("could not check shard coverage", zap.Error(err))
-		return
-	}
+	e.globalProposalQueue <- proposal
 }
 
 // OnRankChange implements consensus.Consumer.
@@ -4050,7 +4026,7 @@ func (e *GlobalConsensusEngine) getPendingProposals(
 		nextQC, err := e.clockStore.GetQuorumCertificate(nil, rank)
 		if err != nil {
 			e.logger.Debug("no qc for rank", zap.Error(err))
-			continue
+			break
 		}
 
 		value, err := e.clockStore.GetGlobalClockFrameCandidate(
@@ -4059,8 +4035,7 @@ func (e *GlobalConsensusEngine) getPendingProposals(
 		)
 		if err != nil {
 			e.logger.Debug("no frame for qc", zap.Error(err))
-			parent = nextQC
-			continue
+			break
 		}
 
 		var priorTCModel models.TimeoutCertificate = nil

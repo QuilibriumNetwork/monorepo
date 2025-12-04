@@ -140,9 +140,9 @@ func TestHypergraphSyncServer(t *testing.T) {
 		inclusionProver,
 	)
 	crdts := make([]application.Hypergraph, numParties)
-	crdts[0] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "server")), serverHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
-	crdts[1] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "client")), clientHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
-	crdts[2] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "control")), controlHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+	crdts[0] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "server")), serverHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 200)
+	crdts[1] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "client")), clientHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 200)
+	crdts[2] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "control")), controlHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 200)
 
 	servertxn, _ := serverHypergraphStore.NewTransaction(false)
 	clienttxn, _ := clientHypergraphStore.NewTransaction(false)
@@ -417,8 +417,8 @@ func TestHypergraphPartialSync(t *testing.T) {
 		inclusionProver,
 	)
 	crdts := make([]application.Hypergraph, numParties)
-	crdts[0] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "server")), serverHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
-	crdts[2] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "control")), controlHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+	crdts[0] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "server")), serverHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 200)
+	crdts[2] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "control")), controlHypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 200)
 
 	servertxn, _ := serverHypergraphStore.NewTransaction(false)
 	controltxn, _ := controlHypergraphStore.NewTransaction(false)
@@ -452,7 +452,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 
 	servertxn.Commit()
 
-	crdts[1] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "client")), clientHypergraphStore, inclusionProver, toIntSlice(toUint32Slice(branchfork)), &tests.Nopthenticator{})
+	crdts[1] = hgcrdt.NewHypergraph(logger.With(zap.String("side", "client")), clientHypergraphStore, inclusionProver, toIntSlice(toUint32Slice(branchfork)), &tests.Nopthenticator{}, 200)
 	logger.Info("saved")
 
 	for _, op := range operations1 {
@@ -807,6 +807,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 		inclusionProver,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	for i := 0; i < clientCount; i++ {
 		clientPath := filepath.Join(clientBase, fmt.Sprintf("client-%d", i))
@@ -824,6 +825,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 			inclusionProver,
 			[]int{},
 			&tests.Nopthenticator{},
+			200,
 		)
 	}
 	defer func() {

@@ -76,6 +76,7 @@ func TestHypergraph(t *testing.T) {
 			prover,
 			[]int{},
 			&Nopthenticator{},
+			200,
 		)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
@@ -145,6 +146,7 @@ func TestHypergraph(t *testing.T) {
 			prover,
 			[]int{},
 			&Nopthenticator{},
+			200,
 		)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
@@ -210,6 +212,7 @@ func TestHypergraph(t *testing.T) {
 			prover,
 			[]int{},
 			&Nopthenticator{},
+			200,
 		)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
@@ -269,6 +272,7 @@ func TestHypergraph(t *testing.T) {
 			prover,
 			[]int{},
 			&Nopthenticator{},
+			200,
 		)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
@@ -325,6 +329,7 @@ func TestHypergraph(t *testing.T) {
 			prover,
 			[]int{},
 			&Nopthenticator{},
+			200,
 		)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
@@ -370,6 +375,7 @@ func TestHypergraph(t *testing.T) {
 			prover,
 			[]int{},
 			&Nopthenticator{},
+			200,
 		)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()

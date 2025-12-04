@@ -258,6 +258,19 @@ func (e *AppConsensusEngine) handleAppShardProposal(
 			return
 		}
 	}
+	if e.frameChainChecker != nil &&
+		e.frameChainChecker.CanProcessSequentialChain(finalized, proposal) {
+		e.deleteCachedProposal(frameNumber)
+		if e.processProposal(proposal) {
+			e.drainProposalCache(frameNumber + 1)
+			return
+		}
+
+		e.logger.Debug("failed to process sequential proposal, caching")
+		e.cacheProposal(proposal)
+		return
+	}
+
 	expectedFrame, _, err := e.clockStore.GetLatestShardClockFrame(e.appAddress)
 	if err != nil {
 		e.logger.Error("could not obtain app time reel head", zap.Error(err))

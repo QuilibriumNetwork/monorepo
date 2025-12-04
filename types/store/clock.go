@@ -16,6 +16,10 @@ type ClockStore interface {
 		startFrameNumber uint64,
 		endFrameNumber uint64,
 	) (TypedIterator[*protobufs.GlobalFrame], error)
+	RangeGlobalClockFrameCandidates(
+		startFrameNumber uint64,
+		endFrameNumber uint64,
+	) (TypedIterator[*protobufs.GlobalFrame], error)
 	PutGlobalClockFrame(frame *protobufs.GlobalFrame, txn Transaction) error
 	PutGlobalClockFrameCandidate(
 		frame *protobufs.GlobalFrame,
@@ -107,6 +111,11 @@ type ClockStore interface {
 		parentSelector []byte,
 		truncate bool,
 	) (*protobufs.AppShardFrame, error)
+	RangeStagedShardClockFrames(
+		filter []byte,
+		startFrameNumber uint64,
+		endFrameNumber uint64,
+	) (TypedIterator[*protobufs.AppShardFrame], error)
 	GetStagedShardClockFramesForFrameNumber(
 		filter []byte,
 		frameNumber uint64,
