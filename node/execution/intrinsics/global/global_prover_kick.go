@@ -3,6 +3,7 @@ package global
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"slices"
 
@@ -398,7 +399,30 @@ func (p *ProverKick) Verify(frameNumber uint64) (bool, error) {
 
 	frame, err := p.clockStore.GetGlobalClockFrame(frameNumber - 1)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		frames, err := p.clockStore.RangeGlobalClockFrameCandidates(
+			frameNumber-1,
+			frameNumber-1,
+		)
+		if err != nil {
+			return false, errors.Wrap(errors.Wrap(
+				err,
+				fmt.Sprintf("frame number: %d", p.FrameNumber),
+			), "verify")
+		}
+		if !frames.First() || !frames.Valid() {
+			return false, errors.Wrap(errors.Wrap(
+				errors.New("not found"),
+				fmt.Sprintf("frame number: %d", p.FrameNumber),
+			), "verify")
+		}
+		frames.Close()
+		frame, err = frames.Value()
+		if err != nil {
+			return false, errors.Wrap(errors.Wrap(
+				err,
+				fmt.Sprintf("frame number: %d", p.FrameNumber),
+			), "verify")
+		}
 	}
 
 	validTraversal, err := p.hypergraph.VerifyTraversalProof(

@@ -30,6 +30,15 @@ func (m *MockProverRegistry) GetAllActiveAppShardProvers() (
 	return args.Get(0).([]*consensus.ProverInfo), args.Error(1)
 }
 
+// GetProverShardSummaries implements consensus.ProverRegistry.
+func (m *MockProverRegistry) GetProverShardSummaries() (
+	[]*consensus.ProverShardSummary,
+	error,
+) {
+	args := m.Called()
+	return args.Get(0).([]*consensus.ProverShardSummary), args.Error(1)
+}
+
 func (m *MockProverRegistry) ProcessStateTransition(
 	state state.State,
 	frameNumber uint64,

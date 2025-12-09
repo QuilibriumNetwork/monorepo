@@ -617,24 +617,6 @@ func EnableAutoNATv2() Option {
 	}
 }
 
-// UDPBlackHoleSuccessCounter configures libp2p to use f as the black hole filter for UDP addrs
-func UDPBlackHoleSuccessCounter(f *swarm.BlackHoleSuccessCounter) Option {
-	return func(cfg *Config) error {
-		cfg.UDPBlackHoleSuccessCounter = f
-		cfg.CustomUDPBlackHoleSuccessCounter = true
-		return nil
-	}
-}
-
-// IPv6BlackHoleSuccessCounter configures libp2p to use f as the black hole filter for IPv6 addrs
-func IPv6BlackHoleSuccessCounter(f *swarm.BlackHoleSuccessCounter) Option {
-	return func(cfg *Config) error {
-		cfg.IPv6BlackHoleSuccessCounter = f
-		cfg.CustomIPv6BlackHoleSuccessCounter = true
-		return nil
-	}
-}
-
 // WithFxOption adds a user provided fx.Option to the libp2p constructor.
 // Experimental: This option is subject to change or removal.
 func WithFxOption(opts ...fx.Option) Option {

@@ -68,6 +68,13 @@ type ProverInfo struct {
 	DelegateAddress []byte
 }
 
+// ProverShardSummary represents the aggregate information about a shard filter
+// and the number of provers assigned to it.
+type ProverShardSummary struct {
+	Filter       []byte
+	StatusCounts map[ProverStatus]int
+}
+
 // ProverRegistry is an interface for tracking prover information from
 // hypergraph state transitions.
 type ProverRegistry interface {
@@ -117,4 +124,8 @@ type ProverRegistry interface {
 	// shards (i.e., all provers with non-nil filters). This is used for global
 	// coordination and coverage checks.
 	GetAllActiveAppShardProvers() ([]*ProverInfo, error)
+
+	// GetProverShardSummaries returns all shard filters that currently have any
+	// provers assigned (regardless of status) along with their counts.
+	GetProverShardSummaries() ([]*ProverShardSummary, error)
 }

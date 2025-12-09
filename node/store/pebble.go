@@ -42,6 +42,9 @@ var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_146,
 	migration_2_1_0_147,
 	migration_2_1_0_148,
+	migration_2_1_0_149,
+	migration_2_1_0_1410,
+	migration_2_1_0_1411,
 }
 
 func NewPebbleDB(
@@ -518,6 +521,18 @@ func migration_2_1_0_147(b *pebble.Batch) error {
 
 func migration_2_1_0_148(b *pebble.Batch) error {
 	return migration_2_1_0_14(b)
+}
+
+func migration_2_1_0_149(b *pebble.Batch) error {
+	return nil
+}
+
+func migration_2_1_0_1410(b *pebble.Batch) error {
+	return migration_2_1_0_149(b)
+}
+
+func migration_2_1_0_1411(b *pebble.Batch) error {
+	return migration_2_1_0_149(b)
 }
 
 type pebbleSnapshotDB struct {

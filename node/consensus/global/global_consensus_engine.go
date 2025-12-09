@@ -605,39 +605,54 @@ func NewGlobalConsensusEngine(
 				latest.FinalizedRank,
 			)
 			if err != nil {
-				establishGenesis()
+				panic(err)
 			} else {
-				frame, err := engine.clockStore.GetGlobalClockFrame(
-					qc.GetFrameNumber(),
-				)
-				if err != nil {
+				if qc.GetFrameNumber() == 0 {
 					establishGenesis()
 				} else {
-					parentFrame, err := engine.clockStore.GetGlobalClockFrame(
-						qc.GetFrameNumber() - 1,
+					frame, err := engine.clockStore.GetGlobalClockFrameCandidate(
+						qc.GetFrameNumber(),
+						qc.Selector,
 					)
 					if err != nil {
-						establishGenesis()
+						panic(err)
 					} else {
-						parentQC, err := engine.clockStore.GetQuorumCertificate(
-							nil,
-							parentFrame.GetRank(),
+						if _, rebuildErr := engine.rebuildShardCommitments(
+							frame.Header.FrameNumber+1,
+							frame.Header.Rank+1,
+						); rebuildErr != nil {
+							logger.Warn(
+								"could not initialize shard commitments from latest frame",
+								zap.Error(rebuildErr),
+							)
+						}
+						parentFrame, err := engine.clockStore.GetGlobalClockFrameCandidate(
+							qc.GetFrameNumber()-1,
+							frame.Header.ParentSelector,
 						)
 						if err != nil {
-							establishGenesis()
+							panic(err)
 						} else {
-							state = &models.CertifiedState[*protobufs.GlobalFrame]{
-								State: &models.State[*protobufs.GlobalFrame]{
-									Rank:                    frame.GetRank(),
-									Identifier:              frame.Identity(),
-									ProposerID:              frame.Source(),
-									ParentQuorumCertificate: parentQC,
-									Timestamp:               frame.GetTimestamp(),
-									State:                   &frame,
-								},
-								CertifyingQuorumCertificate: qc,
+							parentQC, err := engine.clockStore.GetQuorumCertificate(
+								nil,
+								parentFrame.GetRank(),
+							)
+							if err != nil {
+								panic(err)
+							} else {
+								state = &models.CertifiedState[*protobufs.GlobalFrame]{
+									State: &models.State[*protobufs.GlobalFrame]{
+										Rank:                    frame.GetRank(),
+										Identifier:              frame.Identity(),
+										ProposerID:              frame.Source(),
+										ParentQuorumCertificate: parentQC,
+										Timestamp:               frame.GetTimestamp(),
+										State:                   &frame,
+									},
+									CertifyingQuorumCertificate: qc,
+								}
+								pending = engine.getPendingProposals(frame.Header.FrameNumber)
 							}
-							pending = engine.getPendingProposals(frame.Header.FrameNumber)
 						}
 					}
 				}
@@ -3701,6 +3716,7 @@ func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
 
 	prior, err := e.clockStore.GetLatestGlobalClockFrame()
 	if err != nil {
+		e.logger.Error("new rank, no latest global clock frame")
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return
 	}
@@ -3712,6 +3728,79 @@ func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
 	if err != nil {
 		return
 	}
+}
+
+func (e *GlobalConsensusEngine) rebuildShardCommitments(
+	frameNumber uint64,
+	rank uint64,
+) ([]byte, error) {
+	commitments := make([]*tries.VectorCommitmentTree, 256)
+	for i := range commitments {
+		commitments[i] = &tries.VectorCommitmentTree{}
+	}
+
+	commitSet, err := e.hypergraph.Commit(frameNumber)
+	if err != nil {
+		e.logger.Error("could not commit", zap.Error(err))
+		return nil, errors.Wrap(err, "rebuild shard commitments")
+	}
+
+	if err := e.rebuildAppShardCache(rank); err != nil {
+		e.logger.Warn(
+			"could not rebuild app shard cache",
+			zap.Uint64("rank", rank),
+			zap.Error(err),
+		)
+	}
+
+	proverRoot := make([]byte, 64)
+	collected := 0
+
+	for sk, s := range commitSet {
+		if !bytes.Equal(sk.L1[:], []byte{0x00, 0x00, 0x00}) {
+			collected++
+
+			for phaseSet := 0; phaseSet < 4; phaseSet++ {
+				commit := s[phaseSet]
+				foldedShardKey := make([]byte, 32)
+				copy(foldedShardKey, sk.L2[:])
+
+				foldedShardKey[0] |= byte(phaseSet << 6)
+				for l1Idx := 0; l1Idx < 3; l1Idx++ {
+					if err := commitments[sk.L1[l1Idx]].Insert(
+						foldedShardKey,
+						commit,
+						nil,
+						big.NewInt(int64(len(commit))),
+					); err != nil {
+						return nil, errors.Wrap(err, "rebuild shard commitments")
+					}
+				}
+			}
+		} else {
+			proverRoot = s[0]
+		}
+	}
+
+	shardCommitments := make([][]byte, 256)
+	for i := 0; i < 256; i++ {
+		shardCommitments[i] = commitments[i].Commit(e.inclusionProver, false)
+	}
+
+	preimage := slices.Concat(
+		slices.Concat(shardCommitments...),
+		proverRoot,
+	)
+
+	commitmentHash := sha3.Sum256(preimage)
+
+	e.shardCommitments = shardCommitments
+	e.proverRoot = proverRoot
+	e.commitmentHash = commitmentHash[:]
+
+	shardCommitmentsCollected.Set(float64(collected))
+
+	return commitmentHash[:], nil
 }
 
 // OnReceiveProposal implements consensus.Consumer.
@@ -3998,7 +4087,16 @@ func (e *GlobalConsensusEngine) getPendingProposals(
 	*protobufs.GlobalFrame,
 	*protobufs.ProposalVote,
 ] {
-	root, err := e.clockStore.GetGlobalClockFrame(frameNumber)
+	rootIter, err := e.clockStore.RangeGlobalClockFrameCandidates(
+		frameNumber,
+		frameNumber,
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	rootIter.First()
+	root, err := rootIter.Value()
 	if err != nil {
 		panic(err)
 	}

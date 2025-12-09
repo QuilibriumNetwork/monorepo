@@ -14,6 +14,7 @@ import (
 	"net"
 	"runtime/debug"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,19 +23,18 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	libp2pconfig "github.com/libp2p/go-libp2p/config"
 	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
-	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	routedhost "github.com/libp2p/go-libp2p/p2p/host/routed"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/net/gostream"
-	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/mr-tron/base58"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
@@ -43,6 +43,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	grpcpeer "google.golang.org/grpc/peer"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	blossomsub "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub"
@@ -82,7 +84,7 @@ type BlossomSub struct {
 	peerScoreMx         sync.Mutex
 	bootstrap           internal.PeerConnector
 	discovery           internal.PeerConnector
-	reachability        atomic.Pointer[network.Reachability]
+	manualReachability  atomic.Pointer[bool]
 	p2pConfig           config.P2PConfig
 	dht                 *dht.IpfsDHT
 }
@@ -91,6 +93,7 @@ var _ p2p.PubSub = (*BlossomSub)(nil)
 var ErrNoPeersAvailable = errors.New("no peers available")
 
 var ANNOUNCE_PREFIX = "quilibrium-2.0.2-dusk-"
+var connectivityServiceProtocolID = protocol.ID("/quilibrium/connectivity/1.0.0")
 
 func getPeerID(p2pConfig *config.P2PConfig) peer.ID {
 	peerPrivKey, err := hex.DecodeString(p2pConfig.PeerPrivKey)
@@ -149,53 +152,6 @@ func NewBlossomSubWithHost(
 	idService := internal.IDServiceFromHost(host)
 
 	logger.Info("established peer id", zap.String("peer_id", host.ID().String()))
-
-	reachabilitySub, err := host.EventBus().Subscribe(
-		&event.EvtLocalReachabilityChanged{},
-		eventbus.Name("blossomsub"),
-	)
-	if err != nil {
-		logger.Panic("error subscribing to reachability events", zap.Error(err))
-	}
-	go func() {
-		defer reachabilitySub.Close()
-		instance := "node"
-		if coreId != 0 {
-			instance = "worker"
-		}
-		logger := logger.Named("reachability")
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case evt, ok := <-reachabilitySub.Out():
-				if !ok {
-					return
-				}
-				state := evt.(event.EvtLocalReachabilityChanged).Reachability
-				bs.reachability.Store(&state)
-				switch state {
-				case network.ReachabilityPublic:
-					logger.Info(
-						instance+" is externally reachable",
-						zap.Uint("core_id", coreId),
-					)
-				case network.ReachabilityPrivate:
-					logger.Error(
-						instance+" is not externally reachable",
-						zap.Uint("core_id", coreId),
-					)
-				case network.ReachabilityUnknown:
-					logger.Info(
-						instance+" reachability is unknown",
-						zap.Uint("core_id", coreId),
-					)
-				default:
-					logger.Debug("unknown reachability state", zap.Any("state", state))
-				}
-			}
-		}
-	}()
 
 	bootstrappers := []peer.AddrInfo{}
 	for _, bh := range bootstrapHosts {
@@ -267,6 +223,7 @@ func NewBlossomSubWithHost(
 	)
 
 	var tracer *blossomsub.JSONTracer
+	var err error
 	if p2pConfig.TraceLogStdout {
 		tracer, err = blossomsub.NewStdoutJSONTracer()
 		if err != nil {
@@ -355,6 +312,8 @@ func NewBlossomSubWithHost(
 	bs.derivedPeerID = peerID
 
 	go bs.background(ctx)
+
+	bs.initConnectivityServices(isBootstrapPeer, bootstrappers)
 
 	return bs
 }
@@ -516,22 +475,7 @@ func NewBlossomSub(
 
 	opts = append(
 		opts,
-		libp2p.SwarmOpts(
-			swarm.WithUDPBlackHoleSuccessCounter(
-				&swarm.BlackHoleSuccessCounter{
-					N:            8000,
-					MinSuccesses: 1,
-					Name:         "permissive-udp",
-				},
-			),
-			swarm.WithIPv6BlackHoleSuccessCounter(
-				&swarm.BlackHoleSuccessCounter{
-					N:            8000,
-					MinSuccesses: 1,
-					Name:         "permissive-ip6",
-				},
-			),
-		),
+		libp2p.SwarmOpts(),
 	)
 
 	if p2pConfig.LowWatermarkConnections != -1 &&
@@ -574,53 +518,6 @@ func NewBlossomSub(
 	idService := internal.IDServiceFromHost(h)
 
 	logger.Info("established peer id", zap.String("peer_id", h.ID().String()))
-
-	reachabilitySub, err := h.EventBus().Subscribe(
-		&event.EvtLocalReachabilityChanged{},
-		eventbus.Name("blossomsub"),
-	)
-	if err != nil {
-		logger.Panic("error subscribing to reachability events", zap.Error(err))
-	}
-	go func() {
-		defer reachabilitySub.Close()
-		instance := "node"
-		if coreId != 0 {
-			instance = "worker"
-		}
-		logger := logger.Named("reachability")
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case evt, ok := <-reachabilitySub.Out():
-				if !ok {
-					return
-				}
-				state := evt.(event.EvtLocalReachabilityChanged).Reachability
-				bs.reachability.Store(&state)
-				switch state {
-				case network.ReachabilityPublic:
-					logger.Info(
-						instance+" is externally reachable",
-						zap.Uint("core_id", coreId),
-					)
-				case network.ReachabilityPrivate:
-					logger.Error(
-						instance+" is not externally reachable",
-						zap.Uint("core_id", coreId),
-					)
-				case network.ReachabilityUnknown:
-					logger.Info(
-						instance+" reachability is unknown",
-						zap.Uint("core_id", coreId),
-					)
-				default:
-					logger.Debug("unknown reachability state", zap.Any("state", state))
-				}
-			}
-		}
-	}()
 
 	kademliaDHT := initDHT(
 		ctx,
@@ -857,6 +754,7 @@ func NewBlossomSub(
 	bs.peerID = peerID
 	bs.h = h
 	bs.signKey = privKey
+	bs.initConnectivityServices(isBootstrapPeer, bootstrappers)
 
 	go bs.background(ctx)
 
@@ -1241,18 +1139,347 @@ func (b *BlossomSub) IsPeerConnected(peerId []byte) bool {
 }
 
 func (b *BlossomSub) Reachability() *wrapperspb.BoolValue {
-	reachability := b.reachability.Load()
+	if manual := b.manualReachability.Load(); manual != nil {
+		return wrapperspb.Bool(*manual)
+	}
+	reachability := b.manualReachability.Load()
 	if reachability == nil {
 		return nil
 	}
-	switch *reachability {
-	case network.ReachabilityPublic:
-		return wrapperspb.Bool(true)
-	case network.ReachabilityPrivate:
-		return wrapperspb.Bool(false)
-	default:
+	return &wrapperspb.BoolValue{Value: *reachability}
+}
+
+func (b *BlossomSub) initConnectivityServices(
+	isBootstrapPeer bool,
+	bootstrappers []peer.AddrInfo,
+) {
+	if b.h == nil {
+		return
+	}
+	if isBootstrapPeer {
+		b.startConnectivityService()
+		return
+	}
+	clone := make([]peer.AddrInfo, len(bootstrappers))
+	copy(clone, bootstrappers)
+	b.blockUntilConnectivityTest(clone)
+}
+
+func (b *BlossomSub) startConnectivityService() {
+	// Use raw TCP listener on port 8340
+	listenAddr := "0.0.0.0:8340"
+
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		b.logger.Error("failed to start connectivity service", zap.Error(err))
+		return
+	}
+
+	b.logger.Info("started connectivity service", zap.String("addr", listenAddr))
+
+	server := grpc.NewServer()
+	protobufs.RegisterConnectivityServiceServer(
+		server,
+		newConnectivityService(b.logger.Named("connectivity-service"), b.h),
+	)
+
+	go func() {
+		if err := server.Serve(listener); err != nil &&
+			!errors.Is(err, net.ErrClosed) {
+			b.logger.Error("connectivity service exited", zap.Error(err))
+		}
+	}()
+
+	go func() {
+		<-b.ctx.Done()
+		server.GracefulStop()
+		_ = listener.Close()
+	}()
+}
+
+func (b *BlossomSub) blockUntilConnectivityTest(bootstrappers []peer.AddrInfo) {
+	if len(bootstrappers) == 0 {
+		b.logger.Warn("connectivity test skipped, no bootstrap peers available")
+		return
+	}
+
+	delay := time.NewTimer(10 * time.Second)
+	defer delay.Stop()
+	select {
+	case <-delay.C:
+	case <-b.ctx.Done():
+		b.logger.Info("connectivity test cancelled before start, context done")
+		return
+	}
+
+	backoff := 10 * time.Second
+	for {
+		if err := b.runConnectivityTest(b.ctx, bootstrappers); err == nil {
+			return
+		} else {
+			b.logger.Warn("connectivity test failed, retrying", zap.Error(err))
+		}
+
+		wait := time.NewTimer(backoff)
+		select {
+		case <-wait.C:
+			wait.Stop()
+		case <-b.ctx.Done():
+			wait.Stop()
+			b.logger.Info("connectivity test cancelled, context done")
+			return
+		}
+	}
+}
+
+func (b *BlossomSub) runConnectivityTest(
+	ctx context.Context,
+	bootstrappers []peer.AddrInfo,
+) error {
+	candidates := make([]peer.AddrInfo, 0, len(bootstrappers))
+	for _, info := range bootstrappers {
+		if info.ID == b.h.ID() {
+			continue
+		}
+		if strings.Contains(info.Addrs[0].String(), "dnsaddr") {
+			candidates = append(candidates, info)
+		}
+	}
+	if len(candidates) == 0 {
+		return errors.New("connectivity test: no bootstrap peers available")
+	}
+	selection, err := rand.Int(rand.Reader, big.NewInt(int64(len(candidates))))
+	if err != nil {
+		return errors.Wrap(err, "connectivity test peer selection")
+	}
+	target := candidates[selection.Int64()]
+	return b.invokeConnectivityTest(ctx, target)
+}
+
+func (b *BlossomSub) invokeConnectivityTest(
+	ctx context.Context,
+	target peer.AddrInfo,
+) error {
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var targetAddr string
+	for _, addr := range target.Addrs {
+		host, err := addr.ValueForProtocol(ma.P_IP4)
+		if err != nil {
+			host, err = addr.ValueForProtocol(ma.P_IP6)
+			if err != nil {
+				host, err = addr.ValueForProtocol(ma.P_DNSADDR)
+				if err != nil {
+					continue
+				}
+			}
+		}
+
+		targetAddr = fmt.Sprintf("%s:8340", host)
+		break
+	}
+
+	if targetAddr == "" {
+		b.recordManualReachability(false)
+		return errors.New(
+			"connectivity test: no valid address found for bootstrap peer",
+		)
+	}
+
+	b.logger.Debug(
+		"connecting to bootstrap connectivity service",
+		zap.String("target", targetAddr),
+	)
+
+	conn, err := grpc.NewClient(
+		targetAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		b.recordManualReachability(false)
+		return errors.Wrap(err, "connectivity test dial")
+	}
+	defer conn.Close()
+
+	client := protobufs.NewConnectivityServiceClient(conn)
+	req := &protobufs.ConnectivityTestRequest{
+		PeerId:     []byte(b.h.ID()),
+		Multiaddrs: b.collectConnectivityMultiaddrs(),
+	}
+
+	resp, err := client.TestConnectivity(dialCtx, req)
+	if err != nil {
+		b.recordManualReachability(false)
+		return errors.Wrap(err, "connectivity test rpc")
+	}
+
+	b.recordManualReachability(resp.GetSuccess())
+	if resp.GetSuccess() {
+		b.logger.Info(
+			"your node is reachable",
+			zap.String("bootstrap_peer", target.ID.String()),
+		)
 		return nil
 	}
+
+	b.logger.Warn(
+		"YOUR NODE IS NOT REACHABLE. CHECK YOUR FIREWALL AND PORT FORWARDING CONFIGURATION",
+		zap.String("bootstrap_peer", target.ID.String()),
+		zap.String("error", resp.GetErrorMessage()),
+	)
+	if resp.GetErrorMessage() != "" {
+		return errors.New(resp.GetErrorMessage())
+	}
+	return errors.New("connectivity test failed")
+}
+
+func (b *BlossomSub) collectConnectivityMultiaddrs() []string {
+	addrs := b.GetOwnMultiaddrs()
+	out := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		out = append(out, addr.String())
+	}
+	return out
+}
+
+func (b *BlossomSub) recordManualReachability(success bool) {
+	state := new(bool)
+	*state = success
+	b.manualReachability.Store(state)
+}
+
+type connectivityService struct {
+	protobufs.UnimplementedConnectivityServiceServer
+	logger *zap.Logger
+	host   host.Host
+	ping   *ping.PingService
+}
+
+func newConnectivityService(
+	logger *zap.Logger,
+	h host.Host,
+) *connectivityService {
+	return &connectivityService{
+		logger: logger,
+		host:   h,
+		ping:   ping.NewPingService(h),
+	}
+}
+
+func (s *connectivityService) TestConnectivity(
+	ctx context.Context,
+	req *protobufs.ConnectivityTestRequest,
+) (*protobufs.ConnectivityTestResponse, error) {
+	resp := &protobufs.ConnectivityTestResponse{}
+	peerID := peer.ID(req.GetPeerId())
+	if peerID == "" {
+		resp.ErrorMessage = "peer id required"
+		return resp, nil
+	}
+
+	// Get the actual IP address from the gRPC peer context
+	pr, ok := grpcpeer.FromContext(ctx)
+	if !ok || pr.Addr == nil {
+		resp.ErrorMessage = "unable to determine peer address from context"
+		return resp, nil
+	}
+
+	// Extract the IP from the remote address
+	remoteAddr := pr.Addr.String()
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		resp.ErrorMessage = fmt.Sprintf("invalid remote address: %v", err)
+		return resp, nil
+	}
+
+	s.logger.Debug(
+		"connectivity test from peer",
+		zap.String("peer_id", peerID.String()),
+		zap.String("remote_ip", host),
+	)
+
+	addrs := make([]ma.Multiaddr, 0, len(req.GetMultiaddrs()))
+	for _, addrStr := range req.GetMultiaddrs() {
+		maddr, err := ma.NewMultiaddr(addrStr)
+		if err != nil {
+			s.logger.Debug(
+				"invalid multiaddr in connectivity request",
+				zap.String("peer_id", peerID.String()),
+				zap.String("multiaddr", addrStr),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		// Extract the port from the multiaddr but use the actual IP from the
+		// connection
+		port, err := maddr.ValueForProtocol(ma.P_TCP)
+		if err != nil {
+			// If it's not TCP, try UDP
+			port, err = maddr.ValueForProtocol(ma.P_UDP)
+			if err != nil {
+				continue
+			}
+			// Build UDP multiaddr with actual IP
+			newAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s", host, port))
+			if err != nil {
+				continue
+			}
+			addrs = append(addrs, newAddr)
+			continue
+		}
+
+		// Build TCP multiaddr with actual IP
+		newAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%s", host, port))
+		if err != nil {
+			continue
+		}
+		addrs = append(addrs, newAddr)
+	}
+
+	if len(addrs) == 0 {
+		resp.ErrorMessage = "no valid multiaddrs to test"
+		return resp, nil
+	}
+
+	s.logger.Debug(
+		"attempting to connect to peer",
+		zap.String("peer_id", peerID.String()),
+		zap.Any("addrs", addrs),
+	)
+
+	s.host.Peerstore().AddAddrs(peerID, addrs, peerstore.TempAddrTTL)
+
+	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err = s.host.Connect(connectCtx, peer.AddrInfo{
+		ID:    peerID,
+		Addrs: addrs,
+	})
+	if err != nil {
+		resp.ErrorMessage = err.Error()
+		return resp, nil
+	}
+
+	defer s.host.Network().ClosePeer(peerID)
+
+	pingCtx, cancelPing := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelPing()
+
+	select {
+	case <-pingCtx.Done():
+		resp.ErrorMessage = pingCtx.Err().Error()
+		return resp, nil
+	case result := <-s.ping.Ping(pingCtx, peerID):
+		if result.Error != nil {
+			resp.ErrorMessage = result.Error.Error()
+			return resp, nil
+		}
+	}
+
+	resp.Success = true
+	return resp, nil
 }
 
 func initDHT(

@@ -992,12 +992,15 @@ func (e *GlobalConsensusEngine) handleGlobalProposal(
 
 	// if we have a parent, cache and move on
 	if proposal.State.Header.FrameNumber != 0 {
+		_, sErr := e.clockStore.GetGlobalClockFrame(
+			proposal.State.Header.FrameNumber - 1,
+		)
 		// also check with persistence layer
-		_, err := e.clockStore.GetGlobalClockFrameCandidate(
+		_, cErr := e.clockStore.GetGlobalClockFrameCandidate(
 			proposal.State.Header.FrameNumber-1,
 			proposal.State.Header.ParentSelector,
 		)
-		if err != nil {
+		if sErr != nil && cErr != nil {
 			e.logger.Debug(
 				"parent frame not stored, requesting sync",
 				zap.Uint64("rank", proposal.GetRank()),
@@ -1206,6 +1209,23 @@ func (e *GlobalConsensusEngine) cacheProposal(
 	e.proposalCacheMu.Lock()
 	e.proposalCache[frameNumber] = proposal
 	e.proposalCacheMu.Unlock()
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		e.logger.Error("could not create transaction", zap.Error(err))
+		return
+	}
+	err = e.clockStore.PutGlobalClockFrameCandidate(proposal.State, txn)
+	if err != nil {
+		e.logger.Error("could not put global clock frame candidate", zap.Error(err))
+		txn.Abort()
+		return
+	}
+	if err = txn.Commit(); err != nil {
+		e.logger.Error("could not commit transaction", zap.Error(err))
+		txn.Abort()
+		return
+	}
 
 	e.logger.Debug(
 		"cached out-of-order proposal",
@@ -1580,6 +1600,7 @@ func (e *GlobalConsensusEngine) handleVote(message *pb.Message) {
 }
 
 func (e *GlobalConsensusEngine) handleTimeoutState(message *pb.Message) {
+	e.logger.Debug("handling timeout state")
 	// Skip our own messages
 	if bytes.Equal(message.From, e.pubsub.GetPeerID()) {
 		return

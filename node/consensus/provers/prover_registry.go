@@ -1782,3 +1782,51 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 
 	return result, nil
 }
+
+// GetProverShardSummaries implements ProverRegistry
+func (r *ProverRegistry) GetProverShardSummaries() (
+	[]*consensus.ProverShardSummary,
+	error,
+) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	summaries := make([]*consensus.ProverShardSummary, 0, len(r.filterCache))
+	for filterKey, provers := range r.filterCache {
+		if len(filterKey) == 0 || len(provers) == 0 {
+			continue
+		}
+		statusCounts := make(map[consensus.ProverStatus]int)
+		for _, info := range provers {
+			counted := false
+			for _, alloc := range info.Allocations {
+				if len(alloc.ConfirmationFilter) > 0 &&
+					string(alloc.ConfirmationFilter) == filterKey {
+					statusCounts[alloc.Status]++
+					counted = true
+					break
+				}
+				if len(alloc.RejectionFilter) > 0 &&
+					string(alloc.RejectionFilter) == filterKey {
+					statusCounts[alloc.Status]++
+					counted = true
+					break
+				}
+			}
+			if !counted {
+				statusCounts[info.Status]++
+			}
+		}
+		summary := &consensus.ProverShardSummary{
+			Filter:       append([]byte(nil), filterKey...),
+			StatusCounts: statusCounts,
+		}
+		summaries = append(summaries, summary)
+	}
+
+	sort.Slice(summaries, func(i, j int) bool {
+		return bytes.Compare(summaries[i].Filter, summaries[j].Filter) < 0
+	})
+
+	return summaries, nil
+}

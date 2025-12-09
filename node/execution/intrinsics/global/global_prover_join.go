@@ -694,10 +694,30 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 
 	frame, err := p.frameStore.GetGlobalClockFrame(p.FrameNumber)
 	if err != nil {
-		return false, errors.Wrap(errors.Wrap(
-			err,
-			fmt.Sprintf("frame number: %d", p.FrameNumber),
-		), "verify")
+		frames, err := p.frameStore.RangeGlobalClockFrameCandidates(
+			p.FrameNumber,
+			p.FrameNumber,
+		)
+		if err != nil {
+			return false, errors.Wrap(errors.Wrap(
+				err,
+				fmt.Sprintf("frame number: %d", p.FrameNumber),
+			), "verify")
+		}
+		if !frames.First() || !frames.Valid() {
+			return false, errors.Wrap(errors.Wrap(
+				errors.New("not found"),
+				fmt.Sprintf("frame number: %d", p.FrameNumber),
+			), "verify")
+		}
+		frames.Close()
+		frame, err = frames.Value()
+		if err != nil {
+			return false, errors.Wrap(errors.Wrap(
+				err,
+				fmt.Sprintf("frame number: %d", p.FrameNumber),
+			), "verify")
+		}
 	}
 
 	// Prepare challenge for verification

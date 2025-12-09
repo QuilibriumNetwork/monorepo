@@ -61,6 +61,7 @@ message NodeInfoResponse {
   bytes patch_number = 7;
   uint64 last_received_frame = 8;
   uint64 last_global_head_frame = 9;
+  bool reachable = 10;
 }
 
 message WorkerInfo {
@@ -214,6 +215,21 @@ service NodeService {
   rpc Send(SendRequest) returns (SendResponse);
   rpc GetTokensByAccount(GetTokensByAccountRequest)
     returns (GetTokensByAccountResponse);
+}
+
+message ConnectivityTestRequest {
+  bytes peer_id = 1;
+  repeated string multiaddrs = 2;
+}
+
+message ConnectivityTestResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+service ConnectivityService {
+  rpc TestConnectivity(ConnectivityTestRequest)
+    returns (ConnectivityTestResponse);
 }
 
 message RespawnRequest {

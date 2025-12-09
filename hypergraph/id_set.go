@@ -98,6 +98,22 @@ func (set *idSet) Add(
 	)
 }
 
+// AddRaw inserts raw leaf data directly into the backing store without tree
+// traversal. This is used for raw sync operations where data is pre-serialized.
+func (set *idSet) AddRaw(
+	txn tries.TreeBackingStoreTransaction,
+	leaf *tries.RawLeafData,
+) error {
+	set.dirty = true
+	return set.tree.Store.InsertRawLeaf(
+		txn,
+		set.tree.SetType,
+		set.tree.PhaseType,
+		set.tree.ShardKey,
+		leaf,
+	)
+}
+
 // Delete removes an atom from the ID set. The atom must match the set's atom
 // type or ErrInvalidAtomType is returned. The atom is removed from the backing
 // tree store.

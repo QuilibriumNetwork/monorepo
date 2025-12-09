@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha512"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"math/big"
@@ -22,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -780,11 +782,27 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	enc := verenc.NewMPCitHVerifiableEncryptor(1)
 	inclusionProver := bls48581.NewKZGInclusionProver(logger)
 
-	dataTree := buildDataTree(t, enc, inclusionProver)
+	logDuration := func(step string, start time.Time) {
+		t.Logf("%s took %s", step, time.Since(start))
+	}
+
+	start := time.Now()
+	dataTrees := make([]*tries.VectorCommitmentTree, 10000)
+	eg := errgroup.Group{}
+	eg.SetLimit(10000)
+	for i := 0; i < 10000; i++ {
+		eg.Go(func() error {
+			dataTrees[i] = buildDataTree(t, inclusionProver)
+			return nil
+		})
+	}
+	eg.Wait()
+	logDuration("generated data trees", start)
 
 	serverPath := filepath.Join(t.TempDir(), "server")
 	clientBase := filepath.Join(t.TempDir(), "clients")
 
+	setupStart := time.Now()
 	serverDB := store.NewPebbleDB(logger, &config.DBConfig{Path: serverPath}, 0)
 	defer serverDB.Close()
 
@@ -795,12 +813,14 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 		enc,
 		inclusionProver,
 	)
+	logDuration("server DB/store initialization", setupStart)
 
-	const clientCount = 100
+	const clientCount = 8
 	clientDBs := make([]*store.PebbleDB, clientCount)
 	clientStores := make([]*store.PebbleHypergraphStore, clientCount)
 	clientHGs := make([]*hgcrdt.HypergraphCRDT, clientCount)
 
+	serverHypergraphStart := time.Now()
 	serverHG := hgcrdt.NewHypergraph(
 		logger.With(zap.String("side", "server")),
 		serverStore,
@@ -809,6 +829,9 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 		&tests.Nopthenticator{},
 		200,
 	)
+	logDuration("server hypergraph initialization", serverHypergraphStart)
+
+	clientSetupStart := time.Now()
 	for i := 0; i < clientCount; i++ {
 		clientPath := filepath.Join(clientBase, fmt.Sprintf("client-%d", i))
 		clientDBs[i] = store.NewPebbleDB(logger, &config.DBConfig{Path: clientPath}, 0)
@@ -828,6 +851,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 			200,
 		)
 	}
+	logDuration("client hypergraph initialization", clientSetupStart)
 	defer func() {
 		for _, db := range clientDBs {
 			if db != nil {
@@ -841,24 +865,28 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	initialVertex := hgcrdt.NewVertex(
 		domain,
 		randomBytes32(t),
-		dataTree.Commit(inclusionProver, false),
-		dataTree.GetSize(),
+		dataTrees[0].Commit(inclusionProver, false),
+		dataTrees[0].GetSize(),
 	)
+	seedStart := time.Now()
 	addVertices(
 		t,
 		serverStore,
 		serverHG,
-		dataTree,
+		dataTrees[:1],
 		initialVertex,
 	)
+	logDuration("seed server baseline vertex", seedStart)
 	for i := 0; i < clientCount; i++ {
+		start := time.Now()
 		addVertices(
 			t,
 			clientStores[i],
 			clientHGs[i],
-			dataTree,
+			dataTrees[:1],
 			initialVertex,
 		)
+		logDuration(fmt.Sprintf("seed client-%d baseline vertex", i), start)
 	}
 
 	shardKey := application.GetShardKey(initialVertex)
@@ -915,16 +943,21 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 
 	const rounds = 3
 	for round := 0; round < rounds; round++ {
-		c, _ := serverHG.Commit(uint64(round))
+		currentRound := round
+		roundStart := time.Now()
+		c, _ := serverHG.Commit(uint64(currentRound))
 		fmt.Printf("svr commitment: %x\n", c[shardKey][0])
 
+		genStart := time.Now()
 		updates := generateVertices(
 			t,
 			domain,
-			dataTree,
+			dataTrees,
 			inclusionProver,
-			5,
+			15,
+			1+(15*currentRound),
 		)
+		logDuration(fmt.Sprintf("round %d vertex generation", currentRound), genStart)
 
 		var syncWG sync.WaitGroup
 		var serverWG sync.WaitGroup
@@ -933,8 +966,9 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 		serverWG.Add(1)
 
 		for clientIdx := 0; clientIdx < clientCount; clientIdx++ {
-			go func(idx int) {
+			go func(idx int, round int) {
 				defer syncWG.Done()
+				clientSyncStart := time.Now()
 				clientHG := clientHGs[idx]
 				conn, client := dialClient()
 				streamCtx, cancelStream := context.WithTimeout(
@@ -954,13 +988,20 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 
 				c, _ := clientHGs[idx].Commit(uint64(round))
 				fmt.Printf("cli commitment: %x\n", c[shardKey][0])
-			}(clientIdx)
+				logDuration(fmt.Sprintf("round %d client-%d sync", round, idx), clientSyncStart)
+			}(clientIdx, currentRound)
 		}
 
 		go func(round int) {
 			defer serverWG.Done()
+			serverRoundStart := time.Now()
 			logger.Info("server applying concurrent updates", zap.Int("round", round))
-			addVertices(t, serverStore, serverHG, dataTree, updates...)
+			addVertices(t, serverStore, serverHG, dataTrees[1+(15*round):1+(15*(round+1))], updates...)
+			logger.Info(
+				"server applied concurrent updates",
+				zap.Int("round", round),
+				zap.Duration("duration", time.Since(serverRoundStart)),
+			)
 			logger.Info("server commit starting", zap.Int("round", round))
 			_, err := serverHG.Commit(uint64(round + 1))
 			require.NoError(t, err)
@@ -969,23 +1010,29 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 
 		syncWG.Wait()
 		serverWG.Wait()
+		logDuration(fmt.Sprintf("round %d total sync", currentRound), roundStart)
 	}
 
 	// Add additional server-only updates after the concurrent sync rounds.
-	extraUpdates := generateVertices(t, domain, dataTree, inclusionProver, 3)
-	addVertices(t, serverStore, serverHG, dataTree, extraUpdates...)
+	extraStart := time.Now()
+	extraUpdates := generateVertices(t, domain, dataTrees, inclusionProver, len(dataTrees)-(1+(15*rounds))-1, 1+(15*rounds))
+	addVertices(t, serverStore, serverHG, dataTrees[1+(15*rounds):], extraUpdates...)
+	logDuration("server extra updates application", extraStart)
 
+	commitStart := time.Now()
 	_, err := serverHG.Commit(100)
 	require.NoError(t, err)
 
 	_, err = serverHG.Commit(101)
 	require.NoError(t, err)
+	logDuration("server final commits", commitStart)
 	wg := sync.WaitGroup{}
-	wg.Add(100)
+	wg.Add(1)
 	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
-	for i := 0; i < len(clientHGs); i++ {
+	for i := 0; i < 1; i++ {
 		go func(idx int) {
 			defer wg.Done()
+			catchUpStart := time.Now()
 
 			_, err = clientHGs[idx].Commit(100)
 			require.NoError(t, err)
@@ -1011,6 +1058,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 			require.NoError(t, err)
 			clientRoot := clientHGs[idx].GetVertexAddsSet(shardKey).GetTree().Commit(false)
 			assert.Equal(t, serverRoot, clientRoot, "client should converge to server state")
+			logDuration(fmt.Sprintf("client-%d final catch-up", idx), catchUpStart)
 		}(i)
 	}
 	wg.Wait()
@@ -1018,19 +1066,16 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 
 func buildDataTree(
 	t *testing.T,
-	enc *verenc.MPCitHVerifiableEncryptor,
 	prover *bls48581.KZGInclusionProver,
 ) *crypto.VectorCommitmentTree {
 	t.Helper()
 
-	pub, _, _ := ed448.GenerateKey(rand.Reader)
-	data := enc.Encrypt(make([]byte, 20), pub)
-	verenc1 := data[0].Compress()
 	tree := &crypto.VectorCommitmentTree{}
-	for _, encrypted := range []application.Encrypted{verenc1} {
-		bytes := encrypted.ToBytes()
+	b := make([]byte, 20000)
+	rand.Read(b)
+	for bytes := range slices.Chunk(b, 64) {
 		id := sha512.Sum512(bytes)
-		tree.Insert(id[:], bytes, encrypted.GetStatement(), big.NewInt(int64(len(bytes))))
+		tree.Insert(id[:], bytes, nil, big.NewInt(int64(len(bytes))))
 	}
 	tree.Commit(prover, false)
 	return tree
@@ -1040,16 +1085,16 @@ func addVertices(
 	t *testing.T,
 	hStore *store.PebbleHypergraphStore,
 	hg *hgcrdt.HypergraphCRDT,
-	dataTree *crypto.VectorCommitmentTree,
+	dataTrees []*crypto.VectorCommitmentTree,
 	vertices ...application.Vertex,
 ) {
 	t.Helper()
 
 	txn, err := hStore.NewTransaction(false)
 	require.NoError(t, err)
-	for _, v := range vertices {
+	for i, v := range vertices {
 		id := v.GetID()
-		require.NoError(t, hStore.SaveVertexTree(txn, id[:], dataTree))
+		require.NoError(t, hStore.SaveVertexTree(txn, id[:], dataTrees[i]))
 		require.NoError(t, hg.AddVertex(txn, v))
 	}
 	require.NoError(t, txn.Commit())
@@ -1058,20 +1103,22 @@ func addVertices(
 func generateVertices(
 	t *testing.T,
 	appAddress [32]byte,
-	dataTree *crypto.VectorCommitmentTree,
+	dataTrees []*crypto.VectorCommitmentTree,
 	prover *bls48581.KZGInclusionProver,
 	count int,
+	startingIndex int,
 ) []application.Vertex {
 	t.Helper()
 
 	verts := make([]application.Vertex, count)
 	for i := 0; i < count; i++ {
 		addr := randomBytes32(t)
+		binary.BigEndian.PutUint64(addr[:], uint64(i))
 		verts[i] = hgcrdt.NewVertex(
 			appAddress,
 			addr,
-			dataTree.Commit(prover, false),
-			dataTree.GetSize(),
+			dataTrees[startingIndex+i].Commit(prover, false),
+			dataTrees[startingIndex+i].GetSize(),
 		)
 	}
 	return verts

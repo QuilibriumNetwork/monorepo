@@ -405,15 +405,26 @@ func (p *PebbleHypergraphStore) NewTransaction(indexed bool) (
 	return p.db.NewBatch(indexed), nil
 }
 
-func (p *PebbleHypergraphStore) LoadVertexTree(id []byte) (
-	*tries.VectorCommitmentTree,
-	error,
-) {
+func (p *PebbleHypergraphStore) LoadVertexTreeRaw(id []byte) ([]byte, error) {
 	vertexData, closer, err := p.db.Get(hypergraphVertexDataKey(id))
 	if err != nil {
 		return nil, errors.Wrap(err, "load vertex data")
 	}
 	defer closer.Close()
+
+	data := make([]byte, len(vertexData))
+	copy(data, vertexData)
+	return data, nil
+}
+
+func (p *PebbleHypergraphStore) LoadVertexTree(id []byte) (
+	*tries.VectorCommitmentTree,
+	error,
+) {
+	vertexData, err := p.LoadVertexTreeRaw(id)
+	if err != nil {
+		return nil, err
+	}
 
 	tree, err := tries.DeserializeNonLazyTree(vertexData)
 	if err != nil {
@@ -443,6 +454,27 @@ func (p *PebbleHypergraphStore) SaveVertexTree(
 	return errors.Wrap(
 		txn.Set(hypergraphVertexDataKey(id), b),
 		"save vertex tree",
+	)
+}
+
+func (p *PebbleHypergraphStore) SaveVertexTreeRaw(
+	txn tries.TreeBackingStoreTransaction,
+	id []byte,
+	data []byte,
+) error {
+	if txn == nil {
+		return errors.Wrap(
+			errors.New("requires transaction"),
+			"save vertex tree raw",
+		)
+	}
+
+	buf := make([]byte, len(data))
+	copy(buf, data)
+
+	return errors.Wrap(
+		txn.Set(hypergraphVertexDataKey(id), buf),
+		"save vertex tree raw",
 	)
 }
 
@@ -1599,5 +1631,209 @@ func (p *PebbleHypergraphStore) ApplySnapshot(
 		"imported snapshot via raw key/value copy",
 		zap.Int("keys", count),
 	)
+	return nil
+}
+
+// PebbleRawLeafIterator implements tries.RawLeafIterator for direct DB iteration.
+type PebbleRawLeafIterator struct {
+	iter     store.Iterator
+	db       *PebbleHypergraphStore
+	shardKey tries.ShardKey
+	setType  string
+}
+
+var _ tries.RawLeafIterator = (*PebbleRawLeafIterator)(nil)
+
+func (p *PebbleRawLeafIterator) First() bool {
+	return p.iter.First()
+}
+
+func (p *PebbleRawLeafIterator) Next() bool {
+	return p.iter.Next()
+}
+
+func (p *PebbleRawLeafIterator) Valid() bool {
+	return p.iter.Valid()
+}
+
+func (p *PebbleRawLeafIterator) Close() error {
+	return p.iter.Close()
+}
+
+func (p *PebbleRawLeafIterator) Leaf() (*tries.RawLeafData, error) {
+	if !p.iter.Valid() {
+		return nil, errors.New("iterator not valid")
+	}
+
+	nodeData := p.iter.Value()
+	if len(nodeData) == 0 {
+		return nil, errors.New("empty node data")
+	}
+
+	// Only process leaf nodes (type byte == TypeLeaf)
+	if nodeData[0] != tries.TypeLeaf {
+		return nil, errors.New("not a leaf node")
+	}
+
+	leaf, err := tries.DeserializeLeafNode(p.db, bytes.NewReader(nodeData[1:]))
+	if err != nil {
+		return nil, errors.Wrap(err, "deserialize leaf")
+	}
+
+	result := &tries.RawLeafData{
+		Key:        slices.Clone(leaf.Key),
+		Value:      slices.Clone(leaf.Value),
+		HashTarget: slices.Clone(leaf.HashTarget),
+		Commitment: slices.Clone(leaf.Commitment),
+	}
+
+	if leaf.Size != nil {
+		result.Size = leaf.Size.FillBytes(make([]byte, 32))
+	}
+
+	// Load underlying vertex tree data if this is a vertex adds set
+	if p.setType == string(hypergraph.VertexAtomType) {
+		data, err := p.db.LoadVertexTreeRaw(leaf.Key)
+		if err == nil && len(data) > 0 {
+			result.UnderlyingData = data
+		}
+	}
+
+	return result, nil
+}
+
+// IterateRawLeaves returns an iterator over all leaf nodes for a given shard.
+// This iterates directly over the database tree node storage, bypassing any
+// in-memory tree caching.
+func (p *PebbleHypergraphStore) IterateRawLeaves(
+	setType string,
+	phaseType string,
+	shardKey tries.ShardKey,
+) (tries.RawLeafIterator, error) {
+	// Determine the key function based on set and phase type
+	var keyPrefix byte
+	switch hypergraph.AtomType(setType) {
+	case hypergraph.VertexAtomType:
+		switch hypergraph.PhaseType(phaseType) {
+		case hypergraph.AddsPhaseType:
+			keyPrefix = VERTEX_ADDS_TREE_NODE
+		case hypergraph.RemovesPhaseType:
+			keyPrefix = VERTEX_REMOVES_TREE_NODE
+		default:
+			return nil, errors.New("unknown phase type")
+		}
+	case hypergraph.HyperedgeAtomType:
+		switch hypergraph.PhaseType(phaseType) {
+		case hypergraph.AddsPhaseType:
+			keyPrefix = HYPEREDGE_ADDS_TREE_NODE
+		case hypergraph.RemovesPhaseType:
+			keyPrefix = HYPEREDGE_REMOVES_TREE_NODE
+		default:
+			return nil, errors.New("unknown phase type")
+		}
+	default:
+		return nil, errors.New("unknown set type")
+	}
+
+	// Build the key range for this shard's tree nodes
+	startKey := []byte{HYPERGRAPH_SHARD, keyPrefix}
+	startKey = append(startKey, shardKey.L1[:]...)
+	startKey = append(startKey, shardKey.L2[:]...)
+
+	// End key is the next shard (increment L2 by 1 for upper bound)
+	endKey := []byte{HYPERGRAPH_SHARD, keyPrefix}
+	endKey = append(endKey, shardKey.L1[:]...)
+	// Use L2 + 1 as upper bound, handling overflow
+	l2End := new(big.Int).SetBytes(shardKey.L2[:])
+	l2End.Add(l2End, big.NewInt(1))
+
+	// Check if L2 overflowed (would need more than 32 bytes)
+	if l2End.BitLen() > 256 {
+		// L2 overflow: increment L1 and set L2 to zero
+		l1End := [3]byte{shardKey.L1[0], shardKey.L1[1], shardKey.L1[2]}
+		carry := byte(1)
+		for i := 2; i >= 0; i-- {
+			sum := uint16(l1End[i]) + uint16(carry)
+			l1End[i] = byte(sum)
+			carry = byte(sum >> 8)
+		}
+		// If L1 also overflowed (carry is still 1), use max key
+		if carry == 1 {
+			// Both L1 and L2 at max - use prefix+1 as end key (next key prefix)
+			endKey = []byte{HYPERGRAPH_SHARD, keyPrefix + 1}
+		} else {
+			endKey = append(endKey[:2], l1End[:]...)
+			endKey = append(endKey, make([]byte, 32)...) // L2 = all zeros
+		}
+	} else {
+		l2EndBytes := l2End.FillBytes(make([]byte, 32))
+		endKey = append(endKey, l2EndBytes...)
+	}
+
+	iter, err := p.db.NewIter(startKey, endKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "create raw leaf iterator")
+	}
+
+	return &PebbleRawLeafIterator{
+		iter:     iter,
+		db:       p,
+		shardKey: shardKey,
+		setType:  setType,
+	}, nil
+}
+
+// InsertRawLeaf inserts a leaf node directly into the database without tree
+// traversal. This is used during raw sync to efficiently insert many leaves
+// without the overhead of maintaining tree structure.
+func (p *PebbleHypergraphStore) InsertRawLeaf(
+	txn tries.TreeBackingStoreTransaction,
+	setType string,
+	phaseType string,
+	shardKey tries.ShardKey,
+	leaf *tries.RawLeafData,
+) error {
+	if leaf == nil || len(leaf.Key) == 0 {
+		return errors.New("invalid leaf data")
+	}
+
+	// Reconstruct the leaf node
+	leafNode := &tries.LazyVectorCommitmentLeafNode{
+		Key:        leaf.Key,
+		Value:      leaf.Value,
+		HashTarget: leaf.HashTarget,
+		Commitment: leaf.Commitment,
+		Store:      p,
+	}
+
+	if len(leaf.Size) > 0 {
+		leafNode.Size = new(big.Int).SetBytes(leaf.Size)
+	} else {
+		leafNode.Size = big.NewInt(0)
+	}
+
+	// Get the full path for this leaf key
+	path := tries.GetFullPath(leaf.Key)
+
+	// Insert the node directly
+	if err := p.InsertNode(
+		txn,
+		setType,
+		phaseType,
+		shardKey,
+		leaf.Key,
+		path,
+		leafNode,
+	); err != nil {
+		return errors.Wrap(err, "insert raw leaf")
+	}
+
+	// If there's underlying vertex tree data, save it too
+	if len(leaf.UnderlyingData) > 0 {
+		if err := p.SaveVertexTreeRaw(txn, leaf.Key, leaf.UnderlyingData); err != nil {
+			return errors.Wrap(err, "insert raw leaf: save vertex tree")
+		}
+	}
+
 	return nil
 }

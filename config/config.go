@@ -85,9 +85,9 @@ func NewConfig(configPath string) (*Config, error) {
 }
 
 var BootstrapPeers = []string{
-	"/dns/bootstrap.quilibrium.com/udp/8336/quic-v1/p2p/Qme3g6rJWuz8HVXxpDb7aV2hiFq8bZJNqxMmwzmASzfq1M",
-	"/dns/quecifer.quilibrium.com/udp/8336/quic-v1/p2p/QmdWF9bGTH5mwJXkxrG859HA5r34MxXtMSTuEikSMDSESv",
-	"/dns/quagmire.quilibrium.com/udp/8336/quic-v1/p2p/QmaQ9KAaKtqXhYSQ5ARQNnn8B8474cWGvvD6PgJ4gAtMrx",
+	"/dnsaddr/quinoa.quilibrium.com/udp/8339/p2p/QmP9NNzAzRjCL8gdQBkKHwyBCWJGVb3jPrQzTveYdU24kH",
+	"/dnsaddr/qualia.quilibrium.com/udp/8339/p2p/QmRP1UPiDg1enHgN6wEL1Y4uUh1XKg7V3QExdBKV9BUUQf",
+	"/dnsaddr/quetzalcoatl.quilibrium.com/udp/8339/p2p/QmNq4xSqrxTKKtK7J6UFEa4unjsoULP2G4qWwwH5EKmoJj",
 	// "/ip4/204.186.74.46/udp/8316/quic-v1/p2p/QmeqBjm3iX7sdTieyto1gys5ruQrQNPKfaTGcVQQWJPYDV",
 	"/ip4/65.109.17.13/udp/8336/quic-v1/p2p/Qmc35n99eojSvW3PkbfBczJoSX92WmnnKh3Fg114ok3oo4",
 	"/ip4/65.108.194.84/udp/8336/quic-v1/p2p/QmP8C7g9ZRiWzhqN2AgFu5onS6HwHzR6Vv1TCHxAhnCSnq",
