@@ -1,3 +1,9 @@
+# 2.1.0.15
+- Adds direct db sync mode for hypersync
+- Removes blackhole detection entirely
+- Enforces reachability check with new approach
+- Resolves start/stop issue
+
 # 2.1.0.14
 - Resolves race condition around QC processing
 - Remove noisy sync logs
