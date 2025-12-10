@@ -1312,6 +1312,8 @@ func (b *BlossomSub) invokeConnectivityTest(
 		Multiaddrs: b.collectConnectivityMultiaddrs(),
 	}
 
+	b.logger.Debug("own multiaddrs", zap.Strings("mas", b.collectConnectivityMultiaddrs()))
+
 	resp, err := client.TestConnectivity(dialCtx, req)
 	if err != nil {
 		b.recordManualReachability(false)
