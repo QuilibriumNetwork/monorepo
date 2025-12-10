@@ -257,6 +257,96 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	ConnectivityService_TestConnectivity_FullMethodName = "/quilibrium.node.node.pb.ConnectivityService/TestConnectivity"
+)
+
+// ConnectivityServiceClient is the client API for ConnectivityService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type ConnectivityServiceClient interface {
+	TestConnectivity(ctx context.Context, in *ConnectivityTestRequest, opts ...grpc.CallOption) (*ConnectivityTestResponse, error)
+}
+
+type connectivityServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewConnectivityServiceClient(cc grpc.ClientConnInterface) ConnectivityServiceClient {
+	return &connectivityServiceClient{cc}
+}
+
+func (c *connectivityServiceClient) TestConnectivity(ctx context.Context, in *ConnectivityTestRequest, opts ...grpc.CallOption) (*ConnectivityTestResponse, error) {
+	out := new(ConnectivityTestResponse)
+	err := c.cc.Invoke(ctx, ConnectivityService_TestConnectivity_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ConnectivityServiceServer is the server API for ConnectivityService service.
+// All implementations must embed UnimplementedConnectivityServiceServer
+// for forward compatibility
+type ConnectivityServiceServer interface {
+	TestConnectivity(context.Context, *ConnectivityTestRequest) (*ConnectivityTestResponse, error)
+	mustEmbedUnimplementedConnectivityServiceServer()
+}
+
+// UnimplementedConnectivityServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedConnectivityServiceServer struct {
+}
+
+func (UnimplementedConnectivityServiceServer) TestConnectivity(context.Context, *ConnectivityTestRequest) (*ConnectivityTestResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TestConnectivity not implemented")
+}
+func (UnimplementedConnectivityServiceServer) mustEmbedUnimplementedConnectivityServiceServer() {}
+
+// UnsafeConnectivityServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ConnectivityServiceServer will
+// result in compilation errors.
+type UnsafeConnectivityServiceServer interface {
+	mustEmbedUnimplementedConnectivityServiceServer()
+}
+
+func RegisterConnectivityServiceServer(s grpc.ServiceRegistrar, srv ConnectivityServiceServer) {
+	s.RegisterService(&ConnectivityService_ServiceDesc, srv)
+}
+
+func _ConnectivityService_TestConnectivity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConnectivityTestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ConnectivityServiceServer).TestConnectivity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ConnectivityService_TestConnectivity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ConnectivityServiceServer).TestConnectivity(ctx, req.(*ConnectivityTestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ConnectivityService_ServiceDesc is the grpc.ServiceDesc for ConnectivityService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ConnectivityService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "quilibrium.node.node.pb.ConnectivityService",
+	HandlerType: (*ConnectivityServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "TestConnectivity",
+			Handler:    _ConnectivityService_TestConnectivity_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "node.proto",
+}
+
+const (
 	DataIPCService_Respawn_FullMethodName         = "/quilibrium.node.node.pb.DataIPCService/Respawn"
 	DataIPCService_CreateJoinProof_FullMethodName = "/quilibrium.node.node.pb.DataIPCService/CreateJoinProof"
 )

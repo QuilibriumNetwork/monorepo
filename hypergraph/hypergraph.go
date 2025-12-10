@@ -122,6 +122,12 @@ func (hg *HypergraphCRDT) cloneSetWithStore(
 
 func (hg *HypergraphCRDT) SetShutdownContext(ctx context.Context) {
 	hg.shutdownCtx = ctx
+	go func() {
+		select {
+		case <-hg.shutdownCtx.Done():
+			hg.snapshotMgr.release(hg.snapshotMgr.current)
+		}
+	}()
 }
 
 func (hg *HypergraphCRDT) contextWithShutdown(

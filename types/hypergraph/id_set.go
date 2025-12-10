@@ -40,6 +40,13 @@ type IdSet interface {
 		atom Atom,
 	) error
 
+	// AddRaw inserts raw leaf data directly into the backing store without tree
+	// traversal. This is used for raw sync operations where data is pre-serialized.
+	AddRaw(
+		txn tries.TreeBackingStoreTransaction,
+		leaf *tries.RawLeafData,
+	) error
+
 	// Delete removes an atom from the ID set. The atom must match the set's atom
 	// type or ErrInvalidAtomType is returned. The atom is removed from the
 	// backing tree store.

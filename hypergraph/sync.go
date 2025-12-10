@@ -23,18 +23,33 @@ import (
 // HyperStream is the gRPC method that handles synchronization.
 func (hg *HypergraphCRDT) HyperStream(
 	stream protobufs.HypergraphComparisonService_HyperStreamServer,
-) error {
+) (err error) {
 	requestCtx := stream.Context()
 	ctx, shutdownCancel := hg.contextWithShutdown(requestCtx)
 	defer shutdownCancel()
 
+	sessionLogger := hg.logger
+	sessionStart := time.Now()
+	defer func() {
+		sessionLogger.Info(
+			"hyperstream session finished",
+			zap.Duration("session_duration", time.Since(sessionStart)),
+			zap.Error(err),
+		)
+	}()
+
+	identifyStart := time.Now()
 	peerId, err := hg.authenticationProvider.Identify(requestCtx)
 	if err != nil {
 		return errors.Wrap(err, "hyper stream")
 	}
+	sessionLogger = sessionLogger.With(zap.String("peer_id", peerId.String()))
+	sessionLogger.Debug(
+		"identified peer",
+		zap.Duration("duration", time.Since(identifyStart)),
+	)
 
 	peerKey := peerId.String()
-	sessionLogger := hg.logger.With(zap.String("peer_id", peerId.String()))
 	if addr := peerIPFromContext(requestCtx); addr != "" {
 		sessionLogger = sessionLogger.With(zap.String("peer_ip", addr))
 	}
@@ -45,11 +60,16 @@ func (hg *HypergraphCRDT) HyperStream(
 		hg.syncController.EndSyncSession(peerKey)
 	}()
 
+	snapshotStart := time.Now()
 	handle := hg.snapshotMgr.acquire()
 	if handle == nil {
 		return errors.New("hypergraph snapshot unavailable")
 	}
 	defer hg.snapshotMgr.release(handle)
+	sessionLogger.Debug(
+		"snapshot acquisition complete",
+		zap.Duration("duration", time.Since(snapshotStart)),
+	)
 
 	root := handle.Root()
 	if len(root) != 0 {
@@ -63,7 +83,13 @@ func (hg *HypergraphCRDT) HyperStream(
 
 	snapshotStore := handle.Store()
 
-	err = hg.syncTreeServer(ctx, stream, snapshotStore, root, sessionLogger)
+	syncStart := time.Now()
+	err = hg.syncTreeServer(ctx, stream, snapshotStore, root, sessionLogger, handle)
+	sessionLogger.Info(
+		"syncTreeServer completed",
+		zap.Duration("sync_duration", time.Since(syncStart)),
+		zap.Error(err),
+	)
 
 	hg.syncController.SetStatus(peerKey, &hypergraph.SyncInfo{
 		Unreachable: false,
@@ -81,7 +107,7 @@ func (hg *HypergraphCRDT) Sync(
 	stream protobufs.HypergraphComparisonService_HyperStreamClient,
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
-) error {
+) (err error) {
 	const localSyncKey = "local-sync"
 	if !hg.syncController.TryEstablishSyncSession(localSyncKey) {
 		return errors.New("local sync already in progress")
@@ -93,14 +119,21 @@ func (hg *HypergraphCRDT) Sync(
 	hg.mu.Lock()
 	defer hg.mu.Unlock()
 
+	syncStart := time.Now()
+	shardKeyHex := hex.EncodeToString(slices.Concat(shardKey.L1[:], shardKey.L2[:]))
 	hg.logger.Info(
-		"sending initialization message",
-		zap.String(
-			"shard_key",
-			hex.EncodeToString(slices.Concat(shardKey.L1[:], shardKey.L2[:])),
-		),
+		"sync started",
+		zap.String("shard_key", shardKeyHex),
 		zap.Int("phase_set", int(phaseSet)),
 	)
+	defer func() {
+		hg.logger.Info(
+			"sync finished",
+			zap.String("shard_key", shardKeyHex),
+			zap.Duration("duration", time.Since(syncStart)),
+			zap.Error(err),
+		)
+	}()
 
 	var set hypergraph.IdSet
 	switch phaseSet {
@@ -119,6 +152,7 @@ func (hg *HypergraphCRDT) Sync(
 	path := hg.getCoveredPrefix()
 
 	// Send initial query for path
+	sendStart := time.Now()
 	if err := stream.Send(&protobufs.HypergraphComparison{
 		Payload: &protobufs.HypergraphComparison_Query{
 			Query: &protobufs.HypergraphComparisonQuery{
@@ -132,13 +166,24 @@ func (hg *HypergraphCRDT) Sync(
 	}); err != nil {
 		return err
 	}
+	hg.logger.Debug(
+		"sent initialization message",
+		zap.String("shard_key", shardKeyHex),
+		zap.Duration("duration", time.Since(sendStart)),
+	)
 
 	// hg.logger.Debug("server waiting for initial query")
+	recvStart := time.Now()
 	msg, err := stream.Recv()
 	if err != nil {
 		hg.logger.Info("initial recv failed", zap.Error(err))
 		return err
 	}
+	hg.logger.Debug(
+		"received initialization response",
+		zap.String("shard_key", shardKeyHex),
+		zap.Duration("duration", time.Since(recvStart)),
+	)
 	response := msg.GetResponse()
 	if response == nil {
 		return errors.New(
@@ -146,6 +191,7 @@ func (hg *HypergraphCRDT) Sync(
 		)
 	}
 
+	branchInfoStart := time.Now()
 	branchInfo, err := getBranchInfoFromTree(
 		hg.logger,
 		set.GetTree(),
@@ -154,6 +200,11 @@ func (hg *HypergraphCRDT) Sync(
 	if err != nil {
 		return err
 	}
+	hg.logger.Debug(
+		"constructed branch info",
+		zap.String("shard_key", shardKeyHex),
+		zap.Duration("duration", time.Since(branchInfoStart)),
+	)
 
 	resp := &protobufs.HypergraphComparison{
 		Payload: &protobufs.HypergraphComparison_Response{
@@ -161,9 +212,15 @@ func (hg *HypergraphCRDT) Sync(
 		},
 	}
 
+	responseSendStart := time.Now()
 	if err := stream.Send(resp); err != nil {
 		return err
 	}
+	hg.logger.Debug(
+		"sent initial branch info",
+		zap.String("shard_key", shardKeyHex),
+		zap.Duration("duration", time.Since(responseSendStart)),
+	)
 
 	ctx, cancel := context.WithCancel(stream.Context())
 
@@ -242,6 +299,8 @@ func (hg *HypergraphCRDT) Sync(
 			incomingResponsesOut,
 			true,
 			false,
+			shardKey,
+			phaseSet,
 		)
 		if err != nil {
 			hg.logger.Debug("error while syncing", zap.Error(err))
@@ -461,6 +520,398 @@ type streamManager struct {
 	localTree       *tries.LazyVectorCommitmentTree
 	localSet        hypergraph.IdSet
 	lastSent        time.Time
+	snapshot        *snapshotHandle
+}
+
+type rawVertexSaver interface {
+	SaveVertexTreeRaw(
+		txn tries.TreeBackingStoreTransaction,
+		id []byte,
+		data []byte,
+	) error
+}
+
+const (
+	leafAckMinTimeout    = 30 * time.Second
+	leafAckMaxTimeout    = 10 * time.Minute
+	leafAckPerLeafBudget = 20 * time.Millisecond // Generous budget for tree building overhead
+)
+
+func leafAckTimeout(count uint64) time.Duration {
+	// Calculate timeout with per-leaf budget plus a base overhead
+	baseOverhead := 30 * time.Second
+	timeout := baseOverhead + time.Duration(count)*leafAckPerLeafBudget
+
+	if timeout < leafAckMinTimeout {
+		return leafAckMinTimeout
+	}
+	if timeout > leafAckMaxTimeout {
+		return leafAckMaxTimeout
+	}
+	return timeout
+}
+
+func shouldUseRawSync(phaseSet protobufs.HypergraphPhaseSet) bool {
+	return phaseSet == protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS
+}
+
+// rawShardSync performs a full raw sync of all leaves from server to client.
+// This iterates directly over the database, bypassing in-memory tree caching
+// to ensure all leaves are sent even if the in-memory tree is stale.
+func (s *streamManager) rawShardSync(
+	shardKey tries.ShardKey,
+	phaseSet protobufs.HypergraphPhaseSet,
+	incomingLeaves <-chan *protobufs.HypergraphComparison,
+) error {
+	shardHex := hex.EncodeToString(shardKey.L2[:])
+	s.logger.Info(
+		"SERVER: starting raw shard sync (direct DB iteration)",
+		zap.String("shard_key", shardHex),
+	)
+	start := time.Now()
+
+	// Determine set and phase type strings
+	setType := string(hypergraph.VertexAtomType)
+	phaseType := string(hypergraph.AddsPhaseType)
+	switch phaseSet {
+	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS:
+		setType = string(hypergraph.VertexAtomType)
+		phaseType = string(hypergraph.AddsPhaseType)
+	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES:
+		setType = string(hypergraph.VertexAtomType)
+		phaseType = string(hypergraph.RemovesPhaseType)
+	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS:
+		setType = string(hypergraph.HyperedgeAtomType)
+		phaseType = string(hypergraph.AddsPhaseType)
+	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES:
+		setType = string(hypergraph.HyperedgeAtomType)
+		phaseType = string(hypergraph.RemovesPhaseType)
+	}
+
+	// Get raw leaf iterator from the database
+	iter, err := s.hypergraphStore.IterateRawLeaves(setType, phaseType, shardKey)
+	if err != nil {
+		s.logger.Error(
+			"SERVER: failed to create raw leaf iterator",
+			zap.String("shard_key", shardHex),
+			zap.Error(err),
+		)
+		return errors.Wrap(err, "raw shard sync")
+	}
+	defer iter.Close()
+
+	// First pass: count leaves
+	var count uint64
+	for valid := iter.First(); valid; valid = iter.Next() {
+		leaf, err := iter.Leaf()
+		if err != nil {
+			// Skip non-leaf nodes (branches)
+			continue
+		}
+		if leaf != nil {
+			count++
+		}
+	}
+
+	s.logger.Info(
+		"SERVER: raw sync sending metadata",
+		zap.String("shard_key", shardHex),
+		zap.Uint64("leaf_count", count),
+	)
+
+	// Send metadata with leaf count
+	if err := s.stream.Send(&protobufs.HypergraphComparison{
+		Payload: &protobufs.HypergraphComparison_Metadata{
+			Metadata: &protobufs.HypersyncMetadata{Leaves: count},
+		},
+	}); err != nil {
+		return errors.Wrap(err, "raw shard sync: send metadata")
+	}
+
+	// Create new iterator for sending (previous one is exhausted)
+	iter.Close()
+	iter, err = s.hypergraphStore.IterateRawLeaves(setType, phaseType, shardKey)
+	if err != nil {
+		return errors.Wrap(err, "raw shard sync: recreate iterator")
+	}
+	defer iter.Close()
+
+	// Second pass: send leaves
+	var sent uint64
+	for valid := iter.First(); valid; valid = iter.Next() {
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		default:
+		}
+
+		leaf, err := iter.Leaf()
+		if err != nil {
+			// Skip non-leaf nodes
+			continue
+		}
+		if leaf == nil {
+			continue
+		}
+
+		update := &protobufs.LeafData{
+			Key:            leaf.Key,
+			Value:          leaf.Value,
+			HashTarget:     leaf.HashTarget,
+			Size:           leaf.Size,
+			UnderlyingData: leaf.UnderlyingData,
+		}
+
+		msg := &protobufs.HypergraphComparison{
+			Payload: &protobufs.HypergraphComparison_LeafData{
+				LeafData: update,
+			},
+		}
+
+		if err := s.stream.Send(msg); err != nil {
+			return errors.Wrap(err, "raw shard sync: send leaf")
+		}
+
+		sent++
+		if sent%1000 == 0 {
+			s.logger.Debug(
+				"SERVER: raw sync progress",
+				zap.Uint64("sent", sent),
+				zap.Uint64("total", count),
+			)
+		}
+	}
+
+	s.logger.Info(
+		"SERVER: raw sync sent all leaves, waiting for ack",
+		zap.String("shard_key", shardHex),
+		zap.Uint64("sent", sent),
+	)
+
+	// Wait for acknowledgment
+	timeoutTimer := time.NewTimer(leafAckTimeout(count))
+	defer timeoutTimer.Stop()
+
+	select {
+	case <-s.ctx.Done():
+		return errors.Wrap(s.ctx.Err(), "raw shard sync: wait ack")
+	case msg, ok := <-incomingLeaves:
+		if !ok {
+			return errors.Wrap(errors.New("channel closed"), "raw shard sync: wait ack")
+		}
+		meta := msg.GetMetadata()
+		if meta == nil {
+			return errors.Wrap(errors.New("expected metadata ack"), "raw shard sync: wait ack")
+		}
+		if meta.Leaves != count {
+			return errors.Wrap(
+				fmt.Errorf("ack mismatch: expected %d, got %d", count, meta.Leaves),
+				"raw shard sync: wait ack",
+			)
+		}
+	case <-timeoutTimer.C:
+		return errors.Wrap(errors.New("timeout waiting for ack"), "raw shard sync")
+	}
+
+	s.logger.Info(
+		"SERVER: raw shard sync completed",
+		zap.String("shard_key", shardHex),
+		zap.Uint64("leaves_sent", sent),
+		zap.Duration("duration", time.Since(start)),
+	)
+	return nil
+}
+
+// receiveRawShardSync receives a full raw sync of all leaves from server.
+// It uses tree insertion to properly build the tree structure on the client.
+func (s *streamManager) receiveRawShardSync(
+	incomingLeaves <-chan *protobufs.HypergraphComparison,
+) error {
+	start := time.Now()
+	s.logger.Info("CLIENT: starting receiveRawShardSync")
+
+	expectedLeaves, err := s.awaitRawLeafMetadata(incomingLeaves)
+	if err != nil {
+		s.logger.Error("CLIENT: failed to receive metadata", zap.Error(err))
+		return err
+	}
+
+	s.logger.Info(
+		"CLIENT: received metadata",
+		zap.Uint64("expected_leaves", expectedLeaves),
+	)
+
+	var txn tries.TreeBackingStoreTransaction
+	var processed uint64
+	for processed < expectedLeaves {
+		if processed%100 == 0 {
+			if txn != nil {
+				if err := txn.Commit(); err != nil {
+					return errors.Wrap(err, "receive raw shard sync")
+				}
+			}
+			txn, err = s.hypergraphStore.NewTransaction(false)
+			if err != nil {
+				return errors.Wrap(err, "receive raw shard sync")
+			}
+		}
+
+		leafMsg, err := s.awaitLeafData(incomingLeaves)
+		if err != nil {
+			if txn != nil {
+				txn.Abort()
+			}
+			s.logger.Error(
+				"CLIENT: failed to receive leaf",
+				zap.Uint64("processed", processed),
+				zap.Uint64("expected", expectedLeaves),
+				zap.Error(err),
+			)
+			return err
+		}
+
+		// Deserialize the atom from the raw value
+		theirs := AtomFromBytes(leafMsg.Value)
+		if theirs == nil {
+			if txn != nil {
+				txn.Abort()
+			}
+			return errors.Wrap(
+				errors.New("invalid atom"),
+				"receive raw shard sync",
+			)
+		}
+
+		// Persist underlying vertex tree data if present
+		if len(leafMsg.UnderlyingData) > 0 {
+			if saver, ok := s.hypergraphStore.(rawVertexSaver); ok {
+				if err := saver.SaveVertexTreeRaw(
+					txn,
+					leafMsg.Key,
+					leafMsg.UnderlyingData,
+				); err != nil {
+					txn.Abort()
+					return errors.Wrap(err, "receive raw shard sync: save vertex tree")
+				}
+			}
+		}
+
+		// Use Add to properly build tree structure
+		if err := s.localSet.Add(txn, theirs); err != nil {
+			txn.Abort()
+			return errors.Wrap(err, "receive raw shard sync: add atom")
+		}
+
+		processed++
+		if processed%1000 == 0 {
+			s.logger.Debug(
+				"CLIENT: raw sync progress",
+				zap.Uint64("processed", processed),
+				zap.Uint64("expected", expectedLeaves),
+			)
+		}
+	}
+
+	if txn != nil {
+		if err := txn.Commit(); err != nil {
+			return errors.Wrap(err, "receive raw shard sync")
+		}
+	}
+
+	// Send acknowledgment
+	if err := s.sendLeafMetadata(expectedLeaves); err != nil {
+		return errors.Wrap(err, "receive raw shard sync")
+	}
+
+	s.logger.Info(
+		"CLIENT: raw shard sync completed",
+		zap.Uint64("leaves_received", expectedLeaves),
+		zap.Duration("duration", time.Since(start)),
+	)
+	return nil
+}
+
+func (s *streamManager) awaitRawLeafMetadata(
+	incomingLeaves <-chan *protobufs.HypergraphComparison,
+) (uint64, error) {
+	s.logger.Debug("CLIENT: awaitRawLeafMetadata waiting...")
+	select {
+	case <-s.ctx.Done():
+		return 0, errors.Wrap(
+			errors.New("context canceled"),
+			"await raw leaf metadata",
+		)
+	case msg, ok := <-incomingLeaves:
+		if !ok {
+			s.logger.Error("CLIENT: incomingLeaves channel closed")
+			return 0, errors.Wrap(
+				errors.New("channel closed"),
+				"await raw leaf metadata",
+			)
+		}
+		meta := msg.GetMetadata()
+		if meta == nil {
+			s.logger.Error(
+				"CLIENT: received non-metadata message while waiting for metadata",
+				zap.String("payload_type", fmt.Sprintf("%T", msg.Payload)),
+			)
+			return 0, errors.Wrap(
+				errors.New("invalid message: expected metadata"),
+				"await raw leaf metadata",
+			)
+		}
+		s.logger.Debug(
+			"CLIENT: received metadata",
+			zap.Uint64("leaves", meta.Leaves),
+		)
+		return meta.Leaves, nil
+	case <-time.After(leafAckTimeout(1)):
+		s.logger.Error("CLIENT: timeout waiting for metadata")
+		return 0, errors.Wrap(
+			errors.New("timed out waiting for metadata"),
+			"await raw leaf metadata",
+		)
+	}
+}
+
+func (s *streamManager) awaitLeafData(
+	incomingLeaves <-chan *protobufs.HypergraphComparison,
+) (*protobufs.LeafData, error) {
+	select {
+	case <-s.ctx.Done():
+		return nil, errors.Wrap(
+			errors.New("context canceled"),
+			"await leaf data",
+		)
+	case msg, ok := <-incomingLeaves:
+		if !ok {
+			return nil, errors.Wrap(
+				errors.New("channel closed"),
+				"await leaf data",
+			)
+		}
+		if leaf := msg.GetLeafData(); leaf != nil {
+			return leaf, nil
+		}
+		return nil, errors.Wrap(
+			errors.New("invalid message: expected leaf data"),
+			"await leaf data",
+		)
+	case <-time.After(leafAckTimeout(1)):
+		return nil, errors.Wrap(
+			errors.New("timed out waiting for leaf data"),
+			"await leaf data",
+		)
+	}
+}
+
+func (s *streamManager) sendLeafMetadata(leaves uint64) error {
+	s.logger.Debug("sending leaf metadata ack", zap.Uint64("leaves", leaves))
+	return s.stream.Send(&protobufs.HypergraphComparison{
+		Payload: &protobufs.HypergraphComparison_Metadata{
+			Metadata: &protobufs.HypersyncMetadata{Leaves: leaves},
+		},
+	})
 }
 
 // sendLeafData builds a LeafData message (with the full leaf data) for the
@@ -468,7 +919,20 @@ type streamManager struct {
 func (s *streamManager) sendLeafData(
 	path []int32,
 	incomingLeaves <-chan *protobufs.HypergraphComparison,
-) error {
+) (err error) {
+	start := time.Now()
+	pathHex := hex.EncodeToString(packPath(path))
+	var count uint64
+	s.logger.Debug("send leaf data start", zap.String("path", pathHex))
+	defer func() {
+		s.logger.Debug(
+			"send leaf data finished",
+			zap.String("path", pathHex),
+			zap.Uint64("leaves_sent", count),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err),
+		)
+	}()
 	send := func(leaf *tries.LazyVectorCommitmentLeafNode) error {
 		update := &protobufs.LeafData{
 			Key:        leaf.Key,
@@ -476,13 +940,12 @@ func (s *streamManager) sendLeafData(
 			HashTarget: leaf.HashTarget,
 			Size:       leaf.Size.FillBytes(make([]byte, 32)),
 		}
-		tree, err := s.hypergraphStore.LoadVertexTree(leaf.Key)
-		if err == nil {
-			b, err := tries.SerializeNonLazyTree(tree)
-			if err != nil {
-				return errors.Wrap(err, "send leaf data")
-			}
-			update.UnderlyingData = b
+		data, err := s.getSerializedLeaf(leaf.Key)
+		if err != nil {
+			return errors.Wrap(err, "send leaf data")
+		}
+		if len(data) != 0 {
+			update.UnderlyingData = data
 		}
 		msg := &protobufs.HypergraphComparison{
 			Payload: &protobufs.HypergraphComparison_LeafData{
@@ -530,6 +993,12 @@ func (s *streamManager) sendLeafData(
 	}
 
 	if node == nil {
+		s.logger.Warn(
+			"SERVER: node is nil at path, sending 0 leaves",
+			zap.String("path", pathHex),
+			zap.Bool("tree_nil", s.localTree == nil),
+			zap.Bool("root_nil", s.localTree != nil && s.localTree.Root == nil),
+		)
 		if err := s.stream.Send(&protobufs.HypergraphComparison{
 			Payload: &protobufs.HypergraphComparison_Metadata{
 				Metadata: &protobufs.HypersyncMetadata{Leaves: 0},
@@ -541,7 +1010,16 @@ func (s *streamManager) sendLeafData(
 	}
 
 	leaf, ok := node.(*tries.LazyVectorCommitmentLeafNode)
-	count := uint64(0)
+	count = uint64(0)
+
+	// Debug: log the node type
+	s.logger.Info(
+		"SERVER: node type at path",
+		zap.String("path", pathHex),
+		zap.Bool("is_leaf", ok),
+		zap.String("node_type", fmt.Sprintf("%T", node)),
+	)
+
 	if !ok {
 		children := tries.GetAllLeaves(
 			s.localTree.SetType,
@@ -555,6 +1033,12 @@ func (s *streamManager) sendLeafData(
 			}
 			count++
 		}
+		s.logger.Info(
+			"SERVER: sending metadata with leaf count (branch)",
+			zap.String("path", pathHex),
+			zap.Uint64("leaf_count", count),
+			zap.Int("children_slice_len", len(children)),
+		)
 		if err := s.stream.Send(&protobufs.HypergraphComparison{
 			Payload: &protobufs.HypergraphComparison_Metadata{
 				Metadata: &protobufs.HypersyncMetadata{Leaves: count},
@@ -573,6 +1057,11 @@ func (s *streamManager) sendLeafData(
 		}
 	} else {
 		count = 1
+		s.logger.Info(
+			"SERVER: root is a single leaf, sending 1 leaf",
+			zap.String("path", pathHex),
+			zap.String("leaf_key", hex.EncodeToString(leaf.Key)),
+		)
 		if err := s.stream.Send(&protobufs.HypergraphComparison{
 			Payload: &protobufs.HypergraphComparison_Metadata{
 				Metadata: &protobufs.HypersyncMetadata{Leaves: count},
@@ -584,6 +1073,9 @@ func (s *streamManager) sendLeafData(
 			return err
 		}
 	}
+
+	timeoutTimer := time.NewTimer(leafAckTimeout(count))
+	defer timeoutTimer.Stop()
 
 	select {
 	case <-s.ctx.Done():
@@ -615,12 +1107,81 @@ func (s *streamManager) sendLeafData(
 			errors.New("invalid message"),
 			"send leaf data",
 		)
-	case <-time.After(30 * time.Second):
+	case <-timeoutTimer.C:
 		return errors.Wrap(
 			errors.New("timed out"),
 			"send leaf data",
 		)
 	}
+}
+
+func (s *streamManager) getSerializedLeaf(key []byte) ([]byte, error) {
+	if s.snapshot != nil {
+		if data, ok := s.snapshot.getLeafData(key); ok {
+			return data, nil
+		}
+		if s.snapshot.isLeafMiss(key) {
+			return nil, nil
+		}
+	}
+
+	type rawVertexLoader interface {
+		LoadVertexTreeRaw(id []byte) ([]byte, error)
+	}
+
+	if loader, ok := s.hypergraphStore.(rawVertexLoader); ok {
+		data, err := loader.LoadVertexTreeRaw(key)
+		if err != nil {
+			if s.snapshot != nil {
+				s.snapshot.markLeafMiss(key)
+			}
+			return nil, nil
+		}
+		if len(data) != 0 {
+			if s.snapshot != nil {
+				s.snapshot.storeLeafData(key, data)
+			}
+			return data, nil
+		}
+	}
+
+	tree, err := s.hypergraphStore.LoadVertexTree(key)
+	if err != nil {
+		if s.snapshot != nil {
+			s.snapshot.markLeafMiss(key)
+		}
+		return nil, nil
+	}
+	data, err := tries.SerializeNonLazyTree(tree)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.snapshot != nil {
+		s.snapshot.storeLeafData(key, data)
+	}
+	return data, nil
+}
+
+func (s *streamManager) getBranchInfo(
+	path []int32,
+) (*protobufs.HypergraphComparisonResponse, error) {
+	if s.snapshot != nil {
+		if resp, ok := s.snapshot.getBranchInfo(path); ok {
+			return resp, nil
+		}
+	}
+
+	resp, err := getBranchInfoFromTree(s.logger, s.localTree, path)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.snapshot != nil {
+		s.snapshot.storeBranchInfo(path, resp)
+	}
+
+	return resp, nil
 }
 
 // getNodeAtPath traverses the tree along the provided nibble path. It returns
@@ -845,9 +1406,20 @@ func (s *streamManager) queryNext(
 	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
 	path []int32,
 ) (
-	*protobufs.HypergraphComparisonResponse,
-	error,
+	resp *protobufs.HypergraphComparisonResponse,
+	err error,
 ) {
+	start := time.Now()
+	pathHex := hex.EncodeToString(packPath(path))
+	s.logger.Debug("query next start", zap.String("path", pathHex))
+	defer func() {
+		s.logger.Debug(
+			"query next finished",
+			zap.String("path", pathHex),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err),
+		)
+	}()
 	if err := s.stream.Send(&protobufs.HypergraphComparison{
 		Payload: &protobufs.HypergraphComparison_Query{
 			Query: &protobufs.HypergraphComparisonQuery{
@@ -865,13 +1437,14 @@ func (s *streamManager) queryNext(
 			errors.New("context canceled"),
 			"handle query",
 		)
-	case resp, ok := <-incomingResponses:
+	case r, ok := <-incomingResponses:
 		if !ok {
 			return nil, errors.Wrap(
 				errors.New("channel closed"),
 				"handle query",
 			)
 		}
+		resp = r
 		return resp, nil
 	case <-time.After(30 * time.Second):
 		return nil, errors.Wrap(
@@ -883,8 +1456,18 @@ func (s *streamManager) queryNext(
 
 func (s *streamManager) handleLeafData(
 	incomingLeaves <-chan *protobufs.HypergraphComparison,
-) error {
-	expectedLeaves := uint64(0)
+) (err error) {
+	start := time.Now()
+	var expectedLeaves uint64
+	s.logger.Debug("handle leaf data start")
+	defer func() {
+		s.logger.Debug(
+			"handle leaf data finished",
+			zap.Uint64("leaves_expected", expectedLeaves),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err),
+		)
+	}()
 	select {
 	case <-s.ctx.Done():
 		return errors.Wrap(
@@ -918,7 +1501,6 @@ func (s *streamManager) handleLeafData(
 	// s.logger.Info("expecting leaves", zap.Uint64("count", expectedLeaves))
 
 	var txn tries.TreeBackingStoreTransaction
-	var err error
 	for i := uint64(0); i < expectedLeaves; i++ {
 		if i%100 == 0 {
 			if txn != nil {
@@ -968,30 +1550,9 @@ func (s *streamManager) handleLeafData(
 			// )
 
 			theirs := AtomFromBytes(remoteUpdate.Value)
-			if len(remoteUpdate.UnderlyingData) != 0 {
-				tree, err := tries.DeserializeNonLazyTree(remoteUpdate.UnderlyingData)
-				if err != nil {
-					s.logger.Error("server returned invalid tree", zap.Error(err))
-					txn.Abort()
-					return err
-				}
-
-				err = s.localSet.ValidateTree(
-					remoteUpdate.Key,
-					remoteUpdate.Value,
-					tree,
-				)
-				if err != nil {
-					s.logger.Error("server returned invalid tree", zap.Error(err))
-					txn.Abort()
-					return err
-				}
-
-				err = s.hypergraphStore.SaveVertexTree(txn, remoteUpdate.Key, tree)
-				if err != nil {
-					txn.Abort()
-					return err
-				}
+			if err := s.persistLeafTree(txn, remoteUpdate); err != nil {
+				txn.Abort()
+				return err
 			}
 
 			err := s.localSet.Add(txn, theirs)
@@ -1030,13 +1591,72 @@ func (s *streamManager) handleLeafData(
 	return nil
 }
 
+func (s *streamManager) persistLeafTree(
+	txn tries.TreeBackingStoreTransaction,
+	update *protobufs.LeafData,
+) error {
+	if len(update.UnderlyingData) == 0 {
+		return nil
+	}
+
+	needsValidation := s.requiresTreeValidation()
+	_, canSaveRaw := s.hypergraphStore.(rawVertexSaver)
+
+	var tree *tries.VectorCommitmentTree
+	var err error
+	if needsValidation || !canSaveRaw {
+		tree, err = tries.DeserializeNonLazyTree(update.UnderlyingData)
+		if err != nil {
+			s.logger.Error("server returned invalid tree", zap.Error(err))
+			return err
+		}
+	}
+
+	if needsValidation {
+		if err := s.localSet.ValidateTree(
+			update.Key,
+			update.Value,
+			tree,
+		); err != nil {
+			s.logger.Error("server returned invalid tree", zap.Error(err))
+			return err
+		}
+	}
+
+	if saver, ok := s.hypergraphStore.(rawVertexSaver); ok {
+		buf := make([]byte, len(update.UnderlyingData))
+		copy(buf, update.UnderlyingData)
+		return saver.SaveVertexTreeRaw(txn, update.Key, buf)
+	}
+
+	return s.hypergraphStore.SaveVertexTree(txn, update.Key, tree)
+}
+
+func (s *streamManager) requiresTreeValidation() bool {
+	if typed, ok := s.localSet.(*idSet); ok {
+		return typed.validator != nil
+	}
+	return false
+}
+
 func (s *streamManager) handleQueryNext(
 	incomingQueries <-chan *protobufs.HypergraphComparisonQuery,
 	path []int32,
 ) (
-	*protobufs.HypergraphComparisonResponse,
-	error,
+	branch *protobufs.HypergraphComparisonResponse,
+	err error,
 ) {
+	start := time.Now()
+	pathHex := hex.EncodeToString(packPath(path))
+	s.logger.Debug("handle query next start", zap.String("path", pathHex))
+	defer func() {
+		s.logger.Debug(
+			"handle query next finished",
+			zap.String("path", pathHex),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err),
+		)
+	}()
 	select {
 	case <-s.ctx.Done():
 		return nil, errors.Wrap(
@@ -1058,9 +1678,9 @@ func (s *streamManager) handleQueryNext(
 			)
 		}
 
-		branchInfo, err := getBranchInfoFromTree(s.logger, s.localTree, path)
-		if err != nil {
-			return nil, errors.Wrap(err, "handle query next")
+		branchInfo, berr := s.getBranchInfo(path)
+		if berr != nil {
+			return nil, errors.Wrap(berr, "handle query next")
 		}
 
 		resp := &protobufs.HypergraphComparison{
@@ -1073,7 +1693,8 @@ func (s *streamManager) handleQueryNext(
 			return nil, errors.Wrap(err, "handle query next")
 		}
 
-		return branchInfo, nil
+		branch = branchInfo
+		return branch, nil
 	case <-time.After(30 * time.Second):
 		return nil, errors.Wrap(
 			errors.New("timed out"),
@@ -1086,11 +1707,22 @@ func (s *streamManager) descendIndex(
 	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
 	path []int32,
 ) (
-	*protobufs.HypergraphComparisonResponse,
-	*protobufs.HypergraphComparisonResponse,
-	error,
+	local *protobufs.HypergraphComparisonResponse,
+	remote *protobufs.HypergraphComparisonResponse,
+	err error,
 ) {
-	branchInfo, err := getBranchInfoFromTree(s.logger, s.localTree, path)
+	start := time.Now()
+	pathHex := hex.EncodeToString(packPath(path))
+	s.logger.Debug("descend index start", zap.String("path", pathHex))
+	defer func() {
+		s.logger.Debug(
+			"descend index finished",
+			zap.String("path", pathHex),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err),
+		)
+	}()
+	branchInfo, err := s.getBranchInfo(path)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "descend index")
 	}
@@ -1111,7 +1743,7 @@ func (s *streamManager) descendIndex(
 			errors.New("context canceled"),
 			"handle query next",
 		)
-	case resp, ok := <-incomingResponses:
+	case r, ok := <-incomingResponses:
 		if !ok {
 			return nil, nil, errors.Wrap(
 				errors.New("channel closed"),
@@ -1119,18 +1751,20 @@ func (s *streamManager) descendIndex(
 			)
 		}
 
-		if slices.Compare(branchInfo.Path, resp.Path) != 0 {
+		if slices.Compare(branchInfo.Path, r.Path) != 0 {
 			return nil, nil, errors.Wrap(
 				fmt.Errorf(
 					"invalid path received: %v, expected: %v",
-					resp.Path,
+					r.Path,
 					branchInfo.Path,
 				),
 				"descend index",
 			)
 		}
 
-		return branchInfo, resp, nil
+		local = branchInfo
+		remote = r
+		return local, remote, nil
 	case <-time.After(30 * time.Second):
 		return nil, nil, errors.Wrap(
 			errors.New("timed out"),
@@ -1155,7 +1789,22 @@ func (s *streamManager) walk(
 	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
 	init bool,
 	isServer bool,
+	shardKey tries.ShardKey,
+	phaseSet protobufs.HypergraphPhaseSet,
 ) error {
+	// Check if we should use raw sync mode for this phase set
+	if init && shouldUseRawSync(phaseSet) {
+		s.logger.Info(
+			"walk: using raw sync mode",
+			zap.Bool("is_server", isServer),
+			zap.Int("phase_set", int(phaseSet)),
+		)
+		if isServer {
+			return s.rawShardSync(shardKey, phaseSet, incomingLeaves)
+		}
+		return s.receiveRawShardSync(incomingLeaves)
+	}
+
 	select {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
@@ -1249,6 +1898,8 @@ func (s *streamManager) walk(
 				incomingResponses,
 				false,
 				isServer,
+				shardKey,
+				phaseSet,
 			)
 		} else {
 			// s.logger.Debug("remote prefix longer, traversing local to path", pathString)
@@ -1324,6 +1975,8 @@ func (s *streamManager) walk(
 				incomingResponses,
 				false,
 				isServer,
+				shardKey,
+				phaseSet,
 			)
 		}
 	} else {
@@ -1411,6 +2064,8 @@ func (s *streamManager) walk(
 							incomingResponses,
 							false,
 							isServer,
+							shardKey,
+							phaseSet,
 						); err != nil {
 							return errors.Wrap(err, "walk")
 						}
@@ -1447,6 +2102,7 @@ func (hg *HypergraphCRDT) syncTreeServer(
 	snapshotStore tries.TreeBackingStore,
 	snapshotRoot []byte,
 	sessionLogger *zap.Logger,
+	handle *snapshotHandle,
 ) error {
 	logger := sessionLogger
 	if logger == nil {
@@ -1549,6 +2205,7 @@ func (hg *HypergraphCRDT) syncTreeServer(
 				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
+				close(incomingLeavesIn)
 				return
 			}
 			if err != nil {
@@ -1556,6 +2213,7 @@ func (hg *HypergraphCRDT) syncTreeServer(
 				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
+				close(incomingLeavesIn)
 				return
 			}
 			if msg == nil {
@@ -1567,6 +2225,7 @@ func (hg *HypergraphCRDT) syncTreeServer(
 				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
+				close(incomingLeavesIn)
 				return
 			case *protobufs.HypergraphComparison_Metadata:
 				incomingLeavesIn <- msg
@@ -1585,7 +2244,9 @@ func (hg *HypergraphCRDT) syncTreeServer(
 		stream:          stream,
 		hypergraphStore: snapshotStore,
 		localTree:       idSet.GetTree(),
+		localSet:        idSet,
 		lastSent:        time.Now(),
+		snapshot:        handle,
 	}
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -1600,6 +2261,8 @@ func (hg *HypergraphCRDT) syncTreeServer(
 			incomingResponsesOut,
 			true,
 			true,
+			shardKey,
+			query.PhaseSet,
 		)
 		if err != nil {
 			logger.Error("error while syncing", zap.Error(err))

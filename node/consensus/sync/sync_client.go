@@ -33,6 +33,7 @@ type GlobalSyncClient struct {
 	blsConstructor    crypto.BlsConstructor
 	proposalProcessor ProposalProcessor[*protobufs.GlobalProposal]
 	config            *config.Config
+	validateFrames    bool
 }
 
 func NewGlobalSyncClient(
@@ -46,7 +47,12 @@ func NewGlobalSyncClient(
 		config:            config,
 		blsConstructor:    blsConstructor,
 		proposalProcessor: proposalProcessor,
+		validateFrames:    true,
 	}
+}
+
+func (g *GlobalSyncClient) SetValidationEnabled(enabled bool) {
+	g.validateFrames = enabled
 }
 
 func (g *GlobalSyncClient) Sync(
@@ -97,12 +103,14 @@ func (g *GlobalSyncClient) Sync(
 			logger.Debug("received empty response from peer")
 			return ErrInvalidResponse
 		}
-		if err := response.Proposal.Validate(); err != nil {
-			logger.Debug(
-				"received invalid response from peer",
-				zap.Error(err),
-			)
-			return ErrInvalidResponse
+		if g.validateFrames {
+			if err := response.Proposal.Validate(); err != nil {
+				logger.Debug(
+					"received invalid response from peer",
+					zap.Error(err),
+				)
+				return ErrInvalidResponse
+			}
 		}
 
 		if len(expectedIdentity) != 0 {
@@ -138,15 +146,17 @@ func (g *GlobalSyncClient) Sync(
 			),
 		)
 
-		if _, err := g.frameProver.VerifyGlobalFrameHeader(
-			response.Proposal.State.Header,
-			g.blsConstructor,
-		); err != nil {
-			logger.Debug(
-				"received invalid frame from peer",
-				zap.Error(err),
-			)
-			return ErrInvalidResponse
+		if g.validateFrames {
+			if _, err := g.frameProver.VerifyGlobalFrameHeader(
+				response.Proposal.State.Header,
+				g.blsConstructor,
+			); err != nil {
+				logger.Debug(
+					"received invalid frame from peer",
+					zap.Error(err),
+				)
+				return ErrInvalidResponse
+			}
 		}
 
 		g.proposalProcessor.AddProposal(response.Proposal)

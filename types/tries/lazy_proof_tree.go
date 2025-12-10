@@ -426,6 +426,28 @@ type VertexDataIterator interface {
 	Last() bool
 }
 
+// RawLeafData contains serialized leaf node data for raw sync operations.
+type RawLeafData struct {
+	Key            []byte // The leaf key (atom ID)
+	Value          []byte // The atom bytes
+	HashTarget     []byte // Hash target for commitment
+	Commitment     []byte // Pre-computed commitment
+	Size           []byte // Size as big-endian bytes
+	UnderlyingData []byte // Serialized vertex tree data (if applicable)
+}
+
+// RawLeafIterator provides direct database iteration over leaf nodes,
+// bypassing in-memory tree structures for efficient raw sync.
+type RawLeafIterator interface {
+	First() bool
+	Next() bool
+	Valid() bool
+	// Leaf returns the current leaf data. The returned data is only valid
+	// until the next call to Next() or Close().
+	Leaf() (*RawLeafData, error)
+	Close() error
+}
+
 type TreeBackingStore interface {
 	NewTransaction(indexed bool) (TreeBackingStoreTransaction, error)
 	GetNodeByKey(
@@ -529,6 +551,24 @@ type TreeBackingStore interface {
 	) ([]byte, error)
 	GetRootCommits(frameNumber uint64) (map[ShardKey][][]byte, error)
 	NewSnapshot() (TreeBackingStore, func(), error)
+	// IterateRawLeaves returns an iterator over all leaf nodes for a given
+	// shard and phase set. This bypasses in-memory tree caching and reads
+	// directly from the database for raw sync operations.
+	IterateRawLeaves(
+		setType string,
+		phaseType string,
+		shardKey ShardKey,
+	) (RawLeafIterator, error)
+	// InsertRawLeaf inserts a leaf node directly into the database without
+	// tree traversal. This is used for raw sync operations where the tree
+	// structure will be rebuilt later or managed externally.
+	InsertRawLeaf(
+		txn TreeBackingStoreTransaction,
+		setType string,
+		phaseType string,
+		shardKey ShardKey,
+		leaf *RawLeafData,
+	) error
 }
 
 // LazyVectorCommitmentTree is a lazy-loaded (from a TreeBackingStore based

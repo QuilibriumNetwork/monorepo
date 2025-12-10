@@ -42,9 +42,6 @@ var (
 	// been dialed too frequently
 	ErrDialBackoff = errors.New("dial backoff")
 
-	// ErrDialRefusedBlackHole is returned when we are in a black holed environment
-	ErrDialRefusedBlackHole = errors.New("dial refused because of black hole")
-
 	// ErrDialToSelf is returned if we attempt to dial our own peer
 	ErrDialToSelf = errors.New("dial to self attempted")
 
@@ -534,12 +531,6 @@ func (s *Swarm) filterKnownUndialables(p peer.ID, addrs []ma.Multiaddr) (goodAdd
 	// We don't return an error for these addresses
 	addrs = filterLowPriorityAddresses(addrs)
 
-	// remove black holed addrs
-	addrs, blackHoledAddrs := s.bhd.FilterAddrs(addrs)
-	for _, a := range blackHoledAddrs {
-		addrErrs = append(addrErrs, TransportError{Address: a, Cause: ErrDialRefusedBlackHole})
-	}
-
 	return ma.FilterAddrs(addrs,
 		// Linux and BSD treat an unspecified address when dialing as a localhost address.
 		// Windows doesn't support this. We filter all such addresses out because peers
@@ -612,11 +603,6 @@ func (s *Swarm) dialAddr(ctx context.Context, p peer.ID, addr ma.Multiaddr, updC
 	} else {
 		connC, err = tpt.Dial(ctx, addr, p)
 	}
-
-	// We're recording any error as a failure here.
-	// Notably, this also applies to cancellations (i.e. if another dial attempt was faster).
-	// This is ok since the black hole detector uses a very low threshold (5%).
-	s.bhd.RecordResult(addr, err == nil)
 
 	if err != nil {
 		if s.metricsTracer != nil {

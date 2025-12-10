@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha512"
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"slices"
 
@@ -1746,14 +1747,33 @@ func (i *MintTransactionInput) verifyWithProofOfMeaningfulWork(
 			)
 		}
 
-		frame, err := tx.clockStore.GetGlobalClockFrame(
-			binary.BigEndian.Uint64(tx.Outputs[0].FrameNumber),
-		)
+		frameNumber := binary.BigEndian.Uint64(tx.Outputs[0].FrameNumber)
+		frame, err := tx.clockStore.GetGlobalClockFrame(frameNumber)
 		if err != nil {
-			return errors.Wrap(
-				err,
-				"verify with mint with proof of meaningful work",
+			frames, err := tx.clockStore.RangeGlobalClockFrameCandidates(
+				frameNumber,
+				frameNumber,
 			)
+			if err != nil {
+				return errors.Wrap(errors.Wrap(
+					err,
+					fmt.Sprintf("frame number: %d", frameNumber),
+				), "verify with mint with proof of meaningful work")
+			}
+			if !frames.First() || !frames.Valid() {
+				return errors.Wrap(errors.Wrap(
+					errors.New("not found"),
+					fmt.Sprintf("frame number: %d", frameNumber),
+				), "verify with mint with proof of meaningful work")
+			}
+			frames.Close()
+			frame, err = frames.Value()
+			if err != nil {
+				return errors.Wrap(errors.Wrap(
+					err,
+					fmt.Sprintf("frame number: %d", frameNumber),
+				), "verify with mint with proof of meaningful work")
+			}
 		}
 
 		rewardRoot = frame.Header.ProverTreeCommitment

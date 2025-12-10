@@ -1,18 +1,13 @@
 package global
 
 import (
-	"bytes"
 	"context"
-	"math/big"
-	"slices"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
-	"golang.org/x/crypto/sha3"
 	keyedaggregator "source.quilibrium.com/quilibrium/monorepo/node/keyedaggregator"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 // GlobalLivenessProvider implements LivenessProvider
@@ -115,82 +110,10 @@ func (p *GlobalLivenessProvider) Collect(
 		)
 	}
 
-	commitments := make([]*tries.VectorCommitmentTree, 256)
-	for i := range 256 {
-		commitments[i] = &tries.VectorCommitmentTree{}
-	}
-
-	proverRoot := make([]byte, 64)
-
-	commitSet, err := p.engine.hypergraph.Commit(frameNumber)
+	commitmentHash, err := p.engine.rebuildShardCommitments(frameNumber, rank)
 	if err != nil {
-		p.engine.logger.Error(
-			"could not commit",
-			zap.Error(err),
-		)
 		return GlobalCollectedCommitments{}, errors.Wrap(err, "collect")
 	}
-	collected := 0
-
-	if err := p.engine.rebuildAppShardCache(rank); err != nil {
-		p.engine.logger.Warn(
-			"could not rebuild app shard cache",
-			zap.Uint64("rank", rank),
-			zap.Error(err),
-		)
-	}
-
-	// The poseidon hash's field is < 0x3fff...ffff, so we use the upper two bits
-	// to fold the four hypergraph phase/sets into the three different tree
-	// partitions the L1 key designates
-	for sk, s := range commitSet {
-		if !bytes.Equal(sk.L1[:], []byte{0x00, 0x00, 0x00}) {
-			collected++
-
-			for phaseSet := 0; phaseSet < 4; phaseSet++ {
-				commit := s[phaseSet]
-				foldedShardKey := make([]byte, 32)
-				copy(foldedShardKey, sk.L2[:])
-
-				// 0 -> 0b00 -> 0b00000000 -> 0x00
-				// 1 -> 0b01 -> 0b01000000 -> 0x40
-				// 2 -> 0b10 -> 0b10000000 -> 0x80
-				// 3 -> 0b11 -> 0b11000000 -> 0xC0
-				foldedShardKey[0] |= byte(phaseSet << 6)
-				for l1Idx := 0; l1Idx < 3; l1Idx++ {
-					err := commitments[sk.L1[l1Idx]].Insert(
-						foldedShardKey,
-						commit,
-						nil,
-						big.NewInt(int64(len(commit))),
-					)
-					if err != nil {
-						return GlobalCollectedCommitments{}, errors.Wrap(err, "collect")
-					}
-				}
-			}
-		} else {
-			// Prover set is strictly vertex adds, so we simply take the first.
-			proverRoot = s[0]
-		}
-	}
-
-	shardCommitments := make([][]byte, 256)
-
-	for i := 0; i < 256; i++ {
-		shardCommitments[i] = commitments[i].Commit(p.engine.inclusionProver, false)
-	}
-
-	preimage := slices.Concat(
-		slices.Concat(shardCommitments...),
-		proverRoot,
-	)
-
-	commitmentHash := sha3.Sum256(preimage)
-
-	p.engine.shardCommitments = shardCommitments
-	p.engine.proverRoot = proverRoot
-	p.engine.commitmentHash = commitmentHash[:]
 
 	// Store the accepted messages as canonical bytes for inclusion in the frame
 	collectedMsgs := make([][]byte, 0, len(acceptedMessages))
@@ -199,12 +122,9 @@ func (p *GlobalLivenessProvider) Collect(
 	}
 	p.engine.collectedMessages = collectedMsgs
 
-	// Update metrics
-	shardCommitmentsCollected.Set(float64(collected))
-
 	return GlobalCollectedCommitments{
 		frameNumber:    frameNumber,
-		commitmentHash: commitmentHash[:],
+		commitmentHash: commitmentHash,
 		prover:         p.engine.getProverAddress(),
 	}, nil
 }

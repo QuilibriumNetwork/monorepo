@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -355,50 +354,6 @@ func TestAddrsForDialFiltering(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestBlackHoledAddrBlocked(t *testing.T) {
-	resolver, err := madns.NewResolver()
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := newTestSwarmWithResolver(t, resolver)
-	defer s.Close()
-
-	n := 3
-	s.bhd.ipv6 = &BlackHoleSuccessCounter{N: n, MinSuccesses: 1, Name: "IPv6"}
-
-	// All dials to this addr will fail.
-	// manet.IsPublic is aggressive for IPv6 addresses. Use a NAT64 address.
-	addr := tStringCast("/ip6/64:ff9b::1.2.3.4/tcp/54321/")
-
-	p, err := test.RandPeerID()
-	if err != nil {
-		t.Error(err)
-	}
-	s.Peerstore().AddAddr(p, addr, peerstore.PermanentAddrTTL)
-
-	// do 1 extra dial to ensure that the blackHoleDetector state is updated since it
-	// happens in a different goroutine
-	for i := 0; i < n+1; i++ {
-		s.backf.Clear(p)
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		conn, err := s.DialPeer(ctx, p)
-		if err == nil || conn != nil {
-			t.Fatalf("expected dial to fail")
-		}
-		cancel()
-	}
-	s.backf.Clear(p)
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	conn, err := s.DialPeer(ctx, p)
-	require.Nil(t, conn)
-	var de *DialError
-	if !errors.As(err, &de) {
-		t.Fatalf("expected to receive an error of type *DialError, got %s of type %T", err, err)
-	}
-	require.ErrorIs(t, err, ErrDialRefusedBlackHole)
 }
 
 type mockDNSResolver struct {

@@ -220,6 +220,7 @@ func (r *RPCServer) GetNodeInfo(
 		RunningWorkers:   uint32(len(workers)),
 		AllocatedWorkers: allocated,
 		PatchNumber:      append([]byte{}, config.GetPatchNumber()),
+		Reachable:        r.pubSub.Reachability().Value,
 	}, nil
 }
 

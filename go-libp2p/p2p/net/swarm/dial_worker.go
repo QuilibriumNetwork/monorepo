@@ -366,15 +366,11 @@ loop:
 				continue loop
 			}
 
-			// it must be an error -- add backoff if applicable and dispatch
-			// ErrDialRefusedBlackHole shouldn't end up here, just a safety check
-			if res.Err != ErrDialRefusedBlackHole && res.Err != context.Canceled && !w.connected {
+			// it must be an error -- add backoff if applicable
+			if res.Err != context.Canceled && !w.connected {
 				// we only add backoff if there has not been a successful connection
 				// for consistency with the old dialer behavior.
 				w.s.backf.AddBackoff(w.peer, res.Addr)
-			} else if res.Err == ErrDialRefusedBlackHole {
-				log.Error("SWARM BUG: unexpected ErrDialRefusedBlackHole while dialing peer to addr",
-					"peer", w.peer, "addr", res.Addr)
 			}
 
 			w.dispatchError(ad, res.Err)

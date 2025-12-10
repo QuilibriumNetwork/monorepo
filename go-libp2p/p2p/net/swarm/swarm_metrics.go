@@ -94,30 +94,6 @@ var (
 			Buckets:   []float64{0.001, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 2},
 		},
 	)
-	blackHoleSuccessCounterState = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricNamespace,
-			Name:      "black_hole_filter_state",
-			Help:      "State of the black hole filter",
-		},
-		[]string{"name"},
-	)
-	blackHoleSuccessCounterSuccessFraction = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricNamespace,
-			Name:      "black_hole_filter_success_fraction",
-			Help:      "Fraction of successful dials among the last n requests",
-		},
-		[]string{"name"},
-	)
-	blackHoleSuccessCounterNextRequestAllowedAfter = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricNamespace,
-			Name:      "black_hole_filter_next_request_allowed_after",
-			Help:      "Number of requests after which the next request will be allowed",
-		},
-		[]string{"name"},
-	)
 	collectors = []prometheus.Collector{
 		connsOpened,
 		keyTypes,
@@ -128,9 +104,6 @@ var (
 		dialsPerPeer,
 		dialRankingDelay,
 		dialLatency,
-		blackHoleSuccessCounterSuccessFraction,
-		blackHoleSuccessCounterState,
-		blackHoleSuccessCounterNextRequestAllowedAfter,
 	}
 )
 
@@ -141,7 +114,6 @@ type MetricsTracer interface {
 	FailedDialing(ma.Multiaddr, error, error)
 	DialCompleted(success bool, totalDials int, latency time.Duration)
 	DialRankingDelay(d time.Duration)
-	UpdatedBlackHoleSuccessCounter(name string, state BlackHoleState, nextProbeAfter int, successFraction float64)
 }
 
 type metricsTracer struct{}
@@ -283,16 +255,4 @@ func (m *metricsTracer) DialCompleted(success bool, totalDials int, latency time
 
 func (m *metricsTracer) DialRankingDelay(d time.Duration) {
 	dialRankingDelay.Observe(d.Seconds())
-}
-
-func (m *metricsTracer) UpdatedBlackHoleSuccessCounter(name string, state BlackHoleState,
-	nextProbeAfter int, successFraction float64) {
-	tags := metricshelper.GetStringSlice()
-	defer metricshelper.PutStringSlice(tags)
-
-	*tags = append(*tags, name)
-
-	blackHoleSuccessCounterState.WithLabelValues(*tags...).Set(float64(state))
-	blackHoleSuccessCounterSuccessFraction.WithLabelValues(*tags...).Set(successFraction)
-	blackHoleSuccessCounterNextRequestAllowedAfter.WithLabelValues(*tags...).Set(float64(nextProbeAfter))
 }

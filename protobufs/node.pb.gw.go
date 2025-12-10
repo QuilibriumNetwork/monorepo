@@ -201,6 +201,40 @@ func local_request_NodeService_GetTokensByAccount_0(ctx context.Context, marshal
 
 }
 
+func request_ConnectivityService_TestConnectivity_0(ctx context.Context, marshaler runtime.Marshaler, client ConnectivityServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var protoReq ConnectivityTestRequest
+	var metadata runtime.ServerMetadata
+
+	newReader, berr := utilities.IOReaderFactory(req.Body)
+	if berr != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", berr)
+	}
+	if err := marshaler.NewDecoder(newReader()).Decode(&protoReq); err != nil && err != io.EOF {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
+	msg, err := client.TestConnectivity(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+
+}
+
+func local_request_ConnectivityService_TestConnectivity_0(ctx context.Context, marshaler runtime.Marshaler, server ConnectivityServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var protoReq ConnectivityTestRequest
+	var metadata runtime.ServerMetadata
+
+	newReader, berr := utilities.IOReaderFactory(req.Body)
+	if berr != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", berr)
+	}
+	if err := marshaler.NewDecoder(newReader()).Decode(&protoReq); err != nil && err != io.EOF {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
+	msg, err := server.TestConnectivity(ctx, &protoReq)
+	return msg, metadata, err
+
+}
+
 func request_DataIPCService_Respawn_0(ctx context.Context, marshaler runtime.Marshaler, client DataIPCServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var protoReq RespawnRequest
 	var metadata runtime.ServerMetadata
@@ -397,6 +431,40 @@ func RegisterNodeServiceHandlerServer(ctx context.Context, mux *runtime.ServeMux
 		}
 
 		forward_NodeService_GetTokensByAccount_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+
+	})
+
+	return nil
+}
+
+// RegisterConnectivityServiceHandlerServer registers the http handlers for service ConnectivityService to "mux".
+// UnaryRPC     :call ConnectivityServiceServer directly.
+// StreamingRPC :currently unsupported pending https://github.com/grpc/grpc-go/issues/906.
+// Note that using this registration option will cause many gRPC library features to stop working. Consider using RegisterConnectivityServiceHandlerFromEndpoint instead.
+func RegisterConnectivityServiceHandlerServer(ctx context.Context, mux *runtime.ServeMux, server ConnectivityServiceServer) error {
+
+	mux.Handle("POST", pattern_ConnectivityService_TestConnectivity_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		var err error
+		var annotatedContext context.Context
+		annotatedContext, err = runtime.AnnotateIncomingContext(ctx, mux, req, "/quilibrium.node.node.pb.ConnectivityService/TestConnectivity", runtime.WithHTTPPathPattern("/quilibrium.node.node.pb.ConnectivityService/TestConnectivity"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_ConnectivityService_TestConnectivity_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+
+		forward_ConnectivityService_TestConnectivity_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 
 	})
 
@@ -635,6 +703,77 @@ var (
 	forward_NodeService_Send_0 = runtime.ForwardResponseMessage
 
 	forward_NodeService_GetTokensByAccount_0 = runtime.ForwardResponseMessage
+)
+
+// RegisterConnectivityServiceHandlerFromEndpoint is same as RegisterConnectivityServiceHandler but
+// automatically dials to "endpoint" and closes the connection when "ctx" gets done.
+func RegisterConnectivityServiceHandlerFromEndpoint(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) (err error) {
+	conn, err := grpc.DialContext(ctx, endpoint, opts...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Infof("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+			return
+		}
+		go func() {
+			<-ctx.Done()
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Infof("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+		}()
+	}()
+
+	return RegisterConnectivityServiceHandler(ctx, mux, conn)
+}
+
+// RegisterConnectivityServiceHandler registers the http handlers for service ConnectivityService to "mux".
+// The handlers forward requests to the grpc endpoint over "conn".
+func RegisterConnectivityServiceHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc.ClientConn) error {
+	return RegisterConnectivityServiceHandlerClient(ctx, mux, NewConnectivityServiceClient(conn))
+}
+
+// RegisterConnectivityServiceHandlerClient registers the http handlers for service ConnectivityService
+// to "mux". The handlers forward requests to the grpc endpoint over the given implementation of "ConnectivityServiceClient".
+// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "ConnectivityServiceClient"
+// doesn't go through the normal gRPC flow (creating a gRPC client etc.) then it will be up to the passed in
+// "ConnectivityServiceClient" to call the correct interceptors.
+func RegisterConnectivityServiceHandlerClient(ctx context.Context, mux *runtime.ServeMux, client ConnectivityServiceClient) error {
+
+	mux.Handle("POST", pattern_ConnectivityService_TestConnectivity_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		var err error
+		var annotatedContext context.Context
+		annotatedContext, err = runtime.AnnotateContext(ctx, mux, req, "/quilibrium.node.node.pb.ConnectivityService/TestConnectivity", runtime.WithHTTPPathPattern("/quilibrium.node.node.pb.ConnectivityService/TestConnectivity"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_ConnectivityService_TestConnectivity_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+
+		forward_ConnectivityService_TestConnectivity_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+
+	})
+
+	return nil
+}
+
+var (
+	pattern_ConnectivityService_TestConnectivity_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"quilibrium.node.node.pb.ConnectivityService", "TestConnectivity"}, ""))
+)
+
+var (
+	forward_ConnectivityService_TestConnectivity_0 = runtime.ForwardResponseMessage
 )
 
 // RegisterDataIPCServiceHandlerFromEndpoint is same as RegisterDataIPCServiceHandler but

@@ -2,6 +2,7 @@ package global
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -126,6 +127,14 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			timeoutStateValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
+		e.logger.Debug(
+			"received timeout",
+			zap.Uint64("rank", timeoutState.Vote.Rank),
+			zap.String(
+				"voter",
+				hex.EncodeToString([]byte(timeoutState.Vote.Identity())),
+			),
+		)
 
 		// We should still accept votes for the past rank in case a peer needs it
 		if e.currentRank > timeoutState.Vote.Rank+1 {

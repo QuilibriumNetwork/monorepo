@@ -79,10 +79,18 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		)
 	}
 
-	prior, err := p.engine.clockStore.GetGlobalClockFrameCandidate(
-		latestQC.FrameNumber,
-		[]byte(priorState),
-	)
+	var prior *protobufs.GlobalFrame
+	var err error
+	if latestQC.FrameNumber == 0 {
+		prior, err = p.engine.clockStore.GetGlobalClockFrame(
+			latestQC.FrameNumber,
+		)
+	} else {
+		prior, err = p.engine.clockStore.GetGlobalClockFrameCandidate(
+			latestQC.FrameNumber,
+			[]byte(priorState),
+		)
+	}
 	if err != nil {
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return nil, models.NewNoVoteErrorf("could not collect: %+w", err)

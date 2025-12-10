@@ -16,7 +16,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/test"
 	bhost "github.com/libp2p/go-libp2p/p2p/host/blank"
-	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	swarmt "github.com/libp2p/go-libp2p/p2p/net/swarm/testing"
 	"github.com/libp2p/go-libp2p/p2p/protocol/autonatv2/pb"
 	"github.com/libp2p/go-msgio/pbio"
@@ -53,7 +52,7 @@ func TestServerInvalidAddrsRejected(t *testing.T) {
 
 	t.Run("black holed addr", func(t *testing.T) {
 		dialer := bhost.NewBlankHost(swarmt.GenSwarm(
-			t, swarmt.WithSwarmOpts(swarm.WithReadOnlyBlackHoleDetector())))
+			t, swarmt.WithSwarmOpts()))
 		an := newAutoNAT(t, dialer)
 		defer an.Close()
 		defer an.host.Close()
