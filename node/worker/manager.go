@@ -817,6 +817,9 @@ func (w *WorkerManager) getMultiaddrOfWorker(coreId uint) (
 	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/0.0.0.0/", "/127.0.0.1/", 1)
 	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/0:0:0:0:0:0:0:0/", "/::1/", 1)
 	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/::/", "/::1/", 1)
+	// force TCP as stream is not supported over UDP/QUIC
+	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/quic-v1", "", 1)
+	rpcMultiaddr = strings.Replace(rpcMultiaddr, "udp", "tcp", 1)
 
 	ma, err := multiaddr.StringCast(rpcMultiaddr)
 	return ma, errors.Wrap(err, "get multiaddr of worker")
