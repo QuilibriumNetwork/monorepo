@@ -1306,13 +1306,18 @@ func (b *BlossomSub) invokeConnectivityTest(
 	}
 	defer conn.Close()
 
+	connMultiaddrs := b.collectConnectivityMultiaddrs()
+	b.logger.Debug("own multiaddrs", zap.Strings("mas", connMultiaddrs))
+
+	if len(connMultiaddrs) == 0 {
+		return errors.New("connectivity test: no connectivity multiaddrs found")
+	}
+
 	client := protobufs.NewConnectivityServiceClient(conn)
 	req := &protobufs.ConnectivityTestRequest{
 		PeerId:     []byte(b.h.ID()),
-		Multiaddrs: b.collectConnectivityMultiaddrs(),
+		Multiaddrs: connMultiaddrs,
 	}
-
-	b.logger.Debug("own multiaddrs", zap.Strings("mas", b.collectConnectivityMultiaddrs()))
 
 	resp, err := client.TestConnectivity(dialCtx, req)
 	if err != nil {
