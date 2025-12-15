@@ -45,7 +45,7 @@ func NewGRPCTransport(
 ) *GRPCTransport {
 	return &GRPCTransport{
 		logger:        logger,
-		peerID:        peerID,
+		peerID:        peerID, // buildutils:allow-slice-alias slice is static
 		peers:         peers,
 		signers:       signers,
 		serverStreams: make(map[string]protobufs.OnionService_ConnectServer),
@@ -80,9 +80,9 @@ func (g *GRPCTransport) Send(
 	// Send via server stream (to connected client) or client stream (to remote server)
 	if hasServer {
 		msg := &protobufs.ReceiveMessage{
-			SourcePeerId: peerID,
+			SourcePeerId: peerID, // buildutils:allow-slice-alias slice is static
 			CircId:       circID,
-			Cell:         cell,
+			Cell:         cell, // buildutils:allow-slice-alias slice is static
 		}
 		if err := serverStream.Send(msg); err != nil {
 			g.logger.Warn(
@@ -99,9 +99,9 @@ func (g *GRPCTransport) Send(
 		}
 	} else if hasClient {
 		msg := &protobufs.SendMessage{
-			PeerId: peerID,
+			PeerId: peerID, // buildutils:allow-slice-alias slice is static
 			CircId: circID,
-			Cell:   cell,
+			Cell:   cell, // buildutils:allow-slice-alias slice is static
 		}
 		if err := clientStream.Send(msg); err != nil {
 			g.logger.Warn(

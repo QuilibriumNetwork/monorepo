@@ -3,22 +3,31 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"slices"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
+	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
+
+var keyRegistryDomain = []byte("KEY_REGISTRY")
 
 func (e *AppConsensusEngine) processConsensusMessageQueue(
 	ctx lifecycle.SignalerContext,
@@ -310,6 +319,32 @@ func (e *AppConsensusEngine) handleAppShardProposal(
 func (e *AppConsensusEngine) processProposal(
 	proposal *protobufs.AppShardProposal,
 ) bool {
+	return e.processProposalInternal(proposal, false)
+}
+
+func (e *AppConsensusEngine) processProposalInternal(
+	proposal *protobufs.AppShardProposal,
+	skipAncestors bool,
+) bool {
+	if proposal == nil || proposal.State == nil || proposal.State.Header == nil {
+		return false
+	}
+
+	if !skipAncestors {
+		if ok, err := e.ensureShardAncestorStates(proposal); err != nil {
+			e.logger.Warn(
+				"failed to recover app shard ancestors",
+				zap.String("address", e.appAddressHex),
+				zap.Uint64("frame_number", proposal.State.Header.FrameNumber),
+				zap.Error(err),
+			)
+			e.requestShardAncestorSync(proposal)
+			return false
+		} else if !ok {
+			return false
+		}
+	}
+
 	e.logger.Debug(
 		"processing proposal",
 		zap.String("id", hex.EncodeToString([]byte(proposal.State.Identity()))),
@@ -395,6 +430,560 @@ func (e *AppConsensusEngine) processProposal(
 	}
 
 	return true
+}
+
+type shardAncestorDescriptor struct {
+	frameNumber uint64
+	selector    []byte
+}
+
+func (e *AppConsensusEngine) ensureShardAncestorStates(
+	proposal *protobufs.AppShardProposal,
+) (bool, error) {
+	ancestors, err := e.collectMissingShardAncestors(proposal)
+	if err != nil {
+		return false, err
+	}
+
+	if len(ancestors) == 0 {
+		return true, nil
+	}
+
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		ancestor, err := e.buildStoredShardProposal(ancestors[i])
+		if err != nil {
+			return false, err
+		}
+		if !e.processProposalInternal(ancestor, true) {
+			return false, fmt.Errorf(
+				"unable to process ancestor frame %d",
+				ancestors[i].frameNumber,
+			)
+		}
+	}
+
+	return true, nil
+}
+
+func (e *AppConsensusEngine) collectMissingShardAncestors(
+	proposal *protobufs.AppShardProposal,
+) ([]shardAncestorDescriptor, error) {
+	header := proposal.State.Header
+	if header == nil || header.FrameNumber == 0 {
+		return nil, nil
+	}
+
+	finalized := e.forks.FinalizedState()
+	if finalized == nil || finalized.State == nil ||
+		(*finalized.State).Header == nil {
+		return nil, errors.New("finalized state unavailable")
+	}
+
+	finalizedFrame := (*finalized.State).Header.FrameNumber
+	finalizedSelector := []byte(finalized.Identifier)
+
+	parentFrame := header.FrameNumber - 1
+	parentSelector := slices.Clone(header.ParentSelector)
+	if len(parentSelector) == 0 {
+		return nil, nil
+	}
+
+	var ancestors []shardAncestorDescriptor
+	anchored := false
+
+	for parentFrame > finalizedFrame && len(parentSelector) > 0 {
+		if _, found := e.forks.GetState(
+			models.Identity(string(parentSelector)),
+		); found {
+			anchored = true
+			break
+		}
+
+		ancestors = append(ancestors, shardAncestorDescriptor{
+			frameNumber: parentFrame,
+			selector:    slices.Clone(parentSelector),
+		})
+
+		frame, err := e.loadShardFrameFromStore(parentFrame, parentSelector)
+		if err != nil {
+			return nil, err
+		}
+
+		parentFrame--
+		parentSelector = slices.Clone(frame.Header.ParentSelector)
+	}
+
+	if !anchored {
+		switch {
+		case parentFrame == finalizedFrame:
+			if !bytes.Equal(parentSelector, finalizedSelector) {
+				return nil, fmt.Errorf(
+					"ancestor chain not rooted at finalized frame %d",
+					finalizedFrame,
+				)
+			}
+			anchored = true
+		case parentFrame < finalizedFrame:
+			return nil, fmt.Errorf(
+				"ancestor chain crossed finalized boundary (frame %d < %d)",
+				parentFrame,
+				finalizedFrame,
+			)
+		case len(parentSelector) == 0:
+			return nil, errors.New(
+				"ancestor selector missing before reaching finalized state",
+			)
+		}
+	}
+
+	if !anchored {
+		return nil, errors.New("ancestor chain could not be anchored in forks")
+	}
+
+	return ancestors, nil
+}
+
+func (e *AppConsensusEngine) loadShardFrameFromStore(
+	frameNumber uint64,
+	selector []byte,
+) (*protobufs.AppShardFrame, error) {
+	frame, err := e.clockStore.GetStagedShardClockFrame(
+		e.appAddress,
+		frameNumber,
+		selector,
+		false,
+	)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		frame, _, err = e.clockStore.GetShardClockFrame(
+			e.appAddress,
+			frameNumber,
+			false,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if frame == nil || frame.Header == nil ||
+			!bytes.Equal([]byte(frame.Identity()), selector) {
+			return nil, fmt.Errorf(
+				"sealed shard frame mismatch at %d",
+				frameNumber,
+			)
+		}
+	}
+
+	if frame == nil || frame.Header == nil {
+		return nil, errors.New("stored shard frame missing header")
+	}
+
+	return frame, nil
+}
+
+func (e *AppConsensusEngine) buildStoredShardProposal(
+	desc shardAncestorDescriptor,
+) (*protobufs.AppShardProposal, error) {
+	frame, err := e.loadShardFrameFromStore(desc.frameNumber, desc.selector)
+	if err != nil {
+		return nil, err
+	}
+
+	var parentQC *protobufs.QuorumCertificate
+	if frame.GetRank() > 0 {
+		parentQC, err = e.clockStore.GetQuorumCertificate(
+			e.appAddress,
+			frame.GetRank()-1,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var priorTC *protobufs.TimeoutCertificate
+	if frame.GetRank() > 0 {
+		priorTC, err = e.clockStore.GetTimeoutCertificate(
+			e.appAddress,
+			frame.GetRank()-1,
+		)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			priorTC = nil
+		}
+	}
+
+	vote, err := e.clockStore.GetProposalVote(
+		e.appAddress,
+		frame.GetRank(),
+		[]byte(frame.Identity()),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &protobufs.AppShardProposal{
+		State:                       frame,
+		ParentQuorumCertificate:     parentQC,
+		PriorRankTimeoutCertificate: priorTC,
+		Vote:                        vote,
+	}, nil
+}
+
+func (e *AppConsensusEngine) requestShardAncestorSync(
+	proposal *protobufs.AppShardProposal,
+) {
+	if proposal == nil || proposal.State == nil || proposal.State.Header == nil {
+		return
+	}
+	if e.syncProvider == nil {
+		return
+	}
+
+	peerID, err := e.getPeerIDOfProver(proposal.State.Header.Prover)
+	if err != nil {
+		peerID, err = e.getRandomProverPeerId()
+		if err != nil {
+			return
+		}
+	}
+
+	head, _, err := e.clockStore.GetLatestShardClockFrame(e.appAddress)
+	if err != nil || head == nil || head.Header == nil {
+		e.logger.Debug("could not obtain shard head for sync", zap.Error(err))
+		return
+	}
+
+	e.syncProvider.AddState(
+		[]byte(peerID),
+		head.Header.FrameNumber,
+		[]byte(head.Identity()),
+	)
+}
+
+type keyRegistryValidationResult struct {
+	identityPeerID []byte
+	proverAddress  []byte
+}
+
+func (e *AppConsensusEngine) isDuplicatePeerInfo(
+	peerInfo *protobufs.PeerInfo,
+) bool {
+	digest, err := hashPeerInfo(peerInfo)
+	if err != nil {
+		e.logger.Warn("failed to hash peer info", zap.Error(err))
+		return false
+	}
+
+	e.peerInfoDigestCacheMu.Lock()
+	defer e.peerInfoDigestCacheMu.Unlock()
+
+	if _, ok := e.peerInfoDigestCache[digest]; ok {
+		return true
+	}
+
+	e.peerInfoDigestCache[digest] = struct{}{}
+	return false
+}
+
+func (e *AppConsensusEngine) isDuplicateKeyRegistry(
+	keyRegistry *protobufs.KeyRegistry,
+) bool {
+	digest, err := hashKeyRegistry(keyRegistry)
+	if err != nil {
+		e.logger.Warn("failed to hash key registry", zap.Error(err))
+		return false
+	}
+
+	e.keyRegistryDigestCacheMu.Lock()
+	defer e.keyRegistryDigestCacheMu.Unlock()
+
+	if _, ok := e.keyRegistryDigestCache[digest]; ok {
+		return true
+	}
+
+	e.keyRegistryDigestCache[digest] = struct{}{}
+	return false
+}
+
+func hashPeerInfo(peerInfo *protobufs.PeerInfo) (string, error) {
+	cloned := proto.Clone(peerInfo).(*protobufs.PeerInfo)
+	cloned.Timestamp = 0
+
+	data, err := cloned.ToCanonicalBytes()
+	if err != nil {
+		return "", err
+	}
+
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func hashKeyRegistry(keyRegistry *protobufs.KeyRegistry) (string, error) {
+	cloned := proto.Clone(keyRegistry).(*protobufs.KeyRegistry)
+	cloned.LastUpdated = 0
+
+	data, err := cloned.ToCanonicalBytes()
+	if err != nil {
+		return "", err
+	}
+
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (e *AppConsensusEngine) validateKeyRegistry(
+	keyRegistry *protobufs.KeyRegistry,
+) (*keyRegistryValidationResult, error) {
+	if keyRegistry.IdentityKey == nil ||
+		len(keyRegistry.IdentityKey.KeyValue) == 0 {
+		return nil, fmt.Errorf("key registry missing identity key")
+	}
+	if err := keyRegistry.IdentityKey.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid identity key: %w", err)
+	}
+
+	pubKey, err := pcrypto.UnmarshalEd448PublicKey(
+		keyRegistry.IdentityKey.KeyValue,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal identity key: %w", err)
+	}
+	peerID, err := peer.IDFromPublicKey(pubKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive identity peer id: %w", err)
+	}
+	identityPeerID := []byte(peerID)
+
+	if keyRegistry.ProverKey == nil ||
+		len(keyRegistry.ProverKey.KeyValue) == 0 {
+		return nil, fmt.Errorf("key registry missing prover key")
+	}
+	if err := keyRegistry.ProverKey.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid prover key: %w", err)
+	}
+
+	if keyRegistry.IdentityToProver == nil ||
+		len(keyRegistry.IdentityToProver.Signature) == 0 {
+		return nil, fmt.Errorf("missing identity-to-prover signature")
+	}
+
+	identityMsg := slices.Concat(
+		keyRegistryDomain,
+		keyRegistry.ProverKey.KeyValue,
+	)
+	valid, err := e.keyManager.ValidateSignature(
+		crypto.KeyTypeEd448,
+		keyRegistry.IdentityKey.KeyValue,
+		identityMsg,
+		keyRegistry.IdentityToProver.Signature,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"identity-to-prover signature validation failed: %w",
+			err,
+		)
+	}
+	if !valid {
+		return nil, fmt.Errorf("identity-to-prover signature invalid")
+	}
+
+	if keyRegistry.ProverToIdentity == nil ||
+		len(keyRegistry.ProverToIdentity.Signature) == 0 {
+		return nil, fmt.Errorf("missing prover-to-identity signature")
+	}
+
+	valid, err = e.keyManager.ValidateSignature(
+		crypto.KeyTypeBLS48581G1,
+		keyRegistry.ProverKey.KeyValue,
+		keyRegistry.IdentityKey.KeyValue,
+		keyRegistry.ProverToIdentity.Signature,
+		keyRegistryDomain,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"prover-to-identity signature validation failed: %w",
+			err,
+		)
+	}
+	if !valid {
+		return nil, fmt.Errorf("prover-to-identity signature invalid")
+	}
+
+	addrBI, err := poseidon.HashBytes(keyRegistry.ProverKey.KeyValue)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive prover key address: %w", err)
+	}
+	proverAddress := addrBI.FillBytes(make([]byte, 32))
+
+	for purpose, collection := range keyRegistry.KeysByPurpose {
+		if collection == nil {
+			continue
+		}
+		for _, key := range collection.X448Keys {
+			if err := e.validateSignedX448Key(
+				key,
+				identityPeerID,
+				proverAddress,
+				keyRegistry,
+			); err != nil {
+				return nil, fmt.Errorf(
+					"invalid x448 key (purpose %s): %w",
+					purpose,
+					err,
+				)
+			}
+		}
+		for _, key := range collection.Decaf448Keys {
+			if err := e.validateSignedDecaf448Key(
+				key,
+				identityPeerID,
+				proverAddress,
+				keyRegistry,
+			); err != nil {
+				return nil, fmt.Errorf(
+					"invalid decaf448 key (purpose %s): %w",
+					purpose,
+					err,
+				)
+			}
+		}
+	}
+
+	return &keyRegistryValidationResult{
+		identityPeerID: identityPeerID,
+		proverAddress:  proverAddress,
+	}, nil
+}
+
+func (e *AppConsensusEngine) validateSignedX448Key(
+	key *protobufs.SignedX448Key,
+	identityPeerID []byte,
+	proverAddress []byte,
+	keyRegistry *protobufs.KeyRegistry,
+) error {
+	if key == nil || key.Key == nil || len(key.Key.KeyValue) == 0 {
+		return nil
+	}
+
+	msg := slices.Concat(keyRegistryDomain, key.Key.KeyValue)
+	switch sig := key.Signature.(type) {
+	case *protobufs.SignedX448Key_Ed448Signature:
+		if sig.Ed448Signature == nil ||
+			len(sig.Ed448Signature.Signature) == 0 {
+			return fmt.Errorf("missing ed448 signature")
+		}
+		if !bytes.Equal(key.ParentKeyAddress, identityPeerID) {
+			return fmt.Errorf("unexpected parent for ed448 signed x448 key")
+		}
+		valid, err := e.keyManager.ValidateSignature(
+			crypto.KeyTypeEd448,
+			keyRegistry.IdentityKey.KeyValue,
+			msg,
+			sig.Ed448Signature.Signature,
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to validate ed448 signature: %w", err)
+		}
+		if !valid {
+			return fmt.Errorf("ed448 signature invalid")
+		}
+	case *protobufs.SignedX448Key_BlsSignature:
+		if sig.BlsSignature == nil ||
+			len(sig.BlsSignature.Signature) == 0 {
+			return fmt.Errorf("missing bls signature")
+		}
+		if len(proverAddress) != 0 &&
+			!bytes.Equal(key.ParentKeyAddress, proverAddress) {
+			return fmt.Errorf("unexpected parent for bls signed x448 key")
+		}
+		valid, err := e.keyManager.ValidateSignature(
+			crypto.KeyTypeBLS48581G1,
+			keyRegistry.ProverKey.KeyValue,
+			key.Key.KeyValue,
+			sig.BlsSignature.Signature,
+			keyRegistryDomain,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to validate bls signature: %w", err)
+		}
+		if !valid {
+			return fmt.Errorf("bls signature invalid")
+		}
+	case *protobufs.SignedX448Key_DecafSignature:
+		return fmt.Errorf("decaf signature not supported for x448 key")
+	default:
+		return fmt.Errorf("missing signature for x448 key")
+	}
+
+	return nil
+}
+
+func (e *AppConsensusEngine) validateSignedDecaf448Key(
+	key *protobufs.SignedDecaf448Key,
+	identityPeerID []byte,
+	proverAddress []byte,
+	keyRegistry *protobufs.KeyRegistry,
+) error {
+	if key == nil || key.Key == nil || len(key.Key.KeyValue) == 0 {
+		return nil
+	}
+
+	msg := slices.Concat(keyRegistryDomain, key.Key.KeyValue)
+	switch sig := key.Signature.(type) {
+	case *protobufs.SignedDecaf448Key_Ed448Signature:
+		if sig.Ed448Signature == nil ||
+			len(sig.Ed448Signature.Signature) == 0 {
+			return fmt.Errorf("missing ed448 signature")
+		}
+		if !bytes.Equal(key.ParentKeyAddress, identityPeerID) {
+			return fmt.Errorf("unexpected parent for ed448 signed decaf key")
+		}
+		valid, err := e.keyManager.ValidateSignature(
+			crypto.KeyTypeEd448,
+			keyRegistry.IdentityKey.KeyValue,
+			msg,
+			sig.Ed448Signature.Signature,
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to validate ed448 signature: %w", err)
+		}
+		if !valid {
+			return fmt.Errorf("ed448 signature invalid")
+		}
+	case *protobufs.SignedDecaf448Key_BlsSignature:
+		if sig.BlsSignature == nil ||
+			len(sig.BlsSignature.Signature) == 0 {
+			return fmt.Errorf("missing bls signature")
+		}
+		if len(proverAddress) != 0 &&
+			!bytes.Equal(key.ParentKeyAddress, proverAddress) {
+			return fmt.Errorf("unexpected parent for bls signed decaf key")
+		}
+		valid, err := e.keyManager.ValidateSignature(
+			crypto.KeyTypeBLS48581G1,
+			keyRegistry.ProverKey.KeyValue,
+			key.Key.KeyValue,
+			sig.BlsSignature.Signature,
+			keyRegistryDomain,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to validate bls signature: %w", err)
+		}
+		if !valid {
+			return fmt.Errorf("bls signature invalid")
+		}
+	case *protobufs.SignedDecaf448Key_DecafSignature:
+		return fmt.Errorf("decaf signature validation not supported")
+	default:
+		return fmt.Errorf("missing signature for decaf key")
+	}
+
+	return nil
 }
 
 func (e *AppConsensusEngine) cacheProposal(
@@ -625,6 +1214,10 @@ func (e *AppConsensusEngine) addCertifiedState(
 		txn.Abort()
 		return
 	}
+
+	if err := e.checkShardCoverage(parent.State.Header.FrameNumber); err != nil {
+		e.logger.Error("could not check shard coverage", zap.Error(err))
+	}
 }
 
 func (e *AppConsensusEngine) handleConsensusMessage(message *pb.Message) {
@@ -781,6 +1374,8 @@ func (e *AppConsensusEngine) handleGlobalFrameMessage(message *pb.Message) {
 			return
 		}
 
+		e.handleGlobalProverRoot(frame)
+
 		// Success metric recorded at the end of processing
 		globalFramesProcessedTotal.WithLabelValues("success").Inc()
 	default:
@@ -842,6 +1437,23 @@ func (e *AppConsensusEngine) handlePeerInfoMessage(message *pb.Message) {
 			return
 		}
 
+		if e.peerInfoManager == nil {
+			e.logger.Warn(
+				"peer info manager unavailable; dropping peer info",
+				zap.ByteString("peer_id", peerInfo.PeerId),
+			)
+			return
+		}
+
+		if e.isDuplicatePeerInfo(peerInfo) {
+			if existing := e.peerInfoManager.GetPeerInfo(
+				peerInfo.PeerId,
+			); existing != nil {
+				existing.LastSeen = time.Now().UnixMilli()
+				return
+			}
+		}
+
 		// Validate signature
 		if !e.validatePeerInfoSignature(peerInfo) {
 			e.logger.Debug("invalid peer info signature",
@@ -851,6 +1463,141 @@ func (e *AppConsensusEngine) handlePeerInfoMessage(message *pb.Message) {
 
 		// Also add to the existing peer info manager
 		e.peerInfoManager.AddPeerInfo(peerInfo)
+	case protobufs.KeyRegistryType:
+		keyRegistry := &protobufs.KeyRegistry{}
+		if err := keyRegistry.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal key registry", zap.Error(err))
+			return
+		}
+
+		if err := keyRegistry.Validate(); err != nil {
+			e.logger.Debug("invalid key registry", zap.Error(err))
+			return
+		}
+
+		validation, err := e.validateKeyRegistry(keyRegistry)
+		if err != nil {
+			e.logger.Debug("invalid key registry signatures", zap.Error(err))
+			return
+		}
+
+		if e.isDuplicateKeyRegistry(keyRegistry) {
+			_, err := e.keyStore.GetKeyRegistry(validation.identityPeerID)
+			if err == nil {
+				return
+			}
+		}
+
+		txn, err := e.keyStore.NewTransaction()
+		if err != nil {
+			e.logger.Error("failed to create keystore txn", zap.Error(err))
+			return
+		}
+
+		commit := false
+		defer func() {
+			if !commit {
+				if abortErr := txn.Abort(); abortErr != nil {
+					e.logger.Warn("failed to abort keystore txn", zap.Error(abortErr))
+				}
+			}
+		}()
+
+		var identityAddress []byte
+		if keyRegistry.IdentityKey != nil &&
+			len(keyRegistry.IdentityKey.KeyValue) != 0 {
+			if err := e.keyStore.PutIdentityKey(
+				txn,
+				validation.identityPeerID,
+				keyRegistry.IdentityKey,
+			); err != nil {
+				e.logger.Error("failed to store identity key", zap.Error(err))
+				return
+			}
+			identityAddress = validation.identityPeerID
+		}
+
+		var proverAddress []byte
+		if keyRegistry.ProverKey != nil &&
+			len(keyRegistry.ProverKey.KeyValue) != 0 {
+			if err := e.keyStore.PutProvingKey(
+				txn,
+				validation.proverAddress,
+				&protobufs.BLS48581SignatureWithProofOfPossession{
+					PublicKey: keyRegistry.ProverKey,
+				},
+			); err != nil {
+				e.logger.Error("failed to store prover key", zap.Error(err))
+				return
+			}
+			proverAddress = validation.proverAddress
+		}
+
+		if len(identityAddress) != 0 && len(proverAddress) == 32 &&
+			keyRegistry.IdentityToProver != nil &&
+			len(keyRegistry.IdentityToProver.Signature) != 0 &&
+			keyRegistry.ProverToIdentity != nil &&
+			len(keyRegistry.ProverToIdentity.Signature) != 0 {
+			if err := e.keyStore.PutCrossSignature(
+				txn,
+				identityAddress,
+				proverAddress,
+				keyRegistry.IdentityToProver.Signature,
+				keyRegistry.ProverToIdentity.Signature,
+			); err != nil {
+				e.logger.Error("failed to store cross signatures", zap.Error(err))
+				return
+			}
+		}
+
+		for _, collection := range keyRegistry.KeysByPurpose {
+			for _, key := range collection.X448Keys {
+				if key == nil || key.Key == nil ||
+					len(key.Key.KeyValue) == 0 {
+					continue
+				}
+				addrBI, err := poseidon.HashBytes(key.Key.KeyValue)
+				if err != nil {
+					e.logger.Error("failed to derive x448 key address", zap.Error(err))
+					return
+				}
+				address := addrBI.FillBytes(make([]byte, 32))
+				if err := e.keyStore.PutSignedX448Key(txn, address, key); err != nil {
+					e.logger.Error("failed to store signed x448 key", zap.Error(err))
+					return
+				}
+			}
+
+			for _, key := range collection.Decaf448Keys {
+				if key == nil || key.Key == nil ||
+					len(key.Key.KeyValue) == 0 {
+					continue
+				}
+				addrBI, err := poseidon.HashBytes(key.Key.KeyValue)
+				if err != nil {
+					e.logger.Error(
+						"failed to derive decaf448 key address",
+						zap.Error(err),
+					)
+					return
+				}
+				address := addrBI.FillBytes(make([]byte, 32))
+				if err := e.keyStore.PutSignedDecaf448Key(
+					txn,
+					address,
+					key,
+				); err != nil {
+					e.logger.Error("failed to store signed decaf448 key", zap.Error(err))
+					return
+				}
+			}
+		}
+
+		if err := txn.Commit(); err != nil {
+			e.logger.Error("failed to commit key registry txn", zap.Error(err))
+			return
+		}
+		commit = true
 
 	default:
 		e.logger.Debug(

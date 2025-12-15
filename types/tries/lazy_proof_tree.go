@@ -550,7 +550,7 @@ type TreeBackingStore interface {
 		shardAddress []byte,
 	) ([]byte, error)
 	GetRootCommits(frameNumber uint64) (map[ShardKey][][]byte, error)
-	NewSnapshot() (TreeBackingStore, func(), error)
+	NewShardSnapshot(shardKey ShardKey) (TreeBackingStore, func(), error)
 	// IterateRawLeaves returns an iterator over all leaf nodes for a given
 	// shard and phase set. This bypasses in-memory tree caching and reads
 	// directly from the database for raw sync operations.
@@ -817,9 +817,9 @@ func (t *LazyVectorCommitmentTree) Insert(
 		}
 		if node == nil {
 			newNode := &LazyVectorCommitmentLeafNode{
-				Key:        key,
-				Value:      value,
-				HashTarget: hashTarget,
+				Key:        slices.Clone(key),
+				Value:      slices.Clone(value),
+				HashTarget: slices.Clone(hashTarget),
 				Size:       size,
 				Store:      t.Store,
 			}
@@ -860,8 +860,8 @@ func (t *LazyVectorCommitmentTree) Insert(
 		switch n := node.(type) {
 		case *LazyVectorCommitmentLeafNode:
 			if bytes.Equal(n.Key, key) {
-				n.Value = value
-				n.HashTarget = hashTarget
+				n.Value = slices.Clone(value)
+				n.HashTarget = slices.Clone(hashTarget)
 				n.Commitment = nil
 				n.Size = size
 
@@ -900,9 +900,9 @@ func (t *LazyVectorCommitmentTree) Insert(
 			finalNewNibble := getNextNibble(key, divergeDepth)
 			branch.Children[finalOldNibble] = n
 			branch.Children[finalNewNibble] = &LazyVectorCommitmentLeafNode{
-				Key:        key,
-				Value:      value,
-				HashTarget: hashTarget,
+				Key:        slices.Clone(key),
+				Value:      slices.Clone(value),
+				HashTarget: slices.Clone(hashTarget),
 				Size:       size,
 				Store:      t.Store,
 			}
@@ -972,9 +972,9 @@ func (t *LazyVectorCommitmentTree) Insert(
 						newBranch.Children[expectedNibble] = n
 						n.Prefix = n.Prefix[i+1:] // remove shared prefix from old branch
 						newBranch.Children[actualNibble] = &LazyVectorCommitmentLeafNode{
-							Key:        key,
-							Value:      value,
-							HashTarget: hashTarget,
+							Key:        slices.Clone(key),
+							Value:      slices.Clone(value),
+							HashTarget: slices.Clone(hashTarget),
 							Size:       size,
 							Store:      t.Store,
 						}
@@ -1201,7 +1201,7 @@ func (t *LazyVectorCommitmentTree) Verify(
 			false,
 		)
 	} else {
-		rootCommit = root
+		rootCommit = slices.Clone(root)
 	}
 
 	for _, subProof := range proof.SubProofs {
@@ -2154,7 +2154,7 @@ func DeserializeTree(
 		PhaseType:     phaseType,
 		ShardKey:      shardKey,
 		Store:         store,
-		CoveredPrefix: coveredPrefix, // Empty by default, must be set explicitly
+		CoveredPrefix: slices.Clone(coveredPrefix), // Empty by default, must be set explicitly
 	}, nil
 }
 

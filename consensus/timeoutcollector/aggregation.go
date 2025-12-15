@@ -85,8 +85,8 @@ func NewTimeoutSignatureAggregator(
 
 	return &TimeoutSignatureAggregator{
 		aggregator:    aggregator,
-		filter:        filter,
-		dsTag:         dsTag,
+		filter:        filter, // buildutils:allow-slice-alias static value
+		dsTag:         dsTag,  // buildutils:allow-slice-alias static value
 		idToInfo:      idToInfo,
 		idToSignature: make(map[models.Identity]sigInfo),
 		rank:          rank,
@@ -149,7 +149,7 @@ func (a *TimeoutSignatureAggregator) VerifyAndAdd(
 	}
 
 	a.idToSignature[signerID] = sigInfo{
-		sig:          sig,
+		sig:          sig, // buildutils:allow-slice-alias static value for call lifetime
 		newestQCRank: newestQCRank,
 	}
 	a.totalWeight += info.weight

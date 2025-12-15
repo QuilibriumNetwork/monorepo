@@ -396,7 +396,7 @@ func (m *ExecutionEngineManager) ProcessMessage(
 		}
 	}
 
-	route := address
+	route := address // buildutils:allow-slice-alias slice reassigns itself
 
 	if !(bytes.Equal(route, compute.COMPUTE_INTRINSIC_DOMAIN[:]) ||
 		bytes.Equal(route, hypergraphintrinsic.HYPERGRAPH_BASE_DOMAIN[:]) ||

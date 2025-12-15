@@ -2642,6 +2642,11 @@ func (f *FrameHeader) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
+	// Write rank
+	if err := binary.Write(buf, binary.BigEndian, f.Rank); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
 	// Write timestamp
 	if err := binary.Write(buf, binary.BigEndian, f.Timestamp); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
@@ -2788,6 +2793,11 @@ func (f *FrameHeader) FromCanonicalBytes(data []byte) error {
 
 	// Read frame_number
 	if err := binary.Read(buf, binary.BigEndian, &f.FrameNumber); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read rank
+	if err := binary.Read(buf, binary.BigEndian, &f.Rank); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
 
@@ -5678,7 +5688,37 @@ func (f *QuorumCertificate) Validate() error {
 		return errors.Wrap(errors.New("missing aggregate signature"), "validate")
 	}
 
-	return f.AggregateSignature.Validate()
+	if len(f.Filter) == 0 {
+		return f.AggregateSignature.Validate()
+	}
+
+	// Signature should be 74 bytes
+	if len(f.AggregateSignature.Signature) < 74 {
+		return errors.Wrap(
+			errors.Errorf(
+				"bls48581 signature must be at least 74 bytes, got %d",
+				len(f.AggregateSignature.Signature),
+			),
+			"validate",
+		)
+	}
+
+	// Validate public key if present
+	if f.AggregateSignature.PublicKey != nil {
+		if err := f.AggregateSignature.PublicKey.Validate(); err != nil {
+			return errors.Wrap(err, "validate")
+		}
+	}
+
+	// Bitmask can be variable length, but should not exceed 32
+	if len(f.AggregateSignature.Bitmask) > 32 {
+		return errors.Wrap(
+			errors.New("invalid bitmask length"),
+			"validate",
+		)
+	}
+
+	return nil
 }
 
 var _ ValidatableMessage = (*TimeoutCertificate)(nil)
@@ -5688,7 +5728,11 @@ func (f *TimeoutCertificate) Validate() error {
 		return errors.Wrap(errors.New("nil frame confirmation"), "validate")
 	}
 
-	// Rank and frame number is uint64, any value is valid
+	if f.LatestQuorumCertificate != nil {
+		if err := f.LatestQuorumCertificate.Validate(); err != nil {
+			return errors.Wrap(err, "validate")
+		}
+	}
 
 	// Aggregate signature must be present
 	if f.AggregateSignature == nil {

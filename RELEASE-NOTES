@@ -1,3 +1,17 @@
+# 2.1.0.16
+- build_utils – static code analysis checker for underlying slice assignment
+- hypergraph snapshot manager now uses in memory snapshot instead of pebble snapshot
+- hypersync can delete orphaned entries
+- signature aggregation wrapper for app shards no longer expects proposer to have a proof (the proof is already in the frame)
+- hook events on sync for app shards
+- app shards properly sync global prover info
+- coverage streaks/halt events now trigger on app shards
+- peer info and key registry handlers on app shard level
+- updated to pebble v2
+- pebble v2 upgrade handler
+- archive mode memory bug fix
+- subtle underlying slice mutation bug fix
+
 # 2.1.0.15
 - Adds direct db sync mode for hypersync
 - Removes blackhole detection entirely

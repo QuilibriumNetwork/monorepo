@@ -40,7 +40,7 @@ func NewProverResume(
 	rdfMultiprover *schema.RDFMultiprover,
 ) (*ProverResume, error) {
 	return &ProverResume{
-		Filter:         filter,
+		Filter:         filter, // buildutils:allow-slice-alias slice is static
 		FrameNumber:    frameNumber,
 		keyManager:     keyManager,
 		hypergraph:     hypergraph,

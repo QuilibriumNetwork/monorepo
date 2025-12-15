@@ -604,11 +604,14 @@ func main() {
 			)
 			logger.Warn("you are at risk of running out of memory during runtime")
 		default:
-			if _, limit := os.LookupEnv("GOMEMLIMIT"); !limit {
-				rdebug.SetMemoryLimit(availableOverhead * 8 / 10)
-			}
-			if _, explicitGOGC := os.LookupEnv("GOGC"); !explicitGOGC {
-				rdebug.SetGCPercent(10)
+			// Use defaults if archive mode:
+			if !nodeConfig.Engine.ArchiveMode {
+				if _, limit := os.LookupEnv("GOMEMLIMIT"); !limit {
+					rdebug.SetMemoryLimit(availableOverhead * 8 / 10)
+				}
+				if _, explicitGOGC := os.LookupEnv("GOGC"); !explicitGOGC {
+					rdebug.SetGCPercent(10)
+				}
 			}
 		}
 	}

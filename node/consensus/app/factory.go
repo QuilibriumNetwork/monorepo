@@ -108,6 +108,7 @@ func NewAppConsensusEngineFactory(
 		rewardIssuance:       rewardIssuance,
 		blsConstructor:       blsConstructor,
 		encryptedChannel:     encryptedChannel,
+		peerInfoManager:      peerInfoManager,
 	}
 }
 

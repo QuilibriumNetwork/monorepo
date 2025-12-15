@@ -47,7 +47,7 @@ func (c *ConsensusSignatureAggregatorWrapper) Aggregate(
 			noextSigs = append(noextSigs, s[:74])
 		}
 	} else {
-		noextSigs = signatures
+		noextSigs = signatures // buildutils:allow-slice-alias slice will not mutate
 	}
 
 	output, err := c.blsConstructor.Aggregate(
@@ -71,14 +71,16 @@ func (c *ConsensusSignatureAggregatorWrapper) Aggregate(
 	bitmask := make([]byte, (len(provers)+7)/8)
 	extra := []byte{}
 	if len(c.filter) != 0 {
-		extra = make([]byte, 516*len(provers))
+		extra = make([]byte, 516*(len(provers)-1))
 	}
+	adj := 0
 	for i, p := range provers {
 		if j, ok := pubs[string(p.PublicKey)]; ok {
 			bitmask[i/8] |= (1 << (i % 8))
 
-			if len(c.filter) != 0 {
-				copy(extra[516*i:516*(i+1)], signatures[j][74:])
+			if len(c.filter) != 0 && len(signatures[j]) > 74 {
+				copy(extra[516*adj:516*(adj+1)], signatures[j][74:])
+				adj++
 			}
 		}
 	}

@@ -42,7 +42,7 @@ func NewProverUpdate(
 	keyManager keys.KeyManager,
 ) *ProverUpdate {
 	return &ProverUpdate{
-		DelegateAddress:            delegateAddress,
+		DelegateAddress:            delegateAddress, // buildutils:allow-slice-alias slice is static
 		PublicKeySignatureBLS48581: publicKeySignatureBLS48581,
 		hypergraph:                 hypergraph,
 		signer:                     signer,

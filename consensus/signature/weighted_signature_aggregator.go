@@ -76,11 +76,11 @@ func NewWeightedSignatureAggregator(
 	}
 
 	return &WeightedSignatureAggregator{
-		dsTag:         dsTag,
-		ids:           ids,
+		dsTag:         dsTag, // buildutils:allow-slice-alias static value
+		ids:           ids,   // buildutils:allow-slice-alias dynamic value constructed by caller
 		idToInfo:      idToInfo,
 		aggregator:    aggregator,
-		message:       message,
+		message:       message, // buildutils:allow-slice-alias static value for call lifetime
 		collectedSigs: make(map[models.Identity][]byte),
 	}, nil
 }
@@ -156,7 +156,7 @@ func (w *WeightedSignatureAggregator) TrustedAdd(
 		)
 	}
 
-	w.collectedSigs[signerID] = sig
+	w.collectedSigs[signerID] = sig // buildutils:allow-slice-alias static value for call lifetime
 	w.totalWeight += info.weight
 
 	return w.totalWeight, nil

@@ -1022,7 +1022,7 @@ func nonceFrom(prefix [12]byte, ctr uint64) []byte {
 
 // applyForward encrypts for exit->...->entry (reverse hop order)
 func applyForward(c *Circuit, inner []byte) ([]byte, error) {
-	out := inner
+	out := inner // buildutils:allow-slice-alias slice is static
 	for i := len(c.Hops) - 1; i >= 0; i-- {
 		h := &c.Hops[i]
 		nonce := nonceFrom(h.keys.kf.nonce, h.keys.fCtr)
@@ -1036,7 +1036,7 @@ func applyForward(c *Circuit, inner []byte) ([]byte, error) {
 // peelBackward decrypts data coming back from entry (encrypting hop-by-hop with
 // Kb)
 func peelBackward(c *Circuit, outer []byte) ([]byte, error) {
-	in := outer
+	in := outer // buildutils:allow-slice-alias slice is static
 	for i := 0; i < len(c.Hops); i++ {
 		h := &c.Hops[i]
 		nonce := nonceFrom(h.keys.kb.nonce, h.keys.bCtr)

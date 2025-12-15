@@ -219,7 +219,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 		return
 	}
 
-	payload := data
+	payload := data // buildutils:allow-slice-alias slice is static
 	if len(data) >= 4 {
 		typePrefix := binary.BigEndian.Uint32(data[:4])
 		if typePrefix == protobufs.MessageBundleType {

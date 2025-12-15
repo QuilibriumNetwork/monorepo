@@ -38,10 +38,9 @@ func SetBitAtIndex(mask []byte, index uint8) []byte {
 
 	newMask := make([]byte, 32)
 	copy(newMask, mask)
-	mask = newMask
 
-	mask[byteIndex] |= 1 << bitPos
-	return mask
+	newMask[byteIndex] |= 1 << bitPos
+	return newMask
 }
 
 // GetSetBitIndices returns a slice of indices where bits are set in the mask.
@@ -110,7 +109,7 @@ func (w *WesolowskiFrameProver) ProveFrameHeaderGenesis(
 	}
 
 	header := &protobufs.FrameHeader{
-		Address:           address,
+		Address:           address, // buildutils:allow-slice-alias (genesis address is constant)
 		FrameNumber:       0,
 		Timestamp:         0,
 		Difficulty:        difficulty,
@@ -143,8 +142,6 @@ func (w *WesolowskiFrameProver) ProveFrameHeader(
 		)
 	}
 
-	pubkeyType := provingKey.GetType()
-
 	previousSelectorBytes := [516]byte{}
 	copy(previousSelectorBytes[:], previousFrame.Output[:516])
 
@@ -174,47 +171,27 @@ func (w *WesolowskiFrameProver) ProveFrameHeader(
 	b := sha3.Sum256(input)
 	o := WesolowskiSolve(b, difficulty)
 
-	domain := append([]byte("shard"), address...)
-	signature, err := provingKey.SignWithDomain(
-		append(append([]byte{}, b[:]...), o[:]...),
-		domain,
-	)
-	if err != nil {
-		return nil, errors.Wrap(
-			err,
-			"prove frame header",
-		)
+	stateRootsClone := make([][]byte, len(stateRoots))
+	for i, root := range stateRoots {
+		if root != nil {
+			stateRootsClone[i] = slices.Clone(root)
+		}
 	}
+	requestsRootClone := slices.Clone(requestsRoot)
+	addressClone := slices.Clone(address)
+	proverClone := slices.Clone(prover)
 
 	header := &protobufs.FrameHeader{
-		Address:           address,
+		Address:           addressClone,
 		FrameNumber:       previousFrame.FrameNumber + 1,
 		Timestamp:         timestamp,
 		Difficulty:        difficulty,
 		Output:            o[:],
 		ParentSelector:    parent.FillBytes(make([]byte, 32)),
 		FeeMultiplierVote: feeMultiplierVote,
-		RequestsRoot:      requestsRoot,
-		StateRoots:        stateRoots,
-		Prover:            prover,
-	}
-
-	switch pubkeyType {
-	case qcrypto.KeyTypeBLS48581G1:
-		fallthrough
-	case qcrypto.KeyTypeBLS48581G2:
-		header.PublicKeySignatureBls48581 = &protobufs.BLS48581AggregateSignature{
-			Bitmask:   SetBitAtIndex(make([]byte, 32), proverIndex),
-			Signature: signature,
-			PublicKey: &protobufs.BLS48581G2PublicKey{
-				KeyValue: provingKey.Public().([]byte),
-			},
-		}
-	default:
-		return nil, errors.Wrap(
-			errors.New("unsupported proving key"),
-			"prove frame header",
-		)
+		RequestsRoot:      requestsRootClone,
+		StateRoots:        stateRootsClone,
+		Prover:            proverClone,
 	}
 
 	return header, nil
@@ -474,15 +451,24 @@ func (w *WesolowskiFrameProver) ProveGlobalFrameHeader(
 		)
 	}
 
+	clonedCommitments := make([][]byte, len(commitments))
+	for i, commitment := range commitments {
+		if commitment != nil {
+			clonedCommitments[i] = slices.Clone(commitment)
+		}
+	}
+	proverRootCopy := slices.Clone(proverRoot)
+	requestRootCopy := slices.Clone(requestRoot)
+
 	header := &protobufs.GlobalFrameHeader{
 		FrameNumber:          previousFrame.FrameNumber + 1,
 		Timestamp:            timestamp,
 		Difficulty:           difficulty,
 		Output:               o[:],
 		ParentSelector:       parent.FillBytes(make([]byte, 32)),
-		GlobalCommitments:    commitments,
-		ProverTreeCommitment: proverRoot,
-		RequestsRoot:         requestRoot,
+		GlobalCommitments:    clonedCommitments,
+		ProverTreeCommitment: proverRootCopy,
+		RequestsRoot:         requestRootCopy,
 	}
 
 	switch pubkeyType {

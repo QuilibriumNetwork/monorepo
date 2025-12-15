@@ -285,9 +285,9 @@ func (t *VectorCommitmentTree) Insert(
 	) {
 		if node == nil {
 			return 1, &VectorCommitmentLeafNode{
-				Key:        key,
-				Value:      value,
-				HashTarget: hashTarget,
+				Key:        slices.Clone(key),
+				Value:      slices.Clone(value),
+				HashTarget: slices.Clone(hashTarget),
 				Size:       size,
 			}
 		}
@@ -295,8 +295,8 @@ func (t *VectorCommitmentTree) Insert(
 		switch n := node.(type) {
 		case *VectorCommitmentLeafNode:
 			if bytes.Equal(n.Key, key) {
-				n.Value = value
-				n.HashTarget = hashTarget
+				n.Value = slices.Clone(value)
+				n.HashTarget = slices.Clone(hashTarget)
 				n.Commitment = nil
 				n.Size = size
 				return 0, n
@@ -318,9 +318,9 @@ func (t *VectorCommitmentTree) Insert(
 			finalNewNibble := getNextNibble(key, divergeDepth)
 			branch.Children[finalOldNibble] = n
 			branch.Children[finalNewNibble] = &VectorCommitmentLeafNode{
-				Key:        key,
-				Value:      value,
-				HashTarget: hashTarget,
+				Key:        slices.Clone(key),
+				Value:      slices.Clone(value),
+				HashTarget: slices.Clone(hashTarget),
 				Size:       size,
 			}
 
@@ -343,9 +343,9 @@ func (t *VectorCommitmentTree) Insert(
 						newBranch.Children[expectedNibble] = n
 						n.Prefix = n.Prefix[i+1:] // remove shared prefix from old branch
 						newBranch.Children[actualNibble] = &VectorCommitmentLeafNode{
-							Key:        key,
-							Value:      value,
-							HashTarget: hashTarget,
+							Key:        slices.Clone(key),
+							Value:      slices.Clone(value),
+							HashTarget: slices.Clone(hashTarget),
 							Size:       size,
 						}
 						return 1, newBranch

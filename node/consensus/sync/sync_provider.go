@@ -60,9 +60,18 @@ type SyncProvider[StateT UniqueFrame, ProposalT any] struct {
 
 	filter        []byte
 	proverAddress []byte
+	filterLabel   string
+	hooks         SyncProviderHooks[StateT, ProposalT]
 }
 
 var _ consensus.SyncProvider[*protobufs.GlobalFrame] = (*SyncProvider[*protobufs.GlobalFrame, *protobufs.GlobalProposal])(nil)
+
+type SyncProviderHooks[StateT UniqueFrame, ProposalT any] interface {
+	BeforeMeshSync(
+		ctx context.Context,
+		provider *SyncProvider[StateT, ProposalT],
+	)
+}
 
 func NewSyncProvider[StateT UniqueFrame, ProposalT any](
 	logger *zap.Logger,
@@ -75,19 +84,26 @@ func NewSyncProvider[StateT UniqueFrame, ProposalT any](
 	config *config.Config,
 	filter []byte,
 	proverAddress []byte,
+	hooks SyncProviderHooks[StateT, ProposalT],
 ) *SyncProvider[StateT, ProposalT] {
+	label := "global"
+	if len(filter) > 0 {
+		label = hex.EncodeToString(filter)
+	}
 	return &SyncProvider[StateT, ProposalT]{
 		logger:               logger,
-		filter:               filter,
+		filter:               filter, // buildutils:allow-slice-alias slice is static
 		forks:                forks,
 		proverRegistry:       proverRegistry,
 		signerRegistry:       signerRegistry,
 		peerInfoManager:      peerInfoManager,
 		proposalSynchronizer: proposalSynchronizer,
 		hypergraph:           hypergraph,
-		proverAddress:        proverAddress,
+		proverAddress:        proverAddress, // buildutils:allow-slice-alias slice is static
 		config:               config,
 		queuedStates:         make(chan syncRequest, defaultStateQueueCapacity),
+		filterLabel:          label,
+		hooks:                hooks,
 	}
 }
 
@@ -190,7 +206,7 @@ func (p *SyncProvider[StateT, ProposalT]) Synchronize(
 			dataCh <- head.State
 		}
 
-		syncStatusCheck.WithLabelValues("synced").Inc()
+		syncStatusCheck.WithLabelValues(p.filterLabel, "synced").Inc()
 		errCh <- nil
 	}()
 
@@ -201,6 +217,10 @@ func (p *SyncProvider[StateT, ProposalT]) syncWithMesh(
 	ctx context.Context,
 ) error {
 	p.logger.Info("synchronizing with peers")
+
+	if p.hooks != nil {
+		p.hooks.BeforeMeshSync(ctx, p)
+	}
 
 	head := p.forks.FinalizedState()
 
@@ -343,6 +363,7 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSync(
 	ctx context.Context,
 	prover []byte,
 	shardKey tries.ShardKey,
+	filter []byte,
 ) {
 	registry, err := p.signerRegistry.GetKeyRegistryByProver(prover)
 	if err != nil || registry == nil || registry.IdentityKey == nil {
@@ -392,7 +413,7 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSync(
 	}
 
 	for _, reachability := range info.Reachability {
-		if !bytes.Equal(reachability.Filter, p.filter) {
+		if !bytes.Equal(reachability.Filter, filter) {
 			continue
 		}
 		for _, s := range reachability.StreamMultiaddrs {

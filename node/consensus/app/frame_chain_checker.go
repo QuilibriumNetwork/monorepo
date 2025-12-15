@@ -43,7 +43,7 @@ func NewAppFrameChainChecker(
 	}
 	return &AppFrameChainChecker{
 		store:  appFrameChainStoreAdapter{store: store},
-		filter: filter,
+		filter: filter, // buildutils:allow-slice-alias slice is static
 		logger: logger,
 	}
 }

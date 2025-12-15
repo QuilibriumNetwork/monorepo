@@ -123,6 +123,11 @@ func (e *AppConsensusEngine) LeaderForRank(rank uint64) (
 		return "", errors.Wrap(err, "leader for rank")
 	}
 
+	// Handle condition where prover cannot be yet known due to lack of sync:
+	if len(proverSet) == 0 {
+		return models.Identity(make([]byte, 32)), nil
+	}
+
 	inputBI.Mod(inputBI, big.NewInt(int64(len(proverSet))))
 	index := inputBI.Int64()
 	return models.Identity(proverSet[int(index)].Address), nil

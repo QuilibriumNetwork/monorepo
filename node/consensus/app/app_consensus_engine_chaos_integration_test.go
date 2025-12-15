@@ -169,7 +169,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 	sharedInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	sharedVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	sharedHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_chaos__shared"}, sharedDB, logger, sharedVerifiableEncryptor, sharedInclusionProver)
-	sharedHg := hypergraph.NewHypergraph(logger, sharedHypergraphStore, sharedInclusionProver, []int{}, &tests.Nopthenticator{})
+	sharedHg := hypergraph.NewHypergraph(logger, sharedHypergraphStore, sharedInclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 	proverRegistry, err := provers.NewProverRegistry(logger, sharedHg)
 	require.NoError(t, err)
 
@@ -221,7 +221,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		nodeInboxStore := store.NewPebbleInboxStore(nodeDB, logger)
 		nodeShardsStore := store.NewPebbleShardsStore(nodeDB, logger)
 		nodeConsensusStore := store.NewPebbleConsensusStore(nodeDB, logger)
-		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{})
+		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 
 		// Create mock pubsub for network simulation
 		pubsub := newMockAppIntegrationPubSub(c, logger, []byte(m.Nodes[nodeIdx].ID()), m.Nodes[nodeIdx], m.Keys[nodeIdx], m.Nodes)

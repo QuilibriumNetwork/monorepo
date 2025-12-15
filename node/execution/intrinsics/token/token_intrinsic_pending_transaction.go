@@ -59,7 +59,7 @@ func NewPendingTransactionInput(address []byte) (
 	error,
 ) {
 	return &PendingTransactionInput{
-		address: address,
+		address: address, // buildutils:allow-slice-alias slice is static
 	}, nil
 }
 
@@ -798,12 +798,12 @@ func NewPendingTransactionOutput(
 	return &PendingTransactionOutput{
 		value: value,
 		ToOutput: RecipientBundle{
-			recipientView:  toViewPubkey,
-			recipientSpend: toSpendPubkey,
+			recipientView:  toViewPubkey,  // buildutils:allow-slice-alias slice is static
+			recipientSpend: toSpendPubkey, // buildutils:allow-slice-alias slice is static
 		},
 		RefundOutput: RecipientBundle{
-			recipientView:  refundViewPubkey,
-			recipientSpend: refundSpendPubkey,
+			recipientView:  refundViewPubkey,  // buildutils:allow-slice-alias slice is static
+			recipientSpend: refundSpendPubkey, // buildutils:allow-slice-alias slice is static
 		},
 		Expiration: expiration,
 	}, nil
@@ -1067,9 +1067,9 @@ func NewPendingTransaction(
 ) *PendingTransaction {
 	return &PendingTransaction{
 		Domain:              domain,
-		Inputs:              inputs,
-		Outputs:             outputs,
-		Fees:                fees,
+		Inputs:              inputs,  // buildutils:allow-slice-alias slice is static
+		Outputs:             outputs, // buildutils:allow-slice-alias slice is static
+		Fees:                fees,    // buildutils:allow-slice-alias slice is static
 		hypergraph:          hypergraph,
 		bulletproofProver:   bulletproofProver,
 		inclusionProver:     inclusionProver,

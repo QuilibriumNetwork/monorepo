@@ -5,12 +5,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"golang.org/x/exp/slices"
+	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -400,6 +402,195 @@ func (r *ProverRegistry) UpdateProverActivity(
 	}
 
 	return nil
+}
+
+// PruneOrphanJoins implements ProverRegistry
+func (r *ProverRegistry) PruneOrphanJoins(frameNumber uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if frameNumber <= 760 {
+		return nil
+	}
+
+	cutoff := frameNumber - 760
+	var pruned int
+
+	set := r.hypergraph.(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(tries.ShardKey{
+		L1: [3]byte{0x00, 0x00, 0x00},
+		L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
+	})
+
+	txn, err := set.GetTree().Store.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "prune orphan joins")
+	}
+
+	for _, info := range r.proverCache {
+		if info == nil || len(info.Allocations) == 0 {
+			continue
+		}
+
+		updated := info.Allocations[:0]
+		var removedFilters map[string]struct{}
+
+		for _, allocation := range info.Allocations {
+			if allocation.Status == consensus.ProverStatusJoining &&
+				allocation.JoinFrameNumber < cutoff {
+				if err := r.pruneAllocationVertex(txn, info, allocation); err != nil {
+					txn.Abort()
+					return errors.Wrap(err, "prune orphan joins")
+				}
+
+				if removedFilters == nil {
+					removedFilters = make(map[string]struct{})
+				}
+				removedFilters[string(allocation.ConfirmationFilter)] = struct{}{}
+				pruned++
+				continue
+			}
+
+			updated = append(updated, allocation)
+		}
+
+		if len(updated) != len(info.Allocations) {
+			info.Allocations = updated
+			r.cleanupFilterCache(info, removedFilters)
+		}
+	}
+
+	if pruned > 0 {
+		if err := txn.Commit(); err != nil {
+			return errors.Wrap(err, "prune orphan joins")
+		}
+
+		r.logger.Info(
+			"pruned orphan prover allocations",
+			zap.Int("allocations_pruned", pruned),
+			zap.Uint64("frame_cutoff", cutoff),
+		)
+	} else {
+		txn.Abort()
+	}
+
+	return nil
+}
+
+func (r *ProverRegistry) pruneAllocationVertex(
+	txn tries.TreeBackingStoreTransaction,
+	info *consensus.ProverInfo,
+	allocation consensus.ProverAllocationInfo,
+) error {
+	if info == nil {
+		return errors.New("missing info")
+	}
+	if len(info.PublicKey) == 0 {
+		r.logger.Warn(
+			"unable to prune allocation without public key",
+			zap.String("address", hex.EncodeToString(info.Address)),
+		)
+		return errors.New("invalid record")
+	}
+
+	allocationHash, err := poseidon.HashBytes(
+		slices.Concat(
+			[]byte("PROVER_ALLOCATION"),
+			info.PublicKey,
+			allocation.ConfirmationFilter,
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "prune allocation hash")
+	}
+
+	var vertexID [64]byte
+	copy(vertexID[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(
+		vertexID[32:],
+		allocationHash.FillBytes(make([]byte, 32)),
+	)
+
+	_, err = r.hypergraph.GetVertex(vertexID)
+	if err != nil {
+		if errors.Cause(err) == hypergraph.ErrRemoved {
+			return nil
+		}
+		r.logger.Debug(
+			"allocation vertex missing during prune",
+			zap.String("address", hex.EncodeToString(info.Address)),
+			zap.String(
+				"filter",
+				hex.EncodeToString(allocation.ConfirmationFilter),
+			),
+			zap.Error(err),
+		)
+		return nil
+	}
+
+	set := r.hypergraph.(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(tries.ShardKey{
+		L1: [3]byte{0x00, 0x00, 0x00},
+		L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
+	})
+
+	vtree := set.GetTree()
+	if err := vtree.Delete(txn, vertexID[:]); err != nil {
+		return errors.Wrap(err, "prune allocation remove vertex")
+	}
+
+	return nil
+}
+
+func (r *ProverRegistry) cleanupFilterCache(
+	info *consensus.ProverInfo,
+	filters map[string]struct{},
+) {
+	if len(filters) == 0 {
+		return
+	}
+
+	for filterKey := range filters {
+		if r.proverHasFilter(info, filterKey) {
+			continue
+		}
+		r.removeFilterCacheEntry(filterKey, info)
+	}
+}
+
+func (r *ProverRegistry) proverHasFilter(
+	info *consensus.ProverInfo,
+	filterKey string,
+) bool {
+	if info == nil {
+		return false
+	}
+	for _, allocation := range info.Allocations {
+		if string(allocation.ConfirmationFilter) == filterKey {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *ProverRegistry) removeFilterCacheEntry(
+	filterKey string,
+	info *consensus.ProverInfo,
+) {
+	provers, ok := r.filterCache[filterKey]
+	if !ok {
+		return
+	}
+	for i, candidate := range provers {
+		if candidate == info {
+			r.filterCache[filterKey] = append(
+				provers[:i],
+				provers[i+1:]...,
+			)
+			break
+		}
+	}
+	if len(r.filterCache[filterKey]) == 0 {
+		delete(r.filterCache, filterKey)
+	}
 }
 
 // Helper method to get provers by status, returns lexicographic order
@@ -1664,7 +1855,7 @@ func (r *ProverRegistry) extractProverFromAddress(
 	// Create ProverInfo
 	proverInfo := &consensus.ProverInfo{
 		PublicKey:        publicKey,
-		Address:          proverAddress,
+		Address:          proverAddress, // buildutils:allow-slice-alias slice is static
 		Status:           mappedStatus,
 		AvailableStorage: availableStorage,
 		Seniority:        seniority,

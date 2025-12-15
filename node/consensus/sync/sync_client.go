@@ -187,7 +187,7 @@ func NewAppSyncClient(
 		config:            config,
 		blsConstructor:    blsConstructor,
 		proposalProcessor: proposalProcessor,
-		filter:            filter,
+		filter:            filter, // buildutils:allow-slice-alias slice is static
 	}
 }
 

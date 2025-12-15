@@ -92,7 +92,7 @@ func (d *DoubleRatchetEncryptedChannel) EncryptTwoPartyMessage(
 ) (newRatchetState string, envelope *channel.P2PChannelEnvelope, err error) {
 	stateAndMessage := generated.DoubleRatchetStateAndMessage{
 		RatchetState: ratchetState,
-		Message:      message,
+		Message:      message, // buildutils:allow-slice-alias this assignment is ephemeral
 	}
 
 	result := DoubleRatchetEncrypt(stateAndMessage)

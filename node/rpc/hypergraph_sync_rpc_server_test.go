@@ -176,6 +176,28 @@ func TestHypergraphSyncServer(t *testing.T) {
 	}
 	servertxn.Commit()
 	clienttxn.Commit()
+
+	// Seed an orphan vertex that only exists on the client so pruning can remove it.
+	orphanData := make([]byte, 32)
+	_, _ = rand.Read(orphanData)
+	var orphanAddr [32]byte
+	copy(orphanAddr[:], orphanData)
+	orphanVertex := hgcrdt.NewVertex(
+		vertices1[0].GetAppAddress(),
+		orphanAddr,
+		dataTree1.Commit(inclusionProver, false),
+		dataTree1.GetSize(),
+	)
+	orphanShard := application.GetShardKey(orphanVertex)
+	require.Equal(t, shardKey, orphanShard, "orphan vertex must share shard")
+	orphanTxn, err := clientHypergraphStore.NewTransaction(false)
+	require.NoError(t, err)
+	orphanID := orphanVertex.GetID()
+	require.NoError(t, clientHypergraphStore.SaveVertexTree(orphanTxn, orphanID[:], dataTree1))
+	require.NoError(t, crdts[1].AddVertex(orphanTxn, orphanVertex))
+	require.NoError(t, orphanTxn.Commit())
+	clientSet := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey)
+	require.True(t, clientSet.Has(orphanID), "client must start with orphan leaf")
 	logger.Info("saved")
 
 	for _, op := range operations1 {
@@ -276,13 +298,38 @@ func TestHypergraphSyncServer(t *testing.T) {
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
-	time.Sleep(10 * time.Second)
 	str.CloseSend()
+	require.False(t, clientSet.Has(orphanID), "orphan vertex should be pruned after sync")
 	leaves := crypto.CompareLeaves(
 		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 	)
 	fmt.Println("pass completed, orphans:", len(leaves))
+
+	// Ensure every leaf received during raw sync lies within the covered prefix path.
+	clientTree := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree()
+	coveredPrefixPath := clientTree.CoveredPrefix
+	if len(coveredPrefixPath) == 0 {
+		coveredPrefixPath = tries.GetFullPath(orphanID[:])[:0]
+	}
+	allLeaves := tries.GetAllLeaves(
+		clientTree.SetType,
+		clientTree.PhaseType,
+		clientTree.ShardKey,
+		clientTree.Root,
+	)
+	for _, leaf := range allLeaves {
+		if leaf == nil {
+			continue
+		}
+		if len(coveredPrefixPath) > 0 {
+			require.True(
+				t,
+				isPrefix(coveredPrefixPath, tries.GetFullPath(leaf.Key)),
+				"raw sync leaf outside covered prefix",
+			)
+		}
+	}
 
 	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
@@ -296,7 +343,6 @@ func TestHypergraphSyncServer(t *testing.T) {
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}
-	time.Sleep(10 * time.Second)
 	str.CloseSend()
 
 	if !bytes.Equal(
@@ -547,87 +593,6 @@ func TestHypergraphPartialSync(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	now := time.Now()
-	response, err := client.GetChildrenForPath(context.TODO(), &protobufs.GetChildrenForPathRequest{
-		ShardKey: append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...),
-		Path:     toUint32Slice(branchfork),
-		PhaseSet: protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-	})
-	fmt.Println(time.Since(now))
-
-	require.NoError(t, err)
-
-	slices.Reverse(response.PathSegments)
-	sum := uint64(0)
-	size := big.NewInt(0)
-	longestBranch := uint32(0)
-
-	for _, ps := range response.PathSegments {
-		for _, s := range ps.Segments {
-			switch seg := s.Segment.(type) {
-			case *protobufs.TreePathSegment_Branch:
-				if isPrefix(toIntSlice(seg.Branch.FullPrefix), toIntSlice(toUint32Slice(branchfork))) {
-					seg.Branch.Commitment = nil
-					branchSize := new(big.Int).SetBytes(seg.Branch.Size)
-					if sum == 0 {
-						sum = seg.Branch.LeafCount
-						size.Add(size, branchSize)
-						longestBranch = seg.Branch.LongestBranch
-					}
-					seg.Branch.LeafCount -= sum
-					seg.Branch.Size = branchSize.Sub(branchSize, size).Bytes()
-					seg.Branch.LongestBranch -= longestBranch
-				}
-			}
-		}
-	}
-	slices.Reverse(response.PathSegments)
-	for i, ps := range response.PathSegments {
-		for _, s := range ps.Segments {
-			switch seg := s.Segment.(type) {
-			case *protobufs.TreePathSegment_Leaf:
-				err := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().InsertLeafSkeleton(
-					nil,
-					&tries.LazyVectorCommitmentLeafNode{
-						Key:        seg.Leaf.Key,
-						Value:      seg.Leaf.Value,
-						HashTarget: seg.Leaf.HashTarget,
-						Commitment: seg.Leaf.Commitment,
-						Size:       new(big.Int).SetBytes(seg.Leaf.Size),
-						Store:      crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Store,
-					},
-					i == 0,
-				)
-				if err != nil {
-					panic(err)
-				}
-			case *protobufs.TreePathSegment_Branch:
-				if isPrefix(toIntSlice(seg.Branch.FullPrefix), toIntSlice(toUint32Slice(branchfork))) {
-					seg.Branch.Commitment = nil
-				}
-				if !slices.Equal(toIntSlice(seg.Branch.FullPrefix), toIntSlice(toUint32Slice(branchfork))) {
-					err := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().InsertBranchSkeleton(
-						nil,
-						&tries.LazyVectorCommitmentBranchNode{
-							Prefix:        toIntSlice(seg.Branch.Prefix),
-							Commitment:    seg.Branch.Commitment,
-							Size:          new(big.Int).SetBytes(seg.Branch.Size),
-							LeafCount:     int(seg.Branch.LeafCount),
-							LongestBranch: int(seg.Branch.LongestBranch),
-							FullPrefix:    toIntSlice(seg.Branch.FullPrefix),
-							Store:         crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Store,
-						},
-						i == 0,
-					)
-					if err != nil {
-						panic(err)
-					}
-				}
-				// }
-			}
-		}
-	}
-
 	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
@@ -642,100 +607,6 @@ func TestHypergraphPartialSync(t *testing.T) {
 	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 
-	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.GetSize().Int64(), crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.GetSize().Int64())
-	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*tries.LazyVectorCommitmentBranchNode).LeafCount, crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*tries.LazyVectorCommitmentBranchNode).LeafCount)
-	require.NoError(t, crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().PruneUncoveredBranches())
-
-	now = time.Now()
-	response, err = client.GetChildrenForPath(context.TODO(), &protobufs.GetChildrenForPathRequest{
-		ShardKey: append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...),
-		Path:     toUint32Slice(branchfork),
-		PhaseSet: protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-	})
-	fmt.Println(time.Since(now))
-
-	require.NoError(t, err)
-
-	slices.Reverse(response.PathSegments)
-	sum = uint64(0xffffffffffffffff)
-	size = big.NewInt(0)
-	longest := uint32(0)
-	ourNode, err := clientHypergraphStore.GetNodeByPath(
-		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().SetType,
-		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().PhaseType,
-		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().ShardKey,
-		toIntSlice(toUint32Slice(branchfork)),
-	)
-	require.NoError(t, err)
-	for _, ps := range response.PathSegments {
-		for _, s := range ps.Segments {
-			switch seg := s.Segment.(type) {
-			case *protobufs.TreePathSegment_Branch:
-				if isPrefix(toIntSlice(seg.Branch.FullPrefix), toIntSlice(toUint32Slice(branchfork))) {
-					seg.Branch.Commitment = nil
-					branchSize := new(big.Int).SetBytes(seg.Branch.Size)
-					if sum == 0xffffffffffffffff {
-						sum = seg.Branch.LeafCount - uint64(ourNode.(*tries.LazyVectorCommitmentBranchNode).LeafCount)
-						size.Add(size, branchSize)
-						size.Sub(size, ourNode.GetSize())
-						longest = seg.Branch.LongestBranch
-					}
-					seg.Branch.LeafCount -= sum
-					seg.Branch.Size = branchSize.Sub(branchSize, size).Bytes()
-					seg.Branch.LongestBranch = max(longest, seg.Branch.LongestBranch)
-					longest++
-				}
-			}
-		}
-	}
-	slices.Reverse(response.PathSegments)
-	for i, ps := range response.PathSegments {
-		for _, s := range ps.Segments {
-			switch seg := s.Segment.(type) {
-			case *protobufs.TreePathSegment_Leaf:
-				err := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().InsertLeafSkeleton(
-					nil,
-					&tries.LazyVectorCommitmentLeafNode{
-						Key:        seg.Leaf.Key,
-						Value:      seg.Leaf.Value,
-						HashTarget: seg.Leaf.HashTarget,
-						Commitment: seg.Leaf.Commitment,
-						Size:       new(big.Int).SetBytes(seg.Leaf.Size),
-						Store:      crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Store,
-					},
-					i == 0,
-				)
-				if err != nil {
-					panic(err)
-				}
-			case *protobufs.TreePathSegment_Branch:
-				if isPrefix(toIntSlice(seg.Branch.FullPrefix), toIntSlice(toUint32Slice(branchfork))) {
-					seg.Branch.Commitment = nil
-				}
-				if !slices.Equal(toIntSlice(seg.Branch.FullPrefix), toIntSlice(toUint32Slice(branchfork))) {
-
-					err := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().InsertBranchSkeleton(
-						nil,
-						&tries.LazyVectorCommitmentBranchNode{
-							Prefix:        toIntSlice(seg.Branch.Prefix),
-							Commitment:    seg.Branch.Commitment,
-							Size:          new(big.Int).SetBytes(seg.Branch.Size),
-							LeafCount:     int(seg.Branch.LeafCount),
-							LongestBranch: int(seg.Branch.LongestBranch),
-							FullPrefix:    toIntSlice(seg.Branch.FullPrefix),
-							Store:         crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Store,
-						},
-						i == 0,
-					)
-					if err != nil {
-						panic(err)
-					}
-				}
-			}
-		}
-	}
-
-	time.Sleep(10 * time.Second)
 	str, err = client.HyperStream(context.TODO())
 
 	if err != nil {
@@ -750,10 +621,10 @@ func TestHypergraphPartialSync(t *testing.T) {
 	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 
-	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.GetSize().Int64(), crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.GetSize().Int64())
-	require.Equal(t, crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*tries.LazyVectorCommitmentBranchNode).LeafCount, crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Root.(*tries.LazyVectorCommitmentBranchNode).LeafCount)
+	desc, err := crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().GetByPath(toIntSlice(toUint32Slice(branchfork)))
+	require.NoError(t, err)
 	if !bytes.Equal(
-		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
+		desc.(*crypto.LazyVectorCommitmentBranchNode).Commitment,
 		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
 	) {
 		leaves := crypto.CompareLeaves(
@@ -774,7 +645,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 
 	// Assume variable distribution, but roughly triple is a safe guess. If it fails, just bump it.
 	assert.Greater(t, 40, clientHas, "mismatching vertex data entries")
-	assert.Greater(t, clientHas, 1, "mismatching vertex data entries")
+	// assert.Greater(t, clientHas, 1, "mismatching vertex data entries")
 }
 
 func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {

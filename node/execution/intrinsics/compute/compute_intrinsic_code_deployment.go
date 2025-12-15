@@ -40,10 +40,10 @@ func NewCodeDeployment(
 	compiler compiler.CircuitCompiler,
 ) (*CodeDeployment, error) {
 	return &CodeDeployment{
-		inputQCLSource: sourceCode,
+		inputQCLSource: sourceCode, // buildutils:allow-slice-alias slice is static
 		Domain:         domain,
 		InputTypes:     inputTypes,
-		OutputTypes:    outputTypes,
+		OutputTypes:    outputTypes, // buildutils:allow-slice-alias slice is static
 		inputSizes:     inputSizes,
 		compiler:       compiler,
 	}, nil

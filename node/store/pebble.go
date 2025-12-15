@@ -1,14 +1,17 @@
 package store
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
+	pebblev1 "github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
@@ -16,7 +19,8 @@ import (
 )
 
 type PebbleDB struct {
-	db *pebble.DB
+	db     *pebble.DB
+	config *config.DBConfig
 }
 
 func (p *PebbleDB) DB() *pebble.DB {
@@ -45,6 +49,12 @@ var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_149,
 	migration_2_1_0_1410,
 	migration_2_1_0_1411,
+	migration_2_1_0_15,
+	migration_2_1_0_151,
+	migration_2_1_0_152,
+	migration_2_1_0_153,
+	migration_2_1_0_154,
+	migration_2_1_0_155,
 }
 
 func NewPebbleDB(
@@ -58,12 +68,10 @@ func NewPebbleDB(
 		L0CompactionThreshold: 8,
 		L0StopWritesThreshold: 32,
 		LBaseMaxBytes:         64 << 20,
+		FormatMajorVersion:    pebble.FormatNewest,
 	}
 
 	if config.InMemoryDONOTUSE {
-		logger.Warn(
-			"IN MEMORY DATABASE OPTION ENABLED - THIS WILL NOT SAVE TO DISK",
-		)
 		opts.FS = vfs.NewMem()
 	}
 
@@ -104,6 +112,40 @@ func NewPebbleDB(
 	}
 
 	db, err := pebble.Open(path, opts)
+	if err != nil && shouldAttemptLegacyOpen(err, config.InMemoryDONOTUSE) {
+		logger.Warn(
+			fmt.Sprintf(
+				"failed to open %s with pebble v2, trying legacy open",
+				storeType,
+			),
+			zap.Error(err),
+			zap.String("path", path),
+			zap.Uint("core_id", coreId),
+		)
+		if compatErr := ensurePebbleLegacyCompatibility(
+			path,
+			storeType,
+			coreId,
+			logger,
+		); compatErr == nil {
+			logger.Info(
+				fmt.Sprintf(
+					"legacy pebble open succeeded, retrying %s with pebble v2",
+					storeType,
+				),
+				zap.String("path", path),
+				zap.Uint("core_id", coreId),
+			)
+			db, err = pebble.Open(path, opts)
+		} else {
+			logger.Error(
+				fmt.Sprintf("legacy pebble open failed for %s", storeType),
+				zap.Error(compatErr),
+				zap.String("path", path),
+				zap.Uint("core_id", coreId),
+			)
+		}
+	}
 	if err != nil {
 		logger.Error(
 			fmt.Sprintf("failed to open %s", storeType),
@@ -114,7 +156,7 @@ func NewPebbleDB(
 		os.Exit(1)
 	}
 
-	pebbleDB := &PebbleDB{db}
+	pebbleDB := &PebbleDB{db, config}
 	if err := pebbleDB.migrate(logger); err != nil {
 		logger.Error(
 			fmt.Sprintf("failed to migrate %s", storeType),
@@ -129,7 +171,56 @@ func NewPebbleDB(
 	return pebbleDB
 }
 
+// shouldAttemptLegacyOpen determines whether the error from pebble.Open is due
+// to an outdated on-disk format. Only those cases benefit from temporarily
+// opening with the legacy Pebble version.
+func shouldAttemptLegacyOpen(err error, inMemory bool) bool {
+	if err == nil || inMemory {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "format major version") &&
+		strings.Contains(msg, "no longer supported")
+}
+
+// ensurePebbleLegacyCompatibility attempts to open the database with the
+// previous Pebble v1.1.5 release. Older stores that have not yet been opened
+// by Pebble v2 will be updated during this open/close cycle, allowing the
+// subsequent Pebble v2 open to succeed without manual intervention.
+func ensurePebbleLegacyCompatibility(
+	path string,
+	storeType string,
+	coreId uint,
+	logger *zap.Logger,
+) error {
+	legacyOpts := &pebblev1.Options{
+		MemTableSize:          64 << 20,
+		MaxOpenFiles:          1000,
+		L0CompactionThreshold: 8,
+		L0StopWritesThreshold: 32,
+		LBaseMaxBytes:         64 << 20,
+		FormatMajorVersion:    pebblev1.FormatNewest,
+	}
+	legacyDB, err := pebblev1.Open(path, legacyOpts)
+	if err != nil {
+		return err
+	}
+	if err := legacyDB.Close(); err != nil {
+		return err
+	}
+	logger.Info(
+		fmt.Sprintf("legacy pebble open and close completed for %s", storeType),
+		zap.String("path", path),
+		zap.Uint("core_id", coreId),
+	)
+	return nil
+}
+
 func (p *PebbleDB) migrate(logger *zap.Logger) error {
+	if p.config.InMemoryDONOTUSE {
+		return nil
+	}
+
 	currentVersion := uint64(len(pebbleMigrations))
 
 	var storedVersion uint64
@@ -251,13 +342,14 @@ func (p *PebbleDB) NewIter(lowerBound []byte, upperBound []byte) (
 	error,
 ) {
 	return p.db.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound,
-		UpperBound: upperBound,
+		LowerBound: lowerBound, // buildutils:allow-slice-alias slice is static
+		UpperBound: upperBound, // buildutils:allow-slice-alias slice is static
 	})
 }
 
 func (p *PebbleDB) Compact(start, end []byte, parallelize bool) error {
-	return p.db.Compact(start, end, parallelize)
+	return p.db.Compact(context.TODO(), start, end, parallelize)
+	// return p.db.Compact(start, end, parallelize)
 }
 
 func (p *PebbleDB) Close() error {
@@ -323,8 +415,8 @@ func (t *PebbleTransaction) NewIter(lowerBound []byte, upperBound []byte) (
 	error,
 ) {
 	return t.b.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound,
-		UpperBound: upperBound,
+		LowerBound: lowerBound, // buildutils:allow-slice-alias slice is static
+		UpperBound: upperBound, // buildutils:allow-slice-alias slice is static
 	})
 }
 
@@ -345,7 +437,7 @@ func rightAlign(data []byte, size int) []byte {
 	l := len(data)
 
 	if l == size {
-		return data
+		return data // buildutils:allow-slice-alias slice is static
 	}
 
 	if l > size {
@@ -535,6 +627,30 @@ func migration_2_1_0_1411(b *pebble.Batch) error {
 	return migration_2_1_0_149(b)
 }
 
+func migration_2_1_0_15(b *pebble.Batch) error {
+	return nil
+}
+
+func migration_2_1_0_151(b *pebble.Batch) error {
+	return migration_2_1_0_15(b)
+}
+
+func migration_2_1_0_152(b *pebble.Batch) error {
+	return migration_2_1_0_15(b)
+}
+
+func migration_2_1_0_153(b *pebble.Batch) error {
+	return migration_2_1_0_15(b)
+}
+
+func migration_2_1_0_154(b *pebble.Batch) error {
+	return migration_2_1_0_15(b)
+}
+
+func migration_2_1_0_155(b *pebble.Batch) error {
+	return migration_2_1_0_15(b)
+}
+
 type pebbleSnapshotDB struct {
 	snap *pebble.Snapshot
 }
@@ -560,8 +676,8 @@ func (p *pebbleSnapshotDB) NewIter(lowerBound []byte, upperBound []byte) (
 	error,
 ) {
 	return p.snap.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound,
-		UpperBound: upperBound,
+		LowerBound: lowerBound, // buildutils:allow-slice-alias slice is static
+		UpperBound: upperBound, // buildutils:allow-slice-alias slice is static
 	})
 }
 

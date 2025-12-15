@@ -64,6 +64,12 @@ func (e *AppConsensusEngine) eventDistributorLoop(
 							zap.Error(err),
 						)
 					}
+
+					if err := e.checkShardCoverage(
+						data.Frame.Header.FrameNumber,
+					); err != nil {
+						e.logger.Error("could not check shard coverage", zap.Error(err))
+					}
 				}
 			case typesconsensus.ControlEventAppEquivocation:
 				// Handle equivocation by constructing and publishing a ProverKick

@@ -89,11 +89,14 @@ func NewManager(
 // PlanAndAllocate picks up to maxAllocations of the best shard filters and
 // updates the filter in the worker manager for each selected free worker.
 // If maxAllocations == 0, it will use as many free workers as available.
+// frameNumber is recorded so pending joins survive restarts while the network
+// processes the request.
 func (m *Manager) PlanAndAllocate(
 	difficulty uint64,
 	shards []ShardDescriptor,
 	maxAllocations int,
 	worldBytes *big.Int,
+	frameNumber uint64,
 ) ([]Proposal, error) {
 	m.mu.Lock()
 	isPlanning := m.isPlanning
@@ -237,7 +240,7 @@ func (m *Manager) PlanAndAllocate(
 	}
 
 	if len(proposals) > 0 {
-		m.persistPlannedFilters(proposals, workerLookup)
+		m.persistPlannedFilters(proposals, workerLookup, frameNumber)
 	}
 
 	// Perform allocations
@@ -263,6 +266,7 @@ func (m *Manager) PlanAndAllocate(
 func (m *Manager) persistPlannedFilters(
 	proposals []Proposal,
 	workers map[uint]*store.WorkerInfo,
+	frameNumber uint64,
 ) {
 	for _, proposal := range proposals {
 		info, ok := workers[proposal.WorkerId]
@@ -288,6 +292,7 @@ func (m *Manager) persistPlannedFilters(
 		copy(filterCopy, proposal.Filter)
 		info.Filter = filterCopy
 		info.Allocated = false
+		info.PendingFilterFrame = frameNumber
 
 		if err := m.workerMgr.RegisterWorker(info); err != nil {
 			m.logger.Warn(

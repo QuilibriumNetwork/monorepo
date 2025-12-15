@@ -57,7 +57,7 @@ func NewParticipant[
 	livenessState, err := consensusStore.GetLivenessState(filter)
 	if err != nil {
 		livenessState = &models.LivenessState{
-			Filter:                      filter,
+			Filter:                      filter, // buildutils:allow-slice-alias this value is static
 			CurrentRank:                 0,
 			LatestQuorumCertificate:     trustedRoot.CertifyingQuorumCertificate,
 			PriorRankTimeoutCertificate: nil,

@@ -9,7 +9,7 @@ import (
 	"path"
 	"slices"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
@@ -55,29 +55,39 @@ func NewPebbleHypergraphStore(
 	}
 }
 
-func (p *PebbleHypergraphStore) NewSnapshot() (
+func (p *PebbleHypergraphStore) NewShardSnapshot(
+	shardKey tries.ShardKey,
+) (
 	tries.TreeBackingStore,
 	func(),
 	error,
 ) {
-	if p.pebble == nil {
-		return nil, nil, errors.New("hypergraph store does not support snapshots")
-	}
+	memConfig := *p.config
+	memConfig.InMemoryDONOTUSE = true
+	memConfig.Path = fmt.Sprintf(
+		"memory-shard-%x",
+		shardKey.L2[:4],
+	)
 
-	snapshot := p.pebble.NewSnapshot()
-	snapshotDB := &pebbleSnapshotDB{snap: snapshot}
+	memDB := NewPebbleDB(p.logger, &memConfig, 0)
+	managedDB := newManagedKVDB(memDB)
 	snapshotStore := NewPebbleHypergraphStore(
-		p.config,
-		snapshotDB,
+		&memConfig,
+		managedDB,
 		p.logger,
 		p.verenc,
 		p.prover,
 	)
 	snapshotStore.pebble = nil
 
+	if err := p.copyShardData(managedDB, shardKey); err != nil {
+		_ = managedDB.Close()
+		return nil, nil, errors.Wrap(err, "copy shard snapshot")
+	}
+
 	release := func() {
-		if err := snapshotDB.Close(); err != nil {
-			p.logger.Warn("failed to close hypergraph snapshot", zap.Error(err))
+		if err := managedDB.Close(); err != nil {
+			p.logger.Warn("failed to close shard snapshot", zap.Error(err))
 		}
 	}
 
@@ -391,6 +401,169 @@ func hypergraphCoveredPrefixKey() []byte {
 	return key
 }
 
+func (p *PebbleHypergraphStore) copyShardData(
+	dst store.KVDB,
+	shardKey tries.ShardKey,
+) error {
+	prefixes := []byte{
+		VERTEX_ADDS_TREE_NODE,
+		VERTEX_REMOVES_TREE_NODE,
+		HYPEREDGE_ADDS_TREE_NODE,
+		HYPEREDGE_REMOVES_TREE_NODE,
+		VERTEX_ADDS_TREE_NODE_BY_PATH,
+		VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		HYPEREDGE_REMOVES_TREE_NODE_BY_PATH,
+		VERTEX_ADDS_TREE_ROOT,
+		VERTEX_REMOVES_TREE_ROOT,
+		HYPEREDGE_ADDS_TREE_ROOT,
+		HYPEREDGE_REMOVES_TREE_ROOT,
+		VERTEX_ADDS_CHANGE_RECORD,
+		VERTEX_REMOVES_CHANGE_RECORD,
+		HYPEREDGE_ADDS_CHANGE_RECORD,
+		HYPEREDGE_REMOVES_CHANGE_RECORD,
+		HYPERGRAPH_VERTEX_ADDS_SHARD_COMMIT,
+		HYPERGRAPH_VERTEX_REMOVES_SHARD_COMMIT,
+		HYPERGRAPH_HYPEREDGE_ADDS_SHARD_COMMIT,
+		HYPERGRAPH_HYPEREDGE_REMOVES_SHARD_COMMIT,
+	}
+
+	for _, prefix := range prefixes {
+		if err := p.copyPrefixedRange(dst, prefix, shardKey); err != nil {
+			return err
+		}
+	}
+
+	if err := p.copyVertexDataForShard(dst, shardKey); err != nil {
+		return err
+	}
+
+	if err := p.copyCoveredPrefix(dst); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) copyPrefixedRange(
+	dst store.KVDB,
+	prefix byte,
+	shardKey tries.ShardKey,
+) error {
+	start, end := shardRangeBounds(prefix, shardKey)
+	iter, err := p.db.NewIter(start, end)
+	if err != nil {
+		return errors.Wrap(err, "snapshot: iter range")
+	}
+	defer iter.Close()
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		key := append([]byte(nil), iter.Key()...)
+		val := append([]byte(nil), iter.Value()...)
+		if err := dst.Set(key, val); err != nil {
+			return errors.Wrap(err, "snapshot: set range value")
+		}
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) copyVertexDataForShard(
+	dst store.KVDB,
+	shardKey tries.ShardKey,
+) error {
+	sets := []struct {
+		setType   string
+		phaseType string
+	}{
+		{string(hypergraph.VertexAtomType), string(hypergraph.AddsPhaseType)},
+		{string(hypergraph.VertexAtomType), string(hypergraph.RemovesPhaseType)},
+	}
+
+	vertexKeys := make(map[string]struct{})
+	for _, cfg := range sets {
+		iter, err := p.IterateRawLeaves(cfg.setType, cfg.phaseType, shardKey)
+		if err != nil {
+			return errors.Wrap(err, "snapshot: iterate raw leaves")
+		}
+		for valid := iter.First(); valid; valid = iter.Next() {
+			leaf, err := iter.Leaf()
+			if err != nil || leaf == nil {
+				continue
+			}
+			if len(leaf.UnderlyingData) == 0 {
+				continue
+			}
+			keyStr := string(leaf.Key)
+			if _, ok := vertexKeys[keyStr]; ok {
+				continue
+			}
+			vertexKeys[keyStr] = struct{}{}
+			buf := append([]byte(nil), leaf.UnderlyingData...)
+			if err := dst.Set(hypergraphVertexDataKey(leaf.Key), buf); err != nil {
+				iter.Close()
+				return errors.Wrap(err, "snapshot: copy vertex data")
+			}
+		}
+		if err := iter.Close(); err != nil {
+			return errors.Wrap(err, "snapshot: close vertex iterator")
+		}
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) copyCoveredPrefix(dst store.KVDB) error {
+	value, closer, err := p.db.Get(hypergraphCoveredPrefixKey())
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil
+		}
+		return errors.Wrap(err, "snapshot: get covered prefix")
+	}
+	defer closer.Close()
+	buf := append([]byte(nil), value...)
+	return errors.Wrap(
+		dst.Set(hypergraphCoveredPrefixKey(), buf),
+		"snapshot: set covered prefix",
+	)
+}
+
+func shardRangeBounds(
+	prefix byte,
+	shardKey tries.ShardKey,
+) ([]byte, []byte) {
+	shardBytes := shardKeyBytes(shardKey)
+	start := append([]byte{HYPERGRAPH_SHARD, prefix}, shardBytes...)
+	nextShardBytes, ok := incrementShardBytes(shardBytes)
+	if ok {
+		end := append([]byte{HYPERGRAPH_SHARD, prefix}, nextShardBytes...)
+		return start, end
+	}
+	if prefix < 0xFF {
+		return start, []byte{HYPERGRAPH_SHARD, prefix + 1}
+	}
+	return start, []byte{HYPERGRAPH_SHARD + 1}
+}
+
+func shardKeyBytes(shardKey tries.ShardKey) []byte {
+	key := make([]byte, 0, len(shardKey.L1)+len(shardKey.L2))
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	return key
+}
+
+func incrementShardBytes(data []byte) ([]byte, bool) {
+	out := append([]byte(nil), data...)
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i]++
+		if out[i] != 0 {
+			return out, true
+		}
+	}
+	return nil, false
+}
+
 func shardKeyFromKey(key []byte) tries.ShardKey {
 	return tries.ShardKey{
 		L1: [3]byte(key[2:5]),
@@ -475,6 +648,23 @@ func (p *PebbleHypergraphStore) SaveVertexTreeRaw(
 	return errors.Wrap(
 		txn.Set(hypergraphVertexDataKey(id), buf),
 		"save vertex tree raw",
+	)
+}
+
+func (p *PebbleHypergraphStore) DeleteVertexTree(
+	txn tries.TreeBackingStoreTransaction,
+	id []byte,
+) error {
+	if txn == nil {
+		return errors.Wrap(
+			errors.New("requires transaction"),
+			"delete vertex tree",
+		)
+	}
+
+	return errors.Wrap(
+		txn.Delete(hypergraphVertexDataKey(id)),
+		"delete vertex tree",
 	)
 }
 

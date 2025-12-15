@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
@@ -52,6 +53,7 @@ import (
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution"
+	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
@@ -99,47 +101,59 @@ type AppConsensusEngine struct {
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
 	]
-	encryptedChannel          channel.EncryptedChannel
-	dispatchService           *dispatch.DispatchService
-	blsConstructor            crypto.BlsConstructor
-	minimumProvers            func() uint64
-	executors                 map[string]execution.ShardExecutionEngine
-	executorsMu               sync.RWMutex
-	executionManager          *manager.ExecutionEngineManager
-	peerInfoManager           tp2p.PeerInfoManager
-	currentDifficulty         uint32
-	currentDifficultyMu       sync.RWMutex
-	messageCollectors         *keyedaggregator.SequencedCollectors[sequencedAppMessage]
-	messageAggregator         *keyedaggregator.SequencedAggregator[sequencedAppMessage]
-	appMessageSpillover       map[uint64][]*protobufs.Message
-	appSpilloverMu            sync.Mutex
-	lastProposalRank          uint64
-	lastProposalRankMu        sync.RWMutex
-	collectedMessages         []*protobufs.Message
-	collectedMessagesMu       sync.RWMutex
-	provingMessages           []*protobufs.Message
-	provingMessagesMu         sync.RWMutex
-	lastProvenFrameTime       time.Time
-	lastProvenFrameTimeMu     sync.RWMutex
-	frameStore                map[string]*protobufs.AppShardFrame
-	frameStoreMu              sync.RWMutex
-	proposalCache             map[uint64]*protobufs.AppShardProposal
-	proposalCacheMu           sync.RWMutex
-	pendingCertifiedParents   map[uint64]*protobufs.AppShardProposal
-	pendingCertifiedParentsMu sync.RWMutex
-	proofCache                map[uint64][516]byte
-	proofCacheMu              sync.RWMutex
-	ctx                       lifecycle.SignalerContext
-	cancel                    context.CancelFunc
-	quit                      chan struct{}
-	frameChainChecker         *AppFrameChainChecker
-	canRunStandalone          bool
-	blacklistMap              map[string]bool
-	currentRank               uint64
-	alertPublicKey            []byte
-	peerAuthCache             map[string]time.Time
-	peerAuthCacheMu           sync.RWMutex
-	proverAddress             []byte
+	encryptedChannel              channel.EncryptedChannel
+	dispatchService               *dispatch.DispatchService
+	blsConstructor                crypto.BlsConstructor
+	minimumProvers                func() uint64
+	executors                     map[string]execution.ShardExecutionEngine
+	executorsMu                   sync.RWMutex
+	executionManager              *manager.ExecutionEngineManager
+	peerInfoManager               tp2p.PeerInfoManager
+	currentDifficulty             uint32
+	currentDifficultyMu           sync.RWMutex
+	messageCollectors             *keyedaggregator.SequencedCollectors[sequencedAppMessage]
+	messageAggregator             *keyedaggregator.SequencedAggregator[sequencedAppMessage]
+	appMessageSpillover           map[uint64][]*protobufs.Message
+	appSpilloverMu                sync.Mutex
+	lastProposalRank              uint64
+	lastProposalRankMu            sync.RWMutex
+	collectedMessages             []*protobufs.Message
+	collectedMessagesMu           sync.RWMutex
+	provingMessages               []*protobufs.Message
+	provingMessagesMu             sync.RWMutex
+	lastProvenFrameTime           time.Time
+	lastProvenFrameTimeMu         sync.RWMutex
+	frameStore                    map[string]*protobufs.AppShardFrame
+	frameStoreMu                  sync.RWMutex
+	proposalCache                 map[uint64]*protobufs.AppShardProposal
+	proposalCacheMu               sync.RWMutex
+	pendingCertifiedParents       map[uint64]*protobufs.AppShardProposal
+	pendingCertifiedParentsMu     sync.RWMutex
+	proofCache                    map[uint64][516]byte
+	proofCacheMu                  sync.RWMutex
+	ctx                           lifecycle.SignalerContext
+	cancel                        context.CancelFunc
+	quit                          chan struct{}
+	frameChainChecker             *AppFrameChainChecker
+	canRunStandalone              bool
+	blacklistMap                  map[string]bool
+	currentRank                   uint64
+	alertPublicKey                []byte
+	peerAuthCache                 map[string]time.Time
+	peerAuthCacheMu               sync.RWMutex
+	peerInfoDigestCache           map[string]struct{}
+	peerInfoDigestCacheMu         sync.Mutex
+	keyRegistryDigestCache        map[string]struct{}
+	keyRegistryDigestCacheMu      sync.Mutex
+	proverAddress                 []byte
+	lowCoverageStreak             map[string]*coverageStreak
+	coverageOnce                  sync.Once
+	coverageMinProvers            uint64
+	coverageHaltThreshold         uint64
+	coverageHaltGrace             uint64
+	globalProverRootVerifiedFrame atomic.Uint64
+	globalProverRootSynced        atomic.Bool
+	globalProverSyncInProgress    atomic.Bool
 
 	// Message queues
 	consensusMessageQueue      chan *pb.Message
@@ -230,7 +244,7 @@ func NewAppConsensusEngine(
 	engine := &AppConsensusEngine{
 		logger:                     logger,
 		config:                     config,
-		appAddress:                 appAddress,
+		appAddress:                 appAddress, // buildutils:allow-slice-alias slice is static
 		appFilter:                  appFilter,
 		appAddressHex:              hex.EncodeToString(appAddress),
 		pubsub:                     ps,
@@ -278,6 +292,8 @@ func NewAppConsensusEngine(
 		blacklistMap:               make(map[string]bool),
 		alertPublicKey:             []byte{},
 		peerAuthCache:              make(map[string]time.Time),
+		peerInfoDigestCache:        make(map[string]struct{}),
+		keyRegistryDigestCache:     make(map[string]struct{}),
 	}
 
 	engine.frameChainChecker = NewAppFrameChainChecker(clockStore, logger, appAddress)
@@ -402,6 +418,10 @@ func NewAppConsensusEngine(
 	}
 	engine.executionManager = executionManager
 
+	if err := engine.ensureGlobalGenesis(); err != nil {
+		return nil, errors.Wrap(err, "new app consensus engine")
+	}
+
 	// Create dispatch service
 	engine.dispatchService = dispatch.NewDispatchService(
 		inboxStore,
@@ -475,6 +495,7 @@ func NewAppConsensusEngine(
 	componentBuilder.AddWorker(engine.executionManager.Start)
 	componentBuilder.AddWorker(engine.eventDistributor.Start)
 	componentBuilder.AddWorker(engine.appTimeReel.Start)
+	componentBuilder.AddWorker(engine.globalTimeReel.Start)
 	componentBuilder.AddWorker(engine.startAppMessageAggregator)
 
 	latest, err := engine.consensusStore.GetConsensusState(engine.appAddress)
@@ -483,7 +504,7 @@ func NewAppConsensusEngine(
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
 	]
-	if err != nil {
+	initializeCertifiedGenesis := func() {
 		frame, qc := engine.initializeGenesis()
 		state = &models.CertifiedState[*protobufs.AppShardFrame]{
 			State: &models.State[*protobufs.AppShardFrame]{
@@ -493,44 +514,53 @@ func NewAppConsensusEngine(
 			},
 			CertifyingQuorumCertificate: qc,
 		}
+		pending = nil
+	}
+
+	if err != nil {
+		initializeCertifiedGenesis()
 	} else {
-		qc, err := engine.clockStore.GetQuorumCertificate(nil, latest.FinalizedRank)
-		if err != nil {
-			panic(err)
-		}
-		frame, _, err := engine.clockStore.GetShardClockFrame(
+		qc, err := engine.clockStore.GetQuorumCertificate(
 			engine.appAddress,
-			qc.GetFrameNumber(),
-			false,
+			latest.FinalizedRank,
 		)
-		if err != nil {
-			panic(err)
+		if err != nil || qc.GetFrameNumber() == 0 {
+			initializeCertifiedGenesis()
+		} else {
+			frame, _, err := engine.clockStore.GetShardClockFrame(
+				engine.appAddress,
+				qc.GetFrameNumber(),
+				false,
+			)
+			if err != nil {
+				panic(err)
+			}
+			parentFrame, err := engine.clockStore.GetGlobalClockFrame(
+				qc.GetFrameNumber() - 1,
+			)
+			if err != nil {
+				panic(err)
+			}
+			parentQC, err := engine.clockStore.GetQuorumCertificate(
+				engine.appAddress,
+				parentFrame.GetRank(),
+			)
+			if err != nil {
+				panic(err)
+			}
+			state = &models.CertifiedState[*protobufs.AppShardFrame]{
+				State: &models.State[*protobufs.AppShardFrame]{
+					Rank:                    frame.GetRank(),
+					Identifier:              frame.Identity(),
+					ProposerID:              frame.Source(),
+					ParentQuorumCertificate: parentQC,
+					Timestamp:               frame.GetTimestamp(),
+					State:                   &frame,
+				},
+				CertifyingQuorumCertificate: qc,
+			}
+			pending = engine.getPendingProposals(frame.Header.FrameNumber)
 		}
-		parentFrame, err := engine.clockStore.GetGlobalClockFrame(
-			qc.GetFrameNumber() - 1,
-		)
-		if err != nil {
-			panic(err)
-		}
-		parentQC, err := engine.clockStore.GetQuorumCertificate(
-			nil,
-			parentFrame.GetRank(),
-		)
-		if err != nil {
-			panic(err)
-		}
-		state = &models.CertifiedState[*protobufs.AppShardFrame]{
-			State: &models.State[*protobufs.AppShardFrame]{
-				Rank:                    frame.GetRank(),
-				Identifier:              frame.Identity(),
-				ProposerID:              frame.Source(),
-				ParentQuorumCertificate: parentQC,
-				Timestamp:               frame.GetTimestamp(),
-				State:                   &frame,
-			},
-			CertifyingQuorumCertificate: qc,
-		}
-		pending = engine.getPendingProposals(frame.Header.FrameNumber)
 	}
 
 	engine.recordProposalRank(state.Rank())
@@ -578,6 +608,22 @@ func NewAppConsensusEngine(
 	}
 	engine.forks = forks
 
+	dbConfig := config.DB.WithDefaults()
+	dbPath := dbConfig.Path
+	if engine.coreId > 0 {
+		if len(dbConfig.WorkerPaths) >= int(engine.coreId) {
+			dbPath = dbConfig.WorkerPaths[engine.coreId-1]
+		} else if dbConfig.WorkerPathPrefix != "" {
+			dbPath = fmt.Sprintf(dbConfig.WorkerPathPrefix, engine.coreId)
+		}
+	}
+
+	appSyncHooks := qsync.NewAppSyncHooks(
+		appAddress,
+		dbPath,
+		config.P2P.Network,
+	)
+
 	engine.syncProvider = qsync.NewSyncProvider[
 		*protobufs.AppShardFrame,
 		*protobufs.AppShardProposal,
@@ -599,6 +645,7 @@ func NewAppConsensusEngine(
 		config,
 		appAddress,
 		engine.proverAddress,
+		appSyncHooks,
 	)
 
 	// Add sync provider
@@ -609,6 +656,11 @@ func NewAppConsensusEngine(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
+		if err := engine.waitForProverRegistration(ctx); err != nil {
+			engine.logger.Error("prover unavailable", zap.Error(err))
+			ctx.Throw(err)
+			return
+		}
 		if err := engine.startConsensus(state, pending, ctx, ready); err != nil {
 			ctx.Throw(err)
 			return
@@ -783,6 +835,119 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 
 	close(errChan)
 	return errChan
+}
+
+func (e *AppConsensusEngine) handleGlobalProverRoot(
+	frame *protobufs.GlobalFrame,
+) {
+	if frame == nil || frame.Header == nil {
+		return
+	}
+
+	frameNumber := frame.Header.FrameNumber
+	expectedProverRoot := frame.Header.ProverTreeCommitment
+
+	localRoot, err := e.computeLocalGlobalProverRoot(frameNumber)
+	if err != nil {
+		e.logger.Warn(
+			"failed to compute local global prover root",
+			zap.Uint64("frame_number", frameNumber),
+			zap.Error(err),
+		)
+		e.globalProverRootSynced.Store(false)
+		e.globalProverRootVerifiedFrame.Store(0)
+		e.triggerGlobalHypersync(frame.Header.Prover)
+		return
+	}
+
+	if len(localRoot) == 0 || len(expectedProverRoot) == 0 {
+		return
+	}
+
+	if !bytes.Equal(localRoot, expectedProverRoot) {
+		e.logger.Warn(
+			"global prover root mismatch",
+			zap.Uint64("frame_number", frameNumber),
+			zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
+			zap.String("local_root", hex.EncodeToString(localRoot)),
+		)
+		e.globalProverRootSynced.Store(false)
+		e.globalProverRootVerifiedFrame.Store(0)
+		e.triggerGlobalHypersync(frame.Header.Prover)
+		return
+	}
+
+	prev := e.globalProverRootVerifiedFrame.Load()
+	if prev >= frameNumber {
+		return
+	}
+
+	e.globalProverRootSynced.Store(true)
+	e.globalProverRootVerifiedFrame.Store(frameNumber)
+
+	if err := e.proverRegistry.Refresh(); err != nil {
+		e.logger.Warn("failed to refresh prover registry", zap.Error(err))
+	}
+}
+
+func (e *AppConsensusEngine) computeLocalGlobalProverRoot(
+	frameNumber uint64,
+) ([]byte, error) {
+	if e.hypergraph == nil {
+		return nil, errors.New("hypergraph unavailable")
+	}
+
+	commitSet, err := e.hypergraph.Commit(frameNumber)
+	if err != nil {
+		return nil, errors.Wrap(err, "compute global prover root")
+	}
+
+	var zeroShardKey tries.ShardKey
+	for shardKey, phaseCommits := range commitSet {
+		if shardKey.L1 == zeroShardKey.L1 {
+			if len(phaseCommits) == 0 || len(phaseCommits[0]) == 0 {
+				return nil, errors.New("empty global prover root commitment")
+			}
+			return slices.Clone(phaseCommits[0]), nil
+		}
+	}
+
+	return nil, errors.New("global prover root shard missing")
+}
+
+func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte) {
+	if e.syncProvider == nil || len(proposer) == 0 {
+		e.logger.Debug("no sync provider or proposer for hypersync")
+		return
+	}
+	if bytes.Equal(proposer, e.proverAddress) {
+		e.logger.Debug("proposer matches local prover, skipping hypersync")
+		return
+	}
+	if !e.globalProverSyncInProgress.CompareAndSwap(false, true) {
+		e.logger.Debug("global hypersync already running")
+		return
+	}
+
+	go func() {
+		defer e.globalProverSyncInProgress.Store(false)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		shardKey := tries.ShardKey{
+			L1: [3]byte{0x00, 0x00, 0x00},
+			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+		}
+
+		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil)
+		if err := e.proverRegistry.Refresh(); err != nil {
+			e.logger.Warn(
+				"failed to refresh prover registry after hypersync",
+				zap.Error(err),
+			)
+		}
+	}()
 }
 
 func (e *AppConsensusEngine) GetFrame() *protobufs.AppShardFrame {
@@ -1296,7 +1461,7 @@ func (e *AppConsensusEngine) initializeGenesis() (
 	}
 	genesisQC := &protobufs.QuorumCertificate{
 		Rank:        0,
-		Filter:      e.appFilter,
+		Filter:      e.appAddress,
 		FrameNumber: genesisFrame.Header.FrameNumber,
 		Selector:    []byte(genesisFrame.Identity()),
 		Timestamp:   0,
@@ -1345,6 +1510,89 @@ func (e *AppConsensusEngine) initializeGenesis() (
 	)
 
 	return genesisFrame, genesisQC
+}
+
+func (e *AppConsensusEngine) ensureGlobalGenesis() error {
+	genesisFrameNumber := global.ExpectedGenesisFrameNumber(e.config, e.logger)
+	_, err := e.clockStore.GetGlobalClockFrame(genesisFrameNumber)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return errors.Wrap(err, "ensure global genesis")
+	}
+
+	e.logger.Info("global genesis missing, initializing")
+	_, _, initErr := global.InitializeGenesisState(
+		e.logger,
+		e.config,
+		e.clockStore,
+		e.shardsStore,
+		e.hypergraph,
+		e.consensusStore,
+		e.inclusionProver,
+		e.keyManager,
+		e.proverRegistry,
+	)
+	if initErr != nil {
+		return errors.Wrap(initErr, "ensure global genesis")
+	}
+	return nil
+}
+
+func (e *AppConsensusEngine) ensureAppGenesis() error {
+	_, _, err := e.clockStore.GetShardClockFrame(
+		e.appAddress,
+		0,
+		false,
+	)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return errors.Wrap(err, "ensure app genesis")
+	}
+	e.logger.Info(
+		"app shard genesis missing, initializing",
+		zap.String("shard_address", hex.EncodeToString(e.appAddress)),
+	)
+	_, _ = e.initializeGenesis()
+	return nil
+}
+
+func (e *AppConsensusEngine) waitForProverRegistration(
+	ctx lifecycle.SignalerContext,
+) error {
+	logger := e.logger.With(zap.String("shard_address", e.appAddressHex))
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		provers, err := e.proverRegistry.GetActiveProvers(e.appAddress)
+		if err != nil {
+			logger.Warn("could not query prover registry", zap.Error(err))
+		} else {
+			for _, prover := range provers {
+				if bytes.Equal(prover.Address, e.proverAddress) {
+					logger.Info("prover present in registry, starting consensus")
+					return nil
+				}
+			}
+			logger.Info("waiting for prover registration")
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // adjustFeeForTraffic calculates a traffic-adjusted fee multiplier based on
@@ -1518,7 +1766,7 @@ func (e *AppConsensusEngine) internalProveFrame(
 
 	timestamp := time.Now().UnixMilli()
 	difficulty := e.difficultyAdjuster.GetNextDifficulty(
-		previousFrame.GetRank()+1,
+		previousFrame.GetFrameNumber()+1,
 		timestamp,
 	)
 
@@ -1794,38 +2042,6 @@ func (e *AppConsensusEngine) OnOwnProposal(
 			priorTC =
 				proposal.PreviousRankTimeoutCertificate.(*protobufs.TimeoutCertificate)
 		}
-
-		provers, err := e.proverRegistry.GetActiveProvers(e.appAddress)
-		if err != nil {
-			e.logger.Error("could not get provers", zap.Error(err))
-			return
-		}
-
-		var signingProverPubKey []byte
-		var signingProverIndex int
-		for i, prover := range provers {
-			if bytes.Equal(
-				prover.Address,
-				(*proposal.Vote).PublicKeySignatureBls48581.Address,
-			) {
-				signingProverIndex = i
-				signingProverPubKey = prover.PublicKey
-				break
-			}
-		}
-
-		bitmask := make([]byte, (len(provers)+7)/8)
-		bitmask[signingProverIndex/8] = 1 << (signingProverIndex % 8)
-
-		// Manually override the signature as the vdf prover's signature is invalid
-		(*proposal.State.State).Header.PublicKeySignatureBls48581 =
-			&protobufs.BLS48581AggregateSignature{
-				PublicKey: &protobufs.BLS48581G2PublicKey{
-					KeyValue: signingProverPubKey,
-				},
-				Signature: (*proposal.Vote).PublicKeySignatureBls48581.Signature,
-				Bitmask:   bitmask,
-			}
 
 		pbProposal := &protobufs.AppShardProposal{
 			State:                       *proposal.State.State,
@@ -2166,7 +2382,9 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 				if bytes.Equal(info[i].Address, e.getProverAddress()) {
 					myIndex = i
 				}
-				ids = append(ids, info[i].Address)
+				if !bytes.Equal([]byte(nextLeader), info[i].Address) {
+					ids = append(ids, info[i].Address)
+				}
 			}
 
 			if myIndex == -1 {
@@ -2525,7 +2743,7 @@ func (e *AppConsensusEngine) VerifyQuorumCertificate(
 
 	// genesis qc is special:
 	if quorumCertificate.GetRank() == 0 {
-		genqc, err := e.clockStore.GetQuorumCertificate(nil, 0)
+		genqc, err := e.clockStore.GetQuorumCertificate(e.appAddress, 0)
 		if err != nil {
 			return errors.Wrap(err, "verify quorum certificate")
 		}
@@ -2567,7 +2785,7 @@ func (e *AppConsensusEngine) VerifyQuorumCertificate(
 	if valid := e.blsConstructor.VerifySignatureRaw(
 		qc.AggregateSignature.GetPubKey(),
 		qc.AggregateSignature.GetSignature(),
-		verification.MakeVoteMessage(nil, qc.Rank, qc.Identity()),
+		verification.MakeVoteMessage(e.appAddress, qc.Rank, qc.Identity()),
 		slices.Concat([]byte("appshard"), e.appAddress),
 	); !valid {
 		return models.ErrInvalidSignature
@@ -2612,7 +2830,7 @@ func (e *AppConsensusEngine) VerifyTimeoutCertificate(
 			pubkeys = append(pubkeys, prover.PublicKey)
 			signatures = append(signatures, tc.AggregateSignature.GetSignature())
 			messages = append(messages, verification.MakeTimeoutMessage(
-				nil,
+				e.appAddress,
 				tc.Rank,
 				tc.LatestRanks[idx],
 			))
@@ -2678,7 +2896,7 @@ func (e *AppConsensusEngine) VerifyVote(
 	if valid := e.blsConstructor.VerifySignatureRaw(
 		pubkey,
 		(*vote).PublicKeySignatureBls48581.Signature[:74],
-		verification.MakeVoteMessage(nil, (*vote).Rank, (*vote).Source()),
+		verification.MakeVoteMessage(e.appAddress, (*vote).Rank, (*vote).Source()),
 		slices.Concat([]byte("appshard"), e.appAddress),
 	); !valid {
 		return models.ErrInvalidSignature

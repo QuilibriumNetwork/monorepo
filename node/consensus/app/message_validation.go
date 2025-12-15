@@ -62,12 +62,6 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 			return p2p.ValidationResultIgnore
 		}
 
-		if proposal.State.Header.PublicKeySignatureBls48581 != nil {
-			e.logger.Debug("frame validation has signature")
-			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
-			return p2p.ValidationResultReject
-		}
-
 		valid, err := e.frameValidator.Validate(proposal.State)
 		if err != nil {
 			e.logger.Debug("frame validation error", zap.Error(err))
@@ -341,7 +335,7 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
 		e.logger.Debug("message too short", zap.Int("data_length", len(message.Data)))
-		globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+		globalFrameValidationTotal.WithLabelValues("reject").Inc()
 		return p2p.ValidationResultReject
 	}
 
@@ -353,7 +347,7 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 		frame := &protobufs.GlobalFrame{}
 		if err := frame.FromCanonicalBytes(message.Data); err != nil {
 			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
-			globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			globalFrameValidationTotal.WithLabelValues("reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
@@ -361,20 +355,20 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 			frame.Header.PublicKeySignatureBls48581.PublicKey == nil ||
 			frame.Header.PublicKeySignatureBls48581.PublicKey.KeyValue == nil {
 			e.logger.Debug("frame validation missing signature")
-			globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			globalFrameValidationTotal.WithLabelValues("reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
 		valid, err := e.globalFrameValidator.Validate(frame)
 		if err != nil {
 			e.logger.Debug("frame validation error", zap.Error(err))
-			globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			globalFrameValidationTotal.WithLabelValues("reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
 		if !valid {
 			e.logger.Debug("invalid frame")
-			globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
+			globalFrameValidationTotal.WithLabelValues("reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
@@ -382,7 +376,7 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 			return p2p.ValidationResultIgnore
 		}
 
-		globalFrameValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
+		globalFrameValidationTotal.WithLabelValues("accept").Inc()
 
 	default:
 		return p2p.ValidationResultReject
@@ -490,6 +484,27 @@ func (e *AppConsensusEngine) validatePeerInfoMessage(
 				zap.Int64("peer_timestamp", peerInfo.Timestamp),
 				zap.Int64("cutoff", fiveMinutesLater),
 			)
+			return p2p.ValidationResultIgnore
+		}
+	case protobufs.KeyRegistryType:
+		keyRegistry := &protobufs.KeyRegistry{}
+		if err := keyRegistry.FromCanonicalBytes(message.Data); err != nil {
+			e.logger.Debug("failed to unmarshal key registry", zap.Error(err))
+			return p2p.ValidationResultReject
+		}
+
+		if err := keyRegistry.Validate(); err != nil {
+			e.logger.Debug("key registry validation error", zap.Error(err))
+			return p2p.ValidationResultReject
+		}
+
+		now := time.Now().UnixMilli()
+		if int64(keyRegistry.LastUpdated) < now-1000 {
+			e.logger.Debug("key registry timestamp too old")
+			return p2p.ValidationResultIgnore
+		}
+		if int64(keyRegistry.LastUpdated) > now+5000 {
+			e.logger.Debug("key registry timestamp too far in future")
 			return p2p.ValidationResultIgnore
 		}
 

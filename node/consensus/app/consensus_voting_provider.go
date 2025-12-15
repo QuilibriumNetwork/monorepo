@@ -144,7 +144,7 @@ func (p *AppVotingProvider) SignTimeoutVote(
 
 	// Create vote message
 	vote := &protobufs.ProposalVote{
-		Filter:      filter,
+		Filter:      filter, // buildutils:allow-slice-alias slice is static
 		FrameNumber: 0,
 		Rank:        currentRank,
 		Selector:    nil,

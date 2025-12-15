@@ -3,6 +3,7 @@ package hypergraph
 import (
 	"context"
 	"math/big"
+	"slices"
 	"sync"
 
 	"github.com/pkg/errors"
@@ -81,10 +82,10 @@ func NewHypergraph(
 		hyperedgeRemoves:       make(map[tries.ShardKey]hypergraph.IdSet),
 		store:                  store,
 		prover:                 prover,
-		coveredPrefix:          coveredPrefix,
+		coveredPrefix:          slices.Clone(coveredPrefix),
 		authenticationProvider: authenticationProvider,
 		syncController:         hypergraph.NewSyncController(maxSyncSessions),
-		snapshotMgr:            newSnapshotManager(logger),
+		snapshotMgr:            newSnapshotManager(logger, store),
 	}
 
 	hg.publishSnapshot(nil)
@@ -96,14 +97,7 @@ func (hg *HypergraphCRDT) publishSnapshot(root []byte) {
 		return
 	}
 	hg.logger.Debug("publishing snapshot")
-
-	snapshotStore, release, err := hg.store.NewSnapshot()
-	if err != nil {
-		hg.logger.Warn("unable to create hypergraph snapshot", zap.Error(err))
-		return
-	}
-
-	hg.snapshotMgr.publish(snapshotStore, release, root)
+	hg.snapshotMgr.publish(root)
 }
 
 func (hg *HypergraphCRDT) cloneSetWithStore(
@@ -125,7 +119,7 @@ func (hg *HypergraphCRDT) SetShutdownContext(ctx context.Context) {
 	go func() {
 		select {
 		case <-hg.shutdownCtx.Done():
-			hg.snapshotMgr.release(hg.snapshotMgr.current)
+			hg.snapshotMgr.publish(nil)
 		}
 	}()
 }

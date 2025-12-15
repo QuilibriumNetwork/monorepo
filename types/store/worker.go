@@ -8,6 +8,7 @@ type WorkerInfo struct {
 	TotalStorage          uint
 	Automatic             bool
 	Allocated             bool
+	PendingFilterFrame    uint64
 }
 
 type WorkerStore interface {

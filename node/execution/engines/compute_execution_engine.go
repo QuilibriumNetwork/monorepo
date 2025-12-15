@@ -726,7 +726,7 @@ func (e *ComputeExecutionEngine) handleBundle(
 
 	responses := &execution.ProcessMessageResult{}
 
-	movingAddress := address
+	movingAddress := address // buildutils:allow-slice-alias assigned slice will not mutate, reassignment will
 
 	// Validate fees distribute correctly
 	feeQueue := fees.CollectBundleFees(bundle, DefaultFeeMarket)
