@@ -1700,7 +1700,7 @@ func (b *BlossomSub) isLocalOnlyAddr(addr ma.Multiaddr) bool {
 	if err != nil {
 		ipComponent, err = addr.ValueForProtocol(ma.P_IP6)
 		if err != nil {
-			return false
+			return addr.String() == "/p2p-circuit"
 		}
 	}
 
