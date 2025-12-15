@@ -12,7 +12,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	"source.quilibrium.com/quilibrium/monorepo/utils/p2p"
-	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
+	// up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
 // Commit calculates the hierarchical vector commitments of each set and returns
@@ -292,7 +292,7 @@ func (hg *HypergraphCRDT) CommitShard(
 		return nil, errors.Wrap(errors.New("invalid shard address"), "commit shard")
 	}
 
-	l1 := up2p.GetBloomFilterIndices(shardAddress[:32], 256, 3)
+	l1 := p2p.GetBloomFilterIndices(shardAddress[:32], 256, 3)
 	shardKey := tries.ShardKey{
 		L1: [3]byte(l1),
 		L2: [32]byte(shardAddress[:32]),

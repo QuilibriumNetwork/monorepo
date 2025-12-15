@@ -13,7 +13,6 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
@@ -181,22 +180,6 @@ func createClient() (host.Host, error) {
 	// This makes it a client-only node that can connect to others but doesn't accept connections
 	opts := []libp2p.Option{
 		libp2p.NoListenAddrs, // Don't listen on any addresses - client only
-		libp2p.SwarmOpts(
-			swarm.WithUDPBlackHoleSuccessCounter(
-				&swarm.BlackHoleSuccessCounter{
-					N:            8000,
-					MinSuccesses: 1,
-					Name:         "permissive-udp",
-				},
-			),
-			swarm.WithIPv6BlackHoleSuccessCounter(
-				&swarm.BlackHoleSuccessCounter{
-					N:            8000,
-					MinSuccesses: 1,
-					Name:         "permissive-ip6",
-				},
-			),
-		),
 	}
 
 	return libp2p.New(opts...)

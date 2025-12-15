@@ -30,6 +30,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func tStringCast(s string) ma.Multiaddr {
+	st, _ := ma.StringCast(s)
+	return st
+}
+
 func TestAddrsForDial(t *testing.T) {
 	mockResolver := madns.MockResolver{IP: make(map[string][]net.IPAddr)}
 	ipaddr, err := net.ResolveIPAddr("ip4", "1.2.3.4")
