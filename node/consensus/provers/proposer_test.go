@@ -94,8 +94,9 @@ func createWorkers(n int) []*store.WorkerInfo {
 	ws := make([]*store.WorkerInfo, n)
 	for i := 0; i < n; i++ {
 		ws[i] = &store.WorkerInfo{
-			CoreId:    uint(i + 1),
-			Allocated: false,
+			CoreId:             uint(i + 1),
+			Allocated:          false,
+			PendingFilterFrame: 0,
 		}
 	}
 	return ws
@@ -132,7 +133,7 @@ func TestPlanAndAllocate_EqualScores_RandomizedWhenNotDataGreedy(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 
 		wm.lastFiltersHex = nil
-		_, err := m.PlanAndAllocate(100, shards, 1, big.NewInt(40000))
+		_, err := m.PlanAndAllocate(100, shards, 1, big.NewInt(40000), uint64(i+1))
 		if err != nil {
 			t.Fatalf("PlanAndAllocate failed: %v", err)
 		}
@@ -144,6 +145,7 @@ func TestPlanAndAllocate_EqualScores_RandomizedWhenNotDataGreedy(t *testing.T) {
 		// Reset worker filter to simulate completion
 		for _, worker := range wm.workers {
 			worker.Filter = nil
+			worker.PendingFilterFrame = 0
 		}
 	}
 
@@ -172,7 +174,7 @@ func TestPlanAndAllocate_EqualSizes_DeterministicWhenDataGreedy(t *testing.T) {
 	const runs = 16
 	for i := 0; i < runs; i++ {
 		wm.lastFiltersHex = nil
-		_, err := m.PlanAndAllocate(100, shards, 1, big.NewInt(40000))
+		_, err := m.PlanAndAllocate(100, shards, 1, big.NewInt(40000), uint64(i+1))
 		if err != nil {
 			t.Fatalf("PlanAndAllocate failed: %v", err)
 		}
@@ -195,7 +197,7 @@ func TestPlanAndAllocate_UnequalScores_PicksMax(t *testing.T) {
 	other2 := createShard([]byte{0x02}, 50_000, 0, 1)
 	shards := []ShardDescriptor{other1, other2, best}
 
-	_, err := m.PlanAndAllocate(100, shards, 1, big.NewInt(300000))
+	_, err := m.PlanAndAllocate(100, shards, 1, big.NewInt(300000), 1)
 	if err != nil {
 		t.Fatalf("PlanAndAllocate failed: %v", err)
 	}

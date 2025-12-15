@@ -702,8 +702,8 @@ func (c *PubSubProxyClient) PublishToBitmask(
 	_, err := c.client.PublishToBitmask(
 		context.Background(),
 		&protobufs.PublishToBitmaskRequest{
-			Bitmask: bitmask,
-			Data:    data,
+			Bitmask: bitmask, // buildutils:allow-slice-alias slice is static
+			Data:    data,    // buildutils:allow-slice-alias slice is static
 		},
 	)
 	return err
@@ -711,8 +711,8 @@ func (c *PubSubProxyClient) PublishToBitmask(
 
 func (c *PubSubProxyClient) Publish(address []byte, data []byte) error {
 	_, err := c.client.Publish(context.Background(), &protobufs.PublishRequest{
-		Address: address,
-		Data:    data,
+		Address: address, // buildutils:allow-slice-alias slice is static
+		Data:    data,    // buildutils:allow-slice-alias slice is static
 	})
 	return err
 }
@@ -731,7 +731,7 @@ func (c *PubSubProxyClient) Subscribe(
 	c.mu.Unlock()
 
 	stream, err := c.client.Subscribe(ctx, &protobufs.SubscribeRequest{
-		Bitmask:        bitmask,
+		Bitmask:        bitmask, // buildutils:allow-slice-alias slice is static
 		SubscriptionId: subID,
 	})
 	if err != nil {
@@ -781,7 +781,7 @@ func (c *PubSubProxyClient) Unsubscribe(bitmask []byte, raw bool) {
 	_, err := c.client.Unsubscribe(
 		context.Background(),
 		&protobufs.UnsubscribeRequest{
-			Bitmask: bitmask,
+			Bitmask: bitmask, // buildutils:allow-slice-alias slice is static
 			Raw:     raw,
 		},
 	)
@@ -809,7 +809,7 @@ func (c *PubSubProxyClient) RegisterValidator(
 		unreg := &protobufs.ValidationStreamMessage{
 			Message: &protobufs.ValidationStreamMessage_Unregister{
 				Unregister: &protobufs.UnregisterValidatorRequest{
-					Bitmask:     bitmask,
+					Bitmask:     bitmask, // buildutils:allow-slice-alias slice is static
 					ValidatorId: existingID,
 				},
 			},
@@ -834,7 +834,7 @@ func (c *PubSubProxyClient) RegisterValidator(
 	req := &protobufs.ValidationStreamMessage{
 		Message: &protobufs.ValidationStreamMessage_Register{
 			Register: &protobufs.RegisterValidatorRequest{
-				Bitmask:     bitmask,
+				Bitmask:     bitmask, // buildutils:allow-slice-alias slice is static
 				ValidatorId: validatorID,
 				Sync:        sync,
 			},
@@ -887,7 +887,7 @@ func (c *PubSubProxyClient) UnregisterValidator(bitmask []byte) error {
 	req := &protobufs.ValidationStreamMessage{
 		Message: &protobufs.ValidationStreamMessage_Unregister{
 			Unregister: &protobufs.UnregisterValidatorRequest{
-				Bitmask:     bitmask,
+				Bitmask:     bitmask, // buildutils:allow-slice-alias slice is static
 				ValidatorId: validatorID,
 			},
 		},
@@ -937,7 +937,7 @@ func (c *PubSubProxyClient) GetRandomPeer(bitmask []byte) ([]byte, error) {
 	resp, err := c.client.GetRandomPeer(
 		context.Background(),
 		&protobufs.GetRandomPeerRequest{
-			Bitmask: bitmask,
+			Bitmask: bitmask, // buildutils:allow-slice-alias slice is static
 		},
 	)
 	if err != nil {
@@ -958,7 +958,7 @@ func (c *PubSubProxyClient) GetMultiaddrOfPeerStream(
 		stream, err := c.client.GetMultiaddrOfPeerStream(
 			ctx,
 			&protobufs.GetMultiaddrOfPeerRequest{
-				PeerId: peerId,
+				PeerId: peerId, // buildutils:allow-slice-alias slice is static
 			},
 		)
 		if err != nil {
@@ -998,7 +998,7 @@ func (c *PubSubProxyClient) GetMultiaddrOfPeer(peerId []byte) string {
 	resp, err := c.client.GetMultiaddrOfPeer(
 		context.Background(),
 		&protobufs.GetMultiaddrOfPeerRequest{
-			PeerId: peerId,
+			PeerId: peerId, // buildutils:allow-slice-alias slice is static
 		},
 	)
 	if err != nil {
@@ -1077,7 +1077,7 @@ func (c *PubSubProxyClient) SignMessage(msg []byte) ([]byte, error) {
 	resp, err := c.client.SignMessage(
 		context.Background(),
 		&protobufs.SignMessageRequest{
-			Message: msg,
+			Message: msg, // buildutils:allow-slice-alias slice is static
 		},
 	)
 	if err != nil {
@@ -1097,7 +1097,7 @@ func (c *PubSubProxyClient) GetPublicKey() []byte {
 
 func (c *PubSubProxyClient) GetPeerScore(peerId []byte) int64 {
 	resp, err := c.client.GetPeerScore(context.Background(), &protobufs.GetPeerScoreRequest{
-		PeerId: peerId,
+		PeerId: peerId, // buildutils:allow-slice-alias slice is static
 	})
 	if err != nil {
 		c.logger.Error("GetPeerScore error", zap.Error(err))
@@ -1110,7 +1110,7 @@ func (c *PubSubProxyClient) SetPeerScore(peerId []byte, score int64) {
 	_, err := c.client.SetPeerScore(
 		context.Background(),
 		&protobufs.SetPeerScoreRequest{
-			PeerId: peerId,
+			PeerId: peerId, // buildutils:allow-slice-alias slice is static
 			Score:  score,
 		},
 	)
@@ -1123,7 +1123,7 @@ func (c *PubSubProxyClient) AddPeerScore(peerId []byte, scoreDelta int64) {
 	_, err := c.client.AddPeerScore(
 		context.Background(),
 		&protobufs.AddPeerScoreRequest{
-			PeerId:     peerId,
+			PeerId:     peerId, // buildutils:allow-slice-alias slice is static
 			ScoreDelta: scoreDelta,
 		},
 	)
@@ -1136,7 +1136,7 @@ func (c *PubSubProxyClient) Reconnect(peerId []byte) error {
 	_, err := c.client.Reconnect(
 		context.Background(),
 		&protobufs.ReconnectRequest{
-			PeerId: peerId,
+			PeerId: peerId, // buildutils:allow-slice-alias slice is static
 		},
 	)
 	return err
@@ -1165,7 +1165,7 @@ func (c *PubSubProxyClient) IsPeerConnected(peerId []byte) bool {
 	resp, err := c.client.IsPeerConnected(
 		context.Background(),
 		&protobufs.IsPeerConnectedRequest{
-			PeerId: peerId,
+			PeerId: peerId, // buildutils:allow-slice-alias slice is static
 		},
 	)
 	if err != nil {

@@ -71,6 +71,15 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	filter []byte,
 	priorState models.Identity,
 ) (**protobufs.GlobalFrame, error) {
+	if !p.engine.tryBeginProvingRank(rank) {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf(
+			"in-progress proving for rank %d",
+			rank,
+		)
+	}
+	defer p.engine.endProvingRank(rank)
+
 	latestQC, qcErr := p.engine.clockStore.GetLatestQuorumCertificate(nil)
 	if qcErr != nil {
 		p.engine.logger.Debug(

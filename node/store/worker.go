@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
@@ -191,7 +191,7 @@ func encodeWorkerInfo(worker *store.WorkerInfo) ([]byte, error) {
 	// totalLen = coreId(8) + totalStorage(8) + automatic(1) + allocated(1)
 	//   + 2 + listen + 2 + stream + 2 + filter
 	totalLen := 8 + 8 + 1 + 1 + 2 + int(listenMultiaddrLen) + 2 +
-		int(streamListenMultiaddrLen) + 2 + int(filterLen)
+		int(streamListenMultiaddrLen) + 2 + int(filterLen) + 8
 	data := make([]byte, totalLen)
 
 	offset := 0
@@ -228,6 +228,9 @@ func encodeWorkerInfo(worker *store.WorkerInfo) ([]byte, error) {
 	binary.BigEndian.PutUint16(data[offset:], filterLen)
 	offset += 2
 	copy(data[offset:], worker.Filter)
+	offset += int(filterLen)
+
+	binary.BigEndian.PutUint64(data[offset:], worker.PendingFilterFrame)
 
 	return data, nil
 }
@@ -303,6 +306,12 @@ func decodeWorkerInfo(data []byte) (*store.WorkerInfo, error) {
 
 	filter := make([]byte, filterLen)
 	copy(filter, data[offset:offset+filterLen])
+	offset += filterLen
+
+	var pendingFrame uint64
+	if offset+8 <= len(data) {
+		pendingFrame = binary.BigEndian.Uint64(data[offset:])
+	}
 
 	return &store.WorkerInfo{
 		CoreId:                uint(coreId),
@@ -312,5 +321,6 @@ func decodeWorkerInfo(data []byte) (*store.WorkerInfo, error) {
 		TotalStorage:          uint(totalStorage),
 		Automatic:             automatic,
 		Allocated:             allocated,
+		PendingFilterFrame:    pendingFrame,
 	}, nil
 }

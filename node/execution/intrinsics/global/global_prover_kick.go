@@ -60,9 +60,9 @@ func NewProverKick(
 ) (*ProverKick, error) {
 	return &ProverKick{
 		FrameNumber:           frameNumber,
-		KickedProverPublicKey: kickedProverPublicKey,
-		ConflictingFrame1:     conflictingFrame1,
-		ConflictingFrame2:     conflictingFrame2,
+		KickedProverPublicKey: kickedProverPublicKey, // buildutils:allow-slice-alias slice is static
+		ConflictingFrame1:     conflictingFrame1,     // buildutils:allow-slice-alias slice is static
+		ConflictingFrame2:     conflictingFrame2,     // buildutils:allow-slice-alias slice is static
 		blsConstructor:        blsConstructor,
 		frameProver:           frameProver,
 		hypergraph:            hypergraph,
@@ -415,8 +415,8 @@ func (p *ProverKick) Verify(frameNumber uint64) (bool, error) {
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
 			), "verify")
 		}
-		frames.Close()
 		frame, err = frames.Value()
+		frames.Close()
 		if err != nil {
 			return false, errors.Wrap(errors.Wrap(
 				err,

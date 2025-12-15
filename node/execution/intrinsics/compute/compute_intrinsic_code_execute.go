@@ -99,15 +99,15 @@ func NewCodeExecute(
 		Domain:            domain,
 		ProofOfPayment:    [2][]byte{},
 		Rendezvous:        rendezvous,
-		ExecuteOperations: operations,
+		ExecuteOperations: operations, // buildutils:allow-slice-alias slice is static
 		hypergraph:        hypergraph,
 		bulletproofProver: bulletproofProver,
 		inclusionProver:   inclusionProver,
 		verEnc:            verEnc,
 		decafConstructor:  decafConstructor,
 		keyManager:        keyManager,
-		payerPublicKey:    payerPublicKey,
-		secretKey:         secretKey,
+		payerPublicKey:    payerPublicKey, // buildutils:allow-slice-alias slice is static
+		secretKey:         secretKey,      // buildutils:allow-slice-alias slice is static
 		rdfMultiprover: schema.NewRDFMultiprover(
 			&schema.TurtleRDFParser{},
 			inclusionProver,

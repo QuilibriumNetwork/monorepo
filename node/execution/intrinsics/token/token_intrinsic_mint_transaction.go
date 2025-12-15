@@ -67,7 +67,7 @@ func NewMintTransactionInput(
 ) (*MintTransactionInput, error) {
 	return &MintTransactionInput{
 		Value:       value,
-		contextData: contextData,
+		contextData: contextData, // buildutils:allow-slice-alias slice is static
 	}, nil
 }
 
@@ -1766,8 +1766,8 @@ func (i *MintTransactionInput) verifyWithProofOfMeaningfulWork(
 					fmt.Sprintf("frame number: %d", frameNumber),
 				), "verify with mint with proof of meaningful work")
 			}
-			frames.Close()
 			frame, err = frames.Value()
+			frames.Close()
 			if err != nil {
 				return errors.Wrap(errors.Wrap(
 					err,
@@ -1965,8 +1965,8 @@ func NewMintTransactionOutput(
 	return &MintTransactionOutput{
 		value: value,
 		RecipientOutput: RecipientBundle{
-			recipientView:  recipientViewPubkey,
-			recipientSpend: recipientSpendPubkey,
+			recipientView:  recipientViewPubkey,  // buildutils:allow-slice-alias slice is static
+			recipientSpend: recipientSpendPubkey, // buildutils:allow-slice-alias slice is static
 		},
 	}, nil
 }
@@ -2128,9 +2128,9 @@ func NewMintTransaction(
 ) *MintTransaction {
 	return &MintTransaction{
 		Domain:              domain,
-		Inputs:              inputs,
-		Outputs:             outputs,
-		Fees:                fees,
+		Inputs:              inputs,  // buildutils:allow-slice-alias slice is static
+		Outputs:             outputs, // buildutils:allow-slice-alias slice is static
+		Fees:                fees,    // buildutils:allow-slice-alias slice is static
 		hypergraph:          hypergraph,
 		bulletproofProver:   bulletproofProver,
 		inclusionProver:     inclusionProver,

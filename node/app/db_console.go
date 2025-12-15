@@ -537,7 +537,7 @@ func newModel(config *config.Config, specs []tailSpec) model {
 	return model{
 		console: consoleModel(config, false),
 		config:  config,
-		tabs:    specs,
+		tabs:    specs, // buildutils:allow-slice-alias mutation is not an issue
 		active:  0,
 		vps:     vps,
 		offsets: offsets,

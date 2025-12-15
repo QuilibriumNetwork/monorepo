@@ -60,31 +60,8 @@ func (hg *HypergraphCRDT) HyperStream(
 		hg.syncController.EndSyncSession(peerKey)
 	}()
 
-	snapshotStart := time.Now()
-	handle := hg.snapshotMgr.acquire()
-	if handle == nil {
-		return errors.New("hypergraph snapshot unavailable")
-	}
-	defer hg.snapshotMgr.release(handle)
-	sessionLogger.Debug(
-		"snapshot acquisition complete",
-		zap.Duration("duration", time.Since(snapshotStart)),
-	)
-
-	root := handle.Root()
-	if len(root) != 0 {
-		sessionLogger.Debug(
-			"acquired snapshot",
-			zap.String("root", hex.EncodeToString(root)),
-		)
-	} else {
-		sessionLogger.Debug("acquired snapshot", zap.String("root", ""))
-	}
-
-	snapshotStore := handle.Store()
-
 	syncStart := time.Now()
-	err = hg.syncTreeServer(ctx, stream, snapshotStore, root, sessionLogger, handle)
+	err = hg.syncTreeServer(ctx, stream, sessionLogger)
 	sessionLogger.Info(
 		"syncTreeServer completed",
 		zap.Duration("sync_duration", time.Since(syncStart)),
@@ -432,6 +409,14 @@ func toInt32Slice(s []int) []int32 {
 	return o
 }
 
+func toIntSlice(s []int32) []int {
+	o := []int{}
+	for _, p := range s {
+		o = append(o, int(p))
+	}
+	return o
+}
+
 func isPrefix(prefix []int, path []int) bool {
 	if len(prefix) > len(path) {
 		return false
@@ -531,10 +516,18 @@ type rawVertexSaver interface {
 	) error
 }
 
+type vertexTreeDeleter interface {
+	DeleteVertexTree(
+		txn tries.TreeBackingStoreTransaction,
+		id []byte,
+	) error
+}
+
 const (
 	leafAckMinTimeout    = 30 * time.Second
 	leafAckMaxTimeout    = 10 * time.Minute
 	leafAckPerLeafBudget = 20 * time.Millisecond // Generous budget for tree building overhead
+	pruneTxnChunk        = 100
 )
 
 func leafAckTimeout(count uint64) time.Duration {
@@ -555,6 +548,22 @@ func shouldUseRawSync(phaseSet protobufs.HypergraphPhaseSet) bool {
 	return phaseSet == protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS
 }
 
+func keyWithinCoveredPrefix(key []byte, prefix []int) bool {
+	if len(prefix) == 0 {
+		return true
+	}
+	path := tries.GetFullPath(key)
+	if len(path) < len(prefix) {
+		return false
+	}
+	for i, nib := range prefix {
+		if path[i] != nib {
+			return false
+		}
+	}
+	return true
+}
+
 // rawShardSync performs a full raw sync of all leaves from server to client.
 // This iterates directly over the database, bypassing in-memory tree caching
 // to ensure all leaves are sent even if the in-memory tree is stale.
@@ -562,6 +571,7 @@ func (s *streamManager) rawShardSync(
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
 	incomingLeaves <-chan *protobufs.HypergraphComparison,
+	coveredPrefix []int32,
 ) error {
 	shardHex := hex.EncodeToString(shardKey.L2[:])
 	s.logger.Info(
@@ -569,6 +579,7 @@ func (s *streamManager) rawShardSync(
 		zap.String("shard_key", shardHex),
 	)
 	start := time.Now()
+	prefix := toIntSlice(coveredPrefix)
 
 	// Determine set and phase type strings
 	setType := string(hypergraph.VertexAtomType)
@@ -608,7 +619,7 @@ func (s *streamManager) rawShardSync(
 			// Skip non-leaf nodes (branches)
 			continue
 		}
-		if leaf != nil {
+		if leaf != nil && keyWithinCoveredPrefix(leaf.Key, prefix) {
 			count++
 		}
 	}
@@ -651,6 +662,9 @@ func (s *streamManager) rawShardSync(
 			continue
 		}
 		if leaf == nil {
+			continue
+		}
+		if !keyWithinCoveredPrefix(leaf.Key, prefix) {
 			continue
 		}
 
@@ -743,6 +757,7 @@ func (s *streamManager) receiveRawShardSync(
 
 	var txn tries.TreeBackingStoreTransaction
 	var processed uint64
+	seenKeys := make(map[string]struct{})
 	for processed < expectedLeaves {
 		if processed%100 == 0 {
 			if txn != nil {
@@ -796,6 +811,9 @@ func (s *streamManager) receiveRawShardSync(
 			}
 		}
 
+		// Track key so we can prune anything absent from the authoritative list.
+		seenKeys[string(append([]byte(nil), leafMsg.Key...))] = struct{}{}
+
 		// Use Add to properly build tree structure
 		if err := s.localSet.Add(txn, theirs); err != nil {
 			txn.Abort()
@@ -823,11 +841,101 @@ func (s *streamManager) receiveRawShardSync(
 		return errors.Wrap(err, "receive raw shard sync")
 	}
 
+	if err := s.pruneRawSyncExtras(seenKeys); err != nil {
+		return errors.Wrap(err, "receive raw shard sync")
+	}
+
 	s.logger.Info(
 		"CLIENT: raw shard sync completed",
 		zap.Uint64("leaves_received", expectedLeaves),
 		zap.Duration("duration", time.Since(start)),
 	)
+	return nil
+}
+
+func (s *streamManager) pruneRawSyncExtras(seen map[string]struct{}) error {
+	start := time.Now()
+	setType := s.localTree.SetType
+	phaseType := s.localTree.PhaseType
+	shardKey := s.localTree.ShardKey
+
+	iter, err := s.hypergraphStore.IterateRawLeaves(setType, phaseType, shardKey)
+	if err != nil {
+		return errors.Wrap(err, "prune raw sync extras: iterator")
+	}
+	defer iter.Close()
+
+	var txn tries.TreeBackingStoreTransaction
+	var pruned uint64
+
+	commitTxn := func() error {
+		if txn == nil {
+			return nil
+		}
+		if err := txn.Commit(); err != nil {
+			txn.Abort()
+			return err
+		}
+		txn = nil
+		return nil
+	}
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		leaf, err := iter.Leaf()
+		if err != nil || leaf == nil {
+			continue
+		}
+		if _, ok := seen[string(leaf.Key)]; ok {
+			continue
+		}
+
+		if txn == nil {
+			txn, err = s.hypergraphStore.NewTransaction(false)
+			if err != nil {
+				return errors.Wrap(err, "prune raw sync extras")
+			}
+		}
+
+		atom := AtomFromBytes(leaf.Value)
+		if atom == nil {
+			s.logger.Warn("CLIENT: skipping stale leaf with invalid atom", zap.String("key", hex.EncodeToString(leaf.Key)))
+			continue
+		}
+
+		if err := s.localSet.Delete(txn, atom); err != nil {
+			txn.Abort()
+			return errors.Wrap(err, "prune raw sync extras")
+		}
+		if err := s.deleteVertexTreeIfNeeded(txn, atom, leaf.Key); err != nil {
+			txn.Abort()
+			return errors.Wrap(err, "prune raw sync extras")
+		}
+
+		pruned++
+		if pruned%pruneTxnChunk == 0 {
+			if err := commitTxn(); err != nil {
+				return errors.Wrap(err, "prune raw sync extras")
+			}
+		}
+	}
+
+	if err := commitTxn(); err != nil {
+		return errors.Wrap(err, "prune raw sync extras")
+	}
+
+	if pruned > 0 {
+		s.logger.Info(
+			"CLIENT: pruned stale leaves after raw sync",
+			zap.Uint64("count", pruned),
+			zap.Duration("duration", time.Since(start)),
+		)
+	} else {
+		s.logger.Info(
+			"CLIENT: no stale leaves found after raw sync",
+			zap.Duration("duration", time.Since(start)),
+		)
+	}
+
 	return nil
 }
 
@@ -1279,7 +1387,7 @@ func getBranchInfoFromTree(
 	)
 	if node == nil {
 		return &protobufs.HypergraphComparisonResponse{
-			Path:       path,
+			Path:       path, // buildutils:allow-slice-alias this assignment is ephemeral
 			Commitment: []byte{},
 			IsRoot:     len(path) == 0,
 		}, nil
@@ -1293,7 +1401,7 @@ func getBranchInfoFromTree(
 	node = ensureCommittedNode(logger, tree, intpath, node)
 
 	branchInfo := &protobufs.HypergraphComparisonResponse{
-		Path:   path,
+		Path:   path, // buildutils:allow-slice-alias this assignment is ephemeral
 		IsRoot: len(path) == 0,
 	}
 
@@ -1423,7 +1531,7 @@ func (s *streamManager) queryNext(
 	if err := s.stream.Send(&protobufs.HypergraphComparison{
 		Payload: &protobufs.HypergraphComparison_Query{
 			Query: &protobufs.HypergraphComparisonQuery{
-				Path:            path,
+				Path:            path, // buildutils:allow-slice-alias this assignment is ephemeral
 				IncludeLeafData: true,
 			},
 		},
@@ -1589,6 +1697,134 @@ func (s *streamManager) handleLeafData(
 	}
 
 	return nil
+}
+
+func (s *streamManager) deleteVertexTreeIfNeeded(
+	txn tries.TreeBackingStoreTransaction,
+	atom hypergraph.Atom,
+	key []byte,
+) error {
+	if atom == nil || atom.GetAtomType() != hypergraph.VertexAtomType {
+		return nil
+	}
+
+	deleter, ok := s.hypergraphStore.(vertexTreeDeleter)
+	if !ok {
+		return nil
+	}
+
+	return deleter.DeleteVertexTree(txn, key)
+}
+
+func (s *streamManager) pruneLocalSubtree(path []int32) (uint64, error) {
+	start := time.Now()
+	pathHex := hex.EncodeToString(packPath(path))
+	s.logger.Info(
+		"CLIENT: pruning subtree",
+		zap.String("path", pathHex),
+	)
+
+	intPath := make([]int, len(path))
+	for i, nib := range path {
+		intPath[i] = int(nib)
+	}
+
+	node, err := s.localTree.GetByPath(intPath)
+	if err != nil {
+		return 0, errors.Wrap(err, "prune local subtree")
+	}
+
+	if node == nil {
+		s.logger.Debug(
+			"CLIENT: prune skipped, node missing",
+			zap.String("path", pathHex),
+		)
+		return 0, nil
+	}
+
+	leaves := []*tries.LazyVectorCommitmentLeafNode{}
+	if leaf, ok := node.(*tries.LazyVectorCommitmentLeafNode); ok {
+		leaves = append(leaves, leaf)
+	} else {
+		gathered := tries.GetAllLeaves(
+			s.localTree.SetType,
+			s.localTree.PhaseType,
+			s.localTree.ShardKey,
+			node,
+		)
+		for _, leaf := range gathered {
+			if leaf == nil {
+				continue
+			}
+			leaves = append(leaves, leaf)
+		}
+	}
+
+	if len(leaves) == 0 {
+		s.logger.Debug(
+			"CLIENT: prune skipped, no leaves",
+			zap.String("path", pathHex),
+		)
+		return 0, nil
+	}
+
+	var txn tries.TreeBackingStoreTransaction
+	var pruned uint64
+
+	commitTxn := func() error {
+		if txn == nil {
+			return nil
+		}
+		if err := txn.Commit(); err != nil {
+			txn.Abort()
+			return err
+		}
+		txn = nil
+		return nil
+	}
+
+	for idx, leaf := range leaves {
+		if idx%pruneTxnChunk == 0 {
+			if err := commitTxn(); err != nil {
+				return pruned, errors.Wrap(err, "prune local subtree")
+			}
+			txn, err = s.hypergraphStore.NewTransaction(false)
+			if err != nil {
+				return pruned, errors.Wrap(err, "prune local subtree")
+			}
+		}
+
+		atom := AtomFromBytes(leaf.Value)
+		if atom == nil {
+			txn.Abort()
+			return pruned, errors.Wrap(errors.New("invalid atom payload"), "prune local subtree")
+		}
+
+		if err := s.localSet.Delete(txn, atom); err != nil {
+			txn.Abort()
+			return pruned, errors.Wrap(err, "prune local subtree")
+		}
+
+		if err := s.deleteVertexTreeIfNeeded(txn, atom, leaf.Key); err != nil {
+			txn.Abort()
+			return pruned, errors.Wrap(err, "prune local subtree")
+		}
+
+		pruned++
+	}
+
+	if err := commitTxn(); err != nil {
+		return pruned, errors.Wrap(err, "prune local subtree")
+	}
+
+	s.logger.Info(
+		"CLIENT: pruned local subtree",
+		zap.String("path", pathHex),
+		zap.Uint64("leaf_count", pruned),
+		zap.Duration("duration", time.Since(start)),
+	)
+
+	return pruned, nil
 }
 
 func (s *streamManager) persistLeafTree(
@@ -1792,19 +2028,6 @@ func (s *streamManager) walk(
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
 ) error {
-	// Check if we should use raw sync mode for this phase set
-	if init && shouldUseRawSync(phaseSet) {
-		s.logger.Info(
-			"walk: using raw sync mode",
-			zap.Bool("is_server", isServer),
-			zap.Int("phase_set", int(phaseSet)),
-		)
-		if isServer {
-			return s.rawShardSync(shardKey, phaseSet, incomingLeaves)
-		}
-		return s.receiveRawShardSync(incomingLeaves)
-	}
-
 	select {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
@@ -1820,6 +2043,19 @@ func (s *streamManager) walk(
 		// 	zap.String("commitment", hex.EncodeToString(lnode.Commitment)),
 		// )
 		return nil
+	}
+
+	// Check if we should use raw sync mode for this phase set
+	if init && shouldUseRawSync(phaseSet) {
+		s.logger.Info(
+			"walk: using raw sync mode",
+			zap.Bool("is_server", isServer),
+			zap.Int("phase_set", int(phaseSet)),
+		)
+		if isServer {
+			return s.rawShardSync(shardKey, phaseSet, incomingLeaves, path)
+		}
+		return s.receiveRawShardSync(incomingLeaves)
 	}
 
 	if isLeaf(lnode) && isLeaf(rnode) && !init {
@@ -1883,7 +2119,7 @@ func (s *streamManager) walk(
 						)
 						return errors.Wrap(err, "walk")
 					} else {
-						err := s.handleLeafData(incomingLeaves)
+						_, err := s.pruneLocalSubtree(lpref)
 						return errors.Wrap(err, "walk")
 					}
 				}
@@ -1938,27 +2174,16 @@ func (s *streamManager) walk(
 							}
 						}
 					} else {
-						// s.logger.Debug(
-						// 	"known missing branch",
-						// 	zap.String(
-						// 		"path",
-						// 		hex.EncodeToString(
-						// 			packPath(
-						// 				append(append([]int32{}, preTraversal...), child.Index),
-						// 			),
-						// 		),
-						// 	),
-						// )
+						missingPath := append(append([]int32{}, preTraversal...), child.Index)
 						if isServer {
 							if err := s.sendLeafData(
-								append(append([]int32{}, preTraversal...), child.Index),
+								missingPath,
 								incomingLeaves,
 							); err != nil {
 								return errors.Wrap(err, "walk")
 							}
 						} else {
-							err := s.handleLeafData(incomingLeaves)
-							if err != nil {
+							if _, err := s.pruneLocalSubtree(missingPath); err != nil {
 								return errors.Wrap(err, "walk")
 							}
 						}
@@ -2017,6 +2242,10 @@ func (s *streamManager) walk(
 							); err != nil {
 								return errors.Wrap(err, "walk")
 							}
+						} else {
+							if _, err := s.pruneLocalSubtree(nextPath); err != nil {
+								return errors.Wrap(err, "walk")
+							}
 						}
 					}
 					if rchild != nil {
@@ -2047,8 +2276,7 @@ func (s *streamManager) walk(
 									return errors.Wrap(err, "walk")
 								}
 							} else {
-								err := s.handleLeafData(incomingLeaves)
-								if err != nil {
+								if _, err := s.pruneLocalSubtree(nextPath); err != nil {
 									return errors.Wrap(err, "walk")
 								}
 							}
@@ -2099,22 +2327,11 @@ func (s *streamManager) walk(
 func (hg *HypergraphCRDT) syncTreeServer(
 	ctx context.Context,
 	stream protobufs.HypergraphComparisonService_HyperStreamServer,
-	snapshotStore tries.TreeBackingStore,
-	snapshotRoot []byte,
 	sessionLogger *zap.Logger,
-	handle *snapshotHandle,
 ) error {
 	logger := sessionLogger
 	if logger == nil {
 		logger = hg.logger
-	}
-	if len(snapshotRoot) != 0 {
-		logger.Info(
-			"syncing with snapshot",
-			zap.String("root", hex.EncodeToString(snapshotRoot)),
-		)
-	} else {
-		logger.Info("syncing with snapshot", zap.String("root", ""))
 	}
 
 	msg, err := stream.Recv()
@@ -2136,6 +2353,29 @@ func (hg *HypergraphCRDT) syncTreeServer(
 		L1: [3]byte(query.ShardKey[:3]),
 		L2: [32]byte(query.ShardKey[3:]),
 	}
+
+	snapshotStart := time.Now()
+	handle := hg.snapshotMgr.acquire(shardKey)
+	if handle == nil {
+		return errors.New("hypergraph shard snapshot unavailable")
+	}
+	defer hg.snapshotMgr.release(handle)
+	logger.Debug(
+		"snapshot acquisition complete",
+		zap.Duration("duration", time.Since(snapshotStart)),
+	)
+
+	snapshotRoot := handle.Root()
+	if len(snapshotRoot) != 0 {
+		logger.Info(
+			"syncing with snapshot",
+			zap.String("root", hex.EncodeToString(snapshotRoot)),
+		)
+	} else {
+		logger.Info("syncing with snapshot", zap.String("root", ""))
+	}
+
+	snapshotStore := handle.Store()
 
 	idSet := hg.snapshotPhaseSet(shardKey, query.PhaseSet, snapshotStore)
 	if idSet == nil {

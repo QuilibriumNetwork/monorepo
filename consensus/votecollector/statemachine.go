@@ -124,12 +124,12 @@ func NewStateMachine[
 ) *VoteCollector[StateT, VoteT, PeerIDT] {
 	sm := &VoteCollector[StateT, VoteT, PeerIDT]{
 		tracer:                   tracer,
-		filter:                   filter,
+		filter:                   filter, // buildutils:allow-slice-alias static value
 		workers:                  workers,
 		notifier:                 notifier,
 		createVerifyingProcessor: verifyingVoteProcessorFactory,
 		votesCache:               *NewVotesCache[VoteT](rank),
-		dsTag:                    dsTag,
+		dsTag:                    dsTag, // buildutils:allow-slice-alias static value
 		aggregator:               aggregator,
 		voter:                    voter,
 	}

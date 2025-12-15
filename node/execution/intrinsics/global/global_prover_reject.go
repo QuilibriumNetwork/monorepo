@@ -41,7 +41,7 @@ func NewProverReject(
 	rdfMultiprover *schema.RDFMultiprover,
 ) (*ProverReject, error) {
 	return &ProverReject{
-		Filters:        filters,
+		Filters:        filters, // buildutils:allow-slice-alias slice is static
 		FrameNumber:    frameNumber,
 		keyManager:     keyManager,
 		hypergraph:     hypergraph,

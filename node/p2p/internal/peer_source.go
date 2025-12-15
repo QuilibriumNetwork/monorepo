@@ -38,7 +38,7 @@ func (s *staticPeerSource) Peers(context.Context) (
 
 // NewStaticPeerSource creates a new static peer source.
 func NewStaticPeerSource(peers []peer.AddrInfo, permute bool) PeerSource {
-	return &staticPeerSource{peers: peers, permute: permute}
+	return &staticPeerSource{peers: peers, permute: permute} // buildutils:allow-slice-alias slice is static
 }
 
 type routingDiscoveryPeerSource struct {

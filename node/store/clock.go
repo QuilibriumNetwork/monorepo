@@ -7,7 +7,7 @@ import (
 	"math/big"
 	"slices"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -1545,7 +1545,7 @@ func (p *PebbleClockStore) RangeShardClockFrames(
 	}
 
 	return &PebbleClockIterator{
-		filter: filter,
+		filter: filter, // buildutils:allow-slice-alias slice is static
 		start:  startFrameNumber,
 		end:    endFrameNumber + 1,
 		cur:    startFrameNumber,
@@ -1563,7 +1563,7 @@ func (p *PebbleClockStore) RangeStagedShardClockFrames(
 	}
 
 	return &PebbleStagedShardFrameIterator{
-		filter: filter,
+		filter: filter, // buildutils:allow-slice-alias slice is static
 		start:  startFrameNumber,
 		end:    endFrameNumber,
 		cur:    startFrameNumber,
@@ -2284,7 +2284,7 @@ func (p *PebbleClockStore) RangeCertifiedAppShardStates(
 	}
 
 	return &PebbleAppShardStateIterator{
-		filter: filter,
+		filter: filter, // buildutils:allow-slice-alias slice is static
 		start:  startRank,
 		end:    endRank + 1,
 		cur:    startRank,
@@ -2482,7 +2482,7 @@ func (p *PebbleClockStore) RangeQuorumCertificates(
 	}
 
 	return &PebbleQuorumCertificateIterator{
-		filter: filter,
+		filter: filter, // buildutils:allow-slice-alias slice is static
 		start:  startRank,
 		end:    endRank + 1,
 		cur:    startRank,
@@ -2620,7 +2620,7 @@ func (p *PebbleClockStore) RangeTimeoutCertificates(
 	}
 
 	return &PebbleTimeoutCertificateIterator{
-		filter: filter,
+		filter: filter, // buildutils:allow-slice-alias slice is static
 		start:  startRank,
 		end:    endRank + 1,
 		cur:    startRank,

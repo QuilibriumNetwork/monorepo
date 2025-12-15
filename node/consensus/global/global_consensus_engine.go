@@ -194,6 +194,8 @@ type GlobalConsensusEngine struct {
 	proposalCacheMu           sync.RWMutex
 	pendingCertifiedParents   map[uint64]*protobufs.GlobalProposal
 	pendingCertifiedParentsMu sync.RWMutex
+	activeProveRanks          map[uint64]struct{}
+	activeProveRanksMu        sync.Mutex
 	appFrameStore             map[string]*protobufs.AppShardFrame
 	appFrameStoreMu           sync.RWMutex
 	lowCoverageStreak         map[string]*coverageStreak
@@ -231,10 +233,13 @@ type GlobalConsensusEngine struct {
 	livenessProvider *GlobalLivenessProvider
 
 	// Cross-provider state
-	collectedMessages [][]byte
-	shardCommitments  [][]byte
-	proverRoot        []byte
-	commitmentHash    []byte
+	collectedMessages      [][]byte
+	shardCommitments       [][]byte
+	proverRoot             []byte
+	commitmentHash         []byte
+	shardCommitmentTrees   []*tries.VectorCommitmentTree
+	shardCommitmentKeySets []map[string]struct{}
+	shardCommitmentMu      sync.Mutex
 
 	// Authentication provider
 	authProvider channel.AuthenticationProvider
@@ -313,6 +318,9 @@ func NewGlobalConsensusEngine(
 		appFrameStore:               make(map[string]*protobufs.AppShardFrame),
 		proposalCache:               make(map[uint64]*protobufs.GlobalProposal),
 		pendingCertifiedParents:     make(map[uint64]*protobufs.GlobalProposal),
+		activeProveRanks:            make(map[uint64]struct{}),
+		shardCommitmentTrees:        make([]*tries.VectorCommitmentTree, 256),
+		shardCommitmentKeySets:      make([]map[string]struct{}, 256),
 		globalConsensusMessageQueue: make(chan *pb.Message, 1000),
 		globalFrameMessageQueue:     make(chan *pb.Message, 100),
 		globalProverMessageQueue:    make(chan *pb.Message, 1000),
@@ -577,6 +585,12 @@ func NewGlobalConsensusEngine(
 				*protobufs.GlobalFrame,
 				*protobufs.ProposalVote,
 			]{}
+			if _, rebuildErr := engine.rebuildShardCommitments(
+				frame.Header.FrameNumber+1,
+				frame.Header.Rank+1,
+			); rebuildErr != nil {
+				panic(rebuildErr)
+			}
 		}
 		if err != nil {
 			establishGenesis()
@@ -739,6 +753,7 @@ func NewGlobalConsensusEngine(
 			config,
 			nil,
 			engine.proverAddress,
+			nil,
 		)
 
 		// Add sync provider
@@ -784,6 +799,7 @@ func NewGlobalConsensusEngine(
 			config,
 			nil,
 			engine.proverAddress,
+			nil,
 		)
 	}
 
@@ -972,6 +988,24 @@ func NewGlobalConsensusEngine(
 	}
 
 	return engine, nil
+}
+
+func (e *GlobalConsensusEngine) tryBeginProvingRank(rank uint64) bool {
+	e.activeProveRanksMu.Lock()
+	defer e.activeProveRanksMu.Unlock()
+
+	if _, exists := e.activeProveRanks[rank]; exists {
+		return false
+	}
+
+	e.activeProveRanks[rank] = struct{}{}
+	return true
+}
+
+func (e *GlobalConsensusEngine) endProvingRank(rank uint64) {
+	e.activeProveRanksMu.Lock()
+	delete(e.activeProveRanks, rank)
+	e.activeProveRanksMu.Unlock()
 }
 
 func (e *GlobalConsensusEngine) setupGRPCServer() error {
@@ -1533,6 +1567,10 @@ func (e *GlobalConsensusEngine) materialize(
 	requests := frame.Requests
 	expectedProverRoot := frame.Header.ProverTreeCommitment
 	proposer := frame.Header.Prover
+	start := time.Now()
+	var appliedCount atomic.Int64
+	var skippedCount atomic.Int64
+
 	_, err := e.hypergraph.Commit(frameNumber)
 	if err != nil {
 		e.logger.Error("error committing hypergraph", zap.Error(err))
@@ -1555,13 +1593,15 @@ func (e *GlobalConsensusEngine) materialize(
 	eg.SetLimit(len(requests))
 
 	for i, request := range requests {
+		idx := i
+		req := request
 		eg.Go(func() error {
-			requestBytes, err := request.ToCanonicalBytes()
+			requestBytes, err := req.ToCanonicalBytes()
 
 			if err != nil {
 				e.logger.Error(
 					"error serializing request",
-					zap.Int("message_index", i),
+					zap.Int("message_index", idx),
 					zap.Error(err),
 				)
 				return errors.Wrap(err, "materialize")
@@ -1570,7 +1610,7 @@ func (e *GlobalConsensusEngine) materialize(
 			if len(requestBytes) == 0 {
 				e.logger.Error(
 					"empty request bytes",
-					zap.Int("message_index", i),
+					zap.Int("message_index", idx),
 				)
 				return errors.Wrap(errors.New("empty request"), "materialize")
 			}
@@ -1579,9 +1619,10 @@ func (e *GlobalConsensusEngine) materialize(
 			if err != nil {
 				e.logger.Error(
 					"invalid message",
-					zap.Int("message_index", i),
+					zap.Int("message_index", idx),
 					zap.Error(err),
 				)
+				skippedCount.Add(1)
 				return nil
 			}
 
@@ -1608,11 +1649,13 @@ func (e *GlobalConsensusEngine) materialize(
 			if err != nil {
 				e.logger.Error(
 					"error processing message",
-					zap.Int("message_index", i),
+					zap.Int("message_index", idx),
 					zap.Error(err),
 				)
+				skippedCount.Add(1)
 				return nil
 			}
+			appliedCount.Add(1)
 
 			return nil
 		})
@@ -1620,6 +1663,11 @@ func (e *GlobalConsensusEngine) materialize(
 
 	if err := eg.Wait(); err != nil {
 		return err
+	}
+
+	err = e.proverRegistry.PruneOrphanJoins(frameNumber)
+	if err != nil {
+		return errors.Wrap(err, "materialize")
 	}
 
 	if err := state.Commit(); err != nil {
@@ -1631,57 +1679,115 @@ func (e *GlobalConsensusEngine) materialize(
 		return errors.Wrap(err, "materialize")
 	}
 
-	if !e.config.Engine.ArchiveMode || e.config.P2P.Network == 99 {
-		if e.verifyProverRoot(frameNumber, expectedProverRoot, proposer) {
+	shouldVerifyRoot := !e.config.Engine.ArchiveMode || e.config.P2P.Network == 99
+	localProverRoot, localRootErr := e.computeLocalProverRoot(frameNumber)
+	if localRootErr != nil {
+		logMsg := "failed to compute local prover root"
+		if shouldVerifyRoot {
+			e.logger.Warn(
+				logMsg,
+				zap.Uint64("frame_number", frameNumber),
+				zap.Error(localRootErr),
+			)
+		} else {
+			e.logger.Debug(
+				logMsg,
+				zap.Uint64("frame_number", frameNumber),
+				zap.Error(localRootErr),
+			)
+		}
+	}
+
+	if len(localProverRoot) > 0 && shouldVerifyRoot {
+		if e.verifyProverRoot(
+			frameNumber,
+			expectedProverRoot,
+			localProverRoot,
+			proposer,
+		) {
 			e.reconcileLocalWorkerAllocations()
 		}
 	}
 
+	var expectedRootHex string
+	if len(expectedProverRoot) > 0 {
+		expectedRootHex = hex.EncodeToString(expectedProverRoot)
+	}
+	localRootHex := ""
+	if len(localProverRoot) > 0 {
+		localRootHex = hex.EncodeToString(localProverRoot)
+	}
+
+	e.logger.Info(
+		"materialized global frame",
+		zap.Uint64("frame_number", frameNumber),
+		zap.Int("request_count", len(requests)),
+		zap.Int("applied_requests", int(appliedCount.Load())),
+		zap.Int("skipped_requests", int(skippedCount.Load())),
+		zap.String("expected_root", expectedRootHex),
+		zap.String("local_root", localRootHex),
+		zap.String("proposer", hex.EncodeToString(proposer)),
+		zap.Duration("duration", time.Since(start)),
+	)
+
 	return nil
+}
+
+func (e *GlobalConsensusEngine) computeLocalProverRoot(
+	frameNumber uint64,
+) ([]byte, error) {
+	if e.hypergraph == nil {
+		return nil, errors.New("hypergraph unavailable")
+	}
+
+	commitSet, err := e.hypergraph.Commit(frameNumber)
+	if err != nil {
+		return nil, errors.Wrap(err, "compute local prover root")
+	}
+
+	var zeroShardKey tries.ShardKey
+	for shardKey, phaseCommits := range commitSet {
+		if shardKey.L1 == zeroShardKey.L1 {
+			if len(phaseCommits) == 0 || len(phaseCommits[0]) == 0 {
+				return nil, errors.New("empty prover root commitment")
+			}
+			return slices.Clone(phaseCommits[0]), nil
+		}
+	}
+
+	return nil, errors.New("prover root shard missing")
 }
 
 func (e *GlobalConsensusEngine) verifyProverRoot(
 	frameNumber uint64,
 	expected []byte,
+	localRoot []byte,
 	proposer []byte,
 ) bool {
-	if len(expected) == 0 || e.hypergraph == nil {
+	if len(expected) == 0 || len(localRoot) == 0 {
 		return true
 	}
 
-	roots, err := e.hypergraph.GetShardCommits(
-		frameNumber,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-	)
-	if err != nil || len(roots) == 0 || len(roots[0]) == 0 {
-		if err != nil {
-			e.logger.Warn(
-				"failed to load local prover root",
-				zap.Uint64("frame_number", frameNumber),
-				zap.Error(err),
-			)
-		} else {
-			e.logger.Warn(
-				"local prover root missing",
-				zap.Uint64("frame_number", frameNumber),
-			)
-		}
-		return false
-	}
-
-	localRoot := roots[0]
 	if !bytes.Equal(localRoot, expected) {
-		e.logger.Debug(
+		e.logger.Warn(
 			"prover root mismatch",
 			zap.Uint64("frame_number", frameNumber),
 			zap.String("expected_root", hex.EncodeToString(expected)),
 			zap.String("local_root", hex.EncodeToString(localRoot)),
+			zap.String("proposer", hex.EncodeToString(proposer)),
 		)
 		e.proverRootSynced.Store(false)
 		e.proverRootVerifiedFrame.Store(0)
 		e.triggerProverHypersync(proposer)
 		return false
 	}
+
+	e.logger.Debug(
+		"prover root verified",
+		zap.Uint64("frame_number", frameNumber),
+		zap.String("root", hex.EncodeToString(localRoot)),
+		zap.String("proposer", hex.EncodeToString(proposer)),
+	)
 
 	e.proverRootSynced.Store(true)
 	e.proverRootVerifiedFrame.Store(frameNumber)
@@ -1710,7 +1816,7 @@ func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte) {
 			L1: [3]byte{0x00, 0x00, 0x00},
 			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 		}
-		e.syncProvider.HyperSync(ctx, proposer, shardKey)
+		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil)
 		if err := e.proverRegistry.Refresh(); err != nil {
 			e.logger.Warn(
 				"failed to refresh prover registry after hypersync",
@@ -3411,6 +3517,19 @@ func (e *GlobalConsensusEngine) OnOwnProposal(
 			PriorRankTimeoutCertificate: priorTC,
 			Vote:                        *proposal.Vote,
 		}
+		frame := pbProposal.State
+		var proverRootHex string
+		if frame.Header != nil {
+			proverRootHex = hex.EncodeToString(frame.Header.ProverTreeCommitment)
+		}
+		e.logger.Info(
+			"publishing own global proposal",
+			zap.Uint64("rank", frame.GetRank()),
+			zap.Uint64("frame_number", frame.GetFrameNumber()),
+			zap.Int("request_count", len(frame.GetRequests())),
+			zap.String("prover_root", proverRootHex),
+			zap.String("proposer", hex.EncodeToString([]byte(frame.Source()))),
+		)
 		data, err := pbProposal.ToCanonicalBytes()
 		if err != nil {
 			e.logger.Error("could not serialize proposal", zap.Error(err))
@@ -3712,11 +3831,24 @@ func (e *GlobalConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 
 // OnRankChange implements consensus.Consumer.
 func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
+	if e.currentRank == newRank {
+		return
+	}
+
 	e.currentRank = newRank
 
-	prior, err := e.clockStore.GetLatestGlobalClockFrame()
+	qc, err := e.clockStore.GetLatestQuorumCertificate(nil)
 	if err != nil {
-		e.logger.Error("new rank, no latest global clock frame")
+		e.logger.Error("new rank, no latest QC")
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return
+	}
+	prior, err := e.clockStore.GetGlobalClockFrameCandidate(
+		qc.FrameNumber,
+		[]byte(qc.Identity()),
+	)
+	if err != nil {
+		e.logger.Error("new rank, no global clock frame candidate")
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return
 	}
@@ -3734,11 +3866,6 @@ func (e *GlobalConsensusEngine) rebuildShardCommitments(
 	frameNumber uint64,
 	rank uint64,
 ) ([]byte, error) {
-	commitments := make([]*tries.VectorCommitmentTree, 256)
-	for i := range commitments {
-		commitments[i] = &tries.VectorCommitmentTree{}
-	}
-
 	commitSet, err := e.hypergraph.Commit(frameNumber)
 	if err != nil {
 		e.logger.Error("could not commit", zap.Error(err))
@@ -3753,48 +3880,141 @@ func (e *GlobalConsensusEngine) rebuildShardCommitments(
 		)
 	}
 
+	e.shardCommitmentMu.Lock()
+	defer e.shardCommitmentMu.Unlock()
+
+	if e.shardCommitmentTrees == nil {
+		e.shardCommitmentTrees = make([]*tries.VectorCommitmentTree, 256)
+	}
+	if e.shardCommitmentKeySets == nil {
+		e.shardCommitmentKeySets = make([]map[string]struct{}, 256)
+	}
+	if e.shardCommitments == nil {
+		e.shardCommitments = make([][]byte, 256)
+	}
+
+	currentKeySets := make([]map[string]struct{}, 256)
+	changedTrees := make([]bool, 256)
+
 	proverRoot := make([]byte, 64)
 	collected := 0
+	var zeroShardKeyL1 [3]byte
 
-	for sk, s := range commitSet {
-		if !bytes.Equal(sk.L1[:], []byte{0x00, 0x00, 0x00}) {
-			collected++
-
-			for phaseSet := 0; phaseSet < 4; phaseSet++ {
-				commit := s[phaseSet]
-				foldedShardKey := make([]byte, 32)
-				copy(foldedShardKey, sk.L2[:])
-
-				foldedShardKey[0] |= byte(phaseSet << 6)
-				for l1Idx := 0; l1Idx < 3; l1Idx++ {
-					if err := commitments[sk.L1[l1Idx]].Insert(
-						foldedShardKey,
-						commit,
-						nil,
-						big.NewInt(int64(len(commit))),
-					); err != nil {
-						return nil, errors.Wrap(err, "rebuild shard commitments")
-					}
-				}
+	for sk, phaseCommits := range commitSet {
+		if sk.L1 == zeroShardKeyL1 {
+			if len(phaseCommits) > 0 {
+				proverRoot = slices.Clone(phaseCommits[0])
 			}
-		} else {
-			proverRoot = s[0]
+			continue
+		}
+
+		collected++
+
+		for phaseSet := 0; phaseSet < len(phaseCommits); phaseSet++ {
+			commit := phaseCommits[phaseSet]
+			foldedShardKey := make([]byte, 32)
+			copy(foldedShardKey, sk.L2[:])
+
+			foldedShardKey[0] |= byte(phaseSet << 6)
+			keyStr := string(foldedShardKey)
+			var valueCopy []byte
+
+			for l1Idx := 0; l1Idx < len(sk.L1); l1Idx++ {
+				index := int(sk.L1[l1Idx])
+				if index >= len(e.shardCommitmentTrees) {
+					e.logger.Warn(
+						"shard commitment index out of range",
+						zap.Int("index", index),
+					)
+					continue
+				}
+
+				if e.shardCommitmentTrees[index] == nil {
+					e.shardCommitmentTrees[index] = &tries.VectorCommitmentTree{}
+				}
+
+				if currentKeySets[index] == nil {
+					currentKeySets[index] = make(map[string]struct{})
+				}
+				currentKeySets[index][keyStr] = struct{}{}
+
+				tree := e.shardCommitmentTrees[index]
+				if existing, err := tree.Get(foldedShardKey); err == nil &&
+					bytes.Equal(existing, commit) {
+					continue
+				}
+
+				if valueCopy == nil {
+					valueCopy = slices.Clone(commit)
+				}
+
+				if err := tree.Insert(
+					foldedShardKey,
+					valueCopy,
+					nil,
+					big.NewInt(int64(len(commit))),
+				); err != nil {
+					return nil, errors.Wrap(err, "rebuild shard commitments")
+				}
+
+				changedTrees[index] = true
+			}
 		}
 	}
 
-	shardCommitments := make([][]byte, 256)
-	for i := 0; i < 256; i++ {
-		shardCommitments[i] = commitments[i].Commit(e.inclusionProver, false)
+	for idx := 0; idx < len(e.shardCommitmentTrees); idx++ {
+		prevKeys := e.shardCommitmentKeySets[idx]
+		currKeys := currentKeySets[idx]
+
+		if len(prevKeys) > 0 {
+			for key := range prevKeys {
+				if currKeys != nil {
+					if _, ok := currKeys[key]; ok {
+						continue
+					}
+				}
+
+				tree := e.shardCommitmentTrees[idx]
+				if tree == nil {
+					continue
+				}
+
+				if err := tree.Delete([]byte(key)); err != nil {
+					e.logger.Debug(
+						"failed to delete shard commitment leaf",
+						zap.Int("shard_index", idx),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				changedTrees[idx] = true
+			}
+		}
+
+		e.shardCommitmentKeySets[idx] = currKeys
+	}
+
+	for i := 0; i < len(e.shardCommitmentTrees); i++ {
+		if e.shardCommitmentTrees[i] == nil {
+			e.shardCommitmentTrees[i] = &tries.VectorCommitmentTree{}
+		}
+
+		if changedTrees[i] || e.shardCommitments[i] == nil {
+			e.shardCommitments[i] = e.shardCommitmentTrees[i].Commit(
+				e.inclusionProver,
+				false,
+			)
+		}
 	}
 
 	preimage := slices.Concat(
-		slices.Concat(shardCommitments...),
+		slices.Concat(e.shardCommitments...),
 		proverRoot,
 	)
 
 	commitmentHash := sha3.Sum256(preimage)
 
-	e.shardCommitments = shardCommitments
 	e.proverRoot = proverRoot
 	e.commitmentHash = commitmentHash[:]
 
@@ -4117,7 +4337,7 @@ func (e *GlobalConsensusEngine) getPendingProposals(
 
 	parent, err := e.clockStore.GetQuorumCertificate(nil, startRank)
 	if err != nil {
-		panic(err)
+		return result
 	}
 
 	for rank := startRank + 1; rank <= endRank; rank++ {

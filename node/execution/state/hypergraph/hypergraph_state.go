@@ -685,9 +685,9 @@ func (h *HypergraphState) Delete(
 
 	h.mu.Lock()
 	h.changeset = append(h.changeset, state.StateChange{
-		Domain:        domain,
-		Address:       address,
-		Discriminator: discriminator,
+		Domain:        domain,        // buildutils:allow-slice-alias slice is static
+		Address:       address,       // buildutils:allow-slice-alias slice is static
+		Discriminator: discriminator, // buildutils:allow-slice-alias slice is static
 		StateChange:   state.DeleteStateChangeEvent,
 		Value:         value,
 	})
@@ -787,9 +787,9 @@ func (h *HypergraphState) Set(
 
 	h.mu.Lock()
 	h.changeset = append(h.changeset, state.StateChange{
-		Domain:        domain,
-		Address:       address,
-		Discriminator: discriminator,
+		Domain:        domain,        // buildutils:allow-slice-alias slice is static
+		Address:       address,       // buildutils:allow-slice-alias slice is static
+		Discriminator: discriminator, // buildutils:allow-slice-alias slice is static
 		StateChange:   stateChange,
 		Value:         value,
 	})

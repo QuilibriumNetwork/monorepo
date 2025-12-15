@@ -663,7 +663,7 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 ) (*execution.ProcessMessageResult, []byte, error) {
 	payload := []byte{}
 	var err error
-	domain := address
+	domain := address // buildutils:allow-slice-alias assigned slice will not mutate, reassignment will
 	switch message.Request.(type) {
 	case *protobufs.MessageRequest_TokenDeploy:
 		payload, err = message.GetTokenDeploy().ToCanonicalBytes()

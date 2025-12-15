@@ -125,7 +125,7 @@ func LoadHypergraphIntrinsic(
 		lockedWrites:        make(map[string]struct{}),
 		lockedReads:         make(map[string]int),
 		hypergraph:          hypergraph,
-		domain:              appAddress,
+		domain:              appAddress, // buildutils:allow-slice-alias slice is static
 		config:              config,
 		consensusMetadata:   consensusMetadata,
 		sumcheckInfo:        sumcheckInfo,

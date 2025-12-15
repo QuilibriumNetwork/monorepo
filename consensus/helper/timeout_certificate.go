@@ -90,7 +90,7 @@ func WithTCNewestQC(qc models.QuorumCertificate) func(*TestTimeoutCertificate) {
 
 func WithTCSigners(signerIndices []byte) func(*TestTimeoutCertificate) {
 	return func(tc *TestTimeoutCertificate) {
-		tc.AggregatedSignature.(*TestAggregatedSignature).Bitmask = signerIndices
+		tc.AggregatedSignature.(*TestAggregatedSignature).Bitmask = signerIndices // buildutils:allow-slice-alias
 	}
 }
 
@@ -102,7 +102,7 @@ func WithTCRank(rank uint64) func(*TestTimeoutCertificate) {
 
 func WithTCHighQCRanks(highQCRanks []uint64) func(*TestTimeoutCertificate) {
 	return func(tc *TestTimeoutCertificate) {
-		tc.LatestRanks = highQCRanks
+		tc.LatestRanks = highQCRanks // buildutils:allow-slice-alias
 	}
 }
 

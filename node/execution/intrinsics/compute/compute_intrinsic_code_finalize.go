@@ -71,11 +71,11 @@ func NewCodeFinalize(
 ) *CodeFinalize {
 	return &CodeFinalize{
 		Rendezvous:        rendezvous,
-		Results:           results,
-		StateChanges:      stateChanges,
-		MessageOutput:     messageOutput,
+		Results:           results,       // buildutils:allow-slice-alias slice is static
+		StateChanges:      stateChanges,  // buildutils:allow-slice-alias slice is static
+		MessageOutput:     messageOutput, // buildutils:allow-slice-alias slice is static
 		domain:            domain,
-		privateKey:        privateKey,
+		privateKey:        privateKey, // buildutils:allow-slice-alias slice is static
 		config:            config,
 		hypergraph:        hypergraph,
 		bulletproofProver: bulletproofProver,

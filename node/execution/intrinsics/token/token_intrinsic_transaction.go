@@ -60,7 +60,7 @@ type TransactionInput struct {
 
 func NewTransactionInput(address []byte) (*TransactionInput, error) {
 	return &TransactionInput{
-		address: address,
+		address: address, // buildutils:allow-slice-alias slice is static
 	}, nil
 }
 
@@ -818,8 +818,8 @@ func NewTransactionOutput(
 	return &TransactionOutput{
 		value: value,
 		RecipientOutput: RecipientBundle{
-			recipientView:  recipientViewPubkey,
-			recipientSpend: recipientSpendPubkey,
+			recipientView:  recipientViewPubkey,  // buildutils:allow-slice-alias slice is static
+			recipientSpend: recipientSpendPubkey, // buildutils:allow-slice-alias slice is static
 		},
 	}, nil
 }
@@ -972,9 +972,9 @@ func NewTransaction(
 ) *Transaction {
 	return &Transaction{
 		Domain:              domain,
-		Inputs:              inputs,
-		Outputs:             outputs,
-		Fees:                fees,
+		Inputs:              inputs,  // buildutils:allow-slice-alias slice is static
+		Outputs:             outputs, // buildutils:allow-slice-alias slice is static
+		Fees:                fees,    // buildutils:allow-slice-alias slice is static
 		hypergraph:          hypergraph,
 		bulletproofProver:   bulletproofProver,
 		inclusionProver:     inclusionProver,

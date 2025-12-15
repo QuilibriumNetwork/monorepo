@@ -16,6 +16,7 @@ type snapshotHandle struct {
 	release func()
 	refs    atomic.Int32
 	root    []byte
+	key     string
 
 	branchCacheMu sync.RWMutex
 	branchCache   map[string]*protobufs.HypergraphComparisonResponse
@@ -26,6 +27,7 @@ type snapshotHandle struct {
 }
 
 func newSnapshotHandle(
+	key string,
 	store tries.TreeBackingStore,
 	release func(),
 	root []byte,
@@ -36,6 +38,7 @@ func newSnapshotHandle(
 		branchCache:   make(map[string]*protobufs.HypergraphComparisonResponse),
 		leafDataCache: make(map[string][]byte),
 		leafCacheMiss: make(map[string]struct{}),
+		key:           key,
 	}
 	if len(root) != 0 {
 		h.root = append([]byte{}, root...)
@@ -49,16 +52,20 @@ func (h *snapshotHandle) acquire() tries.TreeBackingStore {
 	return h.store
 }
 
-func (h *snapshotHandle) releaseRef(logger *zap.Logger) {
+func (h *snapshotHandle) releaseRef(logger *zap.Logger) bool {
 	if h == nil {
-		return
+		return false
 	}
 
-	if h.refs.Add(-1) == 0 && h.release != nil {
-		if err := safeRelease(h.release); err != nil {
-			logger.Warn("failed to release hypergraph snapshot", zap.Error(err))
+	if h.refs.Add(-1) == 0 {
+		if h.release != nil {
+			if err := safeRelease(h.release); err != nil {
+				logger.Warn("failed to release hypergraph snapshot", zap.Error(err))
+			}
 		}
+		return true
 	}
+	return false
 }
 
 func (h *snapshotHandle) Store() tries.TreeBackingStore {
@@ -112,6 +119,7 @@ func (h *snapshotHandle) getLeafData(key []byte) ([]byte, bool) {
 	return data, ok
 }
 
+// buildutils:allow-slice-alias data is already cloned for this
 func (h *snapshotHandle) storeLeafData(key []byte, data []byte) {
 	if h == nil || len(data) == 0 {
 		return
@@ -146,53 +154,96 @@ func (h *snapshotHandle) isLeafMiss(key []byte) bool {
 
 type snapshotManager struct {
 	logger  *zap.Logger
+	store   tries.TreeBackingStore
 	mu      sync.Mutex
-	current *snapshotHandle
+	root    []byte
+	handles map[string]*snapshotHandle
 }
 
-func newSnapshotManager(logger *zap.Logger) *snapshotManager {
-	return &snapshotManager{logger: logger}
-}
-
-func (m *snapshotManager) publish(
+func newSnapshotManager(
+	logger *zap.Logger,
 	store tries.TreeBackingStore,
-	release func(),
-	root []byte,
-) {
+) *snapshotManager {
+	return &snapshotManager{
+		logger:  logger,
+		store:   store,
+		handles: make(map[string]*snapshotHandle),
+	}
+}
+
+func (m *snapshotManager) publish(root []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	handle := newSnapshotHandle(store, release, root)
-	prev := m.current
-	m.current = handle
+	for key, handle := range m.handles {
+		if handle != nil {
+			handle.releaseRef(m.logger)
+		}
+		delete(m.handles, key)
+	}
 
-	if prev != nil {
-		prev.releaseRef(m.logger)
+	m.root = nil
+	if len(root) != 0 {
+		m.root = append([]byte{}, root...)
 	}
 
 	rootHex := ""
 	if len(root) != 0 {
 		rootHex = hex.EncodeToString(root)
 	}
-	m.logger.Debug("swapped snapshot", zap.String("root", rootHex))
+	m.logger.Debug("reset snapshot state", zap.String("root", rootHex))
 }
 
-func (m *snapshotManager) acquire() *snapshotHandle {
+func (m *snapshotManager) acquire(
+	shardKey tries.ShardKey,
+) *snapshotHandle {
+	key := shardKeyString(shardKey)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.current == nil {
+	if handle, ok := m.handles[key]; ok {
+		handle.acquire()
+		return handle
+	}
+
+	if m.store == nil {
 		return nil
 	}
-	m.current.acquire()
-	return m.current
+
+	storeSnapshot, release, err := m.store.NewShardSnapshot(shardKey)
+	if err != nil {
+		m.logger.Warn(
+			"failed to build shard snapshot",
+			zap.Error(err),
+			zap.String("shard_key", key),
+		)
+		return nil
+	}
+
+	handle := newSnapshotHandle(key, storeSnapshot, release, m.root)
+	m.handles[key] = handle
+	return handle
 }
 
 func (m *snapshotManager) release(handle *snapshotHandle) {
 	if handle == nil {
 		return
 	}
-	handle.releaseRef(m.logger)
+	if !handle.releaseRef(m.logger) {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.handles[handle.key]; ok && current == handle {
+		delete(m.handles, handle.key)
+	}
+}
+
+func shardKeyString(sk tries.ShardKey) string {
+	buf := make([]byte, 0, len(sk.L1)+len(sk.L2))
+	buf = append(buf, sk.L1[:]...)
+	buf = append(buf, sk.L2[:]...)
+	return hex.EncodeToString(buf)
 }
 
 func safeRelease(fn func()) (err error) {

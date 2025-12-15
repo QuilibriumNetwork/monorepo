@@ -1153,6 +1153,10 @@ func (b *BlossomSub) initConnectivityServices(
 	isBootstrapPeer bool,
 	bootstrappers []peer.AddrInfo,
 ) {
+	if b.p2pConfig.Network != 0 {
+		return
+	}
+
 	if b.h == nil {
 		return
 	}
@@ -1422,7 +1426,7 @@ func (s *connectivityService) TestConnectivity(
 				continue
 			}
 			// Build UDP multiaddr with actual IP
-			newAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s", host, port))
+			newAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s/quic-v1", host, port))
 			if err != nil {
 				continue
 			}

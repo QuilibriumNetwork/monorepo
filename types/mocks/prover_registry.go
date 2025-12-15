@@ -12,6 +12,12 @@ type MockProverRegistry struct {
 
 var _ consensus.ProverRegistry = (*MockProverRegistry)(nil)
 
+// PruneOrphanJoins implements consensus.ProverRegistry.
+func (m *MockProverRegistry) PruneOrphanJoins(frameNumber uint64) error {
+	args := m.Called(frameNumber)
+	return args.Error(0)
+}
+
 // GetProvers implements consensus.ProverRegistry.
 func (m *MockProverRegistry) GetProvers(filter []byte) (
 	[]*consensus.ProverInfo,

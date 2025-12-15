@@ -3,6 +3,7 @@ package datarpc
 import (
 	"context"
 	"encoding/hex"
+	"time"
 
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/multiformats/go-multiaddr"
@@ -45,6 +46,8 @@ type DataWorkerIPCServer struct {
 	server                    *grpc.Server
 	frameProver               crypto.FrameProver
 	quit                      chan struct{}
+	peerInfoCtx               lifecycle.SignalerContext
+	peerInfoCancel            context.CancelFunc
 }
 
 func NewDataWorkerIPCServer(
@@ -103,6 +106,24 @@ func NewDataWorkerIPCServer(
 }
 
 func (r *DataWorkerIPCServer) Start() error {
+	peerInfoCtx, peerInfoCancel, _ := lifecycle.WithSignallerAndCancel(
+		context.Background(),
+	)
+	peerInfoReady := make(chan struct{})
+	go r.peerInfoManager.Start(
+		peerInfoCtx,
+		func() {
+			close(peerInfoReady)
+		},
+	)
+	select {
+	case <-peerInfoReady:
+	case <-time.After(5 * time.Second):
+		r.logger.Warn("peer info manager did not start before timeout")
+	}
+	r.peerInfoCtx = peerInfoCtx
+	r.peerInfoCancel = peerInfoCancel
+
 	r.RespawnServer(nil)
 
 	<-r.quit
@@ -114,6 +135,10 @@ func (r *DataWorkerIPCServer) Stop() error {
 	r.pubsub.Close()
 	if r.server != nil {
 		r.server.GracefulStop()
+	}
+	if r.peerInfoCancel != nil {
+		r.peerInfoCancel()
+		r.peerInfoCancel = nil
 	}
 	go func() {
 		r.quit <- struct{}{}

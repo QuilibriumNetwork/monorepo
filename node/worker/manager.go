@@ -114,7 +114,7 @@ func (w *WorkerManager) setWorkerFilterMapping(
 	if len(filter) > 0 {
 		w.workersByFilter[string(filter)] = coreID
 	}
-	w.filtersByWorker[coreID] = filter
+	w.filtersByWorker[coreID] = filter // buildutils:allow-slice-alias slice is static
 	w.mu.Unlock()
 }
 
@@ -424,11 +424,12 @@ func (w *WorkerManager) AllocateWorker(coreId uint, filter []byte) error {
 
 	// Update worker filter if provided
 	if len(filter) > 0 && string(worker.Filter) != string(filter) {
-		worker.Filter = filter
+		worker.Filter = filter // buildutils:allow-slice-alias slice is static
 	}
 
 	// Update allocation status
 	worker.Allocated = true
+	worker.PendingFilterFrame = 0
 
 	// Save to store
 	txn, err := w.store.NewTransaction(false)
@@ -503,6 +504,7 @@ func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 	// Update allocation status and clear filter
 	worker.Allocated = false
 	worker.Filter = nil
+	worker.PendingFilterFrame = 0
 
 	// Save to store
 	txn, err := w.store.NewTransaction(false)
@@ -1047,7 +1049,7 @@ func (w *WorkerManager) respawnWorker(
 		}
 
 		ctx, cancel := context.WithTimeout(managerCtx, respawnTimeout)
-		_, err = svc.Respawn(ctx, &protobufs.RespawnRequest{Filter: filter})
+		_, err = svc.Respawn(ctx, &protobufs.RespawnRequest{Filter: filter}) // buildutils:allow-slice-alias slice is static
 		cancel()
 		if err == nil {
 			return nil

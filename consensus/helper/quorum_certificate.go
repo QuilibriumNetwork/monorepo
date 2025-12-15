@@ -110,7 +110,7 @@ func WithQCState[StateT models.Unique](state *models.State[StateT]) func(*TestQu
 
 func WithQCSigners(signerIndices []byte) func(*TestQuorumCertificate) {
 	return func(qc *TestQuorumCertificate) {
-		qc.AggregatedSignature.(*TestAggregatedSignature).Bitmask = signerIndices
+		qc.AggregatedSignature.(*TestAggregatedSignature).Bitmask = signerIndices // buildutils:allow-slice-alias
 	}
 }
 

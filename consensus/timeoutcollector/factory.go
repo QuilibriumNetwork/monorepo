@@ -89,13 +89,13 @@ func NewTimeoutProcessorFactory[
 ) *TimeoutProcessorFactory[StateT, VoteT, PeerIDT] {
 	return &TimeoutProcessorFactory[StateT, VoteT, PeerIDT]{
 		tracer:              tracer,
-		filter:              filter,
+		filter:              filter, // buildutils:allow-slice-alias static value
 		aggregator:          aggregator,
 		committee:           committee,
 		notifier:            notifier,
 		validator:           validator,
 		voting:              voting,
-		domainSeparationTag: domainSeparationTag,
+		domainSeparationTag: domainSeparationTag, // buildutils:allow-slice-alias static value
 	}
 }
 

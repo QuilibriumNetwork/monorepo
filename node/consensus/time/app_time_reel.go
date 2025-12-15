@@ -127,7 +127,7 @@ func NewAppTimeReel(
 
 	return &AppTimeReel{
 		logger:           logger,
-		address:          address,
+		address:          address, // buildutils:allow-slice-alias slice is static
 		proverRegistry:   proverRegistry,
 		nodes:            make(map[string]*FrameNode),
 		framesByNumber:   make(map[uint64][]*FrameNode),

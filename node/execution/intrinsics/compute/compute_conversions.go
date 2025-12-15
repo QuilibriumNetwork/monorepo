@@ -406,7 +406,7 @@ func CodeFinalizeFromProtobuf(
 		verEnc:            verEnc,
 		keyManager:        keyManager,
 		config:            config,
-		privateKey:        privateKey,
+		privateKey:        privateKey, // buildutils:allow-slice-alias slice is static
 	}, nil
 }
 

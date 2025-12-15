@@ -120,7 +120,7 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 
 	// Create hypergraph
 	hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_basic"}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 
 	// Create consensus store
 	consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
@@ -457,7 +457,7 @@ func TestAppConsensusEngine_Integration_FeeVotingMechanics(t *testing.T) {
 		tempClockStore := store.NewPebbleClockStore(tempDB, logger)
 		tempInboxStore := store.NewPebbleInboxStore(tempDB, logger)
 		tempShardsStore := store.NewPebbleShardsStore(tempDB, logger)
-		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 		proverRegistry, err := provers.NewProverRegistry(zap.NewNop(), hg)
 		require.NoError(t, err)
 
@@ -778,7 +778,7 @@ func TestAppConsensusEngine_Integration_ReconnectCatchup(t *testing.T) {
 		defer nodeDB.Close()
 		inclusionProver := bls48581.NewKZGInclusionProver(nodeLogger)
 		hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_partition_catchup_%d", i)}, nodeDB, nodeLogger, verifiableEncryptor, inclusionProver)
-		hg := hypergraph.NewHypergraph(nodeLogger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+		hg := hypergraph.NewHypergraph(nodeLogger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 		proverRegistry, err := provers.NewProverRegistry(zap.NewNop(), hg)
 		require.NoError(t, err)
 
@@ -1061,8 +1061,8 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 		tempConsensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
 
 		hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_multi_%d", i)}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
-		tempHg := hypergraph.NewHypergraph(logger, tempHypergraphStore, tempInclusionProver, []int{}, &tests.Nopthenticator{})
+		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
+		tempHg := hypergraph.NewHypergraph(logger, tempHypergraphStore, tempInclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 		tempClockStore := store.NewPebbleClockStore(tempDB, logger)
 		tempInboxStore := store.NewPebbleInboxStore(tempDB, logger)
 		tempShardsStore := store.NewPebbleShardsStore(tempDB, logger)
@@ -1221,7 +1221,7 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 	tempInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	tempVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	tempHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_coord_temp"}, tempDB, logger, tempVerifiableEncryptor, tempInclusionProver)
-	tempHg := hypergraph.NewHypergraph(logger, tempHypergraphStore, tempInclusionProver, []int{}, &tests.Nopthenticator{})
+	tempHg := hypergraph.NewHypergraph(logger, tempHypergraphStore, tempInclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 	tempClockStore := store.NewPebbleClockStore(tempDB, logger)
 	tempInboxStore := store.NewPebbleInboxStore(tempDB, logger)
 	proverRegistry, err := provers.NewProverRegistry(zap.NewNop(), tempHg)
@@ -1275,7 +1275,7 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 	shardsStore := store.NewPebbleShardsStore(pebbleDB, logger)
 	hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_coordination"}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
 	consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
-	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 
 	keyStore := store.NewPebbleKeyStore(pebbleDB, logger)
 
@@ -1417,7 +1417,7 @@ func TestAppConsensusEngine_Integration_ProverTrieMembership(t *testing.T) {
 	tempDecafConstructor := &bulletproofs.Decaf448KeyConstructor{}
 	tempCompiler := compiler.NewBedlamCompiler()
 	tempHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_prover_temp"}, tempDB, logger, tempVerifiableEncryptor, tempInclusionProver)
-	tempHg := hypergraph.NewHypergraph(logger, tempHypergraphStore, tempInclusionProver, []int{}, &tests.Nopthenticator{})
+	tempHg := hypergraph.NewHypergraph(logger, tempHypergraphStore, tempInclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 	proverRegistry, err := provers.NewProverRegistry(zap.NewNop(), tempHg)
 	require.NoError(t, err)
 
@@ -1444,7 +1444,7 @@ func TestAppConsensusEngine_Integration_ProverTrieMembership(t *testing.T) {
 		verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 		shardsStore := store.NewPebbleShardsStore(pebbleDB, logger)
 		hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_prover_%d", i)}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 
 		keyStore := store.NewPebbleKeyStore(pebbleDB, logger)
 		clockStore := store.NewPebbleClockStore(pebbleDB, logger)
@@ -1573,7 +1573,7 @@ func TestAppConsensusEngine_Integration_InvalidFrameRejection(t *testing.T) {
 	compiler := compiler.NewBedlamCompiler()
 
 	hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_invalid_rejection"}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 
 	keyStore := store.NewPebbleKeyStore(pebbleDB, logger)
 	clockStore := store.NewPebbleClockStore(pebbleDB, logger)
@@ -1896,7 +1896,7 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 		nodeInboxStore := store.NewPebbleInboxStore(nodeDB, logger)
 		nodeShardsStore := store.NewPebbleShardsStore(nodeDB, logger)
 		nodeConsensusStore := store.NewPebbleConsensusStore(nodeDB, logger)
-		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{})
+		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 		nodeProverRegistry, err := provers.NewProverRegistry(zap.NewNop(), nodeHg)
 		nodeBulletproof := bulletproofs.NewBulletproofProver()
 		nodeDecafConstructor := &bulletproofs.Decaf448KeyConstructor{}
@@ -2352,7 +2352,7 @@ func TestGenerateAddressesForComplexTest(t *testing.T) {
 	nodeVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	nodeHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_chaos"}, nodeDB, zap.L(), nodeVerifiableEncryptor, nodeInclusionProver)
 
-	nodeHg := hypergraph.NewHypergraph(zap.L(), nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{})
+	nodeHg := hypergraph.NewHypergraph(zap.L(), nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 	vksHex := []string{
 		"67ebe1f52284c24bbb2061b6b35823726688fb2d1d474195ad629dc2a8a7442df3e72f164fecc624df8f720ba96ebaf4e3a9ca551490f200",
 		"05e729b718f137ce985471e80e3530e1b6a6356f218f64571f3249f9032dd3c08fec428c368959e0e0ff0e6a0e42aa4ca18427cac0b14516",
@@ -2695,7 +2695,7 @@ func TestAppConsensusEngine_Integration_NoProversStaysInLoading(t *testing.T) {
 			InMemoryDONOTUSE: true,
 			Path:             fmt.Sprintf(".test/app_no_provers_%d", nodeID),
 		}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+		hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 
 		clockStore := store.NewPebbleClockStore(pebbleDB, logger)
 		inboxStore := store.NewPebbleInboxStore(pebbleDB, logger)
@@ -2896,7 +2896,7 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 
 	// Create hypergraph
 	hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_basic"}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+	hg := hypergraph.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 
 	// Create key store
 	keyStore := store.NewPebbleKeyStore(pebbleDB, logger)

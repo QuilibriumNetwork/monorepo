@@ -47,8 +47,8 @@ func NewVertexAdd(
 		signer:          signer,
 		config:          config,
 		verenc:          verenc,
-		rawData:         rawData,
-		encryptionKey:   encryptionKey,
+		rawData:         rawData,       // buildutils:allow-slice-alias slice is static
+		encryptionKey:   encryptionKey, // buildutils:allow-slice-alias slice is static
 		keyManager:      keyManager,
 	}
 }

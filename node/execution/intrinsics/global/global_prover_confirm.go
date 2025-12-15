@@ -49,7 +49,7 @@ func NewProverConfirm(
 	rdfMultiprover *schema.RDFMultiprover,
 ) (*ProverConfirm, error) {
 	return &ProverConfirm{
-		Filters:        filters,
+		Filters:        filters, // buildutils:allow-slice-alias slice is static
 		FrameNumber:    frameNumber,
 		keyManager:     keyManager,
 		hypergraph:     hypergraph,

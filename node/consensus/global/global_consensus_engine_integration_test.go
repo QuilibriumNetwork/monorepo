@@ -466,7 +466,7 @@ func createIntegrationTestGlobalConsensusEngineWithHypergraphAndKey(
 		hg = sharedHypergraph
 	} else {
 		hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-		hg = hgcrdt.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+		hg = hgcrdt.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 	}
 
 	// Create key store
@@ -655,7 +655,7 @@ func TestGlobalConsensusEngine_Integration_MultiNodeConsensus(t *testing.T) {
 	// Create and register 6 provers (one for each node)
 	for i := 0; i < 6; i++ {
 		hypergraphStores[i] = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global_shared"}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-		hypergraphs[i] = hgcrdt.NewHypergraph(logger, hypergraphStores[i], inclusionProver, []int{}, &tests.Nopthenticator{})
+		hypergraphs[i] = hgcrdt.NewHypergraph(logger, hypergraphStores[i], inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 	}
 	for i := 0; i < 6; i++ {
 		tempKeyManager := keys.NewInMemoryKeyManager(bc, dc)
@@ -864,7 +864,7 @@ func TestGlobalConsensusEngine_Integration_ShardCoverage(t *testing.T) {
 		InMemoryDONOTUSE: true,
 		Path:             ".test/global",
 	}, pebbleDB, zap.L(), &verenc.MPCitHVerifiableEncryptor{}, inclusionProver)
-	hg := hgcrdt.NewHypergraph(zap.NewNop(), hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+	hg := hgcrdt.NewHypergraph(zap.NewNop(), hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 	for i := range 6 {
 		k := make([]byte, 585)
 		k[1] = byte(i)
@@ -972,7 +972,7 @@ func TestGlobalConsensusEngine_Integration_NoProversStaysInVerifying(t *testing.
 			InMemoryDONOTUSE: true,
 			Path:             fmt.Sprintf(".test/global_no_provers_%d", nodeID),
 		}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
-		hg := hgcrdt.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{})
+		hg := hgcrdt.NewHypergraph(logger, hypergraphStore, inclusionProver, []int{}, &tests.Nopthenticator{}, 1)
 
 		// Create prover registry - but don't register any provers
 		proverRegistry, err := provers.NewProverRegistry(logger, hg)

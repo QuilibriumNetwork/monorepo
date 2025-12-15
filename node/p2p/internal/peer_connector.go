@@ -238,7 +238,7 @@ func (cpc *chainedPeerConnector) run() {
 func NewChainedPeerConnector(ctx context.Context, connectors ...PeerConnector) PeerConnector {
 	cpc := &chainedPeerConnector{
 		ctx:        ctx,
-		connectors: connectors,
+		connectors: connectors, // buildutils:allow-slice-alias slice is static
 		connectCh:  make(chan (chan<- struct{})),
 	}
 	go cpc.run()

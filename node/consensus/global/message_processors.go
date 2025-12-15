@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
@@ -914,11 +916,23 @@ func (e *GlobalConsensusEngine) handleGlobalProposal(
 		}
 	}()
 
+	frame := proposal.State
+	var proverRootHex string
+	if frame.Header != nil {
+		proverRootHex = hex.EncodeToString(frame.Header.ProverTreeCommitment)
+	}
+	proposerHex := ""
+	if proposal.Vote != nil {
+		proposerHex = hex.EncodeToString([]byte(proposal.Vote.Identity()))
+	}
 	e.logger.Debug(
 		"handling global proposal",
 		zap.Uint64("rank", proposal.GetRank()),
-		zap.Uint64("frame_number", proposal.State.GetFrameNumber()),
-		zap.String("id", hex.EncodeToString([]byte(proposal.State.Identity()))),
+		zap.Uint64("frame_number", frame.GetFrameNumber()),
+		zap.Int("request_count", len(frame.GetRequests())),
+		zap.String("id", hex.EncodeToString([]byte(frame.Identity()))),
+		zap.String("prover_root", proverRootHex),
+		zap.String("proposer", proposerHex),
 	)
 
 	// Small gotcha: the proposal structure uses interfaces, so we can't assign
@@ -1095,14 +1109,68 @@ func (e *GlobalConsensusEngine) tryRecoverFinalizedFrame(
 func (e *GlobalConsensusEngine) processProposal(
 	proposal *protobufs.GlobalProposal,
 ) bool {
+	return e.processProposalInternal(proposal, false)
+}
+
+func (e *GlobalConsensusEngine) processProposalInternal(
+	proposal *protobufs.GlobalProposal,
+	skipAncestors bool,
+) bool {
+	if proposal == nil || proposal.State == nil || proposal.State.Header == nil {
+		return false
+	}
+
+	if !skipAncestors {
+		if ok, err := e.ensureAncestorStates(proposal); err != nil {
+			e.logger.Warn(
+				"failed to recover ancestor states for proposal",
+				zap.Uint64("frame_number", proposal.State.Header.FrameNumber),
+				zap.Uint64("rank", proposal.State.Header.Rank),
+				zap.Error(err),
+			)
+			e.requestAncestorSync(proposal)
+			return false
+		} else if !ok {
+			return false
+		}
+	}
+
+	frame := proposal.State
+	var proverRootHex string
+	if frame.Header != nil {
+		proverRootHex = hex.EncodeToString(frame.Header.ProverTreeCommitment)
+	}
+	proposerHex := ""
+	if proposal.Vote != nil {
+		proposerHex = hex.EncodeToString([]byte(proposal.Vote.Identity()))
+	}
 	e.logger.Debug(
 		"processing proposal",
 		zap.Uint64("rank", proposal.GetRank()),
-		zap.Uint64("frame_number", proposal.State.GetFrameNumber()),
-		zap.String("id", hex.EncodeToString([]byte(proposal.State.Identity()))),
+		zap.Uint64("frame_number", frame.GetFrameNumber()),
+		zap.Int("request_count", len(frame.GetRequests())),
+		zap.String("id", hex.EncodeToString([]byte(frame.Identity()))),
+		zap.String("prover_root", proverRootHex),
+		zap.String("proposer", proposerHex),
 	)
 
-	err := e.VerifyQuorumCertificate(proposal.ParentQuorumCertificate)
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		return false
+	}
+
+	err = e.clockStore.PutGlobalClockFrameCandidate(proposal.State, txn)
+	if err != nil {
+		txn.Abort()
+		return false
+	}
+
+	if err = txn.Commit(); err != nil {
+		txn.Abort()
+		return false
+	}
+
+	err = e.VerifyQuorumCertificate(proposal.ParentQuorumCertificate)
 	if err != nil {
 		e.logger.Debug(
 			"proposal has invalid qc",
@@ -1200,6 +1268,211 @@ func (e *GlobalConsensusEngine) processProposal(
 	e.registerPendingCertifiedParent(proposal)
 
 	return true
+}
+
+type ancestorDescriptor struct {
+	frameNumber uint64
+	selector    []byte
+}
+
+func (e *GlobalConsensusEngine) ensureAncestorStates(
+	proposal *protobufs.GlobalProposal,
+) (bool, error) {
+	ancestors, err := e.collectMissingAncestors(proposal)
+	if err != nil {
+		return false, err
+	}
+
+	if len(ancestors) == 0 {
+		return true, nil
+	}
+
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		ancestor, err := e.buildStoredProposal(ancestors[i])
+		if err != nil {
+			return false, err
+		}
+		if !e.processProposalInternal(ancestor, true) {
+			return false, fmt.Errorf(
+				"unable to process ancestor frame %d",
+				ancestors[i].frameNumber,
+			)
+		}
+	}
+
+	return true, nil
+}
+
+func (e *GlobalConsensusEngine) collectMissingAncestors(
+	proposal *protobufs.GlobalProposal,
+) ([]ancestorDescriptor, error) {
+	header := proposal.State.Header
+	if header == nil || header.FrameNumber == 0 {
+		return nil, nil
+	}
+
+	finalized := e.forks.FinalizedState()
+	if finalized == nil || finalized.State == nil || (*finalized.State).Header == nil {
+		return nil, errors.New("finalized state unavailable")
+	}
+	finalizedFrame := (*finalized.State).Header.FrameNumber
+	finalizedSelector := []byte(finalized.Identifier)
+
+	parentFrame := header.FrameNumber - 1
+	parentSelector := slices.Clone(header.ParentSelector)
+	if len(parentSelector) == 0 {
+		return nil, nil
+	}
+
+	var ancestors []ancestorDescriptor
+	anchored := false
+	for parentFrame > finalizedFrame && len(parentSelector) > 0 {
+		if _, found := e.forks.GetState(
+			models.Identity(string(parentSelector)),
+		); found {
+			anchored = true
+			break
+		}
+		ancestors = append(ancestors, ancestorDescriptor{
+			frameNumber: parentFrame,
+			selector:    slices.Clone(parentSelector),
+		})
+
+		frame, err := e.clockStore.GetGlobalClockFrameCandidate(
+			parentFrame,
+			parentSelector,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if frame == nil || frame.Header == nil {
+			return nil, errors.New("ancestor frame missing header")
+		}
+
+		parentFrame--
+		parentSelector = slices.Clone(frame.Header.ParentSelector)
+	}
+
+	if !anchored {
+		switch {
+		case parentFrame == finalizedFrame:
+			if !bytes.Equal(parentSelector, finalizedSelector) {
+				return nil, fmt.Errorf(
+					"ancestor chain not rooted at finalized frame %d",
+					finalizedFrame,
+				)
+			}
+			anchored = true
+		case parentFrame < finalizedFrame:
+			return nil, fmt.Errorf(
+				"ancestor chain crossed finalized boundary (frame %d < %d)",
+				parentFrame,
+				finalizedFrame,
+			)
+		case len(parentSelector) == 0:
+			return nil, errors.New(
+				"ancestor selector missing before reaching finalized state",
+			)
+		}
+	}
+
+	if !anchored {
+		return nil, errors.New("ancestor chain could not be anchored in forks")
+	}
+
+	return ancestors, nil
+}
+
+func (e *GlobalConsensusEngine) buildStoredProposal(
+	desc ancestorDescriptor,
+) (*protobufs.GlobalProposal, error) {
+	frame, err := e.clockStore.GetGlobalClockFrameCandidate(
+		desc.frameNumber,
+		desc.selector,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if frame == nil || frame.Header == nil {
+		return nil, errors.New("stored ancestor missing header")
+	}
+
+	var parentQC *protobufs.QuorumCertificate
+	if frame.GetRank() > 0 {
+		parentQC, err = e.clockStore.GetQuorumCertificate(
+			nil,
+			frame.GetRank()-1,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if parentQC == nil {
+			return nil, fmt.Errorf(
+				"missing parent qc for frame %d",
+				frame.GetRank()-1,
+			)
+		}
+	}
+
+	var priorTC *protobufs.TimeoutCertificate
+	if frame.GetRank() > 0 {
+		priorTC, err = e.clockStore.GetTimeoutCertificate(
+			nil,
+			frame.GetRank()-1,
+		)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			priorTC = nil
+		}
+	}
+
+	vote, err := e.clockStore.GetProposalVote(
+		nil,
+		frame.GetRank(),
+		[]byte(frame.Identity()),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &protobufs.GlobalProposal{
+		State:                       frame,
+		ParentQuorumCertificate:     parentQC,
+		PriorRankTimeoutCertificate: priorTC,
+		Vote:                        vote,
+	}, nil
+}
+
+func (e *GlobalConsensusEngine) requestAncestorSync(
+	proposal *protobufs.GlobalProposal,
+) {
+	if proposal == nil || proposal.State == nil || proposal.State.Header == nil {
+		return
+	}
+	if e.syncProvider == nil {
+		return
+	}
+
+	peerID, err := e.getPeerIDOfProver(proposal.State.Header.Prover)
+	if err != nil {
+		peerID, err = e.getRandomProverPeerId()
+		if err != nil {
+			return
+		}
+	}
+
+	head := e.forks.FinalizedState()
+	if head == nil || head.State == nil {
+		return
+	}
+
+	e.syncProvider.AddState(
+		[]byte(peerID),
+		(*head.State).Header.FrameNumber,
+		[]byte(head.Identifier),
+	)
 }
 
 func (e *GlobalConsensusEngine) cacheProposal(
@@ -1345,16 +1618,7 @@ func (e *GlobalConsensusEngine) trySealParentWithChild(
 		zap.Uint64("child_frame", header.FrameNumber),
 	)
 
-	head, err := e.clockStore.GetLatestGlobalClockFrame()
-	if err != nil {
-		e.logger.Error("error fetching time reel head", zap.Error(err))
-		return
-	}
-
-	if head.Header.FrameNumber+1 == parent.State.Header.FrameNumber {
-		e.addCertifiedState(parent, child)
-	}
-
+	e.addCertifiedState(parent, child)
 	e.pendingCertifiedParentsMu.Lock()
 	delete(e.pendingCertifiedParents, parentFrame)
 	e.pendingCertifiedParentsMu.Unlock()

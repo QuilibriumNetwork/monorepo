@@ -128,4 +128,8 @@ type ProverRegistry interface {
 	// GetProverShardSummaries returns all shard filters that currently have any
 	// provers assigned (regardless of status) along with their counts.
 	GetProverShardSummaries() ([]*ProverShardSummary, error)
+
+	// PruneOrphanJoins performs pruning of vertexes in the prover trie for
+	// expired joins.
+	PruneOrphanJoins(frameNumber uint64) error
 }

@@ -276,6 +276,8 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 	}
 }
 
+const pendingFilterGraceFrames = 720
+
 func (e *GlobalConsensusEngine) emitCoverageEvent(
 	eventType typesconsensus.ControlEventType,
 	data *typesconsensus.CoverageEventData,
@@ -390,6 +392,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	allowProposals bool,
 ) {
 	self, effectiveSeniority := e.allocationContext()
+	e.reconcileWorkerAllocations(data.Frame.Header.FrameNumber, self)
 	e.checkExcessPendingJoins(self, data.Frame.Header.FrameNumber)
 	canPropose, skipReason := e.joinProposalReady(data.Frame.Header.FrameNumber)
 
@@ -416,6 +419,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				proposalDescriptors,
 				100,
 				worldBytes,
+				data.Frame.Header.FrameNumber,
 			)
 			if err != nil {
 				e.logger.Error("could not plan shard allocations", zap.Error(err))
@@ -515,6 +519,114 @@ func (s *allocationSnapshot) proposalSnapshotFields() []zap.Field {
 		zap.Int("proposal_candidates", len(s.proposalDescriptors)),
 		zap.Int("pending_confirmations", len(s.pendingFilters)),
 		zap.Int("decide_descriptors", len(s.decideDescriptors)),
+	}
+}
+
+func (e *GlobalConsensusEngine) reconcileWorkerAllocations(
+	frameNumber uint64,
+	self *typesconsensus.ProverInfo,
+) {
+	if e.workerManager == nil {
+		return
+	}
+
+	workers, err := e.workerManager.RangeWorkers()
+	if err != nil {
+		e.logger.Warn("could not load workers for reconciliation", zap.Error(err))
+		return
+	}
+
+	filtersToWorkers := make(map[string]*store.WorkerInfo, len(workers))
+	freeWorkers := make([]*store.WorkerInfo, 0, len(workers))
+	for _, worker := range workers {
+		if worker == nil {
+			continue
+		}
+		if len(worker.Filter) == 0 {
+			freeWorkers = append(freeWorkers, worker)
+			continue
+		}
+		filtersToWorkers[string(worker.Filter)] = worker
+	}
+
+	seenFilters := make(map[string]struct{})
+	if self != nil {
+		for _, alloc := range self.Allocations {
+			if len(alloc.ConfirmationFilter) == 0 {
+				continue
+			}
+
+			key := string(alloc.ConfirmationFilter)
+			worker, ok := filtersToWorkers[key]
+			if !ok {
+				if len(freeWorkers) == 0 {
+					e.logger.Warn(
+						"no free worker available for registry allocation",
+						zap.String("filter", hex.EncodeToString(alloc.ConfirmationFilter)),
+					)
+					continue
+				}
+				worker = freeWorkers[0]
+				freeWorkers = freeWorkers[1:]
+				worker.Filter = slices.Clone(alloc.ConfirmationFilter)
+			}
+
+			seenFilters[key] = struct{}{}
+
+			desiredAllocated := alloc.Status == typesconsensus.ProverStatusActive ||
+				alloc.Status == typesconsensus.ProverStatusPaused
+
+			pendingFrame := alloc.JoinFrameNumber
+			if desiredAllocated {
+				pendingFrame = 0
+			}
+
+			if worker.Allocated != desiredAllocated ||
+				worker.PendingFilterFrame != pendingFrame {
+				worker.Allocated = desiredAllocated
+				worker.PendingFilterFrame = pendingFrame
+				if err := e.workerManager.RegisterWorker(worker); err != nil {
+					e.logger.Warn(
+						"failed to update worker allocation state",
+						zap.Uint("core_id", worker.CoreId),
+						zap.Error(err),
+					)
+				}
+			}
+		}
+	}
+
+	for _, worker := range workers {
+		if worker == nil || len(worker.Filter) == 0 {
+			continue
+		}
+		if _, ok := seenFilters[string(worker.Filter)]; ok {
+			continue
+		}
+
+		if worker.PendingFilterFrame != 0 {
+			if frameNumber <= worker.PendingFilterFrame {
+				continue
+			}
+			if frameNumber-worker.PendingFilterFrame < pendingFilterGraceFrames {
+				continue
+			}
+		}
+
+		if worker.PendingFilterFrame == 0 && self == nil {
+			continue
+		}
+
+		worker.Filter = nil
+		worker.Allocated = false
+		worker.PendingFilterFrame = 0
+		if err := e.workerManager.RegisterWorker(worker); err != nil {
+			e.logger.Warn(
+				"failed to clear stale worker filter",
+				zap.Uint("core_id", worker.CoreId),
+				zap.Error(err),
+			)
+		}
 	}
 }
 
@@ -719,8 +831,17 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 
 			above := []*typesconsensus.ProverInfo{}
 			for _, i := range prs {
-				if i.Seniority >= effectiveSeniority {
-					above = append(above, i)
+				for _, a := range i.Allocations {
+					if !bytes.Equal(a.ConfirmationFilter, bp) {
+						continue
+					}
+					if a.Status == typesconsensus.ProverStatusActive ||
+						a.Status == typesconsensus.ProverStatusJoining {
+						if i.Seniority >= effectiveSeniority {
+							above = append(above, i)
+						}
+						break
+					}
 				}
 			}
 
@@ -1027,7 +1148,7 @@ func (e *GlobalConsensusEngine) getAppShardsFromProver(
 	response, err := client.GetAppShards(
 		getCtx,
 		&protobufs.GetAppShardsRequest{
-			ShardKey: shardKey,
+			ShardKey: shardKey, // buildutils:allow-slice-alias slice is static
 		},
 		// The message size limits are swapped because the server is the one
 		// sending the data.

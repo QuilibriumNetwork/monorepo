@@ -243,7 +243,7 @@ func WithParentState[StateT models.Unique](parent *models.State[StateT]) func(*m
 
 func WithParentSigners[StateT models.Unique](signerIndices []byte) func(*models.State[StateT]) {
 	return func(state *models.State[StateT]) {
-		state.ParentQuorumCertificate.(*TestQuorumCertificate).AggregatedSignature.(*TestAggregatedSignature).Bitmask = signerIndices
+		state.ParentQuorumCertificate.(*TestQuorumCertificate).AggregatedSignature.(*TestAggregatedSignature).Bitmask = signerIndices // buildutils:allow-slice-alias
 	}
 }
 

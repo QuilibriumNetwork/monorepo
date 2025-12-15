@@ -40,7 +40,7 @@ func NewIdSet(
 			Store:           store,
 			InclusionProver: prover,
 			Root:            root,
-			CoveredPrefix:   coveredPrefix,
+			CoveredPrefix:   slices.Clone(coveredPrefix),
 		},
 	}
 }

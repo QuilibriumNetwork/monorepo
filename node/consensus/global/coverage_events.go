@@ -115,7 +115,7 @@ func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 			} else {
 				remaining = int(haltGraceFrames - streak.Count)
 			}
-			if remaining <= 0 {
+			if remaining <= 0 && e.config.P2P.Network == 0 {
 				e.logger.Error(
 					"CRITICAL: Shard has insufficient coverage - triggering network halt",
 					zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
@@ -212,7 +212,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 		e.emitCoverageEvent(
 			typesconsensus.ControlEventCoverageWarn,
 			&typesconsensus.CoverageEventData{
-				ShardAddress:    shardAddress,
+				ShardAddress:    shardAddress, // buildutils:allow-slice-alias slice is static
 				ProverCount:     coverage.ProverCount,
 				RequiredProvers: int(minProvers),
 				AttestedStorage: coverage.AttestedStorage,
@@ -277,7 +277,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 			e.emitCoverageEvent(
 				typesconsensus.ControlEventCoverageWarn,
 				&typesconsensus.CoverageEventData{
-					ShardAddress:    shardAddress,
+					ShardAddress:    shardAddress, // buildutils:allow-slice-alias slice is static
 					ProverCount:     coverage.ProverCount,
 					RequiredProvers: int(minProvers),
 					AttestedStorage: coverage.AttestedStorage,
@@ -291,7 +291,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 		e.emitCoverageEvent(
 			typesconsensus.ControlEventCoverageWarn,
 			&typesconsensus.CoverageEventData{
-				ShardAddress:    shardAddress,
+				ShardAddress:    shardAddress, // buildutils:allow-slice-alias slice is static
 				ProverCount:     coverage.ProverCount,
 				RequiredProvers: int(minProvers),
 				AttestedStorage: coverage.AttestedStorage,
@@ -328,7 +328,7 @@ func (e *GlobalConsensusEngine) handleHighCoverage(
 
 			// Emit split eligible event
 			e.emitSplitEvent(&typesconsensus.ShardSplitEventData{
-				ShardAddress:    shardAddress,
+				ShardAddress:    shardAddress, // buildutils:allow-slice-alias slice is static
 				ProverCount:     coverage.ProverCount,
 				AttestedStorage: coverage.AttestedStorage,
 				ProposedShards:  proposedShards,

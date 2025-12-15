@@ -68,7 +68,7 @@ func (p *ConsensusSigDataPacker) Unpack(
 	sigData []byte,
 ) (*consensus.StateSignatureData, error) {
 	return &consensus.StateSignatureData{
-		Signers:   signerIdentities,
-		Signature: sigData,
+		Signers:   signerIdentities, // buildutils:allow-slice-alias
+		Signature: sigData,          // buildutils:allow-slice-alias
 	}, nil
 }

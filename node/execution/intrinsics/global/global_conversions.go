@@ -29,7 +29,7 @@ func BLS48581G2PublicKeyToProtobuf(
 		return nil
 	}
 	return &protobufs.BLS48581G2PublicKey{
-		KeyValue: keyValue,
+		KeyValue: keyValue, // buildutils:allow-slice-alias slice is static
 	}
 }
 

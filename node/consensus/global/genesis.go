@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"slices"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mr-tron/base58"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
@@ -23,7 +26,11 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
+	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
+	typeskeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
@@ -53,6 +60,30 @@ func (e *GlobalConsensusEngine) getMainnetGenesisJSON() *GenesisJson {
 		return nil
 	}
 	return genesisData
+}
+
+// ExpectedGenesisFrameNumber returns the frame number the node should treat as
+// genesis for the provided configuration (mainnet vs. dev/test).
+func ExpectedGenesisFrameNumber(
+	cfg *config.Config,
+	logger *zap.Logger,
+) uint64 {
+	if cfg != nil && cfg.P2P.Network == 0 {
+		genesisData := &GenesisJson{}
+		if err := json.Unmarshal(mainnetGenesisJSON, genesisData); err != nil {
+			if logger != nil {
+				logger.Error(
+					"failed to parse embedded genesis data",
+					zap.Error(err),
+				)
+			}
+			return 0
+		}
+		if genesisData.FrameNumber > 0 {
+			return genesisData.FrameNumber
+		}
+	}
+	return 0
 }
 
 // TODO[2.1.1+]: Refactor out direct hypergraph access
@@ -693,6 +724,41 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 	}
 
 	return genesisFrame
+}
+
+// InitializeGenesisState ensures the global genesis frame and QC exist using the
+// provided stores and executors. It is primarily used by components that need
+// the genesis state (like app consensus engines) without instantiating the full
+// global consensus engine.
+func InitializeGenesisState(
+	logger *zap.Logger,
+	cfg *config.Config,
+	clockStore store.ClockStore,
+	shardsStore store.ShardsStore,
+	hypergraph hypergraph.Hypergraph,
+	consensusStore consensus.ConsensusStore[*protobufs.ProposalVote],
+	inclusionProver crypto.InclusionProver,
+	keyManager typeskeys.KeyManager,
+	proverRegistry typesconsensus.ProverRegistry,
+) (*protobufs.GlobalFrame, *protobufs.QuorumCertificate, error) {
+	engine := &GlobalConsensusEngine{
+		logger:          logger,
+		config:          cfg,
+		clockStore:      clockStore,
+		shardsStore:     shardsStore,
+		hypergraph:      hypergraph,
+		consensusStore:  consensusStore,
+		inclusionProver: inclusionProver,
+		keyManager:      keyManager,
+		proverRegistry:  proverRegistry,
+		frameStore:      make(map[string]*protobufs.GlobalFrame),
+	}
+
+	frame, qc := engine.initializeGenesis()
+	if frame == nil || qc == nil {
+		return nil, nil, errors.New("failed to initialize global genesis")
+	}
+	return frame, qc, nil
 }
 
 func (e *GlobalConsensusEngine) establishMainnetGenesisProvers(

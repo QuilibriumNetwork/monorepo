@@ -93,10 +93,10 @@ func NewProverJoin(
 	frameStore store.ClockStore,
 ) (*ProverJoin, error) {
 	return &ProverJoin{
-		Filters:         filters,
+		Filters:         filters, // buildutils:allow-slice-alias slice is static
 		FrameNumber:     frameNumber,
-		MergeTargets:    mergeTargets,
-		DelegateAddress: delegateAddress,
+		MergeTargets:    mergeTargets,    // buildutils:allow-slice-alias slice is static
+		DelegateAddress: delegateAddress, // buildutils:allow-slice-alias slice is static
 		keyManager:      keyManager,
 		hypergraph:      hypergraph,
 		rdfMultiprover:  rdfMultiprover,
@@ -710,8 +710,8 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
 			), "verify")
 		}
-		frames.Close()
 		frame, err = frames.Value()
+		frames.Close()
 		if err != nil {
 			return false, errors.Wrap(errors.Wrap(
 				err,

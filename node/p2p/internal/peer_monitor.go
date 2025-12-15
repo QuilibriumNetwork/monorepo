@@ -143,7 +143,7 @@ func MonitorPeers(
 		timeout:      timeout,
 		period:       period,
 		attempts:     attempts,
-		direct:       directPeers,
+		direct:       directPeers, // buildutils:allow-slice-alias slice is static
 		directPeriod: 10 * time.Second,
 	}
 
