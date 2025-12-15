@@ -521,6 +521,13 @@ func main() {
 			rpcMultiaddr = nodeConfig.Engine.DataWorkerStreamMultiaddrs[*core-1]
 		}
 
+		rpcMultiaddr = strings.Replace(rpcMultiaddr, "/0.0.0.0/", "/127.0.0.1/", 1)
+		rpcMultiaddr = strings.Replace(rpcMultiaddr, "/0:0:0:0:0:0:0:0/", "/::1/", 1)
+		rpcMultiaddr = strings.Replace(rpcMultiaddr, "/::/", "/::1/", 1)
+		// force TCP as stream is not supported over UDP/QUIC
+		rpcMultiaddr = strings.Replace(rpcMultiaddr, "/quic-v1", "", 1)
+		rpcMultiaddr = strings.Replace(rpcMultiaddr, "udp", "tcp", 1)
+
 		dataWorkerNode, err := app.NewDataWorkerNode(
 			logger,
 			nodeConfig,
