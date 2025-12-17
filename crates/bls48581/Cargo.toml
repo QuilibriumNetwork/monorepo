@@ -1,7 +1,14 @@
 [package]
 name = "bls48581"
-version = "0.1.0"
+version = "2.1.0"
 edition = "2021"
+authors = ["Quilibrium Inc."]
+description = "BLS signature implementation using the BLS48-581 curve with KZG commitments"
+license = "Apache-2.0"
+repository = "https://github.com/quilibriumnetwork/ceremonyclient"
+keywords = ["bls", "signature", "kzg", "commitment", "cryptography"]
+categories = ["cryptography", "algorithms"]
+readme = "README.md"
 
 [lib]
 crate-type = ["lib", "staticlib"]
