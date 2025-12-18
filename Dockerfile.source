@@ -1,12 +1,13 @@
 # syntax=docker.io/docker/dockerfile:1.7-labs
 FROM --platform=${TARGETPLATFORM} ubuntu:24.04 AS base
 
+# Common environment variables
 ENV PATH="${PATH}:/root/.cargo/bin/"
-
 ARG TARGETOS
 ARG TARGETARCH
+ARG GO_VERSION=1.23.5
 
-# Install GMP 6.2 (6.3 which MacOS is using only available on Debian unstable)
+# Install basics
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
@@ -27,15 +28,64 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     python3 \
     python-is-python3 \
+    libflint-dev \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ARG GO_VERSION=1.23.5
+# -----------------------------------------------------------------------------
+# Stage: flint-builder
+# Purpose: Build FLINT library (slowest component)
+# -----------------------------------------------------------------------------
+FROM base AS flint-builder
+
+RUN git clone --branch flint-3.0 --depth 1 https://github.com/flintlib/flint.git && \
+    cd flint && \
+    ./bootstrap.sh && \
+    ./configure \
+    --prefix=/usr/local \
+    --with-gmp=/usr/local \
+    --with-mpfr=/usr/local \
+    --enable-static \
+    --disable-shared \
+    CFLAGS="-O3" && \
+    make -j$(nproc) && \
+    make install
+
+# -----------------------------------------------------------------------------
+# Stage: emp-builder
+# Purpose: Build EMP-toolkit libraries
+# -----------------------------------------------------------------------------
+FROM base AS emp-builder
+
+WORKDIR /opt/ceremonyclient
+# Copy the necessary script and source directories
+COPY emp-install.py .
+COPY emp-tool emp-tool
+COPY emp-ot emp-ot
+
+RUN python emp-install.py --install --tool --ot
+
+# Fix emp-tool to be static and install
+RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make -j$(nproc) && make install
+
+# Install emp-ot
+RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make -j$(nproc) && make install
+
+# -----------------------------------------------------------------------------
+# Stage: go-base
+# Purpose: Install Go
+# -----------------------------------------------------------------------------
+FROM base AS go-base
+
+ARG TARGETARCH
+ARG GO_VERSION
+
 RUN apt update && apt install -y wget && \
     ARCH=$(dpkg --print-architecture) && \
     case ${ARCH} in \
-        amd64) GOARCH=amd64 ;; \
-        arm64) GOARCH=arm64 ;; \
-        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    amd64) GOARCH=amd64 ;; \
+    arm64) GOARCH=arm64 ;; \
+    *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
     esac && \
     wget https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz && \
     rm -rf /usr/local/go && \
@@ -43,139 +93,186 @@ RUN apt update && apt install -y wget && \
     rm go${GO_VERSION}.linux-${GOARCH}.tar.gz
 
 ENV PATH=$PATH:/usr/local/go/bin
+ENV GOPROXY=direct
 
-RUN git clone https://github.com/flintlib/flint.git && \
-    cd flint && \
-    git checkout flint-3.0 && \
-    ./bootstrap.sh && \
-    ./configure \
-        --prefix=/usr/local \
-        --with-gmp=/usr/local \
-        --with-mpfr=/usr/local \
-        --enable-static \
-        --disable-shared \
-        CFLAGS="-O3" && \
-    make && \
-    make install && \
-    cd .. && \
-    rm -rf flint
+# -----------------------------------------------------------------------------
+# Stage: rust-base
+# Purpose: Install Rust and bindgen tools
+# -----------------------------------------------------------------------------
+FROM base AS rust-base
 
 COPY docker/rustup-init.sh /opt/rustup-init.sh
-
 RUN /opt/rustup-init.sh -y --profile minimal
 
-# Install uniffi-bindgen-go
 RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.4.0+v0.28.3
 
-FROM base AS build
+# -----------------------------------------------------------------------------
+# Stage: libs-context
+# Purpose: Aggregate built libraries (Flint + EMP)
+# -----------------------------------------------------------------------------
+FROM base AS libs-context
+COPY --from=flint-builder /usr/local /usr/local
+COPY --from=emp-builder /usr/local /usr/local
+
+# -----------------------------------------------------------------------------
+# Stage: common-context
+# Purpose: Base for generation steps, includes libs, go, and rust
+# -----------------------------------------------------------------------------
+FROM libs-context AS common-context
+
+COPY --from=go-base /usr/local/go /usr/local/go
+ENV PATH=$PATH:/usr/local/go/bin
+ENV GOPROXY=https://proxy.golang.org,direct
+
+COPY --from=rust-base /root/.cargo /root/.cargo
+COPY --from=rust-base /root/.rustup /root/.rustup
+ENV PATH="${PATH}:/root/.cargo/bin/"
 
 ENV GOEXPERIMENT=arenas
 ENV QUILIBRIUM_SIGNATURE_CHECK=false
 
-# Install grpcurl before building the node and client 
-# as to avoid needing to redo it on rebuilds
+# Install grpcurl (common tool)
 RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 
 WORKDIR /opt/ceremonyclient
 
-# Copy everything except node and client so as to avoid 
-# invalidating the cache at this point on client or node rebuilds
-
+# Copy source needed for generation (excluding node/client/sidecar handled in builders)
 COPY --exclude=node \
     --exclude=client \
     --exclude=sidecar . .
 
-RUN python emp-install.py --install --tool --ot
+# -----------------------------------------------------------------------------
+# Parallel Generation Stages
+# -----------------------------------------------------------------------------
 
-RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
-
-RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
-
-## Generate Rust bindings for channel
+FROM common-context AS gen-channel
 WORKDIR /opt/ceremonyclient/channel
-
 RUN go mod download
-
 RUN ./generate.sh
 
-
-## Generate Rust bindings for VDF
+FROM common-context AS gen-vdf
 WORKDIR /opt/ceremonyclient/vdf
-
 RUN go mod download
-
 RUN ./generate.sh
 
-
-## Generate Rust bindings for Ferret
+FROM common-context AS gen-ferret
 WORKDIR /opt/ceremonyclient/ferret
-
 RUN go mod download
-
 RUN ./generate.sh
 
-## Generate Rust bindings for BLS48581
+FROM common-context AS gen-bls48581
 WORKDIR /opt/ceremonyclient/bls48581
-
 RUN go mod download
-
 RUN ./generate.sh
 
-## Generate Rust bindings for RPM
+FROM common-context AS gen-rpm
 WORKDIR /opt/ceremonyclient/rpm
-
 RUN go mod download
-
 RUN ./generate.sh
 
-## Generate Rust bindings for VerEnc
+FROM common-context AS gen-verenc
 WORKDIR /opt/ceremonyclient/verenc
-
 RUN go mod download
-
 RUN ./generate.sh
 
-## Generate Rust bindings for Bulletproofs
+FROM common-context AS gen-bulletproofs
 WORKDIR /opt/ceremonyclient/bulletproofs
-
 RUN go mod download
-
 RUN ./generate.sh
 
-FROM build AS build-node
+# -----------------------------------------------------------------------------
+# Stage: build-context
+# Purpose: Aggregate all generated bindings and static libraries
+# -----------------------------------------------------------------------------
+FROM common-context AS build-context
 
-# Build and install the node
+# Copy generated artifacts back
+COPY --from=gen-channel /opt/ceremonyclient/channel /opt/ceremonyclient/channel
+COPY --from=gen-channel /opt/ceremonyclient/target/release/libchannel.a /opt/ceremonyclient/target/release/libchannel.a
+
+COPY --from=gen-vdf /opt/ceremonyclient/vdf /opt/ceremonyclient/vdf
+COPY --from=gen-vdf /opt/ceremonyclient/target/release/libvdf.a /opt/ceremonyclient/target/release/libvdf.a
+
+COPY --from=gen-ferret /opt/ceremonyclient/ferret /opt/ceremonyclient/ferret
+COPY --from=gen-ferret /opt/ceremonyclient/target/release/libferret.a /opt/ceremonyclient/target/release/libferret.a
+
+COPY --from=gen-bls48581 /opt/ceremonyclient/bls48581 /opt/ceremonyclient/bls48581
+COPY --from=gen-bls48581 /opt/ceremonyclient/target/release/libbls48581.a /opt/ceremonyclient/target/release/libbls48581.a
+
+COPY --from=gen-rpm /opt/ceremonyclient/rpm /opt/ceremonyclient/rpm
+COPY --from=gen-rpm /opt/ceremonyclient/target/release/librpm.a /opt/ceremonyclient/target/release/librpm.a
+
+COPY --from=gen-verenc /opt/ceremonyclient/verenc /opt/ceremonyclient/verenc
+COPY --from=gen-verenc /opt/ceremonyclient/target/release/libverenc.a /opt/ceremonyclient/target/release/libverenc.a
+
+COPY --from=gen-bulletproofs /opt/ceremonyclient/bulletproofs /opt/ceremonyclient/bulletproofs
+COPY --from=gen-bulletproofs /opt/ceremonyclient/target/release/libbulletproofs.a /opt/ceremonyclient/target/release/libbulletproofs.a
+
+# -----------------------------------------------------------------------------
+# Stage: build-node
+# -----------------------------------------------------------------------------
+FROM build-context AS build-node
 COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
-
-ENV GOPROXY=direct
 RUN ./build.sh && cp node /usr/bin
 
-FROM build AS build-qclient
+# -----------------------------------------------------------------------------
+# Stage: build-qclient
+# -----------------------------------------------------------------------------
+FROM build-context AS build-qclient
 ARG TARGETOS
 ARG TARGETARCH
-# Build and install qclient
+
 COPY ./node /opt/ceremonyclient/node
-
 WORKDIR /opt/ceremonyclient/node
-
 RUN go mod download
 
 COPY ./client /opt/ceremonyclient/client
 WORKDIR /opt/ceremonyclient/client
-
 RUN go mod download
 
 ARG BINARIES_DIR=/opt/ceremonyclient/target/release
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh -o qclient
 RUN cp qclient /usr/bin
 
-# Allows exporting single binary
+# -----------------------------------------------------------------------------
+# Stage: node-only
+# -----------------------------------------------------------------------------
+FROM ubuntu:24.04 AS node-only
+ARG NODE_VERSION
+ARG GIT_REPO
+ARG GIT_BRANCH
+ARG GIT_COMMIT
+
+ENV GOEXPERIMENT=arenas
+
+LABEL org.opencontainers.image.title="Quilibrium Network Node"
+LABEL org.opencontainers.image.description="Quilibrium is a decentralized alternative to platform as a service providers."
+LABEL org.opencontainers.image.version=$NODE_VERSION
+LABEL org.opencontainers.image.vendor=Quilibrium
+LABEL org.opencontainers.image.url=https://quilibrium.com/
+LABEL org.opencontainers.image.documentation=https://quilibrium.com/docs
+LABEL org.opencontainers.image.source=$GIT_REPO
+LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
+LABEL org.opencontainers.image.revision=$GIT_COMMIT
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libgmp10 \
+    libmpfr6 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build-node /usr/bin/node /usr/local/bin/node
+WORKDIR /root
+ENTRYPOINT ["node"]
+
+# -----------------------------------------------------------------------------
+# Stage: exports (Scratch)
+# -----------------------------------------------------------------------------
 FROM scratch AS node
 COPY --from=build-node /usr/bin/node /node
 ENTRYPOINT [ "/node" ]
 
-# Allows exporting single binary
 FROM scratch AS qclient-unix
 COPY --from=build-qclient /usr/bin/qclient /qclient
 ENTRYPOINT [ "/qclient" ]
@@ -184,9 +281,15 @@ FROM qclient-unix AS qclient-linux
 FROM qclient-unix AS qclient-darwin
 FROM qclient-${TARGETOS} AS qclient
 
-FROM ubuntu:24.04
+# -----------------------------------------------------------------------------
+# Stage: final (Default combined image)
+# -----------------------------------------------------------------------------
+FROM ubuntu:24.04 AS final
 
-RUN apt-get update && apt-get install libflint-dev -y
+RUN apt-get update && apt-get install -y \
+    libflint-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG NODE_VERSION
 ARG GIT_REPO
@@ -205,11 +308,8 @@ LABEL org.opencontainers.image.source=$GIT_REPO
 LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
 LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
-RUN apt-get update && apt-get install -y ca-certificates
-
 COPY --from=build-node /usr/bin/node /usr/local/bin
 COPY --from=build-qclient /opt/ceremonyclient/client/qclient /usr/local/bin
 
 WORKDIR /root
-
 ENTRYPOINT ["node"]
