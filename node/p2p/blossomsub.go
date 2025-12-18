@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"math/bits"
 	"net"
+
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -26,7 +27,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/peerstore"
+
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
@@ -34,7 +35,7 @@ import (
 	routedhost "github.com/libp2p/go-libp2p/p2p/host/routed"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/net/gostream"
-	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
+
 	"github.com/mr-tron/base58"
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
@@ -44,7 +45,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	grpcpeer "google.golang.org/grpc/peer"
+
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	blossomsub "source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub"
@@ -1358,139 +1359,6 @@ func (b *BlossomSub) recordManualReachability(success bool) {
 	state := new(bool)
 	*state = success
 	b.manualReachability.Store(state)
-}
-
-type connectivityService struct {
-	protobufs.UnimplementedConnectivityServiceServer
-	logger *zap.Logger
-	host   host.Host
-	ping   *ping.PingService
-}
-
-func newConnectivityService(
-	logger *zap.Logger,
-	h host.Host,
-) *connectivityService {
-	return &connectivityService{
-		logger: logger,
-		host:   h,
-		ping:   ping.NewPingService(h),
-	}
-}
-
-func (s *connectivityService) TestConnectivity(
-	ctx context.Context,
-	req *protobufs.ConnectivityTestRequest,
-) (*protobufs.ConnectivityTestResponse, error) {
-	resp := &protobufs.ConnectivityTestResponse{}
-	peerID := peer.ID(req.GetPeerId())
-	if peerID == "" {
-		resp.ErrorMessage = "peer id required"
-		return resp, nil
-	}
-
-	// Get the actual IP address from the gRPC peer context
-	pr, ok := grpcpeer.FromContext(ctx)
-	if !ok || pr.Addr == nil {
-		resp.ErrorMessage = "unable to determine peer address from context"
-		return resp, nil
-	}
-
-	// Extract the IP from the remote address
-	remoteAddr := pr.Addr.String()
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		resp.ErrorMessage = fmt.Sprintf("invalid remote address: %v", err)
-		return resp, nil
-	}
-
-	s.logger.Debug(
-		"connectivity test from peer",
-		zap.String("peer_id", peerID.String()),
-		zap.String("remote_ip", host),
-	)
-
-	addrs := make([]ma.Multiaddr, 0, len(req.GetMultiaddrs()))
-	for _, addrStr := range req.GetMultiaddrs() {
-		maddr, err := ma.NewMultiaddr(addrStr)
-		if err != nil {
-			s.logger.Debug(
-				"invalid multiaddr in connectivity request",
-				zap.String("peer_id", peerID.String()),
-				zap.String("multiaddr", addrStr),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		// Extract the port from the multiaddr but use the actual IP from the
-		// connection
-		port, err := maddr.ValueForProtocol(ma.P_TCP)
-		if err != nil {
-			// If it's not TCP, try UDP
-			port, err = maddr.ValueForProtocol(ma.P_UDP)
-			if err != nil {
-				continue
-			}
-			// Build UDP multiaddr with actual IP
-			newAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s/quic-v1", host, port))
-			if err != nil {
-				continue
-			}
-			addrs = append(addrs, newAddr)
-			continue
-		}
-
-		// Build TCP multiaddr with actual IP
-		newAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%s", host, port))
-		if err != nil {
-			continue
-		}
-		addrs = append(addrs, newAddr)
-	}
-
-	if len(addrs) == 0 {
-		resp.ErrorMessage = "no valid multiaddrs to test"
-		return resp, nil
-	}
-
-	s.logger.Debug(
-		"attempting to connect to peer",
-		zap.String("peer_id", peerID.String()),
-		zap.Any("addrs", addrs),
-	)
-
-	s.host.Peerstore().AddAddrs(peerID, addrs, peerstore.TempAddrTTL)
-
-	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	err = s.host.Connect(connectCtx, peer.AddrInfo{
-		ID:    peerID,
-		Addrs: addrs,
-	})
-	if err != nil {
-		resp.ErrorMessage = err.Error()
-		return resp, nil
-	}
-
-	defer s.host.Network().ClosePeer(peerID)
-
-	pingCtx, cancelPing := context.WithTimeout(ctx, 10*time.Second)
-	defer cancelPing()
-
-	select {
-	case <-pingCtx.Done():
-		resp.ErrorMessage = pingCtx.Err().Error()
-		return resp, nil
-	case result := <-s.ping.Ping(pingCtx, peerID):
-		if result.Error != nil {
-			resp.ErrorMessage = result.Error.Error()
-			return resp, nil
-		}
-	}
-
-	resp.Success = true
-	return resp, nil
 }
 
 func initDHT(
