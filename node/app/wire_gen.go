@@ -125,7 +125,7 @@ func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config
 	if err != nil {
 		return nil, err
 	}
-	dataWorkerNode, err := newDataWorkerNode(logger, pebbleDataProofStore, pebbleClockStore, pebbleTokenStore, fileKeyManager, pebbleDB, frameProver, dataWorkerIPCServer, globalTimeReel, coreId, parentProcess)
+	dataWorkerNode, err := newDataWorkerNode(logger, config2, pebbleDataProofStore, pebbleClockStore, pebbleTokenStore, fileKeyManager, pebbleDB, frameProver, dataWorkerIPCServer, globalTimeReel, coreId, parentProcess, rpcMultiaddr)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +182,7 @@ func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Con
 	if err != nil {
 		return nil, err
 	}
-	dataWorkerNode, err := newDataWorkerNode(logger, pebbleDataProofStore, pebbleClockStore, pebbleTokenStore, fileKeyManager, pebbleDB, frameProver, dataWorkerIPCServer, globalTimeReel, coreId, parentProcess)
+	dataWorkerNode, err := newDataWorkerNode(logger, config2, pebbleDataProofStore, pebbleClockStore, pebbleTokenStore, fileKeyManager, pebbleDB, frameProver, dataWorkerIPCServer, globalTimeReel, coreId, parentProcess, rpcMultiaddr)
 	if err != nil {
 		return nil, err
 	}
