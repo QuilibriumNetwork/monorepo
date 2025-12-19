@@ -307,7 +307,7 @@ checksum = "8d696c370c750c948ada61c69a0ee2cbbb9c50b1019ddb86d9317157a99c2cae"
 
 [[package]]
 name = "bls48581"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "criterion 0.4.0",
  "hex 0.4.3",

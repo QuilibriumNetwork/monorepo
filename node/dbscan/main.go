@@ -35,8 +35,28 @@ var (
 	)
 	configDirectory2 = flag.String(
 		"config2",
-		filepath.Join(".", ".config"),
-		"the configuration directory",
+		"",
+		"the second configuration directory (optional, enables comparison mode)",
+	)
+	keyPrefix = flag.String(
+		"prefix",
+		"",
+		"hex-encoded key prefix to filter results (e.g., '09' for hypergraph keys)",
+	)
+	searchKey = flag.String(
+		"search",
+		"",
+		"hex-encoded key substring to search for in keys",
+	)
+	searchValue = flag.String(
+		"search-value",
+		"",
+		"hex-encoded substring to search for in values",
+	)
+	maxResults = flag.Int(
+		"max",
+		0,
+		"maximum number of results to display (0 = unlimited)",
 	)
 
 	// *char flags
@@ -49,6 +69,34 @@ var (
 func main() {
 	config.Flags(&char, &ver)
 	flag.Parse()
+
+	// Parse filter options
+	var prefixFilter []byte
+	if *keyPrefix != "" {
+		var err error
+		prefixFilter, err = hex.DecodeString(*keyPrefix)
+		if err != nil {
+			log.Fatalf("invalid prefix hex: %v", err)
+		}
+	}
+
+	var keySearchPattern []byte
+	if *searchKey != "" {
+		var err error
+		keySearchPattern, err = hex.DecodeString(*searchKey)
+		if err != nil {
+			log.Fatalf("invalid search hex: %v", err)
+		}
+	}
+
+	var valueSearchPattern []byte
+	if *searchValue != "" {
+		var err error
+		valueSearchPattern, err = hex.DecodeString(*searchValue)
+		if err != nil {
+			log.Fatalf("invalid search-value hex: %v", err)
+		}
+	}
 
 	nodeConfig1, err := config.LoadConfig(*configDirectory1, "", false)
 	if err != nil {
@@ -64,9 +112,102 @@ func main() {
 	db1 := store.NewPebbleDB(logger, nodeConfig1.DB, uint(0))
 	defer db1.Close()
 
-	iter1, err := db1.NewIter([]byte{0x00}, []byte{0xff})
+	// Determine iteration bounds based on prefix filter
+	lowerBound := []byte{0x00}
+	upperBound := []byte{0xff}
+	if len(prefixFilter) > 0 {
+		lowerBound = prefixFilter
+		// Create upper bound by incrementing the last byte of the prefix
+		upperBound = make([]byte, len(prefixFilter))
+		copy(upperBound, prefixFilter)
+		for i := len(upperBound) - 1; i >= 0; i-- {
+			if upperBound[i] < 0xff {
+				upperBound[i]++
+				break
+			}
+			upperBound[i] = 0x00
+			if i == 0 {
+				// Prefix is all 0xff, scan to end
+				upperBound = []byte{0xff}
+			}
+		}
+	}
+
+	// Single database mode (read-only dump)
+	if *configDirectory2 == "" {
+		runSingleDBMode(db1, lowerBound, upperBound, prefixFilter, keySearchPattern, valueSearchPattern, logger)
+		return
+	}
+
+	// Comparison mode (two databases)
+	runCompareMode(db1, lowerBound, upperBound, prefixFilter, keySearchPattern, valueSearchPattern, logger)
+}
+
+func runSingleDBMode(
+	db1 *store.PebbleDB,
+	lowerBound, upperBound []byte,
+	prefixFilter, keySearchPattern, valueSearchPattern []byte,
+	logger *zap.Logger,
+) {
+	iter1, err := db1.NewIter(lowerBound, upperBound)
 	if err != nil {
 		logger.Error("failed to create iterator", zap.Error(err))
+		return
+	}
+	defer iter1.Close()
+
+	count := 0
+	matched := 0
+
+	for iter1.First(); iter1.Valid(); iter1.Next() {
+		key := iter1.Key()
+		value := iter1.Value()
+
+		// Apply prefix filter
+		if len(prefixFilter) > 0 && !bytes.HasPrefix(key, prefixFilter) {
+			continue
+		}
+
+		// Apply key search pattern
+		if len(keySearchPattern) > 0 && !bytes.Contains(key, keySearchPattern) {
+			continue
+		}
+
+		// Apply value search pattern
+		if len(valueSearchPattern) > 0 && !bytes.Contains(value, valueSearchPattern) {
+			continue
+		}
+
+		count++
+		matched++
+
+		decoded := decodeValue(key, value)
+		fmt.Printf(
+			"key: %s\nsemantic: %s\nvalue:\n%s\n\n",
+			hex.EncodeToString(key),
+			describeKey(key),
+			indent(decoded),
+		)
+
+		if *maxResults > 0 && matched >= *maxResults {
+			fmt.Printf("... (stopped after %d results, use -max to change limit)\n", *maxResults)
+			break
+		}
+	}
+
+	fmt.Printf("\nsummary: %d keys displayed from %s\n", matched, *configDirectory1)
+}
+
+func runCompareMode(
+	db1 *store.PebbleDB,
+	lowerBound, upperBound []byte,
+	prefixFilter, keySearchPattern, valueSearchPattern []byte,
+	logger *zap.Logger,
+) {
+	iter1, err := db1.NewIter(lowerBound, upperBound)
+	if err != nil {
+		logger.Error("failed to create iterator", zap.Error(err))
+		return
 	}
 	defer iter1.Close()
 
@@ -78,9 +219,10 @@ func main() {
 	db2 := store.NewPebbleDB(logger, nodeConfig2.DB, uint(0))
 	defer db2.Close()
 
-	iter2, err := db2.NewIter([]byte{0x00}, []byte{0xff})
+	iter2, err := db2.NewIter(lowerBound, upperBound)
 	if err != nil {
 		logger.Error("failed to create iterator", zap.Error(err))
+		return
 	}
 	defer iter2.Close()
 
@@ -90,7 +232,21 @@ func main() {
 	onlyDB1 := 0
 	onlyDB2 := 0
 	valueDiff := 0
+	matched := 0
 	keyPresenceMap := make(map[string]*keyPresence)
+
+	shouldInclude := func(key, value []byte) bool {
+		if len(prefixFilter) > 0 && !bytes.HasPrefix(key, prefixFilter) {
+			return false
+		}
+		if len(keySearchPattern) > 0 && !bytes.Contains(key, keySearchPattern) {
+			return false
+		}
+		if len(valueSearchPattern) > 0 && !bytes.Contains(value, valueSearchPattern) {
+			return false
+		}
+		return true
+	}
 
 	for iter1Valid || iter2Valid {
 		var key1, key2 []byte
@@ -114,34 +270,86 @@ func main() {
 		case iter1Valid && iter2Valid:
 			comparison := bytes.Compare(key1, key2)
 			if comparison == 0 {
-				if bytes.Equal(value1, value2) {
-					fmt.Printf(
-						"key: %s\nsemantic: %s\nvalues identical in %s and %s\nvalue:\n%s\n\n",
-						shortHex(key1),
-						describeKey(key1),
-						*configDirectory1,
-						*configDirectory2,
-						indent(decoded1),
-					)
-				} else {
-					valueDiff++
-					fmt.Printf(
-						"key: %s\nsemantic: %s\nvalue (%s):\n%s\nvalue (%s):\n%s\n",
-						shortHex(key1),
-						describeKey(key1),
-						*configDirectory1,
-						indent(decoded1),
-						*configDirectory2,
-						indent(decoded2),
-					)
-					if diff := diffStrings(decoded1, decoded2); diff != "" {
-						fmt.Printf("diff:\n%s\n", indent(diff))
+				if shouldInclude(key1, value1) || shouldInclude(key2, value2) {
+					matched++
+					if *maxResults > 0 && matched > *maxResults {
+						fmt.Printf("... (stopped after %d results)\n", *maxResults)
+						goto done
 					}
-					fmt.Printf("\n")
+
+					if bytes.Equal(value1, value2) {
+						fmt.Printf(
+							"key: %s\nsemantic: %s\nvalues identical in %s and %s\nvalue:\n%s\n\n",
+							shortHex(key1),
+							describeKey(key1),
+							*configDirectory1,
+							*configDirectory2,
+							indent(decoded1),
+						)
+					} else {
+						valueDiff++
+						fmt.Printf(
+							"key: %s\nsemantic: %s\nvalue (%s):\n%s\nvalue (%s):\n%s\n",
+							shortHex(key1),
+							describeKey(key1),
+							*configDirectory1,
+							indent(decoded1),
+							*configDirectory2,
+							indent(decoded2),
+						)
+						if diff := diffStrings(decoded1, decoded2); diff != "" {
+							fmt.Printf("diff:\n%s\n", indent(diff))
+						}
+						fmt.Printf("\n")
+					}
 				}
 				iter1Valid = iter1.Next()
 				iter2Valid = iter2.Next()
 			} else if comparison < 0 {
+				if shouldInclude(key1, value1) {
+					matched++
+					if *maxResults > 0 && matched > *maxResults {
+						fmt.Printf("... (stopped after %d results)\n", *maxResults)
+						goto done
+					}
+
+					onlyDB1++
+					fmt.Printf(
+						"key only in %s: %s\nsemantic: %s\nvalue:\n%s\n\n",
+						*configDirectory1,
+						shortHex(key1),
+						describeKey(key1),
+						indent(decoded1),
+					)
+				}
+				iter1Valid = iter1.Next()
+			} else {
+				if shouldInclude(key2, value2) {
+					matched++
+					if *maxResults > 0 && matched > *maxResults {
+						fmt.Printf("... (stopped after %d results)\n", *maxResults)
+						goto done
+					}
+
+					onlyDB2++
+					fmt.Printf(
+						"key only in %s: %s\nsemantic: %s\nvalue:\n%s\n\n",
+						*configDirectory2,
+						shortHex(key2),
+						describeKey(key2),
+						indent(decoded2),
+					)
+				}
+				iter2Valid = iter2.Next()
+			}
+		case iter1Valid:
+			if shouldInclude(key1, value1) {
+				matched++
+				if *maxResults > 0 && matched > *maxResults {
+					fmt.Printf("... (stopped after %d results)\n", *maxResults)
+					goto done
+				}
+
 				onlyDB1++
 				fmt.Printf(
 					"key only in %s: %s\nsemantic: %s\nvalue:\n%s\n\n",
@@ -150,8 +358,16 @@ func main() {
 					describeKey(key1),
 					indent(decoded1),
 				)
-				iter1Valid = iter1.Next()
-			} else {
+			}
+			iter1Valid = iter1.Next()
+		case iter2Valid:
+			if shouldInclude(key2, value2) {
+				matched++
+				if *maxResults > 0 && matched > *maxResults {
+					fmt.Printf("... (stopped after %d results)\n", *maxResults)
+					goto done
+				}
+
 				onlyDB2++
 				fmt.Printf(
 					"key only in %s: %s\nsemantic: %s\nvalue:\n%s\n\n",
@@ -160,31 +376,12 @@ func main() {
 					describeKey(key2),
 					indent(decoded2),
 				)
-				iter2Valid = iter2.Next()
 			}
-		case iter1Valid:
-			onlyDB1++
-			fmt.Printf(
-				"key only in %s: %s\nsemantic: %s\nvalue:\n%s\n\n",
-				*configDirectory1,
-				shortHex(key1),
-				describeKey(key1),
-				indent(decoded1),
-			)
-			iter1Valid = iter1.Next()
-		case iter2Valid:
-			onlyDB2++
-			fmt.Printf(
-				"key only in %s: %s\nsemantic: %s\nvalue:\n%s\n\n",
-				*configDirectory2,
-				shortHex(key2),
-				describeKey(key2),
-				indent(decoded2),
-			)
 			iter2Valid = iter2.Next()
 		}
 	}
 
+done:
 	fmt.Printf(
 		"summary: %d keys only in %s, %d keys only in %s, %d keys with differing values\n",
 		onlyDB1,
@@ -687,7 +884,7 @@ func decodeHypergraphValue(key []byte, value []byte) string {
 
 	switch sub {
 	case store.VERTEX_DATA:
-		return summarizeVectorCommitmentTree(value)
+		return summarizeVectorCommitmentTree(key, value)
 	case store.VERTEX_TOMBSTONE:
 		return shortHex(value)
 	case store.VERTEX_ADDS_TREE_NODE,
@@ -765,8 +962,11 @@ func decodeHypergraphProto(value []byte) (string, bool) {
 	return output, matched
 }
 
-func summarizeVectorCommitmentTree(value []byte) string {
-	_, err := tries.DeserializeNonLazyTree(value)
+// Global intrinsic address (32 bytes of 0xff)
+var globalIntrinsicAddress = bytes.Repeat([]byte{0xff}, 32)
+
+func summarizeVectorCommitmentTree(key []byte, value []byte) string {
+	tree, err := tries.DeserializeNonLazyTree(value)
 	if err != nil {
 		return fmt.Sprintf(
 			"vector_commitment_tree decode_error=%v raw=%s",
@@ -780,12 +980,212 @@ func summarizeVectorCommitmentTree(value []byte) string {
 		"size_bytes": len(value),
 		"sha256":     shortHex(sum[:]),
 	}
+
+	// Check if this is a global intrinsic vertex (domain = 0xff*32)
+	// Key structure for vertex data: {0x09, 0xF0, domain[32], address[32]}
+	if len(key) >= 66 {
+		domain := key[2:34]
+		address := key[34:66]
+
+		if bytes.Equal(domain, globalIntrinsicAddress) {
+			// This is a global intrinsic vertex - decode the fields
+			globalData := decodeGlobalIntrinsicVertex(tree, address)
+			if globalData != nil {
+				for k, v := range globalData {
+					summary[k] = v
+				}
+			}
+		}
+	}
+
 	jsonBytes, err := json.MarshalIndent(summary, "", "  ")
 	if err != nil {
 		return fmt.Sprintf("vector_commitment_tree size_bytes=%d", len(value))
 	}
 
 	return string(jsonBytes)
+}
+
+// decodeGlobalIntrinsicVertex attempts to decode the vertex as a global intrinsic type
+// (prover, allocation, or reward)
+func decodeGlobalIntrinsicVertex(tree *tries.VectorCommitmentTree, address []byte) map[string]any {
+	result := make(map[string]any)
+	result["vertex_address"] = hex.EncodeToString(address)
+
+	// Try to detect the type by examining which fields exist
+	// Prover has PublicKey at order 0 (key 0x00) with size 585
+	// Allocation has Prover reference at order 0 (key 0x00)
+	// Reward has DelegateAddress at order 0 (key 0x00) with size 32
+
+	// Check order 0 field
+	order0Value, err := tree.Get([]byte{0x00})
+	if err != nil || len(order0Value) == 0 {
+		result["type"] = "unknown (no order 0 field)"
+		return result
+	}
+
+	switch len(order0Value) {
+	case 585:
+		// Prover: PublicKey is 585 bytes
+		result["type"] = "prover:Prover"
+		result["public_key"] = shortHex(order0Value)
+		decodeProverFields(tree, result)
+	case 32:
+		// Could be Allocation (Prover reference) or Reward (DelegateAddress)
+		// Check for allocation-specific fields
+		confirmFilter, _ := tree.Get([]byte{0x08}) // order 2
+		if len(confirmFilter) > 0 || len(confirmFilter) == 0 {
+			// Check if JoinFrameNumber exists (order 4, key 0x10)
+			joinFrame, _ := tree.Get([]byte{0x10})
+			if len(joinFrame) == 8 {
+				result["type"] = "allocation:ProverAllocation"
+				result["prover_reference"] = hex.EncodeToString(order0Value)
+				decodeAllocationFields(tree, result)
+			} else {
+				// Likely a reward vertex
+				result["type"] = "reward:ProverReward"
+				result["delegate_address"] = hex.EncodeToString(order0Value)
+				decodeRewardFields(tree, result)
+			}
+		}
+	default:
+		result["type"] = "unknown"
+		result["order_0_size"] = len(order0Value)
+	}
+
+	return result
+}
+
+func decodeProverFields(tree *tries.VectorCommitmentTree, result map[string]any) {
+	// Prover schema:
+	// order 0: PublicKey (585 bytes) - already decoded
+	// order 1: Status (1 byte) - key 0x04
+	// order 2: AvailableStorage (8 bytes) - key 0x08
+	// order 3: Seniority (8 bytes) - key 0x0c
+	// order 4: KickFrameNumber (8 bytes) - key 0x10
+
+	if status, err := tree.Get([]byte{0x04}); err == nil && len(status) == 1 {
+		result["status"] = decodeProverStatus(status[0])
+		result["status_raw"] = status[0]
+	}
+
+	if storage, err := tree.Get([]byte{0x08}); err == nil && len(storage) == 8 {
+		result["available_storage"] = binary.BigEndian.Uint64(storage)
+	}
+
+	if seniority, err := tree.Get([]byte{0x0c}); err == nil && len(seniority) == 8 {
+		result["seniority"] = binary.BigEndian.Uint64(seniority)
+	}
+
+	if kickFrame, err := tree.Get([]byte{0x10}); err == nil && len(kickFrame) == 8 {
+		result["kick_frame_number"] = binary.BigEndian.Uint64(kickFrame)
+	}
+}
+
+func decodeAllocationFields(tree *tries.VectorCommitmentTree, result map[string]any) {
+	// Allocation schema:
+	// order 0: Prover (32 bytes) - already decoded
+	// order 1: Status (1 byte) - key 0x04
+	// order 2: ConfirmationFilter (up to 64 bytes) - key 0x08
+	// order 3: RejectionFilter (up to 64 bytes) - key 0x0c
+	// order 4: JoinFrameNumber (8 bytes) - key 0x10
+	// order 5: LeaveFrameNumber (8 bytes) - key 0x14
+	// order 6: PauseFrameNumber (8 bytes) - key 0x18
+	// order 7: ResumeFrameNumber (8 bytes) - key 0x1c
+	// order 8: KickFrameNumber (8 bytes) - key 0x20
+	// order 9: JoinConfirmFrameNumber (8 bytes) - key 0x24
+	// order 10: JoinRejectFrameNumber (8 bytes) - key 0x28
+	// order 11: LeaveConfirmFrameNumber (8 bytes) - key 0x2c
+	// order 12: LeaveRejectFrameNumber (8 bytes) - key 0x30
+	// order 13: LastActiveFrameNumber (8 bytes) - key 0x34
+
+	if status, err := tree.Get([]byte{0x04}); err == nil && len(status) == 1 {
+		result["status"] = decodeAllocationStatus(status[0])
+		result["status_raw"] = status[0]
+	}
+
+	if confirmFilter, err := tree.Get([]byte{0x08}); err == nil && len(confirmFilter) > 0 {
+		result["confirmation_filter"] = hex.EncodeToString(confirmFilter)
+		if bytes.Equal(confirmFilter, make([]byte, len(confirmFilter))) {
+			result["is_global_prover"] = true
+		}
+	} else {
+		result["is_global_prover"] = true
+	}
+
+	if rejFilter, err := tree.Get([]byte{0x0c}); err == nil && len(rejFilter) > 0 {
+		result["rejection_filter"] = hex.EncodeToString(rejFilter)
+	}
+
+	if joinFrame, err := tree.Get([]byte{0x10}); err == nil && len(joinFrame) == 8 {
+		result["join_frame_number"] = binary.BigEndian.Uint64(joinFrame)
+	}
+
+	if leaveFrame, err := tree.Get([]byte{0x14}); err == nil && len(leaveFrame) == 8 {
+		result["leave_frame_number"] = binary.BigEndian.Uint64(leaveFrame)
+	}
+
+	if pauseFrame, err := tree.Get([]byte{0x18}); err == nil && len(pauseFrame) == 8 {
+		result["pause_frame_number"] = binary.BigEndian.Uint64(pauseFrame)
+	}
+
+	if resumeFrame, err := tree.Get([]byte{0x1c}); err == nil && len(resumeFrame) == 8 {
+		result["resume_frame_number"] = binary.BigEndian.Uint64(resumeFrame)
+	}
+
+	if kickFrame, err := tree.Get([]byte{0x20}); err == nil && len(kickFrame) == 8 {
+		result["kick_frame_number"] = binary.BigEndian.Uint64(kickFrame)
+	}
+
+	if joinConfirm, err := tree.Get([]byte{0x24}); err == nil && len(joinConfirm) == 8 {
+		result["join_confirm_frame_number"] = binary.BigEndian.Uint64(joinConfirm)
+	}
+
+	if joinReject, err := tree.Get([]byte{0x28}); err == nil && len(joinReject) == 8 {
+		result["join_reject_frame_number"] = binary.BigEndian.Uint64(joinReject)
+	}
+
+	if leaveConfirm, err := tree.Get([]byte{0x2c}); err == nil && len(leaveConfirm) == 8 {
+		result["leave_confirm_frame_number"] = binary.BigEndian.Uint64(leaveConfirm)
+	}
+
+	if leaveReject, err := tree.Get([]byte{0x30}); err == nil && len(leaveReject) == 8 {
+		result["leave_reject_frame_number"] = binary.BigEndian.Uint64(leaveReject)
+	}
+
+	if lastActive, err := tree.Get([]byte{0x34}); err == nil && len(lastActive) == 8 {
+		result["last_active_frame_number"] = binary.BigEndian.Uint64(lastActive)
+	}
+}
+
+func decodeRewardFields(tree *tries.VectorCommitmentTree, result map[string]any) {
+	// Reward schema - just has DelegateAddress at order 0
+	// Nothing else to decode for now
+}
+
+func decodeProverStatus(status byte) string {
+	// Prover status mapping (internal byte -> name)
+	switch status {
+	case 0:
+		return "Joining"
+	case 1:
+		return "Active"
+	case 2:
+		return "Paused"
+	case 3:
+		return "Leaving"
+	case 4:
+		return "Rejected"
+	case 5:
+		return "Kicked"
+	default:
+		return fmt.Sprintf("Unknown(%d)", status)
+	}
+}
+
+func decodeAllocationStatus(status byte) string {
+	// Allocation status mapping (same as prover status)
+	return decodeProverStatus(status)
 }
 
 func summarizeHypergraphTreeNode(value []byte) string {

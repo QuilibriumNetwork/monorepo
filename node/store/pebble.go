@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -16,6 +17,7 @@ import (
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 type PebbleDB struct {
@@ -55,6 +57,11 @@ var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_153,
 	migration_2_1_0_154,
 	migration_2_1_0_155,
+	migration_2_1_0_156,
+	migration_2_1_0_157,
+	migration_2_1_0_158,
+	migration_2_1_0_159,
+	migration_2_1_0_17,
 }
 
 func NewPebbleDB(
@@ -342,8 +349,8 @@ func (p *PebbleDB) NewIter(lowerBound []byte, upperBound []byte) (
 	error,
 ) {
 	return p.db.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound, // buildutils:allow-slice-alias slice is static
-		UpperBound: upperBound, // buildutils:allow-slice-alias slice is static
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
 	})
 }
 
@@ -415,8 +422,8 @@ func (t *PebbleTransaction) NewIter(lowerBound []byte, upperBound []byte) (
 	error,
 ) {
 	return t.b.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound, // buildutils:allow-slice-alias slice is static
-		UpperBound: upperBound, // buildutils:allow-slice-alias slice is static
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
 	})
 }
 
@@ -437,7 +444,7 @@ func rightAlign(data []byte, size int) []byte {
 	l := len(data)
 
 	if l == size {
-		return data // buildutils:allow-slice-alias slice is static
+		return data
 	}
 
 	if l > size {
@@ -651,6 +658,103 @@ func migration_2_1_0_155(b *pebble.Batch) error {
 	return migration_2_1_0_15(b)
 }
 
+func migration_2_1_0_156(b *pebble.Batch) error {
+	return migration_2_1_0_15(b)
+}
+
+func migration_2_1_0_157(b *pebble.Batch) error {
+	return migration_2_1_0_15(b)
+}
+
+func migration_2_1_0_158(b *pebble.Batch) error {
+	return migration_2_1_0_15(b)
+}
+
+func migration_2_1_0_159(b *pebble.Batch) error {
+	return migration_2_1_0_15(b)
+}
+
+func migration_2_1_0_17(b *pebble.Batch) error {
+	// Global shard key: L1={0,0,0}, L2=0xff*32
+	globalShardKey := tries.ShardKey{
+		L1: [3]byte{},
+		L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
+	}
+	// Next shard key (for exclusive upper bound): L1={0,0,1}, L2=0x00*32
+	nextShardKey := tries.ShardKey{
+		L1: [3]byte{0, 0, 1},
+		L2: [32]byte{},
+	}
+
+	// Delete vertex data for global domain
+	// Vertex data keys: {0x09, 0xF0, domain[32], address[32]}
+	// Start: {0x09, 0xF0, 0xff*32} (prefix for global domain)
+	// End: {0x09, 0xF1} (next prefix type, ensures we capture all addresses)
+	if err := b.DeleteRange(
+		hypergraphVertexDataKey(globalShardKey.L2[:]),
+		[]byte{HYPERGRAPH_SHARD, VERTEX_DATA + 1},
+		&pebble.WriteOptions{},
+	); err != nil {
+		return err
+	}
+
+	// Delete vertex adds tree nodes
+	if err := b.DeleteRange(
+		hypergraphVertexAddsTreeNodeKey(globalShardKey, []byte{}),
+		hypergraphVertexAddsTreeNodeKey(nextShardKey, []byte{}),
+		&pebble.WriteOptions{},
+	); err != nil {
+		return err
+	}
+
+	// Delete vertex adds tree nodes by path
+	if err := b.DeleteRange(
+		hypergraphVertexAddsTreeNodeByPathKey(globalShardKey, []int{}),
+		hypergraphVertexAddsTreeNodeByPathKey(nextShardKey, []int{}),
+		&pebble.WriteOptions{},
+	); err != nil {
+		return err
+	}
+
+	// Delete hyperedge adds tree nodes
+	if err := b.DeleteRange(
+		hypergraphHyperedgeAddsTreeNodeKey(globalShardKey, []byte{}),
+		hypergraphHyperedgeAddsTreeNodeKey(nextShardKey, []byte{}),
+		&pebble.WriteOptions{},
+	); err != nil {
+		return err
+	}
+
+	// Delete hyperedge adds tree nodes by path
+	if err := b.DeleteRange(
+		hypergraphHyperedgeAddsTreeNodeByPathKey(globalShardKey, []int{}),
+		hypergraphHyperedgeAddsTreeNodeByPathKey(nextShardKey, []int{}),
+		&pebble.WriteOptions{},
+	); err != nil {
+		return err
+	}
+
+	// Delete vertex adds tree root
+	if err := b.DeleteRange(
+		hypergraphVertexAddsTreeRootKey(globalShardKey),
+		hypergraphVertexAddsTreeRootKey(nextShardKey),
+		&pebble.WriteOptions{},
+	); err != nil {
+		return err
+	}
+
+	// Delete hyperedge adds tree root
+	if err := b.DeleteRange(
+		hypergraphHyperedgeAddsTreeRootKey(globalShardKey),
+		hypergraphHyperedgeAddsTreeRootKey(nextShardKey),
+		&pebble.WriteOptions{},
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 type pebbleSnapshotDB struct {
 	snap *pebble.Snapshot
 }
@@ -676,8 +780,8 @@ func (p *pebbleSnapshotDB) NewIter(lowerBound []byte, upperBound []byte) (
 	error,
 ) {
 	return p.snap.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound, // buildutils:allow-slice-alias slice is static
-		UpperBound: upperBound, // buildutils:allow-slice-alias slice is static
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
 	})
 }
 
