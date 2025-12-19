@@ -57,7 +57,7 @@ FROM base AS emp-builder
 
 WORKDIR /opt/ceremonyclient
 # Copy the necessary script and source directories
-COPY install_emp.sh .
+COPY install-emp.sh .
 COPY emp-tool emp-tool
 COPY emp-ot emp-ot
 
