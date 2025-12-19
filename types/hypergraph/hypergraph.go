@@ -194,6 +194,42 @@ type Hypergraph interface {
 		frameNumber uint64,
 	) error
 
+	// Hard delete operations - these bypass CRDT semantics for pruning
+
+	// DeleteVertexAdd performs a hard delete of a vertex from the VertexAdds
+	// set. Unlike RemoveVertex (which adds to VertexRemoves for CRDT semantics),
+	// this actually removes the entry from VertexAdds and deletes the associated
+	// vertex data. This is used for pruning stale/orphaned data.
+	DeleteVertexAdd(
+		txn tries.TreeBackingStoreTransaction,
+		shardKey tries.ShardKey,
+		vertexID [64]byte,
+	) error
+
+	// DeleteVertexRemove performs a hard delete of a vertex from the
+	// VertexRemoves set. This is used for pruning stale data.
+	DeleteVertexRemove(
+		txn tries.TreeBackingStoreTransaction,
+		shardKey tries.ShardKey,
+		vertexID [64]byte,
+	) error
+
+	// DeleteHyperedgeAdd performs a hard delete of a hyperedge from the
+	// HyperedgeAdds set. This is used for pruning stale/orphaned data.
+	DeleteHyperedgeAdd(
+		txn tries.TreeBackingStoreTransaction,
+		shardKey tries.ShardKey,
+		hyperedgeID [64]byte,
+	) error
+
+	// DeleteHyperedgeRemove performs a hard delete of a hyperedge from the
+	// HyperedgeRemoves set. This is used for pruning stale data.
+	DeleteHyperedgeRemove(
+		txn tries.TreeBackingStoreTransaction,
+		shardKey tries.ShardKey,
+		hyperedgeID [64]byte,
+	) error
+
 	// Hyperedge data operations
 
 	// GetHyperedgeExtrinsics retrieves the extrinsic tree of a hyperedge, which

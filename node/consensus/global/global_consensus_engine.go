@@ -37,6 +37,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/consensus/validator"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/verification"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/aggregator"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
@@ -199,6 +200,7 @@ type GlobalConsensusEngine struct {
 	appFrameStore             map[string]*protobufs.AppShardFrame
 	appFrameStoreMu           sync.RWMutex
 	lowCoverageStreak         map[string]*coverageStreak
+	proverOnlyMode            atomic.Bool
 	peerInfoDigestCache       map[string]struct{}
 	peerInfoDigestCacheMu     sync.Mutex
 	keyRegistryDigestCache    map[string]struct{}
@@ -595,6 +597,42 @@ func NewGlobalConsensusEngine(
 		if err != nil {
 			establishGenesis()
 		} else {
+			adds := engine.hypergraph.(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(
+				tries.ShardKey{
+					L1: [3]byte{},
+					L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
+				},
+			)
+
+			if lc, _ := adds.GetTree().GetMetadata(); lc == 0 {
+				if config.P2P.Network == 0 {
+					genesisData := engine.getMainnetGenesisJSON()
+					if genesisData == nil {
+						panic("no genesis data")
+					}
+
+					state := hgstate.NewHypergraphState(engine.hypergraph)
+
+					err = engine.establishMainnetGenesisProvers(state, genesisData)
+					if err != nil {
+						engine.logger.Error("failed to establish provers", zap.Error(err))
+						panic(err)
+					}
+
+					err = state.Commit()
+					if err != nil {
+						engine.logger.Error("failed to commit", zap.Error(err))
+						panic(err)
+					}
+				} else {
+					engine.establishTestnetGenesisProvers()
+				}
+
+				err := engine.proverRegistry.Refresh()
+				if err != nil {
+					panic(err)
+				}
+			}
 			if latest.LatestTimeout != nil {
 				logger.Info(
 					"obtained latest consensus state",

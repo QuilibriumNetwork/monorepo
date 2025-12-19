@@ -155,6 +155,10 @@ type AppConsensusEngine struct {
 	globalProverRootSynced        atomic.Bool
 	globalProverSyncInProgress    atomic.Bool
 
+	// Genesis initialization
+	genesisInitialized atomic.Bool
+	genesisInitChan    chan *protobufs.GlobalFrame
+
 	// Message queues
 	consensusMessageQueue      chan *pb.Message
 	proverMessageQueue         chan *pb.Message
@@ -294,6 +298,7 @@ func NewAppConsensusEngine(
 		peerAuthCache:              make(map[string]time.Time),
 		peerInfoDigestCache:        make(map[string]struct{}),
 		keyRegistryDigestCache:     make(map[string]struct{}),
+		genesisInitChan:            make(chan *protobufs.GlobalFrame, 1),
 	}
 
 	engine.frameChainChecker = NewAppFrameChainChecker(clockStore, logger, appAddress)
@@ -504,7 +509,10 @@ func NewAppConsensusEngine(
 		*protobufs.AppShardFrame,
 		*protobufs.ProposalVote,
 	]
-	initializeCertifiedGenesis := func() {
+
+	// Check if we need to await network data for genesis initialization
+	needsNetworkGenesis := false
+	initializeCertifiedGenesis := func(markInitialized bool) {
 		frame, qc := engine.initializeGenesis()
 		state = &models.CertifiedState[*protobufs.AppShardFrame]{
 			State: &models.State[*protobufs.AppShardFrame]{
@@ -515,17 +523,72 @@ func NewAppConsensusEngine(
 			CertifyingQuorumCertificate: qc,
 		}
 		pending = nil
+		if markInitialized {
+			engine.genesisInitialized.Store(true)
+		}
+	}
+
+	initializeCertifiedGenesisFromNetwork := func(
+		difficulty uint32,
+		shardInfo []*protobufs.AppShardInfo,
+	) {
+		// Delete the temporary genesis frame first
+		if err := engine.clockStore.DeleteShardClockFrameRange(
+			engine.appAddress, 0, 1,
+		); err != nil {
+			logger.Debug(
+				"could not delete temporary genesis frame",
+				zap.Error(err),
+			)
+		}
+
+		frame, qc := engine.initializeGenesisWithParams(difficulty, shardInfo)
+		state = &models.CertifiedState[*protobufs.AppShardFrame]{
+			State: &models.State[*protobufs.AppShardFrame]{
+				Rank:       0,
+				Identifier: frame.Identity(),
+				State:      &frame,
+			},
+			CertifyingQuorumCertificate: qc,
+		}
+		pending = nil
+		engine.genesisInitialized.Store(true)
+
+		logger.Info(
+			"initialized genesis with network data",
+			zap.Uint32("difficulty", difficulty),
+			zap.Int("shard_info_count", len(shardInfo)),
+		)
 	}
 
 	if err != nil {
-		initializeCertifiedGenesis()
+		// No consensus state exists - check if we have a genesis frame already
+		_, _, genesisErr := engine.clockStore.GetShardClockFrame(
+			engine.appAddress,
+			0,
+			false,
+		)
+		if genesisErr != nil && errors.Is(genesisErr, store.ErrNotFound) {
+			// No genesis exists - we need to await network data
+			needsNetworkGenesis = true
+			logger.Warn(
+				"app genesis missing - will await network data",
+				zap.String("shard_address", hex.EncodeToString(appAddress)),
+			)
+			// Initialize with default values for now
+			// This will be re-done after receiving network data
+			// Pass false to NOT mark as initialized - we're waiting for network data
+			initializeCertifiedGenesis(false)
+		} else {
+			initializeCertifiedGenesis(true)
+		}
 	} else {
 		qc, err := engine.clockStore.GetQuorumCertificate(
 			engine.appAddress,
 			latest.FinalizedRank,
 		)
 		if err != nil || qc.GetFrameNumber() == 0 {
-			initializeCertifiedGenesis()
+			initializeCertifiedGenesis(true)
 		} else {
 			frame, _, err := engine.clockStore.GetShardClockFrame(
 				engine.appAddress,
@@ -535,8 +598,10 @@ func NewAppConsensusEngine(
 			if err != nil {
 				panic(err)
 			}
-			parentFrame, err := engine.clockStore.GetGlobalClockFrame(
-				qc.GetFrameNumber() - 1,
+			parentFrame, _, err := engine.clockStore.GetShardClockFrame(
+				engine.appAddress,
+				qc.GetFrameNumber()-1,
+				false,
 			)
 			if err != nil {
 				panic(err)
@@ -656,6 +721,48 @@ func NewAppConsensusEngine(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
+		// If we need network genesis, await it before starting consensus
+		if needsNetworkGenesis {
+			engine.logger.Info(
+				"awaiting network data for genesis initialization",
+				zap.String("shard_address", engine.appAddressHex),
+			)
+
+			// Wait for a global frame from pubsub
+			globalFrame, err := engine.awaitFirstGlobalFrame(ctx)
+			if err != nil {
+				engine.logger.Error(
+					"failed to await global frame for genesis",
+					zap.Error(err),
+				)
+				ctx.Throw(err)
+				return
+			}
+
+			// Fetch shard info from bootstrap peers
+			shardInfo, err := engine.fetchShardInfoFromBootstrap(ctx)
+			if err != nil {
+				engine.logger.Warn(
+					"failed to fetch shard info from bootstrap peers",
+					zap.Error(err),
+				)
+				// Continue anyway - we at least have the global frame
+			}
+
+			engine.logger.Info(
+				"received network genesis data",
+				zap.Uint64("global_frame_number", globalFrame.Header.FrameNumber),
+				zap.Uint32("difficulty", globalFrame.Header.Difficulty),
+				zap.Int("shard_info_count", len(shardInfo)),
+			)
+
+			// Re-initialize genesis with the correct network data
+			initializeCertifiedGenesisFromNetwork(
+				globalFrame.Header.Difficulty,
+				shardInfo,
+			)
+		}
+
 		if err := engine.waitForProverRegistration(ctx); err != nil {
 			engine.logger.Error("prover unavailable", zap.Error(err))
 			ctx.Throw(err)
@@ -1402,15 +1509,30 @@ func (e *AppConsensusEngine) initializeGenesis() (
 	*protobufs.AppShardFrame,
 	*protobufs.QuorumCertificate,
 ) {
+	return e.initializeGenesisWithParams(e.config.Engine.Difficulty, nil)
+}
+
+func (e *AppConsensusEngine) initializeGenesisWithParams(
+	difficulty uint32,
+	shardInfo []*protobufs.AppShardInfo,
+) (
+	*protobufs.AppShardFrame,
+	*protobufs.QuorumCertificate,
+) {
 	// Initialize state roots for hypergraph
 	stateRoots := make([][]byte, 4)
 	for i := range stateRoots {
 		stateRoots[i] = make([]byte, 64)
 	}
 
+	// Use provided difficulty or fall back to config
+	if difficulty == 0 {
+		difficulty = e.config.Engine.Difficulty
+	}
+
 	genesisHeader, err := e.frameProver.ProveFrameHeaderGenesis(
 		e.appAddress,
-		80000,
+		difficulty,
 		make([]byte, 516),
 		100,
 	)
@@ -1558,6 +1680,127 @@ func (e *AppConsensusEngine) ensureAppGenesis() error {
 	)
 	_, _ = e.initializeGenesis()
 	return nil
+}
+
+// fetchShardInfoFromBootstrap connects to bootstrap peers and fetches shard info
+// for this app's address using the GetAppShards RPC.
+func (e *AppConsensusEngine) fetchShardInfoFromBootstrap(
+	ctx context.Context,
+) ([]*protobufs.AppShardInfo, error) {
+	bootstrapPeers := e.config.P2P.BootstrapPeers
+	if len(bootstrapPeers) == 0 {
+		return nil, errors.New("no bootstrap peers configured")
+	}
+
+	for _, peerAddr := range bootstrapPeers {
+		shardInfo, err := e.tryFetchShardInfoFromPeer(ctx, peerAddr)
+		if err != nil {
+			e.logger.Debug(
+				"failed to fetch shard info from peer",
+				zap.String("peer", peerAddr),
+				zap.Error(err),
+			)
+			continue
+		}
+		if len(shardInfo) > 0 {
+			e.logger.Info(
+				"fetched shard info from bootstrap peer",
+				zap.String("peer", peerAddr),
+				zap.Int("shard_count", len(shardInfo)),
+			)
+			return shardInfo, nil
+		}
+	}
+
+	return nil, errors.New("failed to fetch shard info from any bootstrap peer")
+}
+
+func (e *AppConsensusEngine) tryFetchShardInfoFromPeer(
+	ctx context.Context,
+	peerAddr string,
+) ([]*protobufs.AppShardInfo, error) {
+	// Parse multiaddr to extract peer ID and address
+	ma, err := multiaddr.StringCast(peerAddr)
+	if err != nil {
+		return nil, errors.Wrap(err, "parse multiaddr")
+	}
+
+	// Extract peer ID from the multiaddr
+	peerIDStr, err := ma.ValueForProtocol(multiaddr.P_P2P)
+	if err != nil {
+		return nil, errors.Wrap(err, "extract peer id")
+	}
+
+	peerID, err := peer.Decode(peerIDStr)
+	if err != nil {
+		return nil, errors.Wrap(err, "decode peer id")
+	}
+
+	// Create gRPC connection to the peer
+	mga, err := mn.ToNetAddr(ma)
+	if err != nil {
+		return nil, errors.Wrap(err, "convert multiaddr")
+	}
+
+	creds, err := p2p.NewPeerAuthenticator(
+		e.logger,
+		e.config.P2P,
+		nil,
+		nil,
+		nil,
+		nil,
+		[][]byte{[]byte(peerID)},
+		map[string]channel.AllowedPeerPolicyType{},
+		map[string]channel.AllowedPeerPolicyType{},
+	).CreateClientTLSCredentials([]byte(peerID))
+	if err != nil {
+		return nil, errors.Wrap(err, "create credentials")
+	}
+
+	conn, err := grpc.NewClient(
+		mga.String(),
+		grpc.WithTransportCredentials(creds),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "dial peer")
+	}
+	defer conn.Close()
+
+	client := protobufs.NewGlobalServiceClient(conn)
+
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	resp, err := client.GetAppShards(reqCtx, &protobufs.GetAppShardsRequest{
+		ShardKey: e.appAddress,
+		Prefix:   []uint32{},
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "get app shards")
+	}
+
+	return resp.GetInfo(), nil
+}
+
+// awaitFirstGlobalFrame waits for a global frame to arrive via pubsub and
+// returns it. This is used during genesis initialization to get the correct
+// difficulty from the network.
+func (e *AppConsensusEngine) awaitFirstGlobalFrame(
+	ctx context.Context,
+) (*protobufs.GlobalFrame, error) {
+	e.logger.Info("awaiting first global frame from network for genesis initialization")
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case frame := <-e.genesisInitChan:
+		e.logger.Info(
+			"received global frame for genesis initialization",
+			zap.Uint64("frame_number", frame.Header.FrameNumber),
+			zap.Uint32("difficulty", frame.Header.Difficulty),
+		)
+		return frame, nil
+	}
 }
 
 func (e *AppConsensusEngine) waitForProverRegistration(

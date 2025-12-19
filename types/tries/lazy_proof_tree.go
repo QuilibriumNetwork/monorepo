@@ -569,6 +569,10 @@ type TreeBackingStore interface {
 		shardKey ShardKey,
 		leaf *RawLeafData,
 	) error
+	DeleteVertexTree(
+		txn TreeBackingStoreTransaction,
+		id []byte,
+	) error
 }
 
 // LazyVectorCommitmentTree is a lazy-loaded (from a TreeBackingStore based

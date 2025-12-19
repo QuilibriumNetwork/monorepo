@@ -762,3 +762,105 @@ func boolToString(b bool) string {
 	}
 	return "false"
 }
+
+// DeleteVertexAdd performs a hard delete of a vertex from the VertexAdds set.
+// Unlike RemoveVertex (which adds to VertexRemoves for CRDT semantics), this
+// actually removes the entry from VertexAdds and deletes the associated vertex
+// data. This is used for pruning stale/orphaned data that should not be synced.
+//
+// The caller must provide a transaction for atomic deletion of both the tree
+// entry and the vertex data.
+func (hg *HypergraphCRDT) DeleteVertexAdd(
+	txn tries.TreeBackingStoreTransaction,
+	shardKey tries.ShardKey,
+	vertexID [64]byte,
+) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
+	set := hg.getVertexAddsSet(shardKey)
+	tree := set.GetTree()
+
+	// Delete from the tree (removes tree node and path index)
+	if err := tree.Delete(txn, vertexID[:]); err != nil {
+		return errors.Wrap(err, "delete vertex add: tree delete")
+	}
+
+	// Delete the vertex data
+	if err := tree.Store.DeleteVertexTree(txn, vertexID[:]); err != nil {
+		// Log but don't fail - vertex data may already be gone
+		hg.logger.Debug(
+			"delete vertex add: vertex data not found",
+			zap.String("vertex_id", string(vertexID[:])),
+			zap.Error(err),
+		)
+	}
+
+	return nil
+}
+
+// DeleteVertexRemove performs a hard delete of a vertex from the VertexRemoves
+// set. This removes the entry from VertexRemoves, effectively "un-removing" the
+// vertex if it still exists in VertexAdds. This is used for pruning stale data.
+func (hg *HypergraphCRDT) DeleteVertexRemove(
+	txn tries.TreeBackingStoreTransaction,
+	shardKey tries.ShardKey,
+	vertexID [64]byte,
+) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
+	set := hg.getVertexRemovesSet(shardKey)
+	tree := set.GetTree()
+
+	// Delete from the tree
+	if err := tree.Delete(txn, vertexID[:]); err != nil {
+		return errors.Wrap(err, "delete vertex remove: tree delete")
+	}
+
+	return nil
+}
+
+// DeleteHyperedgeAdd performs a hard delete of a hyperedge from the
+// HyperedgeAdds set. Unlike RemoveHyperedge (which adds to HyperedgeRemoves for
+// CRDT semantics), this actually removes the entry from HyperedgeAdds. This is
+// used for pruning stale/orphaned data.
+func (hg *HypergraphCRDT) DeleteHyperedgeAdd(
+	txn tries.TreeBackingStoreTransaction,
+	shardKey tries.ShardKey,
+	hyperedgeID [64]byte,
+) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
+	set := hg.getHyperedgeAddsSet(shardKey)
+	tree := set.GetTree()
+
+	// Delete from the tree
+	if err := tree.Delete(txn, hyperedgeID[:]); err != nil {
+		return errors.Wrap(err, "delete hyperedge add: tree delete")
+	}
+
+	return nil
+}
+
+// DeleteHyperedgeRemove performs a hard delete of a hyperedge from the
+// HyperedgeRemoves set. This is used for pruning stale data.
+func (hg *HypergraphCRDT) DeleteHyperedgeRemove(
+	txn tries.TreeBackingStoreTransaction,
+	shardKey tries.ShardKey,
+	hyperedgeID [64]byte,
+) error {
+	hg.mu.Lock()
+	defer hg.mu.Unlock()
+
+	set := hg.getHyperedgeRemovesSet(shardKey)
+	tree := set.GetTree()
+
+	// Delete from the tree
+	if err := tree.Delete(txn, hyperedgeID[:]); err != nil {
+		return errors.Wrap(err, "delete hyperedge remove: tree delete")
+	}
+
+	return nil
+}

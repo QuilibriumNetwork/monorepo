@@ -12,7 +12,6 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -414,19 +413,30 @@ func (r *ProverRegistry) PruneOrphanJoins(frameNumber uint64) error {
 	}
 
 	cutoff := frameNumber - 760
-	var pruned int
+	var prunedAllocations int
+	var prunedProvers int
 
-	set := r.hypergraph.(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(tries.ShardKey{
+	shardKey := tries.ShardKey{
 		L1: [3]byte{0x00, 0x00, 0x00},
 		L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
-	})
+	}
 
-	txn, err := set.GetTree().Store.NewTransaction(false)
+	txn, err := r.hypergraph.NewTransaction(false)
 	if err != nil {
 		return errors.Wrap(err, "prune orphan joins")
 	}
 
-	for _, info := range r.proverCache {
+	// Track provers to remove from cache after pruning
+	proversToRemove := []string{}
+
+	r.logger.Debug(
+		"starting prune orphan joins scan",
+		zap.Uint64("frame_number", frameNumber),
+		zap.Uint64("cutoff", cutoff),
+		zap.Int("prover_cache_size", len(r.proverCache)),
+	)
+
+	for addr, info := range r.proverCache {
 		if info == nil || len(info.Allocations) == 0 {
 			continue
 		}
@@ -435,7 +445,20 @@ func (r *ProverRegistry) PruneOrphanJoins(frameNumber uint64) error {
 		var removedFilters map[string]struct{}
 
 		for _, allocation := range info.Allocations {
-			if allocation.Status == consensus.ProverStatusJoining &&
+			// Log each allocation being evaluated
+			r.logger.Debug(
+				"evaluating allocation for prune",
+				zap.String("prover_address", hex.EncodeToString(info.Address)),
+				zap.Int("status", int(allocation.Status)),
+				zap.Uint64("join_frame", allocation.JoinFrameNumber),
+				zap.Uint64("cutoff", cutoff),
+				zap.Bool("is_joining", allocation.Status == consensus.ProverStatusJoining),
+				zap.Bool("is_rejected", allocation.Status == consensus.ProverStatusRejected),
+				zap.Bool("is_old_enough", allocation.JoinFrameNumber < cutoff),
+			)
+
+			if (allocation.Status == consensus.ProverStatusJoining ||
+				allocation.Status == consensus.ProverStatusRejected) &&
 				allocation.JoinFrameNumber < cutoff {
 				if err := r.pruneAllocationVertex(txn, info, allocation); err != nil {
 					txn.Abort()
@@ -446,7 +469,7 @@ func (r *ProverRegistry) PruneOrphanJoins(frameNumber uint64) error {
 					removedFilters = make(map[string]struct{})
 				}
 				removedFilters[string(allocation.ConfirmationFilter)] = struct{}{}
-				pruned++
+				prunedAllocations++
 				continue
 			}
 
@@ -456,17 +479,33 @@ func (r *ProverRegistry) PruneOrphanJoins(frameNumber uint64) error {
 		if len(updated) != len(info.Allocations) {
 			info.Allocations = updated
 			r.cleanupFilterCache(info, removedFilters)
+
+			// If no allocations remain, prune the prover record as well
+			if len(updated) == 0 {
+				if err := r.pruneProverRecord(txn, shardKey, info); err != nil {
+					txn.Abort()
+					return errors.Wrap(err, "prune orphan joins")
+				}
+				proversToRemove = append(proversToRemove, addr)
+				prunedProvers++
+			}
 		}
 	}
 
-	if pruned > 0 {
+	// Remove pruned provers from cache
+	for _, addr := range proversToRemove {
+		delete(r.proverCache, addr)
+	}
+
+	if prunedAllocations > 0 || prunedProvers > 0 {
 		if err := txn.Commit(); err != nil {
 			return errors.Wrap(err, "prune orphan joins")
 		}
 
 		r.logger.Info(
 			"pruned orphan prover allocations",
-			zap.Int("allocations_pruned", pruned),
+			zap.Int("allocations_pruned", prunedAllocations),
+			zap.Int("provers_pruned", prunedProvers),
 			zap.Uint64("frame_cutoff", cutoff),
 		)
 	} else {
@@ -510,32 +549,95 @@ func (r *ProverRegistry) pruneAllocationVertex(
 		allocationHash.FillBytes(make([]byte, 32)),
 	)
 
-	_, err = r.hypergraph.GetVertex(vertexID)
-	if err != nil {
-		if errors.Cause(err) == hypergraph.ErrRemoved {
-			return nil
-		}
+	shardKey := tries.ShardKey{
+		L1: [3]byte{0x00, 0x00, 0x00},
+		L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
+	}
+
+	// Use DeleteVertexAdd which properly handles locking and deletes both
+	// the tree entry and the vertex data atomically
+	if err := r.hypergraph.DeleteVertexAdd(txn, shardKey, vertexID); err != nil {
 		r.logger.Debug(
-			"allocation vertex missing during prune",
+			"could not delete allocation vertex during prune",
 			zap.String("address", hex.EncodeToString(info.Address)),
 			zap.String(
 				"filter",
 				hex.EncodeToString(allocation.ConfirmationFilter),
 			),
+			zap.String("vertex_id", hex.EncodeToString(vertexID[:])),
 			zap.Error(err),
 		)
-		return nil
+		// Don't return error - the vertex may already be deleted
+	} else {
+		r.logger.Debug(
+			"deleted allocation vertex during prune",
+			zap.String("address", hex.EncodeToString(info.Address)),
+			zap.String(
+				"filter",
+				hex.EncodeToString(allocation.ConfirmationFilter),
+			),
+			zap.String("vertex_id", hex.EncodeToString(vertexID[:])),
+		)
 	}
 
-	set := r.hypergraph.(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(tries.ShardKey{
-		L1: [3]byte{0x00, 0x00, 0x00},
-		L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
-	})
+	return nil
+}
 
-	vtree := set.GetTree()
-	if err := vtree.Delete(txn, vertexID[:]); err != nil {
-		return errors.Wrap(err, "prune allocation remove vertex")
+// pruneProverRecord removes a prover's vertex, hyperedge, and associated data
+// when all of its allocations have been pruned.
+func (r *ProverRegistry) pruneProverRecord(
+	txn tries.TreeBackingStoreTransaction,
+	shardKey tries.ShardKey,
+	info *consensus.ProverInfo,
+) error {
+	if info == nil || len(info.Address) == 0 {
+		return errors.New("missing prover info")
 	}
+
+	// Construct the prover vertex ID
+	var proverVertexID [64]byte
+	copy(proverVertexID[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(proverVertexID[32:], info.Address)
+
+	// Delete prover vertex using DeleteVertexAdd which properly handles locking
+	// and deletes both the tree entry and vertex data atomically
+	if err := r.hypergraph.DeleteVertexAdd(txn, shardKey, proverVertexID); err != nil {
+		r.logger.Debug(
+			"could not delete prover vertex during prune",
+			zap.String("address", hex.EncodeToString(info.Address)),
+			zap.String("vertex_id", hex.EncodeToString(proverVertexID[:])),
+			zap.Error(err),
+		)
+		// Don't return error - the vertex may already be deleted
+	} else {
+		r.logger.Debug(
+			"deleted prover vertex during prune",
+			zap.String("address", hex.EncodeToString(info.Address)),
+			zap.String("vertex_id", hex.EncodeToString(proverVertexID[:])),
+		)
+	}
+
+	// Delete prover hyperedge using DeleteHyperedgeAdd
+	if err := r.hypergraph.DeleteHyperedgeAdd(txn, shardKey, proverVertexID); err != nil {
+		r.logger.Debug(
+			"could not delete prover hyperedge during prune",
+			zap.String("address", hex.EncodeToString(info.Address)),
+			zap.String("hyperedge_id", hex.EncodeToString(proverVertexID[:])),
+			zap.Error(err),
+		)
+		// Don't return error - the hyperedge may already be deleted
+	} else {
+		r.logger.Debug(
+			"deleted prover hyperedge during prune",
+			zap.String("address", hex.EncodeToString(info.Address)),
+			zap.String("hyperedge_id", hex.EncodeToString(proverVertexID[:])),
+		)
+	}
+
+	r.logger.Debug(
+		"pruned prover record",
+		zap.String("address", hex.EncodeToString(info.Address)),
+	)
 
 	return nil
 }
