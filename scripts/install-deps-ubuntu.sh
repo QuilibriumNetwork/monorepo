@@ -57,7 +57,7 @@ rm -rf "$FLINT_TMP"
 
 cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.2.1+v0.25.0
 
-python emp-install.py --install --tool --ot
+bash install-emp.sh
 
 pushd emp-tool
 sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt

@@ -74,20 +74,20 @@ FROM base-avx512 AS build-avx512
 ENV GOEXPERIMENT=arenas
 ENV QUILIBRIUM_SIGNATURE_CHECK=false
 
-# Install grpcurl before building the node and client 
+# Install grpcurl before building the node and client
 # as to avoid needing to redo it on rebuilds
 RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 
 WORKDIR /opt/ceremonyclient
 
-# Copy everything except node and client so as to avoid 
+# Copy everything except node and client so as to avoid
 # invalidating the cache at this point on client or node rebuilds
 
 COPY --exclude=node \
     --exclude=client \
     --exclude=sidecar . .
 
-RUN python emp-install.py --install --tool --ot
+RUN bash install-emp.sh
 
 ENV CFLAGS="-march=skylake-avx512 -mtune=skylake-avx512"
 RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
@@ -98,9 +98,9 @@ RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr
 WORKDIR /opt/ceremonyclient/channel
 
 RUN go mod download
-    
+
 RUN ./generate.sh
-        
+
 
 ## Generate Rust bindings for VDF
 WORKDIR /opt/ceremonyclient/vdf
