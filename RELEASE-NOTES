@@ -1,3 +1,10 @@
+# 2.1.0.17
+- resolve sync race condition with prover registry pruning
+- update hypergraph to directly manage raw deletions
+- migration to resolve records issue from above
+- resolve early snapshot termination issue
+- global halts are now just halts on processing non-global ops
+ 
 # 2.1.0.16
 - build_utils – static code analysis checker for underlying slice assignment
 - hypergraph snapshot manager now uses in memory snapshot instead of pebble snapshot
