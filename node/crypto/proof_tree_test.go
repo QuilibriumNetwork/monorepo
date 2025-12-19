@@ -588,6 +588,349 @@ func TestTreeLongestBranchNoBLS(t *testing.T) {
 	}
 }
 
+// TestTreeNoStaleNodesAfterDelete tests that deleting nodes does not leave
+// orphaned/stale tree nodes in the database. This specifically tests the case
+// where branch merging occurs during deletion.
+func TestTreeNoStaleNodesAfterDeleteNoBLS(t *testing.T) {
+	l, _ := zap.NewProduction()
+	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
+	shardKey := tries.ShardKey{}
+	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: shardKey}
+
+	// Create keys that will force branch creation and then merging on deletion.
+	// We want keys that share a prefix so that:
+	// 1. Inserting them creates branch nodes
+	// 2. Deleting some of them causes branch merging (childCount == 1 case)
+
+	// Create 3 keys with same first 8 bytes, different after
+	commonPrefix := make([]byte, 8)
+	rand.Read(commonPrefix)
+
+	keys := make([][]byte, 3)
+	values := make([][]byte, 3)
+
+	for i := 0; i < 3; i++ {
+		key := make([]byte, 64)
+		copy(key[:8], commonPrefix)
+		// Vary byte 8 to create branching
+		key[8] = byte(i * 64) // 0x00, 0x40, 0x80
+		rand.Read(key[9:])
+		keys[i] = key
+
+		val := make([]byte, 32)
+		rand.Read(val)
+		values[i] = val
+
+		err := tree.Insert(nil, key, val, nil, big.NewInt(1))
+		if err != nil {
+			t.Fatalf("Failed to insert key %d: %v", i, err)
+		}
+	}
+
+	// Verify all 3 keys exist
+	for i, key := range keys {
+		_, err := tree.Get(key)
+		if err != nil {
+			t.Fatalf("Key %d not found after insert: %v", i, err)
+		}
+	}
+
+	// Count tree nodes before deletion
+	nodesBefore := countTreeNodes(t, s, shardKey)
+	t.Logf("Tree nodes before deletion: %d", nodesBefore)
+
+	// Delete one key - this should trigger branch merging
+	err := tree.Delete(nil, keys[1])
+	if err != nil {
+		t.Fatalf("Failed to delete key 1: %v", err)
+	}
+
+	// Verify key 1 is gone
+	_, err = tree.Get(keys[1])
+	if err == nil {
+		t.Fatal("Key 1 should not exist after deletion")
+	}
+
+	// Verify keys 0 and 2 still exist
+	for _, i := range []int{0, 2} {
+		_, err := tree.Get(keys[i])
+		if err != nil {
+			t.Fatalf("Key %d not found after deleting key 1: %v", i, err)
+		}
+	}
+
+	// Count tree nodes after deletion
+	nodesAfter := countTreeNodes(t, s, shardKey)
+	t.Logf("Tree nodes after deletion: %d", nodesAfter)
+
+	// Now verify that all stored nodes are actually reachable from the root.
+	// This is the critical check - any unreachable nodes are "stale".
+	reachableNodes := countReachableNodes(t, tree)
+	t.Logf("Reachable nodes from root: %d", reachableNodes)
+
+	if nodesAfter != reachableNodes {
+		t.Errorf("STALE NODES DETECTED: stored=%d, reachable=%d, stale=%d",
+			nodesAfter, reachableNodes, nodesAfter-reachableNodes)
+	}
+
+	// More aggressive test: delete all but one key
+	err = tree.Delete(nil, keys[2])
+	if err != nil {
+		t.Fatalf("Failed to delete key 2: %v", err)
+	}
+
+	nodesAfterSecondDelete := countTreeNodes(t, s, shardKey)
+	reachableAfterSecondDelete := countReachableNodes(t, tree)
+	t.Logf("After second delete: stored=%d, reachable=%d", nodesAfterSecondDelete, reachableAfterSecondDelete)
+
+	if nodesAfterSecondDelete != reachableAfterSecondDelete {
+		t.Errorf("STALE NODES DETECTED after second delete: stored=%d, reachable=%d, stale=%d",
+			nodesAfterSecondDelete, reachableAfterSecondDelete, nodesAfterSecondDelete-reachableAfterSecondDelete)
+	}
+
+	// Delete the last key - tree should be empty
+	err = tree.Delete(nil, keys[0])
+	if err != nil {
+		t.Fatalf("Failed to delete key 0: %v", err)
+	}
+
+	nodesAfterAllDeleted := countTreeNodes(t, s, shardKey)
+	t.Logf("After all deleted: stored=%d", nodesAfterAllDeleted)
+
+	// There should be no tree nodes left (except possibly the root marker)
+	if nodesAfterAllDeleted > 1 {
+		t.Errorf("STALE NODES DETECTED after all deleted: stored=%d (expected 0 or 1)",
+			nodesAfterAllDeleted)
+	}
+}
+
+// TestTreeNoStaleNodesAfterBranchMerge specifically tests the case where
+// deleting a node causes a branch to merge with its only remaining child branch.
+// This tests the FullPrefix update bug hypothesis.
+func TestTreeNoStaleNodesAfterBranchMergeNoBLS(t *testing.T) {
+	l, _ := zap.NewProduction()
+	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
+	shardKey := tries.ShardKey{}
+	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: shardKey}
+
+	// To trigger a branch-to-branch merge during deletion, we need:
+	// 1. A parent branch with exactly 2 children
+	// 2. One child is a leaf (to be deleted)
+	// 3. The other child is a branch node
+	//
+	// Structure we want to create:
+	//   Root (branch)
+	//   ├── Child A (leaf) - will be deleted
+	//   └── Child B (branch)
+	//       ├── Grandchild 1 (leaf)
+	//       └── Grandchild 2 (leaf)
+	//
+	// After deleting Child A, Root should merge with Child B.
+
+	// Keys with controlled nibbles to create specific tree structure
+	// Nibble = 6 bits, so first nibble is bits 0-5 of first byte
+
+	// Key A: first nibble = 0 (byte[0] bits 7-2 = 000000)
+	keyA := make([]byte, 64)
+	keyA[0] = 0x00 // First nibble = 0
+	rand.Read(keyA[1:])
+
+	// Keys for branch B children: first nibble = 1 (byte[0] bits 7-2 = 000001)
+	// They share first nibble (1) but differ at second nibble
+	keyB1 := make([]byte, 64)
+	keyB1[0] = 0x04 // First nibble = 1 (binary: 000001 << 2 = 00000100)
+	keyB1[1] = 0x00 // Second nibble differs
+	rand.Read(keyB1[2:])
+
+	keyB2 := make([]byte, 64)
+	keyB2[0] = 0x04 // First nibble = 1
+	keyB2[1] = 0x40 // Second nibble differs (binary: 010000...)
+	rand.Read(keyB2[2:])
+
+	// Insert all keys
+	val := make([]byte, 32)
+	rand.Read(val)
+	if err := tree.Insert(nil, keyA, val, nil, big.NewInt(1)); err != nil {
+		t.Fatalf("Failed to insert keyA: %v", err)
+	}
+
+	rand.Read(val)
+	if err := tree.Insert(nil, keyB1, val, nil, big.NewInt(1)); err != nil {
+		t.Fatalf("Failed to insert keyB1: %v", err)
+	}
+
+	rand.Read(val)
+	if err := tree.Insert(nil, keyB2, val, nil, big.NewInt(1)); err != nil {
+		t.Fatalf("Failed to insert keyB2: %v", err)
+	}
+
+	// Verify structure
+	nodesBefore := countTreeNodes(t, s, shardKey)
+	reachableBefore := countReachableNodes(t, tree)
+	t.Logf("Before deletion: stored=%d, reachable=%d", nodesBefore, reachableBefore)
+
+	if nodesBefore != reachableBefore {
+		t.Errorf("STALE NODES before deletion: stored=%d, reachable=%d", nodesBefore, reachableBefore)
+	}
+
+	// Delete keyA - this should trigger the merge of root with child B
+	if err := tree.Delete(nil, keyA); err != nil {
+		t.Fatalf("Failed to delete keyA: %v", err)
+	}
+
+	// Verify keyA is gone
+	if _, err := tree.Get(keyA); err == nil {
+		t.Fatal("keyA should not exist after deletion")
+	}
+
+	// Verify B keys still exist
+	if _, err := tree.Get(keyB1); err != nil {
+		t.Fatalf("keyB1 not found after deletion: %v", err)
+	}
+	if _, err := tree.Get(keyB2); err != nil {
+		t.Fatalf("keyB2 not found after deletion: %v", err)
+	}
+
+	// Check for stale nodes
+	nodesAfter := countTreeNodes(t, s, shardKey)
+	reachableAfter := countReachableNodes(t, tree)
+	t.Logf("After deletion: stored=%d, reachable=%d", nodesAfter, reachableAfter)
+
+	if nodesAfter != reachableAfter {
+		t.Errorf("STALE NODES DETECTED after branch merge: stored=%d, reachable=%d, stale=%d",
+			nodesAfter, reachableAfter, nodesAfter-reachableAfter)
+	}
+}
+
+// TestTreeNoStaleNodesAfterMassDelete tests stale node detection with many keys
+func TestTreeNoStaleNodesAfterMassDeleteNoBLS(t *testing.T) {
+	l, _ := zap.NewProduction()
+	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
+	shardKey := tries.ShardKey{}
+	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: shardKey}
+
+	// Insert 1000 random keys
+	numKeys := 1000
+	keys := make([][]byte, numKeys)
+
+	for i := 0; i < numKeys; i++ {
+		key := make([]byte, 64)
+		rand.Read(key)
+		keys[i] = key
+
+		val := make([]byte, 32)
+		rand.Read(val)
+
+		err := tree.Insert(nil, key, val, nil, big.NewInt(1))
+		if err != nil {
+			t.Fatalf("Failed to insert key %d: %v", i, err)
+		}
+	}
+
+	nodesBefore := countTreeNodes(t, s, shardKey)
+	reachableBefore := countReachableNodes(t, tree)
+	t.Logf("Before deletion: stored=%d, reachable=%d", nodesBefore, reachableBefore)
+
+	if nodesBefore != reachableBefore {
+		t.Errorf("STALE NODES before deletion: stored=%d, reachable=%d", nodesBefore, reachableBefore)
+	}
+
+	// Delete half the keys in random order
+	mrand.Shuffle(numKeys, func(i, j int) {
+		keys[i], keys[j] = keys[j], keys[i]
+	})
+
+	for i := 0; i < numKeys/2; i++ {
+		err := tree.Delete(nil, keys[i])
+		if err != nil {
+			t.Fatalf("Failed to delete key %d: %v", i, err)
+		}
+	}
+
+	nodesAfter := countTreeNodes(t, s, shardKey)
+	reachableAfter := countReachableNodes(t, tree)
+	t.Logf("After deleting half: stored=%d, reachable=%d", nodesAfter, reachableAfter)
+
+	if nodesAfter != reachableAfter {
+		t.Errorf("STALE NODES DETECTED: stored=%d, reachable=%d, stale=%d",
+			nodesAfter, reachableAfter, nodesAfter-reachableAfter)
+	}
+
+	// Verify remaining keys still accessible
+	for i := numKeys / 2; i < numKeys; i++ {
+		_, err := tree.Get(keys[i])
+		if err != nil {
+			t.Errorf("Key %d not found after mass deletion: %v", i, err)
+		}
+	}
+}
+
+// countTreeNodes counts all tree nodes stored in the database for a given shard
+func countTreeNodes(t *testing.T, s *store.PebbleHypergraphStore, shardKey tries.ShardKey) int {
+	count := 0
+
+	// Use the store's iterator to count nodes
+	iter, err := s.IterateRawLeaves("vertex", "adds", shardKey)
+	if err != nil {
+		t.Fatalf("Failed to create iterator: %v", err)
+	}
+	defer iter.Close()
+
+	// Count all entries (both branch and leaf nodes)
+	for valid := iter.First(); valid; valid = iter.Next() {
+		count++
+	}
+
+	return count
+}
+
+// countReachableNodes counts nodes reachable from the tree root by walking the tree
+func countReachableNodes(t *testing.T, tree *tries.LazyVectorCommitmentTree) int {
+	if tree.Root == nil {
+		return 0
+	}
+
+	count := 0
+	var walk func(node tries.LazyVectorCommitmentNode)
+	walk = func(node tries.LazyVectorCommitmentNode) {
+		if node == nil {
+			return
+		}
+		count++
+
+		switch n := node.(type) {
+		case *tries.LazyVectorCommitmentBranchNode:
+			for i := 0; i < 64; i++ {
+				child := n.Children[i]
+				if child == nil {
+					// Try to load from store
+					var err error
+					child, err = tree.Store.GetNodeByPath(
+						tree.SetType,
+						tree.PhaseType,
+						tree.ShardKey,
+						append(n.FullPrefix, i),
+					)
+					if err != nil {
+						continue
+					}
+				}
+				if child != nil {
+					walk(child)
+				}
+			}
+		case *tries.LazyVectorCommitmentLeafNode:
+			// Leaf node, nothing more to walk
+		}
+	}
+
+	walk(tree.Root)
+	return count
+}
+
 // TestTreeBranchStructure tests that the tree structure is preserved after
 // adding and removing leaves that cause branch creation due to shared prefixes.
 func TestTreeBranchStructureNoBLS(t *testing.T) {

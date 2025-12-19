@@ -555,6 +555,46 @@ func (h *MockHypergraph) ImportTree(
 	return args.Error(0)
 }
 
+// DeleteVertexAdd implements hypergraph.Hypergraph.
+func (h *MockHypergraph) DeleteVertexAdd(
+	txn tries.TreeBackingStoreTransaction,
+	shardKey tries.ShardKey,
+	vertexID [64]byte,
+) error {
+	args := h.Called(txn, shardKey, vertexID)
+	return args.Error(0)
+}
+
+// DeleteVertexRemove implements hypergraph.Hypergraph.
+func (h *MockHypergraph) DeleteVertexRemove(
+	txn tries.TreeBackingStoreTransaction,
+	shardKey tries.ShardKey,
+	vertexID [64]byte,
+) error {
+	args := h.Called(txn, shardKey, vertexID)
+	return args.Error(0)
+}
+
+// DeleteHyperedgeAdd implements hypergraph.Hypergraph.
+func (h *MockHypergraph) DeleteHyperedgeAdd(
+	txn tries.TreeBackingStoreTransaction,
+	shardKey tries.ShardKey,
+	hyperedgeID [64]byte,
+) error {
+	args := h.Called(txn, shardKey, hyperedgeID)
+	return args.Error(0)
+}
+
+// DeleteHyperedgeRemove implements hypergraph.Hypergraph.
+func (h *MockHypergraph) DeleteHyperedgeRemove(
+	txn tries.TreeBackingStoreTransaction,
+	shardKey tries.ShardKey,
+	hyperedgeID [64]byte,
+) error {
+	args := h.Called(txn, shardKey, hyperedgeID)
+	return args.Error(0)
+}
+
 // Ensure MockHypergraph implements Hypergraph
 var _ hg.Hypergraph = (*MockHypergraph)(nil)
 

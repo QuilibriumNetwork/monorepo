@@ -234,6 +234,15 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 				return
 			}
 
+			// In prover-only mode, filter out non-prover messages
+			if e.proverOnlyMode.Load() {
+				bundle.Requests = e.filterProverOnlyRequests(bundle.Requests)
+				if len(bundle.Requests) == 0 {
+					// All requests were filtered out
+					return
+				}
+			}
+
 			if len(bundle.Requests) > maxGlobalMessagesPerFrame {
 				if e.logger != nil {
 					e.logger.Debug(
@@ -263,6 +272,49 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 
 	record := newSequencedGlobalMessage(e.currentRank+1, payload)
 	e.messageAggregator.Add(record)
+}
+
+// filterProverOnlyRequests filters a list of message requests to only include
+// prover-related messages. This is used when in prover-only mode due to
+// insufficient coverage.
+func (e *GlobalConsensusEngine) filterProverOnlyRequests(
+	requests []*protobufs.MessageRequest,
+) []*protobufs.MessageRequest {
+	filtered := make([]*protobufs.MessageRequest, 0, len(requests))
+	droppedCount := 0
+
+	for _, req := range requests {
+		if req == nil || req.GetRequest() == nil {
+			continue
+		}
+
+		// Only allow prover-related message types
+		switch req.GetRequest().(type) {
+		case *protobufs.MessageRequest_Join,
+			*protobufs.MessageRequest_Leave,
+			*protobufs.MessageRequest_Pause,
+			*protobufs.MessageRequest_Resume,
+			*protobufs.MessageRequest_Confirm,
+			*protobufs.MessageRequest_Reject,
+			*protobufs.MessageRequest_Kick,
+			*protobufs.MessageRequest_Update:
+			// Prover messages are allowed
+			filtered = append(filtered, req)
+		default:
+			// All other messages are dropped in prover-only mode
+			droppedCount++
+		}
+	}
+
+	if droppedCount > 0 && e.logger != nil {
+		e.logger.Debug(
+			"dropped non-prover messages in prover-only mode",
+			zap.Int("dropped_count", droppedCount),
+			zap.Int("allowed_count", len(filtered)),
+		)
+	}
+
+	return filtered
 }
 
 func (e *GlobalConsensusEngine) logBundleRequestTypes(

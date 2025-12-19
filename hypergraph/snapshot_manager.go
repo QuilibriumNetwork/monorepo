@@ -175,11 +175,17 @@ func (m *snapshotManager) publish(root []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Remove all handles from the map so new syncs get new handles.
+	// Handles with active refs will be released when their last user calls release().
+	// Handles with no active refs (only the initial ref from creation) are released now.
 	for key, handle := range m.handles {
+		delete(m.handles, key)
 		if handle != nil {
+			// releaseRef decrements the ref count. If this was the last ref
+			// (i.e., no active sync sessions), the underlying DB is released.
+			// If there are active sync sessions, they will release it when done.
 			handle.releaseRef(m.logger)
 		}
-		delete(m.handles, key)
 	}
 
 	m.root = nil
@@ -221,6 +227,11 @@ func (m *snapshotManager) acquire(
 	}
 
 	handle := newSnapshotHandle(key, storeSnapshot, release, m.root)
+	// Acquire a ref for the caller. The handle is created with refs=1 (the owner ref
+	// held by the snapshot manager), and this adds another ref for the sync session.
+	// This ensures publish() can release the owner ref without closing the DB while
+	// a sync is still using it.
+	handle.acquire()
 	m.handles[key] = handle
 	return handle
 }

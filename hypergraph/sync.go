@@ -451,7 +451,7 @@ func getChildSegments(
 				prefix,
 			)
 			if err != nil && !strings.Contains(err.Error(), "item not found") {
-				panic(err)
+				return nodes, 0
 			}
 
 			if isPrefix(prefix, path) {
@@ -1345,7 +1345,7 @@ func getNodeAtPath(
 			slices.Concat(n.FullPrefix, []int{int(childIndex)}),
 		)
 		if err != nil && !strings.Contains(err.Error(), "item not found") {
-			logger.Panic("failed to get node by path", zap.Error(err))
+			return nil
 		}
 
 		if child == nil {
@@ -1425,7 +1425,7 @@ func getBranchInfoFromTree(
 					slices.Concat(branch.FullPrefix, []int{i}),
 				)
 				if err != nil && !strings.Contains(err.Error(), "item not found") {
-					logger.Panic("failed to get node by path", zap.Error(err))
+					return nil, err
 				}
 			}
 
@@ -1495,7 +1495,7 @@ func ensureCommittedNode(
 		path,
 	)
 	if err != nil && !strings.Contains(err.Error(), "item not found") {
-		logger.Panic("failed to reload node by path", zap.Error(err))
+		return nil
 	}
 	if reloaded != nil {
 		return reloaded

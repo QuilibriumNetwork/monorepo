@@ -1,16 +1,26 @@
 package store
 
 import (
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 )
+
+func TestPoseidon(t *testing.T) {
+	bi, err := poseidon.HashBytes([]byte("testvector"))
+	require.NoError(t, err)
+	fmt.Println(hex.EncodeToString(bi.FillBytes(make([]byte, 32))))
+	assert.FailNow(t, "")
+}
 
 func TestNewPebbleDB_ExistingDirectory(t *testing.T) {
 	testDir, err := os.MkdirTemp("", "pebble-test-existing-*")

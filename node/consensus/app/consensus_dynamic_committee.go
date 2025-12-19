@@ -123,6 +123,10 @@ func (e *AppConsensusEngine) LeaderForRank(rank uint64) (
 		return "", errors.Wrap(err, "leader for rank")
 	}
 
+	if e.config.P2P.Network == 0 && len(proverSet) < 3 {
+		return models.Identity(make([]byte, 32)), nil
+	}
+
 	// Handle condition where prover cannot be yet known due to lack of sync:
 	if len(proverSet) == 0 {
 		return models.Identity(make([]byte, 32)), nil

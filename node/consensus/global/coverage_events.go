@@ -116,16 +116,21 @@ func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 				remaining = int(haltGraceFrames - streak.Count)
 			}
 			if remaining <= 0 && e.config.P2P.Network == 0 {
-				e.logger.Error(
-					"CRITICAL: Shard has insufficient coverage - triggering network halt",
-					zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
-					zap.Uint64("prover_count", proverCount),
-					zap.Uint64("halt_threshold", haltThreshold),
-				)
+				// Instead of halting, enter prover-only mode at the global level
+				// This allows prover messages to continue while blocking other messages
+				if !e.proverOnlyMode.Load() {
+					e.logger.Warn(
+						"CRITICAL: Shard has insufficient coverage - entering prover-only mode (non-prover messages will be dropped)",
+						zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
+						zap.Uint64("prover_count", proverCount),
+						zap.Uint64("halt_threshold", haltThreshold),
+					)
+					e.proverOnlyMode.Store(true)
+				}
 
-				// Emit halt event
+				// Emit warning event (not halt) so monitoring knows we're in degraded state
 				e.emitCoverageEvent(
-					typesconsensus.ControlEventCoverageHalt,
+					typesconsensus.ControlEventCoverageWarn,
 					&typesconsensus.CoverageEventData{
 						ShardAddress:    []byte(shardAddress),
 						ProverCount:     int(proverCount),
@@ -133,7 +138,7 @@ func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 						AttestedStorage: attestedStorage,
 						TreeMetadata:    coverage.TreeMetadata,
 						Message: fmt.Sprintf(
-							"Shard has only %d provers, network halt required",
+							"Shard has only %d provers, prover-only mode active (non-prover messages dropped)",
 							proverCount,
 						),
 					},
@@ -169,6 +174,16 @@ func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 
 		// Not in critical state — clear any ongoing streak
 		e.clearStreak(shardAddress)
+
+		// If we were in prover-only mode and coverage is restored, exit prover-only mode
+		if e.proverOnlyMode.Load() {
+			e.logger.Info(
+				"Coverage restored - exiting prover-only mode",
+				zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
+				zap.Uint64("prover_count", proverCount),
+			)
+			e.proverOnlyMode.Store(false)
+		}
 
 		// Check for low coverage
 		if proverCount < minProvers {

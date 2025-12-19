@@ -1368,6 +1368,20 @@ func (e *AppConsensusEngine) handleGlobalFrameMessage(message *pb.Message) {
 			return
 		}
 
+		// If genesis hasn't been initialized yet, send this frame to the
+		// genesis init channel (non-blocking)
+		if !e.genesisInitialized.Load() {
+			select {
+			case e.genesisInitChan <- frame:
+				e.logger.Debug(
+					"sent global frame to genesis init channel",
+					zap.Uint64("frame_number", frame.Header.FrameNumber),
+				)
+			default:
+				// Channel already has a frame, skip
+			}
+		}
+
 		if err := e.globalTimeReel.Insert(frame); err != nil {
 			// Success metric recorded at the end of processing
 			globalFramesProcessedTotal.WithLabelValues("error").Inc()

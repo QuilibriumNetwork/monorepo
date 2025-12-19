@@ -531,6 +531,85 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 		commitments[i] = &tries.VectorCommitmentTree{}
 	}
 
+	e.establishTestnetGenesisProvers()
+
+	roots, err := e.hypergraph.Commit(0)
+	if err != nil {
+		e.logger.Error("could not commit", zap.Error(err))
+		return nil
+	}
+
+	// Parse and set initial commitments from JSON
+	for shardKey, commits := range roots {
+		for i := 0; i < 3; i++ {
+			commitments[shardKey.L1[i]].Insert(
+				shardKey.L2[:],
+				commits[0],
+				nil,
+				big.NewInt(int64(len(commits[0]))),
+			)
+			commitments[shardKey.L1[i]].Commit(e.inclusionProver, false)
+		}
+	}
+
+	proverRoots := roots[tries.ShardKey{
+		L1: [3]byte{},
+		L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+	}]
+
+	proverRoot := proverRoots[0]
+
+	genesisHeader.ProverTreeCommitment = proverRoot
+
+	for i := 0; i < 256; i++ {
+		genesisHeader.GlobalCommitments[i] = commitments[i].Commit(
+			e.inclusionProver,
+			false,
+		)
+	}
+
+	// Establish an empty signature payload – this avoids panics on broken
+	// header readers
+	genesisHeader.PublicKeySignatureBls48581 =
+		&protobufs.BLS48581AggregateSignature{
+			Signature: make([]byte, 0),
+			PublicKey: &protobufs.BLS48581G2PublicKey{
+				KeyValue: make([]byte, 0),
+			},
+			Bitmask: make([]byte, 0),
+		}
+
+	genesisFrame := &protobufs.GlobalFrame{
+		Header: genesisHeader,
+	}
+
+	// Compute frame ID and store the full frame
+	frameIDBI, _ := poseidon.HashBytes(genesisHeader.Output)
+	frameID := frameIDBI.FillBytes(make([]byte, 32))
+	e.frameStoreMu.Lock()
+	e.frameStore[string(frameID)] = genesisFrame
+	e.frameStoreMu.Unlock()
+
+	// Add to time reel
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		panic(err)
+	}
+	if err := e.clockStore.PutGlobalClockFrame(genesisFrame, txn); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add frame", zap.Error(err))
+		return nil
+	}
+	if err := txn.Commit(); err != nil {
+		txn.Abort()
+		e.logger.Error("could not add frame", zap.Error(err))
+		return nil
+	}
+
+	return genesisFrame
+}
+
+func (e *GlobalConsensusEngine) establishTestnetGenesisProvers() error {
 	var proverPubKeys [][]byte
 	var err error
 	if e.config.P2P.Network != 99 && e.config.Engine != nil &&
@@ -647,83 +726,9 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 	err = state.Commit()
 	if err != nil {
 		e.logger.Error("failed to commit", zap.Error(err))
-		return nil
 	}
 
-	roots, err := e.hypergraph.Commit(0)
-	if err != nil {
-		e.logger.Error("could not commit", zap.Error(err))
-		return nil
-	}
-
-	// Parse and set initial commitments from JSON
-	for shardKey, commits := range roots {
-		for i := 0; i < 3; i++ {
-			commitments[shardKey.L1[i]].Insert(
-				shardKey.L2[:],
-				commits[0],
-				nil,
-				big.NewInt(int64(len(commits[0]))),
-			)
-			commitments[shardKey.L1[i]].Commit(e.inclusionProver, false)
-		}
-	}
-
-	proverRoots := roots[tries.ShardKey{
-		L1: [3]byte{},
-		L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-	}]
-
-	proverRoot := proverRoots[0]
-
-	genesisHeader.ProverTreeCommitment = proverRoot
-
-	for i := 0; i < 256; i++ {
-		genesisHeader.GlobalCommitments[i] = commitments[i].Commit(
-			e.inclusionProver,
-			false,
-		)
-	}
-
-	// Establish an empty signature payload – this avoids panics on broken
-	// header readers
-	genesisHeader.PublicKeySignatureBls48581 =
-		&protobufs.BLS48581AggregateSignature{
-			Signature: make([]byte, 0),
-			PublicKey: &protobufs.BLS48581G2PublicKey{
-				KeyValue: make([]byte, 0),
-			},
-			Bitmask: make([]byte, 0),
-		}
-
-	genesisFrame := &protobufs.GlobalFrame{
-		Header: genesisHeader,
-	}
-
-	// Compute frame ID and store the full frame
-	frameIDBI, _ := poseidon.HashBytes(genesisHeader.Output)
-	frameID := frameIDBI.FillBytes(make([]byte, 32))
-	e.frameStoreMu.Lock()
-	e.frameStore[string(frameID)] = genesisFrame
-	e.frameStoreMu.Unlock()
-
-	// Add to time reel
-	txn, err := e.clockStore.NewTransaction(false)
-	if err != nil {
-		panic(err)
-	}
-	if err := e.clockStore.PutGlobalClockFrame(genesisFrame, txn); err != nil {
-		txn.Abort()
-		e.logger.Error("could not add frame", zap.Error(err))
-		return nil
-	}
-	if err := txn.Commit(); err != nil {
-		txn.Abort()
-		e.logger.Error("could not add frame", zap.Error(err))
-		return nil
-	}
-
-	return genesisFrame
+	return nil
 }
 
 // InitializeGenesisState ensures the global genesis frame and QC exist using the
