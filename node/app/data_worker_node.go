@@ -81,10 +81,6 @@ func (n *DataWorkerNode) Start(
 	)
 
 	go func() {
-		n.logger.Info(
-			"starting IPC server",
-			zap.Uint("core_id", n.coreId),
-		)
 		err := n.ipcServer.Start()
 		if err != nil {
 			n.logger.Error(
@@ -308,6 +304,7 @@ func WaitForWorkerPortsAvailable(
 // monitorPortHealth checks if both the stream port and P2P listen port are listening after startup
 // The stream port is calculated as: base_stream_port + core_index - 1
 // The P2P listen port is calculated as: base_p2p_port + core_index - 1
+// The stream port check waits for the IPC server to be ready before checking
 func (n *DataWorkerNode) monitorPortHealth() {
 	n.logger.Info(
 		"checking port health",
@@ -330,12 +327,19 @@ func (n *DataWorkerNode) monitorPortHealth() {
 		)
 		streamResult <- false // Mark as failed since we couldn't check
 	} else {
-		// Check stream port in parallel
+		// Wait for IPC server to be ready before checking stream port
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Wait for IPC server to start listening
 			n.logger.Debug(
-				"attempting to bind to the stream port to check if it's listening",
+				"waiting for IPC server to be ready before checking stream port",
+				zap.String("port", streamPort),
+				zap.Uint("core_id", n.coreId),
+			)
+			<-n.ipcServer.Ready()
+			n.logger.Debug(
+				"IPC server is ready, checking stream port",
 				zap.String("port", streamPort),
 				zap.Uint("core_id", n.coreId),
 			)
@@ -348,8 +352,8 @@ func (n *DataWorkerNode) monitorPortHealth() {
 			)
 
 			if !isStreamListening {
-				n.logger.Error(
-					"stream port is not listening",
+				n.logger.Warn(
+					"stream port is not yet listening, may not be ready yet",
 					zap.String("port", streamPort),
 					zap.Uint("core_id", n.coreId),
 				)
@@ -395,7 +399,7 @@ func (n *DataWorkerNode) monitorPortHealth() {
 
 			if !isP2PListening {
 				n.logger.Error(
-					"P2P listen port is not listening",
+					"P2P listen port is not yet listening, may not be ready yet",
 					zap.String("port", p2pPortStr),
 					zap.Uint("core_id", n.coreId),
 				)
@@ -421,12 +425,12 @@ func (n *DataWorkerNode) monitorPortHealth() {
 	// Ports are listening successfully, reset attempt counter
 	if streamOk && p2pOk {
 		n.logger.Info(
-			"all ports are listening successfully, resetting restart attempts",
+			"all ports are listening successfully",
 			zap.Uint("core_id", n.coreId),
 		)
 	}
 	n.logger.Info(
-		"port health check completed successfully",
+		"port health check completed",
 		zap.Uint("core_id", n.coreId),
 	)
 }
