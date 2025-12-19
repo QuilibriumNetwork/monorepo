@@ -26,8 +26,6 @@ RUN apt-get update && apt-get install -y \
     automake \
     libtool \
     libssl-dev \
-    python3 \
-    python-is-python3 \
     libflint-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -59,11 +57,11 @@ FROM base AS emp-builder
 
 WORKDIR /opt/ceremonyclient
 # Copy the necessary script and source directories
-COPY emp-install.py .
+COPY install_emp.sh .
 COPY emp-tool emp-tool
 COPY emp-ot emp-ot
 
-RUN python emp-install.py --install --tool --ot
+RUN bash install-emp.sh
 
 # Fix emp-tool to be static and install
 RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make -j$(nproc) && make install
