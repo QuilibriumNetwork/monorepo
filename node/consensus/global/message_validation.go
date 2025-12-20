@@ -523,7 +523,7 @@ func (e *GlobalConsensusEngine) validatePeerInfoMessage(
 			e.logger.Debug("peer info timestamp too old",
 				zap.Int64("peer_timestamp", peerInfo.Timestamp),
 			)
-			return tp2p.ValidationResultIgnore
+			return tp2p.ValidationResultReject
 		}
 
 		if peerInfo.Timestamp > now+5000 {
@@ -549,7 +549,7 @@ func (e *GlobalConsensusEngine) validatePeerInfoMessage(
 
 		if int64(keyRegistry.LastUpdated) < now-1000 {
 			e.logger.Debug("key registry timestamp too old")
-			return tp2p.ValidationResultIgnore
+			return tp2p.ValidationResultReject
 		}
 
 		if int64(keyRegistry.LastUpdated) > now+5000 {
