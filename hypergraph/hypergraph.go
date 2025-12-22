@@ -122,6 +122,14 @@ func (hg *HypergraphCRDT) cloneSetWithStore(
 	return set
 }
 
+// SetSelfPeerID sets the self peer ID on the sync controller. Sessions from
+// this peer ID are allowed unlimited concurrency (for workers syncing to master).
+func (hg *HypergraphCRDT) SetSelfPeerID(peerID string) {
+	if hg.syncController != nil {
+		hg.syncController.SetSelfPeerID(peerID)
+	}
+}
+
 func (hg *HypergraphCRDT) SetShutdownContext(ctx context.Context) {
 	hg.shutdownCtx = ctx
 	go func() {
