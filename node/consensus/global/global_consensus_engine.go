@@ -1032,7 +1032,7 @@ func NewGlobalConsensusEngine(
 	if hgWithSelfPeer, ok := engine.hyperSync.(interface {
 		SetSelfPeerID(string)
 	}); ok {
-		hgWithSelfPeer.SetSelfPeerID(ps.GetPeerID().String())
+		hgWithSelfPeer.SetSelfPeerID(peer.ID(ps.GetPeerID()).String())
 	}
 
 	return engine, nil

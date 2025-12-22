@@ -944,7 +944,7 @@ func NewAppConsensusEngine(
 	if hgWithSelfPeer, ok := engine.hyperSync.(interface {
 		SetSelfPeerID(string)
 	}); ok {
-		hgWithSelfPeer.SetSelfPeerID(ps.GetPeerID().String())
+		hgWithSelfPeer.SetSelfPeerID(peer.ID(ps.GetPeerID()).String())
 	}
 
 	return engine, nil
@@ -1072,7 +1072,7 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte, expectedRoo
 
 	// Sync from our own master node instead of the proposer to avoid
 	// overburdening the proposer with sync requests from all workers.
-	selfPeerID := e.pubsub.GetPeerID()
+	selfPeerID := peer.ID(e.pubsub.GetPeerID())
 
 	go func() {
 		defer e.globalProverSyncInProgress.Store(false)
