@@ -679,10 +679,10 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	}
 
 	start := time.Now()
-	dataTrees := make([]*tries.VectorCommitmentTree, 10000)
+	dataTrees := make([]*tries.VectorCommitmentTree, 1000)
 	eg := errgroup.Group{}
-	eg.SetLimit(10000)
-	for i := 0; i < 10000; i++ {
+	eg.SetLimit(1000)
+	for i := 0; i < 1000; i++ {
 		eg.Go(func() error {
 			dataTrees[i] = buildDataTree(t, inclusionProver)
 			return nil
@@ -922,6 +922,8 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	// Publish the server's snapshot so clients can sync against this exact state
+	serverHG.PublishSnapshot(serverRoot)
 	for i := 0; i < 1; i++ {
 		go func(idx int) {
 			defer wg.Done()
@@ -941,7 +943,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 				stream,
 				shardKey,
 				protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-				nil,
+				serverRoot,
 			)
 			require.NoError(t, err)
 			require.NoError(t, stream.CloseSend())

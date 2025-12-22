@@ -28,6 +28,14 @@ func (hg *HypergraphCRDT) HyperStream(
 	ctx, shutdownCancel := hg.contextWithShutdown(requestCtx)
 	defer shutdownCancel()
 
+	// Apply session-level timeout only if we have a shutdown context
+	// (i.e., in production, not in tests without shutdown context)
+	if hg.shutdownCtx != nil {
+		var timeoutCancel context.CancelFunc
+		ctx, timeoutCancel = context.WithTimeout(ctx, maxSyncSessionDuration)
+		defer timeoutCancel()
+	}
+
 	sessionLogger := hg.logger
 	sessionStart := time.Now()
 	defer func() {
@@ -60,6 +68,13 @@ func (hg *HypergraphCRDT) HyperStream(
 		hg.syncController.EndSyncSession(peerKey)
 	}()
 
+	// Start idle timeout monitor (only if shutdownCtx is available, i.e., in production)
+	if hg.shutdownCtx != nil {
+		idleCtx, idleCancel := context.WithCancel(ctx)
+		defer idleCancel()
+		go hg.monitorSyncSessionIdle(idleCtx, peerKey, sessionLogger, shutdownCancel)
+	}
+
 	syncStart := time.Now()
 	err = hg.syncTreeServer(ctx, stream, sessionLogger)
 	sessionLogger.Info(
@@ -74,6 +89,35 @@ func (hg *HypergraphCRDT) HyperStream(
 	})
 
 	return err
+}
+
+// monitorSyncSessionIdle periodically checks if the sync session has become idle
+// and cancels the context if so.
+func (hg *HypergraphCRDT) monitorSyncSessionIdle(
+	ctx context.Context,
+	peerKey string,
+	logger *zap.Logger,
+	cancelFunc context.CancelFunc,
+) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if hg.syncController.IsSessionStale(peerKey, maxSyncSessionDuration, syncIdleTimeout) {
+				logger.Warn(
+					"sync session idle timeout - forcing termination",
+					zap.String("peer_id", peerKey),
+					zap.Duration("session_duration", hg.syncController.SessionDuration(peerKey)),
+				)
+				cancelFunc()
+				return
+			}
+		}
+	}
 }
 
 // Sync performs the tree diff and synchronization from the client side.
@@ -514,6 +558,11 @@ type streamManager struct {
 	snapshot        *snapshotHandle
 }
 
+// updateActivity updates the last activity timestamp for the stream.
+func (s *streamManager) updateActivity() {
+	s.lastSent = time.Now()
+}
+
 type rawVertexSaver interface {
 	SaveVertexTreeRaw(
 		txn tries.TreeBackingStoreTransaction,
@@ -534,6 +583,10 @@ const (
 	leafAckMaxTimeout    = 10 * time.Minute
 	leafAckPerLeafBudget = 20 * time.Millisecond // Generous budget for tree building overhead
 	pruneTxnChunk        = 100
+
+	// Session-level timeouts
+	maxSyncSessionDuration = 15 * time.Minute // Maximum total time for a sync session
+	syncIdleTimeout        = 5 * time.Minute  // Maximum time without activity before session is killed
 )
 
 func leafAckTimeout(count uint64) time.Duration {
@@ -693,6 +746,10 @@ func (s *streamManager) rawShardSync(
 		}
 
 		sent++
+		// Update activity periodically to prevent idle timeout
+		if sent%100 == 0 {
+			s.updateActivity()
+		}
 		if sent%1000 == 0 {
 			s.logger.Debug(
 				"SERVER: raw sync progress",
@@ -1078,7 +1135,7 @@ func (s *streamManager) sendLeafData(
 			return errors.Wrap(err, "send leaf data")
 		}
 
-		s.lastSent = time.Now()
+		s.updateActivity()
 		return nil
 	}
 
@@ -1545,6 +1602,8 @@ func (s *streamManager) queryNext(
 		return nil, err
 	}
 
+	s.updateActivity()
+
 	select {
 	case <-s.ctx.Done():
 		return nil, errors.Wrap(
@@ -1558,6 +1617,7 @@ func (s *streamManager) queryNext(
 				"handle query",
 			)
 		}
+		s.updateActivity()
 		resp = r
 		return resp, nil
 	case <-time.After(30 * time.Second):
@@ -1935,6 +1995,7 @@ func (s *streamManager) handleQueryNext(
 			return nil, errors.Wrap(err, "handle query next")
 		}
 
+		s.updateActivity()
 		branch = branchInfo
 		return branch, nil
 	case <-time.After(30 * time.Second):
@@ -1979,6 +2040,8 @@ func (s *streamManager) descendIndex(
 		return nil, nil, errors.Wrap(err, "descend index")
 	}
 
+	s.updateActivity()
+
 	select {
 	case <-s.ctx.Done():
 		return nil, nil, errors.Wrap(
@@ -2004,6 +2067,7 @@ func (s *streamManager) descendIndex(
 			)
 		}
 
+		s.updateActivity()
 		local = branchInfo
 		remote = r
 		return local, remote, nil
