@@ -212,8 +212,9 @@ func (h *MockHypergraph) Sync(
 	stream protobufs.HypergraphComparisonService_HyperStreamClient,
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
+	expectedRoot []byte,
 ) error {
-	args := h.Called(stream, shardKey, phaseSet)
+	args := h.Called(stream, shardKey, phaseSet, expectedRoot)
 	return args.Error(0)
 }
 

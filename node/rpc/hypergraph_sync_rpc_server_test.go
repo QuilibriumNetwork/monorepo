@@ -311,7 +311,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS)
+	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS)
+	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}
@@ -614,7 +614,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS)
+	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
@@ -634,7 +634,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS)
+	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}
@@ -873,6 +873,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 					stream,
 					shardKey,
 					protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+					nil,
 				)
 				require.NoError(t, stream.CloseSend())
 				cancelStream()
@@ -940,6 +941,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 				stream,
 				shardKey,
 				protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+				nil,
 			)
 			require.NoError(t, err)
 			require.NoError(t, stream.CloseSend())
@@ -1097,4 +1099,285 @@ func getNextNibble(key []byte, pos int) int32 {
 	}
 
 	return int32(result & tries.BranchMask)
+}
+
+// TestHypergraphSyncWithExpectedRoot tests that clients can request sync
+// against a specific snapshot generation by providing an expected root.
+// The server should use a matching historical snapshot if available.
+func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	enc := verenc.NewMPCitHVerifiableEncryptor(1)
+	inclusionProver := bls48581.NewKZGInclusionProver(logger)
+
+	// Create data trees for vertices
+	dataTrees := make([]*tries.VectorCommitmentTree, 100)
+	for i := 0; i < 100; i++ {
+		dataTrees[i] = buildDataTree(t, inclusionProver)
+	}
+
+	serverPath := filepath.Join(t.TempDir(), "server")
+
+	serverDB := store.NewPebbleDB(logger, &config.DBConfig{Path: serverPath}, 0)
+	defer serverDB.Close()
+
+	serverStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{Path: serverPath},
+		serverDB,
+		logger,
+		enc,
+		inclusionProver,
+	)
+
+	serverHG := hgcrdt.NewHypergraph(
+		logger.With(zap.String("side", "server")),
+		serverStore,
+		inclusionProver,
+		[]int{},
+		&tests.Nopthenticator{},
+		200,
+	)
+
+	// Create initial vertex to establish shard key
+	domain := randomBytes32(t)
+	initialVertex := hgcrdt.NewVertex(
+		domain,
+		randomBytes32(t),
+		dataTrees[0].Commit(inclusionProver, false),
+		dataTrees[0].GetSize(),
+	)
+	shardKey := application.GetShardKey(initialVertex)
+
+	// Phase 1: Add initial vertices to server and commit
+	phase1Vertices := make([]application.Vertex, 20)
+	phase1Vertices[0] = initialVertex
+	for i := 1; i < 20; i++ {
+		phase1Vertices[i] = hgcrdt.NewVertex(
+			domain,
+			randomBytes32(t),
+			dataTrees[i].Commit(inclusionProver, false),
+			dataTrees[i].GetSize(),
+		)
+	}
+	addVertices(t, serverStore, serverHG, dataTrees[:20], phase1Vertices...)
+
+	// Commit to get root1
+	commitResult1, err := serverHG.Commit(1)
+	require.NoError(t, err)
+	root1 := commitResult1[shardKey][0]
+	t.Logf("Root after phase 1: %x", root1)
+
+	// Publish root1 as the current snapshot generation
+	serverHG.PublishSnapshot(root1)
+
+	// Start gRPC server early so we can create a snapshot while root1 is current
+	const bufSize = 1 << 20
+	lis := bufconn.Listen(bufSize)
+
+	grpcServer := grpc.NewServer(
+		grpc.ChainStreamInterceptor(func(
+			srv interface{},
+			ss grpc.ServerStream,
+			info *grpc.StreamServerInfo,
+			handler grpc.StreamHandler,
+		) error {
+			_, priv, _ := ed448.GenerateKey(rand.Reader)
+			privKey, err := pcrypto.UnmarshalEd448PrivateKey(priv)
+			require.NoError(t, err)
+
+			pub := privKey.GetPublic()
+			peerID, err := peer.IDFromPublicKey(pub)
+			require.NoError(t, err)
+
+			return handler(srv, &serverStream{
+				ServerStream: ss,
+				ctx:          internal_grpc.NewContextWithPeerID(ss.Context(), peerID),
+			})
+		}),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(grpcServer, serverHG)
+	defer grpcServer.Stop()
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	dialClient := func() (*grpc.ClientConn, protobufs.HypergraphComparisonServiceClient) {
+		dialer := func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}
+		conn, err := grpc.DialContext(
+			context.Background(),
+			"bufnet",
+			grpc.WithContextDialer(dialer),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		require.NoError(t, err)
+		return conn, protobufs.NewHypergraphComparisonServiceClient(conn)
+	}
+
+	// Helper to create a fresh client hypergraph
+	createClient := func(name string) (*store.PebbleDB, *hgcrdt.HypergraphCRDT) {
+		clientPath := filepath.Join(t.TempDir(), name)
+		clientDB := store.NewPebbleDB(logger, &config.DBConfig{Path: clientPath}, 0)
+		clientStore := store.NewPebbleHypergraphStore(
+			&config.DBConfig{Path: clientPath},
+			clientDB,
+			logger,
+			enc,
+			inclusionProver,
+		)
+		clientHG := hgcrdt.NewHypergraph(
+			logger.With(zap.String("side", name)),
+			clientStore,
+			inclusionProver,
+			[]int{},
+			&tests.Nopthenticator{},
+			200,
+		)
+		return clientDB, clientHG
+	}
+
+	// IMPORTANT: Create a snapshot while root1 is current by doing a sync now.
+	// This snapshot will be preserved when we later publish root2.
+	t.Log("Creating snapshot for root1 by syncing a client while root1 is current")
+	{
+		clientDB, clientHG := createClient("client-snapshot-root1")
+		conn, client := dialClient()
+
+		stream, err := client.HyperStream(context.Background())
+		require.NoError(t, err)
+
+		err = clientHG.Sync(
+			stream,
+			shardKey,
+			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+			nil,
+		)
+		require.NoError(t, err)
+		require.NoError(t, stream.CloseSend())
+
+		// Verify this client got root1
+		clientCommit, err := clientHG.Commit(1)
+		require.NoError(t, err)
+		require.Equal(t, root1, clientCommit[shardKey][0], "snapshot client should have root1")
+
+		conn.Close()
+		clientDB.Close()
+	}
+
+	// Phase 2: Add more vertices to server and commit
+	phase2Vertices := make([]application.Vertex, 30)
+	for i := 0; i < 30; i++ {
+		phase2Vertices[i] = hgcrdt.NewVertex(
+			domain,
+			randomBytes32(t),
+			dataTrees[20+i].Commit(inclusionProver, false),
+			dataTrees[20+i].GetSize(),
+		)
+	}
+	addVertices(t, serverStore, serverHG, dataTrees[20:50], phase2Vertices...)
+
+	// Commit to get root2
+	commitResult2, err := serverHG.Commit(2)
+	require.NoError(t, err)
+	root2 := commitResult2[shardKey][0]
+	t.Logf("Root after phase 2: %x", root2)
+
+	// Publish root2 as the new current snapshot generation
+	// This preserves the root1 generation (with its snapshot) as a historical generation
+	serverHG.PublishSnapshot(root2)
+
+	// Verify roots are different
+	require.NotEqual(t, root1, root2, "roots should be different after adding more data")
+
+	// Test 1: Sync with nil expectedRoot (should get latest = root2)
+	t.Run("sync with nil expectedRoot gets latest", func(t *testing.T) {
+		clientDB, clientHG := createClient("client1")
+		defer clientDB.Close()
+
+		conn, client := dialClient()
+		defer conn.Close()
+
+		stream, err := client.HyperStream(context.Background())
+		require.NoError(t, err)
+
+		err = clientHG.Sync(
+			stream,
+			shardKey,
+			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+			nil, // nil expectedRoot should use latest snapshot
+		)
+		require.NoError(t, err)
+		require.NoError(t, stream.CloseSend())
+
+		// Commit client to get comparable root
+		clientCommit, err := clientHG.Commit(1)
+		require.NoError(t, err)
+		clientRoot := clientCommit[shardKey][0]
+
+		// Client should have synced to the latest (root2)
+		assert.Equal(t, root2, clientRoot, "client should sync to latest root when expectedRoot is nil")
+	})
+
+	// Test 2: Sync with expectedRoot = root1 (should get historical snapshot)
+	t.Run("sync with expectedRoot gets matching generation", func(t *testing.T) {
+		clientDB, clientHG := createClient("client2")
+		defer clientDB.Close()
+
+		conn, client := dialClient()
+		defer conn.Close()
+
+		stream, err := client.HyperStream(context.Background())
+		require.NoError(t, err)
+
+		err = clientHG.Sync(
+			stream,
+			shardKey,
+			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+			root1, // Request sync against root1
+		)
+		require.NoError(t, err)
+		require.NoError(t, stream.CloseSend())
+
+		// Commit client to get comparable root
+		clientCommit, err := clientHG.Commit(1)
+		require.NoError(t, err)
+		clientRoot := clientCommit[shardKey][0]
+
+		// Client should have synced to root1 (the historical snapshot)
+		assert.Equal(t, root1, clientRoot, "client should sync to historical root when expectedRoot matches")
+	})
+
+	// Test 3: Sync with unknown expectedRoot (should fallback to latest)
+	t.Run("sync with unknown expectedRoot falls back to latest", func(t *testing.T) {
+		clientDB, clientHG := createClient("client3")
+		defer clientDB.Close()
+
+		conn, client := dialClient()
+		defer conn.Close()
+
+		stream, err := client.HyperStream(context.Background())
+		require.NoError(t, err)
+
+		// Use a fake root that doesn't exist
+		unknownRoot := make([]byte, 48)
+		rand.Read(unknownRoot)
+
+		err = clientHG.Sync(
+			stream,
+			shardKey,
+			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+			unknownRoot, // Unknown root should fallback to latest
+		)
+		require.NoError(t, err)
+		require.NoError(t, stream.CloseSend())
+
+		// Commit client to get comparable root
+		clientCommit, err := clientHG.Commit(1)
+		require.NoError(t, err)
+		clientRoot := clientCommit[shardKey][0]
+
+		// Client should have synced to latest (root2) since unknown root falls back
+		assert.Equal(t, root2, clientRoot, "client should sync to latest root when expectedRoot is unknown")
+	})
 }

@@ -40,6 +40,10 @@ message HypergraphComparisonQuery {
   // If set, the comparison response will contain the data of leaves if present
   // in the results.
   bool include_leaf_data = 6;
+  // The expected commit root the client wants to sync against. When set, the
+  // server will attempt to find a snapshot with a matching commit root. If no
+  // matching snapshot exists, the server may return the latest available.
+  bytes expected_root = 7;
 }
 
 // Defines the response containing the commitment for a node and (optionally)

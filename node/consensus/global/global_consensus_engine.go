@@ -1748,6 +1748,14 @@ func (e *GlobalConsensusEngine) materialize(
 		}
 	}
 
+	// Publish the snapshot generation with the new root so clients can sync
+	// against this specific state.
+	if len(localProverRoot) > 0 {
+		if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
+			hgCRDT.PublishSnapshot(localProverRoot)
+		}
+	}
+
 	if len(localProverRoot) > 0 && shouldVerifyRoot {
 		if e.verifyProverRoot(
 			frameNumber,
@@ -1913,7 +1921,7 @@ func (e *GlobalConsensusEngine) verifyProverRoot(
 		)
 		e.proverRootSynced.Store(false)
 		e.proverRootVerifiedFrame.Store(0)
-		e.triggerProverHypersync(proposer)
+		e.triggerProverHypersync(proposer, expected)
 		return false
 	}
 
@@ -1929,7 +1937,7 @@ func (e *GlobalConsensusEngine) verifyProverRoot(
 	return true
 }
 
-func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte) {
+func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte, expectedRoot []byte) {
 	if e.syncProvider == nil || len(proposer) == 0 {
 		e.logger.Debug("no sync provider or proposer")
 		return
@@ -1951,7 +1959,7 @@ func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte) {
 			L1: [3]byte{0x00, 0x00, 0x00},
 			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 		}
-		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil)
+		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
 		if err := e.proverRegistry.Refresh(); err != nil {
 			e.logger.Warn(
 				"failed to refresh prover registry after hypersync",

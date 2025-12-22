@@ -55,6 +55,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/execution"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
+	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
 	tp2p "source.quilibrium.com/quilibrium/monorepo/types/p2p"
@@ -989,7 +990,7 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		e.triggerGlobalHypersync(frame.Header.Prover)
+		e.triggerGlobalHypersync(frame.Header.Prover, expectedProverRoot)
 		return
 	}
 
@@ -1006,7 +1007,7 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		e.triggerGlobalHypersync(frame.Header.Prover)
+		e.triggerGlobalHypersync(frame.Header.Prover, expectedProverRoot)
 		return
 	}
 
@@ -1048,7 +1049,7 @@ func (e *AppConsensusEngine) computeLocalGlobalProverRoot(
 	return nil, errors.New("global prover root shard missing")
 }
 
-func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte) {
+func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte, expectedRoot []byte) {
 	if e.syncProvider == nil || len(proposer) == 0 {
 		e.logger.Debug("no sync provider or proposer for hypersync")
 		return
@@ -1073,7 +1074,7 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte) {
 			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 		}
 
-		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil)
+		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
 		if err := e.proverRegistry.Refresh(); err != nil {
 			e.logger.Warn(
 				"failed to refresh prover registry after hypersync",
@@ -1991,6 +1992,14 @@ func (e *AppConsensusEngine) internalProveFrame(
 		stateRoots[1] = make([]byte, 64)
 		stateRoots[2] = make([]byte, 64)
 		stateRoots[3] = make([]byte, 64)
+	}
+
+	// Publish the snapshot generation with the shard's vertex add root so clients
+	// can sync against this specific state.
+	if len(stateRoots[0]) > 0 {
+		if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
+			hgCRDT.PublishSnapshot(stateRoots[0])
+		}
 	}
 
 	txMap := map[string][][]byte{}
