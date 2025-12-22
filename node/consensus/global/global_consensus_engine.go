@@ -1028,6 +1028,13 @@ func NewGlobalConsensusEngine(
 		)
 	}
 
+	// Set self peer ID on hypergraph to allow unlimited self-sync sessions
+	if hgWithSelfPeer, ok := engine.hyperSync.(interface {
+		SetSelfPeerID(string)
+	}); ok {
+		hgWithSelfPeer.SetSelfPeerID(ps.GetPeerID().String())
+	}
+
 	return engine, nil
 }
 

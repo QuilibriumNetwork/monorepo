@@ -940,6 +940,13 @@ func NewAppConsensusEngine(
 		)
 	}
 
+	// Set self peer ID on hypergraph to allow unlimited self-sync sessions
+	if hgWithSelfPeer, ok := engine.hyperSync.(interface {
+		SetSelfPeerID(string)
+	}); ok {
+		hgWithSelfPeer.SetSelfPeerID(ps.GetPeerID().String())
+	}
+
 	return engine, nil
 }
 
@@ -1050,8 +1057,8 @@ func (e *AppConsensusEngine) computeLocalGlobalProverRoot(
 }
 
 func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte, expectedRoot []byte) {
-	if e.syncProvider == nil || len(proposer) == 0 {
-		e.logger.Debug("no sync provider or proposer for hypersync")
+	if e.syncProvider == nil {
+		e.logger.Debug("no sync provider for hypersync")
 		return
 	}
 	if bytes.Equal(proposer, e.proverAddress) {
@@ -1062,6 +1069,10 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte, expectedRoo
 		e.logger.Debug("global hypersync already running")
 		return
 	}
+
+	// Sync from our own master node instead of the proposer to avoid
+	// overburdening the proposer with sync requests from all workers.
+	selfPeerID := e.pubsub.GetPeerID()
 
 	go func() {
 		defer e.globalProverSyncInProgress.Store(false)
@@ -1074,7 +1085,7 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte, expectedRoo
 			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 		}
 
-		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
+		e.syncProvider.HyperSyncSelf(ctx, selfPeerID, shardKey, nil, expectedRoot)
 		if err := e.proverRegistry.Refresh(); err != nil {
 			e.logger.Warn(
 				"failed to refresh prover registry after hypersync",

@@ -448,6 +448,77 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSync(
 	}
 }
 
+// HyperSyncSelf syncs from our own master node using our peer ID.
+// This is used by workers to sync global prover state from their master
+// instead of burdening the proposer.
+func (p *SyncProvider[StateT, ProposalT]) HyperSyncSelf(
+	ctx context.Context,
+	selfPeerID peer.ID,
+	shardKey tries.ShardKey,
+	filter []byte,
+	expectedRoot []byte,
+) {
+	info := p.peerInfoManager.GetPeerInfo([]byte(selfPeerID))
+	if info == nil {
+		p.logger.Debug(
+			"no peer info for self, skipping self-sync",
+			zap.String("peer", selfPeerID.String()),
+		)
+		return
+	}
+	if len(info.Reachability) == 0 {
+		p.logger.Debug(
+			"no reachability info for self, skipping self-sync",
+			zap.String("peer", selfPeerID.String()),
+		)
+		return
+	}
+
+	phaseSyncs := []func(
+		protobufs.HypergraphComparisonService_HyperStreamClient,
+		tries.ShardKey,
+		[]byte,
+	){
+		p.hyperSyncVertexAdds,
+		p.hyperSyncVertexRemoves,
+		p.hyperSyncHyperedgeAdds,
+		p.hyperSyncHyperedgeRemoves,
+	}
+
+	for _, reachability := range info.Reachability {
+		if !bytes.Equal(reachability.Filter, filter) {
+			continue
+		}
+		for _, s := range reachability.StreamMultiaddrs {
+			for _, syncPhase := range phaseSyncs {
+				ch, err := p.getDirectChannel([]byte(selfPeerID), s)
+				if err != nil {
+					p.logger.Debug(
+						"could not establish direct channel for self-sync, trying next multiaddr",
+						zap.String("peer", selfPeerID.String()),
+						zap.String("multiaddr", s),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				client := protobufs.NewHypergraphComparisonServiceClient(ch)
+				str, err := client.HyperStream(ctx)
+				if err != nil {
+					p.logger.Error("error from self-sync", zap.Error(err))
+					return
+				}
+
+				syncPhase(str, shardKey, expectedRoot)
+				if cerr := ch.Close(); cerr != nil {
+					p.logger.Error("error while closing connection", zap.Error(cerr))
+				}
+			}
+		}
+		break
+	}
+}
+
 func (p *SyncProvider[StateT, ProposalT]) hyperSyncVertexAdds(
 	str protobufs.HypergraphComparisonService_HyperStreamClient,
 	shardKey tries.ShardKey,

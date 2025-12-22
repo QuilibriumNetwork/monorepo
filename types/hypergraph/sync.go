@@ -16,6 +16,7 @@ type SyncController struct {
 	syncStatus        map[string]*SyncInfo
 	maxActiveSessions int32
 	activeSessions    atomic.Int32
+	selfPeerID        string
 }
 
 func (s *SyncController) TryEstablishSyncSession(peerID string) bool {
@@ -25,10 +26,13 @@ func (s *SyncController) TryEstablishSyncSession(peerID string) bool {
 
 	info := s.getOrCreate(peerID)
 
-	// Try to increment peer's session count (up to maxSessionsPerPeer)
+	// Allow unlimited sessions from self (our own workers syncing to master)
+	isSelf := s.selfPeerID != "" && peerID == s.selfPeerID
+
+	// Try to increment peer's session count (up to maxSessionsPerPeer, unless self)
 	for {
 		current := info.activeSessions.Load()
-		if current >= maxSessionsPerPeer {
+		if !isSelf && current >= maxSessionsPerPeer {
 			return false
 		}
 		if info.activeSessions.CompareAndSwap(current, current+1) {
@@ -36,7 +40,8 @@ func (s *SyncController) TryEstablishSyncSession(peerID string) bool {
 		}
 	}
 
-	if !s.incrementActiveSessions() {
+	// Skip global session limit for self-sync
+	if !isSelf && !s.incrementActiveSessions() {
 		info.activeSessions.Add(-1)
 		return false
 	}
@@ -55,6 +60,8 @@ func (s *SyncController) EndSyncSession(peerID string) {
 		return
 	}
 
+	isSelf := s.selfPeerID != "" && peerID == s.selfPeerID
+
 	s.statusMu.RLock()
 	info := s.syncStatus[peerID]
 	s.statusMu.RUnlock()
@@ -66,7 +73,10 @@ func (s *SyncController) EndSyncSession(peerID string) {
 				return
 			}
 			if info.activeSessions.CompareAndSwap(current, current-1) {
-				s.decrementActiveSessions()
+				// Only decrement global counter for non-self sessions
+				if !isSelf {
+					s.decrementActiveSessions()
+				}
 				return
 			}
 		}
@@ -120,6 +130,12 @@ func NewSyncController(maxActiveSessions int) *SyncController {
 		syncStatus:        map[string]*SyncInfo{},
 		maxActiveSessions: max,
 	}
+}
+
+// SetSelfPeerID sets the self peer ID for the controller. Sessions from this
+// peer ID are allowed unlimited concurrency (for workers syncing to master).
+func (s *SyncController) SetSelfPeerID(peerID string) {
+	s.selfPeerID = peerID
 }
 
 func (s *SyncController) incrementActiveSessions() bool {
