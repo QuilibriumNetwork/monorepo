@@ -100,6 +100,14 @@ func (hg *HypergraphCRDT) publishSnapshot(root []byte) {
 	hg.snapshotMgr.publish(root)
 }
 
+// PublishSnapshot announces a new snapshot generation with the given commit root.
+// This should be called after Commit() to make the new state available for sync.
+// Clients can request sync against this root using the expectedRoot parameter.
+// The snapshot manager retains a limited number of historical generations.
+func (hg *HypergraphCRDT) PublishSnapshot(root []byte) {
+	hg.publishSnapshot(root)
+}
+
 func (hg *HypergraphCRDT) cloneSetWithStore(
 	set hypergraph.IdSet,
 	store tries.TreeBackingStore,

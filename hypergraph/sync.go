@@ -80,10 +80,15 @@ func (hg *HypergraphCRDT) HyperStream(
 // The caller (e.g. the client) must initiate the diff from its root.
 // After that, both sides exchange queries, branch info, and leaf updates until
 // their local trees are synchronized.
+//
+// If expectedRoot is provided, the server will attempt to use a snapshot with
+// a matching commit root. This allows the client to sync against a specific
+// known state rather than whatever the server's current state happens to be.
 func (hg *HypergraphCRDT) Sync(
 	stream protobufs.HypergraphComparisonService_HyperStreamClient,
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
+	expectedRoot []byte,
 ) (err error) {
 	const localSyncKey = "local-sync"
 	if !hg.syncController.TryEstablishSyncSession(localSyncKey) {
@@ -138,6 +143,7 @@ func (hg *HypergraphCRDT) Sync(
 				Path:            toInt32Slice(path),
 				Commitment:      set.GetTree().Commit(false),
 				IncludeLeafData: false,
+				ExpectedRoot:    expectedRoot,
 			},
 		},
 	}); err != nil {
@@ -2355,7 +2361,7 @@ func (hg *HypergraphCRDT) syncTreeServer(
 	}
 
 	snapshotStart := time.Now()
-	handle := hg.snapshotMgr.acquire(shardKey)
+	handle := hg.snapshotMgr.acquire(shardKey, query.ExpectedRoot)
 	if handle == nil {
 		return errors.New("hypergraph shard snapshot unavailable")
 	}
