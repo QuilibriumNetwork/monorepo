@@ -1870,6 +1870,214 @@ func (p *ProverUpdate) FromCanonicalBytes(data []byte) error {
 	return nil
 }
 
+// AltShardUpdate serialization methods
+func (a *AltShardUpdate) ToCanonicalBytes() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Write type prefix
+	if err := binary.Write(buf, binary.BigEndian, AltShardUpdateType); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write public_key (length-prefixed)
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(a.PublicKey)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(a.PublicKey); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write frame_number
+	if err := binary.Write(buf, binary.BigEndian, a.FrameNumber); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write vertex_adds_root (length-prefixed)
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(a.VertexAddsRoot)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(a.VertexAddsRoot); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write vertex_removes_root (length-prefixed)
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(a.VertexRemovesRoot)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(a.VertexRemovesRoot); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write hyperedge_adds_root (length-prefixed)
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(a.HyperedgeAddsRoot)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(a.HyperedgeAddsRoot); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write hyperedge_removes_root (length-prefixed)
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(a.HyperedgeRemovesRoot)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(a.HyperedgeRemovesRoot); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write signature (length-prefixed)
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(a.Signature)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(a.Signature); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (a *AltShardUpdate) FromCanonicalBytes(data []byte) error {
+	buf := bytes.NewBuffer(data)
+
+	// Read and verify type prefix
+	var typePrefix uint32
+	if err := binary.Read(buf, binary.BigEndian, &typePrefix); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if typePrefix != AltShardUpdateType {
+		return errors.Wrap(
+			errors.New("invalid type prefix"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read public_key
+	var pubKeyLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &pubKeyLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if pubKeyLen > 600 {
+		return errors.Wrap(
+			errors.New("invalid public key length"),
+			"from canonical bytes",
+		)
+	}
+	a.PublicKey = make([]byte, pubKeyLen)
+	if _, err := buf.Read(a.PublicKey); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read frame_number
+	if err := binary.Read(buf, binary.BigEndian, &a.FrameNumber); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read vertex_adds_root
+	var vertexAddsLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &vertexAddsLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if vertexAddsLen > 80 {
+		return errors.Wrap(
+			errors.New("invalid vertex adds root length"),
+			"from canonical bytes",
+		)
+	}
+	a.VertexAddsRoot = make([]byte, vertexAddsLen)
+	if _, err := buf.Read(a.VertexAddsRoot); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read vertex_removes_root
+	var vertexRemovesLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &vertexRemovesLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if vertexRemovesLen > 80 {
+		return errors.Wrap(
+			errors.New("invalid vertex removes root length"),
+			"from canonical bytes",
+		)
+	}
+	a.VertexRemovesRoot = make([]byte, vertexRemovesLen)
+	if _, err := buf.Read(a.VertexRemovesRoot); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read hyperedge_adds_root
+	var hyperedgeAddsLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &hyperedgeAddsLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if hyperedgeAddsLen > 80 {
+		return errors.Wrap(
+			errors.New("invalid hyperedge adds root length"),
+			"from canonical bytes",
+		)
+	}
+	a.HyperedgeAddsRoot = make([]byte, hyperedgeAddsLen)
+	if _, err := buf.Read(a.HyperedgeAddsRoot); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read hyperedge_removes_root
+	var hyperedgeRemovesLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &hyperedgeRemovesLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if hyperedgeRemovesLen > 80 {
+		return errors.Wrap(
+			errors.New("invalid hyperedge removes root length"),
+			"from canonical bytes",
+		)
+	}
+	a.HyperedgeRemovesRoot = make([]byte, hyperedgeRemovesLen)
+	if _, err := buf.Read(a.HyperedgeRemovesRoot); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read signature
+	var sigLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 80 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
+	}
+	a.Signature = make([]byte, sigLen)
+	if _, err := buf.Read(a.Signature); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	return nil
+}
+
 func (m *MessageRequest) ToCanonicalBytes() ([]byte, error) {
 	buf := new(bytes.Buffer)
 
@@ -1933,6 +2141,8 @@ func (m *MessageRequest) ToCanonicalBytes() ([]byte, error) {
 		innerBytes, err = request.CodeFinalize.ToCanonicalBytes()
 	case *MessageRequest_Shard:
 		innerBytes, err = request.Shard.ToCanonicalBytes()
+	case *MessageRequest_AltShardUpdate:
+		innerBytes, err = request.AltShardUpdate.ToCanonicalBytes()
 	default:
 		return nil, errors.New("unknown request type")
 	}
@@ -2188,6 +2398,15 @@ func (m *MessageRequest) FromCanonicalBytes(data []byte) error {
 			return errors.Wrap(err, "from canonical bytes")
 		}
 		m.Request = &MessageRequest_Shard{Shard: frameHeader}
+
+	case AltShardUpdateType:
+		altShardUpdate := &AltShardUpdate{}
+		if err := altShardUpdate.FromCanonicalBytes(dataBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		m.Request = &MessageRequest_AltShardUpdate{
+			AltShardUpdate: altShardUpdate,
+		}
 
 	default:
 		return errors.Errorf("unknown message type: 0x%08X", innerType)

@@ -583,48 +583,74 @@ func NewAppConsensusEngine(
 			initializeCertifiedGenesis(true)
 		}
 	} else {
+		stateRestored := false
 		qc, err := engine.clockStore.GetQuorumCertificate(
 			engine.appAddress,
 			latest.FinalizedRank,
 		)
-		if err != nil || qc.GetFrameNumber() == 0 {
-			initializeCertifiedGenesis(true)
-		} else {
-			frame, _, err := engine.clockStore.GetShardClockFrame(
+		if err == nil && qc.GetFrameNumber() != 0 {
+			frame, _, frameErr := engine.clockStore.GetShardClockFrame(
 				engine.appAddress,
 				qc.GetFrameNumber(),
 				false,
 			)
-			if err != nil {
-				panic(err)
+			if frameErr != nil {
+				// Frame data was deleted (e.g., non-archive mode cleanup) but
+				// QC/consensus state still exists. Re-initialize genesis and
+				// let sync recover the state.
+				logger.Warn(
+					"frame missing for finalized QC, re-initializing genesis",
+					zap.Uint64("finalized_rank", latest.FinalizedRank),
+					zap.Uint64("qc_frame_number", qc.GetFrameNumber()),
+					zap.Error(frameErr),
+				)
+			} else {
+				parentFrame, _, parentFrameErr := engine.clockStore.GetShardClockFrame(
+					engine.appAddress,
+					qc.GetFrameNumber()-1,
+					false,
+				)
+				if parentFrameErr != nil {
+					// Parent frame missing - same recovery path
+					logger.Warn(
+						"parent frame missing for finalized QC, re-initializing genesis",
+						zap.Uint64("finalized_rank", latest.FinalizedRank),
+						zap.Uint64("qc_frame_number", qc.GetFrameNumber()),
+						zap.Error(parentFrameErr),
+					)
+				} else {
+					parentQC, parentQCErr := engine.clockStore.GetQuorumCertificate(
+						engine.appAddress,
+						parentFrame.GetRank(),
+					)
+					if parentQCErr != nil {
+						// Parent QC missing - same recovery path
+						logger.Warn(
+							"parent QC missing, re-initializing genesis",
+							zap.Uint64("finalized_rank", latest.FinalizedRank),
+							zap.Uint64("parent_rank", parentFrame.GetRank()),
+							zap.Error(parentQCErr),
+						)
+					} else {
+						state = &models.CertifiedState[*protobufs.AppShardFrame]{
+							State: &models.State[*protobufs.AppShardFrame]{
+								Rank:                    frame.GetRank(),
+								Identifier:              frame.Identity(),
+								ProposerID:              frame.Source(),
+								ParentQuorumCertificate: parentQC,
+								Timestamp:               frame.GetTimestamp(),
+								State:                   &frame,
+							},
+							CertifyingQuorumCertificate: qc,
+						}
+						pending = engine.getPendingProposals(frame.Header.FrameNumber)
+						stateRestored = true
+					}
+				}
 			}
-			parentFrame, _, err := engine.clockStore.GetShardClockFrame(
-				engine.appAddress,
-				qc.GetFrameNumber()-1,
-				false,
-			)
-			if err != nil {
-				panic(err)
-			}
-			parentQC, err := engine.clockStore.GetQuorumCertificate(
-				engine.appAddress,
-				parentFrame.GetRank(),
-			)
-			if err != nil {
-				panic(err)
-			}
-			state = &models.CertifiedState[*protobufs.AppShardFrame]{
-				State: &models.State[*protobufs.AppShardFrame]{
-					Rank:                    frame.GetRank(),
-					Identifier:              frame.Identity(),
-					ProposerID:              frame.Source(),
-					ParentQuorumCertificate: parentQC,
-					Timestamp:               frame.GetTimestamp(),
-					State:                   &frame,
-				},
-				CertifyingQuorumCertificate: qc,
-			}
-			pending = engine.getPendingProposals(frame.Header.FrameNumber)
+		}
+		if !stateRestored {
+			initializeCertifiedGenesis(true)
 		}
 	}
 

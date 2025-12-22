@@ -78,6 +78,27 @@ message ProverReject {
   repeated bytes filters = 4;
 }
 
+// AltShardUpdate allows external entities to maintain their own state trees
+// with provable ownership through signature verification. The shard address
+// is derived from the poseidon hash of the BLS48-581 public key.
+message AltShardUpdate {
+  // The BLS48-581 public key that owns this shard (585 bytes)
+  bytes public_key = 1;
+  // The frame number when this update was signed (must be within 2 frames)
+  uint64 frame_number = 2;
+  // The root hash for vertex adds tree (64 or 74 bytes)
+  bytes vertex_adds_root = 3;
+  // The root hash for vertex removes tree (64 or 74 bytes)
+  bytes vertex_removes_root = 4;
+  // The root hash for hyperedge adds tree (64 or 74 bytes)
+  bytes hyperedge_adds_root = 5;
+  // The root hash for hyperedge removes tree (64 or 74 bytes)
+  bytes hyperedge_removes_root = 6;
+  // The BLS48-581 signature (74 bytes) over (FrameNumber || VertexAddsRoot ||
+  // VertexRemovesRoot || HyperedgeAddsRoot || HyperedgeRemovesRoot)
+  bytes signature = 7;
+}
+
 message MessageRequest {
   oneof request {
     quilibrium.node.global.pb.ProverJoin join = 1;
@@ -105,6 +126,7 @@ message MessageRequest {
     quilibrium.node.compute.pb.CodeExecute code_execute = 23;
     quilibrium.node.compute.pb.CodeFinalize code_finalize = 24;
     quilibrium.node.global.pb.FrameHeader shard = 25;
+    quilibrium.node.global.pb.AltShardUpdate alt_shard_update = 26;
   }
   int64 timestamp = 99;
 }

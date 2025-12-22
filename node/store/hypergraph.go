@@ -401,6 +401,35 @@ func hypergraphCoveredPrefixKey() []byte {
 	return key
 }
 
+// hypergraphAltShardCommitKey returns the key for storing alt shard roots at a
+// specific frame number. The value stored at this key contains all four roots
+// concatenated (32 bytes each = 128 bytes total).
+func hypergraphAltShardCommitKey(
+	frameNumber uint64,
+	shardAddress []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_COMMIT}
+	key = binary.BigEndian.AppendUint64(key, frameNumber)
+	key = append(key, shardAddress...)
+	return key
+}
+
+// hypergraphAltShardCommitLatestKey returns the key for storing the latest
+// frame number for an alt shard. The value is an 8-byte big-endian frame number.
+func hypergraphAltShardCommitLatestKey(shardAddress []byte) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_COMMIT_LATEST}
+	key = append(key, shardAddress...)
+	return key
+}
+
+// hypergraphAltShardAddressIndexKey returns the key for marking that an alt
+// shard address exists. Used for iterating all alt shard addresses.
+func hypergraphAltShardAddressIndexKey(shardAddress []byte) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_ADDRESS_INDEX}
+	key = append(key, shardAddress...)
+	return key
+}
+
 func (p *PebbleHypergraphStore) copyShardData(
 	dst store.KVDB,
 	shardKey tries.ShardKey,
@@ -1700,7 +1729,7 @@ func (p *PebbleHypergraphStore) GetRootCommits(
 ) (map[tries.ShardKey][][]byte, error) {
 	iter, err := p.db.NewIter(
 		hypergraphVertexAddsShardCommitKey(frameNumber, nil),
-		hypergraphHyperedgeAddsShardCommitKey(
+		hypergraphHyperedgeRemovesShardCommitKey(
 			frameNumber,
 			bytes.Repeat([]byte{0xff}, 65),
 		),
@@ -2026,4 +2055,199 @@ func (p *PebbleHypergraphStore) InsertRawLeaf(
 	}
 
 	return nil
+}
+
+// SetAltShardCommit stores the four roots for an alt shard at a given frame
+// number and updates the latest index if this is the newest frame.
+func (p *PebbleHypergraphStore) SetAltShardCommit(
+	txn tries.TreeBackingStoreTransaction,
+	frameNumber uint64,
+	shardAddress []byte,
+	vertexAddsRoot []byte,
+	vertexRemovesRoot []byte,
+	hyperedgeAddsRoot []byte,
+	hyperedgeRemovesRoot []byte,
+) error {
+	if txn == nil {
+		return errors.Wrap(
+			errors.New("requires transaction"),
+			"set alt shard commit",
+		)
+	}
+
+	// Validate roots are valid sizes (64 or 74 bytes)
+	for _, root := range [][]byte{
+		vertexAddsRoot, vertexRemovesRoot, hyperedgeAddsRoot, hyperedgeRemovesRoot,
+	} {
+		if len(root) != 64 && len(root) != 74 {
+			return errors.Wrap(
+				errors.New("roots must be 64 or 74 bytes"),
+				"set alt shard commit",
+			)
+		}
+	}
+
+	// Store as length-prefixed values: 1 byte length + data for each root
+	value := make([]byte, 0, 4+len(vertexAddsRoot)+len(vertexRemovesRoot)+
+		len(hyperedgeAddsRoot)+len(hyperedgeRemovesRoot))
+	value = append(value, byte(len(vertexAddsRoot)))
+	value = append(value, vertexAddsRoot...)
+	value = append(value, byte(len(vertexRemovesRoot)))
+	value = append(value, vertexRemovesRoot...)
+	value = append(value, byte(len(hyperedgeAddsRoot)))
+	value = append(value, hyperedgeAddsRoot...)
+	value = append(value, byte(len(hyperedgeRemovesRoot)))
+	value = append(value, hyperedgeRemovesRoot...)
+
+	// Store the commit at the frame-specific key
+	commitKey := hypergraphAltShardCommitKey(frameNumber, shardAddress)
+	if err := txn.Set(commitKey, value); err != nil {
+		return errors.Wrap(err, "set alt shard commit")
+	}
+
+	// Update the latest index if this frame is newer
+	latestKey := hypergraphAltShardCommitLatestKey(shardAddress)
+	existing, closer, err := p.db.Get(latestKey)
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return errors.Wrap(err, "set alt shard commit: get latest")
+	}
+
+	shouldUpdate := true
+	if err == nil {
+		defer closer.Close()
+		if len(existing) == 8 {
+			existingFrame := binary.BigEndian.Uint64(existing)
+			if existingFrame >= frameNumber {
+				shouldUpdate = false
+			}
+		}
+	}
+
+	if shouldUpdate {
+		frameBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(frameBytes, frameNumber)
+		if err := txn.Set(latestKey, frameBytes); err != nil {
+			return errors.Wrap(err, "set alt shard commit: update latest")
+		}
+	}
+
+	// Ensure the address is in the index for RangeAltShardAddresses
+	indexKey := hypergraphAltShardAddressIndexKey(shardAddress)
+	if err := txn.Set(indexKey, []byte{0x01}); err != nil {
+		return errors.Wrap(err, "set alt shard commit: update index")
+	}
+
+	return nil
+}
+
+// GetLatestAltShardCommit retrieves the most recent roots for an alt shard.
+func (p *PebbleHypergraphStore) GetLatestAltShardCommit(
+	shardAddress []byte,
+) (
+	vertexAddsRoot []byte,
+	vertexRemovesRoot []byte,
+	hyperedgeAddsRoot []byte,
+	hyperedgeRemovesRoot []byte,
+	err error,
+) {
+	// Get the latest frame number for this shard
+	latestKey := hypergraphAltShardCommitLatestKey(shardAddress)
+	frameBytes, closer, err := p.db.Get(latestKey)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, nil, nil, nil, errors.Wrap(
+				store.ErrNotFound,
+				"get latest alt shard commit",
+			)
+		}
+		return nil, nil, nil, nil, errors.Wrap(err, "get latest alt shard commit")
+	}
+	defer closer.Close()
+
+	if len(frameBytes) != 8 {
+		return nil, nil, nil, nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get latest alt shard commit: invalid frame number",
+		)
+	}
+
+	frameNumber := binary.BigEndian.Uint64(frameBytes)
+
+	// Get the commit at that frame
+	commitKey := hypergraphAltShardCommitKey(frameNumber, shardAddress)
+	value, commitCloser, err := p.db.Get(commitKey)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, nil, nil, nil, errors.Wrap(
+				store.ErrNotFound,
+				"get latest alt shard commit: commit not found",
+			)
+		}
+		return nil, nil, nil, nil, errors.Wrap(err, "get latest alt shard commit")
+	}
+	defer commitCloser.Close()
+
+	// Parse length-prefixed format
+	offset := 0
+	parseRoot := func() ([]byte, error) {
+		if offset >= len(value) {
+			return nil, errors.New("unexpected end of data")
+		}
+		length := int(value[offset])
+		offset++
+		if offset+length > len(value) {
+			return nil, errors.New("root length exceeds data")
+		}
+		root := make([]byte, length)
+		copy(root, value[offset:offset+length])
+		offset += length
+		return root, nil
+	}
+
+	var parseErr error
+	vertexAddsRoot, parseErr = parseRoot()
+	if parseErr != nil {
+		return nil, nil, nil, nil, errors.Wrap(parseErr, "get latest alt shard commit")
+	}
+	vertexRemovesRoot, parseErr = parseRoot()
+	if parseErr != nil {
+		return nil, nil, nil, nil, errors.Wrap(parseErr, "get latest alt shard commit")
+	}
+	hyperedgeAddsRoot, parseErr = parseRoot()
+	if parseErr != nil {
+		return nil, nil, nil, nil, errors.Wrap(parseErr, "get latest alt shard commit")
+	}
+	hyperedgeRemovesRoot, parseErr = parseRoot()
+	if parseErr != nil {
+		return nil, nil, nil, nil, errors.Wrap(parseErr, "get latest alt shard commit")
+	}
+
+	return vertexAddsRoot, vertexRemovesRoot, hyperedgeAddsRoot, hyperedgeRemovesRoot, nil
+}
+
+// RangeAltShardAddresses returns all alt shard addresses that have stored
+// commits.
+func (p *PebbleHypergraphStore) RangeAltShardAddresses() ([][]byte, error) {
+	startKey := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_ADDRESS_INDEX}
+	endKey := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_ADDRESS_INDEX + 1}
+
+	iter, err := p.db.NewIter(startKey, endKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "range alt shard addresses")
+	}
+	defer iter.Close()
+
+	var addresses [][]byte
+	prefixLen := len(startKey)
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) > prefixLen {
+			addr := make([]byte, len(key)-prefixLen)
+			copy(addr, key[prefixLen:])
+			addresses = append(addresses, addr)
+		}
+	}
+
+	return addresses, nil
 }

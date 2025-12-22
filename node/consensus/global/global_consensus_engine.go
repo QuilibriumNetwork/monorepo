@@ -118,6 +118,7 @@ type GlobalConsensusEngine struct {
 	config             *config.Config
 	pubsub             tp2p.PubSub
 	hypergraph         hypergraph.Hypergraph
+	hypergraphStore    store.HypergraphStore
 	keyManager         typeskeys.KeyManager
 	keyStore           store.KeyStore
 	clockStore         store.ClockStore
@@ -298,6 +299,7 @@ func NewGlobalConsensusEngine(
 		config:                      config,
 		pubsub:                      ps,
 		hypergraph:                  hypergraph,
+		hypergraphStore:             hypergraphStore,
 		keyManager:                  keyManager,
 		keyStore:                    keyStore,
 		clockStore:                  clockStore,
@@ -566,6 +568,43 @@ func NewGlobalConsensusEngine(
 	componentBuilder.AddWorker(engine.globalTimeReel.Start)
 	componentBuilder.AddWorker(engine.startGlobalMessageAggregator)
 
+	adds := engine.hypergraph.(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(
+		tries.ShardKey{
+			L1: [3]byte{},
+			L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
+		},
+	)
+
+	if lc, _ := adds.GetTree().GetMetadata(); lc == 0 {
+		if config.P2P.Network == 0 {
+			genesisData := engine.getMainnetGenesisJSON()
+			if genesisData == nil {
+				panic("no genesis data")
+			}
+
+			state := hgstate.NewHypergraphState(engine.hypergraph)
+
+			err = engine.establishMainnetGenesisProvers(state, genesisData)
+			if err != nil {
+				engine.logger.Error("failed to establish provers", zap.Error(err))
+				panic(err)
+			}
+
+			err = state.Commit()
+			if err != nil {
+				engine.logger.Error("failed to commit", zap.Error(err))
+				panic(err)
+			}
+		} else {
+			engine.establishTestnetGenesisProvers()
+		}
+
+		err := engine.proverRegistry.Refresh()
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
 		latest, err := engine.consensusStore.GetConsensusState(nil)
 		var state *models.CertifiedState[*protobufs.GlobalFrame]
@@ -597,42 +636,6 @@ func NewGlobalConsensusEngine(
 		if err != nil {
 			establishGenesis()
 		} else {
-			adds := engine.hypergraph.(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(
-				tries.ShardKey{
-					L1: [3]byte{},
-					L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
-				},
-			)
-
-			if lc, _ := adds.GetTree().GetMetadata(); lc == 0 {
-				if config.P2P.Network == 0 {
-					genesisData := engine.getMainnetGenesisJSON()
-					if genesisData == nil {
-						panic("no genesis data")
-					}
-
-					state := hgstate.NewHypergraphState(engine.hypergraph)
-
-					err = engine.establishMainnetGenesisProvers(state, genesisData)
-					if err != nil {
-						engine.logger.Error("failed to establish provers", zap.Error(err))
-						panic(err)
-					}
-
-					err = state.Commit()
-					if err != nil {
-						engine.logger.Error("failed to commit", zap.Error(err))
-						panic(err)
-					}
-				} else {
-					engine.establishTestnetGenesisProvers()
-				}
-
-				err := engine.proverRegistry.Refresh()
-				if err != nil {
-					panic(err)
-				}
-			}
 			if latest.LatestTimeout != nil {
 				logger.Info(
 					"obtained latest consensus state",
@@ -1703,16 +1706,25 @@ func (e *GlobalConsensusEngine) materialize(
 		return err
 	}
 
-	err = e.proverRegistry.PruneOrphanJoins(frameNumber)
-	if err != nil {
-		return errors.Wrap(err, "materialize")
-	}
-
 	if err := state.Commit(); err != nil {
 		return errors.Wrap(err, "materialize")
 	}
 
+	// Persist any alt shard updates from this frame
+	if err := e.persistAltShardUpdates(frameNumber, requests); err != nil {
+		e.logger.Error(
+			"failed to persist alt shard updates",
+			zap.Uint64("frame_number", frameNumber),
+			zap.Error(err),
+		)
+	}
+
 	err = e.proverRegistry.ProcessStateTransition(state, frameNumber)
+	if err != nil {
+		return errors.Wrap(err, "materialize")
+	}
+
+	err = e.proverRegistry.PruneOrphanJoins(frameNumber)
 	if err != nil {
 		return errors.Wrap(err, "materialize")
 	}
@@ -1766,6 +1778,91 @@ func (e *GlobalConsensusEngine) materialize(
 		zap.String("local_root", localRootHex),
 		zap.String("proposer", hex.EncodeToString(proposer)),
 		zap.Duration("duration", time.Since(start)),
+	)
+
+	return nil
+}
+
+// persistAltShardUpdates iterates through frame requests to find and persist
+// any AltShardUpdate messages to the hypergraph store.
+func (e *GlobalConsensusEngine) persistAltShardUpdates(
+	frameNumber uint64,
+	requests []*protobufs.MessageBundle,
+) error {
+	var altUpdates []*protobufs.AltShardUpdate
+
+	// Collect all alt shard updates from the frame's requests
+	for _, bundle := range requests {
+		if bundle == nil {
+			continue
+		}
+		for _, req := range bundle.Requests {
+			if req == nil {
+				continue
+			}
+			if altUpdate := req.GetAltShardUpdate(); altUpdate != nil {
+				altUpdates = append(altUpdates, altUpdate)
+			}
+		}
+	}
+
+	if len(altUpdates) == 0 {
+		return nil
+	}
+
+	// Create a transaction for the hypergraph store
+	txn, err := e.hypergraphStore.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "persist alt shard updates")
+	}
+
+	for _, update := range altUpdates {
+		// Derive shard address from public key
+		if len(update.PublicKey) == 0 {
+			e.logger.Warn("alt shard update with empty public key, skipping")
+			continue
+		}
+
+		addrBI, err := poseidon.HashBytes(update.PublicKey)
+		if err != nil {
+			e.logger.Warn(
+				"failed to hash alt shard public key",
+				zap.Error(err),
+			)
+			continue
+		}
+		shardAddress := addrBI.FillBytes(make([]byte, 32))
+
+		// Persist the alt shard commit
+		err = e.hypergraphStore.SetAltShardCommit(
+			txn,
+			frameNumber,
+			shardAddress,
+			update.VertexAddsRoot,
+			update.VertexRemovesRoot,
+			update.HyperedgeAddsRoot,
+			update.HyperedgeRemovesRoot,
+		)
+		if err != nil {
+			txn.Abort()
+			return errors.Wrap(err, "persist alt shard updates")
+		}
+
+		e.logger.Debug(
+			"persisted alt shard update",
+			zap.Uint64("frame_number", frameNumber),
+			zap.String("shard_address", hex.EncodeToString(shardAddress)),
+		)
+	}
+
+	if err := txn.Commit(); err != nil {
+		return errors.Wrap(err, "persist alt shard updates")
+	}
+
+	e.logger.Info(
+		"persisted alt shard updates",
+		zap.Uint64("frame_number", frameNumber),
+		zap.Int("count", len(altUpdates)),
 	)
 
 	return nil
@@ -4031,6 +4128,82 @@ func (e *GlobalConsensusEngine) rebuildShardCommitments(
 		}
 
 		e.shardCommitmentKeySets[idx] = currKeys
+	}
+
+	// Apply alt shard overrides - these have externally-managed roots
+	if e.hypergraphStore != nil {
+		altShardAddrs, err := e.hypergraphStore.RangeAltShardAddresses()
+		if err != nil {
+			e.logger.Warn("failed to get alt shard addresses", zap.Error(err))
+		} else {
+			for _, shardAddr := range altShardAddrs {
+				vertexAdds, vertexRemoves, hyperedgeAdds, hyperedgeRemoves, err :=
+					e.hypergraphStore.GetLatestAltShardCommit(shardAddr)
+				if err != nil {
+					e.logger.Debug(
+						"failed to get alt shard commit",
+						zap.Binary("shard_address", shardAddr),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				// Calculate L1 indices (bloom filter) for this shard address
+				l1Indices := up2p.GetBloomFilterIndices(shardAddr, 256, 3)
+
+				// Insert each phase's root into the commitment trees
+				roots := [][]byte{vertexAdds, vertexRemoves, hyperedgeAdds, hyperedgeRemoves}
+				for phaseSet, root := range roots {
+					if len(root) == 0 {
+						continue
+					}
+
+					foldedShardKey := make([]byte, 32)
+					copy(foldedShardKey, shardAddr)
+					foldedShardKey[0] |= byte(phaseSet << 6)
+					keyStr := string(foldedShardKey)
+
+					for _, l1Idx := range l1Indices {
+						index := int(l1Idx)
+						if index >= len(e.shardCommitmentTrees) {
+							continue
+						}
+
+						if e.shardCommitmentTrees[index] == nil {
+							e.shardCommitmentTrees[index] = &tries.VectorCommitmentTree{}
+						}
+
+						if currentKeySets[index] == nil {
+							currentKeySets[index] = make(map[string]struct{})
+						}
+						currentKeySets[index][keyStr] = struct{}{}
+
+						tree := e.shardCommitmentTrees[index]
+						if existing, err := tree.Get(foldedShardKey); err == nil &&
+							bytes.Equal(existing, root) {
+							continue
+						}
+
+						if err := tree.Insert(
+							foldedShardKey,
+							slices.Clone(root),
+							nil,
+							big.NewInt(int64(len(root))),
+						); err != nil {
+							e.logger.Warn(
+								"failed to insert alt shard root",
+								zap.Binary("shard_address", shardAddr),
+								zap.Int("phase", phaseSet),
+								zap.Error(err),
+							)
+							continue
+						}
+
+						changedTrees[index] = true
+					}
+				}
+			}
+		}
 	}
 
 	for i := 0; i < len(e.shardCommitmentTrees); i++ {

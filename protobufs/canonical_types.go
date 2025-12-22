@@ -62,6 +62,7 @@ const (
 	TraversalProofType      uint32 = 0x0316
 	GlobalProposalType      uint32 = 0x0317
 	AppShardProposalType    uint32 = 0x0318
+	AltShardUpdateType      uint32 = 0x0319
 	TimeoutStateType        uint32 = 0x031C
 	TimeoutCertificateType  uint32 = 0x031D
 

@@ -46,6 +46,9 @@ type ProverAllocationInfo struct {
 	LeaveRejectFrameNumber uint64
 	// Last frame number the prover had proved
 	LastActiveFrameNumber uint64
+	// The 32-byte vertex address of this allocation in the hypergraph
+	// (derived from poseidon hash of "PROVER_ALLOCATION" + PublicKey + Filter)
+	VertexAddress []byte
 }
 
 // ProverInfo represents information about a prover

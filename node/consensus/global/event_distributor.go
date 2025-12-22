@@ -278,6 +278,12 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 
 const pendingFilterGraceFrames = 720
 
+// proposalTimeoutFrames is the number of frames to wait for a join proposal
+// to appear on-chain before clearing the worker's filter. If a proposal is
+// submitted but never lands (e.g., network issues, not included in frame),
+// we should reset the filter so the worker can try again.
+const proposalTimeoutFrames = 10
+
 func (e *GlobalConsensusEngine) emitCoverageEvent(
 	eventType typesconsensus.ControlEventType,
 	data *typesconsensus.CoverageEventData,
@@ -550,9 +556,17 @@ func (e *GlobalConsensusEngine) reconcileWorkerAllocations(
 	}
 
 	seenFilters := make(map[string]struct{})
+	rejectedFilters := make(map[string]struct{})
 	if self != nil {
 		for _, alloc := range self.Allocations {
 			if len(alloc.ConfirmationFilter) == 0 {
+				continue
+			}
+
+			// Track rejected allocations separately - we need to clear their
+			// workers immediately without waiting for the grace period
+			if alloc.Status == typesconsensus.ProverStatusRejected {
+				rejectedFilters[string(alloc.ConfirmationFilter)] = struct{}{}
 				continue
 			}
 
@@ -604,11 +618,30 @@ func (e *GlobalConsensusEngine) reconcileWorkerAllocations(
 			continue
 		}
 
+		// Immediately clear workers whose allocations were rejected
+		// (no grace period needed - the rejection is definitive)
+		if _, rejected := rejectedFilters[string(worker.Filter)]; rejected {
+			worker.Filter = nil
+			worker.Allocated = false
+			worker.PendingFilterFrame = 0
+			if err := e.workerManager.RegisterWorker(worker); err != nil {
+				e.logger.Warn(
+					"failed to clear rejected worker filter",
+					zap.Uint("core_id", worker.CoreId),
+					zap.Error(err),
+				)
+			}
+			continue
+		}
+
 		if worker.PendingFilterFrame != 0 {
 			if frameNumber <= worker.PendingFilterFrame {
 				continue
 			}
-			if frameNumber-worker.PendingFilterFrame < pendingFilterGraceFrames {
+			// Worker has a filter set from a proposal, but no on-chain allocation
+			// exists for this filter. Use shorter timeout since the proposal
+			// likely didn't land at all.
+			if frameNumber-worker.PendingFilterFrame < proposalTimeoutFrames {
 				continue
 			}
 		}

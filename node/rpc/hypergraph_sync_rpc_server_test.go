@@ -177,27 +177,44 @@ func TestHypergraphSyncServer(t *testing.T) {
 	servertxn.Commit()
 	clienttxn.Commit()
 
-	// Seed an orphan vertex that only exists on the client so pruning can remove it.
-	orphanData := make([]byte, 32)
-	_, _ = rand.Read(orphanData)
-	var orphanAddr [32]byte
-	copy(orphanAddr[:], orphanData)
-	orphanVertex := hgcrdt.NewVertex(
-		vertices1[0].GetAppAddress(),
-		orphanAddr,
-		dataTree1.Commit(inclusionProver, false),
-		dataTree1.GetSize(),
-	)
-	orphanShard := application.GetShardKey(orphanVertex)
-	require.Equal(t, shardKey, orphanShard, "orphan vertex must share shard")
+	// Seed many orphan vertices that only exist on the client so pruning can
+	// remove them. We create enough orphans with varied addresses to trigger
+	// tree restructuring (node merges) when they get deleted during sync.
+	// This tests the fix for the FullPrefix bug in lazy_proof_tree.go Delete().
+	numOrphans := 200
+	orphanVertices := make([]application.Vertex, numOrphans)
+	orphanIDs := make([][64]byte, numOrphans)
+
 	orphanTxn, err := clientHypergraphStore.NewTransaction(false)
 	require.NoError(t, err)
-	orphanID := orphanVertex.GetID()
-	require.NoError(t, clientHypergraphStore.SaveVertexTree(orphanTxn, orphanID[:], dataTree1))
-	require.NoError(t, crdts[1].AddVertex(orphanTxn, orphanVertex))
+
+	for i := 0; i < numOrphans; i++ {
+		orphanData := make([]byte, 32)
+		_, _ = rand.Read(orphanData)
+		// Mix in the index to ensure varied distribution across tree branches
+		binary.BigEndian.PutUint32(orphanData[28:], uint32(i))
+
+		var orphanAddr [32]byte
+		copy(orphanAddr[:], orphanData)
+		orphanVertices[i] = hgcrdt.NewVertex(
+			vertices1[0].GetAppAddress(),
+			orphanAddr,
+			dataTree1.Commit(inclusionProver, false),
+			dataTree1.GetSize(),
+		)
+		orphanShard := application.GetShardKey(orphanVertices[i])
+		require.Equal(t, shardKey, orphanShard, "orphan vertex %d must share shard", i)
+
+		orphanIDs[i] = orphanVertices[i].GetID()
+		require.NoError(t, clientHypergraphStore.SaveVertexTree(orphanTxn, orphanIDs[i][:], dataTree1))
+		require.NoError(t, crdts[1].AddVertex(orphanTxn, orphanVertices[i]))
+	}
 	require.NoError(t, orphanTxn.Commit())
+
 	clientSet := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey)
-	require.True(t, clientSet.Has(orphanID), "client must start with orphan leaf")
+	for i := 0; i < numOrphans; i++ {
+		require.True(t, clientSet.Has(orphanIDs[i]), "client must start with orphan leaf %d", i)
+	}
 	logger.Info("saved")
 
 	for _, op := range operations1 {
@@ -299,7 +316,11 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
 	str.CloseSend()
-	require.False(t, clientSet.Has(orphanID), "orphan vertex should be pruned after sync")
+
+	// Verify all orphan vertices were pruned after sync
+	for i := 0; i < numOrphans; i++ {
+		require.False(t, clientSet.Has(orphanIDs[i]), "orphan vertex %d should be pruned after sync", i)
+	}
 	leaves := crypto.CompareLeaves(
 		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
 		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
@@ -310,7 +331,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	clientTree := crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree()
 	coveredPrefixPath := clientTree.CoveredPrefix
 	if len(coveredPrefixPath) == 0 {
-		coveredPrefixPath = tries.GetFullPath(orphanID[:])[:0]
+		coveredPrefixPath = tries.GetFullPath(orphanIDs[0][:])[:0]
 	}
 	allLeaves := tries.GetAllLeaves(
 		clientTree.SetType,

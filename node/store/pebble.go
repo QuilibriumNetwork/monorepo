@@ -62,6 +62,11 @@ var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_158,
 	migration_2_1_0_159,
 	migration_2_1_0_17,
+	migration_2_1_0_171,
+	migration_2_1_0_172,
+	migration_2_1_0_172,
+	migration_2_1_0_173,
+	migration_2_1_0_18,
 }
 
 func NewPebbleDB(
@@ -675,6 +680,22 @@ func migration_2_1_0_159(b *pebble.Batch) error {
 }
 
 func migration_2_1_0_17(b *pebble.Batch) error {
+	return nil
+}
+
+func migration_2_1_0_171(b *pebble.Batch) error {
+	return nil
+}
+
+func migration_2_1_0_172(b *pebble.Batch) error {
+	return nil
+}
+
+func migration_2_1_0_173(b *pebble.Batch) error {
+	return nil
+}
+
+func migration_2_1_0_18(b *pebble.Batch) error {
 	// Global shard key: L1={0,0,0}, L2=0xff*32
 	globalShardKey := tries.ShardKey{
 		L1: [3]byte{},

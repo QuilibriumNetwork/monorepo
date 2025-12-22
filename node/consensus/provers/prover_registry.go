@@ -523,31 +523,37 @@ func (r *ProverRegistry) pruneAllocationVertex(
 	if info == nil {
 		return errors.New("missing info")
 	}
-	if len(info.PublicKey) == 0 {
-		r.logger.Warn(
-			"unable to prune allocation without public key",
-			zap.String("address", hex.EncodeToString(info.Address)),
-		)
-		return errors.New("invalid record")
-	}
-
-	allocationHash, err := poseidon.HashBytes(
-		slices.Concat(
-			[]byte("PROVER_ALLOCATION"),
-			info.PublicKey,
-			allocation.ConfirmationFilter,
-		),
-	)
-	if err != nil {
-		return errors.Wrap(err, "prune allocation hash")
-	}
 
 	var vertexID [64]byte
 	copy(vertexID[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-	copy(
-		vertexID[32:],
-		allocationHash.FillBytes(make([]byte, 32)),
-	)
+
+	// Use pre-computed VertexAddress if available, otherwise derive from public
+	// key
+	if len(allocation.VertexAddress) == 32 {
+		copy(vertexID[32:], allocation.VertexAddress)
+	} else if len(info.PublicKey) == 0 {
+		r.logger.Warn(
+			"unable to prune allocation without vertex address or public key",
+			zap.String("address", hex.EncodeToString(info.Address)),
+		)
+		return nil
+	} else {
+		// Fallback: derive vertex address from public key (legacy path)
+		allocationHash, err := poseidon.HashBytes(
+			slices.Concat(
+				[]byte("PROVER_ALLOCATION"),
+				info.PublicKey,
+				allocation.ConfirmationFilter,
+			),
+		)
+		if err != nil {
+			return errors.Wrap(err, "prune allocation hash")
+		}
+		copy(
+			vertexID[32:],
+			allocationHash.FillBytes(make([]byte, 32)),
+		)
+	}
 
 	shardKey := tries.ShardKey{
 		L1: [3]byte{0x00, 0x00, 0x00},
@@ -1224,7 +1230,7 @@ func (r *ProverRegistry) extractGlobalState() error {
 				lastActiveFrameNumber = binary.BigEndian.Uint64(bytes)
 			}
 
-			// Create allocation info
+			// Create allocation info - key[32:] contains the allocation vertex address
 			allocationInfo := consensus.ProverAllocationInfo{
 				Status:                  mappedStatus,
 				ConfirmationFilter:      confirmationFilter,
@@ -1239,6 +1245,7 @@ func (r *ProverRegistry) extractGlobalState() error {
 				LeaveConfirmFrameNumber: leaveConfirmFrameNumber,
 				LeaveRejectFrameNumber:  leaveRejectFrameNumber,
 				LastActiveFrameNumber:   lastActiveFrameNumber,
+				VertexAddress:           append([]byte(nil), key[32:]...),
 			}
 
 			// Create or update ProverInfo
@@ -1723,6 +1730,11 @@ func (r *ProverRegistry) processProverChange(
 								leaveRejectFrameNumber
 							proverInfo.Allocations[i].LastActiveFrameNumber =
 								lastActiveFrameNumber
+							// Ensure VertexAddress is set (for backwards compatibility)
+							if len(proverInfo.Allocations[i].VertexAddress) == 0 {
+								proverInfo.Allocations[i].VertexAddress =
+									append([]byte(nil), proverAddress...)
+							}
 							found = true
 						}
 					}
@@ -1744,6 +1756,7 @@ func (r *ProverRegistry) processProverChange(
 								LeaveConfirmFrameNumber: leaveConfirmFrameNumber,
 								LeaveRejectFrameNumber:  leaveRejectFrameNumber,
 								LastActiveFrameNumber:   lastActiveFrameNumber,
+								VertexAddress:           append([]byte(nil), proverAddress...),
 							},
 						)
 					}
@@ -2053,6 +2066,7 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 					LeaveConfirmFrameNumber: allocation.LeaveConfirmFrameNumber,
 					LeaveRejectFrameNumber:  allocation.LeaveRejectFrameNumber,
 					LastActiveFrameNumber:   allocation.LastActiveFrameNumber,
+					VertexAddress:           make([]byte, len(allocation.VertexAddress)),
 				}
 				copy(
 					proverCopy.Allocations[i].ConfirmationFilter,
@@ -2061,6 +2075,10 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 				copy(
 					proverCopy.Allocations[i].RejectionFilter,
 					allocation.RejectionFilter,
+				)
+				copy(
+					proverCopy.Allocations[i].VertexAddress,
+					allocation.VertexAddress,
 				)
 			}
 

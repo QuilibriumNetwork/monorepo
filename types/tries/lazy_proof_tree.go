@@ -2045,11 +2045,25 @@ func (t *LazyVectorCommitmentTree) Delete(
 					mergedPrefix = append(mergedPrefix, lastChildIndex)
 					mergedPrefix = append(mergedPrefix, childBranch.Prefix...)
 
+					// Delete the child node from its old location before updating
+					err := t.Store.DeleteNode(
+						txn,
+						t.SetType,
+						t.PhaseType,
+						t.ShardKey,
+						generateKeyFromPath(childBranch.FullPrefix),
+						childBranch.FullPrefix,
+					)
+					if err != nil {
+						log.Panic("failed to delete old child path", zap.Error(err))
+					}
+
 					childBranch.Prefix = mergedPrefix
+					childBranch.FullPrefix = n.FullPrefix // Update to parent's position
 					childBranch.Commitment = nil
 
 					// Delete this node from storage
-					err := t.Store.DeleteNode(
+					err = t.Store.DeleteNode(
 						txn,
 						t.SetType,
 						t.PhaseType,
@@ -2061,7 +2075,7 @@ func (t *LazyVectorCommitmentTree) Delete(
 						log.Panic("failed to delete path", zap.Error(err))
 					}
 
-					// Insert the merged child at this path
+					// Insert the merged child at the parent's path
 					err = t.Store.InsertNode(
 						txn,
 						t.SetType,
@@ -2131,7 +2145,7 @@ func (t *LazyVectorCommitmentTree) Delete(
 
 func SerializeTree(tree *LazyVectorCommitmentTree) ([]byte, error) {
 	tree.treeMx.Lock()
-	defer tree.treeMx.RLock()
+	defer tree.treeMx.Unlock()
 	var buf bytes.Buffer
 	if err := serializeNode(&buf, tree.Root); err != nil {
 		return nil, fmt.Errorf("failed to serialize tree: %w", err)
