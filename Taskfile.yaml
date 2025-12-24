@@ -168,3 +168,35 @@ tasks:
     desc: Test the Quilibrium docker image.
     cmds:
       - client/test/run_tests.sh -d 'ubuntu' -v '24.04'
+
+  config:gen:
+    desc: Generate configuration and keys using Go.
+    cmds:
+      - go run ./utils/config-gen --config {{.CONFIG_DIR | default ".config"}}
+
+
+  build:node:source:
+    desc: Build the optimized Quilibrium node-only docker image.
+    cmds:
+      - |
+        docker build \
+        --target node-only \
+        -f Dockerfile.source \
+        --build-arg NODE_VERSION={{.VERSION}} \
+        --build-arg GIT_REPO={{.GIT_REPO}} \
+        --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
+        --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-node-only \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
+        .
+
+  deploy:node:
+    desc: Run the Quilibrium node using host networking and external config.
+    cmds:
+      - |
+        docker run -d --name q-node \
+           --network host \
+           --restart unless-stopped \
+           -v {{.CONFIG_DIR | default "$(pwd)/.config"}}:/root/.config \
+           ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
+           -signature-check=false

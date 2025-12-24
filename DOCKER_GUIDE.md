@@ -34,53 +34,55 @@ sudo ufw reload
 Quilibrium nodes require a valid configuration and cryptographic keys to participate in the network. For containerized deployments, it is recommended to generate these separately from the main node execution.
 
 ### Generating Config
-You can use the `config-gen` utility included in the Docker image or build it from source.
+You can use the `config-gen` utility included
 
-**Using Go (from repo root):**
+**Using Task (Recommended):**
 ```bash
-go run ./utils/config-gen --config $(pwd)/.config
+task config:gen
 ```
 
-**Using Docker:**
+You can override the directory using `CONFIG_DIR`:
 ```bash
-docker run --rm -it \
-  --entrypoint config-gen \
-  -v $(pwd)/.config:/root/.config \
-  quilibrium --config /root/.config
+task config:gen CONFIG_DIR=/path/to/config
 ```
 
 ## 3. Build from Source
 
-Using `DOCKER_BUILDKIT`, we can build a highly optimized, slim image specifically for the node.
-
-### The Build Command
 Navigate to your monorepo directory and execute:
 
+**Using Task:**
+```bash
+task build:node:source
+```
+
+**Using Docker directly:**
 ```bash
 DOCKER_BUILDKIT=1 docker build \
   --target node-only \
   -f Dockerfile.source \
   --build-arg GIT_COMMIT=$(git log -1 --format=%h) \
-  -t quilibrium \
-  -t quilibrium:$(git describe --tags --abbrev=0 2>/dev/null || echo "latest") .
+  -t quilibrium:node-only .
 ```
 
-### Why these flags?
-- `--target node-only`: Excludes unnecessary build tools from the final image.
-- `--build-arg GIT_COMMIT`: Embeds the specific version hash into the binary for network identification.
-- `-t quilibrium:tag`: Tags the image with a specific version for easy management and rollbacks.
 
 ## 4. Deployment
 
 For servers with dedicated public IPs, **Host Networking** is the recommended deployment method. It eliminates Docker NAT overhead and ensures the node is easily reachable by peers.
 
 ### Run the Container
+
+**Using Task:**
+```bash
+task deploy:node
+```
+
+**Using Docker directly:**
 ```bash
 docker run -d --name q-node \
    --network host \
    --restart unless-stopped \
    -v $(pwd)/.config:/root/.config \
-   quilibrium -signature-check=false
+   quilibrium:node-only -signature-check=false
 ```
 
 ## 5. Managing the Container
