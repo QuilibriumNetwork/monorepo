@@ -33,17 +33,20 @@ sudo ufw reload
 
 Quilibrium nodes require a valid configuration and cryptographic keys to participate in the network. For containerized deployments, it is recommended to generate these separately from the main node execution.
 
-### Why Separate Config Generation?
-1. **Security**: Sensitive key generation is handled explicitly as a separate step.
-2. **Immutability**: Pre-generated configurations can be mounted as read-only volumes, following container best practices.
-3. **Stability**: Ensures consistent network settings (like UDP/QUIC-v1) before the node starts.
-
 ### Generating Config
 You can use the `config-gen` utility included in the Docker image or build it from source.
 
+**Using Go (from repo root):**
+```bash
+go run ./utils/config-gen --config $(pwd)/.config
+```
+
 **Using Docker:**
 ```bash
-docker run --rm -v $(pwd)/.config:/root/.config quilibrium --target node-only config-gen --config /root/.config
+docker run --rm -it \
+  --entrypoint config-gen \
+  -v $(pwd)/.config:/root/.config \
+  quilibrium --config /root/.config
 ```
 
 ## 3. Build from Source
