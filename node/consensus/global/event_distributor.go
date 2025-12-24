@@ -118,6 +118,10 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 								e.evaluateForProposals(ctx, data, needsProposals)
 							} else {
 								self, effectiveSeniority := e.allocationContext()
+								// Still reconcile allocations even when all workers appear
+								// allocated - this clears stale filters that no longer match
+								// prover allocations on-chain.
+								e.reconcileWorkerAllocations(data.Frame.Header.FrameNumber, self)
 								e.checkExcessPendingJoins(self, data.Frame.Header.FrameNumber)
 								e.logAllocationStatusOnly(ctx, data, self, effectiveSeniority)
 							}

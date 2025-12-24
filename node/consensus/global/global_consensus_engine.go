@@ -1625,6 +1625,25 @@ func (e *GlobalConsensusEngine) materialize(
 		return errors.Wrap(err, "materialize")
 	}
 
+	// Check prover root BEFORE processing transactions. If there's a mismatch,
+	// we need to sync first, otherwise we'll apply transactions on top of
+	// divergent state and then sync will delete the newly added records.
+	if len(expectedProverRoot) > 0 {
+		localRoot, localErr := e.computeLocalProverRoot(frameNumber)
+		if localErr == nil && len(localRoot) > 0 {
+			if !bytes.Equal(localRoot, expectedProverRoot) {
+				e.logger.Info(
+					"prover root mismatch detected before processing frame, syncing first",
+					zap.Uint64("frame_number", frameNumber),
+					zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
+					zap.String("local_root", hex.EncodeToString(localRoot)),
+				)
+				// Perform blocking hypersync before continuing
+				e.performBlockingProverHypersync(proposer, expectedProverRoot)
+			}
+		}
+	}
+
 	var state state.State
 	state = hgstate.NewHypergraphState(e.hypergraph)
 
@@ -1736,23 +1755,13 @@ func (e *GlobalConsensusEngine) materialize(
 		return errors.Wrap(err, "materialize")
 	}
 
-	shouldVerifyRoot := !e.config.Engine.ArchiveMode || e.config.P2P.Network == 99
 	localProverRoot, localRootErr := e.computeLocalProverRoot(frameNumber)
 	if localRootErr != nil {
-		logMsg := "failed to compute local prover root"
-		if shouldVerifyRoot {
-			e.logger.Warn(
-				logMsg,
-				zap.Uint64("frame_number", frameNumber),
-				zap.Error(localRootErr),
-			)
-		} else {
-			e.logger.Debug(
-				logMsg,
-				zap.Uint64("frame_number", frameNumber),
-				zap.Error(localRootErr),
-			)
-		}
+		e.logger.Warn(
+			"failed to compute local prover root",
+			zap.Uint64("frame_number", frameNumber),
+			zap.Error(localRootErr),
+		)
 	}
 
 	// Publish the snapshot generation with the new root so clients can sync
@@ -1763,7 +1772,7 @@ func (e *GlobalConsensusEngine) materialize(
 		}
 	}
 
-	if len(localProverRoot) > 0 && shouldVerifyRoot {
+	if len(localProverRoot) > 0 {
 		if e.verifyProverRoot(
 			frameNumber,
 			expectedProverRoot,
@@ -1985,7 +1994,77 @@ func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte, expected
 	}()
 }
 
+// performBlockingProverHypersync performs a synchronous hypersync that blocks
+// until completion. This is used at the start of materialize to ensure we sync
+// before applying any transactions when there's a prover root mismatch.
+func (e *GlobalConsensusEngine) performBlockingProverHypersync(proposer []byte, expectedRoot []byte) {
+	if e.syncProvider == nil || len(proposer) == 0 {
+		e.logger.Debug("blocking hypersync: no sync provider or proposer")
+		return
+	}
+	if bytes.Equal(proposer, e.getProverAddress()) {
+		e.logger.Debug("blocking hypersync: we are the proposer")
+		return
+	}
+
+	// Wait for any existing sync to complete first
+	for e.proverSyncInProgress.Load() {
+		e.logger.Debug("blocking hypersync: waiting for existing sync to complete")
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Mark sync as in progress
+	if !e.proverSyncInProgress.CompareAndSwap(false, true) {
+		// Another sync started, wait for it
+		for e.proverSyncInProgress.Load() {
+			time.Sleep(100 * time.Millisecond)
+		}
+		return
+	}
+	defer e.proverSyncInProgress.Store(false)
+
+	e.logger.Info(
+		"performing blocking hypersync before processing frame",
+		zap.String("proposer", hex.EncodeToString(proposer)),
+		zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Set up shutdown handler
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-e.ShutdownSignal():
+			cancel()
+		case <-done:
+		}
+	}()
+
+	shardKey := tries.ShardKey{
+		L1: [3]byte{0x00, 0x00, 0x00},
+		L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+	}
+
+	// Perform sync synchronously (blocking)
+	e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
+	close(done)
+
+	if err := e.proverRegistry.Refresh(); err != nil {
+		e.logger.Warn(
+			"failed to refresh prover registry after blocking hypersync",
+			zap.Error(err),
+		)
+	}
+
+	e.logger.Info("blocking hypersync completed")
+}
+
 func (e *GlobalConsensusEngine) reconcileLocalWorkerAllocations() {
+	if e.config.Engine.ArchiveMode {
+		return
+	}
 	if e.workerManager == nil || e.proverRegistry == nil {
 		return
 	}

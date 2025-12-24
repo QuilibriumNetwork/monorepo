@@ -563,14 +563,6 @@ func (s *streamManager) updateActivity() {
 	s.lastSent = time.Now()
 }
 
-type rawVertexSaver interface {
-	SaveVertexTreeRaw(
-		txn tries.TreeBackingStoreTransaction,
-		id []byte,
-		data []byte,
-	) error
-}
-
 type vertexTreeDeleter interface {
 	DeleteVertexTree(
 		txn tries.TreeBackingStoreTransaction,
@@ -601,488 +593,6 @@ func leafAckTimeout(count uint64) time.Duration {
 		return leafAckMaxTimeout
 	}
 	return timeout
-}
-
-func shouldUseRawSync(phaseSet protobufs.HypergraphPhaseSet) bool {
-	return phaseSet == protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS
-}
-
-func keyWithinCoveredPrefix(key []byte, prefix []int) bool {
-	if len(prefix) == 0 {
-		return true
-	}
-	path := tries.GetFullPath(key)
-	if len(path) < len(prefix) {
-		return false
-	}
-	for i, nib := range prefix {
-		if path[i] != nib {
-			return false
-		}
-	}
-	return true
-}
-
-// rawShardSync performs a full raw sync of all leaves from server to client.
-// This iterates directly over the database, bypassing in-memory tree caching
-// to ensure all leaves are sent even if the in-memory tree is stale.
-func (s *streamManager) rawShardSync(
-	shardKey tries.ShardKey,
-	phaseSet protobufs.HypergraphPhaseSet,
-	incomingLeaves <-chan *protobufs.HypergraphComparison,
-	coveredPrefix []int32,
-) error {
-	shardHex := hex.EncodeToString(shardKey.L2[:])
-	s.logger.Info(
-		"SERVER: starting raw shard sync (direct DB iteration)",
-		zap.String("shard_key", shardHex),
-	)
-	start := time.Now()
-	prefix := toIntSlice(coveredPrefix)
-
-	// Determine set and phase type strings
-	setType := string(hypergraph.VertexAtomType)
-	phaseType := string(hypergraph.AddsPhaseType)
-	switch phaseSet {
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS:
-		setType = string(hypergraph.VertexAtomType)
-		phaseType = string(hypergraph.AddsPhaseType)
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES:
-		setType = string(hypergraph.VertexAtomType)
-		phaseType = string(hypergraph.RemovesPhaseType)
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS:
-		setType = string(hypergraph.HyperedgeAtomType)
-		phaseType = string(hypergraph.AddsPhaseType)
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES:
-		setType = string(hypergraph.HyperedgeAtomType)
-		phaseType = string(hypergraph.RemovesPhaseType)
-	}
-
-	// Get raw leaf iterator from the database
-	iter, err := s.hypergraphStore.IterateRawLeaves(setType, phaseType, shardKey)
-	if err != nil {
-		s.logger.Error(
-			"SERVER: failed to create raw leaf iterator",
-			zap.String("shard_key", shardHex),
-			zap.Error(err),
-		)
-		return errors.Wrap(err, "raw shard sync")
-	}
-	defer iter.Close()
-
-	// First pass: count leaves
-	var count uint64
-	for valid := iter.First(); valid; valid = iter.Next() {
-		leaf, err := iter.Leaf()
-		if err != nil {
-			// Skip non-leaf nodes (branches)
-			continue
-		}
-		if leaf != nil && keyWithinCoveredPrefix(leaf.Key, prefix) {
-			count++
-		}
-	}
-
-	s.logger.Info(
-		"SERVER: raw sync sending metadata",
-		zap.String("shard_key", shardHex),
-		zap.Uint64("leaf_count", count),
-	)
-
-	// Send metadata with leaf count
-	if err := s.stream.Send(&protobufs.HypergraphComparison{
-		Payload: &protobufs.HypergraphComparison_Metadata{
-			Metadata: &protobufs.HypersyncMetadata{Leaves: count},
-		},
-	}); err != nil {
-		return errors.Wrap(err, "raw shard sync: send metadata")
-	}
-
-	// Create new iterator for sending (previous one is exhausted)
-	iter.Close()
-	iter, err = s.hypergraphStore.IterateRawLeaves(setType, phaseType, shardKey)
-	if err != nil {
-		return errors.Wrap(err, "raw shard sync: recreate iterator")
-	}
-	defer iter.Close()
-
-	// Second pass: send leaves
-	var sent uint64
-	for valid := iter.First(); valid; valid = iter.Next() {
-		select {
-		case <-s.ctx.Done():
-			return s.ctx.Err()
-		default:
-		}
-
-		leaf, err := iter.Leaf()
-		if err != nil {
-			// Skip non-leaf nodes
-			continue
-		}
-		if leaf == nil {
-			continue
-		}
-		if !keyWithinCoveredPrefix(leaf.Key, prefix) {
-			continue
-		}
-
-		update := &protobufs.LeafData{
-			Key:            leaf.Key,
-			Value:          leaf.Value,
-			HashTarget:     leaf.HashTarget,
-			Size:           leaf.Size,
-			UnderlyingData: leaf.UnderlyingData,
-		}
-
-		msg := &protobufs.HypergraphComparison{
-			Payload: &protobufs.HypergraphComparison_LeafData{
-				LeafData: update,
-			},
-		}
-
-		if err := s.stream.Send(msg); err != nil {
-			return errors.Wrap(err, "raw shard sync: send leaf")
-		}
-
-		sent++
-		// Update activity periodically to prevent idle timeout
-		if sent%100 == 0 {
-			s.updateActivity()
-		}
-		if sent%1000 == 0 {
-			s.logger.Debug(
-				"SERVER: raw sync progress",
-				zap.Uint64("sent", sent),
-				zap.Uint64("total", count),
-			)
-		}
-	}
-
-	s.logger.Info(
-		"SERVER: raw sync sent all leaves, waiting for ack",
-		zap.String("shard_key", shardHex),
-		zap.Uint64("sent", sent),
-	)
-
-	// Wait for acknowledgment
-	timeoutTimer := time.NewTimer(leafAckTimeout(count))
-	defer timeoutTimer.Stop()
-
-	select {
-	case <-s.ctx.Done():
-		return errors.Wrap(s.ctx.Err(), "raw shard sync: wait ack")
-	case msg, ok := <-incomingLeaves:
-		if !ok {
-			return errors.Wrap(errors.New("channel closed"), "raw shard sync: wait ack")
-		}
-		meta := msg.GetMetadata()
-		if meta == nil {
-			return errors.Wrap(errors.New("expected metadata ack"), "raw shard sync: wait ack")
-		}
-		if meta.Leaves != count {
-			return errors.Wrap(
-				fmt.Errorf("ack mismatch: expected %d, got %d", count, meta.Leaves),
-				"raw shard sync: wait ack",
-			)
-		}
-	case <-timeoutTimer.C:
-		return errors.Wrap(errors.New("timeout waiting for ack"), "raw shard sync")
-	}
-
-	s.logger.Info(
-		"SERVER: raw shard sync completed",
-		zap.String("shard_key", shardHex),
-		zap.Uint64("leaves_sent", sent),
-		zap.Duration("duration", time.Since(start)),
-	)
-	return nil
-}
-
-// receiveRawShardSync receives a full raw sync of all leaves from server.
-// It uses tree insertion to properly build the tree structure on the client.
-func (s *streamManager) receiveRawShardSync(
-	incomingLeaves <-chan *protobufs.HypergraphComparison,
-) error {
-	start := time.Now()
-	s.logger.Info("CLIENT: starting receiveRawShardSync")
-
-	expectedLeaves, err := s.awaitRawLeafMetadata(incomingLeaves)
-	if err != nil {
-		s.logger.Error("CLIENT: failed to receive metadata", zap.Error(err))
-		return err
-	}
-
-	s.logger.Info(
-		"CLIENT: received metadata",
-		zap.Uint64("expected_leaves", expectedLeaves),
-	)
-
-	var txn tries.TreeBackingStoreTransaction
-	var processed uint64
-	seenKeys := make(map[string]struct{})
-	for processed < expectedLeaves {
-		if processed%100 == 0 {
-			if txn != nil {
-				if err := txn.Commit(); err != nil {
-					return errors.Wrap(err, "receive raw shard sync")
-				}
-			}
-			txn, err = s.hypergraphStore.NewTransaction(false)
-			if err != nil {
-				return errors.Wrap(err, "receive raw shard sync")
-			}
-		}
-
-		leafMsg, err := s.awaitLeafData(incomingLeaves)
-		if err != nil {
-			if txn != nil {
-				txn.Abort()
-			}
-			s.logger.Error(
-				"CLIENT: failed to receive leaf",
-				zap.Uint64("processed", processed),
-				zap.Uint64("expected", expectedLeaves),
-				zap.Error(err),
-			)
-			return err
-		}
-
-		// Deserialize the atom from the raw value
-		theirs := AtomFromBytes(leafMsg.Value)
-		if theirs == nil {
-			if txn != nil {
-				txn.Abort()
-			}
-			return errors.Wrap(
-				errors.New("invalid atom"),
-				"receive raw shard sync",
-			)
-		}
-
-		// Persist underlying vertex tree data if present
-		if len(leafMsg.UnderlyingData) > 0 {
-			if saver, ok := s.hypergraphStore.(rawVertexSaver); ok {
-				if err := saver.SaveVertexTreeRaw(
-					txn,
-					leafMsg.Key,
-					leafMsg.UnderlyingData,
-				); err != nil {
-					txn.Abort()
-					return errors.Wrap(err, "receive raw shard sync: save vertex tree")
-				}
-			}
-		}
-
-		// Track key so we can prune anything absent from the authoritative list.
-		seenKeys[string(append([]byte(nil), leafMsg.Key...))] = struct{}{}
-
-		// Use Add to properly build tree structure
-		if err := s.localSet.Add(txn, theirs); err != nil {
-			txn.Abort()
-			return errors.Wrap(err, "receive raw shard sync: add atom")
-		}
-
-		processed++
-		if processed%1000 == 0 {
-			s.logger.Debug(
-				"CLIENT: raw sync progress",
-				zap.Uint64("processed", processed),
-				zap.Uint64("expected", expectedLeaves),
-			)
-		}
-	}
-
-	if txn != nil {
-		if err := txn.Commit(); err != nil {
-			return errors.Wrap(err, "receive raw shard sync")
-		}
-	}
-
-	// Send acknowledgment
-	if err := s.sendLeafMetadata(expectedLeaves); err != nil {
-		return errors.Wrap(err, "receive raw shard sync")
-	}
-
-	if err := s.pruneRawSyncExtras(seenKeys); err != nil {
-		return errors.Wrap(err, "receive raw shard sync")
-	}
-
-	s.logger.Info(
-		"CLIENT: raw shard sync completed",
-		zap.Uint64("leaves_received", expectedLeaves),
-		zap.Duration("duration", time.Since(start)),
-	)
-	return nil
-}
-
-func (s *streamManager) pruneRawSyncExtras(seen map[string]struct{}) error {
-	start := time.Now()
-	setType := s.localTree.SetType
-	phaseType := s.localTree.PhaseType
-	shardKey := s.localTree.ShardKey
-
-	iter, err := s.hypergraphStore.IterateRawLeaves(setType, phaseType, shardKey)
-	if err != nil {
-		return errors.Wrap(err, "prune raw sync extras: iterator")
-	}
-	defer iter.Close()
-
-	var txn tries.TreeBackingStoreTransaction
-	var pruned uint64
-
-	commitTxn := func() error {
-		if txn == nil {
-			return nil
-		}
-		if err := txn.Commit(); err != nil {
-			txn.Abort()
-			return err
-		}
-		txn = nil
-		return nil
-	}
-
-	for valid := iter.First(); valid; valid = iter.Next() {
-		leaf, err := iter.Leaf()
-		if err != nil || leaf == nil {
-			continue
-		}
-		if _, ok := seen[string(leaf.Key)]; ok {
-			continue
-		}
-
-		if txn == nil {
-			txn, err = s.hypergraphStore.NewTransaction(false)
-			if err != nil {
-				return errors.Wrap(err, "prune raw sync extras")
-			}
-		}
-
-		atom := AtomFromBytes(leaf.Value)
-		if atom == nil {
-			s.logger.Warn("CLIENT: skipping stale leaf with invalid atom", zap.String("key", hex.EncodeToString(leaf.Key)))
-			continue
-		}
-
-		if err := s.localSet.Delete(txn, atom); err != nil {
-			txn.Abort()
-			return errors.Wrap(err, "prune raw sync extras")
-		}
-		if err := s.deleteVertexTreeIfNeeded(txn, atom, leaf.Key); err != nil {
-			txn.Abort()
-			return errors.Wrap(err, "prune raw sync extras")
-		}
-
-		pruned++
-		if pruned%pruneTxnChunk == 0 {
-			if err := commitTxn(); err != nil {
-				return errors.Wrap(err, "prune raw sync extras")
-			}
-		}
-	}
-
-	if err := commitTxn(); err != nil {
-		return errors.Wrap(err, "prune raw sync extras")
-	}
-
-	if pruned > 0 {
-		s.logger.Info(
-			"CLIENT: pruned stale leaves after raw sync",
-			zap.Uint64("count", pruned),
-			zap.Duration("duration", time.Since(start)),
-		)
-	} else {
-		s.logger.Info(
-			"CLIENT: no stale leaves found after raw sync",
-			zap.Duration("duration", time.Since(start)),
-		)
-	}
-
-	return nil
-}
-
-func (s *streamManager) awaitRawLeafMetadata(
-	incomingLeaves <-chan *protobufs.HypergraphComparison,
-) (uint64, error) {
-	s.logger.Debug("CLIENT: awaitRawLeafMetadata waiting...")
-	select {
-	case <-s.ctx.Done():
-		return 0, errors.Wrap(
-			errors.New("context canceled"),
-			"await raw leaf metadata",
-		)
-	case msg, ok := <-incomingLeaves:
-		if !ok {
-			s.logger.Error("CLIENT: incomingLeaves channel closed")
-			return 0, errors.Wrap(
-				errors.New("channel closed"),
-				"await raw leaf metadata",
-			)
-		}
-		meta := msg.GetMetadata()
-		if meta == nil {
-			s.logger.Error(
-				"CLIENT: received non-metadata message while waiting for metadata",
-				zap.String("payload_type", fmt.Sprintf("%T", msg.Payload)),
-			)
-			return 0, errors.Wrap(
-				errors.New("invalid message: expected metadata"),
-				"await raw leaf metadata",
-			)
-		}
-		s.logger.Debug(
-			"CLIENT: received metadata",
-			zap.Uint64("leaves", meta.Leaves),
-		)
-		return meta.Leaves, nil
-	case <-time.After(leafAckTimeout(1)):
-		s.logger.Error("CLIENT: timeout waiting for metadata")
-		return 0, errors.Wrap(
-			errors.New("timed out waiting for metadata"),
-			"await raw leaf metadata",
-		)
-	}
-}
-
-func (s *streamManager) awaitLeafData(
-	incomingLeaves <-chan *protobufs.HypergraphComparison,
-) (*protobufs.LeafData, error) {
-	select {
-	case <-s.ctx.Done():
-		return nil, errors.Wrap(
-			errors.New("context canceled"),
-			"await leaf data",
-		)
-	case msg, ok := <-incomingLeaves:
-		if !ok {
-			return nil, errors.Wrap(
-				errors.New("channel closed"),
-				"await leaf data",
-			)
-		}
-		if leaf := msg.GetLeafData(); leaf != nil {
-			return leaf, nil
-		}
-		return nil, errors.Wrap(
-			errors.New("invalid message: expected leaf data"),
-			"await leaf data",
-		)
-	case <-time.After(leafAckTimeout(1)):
-		return nil, errors.Wrap(
-			errors.New("timed out waiting for leaf data"),
-			"await leaf data",
-		)
-	}
-}
-
-func (s *streamManager) sendLeafMetadata(leaves uint64) error {
-	s.logger.Debug("sending leaf metadata ack", zap.Uint64("leaves", leaves))
-	return s.stream.Send(&protobufs.HypergraphComparison{
-		Payload: &protobufs.HypergraphComparison_Metadata{
-			Metadata: &protobufs.HypersyncMetadata{Leaves: leaves},
-		},
-	})
 }
 
 // sendLeafData builds a LeafData message (with the full leaf data) for the
@@ -1797,6 +1307,14 @@ func (s *streamManager) pruneLocalSubtree(path []int32) (uint64, error) {
 
 	node, err := s.localTree.GetByPath(intPath)
 	if err != nil {
+		// "item not found" means the tree is empty at this path - nothing to prune
+		if strings.Contains(err.Error(), "item not found") {
+			s.logger.Debug(
+				"CLIENT: prune skipped, item not found",
+				zap.String("path", pathHex),
+			)
+			return 0, nil
+		}
 		return 0, errors.Wrap(err, "prune local subtree")
 	}
 
@@ -1901,20 +1419,13 @@ func (s *streamManager) persistLeafTree(
 		return nil
 	}
 
-	needsValidation := s.requiresTreeValidation()
-	_, canSaveRaw := s.hypergraphStore.(rawVertexSaver)
-
-	var tree *tries.VectorCommitmentTree
-	var err error
-	if needsValidation || !canSaveRaw {
-		tree, err = tries.DeserializeNonLazyTree(update.UnderlyingData)
-		if err != nil {
-			s.logger.Error("server returned invalid tree", zap.Error(err))
-			return err
-		}
+	tree, err := tries.DeserializeNonLazyTree(update.UnderlyingData)
+	if err != nil {
+		s.logger.Error("server returned invalid tree", zap.Error(err))
+		return err
 	}
 
-	if needsValidation {
+	if s.requiresTreeValidation() {
 		if err := s.localSet.ValidateTree(
 			update.Key,
 			update.Value,
@@ -1923,12 +1434,6 @@ func (s *streamManager) persistLeafTree(
 			s.logger.Error("server returned invalid tree", zap.Error(err))
 			return err
 		}
-	}
-
-	if saver, ok := s.hypergraphStore.(rawVertexSaver); ok {
-		buf := make([]byte, len(update.UnderlyingData))
-		copy(buf, update.UnderlyingData)
-		return saver.SaveVertexTreeRaw(txn, update.Key, buf)
 	}
 
 	return s.hypergraphStore.SaveVertexTree(txn, update.Key, tree)
@@ -2115,21 +1620,23 @@ func (s *streamManager) walk(
 		return nil
 	}
 
-	// Check if we should use raw sync mode for this phase set
-	if init && shouldUseRawSync(phaseSet) {
-		s.logger.Info(
-			"walk: using raw sync mode",
-			zap.Bool("is_server", isServer),
-			zap.Int("phase_set", int(phaseSet)),
-		)
-		if isServer {
-			return s.rawShardSync(shardKey, phaseSet, incomingLeaves, path)
-		}
-		return s.receiveRawShardSync(incomingLeaves)
-	}
-
 	if isLeaf(lnode) && isLeaf(rnode) && !init {
-		return nil
+		// Both are leaves with differing commitments - need to sync
+		// Server sends its leaf, client prunes local and receives server's leaf
+		if isServer {
+			err := s.sendLeafData(
+				path,
+				incomingLeaves,
+			)
+			return errors.Wrap(err, "walk")
+		} else {
+			// Prune local leaf first since it differs from server
+			if _, err := s.pruneLocalSubtree(path); err != nil {
+				return errors.Wrap(err, "walk")
+			}
+			err := s.handleLeafData(incomingLeaves)
+			return errors.Wrap(err, "walk")
+		}
 	}
 
 	if isLeaf(rnode) || isLeaf(lnode) {
@@ -2141,6 +1648,11 @@ func (s *streamManager) walk(
 			)
 			return errors.Wrap(err, "walk")
 		} else {
+			// Prune local subtree first - either local is leaf with different data,
+			// or local is branch with children that server doesn't have
+			if _, err := s.pruneLocalSubtree(path); err != nil {
+				return errors.Wrap(err, "walk")
+			}
 			err := s.handleLeafData(incomingLeaves)
 			return errors.Wrap(err, "walk")
 		}
@@ -2157,13 +1669,15 @@ func (s *streamManager) walk(
 		// )
 		if len(lpref) > len(rpref) {
 			// s.logger.Debug("local prefix longer, traversing remote to path", pathString)
-			traverse := lpref[len(rpref)-1:]
+			traverse := lpref[len(rpref):]
 			rtrav := rnode
 			traversePath := append([]int32{}, rpref...)
 			for _, nibble := range traverse {
 				// s.logger.Debug("attempting remote traversal step")
+				foundMatch := false
 				for _, child := range rtrav.Children {
 					if child.Index == nibble {
+						foundMatch = true
 						// s.logger.Debug("sending query")
 						traversePath = append(traversePath, child.Index)
 						var err error
@@ -2180,7 +1694,9 @@ func (s *streamManager) walk(
 					}
 				}
 
-				if rtrav == nil {
+				// If no child matched or queryNext returned nil, remote doesn't
+				// have the path that local has
+				if !foundMatch || rtrav == nil {
 					// s.logger.Debug("traversal could not reach path")
 					if isServer {
 						err := s.sendLeafData(
@@ -2209,15 +1725,17 @@ func (s *streamManager) walk(
 			)
 		} else {
 			// s.logger.Debug("remote prefix longer, traversing local to path", pathString)
-			traverse := rpref[len(lpref)-1:]
+			traverse := rpref[len(lpref):]
 			ltrav := lnode
 			traversedPath := append([]int32{}, lnode.Path...)
 
 			for _, nibble := range traverse {
 				// s.logger.Debug("attempting local traversal step")
 				preTraversal := append([]int32{}, traversedPath...)
+				foundMatch := false
 				for _, child := range ltrav.Children {
 					if child.Index == nibble {
+						foundMatch = true
 						traversedPath = append(traversedPath, nibble)
 						var err error
 						// s.logger.Debug("expecting query")
@@ -2258,6 +1776,28 @@ func (s *streamManager) walk(
 							}
 						}
 					}
+				}
+				// If no child matched the nibble, the local tree doesn't extend
+				// to match the remote's deeper prefix. We still need to respond to
+				// the remote's query with an empty response, then handle the leaf data.
+				if !foundMatch {
+					// Respond to remote's pending query with our current path info
+					// (which will have empty commitment since we don't have the path)
+					traversedPath = append(traversedPath, nibble)
+					ltrav, _ = s.handleQueryNext(incomingQueries, traversedPath)
+
+					if isServer {
+						// Server sends its data since client's tree is shallower
+						if err := s.sendLeafData(preTraversal, incomingLeaves); err != nil {
+							return errors.Wrap(err, "walk")
+						}
+					} else {
+						// Client receives data from server
+						if err := s.handleLeafData(incomingLeaves); err != nil {
+							return errors.Wrap(err, "walk")
+						}
+					}
+					return nil
 				}
 			}
 			// s.logger.Debug("traversal completed, performing walk", pathString)
@@ -2319,6 +1859,11 @@ func (s *streamManager) walk(
 						}
 					}
 					if rchild != nil {
+						// Remote has a child that local doesn't have
+						// - If SERVER: remote (client) has extra data, server has nothing to send
+						//   Client will prune this on their side via lchild != nil case
+						// - If CLIENT: remote (server) has data we need to receive
+						//   Server sends this via their lchild != nil case
 						if !isServer {
 							err := s.handleLeafData(incomingLeaves)
 							if err != nil {
@@ -2380,6 +1925,10 @@ func (s *streamManager) walk(
 					return errors.Wrap(err, "walk")
 				}
 			} else {
+				// Prune local data first since prefixes differ
+				if _, err := s.pruneLocalSubtree(path); err != nil {
+					return errors.Wrap(err, "walk")
+				}
 				err := s.handleLeafData(incomingLeaves)
 				if err != nil {
 					return errors.Wrap(err, "walk")

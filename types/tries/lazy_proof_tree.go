@@ -2038,8 +2038,13 @@ func (t *LazyVectorCommitmentTree) Delete(
 				}
 				retNode = nil
 			case 1:
+				// Identify the child's original path to prevent orphaned storage entries
+				originalChildPath := slices.Concat(n.FullPrefix, []int{lastChildIndex})
+
 				if childBranch, ok := lastChild.(*LazyVectorCommitmentBranchNode); ok {
 					// Merge this node's prefix with the child's prefix
+					// Note: We do NOT update FullPrefix because children are stored
+					// relative to the branch's FullPrefix, and they'd become unreachable
 					mergedPrefix := []int{}
 					mergedPrefix = append(mergedPrefix, n.Prefix...)
 					mergedPrefix = append(mergedPrefix, lastChildIndex)
@@ -2048,7 +2053,17 @@ func (t *LazyVectorCommitmentTree) Delete(
 					childBranch.Prefix = mergedPrefix
 					childBranch.Commitment = nil
 
-					// Delete this node from storage
+					// Delete the child from its original path to prevent orphan
+					_ = t.Store.DeleteNode(
+						txn,
+						t.SetType,
+						t.PhaseType,
+						t.ShardKey,
+						generateKeyFromPath(originalChildPath),
+						originalChildPath,
+					)
+
+					// Delete this node (parent) from storage
 					err := t.Store.DeleteNode(
 						txn,
 						t.SetType,

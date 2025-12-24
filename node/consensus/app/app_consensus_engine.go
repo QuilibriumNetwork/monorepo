@@ -997,7 +997,8 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		e.triggerGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+		// Use blocking hypersync to ensure we're synced before continuing
+		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
 		return
 	}
 
@@ -1014,7 +1015,8 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		e.triggerGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+		// Use blocking hypersync to ensure we're synced before continuing
+		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
 		return
 	}
 
@@ -1093,6 +1095,75 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte, expectedRoo
 			)
 		}
 	}()
+}
+
+// performBlockingGlobalHypersync performs a synchronous hypersync that blocks
+// until completion. This is used before materializing frames to ensure we sync
+// before applying any transactions when there's a prover root mismatch.
+func (e *AppConsensusEngine) performBlockingGlobalHypersync(proposer []byte, expectedRoot []byte) {
+	if e.syncProvider == nil {
+		e.logger.Debug("blocking hypersync: no sync provider")
+		return
+	}
+	if bytes.Equal(proposer, e.proverAddress) {
+		e.logger.Debug("blocking hypersync: we are the proposer")
+		return
+	}
+
+	// Wait for any existing sync to complete first
+	for e.globalProverSyncInProgress.Load() {
+		e.logger.Debug("blocking hypersync: waiting for existing sync to complete")
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Mark sync as in progress
+	if !e.globalProverSyncInProgress.CompareAndSwap(false, true) {
+		// Another sync started, wait for it
+		for e.globalProverSyncInProgress.Load() {
+			time.Sleep(100 * time.Millisecond)
+		}
+		return
+	}
+	defer e.globalProverSyncInProgress.Store(false)
+
+	e.logger.Info(
+		"performing blocking global hypersync before processing frame",
+		zap.String("proposer", hex.EncodeToString(proposer)),
+		zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Set up shutdown handler
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-e.ShutdownSignal():
+			cancel()
+		case <-done:
+		}
+	}()
+
+	selfPeerID := peer.ID(e.pubsub.GetPeerID())
+	shardKey := tries.ShardKey{
+		L1: [3]byte{0x00, 0x00, 0x00},
+		L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+	}
+
+	// Perform sync synchronously (blocking)
+	e.syncProvider.HyperSyncSelf(ctx, selfPeerID, shardKey, nil, expectedRoot)
+	close(done)
+
+	if err := e.proverRegistry.Refresh(); err != nil {
+		e.logger.Warn(
+			"failed to refresh prover registry after blocking hypersync",
+			zap.Error(err),
+		)
+	}
+
+	e.globalProverRootSynced.Store(true)
+	e.logger.Info("blocking global hypersync completed")
 }
 
 func (e *AppConsensusEngine) GetFrame() *protobufs.AppShardFrame {

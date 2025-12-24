@@ -277,22 +277,23 @@ func (m *snapshotManager) acquire(
 					handle.acquire()
 					return handle
 				}
-				// Generation exists but no snapshot for this shard yet
-				m.logger.Info(
-					"generation matches expected root but no snapshot exists, using latest",
+				// Generation exists but no snapshot for this shard yet - reject
+				m.logger.Warn(
+					"generation matches expected root but no snapshot exists, rejecting sync request",
 					zap.String("expected_root", hex.EncodeToString(expectedRoot)),
 				)
-				break
+				return nil
 			}
 		}
-		// No matching generation found
+		// No matching generation found - reject instead of falling back to latest
 		if m.logger != nil {
-			m.logger.Info(
-				"no snapshot generation matches expected root, using latest",
+			m.logger.Warn(
+				"no snapshot generation matches expected root, rejecting sync request",
 				zap.String("expected_root", hex.EncodeToString(expectedRoot)),
 				zap.String("latest_root", hex.EncodeToString(m.generations[0].root)),
 			)
 		}
+		return nil
 	}
 
 	// Use the latest generation for new snapshots
