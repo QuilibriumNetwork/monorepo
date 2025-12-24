@@ -1,5 +1,8 @@
 # Quilibrium Docker Instructions
 
+> [!TIP]
+> For a comprehensive guide on building from source and deployment, see [DOCKER_GUIDE.md](DOCKER_GUIDE.md).
+
 ## Build
 
 The only requirements are `git` (to checkout the repository) and docker (to build the image).
