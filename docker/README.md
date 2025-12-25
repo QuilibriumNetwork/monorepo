@@ -1,165 +1,293 @@
-# Quilibrium Docker Instructions
+# Quilibrium Docker Guide
 
-## Install Docker on a Server
+This folder contains all the necessary files to build and run Quilibrium nodes using Docker.
 
-> [!IMPORTANT]
-> You have to install Docker Engine on your server, you don't want to install Docker Desktop.
+## Prerequisites
 
-The official Linux installation instructions start here:  
-https://docs.docker.com/engine/install/
+### Required Tools
+- **Docker** (v20.10+) with BuildKit support
+- **Docker Compose** (v2.0+)
+- **Task** (optional but recommended) - [taskfile.dev](https://taskfile.dev)
 
-For Ubuntu you can start here:  
-https://docs.docker.com/engine/install/ubuntu/
+### Install Task
+```bash
+# macOS
+brew install go-task
 
-While there are several installation methods, you really want to use the apt repository, this way you get
-automatic updates.
+# Linux (script)
+sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
 
-Make sure you also follow the Linux post-installation steps:  
-https://docs.docker.com/engine/install/linux-postinstall/
+# Or via Go
+go install github.com/go-task/task/v3/cmd/task@latest
+```
 
-## Install Docker on a Desktop
+### Docker Version Check
+```bash
+docker --version    # Should be 20.10+
+docker compose version  # Should be v2.0+
+```
 
-For a Linux desktop follow the server installation steps above, do not install Docker Desktop for Linux unless
-you know what you are doing.
+## 1. System Preparation
 
-For Mac and Windows follow the corresponding Docker Desktop installation links from the top of:  
-https://docs.docker.com/engine/install/
+Before building or running, optimize the host network stack. Quilibrium relies on the QUIC protocol (UDP), which requires larger buffer sizes than the Linux default.
 
-## Running a Node
+### Increase UDP Buffer Sizes
+```bash
+sudo sysctl -w net.core.rmem_max=7500000
+sudo sysctl -w net.core.wmem_max=7500000
+```
+To make these changes permanent, add them to `/etc/sysctl.conf`.
 
-Copy [docker-compose.yml](docker-compose.yml) to a new folder on a server. The official
-Docker image provided by Quilibrium Network will be pulled.
+### Configure Firewall (UFW)
+Open the ports required for P2P, gRPC, REST, and worker communication:
 
-A `.config/` subfolder will be created in this folder, this will hold both configuration
-and the node storage.
+```bash
+sudo ufw allow 22/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 8336:8338/udp
+sudo ufw allow 8340/udp
+sudo ufw allow 50000:50010/tcp
+sudo ufw allow 50000:50010/udp
+sudo ufw reload
+```
 
-Optionally you can also copy [Taskfile.yaml](Taskfile.yaml) and [.env.example](.env.example) to the
-server, if you are planning to use them. See below.
+## 2. File Structure
 
-### New Instance
+| File | Purpose |
+| --- | --- |
+| `Dockerfile.source` | Main multi-stage build for node + qclient |
+| `Dockerfile.sourceavx512` | Optimized build with AVX-512 instructions |
+| `Dockerfile.release` | Build from pre-compiled release binaries |
+| `Dockerfile.conntest.source` | Connection test utility build |
+| `Dockerfile.vdf.*` | VDF performance analysis builds (various CPU optimizations) |
+| `docker-compose.yml` | Container orchestration config |
+| `Taskfile.yaml` | Task automation commands |
+| `.env.example` | Environment variable template |
+| `rustup-init.sh` | Rust installer for build stages |
 
-If you are starting a brand new node then simply run Quilibrium in a container with:
-```shell
+## 3. Dockerfile Variants
+
+### Production Dockerfiles
+
+| Dockerfile | Use Case | Target Stages |
+| --- | --- | --- |
+| `Dockerfile.source` | Standard build from source | `node-only`, `node`, `qclient`, `final` |
+| `Dockerfile.sourceavx512` | AVX-512 optimized (Intel Xeon, AMD Zen4+) | Same as above |
+| `Dockerfile.release` | Build from release binaries (faster) | Single stage |
+
+### Specialized Dockerfiles
+
+| Dockerfile | Use Case |
+| --- | --- |
+| `Dockerfile.conntest.source` | Network connectivity testing |
+| `Dockerfile.vdf.source` | VDF performance benchmarking |
+| `Dockerfile.vdf.sourceavx512` | VDF with AVX-512 optimizations |
+| `Dockerfile.vdf.sourcezen3` | VDF optimized for AMD Zen3 |
+| `Dockerfile.vdf.sourcezen4` | VDF optimized for AMD Zen4 |
+
+## 4. Build Targets & Cross-Compilation
+
+### Available Build Tasks
+
+| Task | Platform | Output |
+| --- | --- | --- |
+| `build_node_arm64_linux` | Linux ARM64 | `../node/build/arm64_linux/` |
+| `build_node_amd64_linux` | Linux AMD64 | `../node/build/amd64_linux/` |
+| `build_node_amd64_avx512_linux` | Linux AMD64 (AVX-512) | `../node/build/amd64_avx512_linux/` |
+| `build_node_arm64_macos` | macOS ARM64 | `../node/build/arm64_macos/` |
+| `build_qclient_arm64_linux` | Linux ARM64 | `../client/build/arm64_linux/` |
+| `build_qclient_amd64_linux` | Linux AMD64 | `../client/build/amd64_linux/` |
+| `build_qclient_amd64_avx512_linux` | Linux AMD64 (AVX-512) | `../client/build/amd64_avx512_linux/` |
+| `build_qclient_arm64_macos` | macOS ARM64 | `../client/build/arm64_macos/` |
+
+### Cross-Compilation Examples
+
+**Build Linux ARM64 binary from any platform:**
+```bash
+task build_node_arm64_linux
+```
+
+**Build Linux AMD64 with AVX-512 optimizations:**
+```bash
+task build_node_amd64_avx512_linux
+```
+
+**Manual cross-compilation with Docker:**
+```bash
+# Build for ARM64
+docker build --platform linux/arm64 -f Dockerfile.source --output ../node/build/arm64_linux --target=node ..
+
+# Build for AMD64
+docker build --platform linux/amd64 -f Dockerfile.source --output ../node/build/amd64_linux --target=node ..
+```
+
+## 5. Docker Images
+
+### Build Images
+
+```bash
+# Full image (node + qclient)
+task build:source
+
+# Node-only optimized image
+task build:node:source
+
+# From release binaries (faster)
+task build:release
+```
+
+### Image Tags
+
+After building, images are tagged as:
+- `quilibrium:2.1.0-source` / `quilibrium:source`
+- `quilibrium:2.1.0-node-only` / `quilibrium:node-only`
+- `quilibrium:2.1.0-release` / `quilibrium:release`
+
+## 6. Configuration
+
+### Configuration Directory
+By default, the Docker configuration uses the `.config` directory at the **root of the repository** (`../.config`). This allows you to share configuration between native and containerized builds.
+
+### Generating Config
+```bash
+task config:gen
+```
+This will generate the configuration in `../.config`.
+
+## 7. Running a Node
+
+### Quick Start (Docker Compose)
+```bash
+task up
+```
+Or:
+```bash
 docker compose up -d
 ```
 
-A `.config/` subfolder will be created under the current folder, this is mapped inside the container.
+### Host Networking (Recommended for Servers)
+For servers with dedicated public IPs, host networking eliminates Docker NAT overhead:
+
+```bash
+task deploy:node
+```
+Or:
+```bash
+docker run -d --name q-node \
+   --network host \
+   --restart unless-stopped \
+   -v $(pwd)/../.config:/root/.config \
+   quilibrium:node-only -signature-check=false
+```
+
+### New Instance
+If you are starting a brand new node, a `.config/` folder will be created at the repository root.
 
 > [!IMPORTANT]
-> Once the node is running (the `-node-info` command shows a balance) make sure you backup
-> `config.yml` and `keys.yml`.
+> Once the node is running (the `task node-info` command shows a balance), make sure you backup `config.yml` and `keys.yml`.
 
 ### Restore Previous Instance
+1. Ensure your `config.yml` and `keys.yml` are in the `.config/` folder at the repository root.
+2. Start the node: `task up`
 
-If you have both `config.yml` and `keys.yml` backed up from a previous instance then follow these
-steps to restore them:
+## 8. gRPC & REST API Access
 
-1. Create an empty `.config/` subfolder.
-2. Copy `config.yml` and `keys.yml` to `.config/`. 
-3. Start the node with:
-   ```shell
-   docker compose up -d
-   ```
+The node exposes two APIs for programmatic access:
 
-### Task
+| API | Port | Protocol | Binding |
+| --- | --- | --- | --- |
+| **gRPC** | 8337 | TCP | `127.0.0.1` (localhost only) |
+| **REST** | 8338 | TCP | `127.0.0.1` (localhost only) |
 
-You can also use the [Task](https://taskfile.dev/) tool, it is a simple build tool that takes care of running
-complex commands and intereacting with the container. The tasks are all defined in
-[Taskfile.yaml](Taskfile.yaml).
+### Using grpcurl
+The container includes `grpcurl` for gRPC interaction:
 
-You can optionally create an `.env` file, in the same folder to override specific parameters. Right now
-only one optional env var is supported with `Task` and that is `QUILIBRIUM_IMAGE_NAME`, if you want to change the
-default image name from `quilibrium` to something else. If you are pushing your images to GitHub, for example, then you
-have to follow the GitHub naming convention and use a name like `ghcr.io/mscurtescu/ceremonyclient`. See the
-[.env.example](.env.example) sample file, and keep in mind that `.env` is shared with
-[docker-compose.yml](docker-compose.yml).
+```bash
+# List available services
+docker compose exec node grpcurl -plaintext localhost:8337 list
 
-Bellow there are example interactions with `Task`.
+# Get node info
+docker compose exec node grpcurl -plaintext localhost:8337 quilibrium.node.node.pb.NodeService/GetNodeInfo
 
-Start the container through docker compose:
-```shell
-task up
+# Get token balance
+docker compose exec node grpcurl -plaintext localhost:8337 quilibrium.node.node.pb.NodeService/GetTokenInfo
 ```
 
-Show the logs through docker compose:
-```shell
-task logs
+### Using qclient (inside container)
+```bash
+docker compose exec node qclient help
+docker compose exec node qclient token balance
+docker compose exec node qclient token info
 ```
 
-Drop into a shell inside the running container:
-```shell
-task shell
-```
+### Exposing APIs Externally
+By default, APIs are bound to localhost for security. To expose externally, modify `docker-compose.override.yml`:
 
-Stop the running container(s):
-```shell
-task down
-```
-
-Backup the critical configuration:
-```shell
-task backup
-```
-
-The above command will create a `backup.tar.gz` archive in the current folder, you still have to copy this
-file from the server into a safe location. The command adds the `config.yml` and `keys.yml` files from
-the `.config/` subfolder to the archive, with the ownership of the current user.
-
-
-## Customizing docker-compose.yml
-
-If you want to change certain parameters in [docker-compose.yml](docker-compose.yml) it is better not
-to edit the file directly as new versions pushed through git would overwrite your changes. A more
-flexible solution is to create another file called `docker-compose.override.yml` right next to it
-and specifying the necessary overriding changes there.
-
-For example:
 ```yaml
 services:
   node:
-    image: ghcr.io/mscurtescu/ceremonyclient
-    restart: on-failure:7
+    ports:
+      - '0.0.0.0:8337:8337/tcp'  # gRPC (use with caution)
+      - '0.0.0.0:8338:8338/tcp'  # REST (use with caution)
 ```
 
-The above will override the image name and also the restart policy.
+> [!WARNING]
+> Exposing gRPC/REST externally can be a security risk. Use a reverse proxy with authentication if needed.
 
-You can optionally create an `.env` file, in the same folder to override specific parameters. See the
-[.env.example](.env.example) sample file, and keep in mind that `.env` is shared with
-[Taskfile.yaml](Taskfile.yaml). You can customize the image name and port mappings.
+## 9. Management Commands
 
-To check if your overrides are being picked up run the following command:
-```shell
-docker compose config
+| Action | Task Command | Docker Command |
+| --- | --- | --- |
+| **Status** | `task status` | N/A |
+| **Logs** | `task logs` | `docker compose logs -f` |
+| **Stop** | `task down` | `docker compose down` |
+| **Shell** | `task shell` | `docker compose exec -it node sh` |
+| **Node Info** | `task node-info` | `docker compose exec node node -node-info` |
+| **Backup** | `task backup` | N/A |
+| **Restore** | `task restore` | N/A |
+| **Update** | `task update` | Pull + restart |
+| **Test Port** | `task test:port` | Requires `NODE_PUBLIC_NAME` |
+
+The `backup` task creates a `backup.tar.gz` archive in this `docker/` folder containing `config.yml` and `keys.yml` from `../.config`. Copy this file to a safe location.
+
+### Customizing Configuration
+Create a `.env` file based on [.env.example](.env.example):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `QUILIBRIUM_IMAGE_NAME` | `quilibrium` | Docker image name |
+| `QUILIBRIUM_CONFIG_DIR` | `../.config` | Configuration directory |
+| `QUILIBRIUM_P2P_PORT` | `8336` | P2P UDP port |
+| `QUILIBRIUM_GRPC_PORT` | `8337` | gRPC TCP port |
+| `QUILIBRIUM_REST_PORT` | `8338` | REST TCP port |
+| `NODE_PUBLIC_NAME` | (none) | Public DNS/IP for port testing |
+
+## 10. Verification
+
+### Check Connectivity
+Wait 5–10 minutes for the node to initialize. Look for the "Reachable" status:
+```bash
+docker logs -f q-node | grep "reachable"
 ```
 
-This will output the merged and canonical compose file that will be used to run the container(s).
-
-
-## Interact with a running container
-
-Drop into a shell inside a running container:
-```shell
-docker compose exec -it node sh
+### Test Port Visibility
+```bash
+NODE_PUBLIC_NAME=your.server.ip task test:port
 ```
 
-Watch the logs:
-```shell
-docker compose logs -f
+### Monitor Performance
+```bash
+docker stats q-node
 ```
 
-Get the node related info (peer id, version, max frame and balance):
-```shell
-docker compose exec node node -node-info
-```
+## 11. Troubleshooting
 
-Run the DB console:
-```shell
-docker compose exec node node -db-console
-```
-
-Run the Quilibrium client:
-```shell
-docker compose exec node qclient help
-docker compose exec node qclient token help
-docker compose exec node qclient token balance
-```
+| Issue | Solution |
+| --- | --- |
+| **Node Not Reachable** | Ensure ports 8336-8340 (UDP) are open in your firewall. |
+| **Buffer Size Errors** | Re-run the `sysctl` commands in Step 1. |
+| **Config Not Found** | Verify that `../.config` exists and contains your keys. |
+| **Backup Fails** | Ensure `../.config/config.yml` and `../.config/keys.yml` exist. |
+| **Connection Refused :60000** | Use `--network host` for worker communication. |
+| **grpcurl not found** | Use the full image (`build:source`) not `node-only`. |
+| **Build fails on Apple Silicon** | Use `--platform linux/amd64` for cross-compilation. |

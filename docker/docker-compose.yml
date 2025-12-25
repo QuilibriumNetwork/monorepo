@@ -1,6 +1,6 @@
 name: quilibrium
 
-# See sysctl related warning in DOCKER-README.md.
+# See sysctl related warning in README.md.
 # Host configuration changes are required.
 
 services:
@@ -16,13 +16,13 @@ services:
       - '127.0.0.1:${QUILIBRIUM_GRPC_PORT:-8337}:8337/tcp' # gRPC
       - '127.0.0.1:${QUILIBRIUM_REST_PORT:-8338}:8338/tcp' # REST
     healthcheck:
-      test: ["CMD", "grpcurl", "-plaintext", "localhost:8337", "list", "quilibrium.node.node.pb.NodeService"]
+      test: [ "CMD", "grpcurl", "-plaintext", "localhost:8337", "list", "quilibrium.node.node.pb.NodeService" ]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15m
     volumes:
-      - ./.config:/root/.config
+      - ${QUILIBRIUM_CONFIG_DIR:-../.config}:/root/.config
     logging:
       driver: "json-file"
       options:
