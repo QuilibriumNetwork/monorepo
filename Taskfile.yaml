@@ -20,6 +20,7 @@ tasks:
   status:
     desc: Display configuration info.
     cmds:
+      - echo -n "Image name:" && echo " ${QUILIBRIUM_IMAGE_NAME:-quilibrium}"
       - echo -n "Version   :" && echo " {{.VERSION}}"
       - echo -n "Repo      :" && echo " {{.GIT_REPO}}"
       - echo -n "Branch    :" && echo " {{.GIT_BRANCH}}"
@@ -51,7 +52,3 @@ tasks:
       - rpm/generate.sh
       - client/build.sh -o build/arm64_macos/qclient
 
-  config:gen:
-    desc: Generate configuration and keys using Go.
-    cmds:
-      - go run ./utils/config-gen --config {{.CONFIG_DIR | default ".config"}}
