@@ -10,7 +10,6 @@ import (
 	"log"
 	"math/big"
 	"net"
-	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -691,15 +690,12 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	eg.Wait()
 	logDuration("generated data trees", start)
 
-	serverPath := filepath.Join(t.TempDir(), "server")
-	clientBase := filepath.Join(t.TempDir(), "clients")
-
 	setupStart := time.Now()
-	serverDB := store.NewPebbleDB(logger, &config.DBConfig{Path: serverPath}, 0)
+	serverDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}, 0)
 	defer serverDB.Close()
 
 	serverStore := store.NewPebbleHypergraphStore(
-		&config.DBConfig{Path: serverPath},
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"},
 		serverDB,
 		logger,
 		enc,
@@ -725,10 +721,9 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 
 	clientSetupStart := time.Now()
 	for i := 0; i < clientCount; i++ {
-		clientPath := filepath.Join(clientBase, fmt.Sprintf("client-%d", i))
-		clientDBs[i] = store.NewPebbleDB(logger, &config.DBConfig{Path: clientPath}, 0)
+		clientDBs[i] = store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", i)}, 0)
 		clientStores[i] = store.NewPebbleHypergraphStore(
-			&config.DBConfig{Path: clientPath},
+			&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", i)},
 			clientDBs[i],
 			logger,
 			enc,
@@ -833,6 +828,10 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 		return conn, protobufs.NewHypergraphComparisonServiceClient(conn)
 	}
 
+	// Publish initial snapshot so clients can sync during the rounds
+	initialRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	serverHG.PublishSnapshot(initialRoot)
+
 	const rounds = 3
 	for round := 0; round < rounds; round++ {
 		currentRound := round
@@ -924,6 +923,24 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
 	// Publish the server's snapshot so clients can sync against this exact state
 	serverHG.PublishSnapshot(serverRoot)
+
+	// Create a snapshot handle for this shard by doing a sync with nil expectedRoot.
+	// This is needed because the snapshot manager only creates handles when acquire
+	// is called, and subsequent syncs with expectedRoot require the handle to exist.
+	{
+		conn, client := dialClient()
+		stream, err := client.HyperStream(context.Background())
+		require.NoError(t, err)
+		_ = clientHGs[0].Sync(
+			stream,
+			shardKey,
+			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+			nil, // nil to create the snapshot handle
+		)
+		_ = stream.CloseSend()
+		conn.Close()
+	}
+
 	for i := 0; i < 1; i++ {
 		go func(idx int) {
 			defer wg.Done()
@@ -1117,13 +1134,11 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		dataTrees[i] = buildDataTree(t, inclusionProver)
 	}
 
-	serverPath := filepath.Join(t.TempDir(), "server")
-
-	serverDB := store.NewPebbleDB(logger, &config.DBConfig{Path: serverPath}, 0)
+	serverDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}, 0)
 	defer serverDB.Close()
 
 	serverStore := store.NewPebbleHypergraphStore(
-		&config.DBConfig{Path: serverPath},
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"},
 		serverDB,
 		logger,
 		enc,
@@ -1218,11 +1233,12 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 	}
 
 	// Helper to create a fresh client hypergraph
+	clientCounter := 0
 	createClient := func(name string) (*store.PebbleDB, *hgcrdt.HypergraphCRDT) {
-		clientPath := filepath.Join(t.TempDir(), name)
-		clientDB := store.NewPebbleDB(logger, &config.DBConfig{Path: clientPath}, 0)
+		clientCounter++
+		clientDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", clientCounter)}, 0)
 		clientStore := store.NewPebbleHypergraphStore(
-			&config.DBConfig{Path: clientPath},
+			&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", clientCounter)},
 			clientDB,
 			logger,
 			enc,
@@ -1350,8 +1366,8 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		assert.Equal(t, root1, clientRoot, "client should sync to historical root when expectedRoot matches")
 	})
 
-	// Test 3: Sync with unknown expectedRoot (should fallback to latest)
-	t.Run("sync with unknown expectedRoot falls back to latest", func(t *testing.T) {
+	// Test 3: Sync with unknown expectedRoot (should fail - no matching snapshot)
+	t.Run("sync with unknown expectedRoot fails", func(t *testing.T) {
 		clientDB, clientHG := createClient("client3")
 		defer clientDB.Close()
 
@@ -1369,17 +1385,10 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-			unknownRoot, // Unknown root should fallback to latest
+			unknownRoot, // Unknown root has no matching snapshot
 		)
-		require.NoError(t, err)
-		require.NoError(t, stream.CloseSend())
-
-		// Commit client to get comparable root
-		clientCommit, err := clientHG.Commit(1)
-		require.NoError(t, err)
-		clientRoot := clientCommit[shardKey][0]
-
-		// Client should have synced to latest (root2) since unknown root falls back
-		assert.Equal(t, root2, clientRoot, "client should sync to latest root when expectedRoot is unknown")
+		// Sync should fail because no snapshot exists for the unknown root
+		require.Error(t, err, "sync with unknown expectedRoot should fail")
+		_ = stream.CloseSend()
 	})
 }

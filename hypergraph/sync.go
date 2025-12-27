@@ -1292,6 +1292,260 @@ func (s *streamManager) deleteVertexTreeIfNeeded(
 	return deleter.DeleteVertexTree(txn, key)
 }
 
+// handleLeafDataWithMerge receives leaf data from the server and merges it with
+// local data.
+// 1. Collects all local leaf keys at the path first
+// 2. Receives and adds all remote leaves, tracking which keys were received
+// 3. Only after successful receipt, prunes local keys that weren't in the
+// remote set
+//
+// This ensures data is never lost due to mid-sync failures or incomplete
+// transfers.
+func (s *streamManager) handleLeafDataWithMerge(
+	path []int32,
+	incomingLeaves <-chan *protobufs.HypergraphComparison,
+) (err error) {
+	start := time.Now()
+	pathHex := hex.EncodeToString(packPath(path))
+	var expectedLeaves uint64
+	s.logger.Debug(
+		"handle leaf data with merge start",
+		zap.String("path", pathHex),
+	)
+	defer func() {
+		s.logger.Debug(
+			"handle leaf data with merge finished",
+			zap.String("path", pathHex),
+			zap.Uint64("leaves_expected", expectedLeaves),
+			zap.Duration("duration", time.Since(start)),
+			zap.Error(err),
+		)
+	}()
+
+	// Collect all local leaf keys at this path
+	intPath := make([]int, len(path))
+	for i, nib := range path {
+		intPath[i] = int(nib)
+	}
+
+	localKeys := make(map[string]*tries.LazyVectorCommitmentLeafNode)
+	node, err := s.localTree.GetByPath(intPath)
+	if err != nil && !strings.Contains(err.Error(), "item not found") {
+		return errors.Wrap(err, "handle leaf data with merge")
+	}
+	if node != nil {
+		if leaf, ok := node.(*tries.LazyVectorCommitmentLeafNode); ok {
+			localKeys[string(leaf.Key)] = leaf
+		} else {
+			gathered := tries.GetAllLeaves(
+				s.localTree.SetType,
+				s.localTree.PhaseType,
+				s.localTree.ShardKey,
+				node,
+			)
+			for _, leaf := range gathered {
+				if leaf != nil {
+					localKeys[string(leaf.Key)] = leaf
+				}
+			}
+		}
+	}
+
+	s.logger.Debug(
+		"collected local keys for merge",
+		zap.String("path", pathHex),
+		zap.Int("local_key_count", len(localKeys)),
+	)
+
+	// Receive metadata with expected leaf count
+	select {
+	case <-s.ctx.Done():
+		return errors.Wrap(
+			errors.New("context canceled"),
+			"handle leaf data with merge",
+		)
+	case msg, ok := <-incomingLeaves:
+		if !ok {
+			return errors.Wrap(
+				errors.New("channel closed"),
+				"handle leaf data with merge",
+			)
+		}
+
+		switch msg.Payload.(type) {
+		case *protobufs.HypergraphComparison_LeafData:
+			return errors.Wrap(
+				errors.New("invalid message"),
+				"handle leaf data with merge",
+			)
+		case *protobufs.HypergraphComparison_Metadata:
+			expectedLeaves = msg.GetMetadata().Leaves
+		}
+	case <-time.After(30 * time.Second):
+		return errors.Wrap(
+			errors.New("timed out"),
+			"handle leaf data with merge",
+		)
+	}
+
+	// Receive all leaves and add them, tracking received keys
+	receivedKeys := make(map[string]struct{}, expectedLeaves)
+	var txn tries.TreeBackingStoreTransaction
+
+	for i := uint64(0); i < expectedLeaves; i++ {
+		if i%100 == 0 {
+			if txn != nil {
+				if err := txn.Commit(); err != nil {
+					return errors.Wrap(err, "handle leaf data with merge")
+				}
+			}
+			txn, err = s.hypergraphStore.NewTransaction(false)
+			if err != nil {
+				return errors.Wrap(err, "handle leaf data with merge")
+			}
+		}
+		select {
+		case <-s.ctx.Done():
+			if txn != nil {
+				txn.Abort()
+			}
+			return errors.Wrap(
+				errors.New("context canceled"),
+				"handle leaf data with merge",
+			)
+		case msg, ok := <-incomingLeaves:
+			if !ok {
+				if txn != nil {
+					txn.Abort()
+				}
+				return errors.Wrap(
+					errors.New("channel closed"),
+					"handle leaf data with merge",
+				)
+			}
+
+			var remoteUpdate *protobufs.LeafData
+			switch msg.Payload.(type) {
+			case *protobufs.HypergraphComparison_Metadata:
+				if txn != nil {
+					txn.Abort()
+				}
+				return errors.Wrap(
+					errors.New("invalid message"),
+					"handle leaf data with merge",
+				)
+			case *protobufs.HypergraphComparison_LeafData:
+				remoteUpdate = msg.GetLeafData()
+			}
+
+			// Track this key as received from server
+			receivedKeys[string(remoteUpdate.Key)] = struct{}{}
+
+			theirs := AtomFromBytes(remoteUpdate.Value)
+			if err := s.persistLeafTree(txn, remoteUpdate); err != nil {
+				txn.Abort()
+				return err
+			}
+
+			if err := s.localSet.Add(txn, theirs); err != nil {
+				s.logger.Error("error while saving", zap.Error(err))
+				txn.Abort()
+				return errors.Wrap(err, "handle leaf data with merge")
+			}
+		case <-time.After(30 * time.Second):
+			if txn != nil {
+				txn.Abort()
+			}
+			return errors.Wrap(
+				errors.New("timed out"),
+				"handle leaf data with merge",
+			)
+		}
+	}
+
+	if txn != nil {
+		if err := txn.Commit(); err != nil {
+			return errors.Wrap(err, "handle leaf data with merge")
+		}
+		txn = nil
+	}
+
+	// Prune local keys that weren't in the received set
+	// Only do this AFTER successfully receiving all remote data
+	var prunedCount uint64
+	for keyStr, leaf := range localKeys {
+		if _, received := receivedKeys[keyStr]; !received {
+			// This key exists locally but was not sent by server - prune it
+			if txn == nil {
+				txn, err = s.hypergraphStore.NewTransaction(false)
+				if err != nil {
+					return errors.Wrap(err, "handle leaf data with merge")
+				}
+			} else if prunedCount%pruneTxnChunk == 0 {
+				if err := txn.Commit(); err != nil {
+					return errors.Wrap(err, "handle leaf data with merge")
+				}
+				txn, err = s.hypergraphStore.NewTransaction(false)
+				if err != nil {
+					return errors.Wrap(err, "handle leaf data with merge")
+				}
+			}
+
+			atom := AtomFromBytes(leaf.Value)
+			if atom == nil {
+				if txn != nil {
+					txn.Abort()
+				}
+				return errors.Wrap(
+					errors.New("invalid atom payload"),
+					"handle leaf data with merge",
+				)
+			}
+
+			if err := s.localSet.Delete(txn, atom); err != nil {
+				if txn != nil {
+					txn.Abort()
+				}
+				return errors.Wrap(err, "handle leaf data with merge")
+			}
+
+			if err := s.deleteVertexTreeIfNeeded(txn, atom, leaf.Key); err != nil {
+				if txn != nil {
+					txn.Abort()
+				}
+				return errors.Wrap(err, "handle leaf data with merge")
+			}
+
+			prunedCount++
+		}
+	}
+
+	if txn != nil {
+		if err := txn.Commit(); err != nil {
+			return errors.Wrap(err, "handle leaf data with merge")
+		}
+	}
+
+	s.logger.Info(
+		"merge complete",
+		zap.String("path", pathHex),
+		zap.Uint64("received", expectedLeaves),
+		zap.Int("local_before", len(localKeys)),
+		zap.Uint64("pruned", prunedCount),
+	)
+
+	// Send acknowledgment
+	if err := s.stream.Send(&protobufs.HypergraphComparison{
+		Payload: &protobufs.HypergraphComparison_Metadata{
+			Metadata: &protobufs.HypersyncMetadata{Leaves: expectedLeaves},
+		},
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (s *streamManager) pruneLocalSubtree(path []int32) (uint64, error) {
 	start := time.Now()
 	pathHex := hex.EncodeToString(packPath(path))
@@ -1381,7 +1635,10 @@ func (s *streamManager) pruneLocalSubtree(path []int32) (uint64, error) {
 		atom := AtomFromBytes(leaf.Value)
 		if atom == nil {
 			txn.Abort()
-			return pruned, errors.Wrap(errors.New("invalid atom payload"), "prune local subtree")
+			return pruned, errors.Wrap(
+				errors.New("invalid atom payload"),
+				"prune local subtree",
+			)
 		}
 
 		if err := s.localSet.Delete(txn, atom); err != nil {
@@ -1630,11 +1887,8 @@ func (s *streamManager) walk(
 			)
 			return errors.Wrap(err, "walk")
 		} else {
-			// Prune local leaf first since it differs from server
-			if _, err := s.pruneLocalSubtree(path); err != nil {
-				return errors.Wrap(err, "walk")
-			}
-			err := s.handleLeafData(incomingLeaves)
+			// Merge remote data with local, pruning only what server doesn't have
+			err := s.handleLeafDataWithMerge(path, incomingLeaves)
 			return errors.Wrap(err, "walk")
 		}
 	}
@@ -1648,12 +1902,8 @@ func (s *streamManager) walk(
 			)
 			return errors.Wrap(err, "walk")
 		} else {
-			// Prune local subtree first - either local is leaf with different data,
-			// or local is branch with children that server doesn't have
-			if _, err := s.pruneLocalSubtree(path); err != nil {
-				return errors.Wrap(err, "walk")
-			}
-			err := s.handleLeafData(incomingLeaves)
+			// Merge remote data with local, pruning only what server doesn't have
+			err := s.handleLeafDataWithMerge(path, incomingLeaves)
 			return errors.Wrap(err, "walk")
 		}
 	}
@@ -1705,6 +1955,7 @@ func (s *streamManager) walk(
 						)
 						return errors.Wrap(err, "walk")
 					} else {
+						// Client has data at lpref that server doesn't have - prune it
 						_, err := s.pruneLocalSubtree(lpref)
 						return errors.Wrap(err, "walk")
 					}
@@ -1757,13 +2008,16 @@ func (s *streamManager) walk(
 								)
 								return errors.Wrap(err, "walk")
 							} else {
-								err := s.handleLeafData(incomingLeaves)
+								// Merge server data with local at preTraversal path
+								err := s.handleLeafDataWithMerge(preTraversal, incomingLeaves)
 								return errors.Wrap(err, "walk")
 							}
 						}
 					} else {
+						// Local has a child that's not on remote's traversal path
 						missingPath := append(append([]int32{}, preTraversal...), child.Index)
 						if isServer {
+							// Server has extra data - send it to client
 							if err := s.sendLeafData(
 								missingPath,
 								incomingLeaves,
@@ -1771,6 +2025,7 @@ func (s *streamManager) walk(
 								return errors.Wrap(err, "walk")
 							}
 						} else {
+							// Client has extra data that server doesn't have - prune it
 							if _, err := s.pruneLocalSubtree(missingPath); err != nil {
 								return errors.Wrap(err, "walk")
 							}
@@ -1792,8 +2047,8 @@ func (s *streamManager) walk(
 							return errors.Wrap(err, "walk")
 						}
 					} else {
-						// Client receives data from server
-						if err := s.handleLeafData(incomingLeaves); err != nil {
+						// Client receives and merges data from server at preTraversal path
+						if err := s.handleLeafDataWithMerge(preTraversal, incomingLeaves); err != nil {
 							return errors.Wrap(err, "walk")
 						}
 					}
@@ -1840,12 +2095,14 @@ func (s *streamManager) walk(
 				if (lchild != nil && rchild == nil) ||
 					(lchild == nil && rchild != nil) {
 					// s.logger.Info("branch divergence", pathString)
-					if lchild != nil {
+					if lchild != nil && rchild == nil {
+						// Local has a child that remote doesn't have
 						nextPath := append(
 							append([]int32{}, lpref...),
 							lchild.Index,
 						)
 						if isServer {
+							// Server has data client doesn't - send it
 							if err := s.sendLeafData(
 								nextPath,
 								incomingLeaves,
@@ -1853,22 +2110,29 @@ func (s *streamManager) walk(
 								return errors.Wrap(err, "walk")
 							}
 						} else {
+							// Client has data server doesn't - prune it directly
+							// (no protocol exchange needed, server has nothing to send)
 							if _, err := s.pruneLocalSubtree(nextPath); err != nil {
 								return errors.Wrap(err, "walk")
 							}
 						}
 					}
-					if rchild != nil {
+					if rchild != nil && lchild == nil {
 						// Remote has a child that local doesn't have
-						// - If SERVER: remote (client) has extra data, server has nothing to send
-						//   Client will prune this on their side via lchild != nil case
-						// - If CLIENT: remote (server) has data we need to receive
-						//   Server sends this via their lchild != nil case
-						if !isServer {
+						if isServer {
+							// Server doesn't have what client has - nothing to do
+							// Client will prune on their side
+						} else {
+							// Client doesn't have what server has - receive it
+							nextPath := append(
+								append([]int32{}, rpref...),
+								rchild.Index,
+							)
 							err := s.handleLeafData(incomingLeaves)
 							if err != nil {
 								return errors.Wrap(err, "walk")
 							}
+							_ = nextPath // path used by server's sendLeafData
 						}
 					}
 				} else {
@@ -1891,7 +2155,8 @@ func (s *streamManager) walk(
 									return errors.Wrap(err, "walk")
 								}
 							} else {
-								if _, err := s.pruneLocalSubtree(nextPath); err != nil {
+								// Server will send data, merge with local
+								if err := s.handleLeafDataWithMerge(nextPath, incomingLeaves); err != nil {
 									return errors.Wrap(err, "walk")
 								}
 							}
@@ -1925,11 +2190,8 @@ func (s *streamManager) walk(
 					return errors.Wrap(err, "walk")
 				}
 			} else {
-				// Prune local data first since prefixes differ
-				if _, err := s.pruneLocalSubtree(path); err != nil {
-					return errors.Wrap(err, "walk")
-				}
-				err := s.handleLeafData(incomingLeaves)
+				// Merge server data with local, pruning only what server doesn't have
+				err := s.handleLeafDataWithMerge(path, incomingLeaves)
 				if err != nil {
 					return errors.Wrap(err, "walk")
 				}

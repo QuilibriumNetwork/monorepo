@@ -71,6 +71,7 @@ var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_182,
 	migration_2_1_0_183,
 	migration_2_1_0_184,
+	migration_2_1_0_185,
 }
 
 func NewPebbleDB(
@@ -793,6 +794,10 @@ func migration_2_1_0_183(b *pebble.Batch) error {
 }
 
 func migration_2_1_0_184(b *pebble.Batch) error {
+	return nil
+}
+
+func migration_2_1_0_185(b *pebble.Batch) error {
 	return migration_2_1_0_18(b)
 }
 
