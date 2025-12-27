@@ -1,0 +1,4 @@
+module channelFFI {
+    header "channelFFI.h"
+    export *
+}

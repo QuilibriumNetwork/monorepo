@@ -152,7 +152,7 @@ func (p *PebbleVertexDataIterator) Value() *tries.VectorCommitmentTree {
 		return nil
 	}
 
-	tree, err := tries.DeserializeNonLazyTree(value)
+	tree, err := tries.DeserializeNonLazyTree(slices.Clone(value))
 	if err != nil {
 		return nil
 	}

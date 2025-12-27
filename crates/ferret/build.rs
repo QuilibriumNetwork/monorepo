@@ -13,9 +13,9 @@ fn main() {
         .file("emp_bridge.cpp")
         .flag("-I/usr/local/include/emp-tool/")
         .flag("-I/usr/local/include/emp-ot/")
-        .flag("-I/opt/homebrew/Cellar/openssl@3/3.5.0/include")
+        .flag("-I/opt/homebrew/Cellar/openssl@3/3.6.0/include")
         .flag("-L/usr/local/lib/emp-tool/")
-        .flag("-L/opt/homebrew/Cellar/openssl@3/3.5.0/lib")
+        .flag("-L/opt/homebrew/Cellar/openssl@3/3.6.0/lib")
         .warnings(false)
         .compile("emp_bridge");
 

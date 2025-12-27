@@ -346,6 +346,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_decrypt_inbox_message()
+		})
+		if checksum != 59344 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_decrypt_inbox_message: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_channel_checksum_func_double_ratchet_decrypt()
 		})
 		if checksum != 13335 {
@@ -360,6 +369,51 @@ func uniffiCheckChecksums() {
 		if checksum != 59209 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_double_ratchet_encrypt: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_encrypt_inbox_message()
+		})
+		if checksum != 48273 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_encrypt_inbox_message: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_generate_ed448()
+		})
+		if checksum != 62612 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_generate_ed448: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_generate_x448()
+		})
+		if checksum != 40212 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_generate_x448: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_get_pubkey_ed448()
+		})
+		if checksum != 46020 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_get_pubkey_ed448: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_get_pubkey_x448()
+		})
+		if checksum != 37789 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_get_pubkey_x448: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -396,6 +450,15 @@ func uniffiCheckChecksums() {
 		if checksum != 41646 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_sender_x3dh: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_sign_ed448()
+		})
+		if checksum != 28573 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_sign_ed448: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -450,6 +513,15 @@ func uniffiCheckChecksums() {
 		if checksum != 14779 {
 			// If this happens try cleaning and rebuilding your project
 			panic("channel: uniffi_channel_checksum_func_triple_ratchet_init_round_4: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_channel_checksum_func_verify_ed448()
+		})
+		if checksum != 57200 {
+			// If this happens try cleaning and rebuilding your project
+			panic("channel: uniffi_channel_checksum_func_verify_ed448: UniFFI API checksum mismatch")
 		}
 	}
 }
@@ -913,6 +985,14 @@ func (_ FfiDestroyerMapStringString) Destroy(mapValue map[string]string) {
 	}
 }
 
+func DecryptInboxMessage(input string) string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_decrypt_inbox_message(FfiConverterStringINSTANCE.Lower(input), _uniffiStatus),
+		}
+	}))
+}
+
 func DoubleRatchetDecrypt(ratchetStateAndEnvelope DoubleRatchetStateAndEnvelope) DoubleRatchetStateAndMessage {
 	return FfiConverterDoubleRatchetStateAndMessageINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
 		return GoRustBuffer{
@@ -925,6 +1005,46 @@ func DoubleRatchetEncrypt(ratchetStateAndMessage DoubleRatchetStateAndMessage) D
 	return FfiConverterDoubleRatchetStateAndEnvelopeINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
 		return GoRustBuffer{
 			inner: C.uniffi_channel_fn_func_double_ratchet_encrypt(FfiConverterDoubleRatchetStateAndMessageINSTANCE.Lower(ratchetStateAndMessage), _uniffiStatus),
+		}
+	}))
+}
+
+func EncryptInboxMessage(input string) string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_encrypt_inbox_message(FfiConverterStringINSTANCE.Lower(input), _uniffiStatus),
+		}
+	}))
+}
+
+func GenerateEd448() string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_generate_ed448(_uniffiStatus),
+		}
+	}))
+}
+
+func GenerateX448() string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_generate_x448(_uniffiStatus),
+		}
+	}))
+}
+
+func GetPubkeyEd448(key string) string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_get_pubkey_ed448(FfiConverterStringINSTANCE.Lower(key), _uniffiStatus),
+		}
+	}))
+}
+
+func GetPubkeyX448(key string) string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_get_pubkey_x448(FfiConverterStringINSTANCE.Lower(key), _uniffiStatus),
 		}
 	}))
 }
@@ -957,6 +1077,14 @@ func SenderX3dh(sendingIdentityPrivateKey []uint8, sendingEphemeralPrivateKey []
 	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
 		return GoRustBuffer{
 			inner: C.uniffi_channel_fn_func_sender_x3dh(FfiConverterSequenceUint8INSTANCE.Lower(sendingIdentityPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(sendingEphemeralPrivateKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingIdentityKey), FfiConverterSequenceUint8INSTANCE.Lower(receivingSignedPreKey), FfiConverterUint64INSTANCE.Lower(sessionKeyLength), _uniffiStatus),
+		}
+	}))
+}
+
+func SignEd448(key string, message string) string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_sign_ed448(FfiConverterStringINSTANCE.Lower(key), FfiConverterStringINSTANCE.Lower(message), _uniffiStatus),
 		}
 	}))
 }
@@ -1005,6 +1133,14 @@ func TripleRatchetInitRound4(ratchetStateAndMetadata TripleRatchetStateAndMetada
 	return FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
 		return GoRustBuffer{
 			inner: C.uniffi_channel_fn_func_triple_ratchet_init_round_4(FfiConverterTripleRatchetStateAndMetadataINSTANCE.Lower(ratchetStateAndMetadata), _uniffiStatus),
+		}
+	}))
+}
+
+func VerifyEd448(publicKey string, message string, signature string) string {
+	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_channel_fn_func_verify_ed448(FfiConverterStringINSTANCE.Lower(publicKey), FfiConverterStringINSTANCE.Lower(message), FfiConverterStringINSTANCE.Lower(signature), _uniffiStatus),
 		}
 	}))
 }

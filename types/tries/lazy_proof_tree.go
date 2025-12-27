@@ -1971,7 +1971,7 @@ func (t *LazyVectorCommitmentTree) Delete(
 						t.SetType,
 						t.PhaseType,
 						t.ShardKey,
-						slices.Concat(path, []int{i}),
+						slices.Concat(n.FullPrefix, []int{i}),
 					)
 					if err != nil && !strings.Contains(err.Error(), "item not found") {
 						log.Panic("failed to get node by path", zap.Error(err))

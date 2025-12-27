@@ -1,11 +1,28 @@
 namespace channel {
+    // Key Generation
+    string generate_x448();
+    string generate_ed448();
+    string get_pubkey_x448(string key);
+    string get_pubkey_ed448(string key);
+
+    // Signing
+    string sign_ed448(string key, string message);
+    string verify_ed448(string public_key, string message, string signature);
+
+    // Inbox Message Encryption (Sealed Sender)
+    string encrypt_inbox_message(string input);
+    string decrypt_inbox_message(string input);
+
+    // X3DH Key Agreement
     string sender_x3dh([ByRef] sequence<u8> sending_identity_private_key, [ByRef] sequence<u8> sending_ephemeral_private_key, [ByRef] sequence<u8> receiving_identity_key, [ByRef] sequence<u8> receiving_signed_pre_key, u64 session_key_length);
     string receiver_x3dh([ByRef] sequence<u8> sending_identity_private_key, [ByRef] sequence<u8> sending_signed_private_key, [ByRef] sequence<u8> receiving_identity_key, [ByRef] sequence<u8> receiving_ephemeral_key, u64 session_key_length);
 
+    // Double Ratchet
     string new_double_ratchet([ByRef] sequence<u8> session_key, [ByRef] sequence<u8> sending_header_key, [ByRef] sequence<u8> next_receiving_header_key, boolean is_sender, [ByRef] sequence<u8> sending_ephemeral_private_key, [ByRef] sequence<u8> receiving_ephemeral_key);
     DoubleRatchetStateAndEnvelope double_ratchet_encrypt(DoubleRatchetStateAndMessage ratchet_state_and_message);
     DoubleRatchetStateAndMessage double_ratchet_decrypt(DoubleRatchetStateAndEnvelope ratchet_state_and_envelope);
 
+    // Triple Ratchet
     TripleRatchetStateAndMetadata new_triple_ratchet([ByRef] sequence<sequence<u8>> peers, [ByRef] sequence<u8> peer_key, [ByRef] sequence<u8> identity_key, [ByRef] sequence<u8> signed_pre_key, u64 threshold, boolean async_dkg_ratchet);
     TripleRatchetStateAndMetadata triple_ratchet_init_round_1(TripleRatchetStateAndMetadata ratchet_state_and_metadata);
     TripleRatchetStateAndMetadata triple_ratchet_init_round_2(TripleRatchetStateAndMetadata ratchet_state_and_metadata);

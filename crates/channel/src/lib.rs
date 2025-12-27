@@ -1,9 +1,15 @@
+use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::aead::{Aead, Payload};
 use base64::prelude::*;
+use ed448_rust::Ed448Error;
+use hkdf::Hkdf;
+use rand::{rngs::OsRng, RngCore};
+use sha2::Sha512;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, error::Error, io::Read};
+use std::{collections::HashMap, error::Error};
 use hex;
 
-use ed448_goldilocks_plus::{elliptic_curve::group::GroupEncoding, CompressedEdwardsY, EdwardsPoint, Scalar};
+use ed448_goldilocks_plus::{elliptic_curve::group::GroupEncoding, elliptic_curve::Group, CompressedEdwardsY, EdwardsPoint, Scalar};
 use protocols::{doubleratchet::{DoubleRatchetParticipant, P2PChannelEnvelope}, tripleratchet::{PeerInfo, TripleRatchetParticipant}, x3dh};
 
 pub(crate) mod protocols;
@@ -39,6 +45,305 @@ pub struct TripleRatchetStateAndMessage {
     pub ratchet_state: String,
     pub message: Vec<u8>,
 }
+
+// ============ Keypair Types ============
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct EncryptionKeyPair {
+    pub public_key: Vec<u8>,
+    pub private_key: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageCiphertext {
+    pub ciphertext: String,
+    pub initialization_vector: String,
+    pub associated_data: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct SealedInboxMessageEncryptRequest {
+    pub inbox_public_key: Vec<u8>,
+    pub ephemeral_private_key: Vec<u8>,
+    pub plaintext: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct SealedInboxMessageDecryptRequest {
+    pub inbox_private_key: Vec<u8>,
+    pub ephemeral_public_key: Vec<u8>,
+    pub ciphertext: MessageCiphertext,
+}
+
+// ============ Encryption Helpers ============
+
+fn encrypt_aead(plaintext: &[u8], key: &[u8]) -> Result<MessageCiphertext, String> {
+    use aes_gcm::KeyInit;
+    let mut iv = [0u8; 12];
+    OsRng.fill_bytes(&mut iv);
+
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| format!("Invalid key: {}", e))?;
+    let nonce = Nonce::from_slice(&iv);
+
+    let mut aad = [0u8; 32];
+    OsRng.fill_bytes(&mut aad);
+
+    let ciphertext = cipher.encrypt(nonce, Payload {
+        msg: plaintext,
+        aad: &aad,
+    }).map_err(|e| format!("Encryption failed: {}", e))?;
+
+    Ok(MessageCiphertext {
+        ciphertext: BASE64_STANDARD.encode(ciphertext),
+        initialization_vector: BASE64_STANDARD.encode(iv.to_vec()),
+        associated_data: Some(BASE64_STANDARD.encode(aad.to_vec())),
+    })
+}
+
+fn decrypt_aead(ciphertext: &MessageCiphertext, key: &[u8]) -> Result<Vec<u8>, String> {
+    use aes_gcm::KeyInit;
+    if key.len() != 32 {
+        return Err("Invalid key length".to_string());
+    }
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| format!("Invalid key: {}", e))?;
+
+    let iv = BASE64_STANDARD.decode(&ciphertext.initialization_vector)
+        .map_err(|e| format!("Invalid IV: {}", e))?;
+    let nonce = Nonce::from_slice(&iv);
+
+    let associated_data = match &ciphertext.associated_data {
+        Some(aad) => BASE64_STANDARD.decode(aad)
+            .map_err(|e| format!("Invalid AAD: {}", e))?,
+        None => Vec::new(),
+    };
+
+    let ct = BASE64_STANDARD.decode(&ciphertext.ciphertext)
+        .map_err(|e| format!("Invalid ciphertext: {}", e))?;
+
+    cipher.decrypt(nonce, Payload {
+        msg: &ct,
+        aad: &associated_data,
+    }).map_err(|e| format!("Decryption failed: {}", e))
+}
+
+// ============ Key Generation ============
+
+pub fn generate_x448() -> String {
+    let priv_key = Scalar::random(&mut rand::thread_rng());
+    let pub_key = EdwardsPoint::generator() * priv_key;
+
+    match serde_json::to_string(&EncryptionKeyPair {
+        public_key: pub_key.compress().to_bytes().to_vec(),
+        private_key: priv_key.to_bytes().to_vec(),
+    }) {
+        Ok(result) => result,
+        Err(e) => e.to_string(),
+    }
+}
+
+pub fn generate_ed448() -> String {
+    let priv_key = ed448_rust::PrivateKey::new(&mut rand::thread_rng());
+    let pub_key = ed448_rust::PublicKey::from(&priv_key);
+
+    match serde_json::to_string(&EncryptionKeyPair {
+        public_key: pub_key.as_byte().to_vec(),
+        private_key: priv_key.as_bytes().to_vec(),
+    }) {
+        Ok(result) => result,
+        Err(e) => e.to_string(),
+    }
+}
+
+pub fn get_pubkey_x448(key: String) -> String {
+    let maybe_key = BASE64_STANDARD.decode(&key);
+    if maybe_key.is_err() {
+        return maybe_key.unwrap_err().to_string();
+    }
+
+    let key_bytes = maybe_key.unwrap();
+    if key_bytes.len() != 56 {
+        return "invalid key length".to_string();
+    }
+
+    let mut priv_key_bytes = [0u8; 56];
+    priv_key_bytes.copy_from_slice(&key_bytes);
+
+    let priv_key = Scalar::from_bytes(&priv_key_bytes);
+    let pub_key = EdwardsPoint::generator() * priv_key;
+
+    format!("\"{}\"", BASE64_STANDARD.encode(pub_key.compress().to_bytes().to_vec()))
+}
+
+pub fn get_pubkey_ed448(key: String) -> String {
+    let maybe_key = BASE64_STANDARD.decode(&key);
+    if maybe_key.is_err() {
+        return maybe_key.unwrap_err().to_string();
+    }
+
+    let key_bytes = maybe_key.unwrap();
+    if key_bytes.len() != 57 {
+        return "invalid key length".to_string();
+    }
+
+    let key_arr: [u8; 57] = key_bytes.try_into().unwrap();
+    let priv_key = ed448_rust::PrivateKey::from(key_arr);
+    let pub_key = ed448_rust::PublicKey::from(&priv_key);
+
+    format!("\"{}\"", BASE64_STANDARD.encode(pub_key.as_byte()))
+}
+
+// ============ Signing ============
+
+pub fn sign_ed448(key: String, message: String) -> String {
+    let maybe_key = BASE64_STANDARD.decode(&key);
+    if maybe_key.is_err() {
+        return maybe_key.unwrap_err().to_string();
+    }
+
+    let maybe_message = BASE64_STANDARD.decode(&message);
+    if maybe_message.is_err() {
+        return maybe_message.unwrap_err().to_string();
+    }
+
+    let key_bytes = maybe_key.unwrap();
+    if key_bytes.len() != 57 {
+        return "invalid key length".to_string();
+    }
+
+    let key_arr: [u8; 57] = key_bytes.try_into().unwrap();
+    let priv_key = ed448_rust::PrivateKey::from(key_arr);
+    let signature = priv_key.sign(&maybe_message.unwrap(), None);
+
+    match signature {
+        Ok(output) => format!("\"{}\"", BASE64_STANDARD.encode(output)),
+        Err(Ed448Error::WrongKeyLength) => "invalid key length".to_string(),
+        Err(Ed448Error::WrongPublicKeyLength) => "invalid public key length".to_string(),
+        Err(Ed448Error::WrongSignatureLength) => "invalid signature length".to_string(),
+        Err(Ed448Error::InvalidPoint) => "invalid point".to_string(),
+        Err(Ed448Error::InvalidSignature) => "invalid signature".to_string(),
+        Err(Ed448Error::ContextTooLong) => "context too long".to_string(),
+    }
+}
+
+pub fn verify_ed448(public_key: String, message: String, signature: String) -> String {
+    let maybe_key = BASE64_STANDARD.decode(&public_key);
+    if maybe_key.is_err() {
+        return maybe_key.unwrap_err().to_string();
+    }
+
+    let maybe_message = BASE64_STANDARD.decode(&message);
+    if maybe_message.is_err() {
+        return maybe_message.unwrap_err().to_string();
+    }
+
+    let maybe_signature = BASE64_STANDARD.decode(&signature);
+    if maybe_signature.is_err() {
+        return maybe_signature.unwrap_err().to_string();
+    }
+
+    let key_bytes = maybe_key.unwrap();
+    if key_bytes.len() != 57 {
+        return "invalid key length".to_string();
+    }
+
+    let pub_arr: [u8; 57] = key_bytes.try_into().unwrap();
+    let pub_key = ed448_rust::PublicKey::from(pub_arr);
+    let result = pub_key.verify(&maybe_message.unwrap(), &maybe_signature.unwrap(), None);
+
+    match result {
+        Ok(()) => "true".to_string(),
+        Err(Ed448Error::WrongKeyLength) => "invalid key length".to_string(),
+        Err(Ed448Error::WrongPublicKeyLength) => "invalid public key length".to_string(),
+        Err(Ed448Error::WrongSignatureLength) => "invalid signature length".to_string(),
+        Err(Ed448Error::InvalidPoint) => "invalid point".to_string(),
+        Err(Ed448Error::InvalidSignature) => "invalid signature".to_string(),
+        Err(Ed448Error::ContextTooLong) => "context too long".to_string(),
+    }
+}
+
+// ============ Inbox Message Encryption ============
+
+pub fn encrypt_inbox_message(input: String) -> String {
+    let json: Result<SealedInboxMessageEncryptRequest, serde_json::Error> = serde_json::from_str(&input);
+    match json {
+        Ok(params) => {
+            let key = params.ephemeral_private_key;
+            if key.len() != 56 {
+                return "invalid ephemeral key length".to_string();
+            }
+
+            let inbox_key = params.inbox_public_key;
+            if inbox_key.len() != 57 {
+                return "invalid inbox key length".to_string();
+            }
+
+            let key_bytes: [u8; 56] = key.try_into().unwrap();
+            let inbox_key_bytes: [u8; 57] = inbox_key.try_into().unwrap();
+            let priv_key = Scalar::from_bytes(&key_bytes);
+            let maybe_pub_key = CompressedEdwardsY(inbox_key_bytes).decompress();
+
+            if maybe_pub_key.is_none().into() {
+                return "invalid inbox key".to_string();
+            }
+
+            let dh_output = priv_key * maybe_pub_key.unwrap();
+            let hkdf = Hkdf::<Sha512>::new(None, &dh_output.compress().to_bytes());
+            let mut derived = [0u8; 32];
+            if hkdf.expand(b"quilibrium-sealed-sender", &mut derived).is_err() {
+                return "invalid length".to_string();
+            }
+
+            match encrypt_aead(&params.plaintext, &derived) {
+                Ok(result) => serde_json::to_string(&result).unwrap_or_else(|e| e.to_string()),
+                Err(e) => e,
+            }
+        }
+        Err(e) => e.to_string(),
+    }
+}
+
+pub fn decrypt_inbox_message(input: String) -> String {
+    let json: Result<SealedInboxMessageDecryptRequest, serde_json::Error> = serde_json::from_str(&input);
+    match json {
+        Ok(params) => {
+            let ephemeral_key = params.ephemeral_public_key;
+            if ephemeral_key.len() != 57 {
+                return "invalid ephemeral key length".to_string();
+            }
+
+            let inbox_key = params.inbox_private_key;
+            if inbox_key.len() != 56 {
+                return "invalid inbox key length".to_string();
+            }
+
+            let ephemeral_key_bytes: [u8; 57] = ephemeral_key.try_into().unwrap();
+            let inbox_key_bytes: [u8; 56] = inbox_key.try_into().unwrap();
+            let priv_key = Scalar::from_bytes(&inbox_key_bytes);
+            let maybe_eph_key = CompressedEdwardsY(ephemeral_key_bytes).decompress();
+
+            if maybe_eph_key.is_none().into() {
+                return "invalid ephemeral key".to_string();
+            }
+
+            let dh_output = priv_key * maybe_eph_key.unwrap();
+            let hkdf = Hkdf::<Sha512>::new(None, &dh_output.compress().to_bytes());
+            let mut derived = [0u8; 32];
+            if hkdf.expand(b"quilibrium-sealed-sender", &mut derived).is_err() {
+                return "invalid length".to_string();
+            }
+
+            match decrypt_aead(&params.ciphertext, &derived) {
+                Ok(result) => serde_json::to_string(&result).unwrap_or_else(|e| e.to_string()),
+                Err(e) => e,
+            }
+        }
+        Err(e) => e.to_string(),
+    }
+}
+
+// ============ X3DH Key Agreement ============
 
 pub fn sender_x3dh(sending_identity_private_key: &Vec<u8>, sending_ephemeral_private_key: &Vec<u8>, receiving_identity_key: &Vec<u8>, receiving_signed_pre_key: &Vec<u8>, session_key_length: u64) -> String {
   if sending_identity_private_key.len() != 56 {
