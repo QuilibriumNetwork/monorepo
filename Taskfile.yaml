@@ -1,9 +1,12 @@
 # https://taskfile.dev
 
-version: '3'
+version: "3"
 
 dotenv:
-  - '.env'
+  - ".env"
+
+env:
+  DOCKER_BUILDKIT: '1'
 
 vars:
   VERSION:
@@ -27,7 +30,7 @@ tasks:
       - echo -n "Commit    :" && echo " {{.GIT_COMMIT}}"
       - echo -n "Max Key ID:" && echo " {{.MAX_KEY_ID}}"
     silent: true
-    
+
   build_node_arm64_macos:
     desc: Build the Quilibrium node binary for MacOS ARM. Assumes it's ran from the same platform. Outputs to node/build.
     cmds:
@@ -52,3 +55,208 @@ tasks:
       - rpm/generate.sh
       - client/build.sh -o build/arm64_macos/qclient
 
+  backup:
+    desc: Create a backup file with the critical configuration files.
+    prompt: You will be prompted for root access. Make sure you verify the generated backup file. Continue?
+    preconditions:
+      - sh: 'test -d .config'
+        msg: '.config does not exists!'
+      - sh: 'test -f .config/config.yml'
+        msg: '.config/config.yml does not exists!'
+      - sh: 'test -f .config/keys.yml'
+        msg: '.config/keys.yml does not exists!'
+      - sh: '! test -f backup.tar.gz'
+        msg: 'A previous backup.tar.gz found in the current folder!'
+    sources:
+      - '.config/config.yml'
+      - '.config/keys.yml'
+    generates:
+      - 'backup.tar.gz'
+    cmds:
+      - |
+        export TMP_DIR=$(mktemp -d)
+        export TASK_DIR=$(pwd)
+        sudo cp .config/config.yml $TMP_DIR
+        sudo cp .config/keys.yml $TMP_DIR
+        sudo chown $(whoami):$(id -gn) $TMP_DIR/*
+        cd $TMP_DIR
+        tar -czf $TASK_DIR/backup.tar.gz *
+        cd $TASK_DIR
+        sudo rm -rf $TMP_DIR
+        echo "Backup saved to: backup.tar.gz"
+        echo "Do not assume you have a backup unless you verify it!!!"
+    silent: true
+
+  restore:
+    desc: Restores a backup file with the critical configuration files.
+    preconditions:
+      - sh: '! test -d .config'
+        msg: '.config already exists, restore cannot be performed safely!'
+      - sh: 'test -f backup.tar.gz'
+        msg: 'backup.tar.gz not found in the current folder!'
+    sources:
+      - 'backup.tar.gz'
+    generates:
+      - '.config/config.yml'
+      - '.config/keys.yml'
+    cmds:
+      - |
+        mkdir .config
+        tar -xzf backup.tar.gz -C .config
+        echo "Backup restored from: backup.tar.gz"
+    silent: true
+
+  test:port:
+    desc: Test if the P2P port is visible to the world.
+    preconditions:
+      - sh: 'test -x "$(command -v nc)"'
+        msg: 'nc is not installed, install with "sudo apt install netcat"'
+      - sh: 'test -n "$NODE_PUBLIC_NAME"'
+        msg: 'The public DNS name or IP address of the server must be set in NODE_PUBLIC_NAME.'
+    cmds:
+      - 'nc -vzu ${NODE_PUBLIC_NAME} ${QUILIBRIUM_P2P_PORT:=8336}'
+
+  build_node_arm64_linux:
+    desc: Build the Quilibrium node binary for ARM64 Linux. Outputs to node/build.
+    cmds:
+      - docker build --platform linux/arm64 -f docker/Dockerfile.source --output node/build/arm64_linux --target=node .
+
+  build_qclient_arm64_linux:
+    desc: Build the QClient node binary for ARM64 Linux. Outputs to client/build.
+    cmds:
+      - docker build --platform linux/arm64 -f docker/Dockerfile.source --output client/build/arm64_linux --target=qclient .
+
+  build_node_amd64_linux:
+    desc: Build the Quilibrium node binary for AMD64 Linux. Outputs to node/build.
+    cmds:
+      - docker build --platform linux/amd64 -f docker/Dockerfile.source --output node/build/amd64_linux --target=node .
+
+  build_conntest_amd64_linux:
+    desc: Build the Quilibrium node connection test binary for AMD64 Linux. Outputs to conntest/build.
+    cmds:
+      - docker build --platform linux/amd64 -f docker/Dockerfile.conntest.source --output conntest/build/amd64_linux --target=conntest .
+
+  build_node_amd64_avx512_linux:
+    desc: Build the Quilibrium node binary for AMD64 Linux with AVX-512 extensions. Outputs to node/build.
+    cmds:
+      - docker build --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
+
+  build_qclient_amd64_linux:
+    desc: Build the QClient node binary for AMD64 Linux. Outputs to client/build.
+    cmds:
+      - docker build --platform linux/amd64 -f docker/Dockerfile.source --output client/build/amd64_linux --target=qclient .
+
+  build_qclient_amd64_avx512_linux:
+    desc: Build the QClient node binary for AMD64 Linux with AVX-512 extensions. Outputs to client/build.
+    cmds:
+      - docker build --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output client/build/amd64_avx512_linux --target=qclient .
+
+  build_vdf_perf_analysis_amd64_linux:
+    cmds:
+      - docker build --platform linux/amd64 -f docker/Dockerfile.vdf.source --output vdf/build/amd64_linux --target=vdf  --progress=plain --no-cache .
+
+  build_vdf_perf_analysis_amd64_avx512_linux:
+    cmds:
+      - docker build --platform linux/amd64 -f docker/Dockerfile.vdf.sourceavx512 --output vdf/build/amd64_avx512_linux --target=vdf-avx512 .
+
+  build_vdf_perf_analysis_amd64_zen3_linux:
+    cmds:
+      - docker build --platform linux/amd64 -f docker/Dockerfile.vdf.sourcezen3 --output vdf/build/amd64_zen3_linux --target=vdf-zen3 --progress=plain --no-cache .
+
+  build_vdf_perf_analysis_amd64_zen4_linux:
+    cmds:
+      - docker build --platform linux/amd64 -f docker/Dockerfile.vdf.sourcezen4 --output vdf/build/amd64_zen4_linux --target=vdf-zen4 --progress=plain --no-cache .
+  
+  build_vdf_perf_analysis_arm64_linux:
+    cmds:
+      - docker build --platform linux/arm64 -f docker/Dockerfile.vdf.source --output vdf/build/arm64_linux --target=vdf --progress=plain --no-cache .
+
+  build:source:
+    desc: Build the Quilibrium docker image from source.
+    cmds:
+      - |
+        docker build \
+        -f docker/Dockerfile.source \
+        --build-arg NODE_VERSION={{.VERSION}} \
+        --build-arg GIT_REPO={{.GIT_REPO}} \
+        --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
+        --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-source \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:source \
+        .
+    status:
+      - |
+        docker image inspect \
+        ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-source \
+        >/dev/null 2>/dev/null
+
+  build:release:
+    desc: Build the Quilibrium docker image from release binaries.
+    aliases:
+      - build
+    cmds:
+      - |
+        docker build \
+        -f docker/Dockerfile.release \
+        --build-arg NODE_VERSION={{.VERSION}} \
+        --build-arg GIT_REPO={{.GIT_REPO}} \
+        --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
+        --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        --build-arg MAX_KEY_ID={{.MAX_KEY_ID}} \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-release \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:release \
+        .
+    status:
+      - |
+        docker image inspect \
+        ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-release \
+        >/dev/null 2>/dev/null
+
+  docker:login:
+    desc: Login to Docker hub
+    aliases:
+      - login
+    cmds:
+      - echo $DOCKER_TOKEN | docker login -u $DOCKER_USERNAME --password-stdin
+
+  push:
+    desc: Push Quilibrium docker image to the container registry.
+    cmds:
+      - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}
+      - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:latest
+
+  test:qclient:
+    desc: Test the Quilibrium docker image.
+    cmds:
+      - client/test/run_tests.sh -d 'ubuntu' -v '24.04'
+
+  config:gen:
+    desc: Generate configuration and keys using Go.
+    cmds:
+      - go run utils/config-gen --config {{.CONFIG_DIR | default ".config"}}
+
+  build:node:source:
+    desc: Build the optimized Quilibrium node-only docker image.
+    cmds:
+      - |
+        docker build \
+        --target node-only \
+        -f docker/Dockerfile.source \
+        --build-arg NODE_VERSION={{.VERSION}} \
+        --build-arg GIT_REPO={{.GIT_REPO}} \
+        --build-arg GIT_BRANCH={{.GIT_BRANCH}} \
+        --build-arg GIT_COMMIT={{.GIT_COMMIT}} \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:{{.VERSION}}-node-only \
+        -t ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
+        .
+
+  deploy:node:
+    desc: Run the Quilibrium node using host networking and external config.
+    cmds:
+      - |
+        docker run -d --name q-node \
+           --network host \
+           --restart unless-stopped \
+           -v {{.CONFIG_DIR | default "$(pwd)/.config"}}:/root/.config \
+           ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
+           -signature-check=false
