@@ -151,26 +151,6 @@ tasks:
     cmds:
       - docker build --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output client/build/amd64_avx512_linux --target=qclient .
 
-  build_vdf_perf_analysis_amd64_linux:
-    cmds:
-      - docker build --platform linux/amd64 -f docker/Dockerfile.vdf.source --output vdf/build/amd64_linux --target=vdf  --progress=plain --no-cache .
-
-  build_vdf_perf_analysis_amd64_avx512_linux:
-    cmds:
-      - docker build --platform linux/amd64 -f docker/Dockerfile.vdf.sourceavx512 --output vdf/build/amd64_avx512_linux --target=vdf-avx512 .
-
-  build_vdf_perf_analysis_amd64_zen3_linux:
-    cmds:
-      - docker build --platform linux/amd64 -f docker/Dockerfile.vdf.sourcezen3 --output vdf/build/amd64_zen3_linux --target=vdf-zen3 --progress=plain --no-cache .
-
-  build_vdf_perf_analysis_amd64_zen4_linux:
-    cmds:
-      - docker build --platform linux/amd64 -f docker/Dockerfile.vdf.sourcezen4 --output vdf/build/amd64_zen4_linux --target=vdf-zen4 --progress=plain --no-cache .
-  
-  build_vdf_perf_analysis_arm64_linux:
-    cmds:
-      - docker build --platform linux/arm64 -f docker/Dockerfile.vdf.source --output vdf/build/arm64_linux --target=vdf --progress=plain --no-cache .
-
   build:source:
     desc: Build the Quilibrium docker image from source.
     cmds:
