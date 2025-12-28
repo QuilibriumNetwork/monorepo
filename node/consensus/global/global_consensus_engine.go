@@ -1625,22 +1625,48 @@ func (e *GlobalConsensusEngine) materialize(
 		return errors.Wrap(err, "materialize")
 	}
 
+	var expectedRootHex string
+	localRootHex := ""
+
 	// Check prover root BEFORE processing transactions. If there's a mismatch,
 	// we need to sync first, otherwise we'll apply transactions on top of
 	// divergent state and then sync will delete the newly added records.
 	if len(expectedProverRoot) > 0 {
-		localRoot, localErr := e.computeLocalProverRoot(frameNumber)
-		if localErr == nil && len(localRoot) > 0 {
-			if !bytes.Equal(localRoot, expectedProverRoot) {
+		localProverRoot, localRootErr := e.computeLocalProverRoot(frameNumber)
+		if localRootErr != nil {
+			e.logger.Warn(
+				"failed to compute local prover root",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Error(localRootErr),
+			)
+		}
+
+		if localRootErr == nil && len(localProverRoot) > 0 {
+			if !bytes.Equal(localProverRoot, expectedProverRoot) {
 				e.logger.Info(
 					"prover root mismatch detected before processing frame, syncing first",
 					zap.Uint64("frame_number", frameNumber),
 					zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
-					zap.String("local_root", hex.EncodeToString(localRoot)),
+					zap.String("local_root", hex.EncodeToString(localProverRoot)),
 				)
 				// Perform blocking hypersync before continuing
 				e.performBlockingProverHypersync(proposer, expectedProverRoot)
 			}
+		}
+
+		// Publish the snapshot generation with the new root so clients can sync
+		// against this specific state.
+		if len(localProverRoot) > 0 {
+			if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
+				hgCRDT.PublishSnapshot(localProverRoot)
+			}
+		}
+
+		if len(expectedProverRoot) > 0 {
+			expectedRootHex = hex.EncodeToString(expectedProverRoot)
+		}
+		if len(localProverRoot) > 0 {
+			localRootHex = hex.EncodeToString(localProverRoot)
 		}
 	}
 
@@ -1755,41 +1781,8 @@ func (e *GlobalConsensusEngine) materialize(
 		return errors.Wrap(err, "materialize")
 	}
 
-	localProverRoot, localRootErr := e.computeLocalProverRoot(frameNumber)
-	if localRootErr != nil {
-		e.logger.Warn(
-			"failed to compute local prover root",
-			zap.Uint64("frame_number", frameNumber),
-			zap.Error(localRootErr),
-		)
-	}
-
-	// Publish the snapshot generation with the new root so clients can sync
-	// against this specific state.
-	if len(localProverRoot) > 0 {
-		if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
-			hgCRDT.PublishSnapshot(localProverRoot)
-		}
-	}
-
-	if len(localProverRoot) > 0 {
-		if e.verifyProverRoot(
-			frameNumber,
-			expectedProverRoot,
-			localProverRoot,
-			proposer,
-		) {
-			e.reconcileLocalWorkerAllocations()
-		}
-	}
-
-	var expectedRootHex string
-	if len(expectedProverRoot) > 0 {
-		expectedRootHex = hex.EncodeToString(expectedProverRoot)
-	}
-	localRootHex := ""
-	if len(localProverRoot) > 0 {
-		localRootHex = hex.EncodeToString(localProverRoot)
+	if len(localRootHex) > 0 {
+		e.reconcileLocalWorkerAllocations()
 	}
 
 	e.logger.Info(
