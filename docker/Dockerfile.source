@@ -127,7 +127,7 @@ COPY --from=rust-base /root/.rustup /root/.rustup
 ENV PATH="${PATH}:/root/.cargo/bin/"
 
 ENV GOEXPERIMENT=arenas
-ENV QUILIBRIUM_SIGNATURE_CHECK=false
+ENV QUILIBRIUM_SIGNATURE_CHECK=true
 
 # Install grpcurl (common tool)
 RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
@@ -260,9 +260,6 @@ RUN apt-get update && apt-get install -y \
     libmpfr6 \
     && rm -rf /var/lib/apt/lists/*
 
-ENV QUILIBRIUM_SIGNATURE_CHECK=true
-ENV GOEXPERIMENT=arenas
-
 COPY --from=build-node /usr/bin/node /usr/local/bin/node
 WORKDIR /root
 ENTRYPOINT ["node"]
@@ -298,7 +295,6 @@ ARG GIT_BRANCH
 ARG GIT_COMMIT
 
 ENV GOEXPERIMENT=arenas
-ENV QUILIBRIUM_SIGNATURE_CHECK=false
 
 LABEL org.opencontainers.image.title="Quilibrium Network Node"
 LABEL org.opencontainers.image.description="Quilibrium is a decentralized alternative to platform as a service providers."

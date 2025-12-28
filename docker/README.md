@@ -1,44 +1,59 @@
 # Quilibrium Docker Guide
 
-This folder contains all the necessary files to build and run Quilibrium nodes using Docker.
-
+This folder contains the Dockerfiles and related resources for Quilibrium. All commands should be executed from the **root of the repository** using `task`.
 
 ## 1. System Preparation
 
-For system preparation follow this [guide](https://docs.quilibrium.com/). 
-
-If you have issues with connecting to others consider opening up additonal ports 50000+ and 60000+
-
+For system preparation follow the official [Quilibrium Guide](https://docs.quilibrium.com/). 
 
 ## 2. Configuration
 
-### Configuration Directory
-By default, the Docker configuration uses the `.config` directory at the **root of the repository** (`../.config`). This allows you to share configuration between native and containerized builds.
-
 ### Generating Config
+The configuration directory `.config` is located at the root of the repository.
+
 ```bash
 task config:gen
 ```
-This will generate the configuration in `../.config`.
+This will generate `config.yml` and `keys.yml` in the `.config/` folder.
 
-## 3. Running a Node
+## 3. Workflow Options
 
-### Quick Start (Docker Compose)
-```bash
-task up
-```
-Or:
+You have two primary ways to use Docker with Quilibrium:
 
-```bash
-docker compose up -d
-```
+### Option A: Build Binary via Docker (for Native Run)
+If you prefer to run the node natively but don't want to set up the full Go build environment, you can use Docker to compile the binary for your specific platform.
 
-### New Instance
-If you are starting a brand new node, a `.config/` folder will be created at the repository root.
+1. **Build and Export Binary**:
+   Run the task corresponding to your OS/Architecture:
+   - **Linux AMD64**: `task build_node_amd64_linux`
+   - **Linux ARM64**: `task build_node_arm64_linux`
+   - **MacOS ARM**: `task build_node_arm64_macos`
+
+2. **Run Binary**:
+   The binary will be exported to `node/build/`. You can then run it directly:
+   ```bash
+   ./node/build/[platform]/node
+   ```
+
+### Option B: Run Entirely via Docker
+The node runs inside a Docker container.
+
+1. **Build the Image**:
+   ```bash
+   task build:node:source
+   ```
+2. **Deploy the Node**:
+   ```bash
+   task deploy:node
+   ```
+
+   and then you can use the standard docker commands to manage the node.
+
+## 4. Maintenance & Backup
 
 > [!IMPORTANT]
-> Once the node is running (the `task node-info` command shows a balance), make sure you backup `config.yml` and `keys.yml`.
+> Always backup your `.config/` directory. It contains your unique node identity and balance information.
 
-### Restore Previous Instance
-1. Ensure your `config.yml` and `keys.yml` are in the `.config/` folder at the repository root.
-2. Start the node: `task up`
+- **Backup**: `task backup`
+- **Restore**: `task restore`
+- **Check Status**: `task status`
