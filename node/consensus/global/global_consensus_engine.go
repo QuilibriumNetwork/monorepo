@@ -1668,6 +1668,9 @@ func (e *GlobalConsensusEngine) materialize(
 		if len(localProverRoot) > 0 {
 			localRootHex = hex.EncodeToString(localProverRoot)
 		}
+
+		e.proverRootSynced.Store(true)
+		e.proverRootVerifiedFrame.Store(frameNumber)
 	}
 
 	var state state.State
