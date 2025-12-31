@@ -158,7 +158,7 @@ func (g *GlobalEventDistributor) processEvents() {
 	}
 }
 
-// broadcast sends a control event to all subscribers
+// broadcast sends a control event to all subscribers (non-blocking)
 func (g *GlobalEventDistributor) broadcast(event consensus.ControlEvent) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -169,8 +169,14 @@ func (g *GlobalEventDistributor) broadcast(event consensus.ControlEvent) {
 	eventTypeStr := getEventTypeString(event.Type)
 	broadcastsTotal.WithLabelValues("global", eventTypeStr).Inc()
 
-	for _, ch := range g.subscribers {
-		ch <- event
+	for id, ch := range g.subscribers {
+		select {
+		case ch <- event:
+		default:
+			// Subscriber channel full - drop event to avoid blocking the time reel.
+			// This prevents a slow subscriber from deadlocking frame processing.
+			eventsDroppedTotal.WithLabelValues("global", eventTypeStr, id).Inc()
+		}
 	}
 }
 

@@ -325,11 +325,9 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		if e.currentRank < 14400 {
-			for _, r := range messageBundle.Requests {
-				if r.GetKick() != nil {
-					return tp2p.ValidationResultIgnore
-				}
+		for _, r := range messageBundle.Requests {
+			if r.GetKick() != nil {
+				return tp2p.ValidationResultIgnore
 			}
 		}
 		if err := messageBundle.Validate(); err != nil {

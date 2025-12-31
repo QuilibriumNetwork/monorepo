@@ -1417,12 +1417,15 @@ func (s *streamManager) descendIndex(
 			)
 		}
 
-		if slices.Compare(branchInfo.Path, r.Path) != 0 {
+		// Both sides independently extend the path based on their tree's branch
+		// prefixes. We only need to verify that the server's response path starts
+		// with the original query path - the extensions may differ.
+		if len(r.Path) < len(path) || slices.Compare(r.Path[:len(path)], path) != 0 {
 			return nil, nil, errors.Wrap(
 				fmt.Errorf(
-					"invalid path received: %v, expected: %v",
+					"invalid path received: %v, expected prefix: %v",
 					r.Path,
-					branchInfo.Path,
+					path,
 				),
 				"descend index",
 			)
