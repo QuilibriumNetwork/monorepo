@@ -127,7 +127,7 @@ COPY --from=rust-base /root/.rustup /root/.rustup
 ENV PATH="${PATH}:/root/.cargo/bin/"
 
 ENV GOEXPERIMENT=arenas
-ENV QUILIBRIUM_SIGNATURE_CHECK=false
+ENV QUILIBRIUM_SIGNATURE_CHECK=true
 
 # Install grpcurl (common tool)
 RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
