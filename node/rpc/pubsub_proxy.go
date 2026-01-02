@@ -564,6 +564,11 @@ func (c *PubSubProxyClient) Close() error {
 	return nil
 }
 
+// SetShutdownContext implements p2p.PubSub.
+func (c *PubSubProxyClient) SetShutdownContext(ctx context.Context) {
+	// No-op for proxy client - shutdown is handled by the proxied pubsub
+}
+
 // NewPubSubProxyClient creates a new proxy client
 func NewPubSubProxyClient(
 	ctx context.Context,

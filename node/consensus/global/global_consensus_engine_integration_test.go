@@ -83,6 +83,14 @@ func (m *mockIntegrationPubSub) Close() error {
 	panic("unimplemented")
 }
 
+// SetShutdownContext implements p2p.PubSub.
+func (m *mockIntegrationPubSub) SetShutdownContext(ctx context.Context) {
+	// Forward to underlying blossomsub if available
+	if m.underlyingBlossomSub != nil {
+		m.underlyingBlossomSub.SetShutdownContext(ctx)
+	}
+}
+
 // GetOwnMultiaddrs implements p2p.PubSub.
 func (m *mockIntegrationPubSub) GetOwnMultiaddrs() []multiaddr.Multiaddr {
 	ma, _ := multiaddr.NewMultiaddr("/ip4/127.0.0.1/tcp/8336")

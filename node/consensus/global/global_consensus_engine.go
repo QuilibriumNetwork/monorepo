@@ -1028,6 +1028,11 @@ func NewGlobalConsensusEngine(
 		)
 	}
 
+	// Wire up pubsub shutdown to the component's shutdown signal
+	engine.pubsub.SetShutdownContext(
+		contextFromShutdownSignal(engine.ShutdownSignal()),
+	)
+
 	// Set self peer ID on hypergraph to allow unlimited self-sync sessions
 	if hgWithSelfPeer, ok := engine.hyperSync.(interface {
 		SetSelfPeerID(string)

@@ -1957,6 +1957,21 @@ func (b *BlossomSub) Close() error {
 	return nil
 }
 
+// SetShutdownContext implements p2p.PubSub. When the provided context is
+// cancelled, the internal BlossomSub context will also be cancelled, allowing
+// subscription loops to exit gracefully.
+func (b *BlossomSub) SetShutdownContext(ctx context.Context) {
+	go func() {
+		select {
+		case <-ctx.Done():
+			b.logger.Debug("shutdown context cancelled, closing pubsub")
+			b.Close()
+		case <-b.ctx.Done():
+			// Already closed
+		}
+	}()
+}
+
 // MultiaddrToIPNet converts a multiaddr containing /ip4 or /ip6
 // into a *net.IPNet with a host mask (/32 or /128).
 func MultiaddrToIPNet(m ma.Multiaddr) (*net.IPNet, error) {

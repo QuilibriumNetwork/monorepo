@@ -308,9 +308,18 @@ func (e *GlobalConsensusEngine) emitCoverageEvent(
 	)
 }
 
-func (e *GlobalConsensusEngine) emitMergeEvent(
-	data *typesconsensus.ShardMergeEventData,
+func (e *GlobalConsensusEngine) emitBulkMergeEvent(
+	mergeGroups []typesconsensus.ShardMergeEventData,
 ) {
+	if len(mergeGroups) == 0 {
+		return
+	}
+
+	// Combine all merge groups into a single bulk event
+	data := &typesconsensus.BulkShardMergeEventData{
+		MergeGroups: mergeGroups,
+	}
+
 	event := typesconsensus.ControlEvent{
 		Type: typesconsensus.ControlEventShardMergeEligible,
 		Data: data,
@@ -318,12 +327,18 @@ func (e *GlobalConsensusEngine) emitMergeEvent(
 
 	go e.eventDistributor.Publish(event)
 
+	totalShards := 0
+	totalProvers := 0
+	for _, group := range mergeGroups {
+		totalShards += len(group.ShardAddresses)
+		totalProvers += group.TotalProvers
+	}
+
 	e.logger.Info(
-		"emitted merge eligible event",
-		zap.Int("shard_count", len(data.ShardAddresses)),
-		zap.Int("total_provers", data.TotalProvers),
-		zap.Uint64("attested_storage", data.AttestedStorage),
-		zap.Uint64("required_storage", data.RequiredStorage),
+		"emitted bulk merge eligible event",
+		zap.Int("merge_groups", len(mergeGroups)),
+		zap.Int("total_shards", totalShards),
+		zap.Int("total_provers", totalProvers),
 	)
 }
 

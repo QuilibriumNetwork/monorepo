@@ -831,6 +831,8 @@ func (m *mockPubSub) Close() error {
 	return nil
 }
 
+func (m *mockPubSub) SetShutdownContext(ctx context.Context) {}
+
 type mockTransaction struct{}
 
 // Abort implements store.Transaction.

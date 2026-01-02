@@ -70,6 +70,14 @@ func (m *mockAppIntegrationPubSub) Close() error {
 	panic("unimplemented")
 }
 
+// SetShutdownContext implements p2p.PubSub.
+func (m *mockAppIntegrationPubSub) SetShutdownContext(ctx context.Context) {
+	// Forward to underlying blossomsub if available
+	if m.underlyingBlossomSub != nil {
+		m.underlyingBlossomSub.SetShutdownContext(ctx)
+	}
+}
+
 // GetOwnMultiaddrs implements p2p.PubSub.
 func (m *mockAppIntegrationPubSub) GetOwnMultiaddrs() []multiaddr.Multiaddr {
 	panic("unimplemented")

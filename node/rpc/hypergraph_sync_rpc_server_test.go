@@ -1392,3 +1392,217 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		_ = stream.CloseSend()
 	})
 }
+
+// TestHypergraphSyncWithModifiedEntries tests sync behavior when both client
+// and server have the same keys but with different values (modified entries).
+// This verifies that sync correctly updates entries rather than just adding
+// new ones or deleting orphans.
+func TestHypergraphSyncWithModifiedEntries(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	enc := verenc.NewMPCitHVerifiableEncryptor(1)
+	inclusionProver := bls48581.NewKZGInclusionProver(logger)
+
+	// Create enough data trees for all vertices we'll need
+	numVertices := 50
+	dataTrees := make([]*tries.VectorCommitmentTree, numVertices*2) // Extra for modified versions
+	for i := 0; i < len(dataTrees); i++ {
+		dataTrees[i] = buildDataTree(t, inclusionProver)
+	}
+
+	// Create server and client databases
+	serverDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}, 0)
+	defer serverDB.Close()
+
+	clientDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestclient/store"}, 0)
+	defer clientDB.Close()
+
+	serverStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"},
+		serverDB,
+		logger,
+		enc,
+		inclusionProver,
+	)
+
+	clientStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestclient/store"},
+		clientDB,
+		logger,
+		enc,
+		inclusionProver,
+	)
+
+	serverHG := hgcrdt.NewHypergraph(
+		logger.With(zap.String("side", "server")),
+		serverStore,
+		inclusionProver,
+		[]int{},
+		&tests.Nopthenticator{},
+		200,
+	)
+
+	clientHG := hgcrdt.NewHypergraph(
+		logger.With(zap.String("side", "client")),
+		clientStore,
+		inclusionProver,
+		[]int{},
+		&tests.Nopthenticator{},
+		200,
+	)
+
+	// Create a shared domain for all vertices
+	domain := randomBytes32(t)
+
+	// Generate fixed addresses that will be used by both client and server
+	// This ensures they share the same keys
+	addresses := make([][32]byte, numVertices)
+	for i := 0; i < numVertices; i++ {
+		addresses[i] = randomBytes32(t)
+	}
+
+	// Create "original" vertices for the client (using first set of data trees)
+	clientVertices := make([]application.Vertex, numVertices)
+	for i := 0; i < numVertices; i++ {
+		clientVertices[i] = hgcrdt.NewVertex(
+			domain,
+			addresses[i], // Same address
+			dataTrees[i].Commit(inclusionProver, false),
+			dataTrees[i].GetSize(),
+		)
+	}
+
+	// Create "modified" vertices for the server (using second set of data trees)
+	// These have the SAME addresses but DIFFERENT data commitments
+	serverVertices := make([]application.Vertex, numVertices)
+	for i := 0; i < numVertices; i++ {
+		serverVertices[i] = hgcrdt.NewVertex(
+			domain,
+			addresses[i], // Same address as client
+			dataTrees[numVertices+i].Commit(inclusionProver, false), // Different data
+			dataTrees[numVertices+i].GetSize(),
+		)
+	}
+
+	shardKey := application.GetShardKey(clientVertices[0])
+
+	// Add original vertices to client
+	t.Log("Adding original vertices to client")
+	clientTxn, err := clientStore.NewTransaction(false)
+	require.NoError(t, err)
+	for i, v := range clientVertices {
+		id := v.GetID()
+		require.NoError(t, clientStore.SaveVertexTree(clientTxn, id[:], dataTrees[i]))
+		require.NoError(t, clientHG.AddVertex(clientTxn, v))
+	}
+	require.NoError(t, clientTxn.Commit())
+
+	// Add modified vertices to server
+	t.Log("Adding modified vertices to server")
+	serverTxn, err := serverStore.NewTransaction(false)
+	require.NoError(t, err)
+	for i, v := range serverVertices {
+		id := v.GetID()
+		require.NoError(t, serverStore.SaveVertexTree(serverTxn, id[:], dataTrees[numVertices+i]))
+		require.NoError(t, serverHG.AddVertex(serverTxn, v))
+	}
+	require.NoError(t, serverTxn.Commit())
+
+	// Commit both hypergraphs
+	_, err = clientHG.Commit(1)
+	require.NoError(t, err)
+	_, err = serverHG.Commit(1)
+	require.NoError(t, err)
+
+	// Verify roots are different before sync (modified entries should cause different roots)
+	clientRootBefore := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	require.NotEqual(t, clientRootBefore, serverRoot, "roots should differ before sync due to modified entries")
+
+	t.Logf("Client root before sync: %x", clientRootBefore)
+	t.Logf("Server root: %x", serverRoot)
+
+	// Publish server snapshot
+	serverHG.PublishSnapshot(serverRoot)
+
+	// Start gRPC server
+	const bufSize = 1 << 20
+	lis := bufconn.Listen(bufSize)
+
+	grpcServer := grpc.NewServer(
+		grpc.ChainStreamInterceptor(func(
+			srv interface{},
+			ss grpc.ServerStream,
+			info *grpc.StreamServerInfo,
+			handler grpc.StreamHandler,
+		) error {
+			_, priv, _ := ed448.GenerateKey(rand.Reader)
+			privKey, err := pcrypto.UnmarshalEd448PrivateKey(priv)
+			require.NoError(t, err)
+
+			pub := privKey.GetPublic()
+			peerID, err := peer.IDFromPublicKey(pub)
+			require.NoError(t, err)
+
+			return handler(srv, &serverStream{
+				ServerStream: ss,
+				ctx:          internal_grpc.NewContextWithPeerID(ss.Context(), peerID),
+			})
+		}),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(grpcServer, serverHG)
+	defer grpcServer.Stop()
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	dialClient := func() (*grpc.ClientConn, protobufs.HypergraphComparisonServiceClient) {
+		dialer := func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}
+		conn, err := grpc.DialContext(
+			context.Background(),
+			"bufnet",
+			grpc.WithContextDialer(dialer),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		require.NoError(t, err)
+		return conn, protobufs.NewHypergraphComparisonServiceClient(conn)
+	}
+
+	// Perform sync
+	t.Log("Performing sync to update modified entries")
+	conn, client := dialClient()
+	defer conn.Close()
+
+	stream, err := client.HyperStream(context.Background())
+	require.NoError(t, err)
+
+	err = clientHG.Sync(
+		stream,
+		shardKey,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+		nil,
+	)
+	require.NoError(t, err)
+	require.NoError(t, stream.CloseSend())
+
+	// Commit client after sync
+	_, err = clientHG.Commit(2)
+	require.NoError(t, err)
+
+	// Verify client now matches server
+	clientRootAfter := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	t.Logf("Client root after sync: %x", clientRootAfter)
+
+	assert.Equal(t, serverRoot, clientRootAfter, "client should converge to server state after sync with modified entries")
+
+	// Verify all entries were updated by comparing the leaves
+	serverTree := serverHG.GetVertexAddsSet(shardKey).GetTree()
+	clientTree := clientHG.GetVertexAddsSet(shardKey).GetTree()
+
+	diffLeaves := tries.CompareLeaves(serverTree, clientTree)
+	assert.Empty(t, diffLeaves, "there should be no difference in leaves after sync")
+
+	t.Logf("Sync completed successfully - %d entries with same keys but different values were updated", numVertices)
+}
