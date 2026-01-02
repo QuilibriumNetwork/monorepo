@@ -26,9 +26,10 @@ type PubSubProxyServer struct {
 	logger *zap.Logger
 
 	// Track subscriptions and validators
-	subscriptions map[string]context.CancelFunc
-	validators    map[string]validatorInfo
-	mu            sync.RWMutex
+	subscriptions       map[string]context.CancelFunc
+	validators          map[string]validatorInfo
+	registeredBitmasks  map[string]bool // bitmask key -> registered
+	mu                  sync.RWMutex
 }
 
 type validatorInfo struct {
@@ -43,10 +44,11 @@ func NewPubSubProxyServer(
 	logger *zap.Logger,
 ) *PubSubProxyServer {
 	return &PubSubProxyServer{
-		pubsub:        pubsub,
-		logger:        logger,
-		subscriptions: make(map[string]context.CancelFunc),
-		validators:    make(map[string]validatorInfo),
+		pubsub:             pubsub,
+		logger:             logger,
+		subscriptions:      make(map[string]context.CancelFunc),
+		validators:         make(map[string]validatorInfo),
+		registeredBitmasks: make(map[string]bool),
 	}
 }
 
@@ -174,6 +176,21 @@ func (s *PubSubProxyServer) ValidatorStream(
 			switch m := msg.Message.(type) {
 			case *protobufs.ValidationStreamMessage_Register:
 				reg := m.Register
+				bitmaskKey := string(reg.Bitmask)
+
+				// Check if validator already registered for this bitmask - the
+				// validator is always the same, so just noop for repeats
+				s.mu.RLock()
+				alreadyRegistered := s.registeredBitmasks[bitmaskKey]
+				s.mu.RUnlock()
+
+				if alreadyRegistered {
+					s.logger.Debug("validator already registered for bitmask, skipping",
+						zap.String("validator_id", reg.ValidatorId),
+						zap.Binary("bitmask", reg.Bitmask))
+					continue
+				}
+
 				s.logger.Debug("registering validator",
 					zap.String("validator_id", reg.ValidatorId),
 					zap.Binary("bitmask", reg.Bitmask))
@@ -241,16 +258,27 @@ func (s *PubSubProxyServer) ValidatorStream(
 					s.logger.Error("failed to register validator", zap.Error(err))
 					delete(validatorCallbacks, reg.ValidatorId)
 					close(reqChan)
+				} else {
+					// Mark bitmask as having a registered validator
+					s.mu.Lock()
+					s.registeredBitmasks[bitmaskKey] = true
+					s.mu.Unlock()
 				}
 
 			case *protobufs.ValidationStreamMessage_Unregister:
 				unreg := m.Unregister
+				bitmaskKey := string(unreg.Bitmask)
 				s.logger.Debug("unregistering validator",
 					zap.String("validator_id", unreg.ValidatorId))
 
 				if err := s.pubsub.UnregisterValidator(unreg.Bitmask); err != nil {
 					s.logger.Error("failed to unregister validator", zap.Error(err))
 				}
+
+				// Clear the bitmask registration
+				s.mu.Lock()
+				delete(s.registeredBitmasks, bitmaskKey)
+				s.mu.Unlock()
 
 				if ch, exists := validatorCallbacks[unreg.ValidatorId]; exists {
 					close(ch)

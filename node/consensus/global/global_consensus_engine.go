@@ -1182,6 +1182,11 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.Unsubscribe(GLOBAL_ALERT_BITMASK, false)
 	e.pubsub.UnregisterValidator(GLOBAL_ALERT_BITMASK)
 
+	// Close pubsub to cancel all subscription goroutines
+	if err := e.pubsub.Close(); err != nil {
+		e.logger.Warn("error closing pubsub", zap.Error(err))
+	}
+
 	select {
 	case <-e.Done():
 		// Clean shutdown
