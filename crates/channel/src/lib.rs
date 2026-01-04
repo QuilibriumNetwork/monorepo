@@ -16,6 +16,22 @@ pub(crate) mod protocols;
 
 uniffi::include_scaffolding!("lib");
 
+#[derive(Debug, thiserror::Error)]
+pub enum CryptoError {
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
+    #[error("Invalid envelope: {0}")]
+    InvalidEnvelope(String),
+    #[error("Decryption failed: {0}")]
+    DecryptionFailed(String),
+    #[error("Encryption failed: {0}")]
+    EncryptionFailed(String),
+    #[error("Serialization failed: {0}")]
+    SerializationFailed(String),
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoubleRatchetStateAndEnvelope {
     pub ratchet_state: String,
@@ -467,84 +483,45 @@ pub fn new_double_ratchet(session_key: &Vec<u8>, sending_header_key: &Vec<u8>, n
     return json.unwrap();
 }
 
-pub fn double_ratchet_encrypt(ratchet_state_and_message: DoubleRatchetStateAndMessage) -> DoubleRatchetStateAndEnvelope {
+pub fn double_ratchet_encrypt(ratchet_state_and_message: DoubleRatchetStateAndMessage) -> Result<DoubleRatchetStateAndEnvelope, CryptoError> {
     let ratchet_state = ratchet_state_and_message.ratchet_state.clone();
-    let participant = DoubleRatchetParticipant::from_json(ratchet_state.clone());
+    let participant = DoubleRatchetParticipant::from_json(ratchet_state.clone())
+        .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
 
-    if participant.is_err() {
-        return DoubleRatchetStateAndEnvelope{
-            ratchet_state: participant.unwrap_err().to_string(),
-            envelope: "".to_string(),
-        };
-    }
+    let mut dr = participant;
+    let envelope = dr.ratchet_encrypt(&ratchet_state_and_message.message)
+        .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
 
-    let mut dr = participant.unwrap();
-    let envelope = dr.ratchet_encrypt(&ratchet_state_and_message.message);
+    let participant_json = dr.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    if envelope.is_err() {
-        return DoubleRatchetStateAndEnvelope{
-            ratchet_state: ratchet_state,
-            envelope: envelope.unwrap_err().to_string(),
-        };
-    }
+    let envelope_json = envelope.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-
-    let participant_json = dr.to_json();
-    if participant_json.is_err() {
-        return DoubleRatchetStateAndEnvelope{
-            ratchet_state: participant_json.unwrap_err().to_string(),
-            envelope: "".to_string(),
-        };
-    }
-
-    let envelope_json = envelope.unwrap().to_json();
-    if envelope_json.is_err() {
-        return DoubleRatchetStateAndEnvelope{
-            ratchet_state: ratchet_state,
-            envelope: envelope_json.unwrap_err().to_string(),
-        };
-    }
-
-    return DoubleRatchetStateAndEnvelope{
-        ratchet_state: participant_json.unwrap(),
-        envelope: envelope_json.unwrap(),
-    };
+    Ok(DoubleRatchetStateAndEnvelope{
+        ratchet_state: participant_json,
+        envelope: envelope_json,
+    })
 }
 
-pub fn double_ratchet_decrypt(ratchet_state_and_envelope: DoubleRatchetStateAndEnvelope) -> DoubleRatchetStateAndMessage {
+pub fn double_ratchet_decrypt(ratchet_state_and_envelope: DoubleRatchetStateAndEnvelope) -> Result<DoubleRatchetStateAndMessage, CryptoError> {
     let ratchet_state = ratchet_state_and_envelope.ratchet_state.clone();
-    let participant = DoubleRatchetParticipant::from_json(ratchet_state.clone());
-    let envelope = P2PChannelEnvelope::from_json(ratchet_state_and_envelope.envelope);
+    let participant = DoubleRatchetParticipant::from_json(ratchet_state.clone())
+        .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
+    let envelope = P2PChannelEnvelope::from_json(ratchet_state_and_envelope.envelope)
+        .map_err(|e| CryptoError::InvalidEnvelope(e.to_string()))?;
 
-    if participant.is_err() || envelope.is_err() {
-        return DoubleRatchetStateAndMessage{
-            ratchet_state: ratchet_state,
-            message: vec![],
-        };
-    }
+    let mut dr = participant;
+    let message = dr.ratchet_decrypt(&envelope)
+        .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
 
-    let mut dr = participant.unwrap();
-    let message = dr.ratchet_decrypt(&envelope.unwrap());
+    let participant_json = dr.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    if message.is_err() {
-        return DoubleRatchetStateAndMessage{
-            ratchet_state: ratchet_state,
-            message: message.unwrap_err().to_string().as_bytes().to_vec(),
-        };
-    }
-
-    let participant_json = dr.to_json();
-    if participant_json.is_err() {
-        return DoubleRatchetStateAndMessage{
-            ratchet_state: participant_json.unwrap_err().to_string(),
-            message: vec![],
-        };
-    }
-
-    return DoubleRatchetStateAndMessage{
-        ratchet_state: participant_json.unwrap(),
-        message: message.unwrap(),
-    };
+    Ok(DoubleRatchetStateAndMessage{
+        ratchet_state: participant_json,
+        message: message,
+    })
 }
 
 pub fn new_triple_ratchet(peers: &Vec<Vec<u8>>, peer_key: &Vec<u8>, identity_key: &Vec<u8>, signed_pre_key: &Vec<u8>, threshold: u64, async_dkg_ratchet: bool) -> TripleRatchetStateAndMetadata {
@@ -688,287 +665,178 @@ fn json_to_metadata(ratchet_state_and_metadata: TripleRatchetStateAndMetadata, r
   Ok(metadata)
 }
 
-pub fn triple_ratchet_init_round_1(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> TripleRatchetStateAndMetadata {
-    let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
-    let tr = TripleRatchetParticipant::from_json(&ratchet_state);
-    if tr.is_err() {
-        return TripleRatchetStateAndMetadata{
-            ratchet_state: tr.err().unwrap().to_string(),
-            metadata: HashMap::new(),
-        };
-    }
-
-    let metadata = match json_to_metadata(ratchet_state_and_metadata, &ratchet_state) {
-        Ok(value) => value,
-        Err(value) => return value,
-    };
-
-    let mut trp = tr.unwrap();
-    let result = trp.initialize(&metadata);
-    if result.is_err() {
-        return TripleRatchetStateAndMetadata{
-            ratchet_state: result.err().unwrap().to_string(),
-            metadata: HashMap::new(),
-        };
-    }
-
-    let metadata = result.unwrap();
-    let metadata_json = match metadata_to_json(&ratchet_state, metadata) {
-        Ok(value) => value,
-        Err(value) => return value,
-    };
-
-    let json = trp.to_json();
-    if json.is_err() {
-        return TripleRatchetStateAndMetadata{
-            ratchet_state: json.err().unwrap().to_string(),
-            metadata: HashMap::new(),
-        };
-    }
-
-    return TripleRatchetStateAndMetadata{
-        ratchet_state: json.unwrap(),
-        metadata: metadata_json,
-    };
+fn json_to_metadata_result(ratchet_state_and_metadata: TripleRatchetStateAndMetadata, _ratchet_state: &String) -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, CryptoError> {
+  let mut metadata = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
+  for (k,v) in ratchet_state_and_metadata.metadata {
+      let env = P2PChannelEnvelope::from_json(v)
+          .map_err(|e| CryptoError::InvalidEnvelope(e.to_string()))?;
+      let kb = BASE64_STANDARD.decode(k)
+          .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
+      metadata.insert(kb, env);
+  }
+  Ok(metadata)
 }
 
-pub fn triple_ratchet_init_round_2(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> TripleRatchetStateAndMetadata {
-    let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
-    let tr = TripleRatchetParticipant::from_json(&ratchet_state);
-    if tr.is_err() {
-        return TripleRatchetStateAndMetadata{
-            ratchet_state: tr.err().unwrap().to_string(),
-            metadata: HashMap::new(),
-        };
+fn metadata_to_json_result(_ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChannelEnvelope>) -> Result<HashMap<String, String>, CryptoError> {
+    let mut metadata_json = HashMap::<String, String>::new();
+    for (k,v) in metadata {
+        let env = v.to_json()
+            .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
+        metadata_json.insert(BASE64_STANDARD.encode(k), env);
     }
+    Ok(metadata_json)
+}
 
-    let metadata = match json_to_metadata(ratchet_state_and_metadata, &ratchet_state) {
-        Ok(value) => value,
-        Err(value) => return value,
-    };
+pub fn triple_ratchet_init_round_1(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
+    let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
+    let tr = TripleRatchetParticipant::from_json(&ratchet_state)
+        .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
 
-    let mut trp = tr.unwrap();
+    let metadata = json_to_metadata_result(ratchet_state_and_metadata, &ratchet_state)?;
+
+    let mut trp = tr;
+    let result = trp.initialize(&metadata)
+        .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
+
+    let metadata_json = metadata_to_json_result(&ratchet_state, result)?;
+
+    let json = trp.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
+
+    Ok(TripleRatchetStateAndMetadata{
+        ratchet_state: json,
+        metadata: metadata_json,
+    })
+}
+
+pub fn triple_ratchet_init_round_2(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
+    let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
+    let tr = TripleRatchetParticipant::from_json(&ratchet_state)
+        .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
+
+    let metadata = json_to_metadata_result(ratchet_state_and_metadata, &ratchet_state)?;
+
+    let mut trp = tr;
     let mut result = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
     for (k, v) in metadata {
-        let r = trp.receive_poly_frag(&k, &v);
-        if r.is_err() {
-            return TripleRatchetStateAndMetadata{
-                ratchet_state: r.err().unwrap().to_string(),
-                metadata: HashMap::new(),
-            };
-        }
+        let r = trp.receive_poly_frag(&k, &v)
+            .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
 
-        let opt = r.unwrap();
-        if opt.is_some() {
-          result = opt.unwrap();
+        if let Some(out) = r {
+            result = out;
         }
     }
 
-    let metadata_json = match metadata_to_json(&ratchet_state, result) {
-        Ok(value) => value,
-        Err(value) => return value,
-    };
+    let metadata_json = metadata_to_json_result(&ratchet_state, result)?;
 
-    let json = trp.to_json();
-    if json.is_err() {
-        return TripleRatchetStateAndMetadata{
-            ratchet_state: json.err().unwrap().to_string(),
-            metadata: HashMap::new(),
-        };
-    }
+    let json = trp.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    return TripleRatchetStateAndMetadata{
-        ratchet_state: json.unwrap(),
+    Ok(TripleRatchetStateAndMetadata{
+        ratchet_state: json,
         metadata: metadata_json,
-    };
+    })
 }
 
-pub fn triple_ratchet_init_round_3(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> TripleRatchetStateAndMetadata {
+pub fn triple_ratchet_init_round_3(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
     let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
-    let tr = TripleRatchetParticipant::from_json(&ratchet_state);
-    if tr.is_err() {
-        return TripleRatchetStateAndMetadata{
-            ratchet_state: tr.err().unwrap().to_string(),
-            metadata: HashMap::new(),
-        };
-    }
+    let tr = TripleRatchetParticipant::from_json(&ratchet_state)
+        .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
 
-    let metadata = match json_to_metadata(ratchet_state_and_metadata, &ratchet_state) {
-        Ok(value) => value,
-        Err(value) => return value,
-    };
+    let metadata = json_to_metadata_result(ratchet_state_and_metadata, &ratchet_state)?;
 
-    let mut trp = tr.unwrap();
+    let mut trp = tr;
     let mut result = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
     for (k, v) in metadata {
-        let r = trp.receive_commitment(&k, &v);
-        if r.is_err() {
-            return TripleRatchetStateAndMetadata{
-                ratchet_state: r.err().unwrap().to_string(),
-                metadata: HashMap::new(),
-            };
-        }
+        let r = trp.receive_commitment(&k, &v)
+            .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
 
-        let opt = r.unwrap();
-        if opt.is_some() {
-          result = opt.unwrap();
+        if let Some(out) = r {
+            result = out;
         }
     }
 
-    let metadata_json = match metadata_to_json(&ratchet_state, result) {
-        Ok(value) => value,
-        Err(value) => return value,
-    };
+    let metadata_json = metadata_to_json_result(&ratchet_state, result)?;
 
-    let json = trp.to_json();
-    if json.is_err() {
-        return TripleRatchetStateAndMetadata{
-            ratchet_state: json.err().unwrap().to_string(),
-            metadata: HashMap::new(),
-        };
-    }
+    let json = trp.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    return TripleRatchetStateAndMetadata{
-        ratchet_state: json.unwrap(),
+    Ok(TripleRatchetStateAndMetadata{
+        ratchet_state: json,
         metadata: metadata_json,
-    };
+    })
 }
 
-pub fn triple_ratchet_init_round_4(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> TripleRatchetStateAndMetadata {
+pub fn triple_ratchet_init_round_4(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
     let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
-    let tr = TripleRatchetParticipant::from_json(&ratchet_state);
-    if tr.is_err() {
-        return TripleRatchetStateAndMetadata{
-            ratchet_state: tr.err().unwrap().to_string(),
-            metadata: HashMap::new(),
-        };
-    }
+    let tr = TripleRatchetParticipant::from_json(&ratchet_state)
+        .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
 
-    let metadata = match json_to_metadata(ratchet_state_and_metadata, &ratchet_state) {
-        Ok(value) => value,
-        Err(value) => return value,
-    };
+    let metadata = json_to_metadata_result(ratchet_state_and_metadata, &ratchet_state)?;
 
-    let mut trp = tr.unwrap();
-    let mut result = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
+    let mut trp = tr;
+    let result = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
     for (k, v) in metadata {
-        let r = trp.recombine(&k, &v);
-        if r.is_err() {
-            return TripleRatchetStateAndMetadata{
-                ratchet_state: r.err().unwrap().to_string(),
-                metadata: HashMap::new(),
-            };
-        }
+        trp.recombine(&k, &v)
+            .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
     }
 
-    let metadata_json = match metadata_to_json(&ratchet_state, result) {
-        Ok(value) => value,
-        Err(value) => return value,
-    };
+    let metadata_json = metadata_to_json_result(&ratchet_state, result)?;
 
-    let json = trp.to_json();
-    if json.is_err() {
-        return TripleRatchetStateAndMetadata{
-            ratchet_state: json.err().unwrap().to_string(),
-            metadata: HashMap::new(),
-        };
-    }
+    let json = trp.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    return TripleRatchetStateAndMetadata{
-        ratchet_state: json.unwrap(),
+    Ok(TripleRatchetStateAndMetadata{
+        ratchet_state: json,
         metadata: metadata_json,
-    };
+    })
 }
 
-pub fn triple_ratchet_encrypt(ratchet_state_and_message: TripleRatchetStateAndMessage) -> TripleRatchetStateAndEnvelope {
+pub fn triple_ratchet_encrypt(ratchet_state_and_message: TripleRatchetStateAndMessage) -> Result<TripleRatchetStateAndEnvelope, CryptoError> {
     let ratchet_state = ratchet_state_and_message.ratchet_state.clone();
-    let tr = TripleRatchetParticipant::from_json(&ratchet_state);
-    if tr.is_err() {
-        return TripleRatchetStateAndEnvelope{
-            ratchet_state: tr.err().unwrap().to_string(),
-            envelope: "".to_string(),
-        };
-    }
+    let tr = TripleRatchetParticipant::from_json(&ratchet_state)
+        .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
 
-    let mut trp = tr.unwrap();
-    let result = trp.ratchet_encrypt(&ratchet_state_and_message.message);
+    let mut trp = tr;
+    let envelope = trp.ratchet_encrypt(&ratchet_state_and_message.message)
+        .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
 
-    if result.is_err() {
-        return TripleRatchetStateAndEnvelope{
-            ratchet_state: result.err().unwrap().to_string(),
-            envelope: "".to_string(),
-        };
-    }
+    let envelope_json = envelope.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    let envelope = result.unwrap();
-    let envelope_json = envelope.to_json();
+    let json = trp.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    if envelope_json.is_err() {
-        return TripleRatchetStateAndEnvelope{
-            ratchet_state: envelope_json.err().unwrap().to_string(),
-            envelope: "".to_string(),
-        };
-    }
-
-    let json = trp.to_json();
-    if json.is_err() {
-        return TripleRatchetStateAndEnvelope{
-            ratchet_state: json.err().unwrap().to_string(),
-            envelope: "".to_string(),
-        };
-    }
-
-    return TripleRatchetStateAndEnvelope{
-        ratchet_state: json.unwrap(),
-        envelope: envelope_json.unwrap(),
-    };
+    Ok(TripleRatchetStateAndEnvelope{
+        ratchet_state: json,
+        envelope: envelope_json,
+    })
 }
 
-pub fn triple_ratchet_decrypt(ratchet_state_and_envelope: TripleRatchetStateAndEnvelope) -> TripleRatchetStateAndMessage {
+pub fn triple_ratchet_decrypt(ratchet_state_and_envelope: TripleRatchetStateAndEnvelope) -> Result<TripleRatchetStateAndMessage, CryptoError> {
     let ratchet_state = ratchet_state_and_envelope.ratchet_state.clone();
-    let tr = TripleRatchetParticipant::from_json(&ratchet_state);
-    if tr.is_err() {
-        return TripleRatchetStateAndMessage{
-            ratchet_state: tr.err().unwrap().to_string(),
-            message: vec![],
-        };
-    }
+    let tr = TripleRatchetParticipant::from_json(&ratchet_state)
+        .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
 
-    let mut trp = tr.unwrap();
-    let env = P2PChannelEnvelope::from_json(ratchet_state_and_envelope.envelope);
-    if env.is_err() {
-        return TripleRatchetStateAndMessage{
-            ratchet_state: env.err().unwrap().to_string(),
-            message: vec![],
-        };
-    }
+    let mut trp = tr;
+    let env = P2PChannelEnvelope::from_json(ratchet_state_and_envelope.envelope)
+        .map_err(|e| CryptoError::InvalidEnvelope(e.to_string()))?;
 
-    let result = trp.ratchet_decrypt(&env.unwrap());
+    let result = trp.ratchet_decrypt(&env)
+        .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
 
-    if result.is_err() {
-        return TripleRatchetStateAndMessage{
-            ratchet_state: result.err().unwrap().to_string(),
-            message: vec![],
-        };
-    }
+    let message = result.0;
 
-    let message = result.unwrap().0;
+    let json = trp.to_json()
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    let json = trp.to_json();
-    if json.is_err() {
-        return TripleRatchetStateAndMessage{
-            ratchet_state: json.err().unwrap().to_string(),
-            message: vec![],
-        };
-    }
-
-    return TripleRatchetStateAndMessage{
-        ratchet_state: json.unwrap(),
+    Ok(TripleRatchetStateAndMessage{
+        ratchet_state: json,
         message: message,
-    };
+    })
 }
 
-pub fn triple_ratchet_resize(ratchet_state: String, other: String, id: usize, total: usize) -> Vec<Vec<u8>> {
+pub fn triple_ratchet_resize(ratchet_state: String, other: String, id: u64, total: u64) -> Vec<Vec<u8>> {
     let tr = TripleRatchetParticipant::from_json(&ratchet_state);
     if tr.is_err() {
         return vec![vec![1]];
@@ -979,7 +847,7 @@ pub fn triple_ratchet_resize(ratchet_state: String, other: String, id: usize, to
         return vec![other_bytes.unwrap_err().to_string().as_bytes().to_vec()];
     }
 
-    let result = tr.unwrap().ratchet_resize(other_bytes.unwrap(), id, total);
+    let result = tr.unwrap().ratchet_resize(other_bytes.unwrap(), id as usize, total as usize);
     if result.is_err() {
         return vec![result.unwrap_err().to_string().as_bytes().to_vec()];
     }

@@ -751,6 +751,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -803,6 +805,8 @@ internal interface UniffiLib : Library {
     fun uniffi_channel_fn_func_triple_ratchet_init_round_3(`ratchetStateAndMetadata`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_channel_fn_func_triple_ratchet_init_round_4(`ratchetStateAndMetadata`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_channel_fn_func_triple_ratchet_resize(`ratchetState`: RustBuffer.ByValue,`other`: RustBuffer.ByValue,`id`: Long,`total`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_channel_fn_func_verify_ed448(`publicKey`: RustBuffer.ByValue,`message`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -956,6 +960,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_channel_checksum_func_triple_ratchet_init_round_4(
     ): Short
+    fun uniffi_channel_checksum_func_triple_ratchet_resize(
+    ): Short
     fun uniffi_channel_checksum_func_verify_ed448(
     ): Short
     fun ffi_channel_uniffi_contract_version(
@@ -978,10 +984,10 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_channel_checksum_func_decrypt_inbox_message() != 59344.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_channel_checksum_func_double_ratchet_decrypt() != 13335.toShort()) {
+    if (lib.uniffi_channel_checksum_func_double_ratchet_decrypt() != 59687.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_channel_checksum_func_double_ratchet_encrypt() != 59209.toShort()) {
+    if (lib.uniffi_channel_checksum_func_double_ratchet_encrypt() != 57909.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_channel_checksum_func_encrypt_inbox_message() != 48273.toShort()) {
@@ -1014,22 +1020,25 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_channel_checksum_func_sign_ed448() != 28573.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_channel_checksum_func_triple_ratchet_decrypt() != 42324.toShort()) {
+    if (lib.uniffi_channel_checksum_func_triple_ratchet_decrypt() != 15842.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_channel_checksum_func_triple_ratchet_encrypt() != 61617.toShort()) {
+    if (lib.uniffi_channel_checksum_func_triple_ratchet_encrypt() != 23451.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_channel_checksum_func_triple_ratchet_init_round_1() != 42612.toShort()) {
+    if (lib.uniffi_channel_checksum_func_triple_ratchet_init_round_1() != 63112.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_channel_checksum_func_triple_ratchet_init_round_2() != 11875.toShort()) {
+    if (lib.uniffi_channel_checksum_func_triple_ratchet_init_round_2() != 34197.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_channel_checksum_func_triple_ratchet_init_round_3() != 50331.toShort()) {
+    if (lib.uniffi_channel_checksum_func_triple_ratchet_init_round_3() != 39476.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_channel_checksum_func_triple_ratchet_init_round_4() != 14779.toShort()) {
+    if (lib.uniffi_channel_checksum_func_triple_ratchet_init_round_4() != 19263.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_channel_checksum_func_triple_ratchet_resize() != 57124.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_channel_checksum_func_verify_ed448() != 57200.toShort()) {
@@ -1371,6 +1380,83 @@ public object FfiConverterTypeTripleRatchetStateAndMetadata: FfiConverterRustBuf
 
 
 
+
+sealed class CryptoException(message: String): kotlin.Exception(message) {
+        
+        class InvalidState(message: String) : CryptoException(message)
+        
+        class InvalidEnvelope(message: String) : CryptoException(message)
+        
+        class DecryptionFailed(message: String) : CryptoException(message)
+        
+        class EncryptionFailed(message: String) : CryptoException(message)
+        
+        class SerializationFailed(message: String) : CryptoException(message)
+        
+        class InvalidInput(message: String) : CryptoException(message)
+        
+
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<CryptoException> {
+        override fun lift(error_buf: RustBuffer.ByValue): CryptoException = FfiConverterTypeCryptoError.lift(error_buf)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCryptoError : FfiConverterRustBuffer<CryptoException> {
+    override fun read(buf: ByteBuffer): CryptoException {
+        
+            return when(buf.getInt()) {
+            1 -> CryptoException.InvalidState(FfiConverterString.read(buf))
+            2 -> CryptoException.InvalidEnvelope(FfiConverterString.read(buf))
+            3 -> CryptoException.DecryptionFailed(FfiConverterString.read(buf))
+            4 -> CryptoException.EncryptionFailed(FfiConverterString.read(buf))
+            5 -> CryptoException.SerializationFailed(FfiConverterString.read(buf))
+            6 -> CryptoException.InvalidInput(FfiConverterString.read(buf))
+            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
+        }
+        
+    }
+
+    override fun allocationSize(value: CryptoException): ULong {
+        return 4UL
+    }
+
+    override fun write(value: CryptoException, buf: ByteBuffer) {
+        when(value) {
+            is CryptoException.InvalidState -> {
+                buf.putInt(1)
+                Unit
+            }
+            is CryptoException.InvalidEnvelope -> {
+                buf.putInt(2)
+                Unit
+            }
+            is CryptoException.DecryptionFailed -> {
+                buf.putInt(3)
+                Unit
+            }
+            is CryptoException.EncryptionFailed -> {
+                buf.putInt(4)
+                Unit
+            }
+            is CryptoException.SerializationFailed -> {
+                buf.putInt(5)
+                Unit
+            }
+            is CryptoException.InvalidInput -> {
+                buf.putInt(6)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+
+}
+
+
+
+
 /**
  * @suppress
  */
@@ -1470,18 +1556,20 @@ public object FfiConverterMapStringString: FfiConverterRustBuffer<Map<kotlin.Str
     )
     }
     
- fun `doubleRatchetDecrypt`(`ratchetStateAndEnvelope`: DoubleRatchetStateAndEnvelope): DoubleRatchetStateAndMessage {
+
+    @Throws(CryptoException::class) fun `doubleRatchetDecrypt`(`ratchetStateAndEnvelope`: DoubleRatchetStateAndEnvelope): DoubleRatchetStateAndMessage {
             return FfiConverterTypeDoubleRatchetStateAndMessage.lift(
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(CryptoException) { _status ->
     UniffiLib.INSTANCE.uniffi_channel_fn_func_double_ratchet_decrypt(
         FfiConverterTypeDoubleRatchetStateAndEnvelope.lower(`ratchetStateAndEnvelope`),_status)
 }
     )
     }
     
- fun `doubleRatchetEncrypt`(`ratchetStateAndMessage`: DoubleRatchetStateAndMessage): DoubleRatchetStateAndEnvelope {
+
+    @Throws(CryptoException::class) fun `doubleRatchetEncrypt`(`ratchetStateAndMessage`: DoubleRatchetStateAndMessage): DoubleRatchetStateAndEnvelope {
             return FfiConverterTypeDoubleRatchetStateAndEnvelope.lift(
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(CryptoException) { _status ->
     UniffiLib.INSTANCE.uniffi_channel_fn_func_double_ratchet_encrypt(
         FfiConverterTypeDoubleRatchetStateAndMessage.lower(`ratchetStateAndMessage`),_status)
 }
@@ -1578,56 +1666,71 @@ public object FfiConverterMapStringString: FfiConverterRustBuffer<Map<kotlin.Str
     )
     }
     
- fun `tripleRatchetDecrypt`(`ratchetStateAndEnvelope`: TripleRatchetStateAndEnvelope): TripleRatchetStateAndMessage {
+
+    @Throws(CryptoException::class) fun `tripleRatchetDecrypt`(`ratchetStateAndEnvelope`: TripleRatchetStateAndEnvelope): TripleRatchetStateAndMessage {
             return FfiConverterTypeTripleRatchetStateAndMessage.lift(
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(CryptoException) { _status ->
     UniffiLib.INSTANCE.uniffi_channel_fn_func_triple_ratchet_decrypt(
         FfiConverterTypeTripleRatchetStateAndEnvelope.lower(`ratchetStateAndEnvelope`),_status)
 }
     )
     }
     
- fun `tripleRatchetEncrypt`(`ratchetStateAndMessage`: TripleRatchetStateAndMessage): TripleRatchetStateAndEnvelope {
+
+    @Throws(CryptoException::class) fun `tripleRatchetEncrypt`(`ratchetStateAndMessage`: TripleRatchetStateAndMessage): TripleRatchetStateAndEnvelope {
             return FfiConverterTypeTripleRatchetStateAndEnvelope.lift(
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(CryptoException) { _status ->
     UniffiLib.INSTANCE.uniffi_channel_fn_func_triple_ratchet_encrypt(
         FfiConverterTypeTripleRatchetStateAndMessage.lower(`ratchetStateAndMessage`),_status)
 }
     )
     }
     
- fun `tripleRatchetInitRound1`(`ratchetStateAndMetadata`: TripleRatchetStateAndMetadata): TripleRatchetStateAndMetadata {
+
+    @Throws(CryptoException::class) fun `tripleRatchetInitRound1`(`ratchetStateAndMetadata`: TripleRatchetStateAndMetadata): TripleRatchetStateAndMetadata {
             return FfiConverterTypeTripleRatchetStateAndMetadata.lift(
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(CryptoException) { _status ->
     UniffiLib.INSTANCE.uniffi_channel_fn_func_triple_ratchet_init_round_1(
         FfiConverterTypeTripleRatchetStateAndMetadata.lower(`ratchetStateAndMetadata`),_status)
 }
     )
     }
     
- fun `tripleRatchetInitRound2`(`ratchetStateAndMetadata`: TripleRatchetStateAndMetadata): TripleRatchetStateAndMetadata {
+
+    @Throws(CryptoException::class) fun `tripleRatchetInitRound2`(`ratchetStateAndMetadata`: TripleRatchetStateAndMetadata): TripleRatchetStateAndMetadata {
             return FfiConverterTypeTripleRatchetStateAndMetadata.lift(
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(CryptoException) { _status ->
     UniffiLib.INSTANCE.uniffi_channel_fn_func_triple_ratchet_init_round_2(
         FfiConverterTypeTripleRatchetStateAndMetadata.lower(`ratchetStateAndMetadata`),_status)
 }
     )
     }
     
- fun `tripleRatchetInitRound3`(`ratchetStateAndMetadata`: TripleRatchetStateAndMetadata): TripleRatchetStateAndMetadata {
+
+    @Throws(CryptoException::class) fun `tripleRatchetInitRound3`(`ratchetStateAndMetadata`: TripleRatchetStateAndMetadata): TripleRatchetStateAndMetadata {
             return FfiConverterTypeTripleRatchetStateAndMetadata.lift(
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(CryptoException) { _status ->
     UniffiLib.INSTANCE.uniffi_channel_fn_func_triple_ratchet_init_round_3(
         FfiConverterTypeTripleRatchetStateAndMetadata.lower(`ratchetStateAndMetadata`),_status)
 }
     )
     }
     
- fun `tripleRatchetInitRound4`(`ratchetStateAndMetadata`: TripleRatchetStateAndMetadata): TripleRatchetStateAndMetadata {
+
+    @Throws(CryptoException::class) fun `tripleRatchetInitRound4`(`ratchetStateAndMetadata`: TripleRatchetStateAndMetadata): TripleRatchetStateAndMetadata {
             return FfiConverterTypeTripleRatchetStateAndMetadata.lift(
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(CryptoException) { _status ->
     UniffiLib.INSTANCE.uniffi_channel_fn_func_triple_ratchet_init_round_4(
         FfiConverterTypeTripleRatchetStateAndMetadata.lower(`ratchetStateAndMetadata`),_status)
+}
+    )
+    }
+    
+ fun `tripleRatchetResize`(`ratchetState`: kotlin.String, `other`: kotlin.String, `id`: kotlin.ULong, `total`: kotlin.ULong): List<List<kotlin.UByte>> {
+            return FfiConverterSequenceSequenceUByte.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_channel_fn_func_triple_ratchet_resize(
+        FfiConverterString.lower(`ratchetState`),FfiConverterString.lower(`other`),FfiConverterULong.lower(`id`),FfiConverterULong.lower(`total`),_status)
 }
     )
     }

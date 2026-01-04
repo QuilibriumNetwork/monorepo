@@ -19,17 +19,38 @@ namespace channel {
 
     // Double Ratchet
     string new_double_ratchet([ByRef] sequence<u8> session_key, [ByRef] sequence<u8> sending_header_key, [ByRef] sequence<u8> next_receiving_header_key, boolean is_sender, [ByRef] sequence<u8> sending_ephemeral_private_key, [ByRef] sequence<u8> receiving_ephemeral_key);
+    [Throws=CryptoError]
     DoubleRatchetStateAndEnvelope double_ratchet_encrypt(DoubleRatchetStateAndMessage ratchet_state_and_message);
+    [Throws=CryptoError]
     DoubleRatchetStateAndMessage double_ratchet_decrypt(DoubleRatchetStateAndEnvelope ratchet_state_and_envelope);
 
     // Triple Ratchet
     TripleRatchetStateAndMetadata new_triple_ratchet([ByRef] sequence<sequence<u8>> peers, [ByRef] sequence<u8> peer_key, [ByRef] sequence<u8> identity_key, [ByRef] sequence<u8> signed_pre_key, u64 threshold, boolean async_dkg_ratchet);
+    [Throws=CryptoError]
     TripleRatchetStateAndMetadata triple_ratchet_init_round_1(TripleRatchetStateAndMetadata ratchet_state_and_metadata);
+    [Throws=CryptoError]
     TripleRatchetStateAndMetadata triple_ratchet_init_round_2(TripleRatchetStateAndMetadata ratchet_state_and_metadata);
+    [Throws=CryptoError]
     TripleRatchetStateAndMetadata triple_ratchet_init_round_3(TripleRatchetStateAndMetadata ratchet_state_and_metadata);
+    [Throws=CryptoError]
     TripleRatchetStateAndMetadata triple_ratchet_init_round_4(TripleRatchetStateAndMetadata ratchet_state_and_metadata);
+    [Throws=CryptoError]
     TripleRatchetStateAndEnvelope triple_ratchet_encrypt(TripleRatchetStateAndMessage ratchet_state_and_message);
+    [Throws=CryptoError]
     TripleRatchetStateAndMessage triple_ratchet_decrypt(TripleRatchetStateAndEnvelope ratchet_state_and_envelope);
+
+    // Triple Ratchet Resize
+    sequence<sequence<u8>> triple_ratchet_resize(string ratchet_state, string other, u64 id, u64 total);
+};
+
+[Error]
+enum CryptoError {
+    "InvalidState",
+    "InvalidEnvelope",
+    "DecryptionFailed",
+    "EncryptionFailed",
+    "SerializationFailed",
+    "InvalidInput",
 };
 
 dictionary DoubleRatchetStateAndEnvelope {

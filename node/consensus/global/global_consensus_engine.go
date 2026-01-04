@@ -202,6 +202,7 @@ type GlobalConsensusEngine struct {
 	appFrameStoreMu           sync.RWMutex
 	lowCoverageStreak         map[string]*coverageStreak
 	proverOnlyMode            atomic.Bool
+	coverageCheckInProgress   atomic.Bool
 	peerInfoDigestCache       map[string]struct{}
 	peerInfoDigestCacheMu     sync.Mutex
 	keyRegistryDigestCache    map[string]struct{}

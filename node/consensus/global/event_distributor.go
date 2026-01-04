@@ -81,12 +81,8 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 
 					e.flushDeferredGlobalMessages(data.Frame.GetRank() + 1)
 
-					// Check shard coverage
-					if err := e.checkShardCoverage(
-						data.Frame.Header.FrameNumber,
-					); err != nil {
-						e.logger.Error("failed to check shard coverage", zap.Error(err))
-					}
+					// Check shard coverage asynchronously to avoid blocking event processing
+					e.triggerCoverageCheckAsync(data.Frame.Header.FrameNumber)
 
 					// Update global coordination metrics
 					globalCoordinationTotal.Inc()

@@ -44,6 +44,27 @@ func (e *GlobalConsensusEngine) ensureCoverageThresholds() {
 	haltGraceFrames = 360
 }
 
+// triggerCoverageCheckAsync starts a coverage check in a goroutine if one is
+// not already in progress. This prevents blocking the event processing loop.
+func (e *GlobalConsensusEngine) triggerCoverageCheckAsync(frameNumber uint64) {
+	// Skip if a coverage check is already in progress
+	if !e.coverageCheckInProgress.CompareAndSwap(false, true) {
+		e.logger.Debug(
+			"skipping coverage check, one already in progress",
+			zap.Uint64("frame_number", frameNumber),
+		)
+		return
+	}
+
+	go func() {
+		defer e.coverageCheckInProgress.Store(false)
+
+		if err := e.checkShardCoverage(frameNumber); err != nil {
+			e.logger.Error("failed to check shard coverage", zap.Error(err))
+		}
+	}()
+}
+
 // checkShardCoverage verifies coverage levels for all active shards
 func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 	e.ensureCoverageThresholds()

@@ -823,6 +823,101 @@ public func FfiConverterTypeTripleRatchetStateAndMetadata_lower(_ value: TripleR
     return FfiConverterTypeTripleRatchetStateAndMetadata.lower(value)
 }
 
+
+public enum CryptoError {
+
+    
+    
+    case InvalidState(message: String)
+    
+    case InvalidEnvelope(message: String)
+    
+    case DecryptionFailed(message: String)
+    
+    case EncryptionFailed(message: String)
+    
+    case SerializationFailed(message: String)
+    
+    case InvalidInput(message: String)
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCryptoError: FfiConverterRustBuffer {
+    typealias SwiftType = CryptoError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CryptoError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .InvalidState(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .InvalidEnvelope(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .DecryptionFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .EncryptionFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .SerializationFailed(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .InvalidInput(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CryptoError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .InvalidState(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .InvalidEnvelope(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .DecryptionFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+        case .EncryptionFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(4))
+        case .SerializationFailed(_ /* message is ignored*/):
+            writeInt(&buf, Int32(5))
+        case .InvalidInput(_ /* message is ignored*/):
+            writeInt(&buf, Int32(6))
+
+        
+        }
+    }
+}
+
+
+extension CryptoError: Equatable, Hashable {}
+
+extension CryptoError: Foundation.LocalizedError {
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -905,15 +1000,15 @@ public func decryptInboxMessage(input: String) -> String {
     )
 })
 }
-public func doubleRatchetDecrypt(ratchetStateAndEnvelope: DoubleRatchetStateAndEnvelope) -> DoubleRatchetStateAndMessage {
-    return try!  FfiConverterTypeDoubleRatchetStateAndMessage.lift(try! rustCall() {
+public func doubleRatchetDecrypt(ratchetStateAndEnvelope: DoubleRatchetStateAndEnvelope)throws  -> DoubleRatchetStateAndMessage {
+    return try  FfiConverterTypeDoubleRatchetStateAndMessage.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
     uniffi_channel_fn_func_double_ratchet_decrypt(
         FfiConverterTypeDoubleRatchetStateAndEnvelope.lower(ratchetStateAndEnvelope),$0
     )
 })
 }
-public func doubleRatchetEncrypt(ratchetStateAndMessage: DoubleRatchetStateAndMessage) -> DoubleRatchetStateAndEnvelope {
-    return try!  FfiConverterTypeDoubleRatchetStateAndEnvelope.lift(try! rustCall() {
+public func doubleRatchetEncrypt(ratchetStateAndMessage: DoubleRatchetStateAndMessage)throws  -> DoubleRatchetStateAndEnvelope {
+    return try  FfiConverterTypeDoubleRatchetStateAndEnvelope.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
     uniffi_channel_fn_func_double_ratchet_encrypt(
         FfiConverterTypeDoubleRatchetStateAndMessage.lower(ratchetStateAndMessage),$0
     )
@@ -1006,45 +1101,55 @@ public func signEd448(key: String, message: String) -> String {
     )
 })
 }
-public func tripleRatchetDecrypt(ratchetStateAndEnvelope: TripleRatchetStateAndEnvelope) -> TripleRatchetStateAndMessage {
-    return try!  FfiConverterTypeTripleRatchetStateAndMessage.lift(try! rustCall() {
+public func tripleRatchetDecrypt(ratchetStateAndEnvelope: TripleRatchetStateAndEnvelope)throws  -> TripleRatchetStateAndMessage {
+    return try  FfiConverterTypeTripleRatchetStateAndMessage.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
     uniffi_channel_fn_func_triple_ratchet_decrypt(
         FfiConverterTypeTripleRatchetStateAndEnvelope.lower(ratchetStateAndEnvelope),$0
     )
 })
 }
-public func tripleRatchetEncrypt(ratchetStateAndMessage: TripleRatchetStateAndMessage) -> TripleRatchetStateAndEnvelope {
-    return try!  FfiConverterTypeTripleRatchetStateAndEnvelope.lift(try! rustCall() {
+public func tripleRatchetEncrypt(ratchetStateAndMessage: TripleRatchetStateAndMessage)throws  -> TripleRatchetStateAndEnvelope {
+    return try  FfiConverterTypeTripleRatchetStateAndEnvelope.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
     uniffi_channel_fn_func_triple_ratchet_encrypt(
         FfiConverterTypeTripleRatchetStateAndMessage.lower(ratchetStateAndMessage),$0
     )
 })
 }
-public func tripleRatchetInitRound1(ratchetStateAndMetadata: TripleRatchetStateAndMetadata) -> TripleRatchetStateAndMetadata {
-    return try!  FfiConverterTypeTripleRatchetStateAndMetadata.lift(try! rustCall() {
+public func tripleRatchetInitRound1(ratchetStateAndMetadata: TripleRatchetStateAndMetadata)throws  -> TripleRatchetStateAndMetadata {
+    return try  FfiConverterTypeTripleRatchetStateAndMetadata.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
     uniffi_channel_fn_func_triple_ratchet_init_round_1(
         FfiConverterTypeTripleRatchetStateAndMetadata.lower(ratchetStateAndMetadata),$0
     )
 })
 }
-public func tripleRatchetInitRound2(ratchetStateAndMetadata: TripleRatchetStateAndMetadata) -> TripleRatchetStateAndMetadata {
-    return try!  FfiConverterTypeTripleRatchetStateAndMetadata.lift(try! rustCall() {
+public func tripleRatchetInitRound2(ratchetStateAndMetadata: TripleRatchetStateAndMetadata)throws  -> TripleRatchetStateAndMetadata {
+    return try  FfiConverterTypeTripleRatchetStateAndMetadata.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
     uniffi_channel_fn_func_triple_ratchet_init_round_2(
         FfiConverterTypeTripleRatchetStateAndMetadata.lower(ratchetStateAndMetadata),$0
     )
 })
 }
-public func tripleRatchetInitRound3(ratchetStateAndMetadata: TripleRatchetStateAndMetadata) -> TripleRatchetStateAndMetadata {
-    return try!  FfiConverterTypeTripleRatchetStateAndMetadata.lift(try! rustCall() {
+public func tripleRatchetInitRound3(ratchetStateAndMetadata: TripleRatchetStateAndMetadata)throws  -> TripleRatchetStateAndMetadata {
+    return try  FfiConverterTypeTripleRatchetStateAndMetadata.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
     uniffi_channel_fn_func_triple_ratchet_init_round_3(
         FfiConverterTypeTripleRatchetStateAndMetadata.lower(ratchetStateAndMetadata),$0
     )
 })
 }
-public func tripleRatchetInitRound4(ratchetStateAndMetadata: TripleRatchetStateAndMetadata) -> TripleRatchetStateAndMetadata {
-    return try!  FfiConverterTypeTripleRatchetStateAndMetadata.lift(try! rustCall() {
+public func tripleRatchetInitRound4(ratchetStateAndMetadata: TripleRatchetStateAndMetadata)throws  -> TripleRatchetStateAndMetadata {
+    return try  FfiConverterTypeTripleRatchetStateAndMetadata.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
     uniffi_channel_fn_func_triple_ratchet_init_round_4(
         FfiConverterTypeTripleRatchetStateAndMetadata.lower(ratchetStateAndMetadata),$0
+    )
+})
+}
+public func tripleRatchetResize(ratchetState: String, other: String, id: UInt64, total: UInt64) -> [[UInt8]] {
+    return try!  FfiConverterSequenceSequenceUInt8.lift(try! rustCall() {
+    uniffi_channel_fn_func_triple_ratchet_resize(
+        FfiConverterString.lower(ratchetState),
+        FfiConverterString.lower(other),
+        FfiConverterUInt64.lower(id),
+        FfiConverterUInt64.lower(total),$0
     )
 })
 }
@@ -1076,10 +1181,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_channel_checksum_func_decrypt_inbox_message() != 59344) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_channel_checksum_func_double_ratchet_decrypt() != 13335) {
+    if (uniffi_channel_checksum_func_double_ratchet_decrypt() != 59687) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_channel_checksum_func_double_ratchet_encrypt() != 59209) {
+    if (uniffi_channel_checksum_func_double_ratchet_encrypt() != 57909) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_channel_checksum_func_encrypt_inbox_message() != 48273) {
@@ -1112,22 +1217,25 @@ private var initializationResult: InitializationResult = {
     if (uniffi_channel_checksum_func_sign_ed448() != 28573) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_channel_checksum_func_triple_ratchet_decrypt() != 42324) {
+    if (uniffi_channel_checksum_func_triple_ratchet_decrypt() != 15842) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_channel_checksum_func_triple_ratchet_encrypt() != 61617) {
+    if (uniffi_channel_checksum_func_triple_ratchet_encrypt() != 23451) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_channel_checksum_func_triple_ratchet_init_round_1() != 42612) {
+    if (uniffi_channel_checksum_func_triple_ratchet_init_round_1() != 63112) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_channel_checksum_func_triple_ratchet_init_round_2() != 11875) {
+    if (uniffi_channel_checksum_func_triple_ratchet_init_round_2() != 34197) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_channel_checksum_func_triple_ratchet_init_round_3() != 50331) {
+    if (uniffi_channel_checksum_func_triple_ratchet_init_round_3() != 39476) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_channel_checksum_func_triple_ratchet_init_round_4() != 14779) {
+    if (uniffi_channel_checksum_func_triple_ratchet_init_round_4() != 19263) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_channel_checksum_func_triple_ratchet_resize() != 57124) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_channel_checksum_func_verify_ed448() != 57200) {

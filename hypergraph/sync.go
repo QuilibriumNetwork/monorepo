@@ -1521,7 +1521,7 @@ func (s *streamManager) walk(
 		// )
 		if len(lpref) > len(rpref) {
 			// s.logger.Debug("local prefix longer, traversing remote to path", pathString)
-			traverse := lpref[len(rpref):]
+			traverse := lpref[len(rpref)-1:]
 			rtrav := rnode
 			traversePath := append([]int32{}, rpref...)
 			for _, nibble := range traverse {
@@ -1578,7 +1578,7 @@ func (s *streamManager) walk(
 			)
 		} else {
 			// s.logger.Debug("remote prefix longer, traversing local to path", pathString)
-			traverse := rpref[len(lpref):]
+			traverse := rpref[len(lpref)-1:]
 			ltrav := lnode
 			traversedPath := append([]int32{}, lnode.Path...)
 
@@ -1626,9 +1626,12 @@ func (s *streamManager) walk(
 							); err != nil {
 								return errors.Wrap(err, "walk")
 							}
+						} else {
+							err := s.handleLeafData(incomingLeaves)
+							if err != nil {
+								return errors.Wrap(err, "walk")
+							}
 						}
-						// Client has extra data that server doesn't have
-						// Skip - pruning happens after sync completes
 					}
 				}
 				// If no child matched the nibble, the local tree doesn't extend
@@ -1694,7 +1697,7 @@ func (s *streamManager) walk(
 				if (lchild != nil && rchild == nil) ||
 					(lchild == nil && rchild != nil) {
 					// s.logger.Info("branch divergence", pathString)
-					if lchild != nil && rchild == nil {
+					if lchild != nil {
 						// Local has a child that remote doesn't have
 						if isServer {
 							nextPath := append(
@@ -1712,22 +1715,12 @@ func (s *streamManager) walk(
 						// Client has data server doesn't
 						// Skip - pruning happens after sync completes
 					}
-					if rchild != nil && lchild == nil {
-						// Remote has a child that local doesn't have
-						if isServer {
-							// Server doesn't have what client has - nothing to do
-							// Client will prune on their side
-						} else {
-							// Client doesn't have what server has - receive it
-							nextPath := append(
-								append([]int32{}, rpref...),
-								rchild.Index,
-							)
+					if rchild != nil {
+						if !isServer {
 							err := s.handleLeafData(incomingLeaves)
 							if err != nil {
 								return errors.Wrap(err, "walk")
 							}
-							_ = nextPath // path used by server's sendLeafData
 						}
 					}
 				} else {
@@ -1741,10 +1734,21 @@ func (s *streamManager) walk(
 							nextPath,
 						)
 						if err != nil {
-							// s.logger.Debug("incomplete branch descension", zap.Error(err))
-							// Don't try to merge/prune on error - the connection may have failed
-							// and we don't want to delete local data based on incomplete info
-							return errors.Wrap(err, "walk")
+							s.logger.Info("incomplete branch descension", zap.Error(err))
+							if isServer {
+								if err := s.sendLeafData(
+									nextPath,
+									incomingLeaves,
+								); err != nil {
+									return errors.Wrap(err, "walk")
+								}
+							} else {
+								err := s.handleLeafData(incomingLeaves)
+								if err != nil {
+									return errors.Wrap(err, "walk")
+								}
+							}
+							continue
 						}
 
 						if err = s.walk(

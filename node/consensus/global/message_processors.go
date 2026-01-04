@@ -1708,10 +1708,8 @@ func (e *GlobalConsensusEngine) addCertifiedState(
 		return
 	}
 
-	if err := e.checkShardCoverage(parent.State.GetFrameNumber()); err != nil {
-		e.logger.Error("could not check shard coverage", zap.Error(err))
-		return
-	}
+	// Trigger coverage check asynchronously to avoid blocking message processing
+	e.triggerCoverageCheckAsync(parent.State.GetFrameNumber())
 }
 
 func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {
