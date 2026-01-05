@@ -133,10 +133,10 @@ func (hg *HypergraphCRDT) Sync(
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
 	expectedRoot []byte,
-) (err error) {
+) (root []byte, err error) {
 	const localSyncKey = "local-sync"
 	if !hg.syncController.TryEstablishSyncSession(localSyncKey) {
-		return errors.New("local sync already in progress")
+		return nil, errors.New("local sync already in progress")
 	}
 	defer func() {
 		hg.syncController.EndSyncSession(localSyncKey)
@@ -172,7 +172,7 @@ func (hg *HypergraphCRDT) Sync(
 	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES:
 		set = hg.getHyperedgeRemovesSet(shardKey)
 	default:
-		return errors.New("unsupported phase set")
+		return nil, errors.New("unsupported phase set")
 	}
 
 	path := hg.getCoveredPrefix()
@@ -191,7 +191,7 @@ func (hg *HypergraphCRDT) Sync(
 			},
 		},
 	}); err != nil {
-		return err
+		return nil, err
 	}
 	hg.logger.Debug(
 		"sent initialization message",
@@ -204,7 +204,7 @@ func (hg *HypergraphCRDT) Sync(
 	msg, err := stream.Recv()
 	if err != nil {
 		hg.logger.Info("initial recv failed", zap.Error(err))
-		return err
+		return nil, err
 	}
 	hg.logger.Debug(
 		"received initialization response",
@@ -213,7 +213,7 @@ func (hg *HypergraphCRDT) Sync(
 	)
 	response := msg.GetResponse()
 	if response == nil {
-		return errors.New(
+		return nil, errors.New(
 			"server did not send valid initialization response message",
 		)
 	}
@@ -225,7 +225,7 @@ func (hg *HypergraphCRDT) Sync(
 		toInt32Slice(path),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	hg.logger.Debug(
 		"constructed branch info",
@@ -241,7 +241,7 @@ func (hg *HypergraphCRDT) Sync(
 
 	responseSendStart := time.Now()
 	if err := stream.Send(resp); err != nil {
-		return err
+		return nil, err
 	}
 	hg.logger.Debug(
 		"sent initial branch info",
@@ -336,12 +336,13 @@ func (hg *HypergraphCRDT) Sync(
 
 	wg.Wait()
 
+	root = set.GetTree().Commit(false)
 	hg.logger.Info(
 		"hypergraph root commit",
-		zap.String("root", hex.EncodeToString(set.GetTree().Commit(false))),
+		zap.String("root", hex.EncodeToString(root)),
 	)
 
-	return nil
+	return root, nil
 }
 
 func (hg *HypergraphCRDT) GetChildrenForPath(
@@ -1526,10 +1527,8 @@ func (s *streamManager) walk(
 			traversePath := append([]int32{}, rpref...)
 			for _, nibble := range traverse {
 				// s.logger.Debug("attempting remote traversal step")
-				foundMatch := false
 				for _, child := range rtrav.Children {
 					if child.Index == nibble {
-						foundMatch = true
 						// s.logger.Debug("sending query")
 						traversePath = append(traversePath, child.Index)
 						var err error
@@ -1548,7 +1547,7 @@ func (s *streamManager) walk(
 
 				// If no child matched or queryNext returned nil, remote doesn't
 				// have the path that local has
-				if !foundMatch || rtrav == nil {
+				if rtrav == nil {
 					// s.logger.Debug("traversal could not reach path")
 					if isServer {
 						err := s.sendLeafData(
@@ -1557,9 +1556,8 @@ func (s *streamManager) walk(
 						)
 						return errors.Wrap(err, "walk")
 					} else {
-						// Client has data at lpref that server doesn't have
-						// Skip - pruning happens after sync completes
-						return nil
+						err := s.handleLeafData(incomingLeaves)
+						return errors.Wrap(err, "walk")
 					}
 				}
 			}
@@ -1585,10 +1583,8 @@ func (s *streamManager) walk(
 			for _, nibble := range traverse {
 				// s.logger.Debug("attempting local traversal step")
 				preTraversal := append([]int32{}, traversedPath...)
-				foundMatch := false
 				for _, child := range ltrav.Children {
 					if child.Index == nibble {
-						foundMatch = true
 						traversedPath = append(traversedPath, nibble)
 						var err error
 						// s.logger.Debug("expecting query")
@@ -1633,28 +1629,6 @@ func (s *streamManager) walk(
 							}
 						}
 					}
-				}
-				// If no child matched the nibble, the local tree doesn't extend
-				// to match the remote's deeper prefix. We still need to respond to
-				// the remote's query with an empty response, then handle the leaf data.
-				if !foundMatch {
-					// Respond to remote's pending query with our current path info
-					// (which will have empty commitment since we don't have the path)
-					traversedPath = append(traversedPath, nibble)
-					ltrav, _ = s.handleQueryNext(incomingQueries, traversedPath)
-
-					if isServer {
-						// Server sends its data since client's tree is shallower
-						if err := s.sendLeafData(preTraversal, incomingLeaves); err != nil {
-							return errors.Wrap(err, "walk")
-						}
-					} else {
-						// Client receives and merges data from server at preTraversal path
-						if err := s.handleLeafData(incomingLeaves); err != nil {
-							return errors.Wrap(err, "walk")
-						}
-					}
-					return nil
 				}
 			}
 			// s.logger.Debug("traversal completed, performing walk", pathString)

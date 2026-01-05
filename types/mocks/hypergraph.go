@@ -213,9 +213,9 @@ func (h *MockHypergraph) Sync(
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
 	expectedRoot []byte,
-) error {
+) ([]byte, error) {
 	args := h.Called(stream, shardKey, phaseSet, expectedRoot)
-	return args.Error(0)
+	return args.Get(0).([]byte), args.Error(1)
 }
 
 // RunDataPruning implements hypergraph.Hypergraph.

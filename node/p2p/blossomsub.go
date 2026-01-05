@@ -12,6 +12,8 @@ import (
 	"math/big"
 	"math/bits"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -62,6 +64,10 @@ const (
 	AppDecay      = .9
 )
 
+// ConfigDir is a distinct type for the configuration directory path
+// Used by Wire for dependency injection
+type ConfigDir string
+
 type appScore struct {
 	expire time.Time
 	score  float64
@@ -89,6 +95,8 @@ type BlossomSub struct {
 	manualReachability  atomic.Pointer[bool]
 	p2pConfig           config.P2PConfig
 	dht                 *dht.IpfsDHT
+	coreId              uint
+	configDir           ConfigDir
 }
 
 var _ p2p.PubSub = (*BlossomSub)(nil)
@@ -150,6 +158,7 @@ func NewBlossomSubWithHost(
 		signKey:             privKey,
 		peerScore:           make(map[string]*appScore),
 		p2pConfig:           *p2pConfig,
+		coreId:              coreId,
 	}
 
 	idService := internal.IDServiceFromHost(host)
@@ -326,6 +335,7 @@ func NewBlossomSub(
 	engineConfig *config.EngineConfig,
 	logger *zap.Logger,
 	coreId uint,
+	configDir ConfigDir,
 ) *BlossomSub {
 	ctx := context.Background()
 
@@ -514,6 +524,8 @@ func NewBlossomSub(
 		peerScore:           make(map[string]*appScore),
 		p2pConfig:           *p2pConfig,
 		derivedPeerID:       derivedPeerId,
+		coreId:              coreId,
+		configDir:           configDir,
 	}
 
 	h, err := libp2p.New(opts...)
@@ -1228,6 +1240,14 @@ func (b *BlossomSub) blockUntilConnectivityTest(bootstrappers []peer.AddrInfo) {
 		return
 	}
 
+	// Check if we have a recent successful connectivity check cached
+	if b.isConnectivityCacheValid() {
+		b.logger.Info("skipping connectivity test, recent successful check cached",
+			zap.Uint("core_id", b.coreId))
+		b.recordManualReachability(true)
+		return
+	}
+
 	delay := time.NewTimer(10 * time.Second)
 	defer delay.Stop()
 	select {
@@ -1240,6 +1260,8 @@ func (b *BlossomSub) blockUntilConnectivityTest(bootstrappers []peer.AddrInfo) {
 	backoff := 10 * time.Second
 	for {
 		if err := b.runConnectivityTest(b.ctx, bootstrappers); err == nil {
+			// Write the cache on successful connectivity test
+			b.writeConnectivityCache()
 			return
 		} else {
 			b.logger.Warn("connectivity test failed, retrying", zap.Error(err))
@@ -1372,6 +1394,64 @@ func (b *BlossomSub) recordManualReachability(success bool) {
 	state := new(bool)
 	*state = success
 	b.manualReachability.Store(state)
+}
+
+const connectivityCacheValidity = 7 * 24 * time.Hour // 1 week
+
+// connectivityCachePath returns the path to the connectivity check cache file
+// for this core. The file is stored in <configDir>/connectivity-check-<coreId>
+func (b *BlossomSub) connectivityCachePath() string {
+	return filepath.Join(string(b.configDir), fmt.Sprintf("connectivity-check-%d", b.coreId))
+}
+
+// isConnectivityCacheValid checks if there's a valid (< 1 week old) connectivity
+// cache file indicating a previous successful check
+func (b *BlossomSub) isConnectivityCacheValid() bool {
+	cachePath := b.connectivityCachePath()
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		// File doesn't exist or error accessing it
+		return false
+	}
+
+	// Check if the file is less than 1 week old
+	age := time.Since(info.ModTime())
+	if age < connectivityCacheValidity {
+		b.logger.Debug("connectivity cache is valid",
+			zap.String("path", cachePath),
+			zap.Duration("age", age))
+		return true
+	}
+
+	b.logger.Debug("connectivity cache is stale",
+		zap.String("path", cachePath),
+		zap.Duration("age", age))
+	return false
+}
+
+// writeConnectivityCache writes the connectivity cache file to indicate
+// a successful connectivity check
+func (b *BlossomSub) writeConnectivityCache() {
+	cachePath := b.connectivityCachePath()
+
+	// Ensure the directory exists
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
+		b.logger.Warn("failed to create connectivity cache directory",
+			zap.Error(err))
+		return
+	}
+
+	// Write the cache file with the current timestamp
+	timestamp := time.Now().Format(time.RFC3339)
+	if err := os.WriteFile(cachePath, []byte(timestamp), 0644); err != nil {
+		b.logger.Warn("failed to write connectivity cache",
+			zap.String("path", cachePath),
+			zap.Error(err))
+		return
+	}
+
+	b.logger.Debug("wrote connectivity cache",
+		zap.String("path", cachePath))
 }
 
 type connectivityService struct {

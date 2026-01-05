@@ -1652,6 +1652,7 @@ func (e *GlobalConsensusEngine) materialize(
 			)
 		}
 
+		updatedProverRoot := localProverRoot
 		if localRootErr == nil && len(localProverRoot) > 0 {
 			if !bytes.Equal(localProverRoot, expectedProverRoot) {
 				e.logger.Info(
@@ -1661,15 +1662,21 @@ func (e *GlobalConsensusEngine) materialize(
 					zap.String("local_root", hex.EncodeToString(localProverRoot)),
 				)
 				// Perform blocking hypersync before continuing
-				e.performBlockingProverHypersync(proposer, expectedProverRoot)
+				result := e.performBlockingProverHypersync(
+					proposer,
+					expectedProverRoot,
+				)
+				if result != nil {
+					updatedProverRoot = result
+				}
 			}
 		}
 
 		// Publish the snapshot generation with the new root so clients can sync
 		// against this specific state.
-		if len(localProverRoot) > 0 {
+		if len(updatedProverRoot) > 0 {
 			if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
-				hgCRDT.PublishSnapshot(localProverRoot)
+				hgCRDT.PublishSnapshot(updatedProverRoot)
 			}
 		}
 
@@ -1680,8 +1687,10 @@ func (e *GlobalConsensusEngine) materialize(
 			localRootHex = hex.EncodeToString(localProverRoot)
 		}
 
-		e.proverRootSynced.Store(true)
-		e.proverRootVerifiedFrame.Store(frameNumber)
+		if bytes.Equal(updatedProverRoot, expectedProverRoot) {
+			e.proverRootSynced.Store(true)
+			e.proverRootVerifiedFrame.Store(frameNumber)
+		}
 	}
 
 	var state state.State
@@ -2004,14 +2013,17 @@ func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte, expected
 // performBlockingProverHypersync performs a synchronous hypersync that blocks
 // until completion. This is used at the start of materialize to ensure we sync
 // before applying any transactions when there's a prover root mismatch.
-func (e *GlobalConsensusEngine) performBlockingProverHypersync(proposer []byte, expectedRoot []byte) {
+func (e *GlobalConsensusEngine) performBlockingProverHypersync(
+	proposer []byte,
+	expectedRoot []byte,
+) []byte {
 	if e.syncProvider == nil || len(proposer) == 0 {
 		e.logger.Debug("blocking hypersync: no sync provider or proposer")
-		return
+		return nil
 	}
 	if bytes.Equal(proposer, e.getProverAddress()) {
 		e.logger.Debug("blocking hypersync: we are the proposer")
-		return
+		return nil
 	}
 
 	// Wait for any existing sync to complete first
@@ -2026,7 +2038,7 @@ func (e *GlobalConsensusEngine) performBlockingProverHypersync(proposer []byte, 
 		for e.proverSyncInProgress.Load() {
 			time.Sleep(100 * time.Millisecond)
 		}
-		return
+		return nil
 	}
 	defer e.proverSyncInProgress.Store(false)
 
@@ -2055,7 +2067,7 @@ func (e *GlobalConsensusEngine) performBlockingProverHypersync(proposer []byte, 
 	}
 
 	// Perform sync synchronously (blocking)
-	e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
+	newRoots := e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
 	close(done)
 
 	if err := e.proverRegistry.Refresh(); err != nil {
@@ -2066,6 +2078,7 @@ func (e *GlobalConsensusEngine) performBlockingProverHypersync(proposer []byte, 
 	}
 
 	e.logger.Info("blocking hypersync completed")
+	return newRoots[0]
 }
 
 func (e *GlobalConsensusEngine) reconcileLocalWorkerAllocations() {

@@ -475,6 +475,11 @@ RustBuffer uniffi_channel_fn_func_triple_ratchet_init_round_3(RustBuffer ratchet
 RustBuffer uniffi_channel_fn_func_triple_ratchet_init_round_4(RustBuffer ratchet_state_and_metadata, RustCallStatus *out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_TRIPLE_RATCHET_RESIZE
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_TRIPLE_RATCHET_RESIZE
+RustBuffer uniffi_channel_fn_func_triple_ratchet_resize(RustBuffer ratchet_state, RustBuffer other, uint64_t id, uint64_t total, RustCallStatus *out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_VERIFY_ED448
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_VERIFY_ED448
 RustBuffer uniffi_channel_fn_func_verify_ed448(RustBuffer public_key, RustBuffer message, RustBuffer signature, RustCallStatus *out_status
@@ -871,6 +876,12 @@ uint16_t uniffi_channel_checksum_func_triple_ratchet_init_round_3(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_TRIPLE_RATCHET_INIT_ROUND_4
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_TRIPLE_RATCHET_INIT_ROUND_4
 uint16_t uniffi_channel_checksum_func_triple_ratchet_init_round_4(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_TRIPLE_RATCHET_RESIZE
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_TRIPLE_RATCHET_RESIZE
+uint16_t uniffi_channel_checksum_func_triple_ratchet_resize(void
     
 );
 #endif

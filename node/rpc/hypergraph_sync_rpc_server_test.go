@@ -310,7 +310,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
+	_, err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
@@ -359,7 +359,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
+	_, err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}
@@ -613,7 +613,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
+	_, err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
@@ -633,7 +633,7 @@ func TestHypergraphPartialSync(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
+	_, err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}
@@ -931,7 +931,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 		conn, client := dialClient()
 		stream, err := client.HyperStream(context.Background())
 		require.NoError(t, err)
-		_ = clientHGs[0].Sync(
+		_, _ = clientHGs[0].Sync(
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
@@ -956,7 +956,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 			)
 			stream, err := client.HyperStream(streamCtx)
 			require.NoError(t, err)
-			err = clientHGs[idx].Sync(
+			_, err = clientHGs[idx].Sync(
 				stream,
 				shardKey,
 				protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
@@ -1265,7 +1265,7 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		stream, err := client.HyperStream(context.Background())
 		require.NoError(t, err)
 
-		err = clientHG.Sync(
+		_, err = clientHG.Sync(
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
@@ -1319,7 +1319,7 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		stream, err := client.HyperStream(context.Background())
 		require.NoError(t, err)
 
-		err = clientHG.Sync(
+		_, err = clientHG.Sync(
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
@@ -1348,7 +1348,7 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		stream, err := client.HyperStream(context.Background())
 		require.NoError(t, err)
 
-		err = clientHG.Sync(
+		_, err = clientHG.Sync(
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
@@ -1381,7 +1381,7 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		unknownRoot := make([]byte, 48)
 		rand.Read(unknownRoot)
 
-		err = clientHG.Sync(
+		_, err = clientHG.Sync(
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
@@ -1578,7 +1578,7 @@ func TestHypergraphSyncWithModifiedEntries(t *testing.T) {
 	stream, err := client.HyperStream(context.Background())
 	require.NoError(t, err)
 
-	err = clientHG.Sync(
+	_, err = clientHG.Sync(
 		stream,
 		shardKey,
 		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,

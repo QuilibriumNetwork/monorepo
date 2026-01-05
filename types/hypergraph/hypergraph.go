@@ -303,7 +303,7 @@ type Hypergraph interface {
 		shardKey tries.ShardKey,
 		phaseSet protobufs.HypergraphPhaseSet,
 		expectedRoot []byte,
-	) error
+	) ([]byte, error)
 
 	// Transaction and utility operations
 

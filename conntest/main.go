@@ -33,7 +33,7 @@ func main() {
 	}
 
 	logger, _ := zap.NewProduction()
-	pubsub := p2p.NewBlossomSub(cfg.P2P, cfg.Engine, logger, 0)
+	pubsub := p2p.NewBlossomSub(cfg.P2P, cfg.Engine, logger, 0, p2p.ConfigDir(*configDirectory))
 	fmt.Print("Enter bitmask in hex (no 0x prefix): ")
 	reader := bufio.NewReader(os.Stdin)
 	bitmaskHex, _ := reader.ReadString('\n')
