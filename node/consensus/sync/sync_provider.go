@@ -714,7 +714,7 @@ func (e *SyncProvider[StateT, ProposalT]) getRandomProverPeerId() (
 	peer.ID,
 	error,
 ) {
-	provers, err := e.proverRegistry.GetActiveProvers(nil)
+	provers, err := e.proverRegistry.GetActiveProvers(e.filter)
 	if err != nil {
 		e.logger.Error(
 			"could not get active provers for sync",

@@ -2078,6 +2078,10 @@ func (e *GlobalConsensusEngine) performBlockingProverHypersync(
 	}
 
 	e.logger.Info("blocking hypersync completed")
+	if len(newRoots) == 0 {
+		return nil
+	}
+
 	return newRoots[0]
 }
 

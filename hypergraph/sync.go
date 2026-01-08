@@ -570,8 +570,11 @@ const (
 	leafAckPerLeafBudget = 20 * time.Millisecond // Generous budget for tree building overhead
 
 	// Session-level timeouts
-	maxSyncSessionDuration = 15 * time.Minute // Maximum total time for a sync session
-	syncIdleTimeout        = 5 * time.Minute  // Maximum time without activity before session is killed
+	maxSyncSessionDuration = 30 * time.Minute // Maximum total time for a sync session
+	syncIdleTimeout        = 10 * time.Minute // Maximum time without activity before session is killed
+
+	// Operation-level timeouts
+	syncOperationTimeout = 2 * time.Minute // Timeout for individual sync operations (queries, responses)
 )
 
 func leafAckTimeout(count uint64) time.Duration {
@@ -586,6 +589,17 @@ func leafAckTimeout(count uint64) time.Duration {
 		return leafAckMaxTimeout
 	}
 	return timeout
+}
+
+// isTimeoutError checks if an error is a timeout-related error that should abort the sync.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "timed out") ||
+		strings.Contains(errMsg, "context deadline exceeded") ||
+		strings.Contains(errMsg, "context canceled")
 }
 
 // sendLeafData builds a LeafData message (with the full leaf data) for the
@@ -1123,7 +1137,7 @@ func (s *streamManager) queryNext(
 		s.updateActivity()
 		resp = r
 		return resp, nil
-	case <-time.After(30 * time.Second):
+	case <-time.After(syncOperationTimeout):
 		return nil, errors.Wrap(
 			errors.New("timed out"),
 			"handle query",
@@ -1168,7 +1182,7 @@ func (s *streamManager) handleLeafData(
 		case *protobufs.HypergraphComparison_Metadata:
 			expectedLeaves = msg.GetMetadata().Leaves
 		}
-	case <-time.After(30 * time.Second):
+	case <-time.After(syncOperationTimeout):
 		return errors.Wrap(
 			errors.New("timed out"),
 			"handle leaf data",
@@ -1240,7 +1254,7 @@ func (s *streamManager) handleLeafData(
 					"handle leaf data",
 				)
 			}
-		case <-time.After(30 * time.Second):
+		case <-time.After(syncOperationTimeout):
 			return errors.Wrap(
 				errors.New("timed out"),
 				"handle leaf data",
@@ -1360,7 +1374,7 @@ func (s *streamManager) handleQueryNext(
 		s.updateActivity()
 		branch = branchInfo
 		return branch, nil
-	case <-time.After(30 * time.Second):
+	case <-time.After(syncOperationTimeout):
 		return nil, errors.Wrap(
 			errors.New("timed out"),
 			"handle query next",
@@ -1436,7 +1450,7 @@ func (s *streamManager) descendIndex(
 		local = branchInfo
 		remote = r
 		return local, remote, nil
-	case <-time.After(30 * time.Second):
+	case <-time.After(syncOperationTimeout):
 		return nil, nil, errors.Wrap(
 			errors.New("timed out"),
 			"descend index",
@@ -1527,6 +1541,7 @@ func (s *streamManager) walk(
 			traversePath := append([]int32{}, rpref...)
 			for _, nibble := range traverse {
 				// s.logger.Debug("attempting remote traversal step")
+				found := false
 				for _, child := range rtrav.Children {
 					if child.Index == nibble {
 						// s.logger.Debug("sending query")
@@ -1540,14 +1555,14 @@ func (s *streamManager) walk(
 							s.logger.Error("query failed", zap.Error(err))
 							return errors.Wrap(err, "walk")
 						}
-
+						found = true
 						break
 					}
 				}
 
 				// If no child matched or queryNext returned nil, remote doesn't
 				// have the path that local has
-				if rtrav == nil {
+				if !found || rtrav == nil {
 					// s.logger.Debug("traversal could not reach path")
 					if isServer {
 						err := s.sendLeafData(
@@ -1583,6 +1598,7 @@ func (s *streamManager) walk(
 			for _, nibble := range traverse {
 				// s.logger.Debug("attempting local traversal step")
 				preTraversal := append([]int32{}, traversedPath...)
+				found := false
 				for _, child := range ltrav.Children {
 					if child.Index == nibble {
 						traversedPath = append(traversedPath, nibble)
@@ -1611,6 +1627,7 @@ func (s *streamManager) walk(
 								return errors.Wrap(err, "walk")
 							}
 						}
+						found = true
 					} else {
 						// Local has a child that's not on remote's traversal path
 						missingPath := append(append([]int32{}, preTraversal...), child.Index)
@@ -1628,6 +1645,21 @@ func (s *streamManager) walk(
 								return errors.Wrap(err, "walk")
 							}
 						}
+					}
+				}
+
+				// If no child matched the nibble, local doesn't have the path
+				// that remote expects - receive remote's data
+				if !found {
+					if isServer {
+						err := s.sendLeafData(
+							preTraversal,
+							incomingLeaves,
+						)
+						return errors.Wrap(err, "walk")
+					} else {
+						err := s.handleLeafData(incomingLeaves)
+						return errors.Wrap(err, "walk")
 					}
 				}
 			}
@@ -1708,6 +1740,16 @@ func (s *streamManager) walk(
 							nextPath,
 						)
 						if err != nil {
+							// If this is a timeout or context error, abort the sync entirely
+							// rather than trying to continue with leaf data exchange
+							if isTimeoutError(err) {
+								s.logger.Warn(
+									"branch descension timeout - aborting sync",
+									zap.Error(err),
+									zap.String("path", hex.EncodeToString(packPath(nextPath))),
+								)
+								return errors.Wrap(err, "walk: branch descension timeout")
+							}
 							s.logger.Info("incomplete branch descension", zap.Error(err))
 							if isServer {
 								if err := s.sendLeafData(

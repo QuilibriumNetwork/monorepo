@@ -1401,7 +1401,10 @@ const connectivityCacheValidity = 7 * 24 * time.Hour // 1 week
 // connectivityCachePath returns the path to the connectivity check cache file
 // for this core. The file is stored in <configDir>/connectivity-check-<coreId>
 func (b *BlossomSub) connectivityCachePath() string {
-	return filepath.Join(string(b.configDir), fmt.Sprintf("connectivity-check-%d", b.coreId))
+	return filepath.Join(
+		string(b.configDir),
+		fmt.Sprintf("connectivity-check-%d", b.coreId),
+	)
 }
 
 // isConnectivityCacheValid checks if there's a valid (< 1 week old) connectivity
