@@ -2070,13 +2070,6 @@ func (e *GlobalConsensusEngine) performBlockingProverHypersync(
 	newRoots := e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
 	close(done)
 
-	if err := e.proverRegistry.Refresh(); err != nil {
-		e.logger.Warn(
-			"failed to refresh prover registry after blocking hypersync",
-			zap.Error(err),
-		)
-	}
-
 	e.logger.Info("blocking hypersync completed")
 	if len(newRoots) == 0 {
 		return nil

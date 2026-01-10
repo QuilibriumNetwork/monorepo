@@ -412,19 +412,6 @@ func (r *ProverRegistry) PruneOrphanJoins(frameNumber uint64) error {
 		return nil
 	}
 
-	// Reload prover state from hypergraph to ensure deterministic pruning
-	// across all nodes regardless of in-memory cache state
-	r.globalTrie = &tries.RollingFrecencyCritbitTrie{}
-	r.shardTries = make(map[string]*tries.RollingFrecencyCritbitTrie)
-	r.proverCache = make(map[string]*consensus.ProverInfo)
-	r.filterCache = make(map[string][]*consensus.ProverInfo)
-	r.addressToFilters = make(map[string][]string)
-
-	if err := r.extractGlobalState(); err != nil {
-		r.logger.Error("failed to reload global state before pruning", zap.Error(err))
-		return errors.Wrap(err, "prune orphan joins")
-	}
-
 	cutoff := frameNumber - 760
 	var prunedAllocations int
 	var prunedProvers int

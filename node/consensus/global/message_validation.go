@@ -453,19 +453,6 @@ func (e *GlobalConsensusEngine) validateFrameMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		valid, err := e.frameValidator.Validate(frame)
-		if err != nil {
-			e.logger.Debug("global frame validation error", zap.Error(err))
-			frameValidationTotal.WithLabelValues("reject").Inc()
-			return tp2p.ValidationResultReject
-		}
-
-		if !valid {
-			frameValidationTotal.WithLabelValues("reject").Inc()
-			e.logger.Debug("invalid global frame")
-			return tp2p.ValidationResultReject
-		}
-
 		if e.currentRank > frame.GetRank()+2 {
 			frameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
