@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion7
 const (
 	HypergraphComparisonService_HyperStream_FullMethodName        = "/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream"
 	HypergraphComparisonService_GetChildrenForPath_FullMethodName = "/quilibrium.node.application.pb.HypergraphComparisonService/GetChildrenForPath"
+	HypergraphComparisonService_PerformSync_FullMethodName        = "/quilibrium.node.application.pb.HypergraphComparisonService/PerformSync"
 )
 
 // HypergraphComparisonServiceClient is the client API for HypergraphComparisonService service.
@@ -29,6 +30,11 @@ const (
 type HypergraphComparisonServiceClient interface {
 	HyperStream(ctx context.Context, opts ...grpc.CallOption) (HypergraphComparisonService_HyperStreamClient, error)
 	GetChildrenForPath(ctx context.Context, in *GetChildrenForPathRequest, opts ...grpc.CallOption) (*GetChildrenForPathResponse, error)
+	// PerformSync provides a client-driven sync interface. Unlike HyperStream
+	// which requires both sides to walk in lockstep, PerformSync uses a simple
+	// request/response pattern where the client navigates the server's tree
+	// and fetches data as needed.
+	PerformSync(ctx context.Context, opts ...grpc.CallOption) (HypergraphComparisonService_PerformSyncClient, error)
 }
 
 type hypergraphComparisonServiceClient struct {
@@ -79,12 +85,48 @@ func (c *hypergraphComparisonServiceClient) GetChildrenForPath(ctx context.Conte
 	return out, nil
 }
 
+func (c *hypergraphComparisonServiceClient) PerformSync(ctx context.Context, opts ...grpc.CallOption) (HypergraphComparisonService_PerformSyncClient, error) {
+	stream, err := c.cc.NewStream(ctx, &HypergraphComparisonService_ServiceDesc.Streams[1], HypergraphComparisonService_PerformSync_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &hypergraphComparisonServicePerformSyncClient{stream}
+	return x, nil
+}
+
+type HypergraphComparisonService_PerformSyncClient interface {
+	Send(*HypergraphSyncQuery) error
+	Recv() (*HypergraphSyncResponse, error)
+	grpc.ClientStream
+}
+
+type hypergraphComparisonServicePerformSyncClient struct {
+	grpc.ClientStream
+}
+
+func (x *hypergraphComparisonServicePerformSyncClient) Send(m *HypergraphSyncQuery) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *hypergraphComparisonServicePerformSyncClient) Recv() (*HypergraphSyncResponse, error) {
+	m := new(HypergraphSyncResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // HypergraphComparisonServiceServer is the server API for HypergraphComparisonService service.
 // All implementations must embed UnimplementedHypergraphComparisonServiceServer
 // for forward compatibility
 type HypergraphComparisonServiceServer interface {
 	HyperStream(HypergraphComparisonService_HyperStreamServer) error
 	GetChildrenForPath(context.Context, *GetChildrenForPathRequest) (*GetChildrenForPathResponse, error)
+	// PerformSync provides a client-driven sync interface. Unlike HyperStream
+	// which requires both sides to walk in lockstep, PerformSync uses a simple
+	// request/response pattern where the client navigates the server's tree
+	// and fetches data as needed.
+	PerformSync(HypergraphComparisonService_PerformSyncServer) error
 	mustEmbedUnimplementedHypergraphComparisonServiceServer()
 }
 
@@ -97,6 +139,9 @@ func (UnimplementedHypergraphComparisonServiceServer) HyperStream(HypergraphComp
 }
 func (UnimplementedHypergraphComparisonServiceServer) GetChildrenForPath(context.Context, *GetChildrenForPathRequest) (*GetChildrenForPathResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetChildrenForPath not implemented")
+}
+func (UnimplementedHypergraphComparisonServiceServer) PerformSync(HypergraphComparisonService_PerformSyncServer) error {
+	return status.Errorf(codes.Unimplemented, "method PerformSync not implemented")
 }
 func (UnimplementedHypergraphComparisonServiceServer) mustEmbedUnimplementedHypergraphComparisonServiceServer() {
 }
@@ -156,6 +201,32 @@ func _HypergraphComparisonService_GetChildrenForPath_Handler(srv interface{}, ct
 	return interceptor(ctx, in, info, handler)
 }
 
+func _HypergraphComparisonService_PerformSync_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(HypergraphComparisonServiceServer).PerformSync(&hypergraphComparisonServicePerformSyncServer{stream})
+}
+
+type HypergraphComparisonService_PerformSyncServer interface {
+	Send(*HypergraphSyncResponse) error
+	Recv() (*HypergraphSyncQuery, error)
+	grpc.ServerStream
+}
+
+type hypergraphComparisonServicePerformSyncServer struct {
+	grpc.ServerStream
+}
+
+func (x *hypergraphComparisonServicePerformSyncServer) Send(m *HypergraphSyncResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *hypergraphComparisonServicePerformSyncServer) Recv() (*HypergraphSyncQuery, error) {
+	m := new(HypergraphSyncQuery)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // HypergraphComparisonService_ServiceDesc is the grpc.ServiceDesc for HypergraphComparisonService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -172,6 +243,12 @@ var HypergraphComparisonService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "HyperStream",
 			Handler:       _HypergraphComparisonService_HyperStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "PerformSync",
+			Handler:       _HypergraphComparisonService_PerformSync_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},

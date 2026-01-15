@@ -295,15 +295,14 @@ type Hypergraph interface {
 	// Embeds the comparison service
 	protobufs.HypergraphComparisonServiceServer
 
-	// Sync is the client-side initiator for synchronization. If expectedRoot is
-	// provided, the server will attempt to use a snapshot with a matching commit
-	// root. This allows the client to sync against a specific known state.
-	Sync(
-		stream protobufs.HypergraphComparisonService_HyperStreamClient,
+	// SyncFrom is the client-side initiator for synchronization using the
+	// client-driven protocol. The client navigates the server's tree and
+	// fetches differing data.
+	SyncFrom(
+		stream protobufs.HypergraphComparisonService_PerformSyncClient,
 		shardKey tries.ShardKey,
 		phaseSet protobufs.HypergraphPhaseSet,
-		expectedRoot []byte,
-	) ([]byte, error)
+	) error
 
 	// Transaction and utility operations
 

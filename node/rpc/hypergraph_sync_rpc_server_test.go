@@ -305,12 +305,12 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to listen: %v", err)
 	}
 	client := protobufs.NewHypergraphComparisonServiceClient(conn)
-	str, err := client.HyperStream(context.TODO())
+	str, err := client.PerformSync(context.TODO())
 	if err != nil {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	_, err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
+	err = crdts[1].(*hgcrdt.HypergraphCRDT).SyncFrom(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
@@ -354,12 +354,12 @@ func TestHypergraphSyncServer(t *testing.T) {
 	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 
-	str, err = client.HyperStream(context.TODO())
+	str, err = client.PerformSync(context.TODO())
 	if err != nil {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	_, err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
+	err = crdts[1].(*hgcrdt.HypergraphCRDT).SyncFrom(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}
@@ -608,12 +608,12 @@ func TestHypergraphPartialSync(t *testing.T) {
 		log.Fatalf("Client: failed to listen: %v", err)
 	}
 	client := protobufs.NewHypergraphComparisonServiceClient(conn)
-	str, err := client.HyperStream(context.TODO())
+	str, err := client.PerformSync(context.TODO())
 	if err != nil {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	_, err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
+	err = crdts[1].(*hgcrdt.HypergraphCRDT).SyncFrom(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
@@ -627,13 +627,13 @@ func TestHypergraphPartialSync(t *testing.T) {
 	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
 
-	str, err = client.HyperStream(context.TODO())
+	str, err = client.PerformSync(context.TODO())
 
 	if err != nil {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	_, err = crdts[1].Sync(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, nil)
+	err = crdts[1].(*hgcrdt.HypergraphCRDT).SyncFrom(str, shardKey, protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}
@@ -866,13 +866,12 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 					context.Background(),
 					100*time.Second,
 				)
-				stream, err := client.HyperStream(streamCtx)
+				stream, err := client.PerformSync(streamCtx)
 				require.NoError(t, err)
-				clientHG.Sync(
+				clientHG.SyncFrom(
 					stream,
 					shardKey,
 					protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-					nil,
 				)
 				require.NoError(t, stream.CloseSend())
 				cancelStream()
@@ -924,18 +923,17 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	// Publish the server's snapshot so clients can sync against this exact state
 	serverHG.PublishSnapshot(serverRoot)
 
-	// Create a snapshot handle for this shard by doing a sync with nil expectedRoot.
+	// Create a snapshot handle for this shard by doing a sync.
 	// This is needed because the snapshot manager only creates handles when acquire
-	// is called, and subsequent syncs with expectedRoot require the handle to exist.
+	// is called.
 	{
 		conn, client := dialClient()
-		stream, err := client.HyperStream(context.Background())
+		stream, err := client.PerformSync(context.Background())
 		require.NoError(t, err)
-		_, _ = clientHGs[0].Sync(
+		_ = clientHGs[0].SyncFrom(
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-			nil, // nil to create the snapshot handle
 		)
 		_ = stream.CloseSend()
 		conn.Close()
@@ -954,13 +952,12 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 				context.Background(),
 				100*time.Second,
 			)
-			stream, err := client.HyperStream(streamCtx)
+			stream, err := client.PerformSync(streamCtx)
 			require.NoError(t, err)
-			_, err = clientHGs[idx].Sync(
+			err = clientHGs[idx].SyncFrom(
 				stream,
 				shardKey,
 				protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-				serverRoot,
 			)
 			require.NoError(t, err)
 			require.NoError(t, stream.CloseSend())
@@ -1262,14 +1259,13 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		clientDB, clientHG := createClient("client-snapshot-root1")
 		conn, client := dialClient()
 
-		stream, err := client.HyperStream(context.Background())
+		stream, err := client.PerformSync(context.Background())
 		require.NoError(t, err)
 
-		_, err = clientHG.Sync(
+		err = clientHG.SyncFrom(
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-			nil,
 		)
 		require.NoError(t, err)
 		require.NoError(t, stream.CloseSend())
@@ -1308,22 +1304,21 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 	// Verify roots are different
 	require.NotEqual(t, root1, root2, "roots should be different after adding more data")
 
-	// Test 1: Sync with nil expectedRoot (should get latest = root2)
-	t.Run("sync with nil expectedRoot gets latest", func(t *testing.T) {
+	// Test 1: Sync gets latest state
+	t.Run("sync gets latest", func(t *testing.T) {
 		clientDB, clientHG := createClient("client1")
 		defer clientDB.Close()
 
 		conn, client := dialClient()
 		defer conn.Close()
 
-		stream, err := client.HyperStream(context.Background())
+		stream, err := client.PerformSync(context.Background())
 		require.NoError(t, err)
 
-		_, err = clientHG.Sync(
+		err = clientHG.SyncFrom(
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-			nil, // nil expectedRoot should use latest snapshot
 		)
 		require.NoError(t, err)
 		require.NoError(t, stream.CloseSend())
@@ -1334,25 +1329,24 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		clientRoot := clientCommit[shardKey][0]
 
 		// Client should have synced to the latest (root2)
-		assert.Equal(t, root2, clientRoot, "client should sync to latest root when expectedRoot is nil")
+		assert.Equal(t, root2, clientRoot, "client should sync to latest root")
 	})
 
-	// Test 2: Sync with expectedRoot = root1 (should get historical snapshot)
-	t.Run("sync with expectedRoot gets matching generation", func(t *testing.T) {
+	// Test 2: Multiple syncs converge to same state
+	t.Run("multiple syncs converge", func(t *testing.T) {
 		clientDB, clientHG := createClient("client2")
 		defer clientDB.Close()
 
 		conn, client := dialClient()
 		defer conn.Close()
 
-		stream, err := client.HyperStream(context.Background())
+		stream, err := client.PerformSync(context.Background())
 		require.NoError(t, err)
 
-		_, err = clientHG.Sync(
+		err = clientHG.SyncFrom(
 			stream,
 			shardKey,
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-			root1, // Request sync against root1
 		)
 		require.NoError(t, err)
 		require.NoError(t, stream.CloseSend())
@@ -1362,34 +1356,8 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		require.NoError(t, err)
 		clientRoot := clientCommit[shardKey][0]
 
-		// Client should have synced to root1 (the historical snapshot)
-		assert.Equal(t, root1, clientRoot, "client should sync to historical root when expectedRoot matches")
-	})
-
-	// Test 3: Sync with unknown expectedRoot (should fail - no matching snapshot)
-	t.Run("sync with unknown expectedRoot fails", func(t *testing.T) {
-		clientDB, clientHG := createClient("client3")
-		defer clientDB.Close()
-
-		conn, client := dialClient()
-		defer conn.Close()
-
-		stream, err := client.HyperStream(context.Background())
-		require.NoError(t, err)
-
-		// Use a fake root that doesn't exist
-		unknownRoot := make([]byte, 48)
-		rand.Read(unknownRoot)
-
-		_, err = clientHG.Sync(
-			stream,
-			shardKey,
-			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-			unknownRoot, // Unknown root has no matching snapshot
-		)
-		// Sync should fail because no snapshot exists for the unknown root
-		require.Error(t, err, "sync with unknown expectedRoot should fail")
-		_ = stream.CloseSend()
+		// Client should have synced to the latest (root2)
+		assert.Equal(t, root2, clientRoot, "client should sync to latest root")
 	})
 }
 
@@ -1575,14 +1543,13 @@ func TestHypergraphSyncWithModifiedEntries(t *testing.T) {
 	conn, client := dialClient()
 	defer conn.Close()
 
-	stream, err := client.HyperStream(context.Background())
+	stream, err := client.PerformSync(context.Background())
 	require.NoError(t, err)
 
-	_, err = clientHG.Sync(
+	err = clientHG.SyncFrom(
 		stream,
 		shardKey,
 		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-		nil,
 	)
 	require.NoError(t, err)
 	require.NoError(t, stream.CloseSend())
@@ -1791,14 +1758,13 @@ func TestHypergraphBidirectionalSyncWithDisjointData(t *testing.T) {
 	defer serverB.Stop()
 
 	connB, clientB := dialClient(lisB)
-	streamB, err := clientB.HyperStream(context.Background())
+	streamB, err := clientB.PerformSync(context.Background())
 	require.NoError(t, err)
 
-	_, err = nodeAHG.Sync(
+	err = nodeAHG.SyncFrom(
 		streamB,
 		shardKey,
 		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-		nil,
 	)
 	require.NoError(t, err)
 	require.NoError(t, streamB.CloseSend())
@@ -1818,14 +1784,13 @@ func TestHypergraphBidirectionalSyncWithDisjointData(t *testing.T) {
 	defer serverA.Stop()
 
 	connA, clientA := dialClient(lisA)
-	streamA, err := clientA.HyperStream(context.Background())
+	streamA, err := clientA.PerformSync(context.Background())
 	require.NoError(t, err)
 
-	_, err = nodeBHG.Sync(
+	err = nodeBHG.SyncFrom(
 		streamA,
 		shardKey,
 		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-		nil,
 	)
 	require.NoError(t, err)
 	require.NoError(t, streamA.CloseSend())
@@ -1881,6 +1846,283 @@ func TestHypergraphBidirectionalSyncWithDisjointData(t *testing.T) {
 	assert.Empty(t, diffLeaves, "there should be no differences between the trees")
 
 	t.Log("Bidirectional sync test passed - both nodes have all 1000 vertices")
+}
+
+// TestHypergraphBidirectionalSyncClientDriven tests the new client-driven sync
+// protocol (PerformSync/SyncFrom) with two nodes having disjoint data sets.
+// Node A has 500 unique vertices and node B has 500 different unique vertices.
+// After syncing in both directions, both nodes should have all 1000 vertices.
+func TestHypergraphBidirectionalSyncClientDriven(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	enc := verenc.NewMPCitHVerifiableEncryptor(1)
+	inclusionProver := bls48581.NewKZGInclusionProver(logger)
+
+	// Create data trees for all 1000 vertices
+	numVerticesPerNode := 500
+	totalVertices := numVerticesPerNode * 2
+	dataTrees := make([]*tries.VectorCommitmentTree, totalVertices)
+	eg := errgroup.Group{}
+	eg.SetLimit(100)
+	for i := 0; i < totalVertices; i++ {
+		eg.Go(func() error {
+			dataTrees[i] = buildDataTree(t, inclusionProver)
+			return nil
+		})
+	}
+	eg.Wait()
+	t.Log("Generated data trees")
+
+	// Create databases and stores for both nodes
+	nodeADB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeA_cd/store"}, 0)
+	defer nodeADB.Close()
+
+	nodeBDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeB_cd/store"}, 0)
+	defer nodeBDB.Close()
+
+	nodeAStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeA_cd/store"},
+		nodeADB,
+		logger,
+		enc,
+		inclusionProver,
+	)
+
+	nodeBStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeB_cd/store"},
+		nodeBDB,
+		logger,
+		enc,
+		inclusionProver,
+	)
+
+	nodeAHG := hgcrdt.NewHypergraph(
+		logger.With(zap.String("side", "nodeA-cd")),
+		nodeAStore,
+		inclusionProver,
+		[]int{},
+		&tests.Nopthenticator{},
+		200,
+	)
+
+	nodeBHG := hgcrdt.NewHypergraph(
+		logger.With(zap.String("side", "nodeB-cd")),
+		nodeBStore,
+		inclusionProver,
+		[]int{},
+		&tests.Nopthenticator{},
+		200,
+	)
+
+	// Create a shared domain for all vertices
+	domain := randomBytes32(t)
+
+	// Generate vertices for node A (first 500)
+	nodeAVertices := make([]application.Vertex, numVerticesPerNode)
+	for i := 0; i < numVerticesPerNode; i++ {
+		addr := randomBytes32(t)
+		nodeAVertices[i] = hgcrdt.NewVertex(
+			domain,
+			addr,
+			dataTrees[i].Commit(inclusionProver, false),
+			dataTrees[i].GetSize(),
+		)
+	}
+
+	// Generate vertices for node B (second 500, completely different)
+	nodeBVertices := make([]application.Vertex, numVerticesPerNode)
+	for i := 0; i < numVerticesPerNode; i++ {
+		addr := randomBytes32(t)
+		nodeBVertices[i] = hgcrdt.NewVertex(
+			domain,
+			addr,
+			dataTrees[numVerticesPerNode+i].Commit(inclusionProver, false),
+			dataTrees[numVerticesPerNode+i].GetSize(),
+		)
+	}
+
+	shardKey := application.GetShardKey(nodeAVertices[0])
+
+	// Add vertices to node A
+	t.Log("Adding 500 vertices to node A")
+	nodeATxn, err := nodeAStore.NewTransaction(false)
+	require.NoError(t, err)
+	for i, v := range nodeAVertices {
+		id := v.GetID()
+		require.NoError(t, nodeAStore.SaveVertexTree(nodeATxn, id[:], dataTrees[i]))
+		require.NoError(t, nodeAHG.AddVertex(nodeATxn, v))
+	}
+	require.NoError(t, nodeATxn.Commit())
+
+	// Add vertices to node B
+	t.Log("Adding 500 different vertices to node B")
+	nodeBTxn, err := nodeBStore.NewTransaction(false)
+	require.NoError(t, err)
+	for i, v := range nodeBVertices {
+		id := v.GetID()
+		require.NoError(t, nodeBStore.SaveVertexTree(nodeBTxn, id[:], dataTrees[numVerticesPerNode+i]))
+		require.NoError(t, nodeBHG.AddVertex(nodeBTxn, v))
+	}
+	require.NoError(t, nodeBTxn.Commit())
+
+	// Commit both hypergraphs
+	_, err = nodeAHG.Commit(1)
+	require.NoError(t, err)
+	_, err = nodeBHG.Commit(1)
+	require.NoError(t, err)
+
+	nodeARootBefore := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	nodeBRootBefore := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	t.Logf("Node A root before sync: %x", nodeARootBefore)
+	t.Logf("Node B root before sync: %x", nodeBRootBefore)
+	require.NotEqual(t, nodeARootBefore, nodeBRootBefore, "roots should differ before sync")
+
+	// Helper to set up gRPC server for a hypergraph
+	setupServer := func(hg *hgcrdt.HypergraphCRDT) (*bufconn.Listener, *grpc.Server) {
+		const bufSize = 1 << 20
+		lis := bufconn.Listen(bufSize)
+
+		grpcServer := grpc.NewServer(
+			grpc.ChainStreamInterceptor(func(
+				srv interface{},
+				ss grpc.ServerStream,
+				info *grpc.StreamServerInfo,
+				handler grpc.StreamHandler,
+			) error {
+				_, priv, _ := ed448.GenerateKey(rand.Reader)
+				privKey, err := pcrypto.UnmarshalEd448PrivateKey(priv)
+				require.NoError(t, err)
+
+				pub := privKey.GetPublic()
+				peerID, err := peer.IDFromPublicKey(pub)
+				require.NoError(t, err)
+
+				return handler(srv, &serverStream{
+					ServerStream: ss,
+					ctx:          internal_grpc.NewContextWithPeerID(ss.Context(), peerID),
+				})
+			}),
+		)
+		protobufs.RegisterHypergraphComparisonServiceServer(grpcServer, hg)
+
+		go func() {
+			_ = grpcServer.Serve(lis)
+		}()
+
+		return lis, grpcServer
+	}
+
+	dialClient := func(lis *bufconn.Listener) (*grpc.ClientConn, protobufs.HypergraphComparisonServiceClient) {
+		dialer := func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}
+		conn, err := grpc.DialContext(
+			context.Background(),
+			"bufnet",
+			grpc.WithContextDialer(dialer),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		require.NoError(t, err)
+		return conn, protobufs.NewHypergraphComparisonServiceClient(conn)
+	}
+
+	// Convert tries.ShardKey to bytes for SyncFrom
+	shardKeyBytes := slices.Concat(shardKey.L1[:], shardKey.L2[:])
+	_ = shardKeyBytes // Used below in the SyncFrom call
+
+	// Step 1: Node A syncs from Node B (as server) using client-driven sync
+	// Node A should receive Node B's 500 vertices
+	t.Log("Step 1: Node A syncs from Node B using PerformSync (B is server)")
+	lisB, serverB := setupServer(nodeBHG)
+	defer serverB.Stop()
+
+	connB, clientB := dialClient(lisB)
+	streamB, err := clientB.PerformSync(context.Background())
+	require.NoError(t, err)
+
+	err = nodeAHG.SyncFrom(
+		streamB,
+		shardKey,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+	)
+	require.NoError(t, err)
+	require.NoError(t, streamB.CloseSend())
+	connB.Close()
+
+	_, err = nodeAHG.Commit(2)
+	require.NoError(t, err)
+
+	nodeARootAfterFirstSync := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	t.Logf("Node A root after syncing from B: %x", nodeARootAfterFirstSync)
+
+	// Step 2: Node B syncs from Node A (as server) using client-driven sync
+	// Node B should receive Node A's 500 vertices
+	t.Log("Step 2: Node B syncs from Node A using PerformSync (A is server)")
+	lisA, serverA := setupServer(nodeAHG)
+	defer serverA.Stop()
+
+	connA, clientA := dialClient(lisA)
+	streamA, err := clientA.PerformSync(context.Background())
+	require.NoError(t, err)
+
+	err = nodeBHG.SyncFrom(
+		streamA,
+		shardKey,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+	)
+	require.NoError(t, err)
+	require.NoError(t, streamA.CloseSend())
+	connA.Close()
+
+	_, err = nodeBHG.Commit(2)
+	require.NoError(t, err)
+
+	// Verify both nodes have converged
+	nodeARootFinal := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	nodeBRootFinal := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	t.Logf("Node A final root: %x", nodeARootFinal)
+	t.Logf("Node B final root: %x", nodeBRootFinal)
+
+	assert.Equal(t, nodeARootFinal, nodeBRootFinal, "both nodes should have identical roots after bidirectional sync")
+
+	// Verify the tree contains all 1000 vertices
+	nodeATree := nodeAHG.GetVertexAddsSet(shardKey).GetTree()
+	nodeBTree := nodeBHG.GetVertexAddsSet(shardKey).GetTree()
+
+	nodeALeaves := tries.GetAllLeaves(
+		nodeATree.SetType,
+		nodeATree.PhaseType,
+		nodeATree.ShardKey,
+		nodeATree.Root,
+	)
+	nodeBLeaves := tries.GetAllLeaves(
+		nodeBTree.SetType,
+		nodeBTree.PhaseType,
+		nodeBTree.ShardKey,
+		nodeBTree.Root,
+	)
+
+	nodeALeafCount := 0
+	for _, leaf := range nodeALeaves {
+		if leaf != nil {
+			nodeALeafCount++
+		}
+	}
+	nodeBLeafCount := 0
+	for _, leaf := range nodeBLeaves {
+		if leaf != nil {
+			nodeBLeafCount++
+		}
+	}
+
+	t.Logf("Node A has %d leaves, Node B has %d leaves", nodeALeafCount, nodeBLeafCount)
+	assert.Equal(t, totalVertices, nodeALeafCount, "Node A should have all 1000 vertices")
+	assert.Equal(t, totalVertices, nodeBLeafCount, "Node B should have all 1000 vertices")
+
+	// Verify no differences between the trees
+	diffLeaves := tries.CompareLeaves(nodeATree, nodeBTree)
+	assert.Empty(t, diffLeaves, "there should be no differences between the trees")
+
+	t.Log("Client-driven bidirectional sync test passed - both nodes have all 1000 vertices")
 }
 
 // TestHypergraphSyncWithPrefixLengthMismatch tests sync behavior when one node
@@ -2150,14 +2392,13 @@ func TestHypergraphSyncWithPrefixLengthMismatch(t *testing.T) {
 			t.Logf("Client has %d leaves before sync", clientLeafCountBefore)
 
 			conn, client := dialClient(lis)
-			stream, err := client.HyperStream(context.Background())
+			stream, err := client.PerformSync(context.Background())
 			require.NoError(t, err)
 
-			_, err = clientHG.Sync(
+			err = clientHG.SyncFrom(
 				stream,
 				shardKey,
 				protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-				nil,
 			)
 			require.NoError(t, err)
 			require.NoError(t, stream.CloseSend())

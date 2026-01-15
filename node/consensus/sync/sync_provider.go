@@ -404,9 +404,8 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSync(
 	}
 
 	phaseSyncs := [](func(
-		protobufs.HypergraphComparisonService_HyperStreamClient,
+		protobufs.HypergraphComparisonService_PerformSyncClient,
 		tries.ShardKey,
-		[]byte,
 	) []byte){
 		p.hyperSyncVertexAdds,
 		p.hyperSyncVertexRemoves,
@@ -433,13 +432,13 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSync(
 				}
 
 				client := protobufs.NewHypergraphComparisonServiceClient(ch)
-				str, err := client.HyperStream(ctx)
+				str, err := client.PerformSync(ctx)
 				if err != nil {
 					p.logger.Error("error from sync", zap.Error(err))
 					return nil
 				}
 
-				root := syncPhase(str, shardKey, expectedRoot)
+				root := syncPhase(str, shardKey)
 				if cerr := ch.Close(); cerr != nil {
 					p.logger.Error("error while closing connection", zap.Error(cerr))
 				}
@@ -479,9 +478,8 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSyncSelf(
 	}
 
 	phaseSyncs := [](func(
-		protobufs.HypergraphComparisonService_HyperStreamClient,
+		protobufs.HypergraphComparisonService_PerformSyncClient,
 		tries.ShardKey,
-		[]byte,
 	) []byte){
 		p.hyperSyncVertexAdds,
 		p.hyperSyncVertexRemoves,
@@ -507,13 +505,13 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSyncSelf(
 				}
 
 				client := protobufs.NewHypergraphComparisonServiceClient(ch)
-				str, err := client.HyperStream(ctx)
+				str, err := client.PerformSync(ctx)
 				if err != nil {
 					p.logger.Error("error from self-sync", zap.Error(err))
 					return
 				}
 
-				syncPhase(str, shardKey, expectedRoot)
+				syncPhase(str, shardKey)
 				if cerr := ch.Close(); cerr != nil {
 					p.logger.Error("error while closing connection", zap.Error(cerr))
 				}
@@ -524,75 +522,67 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSyncSelf(
 }
 
 func (p *SyncProvider[StateT, ProposalT]) hyperSyncVertexAdds(
-	str protobufs.HypergraphComparisonService_HyperStreamClient,
+	str protobufs.HypergraphComparisonService_PerformSyncClient,
 	shardKey tries.ShardKey,
-	expectedRoot []byte,
 ) []byte {
-	root, err := p.hypergraph.Sync(
+	err := p.hypergraph.SyncFrom(
 		str,
 		shardKey,
 		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-		expectedRoot,
 	)
 	if err != nil {
 		p.logger.Error("error from sync", zap.Error(err))
 	}
 	str.CloseSend()
-	return root
+	return nil
 }
 
 func (p *SyncProvider[StateT, ProposalT]) hyperSyncVertexRemoves(
-	str protobufs.HypergraphComparisonService_HyperStreamClient,
+	str protobufs.HypergraphComparisonService_PerformSyncClient,
 	shardKey tries.ShardKey,
-	expectedRoot []byte,
 ) []byte {
-	root, err := p.hypergraph.Sync(
+	err := p.hypergraph.SyncFrom(
 		str,
 		shardKey,
 		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES,
-		expectedRoot,
 	)
 	if err != nil {
 		p.logger.Error("error from sync", zap.Error(err))
 	}
 	str.CloseSend()
-	return root
+	return nil
 }
 
 func (p *SyncProvider[StateT, ProposalT]) hyperSyncHyperedgeAdds(
-	str protobufs.HypergraphComparisonService_HyperStreamClient,
+	str protobufs.HypergraphComparisonService_PerformSyncClient,
 	shardKey tries.ShardKey,
-	expectedRoot []byte,
 ) []byte {
-	root, err := p.hypergraph.Sync(
+	err := p.hypergraph.SyncFrom(
 		str,
 		shardKey,
 		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS,
-		expectedRoot,
 	)
 	if err != nil {
 		p.logger.Error("error from sync", zap.Error(err))
 	}
 	str.CloseSend()
-	return root
+	return nil
 }
 
 func (p *SyncProvider[StateT, ProposalT]) hyperSyncHyperedgeRemoves(
-	str protobufs.HypergraphComparisonService_HyperStreamClient,
+	str protobufs.HypergraphComparisonService_PerformSyncClient,
 	shardKey tries.ShardKey,
-	expectedRoot []byte,
 ) []byte {
-	root, err := p.hypergraph.Sync(
+	err := p.hypergraph.SyncFrom(
 		str,
 		shardKey,
 		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES,
-		expectedRoot,
 	)
 	if err != nil {
 		p.logger.Error("error from sync", zap.Error(err))
 	}
 	str.CloseSend()
-	return root
+	return nil
 }
 
 func (p *SyncProvider[StateT, ProposalT]) AddState(
