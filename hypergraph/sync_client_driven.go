@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"slices"
 	"strings"
@@ -73,7 +74,12 @@ func (hg *HypergraphCRDT) PerformSync(
 		case *protobufs.HypergraphSyncQuery_GetBranch:
 			// Initialize session on first request
 			if session == nil {
-				session, err = hg.initSyncSession(r.GetBranch.ShardKey, r.GetBranch.PhaseSet, logger)
+				session, err = hg.initSyncSession(
+					r.GetBranch.ShardKey,
+					r.GetBranch.PhaseSet,
+					r.GetBranch.ExpectedRoot,
+					logger,
+				)
 				if err != nil {
 					return errors.Wrap(err, "init sync session")
 				}
@@ -82,7 +88,12 @@ func (hg *HypergraphCRDT) PerformSync(
 		case *protobufs.HypergraphSyncQuery_GetLeaves:
 			// Initialize session on first request
 			if session == nil {
-				session, err = hg.initSyncSession(r.GetLeaves.ShardKey, r.GetLeaves.PhaseSet, logger)
+				session, err = hg.initSyncSession(
+					r.GetLeaves.ShardKey,
+					r.GetLeaves.PhaseSet,
+					r.GetLeaves.ExpectedRoot,
+					logger,
+				)
 				if err != nil {
 					return errors.Wrap(err, "init sync session")
 				}
@@ -121,6 +132,7 @@ func (hg *HypergraphCRDT) PerformSync(
 func (hg *HypergraphCRDT) initSyncSession(
 	shardKeyBytes []byte,
 	phaseSet protobufs.HypergraphPhaseSet,
+	expectedRoot []byte,
 	logger *zap.Logger,
 ) (*syncSession, error) {
 	if len(shardKeyBytes) != 35 {
@@ -132,8 +144,9 @@ func (hg *HypergraphCRDT) initSyncSession(
 		L2: [32]byte(shardKeyBytes[3:]),
 	}
 
-	// Acquire a snapshot for consistent reads throughout the session
-	snapshot := hg.snapshotMgr.acquire(shardKey, nil)
+	// Acquire a snapshot for consistent reads throughout the session.
+	// If expectedRoot is provided, we try to find a snapshot matching that root.
+	snapshot := hg.snapshotMgr.acquire(shardKey, expectedRoot)
 	if snapshot == nil {
 		return nil, errors.New("failed to acquire snapshot")
 	}
@@ -145,10 +158,14 @@ func (hg *HypergraphCRDT) initSyncSession(
 		return nil, errors.New("unsupported phase set")
 	}
 
+	tree := idSet.GetTree()
 	logger.Debug(
 		"sync session initialized",
 		zap.String("shard", hex.EncodeToString(shardKeyBytes)),
 		zap.Int("phaseSet", int(phaseSet)),
+		zap.Bool("tree_nil", tree == nil),
+		zap.Bool("root_nil", tree != nil && tree.Root == nil),
+		zap.String("snapshot_root", hex.EncodeToString(snapshot.Root())),
 	)
 
 	return &syncSession{
@@ -169,6 +186,11 @@ func (hg *HypergraphCRDT) handleGetBranch(
 	tree := session.idSet.GetTree()
 	if tree == nil || tree.Root == nil {
 		// Empty tree - return empty response
+		logger.Debug("handleGetBranch: empty tree",
+			zap.Bool("tree_nil", tree == nil),
+			zap.Bool("root_nil", tree != nil && tree.Root == nil),
+			zap.String("path", hex.EncodeToString(packPath(req.Path))),
+		)
 		return &protobufs.HypergraphSyncResponse{
 			Response: &protobufs.HypergraphSyncResponse_Branch{
 				Branch: &protobufs.HypergraphSyncBranchResponse{
@@ -312,6 +334,25 @@ func (hg *HypergraphCRDT) handleGetLeaves(
 		}, nil
 	}
 
+	// Debug: log node details to identify snapshot consistency issues
+	var nodeCommitment []byte
+	var nodeStore string
+	switch n := node.(type) {
+	case *tries.LazyVectorCommitmentBranchNode:
+		nodeCommitment = n.Commitment
+		nodeStore = fmt.Sprintf("%p", n.Store)
+	case *tries.LazyVectorCommitmentLeafNode:
+		nodeCommitment = n.Commitment
+		nodeStore = fmt.Sprintf("%p", n.Store)
+	}
+	logger.Debug("handleGetLeaves node info",
+		zap.String("path", hex.EncodeToString(packPath(req.Path))),
+		zap.String("nodeCommitment", hex.EncodeToString(nodeCommitment)),
+		zap.String("nodeStore", nodeStore),
+		zap.String("sessionStore", fmt.Sprintf("%p", session.store)),
+		zap.Int("contTokenLen", len(req.ContinuationToken)),
+	)
+
 	// Get all leaves under this node
 	allLeaves := tries.GetAllLeaves(
 		tree.SetType,
@@ -372,6 +413,17 @@ func (hg *HypergraphCRDT) handleGetLeaves(
 		_ = i // suppress unused warning
 	}
 
+	// Debug: log leaf count details
+	logger.Debug("handleGetLeaves returning",
+		zap.String("path", hex.EncodeToString(packPath(req.Path))),
+		zap.Int("allLeavesLen", len(allLeaves)),
+		zap.Uint64("totalNonNil", totalNonNil),
+		zap.Int("startIdx", startIdx),
+		zap.Int("leavesReturned", len(leaves)),
+		zap.String("treePtr", fmt.Sprintf("%p", tree)),
+		zap.String("treeRootPtr", fmt.Sprintf("%p", tree.Root)),
+	)
+
 	resp := &protobufs.HypergraphSyncLeavesResponse{
 		Path:        req.Path,
 		Leaves:      leaves,
@@ -412,17 +464,15 @@ func parseContToken(token []byte) (int, error) {
 	if len(token) == 0 {
 		return 0, nil
 	}
-	var idx int
-	_, err := hex.Decode(make([]byte, len(token)/2), token)
+	// Token is hex-encoded 4 bytes (big-endian int32)
+	decoded, err := hex.DecodeString(string(token))
 	if err != nil {
 		return 0, err
 	}
-	// Simple: just parse as decimal string
-	for _, b := range token {
-		if b >= '0' && b <= '9' {
-			idx = idx*10 + int(b-'0')
-		}
+	if len(decoded) != 4 {
+		return 0, errors.New("invalid continuation token length")
 	}
+	idx := int(decoded[0])<<24 | int(decoded[1])<<16 | int(decoded[2])<<8 | int(decoded[3])
 	return idx, nil
 }
 
@@ -432,12 +482,15 @@ func makeContToken(idx int) []byte {
 
 // SyncFrom performs a client-driven sync from the given server stream.
 // It navigates to the covered prefix (if any), then recursively syncs
-// differing subtrees.
+// differing subtrees. If expectedRoot is provided, the server will attempt
+// to sync from a snapshot matching that root commitment.
+// Returns the new root commitment after sync completes.
 func (hg *HypergraphCRDT) SyncFrom(
 	stream protobufs.HypergraphComparisonService_PerformSyncClient,
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
-) error {
+	expectedRoot []byte,
+) ([]byte, error) {
 	hg.mu.Lock()
 	defer hg.mu.Unlock()
 
@@ -445,6 +498,9 @@ func (hg *HypergraphCRDT) SyncFrom(
 		zap.String("method", "SyncFrom"),
 		zap.String("shard", hex.EncodeToString(slices.Concat(shardKey.L1[:], shardKey.L2[:]))),
 	)
+	if len(expectedRoot) > 0 {
+		logger = logger.With(zap.String("expectedRoot", hex.EncodeToString(expectedRoot)))
+	}
 
 	syncStart := time.Now()
 	defer func() {
@@ -453,30 +509,39 @@ func (hg *HypergraphCRDT) SyncFrom(
 
 	set := hg.getPhaseSet(shardKey, phaseSet)
 	if set == nil {
-		return errors.New("unsupported phase set")
+		return nil, errors.New("unsupported phase set")
 	}
 
 	shardKeyBytes := slices.Concat(shardKey.L1[:], shardKey.L2[:])
 	coveredPrefix := hg.getCoveredPrefix()
 
 	// Step 1: Navigate to sync point
-	syncPoint, err := hg.navigateToSyncPoint(stream, shardKeyBytes, phaseSet, coveredPrefix, logger)
+	syncPoint, err := hg.navigateToSyncPoint(stream, shardKeyBytes, phaseSet, coveredPrefix, expectedRoot, logger)
 	if err != nil {
-		return errors.Wrap(err, "navigate to sync point")
+		return nil, errors.Wrap(err, "navigate to sync point")
 	}
 
 	if syncPoint == nil || len(syncPoint.Commitment) == 0 {
 		logger.Info("server has no data at sync point")
-		return nil
+		// Return current root even if no data was synced
+		root := set.GetTree().Commit(false)
+		return root, nil
 	}
 
 	// Step 2: Sync the subtree
-	err = hg.syncSubtree(stream, shardKeyBytes, phaseSet, syncPoint, set, logger)
+	err = hg.syncSubtree(stream, shardKeyBytes, phaseSet, expectedRoot, syncPoint, set, logger)
 	if err != nil {
-		return errors.Wrap(err, "sync subtree")
+		return nil, errors.Wrap(err, "sync subtree")
 	}
 
-	return nil
+	// Step 3: Recompute commitment so future syncs see updated state
+	root := set.GetTree().Commit(false)
+	logger.Info(
+		"hypergraph root commit after sync",
+		zap.String("root", hex.EncodeToString(root)),
+	)
+
+	return root, nil
 }
 
 func (hg *HypergraphCRDT) navigateToSyncPoint(
@@ -484,6 +549,7 @@ func (hg *HypergraphCRDT) navigateToSyncPoint(
 	shardKey []byte,
 	phaseSet protobufs.HypergraphPhaseSet,
 	coveredPrefix []int,
+	expectedRoot []byte,
 	logger *zap.Logger,
 ) (*protobufs.HypergraphSyncBranchResponse, error) {
 	path := []int32{}
@@ -493,9 +559,10 @@ func (hg *HypergraphCRDT) navigateToSyncPoint(
 		err := stream.Send(&protobufs.HypergraphSyncQuery{
 			Request: &protobufs.HypergraphSyncQuery_GetBranch{
 				GetBranch: &protobufs.HypergraphSyncGetBranchRequest{
-					ShardKey: shardKey,
-					PhaseSet: phaseSet,
-					Path:     path,
+					ShardKey:     shardKey,
+					PhaseSet:     phaseSet,
+					Path:         path,
+					ExpectedRoot: expectedRoot,
 				},
 			},
 		})
@@ -574,6 +641,7 @@ func (hg *HypergraphCRDT) syncSubtree(
 	stream protobufs.HypergraphComparisonService_PerformSyncClient,
 	shardKey []byte,
 	phaseSet protobufs.HypergraphPhaseSet,
+	expectedRoot []byte,
 	serverBranch *protobufs.HypergraphSyncBranchResponse,
 	localSet hypergraph.IdSet,
 	logger *zap.Logger,
@@ -582,9 +650,10 @@ func (hg *HypergraphCRDT) syncSubtree(
 
 	// Get local node at same path
 	var localCommitment []byte
+	var localNode tries.LazyVectorCommitmentNode
 	if tree != nil && tree.Root != nil {
 		path := toIntSlice(serverBranch.FullPath)
-		localNode := getNodeAtPath(
+		localNode = getNodeAtPath(
 			logger,
 			tree.SetType,
 			tree.PhaseType,
@@ -614,22 +683,24 @@ func (hg *HypergraphCRDT) syncSubtree(
 
 	// If server node is a leaf or has no children, fetch all leaves
 	if serverBranch.IsLeaf || len(serverBranch.Children) == 0 {
-		return hg.fetchAndIntegrateLeaves(stream, shardKey, phaseSet, serverBranch.FullPath, localSet, logger)
+		return hg.fetchAndIntegrateLeaves(stream, shardKey, phaseSet, expectedRoot, serverBranch.FullPath, localSet, logger)
+	}
+
+	// OPTIMIZATION: If we have NO local data at this path, skip the branch-by-branch
+	// traversal and just fetch all leaves directly. This avoids N round trips for N
+	// children when we know we need all of them anyway.
+	if localNode == nil {
+		logger.Debug("no local data at path, fetching all leaves directly",
+			zap.String("path", hex.EncodeToString(packPath(serverBranch.FullPath))),
+			zap.Int("serverChildren", len(serverBranch.Children)),
+		)
+		return hg.fetchAndIntegrateLeaves(stream, shardKey, phaseSet, expectedRoot, serverBranch.FullPath, localSet, logger)
 	}
 
 	// Compare children and recurse
 	localChildren := make(map[int32][]byte)
 	if tree != nil && tree.Root != nil {
 		path := toIntSlice(serverBranch.FullPath)
-		localNode := getNodeAtPath(
-			logger,
-			tree.SetType,
-			tree.PhaseType,
-			tree.ShardKey,
-			tree.Root,
-			serverBranch.FullPath,
-			0,
-		)
 		if branch, ok := localNode.(*tries.LazyVectorCommitmentBranchNode); ok {
 			for i := 0; i < 64; i++ {
 				child := branch.Children[i]
@@ -670,9 +741,10 @@ func (hg *HypergraphCRDT) syncSubtree(
 		err := stream.Send(&protobufs.HypergraphSyncQuery{
 			Request: &protobufs.HypergraphSyncQuery_GetBranch{
 				GetBranch: &protobufs.HypergraphSyncGetBranchRequest{
-					ShardKey: shardKey,
-					PhaseSet: phaseSet,
-					Path:     childPath,
+					ShardKey:     shardKey,
+					PhaseSet:     phaseSet,
+					Path:         childPath,
+					ExpectedRoot: expectedRoot,
 				},
 			},
 		})
@@ -699,7 +771,7 @@ func (hg *HypergraphCRDT) syncSubtree(
 		}
 
 		// Recurse
-		if err := hg.syncSubtree(stream, shardKey, phaseSet, childBranch, localSet, logger); err != nil {
+		if err := hg.syncSubtree(stream, shardKey, phaseSet, expectedRoot, childBranch, localSet, logger); err != nil {
 			return err
 		}
 	}
@@ -711,6 +783,7 @@ func (hg *HypergraphCRDT) fetchAndIntegrateLeaves(
 	stream protobufs.HypergraphComparisonService_PerformSyncClient,
 	shardKey []byte,
 	phaseSet protobufs.HypergraphPhaseSet,
+	expectedRoot []byte,
 	path []int32,
 	localSet hypergraph.IdSet,
 	logger *zap.Logger,
@@ -731,6 +804,7 @@ func (hg *HypergraphCRDT) fetchAndIntegrateLeaves(
 					Path:              path,
 					MaxLeaves:         1000,
 					ContinuationToken: continuationToken,
+					ExpectedRoot:      expectedRoot,
 				},
 			},
 		})
@@ -784,6 +858,7 @@ func (hg *HypergraphCRDT) fetchAndIntegrateLeaves(
 		totalFetched += len(leavesResp.Leaves)
 
 		logger.Debug("fetched leaves batch",
+			zap.String("path", hex.EncodeToString(packPath(path))),
 			zap.Int("count", len(leavesResp.Leaves)),
 			zap.Int("totalFetched", totalFetched),
 			zap.Uint64("totalAvailable", leavesResp.TotalLeaves),

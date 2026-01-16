@@ -213,6 +213,10 @@ message HypergraphSyncGetBranchRequest {
   HypergraphPhaseSet phase_set = 2;
   // The path to query. Empty path queries the root.
   repeated int32 path = 3;
+  // The expected root commitment the client wants to sync against. When set,
+  // the server will attempt to find a snapshot with a matching root. If empty,
+  // the server uses the latest available snapshot.
+  bytes expected_root = 4;
 }
 
 // HypergraphSyncBranchResponse contains branch information at the queried path.
@@ -250,6 +254,10 @@ message HypergraphSyncGetLeavesRequest {
   uint32 max_leaves = 4;
   // Continuation token for pagination. Empty for first request.
   bytes continuation_token = 5;
+  // The expected root commitment the client wants to sync against. When set,
+  // the server will attempt to find a snapshot with a matching root. If empty,
+  // the server uses the latest available snapshot.
+  bytes expected_root = 6;
 }
 
 // HypergraphSyncLeavesResponse contains leaves from the requested subtree.

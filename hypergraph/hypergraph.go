@@ -171,15 +171,27 @@ func (hg *HypergraphCRDT) snapshotSet(
 	hg.setsMu.RUnlock()
 
 	if set == nil {
+		// Try to load root from snapshot store since set doesn't exist in memory
+		var root tries.LazyVectorCommitmentNode
+		if targetStore != nil {
+			root, _ = targetStore.GetNodeByPath(
+				string(atomType),
+				string(phaseType),
+				shardKey,
+				[]int{}, // empty path = root
+			)
+		}
 		set = NewIdSet(
 			atomType,
 			phaseType,
 			shardKey,
-			hg.store,
+			targetStore, // Use target store directly since set is new
 			hg.prover,
-			nil,
+			root,
 			hg.getCoveredPrefix(),
 		)
+		// Return directly - no need to clone since we already used targetStore
+		return set
 	}
 
 	return hg.cloneSetWithStore(set, targetStore)

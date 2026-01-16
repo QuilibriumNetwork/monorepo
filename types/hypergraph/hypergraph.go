@@ -297,12 +297,15 @@ type Hypergraph interface {
 
 	// SyncFrom is the client-side initiator for synchronization using the
 	// client-driven protocol. The client navigates the server's tree and
-	// fetches differing data.
+	// fetches differing data. If expectedRoot is provided, the server will
+	// attempt to sync from a snapshot matching that root commitment.
+	// Returns the new root commitment after sync completes.
 	SyncFrom(
 		stream protobufs.HypergraphComparisonService_PerformSyncClient,
 		shardKey tries.ShardKey,
 		phaseSet protobufs.HypergraphPhaseSet,
-	) error
+		expectedRoot []byte,
+	) ([]byte, error)
 
 	// Transaction and utility operations
 
