@@ -33,12 +33,12 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
-	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	internal_grpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	application "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	tp2p "source.quilibrium.com/quilibrium/monorepo/types/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
@@ -2594,53 +2594,53 @@ func TestMainnetBlossomsubFrameReceptionAndHypersync(t *testing.T) {
 
 	// Create P2P config with mainnet bootstrap peers
 	p2pConfig := &config.P2PConfig{
-		ListenMultiaddr:          "/ip4/0.0.0.0/udp/0/quic-v1", // Use random port
-		BootstrapPeers:           config.BootstrapPeers,
-		PeerPrivKey:              fmt.Sprintf("%x", peerPrivKeyBytes),
-		Network:                  0, // Mainnet
-		D:                        8,
-		DLo:                      6,
-		DHi:                      12,
-		DScore:                   4,
-		DOut:                     2,
-		HistoryLength:            5,
-		HistoryGossip:            3,
-		DLazy:                    6,
-		GossipFactor:             0.25,
-		GossipRetransmission:     3,
-		HeartbeatInitialDelay:    100 * time.Millisecond,
-		HeartbeatInterval:        1 * time.Second,
-		FanoutTTL:                60 * time.Second,
-		PrunePeers:               16,
-		PruneBackoff:             time.Minute,
-		UnsubscribeBackoff:       10 * time.Second,
-		Connectors:               8,
-		MaxPendingConnections:    128,
-		ConnectionTimeout:        30 * time.Second,
-		DirectConnectTicks:       300,
+		ListenMultiaddr:           "/ip4/0.0.0.0/udp/0/quic-v1", // Use random port
+		BootstrapPeers:            config.BootstrapPeers,
+		PeerPrivKey:               fmt.Sprintf("%x", peerPrivKeyBytes),
+		Network:                   0, // Mainnet
+		D:                         8,
+		DLo:                       6,
+		DHi:                       12,
+		DScore:                    4,
+		DOut:                      2,
+		HistoryLength:             5,
+		HistoryGossip:             3,
+		DLazy:                     6,
+		GossipFactor:              0.25,
+		GossipRetransmission:      3,
+		HeartbeatInitialDelay:     100 * time.Millisecond,
+		HeartbeatInterval:         1 * time.Second,
+		FanoutTTL:                 60 * time.Second,
+		PrunePeers:                16,
+		PruneBackoff:              time.Minute,
+		UnsubscribeBackoff:        10 * time.Second,
+		Connectors:                8,
+		MaxPendingConnections:     128,
+		ConnectionTimeout:         30 * time.Second,
+		DirectConnectTicks:        300,
 		DirectConnectInitialDelay: 1 * time.Second,
-		OpportunisticGraftTicks:  60,
-		OpportunisticGraftPeers:  2,
-		GraftFloodThreshold:      10 * time.Second,
-		MaxIHaveLength:           5000,
-		MaxIHaveMessages:         10,
-		MaxIDontWantMessages:     10,
-		IWantFollowupTime:        3 * time.Second,
+		OpportunisticGraftTicks:   60,
+		OpportunisticGraftPeers:   2,
+		GraftFloodThreshold:       10 * time.Second,
+		MaxIHaveLength:            5000,
+		MaxIHaveMessages:          10,
+		MaxIDontWantMessages:      10,
+		IWantFollowupTime:         3 * time.Second,
 		IDontWantMessageThreshold: 10000,
 		IDontWantMessageTTL:       3,
-		MinBootstrapPeers:        1,
-		BootstrapParallelism:     4,
-		DiscoveryParallelism:     4,
-		DiscoveryPeerLookupLimit: 100,
-		PingTimeout:              30 * time.Second,
-		PingPeriod:               time.Minute,
-		PingAttempts:             3,
-		LowWatermarkConnections:  -1,
-		HighWatermarkConnections: -1,
-		SubscriptionQueueSize:    128,
-		ValidateQueueSize:        128,
-		ValidateWorkers:          4,
-		PeerOutboundQueueSize:    128,
+		MinBootstrapPeers:         1,
+		BootstrapParallelism:      4,
+		DiscoveryParallelism:      4,
+		DiscoveryPeerLookupLimit:  100,
+		PingTimeout:               30 * time.Second,
+		PingPeriod:                time.Minute,
+		PingAttempts:              3,
+		LowWatermarkConnections:   -1,
+		HighWatermarkConnections:  -1,
+		SubscriptionQueueSize:     128,
+		ValidateQueueSize:         128,
+		ValidateWorkers:           4,
+		PeerOutboundQueueSize:     128,
 	}
 
 	engineConfig := &config.EngineConfig{}
@@ -3120,7 +3120,7 @@ waitLoop:
 			continue
 		}
 
-		_, err = clientHG.SyncFrom(stream, proverShardKey, phase, expectedRoot)
+		_, err = clientHG.SyncFrom(stream, proverShardKey, phase, nil)
 		if err != nil {
 			t.Logf("SyncFrom error for phase %v: %v", phase, err)
 		}

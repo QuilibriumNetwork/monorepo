@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 
 	pebblev1 "github.com/cockroachdb/pebble"
@@ -15,7 +16,9 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
@@ -76,6 +79,13 @@ var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_187,
 	migration_2_1_0_188,
 	migration_2_1_0_189,
+	migration_2_1_0_1810,
+	migration_2_1_0_1811,
+	migration_2_1_0_1812,
+	migration_2_1_0_1813,
+	migration_2_1_0_1814,
+	migration_2_1_0_1815,
+	migration_2_1_0_1816,
 }
 
 func NewPebbleDB(
@@ -818,8 +828,263 @@ func migration_2_1_0_188(b *pebble.Batch) error {
 }
 
 func migration_2_1_0_189(b *pebble.Batch) error {
-	return migration_2_1_0_18(b)
+	return nil
 }
+
+func migration_2_1_0_1810(b *pebble.Batch) error {
+	return migration_2_1_0_189(b)
+}
+
+func migration_2_1_0_1811(b *pebble.Batch) error {
+	return migration_2_1_0_189(b)
+}
+
+func migration_2_1_0_1812(b *pebble.Batch) error {
+	return migration_2_1_0_189(b)
+}
+
+func migration_2_1_0_1813(b *pebble.Batch) error {
+	return migration_2_1_0_189(b)
+}
+
+func migration_2_1_0_1814(b *pebble.Batch) error {
+	return migration_2_1_0_189(b)
+}
+
+func migration_2_1_0_1815(b *pebble.Batch) error {
+	return migration_2_1_0_189(b)
+}
+
+// migration_2_1_0_1816 recalculates commitments for the global prover trees
+// to fix potential corruption from earlier versions of sync.
+func migration_2_1_0_1816(b *pebble.Batch) error {
+	// Check if already done
+	doneKey := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_GLOBAL_PROVER_RECALC_DONE}
+	if _, closer, err := b.Get(doneKey); err == nil {
+		closer.Close()
+		return nil // Already done
+	}
+
+	// Global prover shard key: L1={0,0,0}, L2=0xff*32
+	globalShardKey := tries.ShardKey{
+		L1: [3]byte{},
+		L2: [32]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		},
+	}
+
+	// Initialize prover (logger can be nil for migrations)
+	prover := bls48581.NewKZGInclusionProver(nil)
+
+	// Create a batch-backed KVDB for the hypergraph store
+	batchDB := &pebbleBatchDB{b: b}
+
+	// Create hypergraph store using the batch
+	hgStore := NewPebbleHypergraphStore(nil, batchDB, nil, nil, prover)
+
+	// Load and recalculate each tree for the global prover shard
+	treeTypes := []struct {
+		setType   string
+		phaseType string
+		rootKey   func(tries.ShardKey) []byte
+	}{
+		{
+			string(hypergraph.VertexAtomType),
+			string(hypergraph.AddsPhaseType),
+			hypergraphVertexAddsTreeRootKey,
+		},
+		{
+			string(hypergraph.VertexAtomType),
+			string(hypergraph.RemovesPhaseType),
+			hypergraphVertexRemovesTreeRootKey,
+		},
+		{
+			string(hypergraph.HyperedgeAtomType),
+			string(hypergraph.AddsPhaseType),
+			hypergraphHyperedgeAddsTreeRootKey,
+		},
+		{
+			string(hypergraph.HyperedgeAtomType),
+			string(hypergraph.RemovesPhaseType),
+			hypergraphHyperedgeRemovesTreeRootKey,
+		},
+	}
+
+	for _, tt := range treeTypes {
+		rootData, closer, err := b.Get(tt.rootKey(globalShardKey))
+		if err != nil {
+			// No root for this tree, skip
+			continue
+		}
+		data := slices.Clone(rootData)
+		closer.Close()
+
+		if len(data) == 0 {
+			continue
+		}
+
+		var node tries.LazyVectorCommitmentNode
+		switch data[0] {
+		case tries.TypeLeaf:
+			node, err = tries.DeserializeLeafNode(hgStore, bytes.NewReader(data[1:]))
+		case tries.TypeBranch:
+			pathLength := binary.BigEndian.Uint32(data[1:5])
+			node, err = tries.DeserializeBranchNode(
+				hgStore,
+				bytes.NewReader(data[5+(pathLength*4):]),
+				false,
+			)
+			if err != nil {
+				return errors.Wrapf(
+					err,
+					"deserialize %s %s branch",
+					tt.setType,
+					tt.phaseType,
+				)
+			}
+
+			fullPrefix := []int{}
+			for i := range pathLength {
+				fullPrefix = append(
+					fullPrefix,
+					int(binary.BigEndian.Uint32(data[5+(i*4):5+((i+1)*4)])),
+				)
+			}
+			branch := node.(*tries.LazyVectorCommitmentBranchNode)
+			branch.FullPrefix = fullPrefix
+		default:
+			continue // Unknown type, skip
+		}
+
+		if err != nil {
+			return errors.Wrapf(
+				err,
+				"deserialize %s %s root",
+				tt.setType,
+				tt.phaseType,
+			)
+		}
+
+		// Create tree and force recalculation
+		tree := &tries.LazyVectorCommitmentTree{
+			Root:            node,
+			SetType:         tt.setType,
+			PhaseType:       tt.phaseType,
+			ShardKey:        globalShardKey,
+			Store:           hgStore,
+			CoveredPrefix:   nil,
+			InclusionProver: prover,
+		}
+
+		// Force full recalculation of commitments
+		tree.Commit(true)
+	}
+
+	// Mark migration as done
+	if err := b.Set(doneKey, []byte{0x01}, &pebble.WriteOptions{}); err != nil {
+		return errors.Wrap(err, "mark global prover recalc done")
+	}
+
+	return nil
+}
+
+// pebbleBatchDB wraps a *pebble.Batch to implement store.KVDB for use in migrations
+type pebbleBatchDB struct {
+	b *pebble.Batch
+}
+
+func (p *pebbleBatchDB) Get(key []byte) ([]byte, io.Closer, error) {
+	return p.b.Get(key)
+}
+
+func (p *pebbleBatchDB) Set(key, value []byte) error {
+	return p.b.Set(key, value, &pebble.WriteOptions{})
+}
+
+func (p *pebbleBatchDB) Delete(key []byte) error {
+	return p.b.Delete(key, &pebble.WriteOptions{})
+}
+
+func (p *pebbleBatchDB) NewBatch(indexed bool) store.Transaction {
+	// Migrations don't need nested transactions; return a wrapper around the same
+	// batch
+	return &pebbleBatchTransaction{b: p.b}
+}
+
+func (p *pebbleBatchDB) NewIter(lowerBound []byte, upperBound []byte) (
+	store.Iterator,
+	error,
+) {
+	return p.b.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+}
+
+func (p *pebbleBatchDB) Compact(start, end []byte, parallelize bool) error {
+	return nil // No-op for batch
+}
+
+func (p *pebbleBatchDB) Close() error {
+	return nil // Don't close the batch here
+}
+
+func (p *pebbleBatchDB) DeleteRange(start, end []byte) error {
+	return p.b.DeleteRange(start, end, &pebble.WriteOptions{})
+}
+
+func (p *pebbleBatchDB) CompactAll() error {
+	return nil // No-op for batch
+}
+
+var _ store.KVDB = (*pebbleBatchDB)(nil)
+
+// pebbleBatchTransaction wraps a *pebble.Batch to implement store.Transaction
+type pebbleBatchTransaction struct {
+	b *pebble.Batch
+}
+
+func (t *pebbleBatchTransaction) Get(key []byte) ([]byte, io.Closer, error) {
+	return t.b.Get(key)
+}
+
+func (t *pebbleBatchTransaction) Set(key []byte, value []byte) error {
+	return t.b.Set(key, value, &pebble.WriteOptions{})
+}
+
+func (t *pebbleBatchTransaction) Commit() error {
+	return nil // Don't commit; the migration batch handles this
+}
+
+func (t *pebbleBatchTransaction) Delete(key []byte) error {
+	return t.b.Delete(key, &pebble.WriteOptions{})
+}
+
+func (t *pebbleBatchTransaction) Abort() error {
+	return nil // Can't abort part of a batch
+}
+
+func (t *pebbleBatchTransaction) NewIter(lowerBound []byte, upperBound []byte) (
+	store.Iterator,
+	error,
+) {
+	return t.b.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+}
+
+func (t *pebbleBatchTransaction) DeleteRange(
+	lowerBound []byte,
+	upperBound []byte,
+) error {
+	return t.b.DeleteRange(lowerBound, upperBound, &pebble.WriteOptions{})
+}
+
+var _ store.Transaction = (*pebbleBatchTransaction)(nil)
 
 type pebbleSnapshotDB struct {
 	snap *pebble.Snapshot

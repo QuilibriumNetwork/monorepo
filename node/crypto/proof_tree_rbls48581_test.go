@@ -1821,6 +1821,563 @@ func TestDeleteMultipleChildrenRemaining(t *testing.T) {
 	t.Logf("Delete tree matches fresh tree with same remaining keys")
 }
 
+// TestDeleteBranchPromotionFullPrefixBug tests that when a delete operation
+// triggers branch promotion (where a parent branch is replaced by its only
+// remaining child branch), the child's FullPrefix is correctly updated to
+// reflect its new position in the tree.
+//
+// The bug: In lazy_proof_tree.go Delete(), when case 1 (single child remaining)
+// handles a branch child, it updates childBranch.Prefix but NOT childBranch.FullPrefix.
+// The node is then stored at the parent's path (n.FullPrefix), but the stored data
+// contains the OLD childBranch.FullPrefix. When loaded later, the node has wrong
+// FullPrefix, causing child lookups and commitment computation to fail.
+func TestDeleteBranchPromotionFullPrefixBug(t *testing.T) {
+	bls48581.Init()
+	l, _ := zap.NewProduction()
+	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	tree := &crypto.LazyVectorCommitmentTree{
+		InclusionProver: bls48581.NewKZGInclusionProver(l),
+		Store:           s,
+		SetType:         "vertex",
+		PhaseType:       "adds",
+		ShardKey:        crypto.ShardKey{},
+	}
+
+	// Create a specific structure that will trigger branch promotion:
+	//
+	//        Root Branch (prefix=[])
+	//       /           \
+	//    Loner1       SubBranch (prefix=[X,Y,Z])
+	//                  /     \
+	//               Key1    Key2
+	//
+	// When we delete Loner1, SubBranch should be promoted to root with its
+	// prefix merged. The bug is that SubBranch.FullPrefix is not updated.
+
+	// All keys start with 0xAA to share initial path
+	// Loner diverges early (at nibble 2)
+	// SubBranch keys share a longer prefix and diverge later
+
+	// Loner key: 0xAA 0x00 ... (diverges at nibble 2 with value 0)
+	lonerKey := make([]byte, 64)
+	lonerKey[0] = 0xAA
+	lonerKey[1] = 0x00 // This makes nibbles [10, 10, 0, 0, ...]
+	rand.Read(lonerKey[2:])
+
+	// SubBranch keys: 0xAA 0xFF ... (diverges at nibble 2 with value F)
+	// Key1 and Key2 share more prefix and diverge at byte 32
+	key1 := make([]byte, 64)
+	key1[0] = 0xAA
+	key1[1] = 0xFF // Nibbles [10, 10, 15, 15, ...]
+	for i := 2; i < 32; i++ {
+		key1[i] = 0xBB // Shared prefix within sub-branch
+	}
+	key1[32] = 0x00 // Key1 diverges here
+	rand.Read(key1[33:])
+
+	key2 := make([]byte, 64)
+	copy(key2, key1)
+	key2[32] = 0xFF // Key2 diverges here differently
+	rand.Read(key2[33:])
+
+	// Insert all keys
+	err := tree.Insert(nil, lonerKey, lonerKey, nil, big.NewInt(1))
+	if err != nil {
+		t.Fatalf("Failed to insert loner key: %v", err)
+	}
+	err = tree.Insert(nil, key1, key1, nil, big.NewInt(1))
+	if err != nil {
+		t.Fatalf("Failed to insert key1: %v", err)
+	}
+	err = tree.Insert(nil, key2, key2, nil, big.NewInt(1))
+	if err != nil {
+		t.Fatalf("Failed to insert key2: %v", err)
+	}
+
+	// Commit to persist everything
+	rootBefore := tree.Commit(false)
+	t.Logf("Root before deletion: %x", rootBefore[:16])
+
+	// Verify all keys exist
+	if _, err := tree.Get(lonerKey); err != nil {
+		t.Fatalf("Loner key not found before deletion: %v", err)
+	}
+	if _, err := tree.Get(key1); err != nil {
+		t.Fatalf("Key1 not found before deletion: %v", err)
+	}
+	if _, err := tree.Get(key2); err != nil {
+		t.Fatalf("Key2 not found before deletion: %v", err)
+	}
+
+	// Delete the loner - this triggers branch promotion for SubBranch
+	err = tree.Delete(nil, lonerKey)
+	if err != nil {
+		t.Fatalf("Failed to delete loner key: %v", err)
+	}
+
+	// Verify loner is gone
+	if _, err := tree.Get(lonerKey); err == nil {
+		t.Fatalf("Loner key still exists after deletion")
+	}
+
+	// At this point, the in-memory tree should still work because
+	// the node references are still valid (even if FullPrefix is wrong)
+	val1, err := tree.Get(key1)
+	if err != nil {
+		t.Fatalf("Key1 not found after deletion (in-memory): %v", err)
+	}
+	if !bytes.Equal(val1, key1) {
+		t.Fatalf("Key1 value corrupted after deletion")
+	}
+
+	val2, err := tree.Get(key2)
+	if err != nil {
+		t.Fatalf("Key2 not found after deletion (in-memory): %v", err)
+	}
+	if !bytes.Equal(val2, key2) {
+		t.Fatalf("Key2 value corrupted after deletion")
+	}
+
+	// Commit after deletion
+	rootAfterDelete := tree.Commit(false)
+	t.Logf("Root after deletion: %x", rootAfterDelete[:16])
+
+	// Now create a FRESH tree that loads from storage
+	// This is the critical test - if FullPrefix is wrong in storage,
+	// the fresh tree will have issues
+	tree2 := &crypto.LazyVectorCommitmentTree{
+		InclusionProver: bls48581.NewKZGInclusionProver(l),
+		Store:           s,
+		SetType:         "vertex",
+		PhaseType:       "adds",
+		ShardKey:        crypto.ShardKey{},
+	}
+
+	// Load root from storage
+	rootNode, err := s.GetNodeByPath("vertex", "adds", crypto.ShardKey{}, []int{})
+	if err != nil {
+		t.Fatalf("Failed to load root from storage: %v", err)
+	}
+	tree2.Root = rootNode
+
+	// Try to get key1 from the fresh tree
+	// If FullPrefix bug exists, this may fail because child lookups use wrong paths
+	val1Fresh, err := tree2.Get(key1)
+	if err != nil {
+		t.Fatalf("Key1 not found in fresh tree loaded from storage: %v", err)
+	}
+	if !bytes.Equal(val1Fresh, key1) {
+		t.Fatalf("Key1 value wrong in fresh tree")
+	}
+
+	val2Fresh, err := tree2.Get(key2)
+	if err != nil {
+		t.Fatalf("Key2 not found in fresh tree loaded from storage: %v", err)
+	}
+	if !bytes.Equal(val2Fresh, key2) {
+		t.Fatalf("Key2 value wrong in fresh tree")
+	}
+
+	// Commit the fresh tree and compare roots
+	rootFresh := tree2.Commit(false)
+	t.Logf("Root from fresh tree: %x", rootFresh[:16])
+
+	if !bytes.Equal(rootAfterDelete, rootFresh) {
+		t.Fatalf("Root mismatch! In-memory tree produced different root than fresh tree loaded from storage\n"+
+			"In-memory: %x\n"+
+			"Fresh:     %x\n"+
+			"This indicates FullPrefix corruption during branch promotion",
+			rootAfterDelete, rootFresh)
+	}
+
+	// Also compare against a completely fresh tree built from scratch with same keys
+	tree3 := &crypto.LazyVectorCommitmentTree{
+		InclusionProver: bls48581.NewKZGInclusionProver(l),
+		Store:           s,
+		SetType:         "vertex",
+		PhaseType:       "scratch",
+		ShardKey:        crypto.ShardKey{},
+	}
+
+	err = tree3.Insert(nil, key1, key1, nil, big.NewInt(1))
+	if err != nil {
+		t.Fatalf("Failed to insert key1 into scratch tree: %v", err)
+	}
+	err = tree3.Insert(nil, key2, key2, nil, big.NewInt(1))
+	if err != nil {
+		t.Fatalf("Failed to insert key2 into scratch tree: %v", err)
+	}
+
+	rootScratch := tree3.Commit(false)
+	t.Logf("Root from scratch tree: %x", rootScratch[:16])
+
+	// Log tree structures for debugging
+	if branch, ok := tree.Root.(*crypto.LazyVectorCommitmentBranchNode); ok {
+		t.Logf("After-delete tree root: Prefix=%v, FullPrefix=%v", branch.Prefix, branch.FullPrefix)
+		for i, child := range branch.Children {
+			if child != nil {
+				switch c := child.(type) {
+				case *crypto.LazyVectorCommitmentBranchNode:
+					t.Logf("  After-delete child[%d]: Branch Prefix=%v, FullPrefix=%v", i, c.Prefix, c.FullPrefix)
+				case *crypto.LazyVectorCommitmentLeafNode:
+					t.Logf("  After-delete child[%d]: Leaf Key=%x...", i, c.Key[:8])
+				}
+			}
+		}
+	}
+	if branch, ok := tree3.Root.(*crypto.LazyVectorCommitmentBranchNode); ok {
+		t.Logf("Scratch tree root: Prefix=%v, FullPrefix=%v", branch.Prefix, branch.FullPrefix)
+		for i, child := range branch.Children {
+			if child != nil {
+				switch c := child.(type) {
+				case *crypto.LazyVectorCommitmentBranchNode:
+					t.Logf("  Scratch child[%d]: Branch Prefix=%v, FullPrefix=%v", i, c.Prefix, c.FullPrefix)
+				case *crypto.LazyVectorCommitmentLeafNode:
+					t.Logf("  Scratch child[%d]: Leaf Key=%x...", i, c.Key[:8])
+				}
+			}
+		}
+	}
+
+	if !bytes.Equal(rootAfterDelete, rootScratch) {
+		t.Fatalf("Root mismatch! Delete-promoted tree produced different root than scratch tree\n"+
+			"After delete: %x\n"+
+			"From scratch: %x\n"+
+			"This indicates structural difference after branch promotion",
+			rootAfterDelete, rootScratch)
+	}
+
+	t.Log("All roots match - branch promotion preserved correct tree structure")
+}
+
+// TestDeleteBranchPromotionDeepNesting tests branch promotion with deeply nested
+// structures where multiple levels of promotion may occur.
+func TestDeleteBranchPromotionDeepNesting(t *testing.T) {
+	bls48581.Init()
+	l, _ := zap.NewProduction()
+	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	tree := &crypto.LazyVectorCommitmentTree{
+		InclusionProver: bls48581.NewKZGInclusionProver(l),
+		Store:           s,
+		SetType:         "vertex",
+		PhaseType:       "deep",
+		ShardKey:        crypto.ShardKey{},
+	}
+
+	// Create a chain of nested branches, each with a loner and a sub-branch
+	// When we delete all loners from innermost to outermost, we trigger
+	// multiple successive branch promotions
+
+	// Structure:
+	//   Root
+	//    |-- Loner0
+	//    |-- Branch1
+	//         |-- Loner1
+	//         |-- Branch2
+	//              |-- Loner2
+	//              |-- Branch3
+	//                   |-- Key1
+	//                   |-- Key2
+
+	// Create keys with progressively longer shared prefixes
+	numLoners := 5
+	loners := make([][]byte, numLoners)
+
+	// Base prefix that all keys share
+	basePrefix := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+
+	for i := 0; i < numLoners; i++ {
+		loner := make([]byte, 64)
+		copy(loner, basePrefix)
+		// Each loner diverges at a different depth
+		// Loner i diverges at byte 4+i with value 0x00
+		for j := 4; j < 4+i; j++ {
+			loner[j] = 0xFF // Shared with sub-branch up to this point
+		}
+		loner[4+i] = 0x00 // Diverges here
+		rand.Read(loner[5+i:])
+		loners[i] = loner
+	}
+
+	// Final keys share the longest prefix and diverge at the end
+	key1 := make([]byte, 64)
+	copy(key1, basePrefix)
+	for i := 4; i < 32; i++ {
+		key1[i] = 0xFF
+	}
+	key1[32] = 0x11
+	rand.Read(key1[33:])
+
+	key2 := make([]byte, 64)
+	copy(key2, key1)
+	key2[32] = 0x22
+	rand.Read(key2[33:])
+
+	// Insert all keys
+	for i, loner := range loners {
+		if err := tree.Insert(nil, loner, loner, nil, big.NewInt(1)); err != nil {
+			t.Fatalf("Failed to insert loner %d: %v", i, err)
+		}
+	}
+	if err := tree.Insert(nil, key1, key1, nil, big.NewInt(1)); err != nil {
+		t.Fatalf("Failed to insert key1: %v", err)
+	}
+	if err := tree.Insert(nil, key2, key2, nil, big.NewInt(1)); err != nil {
+		t.Fatalf("Failed to insert key2: %v", err)
+	}
+
+	initialRoot := tree.Commit(false)
+	leaves, depth := tree.GetMetadata()
+	t.Logf("Initial tree: %d leaves, depth %d", leaves, depth)
+
+	// Delete loners from outermost to innermost (reverse order)
+	// Each deletion should trigger branch promotion
+	for i := 0; i < numLoners; i++ {
+		if err := tree.Delete(nil, loners[i]); err != nil {
+			t.Fatalf("Failed to delete loner %d: %v", i, err)
+		}
+
+		// After each deletion, verify remaining keys are accessible
+		if _, err := tree.Get(key1); err != nil {
+			t.Fatalf("Key1 not accessible after deleting loner %d: %v", i, err)
+		}
+		if _, err := tree.Get(key2); err != nil {
+			t.Fatalf("Key2 not accessible after deleting loner %d: %v", i, err)
+		}
+
+		// Commit and check structure
+		root := tree.Commit(false)
+		t.Logf("After deleting loner %d, root: %x", i, root[:8])
+	}
+
+	finalRoot := tree.Commit(false)
+	if bytes.Equal(initialRoot, finalRoot) {
+		t.Fatalf("Root should have changed after deletions")
+	}
+
+	// Load fresh tree from storage
+	tree2 := &crypto.LazyVectorCommitmentTree{
+		InclusionProver: bls48581.NewKZGInclusionProver(l),
+		Store:           s,
+		SetType:         "vertex",
+		PhaseType:       "deep",
+		ShardKey:        crypto.ShardKey{},
+	}
+
+	rootNode, err := s.GetNodeByPath("vertex", "deep", crypto.ShardKey{}, []int{})
+	if err != nil {
+		t.Fatalf("Failed to load root: %v", err)
+	}
+	tree2.Root = rootNode
+
+	// Verify keys accessible from fresh tree
+	if _, err := tree2.Get(key1); err != nil {
+		t.Fatalf("Key1 not found in fresh tree: %v", err)
+	}
+	if _, err := tree2.Get(key2); err != nil {
+		t.Fatalf("Key2 not found in fresh tree: %v", err)
+	}
+
+	// Verify roots match
+	freshRoot := tree2.Commit(false)
+	if !bytes.Equal(finalRoot, freshRoot) {
+		t.Fatalf("Root mismatch after deep nesting promotion\n"+
+			"Original: %x\n"+
+			"Fresh:    %x", finalRoot, freshRoot)
+	}
+
+	// Compare with scratch tree
+	tree3 := &crypto.LazyVectorCommitmentTree{
+		InclusionProver: bls48581.NewKZGInclusionProver(l),
+		Store:           s,
+		SetType:         "vertex",
+		PhaseType:       "deepscratch",
+		ShardKey:        crypto.ShardKey{},
+	}
+	tree3.Insert(nil, key1, key1, nil, big.NewInt(1))
+	tree3.Insert(nil, key2, key2, nil, big.NewInt(1))
+
+	scratchRoot := tree3.Commit(false)
+	if !bytes.Equal(finalRoot, scratchRoot) {
+		t.Fatalf("Root mismatch with scratch tree\n"+
+			"After deletes: %x\n"+
+			"From scratch:  %x", finalRoot, scratchRoot)
+	}
+
+	t.Log("Deep nesting branch promotion test passed")
+}
+
+// TestBranchPromotionPathIndexCorruption specifically tests if the path index
+// is corrupted when a branch is promoted during delete. This test exercises the
+// scenario where a non-root branch is promoted and then accessed via path lookup.
+//
+// The bug hypothesis: When a branch is promoted (becomes the only child and takes
+// its parent's place), the code updates childBranch.Prefix but NOT childBranch.FullPrefix.
+// When InsertNode is called for a branch, it uses node.FullPrefix (not the path param)
+// to store the path index. This means the path index points to the wrong location.
+func TestBranchPromotionPathIndexCorruption(t *testing.T) {
+	bls48581.Init()
+	l, _ := zap.NewProduction()
+	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/pathidx"}, 0)
+	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+
+	// Create initial tree
+	tree := &crypto.LazyVectorCommitmentTree{
+		InclusionProver: bls48581.NewKZGInclusionProver(l),
+		Store:           s,
+		SetType:         "vertex",
+		PhaseType:       "pathidx",
+		ShardKey:        crypto.ShardKey{},
+	}
+
+	// Structure designed to create a specific path index scenario:
+	//
+	//        Root Branch (FullPrefix=[])
+	//          /       \
+	//    Loner(0x10)   SubBranch(0x20) (FullPrefix=[2,0])
+	//                    /        \
+	//                 Key1       Key2
+	//
+	// After deleting Loner, SubBranch gets promoted:
+	// - Its Prefix becomes merged with root's prefix
+	// - But FullPrefix stays [2,0] (the bug)
+	// - Path index is stored at pathFn([2,0]) not pathFn([])
+	//
+	// If we then close the tree and try to load by path [], we won't find it
+	// (or we'll find at wrong location)
+
+	// Keys designed to create the structure above
+	// Loner: starts with 0x10 (nibbles: 1, 0)
+	lonerKey := make([]byte, 64)
+	lonerKey[0] = 0x10
+	rand.Read(lonerKey[1:])
+
+	// SubBranch keys: start with 0x20 (nibbles: 2, 0)
+	// Key1 and Key2 diverge at byte 10
+	key1 := make([]byte, 64)
+	key1[0] = 0x20
+	for i := 1; i < 10; i++ {
+		key1[i] = 0xAA // Common prefix
+	}
+	key1[10] = 0x11 // Divergence point
+	rand.Read(key1[11:])
+
+	key2 := make([]byte, 64)
+	copy(key2, key1[:10])
+	key2[10] = 0xFF // Different divergence
+	rand.Read(key2[11:])
+
+	// Insert all keys
+	if err := tree.Insert(nil, lonerKey, lonerKey, nil, big.NewInt(1)); err != nil {
+		t.Fatalf("Failed to insert loner: %v", err)
+	}
+	if err := tree.Insert(nil, key1, key1, nil, big.NewInt(1)); err != nil {
+		t.Fatalf("Failed to insert key1: %v", err)
+	}
+	if err := tree.Insert(nil, key2, key2, nil, big.NewInt(1)); err != nil {
+		t.Fatalf("Failed to insert key2: %v", err)
+	}
+
+	// Commit to persist
+	_ = tree.Commit(false)
+
+	// Log the structure before deletion
+	if branch, ok := tree.Root.(*crypto.LazyVectorCommitmentBranchNode); ok {
+		t.Logf("Root before delete: Prefix=%v, FullPrefix=%v", branch.Prefix, branch.FullPrefix)
+		for i, child := range branch.Children {
+			if child != nil {
+				switch c := child.(type) {
+				case *crypto.LazyVectorCommitmentBranchNode:
+					t.Logf("  Child[%d] Branch: Prefix=%v, FullPrefix=%v", i, c.Prefix, c.FullPrefix)
+				case *crypto.LazyVectorCommitmentLeafNode:
+					t.Logf("  Child[%d] Leaf: Key=%x...", i, c.Key[:4])
+				}
+			}
+		}
+	}
+
+	// Delete loner - triggers promotion of SubBranch to root
+	if err := tree.Delete(nil, lonerKey); err != nil {
+		t.Fatalf("Failed to delete loner: %v", err)
+	}
+
+	// Commit after delete to persist changes
+	rootAfterDelete := tree.Commit(false)
+	t.Logf("Root after delete: %x", rootAfterDelete[:16])
+
+	// Log the structure after deletion
+	if branch, ok := tree.Root.(*crypto.LazyVectorCommitmentBranchNode); ok {
+		t.Logf("Root after delete: Prefix=%v, FullPrefix=%v", branch.Prefix, branch.FullPrefix)
+		// THE BUG: If FullPrefix is not updated, it still shows the old path [2,0] or similar
+		// but the node is now at the root (should be [])
+	}
+
+	// Clear the in-memory tree completely
+	tree.Root = nil
+	tree = nil
+
+	// Create a completely fresh tree instance (simulating restart)
+	tree2 := &crypto.LazyVectorCommitmentTree{
+		InclusionProver: bls48581.NewKZGInclusionProver(l),
+		Store:           s,
+		SetType:         "vertex",
+		PhaseType:       "pathidx",
+		ShardKey:        crypto.ShardKey{},
+	}
+
+	// Try to load root by path [] - this uses the path index
+	t.Log("Attempting to load root from storage via path lookup...")
+	rootNode, err := s.GetNodeByPath("vertex", "pathidx", crypto.ShardKey{}, []int{})
+	if err != nil {
+		t.Logf("ERROR: Failed to load root from storage: %v", err)
+		t.Log("This confirms the FullPrefix bug - path index is at wrong location!")
+		// The bug is confirmed if we can't load the root
+		t.FailNow()
+	}
+
+	tree2.Root = rootNode
+
+	// If we got here, check if the loaded root has correct FullPrefix
+	if branch, ok := rootNode.(*crypto.LazyVectorCommitmentBranchNode); ok {
+		t.Logf("Loaded root: Prefix=%v, FullPrefix=%v", branch.Prefix, branch.FullPrefix)
+		if len(branch.FullPrefix) != 0 {
+			t.Logf("BUG DETECTED: Root should have FullPrefix=[] but has %v", branch.FullPrefix)
+			// Don't fail here yet, let's see if it affects functionality
+		}
+	}
+
+	// Try to get the keys from the fresh tree
+	val1, err := tree2.Get(key1)
+	if err != nil {
+		t.Fatalf("Failed to get key1 from fresh tree: %v", err)
+	}
+	if !bytes.Equal(val1, key1) {
+		t.Fatalf("Key1 value corrupted")
+	}
+
+	val2, err := tree2.Get(key2)
+	if err != nil {
+		t.Fatalf("Failed to get key2 from fresh tree: %v", err)
+	}
+	if !bytes.Equal(val2, key2) {
+		t.Fatalf("Key2 value corrupted")
+	}
+
+	// Verify commitment matches
+	freshRoot := tree2.Commit(false)
+	t.Logf("Fresh tree root: %x", freshRoot[:16])
+
+	if !bytes.Equal(rootAfterDelete, freshRoot) {
+		t.Fatalf("Root commitment mismatch!\n"+
+			"After delete: %x\n"+
+			"Fresh load:   %x", rootAfterDelete, freshRoot)
+	}
+
+	t.Log("Test passed - branch promotion path index is working correctly")
+}
+
 func TestNonLazyProveMultipleVerify(t *testing.T) {
 	l, _ := zap.NewProduction()
 	prover := bls48581.NewKZGInclusionProver(l)

@@ -122,6 +122,7 @@ const (
 	VERTEX_TOMBSTONE                          = 0xF1
 	HYPERGRAPH_COVERED_PREFIX                 = 0xFA
 	HYPERGRAPH_COMPLETE                       = 0xFB
+	HYPERGRAPH_GLOBAL_PROVER_RECALC_DONE      = 0xF9
 	VERTEX_ADDS_TREE_ROOT                     = 0xFC
 	VERTEX_REMOVES_TREE_ROOT                  = 0xFD
 	HYPEREDGE_ADDS_TREE_ROOT                  = 0xFE
