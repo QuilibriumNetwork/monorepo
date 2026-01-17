@@ -34,7 +34,7 @@ func (p *PebbleDB) DB() *pebble.DB {
 
 // pebbleMigrations contains ordered migration steps. New migrations append to
 // the end.
-var pebbleMigrations = []func(*pebble.Batch) error{
+var pebbleMigrations = []func(*pebble.Batch, *pebble.DB) error{
 	migration_2_1_0_4,
 	migration_2_1_0_5,
 	migration_2_1_0_8,
@@ -304,7 +304,7 @@ func (p *PebbleDB) migrate(logger *zap.Logger) error {
 			zap.Int("from_version", int(storedVersion)),
 			zap.Int("to_version", int(storedVersion+1)),
 		)
-		if err := pebbleMigrations[i](batch); err != nil {
+		if err := pebbleMigrations[i](batch, p.db); err != nil {
 			batch.Close()
 			logger.Error("migration failed", zap.Error(err))
 			return errors.Wrapf(err, "apply migration %d", i+1)
@@ -482,7 +482,7 @@ func rightAlign(data []byte, size int) []byte {
 
 // Resolves all the variations of store issues from any series of upgrade steps
 // in 2.1.0.1->2.1.0.3
-func migration_2_1_0_4(b *pebble.Batch) error {
+func migration_2_1_0_4(b *pebble.Batch, db *pebble.DB) error {
 	// batches don't use this but for backcompat the parameter is required
 	wo := &pebble.WriteOptions{}
 
@@ -583,138 +583,138 @@ func migration_2_1_0_4(b *pebble.Batch) error {
 	return nil
 }
 
-func migration_2_1_0_5(b *pebble.Batch) error {
+func migration_2_1_0_5(b *pebble.Batch, db *pebble.DB) error {
 	// We just re-run it again
-	return migration_2_1_0_4(b)
+	return migration_2_1_0_4(b, db)
 }
 
-func migration_2_1_0_8(b *pebble.Batch) error {
+func migration_2_1_0_8(b *pebble.Batch, db *pebble.DB) error {
 	// these migration entries exist solely to advance migration number so all
 	// nodes are consistent
 	return nil
 }
 
-func migration_2_1_0_81(b *pebble.Batch) error {
+func migration_2_1_0_81(b *pebble.Batch, db *pebble.DB) error {
 	// these migration entries exist solely to advance migration number so all
 	// nodes are consistent
 	return nil
 }
 
-func migration_2_1_0_10(b *pebble.Batch) error {
+func migration_2_1_0_10(b *pebble.Batch, db *pebble.DB) error {
 	// these migration entries exist solely to advance migration number so all
 	// nodes are consistent
 	return nil
 }
 
-func migration_2_1_0_11(b *pebble.Batch) error {
+func migration_2_1_0_11(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_14(b *pebble.Batch) error {
+func migration_2_1_0_14(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_141(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_141(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_14(b, db)
 }
 
-func migration_2_1_0_142(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_142(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_14(b, db)
 }
 
-func migration_2_1_0_143(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_143(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_14(b, db)
 }
 
-func migration_2_1_0_144(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_144(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_14(b, db)
 }
 
-func migration_2_1_0_145(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_145(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_14(b, db)
 }
 
-func migration_2_1_0_146(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_146(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_14(b, db)
 }
 
-func migration_2_1_0_147(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_147(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_14(b, db)
 }
 
-func migration_2_1_0_148(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_148(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_14(b, db)
 }
 
-func migration_2_1_0_149(b *pebble.Batch) error {
+func migration_2_1_0_149(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_1410(b *pebble.Batch) error {
-	return migration_2_1_0_149(b)
+func migration_2_1_0_1410(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_149(b, db)
 }
 
-func migration_2_1_0_1411(b *pebble.Batch) error {
-	return migration_2_1_0_149(b)
+func migration_2_1_0_1411(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_149(b, db)
 }
 
-func migration_2_1_0_15(b *pebble.Batch) error {
+func migration_2_1_0_15(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_151(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_151(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_15(b, db)
 }
 
-func migration_2_1_0_152(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_152(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_15(b, db)
 }
 
-func migration_2_1_0_153(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_153(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_15(b, db)
 }
 
-func migration_2_1_0_154(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_154(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_15(b, db)
 }
 
-func migration_2_1_0_155(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_155(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_15(b, db)
 }
 
-func migration_2_1_0_156(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_156(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_15(b, db)
 }
 
-func migration_2_1_0_157(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_157(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_15(b, db)
 }
 
-func migration_2_1_0_158(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_158(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_15(b, db)
 }
 
-func migration_2_1_0_159(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_159(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_15(b, db)
 }
 
-func migration_2_1_0_17(b *pebble.Batch) error {
+func migration_2_1_0_17(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_171(b *pebble.Batch) error {
+func migration_2_1_0_171(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_172(b *pebble.Batch) error {
+func migration_2_1_0_172(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_173(b *pebble.Batch) error {
+func migration_2_1_0_173(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_18(b *pebble.Batch) error {
+func migration_2_1_0_18(b *pebble.Batch, db *pebble.DB) error {
 	// Global shard key: L1={0,0,0}, L2=0xff*32
 	globalShardKey := tries.ShardKey{
 		L1: [3]byte{},
@@ -795,69 +795,69 @@ func migration_2_1_0_18(b *pebble.Batch) error {
 	return nil
 }
 
-func migration_2_1_0_181(b *pebble.Batch) error {
-	return migration_2_1_0_18(b)
+func migration_2_1_0_181(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_18(b, db)
 }
 
-func migration_2_1_0_182(b *pebble.Batch) error {
+func migration_2_1_0_182(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_183(b *pebble.Batch) error {
+func migration_2_1_0_183(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_184(b *pebble.Batch) error {
+func migration_2_1_0_184(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_185(b *pebble.Batch) error {
+func migration_2_1_0_185(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_186(b *pebble.Batch) error {
+func migration_2_1_0_186(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_187(b *pebble.Batch) error {
+func migration_2_1_0_187(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_188(b *pebble.Batch) error {
+func migration_2_1_0_188(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_189(b *pebble.Batch) error {
+func migration_2_1_0_189(b *pebble.Batch, db *pebble.DB) error {
 	return nil
 }
 
-func migration_2_1_0_1810(b *pebble.Batch) error {
-	return migration_2_1_0_189(b)
+func migration_2_1_0_1810(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_189(b, db)
 }
 
-func migration_2_1_0_1811(b *pebble.Batch) error {
-	return migration_2_1_0_189(b)
+func migration_2_1_0_1811(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_189(b, db)
 }
 
-func migration_2_1_0_1812(b *pebble.Batch) error {
-	return migration_2_1_0_189(b)
+func migration_2_1_0_1812(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_189(b, db)
 }
 
-func migration_2_1_0_1813(b *pebble.Batch) error {
-	return migration_2_1_0_189(b)
+func migration_2_1_0_1813(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_189(b, db)
 }
 
-func migration_2_1_0_1814(b *pebble.Batch) error {
-	return migration_2_1_0_189(b)
+func migration_2_1_0_1814(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_189(b, db)
 }
 
-func migration_2_1_0_1815(b *pebble.Batch) error {
-	return migration_2_1_0_189(b)
+func migration_2_1_0_1815(b *pebble.Batch, db *pebble.DB) error {
+	return migration_2_1_0_189(b, db)
 }
 
 // migration_2_1_0_1816 recalculates commitments for the global prover trees
 // to fix potential corruption from earlier versions of sync.
-func migration_2_1_0_1816(b *pebble.Batch) error {
+func migration_2_1_0_1816(b *pebble.Batch, db *pebble.DB) error {
 	// Check if already done
 	doneKey := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_GLOBAL_PROVER_RECALC_DONE}
 	if _, closer, err := b.Get(doneKey); err == nil {
@@ -879,11 +879,8 @@ func migration_2_1_0_1816(b *pebble.Batch) error {
 	// Initialize prover (logger can be nil for migrations)
 	prover := bls48581.NewKZGInclusionProver(nil)
 
-	// Create a batch-backed KVDB for the hypergraph store
-	batchDB := &pebbleBatchDB{b: b}
-
 	// Create hypergraph store using the batch
-	hgStore := NewPebbleHypergraphStore(nil, batchDB, nil, nil, prover)
+	hgStore := NewPebbleHypergraphStore(nil, &PebbleDB{db: db}, nil, nil, prover)
 
 	// Load and recalculate each tree for the global prover shard
 	treeTypes := []struct {
