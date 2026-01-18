@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/big"
@@ -3157,6 +3160,223 @@ waitLoop:
 
 	t.Logf("Hypersync complete: client synced %d prover vertices", clientLeafCount)
 	assert.Greater(t, clientLeafCount, 0, "should have synced at least some prover vertices")
+
+	// Verify the sync-based repair approach:
+	// 1. Create a second in-memory hypergraph
+	// 2. Sync from clientHG to the second hypergraph
+	// 3. Wipe the tree data from clientDB
+	// 4. Sync back from the second hypergraph to clientHG
+	// 5. Verify the root still matches
+	t.Log("Verifying sync-based repair approach...")
+
+	// Create second in-memory hypergraph
+	repairDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_mainnet_repair/store"}, 0)
+	defer repairDB.Close()
+
+	repairStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_mainnet_repair/store"},
+		repairDB,
+		logger,
+		enc,
+		inclusionProver,
+	)
+
+	repairHG := hgcrdt.NewHypergraph(
+		logger.With(zap.String("side", "repair")),
+		repairStore,
+		inclusionProver,
+		[]int{},
+		&tests.Nopthenticator{},
+		200,
+	)
+
+	// Get current root from clientHG before repair
+	clientRootBeforeRepair := clientHG.GetVertexAddsSet(proverShardKey).GetTree().Commit(false)
+	t.Logf("Client root before repair: %x", clientRootBeforeRepair)
+
+	// Publish snapshot on clientHG
+	clientHG.PublishSnapshot(clientRootBeforeRepair)
+
+	// Set up gRPC server backed by clientHG
+	const repairBufSize = 1 << 20
+	clientLis := bufconn.Listen(repairBufSize)
+	clientGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(clientGRPCServer, clientHG)
+	go func() { _ = clientGRPCServer.Serve(clientLis) }()
+
+	// Dial clientHG
+	clientDialer := func(context.Context, string) (net.Conn, error) {
+		return clientLis.Dial()
+	}
+	clientRepairConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(clientDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	require.NoError(t, err)
+
+	clientRepairClient := protobufs.NewHypergraphComparisonServiceClient(clientRepairConn)
+
+	// Sync from clientHG to repairHG for all phases
+	repairPhases := []protobufs.HypergraphPhaseSet{
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES,
+	}
+
+	t.Log("Syncing client -> repair hypergraph...")
+	for _, phase := range repairPhases {
+		stream, err := clientRepairClient.PerformSync(context.Background())
+		require.NoError(t, err)
+		_, err = repairHG.SyncFrom(stream, proverShardKey, phase, nil)
+		if err != nil {
+			t.Logf("Sync client->repair phase %v: %v", phase, err)
+		}
+		_ = stream.CloseSend()
+	}
+
+	// Verify repairHG has the data
+	repairRoot := repairHG.GetVertexAddsSet(proverShardKey).GetTree().Commit(false)
+	t.Logf("Repair hypergraph root after sync: %x", repairRoot)
+	assert.Equal(t, clientRootBeforeRepair, repairRoot, "repair HG should match client root")
+
+	// Stop client server before wiping
+	clientGRPCServer.Stop()
+	clientRepairConn.Close()
+
+	// Wipe tree data from clientDB for the prover shard
+	t.Log("Wiping tree data from client DB...")
+	treePrefixes := []byte{
+		store.VERTEX_ADDS_TREE_NODE,
+		store.VERTEX_REMOVES_TREE_NODE,
+		store.HYPEREDGE_ADDS_TREE_NODE,
+		store.HYPEREDGE_REMOVES_TREE_NODE,
+		store.VERTEX_ADDS_TREE_NODE_BY_PATH,
+		store.VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		store.HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		store.HYPEREDGE_REMOVES_TREE_NODE_BY_PATH,
+		store.VERTEX_ADDS_CHANGE_RECORD,
+		store.VERTEX_REMOVES_CHANGE_RECORD,
+		store.HYPEREDGE_ADDS_CHANGE_RECORD,
+		store.HYPEREDGE_REMOVES_CHANGE_RECORD,
+		store.VERTEX_ADDS_TREE_ROOT,
+		store.VERTEX_REMOVES_TREE_ROOT,
+		store.HYPEREDGE_ADDS_TREE_ROOT,
+		store.HYPEREDGE_REMOVES_TREE_ROOT,
+	}
+
+	shardKeyBytes := make([]byte, 0, len(proverShardKey.L1)+len(proverShardKey.L2))
+	shardKeyBytes = append(shardKeyBytes, proverShardKey.L1[:]...)
+	shardKeyBytes = append(shardKeyBytes, proverShardKey.L2[:]...)
+
+	for _, prefix := range treePrefixes {
+		start := append([]byte{store.HYPERGRAPH_SHARD, prefix}, shardKeyBytes...)
+		// Increment shard key for end bound
+		endShardKeyBytes := make([]byte, len(shardKeyBytes))
+		copy(endShardKeyBytes, shardKeyBytes)
+		// Since all bytes of L2 are 0xff, incrementing would overflow, so use next prefix
+		end := []byte{store.HYPERGRAPH_SHARD, prefix + 1}
+		if err := clientDB.DeleteRange(start, end); err != nil {
+			t.Logf("DeleteRange for prefix 0x%02x: %v", prefix, err)
+		}
+	}
+
+	// Reload clientHG after wipe
+	t.Log("Reloading client hypergraph after wipe...")
+	clientStore2 := store.NewPebbleHypergraphStore(
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_mainnet_client/store"},
+		clientDB,
+		logger,
+		enc,
+		inclusionProver,
+	)
+	clientHG2 := hgcrdt.NewHypergraph(
+		logger.With(zap.String("side", "mainnet-client-reloaded")),
+		clientStore2,
+		inclusionProver,
+		[]int{},
+		&tests.Nopthenticator{},
+		200,
+	)
+
+	// Verify tree is now empty/different
+	clientRootAfterWipe := clientHG2.GetVertexAddsSet(proverShardKey).GetTree().Commit(false)
+	t.Logf("Client root after wipe: %x (expected nil or different)", clientRootAfterWipe)
+
+	// Publish snapshot on repairHG for reverse sync
+	repairHG.PublishSnapshot(repairRoot)
+
+	// Set up gRPC server backed by repairHG
+	repairLis := bufconn.Listen(repairBufSize)
+	repairGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(repairGRPCServer, repairHG)
+	go func() { _ = repairGRPCServer.Serve(repairLis) }()
+	defer repairGRPCServer.Stop()
+
+	// Dial repairHG
+	repairDialer := func(context.Context, string) (net.Conn, error) {
+		return repairLis.Dial()
+	}
+	repairConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(repairDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	require.NoError(t, err)
+	defer repairConn.Close()
+
+	repairClient := protobufs.NewHypergraphComparisonServiceClient(repairConn)
+
+	// Sync from repairHG to clientHG2 for all phases
+	t.Log("Syncing repair -> client hypergraph...")
+	for _, phase := range repairPhases {
+		stream, err := repairClient.PerformSync(context.Background())
+		require.NoError(t, err)
+		_, err = clientHG2.SyncFrom(stream, proverShardKey, phase, nil)
+		if err != nil {
+			t.Logf("Sync repair->client phase %v: %v", phase, err)
+		}
+		_ = stream.CloseSend()
+	}
+
+	// Commit and verify root after repair
+	clientRootAfterRepair := clientHG2.GetVertexAddsSet(proverShardKey).GetTree().Commit(true)
+	t.Logf("Client root after repair: %x", clientRootAfterRepair)
+	t.Logf("Expected root from frame: %x", expectedRoot)
+
+	// Verify the root matches the original (before repair) - this confirms the round-trip works
+	assert.Equal(t, clientRootBeforeRepair, clientRootAfterRepair,
+		"root after sync repair should match root before repair")
+
+	// Note: The root may not match the frame's expected root if there was corruption,
+	// but it should at least match what we synced before the repair.
+	// The actual fix for the frame mismatch requires fixing the corruption at the source.
+	t.Logf("Sync-based repair verification complete.")
+	t.Logf("  Original client root: %x", clientRootBeforeRepair)
+	t.Logf("  Repaired client root: %x", clientRootAfterRepair)
+	t.Logf("  Frame expected root:  %x", expectedRoot)
+	if bytes.Equal(clientRootAfterRepair, expectedRoot) {
+		t.Log("SUCCESS: Repaired root matches frame expected root!")
+	} else {
+		t.Log("Note: Repaired root differs from frame expected root - corruption exists at source")
+	}
 }
 
 // TestHypergraphSyncWithPagination tests that syncing a large tree with >1000 leaves
@@ -3375,4 +3595,529 @@ func TestHypergraphSyncWithPagination(t *testing.T) {
 	// Verify roots match
 	assert.Equal(t, serverRoot, clientRoot, "client root should match server root after sync")
 	t.Log("Pagination test passed - client converged to server state")
+}
+
+// dumpHypergraphShardKeys dumps all database keys matching the global prover shard pattern.
+// This replicates the behavior of: dbscan -prefix 09 -search 000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+// Parameters:
+//   - t: testing context for logging
+//   - db: the PebbleDB to inspect
+//   - label: a label to identify the database in output (e.g., "client", "server")
+func dumpHypergraphShardKeys(t *testing.T, db *store.PebbleDB, label string) {
+	// Prefix 0x09 = HYPERGRAPH_SHARD
+	prefixFilter := []byte{store.HYPERGRAPH_SHARD}
+
+	// Global prover shard key: L1=[0x00,0x00,0x00], L2=[0xff * 32]
+	// As hex: 000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff (35 bytes)
+	keySearchPattern, err := hex.DecodeString("000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	if err != nil {
+		t.Logf("[%s] Failed to decode search pattern: %v", label, err)
+		return
+	}
+
+	// Set iteration bounds based on prefix
+	lowerBound := prefixFilter
+	upperBound := []byte{store.HYPERGRAPH_SHARD + 1}
+
+	iter, err := db.NewIter(lowerBound, upperBound)
+	if err != nil {
+		t.Logf("[%s] Failed to create iterator: %v", label, err)
+		return
+	}
+	defer iter.Close()
+
+	t.Logf("=== Database dump for %s (prefix=09, search=global prover shard) ===", label)
+
+	count := 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		value := iter.Value()
+
+		// Apply prefix filter
+		if !bytes.HasPrefix(key, prefixFilter) {
+			continue
+		}
+
+		// Apply key search pattern (must contain the global prover shard key bytes)
+		if !bytes.Contains(key, keySearchPattern) {
+			continue
+		}
+
+		count++
+
+		// Decode and display the key/value
+		semantic := describeHypergraphKeyForTest(key)
+		decoded := decodeHypergraphValueForTest(key, value)
+
+		t.Logf("[%s] key: %s", label, hex.EncodeToString(key))
+		t.Logf("[%s] semantic: %s", label, semantic)
+		t.Logf("[%s] value:\n%s\n", label, indentForTest(decoded))
+	}
+
+	t.Logf("=== End dump for %s: %d keys matched ===", label, count)
+}
+
+// describeHypergraphKeyForTest provides semantic description of hypergraph keys.
+// Mirrors the logic from dbscan/main.go describeHypergraphKey.
+func describeHypergraphKeyForTest(key []byte) string {
+	if len(key) < 2 {
+		return "hypergraph: invalid key length"
+	}
+
+	// Check for shard commit keys (frame-based)
+	if len(key) >= 10 {
+		switch key[9] {
+		case store.HYPERGRAPH_VERTEX_ADDS_SHARD_COMMIT,
+			store.HYPERGRAPH_VERTEX_REMOVES_SHARD_COMMIT,
+			store.HYPERGRAPH_HYPEREDGE_ADDS_SHARD_COMMIT,
+			store.HYPERGRAPH_HYPEREDGE_REMOVES_SHARD_COMMIT:
+			frame := binary.BigEndian.Uint64(key[1:9])
+			shard := key[10:]
+			var setPhase string
+			switch key[9] {
+			case store.HYPERGRAPH_VERTEX_ADDS_SHARD_COMMIT:
+				setPhase = "vertex-adds"
+			case store.HYPERGRAPH_VERTEX_REMOVES_SHARD_COMMIT:
+				setPhase = "vertex-removes"
+			case store.HYPERGRAPH_HYPEREDGE_ADDS_SHARD_COMMIT:
+				setPhase = "hyperedge-adds"
+			case store.HYPERGRAPH_HYPEREDGE_REMOVES_SHARD_COMMIT:
+				setPhase = "hyperedge-removes"
+			}
+			return fmt.Sprintf(
+				"hypergraph shard commit %s frame=%d shard=%s",
+				setPhase,
+				frame,
+				shortHexForTest(shard),
+			)
+		}
+	}
+
+	sub := key[1]
+	payload := key[2:]
+	switch sub {
+	case store.VERTEX_DATA:
+		return fmt.Sprintf("hypergraph vertex data id=%s", shortHexForTest(payload))
+	case store.VERTEX_TOMBSTONE:
+		return fmt.Sprintf("hypergraph vertex tombstone id=%s", shortHexForTest(payload))
+	case store.VERTEX_ADDS_TREE_NODE,
+		store.VERTEX_REMOVES_TREE_NODE,
+		store.HYPEREDGE_ADDS_TREE_NODE,
+		store.HYPEREDGE_REMOVES_TREE_NODE:
+		if len(payload) >= 35 {
+			l1 := payload[:3]
+			l2 := payload[3:35]
+			node := payload[35:]
+			return fmt.Sprintf(
+				"%s tree node shard=[%s|%s] node=%s",
+				describeHypergraphTreeTypeForTest(sub),
+				shortHexForTest(l1),
+				shortHexForTest(l2),
+				shortHexForTest(node),
+			)
+		}
+		return fmt.Sprintf(
+			"%s tree node (invalid length)",
+			describeHypergraphTreeTypeForTest(sub),
+		)
+	case store.VERTEX_ADDS_TREE_NODE_BY_PATH,
+		store.VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		store.HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		store.HYPEREDGE_REMOVES_TREE_NODE_BY_PATH:
+		if len(payload) >= 35 {
+			l1 := payload[:3]
+			l2 := payload[3:35]
+			path := parseUint64PathForTest(payload[35:])
+			return fmt.Sprintf(
+				"%s path shard=[%s|%s] path=%v",
+				describeHypergraphTreeTypeForTest(sub),
+				shortHexForTest(l1),
+				shortHexForTest(l2),
+				path,
+			)
+		}
+		return fmt.Sprintf(
+			"%s path (invalid length)",
+			describeHypergraphTreeTypeForTest(sub),
+		)
+	case store.VERTEX_ADDS_TREE_ROOT,
+		store.VERTEX_REMOVES_TREE_ROOT,
+		store.HYPEREDGE_ADDS_TREE_ROOT,
+		store.HYPEREDGE_REMOVES_TREE_ROOT:
+		if len(payload) >= 35 {
+			l1 := payload[:3]
+			l2 := payload[3:35]
+			return fmt.Sprintf(
+				"%s tree root shard=[%s|%s]",
+				describeHypergraphTreeTypeForTest(sub),
+				shortHexForTest(l1),
+				shortHexForTest(l2),
+			)
+		}
+		return fmt.Sprintf(
+			"%s tree root (invalid length)",
+			describeHypergraphTreeTypeForTest(sub),
+		)
+	case store.HYPERGRAPH_COVERED_PREFIX:
+		return "hypergraph covered prefix metadata"
+	case store.HYPERGRAPH_COMPLETE:
+		return "hypergraph completeness flag"
+	default:
+		return fmt.Sprintf(
+			"hypergraph unknown subtype 0x%02x raw=%s",
+			sub,
+			shortHexForTest(payload),
+		)
+	}
+}
+
+func describeHypergraphTreeTypeForTest(kind byte) string {
+	switch kind {
+	case store.VERTEX_ADDS_TREE_NODE,
+		store.VERTEX_ADDS_TREE_NODE_BY_PATH,
+		store.VERTEX_ADDS_TREE_ROOT:
+		return "vertex adds"
+	case store.VERTEX_REMOVES_TREE_NODE,
+		store.VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		store.VERTEX_REMOVES_TREE_ROOT:
+		return "vertex removes"
+	case store.HYPEREDGE_ADDS_TREE_NODE,
+		store.HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		store.HYPEREDGE_ADDS_TREE_ROOT:
+		return "hyperedge adds"
+	case store.HYPEREDGE_REMOVES_TREE_NODE,
+		store.HYPEREDGE_REMOVES_TREE_NODE_BY_PATH,
+		store.HYPEREDGE_REMOVES_TREE_ROOT:
+		return "hyperedge removes"
+	default:
+		return "hypergraph"
+	}
+}
+
+// decodeHypergraphValueForTest decodes hypergraph values for display.
+// Mirrors the logic from dbscan/main.go decodeHypergraphValue.
+func decodeHypergraphValueForTest(key []byte, value []byte) string {
+	if len(value) == 0 {
+		return "<empty>"
+	}
+
+	sub := byte(0)
+	if len(key) > 1 {
+		sub = key[1]
+	}
+
+	switch sub {
+	case store.VERTEX_DATA:
+		return summarizeVectorCommitmentTreeForTest(key, value)
+	case store.VERTEX_TOMBSTONE:
+		return shortHexForTest(value)
+	case store.VERTEX_ADDS_TREE_NODE,
+		store.VERTEX_REMOVES_TREE_NODE,
+		store.HYPEREDGE_ADDS_TREE_NODE,
+		store.HYPEREDGE_REMOVES_TREE_NODE,
+		store.VERTEX_ADDS_TREE_NODE_BY_PATH,
+		store.VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		store.HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		store.HYPEREDGE_REMOVES_TREE_NODE_BY_PATH,
+		store.VERTEX_ADDS_TREE_ROOT,
+		store.VERTEX_REMOVES_TREE_ROOT,
+		store.HYPEREDGE_ADDS_TREE_ROOT,
+		store.HYPEREDGE_REMOVES_TREE_ROOT:
+		return summarizeHypergraphTreeNodeForTest(value)
+	case store.HYPERGRAPH_COVERED_PREFIX:
+		return decodeCoveredPrefixForTest(value)
+	case store.HYPERGRAPH_COMPLETE:
+		if len(value) == 0 {
+			return "complete=false"
+		}
+		return fmt.Sprintf("complete=%t", value[len(value)-1] != 0)
+	default:
+		return shortHexForTest(value)
+	}
+}
+
+func summarizeVectorCommitmentTreeForTest(key []byte, value []byte) string {
+	tree, err := tries.DeserializeNonLazyTree(value)
+	if err != nil {
+		return fmt.Sprintf(
+			"vector_commitment_tree decode_error=%v raw=%s",
+			err,
+			shortHexForTest(value),
+		)
+	}
+
+	sum := sha256.Sum256(value)
+	summary := map[string]any{
+		"size_bytes": len(value),
+		"sha256":     shortHexForTest(sum[:]),
+	}
+
+	// Check if this is a global intrinsic vertex (domain = 0xff*32)
+	globalIntrinsicAddress := bytes.Repeat([]byte{0xff}, 32)
+	if len(key) >= 66 {
+		domain := key[2:34]
+		address := key[34:66]
+
+		if bytes.Equal(domain, globalIntrinsicAddress) {
+			// This is a global intrinsic vertex - decode the fields
+			globalData := decodeGlobalIntrinsicVertexForTest(tree, address)
+			if globalData != nil {
+				for k, v := range globalData {
+					summary[k] = v
+				}
+			}
+		}
+	}
+
+	jsonBytes, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("vector_commitment_tree size_bytes=%d", len(value))
+	}
+
+	return string(jsonBytes)
+}
+
+func decodeGlobalIntrinsicVertexForTest(tree *tries.VectorCommitmentTree, address []byte) map[string]any {
+	result := make(map[string]any)
+	result["vertex_address"] = hex.EncodeToString(address)
+
+	// Check order 0 field
+	order0Value, err := tree.Get([]byte{0x00})
+	if err != nil || len(order0Value) == 0 {
+		result["type"] = "unknown (no order 0 field)"
+		return result
+	}
+
+	switch len(order0Value) {
+	case 585:
+		// Prover: PublicKey is 585 bytes
+		result["type"] = "prover:Prover"
+		result["public_key"] = shortHexForTest(order0Value)
+		decodeProverFieldsForTest(tree, result)
+	case 32:
+		// Could be Allocation (Prover reference) or Reward (DelegateAddress)
+		joinFrame, _ := tree.Get([]byte{0x10})
+		if len(joinFrame) == 8 {
+			result["type"] = "allocation:ProverAllocation"
+			result["prover_reference"] = hex.EncodeToString(order0Value)
+			decodeAllocationFieldsForTest(tree, result)
+		} else {
+			result["type"] = "reward:ProverReward"
+			result["delegate_address"] = hex.EncodeToString(order0Value)
+		}
+	default:
+		result["type"] = "unknown"
+		result["order_0_size"] = len(order0Value)
+	}
+
+	return result
+}
+
+func decodeProverFieldsForTest(tree *tries.VectorCommitmentTree, result map[string]any) {
+	if status, err := tree.Get([]byte{0x04}); err == nil && len(status) == 1 {
+		result["status"] = decodeProverStatusForTest(status[0])
+		result["status_raw"] = status[0]
+	}
+	if storage, err := tree.Get([]byte{0x08}); err == nil && len(storage) == 8 {
+		result["available_storage"] = binary.BigEndian.Uint64(storage)
+	}
+	if seniority, err := tree.Get([]byte{0x0c}); err == nil && len(seniority) == 8 {
+		result["seniority"] = binary.BigEndian.Uint64(seniority)
+	}
+	if kickFrame, err := tree.Get([]byte{0x10}); err == nil && len(kickFrame) == 8 {
+		result["kick_frame_number"] = binary.BigEndian.Uint64(kickFrame)
+	}
+}
+
+func decodeAllocationFieldsForTest(tree *tries.VectorCommitmentTree, result map[string]any) {
+	if status, err := tree.Get([]byte{0x04}); err == nil && len(status) == 1 {
+		result["status"] = decodeProverStatusForTest(status[0])
+		result["status_raw"] = status[0]
+	}
+	if confirmFilter, err := tree.Get([]byte{0x08}); err == nil && len(confirmFilter) > 0 {
+		result["confirmation_filter"] = hex.EncodeToString(confirmFilter)
+		if bytes.Equal(confirmFilter, make([]byte, len(confirmFilter))) {
+			result["is_global_prover"] = true
+		}
+	} else {
+		result["is_global_prover"] = true
+	}
+	if joinFrame, err := tree.Get([]byte{0x10}); err == nil && len(joinFrame) == 8 {
+		result["join_frame_number"] = binary.BigEndian.Uint64(joinFrame)
+	}
+	if leaveFrame, err := tree.Get([]byte{0x14}); err == nil && len(leaveFrame) == 8 {
+		result["leave_frame_number"] = binary.BigEndian.Uint64(leaveFrame)
+	}
+	if lastActive, err := tree.Get([]byte{0x34}); err == nil && len(lastActive) == 8 {
+		result["last_active_frame_number"] = binary.BigEndian.Uint64(lastActive)
+	}
+}
+
+func decodeProverStatusForTest(status byte) string {
+	switch status {
+	case 0:
+		return "Joining"
+	case 1:
+		return "Active"
+	case 2:
+		return "Paused"
+	case 3:
+		return "Leaving"
+	case 4:
+		return "Rejected"
+	case 5:
+		return "Kicked"
+	default:
+		return fmt.Sprintf("Unknown(%d)", status)
+	}
+}
+
+func summarizeHypergraphTreeNodeForTest(value []byte) string {
+	if len(value) == 0 {
+		return "hypergraph_tree_node <empty>"
+	}
+
+	hash := sha256.Sum256(value)
+	hashStr := shortHexForTest(hash[:])
+
+	reader := bytes.NewReader(value)
+	var nodeType byte
+	if err := binary.Read(reader, binary.BigEndian, &nodeType); err != nil {
+		return fmt.Sprintf("tree_node decode_error=%v sha256=%s", err, hashStr)
+	}
+
+	switch nodeType {
+	case tries.TypeNil:
+		return fmt.Sprintf("tree_nil sha256=%s", hashStr)
+	case tries.TypeLeaf:
+		leaf, err := tries.DeserializeLeafNode(nil, reader)
+		if err != nil {
+			return fmt.Sprintf("tree_leaf decode_error=%v sha256=%s", err, hashStr)
+		}
+
+		summary := map[string]any{
+			"type":         "leaf",
+			"key":          shortHexForTest(leaf.Key),
+			"value":        shortHexForTest(leaf.Value),
+			"hash_target":  shortHexForTest(leaf.HashTarget),
+			"commitment":   shortHexForTest(leaf.Commitment),
+			"bytes_sha256": hashStr,
+		}
+		if leaf.Size != nil {
+			summary["size"] = leaf.Size.String()
+		}
+
+		jsonBytes, err := json.MarshalIndent(summary, "", "  ")
+		if err != nil {
+			return fmt.Sprintf(
+				"tree_leaf key=%s sha256=%s",
+				shortHexForTest(leaf.Key),
+				hashStr,
+			)
+		}
+		return string(jsonBytes)
+	case tries.TypeBranch:
+		branch, err := tries.DeserializeBranchNode(nil, reader, true)
+		if err != nil {
+			return fmt.Sprintf("tree_branch decode_error=%v sha256=%s", err, hashStr)
+		}
+
+		childSummary := map[string]int{
+			"branch": 0,
+			"leaf":   0,
+			"nil":    0,
+		}
+		for _, child := range branch.Children {
+			switch child.(type) {
+			case *tries.LazyVectorCommitmentBranchNode:
+				childSummary["branch"]++
+			case *tries.LazyVectorCommitmentLeafNode:
+				childSummary["leaf"]++
+			default:
+				childSummary["nil"]++
+			}
+		}
+
+		summary := map[string]any{
+			"type":           "branch",
+			"prefix":         branch.Prefix,
+			"leaf_count":     branch.LeafCount,
+			"longest_branch": branch.LongestBranch,
+			"commitment":     shortHexForTest(branch.Commitment),
+			"children":       childSummary,
+			"bytes_sha256":   hashStr,
+		}
+		if branch.Size != nil {
+			summary["size"] = branch.Size.String()
+		}
+
+		jsonBytes, err := json.MarshalIndent(summary, "", "  ")
+		if err != nil {
+			return fmt.Sprintf(
+				"tree_branch prefix=%v leafs=%d sha256=%s",
+				branch.Prefix,
+				branch.LeafCount,
+				hashStr,
+			)
+		}
+		return string(jsonBytes)
+	default:
+		return fmt.Sprintf(
+			"tree_node type=0x%02x payload=%s sha256=%s",
+			nodeType,
+			shortHexForTest(value[1:]),
+			hashStr,
+		)
+	}
+}
+
+func decodeCoveredPrefixForTest(value []byte) string {
+	if len(value)%8 != 0 {
+		return shortHexForTest(value)
+	}
+
+	result := make([]int64, len(value)/8)
+	for i := range result {
+		result[i] = int64(binary.BigEndian.Uint64(value[i*8 : (i+1)*8]))
+	}
+
+	return fmt.Sprintf("covered_prefix=%v", result)
+}
+
+func shortHexForTest(b []byte) string {
+	if len(b) == 0 {
+		return "0x"
+	}
+	if len(b) <= 16 {
+		return "0x" + hex.EncodeToString(b)
+	}
+	return fmt.Sprintf(
+		"0x%s...%s(len=%d)",
+		hex.EncodeToString(b[:8]),
+		hex.EncodeToString(b[len(b)-8:]),
+		len(b),
+	)
+}
+
+func parseUint64PathForTest(b []byte) []uint64 {
+	if len(b)%8 != 0 {
+		return nil
+	}
+
+	out := make([]uint64, len(b)/8)
+	for i := range out {
+		out[i] = binary.BigEndian.Uint64(b[i*8 : (i+1)*8])
+	}
+	return out
+}
+
+func indentForTest(value string) string {
+	if value == "" {
+		return ""
+	}
+	lines := bytes.Split([]byte(value), []byte("\n"))
+	for i, line := range lines {
+		lines[i] = append([]byte("  "), line...)
+	}
+	return string(bytes.Join(lines, []byte("\n")))
 }

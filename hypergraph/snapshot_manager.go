@@ -277,23 +277,38 @@ func (m *snapshotManager) acquire(
 					handle.acquire()
 					return handle
 				}
-				// Generation exists but no snapshot for this shard yet - reject
-				m.logger.Warn(
-					"generation matches expected root but no snapshot exists, rejecting sync request",
+				// Generation exists but no snapshot for this shard yet.
+				// Only create if this is the latest generation (current DB state matches).
+				if gen != m.generations[0] {
+					m.logger.Warn(
+						"generation matches expected root but is not latest, cannot create snapshot",
+						zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+					)
+					return nil
+				}
+				// Fall through to create snapshot for latest generation
+				m.logger.Debug(
+					"creating snapshot for expected root (latest generation)",
 					zap.String("expected_root", hex.EncodeToString(expectedRoot)),
 				)
-				return nil
+				break
 			}
 		}
-		// No matching generation found - reject instead of falling back to latest
-		if m.logger != nil {
-			m.logger.Warn(
-				"no snapshot generation matches expected root, rejecting sync request",
-				zap.String("expected_root", hex.EncodeToString(expectedRoot)),
-				zap.String("latest_root", hex.EncodeToString(m.generations[0].root)),
-			)
+		// If we didn't find a matching generation at all, reject
+		if len(m.generations) == 0 || !bytes.Equal(m.generations[0].root, expectedRoot) {
+			if m.logger != nil {
+				latestRoot := ""
+				if len(m.generations) > 0 {
+					latestRoot = hex.EncodeToString(m.generations[0].root)
+				}
+				m.logger.Warn(
+					"no snapshot generation matches expected root, rejecting sync request",
+					zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+					zap.String("latest_root", latestRoot),
+				)
+			}
+			return nil
 		}
-		return nil
 	}
 
 	// Use the latest generation for new snapshots
