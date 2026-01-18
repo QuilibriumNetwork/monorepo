@@ -241,9 +241,19 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 			globalTimeReel,
 			r.server,
 		)
+		if err != nil {
+			return errors.Wrap(err, "respawn server")
+		}
+
 		r.ctx, r.cancel, _ = lifecycle.WithSignallerAndCancel(context.Background())
+		// Capture engine and ctx in local variables to avoid race with subsequent RespawnServer calls
+		engine := r.appConsensusEngine
+		ctx := r.ctx
 		go func() {
-			if err = r.appConsensusEngine.Start(r.ctx); err != nil {
+			if engine == nil {
+				return
+			}
+			if err = engine.Start(ctx); err != nil {
 				r.logger.Error("error while running", zap.Error(err))
 			}
 		}()
