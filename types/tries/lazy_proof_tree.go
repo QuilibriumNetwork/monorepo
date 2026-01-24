@@ -24,6 +24,12 @@ type ShardKey struct {
 	L2 [32]byte
 }
 
+// DBSnapshot represents a point-in-time snapshot of the database.
+// This is used to ensure consistency when creating shard snapshots.
+type DBSnapshot interface {
+	io.Closer
+}
+
 type ChangeRecord struct {
 	Key      []byte
 	OldValue *VectorCommitmentTree
@@ -551,6 +557,18 @@ type TreeBackingStore interface {
 	) ([]byte, error)
 	GetRootCommits(frameNumber uint64) (map[ShardKey][][]byte, error)
 	NewShardSnapshot(shardKey ShardKey) (TreeBackingStore, func(), error)
+	// NewDBSnapshot creates a point-in-time snapshot of the entire database.
+	// This is used to ensure consistency when creating shard snapshots - the
+	// returned DBSnapshot should be passed to NewShardSnapshotFromDBSnapshot.
+	// The caller must call Close() on the returned DBSnapshot when done.
+	NewDBSnapshot() (DBSnapshot, error)
+	// NewShardSnapshotFromDBSnapshot creates a shard snapshot from an existing
+	// database snapshot. This ensures the shard snapshot reflects the exact state
+	// at the time the DB snapshot was taken, avoiding race conditions.
+	NewShardSnapshotFromDBSnapshot(
+		shardKey ShardKey,
+		dbSnapshot DBSnapshot,
+	) (TreeBackingStore, func(), error)
 	// IterateRawLeaves returns an iterator over all leaf nodes for a given
 	// shard and phase set. This bypasses in-memory tree caching and reads
 	// directly from the database for raw sync operations.
@@ -2043,14 +2061,16 @@ func (t *LazyVectorCommitmentTree) Delete(
 
 				if childBranch, ok := lastChild.(*LazyVectorCommitmentBranchNode); ok {
 					// Merge this node's prefix with the child's prefix
-					// Note: We do NOT update FullPrefix because children are stored
-					// relative to the branch's FullPrefix, and they'd become unreachable
 					mergedPrefix := []int{}
 					mergedPrefix = append(mergedPrefix, n.Prefix...)
 					mergedPrefix = append(mergedPrefix, lastChildIndex)
 					mergedPrefix = append(mergedPrefix, childBranch.Prefix...)
 
 					childBranch.Prefix = mergedPrefix
+					// Note: We do NOT update FullPrefix because children are stored
+					// relative to the branch's FullPrefix. If we updated FullPrefix,
+					// child lookups would compute wrong paths and fail.
+					// The FullPrefix remains at the old value for child path compatibility.
 					childBranch.Commitment = nil
 
 					// Delete the child from its original path to prevent orphan

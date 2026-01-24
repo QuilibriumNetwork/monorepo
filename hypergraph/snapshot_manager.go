@@ -161,8 +161,9 @@ func (h *snapshotHandle) isLeafMiss(key []byte) bool {
 // snapshotGeneration represents a set of shard snapshots for a specific
 // commit root.
 type snapshotGeneration struct {
-	root    []byte
-	handles map[string]*snapshotHandle // keyed by shard key
+	root       []byte
+	handles    map[string]*snapshotHandle // keyed by shard key
+	dbSnapshot tries.DBSnapshot           // point-in-time DB snapshot taken at publish
 }
 
 type snapshotManager struct {
@@ -211,6 +212,22 @@ func (m *snapshotManager) publish(root []byte) {
 		newGen.root = append([]byte{}, root...)
 	}
 
+	// Take a point-in-time DB snapshot if the store supports it.
+	// This ensures all shard snapshots for this generation reflect
+	// the exact state at publish time, avoiding race conditions.
+	if m.store != nil {
+		dbSnap, err := m.store.NewDBSnapshot()
+		if err != nil {
+			m.logger.Warn(
+				"failed to create DB snapshot for generation",
+				zap.String("root", rootHex),
+				zap.Error(err),
+			)
+		} else {
+			newGen.dbSnapshot = dbSnap
+		}
+	}
+
 	// Prepend the new generation (newest first)
 	m.generations = append([]*snapshotGeneration{newGen}, m.generations...)
 
@@ -224,6 +241,16 @@ func (m *snapshotManager) publish(root []byte) {
 			delete(oldGen.handles, key)
 			if handle != nil {
 				handle.releaseRef(m.logger)
+			}
+		}
+
+		// Close the DB snapshot if present
+		if oldGen.dbSnapshot != nil {
+			if err := oldGen.dbSnapshot.Close(); err != nil {
+				m.logger.Warn(
+					"failed to close DB snapshot",
+					zap.Error(err),
+				)
 			}
 		}
 
@@ -247,10 +274,11 @@ func (m *snapshotManager) publish(root []byte) {
 // acquire returns a snapshot handle for the given shard key. If expectedRoot
 // is provided and a matching generation has an existing snapshot for this shard,
 // that snapshot is returned. Otherwise, a new snapshot is created from the
-// current DB state and associated with the latest generation.
+// generation's DB snapshot (if available) to ensure consistency.
 //
-// Note: Historical snapshots are only available if they were created while that
-// generation was current. We cannot create a snapshot of past state retroactively.
+// With DB snapshots: Historical generations can create new shard snapshots because
+// the DB snapshot captures the exact state at publish time.
+// Without DB snapshots (fallback): Only the latest generation can create snapshots.
 func (m *snapshotManager) acquire(
 	shardKey tries.ShardKey,
 	expectedRoot []byte,
@@ -264,7 +292,9 @@ func (m *snapshotManager) acquire(
 		return nil
 	}
 
-	// If expectedRoot is provided, look for an existing snapshot in that generation
+	var targetGen *snapshotGeneration
+
+	// If expectedRoot is provided, look for the matching generation
 	if len(expectedRoot) > 0 {
 		for _, gen := range m.generations {
 			if bytes.Equal(gen.root, expectedRoot) {
@@ -278,24 +308,33 @@ func (m *snapshotManager) acquire(
 					return handle
 				}
 				// Generation exists but no snapshot for this shard yet.
-				// Only create if this is the latest generation (current DB state matches).
+				// If we have a DB snapshot, we can create from it even for older generations.
+				if gen.dbSnapshot != nil {
+					targetGen = gen
+					m.logger.Debug(
+						"creating snapshot for expected root from DB snapshot",
+						zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+					)
+					break
+				}
+				// No DB snapshot - only allow if this is the latest generation
 				if gen != m.generations[0] {
 					m.logger.Warn(
-						"generation matches expected root but is not latest, cannot create snapshot",
+						"generation matches expected root but has no DB snapshot and is not latest",
 						zap.String("expected_root", hex.EncodeToString(expectedRoot)),
 					)
 					return nil
 				}
-				// Fall through to create snapshot for latest generation
+				targetGen = gen
 				m.logger.Debug(
-					"creating snapshot for expected root (latest generation)",
+					"creating snapshot for expected root (latest generation, no DB snapshot)",
 					zap.String("expected_root", hex.EncodeToString(expectedRoot)),
 				)
 				break
 			}
 		}
 		// If we didn't find a matching generation at all, reject
-		if len(m.generations) == 0 || !bytes.Equal(m.generations[0].root, expectedRoot) {
+		if targetGen == nil {
 			if m.logger != nil {
 				latestRoot := ""
 				if len(m.generations) > 0 {
@@ -309,13 +348,13 @@ func (m *snapshotManager) acquire(
 			}
 			return nil
 		}
+	} else {
+		// No expected root - use the latest generation
+		targetGen = m.generations[0]
 	}
 
-	// Use the latest generation for new snapshots
-	latestGen := m.generations[0]
-
-	// Check if we already have a handle for this shard in the latest generation
-	if handle, ok := latestGen.handles[key]; ok {
+	// Check if we already have a handle for this shard in the target generation
+	if handle, ok := targetGen.handles[key]; ok {
 		handle.acquire()
 		return handle
 	}
@@ -324,7 +363,19 @@ func (m *snapshotManager) acquire(
 		return nil
 	}
 
-	storeSnapshot, release, err := m.store.NewShardSnapshot(shardKey)
+	// Create the shard snapshot, preferring DB snapshot if available
+	var storeSnapshot tries.TreeBackingStore
+	var release func()
+	var err error
+
+	if targetGen.dbSnapshot != nil {
+		storeSnapshot, release, err = m.store.NewShardSnapshotFromDBSnapshot(
+			shardKey,
+			targetGen.dbSnapshot,
+		)
+	} else {
+		storeSnapshot, release, err = m.store.NewShardSnapshot(shardKey)
+	}
 	if err != nil {
 		m.logger.Warn(
 			"failed to build shard snapshot",
@@ -334,13 +385,13 @@ func (m *snapshotManager) acquire(
 		return nil
 	}
 
-	handle := newSnapshotHandle(key, storeSnapshot, release, latestGen.root)
+	handle := newSnapshotHandle(key, storeSnapshot, release, targetGen.root)
 	// Acquire a ref for the caller. The handle is created with refs=1 (the owner ref
 	// held by the snapshot manager), and this adds another ref for the sync session.
 	// This ensures publish() can release the owner ref without closing the DB while
 	// a sync is still using it.
 	handle.acquire()
-	latestGen.handles[key] = handle
+	targetGen.handles[key] = handle
 	return handle
 }
 

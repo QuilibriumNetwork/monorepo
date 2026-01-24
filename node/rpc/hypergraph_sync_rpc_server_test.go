@@ -125,9 +125,9 @@ func TestHypergraphSyncServer(t *testing.T) {
 		}
 	}
 
-	clientKvdb := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestclient/store"}, 0)
-	serverKvdb := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}, 0)
-	controlKvdb := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestcontrol/store"}, 0)
+	clientKvdb := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestclient/store"}}, 0)
+	serverKvdb := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}}, 0)
+	controlKvdb := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestcontrol/store"}}, 0)
 
 	clientHypergraphStore := store.NewPebbleHypergraphStore(
 		&config.DBConfig{Path: ".configtestclient/store"},
@@ -477,9 +477,9 @@ func TestHypergraphPartialSync(t *testing.T) {
 		}
 	}
 
-	clientKvdb := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestclient/store"}, 0)
-	serverKvdb := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}, 0)
-	controlKvdb := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestcontrol/store"}, 0)
+	clientKvdb := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestclient/store"}}, 0)
+	serverKvdb := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}}, 0)
+	controlKvdb := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestcontrol/store"}}, 0)
 
 	clientHypergraphStore := store.NewPebbleHypergraphStore(
 		&config.DBConfig{Path: ".configtestclient/store"},
@@ -717,7 +717,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	logDuration("generated data trees", start)
 
 	setupStart := time.Now()
-	serverDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}, 0)
+	serverDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}}, 0)
 	defer serverDB.Close()
 
 	serverStore := store.NewPebbleHypergraphStore(
@@ -747,7 +747,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 
 	clientSetupStart := time.Now()
 	for i := 0; i < clientCount; i++ {
-		clientDBs[i] = store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", i)}, 0)
+		clientDBs[i] = store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", i)}}, 0)
 		clientStores[i] = store.NewPebbleHypergraphStore(
 			&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", i)},
 			clientDBs[i],
@@ -1166,7 +1166,7 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 		dataTrees[i] = buildDataTree(t, inclusionProver)
 	}
 
-	serverDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}, 0)
+	serverDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}}, 0)
 	defer serverDB.Close()
 
 	serverStore := store.NewPebbleHypergraphStore(
@@ -1274,7 +1274,7 @@ func TestHypergraphSyncWithExpectedRoot(t *testing.T) {
 	clientCounter := 0
 	createClient := func(name string) (*store.PebbleDB, *hgcrdt.HypergraphCRDT) {
 		clientCounter++
-		clientDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", clientCounter)}, 0)
+		clientDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", clientCounter)}}, 0)
 		clientStore := store.NewPebbleHypergraphStore(
 			&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestclient%d/store", clientCounter)},
 			clientDB,
@@ -1422,10 +1422,10 @@ func TestHypergraphSyncWithModifiedEntries(t *testing.T) {
 	}
 
 	// Create server and client databases
-	serverDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}, 0)
+	serverDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestserver/store"}}, 0)
 	defer serverDB.Close()
 
-	clientDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestclient/store"}, 0)
+	clientDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestclient/store"}}, 0)
 	defer clientDB.Close()
 
 	serverStore := store.NewPebbleHypergraphStore(
@@ -1649,10 +1649,10 @@ func TestHypergraphBidirectionalSyncWithDisjointData(t *testing.T) {
 	t.Log("Generated data trees")
 
 	// Create databases and stores for both nodes
-	nodeADB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeA/store"}, 0)
+	nodeADB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeA/store"}}, 0)
 	defer nodeADB.Close()
 
-	nodeBDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeB/store"}, 0)
+	nodeBDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeB/store"}}, 0)
 	defer nodeBDB.Close()
 
 	nodeAStore := store.NewPebbleHypergraphStore(
@@ -1932,10 +1932,10 @@ func TestHypergraphBidirectionalSyncClientDriven(t *testing.T) {
 	t.Log("Generated data trees")
 
 	// Create databases and stores for both nodes
-	nodeADB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeA_cd/store"}, 0)
+	nodeADB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeA_cd/store"}}, 0)
 	defer nodeADB.Close()
 
-	nodeBDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeB_cd/store"}, 0)
+	nodeBDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtestnodeB_cd/store"}}, 0)
 	defer nodeBDB.Close()
 
 	nodeAStore := store.NewPebbleHypergraphStore(
@@ -2261,10 +2261,10 @@ func TestHypergraphSyncWithPrefixLengthMismatch(t *testing.T) {
 	runSyncTest := func(direction string) {
 		t.Run(direction, func(t *testing.T) {
 			// Create fresh databases for this sub-test
-			nodeADB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestnodeA_%s/store", direction)}, 0)
+			nodeADB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestnodeA_%s/store", direction)}}, 0)
 			defer nodeADB.Close()
 
-			nodeBDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestnodeB_%s/store", direction)}, 0)
+			nodeBDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".configtestnodeB_%s/store", direction)}}, 0)
 			defer nodeBDB.Close()
 
 			nodeAStore := store.NewPebbleHypergraphStore(
@@ -2569,7 +2569,7 @@ func TestMainnetBlossomsubFrameReceptionAndHypersync(t *testing.T) {
 	globalFrameBitmask := []byte{0x00, 0x00}
 
 	// Create in-memory hypergraph store for the client
-	clientDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_mainnet_client/store"}, 0)
+	clientDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_mainnet_client/store"}}, 0)
 	defer clientDB.Close()
 
 	clientStore := store.NewPebbleHypergraphStore(
@@ -3170,7 +3170,7 @@ waitLoop:
 	t.Log("Verifying sync-based repair approach...")
 
 	// Create second in-memory hypergraph
-	repairDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_mainnet_repair/store"}, 0)
+	repairDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_mainnet_repair/store"}}, 0)
 	defer repairDB.Close()
 
 	repairStore := store.NewPebbleHypergraphStore(
@@ -3401,7 +3401,7 @@ func TestHypergraphSyncWithPagination(t *testing.T) {
 	t.Log("Generated data trees")
 
 	// Create server DB and store
-	serverDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_pagination_server/store"}, 0)
+	serverDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_pagination_server/store"}}, 0)
 	defer serverDB.Close()
 
 	serverStore := store.NewPebbleHypergraphStore(
@@ -3422,7 +3422,7 @@ func TestHypergraphSyncWithPagination(t *testing.T) {
 	)
 
 	// Create client DB and store
-	clientDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_pagination_client/store"}, 0)
+	clientDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest_pagination_client/store"}}, 0)
 	defer clientDB.Close()
 
 	clientStore := store.NewPebbleHypergraphStore(

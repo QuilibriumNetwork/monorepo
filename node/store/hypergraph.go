@@ -62,17 +62,21 @@ func (p *PebbleHypergraphStore) NewShardSnapshot(
 	func(),
 	error,
 ) {
-	memConfig := *p.config
-	memConfig.InMemoryDONOTUSE = true
-	memConfig.Path = fmt.Sprintf(
+	memDBConfig := *p.config
+	memDBConfig.InMemoryDONOTUSE = true
+	memDBConfig.Path = fmt.Sprintf(
 		"memory-shard-%x",
 		shardKey.L2[:4],
 	)
+	// Wrap DBConfig in a minimal Config for NewPebbleDB
+	memConfig := &config.Config{
+		DB: &memDBConfig,
+	}
 
-	memDB := NewPebbleDB(p.logger, &memConfig, 0)
+	memDB := NewPebbleDB(p.logger, memConfig, 0)
 	managedDB := newManagedKVDB(memDB)
 	snapshotStore := NewPebbleHypergraphStore(
-		&memConfig,
+		&memDBConfig,
 		managedDB,
 		p.logger,
 		p.verenc,
@@ -92,6 +96,330 @@ func (p *PebbleHypergraphStore) NewShardSnapshot(
 	}
 
 	return snapshotStore, release, nil
+}
+
+// pebbleDBSnapshot wraps a pebble.Snapshot to implement tries.DBSnapshot.
+type pebbleDBSnapshot struct {
+	snap *pebble.Snapshot
+}
+
+func (s *pebbleDBSnapshot) Close() error {
+	if s.snap == nil {
+		return nil
+	}
+	return s.snap.Close()
+}
+
+// NewDBSnapshot creates a point-in-time snapshot of the database.
+// This is used to ensure consistency when creating shard snapshots.
+func (p *PebbleHypergraphStore) NewDBSnapshot() (tries.DBSnapshot, error) {
+	if p.pebble == nil {
+		return nil, errors.New("pebble handle not available for snapshot")
+	}
+	snap := p.pebble.NewSnapshot()
+	return &pebbleDBSnapshot{snap: snap}, nil
+}
+
+// NewShardSnapshotFromDBSnapshot creates a shard snapshot using data from
+// an existing database snapshot. This ensures the shard snapshot reflects
+// the exact state at the time the DB snapshot was taken.
+func (p *PebbleHypergraphStore) NewShardSnapshotFromDBSnapshot(
+	shardKey tries.ShardKey,
+	dbSnapshot tries.DBSnapshot,
+) (
+	tries.TreeBackingStore,
+	func(),
+	error,
+) {
+	pebbleSnap, ok := dbSnapshot.(*pebbleDBSnapshot)
+	if !ok || pebbleSnap.snap == nil {
+		return nil, nil, errors.New("invalid database snapshot")
+	}
+
+	memDBConfig := *p.config
+	memDBConfig.InMemoryDONOTUSE = true
+	memDBConfig.Path = fmt.Sprintf(
+		"memory-shard-%x",
+		shardKey.L2[:4],
+	)
+	// Wrap DBConfig in a minimal Config for NewPebbleDB
+	memConfig := &config.Config{
+		DB: &memDBConfig,
+	}
+
+	memDB := NewPebbleDB(p.logger, memConfig, 0)
+	managedDB := newManagedKVDB(memDB)
+	snapshotStore := NewPebbleHypergraphStore(
+		&memDBConfig,
+		managedDB,
+		p.logger,
+		p.verenc,
+		p.prover,
+	)
+	snapshotStore.pebble = nil
+
+	// Copy data from the pebble snapshot instead of the live DB
+	if err := p.copyShardDataFromSnapshot(managedDB, shardKey, pebbleSnap.snap); err != nil {
+		_ = managedDB.Close()
+		return nil, nil, errors.Wrap(err, "copy shard snapshot from db snapshot")
+	}
+
+	release := func() {
+		if err := managedDB.Close(); err != nil {
+			p.logger.Warn("failed to close shard snapshot", zap.Error(err))
+		}
+	}
+
+	return snapshotStore, release, nil
+}
+
+// copyShardDataFromSnapshot copies shard data from a pebble snapshot to the
+// destination DB. This is similar to copyShardData but reads from a snapshot
+// instead of the live database.
+func (p *PebbleHypergraphStore) copyShardDataFromSnapshot(
+	dst store.KVDB,
+	shardKey tries.ShardKey,
+	snap *pebble.Snapshot,
+) error {
+	prefixes := []byte{
+		VERTEX_ADDS_TREE_NODE,
+		VERTEX_REMOVES_TREE_NODE,
+		HYPEREDGE_ADDS_TREE_NODE,
+		HYPEREDGE_REMOVES_TREE_NODE,
+		VERTEX_ADDS_TREE_NODE_BY_PATH,
+		VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		HYPEREDGE_REMOVES_TREE_NODE_BY_PATH,
+		VERTEX_ADDS_TREE_ROOT,
+		VERTEX_REMOVES_TREE_ROOT,
+		HYPEREDGE_ADDS_TREE_ROOT,
+		HYPEREDGE_REMOVES_TREE_ROOT,
+		VERTEX_ADDS_CHANGE_RECORD,
+		VERTEX_REMOVES_CHANGE_RECORD,
+		HYPEREDGE_ADDS_CHANGE_RECORD,
+		HYPEREDGE_REMOVES_CHANGE_RECORD,
+		HYPERGRAPH_VERTEX_ADDS_SHARD_COMMIT,
+		HYPERGRAPH_VERTEX_REMOVES_SHARD_COMMIT,
+		HYPERGRAPH_HYPEREDGE_ADDS_SHARD_COMMIT,
+		HYPERGRAPH_HYPEREDGE_REMOVES_SHARD_COMMIT,
+	}
+
+	for _, prefix := range prefixes {
+		if err := p.copyPrefixedRangeFromSnapshot(dst, prefix, shardKey, snap); err != nil {
+			return err
+		}
+	}
+
+	if err := p.copyVertexDataForShardFromSnapshot(dst, shardKey, snap); err != nil {
+		return err
+	}
+
+	if err := p.copyCoveredPrefixFromSnapshot(dst, snap); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) copyPrefixedRangeFromSnapshot(
+	dst store.KVDB,
+	prefix byte,
+	shardKey tries.ShardKey,
+	snap *pebble.Snapshot,
+) error {
+	start, end := shardRangeBounds(prefix, shardKey)
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: start,
+		UpperBound: end,
+	})
+	if err != nil {
+		return errors.Wrap(err, "snapshot: iter range from snapshot")
+	}
+	defer iter.Close()
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		key := append([]byte(nil), iter.Key()...)
+		val := append([]byte(nil), iter.Value()...)
+		if err := dst.Set(key, val); err != nil {
+			return errors.Wrap(err, "snapshot: set range value")
+		}
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) copyVertexDataForShardFromSnapshot(
+	dst store.KVDB,
+	shardKey tries.ShardKey,
+	snap *pebble.Snapshot,
+) error {
+	sets := []struct {
+		setType   string
+		phaseType string
+	}{
+		{string(hypergraph.VertexAtomType), string(hypergraph.AddsPhaseType)},
+		{string(hypergraph.VertexAtomType), string(hypergraph.RemovesPhaseType)},
+	}
+
+	vertexKeys := make(map[string]struct{})
+	for _, cfg := range sets {
+		// Use snapshot-based iteration
+		iter, err := p.iterateRawLeavesFromSnapshot(cfg.setType, cfg.phaseType, shardKey, snap)
+		if err != nil {
+			return errors.Wrap(err, "snapshot: iterate raw leaves from snapshot")
+		}
+		for valid := iter.First(); valid; valid = iter.Next() {
+			leaf, err := iter.Leaf()
+			if err != nil || leaf == nil {
+				continue
+			}
+			if len(leaf.UnderlyingData) == 0 {
+				continue
+			}
+			keyStr := string(leaf.Key)
+			if _, ok := vertexKeys[keyStr]; ok {
+				continue
+			}
+			vertexKeys[keyStr] = struct{}{}
+			buf := append([]byte(nil), leaf.UnderlyingData...)
+			if err := dst.Set(hypergraphVertexDataKey(leaf.Key), buf); err != nil {
+				iter.Close()
+				return errors.Wrap(err, "snapshot: copy vertex data")
+			}
+		}
+		iter.Close()
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) copyCoveredPrefixFromSnapshot(
+	dst store.KVDB,
+	snap *pebble.Snapshot,
+) error {
+	val, closer, err := snap.Get([]byte{HYPERGRAPH_COVERED_PREFIX})
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil
+		}
+		return errors.Wrap(err, "snapshot: get covered prefix")
+	}
+	defer closer.Close()
+	buf := append([]byte(nil), val...)
+	return dst.Set([]byte{HYPERGRAPH_COVERED_PREFIX}, buf)
+}
+
+// pebbleSnapshotRawLeafIterator iterates over raw leaves from a pebble snapshot.
+type pebbleSnapshotRawLeafIterator struct {
+	iter     *pebble.Iterator
+	shardKey tries.ShardKey
+	snap     *pebble.Snapshot
+	setType  string
+	db       *PebbleHypergraphStore
+}
+
+func (p *PebbleHypergraphStore) iterateRawLeavesFromSnapshot(
+	setType string,
+	phaseType string,
+	shardKey tries.ShardKey,
+	snap *pebble.Snapshot,
+) (*pebbleSnapshotRawLeafIterator, error) {
+	// Determine the key prefix based on set and phase type
+	var keyPrefix byte
+	switch hypergraph.AtomType(setType) {
+	case hypergraph.VertexAtomType:
+		switch hypergraph.PhaseType(phaseType) {
+		case hypergraph.AddsPhaseType:
+			keyPrefix = VERTEX_ADDS_TREE_NODE
+		case hypergraph.RemovesPhaseType:
+			keyPrefix = VERTEX_REMOVES_TREE_NODE
+		default:
+			return nil, errors.New("unknown phase type")
+		}
+	case hypergraph.HyperedgeAtomType:
+		switch hypergraph.PhaseType(phaseType) {
+		case hypergraph.AddsPhaseType:
+			keyPrefix = HYPEREDGE_ADDS_TREE_NODE
+		case hypergraph.RemovesPhaseType:
+			keyPrefix = HYPEREDGE_REMOVES_TREE_NODE
+		default:
+			return nil, errors.New("unknown phase type")
+		}
+	default:
+		return nil, errors.New("unknown set type")
+	}
+
+	start, end := shardRangeBounds(keyPrefix, shardKey)
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: start,
+		UpperBound: end,
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "iterate raw leaves from snapshot")
+	}
+
+	return &pebbleSnapshotRawLeafIterator{
+		iter:     iter,
+		shardKey: shardKey,
+		snap:     snap,
+		setType:  setType,
+		db:       p,
+	}, nil
+}
+
+func (i *pebbleSnapshotRawLeafIterator) First() bool {
+	return i.iter.First()
+}
+
+func (i *pebbleSnapshotRawLeafIterator) Next() bool {
+	return i.iter.Next()
+}
+
+func (i *pebbleSnapshotRawLeafIterator) Close() {
+	i.iter.Close()
+}
+
+func (i *pebbleSnapshotRawLeafIterator) Leaf() (*tries.RawLeafData, error) {
+	if !i.iter.Valid() {
+		return nil, nil
+	}
+
+	nodeData := i.iter.Value()
+	if len(nodeData) == 0 {
+		return nil, nil
+	}
+
+	// Only process leaf nodes (type byte == TypeLeaf)
+	if nodeData[0] != tries.TypeLeaf {
+		return nil, nil
+	}
+
+	leaf, err := tries.DeserializeLeafNode(i.db, bytes.NewReader(nodeData[1:]))
+	if err != nil {
+		return nil, err
+	}
+
+	result := &tries.RawLeafData{
+		Key:        slices.Clone(leaf.Key),
+		Value:      slices.Clone(leaf.Value),
+		HashTarget: slices.Clone(leaf.HashTarget),
+		Commitment: slices.Clone(leaf.Commitment),
+	}
+
+	if leaf.Size != nil {
+		result.Size = leaf.Size.FillBytes(make([]byte, 32))
+	}
+
+	// Load vertex data from snapshot if this is a vertex set
+	if i.setType == string(hypergraph.VertexAtomType) {
+		dataVal, closer, err := i.snap.Get(hypergraphVertexDataKey(leaf.Key))
+		if err == nil {
+			result.UnderlyingData = append([]byte(nil), dataVal...)
+			closer.Close()
+		}
+	}
+
+	return result, nil
 }
 
 type PebbleVertexDataIterator struct {

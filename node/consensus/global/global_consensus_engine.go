@@ -3306,88 +3306,39 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		return errors.Wrap(err, "propose worker join")
 	}
 
-	skipMerge := false
 	info, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
-	if err == nil || info != nil {
-		skipMerge = true
+	proverExists := err == nil && info != nil
+
+	// Build merge helpers and calculate potential merge seniority
+	helpers, peerIds := e.buildMergeHelpers()
+	mergeSeniorityBI := compat.GetAggregatedSeniority(peerIds)
+	var mergeSeniority uint64 = 0
+	if mergeSeniorityBI.IsUint64() {
+		mergeSeniority = mergeSeniorityBI.Uint64()
 	}
 
-	helpers := []*global.SeniorityMerge{}
-	if !skipMerge {
-		e.logger.Debug("attempting merge")
-		peerIds := []string{}
-		oldProver, err := keys.Ed448KeyFromBytes(
-			[]byte(e.config.P2P.PeerPrivKey),
-			e.pubsub.GetPublicKey(),
-		)
-		if err != nil {
-			e.logger.Debug("cannot get peer key", zap.Error(err))
-			return errors.Wrap(err, "propose worker join")
+	// If prover already exists, check if we should submit a seniority merge
+	if proverExists {
+		if mergeSeniority > info.Seniority {
+			e.logger.Info(
+				"existing prover has lower seniority than merge would provide, submitting seniority merge",
+				zap.Uint64("existing_seniority", info.Seniority),
+				zap.Uint64("merge_seniority", mergeSeniority),
+			)
+			return e.submitSeniorityMerge(frame, helpers)
 		}
-		helpers = append(helpers, global.NewSeniorityMerge(
-			crypto.KeyTypeEd448,
-			oldProver,
-		))
-		peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
-		if len(e.config.Engine.MultisigProverEnrollmentPaths) != 0 {
-			e.logger.Debug("loading old configs")
-			for _, conf := range e.config.Engine.MultisigProverEnrollmentPaths {
-				extraConf, err := config.LoadConfig(conf, "", false)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				peerPrivKey, err := hex.DecodeString(extraConf.P2P.PeerPrivKey)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				privKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKey)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				pub := privKey.GetPublic()
-				pubBytes, err := pub.Raw()
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				id, err := peer.IDFromPublicKey(pub)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				priv, err := privKey.Raw()
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				signer, err := keys.Ed448KeyFromBytes(priv, pubBytes)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				peerIds = append(peerIds, id.String())
-				helpers = append(helpers, global.NewSeniorityMerge(
-					crypto.KeyTypeEd448,
-					signer,
-				))
-			}
-		}
-		seniorityBI := compat.GetAggregatedSeniority(peerIds)
-		e.logger.Info(
-			"existing seniority detected for proposed join",
-			zap.String("seniority", seniorityBI.String()),
+		e.logger.Debug(
+			"prover already exists with sufficient seniority, skipping join",
+			zap.Uint64("existing_seniority", info.Seniority),
+			zap.Uint64("merge_seniority", mergeSeniority),
 		)
+		return nil
 	}
+
+	e.logger.Info(
+		"existing seniority detected for proposed join",
+		zap.String("seniority", mergeSeniorityBI.String()),
+	)
 
 	var delegate []byte
 	if e.config.Engine.DelegateAddress != "" {
@@ -3518,6 +3469,149 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 	}
 
 	e.logger.Debug("submitted join request")
+
+	return nil
+}
+
+// buildMergeHelpers constructs the seniority merge helpers from the current
+// peer key and any configured multisig prover enrollment paths.
+func (e *GlobalConsensusEngine) buildMergeHelpers() ([]*global.SeniorityMerge, []string) {
+	helpers := []*global.SeniorityMerge{}
+	peerIds := []string{}
+
+	peerPrivKey, err := hex.DecodeString(e.config.P2P.PeerPrivKey)
+	if err != nil {
+		e.logger.Debug("cannot decode peer key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	oldProver, err := keys.Ed448KeyFromBytes(
+		peerPrivKey,
+		e.pubsub.GetPublicKey(),
+	)
+	if err != nil {
+		e.logger.Debug("cannot get peer key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	helpers = append(helpers, global.NewSeniorityMerge(
+		crypto.KeyTypeEd448,
+		oldProver,
+	))
+	peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
+
+	if len(e.config.Engine.MultisigProverEnrollmentPaths) != 0 {
+		e.logger.Debug("loading old configs for merge helpers")
+		for _, conf := range e.config.Engine.MultisigProverEnrollmentPaths {
+			extraConf, err := config.LoadConfig(conf, "", false)
+			if err != nil {
+				e.logger.Error("could not load config for merge helpers", zap.Error(err))
+				continue
+			}
+
+			peerPrivKey, err := hex.DecodeString(extraConf.P2P.PeerPrivKey)
+			if err != nil {
+				e.logger.Error("could not decode peer key for merge helpers", zap.Error(err))
+				continue
+			}
+
+			privKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKey)
+			if err != nil {
+				e.logger.Error("could not unmarshal peer key for merge helpers", zap.Error(err))
+				continue
+			}
+
+			pub := privKey.GetPublic()
+			pubBytes, err := pub.Raw()
+			if err != nil {
+				e.logger.Error("could not get public key for merge helpers", zap.Error(err))
+				continue
+			}
+
+			id, err := peer.IDFromPublicKey(pub)
+			if err != nil {
+				e.logger.Error("could not get peer ID for merge helpers", zap.Error(err))
+				continue
+			}
+
+			priv, err := privKey.Raw()
+			if err != nil {
+				e.logger.Error("could not get private key for merge helpers", zap.Error(err))
+				continue
+			}
+
+			signer, err := keys.Ed448KeyFromBytes(priv, pubBytes)
+			if err != nil {
+				e.logger.Error("could not create signer for merge helpers", zap.Error(err))
+				continue
+			}
+
+			peerIds = append(peerIds, id.String())
+			helpers = append(helpers, global.NewSeniorityMerge(
+				crypto.KeyTypeEd448,
+				signer,
+			))
+		}
+	}
+
+	return helpers, peerIds
+}
+
+// submitSeniorityMerge submits a seniority merge request to claim additional
+// seniority from old peer keys for an existing prover.
+func (e *GlobalConsensusEngine) submitSeniorityMerge(
+	frame *protobufs.GlobalFrame,
+	helpers []*global.SeniorityMerge,
+) error {
+	if len(helpers) == 0 {
+		return errors.New("no merge helpers available")
+	}
+
+	seniorityMerge, err := global.NewProverSeniorityMerge(
+		frame.Header.FrameNumber,
+		helpers,
+		e.hypergraph,
+		schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		e.keyManager,
+	)
+	if err != nil {
+		e.logger.Error("could not construct seniority merge", zap.Error(err))
+		return errors.Wrap(err, "submit seniority merge")
+	}
+
+	err = seniorityMerge.Prove(frame.Header.FrameNumber)
+	if err != nil {
+		e.logger.Error("could not prove seniority merge", zap.Error(err))
+		return errors.Wrap(err, "submit seniority merge")
+	}
+
+	bundle := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{
+			{
+				Request: &protobufs.MessageRequest_SeniorityMerge{
+					SeniorityMerge: seniorityMerge.ToProtobuf(),
+				},
+			},
+		},
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	msg, err := bundle.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not encode seniority merge bundle", zap.Error(err))
+		return errors.Wrap(err, "submit seniority merge")
+	}
+
+	err = e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		msg,
+	)
+	if err != nil {
+		e.logger.Error("could not publish seniority merge", zap.Error(err))
+		return errors.Wrap(err, "submit seniority merge")
+	}
+
+	e.logger.Info("submitted seniority merge request")
 
 	return nil
 }

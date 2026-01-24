@@ -109,7 +109,7 @@ func main() {
 	}
 	defer closer.Close()
 
-	db1 := store.NewPebbleDB(logger, nodeConfig1.DB, uint(0))
+	db1 := store.NewPebbleDB(logger, nodeConfig1, uint(0))
 	defer db1.Close()
 
 	// Determine iteration bounds based on prefix filter
@@ -216,7 +216,7 @@ func runCompareMode(
 		log.Fatal("failed to load config", err)
 	}
 
-	db2 := store.NewPebbleDB(logger, nodeConfig2.DB, uint(0))
+	db2 := store.NewPebbleDB(logger, nodeConfig2, uint(0))
 	defer db2.Close()
 
 	iter2, err := db2.NewIter(lowerBound, upperBound)

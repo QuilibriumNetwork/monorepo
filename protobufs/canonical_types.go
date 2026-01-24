@@ -62,9 +62,10 @@ const (
 	TraversalProofType      uint32 = 0x0316
 	GlobalProposalType      uint32 = 0x0317
 	AppShardProposalType    uint32 = 0x0318
-	AltShardUpdateType      uint32 = 0x0319
-	TimeoutStateType        uint32 = 0x031C
-	TimeoutCertificateType  uint32 = 0x031D
+	AltShardUpdateType          uint32 = 0x0319
+	ProverSeniorityMergeType    uint32 = 0x031A
+	TimeoutStateType            uint32 = 0x031C
+	TimeoutCertificateType      uint32 = 0x031D
 
 	// Hypergraph types (0x0400 - 0x04FF)
 	HypergraphConfigurationType uint32 = 0x0401

@@ -585,6 +585,8 @@ func (e *GlobalExecutionEngine) tryExtractMessageForIntrinsic(
 		payload, err = r.Reject.ToCanonicalBytes()
 	case *protobufs.MessageRequest_Kick:
 		payload, err = r.Kick.ToCanonicalBytes()
+	case *protobufs.MessageRequest_SeniorityMerge:
+		payload, err = r.SeniorityMerge.ToCanonicalBytes()
 	default:
 		err = errors.New("unsupported message type")
 	}

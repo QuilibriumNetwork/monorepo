@@ -297,7 +297,8 @@ func (e *GlobalConsensusEngine) filterProverOnlyRequests(
 			*protobufs.MessageRequest_Confirm,
 			*protobufs.MessageRequest_Reject,
 			*protobufs.MessageRequest_Kick,
-			*protobufs.MessageRequest_Update:
+			*protobufs.MessageRequest_Update,
+			*protobufs.MessageRequest_SeniorityMerge:
 			// Prover messages are allowed
 			filtered = append(filtered, req)
 		default:
@@ -366,6 +367,10 @@ func requestTypeNameAndDetail(
 	case *protobufs.MessageRequest_Update:
 		return "ProverUpdate",
 			zap.Any(fmt.Sprintf("request_%d_prover_update", idx), actual.Update),
+			true
+	case *protobufs.MessageRequest_SeniorityMerge:
+		return "ProverSeniorityMerge",
+			zap.Any(fmt.Sprintf("request_%d_seniority_merge", idx), actual.SeniorityMerge),
 			true
 	case *protobufs.MessageRequest_TokenDeploy:
 		return "TokenDeploy",

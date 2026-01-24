@@ -678,6 +678,58 @@ func (a *GlobalIntrinsic) Validate(
 		).Inc()
 		return nil
 
+	case protobufs.ProverSeniorityMergeType:
+		// Parse ProverSeniorityMerge directly from input
+		pb := &protobufs.ProverSeniorityMerge{}
+		if err := pb.FromCanonicalBytes(input); err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		// Convert from protobuf to intrinsics type
+		op, err := ProverSeniorityMergeFromProtobuf(
+			pb,
+			a.hypergraph,
+			a.rdfMultiprover,
+			a.keyManager,
+		)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		valid, err := op.Verify(frameNumber)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		if !valid {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return errors.Wrap(
+				errors.New("invalid prover seniority merge"),
+				"validate",
+			)
+		}
+
+		observability.ValidateTotal.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return nil
+
 	default:
 		observability.ValidateErrors.WithLabelValues(
 			"global",
@@ -1156,6 +1208,59 @@ func (a *GlobalIntrinsic) InvokeStep(
 		).Inc()
 		return a.state, nil
 
+	case protobufs.ProverSeniorityMergeType:
+		opTimer := prometheus.NewTimer(
+			observability.OperationDuration.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			),
+		)
+		defer opTimer.ObserveDuration()
+
+		// Parse ProverSeniorityMerge directly from input
+		pb := &protobufs.ProverSeniorityMerge{}
+		if err := pb.FromCanonicalBytes(input); err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		// Convert from protobuf to intrinsics type
+		op, err := ProverSeniorityMergeFromProtobuf(
+			pb,
+			a.hypergraph,
+			a.rdfMultiprover,
+			a.keyManager,
+		)
+		if err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		matTimer := prometheus.NewTimer(
+			observability.MaterializeDuration.WithLabelValues("global"),
+		)
+		a.state, err = op.Materialize(frameNumber, state)
+		matTimer.ObserveDuration()
+		if err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		observability.InvokeStepTotal.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return a.state, nil
+
 	default:
 		observability.InvokeStepErrors.WithLabelValues(
 			"global",
@@ -1273,6 +1378,17 @@ func (a *GlobalIntrinsic) Lock(
 		}
 
 		observability.LockTotal.WithLabelValues("global", "prover_kick").Inc()
+
+	case protobufs.ProverSeniorityMergeType:
+		reads, writes, err = a.tryLockSeniorityMerge(frameNumber, input)
+		if err != nil {
+			return nil, err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
 
 	default:
 		observability.LockErrors.WithLabelValues(
@@ -1730,6 +1846,60 @@ func (a *GlobalIntrinsic) tryLockKick(frameNumber uint64, input []byte) (
 		observability.LockErrors.WithLabelValues(
 			"global",
 			"prover_kick",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (a *GlobalIntrinsic) tryLockSeniorityMerge(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	// Parse ProverSeniorityMerge directly from input
+	pb := &protobufs.ProverSeniorityMerge{}
+	if err := pb.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Convert from protobuf to intrinsics type
+	op, err := ProverSeniorityMergeFromProtobuf(
+		pb,
+		a.hypergraph,
+		a.rdfMultiprover,
+		a.keyManager,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
 		).Inc()
 		return nil, nil, errors.Wrap(err, "lock")
 	}

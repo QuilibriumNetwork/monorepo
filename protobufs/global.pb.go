@@ -703,6 +703,75 @@ func (x *ProverReject) GetFilters() [][]byte {
 	return nil
 }
 
+// ProverSeniorityMerge allows existing provers to claim seniority from their
+// old peer keys. This is used as a repair mechanism for provers who joined
+// before the seniority merge bug was fixed.
+type ProverSeniorityMerge struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	// The frame number when this request is made
+	FrameNumber uint64 `protobuf:"varint,1,opt,name=frame_number,json=frameNumber,proto3" json:"frame_number,omitempty"`
+	// The BLS48-581 signature proving ownership of the prover key
+	PublicKeySignatureBls48581 *BLS48581AddressedSignature `protobuf:"bytes,2,opt,name=public_key_signature_bls48581,json=publicKeySignatureBls48581,proto3" json:"public_key_signature_bls48581,omitempty"`
+	// The merge targets containing old peer keys to claim seniority from
+	MergeTargets []*SeniorityMerge `protobuf:"bytes,3,rep,name=merge_targets,json=mergeTargets,proto3" json:"merge_targets,omitempty"`
+}
+
+func (x *ProverSeniorityMerge) Reset() {
+	*x = ProverSeniorityMerge{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_global_proto_msgTypes[10]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *ProverSeniorityMerge) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProverSeniorityMerge) ProtoMessage() {}
+
+func (x *ProverSeniorityMerge) ProtoReflect() protoreflect.Message {
+	mi := &file_global_proto_msgTypes[10]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProverSeniorityMerge.ProtoReflect.Descriptor instead.
+func (*ProverSeniorityMerge) Descriptor() ([]byte, []int) {
+	return file_global_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ProverSeniorityMerge) GetFrameNumber() uint64 {
+	if x != nil {
+		return x.FrameNumber
+	}
+	return 0
+}
+
+func (x *ProverSeniorityMerge) GetPublicKeySignatureBls48581() *BLS48581AddressedSignature {
+	if x != nil {
+		return x.PublicKeySignatureBls48581
+	}
+	return nil
+}
+
+func (x *ProverSeniorityMerge) GetMergeTargets() []*SeniorityMerge {
+	if x != nil {
+		return x.MergeTargets
+	}
+	return nil
+}
+
 // AltShardUpdate allows external entities to maintain their own state trees
 // with provable ownership through signature verification. The shard address
 // is derived from the poseidon hash of the BLS48-581 public key.
@@ -731,7 +800,7 @@ type AltShardUpdate struct {
 func (x *AltShardUpdate) Reset() {
 	*x = AltShardUpdate{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[10]
+		mi := &file_global_proto_msgTypes[11]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -744,7 +813,7 @@ func (x *AltShardUpdate) String() string {
 func (*AltShardUpdate) ProtoMessage() {}
 
 func (x *AltShardUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[10]
+	mi := &file_global_proto_msgTypes[11]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -757,7 +826,7 @@ func (x *AltShardUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AltShardUpdate.ProtoReflect.Descriptor instead.
 func (*AltShardUpdate) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{10}
+	return file_global_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *AltShardUpdate) GetPublicKey() []byte {
@@ -842,6 +911,7 @@ type MessageRequest struct {
 	//	*MessageRequest_CodeFinalize
 	//	*MessageRequest_Shard
 	//	*MessageRequest_AltShardUpdate
+	//	*MessageRequest_SeniorityMerge
 	Request   isMessageRequest_Request `protobuf_oneof:"request"`
 	Timestamp int64                    `protobuf:"varint,99,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 }
@@ -849,7 +919,7 @@ type MessageRequest struct {
 func (x *MessageRequest) Reset() {
 	*x = MessageRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[11]
+		mi := &file_global_proto_msgTypes[12]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -862,7 +932,7 @@ func (x *MessageRequest) String() string {
 func (*MessageRequest) ProtoMessage() {}
 
 func (x *MessageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[11]
+	mi := &file_global_proto_msgTypes[12]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -875,7 +945,7 @@ func (x *MessageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MessageRequest.ProtoReflect.Descriptor instead.
 func (*MessageRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{11}
+	return file_global_proto_rawDescGZIP(), []int{12}
 }
 
 func (m *MessageRequest) GetRequest() isMessageRequest_Request {
@@ -1067,6 +1137,13 @@ func (x *MessageRequest) GetAltShardUpdate() *AltShardUpdate {
 	return nil
 }
 
+func (x *MessageRequest) GetSeniorityMerge() *ProverSeniorityMerge {
+	if x, ok := x.GetRequest().(*MessageRequest_SeniorityMerge); ok {
+		return x.SeniorityMerge
+	}
+	return nil
+}
+
 func (x *MessageRequest) GetTimestamp() int64 {
 	if x != nil {
 		return x.Timestamp
@@ -1182,6 +1259,10 @@ type MessageRequest_AltShardUpdate struct {
 	AltShardUpdate *AltShardUpdate `protobuf:"bytes,26,opt,name=alt_shard_update,json=altShardUpdate,proto3,oneof"`
 }
 
+type MessageRequest_SeniorityMerge struct {
+	SeniorityMerge *ProverSeniorityMerge `protobuf:"bytes,27,opt,name=seniority_merge,json=seniorityMerge,proto3,oneof"`
+}
+
 func (*MessageRequest_Join) isMessageRequest_Request() {}
 
 func (*MessageRequest_Leave) isMessageRequest_Request() {}
@@ -1234,6 +1315,8 @@ func (*MessageRequest_Shard) isMessageRequest_Request() {}
 
 func (*MessageRequest_AltShardUpdate) isMessageRequest_Request() {}
 
+func (*MessageRequest_SeniorityMerge) isMessageRequest_Request() {}
+
 type MessageBundle struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -1246,7 +1329,7 @@ type MessageBundle struct {
 func (x *MessageBundle) Reset() {
 	*x = MessageBundle{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[12]
+		mi := &file_global_proto_msgTypes[13]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1259,7 +1342,7 @@ func (x *MessageBundle) String() string {
 func (*MessageBundle) ProtoMessage() {}
 
 func (x *MessageBundle) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[12]
+	mi := &file_global_proto_msgTypes[13]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1272,7 +1355,7 @@ func (x *MessageBundle) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MessageBundle.ProtoReflect.Descriptor instead.
 func (*MessageBundle) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{12}
+	return file_global_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *MessageBundle) GetRequests() []*MessageRequest {
@@ -1340,7 +1423,7 @@ type GlobalFrameHeader struct {
 func (x *GlobalFrameHeader) Reset() {
 	*x = GlobalFrameHeader{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[13]
+		mi := &file_global_proto_msgTypes[14]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1353,7 +1436,7 @@ func (x *GlobalFrameHeader) String() string {
 func (*GlobalFrameHeader) ProtoMessage() {}
 
 func (x *GlobalFrameHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[13]
+	mi := &file_global_proto_msgTypes[14]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1366,7 +1449,7 @@ func (x *GlobalFrameHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GlobalFrameHeader.ProtoReflect.Descriptor instead.
 func (*GlobalFrameHeader) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{13}
+	return file_global_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *GlobalFrameHeader) GetFrameNumber() uint64 {
@@ -1500,7 +1583,7 @@ type FrameHeader struct {
 func (x *FrameHeader) Reset() {
 	*x = FrameHeader{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[14]
+		mi := &file_global_proto_msgTypes[15]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1513,7 +1596,7 @@ func (x *FrameHeader) String() string {
 func (*FrameHeader) ProtoMessage() {}
 
 func (x *FrameHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[14]
+	mi := &file_global_proto_msgTypes[15]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1526,7 +1609,7 @@ func (x *FrameHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FrameHeader.ProtoReflect.Descriptor instead.
 func (*FrameHeader) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{14}
+	return file_global_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *FrameHeader) GetAddress() []byte {
@@ -1635,7 +1718,7 @@ type ProverLivenessCheck struct {
 func (x *ProverLivenessCheck) Reset() {
 	*x = ProverLivenessCheck{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[15]
+		mi := &file_global_proto_msgTypes[16]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1648,7 +1731,7 @@ func (x *ProverLivenessCheck) String() string {
 func (*ProverLivenessCheck) ProtoMessage() {}
 
 func (x *ProverLivenessCheck) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[15]
+	mi := &file_global_proto_msgTypes[16]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1661,7 +1744,7 @@ func (x *ProverLivenessCheck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProverLivenessCheck.ProtoReflect.Descriptor instead.
 func (*ProverLivenessCheck) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{15}
+	return file_global_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ProverLivenessCheck) GetFilter() []byte {
@@ -1724,7 +1807,7 @@ type AppShardProposal struct {
 func (x *AppShardProposal) Reset() {
 	*x = AppShardProposal{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[16]
+		mi := &file_global_proto_msgTypes[17]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1737,7 +1820,7 @@ func (x *AppShardProposal) String() string {
 func (*AppShardProposal) ProtoMessage() {}
 
 func (x *AppShardProposal) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[16]
+	mi := &file_global_proto_msgTypes[17]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1750,7 +1833,7 @@ func (x *AppShardProposal) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppShardProposal.ProtoReflect.Descriptor instead.
 func (*AppShardProposal) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{16}
+	return file_global_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *AppShardProposal) GetState() *AppShardFrame {
@@ -1799,7 +1882,7 @@ type GlobalProposal struct {
 func (x *GlobalProposal) Reset() {
 	*x = GlobalProposal{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[17]
+		mi := &file_global_proto_msgTypes[18]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1812,7 +1895,7 @@ func (x *GlobalProposal) String() string {
 func (*GlobalProposal) ProtoMessage() {}
 
 func (x *GlobalProposal) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[17]
+	mi := &file_global_proto_msgTypes[18]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1825,7 +1908,7 @@ func (x *GlobalProposal) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GlobalProposal.ProtoReflect.Descriptor instead.
 func (*GlobalProposal) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{17}
+	return file_global_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *GlobalProposal) GetState() *GlobalFrame {
@@ -1878,7 +1961,7 @@ type ProposalVote struct {
 func (x *ProposalVote) Reset() {
 	*x = ProposalVote{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[18]
+		mi := &file_global_proto_msgTypes[19]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1891,7 +1974,7 @@ func (x *ProposalVote) String() string {
 func (*ProposalVote) ProtoMessage() {}
 
 func (x *ProposalVote) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[18]
+	mi := &file_global_proto_msgTypes[19]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1904,7 +1987,7 @@ func (x *ProposalVote) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProposalVote.ProtoReflect.Descriptor instead.
 func (*ProposalVote) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{18}
+	return file_global_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ProposalVote) GetFilter() []byte {
@@ -1977,7 +2060,7 @@ type TimeoutState struct {
 func (x *TimeoutState) Reset() {
 	*x = TimeoutState{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[19]
+		mi := &file_global_proto_msgTypes[20]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1990,7 +2073,7 @@ func (x *TimeoutState) String() string {
 func (*TimeoutState) ProtoMessage() {}
 
 func (x *TimeoutState) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[19]
+	mi := &file_global_proto_msgTypes[20]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2003,7 +2086,7 @@ func (x *TimeoutState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TimeoutState.ProtoReflect.Descriptor instead.
 func (*TimeoutState) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{19}
+	return file_global_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *TimeoutState) GetLatestQuorumCertificate() *QuorumCertificate {
@@ -2063,7 +2146,7 @@ type QuorumCertificate struct {
 func (x *QuorumCertificate) Reset() {
 	*x = QuorumCertificate{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[20]
+		mi := &file_global_proto_msgTypes[21]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2076,7 +2159,7 @@ func (x *QuorumCertificate) String() string {
 func (*QuorumCertificate) ProtoMessage() {}
 
 func (x *QuorumCertificate) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[20]
+	mi := &file_global_proto_msgTypes[21]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2089,7 +2172,7 @@ func (x *QuorumCertificate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QuorumCertificate.ProtoReflect.Descriptor instead.
 func (*QuorumCertificate) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{20}
+	return file_global_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *QuorumCertificate) GetFilter() []byte {
@@ -2156,7 +2239,7 @@ type TimeoutCertificate struct {
 func (x *TimeoutCertificate) Reset() {
 	*x = TimeoutCertificate{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[21]
+		mi := &file_global_proto_msgTypes[22]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2169,7 +2252,7 @@ func (x *TimeoutCertificate) String() string {
 func (*TimeoutCertificate) ProtoMessage() {}
 
 func (x *TimeoutCertificate) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[21]
+	mi := &file_global_proto_msgTypes[22]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2182,7 +2265,7 @@ func (x *TimeoutCertificate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TimeoutCertificate.ProtoReflect.Descriptor instead.
 func (*TimeoutCertificate) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{21}
+	return file_global_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *TimeoutCertificate) GetFilter() []byte {
@@ -2239,7 +2322,7 @@ type GlobalFrame struct {
 func (x *GlobalFrame) Reset() {
 	*x = GlobalFrame{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[22]
+		mi := &file_global_proto_msgTypes[23]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2252,7 +2335,7 @@ func (x *GlobalFrame) String() string {
 func (*GlobalFrame) ProtoMessage() {}
 
 func (x *GlobalFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[22]
+	mi := &file_global_proto_msgTypes[23]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2265,7 +2348,7 @@ func (x *GlobalFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GlobalFrame.ProtoReflect.Descriptor instead.
 func (*GlobalFrame) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{22}
+	return file_global_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *GlobalFrame) GetHeader() *GlobalFrameHeader {
@@ -2294,7 +2377,7 @@ type AppShardFrame struct {
 func (x *AppShardFrame) Reset() {
 	*x = AppShardFrame{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[23]
+		mi := &file_global_proto_msgTypes[24]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2307,7 +2390,7 @@ func (x *AppShardFrame) String() string {
 func (*AppShardFrame) ProtoMessage() {}
 
 func (x *AppShardFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[23]
+	mi := &file_global_proto_msgTypes[24]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2320,7 +2403,7 @@ func (x *AppShardFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppShardFrame.ProtoReflect.Descriptor instead.
 func (*AppShardFrame) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{23}
+	return file_global_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *AppShardFrame) GetHeader() *FrameHeader {
@@ -2349,7 +2432,7 @@ type GlobalAlert struct {
 func (x *GlobalAlert) Reset() {
 	*x = GlobalAlert{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[24]
+		mi := &file_global_proto_msgTypes[25]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2362,7 +2445,7 @@ func (x *GlobalAlert) String() string {
 func (*GlobalAlert) ProtoMessage() {}
 
 func (x *GlobalAlert) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[24]
+	mi := &file_global_proto_msgTypes[25]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2375,7 +2458,7 @@ func (x *GlobalAlert) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GlobalAlert.ProtoReflect.Descriptor instead.
 func (*GlobalAlert) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{24}
+	return file_global_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *GlobalAlert) GetMessage() string {
@@ -2403,7 +2486,7 @@ type GetGlobalFrameRequest struct {
 func (x *GetGlobalFrameRequest) Reset() {
 	*x = GetGlobalFrameRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[25]
+		mi := &file_global_proto_msgTypes[26]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2416,7 +2499,7 @@ func (x *GetGlobalFrameRequest) String() string {
 func (*GetGlobalFrameRequest) ProtoMessage() {}
 
 func (x *GetGlobalFrameRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[25]
+	mi := &file_global_proto_msgTypes[26]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2429,7 +2512,7 @@ func (x *GetGlobalFrameRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetGlobalFrameRequest.ProtoReflect.Descriptor instead.
 func (*GetGlobalFrameRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{25}
+	return file_global_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *GetGlobalFrameRequest) GetFrameNumber() uint64 {
@@ -2451,7 +2534,7 @@ type GlobalFrameResponse struct {
 func (x *GlobalFrameResponse) Reset() {
 	*x = GlobalFrameResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[26]
+		mi := &file_global_proto_msgTypes[27]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2464,7 +2547,7 @@ func (x *GlobalFrameResponse) String() string {
 func (*GlobalFrameResponse) ProtoMessage() {}
 
 func (x *GlobalFrameResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[26]
+	mi := &file_global_proto_msgTypes[27]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2477,7 +2560,7 @@ func (x *GlobalFrameResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GlobalFrameResponse.ProtoReflect.Descriptor instead.
 func (*GlobalFrameResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{26}
+	return file_global_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *GlobalFrameResponse) GetFrame() *GlobalFrame {
@@ -2505,7 +2588,7 @@ type GetGlobalProposalRequest struct {
 func (x *GetGlobalProposalRequest) Reset() {
 	*x = GetGlobalProposalRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[27]
+		mi := &file_global_proto_msgTypes[28]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2518,7 +2601,7 @@ func (x *GetGlobalProposalRequest) String() string {
 func (*GetGlobalProposalRequest) ProtoMessage() {}
 
 func (x *GetGlobalProposalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[27]
+	mi := &file_global_proto_msgTypes[28]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2531,7 +2614,7 @@ func (x *GetGlobalProposalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetGlobalProposalRequest.ProtoReflect.Descriptor instead.
 func (*GetGlobalProposalRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{27}
+	return file_global_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *GetGlobalProposalRequest) GetFrameNumber() uint64 {
@@ -2552,7 +2635,7 @@ type GlobalProposalResponse struct {
 func (x *GlobalProposalResponse) Reset() {
 	*x = GlobalProposalResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[28]
+		mi := &file_global_proto_msgTypes[29]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2565,7 +2648,7 @@ func (x *GlobalProposalResponse) String() string {
 func (*GlobalProposalResponse) ProtoMessage() {}
 
 func (x *GlobalProposalResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[28]
+	mi := &file_global_proto_msgTypes[29]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2578,7 +2661,7 @@ func (x *GlobalProposalResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GlobalProposalResponse.ProtoReflect.Descriptor instead.
 func (*GlobalProposalResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{28}
+	return file_global_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *GlobalProposalResponse) GetProposal() *GlobalProposal {
@@ -2600,7 +2683,7 @@ type GetAppShardFrameRequest struct {
 func (x *GetAppShardFrameRequest) Reset() {
 	*x = GetAppShardFrameRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[29]
+		mi := &file_global_proto_msgTypes[30]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2613,7 +2696,7 @@ func (x *GetAppShardFrameRequest) String() string {
 func (*GetAppShardFrameRequest) ProtoMessage() {}
 
 func (x *GetAppShardFrameRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[29]
+	mi := &file_global_proto_msgTypes[30]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2626,7 +2709,7 @@ func (x *GetAppShardFrameRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAppShardFrameRequest.ProtoReflect.Descriptor instead.
 func (*GetAppShardFrameRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{29}
+	return file_global_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *GetAppShardFrameRequest) GetFilter() []byte {
@@ -2655,7 +2738,7 @@ type AppShardFrameResponse struct {
 func (x *AppShardFrameResponse) Reset() {
 	*x = AppShardFrameResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[30]
+		mi := &file_global_proto_msgTypes[31]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2668,7 +2751,7 @@ func (x *AppShardFrameResponse) String() string {
 func (*AppShardFrameResponse) ProtoMessage() {}
 
 func (x *AppShardFrameResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[30]
+	mi := &file_global_proto_msgTypes[31]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2681,7 +2764,7 @@ func (x *AppShardFrameResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppShardFrameResponse.ProtoReflect.Descriptor instead.
 func (*AppShardFrameResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{30}
+	return file_global_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *AppShardFrameResponse) GetFrame() *AppShardFrame {
@@ -2710,7 +2793,7 @@ type GetAppShardProposalRequest struct {
 func (x *GetAppShardProposalRequest) Reset() {
 	*x = GetAppShardProposalRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[31]
+		mi := &file_global_proto_msgTypes[32]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2723,7 +2806,7 @@ func (x *GetAppShardProposalRequest) String() string {
 func (*GetAppShardProposalRequest) ProtoMessage() {}
 
 func (x *GetAppShardProposalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[31]
+	mi := &file_global_proto_msgTypes[32]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2736,7 +2819,7 @@ func (x *GetAppShardProposalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAppShardProposalRequest.ProtoReflect.Descriptor instead.
 func (*GetAppShardProposalRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{31}
+	return file_global_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *GetAppShardProposalRequest) GetFilter() []byte {
@@ -2764,7 +2847,7 @@ type AppShardProposalResponse struct {
 func (x *AppShardProposalResponse) Reset() {
 	*x = AppShardProposalResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[32]
+		mi := &file_global_proto_msgTypes[33]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2777,7 +2860,7 @@ func (x *AppShardProposalResponse) String() string {
 func (*AppShardProposalResponse) ProtoMessage() {}
 
 func (x *AppShardProposalResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[32]
+	mi := &file_global_proto_msgTypes[33]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2790,7 +2873,7 @@ func (x *AppShardProposalResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppShardProposalResponse.ProtoReflect.Descriptor instead.
 func (*AppShardProposalResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{32}
+	return file_global_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *AppShardProposalResponse) GetProposal() *AppShardProposal {
@@ -2812,7 +2895,7 @@ type GetAppShardsRequest struct {
 func (x *GetAppShardsRequest) Reset() {
 	*x = GetAppShardsRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[33]
+		mi := &file_global_proto_msgTypes[34]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2825,7 +2908,7 @@ func (x *GetAppShardsRequest) String() string {
 func (*GetAppShardsRequest) ProtoMessage() {}
 
 func (x *GetAppShardsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[33]
+	mi := &file_global_proto_msgTypes[34]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2838,7 +2921,7 @@ func (x *GetAppShardsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAppShardsRequest.ProtoReflect.Descriptor instead.
 func (*GetAppShardsRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{33}
+	return file_global_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *GetAppShardsRequest) GetShardKey() []byte {
@@ -2870,7 +2953,7 @@ type AppShardInfo struct {
 func (x *AppShardInfo) Reset() {
 	*x = AppShardInfo{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[34]
+		mi := &file_global_proto_msgTypes[35]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2883,7 +2966,7 @@ func (x *AppShardInfo) String() string {
 func (*AppShardInfo) ProtoMessage() {}
 
 func (x *AppShardInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[34]
+	mi := &file_global_proto_msgTypes[35]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2896,7 +2979,7 @@ func (x *AppShardInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppShardInfo.ProtoReflect.Descriptor instead.
 func (*AppShardInfo) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{34}
+	return file_global_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *AppShardInfo) GetPrefix() []uint32 {
@@ -2945,7 +3028,7 @@ type GetAppShardsResponse struct {
 func (x *GetAppShardsResponse) Reset() {
 	*x = GetAppShardsResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[35]
+		mi := &file_global_proto_msgTypes[36]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -2958,7 +3041,7 @@ func (x *GetAppShardsResponse) String() string {
 func (*GetAppShardsResponse) ProtoMessage() {}
 
 func (x *GetAppShardsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[35]
+	mi := &file_global_proto_msgTypes[36]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2971,7 +3054,7 @@ func (x *GetAppShardsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAppShardsResponse.ProtoReflect.Descriptor instead.
 func (*GetAppShardsResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{35}
+	return file_global_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *GetAppShardsResponse) GetInfo() []*AppShardInfo {
@@ -2993,7 +3076,7 @@ type GetGlobalShardsRequest struct {
 func (x *GetGlobalShardsRequest) Reset() {
 	*x = GetGlobalShardsRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[36]
+		mi := &file_global_proto_msgTypes[37]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3006,7 +3089,7 @@ func (x *GetGlobalShardsRequest) String() string {
 func (*GetGlobalShardsRequest) ProtoMessage() {}
 
 func (x *GetGlobalShardsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[36]
+	mi := &file_global_proto_msgTypes[37]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3019,7 +3102,7 @@ func (x *GetGlobalShardsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetGlobalShardsRequest.ProtoReflect.Descriptor instead.
 func (*GetGlobalShardsRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{36}
+	return file_global_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *GetGlobalShardsRequest) GetL1() []byte {
@@ -3048,7 +3131,7 @@ type GetGlobalShardsResponse struct {
 func (x *GetGlobalShardsResponse) Reset() {
 	*x = GetGlobalShardsResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[37]
+		mi := &file_global_proto_msgTypes[38]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3061,7 +3144,7 @@ func (x *GetGlobalShardsResponse) String() string {
 func (*GetGlobalShardsResponse) ProtoMessage() {}
 
 func (x *GetGlobalShardsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[37]
+	mi := &file_global_proto_msgTypes[38]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3074,7 +3157,7 @@ func (x *GetGlobalShardsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetGlobalShardsResponse.ProtoReflect.Descriptor instead.
 func (*GetGlobalShardsResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{37}
+	return file_global_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *GetGlobalShardsResponse) GetSize() []byte {
@@ -3106,7 +3189,7 @@ type GetLockedAddressesRequest struct {
 func (x *GetLockedAddressesRequest) Reset() {
 	*x = GetLockedAddressesRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[38]
+		mi := &file_global_proto_msgTypes[39]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3119,7 +3202,7 @@ func (x *GetLockedAddressesRequest) String() string {
 func (*GetLockedAddressesRequest) ProtoMessage() {}
 
 func (x *GetLockedAddressesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[38]
+	mi := &file_global_proto_msgTypes[39]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3132,7 +3215,7 @@ func (x *GetLockedAddressesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLockedAddressesRequest.ProtoReflect.Descriptor instead.
 func (*GetLockedAddressesRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{38}
+	return file_global_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *GetLockedAddressesRequest) GetShardAddress() []byte {
@@ -3167,7 +3250,7 @@ type LockedTransaction struct {
 func (x *LockedTransaction) Reset() {
 	*x = LockedTransaction{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[39]
+		mi := &file_global_proto_msgTypes[40]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3180,7 +3263,7 @@ func (x *LockedTransaction) String() string {
 func (*LockedTransaction) ProtoMessage() {}
 
 func (x *LockedTransaction) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[39]
+	mi := &file_global_proto_msgTypes[40]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3193,7 +3276,7 @@ func (x *LockedTransaction) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LockedTransaction.ProtoReflect.Descriptor instead.
 func (*LockedTransaction) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{39}
+	return file_global_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *LockedTransaction) GetTransactionHash() []byte {
@@ -3235,7 +3318,7 @@ type GetLockedAddressesResponse struct {
 func (x *GetLockedAddressesResponse) Reset() {
 	*x = GetLockedAddressesResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[40]
+		mi := &file_global_proto_msgTypes[41]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3248,7 +3331,7 @@ func (x *GetLockedAddressesResponse) String() string {
 func (*GetLockedAddressesResponse) ProtoMessage() {}
 
 func (x *GetLockedAddressesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[40]
+	mi := &file_global_proto_msgTypes[41]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3261,7 +3344,7 @@ func (x *GetLockedAddressesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLockedAddressesResponse.ProtoReflect.Descriptor instead.
 func (*GetLockedAddressesResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{40}
+	return file_global_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *GetLockedAddressesResponse) GetTransactions() []*LockedTransaction {
@@ -3280,7 +3363,7 @@ type GlobalGetWorkerInfoRequest struct {
 func (x *GlobalGetWorkerInfoRequest) Reset() {
 	*x = GlobalGetWorkerInfoRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[41]
+		mi := &file_global_proto_msgTypes[42]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3293,7 +3376,7 @@ func (x *GlobalGetWorkerInfoRequest) String() string {
 func (*GlobalGetWorkerInfoRequest) ProtoMessage() {}
 
 func (x *GlobalGetWorkerInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[41]
+	mi := &file_global_proto_msgTypes[42]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3306,7 +3389,7 @@ func (x *GlobalGetWorkerInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GlobalGetWorkerInfoRequest.ProtoReflect.Descriptor instead.
 func (*GlobalGetWorkerInfoRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{41}
+	return file_global_proto_rawDescGZIP(), []int{42}
 }
 
 type GlobalGetWorkerInfoResponseItem struct {
@@ -3325,7 +3408,7 @@ type GlobalGetWorkerInfoResponseItem struct {
 func (x *GlobalGetWorkerInfoResponseItem) Reset() {
 	*x = GlobalGetWorkerInfoResponseItem{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[42]
+		mi := &file_global_proto_msgTypes[43]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3338,7 +3421,7 @@ func (x *GlobalGetWorkerInfoResponseItem) String() string {
 func (*GlobalGetWorkerInfoResponseItem) ProtoMessage() {}
 
 func (x *GlobalGetWorkerInfoResponseItem) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[42]
+	mi := &file_global_proto_msgTypes[43]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3351,7 +3434,7 @@ func (x *GlobalGetWorkerInfoResponseItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GlobalGetWorkerInfoResponseItem.ProtoReflect.Descriptor instead.
 func (*GlobalGetWorkerInfoResponseItem) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{42}
+	return file_global_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *GlobalGetWorkerInfoResponseItem) GetCoreId() uint32 {
@@ -3407,7 +3490,7 @@ type GlobalGetWorkerInfoResponse struct {
 func (x *GlobalGetWorkerInfoResponse) Reset() {
 	*x = GlobalGetWorkerInfoResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[43]
+		mi := &file_global_proto_msgTypes[44]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3420,7 +3503,7 @@ func (x *GlobalGetWorkerInfoResponse) String() string {
 func (*GlobalGetWorkerInfoResponse) ProtoMessage() {}
 
 func (x *GlobalGetWorkerInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[43]
+	mi := &file_global_proto_msgTypes[44]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3433,7 +3516,7 @@ func (x *GlobalGetWorkerInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GlobalGetWorkerInfoResponse.ProtoReflect.Descriptor instead.
 func (*GlobalGetWorkerInfoResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{43}
+	return file_global_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *GlobalGetWorkerInfoResponse) GetWorkers() []*GlobalGetWorkerInfoResponseItem {
@@ -3456,7 +3539,7 @@ type SendMessage struct {
 func (x *SendMessage) Reset() {
 	*x = SendMessage{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[44]
+		mi := &file_global_proto_msgTypes[45]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3469,7 +3552,7 @@ func (x *SendMessage) String() string {
 func (*SendMessage) ProtoMessage() {}
 
 func (x *SendMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[44]
+	mi := &file_global_proto_msgTypes[45]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3482,7 +3565,7 @@ func (x *SendMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendMessage.ProtoReflect.Descriptor instead.
 func (*SendMessage) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{44}
+	return file_global_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *SendMessage) GetPeerId() []byte {
@@ -3519,7 +3602,7 @@ type ReceiveMessage struct {
 func (x *ReceiveMessage) Reset() {
 	*x = ReceiveMessage{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[45]
+		mi := &file_global_proto_msgTypes[46]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3532,7 +3615,7 @@ func (x *ReceiveMessage) String() string {
 func (*ReceiveMessage) ProtoMessage() {}
 
 func (x *ReceiveMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[45]
+	mi := &file_global_proto_msgTypes[46]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3545,7 +3628,7 @@ func (x *ReceiveMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReceiveMessage.ProtoReflect.Descriptor instead.
 func (*ReceiveMessage) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{45}
+	return file_global_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *ReceiveMessage) GetSourcePeerId() []byte {
@@ -3580,7 +3663,7 @@ type GetKeyRegistryRequest struct {
 func (x *GetKeyRegistryRequest) Reset() {
 	*x = GetKeyRegistryRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[46]
+		mi := &file_global_proto_msgTypes[47]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3593,7 +3676,7 @@ func (x *GetKeyRegistryRequest) String() string {
 func (*GetKeyRegistryRequest) ProtoMessage() {}
 
 func (x *GetKeyRegistryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[46]
+	mi := &file_global_proto_msgTypes[47]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3606,7 +3689,7 @@ func (x *GetKeyRegistryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetKeyRegistryRequest.ProtoReflect.Descriptor instead.
 func (*GetKeyRegistryRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{46}
+	return file_global_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *GetKeyRegistryRequest) GetIdentityKeyAddress() []byte {
@@ -3628,7 +3711,7 @@ type GetKeyRegistryResponse struct {
 func (x *GetKeyRegistryResponse) Reset() {
 	*x = GetKeyRegistryResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[47]
+		mi := &file_global_proto_msgTypes[48]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3641,7 +3724,7 @@ func (x *GetKeyRegistryResponse) String() string {
 func (*GetKeyRegistryResponse) ProtoMessage() {}
 
 func (x *GetKeyRegistryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[47]
+	mi := &file_global_proto_msgTypes[48]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3654,7 +3737,7 @@ func (x *GetKeyRegistryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetKeyRegistryResponse.ProtoReflect.Descriptor instead.
 func (*GetKeyRegistryResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{47}
+	return file_global_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *GetKeyRegistryResponse) GetRegistry() *KeyRegistry {
@@ -3682,7 +3765,7 @@ type GetKeyRegistryByProverRequest struct {
 func (x *GetKeyRegistryByProverRequest) Reset() {
 	*x = GetKeyRegistryByProverRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[48]
+		mi := &file_global_proto_msgTypes[49]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3695,7 +3778,7 @@ func (x *GetKeyRegistryByProverRequest) String() string {
 func (*GetKeyRegistryByProverRequest) ProtoMessage() {}
 
 func (x *GetKeyRegistryByProverRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[48]
+	mi := &file_global_proto_msgTypes[49]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3708,7 +3791,7 @@ func (x *GetKeyRegistryByProverRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetKeyRegistryByProverRequest.ProtoReflect.Descriptor instead.
 func (*GetKeyRegistryByProverRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{48}
+	return file_global_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *GetKeyRegistryByProverRequest) GetProverKeyAddress() []byte {
@@ -3730,7 +3813,7 @@ type GetKeyRegistryByProverResponse struct {
 func (x *GetKeyRegistryByProverResponse) Reset() {
 	*x = GetKeyRegistryByProverResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[49]
+		mi := &file_global_proto_msgTypes[50]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3743,7 +3826,7 @@ func (x *GetKeyRegistryByProverResponse) String() string {
 func (*GetKeyRegistryByProverResponse) ProtoMessage() {}
 
 func (x *GetKeyRegistryByProverResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[49]
+	mi := &file_global_proto_msgTypes[50]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3756,7 +3839,7 @@ func (x *GetKeyRegistryByProverResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetKeyRegistryByProverResponse.ProtoReflect.Descriptor instead.
 func (*GetKeyRegistryByProverResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{49}
+	return file_global_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *GetKeyRegistryByProverResponse) GetRegistry() *KeyRegistry {
@@ -3785,7 +3868,7 @@ type PutIdentityKeyRequest struct {
 func (x *PutIdentityKeyRequest) Reset() {
 	*x = PutIdentityKeyRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[50]
+		mi := &file_global_proto_msgTypes[51]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3798,7 +3881,7 @@ func (x *PutIdentityKeyRequest) String() string {
 func (*PutIdentityKeyRequest) ProtoMessage() {}
 
 func (x *PutIdentityKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[50]
+	mi := &file_global_proto_msgTypes[51]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3811,7 +3894,7 @@ func (x *PutIdentityKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutIdentityKeyRequest.ProtoReflect.Descriptor instead.
 func (*PutIdentityKeyRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{50}
+	return file_global_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *PutIdentityKeyRequest) GetAddress() []byte {
@@ -3839,7 +3922,7 @@ type PutIdentityKeyResponse struct {
 func (x *PutIdentityKeyResponse) Reset() {
 	*x = PutIdentityKeyResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[51]
+		mi := &file_global_proto_msgTypes[52]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3852,7 +3935,7 @@ func (x *PutIdentityKeyResponse) String() string {
 func (*PutIdentityKeyResponse) ProtoMessage() {}
 
 func (x *PutIdentityKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[51]
+	mi := &file_global_proto_msgTypes[52]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3865,7 +3948,7 @@ func (x *PutIdentityKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutIdentityKeyResponse.ProtoReflect.Descriptor instead.
 func (*PutIdentityKeyResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{51}
+	return file_global_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *PutIdentityKeyResponse) GetError() string {
@@ -3886,7 +3969,7 @@ type PutProvingKeyRequest struct {
 func (x *PutProvingKeyRequest) Reset() {
 	*x = PutProvingKeyRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[52]
+		mi := &file_global_proto_msgTypes[53]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3899,7 +3982,7 @@ func (x *PutProvingKeyRequest) String() string {
 func (*PutProvingKeyRequest) ProtoMessage() {}
 
 func (x *PutProvingKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[52]
+	mi := &file_global_proto_msgTypes[53]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3912,7 +3995,7 @@ func (x *PutProvingKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutProvingKeyRequest.ProtoReflect.Descriptor instead.
 func (*PutProvingKeyRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{52}
+	return file_global_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *PutProvingKeyRequest) GetProvingKey() *BLS48581SignatureWithProofOfPossession {
@@ -3933,7 +4016,7 @@ type PutProvingKeyResponse struct {
 func (x *PutProvingKeyResponse) Reset() {
 	*x = PutProvingKeyResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[53]
+		mi := &file_global_proto_msgTypes[54]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3946,7 +4029,7 @@ func (x *PutProvingKeyResponse) String() string {
 func (*PutProvingKeyResponse) ProtoMessage() {}
 
 func (x *PutProvingKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[53]
+	mi := &file_global_proto_msgTypes[54]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3959,7 +4042,7 @@ func (x *PutProvingKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutProvingKeyResponse.ProtoReflect.Descriptor instead.
 func (*PutProvingKeyResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{53}
+	return file_global_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *PutProvingKeyResponse) GetError() string {
@@ -3983,7 +4066,7 @@ type PutCrossSignatureRequest struct {
 func (x *PutCrossSignatureRequest) Reset() {
 	*x = PutCrossSignatureRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[54]
+		mi := &file_global_proto_msgTypes[55]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -3996,7 +4079,7 @@ func (x *PutCrossSignatureRequest) String() string {
 func (*PutCrossSignatureRequest) ProtoMessage() {}
 
 func (x *PutCrossSignatureRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[54]
+	mi := &file_global_proto_msgTypes[55]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4009,7 +4092,7 @@ func (x *PutCrossSignatureRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutCrossSignatureRequest.ProtoReflect.Descriptor instead.
 func (*PutCrossSignatureRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{54}
+	return file_global_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *PutCrossSignatureRequest) GetIdentityKeyAddress() []byte {
@@ -4051,7 +4134,7 @@ type PutCrossSignatureResponse struct {
 func (x *PutCrossSignatureResponse) Reset() {
 	*x = PutCrossSignatureResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[55]
+		mi := &file_global_proto_msgTypes[56]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4064,7 +4147,7 @@ func (x *PutCrossSignatureResponse) String() string {
 func (*PutCrossSignatureResponse) ProtoMessage() {}
 
 func (x *PutCrossSignatureResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[55]
+	mi := &file_global_proto_msgTypes[56]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4077,7 +4160,7 @@ func (x *PutCrossSignatureResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutCrossSignatureResponse.ProtoReflect.Descriptor instead.
 func (*PutCrossSignatureResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{55}
+	return file_global_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *PutCrossSignatureResponse) GetError() string {
@@ -4099,7 +4182,7 @@ type PutSignedKeyRequest struct {
 func (x *PutSignedKeyRequest) Reset() {
 	*x = PutSignedKeyRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[56]
+		mi := &file_global_proto_msgTypes[57]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4112,7 +4195,7 @@ func (x *PutSignedKeyRequest) String() string {
 func (*PutSignedKeyRequest) ProtoMessage() {}
 
 func (x *PutSignedKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[56]
+	mi := &file_global_proto_msgTypes[57]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4125,7 +4208,7 @@ func (x *PutSignedKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutSignedKeyRequest.ProtoReflect.Descriptor instead.
 func (*PutSignedKeyRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{56}
+	return file_global_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *PutSignedKeyRequest) GetAddress() []byte {
@@ -4153,7 +4236,7 @@ type PutSignedKeyResponse struct {
 func (x *PutSignedKeyResponse) Reset() {
 	*x = PutSignedKeyResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[57]
+		mi := &file_global_proto_msgTypes[58]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4166,7 +4249,7 @@ func (x *PutSignedKeyResponse) String() string {
 func (*PutSignedKeyResponse) ProtoMessage() {}
 
 func (x *PutSignedKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[57]
+	mi := &file_global_proto_msgTypes[58]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4179,7 +4262,7 @@ func (x *PutSignedKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutSignedKeyResponse.ProtoReflect.Descriptor instead.
 func (*PutSignedKeyResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{57}
+	return file_global_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *PutSignedKeyResponse) GetError() string {
@@ -4200,7 +4283,7 @@ type GetIdentityKeyRequest struct {
 func (x *GetIdentityKeyRequest) Reset() {
 	*x = GetIdentityKeyRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[58]
+		mi := &file_global_proto_msgTypes[59]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4213,7 +4296,7 @@ func (x *GetIdentityKeyRequest) String() string {
 func (*GetIdentityKeyRequest) ProtoMessage() {}
 
 func (x *GetIdentityKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[58]
+	mi := &file_global_proto_msgTypes[59]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4226,7 +4309,7 @@ func (x *GetIdentityKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetIdentityKeyRequest.ProtoReflect.Descriptor instead.
 func (*GetIdentityKeyRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{58}
+	return file_global_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *GetIdentityKeyRequest) GetAddress() []byte {
@@ -4248,7 +4331,7 @@ type GetIdentityKeyResponse struct {
 func (x *GetIdentityKeyResponse) Reset() {
 	*x = GetIdentityKeyResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[59]
+		mi := &file_global_proto_msgTypes[60]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4261,7 +4344,7 @@ func (x *GetIdentityKeyResponse) String() string {
 func (*GetIdentityKeyResponse) ProtoMessage() {}
 
 func (x *GetIdentityKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[59]
+	mi := &file_global_proto_msgTypes[60]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4274,7 +4357,7 @@ func (x *GetIdentityKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetIdentityKeyResponse.ProtoReflect.Descriptor instead.
 func (*GetIdentityKeyResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{59}
+	return file_global_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *GetIdentityKeyResponse) GetKey() *Ed448PublicKey {
@@ -4302,7 +4385,7 @@ type GetProvingKeyRequest struct {
 func (x *GetProvingKeyRequest) Reset() {
 	*x = GetProvingKeyRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[60]
+		mi := &file_global_proto_msgTypes[61]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4315,7 +4398,7 @@ func (x *GetProvingKeyRequest) String() string {
 func (*GetProvingKeyRequest) ProtoMessage() {}
 
 func (x *GetProvingKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[60]
+	mi := &file_global_proto_msgTypes[61]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4328,7 +4411,7 @@ func (x *GetProvingKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProvingKeyRequest.ProtoReflect.Descriptor instead.
 func (*GetProvingKeyRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{60}
+	return file_global_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *GetProvingKeyRequest) GetAddress() []byte {
@@ -4350,7 +4433,7 @@ type GetProvingKeyResponse struct {
 func (x *GetProvingKeyResponse) Reset() {
 	*x = GetProvingKeyResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[61]
+		mi := &file_global_proto_msgTypes[62]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4363,7 +4446,7 @@ func (x *GetProvingKeyResponse) String() string {
 func (*GetProvingKeyResponse) ProtoMessage() {}
 
 func (x *GetProvingKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[61]
+	mi := &file_global_proto_msgTypes[62]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4376,7 +4459,7 @@ func (x *GetProvingKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProvingKeyResponse.ProtoReflect.Descriptor instead.
 func (*GetProvingKeyResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{61}
+	return file_global_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *GetProvingKeyResponse) GetKey() *BLS48581SignatureWithProofOfPossession {
@@ -4404,7 +4487,7 @@ type GetSignedKeyRequest struct {
 func (x *GetSignedKeyRequest) Reset() {
 	*x = GetSignedKeyRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[62]
+		mi := &file_global_proto_msgTypes[63]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4417,7 +4500,7 @@ func (x *GetSignedKeyRequest) String() string {
 func (*GetSignedKeyRequest) ProtoMessage() {}
 
 func (x *GetSignedKeyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[62]
+	mi := &file_global_proto_msgTypes[63]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4430,7 +4513,7 @@ func (x *GetSignedKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSignedKeyRequest.ProtoReflect.Descriptor instead.
 func (*GetSignedKeyRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{62}
+	return file_global_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *GetSignedKeyRequest) GetAddress() []byte {
@@ -4452,7 +4535,7 @@ type GetSignedKeyResponse struct {
 func (x *GetSignedKeyResponse) Reset() {
 	*x = GetSignedKeyResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[63]
+		mi := &file_global_proto_msgTypes[64]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4465,7 +4548,7 @@ func (x *GetSignedKeyResponse) String() string {
 func (*GetSignedKeyResponse) ProtoMessage() {}
 
 func (x *GetSignedKeyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[63]
+	mi := &file_global_proto_msgTypes[64]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4478,7 +4561,7 @@ func (x *GetSignedKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSignedKeyResponse.ProtoReflect.Descriptor instead.
 func (*GetSignedKeyResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{63}
+	return file_global_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *GetSignedKeyResponse) GetKey() *SignedX448Key {
@@ -4507,7 +4590,7 @@ type GetSignedKeysByParentRequest struct {
 func (x *GetSignedKeysByParentRequest) Reset() {
 	*x = GetSignedKeysByParentRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[64]
+		mi := &file_global_proto_msgTypes[65]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4520,7 +4603,7 @@ func (x *GetSignedKeysByParentRequest) String() string {
 func (*GetSignedKeysByParentRequest) ProtoMessage() {}
 
 func (x *GetSignedKeysByParentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[64]
+	mi := &file_global_proto_msgTypes[65]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4533,7 +4616,7 @@ func (x *GetSignedKeysByParentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSignedKeysByParentRequest.ProtoReflect.Descriptor instead.
 func (*GetSignedKeysByParentRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{64}
+	return file_global_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *GetSignedKeysByParentRequest) GetParentKeyAddress() []byte {
@@ -4562,7 +4645,7 @@ type GetSignedKeysByParentResponse struct {
 func (x *GetSignedKeysByParentResponse) Reset() {
 	*x = GetSignedKeysByParentResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[65]
+		mi := &file_global_proto_msgTypes[66]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4575,7 +4658,7 @@ func (x *GetSignedKeysByParentResponse) String() string {
 func (*GetSignedKeysByParentResponse) ProtoMessage() {}
 
 func (x *GetSignedKeysByParentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[65]
+	mi := &file_global_proto_msgTypes[66]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4588,7 +4671,7 @@ func (x *GetSignedKeysByParentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSignedKeysByParentResponse.ProtoReflect.Descriptor instead.
 func (*GetSignedKeysByParentResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{65}
+	return file_global_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *GetSignedKeysByParentResponse) GetKeys() []*SignedX448Key {
@@ -4614,7 +4697,7 @@ type RangeProvingKeysRequest struct {
 func (x *RangeProvingKeysRequest) Reset() {
 	*x = RangeProvingKeysRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[66]
+		mi := &file_global_proto_msgTypes[67]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4627,7 +4710,7 @@ func (x *RangeProvingKeysRequest) String() string {
 func (*RangeProvingKeysRequest) ProtoMessage() {}
 
 func (x *RangeProvingKeysRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[66]
+	mi := &file_global_proto_msgTypes[67]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4640,7 +4723,7 @@ func (x *RangeProvingKeysRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeProvingKeysRequest.ProtoReflect.Descriptor instead.
 func (*RangeProvingKeysRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{66}
+	return file_global_proto_rawDescGZIP(), []int{67}
 }
 
 type RangeProvingKeysResponse struct {
@@ -4655,7 +4738,7 @@ type RangeProvingKeysResponse struct {
 func (x *RangeProvingKeysResponse) Reset() {
 	*x = RangeProvingKeysResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[67]
+		mi := &file_global_proto_msgTypes[68]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4668,7 +4751,7 @@ func (x *RangeProvingKeysResponse) String() string {
 func (*RangeProvingKeysResponse) ProtoMessage() {}
 
 func (x *RangeProvingKeysResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[67]
+	mi := &file_global_proto_msgTypes[68]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4681,7 +4764,7 @@ func (x *RangeProvingKeysResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeProvingKeysResponse.ProtoReflect.Descriptor instead.
 func (*RangeProvingKeysResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{67}
+	return file_global_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *RangeProvingKeysResponse) GetKey() *BLS48581SignatureWithProofOfPossession {
@@ -4707,7 +4790,7 @@ type RangeIdentityKeysRequest struct {
 func (x *RangeIdentityKeysRequest) Reset() {
 	*x = RangeIdentityKeysRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[68]
+		mi := &file_global_proto_msgTypes[69]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4720,7 +4803,7 @@ func (x *RangeIdentityKeysRequest) String() string {
 func (*RangeIdentityKeysRequest) ProtoMessage() {}
 
 func (x *RangeIdentityKeysRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[68]
+	mi := &file_global_proto_msgTypes[69]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4733,7 +4816,7 @@ func (x *RangeIdentityKeysRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeIdentityKeysRequest.ProtoReflect.Descriptor instead.
 func (*RangeIdentityKeysRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{68}
+	return file_global_proto_rawDescGZIP(), []int{69}
 }
 
 type RangeIdentityKeysResponse struct {
@@ -4748,7 +4831,7 @@ type RangeIdentityKeysResponse struct {
 func (x *RangeIdentityKeysResponse) Reset() {
 	*x = RangeIdentityKeysResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[69]
+		mi := &file_global_proto_msgTypes[70]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4761,7 +4844,7 @@ func (x *RangeIdentityKeysResponse) String() string {
 func (*RangeIdentityKeysResponse) ProtoMessage() {}
 
 func (x *RangeIdentityKeysResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[69]
+	mi := &file_global_proto_msgTypes[70]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4774,7 +4857,7 @@ func (x *RangeIdentityKeysResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeIdentityKeysResponse.ProtoReflect.Descriptor instead.
 func (*RangeIdentityKeysResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{69}
+	return file_global_proto_rawDescGZIP(), []int{70}
 }
 
 func (x *RangeIdentityKeysResponse) GetKey() *Ed448PublicKey {
@@ -4803,7 +4886,7 @@ type RangeSignedKeysRequest struct {
 func (x *RangeSignedKeysRequest) Reset() {
 	*x = RangeSignedKeysRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[70]
+		mi := &file_global_proto_msgTypes[71]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4816,7 +4899,7 @@ func (x *RangeSignedKeysRequest) String() string {
 func (*RangeSignedKeysRequest) ProtoMessage() {}
 
 func (x *RangeSignedKeysRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[70]
+	mi := &file_global_proto_msgTypes[71]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4829,7 +4912,7 @@ func (x *RangeSignedKeysRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeSignedKeysRequest.ProtoReflect.Descriptor instead.
 func (*RangeSignedKeysRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{70}
+	return file_global_proto_rawDescGZIP(), []int{71}
 }
 
 func (x *RangeSignedKeysRequest) GetParentKeyAddress() []byte {
@@ -4858,7 +4941,7 @@ type RangeSignedKeysResponse struct {
 func (x *RangeSignedKeysResponse) Reset() {
 	*x = RangeSignedKeysResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[71]
+		mi := &file_global_proto_msgTypes[72]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4871,7 +4954,7 @@ func (x *RangeSignedKeysResponse) String() string {
 func (*RangeSignedKeysResponse) ProtoMessage() {}
 
 func (x *RangeSignedKeysResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[71]
+	mi := &file_global_proto_msgTypes[72]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4884,7 +4967,7 @@ func (x *RangeSignedKeysResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeSignedKeysResponse.ProtoReflect.Descriptor instead.
 func (*RangeSignedKeysResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{71}
+	return file_global_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *RangeSignedKeysResponse) GetKey() *SignedX448Key {
@@ -4913,7 +4996,7 @@ type MessageKeyShard struct {
 func (x *MessageKeyShard) Reset() {
 	*x = MessageKeyShard{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[72]
+		mi := &file_global_proto_msgTypes[73]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4926,7 +5009,7 @@ func (x *MessageKeyShard) String() string {
 func (*MessageKeyShard) ProtoMessage() {}
 
 func (x *MessageKeyShard) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[72]
+	mi := &file_global_proto_msgTypes[73]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4939,7 +5022,7 @@ func (x *MessageKeyShard) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MessageKeyShard.ProtoReflect.Descriptor instead.
 func (*MessageKeyShard) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{72}
+	return file_global_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *MessageKeyShard) GetPartyIdentifier() uint32 {
@@ -4974,7 +5057,7 @@ type PutMessageRequest struct {
 func (x *PutMessageRequest) Reset() {
 	*x = PutMessageRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[73]
+		mi := &file_global_proto_msgTypes[74]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -4987,7 +5070,7 @@ func (x *PutMessageRequest) String() string {
 func (*PutMessageRequest) ProtoMessage() {}
 
 func (x *PutMessageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[73]
+	mi := &file_global_proto_msgTypes[74]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5000,7 +5083,7 @@ func (x *PutMessageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutMessageRequest.ProtoReflect.Descriptor instead.
 func (*PutMessageRequest) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{73}
+	return file_global_proto_rawDescGZIP(), []int{74}
 }
 
 func (x *PutMessageRequest) GetMessageShards() []*MessageKeyShard {
@@ -5033,7 +5116,7 @@ type PutMessageResponse struct {
 func (x *PutMessageResponse) Reset() {
 	*x = PutMessageResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_global_proto_msgTypes[74]
+		mi := &file_global_proto_msgTypes[75]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -5046,7 +5129,7 @@ func (x *PutMessageResponse) String() string {
 func (*PutMessageResponse) ProtoMessage() {}
 
 func (x *PutMessageResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_global_proto_msgTypes[74]
+	mi := &file_global_proto_msgTypes[75]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5059,7 +5142,7 @@ func (x *PutMessageResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutMessageResponse.ProtoReflect.Descriptor instead.
 func (*PutMessageResponse) Descriptor() ([]byte, []int) {
-	return file_global_proto_rawDescGZIP(), []int{74}
+	return file_global_proto_rawDescGZIP(), []int{75}
 }
 
 var File_global_proto protoreflect.FileDescriptor
@@ -5210,153 +5293,175 @@ var file_global_proto_rawDesc = []byte{
 	0x75, 0x72, 0x65, 0x52, 0x1a, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4b, 0x65, 0x79, 0x53, 0x69,
 	0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x42, 0x6c, 0x73, 0x34, 0x38, 0x35, 0x38, 0x31, 0x12,
 	0x18, 0x0a, 0x07, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x73, 0x18, 0x04, 0x20, 0x03, 0x28, 0x0c,
-	0x52, 0x07, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x73, 0x22, 0xb0, 0x02, 0x0a, 0x0e, 0x41, 0x6c,
-	0x74, 0x53, 0x68, 0x61, 0x72, 0x64, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x12, 0x1d, 0x0a, 0x0a,
-	0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f, 0x6b, 0x65, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0c,
-	0x52, 0x09, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4b, 0x65, 0x79, 0x12, 0x21, 0x0a, 0x0c, 0x66,
-	0x72, 0x61, 0x6d, 0x65, 0x5f, 0x6e, 0x75, 0x6d, 0x62, 0x65, 0x72, 0x18, 0x02, 0x20, 0x01, 0x28,
-	0x04, 0x52, 0x0b, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x4e, 0x75, 0x6d, 0x62, 0x65, 0x72, 0x12, 0x28,
-	0x0a, 0x10, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78, 0x5f, 0x61, 0x64, 0x64, 0x73, 0x5f, 0x72, 0x6f,
-	0x6f, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0e, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78,
-	0x41, 0x64, 0x64, 0x73, 0x52, 0x6f, 0x6f, 0x74, 0x12, 0x2e, 0x0a, 0x13, 0x76, 0x65, 0x72, 0x74,
-	0x65, 0x78, 0x5f, 0x72, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x73, 0x5f, 0x72, 0x6f, 0x6f, 0x74, 0x18,
-	0x04, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x11, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78, 0x52, 0x65, 0x6d,
-	0x6f, 0x76, 0x65, 0x73, 0x52, 0x6f, 0x6f, 0x74, 0x12, 0x2e, 0x0a, 0x13, 0x68, 0x79, 0x70, 0x65,
-	0x72, 0x65, 0x64, 0x67, 0x65, 0x5f, 0x61, 0x64, 0x64, 0x73, 0x5f, 0x72, 0x6f, 0x6f, 0x74, 0x18,
-	0x05, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x11, 0x68, 0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65,
-	0x41, 0x64, 0x64, 0x73, 0x52, 0x6f, 0x6f, 0x74, 0x12, 0x34, 0x0a, 0x16, 0x68, 0x79, 0x70, 0x65,
-	0x72, 0x65, 0x64, 0x67, 0x65, 0x5f, 0x72, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x73, 0x5f, 0x72, 0x6f,
-	0x6f, 0x74, 0x18, 0x06, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x14, 0x68, 0x79, 0x70, 0x65, 0x72, 0x65,
-	0x64, 0x67, 0x65, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x73, 0x52, 0x6f, 0x6f, 0x74, 0x12, 0x1c,
-	0x0a, 0x09, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x18, 0x07, 0x20, 0x01, 0x28,
-	0x0c, 0x52, 0x09, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x22, 0x9b, 0x10, 0x0a,
-	0x0e, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12,
-	0x3b, 0x0a, 0x04, 0x6a, 0x6f, 0x69, 0x6e, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x25, 0x2e,
-	0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e,
-	0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72,
-	0x4a, 0x6f, 0x69, 0x6e, 0x48, 0x00, 0x52, 0x04, 0x6a, 0x6f, 0x69, 0x6e, 0x12, 0x3e, 0x0a, 0x05,
-	0x6c, 0x65, 0x61, 0x76, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x26, 0x2e, 0x71, 0x75,
-	0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c,
-	0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x4c, 0x65,
-	0x61, 0x76, 0x65, 0x48, 0x00, 0x52, 0x05, 0x6c, 0x65, 0x61, 0x76, 0x65, 0x12, 0x3e, 0x0a, 0x05,
-	0x70, 0x61, 0x75, 0x73, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x26, 0x2e, 0x71, 0x75,
-	0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c,
-	0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x50, 0x61,
-	0x75, 0x73, 0x65, 0x48, 0x00, 0x52, 0x05, 0x70, 0x61, 0x75, 0x73, 0x65, 0x12, 0x41, 0x0a, 0x06,
-	0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x27, 0x2e, 0x71,
-	0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67,
-	0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x52,
-	0x65, 0x73, 0x75, 0x6d, 0x65, 0x48, 0x00, 0x52, 0x06, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x12,
-	0x44, 0x0a, 0x07, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0b,
-	0x32, 0x28, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f,
+	0x52, 0x07, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x73, 0x22, 0x81, 0x02, 0x0a, 0x14, 0x50, 0x72,
+	0x6f, 0x76, 0x65, 0x72, 0x53, 0x65, 0x6e, 0x69, 0x6f, 0x72, 0x69, 0x74, 0x79, 0x4d, 0x65, 0x72,
+	0x67, 0x65, 0x12, 0x21, 0x0a, 0x0c, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x5f, 0x6e, 0x75, 0x6d, 0x62,
+	0x65, 0x72, 0x18, 0x01, 0x20, 0x01, 0x28, 0x04, 0x52, 0x0b, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x4e,
+	0x75, 0x6d, 0x62, 0x65, 0x72, 0x12, 0x76, 0x0a, 0x1d, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f,
+	0x6b, 0x65, 0x79, 0x5f, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x5f, 0x62, 0x6c,
+	0x73, 0x34, 0x38, 0x35, 0x38, 0x31, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x33, 0x2e, 0x71,
+	0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x6b,
+	0x65, 0x79, 0x73, 0x2e, 0x70, 0x62, 0x2e, 0x42, 0x4c, 0x53, 0x34, 0x38, 0x35, 0x38, 0x31, 0x41,
+	0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x65, 0x64, 0x53, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72,
+	0x65, 0x52, 0x1a, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4b, 0x65, 0x79, 0x53, 0x69, 0x67, 0x6e,
+	0x61, 0x74, 0x75, 0x72, 0x65, 0x42, 0x6c, 0x73, 0x34, 0x38, 0x35, 0x38, 0x31, 0x12, 0x4e, 0x0a,
+	0x0d, 0x6d, 0x65, 0x72, 0x67, 0x65, 0x5f, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x73, 0x18, 0x03,
+	0x20, 0x03, 0x28, 0x0b, 0x32, 0x29, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75,
+	0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62,
+	0x2e, 0x53, 0x65, 0x6e, 0x69, 0x6f, 0x72, 0x69, 0x74, 0x79, 0x4d, 0x65, 0x72, 0x67, 0x65, 0x52,
+	0x0c, 0x6d, 0x65, 0x72, 0x67, 0x65, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x73, 0x22, 0xb0, 0x02,
+	0x0a, 0x0e, 0x41, 0x6c, 0x74, 0x53, 0x68, 0x61, 0x72, 0x64, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65,
+	0x12, 0x1d, 0x0a, 0x0a, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x5f, 0x6b, 0x65, 0x79, 0x18, 0x01,
+	0x20, 0x01, 0x28, 0x0c, 0x52, 0x09, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x4b, 0x65, 0x79, 0x12,
+	0x21, 0x0a, 0x0c, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x5f, 0x6e, 0x75, 0x6d, 0x62, 0x65, 0x72, 0x18,
+	0x02, 0x20, 0x01, 0x28, 0x04, 0x52, 0x0b, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x4e, 0x75, 0x6d, 0x62,
+	0x65, 0x72, 0x12, 0x28, 0x0a, 0x10, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78, 0x5f, 0x61, 0x64, 0x64,
+	0x73, 0x5f, 0x72, 0x6f, 0x6f, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0e, 0x76, 0x65,
+	0x72, 0x74, 0x65, 0x78, 0x41, 0x64, 0x64, 0x73, 0x52, 0x6f, 0x6f, 0x74, 0x12, 0x2e, 0x0a, 0x13,
+	0x76, 0x65, 0x72, 0x74, 0x65, 0x78, 0x5f, 0x72, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x73, 0x5f, 0x72,
+	0x6f, 0x6f, 0x74, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x11, 0x76, 0x65, 0x72, 0x74, 0x65,
+	0x78, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x73, 0x52, 0x6f, 0x6f, 0x74, 0x12, 0x2e, 0x0a, 0x13,
+	0x68, 0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65, 0x5f, 0x61, 0x64, 0x64, 0x73, 0x5f, 0x72,
+	0x6f, 0x6f, 0x74, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x11, 0x68, 0x79, 0x70, 0x65, 0x72,
+	0x65, 0x64, 0x67, 0x65, 0x41, 0x64, 0x64, 0x73, 0x52, 0x6f, 0x6f, 0x74, 0x12, 0x34, 0x0a, 0x16,
+	0x68, 0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65, 0x5f, 0x72, 0x65, 0x6d, 0x6f, 0x76, 0x65,
+	0x73, 0x5f, 0x72, 0x6f, 0x6f, 0x74, 0x18, 0x06, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x14, 0x68, 0x79,
+	0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x73, 0x52, 0x6f,
+	0x6f, 0x74, 0x12, 0x1c, 0x0a, 0x09, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x18,
+	0x07, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x09, 0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65,
+	0x22, 0xf7, 0x10, 0x0a, 0x0e, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x52, 0x65, 0x71, 0x75,
+	0x65, 0x73, 0x74, 0x12, 0x3b, 0x0a, 0x04, 0x6a, 0x6f, 0x69, 0x6e, 0x18, 0x01, 0x20, 0x01, 0x28,
+	0x0b, 0x32, 0x25, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e,
+	0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72,
+	0x6f, 0x76, 0x65, 0x72, 0x4a, 0x6f, 0x69, 0x6e, 0x48, 0x00, 0x52, 0x04, 0x6a, 0x6f, 0x69, 0x6e,
+	0x12, 0x3e, 0x0a, 0x05, 0x6c, 0x65, 0x61, 0x76, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32,
+	0x26, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64,
+	0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76,
+	0x65, 0x72, 0x4c, 0x65, 0x61, 0x76, 0x65, 0x48, 0x00, 0x52, 0x05, 0x6c, 0x65, 0x61, 0x76, 0x65,
+	0x12, 0x3e, 0x0a, 0x05, 0x70, 0x61, 0x75, 0x73, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0b, 0x32,
+	0x26, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64,
+	0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76,
+	0x65, 0x72, 0x50, 0x61, 0x75, 0x73, 0x65, 0x48, 0x00, 0x52, 0x05, 0x70, 0x61, 0x75, 0x73, 0x65,
+	0x12, 0x41, 0x0a, 0x06, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0b,
+	0x32, 0x27, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f,
 	0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f,
-	0x76, 0x65, 0x72, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x48, 0x00, 0x52, 0x07, 0x63, 0x6f,
-	0x6e, 0x66, 0x69, 0x72, 0x6d, 0x12, 0x41, 0x0a, 0x06, 0x72, 0x65, 0x6a, 0x65, 0x63, 0x74, 0x18,
-	0x06, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x27, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69,
-	0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70,
-	0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x52, 0x65, 0x6a, 0x65, 0x63, 0x74, 0x48, 0x00,
-	0x52, 0x06, 0x72, 0x65, 0x6a, 0x65, 0x63, 0x74, 0x12, 0x3b, 0x0a, 0x04, 0x6b, 0x69, 0x63, 0x6b,
-	0x18, 0x07, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x25, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72,
-	0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e,
-	0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x4b, 0x69, 0x63, 0x6b, 0x48, 0x00, 0x52,
-	0x04, 0x6b, 0x69, 0x63, 0x6b, 0x12, 0x41, 0x0a, 0x06, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x18,
-	0x08, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x27, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69,
-	0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70,
-	0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x48, 0x00,
-	0x52, 0x06, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x12, 0x4a, 0x0a, 0x0c, 0x74, 0x6f, 0x6b, 0x65,
-	0x6e, 0x5f, 0x64, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x18, 0x09, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x25,
+	0x76, 0x65, 0x72, 0x52, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x48, 0x00, 0x52, 0x06, 0x72, 0x65, 0x73,
+	0x75, 0x6d, 0x65, 0x12, 0x44, 0x0a, 0x07, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x18, 0x05,
+	0x20, 0x01, 0x28, 0x0b, 0x32, 0x28, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75,
+	0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62,
+	0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x48, 0x00,
+	0x52, 0x07, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x12, 0x41, 0x0a, 0x06, 0x72, 0x65, 0x6a,
+	0x65, 0x63, 0x74, 0x18, 0x06, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x27, 0x2e, 0x71, 0x75, 0x69, 0x6c,
+	0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62,
+	0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x52, 0x65, 0x6a, 0x65,
+	0x63, 0x74, 0x48, 0x00, 0x52, 0x06, 0x72, 0x65, 0x6a, 0x65, 0x63, 0x74, 0x12, 0x3b, 0x0a, 0x04,
+	0x6b, 0x69, 0x63, 0x6b, 0x18, 0x07, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x25, 0x2e, 0x71, 0x75, 0x69,
+	0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f,
+	0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x4b, 0x69, 0x63,
+	0x6b, 0x48, 0x00, 0x52, 0x04, 0x6b, 0x69, 0x63, 0x6b, 0x12, 0x41, 0x0a, 0x06, 0x75, 0x70, 0x64,
+	0x61, 0x74, 0x65, 0x18, 0x08, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x27, 0x2e, 0x71, 0x75, 0x69, 0x6c,
+	0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62,
+	0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65, 0x72, 0x55, 0x70, 0x64, 0x61,
+	0x74, 0x65, 0x48, 0x00, 0x52, 0x06, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x12, 0x4a, 0x0a, 0x0c,
+	0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x5f, 0x64, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x18, 0x09, 0x20, 0x01,
+	0x28, 0x0b, 0x32, 0x25, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e,
+	0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x2e, 0x70, 0x62, 0x2e, 0x54, 0x6f,
+	0x6b, 0x65, 0x6e, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x48, 0x00, 0x52, 0x0b, 0x74, 0x6f, 0x6b,
+	0x65, 0x6e, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x12, 0x4a, 0x0a, 0x0c, 0x74, 0x6f, 0x6b, 0x65,
+	0x6e, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x18, 0x0a, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x25,
 	0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65,
-	0x2e, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x2e, 0x70, 0x62, 0x2e, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x44,
-	0x65, 0x70, 0x6c, 0x6f, 0x79, 0x48, 0x00, 0x52, 0x0b, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x44, 0x65,
-	0x70, 0x6c, 0x6f, 0x79, 0x12, 0x4a, 0x0a, 0x0c, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x5f, 0x75, 0x70,
-	0x64, 0x61, 0x74, 0x65, 0x18, 0x0a, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x25, 0x2e, 0x71, 0x75, 0x69,
+	0x2e, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x2e, 0x70, 0x62, 0x2e, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x55,
+	0x70, 0x64, 0x61, 0x74, 0x65, 0x48, 0x00, 0x52, 0x0b, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x55, 0x70,
+	0x64, 0x61, 0x74, 0x65, 0x12, 0x49, 0x0a, 0x0b, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74,
+	0x69, 0x6f, 0x6e, 0x18, 0x0b, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x25, 0x2e, 0x71, 0x75, 0x69, 0x6c,
+	0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x74, 0x6f, 0x6b, 0x65,
+	0x6e, 0x2e, 0x70, 0x62, 0x2e, 0x54, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e,
+	0x48, 0x00, 0x52, 0x0b, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x12,
+	0x5f, 0x0a, 0x13, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x5f, 0x74, 0x72, 0x61, 0x6e, 0x73,
+	0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x18, 0x0c, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2c, 0x2e, 0x71,
+	0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x74,
+	0x6f, 0x6b, 0x65, 0x6e, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x54,
+	0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x48, 0x00, 0x52, 0x12, 0x70, 0x65,
+	0x6e, 0x64, 0x69, 0x6e, 0x67, 0x54, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e,
+	0x12, 0x56, 0x0a, 0x10, 0x6d, 0x69, 0x6e, 0x74, 0x5f, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63,
+	0x74, 0x69, 0x6f, 0x6e, 0x18, 0x0d, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x29, 0x2e, 0x71, 0x75, 0x69,
 	0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x74, 0x6f, 0x6b,
-	0x65, 0x6e, 0x2e, 0x70, 0x62, 0x2e, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x55, 0x70, 0x64, 0x61, 0x74,
-	0x65, 0x48, 0x00, 0x52, 0x0b, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65,
-	0x12, 0x49, 0x0a, 0x0b, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x18,
-	0x0b, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x25, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69,
-	0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x2e, 0x70, 0x62,
-	0x2e, 0x54, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x48, 0x00, 0x52, 0x0b,
-	0x74, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x5f, 0x0a, 0x13, 0x70,
-	0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x5f, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69,
-	0x6f, 0x6e, 0x18, 0x0c, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2c, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69,
-	0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x74, 0x6f, 0x6b, 0x65, 0x6e,
-	0x2e, 0x70, 0x62, 0x2e, 0x50, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x54, 0x72, 0x61, 0x6e, 0x73,
-	0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x48, 0x00, 0x52, 0x12, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e,
-	0x67, 0x54, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x56, 0x0a, 0x10,
-	0x6d, 0x69, 0x6e, 0x74, 0x5f, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e,
-	0x18, 0x0d, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x29, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72,
-	0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x2e, 0x70,
-	0x62, 0x2e, 0x4d, 0x69, 0x6e, 0x74, 0x54, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f,
-	0x6e, 0x48, 0x00, 0x52, 0x0f, 0x6d, 0x69, 0x6e, 0x74, 0x54, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63,
-	0x74, 0x69, 0x6f, 0x6e, 0x12, 0x5e, 0x0a, 0x11, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61,
-	0x70, 0x68, 0x5f, 0x64, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x18, 0x0e, 0x20, 0x01, 0x28, 0x0b, 0x32,
-	0x2f, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64,
-	0x65, 0x2e, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x2e, 0x70, 0x62, 0x2e,
-	0x48, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79,
-	0x48, 0x00, 0x52, 0x10, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x44, 0x65,
-	0x70, 0x6c, 0x6f, 0x79, 0x12, 0x5e, 0x0a, 0x11, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61,
-	0x70, 0x68, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x18, 0x0f, 0x20, 0x01, 0x28, 0x0b, 0x32,
-	0x2f, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64,
-	0x65, 0x2e, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x2e, 0x70, 0x62, 0x2e,
-	0x48, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65,
-	0x48, 0x00, 0x52, 0x10, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x55, 0x70,
-	0x64, 0x61, 0x74, 0x65, 0x12, 0x49, 0x0a, 0x0a, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78, 0x5f, 0x61,
-	0x64, 0x64, 0x18, 0x10, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x28, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69,
-	0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x68, 0x79, 0x70, 0x65, 0x72,
-	0x67, 0x72, 0x61, 0x70, 0x68, 0x2e, 0x70, 0x62, 0x2e, 0x56, 0x65, 0x72, 0x74, 0x65, 0x78, 0x41,
-	0x64, 0x64, 0x48, 0x00, 0x52, 0x09, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78, 0x41, 0x64, 0x64, 0x12,
-	0x52, 0x0a, 0x0d, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78, 0x5f, 0x72, 0x65, 0x6d, 0x6f, 0x76, 0x65,
-	0x18, 0x11, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2b, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72,
-	0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72,
-	0x61, 0x70, 0x68, 0x2e, 0x70, 0x62, 0x2e, 0x56, 0x65, 0x72, 0x74, 0x65, 0x78, 0x52, 0x65, 0x6d,
-	0x6f, 0x76, 0x65, 0x48, 0x00, 0x52, 0x0c, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78, 0x52, 0x65, 0x6d,
-	0x6f, 0x76, 0x65, 0x12, 0x52, 0x0a, 0x0d, 0x68, 0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65,
-	0x5f, 0x61, 0x64, 0x64, 0x18, 0x12, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2b, 0x2e, 0x71, 0x75, 0x69,
+	0x65, 0x6e, 0x2e, 0x70, 0x62, 0x2e, 0x4d, 0x69, 0x6e, 0x74, 0x54, 0x72, 0x61, 0x6e, 0x73, 0x61,
+	0x63, 0x74, 0x69, 0x6f, 0x6e, 0x48, 0x00, 0x52, 0x0f, 0x6d, 0x69, 0x6e, 0x74, 0x54, 0x72, 0x61,
+	0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x5e, 0x0a, 0x11, 0x68, 0x79, 0x70, 0x65,
+	0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x5f, 0x64, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x18, 0x0e, 0x20,
+	0x01, 0x28, 0x0b, 0x32, 0x2f, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d,
+	0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68,
+	0x2e, 0x70, 0x62, 0x2e, 0x48, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x44, 0x65,
+	0x70, 0x6c, 0x6f, 0x79, 0x48, 0x00, 0x52, 0x10, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61,
+	0x70, 0x68, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x12, 0x5e, 0x0a, 0x11, 0x68, 0x79, 0x70, 0x65,
+	0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x18, 0x0f, 0x20,
+	0x01, 0x28, 0x0b, 0x32, 0x2f, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d,
+	0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68,
+	0x2e, 0x70, 0x62, 0x2e, 0x48, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x55, 0x70,
+	0x64, 0x61, 0x74, 0x65, 0x48, 0x00, 0x52, 0x10, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61,
+	0x70, 0x68, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x12, 0x49, 0x0a, 0x0a, 0x76, 0x65, 0x72, 0x74,
+	0x65, 0x78, 0x5f, 0x61, 0x64, 0x64, 0x18, 0x10, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x28, 0x2e, 0x71,
+	0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x68,
+	0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x2e, 0x70, 0x62, 0x2e, 0x56, 0x65, 0x72,
+	0x74, 0x65, 0x78, 0x41, 0x64, 0x64, 0x48, 0x00, 0x52, 0x09, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78,
+	0x41, 0x64, 0x64, 0x12, 0x52, 0x0a, 0x0d, 0x76, 0x65, 0x72, 0x74, 0x65, 0x78, 0x5f, 0x72, 0x65,
+	0x6d, 0x6f, 0x76, 0x65, 0x18, 0x11, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2b, 0x2e, 0x71, 0x75, 0x69,
 	0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x68, 0x79, 0x70,
-	0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x2e, 0x70, 0x62, 0x2e, 0x48, 0x79, 0x70, 0x65, 0x72,
-	0x65, 0x64, 0x67, 0x65, 0x41, 0x64, 0x64, 0x48, 0x00, 0x52, 0x0c, 0x68, 0x79, 0x70, 0x65, 0x72,
-	0x65, 0x64, 0x67, 0x65, 0x41, 0x64, 0x64, 0x12, 0x5b, 0x0a, 0x10, 0x68, 0x79, 0x70, 0x65, 0x72,
-	0x65, 0x64, 0x67, 0x65, 0x5f, 0x72, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x18, 0x13, 0x20, 0x01, 0x28,
-	0x0b, 0x32, 0x2e, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e,
-	0x6f, 0x64, 0x65, 0x2e, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x2e, 0x70,
-	0x62, 0x2e, 0x48, 0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65, 0x52, 0x65, 0x6d, 0x6f, 0x76,
-	0x65, 0x48, 0x00, 0x52, 0x0f, 0x68, 0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65, 0x52, 0x65,
-	0x6d, 0x6f, 0x76, 0x65, 0x12, 0x52, 0x0a, 0x0e, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x5f,
-	0x64, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x18, 0x14, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x29, 0x2e, 0x71,
-	0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63,
-	0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x2e, 0x70, 0x62, 0x2e, 0x43, 0x6f, 0x6d, 0x70, 0x75, 0x74,
-	0x65, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x48, 0x00, 0x52, 0x0d, 0x63, 0x6f, 0x6d, 0x70, 0x75,
-	0x74, 0x65, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x12, 0x52, 0x0a, 0x0e, 0x63, 0x6f, 0x6d, 0x70,
-	0x75, 0x74, 0x65, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x18, 0x15, 0x20, 0x01, 0x28, 0x0b,
+	0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x2e, 0x70, 0x62, 0x2e, 0x56, 0x65, 0x72, 0x74, 0x65,
+	0x78, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x48, 0x00, 0x52, 0x0c, 0x76, 0x65, 0x72, 0x74, 0x65,
+	0x78, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x12, 0x52, 0x0a, 0x0d, 0x68, 0x79, 0x70, 0x65, 0x72,
+	0x65, 0x64, 0x67, 0x65, 0x5f, 0x61, 0x64, 0x64, 0x18, 0x12, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2b,
+	0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65,
+	0x2e, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61, 0x70, 0x68, 0x2e, 0x70, 0x62, 0x2e, 0x48,
+	0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65, 0x41, 0x64, 0x64, 0x48, 0x00, 0x52, 0x0c, 0x68,
+	0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65, 0x41, 0x64, 0x64, 0x12, 0x5b, 0x0a, 0x10, 0x68,
+	0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65, 0x5f, 0x72, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x18,
+	0x13, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2e, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69,
+	0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x68, 0x79, 0x70, 0x65, 0x72, 0x67, 0x72, 0x61,
+	0x70, 0x68, 0x2e, 0x70, 0x62, 0x2e, 0x48, 0x79, 0x70, 0x65, 0x72, 0x65, 0x64, 0x67, 0x65, 0x52,
+	0x65, 0x6d, 0x6f, 0x76, 0x65, 0x48, 0x00, 0x52, 0x0f, 0x68, 0x79, 0x70, 0x65, 0x72, 0x65, 0x64,
+	0x67, 0x65, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x12, 0x52, 0x0a, 0x0e, 0x63, 0x6f, 0x6d, 0x70,
+	0x75, 0x74, 0x65, 0x5f, 0x64, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x18, 0x14, 0x20, 0x01, 0x28, 0x0b,
 	0x32, 0x29, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f,
 	0x64, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x2e, 0x70, 0x62, 0x2e, 0x43, 0x6f,
-	0x6d, 0x70, 0x75, 0x74, 0x65, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x48, 0x00, 0x52, 0x0d, 0x63,
-	0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x12, 0x4d, 0x0a, 0x0b,
-	0x63, 0x6f, 0x64, 0x65, 0x5f, 0x64, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x18, 0x16, 0x20, 0x01, 0x28,
-	0x0b, 0x32, 0x2a, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e,
-	0x6f, 0x64, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x2e, 0x70, 0x62, 0x2e, 0x43,
-	0x6f, 0x64, 0x65, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x6d, 0x65, 0x6e, 0x74, 0x48, 0x00, 0x52,
-	0x0a, 0x63, 0x6f, 0x64, 0x65, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x12, 0x4c, 0x0a, 0x0c, 0x63,
-	0x6f, 0x64, 0x65, 0x5f, 0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x65, 0x18, 0x17, 0x20, 0x01, 0x28,
-	0x0b, 0x32, 0x27, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e,
-	0x6f, 0x64, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x2e, 0x70, 0x62, 0x2e, 0x43,
-	0x6f, 0x64, 0x65, 0x45, 0x78, 0x65, 0x63, 0x75, 0x74, 0x65, 0x48, 0x00, 0x52, 0x0b, 0x63, 0x6f,
-	0x64, 0x65, 0x45, 0x78, 0x65, 0x63, 0x75, 0x74, 0x65, 0x12, 0x4f, 0x0a, 0x0d, 0x63, 0x6f, 0x64,
-	0x65, 0x5f, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x18, 0x18, 0x20, 0x01, 0x28, 0x0b,
-	0x32, 0x28, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f,
-	0x64, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x2e, 0x70, 0x62, 0x2e, 0x43, 0x6f,
-	0x64, 0x65, 0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x48, 0x00, 0x52, 0x0c, 0x63, 0x6f,
-	0x64, 0x65, 0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x12, 0x3e, 0x0a, 0x05, 0x73, 0x68,
-	0x61, 0x72, 0x64, 0x18, 0x19, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x26, 0x2e, 0x71, 0x75, 0x69, 0x6c,
-	0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62,
-	0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x46, 0x72, 0x61, 0x6d, 0x65, 0x48, 0x65, 0x61, 0x64, 0x65,
-	0x72, 0x48, 0x00, 0x52, 0x05, 0x73, 0x68, 0x61, 0x72, 0x64, 0x12, 0x55, 0x0a, 0x10, 0x61, 0x6c,
-	0x74, 0x5f, 0x73, 0x68, 0x61, 0x72, 0x64, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x18, 0x1a,
+	0x6d, 0x70, 0x75, 0x74, 0x65, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x48, 0x00, 0x52, 0x0d, 0x63,
+	0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x12, 0x52, 0x0a, 0x0e,
+	0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x18, 0x15,
 	0x20, 0x01, 0x28, 0x0b, 0x32, 0x29, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75,
-	0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62,
-	0x2e, 0x41, 0x6c, 0x74, 0x53, 0x68, 0x61, 0x72, 0x64, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x48,
-	0x00, 0x52, 0x0e, 0x61, 0x6c, 0x74, 0x53, 0x68, 0x61, 0x72, 0x64, 0x55, 0x70, 0x64, 0x61, 0x74,
+	0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x2e, 0x70,
+	0x62, 0x2e, 0x43, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x48,
+	0x00, 0x52, 0x0d, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65,
+	0x12, 0x4d, 0x0a, 0x0b, 0x63, 0x6f, 0x64, 0x65, 0x5f, 0x64, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x18,
+	0x16, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2a, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69,
+	0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x2e,
+	0x70, 0x62, 0x2e, 0x43, 0x6f, 0x64, 0x65, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x6d, 0x65, 0x6e,
+	0x74, 0x48, 0x00, 0x52, 0x0a, 0x63, 0x6f, 0x64, 0x65, 0x44, 0x65, 0x70, 0x6c, 0x6f, 0x79, 0x12,
+	0x4c, 0x0a, 0x0c, 0x63, 0x6f, 0x64, 0x65, 0x5f, 0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x65, 0x18,
+	0x17, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x27, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69,
+	0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x2e,
+	0x70, 0x62, 0x2e, 0x43, 0x6f, 0x64, 0x65, 0x45, 0x78, 0x65, 0x63, 0x75, 0x74, 0x65, 0x48, 0x00,
+	0x52, 0x0b, 0x63, 0x6f, 0x64, 0x65, 0x45, 0x78, 0x65, 0x63, 0x75, 0x74, 0x65, 0x12, 0x4f, 0x0a,
+	0x0d, 0x63, 0x6f, 0x64, 0x65, 0x5f, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x18, 0x18,
+	0x20, 0x01, 0x28, 0x0b, 0x32, 0x28, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75,
+	0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x70, 0x75, 0x74, 0x65, 0x2e, 0x70,
+	0x62, 0x2e, 0x43, 0x6f, 0x64, 0x65, 0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x48, 0x00,
+	0x52, 0x0c, 0x63, 0x6f, 0x64, 0x65, 0x46, 0x69, 0x6e, 0x61, 0x6c, 0x69, 0x7a, 0x65, 0x12, 0x3e,
+	0x0a, 0x05, 0x73, 0x68, 0x61, 0x72, 0x64, 0x18, 0x19, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x26, 0x2e,
+	0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e,
+	0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x46, 0x72, 0x61, 0x6d, 0x65, 0x48,
+	0x65, 0x61, 0x64, 0x65, 0x72, 0x48, 0x00, 0x52, 0x05, 0x73, 0x68, 0x61, 0x72, 0x64, 0x12, 0x55,
+	0x0a, 0x10, 0x61, 0x6c, 0x74, 0x5f, 0x73, 0x68, 0x61, 0x72, 0x64, 0x5f, 0x75, 0x70, 0x64, 0x61,
+	0x74, 0x65, 0x18, 0x1a, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x29, 0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69,
+	0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65, 0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61,
+	0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x41, 0x6c, 0x74, 0x53, 0x68, 0x61, 0x72, 0x64, 0x55, 0x70, 0x64,
+	0x61, 0x74, 0x65, 0x48, 0x00, 0x52, 0x0e, 0x61, 0x6c, 0x74, 0x53, 0x68, 0x61, 0x72, 0x64, 0x55,
+	0x70, 0x64, 0x61, 0x74, 0x65, 0x12, 0x5a, 0x0a, 0x0f, 0x73, 0x65, 0x6e, 0x69, 0x6f, 0x72, 0x69,
+	0x74, 0x79, 0x5f, 0x6d, 0x65, 0x72, 0x67, 0x65, 0x18, 0x1b, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x2f,
+	0x2e, 0x71, 0x75, 0x69, 0x6c, 0x69, 0x62, 0x72, 0x69, 0x75, 0x6d, 0x2e, 0x6e, 0x6f, 0x64, 0x65,
+	0x2e, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x2e, 0x70, 0x62, 0x2e, 0x50, 0x72, 0x6f, 0x76, 0x65,
+	0x72, 0x53, 0x65, 0x6e, 0x69, 0x6f, 0x72, 0x69, 0x74, 0x79, 0x4d, 0x65, 0x72, 0x67, 0x65, 0x48,
+	0x00, 0x52, 0x0e, 0x73, 0x65, 0x6e, 0x69, 0x6f, 0x72, 0x69, 0x74, 0x79, 0x4d, 0x65, 0x72, 0x67,
 	0x65, 0x12, 0x1c, 0x0a, 0x09, 0x74, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70, 0x18, 0x63,
 	0x20, 0x01, 0x28, 0x03, 0x52, 0x09, 0x74, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70, 0x42,
 	0x09, 0x0a, 0x07, 0x72, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x22, 0x74, 0x0a, 0x0d, 0x4d, 0x65,
@@ -6135,7 +6240,7 @@ func file_global_proto_rawDescGZIP() []byte {
 	return file_global_proto_rawDescData
 }
 
-var file_global_proto_msgTypes = make([]protoimpl.MessageInfo, 75)
+var file_global_proto_msgTypes = make([]protoimpl.MessageInfo, 76)
 var file_global_proto_goTypes = []interface{}{
 	(*LegacyProverRequest)(nil),                    // 0: quilibrium.node.global.pb.LegacyProverRequest
 	(*SeniorityMerge)(nil),                         // 1: quilibrium.node.global.pb.SeniorityMerge
@@ -6147,249 +6252,253 @@ var file_global_proto_goTypes = []interface{}{
 	(*ProverUpdate)(nil),                           // 7: quilibrium.node.global.pb.ProverUpdate
 	(*ProverKick)(nil),                             // 8: quilibrium.node.global.pb.ProverKick
 	(*ProverReject)(nil),                           // 9: quilibrium.node.global.pb.ProverReject
-	(*AltShardUpdate)(nil),                         // 10: quilibrium.node.global.pb.AltShardUpdate
-	(*MessageRequest)(nil),                         // 11: quilibrium.node.global.pb.MessageRequest
-	(*MessageBundle)(nil),                          // 12: quilibrium.node.global.pb.MessageBundle
-	(*GlobalFrameHeader)(nil),                      // 13: quilibrium.node.global.pb.GlobalFrameHeader
-	(*FrameHeader)(nil),                            // 14: quilibrium.node.global.pb.FrameHeader
-	(*ProverLivenessCheck)(nil),                    // 15: quilibrium.node.global.pb.ProverLivenessCheck
-	(*AppShardProposal)(nil),                       // 16: quilibrium.node.global.pb.AppShardProposal
-	(*GlobalProposal)(nil),                         // 17: quilibrium.node.global.pb.GlobalProposal
-	(*ProposalVote)(nil),                           // 18: quilibrium.node.global.pb.ProposalVote
-	(*TimeoutState)(nil),                           // 19: quilibrium.node.global.pb.TimeoutState
-	(*QuorumCertificate)(nil),                      // 20: quilibrium.node.global.pb.QuorumCertificate
-	(*TimeoutCertificate)(nil),                     // 21: quilibrium.node.global.pb.TimeoutCertificate
-	(*GlobalFrame)(nil),                            // 22: quilibrium.node.global.pb.GlobalFrame
-	(*AppShardFrame)(nil),                          // 23: quilibrium.node.global.pb.AppShardFrame
-	(*GlobalAlert)(nil),                            // 24: quilibrium.node.global.pb.GlobalAlert
-	(*GetGlobalFrameRequest)(nil),                  // 25: quilibrium.node.global.pb.GetGlobalFrameRequest
-	(*GlobalFrameResponse)(nil),                    // 26: quilibrium.node.global.pb.GlobalFrameResponse
-	(*GetGlobalProposalRequest)(nil),               // 27: quilibrium.node.global.pb.GetGlobalProposalRequest
-	(*GlobalProposalResponse)(nil),                 // 28: quilibrium.node.global.pb.GlobalProposalResponse
-	(*GetAppShardFrameRequest)(nil),                // 29: quilibrium.node.global.pb.GetAppShardFrameRequest
-	(*AppShardFrameResponse)(nil),                  // 30: quilibrium.node.global.pb.AppShardFrameResponse
-	(*GetAppShardProposalRequest)(nil),             // 31: quilibrium.node.global.pb.GetAppShardProposalRequest
-	(*AppShardProposalResponse)(nil),               // 32: quilibrium.node.global.pb.AppShardProposalResponse
-	(*GetAppShardsRequest)(nil),                    // 33: quilibrium.node.global.pb.GetAppShardsRequest
-	(*AppShardInfo)(nil),                           // 34: quilibrium.node.global.pb.AppShardInfo
-	(*GetAppShardsResponse)(nil),                   // 35: quilibrium.node.global.pb.GetAppShardsResponse
-	(*GetGlobalShardsRequest)(nil),                 // 36: quilibrium.node.global.pb.GetGlobalShardsRequest
-	(*GetGlobalShardsResponse)(nil),                // 37: quilibrium.node.global.pb.GetGlobalShardsResponse
-	(*GetLockedAddressesRequest)(nil),              // 38: quilibrium.node.global.pb.GetLockedAddressesRequest
-	(*LockedTransaction)(nil),                      // 39: quilibrium.node.global.pb.LockedTransaction
-	(*GetLockedAddressesResponse)(nil),             // 40: quilibrium.node.global.pb.GetLockedAddressesResponse
-	(*GlobalGetWorkerInfoRequest)(nil),             // 41: quilibrium.node.global.pb.GlobalGetWorkerInfoRequest
-	(*GlobalGetWorkerInfoResponseItem)(nil),        // 42: quilibrium.node.global.pb.GlobalGetWorkerInfoResponseItem
-	(*GlobalGetWorkerInfoResponse)(nil),            // 43: quilibrium.node.global.pb.GlobalGetWorkerInfoResponse
-	(*SendMessage)(nil),                            // 44: quilibrium.node.global.pb.SendMessage
-	(*ReceiveMessage)(nil),                         // 45: quilibrium.node.global.pb.ReceiveMessage
-	(*GetKeyRegistryRequest)(nil),                  // 46: quilibrium.node.global.pb.GetKeyRegistryRequest
-	(*GetKeyRegistryResponse)(nil),                 // 47: quilibrium.node.global.pb.GetKeyRegistryResponse
-	(*GetKeyRegistryByProverRequest)(nil),          // 48: quilibrium.node.global.pb.GetKeyRegistryByProverRequest
-	(*GetKeyRegistryByProverResponse)(nil),         // 49: quilibrium.node.global.pb.GetKeyRegistryByProverResponse
-	(*PutIdentityKeyRequest)(nil),                  // 50: quilibrium.node.global.pb.PutIdentityKeyRequest
-	(*PutIdentityKeyResponse)(nil),                 // 51: quilibrium.node.global.pb.PutIdentityKeyResponse
-	(*PutProvingKeyRequest)(nil),                   // 52: quilibrium.node.global.pb.PutProvingKeyRequest
-	(*PutProvingKeyResponse)(nil),                  // 53: quilibrium.node.global.pb.PutProvingKeyResponse
-	(*PutCrossSignatureRequest)(nil),               // 54: quilibrium.node.global.pb.PutCrossSignatureRequest
-	(*PutCrossSignatureResponse)(nil),              // 55: quilibrium.node.global.pb.PutCrossSignatureResponse
-	(*PutSignedKeyRequest)(nil),                    // 56: quilibrium.node.global.pb.PutSignedKeyRequest
-	(*PutSignedKeyResponse)(nil),                   // 57: quilibrium.node.global.pb.PutSignedKeyResponse
-	(*GetIdentityKeyRequest)(nil),                  // 58: quilibrium.node.global.pb.GetIdentityKeyRequest
-	(*GetIdentityKeyResponse)(nil),                 // 59: quilibrium.node.global.pb.GetIdentityKeyResponse
-	(*GetProvingKeyRequest)(nil),                   // 60: quilibrium.node.global.pb.GetProvingKeyRequest
-	(*GetProvingKeyResponse)(nil),                  // 61: quilibrium.node.global.pb.GetProvingKeyResponse
-	(*GetSignedKeyRequest)(nil),                    // 62: quilibrium.node.global.pb.GetSignedKeyRequest
-	(*GetSignedKeyResponse)(nil),                   // 63: quilibrium.node.global.pb.GetSignedKeyResponse
-	(*GetSignedKeysByParentRequest)(nil),           // 64: quilibrium.node.global.pb.GetSignedKeysByParentRequest
-	(*GetSignedKeysByParentResponse)(nil),          // 65: quilibrium.node.global.pb.GetSignedKeysByParentResponse
-	(*RangeProvingKeysRequest)(nil),                // 66: quilibrium.node.global.pb.RangeProvingKeysRequest
-	(*RangeProvingKeysResponse)(nil),               // 67: quilibrium.node.global.pb.RangeProvingKeysResponse
-	(*RangeIdentityKeysRequest)(nil),               // 68: quilibrium.node.global.pb.RangeIdentityKeysRequest
-	(*RangeIdentityKeysResponse)(nil),              // 69: quilibrium.node.global.pb.RangeIdentityKeysResponse
-	(*RangeSignedKeysRequest)(nil),                 // 70: quilibrium.node.global.pb.RangeSignedKeysRequest
-	(*RangeSignedKeysResponse)(nil),                // 71: quilibrium.node.global.pb.RangeSignedKeysResponse
-	(*MessageKeyShard)(nil),                        // 72: quilibrium.node.global.pb.MessageKeyShard
-	(*PutMessageRequest)(nil),                      // 73: quilibrium.node.global.pb.PutMessageRequest
-	(*PutMessageResponse)(nil),                     // 74: quilibrium.node.global.pb.PutMessageResponse
-	(*Ed448Signature)(nil),                         // 75: quilibrium.node.keys.pb.Ed448Signature
-	(*BLS48581SignatureWithProofOfPossession)(nil), // 76: quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
-	(*BLS48581AddressedSignature)(nil),             // 77: quilibrium.node.keys.pb.BLS48581AddressedSignature
-	(*TraversalProof)(nil),                         // 78: quilibrium.node.application.pb.TraversalProof
-	(*TokenDeploy)(nil),                            // 79: quilibrium.node.token.pb.TokenDeploy
-	(*TokenUpdate)(nil),                            // 80: quilibrium.node.token.pb.TokenUpdate
-	(*Transaction)(nil),                            // 81: quilibrium.node.token.pb.Transaction
-	(*PendingTransaction)(nil),                     // 82: quilibrium.node.token.pb.PendingTransaction
-	(*MintTransaction)(nil),                        // 83: quilibrium.node.token.pb.MintTransaction
-	(*HypergraphDeploy)(nil),                       // 84: quilibrium.node.hypergraph.pb.HypergraphDeploy
-	(*HypergraphUpdate)(nil),                       // 85: quilibrium.node.hypergraph.pb.HypergraphUpdate
-	(*VertexAdd)(nil),                              // 86: quilibrium.node.hypergraph.pb.VertexAdd
-	(*VertexRemove)(nil),                           // 87: quilibrium.node.hypergraph.pb.VertexRemove
-	(*HyperedgeAdd)(nil),                           // 88: quilibrium.node.hypergraph.pb.HyperedgeAdd
-	(*HyperedgeRemove)(nil),                        // 89: quilibrium.node.hypergraph.pb.HyperedgeRemove
-	(*ComputeDeploy)(nil),                          // 90: quilibrium.node.compute.pb.ComputeDeploy
-	(*ComputeUpdate)(nil),                          // 91: quilibrium.node.compute.pb.ComputeUpdate
-	(*CodeDeployment)(nil),                         // 92: quilibrium.node.compute.pb.CodeDeployment
-	(*CodeExecute)(nil),                            // 93: quilibrium.node.compute.pb.CodeExecute
-	(*CodeFinalize)(nil),                           // 94: quilibrium.node.compute.pb.CodeFinalize
-	(*BLS48581AggregateSignature)(nil),             // 95: quilibrium.node.keys.pb.BLS48581AggregateSignature
-	(*KeyRegistry)(nil),                            // 96: quilibrium.node.keys.pb.KeyRegistry
-	(*Ed448PublicKey)(nil),                         // 97: quilibrium.node.keys.pb.Ed448PublicKey
-	(*SignedX448Key)(nil),                          // 98: quilibrium.node.keys.pb.SignedX448Key
-	(*Message)(nil),                                // 99: quilibrium.node.application.pb.Message
-	(*InboxMessagePut)(nil),                        // 100: quilibrium.node.channel.pb.InboxMessagePut
-	(*InboxMessageRequest)(nil),                    // 101: quilibrium.node.channel.pb.InboxMessageRequest
-	(*HubPut)(nil),                                 // 102: quilibrium.node.channel.pb.HubPut
-	(*HubRequest)(nil),                             // 103: quilibrium.node.channel.pb.HubRequest
-	(*DispatchSyncRequest)(nil),                    // 104: quilibrium.node.channel.pb.DispatchSyncRequest
-	(*emptypb.Empty)(nil),                          // 105: google.protobuf.Empty
-	(*InboxMessageResponse)(nil),                   // 106: quilibrium.node.channel.pb.InboxMessageResponse
-	(*HubResponse)(nil),                            // 107: quilibrium.node.channel.pb.HubResponse
-	(*DispatchSyncResponse)(nil),                   // 108: quilibrium.node.channel.pb.DispatchSyncResponse
+	(*ProverSeniorityMerge)(nil),                   // 10: quilibrium.node.global.pb.ProverSeniorityMerge
+	(*AltShardUpdate)(nil),                         // 11: quilibrium.node.global.pb.AltShardUpdate
+	(*MessageRequest)(nil),                         // 12: quilibrium.node.global.pb.MessageRequest
+	(*MessageBundle)(nil),                          // 13: quilibrium.node.global.pb.MessageBundle
+	(*GlobalFrameHeader)(nil),                      // 14: quilibrium.node.global.pb.GlobalFrameHeader
+	(*FrameHeader)(nil),                            // 15: quilibrium.node.global.pb.FrameHeader
+	(*ProverLivenessCheck)(nil),                    // 16: quilibrium.node.global.pb.ProverLivenessCheck
+	(*AppShardProposal)(nil),                       // 17: quilibrium.node.global.pb.AppShardProposal
+	(*GlobalProposal)(nil),                         // 18: quilibrium.node.global.pb.GlobalProposal
+	(*ProposalVote)(nil),                           // 19: quilibrium.node.global.pb.ProposalVote
+	(*TimeoutState)(nil),                           // 20: quilibrium.node.global.pb.TimeoutState
+	(*QuorumCertificate)(nil),                      // 21: quilibrium.node.global.pb.QuorumCertificate
+	(*TimeoutCertificate)(nil),                     // 22: quilibrium.node.global.pb.TimeoutCertificate
+	(*GlobalFrame)(nil),                            // 23: quilibrium.node.global.pb.GlobalFrame
+	(*AppShardFrame)(nil),                          // 24: quilibrium.node.global.pb.AppShardFrame
+	(*GlobalAlert)(nil),                            // 25: quilibrium.node.global.pb.GlobalAlert
+	(*GetGlobalFrameRequest)(nil),                  // 26: quilibrium.node.global.pb.GetGlobalFrameRequest
+	(*GlobalFrameResponse)(nil),                    // 27: quilibrium.node.global.pb.GlobalFrameResponse
+	(*GetGlobalProposalRequest)(nil),               // 28: quilibrium.node.global.pb.GetGlobalProposalRequest
+	(*GlobalProposalResponse)(nil),                 // 29: quilibrium.node.global.pb.GlobalProposalResponse
+	(*GetAppShardFrameRequest)(nil),                // 30: quilibrium.node.global.pb.GetAppShardFrameRequest
+	(*AppShardFrameResponse)(nil),                  // 31: quilibrium.node.global.pb.AppShardFrameResponse
+	(*GetAppShardProposalRequest)(nil),             // 32: quilibrium.node.global.pb.GetAppShardProposalRequest
+	(*AppShardProposalResponse)(nil),               // 33: quilibrium.node.global.pb.AppShardProposalResponse
+	(*GetAppShardsRequest)(nil),                    // 34: quilibrium.node.global.pb.GetAppShardsRequest
+	(*AppShardInfo)(nil),                           // 35: quilibrium.node.global.pb.AppShardInfo
+	(*GetAppShardsResponse)(nil),                   // 36: quilibrium.node.global.pb.GetAppShardsResponse
+	(*GetGlobalShardsRequest)(nil),                 // 37: quilibrium.node.global.pb.GetGlobalShardsRequest
+	(*GetGlobalShardsResponse)(nil),                // 38: quilibrium.node.global.pb.GetGlobalShardsResponse
+	(*GetLockedAddressesRequest)(nil),              // 39: quilibrium.node.global.pb.GetLockedAddressesRequest
+	(*LockedTransaction)(nil),                      // 40: quilibrium.node.global.pb.LockedTransaction
+	(*GetLockedAddressesResponse)(nil),             // 41: quilibrium.node.global.pb.GetLockedAddressesResponse
+	(*GlobalGetWorkerInfoRequest)(nil),             // 42: quilibrium.node.global.pb.GlobalGetWorkerInfoRequest
+	(*GlobalGetWorkerInfoResponseItem)(nil),        // 43: quilibrium.node.global.pb.GlobalGetWorkerInfoResponseItem
+	(*GlobalGetWorkerInfoResponse)(nil),            // 44: quilibrium.node.global.pb.GlobalGetWorkerInfoResponse
+	(*SendMessage)(nil),                            // 45: quilibrium.node.global.pb.SendMessage
+	(*ReceiveMessage)(nil),                         // 46: quilibrium.node.global.pb.ReceiveMessage
+	(*GetKeyRegistryRequest)(nil),                  // 47: quilibrium.node.global.pb.GetKeyRegistryRequest
+	(*GetKeyRegistryResponse)(nil),                 // 48: quilibrium.node.global.pb.GetKeyRegistryResponse
+	(*GetKeyRegistryByProverRequest)(nil),          // 49: quilibrium.node.global.pb.GetKeyRegistryByProverRequest
+	(*GetKeyRegistryByProverResponse)(nil),         // 50: quilibrium.node.global.pb.GetKeyRegistryByProverResponse
+	(*PutIdentityKeyRequest)(nil),                  // 51: quilibrium.node.global.pb.PutIdentityKeyRequest
+	(*PutIdentityKeyResponse)(nil),                 // 52: quilibrium.node.global.pb.PutIdentityKeyResponse
+	(*PutProvingKeyRequest)(nil),                   // 53: quilibrium.node.global.pb.PutProvingKeyRequest
+	(*PutProvingKeyResponse)(nil),                  // 54: quilibrium.node.global.pb.PutProvingKeyResponse
+	(*PutCrossSignatureRequest)(nil),               // 55: quilibrium.node.global.pb.PutCrossSignatureRequest
+	(*PutCrossSignatureResponse)(nil),              // 56: quilibrium.node.global.pb.PutCrossSignatureResponse
+	(*PutSignedKeyRequest)(nil),                    // 57: quilibrium.node.global.pb.PutSignedKeyRequest
+	(*PutSignedKeyResponse)(nil),                   // 58: quilibrium.node.global.pb.PutSignedKeyResponse
+	(*GetIdentityKeyRequest)(nil),                  // 59: quilibrium.node.global.pb.GetIdentityKeyRequest
+	(*GetIdentityKeyResponse)(nil),                 // 60: quilibrium.node.global.pb.GetIdentityKeyResponse
+	(*GetProvingKeyRequest)(nil),                   // 61: quilibrium.node.global.pb.GetProvingKeyRequest
+	(*GetProvingKeyResponse)(nil),                  // 62: quilibrium.node.global.pb.GetProvingKeyResponse
+	(*GetSignedKeyRequest)(nil),                    // 63: quilibrium.node.global.pb.GetSignedKeyRequest
+	(*GetSignedKeyResponse)(nil),                   // 64: quilibrium.node.global.pb.GetSignedKeyResponse
+	(*GetSignedKeysByParentRequest)(nil),           // 65: quilibrium.node.global.pb.GetSignedKeysByParentRequest
+	(*GetSignedKeysByParentResponse)(nil),          // 66: quilibrium.node.global.pb.GetSignedKeysByParentResponse
+	(*RangeProvingKeysRequest)(nil),                // 67: quilibrium.node.global.pb.RangeProvingKeysRequest
+	(*RangeProvingKeysResponse)(nil),               // 68: quilibrium.node.global.pb.RangeProvingKeysResponse
+	(*RangeIdentityKeysRequest)(nil),               // 69: quilibrium.node.global.pb.RangeIdentityKeysRequest
+	(*RangeIdentityKeysResponse)(nil),              // 70: quilibrium.node.global.pb.RangeIdentityKeysResponse
+	(*RangeSignedKeysRequest)(nil),                 // 71: quilibrium.node.global.pb.RangeSignedKeysRequest
+	(*RangeSignedKeysResponse)(nil),                // 72: quilibrium.node.global.pb.RangeSignedKeysResponse
+	(*MessageKeyShard)(nil),                        // 73: quilibrium.node.global.pb.MessageKeyShard
+	(*PutMessageRequest)(nil),                      // 74: quilibrium.node.global.pb.PutMessageRequest
+	(*PutMessageResponse)(nil),                     // 75: quilibrium.node.global.pb.PutMessageResponse
+	(*Ed448Signature)(nil),                         // 76: quilibrium.node.keys.pb.Ed448Signature
+	(*BLS48581SignatureWithProofOfPossession)(nil), // 77: quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
+	(*BLS48581AddressedSignature)(nil),             // 78: quilibrium.node.keys.pb.BLS48581AddressedSignature
+	(*TraversalProof)(nil),                         // 79: quilibrium.node.application.pb.TraversalProof
+	(*TokenDeploy)(nil),                            // 80: quilibrium.node.token.pb.TokenDeploy
+	(*TokenUpdate)(nil),                            // 81: quilibrium.node.token.pb.TokenUpdate
+	(*Transaction)(nil),                            // 82: quilibrium.node.token.pb.Transaction
+	(*PendingTransaction)(nil),                     // 83: quilibrium.node.token.pb.PendingTransaction
+	(*MintTransaction)(nil),                        // 84: quilibrium.node.token.pb.MintTransaction
+	(*HypergraphDeploy)(nil),                       // 85: quilibrium.node.hypergraph.pb.HypergraphDeploy
+	(*HypergraphUpdate)(nil),                       // 86: quilibrium.node.hypergraph.pb.HypergraphUpdate
+	(*VertexAdd)(nil),                              // 87: quilibrium.node.hypergraph.pb.VertexAdd
+	(*VertexRemove)(nil),                           // 88: quilibrium.node.hypergraph.pb.VertexRemove
+	(*HyperedgeAdd)(nil),                           // 89: quilibrium.node.hypergraph.pb.HyperedgeAdd
+	(*HyperedgeRemove)(nil),                        // 90: quilibrium.node.hypergraph.pb.HyperedgeRemove
+	(*ComputeDeploy)(nil),                          // 91: quilibrium.node.compute.pb.ComputeDeploy
+	(*ComputeUpdate)(nil),                          // 92: quilibrium.node.compute.pb.ComputeUpdate
+	(*CodeDeployment)(nil),                         // 93: quilibrium.node.compute.pb.CodeDeployment
+	(*CodeExecute)(nil),                            // 94: quilibrium.node.compute.pb.CodeExecute
+	(*CodeFinalize)(nil),                           // 95: quilibrium.node.compute.pb.CodeFinalize
+	(*BLS48581AggregateSignature)(nil),             // 96: quilibrium.node.keys.pb.BLS48581AggregateSignature
+	(*KeyRegistry)(nil),                            // 97: quilibrium.node.keys.pb.KeyRegistry
+	(*Ed448PublicKey)(nil),                         // 98: quilibrium.node.keys.pb.Ed448PublicKey
+	(*SignedX448Key)(nil),                          // 99: quilibrium.node.keys.pb.SignedX448Key
+	(*Message)(nil),                                // 100: quilibrium.node.application.pb.Message
+	(*InboxMessagePut)(nil),                        // 101: quilibrium.node.channel.pb.InboxMessagePut
+	(*InboxMessageRequest)(nil),                    // 102: quilibrium.node.channel.pb.InboxMessageRequest
+	(*HubPut)(nil),                                 // 103: quilibrium.node.channel.pb.HubPut
+	(*HubRequest)(nil),                             // 104: quilibrium.node.channel.pb.HubRequest
+	(*DispatchSyncRequest)(nil),                    // 105: quilibrium.node.channel.pb.DispatchSyncRequest
+	(*emptypb.Empty)(nil),                          // 106: google.protobuf.Empty
+	(*InboxMessageResponse)(nil),                   // 107: quilibrium.node.channel.pb.InboxMessageResponse
+	(*HubResponse)(nil),                            // 108: quilibrium.node.channel.pb.HubResponse
+	(*DispatchSyncResponse)(nil),                   // 109: quilibrium.node.channel.pb.DispatchSyncResponse
 }
 var file_global_proto_depIdxs = []int32{
-	75,  // 0: quilibrium.node.global.pb.LegacyProverRequest.public_key_signatures_ed448:type_name -> quilibrium.node.keys.pb.Ed448Signature
-	76,  // 1: quilibrium.node.global.pb.ProverJoin.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
+	76,  // 0: quilibrium.node.global.pb.LegacyProverRequest.public_key_signatures_ed448:type_name -> quilibrium.node.keys.pb.Ed448Signature
+	77,  // 1: quilibrium.node.global.pb.ProverJoin.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
 	1,   // 2: quilibrium.node.global.pb.ProverJoin.merge_targets:type_name -> quilibrium.node.global.pb.SeniorityMerge
-	77,  // 3: quilibrium.node.global.pb.ProverLeave.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
-	77,  // 4: quilibrium.node.global.pb.ProverPause.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
-	77,  // 5: quilibrium.node.global.pb.ProverResume.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
-	77,  // 6: quilibrium.node.global.pb.ProverConfirm.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
-	77,  // 7: quilibrium.node.global.pb.ProverUpdate.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
-	78,  // 8: quilibrium.node.global.pb.ProverKick.traversal_proof:type_name -> quilibrium.node.application.pb.TraversalProof
-	77,  // 9: quilibrium.node.global.pb.ProverReject.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
-	2,   // 10: quilibrium.node.global.pb.MessageRequest.join:type_name -> quilibrium.node.global.pb.ProverJoin
-	3,   // 11: quilibrium.node.global.pb.MessageRequest.leave:type_name -> quilibrium.node.global.pb.ProverLeave
-	4,   // 12: quilibrium.node.global.pb.MessageRequest.pause:type_name -> quilibrium.node.global.pb.ProverPause
-	5,   // 13: quilibrium.node.global.pb.MessageRequest.resume:type_name -> quilibrium.node.global.pb.ProverResume
-	6,   // 14: quilibrium.node.global.pb.MessageRequest.confirm:type_name -> quilibrium.node.global.pb.ProverConfirm
-	9,   // 15: quilibrium.node.global.pb.MessageRequest.reject:type_name -> quilibrium.node.global.pb.ProverReject
-	8,   // 16: quilibrium.node.global.pb.MessageRequest.kick:type_name -> quilibrium.node.global.pb.ProverKick
-	7,   // 17: quilibrium.node.global.pb.MessageRequest.update:type_name -> quilibrium.node.global.pb.ProverUpdate
-	79,  // 18: quilibrium.node.global.pb.MessageRequest.token_deploy:type_name -> quilibrium.node.token.pb.TokenDeploy
-	80,  // 19: quilibrium.node.global.pb.MessageRequest.token_update:type_name -> quilibrium.node.token.pb.TokenUpdate
-	81,  // 20: quilibrium.node.global.pb.MessageRequest.transaction:type_name -> quilibrium.node.token.pb.Transaction
-	82,  // 21: quilibrium.node.global.pb.MessageRequest.pending_transaction:type_name -> quilibrium.node.token.pb.PendingTransaction
-	83,  // 22: quilibrium.node.global.pb.MessageRequest.mint_transaction:type_name -> quilibrium.node.token.pb.MintTransaction
-	84,  // 23: quilibrium.node.global.pb.MessageRequest.hypergraph_deploy:type_name -> quilibrium.node.hypergraph.pb.HypergraphDeploy
-	85,  // 24: quilibrium.node.global.pb.MessageRequest.hypergraph_update:type_name -> quilibrium.node.hypergraph.pb.HypergraphUpdate
-	86,  // 25: quilibrium.node.global.pb.MessageRequest.vertex_add:type_name -> quilibrium.node.hypergraph.pb.VertexAdd
-	87,  // 26: quilibrium.node.global.pb.MessageRequest.vertex_remove:type_name -> quilibrium.node.hypergraph.pb.VertexRemove
-	88,  // 27: quilibrium.node.global.pb.MessageRequest.hyperedge_add:type_name -> quilibrium.node.hypergraph.pb.HyperedgeAdd
-	89,  // 28: quilibrium.node.global.pb.MessageRequest.hyperedge_remove:type_name -> quilibrium.node.hypergraph.pb.HyperedgeRemove
-	90,  // 29: quilibrium.node.global.pb.MessageRequest.compute_deploy:type_name -> quilibrium.node.compute.pb.ComputeDeploy
-	91,  // 30: quilibrium.node.global.pb.MessageRequest.compute_update:type_name -> quilibrium.node.compute.pb.ComputeUpdate
-	92,  // 31: quilibrium.node.global.pb.MessageRequest.code_deploy:type_name -> quilibrium.node.compute.pb.CodeDeployment
-	93,  // 32: quilibrium.node.global.pb.MessageRequest.code_execute:type_name -> quilibrium.node.compute.pb.CodeExecute
-	94,  // 33: quilibrium.node.global.pb.MessageRequest.code_finalize:type_name -> quilibrium.node.compute.pb.CodeFinalize
-	14,  // 34: quilibrium.node.global.pb.MessageRequest.shard:type_name -> quilibrium.node.global.pb.FrameHeader
-	10,  // 35: quilibrium.node.global.pb.MessageRequest.alt_shard_update:type_name -> quilibrium.node.global.pb.AltShardUpdate
-	11,  // 36: quilibrium.node.global.pb.MessageBundle.requests:type_name -> quilibrium.node.global.pb.MessageRequest
-	95,  // 37: quilibrium.node.global.pb.GlobalFrameHeader.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AggregateSignature
-	95,  // 38: quilibrium.node.global.pb.FrameHeader.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AggregateSignature
-	77,  // 39: quilibrium.node.global.pb.ProverLivenessCheck.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
-	23,  // 40: quilibrium.node.global.pb.AppShardProposal.state:type_name -> quilibrium.node.global.pb.AppShardFrame
-	20,  // 41: quilibrium.node.global.pb.AppShardProposal.parent_quorum_certificate:type_name -> quilibrium.node.global.pb.QuorumCertificate
-	21,  // 42: quilibrium.node.global.pb.AppShardProposal.prior_rank_timeout_certificate:type_name -> quilibrium.node.global.pb.TimeoutCertificate
-	18,  // 43: quilibrium.node.global.pb.AppShardProposal.vote:type_name -> quilibrium.node.global.pb.ProposalVote
-	22,  // 44: quilibrium.node.global.pb.GlobalProposal.state:type_name -> quilibrium.node.global.pb.GlobalFrame
-	20,  // 45: quilibrium.node.global.pb.GlobalProposal.parent_quorum_certificate:type_name -> quilibrium.node.global.pb.QuorumCertificate
-	21,  // 46: quilibrium.node.global.pb.GlobalProposal.prior_rank_timeout_certificate:type_name -> quilibrium.node.global.pb.TimeoutCertificate
-	18,  // 47: quilibrium.node.global.pb.GlobalProposal.vote:type_name -> quilibrium.node.global.pb.ProposalVote
-	77,  // 48: quilibrium.node.global.pb.ProposalVote.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
-	20,  // 49: quilibrium.node.global.pb.TimeoutState.latest_quorum_certificate:type_name -> quilibrium.node.global.pb.QuorumCertificate
-	21,  // 50: quilibrium.node.global.pb.TimeoutState.prior_rank_timeout_certificate:type_name -> quilibrium.node.global.pb.TimeoutCertificate
-	18,  // 51: quilibrium.node.global.pb.TimeoutState.vote:type_name -> quilibrium.node.global.pb.ProposalVote
-	95,  // 52: quilibrium.node.global.pb.QuorumCertificate.aggregate_signature:type_name -> quilibrium.node.keys.pb.BLS48581AggregateSignature
-	20,  // 53: quilibrium.node.global.pb.TimeoutCertificate.latest_quorum_certificate:type_name -> quilibrium.node.global.pb.QuorumCertificate
-	95,  // 54: quilibrium.node.global.pb.TimeoutCertificate.aggregate_signature:type_name -> quilibrium.node.keys.pb.BLS48581AggregateSignature
-	13,  // 55: quilibrium.node.global.pb.GlobalFrame.header:type_name -> quilibrium.node.global.pb.GlobalFrameHeader
-	12,  // 56: quilibrium.node.global.pb.GlobalFrame.requests:type_name -> quilibrium.node.global.pb.MessageBundle
-	14,  // 57: quilibrium.node.global.pb.AppShardFrame.header:type_name -> quilibrium.node.global.pb.FrameHeader
-	12,  // 58: quilibrium.node.global.pb.AppShardFrame.requests:type_name -> quilibrium.node.global.pb.MessageBundle
-	22,  // 59: quilibrium.node.global.pb.GlobalFrameResponse.frame:type_name -> quilibrium.node.global.pb.GlobalFrame
-	17,  // 60: quilibrium.node.global.pb.GlobalProposalResponse.proposal:type_name -> quilibrium.node.global.pb.GlobalProposal
-	23,  // 61: quilibrium.node.global.pb.AppShardFrameResponse.frame:type_name -> quilibrium.node.global.pb.AppShardFrame
-	16,  // 62: quilibrium.node.global.pb.AppShardProposalResponse.proposal:type_name -> quilibrium.node.global.pb.AppShardProposal
-	34,  // 63: quilibrium.node.global.pb.GetAppShardsResponse.info:type_name -> quilibrium.node.global.pb.AppShardInfo
-	39,  // 64: quilibrium.node.global.pb.GetLockedAddressesResponse.transactions:type_name -> quilibrium.node.global.pb.LockedTransaction
-	42,  // 65: quilibrium.node.global.pb.GlobalGetWorkerInfoResponse.workers:type_name -> quilibrium.node.global.pb.GlobalGetWorkerInfoResponseItem
-	96,  // 66: quilibrium.node.global.pb.GetKeyRegistryResponse.registry:type_name -> quilibrium.node.keys.pb.KeyRegistry
-	96,  // 67: quilibrium.node.global.pb.GetKeyRegistryByProverResponse.registry:type_name -> quilibrium.node.keys.pb.KeyRegistry
-	97,  // 68: quilibrium.node.global.pb.PutIdentityKeyRequest.identity_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	76,  // 69: quilibrium.node.global.pb.PutProvingKeyRequest.proving_key:type_name -> quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
-	98,  // 70: quilibrium.node.global.pb.PutSignedKeyRequest.key:type_name -> quilibrium.node.keys.pb.SignedX448Key
-	97,  // 71: quilibrium.node.global.pb.GetIdentityKeyResponse.key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	76,  // 72: quilibrium.node.global.pb.GetProvingKeyResponse.key:type_name -> quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
-	98,  // 73: quilibrium.node.global.pb.GetSignedKeyResponse.key:type_name -> quilibrium.node.keys.pb.SignedX448Key
-	98,  // 74: quilibrium.node.global.pb.GetSignedKeysByParentResponse.keys:type_name -> quilibrium.node.keys.pb.SignedX448Key
-	76,  // 75: quilibrium.node.global.pb.RangeProvingKeysResponse.key:type_name -> quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
-	97,  // 76: quilibrium.node.global.pb.RangeIdentityKeysResponse.key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
-	98,  // 77: quilibrium.node.global.pb.RangeSignedKeysResponse.key:type_name -> quilibrium.node.keys.pb.SignedX448Key
-	72,  // 78: quilibrium.node.global.pb.PutMessageRequest.message_shards:type_name -> quilibrium.node.global.pb.MessageKeyShard
-	25,  // 79: quilibrium.node.global.pb.GlobalService.GetGlobalFrame:input_type -> quilibrium.node.global.pb.GetGlobalFrameRequest
-	27,  // 80: quilibrium.node.global.pb.GlobalService.GetGlobalProposal:input_type -> quilibrium.node.global.pb.GetGlobalProposalRequest
-	33,  // 81: quilibrium.node.global.pb.GlobalService.GetAppShards:input_type -> quilibrium.node.global.pb.GetAppShardsRequest
-	36,  // 82: quilibrium.node.global.pb.GlobalService.GetGlobalShards:input_type -> quilibrium.node.global.pb.GetGlobalShardsRequest
-	38,  // 83: quilibrium.node.global.pb.GlobalService.GetLockedAddresses:input_type -> quilibrium.node.global.pb.GetLockedAddressesRequest
-	41,  // 84: quilibrium.node.global.pb.GlobalService.GetWorkerInfo:input_type -> quilibrium.node.global.pb.GlobalGetWorkerInfoRequest
-	29,  // 85: quilibrium.node.global.pb.AppShardService.GetAppShardFrame:input_type -> quilibrium.node.global.pb.GetAppShardFrameRequest
-	31,  // 86: quilibrium.node.global.pb.AppShardService.GetAppShardProposal:input_type -> quilibrium.node.global.pb.GetAppShardProposalRequest
-	44,  // 87: quilibrium.node.global.pb.OnionService.Connect:input_type -> quilibrium.node.global.pb.SendMessage
-	73,  // 88: quilibrium.node.global.pb.MixnetService.PutMessage:input_type -> quilibrium.node.global.pb.PutMessageRequest
-	99,  // 89: quilibrium.node.global.pb.MixnetService.RoundStream:input_type -> quilibrium.node.application.pb.Message
-	46,  // 90: quilibrium.node.global.pb.KeyRegistryService.GetKeyRegistry:input_type -> quilibrium.node.global.pb.GetKeyRegistryRequest
-	48,  // 91: quilibrium.node.global.pb.KeyRegistryService.GetKeyRegistryByProver:input_type -> quilibrium.node.global.pb.GetKeyRegistryByProverRequest
-	50,  // 92: quilibrium.node.global.pb.KeyRegistryService.PutIdentityKey:input_type -> quilibrium.node.global.pb.PutIdentityKeyRequest
-	52,  // 93: quilibrium.node.global.pb.KeyRegistryService.PutProvingKey:input_type -> quilibrium.node.global.pb.PutProvingKeyRequest
-	54,  // 94: quilibrium.node.global.pb.KeyRegistryService.PutCrossSignature:input_type -> quilibrium.node.global.pb.PutCrossSignatureRequest
-	56,  // 95: quilibrium.node.global.pb.KeyRegistryService.PutSignedKey:input_type -> quilibrium.node.global.pb.PutSignedKeyRequest
-	58,  // 96: quilibrium.node.global.pb.KeyRegistryService.GetIdentityKey:input_type -> quilibrium.node.global.pb.GetIdentityKeyRequest
-	60,  // 97: quilibrium.node.global.pb.KeyRegistryService.GetProvingKey:input_type -> quilibrium.node.global.pb.GetProvingKeyRequest
-	62,  // 98: quilibrium.node.global.pb.KeyRegistryService.GetSignedKey:input_type -> quilibrium.node.global.pb.GetSignedKeyRequest
-	64,  // 99: quilibrium.node.global.pb.KeyRegistryService.GetSignedKeysByParent:input_type -> quilibrium.node.global.pb.GetSignedKeysByParentRequest
-	66,  // 100: quilibrium.node.global.pb.KeyRegistryService.RangeProvingKeys:input_type -> quilibrium.node.global.pb.RangeProvingKeysRequest
-	68,  // 101: quilibrium.node.global.pb.KeyRegistryService.RangeIdentityKeys:input_type -> quilibrium.node.global.pb.RangeIdentityKeysRequest
-	70,  // 102: quilibrium.node.global.pb.KeyRegistryService.RangeSignedKeys:input_type -> quilibrium.node.global.pb.RangeSignedKeysRequest
-	100, // 103: quilibrium.node.global.pb.DispatchService.PutInboxMessage:input_type -> quilibrium.node.channel.pb.InboxMessagePut
-	101, // 104: quilibrium.node.global.pb.DispatchService.GetInboxMessages:input_type -> quilibrium.node.channel.pb.InboxMessageRequest
-	102, // 105: quilibrium.node.global.pb.DispatchService.PutHub:input_type -> quilibrium.node.channel.pb.HubPut
-	103, // 106: quilibrium.node.global.pb.DispatchService.GetHub:input_type -> quilibrium.node.channel.pb.HubRequest
-	104, // 107: quilibrium.node.global.pb.DispatchService.Sync:input_type -> quilibrium.node.channel.pb.DispatchSyncRequest
-	26,  // 108: quilibrium.node.global.pb.GlobalService.GetGlobalFrame:output_type -> quilibrium.node.global.pb.GlobalFrameResponse
-	28,  // 109: quilibrium.node.global.pb.GlobalService.GetGlobalProposal:output_type -> quilibrium.node.global.pb.GlobalProposalResponse
-	35,  // 110: quilibrium.node.global.pb.GlobalService.GetAppShards:output_type -> quilibrium.node.global.pb.GetAppShardsResponse
-	37,  // 111: quilibrium.node.global.pb.GlobalService.GetGlobalShards:output_type -> quilibrium.node.global.pb.GetGlobalShardsResponse
-	40,  // 112: quilibrium.node.global.pb.GlobalService.GetLockedAddresses:output_type -> quilibrium.node.global.pb.GetLockedAddressesResponse
-	43,  // 113: quilibrium.node.global.pb.GlobalService.GetWorkerInfo:output_type -> quilibrium.node.global.pb.GlobalGetWorkerInfoResponse
-	30,  // 114: quilibrium.node.global.pb.AppShardService.GetAppShardFrame:output_type -> quilibrium.node.global.pb.AppShardFrameResponse
-	32,  // 115: quilibrium.node.global.pb.AppShardService.GetAppShardProposal:output_type -> quilibrium.node.global.pb.AppShardProposalResponse
-	45,  // 116: quilibrium.node.global.pb.OnionService.Connect:output_type -> quilibrium.node.global.pb.ReceiveMessage
-	74,  // 117: quilibrium.node.global.pb.MixnetService.PutMessage:output_type -> quilibrium.node.global.pb.PutMessageResponse
-	99,  // 118: quilibrium.node.global.pb.MixnetService.RoundStream:output_type -> quilibrium.node.application.pb.Message
-	47,  // 119: quilibrium.node.global.pb.KeyRegistryService.GetKeyRegistry:output_type -> quilibrium.node.global.pb.GetKeyRegistryResponse
-	49,  // 120: quilibrium.node.global.pb.KeyRegistryService.GetKeyRegistryByProver:output_type -> quilibrium.node.global.pb.GetKeyRegistryByProverResponse
-	51,  // 121: quilibrium.node.global.pb.KeyRegistryService.PutIdentityKey:output_type -> quilibrium.node.global.pb.PutIdentityKeyResponse
-	53,  // 122: quilibrium.node.global.pb.KeyRegistryService.PutProvingKey:output_type -> quilibrium.node.global.pb.PutProvingKeyResponse
-	55,  // 123: quilibrium.node.global.pb.KeyRegistryService.PutCrossSignature:output_type -> quilibrium.node.global.pb.PutCrossSignatureResponse
-	57,  // 124: quilibrium.node.global.pb.KeyRegistryService.PutSignedKey:output_type -> quilibrium.node.global.pb.PutSignedKeyResponse
-	59,  // 125: quilibrium.node.global.pb.KeyRegistryService.GetIdentityKey:output_type -> quilibrium.node.global.pb.GetIdentityKeyResponse
-	61,  // 126: quilibrium.node.global.pb.KeyRegistryService.GetProvingKey:output_type -> quilibrium.node.global.pb.GetProvingKeyResponse
-	63,  // 127: quilibrium.node.global.pb.KeyRegistryService.GetSignedKey:output_type -> quilibrium.node.global.pb.GetSignedKeyResponse
-	65,  // 128: quilibrium.node.global.pb.KeyRegistryService.GetSignedKeysByParent:output_type -> quilibrium.node.global.pb.GetSignedKeysByParentResponse
-	67,  // 129: quilibrium.node.global.pb.KeyRegistryService.RangeProvingKeys:output_type -> quilibrium.node.global.pb.RangeProvingKeysResponse
-	69,  // 130: quilibrium.node.global.pb.KeyRegistryService.RangeIdentityKeys:output_type -> quilibrium.node.global.pb.RangeIdentityKeysResponse
-	71,  // 131: quilibrium.node.global.pb.KeyRegistryService.RangeSignedKeys:output_type -> quilibrium.node.global.pb.RangeSignedKeysResponse
-	105, // 132: quilibrium.node.global.pb.DispatchService.PutInboxMessage:output_type -> google.protobuf.Empty
-	106, // 133: quilibrium.node.global.pb.DispatchService.GetInboxMessages:output_type -> quilibrium.node.channel.pb.InboxMessageResponse
-	105, // 134: quilibrium.node.global.pb.DispatchService.PutHub:output_type -> google.protobuf.Empty
-	107, // 135: quilibrium.node.global.pb.DispatchService.GetHub:output_type -> quilibrium.node.channel.pb.HubResponse
-	108, // 136: quilibrium.node.global.pb.DispatchService.Sync:output_type -> quilibrium.node.channel.pb.DispatchSyncResponse
-	108, // [108:137] is the sub-list for method output_type
-	79,  // [79:108] is the sub-list for method input_type
-	79,  // [79:79] is the sub-list for extension type_name
-	79,  // [79:79] is the sub-list for extension extendee
-	0,   // [0:79] is the sub-list for field type_name
+	78,  // 3: quilibrium.node.global.pb.ProverLeave.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
+	78,  // 4: quilibrium.node.global.pb.ProverPause.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
+	78,  // 5: quilibrium.node.global.pb.ProverResume.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
+	78,  // 6: quilibrium.node.global.pb.ProverConfirm.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
+	78,  // 7: quilibrium.node.global.pb.ProverUpdate.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
+	79,  // 8: quilibrium.node.global.pb.ProverKick.traversal_proof:type_name -> quilibrium.node.application.pb.TraversalProof
+	78,  // 9: quilibrium.node.global.pb.ProverReject.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
+	78,  // 10: quilibrium.node.global.pb.ProverSeniorityMerge.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
+	1,   // 11: quilibrium.node.global.pb.ProverSeniorityMerge.merge_targets:type_name -> quilibrium.node.global.pb.SeniorityMerge
+	2,   // 12: quilibrium.node.global.pb.MessageRequest.join:type_name -> quilibrium.node.global.pb.ProverJoin
+	3,   // 13: quilibrium.node.global.pb.MessageRequest.leave:type_name -> quilibrium.node.global.pb.ProverLeave
+	4,   // 14: quilibrium.node.global.pb.MessageRequest.pause:type_name -> quilibrium.node.global.pb.ProverPause
+	5,   // 15: quilibrium.node.global.pb.MessageRequest.resume:type_name -> quilibrium.node.global.pb.ProverResume
+	6,   // 16: quilibrium.node.global.pb.MessageRequest.confirm:type_name -> quilibrium.node.global.pb.ProverConfirm
+	9,   // 17: quilibrium.node.global.pb.MessageRequest.reject:type_name -> quilibrium.node.global.pb.ProverReject
+	8,   // 18: quilibrium.node.global.pb.MessageRequest.kick:type_name -> quilibrium.node.global.pb.ProverKick
+	7,   // 19: quilibrium.node.global.pb.MessageRequest.update:type_name -> quilibrium.node.global.pb.ProverUpdate
+	80,  // 20: quilibrium.node.global.pb.MessageRequest.token_deploy:type_name -> quilibrium.node.token.pb.TokenDeploy
+	81,  // 21: quilibrium.node.global.pb.MessageRequest.token_update:type_name -> quilibrium.node.token.pb.TokenUpdate
+	82,  // 22: quilibrium.node.global.pb.MessageRequest.transaction:type_name -> quilibrium.node.token.pb.Transaction
+	83,  // 23: quilibrium.node.global.pb.MessageRequest.pending_transaction:type_name -> quilibrium.node.token.pb.PendingTransaction
+	84,  // 24: quilibrium.node.global.pb.MessageRequest.mint_transaction:type_name -> quilibrium.node.token.pb.MintTransaction
+	85,  // 25: quilibrium.node.global.pb.MessageRequest.hypergraph_deploy:type_name -> quilibrium.node.hypergraph.pb.HypergraphDeploy
+	86,  // 26: quilibrium.node.global.pb.MessageRequest.hypergraph_update:type_name -> quilibrium.node.hypergraph.pb.HypergraphUpdate
+	87,  // 27: quilibrium.node.global.pb.MessageRequest.vertex_add:type_name -> quilibrium.node.hypergraph.pb.VertexAdd
+	88,  // 28: quilibrium.node.global.pb.MessageRequest.vertex_remove:type_name -> quilibrium.node.hypergraph.pb.VertexRemove
+	89,  // 29: quilibrium.node.global.pb.MessageRequest.hyperedge_add:type_name -> quilibrium.node.hypergraph.pb.HyperedgeAdd
+	90,  // 30: quilibrium.node.global.pb.MessageRequest.hyperedge_remove:type_name -> quilibrium.node.hypergraph.pb.HyperedgeRemove
+	91,  // 31: quilibrium.node.global.pb.MessageRequest.compute_deploy:type_name -> quilibrium.node.compute.pb.ComputeDeploy
+	92,  // 32: quilibrium.node.global.pb.MessageRequest.compute_update:type_name -> quilibrium.node.compute.pb.ComputeUpdate
+	93,  // 33: quilibrium.node.global.pb.MessageRequest.code_deploy:type_name -> quilibrium.node.compute.pb.CodeDeployment
+	94,  // 34: quilibrium.node.global.pb.MessageRequest.code_execute:type_name -> quilibrium.node.compute.pb.CodeExecute
+	95,  // 35: quilibrium.node.global.pb.MessageRequest.code_finalize:type_name -> quilibrium.node.compute.pb.CodeFinalize
+	15,  // 36: quilibrium.node.global.pb.MessageRequest.shard:type_name -> quilibrium.node.global.pb.FrameHeader
+	11,  // 37: quilibrium.node.global.pb.MessageRequest.alt_shard_update:type_name -> quilibrium.node.global.pb.AltShardUpdate
+	10,  // 38: quilibrium.node.global.pb.MessageRequest.seniority_merge:type_name -> quilibrium.node.global.pb.ProverSeniorityMerge
+	12,  // 39: quilibrium.node.global.pb.MessageBundle.requests:type_name -> quilibrium.node.global.pb.MessageRequest
+	96,  // 40: quilibrium.node.global.pb.GlobalFrameHeader.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AggregateSignature
+	96,  // 41: quilibrium.node.global.pb.FrameHeader.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AggregateSignature
+	78,  // 42: quilibrium.node.global.pb.ProverLivenessCheck.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
+	24,  // 43: quilibrium.node.global.pb.AppShardProposal.state:type_name -> quilibrium.node.global.pb.AppShardFrame
+	21,  // 44: quilibrium.node.global.pb.AppShardProposal.parent_quorum_certificate:type_name -> quilibrium.node.global.pb.QuorumCertificate
+	22,  // 45: quilibrium.node.global.pb.AppShardProposal.prior_rank_timeout_certificate:type_name -> quilibrium.node.global.pb.TimeoutCertificate
+	19,  // 46: quilibrium.node.global.pb.AppShardProposal.vote:type_name -> quilibrium.node.global.pb.ProposalVote
+	23,  // 47: quilibrium.node.global.pb.GlobalProposal.state:type_name -> quilibrium.node.global.pb.GlobalFrame
+	21,  // 48: quilibrium.node.global.pb.GlobalProposal.parent_quorum_certificate:type_name -> quilibrium.node.global.pb.QuorumCertificate
+	22,  // 49: quilibrium.node.global.pb.GlobalProposal.prior_rank_timeout_certificate:type_name -> quilibrium.node.global.pb.TimeoutCertificate
+	19,  // 50: quilibrium.node.global.pb.GlobalProposal.vote:type_name -> quilibrium.node.global.pb.ProposalVote
+	78,  // 51: quilibrium.node.global.pb.ProposalVote.public_key_signature_bls48581:type_name -> quilibrium.node.keys.pb.BLS48581AddressedSignature
+	21,  // 52: quilibrium.node.global.pb.TimeoutState.latest_quorum_certificate:type_name -> quilibrium.node.global.pb.QuorumCertificate
+	22,  // 53: quilibrium.node.global.pb.TimeoutState.prior_rank_timeout_certificate:type_name -> quilibrium.node.global.pb.TimeoutCertificate
+	19,  // 54: quilibrium.node.global.pb.TimeoutState.vote:type_name -> quilibrium.node.global.pb.ProposalVote
+	96,  // 55: quilibrium.node.global.pb.QuorumCertificate.aggregate_signature:type_name -> quilibrium.node.keys.pb.BLS48581AggregateSignature
+	21,  // 56: quilibrium.node.global.pb.TimeoutCertificate.latest_quorum_certificate:type_name -> quilibrium.node.global.pb.QuorumCertificate
+	96,  // 57: quilibrium.node.global.pb.TimeoutCertificate.aggregate_signature:type_name -> quilibrium.node.keys.pb.BLS48581AggregateSignature
+	14,  // 58: quilibrium.node.global.pb.GlobalFrame.header:type_name -> quilibrium.node.global.pb.GlobalFrameHeader
+	13,  // 59: quilibrium.node.global.pb.GlobalFrame.requests:type_name -> quilibrium.node.global.pb.MessageBundle
+	15,  // 60: quilibrium.node.global.pb.AppShardFrame.header:type_name -> quilibrium.node.global.pb.FrameHeader
+	13,  // 61: quilibrium.node.global.pb.AppShardFrame.requests:type_name -> quilibrium.node.global.pb.MessageBundle
+	23,  // 62: quilibrium.node.global.pb.GlobalFrameResponse.frame:type_name -> quilibrium.node.global.pb.GlobalFrame
+	18,  // 63: quilibrium.node.global.pb.GlobalProposalResponse.proposal:type_name -> quilibrium.node.global.pb.GlobalProposal
+	24,  // 64: quilibrium.node.global.pb.AppShardFrameResponse.frame:type_name -> quilibrium.node.global.pb.AppShardFrame
+	17,  // 65: quilibrium.node.global.pb.AppShardProposalResponse.proposal:type_name -> quilibrium.node.global.pb.AppShardProposal
+	35,  // 66: quilibrium.node.global.pb.GetAppShardsResponse.info:type_name -> quilibrium.node.global.pb.AppShardInfo
+	40,  // 67: quilibrium.node.global.pb.GetLockedAddressesResponse.transactions:type_name -> quilibrium.node.global.pb.LockedTransaction
+	43,  // 68: quilibrium.node.global.pb.GlobalGetWorkerInfoResponse.workers:type_name -> quilibrium.node.global.pb.GlobalGetWorkerInfoResponseItem
+	97,  // 69: quilibrium.node.global.pb.GetKeyRegistryResponse.registry:type_name -> quilibrium.node.keys.pb.KeyRegistry
+	97,  // 70: quilibrium.node.global.pb.GetKeyRegistryByProverResponse.registry:type_name -> quilibrium.node.keys.pb.KeyRegistry
+	98,  // 71: quilibrium.node.global.pb.PutIdentityKeyRequest.identity_key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	77,  // 72: quilibrium.node.global.pb.PutProvingKeyRequest.proving_key:type_name -> quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
+	99,  // 73: quilibrium.node.global.pb.PutSignedKeyRequest.key:type_name -> quilibrium.node.keys.pb.SignedX448Key
+	98,  // 74: quilibrium.node.global.pb.GetIdentityKeyResponse.key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	77,  // 75: quilibrium.node.global.pb.GetProvingKeyResponse.key:type_name -> quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
+	99,  // 76: quilibrium.node.global.pb.GetSignedKeyResponse.key:type_name -> quilibrium.node.keys.pb.SignedX448Key
+	99,  // 77: quilibrium.node.global.pb.GetSignedKeysByParentResponse.keys:type_name -> quilibrium.node.keys.pb.SignedX448Key
+	77,  // 78: quilibrium.node.global.pb.RangeProvingKeysResponse.key:type_name -> quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession
+	98,  // 79: quilibrium.node.global.pb.RangeIdentityKeysResponse.key:type_name -> quilibrium.node.keys.pb.Ed448PublicKey
+	99,  // 80: quilibrium.node.global.pb.RangeSignedKeysResponse.key:type_name -> quilibrium.node.keys.pb.SignedX448Key
+	73,  // 81: quilibrium.node.global.pb.PutMessageRequest.message_shards:type_name -> quilibrium.node.global.pb.MessageKeyShard
+	26,  // 82: quilibrium.node.global.pb.GlobalService.GetGlobalFrame:input_type -> quilibrium.node.global.pb.GetGlobalFrameRequest
+	28,  // 83: quilibrium.node.global.pb.GlobalService.GetGlobalProposal:input_type -> quilibrium.node.global.pb.GetGlobalProposalRequest
+	34,  // 84: quilibrium.node.global.pb.GlobalService.GetAppShards:input_type -> quilibrium.node.global.pb.GetAppShardsRequest
+	37,  // 85: quilibrium.node.global.pb.GlobalService.GetGlobalShards:input_type -> quilibrium.node.global.pb.GetGlobalShardsRequest
+	39,  // 86: quilibrium.node.global.pb.GlobalService.GetLockedAddresses:input_type -> quilibrium.node.global.pb.GetLockedAddressesRequest
+	42,  // 87: quilibrium.node.global.pb.GlobalService.GetWorkerInfo:input_type -> quilibrium.node.global.pb.GlobalGetWorkerInfoRequest
+	30,  // 88: quilibrium.node.global.pb.AppShardService.GetAppShardFrame:input_type -> quilibrium.node.global.pb.GetAppShardFrameRequest
+	32,  // 89: quilibrium.node.global.pb.AppShardService.GetAppShardProposal:input_type -> quilibrium.node.global.pb.GetAppShardProposalRequest
+	45,  // 90: quilibrium.node.global.pb.OnionService.Connect:input_type -> quilibrium.node.global.pb.SendMessage
+	74,  // 91: quilibrium.node.global.pb.MixnetService.PutMessage:input_type -> quilibrium.node.global.pb.PutMessageRequest
+	100, // 92: quilibrium.node.global.pb.MixnetService.RoundStream:input_type -> quilibrium.node.application.pb.Message
+	47,  // 93: quilibrium.node.global.pb.KeyRegistryService.GetKeyRegistry:input_type -> quilibrium.node.global.pb.GetKeyRegistryRequest
+	49,  // 94: quilibrium.node.global.pb.KeyRegistryService.GetKeyRegistryByProver:input_type -> quilibrium.node.global.pb.GetKeyRegistryByProverRequest
+	51,  // 95: quilibrium.node.global.pb.KeyRegistryService.PutIdentityKey:input_type -> quilibrium.node.global.pb.PutIdentityKeyRequest
+	53,  // 96: quilibrium.node.global.pb.KeyRegistryService.PutProvingKey:input_type -> quilibrium.node.global.pb.PutProvingKeyRequest
+	55,  // 97: quilibrium.node.global.pb.KeyRegistryService.PutCrossSignature:input_type -> quilibrium.node.global.pb.PutCrossSignatureRequest
+	57,  // 98: quilibrium.node.global.pb.KeyRegistryService.PutSignedKey:input_type -> quilibrium.node.global.pb.PutSignedKeyRequest
+	59,  // 99: quilibrium.node.global.pb.KeyRegistryService.GetIdentityKey:input_type -> quilibrium.node.global.pb.GetIdentityKeyRequest
+	61,  // 100: quilibrium.node.global.pb.KeyRegistryService.GetProvingKey:input_type -> quilibrium.node.global.pb.GetProvingKeyRequest
+	63,  // 101: quilibrium.node.global.pb.KeyRegistryService.GetSignedKey:input_type -> quilibrium.node.global.pb.GetSignedKeyRequest
+	65,  // 102: quilibrium.node.global.pb.KeyRegistryService.GetSignedKeysByParent:input_type -> quilibrium.node.global.pb.GetSignedKeysByParentRequest
+	67,  // 103: quilibrium.node.global.pb.KeyRegistryService.RangeProvingKeys:input_type -> quilibrium.node.global.pb.RangeProvingKeysRequest
+	69,  // 104: quilibrium.node.global.pb.KeyRegistryService.RangeIdentityKeys:input_type -> quilibrium.node.global.pb.RangeIdentityKeysRequest
+	71,  // 105: quilibrium.node.global.pb.KeyRegistryService.RangeSignedKeys:input_type -> quilibrium.node.global.pb.RangeSignedKeysRequest
+	101, // 106: quilibrium.node.global.pb.DispatchService.PutInboxMessage:input_type -> quilibrium.node.channel.pb.InboxMessagePut
+	102, // 107: quilibrium.node.global.pb.DispatchService.GetInboxMessages:input_type -> quilibrium.node.channel.pb.InboxMessageRequest
+	103, // 108: quilibrium.node.global.pb.DispatchService.PutHub:input_type -> quilibrium.node.channel.pb.HubPut
+	104, // 109: quilibrium.node.global.pb.DispatchService.GetHub:input_type -> quilibrium.node.channel.pb.HubRequest
+	105, // 110: quilibrium.node.global.pb.DispatchService.Sync:input_type -> quilibrium.node.channel.pb.DispatchSyncRequest
+	27,  // 111: quilibrium.node.global.pb.GlobalService.GetGlobalFrame:output_type -> quilibrium.node.global.pb.GlobalFrameResponse
+	29,  // 112: quilibrium.node.global.pb.GlobalService.GetGlobalProposal:output_type -> quilibrium.node.global.pb.GlobalProposalResponse
+	36,  // 113: quilibrium.node.global.pb.GlobalService.GetAppShards:output_type -> quilibrium.node.global.pb.GetAppShardsResponse
+	38,  // 114: quilibrium.node.global.pb.GlobalService.GetGlobalShards:output_type -> quilibrium.node.global.pb.GetGlobalShardsResponse
+	41,  // 115: quilibrium.node.global.pb.GlobalService.GetLockedAddresses:output_type -> quilibrium.node.global.pb.GetLockedAddressesResponse
+	44,  // 116: quilibrium.node.global.pb.GlobalService.GetWorkerInfo:output_type -> quilibrium.node.global.pb.GlobalGetWorkerInfoResponse
+	31,  // 117: quilibrium.node.global.pb.AppShardService.GetAppShardFrame:output_type -> quilibrium.node.global.pb.AppShardFrameResponse
+	33,  // 118: quilibrium.node.global.pb.AppShardService.GetAppShardProposal:output_type -> quilibrium.node.global.pb.AppShardProposalResponse
+	46,  // 119: quilibrium.node.global.pb.OnionService.Connect:output_type -> quilibrium.node.global.pb.ReceiveMessage
+	75,  // 120: quilibrium.node.global.pb.MixnetService.PutMessage:output_type -> quilibrium.node.global.pb.PutMessageResponse
+	100, // 121: quilibrium.node.global.pb.MixnetService.RoundStream:output_type -> quilibrium.node.application.pb.Message
+	48,  // 122: quilibrium.node.global.pb.KeyRegistryService.GetKeyRegistry:output_type -> quilibrium.node.global.pb.GetKeyRegistryResponse
+	50,  // 123: quilibrium.node.global.pb.KeyRegistryService.GetKeyRegistryByProver:output_type -> quilibrium.node.global.pb.GetKeyRegistryByProverResponse
+	52,  // 124: quilibrium.node.global.pb.KeyRegistryService.PutIdentityKey:output_type -> quilibrium.node.global.pb.PutIdentityKeyResponse
+	54,  // 125: quilibrium.node.global.pb.KeyRegistryService.PutProvingKey:output_type -> quilibrium.node.global.pb.PutProvingKeyResponse
+	56,  // 126: quilibrium.node.global.pb.KeyRegistryService.PutCrossSignature:output_type -> quilibrium.node.global.pb.PutCrossSignatureResponse
+	58,  // 127: quilibrium.node.global.pb.KeyRegistryService.PutSignedKey:output_type -> quilibrium.node.global.pb.PutSignedKeyResponse
+	60,  // 128: quilibrium.node.global.pb.KeyRegistryService.GetIdentityKey:output_type -> quilibrium.node.global.pb.GetIdentityKeyResponse
+	62,  // 129: quilibrium.node.global.pb.KeyRegistryService.GetProvingKey:output_type -> quilibrium.node.global.pb.GetProvingKeyResponse
+	64,  // 130: quilibrium.node.global.pb.KeyRegistryService.GetSignedKey:output_type -> quilibrium.node.global.pb.GetSignedKeyResponse
+	66,  // 131: quilibrium.node.global.pb.KeyRegistryService.GetSignedKeysByParent:output_type -> quilibrium.node.global.pb.GetSignedKeysByParentResponse
+	68,  // 132: quilibrium.node.global.pb.KeyRegistryService.RangeProvingKeys:output_type -> quilibrium.node.global.pb.RangeProvingKeysResponse
+	70,  // 133: quilibrium.node.global.pb.KeyRegistryService.RangeIdentityKeys:output_type -> quilibrium.node.global.pb.RangeIdentityKeysResponse
+	72,  // 134: quilibrium.node.global.pb.KeyRegistryService.RangeSignedKeys:output_type -> quilibrium.node.global.pb.RangeSignedKeysResponse
+	106, // 135: quilibrium.node.global.pb.DispatchService.PutInboxMessage:output_type -> google.protobuf.Empty
+	107, // 136: quilibrium.node.global.pb.DispatchService.GetInboxMessages:output_type -> quilibrium.node.channel.pb.InboxMessageResponse
+	106, // 137: quilibrium.node.global.pb.DispatchService.PutHub:output_type -> google.protobuf.Empty
+	108, // 138: quilibrium.node.global.pb.DispatchService.GetHub:output_type -> quilibrium.node.channel.pb.HubResponse
+	109, // 139: quilibrium.node.global.pb.DispatchService.Sync:output_type -> quilibrium.node.channel.pb.DispatchSyncResponse
+	111, // [111:140] is the sub-list for method output_type
+	82,  // [82:111] is the sub-list for method input_type
+	82,  // [82:82] is the sub-list for extension type_name
+	82,  // [82:82] is the sub-list for extension extendee
+	0,   // [0:82] is the sub-list for field type_name
 }
 
 func init() { file_global_proto_init() }
@@ -6525,7 +6634,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[10].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*AltShardUpdate); i {
+			switch v := v.(*ProverSeniorityMerge); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6537,7 +6646,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[11].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*MessageRequest); i {
+			switch v := v.(*AltShardUpdate); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6549,7 +6658,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[12].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*MessageBundle); i {
+			switch v := v.(*MessageRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6561,7 +6670,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[13].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GlobalFrameHeader); i {
+			switch v := v.(*MessageBundle); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6573,7 +6682,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[14].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*FrameHeader); i {
+			switch v := v.(*GlobalFrameHeader); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6585,7 +6694,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[15].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*ProverLivenessCheck); i {
+			switch v := v.(*FrameHeader); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6597,7 +6706,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[16].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*AppShardProposal); i {
+			switch v := v.(*ProverLivenessCheck); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6609,7 +6718,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[17].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GlobalProposal); i {
+			switch v := v.(*AppShardProposal); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6621,7 +6730,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[18].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*ProposalVote); i {
+			switch v := v.(*GlobalProposal); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6633,7 +6742,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[19].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*TimeoutState); i {
+			switch v := v.(*ProposalVote); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6645,7 +6754,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[20].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*QuorumCertificate); i {
+			switch v := v.(*TimeoutState); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6657,7 +6766,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[21].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*TimeoutCertificate); i {
+			switch v := v.(*QuorumCertificate); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6669,7 +6778,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[22].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GlobalFrame); i {
+			switch v := v.(*TimeoutCertificate); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6681,7 +6790,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[23].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*AppShardFrame); i {
+			switch v := v.(*GlobalFrame); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6693,7 +6802,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[24].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GlobalAlert); i {
+			switch v := v.(*AppShardFrame); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6705,7 +6814,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[25].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetGlobalFrameRequest); i {
+			switch v := v.(*GlobalAlert); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6717,7 +6826,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[26].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GlobalFrameResponse); i {
+			switch v := v.(*GetGlobalFrameRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6729,7 +6838,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[27].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetGlobalProposalRequest); i {
+			switch v := v.(*GlobalFrameResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6741,7 +6850,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[28].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GlobalProposalResponse); i {
+			switch v := v.(*GetGlobalProposalRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6753,7 +6862,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[29].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetAppShardFrameRequest); i {
+			switch v := v.(*GlobalProposalResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6765,7 +6874,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[30].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*AppShardFrameResponse); i {
+			switch v := v.(*GetAppShardFrameRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6777,7 +6886,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[31].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetAppShardProposalRequest); i {
+			switch v := v.(*AppShardFrameResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6789,7 +6898,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[32].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*AppShardProposalResponse); i {
+			switch v := v.(*GetAppShardProposalRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6801,7 +6910,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[33].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetAppShardsRequest); i {
+			switch v := v.(*AppShardProposalResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6813,7 +6922,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[34].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*AppShardInfo); i {
+			switch v := v.(*GetAppShardsRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6825,7 +6934,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[35].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetAppShardsResponse); i {
+			switch v := v.(*AppShardInfo); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6837,7 +6946,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[36].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetGlobalShardsRequest); i {
+			switch v := v.(*GetAppShardsResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6849,7 +6958,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[37].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetGlobalShardsResponse); i {
+			switch v := v.(*GetGlobalShardsRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6861,7 +6970,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[38].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetLockedAddressesRequest); i {
+			switch v := v.(*GetGlobalShardsResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6873,7 +6982,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[39].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*LockedTransaction); i {
+			switch v := v.(*GetLockedAddressesRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6885,7 +6994,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[40].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetLockedAddressesResponse); i {
+			switch v := v.(*LockedTransaction); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6897,7 +7006,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[41].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GlobalGetWorkerInfoRequest); i {
+			switch v := v.(*GetLockedAddressesResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6909,7 +7018,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[42].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GlobalGetWorkerInfoResponseItem); i {
+			switch v := v.(*GlobalGetWorkerInfoRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6921,7 +7030,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[43].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GlobalGetWorkerInfoResponse); i {
+			switch v := v.(*GlobalGetWorkerInfoResponseItem); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6933,7 +7042,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[44].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*SendMessage); i {
+			switch v := v.(*GlobalGetWorkerInfoResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6945,7 +7054,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[45].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*ReceiveMessage); i {
+			switch v := v.(*SendMessage); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6957,7 +7066,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[46].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetKeyRegistryRequest); i {
+			switch v := v.(*ReceiveMessage); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6969,7 +7078,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[47].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetKeyRegistryResponse); i {
+			switch v := v.(*GetKeyRegistryRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6981,7 +7090,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[48].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetKeyRegistryByProverRequest); i {
+			switch v := v.(*GetKeyRegistryResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -6993,7 +7102,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[49].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetKeyRegistryByProverResponse); i {
+			switch v := v.(*GetKeyRegistryByProverRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7005,7 +7114,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[50].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PutIdentityKeyRequest); i {
+			switch v := v.(*GetKeyRegistryByProverResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7017,7 +7126,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[51].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PutIdentityKeyResponse); i {
+			switch v := v.(*PutIdentityKeyRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7029,7 +7138,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[52].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PutProvingKeyRequest); i {
+			switch v := v.(*PutIdentityKeyResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7041,7 +7150,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[53].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PutProvingKeyResponse); i {
+			switch v := v.(*PutProvingKeyRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7053,7 +7162,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[54].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PutCrossSignatureRequest); i {
+			switch v := v.(*PutProvingKeyResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7065,7 +7174,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[55].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PutCrossSignatureResponse); i {
+			switch v := v.(*PutCrossSignatureRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7077,7 +7186,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[56].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PutSignedKeyRequest); i {
+			switch v := v.(*PutCrossSignatureResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7089,7 +7198,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[57].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PutSignedKeyResponse); i {
+			switch v := v.(*PutSignedKeyRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7101,7 +7210,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[58].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetIdentityKeyRequest); i {
+			switch v := v.(*PutSignedKeyResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7113,7 +7222,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[59].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetIdentityKeyResponse); i {
+			switch v := v.(*GetIdentityKeyRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7125,7 +7234,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[60].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetProvingKeyRequest); i {
+			switch v := v.(*GetIdentityKeyResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7137,7 +7246,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[61].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetProvingKeyResponse); i {
+			switch v := v.(*GetProvingKeyRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7149,7 +7258,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[62].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetSignedKeyRequest); i {
+			switch v := v.(*GetProvingKeyResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7161,7 +7270,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[63].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetSignedKeyResponse); i {
+			switch v := v.(*GetSignedKeyRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7173,7 +7282,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[64].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetSignedKeysByParentRequest); i {
+			switch v := v.(*GetSignedKeyResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7185,7 +7294,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[65].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*GetSignedKeysByParentResponse); i {
+			switch v := v.(*GetSignedKeysByParentRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7197,7 +7306,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[66].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*RangeProvingKeysRequest); i {
+			switch v := v.(*GetSignedKeysByParentResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7209,7 +7318,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[67].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*RangeProvingKeysResponse); i {
+			switch v := v.(*RangeProvingKeysRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7221,7 +7330,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[68].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*RangeIdentityKeysRequest); i {
+			switch v := v.(*RangeProvingKeysResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7233,7 +7342,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[69].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*RangeIdentityKeysResponse); i {
+			switch v := v.(*RangeIdentityKeysRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7245,7 +7354,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[70].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*RangeSignedKeysRequest); i {
+			switch v := v.(*RangeIdentityKeysResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7257,7 +7366,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[71].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*RangeSignedKeysResponse); i {
+			switch v := v.(*RangeSignedKeysRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7269,7 +7378,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[72].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*MessageKeyShard); i {
+			switch v := v.(*RangeSignedKeysResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7281,7 +7390,7 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[73].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PutMessageRequest); i {
+			switch v := v.(*MessageKeyShard); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -7293,6 +7402,18 @@ func file_global_proto_init() {
 			}
 		}
 		file_global_proto_msgTypes[74].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*PutMessageRequest); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_global_proto_msgTypes[75].Exporter = func(v interface{}, i int) interface{} {
 			switch v := v.(*PutMessageResponse); i {
 			case 0:
 				return &v.state
@@ -7305,7 +7426,7 @@ func file_global_proto_init() {
 			}
 		}
 	}
-	file_global_proto_msgTypes[11].OneofWrappers = []interface{}{
+	file_global_proto_msgTypes[12].OneofWrappers = []interface{}{
 		(*MessageRequest_Join)(nil),
 		(*MessageRequest_Leave)(nil),
 		(*MessageRequest_Pause)(nil),
@@ -7332,6 +7453,7 @@ func file_global_proto_init() {
 		(*MessageRequest_CodeFinalize)(nil),
 		(*MessageRequest_Shard)(nil),
 		(*MessageRequest_AltShardUpdate)(nil),
+		(*MessageRequest_SeniorityMerge)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -7339,7 +7461,7 @@ func file_global_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_global_proto_rawDesc,
 			NumEnums:      0,
-			NumMessages:   75,
+			NumMessages:   76,
 			NumExtensions: 0,
 			NumServices:   6,
 		},

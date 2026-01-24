@@ -383,7 +383,7 @@ func main() {
 	}
 
 	if *dangerClearPending {
-		db := store.NewPebbleDB(logger, nodeConfig.DB, 0)
+		db := store.NewPebbleDB(logger, nodeConfig, 0)
 		defer db.Close()
 		consensusStore := store.NewPebbleConsensusStore(db, logger)
 		state, err := consensusStore.GetConsensusState(nil)
@@ -443,7 +443,7 @@ func main() {
 	}
 
 	if *compactDB {
-		db := store.NewPebbleDB(logger, nodeConfig.DB, uint(*core))
+		db := store.NewPebbleDB(logger, nodeConfig, uint(*core))
 		if err := db.CompactAll(); err != nil {
 			logger.Fatal("failed to compact database", zap.Error(err))
 		}

@@ -453,3 +453,41 @@ func (p *ProverUpdate) FromBytes(data []byte) error {
 
 	return nil
 }
+
+// ToBytes serializes a ProverSeniorityMerge to bytes using protobuf
+func (p *ProverSeniorityMerge) ToBytes() ([]byte, error) {
+	pb := p.ToProtobuf()
+	return pb.ToCanonicalBytes()
+}
+
+// ToRequestBytes serializes a ProverSeniorityMerge to MessageRequest bytes
+// using protobuf
+func (p *ProverSeniorityMerge) ToRequestBytes() ([]byte, error) {
+	pb := p.ToProtobuf()
+	req := &protobufs.MessageRequest{
+		Request: &protobufs.MessageRequest_SeniorityMerge{
+			SeniorityMerge: pb,
+		},
+	}
+	return req.ToCanonicalBytes()
+}
+
+// FromBytes deserializes a ProverSeniorityMerge from bytes using protobuf
+func (p *ProverSeniorityMerge) FromBytes(data []byte) error {
+	pb := &protobufs.ProverSeniorityMerge{}
+	if err := pb.FromCanonicalBytes(data); err != nil {
+		return errors.Wrap(err, "from bytes")
+	}
+
+	converted, err := ProverSeniorityMergeFromProtobuf(pb, nil, nil, nil)
+	if err != nil {
+		return errors.Wrap(err, "from bytes")
+	}
+
+	// Copy only the data fields, runtime dependencies will be set separately
+	p.FrameNumber = converted.FrameNumber
+	p.PublicKeySignatureBLS48581 = converted.PublicKeySignatureBLS48581
+	p.MergeTargets = converted.MergeTargets
+
+	return nil
+}

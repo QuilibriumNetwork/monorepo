@@ -6139,3 +6139,150 @@ func (g *GlobalAlert) Validate() error {
 
 	return nil
 }
+
+// ProverSeniorityMerge serialization methods
+
+func (p *ProverSeniorityMerge) ToCanonicalBytes() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Write type prefix
+	if err := binary.Write(buf, binary.BigEndian, ProverSeniorityMergeType); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write frame_number
+	if err := binary.Write(buf, binary.BigEndian, p.FrameNumber); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write public_key_signature_bls48581
+	if p.PublicKeySignatureBls48581 != nil {
+		sigBytes, err := p.PublicKeySignatureBls48581.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(sigBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(sigBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	} else {
+		if err := binary.Write(buf, binary.BigEndian, uint32(0)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write merge_targets count
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(p.MergeTargets)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write each merge target
+	for _, mt := range p.MergeTargets {
+		mtBytes, err := mt.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(mtBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(mtBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (p *ProverSeniorityMerge) FromCanonicalBytes(data []byte) error {
+	buf := bytes.NewBuffer(data)
+
+	// Read and verify type prefix
+	var typePrefix uint32
+	if err := binary.Read(buf, binary.BigEndian, &typePrefix); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if typePrefix != ProverSeniorityMergeType {
+		return errors.Wrap(
+			errors.New("invalid type prefix"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read frame_number
+	if err := binary.Read(buf, binary.BigEndian, &p.FrameNumber); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read public_key_signature_bls48581
+	var sigLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 118 {
+		return errors.Wrap(
+			errors.New("invalid signature length"),
+			"from canonical bytes",
+		)
+	}
+	if sigLen > 0 {
+		sigBytes := make([]byte, sigLen)
+		if _, err := buf.Read(sigBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		p.PublicKeySignatureBls48581 = &BLS48581AddressedSignature{}
+		if err := p.PublicKeySignatureBls48581.FromCanonicalBytes(sigBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	// Read merge_targets count
+	var mtCount uint32
+	if err := binary.Read(buf, binary.BigEndian, &mtCount); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if mtCount > 100 {
+		return errors.Wrap(
+			errors.New("too many merge targets"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read each merge target
+	p.MergeTargets = make([]*SeniorityMerge, mtCount)
+	for i := uint32(0); i < mtCount; i++ {
+		var mtLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &mtLen); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		if mtLen > 1000 {
+			return errors.Wrap(
+				errors.New("invalid merge target length"),
+				"from canonical bytes",
+			)
+		}
+		mtBytes := make([]byte, mtLen)
+		if _, err := buf.Read(mtBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		p.MergeTargets[i] = &SeniorityMerge{}
+		if err := p.MergeTargets[i].FromCanonicalBytes(mtBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	return nil
+}
