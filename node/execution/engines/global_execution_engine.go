@@ -207,7 +207,8 @@ func (e *GlobalExecutionEngine) validateBundle(
 				op.GetReject() != nil ||
 				op.GetKick() != nil ||
 				op.GetUpdate() != nil ||
-				op.GetShard() != nil
+				op.GetShard() != nil ||
+				op.GetSeniorityMerge() != nil
 
 			if !isGlobalOp {
 				if e.config.Network == 0 &&
