@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2759,9 +2760,9 @@ func TestMainnetBlossomsubFrameReceptionAndHypersync(t *testing.T) {
 			}
 			peerInfoMu.Unlock()
 
-			peerIdStr := peer.ID(peerInfoMsg.PeerId).String()
-			t.Logf("Received peer info for %s with %d reachability entries",
-				peerIdStr, len(reachability))
+			// peerIdStr := peer.ID(peerInfoMsg.PeerId).String()
+			// t.Logf("Received peer info for %s with %d reachability entries",
+			// 	peerIdStr, len(reachability))
 
 		case protobufs.KeyRegistryType:
 			keyRegistry := &protobufs.KeyRegistry{}
@@ -2803,8 +2804,8 @@ func TestMainnetBlossomsubFrameReceptionAndHypersync(t *testing.T) {
 			keyRegistryMap[string(proverAddress)] = identityPeerID
 			keyRegistryMu.Unlock()
 
-			t.Logf("Received key registry: prover %x -> peer %s",
-				proverAddress, identityPeerID.String())
+			// t.Logf("Received key registry: prover %x -> peer %s",
+			// 	proverAddress, identityPeerID.String())
 		}
 
 		return nil
@@ -3109,6 +3110,70 @@ waitLoop:
 
 	client := protobufs.NewHypergraphComparisonServiceClient(conn)
 
+	// First, query the server's root commitment to verify what it claims to have
+	t.Log("Querying server's root commitment before sync...")
+	{
+		diagStream, err := client.PerformSync(context.Background())
+		require.NoError(t, err)
+
+		shardKeyBytes := slices.Concat(proverShardKey.L1[:], proverShardKey.L2[:])
+		err = diagStream.Send(&protobufs.HypergraphSyncQuery{
+			Request: &protobufs.HypergraphSyncQuery_GetBranch{
+				GetBranch: &protobufs.HypergraphSyncGetBranchRequest{
+					ShardKey: shardKeyBytes,
+					PhaseSet: protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+					Path:     []int32{},
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		resp, err := diagStream.Recv()
+		require.NoError(t, err)
+
+		if errResp := resp.GetError(); errResp != nil {
+			t.Logf("Server error on root query: %s", errResp.Message)
+		} else if branch := resp.GetBranch(); branch != nil {
+			t.Logf("Server root commitment: %x", branch.Commitment)
+			t.Logf("Server root path: %v", branch.FullPath)
+			t.Logf("Server root isLeaf: %v", branch.IsLeaf)
+			t.Logf("Server root children count: %d", len(branch.Children))
+			t.Logf("Server root leafCount: %d", branch.LeafCount)
+			t.Logf("Frame expected root: %x", expectedRoot)
+			if !bytes.Equal(branch.Commitment, expectedRoot) {
+				t.Logf("WARNING: Server root commitment does NOT match frame expected root!")
+			} else {
+				t.Logf("OK: Server root commitment matches frame expected root")
+			}
+			// Log each child's commitment
+			for _, child := range branch.Children {
+				t.Logf("  Server child[%d]: commitment=%x", child.Index, child.Commitment)
+			}
+
+			// Drill into child[37] specifically to compare
+			child37Path := append(slices.Clone(branch.FullPath), 37)
+			err = diagStream.Send(&protobufs.HypergraphSyncQuery{
+				Request: &protobufs.HypergraphSyncQuery_GetBranch{
+					GetBranch: &protobufs.HypergraphSyncGetBranchRequest{
+						ShardKey: shardKeyBytes,
+						PhaseSet: protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+						Path:     child37Path,
+					},
+				},
+			})
+			if err == nil {
+				resp37, err := diagStream.Recv()
+				if err == nil {
+					if b37 := resp37.GetBranch(); b37 != nil {
+						t.Logf("Server child[37] details: path=%v, leafCount=%d, isLeaf=%v, childrenCount=%d",
+							b37.FullPath, b37.LeafCount, b37.IsLeaf, len(b37.Children))
+					}
+				}
+			}
+		}
+		_ = diagStream.CloseSend()
+	}
+
 	// Perform hypersync on all phases
 	t.Log("Performing hypersync on prover shard...")
 
@@ -3139,27 +3204,541 @@ waitLoop:
 	t.Logf("Client prover root after sync: %x", clientProverRoot)
 	t.Logf("Expected prover root from frame: %x", expectedRoot)
 
+	// Diagnostic: show client tree structure
+	clientTreeForDiag := clientHG.GetVertexAddsSet(proverShardKey).GetTree()
+	if clientTreeForDiag != nil && clientTreeForDiag.Root != nil {
+		switch n := clientTreeForDiag.Root.(type) {
+		case *tries.LazyVectorCommitmentBranchNode:
+			t.Logf("Client root is BRANCH: path=%v, commitment=%x, leafCount=%d", n.FullPrefix, n.Commitment, n.LeafCount)
+			childCount := 0
+			for i := 0; i < 64; i++ {
+				if n.Children[i] != nil {
+					childCount++
+					child := n.Children[i]
+					switch c := child.(type) {
+					case *tries.LazyVectorCommitmentBranchNode:
+						t.Logf("  Client child[%d]: BRANCH commitment=%x, leafCount=%d", i, c.Commitment, c.LeafCount)
+					case *tries.LazyVectorCommitmentLeafNode:
+						t.Logf("  Client child[%d]: LEAF commitment=%x", i, c.Commitment)
+					}
+				}
+			}
+			t.Logf("Client root in-memory children: %d", childCount)
+		case *tries.LazyVectorCommitmentLeafNode:
+			t.Logf("Client root is LEAF: key=%x, commitment=%x", n.Key, n.Commitment)
+		}
+	} else {
+		t.Logf("Client tree root is nil")
+	}
+
+	// Deep dive into child[37] - get server leaves to compare
+	t.Log("=== Deep dive into child[37] ===")
+	var serverChild37Leaves []*protobufs.LeafData
+	{
+		diagStream, err := client.PerformSync(context.Background())
+		if err != nil {
+			t.Logf("Failed to create diag stream: %v", err)
+		} else {
+			shardKeyBytes := slices.Concat(proverShardKey.L1[:], proverShardKey.L2[:])
+			// Correct path: root is at [...60], child[37] is at [...60, 37]
+			child37Path := []int32{63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 60, 37}
+
+			err = diagStream.Send(&protobufs.HypergraphSyncQuery{
+				Request: &protobufs.HypergraphSyncQuery_GetLeaves{
+					GetLeaves: &protobufs.HypergraphSyncGetLeavesRequest{
+						ShardKey:  shardKeyBytes,
+						PhaseSet:  protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+						Path:      child37Path,
+						MaxLeaves: 1000,
+					},
+				},
+			})
+			if err != nil {
+				t.Logf("Failed to send GetLeaves request: %v", err)
+			} else {
+				resp, err := diagStream.Recv()
+				if err != nil {
+					t.Logf("Failed to receive GetLeaves response: %v", err)
+				} else if errResp := resp.GetError(); errResp != nil {
+					t.Logf("Server returned error: %s", errResp.Message)
+				} else if leaves := resp.GetLeaves(); leaves != nil {
+					serverChild37Leaves = leaves.Leaves
+					t.Logf("Server child[37] leaves: count=%d, total=%d", len(leaves.Leaves), leaves.TotalLeaves)
+					// Show first few leaf keys
+					for i, leaf := range leaves.Leaves {
+						if i < 5 {
+							t.Logf("  Server leaf[%d]: key=%x (len=%d)", i, leaf.Key[:min(32, len(leaf.Key))], len(leaf.Key))
+						}
+					}
+					if len(leaves.Leaves) > 5 {
+						t.Logf("  ... and %d more leaves", len(leaves.Leaves)-5)
+					}
+				} else {
+					t.Logf("Server returned unexpected response type")
+				}
+			}
+			_ = diagStream.CloseSend()
+		}
+	}
+
+	// Get all client leaves and compare with server child[37] leaves
+	clientTree := clientHG.GetVertexAddsSet(proverShardKey).GetTree()
+	allClientLeaves := tries.GetAllLeaves(
+		clientTree.SetType,
+		clientTree.PhaseType,
+		clientTree.ShardKey,
+		clientTree.Root,
+	)
+	t.Logf("Total client leaves: %d", len(allClientLeaves))
+
+	// Build map of client leaf keys -> values
+	clientLeafMap := make(map[string][]byte)
+	for _, leaf := range allClientLeaves {
+		if leaf != nil {
+			clientLeafMap[string(leaf.Key)] = leaf.Value
+		}
+	}
+
+	// Check which server child[37] leaves are in client and compare values
+	if len(serverChild37Leaves) > 0 {
+		found := 0
+		missing := 0
+		valueMismatch := 0
+		for _, serverLeaf := range serverChild37Leaves {
+			clientValue, exists := clientLeafMap[string(serverLeaf.Key)]
+			if !exists {
+				if missing < 3 {
+					t.Logf("  Missing server leaf: key=%x", serverLeaf.Key[:min(32, len(serverLeaf.Key))])
+				}
+				missing++
+			} else {
+				found++
+				if !bytes.Equal(clientValue, serverLeaf.Value) {
+					if valueMismatch < 5 {
+						t.Logf("  VALUE MISMATCH for key=%x: serverLen=%d, clientLen=%d",
+							serverLeaf.Key[:min(32, len(serverLeaf.Key))],
+							len(serverLeaf.Value), len(clientValue))
+						t.Logf("    Server value prefix: %x", serverLeaf.Value[:min(64, len(serverLeaf.Value))])
+						t.Logf("    Client value prefix: %x", clientValue[:min(64, len(clientValue))])
+					}
+					valueMismatch++
+				}
+			}
+		}
+		t.Logf("Server child[37] leaves in client: found=%d, missing=%d, valueMismatch=%d", found, missing, valueMismatch)
+	}
+
+	// Compare branch structure for child[37]
+	t.Log("=== Comparing branch structure for child[37] ===")
+	{
+		// Query server's child[37] branch info
+		diagStream, err := client.PerformSync(context.Background())
+		if err == nil {
+			shardKeyBytes := slices.Concat(proverShardKey.L1[:], proverShardKey.L2[:])
+			child37Path := []int32{63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 60, 37}
+
+			err = diagStream.Send(&protobufs.HypergraphSyncQuery{
+				Request: &protobufs.HypergraphSyncQuery_GetBranch{
+					GetBranch: &protobufs.HypergraphSyncGetBranchRequest{
+						ShardKey: shardKeyBytes,
+						PhaseSet: protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+						Path:     child37Path,
+					},
+				},
+			})
+			if err == nil {
+				resp, err := diagStream.Recv()
+				if err == nil {
+					if branch := resp.GetBranch(); branch != nil {
+						t.Logf("Server child[37] branch: path=%v, commitment=%x, children=%d",
+							branch.FullPath, branch.Commitment[:min(32, len(branch.Commitment))], len(branch.Children))
+
+						// Show first few children with their commitments
+						for i, child := range branch.Children {
+							if i < 10 {
+								t.Logf("  Server sub-child[%d]: commitment=%x", child.Index, child.Commitment[:min(32, len(child.Commitment))])
+							}
+						}
+
+						// Now check client's child[37] branch structure
+						if clientTree != nil && clientTree.Root != nil {
+							if rootBranch, ok := clientTree.Root.(*tries.LazyVectorCommitmentBranchNode); ok {
+								if child37 := rootBranch.Children[37]; child37 != nil {
+									if clientChild37Branch, ok := child37.(*tries.LazyVectorCommitmentBranchNode); ok {
+										t.Logf("Client child[37] branch: path=%v, commitment=%x, leafCount=%d",
+											clientChild37Branch.FullPrefix, clientChild37Branch.Commitment[:min(32, len(clientChild37Branch.Commitment))], clientChild37Branch.LeafCount)
+
+										// Count and show client's children
+										clientChildCount := 0
+										for i := 0; i < 64; i++ {
+											if clientChild37Branch.Children[i] != nil {
+												if clientChildCount < 10 {
+													switch c := clientChild37Branch.Children[i].(type) {
+													case *tries.LazyVectorCommitmentBranchNode:
+														t.Logf("  Client sub-child[%d]: BRANCH commitment=%x", i, c.Commitment[:min(32, len(c.Commitment))])
+													case *tries.LazyVectorCommitmentLeafNode:
+														t.Logf("  Client sub-child[%d]: LEAF commitment=%x", i, c.Commitment[:min(32, len(c.Commitment))])
+													}
+												}
+												clientChildCount++
+											}
+										}
+										t.Logf("Client child[37] has %d in-memory children, server has %d", clientChildCount, len(branch.Children))
+									} else if clientChild37Leaf, ok := child37.(*tries.LazyVectorCommitmentLeafNode); ok {
+										t.Logf("Client child[37] is LEAF: key=%x, commitment=%x",
+											clientChild37Leaf.Key[:min(32, len(clientChild37Leaf.Key))], clientChild37Leaf.Commitment[:min(32, len(clientChild37Leaf.Commitment))])
+									}
+								} else {
+									t.Logf("Client has NO child at index 37")
+								}
+							}
+						}
+					}
+				}
+			}
+			_ = diagStream.CloseSend()
+		}
+	}
+
+	// Recursive comparison function to drill into mismatches
+	var recursiveCompare func(path []int32, depth int)
+	recursiveCompare = func(path []int32, depth int) {
+		if depth > 10 {
+			t.Logf("DEPTH LIMIT REACHED at path=%v", path)
+			return
+		}
+
+		indent := strings.Repeat("  ", depth)
+
+		// Get server branch at path
+		diagStream, err := client.PerformSync(context.Background())
+		if err != nil {
+			t.Logf("%sERROR creating stream: %v", indent, err)
+			return
+		}
+		defer diagStream.CloseSend()
+
+		shardKeyBytes := slices.Concat(proverShardKey.L1[:], proverShardKey.L2[:])
+		err = diagStream.Send(&protobufs.HypergraphSyncQuery{
+			Request: &protobufs.HypergraphSyncQuery_GetBranch{
+				GetBranch: &protobufs.HypergraphSyncGetBranchRequest{
+					ShardKey: shardKeyBytes,
+					PhaseSet: protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+					Path:     path,
+				},
+			},
+		})
+		if err != nil {
+			t.Logf("%sERROR sending request: %v", indent, err)
+			return
+		}
+
+		resp, err := diagStream.Recv()
+		if err != nil {
+			t.Logf("%sERROR receiving response: %v", indent, err)
+			return
+		}
+
+		if errResp := resp.GetError(); errResp != nil {
+			t.Logf("%sSERVER ERROR: %s", indent, errResp.Message)
+			return
+		}
+
+		serverBranch := resp.GetBranch()
+		if serverBranch == nil {
+			t.Logf("%sNO BRANCH in response", indent)
+			return
+		}
+
+		t.Logf("%sSERVER: path=%v, fullPath=%v, leafCount=%d, children=%d, isLeaf=%v",
+			indent, path, serverBranch.FullPath, serverBranch.LeafCount,
+			len(serverBranch.Children), serverBranch.IsLeaf)
+		t.Logf("%sSERVER commitment: %x", indent, serverBranch.Commitment[:min(48, len(serverBranch.Commitment))])
+
+		// Get corresponding client node - convert []int32 to []int
+		pathInt := make([]int, len(path))
+		for i, p := range path {
+			pathInt[i] = int(p)
+		}
+		clientNode, err := clientTree.GetByPath(pathInt)
+		if err != nil {
+			t.Logf("%sERROR getting client node: %v", indent, err)
+			return
+		}
+
+		if clientNode == nil {
+			t.Logf("%sCLIENT: NO NODE at path=%v", indent, path)
+			return
+		}
+
+		switch cn := clientNode.(type) {
+		case *tries.LazyVectorCommitmentBranchNode:
+			t.Logf("%sCLIENT: path=%v, fullPrefix=%v, leafCount=%d, commitment=%x",
+				indent, path, cn.FullPrefix, cn.LeafCount, cn.Commitment[:min(48, len(cn.Commitment))])
+
+			// Check if server is leaf but client is branch
+			if serverBranch.IsLeaf {
+				t.Logf("%s*** TYPE MISMATCH: server is LEAF, client is BRANCH ***", indent)
+				t.Logf("%s  SERVER: fullPath=%v, isLeaf=%v, commitment=%x",
+					indent, serverBranch.FullPath, serverBranch.IsLeaf, serverBranch.Commitment[:min(48, len(serverBranch.Commitment))])
+				return
+			}
+
+			// Check if FullPath differs from FullPrefix
+			serverPathStr := fmt.Sprintf("%v", serverBranch.FullPath)
+			clientPathStr := fmt.Sprintf("%v", cn.FullPrefix)
+			if serverPathStr != clientPathStr {
+				t.Logf("%s*** PATH MISMATCH: server fullPath=%v, client fullPrefix=%v ***",
+					indent, serverBranch.FullPath, cn.FullPrefix)
+			}
+
+			// Check commitment match
+			if !bytes.Equal(serverBranch.Commitment, cn.Commitment) {
+				t.Logf("%s*** COMMITMENT MISMATCH ***", indent)
+
+				// Compare children
+				serverChildren := make(map[int32][]byte)
+				for _, sc := range serverBranch.Children {
+					serverChildren[sc.Index] = sc.Commitment
+				}
+
+				for i := int32(0); i < 64; i++ {
+					serverCommit := serverChildren[i]
+					var clientCommit []byte
+					clientChild := cn.Children[i]
+
+					// Lazy-load client child from store if needed
+					if clientChild == nil && len(serverCommit) > 0 {
+						childPathInt := make([]int, len(cn.FullPrefix)+1)
+						for j, p := range cn.FullPrefix {
+							childPathInt[j] = p
+						}
+						childPathInt[len(cn.FullPrefix)] = int(i)
+						clientChild, _ = clientTree.Store.GetNodeByPath(
+							clientTree.SetType,
+							clientTree.PhaseType,
+							clientTree.ShardKey,
+							childPathInt,
+						)
+					}
+
+					if clientChild != nil {
+						switch cc := clientChild.(type) {
+						case *tries.LazyVectorCommitmentBranchNode:
+							clientCommit = cc.Commitment
+						case *tries.LazyVectorCommitmentLeafNode:
+							clientCommit = cc.Commitment
+						}
+					}
+
+					if len(serverCommit) > 0 || len(clientCommit) > 0 {
+						if !bytes.Equal(serverCommit, clientCommit) {
+							t.Logf("%s  CHILD[%d] MISMATCH: server=%x, client=%x",
+								indent, i,
+								serverCommit[:min(24, len(serverCommit))],
+								clientCommit[:min(24, len(clientCommit))])
+							// Recurse into mismatched child
+							childPath := append(slices.Clone(serverBranch.FullPath), i)
+							recursiveCompare(childPath, depth+1)
+						}
+					}
+				}
+			}
+
+		case *tries.LazyVectorCommitmentLeafNode:
+			t.Logf("%sCLIENT: LEAF key=%x, commitment=%x",
+				indent, cn.Key[:min(32, len(cn.Key))], cn.Commitment[:min(48, len(cn.Commitment))])
+			t.Logf("%sCLIENT LEAF DETAIL: fullKey=%x, value len=%d",
+				indent, cn.Key, len(cn.Value))
+			// Compare with server commitment
+			if serverBranch.IsLeaf {
+				if !bytes.Equal(serverBranch.Commitment, cn.Commitment) {
+					t.Logf("%s*** LEAF COMMITMENT MISMATCH ***", indent)
+					t.Logf("%s  SERVER commitment: %x", indent, serverBranch.Commitment)
+					t.Logf("%s  CLIENT commitment: %x", indent, cn.Commitment)
+					t.Logf("%s  SERVER fullPath: %v", indent, serverBranch.FullPath)
+					// The key in LazyVectorCommitmentLeafNode doesn't have a "fullPrefix" directly -
+					// the path is determined by the key bytes
+				}
+			} else {
+				t.Logf("%s*** TYPE MISMATCH: server is branch, client is leaf ***", indent)
+			}
+		}
+	}
+
+	// Start recursive comparison at root
+	t.Log("=== RECURSIVE MISMATCH ANALYSIS ===")
+	rootPath := []int32{63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 60}
+	recursiveCompare(rootPath, 0)
+
+	// Now let's drill into the specific mismatched subtree to see the leaves
+	t.Log("=== LEAF-LEVEL ANALYSIS for [...60 37 1 50] ===")
+	{
+		// Get server leaves under this subtree
+		diagStream, err := client.PerformSync(context.Background())
+		if err == nil {
+			shardKeyBytes := slices.Concat(proverShardKey.L1[:], proverShardKey.L2[:])
+			mismatchPath := []int32{63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 60, 37, 1, 50}
+
+			err = diagStream.Send(&protobufs.HypergraphSyncQuery{
+				Request: &protobufs.HypergraphSyncQuery_GetLeaves{
+					GetLeaves: &protobufs.HypergraphSyncGetLeavesRequest{
+						ShardKey:  shardKeyBytes,
+						PhaseSet:  protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+						Path:      mismatchPath,
+						MaxLeaves: 100,
+					},
+				},
+			})
+			if err == nil {
+				resp, err := diagStream.Recv()
+				if err == nil {
+					if leaves := resp.GetLeaves(); leaves != nil {
+						t.Logf("SERVER leaves under [...60 37 1 50]: count=%d, total=%d",
+							len(leaves.Leaves), leaves.TotalLeaves)
+						for i, leaf := range leaves.Leaves {
+							t.Logf("  SERVER leaf[%d]: key=%x", i, leaf.Key)
+						}
+					}
+				}
+			}
+			_ = diagStream.CloseSend()
+		}
+
+		// Get client leaves under this subtree
+		clientTree = clientHG.GetVertexAddsSet(proverShardKey).GetTree()
+		mismatchPathInt := []int{63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 60, 37, 1, 50}
+		clientSubtreeNode, err := clientTree.GetByPath(mismatchPathInt)
+		if err != nil {
+			t.Logf("CLIENT error getting node at [...60 37 1 50]: %v", err)
+		} else if clientSubtreeNode != nil {
+			clientSubtreeLeaves := tries.GetAllLeaves(
+				clientTree.SetType,
+				clientTree.PhaseType,
+				clientTree.ShardKey,
+				clientSubtreeNode,
+			)
+			t.Logf("CLIENT leaves under [...60 37 1 50]: count=%d", len(clientSubtreeLeaves))
+			for i, leaf := range clientSubtreeLeaves {
+				if leaf != nil {
+					t.Logf("  CLIENT leaf[%d]: key=%x", i, leaf.Key)
+				}
+			}
+		}
+	}
+
+	// Check the deeper path [...60 37 1 50 50] which server claims has leafCount=2
+	t.Log("=== LEAF-LEVEL ANALYSIS for [...60 37 1 50 50] ===")
+	{
+		diagStream, err := client.PerformSync(context.Background())
+		if err == nil {
+			shardKeyBytes := slices.Concat(proverShardKey.L1[:], proverShardKey.L2[:])
+			deepPath := []int32{63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 60, 37, 1, 50, 50}
+
+			err = diagStream.Send(&protobufs.HypergraphSyncQuery{
+				Request: &protobufs.HypergraphSyncQuery_GetLeaves{
+					GetLeaves: &protobufs.HypergraphSyncGetLeavesRequest{
+						ShardKey:  shardKeyBytes,
+						PhaseSet:  protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+						Path:      deepPath,
+						MaxLeaves: 100,
+					},
+				},
+			})
+			if err == nil {
+				resp, err := diagStream.Recv()
+				if err == nil {
+					if leaves := resp.GetLeaves(); leaves != nil {
+						t.Logf("SERVER leaves under [...60 37 1 50 50]: count=%d, total=%d",
+							len(leaves.Leaves), leaves.TotalLeaves)
+						for i, leaf := range leaves.Leaves {
+							t.Logf("  SERVER leaf[%d]: key=%x", i, leaf.Key)
+						}
+					} else if errResp := resp.GetError(); errResp != nil {
+						t.Logf("SERVER error for [...60 37 1 50 50]: %s", errResp.Message)
+					}
+				}
+			}
+			_ = diagStream.CloseSend()
+		}
+	}
+
+	// Also check path [...60 37 1] to see the 3 vs 3 children issue
+	t.Log("=== LEAF-LEVEL ANALYSIS for [...60 37 1] ===")
+	{
+		diagStream, err := client.PerformSync(context.Background())
+		if err == nil {
+			shardKeyBytes := slices.Concat(proverShardKey.L1[:], proverShardKey.L2[:])
+			path371 := []int32{63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 60, 37, 1}
+
+			err = diagStream.Send(&protobufs.HypergraphSyncQuery{
+				Request: &protobufs.HypergraphSyncQuery_GetLeaves{
+					GetLeaves: &protobufs.HypergraphSyncGetLeavesRequest{
+						ShardKey:  shardKeyBytes,
+						PhaseSet:  protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+						Path:      path371,
+						MaxLeaves: 100,
+					},
+				},
+			})
+			if err == nil {
+				resp, err := diagStream.Recv()
+				if err == nil {
+					if leaves := resp.GetLeaves(); leaves != nil {
+						t.Logf("SERVER leaves under [...60 37 1]: count=%d, total=%d",
+							len(leaves.Leaves), leaves.TotalLeaves)
+						for i, leaf := range leaves.Leaves {
+							t.Logf("  SERVER leaf[%d]: key=%x", i, leaf.Key)
+						}
+					}
+				}
+			}
+			_ = diagStream.CloseSend()
+		}
+
+		// Client leaves under [...60 37 1]
+		clientTree = clientHG.GetVertexAddsSet(proverShardKey).GetTree()
+		path371Int := []int{63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 60, 37, 1}
+		clientNode371, err := clientTree.GetByPath(path371Int)
+		if err != nil {
+			t.Logf("CLIENT error getting node at [...60 37 1]: %v", err)
+		} else if clientNode371 != nil {
+			clientLeaves371 := tries.GetAllLeaves(
+				clientTree.SetType,
+				clientTree.PhaseType,
+				clientTree.ShardKey,
+				clientNode371,
+			)
+			t.Logf("CLIENT leaves under [...60 37 1]: count=%d", len(clientLeaves371))
+			for i, leaf := range clientLeaves371 {
+				if leaf != nil {
+					t.Logf("  CLIENT leaf[%d]: key=%x", i, leaf.Key)
+				}
+			}
+		}
+	}
+
 	assert.Equal(t, expectedRoot, clientProverRoot,
 		"client prover root should match frame's prover tree commitment after hypersync")
 
 	// Count vertices synced
-	clientTree := clientHG.GetVertexAddsSet(proverShardKey).GetTree()
-	clientLeaves := tries.GetAllLeaves(
+	clientTree = clientHG.GetVertexAddsSet(proverShardKey).GetTree()
+	clientLeaves2 := tries.GetAllLeaves(
 		clientTree.SetType,
 		clientTree.PhaseType,
 		clientTree.ShardKey,
 		clientTree.Root,
 	)
 
-	clientLeafCount := 0
-	for _, leaf := range clientLeaves {
+	clientLeafCount2 := 0
+	for _, leaf := range clientLeaves2 {
 		if leaf != nil {
-			clientLeafCount++
+			clientLeafCount2++
 		}
 	}
 
-	t.Logf("Hypersync complete: client synced %d prover vertices", clientLeafCount)
-	assert.Greater(t, clientLeafCount, 0, "should have synced at least some prover vertices")
+	t.Logf("Hypersync complete: client synced %d prover vertices", clientLeafCount2)
+	assert.Greater(t, clientLeafCount2, 0, "should have synced at least some prover vertices")
 
 	// Verify the sync-based repair approach:
 	// 1. Create a second in-memory hypergraph

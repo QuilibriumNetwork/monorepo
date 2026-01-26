@@ -93,6 +93,7 @@ var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_1817,
 	migration_2_1_0_1818,
 	migration_2_1_0_1819,
+	migration_2_1_0_1820,
 }
 
 func NewPebbleDB(
@@ -1134,6 +1135,10 @@ func migration_2_1_0_1819(b *pebble.Batch, db *pebble.DB, cfg *config.Config) er
 		return nil
 	}
 	return migration_2_1_0_18(b, db, cfg)
+}
+
+func migration_2_1_0_1820(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return doMigration1818(db, cfg)
 }
 
 // pebbleBatchDB wraps a *pebble.Batch to implement store.KVDB for use in migrations

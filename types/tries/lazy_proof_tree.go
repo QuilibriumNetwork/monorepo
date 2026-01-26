@@ -1021,24 +1021,17 @@ func (t *LazyVectorCommitmentTree) Insert(
 							[]int{expectedNibble},
 							n.Prefix,
 						)
+						// Note: Relocation not needed in Insert's branch split case because
+						// the branch keeps its absolute position. Children are at paths
+						// relative to n.FullPrefix which doesn't change (only the Prefix gets split).
 
 						err = t.Store.InsertNode(
 							txn,
 							t.SetType,
 							t.PhaseType,
 							t.ShardKey,
-							generateKeyFromPath(slices.Concat(
-								path,
-								newBranch.Prefix,
-								[]int{expectedNibble},
-								n.Prefix,
-							)),
-							slices.Concat(
-								path,
-								newBranch.Prefix,
-								[]int{expectedNibble},
-								n.Prefix,
-							),
+							generateKeyFromPath(n.FullPrefix),
+							n.FullPrefix,
 							newBranch.Children[expectedNibble],
 						)
 						if err != nil {
@@ -1924,7 +1917,9 @@ func (t *LazyVectorCommitmentTree) GetSize() *big.Int {
 	return t.Root.GetSize()
 }
 
-// Delete removes a key-value pair from the tree
+// Delete removes a key-value pair from the tree.
+// This is the inverse of Insert - when a branch is left with only one child,
+// we merge it back (the reverse of Insert's branch split operation).
 func (t *LazyVectorCommitmentTree) Delete(
 	txn TreeBackingStoreTransaction,
 	key []byte,
@@ -1935,6 +1930,8 @@ func (t *LazyVectorCommitmentTree) Delete(
 		return errors.New("empty key not allowed")
 	}
 
+	// remove returns (sizeRemoved, newNode)
+	// newNode is nil if the node was deleted, otherwise the updated node
 	var remove func(
 		node LazyVectorCommitmentNode,
 		depth int,
@@ -1946,6 +1943,7 @@ func (t *LazyVectorCommitmentTree) Delete(
 		depth int,
 		path []int,
 	) (*big.Int, LazyVectorCommitmentNode) {
+		// Lazy load if needed
 		if node == nil {
 			var err error
 			node, err = t.Store.GetNodeByPath(
@@ -1964,8 +1962,8 @@ func (t *LazyVectorCommitmentTree) Delete(
 
 		switch n := node.(type) {
 		case *LazyVectorCommitmentLeafNode:
+			// Base case: found the leaf to delete
 			if bytes.Equal(n.Key, key) {
-				// Delete the node from storage
 				err := t.Store.DeleteNode(
 					txn,
 					t.SetType,
@@ -1975,13 +1973,15 @@ func (t *LazyVectorCommitmentTree) Delete(
 					GetFullPath(key),
 				)
 				if err != nil {
-					log.Panic("failed to delete path", zap.Error(err))
+					log.Panic("failed to delete leaf", zap.Error(err))
 				}
 				return n.Size, nil
 			}
-
+			// Key doesn't match - nothing to delete
 			return big.NewInt(0), n
+
 		case *LazyVectorCommitmentBranchNode:
+			// Ensure branch is fully loaded
 			if !n.FullyLoaded {
 				for i := 0; i < BranchNodes; i++ {
 					var err error
@@ -1998,30 +1998,43 @@ func (t *LazyVectorCommitmentTree) Delete(
 				n.FullyLoaded = true
 			}
 
+			// Check if key matches the prefix
 			for i, expectedNibble := range n.Prefix {
-				currentNibble := getNextNibble(key, depth+i*BranchBits)
-				if currentNibble != expectedNibble {
+				actualNibble := getNextNibble(key, depth+i*BranchBits)
+				if actualNibble != expectedNibble {
+					// Key doesn't match prefix - nothing to delete here
 					return big.NewInt(0), n
 				}
 			}
 
-			finalNibble := getNextNibble(key, depth+len(n.Prefix)*BranchBits)
-			newPath := slices.Concat(path, n.Prefix, []int{finalNibble})
+			// Key matches prefix, find the child nibble
+			childNibble := getNextNibble(key, depth+len(n.Prefix)*BranchBits)
+			childPath := slices.Concat(n.FullPrefix, []int{childNibble})
 
-			var size *big.Int
-			size, n.Children[finalNibble] = remove(
-				n.Children[finalNibble],
+			// Recursively delete from child
+			sizeRemoved, newChild := remove(
+				n.Children[childNibble],
 				depth+len(n.Prefix)*BranchBits+BranchBits,
-				newPath,
+				childPath,
 			)
 
+			if sizeRemoved.Cmp(big.NewInt(0)) == 0 {
+				// Nothing was deleted
+				return big.NewInt(0), n
+			}
+
+			// Update the child
+			n.Children[childNibble] = newChild
 			n.Commitment = nil
 
+			// Count remaining children and gather metadata
 			childCount := 0
 			var lastChild LazyVectorCommitmentNode
 			var lastChildIndex int
-			longestBranch := 1
-			leaves := 0
+			longestBranch := 0
+			leafCount := 0
+			totalSize := big.NewInt(0)
+
 			for i, child := range n.Children {
 				if child != nil {
 					childCount++
@@ -2029,20 +2042,24 @@ func (t *LazyVectorCommitmentTree) Delete(
 					lastChildIndex = i
 					switch c := child.(type) {
 					case *LazyVectorCommitmentBranchNode:
-						leaves += c.LeafCount
-						if longestBranch < c.LongestBranch+1 {
+						leafCount += c.LeafCount
+						if c.LongestBranch+1 > longestBranch {
 							longestBranch = c.LongestBranch + 1
 						}
+						totalSize = totalSize.Add(totalSize, c.Size)
 					case *LazyVectorCommitmentLeafNode:
-						leaves += 1
+						leafCount++
+						if longestBranch < 1 {
+							longestBranch = 1
+						}
+						totalSize = totalSize.Add(totalSize, c.Size)
 					}
 				}
 			}
 
-			var retNode LazyVectorCommitmentNode
 			switch childCount {
 			case 0:
-				// Delete this node from storage
+				// No children left - delete this branch entirely
 				err := t.Store.DeleteNode(
 					txn,
 					t.SetType,
@@ -2052,87 +2069,21 @@ func (t *LazyVectorCommitmentTree) Delete(
 					n.FullPrefix,
 				)
 				if err != nil {
-					log.Panic("failed to delete path", zap.Error(err))
+					log.Panic("failed to delete empty branch", zap.Error(err))
 				}
-				retNode = nil
+				return sizeRemoved, nil
+
 			case 1:
-				// Identify the child's original path to prevent orphaned storage entries
-				originalChildPath := slices.Concat(n.FullPrefix, []int{lastChildIndex})
+				// Only one child left - merge this branch with the child
+				// This is the REVERSE of Insert's branch split operation
+				return t.mergeBranchWithChild(txn, n, lastChild, lastChildIndex, path, sizeRemoved)
 
-				if childBranch, ok := lastChild.(*LazyVectorCommitmentBranchNode); ok {
-					// Merge this node's prefix with the child's prefix
-					mergedPrefix := []int{}
-					mergedPrefix = append(mergedPrefix, n.Prefix...)
-					mergedPrefix = append(mergedPrefix, lastChildIndex)
-					mergedPrefix = append(mergedPrefix, childBranch.Prefix...)
-
-					childBranch.Prefix = mergedPrefix
-					// Note: We do NOT update FullPrefix because children are stored
-					// relative to the branch's FullPrefix. If we updated FullPrefix,
-					// child lookups would compute wrong paths and fail.
-					// The FullPrefix remains at the old value for child path compatibility.
-					childBranch.Commitment = nil
-
-					// Delete the child from its original path to prevent orphan
-					_ = t.Store.DeleteNode(
-						txn,
-						t.SetType,
-						t.PhaseType,
-						t.ShardKey,
-						generateKeyFromPath(originalChildPath),
-						originalChildPath,
-					)
-
-					// Delete this node (parent) from storage
-					err := t.Store.DeleteNode(
-						txn,
-						t.SetType,
-						t.PhaseType,
-						t.ShardKey,
-						generateKeyFromPath(n.FullPrefix),
-						n.FullPrefix,
-					)
-					if err != nil {
-						log.Panic("failed to delete path", zap.Error(err))
-					}
-
-					// Insert the merged child at this path
-					err = t.Store.InsertNode(
-						txn,
-						t.SetType,
-						t.PhaseType,
-						t.ShardKey,
-						generateKeyFromPath(n.FullPrefix),
-						n.FullPrefix,
-						childBranch,
-					)
-					if err != nil {
-						log.Panic("failed to insert node", zap.Error(err))
-					}
-
-					retNode = childBranch
-				} else if leafChild, ok := lastChild.(*LazyVectorCommitmentLeafNode); ok {
-					// Delete this node from storage
-					err := t.Store.DeleteNode(
-						txn,
-						t.SetType,
-						t.PhaseType,
-						t.ShardKey,
-						generateKeyFromPath(n.FullPrefix),
-						n.FullPrefix,
-					)
-					if err != nil {
-						log.Panic("failed to delete path", zap.Error(err))
-					}
-
-					retNode = leafChild
-				}
 			default:
+				// Multiple children remain - just update metadata
+				n.LeafCount = leafCount
 				n.LongestBranch = longestBranch
-				n.LeafCount = leaves
-				n.Size = n.Size.Sub(n.Size, size)
+				n.Size = totalSize
 
-				// Update this node in storage
 				err := t.Store.InsertNode(
 					txn,
 					t.SetType,
@@ -2143,13 +2094,11 @@ func (t *LazyVectorCommitmentTree) Delete(
 					n,
 				)
 				if err != nil {
-					log.Panic("failed to insert node", zap.Error(err))
+					log.Panic("failed to update branch", zap.Error(err))
 				}
-
-				retNode = n
+				return sizeRemoved, n
 			}
 
-			return size, retNode
 		default:
 			return big.NewInt(0), node
 		}
@@ -2162,6 +2111,111 @@ func (t *LazyVectorCommitmentTree) Delete(
 		t.ShardKey,
 		t.Root,
 	), "delete")
+}
+
+// mergeBranchWithChild merges a branch node with its only remaining child.
+// This is the reverse of Insert's branch split operation.
+//
+// When Insert splits a branch/leaf, it creates:
+//   - A new branch at path with prefix[:splitPoint]
+//   - The old node as a child with remaining prefix
+//
+// When Delete leaves only one child, we reverse this:
+//   - If child is a leaf: just return the leaf (branch disappears)
+//   - If child is a branch: merge prefixes and the child takes this branch's place
+func (t *LazyVectorCommitmentTree) mergeBranchWithChild(
+	txn TreeBackingStoreTransaction,
+	branch *LazyVectorCommitmentBranchNode,
+	child LazyVectorCommitmentNode,
+	childIndex int,
+	parentPath []int, // path to the branch (not including branch.Prefix)
+	sizeRemoved *big.Int,
+) (*big.Int, LazyVectorCommitmentNode) {
+	switch c := child.(type) {
+	case *LazyVectorCommitmentLeafNode:
+		// Child is a leaf - the branch simply disappears
+		// The leaf stays at its current location (keyed by c.Key)
+		// We just need to delete the branch node
+		err := t.Store.DeleteNode(
+			txn,
+			t.SetType,
+			t.PhaseType,
+			t.ShardKey,
+			generateKeyFromPath(branch.FullPrefix),
+			branch.FullPrefix,
+		)
+		if err != nil {
+			log.Panic("failed to delete branch during leaf merge", zap.Error(err))
+		}
+		return sizeRemoved, c
+
+	case *LazyVectorCommitmentBranchNode:
+		// Child is a branch - merge prefixes
+		// New prefix = branch.Prefix + childIndex + child.Prefix
+		mergedPrefix := make([]int, 0, len(branch.Prefix)+1+len(c.Prefix))
+		mergedPrefix = append(mergedPrefix, branch.Prefix...)
+		mergedPrefix = append(mergedPrefix, childIndex)
+		mergedPrefix = append(mergedPrefix, c.Prefix...)
+
+		// The merged branch will be at parentPath with the merged prefix
+		// So its FullPrefix = parentPath + mergedPrefix
+		newFullPrefix := slices.Concat(parentPath, mergedPrefix)
+
+		// The child's children are currently stored relative to c.FullPrefix
+		// They need to stay at the same absolute positions, but we need to
+		// update the child branch's metadata
+		oldFullPrefix := c.FullPrefix
+
+		// Delete the old branch node
+		err := t.Store.DeleteNode(
+			txn,
+			t.SetType,
+			t.PhaseType,
+			t.ShardKey,
+			generateKeyFromPath(branch.FullPrefix),
+			branch.FullPrefix,
+		)
+		if err != nil {
+			log.Panic("failed to delete parent branch during merge", zap.Error(err))
+		}
+
+		// Delete the child from its old location
+		err = t.Store.DeleteNode(
+			txn,
+			t.SetType,
+			t.PhaseType,
+			t.ShardKey,
+			generateKeyFromPath(oldFullPrefix),
+			oldFullPrefix,
+		)
+		if err != nil {
+			log.Panic("failed to delete child branch during merge", zap.Error(err))
+		}
+
+		// Update the child branch's prefix and FullPrefix
+		c.Prefix = mergedPrefix
+		c.FullPrefix = newFullPrefix
+		c.Commitment = nil
+
+		// Insert the merged child at the parent's location
+		err = t.Store.InsertNode(
+			txn,
+			t.SetType,
+			t.PhaseType,
+			t.ShardKey,
+			generateKeyFromPath(newFullPrefix),
+			newFullPrefix,
+			c,
+		)
+		if err != nil {
+			log.Panic("failed to insert merged branch", zap.Error(err))
+		}
+
+		return sizeRemoved, c
+
+	default:
+		return sizeRemoved, child
+	}
 }
 
 func SerializeTree(tree *LazyVectorCommitmentTree) ([]byte, error) {

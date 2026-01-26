@@ -6,8 +6,10 @@ package crypto
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"math/big"
 	mrand "math/rand"
+	"slices"
 	"testing"
 
 	"go.uber.org/zap"
@@ -21,10 +23,18 @@ import (
 // This test requires native code integration to be useful
 var verEncr = verenc.NewMPCitHVerifiableEncryptor(1)
 
+// testConfig returns a test config with in-memory database
+func testConfig() *config.Config {
+	return &config.Config{
+		DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"},
+	}
+}
+
 func BenchmarkLazyVectorCommitmentTreeInsert(b *testing.B) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	store := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg := testConfig()
+	db := store.NewPebbleDB(l, cfg, 0)
+	store := store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: store, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 	addresses := [][]byte{}
 
@@ -42,8 +52,9 @@ func BenchmarkLazyVectorCommitmentTreeInsert(b *testing.B) {
 
 func BenchmarkLazyVectorCommitmentTreeCommit(b *testing.B) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	store := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg := testConfig()
+	db := store.NewPebbleDB(l, cfg, 0)
+	store := store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: store, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 	addresses := [][]byte{}
 
@@ -61,8 +72,9 @@ func BenchmarkLazyVectorCommitmentTreeCommit(b *testing.B) {
 
 func BenchmarkLazyVectorCommitmentTreeProve(b *testing.B) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	store := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg := testConfig()
+	db := store.NewPebbleDB(l, cfg, 0)
+	store := store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: store, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 	addresses := [][]byte{}
 
@@ -81,8 +93,9 @@ func BenchmarkLazyVectorCommitmentTreeProve(b *testing.B) {
 
 func BenchmarkLazyVectorCommitmentTreeVerify(b *testing.B) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	store := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg := testConfig()
+	db := store.NewPebbleDB(l, cfg, 0)
+	store := store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: store, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 	addresses := [][]byte{}
 
@@ -105,8 +118,9 @@ func BenchmarkLazyVectorCommitmentTreeVerify(b *testing.B) {
 func TestLazyVectorCommitmentTrees(t *testing.T) {
 	bls48581.Init()
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg := testConfig()
+	db := store.NewPebbleDB(l, cfg, 0)
+	s := store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
 	// Test single insert
@@ -136,8 +150,9 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 	}
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg = testConfig()
+	db = store.NewPebbleDB(l, cfg, 0)
+	s = store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree = &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
 	// Test get on empty tree
@@ -163,8 +178,9 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 	}
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg = testConfig()
+	db = store.NewPebbleDB(l, cfg, 0)
+	s = store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree = &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
 	// Test delete on empty tree
@@ -193,8 +209,9 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 	}
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg = testConfig()
+	db = store.NewPebbleDB(l, cfg, 0)
+	s = store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree = &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
 	// Insert keys that share common prefix
@@ -251,8 +268,9 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 	}
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg = testConfig()
+	db = store.NewPebbleDB(l, cfg, 0)
+	s = store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree = &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
 	// Empty tree should be empty
@@ -286,8 +304,9 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 	}
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg = testConfig()
+	db = store.NewPebbleDB(l, cfg, 0)
+	s = store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree = &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 	cmptree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
@@ -429,8 +448,9 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 // make previous proofs invalid.
 func TestTreeLeafReaddition(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg := testConfig()
+	db := store.NewPebbleDB(l, cfg, 0)
+	s := store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
 	// Generate 1000 random 64-byte keys and corresponding values
@@ -510,8 +530,9 @@ func TestTreeLeafReaddition(t *testing.T) {
 // but proofs still work after recommitting the tree.
 func TestTreeRemoveReaddLeaf(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg := testConfig()
+	db := store.NewPebbleDB(l, cfg, 0)
+	s := store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
 	// Generate 1000 random 64-byte keys and corresponding values
@@ -626,8 +647,9 @@ func TestTreeRemoveReaddLeaf(t *testing.T) {
 // correct.
 func TestTreeLongestBranch(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg := testConfig()
+	db := store.NewPebbleDB(l, cfg, 0)
+	s := store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
 	// Test with an empty tree
@@ -798,8 +820,9 @@ func TestTreeLongestBranch(t *testing.T) {
 // adding and removing leaves that cause branch creation due to shared prefixes.
 func TestTreeBranchStructure(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
-	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	cfg := testConfig()
+	db := store.NewPebbleDB(l, cfg, 0)
+	s := store.NewPebbleHypergraphStore(cfg.DB, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
 	// Create three base keys with 64-byte size
@@ -831,7 +854,8 @@ func TestTreeBranchStructure(t *testing.T) {
 
 	// Commit the initial state
 	initialRoot := tree.Commit(false)
-	initialSize := tree.GetSize()
+	// Copy the size value to avoid aliasing (GetSize returns pointer to internal big.Int)
+	initialSize := new(big.Int).Set(tree.GetSize())
 
 	// Confirm initial state
 	if initialSize.Cmp(big.NewInt(3)) != 0 {
@@ -1056,7 +1080,7 @@ func TestNonLazyProveVerify(t *testing.T) {
 func TestDeleteLeafPromotion(t *testing.T) {
 	bls48581.Init()
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
@@ -1162,7 +1186,7 @@ func TestDeleteLeafPromotion(t *testing.T) {
 func TestDeleteBranchPromotion(t *testing.T) {
 	bls48581.Init()
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
@@ -1320,7 +1344,7 @@ func TestDeleteWithLazyLoadedBranches(t *testing.T) {
 	l, _ := zap.NewProduction()
 
 	// First tree: insert data and commit to storage
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree1 := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
@@ -1478,7 +1502,7 @@ func TestDeleteWithLazyLoadedBranches(t *testing.T) {
 func TestDeleteBranchCollapse(t *testing.T) {
 	bls48581.Init()
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
@@ -1552,13 +1576,72 @@ func TestDeleteBranchCollapse(t *testing.T) {
 	}
 }
 
+// compareTreeBranches walks two trees and logs differences
+func compareTreeBranches(t *testing.T, name1 string, node1 crypto.LazyVectorCommitmentNode, name2 string, node2 crypto.LazyVectorCommitmentNode, depth int) {
+	indent := ""
+	for i := 0; i < depth; i++ {
+		indent += "  "
+	}
+
+	if node1 == nil && node2 == nil {
+		return
+	}
+	if node1 == nil {
+		t.Logf("%s%s is nil but %s is not", indent, name1, name2)
+		return
+	}
+	if node2 == nil {
+		t.Logf("%s%s is nil but %s is not", indent, name2, name1)
+		return
+	}
+
+	b1, ok1 := node1.(*crypto.LazyVectorCommitmentBranchNode)
+	b2, ok2 := node2.(*crypto.LazyVectorCommitmentBranchNode)
+
+	if ok1 != ok2 {
+		t.Logf("%sType mismatch: %s is branch=%v, %s is branch=%v", indent, name1, ok1, name2, ok2)
+		return
+	}
+
+	if !ok1 {
+		// Both are leaves
+		return
+	}
+
+	// Compare Prefix (only log if different or if there's also FullPrefix difference)
+	prefixMatch := slices.Equal(b1.Prefix, b2.Prefix)
+	fullPrefixMatch := slices.Equal(b1.FullPrefix, b2.FullPrefix)
+	if !prefixMatch || !fullPrefixMatch {
+		if !prefixMatch {
+			t.Logf("%sPrefix mismatch at depth %d:", indent, depth)
+			t.Logf("%s  %s.Prefix = %v (len=%d)", indent, name1, b1.Prefix, len(b1.Prefix))
+			t.Logf("%s  %s.Prefix = %v (len=%d)", indent, name2, b2.Prefix, len(b2.Prefix))
+		}
+	}
+
+	// Compare FullPrefix
+	if !slices.Equal(b1.FullPrefix, b2.FullPrefix) {
+		t.Logf("%sFullPrefix mismatch at depth %d:", indent, depth)
+		t.Logf("%s  %s.FullPrefix = %v", indent, name1, b1.FullPrefix)
+		t.Logf("%s  %s.FullPrefix = %v", indent, name2, b2.FullPrefix)
+	}
+
+	// Compare children
+	for i := 0; i < 64; i++ {
+		c1, c2 := b1.Children[i], b2.Children[i]
+		if c1 != nil || c2 != nil {
+			compareTreeBranches(t, fmt.Sprintf("%s.Child[%d]", name1, i), c1, fmt.Sprintf("%s.Child[%d]", name2, i), c2, depth+1)
+		}
+	}
+}
+
 // TestDeleteDeepNestedPrefixes tests deletion in a tree with deeply nested
 // branch prefixes, ensuring prefix merging works correctly.
 // Uses 5000 keys organized into groups with very long shared prefixes.
 func TestDeleteDeepNestedPrefixes(t *testing.T) {
 	bls48581.Init()
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
@@ -1608,6 +1691,11 @@ func TestDeleteDeepNestedPrefixes(t *testing.T) {
 	root1 := tree.Commit(false)
 	leaves1, depth1 := tree.GetMetadata()
 	t.Logf("Initial tree: %d leaves, longest branch: %d", leaves1, depth1)
+
+	// Debug: check initial root Prefix
+	if rootBranch, ok := tree.Root.(*crypto.LazyVectorCommitmentBranchNode); ok {
+		t.Logf("Initial root: Prefix=%v, FullPrefix=%v", rootBranch.Prefix, rootBranch.FullPrefix)
+	}
 
 	// Delete all keys from half the groups
 	// This exercises prefix merging as groups collapse
@@ -1662,6 +1750,11 @@ func TestDeleteDeepNestedPrefixes(t *testing.T) {
 	leaves2, depth2 := tree.GetMetadata()
 	t.Logf("After deletion: %d leaves, longest branch: %d", leaves2, depth2)
 
+	// Debug: check root Prefix before re-insert
+	if rootBranch, ok := tree.Root.(*crypto.LazyVectorCommitmentBranchNode); ok {
+		t.Logf("Root before re-insert: Prefix=%v, FullPrefix=%v", rootBranch.Prefix, rootBranch.FullPrefix)
+	}
+
 	// Now re-insert deleted keys and verify tree matches original
 	for g := 0; g < deletedGroups; g++ {
 		start := groupBoundaries[g]
@@ -1676,6 +1769,32 @@ func TestDeleteDeepNestedPrefixes(t *testing.T) {
 	root3 := tree.Commit(false)
 	leaves3, depth3 := tree.GetMetadata()
 	t.Logf("After re-insert: %d leaves, longest branch: %d", leaves3, depth3)
+
+	// Debug: check final root Prefix
+	if rootBranch, ok := tree.Root.(*crypto.LazyVectorCommitmentBranchNode); ok {
+		t.Logf("Final root: Prefix=%v, FullPrefix=%v", rootBranch.Prefix, rootBranch.FullPrefix)
+	}
+
+	// Build a fresh tree with all keys to compare structure
+	db2 := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store2"}}, 0)
+	s2 := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db2, l, verEncr, bls48581.NewKZGInclusionProver(l))
+	freshTree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s2, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
+	for i, key := range keys {
+		if err := freshTree.Insert(nil, key, values[i], nil, big.NewInt(1)); err != nil {
+			t.Fatalf("Failed to insert key %d in fresh tree: %v", i, err)
+		}
+	}
+	rootFresh := freshTree.Commit(false)
+	t.Logf("Fresh tree root: %x", rootFresh[:16])
+
+	// Compare re-inserted tree to fresh tree
+	if !bytes.Equal(root3, rootFresh) {
+		t.Logf("Re-inserted tree differs from fresh tree!")
+		t.Logf("  Re-inserted: %x", root3[:16])
+		t.Logf("  Fresh:       %x", rootFresh[:16])
+		// Walk both trees to find differences
+		compareTreeBranches(t, "restored", tree.Root, "fresh", freshTree.Root, 0)
+	}
 
 	// The tree structure should be equivalent (same root commitment)
 	if !bytes.Equal(root1, root3) {
@@ -1701,7 +1820,7 @@ func TestDeleteDeepNestedPrefixes(t *testing.T) {
 func TestDeleteMultipleChildrenRemaining(t *testing.T) {
 	bls48581.Init()
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{InclusionProver: bls48581.NewKZGInclusionProver(l), Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: crypto.ShardKey{}}
 
@@ -1834,7 +1953,7 @@ func TestDeleteMultipleChildrenRemaining(t *testing.T) {
 func TestDeleteBranchPromotionFullPrefixBug(t *testing.T) {
 	bls48581.Init()
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{
 		InclusionProver: bls48581.NewKZGInclusionProver(l),
@@ -2056,7 +2175,7 @@ func TestDeleteBranchPromotionFullPrefixBug(t *testing.T) {
 func TestDeleteBranchPromotionDeepNesting(t *testing.T) {
 	bls48581.Init()
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 	tree := &crypto.LazyVectorCommitmentTree{
 		InclusionProver: bls48581.NewKZGInclusionProver(l),
@@ -2220,7 +2339,7 @@ func TestDeleteBranchPromotionDeepNesting(t *testing.T) {
 func TestBranchPromotionPathIndexCorruption(t *testing.T) {
 	bls48581.Init()
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/pathidx"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/pathidx"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verEncr, bls48581.NewKZGInclusionProver(l))
 
 	// Create initial tree

@@ -648,11 +648,12 @@ func (hg *HypergraphCRDT) syncSubtree(
 ) error {
 	tree := localSet.GetTree()
 
-	// Get local commitment at same path to check if subtrees match
+	// Get local node at same path
 	var localCommitment []byte
+	var localNode tries.LazyVectorCommitmentNode
 	if tree != nil && tree.Root != nil {
 		path := toIntSlice(serverBranch.FullPath)
-		localNode := getNodeAtPath(
+		localNode = getNodeAtPath(
 			logger,
 			tree.SetType,
 			tree.PhaseType,
@@ -672,7 +673,7 @@ func (hg *HypergraphCRDT) syncSubtree(
 		}
 	}
 
-	// If commitments match, subtrees are identical - no sync needed
+	// If commitments match, subtrees are identical
 	if bytes.Equal(localCommitment, serverBranch.Commitment) {
 		logger.Debug("subtree matches",
 			zap.String("path", hex.EncodeToString(packPath(serverBranch.FullPath))),
@@ -680,15 +681,101 @@ func (hg *HypergraphCRDT) syncSubtree(
 		return nil
 	}
 
-	// Commitments don't match - fetch all leaves from server.
-	// This is simpler and more reliable than branch-by-branch comparison,
-	// ensuring we get the complete correct state from the server.
-	logger.Debug("subtree mismatch, fetching all leaves from server",
-		zap.String("path", hex.EncodeToString(packPath(serverBranch.FullPath))),
-		zap.String("localCommitment", hex.EncodeToString(localCommitment)),
-		zap.String("serverCommitment", hex.EncodeToString(serverBranch.Commitment)),
-	)
-	return hg.fetchAndIntegrateLeaves(stream, shardKey, phaseSet, expectedRoot, serverBranch.FullPath, localSet, logger)
+	// If server node is a leaf or has no children, fetch all leaves
+	if serverBranch.IsLeaf || len(serverBranch.Children) == 0 {
+		return hg.fetchAndIntegrateLeaves(stream, shardKey, phaseSet, expectedRoot, serverBranch.FullPath, localSet, logger)
+	}
+
+	// If we have NO local data at this path, fetch all leaves directly.
+	// This avoids N round trips for N children when we need all of them anyway.
+	if localNode == nil {
+		logger.Debug("no local data at path, fetching all leaves directly",
+			zap.String("path", hex.EncodeToString(packPath(serverBranch.FullPath))),
+			zap.Int("serverChildren", len(serverBranch.Children)),
+		)
+		return hg.fetchAndIntegrateLeaves(stream, shardKey, phaseSet, expectedRoot, serverBranch.FullPath, localSet, logger)
+	}
+
+	// Compare children and recurse
+	localChildren := make(map[int32][]byte)
+	if tree != nil && tree.Root != nil {
+		path := toIntSlice(serverBranch.FullPath)
+		if branch, ok := localNode.(*tries.LazyVectorCommitmentBranchNode); ok {
+			for i := 0; i < 64; i++ {
+				child := branch.Children[i]
+				if child == nil {
+					child, _ = branch.Store.GetNodeByPath(
+						tree.SetType,
+						tree.PhaseType,
+						tree.ShardKey,
+						slices.Concat(path, []int{i}),
+					)
+				}
+				if child != nil {
+					childPath := slices.Concat(path, []int{i})
+					child = ensureCommittedNode(logger, tree, childPath, child)
+					switch c := child.(type) {
+					case *tries.LazyVectorCommitmentBranchNode:
+						localChildren[int32(i)] = c.Commitment
+					case *tries.LazyVectorCommitmentLeafNode:
+						localChildren[int32(i)] = c.Commitment
+					}
+				}
+			}
+		}
+	}
+
+	for _, serverChild := range serverBranch.Children {
+		localChildCommit := localChildren[serverChild.Index]
+
+		if bytes.Equal(localChildCommit, serverChild.Commitment) {
+			// Child matches, skip
+			continue
+		}
+
+		// Need to sync this child
+		childPath := append(slices.Clone(serverBranch.FullPath), serverChild.Index)
+
+		// Query for child branch
+		err := stream.Send(&protobufs.HypergraphSyncQuery{
+			Request: &protobufs.HypergraphSyncQuery_GetBranch{
+				GetBranch: &protobufs.HypergraphSyncGetBranchRequest{
+					ShardKey:     shardKey,
+					PhaseSet:     phaseSet,
+					Path:         childPath,
+					ExpectedRoot: expectedRoot,
+				},
+			},
+		})
+		if err != nil {
+			return errors.Wrap(err, "send GetBranch for child")
+		}
+
+		resp, err := stream.Recv()
+		if err != nil {
+			return errors.Wrap(err, "receive GetBranch response for child")
+		}
+
+		if errResp := resp.GetError(); errResp != nil {
+			logger.Warn("error getting child branch",
+				zap.String("error", errResp.Message),
+				zap.String("path", hex.EncodeToString(packPath(childPath))),
+			)
+			continue
+		}
+
+		childBranch := resp.GetBranch()
+		if childBranch == nil {
+			continue
+		}
+
+		// Recurse
+		if err := hg.syncSubtree(stream, shardKey, phaseSet, expectedRoot, childBranch, localSet, logger); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (hg *HypergraphCRDT) fetchAndIntegrateLeaves(
