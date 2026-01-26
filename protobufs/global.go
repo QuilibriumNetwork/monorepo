@@ -2143,6 +2143,8 @@ func (m *MessageRequest) ToCanonicalBytes() ([]byte, error) {
 		innerBytes, err = request.Shard.ToCanonicalBytes()
 	case *MessageRequest_AltShardUpdate:
 		innerBytes, err = request.AltShardUpdate.ToCanonicalBytes()
+	case *MessageRequest_SeniorityMerge:
+		innerBytes, err = request.SeniorityMerge.ToCanonicalBytes()
 	default:
 		return nil, errors.New("unknown request type")
 	}
@@ -2406,6 +2408,15 @@ func (m *MessageRequest) FromCanonicalBytes(data []byte) error {
 		}
 		m.Request = &MessageRequest_AltShardUpdate{
 			AltShardUpdate: altShardUpdate,
+		}
+
+	case ProverSeniorityMergeType:
+		seniorityMerge := &ProverSeniorityMerge{}
+		if err := seniorityMerge.FromCanonicalBytes(dataBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		m.Request = &MessageRequest_SeniorityMerge{
+			SeniorityMerge: seniorityMerge,
 		}
 
 	default:
