@@ -25,6 +25,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
+	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
 type PebbleDB struct {
@@ -94,6 +95,7 @@ var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_1818,
 	migration_2_1_0_1819,
 	migration_2_1_0_1820,
+	migration_2_1_0_1821,
 }
 
 func NewPebbleDB(
@@ -1139,6 +1141,115 @@ func migration_2_1_0_1819(b *pebble.Batch, db *pebble.DB, cfg *config.Config) er
 
 func migration_2_1_0_1820(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	return doMigration1818(db, cfg)
+}
+
+// migration_2_1_0_1821 removes spent merge markers from the global intrinsic domain.
+// These markers were created with incorrect seniority values and need to be removed
+// to allow provers to re-merge with correct seniority values.
+//
+// Spent merge markers are identified by:
+// 1. Being in the global intrinsic domain (GLOBAL_INTRINSIC_ADDRESS = 0xff * 32)
+// 2. Having an empty VectorCommitmentTree (no actual data, just a marker)
+func migration_2_1_0_1821(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return doMigration1821(db, cfg)
+}
+
+// doMigration1821 performs the actual work for migration_2_1_0_1821.
+func doMigration1821(db *pebble.DB, cfg *config.Config) error {
+	logger := zap.L()
+
+	// Global intrinsic address: 32 bytes of 0xff
+	globalIntrinsicAddress := [32]byte{
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	}
+
+	prover := bls48581.NewKZGInclusionProver(logger)
+
+	// Create hypergraph from actual DB
+	dbWrapper := &PebbleDB{db: db}
+	hgStore := NewPebbleHypergraphStore(cfg.DB, dbWrapper, logger, nil, prover)
+
+	hg, err := hgStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "load hypergraph")
+	}
+	hgCRDT := hg.(*hgcrdt.HypergraphCRDT)
+
+	// Get shard key for the global intrinsic domain
+	// L1 is computed from bloom filter indices of the domain
+	globalShardKey := tries.ShardKey{
+		L1: [3]byte(up2p.GetBloomFilterIndices(globalIntrinsicAddress[:], 256, 3)),
+		L2: globalIntrinsicAddress,
+	}
+
+	// Create a transaction for the deletions
+	txn, err := hgStore.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "create transaction")
+	}
+
+	// Get the vertex data iterator for the global intrinsic domain
+	iter := hgCRDT.GetVertexDataIterator(globalIntrinsicAddress)
+	defer iter.Close()
+
+	deletedCount := 0
+	totalCount := 0
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		totalCount++
+
+		tree := iter.Value()
+		if tree == nil {
+			continue
+		}
+
+		// Check if this is an empty tree (spent merge marker)
+		// Spent markers have Root == nil or GetSize() == 0
+		if tree.Root == nil || tree.GetSize().Sign() == 0 {
+			// This is a spent marker - delete it
+			// The Key() returns the full 64-byte vertex ID (domain + address)
+			key := iter.Key()
+			if len(key) < 64 {
+				continue
+			}
+
+			var vertexID [64]byte
+			copy(vertexID[:], key[:64])
+
+			if err := hgCRDT.DeleteVertexAdd(txn, globalShardKey, vertexID); err != nil {
+				logger.Warn("failed to delete spent marker",
+					zap.String("vertex_id", hex.EncodeToString(vertexID[:])),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			deletedCount++
+
+			// Log progress every 1000 deletions
+			if deletedCount%1000 == 0 {
+				logger.Info("migration 1821: progress",
+					zap.Int("deleted", deletedCount),
+					zap.Int("examined", totalCount),
+				)
+			}
+		}
+	}
+
+	// Commit the transaction
+	if err := txn.Commit(); err != nil {
+		return errors.Wrap(err, "commit transaction")
+	}
+
+	logger.Info("migration 1821: completed",
+		zap.Int("deleted_spent_markers", deletedCount),
+		zap.Int("total_examined", totalCount),
+	)
+
+	return nil
 }
 
 // pebbleBatchDB wraps a *pebble.Batch to implement store.KVDB for use in migrations

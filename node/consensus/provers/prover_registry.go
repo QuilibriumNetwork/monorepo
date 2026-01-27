@@ -914,6 +914,11 @@ func (r *ProverRegistry) extractGlobalState() error {
 			continue
 		}
 
+		// Skip vertices with nil roots (e.g., spent merge markers)
+		if data.Root == nil {
+			continue
+		}
+
 		// Get the key which is always 64 bytes (domain + data address)
 		key := make([]byte, 64)
 		copy(key, iter.Key())

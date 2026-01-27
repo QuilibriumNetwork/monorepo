@@ -157,6 +157,8 @@ type GlobalConsensusEngine struct {
 	lastRejectFrame         atomic.Uint64
 	proverRootVerifiedFrame atomic.Uint64
 	proverRootSynced        atomic.Bool
+	lastMaterializedFrame   atomic.Uint64
+	hasFrameGapSinceSync    atomic.Bool
 
 	lastProposalFrameNumber     atomic.Uint64
 	lastFrameMessageFrameNumber atomic.Uint64
@@ -1630,6 +1632,19 @@ func (e *GlobalConsensusEngine) materialize(
 	var appliedCount atomic.Int64
 	var skippedCount atomic.Int64
 
+	// Check for frame gaps: if this frame is not contiguous with the last
+	// materialized frame, mark that we've had gaps since sync
+	lastMaterialized := e.lastMaterializedFrame.Load()
+	if lastMaterialized > 0 && frameNumber > lastMaterialized+1 {
+		e.logger.Info(
+			"frame gap detected",
+			zap.Uint64("last_materialized", lastMaterialized),
+			zap.Uint64("current_frame", frameNumber),
+			zap.Uint64("gap_size", frameNumber-lastMaterialized-1),
+		)
+		e.hasFrameGapSinceSync.Store(true)
+	}
+
 	_, err := e.hypergraph.Commit(frameNumber)
 	if err != nil {
 		e.logger.Error("error committing hypergraph", zap.Error(err))
@@ -1642,6 +1657,8 @@ func (e *GlobalConsensusEngine) materialize(
 	// Check prover root BEFORE processing transactions. If there's a mismatch,
 	// we need to sync first, otherwise we'll apply transactions on top of
 	// divergent state and then sync will delete the newly added records.
+	// However, only sync if we've also had frame gaps since last successful
+	// sync - contiguous frames should not trigger sync even if root mismatches.
 	if len(expectedProverRoot) > 0 {
 		localProverRoot, localRootErr := e.computeLocalProverRoot(frameNumber)
 		if localRootErr != nil {
@@ -1654,20 +1671,34 @@ func (e *GlobalConsensusEngine) materialize(
 
 		updatedProverRoot := localProverRoot
 		if localRootErr == nil && len(localProverRoot) > 0 {
-			if !bytes.Equal(localProverRoot, expectedProverRoot) {
-				e.logger.Info(
-					"prover root mismatch detected before processing frame, syncing first",
-					zap.Uint64("frame_number", frameNumber),
-					zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
-					zap.String("local_root", hex.EncodeToString(localProverRoot)),
-				)
-				// Perform blocking hypersync before continuing
-				result := e.performBlockingProverHypersync(
-					proposer,
-					expectedProverRoot,
-				)
-				if result != nil {
-					updatedProverRoot = result
+			hasGap := e.hasFrameGapSinceSync.Load()
+			rootMismatch := !bytes.Equal(localProverRoot, expectedProverRoot)
+
+			if rootMismatch {
+				if hasGap {
+					e.logger.Info(
+						"prover root mismatch with frame gap detected, syncing",
+						zap.Uint64("frame_number", frameNumber),
+						zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
+						zap.String("local_root", hex.EncodeToString(localProverRoot)),
+					)
+					// Perform blocking hypersync before continuing
+					result := e.performBlockingProverHypersync(
+						proposer,
+						expectedProverRoot,
+					)
+					if result != nil {
+						updatedProverRoot = result
+					}
+					// Reset gap tracking after sync
+					e.hasFrameGapSinceSync.Store(false)
+				} else {
+					e.logger.Debug(
+						"prover root mismatch but no frame gap, skipping sync",
+						zap.Uint64("frame_number", frameNumber),
+						zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
+						zap.String("local_root", hex.EncodeToString(localProverRoot)),
+					)
 				}
 			}
 		}
@@ -1692,6 +1723,9 @@ func (e *GlobalConsensusEngine) materialize(
 			e.proverRootVerifiedFrame.Store(frameNumber)
 		}
 	}
+
+	// Update last materialized frame
+	e.lastMaterializedFrame.Store(frameNumber)
 
 	var state state.State
 	state = hgstate.NewHypergraphState(e.hypergraph)
@@ -1944,16 +1978,28 @@ func (e *GlobalConsensusEngine) verifyProverRoot(
 	}
 
 	if !bytes.Equal(localRoot, expected) {
+		hasGap := e.hasFrameGapSinceSync.Load()
 		e.logger.Warn(
 			"prover root mismatch",
 			zap.Uint64("frame_number", frameNumber),
 			zap.String("expected_root", hex.EncodeToString(expected)),
 			zap.String("local_root", hex.EncodeToString(localRoot)),
 			zap.String("proposer", hex.EncodeToString(proposer)),
+			zap.Bool("has_frame_gap", hasGap),
 		)
 		e.proverRootSynced.Store(false)
 		e.proverRootVerifiedFrame.Store(0)
-		e.triggerProverHypersync(proposer, expected)
+
+		// Only trigger sync if we've had frame gaps since last successful sync.
+		// Contiguous frames should not trigger sync even if root mismatches.
+		if hasGap {
+			e.triggerProverHypersync(proposer, expected)
+		} else {
+			e.logger.Debug(
+				"skipping sync trigger - no frame gap since last sync",
+				zap.Uint64("frame_number", frameNumber),
+			)
+		}
 		return false
 	}
 
@@ -1992,6 +2038,8 @@ func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte, expected
 			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 		}
 		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
+		// Reset gap tracking after sync completes
+		e.hasFrameGapSinceSync.Store(false)
 		if err := e.proverRegistry.Refresh(); err != nil {
 			e.logger.Warn(
 				"failed to refresh prover registry after hypersync",
@@ -3324,8 +3372,9 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 				"existing prover has lower seniority than merge would provide, submitting seniority merge",
 				zap.Uint64("existing_seniority", info.Seniority),
 				zap.Uint64("merge_seniority", mergeSeniority),
+				zap.Strings("peer_ids", peerIds),
 			)
-			return e.submitSeniorityMerge(frame, helpers)
+			return e.submitSeniorityMerge(frame, helpers, mergeSeniority, peerIds)
 		}
 		e.logger.Debug(
 			"prover already exists with sufficient seniority, skipping join",
@@ -3336,8 +3385,9 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 	}
 
 	e.logger.Info(
-		"existing seniority detected for proposed join",
-		zap.String("seniority", mergeSeniorityBI.String()),
+		"proposing worker join with seniority",
+		zap.Uint64("seniority", mergeSeniority),
+		zap.Strings("peer_ids", peerIds),
 	)
 
 	var delegate []byte
@@ -3468,7 +3518,11 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		return errors.Wrap(err, "propose worker join")
 	}
 
-	e.logger.Debug("submitted join request")
+	e.logger.Info(
+		"submitted join request",
+		zap.Uint64("seniority", mergeSeniority),
+		zap.Strings("peer_ids", peerIds),
+	)
 
 	return nil
 }
@@ -3562,6 +3616,8 @@ func (e *GlobalConsensusEngine) buildMergeHelpers() ([]*global.SeniorityMerge, [
 func (e *GlobalConsensusEngine) submitSeniorityMerge(
 	frame *protobufs.GlobalFrame,
 	helpers []*global.SeniorityMerge,
+	seniority uint64,
+	peerIds []string,
 ) error {
 	if len(helpers) == 0 {
 		return errors.New("no merge helpers available")
@@ -3611,7 +3667,11 @@ func (e *GlobalConsensusEngine) submitSeniorityMerge(
 		return errors.Wrap(err, "submit seniority merge")
 	}
 
-	e.logger.Info("submitted seniority merge request")
+	e.logger.Info(
+		"submitted seniority merge request",
+		zap.Uint64("seniority", seniority),
+		zap.Strings("peer_ids", peerIds),
+	)
 
 	return nil
 }

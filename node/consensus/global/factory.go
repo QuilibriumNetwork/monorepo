@@ -84,7 +84,9 @@ func NewConsensusEngineFactory(
 	peerInfoManager tp2p.PeerInfoManager,
 ) *ConsensusEngineFactory {
 	// Initialize peer seniority data
-	compat.RebuildPeerSeniority(uint(config.P2P.Network))
+	if err := compat.RebuildPeerSeniority(uint(config.P2P.Network)); err != nil {
+		panic(errors.Wrap(err, "failed to load peer seniority data"))
+	}
 
 	return &ConsensusEngineFactory{
 		logger:             logger,

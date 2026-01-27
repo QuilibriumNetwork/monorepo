@@ -4,11 +4,13 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"strconv"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/mr-tron/base58"
+	"go.uber.org/zap"
 )
 
 type FirstRetroJson struct {
@@ -73,27 +75,27 @@ func RebuildPeerSeniority(network uint) error {
 
 		err := json.Unmarshal(firstRetroJsonBinary, &firstRetro)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to unmarshal first_retro.json: %w", err)
 		}
 
 		err = json.Unmarshal(secondRetroJsonBinary, &secondRetro)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to unmarshal second_retro.json: %w", err)
 		}
 
 		err = json.Unmarshal(thirdRetroJsonBinary, &thirdRetro)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to unmarshal third_retro.json: %w", err)
 		}
 
 		err = json.Unmarshal(fourthRetroJsonBinary, &fourthRetro)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to unmarshal fourth_retro.json: %w", err)
 		}
 
 		err = json.Unmarshal(mainnetSeniorityJsonBinary, &mainnetSeniority)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to unmarshal mainnet_244200_seniority.json: %w", err)
 		}
 	}
 
@@ -121,6 +123,13 @@ func OverrideSeniority(
 }
 
 func GetAggregatedSeniority(peerIds []string) *big.Int {
+	logger := zap.L()
+	logger.Debug(
+		"GetAggregatedSeniority called",
+		zap.Strings("peer_ids", peerIds),
+		zap.Int("mainnet_seniority_map_size", len(mainnetSeniority)),
+	)
+
 	highestFirst := uint64(0)
 	highestSecond := uint64(0)
 	highestThird := uint64(0)
@@ -227,17 +236,36 @@ func GetAggregatedSeniority(peerIds []string) *big.Int {
 	// Calculate current aggregated value
 	currentAggregated := highestFirst + highestSecond + highestThird + highestFourth
 
+	logger.Debug(
+		"retro seniority calculation complete",
+		zap.Uint64("highest_first", highestFirst),
+		zap.Uint64("highest_second", highestSecond),
+		zap.Uint64("highest_third", highestThird),
+		zap.Uint64("highest_fourth", highestFourth),
+		zap.Uint64("current_aggregated", currentAggregated),
+	)
+
 	highestMainnetSeniority := uint64(0)
 	for _, peerId := range peerIds {
 		// Decode base58
 		decoded, err := base58.Decode(peerId)
 		if err != nil {
+			logger.Warn(
+				"failed to decode peer ID from base58",
+				zap.String("peer_id", peerId),
+				zap.Error(err),
+			)
 			continue
 		}
 
 		// Hash with poseidon
 		hashBI, err := poseidon.HashBytes(decoded)
 		if err != nil {
+			logger.Warn(
+				"failed to hash peer ID with poseidon",
+				zap.String("peer_id", peerId),
+				zap.Error(err),
+			)
 			continue
 		}
 
@@ -249,13 +277,32 @@ func GetAggregatedSeniority(peerIds []string) *big.Int {
 
 		// Look up in mainnetSeniority
 		if seniority, exists := mainnetSeniority[addressHex]; exists {
+			logger.Debug(
+				"found mainnet seniority for peer",
+				zap.String("peer_id", peerId),
+				zap.String("address_hex", addressHex),
+				zap.Uint64("seniority", seniority),
+			)
 			if seniority > highestMainnetSeniority {
 				highestMainnetSeniority = seniority
 			}
+		} else {
+			logger.Debug(
+				"no mainnet seniority found for peer",
+				zap.String("peer_id", peerId),
+				zap.String("address_hex", addressHex),
+			)
 		}
 	}
 
 	// Return the higher value between current aggregated and mainnetSeniority
+	logger.Info(
+		"GetAggregatedSeniority result",
+		zap.Uint64("retro_aggregated", currentAggregated),
+		zap.Uint64("highest_mainnet_seniority", highestMainnetSeniority),
+		zap.Bool("using_mainnet", highestMainnetSeniority > currentAggregated),
+	)
+
 	if highestMainnetSeniority > currentAggregated {
 		return new(big.Int).SetUint64(highestMainnetSeniority)
 	}
