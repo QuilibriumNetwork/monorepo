@@ -347,7 +347,7 @@ func TestReconcileWorkerAllocations_UnconfirmedProposalClearsAfterTimeout(t *tes
 		workerManager: wm,
 	}
 
-	// Prover has no allocations at all - the proposal never landed on-chain
+	// Prover has no allocations at all - the proposal never landed in registry
 	self := &typesconsensus.ProverInfo{
 		Address:     []byte("prover-address"),
 		Allocations: []typesconsensus.ProverAllocationInfo{},
