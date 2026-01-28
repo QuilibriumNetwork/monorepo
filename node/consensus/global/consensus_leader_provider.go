@@ -165,6 +165,20 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		)
 	}
 
+	// Collect messages and rebuild shard commitments now that we've acquired
+	// the proving mutex and validated the prior frame. This prevents race
+	// conditions where a subsequent OnRankChange would overwrite collectedMessages
+	// and shardCommitments while we're still proving.
+	_, err = p.engine.livenessProvider.Collect(
+		ctx,
+		prior.Header.FrameNumber+1,
+		rank,
+	)
+	if err != nil {
+		frameProvingTotal.WithLabelValues("error").Inc()
+		return nil, models.NewNoVoteErrorf("could not collect: %+v", err)
+	}
+
 	timer := prometheus.NewTimer(frameProvingDuration)
 	defer timer.ObserveDuration()
 

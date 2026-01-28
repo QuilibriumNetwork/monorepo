@@ -1662,12 +1662,35 @@ func (e *GlobalConsensusEngine) materialize(
 					zap.String("local_root", hex.EncodeToString(localProverRoot)),
 				)
 				// Perform blocking hypersync before continuing
-				result := e.performBlockingProverHypersync(
+				_ = e.performBlockingProverHypersync(
 					proposer,
 					expectedProverRoot,
 				)
-				if result != nil {
-					updatedProverRoot = result
+
+				// Re-compute local prover root after sync to verify convergence
+				newLocalRoot, newRootErr := e.computeLocalProverRoot(frameNumber)
+				if newRootErr != nil {
+					e.logger.Warn(
+						"failed to compute local prover root after sync",
+						zap.Uint64("frame_number", frameNumber),
+						zap.Error(newRootErr),
+					)
+				} else {
+					updatedProverRoot = newLocalRoot
+					if !bytes.Equal(newLocalRoot, expectedProverRoot) {
+						e.logger.Warn(
+							"prover root still mismatched after sync - convergence failed",
+							zap.Uint64("frame_number", frameNumber),
+							zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
+							zap.String("post_sync_local_root", hex.EncodeToString(newLocalRoot)),
+						)
+					} else {
+						e.logger.Info(
+							"prover root converged after sync",
+							zap.Uint64("frame_number", frameNumber),
+							zap.String("root", hex.EncodeToString(newLocalRoot)),
+						)
+					}
 				}
 			}
 		}
@@ -4195,7 +4218,7 @@ func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return
 	}
-	prior, err := e.clockStore.GetGlobalClockFrameCandidate(
+	_, err = e.clockStore.GetGlobalClockFrameCandidate(
 		qc.FrameNumber,
 		[]byte(qc.Identity()),
 	)
@@ -4204,14 +4227,9 @@ func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return
 	}
-	_, err = e.livenessProvider.Collect(
-		context.TODO(),
-		prior.Header.FrameNumber+1,
-		newRank,
-	)
-	if err != nil {
-		return
-	}
+	// Note: Collect is called in ProveNextState after tryBeginProvingRank succeeds
+	// to avoid race conditions where a subsequent OnRankChange overwrites
+	// collectedMessages and shardCommitments while ProveNextState is still running
 }
 
 func (e *GlobalConsensusEngine) rebuildShardCommitments(
