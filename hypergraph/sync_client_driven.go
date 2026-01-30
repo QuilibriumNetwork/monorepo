@@ -689,6 +689,17 @@ func (hg *HypergraphCRDT) syncSubtree(
 
 	// Log divergence for global prover sync
 	isGlobalProver := isGlobalProverShardBytes(shardKey)
+	var localNodeType string
+	switch localNode.(type) {
+	case *tries.LazyVectorCommitmentBranchNode:
+		localNodeType = "branch"
+	case *tries.LazyVectorCommitmentLeafNode:
+		localNodeType = "leaf"
+	case nil:
+		localNodeType = "nil"
+	default:
+		localNodeType = "unknown"
+	}
 	if isGlobalProver {
 		logger.Info("global prover sync: commitment divergence",
 			zap.String("phase", phaseSet.String()),
@@ -697,6 +708,7 @@ func (hg *HypergraphCRDT) syncSubtree(
 			zap.String("local_commitment", hex.EncodeToString(localCommitment)),
 			zap.String("server_commitment", hex.EncodeToString(serverBranch.Commitment)),
 			zap.Bool("local_has_data", localNode != nil),
+			zap.String("local_node_type", localNodeType),
 			zap.Int("server_children", len(serverBranch.Children)),
 			zap.Bool("server_is_leaf", serverBranch.IsLeaf),
 		)
@@ -710,6 +722,18 @@ func (hg *HypergraphCRDT) syncSubtree(
 	// If we have NO local data at this path, fetch all leaves directly.
 	// This avoids N round trips for N children when we need all of them anyway.
 	if localNode == nil {
+		return hg.fetchAndIntegrateLeaves(stream, shardKey, phaseSet, expectedRoot, serverBranch.FullPath, localSet, logger)
+	}
+
+	// Structural mismatch: local is a leaf but server is a branch with children.
+	// We can't compare children because local has none - fetch all server leaves.
+	if _, isLeaf := localNode.(*tries.LazyVectorCommitmentLeafNode); isLeaf {
+		if isGlobalProver {
+			logger.Info("global prover sync: structural mismatch - local leaf vs server branch, fetching leaves",
+				zap.Int("path_depth", len(serverBranch.FullPath)),
+				zap.Int("server_children", len(serverBranch.Children)),
+			)
+		}
 		return hg.fetchAndIntegrateLeaves(stream, shardKey, phaseSet, expectedRoot, serverBranch.FullPath, localSet, logger)
 	}
 
@@ -742,13 +766,36 @@ func (hg *HypergraphCRDT) syncSubtree(
 		}
 	}
 
+	if isGlobalProver {
+		logger.Info("global prover sync: comparing children",
+			zap.Int("path_depth", len(serverBranch.FullPath)),
+			zap.Int("local_children_count", len(localChildren)),
+			zap.Int("server_children_count", len(serverBranch.Children)),
+		)
+	}
+
+	childrenMatched := 0
+	childrenToSync := 0
 	for _, serverChild := range serverBranch.Children {
 		localChildCommit := localChildren[serverChild.Index]
 
-		if bytes.Equal(localChildCommit, serverChild.Commitment) {
-			// Child matches, skip
+		// Both nil/empty means we have no data on either side - skip
+		// But if server has a commitment and we don't (or vice versa), we need to sync
+		localEmpty := len(localChildCommit) == 0
+		serverEmpty := len(serverChild.Commitment) == 0
+
+		if localEmpty && serverEmpty {
+			// Neither side has data, skip
+			childrenMatched++
 			continue
 		}
+
+		if bytes.Equal(localChildCommit, serverChild.Commitment) {
+			// Child matches, skip
+			childrenMatched++
+			continue
+		}
+		childrenToSync++
 
 		// Need to sync this child
 		childPath := append(slices.Clone(serverBranch.FullPath), serverChild.Index)
@@ -792,6 +839,14 @@ func (hg *HypergraphCRDT) syncSubtree(
 		}
 	}
 
+	if isGlobalProver {
+		logger.Info("global prover sync: children comparison complete",
+			zap.Int("path_depth", len(serverBranch.FullPath)),
+			zap.Int("matched", childrenMatched),
+			zap.Int("synced", childrenToSync),
+		)
+	}
+
 	return nil
 }
 
@@ -804,9 +859,17 @@ func (hg *HypergraphCRDT) fetchAndIntegrateLeaves(
 	localSet hypergraph.IdSet,
 	logger *zap.Logger,
 ) error {
-	logger.Debug("fetching leaves",
-		zap.String("path", hex.EncodeToString(packPath(path))),
-	)
+	isGlobalProver := isGlobalProverShardBytes(shardKey)
+	if isGlobalProver {
+		logger.Info("global prover sync: fetching leaves",
+			zap.String("path", hex.EncodeToString(packPath(path))),
+			zap.Int("path_depth", len(path)),
+		)
+	} else {
+		logger.Debug("fetching leaves",
+			zap.String("path", hex.EncodeToString(packPath(path))),
+		)
+	}
 
 	var continuationToken []byte
 	totalFetched := 0
@@ -885,6 +948,13 @@ func (hg *HypergraphCRDT) fetchAndIntegrateLeaves(
 			break
 		}
 		continuationToken = leavesResp.ContinuationToken
+	}
+
+	if isGlobalProver {
+		logger.Info("global prover sync: leaves integrated",
+			zap.String("path", hex.EncodeToString(packPath(path))),
+			zap.Int("total_fetched", totalFetched),
+		)
 	}
 
 	return nil
