@@ -690,9 +690,11 @@ func (hg *HypergraphCRDT) syncSubtree(
 	// Log divergence for global prover sync
 	isGlobalProver := isGlobalProverShardBytes(shardKey)
 	var localNodeType string
-	switch localNode.(type) {
+	var localFullPrefix []int
+	switch n := localNode.(type) {
 	case *tries.LazyVectorCommitmentBranchNode:
 		localNodeType = "branch"
+		localFullPrefix = n.FullPrefix
 	case *tries.LazyVectorCommitmentLeafNode:
 		localNodeType = "leaf"
 	case nil:
@@ -700,10 +702,17 @@ func (hg *HypergraphCRDT) syncSubtree(
 	default:
 		localNodeType = "unknown"
 	}
+
+	// Check for path prefix mismatch
+	serverFullPath := toIntSlice(serverBranch.FullPath)
+	pathMismatch := !slices.Equal(localFullPrefix, serverFullPath)
+
 	if isGlobalProver {
 		logger.Info("global prover sync: commitment divergence",
 			zap.String("phase", phaseSet.String()),
-			zap.String("path", hex.EncodeToString(packPath(serverBranch.FullPath))),
+			zap.String("server_path", hex.EncodeToString(packPath(serverBranch.FullPath))),
+			zap.String("local_path", hex.EncodeToString(packPath(toInt32Slice(localFullPrefix)))),
+			zap.Bool("path_mismatch", pathMismatch),
 			zap.Int("path_depth", len(serverBranch.FullPath)),
 			zap.String("local_commitment", hex.EncodeToString(localCommitment)),
 			zap.String("server_commitment", hex.EncodeToString(serverBranch.Commitment)),
@@ -845,6 +854,19 @@ func (hg *HypergraphCRDT) syncSubtree(
 			zap.Int("matched", childrenMatched),
 			zap.Int("synced", childrenToSync),
 		)
+	}
+
+	// If parent diverged but ALL children matched, we have an inconsistent state.
+	// The parent commitment should be deterministic from children, so this indicates
+	// corruption or staleness. Force fetch all leaves to resolve.
+	if childrenToSync == 0 && len(serverBranch.Children) > 0 {
+		if isGlobalProver {
+			logger.Warn("global prover sync: parent diverged but all children matched - forcing leaf fetch",
+				zap.Int("path_depth", len(serverBranch.FullPath)),
+				zap.Int("children_count", len(serverBranch.Children)),
+			)
+		}
+		return hg.fetchAndIntegrateLeaves(stream, shardKey, phaseSet, expectedRoot, serverBranch.FullPath, localSet, logger)
 	}
 
 	return nil
