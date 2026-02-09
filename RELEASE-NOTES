@@ -1,3 +1,14 @@
+# 2.1.0.18
+- resolve transaction missing from certain tree methods
+- resolve tree deletion corruption
+- resolve seniority bug
+- added DKLs23 fork
+- fixed channel bug
+- added raw bytestream to ferret
+- added challenge derivation for ed448 in FROST
+- fixed race condition in global intrinsic
+- other smaller bug fixes
+
 # 2.1.0.17
 - resolve sync race condition with prover registry pruning
 - update hypergraph to directly manage raw deletions
