@@ -66,7 +66,7 @@ func BenchmarkLazyVectorCommitmentTreeCommit(b *testing.B) {
 		if err != nil {
 			b.Errorf("Failed to insert item %d: %v", i, err)
 		}
-		tree.Commit(false)
+		tree.Commit(nil, false)
 	}
 }
 
@@ -86,7 +86,7 @@ func BenchmarkLazyVectorCommitmentTreeProve(b *testing.B) {
 		if err != nil {
 			b.Errorf("Failed to insert item %d: %v", i, err)
 		}
-		tree.Commit(false)
+		tree.Commit(nil, false)
 		tree.Prove(d)
 	}
 }
@@ -107,7 +107,7 @@ func BenchmarkLazyVectorCommitmentTreeVerify(b *testing.B) {
 		if err != nil {
 			b.Errorf("Failed to insert item %d: %v", i, err)
 		}
-		c := tree.Commit(false)
+		c := tree.Commit(nil, false)
 		p := tree.Prove(d)
 		if valid, _ := tree.Verify(c, p); !valid {
 			b.Errorf("bad proof")
@@ -281,7 +281,7 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 
 	// Root should change after insert
 	tree.Insert(nil, []byte("key1"), []byte("value1"), nil, big.NewInt(1))
-	firstRoot := tree.Commit(false)
+	firstRoot := tree.Commit(nil, false)
 
 	if bytes.Equal(firstRoot, bytes.Repeat([]byte{0x00}, 64)) {
 		t.Error("Root hash should change after insert")
@@ -289,7 +289,7 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 
 	// Root should change after update
 	tree.Insert(nil, []byte("key1"), []byte("value2"), nil, big.NewInt(1))
-	secondRoot := tree.Commit(false)
+	secondRoot := tree.Commit(nil, false)
 
 	if bytes.Equal(secondRoot, firstRoot) {
 		t.Error("Root hash should change after update")
@@ -418,8 +418,8 @@ func TestLazyVectorCommitmentTrees(t *testing.T) {
 			t.Errorf("Item %d: expected %x, got %x", i, string(value), string(cmpvalue))
 		}
 	}
-	tcommit := tree.Commit(false)
-	cmptcommit := cmptree.Commit(false)
+	tcommit := tree.Commit(nil, false)
+	cmptcommit := cmptree.Commit(nil, false)
 
 	if !bytes.Equal(tcommit, cmptcommit) {
 		t.Errorf("tree mismatch, %x, %x", tcommit, cmptcommit)
@@ -484,7 +484,7 @@ func TestTreeLeafReaddition(t *testing.T) {
 	}
 
 	// Commit the tree and get root commitment
-	originalRoot := tree.Commit(false)
+	originalRoot := tree.Commit(nil, false)
 
 	// Choose a random key to test with
 	testIndex := mrand.Intn(numKeys)
@@ -512,7 +512,7 @@ func TestTreeLeafReaddition(t *testing.T) {
 	}
 
 	// Commit again
-	newRoot := tree.Commit(false)
+	newRoot := tree.Commit(nil, false)
 
 	// Check commitment hasn't changed
 	if !bytes.Equal(originalRoot, newRoot) {
@@ -566,7 +566,7 @@ func TestTreeRemoveReaddLeaf(t *testing.T) {
 	}
 
 	// Commit the tree and get root commitment
-	originalRoot := tree.Commit(false)
+	originalRoot := tree.Commit(nil, false)
 
 	// Choose a random key to test with
 	testIndex := mrand.Intn(numKeys)
@@ -595,7 +595,7 @@ func TestTreeRemoveReaddLeaf(t *testing.T) {
 	}
 
 	// Commit after deletion
-	deletedRoot := tree.Commit(false)
+	deletedRoot := tree.Commit(nil, false)
 
 	// Check commitment has changed
 	if bytes.Equal(originalRoot, deletedRoot) {
@@ -620,7 +620,7 @@ func TestTreeRemoveReaddLeaf(t *testing.T) {
 	}
 
 	// Commit again
-	restoredRoot := tree.Commit(false)
+	restoredRoot := tree.Commit(nil, false)
 
 	// Check commitment is different due to the rebuild process
 	if bytes.Equal(deletedRoot, restoredRoot) {
@@ -668,7 +668,7 @@ func TestTreeLongestBranch(t *testing.T) {
 	rand.Read(value1)
 
 	tree.Insert(nil, key1, value1, nil, big.NewInt(1))
-	tree.Commit(false)
+	tree.Commit(nil, false)
 
 	leaves, longestBranch = tree.GetMetadata()
 	if leaves != 1 {
@@ -695,7 +695,7 @@ func TestTreeLongestBranch(t *testing.T) {
 			t.Errorf("Failed to insert batch 1 item %d: %v", i, err)
 		}
 	}
-	origCommit := tree.Commit(false)
+	origCommit := tree.Commit(nil, false)
 	origProof := tree.Prove(batch1Keys[500])
 
 	// With 1000 random keys, we should have created some branches
@@ -752,7 +752,7 @@ func TestTreeLongestBranch(t *testing.T) {
 			t.Errorf("Failed to insert batch 2 item %d: %v", i, err)
 		}
 	}
-	batch2Commit := tree.Commit(false)
+	batch2Commit := tree.Commit(nil, false)
 
 	// With controlled prefixes, branches should be deeper
 	leaves, newLongestBranch := tree.GetMetadata()
@@ -777,7 +777,7 @@ func TestTreeLongestBranch(t *testing.T) {
 			t.Errorf("Failed to delete structured key: %v", err)
 		}
 	}
-	newCommit := tree.Commit(false)
+	newCommit := tree.Commit(nil, false)
 
 	if valid, _ := tree.Verify(newCommit, origProof); !valid {
 		t.Errorf("Proof does not sustain after tree rollback.")
@@ -853,7 +853,7 @@ func TestTreeBranchStructure(t *testing.T) {
 	}
 
 	// Commit the initial state
-	initialRoot := tree.Commit(false)
+	initialRoot := tree.Commit(nil, false)
 	// Copy the size value to avoid aliasing (GetSize returns pointer to internal big.Int)
 	initialSize := new(big.Int).Set(tree.GetSize())
 
@@ -884,7 +884,7 @@ func TestTreeBranchStructure(t *testing.T) {
 	}
 
 	// Commit after adding the branch-creating key
-	branchRoot := tree.Commit(false)
+	branchRoot := tree.Commit(nil, false)
 	branchSize := tree.GetSize()
 
 	// Confirm size increased
@@ -904,7 +904,7 @@ func TestTreeBranchStructure(t *testing.T) {
 	}
 
 	// Commit after removing the branch-creating key
-	restoredRoot := tree.Commit(false)
+	restoredRoot := tree.Commit(nil, false)
 	restoredSize := tree.GetSize()
 	// Confirm size returned to original
 	if restoredSize.Cmp(initialSize) != 0 {
@@ -958,7 +958,7 @@ func TestTreeBranchStructure(t *testing.T) {
 	}
 
 	// Commit after adding all complex keys
-	tree.Commit(false)
+	tree.Commit(nil, false)
 
 	complexSize := tree.GetSize()
 	expectedComplexSize := big.NewInt(3 + numGroups*keysPerGroup)
@@ -976,7 +976,7 @@ func TestTreeBranchStructure(t *testing.T) {
 	}
 
 	// Commit after removal
-	c := tree.Commit(false)
+	c := tree.Commit(nil, false)
 
 	afterGroupRemoval := tree.GetSize()
 	expectedAfterRemoval := big.NewInt(3 + keysPerGroup)
@@ -1119,7 +1119,7 @@ func TestDeleteLeafPromotion(t *testing.T) {
 	}
 
 	// Commit initial state
-	root1 := tree.Commit(false)
+	root1 := tree.Commit(nil, false)
 	t.Logf("Inserted %d keys, tree size: %s", len(keys), tree.GetSize().String())
 
 	leaves, depth := tree.GetMetadata()
@@ -1162,7 +1162,7 @@ func TestDeleteLeafPromotion(t *testing.T) {
 	}
 
 	// Commit and verify proofs
-	root2 := tree.Commit(false)
+	root2 := tree.Commit(nil, false)
 	if bytes.Equal(root1, root2) {
 		t.Fatalf("Root should have changed after deletions")
 	}
@@ -1257,7 +1257,7 @@ func TestDeleteBranchPromotion(t *testing.T) {
 		}
 	}
 
-	root1 := tree.Commit(false)
+	root1 := tree.Commit(nil, false)
 	leaves1, depth1 := tree.GetMetadata()
 	t.Logf("Initial tree: %d leaves, longest branch: %d", leaves1, depth1)
 
@@ -1304,7 +1304,7 @@ func TestDeleteBranchPromotion(t *testing.T) {
 		t.Fatalf("Expected tree size %s, got %s", expectedSize.String(), tree.GetSize().String())
 	}
 
-	root2 := tree.Commit(false)
+	root2 := tree.Commit(nil, false)
 	if bytes.Equal(root1, root2) {
 		t.Fatalf("Root should have changed after deletions")
 	}
@@ -1384,7 +1384,7 @@ func TestDeleteWithLazyLoadedBranches(t *testing.T) {
 	}
 
 	// Commit to persist to storage
-	root1 := tree1.Commit(false)
+	root1 := tree1.Commit(nil, false)
 	leaves1, depth1 := tree1.GetMetadata()
 	t.Logf("Initial tree: %d keys, %d leaves, longest branch: %d", numKeys, leaves1, depth1)
 
@@ -1444,7 +1444,7 @@ func TestDeleteWithLazyLoadedBranches(t *testing.T) {
 	}
 
 	// Commit the changes
-	root2 := tree2.Commit(false)
+	root2 := tree2.Commit(nil, false)
 	if bytes.Equal(root1, root2) {
 		t.Fatalf("Root should have changed after deletions")
 	}
@@ -1475,7 +1475,7 @@ func TestDeleteWithLazyLoadedBranches(t *testing.T) {
 		}
 	}
 
-	root3 := tree3.Commit(false)
+	root3 := tree3.Commit(nil, false)
 
 	// The roots should match since they have the same data
 	if !bytes.Equal(root2, root3) {
@@ -1525,7 +1525,7 @@ func TestDeleteBranchCollapse(t *testing.T) {
 		}
 	}
 
-	tree.Commit(false)
+	tree.Commit(nil, false)
 	leaves, depth := tree.GetMetadata()
 	t.Logf("Initial tree: %d leaves, longest branch: %d", leaves, depth)
 
@@ -1567,7 +1567,7 @@ func TestDeleteBranchCollapse(t *testing.T) {
 		}
 	}
 
-	tree.Commit(false)
+	tree.Commit(nil, false)
 	leaves2, depth2 := tree.GetMetadata()
 	t.Logf("Rebuilt tree: %d leaves, longest branch: %d", leaves2, depth2)
 
@@ -1688,7 +1688,7 @@ func TestDeleteDeepNestedPrefixes(t *testing.T) {
 		}
 	}
 
-	root1 := tree.Commit(false)
+	root1 := tree.Commit(nil, false)
 	leaves1, depth1 := tree.GetMetadata()
 	t.Logf("Initial tree: %d leaves, longest branch: %d", leaves1, depth1)
 
@@ -1746,7 +1746,7 @@ func TestDeleteDeepNestedPrefixes(t *testing.T) {
 		t.Fatalf("Expected size %d, got %s", expectedRemaining, tree.GetSize().String())
 	}
 
-	root2 := tree.Commit(false)
+	root2 := tree.Commit(nil, false)
 	leaves2, depth2 := tree.GetMetadata()
 	t.Logf("After deletion: %d leaves, longest branch: %d", leaves2, depth2)
 
@@ -1766,7 +1766,7 @@ func TestDeleteDeepNestedPrefixes(t *testing.T) {
 		}
 	}
 
-	root3 := tree.Commit(false)
+	root3 := tree.Commit(nil, false)
 	leaves3, depth3 := tree.GetMetadata()
 	t.Logf("After re-insert: %d leaves, longest branch: %d", leaves3, depth3)
 
@@ -1784,7 +1784,7 @@ func TestDeleteDeepNestedPrefixes(t *testing.T) {
 			t.Fatalf("Failed to insert key %d in fresh tree: %v", i, err)
 		}
 	}
-	rootFresh := freshTree.Commit(false)
+	rootFresh := freshTree.Commit(nil, false)
 	t.Logf("Fresh tree root: %x", rootFresh[:16])
 
 	// Compare re-inserted tree to fresh tree
@@ -1843,7 +1843,7 @@ func TestDeleteMultipleChildrenRemaining(t *testing.T) {
 		}
 	}
 
-	root1 := tree.Commit(false)
+	root1 := tree.Commit(nil, false)
 	leaves1, depth1 := tree.GetMetadata()
 	t.Logf("Initial tree: %d leaves, longest branch: %d", leaves1, depth1)
 
@@ -1890,7 +1890,7 @@ func TestDeleteMultipleChildrenRemaining(t *testing.T) {
 		t.Fatalf("Expected size %s, got %s", expectedSize.String(), tree.GetSize().String())
 	}
 
-	root2 := tree.Commit(false)
+	root2 := tree.Commit(nil, false)
 	if bytes.Equal(root1, root2) {
 		t.Fatalf("Root should have changed after deletion")
 	}
@@ -1930,7 +1930,7 @@ func TestDeleteMultipleChildrenRemaining(t *testing.T) {
 		}
 	}
 
-	root3 := tree2.Commit(false)
+	root3 := tree2.Commit(nil, false)
 
 	// The roots should match
 	if !bytes.Equal(root2, root3) {
@@ -2015,7 +2015,7 @@ func TestDeleteBranchPromotionFullPrefixBug(t *testing.T) {
 	}
 
 	// Commit to persist everything
-	rootBefore := tree.Commit(false)
+	rootBefore := tree.Commit(nil, false)
 	t.Logf("Root before deletion: %x", rootBefore[:16])
 
 	// Verify all keys exist
@@ -2059,7 +2059,7 @@ func TestDeleteBranchPromotionFullPrefixBug(t *testing.T) {
 	}
 
 	// Commit after deletion
-	rootAfterDelete := tree.Commit(false)
+	rootAfterDelete := tree.Commit(nil, false)
 	t.Logf("Root after deletion: %x", rootAfterDelete[:16])
 
 	// Now create a FRESH tree that loads from storage
@@ -2099,7 +2099,7 @@ func TestDeleteBranchPromotionFullPrefixBug(t *testing.T) {
 	}
 
 	// Commit the fresh tree and compare roots
-	rootFresh := tree2.Commit(false)
+	rootFresh := tree2.Commit(nil, false)
 	t.Logf("Root from fresh tree: %x", rootFresh[:16])
 
 	if !bytes.Equal(rootAfterDelete, rootFresh) {
@@ -2128,7 +2128,7 @@ func TestDeleteBranchPromotionFullPrefixBug(t *testing.T) {
 		t.Fatalf("Failed to insert key2 into scratch tree: %v", err)
 	}
 
-	rootScratch := tree3.Commit(false)
+	rootScratch := tree3.Commit(nil, false)
 	t.Logf("Root from scratch tree: %x", rootScratch[:16])
 
 	// Log tree structures for debugging
@@ -2247,7 +2247,7 @@ func TestDeleteBranchPromotionDeepNesting(t *testing.T) {
 		t.Fatalf("Failed to insert key2: %v", err)
 	}
 
-	initialRoot := tree.Commit(false)
+	initialRoot := tree.Commit(nil, false)
 	leaves, depth := tree.GetMetadata()
 	t.Logf("Initial tree: %d leaves, depth %d", leaves, depth)
 
@@ -2267,11 +2267,11 @@ func TestDeleteBranchPromotionDeepNesting(t *testing.T) {
 		}
 
 		// Commit and check structure
-		root := tree.Commit(false)
+		root := tree.Commit(nil, false)
 		t.Logf("After deleting loner %d, root: %x", i, root[:8])
 	}
 
-	finalRoot := tree.Commit(false)
+	finalRoot := tree.Commit(nil, false)
 	if bytes.Equal(initialRoot, finalRoot) {
 		t.Fatalf("Root should have changed after deletions")
 	}
@@ -2300,7 +2300,7 @@ func TestDeleteBranchPromotionDeepNesting(t *testing.T) {
 	}
 
 	// Verify roots match
-	freshRoot := tree2.Commit(false)
+	freshRoot := tree2.Commit(nil, false)
 	if !bytes.Equal(finalRoot, freshRoot) {
 		t.Fatalf("Root mismatch after deep nesting promotion\n"+
 			"Original: %x\n"+
@@ -2318,7 +2318,7 @@ func TestDeleteBranchPromotionDeepNesting(t *testing.T) {
 	tree3.Insert(nil, key1, key1, nil, big.NewInt(1))
 	tree3.Insert(nil, key2, key2, nil, big.NewInt(1))
 
-	scratchRoot := tree3.Commit(false)
+	scratchRoot := tree3.Commit(nil, false)
 	if !bytes.Equal(finalRoot, scratchRoot) {
 		t.Fatalf("Root mismatch with scratch tree\n"+
 			"After deletes: %x\n"+
@@ -2400,7 +2400,7 @@ func TestBranchPromotionPathIndexCorruption(t *testing.T) {
 	}
 
 	// Commit to persist
-	_ = tree.Commit(false)
+	_ = tree.Commit(nil, false)
 
 	// Log the structure before deletion
 	if branch, ok := tree.Root.(*crypto.LazyVectorCommitmentBranchNode); ok {
@@ -2423,7 +2423,7 @@ func TestBranchPromotionPathIndexCorruption(t *testing.T) {
 	}
 
 	// Commit after delete to persist changes
-	rootAfterDelete := tree.Commit(false)
+	rootAfterDelete := tree.Commit(nil, false)
 	t.Logf("Root after delete: %x", rootAfterDelete[:16])
 
 	// Log the structure after deletion
@@ -2485,7 +2485,7 @@ func TestBranchPromotionPathIndexCorruption(t *testing.T) {
 	}
 
 	// Verify commitment matches
-	freshRoot := tree2.Commit(false)
+	freshRoot := tree2.Commit(nil, false)
 	t.Logf("Fresh tree root: %x", freshRoot[:16])
 
 	if !bytes.Equal(rootAfterDelete, freshRoot) {

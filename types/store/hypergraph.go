@@ -50,6 +50,7 @@ type HypergraphStore interface {
 		node tries.LazyVectorCommitmentNode,
 	) error
 	SaveRoot(
+		txn tries.TreeBackingStoreTransaction,
 		setType string,
 		phaseType string,
 		shardKey tries.ShardKey,

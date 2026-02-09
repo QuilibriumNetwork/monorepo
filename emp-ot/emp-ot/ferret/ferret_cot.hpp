@@ -28,8 +28,6 @@ FerretCOT<T>::FerretCOT(int64_t party, int64_t threads, T **ios,
 template<typename T>
 FerretCOT<T>::~FerretCOT() {
 	if (ot_pre_data != nullptr) {
-		if(party == ALICE) write_pre_data128_to_file((void*)ot_pre_data, (__uint128_t)Delta, pre_ot_filename);
-		else write_pre_data128_to_file((void*)ot_pre_data, (__uint128_t)0, pre_ot_filename);
 		delete[] ot_pre_data;
 	}
 	if (ot_data != nullptr) delete[] ot_data;

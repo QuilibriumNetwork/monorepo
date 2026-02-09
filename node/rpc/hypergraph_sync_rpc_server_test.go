@@ -370,8 +370,8 @@ func TestHypergraphSyncServer(t *testing.T) {
 		}
 	}
 
-	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
-	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
+	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 
 	str, err = client.PerformSync(context.TODO())
 	if err != nil {
@@ -385,8 +385,8 @@ func TestHypergraphSyncServer(t *testing.T) {
 	str.CloseSend()
 
 	if !bytes.Equal(
-		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
-		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
+		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false),
+		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false),
 	) {
 		leaves := crypto.CompareLeaves(
 			crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
@@ -395,19 +395,19 @@ func TestHypergraphSyncServer(t *testing.T) {
 		fmt.Println("remaining orphans", len(leaves))
 		log.Fatalf(
 			"trees mismatch: %v %v",
-			crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
-			crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
+			crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false),
+			crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false),
 		)
 	}
 
 	if !bytes.Equal(
-		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
-		crdts[2].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
+		crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false),
+		crdts[2].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false),
 	) {
 		log.Fatalf(
 			"trees did not converge to correct state: %v %v",
-			crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
-			crdts[2].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
+			crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false),
+			crdts[2].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false),
 		)
 	}
 }
@@ -651,8 +651,8 @@ func TestHypergraphPartialSync(t *testing.T) {
 	)
 	fmt.Println("pass completed, orphans:", len(leaves))
 
-	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
-	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
+	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 
 	str, err = client.PerformSync(context.TODO())
 
@@ -665,14 +665,14 @@ func TestHypergraphPartialSync(t *testing.T) {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}
 	str.CloseSend()
-	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
-	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
+	crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 
 	desc, err := crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().GetByPath(toIntSlice(toUint32Slice(branchfork)))
 	require.NoError(t, err)
 	if !bytes.Equal(
 		desc.(*crypto.LazyVectorCommitmentBranchNode).Commitment,
-		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(false),
+		crdts[1].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree().Commit(nil, false),
 	) {
 		leaves := crypto.CompareLeaves(
 			crdts[0].(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(shardKey).GetTree(),
@@ -862,7 +862,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	}
 
 	// Publish initial snapshot so clients can sync during the rounds
-	initialRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	initialRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	serverHG.PublishSnapshot(initialRoot)
 
 	const rounds = 3
@@ -953,7 +953,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 	logDuration("server final commits", commitStart)
 	wg := sync.WaitGroup{}
 	wg.Add(1)
-	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	// Publish the server's snapshot so clients can sync against this exact state
 	serverHG.PublishSnapshot(serverRoot)
 
@@ -1002,7 +1002,7 @@ func TestHypergraphSyncWithConcurrentCommits(t *testing.T) {
 
 			_, err = clientHGs[idx].Commit(101)
 			require.NoError(t, err)
-			clientRoot := clientHGs[idx].GetVertexAddsSet(shardKey).GetTree().Commit(false)
+			clientRoot := clientHGs[idx].GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 			assert.Equal(t, serverRoot, clientRoot, "client should converge to server state")
 			logDuration(fmt.Sprintf("client-%d final catch-up", idx), catchUpStart)
 		}(i)
@@ -1527,8 +1527,8 @@ func TestHypergraphSyncWithModifiedEntries(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify roots are different before sync (modified entries should cause different roots)
-	clientRootBefore := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
-	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	clientRootBefore := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
+	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	require.NotEqual(t, clientRootBefore, serverRoot, "roots should differ before sync due to modified entries")
 
 	t.Logf("Client root before sync: %x", clientRootBefore)
@@ -1611,7 +1611,7 @@ func TestHypergraphSyncWithModifiedEntries(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify client now matches server
-	clientRootAfter := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	clientRootAfter := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	t.Logf("Client root after sync: %x", clientRootAfter)
 
 	assert.Equal(t, serverRoot, clientRootAfter, "client should converge to server state after sync with modified entries")
@@ -1747,8 +1747,8 @@ func TestHypergraphBidirectionalSyncWithDisjointData(t *testing.T) {
 	_, err = nodeBHG.Commit(1)
 	require.NoError(t, err)
 
-	nodeARootBefore := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
-	nodeBRootBefore := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	nodeARootBefore := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
+	nodeBRootBefore := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	t.Logf("Node A root before sync: %x", nodeARootBefore)
 	t.Logf("Node B root before sync: %x", nodeBRootBefore)
 	require.NotEqual(t, nodeARootBefore, nodeBRootBefore, "roots should differ before sync")
@@ -1832,7 +1832,7 @@ func TestHypergraphBidirectionalSyncWithDisjointData(t *testing.T) {
 	_, err = nodeAHG.Commit(2)
 	require.NoError(t, err)
 
-	nodeARootAfterFirstSync := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	nodeARootAfterFirstSync := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	t.Logf("Node A root after syncing from B: %x", nodeARootAfterFirstSync)
 
 	// Step 2: Node B syncs from Node A (as server)
@@ -1860,8 +1860,8 @@ func TestHypergraphBidirectionalSyncWithDisjointData(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify both nodes have converged
-	nodeARootFinal := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
-	nodeBRootFinal := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	nodeARootFinal := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
+	nodeBRootFinal := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	t.Logf("Node A final root: %x", nodeARootFinal)
 	t.Logf("Node B final root: %x", nodeBRootFinal)
 
@@ -2030,8 +2030,8 @@ func TestHypergraphBidirectionalSyncClientDriven(t *testing.T) {
 	_, err = nodeBHG.Commit(1)
 	require.NoError(t, err)
 
-	nodeARootBefore := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
-	nodeBRootBefore := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	nodeARootBefore := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
+	nodeBRootBefore := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	t.Logf("Node A root before sync: %x", nodeARootBefore)
 	t.Logf("Node B root before sync: %x", nodeBRootBefore)
 	require.NotEqual(t, nodeARootBefore, nodeBRootBefore, "roots should differ before sync")
@@ -2118,7 +2118,7 @@ func TestHypergraphBidirectionalSyncClientDriven(t *testing.T) {
 	_, err = nodeAHG.Commit(2)
 	require.NoError(t, err)
 
-	nodeARootAfterFirstSync := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	nodeARootAfterFirstSync := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	t.Logf("Node A root after syncing from B: %x", nodeARootAfterFirstSync)
 
 	// Step 2: Node B syncs from Node A (as server) using client-driven sync
@@ -2145,8 +2145,8 @@ func TestHypergraphBidirectionalSyncClientDriven(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify both nodes have converged
-	nodeARootFinal := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
-	nodeBRootFinal := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	nodeARootFinal := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
+	nodeBRootFinal := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	t.Logf("Node A final root: %x", nodeARootFinal)
 	t.Logf("Node B final root: %x", nodeBRootFinal)
 
@@ -2381,8 +2381,8 @@ func TestHypergraphSyncWithPrefixLengthMismatch(t *testing.T) {
 			_, err = nodeBHG.Commit(1)
 			require.NoError(t, err)
 
-			nodeARoot := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
-			nodeBRoot := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+			nodeARoot := nodeAHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
+			nodeBRoot := nodeBHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 			t.Logf("Node A root: %x", nodeARoot)
 			t.Logf("Node B root: %x", nodeBRoot)
 
@@ -2485,7 +2485,7 @@ func TestHypergraphSyncWithPrefixLengthMismatch(t *testing.T) {
 			// In CRDT sync, the client receives data from the server and MERGES it.
 			// The client should now have BOTH its original vertices AND the server's vertices.
 			// So the client root should differ from both original roots (it's a superset).
-			clientRoot := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+			clientRoot := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 			t.Logf("Client root after sync: %x", clientRoot)
 
 			// Get all leaves from the client tree after sync
@@ -3200,7 +3200,7 @@ waitLoop:
 	require.NoError(t, err)
 
 	// Verify client now has the expected prover root
-	clientProverRoot := clientHG.GetVertexAddsSet(proverShardKey).GetTree().Commit(false)
+	clientProverRoot := clientHG.GetVertexAddsSet(proverShardKey).GetTree().Commit(nil, false)
 	t.Logf("Client prover root after sync: %x", clientProverRoot)
 	t.Logf("Expected prover root from frame: %x", expectedRoot)
 
@@ -3770,7 +3770,7 @@ waitLoop:
 	)
 
 	// Get current root from clientHG before repair
-	clientRootBeforeRepair := clientHG.GetVertexAddsSet(proverShardKey).GetTree().Commit(false)
+	clientRootBeforeRepair := clientHG.GetVertexAddsSet(proverShardKey).GetTree().Commit(nil, false)
 	t.Logf("Client root before repair: %x", clientRootBeforeRepair)
 
 	// Publish snapshot on clientHG
@@ -3824,7 +3824,7 @@ waitLoop:
 	}
 
 	// Verify repairHG has the data
-	repairRoot := repairHG.GetVertexAddsSet(proverShardKey).GetTree().Commit(false)
+	repairRoot := repairHG.GetVertexAddsSet(proverShardKey).GetTree().Commit(nil, false)
 	t.Logf("Repair hypergraph root after sync: %x", repairRoot)
 	assert.Equal(t, clientRootBeforeRepair, repairRoot, "repair HG should match client root")
 
@@ -3888,7 +3888,7 @@ waitLoop:
 	)
 
 	// Verify tree is now empty/different
-	clientRootAfterWipe := clientHG2.GetVertexAddsSet(proverShardKey).GetTree().Commit(false)
+	clientRootAfterWipe := clientHG2.GetVertexAddsSet(proverShardKey).GetTree().Commit(nil, false)
 	t.Logf("Client root after wipe: %x (expected nil or different)", clientRootAfterWipe)
 
 	// Publish snapshot on repairHG for reverse sync
@@ -3936,7 +3936,7 @@ waitLoop:
 	}
 
 	// Commit and verify root after repair
-	clientRootAfterRepair := clientHG2.GetVertexAddsSet(proverShardKey).GetTree().Commit(true)
+	clientRootAfterRepair := clientHG2.GetVertexAddsSet(proverShardKey).GetTree().Commit(nil, true)
 	t.Logf("Client root after repair: %x", clientRootAfterRepair)
 	t.Logf("Expected root from frame: %x", expectedRoot)
 
@@ -4059,7 +4059,7 @@ func TestHypergraphSyncWithPagination(t *testing.T) {
 	_, err = clientHG.Commit(1)
 	require.NoError(t, err)
 
-	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	serverRoot := serverHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	serverHG.PublishSnapshot(serverRoot)
 
 	t.Logf("Server root: %x", serverRoot)
@@ -4151,7 +4151,7 @@ func TestHypergraphSyncWithPagination(t *testing.T) {
 	_, err = clientHG.Commit(2)
 	require.NoError(t, err)
 
-	clientRoot := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(false)
+	clientRoot := clientHG.GetVertexAddsSet(shardKey).GetTree().Commit(nil, false)
 	t.Logf("Client root after sync: %x", clientRoot)
 
 	// Verify client now has all 1500 vertices

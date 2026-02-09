@@ -510,7 +510,7 @@ func (hg *HypergraphCRDT) SyncFrom(
 	// For global prover sync, capture pre-sync state to detect changes
 	var preSyncRoot []byte
 	if isGlobalProver {
-		preSyncRoot = set.GetTree().Commit(false)
+		preSyncRoot = set.GetTree().Commit(nil, false)
 	}
 
 	shardKeyBytes := slices.Concat(shardKey.L1[:], shardKey.L2[:])
@@ -525,7 +525,7 @@ func (hg *HypergraphCRDT) SyncFrom(
 	if syncPoint == nil || len(syncPoint.Commitment) == 0 {
 		logger.Debug("server has no data at sync point")
 		// Return current root even if no data was synced
-		root := set.GetTree().Commit(false)
+		root := set.GetTree().Commit(nil, false)
 		return root, nil
 	}
 
@@ -536,7 +536,7 @@ func (hg *HypergraphCRDT) SyncFrom(
 	}
 
 	// Step 3: Recompute commitment so future syncs see updated state
-	root := set.GetTree().Commit(false)
+	root := set.GetTree().Commit(nil, false)
 
 	// For global prover, only log if sync didn't converge (the interesting case)
 	if isGlobalProver && !bytes.Equal(root, expectedRoot) {

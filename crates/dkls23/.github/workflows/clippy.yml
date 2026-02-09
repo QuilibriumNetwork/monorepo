@@ -1,0 +1,22 @@
+name: Cargo clippy
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'src/**/*.rs'
+  pull_request:
+    branches: [main, dev]
+    types: [opened, reopened, synchronize]
+    paths:
+      - 'src/**/*.rs'
+jobs:
+  clippy:
+    name: Run cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - run: cargo clippy --all-targets

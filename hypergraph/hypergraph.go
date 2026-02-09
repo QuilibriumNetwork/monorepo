@@ -394,12 +394,12 @@ func (hg *HypergraphCRDT) GetSize(
 		p, _ := vrs.GetTree().GetByPath(path)
 
 		if p != nil {
-			sum = sum.Add(sum, o.GetSize())
+			sum = sum.Add(sum, p.GetSize())
 		}
 
 		q, _ := hrs.GetTree().GetByPath(path)
 		if q != nil {
-			sum = sum.Add(sum, o.GetSize())
+			sum = sum.Add(sum, q.GetSize())
 		}
 
 		return sum

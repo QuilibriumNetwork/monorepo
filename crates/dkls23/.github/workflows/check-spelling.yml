@@ -1,0 +1,35 @@
+# The configs for this spell check can be find at /.github/actions/spelling
+name: Spell checking
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  spelling:
+    name: Spell checking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check-spelling
+        uses: check-spelling/check-spelling@v0.0.21
+        with:
+          dictionary_source_prefixes: '
+            {
+              "cspell_050923": "https://raw.githubusercontent.com/check-spelling/cspell-dicts/v20230509/dictionaries/"
+            }'
+          # Extra dictionaries to verify words
+          extra_dictionaries:
+            cspell_050923:public-licenses/src/generated/public-licenses.txt
+            cspell_050923:cryptocurrencies/cryptocurrencies.txt
+            cspell_050923:software-terms/src/network-protocols.txt
+            cspell_050923:software-terms/src/software-terms.txt
+            cspell_050923:bash/src/bash-words.txt
+            cspell_050923:filetypes/filetypes.txt
+            cspell_050923:fonts/fonts.txt
+            cspell_050923:fullstack/src/fullstack.txt
+            cspell_050923:rust/src/rust.txt
+            cspell_050923:typescript/src/typescript.txt
+          experimental_apply_changes_via_bot: 1
+          check_file_names: 1

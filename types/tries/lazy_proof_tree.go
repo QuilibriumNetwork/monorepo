@@ -419,6 +419,52 @@ type TreeBackingStoreTransaction interface {
 	DeleteRange(lowerBound []byte, upperBound []byte) error
 }
 
+// SyncTransaction wraps a TreeBackingStoreTransaction with a mutex for
+// thread-safe access from commitNode's parallel goroutines.
+type SyncTransaction struct {
+	mu  sync.Mutex
+	Txn TreeBackingStoreTransaction
+}
+
+func (s *SyncTransaction) Get(key []byte) ([]byte, io.Closer, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Txn.Get(key)
+}
+
+func (s *SyncTransaction) Set(key []byte, value []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Txn.Set(key, value)
+}
+
+func (s *SyncTransaction) Commit() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Txn.Commit()
+}
+
+func (s *SyncTransaction) Delete(key []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Txn.Delete(key)
+}
+
+func (s *SyncTransaction) Abort() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Txn.Abort()
+}
+
+func (s *SyncTransaction) DeleteRange(
+	lowerBound []byte,
+	upperBound []byte,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Txn.DeleteRange(lowerBound, upperBound)
+}
+
 // VertexDataIterator defines an iterator for accessing ranges of data for a
 // given app shard.
 type VertexDataIterator interface {
@@ -478,6 +524,7 @@ type TreeBackingStore interface {
 		node LazyVectorCommitmentNode,
 	) error
 	SaveRoot(
+		txn TreeBackingStoreTransaction,
 		setType string,
 		phaseType string,
 		shardKey ShardKey,
@@ -728,7 +775,7 @@ func (t *LazyVectorCommitmentTree) InsertBranchSkeleton(
 	if isRoot {
 		t.Root = branch
 		return errors.Wrap(
-			t.Store.SaveRoot(t.SetType, t.PhaseType, t.ShardKey, branch),
+			t.Store.SaveRoot(txn, t.SetType, t.PhaseType, t.ShardKey, branch),
 			"insert branch skeleton",
 		)
 	}
@@ -768,7 +815,7 @@ func (t *LazyVectorCommitmentTree) InsertLeafSkeleton(
 	if isRoot {
 		t.Root = leaf
 		return errors.Wrap(
-			t.Store.SaveRoot(t.SetType, t.PhaseType, t.ShardKey, leaf),
+			t.Store.SaveRoot(txn, t.SetType, t.PhaseType, t.ShardKey, leaf),
 			"insert leaf skeleton",
 		)
 	}
@@ -1136,6 +1183,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 
 	_, t.Root = insert(t.Root, 0, []int{})
 	return errors.Wrap(t.Store.SaveRoot(
+		txn,
 		t.SetType,
 		t.PhaseType,
 		t.ShardKey,
@@ -1881,8 +1929,12 @@ func (t *LazyVectorCommitmentTree) GetMetadata() (
 	return 0, 0
 }
 
-// Commit returns the root of the tree
-func (t *LazyVectorCommitmentTree) Commit(recalculate bool) []byte {
+// Commit returns the root of the tree. If txn is non-nil, all node writes
+// are performed through the transaction for atomicity.
+func (t *LazyVectorCommitmentTree) Commit(
+	txn TreeBackingStoreTransaction,
+	recalculate bool,
+) []byte {
 	t.treeMx.Lock()
 	defer t.treeMx.Unlock()
 
@@ -1890,9 +1942,15 @@ func (t *LazyVectorCommitmentTree) Commit(recalculate bool) []byte {
 		return make([]byte, 64)
 	}
 
+	// Wrap txn for thread safety since commitNode uses parallel goroutines
+	var wrappedTxn TreeBackingStoreTransaction
+	if txn != nil {
+		wrappedTxn = &SyncTransaction{Txn: txn}
+	}
+
 	commitment := t.Root.Commit(
 		t.InclusionProver,
-		nil,
+		wrappedTxn,
 		t.SetType,
 		t.PhaseType,
 		t.ShardKey,
@@ -1900,7 +1958,7 @@ func (t *LazyVectorCommitmentTree) Commit(recalculate bool) []byte {
 		recalculate,
 	)
 
-	err := t.Store.SaveRoot(t.SetType, t.PhaseType, t.ShardKey, t.Root)
+	err := t.Store.SaveRoot(wrappedTxn, t.SetType, t.PhaseType, t.ShardKey, t.Root)
 	if err != nil {
 		log.Panic("failed to save root", zap.Error(err))
 	}
@@ -2106,6 +2164,7 @@ func (t *LazyVectorCommitmentTree) Delete(
 
 	_, t.Root = remove(t.Root, 0, []int{})
 	return errors.Wrap(t.Store.SaveRoot(
+		txn,
 		t.SetType,
 		t.PhaseType,
 		t.ShardKey,

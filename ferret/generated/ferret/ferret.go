@@ -348,6 +348,24 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_func_create_buffer_io_manager()
+		})
+		if checksum != 31310 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_func_create_buffer_io_manager: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_func_create_ferret_cot_buffer_manager()
+		})
+		if checksum != 17020 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_func_create_ferret_cot_buffer_manager: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_ferret_checksum_func_create_ferret_cot_manager()
 		})
 		if checksum != 49338 {
@@ -362,6 +380,168 @@ func uniffiCheckChecksums() {
 		if checksum != 37785 {
 			// If this happens try cleaning and rebuilding your project
 			panic("ferret: uniffi_ferret_checksum_func_create_netio_manager: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_bufferiomanager_clear()
+		})
+		if checksum != 46028 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_bufferiomanager_clear: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_bufferiomanager_drain_send()
+		})
+		if checksum != 42377 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_bufferiomanager_drain_send: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_bufferiomanager_fill_recv()
+		})
+		if checksum != 47991 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_bufferiomanager_fill_recv: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_bufferiomanager_recv_available()
+		})
+		if checksum != 30236 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_bufferiomanager_recv_available: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_bufferiomanager_send_size()
+		})
+		if checksum != 7700 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_bufferiomanager_send_size: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_bufferiomanager_set_error()
+		})
+		if checksum != 26761 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_bufferiomanager_set_error: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_bufferiomanager_set_timeout()
+		})
+		if checksum != 18359 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_bufferiomanager_set_timeout: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_assemble_state()
+		})
+		if checksum != 6363 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_assemble_state: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_disassemble_state()
+		})
+		if checksum != 47188 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_disassemble_state: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_get_block_data()
+		})
+		if checksum != 34398 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_get_block_data: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_is_setup()
+		})
+		if checksum != 1717 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_is_setup: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_recv_cot()
+		})
+		if checksum != 8122 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_recv_cot: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_recv_rot()
+		})
+		if checksum != 15345 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_recv_rot: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_send_cot()
+		})
+		if checksum != 13639 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_send_cot: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_send_rot()
+		})
+		if checksum != 3052 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_send_rot: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_set_block_data()
+		})
+		if checksum != 37344 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_set_block_data: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_setup()
+		})
+		if checksum != 11907 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_setup: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_ferret_checksum_method_ferretcotbuffermanager_state_size()
+		})
+		if checksum != 3205 {
+			// If this happens try cleaning and rebuilding your project
+			panic("ferret: uniffi_ferret_checksum_method_ferretcotbuffermanager_state_size: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -491,6 +671,30 @@ func (FfiConverterUint64) Read(reader io.Reader) uint64 {
 type FfiDestroyerUint64 struct{}
 
 func (FfiDestroyerUint64) Destroy(_ uint64) {}
+
+type FfiConverterInt64 struct{}
+
+var FfiConverterInt64INSTANCE = FfiConverterInt64{}
+
+func (FfiConverterInt64) Lower(value int64) C.int64_t {
+	return C.int64_t(value)
+}
+
+func (FfiConverterInt64) Write(writer io.Writer, value int64) {
+	writeInt64(writer, value)
+}
+
+func (FfiConverterInt64) Lift(value C.int64_t) int64 {
+	return int64(value)
+}
+
+func (FfiConverterInt64) Read(reader io.Reader) int64 {
+	return readInt64(reader)
+}
+
+type FfiDestroyerInt64 struct{}
+
+func (FfiDestroyerInt64) Destroy(_ int64) {}
 
 type FfiConverterBool struct{}
 
@@ -634,6 +838,304 @@ func (ffiObject *FfiObject) freeRustArcPtr() {
 		ffiObject.freeFunction(ffiObject.pointer, status)
 		return 0
 	})
+}
+
+type BufferIoManagerInterface interface {
+	Clear()
+	DrainSend(maxLen uint64) []uint8
+	FillRecv(data []uint8) bool
+	RecvAvailable() uint64
+	SendSize() uint64
+	SetError(message string)
+	SetTimeout(timeoutMs int64)
+}
+type BufferIoManager struct {
+	ffiObject FfiObject
+}
+
+func (_self *BufferIoManager) Clear() {
+	_pointer := _self.ffiObject.incrementPointer("*BufferIoManager")
+	defer _self.ffiObject.decrementPointer()
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_ferret_fn_method_bufferiomanager_clear(
+			_pointer, _uniffiStatus)
+		return false
+	})
+}
+
+func (_self *BufferIoManager) DrainSend(maxLen uint64) []uint8 {
+	_pointer := _self.ffiObject.incrementPointer("*BufferIoManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_ferret_fn_method_bufferiomanager_drain_send(
+				_pointer, FfiConverterUint64INSTANCE.Lower(maxLen), _uniffiStatus),
+		}
+	}))
+}
+
+func (_self *BufferIoManager) FillRecv(data []uint8) bool {
+	_pointer := _self.ffiObject.incrementPointer("*BufferIoManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_ferret_fn_method_bufferiomanager_fill_recv(
+			_pointer, FfiConverterSequenceUint8INSTANCE.Lower(data), _uniffiStatus)
+	}))
+}
+
+func (_self *BufferIoManager) RecvAvailable() uint64 {
+	_pointer := _self.ffiObject.incrementPointer("*BufferIoManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterUint64INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint64_t {
+		return C.uniffi_ferret_fn_method_bufferiomanager_recv_available(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+func (_self *BufferIoManager) SendSize() uint64 {
+	_pointer := _self.ffiObject.incrementPointer("*BufferIoManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterUint64INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint64_t {
+		return C.uniffi_ferret_fn_method_bufferiomanager_send_size(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+func (_self *BufferIoManager) SetError(message string) {
+	_pointer := _self.ffiObject.incrementPointer("*BufferIoManager")
+	defer _self.ffiObject.decrementPointer()
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_ferret_fn_method_bufferiomanager_set_error(
+			_pointer, FfiConverterStringINSTANCE.Lower(message), _uniffiStatus)
+		return false
+	})
+}
+
+func (_self *BufferIoManager) SetTimeout(timeoutMs int64) {
+	_pointer := _self.ffiObject.incrementPointer("*BufferIoManager")
+	defer _self.ffiObject.decrementPointer()
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_ferret_fn_method_bufferiomanager_set_timeout(
+			_pointer, FfiConverterInt64INSTANCE.Lower(timeoutMs), _uniffiStatus)
+		return false
+	})
+}
+func (object *BufferIoManager) Destroy() {
+	runtime.SetFinalizer(object, nil)
+	object.ffiObject.destroy()
+}
+
+type FfiConverterBufferIoManager struct{}
+
+var FfiConverterBufferIoManagerINSTANCE = FfiConverterBufferIoManager{}
+
+func (c FfiConverterBufferIoManager) Lift(pointer unsafe.Pointer) *BufferIoManager {
+	result := &BufferIoManager{
+		newFfiObject(
+			pointer,
+			func(pointer unsafe.Pointer, status *C.RustCallStatus) unsafe.Pointer {
+				return C.uniffi_ferret_fn_clone_bufferiomanager(pointer, status)
+			},
+			func(pointer unsafe.Pointer, status *C.RustCallStatus) {
+				C.uniffi_ferret_fn_free_bufferiomanager(pointer, status)
+			},
+		),
+	}
+	runtime.SetFinalizer(result, (*BufferIoManager).Destroy)
+	return result
+}
+
+func (c FfiConverterBufferIoManager) Read(reader io.Reader) *BufferIoManager {
+	return c.Lift(unsafe.Pointer(uintptr(readUint64(reader))))
+}
+
+func (c FfiConverterBufferIoManager) Lower(value *BufferIoManager) unsafe.Pointer {
+	// TODO: this is bad - all synchronization from ObjectRuntime.go is discarded here,
+	// because the pointer will be decremented immediately after this function returns,
+	// and someone will be left holding onto a non-locked pointer.
+	pointer := value.ffiObject.incrementPointer("*BufferIoManager")
+	defer value.ffiObject.decrementPointer()
+	return pointer
+
+}
+
+func (c FfiConverterBufferIoManager) Write(writer io.Writer, value *BufferIoManager) {
+	writeUint64(writer, uint64(uintptr(c.Lower(value))))
+}
+
+type FfiDestroyerBufferIoManager struct{}
+
+func (_ FfiDestroyerBufferIoManager) Destroy(value *BufferIoManager) {
+	value.Destroy()
+}
+
+type FerretCotBufferManagerInterface interface {
+	AssembleState() []uint8
+	DisassembleState(data []uint8) bool
+	GetBlockData(blockChoice uint8, index uint64) []uint8
+	IsSetup() bool
+	RecvCot() bool
+	RecvRot() bool
+	SendCot() bool
+	SendRot() bool
+	SetBlockData(blockChoice uint8, index uint64, data []uint8)
+	Setup() bool
+	StateSize() int64
+}
+type FerretCotBufferManager struct {
+	ffiObject FfiObject
+}
+
+func (_self *FerretCotBufferManager) AssembleState() []uint8 {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_ferret_fn_method_ferretcotbuffermanager_assemble_state(
+				_pointer, _uniffiStatus),
+		}
+	}))
+}
+
+func (_self *FerretCotBufferManager) DisassembleState(data []uint8) bool {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_ferret_fn_method_ferretcotbuffermanager_disassemble_state(
+			_pointer, FfiConverterSequenceUint8INSTANCE.Lower(data), _uniffiStatus)
+	}))
+}
+
+func (_self *FerretCotBufferManager) GetBlockData(blockChoice uint8, index uint64) []uint8 {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterSequenceUint8INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return GoRustBuffer{
+			inner: C.uniffi_ferret_fn_method_ferretcotbuffermanager_get_block_data(
+				_pointer, FfiConverterUint8INSTANCE.Lower(blockChoice), FfiConverterUint64INSTANCE.Lower(index), _uniffiStatus),
+		}
+	}))
+}
+
+func (_self *FerretCotBufferManager) IsSetup() bool {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_ferret_fn_method_ferretcotbuffermanager_is_setup(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+func (_self *FerretCotBufferManager) RecvCot() bool {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_ferret_fn_method_ferretcotbuffermanager_recv_cot(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+func (_self *FerretCotBufferManager) RecvRot() bool {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_ferret_fn_method_ferretcotbuffermanager_recv_rot(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+func (_self *FerretCotBufferManager) SendCot() bool {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_ferret_fn_method_ferretcotbuffermanager_send_cot(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+func (_self *FerretCotBufferManager) SendRot() bool {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_ferret_fn_method_ferretcotbuffermanager_send_rot(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+func (_self *FerretCotBufferManager) SetBlockData(blockChoice uint8, index uint64, data []uint8) {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_ferret_fn_method_ferretcotbuffermanager_set_block_data(
+			_pointer, FfiConverterUint8INSTANCE.Lower(blockChoice), FfiConverterUint64INSTANCE.Lower(index), FfiConverterSequenceUint8INSTANCE.Lower(data), _uniffiStatus)
+		return false
+	})
+}
+
+func (_self *FerretCotBufferManager) Setup() bool {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_ferret_fn_method_ferretcotbuffermanager_setup(
+			_pointer, _uniffiStatus)
+	}))
+}
+
+func (_self *FerretCotBufferManager) StateSize() int64 {
+	_pointer := _self.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterInt64INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int64_t {
+		return C.uniffi_ferret_fn_method_ferretcotbuffermanager_state_size(
+			_pointer, _uniffiStatus)
+	}))
+}
+func (object *FerretCotBufferManager) Destroy() {
+	runtime.SetFinalizer(object, nil)
+	object.ffiObject.destroy()
+}
+
+type FfiConverterFerretCotBufferManager struct{}
+
+var FfiConverterFerretCotBufferManagerINSTANCE = FfiConverterFerretCotBufferManager{}
+
+func (c FfiConverterFerretCotBufferManager) Lift(pointer unsafe.Pointer) *FerretCotBufferManager {
+	result := &FerretCotBufferManager{
+		newFfiObject(
+			pointer,
+			func(pointer unsafe.Pointer, status *C.RustCallStatus) unsafe.Pointer {
+				return C.uniffi_ferret_fn_clone_ferretcotbuffermanager(pointer, status)
+			},
+			func(pointer unsafe.Pointer, status *C.RustCallStatus) {
+				C.uniffi_ferret_fn_free_ferretcotbuffermanager(pointer, status)
+			},
+		),
+	}
+	runtime.SetFinalizer(result, (*FerretCotBufferManager).Destroy)
+	return result
+}
+
+func (c FfiConverterFerretCotBufferManager) Read(reader io.Reader) *FerretCotBufferManager {
+	return c.Lift(unsafe.Pointer(uintptr(readUint64(reader))))
+}
+
+func (c FfiConverterFerretCotBufferManager) Lower(value *FerretCotBufferManager) unsafe.Pointer {
+	// TODO: this is bad - all synchronization from ObjectRuntime.go is discarded here,
+	// because the pointer will be decremented immediately after this function returns,
+	// and someone will be left holding onto a non-locked pointer.
+	pointer := value.ffiObject.incrementPointer("*FerretCotBufferManager")
+	defer value.ffiObject.decrementPointer()
+	return pointer
+
+}
+
+func (c FfiConverterFerretCotBufferManager) Write(writer io.Writer, value *FerretCotBufferManager) {
+	writeUint64(writer, uint64(uintptr(c.Lower(value))))
+}
+
+type FfiDestroyerFerretCotBufferManager struct{}
+
+func (_ FfiDestroyerFerretCotBufferManager) Destroy(value *FerretCotBufferManager) {
+	value.Destroy()
 }
 
 type FerretCotManagerInterface interface {
@@ -933,6 +1435,18 @@ func (FfiDestroyerSequenceBool) Destroy(sequence []bool) {
 	for _, value := range sequence {
 		FfiDestroyerBool{}.Destroy(value)
 	}
+}
+
+func CreateBufferIoManager(initialCap int64) *BufferIoManager {
+	return FfiConverterBufferIoManagerINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) unsafe.Pointer {
+		return C.uniffi_ferret_fn_func_create_buffer_io_manager(FfiConverterInt64INSTANCE.Lower(initialCap), _uniffiStatus)
+	}))
+}
+
+func CreateFerretCotBufferManager(party int32, threads int32, length uint64, choices []bool, bufferio *BufferIoManager, malicious bool) *FerretCotBufferManager {
+	return FfiConverterFerretCotBufferManagerINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) unsafe.Pointer {
+		return C.uniffi_ferret_fn_func_create_ferret_cot_buffer_manager(FfiConverterInt32INSTANCE.Lower(party), FfiConverterInt32INSTANCE.Lower(threads), FfiConverterUint64INSTANCE.Lower(length), FfiConverterSequenceBoolINSTANCE.Lower(choices), FfiConverterBufferIoManagerINSTANCE.Lower(bufferio), FfiConverterBoolINSTANCE.Lower(malicious), _uniffiStatus)
+	}))
 }
 
 func CreateFerretCotManager(party int32, threads int32, length uint64, choices []bool, netio *NetIoManager, malicious bool) *FerretCotManager {

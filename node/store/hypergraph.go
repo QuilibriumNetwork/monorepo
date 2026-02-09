@@ -1580,11 +1580,17 @@ func (p *PebbleHypergraphStore) InsertNode(
 }
 
 func (p *PebbleHypergraphStore) SaveRoot(
+	txn tries.TreeBackingStoreTransaction,
 	setType string,
 	phaseType string,
 	shardKey tries.ShardKey,
 	node tries.LazyVectorCommitmentNode,
 ) error {
+	setter := p.db.Set
+	if txn != nil {
+		setter = txn.Set
+	}
+
 	keyFn := hypergraphVertexAddsTreeRootKey
 	switch hypergraph.AtomType(setType) {
 	case hypergraph.VertexAtomType:
@@ -1622,7 +1628,7 @@ func (p *PebbleHypergraphStore) SaveRoot(
 		}
 		data := append([]byte{tries.TypeBranch}, pathBytes...)
 		data = append(data, b.Bytes()...)
-		err = p.db.Set(nodeKey, data)
+		err = setter(nodeKey, data)
 		return errors.Wrap(err, "insert node")
 	case *tries.LazyVectorCommitmentLeafNode:
 		err := tries.SerializeLeafNode(&b, n)
@@ -1630,7 +1636,7 @@ func (p *PebbleHypergraphStore) SaveRoot(
 			return errors.Wrap(err, "insert node")
 		}
 		data := append([]byte{tries.TypeLeaf}, b.Bytes()...)
-		err = p.db.Set(nodeKey, data)
+		err = setter(nodeKey, data)
 		return errors.Wrap(err, "insert node")
 	}
 

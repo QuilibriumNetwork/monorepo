@@ -185,7 +185,7 @@ func (hg *HypergraphCRDT) Sync(
 				ShardKey:        slices.Concat(shardKey.L1[:], shardKey.L2[:]),
 				PhaseSet:        phaseSet,
 				Path:            toInt32Slice(path),
-				Commitment:      set.GetTree().Commit(false),
+				Commitment:      set.GetTree().Commit(nil, false),
 				IncludeLeafData: false,
 				ExpectedRoot:    expectedRoot,
 			},
@@ -336,7 +336,7 @@ func (hg *HypergraphCRDT) Sync(
 
 	wg.Wait()
 
-	root = set.GetTree().Commit(false)
+	root = set.GetTree().Commit(nil, false)
 	hg.logger.Info(
 		"hypergraph root commit",
 		zap.String("root", hex.EncodeToString(root)),

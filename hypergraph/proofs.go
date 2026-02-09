@@ -52,7 +52,7 @@ func (hg *HypergraphCRDT) Commit(
 		if r, ok := commits[shardKey]; ok && len(r[0]) != 64 {
 			continue
 		}
-		root := vertexAdds.GetTree().Commit(false)
+		root := vertexAdds.GetTree().Commit(txn, false)
 		ensureSet(shardKey)
 		commits[shardKey][0] = root
 
@@ -77,7 +77,7 @@ func (hg *HypergraphCRDT) Commit(
 		if r, ok := commits[shardKey]; ok && len(r[1]) != 64 {
 			continue
 		}
-		root := vertexRemoves.GetTree().Commit(false)
+		root := vertexRemoves.GetTree().Commit(txn, false)
 		ensureSet(shardKey)
 		commits[shardKey][1] = root
 
@@ -104,7 +104,7 @@ func (hg *HypergraphCRDT) Commit(
 		if r, ok := commits[shardKey]; ok && len(r[2]) != 64 {
 			continue
 		}
-		root := hyperedgeAdds.GetTree().Commit(false)
+		root := hyperedgeAdds.GetTree().Commit(txn, false)
 		ensureSet(shardKey)
 		commits[shardKey][2] = root
 
@@ -131,7 +131,7 @@ func (hg *HypergraphCRDT) Commit(
 		if r, ok := commits[shardKey]; ok && len(r[3]) != 64 {
 			continue
 		}
-		root := hyperedgeRemoves.GetTree().Commit(false)
+		root := hyperedgeRemoves.GetTree().Commit(txn, false)
 		ensureSet(shardKey)
 		commits[shardKey][3] = root
 
@@ -306,9 +306,9 @@ func (hg *HypergraphCRDT) CommitShard(
 		hg.getCoveredPrefix(),
 	)
 	vertexAddTree := vertexAddSet.GetTree()
-	vertexAddTree.Commit(false)
+	vertexAddTree.Commit(nil, false)
 	vertexRemoveTree := vertexRemoveSet.GetTree()
-	vertexRemoveTree.Commit(false)
+	vertexRemoveTree.Commit(nil, false)
 
 	path := tries.GetFullPath(shardAddress[:32])
 	for _, p := range shardAddress[32:] {
@@ -333,9 +333,9 @@ func (hg *HypergraphCRDT) CommitShard(
 		hg.getCoveredPrefix(),
 	)
 	hyperedgeAddTree := hyperedgeAddSet.GetTree()
-	hyperedgeAddTree.Commit(false)
+	hyperedgeAddTree.Commit(nil, false)
 	hyperedgeRemoveTree := hyperedgeRemoveSet.GetTree()
-	hyperedgeRemoveTree.Commit(false)
+	hyperedgeRemoveTree.Commit(nil, false)
 
 	hyperedgeAddNode, err := vertexAddTree.GetByPath(path)
 	if err != nil && !strings.Contains(err.Error(), "not found") {

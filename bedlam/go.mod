@@ -10,6 +10,8 @@ replace source.quilibrium.com/quilibrium/monorepo/consensus => ../consensus
 
 replace github.com/libp2p/go-libp2p => ../go-libp2p
 
+replace github.com/multiformats/go-multiaddr => ../go-multiaddr
+
 require (
 	github.com/markkurossi/tabulate v0.0.0-20230223130100-d4965869b123
 	github.com/pkg/errors v0.9.1

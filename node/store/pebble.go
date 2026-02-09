@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -96,6 +95,7 @@ var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_1819,
 	migration_2_1_0_1820,
 	migration_2_1_0_1821,
+	migration_2_1_0_1822,
 }
 
 func NewPebbleDB(
@@ -725,88 +725,11 @@ func migration_2_1_0_173(b *pebble.Batch, db *pebble.DB, cfg *config.Config) err
 }
 
 func migration_2_1_0_18(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	// Global shard key: L1={0,0,0}, L2=0xff*32
-	globalShardKey := tries.ShardKey{
-		L1: [3]byte{},
-		L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
-	}
-	// Next shard key (for exclusive upper bound): L1={0,0,1}, L2=0x00*32
-	nextShardKey := tries.ShardKey{
-		L1: [3]byte{0, 0, 1},
-		L2: [32]byte{},
-	}
-
-	// Delete vertex data for global domain
-	// Vertex data keys: {0x09, 0xF0, domain[32], address[32]}
-	// Start: {0x09, 0xF0, 0xff*32} (prefix for global domain)
-	// End: {0x09, 0xF1} (next prefix type, ensures we capture all addresses)
-	if err := b.DeleteRange(
-		hypergraphVertexDataKey(globalShardKey.L2[:]),
-		[]byte{HYPERGRAPH_SHARD, VERTEX_DATA + 1},
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
-	}
-
-	// Delete vertex adds tree nodes
-	if err := b.DeleteRange(
-		hypergraphVertexAddsTreeNodeKey(globalShardKey, []byte{}),
-		hypergraphVertexAddsTreeNodeKey(nextShardKey, []byte{}),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
-	}
-
-	// Delete vertex adds tree nodes by path
-	if err := b.DeleteRange(
-		hypergraphVertexAddsTreeNodeByPathKey(globalShardKey, []int{}),
-		hypergraphVertexAddsTreeNodeByPathKey(nextShardKey, []int{}),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
-	}
-
-	// Delete hyperedge adds tree nodes
-	if err := b.DeleteRange(
-		hypergraphHyperedgeAddsTreeNodeKey(globalShardKey, []byte{}),
-		hypergraphHyperedgeAddsTreeNodeKey(nextShardKey, []byte{}),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
-	}
-
-	// Delete hyperedge adds tree nodes by path
-	if err := b.DeleteRange(
-		hypergraphHyperedgeAddsTreeNodeByPathKey(globalShardKey, []int{}),
-		hypergraphHyperedgeAddsTreeNodeByPathKey(nextShardKey, []int{}),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
-	}
-
-	// Delete vertex adds tree root
-	if err := b.DeleteRange(
-		hypergraphVertexAddsTreeRootKey(globalShardKey),
-		hypergraphVertexAddsTreeRootKey(nextShardKey),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
-	}
-
-	// Delete hyperedge adds tree root
-	if err := b.DeleteRange(
-		hypergraphHyperedgeAddsTreeRootKey(globalShardKey),
-		hypergraphHyperedgeAddsTreeRootKey(nextShardKey),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
-	}
-
 	return nil
 }
 
 func migration_2_1_0_181(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return migration_2_1_0_18(b, db, cfg)
+	return nil
 }
 
 func migration_2_1_0_182(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
@@ -842,73 +765,39 @@ func migration_2_1_0_189(b *pebble.Batch, db *pebble.DB, cfg *config.Config) err
 }
 
 func migration_2_1_0_1810(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return migration_2_1_0_189(b, db, cfg)
+	return nil
 }
 
 func migration_2_1_0_1811(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return migration_2_1_0_189(b, db, cfg)
+	return nil
 }
 
 func migration_2_1_0_1812(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return migration_2_1_0_189(b, db, cfg)
+	return nil
 }
 
 func migration_2_1_0_1813(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return migration_2_1_0_189(b, db, cfg)
+	return nil
 }
 
 func migration_2_1_0_1814(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return migration_2_1_0_189(b, db, cfg)
+	return nil
 }
 
 func migration_2_1_0_1815(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return migration_2_1_0_189(b, db, cfg)
+	return nil
 }
 
-// migration_2_1_0_1816 recalculates commitments for the global prover trees
-// to fix potential corruption from earlier versions of sync.
 func migration_2_1_0_1816(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	// Global prover shard key: L1={0,0,0}, L2=0xff*32
-	globalShardKey := tries.ShardKey{
-		L1: [3]byte{},
-		L2: [32]byte{
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-		},
-	}
-
-	// Initialize prover (logger can be nil for migrations)
-	prover := bls48581.NewKZGInclusionProver(nil)
-
-	// Create hypergraph store using the batch wrapper
-	hgStore := NewPebbleHypergraphStore(nil, &PebbleDB{db: db}, zap.L(), nil, prover)
-
-	hg, err := hgStore.LoadHypergraph(nil, 0)
-	if err != nil {
-		return err
-	}
-
-	hgc := hg.(*hgcrdt.HypergraphCRDT)
-	hgc.GetVertexAddsSet(globalShardKey).GetTree().Commit(true)
-
 	return nil
 }
 
 func migration_2_1_0_1817(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return migration_2_1_0_1816(b, db, cfg)
+	return nil
 }
 
-// migration_2_1_0_1818 repairs corrupted global prover shard tree data by:
-// 1. Creating an in-memory hypergraph instance
-// 2. Setting up a local gRPC sync server backed by the actual DB hypergraph
-// 3. Syncing from the actual DB to the in-memory instance via the sync protocol
-// 4. Wiping all tree data for the global prover shard from the actual DB
-// 5. Setting up a local gRPC sync server backed by the in-memory hypergraph
-// 6. Syncing from the in-memory instance back to the actual DB hypergraph
 func migration_2_1_0_1818(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return doMigration1818(db, cfg)
+	return nil
 }
 
 // doMigration1818 performs the actual migration work for migration_2_1_0_1818.
@@ -962,7 +851,7 @@ func doMigration1818(db *pebble.DB, cfg *config.Config) error {
 
 	// Phase 1: Sync from actual DB to in-memory
 	// Get the current root from actual DB
-	actualRoot := actualHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(false)
+	actualRoot := actualHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
 	if actualRoot == nil {
 		logger.Info("migration 1818: no data in global prover shard, skipping")
 		return nil
@@ -1024,7 +913,7 @@ func doMigration1818(db *pebble.DB, cfg *config.Config) error {
 	}
 
 	// Commit in-memory to get root
-	memRoot := memHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(false)
+	memRoot := memHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
 	logger.Info("migration 1818: synced to in-memory",
 		zap.String("actual_root", hex.EncodeToString(actualRoot)),
 		zap.String("mem_root", hex.EncodeToString(memRoot)),
@@ -1120,7 +1009,7 @@ func doMigration1818(db *pebble.DB, cfg *config.Config) error {
 	}
 
 	// Final commit
-	finalRoot := actualHGCRDT2.GetVertexAddsSet(globalShardKey).GetTree().Commit(true)
+	finalRoot := actualHGCRDT2.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, true)
 	logger.Info("migration 1818: completed",
 		zap.String("final_root", hex.EncodeToString(finalRoot)),
 	)
@@ -1128,30 +1017,16 @@ func doMigration1818(db *pebble.DB, cfg *config.Config) error {
 	return nil
 }
 
-// migration_2_1_0_1819 re-runs migration_2_1_0_18 for non-archive mode nodes.
-// This ensures that nodes which do not have ArchiveMode enabled will have the
-// global shard hypergraph data cleaned up.
 func migration_2_1_0_1819(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	// Only run for non-archive mode nodes
-	if cfg.Engine != nil && cfg.Engine.ArchiveMode {
-		return nil
-	}
-	return migration_2_1_0_18(b, db, cfg)
+	return nil
 }
 
 func migration_2_1_0_1820(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return doMigration1818(db, cfg)
+	return nil
 }
 
-// migration_2_1_0_1821 removes spent merge markers from the global intrinsic domain.
-// These markers were created with incorrect seniority values and need to be removed
-// to allow provers to re-merge with correct seniority values.
-//
-// Spent merge markers are identified by:
-// 1. Being in the global intrinsic domain (GLOBAL_INTRINSIC_ADDRESS = 0xff * 32)
-// 2. Having an empty VectorCommitmentTree (no actual data, just a marker)
 func migration_2_1_0_1821(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
-	return doMigration1821(db, cfg)
+	return nil
 }
 
 // doMigration1821 performs the actual work for migration_2_1_0_1821.
@@ -1250,6 +1125,12 @@ func doMigration1821(db *pebble.DB, cfg *config.Config) error {
 	)
 
 	return nil
+}
+
+// migration_2_1_0_1822 rebuilds the global prover shard tree to fix potential
+// corruption from transaction bypass bugs in SaveRoot and Commit.
+func migration_2_1_0_1822(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return doMigration1818(db, cfg)
 }
 
 // pebbleBatchDB wraps a *pebble.Batch to implement store.KVDB for use in migrations

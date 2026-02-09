@@ -6,16 +6,29 @@ use std::process::Command;
 
 fn main() {
   let target = env::var("TARGET").expect("cargo should have set this");
+
+  // Get path to local emp-tool and emp-ot directories (relative to crates/ferret)
+  // manifest_dir is .../ceremonyclient/crates/ferret
+  // emp-tool is at .../ceremonyclient/emp-tool
+  // emp-ot is at .../ceremonyclient/emp-ot
+  let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+  let emp_tool_local = format!("{}/../../emp-tool", manifest_dir);
+  let emp_ot_local = format!("{}/../../emp-ot", manifest_dir);
+
   if target == "aarch64-apple-darwin" {
     cc::Build::new()
         .cpp(true)
         .flag_if_supported("-std=c++17")
         .file("emp_bridge.cpp")
+        // Local emp-tool first (for buffer_io_channel.h)
+        .flag(&format!("-I{}", emp_tool_local))
+        // Local emp-ot first (for ferret_cot.h with is_setup())
+        .flag(&format!("-I{}", emp_ot_local))
         .flag("-I/usr/local/include/emp-tool/")
         .flag("-I/usr/local/include/emp-ot/")
-        .flag("-I/opt/homebrew/Cellar/openssl@3/3.6.0/include")
+        .flag("-I/opt/homebrew/Cellar/openssl@3/3.6.1/include")
         .flag("-L/usr/local/lib/emp-tool/")
-        .flag("-L/opt/homebrew/Cellar/openssl@3/3.6.0/lib")
+        .flag("-L/opt/homebrew/Cellar/openssl@3/3.6.1/lib")
         .warnings(false)
         .compile("emp_bridge");
 

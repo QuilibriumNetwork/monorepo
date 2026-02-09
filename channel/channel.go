@@ -75,8 +75,8 @@ func (d *DoubleRatchetEncryptedChannel) EstablishTwoPartyChannel(
 	}
 
 	state := NewDoubleRatchet(
-		sessionKey[:36],
-		sessionKey[36:64],
+		sessionKey[:32],
+		sessionKey[32:64],
 		sessionKey[64:],
 		isSender,
 		sendingSignedPrePrivateKey,
@@ -95,7 +95,10 @@ func (d *DoubleRatchetEncryptedChannel) EncryptTwoPartyMessage(
 		Message:      message, // buildutils:allow-slice-alias this assignment is ephemeral
 	}
 
-	result := DoubleRatchetEncrypt(stateAndMessage)
+	result, err := DoubleRatchetEncrypt(stateAndMessage)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "encrypt two party message")
+	}
 	envelope = &channel.P2PChannelEnvelope{}
 	err = json.Unmarshal([]byte(result.Envelope), envelope)
 	if err != nil {
@@ -120,7 +123,10 @@ func (d *DoubleRatchetEncryptedChannel) DecryptTwoPartyMessage(
 		Envelope:     string(envelopeJson),
 	}
 
-	result := DoubleRatchetDecrypt(stateAndEnvelope)
+	result, err := DoubleRatchetDecrypt(stateAndEnvelope)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "decrypt two party message")
+	}
 	return result.RatchetState, result.Message, nil
 }
 
@@ -162,22 +168,22 @@ func NewTripleRatchet(
 
 func DoubleRatchetEncrypt(
 	ratchetStateAndMessage generated.DoubleRatchetStateAndMessage,
-) generated.DoubleRatchetStateAndEnvelope {
+) (generated.DoubleRatchetStateAndEnvelope, error) {
 	result, err := generated.DoubleRatchetEncrypt(ratchetStateAndMessage)
 	if err != nil {
-		return generated.DoubleRatchetStateAndEnvelope{}
+		return generated.DoubleRatchetStateAndEnvelope{}, err
 	}
-	return result
+	return result, nil
 }
 
 func DoubleRatchetDecrypt(
 	ratchetStateAndEnvelope generated.DoubleRatchetStateAndEnvelope,
-) generated.DoubleRatchetStateAndMessage {
+) (generated.DoubleRatchetStateAndMessage, error) {
 	result, err := generated.DoubleRatchetDecrypt(ratchetStateAndEnvelope)
 	if err != nil {
-		return generated.DoubleRatchetStateAndMessage{}
+		return generated.DoubleRatchetStateAndMessage{}, err
 	}
-	return result
+	return result, nil
 }
 
 func TripleRatchetInitRound1(

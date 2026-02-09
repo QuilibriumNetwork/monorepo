@@ -1,0 +1,32 @@
+[package]
+name = "dkls23_ffi"
+version = "0.1.0"
+edition = "2021"
+authors = ["Quilibrium Inc."]
+description = "FFI bindings for DKLs23 threshold ECDSA protocol"
+license = "Apache-2.0"
+repository = "https://github.com/quilibriumnetwork/monorepo"
+keywords = ["threshold", "ecdsa", "mpc", "cryptography", "dkls"]
+categories = ["cryptography", "algorithms"]
+
+[lib]
+crate-type = ["lib", "staticlib"]
+name = "dkls23_ffi"
+
+[dependencies]
+uniffi = { version = "0.28.3", features = ["cli"] }
+dkls23 = { path = "../dkls23" }
+k256 = { version = "0.13", features = ["ecdsa", "serde"] }
+p256 = { version = "0.13", features = ["ecdsa", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "1.0"
+
+[build-dependencies]
+uniffi = { version = "0.28.3", features = ["build"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
