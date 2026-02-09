@@ -611,6 +611,66 @@ func (p *ProverUpdate) ToProtobuf() *protobufs.ProverUpdate {
 	}
 }
 
+// FromProtobuf converts a protobuf ProverSeniorityMerge to intrinsics
+func ProverSeniorityMergeFromProtobuf(
+	pb *protobufs.ProverSeniorityMerge,
+	hg hypergraph.Hypergraph,
+	rdfMultiprover *schema.RDFMultiprover,
+	keyManager keys.KeyManager,
+) (*ProverSeniorityMerge, error) {
+	if pb == nil {
+		return nil, nil
+	}
+
+	signature, err := BLS48581AddressedSignatureFromProtobuf(
+		pb.PublicKeySignatureBls48581,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "prover seniority merge from protobuf")
+	}
+
+	// Convert MergeTargets
+	var mergeTargets []*SeniorityMerge
+	if len(pb.MergeTargets) > 0 {
+		mergeTargets = make([]*SeniorityMerge, len(pb.MergeTargets))
+		for i, target := range pb.MergeTargets {
+			converted, err := SeniorityMergeFromProtobuf(target)
+			if err != nil {
+				return nil, errors.Wrapf(err, "converting merge target %d", i)
+			}
+			mergeTargets[i] = converted
+		}
+	}
+
+	return &ProverSeniorityMerge{
+		FrameNumber:                pb.FrameNumber,
+		PublicKeySignatureBLS48581: *signature,
+		MergeTargets:               mergeTargets,
+		hypergraph:                 hg,
+		rdfMultiprover:             rdfMultiprover,
+		keyManager:                 keyManager,
+	}, nil
+}
+
+// ToProtobuf converts an intrinsics ProverSeniorityMerge to protobuf
+func (p *ProverSeniorityMerge) ToProtobuf() *protobufs.ProverSeniorityMerge {
+	if p == nil {
+		return nil
+	}
+
+	// Convert MergeTargets
+	mergeTargets := make([]*protobufs.SeniorityMerge, len(p.MergeTargets))
+	for i, target := range p.MergeTargets {
+		mergeTargets[i] = target.ToProtobuf()
+	}
+
+	return &protobufs.ProverSeniorityMerge{
+		FrameNumber:                p.FrameNumber,
+		PublicKeySignatureBls48581: p.PublicKeySignatureBLS48581.ToProtobuf(),
+		MergeTargets:               mergeTargets,
+	}
+}
+
 // FromProtobuf converts a protobuf MessageRequest to intrinsics types
 func GlobalRequestFromProtobuf(
 	pb *protobufs.MessageRequest,
@@ -691,6 +751,14 @@ func GlobalRequestFromProtobuf(
 			req.Update,
 			hg,
 			signer,
+			schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, inclusionProver),
+			keyManager,
+		)
+
+	case *protobufs.MessageRequest_SeniorityMerge:
+		return ProverSeniorityMergeFromProtobuf(
+			req.SeniorityMerge,
+			hg,
 			schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, inclusionProver),
 			keyManager,
 		)

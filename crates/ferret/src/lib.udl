@@ -1,16 +1,66 @@
 
 namespace ferret {
+  // TCP-based (original interface)
   NetIOManager create_netio_manager(i32 party, string? address, i32 port);
   FerretCOTManager create_ferret_cot_manager(i32 party, i32 threads, u64 length, sequence<boolean> choices, [ByRef] NetIOManager netio, boolean malicious);
+
+  // Buffer-based (new message-channel interface)
+  BufferIOManager create_buffer_io_manager(i64 initial_cap);
+  FerretCOTBufferManager create_ferret_cot_buffer_manager(i32 party, i32 threads, u64 length, sequence<boolean> choices, [ByRef] BufferIOManager bufferio, boolean malicious);
 };
 
+// TCP-based IO (original)
 interface NetIOManager {};
 
+// TCP-based Ferret COT (original)
 interface FerretCOTManager {
     void send_cot();
     void recv_cot();
     void send_rot();
     void recv_rot();
+    sequence<u8> get_block_data(u8 block_choice, u64 index);
+    void set_block_data(u8 block_choice, u64 index, sequence<u8> data);
+};
+
+// Buffer-based IO (new - for message channels)
+interface BufferIOManager {
+    // Fill receive buffer with data from external transport
+    boolean fill_recv(sequence<u8> data);
+    // Drain send buffer (up to max_len bytes)
+    sequence<u8> drain_send(u64 max_len);
+    // Get current send buffer size
+    u64 send_size();
+    // Get available bytes in receive buffer
+    u64 recv_available();
+    // Set timeout for blocking receive (milliseconds)
+    void set_timeout(i64 timeout_ms);
+    // Set error state
+    void set_error(string message);
+    // Clear all buffers
+    void clear();
+};
+
+// Buffer-based Ferret COT (new - for message channels)
+// NOTE: After creating with create_ferret_cot_buffer_manager, you MUST either:
+// 1. Call setup() once both parties have their message transport active, OR
+// 2. Call disassemble_state() with previously saved state data
+interface FerretCOTBufferManager {
+    // Run the OT setup protocol (call after message transport is active)
+    // Returns true on success, false on error (e.g., timeout, IO error)
+    boolean setup();
+    // Check if setup has been run
+    boolean is_setup();
+    // Get the size needed to store the OT state
+    i64 state_size();
+    // Serialize OT state for persistent storage (returns empty if failed)
+    sequence<u8> assemble_state();
+    // Restore OT state from a buffer (call INSTEAD of setup, not after)
+    boolean disassemble_state(sequence<u8> data);
+    // COT operations - return true on success, false on error
+    boolean send_cot();
+    boolean recv_cot();
+    boolean send_rot();
+    boolean recv_rot();
     sequence<u8> get_block_data(u8 block_choice, u64 index);
     void set_block_data(u8 block_choice, u64 index, sequence<u8> data);
 };

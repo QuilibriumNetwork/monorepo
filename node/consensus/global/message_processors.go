@@ -265,6 +265,19 @@ func (e *GlobalConsensusEngine) handleFrameMessage(
 			return
 		}
 
+		valid, err := e.frameValidator.Validate(frame)
+		if err != nil {
+			e.logger.Debug("global frame validation error", zap.Error(err))
+			framesProcessedTotal.WithLabelValues("error").Inc()
+			return
+		}
+
+		if !valid {
+			framesProcessedTotal.WithLabelValues("error").Inc()
+			e.logger.Debug("invalid global frame")
+			return
+		}
+
 		if frame.Header != nil {
 			e.recordFrameMessageFrameNumber(frame.Header.FrameNumber)
 		}
@@ -282,7 +295,7 @@ func (e *GlobalConsensusEngine) handleFrameMessage(
 			return
 		}
 
-		frame, err := e.globalTimeReel.GetHead()
+		frame, err = e.globalTimeReel.GetHead()
 		if err == nil && frame != nil {
 			e.currentRank = frame.GetRank()
 		}
@@ -1708,10 +1721,8 @@ func (e *GlobalConsensusEngine) addCertifiedState(
 		return
 	}
 
-	if err := e.checkShardCoverage(parent.State.GetFrameNumber()); err != nil {
-		e.logger.Error("could not check shard coverage", zap.Error(err))
-		return
-	}
+	// Trigger coverage check asynchronously to avoid blocking message processing
+	e.triggerCoverageCheckAsync(parent.State.GetFrameNumber())
 }
 
 func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {

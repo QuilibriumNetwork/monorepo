@@ -325,11 +325,9 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		if e.currentRank < 14400 {
-			for _, r := range messageBundle.Requests {
-				if r.GetKick() != nil {
-					return tp2p.ValidationResultIgnore
-				}
+		for _, r := range messageBundle.Requests {
+			if r.GetKick() != nil {
+				return tp2p.ValidationResultIgnore
 			}
 		}
 		if err := messageBundle.Validate(); err != nil {
@@ -455,19 +453,6 @@ func (e *GlobalConsensusEngine) validateFrameMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		valid, err := e.frameValidator.Validate(frame)
-		if err != nil {
-			e.logger.Debug("global frame validation error", zap.Error(err))
-			frameValidationTotal.WithLabelValues("reject").Inc()
-			return tp2p.ValidationResultReject
-		}
-
-		if !valid {
-			frameValidationTotal.WithLabelValues("reject").Inc()
-			e.logger.Debug("invalid global frame")
-			return tp2p.ValidationResultReject
-		}
-
 		if e.currentRank > frame.GetRank()+2 {
 			frameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
@@ -519,8 +504,15 @@ func (e *GlobalConsensusEngine) validatePeerInfoMessage(
 
 		now := time.Now().UnixMilli()
 
+		if peerInfo.Timestamp < now-60000 {
+			e.logger.Debug("peer info timestamp too old, rejecting",
+				zap.Int64("peer_timestamp", peerInfo.Timestamp),
+			)
+			return tp2p.ValidationResultReject
+		}
+
 		if peerInfo.Timestamp < now-1000 {
-			e.logger.Debug("peer info timestamp too old",
+			e.logger.Debug("peer info timestamp too old, ignoring",
 				zap.Int64("peer_timestamp", peerInfo.Timestamp),
 			)
 			return tp2p.ValidationResultIgnore
@@ -546,6 +538,11 @@ func (e *GlobalConsensusEngine) validatePeerInfoMessage(
 		}
 
 		now := time.Now().UnixMilli()
+
+		if int64(keyRegistry.LastUpdated) < now-60000 {
+			e.logger.Debug("key registry timestamp too old, rejecting")
+			return tp2p.ValidationResultReject
+		}
 
 		if int64(keyRegistry.LastUpdated) < now-1000 {
 			e.logger.Debug("key registry timestamp too old")

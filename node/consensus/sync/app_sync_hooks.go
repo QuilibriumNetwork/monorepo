@@ -109,7 +109,13 @@ func (h *AppSyncHooks) ensureHyperSync(
 			"detected divergence between local hypergraph and frame roots, initiating hypersync",
 			zap.Uint64("frame_number", frame.Header.FrameNumber),
 		)
-		p.HyperSync(ctx, frame.Header.Prover, h.shardKey, frame.Header.Address)
+		// Pass the frame's vertex adds root as expectedRoot to sync against that
+		// specific snapshot.
+		var expectedRoot []byte
+		if len(frame.Header.StateRoots) > 0 {
+			expectedRoot = frame.Header.StateRoots[0]
+		}
+		p.HyperSync(ctx, frame.Header.Prover, h.shardKey, frame.Header.Address, expectedRoot)
 	}
 }
 

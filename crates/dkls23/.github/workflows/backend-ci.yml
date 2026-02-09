@@ -1,0 +1,37 @@
+name: Rust Test
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'src/**/*.rs'
+      - 'Cargo.toml'
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths:
+      - 'src/**/*.rs'
+      - 'Cargo.toml'
+
+jobs:
+  test:
+    name: Run cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          components: rustc, cargo, llvm-tools-preview
+      - name: Update packages
+        run: sudo apt-get update
+      - name: Install C compiler
+        run: sudo apt-get install lld lldb clang -y
+      - name: Configure to use LLVM linker
+        run: echo "[build]" >> ~/.cargo/config && echo "rustflags = [\"-C\", \"link-arg=-fuse-ld=lld\"]" >> ~/.cargo/config
+      - name: Run cargo test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --release

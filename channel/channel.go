@@ -75,8 +75,8 @@ func (d *DoubleRatchetEncryptedChannel) EstablishTwoPartyChannel(
 	}
 
 	state := NewDoubleRatchet(
-		sessionKey[:36],
-		sessionKey[36:64],
+		sessionKey[:32],
+		sessionKey[32:64],
 		sessionKey[64:],
 		isSender,
 		sendingSignedPrePrivateKey,
@@ -95,7 +95,10 @@ func (d *DoubleRatchetEncryptedChannel) EncryptTwoPartyMessage(
 		Message:      message, // buildutils:allow-slice-alias this assignment is ephemeral
 	}
 
-	result := DoubleRatchetEncrypt(stateAndMessage)
+	result, err := DoubleRatchetEncrypt(stateAndMessage)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "encrypt two party message")
+	}
 	envelope = &channel.P2PChannelEnvelope{}
 	err = json.Unmarshal([]byte(result.Envelope), envelope)
 	if err != nil {
@@ -120,7 +123,10 @@ func (d *DoubleRatchetEncryptedChannel) DecryptTwoPartyMessage(
 		Envelope:     string(envelopeJson),
 	}
 
-	result := DoubleRatchetDecrypt(stateAndEnvelope)
+	result, err := DoubleRatchetDecrypt(stateAndEnvelope)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "decrypt two party message")
+	}
 	return result.RatchetState, result.Message, nil
 }
 
@@ -162,45 +168,88 @@ func NewTripleRatchet(
 
 func DoubleRatchetEncrypt(
 	ratchetStateAndMessage generated.DoubleRatchetStateAndMessage,
-) generated.DoubleRatchetStateAndEnvelope {
-	return generated.DoubleRatchetEncrypt(ratchetStateAndMessage)
+) (generated.DoubleRatchetStateAndEnvelope, error) {
+	result, err := generated.DoubleRatchetEncrypt(ratchetStateAndMessage)
+	if err != nil {
+		return generated.DoubleRatchetStateAndEnvelope{}, err
+	}
+	return result, nil
 }
 
 func DoubleRatchetDecrypt(
 	ratchetStateAndEnvelope generated.DoubleRatchetStateAndEnvelope,
-) generated.DoubleRatchetStateAndMessage {
-	return generated.DoubleRatchetDecrypt(ratchetStateAndEnvelope)
+) (generated.DoubleRatchetStateAndMessage, error) {
+	result, err := generated.DoubleRatchetDecrypt(ratchetStateAndEnvelope)
+	if err != nil {
+		return generated.DoubleRatchetStateAndMessage{}, err
+	}
+	return result, nil
 }
 
 func TripleRatchetInitRound1(
 	ratchetStateAndMetadata generated.TripleRatchetStateAndMetadata,
 ) generated.TripleRatchetStateAndMetadata {
-	return generated.TripleRatchetInitRound1(ratchetStateAndMetadata)
+	result, err := generated.TripleRatchetInitRound1(ratchetStateAndMetadata)
+	if err != nil {
+		return generated.TripleRatchetStateAndMetadata{
+			Metadata: map[string]string{"error": err.Error()},
+		}
+	}
+	return result
 }
+
 func TripleRatchetInitRound2(
 	ratchetStateAndMetadata generated.TripleRatchetStateAndMetadata,
 ) generated.TripleRatchetStateAndMetadata {
-	return generated.TripleRatchetInitRound2(ratchetStateAndMetadata)
+	result, err := generated.TripleRatchetInitRound2(ratchetStateAndMetadata)
+	if err != nil {
+		return generated.TripleRatchetStateAndMetadata{
+			Metadata: map[string]string{"error": err.Error()},
+		}
+	}
+	return result
 }
+
 func TripleRatchetInitRound3(
 	ratchetStateAndMetadata generated.TripleRatchetStateAndMetadata,
 ) generated.TripleRatchetStateAndMetadata {
-	return generated.TripleRatchetInitRound3(ratchetStateAndMetadata)
+	result, err := generated.TripleRatchetInitRound3(ratchetStateAndMetadata)
+	if err != nil {
+		return generated.TripleRatchetStateAndMetadata{
+			Metadata: map[string]string{"error": err.Error()},
+		}
+	}
+	return result
 }
+
 func TripleRatchetInitRound4(
 	ratchetStateAndMetadata generated.TripleRatchetStateAndMetadata,
 ) generated.TripleRatchetStateAndMetadata {
-	return generated.TripleRatchetInitRound4(ratchetStateAndMetadata)
+	result, err := generated.TripleRatchetInitRound4(ratchetStateAndMetadata)
+	if err != nil {
+		return generated.TripleRatchetStateAndMetadata{
+			Metadata: map[string]string{"error": err.Error()},
+		}
+	}
+	return result
 }
 
 func TripleRatchetEncrypt(
 	ratchetStateAndMessage generated.TripleRatchetStateAndMessage,
 ) generated.TripleRatchetStateAndEnvelope {
-	return generated.TripleRatchetEncrypt(ratchetStateAndMessage)
+	result, err := generated.TripleRatchetEncrypt(ratchetStateAndMessage)
+	if err != nil {
+		return generated.TripleRatchetStateAndEnvelope{}
+	}
+	return result
 }
 
 func TripleRatchetDecrypt(
 	ratchetStateAndEnvelope generated.TripleRatchetStateAndEnvelope,
 ) generated.TripleRatchetStateAndMessage {
-	return generated.TripleRatchetDecrypt(ratchetStateAndEnvelope)
+	result, err := generated.TripleRatchetDecrypt(ratchetStateAndEnvelope)
+	if err != nil {
+		return generated.TripleRatchetStateAndMessage{}
+	}
+	return result
 }

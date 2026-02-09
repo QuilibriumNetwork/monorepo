@@ -21,7 +21,7 @@ var verencr = &mocks.MockVerifiableEncryptor{}
 
 func TestLazyVectorCommitmentTreesNoBLS(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true}, db, l, verencr, nil)
 	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 
@@ -52,7 +52,7 @@ func TestLazyVectorCommitmentTreesNoBLS(t *testing.T) {
 	}
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db = store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	tree = &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 
@@ -79,7 +79,7 @@ func TestLazyVectorCommitmentTreesNoBLS(t *testing.T) {
 	}
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db = store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	tree = &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 
@@ -109,7 +109,7 @@ func TestLazyVectorCommitmentTreesNoBLS(t *testing.T) {
 	}
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db = store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	tree = &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 
@@ -167,7 +167,7 @@ func TestLazyVectorCommitmentTreesNoBLS(t *testing.T) {
 	}
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db = store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	tree = &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 
@@ -181,7 +181,7 @@ func TestLazyVectorCommitmentTreesNoBLS(t *testing.T) {
 	tree.Delete(nil, []byte("key1"))
 
 	l, _ = zap.NewProduction()
-	db = store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db = store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s = store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	tree = &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 	cmptree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
@@ -312,7 +312,7 @@ func TestLazyVectorCommitmentTreesNoBLS(t *testing.T) {
 // increase the Size metadata
 func TestTreeLeafReadditionNoBLS(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 
@@ -368,7 +368,7 @@ func TestTreeLeafReadditionNoBLS(t *testing.T) {
 // decreases and increases the size metadata appropriately
 func TestTreeRemoveReaddLeafNoBLS(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 
@@ -437,7 +437,7 @@ func TestTreeRemoveReaddLeafNoBLS(t *testing.T) {
 // correct.
 func TestTreeLongestBranchNoBLS(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 
@@ -593,7 +593,7 @@ func TestTreeLongestBranchNoBLS(t *testing.T) {
 // where branch merging occurs during deletion.
 func TestTreeNoStaleNodesAfterDeleteNoBLS(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	shardKey := tries.ShardKey{}
 	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: shardKey}
@@ -710,7 +710,7 @@ func TestTreeNoStaleNodesAfterDeleteNoBLS(t *testing.T) {
 // This tests the FullPrefix update bug hypothesis.
 func TestTreeNoStaleNodesAfterBranchMergeNoBLS(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	shardKey := tries.ShardKey{}
 	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: shardKey}
@@ -807,7 +807,7 @@ func TestTreeNoStaleNodesAfterBranchMergeNoBLS(t *testing.T) {
 // TestTreeNoStaleNodesAfterMassDelete tests stale node detection with many keys
 func TestTreeNoStaleNodesAfterMassDeleteNoBLS(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	shardKey := tries.ShardKey{}
 	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: shardKey}
@@ -935,7 +935,7 @@ func countReachableNodes(t *testing.T, tree *tries.LazyVectorCommitmentTree) int
 // adding and removing leaves that cause branch creation due to shared prefixes.
 func TestTreeBranchStructureNoBLS(t *testing.T) {
 	l, _ := zap.NewProduction()
-	db := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	s := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, l, verencr, nil)
 	tree := &tries.LazyVectorCommitmentTree{Store: s, SetType: "vertex", PhaseType: "adds", ShardKey: tries.ShardKey{}}
 
@@ -966,7 +966,8 @@ func TestTreeBranchStructureNoBLS(t *testing.T) {
 		}
 	}
 
-	initialSize := tree.GetSize()
+	// Copy the size value to avoid aliasing (GetSize returns pointer to internal big.Int)
+	initialSize := new(big.Int).Set(tree.GetSize())
 
 	// Confirm initial state
 	if initialSize.Cmp(big.NewInt(3)) != 0 {

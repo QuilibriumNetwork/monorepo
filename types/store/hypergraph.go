@@ -50,6 +50,7 @@ type HypergraphStore interface {
 		node tries.LazyVectorCommitmentNode,
 	) error
 	SaveRoot(
+		txn tries.TreeBackingStoreTransaction,
 		setType string,
 		phaseType string,
 		shardKey tries.ShardKey,
@@ -113,4 +114,28 @@ type HypergraphStore interface {
 	) ([]byte, error)
 	GetRootCommits(frameNumber uint64) (map[tries.ShardKey][][]byte, error)
 	ApplySnapshot(dbPath string) error
+	// SetAltShardCommit stores the four roots for an alt shard at a given frame
+	// number and updates the latest index if this is the newest frame.
+	SetAltShardCommit(
+		txn tries.TreeBackingStoreTransaction,
+		frameNumber uint64,
+		shardAddress []byte,
+		vertexAddsRoot []byte,
+		vertexRemovesRoot []byte,
+		hyperedgeAddsRoot []byte,
+		hyperedgeRemovesRoot []byte,
+	) error
+	// GetLatestAltShardCommit retrieves the most recent roots for an alt shard.
+	GetLatestAltShardCommit(
+		shardAddress []byte,
+	) (
+		vertexAddsRoot []byte,
+		vertexRemovesRoot []byte,
+		hyperedgeAddsRoot []byte,
+		hyperedgeRemovesRoot []byte,
+		err error,
+	)
+	// RangeAltShardAddresses returns all alt shard addresses that have stored
+	// commits.
+	RangeAltShardAddresses() ([][]byte, error)
 }

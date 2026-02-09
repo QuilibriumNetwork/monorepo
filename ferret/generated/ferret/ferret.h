@@ -378,6 +378,116 @@ static void call_UniffiForeignFutureCompleteVoid(
 
 
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_CLONE_BUFFERIOMANAGER
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_CLONE_BUFFERIOMANAGER
+void* uniffi_ferret_fn_clone_bufferiomanager(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FREE_BUFFERIOMANAGER
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FREE_BUFFERIOMANAGER
+void uniffi_ferret_fn_free_bufferiomanager(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_CLEAR
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_CLEAR
+void uniffi_ferret_fn_method_bufferiomanager_clear(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_DRAIN_SEND
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_DRAIN_SEND
+RustBuffer uniffi_ferret_fn_method_bufferiomanager_drain_send(void* ptr, uint64_t max_len, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_FILL_RECV
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_FILL_RECV
+int8_t uniffi_ferret_fn_method_bufferiomanager_fill_recv(void* ptr, RustBuffer data, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_RECV_AVAILABLE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_RECV_AVAILABLE
+uint64_t uniffi_ferret_fn_method_bufferiomanager_recv_available(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_SEND_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_SEND_SIZE
+uint64_t uniffi_ferret_fn_method_bufferiomanager_send_size(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_SET_ERROR
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_SET_ERROR
+void uniffi_ferret_fn_method_bufferiomanager_set_error(void* ptr, RustBuffer message, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_SET_TIMEOUT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_BUFFERIOMANAGER_SET_TIMEOUT
+void uniffi_ferret_fn_method_bufferiomanager_set_timeout(void* ptr, int64_t timeout_ms, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_CLONE_FERRETCOTBUFFERMANAGER
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_CLONE_FERRETCOTBUFFERMANAGER
+void* uniffi_ferret_fn_clone_ferretcotbuffermanager(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FREE_FERRETCOTBUFFERMANAGER
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FREE_FERRETCOTBUFFERMANAGER
+void uniffi_ferret_fn_free_ferretcotbuffermanager(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_ASSEMBLE_STATE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_ASSEMBLE_STATE
+RustBuffer uniffi_ferret_fn_method_ferretcotbuffermanager_assemble_state(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_DISASSEMBLE_STATE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_DISASSEMBLE_STATE
+int8_t uniffi_ferret_fn_method_ferretcotbuffermanager_disassemble_state(void* ptr, RustBuffer data, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_GET_BLOCK_DATA
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_GET_BLOCK_DATA
+RustBuffer uniffi_ferret_fn_method_ferretcotbuffermanager_get_block_data(void* ptr, uint8_t block_choice, uint64_t index, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_IS_SETUP
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_IS_SETUP
+int8_t uniffi_ferret_fn_method_ferretcotbuffermanager_is_setup(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_RECV_COT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_RECV_COT
+int8_t uniffi_ferret_fn_method_ferretcotbuffermanager_recv_cot(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_RECV_ROT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_RECV_ROT
+int8_t uniffi_ferret_fn_method_ferretcotbuffermanager_recv_rot(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_SEND_COT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_SEND_COT
+int8_t uniffi_ferret_fn_method_ferretcotbuffermanager_send_cot(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_SEND_ROT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_SEND_ROT
+int8_t uniffi_ferret_fn_method_ferretcotbuffermanager_send_rot(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_SET_BLOCK_DATA
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_SET_BLOCK_DATA
+void uniffi_ferret_fn_method_ferretcotbuffermanager_set_block_data(void* ptr, uint8_t block_choice, uint64_t index, RustBuffer data, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_SETUP
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_SETUP
+int8_t uniffi_ferret_fn_method_ferretcotbuffermanager_setup(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_STATE_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_METHOD_FERRETCOTBUFFERMANAGER_STATE_SIZE
+int64_t uniffi_ferret_fn_method_ferretcotbuffermanager_state_size(void* ptr, RustCallStatus *out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_CLONE_FERRETCOTMANAGER
 #define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_CLONE_FERRETCOTMANAGER
 void* uniffi_ferret_fn_clone_ferretcotmanager(void* ptr, RustCallStatus *out_status
@@ -426,6 +536,16 @@ void* uniffi_ferret_fn_clone_netiomanager(void* ptr, RustCallStatus *out_status
 #ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FREE_NETIOMANAGER
 #define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FREE_NETIOMANAGER
 void uniffi_ferret_fn_free_netiomanager(void* ptr, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FUNC_CREATE_BUFFER_IO_MANAGER
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FUNC_CREATE_BUFFER_IO_MANAGER
+void* uniffi_ferret_fn_func_create_buffer_io_manager(int64_t initial_cap, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FUNC_CREATE_FERRET_COT_BUFFER_MANAGER
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FUNC_CREATE_FERRET_COT_BUFFER_MANAGER
+void* uniffi_ferret_fn_func_create_ferret_cot_buffer_manager(int32_t party, int32_t threads, uint64_t length, RustBuffer choices, void* bufferio, int8_t malicious, RustCallStatus *out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_FN_FUNC_CREATE_FERRET_COT_MANAGER
@@ -718,6 +838,18 @@ void ffi_ferret_rust_future_free_void(uint64_t handle
 void ffi_ferret_rust_future_complete_void(uint64_t handle, RustCallStatus *out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_FUNC_CREATE_BUFFER_IO_MANAGER
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_FUNC_CREATE_BUFFER_IO_MANAGER
+uint16_t uniffi_ferret_checksum_func_create_buffer_io_manager(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_FUNC_CREATE_FERRET_COT_BUFFER_MANAGER
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_FUNC_CREATE_FERRET_COT_BUFFER_MANAGER
+uint16_t uniffi_ferret_checksum_func_create_ferret_cot_buffer_manager(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_FUNC_CREATE_FERRET_COT_MANAGER
 #define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_FUNC_CREATE_FERRET_COT_MANAGER
 uint16_t uniffi_ferret_checksum_func_create_ferret_cot_manager(void
@@ -727,6 +859,114 @@ uint16_t uniffi_ferret_checksum_func_create_ferret_cot_manager(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_FUNC_CREATE_NETIO_MANAGER
 #define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_FUNC_CREATE_NETIO_MANAGER
 uint16_t uniffi_ferret_checksum_func_create_netio_manager(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_CLEAR
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_CLEAR
+uint16_t uniffi_ferret_checksum_method_bufferiomanager_clear(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_DRAIN_SEND
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_DRAIN_SEND
+uint16_t uniffi_ferret_checksum_method_bufferiomanager_drain_send(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_FILL_RECV
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_FILL_RECV
+uint16_t uniffi_ferret_checksum_method_bufferiomanager_fill_recv(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_RECV_AVAILABLE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_RECV_AVAILABLE
+uint16_t uniffi_ferret_checksum_method_bufferiomanager_recv_available(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_SEND_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_SEND_SIZE
+uint16_t uniffi_ferret_checksum_method_bufferiomanager_send_size(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_SET_ERROR
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_SET_ERROR
+uint16_t uniffi_ferret_checksum_method_bufferiomanager_set_error(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_SET_TIMEOUT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_BUFFERIOMANAGER_SET_TIMEOUT
+uint16_t uniffi_ferret_checksum_method_bufferiomanager_set_timeout(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_ASSEMBLE_STATE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_ASSEMBLE_STATE
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_assemble_state(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_DISASSEMBLE_STATE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_DISASSEMBLE_STATE
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_disassemble_state(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_GET_BLOCK_DATA
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_GET_BLOCK_DATA
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_get_block_data(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_IS_SETUP
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_IS_SETUP
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_is_setup(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_RECV_COT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_RECV_COT
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_recv_cot(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_RECV_ROT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_RECV_ROT
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_recv_rot(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_SEND_COT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_SEND_COT
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_send_cot(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_SEND_ROT
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_SEND_ROT
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_send_rot(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_SET_BLOCK_DATA
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_SET_BLOCK_DATA
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_set_block_data(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_SETUP
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_SETUP
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_setup(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_STATE_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_FERRET_CHECKSUM_METHOD_FERRETCOTBUFFERMANAGER_STATE_SIZE
+uint16_t uniffi_ferret_checksum_method_ferretcotbuffermanager_state_size(void
     
 );
 #endif

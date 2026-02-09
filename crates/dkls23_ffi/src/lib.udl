@@ -1,0 +1,296 @@
+// Elliptic curve selection for DKLs23 protocol
+enum EllipticCurve {
+    "Secp256k1",
+    "P256",
+};
+
+namespace dkls23_ffi {
+    // Initialization
+    void init();
+
+    // ============================================
+    // Distributed Key Generation (DKG)
+    // ============================================
+
+    // Initialize a new DKG session with a random session ID
+    // Note: For actual multi-party DKG, use dkg_init_with_session_id instead
+    DkgInitResult dkg_init(u32 party_id, u32 threshold, u32 total_parties, EllipticCurve curve);
+
+    // Initialize a new DKG session with a shared session ID
+    // All parties must use the same session_id for DKG to succeed
+    DkgInitResult dkg_init_with_session_id(u32 party_id, u32 threshold, u32 total_parties, [ByRef] sequence<u8> session_id, EllipticCurve curve);
+
+    // Process DKG round 1: generate and return broadcast message
+    DkgRoundResult dkg_round1([ByRef] sequence<u8> session_state);
+
+    // Process DKG round 2: process received messages, generate response
+    DkgRoundResult dkg_round2(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // Process DKG round 3: finalize key generation
+    DkgRoundResult dkg_round3(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // Finalize DKG and extract key share
+    DkgFinalResult dkg_finalize(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // ============================================
+    // Threshold Signing
+    // ============================================
+
+    // Initialize a signing session
+    SignInitResult sign_init(
+        [ByRef] sequence<u8> key_share,
+        [ByRef] sequence<u8> message_hash,
+        [ByRef] sequence<u32> signer_party_ids
+    );
+
+    // Initialize a signing session with a shared sign ID
+    // All parties must use the same sign_id for a signing session to work
+    SignInitResult sign_init_with_sign_id(
+        [ByRef] sequence<u8> key_share,
+        [ByRef] sequence<u8> message_hash,
+        [ByRef] sequence<u32> signer_party_ids,
+        [ByRef] sequence<u8> sign_id
+    );
+
+    // Process signing round 1
+    SignRoundResult sign_round1([ByRef] sequence<u8> session_state);
+
+    // Process signing round 2
+    SignRoundResult sign_round2(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // Process signing round 3 (produces broadcasts)
+    SignRoundResult sign_round3(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // Finalize signing (collects broadcasts, produces signature)
+    SignFinalResult sign_finalize(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // ============================================
+    // Key Refresh (same threshold, new shares)
+    // ============================================
+
+    // Initialize a refresh session
+    RefreshInitResult refresh_init(
+        [ByRef] sequence<u8> key_share,
+        u32 party_id
+    );
+
+    // Initialize a refresh session with a shared refresh ID
+    // All parties must use the same refresh_id for a refresh session to work
+    RefreshInitResult refresh_init_with_refresh_id(
+        [ByRef] sequence<u8> key_share,
+        u32 party_id,
+        [ByRef] sequence<u8> refresh_id
+    );
+
+    // Process refresh round 1 (phase 1: generate polynomial fragments)
+    RefreshRoundResult refresh_round1([ByRef] sequence<u8> session_state);
+
+    // Process refresh round 2 (phase 2: process fragments, generate proofs)
+    RefreshRoundResult refresh_round2(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // Process refresh round 3 (phase 3: process transmits)
+    RefreshRoundResult refresh_round3(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // Finalize refresh (phase 4: verify and produce new key share)
+    RefreshFinalResult refresh_finalize(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // ============================================
+    // Key Resize (change threshold or party count)
+    // ============================================
+
+    // Initialize a resize session
+    ResizeInitResult resize_init(
+        [ByRef] sequence<u8> key_share,
+        u32 party_id,
+        u32 new_threshold,
+        u32 new_total_parties,
+        [ByRef] sequence<u32> new_party_ids,
+        EllipticCurve curve
+    );
+
+    // Process resize round 1
+    ResizeRoundResult resize_round1([ByRef] sequence<u8> session_state);
+
+    // Process resize round 2 and finalize
+    ResizeFinalResult resize_round2(
+        [ByRef] sequence<u8> session_state,
+        [ByRef] sequence<PartyMessage> received_messages
+    );
+
+    // ============================================
+    // Utility Functions
+    // ============================================
+
+    // Convert a full secret key to threshold shares (for migration)
+    RekeyResult rekey_from_secret(
+        [ByRef] sequence<u8> secret_key,
+        u32 threshold,
+        u32 total_parties,
+        EllipticCurve curve
+    );
+
+    // Derive a child key share using BIP-32 path
+    DeriveResult derive_child_share(
+        [ByRef] sequence<u8> key_share,
+        [ByRef] sequence<u32> derivation_path
+    );
+
+    // Get public key from key share
+    sequence<u8> get_public_key([ByRef] sequence<u8> key_share);
+
+    // Validate a key share structure
+    boolean validate_key_share([ByRef] sequence<u8> key_share);
+};
+
+// ============================================
+// Data Types
+// ============================================
+
+// Message exchanged between parties
+dictionary PartyMessage {
+    u32 from_party;
+    u32 to_party;
+    sequence<u8> data;
+};
+
+// DKG initialization result
+dictionary DkgInitResult {
+    sequence<u8> session_state;
+    boolean success;
+    string? error_message;
+};
+
+// DKG round result (intermediate rounds)
+dictionary DkgRoundResult {
+    sequence<u8> session_state;
+    sequence<PartyMessage> messages_to_send;
+    boolean is_complete;
+    boolean success;
+    string? error_message;
+};
+
+// DKG final result
+dictionary DkgFinalResult {
+    sequence<u8> key_share;
+    sequence<u8> public_key;
+    u32 party_id;
+    u32 threshold;
+    u32 total_parties;
+    boolean success;
+    string? error_message;
+};
+
+// Sign initialization result
+dictionary SignInitResult {
+    sequence<u8> session_state;
+    boolean success;
+    string? error_message;
+};
+
+// Sign round result
+dictionary SignRoundResult {
+    sequence<u8> session_state;
+    sequence<PartyMessage> messages_to_send;
+    boolean is_complete;
+    boolean success;
+    string? error_message;
+};
+
+// Sign final result
+dictionary SignFinalResult {
+    sequence<u8> signature;
+    boolean success;
+    string? error_message;
+};
+
+// Refresh initialization result
+dictionary RefreshInitResult {
+    sequence<u8> session_state;
+    boolean success;
+    string? error_message;
+};
+
+// Refresh round result
+dictionary RefreshRoundResult {
+    sequence<u8> session_state;
+    sequence<PartyMessage> messages_to_send;
+    boolean is_complete;
+    boolean success;
+    string? error_message;
+};
+
+// Refresh final result
+dictionary RefreshFinalResult {
+    sequence<u8> new_key_share;
+    u32 generation;
+    boolean success;
+    string? error_message;
+};
+
+// Resize initialization result
+dictionary ResizeInitResult {
+    sequence<u8> session_state;
+    boolean success;
+    string? error_message;
+};
+
+// Resize round result
+dictionary ResizeRoundResult {
+    sequence<u8> session_state;
+    sequence<PartyMessage> messages_to_send;
+    boolean is_complete;
+    boolean success;
+    string? error_message;
+};
+
+// Resize final result
+dictionary ResizeFinalResult {
+    sequence<u8> new_key_share;
+    u32 new_threshold;
+    u32 new_total_parties;
+    boolean success;
+    string? error_message;
+};
+
+// Rekey result (converting full key to shares)
+dictionary RekeyResult {
+    sequence<sequence<u8>> key_shares;
+    sequence<u8> public_key;
+    boolean success;
+    string? error_message;
+};
+
+// Key derivation result
+dictionary DeriveResult {
+    sequence<u8> derived_key_share;
+    sequence<u8> derived_public_key;
+    boolean success;
+    string? error_message;
+};

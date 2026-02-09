@@ -46,10 +46,10 @@ import (
 
 // Injectors from wire.go:
 
-func NewDHTNode(logger *zap.Logger, configConfig *config.Config, uint2 uint) (*DHTNode, error) {
+func NewDHTNode(logger *zap.Logger, configConfig *config.Config, uint2 uint, configDir p2p.ConfigDir) (*DHTNode, error) {
 	p2PConfig := configConfig.P2P
 	engineConfig := configConfig.Engine
-	blossomSub := p2p.NewBlossomSub(p2PConfig, engineConfig, logger, uint2)
+	blossomSub := p2p.NewBlossomSub(p2PConfig, engineConfig, logger, uint2, configDir)
 	dhtNode, err := newDHTNode(blossomSub)
 	if err != nil {
 		return nil, err
@@ -66,15 +66,13 @@ func NewDBConsole(configConfig *config.Config) (*DBConsole, error) {
 }
 
 func NewClockStore(logger *zap.Logger, configConfig *config.Config, uint2 uint) (store.ClockStore, error) {
-	dbConfig := configConfig.DB
-	pebbleDB := store2.NewPebbleDB(logger, dbConfig, uint2)
+	pebbleDB := store2.NewPebbleDB(logger, configConfig, uint2)
 	pebbleClockStore := store2.NewPebbleClockStore(pebbleDB, logger)
 	return pebbleClockStore, nil
 }
 
-func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config, coreId uint, rpcMultiaddr string, parentProcess int) (*DataWorkerNode, error) {
-	dbConfig := config2.DB
-	pebbleDB := store2.NewPebbleDB(logger, dbConfig, coreId)
+func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config, coreId uint, rpcMultiaddr string, parentProcess int, configDir p2p.ConfigDir) (*DataWorkerNode, error) {
+	pebbleDB := store2.NewPebbleDB(logger, config2, coreId)
 	pebbleDataProofStore := store2.NewPebbleDataProofStore(pebbleDB, logger)
 	pebbleClockStore := store2.NewPebbleClockStore(pebbleDB, logger)
 	pebbleTokenStore := store2.NewPebbleTokenStore(pebbleDB, logger)
@@ -88,6 +86,7 @@ func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config
 	if err != nil {
 		return nil, err
 	}
+	dbConfig := config2.DB
 	mpCitHVerifiableEncryptor := newVerifiableEncryptor()
 	kzgInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	pebbleHypergraphStore := store2.NewPebbleHypergraphStore(dbConfig, pebbleDB, logger, mpCitHVerifiableEncryptor, kzgInclusionProver)
@@ -132,9 +131,8 @@ func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config
 	return dataWorkerNode, nil
 }
 
-func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Config, coreId uint, rpcMultiaddr string, parentProcess int) (*DataWorkerNode, error) {
-	dbConfig := config2.DB
-	pebbleDB := store2.NewPebbleDB(logger, dbConfig, coreId)
+func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Config, coreId uint, rpcMultiaddr string, parentProcess int, configDir p2p.ConfigDir) (*DataWorkerNode, error) {
+	pebbleDB := store2.NewPebbleDB(logger, config2, coreId)
 	pebbleDataProofStore := store2.NewPebbleDataProofStore(pebbleDB, logger)
 	pebbleClockStore := store2.NewPebbleClockStore(pebbleDB, logger)
 	pebbleTokenStore := store2.NewPebbleTokenStore(pebbleDB, logger)
@@ -148,6 +146,7 @@ func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Con
 	if err != nil {
 		return nil, err
 	}
+	dbConfig := config2.DB
 	mpCitHVerifiableEncryptor := newVerifiableEncryptor()
 	kzgInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	pebbleHypergraphStore := store2.NewPebbleHypergraphStore(dbConfig, pebbleDB, logger, mpCitHVerifiableEncryptor, kzgInclusionProver)
@@ -161,7 +160,7 @@ func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Con
 	}
 	p2PConfig := config2.P2P
 	engineConfig := config2.Engine
-	blossomSub := p2p.NewBlossomSub(p2PConfig, engineConfig, logger, coreId)
+	blossomSub := p2p.NewBlossomSub(p2PConfig, engineConfig, logger, coreId, configDir)
 	pebbleInboxStore := store2.NewPebbleInboxStore(pebbleDB, logger)
 	pebbleShardsStore := store2.NewPebbleShardsStore(pebbleDB, logger)
 	pebbleConsensusStore := store2.NewPebbleConsensusStore(pebbleDB, logger)
@@ -189,9 +188,8 @@ func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Con
 	return dataWorkerNode, nil
 }
 
-func NewMasterNode(logger *zap.Logger, config2 *config.Config, coreId uint) (*MasterNode, error) {
-	dbConfig := config2.DB
-	pebbleDB := store2.NewPebbleDB(logger, dbConfig, coreId)
+func NewMasterNode(logger *zap.Logger, config2 *config.Config, coreId uint, configDir p2p.ConfigDir) (*MasterNode, error) {
+	pebbleDB := store2.NewPebbleDB(logger, config2, coreId)
 	pebbleDataProofStore := store2.NewPebbleDataProofStore(pebbleDB, logger)
 	pebbleClockStore := store2.NewPebbleClockStore(pebbleDB, logger)
 	pebbleTokenStore := store2.NewPebbleTokenStore(pebbleDB, logger)
@@ -200,8 +198,9 @@ func NewMasterNode(logger *zap.Logger, config2 *config.Config, coreId uint) (*Ma
 	fileKeyManager := keys.NewFileKeyManager(config2, bls48581KeyConstructor, decaf448KeyConstructor, logger)
 	p2PConfig := config2.P2P
 	engineConfig := config2.Engine
-	blossomSub := p2p.NewBlossomSub(p2PConfig, engineConfig, logger, coreId)
+	blossomSub := p2p.NewBlossomSub(p2PConfig, engineConfig, logger, coreId, configDir)
 	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(logger)
+	dbConfig := config2.DB
 	mpCitHVerifiableEncryptor := newVerifiableEncryptor()
 	kzgInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	pebbleHypergraphStore := store2.NewPebbleHypergraphStore(dbConfig, pebbleDB, logger, mpCitHVerifiableEncryptor, kzgInclusionProver)
@@ -301,10 +300,10 @@ var engineSet = wire.NewSet(vdf.NewCachedWesolowskiFrameProver, bls48581.NewKZGI
 ),
 )
 
-func provideHypergraph(store3 *store2.PebbleHypergraphStore, config *config.Config,
+func provideHypergraph(store3 *store2.PebbleHypergraphStore, config2 *config.Config,
 ) (hypergraph.Hypergraph, error) {
 	workers := 1
-	if config.Engine.ArchiveMode {
+	if config2.Engine.ArchiveMode {
 		workers = 100
 	}
 	return store3.LoadHypergraph(&tests.Nopthenticator{}, workers)
@@ -343,18 +342,21 @@ func NewDataWorkerNode(
 	coreId uint,
 	rpcMultiaddr string,
 	parentProcess int,
+	configDir p2p.ConfigDir,
 ) (*DataWorkerNode, error) {
 	if config2.Engine.EnableMasterProxy {
 		return NewDataWorkerNodeWithProxyPubsub(
 			logger, config2, coreId,
 			rpcMultiaddr,
 			parentProcess,
+			configDir,
 		)
 	} else {
 		return NewDataWorkerNodeWithoutProxyPubsub(
 			logger, config2, coreId,
 			rpcMultiaddr,
 			parentProcess,
+			configDir,
 		)
 	}
 }

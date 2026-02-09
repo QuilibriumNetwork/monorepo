@@ -100,6 +100,14 @@ func (hg *HypergraphCRDT) publishSnapshot(root []byte) {
 	hg.snapshotMgr.publish(root)
 }
 
+// PublishSnapshot announces a new snapshot generation with the given commit root.
+// This should be called after Commit() to make the new state available for sync.
+// Clients can request sync against this root using the expectedRoot parameter.
+// The snapshot manager retains a limited number of historical generations.
+func (hg *HypergraphCRDT) PublishSnapshot(root []byte) {
+	hg.publishSnapshot(root)
+}
+
 func (hg *HypergraphCRDT) cloneSetWithStore(
 	set hypergraph.IdSet,
 	store tries.TreeBackingStore,
@@ -112,6 +120,14 @@ func (hg *HypergraphCRDT) cloneSetWithStore(
 		return typed.cloneWithStore(store)
 	}
 	return set
+}
+
+// SetSelfPeerID sets the self peer ID on the sync controller. Sessions from
+// this peer ID are allowed unlimited concurrency (for workers syncing to master).
+func (hg *HypergraphCRDT) SetSelfPeerID(peerID string) {
+	if hg.syncController != nil {
+		hg.syncController.SetSelfPeerID(peerID)
+	}
 }
 
 func (hg *HypergraphCRDT) SetShutdownContext(ctx context.Context) {
@@ -155,15 +171,27 @@ func (hg *HypergraphCRDT) snapshotSet(
 	hg.setsMu.RUnlock()
 
 	if set == nil {
+		// Try to load root from snapshot store since set doesn't exist in memory
+		var root tries.LazyVectorCommitmentNode
+		if targetStore != nil {
+			root, _ = targetStore.GetNodeByPath(
+				string(atomType),
+				string(phaseType),
+				shardKey,
+				[]int{}, // empty path = root
+			)
+		}
 		set = NewIdSet(
 			atomType,
 			phaseType,
 			shardKey,
-			hg.store,
+			targetStore, // Use target store directly since set is new
 			hg.prover,
-			nil,
+			root,
 			hg.getCoveredPrefix(),
 		)
+		// Return directly - no need to clone since we already used targetStore
+		return set
 	}
 
 	return hg.cloneSetWithStore(set, targetStore)
@@ -366,12 +394,12 @@ func (hg *HypergraphCRDT) GetSize(
 		p, _ := vrs.GetTree().GetByPath(path)
 
 		if p != nil {
-			sum = sum.Add(sum, o.GetSize())
+			sum = sum.Add(sum, p.GetSize())
 		}
 
 		q, _ := hrs.GetTree().GetByPath(path)
 		if q != nil {
-			sum = sum.Add(sum, o.GetSize())
+			sum = sum.Add(sum, q.GetSize())
 		}
 
 		return sum

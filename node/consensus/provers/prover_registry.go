@@ -146,7 +146,7 @@ func (r *ProverRegistry) GetProverInfo(
 	)
 
 	if info, exists := r.proverCache[string(address)]; exists {
-		return info, nil
+		return copyProverInfo(info), nil
 	}
 
 	r.logger.Debug(
@@ -154,6 +154,49 @@ func (r *ProverRegistry) GetProverInfo(
 		zap.String("address", fmt.Sprintf("%x", address)),
 	)
 	return nil, nil
+}
+
+// copyProverInfo returns a deep copy of a ProverInfo to avoid callers
+// holding mutable references into the proverCache.
+func copyProverInfo(info *consensus.ProverInfo) *consensus.ProverInfo {
+	if info == nil {
+		return nil
+	}
+	cp := &consensus.ProverInfo{
+		PublicKey:         make([]byte, len(info.PublicKey)),
+		Address:           make([]byte, len(info.Address)),
+		Status:            info.Status,
+		KickFrameNumber:   info.KickFrameNumber,
+		AvailableStorage:  info.AvailableStorage,
+		Seniority:         info.Seniority,
+		DelegateAddress:   make([]byte, len(info.DelegateAddress)),
+		Allocations:       make([]consensus.ProverAllocationInfo, len(info.Allocations)),
+	}
+	copy(cp.PublicKey, info.PublicKey)
+	copy(cp.Address, info.Address)
+	copy(cp.DelegateAddress, info.DelegateAddress)
+	for i, a := range info.Allocations {
+		cp.Allocations[i] = consensus.ProverAllocationInfo{
+			Status:                  a.Status,
+			ConfirmationFilter:      make([]byte, len(a.ConfirmationFilter)),
+			RejectionFilter:         make([]byte, len(a.RejectionFilter)),
+			JoinFrameNumber:         a.JoinFrameNumber,
+			LeaveFrameNumber:        a.LeaveFrameNumber,
+			PauseFrameNumber:        a.PauseFrameNumber,
+			ResumeFrameNumber:       a.ResumeFrameNumber,
+			KickFrameNumber:         a.KickFrameNumber,
+			JoinConfirmFrameNumber:  a.JoinConfirmFrameNumber,
+			JoinRejectFrameNumber:   a.JoinRejectFrameNumber,
+			LeaveConfirmFrameNumber: a.LeaveConfirmFrameNumber,
+			LeaveRejectFrameNumber:  a.LeaveRejectFrameNumber,
+			LastActiveFrameNumber:   a.LastActiveFrameNumber,
+			VertexAddress:           make([]byte, len(a.VertexAddress)),
+		}
+		copy(cp.Allocations[i].ConfirmationFilter, a.ConfirmationFilter)
+		copy(cp.Allocations[i].RejectionFilter, a.RejectionFilter)
+		copy(cp.Allocations[i].VertexAddress, a.VertexAddress)
+	}
+	return cp
 }
 
 // GetNextProver implements ProverRegistry
@@ -405,113 +448,9 @@ func (r *ProverRegistry) UpdateProverActivity(
 
 // PruneOrphanJoins implements ProverRegistry
 func (r *ProverRegistry) PruneOrphanJoins(frameNumber uint64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if frameNumber <= 760 {
-		return nil
-	}
-
-	cutoff := frameNumber - 760
-	var prunedAllocations int
-	var prunedProvers int
-
-	shardKey := tries.ShardKey{
-		L1: [3]byte{0x00, 0x00, 0x00},
-		L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
-	}
-
-	txn, err := r.hypergraph.NewTransaction(false)
-	if err != nil {
-		return errors.Wrap(err, "prune orphan joins")
-	}
-
-	// Track provers to remove from cache after pruning
-	proversToRemove := []string{}
-
-	r.logger.Debug(
-		"starting prune orphan joins scan",
-		zap.Uint64("frame_number", frameNumber),
-		zap.Uint64("cutoff", cutoff),
-		zap.Int("prover_cache_size", len(r.proverCache)),
-	)
-
-	for addr, info := range r.proverCache {
-		if info == nil || len(info.Allocations) == 0 {
-			continue
-		}
-
-		updated := info.Allocations[:0]
-		var removedFilters map[string]struct{}
-
-		for _, allocation := range info.Allocations {
-			// Log each allocation being evaluated
-			r.logger.Debug(
-				"evaluating allocation for prune",
-				zap.String("prover_address", hex.EncodeToString(info.Address)),
-				zap.Int("status", int(allocation.Status)),
-				zap.Uint64("join_frame", allocation.JoinFrameNumber),
-				zap.Uint64("cutoff", cutoff),
-				zap.Bool("is_joining", allocation.Status == consensus.ProverStatusJoining),
-				zap.Bool("is_rejected", allocation.Status == consensus.ProverStatusRejected),
-				zap.Bool("is_old_enough", allocation.JoinFrameNumber < cutoff),
-			)
-
-			if (allocation.Status == consensus.ProverStatusJoining ||
-				allocation.Status == consensus.ProverStatusRejected) &&
-				allocation.JoinFrameNumber < cutoff {
-				if err := r.pruneAllocationVertex(txn, info, allocation); err != nil {
-					txn.Abort()
-					return errors.Wrap(err, "prune orphan joins")
-				}
-
-				if removedFilters == nil {
-					removedFilters = make(map[string]struct{})
-				}
-				removedFilters[string(allocation.ConfirmationFilter)] = struct{}{}
-				prunedAllocations++
-				continue
-			}
-
-			updated = append(updated, allocation)
-		}
-
-		if len(updated) != len(info.Allocations) {
-			info.Allocations = updated
-			r.cleanupFilterCache(info, removedFilters)
-
-			// If no allocations remain, prune the prover record as well
-			if len(updated) == 0 {
-				if err := r.pruneProverRecord(txn, shardKey, info); err != nil {
-					txn.Abort()
-					return errors.Wrap(err, "prune orphan joins")
-				}
-				proversToRemove = append(proversToRemove, addr)
-				prunedProvers++
-			}
-		}
-	}
-
-	// Remove pruned provers from cache
-	for _, addr := range proversToRemove {
-		delete(r.proverCache, addr)
-	}
-
-	if prunedAllocations > 0 || prunedProvers > 0 {
-		if err := txn.Commit(); err != nil {
-			return errors.Wrap(err, "prune orphan joins")
-		}
-
-		r.logger.Info(
-			"pruned orphan prover allocations",
-			zap.Int("allocations_pruned", prunedAllocations),
-			zap.Int("provers_pruned", prunedProvers),
-			zap.Uint64("frame_cutoff", cutoff),
-		)
-	} else {
-		txn.Abort()
-	}
-
+	// Pruning is disabled — it was causing tree divergence between nodes
+	// because non-deterministic pruning timing led to different tree states,
+	// preventing sync convergence.
 	return nil
 }
 
@@ -523,31 +462,37 @@ func (r *ProverRegistry) pruneAllocationVertex(
 	if info == nil {
 		return errors.New("missing info")
 	}
-	if len(info.PublicKey) == 0 {
-		r.logger.Warn(
-			"unable to prune allocation without public key",
-			zap.String("address", hex.EncodeToString(info.Address)),
-		)
-		return errors.New("invalid record")
-	}
-
-	allocationHash, err := poseidon.HashBytes(
-		slices.Concat(
-			[]byte("PROVER_ALLOCATION"),
-			info.PublicKey,
-			allocation.ConfirmationFilter,
-		),
-	)
-	if err != nil {
-		return errors.Wrap(err, "prune allocation hash")
-	}
 
 	var vertexID [64]byte
 	copy(vertexID[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-	copy(
-		vertexID[32:],
-		allocationHash.FillBytes(make([]byte, 32)),
-	)
+
+	// Use pre-computed VertexAddress if available, otherwise derive from public
+	// key
+	if len(allocation.VertexAddress) == 32 {
+		copy(vertexID[32:], allocation.VertexAddress)
+	} else if len(info.PublicKey) == 0 {
+		r.logger.Warn(
+			"unable to prune allocation without vertex address or public key",
+			zap.String("address", hex.EncodeToString(info.Address)),
+		)
+		return nil
+	} else {
+		// Fallback: derive vertex address from public key (legacy path)
+		allocationHash, err := poseidon.HashBytes(
+			slices.Concat(
+				[]byte("PROVER_ALLOCATION"),
+				info.PublicKey,
+				allocation.ConfirmationFilter,
+			),
+		)
+		if err != nil {
+			return errors.Wrap(err, "prune allocation hash")
+		}
+		copy(
+			vertexID[32:],
+			allocationHash.FillBytes(make([]byte, 32)),
+		)
+	}
 
 	shardKey := tries.ShardKey{
 		L1: [3]byte{0x00, 0x00, 0x00},
@@ -908,6 +853,11 @@ func (r *ProverRegistry) extractGlobalState() error {
 			continue
 		}
 
+		// Skip vertices with nil roots (e.g., spent merge markers)
+		if data.Root == nil {
+			continue
+		}
+
 		// Get the key which is always 64 bytes (domain + data address)
 		key := make([]byte, 64)
 		copy(key, iter.Key())
@@ -1224,7 +1174,7 @@ func (r *ProverRegistry) extractGlobalState() error {
 				lastActiveFrameNumber = binary.BigEndian.Uint64(bytes)
 			}
 
-			// Create allocation info
+			// Create allocation info - key[32:] contains the allocation vertex address
 			allocationInfo := consensus.ProverAllocationInfo{
 				Status:                  mappedStatus,
 				ConfirmationFilter:      confirmationFilter,
@@ -1239,6 +1189,7 @@ func (r *ProverRegistry) extractGlobalState() error {
 				LeaveConfirmFrameNumber: leaveConfirmFrameNumber,
 				LeaveRejectFrameNumber:  leaveRejectFrameNumber,
 				LastActiveFrameNumber:   lastActiveFrameNumber,
+				VertexAddress:           append([]byte(nil), key[32:]...),
 			}
 
 			// Create or update ProverInfo
@@ -1723,6 +1674,11 @@ func (r *ProverRegistry) processProverChange(
 								leaveRejectFrameNumber
 							proverInfo.Allocations[i].LastActiveFrameNumber =
 								lastActiveFrameNumber
+							// Ensure VertexAddress is set (for backwards compatibility)
+							if len(proverInfo.Allocations[i].VertexAddress) == 0 {
+								proverInfo.Allocations[i].VertexAddress =
+									append([]byte(nil), proverAddress...)
+							}
 							found = true
 						}
 					}
@@ -1744,6 +1700,7 @@ func (r *ProverRegistry) processProverChange(
 								LeaveConfirmFrameNumber: leaveConfirmFrameNumber,
 								LeaveRejectFrameNumber:  leaveRejectFrameNumber,
 								LastActiveFrameNumber:   lastActiveFrameNumber,
+								VertexAddress:           append([]byte(nil), proverAddress...),
 							},
 						)
 					}
@@ -2053,6 +2010,7 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 					LeaveConfirmFrameNumber: allocation.LeaveConfirmFrameNumber,
 					LeaveRejectFrameNumber:  allocation.LeaveRejectFrameNumber,
 					LastActiveFrameNumber:   allocation.LastActiveFrameNumber,
+					VertexAddress:           make([]byte, len(allocation.VertexAddress)),
 				}
 				copy(
 					proverCopy.Allocations[i].ConfirmationFilter,
@@ -2061,6 +2019,10 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 				copy(
 					proverCopy.Allocations[i].RejectionFilter,
 					allocation.RejectionFilter,
+				)
+				copy(
+					proverCopy.Allocations[i].VertexAddress,
+					allocation.VertexAddress,
 				)
 			}
 

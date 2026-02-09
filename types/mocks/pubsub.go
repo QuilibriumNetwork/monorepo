@@ -23,6 +23,9 @@ func (m *MockPubSub) Close() error {
 	return nil
 }
 
+// SetShutdownContext implements p2p.PubSub.
+func (m *MockPubSub) SetShutdownContext(ctx context.Context) {}
+
 // GetOwnMultiaddrs implements p2p.PubSub.
 func (m *MockPubSub) GetOwnMultiaddrs() []multiaddr.Multiaddr {
 	args := m.Called()

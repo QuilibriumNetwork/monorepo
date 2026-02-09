@@ -378,6 +378,11 @@ static void call_UniffiForeignFutureCompleteVoid(
 
 
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_DECRYPT_INBOX_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_DECRYPT_INBOX_MESSAGE
+RustBuffer uniffi_channel_fn_func_decrypt_inbox_message(RustBuffer input, RustCallStatus *out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_DOUBLE_RATCHET_DECRYPT
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_DOUBLE_RATCHET_DECRYPT
 RustBuffer uniffi_channel_fn_func_double_ratchet_decrypt(RustBuffer ratchet_state_and_envelope, RustCallStatus *out_status
@@ -386,6 +391,33 @@ RustBuffer uniffi_channel_fn_func_double_ratchet_decrypt(RustBuffer ratchet_stat
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_DOUBLE_RATCHET_ENCRYPT
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_DOUBLE_RATCHET_ENCRYPT
 RustBuffer uniffi_channel_fn_func_double_ratchet_encrypt(RustBuffer ratchet_state_and_message, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_ENCRYPT_INBOX_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_ENCRYPT_INBOX_MESSAGE
+RustBuffer uniffi_channel_fn_func_encrypt_inbox_message(RustBuffer input, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_GENERATE_ED448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_GENERATE_ED448
+RustBuffer uniffi_channel_fn_func_generate_ed448(RustCallStatus *out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_GENERATE_X448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_GENERATE_X448
+RustBuffer uniffi_channel_fn_func_generate_x448(RustCallStatus *out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_GET_PUBKEY_ED448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_GET_PUBKEY_ED448
+RustBuffer uniffi_channel_fn_func_get_pubkey_ed448(RustBuffer key, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_GET_PUBKEY_X448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_GET_PUBKEY_X448
+RustBuffer uniffi_channel_fn_func_get_pubkey_x448(RustBuffer key, RustCallStatus *out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_NEW_DOUBLE_RATCHET
@@ -406,6 +438,11 @@ RustBuffer uniffi_channel_fn_func_receiver_x3dh(RustBuffer sending_identity_priv
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_SENDER_X3DH
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_SENDER_X3DH
 RustBuffer uniffi_channel_fn_func_sender_x3dh(RustBuffer sending_identity_private_key, RustBuffer sending_ephemeral_private_key, RustBuffer receiving_identity_key, RustBuffer receiving_signed_pre_key, uint64_t session_key_length, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_SIGN_ED448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_SIGN_ED448
+RustBuffer uniffi_channel_fn_func_sign_ed448(RustBuffer key, RustBuffer message, RustCallStatus *out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_TRIPLE_RATCHET_DECRYPT
@@ -436,6 +473,16 @@ RustBuffer uniffi_channel_fn_func_triple_ratchet_init_round_3(RustBuffer ratchet
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_TRIPLE_RATCHET_INIT_ROUND_4
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_TRIPLE_RATCHET_INIT_ROUND_4
 RustBuffer uniffi_channel_fn_func_triple_ratchet_init_round_4(RustBuffer ratchet_state_and_metadata, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_TRIPLE_RATCHET_RESIZE
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_TRIPLE_RATCHET_RESIZE
+RustBuffer uniffi_channel_fn_func_triple_ratchet_resize(RustBuffer ratchet_state, RustBuffer other, uint64_t id, uint64_t total, RustCallStatus *out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_VERIFY_ED448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_FN_FUNC_VERIFY_ED448
+RustBuffer uniffi_channel_fn_func_verify_ed448(RustBuffer public_key, RustBuffer message, RustBuffer signature, RustCallStatus *out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_CHANNEL_RUSTBUFFER_ALLOC
@@ -718,6 +765,12 @@ void ffi_channel_rust_future_free_void(uint64_t handle
 void ffi_channel_rust_future_complete_void(uint64_t handle, RustCallStatus *out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_DECRYPT_INBOX_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_DECRYPT_INBOX_MESSAGE
+uint16_t uniffi_channel_checksum_func_decrypt_inbox_message(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_DOUBLE_RATCHET_DECRYPT
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_DOUBLE_RATCHET_DECRYPT
 uint16_t uniffi_channel_checksum_func_double_ratchet_decrypt(void
@@ -727,6 +780,36 @@ uint16_t uniffi_channel_checksum_func_double_ratchet_decrypt(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_DOUBLE_RATCHET_ENCRYPT
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_DOUBLE_RATCHET_ENCRYPT
 uint16_t uniffi_channel_checksum_func_double_ratchet_encrypt(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_ENCRYPT_INBOX_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_ENCRYPT_INBOX_MESSAGE
+uint16_t uniffi_channel_checksum_func_encrypt_inbox_message(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_GENERATE_ED448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_GENERATE_ED448
+uint16_t uniffi_channel_checksum_func_generate_ed448(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_GENERATE_X448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_GENERATE_X448
+uint16_t uniffi_channel_checksum_func_generate_x448(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_GET_PUBKEY_ED448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_GET_PUBKEY_ED448
+uint16_t uniffi_channel_checksum_func_get_pubkey_ed448(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_GET_PUBKEY_X448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_GET_PUBKEY_X448
+uint16_t uniffi_channel_checksum_func_get_pubkey_x448(void
     
 );
 #endif
@@ -751,6 +834,12 @@ uint16_t uniffi_channel_checksum_func_receiver_x3dh(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_SENDER_X3DH
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_SENDER_X3DH
 uint16_t uniffi_channel_checksum_func_sender_x3dh(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_SIGN_ED448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_SIGN_ED448
+uint16_t uniffi_channel_checksum_func_sign_ed448(void
     
 );
 #endif
@@ -787,6 +876,18 @@ uint16_t uniffi_channel_checksum_func_triple_ratchet_init_round_3(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_TRIPLE_RATCHET_INIT_ROUND_4
 #define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_TRIPLE_RATCHET_INIT_ROUND_4
 uint16_t uniffi_channel_checksum_func_triple_ratchet_init_round_4(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_TRIPLE_RATCHET_RESIZE
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_TRIPLE_RATCHET_RESIZE
+uint16_t uniffi_channel_checksum_func_triple_ratchet_resize(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_VERIFY_ED448
+#define UNIFFI_FFIDEF_UNIFFI_CHANNEL_CHECKSUM_FUNC_VERIFY_ED448
+uint16_t uniffi_channel_checksum_func_verify_ed448(void
     
 );
 #endif

@@ -27,7 +27,7 @@ func (p *AppLivenessProvider) Collect(
 	}
 
 	mixnetMessages := []*protobufs.Message{}
-	currentSet, _ := p.engine.proverRegistry.GetActiveProvers(nil)
+	currentSet, _ := p.engine.proverRegistry.GetActiveProvers(p.engine.appAddress)
 	if len(currentSet) >= 9 {
 		// Prepare mixnet for collecting messages
 		err := p.engine.mixnet.PrepareMixnet()

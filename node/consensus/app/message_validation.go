@@ -476,6 +476,13 @@ func (e *AppConsensusEngine) validatePeerInfoMessage(
 				zap.Int64("peer_timestamp", peerInfo.Timestamp),
 				zap.Int64("cutoff", oneMinuteAgo),
 			)
+			return p2p.ValidationResultReject
+		}
+
+		if peerInfo.Timestamp < now-1000 {
+			e.logger.Debug("peer info timestamp too old, ignoring",
+				zap.Int64("peer_timestamp", peerInfo.Timestamp),
+			)
 			return p2p.ValidationResultIgnore
 		}
 
@@ -499,10 +506,17 @@ func (e *AppConsensusEngine) validatePeerInfoMessage(
 		}
 
 		now := time.Now().UnixMilli()
+
+		if int64(keyRegistry.LastUpdated) < now-60000 {
+			e.logger.Debug("key registry timestamp too old, rejecting")
+			return p2p.ValidationResultReject
+		}
+
 		if int64(keyRegistry.LastUpdated) < now-1000 {
 			e.logger.Debug("key registry timestamp too old")
 			return p2p.ValidationResultIgnore
 		}
+
 		if int64(keyRegistry.LastUpdated) > now+5000 {
 			e.logger.Debug("key registry timestamp too far in future")
 			return p2p.ValidationResultIgnore

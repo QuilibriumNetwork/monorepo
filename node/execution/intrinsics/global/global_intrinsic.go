@@ -678,6 +678,58 @@ func (a *GlobalIntrinsic) Validate(
 		).Inc()
 		return nil
 
+	case protobufs.ProverSeniorityMergeType:
+		// Parse ProverSeniorityMerge directly from input
+		pb := &protobufs.ProverSeniorityMerge{}
+		if err := pb.FromCanonicalBytes(input); err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		// Convert from protobuf to intrinsics type
+		op, err := ProverSeniorityMergeFromProtobuf(
+			pb,
+			a.hypergraph,
+			a.rdfMultiprover,
+			a.keyManager,
+		)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		valid, err := op.Verify(frameNumber)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		if !valid {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return errors.Wrap(
+				errors.New("invalid prover seniority merge"),
+				"validate",
+			)
+		}
+
+		observability.ValidateTotal.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return nil
+
 	default:
 		observability.ValidateErrors.WithLabelValues(
 			"global",
@@ -759,18 +811,18 @@ func (a *GlobalIntrinsic) InvokeStep(
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
-		a.state, err = op.Materialize(frameNumber, state)
+		resultState, matErr := op.Materialize(frameNumber, state)
 		matTimer.ObserveDuration()
-		if err != nil {
+		if matErr != nil {
 			observability.InvokeStepErrors.WithLabelValues(
 				"global",
 				"prover_join",
 			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
+			return nil, errors.Wrap(matErr, "invoke step")
 		}
 
 		observability.InvokeStepTotal.WithLabelValues("global", "prover_join").Inc()
-		return a.state, nil
+		return resultState, nil
 
 	case protobufs.ProverLeaveType:
 		opTimer := prometheus.NewTimer(
@@ -812,21 +864,21 @@ func (a *GlobalIntrinsic) InvokeStep(
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
-		a.state, err = op.Materialize(frameNumber, state)
+		resultState, matErr := op.Materialize(frameNumber, state)
 		matTimer.ObserveDuration()
-		if err != nil {
+		if matErr != nil {
 			observability.InvokeStepErrors.WithLabelValues(
 				"global",
 				"prover_leave",
 			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
+			return nil, errors.Wrap(matErr, "invoke step")
 		}
 
 		observability.InvokeStepTotal.WithLabelValues(
 			"global",
 			"prover_leave",
 		).Inc()
-		return a.state, nil
+		return resultState, nil
 
 	case protobufs.ProverPauseType:
 		opTimer := prometheus.NewTimer(
@@ -868,21 +920,21 @@ func (a *GlobalIntrinsic) InvokeStep(
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
-		a.state, err = op.Materialize(frameNumber, state)
+		resultState, matErr := op.Materialize(frameNumber, state)
 		matTimer.ObserveDuration()
-		if err != nil {
+		if matErr != nil {
 			observability.InvokeStepErrors.WithLabelValues(
 				"global",
 				"prover_pause",
 			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
+			return nil, errors.Wrap(matErr, "invoke step")
 		}
 
 		observability.InvokeStepTotal.WithLabelValues(
 			"global",
 			"prover_pause",
 		).Inc()
-		return a.state, nil
+		return resultState, nil
 
 	case protobufs.ProverResumeType:
 		opTimer := prometheus.NewTimer(
@@ -927,21 +979,21 @@ func (a *GlobalIntrinsic) InvokeStep(
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
-		a.state, err = op.Materialize(frameNumber, state)
+		resultState, matErr := op.Materialize(frameNumber, state)
 		matTimer.ObserveDuration()
-		if err != nil {
+		if matErr != nil {
 			observability.InvokeStepErrors.WithLabelValues(
 				"global",
 				"prover_resume",
 			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
+			return nil, errors.Wrap(matErr, "invoke step")
 		}
 
 		observability.InvokeStepTotal.WithLabelValues(
 			"global",
 			"prover_resume",
 		).Inc()
-		return a.state, nil
+		return resultState, nil
 
 	case protobufs.ProverConfirmType:
 		opTimer := prometheus.NewTimer(
@@ -986,21 +1038,21 @@ func (a *GlobalIntrinsic) InvokeStep(
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
-		a.state, err = op.Materialize(frameNumber, state)
+		resultState, matErr := op.Materialize(frameNumber, state)
 		matTimer.ObserveDuration()
-		if err != nil {
+		if matErr != nil {
 			observability.InvokeStepErrors.WithLabelValues(
 				"global",
 				"prover_confirm",
 			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
+			return nil, errors.Wrap(matErr, "invoke step")
 		}
 
 		observability.InvokeStepTotal.WithLabelValues(
 			"global",
 			"prover_confirm",
 		).Inc()
-		return a.state, nil
+		return resultState, nil
 
 	case protobufs.ProverRejectType:
 		opTimer := prometheus.NewTimer(
@@ -1045,21 +1097,21 @@ func (a *GlobalIntrinsic) InvokeStep(
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
-		a.state, err = op.Materialize(frameNumber, state)
+		resultState, matErr := op.Materialize(frameNumber, state)
 		matTimer.ObserveDuration()
-		if err != nil {
+		if matErr != nil {
 			observability.InvokeStepErrors.WithLabelValues(
 				"global",
 				"prover_reject",
 			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
+			return nil, errors.Wrap(matErr, "invoke step")
 		}
 
 		observability.InvokeStepTotal.WithLabelValues(
 			"global",
 			"prover_reject",
 		).Inc()
-		return a.state, nil
+		return resultState, nil
 
 	case protobufs.ProverKickType:
 		opTimer := prometheus.NewTimer(
@@ -1094,18 +1146,18 @@ func (a *GlobalIntrinsic) InvokeStep(
 		matTimer := prometheus.NewTimer(
 			observability.MaterializeDuration.WithLabelValues("global"),
 		)
-		a.state, err = op.Materialize(frameNumber, state)
+		resultState, matErr := op.Materialize(frameNumber, state)
 		matTimer.ObserveDuration()
-		if err != nil {
+		if matErr != nil {
 			observability.InvokeStepErrors.WithLabelValues(
 				"global",
 				"prover_kick",
 			).Inc()
-			return nil, errors.Wrap(err, "invoke step")
+			return nil, errors.Wrap(matErr, "invoke step")
 		}
 
 		observability.InvokeStepTotal.WithLabelValues("global", "prover_kick").Inc()
-		return a.state, nil
+		return resultState, nil
 
 	case protobufs.FrameHeaderType:
 		opTimer := prometheus.NewTimer(
@@ -1136,12 +1188,6 @@ func (a *GlobalIntrinsic) InvokeStep(
 			a.proverRegistry,
 			a.blsConstructor,
 		)
-
-		matTimer := prometheus.NewTimer(
-			observability.MaterializeDuration.WithLabelValues("global"),
-		)
-		a.state, err = op.Materialize(frameNumber, state)
-		matTimer.ObserveDuration()
 		if err != nil {
 			observability.InvokeStepErrors.WithLabelValues(
 				"global",
@@ -1150,11 +1196,77 @@ func (a *GlobalIntrinsic) InvokeStep(
 			return nil, errors.Wrap(err, "invoke step")
 		}
 
+		matTimer := prometheus.NewTimer(
+			observability.MaterializeDuration.WithLabelValues("global"),
+		)
+		resultState, matErr := op.Materialize(frameNumber, state)
+		matTimer.ObserveDuration()
+		if matErr != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_shard_update",
+			).Inc()
+			return nil, errors.Wrap(matErr, "invoke step")
+		}
+
 		observability.InvokeStepTotal.WithLabelValues(
 			"global",
 			"prover_shard_update",
 		).Inc()
-		return a.state, nil
+		return resultState, nil
+
+	case protobufs.ProverSeniorityMergeType:
+		opTimer := prometheus.NewTimer(
+			observability.OperationDuration.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			),
+		)
+		defer opTimer.ObserveDuration()
+
+		// Parse ProverSeniorityMerge directly from input
+		pb := &protobufs.ProverSeniorityMerge{}
+		if err := pb.FromCanonicalBytes(input); err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		// Convert from protobuf to intrinsics type
+		op, err := ProverSeniorityMergeFromProtobuf(
+			pb,
+			a.hypergraph,
+			a.rdfMultiprover,
+			a.keyManager,
+		)
+		if err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		matTimer := prometheus.NewTimer(
+			observability.MaterializeDuration.WithLabelValues("global"),
+		)
+		resultState, matErr := op.Materialize(frameNumber, state)
+		matTimer.ObserveDuration()
+		if matErr != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"prover_seniority_merge",
+			).Inc()
+			return nil, errors.Wrap(matErr, "invoke step")
+		}
+
+		observability.InvokeStepTotal.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return resultState, nil
 
 	default:
 		observability.InvokeStepErrors.WithLabelValues(
@@ -1273,6 +1385,17 @@ func (a *GlobalIntrinsic) Lock(
 		}
 
 		observability.LockTotal.WithLabelValues("global", "prover_kick").Inc()
+
+	case protobufs.ProverSeniorityMergeType:
+		reads, writes, err = a.tryLockSeniorityMerge(frameNumber, input)
+		if err != nil {
+			return nil, err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
 
 	default:
 		observability.LockErrors.WithLabelValues(
@@ -1730,6 +1853,60 @@ func (a *GlobalIntrinsic) tryLockKick(frameNumber uint64, input []byte) (
 		observability.LockErrors.WithLabelValues(
 			"global",
 			"prover_kick",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (a *GlobalIntrinsic) tryLockSeniorityMerge(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	// Parse ProverSeniorityMerge directly from input
+	pb := &protobufs.ProverSeniorityMerge{}
+	if err := pb.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	// Convert from protobuf to intrinsics type
+	op, err := ProverSeniorityMergeFromProtobuf(
+		pb,
+		a.hypergraph,
+		a.rdfMultiprover,
+		a.keyManager,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"prover_seniority_merge",
 		).Inc()
 		return nil, nil, errors.Wrap(err, "lock")
 	}

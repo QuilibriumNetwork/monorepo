@@ -1,12 +1,12 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 
@@ -15,14 +15,21 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
+	"source.quilibrium.com/quilibrium/monorepo/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
+	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
 type PebbleDB struct {
 	db     *pebble.DB
-	config *config.DBConfig
+	config *config.Config
 }
 
 func (p *PebbleDB) DB() *pebble.DB {
@@ -31,7 +38,7 @@ func (p *PebbleDB) DB() *pebble.DB {
 
 // pebbleMigrations contains ordered migration steps. New migrations append to
 // the end.
-var pebbleMigrations = []func(*pebble.Batch) error{
+var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_4,
 	migration_2_1_0_5,
 	migration_2_1_0_8,
@@ -62,11 +69,38 @@ var pebbleMigrations = []func(*pebble.Batch) error{
 	migration_2_1_0_158,
 	migration_2_1_0_159,
 	migration_2_1_0_17,
+	migration_2_1_0_171,
+	migration_2_1_0_172,
+	migration_2_1_0_172,
+	migration_2_1_0_173,
+	migration_2_1_0_18,
+	migration_2_1_0_181,
+	migration_2_1_0_182,
+	migration_2_1_0_183,
+	migration_2_1_0_184,
+	migration_2_1_0_185,
+	migration_2_1_0_186,
+	migration_2_1_0_187,
+	migration_2_1_0_188,
+	migration_2_1_0_189,
+	migration_2_1_0_1810,
+	migration_2_1_0_1811,
+	migration_2_1_0_1812,
+	migration_2_1_0_1813,
+	migration_2_1_0_1814,
+	migration_2_1_0_1815,
+	migration_2_1_0_1816,
+	migration_2_1_0_1817,
+	migration_2_1_0_1818,
+	migration_2_1_0_1819,
+	migration_2_1_0_1820,
+	migration_2_1_0_1821,
+	migration_2_1_0_1822,
 }
 
 func NewPebbleDB(
 	logger *zap.Logger,
-	config *config.DBConfig,
+	cfg *config.Config,
 	coreId uint,
 ) *PebbleDB {
 	opts := &pebble.Options{
@@ -78,15 +112,15 @@ func NewPebbleDB(
 		FormatMajorVersion:    pebble.FormatNewest,
 	}
 
-	if config.InMemoryDONOTUSE {
+	if cfg.DB.InMemoryDONOTUSE {
 		opts.FS = vfs.NewMem()
 	}
 
-	path := config.Path
-	if coreId > 0 && len(config.WorkerPaths) > int(coreId-1) {
-		path = config.WorkerPaths[coreId-1]
+	path := cfg.DB.Path
+	if coreId > 0 && len(cfg.DB.WorkerPaths) > int(coreId-1) {
+		path = cfg.DB.WorkerPaths[coreId-1]
 	} else if coreId > 0 {
-		path = fmt.Sprintf(config.WorkerPathPrefix, coreId)
+		path = fmt.Sprintf(cfg.DB.WorkerPathPrefix, coreId)
 	}
 
 	storeType := "store"
@@ -94,7 +128,7 @@ func NewPebbleDB(
 		storeType = "worker store"
 	}
 
-	if _, err := os.Stat(path); os.IsNotExist(err) && !config.InMemoryDONOTUSE {
+	if _, err := os.Stat(path); os.IsNotExist(err) && !cfg.DB.InMemoryDONOTUSE {
 		logger.Warn(
 			fmt.Sprintf("%s not found, creating", storeType),
 			zap.String("path", path),
@@ -119,7 +153,7 @@ func NewPebbleDB(
 	}
 
 	db, err := pebble.Open(path, opts)
-	if err != nil && shouldAttemptLegacyOpen(err, config.InMemoryDONOTUSE) {
+	if err != nil && shouldAttemptLegacyOpen(err, cfg.DB.InMemoryDONOTUSE) {
 		logger.Warn(
 			fmt.Sprintf(
 				"failed to open %s with pebble v2, trying legacy open",
@@ -163,7 +197,7 @@ func NewPebbleDB(
 		os.Exit(1)
 	}
 
-	pebbleDB := &PebbleDB{db, config}
+	pebbleDB := &PebbleDB{db, cfg}
 	if err := pebbleDB.migrate(logger); err != nil {
 		logger.Error(
 			fmt.Sprintf("failed to migrate %s", storeType),
@@ -224,7 +258,7 @@ func ensurePebbleLegacyCompatibility(
 }
 
 func (p *PebbleDB) migrate(logger *zap.Logger) error {
-	if p.config.InMemoryDONOTUSE {
+	if p.config.DB.InMemoryDONOTUSE {
 		return nil
 	}
 
@@ -280,7 +314,7 @@ func (p *PebbleDB) migrate(logger *zap.Logger) error {
 			zap.Int("from_version", int(storedVersion)),
 			zap.Int("to_version", int(storedVersion+1)),
 		)
-		if err := pebbleMigrations[i](batch); err != nil {
+		if err := pebbleMigrations[i](batch, p.db, p.config); err != nil {
 			batch.Close()
 			logger.Error("migration failed", zap.Error(err))
 			return errors.Wrapf(err, "apply migration %d", i+1)
@@ -458,7 +492,7 @@ func rightAlign(data []byte, size int) []byte {
 
 // Resolves all the variations of store issues from any series of upgrade steps
 // in 2.1.0.1->2.1.0.3
-func migration_2_1_0_4(b *pebble.Batch) error {
+func migration_2_1_0_4(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	// batches don't use this but for backcompat the parameter is required
 	wo := &pebble.WriteOptions{}
 
@@ -559,201 +593,640 @@ func migration_2_1_0_4(b *pebble.Batch) error {
 	return nil
 }
 
-func migration_2_1_0_5(b *pebble.Batch) error {
+func migration_2_1_0_5(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	// We just re-run it again
-	return migration_2_1_0_4(b)
+	return migration_2_1_0_4(b, db, cfg)
 }
 
-func migration_2_1_0_8(b *pebble.Batch) error {
+func migration_2_1_0_8(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	// these migration entries exist solely to advance migration number so all
 	// nodes are consistent
 	return nil
 }
 
-func migration_2_1_0_81(b *pebble.Batch) error {
+func migration_2_1_0_81(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	// these migration entries exist solely to advance migration number so all
 	// nodes are consistent
 	return nil
 }
 
-func migration_2_1_0_10(b *pebble.Batch) error {
+func migration_2_1_0_10(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	// these migration entries exist solely to advance migration number so all
 	// nodes are consistent
 	return nil
 }
 
-func migration_2_1_0_11(b *pebble.Batch) error {
+func migration_2_1_0_11(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	return nil
 }
 
-func migration_2_1_0_14(b *pebble.Batch) error {
+func migration_2_1_0_14(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	return nil
 }
 
-func migration_2_1_0_141(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_141(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_14(b, db, cfg)
 }
 
-func migration_2_1_0_142(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_142(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_14(b, db, cfg)
 }
 
-func migration_2_1_0_143(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_143(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_14(b, db, cfg)
 }
 
-func migration_2_1_0_144(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_144(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_14(b, db, cfg)
 }
 
-func migration_2_1_0_145(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_145(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_14(b, db, cfg)
 }
 
-func migration_2_1_0_146(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_146(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_14(b, db, cfg)
 }
 
-func migration_2_1_0_147(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_147(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_14(b, db, cfg)
 }
 
-func migration_2_1_0_148(b *pebble.Batch) error {
-	return migration_2_1_0_14(b)
+func migration_2_1_0_148(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_14(b, db, cfg)
 }
 
-func migration_2_1_0_149(b *pebble.Batch) error {
+func migration_2_1_0_149(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	return nil
 }
 
-func migration_2_1_0_1410(b *pebble.Batch) error {
-	return migration_2_1_0_149(b)
+func migration_2_1_0_1410(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_149(b, db, cfg)
 }
 
-func migration_2_1_0_1411(b *pebble.Batch) error {
-	return migration_2_1_0_149(b)
+func migration_2_1_0_1411(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_149(b, db, cfg)
 }
 
-func migration_2_1_0_15(b *pebble.Batch) error {
+func migration_2_1_0_15(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	return nil
 }
 
-func migration_2_1_0_151(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_151(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_15(b, db, cfg)
 }
 
-func migration_2_1_0_152(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_152(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_15(b, db, cfg)
 }
 
-func migration_2_1_0_153(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_153(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_15(b, db, cfg)
 }
 
-func migration_2_1_0_154(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_154(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_15(b, db, cfg)
 }
 
-func migration_2_1_0_155(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_155(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_15(b, db, cfg)
 }
 
-func migration_2_1_0_156(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_156(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_15(b, db, cfg)
 }
 
-func migration_2_1_0_157(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_157(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_15(b, db, cfg)
 }
 
-func migration_2_1_0_158(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_158(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_15(b, db, cfg)
 }
 
-func migration_2_1_0_159(b *pebble.Batch) error {
-	return migration_2_1_0_15(b)
+func migration_2_1_0_159(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return migration_2_1_0_15(b, db, cfg)
 }
 
-func migration_2_1_0_17(b *pebble.Batch) error {
-	// Global shard key: L1={0,0,0}, L2=0xff*32
+func migration_2_1_0_17(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_171(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_172(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_173(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_18(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_181(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_182(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_183(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_184(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_185(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_186(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_187(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_188(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_189(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1810(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1811(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1812(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1813(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1814(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1815(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1816(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1817(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1818(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+// doMigration1818 performs the actual migration work for migration_2_1_0_1818.
+// It uses the sync protocol to repair corrupted tree data by syncing to an
+// in-memory instance and back.
+func doMigration1818(db *pebble.DB, cfg *config.Config) error {
+	logger := zap.L()
+
+	// Global prover shard key: L1={0,0,0}, L2=0xff*32
 	globalShardKey := tries.ShardKey{
 		L1: [3]byte{},
-		L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
-	}
-	// Next shard key (for exclusive upper bound): L1={0,0,1}, L2=0x00*32
-	nextShardKey := tries.ShardKey{
-		L1: [3]byte{0, 0, 1},
-		L2: [32]byte{},
-	}
-
-	// Delete vertex data for global domain
-	// Vertex data keys: {0x09, 0xF0, domain[32], address[32]}
-	// Start: {0x09, 0xF0, 0xff*32} (prefix for global domain)
-	// End: {0x09, 0xF1} (next prefix type, ensures we capture all addresses)
-	if err := b.DeleteRange(
-		hypergraphVertexDataKey(globalShardKey.L2[:]),
-		[]byte{HYPERGRAPH_SHARD, VERTEX_DATA + 1},
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
+		L2: [32]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		},
 	}
 
-	// Delete vertex adds tree nodes
-	if err := b.DeleteRange(
-		hypergraphVertexAddsTreeNodeKey(globalShardKey, []byte{}),
-		hypergraphVertexAddsTreeNodeKey(nextShardKey, []byte{}),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
+	prover := bls48581.NewKZGInclusionProver(logger)
+
+	// Create hypergraph from actual DB
+	actualDBWrapper := &PebbleDB{db: db}
+	actualStore := NewPebbleHypergraphStore(cfg.DB, actualDBWrapper, logger, nil, prover)
+
+	actualHG, err := actualStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "load actual hypergraph")
+	}
+	actualHGCRDT := actualHG.(*hgcrdt.HypergraphCRDT)
+
+	// Create in-memory pebble DB directly (bypassing NewPebbleDB to avoid cycle)
+	memOpts := &pebble.Options{
+		MemTableSize:       64 << 20,
+		FormatMajorVersion: pebble.FormatNewest,
+		FS:                 vfs.NewMem(),
+	}
+	memDB, err := pebble.Open("", memOpts)
+	if err != nil {
+		return errors.Wrap(err, "open in-memory pebble")
+	}
+	defer memDB.Close()
+
+	memDBWrapper := &PebbleDB{db: memDB}
+	memStore := NewPebbleHypergraphStore(cfg.DB, memDBWrapper, logger, nil, prover)
+	memHG, err := memStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "load in-memory hypergraph")
+	}
+	memHGCRDT := memHG.(*hgcrdt.HypergraphCRDT)
+
+	// Phase 1: Sync from actual DB to in-memory
+	// Get the current root from actual DB
+	actualRoot := actualHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
+	if actualRoot == nil {
+		logger.Info("migration 1818: no data in global prover shard, skipping")
+		return nil
 	}
 
-	// Delete vertex adds tree nodes by path
-	if err := b.DeleteRange(
-		hypergraphVertexAddsTreeNodeByPathKey(globalShardKey, []int{}),
-		hypergraphVertexAddsTreeNodeByPathKey(nextShardKey, []int{}),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
+	// Publish snapshot on actual hypergraph
+	actualHGCRDT.PublishSnapshot(actualRoot)
+
+	// Set up gRPC server backed by actual hypergraph
+	const bufSize = 1 << 20
+	actualLis := bufconn.Listen(bufSize)
+	actualGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(actualGRPCServer, actualHGCRDT)
+	go func() { _ = actualGRPCServer.Serve(actualLis) }()
+	defer actualGRPCServer.Stop()
+
+	// Create client connection to actual hypergraph server
+	actualDialer := func(context.Context, string) (net.Conn, error) {
+		return actualLis.Dial()
+	}
+	actualConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(actualDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "dial actual hypergraph")
+	}
+	defer actualConn.Close()
+
+	actualClient := protobufs.NewHypergraphComparisonServiceClient(actualConn)
+
+	// Sync from actual to in-memory for all phases
+	phases := []protobufs.HypergraphPhaseSet{
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES,
 	}
 
-	// Delete hyperedge adds tree nodes
-	if err := b.DeleteRange(
-		hypergraphHyperedgeAddsTreeNodeKey(globalShardKey, []byte{}),
-		hypergraphHyperedgeAddsTreeNodeKey(nextShardKey, []byte{}),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
+	for _, phase := range phases {
+		stream, err := actualClient.PerformSync(context.Background())
+		if err != nil {
+			return errors.Wrapf(err, "create sync stream for phase %v", phase)
+		}
+		_, err = memHGCRDT.SyncFrom(stream, globalShardKey, phase, nil)
+		if err != nil {
+			logger.Warn("sync from actual to memory failed", zap.Error(err), zap.Any("phase", phase))
+		}
+		_ = stream.CloseSend()
 	}
 
-	// Delete hyperedge adds tree nodes by path
-	if err := b.DeleteRange(
-		hypergraphHyperedgeAddsTreeNodeByPathKey(globalShardKey, []int{}),
-		hypergraphHyperedgeAddsTreeNodeByPathKey(nextShardKey, []int{}),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
+	// Commit in-memory to get root
+	memRoot := memHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
+	logger.Info("migration 1818: synced to in-memory",
+		zap.String("actual_root", hex.EncodeToString(actualRoot)),
+		zap.String("mem_root", hex.EncodeToString(memRoot)),
+	)
+
+	// Stop the actual server before wiping data
+	actualGRPCServer.Stop()
+	actualConn.Close()
+
+	// Phase 2: Wipe tree data for global prover shard from actual DB
+	treePrefixes := []byte{
+		VERTEX_ADDS_TREE_NODE,
+		VERTEX_REMOVES_TREE_NODE,
+		HYPEREDGE_ADDS_TREE_NODE,
+		HYPEREDGE_REMOVES_TREE_NODE,
+		VERTEX_ADDS_TREE_NODE_BY_PATH,
+		VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		HYPEREDGE_REMOVES_TREE_NODE_BY_PATH,
+		VERTEX_ADDS_CHANGE_RECORD,
+		VERTEX_REMOVES_CHANGE_RECORD,
+		HYPEREDGE_ADDS_CHANGE_RECORD,
+		HYPEREDGE_REMOVES_CHANGE_RECORD,
+		VERTEX_ADDS_TREE_ROOT,
+		VERTEX_REMOVES_TREE_ROOT,
+		HYPEREDGE_ADDS_TREE_ROOT,
+		HYPEREDGE_REMOVES_TREE_ROOT,
 	}
 
-	// Delete vertex adds tree root
-	if err := b.DeleteRange(
-		hypergraphVertexAddsTreeRootKey(globalShardKey),
-		hypergraphVertexAddsTreeRootKey(nextShardKey),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
+	for _, prefix := range treePrefixes {
+		start, end := shardRangeBounds(prefix, globalShardKey)
+		if err := db.DeleteRange(start, end, &pebble.WriteOptions{Sync: true}); err != nil {
+			return errors.Wrapf(err, "delete range for prefix 0x%02x", prefix)
+		}
 	}
 
-	// Delete hyperedge adds tree root
-	if err := b.DeleteRange(
-		hypergraphHyperedgeAddsTreeRootKey(globalShardKey),
-		hypergraphHyperedgeAddsTreeRootKey(nextShardKey),
-		&pebble.WriteOptions{},
-	); err != nil {
-		return err
+	logger.Info("migration 1818: wiped tree data from actual DB")
+
+	// Reload actual hypergraph after wipe
+	actualStore2 := NewPebbleHypergraphStore(cfg.DB, actualDBWrapper, logger, nil, prover)
+	actualHG2, err := actualStore2.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "reload actual hypergraph after wipe")
 	}
+	actualHGCRDT2 := actualHG2.(*hgcrdt.HypergraphCRDT)
+
+	// Phase 3: Sync from in-memory back to actual DB
+	// Publish snapshot on in-memory hypergraph
+	memHGCRDT.PublishSnapshot(memRoot)
+
+	// Set up gRPC server backed by in-memory hypergraph
+	memLis := bufconn.Listen(bufSize)
+	memGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(memGRPCServer, memHGCRDT)
+	go func() { _ = memGRPCServer.Serve(memLis) }()
+	defer memGRPCServer.Stop()
+
+	// Create client connection to in-memory hypergraph server
+	memDialer := func(context.Context, string) (net.Conn, error) {
+		return memLis.Dial()
+	}
+	memConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(memDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "dial in-memory hypergraph")
+	}
+	defer memConn.Close()
+
+	memClient := protobufs.NewHypergraphComparisonServiceClient(memConn)
+
+	// Sync from in-memory to actual for all phases
+	for _, phase := range phases {
+		stream, err := memClient.PerformSync(context.Background())
+		if err != nil {
+			return errors.Wrapf(err, "create sync stream for phase %v (reverse)", phase)
+		}
+		_, err = actualHGCRDT2.SyncFrom(stream, globalShardKey, phase, nil)
+		if err != nil {
+			logger.Warn("sync from memory to actual failed", zap.Error(err), zap.Any("phase", phase))
+		}
+		_ = stream.CloseSend()
+	}
+
+	// Final commit
+	finalRoot := actualHGCRDT2.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, true)
+	logger.Info("migration 1818: completed",
+		zap.String("final_root", hex.EncodeToString(finalRoot)),
+	)
 
 	return nil
 }
+
+func migration_2_1_0_1819(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1820(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+func migration_2_1_0_1821(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return nil
+}
+
+// doMigration1821 performs the actual work for migration_2_1_0_1821.
+func doMigration1821(db *pebble.DB, cfg *config.Config) error {
+	logger := zap.L()
+
+	// Global intrinsic address: 32 bytes of 0xff
+	globalIntrinsicAddress := [32]byte{
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	}
+
+	prover := bls48581.NewKZGInclusionProver(logger)
+
+	// Create hypergraph from actual DB
+	dbWrapper := &PebbleDB{db: db}
+	hgStore := NewPebbleHypergraphStore(cfg.DB, dbWrapper, logger, nil, prover)
+
+	hg, err := hgStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "load hypergraph")
+	}
+	hgCRDT := hg.(*hgcrdt.HypergraphCRDT)
+
+	// Get shard key for the global intrinsic domain
+	// L1 is computed from bloom filter indices of the domain
+	globalShardKey := tries.ShardKey{
+		L1: [3]byte(up2p.GetBloomFilterIndices(globalIntrinsicAddress[:], 256, 3)),
+		L2: globalIntrinsicAddress,
+	}
+
+	// Create a transaction for the deletions
+	txn, err := hgStore.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "create transaction")
+	}
+
+	// Get the vertex data iterator for the global intrinsic domain
+	iter := hgCRDT.GetVertexDataIterator(globalIntrinsicAddress)
+	defer iter.Close()
+
+	deletedCount := 0
+	totalCount := 0
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		totalCount++
+
+		tree := iter.Value()
+		if tree == nil {
+			continue
+		}
+
+		// Check if this is an empty tree (spent merge marker)
+		// Spent markers have Root == nil or GetSize() == 0
+		if tree.Root == nil || tree.GetSize().Sign() == 0 {
+			// This is a spent marker - delete it
+			// The Key() returns the full 64-byte vertex ID (domain + address)
+			key := iter.Key()
+			if len(key) < 64 {
+				continue
+			}
+
+			var vertexID [64]byte
+			copy(vertexID[:], key[:64])
+
+			if err := hgCRDT.DeleteVertexAdd(txn, globalShardKey, vertexID); err != nil {
+				logger.Warn("failed to delete spent marker",
+					zap.String("vertex_id", hex.EncodeToString(vertexID[:])),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			deletedCount++
+
+			// Log progress every 1000 deletions
+			if deletedCount%1000 == 0 {
+				logger.Info("migration 1821: progress",
+					zap.Int("deleted", deletedCount),
+					zap.Int("examined", totalCount),
+				)
+			}
+		}
+	}
+
+	// Commit the transaction
+	if err := txn.Commit(); err != nil {
+		return errors.Wrap(err, "commit transaction")
+	}
+
+	logger.Info("migration 1821: completed",
+		zap.Int("deleted_spent_markers", deletedCount),
+		zap.Int("total_examined", totalCount),
+	)
+
+	return nil
+}
+
+// migration_2_1_0_1822 rebuilds the global prover shard tree to fix potential
+// corruption from transaction bypass bugs in SaveRoot and Commit.
+func migration_2_1_0_1822(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return doMigration1818(db, cfg)
+}
+
+// pebbleBatchDB wraps a *pebble.Batch to implement store.KVDB for use in migrations
+type pebbleBatchDB struct {
+	b *pebble.Batch
+}
+
+func (p *pebbleBatchDB) Get(key []byte) ([]byte, io.Closer, error) {
+	return p.b.Get(key)
+}
+
+func (p *pebbleBatchDB) Set(key, value []byte) error {
+	return p.b.Set(key, value, &pebble.WriteOptions{})
+}
+
+func (p *pebbleBatchDB) Delete(key []byte) error {
+	return p.b.Delete(key, &pebble.WriteOptions{})
+}
+
+func (p *pebbleBatchDB) NewBatch(indexed bool) store.Transaction {
+	// Migrations don't need nested transactions; return a wrapper around the same
+	// batch
+	return &pebbleBatchTransaction{b: p.b}
+}
+
+func (p *pebbleBatchDB) NewIter(lowerBound []byte, upperBound []byte) (
+	store.Iterator,
+	error,
+) {
+	return p.b.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+}
+
+func (p *pebbleBatchDB) Compact(start, end []byte, parallelize bool) error {
+	return nil // No-op for batch
+}
+
+func (p *pebbleBatchDB) Close() error {
+	return nil // Don't close the batch here
+}
+
+func (p *pebbleBatchDB) DeleteRange(start, end []byte) error {
+	return p.b.DeleteRange(start, end, &pebble.WriteOptions{})
+}
+
+func (p *pebbleBatchDB) CompactAll() error {
+	return nil // No-op for batch
+}
+
+var _ store.KVDB = (*pebbleBatchDB)(nil)
+
+// pebbleBatchTransaction wraps a *pebble.Batch to implement store.Transaction
+type pebbleBatchTransaction struct {
+	b *pebble.Batch
+}
+
+func (t *pebbleBatchTransaction) Get(key []byte) ([]byte, io.Closer, error) {
+	return t.b.Get(key)
+}
+
+func (t *pebbleBatchTransaction) Set(key []byte, value []byte) error {
+	return t.b.Set(key, value, &pebble.WriteOptions{})
+}
+
+func (t *pebbleBatchTransaction) Commit() error {
+	return nil // Don't commit; the migration batch handles this
+}
+
+func (t *pebbleBatchTransaction) Delete(key []byte) error {
+	return t.b.Delete(key, &pebble.WriteOptions{})
+}
+
+func (t *pebbleBatchTransaction) Abort() error {
+	return nil // Can't abort part of a batch
+}
+
+func (t *pebbleBatchTransaction) NewIter(lowerBound []byte, upperBound []byte) (
+	store.Iterator,
+	error,
+) {
+	return t.b.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+}
+
+func (t *pebbleBatchTransaction) DeleteRange(
+	lowerBound []byte,
+	upperBound []byte,
+) error {
+	return t.b.DeleteRange(lowerBound, upperBound, &pebble.WriteOptions{})
+}
+
+var _ store.Transaction = (*pebbleBatchTransaction)(nil)
 
 type pebbleSnapshotDB struct {
 	snap *pebble.Snapshot

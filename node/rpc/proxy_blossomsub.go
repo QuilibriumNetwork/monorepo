@@ -168,6 +168,12 @@ func (p *ProxyBlossomSub) Close() error {
 	return nil
 }
 
+// SetShutdownContext implements p2p.PubSub.
+func (p *ProxyBlossomSub) SetShutdownContext(ctx context.Context) {
+	// Forward to underlying client
+	p.client.SetShutdownContext(ctx)
+}
+
 // PublishToBitmask publishes data to a specific bitmask
 func (p *ProxyBlossomSub) PublishToBitmask(bitmask []byte, data []byte) error {
 	return p.client.PublishToBitmask(bitmask, data)

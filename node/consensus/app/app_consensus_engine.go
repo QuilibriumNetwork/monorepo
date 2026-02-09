@@ -55,6 +55,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/execution"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
+	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
 	tp2p "source.quilibrium.com/quilibrium/monorepo/types/p2p"
@@ -583,48 +584,74 @@ func NewAppConsensusEngine(
 			initializeCertifiedGenesis(true)
 		}
 	} else {
+		stateRestored := false
 		qc, err := engine.clockStore.GetQuorumCertificate(
 			engine.appAddress,
 			latest.FinalizedRank,
 		)
-		if err != nil || qc.GetFrameNumber() == 0 {
-			initializeCertifiedGenesis(true)
-		} else {
-			frame, _, err := engine.clockStore.GetShardClockFrame(
+		if err == nil && qc.GetFrameNumber() != 0 {
+			frame, _, frameErr := engine.clockStore.GetShardClockFrame(
 				engine.appAddress,
 				qc.GetFrameNumber(),
 				false,
 			)
-			if err != nil {
-				panic(err)
+			if frameErr != nil {
+				// Frame data was deleted (e.g., non-archive mode cleanup) but
+				// QC/consensus state still exists. Re-initialize genesis and
+				// let sync recover the state.
+				logger.Warn(
+					"frame missing for finalized QC, re-initializing genesis",
+					zap.Uint64("finalized_rank", latest.FinalizedRank),
+					zap.Uint64("qc_frame_number", qc.GetFrameNumber()),
+					zap.Error(frameErr),
+				)
+			} else {
+				parentFrame, _, parentFrameErr := engine.clockStore.GetShardClockFrame(
+					engine.appAddress,
+					qc.GetFrameNumber()-1,
+					false,
+				)
+				if parentFrameErr != nil {
+					// Parent frame missing - same recovery path
+					logger.Warn(
+						"parent frame missing for finalized QC, re-initializing genesis",
+						zap.Uint64("finalized_rank", latest.FinalizedRank),
+						zap.Uint64("qc_frame_number", qc.GetFrameNumber()),
+						zap.Error(parentFrameErr),
+					)
+				} else {
+					parentQC, parentQCErr := engine.clockStore.GetQuorumCertificate(
+						engine.appAddress,
+						parentFrame.GetRank(),
+					)
+					if parentQCErr != nil {
+						// Parent QC missing - same recovery path
+						logger.Warn(
+							"parent QC missing, re-initializing genesis",
+							zap.Uint64("finalized_rank", latest.FinalizedRank),
+							zap.Uint64("parent_rank", parentFrame.GetRank()),
+							zap.Error(parentQCErr),
+						)
+					} else {
+						state = &models.CertifiedState[*protobufs.AppShardFrame]{
+							State: &models.State[*protobufs.AppShardFrame]{
+								Rank:                    frame.GetRank(),
+								Identifier:              frame.Identity(),
+								ProposerID:              frame.Source(),
+								ParentQuorumCertificate: parentQC,
+								Timestamp:               frame.GetTimestamp(),
+								State:                   &frame,
+							},
+							CertifyingQuorumCertificate: qc,
+						}
+						pending = engine.getPendingProposals(frame.Header.FrameNumber)
+						stateRestored = true
+					}
+				}
 			}
-			parentFrame, _, err := engine.clockStore.GetShardClockFrame(
-				engine.appAddress,
-				qc.GetFrameNumber()-1,
-				false,
-			)
-			if err != nil {
-				panic(err)
-			}
-			parentQC, err := engine.clockStore.GetQuorumCertificate(
-				engine.appAddress,
-				parentFrame.GetRank(),
-			)
-			if err != nil {
-				panic(err)
-			}
-			state = &models.CertifiedState[*protobufs.AppShardFrame]{
-				State: &models.State[*protobufs.AppShardFrame]{
-					Rank:                    frame.GetRank(),
-					Identifier:              frame.Identity(),
-					ProposerID:              frame.Source(),
-					ParentQuorumCertificate: parentQC,
-					Timestamp:               frame.GetTimestamp(),
-					State:                   &frame,
-				},
-				CertifyingQuorumCertificate: qc,
-			}
-			pending = engine.getPendingProposals(frame.Header.FrameNumber)
+		}
+		if !stateRestored {
+			initializeCertifiedGenesis(true)
 		}
 	}
 
@@ -913,6 +940,13 @@ func NewAppConsensusEngine(
 		)
 	}
 
+	// Set self peer ID on hypergraph to allow unlimited self-sync sessions
+	if hgWithSelfPeer, ok := engine.hyperSync.(interface {
+		SetSelfPeerID(string)
+	}); ok {
+		hgWithSelfPeer.SetSelfPeerID(peer.ID(ps.GetPeerID()).String())
+	}
+
 	return engine, nil
 }
 
@@ -963,7 +997,8 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		e.triggerGlobalHypersync(frame.Header.Prover)
+		// Use blocking hypersync to ensure we're synced before continuing
+		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
 		return
 	}
 
@@ -980,7 +1015,8 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		e.triggerGlobalHypersync(frame.Header.Prover)
+		// Use blocking hypersync to ensure we're synced before continuing
+		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
 		return
 	}
 
@@ -1022,9 +1058,9 @@ func (e *AppConsensusEngine) computeLocalGlobalProverRoot(
 	return nil, errors.New("global prover root shard missing")
 }
 
-func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte) {
-	if e.syncProvider == nil || len(proposer) == 0 {
-		e.logger.Debug("no sync provider or proposer for hypersync")
+func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte, expectedRoot []byte) {
+	if e.syncProvider == nil {
+		e.logger.Debug("no sync provider for hypersync")
 		return
 	}
 	if bytes.Equal(proposer, e.proverAddress) {
@@ -1035,6 +1071,10 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte) {
 		e.logger.Debug("global hypersync already running")
 		return
 	}
+
+	// Sync from our own master node instead of the proposer to avoid
+	// overburdening the proposer with sync requests from all workers.
+	selfPeerID := peer.ID(e.pubsub.GetPeerID())
 
 	go func() {
 		defer e.globalProverSyncInProgress.Store(false)
@@ -1047,7 +1087,7 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte) {
 			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 		}
 
-		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil)
+		e.syncProvider.HyperSyncSelf(ctx, selfPeerID, shardKey, nil, expectedRoot)
 		if err := e.proverRegistry.Refresh(); err != nil {
 			e.logger.Warn(
 				"failed to refresh prover registry after hypersync",
@@ -1055,6 +1095,75 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte) {
 			)
 		}
 	}()
+}
+
+// performBlockingGlobalHypersync performs a synchronous hypersync that blocks
+// until completion. This is used before materializing frames to ensure we sync
+// before applying any transactions when there's a prover root mismatch.
+func (e *AppConsensusEngine) performBlockingGlobalHypersync(proposer []byte, expectedRoot []byte) {
+	if e.syncProvider == nil {
+		e.logger.Debug("blocking hypersync: no sync provider")
+		return
+	}
+	if bytes.Equal(proposer, e.proverAddress) {
+		e.logger.Debug("blocking hypersync: we are the proposer")
+		return
+	}
+
+	// Wait for any existing sync to complete first
+	for e.globalProverSyncInProgress.Load() {
+		e.logger.Debug("blocking hypersync: waiting for existing sync to complete")
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Mark sync as in progress
+	if !e.globalProverSyncInProgress.CompareAndSwap(false, true) {
+		// Another sync started, wait for it
+		for e.globalProverSyncInProgress.Load() {
+			time.Sleep(100 * time.Millisecond)
+		}
+		return
+	}
+	defer e.globalProverSyncInProgress.Store(false)
+
+	e.logger.Info(
+		"performing blocking global hypersync before processing frame",
+		zap.String("proposer", hex.EncodeToString(proposer)),
+		zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Set up shutdown handler
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-e.ShutdownSignal():
+			cancel()
+		case <-done:
+		}
+	}()
+
+	selfPeerID := peer.ID(e.pubsub.GetPeerID())
+	shardKey := tries.ShardKey{
+		L1: [3]byte{0x00, 0x00, 0x00},
+		L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+	}
+
+	// Perform sync synchronously (blocking)
+	e.syncProvider.HyperSyncSelf(ctx, selfPeerID, shardKey, nil, expectedRoot)
+	close(done)
+
+	if err := e.proverRegistry.Refresh(); err != nil {
+		e.logger.Warn(
+			"failed to refresh prover registry after blocking hypersync",
+			zap.Error(err),
+		)
+	}
+
+	e.globalProverRootSynced.Store(true)
+	e.logger.Info("blocking global hypersync completed")
 }
 
 func (e *AppConsensusEngine) GetFrame() *protobufs.AppShardFrame {
@@ -1965,6 +2074,14 @@ func (e *AppConsensusEngine) internalProveFrame(
 		stateRoots[1] = make([]byte, 64)
 		stateRoots[2] = make([]byte, 64)
 		stateRoots[3] = make([]byte, 64)
+	}
+
+	// Publish the snapshot generation with the shard's vertex add root so clients
+	// can sync against this specific state.
+	if len(stateRoots[0]) > 0 {
+		if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
+			hgCRDT.PublishSnapshot(stateRoots[0])
+		}
 	}
 
 	txMap := map[string][][]byte{}

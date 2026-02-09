@@ -1,0 +1,94 @@
+#!/bin/sh
+# Function to check if a command exists
+check_command() {
+  if ! command -v "$1" &> /dev/null; then
+    echo "Error: $1 is not installed. Please install $1 and try again."
+    exit 1
+  fi
+}
+
+# Check if cargo and pnpm are installed and abort if some of them is not.
+REQUIREMENTS=("cargo" "pnpm")
+for REQUIERMENT in ${REQUIREMENTS[@]}; do
+    check_command $REQUIERMENT;
+done
+
+cargo install cargo-audit
+cargo install cargo-unmaintained
+
+# install husky and commitlint
+pnpm add --save-dev husky @commitlint/{cli,config-conventional}
+
+# init husky
+pnpm exec husky init
+
+# Create .commitlintrc
+cat <<EOF > commitlint.config.js
+module.exports = { extends: ['@commitlint/config-conventional'] };
+EOF
+
+# Create pre-commit hook
+cat << 'EOF' > .husky/pre-commit
+#!/bin/sh
+# Run cargo fmt to format all files
+cargo fmt
+
+# Get a list of all staged files
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+# Re-stage any files that were modified by cargo fmt
+for FILE in $STAGED_FILES; do
+  if [ -f "$FILE" ]; then
+    git add "$FILE"
+  fi
+done
+
+# Run clippy to ensure code quality
+cargo clippy --all-targets
+if [ $? -ne 0 ]; then
+  echo "clippy failed"
+  exit 1
+fi
+
+# Run cargo audit to check for vulnerabilities
+cargo audit
+if [ $? -ne 0 ]; then
+  echo "cargo audit found vulnerabilities"
+  exit 1
+fi
+
+# Run cargo unmaintained to check for unmaintained dependencies
+cargo unmaintained
+if [ $? -ne 0 ]; then
+  echo "cargo unmaintained found unmaintained dependencies"
+  exit 1
+fi
+
+# Run cargo test
+cargo test
+EOF
+
+# Create commit-msg hook
+cat <<EOF > .husky/commit-msg
+#!/bin/sh
+pnpm exec commitlint --edit "\$1"
+EOF
+
+# add executable permissions
+chmod +x .husky/pre-commit
+chmod +x .husky/commit-msg
+
+# ignore locally
+LOCAL_IGNORE_FILES=(
+  "package.json"
+  "pnpm-lock.yaml"
+  "commitlint.config.js"
+  "node_modules"
+  ".husky"
+)
+
+for FILE in ${LOCAL_IGNORE_FILES[@]}; do
+  if ! grep -qF -- $FILE .git/info/exclude; then
+    echo $FILE >> .git/info/exclude
+  fi
+done

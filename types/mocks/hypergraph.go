@@ -207,14 +207,18 @@ func (h *MockHypergraph) HyperStream(
 	return args.Error(0)
 }
 
-// Sync implements hypergraph.Hypergraph.
-func (h *MockHypergraph) Sync(
-	stream protobufs.HypergraphComparisonService_HyperStreamClient,
+// SyncFrom implements hypergraph.Hypergraph.
+func (h *MockHypergraph) SyncFrom(
+	stream protobufs.HypergraphComparisonService_PerformSyncClient,
 	shardKey tries.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
-) error {
-	args := h.Called(stream, shardKey, phaseSet)
-	return args.Error(0)
+	expectedRoot []byte,
+) ([]byte, error) {
+	args := h.Called(stream, shardKey, phaseSet, expectedRoot)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]byte), args.Error(1)
 }
 
 // RunDataPruning implements hypergraph.Hypergraph.

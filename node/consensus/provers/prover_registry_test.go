@@ -1399,3 +1399,227 @@ func TestPruneOrphanJoins_IncompleteState(t *testing.T) {
 	t.Logf("  - Prover removed after all allocations pruned")
 	t.Logf("  - Registry methods confirm prover is gone")
 }
+
+// TestPruneOrphanJoins_OrphanedAllocation tests the scenario where an allocation
+// vertex exists but the prover vertex is missing. The allocation should still be
+// pruned if it's eligible (old join frame, joining status).
+func TestPruneOrphanJoins_OrphanedAllocation(t *testing.T) {
+	logger := zap.NewNop()
+
+	// Create stores with in-memory pebble DB
+	pebbleDB := store.NewPebbleDB(
+		logger,
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/prune_orphaned_alloc"},
+		0,
+	)
+	defer pebbleDB.Close()
+
+	// Create inclusion prover and verifiable encryptor
+	inclusionProver := bls48581.NewKZGInclusionProver(logger)
+	verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
+
+	// Create hypergraph store and hypergraph
+	hypergraphStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/prune_orphaned_alloc"},
+		pebbleDB,
+		logger,
+		verifiableEncryptor,
+		inclusionProver,
+	)
+	hg, err := hypergraphStore.LoadHypergraph(&tests.Nopthenticator{}, 1)
+	require.NoError(t, err)
+
+	// Create RDF multiprover for setting up test data
+	rdfMultiprover := schema.NewRDFMultiprover(
+		&schema.TurtleRDFParser{},
+		inclusionProver,
+	)
+
+	const currentFrame = uint64(1000)
+	const oldJoinFrame = uint64(100) // Will be pruned
+
+	// Helper to create ONLY an allocation vertex (no prover vertex)
+	// This simulates the case where the prover was deleted but the allocation remains
+	createOrphanedAllocation := func(
+		publicKey []byte,
+		filter []byte,
+		joinFrame uint64,
+	) (proverAddress []byte, allocationAddress []byte, err error) {
+		proverAddressBI, err := poseidon.HashBytes(publicKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		proverAddr := proverAddressBI.FillBytes(make([]byte, 32))
+
+		allocationAddressBI, err := poseidon.HashBytes(
+			slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, filter),
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		allocAddr := allocationAddressBI.FillBytes(make([]byte, 32))
+
+		hgCRDT := hg.(*hgcrdt.HypergraphCRDT)
+		txn, err := hgCRDT.NewTransaction(false)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// Create ONLY the allocation vertex (no prover vertex)
+		allocationTree := &tries.VectorCommitmentTree{}
+		_ = rdfMultiprover.Set(global.GLOBAL_RDF_SCHEMA, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"allocation:ProverAllocation", "Prover", proverAddr, allocationTree)
+		_ = rdfMultiprover.Set(global.GLOBAL_RDF_SCHEMA, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"allocation:ProverAllocation", "Status", []byte{0}, allocationTree) // Joining
+		_ = rdfMultiprover.Set(global.GLOBAL_RDF_SCHEMA, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"allocation:ProverAllocation", "ConfirmationFilter", filter, allocationTree)
+
+		frameNumberBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(frameNumberBytes, joinFrame)
+		_ = rdfMultiprover.Set(global.GLOBAL_RDF_SCHEMA, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"allocation:ProverAllocation", "JoinFrameNumber", frameNumberBytes, allocationTree)
+
+		allocationVertex := hgcrdt.NewVertex(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+			[32]byte(allocAddr),
+			allocationTree.Commit(inclusionProver, false),
+			big.NewInt(0),
+		)
+		if err := hg.AddVertex(txn, allocationVertex); err != nil {
+			txn.Abort()
+			return nil, nil, err
+		}
+
+		var allocationVertexID [64]byte
+		copy(allocationVertexID[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(allocationVertexID[32:], allocAddr)
+		if err := hg.SetVertexData(txn, allocationVertexID, allocationTree); err != nil {
+			txn.Abort()
+			return nil, nil, err
+		}
+
+		if err := txn.Commit(); err != nil {
+			return nil, nil, err
+		}
+
+		return proverAddr, allocAddr, nil
+	}
+
+	// Helper to check if vertex exists
+	vertexExists := func(vertexID [64]byte) bool {
+		_, err := hg.GetVertex(vertexID)
+		return err == nil
+	}
+
+	// Helper to check if vertex data exists
+	vertexDataExists := func(vertexID [64]byte) bool {
+		data, err := hg.GetVertexData(vertexID)
+		return err == nil && data != nil
+	}
+
+	// Helper to compute vertex ID from address
+	getVertexID := func(address []byte) [64]byte {
+		var id [64]byte
+		copy(id[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(id[32:], address)
+		return id
+	}
+
+	// Create 5 orphaned allocations (no prover vertex exists)
+	publicKeys := make([][]byte, 5)
+	proverAddresses := make([][]byte, 5)
+	allocationAddresses := make([][]byte, 5)
+	filters := make([][]byte, 5)
+
+	for i := 0; i < 5; i++ {
+		publicKeys[i] = bytes.Repeat([]byte{byte(0x70 + i)}, 585)
+		filters[i] = []byte(fmt.Sprintf("orphan_filter_%d", i))
+
+		proverAddr, allocAddr, err := createOrphanedAllocation(
+			publicKeys[i],
+			filters[i],
+			oldJoinFrame,
+		)
+		require.NoError(t, err)
+		proverAddresses[i] = proverAddr
+		allocationAddresses[i] = allocAddr
+		t.Logf("Created orphaned allocation %d: prover=%s, allocation=%s",
+			i, hex.EncodeToString(proverAddr), hex.EncodeToString(allocAddr))
+	}
+
+	// Verify initial state: allocation vertices exist, prover vertices do NOT exist
+	for i := 0; i < 5; i++ {
+		proverVertexID := getVertexID(proverAddresses[i])
+		allocVertexID := getVertexID(allocationAddresses[i])
+
+		assert.False(t, vertexExists(proverVertexID),
+			"Prover %d vertex should NOT exist (orphaned allocation)", i)
+		assert.False(t, vertexDataExists(proverVertexID),
+			"Prover %d vertex data should NOT exist (orphaned allocation)", i)
+
+		assert.True(t, vertexExists(allocVertexID),
+			"Allocation %d vertex should exist before prune", i)
+		assert.True(t, vertexDataExists(allocVertexID),
+			"Allocation %d vertex data should exist before prune", i)
+	}
+
+	// Create registry - this will load allocations from vertex data iterator
+	// The allocations will be loaded even though their prover vertices don't exist
+	registry, err := NewProverRegistry(logger, hg)
+	require.NoError(t, err)
+
+	// Verify the allocations created ProverInfo entries in the cache
+	// (with Address but no PublicKey since prover vertex doesn't exist)
+	for i := 0; i < 5; i++ {
+		info, err := registry.GetProverInfo(proverAddresses[i])
+		require.NoError(t, err)
+		if info != nil {
+			t.Logf("Prover %d in cache: address=%s, publicKey len=%d, allocations=%d",
+				i, hex.EncodeToString(info.Address), len(info.PublicKey), len(info.Allocations))
+			// The prover info should have no public key since the prover vertex doesn't exist
+			assert.Empty(t, info.PublicKey,
+				"Prover %d should have no public key (prover vertex missing)", i)
+			assert.Len(t, info.Allocations, 1,
+				"Prover %d should have 1 allocation", i)
+			// Verify VertexAddress is set on the allocation
+			assert.Len(t, info.Allocations[0].VertexAddress, 32,
+				"Allocation %d should have VertexAddress set", i)
+		}
+	}
+
+	// Run pruning
+	err = registry.PruneOrphanJoins(currentFrame)
+	require.NoError(t, err)
+
+	// Verify post-prune state: all orphaned allocations should be pruned
+	for i := 0; i < 5; i++ {
+		allocVertexID := getVertexID(allocationAddresses[i])
+
+		assert.False(t, vertexExists(allocVertexID),
+			"Allocation %d vertex should be DELETED after prune", i)
+		assert.False(t, vertexDataExists(allocVertexID),
+			"Allocation %d vertex data should be DELETED after prune", i)
+	}
+
+	// Verify registry cache state: provers should be removed
+	for i := 0; i < 5; i++ {
+		info, err := registry.GetProverInfo(proverAddresses[i])
+		require.NoError(t, err)
+		assert.Nil(t, info,
+			"Prover %d should be removed from registry cache after prune", i)
+	}
+
+	// Verify through GetProvers that the provers are gone from all filters
+	for i := 0; i < 5; i++ {
+		provers, err := registry.GetProvers(filters[i])
+		require.NoError(t, err)
+		for _, p := range provers {
+			assert.NotEqual(t, hex.EncodeToString(proverAddresses[i]), hex.EncodeToString(p.Address),
+				"Prover %d should not appear in GetProvers for filter %s", i, string(filters[i]))
+		}
+	}
+
+	t.Logf("Orphaned allocation prune test completed successfully")
+	t.Logf("  - 5 allocations with missing prover vertices: all pruned using VertexAddress")
+	t.Logf("  - Registry cache cleaned up")
+}

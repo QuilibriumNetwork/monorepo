@@ -1,0 +1,22 @@
+name: Cargo fmt
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'src/**/*.rs'
+  pull_request:
+    branches: [main, dev]
+    types: [opened, reopened, synchronize]
+    paths:
+      - 'src/**/*.rs'
+jobs:
+  cargo-fmt:
+    name: Run cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - run: cargo fmt --check -- src/**/*.rs

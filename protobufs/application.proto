@@ -40,6 +40,10 @@ message HypergraphComparisonQuery {
   // If set, the comparison response will contain the data of leaves if present
   // in the results.
   bool include_leaf_data = 6;
+  // The expected commit root the client wants to sync against. When set, the
+  // server will attempt to find a snapshot with a matching commit root. If no
+  // matching snapshot exists, the server may return the latest available.
+  bytes expected_root = 7;
 }
 
 // Defines the response containing the commitment for a node and (optionally)
@@ -176,4 +180,114 @@ message GetChildrenForPathResponse {
 service HypergraphComparisonService {
   rpc HyperStream(stream HypergraphComparison) returns (stream HypergraphComparison);
   rpc GetChildrenForPath(GetChildrenForPathRequest) returns (GetChildrenForPathResponse);
+
+  // PerformSync provides a client-driven sync interface. Unlike HyperStream
+  // which requires both sides to walk in lockstep, PerformSync uses a simple
+  // request/response pattern where the client navigates the server's tree
+  // and fetches data as needed.
+  rpc PerformSync(stream HypergraphSyncQuery) returns (stream HypergraphSyncResponse);
+}
+
+// HypergraphSyncQuery wraps request types for the client-driven sync RPC.
+message HypergraphSyncQuery {
+  oneof request {
+    HypergraphSyncGetBranchRequest get_branch = 1;
+    HypergraphSyncGetLeavesRequest get_leaves = 2;
+  }
+}
+
+// HypergraphSyncResponse wraps response types for the client-driven sync RPC.
+message HypergraphSyncResponse {
+  oneof response {
+    HypergraphSyncBranchResponse branch = 1;
+    HypergraphSyncLeavesResponse leaves = 2;
+    HypergraphSyncError error = 3;
+  }
+}
+
+// HypergraphSyncGetBranchRequest queries for branch information at a path.
+message HypergraphSyncGetBranchRequest {
+  // The shard key (35 bytes: L1 bloom filter (3) + L2 app address (32)).
+  bytes shard_key = 1;
+  // The phase set to query.
+  HypergraphPhaseSet phase_set = 2;
+  // The path to query. Empty path queries the root.
+  repeated int32 path = 3;
+  // The expected root commitment the client wants to sync against. When set,
+  // the server will attempt to find a snapshot with a matching root. If empty,
+  // the server uses the latest available snapshot.
+  bytes expected_root = 4;
+}
+
+// HypergraphSyncBranchResponse contains branch information at the queried path.
+message HypergraphSyncBranchResponse {
+  // The full path to this node, including any compressed prefix.
+  // This may be longer than the requested path due to path compression.
+  repeated int32 full_path = 1;
+  // The commitment (hash) for this node.
+  bytes commitment = 2;
+  // Child information. Empty if this is a leaf node.
+  repeated HypergraphSyncChildInfo children = 3;
+  // True if this node is a leaf (has no children).
+  bool is_leaf = 4;
+  // The number of leaves under this node (for progress estimation).
+  uint64 leaf_count = 5;
+}
+
+// HypergraphSyncChildInfo contains summary information about a child node.
+message HypergraphSyncChildInfo {
+  // The child index (0-63 for a 64-ary tree).
+  int32 index = 1;
+  // The commitment (hash) for this child.
+  bytes commitment = 2;
+}
+
+// HypergraphSyncGetLeavesRequest requests all leaves under a subtree.
+message HypergraphSyncGetLeavesRequest {
+  // The shard key.
+  bytes shard_key = 1;
+  // The phase set to query.
+  HypergraphPhaseSet phase_set = 2;
+  // The path to the subtree root.
+  repeated int32 path = 3;
+  // Maximum number of leaves to return (0 = server default).
+  uint32 max_leaves = 4;
+  // Continuation token for pagination. Empty for first request.
+  bytes continuation_token = 5;
+  // The expected root commitment the client wants to sync against. When set,
+  // the server will attempt to find a snapshot with a matching root. If empty,
+  // the server uses the latest available snapshot.
+  bytes expected_root = 6;
+}
+
+// HypergraphSyncLeavesResponse contains leaves from the requested subtree.
+message HypergraphSyncLeavesResponse {
+  // Echoed path from the request.
+  repeated int32 path = 1;
+  // The leaves under this path (reuses existing LeafData message).
+  repeated LeafData leaves = 2;
+  // Continuation token if more leaves remain. Empty if this is the last batch.
+  bytes continuation_token = 3;
+  // Total number of leaves under this path (for progress tracking).
+  uint64 total_leaves = 4;
+}
+
+// HypergraphSyncError reports an error during sync.
+message HypergraphSyncError {
+  // Error code for programmatic handling.
+  HypergraphSyncErrorCode code = 1;
+  // Human-readable error message.
+  string message = 2;
+  // The path where the error occurred, if applicable.
+  repeated int32 path = 3;
+}
+
+// HypergraphSyncErrorCode enumerates possible sync errors.
+enum HypergraphSyncErrorCode {
+  HYPERGRAPH_SYNC_ERROR_UNKNOWN = 0;
+  HYPERGRAPH_SYNC_ERROR_INVALID_SHARD_KEY = 1;
+  HYPERGRAPH_SYNC_ERROR_INVALID_PATH = 2;
+  HYPERGRAPH_SYNC_ERROR_NODE_NOT_FOUND = 3;
+  HYPERGRAPH_SYNC_ERROR_SNAPSHOT_UNAVAILABLE = 4;
+  HYPERGRAPH_SYNC_ERROR_INTERNAL = 5;
 }

@@ -203,7 +203,7 @@ var appConsensusSet = wire.NewSet(
 	app.NewAppConsensusEngineFactory,
 )
 
-func NewDHTNode(*zap.Logger, *config.Config, uint) (*DHTNode, error) {
+func NewDHTNode(*zap.Logger, *config.Config, uint, p2p.ConfigDir) (*DHTNode, error) {
 	panic(wire.Build(
 		pubSubSet,
 		newDHTNode,
@@ -228,6 +228,7 @@ func NewDataWorkerNodeWithProxyPubsub(
 	coreId uint,
 	rpcMultiaddr string,
 	parentProcess int,
+	configDir p2p.ConfigDir,
 ) (*DataWorkerNode, error) {
 	panic(wire.Build(
 		verencSet,
@@ -251,6 +252,7 @@ func NewDataWorkerNodeWithoutProxyPubsub(
 	coreId uint,
 	rpcMultiaddr string,
 	parentProcess int,
+	configDir p2p.ConfigDir,
 ) (*DataWorkerNode, error) {
 	panic(wire.Build(
 		verencSet,
@@ -274,6 +276,7 @@ func NewDataWorkerNode(
 	coreId uint,
 	rpcMultiaddr string,
 	parentProcess int,
+	configDir p2p.ConfigDir,
 ) (*DataWorkerNode, error) {
 	if config.Engine.EnableMasterProxy {
 		return NewDataWorkerNodeWithProxyPubsub(
@@ -282,6 +285,7 @@ func NewDataWorkerNode(
 			coreId,
 			rpcMultiaddr,
 			parentProcess,
+			configDir,
 		)
 	} else {
 		return NewDataWorkerNodeWithoutProxyPubsub(
@@ -290,6 +294,7 @@ func NewDataWorkerNode(
 			coreId,
 			rpcMultiaddr,
 			parentProcess,
+			configDir,
 		)
 	}
 }
@@ -385,6 +390,7 @@ func NewMasterNode(
 	logger *zap.Logger,
 	config *config.Config,
 	coreId uint,
+	configDir p2p.ConfigDir,
 ) (*MasterNode, error) {
 	panic(wire.Build(
 		verencSet,

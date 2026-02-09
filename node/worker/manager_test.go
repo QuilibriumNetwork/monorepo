@@ -264,7 +264,8 @@ func TestWorkerManager_AllocateDeallocateWorker(t *testing.T) {
 			"quilibrium.node.global.pb.KeyRegistryService":               channel.OnlySelfPeer,
 		},
 		map[string]channel.AllowedPeerPolicyType{
-			"/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream": channel.OnlyShardProverPeer,
+			"/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream":  channel.OnlyShardProverPeer,
+			"/quilibrium.node.application.pb.HypergraphComparisonService/PerformSync":  channel.OnlyShardProverPeer,
 			"/quilibrium.node.global.pb.MixnetService/GetTag":                         channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutTag":                         channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutMessage":                     channel.AnyPeer,
@@ -561,7 +562,8 @@ func TestWorkerManager_EmptyFilter(t *testing.T) {
 			"quilibrium.node.global.pb.KeyRegistryService":               channel.OnlySelfPeer,
 		},
 		map[string]channel.AllowedPeerPolicyType{
-			"/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream": channel.OnlyShardProverPeer,
+			"/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream":  channel.OnlyShardProverPeer,
+			"/quilibrium.node.application.pb.HypergraphComparisonService/PerformSync":  channel.OnlyShardProverPeer,
 			"/quilibrium.node.global.pb.MixnetService/GetTag":                         channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutTag":                         channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutMessage":                     channel.AnyPeer,
@@ -687,7 +689,8 @@ func TestWorkerManager_FilterUpdate(t *testing.T) {
 			"quilibrium.node.global.pb.KeyRegistryService":               channel.OnlySelfPeer,
 		},
 		map[string]channel.AllowedPeerPolicyType{
-			"/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream": channel.OnlyShardProverPeer,
+			"/quilibrium.node.application.pb.HypergraphComparisonService/HyperStream":  channel.OnlyShardProverPeer,
+			"/quilibrium.node.application.pb.HypergraphComparisonService/PerformSync":  channel.OnlyShardProverPeer,
 			"/quilibrium.node.global.pb.MixnetService/GetTag":                         channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutTag":                         channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutMessage":                     channel.AnyPeer,

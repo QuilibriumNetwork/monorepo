@@ -77,6 +77,16 @@ var (
 		[]string{"distributor_type", "event_type"},
 	)
 
+	eventsDroppedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: subsystem,
+			Name:      "events_dropped_total",
+			Help:      "Total number of events dropped due to full subscriber channel",
+		},
+		[]string{"distributor_type", "event_type", "subscriber_id"},
+	)
+
 	broadcastDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: metricsNamespace,

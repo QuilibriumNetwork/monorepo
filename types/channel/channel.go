@@ -18,7 +18,7 @@ type MessageCiphertext struct {
 type P2PChannelEnvelope struct {
 	ProtocolIdentifier uint16            `json:"protocol_identifier"`
 	MessageHeader      MessageCiphertext `json:"message_header"`
-	MessageBody        MessageCiphertext `json:"message_ciphertext"`
+	MessageBody        MessageCiphertext `json:"message_body"`
 }
 
 type PublicChannelClient interface {

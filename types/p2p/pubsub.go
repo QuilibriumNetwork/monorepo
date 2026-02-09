@@ -20,6 +20,10 @@ const (
 )
 
 type PubSub interface {
+	// SetShutdownContext allows the caller to provide a context that, when
+	// cancelled, will trigger graceful shutdown of the pubsub subscription
+	// loops. This should be called before subscribing to any bitmasks.
+	SetShutdownContext(ctx context.Context)
 	Close() error
 	PublishToBitmask(bitmask []byte, data []byte) error
 	Publish(address []byte, data []byte) error

@@ -205,7 +205,7 @@ func (a *AppEventDistributor) processAppEvent(event consensustime.AppEvent) {
 	a.broadcast(controlEvent)
 }
 
-// broadcast sends a control event to all subscribers
+// broadcast sends a control event to all subscribers (non-blocking)
 func (a *AppEventDistributor) broadcast(event consensus.ControlEvent) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -216,8 +216,14 @@ func (a *AppEventDistributor) broadcast(event consensus.ControlEvent) {
 	eventTypeStr := getEventTypeString(event.Type)
 	broadcastsTotal.WithLabelValues("app", eventTypeStr).Inc()
 
-	for _, ch := range a.subscribers {
-		ch <- event
+	for id, ch := range a.subscribers {
+		select {
+		case ch <- event:
+		default:
+			// Subscriber channel full - drop event to avoid blocking the time reel.
+			// This prevents a slow subscriber from deadlocking frame processing.
+			eventsDroppedTotal.WithLabelValues("app", eventTypeStr, id).Inc()
+		}
 	}
 }
 

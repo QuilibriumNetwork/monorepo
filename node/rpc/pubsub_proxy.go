@@ -26,9 +26,10 @@ type PubSubProxyServer struct {
 	logger *zap.Logger
 
 	// Track subscriptions and validators
-	subscriptions map[string]context.CancelFunc
-	validators    map[string]validatorInfo
-	mu            sync.RWMutex
+	subscriptions       map[string]context.CancelFunc
+	validators          map[string]validatorInfo
+	registeredBitmasks  map[string]bool // bitmask key -> registered
+	mu                  sync.RWMutex
 }
 
 type validatorInfo struct {
@@ -43,10 +44,11 @@ func NewPubSubProxyServer(
 	logger *zap.Logger,
 ) *PubSubProxyServer {
 	return &PubSubProxyServer{
-		pubsub:        pubsub,
-		logger:        logger,
-		subscriptions: make(map[string]context.CancelFunc),
-		validators:    make(map[string]validatorInfo),
+		pubsub:             pubsub,
+		logger:             logger,
+		subscriptions:      make(map[string]context.CancelFunc),
+		validators:         make(map[string]validatorInfo),
+		registeredBitmasks: make(map[string]bool),
 	}
 }
 
@@ -155,11 +157,29 @@ func (s *PubSubProxyServer) ValidatorStream(
 ) error {
 	// Map to store validator callbacks that will send requests back to client
 	validatorCallbacks := make(map[string]chan *protobufs.ValidationRequest)
+	// Track which bitmasks were registered on this stream for cleanup
+	streamBitmasks := make(map[string]bool)
+
 	defer func() {
 		// Clean up all validators on disconnect
 		for _, ch := range validatorCallbacks {
 			close(ch)
 		}
+
+		// Clear the bitmask registrations for this stream so reconnecting
+		// workers can re-register their validators
+		s.mu.Lock()
+		for bitmaskKey := range streamBitmasks {
+			delete(s.registeredBitmasks, bitmaskKey)
+			// Also unregister from the underlying pubsub so a new registration
+			// can take its place
+			if err := s.pubsub.UnregisterValidator([]byte(bitmaskKey)); err != nil {
+				s.logger.Debug("failed to unregister validator on stream cleanup",
+					zap.String("bitmask", bitmaskKey),
+					zap.Error(err))
+			}
+		}
+		s.mu.Unlock()
 	}()
 
 	// Handle incoming messages from client
@@ -174,6 +194,21 @@ func (s *PubSubProxyServer) ValidatorStream(
 			switch m := msg.Message.(type) {
 			case *protobufs.ValidationStreamMessage_Register:
 				reg := m.Register
+				bitmaskKey := string(reg.Bitmask)
+
+				// Check if validator already registered for this bitmask - the
+				// validator is always the same, so just noop for repeats
+				s.mu.RLock()
+				alreadyRegistered := s.registeredBitmasks[bitmaskKey]
+				s.mu.RUnlock()
+
+				if alreadyRegistered {
+					s.logger.Debug("validator already registered for bitmask, skipping",
+						zap.String("validator_id", reg.ValidatorId),
+						zap.Binary("bitmask", reg.Bitmask))
+					continue
+				}
+
 				s.logger.Debug("registering validator",
 					zap.String("validator_id", reg.ValidatorId),
 					zap.Binary("bitmask", reg.Bitmask))
@@ -241,16 +276,30 @@ func (s *PubSubProxyServer) ValidatorStream(
 					s.logger.Error("failed to register validator", zap.Error(err))
 					delete(validatorCallbacks, reg.ValidatorId)
 					close(reqChan)
+				} else {
+					// Mark bitmask as having a registered validator
+					s.mu.Lock()
+					s.registeredBitmasks[bitmaskKey] = true
+					s.mu.Unlock()
+					// Track for cleanup when stream ends
+					streamBitmasks[bitmaskKey] = true
 				}
 
 			case *protobufs.ValidationStreamMessage_Unregister:
 				unreg := m.Unregister
+				bitmaskKey := string(unreg.Bitmask)
 				s.logger.Debug("unregistering validator",
 					zap.String("validator_id", unreg.ValidatorId))
 
 				if err := s.pubsub.UnregisterValidator(unreg.Bitmask); err != nil {
 					s.logger.Error("failed to unregister validator", zap.Error(err))
 				}
+
+				// Clear the bitmask registration
+				s.mu.Lock()
+				delete(s.registeredBitmasks, bitmaskKey)
+				s.mu.Unlock()
+				delete(streamBitmasks, bitmaskKey)
 
 				if ch, exists := validatorCallbacks[unreg.ValidatorId]; exists {
 					close(ch)
@@ -515,6 +564,12 @@ func (s *PubSubProxyServer) GetPublicKey(
 	}, nil
 }
 
+// validatorRegistration tracks a registered validator's metadata
+type validatorRegistration struct {
+	validatorID string
+	sync        bool
+}
+
 // PubSubProxyClient wraps a gRPC client to implement the p2p.PubSub interface
 type PubSubProxyClient struct {
 	client protobufs.PubSubProxyClient
@@ -525,7 +580,7 @@ type PubSubProxyClient struct {
 	// Track active subscriptions and validators
 	subscriptions     map[string]context.CancelFunc
 	validators        map[string]func(peer.ID, *pb.Message) p2p.ValidationResult
-	bitmaskValidators map[string]string // bitmask -> validatorID
+	bitmaskValidators map[string]validatorRegistration // bitmask -> registration info
 	validatorStream   protobufs.PubSubProxy_ValidatorStreamClient
 	validatorStreamMu sync.Mutex
 	mu                sync.RWMutex
@@ -534,6 +589,11 @@ type PubSubProxyClient struct {
 // Close implements p2p.PubSub.
 func (c *PubSubProxyClient) Close() error {
 	return nil
+}
+
+// SetShutdownContext implements p2p.PubSub.
+func (c *PubSubProxyClient) SetShutdownContext(ctx context.Context) {
+	// No-op for proxy client - shutdown is handled by the proxied pubsub
 }
 
 // NewPubSubProxyClient creates a new proxy client
@@ -552,7 +612,7 @@ func NewPubSubProxyClient(
 			peer.ID,
 			*pb.Message,
 		) p2p.ValidationResult),
-		bitmaskValidators: make(map[string]string),
+		bitmaskValidators: make(map[string]validatorRegistration),
 	}
 
 	// HACK: Kludgy, but the master process spawns the workers almost certainly
@@ -604,10 +664,56 @@ func (c *PubSubProxyClient) initValidatorStream(ctx context.Context) error {
 			c.validatorStream = stream
 			c.validatorStreamMu.Unlock()
 
+			// Re-register any existing validators after reconnecting
+			// This handles the case where the master restarted but workers are still alive
+			c.reregisterValidators()
+
 			// Start goroutine to handle incoming validation requests
 			go c.handleValidationRequests(ctx)
 
 			return nil
+		}
+	}
+}
+
+// reregisterValidators re-sends registration messages for all locally tracked
+// validators. This is needed when the stream reconnects after the master restarts.
+func (c *PubSubProxyClient) reregisterValidators() {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if len(c.bitmaskValidators) == 0 {
+		return
+	}
+
+	c.logger.Info("re-registering validators after reconnect",
+		zap.Int("count", len(c.bitmaskValidators)))
+
+	c.validatorStreamMu.Lock()
+	defer c.validatorStreamMu.Unlock()
+
+	if c.validatorStream == nil {
+		return
+	}
+
+	for bitmaskKey, reg := range c.bitmaskValidators {
+		req := &protobufs.ValidationStreamMessage{
+			Message: &protobufs.ValidationStreamMessage_Register{
+				Register: &protobufs.RegisterValidatorRequest{
+					Bitmask:     []byte(bitmaskKey),
+					ValidatorId: reg.validatorID,
+					Sync:        reg.sync,
+				},
+			},
+		}
+
+		if err := c.validatorStream.Send(req); err != nil {
+			c.logger.Error("failed to re-register validator",
+				zap.String("validator_id", reg.validatorID),
+				zap.Error(err))
+		} else {
+			c.logger.Debug("re-registered validator",
+				zap.String("validator_id", reg.validatorID))
 		}
 	}
 }
@@ -799,9 +905,9 @@ func (c *PubSubProxyClient) RegisterValidator(
 
 	// Check if there's already a validator for this bitmask
 	c.mu.Lock()
-	if existingID, exists := c.bitmaskValidators[bitmaskKey]; exists {
+	if existingReg, exists := c.bitmaskValidators[bitmaskKey]; exists {
 		// Unregister the existing validator first
-		delete(c.validators, existingID)
+		delete(c.validators, existingReg.validatorID)
 		delete(c.bitmaskValidators, bitmaskKey)
 		c.mu.Unlock()
 
@@ -810,7 +916,7 @@ func (c *PubSubProxyClient) RegisterValidator(
 			Message: &protobufs.ValidationStreamMessage_Unregister{
 				Unregister: &protobufs.UnregisterValidatorRequest{
 					Bitmask:     bitmask, // buildutils:allow-slice-alias slice is static
-					ValidatorId: existingID,
+					ValidatorId: existingReg.validatorID,
 				},
 			},
 		}
@@ -827,7 +933,10 @@ func (c *PubSubProxyClient) RegisterValidator(
 
 	// Store the validator function and mapping
 	c.validators[validatorID] = validator
-	c.bitmaskValidators[bitmaskKey] = validatorID
+	c.bitmaskValidators[bitmaskKey] = validatorRegistration{
+		validatorID: validatorID,
+		sync:        sync,
+	}
 	c.mu.Unlock()
 
 	// Send register request through the stream
@@ -872,14 +981,14 @@ func (c *PubSubProxyClient) UnregisterValidator(bitmask []byte) error {
 
 	// Find and remove the validator ID for this bitmask
 	c.mu.Lock()
-	validatorID, exists := c.bitmaskValidators[bitmaskKey]
+	reg, exists := c.bitmaskValidators[bitmaskKey]
 	if !exists {
 		c.mu.Unlock()
 		return nil // No validator registered for this bitmask
 	}
 
 	// Clean up the mappings
-	delete(c.validators, validatorID)
+	delete(c.validators, reg.validatorID)
 	delete(c.bitmaskValidators, bitmaskKey)
 	c.mu.Unlock()
 
@@ -888,7 +997,7 @@ func (c *PubSubProxyClient) UnregisterValidator(bitmask []byte) error {
 		Message: &protobufs.ValidationStreamMessage_Unregister{
 			Unregister: &protobufs.UnregisterValidatorRequest{
 				Bitmask:     bitmask, // buildutils:allow-slice-alias slice is static
-				ValidatorId: validatorID,
+				ValidatorId: reg.validatorID,
 			},
 		},
 	}

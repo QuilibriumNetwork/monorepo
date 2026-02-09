@@ -25,7 +25,8 @@ members = [
     "crates/rpm",
     "crates/bulletproofs",
     "crates/verenc",
-    "crates/ferret"
+    "crates/ferret",
+    "crates/dkls23_ffi"
 ]
 
 [profile.release]

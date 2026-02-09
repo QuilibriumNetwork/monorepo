@@ -118,6 +118,7 @@ type GlobalConsensusEngine struct {
 	config             *config.Config
 	pubsub             tp2p.PubSub
 	hypergraph         hypergraph.Hypergraph
+	hypergraphStore    store.HypergraphStore
 	keyManager         typeskeys.KeyManager
 	keyStore           store.KeyStore
 	clockStore         store.ClockStore
@@ -201,6 +202,7 @@ type GlobalConsensusEngine struct {
 	appFrameStoreMu           sync.RWMutex
 	lowCoverageStreak         map[string]*coverageStreak
 	proverOnlyMode            atomic.Bool
+	coverageCheckInProgress   atomic.Bool
 	peerInfoDigestCache       map[string]struct{}
 	peerInfoDigestCacheMu     sync.Mutex
 	keyRegistryDigestCache    map[string]struct{}
@@ -298,6 +300,7 @@ func NewGlobalConsensusEngine(
 		config:                      config,
 		pubsub:                      ps,
 		hypergraph:                  hypergraph,
+		hypergraphStore:             hypergraphStore,
 		keyManager:                  keyManager,
 		keyStore:                    keyStore,
 		clockStore:                  clockStore,
@@ -566,6 +569,43 @@ func NewGlobalConsensusEngine(
 	componentBuilder.AddWorker(engine.globalTimeReel.Start)
 	componentBuilder.AddWorker(engine.startGlobalMessageAggregator)
 
+	adds := engine.hypergraph.(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(
+		tries.ShardKey{
+			L1: [3]byte{},
+			L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
+		},
+	)
+
+	if lc, _ := adds.GetTree().GetMetadata(); lc == 0 {
+		if config.P2P.Network == 0 {
+			genesisData := engine.getMainnetGenesisJSON()
+			if genesisData == nil {
+				panic("no genesis data")
+			}
+
+			state := hgstate.NewHypergraphState(engine.hypergraph)
+
+			err = engine.establishMainnetGenesisProvers(state, genesisData)
+			if err != nil {
+				engine.logger.Error("failed to establish provers", zap.Error(err))
+				panic(err)
+			}
+
+			err = state.Commit()
+			if err != nil {
+				engine.logger.Error("failed to commit", zap.Error(err))
+				panic(err)
+			}
+		} else {
+			engine.establishTestnetGenesisProvers()
+		}
+
+		err := engine.proverRegistry.Refresh()
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	if engine.config.P2P.Network == 99 || engine.config.Engine.ArchiveMode {
 		latest, err := engine.consensusStore.GetConsensusState(nil)
 		var state *models.CertifiedState[*protobufs.GlobalFrame]
@@ -597,42 +637,6 @@ func NewGlobalConsensusEngine(
 		if err != nil {
 			establishGenesis()
 		} else {
-			adds := engine.hypergraph.(*hgcrdt.HypergraphCRDT).GetVertexAddsSet(
-				tries.ShardKey{
-					L1: [3]byte{},
-					L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
-				},
-			)
-
-			if lc, _ := adds.GetTree().GetMetadata(); lc == 0 {
-				if config.P2P.Network == 0 {
-					genesisData := engine.getMainnetGenesisJSON()
-					if genesisData == nil {
-						panic("no genesis data")
-					}
-
-					state := hgstate.NewHypergraphState(engine.hypergraph)
-
-					err = engine.establishMainnetGenesisProvers(state, genesisData)
-					if err != nil {
-						engine.logger.Error("failed to establish provers", zap.Error(err))
-						panic(err)
-					}
-
-					err = state.Commit()
-					if err != nil {
-						engine.logger.Error("failed to commit", zap.Error(err))
-						panic(err)
-					}
-				} else {
-					engine.establishTestnetGenesisProvers()
-				}
-
-				err := engine.proverRegistry.Refresh()
-				if err != nil {
-					panic(err)
-				}
-			}
 			if latest.LatestTimeout != nil {
 				logger.Info(
 					"obtained latest consensus state",
@@ -1025,6 +1029,18 @@ func NewGlobalConsensusEngine(
 		)
 	}
 
+	// Wire up pubsub shutdown to the component's shutdown signal
+	engine.pubsub.SetShutdownContext(
+		contextFromShutdownSignal(engine.ShutdownSignal()),
+	)
+
+	// Set self peer ID on hypergraph to allow unlimited self-sync sessions
+	if hgWithSelfPeer, ok := engine.hyperSync.(interface {
+		SetSelfPeerID(string)
+	}); ok {
+		hgWithSelfPeer.SetSelfPeerID(peer.ID(ps.GetPeerID()).String())
+	}
+
 	return engine, nil
 }
 
@@ -1171,6 +1187,11 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.UnregisterValidator(GLOBAL_PEER_INFO_BITMASK)
 	e.pubsub.Unsubscribe(GLOBAL_ALERT_BITMASK, false)
 	e.pubsub.UnregisterValidator(GLOBAL_ALERT_BITMASK)
+
+	// Close pubsub to cancel all subscription goroutines
+	if err := e.pubsub.Close(); err != nil {
+		e.logger.Warn("error closing pubsub", zap.Error(err))
+	}
 
 	select {
 	case <-e.Done():
@@ -1615,6 +1636,86 @@ func (e *GlobalConsensusEngine) materialize(
 		return errors.Wrap(err, "materialize")
 	}
 
+	var expectedRootHex string
+	localRootHex := ""
+
+	// Check prover root BEFORE processing transactions. If there's a mismatch,
+	// we need to sync first, otherwise we'll apply transactions on top of
+	// divergent state and then sync will delete the newly added records.
+	if len(expectedProverRoot) > 0 {
+		localProverRoot, localRootErr := e.computeLocalProverRoot(frameNumber)
+		if localRootErr != nil {
+			e.logger.Warn(
+				"failed to compute local prover root",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Error(localRootErr),
+			)
+		}
+
+		updatedProverRoot := localProverRoot
+		if localRootErr == nil && len(localProverRoot) > 0 {
+			if !bytes.Equal(localProverRoot, expectedProverRoot) {
+				e.logger.Info(
+					"prover root mismatch detected before processing frame, syncing first",
+					zap.Uint64("frame_number", frameNumber),
+					zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
+					zap.String("local_root", hex.EncodeToString(localProverRoot)),
+				)
+				// Perform blocking hypersync before continuing
+				_ = e.performBlockingProverHypersync(
+					proposer,
+					expectedProverRoot,
+				)
+
+				// Re-compute local prover root after sync to verify convergence
+				newLocalRoot, newRootErr := e.computeLocalProverRoot(frameNumber)
+				if newRootErr != nil {
+					e.logger.Warn(
+						"failed to compute local prover root after sync",
+						zap.Uint64("frame_number", frameNumber),
+						zap.Error(newRootErr),
+					)
+				} else {
+					updatedProverRoot = newLocalRoot
+					if !bytes.Equal(newLocalRoot, expectedProverRoot) {
+						e.logger.Warn(
+							"prover root still mismatched after sync - convergence failed",
+							zap.Uint64("frame_number", frameNumber),
+							zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
+							zap.String("post_sync_local_root", hex.EncodeToString(newLocalRoot)),
+						)
+					} else {
+						e.logger.Info(
+							"prover root converged after sync",
+							zap.Uint64("frame_number", frameNumber),
+							zap.String("root", hex.EncodeToString(newLocalRoot)),
+						)
+					}
+				}
+			}
+		}
+
+		// Publish the snapshot generation with the new root so clients can sync
+		// against this specific state.
+		if len(updatedProverRoot) > 0 {
+			if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
+				hgCRDT.PublishSnapshot(updatedProverRoot)
+			}
+		}
+
+		if len(expectedProverRoot) > 0 {
+			expectedRootHex = hex.EncodeToString(expectedProverRoot)
+		}
+		if len(localProverRoot) > 0 {
+			localRootHex = hex.EncodeToString(localProverRoot)
+		}
+
+		if bytes.Equal(updatedProverRoot, expectedProverRoot) {
+			e.proverRootSynced.Store(true)
+			e.proverRootVerifiedFrame.Store(frameNumber)
+		}
+	}
+
 	var state state.State
 	state = hgstate.NewHypergraphState(e.hypergraph)
 
@@ -1703,13 +1804,17 @@ func (e *GlobalConsensusEngine) materialize(
 		return err
 	}
 
-	err = e.proverRegistry.PruneOrphanJoins(frameNumber)
-	if err != nil {
+	if err := state.Commit(); err != nil {
 		return errors.Wrap(err, "materialize")
 	}
 
-	if err := state.Commit(); err != nil {
-		return errors.Wrap(err, "materialize")
+	// Persist any alt shard updates from this frame
+	if err := e.persistAltShardUpdates(frameNumber, requests); err != nil {
+		e.logger.Error(
+			"failed to persist alt shard updates",
+			zap.Uint64("frame_number", frameNumber),
+			zap.Error(err),
+		)
 	}
 
 	err = e.proverRegistry.ProcessStateTransition(state, frameNumber)
@@ -1717,43 +1822,13 @@ func (e *GlobalConsensusEngine) materialize(
 		return errors.Wrap(err, "materialize")
 	}
 
-	shouldVerifyRoot := !e.config.Engine.ArchiveMode || e.config.P2P.Network == 99
-	localProverRoot, localRootErr := e.computeLocalProverRoot(frameNumber)
-	if localRootErr != nil {
-		logMsg := "failed to compute local prover root"
-		if shouldVerifyRoot {
-			e.logger.Warn(
-				logMsg,
-				zap.Uint64("frame_number", frameNumber),
-				zap.Error(localRootErr),
-			)
-		} else {
-			e.logger.Debug(
-				logMsg,
-				zap.Uint64("frame_number", frameNumber),
-				zap.Error(localRootErr),
-			)
-		}
+	err = e.proverRegistry.PruneOrphanJoins(frameNumber)
+	if err != nil {
+		return errors.Wrap(err, "materialize")
 	}
 
-	if len(localProverRoot) > 0 && shouldVerifyRoot {
-		if e.verifyProverRoot(
-			frameNumber,
-			expectedProverRoot,
-			localProverRoot,
-			proposer,
-		) {
-			e.reconcileLocalWorkerAllocations()
-		}
-	}
-
-	var expectedRootHex string
-	if len(expectedProverRoot) > 0 {
-		expectedRootHex = hex.EncodeToString(expectedProverRoot)
-	}
-	localRootHex := ""
-	if len(localProverRoot) > 0 {
-		localRootHex = hex.EncodeToString(localProverRoot)
+	if len(localRootHex) > 0 {
+		e.reconcileLocalWorkerAllocations()
 	}
 
 	e.logger.Info(
@@ -1766,6 +1841,91 @@ func (e *GlobalConsensusEngine) materialize(
 		zap.String("local_root", localRootHex),
 		zap.String("proposer", hex.EncodeToString(proposer)),
 		zap.Duration("duration", time.Since(start)),
+	)
+
+	return nil
+}
+
+// persistAltShardUpdates iterates through frame requests to find and persist
+// any AltShardUpdate messages to the hypergraph store.
+func (e *GlobalConsensusEngine) persistAltShardUpdates(
+	frameNumber uint64,
+	requests []*protobufs.MessageBundle,
+) error {
+	var altUpdates []*protobufs.AltShardUpdate
+
+	// Collect all alt shard updates from the frame's requests
+	for _, bundle := range requests {
+		if bundle == nil {
+			continue
+		}
+		for _, req := range bundle.Requests {
+			if req == nil {
+				continue
+			}
+			if altUpdate := req.GetAltShardUpdate(); altUpdate != nil {
+				altUpdates = append(altUpdates, altUpdate)
+			}
+		}
+	}
+
+	if len(altUpdates) == 0 {
+		return nil
+	}
+
+	// Create a transaction for the hypergraph store
+	txn, err := e.hypergraphStore.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "persist alt shard updates")
+	}
+
+	for _, update := range altUpdates {
+		// Derive shard address from public key
+		if len(update.PublicKey) == 0 {
+			e.logger.Warn("alt shard update with empty public key, skipping")
+			continue
+		}
+
+		addrBI, err := poseidon.HashBytes(update.PublicKey)
+		if err != nil {
+			e.logger.Warn(
+				"failed to hash alt shard public key",
+				zap.Error(err),
+			)
+			continue
+		}
+		shardAddress := addrBI.FillBytes(make([]byte, 32))
+
+		// Persist the alt shard commit
+		err = e.hypergraphStore.SetAltShardCommit(
+			txn,
+			frameNumber,
+			shardAddress,
+			update.VertexAddsRoot,
+			update.VertexRemovesRoot,
+			update.HyperedgeAddsRoot,
+			update.HyperedgeRemovesRoot,
+		)
+		if err != nil {
+			txn.Abort()
+			return errors.Wrap(err, "persist alt shard updates")
+		}
+
+		e.logger.Debug(
+			"persisted alt shard update",
+			zap.Uint64("frame_number", frameNumber),
+			zap.String("shard_address", hex.EncodeToString(shardAddress)),
+		)
+	}
+
+	if err := txn.Commit(); err != nil {
+		return errors.Wrap(err, "persist alt shard updates")
+	}
+
+	e.logger.Info(
+		"persisted alt shard updates",
+		zap.Uint64("frame_number", frameNumber),
+		zap.Int("count", len(altUpdates)),
 	)
 
 	return nil
@@ -1816,7 +1976,7 @@ func (e *GlobalConsensusEngine) verifyProverRoot(
 		)
 		e.proverRootSynced.Store(false)
 		e.proverRootVerifiedFrame.Store(0)
-		e.triggerProverHypersync(proposer)
+		e.triggerProverHypersync(proposer, expected)
 		return false
 	}
 
@@ -1832,7 +1992,7 @@ func (e *GlobalConsensusEngine) verifyProverRoot(
 	return true
 }
 
-func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte) {
+func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte, expectedRoot []byte) {
 	if e.syncProvider == nil || len(proposer) == 0 {
 		e.logger.Debug("no sync provider or proposer")
 		return
@@ -1854,7 +2014,7 @@ func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte) {
 			L1: [3]byte{0x00, 0x00, 0x00},
 			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 		}
-		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil)
+		e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
 		if err := e.proverRegistry.Refresh(); err != nil {
 			e.logger.Warn(
 				"failed to refresh prover registry after hypersync",
@@ -1873,7 +2033,78 @@ func (e *GlobalConsensusEngine) triggerProverHypersync(proposer []byte) {
 	}()
 }
 
+// performBlockingProverHypersync performs a synchronous hypersync that blocks
+// until completion. This is used at the start of materialize to ensure we sync
+// before applying any transactions when there's a prover root mismatch.
+func (e *GlobalConsensusEngine) performBlockingProverHypersync(
+	proposer []byte,
+	expectedRoot []byte,
+) []byte {
+	if e.syncProvider == nil || len(proposer) == 0 {
+		e.logger.Debug("blocking hypersync: no sync provider or proposer")
+		return nil
+	}
+	if bytes.Equal(proposer, e.getProverAddress()) {
+		e.logger.Debug("blocking hypersync: we are the proposer")
+		return nil
+	}
+
+	// Wait for any existing sync to complete first
+	for e.proverSyncInProgress.Load() {
+		e.logger.Debug("blocking hypersync: waiting for existing sync to complete")
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Mark sync as in progress
+	if !e.proverSyncInProgress.CompareAndSwap(false, true) {
+		// Another sync started, wait for it
+		for e.proverSyncInProgress.Load() {
+			time.Sleep(100 * time.Millisecond)
+		}
+		return nil
+	}
+	defer e.proverSyncInProgress.Store(false)
+
+	e.logger.Info(
+		"performing blocking hypersync before processing frame",
+		zap.String("proposer", hex.EncodeToString(proposer)),
+		zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Set up shutdown handler
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-e.ShutdownSignal():
+			cancel()
+		case <-done:
+		}
+	}()
+
+	shardKey := tries.ShardKey{
+		L1: [3]byte{0x00, 0x00, 0x00},
+		L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+	}
+
+	// Perform sync synchronously (blocking)
+	newRoots := e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
+	close(done)
+
+	e.logger.Info("blocking hypersync completed")
+	if len(newRoots) == 0 {
+		return nil
+	}
+
+	return newRoots[0]
+}
+
 func (e *GlobalConsensusEngine) reconcileLocalWorkerAllocations() {
+	if e.config.Engine.ArchiveMode {
+		return
+	}
 	if e.workerManager == nil || e.proverRegistry == nil {
 		return
 	}
@@ -3098,88 +3329,41 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		return errors.Wrap(err, "propose worker join")
 	}
 
-	skipMerge := false
 	info, err := e.proverRegistry.GetProverInfo(e.getProverAddress())
-	if err == nil || info != nil {
-		skipMerge = true
+	proverExists := err == nil && info != nil
+
+	// Build merge helpers and calculate potential merge seniority
+	helpers, peerIds := e.buildMergeHelpers()
+	mergeSeniorityBI := compat.GetAggregatedSeniority(peerIds)
+	var mergeSeniority uint64 = 0
+	if mergeSeniorityBI.IsUint64() {
+		mergeSeniority = mergeSeniorityBI.Uint64()
 	}
 
-	helpers := []*global.SeniorityMerge{}
-	if !skipMerge {
-		e.logger.Debug("attempting merge")
-		peerIds := []string{}
-		oldProver, err := keys.Ed448KeyFromBytes(
-			[]byte(e.config.P2P.PeerPrivKey),
-			e.pubsub.GetPublicKey(),
-		)
-		if err != nil {
-			e.logger.Debug("cannot get peer key", zap.Error(err))
-			return errors.Wrap(err, "propose worker join")
+	// If prover already exists, check if we should submit a seniority merge
+	if proverExists {
+		if mergeSeniority > info.Seniority {
+			e.logger.Info(
+				"existing prover has lower seniority than merge would provide, submitting seniority merge",
+				zap.Uint64("existing_seniority", info.Seniority),
+				zap.Uint64("merge_seniority", mergeSeniority),
+				zap.Strings("peer_ids", peerIds),
+			)
+			return e.submitSeniorityMerge(frame, helpers, mergeSeniority, peerIds)
 		}
-		helpers = append(helpers, global.NewSeniorityMerge(
-			crypto.KeyTypeEd448,
-			oldProver,
-		))
-		peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
-		if len(e.config.Engine.MultisigProverEnrollmentPaths) != 0 {
-			e.logger.Debug("loading old configs")
-			for _, conf := range e.config.Engine.MultisigProverEnrollmentPaths {
-				extraConf, err := config.LoadConfig(conf, "", false)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				peerPrivKey, err := hex.DecodeString(extraConf.P2P.PeerPrivKey)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				privKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKey)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				pub := privKey.GetPublic()
-				pubBytes, err := pub.Raw()
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				id, err := peer.IDFromPublicKey(pub)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				priv, err := privKey.Raw()
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				signer, err := keys.Ed448KeyFromBytes(priv, pubBytes)
-				if err != nil {
-					e.logger.Error("could not construct join", zap.Error(err))
-					return errors.Wrap(err, "propose worker join")
-				}
-
-				peerIds = append(peerIds, id.String())
-				helpers = append(helpers, global.NewSeniorityMerge(
-					crypto.KeyTypeEd448,
-					signer,
-				))
-			}
-		}
-		seniorityBI := compat.GetAggregatedSeniority(peerIds)
-		e.logger.Info(
-			"existing seniority detected for proposed join",
-			zap.String("seniority", seniorityBI.String()),
+		e.logger.Debug(
+			"prover already exists with sufficient seniority, skipping join",
+			zap.Uint64("existing_seniority", info.Seniority),
+			zap.Uint64("merge_seniority", mergeSeniority),
 		)
+		return nil
 	}
+
+	e.logger.Info(
+		"proposing worker join with seniority",
+		zap.Uint64("seniority", mergeSeniority),
+		zap.Strings("peer_ids", peerIds),
+	)
 
 	var delegate []byte
 	if e.config.Engine.DelegateAddress != "" {
@@ -3309,7 +3493,160 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		return errors.Wrap(err, "propose worker join")
 	}
 
-	e.logger.Debug("submitted join request")
+	e.logger.Info(
+		"submitted join request",
+		zap.Uint64("seniority", mergeSeniority),
+		zap.Strings("peer_ids", peerIds),
+	)
+
+	return nil
+}
+
+// buildMergeHelpers constructs the seniority merge helpers from the current
+// peer key and any configured multisig prover enrollment paths.
+func (e *GlobalConsensusEngine) buildMergeHelpers() ([]*global.SeniorityMerge, []string) {
+	helpers := []*global.SeniorityMerge{}
+	peerIds := []string{}
+
+	peerPrivKey, err := hex.DecodeString(e.config.P2P.PeerPrivKey)
+	if err != nil {
+		e.logger.Debug("cannot decode peer key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	oldProver, err := keys.Ed448KeyFromBytes(
+		peerPrivKey,
+		e.pubsub.GetPublicKey(),
+	)
+	if err != nil {
+		e.logger.Debug("cannot get peer key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	helpers = append(helpers, global.NewSeniorityMerge(
+		crypto.KeyTypeEd448,
+		oldProver,
+	))
+	peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
+
+	if len(e.config.Engine.MultisigProverEnrollmentPaths) != 0 {
+		e.logger.Debug("loading old configs for merge helpers")
+		for _, conf := range e.config.Engine.MultisigProverEnrollmentPaths {
+			extraConf, err := config.LoadConfig(conf, "", false)
+			if err != nil {
+				e.logger.Error("could not load config for merge helpers", zap.Error(err))
+				continue
+			}
+
+			peerPrivKey, err := hex.DecodeString(extraConf.P2P.PeerPrivKey)
+			if err != nil {
+				e.logger.Error("could not decode peer key for merge helpers", zap.Error(err))
+				continue
+			}
+
+			privKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKey)
+			if err != nil {
+				e.logger.Error("could not unmarshal peer key for merge helpers", zap.Error(err))
+				continue
+			}
+
+			pub := privKey.GetPublic()
+			pubBytes, err := pub.Raw()
+			if err != nil {
+				e.logger.Error("could not get public key for merge helpers", zap.Error(err))
+				continue
+			}
+
+			id, err := peer.IDFromPublicKey(pub)
+			if err != nil {
+				e.logger.Error("could not get peer ID for merge helpers", zap.Error(err))
+				continue
+			}
+
+			priv, err := privKey.Raw()
+			if err != nil {
+				e.logger.Error("could not get private key for merge helpers", zap.Error(err))
+				continue
+			}
+
+			signer, err := keys.Ed448KeyFromBytes(priv, pubBytes)
+			if err != nil {
+				e.logger.Error("could not create signer for merge helpers", zap.Error(err))
+				continue
+			}
+
+			peerIds = append(peerIds, id.String())
+			helpers = append(helpers, global.NewSeniorityMerge(
+				crypto.KeyTypeEd448,
+				signer,
+			))
+		}
+	}
+
+	return helpers, peerIds
+}
+
+// submitSeniorityMerge submits a seniority merge request to claim additional
+// seniority from old peer keys for an existing prover.
+func (e *GlobalConsensusEngine) submitSeniorityMerge(
+	frame *protobufs.GlobalFrame,
+	helpers []*global.SeniorityMerge,
+	seniority uint64,
+	peerIds []string,
+) error {
+	if len(helpers) == 0 {
+		return errors.New("no merge helpers available")
+	}
+
+	seniorityMerge, err := global.NewProverSeniorityMerge(
+		frame.Header.FrameNumber,
+		helpers,
+		e.hypergraph,
+		schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		e.keyManager,
+	)
+	if err != nil {
+		e.logger.Error("could not construct seniority merge", zap.Error(err))
+		return errors.Wrap(err, "submit seniority merge")
+	}
+
+	err = seniorityMerge.Prove(frame.Header.FrameNumber)
+	if err != nil {
+		e.logger.Error("could not prove seniority merge", zap.Error(err))
+		return errors.Wrap(err, "submit seniority merge")
+	}
+
+	bundle := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{
+			{
+				Request: &protobufs.MessageRequest_SeniorityMerge{
+					SeniorityMerge: seniorityMerge.ToProtobuf(),
+				},
+			},
+		},
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	msg, err := bundle.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not encode seniority merge bundle", zap.Error(err))
+		return errors.Wrap(err, "submit seniority merge")
+	}
+
+	err = e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		msg,
+	)
+	if err != nil {
+		e.logger.Error("could not publish seniority merge", zap.Error(err))
+		return errors.Wrap(err, "submit seniority merge")
+	}
+
+	e.logger.Info(
+		"submitted seniority merge request",
+		zap.Uint64("seniority", seniority),
+		zap.Strings("peer_ids", peerIds),
+	)
 
 	return nil
 }
@@ -3881,7 +4218,7 @@ func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return
 	}
-	prior, err := e.clockStore.GetGlobalClockFrameCandidate(
+	_, err = e.clockStore.GetGlobalClockFrameCandidate(
 		qc.FrameNumber,
 		[]byte(qc.Identity()),
 	)
@@ -3890,14 +4227,9 @@ func (e *GlobalConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
 		frameProvingTotal.WithLabelValues("error").Inc()
 		return
 	}
-	_, err = e.livenessProvider.Collect(
-		context.TODO(),
-		prior.Header.FrameNumber+1,
-		newRank,
-	)
-	if err != nil {
-		return
-	}
+	// Note: Collect is called in ProveNextState after tryBeginProvingRank succeeds
+	// to avoid race conditions where a subsequent OnRankChange overwrites
+	// collectedMessages and shardCommitments while ProveNextState is still running
 }
 
 func (e *GlobalConsensusEngine) rebuildShardCommitments(
@@ -4031,6 +4363,82 @@ func (e *GlobalConsensusEngine) rebuildShardCommitments(
 		}
 
 		e.shardCommitmentKeySets[idx] = currKeys
+	}
+
+	// Apply alt shard overrides - these have externally-managed roots
+	if e.hypergraphStore != nil {
+		altShardAddrs, err := e.hypergraphStore.RangeAltShardAddresses()
+		if err != nil {
+			e.logger.Warn("failed to get alt shard addresses", zap.Error(err))
+		} else {
+			for _, shardAddr := range altShardAddrs {
+				vertexAdds, vertexRemoves, hyperedgeAdds, hyperedgeRemoves, err :=
+					e.hypergraphStore.GetLatestAltShardCommit(shardAddr)
+				if err != nil {
+					e.logger.Debug(
+						"failed to get alt shard commit",
+						zap.Binary("shard_address", shardAddr),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				// Calculate L1 indices (bloom filter) for this shard address
+				l1Indices := up2p.GetBloomFilterIndices(shardAddr, 256, 3)
+
+				// Insert each phase's root into the commitment trees
+				roots := [][]byte{vertexAdds, vertexRemoves, hyperedgeAdds, hyperedgeRemoves}
+				for phaseSet, root := range roots {
+					if len(root) == 0 {
+						continue
+					}
+
+					foldedShardKey := make([]byte, 32)
+					copy(foldedShardKey, shardAddr)
+					foldedShardKey[0] |= byte(phaseSet << 6)
+					keyStr := string(foldedShardKey)
+
+					for _, l1Idx := range l1Indices {
+						index := int(l1Idx)
+						if index >= len(e.shardCommitmentTrees) {
+							continue
+						}
+
+						if e.shardCommitmentTrees[index] == nil {
+							e.shardCommitmentTrees[index] = &tries.VectorCommitmentTree{}
+						}
+
+						if currentKeySets[index] == nil {
+							currentKeySets[index] = make(map[string]struct{})
+						}
+						currentKeySets[index][keyStr] = struct{}{}
+
+						tree := e.shardCommitmentTrees[index]
+						if existing, err := tree.Get(foldedShardKey); err == nil &&
+							bytes.Equal(existing, root) {
+							continue
+						}
+
+						if err := tree.Insert(
+							foldedShardKey,
+							slices.Clone(root),
+							nil,
+							big.NewInt(int64(len(root))),
+						); err != nil {
+							e.logger.Warn(
+								"failed to insert alt shard root",
+								zap.Binary("shard_address", shardAddr),
+								zap.Int("phase", phaseSet),
+								zap.Error(err),
+							)
+							continue
+						}
+
+						changedTrees[index] = true
+					}
+				}
+			}
+		}
 	}
 
 	for i := 0; i < len(e.shardCommitmentTrees); i++ {

@@ -207,7 +207,8 @@ func (e *GlobalExecutionEngine) validateBundle(
 				op.GetReject() != nil ||
 				op.GetKick() != nil ||
 				op.GetUpdate() != nil ||
-				op.GetShard() != nil
+				op.GetShard() != nil ||
+				op.GetSeniorityMerge() != nil
 
 			if !isGlobalOp {
 				if e.config.Network == 0 &&
@@ -585,6 +586,8 @@ func (e *GlobalExecutionEngine) tryExtractMessageForIntrinsic(
 		payload, err = r.Reject.ToCanonicalBytes()
 	case *protobufs.MessageRequest_Kick:
 		payload, err = r.Kick.ToCanonicalBytes()
+	case *protobufs.MessageRequest_SeniorityMerge:
+		payload, err = r.SeniorityMerge.ToCanonicalBytes()
 	default:
 		err = errors.New("unsupported message type")
 	}

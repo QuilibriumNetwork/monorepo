@@ -103,7 +103,7 @@ type TreeMetadata struct {
 	TotalLeaves    uint64
 }
 
-// ShardMergeEventData contains data for shard merge eligibility
+// ShardMergeEventData contains data for a single shard merge group
 type ShardMergeEventData struct {
 	ShardAddresses  [][]byte
 	TotalProvers    int
@@ -112,6 +112,13 @@ type ShardMergeEventData struct {
 }
 
 func (s *ShardMergeEventData) ControlEventData() {}
+
+// BulkShardMergeEventData contains all merge-eligible shard groups in a single event
+type BulkShardMergeEventData struct {
+	MergeGroups []ShardMergeEventData
+}
+
+func (b *BulkShardMergeEventData) ControlEventData() {}
 
 // ShardSplitEventData contains data for shard split eligibility
 type ShardSplitEventData struct {

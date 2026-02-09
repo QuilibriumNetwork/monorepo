@@ -62,17 +62,21 @@ func (p *PebbleHypergraphStore) NewShardSnapshot(
 	func(),
 	error,
 ) {
-	memConfig := *p.config
-	memConfig.InMemoryDONOTUSE = true
-	memConfig.Path = fmt.Sprintf(
+	memDBConfig := *p.config
+	memDBConfig.InMemoryDONOTUSE = true
+	memDBConfig.Path = fmt.Sprintf(
 		"memory-shard-%x",
 		shardKey.L2[:4],
 	)
+	// Wrap DBConfig in a minimal Config for NewPebbleDB
+	memConfig := &config.Config{
+		DB: &memDBConfig,
+	}
 
-	memDB := NewPebbleDB(p.logger, &memConfig, 0)
+	memDB := NewPebbleDB(p.logger, memConfig, 0)
 	managedDB := newManagedKVDB(memDB)
 	snapshotStore := NewPebbleHypergraphStore(
-		&memConfig,
+		&memDBConfig,
 		managedDB,
 		p.logger,
 		p.verenc,
@@ -92,6 +96,330 @@ func (p *PebbleHypergraphStore) NewShardSnapshot(
 	}
 
 	return snapshotStore, release, nil
+}
+
+// pebbleDBSnapshot wraps a pebble.Snapshot to implement tries.DBSnapshot.
+type pebbleDBSnapshot struct {
+	snap *pebble.Snapshot
+}
+
+func (s *pebbleDBSnapshot) Close() error {
+	if s.snap == nil {
+		return nil
+	}
+	return s.snap.Close()
+}
+
+// NewDBSnapshot creates a point-in-time snapshot of the database.
+// This is used to ensure consistency when creating shard snapshots.
+func (p *PebbleHypergraphStore) NewDBSnapshot() (tries.DBSnapshot, error) {
+	if p.pebble == nil {
+		return nil, errors.New("pebble handle not available for snapshot")
+	}
+	snap := p.pebble.NewSnapshot()
+	return &pebbleDBSnapshot{snap: snap}, nil
+}
+
+// NewShardSnapshotFromDBSnapshot creates a shard snapshot using data from
+// an existing database snapshot. This ensures the shard snapshot reflects
+// the exact state at the time the DB snapshot was taken.
+func (p *PebbleHypergraphStore) NewShardSnapshotFromDBSnapshot(
+	shardKey tries.ShardKey,
+	dbSnapshot tries.DBSnapshot,
+) (
+	tries.TreeBackingStore,
+	func(),
+	error,
+) {
+	pebbleSnap, ok := dbSnapshot.(*pebbleDBSnapshot)
+	if !ok || pebbleSnap.snap == nil {
+		return nil, nil, errors.New("invalid database snapshot")
+	}
+
+	memDBConfig := *p.config
+	memDBConfig.InMemoryDONOTUSE = true
+	memDBConfig.Path = fmt.Sprintf(
+		"memory-shard-%x",
+		shardKey.L2[:4],
+	)
+	// Wrap DBConfig in a minimal Config for NewPebbleDB
+	memConfig := &config.Config{
+		DB: &memDBConfig,
+	}
+
+	memDB := NewPebbleDB(p.logger, memConfig, 0)
+	managedDB := newManagedKVDB(memDB)
+	snapshotStore := NewPebbleHypergraphStore(
+		&memDBConfig,
+		managedDB,
+		p.logger,
+		p.verenc,
+		p.prover,
+	)
+	snapshotStore.pebble = nil
+
+	// Copy data from the pebble snapshot instead of the live DB
+	if err := p.copyShardDataFromSnapshot(managedDB, shardKey, pebbleSnap.snap); err != nil {
+		_ = managedDB.Close()
+		return nil, nil, errors.Wrap(err, "copy shard snapshot from db snapshot")
+	}
+
+	release := func() {
+		if err := managedDB.Close(); err != nil {
+			p.logger.Warn("failed to close shard snapshot", zap.Error(err))
+		}
+	}
+
+	return snapshotStore, release, nil
+}
+
+// copyShardDataFromSnapshot copies shard data from a pebble snapshot to the
+// destination DB. This is similar to copyShardData but reads from a snapshot
+// instead of the live database.
+func (p *PebbleHypergraphStore) copyShardDataFromSnapshot(
+	dst store.KVDB,
+	shardKey tries.ShardKey,
+	snap *pebble.Snapshot,
+) error {
+	prefixes := []byte{
+		VERTEX_ADDS_TREE_NODE,
+		VERTEX_REMOVES_TREE_NODE,
+		HYPEREDGE_ADDS_TREE_NODE,
+		HYPEREDGE_REMOVES_TREE_NODE,
+		VERTEX_ADDS_TREE_NODE_BY_PATH,
+		VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		HYPEREDGE_REMOVES_TREE_NODE_BY_PATH,
+		VERTEX_ADDS_TREE_ROOT,
+		VERTEX_REMOVES_TREE_ROOT,
+		HYPEREDGE_ADDS_TREE_ROOT,
+		HYPEREDGE_REMOVES_TREE_ROOT,
+		VERTEX_ADDS_CHANGE_RECORD,
+		VERTEX_REMOVES_CHANGE_RECORD,
+		HYPEREDGE_ADDS_CHANGE_RECORD,
+		HYPEREDGE_REMOVES_CHANGE_RECORD,
+		HYPERGRAPH_VERTEX_ADDS_SHARD_COMMIT,
+		HYPERGRAPH_VERTEX_REMOVES_SHARD_COMMIT,
+		HYPERGRAPH_HYPEREDGE_ADDS_SHARD_COMMIT,
+		HYPERGRAPH_HYPEREDGE_REMOVES_SHARD_COMMIT,
+	}
+
+	for _, prefix := range prefixes {
+		if err := p.copyPrefixedRangeFromSnapshot(dst, prefix, shardKey, snap); err != nil {
+			return err
+		}
+	}
+
+	if err := p.copyVertexDataForShardFromSnapshot(dst, shardKey, snap); err != nil {
+		return err
+	}
+
+	if err := p.copyCoveredPrefixFromSnapshot(dst, snap); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) copyPrefixedRangeFromSnapshot(
+	dst store.KVDB,
+	prefix byte,
+	shardKey tries.ShardKey,
+	snap *pebble.Snapshot,
+) error {
+	start, end := shardRangeBounds(prefix, shardKey)
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: start,
+		UpperBound: end,
+	})
+	if err != nil {
+		return errors.Wrap(err, "snapshot: iter range from snapshot")
+	}
+	defer iter.Close()
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		key := append([]byte(nil), iter.Key()...)
+		val := append([]byte(nil), iter.Value()...)
+		if err := dst.Set(key, val); err != nil {
+			return errors.Wrap(err, "snapshot: set range value")
+		}
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) copyVertexDataForShardFromSnapshot(
+	dst store.KVDB,
+	shardKey tries.ShardKey,
+	snap *pebble.Snapshot,
+) error {
+	sets := []struct {
+		setType   string
+		phaseType string
+	}{
+		{string(hypergraph.VertexAtomType), string(hypergraph.AddsPhaseType)},
+		{string(hypergraph.VertexAtomType), string(hypergraph.RemovesPhaseType)},
+	}
+
+	vertexKeys := make(map[string]struct{})
+	for _, cfg := range sets {
+		// Use snapshot-based iteration
+		iter, err := p.iterateRawLeavesFromSnapshot(cfg.setType, cfg.phaseType, shardKey, snap)
+		if err != nil {
+			return errors.Wrap(err, "snapshot: iterate raw leaves from snapshot")
+		}
+		for valid := iter.First(); valid; valid = iter.Next() {
+			leaf, err := iter.Leaf()
+			if err != nil || leaf == nil {
+				continue
+			}
+			if len(leaf.UnderlyingData) == 0 {
+				continue
+			}
+			keyStr := string(leaf.Key)
+			if _, ok := vertexKeys[keyStr]; ok {
+				continue
+			}
+			vertexKeys[keyStr] = struct{}{}
+			buf := append([]byte(nil), leaf.UnderlyingData...)
+			if err := dst.Set(hypergraphVertexDataKey(leaf.Key), buf); err != nil {
+				iter.Close()
+				return errors.Wrap(err, "snapshot: copy vertex data")
+			}
+		}
+		iter.Close()
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) copyCoveredPrefixFromSnapshot(
+	dst store.KVDB,
+	snap *pebble.Snapshot,
+) error {
+	val, closer, err := snap.Get([]byte{HYPERGRAPH_COVERED_PREFIX})
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil
+		}
+		return errors.Wrap(err, "snapshot: get covered prefix")
+	}
+	defer closer.Close()
+	buf := append([]byte(nil), val...)
+	return dst.Set([]byte{HYPERGRAPH_COVERED_PREFIX}, buf)
+}
+
+// pebbleSnapshotRawLeafIterator iterates over raw leaves from a pebble snapshot.
+type pebbleSnapshotRawLeafIterator struct {
+	iter     *pebble.Iterator
+	shardKey tries.ShardKey
+	snap     *pebble.Snapshot
+	setType  string
+	db       *PebbleHypergraphStore
+}
+
+func (p *PebbleHypergraphStore) iterateRawLeavesFromSnapshot(
+	setType string,
+	phaseType string,
+	shardKey tries.ShardKey,
+	snap *pebble.Snapshot,
+) (*pebbleSnapshotRawLeafIterator, error) {
+	// Determine the key prefix based on set and phase type
+	var keyPrefix byte
+	switch hypergraph.AtomType(setType) {
+	case hypergraph.VertexAtomType:
+		switch hypergraph.PhaseType(phaseType) {
+		case hypergraph.AddsPhaseType:
+			keyPrefix = VERTEX_ADDS_TREE_NODE
+		case hypergraph.RemovesPhaseType:
+			keyPrefix = VERTEX_REMOVES_TREE_NODE
+		default:
+			return nil, errors.New("unknown phase type")
+		}
+	case hypergraph.HyperedgeAtomType:
+		switch hypergraph.PhaseType(phaseType) {
+		case hypergraph.AddsPhaseType:
+			keyPrefix = HYPEREDGE_ADDS_TREE_NODE
+		case hypergraph.RemovesPhaseType:
+			keyPrefix = HYPEREDGE_REMOVES_TREE_NODE
+		default:
+			return nil, errors.New("unknown phase type")
+		}
+	default:
+		return nil, errors.New("unknown set type")
+	}
+
+	start, end := shardRangeBounds(keyPrefix, shardKey)
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: start,
+		UpperBound: end,
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "iterate raw leaves from snapshot")
+	}
+
+	return &pebbleSnapshotRawLeafIterator{
+		iter:     iter,
+		shardKey: shardKey,
+		snap:     snap,
+		setType:  setType,
+		db:       p,
+	}, nil
+}
+
+func (i *pebbleSnapshotRawLeafIterator) First() bool {
+	return i.iter.First()
+}
+
+func (i *pebbleSnapshotRawLeafIterator) Next() bool {
+	return i.iter.Next()
+}
+
+func (i *pebbleSnapshotRawLeafIterator) Close() {
+	i.iter.Close()
+}
+
+func (i *pebbleSnapshotRawLeafIterator) Leaf() (*tries.RawLeafData, error) {
+	if !i.iter.Valid() {
+		return nil, nil
+	}
+
+	nodeData := i.iter.Value()
+	if len(nodeData) == 0 {
+		return nil, nil
+	}
+
+	// Only process leaf nodes (type byte == TypeLeaf)
+	if nodeData[0] != tries.TypeLeaf {
+		return nil, nil
+	}
+
+	leaf, err := tries.DeserializeLeafNode(i.db, bytes.NewReader(nodeData[1:]))
+	if err != nil {
+		return nil, err
+	}
+
+	result := &tries.RawLeafData{
+		Key:        slices.Clone(leaf.Key),
+		Value:      slices.Clone(leaf.Value),
+		HashTarget: slices.Clone(leaf.HashTarget),
+		Commitment: slices.Clone(leaf.Commitment),
+	}
+
+	if leaf.Size != nil {
+		result.Size = leaf.Size.FillBytes(make([]byte, 32))
+	}
+
+	// Load vertex data from snapshot if this is a vertex set
+	if i.setType == string(hypergraph.VertexAtomType) {
+		dataVal, closer, err := i.snap.Get(hypergraphVertexDataKey(leaf.Key))
+		if err == nil {
+			result.UnderlyingData = append([]byte(nil), dataVal...)
+			closer.Close()
+		}
+	}
+
+	return result, nil
 }
 
 type PebbleVertexDataIterator struct {
@@ -152,7 +480,7 @@ func (p *PebbleVertexDataIterator) Value() *tries.VectorCommitmentTree {
 		return nil
 	}
 
-	tree, err := tries.DeserializeNonLazyTree(value)
+	tree, err := tries.DeserializeNonLazyTree(slices.Clone(value))
 	if err != nil {
 		return nil
 	}
@@ -398,6 +726,35 @@ func hypergraphHyperedgeRemovesShardCommitKey(
 
 func hypergraphCoveredPrefixKey() []byte {
 	key := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_COVERED_PREFIX}
+	return key
+}
+
+// hypergraphAltShardCommitKey returns the key for storing alt shard roots at a
+// specific frame number. The value stored at this key contains all four roots
+// concatenated (32 bytes each = 128 bytes total).
+func hypergraphAltShardCommitKey(
+	frameNumber uint64,
+	shardAddress []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_COMMIT}
+	key = binary.BigEndian.AppendUint64(key, frameNumber)
+	key = append(key, shardAddress...)
+	return key
+}
+
+// hypergraphAltShardCommitLatestKey returns the key for storing the latest
+// frame number for an alt shard. The value is an 8-byte big-endian frame number.
+func hypergraphAltShardCommitLatestKey(shardAddress []byte) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_COMMIT_LATEST}
+	key = append(key, shardAddress...)
+	return key
+}
+
+// hypergraphAltShardAddressIndexKey returns the key for marking that an alt
+// shard address exists. Used for iterating all alt shard addresses.
+func hypergraphAltShardAddressIndexKey(shardAddress []byte) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_ADDRESS_INDEX}
+	key = append(key, shardAddress...)
 	return key
 }
 
@@ -1223,11 +1580,17 @@ func (p *PebbleHypergraphStore) InsertNode(
 }
 
 func (p *PebbleHypergraphStore) SaveRoot(
+	txn tries.TreeBackingStoreTransaction,
 	setType string,
 	phaseType string,
 	shardKey tries.ShardKey,
 	node tries.LazyVectorCommitmentNode,
 ) error {
+	setter := p.db.Set
+	if txn != nil {
+		setter = txn.Set
+	}
+
 	keyFn := hypergraphVertexAddsTreeRootKey
 	switch hypergraph.AtomType(setType) {
 	case hypergraph.VertexAtomType:
@@ -1265,7 +1628,7 @@ func (p *PebbleHypergraphStore) SaveRoot(
 		}
 		data := append([]byte{tries.TypeBranch}, pathBytes...)
 		data = append(data, b.Bytes()...)
-		err = p.db.Set(nodeKey, data)
+		err = setter(nodeKey, data)
 		return errors.Wrap(err, "insert node")
 	case *tries.LazyVectorCommitmentLeafNode:
 		err := tries.SerializeLeafNode(&b, n)
@@ -1273,7 +1636,7 @@ func (p *PebbleHypergraphStore) SaveRoot(
 			return errors.Wrap(err, "insert node")
 		}
 		data := append([]byte{tries.TypeLeaf}, b.Bytes()...)
-		err = p.db.Set(nodeKey, data)
+		err = setter(nodeKey, data)
 		return errors.Wrap(err, "insert node")
 	}
 
@@ -1700,7 +2063,7 @@ func (p *PebbleHypergraphStore) GetRootCommits(
 ) (map[tries.ShardKey][][]byte, error) {
 	iter, err := p.db.NewIter(
 		hypergraphVertexAddsShardCommitKey(frameNumber, nil),
-		hypergraphHyperedgeAddsShardCommitKey(
+		hypergraphHyperedgeRemovesShardCommitKey(
 			frameNumber,
 			bytes.Repeat([]byte{0xff}, 65),
 		),
@@ -2026,4 +2389,199 @@ func (p *PebbleHypergraphStore) InsertRawLeaf(
 	}
 
 	return nil
+}
+
+// SetAltShardCommit stores the four roots for an alt shard at a given frame
+// number and updates the latest index if this is the newest frame.
+func (p *PebbleHypergraphStore) SetAltShardCommit(
+	txn tries.TreeBackingStoreTransaction,
+	frameNumber uint64,
+	shardAddress []byte,
+	vertexAddsRoot []byte,
+	vertexRemovesRoot []byte,
+	hyperedgeAddsRoot []byte,
+	hyperedgeRemovesRoot []byte,
+) error {
+	if txn == nil {
+		return errors.Wrap(
+			errors.New("requires transaction"),
+			"set alt shard commit",
+		)
+	}
+
+	// Validate roots are valid sizes (64 or 74 bytes)
+	for _, root := range [][]byte{
+		vertexAddsRoot, vertexRemovesRoot, hyperedgeAddsRoot, hyperedgeRemovesRoot,
+	} {
+		if len(root) != 64 && len(root) != 74 {
+			return errors.Wrap(
+				errors.New("roots must be 64 or 74 bytes"),
+				"set alt shard commit",
+			)
+		}
+	}
+
+	// Store as length-prefixed values: 1 byte length + data for each root
+	value := make([]byte, 0, 4+len(vertexAddsRoot)+len(vertexRemovesRoot)+
+		len(hyperedgeAddsRoot)+len(hyperedgeRemovesRoot))
+	value = append(value, byte(len(vertexAddsRoot)))
+	value = append(value, vertexAddsRoot...)
+	value = append(value, byte(len(vertexRemovesRoot)))
+	value = append(value, vertexRemovesRoot...)
+	value = append(value, byte(len(hyperedgeAddsRoot)))
+	value = append(value, hyperedgeAddsRoot...)
+	value = append(value, byte(len(hyperedgeRemovesRoot)))
+	value = append(value, hyperedgeRemovesRoot...)
+
+	// Store the commit at the frame-specific key
+	commitKey := hypergraphAltShardCommitKey(frameNumber, shardAddress)
+	if err := txn.Set(commitKey, value); err != nil {
+		return errors.Wrap(err, "set alt shard commit")
+	}
+
+	// Update the latest index if this frame is newer
+	latestKey := hypergraphAltShardCommitLatestKey(shardAddress)
+	existing, closer, err := p.db.Get(latestKey)
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return errors.Wrap(err, "set alt shard commit: get latest")
+	}
+
+	shouldUpdate := true
+	if err == nil {
+		defer closer.Close()
+		if len(existing) == 8 {
+			existingFrame := binary.BigEndian.Uint64(existing)
+			if existingFrame >= frameNumber {
+				shouldUpdate = false
+			}
+		}
+	}
+
+	if shouldUpdate {
+		frameBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(frameBytes, frameNumber)
+		if err := txn.Set(latestKey, frameBytes); err != nil {
+			return errors.Wrap(err, "set alt shard commit: update latest")
+		}
+	}
+
+	// Ensure the address is in the index for RangeAltShardAddresses
+	indexKey := hypergraphAltShardAddressIndexKey(shardAddress)
+	if err := txn.Set(indexKey, []byte{0x01}); err != nil {
+		return errors.Wrap(err, "set alt shard commit: update index")
+	}
+
+	return nil
+}
+
+// GetLatestAltShardCommit retrieves the most recent roots for an alt shard.
+func (p *PebbleHypergraphStore) GetLatestAltShardCommit(
+	shardAddress []byte,
+) (
+	vertexAddsRoot []byte,
+	vertexRemovesRoot []byte,
+	hyperedgeAddsRoot []byte,
+	hyperedgeRemovesRoot []byte,
+	err error,
+) {
+	// Get the latest frame number for this shard
+	latestKey := hypergraphAltShardCommitLatestKey(shardAddress)
+	frameBytes, closer, err := p.db.Get(latestKey)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, nil, nil, nil, errors.Wrap(
+				store.ErrNotFound,
+				"get latest alt shard commit",
+			)
+		}
+		return nil, nil, nil, nil, errors.Wrap(err, "get latest alt shard commit")
+	}
+	defer closer.Close()
+
+	if len(frameBytes) != 8 {
+		return nil, nil, nil, nil, errors.Wrap(
+			store.ErrInvalidData,
+			"get latest alt shard commit: invalid frame number",
+		)
+	}
+
+	frameNumber := binary.BigEndian.Uint64(frameBytes)
+
+	// Get the commit at that frame
+	commitKey := hypergraphAltShardCommitKey(frameNumber, shardAddress)
+	value, commitCloser, err := p.db.Get(commitKey)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, nil, nil, nil, errors.Wrap(
+				store.ErrNotFound,
+				"get latest alt shard commit: commit not found",
+			)
+		}
+		return nil, nil, nil, nil, errors.Wrap(err, "get latest alt shard commit")
+	}
+	defer commitCloser.Close()
+
+	// Parse length-prefixed format
+	offset := 0
+	parseRoot := func() ([]byte, error) {
+		if offset >= len(value) {
+			return nil, errors.New("unexpected end of data")
+		}
+		length := int(value[offset])
+		offset++
+		if offset+length > len(value) {
+			return nil, errors.New("root length exceeds data")
+		}
+		root := make([]byte, length)
+		copy(root, value[offset:offset+length])
+		offset += length
+		return root, nil
+	}
+
+	var parseErr error
+	vertexAddsRoot, parseErr = parseRoot()
+	if parseErr != nil {
+		return nil, nil, nil, nil, errors.Wrap(parseErr, "get latest alt shard commit")
+	}
+	vertexRemovesRoot, parseErr = parseRoot()
+	if parseErr != nil {
+		return nil, nil, nil, nil, errors.Wrap(parseErr, "get latest alt shard commit")
+	}
+	hyperedgeAddsRoot, parseErr = parseRoot()
+	if parseErr != nil {
+		return nil, nil, nil, nil, errors.Wrap(parseErr, "get latest alt shard commit")
+	}
+	hyperedgeRemovesRoot, parseErr = parseRoot()
+	if parseErr != nil {
+		return nil, nil, nil, nil, errors.Wrap(parseErr, "get latest alt shard commit")
+	}
+
+	return vertexAddsRoot, vertexRemovesRoot, hyperedgeAddsRoot, hyperedgeRemovesRoot, nil
+}
+
+// RangeAltShardAddresses returns all alt shard addresses that have stored
+// commits.
+func (p *PebbleHypergraphStore) RangeAltShardAddresses() ([][]byte, error) {
+	startKey := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_ADDRESS_INDEX}
+	endKey := []byte{HYPERGRAPH_SHARD, HYPERGRAPH_ALT_SHARD_ADDRESS_INDEX + 1}
+
+	iter, err := p.db.NewIter(startKey, endKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "range alt shard addresses")
+	}
+	defer iter.Close()
+
+	var addresses [][]byte
+	prefixLen := len(startKey)
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) > prefixLen {
+			addr := make([]byte, len(key)-prefixLen)
+			copy(addr, key[prefixLen:])
+			addresses = append(addresses, addr)
+		}
+	}
+
+	return addresses, nil
 }

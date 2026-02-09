@@ -44,6 +44,27 @@ func (e *GlobalConsensusEngine) ensureCoverageThresholds() {
 	haltGraceFrames = 360
 }
 
+// triggerCoverageCheckAsync starts a coverage check in a goroutine if one is
+// not already in progress. This prevents blocking the event processing loop.
+func (e *GlobalConsensusEngine) triggerCoverageCheckAsync(frameNumber uint64) {
+	// Skip if a coverage check is already in progress
+	if !e.coverageCheckInProgress.CompareAndSwap(false, true) {
+		e.logger.Debug(
+			"skipping coverage check, one already in progress",
+			zap.Uint64("frame_number", frameNumber),
+		)
+		return
+	}
+
+	go func() {
+		defer e.coverageCheckInProgress.Store(false)
+
+		if err := e.checkShardCoverage(frameNumber); err != nil {
+			e.logger.Error("failed to check shard coverage", zap.Error(err))
+		}
+	}()
+}
+
 // checkShardCoverage verifies coverage levels for all active shards
 func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 	e.ensureCoverageThresholds()
@@ -60,6 +81,9 @@ func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 
 	// Update state summaries metric
 	stateSummariesAggregated.Set(float64(len(shardCoverageMap)))
+
+	// Collect all merge-eligible shard groups to emit as a single bulk event
+	var allMergeGroups []typesconsensus.ShardMergeEventData
 
 	for shardAddress, coverage := range shardCoverageMap {
 		addressLen := len(shardAddress)
@@ -187,13 +211,20 @@ func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 
 		// Check for low coverage
 		if proverCount < minProvers {
-			e.handleLowCoverage([]byte(shardAddress), coverage, minProvers)
+			if mergeData := e.handleLowCoverage([]byte(shardAddress), coverage, minProvers); mergeData != nil {
+				allMergeGroups = append(allMergeGroups, *mergeData)
+			}
 		}
 
 		// Check for high coverage (potential split)
 		if proverCount > maxProvers {
 			e.handleHighCoverage([]byte(shardAddress), coverage, maxProvers)
 		}
+	}
+
+	// Emit a single bulk merge event if there are any merge-eligible shards
+	if len(allMergeGroups) > 0 {
+		e.emitBulkMergeEvent(allMergeGroups)
 	}
 
 	return nil
@@ -206,12 +237,13 @@ type ShardCoverage struct {
 	TreeMetadata    []typesconsensus.TreeMetadata
 }
 
-// handleLowCoverage handles shards with insufficient provers
+// handleLowCoverage handles shards with insufficient provers.
+// Returns merge event data if merge is possible, nil otherwise.
 func (e *GlobalConsensusEngine) handleLowCoverage(
 	shardAddress []byte,
 	coverage *ShardCoverage,
 	minProvers uint64,
-) {
+) *typesconsensus.ShardMergeEventData {
 	addressLen := len(shardAddress)
 
 	// Case 2.a: Full application address (32 bytes)
@@ -235,7 +267,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 				Message:         "Application shard has low prover coverage",
 			},
 		)
-		return
+		return nil
 	}
 
 	// Case 2.b: Longer than application address (> 32 bytes)
@@ -260,24 +292,13 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 		requiredStorage := e.calculateRequiredStorage(allShards)
 
 		if totalStorage >= requiredStorage {
-			// Case 2.b.i: Merge is possible
-			e.logger.Info(
-				"shards eligible for merge",
-				zap.String("shard_address", hex.EncodeToString(shardAddress)),
-				zap.Int("sibling_count", len(siblingShards)),
-				zap.Uint64("total_storage", totalStorage),
-				zap.Uint64("required_storage", requiredStorage),
-			)
-
-			// Emit merge eligible event
-			e.emitMergeEvent(
-				&typesconsensus.ShardMergeEventData{
-					ShardAddresses:  allShards,
-					TotalProvers:    totalProvers,
-					AttestedStorage: totalStorage,
-					RequiredStorage: requiredStorage,
-				},
-			)
+			// Case 2.b.i: Merge is possible - return the data for bulk emission
+			return &typesconsensus.ShardMergeEventData{
+				ShardAddresses:  allShards,
+				TotalProvers:    totalProvers,
+				AttestedStorage: totalStorage,
+				RequiredStorage: requiredStorage,
+			}
 		} else {
 			// Case 2.b.ii: Insufficient storage for merge
 			e.logger.Warn(
@@ -315,6 +336,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 			},
 		)
 	}
+	return nil
 }
 
 // handleHighCoverage handles shards with too many provers

@@ -39,6 +39,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/app"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -382,7 +383,7 @@ func main() {
 	}
 
 	if *dangerClearPending {
-		db := store.NewPebbleDB(logger, nodeConfig.DB, 0)
+		db := store.NewPebbleDB(logger, nodeConfig, 0)
 		defer db.Close()
 		consensusStore := store.NewPebbleConsensusStore(db, logger)
 		state, err := consensusStore.GetConsensusState(nil)
@@ -442,7 +443,7 @@ func main() {
 	}
 
 	if *compactDB {
-		db := store.NewPebbleDB(logger, nodeConfig.DB, uint(*core))
+		db := store.NewPebbleDB(logger, nodeConfig, uint(*core))
 		if err := db.CompactAll(); err != nil {
 			logger.Fatal("failed to compact database", zap.Error(err))
 		}
@@ -469,7 +470,7 @@ func main() {
 	if *dhtOnly {
 		done := make(chan os.Signal, 1)
 		signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
-		dht, err := app.NewDHTNode(logger, nodeConfig, 0)
+		dht, err := app.NewDHTNode(logger, nodeConfig, 0, p2p.ConfigDir(*configDirectory))
 		if err != nil {
 			logger.Error("failed to start dht node", zap.Error(err))
 		}
@@ -534,6 +535,7 @@ func main() {
 			uint(*core),
 			rpcMultiaddr,
 			*parentProcess,
+			p2p.ConfigDir(*configDirectory),
 		)
 		if err != nil {
 			logger.Panic("failed to create data worker node", zap.Error(err))
@@ -619,7 +621,7 @@ func main() {
 	logger.Info("starting node...")
 
 	// Create MasterNode for core 0
-	masterNode, err := app.NewMasterNode(logger, nodeConfig, uint(*core))
+	masterNode, err := app.NewMasterNode(logger, nodeConfig, uint(*core), p2p.ConfigDir(*configDirectory))
 	if err != nil {
 		logger.Panic("failed to create master node", zap.Error(err))
 	}

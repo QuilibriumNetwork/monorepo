@@ -435,6 +435,14 @@ func (m *Manager) DecideJoins(
 	reject := make([][]byte, 0, len(pending))
 	confirm := make([][]byte, 0, len(pending))
 
+	// Calculate rejection threshold: only reject if bestScore is significantly
+	// better (at least 50% higher) than the pending shard's score. This prevents
+	// churn from minor score fluctuations.
+	// threshold = bestScore * 0.67 (i.e., reject if pending score < 67% of best,
+	// which means best is ~50% better than pending)
+	rejectThreshold := new(big.Int).Mul(bestScore, big.NewInt(67))
+	rejectThreshold.Div(rejectThreshold, big.NewInt(100))
+
 	for _, p := range pending {
 		if len(p) == 0 {
 			continue
@@ -457,13 +465,15 @@ func (m *Manager) DecideJoins(
 			continue
 		}
 
-		// Reject only if there exists a strictly better score.
-		if rec.score.Cmp(bestScore) < 0 {
+		// Reject only if the pending shard's score is significantly worse than
+		// the best available (below 90% of the best score). This prevents churn
+		// from minor score differences.
+		if rec.score.Cmp(rejectThreshold) < 0 {
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			reject = append(reject, pc)
 		} else {
-			// Otherwise confirm
+			// Otherwise confirm - score is within acceptable range of best
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			confirm = append(confirm, pc)
