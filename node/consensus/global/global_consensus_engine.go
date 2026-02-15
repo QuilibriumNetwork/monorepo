@@ -200,8 +200,10 @@ type GlobalConsensusEngine struct {
 	activeProveRanksMu        sync.Mutex
 	appFrameStore             map[string]*protobufs.AppShardFrame
 	appFrameStoreMu           sync.RWMutex
-	lowCoverageStreak         map[string]*coverageStreak
-	proverOnlyMode            atomic.Bool
+	lowCoverageStreak          map[string]*coverageStreak
+	proverOnlyMode             atomic.Bool
+	lastShardActionFrame       map[string]uint64
+	lastShardActionFrameMu     sync.Mutex
 	coverageCheckInProgress   atomic.Bool
 	peerInfoDigestCache       map[string]struct{}
 	peerInfoDigestCacheMu     sync.Mutex
@@ -337,6 +339,7 @@ func NewGlobalConsensusEngine(
 		currentDifficulty:           config.Engine.Difficulty,
 		lastProvenFrameTime:         time.Now(),
 		blacklistMap:                make(map[string]bool),
+		lastShardActionFrame:        make(map[string]uint64),
 		peerInfoDigestCache:         make(map[string]struct{}),
 		keyRegistryDigestCache:      make(map[string]struct{}),
 		peerAuthCache:               make(map[string]time.Time),

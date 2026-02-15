@@ -155,6 +155,7 @@ type AppConsensusEngine struct {
 	globalProverRootVerifiedFrame atomic.Uint64
 	globalProverRootSynced        atomic.Bool
 	globalProverSyncInProgress    atomic.Bool
+	lastGlobalFrameHeader         *protobufs.GlobalFrameHeader // previous frame for deferred root check
 
 	// Genesis initialization
 	genesisInitialized atomic.Bool
@@ -985,8 +986,22 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		return
 	}
 
-	frameNumber := frame.Header.FrameNumber
-	expectedProverRoot := frame.Header.ProverTreeCommitment
+	// Defer root check by one frame: when frame N arrives, check frame N-1's
+	// root. This matches the GlobalConsensusEngine which checks the parent
+	// frame's root during materialize(N-1), triggered when frame N certifies
+	// frame N-1. By the time frame N arrives, the master has had time to
+	// materialize N-2 (triggered when N-1 arrived), so the worker's tree
+	// should reflect post-materialize(N-2) state — exactly what frame N-1's
+	// ProverTreeCommitment was computed against.
+	prevHeader := e.lastGlobalFrameHeader
+	e.lastGlobalFrameHeader = frame.Header
+
+	if prevHeader == nil {
+		return
+	}
+
+	frameNumber := prevHeader.FrameNumber
+	expectedProverRoot := prevHeader.ProverTreeCommitment
 
 	localRoot, err := e.computeLocalGlobalProverRoot(frameNumber)
 	if err != nil {
@@ -997,8 +1012,7 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		// Use blocking hypersync to ensure we're synced before continuing
-		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+		e.performBlockingGlobalHypersync(prevHeader.Prover, expectedProverRoot)
 		return
 	}
 
@@ -1015,8 +1029,7 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		// Use blocking hypersync to ensure we're synced before continuing
-		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+		e.performBlockingGlobalHypersync(prevHeader.Prover, expectedProverRoot)
 		return
 	}
 
@@ -1162,8 +1175,11 @@ func (e *AppConsensusEngine) performBlockingGlobalHypersync(proposer []byte, exp
 		)
 	}
 
-	e.globalProverRootSynced.Store(true)
-	e.logger.Info("blocking global hypersync completed")
+	// Don't unconditionally set synced=true. Commit(N-1) is cached with the
+	// pre-sync root, so we can't re-verify here. The next frame's deferred
+	// check will call Commit(N) fresh and verify convergence — matching the
+	// global engine's pattern where convergence happens on the next materialize.
+	e.logger.Info("blocking global hypersync completed, convergence will be verified on next frame")
 }
 
 func (e *AppConsensusEngine) GetFrame() *protobufs.AppShardFrame {

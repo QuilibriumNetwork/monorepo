@@ -44,7 +44,7 @@ var _ BasicResolver = (*Resolver)(nil)
 
 // NewResolver creates a new Resolver instance with the specified options
 func NewResolver(opts ...Option) (*Resolver, error) {
-	r := &Resolver{def: net.DefaultResolver}
+	r := &Resolver{def: &net.Resolver{PreferGo: true}}
 	for _, opt := range opts {
 		err := opt(r)
 		if err != nil {

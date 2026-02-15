@@ -2078,6 +2078,386 @@ func (a *AltShardUpdate) FromCanonicalBytes(data []byte) error {
 	return nil
 }
 
+// ShardSplit serialization methods
+func (s *ShardSplit) ToCanonicalBytes() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Write type prefix
+	if err := binary.Write(buf, binary.BigEndian, ShardSplitType); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write shard_address (length-prefixed)
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(s.ShardAddress)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(s.ShardAddress); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write number of proposed_shards
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(s.ProposedShards)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write each proposed shard (length-prefixed)
+	for _, shard := range s.ProposedShards {
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(shard)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(shard); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write frame_number
+	if err := binary.Write(buf, binary.BigEndian, s.FrameNumber); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write public_key_signature_bls48581
+	if s.PublicKeySignatureBls48581 != nil {
+		sigBytes, err := s.PublicKeySignatureBls48581.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(sigBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(sigBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	} else {
+		if err := binary.Write(buf, binary.BigEndian, uint32(0)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (s *ShardSplit) FromCanonicalBytes(data []byte) error {
+	buf := bytes.NewBuffer(data)
+
+	// Read and verify type prefix
+	var typePrefix uint32
+	if err := binary.Read(buf, binary.BigEndian, &typePrefix); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if typePrefix != ShardSplitType {
+		return errors.Wrap(
+			errors.New("invalid type prefix"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read shard_address
+	var addrLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &addrLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if addrLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid shard address length"),
+			"from canonical bytes",
+		)
+	}
+	s.ShardAddress = make([]byte, addrLen)
+	if _, err := buf.Read(s.ShardAddress); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read number of proposed_shards
+	var numShards uint32
+	if err := binary.Read(buf, binary.BigEndian, &numShards); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if numShards > 8 {
+		return errors.Wrap(
+			errors.New("too many proposed shards"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read each proposed shard
+	s.ProposedShards = make([][]byte, numShards)
+	for i := uint32(0); i < numShards; i++ {
+		var shardLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &shardLen); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		if shardLen > 66 {
+			return errors.Wrap(
+				errors.New("invalid proposed shard length"),
+				"from canonical bytes",
+			)
+		}
+		s.ProposedShards[i] = make([]byte, shardLen)
+		if _, err := buf.Read(s.ProposedShards[i]); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	// Read frame_number
+	if err := binary.Read(buf, binary.BigEndian, &s.FrameNumber); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read public_key_signature_bls48581
+	var sigLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 0 {
+		sigBytes := make([]byte, sigLen)
+		if _, err := buf.Read(sigBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		s.PublicKeySignatureBls48581 = &BLS48581AddressedSignature{}
+		if err := s.PublicKeySignatureBls48581.FromCanonicalBytes(
+			sigBytes,
+		); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	return nil
+}
+
+func (s *ShardSplit) Validate() error {
+	if len(s.ShardAddress) < 32 || len(s.ShardAddress) > 63 {
+		return errors.New("shard_address must be 32-63 bytes")
+	}
+
+	if len(s.ProposedShards) < 2 || len(s.ProposedShards) > 8 {
+		return errors.New("proposed_shards must have 2-8 entries")
+	}
+
+	for _, shard := range s.ProposedShards {
+		if len(shard) != len(s.ShardAddress)+1 &&
+			len(shard) != len(s.ShardAddress)+2 {
+			return errors.Errorf(
+				"proposed shard length %d invalid for parent length %d",
+				len(shard), len(s.ShardAddress),
+			)
+		}
+		if !bytes.HasPrefix(shard, s.ShardAddress) {
+			return errors.New("proposed shard must share parent prefix")
+		}
+	}
+
+	if s.PublicKeySignatureBls48581 == nil {
+		return errors.New("BLS signature must be present")
+	}
+
+	return nil
+}
+
+// ShardMerge serialization methods
+func (s *ShardMerge) ToCanonicalBytes() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Write type prefix
+	if err := binary.Write(buf, binary.BigEndian, ShardMergeType); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write number of shard_addresses
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(s.ShardAddresses)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write each shard address (length-prefixed)
+	for _, addr := range s.ShardAddresses {
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(addr)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(addr); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	// Write parent_address (length-prefixed)
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(s.ParentAddress)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(s.ParentAddress); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write frame_number
+	if err := binary.Write(buf, binary.BigEndian, s.FrameNumber); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	// Write public_key_signature_bls48581
+	if s.PublicKeySignatureBls48581 != nil {
+		sigBytes, err := s.PublicKeySignatureBls48581.ToCanonicalBytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if err := binary.Write(
+			buf,
+			binary.BigEndian,
+			uint32(len(sigBytes)),
+		); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+		if _, err := buf.Write(sigBytes); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	} else {
+		if err := binary.Write(buf, binary.BigEndian, uint32(0)); err != nil {
+			return nil, errors.Wrap(err, "to canonical bytes")
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (s *ShardMerge) FromCanonicalBytes(data []byte) error {
+	buf := bytes.NewBuffer(data)
+
+	// Read and verify type prefix
+	var typePrefix uint32
+	if err := binary.Read(buf, binary.BigEndian, &typePrefix); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if typePrefix != ShardMergeType {
+		return errors.Wrap(
+			errors.New("invalid type prefix"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read number of shard_addresses
+	var numAddrs uint32
+	if err := binary.Read(buf, binary.BigEndian, &numAddrs); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if numAddrs > 8 {
+		return errors.Wrap(
+			errors.New("too many shard addresses"),
+			"from canonical bytes",
+		)
+	}
+
+	// Read each shard address
+	s.ShardAddresses = make([][]byte, numAddrs)
+	for i := uint32(0); i < numAddrs; i++ {
+		var addrLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &addrLen); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		if addrLen > 64 {
+			return errors.Wrap(
+				errors.New("invalid shard address length"),
+				"from canonical bytes",
+			)
+		}
+		s.ShardAddresses[i] = make([]byte, addrLen)
+		if _, err := buf.Read(s.ShardAddresses[i]); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	// Read parent_address
+	var parentLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &parentLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if parentLen > 64 {
+		return errors.Wrap(
+			errors.New("invalid parent address length"),
+			"from canonical bytes",
+		)
+	}
+	s.ParentAddress = make([]byte, parentLen)
+	if _, err := buf.Read(s.ParentAddress); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read frame_number
+	if err := binary.Read(buf, binary.BigEndian, &s.FrameNumber); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read public_key_signature_bls48581
+	var sigLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &sigLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	if sigLen > 0 {
+		sigBytes := make([]byte, sigLen)
+		if _, err := buf.Read(sigBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		s.PublicKeySignatureBls48581 = &BLS48581AddressedSignature{}
+		if err := s.PublicKeySignatureBls48581.FromCanonicalBytes(
+			sigBytes,
+		); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+	}
+
+	return nil
+}
+
+func (s *ShardMerge) Validate() error {
+	if len(s.ShardAddresses) < 2 || len(s.ShardAddresses) > 8 {
+		return errors.New("shard_addresses must have 2-8 entries")
+	}
+
+	if len(s.ParentAddress) != 32 {
+		return errors.New("parent_address must be 32 bytes")
+	}
+
+	for _, addr := range s.ShardAddresses {
+		if len(addr) <= 32 {
+			return errors.New("cannot merge base shards (must be > 32 bytes)")
+		}
+		if !bytes.HasPrefix(addr, s.ParentAddress) {
+			return errors.New(
+				"all shard addresses must share the parent address prefix",
+			)
+		}
+	}
+
+	if s.PublicKeySignatureBls48581 == nil {
+		return errors.New("BLS signature must be present")
+	}
+
+	return nil
+}
+
 func (m *MessageRequest) ToCanonicalBytes() ([]byte, error) {
 	buf := new(bytes.Buffer)
 
@@ -2145,6 +2525,10 @@ func (m *MessageRequest) ToCanonicalBytes() ([]byte, error) {
 		innerBytes, err = request.AltShardUpdate.ToCanonicalBytes()
 	case *MessageRequest_SeniorityMerge:
 		innerBytes, err = request.SeniorityMerge.ToCanonicalBytes()
+	case *MessageRequest_ShardSplit:
+		innerBytes, err = request.ShardSplit.ToCanonicalBytes()
+	case *MessageRequest_ShardMerge:
+		innerBytes, err = request.ShardMerge.ToCanonicalBytes()
 	default:
 		return nil, errors.New("unknown request type")
 	}
@@ -2417,6 +2801,24 @@ func (m *MessageRequest) FromCanonicalBytes(data []byte) error {
 		}
 		m.Request = &MessageRequest_SeniorityMerge{
 			SeniorityMerge: seniorityMerge,
+		}
+
+	case ShardSplitType:
+		shardSplit := &ShardSplit{}
+		if err := shardSplit.FromCanonicalBytes(dataBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		m.Request = &MessageRequest_ShardSplit{
+			ShardSplit: shardSplit,
+		}
+
+	case ShardMergeType:
+		shardMerge := &ShardMerge{}
+		if err := shardMerge.FromCanonicalBytes(dataBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		m.Request = &MessageRequest_ShardMerge{
+			ShardMerge: shardMerge,
 		}
 
 	default:

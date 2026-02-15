@@ -177,6 +177,17 @@ func (hg *HypergraphCRDT) Sync(
 
 	path := hg.getCoveredPrefix()
 
+	// Commit tree state through a transaction before sending initial query
+	initTxn, err := hg.store.NewTransaction(false)
+	if err != nil {
+		return nil, err
+	}
+	initCommitment := set.GetTree().Commit(initTxn, false)
+	if err := initTxn.Commit(); err != nil {
+		initTxn.Abort()
+		return nil, err
+	}
+
 	// Send initial query for path
 	sendStart := time.Now()
 	if err := stream.Send(&protobufs.HypergraphComparison{
@@ -185,7 +196,7 @@ func (hg *HypergraphCRDT) Sync(
 				ShardKey:        slices.Concat(shardKey.L1[:], shardKey.L2[:]),
 				PhaseSet:        phaseSet,
 				Path:            toInt32Slice(path),
-				Commitment:      set.GetTree().Commit(nil, false),
+				Commitment:      initCommitment,
 				IncludeLeafData: false,
 				ExpectedRoot:    expectedRoot,
 			},
@@ -336,7 +347,15 @@ func (hg *HypergraphCRDT) Sync(
 
 	wg.Wait()
 
-	root = set.GetTree().Commit(nil, false)
+	finalTxn, err := hg.store.NewTransaction(false)
+	if err != nil {
+		return nil, err
+	}
+	root = set.GetTree().Commit(finalTxn, false)
+	if err := finalTxn.Commit(); err != nil {
+		finalTxn.Abort()
+		return nil, err
+	}
 	hg.logger.Info(
 		"hypergraph root commit",
 		zap.String("root", hex.EncodeToString(root)),

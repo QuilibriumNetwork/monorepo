@@ -38,6 +38,7 @@ type GlobalIntrinsic struct {
 	rewardIssuance      consensus.RewardIssuance
 	proverRegistry      consensus.ProverRegistry
 	blsConstructor      crypto.BlsConstructor
+	shardsStore         store.ShardsStore
 }
 
 var GLOBAL_RDF_SCHEMA = `BASE <https://types.quilibrium.com/schema-repository/>
@@ -730,6 +731,108 @@ func (a *GlobalIntrinsic) Validate(
 		).Inc()
 		return nil
 
+	case protobufs.ShardSplitType:
+		pb := &protobufs.ShardSplit{}
+		if err := pb.FromCanonicalBytes(input); err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"shard_split",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		op, err := ShardSplitFromProtobuf(
+			pb,
+			a.hypergraph,
+			a.keyManager,
+			a.shardsStore,
+			a.proverRegistry,
+		)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"shard_split",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		valid, err := op.Verify(frameNumber)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"shard_split",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		if !valid {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"shard_split",
+			).Inc()
+			return errors.Wrap(
+				errors.New("invalid shard split"),
+				"validate",
+			)
+		}
+
+		observability.ValidateTotal.WithLabelValues(
+			"global",
+			"shard_split",
+		).Inc()
+		return nil
+
+	case protobufs.ShardMergeType:
+		pb := &protobufs.ShardMerge{}
+		if err := pb.FromCanonicalBytes(input); err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"shard_merge",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		op, err := ShardMergeFromProtobuf(
+			pb,
+			a.hypergraph,
+			a.keyManager,
+			a.shardsStore,
+			a.proverRegistry,
+		)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"shard_merge",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		valid, err := op.Verify(frameNumber)
+		if err != nil {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"shard_merge",
+			).Inc()
+			return errors.Wrap(err, "validate")
+		}
+
+		if !valid {
+			observability.ValidateErrors.WithLabelValues(
+				"global",
+				"shard_merge",
+			).Inc()
+			return errors.Wrap(
+				errors.New("invalid shard merge"),
+				"validate",
+			)
+		}
+
+		observability.ValidateTotal.WithLabelValues(
+			"global",
+			"shard_merge",
+		).Inc()
+		return nil
+
 	default:
 		observability.ValidateErrors.WithLabelValues(
 			"global",
@@ -1268,6 +1371,110 @@ func (a *GlobalIntrinsic) InvokeStep(
 		).Inc()
 		return resultState, nil
 
+	case protobufs.ShardSplitType:
+		opTimer := prometheus.NewTimer(
+			observability.OperationDuration.WithLabelValues(
+				"global",
+				"shard_split",
+			),
+		)
+		defer opTimer.ObserveDuration()
+
+		pb := &protobufs.ShardSplit{}
+		if err := pb.FromCanonicalBytes(input); err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"shard_split",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		op, err := ShardSplitFromProtobuf(
+			pb,
+			a.hypergraph,
+			a.keyManager,
+			a.shardsStore,
+			a.proverRegistry,
+		)
+		if err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"shard_split",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		matTimer := prometheus.NewTimer(
+			observability.MaterializeDuration.WithLabelValues("global"),
+		)
+		resultState, matErr := op.Materialize(frameNumber, state)
+		matTimer.ObserveDuration()
+		if matErr != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"shard_split",
+			).Inc()
+			return nil, errors.Wrap(matErr, "invoke step")
+		}
+
+		observability.InvokeStepTotal.WithLabelValues(
+			"global",
+			"shard_split",
+		).Inc()
+		return resultState, nil
+
+	case protobufs.ShardMergeType:
+		opTimer := prometheus.NewTimer(
+			observability.OperationDuration.WithLabelValues(
+				"global",
+				"shard_merge",
+			),
+		)
+		defer opTimer.ObserveDuration()
+
+		pb := &protobufs.ShardMerge{}
+		if err := pb.FromCanonicalBytes(input); err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"shard_merge",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		op, err := ShardMergeFromProtobuf(
+			pb,
+			a.hypergraph,
+			a.keyManager,
+			a.shardsStore,
+			a.proverRegistry,
+		)
+		if err != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"shard_merge",
+			).Inc()
+			return nil, errors.Wrap(err, "invoke step")
+		}
+
+		matTimer := prometheus.NewTimer(
+			observability.MaterializeDuration.WithLabelValues("global"),
+		)
+		resultState, matErr := op.Materialize(frameNumber, state)
+		matTimer.ObserveDuration()
+		if matErr != nil {
+			observability.InvokeStepErrors.WithLabelValues(
+				"global",
+				"shard_merge",
+			).Inc()
+			return nil, errors.Wrap(matErr, "invoke step")
+		}
+
+		observability.InvokeStepTotal.WithLabelValues(
+			"global",
+			"shard_merge",
+		).Inc()
+		return resultState, nil
+
 	default:
 		observability.InvokeStepErrors.WithLabelValues(
 			"global",
@@ -1395,6 +1602,28 @@ func (a *GlobalIntrinsic) Lock(
 		observability.LockTotal.WithLabelValues(
 			"global",
 			"prover_seniority_merge",
+		).Inc()
+
+	case protobufs.ShardSplitType:
+		reads, writes, err = a.tryLockShardSplit(frameNumber, input)
+		if err != nil {
+			return nil, err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"global",
+			"shard_split",
+		).Inc()
+
+	case protobufs.ShardMergeType:
+		reads, writes, err = a.tryLockShardMerge(frameNumber, input)
+		if err != nil {
+			return nil, err
+		}
+
+		observability.LockTotal.WithLabelValues(
+			"global",
+			"shard_merge",
 		).Inc()
 
 	default:
@@ -1914,6 +2143,112 @@ func (a *GlobalIntrinsic) tryLockSeniorityMerge(
 	return reads, writes, nil
 }
 
+func (a *GlobalIntrinsic) tryLockShardSplit(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	pb := &protobufs.ShardSplit{}
+	if err := pb.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"shard_split",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	op, err := ShardSplitFromProtobuf(
+		pb,
+		a.hypergraph,
+		a.keyManager,
+		a.shardsStore,
+		a.proverRegistry,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"shard_split",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"shard_split",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"shard_split",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
+func (a *GlobalIntrinsic) tryLockShardMerge(
+	frameNumber uint64,
+	input []byte,
+) (
+	[][]byte,
+	[][]byte,
+	error,
+) {
+	pb := &protobufs.ShardMerge{}
+	if err := pb.FromCanonicalBytes(input); err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"shard_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	op, err := ShardMergeFromProtobuf(
+		pb,
+		a.hypergraph,
+		a.keyManager,
+		a.shardsStore,
+		a.proverRegistry,
+	)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"shard_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	reads, err := op.GetReadAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"shard_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	writes, err := op.GetWriteAddresses(frameNumber)
+	if err != nil {
+		observability.LockErrors.WithLabelValues(
+			"global",
+			"shard_merge",
+		).Inc()
+		return nil, nil, errors.Wrap(err, "lock")
+	}
+
+	return reads, writes, nil
+}
+
 // LoadGlobalIntrinsic loads the global intrinsic from the global intrinsic
 // address. The global intrinsic is implicitly deployed and always exists at the
 // global address.
@@ -1928,6 +2263,7 @@ func LoadGlobalIntrinsic(
 	rewardIssuance consensus.RewardIssuance,
 	proverRegistry consensus.ProverRegistry,
 	blsConstructor crypto.BlsConstructor,
+	shardsStore store.ShardsStore,
 ) (*GlobalIntrinsic, error) {
 	// Verify the address is the global intrinsic address
 	if !bytes.Equal(address, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:]) {
@@ -1956,6 +2292,7 @@ func LoadGlobalIntrinsic(
 		rewardIssuance:      rewardIssuance,
 		proverRegistry:      proverRegistry,
 		blsConstructor:      blsConstructor,
+		shardsStore:         shardsStore,
 	}, nil
 }
 

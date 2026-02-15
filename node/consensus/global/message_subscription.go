@@ -172,7 +172,6 @@ func (e *GlobalConsensusEngine) subscribeToProverMessages() error {
 		GLOBAL_PROVER_BITMASK,
 		func(message *pb.Message) error {
 			if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-				e.logger.Debug("dropping prover message, not in archive mode")
 				return nil
 			}
 

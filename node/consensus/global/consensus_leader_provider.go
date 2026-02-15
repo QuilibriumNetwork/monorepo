@@ -295,11 +295,17 @@ func (p *GlobalLeaderProvider) ProveNextState(
 
 	requestRoot := requestTree.Commit(p.engine.inclusionProver, false)
 
+	// Copy shared state under lock to avoid data race with materialize()
+	p.engine.shardCommitmentMu.Lock()
+	shardCommitments := p.engine.shardCommitments
+	proverRoot := p.engine.proverRoot
+	p.engine.shardCommitmentMu.Unlock()
+
 	// Prove the global frame header
 	newHeader, err := p.engine.frameProver.ProveGlobalFrameHeader(
 		(*prior).Header,
-		p.engine.shardCommitments,
-		p.engine.proverRoot,
+		shardCommitments,
+		proverRoot,
 		requestRoot,
 		signer,
 		timestamp,

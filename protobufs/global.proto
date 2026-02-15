@@ -111,6 +111,28 @@ message AltShardUpdate {
   bytes signature = 7;
 }
 
+message ShardSplit {
+  // The original shard address being split (32-63 bytes)
+  bytes shard_address = 1;
+  // The new sub-shard addresses proposed by the split
+  repeated bytes proposed_shards = 2;
+  // The frame number at which the split was detected
+  uint64 frame_number = 3;
+  // The BLS48-581 addressed signature proving prover identity
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 4;
+}
+
+message ShardMerge {
+  // The sub-shard addresses being merged
+  repeated bytes shard_addresses = 1;
+  // The parent shard address (first 32 bytes)
+  bytes parent_address = 2;
+  // The frame number at which the merge was detected
+  uint64 frame_number = 3;
+  // The BLS48-581 addressed signature proving prover identity
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 4;
+}
+
 message MessageRequest {
   oneof request {
     quilibrium.node.global.pb.ProverJoin join = 1;
@@ -140,6 +162,8 @@ message MessageRequest {
     quilibrium.node.global.pb.FrameHeader shard = 25;
     quilibrium.node.global.pb.AltShardUpdate alt_shard_update = 26;
     quilibrium.node.global.pb.ProverSeniorityMerge seniority_merge = 27;
+    quilibrium.node.global.pb.ShardSplit shard_split = 28;
+    quilibrium.node.global.pb.ShardMerge shard_merge = 29;
   }
   int64 timestamp = 99;
 }

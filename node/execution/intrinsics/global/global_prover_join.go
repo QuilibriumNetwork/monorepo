@@ -528,10 +528,14 @@ func (p *ProverJoin) Prove(frameNumber uint64) error {
 		return errors.Wrap(err, "prove")
 	}
 
+	// Set the public key before signing merge targets, since merge target
+	// signatures are over the BLS public key and Verify() checks against it.
+	blsPublicKey := prover.Public().([]byte)
+
 	for _, mt := range p.MergeTargets {
 		if mt.signer != nil {
 			mt.Signature, err = mt.signer.SignWithDomain(
-				p.PublicKeySignatureBLS48581.PublicKey,
+				blsPublicKey,
 				[]byte("PROVER_JOIN_MERGE"),
 			)
 			if err != nil {
@@ -573,7 +577,7 @@ func (p *ProverJoin) Prove(frameNumber uint64) error {
 	// Create the proof of possession signature over the public key with the POP
 	// domain
 	popSignature, err := prover.SignWithDomain(
-		prover.Public().([]byte),
+		blsPublicKey,
 		popDomain,
 	)
 	if err != nil {
@@ -583,7 +587,7 @@ func (p *ProverJoin) Prove(frameNumber uint64) error {
 	// Create the BLS48581SignatureWithProofOfPossession
 	p.PublicKeySignatureBLS48581 = BLS48581SignatureWithProofOfPossession{
 		Signature:    signature,
-		PublicKey:    prover.Public().([]byte),
+		PublicKey:    blsPublicKey,
 		PopSignature: popSignature,
 	}
 

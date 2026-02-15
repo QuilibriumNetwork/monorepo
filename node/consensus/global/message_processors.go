@@ -1722,7 +1722,10 @@ func (e *GlobalConsensusEngine) addCertifiedState(
 	}
 
 	// Trigger coverage check asynchronously to avoid blocking message processing
-	e.triggerCoverageCheckAsync(parent.State.GetFrameNumber())
+	e.triggerCoverageCheckAsync(
+		parent.State.GetFrameNumber(),
+		parent.State.Header.Prover,
+	)
 }
 
 func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {

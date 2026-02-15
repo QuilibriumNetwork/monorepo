@@ -96,6 +96,7 @@ var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_1820,
 	migration_2_1_0_1821,
 	migration_2_1_0_1822,
+	migration_2_1_0_1823,
 }
 
 func NewPebbleDB(
@@ -1130,6 +1131,12 @@ func doMigration1821(db *pebble.DB, cfg *config.Config) error {
 // migration_2_1_0_1822 rebuilds the global prover shard tree to fix potential
 // corruption from transaction bypass bugs in SaveRoot and Commit.
 func migration_2_1_0_1822(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return doMigration1818(db, cfg)
+}
+
+// migration_2_1_0_1823 rebuilds the global prover shard tree to fix potential
+// corruption from transaction bypass bugs in SaveRoot and Commit.
+func migration_2_1_0_1823(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	return doMigration1818(db, cfg)
 }
 

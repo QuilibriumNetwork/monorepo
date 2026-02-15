@@ -418,6 +418,30 @@ func GlobalRequestFromBytes(
 	)
 }
 
+// ToRequestBytes serializes a ShardSplitOp to MessageRequest bytes using
+// protobuf
+func (op *ShardSplitOp) ToRequestBytes() ([]byte, error) {
+	pb := op.ToProtobuf()
+	req := &protobufs.MessageRequest{
+		Request: &protobufs.MessageRequest_ShardSplit{
+			ShardSplit: pb,
+		},
+	}
+	return req.ToCanonicalBytes()
+}
+
+// ToRequestBytes serializes a ShardMergeOp to MessageRequest bytes using
+// protobuf
+func (op *ShardMergeOp) ToRequestBytes() ([]byte, error) {
+	pb := op.ToProtobuf()
+	req := &protobufs.MessageRequest{
+		Request: &protobufs.MessageRequest_ShardMerge{
+			ShardMerge: pb,
+		},
+	}
+	return req.ToCanonicalBytes()
+}
+
 // ToBytes serializes a ProverUpdate to bytes using protobuf
 func (p *ProverUpdate) ToBytes() ([]byte, error) {
 	pb := p.ToProtobuf()

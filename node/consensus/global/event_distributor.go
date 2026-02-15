@@ -82,7 +82,10 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 					e.flushDeferredGlobalMessages(data.Frame.GetRank() + 1)
 
 					// Check shard coverage asynchronously to avoid blocking event processing
-					e.triggerCoverageCheckAsync(data.Frame.Header.FrameNumber)
+					e.triggerCoverageCheckAsync(
+						data.Frame.Header.FrameNumber,
+						data.Frame.Header.Prover,
+					)
 
 					// Update global coordination metrics
 					globalCoordinationTotal.Inc()
@@ -266,6 +269,16 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 					}()
 				}
 
+			case typesconsensus.ControlEventShardSplitEligible:
+				if data, ok := event.Data.(*typesconsensus.ShardSplitEventData); ok {
+					e.handleShardSplitEvent(data)
+				}
+
+			case typesconsensus.ControlEventShardMergeEligible:
+				if data, ok := event.Data.(*typesconsensus.BulkShardMergeEventData); ok {
+					e.handleShardMergeEvent(data)
+				}
+
 			default:
 				e.logger.Debug(
 					"received unhandled event type",
@@ -306,6 +319,7 @@ func (e *GlobalConsensusEngine) emitCoverageEvent(
 
 func (e *GlobalConsensusEngine) emitBulkMergeEvent(
 	mergeGroups []typesconsensus.ShardMergeEventData,
+	frameProver []byte,
 ) {
 	if len(mergeGroups) == 0 {
 		return
@@ -314,6 +328,7 @@ func (e *GlobalConsensusEngine) emitBulkMergeEvent(
 	// Combine all merge groups into a single bulk event
 	data := &typesconsensus.BulkShardMergeEventData{
 		MergeGroups: mergeGroups,
+		FrameProver: frameProver,
 	}
 
 	event := typesconsensus.ControlEvent{
@@ -368,6 +383,156 @@ func (e *GlobalConsensusEngine) emitAlertEvent(alertMessage string) {
 	go e.eventDistributor.Publish(event)
 
 	e.logger.Info("emitted alert message")
+}
+
+const shardActionCooldownFrames = 360
+
+func (e *GlobalConsensusEngine) handleShardSplitEvent(
+	data *typesconsensus.ShardSplitEventData,
+) {
+	// Only the prover who produced the triggering frame should emit
+	if !bytes.Equal(data.FrameProver, e.getProverAddress()) {
+		return
+	}
+
+	frameNumber := e.lastObservedFrame.Load()
+	if frameNumber == 0 {
+		return
+	}
+
+	addrKey := string(data.ShardAddress)
+	e.lastShardActionFrameMu.Lock()
+	if last, ok := e.lastShardActionFrame[addrKey]; ok &&
+		frameNumber-last < shardActionCooldownFrames {
+		e.lastShardActionFrameMu.Unlock()
+		e.logger.Debug(
+			"skipping shard split, cooldown active",
+			zap.String("shard_address", hex.EncodeToString(data.ShardAddress)),
+			zap.Uint64("last_action_frame", last),
+			zap.Uint64("current_frame", frameNumber),
+		)
+		return
+	}
+	e.lastShardActionFrame[addrKey] = frameNumber
+	e.lastShardActionFrameMu.Unlock()
+
+	op := globalintrinsics.NewShardSplitOp(
+		data.ShardAddress,
+		data.ProposedShards,
+		e.keyManager,
+		e.shardsStore,
+		e.proverRegistry,
+	)
+
+	if err := op.Prove(frameNumber); err != nil {
+		e.logger.Error(
+			"failed to prove shard split",
+			zap.Error(err),
+		)
+		return
+	}
+
+	splitBytes, err := op.ToRequestBytes()
+	if err != nil {
+		e.logger.Error(
+			"failed to serialize shard split",
+			zap.Error(err),
+		)
+		return
+	}
+
+	if err := e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		splitBytes,
+	); err != nil {
+		e.logger.Error("failed to publish shard split", zap.Error(err))
+	} else {
+		e.logger.Info(
+			"published shard split",
+			zap.String("shard_address", hex.EncodeToString(data.ShardAddress)),
+			zap.Int("proposed_shards", len(data.ProposedShards)),
+			zap.Uint64("frame_number", frameNumber),
+		)
+	}
+}
+
+func (e *GlobalConsensusEngine) handleShardMergeEvent(
+	data *typesconsensus.BulkShardMergeEventData,
+) {
+	// Only the prover who produced the triggering frame should emit
+	if !bytes.Equal(data.FrameProver, e.getProverAddress()) {
+		return
+	}
+
+	frameNumber := e.lastObservedFrame.Load()
+	if frameNumber == 0 {
+		return
+	}
+
+	for _, group := range data.MergeGroups {
+		if len(group.ShardAddresses) < 2 {
+			continue
+		}
+
+		// Use first shard's first 32 bytes as parent address
+		parentAddress := group.ShardAddresses[0][:32]
+
+		// Check cooldown for the parent address
+		parentKey := string(parentAddress)
+		e.lastShardActionFrameMu.Lock()
+		if last, ok := e.lastShardActionFrame[parentKey]; ok &&
+			frameNumber-last < shardActionCooldownFrames {
+			e.lastShardActionFrameMu.Unlock()
+			e.logger.Debug(
+				"skipping shard merge, cooldown active",
+				zap.String("parent_address", hex.EncodeToString(parentAddress)),
+				zap.Uint64("last_action_frame", last),
+				zap.Uint64("current_frame", frameNumber),
+			)
+			continue
+		}
+		e.lastShardActionFrame[parentKey] = frameNumber
+		e.lastShardActionFrameMu.Unlock()
+
+		op := globalintrinsics.NewShardMergeOp(
+			group.ShardAddresses,
+			parentAddress,
+			e.keyManager,
+			e.shardsStore,
+			e.proverRegistry,
+		)
+
+		if err := op.Prove(frameNumber); err != nil {
+			e.logger.Error(
+				"failed to prove shard merge",
+				zap.Error(err),
+			)
+			continue
+		}
+
+		mergeBytes, err := op.ToRequestBytes()
+		if err != nil {
+			e.logger.Error(
+				"failed to serialize shard merge",
+				zap.Error(err),
+			)
+			continue
+		}
+
+		if err := e.pubsub.PublishToBitmask(
+			GLOBAL_PROVER_BITMASK,
+			mergeBytes,
+		); err != nil {
+			e.logger.Error("failed to publish shard merge", zap.Error(err))
+		} else {
+			e.logger.Info(
+				"published shard merge",
+				zap.String("parent_address", hex.EncodeToString(parentAddress)),
+				zap.Int("shard_count", len(group.ShardAddresses)),
+				zap.Uint64("frame_number", frameNumber),
+			)
+		}
+	}
 }
 
 func (e *GlobalConsensusEngine) estimateSeniorityFromConfig() uint64 {
