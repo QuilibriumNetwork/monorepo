@@ -109,11 +109,11 @@ func (h *VertexRemove) Verify(frameNumber uint64) (bool, error) {
 		slices.Concat(h.Domain[:], []byte("VERTEX_REMOVE")),
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid vertex remove")
 	}
 
 	if !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid vertex remove")
 	}
 
 	return true, nil

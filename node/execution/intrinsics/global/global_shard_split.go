@@ -115,7 +115,7 @@ func (op *ShardSplitOp) Verify(frameNumber uint64) (bool, error) {
 	)
 	splitDomain, err := poseidon.HashBytes(splitDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid shard split")
 	}
 
 	ok, err := op.keyManager.ValidateSignature(
@@ -128,14 +128,14 @@ func (op *ShardSplitOp) Verify(frameNumber uint64) (bool, error) {
 	if err != nil || !ok {
 		return false, errors.Wrap(
 			errors.New("invalid BLS signature"),
-			"verify",
+			"verify: invalid shard split",
 		)
 	}
 
 	// Verify shard has enough provers to warrant split (> maxProvers)
 	count, err := op.proverRegistry.GetProverCount(op.ShardAddress)
 	if err != nil {
-		return false, errors.Wrap(err, "verify prover count")
+		return false, errors.Wrap(err, "verify: invalid shard split: prover count")
 	}
 	if count <= maxProversThreshold {
 		return false, errors.Errorf(

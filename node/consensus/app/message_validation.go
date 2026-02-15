@@ -41,7 +41,7 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 
 		proposal := &protobufs.AppShardProposal{}
 		if err := proposal.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
+			e.logger.Debug("failed to unmarshal proposal", zap.Error(err))
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
@@ -53,11 +53,21 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 		}
 
 		if !bytes.Equal(proposal.State.Header.Address, e.appAddress) {
+			e.logger.Debug(
+				"ignoring proposal",
+				zap.String("reason", "address mismatch"),
+			)
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}
 
 		if e.forks.FinalizedRank() > proposal.GetRank() {
+			e.logger.Debug(
+				"ignoring proposal",
+				zap.String("reason", "stale rank"),
+				zap.Uint64("current_rank", e.forks.FinalizedRank()),
+				zap.Uint64("proposal_rank", proposal.GetRank()),
+			)
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "ignore").Inc()
 			return p2p.ValidationResultIgnore
 		}
@@ -70,7 +80,10 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 		}
 
 		if !valid {
-			e.logger.Debug("invalid frame")
+			e.logger.Debug(
+				"invalid proposal",
+				zap.String("reason", "frame validator returned false"),
+			)
 			proposalValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
 			return p2p.ValidationResultReject
 		}
@@ -158,6 +171,11 @@ func (e *AppConsensusEngine) validateConsensusMessage(
 		}
 
 	default:
+		e.logger.Debug(
+			"rejecting consensus message",
+			zap.String("reason", "unknown type prefix"),
+			zap.Uint32("type", typePrefix),
+		)
 		return p2p.ValidationResultReject
 	}
 
@@ -170,7 +188,7 @@ func (e *AppConsensusEngine) validateProverMessage(
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)
@@ -197,6 +215,12 @@ func (e *AppConsensusEngine) validateProverMessage(
 
 		now := time.Now().UnixMilli()
 		if messageBundle.Timestamp > now+5000 || messageBundle.Timestamp < now-5000 {
+			e.logger.Debug(
+				"ignoring prover message",
+				zap.String("reason", "timestamp out of window"),
+				zap.Int64("timestamp", messageBundle.Timestamp),
+				zap.Int64("now", now),
+			)
 			return p2p.ValidationResultIgnore
 		}
 
@@ -214,7 +238,7 @@ func (e *AppConsensusEngine) validateGlobalProverMessage(
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)
@@ -241,6 +265,12 @@ func (e *AppConsensusEngine) validateGlobalProverMessage(
 
 		now := time.Now().UnixMilli()
 		if messageBundle.Timestamp > now+5000 || messageBundle.Timestamp < now-5000 {
+			e.logger.Debug(
+				"ignoring global prover message",
+				zap.String("reason", "timestamp out of window"),
+				zap.Int64("timestamp", messageBundle.Timestamp),
+				zap.Int64("now", now),
+			)
 			return p2p.ValidationResultIgnore
 		}
 
@@ -307,18 +337,30 @@ func (e *AppConsensusEngine) validateFrameMessage(
 		}
 
 		if !valid {
+			e.logger.Debug(
+				"invalid app frame",
+				zap.String("reason", "frame validator returned false"),
+			)
 			frameValidationTotal.WithLabelValues(e.appAddressHex, "reject").Inc()
-			e.logger.Debug("invalid frame")
 			return p2p.ValidationResultReject
 		}
 
 		if frametime.AppFrameSince(frame) > 20*time.Second {
+			e.logger.Debug(
+				"ignoring app frame",
+				zap.String("reason", "frame too old"),
+			)
 			return p2p.ValidationResultIgnore
 		}
 
 		frameValidationTotal.WithLabelValues(e.appAddressHex, "accept").Inc()
 
 	default:
+		e.logger.Debug(
+			"rejecting frame message",
+			zap.String("reason", "unknown type prefix"),
+			zap.Uint32("type", typePrefix),
+		)
 		return p2p.ValidationResultReject
 	}
 
@@ -367,18 +409,30 @@ func (e *AppConsensusEngine) validateGlobalFrameMessage(
 		}
 
 		if !valid {
-			e.logger.Debug("invalid frame")
+			e.logger.Debug(
+				"invalid global frame",
+				zap.String("reason", "frame validator returned false"),
+			)
 			globalFrameValidationTotal.WithLabelValues("reject").Inc()
 			return p2p.ValidationResultReject
 		}
 
 		if frametime.GlobalFrameSince(frame) > 20*time.Second {
+			e.logger.Debug(
+				"ignoring global frame",
+				zap.String("reason", "frame too old"),
+			)
 			return p2p.ValidationResultIgnore
 		}
 
 		globalFrameValidationTotal.WithLabelValues("accept").Inc()
 
 	default:
+		e.logger.Debug(
+			"rejecting global frame message",
+			zap.String("reason", "unknown type prefix"),
+			zap.Uint32("type", typePrefix),
+		)
 		return p2p.ValidationResultReject
 	}
 
@@ -391,7 +445,7 @@ func (e *AppConsensusEngine) validateAlertMessage(
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)
@@ -441,7 +495,7 @@ func (e *AppConsensusEngine) validatePeerInfoMessage(
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)
@@ -536,7 +590,7 @@ func (e *AppConsensusEngine) validateDispatchMessage(
 ) p2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)
@@ -562,6 +616,11 @@ func (e *AppConsensusEngine) validateDispatchMessage(
 
 		if envelope.Timestamp < uint64(time.Now().UnixMilli())-2000 ||
 			envelope.Timestamp > uint64(time.Now().UnixMilli())+5000 {
+			e.logger.Debug(
+				"ignoring dispatch message",
+				zap.String("reason", "timestamp out of window"),
+				zap.Uint64("timestamp", envelope.Timestamp),
+			)
 			return p2p.ValidationResultIgnore
 		}
 	case protobufs.HubAddInboxType:

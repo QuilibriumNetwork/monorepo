@@ -341,7 +341,7 @@ func (p *ProverPause) Verify(frameNumber uint64) (bool, error) {
 	)
 	pauseDomain, err := poseidon.HashBytes(pauseDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover pause")
 	}
 
 	_, err = p.hypergraph.GetVertex([64]byte(slices.Concat(
@@ -349,7 +349,7 @@ func (p *ProverPause) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover pause")
 	}
 
 	tree, err := p.hypergraph.GetVertexData([64]byte(slices.Concat(
@@ -357,7 +357,7 @@ func (p *ProverPause) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover pause")
 	}
 
 	pubkey, err := p.rdfMultiprover.Get(
@@ -367,7 +367,7 @@ func (p *ProverPause) Verify(frameNumber uint64) (bool, error) {
 		tree,
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover pause")
 	}
 
 	// Calculate allocation address to verify it exists and is active
@@ -375,7 +375,7 @@ func (p *ProverPause) Verify(frameNumber uint64) (bool, error) {
 		slices.Concat([]byte("PROVER_ALLOCATION"), pubkey, p.Filter),
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover pause")
 	}
 	allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
 	allocationFullAddress := [64]byte{}
@@ -387,7 +387,7 @@ func (p *ProverPause) Verify(frameNumber uint64) (bool, error) {
 	if err != nil || allocationTree == nil {
 		return false, errors.Wrap(
 			errors.New("allocation not found"),
-			"verify",
+			"verify: invalid prover pause",
 		)
 	}
 
@@ -399,7 +399,7 @@ func (p *ProverPause) Verify(frameNumber uint64) (bool, error) {
 		allocationTree,
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover pause")
 	}
 
 	status := uint8(0)
@@ -411,7 +411,7 @@ func (p *ProverPause) Verify(frameNumber uint64) (bool, error) {
 	if status != 1 {
 		return false, errors.Wrap(
 			errors.New("can only pause when allocation is active"),
-			"verify",
+			"verify: invalid prover pause",
 		)
 	}
 
@@ -424,7 +424,7 @@ func (p *ProverPause) Verify(frameNumber uint64) (bool, error) {
 		pauseDomain.Bytes(),
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid prover pause")
 	}
 
 	return true, nil

@@ -1140,8 +1140,8 @@ func (e *GlobalConsensusEngine) setupGRPCServer() error {
 		grpc.Creds(tlsCreds),
 		grpc.ChainUnaryInterceptor(e.authProvider.UnaryInterceptor),
 		grpc.ChainStreamInterceptor(e.authProvider.StreamInterceptor),
-		grpc.MaxRecvMsgSize(10*1024*1024),
-		grpc.MaxSendMsgSize(10*1024*1024),
+		grpc.MaxRecvMsgSize(e.config.Engine.SyncMessageLimits.MaxRecvMsgSize),
+		grpc.MaxSendMsgSize(e.config.Engine.SyncMessageLimits.MaxSendMsgSize),
 	)
 
 	// Create TCP listener

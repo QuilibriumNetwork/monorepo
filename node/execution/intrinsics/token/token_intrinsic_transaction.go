@@ -1474,7 +1474,7 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 		len(tx.Inputs) != len(tx.TraversalProof.SubProofs) {
 		return false, errors.Wrap(
 			errors.New("invalid quantity of inputs, outputs, or proofs"),
-			"verify",
+			"verify: invalid transaction",
 		)
 	}
 
@@ -1482,20 +1482,20 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 		if fee == nil ||
 			new(big.Int).Lsh(big.NewInt(1), uint(128)).Cmp(fee) < 0 ||
 			new(big.Int).Cmp(fee) > 0 {
-			return false, errors.Wrap(errors.New("invalid fees"), "verify")
+			return false, errors.Wrap(errors.New("invalid fees"), "verify: invalid transaction")
 		}
 	}
 
 	if tx.config.Behavior&Divisible == 0 && len(tx.Inputs) != len(tx.Outputs) {
 		return false, errors.Wrap(
 			errors.New("non-divisible token has mismatching inputs and outputs"),
-			"verify",
+			"verify: invalid transaction",
 		)
 	}
 
 	challenge, err := tx.GetChallenge()
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid transaction")
 	}
 
 	inputs := [][]byte{}
@@ -1509,13 +1509,13 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 			tx.TraversalProof,
 			i,
 		); !valid {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid transaction")
 		}
 
 		if _, ok := check[string(input.Signature[(56*4):(56*5)])]; ok {
 			return false, errors.Wrap(
 				errors.New("attempted double-spend"),
-				"verify",
+				"verify: invalid transaction",
 			)
 		}
 		check[string(input.Signature[(56*4):(56*5)])] = struct{}{}
@@ -1526,7 +1526,7 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 	commitments := [][]byte{}
 	for i, o := range tx.Outputs {
 		if valid, err := o.Verify(frameNumber, tx.config); !valid {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid transaction")
 		}
 
 		if tx.config.Behavior&Divisible == 0 {
@@ -1537,13 +1537,13 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 				o.RecipientOutput.AdditionalReferenceKey,
 				tx.Inputs[i].Proofs[len(tx.Inputs[i].Proofs)-1][64:],
 			) {
-				return false, errors.Wrap(errors.New("invalid reference"), "verify")
+				return false, errors.Wrap(errors.New("invalid reference"), "verify: invalid transaction")
 			}
 		}
 
 		spendCheckBI, err := poseidon.HashBytes(o.RecipientOutput.VerificationKey)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid transaction")
 		}
 
 		_, err = tx.hypergraph.GetVertex([64]byte(
@@ -1552,7 +1552,7 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 		if err == nil {
 			return false, errors.Wrap(
 				errors.New("invalid verification key"),
-				"verify",
+				"verify: invalid transaction",
 			)
 		}
 
@@ -1565,7 +1565,7 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 		tx.Domain[:],
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid transaction")
 	}
 
 	valid, err := tx.hypergraph.VerifyTraversalProof(
@@ -1576,11 +1576,11 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 		tx.TraversalProof,
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid transaction")
 	}
 
 	if !tx.bulletproofProver.VerifyRangeProof(tx.RangeProof, commitment, 128) {
-		return false, errors.Wrap(errors.New("invalid range proof"), "verify")
+		return false, errors.Wrap(errors.New("invalid range proof"), "verify: invalid transaction")
 	}
 
 	sumcheckFees := []*big.Int{}
@@ -1594,7 +1594,7 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 		commitments,
 		sumcheckFees,
 	) {
-		return false, errors.Wrap(errors.New("invalid sum check"), "verify")
+		return false, errors.Wrap(errors.New("invalid sum check"), "verify: invalid transaction")
 	}
 
 	return true, nil

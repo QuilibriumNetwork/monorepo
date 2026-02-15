@@ -307,34 +307,34 @@ func (p *ProverUpdate) Verify(frameNumber uint64) (bool, error) {
 	if p.hypergraph == nil {
 		return false, errors.Wrap(
 			errors.New("hypergraph not initialized"),
-			"verify",
+			"verify: invalid prover update",
 		)
 	}
 	if p.keyManager == nil {
 		return false, errors.Wrap(
 			errors.New("key manager not initialized"),
-			"verify",
+			"verify: invalid prover update",
 		)
 	}
 	if p.rdfMultiprover == nil {
 		return false, errors.Wrap(
 			errors.New("rdf multiprover not initialized"),
-			"verify",
+			"verify: invalid prover update",
 		)
 	}
 	if p.PublicKeySignatureBLS48581 == nil {
-		return false, errors.Wrap(errors.New("missing signature"), "verify")
+		return false, errors.Wrap(errors.New("missing signature"), "verify: invalid prover update")
 	}
 	if len(p.DelegateAddress) != 32 {
 		return false, errors.Wrap(
 			errors.New("missing delegate address"),
-			"verify",
+			"verify: invalid prover update",
 		)
 	}
 	if len(p.PublicKeySignatureBLS48581.Address) != 32 {
 		return false, errors.Wrap(
 			errors.New("invalid addressed prover address"),
-			"verify",
+			"verify: invalid prover update",
 		)
 	}
 
@@ -345,7 +345,7 @@ func (p *ProverUpdate) Verify(frameNumber uint64) (bool, error) {
 
 	vertexData, err := p.hypergraph.GetVertexData(proverFullAddr)
 	if err != nil || vertexData == nil {
-		return false, errors.Wrap(errors.New("prover not found"), "verify")
+		return false, errors.Wrap(errors.New("prover not found"), "verify: invalid prover update")
 	}
 
 	// Fetch the registered PublicKey to verify the address binding and the
@@ -357,20 +357,20 @@ func (p *ProverUpdate) Verify(frameNumber uint64) (bool, error) {
 		vertexData,
 	)
 	if err != nil || len(pubKeyBytes) == 0 {
-		return false, errors.Wrap(errors.New("prover public key missing"), "verify")
+		return false, errors.Wrap(errors.New("prover public key missing"), "verify: invalid prover update")
 	}
 	pubKey := pubKeyBytes
 
 	// Check poseidon(pubKey) == addressed.Address
 	addrBI, err := poseidon.HashBytes(pubKey)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover update")
 	}
 	addrCheck := addrBI.FillBytes(make([]byte, 32))
 	if !slices.Equal(addrCheck, p.PublicKeySignatureBLS48581.Address) {
 		return false, errors.Wrap(
 			errors.New("address does not match registered pubkey"),
-			"verify",
+			"verify: invalid prover update",
 		)
 	}
 
@@ -381,7 +381,7 @@ func (p *ProverUpdate) Verify(frameNumber uint64) (bool, error) {
 	)
 	updateDomain, err := poseidon.HashBytes(updateDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover update")
 	}
 
 	// Validate signature over the new DelegateAddress
@@ -394,13 +394,13 @@ func (p *ProverUpdate) Verify(frameNumber uint64) (bool, error) {
 		updateDomain.Bytes(),
 	)
 	if err != nil || !ok {
-		return false, errors.Wrap(errors.New("invalid update signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid update signature"), "verify: invalid prover update")
 	}
 
 	if len(p.DelegateAddress) != 32 {
 		return false, errors.Wrap(
 			errors.New("delegate address must be 32 bytes"),
-			"verify",
+			"verify: invalid prover update",
 		)
 	}
 

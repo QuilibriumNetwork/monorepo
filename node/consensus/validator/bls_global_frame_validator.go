@@ -38,16 +38,14 @@ func (b *BLSGlobalFrameValidator) Validate(
 	frame *protobufs.GlobalFrame,
 ) (bool, error) {
 	if frame == nil || frame.Header == nil {
-		b.logger.Debug("frame or header is nil")
-		return false, nil
+		return false, errors.New("frame or header is nil")
 	}
 
 	if len(frame.Header.Output) != 516 {
-		b.logger.Debug(
-			"invalid output length",
-			zap.Int("output_len", len(frame.Header.Output)),
+		return false, errors.Errorf(
+			"invalid output length: %d",
+			len(frame.Header.Output),
 		)
-		return false, nil
 	}
 
 	if frame.Header.FrameNumber == 0 {
@@ -56,19 +54,16 @@ func (b *BLSGlobalFrameValidator) Validate(
 	}
 
 	if frame.Header.PublicKeySignatureBls48581 == nil {
-		b.logger.Debug("no bls signature")
-		return false, nil
+		return false, errors.New("no bls signature")
 	}
 
 	sig := frame.Header.PublicKeySignatureBls48581
 	if sig.Signature == nil || sig.PublicKey == nil {
-		b.logger.Debug("signature or public key is nil")
-		return false, nil
+		return false, errors.New("signature or public key is nil")
 	}
 
 	if sig.Bitmask == nil {
-		b.logger.Debug("bitmask is nil")
-		return false, nil
+		return false, errors.New("bitmask is nil")
 	}
 
 	bits, err := b.frameProver.VerifyGlobalFrameHeader(
@@ -79,8 +74,7 @@ func (b *BLSGlobalFrameValidator) Validate(
 
 	if !isValid {
 		b.logger.Debug(
-			"frame verification result",
-			zap.Bool("is_valid", isValid),
+			"frame verification failed",
 			zap.Error(err),
 			zap.Uint64("frame_number", frame.Header.FrameNumber),
 			zap.String(
@@ -88,7 +82,7 @@ func (b *BLSGlobalFrameValidator) Validate(
 				hex.EncodeToString(frame.Header.ParentSelector),
 			),
 		)
-		return false, err
+		return false, errors.Wrap(err, "global frame header verification")
 	}
 
 	provers, err := b.proverRegistry.GetActiveProvers(nil)

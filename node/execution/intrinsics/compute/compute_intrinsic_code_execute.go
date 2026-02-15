@@ -356,14 +356,14 @@ func (c *CodeExecute) Verify(frameNumber uint64) (bool, error) {
 		) {
 			return false, errors.Wrap(
 				errors.New("invalid signature"),
-				"verify",
+				"verify: invalid code execute",
 			)
 		}
 	}
 
 	_, err := c.buildExecutionDAG()
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid code execute")
 	}
 
 	return true, nil

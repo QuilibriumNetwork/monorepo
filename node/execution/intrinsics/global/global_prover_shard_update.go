@@ -96,11 +96,11 @@ func (p *ProverShardUpdate) Prove(uint64) error {
 func (p *ProverShardUpdate) Verify(frameNumber uint64) (bool, error) {
 	_, err := p.buildContext()
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover shard update")
 	}
 
 	if frameNumber != p.FrameHeader.FrameNumber+1 {
-		return false, errors.Wrap(errors.New("invalid update"), "verify")
+		return false, errors.Wrap(errors.New("invalid update"), "verify: invalid prover shard update")
 	}
 
 	return true, nil

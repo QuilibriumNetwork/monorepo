@@ -121,7 +121,7 @@ func (c *CodeDeployment) Verify(frameNumber uint64) (bool, error) {
 	buf := bytes.NewReader(c.Circuit)
 	err := c.compiler.ValidateCircuit(buf)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid code deployment")
 	}
 
 	return true, nil

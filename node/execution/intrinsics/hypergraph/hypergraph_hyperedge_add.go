@@ -147,27 +147,27 @@ func (h *HyperedgeAdd) GetWriteAddresses(
 // Verify implements intrinsics.IntrinsicOperation.
 func (h *HyperedgeAdd) Verify(frameNumber uint64) (bool, error) {
 	if h.Value == nil {
-		return false, errors.Wrap(errors.New("missing hyperedge value"), "verify")
+		return false, errors.Wrap(errors.New("missing hyperedge value"), "verify: invalid hyperedge add")
 	}
 
 	conns := h.Value.GetSize()
 	if conns.Cmp(big.NewInt(0)) == 0 {
 		return false, errors.Wrap(
 			errors.New("hyperedge must connect at least one atom"),
-			"verify",
+			"verify: invalid hyperedge add",
 		)
 	}
 
 	hyperedgeID := h.Value.GetID()
 	if !bytes.Equal(hyperedgeID[:32], h.Domain[:]) {
-		return false, errors.Wrap(errors.New("hyperedge domain mismatch"), "verify")
+		return false, errors.Wrap(errors.New("hyperedge domain mismatch"), "verify: invalid hyperedge add")
 	}
 
 	commit := h.Value.Commit(h.inclusionProver)
 	if len(commit) == 0 {
 		return false, errors.Wrap(
 			errors.New("invalid commitment for hyperedge"),
-			"verify",
+			"verify: invalid hyperedge add",
 		)
 	}
 
@@ -183,11 +183,11 @@ func (h *HyperedgeAdd) Verify(frameNumber uint64) (bool, error) {
 		slices.Concat(h.Domain[:], []byte("HYPEREDGE_ADD")),
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid hyperedge add")
 	}
 
 	if !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid hyperedge add")
 	}
 
 	return true, nil

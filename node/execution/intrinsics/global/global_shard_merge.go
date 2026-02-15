@@ -112,7 +112,7 @@ func (op *ShardMergeOp) Verify(frameNumber uint64) (bool, error) {
 	)
 	mergeDomain, err := poseidon.HashBytes(mergeDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid shard merge")
 	}
 
 	ok, err := op.keyManager.ValidateSignature(
@@ -125,14 +125,14 @@ func (op *ShardMergeOp) Verify(frameNumber uint64) (bool, error) {
 	if err != nil || !ok {
 		return false, errors.Wrap(
 			errors.New("invalid BLS signature"),
-			"verify",
+			"verify: invalid shard merge",
 		)
 	}
 
 	// Verify all shards have fewer provers than minimum threshold
 	globalProvers, err := op.proverRegistry.GetActiveProvers(nil)
 	if err != nil {
-		return false, errors.Wrap(err, "verify min provers")
+		return false, errors.Wrap(err, "verify: invalid shard merge: min provers")
 	}
 	minP := uint64(len(globalProvers)) * 2 / 3
 	if minP > 6 {
@@ -142,7 +142,7 @@ func (op *ShardMergeOp) Verify(frameNumber uint64) (bool, error) {
 	for _, addr := range op.ShardAddresses {
 		count, err := op.proverRegistry.GetProverCount(addr)
 		if err != nil {
-			return false, errors.Wrap(err, "verify prover count")
+			return false, errors.Wrap(err, "verify: invalid shard merge: prover count")
 		}
 		if uint64(count) >= minP {
 			return false, errors.Errorf(

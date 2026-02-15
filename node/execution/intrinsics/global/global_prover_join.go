@@ -194,12 +194,29 @@ func (p *ProverJoin) Materialize(
 			return nil, errors.Wrap(err, "materialize")
 		}
 
-		// Calculate seniority from MergeTargets
+		// Calculate seniority from MergeTargets, skipping already-consumed ones
 		var seniority uint64 = 0
 		if len(p.MergeTargets) > 0 {
 			// Convert Ed448 public keys to peer IDs
 			var peerIds []string
 			for _, target := range p.MergeTargets {
+				// Check if this merge target was already consumed
+				spentBI, err := poseidon.HashBytes(slices.Concat(
+					[]byte("PROVER_JOIN_MERGE"),
+					target.PublicKey,
+				))
+				if err != nil {
+					return nil, errors.Wrap(err, "materialize")
+				}
+				v, vErr := hg.Get(
+					intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+					spentBI.FillBytes(make([]byte, 32)),
+					hgstate.VertexAddsDiscriminator,
+				)
+				if vErr == nil && v != nil {
+					continue // already consumed, skip
+				}
+
 				if target.KeyType == crypto.KeyTypeEd448 {
 					pk, err := pcrypto.UnmarshalEd448PublicKey(target.PublicKey)
 					if err != nil {
@@ -457,10 +474,19 @@ func (p *ProverJoin) Materialize(
 			return nil, errors.Wrap(err, "materialize")
 		}
 
-		// confirm this has not already been used
+		// Skip already-consumed merge targets
 		spentAddress := [64]byte{}
 		copy(spentAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
 		copy(spentAddress[32:], spentMergeBI.FillBytes(make([]byte, 32)))
+		existing, existErr := hg.Get(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			spentMergeBI.FillBytes(make([]byte, 32)),
+			hgstate.VertexAddsDiscriminator,
+		)
+		if existErr == nil && existing != nil {
+			continue
+		}
+
 		spentMergeVertex := hg.NewVertexAddMaterializedState(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 			[32]byte(spentMergeBI.FillBytes(make([]byte, 32))),
@@ -677,23 +703,23 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	// First check if prover can join (not in tree or in left state)
 	addressBI, err := poseidon.HashBytes(p.PublicKeySignatureBLS48581.PublicKey)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover join")
 	}
 	address := addressBI.FillBytes(make([]byte, 32))
 
 	for _, filter := range p.Filters {
 		if len(filter) < 32 {
-			return false, errors.Wrap(errors.New("invalid filter size"), "verify")
+			return false, errors.Wrap(errors.New("invalid filter size"), "verify: invalid prover join")
 		}
 	}
 
 	if len(p.Proof)%516 != 0 || len(p.Proof)/516 != len(p.Filters) {
-		return false, errors.Wrap(errors.New("proof size mismatch"), "verify")
+		return false, errors.Wrap(errors.New("proof size mismatch"), "verify: invalid prover join")
 	}
 
 	// Disallow too old of a request
 	if p.FrameNumber+10 < frameNumber {
-		return false, errors.Wrap(errors.New("outdated request"), "verify")
+		return false, errors.Wrap(errors.New("outdated request"), "verify: invalid prover join")
 	}
 
 	frame, err := p.frameStore.GetGlobalClockFrame(p.FrameNumber)
@@ -706,13 +732,13 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			return false, errors.Wrap(errors.Wrap(
 				err,
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
-			), "verify")
+			), "verify: invalid prover join")
 		}
 		if !frames.First() || !frames.Valid() {
 			return false, errors.Wrap(errors.Wrap(
 				errors.New("not found"),
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
-			), "verify")
+			), "verify: invalid prover join")
 		}
 		frame, err = frames.Value()
 		frames.Close()
@@ -720,7 +746,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			return false, errors.Wrap(errors.Wrap(
 				err,
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
-			), "verify")
+			), "verify: invalid prover join")
 		}
 	}
 
@@ -746,7 +772,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		solutions,
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid multi proof"), "verify")
+		return false, errors.Wrap(errors.New("invalid multi proof"), "verify: invalid prover join")
 	}
 
 	for _, mt := range p.MergeTargets {
@@ -758,7 +784,10 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			[]byte("PROVER_JOIN_MERGE"),
 		)
 		if err != nil || !valid {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(
+				errors.New("invalid merge target signature"),
+				"verify: invalid prover join",
+			)
 		}
 
 		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
@@ -766,7 +795,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			mt.PublicKey,
 		))
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid prover join")
 		}
 
 		// confirm this has not already been used
@@ -776,10 +805,9 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 
 		v, err := p.hypergraph.GetVertex(spentAddress)
 		if err == nil && v != nil {
-			return false, errors.Wrap(
-				errors.New("merge target already used"),
-				"verify",
-			)
+			// merge target already consumed, skip – join proceeds without
+			// this target's seniority
+			continue
 		}
 	}
 
@@ -802,7 +830,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 				// Prover has been kicked for malicious behavior
 				return false, errors.Wrap(
 					errors.New("prover has been previously kicked"),
-					"verify",
+					"verify: invalid prover join",
 				)
 			}
 		}
@@ -817,7 +845,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			),
 		)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid prover join")
 		}
 		allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
 		// Create composite address: GLOBAL_INTRINSIC_ADDRESS + prover address
@@ -844,7 +872,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 					// Prover is in some other state - cannot join
 					return false, errors.Wrap(
 						errors.New("prover already exists in non-left state"),
-						"verify",
+						"verify: invalid prover join",
 					)
 				}
 			}
@@ -858,7 +886,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	joinClone.PublicKeySignatureBls48581 = nil
 	joinMessage, err := joinClone.ToCanonicalBytes()
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover join")
 	}
 
 	// Create the domain for the first signature
@@ -869,7 +897,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	)
 	joinDomain, err := poseidon.HashBytes(joinDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover join")
 	}
 
 	// Create the domain for the proof of possession
@@ -884,7 +912,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		joinDomain.FillBytes(make([]byte, 32)),
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid prover join")
 	}
 
 	// Verify the proof of possession
@@ -896,7 +924,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		popDomain,
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid pop signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid pop signature"), "verify: invalid prover join")
 	}
 
 	// Verify any merge signatures
@@ -909,7 +937,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			[]byte("PROVER_JOIN_MERGE"),
 		)
 		if err != nil || !valid {
-			return false, errors.Wrap(errors.New("invalid merge signature"), "verify")
+			return false, errors.Wrap(errors.New("invalid merge signature"), "verify: invalid prover join")
 		}
 	}
 
