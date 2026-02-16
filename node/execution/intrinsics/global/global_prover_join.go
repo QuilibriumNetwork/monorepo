@@ -567,6 +567,23 @@ func (p *ProverJoin) Prove(frameNumber uint64) error {
 			if err != nil {
 				return errors.Wrap(err, "prove")
 			}
+
+			// Self-verify: catch key material issues before publishing
+			valid, verifyErr := p.keyManager.ValidateSignature(
+				mt.KeyType,
+				mt.PublicKey,
+				blsPublicKey,
+				mt.Signature,
+				[]byte("PROVER_JOIN_MERGE"),
+			)
+			if verifyErr != nil || !valid {
+				return fmt.Errorf(
+					"prove: merge target self-verify failed "+
+						"(key_type=%d, pub_key_len=%d, sig_len=%d, bls_pub_len=%d, err=%v)",
+					mt.KeyType, len(mt.PublicKey), len(mt.Signature),
+					len(blsPublicKey), verifyErr,
+				)
+			}
 		}
 	}
 
@@ -805,7 +822,11 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		)
 		if err != nil || !valid {
 			return false, errors.Wrap(
-				errors.New("invalid merge target signature"),
+				fmt.Errorf(
+					"invalid merge target signature (key_type=%d, pub_key_len=%d, sig_len=%d, bls_pub_len=%d)",
+					mt.KeyType, len(mt.PublicKey), len(mt.Signature),
+					len(p.PublicKeySignatureBLS48581.PublicKey),
+				),
 				"verify: invalid prover join",
 			)
 		}

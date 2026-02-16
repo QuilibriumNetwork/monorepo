@@ -2,6 +2,7 @@ package global
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"slices"
 
@@ -235,23 +236,38 @@ func (p *ProverSeniorityMerge) Prove(frameNumber uint64) error {
 	}
 
 	// Sign merge target signatures
+	blsPublicKey := signingKey.Public().([]byte)
 	for _, mt := range p.MergeTargets {
 		if mt.signer != nil {
 			mt.Signature, err = mt.signer.SignWithDomain(
-				signingKey.Public().([]byte),
+				blsPublicKey,
 				[]byte("PROVER_SENIORITY_MERGE"),
 			)
 			if err != nil {
 				return errors.Wrap(err, "prove")
 			}
+
+			// Self-verify: catch key material issues before publishing
+			valid, verifyErr := p.keyManager.ValidateSignature(
+				mt.KeyType,
+				mt.PublicKey,
+				blsPublicKey,
+				mt.Signature,
+				[]byte("PROVER_SENIORITY_MERGE"),
+			)
+			if verifyErr != nil || !valid {
+				return fmt.Errorf(
+					"prove: merge target self-verify failed "+
+						"(key_type=%d, pub_key_len=%d, sig_len=%d, bls_pub_len=%d, err=%v)",
+					mt.KeyType, len(mt.PublicKey), len(mt.Signature),
+					len(blsPublicKey), verifyErr,
+				)
+			}
 		}
 	}
 
-	// Get the public key
-	pubKey := signingKey.Public()
-
 	// Compute address from public key
-	addressBI, err := poseidon.HashBytes(pubKey.([]byte))
+	addressBI, err := poseidon.HashBytes(blsPublicKey)
 	if err != nil {
 		return errors.Wrap(err, "prove")
 	}
