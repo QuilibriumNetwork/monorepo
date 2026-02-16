@@ -776,6 +776,26 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	}
 
 	for _, mt := range p.MergeTargets {
+		// Check spent status first – if already consumed, skip entirely
+		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
+			[]byte("PROVER_JOIN_MERGE"),
+			mt.PublicKey,
+		))
+		if err != nil {
+			return false, errors.Wrap(err, "verify: invalid prover join")
+		}
+
+		spentAddress := [64]byte{}
+		copy(spentAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(spentAddress[32:], spentMergeBI.FillBytes(make([]byte, 32)))
+
+		v, err := p.hypergraph.GetVertex(spentAddress)
+		if err == nil && v != nil {
+			// merge target already consumed, skip – join proceeds without
+			// this target's seniority
+			continue
+		}
+
 		valid, err := p.keyManager.ValidateSignature(
 			mt.KeyType,
 			mt.PublicKey,
@@ -788,26 +808,6 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 				errors.New("invalid merge target signature"),
 				"verify: invalid prover join",
 			)
-		}
-
-		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
-			[]byte("PROVER_JOIN_MERGE"),
-			mt.PublicKey,
-		))
-		if err != nil {
-			return false, errors.Wrap(err, "verify: invalid prover join")
-		}
-
-		// confirm this has not already been used
-		spentAddress := [64]byte{}
-		copy(spentAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-		copy(spentAddress[32:], spentMergeBI.FillBytes(make([]byte, 32)))
-
-		v, err := p.hypergraph.GetVertex(spentAddress)
-		if err == nil && v != nil {
-			// merge target already consumed, skip – join proceeds without
-			// this target's seniority
-			continue
 		}
 	}
 
@@ -927,8 +927,23 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		return false, errors.Wrap(errors.New("invalid pop signature"), "verify: invalid prover join")
 	}
 
-	// Verify any merge signatures
+	// Verify any merge signatures (skip already-consumed targets)
 	for _, mt := range p.MergeTargets {
+		spentBI, err := poseidon.HashBytes(slices.Concat(
+			[]byte("PROVER_JOIN_MERGE"),
+			mt.PublicKey,
+		))
+		if err != nil {
+			return false, errors.Wrap(err, "verify: invalid prover join")
+		}
+		spentAddr := [64]byte{}
+		copy(spentAddr[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(spentAddr[32:], spentBI.FillBytes(make([]byte, 32)))
+		v, vErr := p.hypergraph.GetVertex(spentAddr)
+		if vErr == nil && v != nil {
+			continue
+		}
+
 		valid, err := p.keyManager.ValidateSignature(
 			mt.KeyType,
 			mt.PublicKey,

@@ -3511,16 +3511,32 @@ func (e *GlobalConsensusEngine) buildMergeHelpers() ([]*global.SeniorityMerge, [
 	helpers := []*global.SeniorityMerge{}
 	peerIds := []string{}
 
-	peerPrivKey, err := hex.DecodeString(e.config.P2P.PeerPrivKey)
+	peerPrivKeyBytes, err := hex.DecodeString(e.config.P2P.PeerPrivKey)
 	if err != nil {
 		e.logger.Debug("cannot decode peer key for merge helpers", zap.Error(err))
 		return helpers, peerIds
 	}
 
-	oldProver, err := keys.Ed448KeyFromBytes(
-		peerPrivKey,
-		e.pubsub.GetPublicKey(),
-	)
+	peerPrivKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKeyBytes)
+	if err != nil {
+		e.logger.Debug("cannot unmarshal peer key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	peerPub := peerPrivKey.GetPublic()
+	peerPubBytes, err := peerPub.Raw()
+	if err != nil {
+		e.logger.Debug("cannot get peer public key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	peerPrivRaw, err := peerPrivKey.Raw()
+	if err != nil {
+		e.logger.Debug("cannot get peer private key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	oldProver, err := keys.Ed448KeyFromBytes(peerPrivRaw, peerPubBytes)
 	if err != nil {
 		e.logger.Debug("cannot get peer key for merge helpers", zap.Error(err))
 		return helpers, peerIds
@@ -3530,7 +3546,13 @@ func (e *GlobalConsensusEngine) buildMergeHelpers() ([]*global.SeniorityMerge, [
 		crypto.KeyTypeEd448,
 		oldProver,
 	))
-	peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
+
+	peerId, err := peer.IDFromPublicKey(peerPub)
+	if err != nil {
+		e.logger.Debug("cannot get peer ID for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+	peerIds = append(peerIds, peerId.String())
 
 	if len(e.config.Engine.MultisigProverEnrollmentPaths) != 0 {
 		e.logger.Debug("loading old configs for merge helpers")
