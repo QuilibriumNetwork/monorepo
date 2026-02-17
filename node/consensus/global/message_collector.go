@@ -215,7 +215,7 @@ func (e *GlobalConsensusEngine) startGlobalMessageAggregator(
 }
 
 func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
-	if e.messageAggregator == nil || len(data) == 0 {
+	if e.messageCollectors == nil || len(data) == 0 {
 		return
 	}
 
@@ -270,8 +270,39 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 		}
 	}
 
-	record := newSequencedGlobalMessage(e.currentRank+1, payload)
-	e.messageAggregator.Add(record)
+	seq := e.currentRank + 1
+	record := newSequencedGlobalMessage(seq, payload)
+
+	// Add directly to the collector synchronously rather than going through
+	// the aggregator's async worker queue. The async path loses messages
+	// because OnSequenceChange advances the retention window before workers
+	// finish processing queued items, causing them to be silently pruned.
+	collector, _, err := e.messageCollectors.GetOrCreateCollector(seq)
+	if err != nil {
+		e.logger.Debug(
+			"could not get collector for global message",
+			zap.Uint64("sequence", seq),
+			zap.Uint64("current_rank", e.currentRank),
+			zap.Error(err),
+		)
+		return
+	}
+
+	if err := collector.Add(record); err != nil {
+		e.logger.Debug(
+			"could not add global message to collector",
+			zap.Uint64("sequence", seq),
+			zap.Error(err),
+		)
+		return
+	}
+
+	e.logger.Debug(
+		"added global message to collector",
+		zap.Uint64("sequence", seq),
+		zap.Uint64("current_rank", e.currentRank),
+		zap.Int("payload_len", len(payload)),
+	)
 }
 
 // filterProverOnlyRequests filters a list of message requests to only include

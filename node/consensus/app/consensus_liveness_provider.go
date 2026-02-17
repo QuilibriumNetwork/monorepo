@@ -44,11 +44,17 @@ func (p *AppLivenessProvider) Collect(
 
 	var collectorRecords []*sequencedAppMessage
 	var collector keyedaggregator.Collector[sequencedAppMessage]
+	alreadyCollected := false
 	if p.engine.messageCollectors != nil {
 		var err error
 		var found bool
 		collector, found, err = p.engine.getAppMessageCollector(rank)
-		if err != nil && !errors.Is(err, keyedaggregator.ErrSequenceBelowRetention) {
+		if err != nil && errors.Is(err, keyedaggregator.ErrSequenceBelowRetention) {
+			// Collector was already pruned by a prior Collect call for this
+			// rank. We must not overwrite collectedMessages with an empty
+			// slice or the previously-collected messages will be lost.
+			alreadyCollected = true
+		} else if err != nil {
 			p.engine.logger.Warn(
 				"could not fetch collector for rank",
 				zap.Uint64("rank", rank),
@@ -133,9 +139,14 @@ func (p *AppLivenessProvider) Collect(
 	}
 	pendingMessagesCount.WithLabelValues(p.engine.appAddressHex).Set(0)
 
-	p.engine.collectedMessagesMu.Lock()
-	p.engine.collectedMessages = finalizedMessages
-	p.engine.collectedMessagesMu.Unlock()
+	// If we already collected for this rank (collector was pruned) and found no
+	// new messages, preserve the previously-collected messages rather than
+	// overwriting them with an empty slice.
+	if !alreadyCollected || len(finalizedMessages) > 0 {
+		p.engine.collectedMessagesMu.Lock()
+		p.engine.collectedMessages = finalizedMessages
+		p.engine.collectedMessagesMu.Unlock()
+	}
 
 	return CollectedCommitments{
 		frameNumber:    frameNumber,

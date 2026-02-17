@@ -70,8 +70,11 @@ func (e *GlobalConsensusEngine) processProverMessageQueue(
 	ctx lifecycle.SignalerContext,
 ) {
 	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
+		e.logger.Debug("prover message queue processor disabled (not archive mode)")
 		return
 	}
+
+	e.logger.Info("prover message queue processor started")
 
 	for {
 		select {

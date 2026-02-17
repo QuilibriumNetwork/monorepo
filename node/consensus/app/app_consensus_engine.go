@@ -2783,6 +2783,9 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 
 // OnRankChange implements consensus.Consumer.
 func (e *AppConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
+	if e.currentRank == newRank {
+		return
+	}
 	e.currentRank = newRank
 	err := e.ensureGlobalClient()
 	if err != nil {

@@ -11,7 +11,7 @@ const (
 	defaultDataWorkerMemoryLimit              = int64(1792 * 1024 * 1024) // 1.75 GiB
 	defaultSyncTimeout                        = 4 * time.Second
 	defaultSyncCandidates                     = 8
-	defaultSyncMessageReceiveLimit            = 1 * 1024 * 1024
+	defaultSyncMessageReceiveLimit            = 600 * 1024 * 1024
 	defaultSyncMessageSendLimit               = 600 * 1024 * 1024
 	defaultRewardStrategy                     = "reward-greedy"
 )

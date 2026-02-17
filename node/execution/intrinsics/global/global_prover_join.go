@@ -890,11 +890,46 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			if err == nil && len(statusData) > 0 {
 				status := statusData[0]
 				if status != 4 {
-					// Prover is in some other state - cannot join
-					return false, errors.Wrap(
-						errors.New("prover already exists in non-left state"),
-						"verify: invalid prover join",
-					)
+					// Check if the previous join/leave has implicitly expired
+					// (720 frames), making the prover effectively "left"
+					expired := false
+					if status == 0 {
+						// Joining: check if join expired
+						joinFrameBytes, jErr := p.rdfMultiprover.Get(
+							GLOBAL_RDF_SCHEMA,
+							"allocation:ProverAllocation",
+							"JoinFrameNumber",
+							tree,
+						)
+						if jErr == nil && len(joinFrameBytes) == 8 {
+							joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
+							if joinFrame >= token.FRAME_2_1_EXTENDED_ENROLL_END &&
+								frameNumber > joinFrame+720 {
+								expired = true
+							}
+						}
+					} else if status == 3 {
+						// Leaving: check if leave expired
+						leaveFrameBytes, lErr := p.rdfMultiprover.Get(
+							GLOBAL_RDF_SCHEMA,
+							"allocation:ProverAllocation",
+							"LeaveFrameNumber",
+							tree,
+						)
+						if lErr == nil && len(leaveFrameBytes) == 8 {
+							leaveFrame := binary.BigEndian.Uint64(leaveFrameBytes)
+							if frameNumber > leaveFrame+720 {
+								expired = true
+							}
+						}
+					}
+
+					if !expired {
+						return false, errors.Wrap(
+							errors.New("prover already exists in non-left state"),
+							"verify: invalid prover join",
+						)
+					}
 				}
 			}
 		}

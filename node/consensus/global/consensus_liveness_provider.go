@@ -40,11 +40,17 @@ func (p *GlobalLivenessProvider) Collect(
 
 	var collector keyedaggregator.Collector[sequencedGlobalMessage]
 	var collectorRecords []*sequencedGlobalMessage
+	alreadyCollected := false
 	if p.engine.messageCollectors != nil {
 		var err error
 		var found bool
 		collector, found, err = p.engine.getMessageCollector(rank)
-		if err != nil && !errors.Is(err, keyedaggregator.ErrSequenceBelowRetention) {
+		if err != nil && errors.Is(err, keyedaggregator.ErrSequenceBelowRetention) {
+			// Collector was already pruned by a prior Collect call for this
+			// rank. We must not overwrite collectedMessages with an empty
+			// slice or the previously-collected messages will be lost.
+			alreadyCollected = true
+		} else if err != nil {
 			p.engine.logger.Warn(
 				"could not fetch collector for rank",
 				zap.Uint64("rank", rank),
@@ -53,6 +59,15 @@ func (p *GlobalLivenessProvider) Collect(
 		} else if found {
 			collectorRecords = collector.Records()
 		}
+		p.engine.logger.Debug(
+			"collector lookup for rank",
+			zap.Uint64("rank", rank),
+			zap.Uint64("frame_number", frameNumber),
+			zap.Bool("found", found),
+			zap.Bool("already_collected", alreadyCollected),
+			zap.Int("records", len(collectorRecords)),
+			zap.Uint64("current_rank", p.engine.currentRank),
+		)
 	}
 
 	acceptedMessages := make(
@@ -62,8 +77,10 @@ func (p *GlobalLivenessProvider) Collect(
 	)
 
 	if collector != nil {
+		nilMsgCount := 0
 		for _, record := range collectorRecords {
 			if record == nil || record.message == nil {
+				nilMsgCount++
 				continue
 			}
 			if err := p.lockCollectorMessage(
@@ -79,6 +96,13 @@ func (p *GlobalLivenessProvider) Collect(
 				continue
 			}
 			acceptedMessages = append(acceptedMessages, record.message)
+		}
+		if nilMsgCount > 0 {
+			p.engine.logger.Debug(
+				"collector records with nil message (failed validation)",
+				zap.Int("nil_msg_count", nilMsgCount),
+				zap.Int("total_records", len(collectorRecords)),
+			)
 		}
 	}
 
@@ -115,12 +139,17 @@ func (p *GlobalLivenessProvider) Collect(
 		return GlobalCollectedCommitments{}, errors.Wrap(err, "collect")
 	}
 
-	// Store the accepted messages as canonical bytes for inclusion in the frame
-	collectedMsgs := make([][]byte, 0, len(acceptedMessages))
-	for _, msg := range acceptedMessages {
-		collectedMsgs = append(collectedMsgs, msg.Payload)
+	// Store the accepted messages as canonical bytes for inclusion in the frame.
+	// If we already collected for this rank (collector was pruned) and found no
+	// new messages, preserve the previously-collected messages rather than
+	// overwriting them with an empty slice.
+	if !alreadyCollected || len(acceptedMessages) > 0 {
+		collectedMsgs := make([][]byte, 0, len(acceptedMessages))
+		for _, msg := range acceptedMessages {
+			collectedMsgs = append(collectedMsgs, msg.Payload)
+		}
+		p.engine.collectedMessages = collectedMsgs
 	}
-	p.engine.collectedMessages = collectedMsgs
 
 	return GlobalCollectedCommitments{
 		frameNumber:    frameNumber,

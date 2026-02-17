@@ -1052,7 +1052,8 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 							data.Frame.Header.FrameNumber > token.FRAME_2_1_EXTENDED_ENROLL_END {
 							pending = allocation.Status ==
 								typesconsensus.ProverStatusJoining &&
-								allocation.JoinFrameNumber+360 <= data.Frame.Header.FrameNumber
+								allocation.JoinFrameNumber+360 <= data.Frame.Header.FrameNumber &&
+								data.Frame.Header.FrameNumber <= allocation.JoinFrameNumber+pendingFilterGraceFrames
 						}
 					}
 				}

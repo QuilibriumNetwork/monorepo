@@ -212,7 +212,7 @@ func (e *AppConsensusEngine) startAppMessageAggregator(
 }
 
 func (e *AppConsensusEngine) addAppMessage(message *protobufs.Message) {
-	if e.messageAggregator == nil || message == nil {
+	if e.messageCollectors == nil || message == nil {
 		return
 	}
 	if len(message.Hash) == 0 {
@@ -224,7 +224,29 @@ func (e *AppConsensusEngine) addAppMessage(message *protobufs.Message) {
 	if record == nil {
 		return
 	}
-	e.messageAggregator.Add(record)
+
+	// Add directly to the collector synchronously rather than going through
+	// the aggregator's async worker queue. The async path loses messages
+	// because OnSequenceChange advances the retention window before workers
+	// finish processing queued items, causing them to be silently pruned.
+	collector, _, err := e.messageCollectors.GetOrCreateCollector(rank)
+	if err != nil {
+		e.logger.Debug(
+			"could not get collector for app message",
+			zap.Uint64("rank", rank),
+			zap.Error(err),
+		)
+		return
+	}
+
+	if err := collector.Add(record); err != nil {
+		e.logger.Debug(
+			"could not add app message to collector",
+			zap.Uint64("rank", rank),
+			zap.Error(err),
+		)
+		return
+	}
 }
 
 func (e *AppConsensusEngine) nextRank() uint64 {
@@ -298,7 +320,7 @@ func (e *AppConsensusEngine) deferAppMessage(
 }
 
 func (e *AppConsensusEngine) flushDeferredAppMessages(targetRank uint64) {
-	if e == nil || e.messageAggregator == nil || targetRank == 0 {
+	if e == nil || e.messageCollectors == nil || targetRank == 0 {
 		return
 	}
 
@@ -313,8 +335,36 @@ func (e *AppConsensusEngine) flushDeferredAppMessages(targetRank uint64) {
 		return
 	}
 
+	collector, _, err := e.messageCollectors.GetOrCreateCollector(targetRank)
+	if err != nil {
+		if e.logger != nil {
+			e.logger.Debug(
+				"could not get collector for deferred app messages",
+				zap.String("app_address", e.appAddressHex),
+				zap.Uint64("target_rank", targetRank),
+				zap.Error(err),
+			)
+		}
+		return
+	}
+
+	added := 0
 	for _, msg := range messages {
-		e.messageAggregator.Add(newSequencedAppMessage(targetRank, msg))
+		record := newSequencedAppMessage(targetRank, msg)
+		if record == nil {
+			continue
+		}
+		if err := collector.Add(record); err != nil {
+			if e.logger != nil {
+				e.logger.Debug(
+					"could not add deferred app message to collector",
+					zap.Uint64("target_rank", targetRank),
+					zap.Error(err),
+				)
+			}
+			continue
+		}
+		added++
 	}
 
 	if e.logger != nil {
@@ -322,7 +372,7 @@ func (e *AppConsensusEngine) flushDeferredAppMessages(targetRank uint64) {
 			"replayed deferred app messages",
 			zap.String("app_address", e.appAddressHex),
 			zap.Uint64("target_rank", targetRank),
-			zap.Int("count", len(messages)),
+			zap.Int("count", added),
 		)
 	}
 }
