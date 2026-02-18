@@ -2097,6 +2097,16 @@ func (e *GlobalConsensusEngine) performBlockingProverHypersync(
 	close(done)
 
 	e.logger.Info("blocking hypersync completed")
+
+	if !e.config.Engine.ArchiveMode {
+		if err := e.proverRegistry.Refresh(); err != nil {
+			e.logger.Warn(
+				"failed to refresh prover registry after blocking hypersync",
+				zap.Error(err),
+			)
+		}
+	}
+
 	if len(newRoots) == 0 {
 		return nil
 	}
