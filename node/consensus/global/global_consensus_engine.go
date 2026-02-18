@@ -3487,6 +3487,20 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		return errors.Wrap(err, "propose worker join")
 	}
 
+	// Full self-verification: run the same validation that archive/proposer
+	// nodes execute so we catch any issue locally before publishing.
+	if valid, verifyErr := join.Verify(frame.Header.FrameNumber); !valid || verifyErr != nil {
+		e.logger.Error(
+			"join self-verification failed, not publishing",
+			zap.Bool("valid", valid),
+			zap.Error(verifyErr),
+		)
+		return errors.Wrap(
+			fmt.Errorf("self-verify failed: valid=%v, err=%v", valid, verifyErr),
+			"propose worker join",
+		)
+	}
+
 	bundle := &protobufs.MessageBundle{
 		Requests: []*protobufs.MessageRequest{
 			{
