@@ -18,7 +18,7 @@ var (
 
 var (
 	ResolvableProtocols = []ma.Protocol{dnsaddrProtocol, dns4Protocol, dns6Protocol, dnsProtocol}
-	DefaultResolver     = &Resolver{def: net.DefaultResolver}
+	DefaultResolver     = &Resolver{def: &net.Resolver{PreferGo: true}}
 )
 
 const maxResolvedAddrs = 100

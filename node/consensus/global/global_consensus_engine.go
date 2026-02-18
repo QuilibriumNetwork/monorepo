@@ -2241,6 +2241,7 @@ func (e *GlobalConsensusEngine) joinProposalReady(
 
 func (e *GlobalConsensusEngine) selectExcessPendingFilters(
 	self *typesconsensus.ProverInfo,
+	frameNumber uint64,
 ) [][]byte {
 	if self == nil || e.config == nil || e.config.Engine == nil {
 		e.logger.Debug("excess pending evaluation skipped: missing config or prover info")
@@ -2264,6 +2265,12 @@ func (e *GlobalConsensusEngine) selectExcessPendingFilters(
 		case typesconsensus.ProverStatusActive:
 			active++
 		case typesconsensus.ProverStatusJoining:
+			// Skip expired joins — they are implicitly rejected and should
+			// not count toward the pending limit or be candidates for
+			// explicit rejection.
+			if frameNumber > allocation.JoinFrameNumber+pendingFilterGraceFrames {
+				continue
+			}
 			filterCopy := make([]byte, len(allocation.ConfirmationFilter))
 			copy(filterCopy, allocation.ConfirmationFilter)
 			pending = append(pending, filterCopy)

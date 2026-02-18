@@ -1034,7 +1034,20 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 			if self != nil {
 				for _, allocation := range self.Allocations {
 					if bytes.Equal(allocation.ConfirmationFilter, bp) {
-						allocated = allocation.Status != 4
+						allocated = allocation.Status != typesconsensus.ProverStatusLeaving
+
+						// Treat expired joins and leaves as unallocated so the
+						// proposer will submit a fresh join instead of sitting
+						// in limbo.
+						if allocation.Status == typesconsensus.ProverStatusJoining &&
+							data.Frame.Header.FrameNumber > allocation.JoinFrameNumber+pendingFilterGraceFrames {
+							allocated = false
+						}
+						if allocation.Status == typesconsensus.ProverStatusLeaving &&
+							data.Frame.Header.FrameNumber > allocation.LeaveFrameNumber+pendingFilterGraceFrames {
+							allocated = false
+						}
+
 						if allocation.Status == typesconsensus.ProverStatusJoining {
 							shardsPending++
 							awaitingFrame[allocation.JoinFrameNumber+360] = struct{}{}
@@ -1187,7 +1200,7 @@ func (e *GlobalConsensusEngine) checkExcessPendingJoins(
 	self *typesconsensus.ProverInfo,
 	frameNumber uint64,
 ) {
-	excessFilters := e.selectExcessPendingFilters(self)
+	excessFilters := e.selectExcessPendingFilters(self, frameNumber)
 	if len(excessFilters) != 0 {
 		e.logger.Debug(
 			"identified excess pending joins",

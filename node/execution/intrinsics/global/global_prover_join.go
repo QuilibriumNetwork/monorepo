@@ -926,7 +926,10 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 
 					if !expired {
 						return false, errors.Wrap(
-							errors.New("prover already exists in non-left state"),
+							fmt.Errorf(
+								"prover already exists in non-left state (status=%d, frame=%d)",
+								status, frameNumber,
+							),
 							"verify: invalid prover join",
 						)
 					}
