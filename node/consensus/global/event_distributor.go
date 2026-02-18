@@ -579,6 +579,21 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 ) {
 	self, effectiveSeniority := e.allocationContext()
 	e.reconcileWorkerAllocations(data.Frame.Header.FrameNumber, self)
+
+	// Re-check after reconciliation — stale filters may have been cleared,
+	// making workers available for new proposals.
+	if !allowProposals {
+		workers, err := e.workerManager.RangeWorkers()
+		if err == nil {
+			for _, w := range workers {
+				if w != nil && len(w.Filter) == 0 {
+					allowProposals = true
+					break
+				}
+			}
+		}
+	}
+
 	e.checkExcessPendingJoins(self, data.Frame.Header.FrameNumber)
 	canPropose, skipReason := e.joinProposalReady(data.Frame.Header.FrameNumber)
 
