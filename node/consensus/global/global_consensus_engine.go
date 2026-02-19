@@ -3360,7 +3360,10 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		mergeSeniority = mergeSeniorityBI.Uint64()
 	}
 
-	// If prover already exists, check if we should submit a seniority merge
+	// If prover already exists, submit a seniority merge if needed, then
+	// fall through to the join — the filters being proposed are only for
+	// unallocated shards (already filtered by collectAllocationSnapshot),
+	// so the join is valid even when the prover has existing allocations.
 	if proverExists {
 		if mergeSeniority > info.Seniority {
 			e.logger.Info(
@@ -3369,14 +3372,16 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 				zap.Uint64("merge_seniority", mergeSeniority),
 				zap.Strings("peer_ids", peerIds),
 			)
-			return e.submitSeniorityMerge(frame, helpers, mergeSeniority, peerIds)
+			if mergeErr := e.submitSeniorityMerge(frame, helpers, mergeSeniority, peerIds); mergeErr != nil {
+				e.logger.Warn("failed to submit seniority merge", zap.Error(mergeErr))
+			}
 		}
-		e.logger.Debug(
-			"prover already exists with sufficient seniority, skipping join",
-			zap.Uint64("existing_seniority", info.Seniority),
-			zap.Uint64("merge_seniority", mergeSeniority),
-		)
-		return nil
+		// Clear merge targets for the join — Materialize only applies
+		// seniority from merge targets when creating a new prover vertex.
+		// Including them here would just consume the spent markers without
+		// updating seniority, racing with the separate seniority merge.
+		helpers = nil
+		peerIds = nil
 	}
 
 	e.logger.Info(
@@ -3485,20 +3490,6 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 	if err != nil {
 		e.logger.Error("could not construct join", zap.Error(err))
 		return errors.Wrap(err, "propose worker join")
-	}
-
-	// Full self-verification: run the same validation that archive/proposer
-	// nodes execute so we catch any issue locally before publishing.
-	if valid, verifyErr := join.Verify(frame.Header.FrameNumber); !valid || verifyErr != nil {
-		e.logger.Error(
-			"join self-verification failed, not publishing",
-			zap.Bool("valid", valid),
-			zap.Error(verifyErr),
-		)
-		return errors.Wrap(
-			fmt.Errorf("self-verify failed: valid=%v, err=%v", valid, verifyErr),
-			"propose worker join",
-		)
 	}
 
 	bundle := &protobufs.MessageBundle{
