@@ -872,13 +872,42 @@ func (b *BlossomSub) background(ctx context.Context) {
 	refreshScores := time.NewTicker(DecayInterval)
 	defer refreshScores.Stop()
 
+	peerReconnectInterval := b.p2pConfig.PeerReconnectCheckInterval
+	peerReconnect := time.NewTicker(peerReconnectInterval)
+	defer peerReconnect.Stop()
+
 	for {
 		select {
 		case <-refreshScores.C:
 			b.refreshScores()
+		case <-peerReconnect.C:
+			b.checkAndReconnectPeers(ctx)
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+func (b *BlossomSub) checkAndReconnectPeers(ctx context.Context) {
+	peerCount := len(b.h.Network().Peers())
+	if peerCount > 0 {
+		return
+	}
+
+	b.logger.Warn(
+		"no peers connected, attempting to re-bootstrap and discover",
+		zap.Duration("check_interval", b.p2pConfig.PeerReconnectCheckInterval),
+	)
+
+	if err := b.DiscoverPeers(ctx); err != nil {
+		b.logger.Error("peer reconnect failed", zap.Error(err))
+	}
+
+	newCount := len(b.h.Network().Peers())
+	if newCount > 0 {
+		b.logger.Info("peer reconnect succeeded", zap.Int("peers", newCount))
+	} else {
+		b.logger.Warn("peer reconnect: still no peers found, will retry at next interval")
 	}
 }
 
