@@ -766,6 +766,21 @@ func (e *GlobalConsensusEngine) reconcileWorkerAllocations(
 				continue
 			}
 
+			// Expired joins (implicitly rejected) and expired leaves
+			// (implicitly confirmed) should also be cleared immediately —
+			// the allocation will never be confirmed/completed and the
+			// worker is stuck waiting for a state change that cannot come.
+			if alloc.Status == typesconsensus.ProverStatusJoining &&
+				frameNumber > alloc.JoinFrameNumber+pendingFilterGraceFrames {
+				rejectedFilters[string(alloc.ConfirmationFilter)] = struct{}{}
+				continue
+			}
+			if alloc.Status == typesconsensus.ProverStatusLeaving &&
+				frameNumber > alloc.LeaveFrameNumber+pendingFilterGraceFrames {
+				rejectedFilters[string(alloc.ConfirmationFilter)] = struct{}{}
+				continue
+			}
+
 			key := string(alloc.ConfirmationFilter)
 			worker, ok := filtersToWorkers[key]
 			if !ok {
