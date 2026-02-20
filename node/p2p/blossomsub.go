@@ -890,7 +890,7 @@ func (b *BlossomSub) background(ctx context.Context) {
 
 func (b *BlossomSub) checkAndReconnectPeers(ctx context.Context) {
 	peerCount := len(b.h.Network().Peers())
-	if peerCount > 0 {
+	if peerCount > 1 {
 		return
 	}
 
@@ -904,7 +904,7 @@ func (b *BlossomSub) checkAndReconnectPeers(ctx context.Context) {
 	}
 
 	newCount := len(b.h.Network().Peers())
-	if newCount > 0 {
+	if newCount > 1 {
 		b.logger.Info("peer reconnect succeeded", zap.Int("peers", newCount))
 	} else {
 		b.logger.Warn("peer reconnect: still no peers found, will retry at next interval")
