@@ -890,7 +890,7 @@ func (b *BlossomSub) background(ctx context.Context) {
 
 func (b *BlossomSub) checkAndReconnectPeers(ctx context.Context) {
 	peerCount := len(b.h.Network().Peers())
-	if peerCount > 0 {
+	if peerCount > 1 {
 		return
 	}
 
