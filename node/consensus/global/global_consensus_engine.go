@@ -152,8 +152,9 @@ type GlobalConsensusEngine struct {
 	alertPublicKey          []byte
 	hasSentKeyBundle        bool
 	proverSyncInProgress    atomic.Bool
-	lastJoinAttemptFrame    atomic.Uint64
-	lastObservedFrame       atomic.Uint64
+	lastJoinAttemptFrame       atomic.Uint64
+	lastSeniorityMergeFrame    atomic.Uint64
+	lastObservedFrame          atomic.Uint64
 	lastRejectFrame         atomic.Uint64
 	proverRootVerifiedFrame atomic.Uint64
 	proverRootSynced        atomic.Bool
@@ -3360,28 +3361,15 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		mergeSeniority = mergeSeniorityBI.Uint64()
 	}
 
-	// If prover already exists, submit a seniority merge if needed, then
-	// fall through to the join — the filters being proposed are only for
-	// unallocated shards (already filtered by collectAllocationSnapshot),
-	// so the join is valid even when the prover has existing allocations.
+	// Always include merge targets in the join — Materialize handles
+	// seniority for both new and existing provers. A separate seniority
+	// merge is not submitted because it would double-count with the join.
 	if proverExists {
-		if mergeSeniority > info.Seniority {
-			e.logger.Info(
-				"existing prover has lower seniority than merge would provide, submitting seniority merge",
-				zap.Uint64("existing_seniority", info.Seniority),
-				zap.Uint64("merge_seniority", mergeSeniority),
-				zap.Strings("peer_ids", peerIds),
-			)
-			if mergeErr := e.submitSeniorityMerge(frame, helpers, mergeSeniority, peerIds); mergeErr != nil {
-				e.logger.Warn("failed to submit seniority merge", zap.Error(mergeErr))
-			}
-		}
-		// Clear merge targets for the join — Materialize only applies
-		// seniority from merge targets when creating a new prover vertex.
-		// Including them here would just consume the spent markers without
-		// updating seniority, racing with the separate seniority merge.
-		helpers = nil
-		peerIds = nil
+		e.logger.Debug(
+			"prover already exists, merge targets will be included in join",
+			zap.Uint64("existing_seniority", info.Seniority),
+			zap.Uint64("merge_seniority", mergeSeniority),
+		)
 	}
 
 	e.logger.Info(

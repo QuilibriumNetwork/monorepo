@@ -6,8 +6,8 @@ const (
 	defaultMinimumPeersRequired               = 3
 	priorDefaultDataWorkerBaseListenMultiaddr = "/ip4/127.0.0.1/tcp/%d"
 	defaultDataWorkerBaseListenMultiaddr      = "/ip4/0.0.0.0/tcp/%d"
-	defaultDataWorkerBaseP2PPort              = uint16(50000)
-	defaultDataWorkerBaseStreamPort           = uint16(60000)
+	defaultDataWorkerBaseP2PPort              = uint16(25000)
+	defaultDataWorkerBaseStreamPort           = uint16(32500)
 	defaultDataWorkerMemoryLimit              = int64(1792 * 1024 * 1024) // 1.75 GiB
 	defaultSyncTimeout                        = 4 * time.Second
 	defaultSyncCandidates                     = 8

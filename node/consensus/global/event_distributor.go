@@ -613,6 +613,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	decideDescriptors := snapshot.decideDescriptors
 	worldBytes := snapshot.worldBytes
 
+	joinProposedThisCycle := false
 	if len(proposalDescriptors) != 0 && allowProposals {
 		if canPropose {
 			proposals, err := e.proposer.PlanAndAllocate(
@@ -626,6 +627,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				e.logger.Error("could not plan shard allocations", zap.Error(err))
 			} else {
 				if len(proposals) > 0 {
+					joinProposedThisCycle = true
 					e.lastJoinAttemptFrame.Store(data.Frame.Header.FrameNumber)
 				}
 				expectedRewardSum := big.NewInt(0)
@@ -665,6 +667,50 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
 		)
 	}
+
+	// Standalone seniority merge: when no join was proposed this cycle but the
+	// prover exists with incorrect seniority, submit a seniority merge to fix
+	// it. This covers the case where all worker slots are filled and no new
+	// joins are being proposed.
+	if !joinProposedThisCycle && self != nil {
+		frameNum := data.Frame.Header.FrameNumber
+		mergeSeniority := e.estimateSeniorityFromConfig()
+
+		if mergeSeniority > self.Seniority {
+			lastJoin := e.lastJoinAttemptFrame.Load()
+			lastMerge := e.lastSeniorityMergeFrame.Load()
+			joinCooldownOk := lastJoin == 0 || frameNum-lastJoin >= 10
+			mergeCooldownOk := lastMerge == 0 || frameNum-lastMerge >= 10
+
+			if joinCooldownOk && mergeCooldownOk {
+				frame := e.GetFrame()
+				if frame != nil {
+					helpers, peerIds := e.buildMergeHelpers()
+					err := e.submitSeniorityMerge(
+						frame, helpers, mergeSeniority, peerIds,
+					)
+					if err != nil {
+						e.logger.Error(
+							"could not submit seniority merge",
+							zap.Error(err),
+						)
+					} else {
+						e.lastSeniorityMergeFrame.Store(frameNum)
+					}
+				}
+			} else {
+				e.logger.Debug(
+					"seniority merge deferred due to cooldown",
+					zap.Uint64("merge_seniority", mergeSeniority),
+					zap.Uint64("existing_seniority", self.Seniority),
+					zap.Uint64("last_join_frame", lastJoin),
+					zap.Uint64("last_merge_frame", lastMerge),
+					zap.Uint64("current_frame", frameNum),
+				)
+			}
+		}
+	}
+
 	if len(pendingFilters) != 0 {
 		if err := e.proposer.DecideJoins(
 			uint64(data.Frame.Header.Difficulty),
@@ -1078,7 +1124,8 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 							allocated = false
 						}
 
-						if allocation.Status == typesconsensus.ProverStatusJoining {
+						if allocation.Status == typesconsensus.ProverStatusJoining &&
+							data.Frame.Header.FrameNumber <= allocation.JoinFrameNumber+pendingFilterGraceFrames {
 							shardsPending++
 							awaitingFrame[allocation.JoinFrameNumber+360] = struct{}{}
 						}

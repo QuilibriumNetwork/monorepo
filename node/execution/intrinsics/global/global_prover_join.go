@@ -1,6 +1,7 @@
 package global
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -149,6 +150,66 @@ func (p *ProverJoin) Materialize(
 		}
 	}
 
+	// Compute seniority from merge targets before the prover-exists check,
+	// so it can be applied to both new and existing provers.
+	var computedSeniority uint64 = 0
+	if len(p.MergeTargets) > 0 {
+		var mergePeerIds []string
+		for _, target := range p.MergeTargets {
+			// Check if this merge target was already consumed
+			spentBI, err := poseidon.HashBytes(slices.Concat(
+				[]byte("PROVER_JOIN_MERGE"),
+				target.PublicKey,
+			))
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
+			v, vErr := hg.Get(
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				spentBI.FillBytes(make([]byte, 32)),
+				hgstate.VertexAddsDiscriminator,
+			)
+			if vErr == nil && v != nil {
+				// Spent marker exists — check who consumed it
+				spentTree, ok := v.(*tries.VectorCommitmentTree)
+				if ok && spentTree != nil {
+					storedAddr, getErr := p.rdfMultiprover.Get(
+						GLOBAL_RDF_SCHEMA,
+						"merge:SpentMerge",
+						"ProverAddress",
+						spentTree,
+					)
+					if getErr == nil && len(storedAddr) == 32 &&
+						!bytes.Equal(storedAddr, proverAddress) {
+						continue // consumed by a different prover
+					}
+				}
+				// Same prover or legacy empty marker — count seniority
+			}
+
+			if target.KeyType == crypto.KeyTypeEd448 {
+				pk, err := pcrypto.UnmarshalEd448PublicKey(target.PublicKey)
+				if err != nil {
+					return nil, errors.Wrap(err, "materialize")
+				}
+
+				peerId, err := peer.IDFromPublicKey(pk)
+				if err != nil {
+					return nil, errors.Wrap(err, "materialize")
+				}
+
+				mergePeerIds = append(mergePeerIds, peerId.String())
+			}
+		}
+
+		if len(mergePeerIds) > 0 {
+			seniorityBig := compat.GetAggregatedSeniority(mergePeerIds)
+			if seniorityBig.IsUint64() {
+				computedSeniority = seniorityBig.Uint64()
+			}
+		}
+	}
+
 	if !proverExists {
 		// Create new prover entry
 		proverTree = &qcrypto.VectorCommitmentTree{}
@@ -194,56 +255,9 @@ func (p *ProverJoin) Materialize(
 			return nil, errors.Wrap(err, "materialize")
 		}
 
-		// Calculate seniority from MergeTargets, skipping already-consumed ones
-		var seniority uint64 = 0
-		if len(p.MergeTargets) > 0 {
-			// Convert Ed448 public keys to peer IDs
-			var peerIds []string
-			for _, target := range p.MergeTargets {
-				// Check if this merge target was already consumed
-				spentBI, err := poseidon.HashBytes(slices.Concat(
-					[]byte("PROVER_JOIN_MERGE"),
-					target.PublicKey,
-				))
-				if err != nil {
-					return nil, errors.Wrap(err, "materialize")
-				}
-				v, vErr := hg.Get(
-					intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-					spentBI.FillBytes(make([]byte, 32)),
-					hgstate.VertexAddsDiscriminator,
-				)
-				if vErr == nil && v != nil {
-					continue // already consumed, skip
-				}
-
-				if target.KeyType == crypto.KeyTypeEd448 {
-					pk, err := pcrypto.UnmarshalEd448PublicKey(target.PublicKey)
-					if err != nil {
-						return nil, errors.Wrap(err, "materialize")
-					}
-
-					peerId, err := peer.IDFromPublicKey(pk)
-					if err != nil {
-						return nil, errors.Wrap(err, "materialize")
-					}
-
-					peerIds = append(peerIds, peerId.String())
-				}
-			}
-
-			// Get aggregated seniority
-			if len(peerIds) > 0 {
-				seniorityBig := compat.GetAggregatedSeniority(peerIds)
-				if seniorityBig.IsUint64() {
-					seniority = seniorityBig.Uint64()
-				}
-			}
-		}
-
-		// Store seniority
+		// Store seniority (computed above from merge targets)
 		seniorityBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(seniorityBytes, seniority)
+		binary.BigEndian.PutUint64(seniorityBytes, computedSeniority)
 		err = p.rdfMultiprover.Set(
 			GLOBAL_RDF_SCHEMA,
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
@@ -334,6 +348,54 @@ func (p *ProverJoin) Materialize(
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "materialize")
+		}
+	} else if computedSeniority > 0 {
+		// For existing provers, update seniority if merge targets provide a
+		// higher value than what's currently stored.
+		existingSeniorityData, err := p.rdfMultiprover.Get(
+			GLOBAL_RDF_SCHEMA,
+			"prover:Prover",
+			"Seniority",
+			proverTree,
+		)
+		var existingSeniority uint64 = 0
+		if err == nil && len(existingSeniorityData) == 8 {
+			existingSeniority = binary.BigEndian.Uint64(existingSeniorityData)
+		}
+
+		if computedSeniority > existingSeniority {
+			seniorityBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(seniorityBytes, computedSeniority)
+			err = p.rdfMultiprover.Set(
+				GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"prover:Prover",
+				"Seniority",
+				seniorityBytes,
+				proverTree,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
+
+			updatedVertex := hg.NewVertexAddMaterializedState(
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+				[32]byte(proverAddress),
+				frameNumber,
+				proverTree,
+				proverTree,
+			)
+
+			err = hg.Set(
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				proverAddress,
+				hgstate.VertexAddsDiscriminator,
+				frameNumber,
+				updatedVertex,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
 		}
 	}
 
@@ -474,30 +536,59 @@ func (p *ProverJoin) Materialize(
 			return nil, errors.Wrap(err, "materialize")
 		}
 
-		// Skip already-consumed merge targets
-		spentAddress := [64]byte{}
-		copy(spentAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-		copy(spentAddress[32:], spentMergeBI.FillBytes(make([]byte, 32)))
+		spentMergeAddr := spentMergeBI.FillBytes(make([]byte, 32))
+
+		// Check existing spent marker
+		var prior *tries.VectorCommitmentTree
 		existing, existErr := hg.Get(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			spentMergeBI.FillBytes(make([]byte, 32)),
+			spentMergeAddr,
 			hgstate.VertexAddsDiscriminator,
 		)
 		if existErr == nil && existing != nil {
-			continue
+			existingTree, ok := existing.(*tries.VectorCommitmentTree)
+			if ok && existingTree != nil {
+				storedAddr, getErr := p.rdfMultiprover.Get(
+					GLOBAL_RDF_SCHEMA,
+					"merge:SpentMerge",
+					"ProverAddress",
+					existingTree,
+				)
+				if getErr == nil && len(storedAddr) == 32 {
+					// New format marker — already has a prover address.
+					// Skip regardless of whether it's ours or another's.
+					continue
+				}
+				// Legacy empty marker — overwrite with prover address
+				prior = existingTree
+			}
+		}
+
+		// Write spent marker with prover address
+		spentTree := &tries.VectorCommitmentTree{}
+		err = p.rdfMultiprover.Set(
+			GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"merge:SpentMerge",
+			"ProverAddress",
+			proverAddress,
+			spentTree,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "materialize")
 		}
 
 		spentMergeVertex := hg.NewVertexAddMaterializedState(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-			[32]byte(spentMergeBI.FillBytes(make([]byte, 32))),
+			[32]byte(spentMergeAddr),
 			frameNumber,
-			nil,
-			&tries.VectorCommitmentTree{},
+			prior,
+			spentTree,
 		)
 
 		err = hg.Set(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			spentMergeBI.FillBytes(make([]byte, 32)),
+			spentMergeAddr,
 			hgstate.VertexAddsDiscriminator,
 			frameNumber,
 			spentMergeVertex,
@@ -695,9 +786,36 @@ func (p *ProverJoin) GetWriteAddresses(frameNumber uint64) ([][]byte, error) {
 			return nil, errors.Wrap(err, "get write addresses")
 		}
 
+		spentAddr := spentMergeBI.FillBytes(make([]byte, 32))
+
+		// Skip merge targets whose spent markers already contain a prover
+		// address (new format). These won't be written to — either they
+		// belong to this prover (already recorded) or a different one.
+		// Legacy empty markers and new markers need a write lock since
+		// Materialize will write them.
+		if p.hypergraph != nil {
+			spentFullAddr := [64]byte{}
+			copy(spentFullAddr[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+			copy(spentFullAddr[32:], spentAddr)
+			spentData, dataErr := p.hypergraph.GetVertexData(spentFullAddr)
+			if dataErr == nil && spentData != nil {
+				storedAddr, getErr := p.rdfMultiprover.Get(
+					GLOBAL_RDF_SCHEMA,
+					"merge:SpentMerge",
+					"ProverAddress",
+					spentData,
+				)
+				if getErr == nil && len(storedAddr) == 32 {
+					// New format — won't be written to
+					continue
+				}
+				// Legacy empty — will be overwritten, need write lock
+			}
+		}
+
 		addresses[string(slices.Concat(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			spentMergeBI.FillBytes(make([]byte, 32)),
+			spentAddr,
 		))] = struct{}{}
 	}
 
@@ -793,7 +911,6 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	}
 
 	for _, mt := range p.MergeTargets {
-		// Check spent status first – if already consumed, skip entirely
 		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
 			[]byte("PROVER_JOIN_MERGE"),
 			mt.PublicKey,
@@ -802,15 +919,28 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			return false, errors.Wrap(err, "verify: invalid prover join")
 		}
 
-		spentAddress := [64]byte{}
-		copy(spentAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-		copy(spentAddress[32:], spentMergeBI.FillBytes(make([]byte, 32)))
+		spentFullAddr := [64]byte{}
+		copy(spentFullAddr[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(spentFullAddr[32:], spentMergeBI.FillBytes(make([]byte, 32)))
 
-		v, err := p.hypergraph.GetVertex(spentAddress)
+		v, err := p.hypergraph.GetVertex(spentFullAddr)
 		if err == nil && v != nil {
-			// merge target already consumed, skip – join proceeds without
-			// this target's seniority
-			continue
+			// Spent marker exists — check if consumed by a different prover
+			spentData, dataErr := p.hypergraph.GetVertexData(spentFullAddr)
+			if dataErr == nil && spentData != nil {
+				storedAddr, getErr := p.rdfMultiprover.Get(
+					GLOBAL_RDF_SCHEMA,
+					"merge:SpentMerge",
+					"ProverAddress",
+					spentData,
+				)
+				if getErr == nil && len(storedAddr) == 32 &&
+					!bytes.Equal(storedAddr, address) {
+					// Consumed by a different prover — skip
+					continue
+				}
+			}
+			// Same prover or legacy empty — validate signature below
 		}
 
 		valid, err := p.keyManager.ValidateSignature(
