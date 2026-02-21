@@ -470,7 +470,7 @@ func NewBlossomSub(
 	allowedPeers = append(allowedPeers, bootstrappers...)
 
 	directPeers := []peer.AddrInfo{}
-	if len(p2pConfig.DirectPeers) > 0 {
+	if len(p2pConfig.DirectPeers) > 0 && coreId == 0 {
 		logger.Info("found direct peers in config")
 		for _, peerAddr := range p2pConfig.DirectPeers {
 			peerinfo, err := peer.AddrInfoFromString(peerAddr)
