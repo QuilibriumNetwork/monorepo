@@ -61,7 +61,9 @@ func (e *GlobalConsensusEngine) triggerCoverageCheckAsync(
 		return
 	}
 
+	e.coverageWg.Add(1)
 	go func() {
+		defer e.coverageWg.Done()
 		defer e.coverageCheckInProgress.Store(false)
 
 		if err := e.checkShardCoverage(frameNumber, frameProver); err != nil {

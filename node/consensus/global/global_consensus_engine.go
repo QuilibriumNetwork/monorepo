@@ -206,6 +206,7 @@ type GlobalConsensusEngine struct {
 	lastShardActionFrame       map[string]uint64
 	lastShardActionFrameMu     sync.Mutex
 	coverageCheckInProgress   atomic.Bool
+	coverageWg                sync.WaitGroup
 	peerInfoDigestCache       map[string]struct{}
 	peerInfoDigestCacheMu     sync.Mutex
 	keyRegistryDigestCache    map[string]struct{}
@@ -1205,6 +1206,10 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 			errChan <- errors.New("timeout waiting for graceful shutdown")
 		}
 	}
+
+	// Wait for any in-flight coverage check goroutine to finish before
+	// returning, so callers can safely close the Pebble DB.
+	e.coverageWg.Wait()
 
 	close(errChan)
 	return errChan

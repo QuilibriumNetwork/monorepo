@@ -122,6 +122,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 								// prover allocations in the registry.
 								e.reconcileWorkerAllocations(data.Frame.Header.FrameNumber, self)
 								e.checkExcessPendingJoins(self, data.Frame.Header.FrameNumber)
+								e.checkAndSubmitSeniorityMerge(self, data.Frame.Header.FrameNumber)
 								e.logAllocationStatusOnly(ctx, data, self, effectiveSeniority)
 							}
 						}
@@ -668,47 +669,8 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		)
 	}
 
-	// Standalone seniority merge: when no join was proposed this cycle but the
-	// prover exists with incorrect seniority, submit a seniority merge to fix
-	// it. This covers the case where all worker slots are filled and no new
-	// joins are being proposed.
-	if !joinProposedThisCycle && self != nil {
-		frameNum := data.Frame.Header.FrameNumber
-		mergeSeniority := e.estimateSeniorityFromConfig()
-
-		if mergeSeniority > self.Seniority {
-			lastJoin := e.lastJoinAttemptFrame.Load()
-			lastMerge := e.lastSeniorityMergeFrame.Load()
-			joinCooldownOk := lastJoin == 0 || frameNum-lastJoin >= 10
-			mergeCooldownOk := lastMerge == 0 || frameNum-lastMerge >= 10
-
-			if joinCooldownOk && mergeCooldownOk {
-				frame := e.GetFrame()
-				if frame != nil {
-					helpers, peerIds := e.buildMergeHelpers()
-					err := e.submitSeniorityMerge(
-						frame, helpers, mergeSeniority, peerIds,
-					)
-					if err != nil {
-						e.logger.Error(
-							"could not submit seniority merge",
-							zap.Error(err),
-						)
-					} else {
-						e.lastSeniorityMergeFrame.Store(frameNum)
-					}
-				}
-			} else {
-				e.logger.Debug(
-					"seniority merge deferred due to cooldown",
-					zap.Uint64("merge_seniority", mergeSeniority),
-					zap.Uint64("existing_seniority", self.Seniority),
-					zap.Uint64("last_join_frame", lastJoin),
-					zap.Uint64("last_merge_frame", lastMerge),
-					zap.Uint64("current_frame", frameNum),
-				)
-			}
-		}
+	if !joinProposedThisCycle {
+		e.checkAndSubmitSeniorityMerge(self, data.Frame.Header.FrameNumber)
 	}
 
 	if len(pendingFilters) != 0 {
@@ -1082,12 +1044,23 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 	decideDescriptors := []provers.ShardDescriptor{}
 
 	for _, shardInfo := range shards {
-		resp, err := e.getAppShardsFromProver(
-			client,
-			slices.Concat(shardInfo.L1, shardInfo.L2),
-		)
+		shardKey := slices.Concat(shardInfo.L1, shardInfo.L2)
+		var resp *protobufs.GetAppShardsResponse
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			resp, err = e.getAppShardsFromProver(client, shardKey)
+			if err == nil {
+				break
+			}
+			e.logger.Debug(
+				"retrying app shard retrieval",
+				zap.Int("attempt", attempt+1),
+				zap.Error(err),
+			)
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+		}
 		if err != nil {
-			e.logger.Debug("could not get app shards from prover", zap.Error(err))
+			e.logger.Debug("could not get app shards from prover after retries", zap.Error(err))
 			return nil, false
 		}
 
@@ -1260,6 +1233,56 @@ func (e *GlobalConsensusEngine) logAllocationStatusOnly(
 		snapshot.statusFields()...,
 	)
 	e.logAllocationStatus(snapshot)
+}
+
+// checkAndSubmitSeniorityMerge submits a seniority merge if the prover exists
+// with incorrect seniority and cooldowns have elapsed. This is called both from
+// evaluateForProposals (when no join was proposed) and from the "all workers
+// allocated" path, ensuring seniority is corrected regardless of allocation state.
+func (e *GlobalConsensusEngine) checkAndSubmitSeniorityMerge(
+	self *typesconsensus.ProverInfo,
+	frameNumber uint64,
+) {
+	if self == nil {
+		return
+	}
+
+	mergeSeniority := e.estimateSeniorityFromConfig()
+	if mergeSeniority <= self.Seniority {
+		return
+	}
+
+	lastJoin := e.lastJoinAttemptFrame.Load()
+	lastMerge := e.lastSeniorityMergeFrame.Load()
+	joinCooldownOk := lastJoin == 0 || frameNumber-lastJoin >= 10
+	mergeCooldownOk := lastMerge == 0 || frameNumber-lastMerge >= 10
+
+	if joinCooldownOk && mergeCooldownOk {
+		frame := e.GetFrame()
+		if frame != nil {
+			helpers, peerIds := e.buildMergeHelpers()
+			err := e.submitSeniorityMerge(
+				frame, helpers, mergeSeniority, peerIds,
+			)
+			if err != nil {
+				e.logger.Error(
+					"could not submit seniority merge",
+					zap.Error(err),
+				)
+			} else {
+				e.lastSeniorityMergeFrame.Store(frameNumber)
+			}
+		}
+	} else {
+		e.logger.Debug(
+			"seniority merge deferred due to cooldown",
+			zap.Uint64("merge_seniority", mergeSeniority),
+			zap.Uint64("existing_seniority", self.Seniority),
+			zap.Uint64("last_join_frame", lastJoin),
+			zap.Uint64("last_merge_frame", lastMerge),
+			zap.Uint64("current_frame", frameNumber),
+		)
+	}
 }
 
 func (e *GlobalConsensusEngine) allocationContext() (

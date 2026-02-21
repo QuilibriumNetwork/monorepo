@@ -135,7 +135,7 @@ func (hg *HypergraphCRDT) SetShutdownContext(ctx context.Context) {
 	go func() {
 		select {
 		case <-hg.shutdownCtx.Done():
-			hg.snapshotMgr.publish(nil)
+			hg.snapshotMgr.close()
 		}
 	}()
 }

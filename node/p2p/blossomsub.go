@@ -95,6 +95,7 @@ type BlossomSub struct {
 	manualReachability  atomic.Pointer[bool]
 	p2pConfig           config.P2PConfig
 	dht                 *dht.IpfsDHT
+	routingDiscovery    *routing.RoutingDiscovery
 	coreId              uint
 	configDir           ConfigDir
 }
@@ -317,6 +318,7 @@ func NewBlossomSubWithHost(
 
 	peerID := host.ID()
 	bs.dht = kademliaDHT
+	bs.routingDiscovery = routingDiscovery
 	bs.ps = pubsub
 	bs.peerID = peerID
 	bs.h = host
@@ -767,6 +769,7 @@ func NewBlossomSub(
 
 	peerID := h.ID()
 	bs.dht = kademliaDHT
+	bs.routingDiscovery = routingDiscovery
 	bs.ps = pubsub
 	bs.peerID = peerID
 	bs.h = h
@@ -890,24 +893,60 @@ func (b *BlossomSub) background(ctx context.Context) {
 
 func (b *BlossomSub) checkAndReconnectPeers(ctx context.Context) {
 	peerCount := len(b.h.Network().Peers())
-	if peerCount > 1 {
+	if peerCount >= b.p2pConfig.MinBootstrapPeers {
 		return
 	}
 
 	b.logger.Warn(
-		"no peers connected, attempting to re-bootstrap and discover",
-		zap.Duration("check_interval", b.p2pConfig.PeerReconnectCheckInterval),
+		"low peer count, attempting to re-bootstrap and discover",
+		zap.Int("current_peers", peerCount),
+		zap.Int("min_bootstrap_peers", b.p2pConfig.MinBootstrapPeers),
 	)
+
+	// Re-bootstrap the DHT to refresh the routing table. At startup,
+	// kademliaDHT.Bootstrap() populates the routing table by connecting to
+	// bootstrap peers. Without calling it again here, the routing table can
+	// go empty after all peers disconnect, making FindPeers unable to
+	// discover anyone — leaving the node permanently stuck.
+	if b.dht != nil {
+		if err := b.dht.Bootstrap(ctx); err != nil {
+			b.logger.Error("DHT re-bootstrap failed", zap.Error(err))
+		}
+	}
+
+	// Re-advertise so other peers can find us through the DHT.
+	if b.routingDiscovery != nil {
+		util.Advertise(
+			ctx,
+			b.routingDiscovery,
+			getNetworkNamespace(b.p2pConfig.Network),
+		)
+	}
+
+	// Clear peerstore addresses for disconnected peers so we don't keep
+	// dialing stale/invalid addresses that were added in previous attempts.
+	for _, p := range b.h.Peerstore().Peers() {
+		if p == b.h.ID() {
+			continue
+		}
+		if b.h.Network().Connectedness(p) != network.Connected &&
+			b.h.Network().Connectedness(p) != network.Limited {
+			b.h.Peerstore().ClearAddrs(p)
+		}
+	}
 
 	if err := b.DiscoverPeers(ctx); err != nil {
 		b.logger.Error("peer reconnect failed", zap.Error(err))
 	}
 
 	newCount := len(b.h.Network().Peers())
-	if newCount > 1 {
+	if newCount >= b.p2pConfig.MinBootstrapPeers {
 		b.logger.Info("peer reconnect succeeded", zap.Int("peers", newCount))
 	} else {
-		b.logger.Warn("peer reconnect: still no peers found, will retry at next interval")
+		b.logger.Warn(
+			"peer reconnect: still low peer count, will retry at next interval",
+			zap.Int("peers", newCount),
+		)
 	}
 }
 

@@ -155,7 +155,6 @@ type AppConsensusEngine struct {
 	globalProverRootVerifiedFrame atomic.Uint64
 	globalProverRootSynced        atomic.Bool
 	globalProverSyncInProgress    atomic.Bool
-	lastGlobalFrameHeader         *protobufs.GlobalFrameHeader // previous frame for deferred root check
 
 	// Genesis initialization
 	genesisInitialized atomic.Bool
@@ -986,22 +985,24 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		return
 	}
 
-	// Defer root check by one frame: when frame N arrives, check frame N-1's
-	// root. This matches the GlobalConsensusEngine which checks the parent
-	// frame's root during materialize(N-1), triggered when frame N certifies
-	// frame N-1. By the time frame N arrives, the master has had time to
-	// materialize N-2 (triggered when N-1 arrived), so the worker's tree
-	// should reflect post-materialize(N-2) state — exactly what frame N-1's
-	// ProverTreeCommitment was computed against.
-	prevHeader := e.lastGlobalFrameHeader
-	e.lastGlobalFrameHeader = frame.Header
+	frameNumber := frame.Header.FrameNumber
+	expectedProverRoot := frame.Header.ProverTreeCommitment
 
-	if prevHeader == nil {
+	if len(expectedProverRoot) == 0 {
 		return
 	}
 
-	frameNumber := prevHeader.FrameNumber
-	expectedProverRoot := prevHeader.ProverTreeCommitment
+	// Match the GlobalConsensusEngine's ordering: commit the tree first as a
+	// standalone step, then extract and verify the prover root. The global
+	// engine calls Commit(N) at the start of materialize(N) before checking
+	// the root. We mirror this by committing first, then extracting.
+	if _, err := e.hypergraph.Commit(frameNumber); err != nil {
+		e.logger.Warn(
+			"failed to commit hypergraph for global prover root check",
+			zap.Uint64("frame_number", frameNumber),
+			zap.Error(err),
+		)
+	}
 
 	localRoot, err := e.computeLocalGlobalProverRoot(frameNumber)
 	if err != nil {
@@ -1012,11 +1013,11 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		e.performBlockingGlobalHypersync(prevHeader.Prover, expectedProverRoot)
+		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
 		return
 	}
 
-	if len(localRoot) == 0 || len(expectedProverRoot) == 0 {
+	if len(localRoot) == 0 {
 		return
 	}
 
@@ -1029,7 +1030,35 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		e.performBlockingGlobalHypersync(prevHeader.Prover, expectedProverRoot)
+		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+
+		// Re-compute local root after sync to verify convergence, matching
+		// the global engine's post-sync verification pattern.
+		newLocalRoot, newRootErr := e.computeLocalGlobalProverRoot(frameNumber)
+		if newRootErr != nil {
+			e.logger.Warn(
+				"failed to compute local global prover root after sync",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Error(newRootErr),
+			)
+		} else if bytes.Equal(newLocalRoot, expectedProverRoot) {
+			e.logger.Info(
+				"global prover root converged after sync",
+				zap.Uint64("frame_number", frameNumber),
+			)
+			e.globalProverRootSynced.Store(true)
+			e.globalProverRootVerifiedFrame.Store(frameNumber)
+			if err := e.proverRegistry.Refresh(); err != nil {
+				e.logger.Warn("failed to refresh prover registry", zap.Error(err))
+			}
+		} else {
+			e.logger.Warn(
+				"global prover root still mismatched after sync",
+				zap.Uint64("frame_number", frameNumber),
+				zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
+				zap.String("post_sync_root", hex.EncodeToString(newLocalRoot)),
+			)
+		}
 		return
 	}
 

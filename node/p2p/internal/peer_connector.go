@@ -11,6 +11,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
+	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 	"go.uber.org/zap"
 )
 
@@ -84,7 +86,16 @@ func (pc *peerConnector) connectToPeer(
 		return
 	}
 
-	pc.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.AddressTTL)
+	routable := ma.FilterAddrs(p.Addrs, func(a ma.Multiaddr) bool {
+		pub, err := manet.IsPublicAddr(a)
+		return pub && err == nil
+	})
+	if len(routable) == 0 {
+		atomic.AddUint32(failure, 1)
+		return
+	}
+
+	pc.host.Peerstore().AddAddrs(p.ID, routable, peerstore.AddressTTL)
 
 	conn, err := pc.host.Network().DialPeer(ctx, p.ID)
 	if err != nil {
