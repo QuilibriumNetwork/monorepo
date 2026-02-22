@@ -1982,6 +1982,14 @@ func (e *AppConsensusEngine) waitForProverRegistration(
 		default:
 		}
 
+		// Refresh the registry from the hypergraph on each cycle. The prover
+		// data may already be present in the hypergraph (synced from the
+		// master) but the registry cache may be stale or empty because
+		// handleGlobalProverRoot has not converged yet.
+		if err := e.proverRegistry.Refresh(); err != nil {
+			logger.Warn("failed to refresh prover registry", zap.Error(err))
+		}
+
 		provers, err := e.proverRegistry.GetActiveProvers(e.appAddress)
 		if err != nil {
 			logger.Warn("could not query prover registry", zap.Error(err))
