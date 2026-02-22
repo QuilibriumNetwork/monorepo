@@ -566,6 +566,9 @@ func NewGlobalConsensusEngine(
 			}
 			ready()
 			<-ctx.Done()
+			if err := engine.workerManager.Stop(); err != nil {
+				engine.logger.Warn("error stopping worker manager", zap.Error(err))
+			}
 		})
 	}
 
@@ -1208,8 +1211,19 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	}
 
 	// Wait for any in-flight coverage check goroutine to finish before
-	// returning, so callers can safely close the Pebble DB.
-	e.coverageWg.Wait()
+	// returning, so callers can safely close the Pebble DB. Use a bounded
+	// wait so Stop() cannot hang indefinitely if the goroutine is blocked
+	// on hg.mu (held by a sync or commit that hasn't drained yet).
+	coverageDone := make(chan struct{})
+	go func() {
+		e.coverageWg.Wait()
+		close(coverageDone)
+	}()
+	select {
+	case <-coverageDone:
+	case <-time.After(5 * time.Second):
+		e.logger.Warn("timed out waiting for coverage check to complete")
+	}
 
 	close(errChan)
 	return errChan

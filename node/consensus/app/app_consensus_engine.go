@@ -974,6 +974,17 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.Unsubscribe(e.getDispatchMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getDispatchMessageBitmask())
 
+	// Wait for all component workers to finish before signalling callers.
+	// Without this, RespawnServer creates a new engine while old goroutines
+	// are still running, causing "context cancelled" error loops.
+	select {
+	case <-e.Done():
+	case <-time.After(30 * time.Second):
+		if !force {
+			errChan <- errors.New("timeout waiting for app engine shutdown")
+		}
+	}
+
 	close(errChan)
 	return errChan
 }

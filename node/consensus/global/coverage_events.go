@@ -66,6 +66,14 @@ func (e *GlobalConsensusEngine) triggerCoverageCheckAsync(
 		defer e.coverageWg.Done()
 		defer e.coverageCheckInProgress.Store(false)
 
+		// Bail immediately if shutdown is already in progress to avoid
+		// blocking Stop() on hg.mu (which may be held by a sync or commit).
+		select {
+		case <-e.ShutdownSignal():
+			return
+		default:
+		}
+
 		if err := e.checkShardCoverage(frameNumber, frameProver); err != nil {
 			e.logger.Error("failed to check shard coverage", zap.Error(err))
 		}
