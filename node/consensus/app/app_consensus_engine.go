@@ -1971,7 +1971,10 @@ func (e *AppConsensusEngine) awaitFirstGlobalFrame(
 func (e *AppConsensusEngine) waitForProverRegistration(
 	ctx lifecycle.SignalerContext,
 ) error {
-	logger := e.logger.With(zap.String("shard_address", e.appAddressHex))
+	logger := e.logger.With(
+		zap.String("shard_address", e.appAddressHex),
+		zap.String("prover_address", hex.EncodeToString(e.proverAddress)),
+	)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -1980,14 +1983,6 @@ func (e *AppConsensusEngine) waitForProverRegistration(
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-		}
-
-		// Refresh the registry from the hypergraph on each cycle. The prover
-		// data may already be present in the hypergraph (synced from the
-		// master) but the registry cache may be stale or empty because
-		// handleGlobalProverRoot has not converged yet.
-		if err := e.proverRegistry.Refresh(); err != nil {
-			logger.Warn("failed to refresh prover registry", zap.Error(err))
 		}
 
 		provers, err := e.proverRegistry.GetActiveProvers(e.appAddress)
@@ -2000,7 +1995,16 @@ func (e *AppConsensusEngine) waitForProverRegistration(
 					return nil
 				}
 			}
-			logger.Info("waiting for prover registration")
+			proverAddrs := make([]string, 0, len(provers))
+			for _, p := range provers {
+				proverAddrs = append(proverAddrs, hex.EncodeToString(p.Address))
+			}
+			logger.Info(
+				"waiting for prover registration",
+				zap.Int("active_provers_for_filter", len(provers)),
+				zap.String("filter", hex.EncodeToString(e.appAddress)),
+				zap.Strings("registry_addresses", proverAddrs),
+			)
 		}
 
 		select {
