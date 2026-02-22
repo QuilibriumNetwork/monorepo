@@ -159,6 +159,34 @@ func (hg *HypergraphCRDT) contextWithShutdown(
 	return ctx, cancel
 }
 
+// lockWithShutdown tries to acquire hg.mu exclusively. If the shutdown context
+// fires before the lock is acquired, it returns false and the caller must not
+// proceed. A background goroutine ensures the lock is released if it is
+// eventually acquired after shutdown.
+func (hg *HypergraphCRDT) lockWithShutdown() bool {
+	if hg.shutdownCtx == nil {
+		hg.mu.Lock()
+		return true
+	}
+
+	locked := make(chan struct{})
+	go func() {
+		hg.mu.Lock()
+		close(locked)
+	}()
+
+	select {
+	case <-locked:
+		return true
+	case <-hg.shutdownCtx.Done():
+		go func() {
+			<-locked
+			hg.mu.Unlock()
+		}()
+		return false
+	}
+}
+
 func (hg *HypergraphCRDT) snapshotSet(
 	shardKey tries.ShardKey,
 	targetStore tries.TreeBackingStore,
@@ -696,7 +724,9 @@ func (hg *HypergraphCRDT) GetMetadataAtKey(pathKey []byte) (
 	[]hypergraph.ShardMetadata,
 	error,
 ) {
-	hg.mu.Lock()
+	if !hg.lockWithShutdown() {
+		return nil, errors.New("shutting down")
+	}
 	defer hg.mu.Unlock()
 	if len(pathKey) < 32 {
 		return nil, errors.Wrap(
