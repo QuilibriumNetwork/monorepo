@@ -167,17 +167,21 @@ func (r *DataWorkerIPCServer) Respawn(
 }
 
 func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
-	if r.server != nil {
-		r.logger.Info("stopping server for respawn")
-		r.server.GracefulStop()
-		r.server = nil
-	}
+	// Cancel the engine context BEFORE stopping the gRPC server. GracefulStop
+	// waits for all in-flight RPCs (e.g. HyperStream, PerformSync) to
+	// complete, but those handlers won't stop until the engine context is
+	// cancelled. Reversing the order avoids a deadlock.
 	if r.appConsensusEngine != nil {
 		if r.cancel != nil {
 			r.cancel()
 		}
 		<-r.appConsensusEngine.Stop(false)
 		r.appConsensusEngine = nil
+	}
+	if r.server != nil {
+		r.logger.Info("stopping server for respawn")
+		r.server.GracefulStop()
+		r.server = nil
 	}
 
 	// Establish an auth provider

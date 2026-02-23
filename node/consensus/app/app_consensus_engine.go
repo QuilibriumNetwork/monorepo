@@ -740,11 +740,17 @@ func NewAppConsensusEngine(
 		appSyncHooks,
 	)
 
-	// Add sync provider
-	componentBuilder.AddWorker(engine.syncProvider.Start)
+	// namedWorker wraps a worker function with shutdown logging so we can
+	// identify which worker(s) hang during shutdown.
+	namedWorker := func(name string, fn func(lifecycle.SignalerContext, lifecycle.ReadyFunc)) lifecycle.ComponentWorker {
+		return func(ctx lifecycle.SignalerContext, ready lifecycle.ReadyFunc) {
+			defer engine.logger.Debug("worker stopped", zap.String("worker", name))
+			fn(ctx, ready)
+		}
+	}
 
 	// Add consensus
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("consensus", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
@@ -802,16 +808,16 @@ func NewAppConsensusEngine(
 
 		<-ctx.Done()
 		<-lifecycle.AllDone(engine.voteAggregator, engine.timeoutAggregator)
-	})
+	}))
 
 	// Start app shard proposal queue processor
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("proposalQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.processAppShardProposalQueue(ctx)
-	})
+	}))
 
 	err = engine.subscribeToConsensusMessages()
 	if err != nil {
@@ -854,82 +860,82 @@ func NewAppConsensusEngine(
 	}
 
 	// Add sync provider
-	componentBuilder.AddWorker(engine.syncProvider.Start)
+	componentBuilder.AddWorker(namedWorker("syncProvider", engine.syncProvider.Start))
 
 	// Start message queue processors
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("consensusMsgQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.processConsensusMessageQueue(ctx)
-	})
+	}))
 
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("proverMsgQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.processProverMessageQueue(ctx)
-	})
+	}))
 
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("frameMsgQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.processFrameMessageQueue(ctx)
-	})
+	}))
 
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("globalFrameMsgQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.processGlobalFrameMessageQueue(ctx)
-	})
+	}))
 
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("alertMsgQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.processAlertMessageQueue(ctx)
-	})
+	}))
 
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("peerInfoMsgQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.processPeerInfoMessageQueue(ctx)
-	})
+	}))
 
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("dispatchMsgQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.processDispatchMessageQueue(ctx)
-	})
+	}))
 
 	// Start event distributor event loop
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("eventDistributor", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.eventDistributorLoop(ctx)
-	})
+	}))
 
 	// Start metrics update goroutine
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("metricsLoop", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.updateMetricsLoop(ctx)
-	})
+	}))
 
 	engine.ComponentManager = componentBuilder.Build()
 	if hgWithShutdown, ok := engine.hyperSync.(interface {
@@ -977,13 +983,18 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	// Wait briefly for component workers to finish. If they don't exit in
 	// time, close pubsub to cancel subscription goroutines that may be
 	// keeping handlers alive and preventing clean shutdown.
+	e.logger.Info("app engine shutdown: waiting for workers")
 	select {
 	case <-e.Done():
+		e.logger.Info("app engine shutdown: all workers stopped")
 	case <-time.After(5 * time.Second):
+		e.logger.Warn("app engine shutdown: workers still running after 5s, closing pubsub")
 		e.pubsub.Close()
 		select {
 		case <-e.Done():
+			e.logger.Info("app engine shutdown: all workers stopped after pubsub close")
 		case <-time.After(25 * time.Second):
+			e.logger.Error("app engine shutdown: timed out after 30s")
 			if !force {
 				errChan <- errors.New("timeout waiting for app engine shutdown")
 			}
@@ -1139,6 +1150,16 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte, expectedRoo
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+
+		// Cancel sync when the engine shuts down so this goroutine doesn't
+		// outlive the engine and hold resources (locks, connections).
+		go func() {
+			select {
+			case <-e.ShutdownSignal():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
 
 		shardKey := tries.ShardKey{
 			L1: [3]byte{0x00, 0x00, 0x00},
