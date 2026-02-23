@@ -18,4 +18,5 @@ type WorkerManager interface {
 	ProposeAllocations(coreIds []uint, filters [][]byte) error
 	DecideAllocations(reject [][]byte, confirm [][]byte) error
 	RangeWorkers() ([]*store.WorkerInfo, error)
+	RespawnWorker(coreId uint, filter []byte) error
 }

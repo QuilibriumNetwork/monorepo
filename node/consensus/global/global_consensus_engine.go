@@ -1217,6 +1217,13 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	// fires, so the goroutine will always complete after shutdown.
 	e.coverageWg.Wait()
 
+	// Synchronously close the snapshot manager so no Pebble snapshots remain
+	// open when the database is closed. The async goroutine chain from
+	// SetShutdownContext may not have completed yet.
+	if closer, ok := e.hyperSync.(interface{ CloseSnapshots() }); ok {
+		closer.CloseSnapshots()
+	}
+
 	close(errChan)
 	return errChan
 }

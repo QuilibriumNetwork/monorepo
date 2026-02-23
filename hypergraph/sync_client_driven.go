@@ -404,7 +404,6 @@ func (hg *HypergraphCRDT) handleGetLeaves(
 			Size:       leaf.Size.FillBytes(make([]byte, 32)),
 		}
 
-		// Load underlying vertex tree if available (use snapshot store for consistency)
 		vtree, err := session.store.LoadVertexTree(leaf.Key)
 		if err == nil && vtree != nil {
 			data, err := tries.SerializeNonLazyTree(vtree)

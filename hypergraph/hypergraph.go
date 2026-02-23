@@ -140,6 +140,13 @@ func (hg *HypergraphCRDT) SetShutdownContext(ctx context.Context) {
 	}()
 }
 
+// CloseSnapshots synchronously releases all snapshot generations and their DB
+// snapshots. This must be called before closing the underlying Pebble database
+// to avoid dangling snapshot warnings. It is idempotent.
+func (hg *HypergraphCRDT) CloseSnapshots() {
+	hg.snapshotMgr.close()
+}
+
 func (hg *HypergraphCRDT) contextWithShutdown(
 	parent context.Context,
 ) (context.Context, context.CancelFunc) {

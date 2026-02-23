@@ -301,6 +301,20 @@ func (m *Manager) persistPlannedFilters(
 				zap.Uint("core_id", info.CoreId),
 				zap.Error(err),
 			)
+			continue
+		}
+
+		m.logger.Info(
+			"reassigning worker to new filter",
+			zap.Uint("core_id", info.CoreId),
+			zap.String("filter", hex.EncodeToString(filterCopy)),
+		)
+		if err := m.workerMgr.RespawnWorker(info.CoreId, filterCopy); err != nil {
+			m.logger.Warn(
+				"failed to respawn worker with new filter",
+				zap.Uint("core_id", info.CoreId),
+				zap.Error(err),
+			)
 		}
 	}
 }

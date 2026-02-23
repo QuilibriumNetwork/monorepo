@@ -133,8 +133,8 @@ func (r *DataWorkerIPCServer) Start() error {
 func (r *DataWorkerIPCServer) Stop() error {
 	r.logger.Info("stopping server gracefully")
 
-	// Stop the app consensus engine first so its snapshot manager releases
-	// any open Pebble snapshots before we close the database.
+	// Stop the app consensus engine first, then synchronously close the
+	// snapshot manager so no Pebble snapshots remain when the database closes.
 	if r.appConsensusEngine != nil {
 		if r.cancel != nil {
 			r.cancel()
@@ -142,6 +142,7 @@ func (r *DataWorkerIPCServer) Stop() error {
 		<-r.appConsensusEngine.Stop(false)
 		r.appConsensusEngine = nil
 	}
+	r.appConsensusEngineFactory.CloseSnapshots()
 
 	r.pubsub.Close()
 	if r.server != nil {

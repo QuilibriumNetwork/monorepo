@@ -66,6 +66,9 @@ func (m *mockWorkerManager) ProposeAllocations(coreIds []uint, filters [][]byte)
 func (m *mockWorkerManager) DecideAllocations(reject [][]byte, confirm [][]byte) error {
 	return nil
 }
+func (m *mockWorkerManager) RespawnWorker(coreId uint, filter []byte) error {
+	return nil
+}
 func (m *mockWorkerManager) RangeWorkers() ([]*store.WorkerInfo, error) {
 	result := make([]*store.WorkerInfo, 0, len(m.workers))
 	for _, w := range m.workers {
