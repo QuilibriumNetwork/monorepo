@@ -1170,15 +1170,22 @@ func (e *AppConsensusEngine) performBlockingGlobalHypersync(proposer []byte, exp
 
 	// Wait for any existing sync to complete first
 	for e.globalProverSyncInProgress.Load() {
-		e.logger.Debug("blocking hypersync: waiting for existing sync to complete")
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-e.ShutdownSignal():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 
 	// Mark sync as in progress
 	if !e.globalProverSyncInProgress.CompareAndSwap(false, true) {
 		// Another sync started, wait for it
 		for e.globalProverSyncInProgress.Load() {
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-e.ShutdownSignal():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
 		return
 	}
