@@ -96,8 +96,8 @@ var (
 	)
 	debug = flag.Bool(
 		"debug",
-		false,
-		"sets log output to debug (verbose)",
+		debugDefault(),
+		"sets log output to debug (verbose) (default false or value of QUILIBRIUM_DEBUG env var)",
 	)
 	dhtOnly = flag.Bool(
 		"dht-only",
@@ -180,6 +180,22 @@ func signatureCheckDefault() bool {
 	}
 
 	return true
+}
+
+func debugDefault() bool {
+	envVarValue, envVarExists := os.LookupEnv("QUILIBRIUM_DEBUG")
+	if envVarExists {
+		def, err := strconv.ParseBool(envVarValue)
+		if err == nil {
+			return def
+		}
+		fmt.Println(
+			"Invalid environment variable QUILIBRIUM_DEBUG, must be 'true' or 'false':",
+			envVarValue,
+		)
+	}
+
+	return false
 }
 
 // monitorParentProcess watches parent process and stops the worker if parent dies
