@@ -85,8 +85,11 @@ type BlossomSub struct {
 	// Track which bit slices belong to which original bitmasks, used to reference
 	// count bitmasks for closed subscriptions
 	subscriptionTracker map[string][][]byte
-	subscriptions       []*blossomsub.Subscription
-	subscriptionMutex   sync.RWMutex
+	// Track subscriptions per bitmask key so Unsubscribe can cancel them
+	// before closing the bitmask (blossomsub refuses to close a bitmask
+	// with open subscriptions).
+	subscriptionsByBitmask map[string][]*blossomsub.Subscription
+	subscriptionMutex      sync.RWMutex
 	h                   host.Host
 	signKey             crypto.PrivKey
 	peerScore           map[string]*appScore
@@ -156,11 +159,12 @@ func NewBlossomSubWithHost(
 		cancel:              cancel,
 		logger:              logger,
 		bitmaskMap:          make(map[string]*blossomsub.Bitmask),
-		subscriptionTracker: make(map[string][][]byte),
-		signKey:             privKey,
-		peerScore:           make(map[string]*appScore),
-		p2pConfig:           *p2pConfig,
-		coreId:              coreId,
+		subscriptionTracker:    make(map[string][][]byte),
+		subscriptionsByBitmask: make(map[string][]*blossomsub.Subscription),
+		signKey:                privKey,
+		peerScore:              make(map[string]*appScore),
+		p2pConfig:              *p2pConfig,
+		coreId:                 coreId,
 	}
 
 	idService := internal.IDServiceFromHost(host)
@@ -539,13 +543,14 @@ func NewBlossomSub(
 		cancel:              cancel,
 		logger:              logger,
 		bitmaskMap:          make(map[string]*blossomsub.Bitmask),
-		subscriptionTracker: make(map[string][][]byte),
-		signKey:             privKey,
-		peerScore:           make(map[string]*appScore),
-		p2pConfig:           *p2pConfig,
-		derivedPeerID:       derivedPeerId,
-		coreId:              coreId,
-		configDir:           configDir,
+		subscriptionTracker:    make(map[string][][]byte),
+		subscriptionsByBitmask: make(map[string][]*blossomsub.Subscription),
+		signKey:                privKey,
+		peerScore:              make(map[string]*appScore),
+		p2pConfig:              *p2pConfig,
+		derivedPeerID:          derivedPeerId,
+		coreId:                 coreId,
+		configDir:              configDir,
 	}
 
 	h, err := libp2p.New(opts...)
@@ -1069,9 +1074,9 @@ func (b *BlossomSub) Subscribe(
 		zap.String("bitmask", hex.EncodeToString(bitmask)),
 	)
 
-	// Track subscriptions for cleanup on Close
+	// Track subscriptions per bitmask for cleanup
 	b.subscriptionMutex.Lock()
-	b.subscriptions = append(b.subscriptions, subs...)
+	b.subscriptionsByBitmask[string(bitmask)] = subs
 	b.subscriptionMutex.Unlock()
 
 	for _, sub := range subs {
@@ -1153,6 +1158,15 @@ func (b *BlossomSub) Unsubscribe(bitmask []byte, raw bool) {
 		"unsubscribing from bitmask",
 		zap.String("bitmask", hex.EncodeToString(bitmask)),
 	)
+
+	// Cancel the subscription objects so the bitmask can be closed and the
+	// subscription goroutines exit.
+	if subs, ok := b.subscriptionsByBitmask[bitmaskKey]; ok {
+		for _, sub := range subs {
+			sub.Cancel()
+		}
+		delete(b.subscriptionsByBitmask, bitmaskKey)
+	}
 
 	// Check each bit slice to see if it's still needed by other subscriptions
 	for _, bitSlice := range bitSlices {
@@ -2117,10 +2131,12 @@ func (b *BlossomSub) Close() error {
 
 	// Cancel all subscriptions to unblock any pending Next() calls
 	b.subscriptionMutex.Lock()
-	for _, sub := range b.subscriptions {
-		sub.Cancel()
+	for _, subs := range b.subscriptionsByBitmask {
+		for _, sub := range subs {
+			sub.Cancel()
+		}
 	}
-	b.subscriptions = nil
+	b.subscriptionsByBitmask = nil
 	b.subscriptionMutex.Unlock()
 
 	return nil
