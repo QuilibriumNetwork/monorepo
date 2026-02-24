@@ -744,6 +744,7 @@ func NewAppConsensusEngine(
 	// identify which worker(s) hang during shutdown.
 	namedWorker := func(name string, fn func(lifecycle.SignalerContext, lifecycle.ReadyFunc)) lifecycle.ComponentWorker {
 		return func(ctx lifecycle.SignalerContext, ready lifecycle.ReadyFunc) {
+			engine.logger.Debug("worker starting", zap.String("worker", name))
 			defer engine.logger.Debug("worker stopped", zap.String("worker", name))
 			fn(ctx, ready)
 		}
@@ -966,6 +967,7 @@ func NewAppConsensusEngine(
 }
 
 func (e *AppConsensusEngine) Stop(force bool) <-chan error {
+	e.logger.Info("app engine stopping", zap.Bool("force", force))
 	errChan := make(chan error, 1)
 
 	// First, cancel context to signal all goroutines to stop
@@ -2415,6 +2417,8 @@ func (e *AppConsensusEngine) startConsensus(
 	e.timeoutAggregator.Start(ctx)
 	<-lifecycle.AllReady(e.voteAggregator, e.timeoutAggregator)
 	e.consensusParticipant.Start(ctx)
+	e.logger.Info("consensus started successfully",
+		zap.String("shard_address", e.appAddressHex))
 	return nil
 }
 
