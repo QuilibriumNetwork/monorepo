@@ -819,45 +819,10 @@ func NewAppConsensusEngine(
 		engine.processAppShardProposalQueue(ctx)
 	}))
 
-	err = engine.subscribeToConsensusMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToProverMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToFrameMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToGlobalFrameMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToGlobalProverMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToGlobalAlertMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToPeerInfoMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToDispatchMessages()
-	if err != nil {
-		return nil, err
-	}
+	// NOTE: subscribe calls are deferred until after ComponentManager is built
+	// (see below). The handler closures reference e.ShutdownSignal() which
+	// panics if ComponentManager is nil. Since Subscribe spawns goroutines
+	// immediately, a message arriving before Build() would hit a nil receiver.
 
 	// Add sync provider
 	componentBuilder.AddWorker(namedWorker("syncProvider", engine.syncProvider.Start))
@@ -951,6 +916,50 @@ func NewAppConsensusEngine(
 		SetSelfPeerID(string)
 	}); ok {
 		hgWithSelfPeer.SetSelfPeerID(peer.ID(ps.GetPeerID()).String())
+	}
+
+	// Subscribe to pubsub bitmasks. These calls spawn handler goroutines
+	// immediately, and the handlers reference e.ShutdownSignal() which
+	// requires ComponentManager to be non-nil. That's why subscriptions
+	// must happen after componentBuilder.Build() above.
+	err = engine.subscribeToConsensusMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	err = engine.subscribeToProverMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	err = engine.subscribeToFrameMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	err = engine.subscribeToGlobalFrameMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	err = engine.subscribeToGlobalProverMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	err = engine.subscribeToGlobalAlertMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	err = engine.subscribeToPeerInfoMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	err = engine.subscribeToDispatchMessages()
+	if err != nil {
+		return nil, err
 	}
 
 	return engine, nil

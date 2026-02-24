@@ -855,41 +855,10 @@ func NewGlobalConsensusEngine(
 
 	componentBuilder.AddWorker(engine.peerInfoManager.Start)
 
-	// Subscribe to global consensus if participating
-	err = engine.subscribeToGlobalConsensus()
-	if err != nil {
-		return nil, err
-	}
-
-	// Subscribe to shard consensus messages to broker lock agreement
-	err = engine.subscribeToShardConsensusMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
-
-	// Subscribe to frames
-	err = engine.subscribeToFrameMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
-
-	// Subscribe to prover messages
-	err = engine.subscribeToProverMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
-
-	// Subscribe to peer info messages
-	err = engine.subscribeToPeerInfoMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
-
-	// Subscribe to alert messages
-	err = engine.subscribeToAlertMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
+	// NOTE: subscribe calls are deferred until after ComponentManager is built
+	// (see below). The handler closures reference e.ShutdownSignal() which
+	// panics if ComponentManager is nil. Since Subscribe spawns goroutines
+	// immediately, a message arriving before Build() would hit a nil receiver.
 
 	// Start consensus message queue processor
 	componentBuilder.AddWorker(func(
@@ -1047,6 +1016,47 @@ func NewGlobalConsensusEngine(
 		SetSelfPeerID(string)
 	}); ok {
 		hgWithSelfPeer.SetSelfPeerID(peer.ID(ps.GetPeerID()).String())
+	}
+
+	// Subscribe to pubsub bitmasks. These calls spawn handler goroutines
+	// immediately, and the handlers reference e.ShutdownSignal() which
+	// requires ComponentManager to be non-nil. That's why subscriptions
+	// must happen after componentBuilder.Build() above.
+
+	// Subscribe to global consensus if participating
+	err = engine.subscribeToGlobalConsensus()
+	if err != nil {
+		return nil, err
+	}
+
+	// Subscribe to shard consensus messages to broker lock agreement
+	err = engine.subscribeToShardConsensusMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
+	}
+
+	// Subscribe to frames
+	err = engine.subscribeToFrameMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
+	}
+
+	// Subscribe to prover messages
+	err = engine.subscribeToProverMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
+	}
+
+	// Subscribe to peer info messages
+	err = engine.subscribeToPeerInfoMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
+	}
+
+	// Subscribe to alert messages
+	err = engine.subscribeToAlertMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
 	}
 
 	return engine, nil
