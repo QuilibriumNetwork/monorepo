@@ -44,6 +44,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	grpcpeer "google.golang.org/grpc/peer"
@@ -459,7 +460,24 @@ func NewBlossomSub(
 		if coreId == 0 {
 			opts = append(opts, libp2p.Identity(privKey))
 		} else {
-			workerKey, _, err := crypto.GenerateEd448Key(rand.Reader)
+			// Derive a deterministic worker key from the peer key + core ID.
+			// This gives each worker a stable, unique peer ID across restarts
+			// (avoiding sybil detection) while still using the original peer
+			// key for message signing.
+			rawPriv, err := privKey.Raw()
+			if err != nil {
+				logger.Panic("error getting private key bytes", zap.Error(err))
+			}
+			shake := sha3.NewShake256()
+			shake.Write(rawPriv)
+			shake.Write([]byte(fmt.Sprintf("/worker/%d", coreId)))
+			seed := make([]byte, 64)
+			if _, err := shake.Read(seed); err != nil {
+				logger.Panic("error deriving worker key seed", zap.Error(err))
+			}
+			workerKey, _, err := crypto.GenerateEd448Key(
+				bytes.NewReader(seed),
+			)
 			if err != nil {
 				logger.Panic("error generating worker peerkey", zap.Error(err))
 			}
