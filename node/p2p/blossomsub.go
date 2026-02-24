@@ -90,18 +90,18 @@ type BlossomSub struct {
 	// with open subscriptions).
 	subscriptionsByBitmask map[string][]*blossomsub.Subscription
 	subscriptionMutex      sync.RWMutex
-	h                   host.Host
-	signKey             crypto.PrivKey
-	peerScore           map[string]*appScore
-	peerScoreMx         sync.Mutex
-	bootstrap           internal.PeerConnector
-	discovery           internal.PeerConnector
-	manualReachability  atomic.Pointer[bool]
-	p2pConfig           config.P2PConfig
-	dht                 *dht.IpfsDHT
-	routingDiscovery    *routing.RoutingDiscovery
-	coreId              uint
-	configDir           ConfigDir
+	h                      host.Host
+	signKey                crypto.PrivKey
+	peerScore              map[string]*appScore
+	peerScoreMx            sync.Mutex
+	bootstrap              internal.PeerConnector
+	discovery              internal.PeerConnector
+	manualReachability     atomic.Pointer[bool]
+	p2pConfig              config.P2PConfig
+	dht                    *dht.IpfsDHT
+	routingDiscovery       *routing.RoutingDiscovery
+	coreId                 uint
+	configDir              ConfigDir
 }
 
 var _ p2p.PubSub = (*BlossomSub)(nil)
@@ -155,10 +155,10 @@ func NewBlossomSubWithHost(
 	}
 
 	bs := &BlossomSub{
-		ctx:                 ctx,
-		cancel:              cancel,
-		logger:              logger,
-		bitmaskMap:          make(map[string]*blossomsub.Bitmask),
+		ctx:                    ctx,
+		cancel:                 cancel,
+		logger:                 logger,
+		bitmaskMap:             make(map[string]*blossomsub.Bitmask),
 		subscriptionTracker:    make(map[string][][]byte),
 		subscriptionsByBitmask: make(map[string][]*blossomsub.Subscription),
 		signKey:                privKey,
@@ -539,10 +539,10 @@ func NewBlossomSub(
 
 	ctx, cancel := context.WithCancel(ctx)
 	bs := &BlossomSub{
-		ctx:                 ctx,
-		cancel:              cancel,
-		logger:              logger,
-		bitmaskMap:          make(map[string]*blossomsub.Bitmask),
+		ctx:                    ctx,
+		cancel:                 cancel,
+		logger:                 logger,
+		bitmaskMap:             make(map[string]*blossomsub.Bitmask),
 		subscriptionTracker:    make(map[string][][]byte),
 		subscriptionsByBitmask: make(map[string][]*blossomsub.Subscription),
 		signKey:                privKey,
@@ -1388,7 +1388,7 @@ func (b *BlossomSub) runConnectivityTest(
 		if info.ID == b.h.ID() {
 			continue
 		}
-		if strings.Contains(info.Addrs[0].String(), "dnsaddr") {
+		if strings.Contains(info.Addrs[0].String(), "dns4") {
 			candidates = append(candidates, info)
 		}
 	}
@@ -1416,7 +1416,7 @@ func (b *BlossomSub) invokeConnectivityTest(
 		if err != nil {
 			host, err = addr.ValueForProtocol(ma.P_IP6)
 			if err != nil {
-				host, err = addr.ValueForProtocol(ma.P_DNSADDR)
+				host, err = addr.ValueForProtocol(ma.P_DNS4)
 				if err != nil {
 					continue
 				}
