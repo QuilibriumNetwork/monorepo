@@ -980,24 +980,16 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.Unsubscribe(e.getDispatchMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getDispatchMessageBitmask())
 
-	// Wait briefly for component workers to finish. If they don't exit in
-	// time, close pubsub to cancel subscription goroutines that may be
-	// keeping handlers alive and preventing clean shutdown.
+	// Wait for component workers to finish. The IPC server owns the pubsub
+	// lifecycle, so we don't close it here (doing so would break respawns).
 	e.logger.Info("app engine shutdown: waiting for workers")
 	select {
 	case <-e.Done():
 		e.logger.Info("app engine shutdown: all workers stopped")
-	case <-time.After(5 * time.Second):
-		e.logger.Warn("app engine shutdown: workers still running after 5s, closing pubsub")
-		e.pubsub.Close()
-		select {
-		case <-e.Done():
-			e.logger.Info("app engine shutdown: all workers stopped after pubsub close")
-		case <-time.After(25 * time.Second):
-			e.logger.Error("app engine shutdown: timed out after 30s")
-			if !force {
-				errChan <- errors.New("timeout waiting for app engine shutdown")
-			}
+	case <-time.After(30 * time.Second):
+		e.logger.Error("app engine shutdown: timed out after 30s")
+		if !force {
+			errChan <- errors.New("timeout waiting for app engine shutdown")
 		}
 	}
 

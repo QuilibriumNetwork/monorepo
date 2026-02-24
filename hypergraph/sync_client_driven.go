@@ -68,7 +68,8 @@ func isGlobalProverShardBytes(shardKeyBytes []byte) bool {
 func (hg *HypergraphCRDT) PerformSync(
 	stream protobufs.HypergraphComparisonService_PerformSyncServer,
 ) error {
-	ctx := stream.Context()
+	ctx, shutdownCancel := hg.contextWithShutdown(stream.Context())
+	defer shutdownCancel()
 
 	logger := hg.logger.With(zap.String("method", "PerformSync"))
 	sessionStart := time.Now()

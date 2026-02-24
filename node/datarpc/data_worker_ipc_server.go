@@ -146,7 +146,19 @@ func (r *DataWorkerIPCServer) Stop() error {
 
 	r.pubsub.Close()
 	if r.server != nil {
-		r.server.GracefulStop()
+		stopped := make(chan struct{})
+		srv := r.server
+		go func() {
+			srv.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			r.logger.Warn("server graceful stop timed out during shutdown, forcing")
+			srv.Stop()
+			<-stopped
+		}
 	}
 	if r.peerInfoCancel != nil {
 		r.peerInfoCancel()
@@ -180,7 +192,19 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 	}
 	if r.server != nil {
 		r.logger.Info("stopping server for respawn")
-		r.server.GracefulStop()
+		stopped := make(chan struct{})
+		srv := r.server
+		go func() {
+			srv.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			r.logger.Warn("server graceful stop timed out, forcing stop")
+			srv.Stop()
+			<-stopped
+		}
 		r.server = nil
 	}
 
