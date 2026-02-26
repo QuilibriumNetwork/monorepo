@@ -984,6 +984,8 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.UnregisterValidator(e.getFrameMessageBitmask())
 	e.pubsub.Unsubscribe(e.getGlobalFrameMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getGlobalFrameMessageBitmask())
+	e.pubsub.Unsubscribe(e.getGlobalProverMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getGlobalProverMessageBitmask())
 	e.pubsub.Unsubscribe(e.getGlobalAlertMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getGlobalAlertMessageBitmask())
 	e.pubsub.Unsubscribe(e.getGlobalPeerInfoMessageBitmask(), false)

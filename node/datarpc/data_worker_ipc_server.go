@@ -180,16 +180,13 @@ func (r *DataWorkerIPCServer) Respawn(
 
 func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 	if r.appConsensusEngine != nil {
-		// Re-respawn: gracefully shut down the process for a clean restart.
-		// The master's spawn loop (manager.go) detects the exit and
-		// immediately restarts the worker process, giving it fresh
-		// memory, a clean pubsub mesh, and a ProverRegistry built
-		// from the current on-disk hypergraph state.
-		r.logger.Info("re-respawn requested, shutting down worker for clean restart",
-			zap.Uint32("core_id", r.coreId),
-		)
-		r.Stop()
-		return nil
+		r.logger.Info("respawning worker: stopping old engine")
+		if r.cancel != nil {
+			r.cancel()
+		}
+		<-r.appConsensusEngine.Stop(false)
+		r.appConsensusEngine = nil
+		r.logger.Info("respawning worker: old engine stopped")
 	}
 	if r.server != nil {
 		r.logger.Info("stopping server for respawn")

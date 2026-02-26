@@ -462,6 +462,21 @@ func (m *snapshotManager) close() {
 	m.logger.Debug("snapshot manager closed")
 }
 
+// reopen resets the closed flag so the snapshot manager can accept new
+// snapshots after a respawn. Any previously held snapshots were already
+// released by close(), so we start with an empty generation list.
+func (m *snapshotManager) reopen() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.closed {
+		return
+	}
+	m.closed = false
+	m.generations = make([]*snapshotGeneration, 0, maxSnapshotGenerations)
+	m.logger.Debug("snapshot manager reopened")
+}
+
 func shardKeyString(sk tries.ShardKey) string {
 	buf := make([]byte, 0, len(sk.L1)+len(sk.L2))
 	buf = append(buf, sk.L1[:]...)
