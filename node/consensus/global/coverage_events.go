@@ -46,7 +46,12 @@ func (e *GlobalConsensusEngine) ensureCoverageThresholds() {
 
 // triggerCoverageCheckAsync starts a coverage check in a goroutine if one is
 // not already in progress. This prevents blocking the event processing loop.
-func (e *GlobalConsensusEngine) triggerCoverageCheckAsync(frameNumber uint64) {
+// frameProver is the address of the prover who produced the triggering frame;
+// only that prover will emit split/merge messages.
+func (e *GlobalConsensusEngine) triggerCoverageCheckAsync(
+	frameNumber uint64,
+	frameProver []byte,
+) {
 	// Skip if a coverage check is already in progress
 	if !e.coverageCheckInProgress.CompareAndSwap(false, true) {
 		e.logger.Debug(
@@ -56,17 +61,31 @@ func (e *GlobalConsensusEngine) triggerCoverageCheckAsync(frameNumber uint64) {
 		return
 	}
 
+	e.coverageWg.Add(1)
 	go func() {
+		defer e.coverageWg.Done()
 		defer e.coverageCheckInProgress.Store(false)
 
-		if err := e.checkShardCoverage(frameNumber); err != nil {
+		// Bail immediately if shutdown is already in progress to avoid
+		// blocking Stop() on hg.mu (which may be held by a sync or commit).
+		select {
+		case <-e.ShutdownSignal():
+			return
+		default:
+		}
+
+		if err := e.checkShardCoverage(frameNumber, frameProver); err != nil {
 			e.logger.Error("failed to check shard coverage", zap.Error(err))
 		}
 	}()
 }
 
-// checkShardCoverage verifies coverage levels for all active shards
-func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
+// checkShardCoverage verifies coverage levels for all active shards.
+// frameProver is the address of the prover who produced the triggering frame.
+func (e *GlobalConsensusEngine) checkShardCoverage(
+	frameNumber uint64,
+	frameProver []byte,
+) error {
 	e.ensureCoverageThresholds()
 
 	// Get shard coverage information from prover registry
@@ -218,13 +237,13 @@ func (e *GlobalConsensusEngine) checkShardCoverage(frameNumber uint64) error {
 
 		// Check for high coverage (potential split)
 		if proverCount > maxProvers {
-			e.handleHighCoverage([]byte(shardAddress), coverage, maxProvers)
+			e.handleHighCoverage([]byte(shardAddress), coverage, maxProvers, frameProver)
 		}
 	}
 
 	// Emit a single bulk merge event if there are any merge-eligible shards
 	if len(allMergeGroups) > 0 {
-		e.emitBulkMergeEvent(allMergeGroups)
+		e.emitBulkMergeEvent(allMergeGroups, frameProver)
 	}
 
 	return nil
@@ -344,6 +363,7 @@ func (e *GlobalConsensusEngine) handleHighCoverage(
 	shardAddress []byte,
 	coverage *ShardCoverage,
 	maxProvers uint64,
+	frameProver []byte,
 ) {
 	addressLen := len(shardAddress)
 
@@ -369,6 +389,7 @@ func (e *GlobalConsensusEngine) handleHighCoverage(
 				ProverCount:     coverage.ProverCount,
 				AttestedStorage: coverage.AttestedStorage,
 				ProposedShards:  proposedShards,
+				FrameProver:     frameProver,
 			})
 		} else {
 			// Case 3.a.ii: No space to split, do nothing

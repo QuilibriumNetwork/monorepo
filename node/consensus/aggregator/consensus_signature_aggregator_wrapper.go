@@ -86,7 +86,11 @@ func (c *ConsensusSignatureAggregatorWrapper) Aggregate(
 	}
 
 	// TODO: remove direct reference
-	if len(c.filter) != 0 {
+	// Only append extra bytes when extProofs were actually present (adj > 0).
+	// Timeout votes produce 74-byte signatures with no extProof, so appending
+	// 516*(n-1) zero bytes would bloat the TC aggregate signature beyond the
+	// deserialization limit (711 bytes) in TimeoutCertificate.FromCanonicalBytes.
+	if len(c.filter) != 0 && adj > 0 {
 		output.(*bls48581.BlsAggregateOutput).AggregateSignature =
 			append(output.(*bls48581.BlsAggregateOutput).AggregateSignature, extra...)
 	}

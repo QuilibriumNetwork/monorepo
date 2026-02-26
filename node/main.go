@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	npprof "net/http/pprof"
 	"os"
@@ -45,6 +46,12 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	qruntime "source.quilibrium.com/quilibrium/monorepo/utils/runtime"
 )
+
+func init() {
+	// Use the pure-Go DNS resolver to avoid SIGFPE crashes in cgo-based
+	// system resolvers (observed on some glibc/musl configurations).
+	net.DefaultResolver = &net.Resolver{PreferGo: true}
+}
 
 var (
 	configDirectory = flag.String(
@@ -631,6 +638,9 @@ func main() {
 	errCh := masterNode.Start(ctx)
 	defer masterNode.Stop()
 
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
+
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		srv, err := rpc.NewRPCServer(
 			nodeConfig,
@@ -662,6 +672,9 @@ func main() {
 	monitor.Start(ctx)
 
 	select {
+	case <-done:
+		logger.Info("received shutdown signal")
+		quit()
 	case <-diskFullCh:
 		quit()
 	case err := <-errCh:

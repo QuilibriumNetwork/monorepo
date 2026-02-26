@@ -2698,7 +2698,7 @@ func (tx *MintTransaction) Verify(frameNumber uint64) (bool, error) {
 		len(tx.Inputs) > 100 || len(tx.Outputs) > 100 {
 		return false, errors.Wrap(
 			errors.New("invalid quantity of inputs, outputs, or proofs"),
-			"verify",
+			"verify: invalid mint transaction",
 		)
 	}
 
@@ -2706,20 +2706,20 @@ func (tx *MintTransaction) Verify(frameNumber uint64) (bool, error) {
 		if fee == nil ||
 			new(big.Int).Lsh(big.NewInt(1), uint(128)).Cmp(fee) < 0 ||
 			new(big.Int).Cmp(fee) > 0 {
-			return false, errors.Wrap(errors.New("invalid fees"), "verify")
+			return false, errors.Wrap(errors.New("invalid fees"), "verify: invalid mint transaction")
 		}
 	}
 
 	if tx.config.Behavior&Divisible == 0 && len(tx.Inputs) != len(tx.Outputs) {
 		return false, errors.Wrap(
 			errors.New("non-divisible token has mismatching inputs and outputs"),
-			"verify",
+			"verify: invalid mint transaction",
 		)
 	}
 
 	challenge, err := tx.GetChallenge()
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid mint transaction")
 	}
 
 	inputs := [][]byte{}
@@ -2731,13 +2731,13 @@ func (tx *MintTransaction) Verify(frameNumber uint64) (bool, error) {
 			challenge,
 			tx,
 		); !valid {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid mint transaction")
 		}
 
 		if _, ok := check[string(input.Signature[(56*4):(56*5)])]; ok {
 			return false, errors.Wrap(
 				errors.New("attempted double-spend"),
-				"verify",
+				"verify: invalid mint transaction",
 			)
 		}
 		check[string(input.Signature[(56*4):(56*5)])] = struct{}{}
@@ -2748,12 +2748,12 @@ func (tx *MintTransaction) Verify(frameNumber uint64) (bool, error) {
 	commitments := [][]byte{}
 	for i, o := range tx.Outputs {
 		if valid, err := o.Verify(frameNumber, i, tx); !valid {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid mint transaction")
 		}
 
 		spendCheckBI, err := poseidon.HashBytes(o.RecipientOutput.VerificationKey)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid mint transaction")
 		}
 
 		_, err = tx.hypergraph.GetVertex([64]byte(
@@ -2762,7 +2762,7 @@ func (tx *MintTransaction) Verify(frameNumber uint64) (bool, error) {
 		if err == nil {
 			return false, errors.Wrap(
 				errors.New("invalid verification key"),
-				"verify",
+				"verify: invalid mint transaction",
 			)
 		}
 
@@ -2771,7 +2771,7 @@ func (tx *MintTransaction) Verify(frameNumber uint64) (bool, error) {
 	}
 
 	if !tx.bulletproofProver.VerifyRangeProof(tx.RangeProof, commitment, 128) {
-		return false, errors.Wrap(errors.New("invalid range proof"), "verify")
+		return false, errors.Wrap(errors.New("invalid range proof"), "verify: invalid mint transaction")
 	}
 
 	// There are no fees in the sumcheck, either because QUIL token native mint
@@ -2783,7 +2783,7 @@ func (tx *MintTransaction) Verify(frameNumber uint64) (bool, error) {
 		commitments,
 		[]*big.Int{},
 	) {
-		return false, errors.Wrap(errors.New("invalid sum check"), "verify")
+		return false, errors.Wrap(errors.New("invalid sum check"), "verify: invalid mint transaction")
 	}
 
 	return true, nil

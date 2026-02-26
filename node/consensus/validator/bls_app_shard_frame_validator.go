@@ -38,31 +38,26 @@ func (b *BLSAppFrameValidator) Validate(
 	frame *protobufs.AppShardFrame,
 ) (bool, error) {
 	if frame == nil || frame.Header == nil {
-		b.logger.Debug("frame or header is nil")
-		return false, nil
+		return false, errors.New("frame or header is nil")
 	}
 
 	if len(frame.Header.Address) == 0 {
-		b.logger.Debug("address is empty")
-		return false, nil
+		return false, errors.New("address is empty")
 	}
 
 	if frame.Header.StateRoots == nil || len(frame.Header.StateRoots) != 4 {
-		b.logger.Debug(
-			"invalid state roots",
-			zap.Int("roots_len", len(frame.Header.StateRoots)),
+		return false, errors.Errorf(
+			"invalid state roots count: %d",
+			len(frame.Header.StateRoots),
 		)
-		return false, nil
 	}
 
 	for i, stateRoot := range frame.Header.StateRoots {
 		if len(stateRoot) != 74 && len(stateRoot) != 64 {
-			b.logger.Debug(
-				"invalid state root",
-				zap.Int("root_index", i),
-				zap.Int("root_len", len(stateRoot)),
+			return false, errors.Errorf(
+				"invalid state root length at index %d: %d",
+				i, len(stateRoot),
 			)
-			return false, nil
 		}
 	}
 
@@ -75,8 +70,7 @@ func (b *BLSAppFrameValidator) Validate(
 
 	if !isValid {
 		b.logger.Debug(
-			"frame verification result",
-			zap.Bool("is_valid", isValid),
+			"frame verification failed",
 			zap.Error(err),
 			zap.Uint64("frame_number", frame.Header.FrameNumber),
 			zap.String("address", hex.EncodeToString(frame.Header.Address)),
@@ -85,7 +79,7 @@ func (b *BLSAppFrameValidator) Validate(
 				hex.EncodeToString(frame.Header.ParentSelector),
 			),
 		)
-		return false, nil
+		return false, errors.Wrap(err, "frame header verification")
 	}
 
 	if frame.Header.PublicKeySignatureBls48581 != nil {

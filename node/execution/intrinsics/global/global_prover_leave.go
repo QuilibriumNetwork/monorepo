@@ -363,7 +363,7 @@ func (p *ProverLeave) Verify(frameNumber uint64) (bool, error) {
 	)
 	leaveDomain, err := poseidon.HashBytes(leaveDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover leave")
 	}
 
 	_, err = p.hypergraph.GetVertex([64]byte(slices.Concat(
@@ -371,7 +371,7 @@ func (p *ProverLeave) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover leave")
 	}
 
 	tree, err := p.hypergraph.GetVertexData([64]byte(slices.Concat(
@@ -379,7 +379,7 @@ func (p *ProverLeave) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover leave")
 	}
 
 	pubkey, err := p.rdfMultiprover.Get(
@@ -389,7 +389,7 @@ func (p *ProverLeave) Verify(frameNumber uint64) (bool, error) {
 		tree,
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover leave")
 	}
 
 	// Check that at least one allocation exists and is active
@@ -431,7 +431,7 @@ func (p *ProverLeave) Verify(frameNumber uint64) (bool, error) {
 	if !hasActiveAllocation {
 		return false, errors.Wrap(
 			errors.New("no active allocations found for specified filters"),
-			"verify",
+			"verify: invalid prover leave",
 		)
 	}
 
@@ -444,7 +444,7 @@ func (p *ProverLeave) Verify(frameNumber uint64) (bool, error) {
 		leaveDomain.Bytes(),
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid prover leave")
 	}
 
 	return true, nil

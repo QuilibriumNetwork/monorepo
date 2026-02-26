@@ -393,7 +393,7 @@ func (p *ProverKick) Verify(frameNumber uint64) (bool, error) {
 	if !p.verifyEquivocation(p.KickedProverPublicKey) {
 		return false, errors.Wrap(
 			errors.New("no equivocation detected"),
-			"verify",
+			"verify: invalid prover kick",
 		)
 	}
 
@@ -407,13 +407,13 @@ func (p *ProverKick) Verify(frameNumber uint64) (bool, error) {
 			return false, errors.Wrap(errors.Wrap(
 				err,
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
-			), "verify")
+			), "verify: invalid prover kick")
 		}
 		if !frames.First() || !frames.Valid() {
 			return false, errors.Wrap(errors.Wrap(
 				errors.New("not found"),
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
-			), "verify")
+			), "verify: invalid prover kick")
 		}
 		frame, err = frames.Value()
 		frames.Close()
@@ -421,7 +421,7 @@ func (p *ProverKick) Verify(frameNumber uint64) (bool, error) {
 			return false, errors.Wrap(errors.Wrap(
 				err,
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
-			), "verify")
+			), "verify: invalid prover kick")
 		}
 	}
 
@@ -433,17 +433,17 @@ func (p *ProverKick) Verify(frameNumber uint64) (bool, error) {
 		p.TraversalProof,
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover kick")
 	}
 
 	if !validTraversal || len(p.Proof) == 0 {
-		return false, errors.Wrap(errors.New("invalid multiproof"), "verify")
+		return false, errors.Wrap(errors.New("invalid multiproof"), "verify: invalid prover kick")
 	}
 
 	// Parse the multiproof
 	multiproof := p.hypergraph.GetProver().NewMultiproof()
 	if err := multiproof.FromBytes(p.Proof); err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover kick")
 	}
 
 	// Verify the proof against the tree
@@ -459,10 +459,10 @@ func (p *ProverKick) Verify(frameNumber uint64) (bool, error) {
 		nil, // No type index needed for global intrinsic
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover kick")
 	}
 	if !valid {
-		return false, errors.Wrap(errors.New("invalid multiproof"), "verify")
+		return false, errors.Wrap(errors.New("invalid multiproof"), "verify: invalid prover kick")
 	}
 
 	return true, nil

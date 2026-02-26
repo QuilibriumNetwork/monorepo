@@ -179,14 +179,14 @@ func (h *VertexAdd) GetWriteAddresses(
 func (h *VertexAdd) Verify(frameNumber uint64) (bool, error) {
 	// Check if data is valid and can be committed
 	if len(h.Data) == 0 {
-		return false, errors.Wrap(errors.New("missing data for vertex"), "verify")
+		return false, errors.Wrap(errors.New("missing data for vertex"), "verify: invalid vertex add")
 	}
 
 	for _, d := range h.Data {
 		if !d.Verify() {
 			return false, errors.Wrap(
 				errors.New("invalid proof for data"),
-				"verify",
+				"verify: invalid vertex add",
 			)
 		}
 	}
@@ -202,7 +202,7 @@ func (h *VertexAdd) Verify(frameNumber uint64) (bool, error) {
 	}
 
 	if diskSize > 1024*1024*5 {
-		return false, errors.Wrap(errors.New("data too large"), "verify")
+		return false, errors.Wrap(errors.New("data too large"), "verify: invalid vertex add")
 	}
 
 	valid, err := h.keyManager.ValidateSignature(
@@ -213,11 +213,11 @@ func (h *VertexAdd) Verify(frameNumber uint64) (bool, error) {
 		slices.Concat(h.Domain[:], []byte("VERTEX_ADD")),
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid vertex add")
 	}
 
 	if !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid vertex add")
 	}
 
 	return true, nil

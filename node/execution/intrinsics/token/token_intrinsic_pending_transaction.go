@@ -1566,7 +1566,7 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 		len(tx.Inputs) != len(tx.TraversalProof.SubProofs) {
 		return false, errors.Wrap(
 			errors.New("invalid quantity of inputs, outputs, or proofs"),
-			"verify",
+			"verify: invalid pending transaction",
 		)
 	}
 
@@ -1574,20 +1574,20 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 		if fee == nil ||
 			new(big.Int).Lsh(big.NewInt(1), uint(128)).Cmp(fee) < 0 ||
 			new(big.Int).Cmp(fee) > 0 {
-			return false, errors.Wrap(errors.New("invalid fees"), "verify")
+			return false, errors.Wrap(errors.New("invalid fees"), "verify: invalid pending transaction")
 		}
 	}
 
 	if tx.config.Behavior&Divisible == 0 && len(tx.Inputs) != len(tx.Outputs) {
 		return false, errors.Wrap(
 			errors.New("non-divisible token has mismatching inputs and outputs"),
-			"verify",
+			"verify: invalid pending transaction",
 		)
 	}
 
 	challenge, err := tx.GetChallenge()
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid pending transaction")
 	}
 
 	inputs := [][]byte{}
@@ -1601,7 +1601,7 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 			tx.TraversalProof,
 			i,
 		); !valid {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid pending transaction")
 		}
 
 		if bytes.Equal(tx.Domain[:], QUIL_TOKEN_ADDRESS) &&
@@ -1609,7 +1609,7 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 			if _, ok := check[string(input.Signature[:32])]; ok {
 				return false, errors.Wrap(
 					errors.New("attempted double-spend"),
-					"verify",
+					"verify: invalid pending transaction",
 				)
 			}
 			check[string(input.Signature[:32])] = struct{}{}
@@ -1618,7 +1618,7 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 			if _, ok := check[string(input.Signature[(56*4):(56*5)])]; ok {
 				return false, errors.Wrap(
 					errors.New("attempted double-spend"),
-					"verify",
+					"verify: invalid pending transaction",
 				)
 			}
 			check[string(input.Signature[(56*4):(56*5)])] = struct{}{}
@@ -1630,12 +1630,12 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 	commitments := [][]byte{}
 	for i, o := range tx.Outputs {
 		if valid, err := o.Verify(frameNumber, tx.config); !valid {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid pending transaction")
 		}
 
 		spendCheckBI, err := poseidon.HashBytes(o.RefundOutput.VerificationKey)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid pending transaction")
 		}
 
 		_, err = tx.hypergraph.GetVertex([64]byte(
@@ -1644,13 +1644,13 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 		if err == nil {
 			return false, errors.Wrap(
 				errors.New("invalid refund verification key"),
-				"verify",
+				"verify: invalid pending transaction",
 			)
 		}
 
 		spendCheckBI, err = poseidon.HashBytes(o.ToOutput.VerificationKey)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid pending transaction")
 		}
 
 		_, err = tx.hypergraph.GetVertex([64]byte(
@@ -1659,7 +1659,7 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 		if err == nil {
 			return false, errors.Wrap(
 				errors.New("invalid to verification key"),
-				"verify",
+				"verify: invalid pending transaction",
 			)
 		}
 
@@ -1672,7 +1672,7 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 		tx.Domain[:],
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid pending transaction")
 	}
 
 	valid, err := tx.hypergraph.VerifyTraversalProof(
@@ -1685,11 +1685,11 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 	if err != nil || !valid {
 		return false, errors.Wrap(errors.New(
 			fmt.Sprintf("invalid traversal proof: %v", err),
-		), "verify")
+		), "verify: invalid pending transaction")
 	}
 
 	if !tx.bulletproofProver.VerifyRangeProof(tx.RangeProof, commitment, 128) {
-		return false, errors.Wrap(errors.New("invalid range proof"), "verify")
+		return false, errors.Wrap(errors.New("invalid range proof"), "verify: invalid pending transaction")
 	}
 
 	sumcheckFees := []*big.Int{}
@@ -1703,7 +1703,7 @@ func (tx *PendingTransaction) Verify(frameNumber uint64) (bool, error) {
 		commitments,
 		sumcheckFees,
 	) {
-		return false, errors.Wrap(errors.New("invalid sum check"), "verify")
+		return false, errors.Wrap(errors.New("invalid sum check"), "verify: invalid pending transaction")
 	}
 
 	return true, nil

@@ -116,6 +116,7 @@ func (s *ShardMergeEventData) ControlEventData() {}
 // BulkShardMergeEventData contains all merge-eligible shard groups in a single event
 type BulkShardMergeEventData struct {
 	MergeGroups []ShardMergeEventData
+	FrameProver []byte
 }
 
 func (b *BulkShardMergeEventData) ControlEventData() {}
@@ -126,6 +127,7 @@ type ShardSplitEventData struct {
 	ProverCount     int
 	AttestedStorage uint64
 	ProposedShards  [][]byte
+	FrameProver     []byte
 }
 
 func (s *ShardSplitEventData) ControlEventData() {}

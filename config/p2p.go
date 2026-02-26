@@ -18,6 +18,7 @@ const (
 	defaultPingTimeout              = 5 * time.Second
 	defaultPingPeriod               = 30 * time.Second
 	defaultPingAttempts             = 3
+	defaultPeerReconnectInterval    = 60 * time.Second
 	defaultStreamListenMultiaddr    = "/ip4/0.0.0.0/tcp/8340"
 )
 
@@ -76,6 +77,7 @@ type P2PConfig struct {
 	ValidateWorkers               int           `yaml:"validateWorkers"`
 	SubscriptionQueueSize         int           `yaml:"subscriptionQueueSize"`
 	PeerOutboundQueueSize         int           `yaml:"peerOutboundQueueSize"`
+	PeerReconnectCheckInterval    time.Duration `yaml:"peerReconnectCheckInterval"`
 }
 
 // WithDefaults returns a copy of the P2PConfig with any missing fields set to
@@ -219,6 +221,9 @@ func (c P2PConfig) WithDefaults() P2PConfig {
 	}
 	if cpy.PeerOutboundQueueSize == 0 {
 		cpy.PeerOutboundQueueSize = blossomsub.DefaultPeerOutboundQueueSize
+	}
+	if cpy.PeerReconnectCheckInterval == 0 {
+		cpy.PeerReconnectCheckInterval = defaultPeerReconnectInterval
 	}
 	return cpy
 }

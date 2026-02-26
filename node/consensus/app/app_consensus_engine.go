@@ -740,11 +740,18 @@ func NewAppConsensusEngine(
 		appSyncHooks,
 	)
 
-	// Add sync provider
-	componentBuilder.AddWorker(engine.syncProvider.Start)
+	// namedWorker wraps a worker function with shutdown logging so we can
+	// identify which worker(s) hang during shutdown.
+	namedWorker := func(name string, fn func(lifecycle.SignalerContext, lifecycle.ReadyFunc)) lifecycle.ComponentWorker {
+		return func(ctx lifecycle.SignalerContext, ready lifecycle.ReadyFunc) {
+			engine.logger.Debug("worker starting", zap.String("worker", name))
+			defer engine.logger.Debug("worker stopped", zap.String("worker", name))
+			fn(ctx, ready)
+		}
+	}
 
 	// Add consensus
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("consensus", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
@@ -802,17 +809,120 @@ func NewAppConsensusEngine(
 
 		<-ctx.Done()
 		<-lifecycle.AllDone(engine.voteAggregator, engine.timeoutAggregator)
-	})
+	}))
 
 	// Start app shard proposal queue processor
-	componentBuilder.AddWorker(func(
+	componentBuilder.AddWorker(namedWorker("proposalQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
 	) {
 		ready()
 		engine.processAppShardProposalQueue(ctx)
-	})
+	}))
 
+	// NOTE: subscribe calls are deferred until after ComponentManager is built
+	// (see below). The handler closures reference e.ShutdownSignal() which
+	// panics if ComponentManager is nil. Since Subscribe spawns goroutines
+	// immediately, a message arriving before Build() would hit a nil receiver.
+
+	// Add sync provider
+	componentBuilder.AddWorker(namedWorker("syncProvider", engine.syncProvider.Start))
+
+	// Start message queue processors
+	componentBuilder.AddWorker(namedWorker("consensusMsgQueue", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processConsensusMessageQueue(ctx)
+	}))
+
+	componentBuilder.AddWorker(namedWorker("proverMsgQueue", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processProverMessageQueue(ctx)
+	}))
+
+	componentBuilder.AddWorker(namedWorker("frameMsgQueue", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processFrameMessageQueue(ctx)
+	}))
+
+	componentBuilder.AddWorker(namedWorker("globalFrameMsgQueue", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processGlobalFrameMessageQueue(ctx)
+	}))
+
+	componentBuilder.AddWorker(namedWorker("alertMsgQueue", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processAlertMessageQueue(ctx)
+	}))
+
+	componentBuilder.AddWorker(namedWorker("peerInfoMsgQueue", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processPeerInfoMessageQueue(ctx)
+	}))
+
+	componentBuilder.AddWorker(namedWorker("dispatchMsgQueue", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.processDispatchMessageQueue(ctx)
+	}))
+
+	// Start event distributor event loop
+	componentBuilder.AddWorker(namedWorker("eventDistributor", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.eventDistributorLoop(ctx)
+	}))
+
+	// Start metrics update goroutine
+	componentBuilder.AddWorker(namedWorker("metricsLoop", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.updateMetricsLoop(ctx)
+	}))
+
+	engine.ComponentManager = componentBuilder.Build()
+	if hgWithShutdown, ok := engine.hyperSync.(interface {
+		SetShutdownContext(context.Context)
+	}); ok {
+		hgWithShutdown.SetShutdownContext(
+			contextFromShutdownSignal(engine.ShutdownSignal()),
+		)
+	}
+
+	// Set self peer ID on hypergraph to allow unlimited self-sync sessions
+	if hgWithSelfPeer, ok := engine.hyperSync.(interface {
+		SetSelfPeerID(string)
+	}); ok {
+		hgWithSelfPeer.SetSelfPeerID(peer.ID(ps.GetPeerID()).String())
+	}
+
+	// Subscribe to pubsub bitmasks. These calls spawn handler goroutines
+	// immediately, and the handlers reference e.ShutdownSignal() which
+	// requires ComponentManager to be non-nil. That's why subscriptions
+	// must happen after componentBuilder.Build() above.
 	err = engine.subscribeToConsensusMessages()
 	if err != nil {
 		return nil, err
@@ -853,104 +963,11 @@ func NewAppConsensusEngine(
 		return nil, err
 	}
 
-	// Add sync provider
-	componentBuilder.AddWorker(engine.syncProvider.Start)
-
-	// Start message queue processors
-	componentBuilder.AddWorker(func(
-		ctx lifecycle.SignalerContext,
-		ready lifecycle.ReadyFunc,
-	) {
-		ready()
-		engine.processConsensusMessageQueue(ctx)
-	})
-
-	componentBuilder.AddWorker(func(
-		ctx lifecycle.SignalerContext,
-		ready lifecycle.ReadyFunc,
-	) {
-		ready()
-		engine.processProverMessageQueue(ctx)
-	})
-
-	componentBuilder.AddWorker(func(
-		ctx lifecycle.SignalerContext,
-		ready lifecycle.ReadyFunc,
-	) {
-		ready()
-		engine.processFrameMessageQueue(ctx)
-	})
-
-	componentBuilder.AddWorker(func(
-		ctx lifecycle.SignalerContext,
-		ready lifecycle.ReadyFunc,
-	) {
-		ready()
-		engine.processGlobalFrameMessageQueue(ctx)
-	})
-
-	componentBuilder.AddWorker(func(
-		ctx lifecycle.SignalerContext,
-		ready lifecycle.ReadyFunc,
-	) {
-		ready()
-		engine.processAlertMessageQueue(ctx)
-	})
-
-	componentBuilder.AddWorker(func(
-		ctx lifecycle.SignalerContext,
-		ready lifecycle.ReadyFunc,
-	) {
-		ready()
-		engine.processPeerInfoMessageQueue(ctx)
-	})
-
-	componentBuilder.AddWorker(func(
-		ctx lifecycle.SignalerContext,
-		ready lifecycle.ReadyFunc,
-	) {
-		ready()
-		engine.processDispatchMessageQueue(ctx)
-	})
-
-	// Start event distributor event loop
-	componentBuilder.AddWorker(func(
-		ctx lifecycle.SignalerContext,
-		ready lifecycle.ReadyFunc,
-	) {
-		ready()
-		engine.eventDistributorLoop(ctx)
-	})
-
-	// Start metrics update goroutine
-	componentBuilder.AddWorker(func(
-		ctx lifecycle.SignalerContext,
-		ready lifecycle.ReadyFunc,
-	) {
-		ready()
-		engine.updateMetricsLoop(ctx)
-	})
-
-	engine.ComponentManager = componentBuilder.Build()
-	if hgWithShutdown, ok := engine.hyperSync.(interface {
-		SetShutdownContext(context.Context)
-	}); ok {
-		hgWithShutdown.SetShutdownContext(
-			contextFromShutdownSignal(engine.ShutdownSignal()),
-		)
-	}
-
-	// Set self peer ID on hypergraph to allow unlimited self-sync sessions
-	if hgWithSelfPeer, ok := engine.hyperSync.(interface {
-		SetSelfPeerID(string)
-	}); ok {
-		hgWithSelfPeer.SetSelfPeerID(peer.ID(ps.GetPeerID()).String())
-	}
-
 	return engine, nil
 }
 
 func (e *AppConsensusEngine) Stop(force bool) <-chan error {
+	e.logger.Info("app engine stopping", zap.Bool("force", force))
 	errChan := make(chan error, 1)
 
 	// First, cancel context to signal all goroutines to stop
@@ -967,12 +984,27 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.UnregisterValidator(e.getFrameMessageBitmask())
 	e.pubsub.Unsubscribe(e.getGlobalFrameMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getGlobalFrameMessageBitmask())
+	e.pubsub.Unsubscribe(e.getGlobalProverMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getGlobalProverMessageBitmask())
 	e.pubsub.Unsubscribe(e.getGlobalAlertMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getGlobalAlertMessageBitmask())
 	e.pubsub.Unsubscribe(e.getGlobalPeerInfoMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getGlobalPeerInfoMessageBitmask())
 	e.pubsub.Unsubscribe(e.getDispatchMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getDispatchMessageBitmask())
+
+	// Wait for component workers to finish. The IPC server owns the pubsub
+	// lifecycle, so we don't close it here (doing so would break respawns).
+	e.logger.Info("app engine shutdown: waiting for workers")
+	select {
+	case <-e.Done():
+		e.logger.Info("app engine shutdown: all workers stopped")
+	case <-time.After(30 * time.Second):
+		e.logger.Error("app engine shutdown: timed out after 30s")
+		if !force {
+			errChan <- errors.New("timeout waiting for app engine shutdown")
+		}
+	}
 
 	close(errChan)
 	return errChan
@@ -988,6 +1020,22 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 	frameNumber := frame.Header.FrameNumber
 	expectedProverRoot := frame.Header.ProverTreeCommitment
 
+	if len(expectedProverRoot) == 0 {
+		return
+	}
+
+	// Match the GlobalConsensusEngine's ordering: commit the tree first as a
+	// standalone step, then extract and verify the prover root. The global
+	// engine calls Commit(N) at the start of materialize(N) before checking
+	// the root. We mirror this by committing first, then extracting.
+	if _, err := e.hypergraph.Commit(frameNumber); err != nil {
+		e.logger.Warn(
+			"failed to commit hypergraph for global prover root check",
+			zap.Uint64("frame_number", frameNumber),
+			zap.Error(err),
+		)
+	}
+
 	localRoot, err := e.computeLocalGlobalProverRoot(frameNumber)
 	if err != nil {
 		e.logger.Warn(
@@ -997,12 +1045,11 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		// Use blocking hypersync to ensure we're synced before continuing
 		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
 		return
 	}
 
-	if len(localRoot) == 0 || len(expectedProverRoot) == 0 {
+	if len(localRoot) == 0 {
 		return
 	}
 
@@ -1015,8 +1062,35 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		// Use blocking hypersync to ensure we're synced before continuing
 		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+
+		// Re-compute local root after sync to verify convergence, matching
+		// the global engine's post-sync verification pattern.
+		newLocalRoot, newRootErr := e.computeLocalGlobalProverRoot(frameNumber)
+		if newRootErr != nil {
+			e.logger.Warn(
+				"failed to compute local global prover root after sync",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Error(newRootErr),
+			)
+		} else if bytes.Equal(newLocalRoot, expectedProverRoot) {
+			e.logger.Info(
+				"global prover root converged after sync",
+				zap.Uint64("frame_number", frameNumber),
+			)
+			e.globalProverRootSynced.Store(true)
+			e.globalProverRootVerifiedFrame.Store(frameNumber)
+			if err := e.proverRegistry.Refresh(); err != nil {
+				e.logger.Warn("failed to refresh prover registry", zap.Error(err))
+			}
+		} else {
+			e.logger.Warn(
+				"global prover root still mismatched after sync",
+				zap.Uint64("frame_number", frameNumber),
+				zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
+				zap.String("post_sync_root", hex.EncodeToString(newLocalRoot)),
+			)
+		}
 		return
 	}
 
@@ -1082,6 +1156,16 @@ func (e *AppConsensusEngine) triggerGlobalHypersync(proposer []byte, expectedRoo
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
+		// Cancel sync when the engine shuts down so this goroutine doesn't
+		// outlive the engine and hold resources (locks, connections).
+		go func() {
+			select {
+			case <-e.ShutdownSignal():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
 		shardKey := tries.ShardKey{
 			L1: [3]byte{0x00, 0x00, 0x00},
 			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
@@ -1112,15 +1196,22 @@ func (e *AppConsensusEngine) performBlockingGlobalHypersync(proposer []byte, exp
 
 	// Wait for any existing sync to complete first
 	for e.globalProverSyncInProgress.Load() {
-		e.logger.Debug("blocking hypersync: waiting for existing sync to complete")
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-e.ShutdownSignal():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 
 	// Mark sync as in progress
 	if !e.globalProverSyncInProgress.CompareAndSwap(false, true) {
 		// Another sync started, wait for it
 		for e.globalProverSyncInProgress.Load() {
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-e.ShutdownSignal():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
 		return
 	}
@@ -1162,8 +1253,11 @@ func (e *AppConsensusEngine) performBlockingGlobalHypersync(proposer []byte, exp
 		)
 	}
 
-	e.globalProverRootSynced.Store(true)
-	e.logger.Info("blocking global hypersync completed")
+	// Don't unconditionally set synced=true. Commit(N-1) is cached with the
+	// pre-sync root, so we can't re-verify here. The next frame's deferred
+	// check will call Commit(N) fresh and verify convergence — matching the
+	// global engine's pattern where convergence happens on the next materialize.
+	e.logger.Info("blocking global hypersync completed, convergence will be verified on next frame")
 }
 
 func (e *AppConsensusEngine) GetFrame() *protobufs.AppShardFrame {
@@ -1915,7 +2009,10 @@ func (e *AppConsensusEngine) awaitFirstGlobalFrame(
 func (e *AppConsensusEngine) waitForProverRegistration(
 	ctx lifecycle.SignalerContext,
 ) error {
-	logger := e.logger.With(zap.String("shard_address", e.appAddressHex))
+	logger := e.logger.With(
+		zap.String("shard_address", e.appAddressHex),
+		zap.String("prover_address", hex.EncodeToString(e.proverAddress)),
+	)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -1936,7 +2033,16 @@ func (e *AppConsensusEngine) waitForProverRegistration(
 					return nil
 				}
 			}
-			logger.Info("waiting for prover registration")
+			proverAddrs := make([]string, 0, len(provers))
+			for _, p := range provers {
+				proverAddrs = append(proverAddrs, hex.EncodeToString(p.Address))
+			}
+			logger.Info(
+				"waiting for prover registration",
+				zap.Int("active_provers_for_filter", len(provers)),
+				zap.String("filter", hex.EncodeToString(e.appAddress)),
+				zap.Strings("registry_addresses", proverAddrs),
+			)
 		}
 
 		select {
@@ -2313,6 +2419,8 @@ func (e *AppConsensusEngine) startConsensus(
 	e.timeoutAggregator.Start(ctx)
 	<-lifecycle.AllReady(e.voteAggregator, e.timeoutAggregator)
 	e.consensusParticipant.Start(ctx)
+	e.logger.Info("consensus started successfully",
+		zap.String("shard_address", e.appAddressHex))
 	return nil
 }
 
@@ -2767,6 +2875,9 @@ func (e *AppConsensusEngine) OnQuorumCertificateTriggeredRankChange(
 
 // OnRankChange implements consensus.Consumer.
 func (e *AppConsensusEngine) OnRankChange(oldRank uint64, newRank uint64) {
+	if e.currentRank == newRank {
+		return
+	}
 	e.currentRank = newRank
 	err := e.ensureGlobalClient()
 	if err != nil {

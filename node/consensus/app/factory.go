@@ -112,6 +112,15 @@ func NewAppConsensusEngineFactory(
 	}
 }
 
+// CloseSnapshots synchronously closes the hypergraph snapshot manager. Call
+// this before closing the underlying database to ensure no Pebble snapshots
+// remain open.
+func (f *AppConsensusEngineFactory) CloseSnapshots() {
+	if closer, ok := f.hypergraph.(interface{ CloseSnapshots() }); ok {
+		closer.CloseSnapshots()
+	}
+}
+
 // CreateAppConsensusEngine creates a new AppConsensusEngine
 func (f *AppConsensusEngineFactory) CreateAppConsensusEngine(
 	appAddress []byte,

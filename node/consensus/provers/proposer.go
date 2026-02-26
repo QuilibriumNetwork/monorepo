@@ -234,15 +234,6 @@ func (m *Manager) PlanAndAllocate(
 		})
 	}
 
-	workerLookup := make(map[uint]*store.WorkerInfo, len(all))
-	for _, w := range all {
-		workerLookup[w.CoreId] = w
-	}
-
-	if len(proposals) > 0 {
-		m.persistPlannedFilters(proposals, workerLookup, frameNumber)
-	}
-
 	// Perform allocations
 	workerIds := []uint{}
 	filters := [][]byte{}
@@ -258,9 +249,19 @@ func (m *Manager) PlanAndAllocate(
 		m.logger.Warn("allocate worker failed",
 			zap.Error(err),
 		)
+		return proposals, errors.Wrap(err, "plan and allocate")
 	}
 
-	return proposals, errors.Wrap(err, "plan and allocate")
+	// Persist filters only after successful publication — if the join
+	// fails to publish, we don't want workers stuck with filters that
+	// block them for proposalTimeoutFrames.
+	workerLookup := make(map[uint]*store.WorkerInfo, len(all))
+	for _, w := range all {
+		workerLookup[w.CoreId] = w
+	}
+	m.persistPlannedFilters(proposals, workerLookup, frameNumber)
+
+	return proposals, nil
 }
 
 func (m *Manager) persistPlannedFilters(
@@ -297,6 +298,20 @@ func (m *Manager) persistPlannedFilters(
 		if err := m.workerMgr.RegisterWorker(info); err != nil {
 			m.logger.Warn(
 				"failed to persist worker filter",
+				zap.Uint("core_id", info.CoreId),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		m.logger.Info(
+			"reassigning worker to new filter",
+			zap.Uint("core_id", info.CoreId),
+			zap.String("filter", hex.EncodeToString(filterCopy)),
+		)
+		if err := m.workerMgr.RespawnWorker(info.CoreId, filterCopy); err != nil {
+			m.logger.Warn(
+				"failed to respawn worker with new filter",
 				zap.Uint("core_id", info.CoreId),
 				zap.Error(err),
 			)

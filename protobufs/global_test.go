@@ -664,6 +664,284 @@ func TestProverKick_Serialization(t *testing.T) {
 	}
 }
 
+func TestShardSplit_Serialization(t *testing.T) {
+	tests := []struct {
+		name  string
+		split *ShardSplit
+	}{
+		{
+			name: "complete shard split",
+			split: &ShardSplit{
+				ShardAddress:   make([]byte, 33),
+				ProposedShards: [][]byte{make([]byte, 34), make([]byte, 34)},
+				FrameNumber:    12345,
+				PublicKeySignatureBls48581: &BLS48581AddressedSignature{
+					Signature: make([]byte, 74),
+					Address:   make([]byte, 32),
+				},
+			},
+		},
+		{
+			name: "split with max proposed shards",
+			split: &ShardSplit{
+				ShardAddress: append([]byte{0xFF}, make([]byte, 32)...),
+				ProposedShards: [][]byte{
+					make([]byte, 34), make([]byte, 34),
+					make([]byte, 34), make([]byte, 34),
+					make([]byte, 34), make([]byte, 34),
+					make([]byte, 34), make([]byte, 34),
+				},
+				FrameNumber: 99999,
+				PublicKeySignatureBls48581: &BLS48581AddressedSignature{
+					Signature: append([]byte{0xAA}, make([]byte, 73)...),
+					Address:   append([]byte{0xCC}, make([]byte, 31)...),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := tt.split.ToCanonicalBytes()
+			require.NoError(t, err)
+			require.NotNil(t, data)
+
+			split2 := &ShardSplit{}
+			err = split2.FromCanonicalBytes(data)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.split.ShardAddress, split2.ShardAddress)
+			assert.Equal(t, tt.split.ProposedShards, split2.ProposedShards)
+			assert.Equal(t, tt.split.FrameNumber, split2.FrameNumber)
+			require.NotNil(t, split2.PublicKeySignatureBls48581)
+			assert.Equal(t, tt.split.PublicKeySignatureBls48581.Signature, split2.PublicKeySignatureBls48581.Signature)
+			assert.Equal(t, tt.split.PublicKeySignatureBls48581.Address, split2.PublicKeySignatureBls48581.Address)
+		})
+	}
+}
+
+func TestShardMerge_Serialization(t *testing.T) {
+	tests := []struct {
+		name  string
+		merge *ShardMerge
+	}{
+		{
+			name: "complete shard merge",
+			merge: &ShardMerge{
+				ShardAddresses: [][]byte{make([]byte, 33), make([]byte, 33)},
+				ParentAddress:  make([]byte, 32),
+				FrameNumber:    12345,
+				PublicKeySignatureBls48581: &BLS48581AddressedSignature{
+					Signature: make([]byte, 74),
+					Address:   make([]byte, 32),
+				},
+			},
+		},
+		{
+			name: "merge with max shard addresses",
+			merge: &ShardMerge{
+				ShardAddresses: [][]byte{
+					append([]byte{0x01}, make([]byte, 32)...),
+					append([]byte{0x02}, make([]byte, 32)...),
+					append([]byte{0x03}, make([]byte, 32)...),
+					append([]byte{0x04}, make([]byte, 32)...),
+				},
+				ParentAddress: append([]byte{0xFF}, make([]byte, 31)...),
+				FrameNumber:   77777,
+				PublicKeySignatureBls48581: &BLS48581AddressedSignature{
+					Signature: append([]byte{0xDD}, make([]byte, 73)...),
+					Address:   append([]byte{0xFF}, make([]byte, 31)...),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := tt.merge.ToCanonicalBytes()
+			require.NoError(t, err)
+			require.NotNil(t, data)
+
+			merge2 := &ShardMerge{}
+			err = merge2.FromCanonicalBytes(data)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.merge.ShardAddresses, merge2.ShardAddresses)
+			assert.Equal(t, tt.merge.ParentAddress, merge2.ParentAddress)
+			assert.Equal(t, tt.merge.FrameNumber, merge2.FrameNumber)
+			require.NotNil(t, merge2.PublicKeySignatureBls48581)
+			assert.Equal(t, tt.merge.PublicKeySignatureBls48581.Signature, merge2.PublicKeySignatureBls48581.Signature)
+			assert.Equal(t, tt.merge.PublicKeySignatureBls48581.Address, merge2.PublicKeySignatureBls48581.Address)
+		})
+	}
+}
+
+func TestShardSplit_Validate(t *testing.T) {
+	t.Run("valid split passes", func(t *testing.T) {
+		parent := make([]byte, 33)
+		split := &ShardSplit{
+			ShardAddress:   parent,
+			ProposedShards: [][]byte{append(parent, 0x00), append(parent, 0x01)},
+			FrameNumber:    100,
+			PublicKeySignatureBls48581: &BLS48581AddressedSignature{
+				Signature: make([]byte, 74),
+				Address:   make([]byte, 32),
+			},
+		}
+		err := split.Validate()
+		assert.NoError(t, err)
+	})
+
+	t.Run("shard address too short", func(t *testing.T) {
+		split := &ShardSplit{
+			ShardAddress:   make([]byte, 31),
+			ProposedShards: [][]byte{make([]byte, 33), make([]byte, 33)},
+		}
+		err := split.Validate()
+		assert.Error(t, err)
+	})
+
+	t.Run("too few proposed shards", func(t *testing.T) {
+		split := &ShardSplit{
+			ShardAddress:   make([]byte, 33),
+			ProposedShards: [][]byte{make([]byte, 34)},
+		}
+		err := split.Validate()
+		assert.Error(t, err)
+	})
+
+	t.Run("nil signature", func(t *testing.T) {
+		parent := make([]byte, 33)
+		split := &ShardSplit{
+			ShardAddress:               parent,
+			ProposedShards:             [][]byte{append(parent, 0x00), append(parent, 0x01)},
+			FrameNumber:               100,
+			PublicKeySignatureBls48581: nil,
+		}
+		err := split.Validate()
+		assert.Error(t, err)
+	})
+}
+
+func TestShardMerge_Validate(t *testing.T) {
+	t.Run("valid merge passes", func(t *testing.T) {
+		parent := make([]byte, 32)
+		merge := &ShardMerge{
+			ShardAddresses: [][]byte{append(parent, 0x00), append(parent, 0x01)},
+			ParentAddress:  parent,
+			FrameNumber:    100,
+			PublicKeySignatureBls48581: &BLS48581AddressedSignature{
+				Signature: make([]byte, 74),
+				Address:   make([]byte, 32),
+			},
+		}
+		err := merge.Validate()
+		assert.NoError(t, err)
+	})
+
+	t.Run("too few shard addresses", func(t *testing.T) {
+		merge := &ShardMerge{
+			ShardAddresses: [][]byte{make([]byte, 33)},
+			ParentAddress:  make([]byte, 32),
+		}
+		err := merge.Validate()
+		assert.Error(t, err)
+	})
+
+	t.Run("parent address wrong length", func(t *testing.T) {
+		merge := &ShardMerge{
+			ShardAddresses: [][]byte{make([]byte, 33), make([]byte, 33)},
+			ParentAddress:  make([]byte, 31),
+		}
+		err := merge.Validate()
+		assert.Error(t, err)
+	})
+
+	t.Run("base shard rejected", func(t *testing.T) {
+		parent := make([]byte, 32)
+		merge := &ShardMerge{
+			ShardAddresses: [][]byte{make([]byte, 32), append(parent, 0x01)},
+			ParentAddress:  parent,
+		}
+		err := merge.Validate()
+		assert.Error(t, err)
+	})
+
+	t.Run("nil signature", func(t *testing.T) {
+		parent := make([]byte, 32)
+		merge := &ShardMerge{
+			ShardAddresses:             [][]byte{append(parent, 0x00), append(parent, 0x01)},
+			ParentAddress:              parent,
+			FrameNumber:               100,
+			PublicKeySignatureBls48581: nil,
+		}
+		err := merge.Validate()
+		assert.Error(t, err)
+	})
+}
+
+func TestMessageRequest_ShardSplit_Serialization(t *testing.T) {
+	parent := make([]byte, 33)
+	req := &MessageRequest{
+		Request: &MessageRequest_ShardSplit{
+			ShardSplit: &ShardSplit{
+				ShardAddress:   parent,
+				ProposedShards: [][]byte{append(parent, 0x00), append(parent, 0x01)},
+				FrameNumber:    12345,
+				PublicKeySignatureBls48581: &BLS48581AddressedSignature{
+					Signature: make([]byte, 74),
+					Address:   make([]byte, 32),
+				},
+			},
+		},
+	}
+
+	data, err := req.ToCanonicalBytes()
+	require.NoError(t, err)
+	require.NotNil(t, data)
+
+	req2 := &MessageRequest{}
+	err = req2.FromCanonicalBytes(data)
+	require.NoError(t, err)
+
+	splitReq, ok := req2.Request.(*MessageRequest_ShardSplit)
+	require.True(t, ok)
+	assert.Equal(t, parent, splitReq.ShardSplit.ShardAddress)
+	assert.Equal(t, uint64(12345), splitReq.ShardSplit.FrameNumber)
+	assert.Len(t, splitReq.ShardSplit.ProposedShards, 2)
+}
+
+func TestMessageRequest_ShardMerge_Serialization(t *testing.T) {
+	parent := make([]byte, 32)
+	req := &MessageRequest{
+		Request: &MessageRequest_ShardMerge{
+			ShardMerge: &ShardMerge{
+				ShardAddresses: [][]byte{append(parent, 0x00), append(parent, 0x01)},
+				ParentAddress:  parent,
+				FrameNumber:    67890,
+				PublicKeySignatureBls48581: &BLS48581AddressedSignature{
+					Signature: make([]byte, 74),
+					Address:   make([]byte, 32),
+				},
+			},
+		},
+	}
+
+	data, err := req.ToCanonicalBytes()
+	require.NoError(t, err)
+	require.NotNil(t, data)
+
+	req2 := &MessageRequest{}
+	err = req2.FromCanonicalBytes(data)
+	require.NoError(t, err)
+
+	mergeReq, ok := req2.Request.(*MessageRequest_ShardMerge)
+	require.True(t, ok)
+	assert.Equal(t, parent, mergeReq.ShardMerge.ParentAddress)
+	assert.Equal(t, uint64(67890), mergeReq.ShardMerge.FrameNumber)
+	assert.Len(t, mergeReq.ShardMerge.ShardAddresses, 2)
+}
+
 func TestProverLivenessCheck_Serialization(t *testing.T) {
 	tests := []struct {
 		name  string

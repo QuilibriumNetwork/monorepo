@@ -66,6 +66,8 @@ const (
 	ProverSeniorityMergeType    uint32 = 0x031A
 	TimeoutStateType            uint32 = 0x031C
 	TimeoutCertificateType      uint32 = 0x031D
+	ShardSplitType              uint32 = 0x031E
+	ShardMergeType              uint32 = 0x031F
 
 	// Hypergraph types (0x0400 - 0x04FF)
 	HypergraphConfigurationType uint32 = 0x0401

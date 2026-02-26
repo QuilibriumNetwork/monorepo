@@ -298,6 +298,11 @@ func (hg *HypergraphCRDT) CommitShard(
 		L2: [32]byte(shardAddress[:32]),
 	}
 
+	txn, err := hg.store.NewTransaction(false)
+	if err != nil {
+		return nil, errors.Wrap(err, "commit shard")
+	}
+
 	vertexAddSet, vertexRemoveSet := hg.getOrCreateIdSet(
 		shardKey,
 		hg.vertexAdds,
@@ -306,9 +311,9 @@ func (hg *HypergraphCRDT) CommitShard(
 		hg.getCoveredPrefix(),
 	)
 	vertexAddTree := vertexAddSet.GetTree()
-	vertexAddTree.Commit(nil, false)
+	vertexAddTree.Commit(txn, false)
 	vertexRemoveTree := vertexRemoveSet.GetTree()
-	vertexRemoveTree.Commit(nil, false)
+	vertexRemoveTree.Commit(txn, false)
 
 	path := tries.GetFullPath(shardAddress[:32])
 	for _, p := range shardAddress[32:] {
@@ -333,22 +338,17 @@ func (hg *HypergraphCRDT) CommitShard(
 		hg.getCoveredPrefix(),
 	)
 	hyperedgeAddTree := hyperedgeAddSet.GetTree()
-	hyperedgeAddTree.Commit(nil, false)
+	hyperedgeAddTree.Commit(txn, false)
 	hyperedgeRemoveTree := hyperedgeRemoveSet.GetTree()
-	hyperedgeRemoveTree.Commit(nil, false)
+	hyperedgeRemoveTree.Commit(txn, false)
 
-	hyperedgeAddNode, err := vertexAddTree.GetByPath(path)
+	hyperedgeAddNode, err := hyperedgeAddTree.GetByPath(path)
 	if err != nil && !strings.Contains(err.Error(), "not found") {
 		return nil, errors.Wrap(err, "commit shard")
 	}
 
-	hyperedgeRemoveNode, err := vertexRemoveTree.GetByPath(path)
+	hyperedgeRemoveNode, err := hyperedgeRemoveTree.GetByPath(path)
 	if err != nil && !strings.Contains(err.Error(), "not found") {
-		return nil, errors.Wrap(err, "commit shard")
-	}
-
-	txn, err := hg.store.NewTransaction(false)
-	if err != nil {
 		return nil, errors.Wrap(err, "commit shard")
 	}
 

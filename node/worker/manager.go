@@ -466,6 +466,10 @@ func (w *WorkerManager) AllocateWorker(coreId uint, filter []byte) error {
 	return nil
 }
 
+func (w *WorkerManager) RespawnWorker(coreId uint, filter []byte) error {
+	return w.respawnWorker(coreId, filter)
+}
+
 func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 	timer := prometheus.NewTimer(
 		workerOperationDuration.WithLabelValues("deallocate"),

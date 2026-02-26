@@ -208,7 +208,9 @@ func (e *GlobalExecutionEngine) validateBundle(
 				op.GetKick() != nil ||
 				op.GetUpdate() != nil ||
 				op.GetShard() != nil ||
-				op.GetSeniorityMerge() != nil
+				op.GetSeniorityMerge() != nil ||
+				op.GetShardSplit() != nil ||
+				op.GetShardMerge() != nil
 
 			if !isGlobalOp {
 				if e.config.Network == 0 &&
@@ -526,6 +528,7 @@ func (e *GlobalExecutionEngine) tryGetIntrinsic(address []byte) (
 			e.rewardIssuance,
 			e.proverRegistry,
 			e.blsConstructor,
+			e.shardsStore,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "try get intrinsic")

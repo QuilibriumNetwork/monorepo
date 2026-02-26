@@ -2,6 +2,7 @@ package global
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"slices"
 
@@ -235,23 +236,38 @@ func (p *ProverSeniorityMerge) Prove(frameNumber uint64) error {
 	}
 
 	// Sign merge target signatures
+	blsPublicKey := signingKey.Public().([]byte)
 	for _, mt := range p.MergeTargets {
 		if mt.signer != nil {
 			mt.Signature, err = mt.signer.SignWithDomain(
-				signingKey.Public().([]byte),
+				blsPublicKey,
 				[]byte("PROVER_SENIORITY_MERGE"),
 			)
 			if err != nil {
 				return errors.Wrap(err, "prove")
 			}
+
+			// Self-verify: catch key material issues before publishing
+			valid, verifyErr := p.keyManager.ValidateSignature(
+				mt.KeyType,
+				mt.PublicKey,
+				blsPublicKey,
+				mt.Signature,
+				[]byte("PROVER_SENIORITY_MERGE"),
+			)
+			if verifyErr != nil || !valid {
+				return fmt.Errorf(
+					"prove: merge target self-verify failed "+
+						"(key_type=%d, pub_key_len=%d, sig_len=%d, bls_pub_len=%d, err=%v)",
+					mt.KeyType, len(mt.PublicKey), len(mt.Signature),
+					len(blsPublicKey), verifyErr,
+				)
+			}
 		}
 	}
 
-	// Get the public key
-	pubKey := signingKey.Public()
-
 	// Compute address from public key
-	addressBI, err := poseidon.HashBytes(pubKey.([]byte))
+	addressBI, err := poseidon.HashBytes(blsPublicKey)
 	if err != nil {
 		return errors.Wrap(err, "prove")
 	}
@@ -333,34 +349,34 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 	if p.hypergraph == nil {
 		return false, errors.Wrap(
 			errors.New("hypergraph not initialized"),
-			"verify",
+			"verify: invalid prover seniority merge",
 		)
 	}
 	if p.keyManager == nil {
 		return false, errors.Wrap(
 			errors.New("key manager not initialized"),
-			"verify",
+			"verify: invalid prover seniority merge",
 		)
 	}
 	if p.rdfMultiprover == nil {
 		return false, errors.Wrap(
 			errors.New("rdf multiprover not initialized"),
-			"verify",
+			"verify: invalid prover seniority merge",
 		)
 	}
 	if len(p.MergeTargets) == 0 {
-		return false, errors.Wrap(errors.New("no merge targets"), "verify")
+		return false, errors.Wrap(errors.New("no merge targets"), "verify: invalid prover seniority merge")
 	}
 	if len(p.PublicKeySignatureBLS48581.Address) != 32 {
 		return false, errors.Wrap(
 			errors.New("invalid addressed prover address"),
-			"verify",
+			"verify: invalid prover seniority merge",
 		)
 	}
 
 	// Disallow too old of a request
 	if p.FrameNumber+10 < frameNumber {
-		return false, errors.Wrap(errors.New("outdated request"), "verify")
+		return false, errors.Wrap(errors.New("outdated request"), "verify: invalid prover seniority merge")
 	}
 
 	// Resolve the prover vertex
@@ -370,7 +386,7 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 
 	vertexData, err := p.hypergraph.GetVertexData(proverFullAddr)
 	if err != nil || vertexData == nil {
-		return false, errors.Wrap(errors.New("prover not found"), "verify")
+		return false, errors.Wrap(errors.New("prover not found"), "verify: invalid prover seniority merge")
 	}
 
 	// Fetch the registered PublicKey
@@ -381,19 +397,19 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 		vertexData,
 	)
 	if err != nil || len(pubKeyBytes) == 0 {
-		return false, errors.Wrap(errors.New("prover public key missing"), "verify")
+		return false, errors.Wrap(errors.New("prover public key missing"), "verify: invalid prover seniority merge")
 	}
 
 	// Check poseidon(pubKey) == addressed.Address
 	addrBI, err := poseidon.HashBytes(pubKeyBytes)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover seniority merge")
 	}
 	addrCheck := addrBI.FillBytes(make([]byte, 32))
 	if !slices.Equal(addrCheck, p.PublicKeySignatureBLS48581.Address) {
 		return false, errors.Wrap(
 			errors.New("address does not match registered pubkey"),
-			"verify",
+			"verify: invalid prover seniority merge",
 		)
 	}
 
@@ -408,7 +424,10 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 			[]byte("PROVER_SENIORITY_MERGE"),
 		)
 		if err != nil || !valid {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(
+				errors.New("invalid merge target signature"),
+				"verify: invalid prover seniority merge",
+			)
 		}
 
 		// Confirm this merge target has not already been used
@@ -417,7 +436,7 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 			mt.PublicKey,
 		))
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid prover seniority merge")
 		}
 
 		spentAddress := [64]byte{}
@@ -428,7 +447,7 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 		if err == nil && v != nil {
 			return false, errors.Wrap(
 				errors.New("merge target already used"),
-				"verify",
+				"verify: invalid prover seniority merge",
 			)
 		}
 
@@ -438,7 +457,7 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 			mt.PublicKey,
 		))
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid prover seniority merge")
 		}
 
 		joinSpentAddress := [64]byte{}
@@ -449,7 +468,7 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 		if err == nil && v != nil {
 			return false, errors.Wrap(
 				errors.New("merge target already used in join"),
-				"verify",
+				"verify: invalid prover seniority merge",
 			)
 		}
 
@@ -457,12 +476,12 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 		if mt.KeyType == crypto.KeyTypeEd448 {
 			pk, err := pcrypto.UnmarshalEd448PublicKey(mt.PublicKey)
 			if err != nil {
-				return false, errors.Wrap(err, "verify")
+				return false, errors.Wrap(err, "verify: invalid prover seniority merge")
 			}
 
 			peerId, err := peer.IDFromPublicKey(pk)
 			if err != nil {
-				return false, errors.Wrap(err, "verify")
+				return false, errors.Wrap(err, "verify: invalid prover seniority merge")
 			}
 
 			peerIds = append(peerIds, peerId.String())
@@ -494,7 +513,7 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 	if mergeSeniority <= existingSeniority {
 		return false, errors.Wrap(
 			errors.New("merge would not increase seniority"),
-			"verify",
+			"verify: invalid prover seniority merge",
 		)
 	}
 
@@ -505,7 +524,7 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 	)
 	mergeDomain, err := poseidon.HashBytes(mergeDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover seniority merge")
 	}
 
 	// Recreate the message that was signed
@@ -523,7 +542,7 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 		mergeDomain.Bytes(),
 	)
 	if err != nil || !ok {
-		return false, errors.Wrap(errors.New("invalid seniority merge signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid seniority merge signature"), "verify: invalid prover seniority merge")
 	}
 
 	return true, nil

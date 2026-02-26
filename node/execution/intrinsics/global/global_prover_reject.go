@@ -392,7 +392,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 	)
 	rejectDomain, err := poseidon.HashBytes(rejectDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover reject")
 	}
 
 	_, err = p.hypergraph.GetVertex([64]byte(slices.Concat(
@@ -400,7 +400,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover reject")
 	}
 
 	tree, err := p.hypergraph.GetVertexData([64]byte(slices.Concat(
@@ -408,7 +408,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover reject")
 	}
 
 	pubkey, err := p.rdfMultiprover.Get(
@@ -418,7 +418,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 		tree,
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover reject")
 	}
 
 	for _, filter := range p.Filters {
@@ -427,7 +427,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 			slices.Concat([]byte("PROVER_ALLOCATION"), pubkey, filter),
 		)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid prover reject")
 		}
 		allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
 		allocationFullAddress := [64]byte{}
@@ -439,7 +439,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 		if err != nil || allocationTree == nil {
 			return false, errors.Wrap(
 				errors.New("allocation not found"),
-				"verify",
+				"verify: invalid prover reject",
 			)
 		}
 
@@ -451,7 +451,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 			allocationTree,
 		)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid prover reject")
 		}
 
 		status := uint8(0)
@@ -463,7 +463,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 		if status != 0 && status != 3 {
 			return false, errors.Wrap(
 				errors.New("invalid allocation state for rejection"),
-				"verify",
+				"verify: invalid prover reject",
 			)
 		}
 
@@ -477,7 +477,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 				allocationTree,
 			)
 			if err != nil || len(joinFrameBytes) != 8 {
-				return false, errors.Wrap(errors.New("missing join frame"), "verify")
+				return false, errors.Wrap(errors.New("missing join frame"), "verify: invalid prover reject")
 			}
 			joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
 
@@ -488,7 +488,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 				if framesSinceJoin > 720 {
 					return false, errors.Wrap(
 						errors.New("join already implicitly rejected after 720 frames"),
-						"verify",
+						"verify: invalid prover reject",
 					)
 				}
 			}
@@ -502,7 +502,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 				allocationTree,
 			)
 			if err != nil || len(leaveFrameBytes) != 8 {
-				return false, errors.Wrap(errors.New("missing leave frame"), "verify")
+				return false, errors.Wrap(errors.New("missing leave frame"), "verify: invalid prover reject")
 			}
 			leaveFrame := binary.BigEndian.Uint64(leaveFrameBytes)
 
@@ -510,13 +510,13 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 			if framesSinceLeave < 360 {
 				return false, errors.Wrap(
 					errors.New("must wait 360 frames after leave to reject"),
-					"verify",
+					"verify: invalid prover reject",
 				)
 			}
 			if framesSinceLeave > 720 {
 				return false, errors.Wrap(
 					errors.New("leave already implicitly confirmed after 720 frames"),
-					"verify",
+					"verify: invalid prover reject",
 				)
 			}
 		}
@@ -531,7 +531,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 		rejectDomain.Bytes(),
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid prover reject")
 	}
 
 	return true, nil

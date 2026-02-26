@@ -132,9 +132,33 @@ func (r *DataWorkerIPCServer) Start() error {
 
 func (r *DataWorkerIPCServer) Stop() error {
 	r.logger.Info("stopping server gracefully")
+
+	// Stop the app consensus engine first, then synchronously close the
+	// snapshot manager so no Pebble snapshots remain when the database closes.
+	if r.appConsensusEngine != nil {
+		if r.cancel != nil {
+			r.cancel()
+		}
+		<-r.appConsensusEngine.Stop(false)
+		r.appConsensusEngine = nil
+	}
+	r.appConsensusEngineFactory.CloseSnapshots()
+
 	r.pubsub.Close()
 	if r.server != nil {
-		r.server.GracefulStop()
+		stopped := make(chan struct{})
+		srv := r.server
+		go func() {
+			srv.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			r.logger.Warn("server graceful stop timed out during shutdown, forcing")
+			srv.Stop()
+			<-stopped
+		}
 	}
 	if r.peerInfoCancel != nil {
 		r.peerInfoCancel()
@@ -155,17 +179,31 @@ func (r *DataWorkerIPCServer) Respawn(
 }
 
 func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
-	if r.server != nil {
-		r.logger.Info("stopping server for respawn")
-		r.server.GracefulStop()
-		r.server = nil
-	}
 	if r.appConsensusEngine != nil {
+		r.logger.Info("respawning worker: stopping old engine")
 		if r.cancel != nil {
 			r.cancel()
 		}
 		<-r.appConsensusEngine.Stop(false)
 		r.appConsensusEngine = nil
+		r.logger.Info("respawning worker: old engine stopped")
+	}
+	if r.server != nil {
+		r.logger.Info("stopping server for respawn")
+		stopped := make(chan struct{})
+		srv := r.server
+		go func() {
+			srv.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			r.logger.Warn("server graceful stop timed out, forcing stop")
+			srv.Stop()
+			<-stopped
+		}
+		r.server = nil
 	}
 
 	// Establish an auth provider
@@ -245,16 +283,26 @@ func (r *DataWorkerIPCServer) RespawnServer(filter []byte) error {
 			return errors.Wrap(err, "respawn server")
 		}
 
-		r.ctx, r.cancel, _ = lifecycle.WithSignallerAndCancel(context.Background())
+		var errCh <-chan error
+		r.ctx, r.cancel, errCh = lifecycle.WithSignallerAndCancel(context.Background())
 		// Capture engine and ctx in local variables to avoid race with subsequent RespawnServer calls
 		engine := r.appConsensusEngine
 		ctx := r.ctx
+		go func() {
+			if err, ok := <-errCh; ok && err != nil {
+				r.logger.Error("app engine fatal error during respawn",
+					zap.Error(err))
+			}
+		}()
+		r.logger.Info("respawning worker: engine created, starting")
 		go func() {
 			if engine == nil {
 				return
 			}
 			if err = engine.Start(ctx); err != nil {
-				r.logger.Error("error while running", zap.Error(err))
+				r.logger.Error("respawning worker: engine start failed", zap.Error(err))
+			} else {
+				r.logger.Info("respawning worker: engine started successfully")
 			}
 		}()
 	}

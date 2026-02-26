@@ -204,7 +204,7 @@ func (a *AltShardUpdate) Verify(frameNumber uint64) (bool, error) {
 	)
 	domain, err := poseidon.HashBytes(domainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid alt shard update")
 	}
 
 	message := a.getSignedMessage()
@@ -216,7 +216,7 @@ func (a *AltShardUpdate) Verify(frameNumber uint64) (bool, error) {
 		domain.FillBytes(make([]byte, 32)),
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid alt shard update")
 	}
 	if !valid {
 		return false, errors.New("invalid signature")

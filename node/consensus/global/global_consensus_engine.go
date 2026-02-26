@@ -152,8 +152,9 @@ type GlobalConsensusEngine struct {
 	alertPublicKey          []byte
 	hasSentKeyBundle        bool
 	proverSyncInProgress    atomic.Bool
-	lastJoinAttemptFrame    atomic.Uint64
-	lastObservedFrame       atomic.Uint64
+	lastJoinAttemptFrame       atomic.Uint64
+	lastSeniorityMergeFrame    atomic.Uint64
+	lastObservedFrame          atomic.Uint64
 	lastRejectFrame         atomic.Uint64
 	proverRootVerifiedFrame atomic.Uint64
 	proverRootSynced        atomic.Bool
@@ -200,9 +201,12 @@ type GlobalConsensusEngine struct {
 	activeProveRanksMu        sync.Mutex
 	appFrameStore             map[string]*protobufs.AppShardFrame
 	appFrameStoreMu           sync.RWMutex
-	lowCoverageStreak         map[string]*coverageStreak
-	proverOnlyMode            atomic.Bool
+	lowCoverageStreak          map[string]*coverageStreak
+	proverOnlyMode             atomic.Bool
+	lastShardActionFrame       map[string]uint64
+	lastShardActionFrameMu     sync.Mutex
 	coverageCheckInProgress   atomic.Bool
+	coverageWg                sync.WaitGroup
 	peerInfoDigestCache       map[string]struct{}
 	peerInfoDigestCacheMu     sync.Mutex
 	keyRegistryDigestCache    map[string]struct{}
@@ -337,6 +341,7 @@ func NewGlobalConsensusEngine(
 		currentDifficulty:           config.Engine.Difficulty,
 		lastProvenFrameTime:         time.Now(),
 		blacklistMap:                make(map[string]bool),
+		lastShardActionFrame:        make(map[string]uint64),
 		peerInfoDigestCache:         make(map[string]struct{}),
 		keyRegistryDigestCache:      make(map[string]struct{}),
 		peerAuthCache:               make(map[string]time.Time),
@@ -561,6 +566,9 @@ func NewGlobalConsensusEngine(
 			}
 			ready()
 			<-ctx.Done()
+			if err := engine.workerManager.Stop(); err != nil {
+				engine.logger.Warn("error stopping worker manager", zap.Error(err))
+			}
 		})
 	}
 
@@ -847,41 +855,10 @@ func NewGlobalConsensusEngine(
 
 	componentBuilder.AddWorker(engine.peerInfoManager.Start)
 
-	// Subscribe to global consensus if participating
-	err = engine.subscribeToGlobalConsensus()
-	if err != nil {
-		return nil, err
-	}
-
-	// Subscribe to shard consensus messages to broker lock agreement
-	err = engine.subscribeToShardConsensusMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
-
-	// Subscribe to frames
-	err = engine.subscribeToFrameMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
-
-	// Subscribe to prover messages
-	err = engine.subscribeToProverMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
-
-	// Subscribe to peer info messages
-	err = engine.subscribeToPeerInfoMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
-
-	// Subscribe to alert messages
-	err = engine.subscribeToAlertMessages()
-	if err != nil {
-		return nil, errors.Wrap(err, "start")
-	}
+	// NOTE: subscribe calls are deferred until after ComponentManager is built
+	// (see below). The handler closures reference e.ShutdownSignal() which
+	// panics if ComponentManager is nil. Since Subscribe spawns goroutines
+	// immediately, a message arriving before Build() would hit a nil receiver.
 
 	// Start consensus message queue processor
 	componentBuilder.AddWorker(func(
@@ -1041,6 +1018,47 @@ func NewGlobalConsensusEngine(
 		hgWithSelfPeer.SetSelfPeerID(peer.ID(ps.GetPeerID()).String())
 	}
 
+	// Subscribe to pubsub bitmasks. These calls spawn handler goroutines
+	// immediately, and the handlers reference e.ShutdownSignal() which
+	// requires ComponentManager to be non-nil. That's why subscriptions
+	// must happen after componentBuilder.Build() above.
+
+	// Subscribe to global consensus if participating
+	err = engine.subscribeToGlobalConsensus()
+	if err != nil {
+		return nil, err
+	}
+
+	// Subscribe to shard consensus messages to broker lock agreement
+	err = engine.subscribeToShardConsensusMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
+	}
+
+	// Subscribe to frames
+	err = engine.subscribeToFrameMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
+	}
+
+	// Subscribe to prover messages
+	err = engine.subscribeToProverMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
+	}
+
+	// Subscribe to peer info messages
+	err = engine.subscribeToPeerInfoMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
+	}
+
+	// Subscribe to alert messages
+	err = engine.subscribeToAlertMessages()
+	if err != nil {
+		return nil, errors.Wrap(err, "start")
+	}
+
 	return engine, nil
 }
 
@@ -1137,8 +1155,8 @@ func (e *GlobalConsensusEngine) setupGRPCServer() error {
 		grpc.Creds(tlsCreds),
 		grpc.ChainUnaryInterceptor(e.authProvider.UnaryInterceptor),
 		grpc.ChainStreamInterceptor(e.authProvider.StreamInterceptor),
-		grpc.MaxRecvMsgSize(10*1024*1024),
-		grpc.MaxSendMsgSize(10*1024*1024),
+		grpc.MaxRecvMsgSize(e.config.Engine.SyncMessageLimits.MaxRecvMsgSize),
+		grpc.MaxSendMsgSize(e.config.Engine.SyncMessageLimits.MaxSendMsgSize),
 	)
 
 	// Create TCP listener
@@ -1200,6 +1218,20 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 		if !force {
 			errChan <- errors.New("timeout waiting for graceful shutdown")
 		}
+	}
+
+	// Wait for any in-flight coverage check goroutine to finish before
+	// returning, so callers can safely close the Pebble DB. This is safe
+	// to wait on unboundedly because GetMetadataAtKey (the only hg.mu
+	// caller in the coverage path) bails immediately once shutdownCtx
+	// fires, so the goroutine will always complete after shutdown.
+	e.coverageWg.Wait()
+
+	// Synchronously close the snapshot manager so no Pebble snapshots remain
+	// open when the database is closed. The async goroutine chain from
+	// SetShutdownContext may not have completed yet.
+	if closer, ok := e.hyperSync.(interface{ CloseSnapshots() }); ok {
+		closer.CloseSnapshots()
 	}
 
 	close(errChan)
@@ -2094,6 +2126,16 @@ func (e *GlobalConsensusEngine) performBlockingProverHypersync(
 	close(done)
 
 	e.logger.Info("blocking hypersync completed")
+
+	if !e.config.Engine.ArchiveMode {
+		if err := e.proverRegistry.Refresh(); err != nil {
+			e.logger.Warn(
+				"failed to refresh prover registry after blocking hypersync",
+				zap.Error(err),
+			)
+		}
+	}
+
 	if len(newRoots) == 0 {
 		return nil
 	}
@@ -2238,6 +2280,7 @@ func (e *GlobalConsensusEngine) joinProposalReady(
 
 func (e *GlobalConsensusEngine) selectExcessPendingFilters(
 	self *typesconsensus.ProverInfo,
+	frameNumber uint64,
 ) [][]byte {
 	if self == nil || e.config == nil || e.config.Engine == nil {
 		e.logger.Debug("excess pending evaluation skipped: missing config or prover info")
@@ -2261,6 +2304,12 @@ func (e *GlobalConsensusEngine) selectExcessPendingFilters(
 		case typesconsensus.ProverStatusActive:
 			active++
 		case typesconsensus.ProverStatusJoining:
+			// Skip expired joins — they are implicitly rejected and should
+			// not count toward the pending limit or be candidates for
+			// explicit rejection.
+			if frameNumber > allocation.JoinFrameNumber+pendingFilterGraceFrames {
+				continue
+			}
 			filterCopy := make([]byte, len(allocation.ConfirmationFilter))
 			copy(filterCopy, allocation.ConfirmationFilter)
 			pending = append(pending, filterCopy)
@@ -3340,23 +3389,15 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		mergeSeniority = mergeSeniorityBI.Uint64()
 	}
 
-	// If prover already exists, check if we should submit a seniority merge
+	// Always include merge targets in the join — Materialize handles
+	// seniority for both new and existing provers. A separate seniority
+	// merge is not submitted because it would double-count with the join.
 	if proverExists {
-		if mergeSeniority > info.Seniority {
-			e.logger.Info(
-				"existing prover has lower seniority than merge would provide, submitting seniority merge",
-				zap.Uint64("existing_seniority", info.Seniority),
-				zap.Uint64("merge_seniority", mergeSeniority),
-				zap.Strings("peer_ids", peerIds),
-			)
-			return e.submitSeniorityMerge(frame, helpers, mergeSeniority, peerIds)
-		}
 		e.logger.Debug(
-			"prover already exists with sufficient seniority, skipping join",
+			"prover already exists, merge targets will be included in join",
 			zap.Uint64("existing_seniority", info.Seniority),
 			zap.Uint64("merge_seniority", mergeSeniority),
 		)
-		return nil
 	}
 
 	e.logger.Info(
@@ -3508,16 +3549,32 @@ func (e *GlobalConsensusEngine) buildMergeHelpers() ([]*global.SeniorityMerge, [
 	helpers := []*global.SeniorityMerge{}
 	peerIds := []string{}
 
-	peerPrivKey, err := hex.DecodeString(e.config.P2P.PeerPrivKey)
+	peerPrivKeyBytes, err := hex.DecodeString(e.config.P2P.PeerPrivKey)
 	if err != nil {
 		e.logger.Debug("cannot decode peer key for merge helpers", zap.Error(err))
 		return helpers, peerIds
 	}
 
-	oldProver, err := keys.Ed448KeyFromBytes(
-		peerPrivKey,
-		e.pubsub.GetPublicKey(),
-	)
+	peerPrivKey, err := pcrypto.UnmarshalEd448PrivateKey(peerPrivKeyBytes)
+	if err != nil {
+		e.logger.Debug("cannot unmarshal peer key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	peerPub := peerPrivKey.GetPublic()
+	peerPubBytes, err := peerPub.Raw()
+	if err != nil {
+		e.logger.Debug("cannot get peer public key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	peerPrivRaw, err := peerPrivKey.Raw()
+	if err != nil {
+		e.logger.Debug("cannot get peer private key for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+
+	oldProver, err := keys.Ed448KeyFromBytes(peerPrivRaw, peerPubBytes)
 	if err != nil {
 		e.logger.Debug("cannot get peer key for merge helpers", zap.Error(err))
 		return helpers, peerIds
@@ -3527,7 +3584,13 @@ func (e *GlobalConsensusEngine) buildMergeHelpers() ([]*global.SeniorityMerge, [
 		crypto.KeyTypeEd448,
 		oldProver,
 	))
-	peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
+
+	peerId, err := peer.IDFromPublicKey(peerPub)
+	if err != nil {
+		e.logger.Debug("cannot get peer ID for merge helpers", zap.Error(err))
+		return helpers, peerIds
+	}
+	peerIds = append(peerIds, peerId.String())
 
 	if len(e.config.Engine.MultisigProverEnrollmentPaths) != 0 {
 		e.logger.Debug("loading old configs for merge helpers")

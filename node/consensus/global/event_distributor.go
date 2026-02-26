@@ -82,7 +82,10 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 					e.flushDeferredGlobalMessages(data.Frame.GetRank() + 1)
 
 					// Check shard coverage asynchronously to avoid blocking event processing
-					e.triggerCoverageCheckAsync(data.Frame.Header.FrameNumber)
+					e.triggerCoverageCheckAsync(
+						data.Frame.Header.FrameNumber,
+						data.Frame.Header.Prover,
+					)
 
 					// Update global coordination metrics
 					globalCoordinationTotal.Inc()
@@ -119,6 +122,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 								// prover allocations in the registry.
 								e.reconcileWorkerAllocations(data.Frame.Header.FrameNumber, self)
 								e.checkExcessPendingJoins(self, data.Frame.Header.FrameNumber)
+								e.checkAndSubmitSeniorityMerge(self, data.Frame.Header.FrameNumber)
 								e.logAllocationStatusOnly(ctx, data, self, effectiveSeniority)
 							}
 						}
@@ -266,6 +270,16 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 					}()
 				}
 
+			case typesconsensus.ControlEventShardSplitEligible:
+				if data, ok := event.Data.(*typesconsensus.ShardSplitEventData); ok {
+					e.handleShardSplitEvent(data)
+				}
+
+			case typesconsensus.ControlEventShardMergeEligible:
+				if data, ok := event.Data.(*typesconsensus.BulkShardMergeEventData); ok {
+					e.handleShardMergeEvent(data)
+				}
+
 			default:
 				e.logger.Debug(
 					"received unhandled event type",
@@ -306,6 +320,7 @@ func (e *GlobalConsensusEngine) emitCoverageEvent(
 
 func (e *GlobalConsensusEngine) emitBulkMergeEvent(
 	mergeGroups []typesconsensus.ShardMergeEventData,
+	frameProver []byte,
 ) {
 	if len(mergeGroups) == 0 {
 		return
@@ -314,6 +329,7 @@ func (e *GlobalConsensusEngine) emitBulkMergeEvent(
 	// Combine all merge groups into a single bulk event
 	data := &typesconsensus.BulkShardMergeEventData{
 		MergeGroups: mergeGroups,
+		FrameProver: frameProver,
 	}
 
 	event := typesconsensus.ControlEvent{
@@ -370,6 +386,156 @@ func (e *GlobalConsensusEngine) emitAlertEvent(alertMessage string) {
 	e.logger.Info("emitted alert message")
 }
 
+const shardActionCooldownFrames = 360
+
+func (e *GlobalConsensusEngine) handleShardSplitEvent(
+	data *typesconsensus.ShardSplitEventData,
+) {
+	// Only the prover who produced the triggering frame should emit
+	if !bytes.Equal(data.FrameProver, e.getProverAddress()) {
+		return
+	}
+
+	frameNumber := e.lastObservedFrame.Load()
+	if frameNumber == 0 {
+		return
+	}
+
+	addrKey := string(data.ShardAddress)
+	e.lastShardActionFrameMu.Lock()
+	if last, ok := e.lastShardActionFrame[addrKey]; ok &&
+		frameNumber-last < shardActionCooldownFrames {
+		e.lastShardActionFrameMu.Unlock()
+		e.logger.Debug(
+			"skipping shard split, cooldown active",
+			zap.String("shard_address", hex.EncodeToString(data.ShardAddress)),
+			zap.Uint64("last_action_frame", last),
+			zap.Uint64("current_frame", frameNumber),
+		)
+		return
+	}
+	e.lastShardActionFrame[addrKey] = frameNumber
+	e.lastShardActionFrameMu.Unlock()
+
+	op := globalintrinsics.NewShardSplitOp(
+		data.ShardAddress,
+		data.ProposedShards,
+		e.keyManager,
+		e.shardsStore,
+		e.proverRegistry,
+	)
+
+	if err := op.Prove(frameNumber); err != nil {
+		e.logger.Error(
+			"failed to prove shard split",
+			zap.Error(err),
+		)
+		return
+	}
+
+	splitBytes, err := op.ToRequestBytes()
+	if err != nil {
+		e.logger.Error(
+			"failed to serialize shard split",
+			zap.Error(err),
+		)
+		return
+	}
+
+	if err := e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		splitBytes,
+	); err != nil {
+		e.logger.Error("failed to publish shard split", zap.Error(err))
+	} else {
+		e.logger.Info(
+			"published shard split",
+			zap.String("shard_address", hex.EncodeToString(data.ShardAddress)),
+			zap.Int("proposed_shards", len(data.ProposedShards)),
+			zap.Uint64("frame_number", frameNumber),
+		)
+	}
+}
+
+func (e *GlobalConsensusEngine) handleShardMergeEvent(
+	data *typesconsensus.BulkShardMergeEventData,
+) {
+	// Only the prover who produced the triggering frame should emit
+	if !bytes.Equal(data.FrameProver, e.getProverAddress()) {
+		return
+	}
+
+	frameNumber := e.lastObservedFrame.Load()
+	if frameNumber == 0 {
+		return
+	}
+
+	for _, group := range data.MergeGroups {
+		if len(group.ShardAddresses) < 2 {
+			continue
+		}
+
+		// Use first shard's first 32 bytes as parent address
+		parentAddress := group.ShardAddresses[0][:32]
+
+		// Check cooldown for the parent address
+		parentKey := string(parentAddress)
+		e.lastShardActionFrameMu.Lock()
+		if last, ok := e.lastShardActionFrame[parentKey]; ok &&
+			frameNumber-last < shardActionCooldownFrames {
+			e.lastShardActionFrameMu.Unlock()
+			e.logger.Debug(
+				"skipping shard merge, cooldown active",
+				zap.String("parent_address", hex.EncodeToString(parentAddress)),
+				zap.Uint64("last_action_frame", last),
+				zap.Uint64("current_frame", frameNumber),
+			)
+			continue
+		}
+		e.lastShardActionFrame[parentKey] = frameNumber
+		e.lastShardActionFrameMu.Unlock()
+
+		op := globalintrinsics.NewShardMergeOp(
+			group.ShardAddresses,
+			parentAddress,
+			e.keyManager,
+			e.shardsStore,
+			e.proverRegistry,
+		)
+
+		if err := op.Prove(frameNumber); err != nil {
+			e.logger.Error(
+				"failed to prove shard merge",
+				zap.Error(err),
+			)
+			continue
+		}
+
+		mergeBytes, err := op.ToRequestBytes()
+		if err != nil {
+			e.logger.Error(
+				"failed to serialize shard merge",
+				zap.Error(err),
+			)
+			continue
+		}
+
+		if err := e.pubsub.PublishToBitmask(
+			GLOBAL_PROVER_BITMASK,
+			mergeBytes,
+		); err != nil {
+			e.logger.Error("failed to publish shard merge", zap.Error(err))
+		} else {
+			e.logger.Info(
+				"published shard merge",
+				zap.String("parent_address", hex.EncodeToString(parentAddress)),
+				zap.Int("shard_count", len(group.ShardAddresses)),
+				zap.Uint64("frame_number", frameNumber),
+			)
+		}
+	}
+}
+
 func (e *GlobalConsensusEngine) estimateSeniorityFromConfig() uint64 {
 	peerIds := []string{}
 	peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
@@ -414,6 +580,21 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 ) {
 	self, effectiveSeniority := e.allocationContext()
 	e.reconcileWorkerAllocations(data.Frame.Header.FrameNumber, self)
+
+	// Re-check after reconciliation — stale filters may have been cleared,
+	// making workers available for new proposals.
+	if !allowProposals {
+		workers, err := e.workerManager.RangeWorkers()
+		if err == nil {
+			for _, w := range workers {
+				if w != nil && len(w.Filter) == 0 {
+					allowProposals = true
+					break
+				}
+			}
+		}
+	}
+
 	e.checkExcessPendingJoins(self, data.Frame.Header.FrameNumber)
 	canPropose, skipReason := e.joinProposalReady(data.Frame.Header.FrameNumber)
 
@@ -433,6 +614,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	decideDescriptors := snapshot.decideDescriptors
 	worldBytes := snapshot.worldBytes
 
+	joinProposedThisCycle := false
 	if len(proposalDescriptors) != 0 && allowProposals {
 		if canPropose {
 			proposals, err := e.proposer.PlanAndAllocate(
@@ -446,6 +628,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 				e.logger.Error("could not plan shard allocations", zap.Error(err))
 			} else {
 				if len(proposals) > 0 {
+					joinProposedThisCycle = true
 					e.lastJoinAttemptFrame.Store(data.Frame.Header.FrameNumber)
 				}
 				expectedRewardSum := big.NewInt(0)
@@ -485,6 +668,11 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
 		)
 	}
+
+	if !joinProposedThisCycle {
+		e.checkAndSubmitSeniorityMerge(self, data.Frame.Header.FrameNumber)
+	}
+
 	if len(pendingFilters) != 0 {
 		if err := e.proposer.DecideJoins(
 			uint64(data.Frame.Header.Difficulty),
@@ -582,6 +770,21 @@ func (e *GlobalConsensusEngine) reconcileWorkerAllocations(
 			// Track rejected allocations separately - we need to clear their
 			// workers immediately without waiting for the grace period
 			if alloc.Status == typesconsensus.ProverStatusRejected {
+				rejectedFilters[string(alloc.ConfirmationFilter)] = struct{}{}
+				continue
+			}
+
+			// Expired joins (implicitly rejected) and expired leaves
+			// (implicitly confirmed) should also be cleared immediately —
+			// the allocation will never be confirmed/completed and the
+			// worker is stuck waiting for a state change that cannot come.
+			if alloc.Status == typesconsensus.ProverStatusJoining &&
+				frameNumber > alloc.JoinFrameNumber+pendingFilterGraceFrames {
+				rejectedFilters[string(alloc.ConfirmationFilter)] = struct{}{}
+				continue
+			}
+			if alloc.Status == typesconsensus.ProverStatusLeaving &&
+				frameNumber > alloc.LeaveFrameNumber+pendingFilterGraceFrames {
 				rejectedFilters[string(alloc.ConfirmationFilter)] = struct{}{}
 				continue
 			}
@@ -841,12 +1044,23 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 	decideDescriptors := []provers.ShardDescriptor{}
 
 	for _, shardInfo := range shards {
-		resp, err := e.getAppShardsFromProver(
-			client,
-			slices.Concat(shardInfo.L1, shardInfo.L2),
-		)
+		shardKey := slices.Concat(shardInfo.L1, shardInfo.L2)
+		var resp *protobufs.GetAppShardsResponse
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			resp, err = e.getAppShardsFromProver(client, shardKey)
+			if err == nil {
+				break
+			}
+			e.logger.Debug(
+				"retrying app shard retrieval",
+				zap.Int("attempt", attempt+1),
+				zap.Error(err),
+			)
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+		}
 		if err != nil {
-			e.logger.Debug("could not get app shards from prover", zap.Error(err))
+			e.logger.Debug("could not get app shards from prover after retries", zap.Error(err))
 			return nil, false
 		}
 
@@ -869,8 +1083,22 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 			if self != nil {
 				for _, allocation := range self.Allocations {
 					if bytes.Equal(allocation.ConfirmationFilter, bp) {
-						allocated = allocation.Status != 4
-						if allocation.Status == typesconsensus.ProverStatusJoining {
+						allocated = allocation.Status != typesconsensus.ProverStatusLeaving
+
+						// Treat expired joins and leaves as unallocated so the
+						// proposer will submit a fresh join instead of sitting
+						// in limbo.
+						if allocation.Status == typesconsensus.ProverStatusJoining &&
+							data.Frame.Header.FrameNumber > allocation.JoinFrameNumber+pendingFilterGraceFrames {
+							allocated = false
+						}
+						if allocation.Status == typesconsensus.ProverStatusLeaving &&
+							data.Frame.Header.FrameNumber > allocation.LeaveFrameNumber+pendingFilterGraceFrames {
+							allocated = false
+						}
+
+						if allocation.Status == typesconsensus.ProverStatusJoining &&
+							data.Frame.Header.FrameNumber <= allocation.JoinFrameNumber+pendingFilterGraceFrames {
 							shardsPending++
 							awaitingFrame[allocation.JoinFrameNumber+360] = struct{}{}
 						}
@@ -887,7 +1115,8 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 							data.Frame.Header.FrameNumber > token.FRAME_2_1_EXTENDED_ENROLL_END {
 							pending = allocation.Status ==
 								typesconsensus.ProverStatusJoining &&
-								allocation.JoinFrameNumber+360 <= data.Frame.Header.FrameNumber
+								allocation.JoinFrameNumber+360 <= data.Frame.Header.FrameNumber &&
+								data.Frame.Header.FrameNumber <= allocation.JoinFrameNumber+pendingFilterGraceFrames
 						}
 					}
 				}
@@ -1006,6 +1235,56 @@ func (e *GlobalConsensusEngine) logAllocationStatusOnly(
 	e.logAllocationStatus(snapshot)
 }
 
+// checkAndSubmitSeniorityMerge submits a seniority merge if the prover exists
+// with incorrect seniority and cooldowns have elapsed. This is called both from
+// evaluateForProposals (when no join was proposed) and from the "all workers
+// allocated" path, ensuring seniority is corrected regardless of allocation state.
+func (e *GlobalConsensusEngine) checkAndSubmitSeniorityMerge(
+	self *typesconsensus.ProverInfo,
+	frameNumber uint64,
+) {
+	if self == nil {
+		return
+	}
+
+	mergeSeniority := e.estimateSeniorityFromConfig()
+	if mergeSeniority <= self.Seniority {
+		return
+	}
+
+	lastJoin := e.lastJoinAttemptFrame.Load()
+	lastMerge := e.lastSeniorityMergeFrame.Load()
+	joinCooldownOk := lastJoin == 0 || frameNumber-lastJoin >= 10
+	mergeCooldownOk := lastMerge == 0 || frameNumber-lastMerge >= 10
+
+	if joinCooldownOk && mergeCooldownOk {
+		frame := e.GetFrame()
+		if frame != nil {
+			helpers, peerIds := e.buildMergeHelpers()
+			err := e.submitSeniorityMerge(
+				frame, helpers, mergeSeniority, peerIds,
+			)
+			if err != nil {
+				e.logger.Error(
+					"could not submit seniority merge",
+					zap.Error(err),
+				)
+			} else {
+				e.lastSeniorityMergeFrame.Store(frameNumber)
+			}
+		}
+	} else {
+		e.logger.Debug(
+			"seniority merge deferred due to cooldown",
+			zap.Uint64("merge_seniority", mergeSeniority),
+			zap.Uint64("existing_seniority", self.Seniority),
+			zap.Uint64("last_join_frame", lastJoin),
+			zap.Uint64("last_merge_frame", lastMerge),
+			zap.Uint64("current_frame", frameNumber),
+		)
+	}
+}
+
 func (e *GlobalConsensusEngine) allocationContext() (
 	*typesconsensus.ProverInfo,
 	uint64,
@@ -1021,7 +1300,7 @@ func (e *GlobalConsensusEngine) checkExcessPendingJoins(
 	self *typesconsensus.ProverInfo,
 	frameNumber uint64,
 ) {
-	excessFilters := e.selectExcessPendingFilters(self)
+	excessFilters := e.selectExcessPendingFilters(self, frameNumber)
 	if len(excessFilters) != 0 {
 		e.logger.Debug(
 			"identified excess pending joins",

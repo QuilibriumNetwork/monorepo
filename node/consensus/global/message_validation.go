@@ -20,7 +20,7 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)
@@ -39,7 +39,7 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 
 		proposal := &protobufs.GlobalProposal{}
 		if err := proposal.FromCanonicalBytes(message.Data); err != nil {
-			e.logger.Debug("failed to unmarshal frame", zap.Error(err))
+			e.logger.Debug("failed to unmarshal proposal", zap.Error(err))
 			proposalValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
@@ -68,7 +68,10 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 		}
 
 		if !valid {
-			e.logger.Debug("invalid global frame")
+			e.logger.Debug(
+				"invalid global frame",
+				zap.String("reason", "frame validator returned false"),
+			)
 			proposalValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
@@ -193,6 +196,10 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 		}
 
 		if frametime.AppFrameSince(frame) > 20*time.Second {
+			e.logger.Debug(
+				"ignoring shard proposal",
+				zap.String("reason", "frame too old"),
+			)
 			shardProposalValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
@@ -211,7 +218,10 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 		}
 
 		if !valid {
-			e.logger.Debug("invalid app frame")
+			e.logger.Debug(
+				"invalid app frame",
+				zap.String("reason", "frame validator returned false"),
+			)
 			shardProposalValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
@@ -233,6 +243,12 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 
 		now := uint64(time.Now().UnixMilli())
 		if vote.Timestamp > now+5000 || vote.Timestamp < now-5000 {
+			e.logger.Debug(
+				"ignoring shard vote",
+				zap.String("reason", "timestamp out of window"),
+				zap.Uint64("timestamp", vote.Timestamp),
+				zap.Uint64("now", now),
+			)
 			shardVoteValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
@@ -260,6 +276,12 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 
 		now := uint64(time.Now().UnixMilli())
 		if timeoutState.Timestamp > now+5000 || timeoutState.Timestamp < now-5000 {
+			e.logger.Debug(
+				"ignoring shard timeout",
+				zap.String("reason", "timestamp out of window"),
+				zap.Uint64("timestamp", timeoutState.Timestamp),
+				zap.Uint64("now", now),
+			)
 			shardTimeoutStateValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
@@ -285,6 +307,11 @@ func (e *GlobalConsensusEngine) validateShardConsensusMessage(
 		}
 
 	default:
+		e.logger.Debug(
+			"rejecting shard consensus message",
+			zap.String("reason", "unknown type prefix"),
+			zap.Uint32("type", typePrefix),
+		)
 		return tp2p.ValidationResultReject
 	}
 
@@ -301,7 +328,7 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 	)
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)
@@ -327,6 +354,10 @@ func (e *GlobalConsensusEngine) validateProverMessage(
 
 		for _, r := range messageBundle.Requests {
 			if r.GetKick() != nil {
+				e.logger.Debug(
+					"ignoring prover message",
+					zap.String("reason", "bundle contains kick request"),
+				)
 				return tp2p.ValidationResultIgnore
 			}
 		}
@@ -396,12 +427,19 @@ func (e *GlobalConsensusEngine) validateAppFrameMessage(
 		}
 
 		if !valid {
-			e.logger.Debug("invalid frame")
+			e.logger.Debug(
+				"invalid app frame",
+				zap.String("reason", "frame validator returned false"),
+			)
 			shardFrameValidationTotal.WithLabelValues("reject").Inc()
 			return tp2p.ValidationResultReject
 		}
 
 		if frametime.AppFrameSince(frame) > 120*time.Second {
+			e.logger.Debug(
+				"ignoring app frame",
+				zap.String("reason", "frame too old"),
+			)
 			shardFrameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
@@ -409,6 +447,11 @@ func (e *GlobalConsensusEngine) validateAppFrameMessage(
 		shardFrameValidationTotal.WithLabelValues("accept").Inc()
 
 	default:
+		e.logger.Debug(
+			"rejecting app frame message",
+			zap.String("reason", "unknown type prefix"),
+			zap.Uint32("type", typePrefix),
+		)
 		return tp2p.ValidationResultReject
 	}
 
@@ -421,7 +464,7 @@ func (e *GlobalConsensusEngine) validateFrameMessage(
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)
@@ -454,11 +497,21 @@ func (e *GlobalConsensusEngine) validateFrameMessage(
 		}
 
 		if e.currentRank > frame.GetRank()+2 {
+			e.logger.Debug(
+				"ignoring global frame",
+				zap.String("reason", "rank too old"),
+				zap.Uint64("current_rank", e.currentRank),
+				zap.Uint64("frame_rank", frame.GetRank()),
+			)
 			frameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
 
 		if frametime.GlobalFrameSince(frame) > 120*time.Second {
+			e.logger.Debug(
+				"ignoring global frame",
+				zap.String("reason", "frame too old"),
+			)
 			frameValidationTotal.WithLabelValues("ignore").Inc()
 			return tp2p.ValidationResultIgnore
 		}
@@ -478,7 +531,7 @@ func (e *GlobalConsensusEngine) validatePeerInfoMessage(
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)
@@ -567,7 +620,7 @@ func (e *GlobalConsensusEngine) validateAlertMessage(
 ) tp2p.ValidationResult {
 	// Check if data is long enough to contain type prefix
 	if len(message.Data) < 4 {
-		e.logger.Error(
+		e.logger.Debug(
 			"message too short",
 			zap.Int("data_length", len(message.Data)),
 		)

@@ -170,6 +170,7 @@ type snapshotManager struct {
 	logger *zap.Logger
 	store  tries.TreeBackingStore
 	mu     sync.Mutex
+	closed bool
 	// generations holds snapshot generations ordered from newest to oldest.
 	// generations[0] is the current/latest generation.
 	generations []*snapshotGeneration
@@ -189,6 +190,10 @@ func newSnapshotManager(
 func (m *snapshotManager) publish(root []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if m.closed {
+		return
+	}
 
 	rootHex := ""
 	if len(root) != 0 {
@@ -287,7 +292,7 @@ func (m *snapshotManager) acquire(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if len(m.generations) == 0 {
+	if m.closed || len(m.generations) == 0 {
 		m.logger.Warn("no snapshot generations available")
 		return nil
 	}
@@ -423,6 +428,53 @@ func (m *snapshotManager) release(handle *snapshotHandle) {
 			return
 		}
 	}
+}
+
+// close releases all snapshot generations and their DB snapshots. After close,
+// publish and acquire become no-ops. Shard snapshot handles held by active sync
+// sessions remain valid (they are self-contained in-memory DBs) and will be
+// released when the session ends.
+func (m *snapshotManager) close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return
+	}
+	m.closed = true
+
+	for _, gen := range m.generations {
+		for key, handle := range gen.handles {
+			delete(gen.handles, key)
+			if handle != nil {
+				handle.releaseRef(m.logger)
+			}
+		}
+		if gen.dbSnapshot != nil {
+			if err := gen.dbSnapshot.Close(); err != nil {
+				m.logger.Warn("failed to close DB snapshot during shutdown", zap.Error(err))
+			}
+			gen.dbSnapshot = nil
+		}
+	}
+	m.generations = nil
+
+	m.logger.Debug("snapshot manager closed")
+}
+
+// reopen resets the closed flag so the snapshot manager can accept new
+// snapshots after a respawn. Any previously held snapshots were already
+// released by close(), so we start with an empty generation list.
+func (m *snapshotManager) reopen() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.closed {
+		return
+	}
+	m.closed = false
+	m.generations = make([]*snapshotGeneration, 0, maxSnapshotGenerations)
+	m.logger.Debug("snapshot manager reopened")
 }
 
 func shardKeyString(sk tries.ShardKey) string {

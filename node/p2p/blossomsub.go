@@ -44,6 +44,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	grpcpeer "google.golang.org/grpc/peer"
@@ -84,19 +85,23 @@ type BlossomSub struct {
 	// Track which bit slices belong to which original bitmasks, used to reference
 	// count bitmasks for closed subscriptions
 	subscriptionTracker map[string][][]byte
-	subscriptions       []*blossomsub.Subscription
-	subscriptionMutex   sync.RWMutex
-	h                   host.Host
-	signKey             crypto.PrivKey
-	peerScore           map[string]*appScore
-	peerScoreMx         sync.Mutex
-	bootstrap           internal.PeerConnector
-	discovery           internal.PeerConnector
-	manualReachability  atomic.Pointer[bool]
-	p2pConfig           config.P2PConfig
-	dht                 *dht.IpfsDHT
-	coreId              uint
-	configDir           ConfigDir
+	// Track subscriptions per bitmask key so Unsubscribe can cancel them
+	// before closing the bitmask (blossomsub refuses to close a bitmask
+	// with open subscriptions).
+	subscriptionsByBitmask map[string][]*blossomsub.Subscription
+	subscriptionMutex      sync.RWMutex
+	h                      host.Host
+	signKey                crypto.PrivKey
+	peerScore              map[string]*appScore
+	peerScoreMx            sync.Mutex
+	bootstrap              internal.PeerConnector
+	discovery              internal.PeerConnector
+	manualReachability     atomic.Pointer[bool]
+	p2pConfig              config.P2PConfig
+	dht                    *dht.IpfsDHT
+	routingDiscovery       *routing.RoutingDiscovery
+	coreId                 uint
+	configDir              ConfigDir
 }
 
 var _ p2p.PubSub = (*BlossomSub)(nil)
@@ -150,15 +155,16 @@ func NewBlossomSubWithHost(
 	}
 
 	bs := &BlossomSub{
-		ctx:                 ctx,
-		cancel:              cancel,
-		logger:              logger,
-		bitmaskMap:          make(map[string]*blossomsub.Bitmask),
-		subscriptionTracker: make(map[string][][]byte),
-		signKey:             privKey,
-		peerScore:           make(map[string]*appScore),
-		p2pConfig:           *p2pConfig,
-		coreId:              coreId,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		logger:                 logger,
+		bitmaskMap:             make(map[string]*blossomsub.Bitmask),
+		subscriptionTracker:    make(map[string][][]byte),
+		subscriptionsByBitmask: make(map[string][]*blossomsub.Subscription),
+		signKey:                privKey,
+		peerScore:              make(map[string]*appScore),
+		p2pConfig:              *p2pConfig,
+		coreId:                 coreId,
 	}
 
 	idService := internal.IDServiceFromHost(host)
@@ -317,6 +323,7 @@ func NewBlossomSubWithHost(
 
 	peerID := host.ID()
 	bs.dht = kademliaDHT
+	bs.routingDiscovery = routingDiscovery
 	bs.ps = pubsub
 	bs.peerID = peerID
 	bs.h = host
@@ -457,7 +464,24 @@ func NewBlossomSub(
 		if coreId == 0 {
 			opts = append(opts, libp2p.Identity(privKey))
 		} else {
-			workerKey, _, err := crypto.GenerateEd448Key(rand.Reader)
+			// Derive a deterministic worker key from the peer key + core ID.
+			// This gives each worker a stable, unique peer ID across restarts
+			// (avoiding sybil detection) while still using the original peer
+			// key for message signing.
+			rawPriv, err := privKey.Raw()
+			if err != nil {
+				logger.Panic("error getting private key bytes", zap.Error(err))
+			}
+			shake := sha3.NewShake256()
+			shake.Write(rawPriv)
+			shake.Write([]byte(fmt.Sprintf("/worker/%d", coreId)))
+			seed := make([]byte, 64)
+			if _, err := shake.Read(seed); err != nil {
+				logger.Panic("error deriving worker key seed", zap.Error(err))
+			}
+			workerKey, _, err := crypto.GenerateEd448Key(
+				bytes.NewReader(seed),
+			)
 			if err != nil {
 				logger.Panic("error generating worker peerkey", zap.Error(err))
 			}
@@ -515,17 +539,18 @@ func NewBlossomSub(
 
 	ctx, cancel := context.WithCancel(ctx)
 	bs := &BlossomSub{
-		ctx:                 ctx,
-		cancel:              cancel,
-		logger:              logger,
-		bitmaskMap:          make(map[string]*blossomsub.Bitmask),
-		subscriptionTracker: make(map[string][][]byte),
-		signKey:             privKey,
-		peerScore:           make(map[string]*appScore),
-		p2pConfig:           *p2pConfig,
-		derivedPeerID:       derivedPeerId,
-		coreId:              coreId,
-		configDir:           configDir,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		logger:                 logger,
+		bitmaskMap:             make(map[string]*blossomsub.Bitmask),
+		subscriptionTracker:    make(map[string][][]byte),
+		subscriptionsByBitmask: make(map[string][]*blossomsub.Subscription),
+		signKey:                privKey,
+		peerScore:              make(map[string]*appScore),
+		p2pConfig:              *p2pConfig,
+		derivedPeerID:          derivedPeerId,
+		coreId:                 coreId,
+		configDir:              configDir,
 	}
 
 	h, err := libp2p.New(opts...)
@@ -767,6 +792,7 @@ func NewBlossomSub(
 
 	peerID := h.ID()
 	bs.dht = kademliaDHT
+	bs.routingDiscovery = routingDiscovery
 	bs.ps = pubsub
 	bs.peerID = peerID
 	bs.h = h
@@ -872,13 +898,78 @@ func (b *BlossomSub) background(ctx context.Context) {
 	refreshScores := time.NewTicker(DecayInterval)
 	defer refreshScores.Stop()
 
+	peerReconnectInterval := b.p2pConfig.PeerReconnectCheckInterval
+	peerReconnect := time.NewTicker(peerReconnectInterval)
+	defer peerReconnect.Stop()
+
 	for {
 		select {
 		case <-refreshScores.C:
 			b.refreshScores()
+		case <-peerReconnect.C:
+			b.checkAndReconnectPeers(ctx)
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+func (b *BlossomSub) checkAndReconnectPeers(ctx context.Context) {
+	peerCount := len(b.h.Network().Peers())
+	if peerCount >= b.p2pConfig.MinBootstrapPeers {
+		return
+	}
+
+	b.logger.Warn(
+		"low peer count, attempting to re-bootstrap and discover",
+		zap.Int("current_peers", peerCount),
+		zap.Int("min_bootstrap_peers", b.p2pConfig.MinBootstrapPeers),
+	)
+
+	// Re-bootstrap the DHT to refresh the routing table. At startup,
+	// kademliaDHT.Bootstrap() populates the routing table by connecting to
+	// bootstrap peers. Without calling it again here, the routing table can
+	// go empty after all peers disconnect, making FindPeers unable to
+	// discover anyone — leaving the node permanently stuck.
+	if b.dht != nil {
+		if err := b.dht.Bootstrap(ctx); err != nil {
+			b.logger.Error("DHT re-bootstrap failed", zap.Error(err))
+		}
+	}
+
+	// Re-advertise so other peers can find us through the DHT.
+	if b.routingDiscovery != nil {
+		util.Advertise(
+			ctx,
+			b.routingDiscovery,
+			getNetworkNamespace(b.p2pConfig.Network),
+		)
+	}
+
+	// Clear peerstore addresses for disconnected peers so we don't keep
+	// dialing stale/invalid addresses that were added in previous attempts.
+	for _, p := range b.h.Peerstore().Peers() {
+		if p == b.h.ID() {
+			continue
+		}
+		if b.h.Network().Connectedness(p) != network.Connected &&
+			b.h.Network().Connectedness(p) != network.Limited {
+			b.h.Peerstore().ClearAddrs(p)
+		}
+	}
+
+	if err := b.DiscoverPeers(ctx); err != nil {
+		b.logger.Error("peer reconnect failed", zap.Error(err))
+	}
+
+	newCount := len(b.h.Network().Peers())
+	if newCount >= b.p2pConfig.MinBootstrapPeers {
+		b.logger.Info("peer reconnect succeeded", zap.Int("peers", newCount))
+	} else {
+		b.logger.Warn(
+			"peer reconnect: still low peer count, will retry at next interval",
+			zap.Int("peers", newCount),
+		)
 	}
 }
 
@@ -983,9 +1074,9 @@ func (b *BlossomSub) Subscribe(
 		zap.String("bitmask", hex.EncodeToString(bitmask)),
 	)
 
-	// Track subscriptions for cleanup on Close
+	// Track subscriptions per bitmask for cleanup
 	b.subscriptionMutex.Lock()
-	b.subscriptions = append(b.subscriptions, subs...)
+	b.subscriptionsByBitmask[string(bitmask)] = subs
 	b.subscriptionMutex.Unlock()
 
 	for _, sub := range subs {
@@ -1067,6 +1158,15 @@ func (b *BlossomSub) Unsubscribe(bitmask []byte, raw bool) {
 		"unsubscribing from bitmask",
 		zap.String("bitmask", hex.EncodeToString(bitmask)),
 	)
+
+	// Cancel the subscription objects so the bitmask can be closed and the
+	// subscription goroutines exit.
+	if subs, ok := b.subscriptionsByBitmask[bitmaskKey]; ok {
+		for _, sub := range subs {
+			sub.Cancel()
+		}
+		delete(b.subscriptionsByBitmask, bitmaskKey)
+	}
 
 	// Check each bit slice to see if it's still needed by other subscriptions
 	for _, bitSlice := range bitSlices {
@@ -1288,7 +1388,7 @@ func (b *BlossomSub) runConnectivityTest(
 		if info.ID == b.h.ID() {
 			continue
 		}
-		if strings.Contains(info.Addrs[0].String(), "dnsaddr") {
+		if strings.Contains(info.Addrs[0].String(), "dns4") {
 			candidates = append(candidates, info)
 		}
 	}
@@ -1316,7 +1416,7 @@ func (b *BlossomSub) invokeConnectivityTest(
 		if err != nil {
 			host, err = addr.ValueForProtocol(ma.P_IP6)
 			if err != nil {
-				host, err = addr.ValueForProtocol(ma.P_DNSADDR)
+				host, err = addr.ValueForProtocol(ma.P_DNS4)
 				if err != nil {
 					continue
 				}
@@ -2031,10 +2131,12 @@ func (b *BlossomSub) Close() error {
 
 	// Cancel all subscriptions to unblock any pending Next() calls
 	b.subscriptionMutex.Lock()
-	for _, sub := range b.subscriptions {
-		sub.Cancel()
+	for _, subs := range b.subscriptionsByBitmask {
+		for _, sub := range subs {
+			sub.Cancel()
+		}
 	}
-	b.subscriptions = nil
+	b.subscriptionsByBitmask = nil
 	b.subscriptionMutex.Unlock()
 
 	return nil

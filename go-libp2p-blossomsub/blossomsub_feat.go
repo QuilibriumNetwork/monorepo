@@ -23,15 +23,15 @@ const (
 )
 
 // BlossomSubDefaultProtocols is the default BlossomSub router protocol list
-var BlossomSubDefaultProtocols = []protocol.ID{BlossomSubID_v21, BlossomSubID_v2}
+var BlossomSubDefaultProtocols = []protocol.ID{BlossomSubID_v21}
 
 // BlossomSubDefaultFeatures is the feature test function for the default BlossomSub protocols
 func BlossomSubDefaultFeatures(feat BlossomSubFeature, proto protocol.ID) bool {
 	switch feat {
 	case BlossomSubFeatureMesh:
-		return proto == BlossomSubID_v21 || proto == BlossomSubID_v2
+		return proto == BlossomSubID_v21
 	case BlossomSubFeaturePX:
-		return proto == BlossomSubID_v21 || proto == BlossomSubID_v2
+		return proto == BlossomSubID_v21
 	case BlossomSubFeatureIdontwant:
 		return proto == BlossomSubID_v21
 	default:

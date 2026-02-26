@@ -66,6 +66,9 @@ func (m *mockWorkerManager) Start(ctx context.Context) error {
 func (m *mockWorkerManager) Stop() error {
 	panic("unimplemented")
 }
+func (m *mockWorkerManager) RespawnWorker(coreId uint, filter []byte) error {
+	return nil
+}
 
 func (m *mockWorkerManager) RangeWorkers() ([]*store.WorkerInfo, error) {
 	out := make([]*store.WorkerInfo, len(m.workers))

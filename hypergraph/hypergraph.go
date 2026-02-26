@@ -132,12 +132,22 @@ func (hg *HypergraphCRDT) SetSelfPeerID(peerID string) {
 
 func (hg *HypergraphCRDT) SetShutdownContext(ctx context.Context) {
 	hg.shutdownCtx = ctx
+	// Reopen the snapshot manager in case it was closed by a previous
+	// shutdown context (i.e. during in-process engine respawn).
+	hg.snapshotMgr.reopen()
 	go func() {
 		select {
 		case <-hg.shutdownCtx.Done():
-			hg.snapshotMgr.publish(nil)
+			hg.snapshotMgr.close()
 		}
 	}()
+}
+
+// CloseSnapshots synchronously releases all snapshot generations and their DB
+// snapshots. This must be called before closing the underlying Pebble database
+// to avoid dangling snapshot warnings. It is idempotent.
+func (hg *HypergraphCRDT) CloseSnapshots() {
+	hg.snapshotMgr.close()
 }
 
 func (hg *HypergraphCRDT) contextWithShutdown(
@@ -157,6 +167,34 @@ func (hg *HypergraphCRDT) contextWithShutdown(
 	}()
 
 	return ctx, cancel
+}
+
+// lockWithShutdown tries to acquire hg.mu exclusively. If the shutdown context
+// fires before the lock is acquired, it returns false and the caller must not
+// proceed. A background goroutine ensures the lock is released if it is
+// eventually acquired after shutdown.
+func (hg *HypergraphCRDT) lockWithShutdown() bool {
+	if hg.shutdownCtx == nil {
+		hg.mu.Lock()
+		return true
+	}
+
+	locked := make(chan struct{})
+	go func() {
+		hg.mu.Lock()
+		close(locked)
+	}()
+
+	select {
+	case <-locked:
+		return true
+	case <-hg.shutdownCtx.Done():
+		go func() {
+			<-locked
+			hg.mu.Unlock()
+		}()
+		return false
+	}
 }
 
 func (hg *HypergraphCRDT) snapshotSet(
@@ -696,7 +734,9 @@ func (hg *HypergraphCRDT) GetMetadataAtKey(pathKey []byte) (
 	[]hypergraph.ShardMetadata,
 	error,
 ) {
-	hg.mu.Lock()
+	if !hg.lockWithShutdown() {
+		return nil, errors.New("shutting down")
+	}
 	defer hg.mu.Unlock()
 	if len(pathKey) < 32 {
 		return nil, errors.Wrap(

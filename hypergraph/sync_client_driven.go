@@ -68,7 +68,8 @@ func isGlobalProverShardBytes(shardKeyBytes []byte) bool {
 func (hg *HypergraphCRDT) PerformSync(
 	stream protobufs.HypergraphComparisonService_PerformSyncServer,
 ) error {
-	ctx := stream.Context()
+	ctx, shutdownCancel := hg.contextWithShutdown(stream.Context())
+	defer shutdownCancel()
 
 	logger := hg.logger.With(zap.String("method", "PerformSync"))
 	sessionStart := time.Now()
@@ -404,7 +405,6 @@ func (hg *HypergraphCRDT) handleGetLeaves(
 			Size:       leaf.Size.FillBytes(make([]byte, 32)),
 		}
 
-		// Load underlying vertex tree if available (use snapshot store for consistency)
 		vtree, err := session.store.LoadVertexTree(leaf.Key)
 		if err == nil && vtree != nil {
 			data, err := tries.SerializeNonLazyTree(vtree)

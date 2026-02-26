@@ -115,21 +115,21 @@ func (h *HyperedgeRemove) GetWriteAddresses(
 func (h *HyperedgeRemove) Verify(frameNumber uint64) (bool, error) {
 	// Verify that the hyperedge is valid
 	if h.Value == nil {
-		return false, errors.Wrap(errors.New("missing hyperedge value"), "verify")
+		return false, errors.Wrap(errors.New("missing hyperedge value"), "verify: invalid hyperedge remove")
 	}
 
 	hyperedgeID := h.Value.GetID()
 	if len(hyperedgeID) != 64 {
 		return false, errors.Wrap(
 			errors.New("invalid hyperedge id length"),
-			"verify",
+			"verify: invalid hyperedge remove",
 		)
 	}
 
 	if !bytes.Equal(hyperedgeID[:32], h.Domain[:]) {
 		return false, errors.Wrap(
 			errors.New("hyperedge domain mismatch"),
-			"verify",
+			"verify: invalid hyperedge remove",
 		)
 	}
 
@@ -144,11 +144,11 @@ func (h *HyperedgeRemove) Verify(frameNumber uint64) (bool, error) {
 		slices.Concat(h.Domain[:], []byte("HYPEREDGE_REMOVE")),
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid hyperedge remove")
 	}
 
 	if !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid hyperedge remove")
 	}
 
 	return true, nil

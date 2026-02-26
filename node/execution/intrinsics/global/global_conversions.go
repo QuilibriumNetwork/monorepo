@@ -5,6 +5,7 @@ import (
 
 	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
@@ -668,6 +669,96 @@ func (p *ProverSeniorityMerge) ToProtobuf() *protobufs.ProverSeniorityMerge {
 		FrameNumber:                p.FrameNumber,
 		PublicKeySignatureBls48581: p.PublicKeySignatureBLS48581.ToProtobuf(),
 		MergeTargets:               mergeTargets,
+	}
+}
+
+// ShardSplitFromProtobuf converts a protobuf ShardSplit to intrinsics
+func ShardSplitFromProtobuf(
+	pb *protobufs.ShardSplit,
+	hg hypergraph.Hypergraph,
+	keyManager keys.KeyManager,
+	shardsStore store.ShardsStore,
+	proverRegistry consensus.ProverRegistry,
+) (*ShardSplitOp, error) {
+	if pb == nil {
+		return nil, nil
+	}
+
+	pubKeySig, err := BLS48581AddressedSignatureFromProtobuf(
+		pb.PublicKeySignatureBls48581,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "shard split from protobuf")
+	}
+
+	return &ShardSplitOp{
+		ShardAddress:               pb.ShardAddress,
+		ProposedShards:             pb.ProposedShards,
+		FrameNumber:                pb.FrameNumber,
+		PublicKeySignatureBLS48581: *pubKeySig,
+		hypergraph:                 hg,
+		keyManager:                 keyManager,
+		shardsStore:                shardsStore,
+		proverRegistry:             proverRegistry,
+	}, nil
+}
+
+// ToProtobuf converts an intrinsics ShardSplitOp to protobuf
+func (op *ShardSplitOp) ToProtobuf() *protobufs.ShardSplit {
+	if op == nil {
+		return nil
+	}
+
+	return &protobufs.ShardSplit{
+		ShardAddress:               op.ShardAddress,
+		ProposedShards:             op.ProposedShards,
+		FrameNumber:                op.FrameNumber,
+		PublicKeySignatureBls48581: op.PublicKeySignatureBLS48581.ToProtobuf(),
+	}
+}
+
+// ShardMergeFromProtobuf converts a protobuf ShardMerge to intrinsics
+func ShardMergeFromProtobuf(
+	pb *protobufs.ShardMerge,
+	hg hypergraph.Hypergraph,
+	keyManager keys.KeyManager,
+	shardsStore store.ShardsStore,
+	proverRegistry consensus.ProverRegistry,
+) (*ShardMergeOp, error) {
+	if pb == nil {
+		return nil, nil
+	}
+
+	pubKeySig, err := BLS48581AddressedSignatureFromProtobuf(
+		pb.PublicKeySignatureBls48581,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "shard merge from protobuf")
+	}
+
+	return &ShardMergeOp{
+		ShardAddresses:             pb.ShardAddresses,
+		ParentAddress:              pb.ParentAddress,
+		FrameNumber:                pb.FrameNumber,
+		PublicKeySignatureBLS48581: *pubKeySig,
+		hypergraph:                 hg,
+		keyManager:                 keyManager,
+		shardsStore:                shardsStore,
+		proverRegistry:             proverRegistry,
+	}, nil
+}
+
+// ToProtobuf converts an intrinsics ShardMergeOp to protobuf
+func (op *ShardMergeOp) ToProtobuf() *protobufs.ShardMerge {
+	if op == nil {
+		return nil
+	}
+
+	return &protobufs.ShardMerge{
+		ShardAddresses:             op.ShardAddresses,
+		ParentAddress:              op.ParentAddress,
+		FrameNumber:                op.FrameNumber,
+		PublicKeySignatureBls48581: op.PublicKeySignatureBLS48581.ToProtobuf(),
 	}
 }
 

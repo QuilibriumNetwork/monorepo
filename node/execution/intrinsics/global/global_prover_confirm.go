@@ -414,7 +414,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 	)
 	confirmDomain, err := poseidon.HashBytes(confirmDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover confirm")
 	}
 
 	_, err = p.hypergraph.GetVertex([64]byte(slices.Concat(
@@ -422,7 +422,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover confirm")
 	}
 
 	tree, err := p.hypergraph.GetVertexData([64]byte(slices.Concat(
@@ -430,7 +430,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover confirm")
 	}
 
 	pubkey, err := p.rdfMultiprover.Get(
@@ -440,7 +440,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		tree,
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover confirm")
 	}
 
 	for _, filter := range p.Filters {
@@ -449,7 +449,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 			slices.Concat([]byte("PROVER_ALLOCATION"), pubkey, filter),
 		)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid prover confirm")
 		}
 		allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
 		allocationFullAddress := [64]byte{}
@@ -461,7 +461,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		if err != nil || allocationTree == nil {
 			return false, errors.Wrap(
 				errors.New("allocation not found"),
-				"verify",
+				"verify: invalid prover confirm",
 			)
 		}
 
@@ -473,7 +473,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 			allocationTree,
 		)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid prover confirm")
 		}
 
 		status := uint8(0)
@@ -485,7 +485,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		if status != 0 && status != 3 {
 			return false, errors.Wrap(
 				errors.New("invalid allocation state for confirmation"),
-				"verify",
+				"verify: invalid prover confirm",
 			)
 		}
 
@@ -499,7 +499,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 				allocationTree,
 			)
 			if err != nil || len(joinFrameBytes) != 8 {
-				return false, errors.Wrap(errors.New("missing join frame"), "verify")
+				return false, errors.Wrap(errors.New("missing join frame"), "verify: invalid prover confirm")
 			}
 			joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
 
@@ -509,7 +509,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 					// If joined before frame 255840, cannot confirm until frame 255840
 					return false, errors.Wrap(
 						errors.New("cannot confirm before frame 255840"),
-						"verify",
+						"verify: invalid prover confirm",
 					)
 				}
 
@@ -534,13 +534,13 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 							"must wait 360 frames after join to confirm (%d)",
 							framesSinceJoin,
 						),
-						"verify",
+						"verify: invalid prover confirm",
 					)
 				}
 				if framesSinceJoin > 720 {
 					return false, errors.Wrap(
 						errors.New("confirmation window expired (720 frames)"),
-						"verify",
+						"verify: invalid prover confirm",
 					)
 				}
 			}
@@ -554,7 +554,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 				allocationTree,
 			)
 			if err != nil || len(leaveFrameBytes) != 8 {
-				return false, errors.Wrap(errors.New("missing leave frame"), "verify")
+				return false, errors.Wrap(errors.New("missing leave frame"), "verify: invalid prover confirm")
 			}
 			leaveFrame := binary.BigEndian.Uint64(leaveFrameBytes)
 
@@ -562,13 +562,13 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 			if framesSinceLeave < 360 {
 				return false, errors.Wrap(
 					errors.New("must wait 360 frames after leave to confirm"),
-					"verify",
+					"verify: invalid prover confirm",
 				)
 			}
 			if framesSinceLeave > 720 {
 				return false, errors.Wrap(
 					errors.New("leave confirmation window expired (720 frames)"),
-					"verify",
+					"verify: invalid prover confirm",
 				)
 			}
 		}
@@ -583,7 +583,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		confirmDomain.Bytes(),
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid prover confirm")
 	}
 
 	return true, nil

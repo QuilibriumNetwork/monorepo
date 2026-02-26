@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/config"
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/worker"
@@ -63,6 +64,9 @@ func (m *mockWorkerManager) ProposeAllocations(coreIds []uint, filters [][]byte)
 	return nil
 }
 func (m *mockWorkerManager) DecideAllocations(reject [][]byte, confirm [][]byte) error {
+	return nil
+}
+func (m *mockWorkerManager) RespawnWorker(coreId uint, filter []byte) error {
 	return nil
 }
 func (m *mockWorkerManager) RangeWorkers() ([]*store.WorkerInfo, error) {
@@ -410,4 +414,134 @@ func TestReconcileWorkerAllocations_UnconfirmedProposalWithNilSelf(t *testing.T)
 	require.NoError(t, err)
 	require.Len(t, workers, 1)
 	assert.Nil(t, workers[0].Filter, "filter should be cleared after timeout even with nil self")
+}
+
+func TestSelectExcessPendingFilters_ExpiredJoinsNotCounted(t *testing.T) {
+	engine := &GlobalConsensusEngine{
+		logger: zap.NewNop(),
+		config: &config.Config{
+			Engine: &config.EngineConfig{
+				DataWorkerCount: 2,
+			},
+		},
+	}
+
+	filter1 := []byte("shard-filter-1")
+	filter2 := []byte("shard-filter-2")
+	filter3 := []byte("shard-filter-3")
+
+	joinFrame := uint64(260000)
+
+	// 3 pending joins: 2 expired, 1 valid. Capacity = 2, active = 0.
+	// Without the fix, all 3 count as pending, allowedPending = 2, excess = 1,
+	// and the valid join might be randomly selected for rejection.
+	// With the fix, only the valid join counts, so excess = 0.
+	self := &typesconsensus.ProverInfo{
+		Address: []byte("prover-address"),
+		Allocations: []typesconsensus.ProverAllocationInfo{
+			{
+				Status:             typesconsensus.ProverStatusJoining,
+				ConfirmationFilter: filter1,
+				JoinFrameNumber:    joinFrame,
+			},
+			{
+				Status:             typesconsensus.ProverStatusJoining,
+				ConfirmationFilter: filter2,
+				JoinFrameNumber:    joinFrame,
+			},
+			{
+				Status:             typesconsensus.ProverStatusJoining,
+				ConfirmationFilter: filter3,
+				JoinFrameNumber:    joinFrame + 500, // recent, not expired
+			},
+		},
+	}
+
+	// Frame is past the grace period for filter1 and filter2 but not filter3
+	frameNumber := joinFrame + pendingFilterGraceFrames + 1
+
+	excess := engine.selectExcessPendingFilters(self, frameNumber)
+	assert.Empty(t, excess, "expired joins should not count toward pending limit")
+}
+
+func TestSelectExcessPendingFilters_ValidJoinsStillLimited(t *testing.T) {
+	engine := &GlobalConsensusEngine{
+		logger: zap.NewNop(),
+		config: &config.Config{
+			Engine: &config.EngineConfig{
+				DataWorkerCount: 1,
+			},
+		},
+	}
+
+	filter1 := []byte("shard-filter-1")
+	filter2 := []byte("shard-filter-2")
+
+	joinFrame := uint64(260000)
+
+	// 2 valid pending joins, capacity = 1, active = 0 → excess = 1
+	self := &typesconsensus.ProverInfo{
+		Address: []byte("prover-address"),
+		Allocations: []typesconsensus.ProverAllocationInfo{
+			{
+				Status:             typesconsensus.ProverStatusJoining,
+				ConfirmationFilter: filter1,
+				JoinFrameNumber:    joinFrame,
+			},
+			{
+				Status:             typesconsensus.ProverStatusJoining,
+				ConfirmationFilter: filter2,
+				JoinFrameNumber:    joinFrame,
+			},
+		},
+	}
+
+	frameNumber := joinFrame + 100 // well within grace period
+
+	excess := engine.selectExcessPendingFilters(self, frameNumber)
+	assert.Len(t, excess, 1, "should identify 1 excess pending join")
+}
+
+func TestSelectExcessPendingFilters_MixedActiveAndExpired(t *testing.T) {
+	engine := &GlobalConsensusEngine{
+		logger: zap.NewNop(),
+		config: &config.Config{
+			Engine: &config.EngineConfig{
+				DataWorkerCount: 2,
+			},
+		},
+	}
+
+	filter1 := []byte("shard-filter-1")
+	filter2 := []byte("shard-filter-2")
+	filter3 := []byte("shard-filter-3")
+
+	// 1 active + 1 expired joining + 1 valid joining. Capacity = 2.
+	// Active uses 1 slot, so allowedPending = 1.
+	// Expired join should not count, leaving 1 valid pending → no excess.
+	self := &typesconsensus.ProverInfo{
+		Address: []byte("prover-address"),
+		Allocations: []typesconsensus.ProverAllocationInfo{
+			{
+				Status:             typesconsensus.ProverStatusActive,
+				ConfirmationFilter: filter1,
+				JoinFrameNumber:    200000,
+			},
+			{
+				Status:             typesconsensus.ProverStatusJoining,
+				ConfirmationFilter: filter2,
+				JoinFrameNumber:    250000, // expired
+			},
+			{
+				Status:             typesconsensus.ProverStatusJoining,
+				ConfirmationFilter: filter3,
+				JoinFrameNumber:    260000, // valid
+			},
+		},
+	}
+
+	frameNumber := uint64(260500) // past 250000+720 but not 260000+720
+
+	excess := engine.selectExcessPendingFilters(self, frameNumber)
+	assert.Empty(t, excess, "expired joins should be excluded; 1 active + 1 valid pending fits capacity 2")
 }

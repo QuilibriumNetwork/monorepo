@@ -340,7 +340,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 	)
 	resumeDomain, err := poseidon.HashBytes(resumeDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover resume")
 	}
 
 	_, err = p.hypergraph.GetVertex([64]byte(slices.Concat(
@@ -348,7 +348,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover resume")
 	}
 
 	tree, err := p.hypergraph.GetVertexData([64]byte(slices.Concat(
@@ -356,7 +356,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 		p.PublicKeySignatureBLS48581.Address,
 	)))
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover resume")
 	}
 
 	pubkey, err := p.rdfMultiprover.Get(
@@ -366,7 +366,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 		tree,
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover resume")
 	}
 
 	// Calculate allocation address to verify it exists and is paused
@@ -374,7 +374,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 		slices.Concat([]byte("PROVER_ALLOCATION"), pubkey, p.Filter),
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover resume")
 	}
 	allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
 	allocationFullAddress := [64]byte{}
@@ -386,7 +386,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 	if err != nil || allocationTree == nil {
 		return false, errors.Wrap(
 			errors.New("allocation not found"),
-			"verify",
+			"verify: invalid prover resume",
 		)
 	}
 
@@ -398,7 +398,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 		allocationTree,
 	)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover resume")
 	}
 
 	status := uint8(0)
@@ -410,7 +410,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 	if status != 2 {
 		return false, errors.Wrap(
 			errors.New("can only resume when allocation is paused"),
-			"verify",
+			"verify: invalid prover resume",
 		)
 	}
 
@@ -422,7 +422,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 		allocationTree,
 	)
 	if err != nil || len(pauseFrameBytes) != 8 {
-		return false, errors.Wrap(errors.New("missing pause frame"), "verify")
+		return false, errors.Wrap(errors.New("missing pause frame"), "verify: invalid prover resume")
 	}
 	pauseFrame := binary.BigEndian.Uint64(pauseFrameBytes)
 
@@ -431,7 +431,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 	if framesSincePause > 360 {
 		return false, errors.Wrap(
 			errors.New("pause timeout exceeded, allocation has implicitly left"),
-			"verify",
+			"verify: invalid prover resume",
 		)
 	}
 
@@ -444,7 +444,7 @@ func (p *ProverResume) Verify(frameNumber uint64) (bool, error) {
 		resumeDomain.Bytes(),
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid prover resume")
 	}
 
 	return true, nil

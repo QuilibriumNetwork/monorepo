@@ -349,7 +349,7 @@ func (c *CodeFinalize) Verify(frameNumber uint64) (bool, error) {
 	if len(c.Results) == 0 {
 		return false, errors.Wrap(
 			errors.New("no execution results provided"),
-			"verify",
+			"verify: invalid code finalize",
 		)
 	}
 
@@ -358,7 +358,7 @@ func (c *CodeFinalize) Verify(frameNumber uint64) (bool, error) {
 		if len(change.Address) != 32 || len(change.Domain) != 32 {
 			return false, errors.Wrap(
 				errors.New("invalid address length in state change"),
-				"verify",
+				"verify: invalid code finalize",
 			)
 		}
 	}
@@ -367,7 +367,7 @@ func (c *CodeFinalize) Verify(frameNumber uint64) (bool, error) {
 	clone.ProofOfExecution = nil
 	msg, err := clone.ToCanonicalBytes()
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid code finalize")
 	}
 
 	valid, err := c.keyManager.ValidateSignature(
@@ -379,11 +379,11 @@ func (c *CodeFinalize) Verify(frameNumber uint64) (bool, error) {
 	)
 
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid code finalize")
 	}
 
 	if !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid code finalize")
 	}
 
 	return true, nil

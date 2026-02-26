@@ -70,8 +70,11 @@ func (e *GlobalConsensusEngine) processProverMessageQueue(
 	ctx lifecycle.SignalerContext,
 ) {
 	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
+		e.logger.Debug("prover message queue processor disabled (not archive mode)")
 		return
 	}
+
+	e.logger.Info("prover message queue processor started")
 
 	for {
 		select {
@@ -1722,7 +1725,10 @@ func (e *GlobalConsensusEngine) addCertifiedState(
 	}
 
 	// Trigger coverage check asynchronously to avoid blocking message processing
-	e.triggerCoverageCheckAsync(parent.State.GetFrameNumber())
+	e.triggerCoverageCheckAsync(
+		parent.State.GetFrameNumber(),
+		parent.State.Header.Prover,
+	)
 }
 
 func (e *GlobalConsensusEngine) handleProposal(message *pb.Message) {

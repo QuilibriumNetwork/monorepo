@@ -1,6 +1,7 @@
 package global
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -149,6 +150,66 @@ func (p *ProverJoin) Materialize(
 		}
 	}
 
+	// Compute seniority from merge targets before the prover-exists check,
+	// so it can be applied to both new and existing provers.
+	var computedSeniority uint64 = 0
+	if len(p.MergeTargets) > 0 {
+		var mergePeerIds []string
+		for _, target := range p.MergeTargets {
+			// Check if this merge target was already consumed
+			spentBI, err := poseidon.HashBytes(slices.Concat(
+				[]byte("PROVER_JOIN_MERGE"),
+				target.PublicKey,
+			))
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
+			v, vErr := hg.Get(
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				spentBI.FillBytes(make([]byte, 32)),
+				hgstate.VertexAddsDiscriminator,
+			)
+			if vErr == nil && v != nil {
+				// Spent marker exists — check who consumed it
+				spentTree, ok := v.(*tries.VectorCommitmentTree)
+				if ok && spentTree != nil {
+					storedAddr, getErr := p.rdfMultiprover.Get(
+						GLOBAL_RDF_SCHEMA,
+						"merge:SpentMerge",
+						"ProverAddress",
+						spentTree,
+					)
+					if getErr == nil && len(storedAddr) == 32 &&
+						!bytes.Equal(storedAddr, proverAddress) {
+						continue // consumed by a different prover
+					}
+				}
+				// Same prover or legacy empty marker — count seniority
+			}
+
+			if target.KeyType == crypto.KeyTypeEd448 {
+				pk, err := pcrypto.UnmarshalEd448PublicKey(target.PublicKey)
+				if err != nil {
+					return nil, errors.Wrap(err, "materialize")
+				}
+
+				peerId, err := peer.IDFromPublicKey(pk)
+				if err != nil {
+					return nil, errors.Wrap(err, "materialize")
+				}
+
+				mergePeerIds = append(mergePeerIds, peerId.String())
+			}
+		}
+
+		if len(mergePeerIds) > 0 {
+			seniorityBig := compat.GetAggregatedSeniority(mergePeerIds)
+			if seniorityBig.IsUint64() {
+				computedSeniority = seniorityBig.Uint64()
+			}
+		}
+	}
+
 	if !proverExists {
 		// Create new prover entry
 		proverTree = &qcrypto.VectorCommitmentTree{}
@@ -194,39 +255,9 @@ func (p *ProverJoin) Materialize(
 			return nil, errors.Wrap(err, "materialize")
 		}
 
-		// Calculate seniority from MergeTargets
-		var seniority uint64 = 0
-		if len(p.MergeTargets) > 0 {
-			// Convert Ed448 public keys to peer IDs
-			var peerIds []string
-			for _, target := range p.MergeTargets {
-				if target.KeyType == crypto.KeyTypeEd448 {
-					pk, err := pcrypto.UnmarshalEd448PublicKey(target.PublicKey)
-					if err != nil {
-						return nil, errors.Wrap(err, "materialize")
-					}
-
-					peerId, err := peer.IDFromPublicKey(pk)
-					if err != nil {
-						return nil, errors.Wrap(err, "materialize")
-					}
-
-					peerIds = append(peerIds, peerId.String())
-				}
-			}
-
-			// Get aggregated seniority
-			if len(peerIds) > 0 {
-				seniorityBig := compat.GetAggregatedSeniority(peerIds)
-				if seniorityBig.IsUint64() {
-					seniority = seniorityBig.Uint64()
-				}
-			}
-		}
-
-		// Store seniority
+		// Store seniority (computed above from merge targets)
 		seniorityBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(seniorityBytes, seniority)
+		binary.BigEndian.PutUint64(seniorityBytes, computedSeniority)
 		err = p.rdfMultiprover.Set(
 			GLOBAL_RDF_SCHEMA,
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
@@ -317,6 +348,54 @@ func (p *ProverJoin) Materialize(
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "materialize")
+		}
+	} else if computedSeniority > 0 {
+		// For existing provers, update seniority if merge targets provide a
+		// higher value than what's currently stored.
+		existingSeniorityData, err := p.rdfMultiprover.Get(
+			GLOBAL_RDF_SCHEMA,
+			"prover:Prover",
+			"Seniority",
+			proverTree,
+		)
+		var existingSeniority uint64 = 0
+		if err == nil && len(existingSeniorityData) == 8 {
+			existingSeniority = binary.BigEndian.Uint64(existingSeniorityData)
+		}
+
+		if computedSeniority > existingSeniority {
+			seniorityBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(seniorityBytes, computedSeniority)
+			err = p.rdfMultiprover.Set(
+				GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"prover:Prover",
+				"Seniority",
+				seniorityBytes,
+				proverTree,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
+
+			updatedVertex := hg.NewVertexAddMaterializedState(
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+				[32]byte(proverAddress),
+				frameNumber,
+				proverTree,
+				proverTree,
+			)
+
+			err = hg.Set(
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				proverAddress,
+				hgstate.VertexAddsDiscriminator,
+				frameNumber,
+				updatedVertex,
+			)
+			if err != nil {
+				return nil, errors.Wrap(err, "materialize")
+			}
 		}
 	}
 
@@ -457,21 +536,59 @@ func (p *ProverJoin) Materialize(
 			return nil, errors.Wrap(err, "materialize")
 		}
 
-		// confirm this has not already been used
-		spentAddress := [64]byte{}
-		copy(spentAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-		copy(spentAddress[32:], spentMergeBI.FillBytes(make([]byte, 32)))
+		spentMergeAddr := spentMergeBI.FillBytes(make([]byte, 32))
+
+		// Check existing spent marker
+		var prior *tries.VectorCommitmentTree
+		existing, existErr := hg.Get(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			spentMergeAddr,
+			hgstate.VertexAddsDiscriminator,
+		)
+		if existErr == nil && existing != nil {
+			existingTree, ok := existing.(*tries.VectorCommitmentTree)
+			if ok && existingTree != nil {
+				storedAddr, getErr := p.rdfMultiprover.Get(
+					GLOBAL_RDF_SCHEMA,
+					"merge:SpentMerge",
+					"ProverAddress",
+					existingTree,
+				)
+				if getErr == nil && len(storedAddr) == 32 {
+					// New format marker — already has a prover address.
+					// Skip regardless of whether it's ours or another's.
+					continue
+				}
+				// Legacy empty marker — overwrite with prover address
+				prior = existingTree
+			}
+		}
+
+		// Write spent marker with prover address
+		spentTree := &tries.VectorCommitmentTree{}
+		err = p.rdfMultiprover.Set(
+			GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"merge:SpentMerge",
+			"ProverAddress",
+			proverAddress,
+			spentTree,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "materialize")
+		}
+
 		spentMergeVertex := hg.NewVertexAddMaterializedState(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-			[32]byte(spentMergeBI.FillBytes(make([]byte, 32))),
+			[32]byte(spentMergeAddr),
 			frameNumber,
-			nil,
-			&tries.VectorCommitmentTree{},
+			prior,
+			spentTree,
 		)
 
 		err = hg.Set(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			spentMergeBI.FillBytes(make([]byte, 32)),
+			spentMergeAddr,
 			hgstate.VertexAddsDiscriminator,
 			frameNumber,
 			spentMergeVertex,
@@ -528,14 +645,35 @@ func (p *ProverJoin) Prove(frameNumber uint64) error {
 		return errors.Wrap(err, "prove")
 	}
 
+	// Set the public key before signing merge targets, since merge target
+	// signatures are over the BLS public key and Verify() checks against it.
+	blsPublicKey := prover.Public().([]byte)
+
 	for _, mt := range p.MergeTargets {
 		if mt.signer != nil {
 			mt.Signature, err = mt.signer.SignWithDomain(
-				p.PublicKeySignatureBLS48581.PublicKey,
+				blsPublicKey,
 				[]byte("PROVER_JOIN_MERGE"),
 			)
 			if err != nil {
 				return errors.Wrap(err, "prove")
+			}
+
+			// Self-verify: catch key material issues before publishing
+			valid, verifyErr := p.keyManager.ValidateSignature(
+				mt.KeyType,
+				mt.PublicKey,
+				blsPublicKey,
+				mt.Signature,
+				[]byte("PROVER_JOIN_MERGE"),
+			)
+			if verifyErr != nil || !valid {
+				return fmt.Errorf(
+					"prove: merge target self-verify failed "+
+						"(key_type=%d, pub_key_len=%d, sig_len=%d, bls_pub_len=%d, err=%v)",
+					mt.KeyType, len(mt.PublicKey), len(mt.Signature),
+					len(blsPublicKey), verifyErr,
+				)
 			}
 		}
 	}
@@ -573,7 +711,7 @@ func (p *ProverJoin) Prove(frameNumber uint64) error {
 	// Create the proof of possession signature over the public key with the POP
 	// domain
 	popSignature, err := prover.SignWithDomain(
-		prover.Public().([]byte),
+		blsPublicKey,
 		popDomain,
 	)
 	if err != nil {
@@ -583,7 +721,7 @@ func (p *ProverJoin) Prove(frameNumber uint64) error {
 	// Create the BLS48581SignatureWithProofOfPossession
 	p.PublicKeySignatureBLS48581 = BLS48581SignatureWithProofOfPossession{
 		Signature:    signature,
-		PublicKey:    prover.Public().([]byte),
+		PublicKey:    blsPublicKey,
 		PopSignature: popSignature,
 	}
 
@@ -648,9 +786,36 @@ func (p *ProverJoin) GetWriteAddresses(frameNumber uint64) ([][]byte, error) {
 			return nil, errors.Wrap(err, "get write addresses")
 		}
 
+		spentAddr := spentMergeBI.FillBytes(make([]byte, 32))
+
+		// Skip merge targets whose spent markers already contain a prover
+		// address (new format). These won't be written to — either they
+		// belong to this prover (already recorded) or a different one.
+		// Legacy empty markers and new markers need a write lock since
+		// Materialize will write them.
+		if p.hypergraph != nil {
+			spentFullAddr := [64]byte{}
+			copy(spentFullAddr[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+			copy(spentFullAddr[32:], spentAddr)
+			spentData, dataErr := p.hypergraph.GetVertexData(spentFullAddr)
+			if dataErr == nil && spentData != nil {
+				storedAddr, getErr := p.rdfMultiprover.Get(
+					GLOBAL_RDF_SCHEMA,
+					"merge:SpentMerge",
+					"ProverAddress",
+					spentData,
+				)
+				if getErr == nil && len(storedAddr) == 32 {
+					// New format — won't be written to
+					continue
+				}
+				// Legacy empty — will be overwritten, need write lock
+			}
+		}
+
 		addresses[string(slices.Concat(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			spentMergeBI.FillBytes(make([]byte, 32)),
+			spentAddr,
 		))] = struct{}{}
 	}
 
@@ -673,23 +838,23 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	// First check if prover can join (not in tree or in left state)
 	addressBI, err := poseidon.HashBytes(p.PublicKeySignatureBLS48581.PublicKey)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover join")
 	}
 	address := addressBI.FillBytes(make([]byte, 32))
 
 	for _, filter := range p.Filters {
 		if len(filter) < 32 {
-			return false, errors.Wrap(errors.New("invalid filter size"), "verify")
+			return false, errors.Wrap(errors.New("invalid filter size"), "verify: invalid prover join")
 		}
 	}
 
 	if len(p.Proof)%516 != 0 || len(p.Proof)/516 != len(p.Filters) {
-		return false, errors.Wrap(errors.New("proof size mismatch"), "verify")
+		return false, errors.Wrap(errors.New("proof size mismatch"), "verify: invalid prover join")
 	}
 
 	// Disallow too old of a request
 	if p.FrameNumber+10 < frameNumber {
-		return false, errors.Wrap(errors.New("outdated request"), "verify")
+		return false, errors.Wrap(errors.New("outdated request"), "verify: invalid prover join")
 	}
 
 	frame, err := p.frameStore.GetGlobalClockFrame(p.FrameNumber)
@@ -702,13 +867,13 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			return false, errors.Wrap(errors.Wrap(
 				err,
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
-			), "verify")
+			), "verify: invalid prover join")
 		}
 		if !frames.First() || !frames.Valid() {
 			return false, errors.Wrap(errors.Wrap(
 				errors.New("not found"),
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
-			), "verify")
+			), "verify: invalid prover join")
 		}
 		frame, err = frames.Value()
 		frames.Close()
@@ -716,7 +881,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			return false, errors.Wrap(errors.Wrap(
 				err,
 				fmt.Sprintf("frame number: %d", p.FrameNumber),
-			), "verify")
+			), "verify: invalid prover join")
 		}
 	}
 
@@ -742,10 +907,42 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		solutions,
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid multi proof"), "verify")
+		return false, errors.Wrap(errors.New("invalid multi proof"), "verify: invalid prover join")
 	}
 
 	for _, mt := range p.MergeTargets {
+		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
+			[]byte("PROVER_JOIN_MERGE"),
+			mt.PublicKey,
+		))
+		if err != nil {
+			return false, errors.Wrap(err, "verify: invalid prover join")
+		}
+
+		spentFullAddr := [64]byte{}
+		copy(spentFullAddr[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(spentFullAddr[32:], spentMergeBI.FillBytes(make([]byte, 32)))
+
+		v, err := p.hypergraph.GetVertex(spentFullAddr)
+		if err == nil && v != nil {
+			// Spent marker exists — check if consumed by a different prover
+			spentData, dataErr := p.hypergraph.GetVertexData(spentFullAddr)
+			if dataErr == nil && spentData != nil {
+				storedAddr, getErr := p.rdfMultiprover.Get(
+					GLOBAL_RDF_SCHEMA,
+					"merge:SpentMerge",
+					"ProverAddress",
+					spentData,
+				)
+				if getErr == nil && len(storedAddr) == 32 &&
+					!bytes.Equal(storedAddr, address) {
+					// Consumed by a different prover — skip
+					continue
+				}
+			}
+			// Same prover or legacy empty — validate signature below
+		}
+
 		valid, err := p.keyManager.ValidateSignature(
 			mt.KeyType,
 			mt.PublicKey,
@@ -754,27 +951,13 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			[]byte("PROVER_JOIN_MERGE"),
 		)
 		if err != nil || !valid {
-			return false, errors.Wrap(err, "verify")
-		}
-
-		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
-			[]byte("PROVER_JOIN_MERGE"),
-			mt.PublicKey,
-		))
-		if err != nil {
-			return false, errors.Wrap(err, "verify")
-		}
-
-		// confirm this has not already been used
-		spentAddress := [64]byte{}
-		copy(spentAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-		copy(spentAddress[32:], spentMergeBI.FillBytes(make([]byte, 32)))
-
-		v, err := p.hypergraph.GetVertex(spentAddress)
-		if err == nil && v != nil {
 			return false, errors.Wrap(
-				errors.New("merge target already used"),
-				"verify",
+				fmt.Errorf(
+					"invalid merge target signature (key_type=%d, pub_key_len=%d, sig_len=%d, bls_pub_len=%d)",
+					mt.KeyType, len(mt.PublicKey), len(mt.Signature),
+					len(p.PublicKeySignatureBLS48581.PublicKey),
+				),
+				"verify: invalid prover join",
 			)
 		}
 	}
@@ -798,7 +981,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 				// Prover has been kicked for malicious behavior
 				return false, errors.Wrap(
 					errors.New("prover has been previously kicked"),
-					"verify",
+					"verify: invalid prover join",
 				)
 			}
 		}
@@ -813,7 +996,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			),
 		)
 		if err != nil {
-			return false, errors.Wrap(err, "verify")
+			return false, errors.Wrap(err, "verify: invalid prover join")
 		}
 		allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
 		// Create composite address: GLOBAL_INTRINSIC_ADDRESS + prover address
@@ -837,11 +1020,49 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			if err == nil && len(statusData) > 0 {
 				status := statusData[0]
 				if status != 4 {
-					// Prover is in some other state - cannot join
-					return false, errors.Wrap(
-						errors.New("prover already exists in non-left state"),
-						"verify",
-					)
+					// Check if the previous join/leave has implicitly expired
+					// (720 frames), making the prover effectively "left"
+					expired := false
+					if status == 0 {
+						// Joining: check if join expired
+						joinFrameBytes, jErr := p.rdfMultiprover.Get(
+							GLOBAL_RDF_SCHEMA,
+							"allocation:ProverAllocation",
+							"JoinFrameNumber",
+							tree,
+						)
+						if jErr == nil && len(joinFrameBytes) == 8 {
+							joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
+							if joinFrame >= token.FRAME_2_1_EXTENDED_ENROLL_END &&
+								frameNumber > joinFrame+720 {
+								expired = true
+							}
+						}
+					} else if status == 3 {
+						// Leaving: check if leave expired
+						leaveFrameBytes, lErr := p.rdfMultiprover.Get(
+							GLOBAL_RDF_SCHEMA,
+							"allocation:ProverAllocation",
+							"LeaveFrameNumber",
+							tree,
+						)
+						if lErr == nil && len(leaveFrameBytes) == 8 {
+							leaveFrame := binary.BigEndian.Uint64(leaveFrameBytes)
+							if frameNumber > leaveFrame+720 {
+								expired = true
+							}
+						}
+					}
+
+					if !expired {
+						return false, errors.Wrap(
+							fmt.Errorf(
+								"prover already exists in non-left state (status=%d, frame=%d)",
+								status, frameNumber,
+							),
+							"verify: invalid prover join",
+						)
+					}
 				}
 			}
 		}
@@ -854,7 +1075,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	joinClone.PublicKeySignatureBls48581 = nil
 	joinMessage, err := joinClone.ToCanonicalBytes()
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover join")
 	}
 
 	// Create the domain for the first signature
@@ -865,7 +1086,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 	)
 	joinDomain, err := poseidon.HashBytes(joinDomainPreimage)
 	if err != nil {
-		return false, errors.Wrap(err, "verify")
+		return false, errors.Wrap(err, "verify: invalid prover join")
 	}
 
 	// Create the domain for the proof of possession
@@ -880,7 +1101,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		joinDomain.FillBytes(make([]byte, 32)),
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid signature"), "verify: invalid prover join")
 	}
 
 	// Verify the proof of possession
@@ -892,11 +1113,26 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 		popDomain,
 	)
 	if err != nil || !valid {
-		return false, errors.Wrap(errors.New("invalid pop signature"), "verify")
+		return false, errors.Wrap(errors.New("invalid pop signature"), "verify: invalid prover join")
 	}
 
-	// Verify any merge signatures
+	// Verify any merge signatures (skip already-consumed targets)
 	for _, mt := range p.MergeTargets {
+		spentBI, err := poseidon.HashBytes(slices.Concat(
+			[]byte("PROVER_JOIN_MERGE"),
+			mt.PublicKey,
+		))
+		if err != nil {
+			return false, errors.Wrap(err, "verify: invalid prover join")
+		}
+		spentAddr := [64]byte{}
+		copy(spentAddr[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(spentAddr[32:], spentBI.FillBytes(make([]byte, 32)))
+		v, vErr := p.hypergraph.GetVertex(spentAddr)
+		if vErr == nil && v != nil {
+			continue
+		}
+
 		valid, err := p.keyManager.ValidateSignature(
 			mt.KeyType,
 			mt.PublicKey,
@@ -905,7 +1141,7 @@ func (p *ProverJoin) Verify(frameNumber uint64) (valid bool, err error) {
 			[]byte("PROVER_JOIN_MERGE"),
 		)
 		if err != nil || !valid {
-			return false, errors.Wrap(errors.New("invalid merge signature"), "verify")
+			return false, errors.Wrap(errors.New("invalid merge signature"), "verify: invalid prover join")
 		}
 	}
 
