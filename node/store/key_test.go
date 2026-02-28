@@ -16,7 +16,7 @@ import (
 
 func setupTestKeyStore(t *testing.T) *PebbleKeyStore {
 	logger, _ := zap.NewDevelopment()
-	tempDB := NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}, 0)
+	tempDB := NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}}, 0)
 	return NewPebbleKeyStore(tempDB, logger)
 }
 

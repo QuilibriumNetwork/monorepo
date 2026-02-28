@@ -29,7 +29,7 @@ import (
 // setupTest creates a test environment with a HypergraphState
 func setupTest(t *testing.T) (*hypergraph.HypergraphState, thypergraph.Hypergraph, tcrypto.VerEncProof, []byte, tcrypto.InclusionProver) {
 	logger, _ := zap.NewDevelopment()
-	s := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	enc := &mocks.MockVerifiableEncryptor{}
 	incProver := &mocks.MockInclusionProver{}
 	vep := &mocks.MockVerEncProof{}
@@ -79,7 +79,7 @@ func TestHypergraphState(t *testing.T) {
 	// Test state operations
 	t.Run("State Operations", func(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
-		s := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		enc := &mocks.MockVerifiableEncryptor{}
 		incProver := &mocks.MockInclusionProver{}
 		vep := &mocks.MockVerEncProof{}

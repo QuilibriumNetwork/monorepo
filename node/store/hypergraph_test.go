@@ -13,14 +13,14 @@ import (
 
 func setupTestHypergraphStore(t *testing.T) *PebbleHypergraphStore {
 	logger := zap.NewNop()
-	cfg := &config.DBConfig{
+	cfg := &config.Config{DB: &config.DBConfig{
 		InMemoryDONOTUSE: true,
 		Path:             ".test/hypergraph",
-	}
+	}}
 	db := NewPebbleDB(logger, cfg, 0)
 	require.NotNil(t, db)
 	t.Cleanup(func() { db.Close() })
-	return NewPebbleHypergraphStore(cfg, db, logger, nil, nil)
+	return NewPebbleHypergraphStore(cfg.DB, db, logger, nil, nil)
 }
 
 func TestGetRootCommits_IncludesAllCommitTypes(t *testing.T) {

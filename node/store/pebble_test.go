@@ -30,9 +30,9 @@ func TestNewPebbleDB_ExistingDirectory(t *testing.T) {
 	core, logs := observer.New(zap.InfoLevel)
 	testLogger := zap.New(core)
 
-	cfg := &config.DBConfig{
+	cfg := &config.Config{DB: &config.DBConfig{
 		Path: testDir,
-	}
+	}}
 
 	db := NewPebbleDB(testLogger, cfg, 0)
 	require.NotNil(t, db)
@@ -57,9 +57,9 @@ func TestNewPebbleDB_ExistingDirectoryWorker(t *testing.T) {
 	core, logs := observer.New(zap.InfoLevel)
 	testLogger := zap.New(core)
 
-	cfg := &config.DBConfig{
+	cfg := &config.Config{DB: &config.DBConfig{
 		WorkerPaths: []string{testDir},
-	}
+	}}
 
 	db := NewPebbleDB(testLogger, cfg, 1)
 	require.NotNil(t, db)
@@ -87,9 +87,9 @@ func TestNewPebbleDB_NonExistingDirectory(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	testLogger := zap.New(core)
 
-	cfg := &config.DBConfig{
+	cfg := &config.Config{DB: &config.DBConfig{
 		Path: testDir,
-	}
+	}}
 
 	db := NewPebbleDB(testLogger, cfg, 0)
 	require.NotNil(t, db)
@@ -119,9 +119,9 @@ func TestNewPebbleDB_NonExistingDirectoryWorker(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	testLogger := zap.New(core)
 
-	cfg := &config.DBConfig{
+	cfg := &config.Config{DB: &config.DBConfig{
 		WorkerPaths: []string{testDir},
-	}
+	}}
 
 	db := NewPebbleDB(testLogger, cfg, 1)
 	require.NotNil(t, db)
@@ -151,9 +151,9 @@ func TestNewPebbleDB_WorkerPathPrefix(t *testing.T) {
 	testLogger := zap.New(core)
 
 	pathFormat := filepath.Join(baseDir, "worker-%d")
-	cfg := &config.DBConfig{
+	cfg := &config.Config{DB: &config.DBConfig{
 		WorkerPathPrefix: pathFormat,
-	}
+	}}
 
 	db := NewPebbleDB(testLogger, cfg, 2)
 	require.NotNil(t, db)
