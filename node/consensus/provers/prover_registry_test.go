@@ -192,7 +192,7 @@ func TestPruneOrphanJoins_Comprehensive(t *testing.T) {
 	// Create stores with in-memory pebble DB
 	pebbleDB := store.NewPebbleDB(
 		logger,
-		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/prune_orphan"},
+		&config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/prune_orphan"}},
 		0,
 	)
 	defer pebbleDB.Close()
@@ -623,8 +623,8 @@ func TestPruneOrphanJoins_Comprehensive(t *testing.T) {
 	// Prover should remain because it has Active allocations
 	mixedActiveJoiningProverAddrs := make([][]byte, 3)
 	mixedActiveJoiningProverKeys := make([][]byte, 3)
-	mixedActiveFilters := make([][][]byte, 3)   // Active filters that should remain
-	mixedJoiningFilters := make([][][]byte, 3)  // Joining filters that should be pruned
+	mixedActiveFilters := make([][][]byte, 3)  // Active filters that should remain
+	mixedJoiningFilters := make([][][]byte, 3) // Joining filters that should be pruned
 	for i := 0; i < 3; i++ {
 		publicKey := bytes.Repeat([]byte{byte(0x50 + i)}, 585)
 		mixedActiveJoiningProverKeys[i] = publicKey
@@ -1101,7 +1101,7 @@ func TestPruneOrphanJoins_IncompleteState(t *testing.T) {
 	// Create stores with in-memory pebble DB
 	pebbleDB := store.NewPebbleDB(
 		logger,
-		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/prune_incomplete"},
+		&config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/prune_incomplete"}},
 		0,
 	)
 	defer pebbleDB.Close()
@@ -1409,7 +1409,7 @@ func TestPruneOrphanJoins_OrphanedAllocation(t *testing.T) {
 	// Create stores with in-memory pebble DB
 	pebbleDB := store.NewPebbleDB(
 		logger,
-		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/prune_orphaned_alloc"},
+		&config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/prune_orphaned_alloc"}},
 		0,
 	)
 	defer pebbleDB.Close()

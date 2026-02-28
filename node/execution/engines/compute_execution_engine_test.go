@@ -488,7 +488,7 @@ func createTestAppConsensusEngine(
 	mockDifficultyAdjuster := new(mocks.MockDifficultyAdjuster)
 	mockRewardIssuance := new(mocks.MockRewardIssuance)
 	mockEventDistributor := new(mocks.MockEventDistributor)
-	pebbleDB := pstore.NewPebbleDB(logger, config.DB, 0)
+	pebbleDB := pstore.NewPebbleDB(logger, config, 0)
 	clockStore := pstore.NewPebbleClockStore(pebbleDB, logger)
 	inboxStore := pstore.NewPebbleInboxStore(pebbleDB, logger)
 	shardStore := pstore.NewPebbleShardsStore(pebbleDB, logger)

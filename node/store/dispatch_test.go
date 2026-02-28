@@ -16,7 +16,7 @@ import (
 
 func setupTestInboxStore(t *testing.T) *PebbleInboxStore {
 	logger, _ := zap.NewDevelopment()
-	tempDB := NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}, 0)
+	tempDB := NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}}, 0)
 	return NewPebbleInboxStore(tempDB, logger)
 }
 
@@ -554,7 +554,7 @@ func TestCRDTConcurrentScenarios(t *testing.T) {
 
 func BenchmarkCRDTOperations(b *testing.B) {
 	logger, _ := zap.NewDevelopment()
-	tempDB := NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}, 0)
+	tempDB := NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}}, 0)
 	store := NewPebbleInboxStore(tempDB, logger)
 
 	address := bytes.Repeat([]byte{0xAA}, 32)

@@ -18,7 +18,7 @@ import (
 
 func setupTestClockStore(t *testing.T) *store.PebbleClockStore {
 	logger, _ := zap.NewDevelopment()
-	tempDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}, 0)
+	tempDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}}, 0)
 	return store.NewPebbleClockStore(tempDB, logger)
 }
 
