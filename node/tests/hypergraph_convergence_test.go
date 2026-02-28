@@ -104,7 +104,7 @@ func TestConvergence(t *testing.T) {
 	var store0 store.KVDB
 	for i := 0; i < numParties; i++ {
 		logger, _ := zap.NewDevelopment()
-		s := pebblestore.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := pebblestore.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		if i == 0 {
 			store0 = s
 		}

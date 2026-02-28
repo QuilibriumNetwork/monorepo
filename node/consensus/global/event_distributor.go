@@ -674,9 +674,24 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	}
 
 	if len(pendingFilters) != 0 {
+		// Build a descriptor list that excludes self's active allocations.
+		// DecideJoins computes bestScore from this list — if we include
+		// active allocations, their high scores cause perpetual rejection
+		// of pending joins (the proposer compares against shards it can't
+		// actually switch to, creating an infinite propose-reject loop).
+		pendingSet := make(map[string]struct{}, len(pendingFilters))
+		for _, pf := range pendingFilters {
+			pendingSet[string(pf)] = struct{}{}
+		}
+		decideCandidates := slices.Clone(proposalDescriptors)
+		for _, d := range decideDescriptors {
+			if _, isPending := pendingSet[string(d.Filter)]; isPending {
+				decideCandidates = append(decideCandidates, d)
+			}
+		}
 		if err := e.proposer.DecideJoins(
 			uint64(data.Frame.Header.Difficulty),
-			decideDescriptors,
+			decideCandidates,
 			pendingFilters,
 			worldBytes,
 		); err != nil {

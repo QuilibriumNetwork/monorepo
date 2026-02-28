@@ -132,6 +132,9 @@ func (hg *HypergraphCRDT) SetSelfPeerID(peerID string) {
 
 func (hg *HypergraphCRDT) SetShutdownContext(ctx context.Context) {
 	hg.shutdownCtx = ctx
+	// Reopen the snapshot manager in case it was closed by a previous
+	// shutdown context (i.e. during in-process engine respawn).
+	hg.snapshotMgr.reopen()
 	go func() {
 		select {
 		case <-hg.shutdownCtx.Done():

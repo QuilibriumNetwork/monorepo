@@ -248,6 +248,7 @@ type GlobalConsensusEngine struct {
 	shardCommitmentTrees   []*tries.VectorCommitmentTree
 	shardCommitmentKeySets []map[string]struct{}
 	shardCommitmentMu      sync.Mutex
+	commitBarrier          sync.Mutex
 
 	// Authentication provider
 	authProvider channel.AuthenticationProvider
@@ -1662,7 +1663,9 @@ func (e *GlobalConsensusEngine) materialize(
 	var appliedCount atomic.Int64
 	var skippedCount atomic.Int64
 
+	e.commitBarrier.Lock()
 	_, err := e.hypergraph.Commit(frameNumber)
+	e.commitBarrier.Unlock()
 	if err != nil {
 		e.logger.Error("error committing hypergraph", zap.Error(err))
 		return errors.Wrap(err, "materialize")
@@ -1836,8 +1839,11 @@ func (e *GlobalConsensusEngine) materialize(
 		return err
 	}
 
-	if err := state.Commit(); err != nil {
-		return errors.Wrap(err, "materialize")
+	e.commitBarrier.Lock()
+	stateCommitErr := state.Commit()
+	e.commitBarrier.Unlock()
+	if stateCommitErr != nil {
+		return errors.Wrap(stateCommitErr, "materialize")
 	}
 
 	// Persist any alt shard updates from this frame
@@ -4299,7 +4305,9 @@ func (e *GlobalConsensusEngine) rebuildShardCommitments(
 	frameNumber uint64,
 	rank uint64,
 ) ([]byte, error) {
+	e.commitBarrier.Lock()
 	commitSet, err := e.hypergraph.Commit(frameNumber)
+	e.commitBarrier.Unlock()
 	if err != nil {
 		e.logger.Error("could not commit", zap.Error(err))
 		return nil, errors.Wrap(err, "rebuild shard commitments")
