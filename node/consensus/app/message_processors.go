@@ -1137,12 +1137,6 @@ func (e *AppConsensusEngine) addCertifiedState(
 		return
 	}
 
-	txn, err := e.clockStore.NewTransaction(false)
-	if err != nil {
-		e.logger.Error("could not create transaction", zap.Error(err))
-		return
-	}
-
 	aggregateSig := &protobufs.BLS48581AggregateSignature{
 		Signature: qc.GetAggregatedSignature().GetSignature(),
 		PublicKey: &protobufs.BLS48581G2PublicKey{
@@ -1150,30 +1144,10 @@ func (e *AppConsensusEngine) addCertifiedState(
 		},
 		Bitmask: qc.GetAggregatedSignature().GetBitmask(),
 	}
-	if err := e.clockStore.PutQuorumCertificate(
-		&protobufs.QuorumCertificate{
-			Filter:             e.appAddress,
-			Rank:               qc.GetRank(),
-			FrameNumber:        qc.GetFrameNumber(),
-			Selector:           []byte(qc.Identity()),
-			AggregateSignature: aggregateSig,
-		},
-		txn,
-	); err != nil {
-		e.logger.Error("could not insert quorum certificate", zap.Error(err))
-		txn.Abort()
-		return
-	}
-
-	if err := txn.Commit(); err != nil {
-		e.logger.Error("could not commit transaction", zap.Error(err))
-		txn.Abort()
-		return
-	}
 
 	parent.State.Header.PublicKeySignatureBls48581 = aggregateSig
 
-	txn, err = e.clockStore.NewTransaction(false)
+	txn, err := e.clockStore.NewTransaction(false)
 	if err != nil {
 		e.logger.Error("could not create transaction", zap.Error(err))
 		return
@@ -1205,6 +1179,21 @@ func (e *AppConsensusEngine) addCertifiedState(
 		txn,
 	); err != nil {
 		e.logger.Error("could not insert certified state", zap.Error(err))
+		txn.Abort()
+		return
+	}
+
+	if err := e.clockStore.PutQuorumCertificate(
+		&protobufs.QuorumCertificate{
+			Filter:             e.appAddress,
+			Rank:               qc.GetRank(),
+			FrameNumber:        qc.GetFrameNumber(),
+			Selector:           []byte(qc.Identity()),
+			AggregateSignature: aggregateSig,
+		},
+		txn,
+	); err != nil {
+		e.logger.Error("could not insert quorum certificate", zap.Error(err))
 		txn.Abort()
 		return
 	}

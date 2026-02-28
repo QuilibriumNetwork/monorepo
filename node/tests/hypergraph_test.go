@@ -58,7 +58,7 @@ func TestHypergraph(t *testing.T) {
 	// Test vertex operations
 	t.Run("Vertex Operations", func(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
-		s := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		enc := &mocks.MockVerifiableEncryptor{}
 		prover := &mocks.MockInclusionProver{}
 		vep := &mocks.MockVerEncProof{}
@@ -124,7 +124,7 @@ func TestHypergraph(t *testing.T) {
 	// Test hyperedge operations
 	t.Run("Hyperedge Operations", func(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
-		s := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		enc := &mocks.MockVerifiableEncryptor{}
 		prover := &mocks.MockInclusionProver{}
 		vep := &mocks.MockVerEncProof{}
@@ -190,7 +190,7 @@ func TestHypergraph(t *testing.T) {
 	// Test "within" relationship
 	t.Run("Within Relationship", func(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
-		s := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		enc := &mocks.MockVerifiableEncryptor{}
 		prover := &mocks.MockInclusionProver{}
 		vep := &mocks.MockVerEncProof{}
@@ -250,7 +250,7 @@ func TestHypergraph(t *testing.T) {
 	// Test nested hyperedges
 	t.Run("Nested Hyperedges", func(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
-		s := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		enc := &mocks.MockVerifiableEncryptor{}
 		prover := &mocks.MockInclusionProver{}
 		vep := &mocks.MockVerEncProof{}
@@ -307,7 +307,7 @@ func TestHypergraph(t *testing.T) {
 	// Test error cases
 	t.Run("Error Cases", func(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
-		s := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		enc := &mocks.MockVerifiableEncryptor{}
 		prover := &mocks.MockInclusionProver{}
 		vep := &mocks.MockVerEncProof{}
@@ -353,7 +353,7 @@ func TestHypergraph(t *testing.T) {
 	// Test sharding
 	t.Run("Sharding", func(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
-		s := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		enc := &mocks.MockVerifiableEncryptor{}
 		prover := &mocks.MockInclusionProver{}
 		vep := &mocks.MockVerEncProof{}

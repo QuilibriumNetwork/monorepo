@@ -43,7 +43,7 @@ func FormatVersion(version []byte) string {
 }
 
 func GetPatchNumber() byte {
-	return 0x13
+	return 0x14
 }
 
 func GetRCNumber() byte {

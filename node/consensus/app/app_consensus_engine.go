@@ -118,6 +118,7 @@ type AppConsensusEngine struct {
 	appSpilloverMu                sync.Mutex
 	lastProposalRank              uint64
 	lastProposalRankMu            sync.RWMutex
+	commitBarrier                 sync.Mutex
 	collectedMessages             []*protobufs.Message
 	collectedMessagesMu           sync.RWMutex
 	provingMessages               []*protobufs.Message
@@ -1476,8 +1477,11 @@ func (e *AppConsensusEngine) materialize(
 		zap.Any("current_changeset_count", len(state.Changeset())),
 	)
 
-	if err := state.Commit(); err != nil {
-		return errors.Wrap(err, "materialize")
+	e.commitBarrier.Lock()
+	stateCommitErr := state.Commit()
+	e.commitBarrier.Unlock()
+	if stateCommitErr != nil {
+		return errors.Wrap(stateCommitErr, "materialize")
 	}
 
 	return nil
@@ -2166,10 +2170,12 @@ func (e *AppConsensusEngine) internalProveFrame(
 		return nil, errors.New("no proving key available")
 	}
 
+	e.commitBarrier.Lock()
 	stateRoots, err := e.hypergraph.CommitShard(
 		previousFrame.Header.FrameNumber+1,
 		e.appAddress,
 	)
+	e.commitBarrier.Unlock()
 	if err != nil {
 		return nil, err
 	}

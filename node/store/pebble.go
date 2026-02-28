@@ -97,6 +97,7 @@ var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_1821,
 	migration_2_1_0_1822,
 	migration_2_1_0_1823,
+	migration_2_1_0_1824,
 }
 
 func NewPebbleDB(
@@ -1138,6 +1139,234 @@ func migration_2_1_0_1822(b *pebble.Batch, db *pebble.DB, cfg *config.Config) er
 // corruption from transaction bypass bugs in SaveRoot and Commit.
 func migration_2_1_0_1823(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
 	return doMigration1818(db, cfg)
+}
+
+// migration_2_1_0_1824 rebuilds both vertex adds and hyperedge adds trees for
+// the global prover shard to fix divergence from the materialize/commit race.
+func migration_2_1_0_1824(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return doMigration1824(db, cfg)
+}
+
+// doMigration1824 rebuilds the global prover shard's vertex adds and hyperedge
+// adds trees by syncing to an in-memory instance and back. Unlike doMigration1818
+// which only checked vertex adds, this migration ensures both trees are rebuilt.
+func doMigration1824(db *pebble.DB, cfg *config.Config) error {
+	logger := zap.L()
+
+	// Global prover shard key: L1={0,0,0}, L2=0xff*32
+	globalShardKey := tries.ShardKey{
+		L1: [3]byte{},
+		L2: [32]byte{
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		},
+	}
+
+	prover := bls48581.NewKZGInclusionProver(logger)
+
+	// Create hypergraph from actual DB
+	actualDBWrapper := &PebbleDB{db: db}
+	actualStore := NewPebbleHypergraphStore(cfg.DB, actualDBWrapper, logger, nil, prover)
+
+	actualHG, err := actualStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "load actual hypergraph")
+	}
+	actualHGCRDT := actualHG.(*hgcrdt.HypergraphCRDT)
+
+	// Create in-memory pebble DB directly (bypassing NewPebbleDB to avoid cycle)
+	memOpts := &pebble.Options{
+		MemTableSize:       64 << 20,
+		FormatMajorVersion: pebble.FormatNewest,
+		FS:                 vfs.NewMem(),
+	}
+	memDB, err := pebble.Open("", memOpts)
+	if err != nil {
+		return errors.Wrap(err, "open in-memory pebble")
+	}
+	defer memDB.Close()
+
+	memDBWrapper := &PebbleDB{db: memDB}
+	memStore := NewPebbleHypergraphStore(cfg.DB, memDBWrapper, logger, nil, prover)
+	memHG, err := memStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "load in-memory hypergraph")
+	}
+	memHGCRDT := memHG.(*hgcrdt.HypergraphCRDT)
+
+	// Phase 1: Sync from actual DB to in-memory
+	// Check both vertex adds and hyperedge adds roots
+	actualVertexRoot := actualHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
+	actualHyperedgeRoot := actualHGCRDT.GetHyperedgeAddsSet(globalShardKey).GetTree().Commit(nil, false)
+
+	if actualVertexRoot == nil && actualHyperedgeRoot == nil {
+		logger.Info("migration 1824: no data in global prover shard, skipping")
+		return nil
+	}
+
+	// Use whichever root is available for the snapshot
+	snapshotRoot := actualVertexRoot
+	if snapshotRoot == nil {
+		snapshotRoot = actualHyperedgeRoot
+	}
+	actualHGCRDT.PublishSnapshot(snapshotRoot)
+
+	// Set up gRPC server backed by actual hypergraph
+	const bufSize = 1 << 20
+	actualLis := bufconn.Listen(bufSize)
+	actualGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(actualGRPCServer, actualHGCRDT)
+	go func() { _ = actualGRPCServer.Serve(actualLis) }()
+	defer actualGRPCServer.Stop()
+
+	// Create client connection to actual hypergraph server
+	actualDialer := func(context.Context, string) (net.Conn, error) {
+		return actualLis.Dial()
+	}
+	actualConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(actualDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "dial actual hypergraph")
+	}
+	defer actualConn.Close()
+
+	actualClient := protobufs.NewHypergraphComparisonServiceClient(actualConn)
+
+	// Sync from actual to in-memory for vertex adds and hyperedge adds
+	phases := []protobufs.HypergraphPhaseSet{
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS,
+	}
+
+	for _, phase := range phases {
+		stream, err := actualClient.PerformSync(context.Background())
+		if err != nil {
+			return errors.Wrapf(err, "create sync stream for phase %v", phase)
+		}
+		_, err = memHGCRDT.SyncFrom(stream, globalShardKey, phase, nil)
+		if err != nil {
+			logger.Warn("sync from actual to memory failed", zap.Error(err), zap.Any("phase", phase))
+		}
+		_ = stream.CloseSend()
+	}
+
+	// Commit in-memory to get roots
+	memVertexRoot := memHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
+	memHyperedgeRoot := memHGCRDT.GetHyperedgeAddsSet(globalShardKey).GetTree().Commit(nil, false)
+	logger.Info("migration 1824: synced to in-memory",
+		zap.String("actual_vertex_root", hex.EncodeToString(actualVertexRoot)),
+		zap.String("mem_vertex_root", hex.EncodeToString(memVertexRoot)),
+		zap.String("actual_hyperedge_root", hex.EncodeToString(actualHyperedgeRoot)),
+		zap.String("mem_hyperedge_root", hex.EncodeToString(memHyperedgeRoot)),
+	)
+
+	// Stop the actual server before wiping data
+	actualGRPCServer.Stop()
+	actualConn.Close()
+
+	// Phase 2: Wipe tree data for global prover shard from actual DB
+	// Only wipe vertex adds and hyperedge adds (not removes)
+	treePrefixes := []byte{
+		VERTEX_ADDS_TREE_NODE,
+		VERTEX_ADDS_TREE_NODE_BY_PATH,
+		VERTEX_ADDS_CHANGE_RECORD,
+		VERTEX_ADDS_TREE_ROOT,
+		HYPEREDGE_ADDS_TREE_NODE,
+		HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		HYPEREDGE_ADDS_CHANGE_RECORD,
+		HYPEREDGE_ADDS_TREE_ROOT,
+	}
+
+	for _, prefix := range treePrefixes {
+		start, end := shardRangeBounds(prefix, globalShardKey)
+		if err := db.DeleteRange(start, end, &pebble.WriteOptions{Sync: true}); err != nil {
+			return errors.Wrapf(err, "delete range for prefix 0x%02x", prefix)
+		}
+	}
+
+	logger.Info("migration 1824: wiped vertex adds and hyperedge adds tree data from actual DB")
+
+	// Reload actual hypergraph after wipe
+	actualStore2 := NewPebbleHypergraphStore(cfg.DB, actualDBWrapper, logger, nil, prover)
+	actualHG2, err := actualStore2.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "reload actual hypergraph after wipe")
+	}
+	actualHGCRDT2 := actualHG2.(*hgcrdt.HypergraphCRDT)
+
+	// Phase 3: Sync from in-memory back to actual DB
+	memSnapshotRoot := memVertexRoot
+	if memSnapshotRoot == nil {
+		memSnapshotRoot = memHyperedgeRoot
+	}
+	memHGCRDT.PublishSnapshot(memSnapshotRoot)
+
+	// Set up gRPC server backed by in-memory hypergraph
+	memLis := bufconn.Listen(bufSize)
+	memGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(memGRPCServer, memHGCRDT)
+	go func() { _ = memGRPCServer.Serve(memLis) }()
+	defer memGRPCServer.Stop()
+
+	// Create client connection to in-memory hypergraph server
+	memDialer := func(context.Context, string) (net.Conn, error) {
+		return memLis.Dial()
+	}
+	memConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(memDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "dial in-memory hypergraph")
+	}
+	defer memConn.Close()
+
+	memClient := protobufs.NewHypergraphComparisonServiceClient(memConn)
+
+	// Sync from in-memory to actual for vertex adds and hyperedge adds
+	for _, phase := range phases {
+		stream, err := memClient.PerformSync(context.Background())
+		if err != nil {
+			return errors.Wrapf(err, "create sync stream for phase %v (reverse)", phase)
+		}
+		_, err = actualHGCRDT2.SyncFrom(stream, globalShardKey, phase, nil)
+		if err != nil {
+			logger.Warn("sync from memory to actual failed", zap.Error(err), zap.Any("phase", phase))
+		}
+		_ = stream.CloseSend()
+	}
+
+	// Final commit
+	finalVertexRoot := actualHGCRDT2.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, true)
+	finalHyperedgeRoot := actualHGCRDT2.GetHyperedgeAddsSet(globalShardKey).GetTree().Commit(nil, true)
+	logger.Info("migration 1824: completed",
+		zap.String("final_vertex_root", hex.EncodeToString(finalVertexRoot)),
+		zap.String("final_hyperedge_root", hex.EncodeToString(finalHyperedgeRoot)),
+	)
+
+	return nil
 }
 
 // pebbleBatchDB wraps a *pebble.Batch to implement store.KVDB for use in migrations
