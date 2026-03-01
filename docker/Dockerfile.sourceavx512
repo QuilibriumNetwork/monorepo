@@ -69,7 +69,12 @@ RUN /opt/rustup-init.sh -y --profile minimal
 # Install uniffi-bindgen-go
 RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.4.0+v0.28.3
 
-FROM base-avx512 AS build-avx512
+# -----------------------------------------------------------------------------
+# Stage: gen-avx512
+# Purpose: Build EMP and generate Rust bindings. Only Rust/gen sources are
+#          copied here so that Go source changes don't bust the cache.
+# -----------------------------------------------------------------------------
+FROM base-avx512 AS gen-avx512
 
 ENV GOEXPERIMENT=arenas
 ENV QUILIBRIUM_SIGNATURE_CHECK=false
@@ -80,12 +85,41 @@ RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 
 WORKDIR /opt/ceremonyclient
 
-# Copy everything except node and client so as to avoid
-# invalidating the cache at this point on client or node rebuilds
+# Rust workspace files (rarely change)
+COPY Cargo.toml Cargo.lock ./
 
-COPY --exclude=node \
-    --exclude=client \
-    --exclude=sidecar . .
+# Rust crate sources (needed by cargo build in generate.sh)
+COPY crates crates
+
+# EMP toolkit sources
+COPY install-emp.sh .
+COPY emp-tool emp-tool
+COPY emp-ot emp-ot
+
+# Gen-* module directories (Go wrappers + generate.sh scripts)
+COPY channel channel
+COPY vdf vdf
+COPY ferret ferret
+COPY bls48581 bls48581
+COPY rpm rpm
+COPY verenc verenc
+COPY bulletproofs bulletproofs
+
+# go.mod/go.sum stubs for replace directive targets across all gen-* modules.
+# Only module metadata is needed for go mod download; full Go source is deferred
+# to build-avx512 so that source changes don't bust gen stage caches.
+COPY nekryptology/go.mod nekryptology/go.sum nekryptology/
+COPY protobufs/go.mod protobufs/go.sum protobufs/
+COPY consensus/go.mod consensus/go.sum consensus/
+COPY types/go.mod types/go.sum types/
+COPY utils/go.mod utils/go.sum utils/
+COPY config/go.mod config/go.sum config/
+COPY lifecycle/go.mod lifecycle/go.sum lifecycle/
+COPY go-multiaddr/go.mod go-multiaddr/go.sum go-multiaddr/
+COPY go-multiaddr-dns/go.mod go-multiaddr-dns/go.sum go-multiaddr-dns/
+COPY go-libp2p/go.mod go-libp2p/go.sum go-libp2p/
+COPY go-libp2p-kad-dht/go.mod go-libp2p-kad-dht/go.sum go-libp2p-kad-dht/
+COPY go-libp2p-blossomsub/go.mod go-libp2p-blossomsub/go.sum go-libp2p-blossomsub/
 
 RUN bash install-emp.sh
 
@@ -143,6 +177,20 @@ WORKDIR /opt/ceremonyclient/bulletproofs
 RUN go mod download
 
 RUN ./generate.sh
+
+# -----------------------------------------------------------------------------
+# Stage: build-avx512
+# Purpose: Add full source tree for Go builds. Changes here only bust
+#          build cache, not the expensive gen stage above.
+# -----------------------------------------------------------------------------
+FROM gen-avx512 AS build-avx512
+
+WORKDIR /opt/ceremonyclient
+
+# Copy full source tree for Go builds
+COPY --exclude=node \
+    --exclude=client \
+    --exclude=sidecar . .
 
 FROM build-avx512 AS build-node-avx512
 
