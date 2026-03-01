@@ -64,6 +64,10 @@ import (
 	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
+// globalSyncCooldownFrames is the number of frames to wait between
+// performBlockingGlobalHypersync calls. At ~10s/frame this is ~50 seconds.
+const globalSyncCooldownFrames = 5
+
 // AppConsensusEngine uses the generic state machine for consensus
 type AppConsensusEngine struct {
 	*lifecycle.ComponentManager
@@ -153,9 +157,10 @@ type AppConsensusEngine struct {
 	coverageMinProvers            uint64
 	coverageHaltThreshold         uint64
 	coverageHaltGrace             uint64
-	globalProverRootVerifiedFrame atomic.Uint64
-	globalProverRootSynced        atomic.Bool
-	globalProverSyncInProgress    atomic.Bool
+	globalProverRootVerifiedFrame  atomic.Uint64
+	globalProverRootSynced         atomic.Bool
+	globalProverSyncInProgress     atomic.Bool
+	globalSyncCooldownUntilFrame   atomic.Uint64
 
 	// Genesis initialization
 	genesisInitialized atomic.Bool
@@ -1046,7 +1051,16 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
+		if frameNumber < e.globalSyncCooldownUntilFrame.Load() {
+			e.logger.Debug(
+				"global prover root error, skipping sync (cooldown active)",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Uint64("cooldown_until", e.globalSyncCooldownUntilFrame.Load()),
+			)
+			return
+		}
 		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+		e.globalSyncCooldownUntilFrame.Store(frameNumber + globalSyncCooldownFrames)
 		return
 	}
 
@@ -1063,7 +1077,16 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
+		if frameNumber < e.globalSyncCooldownUntilFrame.Load() {
+			e.logger.Debug(
+				"global prover root mismatch, skipping sync (cooldown active)",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Uint64("cooldown_until", e.globalSyncCooldownUntilFrame.Load()),
+			)
+			return
+		}
 		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+		e.globalSyncCooldownUntilFrame.Store(frameNumber + globalSyncCooldownFrames)
 
 		// Re-compute local root after sync to verify convergence, matching
 		// the global engine's post-sync verification pattern.
@@ -1081,6 +1104,7 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 			)
 			e.globalProverRootSynced.Store(true)
 			e.globalProverRootVerifiedFrame.Store(frameNumber)
+			e.globalSyncCooldownUntilFrame.Store(0)
 			if err := e.proverRegistry.Refresh(); err != nil {
 				e.logger.Warn("failed to refresh prover registry", zap.Error(err))
 			}
@@ -1102,6 +1126,7 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 
 	e.globalProverRootSynced.Store(true)
 	e.globalProverRootVerifiedFrame.Store(frameNumber)
+	e.globalSyncCooldownUntilFrame.Store(0)
 
 	if err := e.proverRegistry.Refresh(); err != nil {
 		e.logger.Warn("failed to refresh prover registry", zap.Error(err))

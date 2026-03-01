@@ -122,7 +122,10 @@ func (n *LazyVectorCommitmentBranchNode) Commit(
 	}
 
 	workers := runtime.WorkerCount(0, false, false)
-	throttle := make(chan struct{}, workers)
+	var throttle chan struct{}
+	if workers > 1 {
+		throttle = make(chan struct{}, workers)
+	}
 
 	commitment, err := commitNode(
 		inclusionProver,
@@ -159,72 +162,11 @@ func commitNode(
 		}
 
 		vector := make([][]byte, len(node.Children))
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		var firstErr error
 
-		for i, child := range node.Children {
-			childPath := slices.Concat(node.FullPrefix, []int{i})
-			wg.Add(1)
-
-			select {
-			case throttle <- struct{}{}:
-				go func(i int, child LazyVectorCommitmentNode, childPath []int) {
-					defer wg.Done()
-					defer func() { <-throttle }()
-
-					if child == nil {
-						var err error
-						child, err = node.Store.GetNodeByPath(
-							setType,
-							phaseType,
-							shardKey,
-							childPath,
-						)
-						if err != nil && !strings.Contains(err.Error(), "item not found") {
-							mu.Lock()
-							if firstErr == nil {
-								firstErr = errors.Wrap(err, "failed to get node by path")
-							}
-							mu.Unlock()
-							return
-						}
-					}
-					if child != nil {
-						commit, err := commitNode(
-							inclusionProver,
-							child,
-							txn,
-							setType,
-							phaseType,
-							shardKey,
-							childPath,
-							recalculate,
-							throttle,
-						)
-						if err != nil {
-							mu.Lock()
-							if firstErr == nil {
-								firstErr = err
-							}
-							mu.Unlock()
-							return
-						}
-						if branchChild, ok := child.(*LazyVectorCommitmentBranchNode); ok {
-							h := sha512.New()
-							h.Write([]byte{1})
-							for _, p := range branchChild.Prefix {
-								h.Write(binary.BigEndian.AppendUint32([]byte{}, uint32(p)))
-							}
-							h.Write(commit)
-							commit = h.Sum(nil)
-						}
-						vector[i] = commit
-					} else {
-						vector[i] = make([]byte, 64)
-					}
-				}(i, child, childPath)
-			default:
+		if throttle == nil {
+			// Sequential path: no goroutines, no sync primitives
+			for i, child := range node.Children {
+				childPath := slices.Concat(node.FullPrefix, []int{i})
 				if child == nil {
 					var err error
 					child, err = node.Store.GetNodeByPath(
@@ -265,13 +207,123 @@ func commitNode(
 				} else {
 					vector[i] = make([]byte, 64)
 				}
-				wg.Done()
 			}
-		}
-		wg.Wait()
+		} else {
+			// Parallel path: use goroutines with throttle channel
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			var firstErr error
 
-		if firstErr != nil {
-			return nil, firstErr
+			for i, child := range node.Children {
+				childPath := slices.Concat(node.FullPrefix, []int{i})
+				wg.Add(1)
+
+				select {
+				case throttle <- struct{}{}:
+					go func(i int, child LazyVectorCommitmentNode, childPath []int) {
+						defer wg.Done()
+						defer func() { <-throttle }()
+
+						if child == nil {
+							var err error
+							child, err = node.Store.GetNodeByPath(
+								setType,
+								phaseType,
+								shardKey,
+								childPath,
+							)
+							if err != nil && !strings.Contains(err.Error(), "item not found") {
+								mu.Lock()
+								if firstErr == nil {
+									firstErr = errors.Wrap(err, "failed to get node by path")
+								}
+								mu.Unlock()
+								return
+							}
+						}
+						if child != nil {
+							commit, err := commitNode(
+								inclusionProver,
+								child,
+								txn,
+								setType,
+								phaseType,
+								shardKey,
+								childPath,
+								recalculate,
+								throttle,
+							)
+							if err != nil {
+								mu.Lock()
+								if firstErr == nil {
+									firstErr = err
+								}
+								mu.Unlock()
+								return
+							}
+							if branchChild, ok := child.(*LazyVectorCommitmentBranchNode); ok {
+								h := sha512.New()
+								h.Write([]byte{1})
+								for _, p := range branchChild.Prefix {
+									h.Write(binary.BigEndian.AppendUint32([]byte{}, uint32(p)))
+								}
+								h.Write(commit)
+								commit = h.Sum(nil)
+							}
+							vector[i] = commit
+						} else {
+							vector[i] = make([]byte, 64)
+						}
+					}(i, child, childPath)
+				default:
+					if child == nil {
+						var err error
+						child, err = node.Store.GetNodeByPath(
+							setType,
+							phaseType,
+							shardKey,
+							childPath,
+						)
+						if err != nil && !strings.Contains(err.Error(), "item not found") {
+							return nil, errors.Wrap(err, "failed to get node by path")
+						}
+					}
+					if child != nil {
+						commit, err := commitNode(
+							inclusionProver,
+							child,
+							txn,
+							setType,
+							phaseType,
+							shardKey,
+							childPath,
+							recalculate,
+							throttle,
+						)
+						if err != nil {
+							return nil, err
+						}
+						if branchChild, ok := child.(*LazyVectorCommitmentBranchNode); ok {
+							h := sha512.New()
+							h.Write([]byte{1})
+							for _, p := range branchChild.Prefix {
+								h.Write(binary.BigEndian.AppendUint32([]byte{}, uint32(p)))
+							}
+							h.Write(commit)
+							commit = h.Sum(nil)
+						}
+						vector[i] = commit
+					} else {
+						vector[i] = make([]byte, 64)
+					}
+					wg.Done()
+				}
+			}
+			wg.Wait()
+
+			if firstErr != nil {
+				return nil, firstErr
+			}
 		}
 
 		data := []byte{}
@@ -1942,10 +1994,15 @@ func (t *LazyVectorCommitmentTree) Commit(
 		return make([]byte, 64)
 	}
 
-	// Wrap txn for thread safety since commitNode uses parallel goroutines
+	// Wrap txn for thread safety when commitNode uses parallel goroutines.
+	// With GOMAXPROCS=1, commitNode runs sequentially so no wrapper needed.
 	var wrappedTxn TreeBackingStoreTransaction
 	if txn != nil {
-		wrappedTxn = &SyncTransaction{Txn: txn}
+		if runtime.WorkerCount(0, false, false) > 1 {
+			wrappedTxn = &SyncTransaction{Txn: txn}
+		} else {
+			wrappedTxn = txn
+		}
 	}
 
 	commitment := t.Root.Commit(
