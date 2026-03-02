@@ -94,6 +94,16 @@ var (
 		false,
 		"prints peer info",
 	)
+	metrics = flag.Bool(
+		"metrics",
+		false,
+		"print prometheus metrics and exit",
+	)
+	metricsFilter = flag.String(
+		"metrics-filter",
+		"",
+		"optional metric name filter (substring match)",
+	)
 	debug = flag.Bool(
 		"debug",
 		debugDefault(),
@@ -402,6 +412,16 @@ func main() {
 		}
 
 		printPeerInfo(logger, config)
+		return
+	}
+
+	if *metrics {
+		cfg, err := config.LoadConfig(*configDirectory, "", false)
+		if err != nil {
+			logger.Fatal("failed to load config", zap.Error(err))
+		}
+
+		printMetrics(logger, cfg, *metricsFilter)
 		return
 	}
 
@@ -763,6 +783,33 @@ func printNodeInfo(logger *zap.Logger, cfg *config.Config) {
 	).String())
 	fmt.Println("Running Workers:", nodeInfo.RunningWorkers)
 	fmt.Println("Active Workers:", nodeInfo.AllocatedWorkers)
+
+	if len(nodeInfo.ShardAllocations) > 0 {
+		var active, joining, leaving, paused int
+		var joinFrames []string
+		for _, a := range nodeInfo.ShardAllocations {
+			switch a.Status {
+			case 1: // Joining
+				joining++
+				joinFrames = append(joinFrames, fmt.Sprintf("%d", a.JoinFrameNumber))
+			case 2: // Active
+				active++
+			case 3: // Paused
+				paused++
+			case 4: // Leaving
+				leaving++
+			}
+		}
+		fmt.Println("Shard Allocations:")
+		fmt.Println("  Active: ", active)
+		if len(joinFrames) > 0 {
+			fmt.Printf("  Joining: %d (join frames: %s)\n", joining, strings.Join(joinFrames, ", "))
+		} else {
+			fmt.Println("  Joining:", joining)
+		}
+		fmt.Println("  Leaving:", leaving)
+		fmt.Println("  Paused: ", paused)
+	}
 }
 
 func printPeerInfo(logger *zap.Logger, cfg *config.Config) {
@@ -845,6 +892,33 @@ func printPeerInfo(logger *zap.Logger, cfg *config.Config) {
 			fmt.Println()
 		}
 	}
+}
+
+func printMetrics(logger *zap.Logger, cfg *config.Config, filter string) {
+	if cfg.ListenGRPCMultiaddr == "" {
+		logger.Fatal("gRPC Not Enabled, Please Configure")
+	}
+
+	conn, err := ConnectToNode(logger, cfg)
+	if err != nil {
+		logger.Fatal(
+			"could not connect to node. if it is still booting, please wait.",
+			zap.Error(err),
+		)
+	}
+	defer conn.Close()
+
+	client := protobufs.NewNodeServiceClient(conn)
+
+	resp, err := client.GetMetrics(
+		context.Background(),
+		&protobufs.GetMetricsRequest{Filter: filter},
+	)
+	if err != nil {
+		logger.Fatal("failed to fetch metrics", zap.Error(err))
+	}
+
+	fmt.Print(string(resp.Metrics))
 }
 
 func formatPeerID(raw []byte) string {

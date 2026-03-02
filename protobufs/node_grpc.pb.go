@@ -24,6 +24,7 @@ const (
 	NodeService_GetWorkerInfo_FullMethodName      = "/quilibrium.node.node.pb.NodeService/GetWorkerInfo"
 	NodeService_Send_FullMethodName               = "/quilibrium.node.node.pb.NodeService/Send"
 	NodeService_GetTokensByAccount_FullMethodName = "/quilibrium.node.node.pb.NodeService/GetTokensByAccount"
+	NodeService_GetMetrics_FullMethodName         = "/quilibrium.node.node.pb.NodeService/GetMetrics"
 )
 
 // NodeServiceClient is the client API for NodeService service.
@@ -35,6 +36,7 @@ type NodeServiceClient interface {
 	GetWorkerInfo(ctx context.Context, in *GetWorkerInfoRequest, opts ...grpc.CallOption) (*WorkerInfoResponse, error)
 	Send(ctx context.Context, in *SendRequest, opts ...grpc.CallOption) (*SendResponse, error)
 	GetTokensByAccount(ctx context.Context, in *GetTokensByAccountRequest, opts ...grpc.CallOption) (*GetTokensByAccountResponse, error)
+	GetMetrics(ctx context.Context, in *GetMetricsRequest, opts ...grpc.CallOption) (*GetMetricsResponse, error)
 }
 
 type nodeServiceClient struct {
@@ -90,6 +92,15 @@ func (c *nodeServiceClient) GetTokensByAccount(ctx context.Context, in *GetToken
 	return out, nil
 }
 
+func (c *nodeServiceClient) GetMetrics(ctx context.Context, in *GetMetricsRequest, opts ...grpc.CallOption) (*GetMetricsResponse, error) {
+	out := new(GetMetricsResponse)
+	err := c.cc.Invoke(ctx, NodeService_GetMetrics_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeServiceServer is the server API for NodeService service.
 // All implementations must embed UnimplementedNodeServiceServer
 // for forward compatibility
@@ -99,6 +110,7 @@ type NodeServiceServer interface {
 	GetWorkerInfo(context.Context, *GetWorkerInfoRequest) (*WorkerInfoResponse, error)
 	Send(context.Context, *SendRequest) (*SendResponse, error)
 	GetTokensByAccount(context.Context, *GetTokensByAccountRequest) (*GetTokensByAccountResponse, error)
+	GetMetrics(context.Context, *GetMetricsRequest) (*GetMetricsResponse, error)
 	mustEmbedUnimplementedNodeServiceServer()
 }
 
@@ -120,6 +132,9 @@ func (UnimplementedNodeServiceServer) Send(context.Context, *SendRequest) (*Send
 }
 func (UnimplementedNodeServiceServer) GetTokensByAccount(context.Context, *GetTokensByAccountRequest) (*GetTokensByAccountResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTokensByAccount not implemented")
+}
+func (UnimplementedNodeServiceServer) GetMetrics(context.Context, *GetMetricsRequest) (*GetMetricsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetMetrics not implemented")
 }
 func (UnimplementedNodeServiceServer) mustEmbedUnimplementedNodeServiceServer() {}
 
@@ -224,6 +239,24 @@ func _NodeService_GetTokensByAccount_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeService_GetMetrics_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMetricsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).GetMetrics(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_GetMetrics_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).GetMetrics(ctx, req.(*GetMetricsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NodeService_ServiceDesc is the grpc.ServiceDesc for NodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -250,6 +283,10 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTokensByAccount",
 			Handler:    _NodeService_GetTokensByAccount_Handler,
+		},
+		{
+			MethodName: "GetMetrics",
+			Handler:    _NodeService_GetMetrics_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
