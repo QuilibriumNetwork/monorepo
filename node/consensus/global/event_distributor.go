@@ -703,6 +703,53 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 			)
 		}
 	}
+
+	// Leave rebalancing: propose leaves for overcrowded shards
+	if len(snapshot.leaveProposalCandidates) > 0 && canPropose && !joinProposedThisCycle {
+		leaveFilters, err := e.proposer.PlanLeaves(
+			uint64(data.Frame.Header.Difficulty),
+			snapshot.leaveProposalCandidates,
+			proposalDescriptors,
+			worldBytes,
+		)
+		if err != nil {
+			e.logger.Error("could not plan leaves", zap.Error(err))
+		} else if len(leaveFilters) > 0 {
+			e.lastJoinAttemptFrame.Store(data.Frame.Header.FrameNumber)
+			e.logger.Info(
+				"proposed leaves",
+				zap.Int("leave_proposals", len(leaveFilters)),
+			)
+		}
+	}
+
+	// Decide pending leaves in the 360-720 frame window
+	if len(snapshot.pendingLeaveFilters) > 0 {
+		// Build decideCandidates for leaves: unallocated shards + leaving shard descriptors
+		pendingLeaveSet := make(map[string]struct{}, len(snapshot.pendingLeaveFilters))
+		for _, pf := range snapshot.pendingLeaveFilters {
+			pendingLeaveSet[string(pf)] = struct{}{}
+		}
+		leaveDecideCandidates := slices.Clone(proposalDescriptors)
+		for _, d := range decideDescriptors {
+			if _, isLeaving := pendingLeaveSet[string(d.Filter)]; isLeaving {
+				leaveDecideCandidates = append(leaveDecideCandidates, d)
+			}
+		}
+		if err := e.proposer.DecideLeaves(
+			uint64(data.Frame.Header.Difficulty),
+			leaveDecideCandidates,
+			snapshot.pendingLeaveFilters,
+			worldBytes,
+		); err != nil {
+			e.logger.Error("could not decide leaves", zap.Error(err))
+		} else {
+			e.logger.Info(
+				"decided on leaves",
+				zap.Int("leaves", len(snapshot.pendingLeaveFilters)),
+			)
+		}
+	}
 }
 
 type allocationSnapshot struct {
@@ -717,6 +764,10 @@ type allocationSnapshot struct {
 	proposalDescriptors []provers.ShardDescriptor
 	decideDescriptors   []provers.ShardDescriptor
 	worldBytes          *big.Int
+
+	// Leave rebalancing fields
+	leaveProposalCandidates []provers.ShardDescriptor // Active allocations eligible for leave
+	pendingLeaveFilters     [][]byte                  // Leaving allocations in 360-720 window
 }
 
 func (s *allocationSnapshot) statusFields() []zap.Field {
@@ -1057,6 +1108,8 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 	pendingFilters := [][]byte{}
 	proposalDescriptors := []provers.ShardDescriptor{}
 	decideDescriptors := []provers.ShardDescriptor{}
+	leaveProposalCandidates := []provers.ShardDescriptor{}
+	pendingLeaveFilters := [][]byte{}
 
 	for _, shardInfo := range shards {
 		shardKey := slices.Concat(shardInfo.L1, shardInfo.L2)
@@ -1095,6 +1148,8 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 
 			allocated := false
 			pending := false
+			isActiveAllocation := false
+			isPendingLeave := false
 			if self != nil {
 				for _, allocation := range self.Allocations {
 					if bytes.Equal(allocation.ConfirmationFilter, bp) {
@@ -1119,9 +1174,15 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 						}
 						if allocation.Status == typesconsensus.ProverStatusActive {
 							shardsActive++
+							isActiveAllocation = true
 						}
 						if allocation.Status == typesconsensus.ProverStatusLeaving {
 							shardsLeaving++
+							// Check if in the 360-720 decision window
+							if allocation.LeaveFrameNumber+360 <= data.Frame.Header.FrameNumber &&
+								data.Frame.Header.FrameNumber <= allocation.LeaveFrameNumber+pendingFilterGraceFrames {
+								isPendingLeave = true
+							}
 						}
 						if allocation.Status == typesconsensus.ProverStatusPaused {
 							shardsPaused++
@@ -1174,6 +1235,20 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 					},
 				)
 			}
+			if isActiveAllocation {
+				leaveProposalCandidates = append(
+					leaveProposalCandidates,
+					provers.ShardDescriptor{
+						Filter: bp,
+						Size:   size.Uint64(),
+						Ring:   uint8(len(above) / 8),
+						Shards: shard.DataShards,
+					},
+				)
+			}
+			if isPendingLeave {
+				pendingLeaveFilters = append(pendingLeaveFilters, bp)
+			}
 			decideDescriptors = append(
 				decideDescriptors,
 				provers.ShardDescriptor{
@@ -1192,17 +1267,19 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 	}
 
 	return &allocationSnapshot{
-		shardsPending:       shardsPending,
-		awaitingFrames:      awaitingFrames,
-		shardsLeaving:       shardsLeaving,
-		shardsActive:        shardsActive,
-		shardsPaused:        shardsPaused,
-		shardDivisions:      shardDivisions,
-		logicalShards:       logicalShards,
-		pendingFilters:      pendingFilters,
-		proposalDescriptors: proposalDescriptors,
-		decideDescriptors:   decideDescriptors,
-		worldBytes:          worldBytes,
+		shardsPending:           shardsPending,
+		awaitingFrames:          awaitingFrames,
+		shardsLeaving:           shardsLeaving,
+		shardsActive:            shardsActive,
+		shardsPaused:            shardsPaused,
+		shardDivisions:          shardDivisions,
+		logicalShards:           logicalShards,
+		pendingFilters:          pendingFilters,
+		proposalDescriptors:     proposalDescriptors,
+		decideDescriptors:       decideDescriptors,
+		worldBytes:              worldBytes,
+		leaveProposalCandidates: leaveProposalCandidates,
+		pendingLeaveFilters:     pendingLeaveFilters,
 	}, true
 }
 

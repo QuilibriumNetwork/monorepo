@@ -66,6 +66,12 @@ func (m *mockWorkerManager) ProposeAllocations(coreIds []uint, filters [][]byte)
 func (m *mockWorkerManager) DecideAllocations(reject [][]byte, confirm [][]byte) error {
 	return nil
 }
+func (m *mockWorkerManager) ProposeLeave(filters [][]byte) error {
+	return nil
+}
+func (m *mockWorkerManager) DecideLeave(reject [][]byte, confirm [][]byte) error {
+	return nil
+}
 func (m *mockWorkerManager) RespawnWorker(coreId uint, filter []byte) error {
 	return nil
 }

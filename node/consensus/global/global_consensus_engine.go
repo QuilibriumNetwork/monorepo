@@ -436,6 +436,8 @@ func NewGlobalConsensusEngine(
 		config,
 		engine.ProposeWorkerJoin,
 		engine.DecideWorkerJoins,
+		engine.ProposeWorkerLeave,
+		engine.DecideWorkerLeaves,
 	)
 	if !config.Engine.ArchiveMode {
 		strategy := provers.RewardGreedy
@@ -3808,6 +3810,167 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 	}
 
 	e.logger.Debug("submitted join decisions")
+
+	return nil
+}
+
+func (e *GlobalConsensusEngine) ProposeWorkerLeave(
+	filters [][]byte,
+) error {
+	frame := e.GetFrame()
+	if frame == nil {
+		e.logger.Debug("cannot propose leave, no frame")
+		return errors.New("not ready")
+	}
+
+	_, err := e.keyManager.GetSigningKey("q-prover-key")
+	if err != nil {
+		e.logger.Debug("cannot propose leave, no signer key")
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	leave, err := global.NewProverLeave(
+		filters,
+		frame.Header.FrameNumber,
+		e.keyManager,
+		e.hypergraph,
+		schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+	)
+	if err != nil {
+		e.logger.Error("could not construct leave", zap.Error(err))
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	err = leave.Prove(frame.Header.FrameNumber)
+	if err != nil {
+		e.logger.Error("could not prove leave", zap.Error(err))
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	bundle := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{
+			{
+				Request: &protobufs.MessageRequest_Leave{
+					Leave: leave.ToProtobuf(),
+				},
+			},
+		},
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	msg, err := bundle.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize leave", zap.Error(err))
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	err = e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		msg,
+	)
+	if err != nil {
+		e.logger.Error("could not publish leave", zap.Error(err))
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	e.logger.Info(
+		"submitted leave request",
+		zap.Int("filters", len(filters)),
+	)
+
+	return nil
+}
+
+func (e *GlobalConsensusEngine) DecideWorkerLeaves(
+	reject [][]byte,
+	confirm [][]byte,
+) error {
+	frame := e.GetFrame()
+	if frame == nil {
+		e.logger.Debug("cannot decide leaves, no frame")
+		return errors.New("not ready")
+	}
+
+	_, err := e.keyManager.GetSigningKey("q-prover-key")
+	if err != nil {
+		e.logger.Debug("cannot decide leaves, no signer key")
+		return errors.Wrap(err, "decide worker leaves")
+	}
+
+	bundle := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{},
+	}
+
+	if len(reject) != 0 {
+		rejectMessage, err := global.NewProverReject(
+			reject,
+			frame.Header.FrameNumber,
+			e.keyManager,
+			e.hypergraph,
+			schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		)
+		if err != nil {
+			e.logger.Error("could not construct leave reject", zap.Error(err))
+			return errors.Wrap(err, "decide worker leaves")
+		}
+
+		err = rejectMessage.Prove(frame.Header.FrameNumber)
+		if err != nil {
+			e.logger.Error("could not prove leave reject", zap.Error(err))
+			return errors.Wrap(err, "decide worker leaves")
+		}
+
+		bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+			Request: &protobufs.MessageRequest_Reject{
+				Reject: rejectMessage.ToProtobuf(),
+			},
+		})
+	}
+
+	if len(confirm) != 0 {
+		confirmMessage, err := global.NewProverConfirm(
+			confirm,
+			frame.Header.FrameNumber,
+			e.keyManager,
+			e.hypergraph,
+			schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		)
+		if err != nil {
+			e.logger.Error("could not construct leave confirm", zap.Error(err))
+			return errors.Wrap(err, "decide worker leaves")
+		}
+
+		err = confirmMessage.Prove(frame.Header.FrameNumber)
+		if err != nil {
+			e.logger.Error("could not prove leave confirm", zap.Error(err))
+			return errors.Wrap(err, "decide worker leaves")
+		}
+
+		bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+			Request: &protobufs.MessageRequest_Confirm{
+				Confirm: confirmMessage.ToProtobuf(),
+			},
+		})
+	}
+
+	bundle.Timestamp = time.Now().UnixMilli()
+
+	msg, err := bundle.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize leave decisions", zap.Error(err))
+		return errors.Wrap(err, "decide worker leaves")
+	}
+
+	err = e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		msg,
+	)
+	if err != nil {
+		e.logger.Error("could not publish leave decisions", zap.Error(err))
+		return errors.Wrap(err, "decide worker leaves")
+	}
+
+	e.logger.Debug("submitted leave decisions")
 
 	return nil
 }

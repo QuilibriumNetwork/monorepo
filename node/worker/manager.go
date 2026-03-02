@@ -44,6 +44,13 @@ type WorkerManager struct {
 		reject [][]byte,
 		confirm [][]byte,
 	) error
+	proposeLeaveFunc func(
+		filters [][]byte,
+	) error
+	decideLeaveFunc func(
+		reject [][]byte,
+		confirm [][]byte,
+	) error
 
 	// When automatic, hold reference to the workers
 	dataWorkers []*exec.Cmd
@@ -72,6 +79,13 @@ func NewWorkerManager(
 		reject [][]byte,
 		confirm [][]byte,
 	) error,
+	proposeLeaveFunc func(
+		filters [][]byte,
+	) error,
+	decideLeaveFunc func(
+		reject [][]byte,
+		confirm [][]byte,
+	) error,
 ) typesWorker.WorkerManager {
 	return &WorkerManager{
 		store:            store,
@@ -83,6 +97,8 @@ func NewWorkerManager(
 		config:           config,
 		proposeFunc:      proposeFunc,
 		decideFunc:       decideFunc,
+		proposeLeaveFunc: proposeLeaveFunc,
+		decideLeaveFunc:  decideLeaveFunc,
 	}
 }
 
@@ -704,6 +720,21 @@ func (w *WorkerManager) DecideAllocations(
 	confirm [][]byte,
 ) error {
 	return w.decideFunc(reject, confirm)
+}
+
+// ProposeLeave invokes a leave proposal function set by the parent of the
+// manager.
+func (w *WorkerManager) ProposeLeave(filters [][]byte) error {
+	return w.proposeLeaveFunc(filters)
+}
+
+// DecideLeave invokes a leave deciding function set by the parent of the
+// manager.
+func (w *WorkerManager) DecideLeave(
+	reject [][]byte,
+	confirm [][]byte,
+) error {
+	return w.decideLeaveFunc(reject, confirm)
 }
 
 // loadWorkersFromStore loads all workers from persistent storage into memory
