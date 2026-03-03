@@ -247,9 +247,9 @@ func NewBlossomSubRouter(h host.Host, params BlossomSubParams, network uint8) *B
 		feature = func(f BlossomSubFeature, proto protocol.ID) bool {
 			switch f {
 			case BlossomSubFeatureMesh:
-				return proto == protos[0] || proto == protos[1]
+				return proto == protos[0]
 			case BlossomSubFeaturePX:
-				return proto == protos[0] || proto == protos[1]
+				return proto == protos[0]
 			case BlossomSubFeatureIdontwant:
 				return proto == protos[0]
 			default:

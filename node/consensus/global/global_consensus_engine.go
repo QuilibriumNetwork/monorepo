@@ -109,6 +109,42 @@ func contextFromShutdownSignal(sig <-chan struct{}) context.Context {
 	return ctx
 }
 
+func (e *GlobalConsensusEngine) addGlobalMessageSubscriber(
+	ch chan *protobufs.StreamGlobalMessagesResponse,
+) {
+	e.globalMessageSubscribersMu.Lock()
+	e.globalMessageSubscribers[ch] = struct{}{}
+	e.globalMessageSubscribersMu.Unlock()
+}
+
+func (e *GlobalConsensusEngine) removeGlobalMessageSubscriber(
+	ch chan *protobufs.StreamGlobalMessagesResponse,
+) {
+	e.globalMessageSubscribersMu.Lock()
+	delete(e.globalMessageSubscribers, ch)
+	e.globalMessageSubscribersMu.Unlock()
+}
+
+func (e *GlobalConsensusEngine) broadcastGlobalMessage(
+	data []byte,
+	bitmask []byte,
+) {
+	msg := &protobufs.StreamGlobalMessagesResponse{
+		Data:    data,
+		Bitmask: bitmask,
+	}
+
+	e.globalMessageSubscribersMu.RLock()
+	defer e.globalMessageSubscribersMu.RUnlock()
+
+	for ch := range e.globalMessageSubscribers {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
 // GlobalConsensusEngine  uses the generic state machine for consensus
 type GlobalConsensusEngine struct {
 	*lifecycle.ComponentManager
@@ -263,6 +299,10 @@ type GlobalConsensusEngine struct {
 	// gRPC server for services
 	grpcServer   *grpc.Server
 	grpcListener net.Listener
+
+	// Global message streaming to workers
+	globalMessageSubscribersMu sync.RWMutex
+	globalMessageSubscribers   map[chan *protobufs.StreamGlobalMessagesResponse]struct{}
 }
 
 // NewGlobalConsensusEngine creates a new global consensus engine using the
@@ -350,6 +390,7 @@ func NewGlobalConsensusEngine(
 		txLockMap:                   make(map[uint64]map[string]map[string]*LockedTransaction),
 		appShardCache:               make(map[string]*appShardCacheEntry),
 		globalMessageSpillover:      make(map[uint64][][]byte),
+		globalMessageSubscribers:    make(map[chan *protobufs.StreamGlobalMessagesResponse]struct{}),
 	}
 	engine.frameChainChecker = NewFrameChainChecker(clockStore, logger)
 

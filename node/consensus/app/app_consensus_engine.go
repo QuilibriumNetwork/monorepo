@@ -883,6 +883,14 @@ func NewAppConsensusEngine(
 		engine.processPeerInfoMessageQueue(ctx)
 	}))
 
+	componentBuilder.AddWorker(namedWorker("globalMessageStream", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.streamGlobalMessagesFromMaster(ctx)
+	}))
+
 	componentBuilder.AddWorker(namedWorker("dispatchMsgQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
@@ -944,26 +952,6 @@ func NewAppConsensusEngine(
 		return nil, err
 	}
 
-	err = engine.subscribeToGlobalFrameMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToGlobalProverMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToGlobalAlertMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToPeerInfoMessages()
-	if err != nil {
-		return nil, err
-	}
-
 	err = engine.subscribeToDispatchMessages()
 	if err != nil {
 		return nil, err
@@ -988,14 +976,6 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.UnregisterValidator(e.getProverMessageBitmask())
 	e.pubsub.Unsubscribe(e.getFrameMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getFrameMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalFrameMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalFrameMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalProverMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalProverMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalAlertMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalAlertMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalPeerInfoMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalPeerInfoMessageBitmask())
 	e.pubsub.Unsubscribe(e.getDispatchMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getDispatchMessageBitmask())
 
@@ -1599,28 +1579,12 @@ func (e *AppConsensusEngine) getConsensusMessageBitmask() []byte {
 	return slices.Concat([]byte{0}, e.appFilter)
 }
 
-func (e *AppConsensusEngine) getGlobalProverMessageBitmask() []byte {
-	return global.GLOBAL_PROVER_BITMASK
-}
-
 func (e *AppConsensusEngine) getFrameMessageBitmask() []byte {
 	return e.appFilter
 }
 
 func (e *AppConsensusEngine) getProverMessageBitmask() []byte {
 	return slices.Concat([]byte{0, 0, 0}, e.appFilter)
-}
-
-func (e *AppConsensusEngine) getGlobalFrameMessageBitmask() []byte {
-	return global.GLOBAL_FRAME_BITMASK
-}
-
-func (e *AppConsensusEngine) getGlobalAlertMessageBitmask() []byte {
-	return global.GLOBAL_ALERT_BITMASK
-}
-
-func (e *AppConsensusEngine) getGlobalPeerInfoMessageBitmask() []byte {
-	return global.GLOBAL_PEER_INFO_BITMASK
 }
 
 func (e *AppConsensusEngine) getDispatchMessageBitmask() []byte {

@@ -411,6 +411,40 @@ func (e *GlobalConsensusEngine) GetWorkerInfo(
 	return resp, nil
 }
 
+func (e *GlobalConsensusEngine) StreamGlobalMessages(
+	req *protobufs.StreamGlobalMessagesRequest,
+	stream protobufs.GlobalService_StreamGlobalMessagesServer,
+) error {
+	peerID, ok := qgrpc.PeerIDFromContext(stream.Context())
+	if !ok {
+		return status.Error(codes.Internal, "remote peer ID not found")
+	}
+
+	if !bytes.Equal(e.pubsub.GetPeerID(), []byte(peerID)) {
+		return status.Error(codes.PermissionDenied, "only local workers may stream global messages")
+	}
+
+	ch := make(chan *protobufs.StreamGlobalMessagesResponse, 256)
+	e.addGlobalMessageSubscriber(ch)
+	defer e.removeGlobalMessageSubscriber(ch)
+
+	e.logger.Info("worker connected to global message stream",
+		zap.String("peer_id", peerID.String()),
+	)
+
+	ctx := stream.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case msg := <-ch:
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func (e *GlobalConsensusEngine) RegisterServices(server *grpc.Server) {
 	protobufs.RegisterGlobalServiceServer(server, e)
 	protobufs.RegisterDispatchServiceServer(server, e.dispatchService)

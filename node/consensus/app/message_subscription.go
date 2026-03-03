@@ -1,9 +1,18 @@
 package app
 
 import (
+	"bytes"
+	"context"
+	"io"
+	"time"
+
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
+	"source.quilibrium.com/quilibrium/monorepo/node/consensus/global"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/rpm"
 	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
 )
@@ -50,29 +59,6 @@ func (e *AppConsensusEngine) subscribeToConsensusMessages() error {
 	return nil
 }
 
-func (e *AppConsensusEngine) subscribeToGlobalProverMessages() error {
-	if err := e.pubsub.Subscribe(
-		e.getGlobalProverMessageBitmask(),
-		func(message *pb.Message) error {
-			return nil
-		},
-	); err != nil {
-		return errors.Wrap(err, "subscribe to consensus messages")
-	}
-
-	// Register consensus message validator
-	if err := e.pubsub.RegisterValidator(
-		e.getGlobalProverMessageBitmask(),
-		func(peerID peer.ID, message *pb.Message) p2p.ValidationResult {
-			return e.validateGlobalProverMessage(peerID, message)
-		},
-		true,
-	); err != nil {
-		return errors.Wrap(err, "subscribe to consensus messages")
-	}
-
-	return nil
-}
 
 func (e *AppConsensusEngine) subscribeToProverMessages() error {
 	if err := e.pubsub.Subscribe(
@@ -147,105 +133,6 @@ func (e *AppConsensusEngine) subscribeToFrameMessages() error {
 	return nil
 }
 
-func (e *AppConsensusEngine) subscribeToGlobalFrameMessages() error {
-	if err := e.pubsub.Subscribe(
-		e.getGlobalFrameMessageBitmask(),
-		func(message *pb.Message) error {
-			select {
-			case <-e.haltCtx.Done():
-				return nil
-			case e.globalFrameMessageQueue <- message:
-				return nil
-			case <-e.ShutdownSignal():
-				return errors.New("context cancelled")
-			default:
-				e.logger.Warn("global message queue full, dropping message")
-				return nil
-			}
-		},
-	); err != nil {
-		return errors.Wrap(err, "subscribe to global frame messages")
-	}
-
-	// Register frame validator
-	if err := e.pubsub.RegisterValidator(
-		e.getGlobalFrameMessageBitmask(),
-		func(peerID peer.ID, message *pb.Message) p2p.ValidationResult {
-			return e.validateGlobalFrameMessage(peerID, message)
-		},
-		true,
-	); err != nil {
-		return errors.Wrap(err, "subscribe to global frame messages")
-	}
-
-	return nil
-}
-
-func (e *AppConsensusEngine) subscribeToGlobalAlertMessages() error {
-	if err := e.pubsub.Subscribe(
-		e.getGlobalAlertMessageBitmask(),
-		func(message *pb.Message) error {
-			select {
-			case e.globalAlertMessageQueue <- message:
-				return nil
-			case <-e.ShutdownSignal():
-				return errors.New("context cancelled")
-			default:
-				e.logger.Warn("global alert queue full, dropping message")
-				return nil
-			}
-		},
-	); err != nil {
-		return errors.Wrap(err, "subscribe to global alert messages")
-	}
-
-	// Register alert validator
-	if err := e.pubsub.RegisterValidator(
-		e.getGlobalAlertMessageBitmask(),
-		func(peerID peer.ID, message *pb.Message) p2p.ValidationResult {
-			return e.validateAlertMessage(peerID, message)
-		},
-		true,
-	); err != nil {
-		return errors.Wrap(err, "subscribe to global alert messages")
-	}
-
-	return nil
-}
-
-func (e *AppConsensusEngine) subscribeToPeerInfoMessages() error {
-	if err := e.pubsub.Subscribe(
-		e.getGlobalPeerInfoMessageBitmask(),
-		func(message *pb.Message) error {
-			select {
-			case <-e.haltCtx.Done():
-				return nil
-			case e.globalPeerInfoMessageQueue <- message:
-				return nil
-			case <-e.ShutdownSignal():
-				return errors.New("context cancelled")
-			default:
-				e.logger.Warn("peer info message queue full, dropping message")
-				return nil
-			}
-		},
-	); err != nil {
-		return errors.Wrap(err, "subscribe to peer info messages")
-	}
-
-	// Register frame validator
-	if err := e.pubsub.RegisterValidator(
-		e.getGlobalPeerInfoMessageBitmask(),
-		func(peerID peer.ID, message *pb.Message) p2p.ValidationResult {
-			return e.validatePeerInfoMessage(peerID, message)
-		},
-		true,
-	); err != nil {
-		return errors.Wrap(err, "subscribe to peer info messages")
-	}
-
-	return nil
-}
 
 func (e *AppConsensusEngine) subscribeToDispatchMessages() error {
 	if err := e.pubsub.Subscribe(
@@ -277,4 +164,102 @@ func (e *AppConsensusEngine) subscribeToDispatchMessages() error {
 	}
 
 	return nil
+}
+
+func (e *AppConsensusEngine) streamGlobalMessagesFromMaster(
+	ctx lifecycle.SignalerContext,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if err := e.ensureGlobalClient(); err != nil {
+			e.logger.Warn("global message stream: failed to connect to master",
+				zap.Error(err),
+			)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+
+		stream, err := e.globalClient.StreamGlobalMessages(
+			ctx,
+			&protobufs.StreamGlobalMessagesRequest{},
+		)
+		if err != nil {
+			e.logger.Warn("global message stream: failed to open stream",
+				zap.Error(err),
+			)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+
+		e.logger.Info("connected to master global message stream")
+		e.receiveGlobalMessages(ctx, stream)
+
+		e.logger.Warn("global message stream disconnected, reconnecting")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (e *AppConsensusEngine) receiveGlobalMessages(
+	ctx lifecycle.SignalerContext,
+	stream protobufs.GlobalService_StreamGlobalMessagesClient,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		msg, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+				return
+			}
+			e.logger.Warn("global message stream: recv error",
+				zap.Error(err),
+			)
+			return
+		}
+
+		pbMsg := &pb.Message{
+			Data:    msg.Data,
+			Bitmask: msg.Bitmask,
+		}
+
+		switch {
+		case bytes.Equal(msg.Bitmask, global.GLOBAL_FRAME_BITMASK):
+			select {
+			case e.globalFrameMessageQueue <- pbMsg:
+			default:
+			}
+		case bytes.Equal(msg.Bitmask, global.GLOBAL_ALERT_BITMASK):
+			select {
+			case e.globalAlertMessageQueue <- pbMsg:
+			default:
+			}
+		case bytes.Equal(msg.Bitmask, global.GLOBAL_PEER_INFO_BITMASK):
+			select {
+			case e.globalPeerInfoMessageQueue <- pbMsg:
+			default:
+			}
+		// GLOBAL_PROVER_BITMASK: intentionally not dispatched (workers discard)
+		}
+	}
 }

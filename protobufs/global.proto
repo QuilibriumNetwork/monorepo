@@ -484,6 +484,13 @@ message GlobalGetWorkerInfoResponse {
   repeated GlobalGetWorkerInfoResponseItem workers = 1;
 }
 
+message StreamGlobalMessagesRequest {}
+
+message StreamGlobalMessagesResponse {
+  bytes data = 1;
+  bytes bitmask = 2;
+}
+
 service GlobalService {
   rpc GetGlobalFrame (GetGlobalFrameRequest) returns (GlobalFrameResponse);
   rpc GetGlobalProposal (GetGlobalProposalRequest) returns (GlobalProposalResponse);
@@ -491,6 +498,7 @@ service GlobalService {
   rpc GetGlobalShards(GetGlobalShardsRequest) returns (GetGlobalShardsResponse);
   rpc GetLockedAddresses(GetLockedAddressesRequest) returns (GetLockedAddressesResponse);
   rpc GetWorkerInfo(GlobalGetWorkerInfoRequest) returns (GlobalGetWorkerInfoResponse);
+  rpc StreamGlobalMessages(StreamGlobalMessagesRequest) returns (stream StreamGlobalMessagesResponse);
 }
 
 service AppShardService {
