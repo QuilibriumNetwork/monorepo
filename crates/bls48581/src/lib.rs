@@ -476,6 +476,149 @@ pub fn verify_raw(
   );
 }
 
+// ── Full-width scalar API ───────────────────────────────────────────────────
+//
+// The original commit/prove functions use 64-byte-per-scalar serialization
+// (BYTES_PER_SCALAR = 64), which truncates the top 9 bytes of BLS48-581
+// field elements (MODBYTES = 73).  The functions below use the full MODBYTES
+// width, preserving complete field elements.
+
+/// Bytes per scalar in the full-width encoding (= MODBYTES = 73).
+pub const FULL_BYTES_PER_SCALAR: usize = big::MODBYTES;
+
+fn bytes_to_polynomial_full(
+  bytes: &[u8],
+) -> Vec<big::BIG> {
+  let size = bytes.len() / FULL_BYTES_PER_SCALAR;
+  let trunc_last = bytes.len() % FULL_BYTES_PER_SCALAR > 0;
+
+  let mut poly = Vec::with_capacity(size + (if trunc_last { 1 } else { 0 }));
+
+  for i in 0..size {
+    let start = i * FULL_BYTES_PER_SCALAR;
+    let scalar = big::BIG::frombytes(&bytes[start..start + FULL_BYTES_PER_SCALAR]);
+    poly.push(scalar);
+  }
+
+  if trunc_last {
+    let scalar = big::BIG::frombytes(&bytes[size * FULL_BYTES_PER_SCALAR..]);
+    poly.push(scalar);
+  }
+
+  poly
+}
+
+/// Commit to a polynomial in evaluation form using full-width (MODBYTES per
+/// scalar) encoding.
+///
+/// Like [`commit_raw`] but reads 73 bytes per scalar instead of 64,
+/// preserving the full field element without truncation.
+pub fn commit_raw_full(
+  data: &[u8],
+  poly_size: u64,
+) -> Vec<u8> {
+  let mut poly = bytes_to_polynomial_full(data);
+  while poly.len() < poly_size as usize {
+    poly.push(big::BIG::new());
+  }
+  match point_linear_combination(
+    &bls::singleton().FFTBLS48581[&poly_size],
+    &poly,
+  ) {
+    Ok(commit) => {
+      let mut b = [0u8; 74];
+      commit.tobytes(&mut b, true);
+      b.to_vec()
+    }
+    Err(_) => vec![],
+  }
+}
+
+/// Create an opening proof at a domain-point index using full-width scalars.
+///
+/// Like [`prove_raw`] but reads 73 bytes per scalar. Uses the existing
+/// [`div_by_linear`] helper and monomial-basis SRS for the quotient commitment.
+pub fn prove_raw_full(
+  data: &[u8],
+  index: u64,
+  poly_size: u64,
+) -> Vec<u8> {
+  let mut poly = bytes_to_polynomial_full(data);
+  while poly.len() < poly_size as usize {
+    poly.push(big::BIG::new());
+  }
+
+  let z = bls::singleton().RootsOfUnityBLS48581[&poly_size][index as usize];
+
+  match fft(&poly, poly_size, true) {
+    Ok(coeffs) => {
+      let q = div_by_linear(&coeffs, &z);
+      match point_linear_combination(
+        &bls::singleton().CeremonyBLS48581G1[..q.len()],
+        &q,
+      ) {
+        Ok(proof) => {
+          let mut b = [0u8; 74];
+          proof.tobytes(&mut b, true);
+          b.to_vec()
+        }
+        Err(_) => vec![],
+      }
+    }
+    Err(_) => vec![],
+  }
+}
+
+/// Commit to a polynomial given directly as `BIG` scalars in evaluation form.
+///
+/// Uses the Lagrange-basis SRS (`FFTBLS48581`) to compute
+/// `C = Σ scalars[i] · [Lᵢ(τ)]₁`.  No byte serialization — avoids the
+/// 64-byte truncation inherent in [`commit_raw`].
+pub fn commit_scalars(
+  scalars: &[big::BIG],
+  poly_size: u64,
+) -> Vec<u8> {
+  let mut poly = scalars.to_vec();
+  while poly.len() < poly_size as usize {
+    poly.push(big::BIG::new());
+  }
+  match point_linear_combination(
+    &bls::singleton().FFTBLS48581[&poly_size],
+    &poly,
+  ) {
+    Ok(commit) => {
+      let mut b = [0u8; 74];
+      commit.tobytes(&mut b, true);
+      b.to_vec()
+    }
+    Err(_) => vec![],
+  }
+}
+
+/// Commit to a polynomial given as `BIG` scalars in coefficient form.
+///
+/// Uses the monomial-basis SRS (`CeremonyBLS48581G1`) to compute
+/// `C = Σ coeffs[i] · [τⁱ]₁`.  Useful when you already have coefficient-form
+/// polynomials (e.g. quotients from synthetic division) and want to skip the
+/// FFT that would be needed to convert to evaluation form first.
+pub fn commit_scalars_monomial(
+  coeffs: &[big::BIG],
+) -> Vec<u8> {
+  match point_linear_combination(
+    &bls::singleton().CeremonyBLS48581G1[..coeffs.len()],
+    &coeffs.to_vec(),
+  ) {
+    Ok(commit) => {
+      let mut b = [0u8; 74];
+      commit.tobytes(&mut b, true);
+      b.to_vec()
+    }
+    Err(_) => vec![],
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Debug)]
 pub struct Multiproof {
     pub d: Vec<u8>,
@@ -1013,5 +1156,84 @@ mod tests {
             "multiproof verification failed"
         );
         println!("verification: {:?} elapsed", now.elapsed());
+    }
+
+    #[test]
+    fn full_width_commit_prove_verify_roundtrip() {
+        init();
+        let poly_size: u64 = 16;
+        let index: u64 = 3;
+
+        let mut rng = rand::RAND::new();
+        rng.clean();
+        rng.seed(32, &[0xB7; 32]);
+
+        let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+
+        // Generate random field-element scalars (evaluation form)
+        let mut scalars = Vec::with_capacity(poly_size as usize);
+        for _ in 0..poly_size {
+            let mut s = big::BIG::random(&mut rng);
+            s.rmod(&modulus);
+            scalars.push(s);
+        }
+
+        // Serialize to full-width bytes (MODBYTES per scalar)
+        let mut full_bytes = Vec::with_capacity(poly_size as usize * FULL_BYTES_PER_SCALAR);
+        for s in &scalars {
+            let mut buf = [0u8; big::MODBYTES];
+            s.tobytes(&mut buf);
+            full_bytes.extend_from_slice(&buf);
+        }
+
+        // 1. commit_raw_full and commit_scalars must agree
+        let c1 = commit_raw_full(&full_bytes, poly_size);
+        assert!(!c1.is_empty(), "commit_raw_full returned empty");
+        let c2 = commit_scalars(&scalars, poly_size);
+        assert_eq!(c1, c2, "commit_raw_full and commit_scalars must match");
+
+        // 2. prove_raw_full opening at a domain point
+        let proof = prove_raw_full(&full_bytes, index, poly_size);
+        assert!(!proof.is_empty(), "prove_raw_full returned empty");
+
+        // 3. Evaluation value is scalars[index] (Lagrange eval form)
+        let mut y_bytes = [0u8; big::MODBYTES];
+        scalars[index as usize].tobytes(&mut y_bytes);
+
+        // 4. Verify — verify_raw accepts any-length data slice
+        assert!(
+            verify_raw(&y_bytes, &c1, index, &proof, poly_size),
+            "full-width roundtrip verification failed"
+        );
+    }
+
+    #[test]
+    fn commit_monomial_matches_lagrange() {
+        init();
+        let poly_size: u64 = 16;
+
+        let mut rng = rand::RAND::new();
+        rng.clean();
+        rng.seed(32, &[0xC3; 32]);
+
+        let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+
+        // Random coefficient-form polynomial
+        let mut coeffs = Vec::with_capacity(poly_size as usize);
+        for _ in 0..poly_size {
+            let mut s = big::BIG::random(&mut rng);
+            s.rmod(&modulus);
+            coeffs.push(s);
+        }
+
+        // Commit via monomial SRS (coefficient form)
+        let c_mono = commit_scalars_monomial(&coeffs);
+        assert!(!c_mono.is_empty());
+
+        // Convert to eval form and commit via Lagrange SRS
+        let evals = fft(&coeffs, poly_size, false).unwrap();
+        let c_lagr = commit_scalars(&evals, poly_size);
+
+        assert_eq!(c_mono, c_lagr, "monomial and Lagrange commits must match");
     }
 }
