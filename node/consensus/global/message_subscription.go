@@ -132,6 +132,8 @@ func (e *GlobalConsensusEngine) subscribeToFrameMessages() error {
 	if err := e.pubsub.Subscribe(
 		GLOBAL_FRAME_BITMASK,
 		func(message *pb.Message) error {
+			e.broadcastGlobalMessage(message.Data, GLOBAL_FRAME_BITMASK)
+
 			// Don't subscribe if running in consensus, the time reel shouldn't have
 			// the frame ahead of time
 			if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
@@ -171,6 +173,8 @@ func (e *GlobalConsensusEngine) subscribeToProverMessages() error {
 	if err := e.pubsub.Subscribe(
 		GLOBAL_PROVER_BITMASK,
 		func(message *pb.Message) error {
+			e.broadcastGlobalMessage(message.Data, GLOBAL_PROVER_BITMASK)
+
 			if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
 				return nil
 			}
@@ -210,6 +214,8 @@ func (e *GlobalConsensusEngine) subscribeToPeerInfoMessages() error {
 	if err := e.pubsub.Subscribe(
 		GLOBAL_PEER_INFO_BITMASK,
 		func(message *pb.Message) error {
+			e.broadcastGlobalMessage(message.Data, GLOBAL_PEER_INFO_BITMASK)
+
 			select {
 			case <-e.haltCtx.Done():
 				return nil
@@ -244,6 +250,8 @@ func (e *GlobalConsensusEngine) subscribeToAlertMessages() error {
 	if err := e.pubsub.Subscribe(
 		GLOBAL_ALERT_BITMASK,
 		func(message *pb.Message) error {
+			e.broadcastGlobalMessage(message.Data, GLOBAL_ALERT_BITMASK)
+
 			select {
 			case e.globalAlertMessageQueue <- message:
 				return nil

@@ -446,6 +446,13 @@ func (r *ProverRegistry) UpdateProverActivity(
 	return nil
 }
 
+// CurrentFrame implements ProverRegistry
+func (r *ProverRegistry) CurrentFrame() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.currentFrame
+}
+
 // PruneOrphanJoins implements ProverRegistry
 func (r *ProverRegistry) PruneOrphanJoins(frameNumber uint64) error {
 	// Pruning is disabled — it was causing tree divergence between nodes

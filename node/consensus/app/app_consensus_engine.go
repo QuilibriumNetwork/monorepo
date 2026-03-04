@@ -64,6 +64,10 @@ import (
 	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
+// globalSyncCooldownFrames is the number of frames to wait between
+// performBlockingGlobalHypersync calls. At ~10s/frame this is ~50 seconds.
+const globalSyncCooldownFrames = 5
+
 // AppConsensusEngine uses the generic state machine for consensus
 type AppConsensusEngine struct {
 	*lifecycle.ComponentManager
@@ -118,6 +122,7 @@ type AppConsensusEngine struct {
 	appSpilloverMu                sync.Mutex
 	lastProposalRank              uint64
 	lastProposalRankMu            sync.RWMutex
+	commitBarrier                 sync.Mutex
 	collectedMessages             []*protobufs.Message
 	collectedMessagesMu           sync.RWMutex
 	provingMessages               []*protobufs.Message
@@ -152,9 +157,10 @@ type AppConsensusEngine struct {
 	coverageMinProvers            uint64
 	coverageHaltThreshold         uint64
 	coverageHaltGrace             uint64
-	globalProverRootVerifiedFrame atomic.Uint64
-	globalProverRootSynced        atomic.Bool
-	globalProverSyncInProgress    atomic.Bool
+	globalProverRootVerifiedFrame  atomic.Uint64
+	globalProverRootSynced         atomic.Bool
+	globalProverSyncInProgress     atomic.Bool
+	globalSyncCooldownUntilFrame   atomic.Uint64
 
 	// Genesis initialization
 	genesisInitialized atomic.Bool
@@ -877,6 +883,14 @@ func NewAppConsensusEngine(
 		engine.processPeerInfoMessageQueue(ctx)
 	}))
 
+	componentBuilder.AddWorker(namedWorker("globalMessageStream", func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.streamGlobalMessagesFromMaster(ctx)
+	}))
+
 	componentBuilder.AddWorker(namedWorker("dispatchMsgQueue", func(
 		ctx lifecycle.SignalerContext,
 		ready lifecycle.ReadyFunc,
@@ -938,26 +952,6 @@ func NewAppConsensusEngine(
 		return nil, err
 	}
 
-	err = engine.subscribeToGlobalFrameMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToGlobalProverMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToGlobalAlertMessages()
-	if err != nil {
-		return nil, err
-	}
-
-	err = engine.subscribeToPeerInfoMessages()
-	if err != nil {
-		return nil, err
-	}
-
 	err = engine.subscribeToDispatchMessages()
 	if err != nil {
 		return nil, err
@@ -982,14 +976,6 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	e.pubsub.UnregisterValidator(e.getProverMessageBitmask())
 	e.pubsub.Unsubscribe(e.getFrameMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getFrameMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalFrameMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalFrameMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalProverMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalProverMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalAlertMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalAlertMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalPeerInfoMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalPeerInfoMessageBitmask())
 	e.pubsub.Unsubscribe(e.getDispatchMessageBitmask(), false)
 	e.pubsub.UnregisterValidator(e.getDispatchMessageBitmask())
 
@@ -1045,7 +1031,16 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
+		if frameNumber < e.globalSyncCooldownUntilFrame.Load() {
+			e.logger.Debug(
+				"global prover root error, skipping sync (cooldown active)",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Uint64("cooldown_until", e.globalSyncCooldownUntilFrame.Load()),
+			)
+			return
+		}
 		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+		e.globalSyncCooldownUntilFrame.Store(frameNumber + globalSyncCooldownFrames)
 		return
 	}
 
@@ -1062,7 +1057,16 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
+		if frameNumber < e.globalSyncCooldownUntilFrame.Load() {
+			e.logger.Debug(
+				"global prover root mismatch, skipping sync (cooldown active)",
+				zap.Uint64("frame_number", frameNumber),
+				zap.Uint64("cooldown_until", e.globalSyncCooldownUntilFrame.Load()),
+			)
+			return
+		}
 		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
+		e.globalSyncCooldownUntilFrame.Store(frameNumber + globalSyncCooldownFrames)
 
 		// Re-compute local root after sync to verify convergence, matching
 		// the global engine's post-sync verification pattern.
@@ -1080,6 +1084,7 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 			)
 			e.globalProverRootSynced.Store(true)
 			e.globalProverRootVerifiedFrame.Store(frameNumber)
+			e.globalSyncCooldownUntilFrame.Store(0)
 			if err := e.proverRegistry.Refresh(); err != nil {
 				e.logger.Warn("failed to refresh prover registry", zap.Error(err))
 			}
@@ -1101,6 +1106,7 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 
 	e.globalProverRootSynced.Store(true)
 	e.globalProverRootVerifiedFrame.Store(frameNumber)
+	e.globalSyncCooldownUntilFrame.Store(0)
 
 	if err := e.proverRegistry.Refresh(); err != nil {
 		e.logger.Warn("failed to refresh prover registry", zap.Error(err))
@@ -1476,8 +1482,11 @@ func (e *AppConsensusEngine) materialize(
 		zap.Any("current_changeset_count", len(state.Changeset())),
 	)
 
-	if err := state.Commit(); err != nil {
-		return errors.Wrap(err, "materialize")
+	e.commitBarrier.Lock()
+	stateCommitErr := state.Commit()
+	e.commitBarrier.Unlock()
+	if stateCommitErr != nil {
+		return errors.Wrap(stateCommitErr, "materialize")
 	}
 
 	return nil
@@ -1570,28 +1579,12 @@ func (e *AppConsensusEngine) getConsensusMessageBitmask() []byte {
 	return slices.Concat([]byte{0}, e.appFilter)
 }
 
-func (e *AppConsensusEngine) getGlobalProverMessageBitmask() []byte {
-	return global.GLOBAL_PROVER_BITMASK
-}
-
 func (e *AppConsensusEngine) getFrameMessageBitmask() []byte {
 	return e.appFilter
 }
 
 func (e *AppConsensusEngine) getProverMessageBitmask() []byte {
 	return slices.Concat([]byte{0, 0, 0}, e.appFilter)
-}
-
-func (e *AppConsensusEngine) getGlobalFrameMessageBitmask() []byte {
-	return global.GLOBAL_FRAME_BITMASK
-}
-
-func (e *AppConsensusEngine) getGlobalAlertMessageBitmask() []byte {
-	return global.GLOBAL_ALERT_BITMASK
-}
-
-func (e *AppConsensusEngine) getGlobalPeerInfoMessageBitmask() []byte {
-	return global.GLOBAL_PEER_INFO_BITMASK
 }
 
 func (e *AppConsensusEngine) getDispatchMessageBitmask() []byte {
@@ -2166,10 +2159,12 @@ func (e *AppConsensusEngine) internalProveFrame(
 		return nil, errors.New("no proving key available")
 	}
 
+	e.commitBarrier.Lock()
 	stateRoots, err := e.hypergraph.CommitShard(
 		previousFrame.Header.FrameNumber+1,
 		e.appAddress,
 	)
+	e.commitBarrier.Unlock()
 	if err != nil {
 		return nil, err
 	}

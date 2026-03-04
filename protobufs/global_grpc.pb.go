@@ -20,12 +20,13 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	GlobalService_GetGlobalFrame_FullMethodName     = "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame"
-	GlobalService_GetGlobalProposal_FullMethodName  = "/quilibrium.node.global.pb.GlobalService/GetGlobalProposal"
-	GlobalService_GetAppShards_FullMethodName       = "/quilibrium.node.global.pb.GlobalService/GetAppShards"
-	GlobalService_GetGlobalShards_FullMethodName    = "/quilibrium.node.global.pb.GlobalService/GetGlobalShards"
-	GlobalService_GetLockedAddresses_FullMethodName = "/quilibrium.node.global.pb.GlobalService/GetLockedAddresses"
-	GlobalService_GetWorkerInfo_FullMethodName      = "/quilibrium.node.global.pb.GlobalService/GetWorkerInfo"
+	GlobalService_GetGlobalFrame_FullMethodName       = "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame"
+	GlobalService_GetGlobalProposal_FullMethodName    = "/quilibrium.node.global.pb.GlobalService/GetGlobalProposal"
+	GlobalService_GetAppShards_FullMethodName         = "/quilibrium.node.global.pb.GlobalService/GetAppShards"
+	GlobalService_GetGlobalShards_FullMethodName      = "/quilibrium.node.global.pb.GlobalService/GetGlobalShards"
+	GlobalService_GetLockedAddresses_FullMethodName   = "/quilibrium.node.global.pb.GlobalService/GetLockedAddresses"
+	GlobalService_GetWorkerInfo_FullMethodName        = "/quilibrium.node.global.pb.GlobalService/GetWorkerInfo"
+	GlobalService_StreamGlobalMessages_FullMethodName = "/quilibrium.node.global.pb.GlobalService/StreamGlobalMessages"
 )
 
 // GlobalServiceClient is the client API for GlobalService service.
@@ -38,6 +39,7 @@ type GlobalServiceClient interface {
 	GetGlobalShards(ctx context.Context, in *GetGlobalShardsRequest, opts ...grpc.CallOption) (*GetGlobalShardsResponse, error)
 	GetLockedAddresses(ctx context.Context, in *GetLockedAddressesRequest, opts ...grpc.CallOption) (*GetLockedAddressesResponse, error)
 	GetWorkerInfo(ctx context.Context, in *GlobalGetWorkerInfoRequest, opts ...grpc.CallOption) (*GlobalGetWorkerInfoResponse, error)
+	StreamGlobalMessages(ctx context.Context, in *StreamGlobalMessagesRequest, opts ...grpc.CallOption) (GlobalService_StreamGlobalMessagesClient, error)
 }
 
 type globalServiceClient struct {
@@ -102,6 +104,38 @@ func (c *globalServiceClient) GetWorkerInfo(ctx context.Context, in *GlobalGetWo
 	return out, nil
 }
 
+func (c *globalServiceClient) StreamGlobalMessages(ctx context.Context, in *StreamGlobalMessagesRequest, opts ...grpc.CallOption) (GlobalService_StreamGlobalMessagesClient, error) {
+	stream, err := c.cc.NewStream(ctx, &GlobalService_ServiceDesc.Streams[0], GlobalService_StreamGlobalMessages_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &globalServiceStreamGlobalMessagesClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type GlobalService_StreamGlobalMessagesClient interface {
+	Recv() (*StreamGlobalMessagesResponse, error)
+	grpc.ClientStream
+}
+
+type globalServiceStreamGlobalMessagesClient struct {
+	grpc.ClientStream
+}
+
+func (x *globalServiceStreamGlobalMessagesClient) Recv() (*StreamGlobalMessagesResponse, error) {
+	m := new(StreamGlobalMessagesResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // GlobalServiceServer is the server API for GlobalService service.
 // All implementations must embed UnimplementedGlobalServiceServer
 // for forward compatibility
@@ -112,6 +146,7 @@ type GlobalServiceServer interface {
 	GetGlobalShards(context.Context, *GetGlobalShardsRequest) (*GetGlobalShardsResponse, error)
 	GetLockedAddresses(context.Context, *GetLockedAddressesRequest) (*GetLockedAddressesResponse, error)
 	GetWorkerInfo(context.Context, *GlobalGetWorkerInfoRequest) (*GlobalGetWorkerInfoResponse, error)
+	StreamGlobalMessages(*StreamGlobalMessagesRequest, GlobalService_StreamGlobalMessagesServer) error
 	mustEmbedUnimplementedGlobalServiceServer()
 }
 
@@ -136,6 +171,9 @@ func (UnimplementedGlobalServiceServer) GetLockedAddresses(context.Context, *Get
 }
 func (UnimplementedGlobalServiceServer) GetWorkerInfo(context.Context, *GlobalGetWorkerInfoRequest) (*GlobalGetWorkerInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetWorkerInfo not implemented")
+}
+func (UnimplementedGlobalServiceServer) StreamGlobalMessages(*StreamGlobalMessagesRequest, GlobalService_StreamGlobalMessagesServer) error {
+	return status.Errorf(codes.Unimplemented, "method StreamGlobalMessages not implemented")
 }
 func (UnimplementedGlobalServiceServer) mustEmbedUnimplementedGlobalServiceServer() {}
 
@@ -258,6 +296,27 @@ func _GlobalService_GetWorkerInfo_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _GlobalService_StreamGlobalMessages_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamGlobalMessagesRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(GlobalServiceServer).StreamGlobalMessages(m, &globalServiceStreamGlobalMessagesServer{stream})
+}
+
+type GlobalService_StreamGlobalMessagesServer interface {
+	Send(*StreamGlobalMessagesResponse) error
+	grpc.ServerStream
+}
+
+type globalServiceStreamGlobalMessagesServer struct {
+	grpc.ServerStream
+}
+
+func (x *globalServiceStreamGlobalMessagesServer) Send(m *StreamGlobalMessagesResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
 // GlobalService_ServiceDesc is the grpc.ServiceDesc for GlobalService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -290,7 +349,13 @@ var GlobalService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _GlobalService_GetWorkerInfo_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamGlobalMessages",
+			Handler:       _GlobalService_StreamGlobalMessages_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "global.proto",
 }
 

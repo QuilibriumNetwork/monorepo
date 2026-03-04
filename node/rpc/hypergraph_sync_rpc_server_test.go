@@ -2645,6 +2645,7 @@ func TestMainnetBlossomsubFrameReceptionAndHypersync(t *testing.T) {
 		ValidateQueueSize:         128,
 		ValidateWorkers:           4,
 		PeerOutboundQueueSize:     128,
+		PeerReconnectCheckInterval: 60 * time.Second,
 	}
 
 	engineConfig := &config.EngineConfig{}

@@ -51,6 +51,15 @@ message PeerInfoResponse {
   repeated PeerInfo peer_info = 1;
 }
 
+message ShardAllocationInfo {
+  bytes filter = 1;
+  uint32 status = 2;
+  uint64 join_frame_number = 3;
+  uint64 join_confirm_frame_number = 4;
+  uint64 leave_frame_number = 5;
+  uint64 last_active_frame_number = 6;
+}
+
 message NodeInfoResponse {
   string peer_id = 1;
   uint64 peer_score = 2;
@@ -62,6 +71,7 @@ message NodeInfoResponse {
   uint64 last_received_frame = 8;
   uint64 last_global_head_frame = 9;
   bool reachable = 10;
+  repeated ShardAllocationInfo shard_allocations = 11;
 }
 
 message WorkerInfo {
@@ -197,6 +207,14 @@ message MaterializedPendingTransaction {
   uint64 expiration = 17;
 }
 
+message GetMetricsRequest {
+  string filter = 1;
+}
+
+message GetMetricsResponse {
+  bytes metrics = 1;
+}
+
 message GetTokensByAccountRequest {
   bytes address = 1;
   bytes domain = 2;
@@ -215,6 +233,7 @@ service NodeService {
   rpc Send(SendRequest) returns (SendResponse);
   rpc GetTokensByAccount(GetTokensByAccountRequest)
     returns (GetTokensByAccountResponse);
+  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
 }
 
 message ConnectivityTestRequest {

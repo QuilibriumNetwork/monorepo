@@ -533,3 +533,212 @@ func (m *Manager) unallocatedWorkerCount() (int, error) {
 	}
 	return count, nil
 }
+
+// PlanLeaves identifies Active allocations that are on overcrowded shards
+// (high Ring) when significantly better unallocated shards exist. Returns up
+// to 3 filters to propose leaving.
+func (m *Manager) PlanLeaves(
+	difficulty uint64,
+	allocatedShards []ShardDescriptor,
+	unallocatedShards []ShardDescriptor,
+	worldBytes *big.Int,
+) ([][]byte, error) {
+	if len(allocatedShards) == 0 || len(unallocatedShards) == 0 {
+		return nil, nil
+	}
+
+	if worldBytes.Cmp(big.NewInt(0)) == 0 {
+		return nil, nil
+	}
+
+	basis := reward.PomwBasis(difficulty, worldBytes.Uint64(), m.Units)
+
+	unallocatedScores, err := m.scoreShards(unallocatedShards, basis, worldBytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "plan leaves")
+	}
+
+	// Find best unallocated score.
+	var bestUnallocatedScore *big.Int
+	for _, sc := range unallocatedScores {
+		if bestUnallocatedScore == nil || sc.score.Cmp(bestUnallocatedScore) > 0 {
+			bestUnallocatedScore = sc.score
+		}
+	}
+
+	if bestUnallocatedScore == nil || bestUnallocatedScore.Sign() == 0 {
+		return nil, nil
+	}
+
+	allocatedScores, err := m.scoreShards(allocatedShards, basis, worldBytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "plan leaves")
+	}
+
+	// Leave threshold: allocated shard must score below 67% of best unallocated
+	// (i.e., the alternative is ~50% better).
+	leaveThreshold := new(big.Int).Mul(bestUnallocatedScore, big.NewInt(67))
+	leaveThreshold.Div(leaveThreshold, big.NewInt(100))
+
+	// Collect leave candidates.
+	type candidate struct {
+		filter []byte
+		score  *big.Int
+	}
+	candidates := make([]candidate, 0)
+	for _, sc := range allocatedScores {
+		if sc.score.Cmp(leaveThreshold) < 0 {
+			candidates = append(candidates, candidate{
+				filter: allocatedShards[sc.idx].Filter,
+				score:  sc.score,
+			})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Sort by score ascending (worst shards first).
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score.Cmp(candidates[j].score) < 0
+	})
+
+	// Return up to 3 filters.
+	limit := 3
+	if limit > len(candidates) {
+		limit = len(candidates)
+	}
+
+	filters := make([][]byte, 0, limit)
+	for i := 0; i < limit; i++ {
+		fc := make([]byte, len(candidates[i].filter))
+		copy(fc, candidates[i].filter)
+		filters = append(filters, fc)
+	}
+
+	err = m.workerMgr.ProposeLeave(filters)
+	if err != nil {
+		return nil, errors.Wrap(err, "plan leaves")
+	}
+
+	return filters, nil
+}
+
+// DecideLeaves confirms or rejects pending leaves after 360 frames. For each
+// pending leave filter:
+//   - If the shard's score is competitive (>= 67% of best), reject the leave
+//     (the shard improved, stay on it).
+//   - If the shard's score is still poor (< 67% of best), confirm the leave
+//     (better alternatives still exist).
+//   - If the filter is not found in shards, confirm (shard disappeared).
+func (m *Manager) DecideLeaves(
+	difficulty uint64,
+	shards []ShardDescriptor,
+	pendingLeaves [][]byte,
+	worldBytes *big.Int,
+) error {
+	if len(pendingLeaves) == 0 {
+		return nil
+	}
+
+	if len(shards) == 0 {
+		// No shards to score — confirm all leaves.
+		confirm := make([][]byte, 0, len(pendingLeaves))
+		for _, p := range pendingLeaves {
+			if len(p) == 0 {
+				continue
+			}
+			if len(confirm) > 99 {
+				break
+			}
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			confirm = append(confirm, pc)
+		}
+		return m.workerMgr.DecideLeave(nil, confirm)
+	}
+
+	basis := reward.PomwBasis(difficulty, worldBytes.Uint64(), m.Units)
+
+	scores, err := m.scoreShards(shards, basis, worldBytes)
+	if err != nil {
+		return errors.Wrap(err, "decide leaves")
+	}
+
+	type srec struct {
+		desc  ShardDescriptor
+		score *big.Int
+	}
+	byHex := make(map[string]srec, len(shards))
+	var bestScore *big.Int
+	for _, sc := range scores {
+		s := shards[sc.idx]
+		key := hex.EncodeToString(s.Filter)
+		byHex[key] = srec{desc: s, score: sc.score}
+		if bestScore == nil || sc.score.Cmp(bestScore) > 0 {
+			bestScore = sc.score
+		}
+	}
+
+	if bestScore == nil {
+		// Nothing scored — confirm all leaves.
+		confirm := make([][]byte, 0, len(pendingLeaves))
+		for _, p := range pendingLeaves {
+			if len(p) == 0 {
+				continue
+			}
+			if len(confirm) > 99 {
+				break
+			}
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			confirm = append(confirm, pc)
+		}
+		return m.workerMgr.DecideLeave(nil, confirm)
+	}
+
+	// Reject threshold: if the leaving shard's score >= 67% of best, reject
+	// the leave (the shard has improved enough to stay).
+	rejectThreshold := new(big.Int).Mul(bestScore, big.NewInt(67))
+	rejectThreshold.Div(rejectThreshold, big.NewInt(100))
+
+	reject := make([][]byte, 0, len(pendingLeaves))
+	confirm := make([][]byte, 0, len(pendingLeaves))
+
+	for _, p := range pendingLeaves {
+		if len(p) == 0 {
+			continue
+		}
+		if len(reject) > 99 {
+			break
+		}
+		if len(confirm) > 99 {
+			break
+		}
+
+		key := hex.EncodeToString(p)
+		rec, ok := byHex[key]
+		if !ok {
+			// Shard disappeared — confirm the leave.
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			confirm = append(confirm, pc)
+			continue
+		}
+
+		if rec.score.Cmp(rejectThreshold) >= 0 {
+			// Shard is now competitive — reject the leave (stay).
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			reject = append(reject, pc)
+		} else {
+			// Still a bad shard — confirm the leave.
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			confirm = append(confirm, pc)
+		}
+	}
+
+	return m.workerMgr.DecideLeave(reject, confirm)
+}

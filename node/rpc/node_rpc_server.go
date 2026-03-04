@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -14,6 +15,8 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/expfmt"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -212,6 +215,31 @@ func (r *RPCServer) GetNodeInfo(
 		}
 	}
 
+	var shardAllocations []*protobufs.ShardAllocationInfo
+	if proverInfo != nil {
+		currentFrame := r.proverRegistry.CurrentFrame()
+		for _, alloc := range proverInfo.Allocations {
+			// Omit expired joins and leaves, matching the proposer's logic
+			// in event_distributor.go (pendingFilterGraceFrames = 720).
+			if alloc.Status == consensus.ProverStatusJoining &&
+				currentFrame > alloc.JoinFrameNumber+720 {
+				continue
+			}
+			if alloc.Status == consensus.ProverStatusLeaving &&
+				currentFrame > alloc.LeaveFrameNumber+720 {
+				continue
+			}
+			shardAllocations = append(shardAllocations, &protobufs.ShardAllocationInfo{
+				Filter:                 alloc.ConfirmationFilter,
+				Status:                 uint32(alloc.Status),
+				JoinFrameNumber:        alloc.JoinFrameNumber,
+				JoinConfirmFrameNumber: alloc.JoinConfirmFrameNumber,
+				LeaveFrameNumber:       alloc.LeaveFrameNumber,
+				LastActiveFrameNumber:  alloc.LastActiveFrameNumber,
+			})
+		}
+	}
+
 	return &protobufs.NodeInfoResponse{
 		PeerId:           peer.ID(peerID).String(),
 		PeerScore:        uint64(r.pubSub.GetPeerScore(peerID)),
@@ -221,6 +249,7 @@ func (r *RPCServer) GetNodeInfo(
 		AllocatedWorkers: allocated,
 		PatchNumber:      append([]byte{}, config.GetPatchNumber()),
 		Reachable:        r.pubSub.Reachability().Value,
+		ShardAllocations: shardAllocations,
 	}, nil
 }
 
@@ -247,6 +276,30 @@ func (r *RPCServer) GetWorkerInfo(
 	return &protobufs.WorkerInfoResponse{
 		WorkerInfo: info,
 	}, nil
+}
+
+func (r *RPCServer) GetMetrics(
+	ctx context.Context,
+	req *protobufs.GetMetricsRequest,
+) (*protobufs.GetMetricsResponse, error) {
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		r.logger.Warn("partial metrics gather error", zap.Error(err))
+	}
+
+	var buf bytes.Buffer
+	enc := expfmt.NewEncoder(&buf, expfmt.NewFormat(expfmt.TypeTextPlain))
+	filter := strings.ToLower(req.Filter)
+	for _, fam := range families {
+		if filter != "" && !strings.Contains(strings.ToLower(fam.GetName()), filter) {
+			continue
+		}
+		if err := enc.Encode(fam); err != nil {
+			return nil, errors.Wrap(err, "encode metrics")
+		}
+	}
+
+	return &protobufs.GetMetricsResponse{Metrics: buf.Bytes()}, nil
 }
 
 // Send implements protobufs.NodeServiceServer.

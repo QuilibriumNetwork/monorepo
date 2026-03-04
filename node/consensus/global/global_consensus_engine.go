@@ -109,6 +109,42 @@ func contextFromShutdownSignal(sig <-chan struct{}) context.Context {
 	return ctx
 }
 
+func (e *GlobalConsensusEngine) addGlobalMessageSubscriber(
+	ch chan *protobufs.StreamGlobalMessagesResponse,
+) {
+	e.globalMessageSubscribersMu.Lock()
+	e.globalMessageSubscribers[ch] = struct{}{}
+	e.globalMessageSubscribersMu.Unlock()
+}
+
+func (e *GlobalConsensusEngine) removeGlobalMessageSubscriber(
+	ch chan *protobufs.StreamGlobalMessagesResponse,
+) {
+	e.globalMessageSubscribersMu.Lock()
+	delete(e.globalMessageSubscribers, ch)
+	e.globalMessageSubscribersMu.Unlock()
+}
+
+func (e *GlobalConsensusEngine) broadcastGlobalMessage(
+	data []byte,
+	bitmask []byte,
+) {
+	msg := &protobufs.StreamGlobalMessagesResponse{
+		Data:    data,
+		Bitmask: bitmask,
+	}
+
+	e.globalMessageSubscribersMu.RLock()
+	defer e.globalMessageSubscribersMu.RUnlock()
+
+	for ch := range e.globalMessageSubscribers {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
 // GlobalConsensusEngine  uses the generic state machine for consensus
 type GlobalConsensusEngine struct {
 	*lifecycle.ComponentManager
@@ -248,6 +284,7 @@ type GlobalConsensusEngine struct {
 	shardCommitmentTrees   []*tries.VectorCommitmentTree
 	shardCommitmentKeySets []map[string]struct{}
 	shardCommitmentMu      sync.Mutex
+	commitBarrier          sync.Mutex
 
 	// Authentication provider
 	authProvider channel.AuthenticationProvider
@@ -262,6 +299,10 @@ type GlobalConsensusEngine struct {
 	// gRPC server for services
 	grpcServer   *grpc.Server
 	grpcListener net.Listener
+
+	// Global message streaming to workers
+	globalMessageSubscribersMu sync.RWMutex
+	globalMessageSubscribers   map[chan *protobufs.StreamGlobalMessagesResponse]struct{}
 }
 
 // NewGlobalConsensusEngine creates a new global consensus engine using the
@@ -349,6 +390,7 @@ func NewGlobalConsensusEngine(
 		txLockMap:                   make(map[uint64]map[string]map[string]*LockedTransaction),
 		appShardCache:               make(map[string]*appShardCacheEntry),
 		globalMessageSpillover:      make(map[uint64][][]byte),
+		globalMessageSubscribers:    make(map[chan *protobufs.StreamGlobalMessagesResponse]struct{}),
 	}
 	engine.frameChainChecker = NewFrameChainChecker(clockStore, logger)
 
@@ -435,6 +477,8 @@ func NewGlobalConsensusEngine(
 		config,
 		engine.ProposeWorkerJoin,
 		engine.DecideWorkerJoins,
+		engine.ProposeWorkerLeave,
+		engine.DecideWorkerLeaves,
 	)
 	if !config.Engine.ArchiveMode {
 		strategy := provers.RewardGreedy
@@ -1662,7 +1706,9 @@ func (e *GlobalConsensusEngine) materialize(
 	var appliedCount atomic.Int64
 	var skippedCount atomic.Int64
 
+	e.commitBarrier.Lock()
 	_, err := e.hypergraph.Commit(frameNumber)
+	e.commitBarrier.Unlock()
 	if err != nil {
 		e.logger.Error("error committing hypergraph", zap.Error(err))
 		return errors.Wrap(err, "materialize")
@@ -1836,8 +1882,11 @@ func (e *GlobalConsensusEngine) materialize(
 		return err
 	}
 
-	if err := state.Commit(); err != nil {
-		return errors.Wrap(err, "materialize")
+	e.commitBarrier.Lock()
+	stateCommitErr := state.Commit()
+	e.commitBarrier.Unlock()
+	if stateCommitErr != nil {
+		return errors.Wrap(stateCommitErr, "materialize")
 	}
 
 	// Persist any alt shard updates from this frame
@@ -3806,6 +3855,167 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 	return nil
 }
 
+func (e *GlobalConsensusEngine) ProposeWorkerLeave(
+	filters [][]byte,
+) error {
+	frame := e.GetFrame()
+	if frame == nil {
+		e.logger.Debug("cannot propose leave, no frame")
+		return errors.New("not ready")
+	}
+
+	_, err := e.keyManager.GetSigningKey("q-prover-key")
+	if err != nil {
+		e.logger.Debug("cannot propose leave, no signer key")
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	leave, err := global.NewProverLeave(
+		filters,
+		frame.Header.FrameNumber,
+		e.keyManager,
+		e.hypergraph,
+		schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+	)
+	if err != nil {
+		e.logger.Error("could not construct leave", zap.Error(err))
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	err = leave.Prove(frame.Header.FrameNumber)
+	if err != nil {
+		e.logger.Error("could not prove leave", zap.Error(err))
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	bundle := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{
+			{
+				Request: &protobufs.MessageRequest_Leave{
+					Leave: leave.ToProtobuf(),
+				},
+			},
+		},
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	msg, err := bundle.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize leave", zap.Error(err))
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	err = e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		msg,
+	)
+	if err != nil {
+		e.logger.Error("could not publish leave", zap.Error(err))
+		return errors.Wrap(err, "propose worker leave")
+	}
+
+	e.logger.Info(
+		"submitted leave request",
+		zap.Int("filters", len(filters)),
+	)
+
+	return nil
+}
+
+func (e *GlobalConsensusEngine) DecideWorkerLeaves(
+	reject [][]byte,
+	confirm [][]byte,
+) error {
+	frame := e.GetFrame()
+	if frame == nil {
+		e.logger.Debug("cannot decide leaves, no frame")
+		return errors.New("not ready")
+	}
+
+	_, err := e.keyManager.GetSigningKey("q-prover-key")
+	if err != nil {
+		e.logger.Debug("cannot decide leaves, no signer key")
+		return errors.Wrap(err, "decide worker leaves")
+	}
+
+	bundle := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{},
+	}
+
+	if len(reject) != 0 {
+		rejectMessage, err := global.NewProverReject(
+			reject,
+			frame.Header.FrameNumber,
+			e.keyManager,
+			e.hypergraph,
+			schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		)
+		if err != nil {
+			e.logger.Error("could not construct leave reject", zap.Error(err))
+			return errors.Wrap(err, "decide worker leaves")
+		}
+
+		err = rejectMessage.Prove(frame.Header.FrameNumber)
+		if err != nil {
+			e.logger.Error("could not prove leave reject", zap.Error(err))
+			return errors.Wrap(err, "decide worker leaves")
+		}
+
+		bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+			Request: &protobufs.MessageRequest_Reject{
+				Reject: rejectMessage.ToProtobuf(),
+			},
+		})
+	}
+
+	if len(confirm) != 0 {
+		confirmMessage, err := global.NewProverConfirm(
+			confirm,
+			frame.Header.FrameNumber,
+			e.keyManager,
+			e.hypergraph,
+			schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		)
+		if err != nil {
+			e.logger.Error("could not construct leave confirm", zap.Error(err))
+			return errors.Wrap(err, "decide worker leaves")
+		}
+
+		err = confirmMessage.Prove(frame.Header.FrameNumber)
+		if err != nil {
+			e.logger.Error("could not prove leave confirm", zap.Error(err))
+			return errors.Wrap(err, "decide worker leaves")
+		}
+
+		bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+			Request: &protobufs.MessageRequest_Confirm{
+				Confirm: confirmMessage.ToProtobuf(),
+			},
+		})
+	}
+
+	bundle.Timestamp = time.Now().UnixMilli()
+
+	msg, err := bundle.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not serialize leave decisions", zap.Error(err))
+		return errors.Wrap(err, "decide worker leaves")
+	}
+
+	err = e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		msg,
+	)
+	if err != nil {
+		e.logger.Error("could not publish leave decisions", zap.Error(err))
+		return errors.Wrap(err, "decide worker leaves")
+	}
+
+	e.logger.Debug("submitted leave decisions")
+
+	return nil
+}
+
 func (e *GlobalConsensusEngine) startConsensus(
 	trustedRoot *models.CertifiedState[*protobufs.GlobalFrame],
 	pending []*models.SignedProposal[
@@ -4299,7 +4509,9 @@ func (e *GlobalConsensusEngine) rebuildShardCommitments(
 	frameNumber uint64,
 	rank uint64,
 ) ([]byte, error) {
+	e.commitBarrier.Lock()
 	commitSet, err := e.hypergraph.Commit(frameNumber)
+	e.commitBarrier.Unlock()
 	if err != nil {
 		e.logger.Error("could not commit", zap.Error(err))
 		return nil, errors.Wrap(err, "rebuild shard commitments")

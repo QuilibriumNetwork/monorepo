@@ -160,7 +160,7 @@ func (t *mockTransaction) Abort() error {
 func TestWorkerManager_StartStop(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 
 	// Test starting the manager
 	ctx := context.Background()
@@ -185,7 +185,7 @@ func TestWorkerManager_StartStop(t *testing.T) {
 func TestWorkerManager_RegisterWorker(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -217,7 +217,7 @@ func TestWorkerManager_RegisterWorker(t *testing.T) {
 func TestWorkerManager_RegisterWorkerNotStarted(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 
 	// Try to register without starting
 	workerInfo := &typesStore.WorkerInfo{
@@ -246,7 +246,7 @@ func TestWorkerManager_AllocateDeallocateWorker(t *testing.T) {
 	require.NoError(t, err)
 	k, _ := priv.Raw()
 	p2pcfg.PeerPrivKey = hex.EncodeToString(k)
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &engcfg, P2P: &p2pcfg}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &engcfg, P2P: &p2pcfg}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 	auth := p2p.NewPeerAuthenticator(
 		zap.L(),
 		&p2pcfg,
@@ -353,7 +353,7 @@ func TestWorkerManager_AllocateDeallocateWorker(t *testing.T) {
 func TestWorkerManager_AllocateNonExistentWorker(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -370,7 +370,7 @@ func TestWorkerManager_AllocateNonExistentWorker(t *testing.T) {
 func TestWorkerManager_GetWorkerIdByFilter(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -406,7 +406,7 @@ func TestWorkerManager_GetWorkerIdByFilter(t *testing.T) {
 func TestWorkerManager_GetFilterByWorkerId(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -467,7 +467,7 @@ func TestWorkerManager_LoadWorkersOnStart(t *testing.T) {
 	store.workersByFilter[string(worker2.Filter)] = worker2
 
 	// Create manager and start it
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{DataWorkerCount: 2}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{DataWorkerCount: 2}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 	ctx := context.Background()
 	err := manager.Start(ctx)
 	require.NoError(t, err)
@@ -494,7 +494,7 @@ func TestWorkerManager_LoadWorkersOnStart(t *testing.T) {
 func TestWorkerManager_ConcurrentOperations(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	store := newMockWorkerStore()
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &config.EngineConfig{}}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 
 	// Start the manager
 	ctx := context.Background()
@@ -544,7 +544,7 @@ func TestWorkerManager_EmptyFilter(t *testing.T) {
 	require.NoError(t, err)
 	k, _ := priv.Raw()
 	p2pcfg.PeerPrivKey = hex.EncodeToString(k)
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &engcfg, P2P: &p2pcfg}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &engcfg, P2P: &p2pcfg}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 	auth := p2p.NewPeerAuthenticator(
 		zap.L(),
 		&p2pcfg,
@@ -671,7 +671,7 @@ func TestWorkerManager_FilterUpdate(t *testing.T) {
 	require.NoError(t, err)
 	k, _ := priv.Raw()
 	p2pcfg.PeerPrivKey = hex.EncodeToString(k)
-	manager := NewWorkerManager(store, logger, &config.Config{Engine: &engcfg, P2P: &p2pcfg}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
+	manager := NewWorkerManager(store, logger, &config.Config{Engine: &engcfg, P2P: &p2pcfg}, func(coreIds []uint, filters [][]byte, serviceClients map[uint]*grpc.ClientConn) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil }, func(filters [][]byte) error { return nil }, func(reject [][]byte, confirm [][]byte) error { return nil })
 	auth := p2p.NewPeerAuthenticator(
 		zap.L(),
 		&p2pcfg,
