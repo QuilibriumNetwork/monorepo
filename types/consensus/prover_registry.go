@@ -135,4 +135,7 @@ type ProverRegistry interface {
 	// PruneOrphanJoins performs pruning of vertexes in the prover trie for
 	// expired joins.
 	PruneOrphanJoins(frameNumber uint64) error
+
+	// CurrentFrame returns the last frame number processed by the registry.
+	CurrentFrame() uint64
 }

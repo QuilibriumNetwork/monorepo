@@ -217,7 +217,18 @@ func (r *RPCServer) GetNodeInfo(
 
 	var shardAllocations []*protobufs.ShardAllocationInfo
 	if proverInfo != nil {
+		currentFrame := r.proverRegistry.CurrentFrame()
 		for _, alloc := range proverInfo.Allocations {
+			// Omit expired joins and leaves, matching the proposer's logic
+			// in event_distributor.go (pendingFilterGraceFrames = 720).
+			if alloc.Status == consensus.ProverStatusJoining &&
+				currentFrame > alloc.JoinFrameNumber+720 {
+				continue
+			}
+			if alloc.Status == consensus.ProverStatusLeaving &&
+				currentFrame > alloc.LeaveFrameNumber+720 {
+				continue
+			}
 			shardAllocations = append(shardAllocations, &protobufs.ShardAllocationInfo{
 				Filter:                 alloc.ConfirmationFilter,
 				Status:                 uint32(alloc.Status),
