@@ -3,7 +3,6 @@ package votecollector
 import (
 	"errors"
 	"fmt"
-	"sync"
 
 	"go.uber.org/atomic"
 
@@ -32,13 +31,32 @@ type VerifyingVoteProcessorFactory[
 ) (consensus.VerifyingVoteProcessor[StateT, VoteT], error)
 
 // VoteCollector implements a state machine for transition between different
-// states of vote collector
+// states of vote collector.
+//
+// Byzantine nodes might mount the following attacks on the vote-processing logic:
+//  1. The leader might send a state proposal and equivocate by sending a different
+//     conflicting vote as an independent message.
+//  2. The leader might send a state proposal and (repeatedly) send the same vote
+//     again as an independent message.
+//  3. Any byzantine replica might send multiple individual vote messages.
+//
+// Detecting vote equivocation is a collaborative effort of votesCache and the
+// VoteProcessor:
+//   - The votesCache is the primary uniqueness filter. It caches the first vote
+//     from each signer and detects equivocation (same signer, different vote).
+//   - The VoteProcessor provides a secondary defense. If a vote somehow reaches
+//     the processor despite being a duplicate (e.g., race between proposal
+//     processing and standalone vote), it returns a DuplicatedSignerError which
+//     is handled gracefully.
+//
+// ATTENTION: ensureVoteUnique MUST be called for every vote — both standalone
+// votes (AddVote) and proposer votes embedded in proposals (ProcessState) — to
+// guarantee that all equivocation attempts are caught.
 type VoteCollector[
 	StateT models.Unique,
 	VoteT models.Unique,
 	PeerIDT models.Unique,
 ] struct {
-	sync.Mutex
 	tracer                   consensus.TraceLogger
 	filter                   []byte
 	workers                  consensus.Workers
@@ -141,15 +159,21 @@ func NewStateMachine[
 	return sm
 }
 
-// AddVote adds a vote to current vote collector
-// All expected errors are handled via callbacks to notifier.
-// Under normal execution only exceptions are propagated to caller.
-func (m *VoteCollector[StateT, VoteT, PeerIDT]) AddVote(vote *VoteT) error {
-	// Cache vote
+// ensureVoteUnique caches the vote in the votesCache (or rejects it).
+// Reports byzantine behavior when a leader or replica sends an equivocating vote.
+//
+// ATTENTION: To guarantee all equivocation attempts are caught, this function
+// must be called consistently before processing individual votes _and_ state proposals.
+//
+// Returns:
+//   - (true, nil) if vote is first from given signer
+//   - (false, nil) if an identical or equivocating vote was already cached
+//   - (false, error) if exception during processing
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) ensureVoteUnique(vote *VoteT) (bool, error) {
 	err := m.votesCache.AddVote(vote)
 	if err != nil {
 		if errors.Is(err, RepeatedVoteErr) {
-			return nil
+			return false, nil
 		}
 		doubleVoteErr, isDoubleVoteErr := models.AsDoubleVoteError[VoteT](err)
 		if isDoubleVoteErr {
@@ -157,36 +181,32 @@ func (m *VoteCollector[StateT, VoteT, PeerIDT]) AddVote(vote *VoteT) error {
 				doubleVoteErr.FirstVote,
 				doubleVoteErr.ConflictingVote,
 			)
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf(
+		return false, fmt.Errorf(
 			"internal error adding vote %x to cache for state %x: %w",
 			(*vote).Identity(),
 			(*vote).Source(),
 			err,
 		)
 	}
+	return true, nil
+}
+
+// AddVote adds a vote to current vote collector.
+// All expected errors are handled via callbacks to notifier.
+// Under normal execution only exceptions are propagated to caller.
+func (m *VoteCollector[StateT, VoteT, PeerIDT]) AddVote(vote *VoteT) error {
+	unique, err := m.ensureVoteUnique(vote)
+	if err != nil {
+		return err
+	}
+	if !unique {
+		return nil
+	}
 
 	err = m.processVote(vote)
 	if err != nil {
-		if errors.Is(err, VoteForIncompatibleStateError) {
-			// For honest nodes, there should be only a single proposal per rank and
-			// all votes should be for this proposal. However, byzantine nodes might
-			// deviate from this happy path:
-			// * A malicious leader might create multiple (individually valid)
-			//   conflicting proposals for the same rank. Honest replicas will send
-			//   correct votes for whatever proposal they see first. We only accept
-			//   the first valid state and reject any other conflicting states that
-			//   show up later.
-			// * Alternatively, malicious replicas might send votes with the expected
-			//   rank, but for states that don't exist.
-			// In either case, receiving votes for the same rank but for different
-			// state IDs is a symptom of malicious consensus participants. Hence, we
-			// log it here as a warning:
-			m.tracer.Error("received vote for incompatible state", err)
-
-			return nil
-		}
 		return fmt.Errorf(
 			"internal error processing vote %x for state %x: %w",
 			(*vote).Identity(),
@@ -198,7 +218,37 @@ func (m *VoteCollector[StateT, VoteT, PeerIDT]) AddVote(vote *VoteT) error {
 }
 
 // processVote uses compare-and-repeat pattern to process vote with underlying
-// vote processor
+// vote processor.
+//
+// Liveness argument: We need to ensure that every vote eventually gets processed
+// by the VerifyingVoteProcessor (if the VoteCollector has transitioned to that
+// state). The key insight is:
+//
+//  1. The VoteCollector's state only moves forward: CachingVotes → VerifyingVotes
+//     → Invalid. Once it leaves a state, it never returns.
+//
+//  2. When we load the processor and call Process(vote), the vote is processed by
+//     whatever processor was active at that instant. If the processor's status has
+//     changed by the time Process returns (checked via currentState != m.Status()),
+//     it means a state transition occurred concurrently. In that case, we retry
+//     with the new processor.
+//
+//  3. The retry loop terminates because:
+//     - There are at most 2 state transitions (Caching→Verifying→Invalid).
+//     - Each transition changes the status, so the CAS comparison
+//       `currentState != m.Status()` can only trigger a retry a bounded number
+//       of times.
+//     - The NoopProcessor (used for Caching and Invalid states) and the
+//       VerifyingVoteProcessor both return in bounded time.
+//
+//  4. Votes cached _before_ the Caching→Verifying transition are replayed by
+//     processCachedVotes. Votes arriving _during_ or _after_ the transition are
+//     handled by this retry loop, which will eventually see the
+//     VerifyingVoteProcessor.
+//
+// Therefore, no vote is lost: it is either processed by the VerifyingVoteProcessor
+// directly, replayed from cache, or dropped only after being identified as invalid,
+// duplicate, or for an incompatible state.
 func (m *VoteCollector[StateT, VoteT, PeerIDT]) processVote(vote *VoteT) error {
 	for {
 		processor := m.atomicLoadProcessor()
@@ -215,6 +265,23 @@ func (m *VoteCollector[StateT, VoteT, PeerIDT]) processVote(vote *VoteT) error {
 			// additionally to the vote in proposal.
 			if models.IsDuplicatedSignerError(err) {
 				m.tracer.Trace(fmt.Sprintf("duplicated signer %x", (*vote).Identity()))
+				return nil
+			}
+			if errors.Is(err, VoteForIncompatibleStateError) {
+				// For honest nodes, there should be only a single proposal per rank and
+				// all votes should be for this proposal. However, byzantine nodes might
+				// deviate from this happy path:
+				// * A malicious leader might create multiple (individually valid)
+				//   conflicting proposals for the same rank. Honest replicas will send
+				//   correct votes for whatever proposal they see first. We only accept
+				//   the first valid state and reject any other conflicting states that
+				//   show up later.
+				// * Alternatively, malicious replicas might send votes with the expected
+				//   rank, but for states that don't exist.
+				// In either case, receiving votes for the same rank but for different
+				// state IDs is a symptom of malicious consensus participants. Hence, we
+				// log it here as a warning:
+				m.tracer.Error("received vote for incompatible state", err)
 				return nil
 			}
 			return err
@@ -256,6 +323,17 @@ func (m *VoteCollector[StateT, VoteT, PeerIDT]) Rank() uint64 {
 func (m *VoteCollector[StateT, VoteT, PeerIDT]) ProcessState(
 	proposal *models.SignedProposal[StateT, VoteT],
 ) error {
+	proposerVote, err := proposal.ProposerVote()
+	if err != nil {
+		return models.NewInvalidProposalErrorf(proposal, "invalid proposer vote")
+	}
+	// Cache proposer's vote to detect equivocation. We proceed regardless of
+	// whether the vote is unique, a duplicate, or equivocating — the VoteProcessor
+	// is robust against all byzantine edge cases.
+	_, err = m.ensureVoteUnique(proposerVote)
+	if err != nil {
+		return err
+	}
 
 	if proposal.State.Rank != m.Rank() {
 		return fmt.Errorf(
@@ -367,31 +445,42 @@ func (m *VoteCollector[StateT, VoteT, PeerIDT]) caching2Verifying(
 	}
 	newProcWrapper := &atomicValueWrapper[VoteT]{processor: newProc}
 
-	m.Lock()
-	defer m.Unlock()
-	proc := m.atomicLoadProcessor()
-	if proc.Status() != consensus.VoteCollectorStatusCaching {
+	currentProcWrapper := m.votesProcessor.Load().(*atomicValueWrapper[VoteT])
+	currentState := currentProcWrapper.processor.Status()
+	if currentState != consensus.VoteCollectorStatusCaching {
 		return fmt.Errorf(
 			"processors's current state is %s: %w",
-			proc.Status().String(),
+			currentState.String(),
 			ErrDifferentCollectorState,
 		)
 	}
-	m.votesProcessor.Store(newProcWrapper)
+	if !m.votesProcessor.CompareAndSwap(currentProcWrapper, newProcWrapper) {
+		return fmt.Errorf(
+			"CAS failed, processors's current state is %s: %w",
+			m.Status(),
+			ErrDifferentCollectorState,
+		)
+	}
 	return nil
 }
 
 func (m *VoteCollector[StateT, VoteT, PeerIDT]) terminateVoteProcessing() {
-	if m.Status() == consensus.VoteCollectorStatusInvalid {
+	currentProcWrapper := m.votesProcessor.Load().(*atomicValueWrapper[VoteT])
+	if currentProcWrapper.processor.Status() == consensus.VoteCollectorStatusInvalid {
 		return
 	}
 	newProcWrapper := &atomicValueWrapper[VoteT]{
 		processor: NewNoopCollector[VoteT](consensus.VoteCollectorStatusInvalid),
 	}
-
-	m.Lock()
-	defer m.Unlock()
-	m.votesProcessor.Store(newProcWrapper)
+	for {
+		if m.votesProcessor.CompareAndSwap(currentProcWrapper, newProcWrapper) {
+			return
+		}
+		currentProcWrapper = m.votesProcessor.Load().(*atomicValueWrapper[VoteT])
+		if currentProcWrapper.processor.Status() == consensus.VoteCollectorStatusInvalid {
+			return
+		}
+	}
 }
 
 // processCachedVotes feeds all cached votes into the VoteProcessor

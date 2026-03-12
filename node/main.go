@@ -687,6 +687,7 @@ func main() {
 			masterNode.GetWorkerManager(),
 			masterNode.GetProverRegistry(),
 			masterNode.GetExecutionEngineManager(),
+			masterNode.GetGlobalConsensusEngine(),
 		)
 		if err != nil {
 			logger.Panic("failed to new rpc server", zap.Error(err))

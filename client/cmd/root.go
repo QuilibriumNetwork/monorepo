@@ -1,37 +1,69 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
-	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/cloudflare/circl/sign/ed448"
-	"github.com/multiformats/go-multiaddr"
-	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/sha3"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-	"source.quilibrium.com/quilibrium/monorepo/node/config"
+
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/alias"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/compute"
+	clientConfig "source.quilibrium.com/quilibrium/monorepo/client/cmd/config"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/deploy"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/key"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/message"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
+	"source.quilibrium.com/quilibrium/monorepo/client/cmd/token"
+	"source.quilibrium.com/quilibrium/monorepo/client/utils"
+	"source.quilibrium.com/quilibrium/monorepo/config"
 )
 
-var configDirectory string
-var signatureCheck bool = true
-var NodeConfig *config.Config
-var simulateFail bool
-var LightNode bool = false
-var DryRun bool = false
-var publicRPC bool = false
+var (
+	signatureCheck       bool = true
+	byPassSignatureCheck bool = false
+	simulateFail         bool
+	DryRun               bool = false
+	ClientConfig         *utils.ClientConfig
+	networkFlag          string
+)
+
+var StandardizedQClientFileName string = "qclient-" + config.GetVersionString() + "-" + osType + "-" + arch
 
 var rootCmd = &cobra.Command{
 	Use:   "qclient",
-	Short: "Quilibrium RPC Client",
+	Short: "Quilibrium client",
+	Long: `Quilibrium client is a command-line tool for managing Quilibrium nodes.
+It provides commands for installing, updating, and managing Quilibrium nodes.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+
+		if cmd.Name() == "help" || cmd.Name() == "download-signatures" {
+			return
+		}
+
+		if !utils.FileExists(utils.GetConfigPath()) {
+			fmt.Println("A QClient config was not found, creating a default config")
+			utils.CreateDefaultConfig()
+		}
+
+		clientConfig, err := utils.LoadClientConfig()
+		if err != nil {
+			fmt.Printf("Error loading client config: %v\n", err)
+			os.Exit(1)
+		}
+
+		if !clientConfig.SignatureCheck || byPassSignatureCheck {
+			signatureCheck = false
+		}
+
 		if signatureCheck {
 			ex, err := os.Executable()
 			if err != nil {
@@ -48,112 +80,122 @@ var rootCmd = &cobra.Command{
 			}
 
 			checksum := sha3.Sum256(b)
-			digest, err := os.ReadFile(ex + ".dgst")
+
+			// First check var data path for signatures
+			varDataPath := filepath.Join(utils.ClientDataPath, config.GetVersionString())
+			digestPath := filepath.Join(varDataPath, StandardizedQClientFileName+".dgst")
+
+			fmt.Printf("Checking signature for %s\n", digestPath)
+
+			// Try to read digest from var data path first
+			digest, err := os.ReadFile(digestPath)
 			if err != nil {
-				fmt.Println("Digest file not found")
-				os.Exit(1)
-			}
-
-			parts := strings.Split(string(digest), " ")
-			if len(parts) != 2 {
-				fmt.Println("Invalid digest file format")
-				os.Exit(1)
-			}
-
-			digestBytes, err := hex.DecodeString(parts[1][:64])
-			if err != nil {
-				fmt.Println("Invalid digest file format")
-				os.Exit(1)
-			}
-
-			if !bytes.Equal(checksum[:], digestBytes) {
-				fmt.Println("Invalid digest for node")
-				os.Exit(1)
-			}
-
-			count := 0
-
-			for i := 1; i <= len(config.Signatories); i++ {
-				signatureFile := fmt.Sprintf(ex+".dgst.sig.%d", i)
-				sig, err := os.ReadFile(signatureFile)
+				// Fall back to checking next to executable
+				digest, err = os.ReadFile(ex + ".dgst")
 				if err != nil {
-					continue
-				}
+					fmt.Println("")
+					fmt.Println("The digest file was not found. Do you want to continue without signature verification? (y/n)")
 
-				pubkey, _ := hex.DecodeString(config.Signatories[i-1])
-				if !ed448.Verify(pubkey, digest, sig, "") {
-					fmt.Printf("Failed signature check for signatory #%d\n", i)
+					reader := bufio.NewReader(os.Stdin)
+					response, _ := reader.ReadString('\n')
+					response = strings.ToLower(strings.TrimSpace(response))
+
+					if response != "y" && response != "yes" {
+						fmt.Println("Exiting due to missing digest file")
+						fmt.Println("The signature files (if they exist) can be downloaded with the 'qclient download-signatures' command")
+						fmt.Println("You can also skip this prompt manually by using the --signature-check=false flag or to permanently disable signature checks running 'qclient config signature-check false'")
+
+						os.Exit(1)
+					}
+					// Check if the user is trying to run the config command to disable/enable signature checks
+					if len(os.Args) >= 3 && os.Args[1] == "config" && os.Args[2] != "signature-check" {
+						fmt.Println("The signature files (if they exist) can be downloaded with the 'qclient download-signatures' command")
+						fmt.Println("You can also skip this prompt manually by using the --signature-check=false flag or to permanently disable signature checks running 'qclient config signature-check false'")
+					}
+
+					fmt.Println("Continuing without signature verification")
+
+					signatureCheck = false
+				}
+			}
+
+			if signatureCheck {
+				parts := strings.Split(string(digest), " ")
+				if len(parts) != 2 {
+					fmt.Println("Invalid digest file format")
 					os.Exit(1)
 				}
-				count++
-			}
 
-			if count < ((len(config.Signatories)-4)/2)+((len(config.Signatories)-4)%2) {
-				fmt.Printf("Quorum on signatures not met")
-				os.Exit(1)
-			}
+				digestBytes, err := hex.DecodeString(parts[1][:64])
+				if err != nil {
+					fmt.Println("Invalid digest file format")
+					os.Exit(1)
+				}
 
-			fmt.Println("Signature check passed")
+				if !bytes.Equal(checksum[:], digestBytes) {
+					fmt.Println("Invalid digest for node")
+					os.Exit(1)
+				}
+
+				count := 0
+
+				for i := 1; i <= len(config.Signatories); i++ {
+					// Try var data path first for signature files
+					signatureFile := filepath.Join(varDataPath, fmt.Sprintf("%s.dgst.sig.%d", filepath.Base(ex), i))
+					sig, err := os.ReadFile(signatureFile)
+					if err != nil {
+						// Fall back to checking next to executable
+						signatureFile = fmt.Sprintf(ex+".dgst.sig.%d", i)
+						sig, err = os.ReadFile(signatureFile)
+						if err != nil {
+							continue
+						}
+					}
+
+					pubkey, _ := hex.DecodeString(config.Signatories[i-1])
+					if !ed448.Verify(pubkey, digest, sig, "") {
+						fmt.Printf("Failed signature check for signatory #%d\n", i)
+						os.Exit(1)
+					}
+					count++
+				}
+
+				if count < ((len(config.Signatories)-4)/2)+((len(config.Signatories)-4)%2) {
+					fmt.Printf("Quorum on signatures not met")
+					os.Exit(1)
+				}
+
+				fmt.Println("Signature check passed")
+			}
 		} else {
 			fmt.Println("Signature check bypassed, be sure you know what you're doing")
+			fmt.Println("----------------------------------------------------------")
+			fmt.Println("")
 		}
-
-		_, err := os.Stat(configDirectory)
-		if os.IsNotExist(err) {
-			fmt.Printf("config directory doesn't exist: %s\n", configDirectory)
-			os.Exit(1)
-		}
-
-		NodeConfig, err = config.LoadConfig(configDirectory, "", false)
-		if err != nil {
-			fmt.Printf("invalid config directory: %s\n", configDirectory)
-			os.Exit(1)
-		}
-
-		if publicRPC {
-			fmt.Println("Public RPC enabled, using light node")
-			LightNode = true
-		}
-		if !LightNode && NodeConfig.ListenGRPCMultiaddr == "" {
-			fmt.Println("No ListenGRPCMultiaddr found in config, using light node")
-			LightNode = true
-		}
+	},
+	PersistentPostRun: func(cmd *cobra.Command, args []string) {
+		fmt.Println("")
 	},
 }
 
 func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func GetGRPCClient() (*grpc.ClientConn, error) {
-	addr := "rpc.quilibrium.com:8337"
-	credentials := credentials.NewTLS(&tls.Config{InsecureSkipVerify: false})
-	if !LightNode {
-		ma, err := multiaddr.NewMultiaddr(NodeConfig.ListenGRPCMultiaddr)
-		if err != nil {
-			panic(err)
-		}
-
-		_, addr, err = mn.DialArgs(ma)
-		if err != nil {
-			panic(err)
-		}
-		credentials = insecure.NewCredentials()
+func networkDefault() string {
+	if v, ok := os.LookupEnv("QUILIBRIUM_NETWORK"); ok {
+		return v
 	}
+	return ""
+}
 
-	return grpc.Dial(
-		addr,
-		grpc.WithTransportCredentials(
-			credentials,
-		),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallSendMsgSize(600*1024*1024),
-			grpc.MaxCallRecvMsgSize(600*1024*1024),
-		),
-	)
+func initNetwork() {
+	if networkFlag != "" {
+		utils.NetworkConfigOverride = networkFlag
+	}
 }
 
 func signatureCheckDefault() bool {
@@ -171,28 +213,42 @@ func signatureCheckDefault() bool {
 }
 
 func init() {
+	cobra.OnInitialize(initNetwork)
+
 	rootCmd.PersistentFlags().StringVar(
-		&configDirectory,
-		"config",
-		".config/",
-		"config directory (default is .config/)",
+		&networkFlag, "network", networkDefault(),
+		"Network config to use (e.g. mainnet, testnet, devnet) — "+
+			"loads from ~/.quilibrium/configs/{name}/",
 	)
-	rootCmd.PersistentFlags().BoolVar(
-		&DryRun,
-		"dry-run",
-		false,
-		"runs the command (if applicable) without actually mutating state (printing effect output)",
-	)
+
 	rootCmd.PersistentFlags().BoolVar(
 		&signatureCheck,
 		"signature-check",
 		signatureCheckDefault(),
 		"bypass signature check (not recommended for binaries) (default true or value of QUILIBRIUM_SIGNATURE_CHECK env var)",
 	)
-	rootCmd.PersistentFlags().BoolVar(
-		&publicRPC,
-		"public-rpc",
+
+	rootCmd.PersistentFlags().BoolVarP(
+		&byPassSignatureCheck,
+		"yes",
+		"y",
 		false,
-		"uses the public RPC",
+		"auto-approve and bypass signature check (sets signature-check=false)",
 	)
+
+	// Add immediate sub commands
+	// following structure here: https://github.com/spf13/cobra/blob/main/site/content/user_guide.md#organizing-subcommands
+	rootCmd.AddCommand(node.NodeCmd)
+	rootCmd.AddCommand(clientConfig.ConfigCmd)
+	rootCmd.AddCommand(token.TokenCmd)
+	rootCmd.AddCommand(hypergraph.HypergraphCmd)
+	rootCmd.AddCommand(compute.ComputeCmd)
+	rootCmd.AddCommand(deploy.DeployCmd)
+	rootCmd.AddCommand(key.KeyCmd)
+	rootCmd.AddCommand(message.MessageCmd)
+	rootCmd.AddCommand(alias.AliasCmd)
+	rootCmd.AddCommand(CrossMintCmd)
+	rootCmd.AddCommand(DownloadSignaturesCmd)
+	rootCmd.AddCommand(LinkCmd)
+	rootCmd.AddCommand(VersionCmd)
 }

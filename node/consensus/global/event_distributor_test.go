@@ -83,6 +83,10 @@ func (m *mockWorkerManager) RangeWorkers() ([]*store.WorkerInfo, error) {
 	return result, nil
 }
 
+func (m *mockWorkerManager) RequestJoin(ctx context.Context, filters [][]byte, delegate []byte) error {
+	return nil
+}
+
 var _ worker.WorkerManager = (*mockWorkerManager)(nil)
 
 func TestReconcileWorkerAllocations_RejectedAllocationClearsFilter(t *testing.T) {

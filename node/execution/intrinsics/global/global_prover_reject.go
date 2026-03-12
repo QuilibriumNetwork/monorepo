@@ -493,8 +493,7 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 				}
 			}
 		} else if status == 3 {
-			// Rejecting leave
-			// Get leave frame number
+			// Rejecting leave – allowed immediately, expires at 720 frames
 			leaveFrameBytes, err := p.rdfMultiprover.Get(
 				GLOBAL_RDF_SCHEMA,
 				"allocation:ProverAllocation",
@@ -507,12 +506,6 @@ func (p *ProverReject) Verify(frameNumber uint64) (bool, error) {
 			leaveFrame := binary.BigEndian.Uint64(leaveFrameBytes)
 
 			framesSinceLeave := frameNumber - leaveFrame
-			if framesSinceLeave < 360 {
-				return false, errors.Wrap(
-					errors.New("must wait 360 frames after leave to reject"),
-					"verify: invalid prover reject",
-				)
-			}
 			if framesSinceLeave > 720 {
 				return false, errors.Wrap(
 					errors.New("leave already implicitly confirmed after 720 frames"),

@@ -226,6 +226,77 @@ message GetTokensByAccountResponse {
   repeated MaterializedPendingTransaction pending_transactions = 3;
 }
 
+message GetVertexDataRequest {
+  bytes address = 1;  // 64-byte vertex ID (32-byte app address + 32-byte data address)
+  bool full_data = 2; // When true, return serialized tree in raw_data
+}
+
+message VertexDataEntry {
+  bytes key = 1;    // leaf key (e.g. [0], [4], [8], ...)
+  bytes value = 2;  // leaf value
+}
+
+message GetVertexDataResponse {
+  repeated VertexDataEntry entries = 1;
+  string set_type = 2;    // "vertex"
+  string phase_type = 3;  // "adds"
+  bytes shard_l1 = 4;     // ShardKey.L1 (3 bytes)
+  bytes shard_l2 = 5;     // ShardKey.L2 (32 bytes)
+  bytes raw_data = 6;     // Serialized VectorCommitmentTree when full_data requested
+}
+
+message GetHyperedgeDataRequest {
+  bytes address = 1;  // 64-byte hyperedge ID (32-byte app address + 32-byte data address)
+}
+
+message GetHyperedgeDataResponse {
+  repeated VertexDataEntry entries = 1;
+  string set_type = 2;    // "hyperedge"
+  string phase_type = 3;  // "adds"
+  bytes shard_l1 = 4;     // ShardKey.L1 (3 bytes)
+  bytes shard_l2 = 5;     // ShardKey.L2 (32 bytes)
+}
+
+message CreateTraversalProofRequest {
+  bytes domain = 1;       // 32-byte domain
+  string atom_type = 2;   // "vertex" or "hyperedge"
+  string phase_type = 3;  // "adds" or "removes"
+  repeated bytes keys = 4; // list of keys to prove
+}
+
+message CreateTraversalProofResponse {
+  bytes proof = 1;  // serialized TraversalProof (via ToBytes())
+}
+
+message ShardRewardInfo {
+  bytes filter = 1;
+  uint32 active_provers = 2;
+  uint32 ring = 3;
+  bytes shard_size = 4;
+  bytes estimated_reward = 5;
+  bool is_allocated = 6;
+}
+
+message GetShardInfoRequest {
+  bool include_all = 1;
+}
+
+message GetShardInfoResponse {
+  repeated ShardRewardInfo shards = 1;
+  uint64 difficulty = 2;
+  bytes pomw_basis = 3;
+  bytes world_state_bytes = 4;
+  uint64 frame_number = 5;
+}
+
+message RequestJoinRequest {
+  repeated bytes filters = 1;
+  bytes delegate = 2;
+}
+
+message RequestJoinResponse {
+}
+
 service NodeService {
   rpc GetPeerInfo(GetPeerInfoRequest) returns (PeerInfoResponse);
   rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
@@ -234,6 +305,12 @@ service NodeService {
   rpc GetTokensByAccount(GetTokensByAccountRequest)
     returns (GetTokensByAccountResponse);
   rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+  rpc GetVertexData(GetVertexDataRequest) returns (GetVertexDataResponse);
+  rpc GetHyperedgeData(GetHyperedgeDataRequest) returns (GetHyperedgeDataResponse);
+  rpc CreateTraversalProof(CreateTraversalProofRequest)
+    returns (CreateTraversalProofResponse);
+  rpc GetShardInfo(GetShardInfoRequest) returns (GetShardInfoResponse);
+  rpc RequestJoin(RequestJoinRequest) returns (RequestJoinResponse);
 }
 
 message ConnectivityTestRequest {

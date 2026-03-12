@@ -19,12 +19,17 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	NodeService_GetPeerInfo_FullMethodName        = "/quilibrium.node.node.pb.NodeService/GetPeerInfo"
-	NodeService_GetNodeInfo_FullMethodName        = "/quilibrium.node.node.pb.NodeService/GetNodeInfo"
-	NodeService_GetWorkerInfo_FullMethodName      = "/quilibrium.node.node.pb.NodeService/GetWorkerInfo"
-	NodeService_Send_FullMethodName               = "/quilibrium.node.node.pb.NodeService/Send"
-	NodeService_GetTokensByAccount_FullMethodName = "/quilibrium.node.node.pb.NodeService/GetTokensByAccount"
-	NodeService_GetMetrics_FullMethodName         = "/quilibrium.node.node.pb.NodeService/GetMetrics"
+	NodeService_GetPeerInfo_FullMethodName          = "/quilibrium.node.node.pb.NodeService/GetPeerInfo"
+	NodeService_GetNodeInfo_FullMethodName          = "/quilibrium.node.node.pb.NodeService/GetNodeInfo"
+	NodeService_GetWorkerInfo_FullMethodName        = "/quilibrium.node.node.pb.NodeService/GetWorkerInfo"
+	NodeService_Send_FullMethodName                 = "/quilibrium.node.node.pb.NodeService/Send"
+	NodeService_GetTokensByAccount_FullMethodName   = "/quilibrium.node.node.pb.NodeService/GetTokensByAccount"
+	NodeService_GetMetrics_FullMethodName           = "/quilibrium.node.node.pb.NodeService/GetMetrics"
+	NodeService_GetVertexData_FullMethodName        = "/quilibrium.node.node.pb.NodeService/GetVertexData"
+	NodeService_GetHyperedgeData_FullMethodName     = "/quilibrium.node.node.pb.NodeService/GetHyperedgeData"
+	NodeService_CreateTraversalProof_FullMethodName = "/quilibrium.node.node.pb.NodeService/CreateTraversalProof"
+	NodeService_GetShardInfo_FullMethodName         = "/quilibrium.node.node.pb.NodeService/GetShardInfo"
+	NodeService_RequestJoin_FullMethodName          = "/quilibrium.node.node.pb.NodeService/RequestJoin"
 )
 
 // NodeServiceClient is the client API for NodeService service.
@@ -37,6 +42,11 @@ type NodeServiceClient interface {
 	Send(ctx context.Context, in *SendRequest, opts ...grpc.CallOption) (*SendResponse, error)
 	GetTokensByAccount(ctx context.Context, in *GetTokensByAccountRequest, opts ...grpc.CallOption) (*GetTokensByAccountResponse, error)
 	GetMetrics(ctx context.Context, in *GetMetricsRequest, opts ...grpc.CallOption) (*GetMetricsResponse, error)
+	GetVertexData(ctx context.Context, in *GetVertexDataRequest, opts ...grpc.CallOption) (*GetVertexDataResponse, error)
+	GetHyperedgeData(ctx context.Context, in *GetHyperedgeDataRequest, opts ...grpc.CallOption) (*GetHyperedgeDataResponse, error)
+	CreateTraversalProof(ctx context.Context, in *CreateTraversalProofRequest, opts ...grpc.CallOption) (*CreateTraversalProofResponse, error)
+	GetShardInfo(ctx context.Context, in *GetShardInfoRequest, opts ...grpc.CallOption) (*GetShardInfoResponse, error)
+	RequestJoin(ctx context.Context, in *RequestJoinRequest, opts ...grpc.CallOption) (*RequestJoinResponse, error)
 }
 
 type nodeServiceClient struct {
@@ -101,6 +111,51 @@ func (c *nodeServiceClient) GetMetrics(ctx context.Context, in *GetMetricsReques
 	return out, nil
 }
 
+func (c *nodeServiceClient) GetVertexData(ctx context.Context, in *GetVertexDataRequest, opts ...grpc.CallOption) (*GetVertexDataResponse, error) {
+	out := new(GetVertexDataResponse)
+	err := c.cc.Invoke(ctx, NodeService_GetVertexData_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeServiceClient) GetHyperedgeData(ctx context.Context, in *GetHyperedgeDataRequest, opts ...grpc.CallOption) (*GetHyperedgeDataResponse, error) {
+	out := new(GetHyperedgeDataResponse)
+	err := c.cc.Invoke(ctx, NodeService_GetHyperedgeData_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeServiceClient) CreateTraversalProof(ctx context.Context, in *CreateTraversalProofRequest, opts ...grpc.CallOption) (*CreateTraversalProofResponse, error) {
+	out := new(CreateTraversalProofResponse)
+	err := c.cc.Invoke(ctx, NodeService_CreateTraversalProof_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeServiceClient) GetShardInfo(ctx context.Context, in *GetShardInfoRequest, opts ...grpc.CallOption) (*GetShardInfoResponse, error) {
+	out := new(GetShardInfoResponse)
+	err := c.cc.Invoke(ctx, NodeService_GetShardInfo_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeServiceClient) RequestJoin(ctx context.Context, in *RequestJoinRequest, opts ...grpc.CallOption) (*RequestJoinResponse, error) {
+	out := new(RequestJoinResponse)
+	err := c.cc.Invoke(ctx, NodeService_RequestJoin_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeServiceServer is the server API for NodeService service.
 // All implementations must embed UnimplementedNodeServiceServer
 // for forward compatibility
@@ -111,6 +166,11 @@ type NodeServiceServer interface {
 	Send(context.Context, *SendRequest) (*SendResponse, error)
 	GetTokensByAccount(context.Context, *GetTokensByAccountRequest) (*GetTokensByAccountResponse, error)
 	GetMetrics(context.Context, *GetMetricsRequest) (*GetMetricsResponse, error)
+	GetVertexData(context.Context, *GetVertexDataRequest) (*GetVertexDataResponse, error)
+	GetHyperedgeData(context.Context, *GetHyperedgeDataRequest) (*GetHyperedgeDataResponse, error)
+	CreateTraversalProof(context.Context, *CreateTraversalProofRequest) (*CreateTraversalProofResponse, error)
+	GetShardInfo(context.Context, *GetShardInfoRequest) (*GetShardInfoResponse, error)
+	RequestJoin(context.Context, *RequestJoinRequest) (*RequestJoinResponse, error)
 	mustEmbedUnimplementedNodeServiceServer()
 }
 
@@ -135,6 +195,21 @@ func (UnimplementedNodeServiceServer) GetTokensByAccount(context.Context, *GetTo
 }
 func (UnimplementedNodeServiceServer) GetMetrics(context.Context, *GetMetricsRequest) (*GetMetricsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetMetrics not implemented")
+}
+func (UnimplementedNodeServiceServer) GetVertexData(context.Context, *GetVertexDataRequest) (*GetVertexDataResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetVertexData not implemented")
+}
+func (UnimplementedNodeServiceServer) GetHyperedgeData(context.Context, *GetHyperedgeDataRequest) (*GetHyperedgeDataResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetHyperedgeData not implemented")
+}
+func (UnimplementedNodeServiceServer) CreateTraversalProof(context.Context, *CreateTraversalProofRequest) (*CreateTraversalProofResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateTraversalProof not implemented")
+}
+func (UnimplementedNodeServiceServer) GetShardInfo(context.Context, *GetShardInfoRequest) (*GetShardInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetShardInfo not implemented")
+}
+func (UnimplementedNodeServiceServer) RequestJoin(context.Context, *RequestJoinRequest) (*RequestJoinResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RequestJoin not implemented")
 }
 func (UnimplementedNodeServiceServer) mustEmbedUnimplementedNodeServiceServer() {}
 
@@ -257,6 +332,96 @@ func _NodeService_GetMetrics_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeService_GetVertexData_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetVertexDataRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).GetVertexData(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_GetVertexData_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).GetVertexData(ctx, req.(*GetVertexDataRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeService_GetHyperedgeData_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetHyperedgeDataRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).GetHyperedgeData(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_GetHyperedgeData_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).GetHyperedgeData(ctx, req.(*GetHyperedgeDataRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeService_CreateTraversalProof_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateTraversalProofRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).CreateTraversalProof(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_CreateTraversalProof_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).CreateTraversalProof(ctx, req.(*CreateTraversalProofRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeService_GetShardInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetShardInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).GetShardInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_GetShardInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).GetShardInfo(ctx, req.(*GetShardInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeService_RequestJoin_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RequestJoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).RequestJoin(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_RequestJoin_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).RequestJoin(ctx, req.(*RequestJoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NodeService_ServiceDesc is the grpc.ServiceDesc for NodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -287,6 +452,26 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetMetrics",
 			Handler:    _NodeService_GetMetrics_Handler,
+		},
+		{
+			MethodName: "GetVertexData",
+			Handler:    _NodeService_GetVertexData_Handler,
+		},
+		{
+			MethodName: "GetHyperedgeData",
+			Handler:    _NodeService_GetHyperedgeData_Handler,
+		},
+		{
+			MethodName: "CreateTraversalProof",
+			Handler:    _NodeService_CreateTraversalProof_Handler,
+		},
+		{
+			MethodName: "GetShardInfo",
+			Handler:    _NodeService_GetShardInfo_Handler,
+		},
+		{
+			MethodName: "RequestJoin",
+			Handler:    _NodeService_RequestJoin_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

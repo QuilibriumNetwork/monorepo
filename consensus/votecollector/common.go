@@ -3,6 +3,7 @@ package votecollector
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
@@ -65,4 +66,31 @@ func EnsureVoteForState[StateT models.Unique, VoteT models.Unique](
 		)
 	}
 	return nil
+}
+
+/********************* AppendOnlyIdentifierSet *********************/
+
+// AppendOnlyIdentifierSet implements a simple set for tracking unique entries by
+// identifier. Removal is not supported — append-only guarantees. Concurrency safe.
+type AppendOnlyIdentifierSet struct {
+	set  map[models.Identity]struct{}
+	lock sync.Mutex
+}
+
+// NewConcurrentIdentifierSet creates a new AppendOnlyIdentifierSet.
+func NewConcurrentIdentifierSet() *AppendOnlyIdentifierSet {
+	return &AppendOnlyIdentifierSet{
+		set: make(map[models.Identity]struct{}),
+	}
+}
+
+// Add adds identifier to the internal set. Returns true when added, false if already present.
+func (s *AppendOnlyIdentifierSet) Add(identifier models.Identity) bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	_, exists := s.set[identifier]
+	if !exists {
+		s.set[identifier] = struct{}{}
+	}
+	return !exists
 }

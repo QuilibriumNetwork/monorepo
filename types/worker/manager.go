@@ -21,4 +21,5 @@ type WorkerManager interface {
 	DecideLeave(reject [][]byte, confirm [][]byte) error
 	RangeWorkers() ([]*store.WorkerInfo, error)
 	RespawnWorker(coreId uint, filter []byte) error
+	RequestJoin(ctx context.Context, filters [][]byte, delegate []byte) error
 }

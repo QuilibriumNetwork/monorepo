@@ -1162,6 +1162,43 @@ func (w *WorkerManager) spawnDataWorkers() {
 	}
 }
 
+// RequestJoin finds available worker cores and triggers the join flow via
+// ProposeAllocations. The delegate parameter is currently unused; the node's
+// configured DelegateAddress is used by ProposeWorkerJoin instead.
+func (w *WorkerManager) RequestJoin(
+	ctx context.Context,
+	filters [][]byte,
+	delegate []byte,
+) error {
+	if !w.isStarted() {
+		return errors.New("worker manager not started")
+	}
+
+	workers, err := w.store.RangeWorkers()
+	if err != nil {
+		return errors.Wrap(err, "request join")
+	}
+
+	var coreIds []uint
+	for _, worker := range workers {
+		if _, ipcErr := w.getIPCOfWorker(worker.CoreId); ipcErr == nil {
+			coreIds = append(coreIds, worker.CoreId)
+		}
+		if len(coreIds) >= len(filters) {
+			break
+		}
+	}
+
+	if len(coreIds) < len(filters) {
+		return fmt.Errorf(
+			"request join: not enough workers (%d) for %d filters",
+			len(coreIds), len(filters),
+		)
+	}
+
+	return w.proposeFunc(coreIds[:len(filters)], filters, w.copyServiceClients())
+}
+
 func (w *WorkerManager) stopDataWorkers() {
 	for i := 0; i < w.dataWorkerLen(); i++ {
 		cmd := w.getDataWorker(i)
@@ -1178,3 +1215,4 @@ func (w *WorkerManager) stopDataWorkers() {
 		}
 	}
 }
+
