@@ -1,14 +1,11 @@
 package utils
 
 import (
-	"bytes"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"strings"
 )
 
 var (
@@ -40,17 +37,12 @@ func GetCurrentSudoUser() (*user.User, error) {
 		return user.Current()
 	}
 
-	cmd := exec.Command("sh", "-c", "env | grep SUDO_USER | cut -d= -f2 | cut -d\\n -f1")
-	var out bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current sudo user: %v", err)
+	username := os.Getenv("SUDO_USER")
+	if username == "" {
+		username = "root"
 	}
 
-	userLookup, err := user.Lookup(strings.TrimSpace(out.String()))
+	userLookup, err := user.Lookup(username)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current sudo user: %v", err)
 	}

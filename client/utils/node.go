@@ -144,28 +144,8 @@ func LoadDefaultNodeConfig() (*config.Config, error) {
 }
 
 func LoadNodeConfig(configDirectory string) (*config.Config, error) {
-	// if the provided config directory is "default", load the default config
 	if configDirectory == "default" {
 		return LoadDefaultNodeConfig()
-	}
-
-	// if the provided config directory has both config.yml and keys.yml files,
-	// load it
-	if HasNodeConfigFiles(configDirectory) {
-		return config.LoadConfig(configDirectory, "", false)
-	}
-
-	// if not, check with the user's config home directory
-	configPath := filepath.Join(
-		GetNodeConfigHomeDir(),
-		configDirectory,
-		"config.yml",
-	)
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		// Otherwise, the config with this name or location does not exist, return
-		// an error and allow the caller of this function to handle it
-		return nil, errors.New(ErrConfigNotFoundErrorMessage)
-
 	}
 
 	return config.LoadConfig(configDirectory, "", false)

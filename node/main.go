@@ -688,6 +688,7 @@ func main() {
 			masterNode.GetProverRegistry(),
 			masterNode.GetExecutionEngineManager(),
 			masterNode.GetGlobalConsensusEngine(),
+			masterNode.GetCoinStore(),
 		)
 		if err != nil {
 			logger.Panic("failed to new rpc server", zap.Error(err))

@@ -17,18 +17,30 @@ var (
 	showChecksum   bool
 )
 
+func versionWithPatch(base string) string {
+	patch := config.GetPatchNumber()
+	if patch != 0x00 {
+		return fmt.Sprintf("%s-p%d", base, patch)
+	}
+	return base
+}
+
 // VersionInfo holds version and hash information
 type VersionInfo struct {
-	Version string
-	SHA256  string
-	MD5     string
+	Version          string
+	VersionWithPatch string
+	SHA256           string
+	MD5              string
 }
 
 // GetVersionInfo extracts version from executable and optionally calculates hashes
 func GetVersionInfo(calcChecksum bool) (VersionInfo, error) {
 	executable, err := os.Executable()
 	if err != nil {
-		return VersionInfo{Version: DefaultVersion}, fmt.Errorf("error getting executable path: %v", err)
+		return VersionInfo{
+			Version:          DefaultVersion,
+			VersionWithPatch: versionWithPatch(DefaultVersion),
+		}, fmt.Errorf("error getting executable path: %v", err)
 	}
 
 	// Extract version from executable name (e.g. qclient-2.0.3-linux-amd)
@@ -45,18 +57,23 @@ func GetVersionInfo(calcChecksum bool) (VersionInfo, error) {
 	if len(matches) <= 1 || calcChecksum {
 		sha256Hash, md5Hash, err := utils.CalculateFileHashes(executable)
 		if err != nil {
-			return VersionInfo{Version: version}, fmt.Errorf("error calculating file hashes: %v", err)
+			return VersionInfo{
+				Version:          version,
+				VersionWithPatch: versionWithPatch(version),
+			}, fmt.Errorf("error calculating file hashes: %v", err)
 		}
 
 		return VersionInfo{
-			Version: version,
-			SHA256:  sha256Hash,
-			MD5:     md5Hash,
+			Version:          version,
+			VersionWithPatch: versionWithPatch(version),
+			SHA256:           sha256Hash,
+			MD5:              md5Hash,
 		}, nil
 	}
 
 	return VersionInfo{
-		Version: version,
+		Version:          version,
+		VersionWithPatch: versionWithPatch(version),
 	}, nil
 }
 
@@ -73,7 +90,7 @@ var VersionCmd = &cobra.Command{
 			return
 		}
 
-		fmt.Printf("%s\n", info.Version)
+		fmt.Printf("%s\n", info.VersionWithPatch)
 
 		if showChecksum {
 			if info.SHA256 != "" && info.MD5 != "" {

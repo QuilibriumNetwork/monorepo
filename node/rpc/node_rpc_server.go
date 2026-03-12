@@ -66,6 +66,14 @@ func (r *RPCServer) GetTokensByAccount(
 	ctx context.Context,
 	req *protobufs.GetTokensByAccountRequest,
 ) (*protobufs.GetTokensByAccountResponse, error) {
+	if r.coinStore == nil {
+		return nil, errors.New(
+			"get tokens by account: token store not available – " +
+				"token shards may not yet be unlocked, or node synchronization " +
+				"may still be in progress",
+		)
+	}
+
 	// Handle legacy (pre-2.1) coins:
 	if (len(req.Domain) == 0 ||
 		bytes.Equal(req.Domain, token.QUIL_TOKEN_ADDRESS)) &&
@@ -632,6 +640,7 @@ func NewRPCServer(
 	proverRegistry consensus.ProverRegistry,
 	executionManager *manager.ExecutionEngineManager,
 	shardInfoProvider consensus.ShardInfoProvider,
+	coinStore store.TokenStore,
 ) (*RPCServer, error) {
 	mg, err := multiaddr.NewMultiaddr(config.ListenGRPCMultiaddr)
 	if err != nil {
@@ -672,6 +681,7 @@ func NewRPCServer(
 		proverRegistry:    proverRegistry,
 		executionManager:  executionManager,
 		shardInfoProvider: shardInfoProvider,
+		coinStore:         coinStore,
 		grpcServer: qgrpc.NewServer(
 			grpc.MaxRecvMsgSize(10*1024*1024),
 			grpc.MaxSendMsgSize(10*1024*1024),
