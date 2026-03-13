@@ -41,7 +41,13 @@ var CrossMintCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		nodeConfig, err := utils.LoadDefaultNodeConfig()
+		var nodeConfig *config.Config
+		var err error
+		if ConfigDirectory != "" && ConfigDirectory != "default" {
+			nodeConfig, err = utils.LoadNodeConfig(ConfigDirectory)
+		} else {
+			nodeConfig, err = utils.LoadDefaultNodeConfig()
+		}
 		if err != nil {
 			fmt.Printf("error loading node config: %s\n", err)
 			os.Exit(1)

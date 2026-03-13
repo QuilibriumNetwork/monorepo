@@ -49,7 +49,7 @@ var NodeCmd = &cobra.Command{
 		}
 		NodeUser = userLookup
 		ConfigDirs = filepath.Join(userLookup.HomeDir, ".quilibrium", "configs")
-		if ConfigDirectory != "" && ConfigDirectory != ".config" {
+		if ConfigDirectory != "" {
 			NodeConfig, err = utils.LoadNodeConfig(ConfigDirectory)
 		} else {
 			NodeConfig, err = utils.LoadDefaultNodeConfig()
@@ -76,7 +76,7 @@ var NodeCmd = &cobra.Command{
 }
 
 func init() {
-	NodeCmd.PersistentFlags().StringVar(&ConfigDirectory, "config", ".config", "config directory (default is .config/)")
+	NodeCmd.PersistentFlags().StringVar(&ConfigDirectory, "config", "", "config directory")
 	viper.BindPFlag("config", NodeCmd.PersistentFlags().Lookup("config"))
 
 	// Add subcommands

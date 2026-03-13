@@ -39,8 +39,6 @@ var TokenCmd = &cobra.Command{
 			NodeConfig, err = utils.LoadDefaultNodeConfig()
 		}
 
-		fmt.Println(utils.GetPeerIDFromConfig(NodeConfig).String())
-
 		if err != nil {
 			if err.Error() == utils.ErrConfigNotFoundErrorMessage {
 				fmt.Println("Config not found, creating default configuration...")
@@ -57,6 +55,8 @@ var TokenCmd = &cobra.Command{
 				os.Exit(1)
 			}
 		}
+
+		fmt.Println(utils.GetPeerIDFromConfig(NodeConfig).String())
 
 		logger, _ := zap.NewProduction()
 		KeyManager = keys.NewFileKeyManager(
