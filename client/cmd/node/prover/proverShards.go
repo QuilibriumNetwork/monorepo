@@ -61,7 +61,8 @@ estimated per-frame rewards based on ring position.
 			)
 		}
 
-		fmt.Printf("\nTotal estimated: ~%s QUIL/frame\n", formatQUIL(totalReward))
+		fmt.Printf("\nTotal estimated: ~%s QUIL/frame (~%s QUIL/day)\n",
+			formatQUIL(totalReward), formatQUILDaily(totalReward))
 		fmt.Printf("Difficulty: %d  Frame: %d\n",
 			resp.GetDifficulty(),
 			resp.GetFrameNumber(),
@@ -75,17 +76,25 @@ estimated per-frame rewards based on ring position.
 }
 
 // formatQUIL converts raw reward units (1 QUIL = 10^8 units) to a
-// human-readable decimal string.
+// human-readable decimal string with full precision.
 func formatQUIL(raw *big.Int) string {
 	if raw.Sign() == 0 {
-		return "0.0000"
+		return "0.00000000"
 	}
 
 	divisor := big.NewInt(100_000_000) // 10^8
 	whole := new(big.Int).Div(raw, divisor)
 	frac := new(big.Int).Mod(raw, divisor)
 
-	// Ensure the fractional part is zero-padded to 8 digits, then truncate to 4.
-	fracStr := fmt.Sprintf("%08d", frac.Int64())
-	return fmt.Sprintf("%s.%s", whole.String(), fracStr[:4])
+	return fmt.Sprintf("%s.%08d", whole.String(), frac.Int64())
+}
+
+// framesPerDay is the expected number of frames in 24 hours at the target
+// frame time of 10 seconds.
+const framesPerDay = 24 * 60 * 60 / 10 // 8640
+
+// formatQUILDaily converts a per-frame reward to an estimated 24hr total.
+func formatQUILDaily(perFrame *big.Int) string {
+	daily := new(big.Int).Mul(perFrame, big.NewInt(framesPerDay))
+	return formatQUIL(daily)
 }

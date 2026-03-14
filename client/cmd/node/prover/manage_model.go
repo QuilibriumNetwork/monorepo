@@ -952,7 +952,13 @@ func (m manageModel) renderView() string {
 	availHeight := panelBudget - allocHeight
 
 	// Allocations panel.
-	allocTitle := fmt.Sprintf(" Your Allocations (%d)", len(m.filteredAllocations()))
+	filteredAllocs := m.filteredAllocations()
+	totalPerFrame := big.NewInt(0)
+	for _, a := range filteredAllocs {
+		totalPerFrame.Add(totalPerFrame, a.estimatedReward)
+	}
+	allocTitle := fmt.Sprintf(" Your Allocations (%d) ~%s QUIL/day",
+		len(filteredAllocs), formatQUILDaily(totalPerFrame))
 	if n := len(m.allocSelected); n > 0 {
 		allocTitle += fmt.Sprintf(" [%d selected]", n)
 	}
@@ -1018,10 +1024,10 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	// Column header.
 	var hdr string
 	if hasSelections {
-		hdr = fmt.Sprintf("    %-20s %-16s %10s %7s %5s %16s",
+		hdr = fmt.Sprintf("    %-20s %-16s %10s %7s %5s %20s",
 			"Filter", "Status", "Size", "Provers", "Ring", "Reward")
 	} else {
-		hdr = fmt.Sprintf("  %-20s %-16s %10s %7s %5s %16s",
+		hdr = fmt.Sprintf("  %-20s %-16s %10s %7s %5s %20s",
 			"Filter", "Status", "Size", "Provers", "Ring", "Reward")
 	}
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
@@ -1046,7 +1052,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 			if m.allocSelected[a.filterKey] {
 				marker = "[x]"
 			}
-			line = fmt.Sprintf("%s %-20s %-16s %10s %7d %5d %16s",
+			line = fmt.Sprintf("%s %-20s %-16s %10s %7d %5d %20s",
 				marker,
 				a.filterHex,
 				a.statusName,
@@ -1056,7 +1062,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 				"~"+formatQUIL(a.estimatedReward)+" Q/f",
 			)
 		} else {
-			line = fmt.Sprintf("  %-20s %-16s %10s %7d %5d %16s",
+			line = fmt.Sprintf("  %-20s %-16s %10s %7d %5d %20s",
 				a.filterHex,
 				a.statusName,
 				formatStorage(a.shardSize.Uint64()),
@@ -1084,10 +1090,10 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 
 	var hdr string
 	if hasSelections {
-		hdr = fmt.Sprintf("    %-20s %7s %5s %10s %16s",
+		hdr = fmt.Sprintf("    %-20s %7s %5s %10s %20s",
 			"Filter", "Provers", "Ring", "Size", "Reward")
 	} else {
-		hdr = fmt.Sprintf("  %-20s %7s %5s %10s %16s",
+		hdr = fmt.Sprintf("  %-20s %7s %5s %10s %20s",
 			"Filter", "Provers", "Ring", "Size", "Reward")
 	}
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
@@ -1111,7 +1117,7 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 			if m.availSelected[s.filterKey] {
 				marker = "[x]"
 			}
-			line = fmt.Sprintf("%s %-20s %7d %5d %10s %16s",
+			line = fmt.Sprintf("%s %-20s %7d %5d %10s %20s",
 				marker,
 				s.filterHex,
 				s.activeProvers,
@@ -1120,7 +1126,7 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 				"~"+formatQUIL(s.estimatedReward)+" Q/f",
 			)
 		} else {
-			line = fmt.Sprintf("  %-20s %7d %5d %10s %16s",
+			line = fmt.Sprintf("  %-20s %7d %5d %10s %20s",
 				s.filterHex,
 				s.activeProvers,
 				s.ring,

@@ -98,6 +98,7 @@ type BlossomSub struct {
 	discovery              internal.PeerConnector
 	manualReachability     atomic.Pointer[bool]
 	p2pConfig              config.P2PConfig
+	bootstrapPeerIDs       map[peer.ID]struct{}
 	dht                    *dht.IpfsDHT
 	routingDiscovery       *routing.RoutingDiscovery
 	coreId                 uint
@@ -164,6 +165,7 @@ func NewBlossomSubWithHost(
 		signKey:                privKey,
 		peerScore:              make(map[string]*appScore),
 		p2pConfig:              *p2pConfig,
+		bootstrapPeerIDs:       make(map[peer.ID]struct{}),
 		coreId:                 coreId,
 	}
 
@@ -182,6 +184,9 @@ func NewBlossomSubWithHost(
 			panic(fmt.Sprintf("error for addr %v, %+v:", bh.Addrs()[0], err))
 		}
 		bootstrappers = append(bootstrappers, *ai)
+	}
+	for _, b := range bootstrappers {
+		bs.bootstrapPeerIDs[b.ID] = struct{}{}
 	}
 	kademliaDHT := initDHT(
 		ctx,
@@ -538,6 +543,11 @@ func NewBlossomSub(
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
+	bootstrapPeerIDs := make(map[peer.ID]struct{}, len(bootstrappers))
+	for _, b := range bootstrappers {
+		bootstrapPeerIDs[b.ID] = struct{}{}
+	}
+
 	bs := &BlossomSub{
 		ctx:                    ctx,
 		cancel:                 cancel,
@@ -548,6 +558,7 @@ func NewBlossomSub(
 		signKey:                privKey,
 		peerScore:              make(map[string]*appScore),
 		p2pConfig:              *p2pConfig,
+		bootstrapPeerIDs:       bootstrapPeerIDs,
 		derivedPeerID:          derivedPeerId,
 		coreId:                 coreId,
 		configDir:              configDir,
@@ -895,6 +906,9 @@ func resourceManager(highWatermark int, allowed []peer.AddrInfo) (
 }
 
 func (b *BlossomSub) background(ctx context.Context) {
+	// Run an immediate check so recovery doesn't wait for the first tick.
+	b.checkAndReconnectPeers(ctx)
+
 	refreshScores := time.NewTicker(DecayInterval)
 	defer refreshScores.Stop()
 
@@ -915,7 +929,12 @@ func (b *BlossomSub) background(ctx context.Context) {
 }
 
 func (b *BlossomSub) checkAndReconnectPeers(ctx context.Context) {
-	peerCount := len(b.h.Network().Peers())
+	peerCount := 0
+	for _, p := range b.h.Network().Peers() {
+		if _, isBootstrap := b.bootstrapPeerIDs[p]; !isBootstrap {
+			peerCount++
+		}
+	}
 	if peerCount >= b.p2pConfig.MinBootstrapPeers {
 		return
 	}
