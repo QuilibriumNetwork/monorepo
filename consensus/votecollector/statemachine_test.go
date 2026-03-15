@@ -75,8 +75,14 @@ func (s *StateMachineTestSuite) prepareMockedProcessor(proposal *models.SignedPr
 // when proposal processing can possibly change state of collector
 func (s *StateMachineTestSuite) TestStatus_StateTransitions() {
 	state := helper.MakeState(helper.WithStateRank[*helper.TestState](s.rank))
-	proposal := helper.MakeSignedProposal(helper.WithProposal[*helper.TestState, *helper.TestVote](helper.MakeProposal(helper.WithState(state))))
-	s.prepareMockedProcessor(proposal)
+	proposerVote := helper.VoteForStateFixture(state)
+	proposal := helper.MakeSignedProposal(
+		helper.WithProposal[*helper.TestState, *helper.TestVote](helper.MakeProposal(helper.WithState(state))),
+		helper.WithVote[*helper.TestState, *helper.TestVote](&proposerVote),
+	)
+	processor := s.prepareMockedProcessor(proposal)
+	processor.On("Process", mock.Anything).Return(nil).Maybe()
+	s.notifier.On("OnVoteProcessed", mock.Anything).Maybe()
 
 	// by default, we should create in caching status
 	require.Equal(s.T(), consensus.VoteCollectorStatusCaching, s.collector.Status())
@@ -114,6 +120,9 @@ func (s *StateMachineTestSuite) TestAddVote_VerifyingState() {
 	proposal := makeSignedProposalWithRank(s.rank)
 	state := proposal.State
 	processor := s.prepareMockedProcessor(proposal)
+	// The proposer vote embedded in the proposal will be cached and processed
+	s.notifier.On("OnVoteProcessed", proposal.Vote).Maybe()
+	processor.On("Process", proposal.Vote).Return(nil).Maybe()
 	err := s.collector.ProcessState(proposal)
 	require.NoError(s.T(), err)
 	s.T().Run("add-valid-vote", func(t *testing.T) {
@@ -210,6 +219,9 @@ func (s *StateMachineTestSuite) TestProcessState_ProcessingOfCachedVotes() {
 	proposal := makeSignedProposalWithRank(s.rank)
 	state := proposal.State
 	processor := s.prepareMockedProcessor(proposal)
+	// The proposer vote embedded in the proposal will be cached and processed
+	s.notifier.On("OnVoteProcessed", proposal.Vote).Maybe()
+	processor.On("Process", proposal.Vote).Return(nil).Maybe()
 	for i := 0; i < votes; i++ {
 		vote := helper.VoteForStateFixture(state)
 		// once when caching vote, and once when processing cached vote
@@ -234,8 +246,12 @@ func (s *StateMachineTestSuite) Test_VoteProcessorErrorPropagation() {
 	state := proposal.State
 	processor := s.prepareMockedProcessor(proposal)
 
+	proposerVote := helper.VoteForStateFixture(state)
+	processor.On("Process", &proposerVote).Return(nil).Maybe()
+	s.notifier.On("OnVoteProcessed", &proposerVote).Maybe()
 	err := s.collector.ProcessState(helper.MakeSignedProposal[*helper.TestState, *helper.TestVote](
-		helper.WithProposal[*helper.TestState, *helper.TestVote](helper.MakeProposal(helper.WithState[*helper.TestState](state)))))
+		helper.WithProposal[*helper.TestState, *helper.TestVote](helper.MakeProposal(helper.WithState[*helper.TestState](state))),
+		helper.WithVote[*helper.TestState, *helper.TestVote](&proposerVote)))
 	require.NoError(s.T(), err)
 
 	unexpectedError := errors.New("some unexpected error")
@@ -282,5 +298,10 @@ func (s *StateMachineTestSuite) RegisterVoteConsumer() {
 }
 
 func makeSignedProposalWithRank(rank uint64) *models.SignedProposal[*helper.TestState, *helper.TestVote] {
-	return helper.MakeSignedProposal[*helper.TestState, *helper.TestVote](helper.WithProposal[*helper.TestState, *helper.TestVote](helper.MakeProposal(helper.WithState(helper.MakeState(helper.WithStateRank[*helper.TestState](rank))))))
+	state := helper.MakeState(helper.WithStateRank[*helper.TestState](rank))
+	vote := helper.VoteForStateFixture(state)
+	return helper.MakeSignedProposal(
+		helper.WithProposal[*helper.TestState, *helper.TestVote](helper.MakeProposal(helper.WithState(state))),
+		helper.WithVote[*helper.TestState, *helper.TestVote](&vote),
+	)
 }

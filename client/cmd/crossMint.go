@@ -14,10 +14,19 @@ import (
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/bls48581"
+	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
+	"source.quilibrium.com/quilibrium/monorepo/client/utils"
+	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 )
 
-var crossMintCmd = &cobra.Command{
+var (
+	NodeConfig      *config.Config
+	ConfigDirectory string
+)
+
+var CrossMintCmd = &cobra.Command{
 	Use:   "cross-mint",
 	Short: "Signs a payload from the Quilibrium bridge to mint tokens on Ethereum L1 and prints the result to stdout",
 	Long: `Signs a payload from the Quilibrium bridge to mint tokens on Ethereum L1 and prints the result to stdout":
@@ -26,6 +35,26 @@ var crossMintCmd = &cobra.Command{
 	
 	Payload – the hex-encoded payload from the Quilibrium bridge with optional 0x-prefix, must be specified
 	`,
+	PreRun: func(cmd *cobra.Command, args []string) {
+		if len(args) < 1 {
+			fmt.Println("missing payload")
+			os.Exit(1)
+		}
+
+		var nodeConfig *config.Config
+		var err error
+		if ConfigDirectory != "" && ConfigDirectory != "default" {
+			nodeConfig, err = utils.LoadNodeConfig(ConfigDirectory)
+		} else {
+			nodeConfig, err = utils.LoadDefaultNodeConfig()
+		}
+		if err != nil {
+			fmt.Printf("error loading node config: %s\n", err)
+			os.Exit(1)
+		}
+
+		NodeConfig = nodeConfig
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) < 1 {
 			fmt.Println("missing payload")
@@ -59,7 +88,7 @@ var crossMintCmd = &cobra.Command{
 		// account if it was changed.
 		if !filepath.IsAbs(NodeConfig.Key.KeyStoreFile.Path) {
 			NodeConfig.Key.KeyStoreFile.Path = filepath.Join(
-				configDirectory,
+				ConfigDirectory,
 				filepath.Base(NodeConfig.Key.KeyStoreFile.Path),
 			)
 		}
@@ -69,7 +98,7 @@ var crossMintCmd = &cobra.Command{
 			panic(errors.Wrap(err, "cross mint"))
 		}
 
-		fileKeyManager := keys.NewFileKeyManager(NodeConfig.Key, logger)
+		fileKeyManager := keys.NewFileKeyManager(NodeConfig, &bls48581.Bls48581KeyConstructor{}, &bulletproofs.Decaf448KeyConstructor{}, logger)
 		provingKey, err := fileKeyManager.GetSigningKey(NodeConfig.Engine.ProvingKeyId)
 		if err != nil {
 			panic(errors.Wrap(err, "cross mint"))
@@ -78,7 +107,7 @@ var crossMintCmd = &cobra.Command{
 		result, err := CrossMint(&CrossMintArgs{
 			Payload:    args[0],
 			PeerKey:    rawPeerKey,
-			ProvingKey: provingKey.(ed448.PrivateKey),
+			ProvingKey: ed448.PrivateKey(provingKey.Private()),
 		})
 		if err != nil {
 			panic(errors.Wrap(err, "error cross minting"))
@@ -90,10 +119,6 @@ var crossMintCmd = &cobra.Command{
 		}
 		fmt.Println(string(jsonResult))
 	},
-}
-
-func init() {
-	rootCmd.AddCommand(crossMintCmd)
 }
 
 // CrossMintArgs Arguments for the cross mint operation
@@ -198,4 +223,8 @@ func decodeHexString(hexStr string) ([]byte, error) {
 		return nil, errors.Wrap(err, "error decoding hex string")
 	}
 	return data, nil
+}
+
+func init() {
+	CrossMintCmd.PersistentFlags().StringVar(&ConfigDirectory, "config", "default", "config directory")
 }

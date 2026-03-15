@@ -1,6 +1,7 @@
 package votecollector
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 
@@ -31,7 +32,14 @@ type voteContainer[VoteT models.Unique] struct {
 //     If v and v0 have different Identifiers, the voter is equivocating and
 //     we return a models.DoubleVoteError
 type VotesCache[VoteT models.Unique] struct {
-	lock          sync.RWMutex
+	// CAUTION: In the VoteCollector's liveness proof, we utilized that reading the VotesCache
+	// happens before writing to it. Only locks are agnostic to the performed operation being a
+	// read or a write. Atomic variables only establish a 'synchronized before' relation when a
+	// preceding write is observed by a subsequent read. However, the VoteProcessor first reads
+	// and then writes. For atomic variables, this order does not induce any synchronization
+	// guarantees per Go Memory Model (https://go.dev/ref/mem). Hence, utilizing locks here is
+	// critical for the correctness of the VoteCollector.
+	lock sync.RWMutex
 	rank          uint64
 	votes         map[models.Identity]voteContainer[VoteT] // signerID -> first vote
 	voteConsumers []consensus.VoteConsumer[VoteT]
@@ -73,15 +81,27 @@ func (vc *VotesCache[VoteT]) AddVote(vote *VoteT) error {
 	//    we return a models.DoubleVoteError
 	firstVote, exists := vc.votes[(*vote).Identity()]
 	if exists {
+		// Check if votes are identical (exact same source AND signature)
+		if (*firstVote.Vote).Source() == (*vote).Source() &&
+			bytes.Equal((*firstVote.Vote).GetSignature(), (*vote).GetSignature()) {
+			return RepeatedVoteErr
+		}
 		if (*firstVote.Vote).Source() != (*vote).Source() {
+			// voting for different states → vote equivocation
 			return models.NewDoubleVoteErrorf(
 				firstVote.Vote,
 				vote,
-				"detected vote equivocation at rank: %d",
+				"replica voted for different states in rank %d",
 				vc.rank,
 			)
 		}
-		return RepeatedVoteErr
+		// Same source but different signature → equivocation
+		return models.NewDoubleVoteErrorf(
+			firstVote.Vote,
+			vote,
+			"detected vote equivocation at rank: %d",
+			vc.rank,
+		)
 	}
 
 	// previously unknown vote: (1) store and (2) forward to consumers

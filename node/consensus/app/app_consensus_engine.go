@@ -23,6 +23,7 @@ import (
 	"golang.org/x/crypto/sha3"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/forks"
@@ -210,7 +211,8 @@ type AppConsensusEngine struct {
 	onionService *onion.GRPCTransport
 
 	// Communication with master process
-	globalClient protobufs.GlobalServiceClient
+	globalClient     protobufs.GlobalServiceClient
+	globalClientConn *grpc.ClientConn
 }
 
 // NewAppConsensusEngine creates a new app consensus engine using the generic
@@ -2318,19 +2320,40 @@ func (e *AppConsensusEngine) SetGlobalClient(
 	e.globalClient = client
 }
 
+func (e *AppConsensusEngine) resetGlobalClient() {
+	if e.globalClientConn != nil {
+		e.globalClientConn.Close()
+		e.globalClientConn = nil
+	}
+	e.globalClient = nil
+}
+
+// multiaddrToTCPAddr parses a multiaddr string into a "host:port" address,
+// normalizing 0.0.0.0 to localhost for local connections.
+func multiaddrToTCPAddr(maStr string) (string, error) {
+	ma, err := multiaddr.StringCast(maStr)
+	if err != nil {
+		return "", err
+	}
+
+	netAddr, err := mn.ToNetAddr(ma)
+	if err != nil {
+		return "", err
+	}
+
+	addr := netAddr.String()
+
+	// Normalize 0.0.0.0 to localhost for worker-to-master connections
+	if strings.HasPrefix(addr, "0.0.0.0:") {
+		addr = "localhost:" + strings.TrimPrefix(addr, "0.0.0.0:")
+	}
+
+	return addr, nil
+}
+
 func (e *AppConsensusEngine) ensureGlobalClient() error {
 	if e.globalClient != nil {
 		return nil
-	}
-
-	addr, err := multiaddr.StringCast(e.config.P2P.StreamListenMultiaddr)
-	if err != nil {
-		return errors.Wrap(err, "ensure global client")
-	}
-
-	mga, err := mn.ToNetAddr(addr)
-	if err != nil {
-		return errors.Wrap(err, "ensure global client")
 	}
 
 	creds, err := p2p.NewPeerAuthenticator(
@@ -2350,16 +2373,77 @@ func (e *AppConsensusEngine) ensureGlobalClient() error {
 		return errors.Wrap(err, "ensure global client")
 	}
 
-	client, err := grpc.NewClient(
-		mga.String(),
-		grpc.WithTransportCredentials(creds),
-	)
-	if err != nil {
-		return errors.Wrap(err, "ensure global client")
+	// Build candidate addresses: StreamListenMultiaddr first, then
+	// AnnounceStreamListenMultiaddr as fallback.
+	candidates := []string{}
+	if e.config.P2P.StreamListenMultiaddr != "" {
+		candidates = append(candidates, e.config.P2P.StreamListenMultiaddr)
+	}
+	if e.config.P2P.AnnounceStreamListenMultiaddr != "" {
+		candidates = append(candidates, e.config.P2P.AnnounceStreamListenMultiaddr)
+	}
+	if len(candidates) == 0 {
+		return errors.New("ensure global client: no stream multiaddr configured")
 	}
 
-	e.globalClient = protobufs.NewGlobalServiceClient(client)
-	return nil
+	var lastErr error
+	for _, maStr := range candidates {
+		addr, err := multiaddrToTCPAddr(maStr)
+		if err != nil {
+			lastErr = errors.Wrapf(err, "ensure global client: parse %s", maStr)
+			continue
+		}
+
+		conn, err := grpc.NewClient(
+			addr,
+			grpc.WithTransportCredentials(creds),
+		)
+		if err != nil {
+			lastErr = errors.Wrapf(err, "ensure global client: dial %s", addr)
+			continue
+		}
+
+		// Verify connectivity before committing — grpc.NewClient is lazy.
+		conn.Connect()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		connected := false
+		for {
+			state := conn.GetState()
+			if state == connectivity.Ready {
+				connected = true
+				break
+			}
+			if state == connectivity.TransientFailure {
+				break
+			}
+			if !conn.WaitForStateChange(ctx, state) {
+				break // timeout
+			}
+		}
+		cancel()
+
+		if !connected {
+			conn.Close()
+			lastErr = fmt.Errorf(
+				"ensure global client: connect to %s timed out or failed", addr,
+			)
+			e.logger.Warn("master connection attempt failed, trying next address",
+				zap.String("address", addr),
+				zap.String("multiaddr", maStr),
+			)
+			continue
+		}
+
+		e.globalClientConn = conn
+		e.globalClient = protobufs.NewGlobalServiceClient(conn)
+		e.logger.Info("connected to master node",
+			zap.String("address", addr),
+			zap.String("multiaddr", maStr),
+		)
+		return nil
+	}
+
+	return lastErr
 }
 
 func (e *AppConsensusEngine) startConsensus(

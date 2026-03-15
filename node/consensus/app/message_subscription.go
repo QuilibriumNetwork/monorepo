@@ -196,6 +196,7 @@ func (e *AppConsensusEngine) streamGlobalMessagesFromMaster(
 			e.logger.Warn("global message stream: failed to open stream",
 				zap.Error(err),
 			)
+			e.resetGlobalClient()
 			select {
 			case <-ctx.Done():
 				return
@@ -208,6 +209,7 @@ func (e *AppConsensusEngine) streamGlobalMessagesFromMaster(
 		e.receiveGlobalMessages(ctx, stream)
 
 		e.logger.Warn("global message stream disconnected, reconnecting")
+		e.resetGlobalClient()
 		select {
 		case <-ctx.Done():
 			return

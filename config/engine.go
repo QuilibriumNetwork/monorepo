@@ -131,6 +131,9 @@ type EngineConfig struct {
 	ArchiveMode bool `yaml:"archiveMode"`
 	// Delegate address for rewards (hexadecimal string without 0x prefix)
 	DelegateAddress string `yaml:"delegateAddress"`
+	// Rewards address override (hexadecimal string without 0x prefix).
+	// When set, rewards are directed to this address instead of the node's own.
+	RewardsAddress string `yaml:"rewardsAddress"`
 	// Whether to allow GOMAXPROCS values above the number of physical cores.
 	AllowExcessiveGOMAXPROCS bool `yaml:"allowExcessiveGOMAXPROCS"`
 	// Blacklisted addresses

@@ -1,8 +1,26 @@
 package consensus
 
 import (
+	"math/big"
+
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 )
+
+// ShardDetail holds per-shard reward and prover information.
+type ShardDetail struct {
+	Filter          []byte
+	ShardSize       *big.Int
+	ActiveProvers   int
+	Ring            uint8
+	EstimatedReward *big.Int
+	IsAllocated     bool
+}
+
+// ShardInfoProvider computes shard-level reward information for the local
+// prover. It is implemented by the global consensus engine.
+type ShardInfoProvider interface {
+	GetShardInfo(includeAll bool) ([]*ShardDetail, uint64, *big.Int, uint64, error)
+}
 
 // ProverStatus represents the current status of a prover
 type ProverStatus uint8

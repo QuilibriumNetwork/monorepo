@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -11,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"source.quilibrium.com/quilibrium/monorepo/config"
@@ -61,46 +63,6 @@ func NewProxyBlossomSub(
 		zap.Uint("core_id", coreId),
 	)
 
-	// Parse the StreamListenMultiaddr to get the master RPC address
-	streamMultiaddr := p2pConfig.StreamListenMultiaddr
-	var masterAddr string
-
-	if streamMultiaddr == "" {
-		masterAddr = "localhost:8340" // Default fallback
-	} else {
-		// Parse the multiaddr
-		ma, err := multiaddr.NewMultiaddr(streamMultiaddr)
-		if err != nil {
-			return nil, errors.Wrap(err, "new proxy blossom sub")
-		}
-
-		// Extract host and port
-		host, err := ma.ValueForProtocol(multiaddr.P_IP4)
-		if err != nil {
-			// Try IPv6
-			host, err = ma.ValueForProtocol(multiaddr.P_IP6)
-			if err != nil {
-				host = "localhost" // fallback
-			}
-		}
-
-		port, err := ma.ValueForProtocol(multiaddr.P_TCP)
-		if err != nil {
-			port = "8340" // fallback
-		}
-
-		// Use localhost if binding to 0.0.0.0
-		if host == "0.0.0.0" {
-			host = "localhost"
-		}
-
-		masterAddr = fmt.Sprintf("%s:%s", host, port)
-	}
-
-	logger.Info("connecting to master node RPC",
-		zap.String("address", masterAddr),
-		zap.String("stream_listen_multiaddr", streamMultiaddr))
-
 	pubkeyBytes, err := hex.DecodeString(p2pConfig.PeerPrivKey)
 	if err != nil {
 		return nil, errors.Wrap(err, "new proxy blossom sub")
@@ -135,14 +97,68 @@ func NewProxyBlossomSub(
 
 	logger.Info("using TLS connection to master node")
 
-	// Create gRPC connection with TLS
-	conn, err := grpc.Dial(
-		masterAddr,
+	// Build candidate addresses: StreamListenMultiaddr first, then
+	// AnnounceStreamListenMultiaddr as fallback.
+	candidates := proxyAddrCandidates(p2pConfig)
+
+	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(tlsCreds),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(100*1024*1024)),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "new proxy blossom sub")
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(100 * 1024 * 1024)),
+	}
+
+	var conn *grpc.ClientConn
+	var lastErr error
+	for _, addr := range candidates {
+		logger.Info("attempting connection to master node RPC",
+			zap.String("address", addr))
+
+		c, dialErr := grpc.NewClient(addr, dialOpts...)
+		if dialErr != nil {
+			lastErr = dialErr
+			continue
+		}
+
+		// Verify connectivity — grpc.NewClient is lazy.
+		c.Connect()
+		connCtx, connCancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		connected := false
+		for {
+			state := c.GetState()
+			if state == connectivity.Ready {
+				connected = true
+				break
+			}
+			if state == connectivity.TransientFailure {
+				break
+			}
+			if !c.WaitForStateChange(connCtx, state) {
+				break // timeout
+			}
+		}
+		connCancel()
+
+		if connected {
+			conn = c
+			logger.Info("connected to master node RPC",
+				zap.String("address", addr))
+			break
+		}
+
+		c.Close()
+		lastErr = fmt.Errorf("connect to %s timed out or failed", addr)
+		logger.Warn("master connection attempt failed, trying next address",
+			zap.String("address", addr))
+	}
+
+	if conn == nil {
+		if lastErr != nil {
+			return nil, errors.Wrap(lastErr, "new proxy blossom sub")
+		}
+		return nil, errors.New(
+			"new proxy blossom sub: no master addresses available",
+		)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -157,6 +173,58 @@ func NewProxyBlossomSub(
 		logger: logger,
 		coreId: coreId,
 	}, nil
+}
+
+// proxyAddrCandidates returns a list of "host:port" addresses to try when
+// connecting to the master node. StreamListenMultiaddr is tried first (with
+// 0.0.0.0 normalized to localhost), then AnnounceStreamListenMultiaddr.
+func proxyAddrCandidates(p2pConfig *config.P2PConfig) []string {
+	var addrs []string
+
+	if addr := parseMultiaddrToHostPort(p2pConfig.StreamListenMultiaddr); addr != "" {
+		addrs = append(addrs, addr)
+	}
+	if addr := parseMultiaddrToHostPort(p2pConfig.AnnounceStreamListenMultiaddr); addr != "" {
+		addrs = append(addrs, addr)
+	}
+
+	if len(addrs) == 0 {
+		addrs = append(addrs, "localhost:8340")
+	}
+	return addrs
+}
+
+// parseMultiaddrToHostPort parses a multiaddr string into "host:port",
+// normalizing 0.0.0.0 to localhost. Returns "" if the input is empty or
+// cannot be parsed.
+func parseMultiaddrToHostPort(maStr string) string {
+	if maStr == "" {
+		return ""
+	}
+
+	ma, err := multiaddr.NewMultiaddr(maStr)
+	if err != nil {
+		return ""
+	}
+
+	host, err := ma.ValueForProtocol(multiaddr.P_IP4)
+	if err != nil {
+		host, err = ma.ValueForProtocol(multiaddr.P_IP6)
+		if err != nil {
+			host = "localhost"
+		}
+	}
+
+	port, err := ma.ValueForProtocol(multiaddr.P_TCP)
+	if err != nil {
+		port = "8340"
+	}
+
+	if host == "0.0.0.0" {
+		host = "localhost"
+	}
+
+	return fmt.Sprintf("%s:%s", host, port)
 }
 
 // Close closes the proxy connection

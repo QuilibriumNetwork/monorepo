@@ -32,6 +32,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	"source.quilibrium.com/quilibrium/monorepo/types/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/worker"
@@ -51,8 +52,9 @@ type RPCServer struct {
 	workerManager    worker.WorkerManager
 	proverRegistry   consensus.ProverRegistry
 	executionManager *manager.ExecutionEngineManager
-	coinStore        store.TokenStore
-	hypergraph       hypergraph.Hypergraph
+	shardInfoProvider consensus.ShardInfoProvider
+	coinStore         store.TokenStore
+	hypergraph        hypergraph.Hypergraph
 
 	// server interfaces
 	grpcServer *grpc.Server
@@ -64,6 +66,14 @@ func (r *RPCServer) GetTokensByAccount(
 	ctx context.Context,
 	req *protobufs.GetTokensByAccountRequest,
 ) (*protobufs.GetTokensByAccountResponse, error) {
+	if r.coinStore == nil {
+		return nil, errors.New(
+			"get tokens by account: token store not available – " +
+				"token shards may not yet be unlocked, or node synchronization " +
+				"may still be in progress",
+		)
+	}
+
 	// Handle legacy (pre-2.1) coins:
 	if (len(req.Domain) == 0 ||
 		bytes.Equal(req.Domain, token.QUIL_TOKEN_ADDRESS)) &&
@@ -240,6 +250,13 @@ func (r *RPCServer) GetNodeInfo(
 		}
 	}
 
+	reachable := r.config.P2P.Network != 0
+	if !reachable {
+		if r := r.pubSub.Reachability(); r != nil {
+			reachable = r.Value
+		}
+	}
+
 	return &protobufs.NodeInfoResponse{
 		PeerId:           peer.ID(peerID).String(),
 		PeerScore:        uint64(r.pubSub.GetPeerScore(peerID)),
@@ -248,7 +265,7 @@ func (r *RPCServer) GetNodeInfo(
 		RunningWorkers:   uint32(len(workers)),
 		AllocatedWorkers: allocated,
 		PatchNumber:      append([]byte{}, config.GetPatchNumber()),
-		Reachable:        r.pubSub.Reachability().Value,
+		Reachable:        reachable,
 		ShardAllocations: shardAllocations,
 	}, nil
 }
@@ -302,20 +319,231 @@ func (r *RPCServer) GetMetrics(
 	return &protobufs.GetMetricsResponse{Metrics: buf.Bytes()}, nil
 }
 
+// GetVertexData implements protobufs.NodeServiceServer.
+func (r *RPCServer) GetVertexData(
+	ctx context.Context,
+	req *protobufs.GetVertexDataRequest,
+) (*protobufs.GetVertexDataResponse, error) {
+	if r.hypergraph == nil {
+		return nil, errors.New("hypergraph not available")
+	}
+
+	if len(req.Address) != 64 {
+		return nil, errors.Wrap(
+			errors.New("invalid address length, expected 64 bytes"),
+			"get vertex data",
+		)
+	}
+
+	var id [64]byte
+	copy(id[:], req.Address)
+	tree, err := r.hypergraph.GetVertexData(id)
+	if err != nil {
+		return nil, errors.Wrap(err, "get vertex data")
+	}
+
+	// Derive shard key from the vertex's app address (first 32 bytes)
+	shardL1 := up2p.GetBloomFilterIndices(id[:32], 256, 3)
+	shardL2 := make([]byte, 32)
+	copy(shardL2, id[:32])
+
+	resp := &protobufs.GetVertexDataResponse{
+		SetType:   "vertex",
+		PhaseType: "adds",
+		ShardL1:   shardL1,
+		ShardL2:   shardL2,
+	}
+
+	if req.GetFullData() {
+		serialized, err := tries.SerializeNonLazyTree(tree)
+		if err != nil {
+			return nil, errors.Wrap(err, "serialize vertex tree")
+		}
+		resp.RawData = serialized
+	} else {
+		entries := []*protobufs.VertexDataEntry{}
+		knownIndices := [][]byte{
+			{0}, {4}, {8}, {12}, {16}, {20}, {24}, {28}, {0xff},
+		}
+		for _, key := range knownIndices {
+			val, err := tree.Get(key)
+			if err != nil || val == nil {
+				continue
+			}
+			entries = append(entries, &protobufs.VertexDataEntry{
+				Key:   slices.Clone(key),
+				Value: slices.Clone(val),
+			})
+		}
+		resp.Entries = entries
+	}
+
+	return resp, nil
+}
+
+// GetHyperedgeData implements protobufs.NodeServiceServer.
+func (r *RPCServer) GetHyperedgeData(
+	ctx context.Context,
+	req *protobufs.GetHyperedgeDataRequest,
+) (*protobufs.GetHyperedgeDataResponse, error) {
+	if r.hypergraph == nil {
+		return nil, errors.New("hypergraph not available")
+	}
+
+	if len(req.Address) != 64 {
+		return nil, errors.Wrap(
+			errors.New("invalid address length, expected 64 bytes"),
+			"get hyperedge data",
+		)
+	}
+
+	var id [64]byte
+	copy(id[:], req.Address)
+	tree, err := r.hypergraph.GetHyperedgeExtrinsics(id)
+	if err != nil {
+		return nil, errors.Wrap(err, "get hyperedge data")
+	}
+
+	entries := []*protobufs.VertexDataEntry{}
+	if tree != nil && tree.Root != nil {
+		for _, leaf := range tries.GetAllPreloadedLeaves(tree.Root) {
+			entries = append(entries, &protobufs.VertexDataEntry{
+				Key:   slices.Clone(leaf.Key),
+				Value: slices.Clone(leaf.Value),
+			})
+		}
+	}
+
+	shardL1 := up2p.GetBloomFilterIndices(id[:32], 256, 3)
+	shardL2 := make([]byte, 32)
+	copy(shardL2, id[:32])
+
+	return &protobufs.GetHyperedgeDataResponse{
+		Entries:   entries,
+		SetType:   "hyperedge",
+		PhaseType: "adds",
+		ShardL1:   shardL1,
+		ShardL2:   shardL2,
+	}, nil
+}
+
+// CreateTraversalProof implements protobufs.NodeServiceServer.
+func (r *RPCServer) CreateTraversalProof(
+	ctx context.Context,
+	req *protobufs.CreateTraversalProofRequest,
+) (*protobufs.CreateTraversalProofResponse, error) {
+	if r.hypergraph == nil {
+		return nil, errors.New("hypergraph not available")
+	}
+
+	if len(req.Domain) != 32 {
+		return nil, errors.Wrap(
+			errors.New("invalid domain length, expected 32 bytes"),
+			"create traversal proof",
+		)
+	}
+
+	var domain [32]byte
+	copy(domain[:], req.Domain)
+
+	proof, err := r.hypergraph.CreateTraversalProof(
+		domain,
+		hypergraph.AtomType(req.AtomType),
+		hypergraph.PhaseType(req.PhaseType),
+		req.Keys,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "create traversal proof")
+	}
+
+	proofBytes, err := proof.ToBytes()
+	if err != nil {
+		return nil, errors.Wrap(err, "create traversal proof")
+	}
+
+	return &protobufs.CreateTraversalProofResponse{
+		Proof: proofBytes,
+	}, nil
+}
+
+// GetShardInfo implements protobufs.NodeServiceServer.
+func (r *RPCServer) GetShardInfo(
+	ctx context.Context,
+	req *protobufs.GetShardInfoRequest,
+) (*protobufs.GetShardInfoResponse, error) {
+	if r.shardInfoProvider == nil {
+		return nil, errors.New("shard info not available")
+	}
+
+	details, difficulty, basis, frameNumber, err := r.shardInfoProvider.GetShardInfo(
+		req.IncludeAll,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get shard info")
+	}
+
+	shards := make([]*protobufs.ShardRewardInfo, 0, len(details))
+	worldBytes := big.NewInt(0)
+	for _, d := range details {
+		worldBytes.Add(worldBytes, d.ShardSize)
+		shards = append(shards, &protobufs.ShardRewardInfo{
+			Filter:          d.Filter,
+			ActiveProvers:   uint32(d.ActiveProvers),
+			Ring:            uint32(d.Ring),
+			ShardSize:       d.ShardSize.Bytes(),
+			EstimatedReward: d.EstimatedReward.Bytes(),
+			IsAllocated:     d.IsAllocated,
+		})
+	}
+
+	resp := &protobufs.GetShardInfoResponse{
+		Shards:         shards,
+		Difficulty:     difficulty,
+		FrameNumber:    frameNumber,
+		WorldStateBytes: worldBytes.Bytes(),
+	}
+	if basis != nil {
+		resp.PomwBasis = basis.Bytes()
+	}
+
+	return resp, nil
+}
+
+// RequestJoin implements protobufs.NodeServiceServer.
+func (r *RPCServer) RequestJoin(
+	ctx context.Context,
+	req *protobufs.RequestJoinRequest,
+) (*protobufs.RequestJoinResponse, error) {
+	if r.workerManager == nil {
+		return nil, errors.New("worker manager not available")
+	}
+
+	if len(req.Filters) == 0 {
+		return nil, errors.New("at least one filter is required")
+	}
+
+	if err := r.workerManager.RequestJoin(
+		ctx, req.Filters, req.Delegate,
+	); err != nil {
+		return nil, errors.Wrap(err, "request join")
+	}
+
+	return &protobufs.RequestJoinResponse{}, nil
+}
+
 // Send implements protobufs.NodeServiceServer.
 func (r *RPCServer) Send(
 	ctx context.Context,
 	req *protobufs.SendRequest,
 ) (*protobufs.SendResponse, error) {
 	if req == nil || req.Request == nil || len(req.Authentication) == 0 {
-		return &protobufs.SendResponse{}, nil
+		return nil, errors.New("send: missing request or authentication")
 	}
 
-	signer, err := r.keyManager.GetSigningKey("q-node-auth")
+	signer, err := r.keyManager.GetSigningKey("q-peer-key")
 	if err != nil {
 		r.logger.Error("no node auth key found")
-		// Do not flag auth failures
-		return &protobufs.SendResponse{}, nil
+		return nil, errors.Wrap(err, "send: get auth key")
 	}
 
 	var payload []byte
@@ -339,7 +567,7 @@ func (r *RPCServer) Send(
 	}
 
 	if len(payload) == 0 {
-		return &protobufs.SendResponse{}, nil
+		return nil, errors.New("send: empty payload")
 	}
 
 	valid, err := r.keyManager.ValidateSignature(
@@ -350,8 +578,7 @@ func (r *RPCServer) Send(
 		slices.Concat([]byte("NODE_AUTHENTICATION"), req.Domain),
 	)
 	if err != nil || !valid {
-		// Do not flag auth failures
-		return &protobufs.SendResponse{}, nil
+		return nil, errors.New("send: authentication failed")
 	}
 
 	if len(request) != 0 {
@@ -412,6 +639,8 @@ func NewRPCServer(
 	workerManager worker.WorkerManager,
 	proverRegistry consensus.ProverRegistry,
 	executionManager *manager.ExecutionEngineManager,
+	shardInfoProvider consensus.ShardInfoProvider,
+	coinStore store.TokenStore,
 ) (*RPCServer, error) {
 	mg, err := multiaddr.NewMultiaddr(config.ListenGRPCMultiaddr)
 	if err != nil {
@@ -443,14 +672,16 @@ func NewRPCServer(
 	}
 
 	rpcServer := &RPCServer{
-		config:           config,
-		logger:           logger,
-		keyManager:       keyManager,
-		pubSub:           pubSub,
-		peerInfoProvider: peerInfoProvider,
-		workerManager:    workerManager,
-		proverRegistry:   proverRegistry,
-		executionManager: executionManager,
+		config:            config,
+		logger:            logger,
+		keyManager:        keyManager,
+		pubSub:            pubSub,
+		peerInfoProvider:  peerInfoProvider,
+		workerManager:     workerManager,
+		proverRegistry:    proverRegistry,
+		executionManager:  executionManager,
+		shardInfoProvider: shardInfoProvider,
+		coinStore:         coinStore,
 		grpcServer: qgrpc.NewServer(
 			grpc.MaxRecvMsgSize(10*1024*1024),
 			grpc.MaxSendMsgSize(10*1024*1024),

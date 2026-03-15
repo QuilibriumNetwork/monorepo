@@ -974,7 +974,7 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 	ctx context.Context,
 	data *consensustime.GlobalEvent,
 	self *typesconsensus.ProverInfo,
-	effectiveSeniority uint64,
+	_ uint64, // effectiveSeniority – no longer used for ring prediction
 ) (*allocationSnapshot, bool) {
 	appShards, err := e.shardsStore.RangeAppShards()
 	if err != nil {
@@ -1205,7 +1205,12 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 
 			logicalShards += int(shard.DataShards)
 
-			above := []*typesconsensus.ProverInfo{}
+			// Count all active/joining provers on this shard. The actual ring
+			// assignment (global_prover_shard_update.go:computeRingAssignments)
+			// uses floor(rank / 8) where rank is position in the full sorted
+			// candidate list. A new joiner lands at the end, so predicted ring
+			// = floor(totalActiveJoining / 8).
+			totalActiveJoining := 0
 			for _, i := range prs {
 				for _, a := range i.Allocations {
 					if !bytes.Equal(a.ConfirmationFilter, bp) {
@@ -1213,13 +1218,16 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 					}
 					if a.Status == typesconsensus.ProverStatusActive ||
 						a.Status == typesconsensus.ProverStatusJoining {
-						if i.Seniority >= effectiveSeniority {
-							above = append(above, i)
-						}
-						break
+						totalActiveJoining++
 					}
+					break
 				}
 			}
+
+			// For shards this prover is already on, use the current count.
+			// For unallocated shards, add 1 (self would be a new joiner).
+			currentRing := uint8(totalActiveJoining / 8)
+			joinerRing := uint8((totalActiveJoining + 1) / 8)
 
 			if allocated && pending {
 				pendingFilters = append(pendingFilters, bp)
@@ -1230,7 +1238,7 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 					provers.ShardDescriptor{
 						Filter: bp,
 						Size:   size.Uint64(),
-						Ring:   uint8(len(above) / 8),
+						Ring:   joinerRing,
 						Shards: shard.DataShards,
 					},
 				)
@@ -1241,7 +1249,7 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 					provers.ShardDescriptor{
 						Filter: bp,
 						Size:   size.Uint64(),
-						Ring:   uint8(len(above) / 8),
+						Ring:   currentRing,
 						Shards: shard.DataShards,
 					},
 				)
@@ -1254,7 +1262,7 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 				provers.ShardDescriptor{
 					Filter: bp,
 					Size:   size.Uint64(),
-					Ring:   uint8(len(above) / 8),
+					Ring:   joinerRing,
 					Shards: shard.DataShards,
 				},
 			)
