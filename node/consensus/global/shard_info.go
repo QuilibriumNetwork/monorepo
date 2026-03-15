@@ -2,15 +2,33 @@ package global
 
 import (
 	"bytes"
+	"context"
 	"math/big"
 	"slices"
+	"time"
 
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
+
+type shardEntry struct {
+	filter      []byte
+	size        *big.Int
+	dataShards  uint64
+	totalActive int
+	isAllocated bool
+}
 
 // GetShardInfo implements typesconsensus.ShardInfoProvider.
 // Returns: shardDetails, difficulty, pomwBasis, frameNumber, error.
@@ -66,25 +84,84 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 		})
 	}
 
+	// Try local hypergraph first.
 	hg, ok := e.hypergraph.(*hypergraph.HypergraphCRDT)
 	if !ok {
 		return nil, 0, nil, 0, errors.New("get shard info: hypergraph type unsupported")
 	}
 
-	worldBytes := big.NewInt(0)
+	entries, worldBytes := e.buildShardEntries(
+		shards,
+		func(shardKey []byte, si store.ShardInfo) ([]*shardInfoEntry, error) {
+			return e.getLocalAppShards(hg, shardKey, si)
+		},
+		allocatedFilters,
+		includeAll,
+	)
 
-	type shardEntry struct {
-		filter      []byte
-		size        *big.Int
-		dataShards  uint64
-		totalActive int
-		isAllocated bool
+	// If local hypergraph has no data (non-archive node), fall back to
+	// fetching shard sizes from the latest frame's prover.
+	if worldBytes.Sign() == 0 {
+		client, conn, err := e.dialFrameProver(frame)
+		if err == nil {
+			defer conn.Close()
+			entries, worldBytes = e.buildShardEntries(
+				shards,
+				func(shardKey []byte, _ store.ShardInfo) ([]*shardInfoEntry, error) {
+					return e.getRemoteAppShards(client, shardKey)
+				},
+				allocatedFilters,
+				includeAll,
+			)
+		}
 	}
+
+	if worldBytes.Sign() == 0 {
+		return nil, difficulty, big.NewInt(0), frameNumber, nil
+	}
+
+	basis := reward.PomwBasis(difficulty, worldBytes.Uint64(), 8_000_000_000)
+
+	details := make([]*typesconsensus.ShardDetail, 0, len(entries))
+	for _, entry := range entries {
+		// Ring matches the actual assignment in computeRingAssignments:
+		// floor(totalActiveJoining / 8) for current members, +1 for a
+		// new joiner.
+		ring := uint8(entry.totalActive / 8)
+		if !entry.isAllocated && includeAll {
+			ring = uint8((entry.totalActive + 1) / 8)
+		}
+
+		est := computeShardReward(basis, entry.size, worldBytes, ring, entry.dataShards)
+
+		details = append(details, &typesconsensus.ShardDetail{
+			Filter:          entry.filter,
+			ShardSize:       entry.size,
+			ActiveProvers:   entry.totalActive,
+			Ring:            ring,
+			EstimatedReward: est,
+			IsAllocated:     entry.isAllocated,
+		})
+	}
+
+	return details, difficulty, basis, frameNumber, nil
+}
+
+// buildShardEntries iterates the provided shards, fetches size data via the
+// supplied function, and constructs entries enriched with local prover registry
+// data. Returns the entries and total world state bytes.
+func (e *GlobalConsensusEngine) buildShardEntries(
+	shards []store.ShardInfo,
+	getSizes func(shardKey []byte, si store.ShardInfo) ([]*shardInfoEntry, error),
+	allocatedFilters map[string]bool,
+	includeAll bool,
+) ([]shardEntry, *big.Int) {
+	worldBytes := big.NewInt(0)
 	var entries []shardEntry
 
 	for _, shardInfo := range shards {
 		shardKey := slices.Concat(shardInfo.L1, shardInfo.L2)
-		resp, err := e.getLocalAppShards(hg, shardKey, shardInfo)
+		resp, err := getSizes(shardKey, shardInfo)
 		if err != nil {
 			continue
 		}
@@ -136,35 +213,104 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 		}
 	}
 
-	if worldBytes.Cmp(big.NewInt(0)) == 0 {
-		return nil, difficulty, big.NewInt(0), frameNumber, nil
+	return entries, worldBytes
+}
+
+// dialFrameProver establishes a gRPC connection to the prover that produced
+// the given frame. The prover is discovered via the key registry and peer info
+// manager. The caller must close the returned connection.
+func (e *GlobalConsensusEngine) dialFrameProver(
+	frame *protobufs.GlobalFrame,
+) (protobufs.GlobalServiceClient, *grpc.ClientConn, error) {
+	registry, err := e.keyStore.GetKeyRegistryByProver(frame.Header.Prover)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "get key registry for prover")
 	}
 
-	basis := reward.PomwBasis(difficulty, worldBytes.Uint64(), 8_000_000_000)
+	if registry.IdentityKey == nil || registry.IdentityKey.KeyValue == nil {
+		return nil, nil, errors.New("prover identity key missing")
+	}
 
-	details := make([]*typesconsensus.ShardDetail, 0, len(entries))
-	for _, entry := range entries {
-		// Ring matches the actual assignment in computeRingAssignments:
-		// floor(totalActiveJoining / 8) for current members, +1 for a
-		// new joiner.
-		ring := uint8(entry.totalActive / 8)
-		if !entry.isAllocated && includeAll {
-			ring = uint8((entry.totalActive + 1) / 8)
-		}
+	pub, err := pcrypto.UnmarshalEd448PublicKey(registry.IdentityKey.KeyValue)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "unmarshal identity key")
+	}
 
-		est := computeShardReward(basis, entry.size, worldBytes, ring, entry.dataShards)
+	peerId, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "derive peer id")
+	}
 
-		details = append(details, &typesconsensus.ShardDetail{
-			Filter:          entry.filter,
-			ShardSize:       entry.size,
-			ActiveProvers:   entry.totalActive,
-			Ring:            ring,
-			EstimatedReward: est,
-			IsAllocated:     entry.isAllocated,
+	info := e.peerInfoManager.GetPeerInfo([]byte(peerId))
+	if info == nil {
+		return nil, nil, errors.New("no peer info for prover")
+	}
+
+	if len(info.Reachability) == 0 ||
+		len(info.Reachability[0].StreamMultiaddrs) == 0 {
+		return nil, nil, errors.New("no stream multiaddrs for prover")
+	}
+
+	s := info.Reachability[0].StreamMultiaddrs[0]
+
+	creds, err := p2p.NewPeerAuthenticator(
+		e.logger,
+		e.config.P2P,
+		nil, nil, nil, nil,
+		[][]byte{[]byte(peerId)},
+		map[string]channel.AllowedPeerPolicyType{},
+		map[string]channel.AllowedPeerPolicyType{},
+	).CreateClientTLSCredentials([]byte(peerId))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "create credentials")
+	}
+
+	maddr, err := multiaddr.StringCast(s)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "parse stream multiaddr")
+	}
+
+	mga, err := mn.ToNetAddr(maddr)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "convert multiaddr")
+	}
+
+	conn, err := grpc.NewClient(
+		mga.String(),
+		grpc.WithTransportCredentials(creds),
+	)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "dial prover")
+	}
+
+	return protobufs.NewGlobalServiceClient(conn), conn, nil
+}
+
+// getRemoteAppShards fetches shard sizes from a remote peer via GetAppShards.
+func (e *GlobalConsensusEngine) getRemoteAppShards(
+	client protobufs.GlobalServiceClient,
+	shardKey []byte,
+) ([]*shardInfoEntry, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.GetAppShards(ctx, &protobufs.GetAppShardsRequest{
+		ShardKey: shardKey,
+		Prefix:   []uint32{},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var result []*shardInfoEntry
+	for _, shard := range resp.GetInfo() {
+		result = append(result, &shardInfoEntry{
+			Prefix:     shard.GetPrefix(),
+			Size:       shard.GetSize(),
+			DataShards: shard.GetDataShards(),
 		})
 	}
-
-	return details, difficulty, basis, frameNumber, nil
+	return result, nil
 }
 
 // getLocalAppShards retrieves app shard info from the local cache/hypergraph.
