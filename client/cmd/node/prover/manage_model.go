@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -129,6 +130,14 @@ type manageKeyMap struct {
 	Refresh   key.Binding
 	Quit      key.Binding
 }
+
+// Constants
+const FILTER_WIDTH = 70
+const STATUS_WIDTH = 16
+const SIZE_WIDTH = 10
+const PROVERS_WIDTH = 7
+const RING_WIDTH = 5
+const REWARD_WIDTH = 20
 
 func newManageKeyMap() manageKeyMap {
 	return manageKeyMap{
@@ -787,6 +796,10 @@ func (m *manageModel) processRefreshData(
 	// Build allocations from NodeInfo, enriched with ShardInfo.
 	allocs := make([]allocationRow, 0, len(nodeInfo.GetShardAllocations()))
 	for _, a := range nodeInfo.GetShardAllocations() {
+		//skip unknown, rejected and kicked allocations
+		if a.GetStatus() == 0 || a.GetStatus() == 5 || a.GetStatus() == 6 {
+			continue
+		}
 		filterHex := hex.EncodeToString(a.GetFilter())
 		allocatedFilters[filterHex] = true
 
@@ -925,7 +938,7 @@ func (m manageModel) renderView() string {
 		workerMode = "Auto"
 	}
 	header := fmt.Sprintf(
-		" Peer: %s  Seniority: %s  Workers: %d/%d (%s)  Frame: %d  [%s]",
+		" Peer ID: %s  Seniority: %s  Workers: %d/%d (%s)  Frame: %d  [%s]",
 		peerDisplay,
 		m.seniority,
 		m.allocatedWorkers,
@@ -1024,11 +1037,11 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	// Column header.
 	var hdr string
 	if hasSelections {
-		hdr = fmt.Sprintf("    %-20s %-16s %10s %7s %5s %20s",
-			"Filter", "Status", "Size", "Provers", "Ring", "Reward")
+		hdr = fmt.Sprintf("    %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
+			"Filter", "Provers", "Ring", "Size", "Reward", "Status")
 	} else {
-		hdr = fmt.Sprintf("  %-20s %-16s %10s %7s %5s %20s",
-			"Filter", "Status", "Size", "Provers", "Ring", "Reward")
+		hdr = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
+			"Filter", "Provers", "Ring", "Size", "Reward", "Status")
 	}
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
 
@@ -1052,23 +1065,23 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 			if m.allocSelected[a.filterKey] {
 				marker = "[x]"
 			}
-			line = fmt.Sprintf("%s %-20s %-16s %10s %7d %5d %20s",
+			line = fmt.Sprintf("%s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
 				marker,
 				a.filterHex,
-				a.statusName,
-				formatStorage(a.shardSize.Uint64()),
 				a.activeProvers,
 				a.ring,
+				formatStorage(a.shardSize.Uint64()),
 				"~"+formatQUIL(a.estimatedReward)+" Q/f",
+				a.statusName,
 			)
 		} else {
-			line = fmt.Sprintf("  %-20s %-16s %10s %7d %5d %20s",
+			line = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
 				a.filterHex,
-				a.statusName,
-				formatStorage(a.shardSize.Uint64()),
 				a.activeProvers,
 				a.ring,
+				formatStorage(a.shardSize.Uint64()),
 				"~"+formatQUIL(a.estimatedReward)+" Q/f",
+				a.statusName,
 			)
 		}
 		if i == m.allocCursor && m.focus == allocationsPanel {
@@ -1090,10 +1103,10 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 
 	var hdr string
 	if hasSelections {
-		hdr = fmt.Sprintf("    %-20s %7s %5s %10s %20s",
+		hdr = fmt.Sprintf("    %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
 			"Filter", "Provers", "Ring", "Size", "Reward")
 	} else {
-		hdr = fmt.Sprintf("  %-20s %7s %5s %10s %20s",
+		hdr = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
 			"Filter", "Provers", "Ring", "Size", "Reward")
 	}
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
@@ -1117,7 +1130,7 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 			if m.availSelected[s.filterKey] {
 				marker = "[x]"
 			}
-			line = fmt.Sprintf("%s %-20s %7d %5d %10s %20s",
+			line = fmt.Sprintf("%s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
 				marker,
 				s.filterHex,
 				s.activeProvers,
@@ -1126,7 +1139,7 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 				"~"+formatQUIL(s.estimatedReward)+" Q/f",
 			)
 		} else {
-			line = fmt.Sprintf("  %-20s %7d %5d %10s %20s",
+			line = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
 				s.filterHex,
 				s.activeProvers,
 				s.ring,
@@ -1161,8 +1174,8 @@ func clampOffset(offset, cursor, visibleRows, total int) int {
 }
 
 func truncHex(h string) string {
-	if len(h) > 20 {
-		return h[:16] + "..."
+	if len(h) > FILTER_WIDTH {
+		return "..." + h[len(h)-FILTER_WIDTH+4:]
 	}
 	return h
 }
