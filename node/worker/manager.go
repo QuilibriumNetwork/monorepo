@@ -89,7 +89,7 @@ func NewWorkerManager(
 ) typesWorker.WorkerManager {
 	return &WorkerManager{
 		store:            store,
-		logger:           logger.Named("worker_manager"),
+		logger:           logger.Named("workerManager"),
 		workersByFilter:  make(map[string]uint),
 		filtersByWorker:  make(map[uint][]byte),
 		allocatedWorkers: make(map[uint]bool),

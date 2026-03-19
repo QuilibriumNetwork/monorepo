@@ -156,7 +156,7 @@ func (p *globalMessageProcessor) enforceCollectorLimit(
 }
 
 func (e *GlobalConsensusEngine) initGlobalMessageAggregator() error {
-	tracer := tracing.NewZapTracer(e.logger.Named("global_message_collector"))
+	tracer := tracing.NewZapTracer(e.logger.Named("globalMessageCollector"))
 	processorFactory := &globalMessageProcessorFactory{engine: e}
 	collectorFactory, err := keyedcollector.NewFactory(
 		tracer,

@@ -78,7 +78,7 @@ func NewManager(
 	strategy Strategy,
 ) *Manager {
 	return &Manager{
-		logger:    logger.Named("allocation_manager"),
+		logger:    logger.Named("allocationManager"),
 		store:     ws,
 		workerMgr: wm,
 		Units:     units,

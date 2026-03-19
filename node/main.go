@@ -149,6 +149,11 @@ var (
 		false,
 		"clears pending states (dangerous action)",
 	)
+	logFilter = flag.String(
+		"log-filter",
+		"",
+		"per-component log levels, comma-separated (e.g. \"bootstrap=debug,peerMonitor=warn\")",
+	)
 
 	// *char flags
 	blockchar         = "█"
@@ -190,6 +195,30 @@ func signatureCheckDefault() bool {
 	}
 
 	return true
+}
+
+func parseLogFilterFlag(flag string) map[string]string {
+	flag = strings.TrimSpace(flag)
+	if flag == "" {
+		return nil
+	}
+	result := make(map[string]string)
+	for _, part := range strings.Split(flag, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			fmt.Fprintf(os.Stderr,
+				"warning: ignoring malformed log filter entry %q (expected component=level)\n",
+				part,
+			)
+			continue
+		}
+		result[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+	}
+	return result
 }
 
 func debugDefault() bool {
@@ -257,7 +286,9 @@ func main() {
 		os.Exit(0)
 	}
 
-	logger, closer, err := nodeConfig.CreateLogger(uint(*core), *debug)
+	logger, closer, err := nodeConfig.CreateLogger(
+		uint(*core), *debug, parseLogFilterFlag(*logFilter),
+	)
 	if err != nil {
 		log.Fatal("failed to create logger", err)
 	}
