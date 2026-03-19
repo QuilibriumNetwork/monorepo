@@ -134,6 +134,14 @@ func (m *mockNodeServiceClient) RequestJoin(
 	return &protobufs.RequestJoinResponse{}, nil
 }
 
+func (m *mockNodeServiceClient) SetManuallyManaged(
+	ctx context.Context,
+	in *protobufs.SetManuallyManagedRequest,
+	opts ...grpc.CallOption,
+) (*protobufs.SetManuallyManagedResponse, error) {
+	return &protobufs.SetManuallyManagedResponse{}, nil
+}
+
 // ---------------------------------------------------------------------------
 // mockSigner
 // ---------------------------------------------------------------------------

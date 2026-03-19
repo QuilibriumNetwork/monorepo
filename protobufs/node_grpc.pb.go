@@ -30,6 +30,7 @@ const (
 	NodeService_CreateTraversalProof_FullMethodName = "/quilibrium.node.node.pb.NodeService/CreateTraversalProof"
 	NodeService_GetShardInfo_FullMethodName         = "/quilibrium.node.node.pb.NodeService/GetShardInfo"
 	NodeService_RequestJoin_FullMethodName          = "/quilibrium.node.node.pb.NodeService/RequestJoin"
+	NodeService_SetManuallyManaged_FullMethodName   = "/quilibrium.node.node.pb.NodeService/SetManuallyManaged"
 )
 
 // NodeServiceClient is the client API for NodeService service.
@@ -47,6 +48,7 @@ type NodeServiceClient interface {
 	CreateTraversalProof(ctx context.Context, in *CreateTraversalProofRequest, opts ...grpc.CallOption) (*CreateTraversalProofResponse, error)
 	GetShardInfo(ctx context.Context, in *GetShardInfoRequest, opts ...grpc.CallOption) (*GetShardInfoResponse, error)
 	RequestJoin(ctx context.Context, in *RequestJoinRequest, opts ...grpc.CallOption) (*RequestJoinResponse, error)
+	SetManuallyManaged(ctx context.Context, in *SetManuallyManagedRequest, opts ...grpc.CallOption) (*SetManuallyManagedResponse, error)
 }
 
 type nodeServiceClient struct {
@@ -156,6 +158,15 @@ func (c *nodeServiceClient) RequestJoin(ctx context.Context, in *RequestJoinRequ
 	return out, nil
 }
 
+func (c *nodeServiceClient) SetManuallyManaged(ctx context.Context, in *SetManuallyManagedRequest, opts ...grpc.CallOption) (*SetManuallyManagedResponse, error) {
+	out := new(SetManuallyManagedResponse)
+	err := c.cc.Invoke(ctx, NodeService_SetManuallyManaged_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeServiceServer is the server API for NodeService service.
 // All implementations must embed UnimplementedNodeServiceServer
 // for forward compatibility
@@ -171,6 +182,7 @@ type NodeServiceServer interface {
 	CreateTraversalProof(context.Context, *CreateTraversalProofRequest) (*CreateTraversalProofResponse, error)
 	GetShardInfo(context.Context, *GetShardInfoRequest) (*GetShardInfoResponse, error)
 	RequestJoin(context.Context, *RequestJoinRequest) (*RequestJoinResponse, error)
+	SetManuallyManaged(context.Context, *SetManuallyManagedRequest) (*SetManuallyManagedResponse, error)
 	mustEmbedUnimplementedNodeServiceServer()
 }
 
@@ -210,6 +222,9 @@ func (UnimplementedNodeServiceServer) GetShardInfo(context.Context, *GetShardInf
 }
 func (UnimplementedNodeServiceServer) RequestJoin(context.Context, *RequestJoinRequest) (*RequestJoinResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RequestJoin not implemented")
+}
+func (UnimplementedNodeServiceServer) SetManuallyManaged(context.Context, *SetManuallyManagedRequest) (*SetManuallyManagedResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetManuallyManaged not implemented")
 }
 func (UnimplementedNodeServiceServer) mustEmbedUnimplementedNodeServiceServer() {}
 
@@ -422,6 +437,24 @@ func _NodeService_RequestJoin_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeService_SetManuallyManaged_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetManuallyManagedRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).SetManuallyManaged(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_SetManuallyManaged_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).SetManuallyManaged(ctx, req.(*SetManuallyManagedRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NodeService_ServiceDesc is the grpc.ServiceDesc for NodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -472,6 +505,10 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RequestJoin",
 			Handler:    _NodeService_RequestJoin_Handler,
+		},
+		{
+			MethodName: "SetManuallyManaged",
+			Handler:    _NodeService_SetManuallyManaged_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

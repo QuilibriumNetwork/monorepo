@@ -296,14 +296,31 @@ func (r *RPCServer) GetWorkerInfo(
 			CoreId: uint32(worker.CoreId),
 			Filter: worker.Filter,
 			// TODO(2.1.1+): Expose available storage
-			AvailableStorage: uint64(worker.TotalStorage),
-			TotalStorage:     uint64(worker.TotalStorage),
+			AvailableStorage:  uint64(worker.TotalStorage),
+			TotalStorage:      uint64(worker.TotalStorage),
+			ManuallyManaged:   worker.ManuallyManaged,
 		})
 	}
 
 	return &protobufs.WorkerInfoResponse{
 		WorkerInfo: info,
 	}, nil
+}
+
+func (r *RPCServer) SetManuallyManaged(
+	ctx context.Context,
+	req *protobufs.SetManuallyManagedRequest,
+) (*protobufs.SetManuallyManagedResponse, error) {
+	if r.workerManager == nil {
+		return nil, errors.New("worker manager not available")
+	}
+	err := r.workerManager.SetManuallyManaged(
+		uint(req.CoreId), req.ManuallyManaged,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "set manually managed")
+	}
+	return &protobufs.SetManuallyManagedResponse{}, nil
 }
 
 func (r *RPCServer) GetMetrics(

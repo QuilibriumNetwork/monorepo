@@ -79,6 +79,7 @@ message WorkerInfo {
   bytes filter = 2;
   uint64 available_storage = 3;
   uint64 total_storage = 4;
+  bool manually_managed = 5;
 }
 
 message WorkerInfoResponse {
@@ -297,6 +298,14 @@ message RequestJoinRequest {
 message RequestJoinResponse {
 }
 
+message SetManuallyManagedRequest {
+  uint32 core_id = 1;
+  bool manually_managed = 2;
+}
+
+message SetManuallyManagedResponse {
+}
+
 service NodeService {
   rpc GetPeerInfo(GetPeerInfoRequest) returns (PeerInfoResponse);
   rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
@@ -311,6 +320,7 @@ service NodeService {
     returns (CreateTraversalProofResponse);
   rpc GetShardInfo(GetShardInfoRequest) returns (GetShardInfoResponse);
   rpc RequestJoin(RequestJoinRequest) returns (RequestJoinResponse);
+  rpc SetManuallyManaged(SetManuallyManagedRequest) returns (SetManuallyManagedResponse);
 }
 
 message ConnectivityTestRequest {

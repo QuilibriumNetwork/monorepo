@@ -50,6 +50,7 @@ type allocationRow struct {
 	leaveFrame      uint64
 	lastActiveFrame uint64
 	workerID        int // core_id, -1 if no worker assigned
+	manuallyManaged bool
 }
 
 type shardRow struct {
@@ -98,6 +99,17 @@ type actionBroadcastMsg struct {
 	err            error
 }
 
+type toggleManualMsg struct {
+	coreId   uint32
+	newState bool
+	err      error
+}
+
+type markManualMsg struct {
+	workerIDs []uint32
+	err       error
+}
+
 type awaitCheckMsg time.Time
 
 type awaitResultMsg struct {
@@ -118,19 +130,20 @@ type actionConfirmedMsg struct {
 // Key map for help display.
 
 type manageKeyMap struct {
-	Up        key.Binding
-	Down      key.Binding
-	Tab       key.Binding
-	Select    key.Binding
-	SelectAll key.Binding
-	Join      key.Binding
-	Leave     key.Binding
-	Confirm   key.Binding
-	Reject    key.Binding
-	Pause     key.Binding
-	Resume    key.Binding
-	Refresh   key.Binding
-	Quit      key.Binding
+	Up           key.Binding
+	Down         key.Binding
+	Tab          key.Binding
+	Select       key.Binding
+	SelectAll    key.Binding
+	Join         key.Binding
+	Leave        key.Binding
+	Confirm      key.Binding
+	Reject       key.Binding
+	Pause        key.Binding
+	Resume       key.Binding
+	ToggleManual key.Binding
+	Refresh      key.Binding
+	Quit         key.Binding
 }
 
 // Constants
@@ -155,13 +168,14 @@ func newManageKeyMap() manageKeyMap {
 		Reject:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "reject")),
 		Pause:     key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
 		Resume:    key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "resume")),
-		Refresh:   key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
-		Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+		ToggleManual: key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "mode")),
+		Refresh:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
+		Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
 func (k manageKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.Refresh, k.Quit}
+	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Quit}
 }
 
 func (k manageKeyMap) FullHelp() [][]key.Binding { return nil }
@@ -239,6 +253,16 @@ type manageModel struct {
 	allocFilter string
 	availFilter string
 
+	// Free workers (no filter assigned), refreshed each data fetch.
+	freeWorkers []uint32
+
+	// Join worker picker state.
+	joinPickerActive   bool
+	joinPickerCursor   int
+	joinPickerWorkers  []uint32
+	joinPickerSelected map[uint32]bool
+	joinPickerFilters  [][]byte
+
 	// Await state for multi-phase action tracking.
 	awaitAction         string
 	awaitFilters        [][]byte
@@ -265,15 +289,12 @@ func newManageModel(client protobufs.NodeServiceClient) manageModel {
 
 	h := help.New()
 
-	cfg := getConfig()
-	autoManaged := cfg == nil || cfg.Engine == nil || len(cfg.Engine.DataWorkerFilters) == 0
-
 	return manageModel{
 		client:        client,
 		keyMap:        newManageKeyMap(),
 		spinner:       s,
 		help:          h,
-		autoManaged:   autoManaged,
+		autoManaged:   true, // derived from server data on first refresh
 		allocSelected: make(map[string]bool),
 		availSelected: make(map[string]bool),
 	}
@@ -477,6 +498,24 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, fetchData(m.client)
 
+	case toggleManualMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("toggle manual mode failed: %v", msg.err)
+			m.statusIsError = true
+		} else {
+			state := "Manual"
+			if !msg.newState {
+				state = "Auto"
+			}
+			m.statusMsg = fmt.Sprintf("Worker %d set to %s mode", msg.coreId, state)
+			m.statusIsError = false
+		}
+		return m, fetchData(m.client)
+
+	case markManualMsg:
+		// Fire-and-forget: errors here don't block the main action.
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
@@ -536,13 +575,18 @@ func (m *manageModel) selectedAvailRows() []shardRow {
 
 // startMultiFilterAction collects valid filters and sends them in a single message.
 // Used for Leave, Confirm, Reject (which support multiple filters per message).
+// Also marks affected workers as manually managed.
 func (m *manageModel) startMultiFilterAction(action string, rows []allocationRow, validStatus func(uint32) bool) (tea.Model, tea.Cmd) {
 	var filters [][]byte
 	var status uint32
+	var workerIDs []uint32
 	for _, row := range rows {
 		if validStatus(row.status) {
 			filters = append(filters, row.filter)
 			status = row.status
+			if row.workerID >= 0 {
+				workerIDs = append(workerIDs, uint32(row.workerID))
+			}
 		}
 	}
 	if len(filters) == 0 {
@@ -556,16 +600,19 @@ func (m *manageModel) startMultiFilterAction(action string, rows []allocationRow
 	m.allocSelected = make(map[string]bool)
 	m.statusMsg = fmt.Sprintf("Creating %s message for %d allocation(s)...", action, len(filters))
 
-	var cmd tea.Cmd
+	var cmds []tea.Cmd
 	switch action {
 	case "Leave":
-		cmd = doLeave(m.client, filters, status)
+		cmds = append(cmds, doLeave(m.client, filters, status))
 	case "Confirm":
-		cmd = doConfirm(m.client, filters, status)
+		cmds = append(cmds, doConfirm(m.client, filters, status))
 	case "Reject":
-		cmd = doReject(m.client, filters, status)
+		cmds = append(cmds, doReject(m.client, filters, status))
 	}
-	return m, cmd
+	if len(workerIDs) > 0 {
+		cmds = append(cmds, doMarkWorkersManual(m.client, workerIDs))
+	}
+	return m, tea.Batch(cmds...)
 }
 
 // startBatchAction queues individual actions for operations that only support
@@ -626,6 +673,10 @@ func (m *manageModel) advanceQueue() tea.Cmd {
 }
 
 func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.joinPickerActive {
+		return m.handleJoinPickerKey(msg)
+	}
+
 	switch {
 	case key.Matches(msg, m.keyMap.Quit):
 		return m, tea.Quit
@@ -727,6 +778,18 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		for _, row := range rows {
 			filters = append(filters, row.filter)
 		}
+
+		// If there are free workers, let user pick which to mark manual.
+		if len(m.freeWorkers) > 0 {
+			m.joinPickerActive = true
+			m.joinPickerCursor = 0
+			m.joinPickerWorkers = append([]uint32(nil), m.freeWorkers...)
+			m.joinPickerSelected = make(map[uint32]bool)
+			m.joinPickerFilters = filters
+			return m, nil
+		}
+
+		// No free workers — proceed with join only.
 		m.actionInFlight = true
 		m.statusMsg = fmt.Sprintf("Joining %d shard(s) (VDF may take a while)...", len(filters))
 		m.statusIsError = false
@@ -762,6 +825,23 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.startBatchAction("Resume", m.selectedAllocRows(), func(s uint32) bool { return s == 3 })
+
+	case key.Matches(msg, m.keyMap.ToggleManual):
+		if m.actionInFlight || m.focus != allocationsPanel {
+			return m, nil
+		}
+		filtered := m.filteredAllocations()
+		if m.allocCursor >= len(filtered) {
+			return m, nil
+		}
+		row := filtered[m.allocCursor]
+		if row.workerID < 0 {
+			m.statusMsg = "No worker assigned to this allocation"
+			m.statusIsError = true
+			return m, nil
+		}
+		newState := !row.manuallyManaged
+		return m, doToggleManual(m.client, uint32(row.workerID), newState)
 	}
 
 	return m, nil
@@ -788,13 +868,37 @@ func (m *manageModel) processRefreshData(
 		m.difficulty = shardInfo.GetDifficulty()
 	}
 
-	// Build a map of worker core_id by filter hex.
-	workers := make(map[string]uint32)
+	// Build maps of worker core_id and manually-managed state by filter hex.
+	type workerData struct {
+		coreId          uint32
+		manuallyManaged bool
+	}
+	workers := make(map[string]workerData)
+	anyManuallyManaged := false
 	if workerInfo != nil {
 		for _, w := range workerInfo.GetWorkerInfo() {
-			workers[hex.EncodeToString(w.GetFilter())] = w.GetCoreId()
+			workers[hex.EncodeToString(w.GetFilter())] = workerData{
+				coreId:          w.GetCoreId(),
+				manuallyManaged: w.GetManuallyManaged(),
+			}
+			if w.GetManuallyManaged() {
+				anyManuallyManaged = true
+			}
 		}
 	}
+	m.autoManaged = !anyManuallyManaged
+
+	// Collect free workers (no filter assigned).
+	var freeWorkers []uint32
+	if workerInfo != nil {
+		for _, w := range workerInfo.GetWorkerInfo() {
+			if len(w.GetFilter()) == 0 {
+				freeWorkers = append(freeWorkers, w.GetCoreId())
+			}
+		}
+	}
+	sort.Slice(freeWorkers, func(i, j int) bool { return freeWorkers[i] < freeWorkers[j] })
+	m.freeWorkers = freeWorkers
 
 	// Build a map of shard reward info by filter for enrichment.
 	rewardByFilter := make(map[string]*protobufs.ShardRewardInfo)
@@ -840,8 +944,10 @@ func (m *manageModel) processRefreshData(
 		}
 
 		wid := -1
-		if id, ok := workers[filterHex]; ok {
-			wid = int(id)
+		mm := false
+		if wd, ok := workers[filterHex]; ok {
+			wid = int(wd.coreId)
+			mm = wd.manuallyManaged
 		}
 
 		row := allocationRow{
@@ -857,6 +963,7 @@ func (m *manageModel) processRefreshData(
 			shardSize:       big.NewInt(0),
 			estimatedReward: big.NewInt(0),
 			workerID:        wid,
+			manuallyManaged: mm,
 		}
 
 		if info, ok := rewardByFilter[filterHex]; ok {
@@ -940,6 +1047,10 @@ func (m manageModel) View() tea.View {
 func (m manageModel) renderView() string {
 	if m.width < 40 || m.height < 10 {
 		return "Terminal too small. Please resize."
+	}
+
+	if m.joinPickerActive {
+		return m.renderJoinPicker()
 	}
 
 	var doc strings.Builder
@@ -1083,6 +1194,10 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		if a.workerID >= 0 {
 			workerStr = strconv.Itoa(a.workerID)
 		}
+		displayStatus := a.statusName
+		if a.manuallyManaged {
+			displayStatus += " [M]"
+		}
 		var line string
 		if hasSelections {
 			marker := "[ ]"
@@ -1097,7 +1212,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 				a.ring,
 				formatStorage(a.shardSize.Uint64()),
 				"~"+formatQUIL(a.estimatedReward)+" Q/f",
-				a.statusName,
+				displayStatus,
 			)
 		} else {
 			line = fmt.Sprintf("  %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
@@ -1107,7 +1222,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 				a.ring,
 				formatStorage(a.shardSize.Uint64()),
 				"~"+formatQUIL(a.estimatedReward)+" Q/f",
-				a.statusName,
+				displayStatus,
 			)
 		}
 		if i == m.allocCursor && m.focus == allocationsPanel {
@@ -1180,6 +1295,90 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// handleJoinPickerKey processes keys while the join worker picker is active.
+func (m manageModel) handleJoinPickerKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	enterKey := key.NewBinding(key.WithKeys("enter"))
+	escKey := key.NewBinding(key.WithKeys("esc"))
+
+	switch {
+	case key.Matches(msg, m.keyMap.Up):
+		if m.joinPickerCursor > 0 {
+			m.joinPickerCursor--
+		}
+
+	case key.Matches(msg, m.keyMap.Down):
+		if m.joinPickerCursor < len(m.joinPickerWorkers)-1 {
+			m.joinPickerCursor++
+		}
+
+	case key.Matches(msg, m.keyMap.Select): // space
+		if m.joinPickerCursor < len(m.joinPickerWorkers) {
+			wid := m.joinPickerWorkers[m.joinPickerCursor]
+			if m.joinPickerSelected[wid] {
+				delete(m.joinPickerSelected, wid)
+			} else {
+				m.joinPickerSelected[wid] = true
+			}
+		}
+
+	case key.Matches(msg, m.keyMap.Join), key.Matches(msg, enterKey):
+		// Confirm: collect selected worker IDs, do join + mark.
+		var workerIDs []uint32
+		for wid := range m.joinPickerSelected {
+			workerIDs = append(workerIDs, wid)
+		}
+		m.joinPickerActive = false
+		m.actionInFlight = true
+		m.statusMsg = fmt.Sprintf("Joining %d shard(s) (VDF may take a while)...", len(m.joinPickerFilters))
+		m.statusIsError = false
+		m.availSelected = make(map[string]bool)
+
+		cmds := []tea.Cmd{doJoin(m.client, m.joinPickerFilters)}
+		if len(workerIDs) > 0 {
+			cmds = append(cmds, doMarkWorkersManual(m.client, workerIDs))
+		}
+		return m, tea.Batch(cmds...)
+
+	case key.Matches(msg, escKey), key.Matches(msg, m.keyMap.Quit):
+		m.joinPickerActive = false
+		m.statusMsg = "Join cancelled"
+		m.statusIsError = false
+	}
+
+	return m, nil
+}
+
+// renderJoinPicker draws the worker selection screen for manual-mode marking.
+func (m manageModel) renderJoinPicker() string {
+	var doc strings.Builder
+
+	doc.WriteString(mHeaderStyle.Width(m.width).Render(" Select workers to mark as manually managed"))
+	doc.WriteString("\n\n")
+	doc.WriteString(fmt.Sprintf("  Joining %d shard(s). Select which free workers to set to Manual mode:\n\n", len(m.joinPickerFilters)))
+
+	for i, wid := range m.joinPickerWorkers {
+		marker := "[ ]"
+		if m.joinPickerSelected[wid] {
+			marker = "[x]"
+		}
+		cursor := "  "
+		if i == m.joinPickerCursor {
+			cursor = "> "
+		}
+		line := fmt.Sprintf("%s%s Worker %d", cursor, marker, wid)
+		if i == m.joinPickerCursor {
+			line = mSelectedStyle.Render(line)
+		}
+		doc.WriteString(line)
+		doc.WriteString("\n")
+	}
+
+	doc.WriteString("\n")
+	doc.WriteString(mFooterStyle.Render("  space: toggle  J/enter: confirm join  esc: cancel"))
+
+	return doc.String()
 }
 
 // clampOffset adjusts the scroll offset so cursor is always visible.

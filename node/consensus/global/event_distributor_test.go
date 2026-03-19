@@ -87,6 +87,17 @@ func (m *mockWorkerManager) RequestJoin(ctx context.Context, filters [][]byte, d
 	return nil
 }
 
+func (m *mockWorkerManager) SetManuallyManaged(coreId uint, manual bool) error {
+	if w, ok := m.workers[coreId]; ok {
+		w.ManuallyManaged = manual
+	}
+	return nil
+}
+
+func (m *mockWorkerManager) ManuallyManagedFilters() map[string]struct{} {
+	return nil
+}
+
 var _ worker.WorkerManager = (*mockWorkerManager)(nil)
 
 func TestReconcileWorkerAllocations_RejectedAllocationClearsFilter(t *testing.T) {

@@ -256,6 +256,41 @@ func doResume(client protobufs.NodeServiceClient, filter []byte, originalStatus 
 	}
 }
 
+// doToggleManual sends a SetManuallyManaged RPC for the given worker.
+func doToggleManual(client protobufs.NodeServiceClient, coreId uint32, manual bool) tea.Cmd {
+	return func() tea.Msg {
+		_, err := client.SetManuallyManaged(
+			context.Background(),
+			&protobufs.SetManuallyManagedRequest{
+				CoreId:          coreId,
+				ManuallyManaged: manual,
+			},
+		)
+		return toggleManualMsg{coreId: coreId, newState: manual, err: err}
+	}
+}
+
+// doMarkWorkersManual marks one or more workers as manually managed.
+// Fire-and-forget: the result message is handled silently.
+func doMarkWorkersManual(client protobufs.NodeServiceClient, workerIDs []uint32) tea.Cmd {
+	return func() tea.Msg {
+		var firstErr error
+		for _, id := range workerIDs {
+			_, err := client.SetManuallyManaged(
+				context.Background(),
+				&protobufs.SetManuallyManagedRequest{
+					CoreId:          id,
+					ManuallyManaged: true,
+				},
+			)
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return markManualMsg{workerIDs: workerIDs, err: firstErr}
+	}
+}
+
 // sendAction broadcasts a prepared message to the network.
 func sendAction(client protobufs.NodeServiceClient, prepared actionPreparedMsg) tea.Cmd {
 	return func() tea.Msg {

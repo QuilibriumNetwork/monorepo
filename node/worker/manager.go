@@ -1199,6 +1199,60 @@ func (w *WorkerManager) RequestJoin(
 	return w.proposeFunc(coreIds[:len(filters)], filters, w.copyServiceClients())
 }
 
+func (w *WorkerManager) SetManuallyManaged(coreId uint, manual bool) error {
+	if !w.isStarted() {
+		return errors.New("worker manager not started")
+	}
+
+	worker, err := w.store.GetWorker(coreId)
+	if err != nil {
+		return errors.Wrap(err, "set manually managed")
+	}
+
+	if worker.ManuallyManaged == manual {
+		return nil
+	}
+
+	worker.ManuallyManaged = manual
+
+	txn, err := w.store.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "set manually managed")
+	}
+
+	if err := w.store.PutWorker(txn, worker); err != nil {
+		txn.Abort()
+		return errors.Wrap(err, "set manually managed")
+	}
+
+	if err := txn.Commit(); err != nil {
+		return errors.Wrap(err, "set manually managed")
+	}
+
+	w.logger.Info(
+		"worker manually managed flag updated",
+		zap.Uint("core_id", coreId),
+		zap.Bool("manually_managed", manual),
+	)
+	return nil
+}
+
+func (w *WorkerManager) ManuallyManagedFilters() map[string]struct{} {
+	workers, err := w.store.RangeWorkers()
+	if err != nil {
+		w.logger.Warn("could not range workers for manual filter check", zap.Error(err))
+		return nil
+	}
+
+	result := make(map[string]struct{})
+	for _, worker := range workers {
+		if worker.ManuallyManaged && len(worker.Filter) > 0 {
+			result[hex.EncodeToString(worker.Filter)] = struct{}{}
+		}
+	}
+	return result
+}
+
 func (w *WorkerManager) stopDataWorkers() {
 	for i := 0; i < w.dataWorkerLen(); i++ {
 		cmd := w.getDataWorker(i)

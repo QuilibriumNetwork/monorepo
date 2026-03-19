@@ -119,14 +119,14 @@ func (m *Manager) PlanAndAllocate(
 		return nil, nil
 	}
 
-	// Enumerate free workers (unallocated).
+	// Enumerate free workers (unallocated, not manually managed).
 	all, err := m.workerMgr.RangeWorkers()
 	if err != nil {
 		return nil, errors.Wrap(err, "plan and allocate")
 	}
 	free := make([]uint, 0, len(all))
 	for _, w := range all {
-		if len(w.Filter) == 0 {
+		if len(w.Filter) == 0 && !w.ManuallyManaged {
 			free = append(free, w.CoreId)
 		}
 	}
