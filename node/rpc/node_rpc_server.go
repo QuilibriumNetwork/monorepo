@@ -229,6 +229,17 @@ func (r *RPCServer) GetNodeInfo(
 	if proverInfo != nil {
 		currentFrame := r.proverRegistry.CurrentFrame()
 		for _, alloc := range proverInfo.Allocations {
+			// Only include actively-relevant allocations: Joining, Active,
+			// Paused, Leaving. Skip Unknown, Rejected, Kicked, and any
+			// future terminal states.
+			switch alloc.Status {
+			case consensus.ProverStatusJoining,
+				consensus.ProverStatusActive,
+				consensus.ProverStatusPaused,
+				consensus.ProverStatusLeaving:
+			default:
+				continue
+			}
 			// Omit expired joins and leaves, matching the proposer's logic
 			// in event_distributor.go (pendingFilterGraceFrames = 720).
 			if alloc.Status == consensus.ProverStatusJoining &&

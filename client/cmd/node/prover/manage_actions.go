@@ -280,7 +280,7 @@ func checkAllocationStatus(
 	originalStatus uint32,
 ) tea.Cmd {
 	return func() tea.Msg {
-		nodeInfo, shardInfo, err := fetchRPCData(client)
+		nodeInfo, shardInfo, _, err := fetchRPCData(client)
 		if err != nil {
 			return awaitResultMsg{action: action, err: err}
 		}

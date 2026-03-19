@@ -49,6 +49,7 @@ type allocationRow struct {
 	confirmFrame    uint64
 	leaveFrame      uint64
 	lastActiveFrame uint64
+	workerID        int // core_id, -1 if no worker assigned
 }
 
 type shardRow struct {
@@ -66,9 +67,10 @@ type shardRow struct {
 type tickMsg time.Time
 
 type dataRefreshMsg struct {
-	nodeInfo  *protobufs.NodeInfoResponse
-	shardInfo *protobufs.GetShardInfoResponse
-	err       error
+	nodeInfo   *protobufs.NodeInfoResponse
+	shardInfo  *protobufs.GetShardInfoResponse
+	workerInfo *protobufs.WorkerInfoResponse
+	err        error
 }
 
 type actionResultMsg struct {
@@ -138,6 +140,7 @@ const SIZE_WIDTH = 10
 const PROVERS_WIDTH = 7
 const RING_WIDTH = 5
 const REWARD_WIDTH = 20
+const WORKER_WIDTH = 7
 
 func newManageKeyMap() manageKeyMap {
 	return manageKeyMap{
@@ -293,11 +296,12 @@ func tickEvery(d time.Duration) tea.Cmd {
 
 func fetchData(client protobufs.NodeServiceClient) tea.Cmd {
 	return func() tea.Msg {
-		nodeInfo, shardInfo, err := fetchRPCData(client)
+		nodeInfo, shardInfo, workerInfo, err := fetchRPCData(client)
 		return dataRefreshMsg{
-			nodeInfo:  nodeInfo,
-			shardInfo: shardInfo,
-			err:       err,
+			nodeInfo:   nodeInfo,
+			shardInfo:  shardInfo,
+			workerInfo: workerInfo,
+			err:        err,
 		}
 	}
 }
@@ -328,7 +332,7 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusIsError = true
 			return m, nil
 		}
-		m.processRefreshData(msg.nodeInfo, msg.shardInfo)
+		m.processRefreshData(msg.nodeInfo, msg.shardInfo, msg.workerInfo)
 		if !m.actionInFlight {
 			m.statusMsg = ""
 			m.statusIsError = false
@@ -767,6 +771,7 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *manageModel) processRefreshData(
 	nodeInfo *protobufs.NodeInfoResponse,
 	shardInfo *protobufs.GetShardInfoResponse,
+	workerInfo *protobufs.WorkerInfoResponse,
 ) {
 	// Header.
 	m.peerId = nodeInfo.GetPeerId()
@@ -783,6 +788,14 @@ func (m *manageModel) processRefreshData(
 		m.difficulty = shardInfo.GetDifficulty()
 	}
 
+	// Build a map of worker core_id by filter hex.
+	workers := make(map[string]uint32)
+	if workerInfo != nil {
+		for _, w := range workerInfo.GetWorkerInfo() {
+			workers[hex.EncodeToString(w.GetFilter())] = w.GetCoreId()
+		}
+	}
+
 	// Build a map of shard reward info by filter for enrichment.
 	rewardByFilter := make(map[string]*protobufs.ShardRewardInfo)
 	allocatedFilters := make(map[string]bool)
@@ -796,8 +809,9 @@ func (m *manageModel) processRefreshData(
 	// Build allocations from NodeInfo, enriched with ShardInfo.
 	allocs := make([]allocationRow, 0, len(nodeInfo.GetShardAllocations()))
 	for _, a := range nodeInfo.GetShardAllocations() {
-		//skip unknown, rejected and kicked allocations
-		if a.GetStatus() == 0 || a.GetStatus() == 5 || a.GetStatus() == 6 {
+		// Only show allocations the prover is actively participating in.
+		s := a.GetStatus()
+		if s != 1 && s != 2 && s != 3 && s != 4 {
 			continue
 		}
 		filterHex := hex.EncodeToString(a.GetFilter())
@@ -825,6 +839,11 @@ func (m *manageModel) processRefreshData(
 			}
 		}
 
+		wid := -1
+		if id, ok := workers[filterHex]; ok {
+			wid = int(id)
+		}
+
 		row := allocationRow{
 			filter:          a.GetFilter(),
 			filterKey:       filterHex,
@@ -837,6 +856,7 @@ func (m *manageModel) processRefreshData(
 			lastActiveFrame: a.GetLastActiveFrameNumber(),
 			shardSize:       big.NewInt(0),
 			estimatedReward: big.NewInt(0),
+			workerID:        wid,
 		}
 
 		if info, ok := rewardByFilter[filterHex]; ok {
@@ -1037,11 +1057,11 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	// Column header.
 	var hdr string
 	if hasSelections {
-		hdr = fmt.Sprintf("    %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-			"Filter", "Provers", "Ring", "Size", "Reward", "Status")
+		hdr = fmt.Sprintf("    %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
+			"Worker", "Filter", "Provers", "Ring", "Size", "Reward", "Status")
 	} else {
-		hdr = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-			"Filter", "Provers", "Ring", "Size", "Reward", "Status")
+		hdr = fmt.Sprintf("  %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
+			"Worker", "Filter", "Provers", "Ring", "Size", "Reward", "Status")
 	}
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
 
@@ -1059,14 +1079,19 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 
 	for i := m.allocOffset; i < end; i++ {
 		a := filtered[i]
+		workerStr := "-"
+		if a.workerID >= 0 {
+			workerStr = strconv.Itoa(a.workerID)
+		}
 		var line string
 		if hasSelections {
 			marker := "[ ]"
 			if m.allocSelected[a.filterKey] {
 				marker = "[x]"
 			}
-			line = fmt.Sprintf("%s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
+			line = fmt.Sprintf("%s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
 				marker,
+				workerStr,
 				a.filterHex,
 				a.activeProvers,
 				a.ring,
@@ -1075,7 +1100,8 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 				a.statusName,
 			)
 		} else {
-			line = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
+			line = fmt.Sprintf("  %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
+				workerStr,
 				a.filterHex,
 				a.activeProvers,
 				a.ring,
@@ -1180,14 +1206,14 @@ func truncHex(h string) string {
 	return h
 }
 
-// fetchRPCData calls both GetNodeInfo and GetShardInfo.
-func fetchRPCData(client protobufs.NodeServiceClient) (*protobufs.NodeInfoResponse, *protobufs.GetShardInfoResponse, error) {
+// fetchRPCData calls GetNodeInfo, GetShardInfo, and GetWorkerInfo.
+func fetchRPCData(client protobufs.NodeServiceClient) (*protobufs.NodeInfoResponse, *protobufs.GetShardInfoResponse, *protobufs.WorkerInfoResponse, error) {
 	nodeInfo, err := client.GetNodeInfo(
 		context.Background(),
 		&protobufs.GetNodeInfoRequest{},
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("GetNodeInfo: %w", err)
+		return nil, nil, nil, fmt.Errorf("GetNodeInfo: %w", err)
 	}
 
 	shardInfo, err := client.GetShardInfo(
@@ -1196,8 +1222,16 @@ func fetchRPCData(client protobufs.NodeServiceClient) (*protobufs.NodeInfoRespon
 	)
 	if err != nil {
 		// Shard info is optional - we can still show allocations.
-		return nodeInfo, nil, nil
+		shardInfo = nil
 	}
 
-	return nodeInfo, shardInfo, nil
+	workerInfo, err := client.GetWorkerInfo(
+		context.Background(),
+		&protobufs.GetWorkerInfoRequest{},
+	)
+	if err != nil {
+		workerInfo = nil
+	}
+
+	return nodeInfo, shardInfo, workerInfo, nil
 }

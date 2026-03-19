@@ -77,6 +77,8 @@ and shard allocations.
 			return
 		}
 
+		workers := workerByFilter(client)
+
 		fmt.Printf("\nShard Allocations (%d):\n", len(allocations))
 		for i, alloc := range allocations {
 			statusName, ok := allocationStatusNames[alloc.GetStatus()]
@@ -86,11 +88,13 @@ and shard allocations.
 
 			filter := alloc.GetFilter()
 			filterHex := hex.EncodeToString(filter)
-			if len(filterHex) > 16 {
-				filterHex = filterHex[:16] + "..."
+
+			workerStr := ""
+			if wid, ok := workers[filterHex]; ok {
+				workerStr = fmt.Sprintf("  Worker: %d", wid)
 			}
 
-			fmt.Printf("  [%d] Filter: %s  Status: %s\n", i, filterHex, statusName)
+			fmt.Printf("  [%d] Filter: %s  Status: %s%s\n", i, filterHex, statusName, workerStr)
 
 			if alloc.GetJoinFrameNumber() > 0 {
 				fmt.Printf("      Join Frame: %d", alloc.GetJoinFrameNumber())
@@ -116,9 +120,6 @@ and shard allocations.
 			fmt.Printf("\nWorkers (%d):\n", len(workerInfo.GetWorkerInfo()))
 			for _, w := range workerInfo.GetWorkerInfo() {
 				filterHex := hex.EncodeToString(w.GetFilter())
-				if len(filterHex) > 16 {
-					filterHex = filterHex[:16] + "..."
-				}
 				fmt.Printf("  Core %d: Filter: %s  Storage: %s / %s\n",
 					w.GetCoreId(),
 					filterHex,
