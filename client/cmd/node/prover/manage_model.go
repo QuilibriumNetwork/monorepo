@@ -50,6 +50,8 @@ type allocationRow struct {
 	leaveFrame      uint64
 	lastActiveFrame uint64
 	workerID        int // core_id, -1 if no worker assigned
+	nextAction      string
+	defaultAction   string
 }
 
 type shardRow struct {
@@ -134,13 +136,18 @@ type manageKeyMap struct {
 }
 
 // Constants
+const SELECT_WIDTH = 6
 const FILTER_WIDTH = 70
-const STATUS_WIDTH = 16
-const SIZE_WIDTH = 10
 const PROVERS_WIDTH = 7
 const RING_WIDTH = 5
+const SIZE_WIDTH = 10
 const REWARD_WIDTH = 20
 const WORKER_WIDTH = 7
+const STATUS_WIDTH = 8
+const NEXT_ACTION_WIDTH = 30
+const DEFAULT_ACTION_WIDTH = 16
+
+const ACTION_FRAME_DELAY = 360
 
 func newManageKeyMap() manageKeyMap {
 	return manageKeyMap{
@@ -822,21 +829,27 @@ func (m *manageModel) processRefreshData(
 			statusName = fmt.Sprintf("Unknown(%d)", a.GetStatus())
 		}
 
+		nextAction := ""
+		defaultAction := ""
 		// For Pending (Joining) and Leaving, annotate with confirmable frame.
-		if a.GetStatus() == 1 && a.GetJoinFrameNumber() > 0 {
-			confirmAt := a.GetJoinFrameNumber() + 360
-			if m.frameNumber >= confirmAt {
-				statusName = "Confirm Now"
+		if (a.GetStatus() == 1 || a.GetStatus() == 4) && a.GetJoinFrameNumber() > 0 {
+
+			actionFrame := a.GetJoinFrameNumber() + ACTION_FRAME_DELAY
+			expiryFrame := a.GetJoinFrameNumber() + ACTION_FRAME_DELAY*2
+			if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
+				nextAction = "Reject@now | Confirm@now"
 			} else {
-				statusName = fmt.Sprintf("Pending @%d", confirmAt)
+				nextAction = fmt.Sprintf("Reject@now | Confirm@%d", actionFrame)
 			}
-		} else if a.GetStatus() == 4 && a.GetLeaveFrameNumber() > 0 {
-			confirmAt := a.GetLeaveFrameNumber() + 360
-			if m.frameNumber >= confirmAt {
-				statusName = "Confirm Now"
-			} else {
-				statusName = fmt.Sprintf("Leaving @%d", confirmAt)
+			if a.GetStatus() == 1 && m.frameNumber < expiryFrame {
+				defaultAction = fmt.Sprintf("Reject@%d", expiryFrame)
+			} else if a.GetStatus() == 4 && m.frameNumber < expiryFrame {
+				defaultAction = fmt.Sprintf("Confirm@%d", expiryFrame)
 			}
+		} else if a.GetStatus() == 2 {
+			nextAction = "Pause@now | Leave@now"
+		} else if a.GetStatus() == 3 {
+			nextAction = "Resume@now | Leave@now"
 		}
 
 		wid := -1
@@ -857,6 +870,8 @@ func (m *manageModel) processRefreshData(
 			shardSize:       big.NewInt(0),
 			estimatedReward: big.NewInt(0),
 			workerID:        wid,
+			nextAction:      nextAction,
+			defaultAction:   defaultAction,
 		}
 
 		if info, ok := rewardByFilter[filterHex]; ok {
@@ -946,9 +961,6 @@ func (m manageModel) renderView() string {
 
 	// Header bar.
 	peerDisplay := m.peerId
-	if len(peerDisplay) > 16 {
-		peerDisplay = peerDisplay[:8] + ".." + peerDisplay[len(peerDisplay)-6:]
-	}
 	reachStr := "OK"
 	if !m.reachable {
 		reachStr = "UNREACHABLE"
@@ -986,12 +998,32 @@ func (m manageModel) renderView() string {
 
 	// Allocations panel.
 	filteredAllocs := m.filteredAllocations()
-	totalPerFrame := big.NewInt(0)
+	activePerFrame := big.NewInt(0)
+	pendingPerFrame := big.NewInt(0)
+	pausedPerFrame := big.NewInt(0)
+	leavingPerFrame := big.NewInt(0)
 	for _, a := range filteredAllocs {
-		totalPerFrame.Add(totalPerFrame, a.estimatedReward)
+		switch a.status {
+		case 1:
+			pendingPerFrame.Add(pendingPerFrame, a.estimatedReward)
+		case 2:
+			activePerFrame.Add(activePerFrame, a.estimatedReward)
+		case 3:
+			pausedPerFrame.Add(pausedPerFrame, a.estimatedReward)
+		case 4:
+			leavingPerFrame.Add(leavingPerFrame, a.estimatedReward)
+		}
+
 	}
-	allocTitle := fmt.Sprintf(" Your Allocations (%d) ~%s QUIL/day",
-		len(filteredAllocs), formatQUILDaily(totalPerFrame))
+	totalPerFrame := big.NewInt(0)
+	totalPerFrame.Add(totalPerFrame, pendingPerFrame)
+	totalPerFrame.Add(totalPerFrame, activePerFrame)
+	totalPerFrame.Add(totalPerFrame, pausedPerFrame)
+	totalPerFrame.Add(totalPerFrame, leavingPerFrame)
+
+	allocTitle := fmt.Sprintf("Allocations (%d) Rewards: Total ~%s QUIL/day = Pending ~%s QUIL/day + Active ~%s QUIL/day + Paused ~%s QUIL/day + Leaving ~%s QUIL/day",
+		len(filteredAllocs), formatQUILDaily(totalPerFrame), formatQUILDaily(pendingPerFrame), formatQUILDaily(activePerFrame),
+		formatQUILDaily(pausedPerFrame), formatQUILDaily(leavingPerFrame))
 	if n := len(m.allocSelected); n > 0 {
 		allocTitle += fmt.Sprintf(" [%d selected]", n)
 	}
@@ -1052,17 +1084,12 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		return "  No allocations"
 	}
 
-	hasSelections := len(m.allocSelected) > 0
-
 	// Column header.
 	var hdr string
-	if hasSelections {
-		hdr = fmt.Sprintf("    %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-			"Worker", "Filter", "Provers", "Ring", "Size", "Reward", "Status")
-	} else {
-		hdr = fmt.Sprintf("  %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-			"Worker", "Filter", "Provers", "Ring", "Size", "Reward", "Status")
-	}
+	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s "+
+		"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(STATUS_WIDTH)+"s "+
+		"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
+		"Select", "Filter", "Provers", "Ring", "Size", "Reward", "Worker", "Status", "Next Action", "Default Action")
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
 
 	// Compute visible window.
@@ -1079,37 +1106,25 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 
 	for i := m.allocOffset; i < end; i++ {
 		a := filtered[i]
-		workerStr := "-"
-		if a.workerID >= 0 {
-			workerStr = strconv.Itoa(a.workerID)
-		}
 		var line string
-		if hasSelections {
-			marker := "[ ]"
-			if m.allocSelected[a.filterKey] {
-				marker = "[x]"
-			}
-			line = fmt.Sprintf("%s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-				marker,
-				workerStr,
-				a.filterHex,
-				a.activeProvers,
-				a.ring,
-				formatStorage(a.shardSize.Uint64()),
-				"~"+formatQUIL(a.estimatedReward)+" Q/f",
-				a.statusName,
-			)
-		} else {
-			line = fmt.Sprintf("  %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-				workerStr,
-				a.filterHex,
-				a.activeProvers,
-				a.ring,
-				formatStorage(a.shardSize.Uint64()),
-				"~"+formatQUIL(a.estimatedReward)+" Q/f",
-				a.statusName,
-			)
+		marker := "[ ]"
+		if m.allocSelected[a.filterKey] {
+			marker = "[x]"
 		}
+		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
+			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"d %"+strconv.Itoa(STATUS_WIDTH)+"s "+
+			"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
+			marker,
+			a.filterHex,
+			a.activeProvers,
+			a.ring,
+			formatStorage(a.shardSize.Uint64()),
+			"~"+formatQUIL(a.estimatedReward)+" Q/f",
+			a.workerID,
+			a.statusName,
+			a.nextAction,
+			a.defaultAction,
+		)
 		if i == m.allocCursor && m.focus == allocationsPanel {
 			line = mSelectedStyle.Width(width).Render(line)
 		}
@@ -1125,16 +1140,9 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		return "  No available shards"
 	}
 
-	hasSelections := len(m.availSelected) > 0
-
 	var hdr string
-	if hasSelections {
-		hdr = fmt.Sprintf("    %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-			"Filter", "Provers", "Ring", "Size", "Reward")
-	} else {
-		hdr = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-			"Filter", "Provers", "Ring", "Size", "Reward")
-	}
+	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
+		"Select", "Filter", "Provers", "Ring", "Size", "Reward")
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
 
 	visibleRows := height - 1
@@ -1151,28 +1159,18 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	for i := m.availOffset; i < end; i++ {
 		s := filtered[i]
 		var line string
-		if hasSelections {
-			marker := "[ ]"
-			if m.availSelected[s.filterKey] {
-				marker = "[x]"
-			}
-			line = fmt.Sprintf("%s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-				marker,
-				s.filterHex,
-				s.activeProvers,
-				s.ring,
-				formatStorage(s.shardSize.Uint64()),
-				"~"+formatQUIL(s.estimatedReward)+" Q/f",
-			)
-		} else {
-			line = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-				s.filterHex,
-				s.activeProvers,
-				s.ring,
-				formatStorage(s.shardSize.Uint64()),
-				"~"+formatQUIL(s.estimatedReward)+" Q/f",
-			)
+		marker := "[ ]"
+		if m.availSelected[s.filterKey] {
+			marker = "[x]"
 		}
+		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
+			marker,
+			s.filterHex,
+			s.activeProvers,
+			s.ring,
+			formatStorage(s.shardSize.Uint64()),
+			"~"+formatQUIL(s.estimatedReward)+" Q/f",
+		)
 		if i == m.availCursor && m.focus == availablePanel {
 			line = mSelectedStyle.Width(width).Render(line)
 		}
