@@ -443,7 +443,9 @@ func (m *Manager) DecideJoins(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			reject = append(reject, pc)
+			m.logger.Debug("added shard to reject list", zap.String("shard", hex.EncodeToString(p)))
 		}
+		m.logger.Info("rejecting all pending allocations")
 		return m.workerMgr.DecideAllocations(reject, nil)
 	}
 
@@ -477,6 +479,7 @@ func (m *Manager) DecideJoins(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			reject = append(reject, pc)
+			m.logger.Debug("added shard to reject list", zap.String("shard", hex.EncodeToString(p)))
 			continue
 		}
 
@@ -487,15 +490,20 @@ func (m *Manager) DecideJoins(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			reject = append(reject, pc)
+			m.logger.Debug("added shard to reject list", zap.String("shard", hex.EncodeToString(p)),
+				zap.String("score", rec.score.String()), zap.String("threashold", rejectThreshold.String()))
 		} else {
 			// Otherwise confirm - score is within acceptable range of best
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			confirm = append(confirm, pc)
+			m.logger.Debug("added shard to confirm list", zap.String("shard", hex.EncodeToString(p)),
+				zap.String("score", rec.score.String()), zap.String("threashold", rejectThreshold.String()))
 		}
 	}
 
 	if len(reject) > 0 {
+		m.logger.Info("rejecting some pending allocations")
 		return m.workerMgr.DecideAllocations(reject, nil)
 	} else {
 		if availableWorkers == 0 && len(confirm) > 0 {
@@ -512,6 +520,7 @@ func (m *Manager) DecideJoins(
 			)
 			confirm = confirm[:availableWorkers]
 		}
+		m.logger.Info("confirming some pending allocations")
 		return m.workerMgr.DecideAllocations(nil, confirm)
 	}
 }
