@@ -306,6 +306,12 @@ message SetManuallyManagedRequest {
 message SetManuallyManagedResponse {
 }
 
+message SubmitMessageRequest {
+  bytes data = 1; // canonical bytes (type prefix + serialized MessageBundle)
+}
+
+message SubmitMessageResponse {}
+
 service NodeService {
   rpc GetPeerInfo(GetPeerInfoRequest) returns (PeerInfoResponse);
   rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
@@ -321,6 +327,9 @@ service NodeService {
   rpc GetShardInfo(GetShardInfoRequest) returns (GetShardInfoResponse);
   rpc RequestJoin(RequestJoinRequest) returns (RequestJoinResponse);
   rpc SetManuallyManaged(SetManuallyManagedRequest) returns (SetManuallyManagedResponse);
+  rpc GetLatestFrame(quilibrium.node.global.pb.GetGlobalFrameRequest)
+    returns (quilibrium.node.global.pb.GlobalFrameResponse);
+  rpc SubmitMessage(SubmitMessageRequest) returns (SubmitMessageResponse);
 }
 
 message ConnectivityTestRequest {

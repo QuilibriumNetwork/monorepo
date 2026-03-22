@@ -462,7 +462,7 @@ pub fn commit_raw(
   while poly.len() < poly_size as usize {
     poly.push(big::BIG::new());
   }
-  match point_linear_combination(
+  match point_linear_combination_fast(
 		&bls::singleton().FFTBLS48581[&poly_size],
 		&poly,
 	) {
@@ -489,7 +489,7 @@ pub fn prove_raw(
 
   let z = bls::singleton().RootsOfUnityBLS48581[&poly_size][index as usize];
 
-  match fft(
+  match fft_fast(
     &poly,
     poly_size,
     true,
@@ -538,7 +538,7 @@ pub fn prove_raw(
         diff -= 1;
       }
     
-      match point_linear_combination(
+      match point_linear_combination_fast(
         &bls::singleton().CeremonyBLS48581G1[..(poly_size as usize - 1)],
         &out,
       ) {
@@ -632,7 +632,7 @@ pub fn commit_raw_full(
   while poly.len() < poly_size as usize {
     poly.push(big::BIG::new());
   }
-  match point_linear_combination(
+  match point_linear_combination_fast(
     &bls::singleton().FFTBLS48581[&poly_size],
     &poly,
   ) {
@@ -661,10 +661,10 @@ pub fn prove_raw_full(
 
   let z = bls::singleton().RootsOfUnityBLS48581[&poly_size][index as usize];
 
-  match fft(&poly, poly_size, true) {
+  match fft_fast(&poly, poly_size, true) {
     Ok(coeffs) => {
       let q = div_by_linear(&coeffs, &z);
-      match point_linear_combination(
+      match point_linear_combination_fast(
         &bls::singleton().CeremonyBLS48581G1[..q.len()],
         &q,
       ) {
@@ -693,7 +693,7 @@ pub fn commit_scalars(
   while poly.len() < poly_size as usize {
     poly.push(big::BIG::new());
   }
-  match point_linear_combination(
+  match point_linear_combination_fast(
     &bls::singleton().FFTBLS48581[&poly_size],
     &poly,
   ) {
@@ -715,7 +715,7 @@ pub fn commit_scalars(
 pub fn commit_scalars_monomial(
   coeffs: &[big::BIG],
 ) -> Vec<u8> {
-  match point_linear_combination(
+  match point_linear_combination_fast(
     &bls::singleton().CeremonyBLS48581G1[..coeffs.len()],
     &coeffs.to_vec(),
   ) {
@@ -1018,7 +1018,7 @@ pub fn prove_multiple(
     for ((index, blob), (&idx, y_i)) in polys.iter().enumerate().zip(indices.iter().zip(y.iter())) {
         let mut f_eval = bytes_to_polynomial(blob);
         while f_eval.len() < poly_size as usize { f_eval.push(big::BIG::new()); }
-        let coeffs = fft(&f_eval, poly_size, true).unwrap();    // coeff form
+        let coeffs = fft_fast(&f_eval, poly_size, true).unwrap();    // coeff form
         f_evals.push(coeffs.clone());
 
         // 2a. divide by (X − zᵢ)
@@ -1045,7 +1045,7 @@ pub fn prove_multiple(
     );
     qx.push(big::BIG::new());
 
-    let c_q = &point_linear_combination(
+    let c_q = &point_linear_combination_fast(
       &bls::singleton().CeremonyBLS48581G1[..(qx.len())],
       &qx,
     ).unwrap();
@@ -1075,7 +1075,7 @@ pub fn prove_multiple(
       vec![big::BIG::new(); poly_size as usize],
       |acc, q| acc.iter().zip(q).map(|(a,b)| big::BIG::modadd(a,b,&modulus)).collect(),
     );
-    let c_h = &point_linear_combination(
+    let c_h = &point_linear_combination_fast(
       &bls::singleton().CeremonyBLS48581G1[..(hx.len())],
       &hx,
     ).unwrap();
@@ -1102,7 +1102,7 @@ pub fn prove_multiple(
     // (g2 − q_t)/(X − t)
     let g2div = div_by_linear(&g2x, &t);
 
-    let proof = point_linear_combination(
+    let proof = point_linear_combination_fast(
         &bls::singleton().CeremonyBLS48581G1[..g2div.len()],
         &g2div
     ).unwrap();
@@ -1183,7 +1183,7 @@ pub fn verify_multiple(
     }
 
     // commit = E-D
-    let mut commit = point_linear_combination(&c_points, &scalars).unwrap();
+    let mut commit = point_linear_combination_fast(&c_points, &scalars).unwrap();
     let mut e_bytes = [0u8; 74];
     commit.tobytes(&mut e_bytes, true);
     commit.sub(&c_q);

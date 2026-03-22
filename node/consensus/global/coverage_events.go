@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"math/big"
 
 	"github.com/pkg/errors"
@@ -93,10 +94,13 @@ func (e *GlobalConsensusEngine) checkShardCoverage(
 
 	// Set up the streak map so we can quickly establish halt conditions on
 	// restarts
+	e.lowCoverageStreakMu.Lock()
 	err := e.ensureStreakMap(frameNumber)
 	if err != nil {
+		e.lowCoverageStreakMu.Unlock()
 		return errors.Wrap(err, "check shard coverage")
 	}
+	e.lowCoverageStreakMu.Unlock()
 
 	// Update state summaries metric
 	stateSummariesAggregated.Set(float64(len(shardCoverageMap)))
@@ -675,11 +679,27 @@ func (e *GlobalConsensusEngine) ensureStreakMap(frameNumber uint64) error {
 	}
 
 	for shardKey, coverage := range effectiveCoverage {
+		staleness := uint64(0)
+		if frameNumber > lastFrame[shardKey] {
+			staleness = frameNumber - lastFrame[shardKey]
+		}
 		if coverage <= int(haltThreshold) {
+			// Currently halted — record the full staleness as the streak
 			e.lowCoverageStreak[shardKey] = &coverageStreak{
 				StartFrame: lastFrame[shardKey],
 				LastFrame:  frameNumber,
-				Count:      frameNumber - lastFrame[shardKey],
+				Count:      staleness,
+			}
+		} else if staleness > 1 {
+			// Shard has recovered but all provers are still stale from a
+			// prior halt. Record the gap so eviction subtracts it. Without
+			// this, a reboot after halt recovery would lose the in-memory
+			// streak data and immediately evict everyone. The streak will
+			// be cleared once provers submit and clearStreak runs.
+			e.lowCoverageStreak[shardKey] = &coverageStreak{
+				StartFrame: lastFrame[shardKey],
+				LastFrame:  frameNumber,
+				Count:      staleness,
 			}
 		}
 	}
@@ -691,6 +711,9 @@ func (e *GlobalConsensusEngine) bumpStreak(
 	shardKey string,
 	frame uint64,
 ) (*coverageStreak, error) {
+	e.lowCoverageStreakMu.Lock()
+	defer e.lowCoverageStreakMu.Unlock()
+
 	err := e.ensureStreakMap(frame)
 	if err != nil {
 		return nil, errors.Wrap(err, "bump streak")
@@ -713,7 +736,60 @@ func (e *GlobalConsensusEngine) bumpStreak(
 }
 
 func (e *GlobalConsensusEngine) clearStreak(shardKey string) {
+	e.lowCoverageStreakMu.Lock()
+	defer e.lowCoverageStreakMu.Unlock()
+
 	if e.lowCoverageStreak != nil {
 		delete(e.lowCoverageStreak, shardKey)
 	}
+}
+
+// computeShardHaltDurations returns a map from shard filter to the number of
+// frames the shard has been in a halt state. Shards currently at or below
+// haltThreshold get math.MaxUint64 so eviction is fully suppressed. Shards
+// that recently recovered but still have a coverage streak get the streak
+// count so that the halt period is subtracted from the inactivity window.
+func (e *GlobalConsensusEngine) computeShardHaltDurations(
+	frameNumber uint64,
+) map[string]uint64 {
+	e.ensureCoverageThresholds()
+
+	durations := make(map[string]uint64)
+
+	// Ensure the streak map is initialized (reconstructs halt data from
+	// prover LastActiveFrameNumber on first call after a restart).
+	// Return nil if initialization fails — caller skips eviction.
+	e.lowCoverageStreakMu.Lock()
+	if err := e.ensureStreakMap(frameNumber); err != nil {
+		e.lowCoverageStreakMu.Unlock()
+		e.logger.Error("failed to ensure streak map for eviction",
+			zap.Error(err),
+		)
+		return nil
+	}
+
+	// Snapshot the streak counts.
+	for shardKey, streak := range e.lowCoverageStreak {
+		if streak != nil && streak.Count > 0 {
+			durations[shardKey] = streak.Count
+		}
+	}
+	e.lowCoverageStreakMu.Unlock()
+
+	// Shards currently at or below haltThreshold are fully exempt even if
+	// they don't have a streak entry yet (e.g. first frame of low coverage).
+	summaries, err := e.proverRegistry.GetProverShardSummaries()
+	if err != nil {
+		e.logger.Error("failed to get shard summaries for eviction exemption",
+			zap.Error(err),
+		)
+		return durations
+	}
+	for _, s := range summaries {
+		activeCount := s.StatusCounts[typesconsensus.ProverStatusActive]
+		if uint64(activeCount) <= haltThreshold {
+			durations[string(s.Filter)] = math.MaxUint64
+		}
+	}
+	return durations
 }

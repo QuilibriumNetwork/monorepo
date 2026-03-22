@@ -46,6 +46,9 @@ func (p *AppVotingProvider) FinalizeQuorumCertificate(
 		frameBytes,
 	)
 
+	// Submit shard frame header to master via gRPC for reliable delivery.
+	go p.engine.submitShardFrameToMaster(cloned.Header)
+
 	return &protobufs.QuorumCertificate{
 		Filter:      (*state.State).Header.Address,
 		Rank:        (*state.State).GetRank(),

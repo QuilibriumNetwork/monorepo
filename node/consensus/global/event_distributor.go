@@ -213,10 +213,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 						}
 
 						// Publish the kick message
-						if err := e.pubsub.PublishToBitmask(
-							GLOBAL_PROVER_BITMASK,
-							kickBytes,
-						); err != nil {
+						if err := e.publishProverMessage(kickBytes); err != nil {
 							e.logger.Error("failed to publish prover kick", zap.Error(err))
 						} else {
 							e.logger.Info(
@@ -445,10 +442,7 @@ func (e *GlobalConsensusEngine) handleShardSplitEvent(
 		return
 	}
 
-	if err := e.pubsub.PublishToBitmask(
-		GLOBAL_PROVER_BITMASK,
-		splitBytes,
-	); err != nil {
+	if err := e.publishProverMessage(splitBytes); err != nil {
 		e.logger.Error("failed to publish shard split", zap.Error(err))
 	} else {
 		e.logger.Info(
@@ -523,10 +517,7 @@ func (e *GlobalConsensusEngine) handleShardMergeEvent(
 			continue
 		}
 
-		if err := e.pubsub.PublishToBitmask(
-			GLOBAL_PROVER_BITMASK,
-			mergeBytes,
-		); err != nil {
+		if err := e.publishProverMessage(mergeBytes); err != nil {
 			e.logger.Error("failed to publish shard merge", zap.Error(err))
 		} else {
 			e.logger.Info(

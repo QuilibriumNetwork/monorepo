@@ -142,6 +142,22 @@ func (m *mockNodeServiceClient) SetManuallyManaged(
 	return &protobufs.SetManuallyManagedResponse{}, nil
 }
 
+func (m *mockNodeServiceClient) GetLatestFrame(
+	ctx context.Context,
+	in *protobufs.GetGlobalFrameRequest,
+	opts ...grpc.CallOption,
+) (*protobufs.GlobalFrameResponse, error) {
+	return &protobufs.GlobalFrameResponse{}, nil
+}
+
+func (m *mockNodeServiceClient) SubmitMessage(
+	ctx context.Context,
+	in *protobufs.SubmitMessageRequest,
+	opts ...grpc.CallOption,
+) (*protobufs.SubmitMessageResponse, error) {
+	return &protobufs.SubmitMessageResponse{}, nil
+}
+
 // ---------------------------------------------------------------------------
 // mockSigner
 // ---------------------------------------------------------------------------

@@ -154,6 +154,19 @@ type ProverRegistry interface {
 	// expired joins.
 	PruneOrphanJoins(frameNumber uint64) error
 
+	// EvictInactiveProvers kicks provers that have any allocation inactive for
+	// more than the given threshold, accounting for halt durations.
+	// shardHaltDurations maps shard filter keys to the number of frames the
+	// shard has been halted. math.MaxUint64 means fully exempt (currently
+	// halted). Any other value is subtracted from the inactivity window.
+	// Returns addresses of evicted provers.
+	EvictInactiveProvers(
+		frameNumber uint64,
+		inactivityThreshold uint64,
+		shardHaltDurations map[string]uint64,
+		state state.State,
+	) ([][]byte, error)
+
 	// CurrentFrame returns the last frame number processed by the registry.
 	CurrentFrame() uint64
 }

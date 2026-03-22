@@ -44,6 +44,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	qruntime "source.quilibrium.com/quilibrium/monorepo/utils/runtime"
 )
 
@@ -175,6 +176,7 @@ var capabilityLabels = map[uint32]string{
 	0x00020001: "Global Protocol v1",
 	0x00030001: "Hypergraph Protocol v1",
 	0x00040001: "Token Protocol v1",
+	0x00050001: "Archive Service v1",
 	0x0101:     "Double Ratchet v1",
 	0x0201:     "Triple Ratchet v1",
 	0x0301:     "Onion Routing v1",
@@ -700,6 +702,64 @@ func main() {
 		logger.Panic("failed to create master node", zap.Error(err))
 	}
 
+	// Config-driven archive client: connect to a pre-configured archive
+	// endpoint using mTLS. Non-archive nodes use this instead of bitmask
+	// subscriptions for frame retrieval and message submission.
+	if nodeConfig.Engine != nil &&
+		!nodeConfig.Engine.ArchiveMode &&
+		len(nodeConfig.Engine.ArchiveEndpoints) > 0 {
+		for _, endpoint := range nodeConfig.Engine.ArchiveEndpoints {
+			maddr, err := multiaddr.NewMultiaddr(endpoint)
+			if err != nil {
+				logger.Warn("failed to parse archive endpoint",
+					zap.String("endpoint", endpoint),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			mga, err := mn.ToNetAddr(maddr)
+			if err != nil {
+				logger.Warn("failed to convert archive multiaddr",
+					zap.String("endpoint", endpoint),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			creds, err := p2p.NewPeerAuthenticator(
+				logger, nodeConfig.P2P,
+				nil, nil, nil, nil, nil, nil, nil,
+			).CreateClientTLSCredentials(nil)
+			if err != nil {
+				logger.Warn("failed to create mTLS credentials for archive",
+					zap.Error(err),
+				)
+				continue
+			}
+
+			conn, err := grpc.NewClient(
+				mga.String(),
+				grpc.WithTransportCredentials(creds),
+			)
+			if err != nil {
+				logger.Warn("failed to create archive gRPC client",
+					zap.String("addr", mga.String()),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			client := protobufs.NewGlobalServiceClient(conn)
+			archiveClient := rpc.NewArchiveClient(client, conn, logger)
+			masterNode.GetGlobalConsensusEngine().SetArchiveClient(archiveClient)
+			logger.Info("archive client configured from config",
+				zap.String("endpoint", endpoint),
+			)
+			break
+		}
+	}
+
 	// Start the master node
 	ctx, quit := context.WithCancel(context.Background())
 	errCh := masterNode.Start(ctx)
@@ -707,6 +767,13 @@ func main() {
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
+
+	// GlobalFrameService is provided by the consensus engine on all nodes.
+	// It powers GetLatestFrame/SubmitMessage RPCs and Send()'s global domain
+	// message relay through the engine.
+	globalFrameService := typesconsensus.GlobalFrameService(
+		masterNode.GetGlobalConsensusEngine(),
+	)
 
 	if nodeConfig.ListenGRPCMultiaddr != "" {
 		srv, err := rpc.NewRPCServer(
@@ -720,6 +787,7 @@ func main() {
 			masterNode.GetExecutionEngineManager(),
 			masterNode.GetGlobalConsensusEngine(),
 			masterNode.GetCoinStore(),
+			globalFrameService,
 		)
 		if err != nil {
 			logger.Panic("failed to new rpc server", zap.Error(err))

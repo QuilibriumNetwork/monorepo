@@ -19,7 +19,9 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"source.quilibrium.com/quilibrium/monorepo/config"
@@ -55,6 +57,7 @@ type RPCServer struct {
 	shardInfoProvider consensus.ShardInfoProvider
 	coinStore         store.TokenStore
 	hypergraph        hypergraph.Hypergraph
+	globalFrameService consensus.GlobalFrameService
 
 	// server interfaces
 	grpcServer *grpc.Server
@@ -611,13 +614,19 @@ func (r *RPCServer) Send(
 
 	if len(request) != 0 {
 		if bytes.Equal(req.Domain, bytes.Repeat([]byte{0xff}, 32)) {
-			r.pubSub.Subscribe(
-				[]byte{0x00, 0x00, 0x00},
-				func(message *pb.Message) error { return nil },
-			)
-			err := r.pubSub.PublishToBitmask([]byte{0x00, 0x00, 0x00}, payload)
-			if err != nil {
-				return nil, err
+			if r.globalFrameService != nil {
+				if err := r.globalFrameService.InjectGlobalMessage(request); err != nil {
+					return nil, err
+				}
+			} else {
+				r.pubSub.Subscribe(
+					[]byte{0x00, 0x00, 0x00},
+					func(message *pb.Message) error { return nil },
+				)
+				err := r.pubSub.PublishToBitmask([]byte{0x00, 0x00, 0x00}, payload)
+				if err != nil {
+					return nil, err
+				}
 			}
 		} else {
 			bitmask := up2p.GetBloomFilter(req.Domain, 256, 3)
@@ -658,6 +667,48 @@ func (r *RPCServer) Send(
 	return &protobufs.SendResponse{}, nil
 }
 
+// GetLatestFrame implements protobufs.NodeServiceServer.
+func (r *RPCServer) GetLatestFrame(
+	ctx context.Context,
+	req *protobufs.GetGlobalFrameRequest,
+) (*protobufs.GlobalFrameResponse, error) {
+	if r.globalFrameService == nil {
+		return nil, status.Error(codes.Unavailable, "global frame service not available")
+	}
+
+	var frame *protobufs.GlobalFrame
+	var err error
+	if req.FrameNumber == 0 {
+		frame, err = r.globalFrameService.LatestGlobalFrame()
+	} else {
+		frame, err = r.globalFrameService.GlobalFrameByNumber(req.FrameNumber)
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get frame: %v", err)
+	}
+
+	return &protobufs.GlobalFrameResponse{
+		Frame: frame,
+	}, nil
+}
+
+// SubmitMessage implements protobufs.NodeServiceServer.
+func (r *RPCServer) SubmitMessage(
+	ctx context.Context,
+	req *protobufs.SubmitMessageRequest,
+) (*protobufs.SubmitMessageResponse, error) {
+	if r.globalFrameService == nil {
+		return nil, status.Error(codes.Unavailable, "message submission not available")
+	}
+	if len(req.Data) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "empty data")
+	}
+	if err := r.globalFrameService.InjectGlobalMessage(req.Data); err != nil {
+		return nil, status.Errorf(codes.Internal, "inject message: %v", err)
+	}
+	return &protobufs.SubmitMessageResponse{}, nil
+}
+
 func NewRPCServer(
 	config *config.Config,
 	logger *zap.Logger,
@@ -669,6 +720,7 @@ func NewRPCServer(
 	executionManager *manager.ExecutionEngineManager,
 	shardInfoProvider consensus.ShardInfoProvider,
 	coinStore store.TokenStore,
+	globalFrameService consensus.GlobalFrameService,
 ) (*RPCServer, error) {
 	mg, err := multiaddr.NewMultiaddr(config.ListenGRPCMultiaddr)
 	if err != nil {
@@ -700,16 +752,17 @@ func NewRPCServer(
 	}
 
 	rpcServer := &RPCServer{
-		config:            config,
-		logger:            logger,
-		keyManager:        keyManager,
-		pubSub:            pubSub,
-		peerInfoProvider:  peerInfoProvider,
-		workerManager:     workerManager,
-		proverRegistry:    proverRegistry,
-		executionManager:  executionManager,
-		shardInfoProvider: shardInfoProvider,
-		coinStore:         coinStore,
+		config:             config,
+		logger:             logger,
+		keyManager:         keyManager,
+		pubSub:             pubSub,
+		peerInfoProvider:   peerInfoProvider,
+		workerManager:      workerManager,
+		proverRegistry:     proverRegistry,
+		executionManager:   executionManager,
+		shardInfoProvider:  shardInfoProvider,
+		coinStore:          coinStore,
+		globalFrameService: globalFrameService,
 		grpcServer: qgrpc.NewServer(
 			grpc.MaxRecvMsgSize(10*1024*1024),
 			grpc.MaxSendMsgSize(10*1024*1024),

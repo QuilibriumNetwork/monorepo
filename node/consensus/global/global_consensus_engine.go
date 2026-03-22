@@ -57,6 +57,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p/onion"
+	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	mgr "source.quilibrium.com/quilibrium/monorepo/node/worker"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/channel"
@@ -82,6 +83,10 @@ var GLOBAL_PROVER_BITMASK = []byte{0x00, 0x00, 0x00}
 var GLOBAL_PEER_INFO_BITMASK = []byte{0x00, 0x00, 0x00, 0x00}
 
 var GLOBAL_ALERT_BITMASK = bytes.Repeat([]byte{0x00}, 16)
+
+// ArchiveServiceCapabilityID is advertised in PeerInfo by archive nodes
+// so non-archive nodes can discover them for frame retrieval.
+const ArchiveServiceCapabilityID = uint32(0x00050001)
 
 type coverageStreak struct {
 	StartFrame uint64
@@ -145,6 +150,22 @@ func (e *GlobalConsensusEngine) broadcastGlobalMessage(
 	}
 }
 
+// SetArchiveClient configures the engine to route frame retrieval and prover
+// messages through the given archive client instead of pubsub.
+func (e *GlobalConsensusEngine) SetArchiveClient(c *rpc.ArchiveClient) {
+	e.archiveClient = c
+}
+
+// publishProverMessage sends data to the prover bitmask. When an archive
+// client is configured (non-archive node), it routes through the archive's
+// SubmitMessage RPC instead of local pubsub.
+func (e *GlobalConsensusEngine) publishProverMessage(data []byte) error {
+	if e.archiveClient != nil {
+		return e.archiveClient.SubmitMessage(context.Background(), data)
+	}
+	return e.pubsub.PublishToBitmask(GLOBAL_PROVER_BITMASK, data)
+}
+
 // GlobalConsensusEngine  uses the generic state machine for consensus
 type GlobalConsensusEngine struct {
 	*lifecycle.ComponentManager
@@ -188,9 +209,9 @@ type GlobalConsensusEngine struct {
 	alertPublicKey          []byte
 	hasSentKeyBundle        bool
 	proverSyncInProgress    atomic.Bool
-	lastJoinAttemptFrame       atomic.Uint64
-	lastSeniorityMergeFrame    atomic.Uint64
-	lastObservedFrame          atomic.Uint64
+	lastJoinAttemptFrame    atomic.Uint64
+	lastSeniorityMergeFrame atomic.Uint64
+	lastObservedFrame       atomic.Uint64
 	lastRejectFrame         atomic.Uint64
 	proverRootVerifiedFrame atomic.Uint64
 	proverRootSynced        atomic.Bool
@@ -237,10 +258,13 @@ type GlobalConsensusEngine struct {
 	activeProveRanksMu        sync.Mutex
 	appFrameStore             map[string]*protobufs.AppShardFrame
 	appFrameStoreMu           sync.RWMutex
-	lowCoverageStreak          map[string]*coverageStreak
-	proverOnlyMode             atomic.Bool
-	lastShardActionFrame       map[string]uint64
-	lastShardActionFrameMu     sync.Mutex
+	lowCoverageStreak         map[string]*coverageStreak
+	lowCoverageStreakMu       sync.Mutex
+	proverOnlyMode            atomic.Bool
+	lastShardActionFrame      map[string]uint64
+	lastShardActionFrameMu    sync.Mutex
+	shardFrameDedup           map[string]uint64
+	shardFrameDedupMu         sync.Mutex
 	coverageCheckInProgress   atomic.Bool
 	coverageWg                sync.WaitGroup
 	peerInfoDigestCache       map[string]struct{}
@@ -286,6 +310,11 @@ type GlobalConsensusEngine struct {
 	shardCommitmentMu      sync.Mutex
 	commitBarrier          sync.Mutex
 
+	// Materialize idempotency: ensures each frame is materialized at most once,
+	// even when called from both ProveNextState and addCertifiedState.
+	lastMaterializedFrame atomic.Uint64
+	materializeMu         sync.Mutex
+
 	// Authentication provider
 	authProvider channel.AuthenticationProvider
 
@@ -303,6 +332,9 @@ type GlobalConsensusEngine struct {
 	// Global message streaming to workers
 	globalMessageSubscribersMu sync.RWMutex
 	globalMessageSubscribers   map[chan *protobufs.StreamGlobalMessagesResponse]struct{}
+
+	// Archive client for non-archive nodes (nil when using pubsub)
+	archiveClient *rpc.ArchiveClient
 }
 
 // NewGlobalConsensusEngine creates a new global consensus engine using the
@@ -383,6 +415,7 @@ func NewGlobalConsensusEngine(
 		lastProvenFrameTime:         time.Now(),
 		blacklistMap:                make(map[string]bool),
 		lastShardActionFrame:        make(map[string]uint64),
+		shardFrameDedup:             make(map[string]uint64),
 		peerInfoDigestCache:         make(map[string]struct{}),
 		keyRegistryDigestCache:      make(map[string]struct{}),
 		peerAuthCache:               make(map[string]time.Time),
@@ -931,6 +964,15 @@ func NewGlobalConsensusEngine(
 		engine.processFrameMessageQueue(ctx)
 	})
 
+	// Start archive frame poller (no-op when archiveClient is nil)
+	componentBuilder.AddWorker(func(
+		ctx lifecycle.SignalerContext,
+		ready lifecycle.ReadyFunc,
+	) {
+		ready()
+		engine.pollFramesFromArchive(ctx)
+	})
+
 	// Start prover message queue processor
 	componentBuilder.AddWorker(func(
 		ctx lifecycle.SignalerContext,
@@ -1392,6 +1434,14 @@ func (e *GlobalConsensusEngine) GetPeerInfo() *protobufs.PeerInfo {
 	// Get supported capabilities from execution manager
 	capabilities := e.executionManager.GetSupportedCapabilities()
 
+	// If this is an archive node, advertise the capability as a presence flag.
+	// The stream multiaddr is already in Reachability[0].StreamMultiaddrs.
+	if archiveMode {
+		capabilities = append(capabilities, &protobufs.Capability{
+			ProtocolIdentifier: ArchiveServiceCapabilityID,
+		})
+	}
+
 	var reachability []*protobufs.Reachability
 
 	// master node process:
@@ -1439,6 +1489,12 @@ func (e *GlobalConsensusEngine) GetPeerInfo() *protobufs.PeerInfo {
 					)
 				}
 			}
+		}
+		// If no stream addresses were derived from observed pubsub addresses
+		// (common on local dev setups with no external-facing addresses), fall
+		// back to the raw StreamListenMultiaddr so local workers can connect.
+		if len(streamAddrs) == 0 && e.config.P2P.StreamListenMultiaddr != "" {
+			streamAddrs = append(streamAddrs, e.config.P2P.StreamListenMultiaddr)
 		}
 		reachability = append(reachability, &protobufs.Reachability{
 			Filter:           []byte{}, // master has empty filter
@@ -1699,6 +1755,19 @@ func (e *GlobalConsensusEngine) materialize(
 	frame *protobufs.GlobalFrame,
 ) error {
 	frameNumber := frame.Header.FrameNumber
+
+	// Idempotency guard: each frame is materialized at most once.
+	// ProveNextState calls materialize(nil, prior) to ensure frame N's
+	// mutations are applied before computing N+1's prover root.
+	// addCertifiedState also calls materialize for the same frame;
+	// the second call returns immediately.
+	e.materializeMu.Lock()
+	if frameNumber <= e.lastMaterializedFrame.Load() {
+		e.materializeMu.Unlock()
+		return nil
+	}
+	defer e.materializeMu.Unlock()
+
 	requests := frame.Requests
 	expectedProverRoot := frame.Header.ProverTreeCommitment
 	proposer := frame.Header.Prover
@@ -1745,31 +1814,10 @@ func (e *GlobalConsensusEngine) materialize(
 					expectedProverRoot,
 				)
 
-				// Re-compute local prover root after sync to verify convergence
-				newLocalRoot, newRootErr := e.computeLocalProverRoot(frameNumber)
-				if newRootErr != nil {
-					e.logger.Warn(
-						"failed to compute local prover root after sync",
-						zap.Uint64("frame_number", frameNumber),
-						zap.Error(newRootErr),
-					)
-				} else {
-					updatedProverRoot = newLocalRoot
-					if !bytes.Equal(newLocalRoot, expectedProverRoot) {
-						e.logger.Warn(
-							"prover root still mismatched after sync - convergence failed",
-							zap.Uint64("frame_number", frameNumber),
-							zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
-							zap.String("post_sync_local_root", hex.EncodeToString(newLocalRoot)),
-						)
-					} else {
-						e.logger.Info(
-							"prover root converged after sync",
-							zap.Uint64("frame_number", frameNumber),
-							zap.String("root", hex.EncodeToString(newLocalRoot)),
-						)
-					}
-				}
+				// After sync, use expectedProverRoot for the snapshot so
+				// workers can sync against the root they expect. The next
+				// frame's Commit(N+1) will verify actual convergence.
+				updatedProverRoot = expectedProverRoot
 			}
 		}
 
@@ -1908,8 +1956,58 @@ func (e *GlobalConsensusEngine) materialize(
 		return errors.Wrap(err, "materialize")
 	}
 
+	// Evict provers inactive for >360 frames, subtracting any halt duration.
+	// computeShardHaltDurations initializes the streak map on first call
+	// (reconstructing halt data from LastActiveFrameNumber). Skip eviction
+	// until it has run at least once so we never evict before accounting
+	// for halt periods.
+	shardHaltDurations := e.computeShardHaltDurations(frameNumber)
+	if shardHaltDurations != nil {
+		evictionState := hgstate.NewHypergraphState(e.hypergraph)
+		evicted, evictErr := e.proverRegistry.EvictInactiveProvers(
+			frameNumber, 360, shardHaltDurations, evictionState,
+		)
+		if evictErr != nil {
+			e.logger.Error("error evicting inactive provers", zap.Error(evictErr))
+		} else if len(evicted) > 0 {
+			e.commitBarrier.Lock()
+			commitErr := evictionState.Commit()
+			e.commitBarrier.Unlock()
+			if commitErr != nil {
+				e.logger.Error(
+					"error committing eviction state",
+					zap.Error(commitErr),
+				)
+			} else {
+				e.logger.Info("evicted inactive provers",
+					zap.Int("count", len(evicted)),
+					zap.Uint64("frame_number", frameNumber),
+				)
+			}
+		}
+	}
+
 	if len(localRootHex) > 0 {
 		e.reconcileLocalWorkerAllocations()
+	}
+
+	// After all tree modifications (ProcessMessages, state transitions,
+	// evictions), publish a snapshot with the post-materialize vertex adds
+	// root. This is the root that frame N+1's ProverTreeCommitment will
+	// contain. Workers detecting a mismatch at frame N+1 will sync against
+	// this root, so the master must have a matching snapshot available.
+	e.commitBarrier.Lock()
+	postRoot, postRootErr := e.computeLocalProverRoot(frameNumber + 1)
+	if postRootErr == nil && len(postRoot) > 0 {
+		if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
+			hgCRDT.PublishSnapshot(postRoot)
+		}
+	}
+	e.commitBarrier.Unlock()
+
+	postRootHex := ""
+	if len(postRoot) > 0 {
+		postRootHex = hex.EncodeToString(postRoot)
 	}
 
 	e.logger.Info(
@@ -1920,10 +2018,12 @@ func (e *GlobalConsensusEngine) materialize(
 		zap.Int("skipped_requests", int(skippedCount.Load())),
 		zap.String("expected_root", expectedRootHex),
 		zap.String("local_root", localRootHex),
+		zap.String("post_materialize_root", postRootHex),
 		zap.String("proposer", hex.EncodeToString(proposer)),
 		zap.Duration("duration", time.Since(start)),
 	)
 
+	e.lastMaterializedFrame.Store(frameNumber)
 	return nil
 }
 
@@ -2174,7 +2274,71 @@ func (e *GlobalConsensusEngine) performBlockingProverHypersync(
 	newRoots := e.syncProvider.HyperSync(ctx, proposer, shardKey, nil, expectedRoot)
 	close(done)
 
-	e.logger.Info("blocking hypersync completed")
+	// Check if HyperSync actually converged: the vertex adds root (first
+	// valid entry) must match expectedRoot. HyperSync appends nil roots for
+	// failed phase syncs, so len(newRoots) > 0 does not imply success.
+	hyperSyncConverged := false
+	for _, root := range newRoots {
+		if len(root) > 0 && bytes.Equal(root, expectedRoot) {
+			hyperSyncConverged = true
+			break
+		}
+	}
+
+	if !hyperSyncConverged {
+		if len(newRoots) > 0 {
+			e.logger.Warn(
+				"HyperSync returned roots but did not converge to expected root",
+				zap.Int("root_count", len(newRoots)),
+				zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+			)
+		}
+
+		// Fall back to the archive client's existing gRPC connection. The
+		// archive server registers HypergraphComparisonService on the same
+		// streaming server, so we can sync directly without key registry or
+		// peer info.
+		if e.archiveClient != nil {
+			e.logger.Info("falling back to archive client for sync")
+			newRoots = nil
+			if hg, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
+				conn := e.archiveClient.Conn()
+				phases := []protobufs.HypergraphPhaseSet{
+					protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+					protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES,
+					protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS,
+					protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES,
+				}
+				for _, phase := range phases {
+					client := protobufs.NewHypergraphComparisonServiceClient(conn)
+					str, err := client.PerformSync(ctx)
+					if err != nil {
+						e.logger.Error(
+							"archive sync: PerformSync error",
+							zap.String("phase", phase.String()),
+							zap.Error(err),
+						)
+						break
+					}
+					root, syncErr := hg.SyncFrom(str, shardKey, phase, expectedRoot)
+					str.CloseSend()
+					if syncErr != nil {
+						e.logger.Error(
+							"archive sync: SyncFrom error",
+							zap.String("phase", phase.String()),
+							zap.Error(syncErr),
+						)
+					}
+					newRoots = append(newRoots, root)
+				}
+			}
+		}
+	}
+
+	e.logger.Info("blocking hypersync completed",
+		zap.Int("root_count", len(newRoots)),
+		zap.Bool("converged", hyperSyncConverged),
+	)
 
 	if !e.config.Engine.ArchiveMode {
 		if err := e.proverRegistry.Refresh(); err != nil {
@@ -2995,38 +3159,53 @@ func (e *GlobalConsensusEngine) reportPeerInfoPeriodically(
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
+	// Publish immediately at startup so workers can sync before the first
+	// ticker fires. Without this, workers wait 5 minutes before receiving
+	// the master's PeerInfo and any HyperSyncSelf calls silently fail.
+	e.publishPeerInfo()
+
 	for {
 		select {
 		case <-ctx.Done():
 			e.logger.Info("stopping periodic peer info reporting")
 			return
 		case <-ticker.C:
-			e.logger.Debug("publishing periodic peer info")
-
-			peerInfo := e.GetPeerInfo()
-
-			peerInfoData, err := peerInfo.ToCanonicalBytes()
-			if err != nil {
-				e.logger.Error("failed to serialize peer info", zap.Error(err))
-				continue
-			}
-
-			// Publish to the peer info bitmask
-			if err := e.pubsub.PublishToBitmask(
-				GLOBAL_PEER_INFO_BITMASK,
-				peerInfoData,
-			); err != nil {
-				e.logger.Error("failed to publish peer info", zap.Error(err))
-			} else {
-				e.logger.Debug("successfully published peer info",
-					zap.String("peer_id", base58.Encode(peerInfo.PeerId)),
-					zap.Int("capabilities_count", len(peerInfo.Capabilities)),
-				)
-			}
-
+			e.publishPeerInfo()
 			e.publishKeyRegistry()
 		}
 	}
+}
+
+func (e *GlobalConsensusEngine) publishPeerInfo() {
+	e.logger.Debug("publishing peer info")
+
+	peerInfo := e.GetPeerInfo()
+
+	peerInfoData, err := peerInfo.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("failed to serialize peer info", zap.Error(err))
+		return
+	}
+
+	// Publish to the peer info bitmask for network peers
+	if err := e.pubsub.PublishToBitmask(
+		GLOBAL_PEER_INFO_BITMASK,
+		peerInfoData,
+	); err != nil {
+		e.logger.Error("failed to publish peer info", zap.Error(err))
+	} else {
+		e.logger.Debug("successfully published peer info",
+			zap.String("peer_id", base58.Encode(peerInfo.PeerId)),
+			zap.Int("capabilities_count", len(peerInfo.Capabilities)),
+		)
+	}
+
+	// Also broadcast directly to local workers. Blossomsub does not echo
+	// self-published messages back to the publisher, so the subscription
+	// handler's broadcastGlobalMessage call never fires for our own
+	// PeerInfo. Without this, workers' PeerInfoManagers never contain the
+	// master's PeerInfo and HyperSyncSelf silently fails.
+	e.broadcastGlobalMessage(peerInfoData, GLOBAL_PEER_INFO_BITMASK)
 }
 
 func (e *GlobalConsensusEngine) pruneTxLocksPeriodically(
@@ -3574,10 +3753,7 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		return errors.Wrap(err, "propose worker join")
 	}
 
-	err = e.pubsub.PublishToBitmask(
-		GLOBAL_PROVER_BITMASK,
-		msg,
-	)
+	err = e.publishProverMessage(msg)
 	if err != nil {
 		e.logger.Error("could not construct join", zap.Error(err))
 		return errors.Wrap(err, "propose worker join")
@@ -3745,10 +3921,7 @@ func (e *GlobalConsensusEngine) submitSeniorityMerge(
 		return errors.Wrap(err, "submit seniority merge")
 	}
 
-	err = e.pubsub.PublishToBitmask(
-		GLOBAL_PROVER_BITMASK,
-		msg,
-	)
+	err = e.publishProverMessage(msg)
 	if err != nil {
 		e.logger.Error("could not publish seniority merge", zap.Error(err))
 		return errors.Wrap(err, "submit seniority merge")
@@ -3841,10 +4014,7 @@ func (e *GlobalConsensusEngine) DecideWorkerJoins(
 		return errors.Wrap(err, "decide worker joins")
 	}
 
-	err = e.pubsub.PublishToBitmask(
-		GLOBAL_PROVER_BITMASK,
-		msg,
-	)
+	err = e.publishProverMessage(msg)
 	if err != nil {
 		e.logger.Error("could not construct join decisions", zap.Error(err))
 		return errors.Wrap(err, "decide worker joins")
@@ -3905,10 +4075,7 @@ func (e *GlobalConsensusEngine) ProposeWorkerLeave(
 		return errors.Wrap(err, "propose worker leave")
 	}
 
-	err = e.pubsub.PublishToBitmask(
-		GLOBAL_PROVER_BITMASK,
-		msg,
-	)
+	err = e.publishProverMessage(msg)
 	if err != nil {
 		e.logger.Error("could not publish leave", zap.Error(err))
 		return errors.Wrap(err, "propose worker leave")
@@ -4002,10 +4169,7 @@ func (e *GlobalConsensusEngine) DecideWorkerLeaves(
 		return errors.Wrap(err, "decide worker leaves")
 	}
 
-	err = e.pubsub.PublishToBitmask(
-		GLOBAL_PROVER_BITMASK,
-		msg,
-	)
+	err = e.publishProverMessage(msg)
 	if err != nil {
 		e.logger.Error("could not publish leave decisions", zap.Error(err))
 		return errors.Wrap(err, "decide worker leaves")
@@ -4511,11 +4675,29 @@ func (e *GlobalConsensusEngine) rebuildShardCommitments(
 ) ([]byte, error) {
 	e.commitBarrier.Lock()
 	commitSet, err := e.hypergraph.Commit(frameNumber)
-	e.commitBarrier.Unlock()
 	if err != nil {
+		e.commitBarrier.Unlock()
 		e.logger.Error("could not commit", zap.Error(err))
 		return nil, errors.Wrap(err, "rebuild shard commitments")
 	}
+
+	// Publish the snapshot with proverRoot BEFORE releasing commitBarrier.
+	// This prevents a race where materialize(N) modifies the tree between
+	// Commit(N+1) and PublishSnapshot, causing the snapshot to capture
+	// post-materialize data (root 020897...) while being tagged with the
+	// pre-materialize proverRoot (030270...). Workers would then find the
+	// snapshot's actual data matches their stale state, resulting in
+	// tree_changed=false despite a root mismatch.
+	var zeroShardKeyL1 [3]byte
+	for sk, phaseCommits := range commitSet {
+		if sk.L1 == zeroShardKeyL1 && len(phaseCommits) > 0 && len(phaseCommits[0]) > 0 {
+			if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
+				hgCRDT.PublishSnapshot(slices.Clone(phaseCommits[0]))
+			}
+			break
+		}
+	}
+	e.commitBarrier.Unlock()
 
 	if err := e.rebuildAppShardCache(rank); err != nil {
 		e.logger.Warn(
@@ -4543,7 +4725,6 @@ func (e *GlobalConsensusEngine) rebuildShardCommitments(
 
 	proverRoot := make([]byte, 64)
 	collected := 0
-	var zeroShardKeyL1 [3]byte
 
 	for sk, phaseCommits := range commitSet {
 		if sk.L1 == zeroShardKeyL1 {
@@ -4738,6 +4919,10 @@ func (e *GlobalConsensusEngine) rebuildShardCommitments(
 
 	e.proverRoot = proverRoot
 	e.commitmentHash = commitmentHash[:]
+
+	// Note: PublishSnapshot(proverRoot) is now called earlier, inside the
+	// commitBarrier lock, immediately after hg.Commit(). This prevents
+	// materialize(N) from racing and corrupting the snapshot data.
 
 	shardCommitmentsCollected.Set(float64(collected))
 

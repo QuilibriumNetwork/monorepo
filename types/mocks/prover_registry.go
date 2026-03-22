@@ -139,3 +139,17 @@ func (m *MockProverRegistry) ExtractProversFromTransactions(
 	args := m.Called(transactions)
 	return args.Error(0)
 }
+
+// EvictInactiveProvers implements consensus.ProverRegistry.
+func (m *MockProverRegistry) EvictInactiveProvers(
+	frameNumber uint64,
+	inactivityThreshold uint64,
+	shardHaltDurations map[string]uint64,
+	state state.State,
+) ([][]byte, error) {
+	args := m.Called(frameNumber, inactivityThreshold, shardHaltDurations, state)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([][]byte), args.Error(1)
+}

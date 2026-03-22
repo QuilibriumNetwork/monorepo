@@ -32,6 +32,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 	"source.quilibrium.com/quilibrium/monorepo/vdf"
@@ -42,14 +43,16 @@ import (
 func createHypergraph(t *testing.T) (hypergraph.Hypergraph, *bls48581.KZGInclusionProver, *schema.RDFMultiprover) {
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	dbCfg := &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}
+	s := store.NewPebbleDB(l, &config.Config{DB: dbCfg}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hgcrdt.NewHypergraph(
 		l,
-		store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, s, l, ve, ip),
+		store.NewPebbleHypergraphStore(dbCfg, s, l, ve, ip),
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		0,
 	)
 	rm := schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, ip)
 	return hg, ip, rm
@@ -67,7 +70,7 @@ func TestGlobalIntrinsicProverJoinFlow(t *testing.T) {
 	hg, inclusionProver, rdfMultiprover := createHypergraph(t)
 	frameProver := vdf.NewWesolowskiFrameProver(logger)
 
-	pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global_intrinsic"}, 0)
+	pebbleDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global_intrinsic"}}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, logger)
 	txn, err := frameStore.NewTransaction(false)
 	require.NoError(t, err)
@@ -96,6 +99,7 @@ func TestGlobalIntrinsicProverJoinFlow(t *testing.T) {
 		rewardIssuance,
 		proverRegistry,
 		blsConstructor,
+		nil,
 	)
 	require.NoError(t, err)
 	addresses := make([][]byte, 100)
@@ -268,7 +272,7 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 	filter := []byte("integration-test-filter000000000000000")
 	filter2 := []byte("integration-test-filter000000000000002")
 	frameNumber := uint64(100)
-	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 	txn, err := frameStore.NewTransaction(false)
 	require.NoError(t, err)
@@ -527,7 +531,7 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 
 		// Try to confirm at frame 255840 + 1080
 		confirmFrame := uint64(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END)
-		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rm)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rm)
 		require.NoError(t, err)
 
 		// Generate the signatures with keys
@@ -588,7 +592,7 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 		hg.SetVertexData(txn, [64]byte(slices.Concat(intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], allocationAddress)), allocationTree)
 		txn.Commit()
 
-		proverReject, err := global.NewProverReject(filter, frameNumber, keyManager, hg, rm)
+		proverReject, err := global.NewProverReject([][]byte{filter}, frameNumber, keyManager, hg, rm)
 		require.NoError(t, err)
 
 		// Generate the signatures with keys

@@ -1056,6 +1056,7 @@ func (w *WorkerManager) respawnWorker(
 		respawnTimeout    = 5 * time.Second
 		initialBackoff    = 50 * time.Millisecond
 		maxRespawnBackoff = 2 * time.Second
+		maxAttempts       = 30
 	)
 
 	managerCtx := w.currentContext()
@@ -1064,7 +1065,7 @@ func (w *WorkerManager) respawnWorker(
 	}
 
 	backoff := initialBackoff
-	for {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		svc, err := w.getIPCOfWorker(coreId)
 		if err != nil {
 			w.logger.Error(
@@ -1090,6 +1091,8 @@ func (w *WorkerManager) respawnWorker(
 		w.logger.Warn(
 			"worker respawn failed, retrying",
 			zap.Uint("core_id", coreId),
+			zap.Int("attempt", attempt+1),
+			zap.Int("max_attempts", maxAttempts),
 			zap.Duration("backoff", backoff),
 			zap.Error(err),
 		)
@@ -1108,6 +1111,8 @@ func (w *WorkerManager) respawnWorker(
 			}
 		}
 	}
+
+	return errors.Errorf("worker %d: respawn failed after %d attempts", coreId, maxAttempts)
 }
 
 func (w *WorkerManager) spawnDataWorkers() {

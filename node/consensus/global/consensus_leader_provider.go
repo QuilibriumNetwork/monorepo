@@ -165,6 +165,17 @@ func (p *GlobalLeaderProvider) ProveNextState(
 		)
 	}
 
+	// Materialize prior frame's transactions before computing roots for N+1.
+	// Without this, rebuildShardCommitments sees pre-frame-N state because
+	// HotStuff's two-chain commit rule hasn't materialized N yet.
+	if err := p.engine.materialize(nil, prior); err != nil {
+		p.engine.logger.Warn(
+			"failed to materialize prior frame in ProveNextState",
+			zap.Uint64("frame_number", prior.Header.FrameNumber),
+			zap.Error(err),
+		)
+	}
+
 	// Collect messages and rebuild shard commitments now that we've acquired
 	// the proving mutex and validated the prior frame. This prevents race
 	// conditions where a subsequent OnRankChange would overwrite collectedMessages
