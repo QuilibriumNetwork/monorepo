@@ -164,17 +164,17 @@ const ACTION_FRAME_DELAY = 360
 
 func newManageKeyMap() manageKeyMap {
 	return manageKeyMap{
-		Up:        key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
-		Down:      key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
-		Tab:       key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch")),
-		Select:    key.NewBinding(key.WithKeys("space"), key.WithHelp("spc", "select")),
-		SelectAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "sel all")),
-		Join:      key.NewBinding(key.WithKeys("J"), key.WithHelp("J", "join")),
-		Leave:     key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "leave")),
-		Confirm:   key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "confirm")),
-		Reject:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "reject")),
-		Pause:     key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
-		Resume:    key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "resume")),
+		Up:           key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
+		Down:         key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+		Tab:          key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch")),
+		Select:       key.NewBinding(key.WithKeys("space"), key.WithHelp("spc", "select")),
+		SelectAll:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "sel all")),
+		Join:         key.NewBinding(key.WithKeys("J"), key.WithHelp("J", "join")),
+		Leave:        key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "leave")),
+		Confirm:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "confirm")),
+		Reject:       key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "reject")),
+		Pause:        key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
+		Resume:       key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "resume")),
 		ToggleManual: key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "mode")),
 		Refresh:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
 		Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
@@ -1125,13 +1125,13 @@ func (m manageModel) renderView() string {
 	// Allocations panel.
 	filteredAllocs := m.filteredAllocations()
 	activePerFrame := big.NewInt(0)
-	pendingPerFrame := big.NewInt(0)
+	joiningPerFrame := big.NewInt(0)
 	pausedPerFrame := big.NewInt(0)
 	leavingPerFrame := big.NewInt(0)
 	for _, a := range filteredAllocs {
 		switch a.status {
 		case 1:
-			pendingPerFrame.Add(pendingPerFrame, a.estimatedReward)
+			joiningPerFrame.Add(joiningPerFrame, a.estimatedReward)
 		case 2:
 			activePerFrame.Add(activePerFrame, a.estimatedReward)
 		case 3:
@@ -1142,13 +1142,13 @@ func (m manageModel) renderView() string {
 
 	}
 	totalPerFrame := big.NewInt(0)
-	totalPerFrame.Add(totalPerFrame, pendingPerFrame)
+	totalPerFrame.Add(totalPerFrame, joiningPerFrame)
 	totalPerFrame.Add(totalPerFrame, activePerFrame)
 	totalPerFrame.Add(totalPerFrame, pausedPerFrame)
 	totalPerFrame.Add(totalPerFrame, leavingPerFrame)
 
 	allocTitle := fmt.Sprintf("Allocations (%d) Rewards: Total ~%s QUIL/day = Joining ~%s QUIL/day + Active ~%s QUIL/day + Paused ~%s QUIL/day + Leaving ~%s QUIL/day",
-		len(filteredAllocs), formatQUILDaily(totalPerFrame), formatQUILDaily(pendingPerFrame), formatQUILDaily(activePerFrame),
+		len(filteredAllocs), formatQUILDaily(totalPerFrame), formatQUILDaily(joiningPerFrame), formatQUILDaily(activePerFrame),
 		formatQUILDaily(pausedPerFrame), formatQUILDaily(leavingPerFrame))
 	if n := len(m.allocSelected); n > 0 {
 		allocTitle += fmt.Sprintf(" [%d selected]", n)
