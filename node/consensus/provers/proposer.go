@@ -615,13 +615,15 @@ func (m *Manager) PlanLeaves(
 		fc := make([]byte, len(candidates[i].filter))
 		copy(fc, candidates[i].filter)
 		filters = append(filters, fc)
+		m.logger.Debug("added shard to leave list", zap.String("shard", hex.EncodeToString(fc)),
+			zap.String("score", candidates[i].score.String()), zap.String("leaveThreashold", leaveThreshold.String()))
 	}
 
 	err = m.workerMgr.ProposeLeave(filters)
 	if err != nil {
 		return nil, errors.Wrap(err, "plan leaves")
 	}
-
+	m.logger.Info("proposed leaves")
 	return filters, nil
 }
 
