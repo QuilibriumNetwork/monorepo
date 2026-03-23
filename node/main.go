@@ -702,13 +702,19 @@ func main() {
 		logger.Panic("failed to create master node", zap.Error(err))
 	}
 
-	// Config-driven archive client: connect to a pre-configured archive
-	// endpoint using mTLS. Non-archive nodes use this instead of bitmask
-	// subscriptions for frame retrieval and message submission.
+	// Archive client: connect to an archive endpoint using mTLS.
+	// Non-archive nodes use this instead of bitmask subscriptions for
+	// frame retrieval and message submission.
+	archiveEndpoints := []string{}
+	if nodeConfig.Engine != nil && len(nodeConfig.Engine.ArchiveEndpoints) > 0 {
+		archiveEndpoints = nodeConfig.Engine.ArchiveEndpoints
+	} else if nodeConfig.P2P != nil && nodeConfig.P2P.Network == 0 {
+		archiveEndpoints = config.ArchiveEndpoints
+	}
 	if nodeConfig.Engine != nil &&
 		!nodeConfig.Engine.ArchiveMode &&
-		len(nodeConfig.Engine.ArchiveEndpoints) > 0 {
-		for _, endpoint := range nodeConfig.Engine.ArchiveEndpoints {
+		len(archiveEndpoints) > 0 {
+		for _, endpoint := range archiveEndpoints {
 			maddr, err := multiaddr.NewMultiaddr(endpoint)
 			if err != nil {
 				logger.Warn("failed to parse archive endpoint",
