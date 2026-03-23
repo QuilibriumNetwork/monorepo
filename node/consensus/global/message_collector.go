@@ -156,7 +156,7 @@ func (p *globalMessageProcessor) enforceCollectorLimit(
 }
 
 func (e *GlobalConsensusEngine) initGlobalMessageAggregator() error {
-	tracer := tracing.NewZapTracer(e.logger.Named("global_message_collector"))
+	tracer := tracing.NewZapTracer(e.logger.Named("globalMessageCollector"))
 	processorFactory := &globalMessageProcessorFactory{engine: e}
 	collectorFactory, err := keyedcollector.NewFactory(
 		tracer,
@@ -240,6 +240,33 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 				if len(bundle.Requests) == 0 {
 					// All requests were filtered out
 					return
+				}
+			}
+
+			// Dedup shard frames: only accept strictly increasing frame numbers
+			// per shard address. Different delivery paths (pubsub vs gRPC)
+			// produce different serializations of the same shard frame, so we
+			// dedup by (shard address, frame number) rather than by hash.
+			for _, req := range bundle.Requests {
+				if shard := req.GetShard(); shard != nil {
+					shardAddr := string(shard.Address)
+					shardFrame := shard.FrameNumber
+
+					e.shardFrameDedupMu.Lock()
+					lastSeen, exists := e.shardFrameDedup[shardAddr]
+					if exists && shardFrame <= lastSeen {
+						e.shardFrameDedupMu.Unlock()
+						if e.logger != nil {
+							e.logger.Debug(
+								"dropping duplicate/stale shard frame",
+								zap.Uint64("shard_frame", shardFrame),
+								zap.Uint64("last_seen", lastSeen),
+							)
+						}
+						return
+					}
+					e.shardFrameDedup[shardAddr] = shardFrame
+					e.shardFrameDedupMu.Unlock()
 				}
 			}
 

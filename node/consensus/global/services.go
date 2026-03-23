@@ -25,9 +25,9 @@ func (e *GlobalConsensusEngine) GetGlobalFrame(
 	ctx context.Context,
 	request *protobufs.GetGlobalFrameRequest,
 ) (*protobufs.GlobalFrameResponse, error) {
-	peerID, err := e.authenticateProverFromContext(ctx)
-	if err != nil {
-		return nil, err
+	peerID, ok := qgrpc.PeerIDFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "remote peer ID not found")
 	}
 
 	e.logger.Debug(
@@ -36,6 +36,7 @@ func (e *GlobalConsensusEngine) GetGlobalFrame(
 		zap.String("peer_id", peerID.String()),
 	)
 	var frame *protobufs.GlobalFrame
+	var err error
 	if request.FrameNumber == 0 {
 		frame = (*e.forks.FinalizedState().State)
 		if frame.Header.FrameNumber == 0 {
@@ -432,6 +433,19 @@ func (e *GlobalConsensusEngine) StreamGlobalMessages(
 		zap.String("peer_id", peerID.String()),
 	)
 
+	// Send current PeerInfo immediately so the worker can sync before the
+	// next periodic publish (5-minute interval). The initial publish at
+	// startup races with worker connections — workers typically miss it.
+	peerInfo := e.GetPeerInfo()
+	if peerInfoData, err := peerInfo.ToCanonicalBytes(); err == nil {
+		if err := stream.Send(&protobufs.StreamGlobalMessagesResponse{
+			Data:    peerInfoData,
+			Bitmask: GLOBAL_PEER_INFO_BITMASK,
+		}); err != nil {
+			return err
+		}
+	}
+
 	ctx := stream.Context()
 	for {
 		select {
@@ -443,6 +457,52 @@ func (e *GlobalConsensusEngine) StreamGlobalMessages(
 			}
 		}
 	}
+}
+
+// LatestGlobalFrame implements consensus.GlobalFrameService.
+func (e *GlobalConsensusEngine) LatestGlobalFrame() (*protobufs.GlobalFrame, error) {
+	finalized := e.forks.FinalizedState()
+	if finalized == nil || finalized.State == nil {
+		return nil, errors.New("finalized state unavailable")
+	}
+	frame := *finalized.State
+	if frame == nil || frame.Header == nil || frame.Header.FrameNumber == 0 {
+		return nil, errors.New("not currently syncable")
+	}
+	return frame, nil
+}
+
+// GlobalFrameByNumber implements consensus.GlobalFrameService.
+func (e *GlobalConsensusEngine) GlobalFrameByNumber(
+	frameNumber uint64,
+) (*protobufs.GlobalFrame, error) {
+	return e.clockStore.GetGlobalClockFrame(frameNumber)
+}
+
+// InjectGlobalMessage implements consensus.GlobalFrameService.
+func (e *GlobalConsensusEngine) InjectGlobalMessage(data []byte) error {
+	e.addGlobalMessage(data)
+	return e.pubsub.PublishToBitmask(GLOBAL_PROVER_BITMASK, data)
+}
+
+func (e *GlobalConsensusEngine) SubmitGlobalMessage(
+	ctx context.Context,
+	req *protobufs.SubmitGlobalMessageRequest,
+) (*protobufs.SubmitGlobalMessageResponse, error) {
+	if _, ok := qgrpc.PeerIDFromContext(ctx); !ok {
+		return nil, status.Error(codes.Internal, "remote peer ID not found")
+	}
+
+	if len(req.Data) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "empty data")
+	}
+
+	e.addGlobalMessage(req.Data)
+	if err := e.publishProverMessage(req.Data); err != nil {
+		return nil, status.Errorf(codes.Internal, "publish message: %v", err)
+	}
+
+	return &protobufs.SubmitGlobalMessageResponse{}, nil
 }
 
 func (e *GlobalConsensusEngine) RegisterServices(server *grpc.Server) {

@@ -9,6 +9,7 @@ type WorkerInfo struct {
 	Automatic             bool
 	Allocated             bool
 	PendingFilterFrame    uint64
+	ManuallyManaged       bool
 }
 
 type WorkerStore interface {

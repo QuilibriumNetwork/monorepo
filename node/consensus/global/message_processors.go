@@ -14,14 +14,20 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/verification"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
@@ -268,48 +274,126 @@ func (e *GlobalConsensusEngine) handleFrameMessage(
 			return
 		}
 
-		valid, err := e.frameValidator.Validate(frame)
-		if err != nil {
-			e.logger.Debug("global frame validation error", zap.Error(err))
-			framesProcessedTotal.WithLabelValues("error").Inc()
-			return
-		}
-
-		if !valid {
-			framesProcessedTotal.WithLabelValues("error").Inc()
-			e.logger.Debug("invalid global frame")
-			return
-		}
-
-		if frame.Header != nil {
-			e.recordFrameMessageFrameNumber(frame.Header.FrameNumber)
-		}
-
-		frameIDBI, _ := poseidon.HashBytes(frame.Header.Output)
-		frameID := frameIDBI.FillBytes(make([]byte, 32))
-		e.frameStoreMu.Lock()
-		e.frameStore[string(frameID)] = frame
-		clone := frame.Clone().(*protobufs.GlobalFrame)
-		e.frameStoreMu.Unlock()
-
-		if err := e.globalTimeReel.Insert(clone); err != nil {
-			// Success metric recorded at the end of processing
-			framesProcessedTotal.WithLabelValues("error").Inc()
-			return
-		}
-
-		frame, err = e.globalTimeReel.GetHead()
-		if err == nil && frame != nil {
-			e.currentRank = frame.GetRank()
-		}
-
-		// Success metric recorded at the end of processing
-		framesProcessedTotal.WithLabelValues("success").Inc()
+		e.processGlobalFrame(frame)
 	default:
 		e.logger.Debug(
 			"unknown message type",
 			zap.Uint32("type", typePrefix),
 		)
+	}
+}
+
+// processGlobalFrame is the core frame-processing pipeline shared by both
+// the pubsub path (handleFrameMessage) and the archive polling path
+// (pollFramesFromArchive).
+func (e *GlobalConsensusEngine) processGlobalFrame(frame *protobufs.GlobalFrame) {
+	valid, err := e.frameValidator.Validate(frame)
+	if err != nil {
+		e.logger.Debug("global frame validation error", zap.Error(err))
+		framesProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	if !valid {
+		framesProcessedTotal.WithLabelValues("error").Inc()
+		e.logger.Debug("invalid global frame")
+		return
+	}
+
+	if frame.Header != nil {
+		e.recordFrameMessageFrameNumber(frame.Header.FrameNumber)
+	}
+
+	frameIDBI, _ := poseidon.HashBytes(frame.Header.Output)
+	frameID := frameIDBI.FillBytes(make([]byte, 32))
+	e.frameStoreMu.Lock()
+	e.frameStore[string(frameID)] = frame
+	clone := frame.Clone().(*protobufs.GlobalFrame)
+	e.frameStoreMu.Unlock()
+
+	if err := e.globalTimeReel.Insert(clone); err != nil {
+		framesProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Broadcast to workers AFTER the time reel insert (which triggers
+	// materialize). This ensures the master's snapshot reflects the correct
+	// tree state before workers try to verify the prover root and sync.
+	if frameBytes, err := frame.ToCanonicalBytes(); err == nil {
+		e.broadcastGlobalMessage(frameBytes, GLOBAL_FRAME_BITMASK)
+	}
+
+	head, err := e.globalTimeReel.GetHead()
+	if err == nil && head != nil {
+		e.currentRank = head.GetRank()
+	}
+
+	framesProcessedTotal.WithLabelValues("success").Inc()
+}
+
+// pollFramesFromArchive periodically fetches new frames from the archive
+// node and feeds them into processGlobalFrame. It replaces the pubsub
+// frame subscription for non-archive nodes.
+func (e *GlobalConsensusEngine) pollFramesFromArchive(
+	ctx lifecycle.SignalerContext,
+) {
+	if e.archiveClient == nil {
+		<-ctx.Done()
+		return
+	}
+
+	e.logger.Info("starting archive frame poller")
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var lastFrameNumber uint64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-e.haltCtx.Done():
+			return
+		case <-ticker.C:
+			frame, err := e.archiveClient.GetGlobalFrame(
+				context.Background(), 0,
+			)
+			if err != nil {
+				e.logger.Debug("archive poll error", zap.Error(err))
+				continue
+			}
+			if frame == nil || frame.Header == nil {
+				continue
+			}
+
+			newNumber := frame.Header.FrameNumber
+			if newNumber <= lastFrameNumber {
+				continue
+			}
+
+			// Catch up on any missed frames
+			if lastFrameNumber > 0 && newNumber > lastFrameNumber+1 {
+				for fn := lastFrameNumber + 1; fn < newNumber; fn++ {
+					catchup, err := e.archiveClient.GetGlobalFrame(
+						context.Background(), fn,
+					)
+					if err != nil {
+						e.logger.Debug(
+							"archive catchup error",
+							zap.Uint64("frame_number", fn),
+							zap.Error(err),
+						)
+						break
+					}
+					if catchup != nil {
+						e.processGlobalFrame(catchup)
+					}
+				}
+			}
+
+			e.processGlobalFrame(frame)
+			lastFrameNumber = newNumber
+		}
 	}
 }
 
@@ -342,14 +426,14 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 			return
 		}
 
-		e.frameStoreMu.RLock()
+		e.appFrameStoreMu.RLock()
 		existing, ok := e.appFrameStore[string(frame.Header.Address)]
 		if ok && existing != nil &&
 			existing.Header.FrameNumber >= frame.Header.FrameNumber {
-			e.frameStoreMu.RUnlock()
+			e.appFrameStoreMu.RUnlock()
 			return
 		}
-		e.frameStoreMu.RUnlock()
+		e.appFrameStoreMu.RUnlock()
 
 		valid, err := e.appFrameValidator.Validate(frame)
 		if !valid || err != nil {
@@ -375,8 +459,14 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 		}
 
 		e.addGlobalMessage(bundleBytes)
-		e.frameStoreMu.Lock()
-		defer e.frameStoreMu.Unlock()
+		if err := e.publishProverMessage(bundleBytes); err != nil {
+			e.logger.Warn(
+				"failed to forward shard frame to archive",
+				zap.Error(err),
+			)
+		}
+		e.appFrameStoreMu.Lock()
+		defer e.appFrameStoreMu.Unlock()
 		e.appFrameStore[string(frame.Header.Address)] = frame
 		shardFramesProcessedTotal.WithLabelValues("success").Inc()
 	default:
@@ -423,6 +513,9 @@ func (e *GlobalConsensusEngine) handlePeerInfoMessage(message *pb.Message) {
 
 		// Also add to the existing peer info manager
 		e.peerInfoManager.AddPeerInfo(peerInfo)
+
+		// Try to discover an archive endpoint from the peer's capabilities
+		e.tryDiscoverArchiveEndpoint(peerInfo)
 	case protobufs.KeyRegistryType:
 		keyRegistry := &protobufs.KeyRegistry{}
 		if err := keyRegistry.FromCanonicalBytes(message.Data); err != nil {
@@ -2230,4 +2323,108 @@ func (e *GlobalConsensusEngine) peekMessageType(message *pb.Message) uint32 {
 
 	// Read type prefix from first 4 bytes
 	return binary.BigEndian.Uint32(message.Data[:4])
+}
+
+// tryDiscoverArchiveEndpoint checks if a received PeerInfo advertises the
+// archive service capability. If this is a non-archive node without a
+// configured archive client, it connects to the peer's streaming gRPC server
+// using mTLS peer authentication and creates an ArchiveClient.
+func (e *GlobalConsensusEngine) tryDiscoverArchiveEndpoint(
+	peerInfo *protobufs.PeerInfo,
+) {
+	// Only relevant for non-archive nodes that don't already have an archive
+	// client.
+	if e.config.Engine != nil && e.config.Engine.ArchiveMode {
+		return
+	}
+	if e.archiveClient != nil {
+		return
+	}
+
+	// Scan capabilities for the archive service (presence flag only)
+	found := false
+	for _, cap := range peerInfo.Capabilities {
+		if cap != nil && cap.ProtocolIdentifier == ArchiveServiceCapabilityID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+
+	// Extract the stream multiaddr from the peer's reachability info
+	if len(peerInfo.Reachability) == 0 ||
+		len(peerInfo.Reachability[0].StreamMultiaddrs) == 0 {
+		e.logger.Debug(
+			"archive peer has no stream multiaddrs",
+			zap.String("peer_id", peer.ID(peerInfo.PeerId).String()),
+		)
+		return
+	}
+
+	s := peerInfo.Reachability[0].StreamMultiaddrs[0]
+
+	// Create mTLS credentials for the archive peer
+	emptyPolicies := map[string]channel.AllowedPeerPolicyType{}
+	creds, err := p2p.NewPeerAuthenticator(
+		e.logger,
+		e.config.P2P,
+		nil, nil, nil, nil,
+		[][]byte{peerInfo.PeerId},
+		emptyPolicies,
+		emptyPolicies,
+	).CreateClientTLSCredentials(peerInfo.PeerId)
+	if err != nil {
+		e.logger.Warn(
+			"failed to create mTLS credentials for archive peer",
+			zap.String("peer_id", peer.ID(peerInfo.PeerId).String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	maddr, err := multiaddr.StringCast(s)
+	if err != nil {
+		e.logger.Debug(
+			"failed to parse archive stream multiaddr",
+			zap.String("multiaddr", s),
+			zap.Error(err),
+		)
+		return
+	}
+
+	mga, err := mn.ToNetAddr(maddr)
+	if err != nil {
+		e.logger.Debug(
+			"failed to convert archive stream multiaddr to net addr",
+			zap.String("multiaddr", s),
+			zap.Error(err),
+		)
+		return
+	}
+
+	conn, err := grpc.NewClient(
+		mga.String(),
+		grpc.WithTransportCredentials(creds),
+	)
+	if err != nil {
+		e.logger.Warn(
+			"failed to dial archive peer",
+			zap.String("addr", mga.String()),
+			zap.String("peer_id", peer.ID(peerInfo.PeerId).String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	client := protobufs.NewGlobalServiceClient(conn)
+	archiveClient := rpc.NewArchiveClient(client, conn, e.logger)
+
+	e.SetArchiveClient(archiveClient)
+	e.logger.Info(
+		"archive client configured from discovered peer",
+		zap.String("addr", mga.String()),
+		zap.String("peer_id", peer.ID(peerInfo.PeerId).String()),
+	)
 }

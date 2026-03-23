@@ -153,7 +153,7 @@ func (p *appMessageProcessor) enforceCollectorLimit(
 }
 
 func (e *AppConsensusEngine) initAppMessageAggregator() error {
-	tracer := tracing.NewZapTracer(e.logger.Named("app_message_collector"))
+	tracer := tracing.NewZapTracer(e.logger.Named("appMessageCollector"))
 	processorFactory := &appMessageProcessorFactory{engine: e}
 	collectorFactory, err := keyedcollector.NewFactory(
 		tracer,

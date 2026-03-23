@@ -108,6 +108,9 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 							allAllocated := true
 							needsProposals := false
 							for _, w := range workers {
+								if w.ManuallyManaged {
+									continue
+								}
 								allAllocated = allAllocated && w.Allocated
 								if len(w.Filter) == 0 {
 									needsProposals = true
@@ -210,10 +213,7 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 						}
 
 						// Publish the kick message
-						if err := e.pubsub.PublishToBitmask(
-							GLOBAL_PROVER_BITMASK,
-							kickBytes,
-						); err != nil {
+						if err := e.publishProverMessage(kickBytes); err != nil {
 							e.logger.Error("failed to publish prover kick", zap.Error(err))
 						} else {
 							e.logger.Info(
@@ -442,10 +442,7 @@ func (e *GlobalConsensusEngine) handleShardSplitEvent(
 		return
 	}
 
-	if err := e.pubsub.PublishToBitmask(
-		GLOBAL_PROVER_BITMASK,
-		splitBytes,
-	); err != nil {
+	if err := e.publishProverMessage(splitBytes); err != nil {
 		e.logger.Error("failed to publish shard split", zap.Error(err))
 	} else {
 		e.logger.Info(
@@ -520,10 +517,7 @@ func (e *GlobalConsensusEngine) handleShardMergeEvent(
 			continue
 		}
 
-		if err := e.pubsub.PublishToBitmask(
-			GLOBAL_PROVER_BITMASK,
-			mergeBytes,
-		); err != nil {
+		if err := e.publishProverMessage(mergeBytes); err != nil {
 			e.logger.Error("failed to publish shard merge", zap.Error(err))
 		} else {
 			e.logger.Info(
@@ -587,7 +581,7 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 		workers, err := e.workerManager.RangeWorkers()
 		if err == nil {
 			for _, w := range workers {
-				if w != nil && len(w.Filter) == 0 {
+				if w != nil && len(w.Filter) == 0 && !w.ManuallyManaged {
 					allowProposals = true
 					break
 				}
@@ -613,6 +607,13 @@ func (e *GlobalConsensusEngine) evaluateForProposals(
 	proposalDescriptors := snapshot.proposalDescriptors
 	decideDescriptors := snapshot.decideDescriptors
 	worldBytes := snapshot.worldBytes
+
+	// Filter out manually-managed workers from auto-management decisions.
+	if mmFilters := e.workerManager.ManuallyManagedFilters(); len(mmFilters) > 0 {
+		pendingFilters = filterByteSlices(pendingFilters, mmFilters)
+		snapshot.leaveProposalCandidates = filterDescriptors(snapshot.leaveProposalCandidates, mmFilters)
+		snapshot.pendingLeaveFilters = filterByteSlices(snapshot.pendingLeaveFilters, mmFilters)
+	}
 
 	joinProposedThisCycle := false
 	if len(proposalDescriptors) != 0 && allowProposals {
@@ -1619,4 +1620,26 @@ func (e *GlobalConsensusEngine) getAppShardsFromProver(
 	}
 
 	return response, nil
+}
+
+// filterByteSlices removes entries whose hex encoding appears in the exclude set.
+func filterByteSlices(items [][]byte, exclude map[string]struct{}) [][]byte {
+	out := make([][]byte, 0, len(items))
+	for _, item := range items {
+		if _, skip := exclude[hex.EncodeToString(item)]; !skip {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// filterDescriptors removes ShardDescriptors whose filter hex appears in the exclude set.
+func filterDescriptors(descs []provers.ShardDescriptor, exclude map[string]struct{}) []provers.ShardDescriptor {
+	out := make([]provers.ShardDescriptor, 0, len(descs))
+	for _, d := range descs {
+		if _, skip := exclude[hex.EncodeToString(d.Filter)]; !skip {
+			out = append(out, d)
+		}
+	}
+	return out
 }

@@ -464,19 +464,27 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSyncSelf(
 ) {
 	info := p.peerInfoManager.GetPeerInfo([]byte(selfPeerID))
 	if info == nil {
-		p.logger.Debug(
+		p.logger.Warn(
 			"no peer info for self, skipping self-sync",
 			zap.String("peer", selfPeerID.String()),
 		)
 		return
 	}
 	if len(info.Reachability) == 0 {
-		p.logger.Debug(
+		p.logger.Warn(
 			"no reachability info for self, skipping self-sync",
 			zap.String("peer", selfPeerID.String()),
 		)
 		return
 	}
+
+	p.logger.Info(
+		"HyperSyncSelf: starting",
+		zap.Int("reachability_count", len(info.Reachability)),
+		zap.Bool("filter_is_nil", filter == nil),
+		zap.Int("filter_len", len(filter)),
+		zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+	)
 
 	phaseSyncs := [](func(
 		protobufs.HypergraphComparisonService_PerformSyncClient,
@@ -489,16 +497,34 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSyncSelf(
 		p.hyperSyncHyperedgeRemoves,
 	}
 
-	for _, reachability := range info.Reachability {
-		if !bytes.Equal(reachability.Filter, filter) {
+	filterMatched := false
+	for i, reachability := range info.Reachability {
+		matches := bytes.Equal(reachability.Filter, filter)
+		p.logger.Info(
+			"HyperSyncSelf: checking reachability",
+			zap.Int("index", i),
+			zap.Bool("filter_nil", reachability.Filter == nil),
+			zap.Int("filter_len", len(reachability.Filter)),
+			zap.String("filter_hex", hex.EncodeToString(reachability.Filter)),
+			zap.Bool("matches", matches),
+			zap.Int("stream_addrs", len(reachability.StreamMultiaddrs)),
+			zap.Strings("stream_multiaddrs", reachability.StreamMultiaddrs),
+		)
+		if !matches {
 			continue
 		}
+		filterMatched = true
 		for _, s := range reachability.StreamMultiaddrs {
-			for _, syncPhase := range phaseSyncs {
+			for phaseIdx, syncPhase := range phaseSyncs {
+				p.logger.Info(
+					"HyperSyncSelf: connecting for sync phase",
+					zap.Int("phase", phaseIdx),
+					zap.String("multiaddr", s),
+				)
 				ch, err := p.getDirectChannel([]byte(selfPeerID), s)
 				if err != nil {
-					p.logger.Debug(
-						"could not establish direct channel for self-sync, trying next multiaddr",
+					p.logger.Warn(
+						"could not establish direct channel for self-sync",
 						zap.String("peer", selfPeerID.String()),
 						zap.String("multiaddr", s),
 						zap.Error(err),
@@ -509,10 +535,17 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSyncSelf(
 				client := protobufs.NewHypergraphComparisonServiceClient(ch)
 				str, err := client.PerformSync(ctx)
 				if err != nil {
-					p.logger.Error("error from self-sync", zap.Error(err))
+					p.logger.Error("error from self-sync",
+						zap.Int("phase", phaseIdx),
+						zap.Error(err),
+					)
 					return
 				}
 
+				p.logger.Info(
+					"HyperSyncSelf: calling syncPhase",
+					zap.Int("phase", phaseIdx),
+				)
 				syncPhase(str, shardKey, expectedRoot)
 				if cerr := ch.Close(); cerr != nil {
 					p.logger.Error("error while closing connection", zap.Error(cerr))
@@ -520,6 +553,14 @@ func (p *SyncProvider[StateT, ProposalT]) HyperSyncSelf(
 			}
 		}
 		break
+	}
+
+	if !filterMatched {
+		p.logger.Warn(
+			"HyperSyncSelf: no reachability matched filter",
+			zap.Int("reachability_count", len(info.Reachability)),
+			zap.Bool("filter_is_nil", filter == nil),
+		)
 	}
 }
 

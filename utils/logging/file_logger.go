@@ -27,6 +27,7 @@ func NewRotatingFileLogger(
 	maxBackups int,
 	maxAge int,
 	compress bool,
+	logFilters map[string]string,
 ) (
 	*zap.Logger,
 	io.Closer,
@@ -58,12 +59,21 @@ func NewRotatingFileLogger(
 
 	ws := zapcore.AddSync(rot)
 
-	logLevel := zap.InfoLevel
+	baseLevel := zap.InfoLevel
 	if debug {
-		logLevel = zap.DebugLevel
+		baseLevel = zap.DebugLevel
 	}
 
-	core := zapcore.NewCore(enc, ws, logLevel)
+	filters := ParseLogFilters(logFilters)
+	coreLevel := baseLevel
+	for _, lvl := range filters {
+		if lvl < coreLevel {
+			coreLevel = lvl
+		}
+	}
+
+	core := zapcore.NewCore(enc, ws, coreLevel)
+	core = NewComponentFilterCore(core, baseLevel, filters)
 	logger := zap.New(core, zap.AddCaller(), zap.Fields(
 		zap.Uint("coreId", coreId),
 	))

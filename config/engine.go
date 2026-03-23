@@ -136,6 +136,9 @@ type EngineConfig struct {
 	RewardsAddress string `yaml:"rewardsAddress"`
 	// Whether to allow GOMAXPROCS values above the number of physical cores.
 	AllowExcessiveGOMAXPROCS bool `yaml:"allowExcessiveGOMAXPROCS"`
+	// RPC endpoints for archive nodes. When set, non-archive nodes use these
+	// for frame retrieval and message submission instead of blossomsub.
+	ArchiveEndpoints []string `yaml:"archiveEndpoints"`
 	// Blacklisted addresses
 	Blacklist []string `yaml:"blacklist"`
 	// Alert public key

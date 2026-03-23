@@ -129,6 +129,12 @@ func (e *GlobalConsensusEngine) subscribeToShardConsensusMessages() error {
 }
 
 func (e *GlobalConsensusEngine) subscribeToFrameMessages() error {
+	// Non-archive nodes receive frames via the archive client (polled or
+	// discovered), so they never subscribe to the frame bitmask.
+	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
+		return nil
+	}
+
 	if err := e.pubsub.Subscribe(
 		GLOBAL_FRAME_BITMASK,
 		func(message *pb.Message) error {
@@ -170,6 +176,12 @@ func (e *GlobalConsensusEngine) subscribeToFrameMessages() error {
 }
 
 func (e *GlobalConsensusEngine) subscribeToProverMessages() error {
+	// Non-archive nodes submit prover messages via the archive client, so
+	// they never subscribe to the prover bitmask.
+	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
+		return nil
+	}
+
 	if err := e.pubsub.Subscribe(
 		GLOBAL_PROVER_BITMASK,
 		func(message *pb.Message) error {

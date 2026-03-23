@@ -89,7 +89,7 @@ func NewWorkerManager(
 ) typesWorker.WorkerManager {
 	return &WorkerManager{
 		store:            store,
-		logger:           logger.Named("worker_manager"),
+		logger:           logger.Named("workerManager"),
 		workersByFilter:  make(map[string]uint),
 		filtersByWorker:  make(map[uint][]byte),
 		allocatedWorkers: make(map[uint]bool),
@@ -1056,6 +1056,7 @@ func (w *WorkerManager) respawnWorker(
 		respawnTimeout    = 5 * time.Second
 		initialBackoff    = 50 * time.Millisecond
 		maxRespawnBackoff = 2 * time.Second
+		maxAttempts       = 30
 	)
 
 	managerCtx := w.currentContext()
@@ -1064,7 +1065,7 @@ func (w *WorkerManager) respawnWorker(
 	}
 
 	backoff := initialBackoff
-	for {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		svc, err := w.getIPCOfWorker(coreId)
 		if err != nil {
 			w.logger.Error(
@@ -1090,6 +1091,8 @@ func (w *WorkerManager) respawnWorker(
 		w.logger.Warn(
 			"worker respawn failed, retrying",
 			zap.Uint("core_id", coreId),
+			zap.Int("attempt", attempt+1),
+			zap.Int("max_attempts", maxAttempts),
 			zap.Duration("backoff", backoff),
 			zap.Error(err),
 		)
@@ -1108,6 +1111,8 @@ func (w *WorkerManager) respawnWorker(
 			}
 		}
 	}
+
+	return errors.Errorf("worker %d: respawn failed after %d attempts", coreId, maxAttempts)
 }
 
 func (w *WorkerManager) spawnDataWorkers() {
@@ -1197,6 +1202,60 @@ func (w *WorkerManager) RequestJoin(
 	}
 
 	return w.proposeFunc(coreIds[:len(filters)], filters, w.copyServiceClients())
+}
+
+func (w *WorkerManager) SetManuallyManaged(coreId uint, manual bool) error {
+	if !w.isStarted() {
+		return errors.New("worker manager not started")
+	}
+
+	worker, err := w.store.GetWorker(coreId)
+	if err != nil {
+		return errors.Wrap(err, "set manually managed")
+	}
+
+	if worker.ManuallyManaged == manual {
+		return nil
+	}
+
+	worker.ManuallyManaged = manual
+
+	txn, err := w.store.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "set manually managed")
+	}
+
+	if err := w.store.PutWorker(txn, worker); err != nil {
+		txn.Abort()
+		return errors.Wrap(err, "set manually managed")
+	}
+
+	if err := txn.Commit(); err != nil {
+		return errors.Wrap(err, "set manually managed")
+	}
+
+	w.logger.Info(
+		"worker manually managed flag updated",
+		zap.Uint("core_id", coreId),
+		zap.Bool("manually_managed", manual),
+	)
+	return nil
+}
+
+func (w *WorkerManager) ManuallyManagedFilters() map[string]struct{} {
+	workers, err := w.store.RangeWorkers()
+	if err != nil {
+		w.logger.Warn("could not range workers for manual filter check", zap.Error(err))
+		return nil
+	}
+
+	result := make(map[string]struct{})
+	for _, worker := range workers {
+		if worker.ManuallyManaged && len(worker.Filter) > 0 {
+			result[hex.EncodeToString(worker.Filter)] = struct{}{}
+		}
+	}
+	return result
 }
 
 func (w *WorkerManager) stopDataWorkers() {

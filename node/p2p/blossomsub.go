@@ -238,7 +238,7 @@ func NewBlossomSubWithHost(
 
 	internal.MonitorPeers(
 		ctx,
-		logger.Named("peer-monitor"),
+		logger.Named("peerMonitor"),
 		host,
 		p2pConfig.PingTimeout,
 		p2pConfig.PingPeriod,
@@ -631,7 +631,7 @@ func NewBlossomSub(
 
 	internal.MonitorPeers(
 		ctx,
-		logger.Named("peer-monitor"),
+		logger.Named("peerMonitor"),
 		h,
 		p2pConfig.PingTimeout,
 		p2pConfig.PingPeriod,
@@ -1363,7 +1363,7 @@ func (b *BlossomSub) startConnectivityService() {
 	server := grpc.NewServer()
 	protobufs.RegisterConnectivityServiceServer(
 		server,
-		newConnectivityService(b.logger.Named("connectivity-service"), b.h),
+		newConnectivityService(b.logger.Named("connectivityService"), b.h),
 	)
 
 	go func() {

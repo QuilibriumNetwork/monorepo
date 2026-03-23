@@ -27,6 +27,7 @@ const (
 	GlobalService_GetLockedAddresses_FullMethodName   = "/quilibrium.node.global.pb.GlobalService/GetLockedAddresses"
 	GlobalService_GetWorkerInfo_FullMethodName        = "/quilibrium.node.global.pb.GlobalService/GetWorkerInfo"
 	GlobalService_StreamGlobalMessages_FullMethodName = "/quilibrium.node.global.pb.GlobalService/StreamGlobalMessages"
+	GlobalService_SubmitGlobalMessage_FullMethodName  = "/quilibrium.node.global.pb.GlobalService/SubmitGlobalMessage"
 )
 
 // GlobalServiceClient is the client API for GlobalService service.
@@ -40,6 +41,7 @@ type GlobalServiceClient interface {
 	GetLockedAddresses(ctx context.Context, in *GetLockedAddressesRequest, opts ...grpc.CallOption) (*GetLockedAddressesResponse, error)
 	GetWorkerInfo(ctx context.Context, in *GlobalGetWorkerInfoRequest, opts ...grpc.CallOption) (*GlobalGetWorkerInfoResponse, error)
 	StreamGlobalMessages(ctx context.Context, in *StreamGlobalMessagesRequest, opts ...grpc.CallOption) (GlobalService_StreamGlobalMessagesClient, error)
+	SubmitGlobalMessage(ctx context.Context, in *SubmitGlobalMessageRequest, opts ...grpc.CallOption) (*SubmitGlobalMessageResponse, error)
 }
 
 type globalServiceClient struct {
@@ -136,6 +138,15 @@ func (x *globalServiceStreamGlobalMessagesClient) Recv() (*StreamGlobalMessagesR
 	return m, nil
 }
 
+func (c *globalServiceClient) SubmitGlobalMessage(ctx context.Context, in *SubmitGlobalMessageRequest, opts ...grpc.CallOption) (*SubmitGlobalMessageResponse, error) {
+	out := new(SubmitGlobalMessageResponse)
+	err := c.cc.Invoke(ctx, GlobalService_SubmitGlobalMessage_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GlobalServiceServer is the server API for GlobalService service.
 // All implementations must embed UnimplementedGlobalServiceServer
 // for forward compatibility
@@ -147,6 +158,7 @@ type GlobalServiceServer interface {
 	GetLockedAddresses(context.Context, *GetLockedAddressesRequest) (*GetLockedAddressesResponse, error)
 	GetWorkerInfo(context.Context, *GlobalGetWorkerInfoRequest) (*GlobalGetWorkerInfoResponse, error)
 	StreamGlobalMessages(*StreamGlobalMessagesRequest, GlobalService_StreamGlobalMessagesServer) error
+	SubmitGlobalMessage(context.Context, *SubmitGlobalMessageRequest) (*SubmitGlobalMessageResponse, error)
 	mustEmbedUnimplementedGlobalServiceServer()
 }
 
@@ -174,6 +186,9 @@ func (UnimplementedGlobalServiceServer) GetWorkerInfo(context.Context, *GlobalGe
 }
 func (UnimplementedGlobalServiceServer) StreamGlobalMessages(*StreamGlobalMessagesRequest, GlobalService_StreamGlobalMessagesServer) error {
 	return status.Errorf(codes.Unimplemented, "method StreamGlobalMessages not implemented")
+}
+func (UnimplementedGlobalServiceServer) SubmitGlobalMessage(context.Context, *SubmitGlobalMessageRequest) (*SubmitGlobalMessageResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SubmitGlobalMessage not implemented")
 }
 func (UnimplementedGlobalServiceServer) mustEmbedUnimplementedGlobalServiceServer() {}
 
@@ -317,6 +332,24 @@ func (x *globalServiceStreamGlobalMessagesServer) Send(m *StreamGlobalMessagesRe
 	return x.ServerStream.SendMsg(m)
 }
 
+func _GlobalService_SubmitGlobalMessage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitGlobalMessageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GlobalServiceServer).SubmitGlobalMessage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GlobalService_SubmitGlobalMessage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GlobalServiceServer).SubmitGlobalMessage(ctx, req.(*SubmitGlobalMessageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // GlobalService_ServiceDesc is the grpc.ServiceDesc for GlobalService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -347,6 +380,10 @@ var GlobalService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetWorkerInfo",
 			Handler:    _GlobalService_GetWorkerInfo_Handler,
+		},
+		{
+			MethodName: "SubmitGlobalMessage",
+			Handler:    _GlobalService_SubmitGlobalMessage_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

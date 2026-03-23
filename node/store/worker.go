@@ -189,9 +189,10 @@ func encodeWorkerInfo(worker *store.WorkerInfo) ([]byte, error) {
 	filterLen := uint16(len(worker.Filter))
 
 	// totalLen = coreId(8) + totalStorage(8) + automatic(1) + allocated(1)
-	//   + 2 + listen + 2 + stream + 2 + filter
+	//   + 2 + listen + 2 + stream + 2 + filter + pendingFilterFrame(8)
+	//   + manuallyManaged(1)
 	totalLen := 8 + 8 + 1 + 1 + 2 + int(listenMultiaddrLen) + 2 +
-		int(streamListenMultiaddrLen) + 2 + int(filterLen) + 8
+		int(streamListenMultiaddrLen) + 2 + int(filterLen) + 8 + 1
 	data := make([]byte, totalLen)
 
 	offset := 0
@@ -231,6 +232,11 @@ func encodeWorkerInfo(worker *store.WorkerInfo) ([]byte, error) {
 	offset += int(filterLen)
 
 	binary.BigEndian.PutUint64(data[offset:], worker.PendingFilterFrame)
+	offset += 8
+
+	if worker.ManuallyManaged {
+		data[offset] = 1
+	}
 
 	return data, nil
 }
@@ -311,6 +317,12 @@ func decodeWorkerInfo(data []byte) (*store.WorkerInfo, error) {
 	var pendingFrame uint64
 	if offset+8 <= len(data) {
 		pendingFrame = binary.BigEndian.Uint64(data[offset:])
+		offset += 8
+	}
+
+	var manuallyManaged bool
+	if offset+1 <= len(data) {
+		manuallyManaged = data[offset] == 1
 	}
 
 	return &store.WorkerInfo{
@@ -322,5 +334,6 @@ func decodeWorkerInfo(data []byte) (*store.WorkerInfo, error) {
 		Automatic:             automatic,
 		Allocated:             allocated,
 		PendingFilterFrame:    pendingFrame,
+		ManuallyManaged:       manuallyManaged,
 	}, nil
 }
