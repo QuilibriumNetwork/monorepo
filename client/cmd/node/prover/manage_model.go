@@ -1217,42 +1217,15 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 
 	for i := m.allocOffset; i < end; i++ {
 		a := filtered[i]
-		workerStr := "-"
-		if a.workerID >= 0 {
-			workerStr = strconv.Itoa(a.workerID)
-		}
 		displayStatus := a.statusName
 		if a.manuallyManaged {
 			displayStatus += " [M]"
 		}
-		var line string
-		if hasSelections {
-			marker := "[ ]"
-			if m.allocSelected[a.filterKey] {
-				marker = "[x]"
-			}
-			line = fmt.Sprintf("%s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-				marker,
-				workerStr,
-				a.filterHex,
-				a.activeProvers,
-				a.ring,
-				formatStorage(a.shardSize.Uint64()),
-				"~"+formatQUIL(a.estimatedReward)+" Q/f",
-				displayStatus,
-			)
-		} else {
-			line = fmt.Sprintf("  %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-				workerStr,
-				a.filterHex,
-				a.activeProvers,
-				a.ring,
-				formatStorage(a.shardSize.Uint64()),
-				"~"+formatQUIL(a.estimatedReward)+" Q/f",
-				displayStatus,
-			)
+		marker := "[ ]"
+		if m.allocSelected[a.filterKey] {
+			marker = "[x]"
 		}
-		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
+		line := fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
 			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"d %"+strconv.Itoa(STATUS_WIDTH)+"s "+
 			"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
 			marker,
@@ -1262,7 +1235,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 			formatStorage(a.shardSize.Uint64()),
 			"~"+formatQUIL(a.estimatedReward)+" Q/f",
 			a.workerID,
-			a.statusName,
+			displayStatus,
 			a.nextAction,
 			a.defaultAction,
 		)
