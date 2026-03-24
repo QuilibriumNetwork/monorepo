@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"math/big"
 	"math/rand"
 	"net"
@@ -1957,12 +1958,22 @@ func (e *GlobalConsensusEngine) materialize(
 	}
 
 	// Evict provers inactive for >360 frames, subtracting any halt duration.
+	// Only archive nodes perform eviction — non-archive nodes receive the
+	// eviction results through sync.
 	// computeShardHaltDurations initializes the streak map on first call
 	// (reconstructing halt data from LastActiveFrameNumber). Skip eviction
 	// until it has run at least once so we never evict before accounting
-	// for halt periods.
+	// for halt periods. During an active coverage halt (any shard at
+	// math.MaxUint64), skip eviction entirely — nobody should be evicted.
 	shardHaltDurations := e.computeShardHaltDurations(frameNumber)
-	if shardHaltDurations != nil {
+	anyHalted := false
+	for _, d := range shardHaltDurations {
+		if d == math.MaxUint64 {
+			anyHalted = true
+			break
+		}
+	}
+	if e.config.Engine.ArchiveMode && shardHaltDurations != nil && !anyHalted {
 		evictionState := hgstate.NewHypergraphState(e.hypergraph)
 		evicted, evictErr := e.proverRegistry.EvictInactiveProvers(
 			frameNumber, 360, shardHaltDurations, evictionState,

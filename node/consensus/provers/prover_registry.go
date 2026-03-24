@@ -2130,6 +2130,10 @@ func (r *ProverRegistry) EvictInactiveProvers(
 			if alloc.Status != consensus.ProverStatusActive {
 				continue
 			}
+			// Global provers (empty confirmation filter) are never evicted.
+			if len(alloc.ConfirmationFilter) == 0 {
+				continue
+			}
 			filterKey := string(alloc.ConfirmationFilter)
 			haltDuration := shardHaltDurations[filterKey]
 			if haltDuration == math.MaxUint64 {
