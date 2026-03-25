@@ -1,6 +1,7 @@
 package global
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -190,7 +191,8 @@ func (p *ProverSeniorityMerge) Materialize(
 		return nil, errors.Wrap(err, "materialize")
 	}
 
-	// Mark merge targets as spent
+	// Mark merge targets as spent with prover address so the same prover
+	// can re-use them (matching the ProverJoin spent marker format).
 	for _, mt := range p.MergeTargets {
 		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
 			[]byte("PROVER_SENIORITY_MERGE"),
@@ -200,17 +202,58 @@ func (p *ProverSeniorityMerge) Materialize(
 			return nil, errors.Wrap(err, "materialize")
 		}
 
+		spentMergeAddr := spentMergeBI.FillBytes(make([]byte, 32))
+
+		// Check for existing spent marker to use as prior tree
+		var prior *tries.VectorCommitmentTree
+		existing, existErr := hg.Get(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			spentMergeAddr,
+			hgstate.VertexAddsDiscriminator,
+		)
+		if existErr == nil && existing != nil {
+			existingTree, ok := existing.(*tries.VectorCommitmentTree)
+			if ok && existingTree != nil {
+				storedAddr, getErr := p.rdfMultiprover.Get(
+					GLOBAL_RDF_SCHEMA,
+					"merge:SpentMerge",
+					"ProverAddress",
+					existingTree,
+				)
+				if getErr == nil && len(storedAddr) == 32 {
+					// Already has a prover address — skip
+					continue
+				}
+				// Legacy empty marker — overwrite with prover address
+				prior = existingTree
+			}
+		}
+
+		// Write spent marker with prover address
+		spentTree := &tries.VectorCommitmentTree{}
+		err = p.rdfMultiprover.Set(
+			GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"merge:SpentMerge",
+			"ProverAddress",
+			proverAddress,
+			spentTree,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "materialize")
+		}
+
 		spentMergeVertex := hg.NewVertexAddMaterializedState(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-			[32]byte(spentMergeBI.FillBytes(make([]byte, 32))),
+			[32]byte(spentMergeAddr),
 			frameNumber,
-			nil,
-			&tries.VectorCommitmentTree{},
+			prior,
+			spentTree,
 		)
 
 		err = hg.Set(
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-			spentMergeBI.FillBytes(make([]byte, 32)),
+			spentMergeAddr,
 			hgstate.VertexAddsDiscriminator,
 			frameNumber,
 			spentMergeVertex,
@@ -430,7 +473,9 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 			)
 		}
 
-		// Confirm this merge target has not already been used
+		// Confirm this merge target has not already been used by a
+		// different prover. If the same prover consumed it (via a prior
+		// join or merge), allow re-use so seniority can be restored.
 		spentMergeBI, err := poseidon.HashBytes(slices.Concat(
 			[]byte("PROVER_SENIORITY_MERGE"),
 			mt.PublicKey,
@@ -445,10 +490,22 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 
 		v, err := p.hypergraph.GetVertex(spentAddress)
 		if err == nil && v != nil {
-			return false, errors.Wrap(
-				errors.New("merge target already used"),
-				"verify: invalid prover seniority merge",
-			)
+			spentData, dataErr := p.hypergraph.GetVertexData(spentAddress)
+			if dataErr == nil && spentData != nil {
+				storedAddr, getErr := p.rdfMultiprover.Get(
+					GLOBAL_RDF_SCHEMA,
+					"merge:SpentMerge",
+					"ProverAddress",
+					spentData,
+				)
+				if getErr == nil && len(storedAddr) == 32 &&
+					!bytes.Equal(storedAddr, p.PublicKeySignatureBLS48581.Address) {
+					return false, errors.Wrap(
+						errors.New("merge target already used"),
+						"verify: invalid prover seniority merge",
+					)
+				}
+			}
 		}
 
 		// Also check against the ProverJoin spent marker
@@ -466,10 +523,22 @@ func (p *ProverSeniorityMerge) Verify(frameNumber uint64) (bool, error) {
 
 		v, err = p.hypergraph.GetVertex(joinSpentAddress)
 		if err == nil && v != nil {
-			return false, errors.Wrap(
-				errors.New("merge target already used in join"),
-				"verify: invalid prover seniority merge",
-			)
+			spentData, dataErr := p.hypergraph.GetVertexData(joinSpentAddress)
+			if dataErr == nil && spentData != nil {
+				storedAddr, getErr := p.rdfMultiprover.Get(
+					GLOBAL_RDF_SCHEMA,
+					"merge:SpentMerge",
+					"ProverAddress",
+					spentData,
+				)
+				if getErr == nil && len(storedAddr) == 32 &&
+					!bytes.Equal(storedAddr, p.PublicKeySignatureBLS48581.Address) {
+					return false, errors.Wrap(
+						errors.New("merge target already used in join"),
+						"verify: invalid prover seniority merge",
+					)
+				}
+			}
 		}
 
 		// Track peer ID for seniority lookup
