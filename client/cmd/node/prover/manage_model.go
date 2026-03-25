@@ -1125,13 +1125,13 @@ func (m manageModel) renderView() string {
 	// Allocations panel.
 	filteredAllocs := m.filteredAllocations()
 	activePerFrame := big.NewInt(0)
-	pendingPerFrame := big.NewInt(0)
+	joiningPerFrame := big.NewInt(0)
 	pausedPerFrame := big.NewInt(0)
 	leavingPerFrame := big.NewInt(0)
 	for _, a := range filteredAllocs {
 		switch a.status {
 		case 1:
-			pendingPerFrame.Add(pendingPerFrame, a.estimatedReward)
+			joiningPerFrame.Add(joiningPerFrame, a.estimatedReward)
 		case 2:
 			activePerFrame.Add(activePerFrame, a.estimatedReward)
 		case 3:
@@ -1142,13 +1142,13 @@ func (m manageModel) renderView() string {
 
 	}
 	totalPerFrame := big.NewInt(0)
-	totalPerFrame.Add(totalPerFrame, pendingPerFrame)
+	totalPerFrame.Add(totalPerFrame, joiningPerFrame)
 	totalPerFrame.Add(totalPerFrame, activePerFrame)
 	totalPerFrame.Add(totalPerFrame, pausedPerFrame)
 	totalPerFrame.Add(totalPerFrame, leavingPerFrame)
 
 	allocTitle := fmt.Sprintf("Allocations (%d) Rewards: Total ~%s QUIL/day = Joining ~%s QUIL/day + Active ~%s QUIL/day + Paused ~%s QUIL/day + Leaving ~%s QUIL/day",
-		len(filteredAllocs), formatQUILDaily(totalPerFrame), formatQUILDaily(pendingPerFrame), formatQUILDaily(activePerFrame),
+		len(filteredAllocs), formatQUILDaily(totalPerFrame), formatQUILDaily(joiningPerFrame), formatQUILDaily(activePerFrame),
 		formatQUILDaily(pausedPerFrame), formatQUILDaily(leavingPerFrame))
 	if n := len(m.allocSelected); n > 0 {
 		allocTitle += fmt.Sprintf(" [%d selected]", n)
