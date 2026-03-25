@@ -13,7 +13,7 @@ import (
 
 var allocationStatusNames = map[uint32]string{
 	0: "Unknown",
-	1: "Pending",
+	1: "Joining",
 	2: "Active",
 	3: "Paused",
 	4: "Leaving",
@@ -78,9 +78,21 @@ and shard allocations.
 		}
 
 		workers := workerByFilter(client)
+		headFrame := info.GetLastGlobalHeadFrame()
 
-		fmt.Printf("\nShard Allocations (%d):\n", len(allocations))
+		fmt.Printf("\nShard Allocations:\n")
 		for i, alloc := range allocations {
+			// Skip expired joins (implicitly rejected after 720 frames)
+			if alloc.GetStatus() == 1 && alloc.GetJoinFrameNumber() > 0 &&
+				headFrame >= alloc.GetJoinFrameNumber()+720 {
+				continue
+			}
+			// Skip expired leaves (implicitly left after 720 frames)
+			if alloc.GetStatus() == 4 && alloc.GetLeaveFrameNumber() > 0 &&
+				headFrame >= alloc.GetLeaveFrameNumber()+720 {
+				continue
+			}
+
 			statusName, ok := allocationStatusNames[alloc.GetStatus()]
 			if !ok {
 				statusName = fmt.Sprintf("Unknown(%d)", alloc.GetStatus())

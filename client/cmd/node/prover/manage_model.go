@@ -925,6 +925,16 @@ func (m *manageModel) processRefreshData(
 		if s != 1 && s != 2 && s != 3 && s != 4 {
 			continue
 		}
+		// Skip expired joins (implicitly rejected after 720 frames).
+		if s == 1 && a.GetJoinFrameNumber() > 0 &&
+			m.frameNumber >= a.GetJoinFrameNumber()+ACTION_FRAME_DELAY*2 {
+			continue
+		}
+		// Skip expired leaves (implicitly left after 720 frames).
+		if s == 4 && a.GetLeaveFrameNumber() > 0 &&
+			m.frameNumber >= a.GetLeaveFrameNumber()+ACTION_FRAME_DELAY*2 {
+			continue
+		}
 		filterHex := hex.EncodeToString(a.GetFilter())
 		allocatedFilters[filterHex] = true
 
@@ -935,9 +945,8 @@ func (m *manageModel) processRefreshData(
 
 		nextAction := ""
 		defaultAction := ""
-		// For Pending (Joining) and Leaving, annotate with confirmable frame.
-		if (a.GetStatus() == 1 || a.GetStatus() == 4) && a.GetJoinFrameNumber() > 0 {
-
+		// For Joining, annotate with confirmable frame.
+		if a.GetStatus() == 1 && a.GetJoinFrameNumber() > 0 {
 			actionFrame := a.GetJoinFrameNumber() + ACTION_FRAME_DELAY
 			expiryFrame := a.GetJoinFrameNumber() + ACTION_FRAME_DELAY*2
 			if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
@@ -945,11 +954,17 @@ func (m *manageModel) processRefreshData(
 			} else {
 				nextAction = fmt.Sprintf("Reject@now | Confirm@%d", actionFrame)
 			}
-			if a.GetStatus() == 1 && m.frameNumber < expiryFrame {
-				defaultAction = fmt.Sprintf("Reject@%d", expiryFrame)
-			} else if a.GetStatus() == 4 && m.frameNumber < expiryFrame {
-				defaultAction = fmt.Sprintf("Confirm@%d", expiryFrame)
+			defaultAction = fmt.Sprintf("Reject@%d", expiryFrame)
+		} else if a.GetStatus() == 4 && a.GetLeaveFrameNumber() > 0 {
+			// For Leaving, use LeaveFrameNumber for action/expiry calculation.
+			actionFrame := a.GetLeaveFrameNumber() + ACTION_FRAME_DELAY
+			expiryFrame := a.GetLeaveFrameNumber() + ACTION_FRAME_DELAY*2
+			if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
+				nextAction = "Reject@now | Confirm@now"
+			} else {
+				nextAction = fmt.Sprintf("Reject@now | Confirm@%d", actionFrame)
 			}
+			defaultAction = fmt.Sprintf("Confirm@%d", expiryFrame)
 		} else if a.GetStatus() == 2 {
 			nextAction = "Pause@now | Leave@now"
 		} else if a.GetStatus() == 3 {
@@ -1132,7 +1147,7 @@ func (m manageModel) renderView() string {
 	totalPerFrame.Add(totalPerFrame, pausedPerFrame)
 	totalPerFrame.Add(totalPerFrame, leavingPerFrame)
 
-	allocTitle := fmt.Sprintf("Allocations (%d) Rewards: Total ~%s QUIL/day = Pending ~%s QUIL/day + Active ~%s QUIL/day + Paused ~%s QUIL/day + Leaving ~%s QUIL/day",
+	allocTitle := fmt.Sprintf("Allocations (%d) Rewards: Total ~%s QUIL/day = Joining ~%s QUIL/day + Active ~%s QUIL/day + Paused ~%s QUIL/day + Leaving ~%s QUIL/day",
 		len(filteredAllocs), formatQUILDaily(totalPerFrame), formatQUILDaily(pendingPerFrame), formatQUILDaily(activePerFrame),
 		formatQUILDaily(pausedPerFrame), formatQUILDaily(leavingPerFrame))
 	if n := len(m.allocSelected); n > 0 {
