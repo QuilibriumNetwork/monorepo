@@ -1177,11 +1177,11 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 							shardsActive++
 							isActiveAllocation = true
 						}
-						if allocation.Status == typesconsensus.ProverStatusLeaving {
+						if allocation.Status == typesconsensus.ProverStatusLeaving &&
+							data.Frame.Header.FrameNumber <= allocation.LeaveFrameNumber+pendingFilterGraceFrames {
 							shardsLeaving++
 							// Check if in the 360-720 decision window
-							if allocation.LeaveFrameNumber+360 <= data.Frame.Header.FrameNumber &&
-								data.Frame.Header.FrameNumber <= allocation.LeaveFrameNumber+pendingFilterGraceFrames {
+							if allocation.LeaveFrameNumber+360 <= data.Frame.Header.FrameNumber {
 								isPendingLeave = true
 							}
 						}
