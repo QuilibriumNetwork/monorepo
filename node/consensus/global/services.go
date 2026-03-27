@@ -21,6 +21,24 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
+// getCachedGlobalFrame returns a global frame by number, using an in-memory
+// LRU cache to avoid repeated Pebble reads for recently-served frames.
+func (e *GlobalConsensusEngine) getCachedGlobalFrame(
+	frameNumber uint64,
+) (*protobufs.GlobalFrame, error) {
+	if frame, ok := e.globalFrameCache.Get(frameNumber); ok {
+		return frame, nil
+	}
+
+	frame, err := e.clockStore.GetGlobalClockFrame(frameNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	e.globalFrameCache.Add(frameNumber, frame)
+	return frame, nil
+}
+
 func (e *GlobalConsensusEngine) GetGlobalFrame(
 	ctx context.Context,
 	request *protobufs.GetGlobalFrameRequest,
@@ -46,7 +64,7 @@ func (e *GlobalConsensusEngine) GetGlobalFrame(
 			)
 		}
 	} else {
-		frame, err = e.clockStore.GetGlobalClockFrame(request.FrameNumber)
+		frame, err = e.getCachedGlobalFrame(request.FrameNumber)
 	}
 
 	if err != nil {
@@ -75,7 +93,7 @@ func (e *GlobalConsensusEngine) GetGlobalProposal(
 
 	// Genesis does not have a parent cert, treat special:
 	if request.FrameNumber == 0 {
-		frame, err := e.clockStore.GetGlobalClockFrame(request.FrameNumber)
+		frame, err := e.getCachedGlobalFrame(request.FrameNumber)
 		if err != nil {
 			e.logger.Debug(
 				"received error while fetching global frame",
@@ -165,7 +183,7 @@ func (e *GlobalConsensusEngine) loadFrameMatchingSelector(
 		return bytes.Equal([]byte(frame.Identity()), expectedSelector)
 	}
 
-	frame, err := e.clockStore.GetGlobalClockFrame(frameNumber)
+	frame, err := e.getCachedGlobalFrame(frameNumber)
 	if err == nil && matchesSelector(frame) {
 		return frame, nil
 	}
@@ -476,7 +494,7 @@ func (e *GlobalConsensusEngine) LatestGlobalFrame() (*protobufs.GlobalFrame, err
 func (e *GlobalConsensusEngine) GlobalFrameByNumber(
 	frameNumber uint64,
 ) (*protobufs.GlobalFrame, error) {
-	return e.clockStore.GetGlobalClockFrame(frameNumber)
+	return e.getCachedGlobalFrame(frameNumber)
 }
 
 // InjectGlobalMessage implements consensus.GlobalFrameService.
