@@ -355,9 +355,11 @@ func (e *GlobalConsensusEngine) pollFramesFromArchive(
 		case <-e.haltCtx.Done():
 			return
 		case <-ticker.C:
-			frame, err := e.archiveClient.GetGlobalFrame(
-				context.Background(), 0,
+			pollCtx, pollCancel := context.WithTimeout(
+				context.Background(), 30*time.Second,
 			)
+			frame, err := e.archiveClient.GetGlobalFrame(pollCtx, 0)
+			pollCancel()
 			if err != nil {
 				e.logger.Debug("archive poll error", zap.Error(err))
 				continue
@@ -374,9 +376,13 @@ func (e *GlobalConsensusEngine) pollFramesFromArchive(
 			// Catch up on any missed frames
 			if lastFrameNumber > 0 && newNumber > lastFrameNumber+1 {
 				for fn := lastFrameNumber + 1; fn < newNumber; fn++ {
-					catchup, err := e.archiveClient.GetGlobalFrame(
-						context.Background(), fn,
+					catchupCtx, catchupCancel := context.WithTimeout(
+						context.Background(), 30*time.Second,
 					)
+					catchup, err := e.archiveClient.GetGlobalFrame(
+						catchupCtx, fn,
+					)
+					catchupCancel()
 					if err != nil {
 						e.logger.Debug(
 							"archive catchup error",
