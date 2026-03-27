@@ -603,6 +603,12 @@ func (g *GlobalTimeReel) evaluateForkChoice(newNode *GlobalFrameNode) {
 			maxGlobalTreeDepth) {
 		oldHead := g.head
 		g.head = newNode
+
+		// Persist and materialize the frame even during jump-ahead so that
+		// the consensus engine processes the frame instead of silently
+		// advancing the head pointer.
+		g.persistCanonicalFrames([]*protobufs.GlobalFrame{newNode.Frame})
+
 		g.sendHeadEvent(newNode, oldHead)
 		return
 	}
