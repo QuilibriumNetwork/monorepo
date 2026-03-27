@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -277,6 +278,7 @@ type GlobalConsensusEngine struct {
 	appShardCache             map[string]*appShardCacheEntry
 	appShardCacheMu           sync.RWMutex
 	appShardCacheRank         uint64
+	globalFrameCache          *lru.Cache[uint64, *protobufs.GlobalFrame]
 
 	// Transaction cross-shard lock tracking
 	txLockMap map[uint64]map[string]map[string]*LockedTransaction
@@ -426,6 +428,12 @@ func NewGlobalConsensusEngine(
 		globalMessageSpillover:      make(map[uint64][][]byte),
 		globalMessageSubscribers:    make(map[chan *protobufs.StreamGlobalMessagesResponse]struct{}),
 	}
+
+	frameCache, err := lru.New[uint64, *protobufs.GlobalFrame](128)
+	if err != nil {
+		return nil, errors.Wrap(err, "create global frame cache")
+	}
+	engine.globalFrameCache = frameCache
 	engine.frameChainChecker = NewFrameChainChecker(clockStore, logger)
 
 	if err := engine.initGlobalMessageAggregator(); err != nil {
