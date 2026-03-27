@@ -28,14 +28,18 @@ const (
 type ShardDescriptor struct {
 	// Confirmation filter for the shard (routing key). Must be non-empty.
 	Filter []byte
-	// Size in bytes of this shard’s state (for reward proportionality).
+	// Size in bytes of this shard's state (for reward proportionality).
 	Size uint64
 	// Ring attenuation factor (reward is divided by 2^Ring). Usually 0 unless
 	// you intentionally place on outer rings.
 	Ring uint8
 	// Logical shard-group participation count for sqrt divisor (>=1).
-	// If you’re assigning a worker to exactly one shard, use 1.
+	// If you're assigning a worker to exactly one shard, use 1.
 	Shards uint64
+	// Number of provers that would share the joiner's ring (including the
+	// joiner). The per-ring reward is divided evenly among these provers.
+	// Set to 0 to omit the per-ring sharing divisor from scoring.
+	ActiveOnRing uint64
 }
 
 // Proposal is a plan to allocate a specific worker to a shard filter.
@@ -374,6 +378,13 @@ func (m *Manager) scoreShards(
 
 			factor = factor.Div(ringDiv)
 			factor = factor.Div(shardsSqrt)
+
+			// Divide by the number of provers sharing this ring to get
+			// per-prover reward (matches Materialize's share calculation).
+			if s.ActiveOnRing > 1 {
+				factor = factor.Div(decimal.NewFromUint64(s.ActiveOnRing))
+			}
+
 			score = factor.BigInt()
 		}
 

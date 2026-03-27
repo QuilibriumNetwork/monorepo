@@ -24,12 +24,13 @@ import (
 )
 
 type shardEntry struct {
-	filter      []byte
-	size        *big.Int
-	dataShards  uint64
-	totalActive int
-	isAllocated bool
-	ring        uint8
+	filter        []byte
+	size          *big.Int
+	dataShards    uint64
+	totalActive   int
+	proversOnRing int
+	isAllocated   bool
+	ring          uint8
 }
 
 // GetShardInfo implements typesconsensus.ShardInfoProvider.
@@ -144,7 +145,7 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 
 	details := make([]*typesconsensus.ShardDetail, 0, len(entries))
 	for _, entry := range entries {
-		est := computeShardReward(basis, entry.size, worldBytes, entry.ring, entry.dataShards)
+		est := computeShardReward(basis, entry.size, worldBytes, entry.ring, entry.dataShards, entry.proversOnRing)
 
 		details = append(details, &typesconsensus.ShardDetail{
 			Filter:          entry.filter,
@@ -257,13 +258,24 @@ func (e *GlobalConsensusEngine) buildShardEntries(
 				ring = uint8(len(candidates) / 8)
 			}
 
+			// Count provers sharing this ring.
+			ringStart := int(ring) * 8
+			onRing := len(candidates) - ringStart
+			if onRing > 8 {
+				onRing = 8
+			}
+			if onRing < 1 {
+				onRing = 1
+			}
+
 			entries = append(entries, shardEntry{
-				filter:      bp,
-				size:        size,
-				dataShards:  shard.DataShards,
-				totalActive: len(candidates),
-				isAllocated: isAlloc,
-				ring:        ring,
+				filter:        bp,
+				size:          size,
+				dataShards:    shard.DataShards,
+				totalActive:   len(candidates),
+				proversOnRing: onRing,
+				isAllocated:   isAlloc,
+				ring:          ring,
 			})
 		}
 	}
@@ -404,18 +416,20 @@ type shardInfoEntry struct {
 	DataShards uint64
 }
 
-// computeShardReward computes the per-frame reward estimate for a single shard.
-// Formula matches proof_of_meaningful_work.go:
+// computeShardReward computes the per-prover per-frame reward estimate.
+// Formula matches proof_of_meaningful_work.go (Materialize):
 //
-//	(basis * shardSize / worldBytes) / (2^(ring+1) * sqrt(activeProvers))
+//	per_ring  = (basis * shardSize / worldBytes) / (2^(ring+1) * sqrt(dataShards))
+//	per_prover = per_ring / proversOnRing
 func computeShardReward(
 	basis *big.Int,
 	shardSize *big.Int,
 	worldBytes *big.Int,
 	ring uint8,
-	activeProvers uint64,
+	dataShards uint64,
+	proversOnRing int,
 ) *big.Int {
-	if basis.Sign() == 0 || worldBytes.Sign() == 0 || activeProvers == 0 {
+	if basis.Sign() == 0 || worldBytes.Sign() == 0 || dataShards == 0 {
 		return big.NewInt(0)
 	}
 
@@ -434,13 +448,17 @@ func computeShardReward(
 	}
 	factor.Div(factor, big.NewInt(divisor))
 
-	// Approximate sqrt(activeProvers) using integer math:
-	// Newton's method for isqrt.
-	if activeProvers > 1 {
-		sqrtVal := isqrt(activeProvers)
+	// sqrt(dataShards) — matches the sqrt(shardCount) in the reward module.
+	if dataShards > 1 {
+		sqrtVal := isqrt(dataShards)
 		if sqrtVal > 0 {
 			factor.Div(factor, big.NewInt(int64(sqrtVal)))
 		}
+	}
+
+	// Divide by provers sharing this ring to get per-prover reward.
+	if proversOnRing > 1 {
+		factor.Div(factor, big.NewInt(int64(proversOnRing)))
 	}
 
 	return factor

@@ -1209,8 +1209,9 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 			// Count all active/joining provers on this shard. The actual ring
 			// assignment (global_prover_shard_update.go:computeRingAssignments)
 			// uses floor(rank / 8) where rank is position in the full sorted
-			// candidate list. A new joiner lands at the end, so predicted ring
-			// = floor(totalActiveJoining / 8).
+			// candidate list. A new joiner lands at the end (0-indexed
+			// position = totalActiveJoining), so predicted ring =
+			// floor(totalActiveJoining / 8).
 			totalActiveJoining := 0
 			for _, i := range prs {
 				for _, a := range i.Allocations {
@@ -1225,10 +1226,11 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 				}
 			}
 
-			// For shards this prover is already on, use the current count.
-			// For unallocated shards, add 1 (self would be a new joiner).
 			currentRing := uint8(totalActiveJoining / 8)
-			joinerRing := uint8((totalActiveJoining + 1) / 8)
+			joinerRing := uint8(totalActiveJoining / 8)
+			// Number of provers that would share the joiner's ring (existing
+			// provers already on that ring + the joiner itself).
+			activeOnJoinerRing := uint64(totalActiveJoining%8) + 1
 
 			if allocated && pending {
 				pendingFilters = append(pendingFilters, bp)
@@ -1237,21 +1239,30 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 				proposalDescriptors = append(
 					proposalDescriptors,
 					provers.ShardDescriptor{
-						Filter: bp,
-						Size:   size.Uint64(),
-						Ring:   joinerRing,
-						Shards: shard.DataShards,
+						Filter:       bp,
+						Size:         size.Uint64(),
+						Ring:         joinerRing,
+						Shards:       shard.DataShards,
+						ActiveOnRing: activeOnJoinerRing,
 					},
 				)
 			}
 			if isActiveAllocation {
+				// Approximate provers sharing the current ring. Exact
+				// value requires a full sort; use the last ring's count as
+				// a reasonable estimate for leave scoring.
+				activeOnCurrentRing := uint64(totalActiveJoining % 8)
+				if activeOnCurrentRing == 0 && totalActiveJoining > 0 {
+					activeOnCurrentRing = 8
+				}
 				leaveProposalCandidates = append(
 					leaveProposalCandidates,
 					provers.ShardDescriptor{
-						Filter: bp,
-						Size:   size.Uint64(),
-						Ring:   currentRing,
-						Shards: shard.DataShards,
+						Filter:       bp,
+						Size:         size.Uint64(),
+						Ring:         currentRing,
+						Shards:       shard.DataShards,
+						ActiveOnRing: activeOnCurrentRing,
 					},
 				)
 			}
@@ -1261,10 +1272,11 @@ func (e *GlobalConsensusEngine) collectAllocationSnapshot(
 			decideDescriptors = append(
 				decideDescriptors,
 				provers.ShardDescriptor{
-					Filter: bp,
-					Size:   size.Uint64(),
-					Ring:   joinerRing,
-					Shards: shard.DataShards,
+					Filter:       bp,
+					Size:         size.Uint64(),
+					Ring:         joinerRing,
+					Shards:       shard.DataShards,
+					ActiveOnRing: activeOnJoinerRing,
 				},
 			)
 		}
