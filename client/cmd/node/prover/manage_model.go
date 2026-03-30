@@ -38,7 +38,7 @@ type pendingAction struct {
 type allocationRow struct {
 	filter          []byte
 	filterKey       string // full hex, used as map key for selection
-	filterHex       string // truncated hex, used for display
+	filterHex       string // full hex, truncated at render time
 	status          uint32
 	statusName      string
 	ring            uint32
@@ -59,7 +59,7 @@ type allocationRow struct {
 type shardRow struct {
 	filter          []byte
 	filterKey       string // full hex, used as map key for selection
-	filterHex       string // truncated hex, used for display
+	filterHex       string // full hex, truncated at render time
 	activeProvers   uint32
 	ring            uint32
 	shardSize       *big.Int
@@ -152,7 +152,6 @@ type manageKeyMap struct {
 
 // Constants
 const SELECT_WIDTH = 6
-const FILTER_WIDTH = 70
 const PROVERS_WIDTH = 7
 const RING_WIDTH = 5
 const SIZE_WIDTH = 10
@@ -162,6 +161,14 @@ const WORKER_WIDTH = 7
 const STATUS_WIDTH = 12
 const NEXT_ACTION_WIDTH = 30
 const DEFAULT_ACTION_WIDTH = 16
+
+// Fixed column widths excluding filter (with inter-column spaces).
+const allocFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
+	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + WORKER_WIDTH +
+	STATUS_WIDTH + NEXT_ACTION_WIDTH + DEFAULT_ACTION_WIDTH + 10 // 10 spaces between 11 columns
+const availFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
+	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + 6 // 6 spaces between 7 columns
+const minFilterWidth = 12
 
 const ACTION_FRAME_DELAY = 360
 
@@ -985,7 +992,7 @@ func (m *manageModel) processRefreshData(
 		row := allocationRow{
 			filter:          a.GetFilter(),
 			filterKey:       filterHex,
-			filterHex:       truncHex(filterHex),
+			filterHex:       filterHex,
 			status:          a.GetStatus(),
 			statusName:      statusName,
 			joinFrame:       a.GetJoinFrameNumber(),
@@ -1023,7 +1030,7 @@ func (m *manageModel) processRefreshData(
 			avail = append(avail, shardRow{
 				filter:          s.GetFilter(),
 				filterKey:       filterHex,
-				filterHex:       truncHex(filterHex),
+				filterHex:       filterHex,
 				activeProvers:   s.GetActiveProvers(),
 				ring:            s.GetRing(),
 				shardSize:       new(big.Int).SetBytes(s.GetShardSize()),
@@ -1216,9 +1223,16 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		return "  No allocations"
 	}
 
+	// Dynamic filter column width based on available space.
+	fw := width - allocFixedWidth
+	if fw < minFilterWidth {
+		fw = minFilterWidth
+	}
+	fws := strconv.Itoa(fw)
+
 	// Column header.
 	var hdr string
-	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s "+
+	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s "+
 		"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(STATUS_WIDTH)+"s "+
 		"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
 		"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward", "Worker", "Status", "Next Action", "Default Action")
@@ -1246,11 +1260,11 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		if m.allocSelected[a.filterKey] {
 			marker = "[x]"
 		}
-		line := fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
+		line := fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
 			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"d %"+strconv.Itoa(STATUS_WIDTH)+"s "+
 			"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
 			marker,
-			a.filterHex,
+			centerTrunc(a.filterHex, fw),
 			a.activeProvers,
 			a.ring,
 			formatStorage(a.shardSize.Uint64()),
@@ -1276,8 +1290,14 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		return "  No available shards"
 	}
 
+	fw := width - availFixedWidth
+	if fw < minFilterWidth {
+		fw = minFilterWidth
+	}
+	fws := strconv.Itoa(fw)
+
 	var hdr string
-	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
+	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
 		"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward")
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
 
@@ -1299,9 +1319,9 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		if m.availSelected[s.filterKey] {
 			marker = "[x]"
 		}
-		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
+		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
 			marker,
-			s.filterHex,
+			centerTrunc(s.filterHex, fw),
 			s.activeProvers,
 			s.ring,
 			formatStorage(s.shardSize.Uint64()),
@@ -1431,11 +1451,25 @@ func clampOffset(offset, cursor, visibleRows, total int) int {
 	return offset
 }
 
-func truncHex(h string) string {
-	if len(h) > FILTER_WIDTH {
-		return "..." + h[len(h)-FILTER_WIDTH+4:]
+// centerTrunc shortens h to maxWidth by eliding the middle with "...".
+func centerTrunc(h string, maxWidth int) string {
+	if maxWidth <= 3 {
+		if len(h) > maxWidth {
+			return h[:maxWidth]
+		}
+		return h
 	}
-	return h
+	if len(h) <= maxWidth {
+		return h
+	}
+	prefix := (maxWidth - 3) / 2
+	suffix := maxWidth - 3 - prefix
+	return h[:prefix] + "..." + h[len(h)-suffix:]
+}
+
+// truncHex shortens a hex string for use in short status messages.
+func truncHex(h string) string {
+	return centerTrunc(h, 20)
 }
 
 // fetchRPCData calls GetNodeInfo, GetShardInfo, and GetWorkerInfo.
