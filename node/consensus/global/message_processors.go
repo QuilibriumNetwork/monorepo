@@ -60,6 +60,11 @@ func (e *GlobalConsensusEngine) processGlobalConsensusMessageQueue(
 func (e *GlobalConsensusEngine) processShardConsensusMessageQueue(
 	ctx lifecycle.SignalerContext,
 ) {
+	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
+		<-ctx.Done()
+		return
+	}
+
 	for {
 		select {
 		case <-e.haltCtx.Done():
@@ -2128,7 +2133,7 @@ func (e *GlobalConsensusEngine) handleShardLivenessCheck(message *pb.Message) {
 		) {
 			lcBytes, err := livenessCheck.ConstructSignaturePayload()
 			if err != nil {
-				e.logger.Error(
+				e.logger.Debug(
 					"could not construct signature message for liveness check",
 					zap.Error(err),
 				)
@@ -2143,7 +2148,7 @@ func (e *GlobalConsensusEngine) handleShardLivenessCheck(message *pb.Message) {
 				livenessCheck.GetSignatureDomain(),
 			)
 			if err != nil || !valid {
-				e.logger.Error(
+				e.logger.Debug(
 					"could not validate signature for liveness check",
 					zap.Error(err),
 				)
@@ -2157,7 +2162,7 @@ func (e *GlobalConsensusEngine) handleShardLivenessCheck(message *pb.Message) {
 	}
 
 	if found == nil {
-		e.logger.Warn(
+		e.logger.Debug(
 			"invalid liveness check",
 			zap.String(
 				"prover",

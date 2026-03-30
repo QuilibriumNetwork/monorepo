@@ -108,13 +108,17 @@ func (e *GlobalConsensusEngine) computeAppShardMetadata(
 	commitments := make([][]byte, 0, len(phaseSets))
 	var dataShards uint64
 
-	for _, ps := range phaseSets {
+	for i, ps := range phaseSets {
 		commitment, shardCount, nodeSize := getNodeMetadata(ps, fullPrefix)
 		commitments = append(commitments, commitment)
-		if nodeSize != nil {
-			size = nodeSize
+		if i == 0 {
+			// Match proof_of_meaningful_work materialization which uses
+			// only metadata[0] (vertexAdds) for stateSize and shardCount.
+			if nodeSize != nil {
+				size = nodeSize
+			}
+			dataShards = shardCount
 		}
-		dataShards += shardCount
 	}
 
 	return commitments, size.Bytes(), dataShards

@@ -1227,7 +1227,7 @@ func (e *GlobalConsensusEngine) setupGRPCServer() error {
 		map[string]channel.AllowedPeerPolicyType{
 			// Alternative nodes may not need to make this only self peer, but this
 			// prevents a repeated lock DoS
-			"/quilibrium.node.global.pb.GlobalService/GetLockedAddresses": channel.OnlySelfPeer,
+			"/quilibrium.node.global.pb.GlobalService/GetLockedAddresses": channel.AnyProverPeer,
 			"/quilibrium.node.global.pb.MixnetService/GetTag":             channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutTag":             channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutMessage":         channel.AnyPeer,
@@ -3230,6 +3230,11 @@ func (e *GlobalConsensusEngine) publishPeerInfo() {
 func (e *GlobalConsensusEngine) pruneTxLocksPeriodically(
 	ctx lifecycle.SignalerContext,
 ) {
+	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
+		<-ctx.Done()
+		return
+	}
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 

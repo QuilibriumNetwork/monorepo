@@ -62,6 +62,14 @@ func (c *ArchiveClient) SubmitMessage(ctx context.Context, data []byte) error {
 	return err
 }
 
+// GetLockedAddresses fetches cross-shard transaction locks from the archive.
+func (c *ArchiveClient) GetLockedAddresses(
+	ctx context.Context,
+	req *protobufs.GetLockedAddressesRequest,
+) (*protobufs.GetLockedAddressesResponse, error) {
+	return c.client.GetLockedAddresses(ctx, req)
+}
+
 // Conn returns the underlying gRPC connection. This allows callers to create
 // additional service clients (e.g. HypergraphComparisonServiceClient) on the
 // same mTLS connection.

@@ -14,6 +14,7 @@ type ShardDetail struct {
 	Ring            uint8
 	EstimatedReward *big.Int
 	IsAllocated     bool
+	DataShards      uint64
 }
 
 // ShardInfoProvider computes shard-level reward information for the local

@@ -524,6 +524,7 @@ func (r *RPCServer) GetShardInfo(
 			ShardSize:       d.ShardSize.Bytes(),
 			EstimatedReward: d.EstimatedReward.Bytes(),
 			IsAllocated:     d.IsAllocated,
+			DataShards:      d.DataShards,
 		})
 	}
 

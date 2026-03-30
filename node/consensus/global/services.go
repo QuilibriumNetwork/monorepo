@@ -365,6 +365,10 @@ func (e *GlobalConsensusEngine) GetLockedAddresses(
 	ctx context.Context,
 	req *protobufs.GetLockedAddressesRequest,
 ) (*protobufs.GetLockedAddressesResponse, error) {
+	if e.archiveClient != nil {
+		return e.archiveClient.GetLockedAddresses(ctx, req)
+	}
+
 	e.txLockMu.RLock()
 	defer e.txLockMu.RUnlock()
 	if _, ok := e.txLockMap[req.FrameNumber]; !ok {

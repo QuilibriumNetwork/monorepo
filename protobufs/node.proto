@@ -276,6 +276,7 @@ message ShardRewardInfo {
   bytes shard_size = 4;
   bytes estimated_reward = 5;
   bool is_allocated = 6;
+  uint64 data_shards = 7;
 }
 
 message GetShardInfoRequest {

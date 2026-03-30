@@ -89,6 +89,10 @@ func (e *GlobalConsensusEngine) subscribeToGlobalConsensus() error {
 }
 
 func (e *GlobalConsensusEngine) subscribeToShardConsensusMessages() error {
+	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
+		return nil
+	}
+
 	if err := e.pubsub.Subscribe(
 		slices.Concat(
 			[]byte{0},

@@ -60,9 +60,10 @@ estimated per-frame reward, and whether the local prover is on each shard.
 			shardSize := new(big.Int).SetBytes(shard.GetShardSize())
 			reward := new(big.Int).SetBytes(shard.GetEstimatedReward())
 
-			fmt.Printf("  Filter: %s  Size: %-10s Provers: %-4d Ring: %d  Reward: ~%s QUIL/frame%s\n",
+			fmt.Printf("  Filter: %s  Size: %-10s Shards: %-6d Provers: %-4d Ring: %d  Reward: ~%s QUIL/frame%s\n",
 				filterHex,
 				formatStorage(shardSize.Uint64()),
+				shard.GetDataShards(),
 				shard.GetActiveProvers(),
 				shard.GetRing(),
 				formatQUIL(reward),

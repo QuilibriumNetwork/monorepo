@@ -57,8 +57,9 @@ estimated per-frame rewards based on ring position.
 			reward := new(big.Int).SetBytes(shard.GetEstimatedReward())
 			totalReward.Add(totalReward, reward)
 
-			fmt.Printf("  Filter: %s  Provers: %-4d Ring: %d  Reward: ~%s QUIL/frame%s\n",
+			fmt.Printf("  Filter: %s  Shards: %-6d Provers: %-4d Ring: %d  Reward: ~%s QUIL/frame%s\n",
 				filterHex,
+				shard.GetDataShards(),
 				shard.GetActiveProvers(),
 				shard.GetRing(),
 				formatQUIL(reward),

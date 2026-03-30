@@ -154,6 +154,7 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 			Ring:            entry.ring,
 			EstimatedReward: est,
 			IsAllocated:     entry.isAllocated,
+			DataShards:      entry.dataShards,
 		})
 	}
 

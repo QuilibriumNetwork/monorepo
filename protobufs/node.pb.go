@@ -2396,6 +2396,7 @@ type ShardRewardInfo struct {
 	ShardSize       []byte `protobuf:"bytes,4,opt,name=shard_size,json=shardSize,proto3" json:"shard_size,omitempty"`
 	EstimatedReward []byte `protobuf:"bytes,5,opt,name=estimated_reward,json=estimatedReward,proto3" json:"estimated_reward,omitempty"`
 	IsAllocated     bool   `protobuf:"varint,6,opt,name=is_allocated,json=isAllocated,proto3" json:"is_allocated,omitempty"`
+	DataShards      uint64 `protobuf:"varint,7,opt,name=data_shards,json=dataShards,proto3" json:"data_shards,omitempty"`
 }
 
 func (x *ShardRewardInfo) Reset() {
@@ -2470,6 +2471,13 @@ func (x *ShardRewardInfo) GetIsAllocated() bool {
 		return x.IsAllocated
 	}
 	return false
+}
+
+func (x *ShardRewardInfo) GetDataShards() uint64 {
+	if x != nil {
+		return x.DataShards
+	}
+	return 0
 }
 
 type GetShardInfoRequest struct {

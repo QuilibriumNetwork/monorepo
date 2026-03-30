@@ -44,6 +44,7 @@ type allocationRow struct {
 	ring            uint32
 	activeProvers   uint32
 	shardSize       *big.Int
+	dataShards      uint64
 	estimatedReward *big.Int
 	joinFrame       uint64
 	confirmFrame    uint64
@@ -62,6 +63,7 @@ type shardRow struct {
 	activeProvers   uint32
 	ring            uint32
 	shardSize       *big.Int
+	dataShards      uint64
 	estimatedReward *big.Int
 }
 
@@ -154,6 +156,7 @@ const FILTER_WIDTH = 70
 const PROVERS_WIDTH = 7
 const RING_WIDTH = 5
 const SIZE_WIDTH = 10
+const SHARDS_WIDTH = 7
 const REWARD_WIDTH = 20
 const WORKER_WIDTH = 7
 const STATUS_WIDTH = 12
@@ -266,6 +269,7 @@ type manageModel struct {
 	// Join worker picker state.
 	joinPickerActive   bool
 	joinPickerCursor   int
+	joinPickerOffset   int
 	joinPickerWorkers  []uint32
 	joinPickerSelected map[uint32]bool
 	joinPickerFilters  [][]byte
@@ -1000,6 +1004,7 @@ func (m *manageModel) processRefreshData(
 			row.ring = info.GetRing()
 			row.activeProvers = info.GetActiveProvers()
 			row.shardSize = new(big.Int).SetBytes(info.GetShardSize())
+			row.dataShards = info.GetDataShards()
 			row.estimatedReward = new(big.Int).SetBytes(info.GetEstimatedReward())
 		}
 
@@ -1022,6 +1027,7 @@ func (m *manageModel) processRefreshData(
 				activeProvers:   s.GetActiveProvers(),
 				ring:            s.GetRing(),
 				shardSize:       new(big.Int).SetBytes(s.GetShardSize()),
+				dataShards:      s.GetDataShards(),
 				estimatedReward: new(big.Int).SetBytes(s.GetEstimatedReward()),
 			})
 		}
@@ -1213,9 +1219,9 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	// Column header.
 	var hdr string
 	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s "+
-		"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(STATUS_WIDTH)+"s "+
+		"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(STATUS_WIDTH)+"s "+
 		"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
-		"Select", "Filter", "Provers", "Ring", "Size", "Reward", "Worker", "Status", "Next Action", "Default Action")
+		"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward", "Worker", "Status", "Next Action", "Default Action")
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
 
 	// Compute visible window.
@@ -1241,13 +1247,14 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 			marker = "[x]"
 		}
 		line := fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
-			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"d %"+strconv.Itoa(STATUS_WIDTH)+"s "+
+			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"d %"+strconv.Itoa(STATUS_WIDTH)+"s "+
 			"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
 			marker,
 			a.filterHex,
 			a.activeProvers,
 			a.ring,
 			formatStorage(a.shardSize.Uint64()),
+			a.dataShards,
 			"~"+formatQUIL(a.estimatedReward)+" Q/f",
 			a.workerID,
 			displayStatus,
@@ -1270,8 +1277,8 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	}
 
 	var hdr string
-	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-		"Select", "Filter", "Provers", "Ring", "Size", "Reward")
+	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
+		"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward")
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
 
 	visibleRows := height - 1
@@ -1292,12 +1299,13 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		if m.availSelected[s.filterKey] {
 			marker = "[x]"
 		}
-		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
+		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
 			marker,
 			s.filterHex,
 			s.activeProvers,
 			s.ring,
 			formatStorage(s.shardSize.Uint64()),
+			s.dataShards,
 			"~"+formatQUIL(s.estimatedReward)+" Q/f",
 		)
 		if i == m.availCursor && m.focus == availablePanel {
@@ -1370,7 +1378,20 @@ func (m manageModel) renderJoinPicker() string {
 	doc.WriteString("\n\n")
 	doc.WriteString(fmt.Sprintf("  Joining %d shard(s). Select which free workers to set to Manual mode:\n\n", len(m.joinPickerFilters)))
 
-	for i, wid := range m.joinPickerWorkers {
+	// header(1) + blank(1) + description(1) + blank(1) + footer blank(1) + footer(1) = 6
+	visibleRows := m.height - 6
+	if visibleRows < 1 {
+		visibleRows = 1
+	}
+	m.joinPickerOffset = clampOffset(m.joinPickerOffset, m.joinPickerCursor, visibleRows, len(m.joinPickerWorkers))
+
+	end := m.joinPickerOffset + visibleRows
+	if end > len(m.joinPickerWorkers) {
+		end = len(m.joinPickerWorkers)
+	}
+
+	for i := m.joinPickerOffset; i < end; i++ {
+		wid := m.joinPickerWorkers[i]
 		marker := "[ ]"
 		if m.joinPickerSelected[wid] {
 			marker = "[x]"
