@@ -152,6 +152,7 @@ type manageKeyMap struct {
 
 // Constants
 const SELECT_WIDTH = 6
+const FILTER_WIDTH = 70
 const PROVERS_WIDTH = 7
 const RING_WIDTH = 5
 const SIZE_WIDTH = 10
@@ -165,9 +166,9 @@ const DEFAULT_ACTION_WIDTH = 16
 // Fixed column widths excluding filter (with inter-column spaces).
 const allocFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
 	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + WORKER_WIDTH +
-	STATUS_WIDTH + NEXT_ACTION_WIDTH + DEFAULT_ACTION_WIDTH + 10 // 10 spaces between 11 columns
+	STATUS_WIDTH + NEXT_ACTION_WIDTH + DEFAULT_ACTION_WIDTH + 10 + 2 // 10 spaces between 11 columns and 2 external borders
 const availFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
-	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + 6 // 6 spaces between 7 columns
+	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + 6 + 2 // 6 spaces between 7 columns and 2 external borders
 const minFilterWidth = 12
 
 const ACTION_FRAME_DELAY = 360
@@ -1228,6 +1229,9 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	if fw < minFilterWidth {
 		fw = minFilterWidth
 	}
+	if fw > FILTER_WIDTH {
+		fw = FILTER_WIDTH
+	}
 	fws := strconv.Itoa(fw)
 
 	// Column header.
@@ -1293,6 +1297,9 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	fw := width - availFixedWidth
 	if fw < minFilterWidth {
 		fw = minFilterWidth
+	}
+	if fw > FILTER_WIDTH {
+		fw = FILTER_WIDTH
 	}
 	fws := strconv.Itoa(fw)
 
