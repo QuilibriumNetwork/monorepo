@@ -454,9 +454,9 @@ func (m *Manager) DecideJoins(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			reject = append(reject, pc)
-			m.logger.Debug("added shard to reject list", zap.String("shard", hex.EncodeToString(p)))
+			m.logger.Debug("added shard to join reject list", zap.String("shard", hex.EncodeToString(p)))
 		}
-		m.logger.Info("rejecting all pending allocations")
+		m.logger.Info("rejecting all pending joins")
 		return m.workerMgr.DecideAllocations(reject, nil)
 	}
 
@@ -490,7 +490,7 @@ func (m *Manager) DecideJoins(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			reject = append(reject, pc)
-			m.logger.Debug("added shard to reject list", zap.String("shard", hex.EncodeToString(p)))
+			m.logger.Debug("added shard to join reject list", zap.String("shard", hex.EncodeToString(p)))
 			continue
 		}
 
@@ -501,14 +501,14 @@ func (m *Manager) DecideJoins(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			reject = append(reject, pc)
-			m.logger.Debug("added shard to reject list", zap.String("shard", hex.EncodeToString(p)),
+			m.logger.Debug("added shard to join reject list", zap.String("shard", hex.EncodeToString(p)),
 				zap.String("score", rec.score.String()), zap.String("threashold", rejectThreshold.String()))
 		} else {
 			// Otherwise confirm - score is within acceptable range of best
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			confirm = append(confirm, pc)
-			m.logger.Debug("added shard to confirm list", zap.String("shard", hex.EncodeToString(p)),
+			m.logger.Debug("added shard to join confirm list", zap.String("shard", hex.EncodeToString(p)),
 				zap.String("score", rec.score.String()), zap.String("threashold", rejectThreshold.String()))
 		}
 	}
@@ -531,7 +531,7 @@ func (m *Manager) DecideJoins(
 			)
 			confirm = confirm[:availableWorkers]
 		}
-		m.logger.Info("confirming some pending allocations")
+		m.logger.Info("decided on pending joins")
 		return m.workerMgr.DecideAllocations(nil, confirm)
 	}
 }
@@ -643,7 +643,7 @@ func (m *Manager) PlanLeaves(
 	if err != nil {
 		return nil, errors.Wrap(err, "plan leaves")
 	}
-	m.logger.Info("proposed leaves")
+	m.logger.Info("planned leaves")
 	return filters, nil
 }
 
@@ -677,7 +677,9 @@ func (m *Manager) DecideLeaves(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			confirm = append(confirm, pc)
+			m.logger.Debug("added shard to leave confirm list", zap.String("shard", hex.EncodeToString(pc)))
 		}
+		m.logger.Info("confirming all leaves")
 		return m.workerMgr.DecideLeave(nil, confirm)
 	}
 
@@ -717,6 +719,7 @@ func (m *Manager) DecideLeaves(
 			copy(pc, p)
 			confirm = append(confirm, pc)
 		}
+		m.logger.Info("confirming all pending leaves")
 		return m.workerMgr.DecideLeave(nil, confirm)
 	}
 
@@ -746,6 +749,7 @@ func (m *Manager) DecideLeaves(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			confirm = append(confirm, pc)
+			m.logger.Debug("added shard to leave confirn list", zap.String("shard", hex.EncodeToString(pc)))
 			continue
 		}
 
@@ -754,13 +758,18 @@ func (m *Manager) DecideLeaves(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			reject = append(reject, pc)
+			m.logger.Debug("added shard to leave reject list", zap.String("shard", hex.EncodeToString(pc)),
+				zap.String("score", rec.score.String()), zap.String("leaveThreashold", rejectThreshold.String()))
 		} else {
 			// Still a bad shard — confirm the leave.
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			confirm = append(confirm, pc)
+			m.logger.Debug("added shard to leave confirm list", zap.String("shard", hex.EncodeToString(pc)),
+				zap.String("score", rec.score.String()), zap.String("leaveThreashold", rejectThreshold.String()))
 		}
 	}
 
+	m.logger.Info("decided on pending leaves")
 	return m.workerMgr.DecideLeave(reject, confirm)
 }
