@@ -106,6 +106,7 @@ var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_1823,
 	migration_2_1_0_1824,
 	migration_2_1_0_22,
+	migration_2_1_0_221,
 }
 
 func NewPebbleDB(
@@ -1856,6 +1857,283 @@ func doMigration22(db *pebble.DB, cfg *config.Config) error {
 		zap.Int("global_allocs_reset", allocResetCount),
 		zap.Int("non_global_provers_deleted", deleteCount),
 		zap.Int("non_global_allocs_deleted", allocDeleteCount),
+	)
+
+	return nil
+}
+
+// migration_2_1_0_221 removes orphaned vertex tree entries that have no matching
+// vertex data (left behind by migration_22's DeleteVertexAdd when tree.Delete
+// failed to persist), then rebuilds the tree via copy-wipe-copy-back.
+func migration_2_1_0_221(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	if cfg == nil || cfg.P2P == nil || cfg.P2P.Network != 0 {
+		return nil
+	}
+	return doMigration221(db, cfg)
+}
+
+func doMigration221(db *pebble.DB, cfg *config.Config) error {
+	logger := zap.L()
+	logger.Info("migration 221: removing orphaned vertex tree entries")
+
+	globalIntrinsicAddress := intrinsics.GLOBAL_INTRINSIC_ADDRESS
+
+	prover := bls48581.NewKZGInclusionProver(logger)
+
+	dbWrapper := &PebbleDB{db: db}
+	hgStore := NewPebbleHypergraphStore(cfg.DB, dbWrapper, logger, nil, prover)
+
+	hg, err := hgStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "migration 221: load hypergraph")
+	}
+	hgCRDT := hg.(*hgcrdt.HypergraphCRDT)
+
+	globalShardKey := tries.ShardKey{
+		L1: [3]byte(up2p.GetBloomFilterIndices(globalIntrinsicAddress[:], 256, 3)),
+		L2: globalIntrinsicAddress,
+	}
+
+	// Phase 1: Iterate vertex adds tree leaves and identify entries with no
+	// matching vertex data.
+	iter, err := hgStore.IterateRawLeaves("vertex", "adds", globalShardKey)
+	if err != nil {
+		return errors.Wrap(err, "migration 221: create leaf iterator")
+	}
+
+	var orphanedVertexIDs [][64]byte
+	totalLeaves := 0
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		leaf, err := iter.Leaf()
+		if err != nil {
+			continue // skip non-leaf (branch) nodes
+		}
+		totalLeaves++
+
+		// UnderlyingData is populated by LoadVertexTreeRaw inside Leaf();
+		// nil means the vertex data key does not exist in the DB.
+		if leaf.UnderlyingData == nil {
+			var vertexID [64]byte
+			copy(vertexID[:], leaf.Key)
+			orphanedVertexIDs = append(orphanedVertexIDs, vertexID)
+		}
+	}
+
+	iter.Close()
+
+	logger.Info("migration 221: scan complete",
+		zap.Int("total_leaves", totalLeaves),
+		zap.Int("orphaned", len(orphanedVertexIDs)),
+	)
+
+	// Phase 2: Delete orphaned entries from the tree.
+	if len(orphanedVertexIDs) > 0 {
+		txn, err := hgStore.NewTransaction(false)
+		if err != nil {
+			return errors.Wrap(err, "migration 221: create transaction")
+		}
+
+		deleteCount := 0
+		for _, vertexID := range orphanedVertexIDs {
+			if err := hgCRDT.DeleteVertexAdd(txn, globalShardKey, vertexID); err != nil {
+				logger.Warn("migration 221: failed to delete orphaned vertex",
+					zap.String("address", hex.EncodeToString(vertexID[32:])),
+					zap.Error(err),
+				)
+				continue
+			}
+			deleteCount++
+			logger.Info("migration 221: deleted orphaned vertex",
+				zap.String("address", hex.EncodeToString(vertexID[32:])),
+			)
+		}
+
+		if err := txn.Commit(); err != nil {
+			return errors.Wrap(err, "migration 221: commit deletions")
+		}
+
+		logger.Info("migration 221: deleted orphaned entries",
+			zap.Int("deleted", deleteCount),
+		)
+	}
+
+	// Phase 3: Copy-wipe-copy-back to ensure tree consistency.
+	actualRoot := hgCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
+	if actualRoot == nil {
+		logger.Info("migration 221: no data in global prover shard, skipping copy-wipe-copy-back")
+		return nil
+	}
+
+	hgCRDT.PublishSnapshot(actualRoot)
+
+	const bufSize = 1 << 20
+	actualLis := bufconn.Listen(bufSize)
+	actualGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(actualGRPCServer, hgCRDT)
+	go func() { _ = actualGRPCServer.Serve(actualLis) }()
+	defer actualGRPCServer.Stop()
+
+	actualDialer := func(context.Context, string) (net.Conn, error) {
+		return actualLis.Dial()
+	}
+	actualConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(actualDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "migration 221: dial actual hypergraph")
+	}
+	defer actualConn.Close()
+
+	actualClient := protobufs.NewHypergraphComparisonServiceClient(actualConn)
+
+	// Create in-memory pebble DB
+	memOpts := &pebble.Options{
+		MemTableSize:       64 << 20,
+		FormatMajorVersion: pebble.FormatNewest,
+		FS:                 vfs.NewMem(),
+	}
+	memDB, err := pebble.Open("", memOpts)
+	if err != nil {
+		return errors.Wrap(err, "migration 221: open in-memory pebble")
+	}
+	defer memDB.Close()
+
+	memDBWrapper := &PebbleDB{db: memDB}
+	memStore := NewPebbleHypergraphStore(cfg.DB, memDBWrapper, logger, nil, prover)
+	memHG, err := memStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "migration 221: load in-memory hypergraph")
+	}
+	memHGCRDT := memHG.(*hgcrdt.HypergraphCRDT)
+
+	// Sync from actual to in-memory for all phases
+	phases := []protobufs.HypergraphPhaseSet{
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES,
+	}
+
+	for _, phase := range phases {
+		stream, err := actualClient.PerformSync(context.Background())
+		if err != nil {
+			return errors.Wrapf(err, "migration 221: create sync stream for phase %v", phase)
+		}
+		_, err = memHGCRDT.SyncFrom(stream, globalShardKey, phase, nil)
+		if err != nil {
+			logger.Warn("migration 221: sync from actual to memory failed",
+				zap.Error(err), zap.Any("phase", phase))
+		}
+		_ = stream.CloseSend()
+	}
+
+	memRoot := memHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
+	logger.Info("migration 221: synced to in-memory",
+		zap.String("actual_root", hex.EncodeToString(actualRoot)),
+		zap.String("mem_root", hex.EncodeToString(memRoot)),
+	)
+
+	// Stop the actual server before wiping data
+	actualGRPCServer.Stop()
+	actualConn.Close()
+
+	// Wipe tree data for global prover shard from actual DB
+	treePrefixes := []byte{
+		VERTEX_ADDS_TREE_NODE,
+		VERTEX_REMOVES_TREE_NODE,
+		HYPEREDGE_ADDS_TREE_NODE,
+		HYPEREDGE_REMOVES_TREE_NODE,
+		VERTEX_ADDS_TREE_NODE_BY_PATH,
+		VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		HYPEREDGE_REMOVES_TREE_NODE_BY_PATH,
+		VERTEX_ADDS_CHANGE_RECORD,
+		VERTEX_REMOVES_CHANGE_RECORD,
+		HYPEREDGE_ADDS_CHANGE_RECORD,
+		HYPEREDGE_REMOVES_CHANGE_RECORD,
+		VERTEX_ADDS_TREE_ROOT,
+		VERTEX_REMOVES_TREE_ROOT,
+		HYPEREDGE_ADDS_TREE_ROOT,
+		HYPEREDGE_REMOVES_TREE_ROOT,
+	}
+
+	for _, prefix := range treePrefixes {
+		start, end := shardRangeBounds(prefix, globalShardKey)
+		if err := db.DeleteRange(start, end, &pebble.WriteOptions{Sync: true}); err != nil {
+			return errors.Wrapf(err, "migration 221: delete range for prefix 0x%02x", prefix)
+		}
+	}
+
+	logger.Info("migration 221: wiped tree data from actual DB")
+
+	// Reload actual hypergraph after wipe
+	actualStore2 := NewPebbleHypergraphStore(cfg.DB, dbWrapper, logger, nil, prover)
+	actualHG2, err := actualStore2.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "migration 221: reload actual hypergraph after wipe")
+	}
+	actualHGCRDT2 := actualHG2.(*hgcrdt.HypergraphCRDT)
+
+	// Sync from in-memory back to actual DB
+	memHGCRDT.PublishSnapshot(memRoot)
+
+	memLis := bufconn.Listen(bufSize)
+	memGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(memGRPCServer, memHGCRDT)
+	go func() { _ = memGRPCServer.Serve(memLis) }()
+	defer memGRPCServer.Stop()
+
+	memDialer := func(context.Context, string) (net.Conn, error) {
+		return memLis.Dial()
+	}
+	memConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(memDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "migration 221: dial in-memory hypergraph")
+	}
+	defer memConn.Close()
+
+	memClient := protobufs.NewHypergraphComparisonServiceClient(memConn)
+
+	for _, phase := range phases {
+		stream, err := memClient.PerformSync(context.Background())
+		if err != nil {
+			return errors.Wrapf(err, "migration 221: create sync stream for phase %v (reverse)", phase)
+		}
+		_, err = actualHGCRDT2.SyncFrom(stream, globalShardKey, phase, nil)
+		if err != nil {
+			logger.Warn("migration 221: sync from memory to actual failed",
+				zap.Error(err), zap.Any("phase", phase))
+		}
+		_ = stream.CloseSend()
+	}
+
+	// Final commit
+	finalRoot := actualHGCRDT2.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, true)
+	logger.Info("migration 221: completed",
+		zap.String("final_root", hex.EncodeToString(finalRoot)),
 	)
 
 	return nil

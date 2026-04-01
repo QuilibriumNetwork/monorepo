@@ -63,6 +63,8 @@ var (
 	BlossomSubIWantFollowupTime                = 3 * time.Second
 	BlossomSubIDontWantMessageThreshold        = 1024 // 1KB
 	BlossomSubIDontWantMessageTTL              = 60   // 60 heartbeats / 42 seconds
+	BlossomSubDsame                            = 3
+	BlossomSubDsameLo                          = 2
 )
 
 // BlossomSubParams defines all the BlossomSub specific parameters.
@@ -222,6 +224,14 @@ type BlossomSubParams struct {
 
 	// IDONTWANT is cleared when it's older than the TTL.
 	IDontWantMessageTTL int
+
+	// Dsame is the minimum desired number of "same-bitmask" peers in a composite mesh.
+	// A same-bitmask peer is subscribed to ALL slices of a multi-bit bitmask.
+	Dsame int
+
+	// DsameLo is the threshold below which the heartbeat will attempt to graft additional
+	// same-bitmask peers into the composite mesh, potentially replacing broker peers.
+	DsameLo int
 }
 
 // NewBlossomSub returns a new PubSub object using the default BlossomSubRouter as the router.
@@ -259,26 +269,28 @@ func NewBlossomSubRouter(h host.Host, params BlossomSubParams, network uint8) *B
 	}
 
 	return &BlossomSubRouter{
-		peers:        make(map[peer.ID]protocol.ID),
-		mesh:         make(map[string]map[peer.ID]struct{}),
-		fanout:       make(map[string]map[peer.ID]struct{}),
-		lastpub:      make(map[string]int64),
-		gossip:       make(map[peer.ID][]*pb.ControlIHave),
-		control:      make(map[peer.ID]*pb.ControlMessage),
-		cab:          pstoremem.NewAddrBook(),
-		backoff:      make(map[string]map[peer.ID]time.Time),
-		peerhave:     make(map[peer.ID]int),
-		peerdontwant: make(map[peer.ID]int),
-		unwanted:     make(map[peer.ID]map[string]int),
-		iasked:       make(map[peer.ID]int),
-		outbound:     make(map[peer.ID]bool),
-		connect:      make(chan connectInfo, params.MaxPendingConnections),
-		mcache:       NewMessageCache(params.HistoryGossip, params.HistoryLength),
-		protos:       protos,
-		feature:      feature,
-		tagTracer:    newTagTracer(h.ConnManager()),
-		params:       params,
-		network:      network,
+		peers:            make(map[peer.ID]protocol.ID),
+		mesh:             make(map[string]map[peer.ID]struct{}),
+		fanout:           make(map[string]map[peer.ID]struct{}),
+		lastpub:          make(map[string]int64),
+		gossip:           make(map[peer.ID][]*pb.ControlIHave),
+		control:          make(map[peer.ID]*pb.ControlMessage),
+		cab:              pstoremem.NewAddrBook(),
+		backoff:          make(map[string]map[peer.ID]time.Time),
+		peerhave:         make(map[peer.ID]int),
+		peerdontwant:     make(map[peer.ID]int),
+		unwanted:         make(map[peer.ID]map[string]int),
+		iasked:           make(map[peer.ID]int),
+		outbound:         make(map[peer.ID]bool),
+		connect:          make(chan connectInfo, params.MaxPendingConnections),
+		composites:       make(map[string]*compositeMeshEntry),
+		sliceToComposite: make(map[string][]string),
+		mcache:           NewMessageCache(params.HistoryGossip, params.HistoryLength),
+		protos:           protos,
+		feature:          feature,
+		tagTracer:        newTagTracer(h.ConnManager()),
+		params:           params,
+		network:          network,
 	}
 }
 
@@ -286,25 +298,27 @@ func NewBlossomSubRouter(h host.Host, params BlossomSubParams, network uint8) *B
 func DefaultBlossomSubRouter(h host.Host) *BlossomSubRouter {
 	params := DefaultBlossomSubParams()
 	return &BlossomSubRouter{
-		peers:        make(map[peer.ID]protocol.ID),
-		mesh:         make(map[string]map[peer.ID]struct{}),
-		fanout:       make(map[string]map[peer.ID]struct{}),
-		lastpub:      make(map[string]int64),
-		gossip:       make(map[peer.ID][]*pb.ControlIHave),
-		control:      make(map[peer.ID]*pb.ControlMessage),
-		backoff:      make(map[string]map[peer.ID]time.Time),
-		peerhave:     make(map[peer.ID]int),
-		peerdontwant: make(map[peer.ID]int),
-		unwanted:     make(map[peer.ID]map[string]int),
-		iasked:       make(map[peer.ID]int),
-		outbound:     make(map[peer.ID]bool),
-		connect:      make(chan connectInfo, params.MaxPendingConnections),
-		cab:          pstoremem.NewAddrBook(),
-		mcache:       NewMessageCache(params.HistoryGossip, params.HistoryLength),
-		protos:       BlossomSubDefaultProtocols,
-		feature:      BlossomSubDefaultFeatures,
-		tagTracer:    newTagTracer(h.ConnManager()),
-		params:       params,
+		peers:            make(map[peer.ID]protocol.ID),
+		mesh:             make(map[string]map[peer.ID]struct{}),
+		fanout:           make(map[string]map[peer.ID]struct{}),
+		lastpub:          make(map[string]int64),
+		gossip:           make(map[peer.ID][]*pb.ControlIHave),
+		control:          make(map[peer.ID]*pb.ControlMessage),
+		backoff:          make(map[string]map[peer.ID]time.Time),
+		peerhave:         make(map[peer.ID]int),
+		peerdontwant:     make(map[peer.ID]int),
+		unwanted:         make(map[peer.ID]map[string]int),
+		iasked:           make(map[peer.ID]int),
+		outbound:         make(map[peer.ID]bool),
+		connect:          make(chan connectInfo, params.MaxPendingConnections),
+		cab:              pstoremem.NewAddrBook(),
+		composites:       make(map[string]*compositeMeshEntry),
+		sliceToComposite: make(map[string][]string),
+		mcache:           NewMessageCache(params.HistoryGossip, params.HistoryLength),
+		protos:           BlossomSubDefaultProtocols,
+		feature:          BlossomSubDefaultFeatures,
+		tagTracer:        newTagTracer(h.ConnManager()),
+		params:           params,
 	}
 }
 
@@ -342,6 +356,8 @@ func DefaultBlossomSubParams() BlossomSubParams {
 		IWantFollowupTime:         BlossomSubIWantFollowupTime,
 		IDontWantMessageThreshold: BlossomSubIDontWantMessageThreshold,
 		IDontWantMessageTTL:       BlossomSubIDontWantMessageTTL,
+		Dsame:                     BlossomSubDsame,
+		DsameLo:                   BlossomSubDsameLo,
 		SlowHeartbeatWarning:      0.1,
 	}
 }
@@ -487,14 +503,27 @@ func WithBlossomSubParams(cfg BlossomSubParams) Option {
 // messages flow; this is the mesh map.
 // For each bitmask we publish to without joining, we maintain a list of peers
 // to use for injecting our messages in the overlay with stable routes; this
+// compositeMeshEntry represents a composite mesh for a full (unspliced) multi-bit bitmask.
+// Instead of maintaining D peers per individual bit-slice, a composite mesh maintains D peers
+// total across all slices, categorized as "same" (subscribed to ALL slices) or "broker"
+// (subscribed to SOME slices, providing cross-pollination).
+type compositeMeshEntry struct {
+	bitmask []byte              // full (unspliced) bitmask
+	slices  [][]byte            // SliceBitmask(bitmask) result, cached
+	same    map[peer.ID]struct{} // peers subscribed to ALL slices
+	broker  map[peer.ID]struct{} // peers subscribed to SOME but not all slices
+}
+
 // is the fanout map. Fanout peer lists are expired if we don't publish any
 // messages to their bitmask for BlossomSubFanoutTTL.
 type BlossomSubRouter struct {
 	p            *PubSub
 	peers        map[peer.ID]protocol.ID          // peer protocols
 	direct       map[peer.ID]struct{}             // direct peers
-	mesh         map[string]map[peer.ID]struct{}  // bitmask meshes
-	fanout       map[string]map[peer.ID]struct{}  // bitmask fanout
+	mesh             map[string]map[peer.ID]struct{}  // bitmask meshes (per-slice, derived from composites for multi-bit bitmasks)
+	fanout           map[string]map[peer.ID]struct{}  // bitmask fanout
+	composites       map[string]*compositeMeshEntry   // composite meshes keyed by string(fullBitmask)
+	sliceToComposite map[string][]string              // slice key → list of composite bitmask keys
 	lastpub      map[string]int64                 // last publish time for fanout bitmasks
 	gossip       map[peer.ID][]*pb.ControlIHave   // pending gossip
 	control      map[peer.ID]*pb.ControlMessage   // pending control messages
@@ -688,6 +717,21 @@ func (bs *BlossomSubRouter) RemovePeer(p peer.ID) {
 	}
 	bs.tracer.RemovePeer(p)
 	delete(bs.peers, p)
+	// Remove from composite meshes
+	compositeChanged := false
+	for _, comp := range bs.composites {
+		if _, ok := comp.same[p]; ok {
+			delete(comp.same, p)
+			compositeChanged = true
+		}
+		if _, ok := comp.broker[p]; ok {
+			delete(comp.broker, p)
+			compositeChanged = true
+		}
+	}
+	if compositeChanged {
+		bs.rebuildSliceMeshes()
+	}
 	for _, peers := range bs.mesh {
 		delete(peers, p)
 	}
@@ -1005,6 +1049,40 @@ func (bs *BlossomSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb
 			continue
 		}
 
+		// If this slice is managed by a composite, handle through the composite
+		if compKeys, managed := bs.sliceToComposite[string(bitmask)]; managed {
+			for _, ck := range compKeys {
+				comp := bs.composites[ck]
+				if _, inSame := comp.same[p]; inSame {
+					continue
+				}
+				if _, inBroker := comp.broker[p]; inBroker {
+					// Try promoting broker→same if now subscribed to all slices
+					if bs.classifyPeer(p, comp) == "same" {
+						delete(comp.broker, p)
+						comp.same[p] = struct{}{}
+					}
+					continue
+				}
+				total := len(comp.same) + len(comp.broker)
+				if total >= bs.params.Dhi && !bs.outbound[p] {
+					prune = append(prune, bitmask)
+					bs.addBackoff(p, bitmask, false)
+					continue
+				}
+				cls := bs.classifyPeer(p, comp)
+				if cls == "same" {
+					comp.same[p] = struct{}{}
+				} else {
+					comp.broker[p] = struct{}{}
+				}
+				log.Debugf("GRAFT: add composite mesh link from %s in %s", p, bitmask)
+				bs.tracer.Graft(p, bitmask)
+			}
+			bs.rebuildSliceMeshes()
+			continue
+		}
+
 		// check the number of mesh peers; if it is at (or over) Dhi, we only accept grafts
 		// from peers with outbound connections; this is a defensive check to restrict potential
 		// mesh takeover attacks combined with love bombing
@@ -1041,7 +1119,25 @@ func (bs *BlossomSubRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 			continue
 		}
 
-		if _, inMesh := peers[p]; inMesh {
+		// If this slice is managed by a composite, demote same→broker
+		// instead of removing entirely.  Previous code deleted the peer
+		// from the entire composite on a single-slice PRUNE, causing a
+		// cascading mesh collapse where bilateral mesh link loss led to
+		// connmgr protection removal and connection trimming.
+		if compKeys, managed := bs.sliceToComposite[string(bitmask)]; managed {
+			for _, ck := range compKeys {
+				comp := bs.composites[ck]
+				if _, inSame := comp.same[p]; inSame {
+					log.Debugf("PRUNE: Demote composite peer %s from same to broker in %s", p, bitmask)
+					delete(comp.same, p)
+					comp.broker[p] = struct{}{}
+				}
+				// Broker stays as broker — still in mesh for all slices,
+				// still bridges traffic.  The remote peer won't forward to
+				// us for this slice, but we can still send to them.
+			}
+			// No rebuildSliceMeshes needed — broker stays in all slice meshes
+		} else if _, inMesh := peers[p]; inMesh {
 			log.Debugf("PRUNE: Remove mesh link to %s in %s", p, bitmask)
 			bs.tracer.Prune(p, bitmask)
 			delete(peers, p)
@@ -1360,6 +1456,246 @@ func (bs *BlossomSubRouter) Leave(bitmask []byte) {
 	}
 }
 
+// rebuildSliceMeshes derives the per-slice bs.mesh entries from bs.composites.
+// All composite peers (same + broker) are added to all slices — brokers
+// intentionally bridge non-subscribed slices (they still process messages
+// because the message's full bitmask overlaps their subscription).
+// Non-composite-managed slices in bs.mesh are left untouched.
+func (bs *BlossomSubRouter) rebuildSliceMeshes() {
+	// Clear only composite-managed slices
+	for slice := range bs.sliceToComposite {
+		if m, ok := bs.mesh[slice]; ok {
+			clear(m)
+		}
+	}
+	for _, comp := range bs.composites {
+		for _, slice := range comp.slices {
+			sk := string(slice)
+			m, ok := bs.mesh[sk]
+			if !ok {
+				m = make(map[peer.ID]struct{})
+				bs.mesh[sk] = m
+			}
+			for p := range comp.same {
+				m[p] = struct{}{}
+			}
+			for p := range comp.broker {
+				m[p] = struct{}{}
+			}
+		}
+	}
+}
+
+// classifyPeer determines if a peer is "same" (subscribed to ALL slices of the composite)
+// or "broker" (subscribed to at least one but not all slices).
+func (bs *BlossomSubRouter) classifyPeer(p peer.ID, comp *compositeMeshEntry) string {
+	for _, slice := range comp.slices {
+		if _, ok := bs.p.bitmasks[string(slice)][p]; !ok {
+			return "broker"
+		}
+	}
+	return "same"
+}
+
+// JoinComposite creates a composite mesh for a multi-bit bitmask. If the bitmask
+// produces only one slice, no composite is created (the regular per-slice Join handles it).
+// The composite mesh selects D peers total, preferring "same" peers (subscribed to all
+// slices) and filling with "broker" peers (subscribed to some slices).
+func (bs *BlossomSubRouter) JoinComposite(bitmask []byte) {
+	slices := SliceBitmask(bitmask)
+	if len(slices) <= 1 {
+		return // single-bit bitmask, no composite needed
+	}
+
+	ck := string(bitmask)
+	if _, exists := bs.composites[ck]; exists {
+		return // already have this composite
+	}
+
+	comp := &compositeMeshEntry{
+		bitmask: bitmask,
+		slices:  slices,
+		same:    make(map[peer.ID]struct{}),
+		broker:  make(map[peer.ID]struct{}),
+	}
+
+	// Find "same" peers: subscribed to ALL slices (getPeers computes the intersection)
+	backoff := make(map[peer.ID]time.Time)
+	for _, slice := range slices {
+		for p, t := range bs.backoff[string(slice)] {
+			if t.After(backoff[p]) {
+				backoff[p] = t
+			}
+		}
+	}
+	now := time.Now()
+
+	samePeers := bs.getPeers(bitmask, bs.params.D, func(p peer.ID) bool {
+		_, direct := bs.direct[p]
+		expire, inBackoff := backoff[p]
+		return !direct && !(inBackoff && now.Before(expire)) && bs.score.Score(p) >= 0
+	})
+	for _, p := range samePeers {
+		comp.same[p] = struct{}{}
+	}
+
+	// If fewer than D same peers, find broker peers from individual slices
+	needed := bs.params.D - len(comp.same)
+	if needed > 0 {
+		// Collect candidate brokers from each slice
+		brokerCandidates := make(map[peer.ID]struct{})
+		for _, slice := range slices {
+			tmap, ok := bs.p.bitmasks[string(slice)]
+			if !ok {
+				continue
+			}
+			for p := range tmap {
+				if _, inSame := comp.same[p]; inSame {
+					continue
+				}
+				_, direct := bs.direct[p]
+				expire, inBackoff := backoff[p]
+				if direct || (inBackoff && now.Before(expire)) || bs.score.Score(p) < 0 {
+					continue
+				}
+				if !bs.feature(BlossomSubFeatureMesh, bs.peers[p]) {
+					continue
+				}
+				brokerCandidates[p] = struct{}{}
+			}
+		}
+		// Shuffle and pick up to needed
+		brokerList := make([]peer.ID, 0, len(brokerCandidates))
+		for p := range brokerCandidates {
+			brokerList = append(brokerList, p)
+		}
+		shufflePeers(brokerList)
+		if len(brokerList) > needed {
+			brokerList = brokerList[:needed]
+		}
+		for _, p := range brokerList {
+			comp.broker[p] = struct{}{}
+		}
+	}
+
+	// Collect peers from existing per-slice meshes before replacing them
+	oldSlicePeers := make(map[string]map[peer.ID]struct{})
+	for _, slice := range slices {
+		sk := string(slice)
+		if existing, ok := bs.mesh[sk]; ok {
+			oldSlicePeers[sk] = make(map[peer.ID]struct{}, len(existing))
+			for p := range existing {
+				oldSlicePeers[sk][p] = struct{}{}
+			}
+		}
+	}
+
+	// Register composite and reverse index
+	bs.composites[ck] = comp
+	for _, slice := range slices {
+		sk := string(slice)
+		bs.sliceToComposite[sk] = append(bs.sliceToComposite[sk], ck)
+	}
+
+	// Rebuild per-slice mesh entries from composites
+	bs.rebuildSliceMeshes()
+
+	// Build set of all composite peers
+	allPeers := make(map[peer.ID]struct{}, len(comp.same)+len(comp.broker))
+	for p := range comp.same {
+		allPeers[p] = struct{}{}
+	}
+	for p := range comp.broker {
+		allPeers[p] = struct{}{}
+	}
+
+	// PRUNE peers that were in old per-slice meshes but aren't in the composite
+	for _, slice := range slices {
+		sk := string(slice)
+		for p := range oldSlicePeers[sk] {
+			if _, inComposite := allPeers[p]; !inComposite {
+				log.Debugf("JOIN COMPOSITE: Prune old per-slice peer %s in %s", p, slice)
+				bs.tracer.Prune(p, []byte(sk))
+				bs.sendPrune(p, []byte(sk), false)
+				bs.addBackoff(p, []byte(sk), false)
+			}
+		}
+	}
+
+	// Send GRAFTs per-slice to new composite mesh peers that weren't in old meshes
+	for p := range allPeers {
+		for _, slice := range slices {
+			if _, ok := bs.p.bitmasks[string(slice)][p]; ok {
+				sk := string(slice)
+				if _, wasInOld := oldSlicePeers[sk][p]; !wasInOld {
+					log.Debugf("JOIN COMPOSITE: Add mesh link to %s in %s", p, slice)
+					bs.tracer.Graft(p, slice)
+					bs.sendGraft(p, slice)
+				}
+			}
+		}
+	}
+}
+
+// LeaveComposite removes a composite mesh for a multi-bit bitmask, sending PRUNEs
+// per-slice and cleaning up the reverse index.
+func (bs *BlossomSubRouter) LeaveComposite(bitmask []byte) {
+	ck := string(bitmask)
+	comp, ok := bs.composites[ck]
+	if !ok {
+		return
+	}
+
+	log.Debugf("LEAVE COMPOSITE %s", bitmask)
+
+	// Collect all peers in the composite
+	allPeers := make(map[peer.ID]struct{}, len(comp.same)+len(comp.broker))
+	for p := range comp.same {
+		allPeers[p] = struct{}{}
+	}
+	for p := range comp.broker {
+		allPeers[p] = struct{}{}
+	}
+
+	// Send PRUNEs per-slice
+	for p := range allPeers {
+		for _, slice := range comp.slices {
+			if _, ok := bs.p.bitmasks[string(slice)][p]; ok {
+				log.Debugf("LEAVE COMPOSITE: Remove mesh link to %s in %s", p, slice)
+				bs.tracer.Prune(p, slice)
+				bs.sendPrune(p, slice, true)
+				bs.addBackoff(p, slice, true)
+			}
+		}
+	}
+
+	// Clean up reverse index
+	for _, slice := range comp.slices {
+		sk := string(slice)
+		keys := bs.sliceToComposite[sk]
+		for i, k := range keys {
+			if k == ck {
+				bs.sliceToComposite[sk] = append(keys[:i], keys[i+1:]...)
+				break
+			}
+		}
+		if len(bs.sliceToComposite[sk]) == 0 {
+			delete(bs.sliceToComposite, sk)
+		}
+	}
+
+	delete(bs.composites, ck)
+
+	// Clear the per-slice mesh entries for slices that are no longer composite-managed
+	for _, slice := range comp.slices {
+		sk := string(slice)
+		if _, stillManaged := bs.sliceToComposite[sk]; !stillManaged {
+			delete(bs.mesh, sk)
+		}
+	}
+	bs.rebuildSliceMeshes()
+}
+
 func (bs *BlossomSubRouter) sendGraft(p peer.ID, bitmask []byte) {
 	graft := []*pb.ControlGraft{{Bitmask: bitmask}}
 	out := rpcWithControl(nil, nil, nil, graft, nil, nil)
@@ -1633,8 +1969,17 @@ func (bs *BlossomSubRouter) heartbeat() {
 		return s
 	}
 
+	// maintain composite meshes
+	bs.heartbeatComposites(tograft, toprune, noPX, score)
+
 	// maintain the mesh for bitmasks we have joined
 	for bitmask, peers := range bs.mesh {
+		// skip slices managed by a composite — they are maintained by heartbeatComposites
+		// (gossip is also emitted there per-slice)
+		if _, managed := bs.sliceToComposite[bitmask]; managed {
+			continue
+		}
+
 		bitmask := []byte(bitmask)
 		prunePeer := func(p peer.ID) {
 			bs.tracer.Prune(p, bitmask)
@@ -1865,6 +2210,335 @@ func (bs *BlossomSubRouter) heartbeat() {
 
 	// advance the message history window
 	bs.mcache.Shift()
+}
+
+// heartbeatComposites maintains composite meshes. For each composite:
+// 1. Remove peers with negative score
+// 2. Reclassify peers (same↔broker) based on current subscriptions
+// 3. Remove peers that no longer subscribe to any slice
+// 4. Enforce Dlo/Dhi bounds on total peers (same + broker)
+// 5. Enforce DsameLo: try to replace brokers with same peers when same < DsameLo
+// 6. Maintain Dout outbound peer quota
+// After all composites are maintained, rebuild slice meshes.
+func (bs *BlossomSubRouter) heartbeatComposites(
+	tograft map[peer.ID][][]byte,
+	toprune map[peer.ID][][]byte,
+	noPX map[peer.ID]bool,
+	score func(peer.ID) float64,
+) {
+	if len(bs.composites) == 0 {
+		return
+	}
+
+	changed := false
+
+	for _, comp := range bs.composites {
+		// Helper to graft a peer into the composite on all subscribed slices
+		compositePeerSlices := func(p peer.ID) [][]byte {
+			var subscribed [][]byte
+			for _, slice := range comp.slices {
+				if _, ok := bs.p.bitmasks[string(slice)][p]; ok {
+					subscribed = append(subscribed, slice)
+				}
+			}
+			return subscribed
+		}
+
+		graftComposite := func(p peer.ID) {
+			cls := bs.classifyPeer(p, comp)
+			if cls == "same" {
+				comp.same[p] = struct{}{}
+			} else {
+				comp.broker[p] = struct{}{}
+			}
+			for _, slice := range compositePeerSlices(p) {
+				bs.tracer.Graft(p, slice)
+				tograft[p] = append(tograft[p], slice)
+			}
+			changed = true
+		}
+
+		pruneComposite := func(p peer.ID) {
+			delete(comp.same, p)
+			delete(comp.broker, p)
+			for _, slice := range compositePeerSlices(p) {
+				bs.tracer.Prune(p, slice)
+				bs.addBackoff(p, slice, false)
+				toprune[p] = append(toprune[p], slice)
+			}
+			changed = true
+		}
+
+		// 1. Remove peers with negative score
+		for p := range comp.same {
+			if score(p) < 0 {
+				pruneComposite(p)
+				noPX[p] = true
+			}
+		}
+		for p := range comp.broker {
+			if score(p) < 0 {
+				pruneComposite(p)
+				noPX[p] = true
+			}
+		}
+
+		// 2. Reclassify peers and remove peers with no slice subscriptions
+		for p := range comp.same {
+			cls := bs.classifyPeer(p, comp)
+			if cls == "broker" {
+				// Lost a slice subscription; demote to broker
+				delete(comp.same, p)
+				// Check if still subscribed to at least one slice
+				if len(compositePeerSlices(p)) > 0 {
+					comp.broker[p] = struct{}{}
+				}
+				changed = true
+			}
+		}
+		for p := range comp.broker {
+			if len(compositePeerSlices(p)) == 0 {
+				// No longer subscribed to any slice; remove
+				delete(comp.broker, p)
+				changed = true
+				continue
+			}
+			cls := bs.classifyPeer(p, comp)
+			if cls == "same" {
+				// Now subscribed to all slices; promote to same
+				delete(comp.broker, p)
+				comp.same[p] = struct{}{}
+				changed = true
+			}
+		}
+
+		total := len(comp.same) + len(comp.broker)
+
+		// 3. Too few peers? Graft more (prefer same, fall back to broker)
+		if total < bs.params.Dlo {
+			ineed := bs.params.D - total
+
+			// Collect all peers currently in composite
+			inComposite := make(map[peer.ID]struct{}, total)
+			for p := range comp.same {
+				inComposite[p] = struct{}{}
+			}
+			for p := range comp.broker {
+				inComposite[p] = struct{}{}
+			}
+
+			// Merge backoffs from all slices
+			backoff := make(map[peer.ID]time.Time)
+			for _, slice := range comp.slices {
+				for p, t := range bs.backoff[string(slice)] {
+					if t.After(backoff[p]) {
+						backoff[p] = t
+					}
+				}
+			}
+			now := time.Now()
+
+			// Try same peers first (intersection of all slices)
+			samePeers := bs.getPeers(comp.bitmask, ineed, func(p peer.ID) bool {
+				_, inComp := inComposite[p]
+				_, direct := bs.direct[p]
+				expire, inBackoff := backoff[p]
+				return !inComp && !direct && !(inBackoff && now.Before(expire)) && score(p) >= 0
+			})
+			for _, p := range samePeers {
+				graftComposite(p)
+				inComposite[p] = struct{}{}
+			}
+
+			// Still need more? Try broker peers from individual slices
+			stillNeed := bs.params.D - len(comp.same) - len(comp.broker)
+			if stillNeed > 0 {
+				brokerCandidates := make(map[peer.ID]struct{})
+				for _, slice := range comp.slices {
+					tmap, ok := bs.p.bitmasks[string(slice)]
+					if !ok {
+						continue
+					}
+					for p := range tmap {
+						if _, inComp := inComposite[p]; inComp {
+							continue
+						}
+						_, direct := bs.direct[p]
+						expire, inBackoff := backoff[p]
+						if direct || (inBackoff && now.Before(expire)) || score(p) < 0 {
+							continue
+						}
+						if !bs.feature(BlossomSubFeatureMesh, bs.peers[p]) {
+							continue
+						}
+						brokerCandidates[p] = struct{}{}
+					}
+				}
+				brokerList := make([]peer.ID, 0, len(brokerCandidates))
+				for p := range brokerCandidates {
+					brokerList = append(brokerList, p)
+				}
+				shufflePeers(brokerList)
+				if len(brokerList) > stillNeed {
+					brokerList = brokerList[:stillNeed]
+				}
+				for _, p := range brokerList {
+					graftComposite(p)
+				}
+			}
+		}
+
+		// 4. Too many peers? Prune excess (prefer pruning brokers first)
+		total = len(comp.same) + len(comp.broker)
+		if total > bs.params.Dhi {
+			excess := total - bs.params.D
+			// Prune brokers first
+			brokerList := peerMapToList(comp.broker)
+			shufflePeers(brokerList)
+			sort.Slice(brokerList, func(i, j int) bool {
+				return score(brokerList[i]) > score(brokerList[j])
+			})
+			for i := len(brokerList) - 1; i >= 0 && excess > 0; i-- {
+				p := brokerList[i]
+				// Keep outbound peers if needed for Dout
+				if bs.outbound[p] {
+					continue
+				}
+				pruneComposite(p)
+				excess--
+			}
+			// If still need to prune, prune same peers (lowest score first)
+			if excess > 0 {
+				sameList := peerMapToList(comp.same)
+				shufflePeers(sameList)
+				sort.Slice(sameList, func(i, j int) bool {
+					return score(sameList[i]) > score(sameList[j])
+				})
+				for i := len(sameList) - 1; i >= 0 && excess > 0; i-- {
+					p := sameList[i]
+					if bs.outbound[p] {
+						continue
+					}
+					pruneComposite(p)
+					excess--
+				}
+			}
+		}
+
+		// 5. Enforce DsameLo: if same < DsameLo, try to find same peers and
+		// potentially replace broker peers
+		if len(comp.same) < bs.params.DsameLo {
+			inComposite := make(map[peer.ID]struct{}, len(comp.same)+len(comp.broker))
+			for p := range comp.same {
+				inComposite[p] = struct{}{}
+			}
+			for p := range comp.broker {
+				inComposite[p] = struct{}{}
+			}
+
+			backoff := make(map[peer.ID]time.Time)
+			for _, slice := range comp.slices {
+				for p, t := range bs.backoff[string(slice)] {
+					if t.After(backoff[p]) {
+						backoff[p] = t
+					}
+				}
+			}
+			now := time.Now()
+
+			needed := bs.params.Dsame - len(comp.same)
+			samePeers := bs.getPeers(comp.bitmask, needed, func(p peer.ID) bool {
+				_, inComp := inComposite[p]
+				_, direct := bs.direct[p]
+				expire, inBackoff := backoff[p]
+				return !inComp && !direct && !(inBackoff && now.Before(expire)) && score(p) >= 0
+			})
+
+			for _, p := range samePeers {
+				graftComposite(p)
+				// If we're over D, prune a broker to make room
+				total = len(comp.same) + len(comp.broker)
+				if total > bs.params.D && len(comp.broker) > 0 {
+					// Find lowest-score non-outbound broker to prune
+					var worst peer.ID
+					worstScore := float64(1e18)
+					for bp := range comp.broker {
+						if !bs.outbound[bp] && score(bp) < worstScore {
+							worst = bp
+							worstScore = score(bp)
+						}
+					}
+					if worst != "" {
+						pruneComposite(worst)
+					}
+				}
+			}
+		}
+
+		// 6. Maintain Dout outbound peers
+		total = len(comp.same) + len(comp.broker)
+		if total >= bs.params.Dlo {
+			outbound := 0
+			for p := range comp.same {
+				if bs.outbound[p] {
+					outbound++
+				}
+			}
+			for p := range comp.broker {
+				if bs.outbound[p] {
+					outbound++
+				}
+			}
+			if outbound < bs.params.Dout {
+				inComposite := make(map[peer.ID]struct{}, total)
+				for p := range comp.same {
+					inComposite[p] = struct{}{}
+				}
+				for p := range comp.broker {
+					inComposite[p] = struct{}{}
+				}
+
+				ineed := bs.params.Dout - outbound
+				// Try same outbound peers first
+				backoff := make(map[peer.ID]time.Time)
+				for _, slice := range comp.slices {
+					for p, t := range bs.backoff[string(slice)] {
+						if t.After(backoff[p]) {
+							backoff[p] = t
+						}
+					}
+				}
+				now := time.Now()
+
+				plst := bs.getPeers(comp.bitmask, ineed, func(p peer.ID) bool {
+					_, inComp := inComposite[p]
+					_, direct := bs.direct[p]
+					expire, inBackoff := backoff[p]
+					return !inComp && !direct && bs.outbound[p] &&
+						!(inBackoff && now.Before(expire)) && score(p) >= 0
+				})
+				for _, p := range plst {
+					graftComposite(p)
+				}
+			}
+		}
+
+		// Emit gossip for each slice of this composite
+		allPeers := make(map[peer.ID]struct{}, len(comp.same)+len(comp.broker))
+		for p := range comp.same {
+			allPeers[p] = struct{}{}
+		}
+		for p := range comp.broker {
+			allPeers[p] = struct{}{}
+		}
+		for _, slice := range comp.slices {
+			bs.emitGossip(slice, allPeers)
+		}
+	}
+
+	if changed {
+		bs.rebuildSliceMeshes()
+	}
 }
 
 func (bs *BlossomSubRouter) clearIHaveCounters() {

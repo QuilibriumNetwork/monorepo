@@ -145,7 +145,7 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 
 	details := make([]*typesconsensus.ShardDetail, 0, len(entries))
 	for _, entry := range entries {
-		est := computeShardReward(basis, entry.size, worldBytes, entry.ring, entry.dataShards, entry.proversOnRing)
+		est := computeShardReward(basis, entry.size, worldBytes, entry.ring, entry.dataShards)
 
 		details = append(details, &typesconsensus.ShardDetail{
 			Filter:          entry.filter,
@@ -428,7 +428,6 @@ func computeShardReward(
 	worldBytes *big.Int,
 	ring uint8,
 	dataShards uint64,
-	proversOnRing int,
 ) *big.Int {
 	if basis.Sign() == 0 || worldBytes.Sign() == 0 || dataShards == 0 {
 		return big.NewInt(0)
@@ -457,10 +456,8 @@ func computeShardReward(
 		}
 	}
 
-	// Divide by provers sharing this ring to get per-prover reward.
-	if proversOnRing > 1 {
-		factor.Div(factor, big.NewInt(int64(proversOnRing)))
-	}
+	// Divide by constant max ring size (partially filled rings still split by 8).
+	factor.Div(factor, big.NewInt(8))
 
 	return factor
 }

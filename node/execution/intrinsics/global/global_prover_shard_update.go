@@ -192,7 +192,7 @@ func (p *ProverShardUpdate) Materialize(
 		}
 
 		share := new(big.Int).Set(outputs[0])
-		share.Div(share, big.NewInt(int64(len(participants))))
+		share.Div(share, big.NewInt(ringGroupSize))
 		rewardsPerRing[ring] = share
 	}
 

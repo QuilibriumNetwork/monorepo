@@ -379,11 +379,9 @@ func (m *Manager) scoreShards(
 			factor = factor.Div(ringDiv)
 			factor = factor.Div(shardsSqrt)
 
-			// Divide by the number of provers sharing this ring to get
-			// per-prover reward (matches Materialize's share calculation).
-			if s.ActiveOnRing > 1 {
-				factor = factor.Div(decimal.NewFromUint64(s.ActiveOnRing))
-			}
+			// Divide by the constant max ring size (matches Materialize's
+			// share calculation where partially filled rings still split by 8).
+			factor = factor.Div(decimal.NewFromInt(8))
 
 			score = factor.BigInt()
 		}
