@@ -503,7 +503,9 @@ func (e *GlobalConsensusEngine) GlobalFrameByNumber(
 
 // InjectGlobalMessage implements consensus.GlobalFrameService.
 func (e *GlobalConsensusEngine) InjectGlobalMessage(data []byte) error {
-	e.addGlobalMessage(data)
+	if err := e.addGlobalMessage(data); err != nil {
+		e.logger.Warn("injected global message rejected by collector", zap.Error(err))
+	}
 	return e.pubsub.PublishToBitmask(GLOBAL_PROVER_BITMASK, data)
 }
 
@@ -519,7 +521,9 @@ func (e *GlobalConsensusEngine) SubmitGlobalMessage(
 		return nil, status.Error(codes.InvalidArgument, "empty data")
 	}
 
-	e.addGlobalMessage(req.Data)
+	if err := e.addGlobalMessage(req.Data); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "message rejected: %v", err)
+	}
 	if err := e.publishProverMessage(req.Data); err != nil {
 		return nil, status.Errorf(codes.Internal, "publish message: %v", err)
 	}

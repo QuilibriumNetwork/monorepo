@@ -214,9 +214,9 @@ func (e *GlobalConsensusEngine) startGlobalMessageAggregator(
 	<-e.messageAggregator.ComponentManager.Done()
 }
 
-func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
+func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) error {
 	if e.messageCollectors == nil || len(data) == 0 {
-		return
+		return nil
 	}
 
 	payload := data // buildutils:allow-slice-alias slice is static
@@ -231,7 +231,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 						zap.Error(err),
 					)
 				}
-				return
+				return err
 			}
 
 			// In prover-only mode, filter out non-prover messages
@@ -239,7 +239,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 				bundle.Requests = e.filterProverOnlyRequests(bundle.Requests)
 				if len(bundle.Requests) == 0 {
 					// All requests were filtered out
-					return
+					return nil
 				}
 			}
 
@@ -263,7 +263,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 								zap.Uint64("last_seen", lastSeen),
 							)
 						}
-						return
+						return nil
 					}
 					e.shardFrameDedup[shardAddr] = shardFrame
 					e.shardFrameDedupMu.Unlock()
@@ -291,7 +291,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 						zap.Error(err),
 					)
 				}
-				return
+				return err
 			}
 			payload = encoded
 		}
@@ -312,7 +312,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 			zap.Uint64("current_rank", e.currentRank),
 			zap.Error(err),
 		)
-		return
+		return err
 	}
 
 	if err := collector.Add(record); err != nil {
@@ -321,7 +321,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 			zap.Uint64("sequence", seq),
 			zap.Error(err),
 		)
-		return
+		return err
 	}
 
 	e.logger.Debug(
@@ -330,6 +330,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 		zap.Uint64("current_rank", e.currentRank),
 		zap.Int("payload_len", len(payload)),
 	)
+	return nil
 }
 
 // filterProverOnlyRequests filters a list of message requests to only include

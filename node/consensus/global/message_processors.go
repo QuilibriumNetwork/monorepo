@@ -236,12 +236,17 @@ func (e *GlobalConsensusEngine) handleProverMessage(message *pb.Message) {
 
 	switch typePrefix {
 	case protobufs.MessageBundleType:
-		e.addGlobalMessage(message.Data)
-
-		e.logger.Debug(
-			"collected global request for execution",
-			zap.Uint32("type", typePrefix),
-		)
+		if err := e.addGlobalMessage(message.Data); err != nil {
+			e.logger.Warn(
+				"prover message rejected by collector",
+				zap.Error(err),
+			)
+		} else {
+			e.logger.Debug(
+				"collected global request for execution",
+				zap.Uint32("type", typePrefix),
+			)
+		}
 
 	default:
 		e.logger.Debug(
@@ -469,7 +474,9 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 			return
 		}
 
-		e.addGlobalMessage(bundleBytes)
+		if err := e.addGlobalMessage(bundleBytes); err != nil {
+			e.logger.Warn("shard frame rejected by collector", zap.Error(err))
+		}
 		if err := e.publishProverMessage(bundleBytes); err != nil {
 			e.logger.Warn(
 				"failed to forward shard frame to archive",
@@ -2039,8 +2046,11 @@ func (e *GlobalConsensusEngine) handleTimeoutState(message *pb.Message) {
 }
 
 func (e *GlobalConsensusEngine) handleMessageBundle(message *pb.Message) {
-	e.addGlobalMessage(message.Data)
-	e.logger.Debug("collected global request for execution")
+	if err := e.addGlobalMessage(message.Data); err != nil {
+		e.logger.Warn("message bundle rejected by collector", zap.Error(err))
+	} else {
+		e.logger.Debug("collected global request for execution")
+	}
 }
 
 func (e *GlobalConsensusEngine) handleShardProposal(message *pb.Message) {
