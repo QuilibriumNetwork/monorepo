@@ -108,6 +108,8 @@ var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_22,
 	migration_2_1_0_221,
 	migration_2_1_0_222,
+	migration_2_1_0_223,
+	migration_2_1_0_224,
 }
 
 func NewPebbleDB(
@@ -2200,7 +2202,10 @@ func doMigration222(db *pebble.DB, cfg *config.Config) error {
 		var vertexID [64]byte
 		copy(vertexID[:], key[:64])
 
-		// Try as prover:Prover — eviction sets prover status to 4.
+		// Try as prover:Prover — eviction sets status to 4 AND a non-zero
+		// KickFrameNumber.  UpdateAggregateProverStatus also sets status to 4
+		// when all allocations have left, but with KickFrameNumber == 0.
+		// Only repair provers that were actually evicted (non-zero kick frame).
 		statusBytes, err := rdfMultiprover.Get(
 			globalRDFSchema,
 			"prover:Prover",
@@ -2208,10 +2213,18 @@ func doMigration222(db *pebble.DB, cfg *config.Config) error {
 			tree,
 		)
 		if err == nil && len(statusBytes) > 0 && statusBytes[0] == 4 {
-			kickedProvers = append(kickedProvers, &kickedVertexInfo{
-				vertexID: vertexID,
-				tree:     tree,
-			})
+			kickBytes, _ := rdfMultiprover.Get(
+				globalRDFSchema,
+				"prover:Prover",
+				"KickFrameNumber",
+				tree,
+			)
+			if len(kickBytes) >= 8 && binary.BigEndian.Uint64(kickBytes) != 0 {
+				kickedProvers = append(kickedProvers, &kickedVertexInfo{
+					vertexID: vertexID,
+					tree:     tree,
+				})
+			}
 			continue
 		}
 
@@ -2356,6 +2369,335 @@ func doMigration222(db *pebble.DB, cfg *config.Config) error {
 	)
 
 	return nil
+}
+
+// migration_2_1_0_223 recomputes aggregate prover status for provers stuck at
+// status 4 ("left/kicked").  Previous migrations could not reliably distinguish
+// evicted provers from naturally-departed ones because KickFrameNumber may have
+// been cleared by earlier migrations or UpdateAggregateProverStatus.
+//
+// The correct invariant: a prover's status should reflect the aggregate of its
+// allocations (same logic as UpdateAggregateProverStatus in global_prover_utils).
+// If a prover has status 4 but any of its allocations are NOT status 4, the
+// prover status is stale and must be recomputed.
+func migration_2_1_0_223(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	if cfg == nil || cfg.P2P == nil || cfg.P2P.Network != 0 {
+		return nil
+	}
+	return doMigration223(db, cfg)
+}
+
+func doMigration223(db *pebble.DB, cfg *config.Config) error {
+	logger := zap.L()
+	logger.Info("migration 223: recomputing aggregate prover status")
+
+	globalIntrinsicAddress := intrinsics.GLOBAL_INTRINSIC_ADDRESS
+
+	prover := bls48581.NewKZGInclusionProver(logger)
+	rdfMultiprover := schema.NewRDFMultiprover(
+		&schema.TurtleRDFParser{},
+		prover,
+	)
+
+	dbWrapper := &PebbleDB{db: db}
+	hgStore := NewPebbleHypergraphStore(cfg.DB, dbWrapper, logger, nil, prover)
+	hg, err := hgStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "migration 223: load hypergraph")
+	}
+	hgCRDT := hg.(*hgcrdt.HypergraphCRDT)
+
+	// Phase 1: Collect all status-4 provers, all allocations (for aggregate
+	// computation), and kicked allocations (status 4 with non-zero
+	// KickFrameNumber) in a single pass.
+	type proverInfo struct {
+		vertexID [64]byte
+		tree     *tries.VectorCommitmentTree
+	}
+
+	type allocInfo struct {
+		proverRef []byte
+		status    byte
+	}
+
+	type kickedAllocInfo struct {
+		vertexID [64]byte
+		tree     *tries.VectorCommitmentTree
+	}
+
+	leftProvers := map[string]*proverInfo{}      // keyed by prover address (vertexID[32:64])
+	allocsByProver := map[string][]allocInfo{}    // keyed by prover reference
+	var kickedAllocs []*kickedAllocInfo           // allocations needing KickFrameNumber cleared
+
+	iter := hgCRDT.GetVertexDataIterator(globalIntrinsicAddress)
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		tree := iter.Value()
+		if tree == nil || tree.Root == nil || tree.GetSize().Sign() == 0 {
+			continue
+		}
+
+		key := iter.Key()
+		if len(key) < 64 {
+			continue
+		}
+
+		var vertexID [64]byte
+		copy(vertexID[:], key[:64])
+
+		// Use GetType to reliably distinguish prover from allocation vertices.
+		// Both types store Status at the same tree key (order 1 → 0x04), so
+		// reading "prover:Prover.Status" succeeds on allocation trees too.
+		typeName, err := rdfMultiprover.GetType(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			tree,
+		)
+		if err != nil {
+			continue
+		}
+
+		switch typeName {
+		case "prover:Prover":
+			statusBytes, err := rdfMultiprover.Get(
+				globalRDFSchema,
+				"prover:Prover",
+				"Status",
+				tree,
+			)
+			if err == nil && len(statusBytes) > 0 && statusBytes[0] == 4 {
+				addr := string(vertexID[32:])
+				leftProvers[addr] = &proverInfo{
+					vertexID: vertexID,
+					tree:     tree,
+				}
+			}
+
+		case "allocation:ProverAllocation":
+			allocStatus, err := rdfMultiprover.Get(
+				globalRDFSchema,
+				"allocation:ProverAllocation",
+				"Status",
+				tree,
+			)
+			if err == nil && len(allocStatus) > 0 {
+				proverRef, _ := rdfMultiprover.Get(
+					globalRDFSchema,
+					"allocation:ProverAllocation",
+					"Prover",
+					tree,
+				)
+				if len(proverRef) > 0 {
+					key := string(proverRef)
+					allocsByProver[key] = append(allocsByProver[key], allocInfo{
+						proverRef: proverRef,
+						status:    allocStatus[0],
+					})
+				}
+
+				// Also collect kicked allocations (status 4 with non-zero
+				// KickFrameNumber) — migration 222 never cleared these due to
+				// the same GetType bug.
+				if allocStatus[0] == 4 {
+					kickBytes, _ := rdfMultiprover.Get(
+						globalRDFSchema,
+						"allocation:ProverAllocation",
+						"KickFrameNumber",
+						tree,
+					)
+					if len(kickBytes) >= 8 && binary.BigEndian.Uint64(kickBytes) != 0 {
+						kickedAllocs = append(kickedAllocs, &kickedAllocInfo{
+							vertexID: vertexID,
+							tree:     tree,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	iter.Close()
+
+	// Phase 2: For each status-4 prover, recompute the aggregate from its
+	// allocations.  Only fix provers whose aggregate disagrees with status 4.
+	type proverFix struct {
+		info      *proverInfo
+		newStatus byte
+	}
+
+	var fixes []proverFix
+
+	for addr, p := range leftProvers {
+		allocs := allocsByProver[addr]
+
+		hasActive := false
+		hasJoining := false
+		hasLeaving := false
+		hasPaused := false
+
+		for _, a := range allocs {
+			switch a.status {
+			case 0:
+				hasJoining = true
+			case 1:
+				hasActive = true
+			case 2:
+				hasPaused = true
+			case 3:
+				hasLeaving = true
+			}
+		}
+
+		// Same priority as UpdateAggregateProverStatus
+		var correct byte
+		if hasActive {
+			correct = 1
+		} else if hasJoining {
+			correct = 0
+		} else if hasLeaving {
+			correct = 3
+		} else if hasPaused {
+			correct = 2
+		} else {
+			correct = 4 // all allocations are left — status 4 is correct
+		}
+
+		if correct != 4 {
+			fixes = append(fixes, proverFix{info: p, newStatus: correct})
+		}
+	}
+
+	logger.Info("migration 223: scan complete",
+		zap.Int("status_4_provers", len(leftProvers)),
+		zap.Int("prover_fixes_needed", len(fixes)),
+		zap.Int("kicked_allocations", len(kickedAllocs)),
+	)
+
+	if len(fixes) == 0 && len(kickedAllocs) == 0 {
+		logger.Info("migration 223: nothing to fix")
+		return nil
+	}
+
+	// Phase 3: Apply fixes.
+	txn, err := hgStore.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "migration 223: create transaction")
+	}
+
+	zeroBytes := make([]byte, 8)
+
+	// 3a: Fix prover aggregate status.
+	proverResetCount := 0
+	for _, fix := range fixes {
+		p := fix.info
+
+		if err := rdfMultiprover.Set(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			"prover:Prover",
+			"Status",
+			[]byte{fix.newStatus},
+			p.tree,
+		); err != nil {
+			logger.Warn("migration 223: failed to set prover status", zap.Error(err))
+			continue
+		}
+
+		// Clear KickFrameNumber regardless — if status is no longer 4,
+		// any leftover kick frame is stale.
+		if err := rdfMultiprover.Set(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			"prover:Prover",
+			"KickFrameNumber",
+			zeroBytes,
+			p.tree,
+		); err != nil {
+			logger.Warn("migration 223: failed to clear prover kick frame", zap.Error(err))
+			continue
+		}
+
+		if err := hgCRDT.SetVertexData(txn, p.vertexID, p.tree); err != nil {
+			logger.Warn("migration 223: failed to save prover vertex data", zap.Error(err))
+			continue
+		}
+
+		newCommitment := p.tree.Commit(prover, false)
+		vertex := hgcrdt.NewVertex(
+			globalIntrinsicAddress,
+			[32]byte(p.vertexID[32:]),
+			newCommitment,
+			p.tree.GetSize(),
+		)
+		if err := hgCRDT.AddVertex(txn, vertex); err != nil {
+			logger.Warn("migration 223: failed to update prover atom", zap.Error(err))
+			continue
+		}
+
+		proverResetCount++
+		logger.Info("migration 223: corrected prover status",
+			zap.String("address", hex.EncodeToString(p.vertexID[32:])),
+			zap.Uint8("new_status", fix.newStatus),
+		)
+	}
+
+	// 3b: Clear KickFrameNumber on eviction-kicked allocations (status stays 4 = "left").
+	allocResetCount := 0
+	for _, a := range kickedAllocs {
+		if err := rdfMultiprover.Set(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			"allocation:ProverAllocation",
+			"KickFrameNumber",
+			zeroBytes,
+			a.tree,
+		); err != nil {
+			logger.Warn("migration 223: failed to clear allocation kick frame", zap.Error(err))
+			continue
+		}
+
+		if err := hgCRDT.SetVertexData(txn, a.vertexID, a.tree); err != nil {
+			logger.Warn("migration 223: failed to save allocation vertex data", zap.Error(err))
+			continue
+		}
+
+		newCommitment := a.tree.Commit(prover, false)
+		vertex := hgcrdt.NewVertex(
+			globalIntrinsicAddress,
+			[32]byte(a.vertexID[32:]),
+			newCommitment,
+			a.tree.GetSize(),
+		)
+		if err := hgCRDT.AddVertex(txn, vertex); err != nil {
+			logger.Warn("migration 223: failed to update allocation atom", zap.Error(err))
+			continue
+		}
+
+		allocResetCount++
+	}
+
+	if err := txn.Commit(); err != nil {
+		return errors.Wrap(err, "migration 223: commit transaction")
+	}
+
+	logger.Info("migration 223: completed",
+		zap.Int("provers_corrected", proverResetCount),
+		zap.Int("allocs_kick_cleared", allocResetCount),
+	)
+
+	return nil
+}
+
+// migration_2_1_0_224 re-runs the aggregate prover status recomputation with the
+// GetType fix. migration_2_1_0_223 was deployed with a bug where both prover and
+// allocation vertices matched the "prover:Prover.Status" read (same tree key),
+// causing all allocations to be misclassified as provers. The allocsByProver map
+// stayed empty, aggregate always computed as 4, and no provers were corrected.
+func migration_2_1_0_224(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	if cfg == nil || cfg.P2P == nil || cfg.P2P.Network != 0 {
+		return nil
+	}
+	return doMigration223(db, cfg)
 }
 
 // pebbleBatchDB wraps a *pebble.Batch to implement store.KVDB for use in migrations
