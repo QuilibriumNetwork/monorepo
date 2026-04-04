@@ -110,6 +110,7 @@ var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_222,
 	migration_2_1_0_223,
 	migration_2_1_0_224,
+	migration_2_1_0_225,
 }
 
 func NewPebbleDB(
@@ -2880,3 +2881,436 @@ func (s *snapshotTransaction) DeleteRange(
 }
 
 var _ store.Transaction = (*snapshotTransaction)(nil)
+
+// migration_2_1_0_225 fixes orphaned allocations (prover reference points to a
+// non-existent prover vertex) and provers with active allocations that are still
+// marked as left/kicked. After applying fixes, rebuilds CRDT trie indices via
+// the copy-wipe-copy-back pattern (same as migration_2_1_0_221).
+func migration_2_1_0_225(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	if cfg == nil || cfg.P2P == nil || cfg.P2P.Network != 0 {
+		return nil
+	}
+	return doMigration225(db, cfg)
+}
+
+func doMigration225(db *pebble.DB, cfg *config.Config) error {
+	logger := zap.L()
+	logger.Info("migration 225: fixing orphaned allocations and stale prover status")
+
+	globalIntrinsicAddress := intrinsics.GLOBAL_INTRINSIC_ADDRESS
+
+	inclusionProver := bls48581.NewKZGInclusionProver(logger)
+	rdfMultiprover := schema.NewRDFMultiprover(
+		&schema.TurtleRDFParser{},
+		inclusionProver,
+	)
+
+	dbWrapper := &PebbleDB{db: db}
+	hgStore := NewPebbleHypergraphStore(cfg.DB, dbWrapper, logger, nil, inclusionProver)
+	hg, err := hgStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "migration 225: load hypergraph")
+	}
+	hgCRDT := hg.(*hgcrdt.HypergraphCRDT)
+
+	globalShardKey := tries.ShardKey{
+		L1: [3]byte(up2p.GetBloomFilterIndices(globalIntrinsicAddress[:], 256, 3)),
+		L2: globalIntrinsicAddress,
+	}
+
+	// Phase 1: Scan all vertices, collecting provers and allocations.
+	type proverScanInfo struct {
+		vertexID [64]byte
+		tree     *tries.VectorCommitmentTree
+		status   byte
+	}
+
+	type allocScanInfo struct {
+		vertexID  [64]byte
+		tree      *tries.VectorCommitmentTree
+		proverRef []byte // raw bytes from allocation:Prover field
+		status    byte
+	}
+
+	provers := map[string]*proverScanInfo{} // keyed by string(vertexID[32:])
+	var allocs []*allocScanInfo
+
+	iter := hgCRDT.GetVertexDataIterator(globalIntrinsicAddress)
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		tree := iter.Value()
+		if tree == nil || tree.Root == nil || tree.GetSize().Sign() == 0 {
+			continue
+		}
+
+		key := iter.Key()
+		if len(key) < 64 {
+			continue
+		}
+
+		var vertexID [64]byte
+		copy(vertexID[:], key[:64])
+
+		typeName, err := rdfMultiprover.GetType(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			tree,
+		)
+		if err != nil {
+			continue
+		}
+
+		switch typeName {
+		case "prover:Prover":
+			statusBytes, err := rdfMultiprover.Get(
+				globalRDFSchema,
+				"prover:Prover",
+				"Status",
+				tree,
+			)
+			if err == nil && len(statusBytes) > 0 {
+				provers[string(vertexID[32:])] = &proverScanInfo{
+					vertexID: vertexID,
+					tree:     tree,
+					status:   statusBytes[0],
+				}
+			}
+
+		case "allocation:ProverAllocation":
+			allocStatus, err := rdfMultiprover.Get(
+				globalRDFSchema,
+				"allocation:ProverAllocation",
+				"Status",
+				tree,
+			)
+			if err != nil || len(allocStatus) == 0 {
+				continue
+			}
+
+			proverRef, _ := rdfMultiprover.Get(
+				globalRDFSchema,
+				"allocation:ProverAllocation",
+				"Prover",
+				tree,
+			)
+
+			allocs = append(allocs, &allocScanInfo{
+				vertexID:  vertexID,
+				tree:      tree,
+				proverRef: proverRef,
+				status:    allocStatus[0],
+			})
+		}
+	}
+
+	iter.Close()
+
+	logger.Info("migration 225: scan complete",
+		zap.Int("provers", len(provers)),
+		zap.Int("allocations", len(allocs)),
+	)
+
+	// Phase 2: Identify orphaned allocations and stale prover status.
+	var orphanedAllocs []*allocScanInfo
+	// Track which provers have active allocations.
+	proversWithActive := map[string]bool{}
+
+	for _, a := range allocs {
+		if len(a.proverRef) == 0 || provers[string(a.proverRef)] == nil {
+			orphanedAllocs = append(orphanedAllocs, a)
+			continue
+		}
+
+		if a.status == 1 {
+			proversWithActive[string(a.proverRef)] = true
+		}
+	}
+
+	// Find provers that have active allocations but are not status 1.
+	type proverFix struct {
+		info *proverScanInfo
+	}
+	var staleProvers []proverFix
+
+	for addr := range proversWithActive {
+		p := provers[addr]
+		if p != nil && p.status != 1 {
+			staleProvers = append(staleProvers, proverFix{info: p})
+		}
+	}
+
+	logger.Info("migration 225: issues identified",
+		zap.Int("orphaned_allocations", len(orphanedAllocs)),
+		zap.Int("stale_prover_status", len(staleProvers)),
+	)
+
+	if len(orphanedAllocs) == 0 && len(staleProvers) == 0 {
+		logger.Info("migration 225: nothing to fix")
+		return nil
+	}
+
+	// Phase 3: Apply fixes.
+	txn, err := hgStore.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "migration 225: create transaction")
+	}
+
+	// 3a: Delete orphaned allocations.
+	orphanDeleteCount := 0
+	for _, a := range orphanedAllocs {
+		if err := hgCRDT.DeleteVertexAdd(txn, globalShardKey, a.vertexID); err != nil {
+			logger.Warn("migration 225: failed to delete orphaned allocation",
+				zap.String("address", hex.EncodeToString(a.vertexID[32:])),
+				zap.Error(err),
+			)
+			continue
+		}
+		orphanDeleteCount++
+		logger.Info("migration 225: deleted orphaned allocation",
+			zap.String("address", hex.EncodeToString(a.vertexID[32:])),
+		)
+	}
+
+	// 3b: Fix prover status to active (1) and clear KickFrameNumber.
+	zeroBytes := make([]byte, 8)
+	proverFixCount := 0
+	for _, fix := range staleProvers {
+		p := fix.info
+
+		if err := rdfMultiprover.Set(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			"prover:Prover",
+			"Status",
+			[]byte{1},
+			p.tree,
+		); err != nil {
+			logger.Warn("migration 225: failed to set prover status", zap.Error(err))
+			continue
+		}
+
+		if err := rdfMultiprover.Set(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			"prover:Prover",
+			"KickFrameNumber",
+			zeroBytes,
+			p.tree,
+		); err != nil {
+			logger.Warn("migration 225: failed to clear prover kick frame", zap.Error(err))
+			continue
+		}
+
+		if err := hgCRDT.SetVertexData(txn, p.vertexID, p.tree); err != nil {
+			logger.Warn("migration 225: failed to save prover vertex data", zap.Error(err))
+			continue
+		}
+
+		newCommitment := p.tree.Commit(inclusionProver, false)
+		vertex := hgcrdt.NewVertex(
+			globalIntrinsicAddress,
+			[32]byte(p.vertexID[32:]),
+			newCommitment,
+			p.tree.GetSize(),
+		)
+		if err := hgCRDT.AddVertex(txn, vertex); err != nil {
+			logger.Warn("migration 225: failed to update prover atom", zap.Error(err))
+			continue
+		}
+
+		proverFixCount++
+		logger.Info("migration 225: corrected prover status to active",
+			zap.String("address", hex.EncodeToString(p.vertexID[32:])),
+			zap.Uint8("old_status", p.status),
+		)
+	}
+
+	if err := txn.Commit(); err != nil {
+		return errors.Wrap(err, "migration 225: commit fixes")
+	}
+
+	logger.Info("migration 225: fixes applied",
+		zap.Int("orphans_deleted", orphanDeleteCount),
+		zap.Int("provers_corrected", proverFixCount),
+	)
+
+	// Phase 4: Copy-wipe-copy-back to rebuild CRDT trie indices.
+	actualRoot := hgCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
+	if actualRoot == nil {
+		logger.Info("migration 225: no data in global prover shard, skipping copy-wipe-copy-back")
+		return nil
+	}
+
+	hgCRDT.PublishSnapshot(actualRoot)
+
+	const bufSize = 1 << 20
+	actualLis := bufconn.Listen(bufSize)
+	actualGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(actualGRPCServer, hgCRDT)
+	go func() { _ = actualGRPCServer.Serve(actualLis) }()
+	defer actualGRPCServer.Stop()
+
+	actualDialer := func(context.Context, string) (net.Conn, error) {
+		return actualLis.Dial()
+	}
+	actualConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(actualDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "migration 225: dial actual hypergraph")
+	}
+	defer actualConn.Close()
+
+	actualClient := protobufs.NewHypergraphComparisonServiceClient(actualConn)
+
+	// Create in-memory pebble DB
+	memOpts := &pebble.Options{
+		MemTableSize:       64 << 20,
+		FormatMajorVersion: pebble.FormatNewest,
+		FS:                 vfs.NewMem(),
+	}
+	memDB, err := pebble.Open("", memOpts)
+	if err != nil {
+		return errors.Wrap(err, "migration 225: open in-memory pebble")
+	}
+	defer memDB.Close()
+
+	memDBWrapper := &PebbleDB{db: memDB}
+	memStore := NewPebbleHypergraphStore(cfg.DB, memDBWrapper, logger, nil, inclusionProver)
+	memHG, err := memStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "migration 225: load in-memory hypergraph")
+	}
+	memHGCRDT := memHG.(*hgcrdt.HypergraphCRDT)
+
+	// Sync from actual to in-memory for all phases
+	phases := []protobufs.HypergraphPhaseSet{
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS,
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES,
+	}
+
+	for _, phase := range phases {
+		stream, err := actualClient.PerformSync(context.Background())
+		if err != nil {
+			return errors.Wrapf(err, "migration 225: create sync stream for phase %v", phase)
+		}
+		_, err = memHGCRDT.SyncFrom(stream, globalShardKey, phase, nil)
+		if err != nil {
+			logger.Warn("migration 225: sync from actual to memory failed",
+				zap.Error(err), zap.Any("phase", phase))
+		}
+		_ = stream.CloseSend()
+	}
+
+	memRoot := memHGCRDT.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, false)
+	logger.Info("migration 225: synced to in-memory",
+		zap.String("actual_root", hex.EncodeToString(actualRoot)),
+		zap.String("mem_root", hex.EncodeToString(memRoot)),
+	)
+
+	// Stop the actual server before wiping data
+	actualGRPCServer.Stop()
+	actualConn.Close()
+
+	// Wipe tree data for global prover shard from actual DB
+	treePrefixes := []byte{
+		VERTEX_ADDS_TREE_NODE,
+		VERTEX_REMOVES_TREE_NODE,
+		HYPEREDGE_ADDS_TREE_NODE,
+		HYPEREDGE_REMOVES_TREE_NODE,
+		VERTEX_ADDS_TREE_NODE_BY_PATH,
+		VERTEX_REMOVES_TREE_NODE_BY_PATH,
+		HYPEREDGE_ADDS_TREE_NODE_BY_PATH,
+		HYPEREDGE_REMOVES_TREE_NODE_BY_PATH,
+		VERTEX_ADDS_CHANGE_RECORD,
+		VERTEX_REMOVES_CHANGE_RECORD,
+		HYPEREDGE_ADDS_CHANGE_RECORD,
+		HYPEREDGE_REMOVES_CHANGE_RECORD,
+		VERTEX_ADDS_TREE_ROOT,
+		VERTEX_REMOVES_TREE_ROOT,
+		HYPEREDGE_ADDS_TREE_ROOT,
+		HYPEREDGE_REMOVES_TREE_ROOT,
+	}
+
+	for _, prefix := range treePrefixes {
+		start, end := shardRangeBounds(prefix, globalShardKey)
+		if err := db.DeleteRange(start, end, &pebble.WriteOptions{Sync: true}); err != nil {
+			return errors.Wrapf(err, "migration 225: delete range for prefix 0x%02x", prefix)
+		}
+	}
+
+	logger.Info("migration 225: wiped tree data from actual DB")
+
+	// Reload actual hypergraph after wipe
+	actualStore2 := NewPebbleHypergraphStore(cfg.DB, dbWrapper, logger, nil, inclusionProver)
+	actualHG2, err := actualStore2.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "migration 225: reload actual hypergraph after wipe")
+	}
+	actualHGCRDT2 := actualHG2.(*hgcrdt.HypergraphCRDT)
+
+	// Sync from in-memory back to actual DB
+	memHGCRDT.PublishSnapshot(memRoot)
+
+	memLis := bufconn.Listen(bufSize)
+	memGRPCServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(100*1024*1024),
+		grpc.MaxSendMsgSize(100*1024*1024),
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(memGRPCServer, memHGCRDT)
+	go func() { _ = memGRPCServer.Serve(memLis) }()
+	defer memGRPCServer.Stop()
+
+	memDialer := func(context.Context, string) (net.Conn, error) {
+		return memLis.Dial()
+	}
+	memConn, err := grpc.DialContext(
+		context.Background(),
+		"bufnet",
+		grpc.WithContextDialer(memDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "migration 225: dial in-memory hypergraph")
+	}
+	defer memConn.Close()
+
+	memClient := protobufs.NewHypergraphComparisonServiceClient(memConn)
+
+	for _, phase := range phases {
+		stream, err := memClient.PerformSync(context.Background())
+		if err != nil {
+			return errors.Wrapf(err, "migration 225: create sync stream for phase %v (reverse)", phase)
+		}
+		_, err = actualHGCRDT2.SyncFrom(stream, globalShardKey, phase, nil)
+		if err != nil {
+			logger.Warn("migration 225: sync from memory to actual failed",
+				zap.Error(err), zap.Any("phase", phase))
+		}
+		_ = stream.CloseSend()
+	}
+
+	// Final commit
+	finalRoot := actualHGCRDT2.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, true)
+	logger.Info("migration 225: completed",
+		zap.String("final_root", hex.EncodeToString(finalRoot)),
+	)
+
+	return nil
+}
