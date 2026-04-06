@@ -163,7 +163,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 	logger, _ := cfg.Build()
 
 	// Create a shared hypergraph and prover registry for all nodes
-	sharedDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_chaos__shared"}, 0)
+	sharedDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_chaos__shared"}}, 0)
 	defer sharedDB.Close()
 
 	sharedInclusionProver := bls48581.NewKZGInclusionProver(logger)
@@ -195,6 +195,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 	p2pcfg.MinBootstrapPeers = numNodes - 1
 	p2pcfg.DiscoveryPeerLookupLimit = numNodes - 1
 	c := &config.Config{
+		DB: &config.DBConfig{},
 		Engine: &config.EngineConfig{
 			Difficulty:   80000,
 			ProvingKeyId: "q-prover-key",
@@ -212,7 +213,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		}
 		logger, _ := cfg.Build()
 		// Create node-specific components
-		nodeDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_chaos__%d", nodeIdx)}, 0)
+		nodeDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_chaos__%d", nodeIdx)}}, 0)
 		nodeInclusionProver := bls48581.NewKZGInclusionProver(logger)
 		nodeVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 		nodeHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_chaos__%d", nodeIdx)}, nodeDB, logger, nodeVerifiableEncryptor, nodeInclusionProver)
@@ -228,6 +229,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 		// Aside from pubsub, the rest should be concrete instances
 		conf := &config.Config{
+			DB: &config.DBConfig{},
 			Engine: &config.EngineConfig{
 				Difficulty:   80000,
 				ProvingKeyId: "q-prover-key",

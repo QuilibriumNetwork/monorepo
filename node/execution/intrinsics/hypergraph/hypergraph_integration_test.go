@@ -31,7 +31,7 @@ func TestHypergraphIntrinsicIntegration(t *testing.T) {
 
 	// Setup in-memory database and hypergraph
 	logger, _ := zap.NewProduction()
-	db := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	defer db.Close()
 
 	encryptor := verenc.NewMPCitHVerifiableEncryptor(1)
@@ -41,7 +41,7 @@ func TestHypergraphIntrinsicIntegration(t *testing.T) {
 
 	hyperstore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, logger, encryptor, prover)
 
-	hg := hgcrdt.NewHypergraph(logger, hyperstore, prover, []int{}, &tests.Nopthenticator{})
+	hg := hgcrdt.NewHypergraph(logger, hyperstore, prover, []int{}, &tests.Nopthenticator{}, 0)
 
 	// Create a key manager with Ed448 keys for hypergraph operations
 	keyManager := keys.NewInMemoryKeyManager(bc, dc)

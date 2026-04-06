@@ -148,8 +148,9 @@ func TestCodeDeployment_Materialize(t *testing.T) {
 	// Create mock hypergraph
 	mockHypergraph := &mocks.MockHypergraph{}
 
-	// Mock the GetVertex call
+	// Mock the GetVertex and GetProver calls
 	mockHypergraph.On("GetVertex", mock.Anything).Return(nil, nil)
+	mockHypergraph.On("GetProver").Return(bls48581.NewKZGInclusionProver(zap.NewNop()))
 
 	// Create hypergraph state
 	state := hgstate.NewHypergraphState(mockHypergraph)
@@ -309,7 +310,7 @@ func TestCodeDeployment_Serialization_RoundTrip(t *testing.T) {
 func TestCodeDeployment_Materialize_TreeConstruction(t *testing.T) {
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -317,6 +318,7 @@ func TestCodeDeployment_Materialize_TreeConstruction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		0,
 	)
 
 	// Test data

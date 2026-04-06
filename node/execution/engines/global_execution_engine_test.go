@@ -29,6 +29,7 @@ import (
 func TestGlobalExecutionEngine_Start(t *testing.T) {
 	logger := zap.NewNop()
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockHG.On("TrackChange", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	mockClockStore := new(mocks.MockClockStore)
 	mockShardsStore := new(mocks.MockShardsStore)
@@ -125,6 +126,7 @@ func TestGlobalExecutionEngine_ProcessMessage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := zap.NewNop()
 			mockHG := new(mocks.MockHypergraph)
+			mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 			mockClockStore := new(mocks.MockClockStore)
 			mockShardsStore := new(mocks.MockShardsStore)
 			mockShardsStore.On("GetAppShards", mock.Anything, mock.Anything).Return([]store.ShardInfo{}, nil)
@@ -216,6 +218,7 @@ func TestGlobalExecutionEngine_AllOperationTypes(t *testing.T) {
 			logger := zap.NewNop()
 			mockHG := new(mocks.MockHypergraph)
 			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
+			mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 			mockClockStore := new(mocks.MockClockStore)
 			mockShardsStore := new(mocks.MockShardsStore)
 			mockKeyManager := new(mocks.MockKeyManager)

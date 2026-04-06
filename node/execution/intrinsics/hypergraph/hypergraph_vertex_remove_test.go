@@ -66,6 +66,7 @@ func TestVertexRemove_Materialize(t *testing.T) {
 	domain := [32]byte{1, 2, 3}
 	dataAddress := [32]byte{4, 5, 6}
 	mockHypergraph := &mocks.MockHypergraph{}
+	mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockHypergraph.On("GetVertex", mock.Anything).Return(nodehg.NewVertex(domain, dataAddress, make([]byte, 74), big.NewInt(74)), nil)
 	mockHypergraph.On("GetVertexData", mock.Anything).Return(&crypto.VectorCommitmentTree{}, nil)
 	hgState := hgstate.NewHypergraphState(mockHypergraph)

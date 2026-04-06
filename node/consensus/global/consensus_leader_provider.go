@@ -139,7 +139,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 						zap.Uint64("frame_number", latestQC.GetFrameNumber()),
 						zap.String("peer_id", peerID.String()),
 					)
-					p.engine.syncProvider.AddState(
+					p.engine.consensusProtocol.syncProvider.AddState(
 						[]byte(peerID),
 						latestQC.GetFrameNumber(),
 						[]byte(latestQC.Identity()),
@@ -168,7 +168,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	// Materialize prior frame's transactions before computing roots for N+1.
 	// Without this, rebuildShardCommitments sees pre-frame-N state because
 	// HotStuff's two-chain commit rule hasn't materialized N yet.
-	if err := p.engine.materialize(nil, prior); err != nil {
+	if err := p.engine.materializer.materialize(nil, prior); err != nil {
 		p.engine.logger.Warn(
 			"failed to materialize prior frame in ProveNextState",
 			zap.Uint64("frame_number", prior.Header.FrameNumber),
@@ -180,7 +180,7 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	// the proving mutex and validated the prior frame. This prevents race
 	// conditions where a subsequent OnRankChange would overwrite collectedMessages
 	// and shardCommitments while we're still proving.
-	_, err = p.engine.livenessProvider.Collect(
+	_, err = p.engine.consensusProtocol.livenessProvider.Collect(
 		ctx,
 		prior.Header.FrameNumber+1,
 		rank,
@@ -247,14 +247,14 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	requests := make(
 		[]*protobufs.MessageBundle,
 		0,
-		len(p.engine.collectedMessages),
+		len(p.engine.consensusProtocol.collectedMessages),
 	)
 	p.engine.logger.Debug(
 		"including messages",
-		zap.Int("message_count", len(p.engine.collectedMessages)),
+		zap.Int("message_count", len(p.engine.consensusProtocol.collectedMessages)),
 	)
 	requestTree := &tries.VectorCommitmentTree{}
-	for _, msgData := range p.engine.collectedMessages {
+	for _, msgData := range p.engine.consensusProtocol.collectedMessages {
 		// Check if data is long enough to contain type prefix
 		if len(msgData) < 4 {
 			p.engine.logger.Warn(
@@ -307,10 +307,10 @@ func (p *GlobalLeaderProvider) ProveNextState(
 	requestRoot := requestTree.Commit(p.engine.inclusionProver, false)
 
 	// Copy shared state under lock to avoid data race with materialize()
-	p.engine.shardCommitmentMu.Lock()
-	shardCommitments := p.engine.shardCommitments
-	proverRoot := p.engine.proverRoot
-	p.engine.shardCommitmentMu.Unlock()
+	p.engine.consensusProtocol.shardCommitmentMu.Lock()
+	shardCommitments := p.engine.consensusProtocol.shardCommitments
+	proverRoot := p.engine.consensusProtocol.proverRoot
+	p.engine.consensusProtocol.shardCommitmentMu.Unlock()
 
 	// Prove the global frame header
 	newHeader, err := p.engine.frameProver.ProveGlobalFrameHeader(

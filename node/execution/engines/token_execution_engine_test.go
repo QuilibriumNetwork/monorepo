@@ -67,6 +67,7 @@ func TestTokenExecutionEngine_Start(t *testing.T) {
 	logger := zap.NewNop()
 	mockHG := new(mocks.MockHypergraph)
 	mockHG.On("GetCoveredPrefix").Return([]int{}, nil).Maybe()
+	mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockClockStore := new(mocks.MockClockStore)
 	mockKeyManager := new(mocks.MockKeyManager)
 	mockInclusionProver := new(mocks.MockInclusionProver)
@@ -145,6 +146,7 @@ func TestTokenExecutionEngine_ProcessMessage_DeployEdgeCases(t *testing.T) {
 			logger := zap.NewNop()
 			mockHG := new(mocks.MockHypergraph)
 			mockHG.On("GetCoveredPrefix").Return([]int{}, nil).Maybe()
+			mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 			mockClockStore := new(mocks.MockClockStore)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockInclusionProver := new(mocks.MockInclusionProver)
@@ -438,6 +440,7 @@ func createTokenDeployPayloadFull(t *testing.T, mockHG *mocks.MockHypergraph) *p
 func createTokenTransactionPayload(t *testing.T) *protobufs.MessageRequest {
 	// Create mock dependencies
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockBP := new(mocks.MockBulletproofProver)
 	mockBP.On("GenerateRangeProofFromBig", mock.Anything, mock.Anything, mock.Anything).Return(crypto.RangeProofResult{
 		Proof:      make([]byte, 56),
@@ -570,6 +573,7 @@ func createTokenTransactionPayload(t *testing.T) *protobufs.MessageRequest {
 func createTokenPendingTransactionPayload(t *testing.T) *protobufs.MessageRequest {
 	// Create mock dependencies
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockBP := new(mocks.MockBulletproofProver)
 	mockIP := new(mocks.MockInclusionProver)
 	mockVE := new(mocks.MockVerifiableEncryptor)
@@ -656,6 +660,7 @@ func createTokenPendingTransactionPayload(t *testing.T) *protobufs.MessageReques
 func createTokenMintTransactionPayload(t *testing.T) *protobufs.MessageRequest {
 	// Create mock dependencies
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockBP := new(mocks.MockBulletproofProver)
 	mockIP := new(mocks.MockInclusionProver)
 	mockVE := new(mocks.MockVerifiableEncryptor)

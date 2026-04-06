@@ -200,10 +200,12 @@ func TestLoadTokenIntrinsic(t *testing.T) {
 
 	// Setup mocks for the error case
 	mockHypergraphErr := new(mocks.MockHypergraph)
+	mockHypergraphErr.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockHypergraphErr.On("GetVertex", mock.Anything).Return(nil, errors.New("vertex not found"))
 
 	// Setup mocks for the success case
 	mockHypergraphSuccess := new(mocks.MockHypergraph)
+	mockHypergraphSuccess.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 
 	// Create test configuration
 	config := createMintableTestConfig()

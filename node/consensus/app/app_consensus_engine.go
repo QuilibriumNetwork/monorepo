@@ -2245,8 +2245,8 @@ func (e *AppConsensusEngine) internalProveFrame(
 		frameNumber,
 		e.appAddress,
 	)
-	e.commitBarrier.Unlock()
 	if err != nil {
+		e.commitBarrier.Unlock()
 		return nil, err
 	}
 
@@ -2258,13 +2258,19 @@ func (e *AppConsensusEngine) internalProveFrame(
 		stateRoots[3] = make([]byte, 64)
 	}
 
-	// Publish the snapshot generation with the shard's vertex add root so clients
-	// can sync against this specific state.
+	// Publish the snapshot generation with the shard's vertex add root so
+	// clients can sync against this specific state. This MUST happen inside
+	// the commitBarrier lock — releasing the lock before publishing allows
+	// another goroutine to acquire commitBarrier and call state.Commit(),
+	// modifying tree data in Pebble. The subsequent PublishSnapshot would
+	// then capture post-modification data tagged with the pre-modification
+	// root, causing sync clients to receive mismatched data.
 	if len(stateRoots[0]) > 0 {
 		if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
 			hgCRDT.PublishSnapshot(stateRoots[0])
 		}
 	}
+	e.commitBarrier.Unlock()
 
 	txMap := map[string][][]byte{}
 	for i, message := range messages {

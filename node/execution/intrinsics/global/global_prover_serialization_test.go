@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
@@ -246,7 +247,7 @@ func TestProverRejectSerialization(t *testing.T) {
 // TestProverKickSerialization tests serialization and deserialization of ProverKick
 func TestProverKickSerialization(t *testing.T) {
 	// Create a mock inclusion prover that will create mock multiproofs
-	mockInclusionProver := &mocks.MockInclusionProver{}
+	mockInclusionProver := func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()
 
 	// Create a mock multiproof for serialization
 	mockMultiproof := &mocks.MockMultiproof{}

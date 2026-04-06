@@ -213,7 +213,7 @@ func TestValidMintWithProofOfMeaningfulWorkTransaction(t *testing.T) {
 	sk, _ := dc.New()
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -221,6 +221,7 @@ func TestValidMintWithProofOfMeaningfulWorkTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -313,7 +314,7 @@ func TestValidMintWithVerkleMultiproofSignatureTransaction(t *testing.T) {
 	sk, _ := dc.New()
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -321,6 +322,7 @@ func TestValidMintWithVerkleMultiproofSignatureTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -426,7 +428,7 @@ func TestValidMintWithAuthorityTransaction(t *testing.T) {
 	sk, _ := dc.New()
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -434,6 +436,7 @@ func TestValidMintWithAuthorityTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -528,7 +531,7 @@ func TestValidMintWithSignatureTransaction(t *testing.T) {
 	dc := &bulletproofs.Decaf448KeyConstructor{}
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -536,6 +539,7 @@ func TestValidMintWithSignatureTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -635,7 +639,7 @@ func TestValidMintWithPaymentZeroFeeBasisTransaction(t *testing.T) {
 
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -643,6 +647,7 @@ func TestValidMintWithPaymentZeroFeeBasisTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -773,7 +778,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisValidQuantityTransaction
 
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -781,6 +786,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisValidQuantityTransaction
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -969,7 +975,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisInvalidQuantityTransacti
 
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -977,6 +983,7 @@ func TestValidMintWithPaymentNonDivisibleNonZeroFeeBasisInvalidQuantityTransacti
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -1160,7 +1167,7 @@ func TestValidMintWithPaymentNonZeroFeeBasisTransaction(t *testing.T) {
 
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -1168,6 +1175,7 @@ func TestValidMintWithPaymentNonZeroFeeBasisTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -1351,7 +1359,7 @@ func TestValidPendingTransaction(t *testing.T) {
 
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -1359,6 +1367,7 @@ func TestValidPendingTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -1517,7 +1526,7 @@ func TestValidPendingTransactionFeeOnly(t *testing.T) {
 
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -1525,6 +1534,7 @@ func TestValidPendingTransactionFeeOnly(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -1687,7 +1697,7 @@ func TestValidPendingTransactionMixed(t *testing.T) {
 
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -1695,6 +1705,7 @@ func TestValidPendingTransactionMixed(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -1854,7 +1865,7 @@ func TestValidPendingTransactionLegacyOnly(t *testing.T) {
 
 		l, _ := zap.NewProduction()
 		ip := bls48581.NewKZGInclusionProver(l)
-		s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		ve := verenc.NewMPCitHVerifiableEncryptor(1)
 		hg := hypergraph.NewHypergraph(
 			l,
@@ -1862,6 +1873,7 @@ func TestValidPendingTransactionLegacyOnly(t *testing.T) {
 			ip,
 			[]int{},
 			&tests.Nopthenticator{},
+			200,
 		)
 		bp := &bulletproofs.Decaf448BulletproofProver{}
 		km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -1965,7 +1977,7 @@ func TestValidTransaction(t *testing.T) {
 
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -1973,6 +1985,7 @@ func TestValidTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -2201,7 +2214,7 @@ func TestValidAltTransaction(t *testing.T) {
 
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -2209,6 +2222,7 @@ func TestValidAltTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -2431,7 +2445,7 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 	dc := &bulletproofs.Decaf448KeyConstructor{}
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -2439,6 +2453,7 @@ func TestFullTokenFlow_MintPendingTransaction(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
@@ -2716,7 +2731,7 @@ func TestFullTokenFlow_MintPendingTransactionNonDivisible(t *testing.T) {
 	dc := &bulletproofs.Decaf448KeyConstructor{}
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -2724,6 +2739,7 @@ func TestFullTokenFlow_MintPendingTransactionNonDivisible(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		200,
 	)
 	bp := &bulletproofs.Decaf448BulletproofProver{}
 	km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)

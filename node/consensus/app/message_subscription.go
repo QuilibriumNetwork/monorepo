@@ -192,7 +192,7 @@ func (e *AppConsensusEngine) streamGlobalMessagesFromMaster(
 			ctx,
 			&protobufs.StreamGlobalMessagesRequest{},
 		)
-		if err != nil {
+		if err != nil || stream == nil {
 			e.logger.Warn("global message stream: failed to open stream",
 				zap.Error(err),
 			)

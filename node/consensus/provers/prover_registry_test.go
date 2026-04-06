@@ -1975,6 +1975,9 @@ func TestEvictInactiveProvers(t *testing.T) {
 	changes := state.Changeset()
 	assert.NotEmpty(t, changes, "state changeset should have mutations from eviction")
 
+	// Commit eviction state so vertex data is readable from the hypergraph
+	require.NoError(t, state.Commit(), "committing eviction state")
+
 	// Check that prover vertex mutations exist for evicted provers
 	// Each evicted prover should have its prover vertex + allocation vertices changed
 	evictedVertexChanges := 0

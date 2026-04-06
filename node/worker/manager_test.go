@@ -648,15 +648,14 @@ func TestWorkerManager_EmptyFilter(t *testing.T) {
 	err = manager.DeallocateWorker(1)
 	require.NoError(t, err)
 
-	// Filter should still be set
+	// Filter is cleared on deallocation
 	filter, err = manager.GetFilterByWorkerId(1)
 	require.NoError(t, err)
-	assert.Equal(t, newFilter, filter)
+	assert.Nil(t, filter)
 
-	// Can still get by filter after deallocation
-	workerId, err = manager.GetWorkerIdByFilter(newFilter)
-	require.NoError(t, err)
-	assert.Equal(t, uint(1), workerId)
+	// Lookup by old filter should fail after deallocation
+	_, err = manager.GetWorkerIdByFilter(newFilter)
+	assert.Error(t, err)
 }
 
 func TestWorkerManager_FilterUpdate(t *testing.T) {
@@ -770,18 +769,18 @@ func TestWorkerManager_FilterUpdate(t *testing.T) {
 	err = manager.AllocateWorker(2, []byte{})
 	assert.Error(t, err) // Should fail because already allocated
 
-	// Deallocate first
+	// Deallocate first (clears filter)
 	err = manager.DeallocateWorker(2)
 	require.NoError(t, err)
 
-	// Now allocate with empty filter - should keep existing filter
+	// Now allocate with empty filter - filter stays nil since deallocation cleared it
 	err = manager.AllocateWorker(2, []byte{})
 	require.NoError(t, err)
 
-	// Should still have the new filter
+	// Filter is nil because deallocation cleared it and empty filter doesn't set a new one
 	filter, err := manager.GetFilterByWorkerId(2)
 	require.NoError(t, err)
-	assert.Equal(t, newFilter, filter)
+	assert.Nil(t, filter)
 }
 
 type mockIPC struct {

@@ -109,7 +109,7 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	}
 	logger, _ := cfg.Build()
 	// Create stores
-	pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_basic"}, 0)
+	pebbleDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_basic"}}, 0)
 
 	// Create inclusion prover and verifiable encryptor
 	inclusionProver := bls48581.NewKZGInclusionProver(logger)
@@ -174,6 +174,7 @@ func TestAppConsensusEngine_Integration_BasicFrameProgression(t *testing.T) {
 	p2pcfg.DOut = 0
 	p2pcfg.DLazy = 0
 	config := &config.Config{
+		DB: &config.DBConfig{},
 		Engine: &config.EngineConfig{
 			Difficulty:   80000,
 			ProvingKeyId: "q-prover-key",
@@ -415,6 +416,7 @@ func TestAppConsensusEngine_Integration_FeeVotingMechanics(t *testing.T) {
 		p2pcfg.MinBootstrapPeers = numNodes - 1
 		p2pcfg.DiscoveryPeerLookupLimit = numNodes - 1
 		config := &config.Config{
+			DB: &config.DBConfig{},
 			Engine: &config.EngineConfig{
 				Difficulty:   80000,
 				ProvingKeyId: "q-prover-key",
@@ -442,7 +444,7 @@ func TestAppConsensusEngine_Integration_FeeVotingMechanics(t *testing.T) {
 	t.Log("  - All nodes connected")
 
 	// Create a temporary hypergraph for prover registry
-	tempDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_fee_temp"}, 0)
+	tempDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_fee_temp"}}, 0)
 	tempInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	tempVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	tempHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_fee_temp"}, tempDB, logger, tempVerifiableEncryptor, tempInclusionProver)
@@ -451,7 +453,7 @@ func TestAppConsensusEngine_Integration_FeeVotingMechanics(t *testing.T) {
 	t.Log("Step 4: Creating consensus engines for each node")
 	for i := 0; i < numNodes; i++ {
 		verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
-		pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_fee_%d", i)}, 0)
+		pebbleDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_fee_%d", i)}}, 0)
 		hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_fee_%d", i)}, pebbleDB, logger, verifiableEncryptor, inclusionProver)
 		consensusStore := store.NewPebbleConsensusStore(pebbleDB, logger)
 		tempClockStore := store.NewPebbleClockStore(tempDB, logger)
@@ -755,7 +757,7 @@ func TestAppConsensusEngine_Integration_ReconnectCatchup(t *testing.T) {
 
 	for i := 0; i < numNodes; i++ {
 		// Shared backing stores used by the factories
-		tempDB := store.NewPebbleDB(baseLogger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_partition_catchup_temp"}, 0)
+		tempDB := store.NewPebbleDB(baseLogger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_partition_catchup_temp"}}, 0)
 		defer tempDB.Close()
 		tempInclusionProver := bls48581.NewKZGInclusionProver(baseLogger)
 		tempVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
@@ -774,7 +776,7 @@ func TestAppConsensusEngine_Integration_ReconnectCatchup(t *testing.T) {
 		nodeLogger, _ := cfg.Build()
 
 		verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
-		nodeDB := store.NewPebbleDB(nodeLogger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_partition_catchup_%d", i)}, 0)
+		nodeDB := store.NewPebbleDB(nodeLogger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_partition_catchup_%d", i)}}, 0)
 		defer nodeDB.Close()
 		inclusionProver := bls48581.NewKZGInclusionProver(nodeLogger)
 		hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_partition_catchup_%d", i)}, nodeDB, nodeLogger, verifiableEncryptor, inclusionProver)
@@ -1022,7 +1024,7 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 
 	// Create shared infrastructure
 	// Create a temporary hypergraph for prover registry
-	tempDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_multi_temp"}, 0)
+	tempDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_multi_temp"}}, 0)
 	tempInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	tempVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	tempHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_multi_temp"}, tempDB, logger, tempVerifiableEncryptor, tempInclusionProver)
@@ -1051,7 +1053,7 @@ func TestAppConsensusEngine_Integration_MultipleAppShards(t *testing.T) {
 		bc := &bls48581.Bls48581KeyConstructor{}
 		keyManager := keyManagers[i]
 
-		pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_multi_%d", i)}, 0)
+		pebbleDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_multi_%d", i)}}, 0)
 
 		inclusionProver := bls48581.NewKZGInclusionProver(logger)
 		verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
@@ -1217,7 +1219,7 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 
 	// Create prover registry
 	// Create a temporary hypergraph for prover registry
-	tempDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_coord_temp"}, 0)
+	tempDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_coord_temp"}}, 0)
 	tempInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	tempVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	tempHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_coord_temp"}, tempDB, logger, tempVerifiableEncryptor, tempInclusionProver)
@@ -1268,7 +1270,7 @@ func TestAppConsensusEngine_Integration_GlobalAppCoordination(t *testing.T) {
 	// Don't add initial frame - let the time reel initialize itself
 
 	// Create app engine
-	pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_coordination"}, 0)
+	pebbleDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_coordination"}}, 0)
 
 	inclusionProver := bls48581.NewKZGInclusionProver(logger)
 	verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
@@ -1410,7 +1412,7 @@ func TestAppConsensusEngine_Integration_ProverTrieMembership(t *testing.T) {
 
 	// Create prover registry with specific provers
 	// Create a temporary hypergraph for prover registry
-	tempDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_prover_temp"}, 0)
+	tempDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_prover_temp"}}, 0)
 	tempInclusionProver := bls48581.NewKZGInclusionProver(logger)
 	tempVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	tempBulletproof := bulletproofs.NewBulletproofProver()
@@ -1438,7 +1440,7 @@ func TestAppConsensusEngine_Integration_ProverTrieMembership(t *testing.T) {
 		bc := &bls48581.Bls48581KeyConstructor{}
 		keyManager := keyManagers[i]
 
-		pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_prover_%d", i)}, 0)
+		pebbleDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_prover_%d", i)}}, 0)
 
 		inclusionProver := bls48581.NewKZGInclusionProver(logger)
 		verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
@@ -1564,7 +1566,7 @@ func TestAppConsensusEngine_Integration_InvalidFrameRejection(t *testing.T) {
 	require.NoError(t, err)
 	proverKey := pk.Public().([]byte)
 
-	pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_invalid_rejection"}, 0)
+	pebbleDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_invalid_rejection"}}, 0)
 
 	inclusionProver := bls48581.NewKZGInclusionProver(logger)
 	verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
@@ -1887,7 +1889,7 @@ func TestAppConsensusEngine_Integration_ComplexMultiShardScenario(t *testing.T) 
 		}
 		logger, _ := cfg.Build()
 		// Create node-specific components
-		nodeDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_chaos__%d", nodeIdx)}, 0)
+		nodeDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_chaos__%d", nodeIdx)}}, 0)
 		nodeInclusionProver := bls48581.NewKZGInclusionProver(logger)
 		nodeVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 		nodeHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: fmt.Sprintf(".test/app_chaos__%d", nodeIdx)}, nodeDB, logger, nodeVerifiableEncryptor, nodeInclusionProver)
@@ -2348,7 +2350,7 @@ func TestGenerateAddressesForComplexTest(t *testing.T) {
 	bc := &bls48581.Bls48581KeyConstructor{}
 	dc := &bulletproofs.Decaf448KeyConstructor{}
 
-	nodeDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_chaos"}, 0)
+	nodeDB := store.NewPebbleDB(zap.L(), &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_chaos"}}, 0)
 	nodeVerifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
 	nodeHypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_chaos"}, nodeDB, zap.L(), nodeVerifiableEncryptor, nodeInclusionProver)
 
@@ -2686,10 +2688,10 @@ func TestAppConsensusEngine_Integration_NoProversStaysInLoading(t *testing.T) {
 		t.Logf("Creating node %d with peer ID: %x", nodeID, peerID)
 
 		// Create unique components for each node
-		pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{
+		pebbleDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{
 			InMemoryDONOTUSE: true,
 			Path:             fmt.Sprintf(".test/app_no_provers_%d", nodeID),
-		}, 0)
+		}}, 0)
 
 		hypergraphStore := store.NewPebbleHypergraphStore(&config.DBConfig{
 			InMemoryDONOTUSE: true,
@@ -2885,7 +2887,7 @@ func TestAppConsensusEngine_Integration_AlertStopsProgression(t *testing.T) {
 	}
 	logger, _ := cfg.Build()
 	// Create stores
-	pebbleDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_basic"}, 0)
+	pebbleDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/app_basic"}}, 0)
 
 	// Create inclusion prover and verifiable encryptor
 	inclusionProver := bls48581.NewKZGInclusionProver(logger)

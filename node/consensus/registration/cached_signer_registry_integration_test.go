@@ -23,7 +23,7 @@ import (
 
 func setupTestKeyStore(t *testing.T) *store.PebbleKeyStore {
 	logger, _ := zap.NewDevelopment()
-	tempDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}, 0)
+	tempDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}}, 0)
 	return store.NewPebbleKeyStore(tempDB, logger)
 }
 
@@ -330,7 +330,7 @@ func TestCacheManagement(t *testing.T) {
 // BenchmarkCachedSignerRegistry benchmarks various operations
 func BenchmarkCachedSignerRegistry(b *testing.B) {
 	logger := zap.NewNop()
-	tempDB := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}, 0)
+	tempDB := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/store"}}, 0)
 	keyStore := store.NewPebbleKeyStore(tempDB, logger)
 	bc := &bls48581.Bls48581KeyConstructor{}
 	dc := &bulletproofs.Decaf448KeyConstructor{}

@@ -46,7 +46,7 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 	difficulty := uint64(frame.Header.Difficulty)
 	frameNumber := frame.Header.FrameNumber
 
-	self, _ := e.allocationContext()
+	self, _ := e.workerAllocator.allocationContext()
 
 	var selfAddress []byte
 	if self != nil {

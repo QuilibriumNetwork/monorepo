@@ -111,6 +111,7 @@ var pebbleMigrations = []func(*pebble.Batch, *pebble.DB, *config.Config) error{
 	migration_2_1_0_223,
 	migration_2_1_0_224,
 	migration_2_1_0_225,
+	migration_2_1_0_226,
 }
 
 func NewPebbleDB(
@@ -3310,6 +3311,236 @@ func doMigration225(db *pebble.DB, cfg *config.Config) error {
 	finalRoot := actualHGCRDT2.GetVertexAddsSet(globalShardKey).GetTree().Commit(nil, true)
 	logger.Info("migration 225: completed",
 		zap.String("final_root", hex.EncodeToString(finalRoot)),
+	)
+
+	return nil
+}
+
+// migration_2_1_0_226 fixes prover records whose aggregate status disagrees
+// with their allocations. If any allocation is active (1), the prover must be
+// active. If none are active but some are joining (0), the prover must be
+// joining. This corrects damage from the inverted error check in
+// UpdateAggregateProverStatus (if err != nil → if err == nil).
+func migration_2_1_0_226(b *pebble.Batch, db *pebble.DB, cfg *config.Config) error {
+	return doMigration226(db, cfg)
+}
+
+func doMigration226(db *pebble.DB, cfg *config.Config) error {
+	logger := zap.L()
+	logger.Info("migration 226: reconciling prover status with allocation statuses")
+
+	globalIntrinsicAddress := intrinsics.GLOBAL_INTRINSIC_ADDRESS
+
+	inclusionProver := bls48581.NewKZGInclusionProver(logger)
+	rdfMultiprover := schema.NewRDFMultiprover(
+		&schema.TurtleRDFParser{},
+		inclusionProver,
+	)
+
+	dbWrapper := &PebbleDB{db: db}
+	hgStore := NewPebbleHypergraphStore(cfg.DB, dbWrapper, logger, nil, inclusionProver)
+	hg, err := hgStore.LoadHypergraph(nil, 0)
+	if err != nil {
+		return errors.Wrap(err, "migration 226: load hypergraph")
+	}
+	hgCRDT := hg.(*hgcrdt.HypergraphCRDT)
+
+	// Phase 1: Scan all vertices, collecting provers and allocations.
+	type proverInfo struct {
+		vertexID [64]byte
+		tree     *tries.VectorCommitmentTree
+		status   byte
+	}
+
+	type allocInfo struct {
+		proverRef []byte
+		status    byte
+	}
+
+	provers := map[string]*proverInfo{}
+	var allocs []allocInfo
+
+	iter := hgCRDT.GetVertexDataIterator(globalIntrinsicAddress)
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		tree := iter.Value()
+		if tree == nil || tree.Root == nil || tree.GetSize().Sign() == 0 {
+			continue
+		}
+
+		key := iter.Key()
+		if len(key) < 64 {
+			continue
+		}
+
+		var vertexID [64]byte
+		copy(vertexID[:], key[:64])
+
+		typeName, err := rdfMultiprover.GetType(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			tree,
+		)
+		if err != nil {
+			continue
+		}
+
+		switch typeName {
+		case "prover:Prover":
+			statusBytes, err := rdfMultiprover.Get(
+				globalRDFSchema,
+				"prover:Prover",
+				"Status",
+				tree,
+			)
+			if err == nil && len(statusBytes) > 0 {
+				provers[string(vertexID[32:])] = &proverInfo{
+					vertexID: vertexID,
+					tree:     tree,
+					status:   statusBytes[0],
+				}
+			}
+
+		case "allocation:ProverAllocation":
+			allocStatus, err := rdfMultiprover.Get(
+				globalRDFSchema,
+				"allocation:ProverAllocation",
+				"Status",
+				tree,
+			)
+			if err != nil || len(allocStatus) == 0 {
+				continue
+			}
+
+			proverRef, _ := rdfMultiprover.Get(
+				globalRDFSchema,
+				"allocation:ProverAllocation",
+				"Prover",
+				tree,
+			)
+
+			allocs = append(allocs, allocInfo{
+				proverRef: proverRef,
+				status:    allocStatus[0],
+			})
+		}
+	}
+
+	iter.Close()
+
+	logger.Info("migration 226: scan complete",
+		zap.Int("provers", len(provers)),
+		zap.Int("allocations", len(allocs)),
+	)
+
+	// Phase 2: For each prover, determine what status it should have based
+	// on its allocations. Priority: active (1) > joining (0).
+	// We only fix provers that are NOT already correct.
+	proverHasActive := map[string]bool{}
+	proverHasJoining := map[string]bool{}
+
+	for _, a := range allocs {
+		if len(a.proverRef) == 0 {
+			continue
+		}
+		key := string(a.proverRef)
+		if a.status == 1 {
+			proverHasActive[key] = true
+		} else if a.status == 0 {
+			proverHasJoining[key] = true
+		}
+	}
+
+	type proverFix struct {
+		info      *proverInfo
+		newStatus byte
+	}
+	var fixes []proverFix
+
+	for addr, p := range provers {
+		if proverHasActive[addr] && p.status != 1 {
+			fixes = append(fixes, proverFix{info: p, newStatus: 1})
+		} else if !proverHasActive[addr] && proverHasJoining[addr] && p.status != 0 {
+			fixes = append(fixes, proverFix{info: p, newStatus: 0})
+		}
+	}
+
+	logger.Info("migration 226: provers to fix",
+		zap.Int("count", len(fixes)),
+	)
+
+	if len(fixes) == 0 {
+		logger.Info("migration 226: all prover statuses are consistent, nothing to do")
+		return nil
+	}
+
+	// Phase 3: Apply fixes — only update prover vertex data, no tree rebuild needed.
+	txn, err := hgStore.NewTransaction(false)
+	if err != nil {
+		return errors.Wrap(err, "migration 226: create transaction")
+	}
+
+	fixCount := 0
+	for _, fix := range fixes {
+		p := fix.info
+
+		if err := rdfMultiprover.Set(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			"prover:Prover",
+			"Status",
+			[]byte{fix.newStatus},
+			p.tree,
+		); err != nil {
+			logger.Warn("migration 226: failed to set prover status", zap.Error(err))
+			continue
+		}
+
+		// Clear KickFrameNumber if we're setting to active or joining
+		zeroBytes := make([]byte, 8)
+		if err := rdfMultiprover.Set(
+			globalRDFSchema,
+			globalIntrinsicAddress[:],
+			"prover:Prover",
+			"KickFrameNumber",
+			zeroBytes,
+			p.tree,
+		); err != nil {
+			logger.Warn("migration 226: failed to clear kick frame", zap.Error(err))
+			continue
+		}
+
+		if err := hgCRDT.SetVertexData(txn, p.vertexID, p.tree); err != nil {
+			logger.Warn("migration 226: failed to save vertex data", zap.Error(err))
+			continue
+		}
+
+		newCommitment := p.tree.Commit(inclusionProver, false)
+		vertex := hgcrdt.NewVertex(
+			globalIntrinsicAddress,
+			[32]byte(p.vertexID[32:]),
+			newCommitment,
+			p.tree.GetSize(),
+		)
+		if err := hgCRDT.AddVertex(txn, vertex); err != nil {
+			logger.Warn("migration 226: failed to update prover atom", zap.Error(err))
+			continue
+		}
+
+		fixCount++
+		logger.Info("migration 226: corrected prover status",
+			zap.String("address", hex.EncodeToString(p.vertexID[32:])),
+			zap.Uint8("old_status", p.status),
+			zap.Uint8("new_status", fix.newStatus),
+		)
+	}
+
+	if err := txn.Commit(); err != nil {
+		return errors.Wrap(err, "migration 226: commit fixes")
+	}
+
+	logger.Info("migration 226: completed",
+		zap.Int("provers_fixed", fixCount),
 	)
 
 	return nil

@@ -56,7 +56,13 @@ func (e *GlobalConsensusEngine) GetGlobalFrame(
 	var frame *protobufs.GlobalFrame
 	var err error
 	if request.FrameNumber == 0 {
-		frame = (*e.forks.FinalizedState().State)
+		if e.consensusProtocol.forks == nil {
+			return nil, errors.Wrap(
+				errors.New("not currently syncable"),
+				"get global frame",
+			)
+		}
+		frame = (*e.consensusProtocol.forks.FinalizedState().State)
 		if frame.Header.FrameNumber == 0 {
 			return nil, errors.Wrap(
 				errors.New("not currently syncable"),
@@ -483,7 +489,10 @@ func (e *GlobalConsensusEngine) StreamGlobalMessages(
 
 // LatestGlobalFrame implements consensus.GlobalFrameService.
 func (e *GlobalConsensusEngine) LatestGlobalFrame() (*protobufs.GlobalFrame, error) {
-	finalized := e.forks.FinalizedState()
+	if e.consensusProtocol.forks == nil {
+		return nil, errors.New("finalized state unavailable")
+	}
+	finalized := e.consensusProtocol.forks.FinalizedState()
 	if finalized == nil || finalized.State == nil {
 		return nil, errors.New("finalized state unavailable")
 	}

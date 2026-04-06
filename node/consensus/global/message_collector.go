@@ -297,7 +297,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) error {
 		}
 	}
 
-	seq := e.currentRank + 1
+	seq := e.consensusProtocol.currentRank + 1
 	record := newSequencedGlobalMessage(seq, payload)
 
 	// Add directly to the collector synchronously rather than going through
@@ -309,7 +309,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) error {
 		e.logger.Debug(
 			"could not get collector for global message",
 			zap.Uint64("sequence", seq),
-			zap.Uint64("current_rank", e.currentRank),
+			zap.Uint64("current_rank", e.consensusProtocol.currentRank),
 			zap.Error(err),
 		)
 		return err
@@ -327,7 +327,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) error {
 	e.logger.Debug(
 		"added global message to collector",
 		zap.Uint64("sequence", seq),
-		zap.Uint64("current_rank", e.currentRank),
+		zap.Uint64("current_rank", e.consensusProtocol.currentRank),
 		zap.Int("payload_len", len(payload)),
 	)
 	return nil

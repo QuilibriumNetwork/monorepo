@@ -200,13 +200,22 @@ func (m *snapshotManager) publish(root []byte) {
 		rootHex = hex.EncodeToString(root)
 	}
 
-	// Check if this root already matches the current generation
-	if len(m.generations) > 0 && bytes.Equal(m.generations[0].root, root) {
-		m.logger.Debug(
-			"publish called with current root, no change",
-			zap.String("root", rootHex),
-		)
-		return
+	// Check if this root already exists in any generation. Only comparing
+	// against generations[0] allows a later publish with the same root but
+	// different DB state to shadow the correct generation. This happens when
+	// materialize(N) processes messages (changing the tree), then publishes
+	// with a cached root from Commit(N+1) — creating a generation whose DB
+	// snapshot reflects post-message state but is tagged with the pre-message
+	// root. Clients finding this newer, wrong generation instead of the
+	// original correct one get mismatched data and fail to converge.
+	for _, gen := range m.generations {
+		if bytes.Equal(gen.root, root) {
+			m.logger.Debug(
+				"publish called with existing root, no change",
+				zap.String("root", rootHex),
+			)
+			return
+		}
 	}
 
 	// Create a new generation for this root

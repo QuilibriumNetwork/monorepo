@@ -43,6 +43,7 @@ func TestProverKick_Prove(t *testing.T) {
 	// Setup
 	mockHypergraph := new(mocks.MockHypergraph)
 	mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+	mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 	mockClockStore := new(mocks.MockClockStore)
 	mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
 		Header: &protobufs.GlobalFrameHeader{
@@ -128,6 +129,7 @@ func TestProverKick_Verify(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		mockClockStore := new(mocks.MockClockStore)
 		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
 			Header: &protobufs.GlobalFrameHeader{
@@ -250,6 +252,7 @@ func TestProverKick_Verify(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		mockClockStore := new(mocks.MockClockStore)
 		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
 			Header: &protobufs.GlobalFrameHeader{
@@ -303,6 +306,7 @@ func TestProverKick_Verify(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		mockClockStore := new(mocks.MockClockStore)
 		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
 			Header: &protobufs.GlobalFrameHeader{
@@ -368,6 +372,7 @@ func TestProverKick_Verify(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		mockFrameProver := new(mocks.MockFrameProver)
 		mockFrameProver.On("VerifyFrameHeaderSignature", mock.Anything, mock.Anything).Return(true, nil)
 		mockClockStore := new(mocks.MockClockStore)
@@ -440,6 +445,7 @@ func TestProverKick_Verify(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		mockFrameProver := new(mocks.MockFrameProver)
 		mockFrameProver.On("VerifyFrameHeaderSignature", mock.Anything, mock.Anything).Return(true, nil)
 		mockClockStore := new(mocks.MockClockStore)
@@ -530,6 +536,7 @@ func TestProverKick_Materialize(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 		mockClockStore := new(mocks.MockClockStore)
 		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
@@ -651,6 +658,7 @@ func TestProverKick_Materialize(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 		mockClockStore := new(mocks.MockClockStore)
 		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
@@ -724,6 +732,7 @@ func TestProverKick_Materialize(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 		mockClockStore := new(mocks.MockClockStore)
 		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
@@ -821,6 +830,7 @@ func TestProverKick_Materialize(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 		mockClockStore := new(mocks.MockClockStore)
 		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
@@ -938,6 +948,7 @@ func TestProverKick_GetCost(t *testing.T) {
 	// Setup
 	mockHypergraph := new(mocks.MockHypergraph)
 	mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+	mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 	mockClockStore := new(mocks.MockClockStore)
 	mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
 		Header: &protobufs.GlobalFrameHeader{
@@ -982,6 +993,7 @@ func TestProverKick_VerifyEquivocation(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		mockFrameProver := new(mocks.MockFrameProver)
 		mockFrameProver.On("VerifyFrameHeaderSignature", mock.Anything, mock.Anything).Return(true, nil)
 		mockClockStore := new(mocks.MockClockStore)
@@ -1035,7 +1047,7 @@ func TestProverKick_VerifyEquivocation(t *testing.T) {
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(kickedTree, nil)
 		mockHypergraph.On("GetHyperedge", mock.Anything).Return(&mockHyperedge{}, nil)
 		mockHypergraph.On("VerifyTraversalProof", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
-		mockInclusionProver := &mocks.MockInclusionProver{}
+		mockInclusionProver := func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()
 		mp := &mocks.MockMultiproof{}
 		mp.On("FromBytes", mock.Anything).Return(nil)
 		mockInclusionProver.On("NewMultiproof").Return(mp)
@@ -1102,6 +1114,7 @@ func TestProverKick_VerifyEquivocation(t *testing.T) {
 		// Setup
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		mockClockStore := new(mocks.MockClockStore)
 		mockClockStore.On("GetGlobalClockFrame", mock.Anything).Return(&protobufs.GlobalFrame{
 			Header: &protobufs.GlobalFrameHeader{

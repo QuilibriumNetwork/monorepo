@@ -110,6 +110,7 @@ func TestVertexAdd_Materialize(t *testing.T) {
 	domain := [32]byte{1, 2, 3}
 	dataAddress := [32]byte{4, 5, 6}
 	mockHypergraph := &mocks.MockHypergraph{}
+	mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockHypergraph.On("GetVertex", mock.Anything).Return(nil, nil)
 	mockHypergraph.On("GetVertexData", mock.Anything).Return(&tries.VectorCommitmentTree{}, nil)
 	mockInclusionProver := &mocks.MockInclusionProver{}

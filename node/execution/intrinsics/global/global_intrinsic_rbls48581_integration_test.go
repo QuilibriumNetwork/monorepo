@@ -32,7 +32,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
-	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
+
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 	"source.quilibrium.com/quilibrium/monorepo/vdf"
@@ -175,7 +175,7 @@ func TestGlobalIntrinsicProverJoinFlow(t *testing.T) {
 	fmt.Println(len(initialState.Changeset()))
 	fmt.Println("invoke", time.Since(now))
 	now = time.Now()
-	_, err = intrinsic.Commit()
+	err = initialState.Commit()
 	fmt.Println("commit", time.Since(now))
 	require.NoError(t, err)
 	for i := 0; i < 100; i++ {
@@ -529,8 +529,8 @@ func TestGlobalProverOperations_Integration(t *testing.T) {
 		hg.SetVertexData(txn, [64]byte(slices.Concat(intrinsics.GLOBAL_INTRINSIC_ADDRESS[:], allocationAddress)), allocationTree)
 		txn.Commit()
 
-		// Try to confirm at frame 255840 + 1080
-		confirmFrame := uint64(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END)
+		// Try to confirm within the 360-720 window after join at frame 255840
+		confirmFrame := uint64(255840 + 500)
 		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rm)
 		require.NoError(t, err)
 

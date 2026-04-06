@@ -17,6 +17,7 @@ func TestCreateExecutionEngine(t *testing.T) {
 	// Create test dependencies
 	logger := zap.NewNop()
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockClockStore := new(mocks.MockClockStore)
 	mockShardsStore := new(mocks.MockShardsStore)
 	mockKeyManager := new(mocks.MockKeyManager)
@@ -106,6 +107,7 @@ func TestCreateAllEngines(t *testing.T) {
 	// Create test dependencies
 	logger := zap.NewNop()
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockClockStore := new(mocks.MockClockStore)
 	mockShardsStore := new(mocks.MockShardsStore)
 	mockKeyManager := new(mocks.MockKeyManager)

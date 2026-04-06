@@ -109,6 +109,7 @@ func TestHyperedgeRemove_Materialize(t *testing.T) {
 	// Setup
 	domain := [32]byte{1, 2, 3}
 	mockHypergraph := &mocks.MockHypergraph{}
+	mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 
 	// Create a mock hyperedge
 	id := make([]byte, 64)

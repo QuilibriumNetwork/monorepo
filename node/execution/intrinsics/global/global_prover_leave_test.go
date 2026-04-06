@@ -95,6 +95,7 @@ func TestProverLeave_Verify(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 		// Test data
 		filters := [][]byte{[]byte("testfilter1"), []byte("testfilter2")}
@@ -198,6 +199,7 @@ func TestProverLeave_Verify(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 		// Test data
 		filters := [][]byte{[]byte("testfilter")}
@@ -254,6 +256,7 @@ func TestProverLeave_Verify(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 		// Test data
 		filters := [][]byte{[]byte("testfilter")}
@@ -344,6 +347,7 @@ func TestProverLeave_Materialize(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 
 		// Test data
@@ -445,6 +449,7 @@ func TestProverLeave_Materialize(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 
 		// Test data

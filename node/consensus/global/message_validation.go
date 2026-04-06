@@ -50,10 +50,10 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 			return tp2p.ValidationResultIgnore
 		}
 
-		if e.currentRank > proposal.GetRank() {
+		if e.consensusProtocol.currentRank > proposal.GetRank() {
 			e.logger.Debug(
 				"proposal is stale",
-				zap.Uint64("current_rank", e.currentRank),
+				zap.Uint64("current_rank", e.consensusProtocol.currentRank),
 				zap.Uint64("timeout_rank", proposal.GetRank()),
 			)
 			proposalValidationTotal.WithLabelValues("reject").Inc()
@@ -93,10 +93,10 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 
 		// We should still accept votes for the past rank – either because a peer
 		// needs it, or because we need it to trump a TC
-		if e.currentRank > vote.Rank+1 {
+		if e.consensusProtocol.currentRank > vote.Rank+1 {
 			e.logger.Debug(
 				"vote is stale",
-				zap.Uint64("current_rank", e.currentRank),
+				zap.Uint64("current_rank", e.consensusProtocol.currentRank),
 				zap.Uint64("timeout_rank", vote.Rank),
 			)
 			return tp2p.ValidationResultIgnore
@@ -140,10 +140,10 @@ func (e *GlobalConsensusEngine) validateGlobalConsensusMessage(
 		)
 
 		// We should still accept votes for the past rank in case a peer needs it
-		if e.currentRank > timeoutState.Vote.Rank+1 {
+		if e.consensusProtocol.currentRank > timeoutState.Vote.Rank+1 {
 			e.logger.Debug(
 				"timeout is stale",
-				zap.Uint64("current_rank", e.currentRank),
+				zap.Uint64("current_rank", e.consensusProtocol.currentRank),
 				zap.Uint64("timeout_rank", timeoutState.Vote.Rank),
 			)
 			return tp2p.ValidationResultIgnore
@@ -496,11 +496,11 @@ func (e *GlobalConsensusEngine) validateFrameMessage(
 			return tp2p.ValidationResultReject
 		}
 
-		if e.currentRank > frame.GetRank()+2 {
+		if e.consensusProtocol.currentRank > frame.GetRank()+2 {
 			e.logger.Debug(
 				"ignoring global frame",
 				zap.String("reason", "rank too old"),
-				zap.Uint64("current_rank", e.currentRank),
+				zap.Uint64("current_rank", e.consensusProtocol.currentRank),
 				zap.Uint64("frame_rank", frame.GetRank()),
 			)
 			frameValidationTotal.WithLabelValues("ignore").Inc()

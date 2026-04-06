@@ -66,7 +66,7 @@ func (p *GlobalLivenessProvider) Collect(
 			zap.Bool("found", found),
 			zap.Bool("already_collected", alreadyCollected),
 			zap.Int("records", len(collectorRecords)),
-			zap.Uint64("current_rank", p.engine.currentRank),
+			zap.Uint64("current_rank", p.engine.consensusProtocol.currentRank),
 		)
 	}
 
@@ -134,7 +134,7 @@ func (p *GlobalLivenessProvider) Collect(
 		)
 	}
 
-	commitmentHash, err := p.engine.rebuildShardCommitments(frameNumber, rank)
+	commitmentHash, err := p.engine.consensusProtocol.rebuildShardCommitments(frameNumber, rank)
 	if err != nil {
 		return GlobalCollectedCommitments{}, errors.Wrap(err, "collect")
 	}
@@ -148,7 +148,7 @@ func (p *GlobalLivenessProvider) Collect(
 		for _, msg := range acceptedMessages {
 			collectedMsgs = append(collectedMsgs, msg.Payload)
 		}
-		p.engine.collectedMessages = collectedMsgs
+		p.engine.consensusProtocol.collectedMessages = collectedMsgs
 	}
 
 	return GlobalCollectedCommitments{

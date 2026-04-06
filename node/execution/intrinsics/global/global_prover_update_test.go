@@ -72,6 +72,7 @@ func TestProverUpdate_Verify_Succeeds(t *testing.T) {
 	mockKM := new(mocks.MockKeyManager)
 	mockHG := new(mocks.MockHypergraph)
 	mockHG.On("GetCoveredPrefix").Return([]int{}, nil).Maybe()
+	mockHG.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 	// Setup pubkey and its address
 	pubKey := make([]byte, 585)
@@ -130,6 +131,7 @@ func TestProverUpdate_Verify_FailsOnBadSignature(t *testing.T) {
 	mockKM := new(mocks.MockKeyManager)
 	mockHG := new(mocks.MockHypergraph)
 	mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
+	mockHG.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 	// Prover tree with pubkey
 	pubKey := make([]byte, 585)
@@ -181,6 +183,7 @@ func TestProverUpdate_Verify_FailsOnAddressMismatch(t *testing.T) {
 	mockKM := new(mocks.MockKeyManager)
 	mockHG := new(mocks.MockHypergraph)
 	mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
+	mockHG.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 	// Prover tree with pubkey
 	pubKey := make([]byte, 585)
@@ -224,6 +227,7 @@ func TestProverUpdate_Materialize_PreservesBalance(t *testing.T) {
 	mockKM := new(mocks.MockKeyManager)
 	mockHG := new(mocks.MockHypergraph)
 	mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
+	mockHG.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 	hypergraphState := hgstate.NewHypergraphState(mockHG)
 
 	// Prover exists with PublicKey
