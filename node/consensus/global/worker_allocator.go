@@ -516,6 +516,80 @@ func (w *WorkerAllocator) reconcileWorkerAllocations(
 	}
 }
 
+// shardRingInfo holds the ring assignment values derived from the total
+// number of active+joining provers on a shard. Ring = floor(rank / 8)
+// where rank is a 0-indexed position in the sorted candidate list.
+type shardRingInfo struct {
+	// currentRing: ring of the last existing prover (position count-1).
+	currentRing uint8
+	// joinerRing: ring a new joiner would land on (position count).
+	joinerRing uint8
+	// activeOnCurrentRing: provers sharing the last existing prover's ring.
+	activeOnCurrentRing uint64
+	// activeOnJoinerRing: provers that would share the joiner's ring
+	// (existing on that ring + the joiner itself).
+	activeOnJoinerRing uint64
+}
+
+// computeShardRingInfo calculates ring assignments from the count of
+// active+joining provers on a shard.
+func computeShardRingInfo(totalActiveJoining int) shardRingInfo {
+	ri := shardRingInfo{}
+
+	if totalActiveJoining > 0 {
+		ri.currentRing = uint8((totalActiveJoining - 1) / 8)
+	}
+	ri.joinerRing = uint8(totalActiveJoining / 8)
+
+	ri.activeOnCurrentRing = uint64(totalActiveJoining % 8)
+	if ri.activeOnCurrentRing == 0 && totalActiveJoining > 0 {
+		ri.activeOnCurrentRing = 8
+	}
+
+	ri.activeOnJoinerRing = uint64(totalActiveJoining%8) + 1
+
+	return ri
+}
+
+// resolveProverRing determines the ring and on-ring count for a shard entry.
+//
+//   - totalCandidates: number of active+joining provers on the shard.
+//   - isAllocated: whether the local prover is allocated to this shard.
+//   - selfAddress: the local prover's address (may be nil).
+//   - candidateAddrs: lazy accessor returning the sorted candidate addresses
+//     (only called when isAllocated && selfAddress is set).
+//
+// Returns (ring, onRing).
+func resolveProverRing(
+	totalCandidates int,
+	isAllocated bool,
+	selfAddress []byte,
+	candidateAddrs func() [][]byte,
+) (uint8, int) {
+	ri := computeShardRingInfo(totalCandidates)
+
+	if !isAllocated || len(selfAddress) == 0 {
+		return ri.joinerRing, int(ri.activeOnJoinerRing)
+	}
+
+	// Find this prover's actual rank in the sorted candidate list.
+	for rank, addr := range candidateAddrs() {
+		if bytes.Equal(addr, selfAddress) {
+			ring := uint8(rank / 8)
+			ringStart := rank - (rank % 8)
+			onRing := totalCandidates - ringStart
+			if onRing > 8 {
+				onRing = 8
+			}
+			return ring, onRing
+		}
+	}
+
+	// Prover is allocated but not in the active/joining candidate list
+	// (e.g. leaving or paused). Fall back to the last existing prover's ring.
+	return ri.currentRing, int(ri.activeOnCurrentRing)
+}
+
 func (w *WorkerAllocator) collectAllocationSnapshot(
 	ctx context.Context,
 	data *consensustime.GlobalEvent,
@@ -771,11 +845,11 @@ func (w *WorkerAllocator) collectAllocationSnapshot(
 				}
 			}
 
-			currentRing := uint8(totalActiveJoining / 8)
-			joinerRing := uint8(totalActiveJoining / 8)
-			// Number of provers that would share the joiner's ring (existing
-			// provers already on that ring + the joiner itself).
-			activeOnJoinerRing := uint64(totalActiveJoining%8) + 1
+			ri := computeShardRingInfo(totalActiveJoining)
+			currentRing := ri.currentRing
+			joinerRing := ri.joinerRing
+			activeOnJoinerRing := ri.activeOnJoinerRing
+			activeOnCurrentRing := ri.activeOnCurrentRing
 
 			if allocated && pending {
 				pendingFilters = append(pendingFilters, bp)
@@ -793,13 +867,6 @@ func (w *WorkerAllocator) collectAllocationSnapshot(
 				)
 			}
 			if isActiveAllocation {
-				// Approximate provers sharing the current ring. Exact
-				// value requires a full sort; use the last ring's count as
-				// a reasonable estimate for leave scoring.
-				activeOnCurrentRing := uint64(totalActiveJoining % 8)
-				if activeOnCurrentRing == 0 && totalActiveJoining > 0 {
-					activeOnCurrentRing = 8
-				}
 				leaveProposalCandidates = append(
 					leaveProposalCandidates,
 					provers.ShardDescriptor{
@@ -819,9 +886,9 @@ func (w *WorkerAllocator) collectAllocationSnapshot(
 				provers.ShardDescriptor{
 					Filter:       bp,
 					Size:         size.Uint64(),
-					Ring:         joinerRing,
+					Ring:         currentRing,
 					Shards:       shard.DataShards,
-					ActiveOnRing: activeOnJoinerRing,
+					ActiveOnRing: activeOnCurrentRing,
 				},
 			)
 		}

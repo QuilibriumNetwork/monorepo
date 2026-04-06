@@ -244,30 +244,16 @@ func (e *GlobalConsensusEngine) buildShardEntries(
 				return bytes.Compare(candidates[i].address, candidates[j].address) < 0
 			})
 
-			var ring uint8
-			if isAlloc && len(selfAddress) > 0 {
-				// Find this prover's actual rank in the sorted list.
-				for rank, c := range candidates {
-					if bytes.Equal(c.address, selfAddress) {
-						ring = uint8(rank / 8)
-						break
+			ring, onRing := resolveProverRing(
+				len(candidates), isAlloc, selfAddress,
+				func() [][]byte {
+					addrs := make([][]byte, len(candidates))
+					for i, c := range candidates {
+						addrs[i] = c.address
 					}
-				}
-			} else {
-				// For unallocated shards, show the ring a new joiner
-				// would land on (appended at end of the list).
-				ring = uint8(len(candidates) / 8)
-			}
-
-			// Count provers sharing this ring.
-			ringStart := int(ring) * 8
-			onRing := len(candidates) - ringStart
-			if onRing > 8 {
-				onRing = 8
-			}
-			if onRing < 1 {
-				onRing = 1
-			}
+					return addrs
+				},
+			)
 
 			entries = append(entries, shardEntry{
 				filter:        bp,
