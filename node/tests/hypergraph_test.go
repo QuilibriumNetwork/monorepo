@@ -61,6 +61,7 @@ func TestHypergraph(t *testing.T) {
 		s := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		enc := &mocks.MockVerifiableEncryptor{}
 		prover := &mocks.MockInclusionProver{}
+		prover.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe()
 		vep := &mocks.MockVerEncProof{}
 		ve := &mocks.MockVerEnc{}
 		pub, _, _ := ed448.GenerateKey(rand.Reader)

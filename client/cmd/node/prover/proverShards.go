@@ -41,23 +41,29 @@ estimated per-frame rewards based on ring position.
 			return
 		}
 
+		workers := workerByFilter(client)
+
 		fmt.Printf("Shard Rewards (%d shards):\n", len(resp.GetShards()))
 
 		totalReward := big.NewInt(0)
 		for _, shard := range resp.GetShards() {
 			filterHex := hex.EncodeToString(shard.GetFilter())
-			if len(filterHex) > 16 {
-				filterHex = filterHex[:16] + "..."
+
+			workerStr := ""
+			if wid, ok := workers[filterHex]; ok {
+				workerStr = fmt.Sprintf("  Worker: %d", wid)
 			}
 
 			reward := new(big.Int).SetBytes(shard.GetEstimatedReward())
 			totalReward.Add(totalReward, reward)
 
-			fmt.Printf("  Filter: %s  Provers: %-4d Ring: %d  Reward: ~%s QUIL/frame\n",
+			fmt.Printf("  Filter: %s  Shards: %-6d Provers: %-4d Ring: %d  Reward: ~%s QUIL/frame%s\n",
 				filterHex,
+				shard.GetDataShards(),
 				shard.GetActiveProvers(),
 				shard.GetRing(),
 				formatQUIL(reward),
+				workerStr,
 			)
 		}
 

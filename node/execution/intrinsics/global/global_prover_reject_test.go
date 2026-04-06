@@ -81,6 +81,7 @@ func TestProverReject_Verify(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 		// Test data
 		filter := []byte("testfilter")
@@ -153,6 +154,7 @@ func TestProverReject_Verify(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 		// Test data
 		filter := []byte("testfilter")
@@ -225,6 +227,7 @@ func TestProverReject_Verify(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 		// Test data
 		filter := []byte("testfilter")
@@ -273,6 +276,7 @@ func TestProverReject_Verify(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 		// Test data
 		filter := []byte("testfilter")
@@ -318,6 +322,7 @@ func TestProverReject_Verify(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 		// Test data
 		filter := []byte("testfilter")

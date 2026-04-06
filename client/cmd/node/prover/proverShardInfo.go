@@ -41,29 +41,33 @@ estimated per-frame reward, and whether the local prover is on each shard.
 			return
 		}
 
+		workers := workerByFilter(client)
+
 		fmt.Printf("All Shards (%d shards):\n", len(resp.GetShards()))
 
 		for _, shard := range resp.GetShards() {
 			filterHex := hex.EncodeToString(shard.GetFilter())
-			if len(filterHex) > 16 {
-				filterHex = filterHex[:16] + "..."
+
+			suffix := ""
+			if shard.GetIsAllocated() {
+				if wid, ok := workers[filterHex]; ok {
+					suffix = fmt.Sprintf("  [Worker %d]", wid)
+				} else {
+					suffix = "  [ACTIVE]"
+				}
 			}
 
 			shardSize := new(big.Int).SetBytes(shard.GetShardSize())
 			reward := new(big.Int).SetBytes(shard.GetEstimatedReward())
 
-			active := ""
-			if shard.GetIsAllocated() {
-				active = "  [ACTIVE]"
-			}
-
-			fmt.Printf("  Filter: %s  Size: %-10s Provers: %-4d Ring: %d  Reward: ~%s QUIL/frame%s\n",
+			fmt.Printf("  Filter: %s  Size: %-10s Shards: %-6d Provers: %-4d Ring: %d  Reward: ~%s QUIL/frame%s\n",
 				filterHex,
 				formatStorage(shardSize.Uint64()),
+				shard.GetDataShards(),
 				shard.GetActiveProvers(),
 				shard.GetRing(),
 				formatQUIL(reward),
-				active,
+				suffix,
 			)
 		}
 

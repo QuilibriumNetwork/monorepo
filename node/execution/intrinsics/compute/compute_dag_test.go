@@ -37,6 +37,7 @@ func TestExecutionDAG_BasicConstruction(t *testing.T) {
 
 		// Set up mock dependencies
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(nil, nil)
 		codeExecute.hypergraph = mockHypergraph
 
@@ -85,6 +86,7 @@ func TestExecutionDAG_BasicConstruction(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(nil, nil)
 		codeExecute.hypergraph = mockHypergraph
 
@@ -141,6 +143,7 @@ func TestExecutionDAG_BasicConstruction(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(nil, nil)
 		codeExecute.hypergraph = mockHypergraph
 
@@ -186,6 +189,7 @@ func TestExecutionDAG_CycleDetection(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		codeExecute.hypergraph = mockHypergraph
 
 		dag, err := codeExecute.buildExecutionDAG()
@@ -228,6 +232,7 @@ func TestExecutionDAG_CycleDetection(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		codeExecute.hypergraph = mockHypergraph
 
 		dag, err := codeExecute.buildExecutionDAG()
@@ -290,6 +295,7 @@ func TestExecutionDAG_DisconnectedGraph(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(nil, nil)
 		codeExecute.hypergraph = mockHypergraph
 
@@ -340,6 +346,7 @@ func TestExecutionDAG_ErrorCases(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		codeExecute.hypergraph = mockHypergraph
 
 		dag, err := codeExecute.buildExecutionDAG()
@@ -366,6 +373,7 @@ func TestExecutionDAG_ErrorCases(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		codeExecute.hypergraph = mockHypergraph
 
 		dag, err := codeExecute.buildExecutionDAG()
@@ -408,6 +416,7 @@ func TestExecutionDAG_ConflictDetection(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(nil, nil)
 		codeExecute.hypergraph = mockHypergraph
 
@@ -475,6 +484,7 @@ func TestExecutionDAG_ComplexScenarios(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(nil, nil)
 		codeExecute.hypergraph = mockHypergraph
 
@@ -523,6 +533,7 @@ func TestExecutionDAG_SequentialDependenciesIssue(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		codeExecute.hypergraph = mockHypergraph
 
 		dag, err := codeExecute.buildExecutionDAG()
@@ -568,6 +579,7 @@ func TestExecutionDAG_SequentialDependenciesIssue(t *testing.T) {
 		}
 
 		mockHypergraph := &mocks.MockHypergraph{}
+		mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 		mockHypergraph.On("GetVertexData", mock.Anything).Return(nil, nil)
 		codeExecute.hypergraph = mockHypergraph
 

@@ -22,4 +22,6 @@ type WorkerManager interface {
 	RangeWorkers() ([]*store.WorkerInfo, error)
 	RespawnWorker(coreId uint, filter []byte) error
 	RequestJoin(ctx context.Context, filters [][]byte, delegate []byte) error
+	SetManuallyManaged(coreId uint, manual bool) error
+	ManuallyManagedFilters() map[string]struct{}
 }

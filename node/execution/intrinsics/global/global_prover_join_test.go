@@ -34,6 +34,7 @@ func TestProverJoin_Verify(t *testing.T) {
 	// Setup
 	mockKeyManager := new(mocks.MockKeyManager)
 	mockHypergraph := new(mocks.MockHypergraph)
+	mockHypergraph.On("GetVertexData", mock.Anything).Return(nil, nil).Maybe()
 	mockInclusionProver := new(mocks.MockInclusionProver)
 	mockFrameProver := new(mocks.MockFrameProver)
 	mockFrameStore := new(mocks.MockClockStore)
@@ -114,6 +115,7 @@ func TestProverJoin_Verify(t *testing.T) {
 	// Test case: verify fails if the join signature is invalid
 	mockKeyManager = new(mocks.MockKeyManager)
 	mockHypergraph = new(mocks.MockHypergraph)
+	mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 	mockHypergraph.On("GetVertexData", fullAddress).Return(nil, assert.AnError)
 	mockKeyManager.On("ValidateSignature",
 		crypto.KeyTypeBLS48581G1,
@@ -137,6 +139,7 @@ func TestProverJoin_Verify(t *testing.T) {
 	// Test case: verify fails if prover is already active (not in left state)
 	mockKeyManager = new(mocks.MockKeyManager)
 	mockHypergraph = new(mocks.MockHypergraph)
+	mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 	// Create a tree showing prover is active (status = 1)
 	tree := &qcrypto.VectorCommitmentTree{}
@@ -176,6 +179,7 @@ func TestProverJoin_Verify(t *testing.T) {
 	mockKeyManager = new(mocks.MockKeyManager)
 	mockHypergraph = new(mocks.MockHypergraph)
 	mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+	mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 
 	// Create a tree showing prover is left (status = 4)
 	tree = &qcrypto.VectorCommitmentTree{}
@@ -216,6 +220,7 @@ func TestProverJoin_Materialize(t *testing.T) {
 		// Setup
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 		mockInclusionProver := new(mocks.MockInclusionProver)
 		mockFrameProver := new(mocks.MockFrameProver)
@@ -299,6 +304,7 @@ func TestProverJoin_Materialize(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 		mockInclusionProver := new(mocks.MockInclusionProver)
 		mockFrameProver := new(mocks.MockFrameProver)
@@ -398,6 +404,7 @@ func TestProverJoin_Materialize(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 		mockInclusionProver := new(mocks.MockInclusionProver)
 		mockFrameProver := new(mocks.MockFrameProver)
@@ -460,6 +467,7 @@ func TestProverJoin_Materialize(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 		mockFrameProver := new(mocks.MockFrameProver)
 		mockFrameStore := new(mocks.MockClockStore)
@@ -492,6 +500,7 @@ func TestProverJoin_Materialize(t *testing.T) {
 		mockKeyManager := new(mocks.MockKeyManager)
 		mockHypergraph := new(mocks.MockHypergraph)
 		mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+		mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 		hypergraphState := hgstate.NewHypergraphState(mockHypergraph)
 		mockInclusionProver := new(mocks.MockInclusionProver)
 		mockFrameProver := new(mocks.MockFrameProver)
@@ -626,6 +635,7 @@ func TestProverJoin_GetCost(t *testing.T) {
 	mockKeyManager := new(mocks.MockKeyManager)
 	mockHypergraph := new(mocks.MockHypergraph)
 	mockHypergraph.On("GetCoveredPrefix").Return([]int{}, nil)
+	mockHypergraph.On("GetProver").Return(func() *mocks.MockInclusionProver { m := new(mocks.MockInclusionProver); m.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil).Maybe(); return m }()).Maybe()
 	mockFrameStore := new(mocks.MockClockStore)
 
 	// Test data

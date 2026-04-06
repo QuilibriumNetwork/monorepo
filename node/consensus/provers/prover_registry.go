@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"sync"
@@ -2091,4 +2092,267 @@ func (r *ProverRegistry) GetProverShardSummaries() (
 	})
 
 	return summaries, nil
+}
+
+// proverEvictionCandidate holds data collected under read lock for a prover
+// that needs eviction.
+type proverEvictionCandidate struct {
+	address   []byte
+	allocInfo []consensus.ProverAllocationInfo
+}
+
+// EvictInactiveProvers kicks provers that have any allocation inactive for
+// more than the given threshold, accounting for halt durations.
+// shardHaltDurations maps shard filter keys to the number of frames the
+// shard has been in a halt state. math.MaxUint64 means the shard is
+// currently halted and fully exempt. Any other value is subtracted from
+// the inactivity window so provers are not penalized for halt time.
+func (r *ProverRegistry) EvictInactiveProvers(
+	frameNumber uint64,
+	inactivityThreshold uint64,
+	shardHaltDurations map[string]uint64,
+	s state.State,
+) ([][]byte, error) {
+	hg, ok := s.(*hgstate.HypergraphState)
+	if !ok {
+		return nil, errors.New("evict inactive provers: state is not HypergraphState")
+	}
+
+	// Query phase: collect candidates under read lock
+	var candidates []proverEvictionCandidate
+	r.mu.RLock()
+	for _, info := range r.proverCache {
+		if info.Status != consensus.ProverStatusActive {
+			continue
+		}
+		shouldEvict := false
+		for _, alloc := range info.Allocations {
+			if alloc.Status != consensus.ProverStatusActive {
+				continue
+			}
+			// Global provers (empty confirmation filter) are never evicted.
+			if len(alloc.ConfirmationFilter) == 0 {
+				continue
+			}
+			filterKey := string(alloc.ConfirmationFilter)
+			haltDuration := shardHaltDurations[filterKey]
+			if haltDuration == math.MaxUint64 {
+				// Shard is currently halted — fully exempt
+				continue
+			}
+			if alloc.LastActiveFrameNumber > 0 &&
+				frameNumber > alloc.LastActiveFrameNumber {
+				totalInactive := frameNumber - alloc.LastActiveFrameNumber
+				effectiveInactive := totalInactive
+				if haltDuration > 0 && haltDuration < totalInactive {
+					effectiveInactive = totalInactive - haltDuration
+				} else if haltDuration >= totalInactive {
+					effectiveInactive = 0
+				}
+				if effectiveInactive > inactivityThreshold {
+					shouldEvict = true
+					break
+				}
+			}
+		}
+		if shouldEvict {
+			// Copy allocation info to avoid holding references into cache
+			allocCopy := make([]consensus.ProverAllocationInfo, len(info.Allocations))
+			copy(allocCopy, info.Allocations)
+			candidates = append(candidates, proverEvictionCandidate{
+				address:   append([]byte(nil), info.Address...),
+				allocInfo: allocCopy,
+			})
+		}
+	}
+	r.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Mutation phase: apply RDF mutations through the HypergraphState
+	frameNumberBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(frameNumberBytes, frameNumber)
+	var evicted [][]byte
+
+	for _, candidate := range candidates {
+		if err := r.evictProver(hg, candidate.address, frameNumber, frameNumberBytes); err != nil {
+			r.logger.Error(
+				"failed to evict inactive prover",
+				zap.String("address", hex.EncodeToString(candidate.address)),
+				zap.Error(err),
+			)
+			continue
+		}
+		evicted = append(evicted, candidate.address)
+	}
+
+	// Cache cleanup under write lock
+	if len(evicted) > 0 {
+		r.mu.Lock()
+		for _, addr := range evicted {
+			r.removeProver(addr)
+		}
+		r.mu.Unlock()
+	}
+
+	return evicted, nil
+}
+
+// evictProver writes the RDF mutations to kick a single prover and all its
+// allocations, following the pattern from global_prover_kick.go.
+func (r *ProverRegistry) evictProver(
+	hg *hgstate.HypergraphState,
+	proverAddress []byte,
+	frameNumber uint64,
+	frameNumberBytes []byte,
+) error {
+	fullAddress := [64]byte{}
+	copy(fullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(fullAddress[32:], proverAddress)
+
+	// Get the prover vertex tree
+	tree, err := r.hypergraph.GetVertexData(fullAddress)
+	if err != nil {
+		return errors.Wrap(err, "evict prover: get vertex data")
+	}
+
+	// Set status to left/kicked (4)
+	if err := r.rdfMultiprover.Set(
+		global.GLOBAL_RDF_SCHEMA,
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+		"prover:Prover",
+		"Status",
+		[]byte{4},
+		tree,
+	); err != nil {
+		return errors.Wrap(err, "evict prover: set status")
+	}
+
+	// Set kick frame number
+	if err := r.rdfMultiprover.Set(
+		global.GLOBAL_RDF_SCHEMA,
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+		"prover:Prover",
+		"KickFrameNumber",
+		frameNumberBytes,
+		tree,
+	); err != nil {
+		return errors.Wrap(err, "evict prover: set kick frame")
+	}
+
+	// Get original (unmodified) prover vertex for change tracking
+	var prior *tries.VectorCommitmentTree
+	original, err := r.hypergraph.GetVertexData(fullAddress)
+	if err == nil && original != nil {
+		prior = original
+	}
+
+	// Write prover vertex via HypergraphState
+	proverVertex := hg.NewVertexAddMaterializedState(
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+		[32]byte(proverAddress),
+		frameNumber,
+		prior,
+		tree,
+	)
+	if err := hg.Set(
+		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+		proverAddress,
+		hgstate.VertexAddsDiscriminator,
+		frameNumber,
+		proverVertex,
+	); err != nil {
+		return errors.Wrap(err, "evict prover: set prover vertex")
+	}
+
+	// Get the hyperedge to find allocation vertices
+	hyperedge, err := r.hypergraph.GetHyperedge(fullAddress)
+	if err != nil {
+		// No hyperedge means no allocations to update
+		r.logger.Debug(
+			"no hyperedge found for evicted prover",
+			zap.String("address", hex.EncodeToString(proverAddress)),
+		)
+		return nil
+	}
+
+	vertices := tries.GetAllPreloadedLeaves(hyperedge.GetExtrinsicTree().Root)
+	for _, vertex := range vertices {
+		allocationFullAddress := vertex.Key
+		if len(allocationFullAddress) < 64 {
+			continue
+		}
+		if !bytes.Equal(
+			allocationFullAddress[:32],
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+		) {
+			continue
+		}
+
+		// Get allocation vertex tree
+		allocTree, err := r.hypergraph.GetVertexData([64]byte(allocationFullAddress))
+		if err != nil {
+			r.logger.Debug(
+				"could not get allocation vertex for eviction",
+				zap.String("address", hex.EncodeToString(allocationFullAddress[32:])),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		// Set allocation status to left/kicked (4)
+		if err := r.rdfMultiprover.Set(
+			global.GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"allocation:ProverAllocation",
+			"Status",
+			[]byte{4},
+			allocTree,
+		); err != nil {
+			return errors.Wrap(err, "evict prover: set allocation status")
+		}
+
+		// Set allocation kick frame number
+		if err := r.rdfMultiprover.Set(
+			global.GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"allocation:ProverAllocation",
+			"KickFrameNumber",
+			frameNumberBytes,
+			allocTree,
+		); err != nil {
+			return errors.Wrap(err, "evict prover: set allocation kick frame")
+		}
+
+		// Get original allocation for change tracking
+		var allocPrior *tries.VectorCommitmentTree
+		origAlloc, err := r.hypergraph.GetVertexData(
+			[64]byte(allocationFullAddress),
+		)
+		if err == nil && origAlloc != nil {
+			allocPrior = origAlloc
+		}
+
+		// Write allocation vertex
+		allocationVertex := hg.NewVertexAddMaterializedState(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+			[32]byte(allocationFullAddress[32:]),
+			frameNumber,
+			allocPrior,
+			allocTree,
+		)
+		if err := hg.Set(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			allocationFullAddress[32:],
+			hgstate.VertexAddsDiscriminator,
+			frameNumber,
+			allocationVertex,
+		); err != nil {
+			return errors.Wrap(err, "evict prover: set allocation vertex")
+		}
+	}
+
+	return nil
 }

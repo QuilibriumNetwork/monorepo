@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"math/big"
 	"slices"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
+	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tests"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
@@ -1622,4 +1624,425 @@ func TestPruneOrphanJoins_OrphanedAllocation(t *testing.T) {
 	t.Logf("Orphaned allocation prune test completed successfully")
 	t.Logf("  - 5 allocations with missing prover vertices: all pruned using VertexAddress")
 	t.Logf("  - Registry cache cleaned up")
+}
+
+// TestEvictInactiveProvers tests the eviction of provers whose active
+// allocations have been inactive beyond the threshold, while leaving
+// recently active provers, exempt-shard provers, and non-active provers
+// untouched.
+func TestEvictInactiveProvers(t *testing.T) {
+	logger := zap.NewNop()
+
+	// Create stores with in-memory pebble DB
+	pebbleDB := store.NewPebbleDB(
+		logger,
+		&config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/evict_inactive"}},
+		0,
+	)
+	defer pebbleDB.Close()
+
+	inclusionProver := bls48581.NewKZGInclusionProver(logger)
+	verifiableEncryptor := verenc.NewMPCitHVerifiableEncryptor(1)
+
+	hypergraphStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/evict_inactive"},
+		pebbleDB,
+		logger,
+		verifiableEncryptor,
+		inclusionProver,
+	)
+	hg, err := hypergraphStore.LoadHypergraph(&tests.Nopthenticator{}, 1)
+	require.NoError(t, err)
+
+	rdfMultiprover := schema.NewRDFMultiprover(
+		&schema.TurtleRDFParser{},
+		inclusionProver,
+	)
+
+	// Frame and threshold parameters
+	const currentFrame = uint64(500)
+	const inactivityThreshold = uint64(360)
+
+	// Exempt shard filter (math.MaxUint64 = currently halted, fully exempt)
+	exemptFilter := []byte("exempt_shard")
+	exemptShards := map[string]uint64{string(exemptFilter): math.MaxUint64}
+
+	type allocationSpec struct {
+		filter              []byte
+		joinFrame           uint64
+		status              byte   // 0=Joining, 1=Active
+		lastActiveFrame     uint64 // only relevant for Active allocations
+	}
+
+	// Helper to create a prover with specific allocations (extended with LastActiveFrameNumber)
+	createProverWithAllocations := func(
+		publicKey []byte,
+		proverStatus byte,
+		allocations []allocationSpec,
+	) ([]byte, error) {
+		proverAddressBI, err := poseidon.HashBytes(publicKey)
+		if err != nil {
+			return nil, err
+		}
+		proverAddress := proverAddressBI.FillBytes(make([]byte, 32))
+
+		hgCRDT := hg.(*hgcrdt.HypergraphCRDT)
+		txn, err := hgCRDT.NewTransaction(false)
+		if err != nil {
+			return nil, err
+		}
+
+		// Create prover vertex
+		proverTree := &tries.VectorCommitmentTree{}
+		err = rdfMultiprover.Set(
+			global.GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"prover:Prover", "PublicKey", publicKey, proverTree,
+		)
+		if err != nil {
+			txn.Abort()
+			return nil, err
+		}
+		err = rdfMultiprover.Set(
+			global.GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"prover:Prover", "Status", []byte{proverStatus}, proverTree,
+		)
+		if err != nil {
+			txn.Abort()
+			return nil, err
+		}
+		err = rdfMultiprover.Set(
+			global.GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"prover:Prover", "AvailableStorage", make([]byte, 8), proverTree,
+		)
+		if err != nil {
+			txn.Abort()
+			return nil, err
+		}
+		err = rdfMultiprover.Set(
+			global.GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"prover:Prover", "Seniority", make([]byte, 8), proverTree,
+		)
+		if err != nil {
+			txn.Abort()
+			return nil, err
+		}
+
+		proverVertex := hgcrdt.NewVertex(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+			[32]byte(proverAddress),
+			proverTree.Commit(inclusionProver, false),
+			big.NewInt(0),
+		)
+		err = hg.AddVertex(txn, proverVertex)
+		if err != nil {
+			txn.Abort()
+			return nil, err
+		}
+
+		var proverVertexID [64]byte
+		copy(proverVertexID[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(proverVertexID[32:], proverAddress)
+		err = hg.SetVertexData(txn, proverVertexID, proverTree)
+		if err != nil {
+			txn.Abort()
+			return nil, err
+		}
+
+		hyperedge := hgcrdt.NewHyperedge(
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+			[32]byte(proverAddress),
+		)
+
+		for _, alloc := range allocations {
+			allocationAddressBI, err := poseidon.HashBytes(
+				slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, alloc.filter),
+			)
+			if err != nil {
+				txn.Abort()
+				return nil, err
+			}
+			allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
+
+			allocationTree := &tries.VectorCommitmentTree{}
+			err = rdfMultiprover.Set(
+				global.GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"allocation:ProverAllocation", "Prover", proverAddress, allocationTree,
+			)
+			if err != nil {
+				txn.Abort()
+				return nil, err
+			}
+			err = rdfMultiprover.Set(
+				global.GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"allocation:ProverAllocation", "Status", []byte{alloc.status}, allocationTree,
+			)
+			if err != nil {
+				txn.Abort()
+				return nil, err
+			}
+			err = rdfMultiprover.Set(
+				global.GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"allocation:ProverAllocation", "ConfirmationFilter", alloc.filter, allocationTree,
+			)
+			if err != nil {
+				txn.Abort()
+				return nil, err
+			}
+
+			frameNumberBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(frameNumberBytes, alloc.joinFrame)
+			err = rdfMultiprover.Set(
+				global.GLOBAL_RDF_SCHEMA,
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+				"allocation:ProverAllocation", "JoinFrameNumber", frameNumberBytes, allocationTree,
+			)
+			if err != nil {
+				txn.Abort()
+				return nil, err
+			}
+
+			if alloc.lastActiveFrame > 0 {
+				lastActiveBytes := make([]byte, 8)
+				binary.BigEndian.PutUint64(lastActiveBytes, alloc.lastActiveFrame)
+				err = rdfMultiprover.Set(
+					global.GLOBAL_RDF_SCHEMA,
+					intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+					"allocation:ProverAllocation", "LastActiveFrameNumber", lastActiveBytes, allocationTree,
+				)
+				if err != nil {
+					txn.Abort()
+					return nil, err
+				}
+			}
+
+			allocationVertex := hgcrdt.NewVertex(
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS,
+				[32]byte(allocationAddress),
+				allocationTree.Commit(inclusionProver, false),
+				big.NewInt(0),
+			)
+			err = hg.AddVertex(txn, allocationVertex)
+			if err != nil {
+				txn.Abort()
+				return nil, err
+			}
+
+			var allocationVertexID [64]byte
+			copy(allocationVertexID[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+			copy(allocationVertexID[32:], allocationAddress)
+			err = hg.SetVertexData(txn, allocationVertexID, allocationTree)
+			if err != nil {
+				txn.Abort()
+				return nil, err
+			}
+
+			hyperedge.AddExtrinsic(allocationVertex)
+		}
+
+		err = hg.AddHyperedge(txn, hyperedge)
+		if err != nil {
+			txn.Abort()
+			return nil, err
+		}
+
+		err = txn.Commit()
+		if err != nil {
+			return nil, err
+		}
+
+		return proverAddress, nil
+	}
+
+	// ===== CREATE TEST DATA =====
+
+	// 1. Stale allocation -> should be evicted
+	// Active prover, allocation LastActiveFrameNumber=100, frame=500
+	// Gap = 500-100 = 400 > 360 threshold -> evicted
+	staleKey := bytes.Repeat([]byte{0xA0}, 585)
+	staleAddr, err := createProverWithAllocations(staleKey, 1, []allocationSpec{
+		{filter: []byte("shard_a"), joinFrame: 50, status: 1, lastActiveFrame: 100},
+	})
+	require.NoError(t, err)
+	t.Logf("Created stale prover: %s", hex.EncodeToString(staleAddr))
+
+	// 2. Recent activity -> should NOT be evicted
+	// Active prover, allocation LastActiveFrameNumber=400, frame=500
+	// Gap = 500-400 = 100 < 360 -> safe
+	recentKey := bytes.Repeat([]byte{0xA1}, 585)
+	recentAddr, err := createProverWithAllocations(recentKey, 1, []allocationSpec{
+		{filter: []byte("shard_b"), joinFrame: 50, status: 1, lastActiveFrame: 400},
+	})
+	require.NoError(t, err)
+	t.Logf("Created recent prover: %s", hex.EncodeToString(recentAddr))
+
+	// 3. Exempt shard -> should NOT be evicted despite being stale
+	// Active prover, stale allocation on exempt shard
+	exemptKey := bytes.Repeat([]byte{0xA2}, 585)
+	exemptAddr, err := createProverWithAllocations(exemptKey, 1, []allocationSpec{
+		{filter: exemptFilter, joinFrame: 50, status: 1, lastActiveFrame: 100},
+	})
+	require.NoError(t, err)
+	t.Logf("Created exempt prover: %s", hex.EncodeToString(exemptAddr))
+
+	// 4. Non-active (joining) prover -> should NOT be evicted
+	// Joining prover with stale allocation (status=0 joining, not 1 active)
+	// EvictInactiveProvers only checks provers with Status==Active
+	joiningKey := bytes.Repeat([]byte{0xA3}, 585)
+	joiningAddr, err := createProverWithAllocations(joiningKey, 0, []allocationSpec{
+		{filter: []byte("shard_c"), joinFrame: 50, status: 1, lastActiveFrame: 100},
+	})
+	require.NoError(t, err)
+	t.Logf("Created joining prover: %s", hex.EncodeToString(joiningAddr))
+
+	// 5. Multi-allocation mixed: two allocations, one recent + one stale
+	// Stale triggers eviction of entire prover
+	mixedKey := bytes.Repeat([]byte{0xA4}, 585)
+	mixedAddr, err := createProverWithAllocations(mixedKey, 1, []allocationSpec{
+		{filter: []byte("shard_d"), joinFrame: 50, status: 1, lastActiveFrame: 400}, // recent
+		{filter: []byte("shard_e"), joinFrame: 50, status: 1, lastActiveFrame: 100}, // stale -> triggers eviction
+	})
+	require.NoError(t, err)
+	t.Logf("Created mixed prover: %s", hex.EncodeToString(mixedAddr))
+
+	// ===== CREATE REGISTRY =====
+	registry, err := NewProverRegistry(logger, hg)
+	require.NoError(t, err)
+
+	// Verify all provers exist in cache before eviction
+	for _, addr := range [][]byte{staleAddr, recentAddr, exemptAddr, joiningAddr, mixedAddr} {
+		info, err := registry.GetProverInfo(addr)
+		require.NoError(t, err)
+		require.NotNil(t, info, "prover %s should exist before eviction",
+			hex.EncodeToString(addr))
+	}
+
+	// ===== EVICT =====
+	state := hgstate.NewHypergraphState(hg)
+	evicted, err := registry.EvictInactiveProvers(
+		currentFrame, inactivityThreshold, exemptShards, state,
+	)
+	require.NoError(t, err)
+
+	// ===== VERIFY RETURNED EVICTED ADDRESSES =====
+	evictedSet := make(map[string]bool)
+	for _, addr := range evicted {
+		evictedSet[hex.EncodeToString(addr)] = true
+	}
+
+	assert.True(t, evictedSet[hex.EncodeToString(staleAddr)],
+		"stale prover should be in evicted list")
+	assert.True(t, evictedSet[hex.EncodeToString(mixedAddr)],
+		"mixed prover should be in evicted list")
+	assert.False(t, evictedSet[hex.EncodeToString(recentAddr)],
+		"recent prover should NOT be in evicted list")
+	assert.False(t, evictedSet[hex.EncodeToString(exemptAddr)],
+		"exempt prover should NOT be in evicted list")
+	assert.False(t, evictedSet[hex.EncodeToString(joiningAddr)],
+		"joining prover should NOT be in evicted list")
+
+	// ===== VERIFY REGISTRY CACHE STATE =====
+
+	// Evicted provers should be removed from cache
+	info, err := registry.GetProverInfo(staleAddr)
+	require.NoError(t, err)
+	assert.Nil(t, info, "stale prover should be removed from cache")
+
+	info, err = registry.GetProverInfo(mixedAddr)
+	require.NoError(t, err)
+	assert.Nil(t, info, "mixed prover should be removed from cache")
+
+	// Non-evicted provers should still be in cache
+	info, err = registry.GetProverInfo(recentAddr)
+	require.NoError(t, err)
+	assert.NotNil(t, info, "recent prover should still be in cache")
+
+	info, err = registry.GetProverInfo(exemptAddr)
+	require.NoError(t, err)
+	assert.NotNil(t, info, "exempt prover should still be in cache")
+
+	info, err = registry.GetProverInfo(joiningAddr)
+	require.NoError(t, err)
+	assert.NotNil(t, info, "joining prover should still be in cache")
+
+	// ===== VERIFY RDF MUTATIONS VIA STATE CHANGESET =====
+	changes := state.Changeset()
+	assert.NotEmpty(t, changes, "state changeset should have mutations from eviction")
+
+	// Commit eviction state so vertex data is readable from the hypergraph
+	require.NoError(t, state.Commit(), "committing eviction state")
+
+	// Check that prover vertex mutations exist for evicted provers
+	// Each evicted prover should have its prover vertex + allocation vertices changed
+	evictedVertexChanges := 0
+	for _, change := range changes {
+		if bytes.Equal(change.Domain, intrinsics.GLOBAL_INTRINSIC_ADDRESS[:]) {
+			if bytes.Equal(change.Address, staleAddr) ||
+				bytes.Equal(change.Address, mixedAddr) {
+				evictedVertexChanges++
+			}
+		}
+	}
+	assert.Greater(t, evictedVertexChanges, 0,
+		"should have vertex changes for evicted provers")
+
+	// Verify evicted provers' vertex data has Status=4 (kicked)
+	for _, addr := range [][]byte{staleAddr, mixedAddr} {
+		var fullAddress [64]byte
+		copy(fullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(fullAddress[32:], addr)
+
+		tree, err := hg.GetVertexData(fullAddress)
+		require.NoError(t, err, "evicted prover vertex data should be readable")
+		require.NotNil(t, tree, "evicted prover vertex data should exist")
+
+		statusBytes, err := rdfMultiprover.Get(
+			global.GLOBAL_RDF_SCHEMA,
+			"prover:Prover", "Status", tree,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, byte(4), statusBytes[0],
+			"evicted prover status should be 4 (kicked)")
+
+		kickBytes, err := rdfMultiprover.Get(
+			global.GLOBAL_RDF_SCHEMA,
+			"prover:Prover", "KickFrameNumber", tree,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, currentFrame, binary.BigEndian.Uint64(kickBytes),
+			"evicted prover KickFrameNumber should be set to current frame")
+	}
+
+	// Verify non-evicted provers' vertex data is unchanged
+	for _, addr := range [][]byte{recentAddr, exemptAddr} {
+		var fullAddress [64]byte
+		copy(fullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+		copy(fullAddress[32:], addr)
+
+		tree, err := hg.GetVertexData(fullAddress)
+		require.NoError(t, err)
+		require.NotNil(t, tree)
+
+		statusBytes, err := rdfMultiprover.Get(
+			global.GLOBAL_RDF_SCHEMA,
+			"prover:Prover", "Status", tree,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, byte(1), statusBytes[0],
+			"non-evicted prover status should remain 1 (active)")
+	}
+
+	t.Logf("EvictInactiveProvers test completed successfully:")
+	t.Logf("  - Stale prover (gap 400 > 360): evicted")
+	t.Logf("  - Recent prover (gap 100 < 360): safe")
+	t.Logf("  - Exempt shard prover: safe")
+	t.Logf("  - Joining prover: safe (not Active status)")
+	t.Logf("  - Mixed prover (one stale allocation): evicted")
+	t.Logf("  - Evicted provers have Status=4, KickFrameNumber=%d", currentFrame)
 }

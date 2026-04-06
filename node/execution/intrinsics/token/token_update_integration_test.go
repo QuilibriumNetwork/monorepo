@@ -29,7 +29,7 @@ import (
 func TestTokenIntrinsicUpdate(t *testing.T) {
 	// Setup
 	logger, _ := zap.NewProduction()
-	db := store.NewPebbleDB(logger, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	db := store.NewPebbleDB(logger, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	defer db.Close()
 
 	encryptor := verenc.NewMPCitHVerifiableEncryptor(1)
@@ -39,7 +39,7 @@ func TestTokenIntrinsicUpdate(t *testing.T) {
 	prover := bls48581.NewKZGInclusionProver(logger)
 
 	hyperstore := store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, db, logger, encryptor, prover)
-	hg := hypergraph.NewHypergraph(logger, hyperstore, prover, []int{}, &tests.Nopthenticator{})
+	hg := hypergraph.NewHypergraph(logger, hyperstore, prover, []int{}, &tests.Nopthenticator{}, 0)
 
 	keyManager := keys.NewInMemoryKeyManager(bc, dc)
 

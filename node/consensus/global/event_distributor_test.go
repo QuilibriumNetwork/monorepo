@@ -87,6 +87,17 @@ func (m *mockWorkerManager) RequestJoin(ctx context.Context, filters [][]byte, d
 	return nil
 }
 
+func (m *mockWorkerManager) SetManuallyManaged(coreId uint, manual bool) error {
+	if w, ok := m.workers[coreId]; ok {
+		w.ManuallyManaged = manual
+	}
+	return nil
+}
+
+func (m *mockWorkerManager) ManuallyManagedFilters() map[string]struct{} {
+	return nil
+}
+
 var _ worker.WorkerManager = (*mockWorkerManager)(nil)
 
 func TestReconcileWorkerAllocations_RejectedAllocationClearsFilter(t *testing.T) {
@@ -108,6 +119,7 @@ func TestReconcileWorkerAllocations_RejectedAllocationClearsFilter(t *testing.T)
 		logger:        logger,
 		workerManager: wm,
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	// Case 1: Allocation is rejected - filter should be cleared
 	selfWithRejected := &typesconsensus.ProverInfo{
@@ -122,7 +134,7 @@ func TestReconcileWorkerAllocations_RejectedAllocationClearsFilter(t *testing.T)
 	}
 
 	// Run reconciliation at frame 200 (past the join frame but within grace period)
-	engine.reconcileWorkerAllocations(200, selfWithRejected)
+	engine.workerAllocator.reconcileWorkerAllocations(200, selfWithRejected)
 
 	// Verify the worker's filter was cleared because the allocation is rejected
 	workers, err := wm.RangeWorkers()
@@ -151,6 +163,7 @@ func TestReconcileWorkerAllocations_ActiveAllocationKeepsFilter(t *testing.T) {
 		logger:        logger,
 		workerManager: wm,
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	// Case 2: Allocation is active - filter should be kept
 	selfWithActive := &typesconsensus.ProverInfo{
@@ -164,7 +177,7 @@ func TestReconcileWorkerAllocations_ActiveAllocationKeepsFilter(t *testing.T) {
 		},
 	}
 
-	engine.reconcileWorkerAllocations(200, selfWithActive)
+	engine.workerAllocator.reconcileWorkerAllocations(200, selfWithActive)
 
 	workers, err := wm.RangeWorkers()
 	require.NoError(t, err)
@@ -191,6 +204,7 @@ func TestReconcileWorkerAllocations_JoiningAllocationKeepsFilter(t *testing.T) {
 		logger:        logger,
 		workerManager: wm,
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	// Case 3: Allocation is joining - filter should be kept
 	selfWithJoining := &typesconsensus.ProverInfo{
@@ -204,7 +218,7 @@ func TestReconcileWorkerAllocations_JoiningAllocationKeepsFilter(t *testing.T) {
 		},
 	}
 
-	engine.reconcileWorkerAllocations(200, selfWithJoining)
+	engine.workerAllocator.reconcileWorkerAllocations(200, selfWithJoining)
 
 	workers, err := wm.RangeWorkers()
 	require.NoError(t, err)
@@ -249,6 +263,7 @@ func TestReconcileWorkerAllocations_MultipleWorkersWithMixedStates(t *testing.T)
 		logger:        logger,
 		workerManager: wm,
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	// Mixed states: one active, one joining, one rejected
 	self := &typesconsensus.ProverInfo{
@@ -272,7 +287,7 @@ func TestReconcileWorkerAllocations_MultipleWorkersWithMixedStates(t *testing.T)
 		},
 	}
 
-	engine.reconcileWorkerAllocations(200, self)
+	engine.workerAllocator.reconcileWorkerAllocations(200, self)
 
 	workers, err := wm.RangeWorkers()
 	require.NoError(t, err)
@@ -317,6 +332,7 @@ func TestReconcileWorkerAllocations_RejectedWithNoFreeWorker(t *testing.T) {
 		logger:        logger,
 		workerManager: wm,
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	// A rejected allocation shouldn't try to assign a worker
 	filter1 := []byte("shard-filter-1")
@@ -331,7 +347,7 @@ func TestReconcileWorkerAllocations_RejectedWithNoFreeWorker(t *testing.T) {
 		},
 	}
 
-	engine.reconcileWorkerAllocations(200, self)
+	engine.workerAllocator.reconcileWorkerAllocations(200, self)
 
 	workers, err := wm.RangeWorkers()
 	require.NoError(t, err)
@@ -360,6 +376,7 @@ func TestReconcileWorkerAllocations_UnconfirmedProposalClearsAfterTimeout(t *tes
 		logger:        logger,
 		workerManager: wm,
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	// Prover has no allocations at all - the proposal never landed in registry
 	self := &typesconsensus.ProverInfo{
@@ -368,7 +385,7 @@ func TestReconcileWorkerAllocations_UnconfirmedProposalClearsAfterTimeout(t *tes
 	}
 
 	// At frame 105 (5 frames after proposal), filter should NOT be cleared yet
-	engine.reconcileWorkerAllocations(105, self)
+	engine.workerAllocator.reconcileWorkerAllocations(105, self)
 
 	workers, err := wm.RangeWorkers()
 	require.NoError(t, err)
@@ -377,7 +394,7 @@ func TestReconcileWorkerAllocations_UnconfirmedProposalClearsAfterTimeout(t *tes
 	assert.Equal(t, uint64(100), workers[0].PendingFilterFrame, "pending frame should be preserved")
 
 	// At frame 111 (11 frames after proposal, past the 10 frame timeout), filter SHOULD be cleared
-	engine.reconcileWorkerAllocations(111, self)
+	engine.workerAllocator.reconcileWorkerAllocations(111, self)
 
 	workers, err = wm.RangeWorkers()
 	require.NoError(t, err)
@@ -405,12 +422,13 @@ func TestReconcileWorkerAllocations_UnconfirmedProposalWithNilSelf(t *testing.T)
 		logger:        logger,
 		workerManager: wm,
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	// Even with nil self (no prover info yet), after timeout the filter should be cleared
 	// This handles the case where we proposed but haven't synced prover info yet
 
 	// At frame 105, still within timeout - should keep filter
-	engine.reconcileWorkerAllocations(105, nil)
+	engine.workerAllocator.reconcileWorkerAllocations(105, nil)
 
 	workers, err := wm.RangeWorkers()
 	require.NoError(t, err)
@@ -418,7 +436,7 @@ func TestReconcileWorkerAllocations_UnconfirmedProposalWithNilSelf(t *testing.T)
 	assert.Equal(t, filter1, workers[0].Filter, "filter should be kept within timeout window even with nil self")
 
 	// At frame 111, past timeout - should clear filter
-	engine.reconcileWorkerAllocations(111, nil)
+	engine.workerAllocator.reconcileWorkerAllocations(111, nil)
 
 	workers, err = wm.RangeWorkers()
 	require.NoError(t, err)
@@ -435,6 +453,7 @@ func TestSelectExcessPendingFilters_ExpiredJoinsNotCounted(t *testing.T) {
 			},
 		},
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	filter1 := []byte("shard-filter-1")
 	filter2 := []byte("shard-filter-2")
@@ -470,7 +489,7 @@ func TestSelectExcessPendingFilters_ExpiredJoinsNotCounted(t *testing.T) {
 	// Frame is past the grace period for filter1 and filter2 but not filter3
 	frameNumber := joinFrame + pendingFilterGraceFrames + 1
 
-	excess := engine.selectExcessPendingFilters(self, frameNumber)
+	excess := engine.workerAllocator.selectExcessPendingFilters(self, frameNumber)
 	assert.Empty(t, excess, "expired joins should not count toward pending limit")
 }
 
@@ -483,6 +502,7 @@ func TestSelectExcessPendingFilters_ValidJoinsStillLimited(t *testing.T) {
 			},
 		},
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	filter1 := []byte("shard-filter-1")
 	filter2 := []byte("shard-filter-2")
@@ -508,7 +528,7 @@ func TestSelectExcessPendingFilters_ValidJoinsStillLimited(t *testing.T) {
 
 	frameNumber := joinFrame + 100 // well within grace period
 
-	excess := engine.selectExcessPendingFilters(self, frameNumber)
+	excess := engine.workerAllocator.selectExcessPendingFilters(self, frameNumber)
 	assert.Len(t, excess, 1, "should identify 1 excess pending join")
 }
 
@@ -521,6 +541,7 @@ func TestSelectExcessPendingFilters_MixedActiveAndExpired(t *testing.T) {
 			},
 		},
 	}
+	engine.workerAllocator = NewWorkerAllocator(engine, nil)
 
 	filter1 := []byte("shard-filter-1")
 	filter2 := []byte("shard-filter-2")
@@ -552,6 +573,6 @@ func TestSelectExcessPendingFilters_MixedActiveAndExpired(t *testing.T) {
 
 	frameNumber := uint64(260500) // past 250000+720 but not 260000+720
 
-	excess := engine.selectExcessPendingFilters(self, frameNumber)
+	excess := engine.workerAllocator.selectExcessPendingFilters(self, frameNumber)
 	assert.Empty(t, excess, "expired joins should be excluded; 1 active + 1 valid pending fits capacity 2")
 }

@@ -125,8 +125,6 @@ func UpdateAggregateProverStatus(
 		newProverStatus = 3 // Leaving if any allocation is leaving
 	} else if hasPaused {
 		newProverStatus = 2 // Paused if all allocations are paused
-	} else {
-		newProverStatus = 4 // Left if all allocations are left
 	}
 
 	// Update prover status
@@ -148,7 +146,7 @@ func UpdateAggregateProverStatus(
 		proverAddress,
 		hgstate.VertexAddsDiscriminator,
 	)
-	if err != nil {
+	if err == nil && existingRecord != nil {
 		prior = existingRecord.(*tries.VectorCommitmentTree)
 	}
 

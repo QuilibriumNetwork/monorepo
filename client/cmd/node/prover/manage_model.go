@@ -38,26 +38,32 @@ type pendingAction struct {
 type allocationRow struct {
 	filter          []byte
 	filterKey       string // full hex, used as map key for selection
-	filterHex       string // truncated hex, used for display
+	filterHex       string // full hex, truncated at render time
 	status          uint32
 	statusName      string
 	ring            uint32
 	activeProvers   uint32
 	shardSize       *big.Int
+	dataShards      uint64
 	estimatedReward *big.Int
 	joinFrame       uint64
 	confirmFrame    uint64
 	leaveFrame      uint64
 	lastActiveFrame uint64
+	workerID        int // core_id, -1 if no worker assigned
+	nextAction      string
+	defaultAction   string
+	manuallyManaged bool
 }
 
 type shardRow struct {
 	filter          []byte
 	filterKey       string // full hex, used as map key for selection
-	filterHex       string // truncated hex, used for display
+	filterHex       string // full hex, truncated at render time
 	activeProvers   uint32
 	ring            uint32
 	shardSize       *big.Int
+	dataShards      uint64
 	estimatedReward *big.Int
 }
 
@@ -66,9 +72,10 @@ type shardRow struct {
 type tickMsg time.Time
 
 type dataRefreshMsg struct {
-	nodeInfo  *protobufs.NodeInfoResponse
-	shardInfo *protobufs.GetShardInfoResponse
-	err       error
+	nodeInfo   *protobufs.NodeInfoResponse
+	shardInfo  *protobufs.GetShardInfoResponse
+	workerInfo *protobufs.WorkerInfoResponse
+	err        error
 }
 
 type actionResultMsg struct {
@@ -96,6 +103,17 @@ type actionBroadcastMsg struct {
 	err            error
 }
 
+type toggleManualMsg struct {
+	coreId   uint32
+	newState bool
+	err      error
+}
+
+type markManualMsg struct {
+	workerIDs []uint32
+	err       error
+}
+
 type awaitCheckMsg time.Time
 
 type awaitResultMsg struct {
@@ -116,28 +134,44 @@ type actionConfirmedMsg struct {
 // Key map for help display.
 
 type manageKeyMap struct {
-	Up        key.Binding
-	Down      key.Binding
-	Tab       key.Binding
-	Select    key.Binding
-	SelectAll key.Binding
-	Join      key.Binding
-	Leave     key.Binding
-	Confirm   key.Binding
-	Reject    key.Binding
-	Pause     key.Binding
-	Resume    key.Binding
-	Refresh   key.Binding
-	Quit      key.Binding
+	Up           key.Binding
+	Down         key.Binding
+	Tab          key.Binding
+	Select       key.Binding
+	SelectAll    key.Binding
+	Join         key.Binding
+	Leave        key.Binding
+	Confirm      key.Binding
+	Reject       key.Binding
+	Pause        key.Binding
+	Resume       key.Binding
+	ToggleManual key.Binding
+	Refresh      key.Binding
+	Quit         key.Binding
 }
 
 // Constants
+const SELECT_WIDTH = 6
 const FILTER_WIDTH = 70
-const STATUS_WIDTH = 16
-const SIZE_WIDTH = 10
 const PROVERS_WIDTH = 7
 const RING_WIDTH = 5
+const SIZE_WIDTH = 10
+const SHARDS_WIDTH = 7
 const REWARD_WIDTH = 20
+const WORKER_WIDTH = 7
+const STATUS_WIDTH = 12
+const NEXT_ACTION_WIDTH = 30
+const DEFAULT_ACTION_WIDTH = 16
+
+// Fixed column widths excluding filter (with inter-column spaces).
+const allocFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
+	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + WORKER_WIDTH +
+	STATUS_WIDTH + NEXT_ACTION_WIDTH + DEFAULT_ACTION_WIDTH + 10 + 2 // 10 spaces between 11 columns and 2 external borders
+const availFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
+	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + 6 + 2 // 6 spaces between 7 columns and 2 external borders
+const minFilterWidth = 12
+
+const ACTION_FRAME_DELAY = 360
 
 func newManageKeyMap() manageKeyMap {
 	return manageKeyMap{
@@ -152,13 +186,14 @@ func newManageKeyMap() manageKeyMap {
 		Reject:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "reject")),
 		Pause:     key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
 		Resume:    key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "resume")),
-		Refresh:   key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
-		Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+		ToggleManual: key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "mode")),
+		Refresh:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
+		Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
 func (k manageKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.Refresh, k.Quit}
+	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Quit}
 }
 
 func (k manageKeyMap) FullHelp() [][]key.Binding { return nil }
@@ -236,6 +271,17 @@ type manageModel struct {
 	allocFilter string
 	availFilter string
 
+	// Free workers (no filter assigned), refreshed each data fetch.
+	freeWorkers []uint32
+
+	// Join worker picker state.
+	joinPickerActive   bool
+	joinPickerCursor   int
+	joinPickerOffset   int
+	joinPickerWorkers  []uint32
+	joinPickerSelected map[uint32]bool
+	joinPickerFilters  [][]byte
+
 	// Await state for multi-phase action tracking.
 	awaitAction         string
 	awaitFilters        [][]byte
@@ -262,15 +308,12 @@ func newManageModel(client protobufs.NodeServiceClient) manageModel {
 
 	h := help.New()
 
-	cfg := getConfig()
-	autoManaged := cfg == nil || cfg.Engine == nil || len(cfg.Engine.DataWorkerFilters) == 0
-
 	return manageModel{
 		client:        client,
 		keyMap:        newManageKeyMap(),
 		spinner:       s,
 		help:          h,
-		autoManaged:   autoManaged,
+		autoManaged:   true, // derived from server data on first refresh
 		allocSelected: make(map[string]bool),
 		availSelected: make(map[string]bool),
 	}
@@ -293,11 +336,12 @@ func tickEvery(d time.Duration) tea.Cmd {
 
 func fetchData(client protobufs.NodeServiceClient) tea.Cmd {
 	return func() tea.Msg {
-		nodeInfo, shardInfo, err := fetchRPCData(client)
+		nodeInfo, shardInfo, workerInfo, err := fetchRPCData(client)
 		return dataRefreshMsg{
-			nodeInfo:  nodeInfo,
-			shardInfo: shardInfo,
-			err:       err,
+			nodeInfo:   nodeInfo,
+			shardInfo:  shardInfo,
+			workerInfo: workerInfo,
+			err:        err,
 		}
 	}
 }
@@ -328,7 +372,7 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusIsError = true
 			return m, nil
 		}
-		m.processRefreshData(msg.nodeInfo, msg.shardInfo)
+		m.processRefreshData(msg.nodeInfo, msg.shardInfo, msg.workerInfo)
 		if !m.actionInFlight {
 			m.statusMsg = ""
 			m.statusIsError = false
@@ -473,6 +517,24 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, fetchData(m.client)
 
+	case toggleManualMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("toggle manual mode failed: %v", msg.err)
+			m.statusIsError = true
+		} else {
+			state := "Manual"
+			if !msg.newState {
+				state = "Auto"
+			}
+			m.statusMsg = fmt.Sprintf("Worker %d set to %s mode", msg.coreId, state)
+			m.statusIsError = false
+		}
+		return m, fetchData(m.client)
+
+	case markManualMsg:
+		// Fire-and-forget: errors here don't block the main action.
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
@@ -532,13 +594,18 @@ func (m *manageModel) selectedAvailRows() []shardRow {
 
 // startMultiFilterAction collects valid filters and sends them in a single message.
 // Used for Leave, Confirm, Reject (which support multiple filters per message).
+// Also marks affected workers as manually managed.
 func (m *manageModel) startMultiFilterAction(action string, rows []allocationRow, validStatus func(uint32) bool) (tea.Model, tea.Cmd) {
 	var filters [][]byte
 	var status uint32
+	var workerIDs []uint32
 	for _, row := range rows {
 		if validStatus(row.status) {
 			filters = append(filters, row.filter)
 			status = row.status
+			if row.workerID >= 0 {
+				workerIDs = append(workerIDs, uint32(row.workerID))
+			}
 		}
 	}
 	if len(filters) == 0 {
@@ -552,16 +619,19 @@ func (m *manageModel) startMultiFilterAction(action string, rows []allocationRow
 	m.allocSelected = make(map[string]bool)
 	m.statusMsg = fmt.Sprintf("Creating %s message for %d allocation(s)...", action, len(filters))
 
-	var cmd tea.Cmd
+	var cmds []tea.Cmd
 	switch action {
 	case "Leave":
-		cmd = doLeave(m.client, filters, status)
+		cmds = append(cmds, doLeave(m.client, filters, status))
 	case "Confirm":
-		cmd = doConfirm(m.client, filters, status)
+		cmds = append(cmds, doConfirm(m.client, filters, status))
 	case "Reject":
-		cmd = doReject(m.client, filters, status)
+		cmds = append(cmds, doReject(m.client, filters, status))
 	}
-	return m, cmd
+	if len(workerIDs) > 0 {
+		cmds = append(cmds, doMarkWorkersManual(m.client, workerIDs))
+	}
+	return m, tea.Batch(cmds...)
 }
 
 // startBatchAction queues individual actions for operations that only support
@@ -622,6 +692,10 @@ func (m *manageModel) advanceQueue() tea.Cmd {
 }
 
 func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.joinPickerActive {
+		return m.handleJoinPickerKey(msg)
+	}
+
 	switch {
 	case key.Matches(msg, m.keyMap.Quit):
 		return m, tea.Quit
@@ -723,6 +797,18 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		for _, row := range rows {
 			filters = append(filters, row.filter)
 		}
+
+		// If there are free workers, let user pick which to mark manual.
+		if len(m.freeWorkers) > 0 {
+			m.joinPickerActive = true
+			m.joinPickerCursor = 0
+			m.joinPickerWorkers = append([]uint32(nil), m.freeWorkers...)
+			m.joinPickerSelected = make(map[uint32]bool)
+			m.joinPickerFilters = filters
+			return m, nil
+		}
+
+		// No free workers — proceed with join only.
 		m.actionInFlight = true
 		m.statusMsg = fmt.Sprintf("Joining %d shard(s) (VDF may take a while)...", len(filters))
 		m.statusIsError = false
@@ -758,6 +844,23 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.startBatchAction("Resume", m.selectedAllocRows(), func(s uint32) bool { return s == 3 })
+
+	case key.Matches(msg, m.keyMap.ToggleManual):
+		if m.actionInFlight || m.focus != allocationsPanel {
+			return m, nil
+		}
+		filtered := m.filteredAllocations()
+		if m.allocCursor >= len(filtered) {
+			return m, nil
+		}
+		row := filtered[m.allocCursor]
+		if row.workerID < 0 {
+			m.statusMsg = "No worker assigned to this allocation"
+			m.statusIsError = true
+			return m, nil
+		}
+		newState := !row.manuallyManaged
+		return m, doToggleManual(m.client, uint32(row.workerID), newState)
 	}
 
 	return m, nil
@@ -767,6 +870,7 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *manageModel) processRefreshData(
 	nodeInfo *protobufs.NodeInfoResponse,
 	shardInfo *protobufs.GetShardInfoResponse,
+	workerInfo *protobufs.WorkerInfoResponse,
 ) {
 	// Header.
 	m.peerId = nodeInfo.GetPeerId()
@@ -783,6 +887,38 @@ func (m *manageModel) processRefreshData(
 		m.difficulty = shardInfo.GetDifficulty()
 	}
 
+	// Build maps of worker core_id and manually-managed state by filter hex.
+	type workerData struct {
+		coreId          uint32
+		manuallyManaged bool
+	}
+	workers := make(map[string]workerData)
+	anyManuallyManaged := false
+	if workerInfo != nil {
+		for _, w := range workerInfo.GetWorkerInfo() {
+			workers[hex.EncodeToString(w.GetFilter())] = workerData{
+				coreId:          w.GetCoreId(),
+				manuallyManaged: w.GetManuallyManaged(),
+			}
+			if w.GetManuallyManaged() {
+				anyManuallyManaged = true
+			}
+		}
+	}
+	m.autoManaged = !anyManuallyManaged
+
+	// Collect free workers (no filter assigned).
+	var freeWorkers []uint32
+	if workerInfo != nil {
+		for _, w := range workerInfo.GetWorkerInfo() {
+			if len(w.GetFilter()) == 0 {
+				freeWorkers = append(freeWorkers, w.GetCoreId())
+			}
+		}
+	}
+	sort.Slice(freeWorkers, func(i, j int) bool { return freeWorkers[i] < freeWorkers[j] })
+	m.freeWorkers = freeWorkers
+
 	// Build a map of shard reward info by filter for enrichment.
 	rewardByFilter := make(map[string]*protobufs.ShardRewardInfo)
 	allocatedFilters := make(map[string]bool)
@@ -796,8 +932,19 @@ func (m *manageModel) processRefreshData(
 	// Build allocations from NodeInfo, enriched with ShardInfo.
 	allocs := make([]allocationRow, 0, len(nodeInfo.GetShardAllocations()))
 	for _, a := range nodeInfo.GetShardAllocations() {
-		//skip unknown, rejected and kicked allocations
-		if a.GetStatus() == 0 || a.GetStatus() == 5 || a.GetStatus() == 6 {
+		// Only show allocations the prover is actively participating in.
+		s := a.GetStatus()
+		if s != 1 && s != 2 && s != 3 && s != 4 {
+			continue
+		}
+		// Skip expired joins (implicitly rejected after 720 frames).
+		if s == 1 && a.GetJoinFrameNumber() > 0 &&
+			m.frameNumber >= a.GetJoinFrameNumber()+ACTION_FRAME_DELAY*2 {
+			continue
+		}
+		// Skip expired leaves (implicitly left after 720 frames).
+		if s == 4 && a.GetLeaveFrameNumber() > 0 &&
+			m.frameNumber >= a.GetLeaveFrameNumber()+ACTION_FRAME_DELAY*2 {
 			continue
 		}
 		filterHex := hex.EncodeToString(a.GetFilter())
@@ -808,27 +955,45 @@ func (m *manageModel) processRefreshData(
 			statusName = fmt.Sprintf("Unknown(%d)", a.GetStatus())
 		}
 
-		// For Pending (Joining) and Leaving, annotate with confirmable frame.
+		nextAction := ""
+		defaultAction := ""
+		// For Joining, annotate with confirmable frame.
 		if a.GetStatus() == 1 && a.GetJoinFrameNumber() > 0 {
-			confirmAt := a.GetJoinFrameNumber() + 360
-			if m.frameNumber >= confirmAt {
-				statusName = "Confirm Now"
+			actionFrame := a.GetJoinFrameNumber() + ACTION_FRAME_DELAY
+			expiryFrame := a.GetJoinFrameNumber() + ACTION_FRAME_DELAY*2
+			if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
+				nextAction = "Reject@now | Confirm@now"
 			} else {
-				statusName = fmt.Sprintf("Pending @%d", confirmAt)
+				nextAction = fmt.Sprintf("Reject@now | Confirm@%d", actionFrame)
 			}
+			defaultAction = fmt.Sprintf("Reject@%d", expiryFrame)
 		} else if a.GetStatus() == 4 && a.GetLeaveFrameNumber() > 0 {
-			confirmAt := a.GetLeaveFrameNumber() + 360
-			if m.frameNumber >= confirmAt {
-				statusName = "Confirm Now"
+			// For Leaving, use LeaveFrameNumber for action/expiry calculation.
+			actionFrame := a.GetLeaveFrameNumber() + ACTION_FRAME_DELAY
+			expiryFrame := a.GetLeaveFrameNumber() + ACTION_FRAME_DELAY*2
+			if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
+				nextAction = "Reject@now | Confirm@now"
 			} else {
-				statusName = fmt.Sprintf("Leaving @%d", confirmAt)
+				nextAction = fmt.Sprintf("Reject@now | Confirm@%d", actionFrame)
 			}
+			defaultAction = fmt.Sprintf("Confirm@%d", expiryFrame)
+		} else if a.GetStatus() == 2 {
+			nextAction = "Pause@now | Leave@now"
+		} else if a.GetStatus() == 3 {
+			nextAction = "Resume@now | Leave@now"
+		}
+
+		wid := -1
+		mm := false
+		if wd, ok := workers[filterHex]; ok {
+			wid = int(wd.coreId)
+			mm = wd.manuallyManaged
 		}
 
 		row := allocationRow{
 			filter:          a.GetFilter(),
 			filterKey:       filterHex,
-			filterHex:       truncHex(filterHex),
+			filterHex:       filterHex,
 			status:          a.GetStatus(),
 			statusName:      statusName,
 			joinFrame:       a.GetJoinFrameNumber(),
@@ -837,12 +1002,17 @@ func (m *manageModel) processRefreshData(
 			lastActiveFrame: a.GetLastActiveFrameNumber(),
 			shardSize:       big.NewInt(0),
 			estimatedReward: big.NewInt(0),
+			workerID:        wid,
+			nextAction:      nextAction,
+			defaultAction:   defaultAction,
+			manuallyManaged: mm,
 		}
 
 		if info, ok := rewardByFilter[filterHex]; ok {
 			row.ring = info.GetRing()
 			row.activeProvers = info.GetActiveProvers()
 			row.shardSize = new(big.Int).SetBytes(info.GetShardSize())
+			row.dataShards = info.GetDataShards()
 			row.estimatedReward = new(big.Int).SetBytes(info.GetEstimatedReward())
 		}
 
@@ -861,10 +1031,11 @@ func (m *manageModel) processRefreshData(
 			avail = append(avail, shardRow{
 				filter:          s.GetFilter(),
 				filterKey:       filterHex,
-				filterHex:       truncHex(filterHex),
+				filterHex:       filterHex,
 				activeProvers:   s.GetActiveProvers(),
 				ring:            s.GetRing(),
 				shardSize:       new(big.Int).SetBytes(s.GetShardSize()),
+				dataShards:      s.GetDataShards(),
 				estimatedReward: new(big.Int).SetBytes(s.GetEstimatedReward()),
 			})
 		}
@@ -922,13 +1093,14 @@ func (m manageModel) renderView() string {
 		return "Terminal too small. Please resize."
 	}
 
+	if m.joinPickerActive {
+		return m.renderJoinPicker()
+	}
+
 	var doc strings.Builder
 
 	// Header bar.
 	peerDisplay := m.peerId
-	if len(peerDisplay) > 16 {
-		peerDisplay = peerDisplay[:8] + ".." + peerDisplay[len(peerDisplay)-6:]
-	}
 	reachStr := "OK"
 	if !m.reachable {
 		reachStr = "UNREACHABLE"
@@ -966,12 +1138,32 @@ func (m manageModel) renderView() string {
 
 	// Allocations panel.
 	filteredAllocs := m.filteredAllocations()
-	totalPerFrame := big.NewInt(0)
+	activePerFrame := big.NewInt(0)
+	joiningPerFrame := big.NewInt(0)
+	pausedPerFrame := big.NewInt(0)
+	leavingPerFrame := big.NewInt(0)
 	for _, a := range filteredAllocs {
-		totalPerFrame.Add(totalPerFrame, a.estimatedReward)
+		switch a.status {
+		case 1:
+			joiningPerFrame.Add(joiningPerFrame, a.estimatedReward)
+		case 2:
+			activePerFrame.Add(activePerFrame, a.estimatedReward)
+		case 3:
+			pausedPerFrame.Add(pausedPerFrame, a.estimatedReward)
+		case 4:
+			leavingPerFrame.Add(leavingPerFrame, a.estimatedReward)
+		}
+
 	}
-	allocTitle := fmt.Sprintf(" Your Allocations (%d) ~%s QUIL/day",
-		len(filteredAllocs), formatQUILDaily(totalPerFrame))
+	totalPerFrame := big.NewInt(0)
+	totalPerFrame.Add(totalPerFrame, joiningPerFrame)
+	totalPerFrame.Add(totalPerFrame, activePerFrame)
+	totalPerFrame.Add(totalPerFrame, pausedPerFrame)
+	totalPerFrame.Add(totalPerFrame, leavingPerFrame)
+
+	allocTitle := fmt.Sprintf("Allocations (%d) Rewards: Total ~%s QUIL/day = Joining ~%s QUIL/day + Active ~%s QUIL/day + Paused ~%s QUIL/day + Leaving ~%s QUIL/day",
+		len(filteredAllocs), formatQUILDaily(totalPerFrame), formatQUILDaily(joiningPerFrame), formatQUILDaily(activePerFrame),
+		formatQUILDaily(pausedPerFrame), formatQUILDaily(leavingPerFrame))
 	if n := len(m.allocSelected); n > 0 {
 		allocTitle += fmt.Sprintf(" [%d selected]", n)
 	}
@@ -1032,17 +1224,22 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		return "  No allocations"
 	}
 
-	hasSelections := len(m.allocSelected) > 0
+	// Dynamic filter column width based on available space.
+	fw := width - allocFixedWidth
+	if fw < minFilterWidth {
+		fw = minFilterWidth
+	}
+	if fw > FILTER_WIDTH {
+		fw = FILTER_WIDTH
+	}
+	fws := strconv.Itoa(fw)
 
 	// Column header.
 	var hdr string
-	if hasSelections {
-		hdr = fmt.Sprintf("    %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-			"Filter", "Provers", "Ring", "Size", "Reward", "Status")
-	} else {
-		hdr = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-			"Filter", "Provers", "Ring", "Size", "Reward", "Status")
-	}
+	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s "+
+		"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(STATUS_WIDTH)+"s "+
+		"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
+		"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward", "Worker", "Status", "Next Action", "Default Action")
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
 
 	// Compute visible window.
@@ -1059,31 +1256,29 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 
 	for i := m.allocOffset; i < end; i++ {
 		a := filtered[i]
-		var line string
-		if hasSelections {
-			marker := "[ ]"
-			if m.allocSelected[a.filterKey] {
-				marker = "[x]"
-			}
-			line = fmt.Sprintf("%s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-				marker,
-				a.filterHex,
-				a.activeProvers,
-				a.ring,
-				formatStorage(a.shardSize.Uint64()),
-				"~"+formatQUIL(a.estimatedReward)+" Q/f",
-				a.statusName,
-			)
-		} else {
-			line = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %-"+strconv.Itoa(STATUS_WIDTH)+"s",
-				a.filterHex,
-				a.activeProvers,
-				a.ring,
-				formatStorage(a.shardSize.Uint64()),
-				"~"+formatQUIL(a.estimatedReward)+" Q/f",
-				a.statusName,
-			)
+		displayStatus := a.statusName
+		if a.manuallyManaged {
+			displayStatus += " [M]"
 		}
+		marker := "[ ]"
+		if m.allocSelected[a.filterKey] {
+			marker = "[x]"
+		}
+		line := fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
+			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"d %"+strconv.Itoa(STATUS_WIDTH)+"s "+
+			"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
+			marker,
+			centerTrunc(a.filterHex, fw),
+			a.activeProvers,
+			a.ring,
+			formatStorage(a.shardSize.Uint64()),
+			a.dataShards,
+			"~"+formatQUIL(a.estimatedReward)+" Q/f",
+			a.workerID,
+			displayStatus,
+			a.nextAction,
+			a.defaultAction,
+		)
 		if i == m.allocCursor && m.focus == allocationsPanel {
 			line = mSelectedStyle.Width(width).Render(line)
 		}
@@ -1099,16 +1294,18 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		return "  No available shards"
 	}
 
-	hasSelections := len(m.availSelected) > 0
+	fw := width - availFixedWidth
+	if fw < minFilterWidth {
+		fw = minFilterWidth
+	}
+	if fw > FILTER_WIDTH {
+		fw = FILTER_WIDTH
+	}
+	fws := strconv.Itoa(fw)
 
 	var hdr string
-	if hasSelections {
-		hdr = fmt.Sprintf("    %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-			"Filter", "Provers", "Ring", "Size", "Reward")
-	} else {
-		hdr = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-			"Filter", "Provers", "Ring", "Size", "Reward")
-	}
+	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
+		"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward")
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
 
 	visibleRows := height - 1
@@ -1125,28 +1322,19 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	for i := m.availOffset; i < end; i++ {
 		s := filtered[i]
 		var line string
-		if hasSelections {
-			marker := "[ ]"
-			if m.availSelected[s.filterKey] {
-				marker = "[x]"
-			}
-			line = fmt.Sprintf("%s %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-				marker,
-				s.filterHex,
-				s.activeProvers,
-				s.ring,
-				formatStorage(s.shardSize.Uint64()),
-				"~"+formatQUIL(s.estimatedReward)+" Q/f",
-			)
-		} else {
-			line = fmt.Sprintf("  %"+strconv.Itoa(FILTER_WIDTH)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-				s.filterHex,
-				s.activeProvers,
-				s.ring,
-				formatStorage(s.shardSize.Uint64()),
-				"~"+formatQUIL(s.estimatedReward)+" Q/f",
-			)
+		marker := "[ ]"
+		if m.availSelected[s.filterKey] {
+			marker = "[x]"
 		}
+		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
+			marker,
+			centerTrunc(s.filterHex, fw),
+			s.activeProvers,
+			s.ring,
+			formatStorage(s.shardSize.Uint64()),
+			s.dataShards,
+			"~"+formatQUIL(s.estimatedReward)+" Q/f",
+		)
 		if i == m.availCursor && m.focus == availablePanel {
 			line = mSelectedStyle.Width(width).Render(line)
 		}
@@ -1154,6 +1342,103 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// handleJoinPickerKey processes keys while the join worker picker is active.
+func (m manageModel) handleJoinPickerKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	enterKey := key.NewBinding(key.WithKeys("enter"))
+	escKey := key.NewBinding(key.WithKeys("esc"))
+
+	switch {
+	case key.Matches(msg, m.keyMap.Up):
+		if m.joinPickerCursor > 0 {
+			m.joinPickerCursor--
+		}
+
+	case key.Matches(msg, m.keyMap.Down):
+		if m.joinPickerCursor < len(m.joinPickerWorkers)-1 {
+			m.joinPickerCursor++
+		}
+
+	case key.Matches(msg, m.keyMap.Select): // space
+		if m.joinPickerCursor < len(m.joinPickerWorkers) {
+			wid := m.joinPickerWorkers[m.joinPickerCursor]
+			if m.joinPickerSelected[wid] {
+				delete(m.joinPickerSelected, wid)
+			} else {
+				m.joinPickerSelected[wid] = true
+			}
+		}
+
+	case key.Matches(msg, m.keyMap.Join), key.Matches(msg, enterKey):
+		// Confirm: collect selected worker IDs, do join + mark.
+		var workerIDs []uint32
+		for wid := range m.joinPickerSelected {
+			workerIDs = append(workerIDs, wid)
+		}
+		m.joinPickerActive = false
+		m.actionInFlight = true
+		m.statusMsg = fmt.Sprintf("Joining %d shard(s) (VDF may take a while)...", len(m.joinPickerFilters))
+		m.statusIsError = false
+		m.availSelected = make(map[string]bool)
+
+		cmds := []tea.Cmd{doJoin(m.client, m.joinPickerFilters)}
+		if len(workerIDs) > 0 {
+			cmds = append(cmds, doMarkWorkersManual(m.client, workerIDs))
+		}
+		return m, tea.Batch(cmds...)
+
+	case key.Matches(msg, escKey), key.Matches(msg, m.keyMap.Quit):
+		m.joinPickerActive = false
+		m.statusMsg = "Join cancelled"
+		m.statusIsError = false
+	}
+
+	return m, nil
+}
+
+// renderJoinPicker draws the worker selection screen for manual-mode marking.
+func (m manageModel) renderJoinPicker() string {
+	var doc strings.Builder
+
+	doc.WriteString(mHeaderStyle.Width(m.width).Render(" Select workers to mark as manually managed"))
+	doc.WriteString("\n\n")
+	doc.WriteString(fmt.Sprintf("  Joining %d shard(s). Select which free workers to set to Manual mode:\n\n", len(m.joinPickerFilters)))
+
+	// header(1) + blank(1) + description(1) + blank(1) + footer blank(1) + footer(1) = 6
+	visibleRows := m.height - 6
+	if visibleRows < 1 {
+		visibleRows = 1
+	}
+	m.joinPickerOffset = clampOffset(m.joinPickerOffset, m.joinPickerCursor, visibleRows, len(m.joinPickerWorkers))
+
+	end := m.joinPickerOffset + visibleRows
+	if end > len(m.joinPickerWorkers) {
+		end = len(m.joinPickerWorkers)
+	}
+
+	for i := m.joinPickerOffset; i < end; i++ {
+		wid := m.joinPickerWorkers[i]
+		marker := "[ ]"
+		if m.joinPickerSelected[wid] {
+			marker = "[x]"
+		}
+		cursor := "  "
+		if i == m.joinPickerCursor {
+			cursor = "> "
+		}
+		line := fmt.Sprintf("%s%s Worker %d", cursor, marker, wid)
+		if i == m.joinPickerCursor {
+			line = mSelectedStyle.Render(line)
+		}
+		doc.WriteString(line)
+		doc.WriteString("\n")
+	}
+
+	doc.WriteString("\n")
+	doc.WriteString(mFooterStyle.Render("  space: toggle  J/enter: confirm join  esc: cancel"))
+
+	return doc.String()
 }
 
 // clampOffset adjusts the scroll offset so cursor is always visible.
@@ -1173,21 +1458,35 @@ func clampOffset(offset, cursor, visibleRows, total int) int {
 	return offset
 }
 
-func truncHex(h string) string {
-	if len(h) > FILTER_WIDTH {
-		return "..." + h[len(h)-FILTER_WIDTH+4:]
+// centerTrunc shortens h to maxWidth by eliding the middle with "...".
+func centerTrunc(h string, maxWidth int) string {
+	if maxWidth <= 3 {
+		if len(h) > maxWidth {
+			return h[:maxWidth]
+		}
+		return h
 	}
-	return h
+	if len(h) <= maxWidth {
+		return h
+	}
+	prefix := (maxWidth - 3) / 2
+	suffix := maxWidth - 3 - prefix
+	return h[:prefix] + "..." + h[len(h)-suffix:]
 }
 
-// fetchRPCData calls both GetNodeInfo and GetShardInfo.
-func fetchRPCData(client protobufs.NodeServiceClient) (*protobufs.NodeInfoResponse, *protobufs.GetShardInfoResponse, error) {
+// truncHex shortens a hex string for use in short status messages.
+func truncHex(h string) string {
+	return centerTrunc(h, 20)
+}
+
+// fetchRPCData calls GetNodeInfo, GetShardInfo, and GetWorkerInfo.
+func fetchRPCData(client protobufs.NodeServiceClient) (*protobufs.NodeInfoResponse, *protobufs.GetShardInfoResponse, *protobufs.WorkerInfoResponse, error) {
 	nodeInfo, err := client.GetNodeInfo(
 		context.Background(),
 		&protobufs.GetNodeInfoRequest{},
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("GetNodeInfo: %w", err)
+		return nil, nil, nil, fmt.Errorf("GetNodeInfo: %w", err)
 	}
 
 	shardInfo, err := client.GetShardInfo(
@@ -1196,8 +1495,16 @@ func fetchRPCData(client protobufs.NodeServiceClient) (*protobufs.NodeInfoRespon
 	)
 	if err != nil {
 		// Shard info is optional - we can still show allocations.
-		return nodeInfo, nil, nil
+		shardInfo = nil
 	}
 
-	return nodeInfo, shardInfo, nil
+	workerInfo, err := client.GetWorkerInfo(
+		context.Background(),
+		&protobufs.GetWorkerInfoRequest{},
+	)
+	if err != nil {
+		workerInfo = nil
+	}
+
+	return nodeInfo, shardInfo, workerInfo, nil
 }

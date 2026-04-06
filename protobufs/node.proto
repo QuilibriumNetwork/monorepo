@@ -79,6 +79,7 @@ message WorkerInfo {
   bytes filter = 2;
   uint64 available_storage = 3;
   uint64 total_storage = 4;
+  bool manually_managed = 5;
 }
 
 message WorkerInfoResponse {
@@ -275,6 +276,7 @@ message ShardRewardInfo {
   bytes shard_size = 4;
   bytes estimated_reward = 5;
   bool is_allocated = 6;
+  uint64 data_shards = 7;
 }
 
 message GetShardInfoRequest {
@@ -297,6 +299,20 @@ message RequestJoinRequest {
 message RequestJoinResponse {
 }
 
+message SetManuallyManagedRequest {
+  uint32 core_id = 1;
+  bool manually_managed = 2;
+}
+
+message SetManuallyManagedResponse {
+}
+
+message SubmitMessageRequest {
+  bytes data = 1; // canonical bytes (type prefix + serialized MessageBundle)
+}
+
+message SubmitMessageResponse {}
+
 service NodeService {
   rpc GetPeerInfo(GetPeerInfoRequest) returns (PeerInfoResponse);
   rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
@@ -311,6 +327,10 @@ service NodeService {
     returns (CreateTraversalProofResponse);
   rpc GetShardInfo(GetShardInfoRequest) returns (GetShardInfoResponse);
   rpc RequestJoin(RequestJoinRequest) returns (RequestJoinResponse);
+  rpc SetManuallyManaged(SetManuallyManagedRequest) returns (SetManuallyManagedResponse);
+  rpc GetLatestFrame(quilibrium.node.global.pb.GetGlobalFrameRequest)
+    returns (quilibrium.node.global.pb.GlobalFrameResponse);
+  rpc SubmitMessage(SubmitMessageRequest) returns (SubmitMessageResponse);
 }
 
 message ConnectivityTestRequest {

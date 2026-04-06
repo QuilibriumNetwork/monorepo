@@ -1,6 +1,7 @@
 package token
 
 import (
+	"encoding/binary"
 	"math/big"
 
 	"github.com/pkg/errors"
@@ -856,12 +857,25 @@ func TraversalProofToProtobuf(
 	var multiproof *protobufs.Multiproof
 	if tp.Multiproof != nil {
 		multiproofBytes, _ := tp.Multiproof.ToBytes()
-		// Split the bytes - assuming first part is multicommitment, rest is proof
-		// This needs to match how the Multiproof is serialized
-		if len(multiproofBytes) > 0 {
-			multiproof = &protobufs.Multiproof{
-				Multicommitment: multiproofBytes[:min(74, len(multiproofBytes))],
-				Proof:           multiproofBytes[min(74, len(multiproofBytes)):],
+		// bls48581.Multiproof.ToBytes() serializes as:
+		//   [4 bytes: len(D)] [D bytes] [4 bytes: len(Proof)] [Proof bytes]
+		// We need to parse the length-prefixed fields into the protobuf
+		// Multiproof which has Multicommitment (= D) and Proof.
+		if len(multiproofBytes) >= 8 {
+			dLen := binary.BigEndian.Uint32(multiproofBytes[0:4])
+			if uint32(len(multiproofBytes)) >= 4+dLen+4 {
+				d := multiproofBytes[4 : 4+dLen]
+				proofOffset := 4 + dLen
+				pLen := binary.BigEndian.Uint32(
+					multiproofBytes[proofOffset : proofOffset+4],
+				)
+				if uint32(len(multiproofBytes)) >= proofOffset+4+pLen {
+					p := multiproofBytes[proofOffset+4 : proofOffset+4+pLen]
+					multiproof = &protobufs.Multiproof{
+						Multicommitment: d,
+						Proof:           p,
+					}
+				}
 			}
 		}
 	}

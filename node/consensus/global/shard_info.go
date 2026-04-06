@@ -5,6 +5,7 @@ import (
 	"context"
 	"math/big"
 	"slices"
+	"sort"
 	"time"
 
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -23,11 +24,13 @@ import (
 )
 
 type shardEntry struct {
-	filter      []byte
-	size        *big.Int
-	dataShards  uint64
-	totalActive int
-	isAllocated bool
+	filter        []byte
+	size          *big.Int
+	dataShards    uint64
+	totalActive   int
+	proversOnRing int
+	isAllocated   bool
+	ring          uint8
 }
 
 // GetShardInfo implements typesconsensus.ShardInfoProvider.
@@ -43,7 +46,12 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 	difficulty := uint64(frame.Header.Difficulty)
 	frameNumber := frame.Header.FrameNumber
 
-	self, _ := e.allocationContext()
+	self, _ := e.workerAllocator.allocationContext()
+
+	var selfAddress []byte
+	if self != nil {
+		selfAddress = self.Address
+	}
 
 	// Build a set of filters this prover is allocated to.
 	allocatedFilters := map[string]bool{}
@@ -96,12 +104,24 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 			return e.getLocalAppShards(hg, shardKey, si)
 		},
 		allocatedFilters,
+		selfAddress,
 		includeAll,
 	)
 
-	// If local hypergraph has no data (non-archive node), fall back to
-	// fetching shard sizes from the latest frame's prover.
-	if worldBytes.Sign() == 0 {
+	// Non-archive nodes only have local hypergraph data for shards they're
+	// assigned to. When includeAll is requested the local path returns
+	// partial results (zero-size shards are dropped in buildShardEntries),
+	// but worldBytes > 0 from the allocated shards prevents the fallback
+	// from triggering. Fall back to the remote path when the local result
+	// is incomplete.
+	useRemote := worldBytes.Sign() == 0
+	if !useRemote && includeAll && !e.config.Engine.ArchiveMode {
+		// Count how many shards we expect vs how many we got.
+		// If local data is incomplete, prefer remote.
+		useRemote = len(entries) < len(shards)
+	}
+
+	if useRemote {
 		client, conn, err := e.dialFrameProver(frame)
 		if err == nil {
 			defer conn.Close()
@@ -111,6 +131,7 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 					return e.getRemoteAppShards(client, shardKey)
 				},
 				allocatedFilters,
+				selfAddress,
 				includeAll,
 			)
 		}
@@ -124,23 +145,16 @@ func (e *GlobalConsensusEngine) GetShardInfo(
 
 	details := make([]*typesconsensus.ShardDetail, 0, len(entries))
 	for _, entry := range entries {
-		// Ring matches the actual assignment in computeRingAssignments:
-		// floor(totalActiveJoining / 8) for current members, +1 for a
-		// new joiner.
-		ring := uint8(entry.totalActive / 8)
-		if !entry.isAllocated && includeAll {
-			ring = uint8((entry.totalActive + 1) / 8)
-		}
-
-		est := computeShardReward(basis, entry.size, worldBytes, ring, entry.dataShards)
+		est := computeShardReward(basis, entry.size, worldBytes, entry.ring, entry.dataShards)
 
 		details = append(details, &typesconsensus.ShardDetail{
 			Filter:          entry.filter,
 			ShardSize:       entry.size,
 			ActiveProvers:   entry.totalActive,
-			Ring:            ring,
+			Ring:            entry.ring,
 			EstimatedReward: est,
 			IsAllocated:     entry.isAllocated,
+			DataShards:      entry.dataShards,
 		})
 	}
 
@@ -154,6 +168,7 @@ func (e *GlobalConsensusEngine) buildShardEntries(
 	shards []store.ShardInfo,
 	getSizes func(shardKey []byte, si store.ShardInfo) ([]*shardInfoEntry, error),
 	allocatedFilters map[string]bool,
+	selfAddress []byte,
 	includeAll bool,
 ) ([]shardEntry, *big.Int) {
 	worldBytes := big.NewInt(0)
@@ -189,26 +204,65 @@ func (e *GlobalConsensusEngine) buildShardEntries(
 				continue
 			}
 
-			totalActive := 0
-			for _, i := range prs {
-				for _, a := range i.Allocations {
+			// Compute the actual ring assignment for this prover by
+			// replicating the sort from computeRingAssignments:
+			// sort by joinFrame asc, seniority desc, address asc.
+			type candidate struct {
+				joinFrame uint64
+				seniority uint64
+				address   []byte
+			}
+			var candidates []candidate
+			for _, pr := range prs {
+				for _, a := range pr.Allocations {
 					if !bytes.Equal(a.ConfirmationFilter, bp) {
 						continue
 					}
 					if a.Status == typesconsensus.ProverStatusActive ||
 						a.Status == typesconsensus.ProverStatusJoining {
-						totalActive++
+						jf := a.JoinFrameNumber
+						if jf == 0 && a.JoinConfirmFrameNumber != 0 {
+							jf = a.JoinConfirmFrameNumber
+						}
+						candidates = append(candidates, candidate{
+							joinFrame: jf,
+							seniority: pr.Seniority,
+							address:   pr.Address,
+						})
 					}
 					break
 				}
 			}
 
+			sort.Slice(candidates, func(i, j int) bool {
+				if candidates[i].joinFrame != candidates[j].joinFrame {
+					return candidates[i].joinFrame < candidates[j].joinFrame
+				}
+				if candidates[i].seniority != candidates[j].seniority {
+					return candidates[i].seniority > candidates[j].seniority
+				}
+				return bytes.Compare(candidates[i].address, candidates[j].address) < 0
+			})
+
+			ring, onRing := resolveProverRing(
+				len(candidates), isAlloc, selfAddress,
+				func() [][]byte {
+					addrs := make([][]byte, len(candidates))
+					for i, c := range candidates {
+						addrs[i] = c.address
+					}
+					return addrs
+				},
+			)
+
 			entries = append(entries, shardEntry{
-				filter:      bp,
-				size:        size,
-				dataShards:  shard.DataShards,
-				totalActive: totalActive,
-				isAllocated: isAlloc,
+				filter:        bp,
+				size:          size,
+				dataShards:    shard.DataShards,
+				totalActive:   len(candidates),
+				proversOnRing: onRing,
+				isAllocated:   isAlloc,
+				ring:          ring,
 			})
 		}
 	}
@@ -349,18 +403,19 @@ type shardInfoEntry struct {
 	DataShards uint64
 }
 
-// computeShardReward computes the per-frame reward estimate for a single shard.
-// Formula matches proof_of_meaningful_work.go:
+// computeShardReward computes the per-prover per-frame reward estimate.
+// Formula matches proof_of_meaningful_work.go (Materialize):
 //
-//	(basis * shardSize / worldBytes) / (2^(ring+1) * sqrt(activeProvers))
+//	per_ring  = (basis * shardSize / worldBytes) / (2^(ring+1) * sqrt(dataShards))
+//	per_prover = per_ring / proversOnRing
 func computeShardReward(
 	basis *big.Int,
 	shardSize *big.Int,
 	worldBytes *big.Int,
 	ring uint8,
-	activeProvers uint64,
+	dataShards uint64,
 ) *big.Int {
-	if basis.Sign() == 0 || worldBytes.Sign() == 0 || activeProvers == 0 {
+	if basis.Sign() == 0 || worldBytes.Sign() == 0 || dataShards == 0 {
 		return big.NewInt(0)
 	}
 
@@ -379,14 +434,16 @@ func computeShardReward(
 	}
 	factor.Div(factor, big.NewInt(divisor))
 
-	// Approximate sqrt(activeProvers) using integer math:
-	// Newton's method for isqrt.
-	if activeProvers > 1 {
-		sqrtVal := isqrt(activeProvers)
+	// sqrt(dataShards) — matches the sqrt(shardCount) in the reward module.
+	if dataShards > 1 {
+		sqrtVal := isqrt(dataShards)
 		if sqrtVal > 0 {
 			factor.Div(factor, big.NewInt(int64(sqrtVal)))
 		}
 	}
+
+	// Divide by constant max ring size (partially filled rings still split by 8).
+	factor.Div(factor, big.NewInt(8))
 
 	return factor
 }

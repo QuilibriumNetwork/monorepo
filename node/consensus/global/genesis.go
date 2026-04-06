@@ -53,13 +53,17 @@ type GenesisJson struct {
 //go:embed mainnet_genesis.json
 var mainnetGenesisJSON []byte
 
-func (e *GlobalConsensusEngine) getMainnetGenesisJSON() *GenesisJson {
+// GetMainnetGenesisData returns the parsed mainnet genesis JSON data.
+func GetMainnetGenesisData() *GenesisJson {
 	genesisData := &GenesisJson{}
 	if err := json.Unmarshal(mainnetGenesisJSON, genesisData); err != nil {
-		e.logger.Error("failed to parse embedded genesis data", zap.Error(err))
 		return nil
 	}
 	return genesisData
+}
+
+func (e *GlobalConsensusEngine) getMainnetGenesisJSON() *GenesisJson {
+	return GetMainnetGenesisData()
 }
 
 // ExpectedGenesisFrameNumber returns the frame number the node should treat as

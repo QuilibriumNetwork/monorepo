@@ -215,7 +215,7 @@ func TestComputeIntrinsic_Integration(t *testing.T) {
 	// Create a hypergrpah
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -223,6 +223,7 @@ func TestComputeIntrinsic_Integration(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		0,
 	)
 
 	// Create compute intrinsic
@@ -580,7 +581,7 @@ func TestComputeIntrinsic_HypergraphIntegration(t *testing.T) {
 	// Setup
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/hypergraph"}, 0)
+	s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/hypergraph"}}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hypergraph.NewHypergraph(
 		l,
@@ -588,6 +589,7 @@ func TestComputeIntrinsic_HypergraphIntegration(t *testing.T) {
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		0,
 	)
 
 	keyManager := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, &bulletproofs.Decaf448KeyConstructor{})
@@ -703,7 +705,7 @@ func TestComputeIntrinsic_CryptoOperations(t *testing.T) {
 
 		l, _ := zap.NewProduction()
 		ip := bls48581.NewKZGInclusionProver(l)
-		s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+		s := store.NewPebbleDB(l, &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}}, 0)
 		ve := verenc.NewMPCitHVerifiableEncryptor(1)
 		hg := hypergraph.NewHypergraph(
 			l,
@@ -711,6 +713,7 @@ func TestComputeIntrinsic_CryptoOperations(t *testing.T) {
 			ip,
 			[]int{},
 			&tests.Nopthenticator{},
+			0,
 		)
 		km := keys.NewInMemoryKeyManager(&bls48581.Bls48581KeyConstructor{}, dc)
 

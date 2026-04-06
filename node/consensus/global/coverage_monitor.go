@@ -1,102 +1,168 @@
 package global
 
+// Coverage monitoring: shard coverage checks, halt detection, split/merge events, blacklist management, and event emission.
+
 import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"math/big"
+	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/config"
+	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	typesconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
+	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
+	typeskeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
-// Define coverage thresholds
-var (
-	minProvers      = uint64(0)
-	maxProvers      = uint64(0)
-	haltThreshold   = uint64(0)
-	haltGraceFrames = uint64(0)
-)
+// CoverageMonitor encapsulates all shard coverage monitoring state and logic.
+type CoverageMonitor struct {
+	logger           *zap.Logger
+	config           *config.Config
+	proverRegistry   typesconsensus.ProverRegistry
+	hypergraph       hypergraph.Hypergraph
+	eventDistributor typesconsensus.EventDistributor
+	keyManager       typeskeys.KeyManager
+	shardsStore      store.ShardsStore
 
-func (e *GlobalConsensusEngine) ensureCoverageThresholds() {
-	if minProvers != 0 {
+	// Owned state (moved from engine)
+	coverageCheckInProgress atomic.Bool
+	coverageWg              sync.WaitGroup
+	lowCoverageStreak       map[string]*coverageStreak
+	lowCoverageStreakMu     sync.Mutex
+	lastShardActionFrame    map[string]uint64
+	lastShardActionFrameMu  sync.Mutex
+	blacklistMap            map[string]bool
+	blacklistMu             sync.RWMutex
+
+	// Coverage thresholds (were package-level vars)
+	minProvers      uint64
+	maxProvers      uint64
+	haltThreshold   uint64
+	haltGraceFrames uint64
+
+	// Callbacks for engine operations the monitor needs
+	getProverAddress     func() []byte
+	getLastObservedFrame func() uint64
+	getProverOnlyMode    func() *atomic.Bool
+	publishProverMessage func([]byte) error
+	shutdownSignal       func() <-chan struct{}
+	minimumProvers       func() uint64
+}
+
+// NewCoverageMonitor creates a new CoverageMonitor.
+func NewCoverageMonitor(
+	logger *zap.Logger,
+	cfg *config.Config,
+	proverRegistry typesconsensus.ProverRegistry,
+	hg hypergraph.Hypergraph,
+	eventDistributor typesconsensus.EventDistributor,
+	keyManager typeskeys.KeyManager,
+	shardsStore store.ShardsStore,
+) *CoverageMonitor {
+	return &CoverageMonitor{
+		logger:               logger,
+		config:               cfg,
+		proverRegistry:       proverRegistry,
+		hypergraph:           hg,
+		eventDistributor:     eventDistributor,
+		keyManager:           keyManager,
+		shardsStore:          shardsStore,
+		lastShardActionFrame: make(map[string]uint64),
+		blacklistMap:         make(map[string]bool),
+		// lowCoverageStreak intentionally left nil so ensureStreakMap
+		// populates it from prover data on first use.
+	}
+}
+
+func (c *CoverageMonitor) ensureCoverageThresholds() {
+	if c.minProvers != 0 {
 		return
 	}
 
 	// Network halt if <= 3 provers for mainnet:
-	haltThreshold = 3
-	if e.config.P2P.Network != 0 {
-		haltThreshold = 0
-		if e.minimumProvers() > 1 {
-			haltThreshold = 1
+	c.haltThreshold = 3
+	if c.config.P2P.Network != 0 {
+		c.haltThreshold = 0
+		if c.minimumProvers() > 1 {
+			c.haltThreshold = 1
 		}
 	}
 
 	// Minimum provers for safe operation
-	minProvers = e.minimumProvers()
+	c.minProvers = c.minimumProvers()
 
 	// Maximum provers before split consideration
-	maxProvers = 32
+	c.maxProvers = 32
 
 	// Require sustained critical state for 360 frames
-	haltGraceFrames = 360
+	c.haltGraceFrames = 360
 }
 
 // triggerCoverageCheckAsync starts a coverage check in a goroutine if one is
 // not already in progress. This prevents blocking the event processing loop.
 // frameProver is the address of the prover who produced the triggering frame;
 // only that prover will emit split/merge messages.
-func (e *GlobalConsensusEngine) triggerCoverageCheckAsync(
+func (c *CoverageMonitor) triggerCoverageCheckAsync(
 	frameNumber uint64,
 	frameProver []byte,
 ) {
 	// Skip if a coverage check is already in progress
-	if !e.coverageCheckInProgress.CompareAndSwap(false, true) {
-		e.logger.Debug(
+	if !c.coverageCheckInProgress.CompareAndSwap(false, true) {
+		c.logger.Debug(
 			"skipping coverage check, one already in progress",
 			zap.Uint64("frame_number", frameNumber),
 		)
 		return
 	}
 
-	e.coverageWg.Add(1)
+	c.coverageWg.Add(1)
 	go func() {
-		defer e.coverageWg.Done()
-		defer e.coverageCheckInProgress.Store(false)
+		defer c.coverageWg.Done()
+		defer c.coverageCheckInProgress.Store(false)
 
 		// Bail immediately if shutdown is already in progress to avoid
 		// blocking Stop() on hg.mu (which may be held by a sync or commit).
 		select {
-		case <-e.ShutdownSignal():
+		case <-c.shutdownSignal():
 			return
 		default:
 		}
 
-		if err := e.checkShardCoverage(frameNumber, frameProver); err != nil {
-			e.logger.Error("failed to check shard coverage", zap.Error(err))
+		if err := c.checkShardCoverage(frameNumber, frameProver); err != nil {
+			c.logger.Error("failed to check shard coverage", zap.Error(err))
 		}
 	}()
 }
 
 // checkShardCoverage verifies coverage levels for all active shards.
 // frameProver is the address of the prover who produced the triggering frame.
-func (e *GlobalConsensusEngine) checkShardCoverage(
+func (c *CoverageMonitor) checkShardCoverage(
 	frameNumber uint64,
 	frameProver []byte,
 ) error {
-	e.ensureCoverageThresholds()
+	c.ensureCoverageThresholds()
 
 	// Get shard coverage information from prover registry
-	shardCoverageMap := e.getShardCoverageMap()
+	shardCoverageMap := c.getShardCoverageMap()
 
 	// Set up the streak map so we can quickly establish halt conditions on
 	// restarts
-	err := e.ensureStreakMap(frameNumber)
+	c.lowCoverageStreakMu.Lock()
+	err := c.ensureStreakMap(frameNumber)
 	if err != nil {
+		c.lowCoverageStreakMu.Unlock()
 		return errors.Wrap(err, "check shard coverage")
 	}
+	c.lowCoverageStreakMu.Unlock()
 
 	// Update state summaries metric
 	stateSummariesAggregated.Set(float64(len(shardCoverageMap)))
@@ -109,7 +175,7 @@ func (e *GlobalConsensusEngine) checkShardCoverage(
 
 		// Validate address length (must be 32-64 bytes)
 		if addressLen < 32 || addressLen > 64 {
-			e.logger.Error(
+			c.logger.Error(
 				"invalid shard address length",
 				zap.Int("length", addressLen),
 				zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
@@ -125,7 +191,7 @@ func (e *GlobalConsensusEngine) checkShardCoverage(
 			size = size.Add(size, new(big.Int).SetUint64(metadata.TotalSize))
 		}
 
-		e.logger.Debug(
+		c.logger.Debug(
 			"checking shard coverage",
 			zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
 			zap.Uint64("prover_count", proverCount),
@@ -134,50 +200,51 @@ func (e *GlobalConsensusEngine) checkShardCoverage(
 		)
 
 		// Check for critical coverage (halt condition)
-		if proverCount <= haltThreshold && size.Cmp(big.NewInt(0)) > 0 {
+		if proverCount <= c.haltThreshold && size.Cmp(big.NewInt(0)) > 0 {
 			// Check if this address is blacklisted
-			if e.isAddressBlacklisted([]byte(shardAddress)) {
-				e.logger.Warn(
+			if c.isAddressBlacklisted([]byte(shardAddress)) {
+				c.logger.Warn(
 					"Shard has insufficient coverage but is blacklisted - skipping halt",
 					zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
 					zap.Uint64("prover_count", proverCount),
-					zap.Uint64("halt_threshold", haltThreshold),
+					zap.Uint64("halt_threshold", c.haltThreshold),
 				)
 				continue
 			}
 
 			// Bump the streak – only increments once per frame
-			streak, err := e.bumpStreak(shardAddress, frameNumber)
+			streak, err := c.bumpStreak(shardAddress, frameNumber)
 			if err != nil {
 				return errors.Wrap(err, "check shard coverage")
 			}
 
 			var remaining int
 			if frameNumber < token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+360 {
-				remaining = int(haltGraceFrames + 720 - streak.Count)
+				remaining = int(c.haltGraceFrames + 720 - streak.Count)
 			} else {
-				remaining = int(haltGraceFrames - streak.Count)
+				remaining = int(c.haltGraceFrames - streak.Count)
 			}
-			if remaining <= 0 && e.config.P2P.Network == 0 {
+			if remaining <= 0 && c.config.P2P.Network == 0 {
 				// Instead of halting, enter prover-only mode at the global level
 				// This allows prover messages to continue while blocking other messages
-				if !e.proverOnlyMode.Load() {
-					e.logger.Warn(
+				proverOnlyMode := c.getProverOnlyMode()
+				if !proverOnlyMode.Load() {
+					c.logger.Warn(
 						"CRITICAL: Shard has insufficient coverage - entering prover-only mode (non-prover messages will be dropped)",
 						zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
 						zap.Uint64("prover_count", proverCount),
-						zap.Uint64("halt_threshold", haltThreshold),
+						zap.Uint64("halt_threshold", c.haltThreshold),
 					)
-					e.proverOnlyMode.Store(true)
+					proverOnlyMode.Store(true)
 				}
 
 				// Emit warning event (not halt) so monitoring knows we're in degraded state
-				e.emitCoverageEvent(
+				c.emitCoverageEvent(
 					typesconsensus.ControlEventCoverageWarn,
 					&typesconsensus.CoverageEventData{
 						ShardAddress:    []byte(shardAddress),
 						ProverCount:     int(proverCount),
-						RequiredProvers: int(minProvers),
+						RequiredProvers: int(c.minProvers),
 						AttestedStorage: attestedStorage,
 						TreeMetadata:    coverage.TreeMetadata,
 						Message: fmt.Sprintf(
@@ -190,25 +257,25 @@ func (e *GlobalConsensusEngine) checkShardCoverage(
 			}
 
 			// During grace, warn and include progress toward halt
-			e.logger.Warn(
+			c.logger.Warn(
 				"Shard at critical coverage — grace window in effect",
 				zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
 				zap.Uint64("prover_count", proverCount),
-				zap.Uint64("halt_threshold", haltThreshold),
+				zap.Uint64("halt_threshold", c.haltThreshold),
 				zap.Uint64("streak_frames", streak.Count),
 				zap.Int("frames_until_halt", remaining),
 			)
-			e.emitCoverageEvent(
+			c.emitCoverageEvent(
 				typesconsensus.ControlEventCoverageWarn,
 				&typesconsensus.CoverageEventData{
 					ShardAddress:    []byte(shardAddress),
 					ProverCount:     int(proverCount),
-					RequiredProvers: int(minProvers),
+					RequiredProvers: int(c.minProvers),
 					AttestedStorage: attestedStorage,
 					TreeMetadata:    coverage.TreeMetadata,
 					Message: fmt.Sprintf(
 						"Critical coverage (less than or equal to %d provers). Grace period: %d/%d frames toward halt.",
-						haltThreshold, streak.Count, haltGraceFrames,
+						c.haltThreshold, streak.Count, c.haltGraceFrames,
 					),
 				},
 			)
@@ -216,34 +283,35 @@ func (e *GlobalConsensusEngine) checkShardCoverage(
 		}
 
 		// Not in critical state — clear any ongoing streak
-		e.clearStreak(shardAddress)
+		c.clearStreak(shardAddress)
 
 		// If we were in prover-only mode and coverage is restored, exit prover-only mode
-		if e.proverOnlyMode.Load() {
-			e.logger.Info(
+		proverOnlyMode := c.getProverOnlyMode()
+		if proverOnlyMode.Load() {
+			c.logger.Info(
 				"Coverage restored - exiting prover-only mode",
 				zap.String("shard_address", hex.EncodeToString([]byte(shardAddress))),
 				zap.Uint64("prover_count", proverCount),
 			)
-			e.proverOnlyMode.Store(false)
+			proverOnlyMode.Store(false)
 		}
 
 		// Check for low coverage
-		if proverCount < minProvers {
-			if mergeData := e.handleLowCoverage([]byte(shardAddress), coverage, minProvers); mergeData != nil {
+		if proverCount < c.minProvers {
+			if mergeData := c.handleLowCoverage([]byte(shardAddress), coverage, c.minProvers); mergeData != nil {
 				allMergeGroups = append(allMergeGroups, *mergeData)
 			}
 		}
 
 		// Check for high coverage (potential split)
-		if proverCount > maxProvers {
-			e.handleHighCoverage([]byte(shardAddress), coverage, maxProvers, frameProver)
+		if proverCount > c.maxProvers {
+			c.handleHighCoverage([]byte(shardAddress), coverage, c.maxProvers, frameProver)
 		}
 	}
 
 	// Emit a single bulk merge event if there are any merge-eligible shards
 	if len(allMergeGroups) > 0 {
-		e.emitBulkMergeEvent(allMergeGroups, frameProver)
+		c.emitBulkMergeEvent(allMergeGroups, frameProver)
 	}
 
 	return nil
@@ -258,7 +326,7 @@ type ShardCoverage struct {
 
 // handleLowCoverage handles shards with insufficient provers.
 // Returns merge event data if merge is possible, nil otherwise.
-func (e *GlobalConsensusEngine) handleLowCoverage(
+func (c *CoverageMonitor) handleLowCoverage(
 	shardAddress []byte,
 	coverage *ShardCoverage,
 	minProvers uint64,
@@ -267,7 +335,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 
 	// Case 2.a: Full application address (32 bytes)
 	if addressLen == 32 {
-		e.logger.Warn(
+		c.logger.Warn(
 			"shard has low coverage",
 			zap.String("shard_address", hex.EncodeToString(shardAddress)),
 			zap.Int("prover_count", coverage.ProverCount),
@@ -275,7 +343,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 		)
 
 		// Emit coverage warning event
-		e.emitCoverageEvent(
+		c.emitCoverageEvent(
 			typesconsensus.ControlEventCoverageWarn,
 			&typesconsensus.CoverageEventData{
 				ShardAddress:    shardAddress, // buildutils:allow-slice-alias slice is static
@@ -292,7 +360,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 	// Case 2.b: Longer than application address (> 32 bytes)
 	// Check if merge is possible with sibling shards
 	appPrefix := shardAddress[:32] // Application prefix
-	siblingShards := e.findSiblingShards(appPrefix, shardAddress)
+	siblingShards := c.findSiblingShards(appPrefix, shardAddress)
 
 	if len(siblingShards) > 0 {
 		// Calculate total storage across siblings
@@ -301,14 +369,14 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 		allShards := append([][]byte{shardAddress}, siblingShards...)
 
 		for _, sibling := range siblingShards {
-			if sibCoverage, exists := e.getShardCoverage(sibling); exists {
+			if sibCoverage, exists := c.getShardCoverage(sibling); exists {
 				totalStorage += sibCoverage.AttestedStorage
 				totalProvers += sibCoverage.ProverCount
 			}
 		}
 
 		// Check if siblings have sufficient storage to handle merge
-		requiredStorage := e.calculateRequiredStorage(allShards)
+		requiredStorage := c.calculateRequiredStorage(allShards)
 
 		if totalStorage >= requiredStorage {
 			// Case 2.b.i: Merge is possible - return the data for bulk emission
@@ -320,7 +388,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 			}
 		} else {
 			// Case 2.b.ii: Insufficient storage for merge
-			e.logger.Warn(
+			c.logger.Warn(
 				"shard has low coverage, merge not possible due to insufficient storage",
 				zap.String("shard_address", hex.EncodeToString(shardAddress)),
 				zap.Int("prover_count", coverage.ProverCount),
@@ -329,7 +397,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 			)
 
 			// Emit coverage warning event
-			e.emitCoverageEvent(
+			c.emitCoverageEvent(
 				typesconsensus.ControlEventCoverageWarn,
 				&typesconsensus.CoverageEventData{
 					ShardAddress:    shardAddress, // buildutils:allow-slice-alias slice is static
@@ -343,7 +411,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 		}
 	} else {
 		// No siblings found, emit warning
-		e.emitCoverageEvent(
+		c.emitCoverageEvent(
 			typesconsensus.ControlEventCoverageWarn,
 			&typesconsensus.CoverageEventData{
 				ShardAddress:    shardAddress, // buildutils:allow-slice-alias slice is static
@@ -359,7 +427,7 @@ func (e *GlobalConsensusEngine) handleLowCoverage(
 }
 
 // handleHighCoverage handles shards with too many provers
-func (e *GlobalConsensusEngine) handleHighCoverage(
+func (c *CoverageMonitor) handleHighCoverage(
 	shardAddress []byte,
 	coverage *ShardCoverage,
 	maxProvers uint64,
@@ -370,13 +438,13 @@ func (e *GlobalConsensusEngine) handleHighCoverage(
 	// Case 3.a: Not a full app+data address (< 64 bytes)
 	if addressLen < 64 {
 		// Check if there's space to split
-		availableAddressSpace := e.calculateAvailableAddressSpace(shardAddress)
+		availableAddressSpace := c.calculateAvailableAddressSpace(shardAddress)
 
 		if availableAddressSpace > 0 {
 			// Case 3.a.i: Split is possible
-			proposedShards := e.proposeShardSplit(shardAddress, coverage.ProverCount)
+			proposedShards := c.proposeShardSplit(shardAddress, coverage.ProverCount)
 
-			e.logger.Info(
+			c.logger.Info(
 				"shard eligible for split",
 				zap.String("shard_address", hex.EncodeToString(shardAddress)),
 				zap.Int("prover_count", coverage.ProverCount),
@@ -384,7 +452,7 @@ func (e *GlobalConsensusEngine) handleHighCoverage(
 			)
 
 			// Emit split eligible event
-			e.emitSplitEvent(&typesconsensus.ShardSplitEventData{
+			c.emitSplitEvent(&typesconsensus.ShardSplitEventData{
 				ShardAddress:    shardAddress, // buildutils:allow-slice-alias slice is static
 				ProverCount:     coverage.ProverCount,
 				AttestedStorage: coverage.AttestedStorage,
@@ -393,7 +461,7 @@ func (e *GlobalConsensusEngine) handleHighCoverage(
 			})
 		} else {
 			// Case 3.a.ii: No space to split, do nothing
-			e.logger.Debug(
+			c.logger.Debug(
 				"Shard has high prover count but cannot be split (no address space)",
 				zap.String("shard_address", hex.EncodeToString(shardAddress)),
 				zap.Int("prover_count", coverage.ProverCount),
@@ -401,7 +469,7 @@ func (e *GlobalConsensusEngine) handleHighCoverage(
 		}
 	} else {
 		// Already at maximum address length (64 bytes), cannot split further
-		e.logger.Debug(
+		c.logger.Debug(
 			"Shard has high prover count but cannot be split (max address length)",
 			zap.String("shard_address", hex.EncodeToString(shardAddress)),
 			zap.Int("prover_count", coverage.ProverCount),
@@ -409,14 +477,14 @@ func (e *GlobalConsensusEngine) handleHighCoverage(
 	}
 }
 
-func (e *GlobalConsensusEngine) getShardCoverageMap() map[string]*ShardCoverage {
+func (c *CoverageMonitor) getShardCoverageMap() map[string]*ShardCoverage {
 	// Get all active app shard provers from the registry
 	coverageMap := make(map[string]*ShardCoverage)
 
 	// Get all app shard provers (provers with filters)
-	allProvers, err := e.proverRegistry.GetAllActiveAppShardProvers()
+	allProvers, err := c.proverRegistry.GetAllActiveAppShardProvers()
 	if err != nil {
-		e.logger.Error("failed to get active app shard provers", zap.Error(err))
+		c.logger.Error("failed to get active app shard provers", zap.Error(err))
 		return coverageMap
 	}
 
@@ -442,9 +510,9 @@ func (e *GlobalConsensusEngine) getShardCoverageMap() map[string]*ShardCoverage 
 
 		// Get tree metadata from hypergraph
 		var treeMetadata []typesconsensus.TreeMetadata
-		metadata, err := e.hypergraph.GetMetadataAtKey([]byte(shardAddress))
+		metadata, err := c.hypergraph.GetMetadataAtKey([]byte(shardAddress))
 		if err != nil {
-			e.logger.Error("could not obtain metadata for path", zap.Error(err))
+			c.logger.Error("could not obtain metadata for path", zap.Error(err))
 			return nil
 		}
 		for _, metadata := range metadata {
@@ -465,14 +533,14 @@ func (e *GlobalConsensusEngine) getShardCoverageMap() map[string]*ShardCoverage 
 	return coverageMap
 }
 
-func (e *GlobalConsensusEngine) getShardCoverage(shardAddress []byte) (
+func (c *CoverageMonitor) getShardCoverage(shardAddress []byte) (
 	*ShardCoverage,
 	bool,
 ) {
 	// Query prover registry for specific shard coverage
-	proverCount, err := e.proverRegistry.GetProverCount(shardAddress)
+	proverCount, err := c.proverRegistry.GetProverCount(shardAddress)
 	if err != nil {
-		e.logger.Debug(
+		c.logger.Debug(
 			"failed to get prover count for shard",
 			zap.String("shard_address", hex.EncodeToString(shardAddress)),
 			zap.Error(err),
@@ -486,9 +554,9 @@ func (e *GlobalConsensusEngine) getShardCoverage(shardAddress []byte) (
 	}
 
 	// Get active provers for this shard to calculate storage
-	activeProvers, err := e.proverRegistry.GetActiveProvers(shardAddress)
+	activeProvers, err := c.proverRegistry.GetActiveProvers(shardAddress)
 	if err != nil {
-		e.logger.Warn(
+		c.logger.Warn(
 			"failed to get active provers for shard",
 			zap.String("shard_address", hex.EncodeToString(shardAddress)),
 			zap.Error(err),
@@ -505,9 +573,9 @@ func (e *GlobalConsensusEngine) getShardCoverage(shardAddress []byte) (
 	// Get tree metadata from hypergraph
 	var treeMetadata []typesconsensus.TreeMetadata
 
-	metadata, err := e.hypergraph.GetMetadataAtKey(shardAddress)
+	metadata, err := c.hypergraph.GetMetadataAtKey(shardAddress)
 	if err != nil {
-		e.logger.Error("could not obtain metadata for path", zap.Error(err))
+		c.logger.Error("could not obtain metadata for path", zap.Error(err))
 		return nil, false
 	}
 	for _, metadata := range metadata {
@@ -527,14 +595,14 @@ func (e *GlobalConsensusEngine) getShardCoverage(shardAddress []byte) (
 	return coverage, true
 }
 
-func (e *GlobalConsensusEngine) findSiblingShards(
+func (c *CoverageMonitor) findSiblingShards(
 	appPrefix, shardAddress []byte,
 ) [][]byte {
 	// Find shards with same app prefix but different suffixes
 	var siblings [][]byte
 
 	// Get all active shards from coverage map
-	coverageMap := e.getShardCoverageMap()
+	coverageMap := c.getShardCoverageMap()
 
 	for shardKey := range coverageMap {
 		shardBytes := []byte(shardKey)
@@ -550,7 +618,7 @@ func (e *GlobalConsensusEngine) findSiblingShards(
 		}
 	}
 
-	e.logger.Debug(
+	c.logger.Debug(
 		"found sibling shards",
 		zap.String("app_prefix", hex.EncodeToString(appPrefix)),
 		zap.Int("sibling_count", len(siblings)),
@@ -559,13 +627,13 @@ func (e *GlobalConsensusEngine) findSiblingShards(
 	return siblings
 }
 
-func (e *GlobalConsensusEngine) calculateRequiredStorage(
+func (c *CoverageMonitor) calculateRequiredStorage(
 	shards [][]byte,
 ) uint64 {
 	// Calculate total storage needed for these shards
 	totalStorage := uint64(0)
 	for _, shard := range shards {
-		coverage, exists := e.getShardCoverage(shard)
+		coverage, exists := c.getShardCoverage(shard)
 		if exists && len(coverage.TreeMetadata) > 0 {
 			totalStorage += coverage.TreeMetadata[0].TotalSize
 		}
@@ -574,7 +642,7 @@ func (e *GlobalConsensusEngine) calculateRequiredStorage(
 	return totalStorage
 }
 
-func (e *GlobalConsensusEngine) calculateAvailableAddressSpace(
+func (c *CoverageMonitor) calculateAvailableAddressSpace(
 	shardAddress []byte,
 ) int {
 	// Calculate how many more bytes can be added to address for splitting
@@ -584,12 +652,12 @@ func (e *GlobalConsensusEngine) calculateAvailableAddressSpace(
 	return 64 - len(shardAddress)
 }
 
-func (e *GlobalConsensusEngine) proposeShardSplit(
+func (c *CoverageMonitor) proposeShardSplit(
 	shardAddress []byte,
 	proverCount int,
 ) [][]byte {
 	// Propose how to split the shard address space
-	availableSpace := e.calculateAvailableAddressSpace(shardAddress)
+	availableSpace := c.calculateAvailableAddressSpace(shardAddress)
 	if availableSpace == 0 {
 		return nil
 	}
@@ -626,7 +694,7 @@ func (e *GlobalConsensusEngine) proposeShardSplit(
 		}
 	}
 
-	e.logger.Debug(
+	c.logger.Debug(
 		"proposed shard split",
 		zap.String("original_shard", hex.EncodeToString(shardAddress)),
 		zap.Int("split_factor", splitFactor),
@@ -636,17 +704,17 @@ func (e *GlobalConsensusEngine) proposeShardSplit(
 	return proposedShards
 }
 
-func (e *GlobalConsensusEngine) ensureStreakMap(frameNumber uint64) error {
-	if e.lowCoverageStreak != nil {
+func (c *CoverageMonitor) ensureStreakMap(frameNumber uint64) error {
+	if c.lowCoverageStreak != nil {
 		return nil
 	}
 
-	e.logger.Debug("ensuring streak map")
-	e.lowCoverageStreak = make(map[string]*coverageStreak)
+	c.logger.Debug("ensuring streak map")
+	c.lowCoverageStreak = make(map[string]*coverageStreak)
 
-	info, err := e.proverRegistry.GetAllActiveAppShardProvers()
+	info, err := c.proverRegistry.GetAllActiveAppShardProvers()
 	if err != nil {
-		e.logger.Error(
+		c.logger.Error(
 			"could not retrieve active app shard provers",
 			zap.Error(err),
 		)
@@ -675,11 +743,27 @@ func (e *GlobalConsensusEngine) ensureStreakMap(frameNumber uint64) error {
 	}
 
 	for shardKey, coverage := range effectiveCoverage {
-		if coverage <= int(haltThreshold) {
-			e.lowCoverageStreak[shardKey] = &coverageStreak{
+		staleness := uint64(0)
+		if frameNumber > lastFrame[shardKey] {
+			staleness = frameNumber - lastFrame[shardKey]
+		}
+		if coverage <= int(c.haltThreshold) {
+			// Currently halted — record the full staleness as the streak
+			c.lowCoverageStreak[shardKey] = &coverageStreak{
 				StartFrame: lastFrame[shardKey],
 				LastFrame:  frameNumber,
-				Count:      frameNumber - lastFrame[shardKey],
+				Count:      staleness,
+			}
+		} else if staleness > 1 {
+			// Shard has recovered but all provers are still stale from a
+			// prior halt. Record the gap so eviction subtracts it. Without
+			// this, a reboot after halt recovery would lose the in-memory
+			// streak data and immediately evict everyone. The streak will
+			// be cleared once provers submit and clearStreak runs.
+			c.lowCoverageStreak[shardKey] = &coverageStreak{
+				StartFrame: lastFrame[shardKey],
+				LastFrame:  frameNumber,
+				Count:      staleness,
 			}
 		}
 	}
@@ -687,19 +771,22 @@ func (e *GlobalConsensusEngine) ensureStreakMap(frameNumber uint64) error {
 	return nil
 }
 
-func (e *GlobalConsensusEngine) bumpStreak(
+func (c *CoverageMonitor) bumpStreak(
 	shardKey string,
 	frame uint64,
 ) (*coverageStreak, error) {
-	err := e.ensureStreakMap(frame)
+	c.lowCoverageStreakMu.Lock()
+	defer c.lowCoverageStreakMu.Unlock()
+
+	err := c.ensureStreakMap(frame)
 	if err != nil {
 		return nil, errors.Wrap(err, "bump streak")
 	}
 
-	s := e.lowCoverageStreak[shardKey]
+	s := c.lowCoverageStreak[shardKey]
 	if s == nil {
 		s = &coverageStreak{StartFrame: frame, LastFrame: frame, Count: 1}
-		e.lowCoverageStreak[shardKey] = s
+		c.lowCoverageStreak[shardKey] = s
 		return s, nil
 	}
 
@@ -712,8 +799,318 @@ func (e *GlobalConsensusEngine) bumpStreak(
 	return s, nil
 }
 
-func (e *GlobalConsensusEngine) clearStreak(shardKey string) {
-	if e.lowCoverageStreak != nil {
-		delete(e.lowCoverageStreak, shardKey)
+func (c *CoverageMonitor) clearStreak(shardKey string) {
+	c.lowCoverageStreakMu.Lock()
+	defer c.lowCoverageStreakMu.Unlock()
+
+	if c.lowCoverageStreak != nil {
+		delete(c.lowCoverageStreak, shardKey)
 	}
+}
+
+// computeShardHaltDurations returns a map from shard filter to the number of
+// frames the shard has been in a halt state. Shards currently at or below
+// haltThreshold get math.MaxUint64 so eviction is fully suppressed. Shards
+// that recently recovered but still have a coverage streak get the streak
+// count so that the halt period is subtracted from the inactivity window.
+func (c *CoverageMonitor) computeShardHaltDurations(
+	frameNumber uint64,
+) map[string]uint64 {
+	c.ensureCoverageThresholds()
+
+	durations := make(map[string]uint64)
+
+	// Ensure the streak map is initialized (reconstructs halt data from
+	// prover LastActiveFrameNumber on first call after a restart).
+	// Return nil if initialization fails — caller skips eviction.
+	c.lowCoverageStreakMu.Lock()
+	if err := c.ensureStreakMap(frameNumber); err != nil {
+		c.lowCoverageStreakMu.Unlock()
+		c.logger.Error("failed to ensure streak map for eviction",
+			zap.Error(err),
+		)
+		return nil
+	}
+
+	// Snapshot the streak counts.
+	for shardKey, streak := range c.lowCoverageStreak {
+		if streak != nil && streak.Count > 0 {
+			durations[shardKey] = streak.Count
+		}
+	}
+	c.lowCoverageStreakMu.Unlock()
+
+	// Shards currently at or below haltThreshold are fully exempt even if
+	// they don't have a streak entry yet (e.g. first frame of low coverage).
+	summaries, err := c.proverRegistry.GetProverShardSummaries()
+	if err != nil {
+		c.logger.Error("failed to get shard summaries for eviction exemption",
+			zap.Error(err),
+		)
+		return durations
+	}
+	for _, s := range summaries {
+		activeCount := s.StatusCounts[typesconsensus.ProverStatusActive]
+		if uint64(activeCount) <= c.haltThreshold {
+			durations[string(s.Filter)] = math.MaxUint64
+		}
+	}
+
+	return durations
+}
+
+func (c *CoverageMonitor) emitCoverageEvent(
+	eventType typesconsensus.ControlEventType,
+	data *typesconsensus.CoverageEventData,
+) {
+	event := typesconsensus.ControlEvent{
+		Type: eventType,
+		Data: data,
+	}
+
+	go c.eventDistributor.Publish(event)
+
+	c.logger.Info(
+		"emitted coverage event",
+		zap.String("type", fmt.Sprintf("%d", eventType)),
+		zap.String("shard_address", hex.EncodeToString(data.ShardAddress)),
+		zap.Int("prover_count", data.ProverCount),
+		zap.String("message", data.Message),
+	)
+}
+
+func (c *CoverageMonitor) emitBulkMergeEvent(
+	mergeGroups []typesconsensus.ShardMergeEventData,
+	frameProver []byte,
+) {
+	if len(mergeGroups) == 0 {
+		return
+	}
+
+	// Combine all merge groups into a single bulk event
+	data := &typesconsensus.BulkShardMergeEventData{
+		MergeGroups: mergeGroups,
+		FrameProver: frameProver,
+	}
+
+	event := typesconsensus.ControlEvent{
+		Type: typesconsensus.ControlEventShardMergeEligible,
+		Data: data,
+	}
+
+	go c.eventDistributor.Publish(event)
+
+	totalShards := 0
+	totalProvers := 0
+	for _, group := range mergeGroups {
+		totalShards += len(group.ShardAddresses)
+		totalProvers += group.TotalProvers
+	}
+
+	c.logger.Info(
+		"emitted bulk merge eligible event",
+		zap.Int("merge_groups", len(mergeGroups)),
+		zap.Int("total_shards", totalShards),
+		zap.Int("total_provers", totalProvers),
+	)
+}
+
+func (c *CoverageMonitor) emitSplitEvent(
+	data *typesconsensus.ShardSplitEventData,
+) {
+	event := typesconsensus.ControlEvent{
+		Type: typesconsensus.ControlEventShardSplitEligible,
+		Data: data,
+	}
+
+	go c.eventDistributor.Publish(event)
+
+	c.logger.Info(
+		"emitted split eligible event",
+		zap.String("shard_address", hex.EncodeToString(data.ShardAddress)),
+		zap.Int("proposed_shard_count", len(data.ProposedShards)),
+		zap.Int("prover_count", data.ProverCount),
+		zap.Uint64("attested_storage", data.AttestedStorage),
+	)
+}
+
+func (c *CoverageMonitor) emitAlertEvent(alertMessage string) {
+	event := typesconsensus.ControlEvent{
+		Type: typesconsensus.ControlEventHalt,
+		Data: &typesconsensus.ErrorEventData{
+			Error: errors.New(alertMessage),
+		},
+	}
+
+	go c.eventDistributor.Publish(event)
+
+	c.logger.Info("emitted alert message")
+}
+
+const shardActionCooldownFrames = 360
+
+func (c *CoverageMonitor) handleShardSplitEvent(
+	data *typesconsensus.ShardSplitEventData,
+) {
+	// Only the prover who produced the triggering frame should emit
+	if !bytes.Equal(data.FrameProver, c.getProverAddress()) {
+		return
+	}
+
+	frameNumber := c.getLastObservedFrame()
+	if frameNumber == 0 {
+		return
+	}
+
+	addrKey := string(data.ShardAddress)
+	c.lastShardActionFrameMu.Lock()
+	if last, ok := c.lastShardActionFrame[addrKey]; ok &&
+		frameNumber-last < shardActionCooldownFrames {
+		c.lastShardActionFrameMu.Unlock()
+		c.logger.Debug(
+			"skipping shard split, cooldown active",
+			zap.String("shard_address", hex.EncodeToString(data.ShardAddress)),
+			zap.Uint64("last_action_frame", last),
+			zap.Uint64("current_frame", frameNumber),
+		)
+		return
+	}
+	c.lastShardActionFrame[addrKey] = frameNumber
+	c.lastShardActionFrameMu.Unlock()
+
+	op := globalintrinsics.NewShardSplitOp(
+		data.ShardAddress,
+		data.ProposedShards,
+		c.keyManager,
+		c.shardsStore,
+		c.proverRegistry,
+	)
+
+	if err := op.Prove(frameNumber); err != nil {
+		c.logger.Error(
+			"failed to prove shard split",
+			zap.Error(err),
+		)
+		return
+	}
+
+	splitBytes, err := op.ToRequestBytes()
+	if err != nil {
+		c.logger.Error(
+			"failed to serialize shard split",
+			zap.Error(err),
+		)
+		return
+	}
+
+	if err := c.publishProverMessage(splitBytes); err != nil {
+		c.logger.Error("failed to publish shard split", zap.Error(err))
+	} else {
+		c.logger.Info(
+			"published shard split",
+			zap.String("shard_address", hex.EncodeToString(data.ShardAddress)),
+			zap.Int("proposed_shards", len(data.ProposedShards)),
+			zap.Uint64("frame_number", frameNumber),
+		)
+	}
+}
+
+func (c *CoverageMonitor) handleShardMergeEvent(
+	data *typesconsensus.BulkShardMergeEventData,
+) {
+	// Only the prover who produced the triggering frame should emit
+	if !bytes.Equal(data.FrameProver, c.getProverAddress()) {
+		return
+	}
+
+	frameNumber := c.getLastObservedFrame()
+	if frameNumber == 0 {
+		return
+	}
+
+	for _, group := range data.MergeGroups {
+		if len(group.ShardAddresses) < 2 {
+			continue
+		}
+
+		// Use first shard's first 32 bytes as parent address
+		parentAddress := group.ShardAddresses[0][:32]
+
+		// Check cooldown for the parent address
+		parentKey := string(parentAddress)
+		c.lastShardActionFrameMu.Lock()
+		if last, ok := c.lastShardActionFrame[parentKey]; ok &&
+			frameNumber-last < shardActionCooldownFrames {
+			c.lastShardActionFrameMu.Unlock()
+			c.logger.Debug(
+				"skipping shard merge, cooldown active",
+				zap.String("parent_address", hex.EncodeToString(parentAddress)),
+				zap.Uint64("last_action_frame", last),
+				zap.Uint64("current_frame", frameNumber),
+			)
+			continue
+		}
+		c.lastShardActionFrame[parentKey] = frameNumber
+		c.lastShardActionFrameMu.Unlock()
+
+		op := globalintrinsics.NewShardMergeOp(
+			group.ShardAddresses,
+			parentAddress,
+			c.keyManager,
+			c.shardsStore,
+			c.proverRegistry,
+		)
+
+		if err := op.Prove(frameNumber); err != nil {
+			c.logger.Error(
+				"failed to prove shard merge",
+				zap.Error(err),
+			)
+			continue
+		}
+
+		mergeBytes, err := op.ToRequestBytes()
+		if err != nil {
+			c.logger.Error(
+				"failed to serialize shard merge",
+				zap.Error(err),
+			)
+			continue
+		}
+
+		if err := c.publishProverMessage(mergeBytes); err != nil {
+			c.logger.Error("failed to publish shard merge", zap.Error(err))
+		} else {
+			c.logger.Info(
+				"published shard merge",
+				zap.String("parent_address", hex.EncodeToString(parentAddress)),
+				zap.Int("shard_count", len(group.ShardAddresses)),
+				zap.Uint64("frame_number", frameNumber),
+			)
+		}
+	}
+}
+
+// isAddressBlacklisted checks whether the given address is blacklisted.
+func (c *CoverageMonitor) isAddressBlacklisted(address []byte) bool {
+	c.blacklistMu.RLock()
+	defer c.blacklistMu.RUnlock()
+
+	// Check for exact match first
+	if c.blacklistMap[string(address)] {
+		return true
+	}
+
+	// Check for prefix matches (for partial blacklist entries)
+	for blacklistedAddress := range c.blacklistMap {
+		// If the blacklisted address is shorter than the full address,
+		// it's a prefix and we check if the address starts with it
+		if len(blacklistedAddress) < len(address) {
+			if strings.HasPrefix(string(address), blacklistedAddress) {
+				return true
+			}
+		}
+	}
+
+	return false
 }

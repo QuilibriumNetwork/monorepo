@@ -143,6 +143,17 @@ func (p *AppLeaderProvider) ProveNextState(
 		)
 	}
 
+	// Materialize prior frame's transactions before proving N+1.
+	// Without this, the state that N+1 is built on is one frame stale
+	// because HotStuff's two-chain commit rule hasn't materialized N yet.
+	if err := p.engine.materialize(nil, prior); err != nil {
+		p.engine.logger.Warn(
+			"failed to materialize prior frame in ProveNextState",
+			zap.Uint64("frame_number", prior.Header.FrameNumber),
+			zap.Error(err),
+		)
+	}
+
 	timer := prometheus.NewTimer(frameProvingDuration.WithLabelValues(
 		p.engine.appAddressHex,
 	))

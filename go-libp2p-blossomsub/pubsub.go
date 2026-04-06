@@ -143,6 +143,12 @@ type PubSub struct {
 	// bitmasks tracks which bitmasks each of our peers are subscribed to
 	bitmasks map[string]map[peer.ID]struct{}
 
+	// compositeSlices maps each per-slice bitmask key to the set of original multi-bit
+	// bitmasks that include this slice. Multiple composite bitmasks can share bit-slices,
+	// so each slice maps to a list of originals. Used to trigger
+	// CompositeRouter.JoinComposite/LeaveComposite.
+	compositeSlices map[string][][]byte
+
 	// sendMsg handles messages that have been validated
 	sendMsg chan *Message
 
@@ -233,6 +239,14 @@ type PubSubRouter interface {
 	Leave(bitmask []byte)
 }
 
+// CompositeRouter is an optional interface that routers can implement to support
+// composite mesh management. A composite mesh maintains D peers per full (unspliced)
+// multi-bit bitmask instead of D peers per individual bit-slice.
+type CompositeRouter interface {
+	JoinComposite(bitmask []byte)
+	LeaveComposite(bitmask []byte)
+}
+
 type AcceptStatus int
 
 const (
@@ -305,6 +319,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		mySubs:                make(map[string]map[*Subscription]struct{}),
 		myRelays:              make(map[string]int),
 		bitmasks:              make(map[string]map[peer.ID]struct{}),
+		compositeSlices:       make(map[string][][]byte),
 		peers:                 make(map[peer.ID]*rpcQueue),
 		inboundStreams:        make(map[peer.ID]network.Stream),
 		blacklist:             NewMapBlacklist(),
@@ -894,6 +909,7 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 
 		// stop announcing only if there are no more subs and relays
 		if p.myRelays[string(sub.bitmask)] == 0 {
+			p.tryLeaveComposite(sub.bitmask)
 			p.disc.StopAdvertise(sub.bitmask)
 			p.announce(sub.bitmask, false)
 			p.rt.Leave(sub.bitmask)
@@ -914,6 +930,7 @@ func (p *PubSub) handleAddSubscription(req *addSubReq) {
 		p.disc.Advertise(sub.bitmask)
 		p.announce(sub.bitmask, true)
 		p.rt.Join(sub.bitmask)
+		p.tryJoinComposite(sub.bitmask)
 	}
 
 	// make new if not there
@@ -942,6 +959,7 @@ func (p *PubSub) handleAddRelay(req *addRelayReq) {
 		p.disc.Advertise(bitmask)
 		p.announce(bitmask, true)
 		p.rt.Join(bitmask)
+		p.tryJoinComposite(bitmask)
 	}
 
 	// flag used to prevent calling cancel function multiple times
@@ -979,10 +997,100 @@ func (p *PubSub) handleRemoveRelay(bitmask []byte) {
 
 		// stop announcing only if there are no more relays and subs
 		if len(p.mySubs[string(bitmask)]) == 0 {
+			p.tryLeaveComposite(bitmask)
 			p.disc.StopAdvertise(bitmask)
 			p.announce(bitmask, false)
 			p.rt.Leave(bitmask)
 		}
+	}
+}
+
+// tryJoinComposite checks if the given slice bitmask belongs to one or more composites
+// and, for each composite whose sibling slices all have subscriptions or relays, calls
+// CompositeRouter.JoinComposite.
+// Only called from processLoop.
+func (p *PubSub) tryJoinComposite(slice []byte) {
+	cr, ok := p.rt.(CompositeRouter)
+	if !ok {
+		return
+	}
+	origBitmasks, ok := p.compositeSlices[string(slice)]
+	if !ok {
+		return
+	}
+	for _, origBitmask := range origBitmasks {
+		// Check if all sibling slices now have subs or relays
+		allReady := true
+		for _, sibling := range SliceBitmask(origBitmask) {
+			sk := string(sibling)
+			if len(p.mySubs[sk]) == 0 && p.myRelays[sk] == 0 {
+				allReady = false
+				break
+			}
+		}
+		if allReady {
+			cr.JoinComposite(origBitmask)
+		}
+	}
+}
+
+// tryLeaveComposite checks if the given slice bitmask belongs to one or more composites
+// and calls CompositeRouter.LeaveComposite for each. Called when a slice is about to be
+// left (last sub/relay removed). Also cleans up compositeSlices entries for composites
+// whose sibling slices are all being left.
+// Only called from processLoop.
+func (p *PubSub) tryLeaveComposite(slice []byte) {
+	cr, ok := p.rt.(CompositeRouter)
+	if !ok {
+		return
+	}
+	sk := string(slice)
+	origBitmasks, ok := p.compositeSlices[sk]
+	if !ok {
+		return
+	}
+
+	// Work on a copy since we may mutate compositeSlices during iteration
+	origCopy := make([][]byte, len(origBitmasks))
+	copy(origCopy, origBitmasks)
+
+	for _, origBitmask := range origCopy {
+		cr.LeaveComposite(origBitmask)
+
+		// Clean up compositeSlices for this specific composite:
+		// remove origBitmask from every sibling slice's list
+		allLeaving := true
+		for _, sibling := range SliceBitmask(origBitmask) {
+			sibKey := string(sibling)
+			if sibKey == sk {
+				continue // this one is being left now
+			}
+			if len(p.mySubs[sibKey]) > 0 || p.myRelays[sibKey] > 0 {
+				allLeaving = false
+				break
+			}
+		}
+		if allLeaving {
+			for _, sibling := range SliceBitmask(origBitmask) {
+				sibKey := string(sibling)
+				p.removeCompositeSliceEntry(sibKey, origBitmask)
+			}
+		}
+	}
+}
+
+// removeCompositeSliceEntry removes a specific origBitmask from the compositeSlices
+// list for the given slice key. If the list becomes empty, deletes the key.
+func (p *PubSub) removeCompositeSliceEntry(sliceKey string, origBitmask []byte) {
+	entries := p.compositeSlices[sliceKey]
+	for i, entry := range entries {
+		if bytes.Equal(entry, origBitmask) {
+			p.compositeSlices[sliceKey] = append(entries[:i], entries[i+1:]...)
+			break
+		}
+	}
+	if len(p.compositeSlices[sliceKey]) == 0 {
+		delete(p.compositeSlices, sliceKey)
 	}
 }
 
@@ -1365,6 +1473,29 @@ func (p *PubSub) tryJoin(bitmask []byte, opts ...BitmaskOpt) ([]*Bitmask, []bool
 	}
 
 	sliced := SliceBitmask(bitmask)
+
+	// Register composite slice mapping for multi-bit bitmasks so that
+	// handleAddSubscription can trigger CompositeRouter.JoinComposite
+	// when all slices have been subscribed.
+	if len(sliced) > 1 {
+		bitmaskCopy := make([]byte, len(bitmask))
+		copy(bitmaskCopy, bitmask)
+		done := make(chan struct{})
+		select {
+		case p.eval <- func() {
+			for _, slice := range sliced {
+				sk := string(slice)
+				// Append — multiple composite bitmasks can share the same slice
+				p.compositeSlices[sk] = append(p.compositeSlices[sk], bitmaskCopy)
+			}
+			close(done)
+		}:
+		case <-p.ctx.Done():
+			return nil, nil, []error{p.ctx.Err()}
+		}
+		<-done
+	}
+
 	var bitmasks []*Bitmask
 	var newBitmasks []bool
 	var errors []error

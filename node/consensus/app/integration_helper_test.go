@@ -609,6 +609,13 @@ func (m *mockGlobalClientLocks) GetLockedAddresses(ctx context.Context, in *prot
 	return out, nil
 }
 
+func (m *mockGlobalClientLocks) StreamGlobalMessages(ctx context.Context, in *protobufs.StreamGlobalMessagesRequest, opts ...grpc.CallOption) (protobufs.GlobalService_StreamGlobalMessagesClient, error) {
+	return nil, nil
+}
+func (m *mockGlobalClientLocks) SubmitGlobalMessage(ctx context.Context, in *protobufs.SubmitGlobalMessageRequest, opts ...grpc.CallOption) (*protobufs.SubmitGlobalMessageResponse, error) {
+	return nil, nil
+}
+
 func createValidPendingTxPayload(t *testing.T, hgs []thypergraph.Hypergraph, km *keys.InMemoryKeyManager, prefix byte) *token.PendingTransaction {
 	// set this value so we skip cutover checks
 	token.BEHAVIOR_PASS = true

@@ -14,135 +14,26 @@ import (
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/models"
 	"source.quilibrium.com/quilibrium/monorepo/consensus/verification"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/lifecycle"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
 var keyRegistryDomain = []byte("KEY_REGISTRY")
-
-func (e *GlobalConsensusEngine) processGlobalConsensusMessageQueue(
-	ctx lifecycle.SignalerContext,
-) {
-	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-		<-ctx.Done()
-		return
-	}
-
-	for {
-		select {
-		case <-e.haltCtx.Done():
-			return
-		case <-ctx.Done():
-			return
-		case message := <-e.globalConsensusMessageQueue:
-			e.handleGlobalConsensusMessage(message)
-		case appmsg := <-e.appFramesMessageQueue:
-			e.handleAppFrameMessage(appmsg)
-		}
-	}
-}
-
-func (e *GlobalConsensusEngine) processShardConsensusMessageQueue(
-	ctx lifecycle.SignalerContext,
-) {
-	for {
-		select {
-		case <-e.haltCtx.Done():
-			return
-		case <-ctx.Done():
-			return
-		case message := <-e.shardConsensusMessageQueue:
-			e.handleShardConsensusMessage(message)
-		}
-	}
-}
-
-func (e *GlobalConsensusEngine) processProverMessageQueue(
-	ctx lifecycle.SignalerContext,
-) {
-	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-		e.logger.Debug("prover message queue processor disabled (not archive mode)")
-		return
-	}
-
-	e.logger.Info("prover message queue processor started")
-
-	for {
-		select {
-		case <-e.haltCtx.Done():
-			return
-		case <-ctx.Done():
-			return
-		case message := <-e.globalProverMessageQueue:
-			e.handleProverMessage(message)
-		}
-	}
-}
-
-func (e *GlobalConsensusEngine) processFrameMessageQueue(
-	ctx lifecycle.SignalerContext,
-) {
-	for {
-		select {
-		case <-e.haltCtx.Done():
-			return
-		case <-ctx.Done():
-			return
-		case message := <-e.globalFrameMessageQueue:
-			e.handleFrameMessage(ctx, message)
-		}
-	}
-}
-
-func (e *GlobalConsensusEngine) processPeerInfoMessageQueue(
-	ctx lifecycle.SignalerContext,
-) {
-	for {
-		select {
-		case <-e.haltCtx.Done():
-			return
-		case <-ctx.Done():
-			return
-		case message := <-e.globalPeerInfoMessageQueue:
-			e.handlePeerInfoMessage(message)
-		}
-	}
-}
-
-func (e *GlobalConsensusEngine) processAlertMessageQueue(
-	ctx lifecycle.SignalerContext,
-) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case message := <-e.globalAlertMessageQueue:
-			e.handleAlertMessage(message)
-		}
-	}
-}
-
-func (e *GlobalConsensusEngine) processGlobalProposalQueue(
-	ctx lifecycle.SignalerContext,
-) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case proposal := <-e.globalProposalQueue:
-			e.handleGlobalProposal(proposal)
-		}
-	}
-}
 
 func (e *GlobalConsensusEngine) handleGlobalConsensusMessage(
 	message *pb.Message,
@@ -225,12 +116,17 @@ func (e *GlobalConsensusEngine) handleProverMessage(message *pb.Message) {
 
 	switch typePrefix {
 	case protobufs.MessageBundleType:
-		e.addGlobalMessage(message.Data)
-
-		e.logger.Debug(
-			"collected global request for execution",
-			zap.Uint32("type", typePrefix),
-		)
+		if err := e.addGlobalMessage(message.Data); err != nil {
+			e.logger.Warn(
+				"prover message rejected by collector",
+				zap.Error(err),
+			)
+		} else {
+			e.logger.Debug(
+				"collected global request for execution",
+				zap.Uint32("type", typePrefix),
+			)
+		}
 
 	default:
 		e.logger.Debug(
@@ -268,49 +164,61 @@ func (e *GlobalConsensusEngine) handleFrameMessage(
 			return
 		}
 
-		valid, err := e.frameValidator.Validate(frame)
-		if err != nil {
-			e.logger.Debug("global frame validation error", zap.Error(err))
-			framesProcessedTotal.WithLabelValues("error").Inc()
-			return
-		}
-
-		if !valid {
-			framesProcessedTotal.WithLabelValues("error").Inc()
-			e.logger.Debug("invalid global frame")
-			return
-		}
-
-		if frame.Header != nil {
-			e.recordFrameMessageFrameNumber(frame.Header.FrameNumber)
-		}
-
-		frameIDBI, _ := poseidon.HashBytes(frame.Header.Output)
-		frameID := frameIDBI.FillBytes(make([]byte, 32))
-		e.frameStoreMu.Lock()
-		e.frameStore[string(frameID)] = frame
-		clone := frame.Clone().(*protobufs.GlobalFrame)
-		e.frameStoreMu.Unlock()
-
-		if err := e.globalTimeReel.Insert(clone); err != nil {
-			// Success metric recorded at the end of processing
-			framesProcessedTotal.WithLabelValues("error").Inc()
-			return
-		}
-
-		frame, err = e.globalTimeReel.GetHead()
-		if err == nil && frame != nil {
-			e.currentRank = frame.GetRank()
-		}
-
-		// Success metric recorded at the end of processing
-		framesProcessedTotal.WithLabelValues("success").Inc()
+		e.processGlobalFrame(frame)
 	default:
 		e.logger.Debug(
 			"unknown message type",
 			zap.Uint32("type", typePrefix),
 		)
 	}
+}
+
+// processGlobalFrame is the core frame-processing pipeline shared by both
+// the pubsub path (handleFrameMessage) and the archive polling path
+// (pollFramesFromArchive).
+func (e *GlobalConsensusEngine) processGlobalFrame(frame *protobufs.GlobalFrame) {
+	valid, err := e.frameValidator.Validate(frame)
+	if err != nil {
+		e.logger.Debug("global frame validation error", zap.Error(err))
+		framesProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	if !valid {
+		framesProcessedTotal.WithLabelValues("error").Inc()
+		e.logger.Debug("invalid global frame")
+		return
+	}
+
+	if frame.Header != nil {
+		e.recordFrameMessageFrameNumber(frame.Header.FrameNumber)
+	}
+
+	frameIDBI, _ := poseidon.HashBytes(frame.Header.Output)
+	frameID := frameIDBI.FillBytes(make([]byte, 32))
+	e.frameStoreMu.Lock()
+	e.frameStore[string(frameID)] = frame
+	clone := frame.Clone().(*protobufs.GlobalFrame)
+	e.frameStoreMu.Unlock()
+
+	if err := e.globalTimeReel.Insert(clone); err != nil {
+		framesProcessedTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Broadcast to workers AFTER the time reel insert (which triggers
+	// materialize). This ensures the master's snapshot reflects the correct
+	// tree state before workers try to verify the prover root and sync.
+	if frameBytes, err := frame.ToCanonicalBytes(); err == nil {
+		e.broadcastGlobalMessage(frameBytes, GLOBAL_FRAME_BITMASK)
+	}
+
+	head, err := e.globalTimeReel.GetHead()
+	if err == nil && head != nil {
+		e.consensusProtocol.currentRank = head.GetRank()
+	}
+
+	framesProcessedTotal.WithLabelValues("success").Inc()
 }
 
 func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
@@ -325,7 +233,7 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 	}()
 
 	// we're already getting this from consensus
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
+	if e.isConsensusParticipant() {
 		return
 	}
 
@@ -342,14 +250,14 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 			return
 		}
 
-		e.frameStoreMu.RLock()
+		e.appFrameStoreMu.RLock()
 		existing, ok := e.appFrameStore[string(frame.Header.Address)]
 		if ok && existing != nil &&
 			existing.Header.FrameNumber >= frame.Header.FrameNumber {
-			e.frameStoreMu.RUnlock()
+			e.appFrameStoreMu.RUnlock()
 			return
 		}
-		e.frameStoreMu.RUnlock()
+		e.appFrameStoreMu.RUnlock()
 
 		valid, err := e.appFrameValidator.Validate(frame)
 		if !valid || err != nil {
@@ -374,9 +282,17 @@ func (e *GlobalConsensusEngine) handleAppFrameMessage(message *pb.Message) {
 			return
 		}
 
-		e.addGlobalMessage(bundleBytes)
-		e.frameStoreMu.Lock()
-		defer e.frameStoreMu.Unlock()
+		if err := e.addGlobalMessage(bundleBytes); err != nil {
+			e.logger.Warn("shard frame rejected by collector", zap.Error(err))
+		}
+		if err := e.publishProverMessage(bundleBytes); err != nil {
+			e.logger.Warn(
+				"failed to forward shard frame to archive",
+				zap.Error(err),
+			)
+		}
+		e.appFrameStoreMu.Lock()
+		defer e.appFrameStoreMu.Unlock()
 		e.appFrameStore[string(frame.Header.Address)] = frame
 		shardFramesProcessedTotal.WithLabelValues("success").Inc()
 	default:
@@ -423,6 +339,9 @@ func (e *GlobalConsensusEngine) handlePeerInfoMessage(message *pb.Message) {
 
 		// Also add to the existing peer info manager
 		e.peerInfoManager.AddPeerInfo(peerInfo)
+
+		// Try to discover an archive endpoint from the peer's capabilities
+		e.tryDiscoverArchiveEndpoint(peerInfo)
 	case protobufs.KeyRegistryType:
 		keyRegistry := &protobufs.KeyRegistry{}
 		if err := keyRegistry.FromCanonicalBytes(message.Data); err != nil {
@@ -909,7 +828,7 @@ func (e *GlobalConsensusEngine) handleAlertMessage(message *pb.Message) {
 			return
 		}
 
-		e.emitAlertEvent(alert.Message)
+		e.coverageMonitor.emitAlertEvent(alert.Message)
 
 	default:
 		e.logger.Debug(
@@ -979,7 +898,7 @@ func (e *GlobalConsensusEngine) handleGlobalProposal(
 		signedProposal.PreviousRankTimeoutCertificate = prtc
 	}
 
-	finalized := e.forks.FinalizedState()
+	finalized := e.consensusProtocol.forks.FinalizedState()
 	finalizedRank := finalized.Rank
 	finalizedFrameNumber := (*finalized.State).Header.FrameNumber
 	frameNumber := proposal.State.Header.FrameNumber
@@ -1047,9 +966,9 @@ func (e *GlobalConsensusEngine) handleGlobalProposal(
 				}
 			}
 
-			head := e.forks.FinalizedState()
+			head := e.consensusProtocol.forks.FinalizedState()
 
-			e.syncProvider.AddState(
+			e.consensusProtocol.syncProvider.AddState(
 				[]byte(peerID),
 				(*head.State).Header.FrameNumber,
 				[]byte(head.Identifier),
@@ -1186,7 +1105,7 @@ func (e *GlobalConsensusEngine) processProposalInternal(
 		return false
 	}
 
-	err = e.VerifyQuorumCertificate(proposal.ParentQuorumCertificate)
+	err = e.consensusProtocol.VerifyQuorumCertificate(proposal.ParentQuorumCertificate)
 	if err != nil {
 		e.logger.Debug(
 			"proposal has invalid qc",
@@ -1198,7 +1117,7 @@ func (e *GlobalConsensusEngine) processProposalInternal(
 	}
 
 	if proposal.PriorRankTimeoutCertificate != nil {
-		err := e.VerifyTimeoutCertificate(proposal.PriorRankTimeoutCertificate)
+		err := e.consensusProtocol.VerifyTimeoutCertificate(proposal.PriorRankTimeoutCertificate)
 		if err != nil {
 			e.logger.Debug(
 				"proposal has invalid tc",
@@ -1210,7 +1129,7 @@ func (e *GlobalConsensusEngine) processProposalInternal(
 		}
 	}
 
-	err = e.VerifyVote(&proposal.Vote)
+	err = e.consensusProtocol.VerifyVote(&proposal.Vote)
 	if err != nil {
 		e.logger.Debug(
 			"proposal has invalid vote",
@@ -1275,10 +1194,10 @@ func (e *GlobalConsensusEngine) processProposalInternal(
 	// we risk engine shutdown if the leader selection method changed – frame
 	// validation ensures that the proposer is valid for the proposal per time
 	// reel rules.
-	if signedProposal.State.Rank >= e.currentRank {
-		e.voteAggregator.AddState(signedProposal)
+	if signedProposal.State.Rank >= e.consensusProtocol.currentRank {
+		e.consensusProtocol.voteAggregator.AddState(signedProposal)
 	}
-	e.consensusParticipant.SubmitProposal(signedProposal)
+	e.consensusProtocol.consensusParticipant.SubmitProposal(signedProposal)
 
 	e.trySealParentWithChild(proposal)
 	e.registerPendingCertifiedParent(proposal)
@@ -1327,7 +1246,7 @@ func (e *GlobalConsensusEngine) collectMissingAncestors(
 		return nil, nil
 	}
 
-	finalized := e.forks.FinalizedState()
+	finalized := e.consensusProtocol.forks.FinalizedState()
 	if finalized == nil || finalized.State == nil || (*finalized.State).Header == nil {
 		return nil, errors.New("finalized state unavailable")
 	}
@@ -1343,7 +1262,7 @@ func (e *GlobalConsensusEngine) collectMissingAncestors(
 	var ancestors []ancestorDescriptor
 	anchored := false
 	for parentFrame > finalizedFrame && len(parentSelector) > 0 {
-		if _, found := e.forks.GetState(
+		if _, found := e.consensusProtocol.forks.GetState(
 			models.Identity(string(parentSelector)),
 		); found {
 			anchored = true
@@ -1467,7 +1386,7 @@ func (e *GlobalConsensusEngine) requestAncestorSync(
 	if proposal == nil || proposal.State == nil || proposal.State.Header == nil {
 		return
 	}
-	if e.syncProvider == nil {
+	if e.consensusProtocol.syncProvider == nil {
 		return
 	}
 
@@ -1479,12 +1398,12 @@ func (e *GlobalConsensusEngine) requestAncestorSync(
 		}
 	}
 
-	head := e.forks.FinalizedState()
+	head := e.consensusProtocol.forks.FinalizedState()
 	if head == nil || head.State == nil {
 		return
 	}
 
-	e.syncProvider.AddState(
+	e.consensusProtocol.syncProvider.AddState(
 		[]byte(peerID),
 		(*head.State).Header.FrameNumber,
 		[]byte(head.Identifier),
@@ -1495,9 +1414,9 @@ func (e *GlobalConsensusEngine) cacheProposal(
 	proposal *protobufs.GlobalProposal,
 ) {
 	frameNumber := proposal.State.Header.FrameNumber
-	e.proposalCacheMu.Lock()
-	e.proposalCache[frameNumber] = proposal
-	e.proposalCacheMu.Unlock()
+	e.consensusProtocol.proposalCacheMu.Lock()
+	e.consensusProtocol.proposalCache[frameNumber] = proposal
+	e.consensusProtocol.proposalCacheMu.Unlock()
 
 	txn, err := e.clockStore.NewTransaction(false)
 	if err != nil {
@@ -1525,20 +1444,20 @@ func (e *GlobalConsensusEngine) cacheProposal(
 }
 
 func (e *GlobalConsensusEngine) deleteCachedProposal(frameNumber uint64) {
-	e.proposalCacheMu.Lock()
-	delete(e.proposalCache, frameNumber)
-	e.proposalCacheMu.Unlock()
+	e.consensusProtocol.proposalCacheMu.Lock()
+	delete(e.consensusProtocol.proposalCache, frameNumber)
+	e.consensusProtocol.proposalCacheMu.Unlock()
 }
 
 func (e *GlobalConsensusEngine) popCachedProposal(
 	frameNumber uint64,
 ) *protobufs.GlobalProposal {
-	e.proposalCacheMu.Lock()
-	defer e.proposalCacheMu.Unlock()
+	e.consensusProtocol.proposalCacheMu.Lock()
+	defer e.consensusProtocol.proposalCacheMu.Unlock()
 
-	proposal, ok := e.proposalCache[frameNumber]
+	proposal, ok := e.consensusProtocol.proposalCache[frameNumber]
 	if ok {
-		delete(e.proposalCache, frameNumber)
+		delete(e.consensusProtocol.proposalCache, frameNumber)
 	}
 
 	return proposal
@@ -1574,9 +1493,9 @@ func (e *GlobalConsensusEngine) registerPendingCertifiedParent(
 	}
 
 	frameNumber := proposal.State.Header.FrameNumber
-	e.pendingCertifiedParentsMu.Lock()
-	e.pendingCertifiedParents[frameNumber] = proposal
-	e.pendingCertifiedParentsMu.Unlock()
+	e.consensusProtocol.pendingCertifiedParentsMu.Lock()
+	e.consensusProtocol.pendingCertifiedParents[frameNumber] = proposal
+	e.consensusProtocol.pendingCertifiedParentsMu.Unlock()
 }
 
 func (e *GlobalConsensusEngine) trySealParentWithChild(
@@ -1593,9 +1512,9 @@ func (e *GlobalConsensusEngine) trySealParentWithChild(
 
 	parentFrame := header.FrameNumber - 1
 
-	e.pendingCertifiedParentsMu.RLock()
-	parent, ok := e.pendingCertifiedParents[parentFrame]
-	e.pendingCertifiedParentsMu.RUnlock()
+	e.consensusProtocol.pendingCertifiedParentsMu.RLock()
+	parent, ok := e.consensusProtocol.pendingCertifiedParents[parentFrame]
+	e.consensusProtocol.pendingCertifiedParentsMu.RUnlock()
 	if !ok || parent == nil || parent.State == nil || parent.State.Header == nil {
 		return
 	}
@@ -1609,22 +1528,22 @@ func (e *GlobalConsensusEngine) trySealParentWithChild(
 			zap.Uint64("parent_frame", parent.State.Header.FrameNumber),
 			zap.Uint64("child_frame", header.FrameNumber),
 		)
-		e.pendingCertifiedParentsMu.Lock()
-		delete(e.pendingCertifiedParents, parentFrame)
-		e.pendingCertifiedParentsMu.Unlock()
+		e.consensusProtocol.pendingCertifiedParentsMu.Lock()
+		delete(e.consensusProtocol.pendingCertifiedParents, parentFrame)
+		e.consensusProtocol.pendingCertifiedParentsMu.Unlock()
 		return
 	}
 
-	finalized := e.forks.FinalizedState()
+	finalized := e.consensusProtocol.forks.FinalizedState()
 	if finalized != nil && finalized.State != nil &&
 		parentFrame <= (*finalized.State).Header.FrameNumber {
 		e.logger.Debug(
 			"skipping sealing for already finalized parent",
 			zap.Uint64("parent_frame", parentFrame),
 		)
-		e.pendingCertifiedParentsMu.Lock()
-		delete(e.pendingCertifiedParents, parentFrame)
-		e.pendingCertifiedParentsMu.Unlock()
+		e.consensusProtocol.pendingCertifiedParentsMu.Lock()
+		delete(e.consensusProtocol.pendingCertifiedParents, parentFrame)
+		e.consensusProtocol.pendingCertifiedParentsMu.Unlock()
 		return
 	}
 
@@ -1635,9 +1554,9 @@ func (e *GlobalConsensusEngine) trySealParentWithChild(
 	)
 
 	e.addCertifiedState(parent, child)
-	e.pendingCertifiedParentsMu.Lock()
-	delete(e.pendingCertifiedParents, parentFrame)
-	e.pendingCertifiedParentsMu.Unlock()
+	e.consensusProtocol.pendingCertifiedParentsMu.Lock()
+	delete(e.consensusProtocol.pendingCertifiedParents, parentFrame)
+	e.consensusProtocol.pendingCertifiedParentsMu.Unlock()
 }
 
 func (e *GlobalConsensusEngine) addCertifiedState(
@@ -1673,7 +1592,7 @@ func (e *GlobalConsensusEngine) addCertifiedState(
 		return
 	}
 
-	if err := e.materialize(txn, parent.State); err != nil {
+	if err := e.materializer.materialize(txn, parent.State); err != nil {
 		_ = txn.Abort()
 		e.logger.Error("could not materialize frame requests", zap.Error(err))
 		return
@@ -1714,7 +1633,7 @@ func (e *GlobalConsensusEngine) addCertifiedState(
 	}
 
 	// Trigger coverage check asynchronously to avoid blocking message processing
-	e.triggerCoverageCheckAsync(
+	e.coverageMonitor.triggerCoverageCheckAsync(
 		parent.State.GetFrameNumber(),
 		parent.State.Header.Prover,
 	)
@@ -1864,7 +1783,7 @@ func (e *GlobalConsensusEngine) handleVote(message *pb.Message) {
 		return
 	}
 
-	e.voteAggregator.AddVote(&vote)
+	e.consensusProtocol.voteAggregator.AddVote(&vote)
 
 	voteProcessedTotal.WithLabelValues("success").Inc()
 }
@@ -1929,14 +1848,17 @@ func (e *GlobalConsensusEngine) handleTimeoutState(message *pb.Message) {
 		return
 	}
 
-	e.timeoutAggregator.AddTimeout(timeout)
+	e.consensusProtocol.timeoutAggregator.AddTimeout(timeout)
 
 	voteProcessedTotal.WithLabelValues("success").Inc()
 }
 
 func (e *GlobalConsensusEngine) handleMessageBundle(message *pb.Message) {
-	e.addGlobalMessage(message.Data)
-	e.logger.Debug("collected global request for execution")
+	if err := e.addGlobalMessage(message.Data); err != nil {
+		e.logger.Warn("message bundle rejected by collector", zap.Error(err))
+	} else {
+		e.logger.Debug("collected global request for execution")
+	}
 }
 
 func (e *GlobalConsensusEngine) handleShardProposal(message *pb.Message) {
@@ -2029,7 +1951,7 @@ func (e *GlobalConsensusEngine) handleShardLivenessCheck(message *pb.Message) {
 		) {
 			lcBytes, err := livenessCheck.ConstructSignaturePayload()
 			if err != nil {
-				e.logger.Error(
+				e.logger.Debug(
 					"could not construct signature message for liveness check",
 					zap.Error(err),
 				)
@@ -2044,7 +1966,7 @@ func (e *GlobalConsensusEngine) handleShardLivenessCheck(message *pb.Message) {
 				livenessCheck.GetSignatureDomain(),
 			)
 			if err != nil || !valid {
-				e.logger.Error(
+				e.logger.Debug(
 					"could not validate signature for liveness check",
 					zap.Error(err),
 				)
@@ -2058,7 +1980,7 @@ func (e *GlobalConsensusEngine) handleShardLivenessCheck(message *pb.Message) {
 	}
 
 	if found == nil {
-		e.logger.Warn(
+		e.logger.Debug(
 			"invalid liveness check",
 			zap.String(
 				"prover",
@@ -2230,4 +2152,184 @@ func (e *GlobalConsensusEngine) peekMessageType(message *pb.Message) uint32 {
 
 	// Read type prefix from first 4 bytes
 	return binary.BigEndian.Uint32(message.Data[:4])
+}
+
+// ---------------------------------------------------------------------------
+// Archive frame polling
+// ---------------------------------------------------------------------------
+
+// pollFramesFromArchive periodically fetches new frames from the archive
+// node and feeds them into processGlobalFrame. It replaces the pubsub
+// frame subscription for non-archive nodes.
+func (e *GlobalConsensusEngine) pollFramesFromArchive(
+	ctx lifecycle.SignalerContext,
+) {
+	if e.archiveClient == nil {
+		<-ctx.Done()
+		return
+	}
+
+	e.logger.Info("starting archive frame poller")
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var lastFrameNumber uint64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-e.haltCtx.Done():
+			return
+		case <-ticker.C:
+			pollCtx, pollCancel := context.WithTimeout(
+				context.Background(), 30*time.Second,
+			)
+			frame, err := e.archiveClient.GetGlobalFrame(pollCtx, 0)
+			pollCancel()
+			if err != nil {
+				e.logger.Debug("archive poll error", zap.Error(err))
+				continue
+			}
+			if frame == nil || frame.Header == nil {
+				continue
+			}
+
+			newNumber := frame.Header.FrameNumber
+			if newNumber <= lastFrameNumber {
+				continue
+			}
+
+			// Catch up on any missed frames
+			if lastFrameNumber > 0 && newNumber > lastFrameNumber+1 {
+				for fn := lastFrameNumber + 1; fn < newNumber; fn++ {
+					catchupCtx, catchupCancel := context.WithTimeout(
+						context.Background(), 30*time.Second,
+					)
+					catchup, err := e.archiveClient.GetGlobalFrame(
+						catchupCtx, fn,
+					)
+					catchupCancel()
+					if err != nil {
+						e.logger.Debug(
+							"archive catchup error",
+							zap.Uint64("frame_number", fn),
+							zap.Error(err),
+						)
+						break
+					}
+					if catchup != nil {
+						e.processGlobalFrame(catchup)
+					}
+				}
+			}
+
+			e.processGlobalFrame(frame)
+			lastFrameNumber = newNumber
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Archive endpoint discovery
+// ---------------------------------------------------------------------------
+
+func (e *GlobalConsensusEngine) tryDiscoverArchiveEndpoint(
+	peerInfo *protobufs.PeerInfo,
+) {
+	// Only relevant for non-archive nodes that don't already have an archive
+	// client.
+	if e.isConsensusParticipant() {
+		return
+	}
+	if e.archiveClient != nil {
+		return
+	}
+
+	// Scan capabilities for the archive service (presence flag only)
+	found := false
+	for _, cap := range peerInfo.Capabilities {
+		if cap != nil && cap.ProtocolIdentifier == ArchiveServiceCapabilityID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+
+	// Extract the stream multiaddr from the peer's reachability info
+	if len(peerInfo.Reachability) == 0 ||
+		len(peerInfo.Reachability[0].StreamMultiaddrs) == 0 {
+		e.logger.Debug(
+			"archive peer has no stream multiaddrs",
+			zap.String("peer_id", peer.ID(peerInfo.PeerId).String()),
+		)
+		return
+	}
+
+	s := peerInfo.Reachability[0].StreamMultiaddrs[0]
+
+	// Create mTLS credentials for the archive peer
+	emptyPolicies := map[string]channel.AllowedPeerPolicyType{}
+	creds, err := p2p.NewPeerAuthenticator(
+		e.logger,
+		e.config.P2P,
+		nil, nil, nil, nil,
+		[][]byte{peerInfo.PeerId},
+		emptyPolicies,
+		emptyPolicies,
+	).CreateClientTLSCredentials(peerInfo.PeerId)
+	if err != nil {
+		e.logger.Warn(
+			"failed to create mTLS credentials for archive peer",
+			zap.String("peer_id", peer.ID(peerInfo.PeerId).String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	maddr, err := multiaddr.StringCast(s)
+	if err != nil {
+		e.logger.Debug(
+			"failed to parse archive stream multiaddr",
+			zap.String("multiaddr", s),
+			zap.Error(err),
+		)
+		return
+	}
+
+	mga, err := mn.ToNetAddr(maddr)
+	if err != nil {
+		e.logger.Debug(
+			"failed to convert archive stream multiaddr to net addr",
+			zap.String("multiaddr", s),
+			zap.Error(err),
+		)
+		return
+	}
+
+	conn, err := grpc.NewClient(
+		mga.String(),
+		grpc.WithTransportCredentials(creds),
+	)
+	if err != nil {
+		e.logger.Warn(
+			"failed to dial archive peer",
+			zap.String("addr", mga.String()),
+			zap.String("peer_id", peer.ID(peerInfo.PeerId).String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	client := protobufs.NewGlobalServiceClient(conn)
+	archiveClient := rpc.NewArchiveClient(client, conn, e.logger)
+
+	e.SetArchiveClient(archiveClient)
+	e.logger.Info(
+		"archive client configured from discovered peer",
+		zap.String("addr", mga.String()),
+		zap.String("peer_id", peer.ID(peerInfo.PeerId).String()),
+	)
 }

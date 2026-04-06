@@ -358,6 +358,7 @@ func createTestGlobalConsensusEngine(t *testing.T) (
 	// Create mocks
 	pubsub := newMockPubSub([]byte{0x01, 0x02, 0x03, 0x04})
 	hypergraph := &mocks.MockHypergraph{}
+	hypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	keyManager := &mocks.MockKeyManager{}
 	keyStore := &mocks.MockKeyStore{}
 	clockStore := &mocks.MockClockStore{}
@@ -479,6 +480,7 @@ func createTestAppConsensusEngine(
 
 	mockPubSub := newMockPubSub([]byte{0x01, 0x02, 0x03, 0x04})
 	mockHypergraph := new(mocks.MockHypergraph)
+	mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockKeyManager := new(mocks.MockKeyManager)
 	mockKeyStore := new(mocks.MockKeyStore)
 	mockFrameProver := new(mocks.MockFrameProver)

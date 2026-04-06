@@ -204,35 +204,43 @@ func (hg *HypergraphCRDT) snapshotSet(
 	atomType hypergraph.AtomType,
 	phaseType hypergraph.PhaseType,
 ) hypergraph.IdSet {
-	hg.setsMu.RLock()
-	set := setMap[shardKey]
-	hg.setsMu.RUnlock()
-
-	if set == nil {
-		// Try to load root from snapshot store since set doesn't exist in memory
-		var root tries.LazyVectorCommitmentNode
-		if targetStore != nil {
-			root, _ = targetStore.GetNodeByPath(
-				string(atomType),
-				string(phaseType),
-				shardKey,
-				[]int{}, // empty path = root
-			)
-		}
-		set = NewIdSet(
-			atomType,
-			phaseType,
+	// Always load root from the snapshot store rather than cloning the live
+	// in-memory tree. After PublishSnapshot takes the Pebble snapshot,
+	// message processing modifies the live tree (clears commitments, adds
+	// children). Cloning the live tree would mix post-snapshot in-memory
+	// state with pre-snapshot store data, causing sync to serve
+	// inconsistent data (extra leaves from message processing that don't
+	// belong to this snapshot's root).
+	var root tries.LazyVectorCommitmentNode
+	if targetStore != nil {
+		root, _ = targetStore.GetNodeByPath(
+			string(atomType),
+			string(phaseType),
 			shardKey,
-			targetStore, // Use target store directly since set is new
-			hg.prover,
-			root,
-			hg.getCoveredPrefix(),
+			[]int{}, // empty path = root
 		)
-		// Return directly - no need to clone since we already used targetStore
-		return set
+	}
+	newSet := NewIdSet(
+		atomType,
+		phaseType,
+		shardKey,
+		targetStore,
+		hg.prover,
+		root,
+		hg.getCoveredPrefix(),
+	)
+
+	// Propagate validator from live set if present
+	hg.setsMu.RLock()
+	liveSet := setMap[shardKey]
+	hg.setsMu.RUnlock()
+	if liveSet != nil {
+		if typed, ok := liveSet.(*idSet); ok && typed.validator != nil {
+			newSet.AttachValidator(typed.validator)
+		}
 	}
 
-	return hg.cloneSetWithStore(set, targetStore)
+	return newSet
 }
 
 func (hg *HypergraphCRDT) snapshotPhaseSet(

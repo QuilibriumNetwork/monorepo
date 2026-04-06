@@ -226,6 +226,7 @@ func TestHyperedgeAdd_Materialize(t *testing.T) {
 	// Setup
 	domain := [32]byte{1, 2, 3}
 	mockHypergraph := &mocks.MockHypergraph{}
+	mockHypergraph.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	hgState := hgstate.NewHypergraphState(mockHypergraph)
 	mockHypergraph.On("GetHyperedge", mock.Anything).Return(nil, nil)
 

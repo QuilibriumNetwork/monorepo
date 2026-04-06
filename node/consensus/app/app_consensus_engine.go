@@ -124,6 +124,12 @@ type AppConsensusEngine struct {
 	lastProposalRank              uint64
 	lastProposalRankMu            sync.RWMutex
 	commitBarrier                 sync.Mutex
+
+	// Materialize idempotency: ensures each frame is materialized at most once,
+	// even when called from both ProveNextState and addCertifiedState.
+	lastMaterializedFrame         atomic.Uint64
+	materializeMu                 sync.Mutex
+
 	collectedMessages             []*protobufs.Message
 	collectedMessagesMu           sync.RWMutex
 	provingMessages               []*protobufs.Message
@@ -1051,53 +1057,32 @@ func (e *AppConsensusEngine) handleGlobalProverRoot(
 	}
 
 	if !bytes.Equal(localRoot, expectedProverRoot) {
+		cooldownUntil := e.globalSyncCooldownUntilFrame.Load()
 		e.logger.Warn(
 			"global prover root mismatch",
 			zap.Uint64("frame_number", frameNumber),
 			zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
 			zap.String("local_root", hex.EncodeToString(localRoot)),
+			zap.Uint64("cooldown_until", cooldownUntil),
 		)
 		e.globalProverRootSynced.Store(false)
 		e.globalProverRootVerifiedFrame.Store(0)
-		if frameNumber < e.globalSyncCooldownUntilFrame.Load() {
+		if frameNumber < cooldownUntil {
 			e.logger.Debug(
 				"global prover root mismatch, skipping sync (cooldown active)",
 				zap.Uint64("frame_number", frameNumber),
-				zap.Uint64("cooldown_until", e.globalSyncCooldownUntilFrame.Load()),
+				zap.Uint64("cooldown_until", cooldownUntil),
 			)
 			return
 		}
 		e.performBlockingGlobalHypersync(frame.Header.Prover, expectedProverRoot)
 		e.globalSyncCooldownUntilFrame.Store(frameNumber + globalSyncCooldownFrames)
 
-		// Re-compute local root after sync to verify convergence, matching
-		// the global engine's post-sync verification pattern.
-		newLocalRoot, newRootErr := e.computeLocalGlobalProverRoot(frameNumber)
-		if newRootErr != nil {
-			e.logger.Warn(
-				"failed to compute local global prover root after sync",
-				zap.Uint64("frame_number", frameNumber),
-				zap.Error(newRootErr),
-			)
-		} else if bytes.Equal(newLocalRoot, expectedProverRoot) {
-			e.logger.Info(
-				"global prover root converged after sync",
-				zap.Uint64("frame_number", frameNumber),
-			)
-			e.globalProverRootSynced.Store(true)
-			e.globalProverRootVerifiedFrame.Store(frameNumber)
-			e.globalSyncCooldownUntilFrame.Store(0)
-			if err := e.proverRegistry.Refresh(); err != nil {
-				e.logger.Warn("failed to refresh prover registry", zap.Error(err))
-			}
-		} else {
-			e.logger.Warn(
-				"global prover root still mismatched after sync",
-				zap.Uint64("frame_number", frameNumber),
-				zap.String("expected_root", hex.EncodeToString(expectedProverRoot)),
-				zap.String("post_sync_root", hex.EncodeToString(newLocalRoot)),
-			)
-		}
+		// Don't attempt post-sync verification for the same frame number.
+		// Commit(N) caches shard commits in the DB on first call; subsequent
+		// calls for the same N return the stale pre-sync values and skip tree
+		// recomputation (proofs.go: len(r[0]) != 64 → continue). The next
+		// frame's fresh Commit(N+1) will verify convergence.
 		return
 	}
 
@@ -1250,8 +1235,52 @@ func (e *AppConsensusEngine) performBlockingGlobalHypersync(proposer []byte, exp
 		L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
 	}
 
-	// Perform sync synchronously (blocking)
-	e.syncProvider.HyperSyncSelf(ctx, selfPeerID, shardKey, nil, expectedRoot)
+	// Retry sync a few times with a short delay. The master publishes its
+	// snapshot inside materialize(), which races with the worker processing
+	// the same finalized frame. If the worker is faster, the snapshot won't
+	// exist yet on the master and initSyncSession will fail. A brief retry
+	// avoids falling back to the 5-frame cooldown for a transient race.
+	const maxSyncAttempts = 3
+	const syncRetryDelay = 500 * time.Millisecond
+
+	for attempt := 0; attempt < maxSyncAttempts; attempt++ {
+		if attempt > 0 {
+			e.logger.Info(
+				"retrying global hypersync",
+				zap.Int("attempt", attempt+1),
+				zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+			)
+			select {
+			case <-e.ShutdownSignal():
+				close(done)
+				return
+			case <-time.After(syncRetryDelay):
+			}
+		}
+
+		preSyncRoot := e.getVertexAddsTreeRoot(shardKey)
+		e.syncProvider.HyperSyncSelf(ctx, selfPeerID, shardKey, nil, expectedRoot)
+
+		// Check if sync converged by recomputing the tree root directly.
+		// This bypasses the frame-level Commit cache by calling the tree's
+		// Commit (which always recomputes from current state).
+		postSyncRoot := e.getVertexAddsTreeRoot(shardKey)
+		if bytes.Equal(postSyncRoot, expectedRoot) {
+			e.logger.Info(
+				"global hypersync converged",
+				zap.Int("attempts", attempt+1),
+			)
+			break
+		}
+		e.logger.Warn(
+			"global hypersync did not converge",
+			zap.Int("attempt", attempt+1),
+			zap.String("pre_sync_root", hex.EncodeToString(preSyncRoot)),
+			zap.String("post_sync_root", hex.EncodeToString(postSyncRoot)),
+			zap.String("expected_root", hex.EncodeToString(expectedRoot)),
+			zap.Bool("tree_changed", !bytes.Equal(preSyncRoot, postSyncRoot)),
+		)
+	}
 	close(done)
 
 	if err := e.proverRegistry.Refresh(); err != nil {
@@ -1260,12 +1289,23 @@ func (e *AppConsensusEngine) performBlockingGlobalHypersync(proposer []byte, exp
 			zap.Error(err),
 		)
 	}
+}
 
-	// Don't unconditionally set synced=true. Commit(N-1) is cached with the
-	// pre-sync root, so we can't re-verify here. The next frame's deferred
-	// check will call Commit(N) fresh and verify convergence — matching the
-	// global engine's pattern where convergence happens on the next materialize.
-	e.logger.Info("blocking global hypersync completed, convergence will be verified on next frame")
+// getVertexAddsTreeRoot computes the vertex adds tree root directly from the
+// tree's current state, bypassing the frame-level Commit cache. This is used
+// to verify sync convergence after HyperSyncSelf.
+func (e *AppConsensusEngine) getVertexAddsTreeRoot(
+	shardKey tries.ShardKey,
+) []byte {
+	hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT)
+	if !ok {
+		return nil
+	}
+	set := hgCRDT.GetVertexAddsSet(shardKey)
+	if set == nil {
+		return nil
+	}
+	return set.GetTree().Commit(nil, false)
 }
 
 func (e *AppConsensusEngine) GetFrame() *protobufs.AppShardFrame {
@@ -1394,6 +1434,20 @@ func (e *AppConsensusEngine) materialize(
 	txn store.Transaction,
 	frame *protobufs.AppShardFrame,
 ) error {
+	frameNumber := frame.Header.FrameNumber
+
+	// Idempotency guard: each frame is materialized at most once.
+	// ProveNextState calls materialize(nil, prior) to ensure frame N's
+	// mutations are applied before proving N+1.
+	// The HotStuff commit path also calls materialize for the same frame;
+	// the second call returns immediately.
+	e.materializeMu.Lock()
+	if frameNumber <= e.lastMaterializedFrame.Load() {
+		e.materializeMu.Unlock()
+		return nil
+	}
+	defer e.materializeMu.Unlock()
+
 	var state state.State
 	state = hgstate.NewHypergraphState(e.hypergraph)
 
@@ -1491,6 +1545,7 @@ func (e *AppConsensusEngine) materialize(
 		return errors.Wrap(stateCommitErr, "materialize")
 	}
 
+	e.lastMaterializedFrame.Store(frameNumber)
 	return nil
 }
 
@@ -2161,13 +2216,37 @@ func (e *AppConsensusEngine) internalProveFrame(
 		return nil, errors.New("no proving key available")
 	}
 
+	// Sync shard frame number to the current global frame number.
+	// ProverShardUpdate.Verify checks (globalFrame == shardFrame + 1),
+	// so the shard frame number must equal the current global head frame
+	// number. ProveFrameHeader computes previousFrame.FrameNumber + 1,
+	// so we set the synced header's FrameNumber to globalFrameNumber - 1.
+	frameNumber := previousFrame.Header.FrameNumber + 1
+	prevHeader := previousFrame.Header
+	globalHead, err := e.globalTimeReel.GetHead()
+	if err == nil && globalHead != nil {
+		globalFrameNumber := globalHead.Header.FrameNumber
+		if globalFrameNumber != frameNumber {
+			e.logger.Debug(
+				"syncing shard frame number to global",
+				zap.Uint64("shard_frame", frameNumber),
+				zap.Uint64("global_frame", globalFrameNumber),
+			)
+			frameNumber = globalFrameNumber
+			prevHeader = &protobufs.FrameHeader{
+				Output:      previousFrame.Header.Output,
+				FrameNumber: globalFrameNumber - 1,
+			}
+		}
+	}
+
 	e.commitBarrier.Lock()
 	stateRoots, err := e.hypergraph.CommitShard(
-		previousFrame.Header.FrameNumber+1,
+		frameNumber,
 		e.appAddress,
 	)
-	e.commitBarrier.Unlock()
 	if err != nil {
+		e.commitBarrier.Unlock()
 		return nil, err
 	}
 
@@ -2179,13 +2258,19 @@ func (e *AppConsensusEngine) internalProveFrame(
 		stateRoots[3] = make([]byte, 64)
 	}
 
-	// Publish the snapshot generation with the shard's vertex add root so clients
-	// can sync against this specific state.
+	// Publish the snapshot generation with the shard's vertex add root so
+	// clients can sync against this specific state. This MUST happen inside
+	// the commitBarrier lock — releasing the lock before publishing allows
+	// another goroutine to acquire commitBarrier and call state.Commit(),
+	// modifying tree data in Pebble. The subsequent PublishSnapshot would
+	// then capture post-modification data tagged with the pre-modification
+	// root, causing sync clients to receive mismatched data.
 	if len(stateRoots[0]) > 0 {
 		if hgCRDT, ok := e.hypergraph.(*hgcrdt.HypergraphCRDT); ok {
 			hgCRDT.PublishSnapshot(stateRoots[0])
 		}
 	}
+	e.commitBarrier.Unlock()
 
 	txMap := map[string][][]byte{}
 	for i, message := range messages {
@@ -2195,7 +2280,7 @@ func (e *AppConsensusEngine) internalProveFrame(
 			zap.String("tx_hash", hex.EncodeToString(message.Hash)),
 		)
 		lockedAddrs, err := e.executionManager.Lock(
-			previousFrame.Header.FrameNumber+1,
+			frameNumber,
 			message.Address,
 			message.Payload,
 		)
@@ -2229,7 +2314,7 @@ func (e *AppConsensusEngine) internalProveFrame(
 
 	timestamp := time.Now().UnixMilli()
 	difficulty := e.difficultyAdjuster.GetNextDifficulty(
-		previousFrame.GetFrameNumber()+1,
+		frameNumber,
 		timestamp,
 	)
 
@@ -2276,7 +2361,7 @@ func (e *AppConsensusEngine) internalProveFrame(
 	}
 
 	newHeader, err := e.frameProver.ProveFrameHeader(
-		previousFrame.Header,
+		prevHeader,
 		e.appAddress,
 		rootCommit,
 		stateRoots,
@@ -2444,6 +2529,45 @@ func (e *AppConsensusEngine) ensureGlobalClient() error {
 	}
 
 	return lastErr
+}
+
+func (e *AppConsensusEngine) submitShardFrameToMaster(
+	header *protobufs.FrameHeader,
+) {
+	if e.globalClient == nil {
+		return
+	}
+
+	bundle := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{
+			{
+				Request: &protobufs.MessageRequest_Shard{
+					Shard: header,
+				},
+			},
+		},
+		Timestamp: header.Timestamp,
+	}
+
+	bundleBytes, err := bundle.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("failed to encode shard frame bundle for master", zap.Error(err))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = e.globalClient.SubmitGlobalMessage(ctx,
+		&protobufs.SubmitGlobalMessageRequest{Data: bundleBytes},
+	)
+	if err != nil {
+		e.logger.Warn("failed to submit shard frame to master via gRPC",
+			zap.Binary("shard_address", header.Address),
+			zap.Uint64("frame_number", header.FrameNumber),
+			zap.Error(err),
+		)
+	}
 }
 
 func (e *AppConsensusEngine) startConsensus(

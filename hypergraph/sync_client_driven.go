@@ -523,10 +523,25 @@ func (hg *HypergraphCRDT) SyncFrom(
 	}
 
 	if syncPoint == nil || len(syncPoint.Commitment) == 0 {
-		logger.Debug("server has no data at sync point")
+		if isGlobalProver {
+			logger.Warn("global prover sync: server has no data at sync point",
+				zap.Bool("syncPoint_nil", syncPoint == nil),
+			)
+		} else {
+			logger.Debug("server has no data at sync point")
+		}
 		// Return current root even if no data was synced
 		root := set.GetTree().Commit(nil, false)
 		return root, nil
+	}
+
+	if isGlobalProver {
+		logger.Info("global prover sync: server returned sync point",
+			zap.String("server_commitment", hex.EncodeToString(syncPoint.Commitment)),
+			zap.String("local_root", hex.EncodeToString(preSyncRoot)),
+			zap.Int("server_children", len(syncPoint.Children)),
+			zap.Bool("server_is_leaf", syncPoint.IsLeaf),
+		)
 	}
 
 	// Step 2: Sync the subtree

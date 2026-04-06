@@ -156,7 +156,7 @@ func (p *globalMessageProcessor) enforceCollectorLimit(
 }
 
 func (e *GlobalConsensusEngine) initGlobalMessageAggregator() error {
-	tracer := tracing.NewZapTracer(e.logger.Named("global_message_collector"))
+	tracer := tracing.NewZapTracer(e.logger.Named("globalMessageCollector"))
 	processorFactory := &globalMessageProcessorFactory{engine: e}
 	collectorFactory, err := keyedcollector.NewFactory(
 		tracer,
@@ -214,9 +214,9 @@ func (e *GlobalConsensusEngine) startGlobalMessageAggregator(
 	<-e.messageAggregator.ComponentManager.Done()
 }
 
-func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
+func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) error {
 	if e.messageCollectors == nil || len(data) == 0 {
-		return
+		return nil
 	}
 
 	payload := data // buildutils:allow-slice-alias slice is static
@@ -231,7 +231,7 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 						zap.Error(err),
 					)
 				}
-				return
+				return err
 			}
 
 			// In prover-only mode, filter out non-prover messages
@@ -239,7 +239,34 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 				bundle.Requests = e.filterProverOnlyRequests(bundle.Requests)
 				if len(bundle.Requests) == 0 {
 					// All requests were filtered out
-					return
+					return nil
+				}
+			}
+
+			// Dedup shard frames: only accept strictly increasing frame numbers
+			// per shard address. Different delivery paths (pubsub vs gRPC)
+			// produce different serializations of the same shard frame, so we
+			// dedup by (shard address, frame number) rather than by hash.
+			for _, req := range bundle.Requests {
+				if shard := req.GetShard(); shard != nil {
+					shardAddr := string(shard.Address)
+					shardFrame := shard.FrameNumber
+
+					e.shardFrameDedupMu.Lock()
+					lastSeen, exists := e.shardFrameDedup[shardAddr]
+					if exists && shardFrame <= lastSeen {
+						e.shardFrameDedupMu.Unlock()
+						if e.logger != nil {
+							e.logger.Debug(
+								"dropping duplicate/stale shard frame",
+								zap.Uint64("shard_frame", shardFrame),
+								zap.Uint64("last_seen", lastSeen),
+							)
+						}
+						return nil
+					}
+					e.shardFrameDedup[shardAddr] = shardFrame
+					e.shardFrameDedupMu.Unlock()
 				}
 			}
 
@@ -264,13 +291,13 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 						zap.Error(err),
 					)
 				}
-				return
+				return err
 			}
 			payload = encoded
 		}
 	}
 
-	seq := e.currentRank + 1
+	seq := e.consensusProtocol.currentRank + 1
 	record := newSequencedGlobalMessage(seq, payload)
 
 	// Add directly to the collector synchronously rather than going through
@@ -282,10 +309,10 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 		e.logger.Debug(
 			"could not get collector for global message",
 			zap.Uint64("sequence", seq),
-			zap.Uint64("current_rank", e.currentRank),
+			zap.Uint64("current_rank", e.consensusProtocol.currentRank),
 			zap.Error(err),
 		)
-		return
+		return err
 	}
 
 	if err := collector.Add(record); err != nil {
@@ -294,15 +321,16 @@ func (e *GlobalConsensusEngine) addGlobalMessage(data []byte) {
 			zap.Uint64("sequence", seq),
 			zap.Error(err),
 		)
-		return
+		return err
 	}
 
 	e.logger.Debug(
 		"added global message to collector",
 		zap.Uint64("sequence", seq),
-		zap.Uint64("current_rank", e.currentRank),
+		zap.Uint64("current_rank", e.consensusProtocol.currentRank),
 		zap.Int("payload_len", len(payload)),
 	)
+	return nil
 }
 
 // filterProverOnlyRequests filters a list of message requests to only include

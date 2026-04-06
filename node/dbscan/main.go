@@ -103,7 +103,7 @@ func main() {
 		log.Fatal("failed to load config", err)
 	}
 
-	logger, closer, err := nodeConfig1.CreateLogger(0, true)
+	logger, closer, err := nodeConfig1.CreateLogger(0, true, nil)
 	if err != nil {
 		log.Fatal("failed to create logger", err)
 	}

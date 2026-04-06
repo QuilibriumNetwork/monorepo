@@ -709,6 +709,7 @@ func FuzzMixedTransactionTypeDeserialization(f *testing.F) {
 }
 
 func setupMockHypergraph(mockHypergraph *mocks.MockHypergraph, mockInclusionProver *mocks.MockInclusionProver) {
+	mockHypergraph.On("GetProver").Return(mockInclusionProver).Maybe()
 	mockInclusionProver.On("CommitRaw", mock.Anything, mock.Anything).Return(make([]byte, 74), nil)
 	mockMultiproof := &mocks.MockMultiproof{}
 	mockMultiproof.On("FromBytes", mock.Anything).Return(nil).Maybe()

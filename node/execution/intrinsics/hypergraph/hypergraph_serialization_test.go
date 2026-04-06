@@ -227,6 +227,7 @@ func TestHyperedgeAddSerialization(t *testing.T) {
 func TestHyperedgeRemoveSerialization(t *testing.T) {
 	// Setup mocks
 	mockHg := &mocks.MockHypergraph{}
+	mockHg.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	mockHyperedge := &mocks.MockHyperedge{}
 
 	vert := hgnode.NewVertex([32]byte(make([]byte, 32)), [32]byte(make([]byte, 32)), make([]byte, 74), big.NewInt(74))

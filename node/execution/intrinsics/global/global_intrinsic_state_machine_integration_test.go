@@ -39,14 +39,16 @@ func setupTestEnvironment(t *testing.T) (*keys.InMemoryKeyManager, hypergraph.Hy
 	// Create a hypergraph
 	l, _ := zap.NewProduction()
 	ip := bls48581.NewKZGInclusionProver(l)
-	s := store.NewPebbleDB(l, &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, 0)
+	dbCfg := &config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}
+	s := store.NewPebbleDB(l, &config.Config{DB: dbCfg}, 0)
 	ve := verenc.NewMPCitHVerifiableEncryptor(1)
 	hg := hgcrdt.NewHypergraph(
 		l,
-		store.NewPebbleHypergraphStore(&config.DBConfig{InMemoryDONOTUSE: true, Path: ".configtest/store"}, s, l, ve, ip),
+		store.NewPebbleHypergraphStore(dbCfg, s, l, ve, ip),
 		ip,
 		[]int{},
 		&tests.Nopthenticator{},
+		0,
 	)
 
 	// Create hypergraph state
@@ -112,7 +114,7 @@ func TestProverJoinConfirmFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
-	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// Test 1: Join at frame 255840
@@ -133,7 +135,7 @@ func TestProverJoinConfirmFlow(t *testing.T) {
 
 		// Try to confirm too early (should fail in verify)
 		confirmFrame := joinFrame + 359
-		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverConfirm.Prove(confirmFrame)
 		require.NoError(t, err)
@@ -145,7 +147,7 @@ func TestProverJoinConfirmFlow(t *testing.T) {
 
 		// Confirm at exactly 360 frames (should succeed)
 		confirmFrame = joinFrame + 360
-		proverConfirm, err = global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
+		proverConfirm, err = global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverConfirm.Prove(confirmFrame)
 		require.NoError(t, err)
@@ -167,7 +169,7 @@ func TestProverJoinRejectFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
-	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	t.Run("Join and reject immediately", func(t *testing.T) {
@@ -187,7 +189,7 @@ func TestProverJoinRejectFlow(t *testing.T) {
 
 		// Reject immediately (should succeed)
 		rejectFrame := joinFrame + 10
-		proverReject, err := global.NewProverReject(filter, rejectFrame, keyManager, hg, rdfMultiprover)
+		proverReject, err := global.NewProverReject([][]byte{filter}, rejectFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverReject.Prove(rejectFrame)
 		require.NoError(t, err)
@@ -209,7 +211,7 @@ func TestProverPauseResumeFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
-	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// First join and confirm to get to active state
@@ -221,7 +223,7 @@ func TestProverPauseResumeFlow(t *testing.T) {
 	state = materializeAndCommit(t, proverJoin, joinFrame, state, hg)
 
 	confirmFrame := joinFrame + 360
-	proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
+	proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rdfMultiprover)
 	require.NoError(t, err)
 	err = proverConfirm.Prove(confirmFrame)
 	require.NoError(t, err)
@@ -271,7 +273,7 @@ func TestProverLeaveFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
-	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// First join and confirm to get to active state
@@ -283,7 +285,7 @@ func TestProverLeaveFlow(t *testing.T) {
 	state = materializeAndCommit(t, proverJoin, joinFrame, state, hg)
 
 	confirmFrame := joinFrame + 360
-	proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
+	proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rdfMultiprover)
 	require.NoError(t, err)
 	err = proverConfirm.Prove(confirmFrame)
 	require.NoError(t, err)
@@ -310,7 +312,7 @@ func TestProverLeaveFlow(t *testing.T) {
 
 		// Try to confirm too early
 		confirmLeaveFrame := leaveFrame + 359
-		proverConfirmLeave, err := global.NewProverConfirm(filter, confirmLeaveFrame, keyManager, hg, rdfMultiprover)
+		proverConfirmLeave, err := global.NewProverConfirm([][]byte{filter}, confirmLeaveFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverConfirmLeave.Prove(confirmLeaveFrame)
 		require.NoError(t, err)
@@ -322,7 +324,7 @@ func TestProverLeaveFlow(t *testing.T) {
 
 		// Confirm leave after 360 frames
 		confirmLeaveFrame = leaveFrame + 360
-		proverConfirmLeave, err = global.NewProverConfirm(filter, confirmLeaveFrame, keyManager, hg, rdfMultiprover)
+		proverConfirmLeave, err = global.NewProverConfirm([][]byte{filter}, confirmLeaveFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverConfirmLeave.Prove(confirmLeaveFrame)
 		require.NoError(t, err)
@@ -344,7 +346,7 @@ func TestProverLeaveRejectFlow(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	address := getProverAddress(t, keyManager)
 	filter := []byte("test-filter")
-	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// First join and confirm to get to active state
@@ -356,7 +358,7 @@ func TestProverLeaveRejectFlow(t *testing.T) {
 	state = materializeAndCommit(t, proverJoin, joinFrame, state, hg)
 
 	confirmFrame := joinFrame + 360
-	proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
+	proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rdfMultiprover)
 	require.NoError(t, err)
 	err = proverConfirm.Prove(confirmFrame)
 	require.NoError(t, err)
@@ -377,7 +379,7 @@ func TestProverLeaveRejectFlow(t *testing.T) {
 
 		// Reject leave after 360 frames
 		rejectLeaveFrame := leaveFrame + 360
-		proverRejectLeave, err := global.NewProverReject(filter, rejectLeaveFrame, keyManager, hg, rdfMultiprover)
+		proverRejectLeave, err := global.NewProverReject([][]byte{filter}, rejectLeaveFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverRejectLeave.Prove(rejectLeaveFrame)
 		require.NoError(t, err)
@@ -398,7 +400,7 @@ func TestProverLeaveRejectFlow(t *testing.T) {
 func TestProverTimingEdgeCases(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	filter := []byte("test-filter")
-	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	t.Run("Join before 255840 with special confirmation rules", func(t *testing.T) {
@@ -415,7 +417,7 @@ func TestProverTimingEdgeCases(t *testing.T) {
 
 		// Try to confirm before frame 255840 (should fail)
 		confirmFrame := uint64(252839)
-		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverConfirm.Prove(confirmFrame)
 		require.NoError(t, err)
@@ -427,7 +429,7 @@ func TestProverTimingEdgeCases(t *testing.T) {
 
 		// Confirm at frame 255840 (should succeed even though less than 360 frames)
 		confirmFrame = uint64(255840)
-		proverConfirm, err = global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
+		proverConfirm, err = global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverConfirm.Prove(confirmFrame)
 		require.NoError(t, err)
@@ -447,7 +449,7 @@ func TestProverTimingEdgeCases(t *testing.T) {
 		state = materializeAndCommit(t, proverJoin, joinFrame, state, hg)
 
 		confirmFrame := joinFrame + 360
-		proverConfirm, err := global.NewProverConfirm(filter, confirmFrame, keyManager, hg, rdfMultiprover)
+		proverConfirm, err := global.NewProverConfirm([][]byte{filter}, confirmFrame, keyManager, hg, rdfMultiprover)
 		require.NoError(t, err)
 		err = proverConfirm.Prove(confirmFrame)
 		require.NoError(t, err)
@@ -479,7 +481,7 @@ func TestProverTimingEdgeCases(t *testing.T) {
 func TestProverInvalidStateTransitions(t *testing.T) {
 	keyManager, hg, state, rdfMultiprover := setupTestEnvironment(t)
 	filter := []byte("test-filter")
-	pebbleDB := store.NewPebbleDB(zap.L(), &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}, 0)
+	pebbleDB := store.NewPebbleDB(zap.L(), &config.Config{DB: &config.DBConfig{InMemoryDONOTUSE: true, Path: ".test/global"}}, 0)
 	frameStore := store.NewPebbleClockStore(pebbleDB, zap.L())
 
 	// Join first

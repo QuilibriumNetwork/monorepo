@@ -111,6 +111,7 @@ func TestTransactionInputSerialization(t *testing.T) {
 func TestPendingTransactionSerialization(t *testing.T) {
 	// Setup mocks
 	hg := &mocks.MockHypergraph{}
+	hg.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	bp := &mocks.MockBulletproofProver{}
 	ip := &mocks.MockInclusionProver{}
 	ve := &mocks.MockVerifiableEncryptor{}
@@ -258,6 +259,7 @@ func TestPendingTransactionSerialization(t *testing.T) {
 func TestTransactionSerialization(t *testing.T) {
 	// Setup mocks
 	hg := &mocks.MockHypergraph{}
+	hg.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	bp := &mocks.MockBulletproofProver{}
 	ip := &mocks.MockInclusionProver{}
 	ve := &mocks.MockVerifiableEncryptor{}
@@ -540,6 +542,7 @@ func TestMintTransactionOutputSerialization(t *testing.T) {
 func TestMintTransactionSerialization(t *testing.T) {
 	// Setup mocks
 	hg := &mocks.MockHypergraph{}
+	hg.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	bp := &mocks.MockBulletproofProver{}
 	ip := &mocks.MockInclusionProver{}
 	ve := &mocks.MockVerifiableEncryptor{}
@@ -688,6 +691,7 @@ func TestInvalidSerialization(t *testing.T) {
 func TestInvalidMintTransactionSerialization(t *testing.T) {
 	// Setup mocks
 	hg := &mocks.MockHypergraph{}
+	hg.On("GetProver").Return(&mocks.MockInclusionProver{}).Maybe()
 	bp := &mocks.MockBulletproofProver{}
 	ip := &mocks.MockInclusionProver{}
 	ve := &mocks.MockVerifiableEncryptor{}

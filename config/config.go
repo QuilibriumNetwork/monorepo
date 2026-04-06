@@ -84,6 +84,15 @@ func NewConfig(configPath string) (*Config, error) {
 	return config, nil
 }
 
+var ArchiveEndpoints = []string{
+	"/ip4/192.69.222.130/tcp/8340",
+	"/ip4/192.200.112.178/tcp/8340",
+	"/ip4/191.96.166.157/tcp/8340",
+	"/ip4/109.94.96.255/tcp/8340",
+	"/ip4/147.124.199.194/tcp/8340",
+	"/ip4/192.154.103.90/tcp/8340",
+}
+
 var BootstrapPeers = []string{
 	"/dns4/quinoa.quilibrium.com/udp/8336/quic-v1/p2p/QmP9NNzAzRjCL8gdQBkKHwyBCWJGVb3jPrQzTveYdU24kH",
 	"/dns4/qualia.quilibrium.com/udp/8336/quic-v1/p2p/QmRP1UPiDg1enHgN6wEL1Y4uUh1XKg7V3QExdBKV9BUUQf",

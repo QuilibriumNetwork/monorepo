@@ -298,7 +298,7 @@ func (p *PeerAuthenticator) CreateClientTLSCredentials(
 				return err
 			}
 
-			if !bytes.Equal([]byte(peerId), expectedPeerId) {
+			if len(expectedPeerId) > 0 && !bytes.Equal([]byte(peerId), expectedPeerId) {
 				return errors.New("peer mismatch")
 			}
 

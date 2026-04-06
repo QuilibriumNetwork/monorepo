@@ -30,6 +30,9 @@ const (
 	NodeService_CreateTraversalProof_FullMethodName = "/quilibrium.node.node.pb.NodeService/CreateTraversalProof"
 	NodeService_GetShardInfo_FullMethodName         = "/quilibrium.node.node.pb.NodeService/GetShardInfo"
 	NodeService_RequestJoin_FullMethodName          = "/quilibrium.node.node.pb.NodeService/RequestJoin"
+	NodeService_SetManuallyManaged_FullMethodName   = "/quilibrium.node.node.pb.NodeService/SetManuallyManaged"
+	NodeService_GetLatestFrame_FullMethodName       = "/quilibrium.node.node.pb.NodeService/GetLatestFrame"
+	NodeService_SubmitMessage_FullMethodName        = "/quilibrium.node.node.pb.NodeService/SubmitMessage"
 )
 
 // NodeServiceClient is the client API for NodeService service.
@@ -47,6 +50,9 @@ type NodeServiceClient interface {
 	CreateTraversalProof(ctx context.Context, in *CreateTraversalProofRequest, opts ...grpc.CallOption) (*CreateTraversalProofResponse, error)
 	GetShardInfo(ctx context.Context, in *GetShardInfoRequest, opts ...grpc.CallOption) (*GetShardInfoResponse, error)
 	RequestJoin(ctx context.Context, in *RequestJoinRequest, opts ...grpc.CallOption) (*RequestJoinResponse, error)
+	SetManuallyManaged(ctx context.Context, in *SetManuallyManagedRequest, opts ...grpc.CallOption) (*SetManuallyManagedResponse, error)
+	GetLatestFrame(ctx context.Context, in *GetGlobalFrameRequest, opts ...grpc.CallOption) (*GlobalFrameResponse, error)
+	SubmitMessage(ctx context.Context, in *SubmitMessageRequest, opts ...grpc.CallOption) (*SubmitMessageResponse, error)
 }
 
 type nodeServiceClient struct {
@@ -156,6 +162,33 @@ func (c *nodeServiceClient) RequestJoin(ctx context.Context, in *RequestJoinRequ
 	return out, nil
 }
 
+func (c *nodeServiceClient) SetManuallyManaged(ctx context.Context, in *SetManuallyManagedRequest, opts ...grpc.CallOption) (*SetManuallyManagedResponse, error) {
+	out := new(SetManuallyManagedResponse)
+	err := c.cc.Invoke(ctx, NodeService_SetManuallyManaged_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeServiceClient) GetLatestFrame(ctx context.Context, in *GetGlobalFrameRequest, opts ...grpc.CallOption) (*GlobalFrameResponse, error) {
+	out := new(GlobalFrameResponse)
+	err := c.cc.Invoke(ctx, NodeService_GetLatestFrame_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeServiceClient) SubmitMessage(ctx context.Context, in *SubmitMessageRequest, opts ...grpc.CallOption) (*SubmitMessageResponse, error) {
+	out := new(SubmitMessageResponse)
+	err := c.cc.Invoke(ctx, NodeService_SubmitMessage_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeServiceServer is the server API for NodeService service.
 // All implementations must embed UnimplementedNodeServiceServer
 // for forward compatibility
@@ -171,6 +204,9 @@ type NodeServiceServer interface {
 	CreateTraversalProof(context.Context, *CreateTraversalProofRequest) (*CreateTraversalProofResponse, error)
 	GetShardInfo(context.Context, *GetShardInfoRequest) (*GetShardInfoResponse, error)
 	RequestJoin(context.Context, *RequestJoinRequest) (*RequestJoinResponse, error)
+	SetManuallyManaged(context.Context, *SetManuallyManagedRequest) (*SetManuallyManagedResponse, error)
+	GetLatestFrame(context.Context, *GetGlobalFrameRequest) (*GlobalFrameResponse, error)
+	SubmitMessage(context.Context, *SubmitMessageRequest) (*SubmitMessageResponse, error)
 	mustEmbedUnimplementedNodeServiceServer()
 }
 
@@ -210,6 +246,15 @@ func (UnimplementedNodeServiceServer) GetShardInfo(context.Context, *GetShardInf
 }
 func (UnimplementedNodeServiceServer) RequestJoin(context.Context, *RequestJoinRequest) (*RequestJoinResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RequestJoin not implemented")
+}
+func (UnimplementedNodeServiceServer) SetManuallyManaged(context.Context, *SetManuallyManagedRequest) (*SetManuallyManagedResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetManuallyManaged not implemented")
+}
+func (UnimplementedNodeServiceServer) GetLatestFrame(context.Context, *GetGlobalFrameRequest) (*GlobalFrameResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLatestFrame not implemented")
+}
+func (UnimplementedNodeServiceServer) SubmitMessage(context.Context, *SubmitMessageRequest) (*SubmitMessageResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SubmitMessage not implemented")
 }
 func (UnimplementedNodeServiceServer) mustEmbedUnimplementedNodeServiceServer() {}
 
@@ -422,6 +467,60 @@ func _NodeService_RequestJoin_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeService_SetManuallyManaged_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetManuallyManagedRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).SetManuallyManaged(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_SetManuallyManaged_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).SetManuallyManaged(ctx, req.(*SetManuallyManagedRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeService_GetLatestFrame_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetGlobalFrameRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).GetLatestFrame(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_GetLatestFrame_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).GetLatestFrame(ctx, req.(*GetGlobalFrameRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeService_SubmitMessage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitMessageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).SubmitMessage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_SubmitMessage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).SubmitMessage(ctx, req.(*SubmitMessageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NodeService_ServiceDesc is the grpc.ServiceDesc for NodeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -472,6 +571,18 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RequestJoin",
 			Handler:    _NodeService_RequestJoin_Handler,
+		},
+		{
+			MethodName: "SetManuallyManaged",
+			Handler:    _NodeService_SetManuallyManaged_Handler,
+		},
+		{
+			MethodName: "GetLatestFrame",
+			Handler:    _NodeService_GetLatestFrame_Handler,
+		},
+		{
+			MethodName: "SubmitMessage",
+			Handler:    _NodeService_SubmitMessage_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

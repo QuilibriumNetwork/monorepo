@@ -2,6 +2,7 @@ package prover
 
 import (
 	"context"
+	"encoding/hex"
 	"slices"
 	"time"
 
@@ -62,6 +63,23 @@ func getNodeClient() (protobufs.NodeServiceClient, *grpc.ClientConn, error) {
 	}
 
 	return protobufs.NewNodeServiceClient(conn), conn, nil
+}
+
+// workerByFilter calls GetWorkerInfo and returns a map from hex-encoded filter
+// to core_id. Returns an empty map on error.
+func workerByFilter(client protobufs.NodeServiceClient) map[string]uint32 {
+	resp, err := client.GetWorkerInfo(
+		context.Background(),
+		&protobufs.GetWorkerInfoRequest{},
+	)
+	m := make(map[string]uint32)
+	if err != nil || resp == nil {
+		return m
+	}
+	for _, w := range resp.GetWorkerInfo() {
+		m[hex.EncodeToString(w.GetFilter())] = w.GetCoreId()
+	}
+	return m
 }
 
 func sendProverMessage(

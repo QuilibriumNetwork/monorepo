@@ -13,7 +13,7 @@ import (
 
 var allocationStatusNames = map[uint32]string{
 	0: "Unknown",
-	1: "Pending",
+	1: "Joining",
 	2: "Active",
 	3: "Paused",
 	4: "Leaving",
@@ -77,8 +77,22 @@ and shard allocations.
 			return
 		}
 
-		fmt.Printf("\nShard Allocations (%d):\n", len(allocations))
+		workers := workerByFilter(client)
+		headFrame := info.GetLastGlobalHeadFrame()
+
+		fmt.Printf("\nShard Allocations:\n")
 		for i, alloc := range allocations {
+			// Skip expired joins (implicitly rejected after 720 frames)
+			if alloc.GetStatus() == 1 && alloc.GetJoinFrameNumber() > 0 &&
+				headFrame >= alloc.GetJoinFrameNumber()+720 {
+				continue
+			}
+			// Skip expired leaves (implicitly left after 720 frames)
+			if alloc.GetStatus() == 4 && alloc.GetLeaveFrameNumber() > 0 &&
+				headFrame >= alloc.GetLeaveFrameNumber()+720 {
+				continue
+			}
+
 			statusName, ok := allocationStatusNames[alloc.GetStatus()]
 			if !ok {
 				statusName = fmt.Sprintf("Unknown(%d)", alloc.GetStatus())
@@ -86,11 +100,13 @@ and shard allocations.
 
 			filter := alloc.GetFilter()
 			filterHex := hex.EncodeToString(filter)
-			if len(filterHex) > 16 {
-				filterHex = filterHex[:16] + "..."
+
+			workerStr := ""
+			if wid, ok := workers[filterHex]; ok {
+				workerStr = fmt.Sprintf("  Worker: %d", wid)
 			}
 
-			fmt.Printf("  [%d] Filter: %s  Status: %s\n", i, filterHex, statusName)
+			fmt.Printf("  [%d] Filter: %s  Status: %s%s\n", i, filterHex, statusName, workerStr)
 
 			if alloc.GetJoinFrameNumber() > 0 {
 				fmt.Printf("      Join Frame: %d", alloc.GetJoinFrameNumber())
@@ -116,9 +132,6 @@ and shard allocations.
 			fmt.Printf("\nWorkers (%d):\n", len(workerInfo.GetWorkerInfo()))
 			for _, w := range workerInfo.GetWorkerInfo() {
 				filterHex := hex.EncodeToString(w.GetFilter())
-				if len(filterHex) > 16 {
-					filterHex = filterHex[:16] + "..."
-				}
 				fmt.Printf("  Core %d: Filter: %s  Storage: %s / %s\n",
 					w.GetCoreId(),
 					filterHex,
