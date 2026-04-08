@@ -87,9 +87,6 @@ func (e *GlobalConsensusEngine) eventDistributorLoop(
 							allAllocated := true
 							needsProposals := false
 							for _, w := range workers {
-								if w.ManuallyManaged {
-									continue
-								}
 								allAllocated = allAllocated && w.Allocated
 								if len(w.Filter) == 0 {
 									needsProposals = true
