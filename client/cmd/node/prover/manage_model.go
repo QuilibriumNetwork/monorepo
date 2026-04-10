@@ -626,7 +626,7 @@ func (m *manageModel) startMultiFilterAction(action string, rows []allocationRow
 		}
 	}
 	if len(filters) == 0 {
-		m.statusMsg = fmt.Sprintf("No selected allocations are valid for %s", action)
+		m.statusMsg = fmt.Sprintf("No selected allocations are valid for %s. Applicable action(s): %s", action, m.applicableActionsLabel())
 		m.statusIsError = true
 		return m, nil
 	}
@@ -661,7 +661,7 @@ func (m *manageModel) startBatchAction(action string, rows []allocationRow, vali
 		}
 	}
 	if len(queue) == 0 {
-		m.statusMsg = fmt.Sprintf("No selected allocations are valid for %s", action)
+		m.statusMsg = fmt.Sprintf("No selected allocations are valid for %s. Applicable action(s): %s", action, m.applicableActionsLabel())
 		m.statusIsError = true
 		return m, nil
 	}
@@ -684,6 +684,145 @@ func (m *manageModel) startBatchAction(action string, rows []allocationRow, vali
 		cmd = doResume(m.client, first.filter, first.status)
 	}
 	return m, cmd
+}
+
+// applicableAllocActions returns the set of action names that are valid for the
+// current allocation selection (intersection across all selected rows).
+// Returns empty when an action is in-flight.
+func (m manageModel) applicableAllocActions() map[string]bool {
+	if m.actionInFlight {
+		return map[string]bool{}
+	}
+
+	rows := m.selectedAllocRows()
+	if len(rows) == 0 {
+		return map[string]bool{}
+	}
+
+	actionsForRow := func(row allocationRow) map[string]bool {
+		switch row.status {
+		case 1:
+			// Confirm is only valid once the action window opens (joinFrame+delay)
+			// and before it expires (joinFrame+2*delay).
+			actions := map[string]bool{"Reject": true}
+			if row.joinFrame > 0 {
+				actionFrame := row.joinFrame + ACTION_FRAME_DELAY
+				expiryFrame := row.joinFrame + ACTION_FRAME_DELAY*2
+				if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
+					actions["Confirm"] = true
+				}
+			}
+			return actions
+		case 4:
+			// Same window logic using leaveFrame.
+			actions := map[string]bool{"Reject": true}
+			if row.leaveFrame > 0 {
+				actionFrame := row.leaveFrame + ACTION_FRAME_DELAY
+				expiryFrame := row.leaveFrame + ACTION_FRAME_DELAY*2
+				if m.frameNumber >= actionFrame && m.frameNumber < expiryFrame {
+					actions["Confirm"] = true
+				}
+			}
+			return actions
+		case 2:
+			return map[string]bool{"Leave": true, "Pause": true}
+		case 3:
+			return map[string]bool{"Leave": true, "Resume": true}
+		default:
+			return map[string]bool{}
+		}
+	}
+
+	result := actionsForRow(rows[0])
+	for _, row := range rows[1:] {
+		rowActions := actionsForRow(row)
+		for action := range result {
+			if !rowActions[action] {
+				delete(result, action)
+			}
+		}
+	}
+	return result
+}
+
+// applicableActionsLabel returns a human-readable comma-separated list of
+// applicable actions for the current focus and selection.
+func (m manageModel) applicableActionsLabel() string {
+	if m.focus == availablePanel {
+		if len(m.freeWorkers) > 0 {
+			return "Join"
+		}
+		return "none (no free workers)"
+	}
+	actions := m.applicableAllocActions()
+	if len(actions) == 0 {
+		return "none"
+	}
+	var names []string
+	for _, a := range []string{"Confirm", "Reject", "Leave", "Pause", "Resume"} {
+		if actions[a] {
+			names = append(names, a)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+// renderHelpLine renders the key-binding help line with applicable action keys
+// highlighted in the primary color and inapplicable ones dimmed.
+func (m manageModel) renderHelpLine() string {
+	applicable := map[string]bool{}
+	if !m.actionInFlight {
+		if m.focus == allocationsPanel {
+			for a := range m.applicableAllocActions() {
+				applicable[a] = true
+			}
+			filtered := m.filteredAllocations()
+			if m.allocCursor < len(filtered) && filtered[m.allocCursor].workerID >= 0 {
+				applicable["ToggleManual"] = true
+			}
+		} else {
+			if len(m.freeWorkers) > 0 {
+				applicable["Join"] = true
+			}
+		}
+	}
+
+	type helpEntry struct {
+		b      key.Binding
+		action string // empty = always shown in normal help color
+	}
+	entries := []helpEntry{
+		{m.keyMap.Tab, ""},
+		{m.keyMap.Up, ""},
+		{m.keyMap.Down, ""},
+		{m.keyMap.Select, ""},
+		{m.keyMap.SelectAll, ""},
+		{m.keyMap.Join, "Join"},
+		{m.keyMap.Leave, "Leave"},
+		{m.keyMap.Confirm, "Confirm"},
+		{m.keyMap.Reject, "Reject"},
+		{m.keyMap.Pause, "Pause"},
+		{m.keyMap.Resume, "Resume"},
+		{m.keyMap.ToggleManual, "ToggleManual"},
+		{m.keyMap.Refresh, ""},
+		{m.keyMap.Sort, ""},
+		{m.keyMap.Quit, ""},
+	}
+
+	var parts []string
+	for _, e := range entries {
+		h := e.b.Help()
+		text := h.Key + " " + h.Desc
+		switch {
+		case e.action == "":
+			parts = append(parts, lipgloss.NewStyle().Foreground(mHelpColor).Render(text))
+		case applicable[e.action]:
+			parts = append(parts, lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(text))
+		default:
+			parts = append(parts, lipgloss.NewStyle().Foreground(mDimColor).Render(text))
+		}
+	}
+	return strings.Join(parts, "  ")
 }
 
 // advanceQueue starts the next queued action if any remain.
@@ -809,7 +948,17 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, fetchData(m.client)
 
 	case key.Matches(msg, m.keyMap.Join):
-		if m.actionInFlight || m.focus != availablePanel {
+		if m.actionInFlight {
+			return m, nil
+		}
+		if m.focus != availablePanel {
+			m.statusMsg = "Join is only available in the Available Shards panel (Tab to switch)"
+			m.statusIsError = true
+			return m, nil
+		}
+		if len(m.freeWorkers) == 0 {
+			m.statusMsg = "Join requires at least one free worker"
+			m.statusIsError = true
 			return m, nil
 		}
 		rows := m.selectedAvailRows()
@@ -820,56 +969,105 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		for _, row := range rows {
 			filters = append(filters, row.filter)
 		}
-
-		// If there are free workers, let user pick which to mark manual.
-		if len(m.freeWorkers) > 0 {
-			m.joinPickerActive = true
-			m.joinPickerCursor = 0
-			m.joinPickerWorkers = append([]uint32(nil), m.freeWorkers...)
-			m.joinPickerSelected = make(map[uint32]bool)
-			m.joinPickerFilters = filters
-			return m, nil
-		}
-
-		// No free workers — proceed with join only.
-		m.actionInFlight = true
-		m.statusMsg = fmt.Sprintf("Joining %d shard(s) (VDF may take a while)...", len(filters))
-		m.statusIsError = false
-		m.availSelected = make(map[string]bool)
-		return m, doJoin(m.client, filters)
+		m.joinPickerActive = true
+		m.joinPickerCursor = 0
+		m.joinPickerWorkers = append([]uint32(nil), m.freeWorkers...)
+		m.joinPickerSelected = make(map[uint32]bool)
+		m.joinPickerFilters = filters
+		return m, nil
 
 	case key.Matches(msg, m.keyMap.Leave):
-		if m.actionInFlight || m.focus != allocationsPanel {
+		if m.actionInFlight {
+			return m, nil
+		}
+		if m.focus != allocationsPanel {
+			m.statusMsg = fmt.Sprintf("Leave is only available in the Allocations panel (Tab to switch). Current panel supports: %s", m.applicableActionsLabel())
+			m.statusIsError = true
 			return m, nil
 		}
 		return m.startMultiFilterAction("Leave", m.selectedAllocRows(), func(s uint32) bool { return s == 2 })
 
 	case key.Matches(msg, m.keyMap.Confirm):
-		if m.actionInFlight || m.focus != allocationsPanel {
+		if m.actionInFlight {
 			return m, nil
 		}
-		return m.startMultiFilterAction("Confirm", m.selectedAllocRows(), func(s uint32) bool { return s == 1 || s == 4 })
+		if m.focus != allocationsPanel {
+			m.statusMsg = fmt.Sprintf("Confirm is only available in the Allocations panel (Tab to switch). Current panel supports: %s", m.applicableActionsLabel())
+			m.statusIsError = true
+			return m, nil
+		}
+		// Pre-filter to rows whose confirmation window is currently open.
+		var confirmRows []allocationRow
+		var earliestConfirmFrame uint64
+		for _, row := range m.selectedAllocRows() {
+			var actionFrame uint64
+			switch row.status {
+			case 1:
+				if row.joinFrame > 0 {
+					actionFrame = row.joinFrame + ACTION_FRAME_DELAY
+					if m.frameNumber >= actionFrame && m.frameNumber < row.joinFrame+ACTION_FRAME_DELAY*2 {
+						confirmRows = append(confirmRows, row)
+					}
+				}
+			case 4:
+				if row.leaveFrame > 0 {
+					actionFrame = row.leaveFrame + ACTION_FRAME_DELAY
+					if m.frameNumber >= actionFrame && m.frameNumber < row.leaveFrame+ACTION_FRAME_DELAY*2 {
+						confirmRows = append(confirmRows, row)
+					}
+				}
+			}
+			if actionFrame > m.frameNumber && (earliestConfirmFrame == 0 || actionFrame < earliestConfirmFrame) {
+				earliestConfirmFrame = actionFrame
+			}
+		}
+		if len(confirmRows) == 0 && earliestConfirmFrame > 0 {
+			m.statusMsg = fmt.Sprintf("Confirm not yet available (current frame: %d, opens at: %d). Applicable action(s): Reject", m.frameNumber, earliestConfirmFrame)
+			m.statusIsError = true
+			return m, nil
+		}
+		return m.startMultiFilterAction("Confirm", confirmRows, func(s uint32) bool { return s == 1 || s == 4 })
 
 	case key.Matches(msg, m.keyMap.Reject):
-		if m.actionInFlight || m.focus != allocationsPanel {
+		if m.actionInFlight {
+			return m, nil
+		}
+		if m.focus != allocationsPanel {
+			m.statusMsg = fmt.Sprintf("Reject is only available in the Allocations panel (Tab to switch). Current panel supports: %s", m.applicableActionsLabel())
+			m.statusIsError = true
 			return m, nil
 		}
 		return m.startMultiFilterAction("Reject", m.selectedAllocRows(), func(s uint32) bool { return s == 1 || s == 4 })
 
 	case key.Matches(msg, m.keyMap.Pause):
-		if m.actionInFlight || m.focus != allocationsPanel {
+		if m.actionInFlight {
+			return m, nil
+		}
+		if m.focus != allocationsPanel {
+			m.statusMsg = fmt.Sprintf("Pause is only available in the Allocations panel (Tab to switch). Current panel supports: %s", m.applicableActionsLabel())
+			m.statusIsError = true
 			return m, nil
 		}
 		return m.startBatchAction("Pause", m.selectedAllocRows(), func(s uint32) bool { return s == 2 })
 
 	case key.Matches(msg, m.keyMap.Resume):
-		if m.actionInFlight || m.focus != allocationsPanel {
+		if m.actionInFlight {
+			return m, nil
+		}
+		if m.focus != allocationsPanel {
+			m.statusMsg = fmt.Sprintf("Resume is only available in the Allocations panel (Tab to switch). Current panel supports: %s", m.applicableActionsLabel())
+			m.statusIsError = true
 			return m, nil
 		}
 		return m.startBatchAction("Resume", m.selectedAllocRows(), func(s uint32) bool { return s == 3 })
 
 	case key.Matches(msg, m.keyMap.ToggleManual):
-		if m.actionInFlight || m.focus != allocationsPanel {
+		if m.actionInFlight {
+			return m, nil
+		}
+		if m.focus != allocationsPanel {
+			m.statusMsg = fmt.Sprintf("Mode toggle is only available in the Allocations panel (Tab to switch). Current panel supports: %s", m.applicableActionsLabel())
+			m.statusIsError = true
 			return m, nil
 		}
 		filtered := m.filteredAllocations()
@@ -1466,7 +1664,7 @@ func (m manageModel) renderView() string {
 		)
 	}
 
-	helpLine := m.help.View(m.keyMap)
+	helpLine := m.renderHelpLine()
 	footer := statusLine
 	if footer != "" {
 		footer += "  "
