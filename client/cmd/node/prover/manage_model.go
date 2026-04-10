@@ -1692,7 +1692,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	}
 
 	// Build column header with sort indicators and sort-mode column highlighting.
-	allocColNames := []string{"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward", "Worker", "Status", "Mode", "Next Action", "Default Action"}
+	allocColNames := []string{"Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Reward [Q/f]", "Worker", "Status", "Mode", "Next Action", "Default Action"}
 	allocColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH, WORKER_WIDTH, STATUS_WIDTH, MODE_WIDTH, NEXT_ACTION_WIDTH, DEFAULT_ACTION_WIDTH}
 	if m.allocSortCol >= 0 && m.allocSortCol < len(allocColWidths) {
 		allocColWidths[m.allocSortCol] += 2
@@ -1750,9 +1750,9 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 			centerTrunc(a.filterHex, fw),
 			a.activeProvers,
 			a.ring,
-			formatStorage(a.shardSize.Uint64()),
+			fmt.Sprintf("%.1f", float64(a.shardSize.Uint64())/float64(1024*1024)),
 			a.dataShards,
-			"~"+formatQUIL(a.estimatedReward)+" Q/f",
+			"~"+formatQUIL(a.estimatedReward),
 			workerStr,
 			a.statusName,
 			modeStr,
@@ -1783,7 +1783,7 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	}
 
 	// Build column header with sort indicators and sort-mode column highlighting.
-	availColNames := []string{"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward"}
+	availColNames := []string{"Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Reward [Q/f]"}
 	availColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH}
 	if m.availSortCol >= 0 && m.availSortCol < len(availColWidths) {
 		availColWidths[m.availSortCol] += 2
@@ -1831,9 +1831,9 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 			centerTrunc(s.filterHex, fw),
 			s.activeProvers,
 			s.ring,
-			formatStorage(s.shardSize.Uint64()),
+			fmt.Sprintf("%.1f", float64(s.shardSize.Uint64())/float64(1024*1024)),
 			s.dataShards,
-			"~"+formatQUIL(s.estimatedReward)+" Q/f",
+			"~"+formatQUIL(s.estimatedReward),
 		)
 		if i == m.availCursor && m.focus == availablePanel {
 			line = mSelectedStyle.Width(width).Render(line)
