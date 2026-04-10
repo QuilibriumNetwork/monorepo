@@ -33,6 +33,62 @@ type pendingAction struct {
 	status uint32
 }
 
+// columnFilter holds the active filter state for a single table column.
+type columnFilter struct {
+	text   string          // filterColText: substring to match against hex
+	values map[string]bool // filterColSelect: selected values (empty = all = no filter)
+	expr   string          // filterColNumeric: expression like "> 47" or "1,5,7"
+}
+
+func (cf columnFilter) isActive() bool {
+	return cf.text != "" || len(cf.values) > 0 || cf.expr != ""
+}
+
+type filterColKind int
+
+const (
+	filterColText    filterColKind = iota // text substring (Filter column)
+	filterColNumeric                      // numeric expression
+	filterColSelect                       // text multi-value select
+)
+
+// Package-level column name definitions, shared between rendering and filtering.
+var (
+	allocColNames = []string{
+		"Select", "Filter", "Provers", "Ring", "Size [MB]",
+		"Shards", "Reward [Q/f]", "Worker", "Status", "Mode",
+		"Next Action", "Default Action",
+	}
+	availColNames = []string{
+		"Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Reward [Q/f]",
+	}
+
+	// Filterable column indices per panel (matching sort column indices).
+	allocFilterableCols = []int{1, 2, 3, 4, 5, 6, 7, 8, 9}
+	availFilterableCols = []int{1, 2, 3, 4, 5, 6}
+
+	// Filter kind per absolute column index.
+	allocFilterColKinds = map[int]filterColKind{
+		1: filterColText,
+		2: filterColNumeric,
+		3: filterColNumeric,
+		4: filterColNumeric,
+		5: filterColNumeric,
+		6: filterColNumeric,
+		7: filterColNumeric,
+		8: filterColSelect,
+		9: filterColSelect,
+	}
+	availFilterColKinds = map[int]filterColKind{
+		1: filterColText,
+		2: filterColNumeric,
+		3: filterColNumeric,
+		4: filterColNumeric,
+		5: filterColNumeric,
+		6: filterColNumeric,
+	}
+)
+
 // Row types for each panel.
 
 type allocationRow struct {
@@ -148,6 +204,7 @@ type manageKeyMap struct {
 	ToggleManual key.Binding
 	Refresh      key.Binding
 	Sort         key.Binding
+	Filter       key.Binding
 	Quit         key.Binding
 }
 
@@ -191,12 +248,13 @@ func newManageKeyMap() manageKeyMap {
 		ToggleManual: key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "mode")),
 		Refresh:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
 		Sort:         key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "sort")),
+		Filter:       key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "filter")),
 		Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
 func (k manageKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Sort, k.Quit}
+	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Sort, k.Filter, k.Quit}
 }
 
 func (k manageKeyMap) FullHelp() [][]key.Binding { return nil }
@@ -234,6 +292,7 @@ var (
 
 	mStatusSuccessStyle = lipgloss.NewStyle().Foreground(mSuccessColor)
 	mStatusErrorStyle   = lipgloss.NewStyle().Foreground(mErrorColor)
+	mFilterColor        = lipgloss.Color("#ffaa00") // amber: active filter indicator
 )
 
 // Model.
@@ -270,10 +329,6 @@ type manageModel struct {
 	actionTotal int
 	actionIndex int
 
-	// Filter input for each panel.
-	allocFilter string
-	availFilter string
-
 	// Free workers (no filter assigned), refreshed each data fetch.
 	freeWorkers []uint32
 
@@ -304,6 +359,24 @@ type manageModel struct {
 	sortOrderMode    bool // sort order prompt active (sub-state of sortMode)
 	sortHighlightCol int  // 0-based column index highlighted in sortMode
 
+	// Per-column filter state (keyed by absolute column index).
+	allocColFilters map[int]columnFilter
+	availColFilters map[int]columnFilter
+
+	// Filter mode state per panel (entered via 'f' key).
+	allocFilterMode         bool
+	allocFilterHighlightIdx int // index into allocFilterableCols
+	availFilterMode         bool
+	availFilterHighlightIdx int // index into availFilterableCols
+
+	// Filter column edit state.
+	filterEditActive       bool
+	filterEditColIdx       int
+	filterEditInput        string // text/numeric input
+	filterEditSelectCursor int
+	filterEditSelectItems  []string
+	filterEditSelectState  map[string]bool
+
 	// UI.
 	width          int
 	height         int
@@ -323,17 +396,19 @@ func newManageModel(client protobufs.NodeServiceClient) manageModel {
 	h := help.New()
 
 	return manageModel{
-		client:        client,
-		keyMap:        newManageKeyMap(),
-		spinner:       s,
-		help:          h,
-		autoManaged:   true, // derived from server data on first refresh
-		allocSelected: make(map[string]bool),
-		availSelected: make(map[string]bool),
-		allocSortCol:  7, // Worker column, descending
-		allocSortAsc:  true,
-		availSortCol:  6, // Reward column, descending
-		availSortAsc:  false,
+		client:          client,
+		keyMap:          newManageKeyMap(),
+		spinner:         s,
+		help:            h,
+		autoManaged:     true, // derived from server data on first refresh
+		allocSelected:   make(map[string]bool),
+		availSelected:   make(map[string]bool),
+		allocSortCol:    7, // Worker column, descending
+		allocSortAsc:    true,
+		availSortCol:    6, // Reward column, descending
+		availSortAsc:    false,
+		allocColFilters: make(map[int]columnFilter),
+		availColFilters: make(map[int]columnFilter),
 	}
 }
 
@@ -790,7 +865,7 @@ func (m manageModel) renderHelpLine() string {
 
 	type helpEntry struct {
 		b      key.Binding
-		action string // empty = always shown in normal help color
+		action string // empty = always shown in normal help color; "Filter" = filter indicator
 	}
 	entries := []helpEntry{
 		{m.keyMap.Tab, ""},
@@ -807,14 +882,24 @@ func (m manageModel) renderHelpLine() string {
 		{m.keyMap.ToggleManual, "ToggleManual"},
 		{m.keyMap.Refresh, ""},
 		{m.keyMap.Sort, ""},
+		{m.keyMap.Filter, "Filter"},
 		{m.keyMap.Quit, ""},
 	}
+
+	filtersActive := m.hasActiveFilters()
 
 	var parts []string
 	for _, e := range entries {
 		h := e.b.Help()
 		text := h.Key + " " + h.Desc
 		switch {
+		case e.action == "Filter":
+			// Use a distinct amber color when filtering is enabled.
+			if filtersActive {
+				parts = append(parts, lipgloss.NewStyle().Foreground(mFilterColor).Bold(true).Render(text))
+			} else {
+				parts = append(parts, lipgloss.NewStyle().Foreground(mHelpColor).Render(text))
+			}
 		case e.action == "":
 			parts = append(parts, lipgloss.NewStyle().Foreground(mHelpColor).Render(text))
 		case applicable[e.action]:
@@ -848,9 +933,276 @@ func (m *manageModel) advanceQueue() tea.Cmd {
 	return nil
 }
 
+// ── Filter helpers ──────────────────────────────────────────────────────────
+
+// activePanelFilterCols returns the filterable column indices for the focused panel.
+func (m manageModel) activePanelFilterCols() []int {
+	if m.focus == allocationsPanel {
+		return allocFilterableCols
+	}
+	return availFilterableCols
+}
+
+// isFilterModeActive returns true when the focused panel is in filter navigation mode.
+func (m manageModel) isFilterModeActive() bool {
+	if m.focus == allocationsPanel {
+		return m.allocFilterMode
+	}
+	return m.availFilterMode
+}
+
+// getFilterHighlightIdx returns the filter highlight index for the focused panel.
+func (m manageModel) getFilterHighlightIdx() int {
+	if m.focus == allocationsPanel {
+		return m.allocFilterHighlightIdx
+	}
+	return m.availFilterHighlightIdx
+}
+
+// activeFilterColIdx returns the absolute column index currently highlighted in filter mode.
+func (m manageModel) activeFilterColIdx() int {
+	cols := m.activePanelFilterCols()
+	idx := m.getFilterHighlightIdx()
+	if idx < len(cols) {
+		return cols[idx]
+	}
+	return -1
+}
+
+// activeFilterColKind returns the filter kind for a column in the focused panel.
+func (m manageModel) activeFilterColKind(colIdx int) filterColKind {
+	if m.focus == allocationsPanel {
+		return allocFilterColKinds[colIdx]
+	}
+	return availFilterColKinds[colIdx]
+}
+
+// activeFilterCol returns the current columnFilter for a column in the focused panel.
+func (m manageModel) activeFilterCol(colIdx int) columnFilter {
+	if m.focus == allocationsPanel {
+		return m.allocColFilters[colIdx]
+	}
+	return m.availColFilters[colIdx]
+}
+
+// setActiveFilterCol stores a columnFilter for a column in the focused panel.
+func (m *manageModel) setActiveFilterCol(colIdx int, cf columnFilter) {
+	if m.focus == allocationsPanel {
+		if cf.isActive() {
+			m.allocColFilters[colIdx] = cf
+		} else {
+			delete(m.allocColFilters, colIdx)
+		}
+	} else {
+		if cf.isActive() {
+			m.availColFilters[colIdx] = cf
+		} else {
+			delete(m.availColFilters, colIdx)
+		}
+	}
+}
+
+// hasActiveFilters returns true if any column filter is active in the focused panel.
+func (m manageModel) hasActiveFilters() bool {
+	if m.focus == allocationsPanel {
+		for _, cf := range m.allocColFilters {
+			if cf.isActive() {
+				return true
+			}
+		}
+		return false
+	}
+	for _, cf := range m.availColFilters {
+		if cf.isActive() {
+			return true
+		}
+	}
+	return false
+}
+
+// filterSelectValues returns the set of unique values for a select-kind column.
+func (m manageModel) filterSelectValues(colIdx int) []string {
+	seen := make(map[string]bool)
+	if m.focus == allocationsPanel {
+		for _, row := range m.allocations {
+			v := allocRowTextVal(row, colIdx)
+			if v != "" {
+				seen[v] = true
+			}
+		}
+	}
+	var vals []string
+	for v := range seen {
+		vals = append(vals, v)
+	}
+	sort.Strings(vals)
+	return vals
+}
+
+// clampCursors clamps panel cursors to valid ranges after filter changes.
+func (m *manageModel) clampCursors() {
+	if sorted := m.sortedAllocations(); m.allocCursor >= len(sorted) {
+		m.allocCursor = max(0, len(sorted)-1)
+	}
+	if sorted := m.sortedAvailable(); m.availCursor >= len(sorted) {
+		m.availCursor = max(0, len(sorted)-1)
+	}
+}
+
+// allocRowNumericVal returns the numeric value for a filterable numeric column.
+func allocRowNumericVal(row allocationRow, colIdx int) float64 {
+	switch colIdx {
+	case 2:
+		return float64(row.activeProvers)
+	case 3:
+		return float64(row.ring)
+	case 4:
+		if row.shardSize == nil {
+			return 0
+		}
+		return float64(row.shardSize.Uint64()) / float64(1024*1024)
+	case 5:
+		return float64(row.dataShards)
+	case 6:
+		if row.estimatedReward == nil || row.estimatedReward.Sign() == 0 {
+			return 0
+		}
+		f, _ := new(big.Float).SetInt(row.estimatedReward).Float64()
+		return f / 1e8
+	case 7:
+		return float64(row.workerID)
+	}
+	return 0
+}
+
+// allocRowTextVal returns the text value for a filterable text/select column.
+func allocRowTextVal(row allocationRow, colIdx int) string {
+	switch colIdx {
+	case 1:
+		return row.filterHex
+	case 8:
+		return row.statusName
+	case 9:
+		if row.manuallyManaged {
+			return "M"
+		}
+		return "A"
+	}
+	return ""
+}
+
+// availRowNumericVal returns the numeric value for a filterable numeric column (available panel).
+func availRowNumericVal(row shardRow, colIdx int) float64 {
+	switch colIdx {
+	case 2:
+		return float64(row.activeProvers)
+	case 3:
+		return float64(row.ring)
+	case 4:
+		if row.shardSize == nil {
+			return 0
+		}
+		return float64(row.shardSize.Uint64()) / float64(1024*1024)
+	case 5:
+		return float64(row.dataShards)
+	case 6:
+		if row.estimatedReward == nil || row.estimatedReward.Sign() == 0 {
+			return 0
+		}
+		f, _ := new(big.Float).SetInt(row.estimatedReward).Float64()
+		return f / 1e8
+	}
+	return 0
+}
+
+// parseNumericExpr parses a filter expression such as "> 47", ">= 5.5", "=3", or "1,3,7".
+// Returns (op, threshold, values); op is "", ">", ">=", "<", "<=", "=" or "in".
+func parseNumericExpr(expr string) (op string, threshold float64, values []float64) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return "", 0, nil
+	}
+	for _, prefix := range []string{">=", "<=", ">", "<", "="} {
+		if strings.HasPrefix(expr, prefix) {
+			rest := strings.TrimSpace(expr[len(prefix):])
+			v, err := strconv.ParseFloat(rest, 64)
+			if err != nil {
+				return "", 0, nil
+			}
+			return prefix, v, nil
+		}
+	}
+	// Comma-separated value list.
+	parts := strings.Split(expr, ",")
+	var vals []float64
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		v, err := strconv.ParseFloat(p, 64)
+		if err != nil {
+			return "", 0, nil
+		}
+		vals = append(vals, v)
+	}
+	if len(vals) > 0 {
+		return "in", 0, vals
+	}
+	return "", 0, nil
+}
+
+// matchesNumericExpr returns true if val satisfies the filter expression.
+func matchesNumericExpr(val float64, expr string) bool {
+	if expr == "" {
+		return true
+	}
+	op, threshold, values := parseNumericExpr(expr)
+	switch op {
+	case ">":
+		return val > threshold
+	case ">=":
+		return val >= threshold
+	case "<":
+		return val < threshold
+	case "<=":
+		return val <= threshold
+	case "=":
+		return val == threshold
+	case "in":
+		parts := strings.Split(expr, ",")
+		for i, v := range values {
+			if val == v {
+				return true
+			}
+			// For filter values with a decimal point, compare using formatted strings
+			// to handle float64 precision (e.g. "47.1" should match 47.09375 displayed as "47.1").
+			if i < len(parts) {
+				part := strings.TrimSpace(parts[i])
+				if dotIdx := strings.IndexByte(part, '.'); dotIdx >= 0 {
+					decimals := len(part) - dotIdx - 1
+					if fmt.Sprintf("%.*f", decimals, val) == part {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	return true // unparseable = no filter
+}
+
+// ── Key handlers ─────────────────────────────────────────────────────────────
+
 func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.joinPickerActive {
 		return m.handleJoinPickerKey(msg)
+	}
+	if m.filterEditActive {
+		return m.handleFilterEditKey(msg)
+	}
+	if m.isFilterModeActive() {
+		return m.handleFilterModeKey(msg)
 	}
 	if m.sortMode && m.sortOrderMode {
 		return m.handleSortOrderKey(msg)
@@ -869,6 +1221,7 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.focus = allocationsPanel
 		}
+		m.filterEditActive = false
 
 	case key.Matches(msg, m.keyMap.Select):
 		if m.focus == allocationsPanel {
@@ -1088,6 +1441,16 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.sortMode = true
 		m.sortOrderMode = false
 		m.sortHighlightCol = 0
+
+	case key.Matches(msg, m.keyMap.Filter):
+		if m.focus == allocationsPanel {
+			m.allocFilterMode = true
+			m.allocFilterHighlightIdx = 0
+		} else {
+			m.availFilterMode = true
+			m.availFilterHighlightIdx = 0
+		}
+		m.filterEditActive = false
 	}
 
 	return m, nil
@@ -1298,29 +1661,71 @@ func (m *manageModel) processRefreshData(
 }
 
 func (m manageModel) filteredAllocations() []allocationRow {
-	if m.allocFilter == "" {
+	if len(m.allocColFilters) == 0 {
 		return m.allocations
 	}
 	var out []allocationRow
-	for _, a := range m.allocations {
-		if strings.Contains(a.filterHex, m.allocFilter) {
-			out = append(out, a)
+	for _, row := range m.allocations {
+		if m.allocRowMatchesFilters(row) {
+			out = append(out, row)
 		}
 	}
 	return out
 }
 
+func (m manageModel) allocRowMatchesFilters(row allocationRow) bool {
+	for colIdx, cf := range m.allocColFilters {
+		if !cf.isActive() {
+			continue
+		}
+		switch allocFilterColKinds[colIdx] {
+		case filterColText:
+			if !strings.Contains(row.filterHex, cf.text) {
+				return false
+			}
+		case filterColNumeric:
+			if !matchesNumericExpr(allocRowNumericVal(row, colIdx), cf.expr) {
+				return false
+			}
+		case filterColSelect:
+			if len(cf.values) > 0 && !cf.values[allocRowTextVal(row, colIdx)] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (m manageModel) filteredAvailable() []shardRow {
-	if m.availFilter == "" {
+	if len(m.availColFilters) == 0 {
 		return m.available
 	}
 	var out []shardRow
-	for _, s := range m.available {
-		if strings.Contains(s.filterHex, m.availFilter) {
-			out = append(out, s)
+	for _, row := range m.available {
+		if m.availRowMatchesFilters(row) {
+			out = append(out, row)
 		}
 	}
 	return out
+}
+
+func (m manageModel) availRowMatchesFilters(row shardRow) bool {
+	for colIdx, cf := range m.availColFilters {
+		if !cf.isActive() {
+			continue
+		}
+		switch availFilterColKinds[colIdx] {
+		case filterColText:
+			if !strings.Contains(row.filterHex, cf.text) {
+				return false
+			}
+		case filterColNumeric:
+			if !matchesNumericExpr(availRowNumericVal(row, colIdx), cf.expr) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // sortedAllocations returns filtered allocations sorted by the active sort column.
@@ -1520,6 +1925,200 @@ func (m manageModel) handleSortOrderKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd
 	return m, nil
 }
 
+// handleFilterModeKey processes key events during filter column navigation.
+func (m manageModel) handleFilterModeKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	rightKey := key.NewBinding(key.WithKeys("right"))
+	leftKey := key.NewBinding(key.WithKeys("left"))
+	enterKey := key.NewBinding(key.WithKeys("enter"))
+	escKey := key.NewBinding(key.WithKeys("esc"))
+	delKey := key.NewBinding(key.WithKeys("delete", "backspace"))
+	xKey := key.NewBinding(key.WithKeys("x"))
+
+	filterCols := m.activePanelFilterCols()
+	numCols := len(filterCols)
+	hiIdx := m.getFilterHighlightIdx()
+
+	setHiIdx := func(idx int) {
+		if m.focus == allocationsPanel {
+			m.allocFilterHighlightIdx = idx
+		} else {
+			m.availFilterHighlightIdx = idx
+		}
+	}
+	closeFilterMode := func() {
+		if m.focus == allocationsPanel {
+			m.allocFilterMode = false
+		} else {
+			m.availFilterMode = false
+		}
+	}
+
+	switch {
+	case key.Matches(msg, rightKey):
+		setHiIdx((hiIdx + 1) % numCols)
+	case key.Matches(msg, leftKey):
+		setHiIdx((hiIdx - 1 + numCols) % numCols)
+	case key.Matches(msg, enterKey):
+		if hiIdx < numCols {
+			colIdx := filterCols[hiIdx]
+			kind := m.activeFilterColKind(colIdx)
+			m.filterEditColIdx = colIdx
+			m.filterEditActive = true
+			switch kind {
+			case filterColText:
+				m.filterEditInput = m.activeFilterCol(colIdx).text
+			case filterColNumeric:
+				m.filterEditInput = m.activeFilterCol(colIdx).expr
+			case filterColSelect:
+				m.filterEditSelectItems = m.filterSelectValues(colIdx)
+				existing := m.activeFilterCol(colIdx)
+				m.filterEditSelectState = make(map[string]bool)
+				if len(existing.values) > 0 {
+					for v := range existing.values {
+						m.filterEditSelectState[v] = true
+					}
+				} else {
+					// No active filter = all items "selected" (shown)
+					for _, v := range m.filterEditSelectItems {
+						m.filterEditSelectState[v] = true
+					}
+				}
+				m.filterEditSelectCursor = 0
+			}
+		}
+	case key.Matches(msg, delKey):
+		// Clear filter for the highlighted column.
+		if hiIdx < numCols {
+			colIdx := filterCols[hiIdx]
+			m.setActiveFilterCol(colIdx, columnFilter{})
+			m.clampCursors()
+		}
+	case key.Matches(msg, xKey):
+		// Disable all filtering for the focused panel only.
+		closeFilterMode()
+		m.filterEditActive = false
+		if m.focus == allocationsPanel {
+			m.allocColFilters = make(map[int]columnFilter)
+		} else {
+			m.availColFilters = make(map[int]columnFilter)
+		}
+		m.clampCursors()
+	case key.Matches(msg, escKey):
+		// Close filter panel without clearing filters.
+		closeFilterMode()
+		m.filterEditActive = false
+	case key.Matches(msg, m.keyMap.Quit):
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+// handleFilterEditKey dispatches to the appropriate edit handler.
+func (m manageModel) handleFilterEditKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	kind := m.activeFilterColKind(m.filterEditColIdx)
+	if kind == filterColSelect {
+		return m.handleFilterSelectKey(msg)
+	}
+	return m.handleFilterTextKey(msg)
+}
+
+// handleFilterTextKey handles text/numeric filter input.
+func (m manageModel) handleFilterTextKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	enterKey := key.NewBinding(key.WithKeys("enter"))
+	escKey := key.NewBinding(key.WithKeys("esc"))
+	bsKey := key.NewBinding(key.WithKeys("backspace", "ctrl+h"))
+
+	switch {
+	case key.Matches(msg, enterKey):
+		kind := m.activeFilterColKind(m.filterEditColIdx)
+		cf := columnFilter{}
+		switch kind {
+		case filterColText:
+			cf.text = m.filterEditInput
+		case filterColNumeric:
+			cf.expr = m.filterEditInput
+		}
+		m.setActiveFilterCol(m.filterEditColIdx, cf)
+		m.filterEditActive = false
+		m.filterEditInput = ""
+		m.clampCursors()
+	case key.Matches(msg, escKey):
+		m.filterEditActive = false
+		m.filterEditInput = ""
+	case key.Matches(msg, bsKey):
+		runes := []rune(m.filterEditInput)
+		if len(runes) > 0 {
+			m.filterEditInput = string(runes[:len(runes)-1])
+		}
+	default:
+		if msg.Text != "" {
+			m.filterEditInput += msg.Text
+		}
+	}
+	return m, nil
+}
+
+// handleFilterSelectKey handles multi-value select filter input.
+func (m manageModel) handleFilterSelectKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	enterKey := key.NewBinding(key.WithKeys("enter"))
+	escKey := key.NewBinding(key.WithKeys("esc"))
+	rightKey := key.NewBinding(key.WithKeys("right"))
+	leftKey := key.NewBinding(key.WithKeys("left"))
+	aKey := key.NewBinding(key.WithKeys("a", "A"))
+	n := len(m.filterEditSelectItems)
+
+	switch {
+	case key.Matches(msg, rightKey):
+		if n > 0 {
+			m.filterEditSelectCursor = (m.filterEditSelectCursor + 1) % n
+		}
+	case key.Matches(msg, leftKey):
+		if n > 0 {
+			m.filterEditSelectCursor = (m.filterEditSelectCursor - 1 + n) % n
+		}
+	case key.Matches(msg, m.keyMap.Select): // space
+		if m.filterEditSelectCursor < n {
+			v := m.filterEditSelectItems[m.filterEditSelectCursor]
+			m.filterEditSelectState[v] = !m.filterEditSelectState[v]
+		}
+	case key.Matches(msg, aKey):
+		// Toggle all: if all are selected, deselect all; otherwise select all.
+		allSelected := true
+		for _, v := range m.filterEditSelectItems {
+			if !m.filterEditSelectState[v] {
+				allSelected = false
+				break
+			}
+		}
+		for _, v := range m.filterEditSelectItems {
+			m.filterEditSelectState[v] = !allSelected
+		}
+	case key.Matches(msg, enterKey):
+		// Build value set. If all items are selected (or no items exist), clear the filter.
+		values := make(map[string]bool)
+		allSelected := true
+		for _, v := range m.filterEditSelectItems {
+			if m.filterEditSelectState[v] {
+				values[v] = true
+			} else {
+				allSelected = false
+			}
+		}
+		cf := columnFilter{}
+		if !allSelected && len(values) > 0 {
+			cf.values = values
+		}
+		m.setActiveFilterCol(m.filterEditColIdx, cf)
+		m.filterEditActive = false
+		m.filterEditSelectState = nil
+		m.clampCursors()
+	case key.Matches(msg, escKey):
+		m.filterEditActive = false
+		m.filterEditSelectState = nil
+	}
+	return m, nil
+}
+
 // applySort applies the selected column and direction to the active panel.
 func (m *manageModel) applySort(asc bool) {
 	if m.focus == allocationsPanel {
@@ -1644,36 +2243,103 @@ func (m manageModel) renderView() string {
 	}
 	doc.WriteString("\n")
 
-	// Actions line (key bindings or sort hint).
-	var actionsLine string
-	if m.sortMode && m.sortOrderMode {
+	// Actions line (key bindings, sort hint, or filter UI).
+	var actionsLine, statusLine string
+	switch {
+	case m.filterEditActive:
+		actionsLine, statusLine = m.renderFilterEditLines()
+	case m.isFilterModeActive():
+		colIdx := m.activeFilterColIdx()
+		colName := ""
+		if m.focus == allocationsPanel && colIdx >= 0 && colIdx < len(allocColNames) {
+			colName = allocColNames[colIdx]
+		} else if m.focus == availablePanel && colIdx >= 0 && colIdx < len(availColNames) {
+			colName = availColNames[colIdx]
+		}
+		actionsLine = lipgloss.NewStyle().Foreground(mFilterColor).Bold(true).Render(
+			fmt.Sprintf("Filter [%s]: [←/→] Column  [Enter] Edit  [Del] Clear  [x] Disable all  [Esc] Close", colName),
+		)
+		if m.actionInFlight {
+			statusLine = m.spinner.View() + " " + m.statusMsg
+		} else if m.statusMsg != "" {
+			if m.statusIsError {
+				statusLine = mStatusErrorStyle.Render(m.statusMsg)
+			} else {
+				statusLine = mStatusSuccessStyle.Render(m.statusMsg)
+			}
+		}
+	case m.sortMode && m.sortOrderMode:
 		actionsLine = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
 			"Sort order: [Enter/a] Ascending (default)  [d] Descending  [Esc] Cancel",
 		)
-	} else if m.sortMode {
+	case m.sortMode:
 		actionsLine = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
 			"Sort: [←/→] Move column  [Enter] Confirm  [Esc] Cancel",
 		)
-	} else {
+	default:
 		actionsLine = m.renderHelpLine()
+		if m.actionInFlight {
+			statusLine = m.spinner.View() + " " + m.statusMsg
+		} else if m.statusMsg != "" {
+			if m.statusIsError {
+				statusLine = mStatusErrorStyle.Render(m.statusMsg)
+			} else {
+				statusLine = mStatusSuccessStyle.Render(m.statusMsg)
+			}
+		}
 	}
 	doc.WriteString(mFooterStyle.Width(m.width).Render(actionsLine))
 	doc.WriteString("\n")
-
-	// Status line.
-	statusLine := ""
-	if m.actionInFlight {
-		statusLine = m.spinner.View() + " " + m.statusMsg
-	} else if m.statusMsg != "" {
-		if m.statusIsError {
-			statusLine = mStatusErrorStyle.Render(m.statusMsg)
-		} else {
-			statusLine = mStatusSuccessStyle.Render(m.statusMsg)
-		}
-	}
 	doc.WriteString(mFooterStyle.Width(m.width).Render(statusLine))
 
 	return doc.String()
+}
+
+// renderFilterEditLines returns the (actionsLine, statusLine) pair rendered during filter editing.
+func (m manageModel) renderFilterEditLines() (string, string) {
+	colName := ""
+	if m.focus == allocationsPanel && m.filterEditColIdx < len(allocColNames) {
+		colName = allocColNames[m.filterEditColIdx]
+	} else if m.focus == availablePanel && m.filterEditColIdx < len(availColNames) {
+		colName = availColNames[m.filterEditColIdx]
+	}
+
+	kind := m.activeFilterColKind(m.filterEditColIdx)
+
+	if kind == filterColSelect {
+		// Show horizontal toggle list with cursor indicator.
+		var itemParts []string
+		for i, v := range m.filterEditSelectItems {
+			checked := "[ ]"
+			if m.filterEditSelectState[v] {
+				checked = "[x]"
+			}
+			item := fmt.Sprintf("%s %s", checked, v)
+			if i == m.filterEditSelectCursor {
+				item = lipgloss.NewStyle().Foreground(mFilterColor).Bold(true).Render("▶" + item)
+			} else {
+				item = lipgloss.NewStyle().Foreground(mHelpColor).Render("  " + item)
+			}
+			itemParts = append(itemParts, item)
+		}
+		actionsLine := fmt.Sprintf("Filter [%s]: %s", colName, strings.Join(itemParts, "  "))
+		statusLine := lipgloss.NewStyle().Foreground(mHelpColor).Render(
+			"←/→: navigate  Space: toggle  a: all/none  Enter: apply  Esc: cancel",
+		)
+		return actionsLine, statusLine
+	}
+
+	// Text or numeric input.
+	cursor := lipgloss.NewStyle().Foreground(mFilterColor).Render("_")
+	actionsLine := lipgloss.NewStyle().Foreground(mFilterColor).Bold(true).Render(
+		fmt.Sprintf("Filter [%s]: %s%s", colName, m.filterEditInput, cursor),
+	)
+	hint := "Enter: apply  Esc: cancel"
+	if kind == filterColNumeric {
+		hint = "Numeric: >N  >=N  <N  <=N  =N  or  N1,N2,...    " + hint
+	}
+	statusLine := lipgloss.NewStyle().Foreground(mHelpColor).Render(hint)
+	return actionsLine, statusLine
 }
 
 func (m manageModel) renderAllocationsPanel(width, height int) string {
@@ -1683,7 +2349,17 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	}
 
 	// Dynamic filter column width based on available space.
+	// Each active filter on a non-filter column adds a '*' (1 char) to that column's
+	// header; compensate by reducing fw so total layout width stays constant.
 	fw := width - allocFixedWidth
+	for _, colIdx := range allocFilterableCols {
+		if colIdx == 1 {
+			continue
+		}
+		if cf, ok := m.allocColFilters[colIdx]; ok && cf.isActive() {
+			fw--
+		}
+	}
 	if fw < minFilterWidth {
 		fw = minFilterWidth
 	}
@@ -1691,27 +2367,43 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		fw = FILTER_WIDTH
 	}
 
-	// Build column header with sort indicators and sort-mode column highlighting.
-	allocColNames := []string{"Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Reward [Q/f]", "Worker", "Status", "Mode", "Next Action", "Default Action"}
+	// Build column header with sort indicators, filter markers, and highlighting.
 	allocColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH, WORKER_WIDTH, STATUS_WIDTH, MODE_WIDTH, NEXT_ACTION_WIDTH, DEFAULT_ACTION_WIDTH}
+	// Add 1 to each filtered non-filter column to fit the '*' suffix.
+	for _, colIdx := range allocFilterableCols {
+		if colIdx == 1 {
+			continue
+		}
+		if cf, ok := m.allocColFilters[colIdx]; ok && cf.isActive() {
+			allocColWidths[colIdx]++
+		}
+	}
 	if m.allocSortCol >= 0 && m.allocSortCol < len(allocColWidths) {
 		allocColWidths[m.allocSortCol] += 2
 	}
+	filterHighlightCol := m.activeFilterColIdx() // -1 when not in filter mode
 	var hdrParts []string
 	for i, name := range allocColNames {
 		w := allocColWidths[i]
 		displayName := name
+		// '*' suffix when a custom filter is active for this column.
+		if cf, ok := m.allocColFilters[i]; ok && cf.isActive() {
+			displayName = name + "*"
+		}
 		if m.allocSortCol == i {
 			indicator := "^|"
 			if !m.allocSortAsc {
 				indicator = "v|"
 			}
-			displayName = indicator + name
+			displayName = indicator + displayName
 		}
 		cell := fmt.Sprintf("%*s", w, displayName)
-		if m.sortMode && m.focus == allocationsPanel && m.sortHighlightCol == i {
+		switch {
+		case m.sortMode && m.focus == allocationsPanel && m.sortHighlightCol == i:
 			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Background(mPrimaryColor).Foreground(mTextColor).Render(cell))
-		} else {
+		case m.allocFilterMode && !m.filterEditActive && m.focus == allocationsPanel && filterHighlightCol == i:
+			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Background(mFilterColor).Foreground(mTextColor).Render(cell))
+		default:
 			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Render(cell))
 		}
 	}
@@ -1739,10 +2431,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		if m.allocSelected[a.filterKey] {
 			marker = "[x]"
 		}
-		workerStr := "-"
-		if a.workerID >= 0 {
-			workerStr = strconv.Itoa(a.workerID)
-		}
+		workerStr := strconv.Itoa(a.workerID) // -1 for no worker assigned
 		line := fmt.Sprintf("%"+strconv.Itoa(allocColWidths[0])+"s %"+strconv.Itoa(allocColWidths[1])+"s %"+strconv.Itoa(allocColWidths[2])+"d %"+strconv.Itoa(allocColWidths[3])+"d "+
 			"%"+strconv.Itoa(allocColWidths[4])+"s %"+strconv.Itoa(allocColWidths[5])+"d %"+strconv.Itoa(allocColWidths[6])+"s %"+strconv.Itoa(allocColWidths[7])+"s %"+strconv.Itoa(allocColWidths[8])+"s "+
 			"%"+strconv.Itoa(allocColWidths[9])+"s %"+strconv.Itoa(allocColWidths[10])+"s %"+strconv.Itoa(allocColWidths[11])+"s",
@@ -1775,6 +2464,14 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	}
 
 	fw := width - availFixedWidth
+	for _, colIdx := range availFilterableCols {
+		if colIdx == 1 {
+			continue
+		}
+		if cf, ok := m.availColFilters[colIdx]; ok && cf.isActive() {
+			fw--
+		}
+	}
 	if fw < minFilterWidth {
 		fw = minFilterWidth
 	}
@@ -1782,27 +2479,41 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		fw = FILTER_WIDTH
 	}
 
-	// Build column header with sort indicators and sort-mode column highlighting.
-	availColNames := []string{"Select", "Filter", "Provers", "Ring", "Size [MB]", "Shards", "Reward [Q/f]"}
+	// Build column header with sort indicators, filter markers, and highlighting.
 	availColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH}
+	for _, colIdx := range availFilterableCols {
+		if colIdx == 1 {
+			continue
+		}
+		if cf, ok := m.availColFilters[colIdx]; ok && cf.isActive() {
+			availColWidths[colIdx]++
+		}
+	}
 	if m.availSortCol >= 0 && m.availSortCol < len(availColWidths) {
 		availColWidths[m.availSortCol] += 2
 	}
+	filterHighlightCol := m.activeFilterColIdx()
 	var hdrParts []string
 	for i, name := range availColNames {
 		w := availColWidths[i]
 		displayName := name
+		if cf, ok := m.availColFilters[i]; ok && cf.isActive() {
+			displayName = name + "*"
+		}
 		if m.availSortCol == i {
 			indicator := "^|"
 			if !m.availSortAsc {
 				indicator = "v|"
 			}
-			displayName = indicator + name
+			displayName = indicator + displayName
 		}
 		cell := fmt.Sprintf("%*s", w, displayName)
-		if m.sortMode && m.focus == availablePanel && m.sortHighlightCol == i {
+		switch {
+		case m.sortMode && m.focus == availablePanel && m.sortHighlightCol == i:
 			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Background(mPrimaryColor).Foreground(mTextColor).Render(cell))
-		} else {
+		case m.availFilterMode && !m.filterEditActive && m.focus == availablePanel && filterHighlightCol == i:
+			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Background(mFilterColor).Foreground(mTextColor).Render(cell))
+		default:
 			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Render(cell))
 		}
 	}
