@@ -161,13 +161,14 @@ const SHARDS_WIDTH = 7
 const REWARD_WIDTH = 20
 const WORKER_WIDTH = 7
 const STATUS_WIDTH = 12
+const MODE_WIDTH = 4
 const NEXT_ACTION_WIDTH = 30
 const DEFAULT_ACTION_WIDTH = 16
 
 // Fixed column widths excluding filter (with inter-column spaces).
 const allocFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
 	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + WORKER_WIDTH +
-	STATUS_WIDTH + NEXT_ACTION_WIDTH + DEFAULT_ACTION_WIDTH + 10 + 2 + 2 // 10 spaces between 11 columns, 2 external borders and 2-char sort order indicator
+	STATUS_WIDTH + MODE_WIDTH + NEXT_ACTION_WIDTH + DEFAULT_ACTION_WIDTH + 11 + 2 + 2 // 11 spaces between 12 columns, 2 external borders and 2-char sort order indicator
 const availFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
 	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + 6 + 2 + 2 // 6 spaces between 7 columns, 2 external borders and 2-char sort order indicator
 const minFilterWidth = 12
@@ -1384,12 +1385,17 @@ func (m manageModel) sortedAllocations() []allocationRow {
 				return a.status < b.status
 			}
 			return a.status > b.status
-		case 9: // Next Action
+		case 9: // Mode
+			if asc {
+				return !a.manuallyManaged && b.manuallyManaged
+			}
+			return a.manuallyManaged && !b.manuallyManaged
+		case 10: // Next Action
 			if asc {
 				return a.nextAction < b.nextAction
 			}
 			return a.nextAction > b.nextAction
-		case 10: // Default Action
+		case 11: // Default Action
 			if asc {
 				return a.defaultAction < b.defaultAction
 			}
@@ -1686,8 +1692,8 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	}
 
 	// Build column header with sort indicators and sort-mode column highlighting.
-	allocColNames := []string{"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward", "Worker", "Status", "Next Action", "Default Action"}
-	allocColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH, WORKER_WIDTH, STATUS_WIDTH, NEXT_ACTION_WIDTH, DEFAULT_ACTION_WIDTH}
+	allocColNames := []string{"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward", "Worker", "Status", "Mode", "Next Action", "Default Action"}
+	allocColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH, WORKER_WIDTH, STATUS_WIDTH, MODE_WIDTH, NEXT_ACTION_WIDTH, DEFAULT_ACTION_WIDTH}
 	if m.allocSortCol >= 0 && m.allocSortCol < len(allocColWidths) {
 		allocColWidths[m.allocSortCol] += 2
 	}
@@ -1725,9 +1731,9 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 
 	for i := m.allocOffset; i < end; i++ {
 		a := sorted[i]
-		displayStatus := a.statusName
+		modeStr := "A"
 		if a.manuallyManaged {
-			displayStatus += " [M]"
+			modeStr = "M"
 		}
 		marker := "[ ]"
 		if m.allocSelected[a.filterKey] {
@@ -1739,7 +1745,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		}
 		line := fmt.Sprintf("%"+strconv.Itoa(allocColWidths[0])+"s %"+strconv.Itoa(allocColWidths[1])+"s %"+strconv.Itoa(allocColWidths[2])+"d %"+strconv.Itoa(allocColWidths[3])+"d "+
 			"%"+strconv.Itoa(allocColWidths[4])+"s %"+strconv.Itoa(allocColWidths[5])+"d %"+strconv.Itoa(allocColWidths[6])+"s %"+strconv.Itoa(allocColWidths[7])+"s %"+strconv.Itoa(allocColWidths[8])+"s "+
-			"%"+strconv.Itoa(allocColWidths[9])+"s %"+strconv.Itoa(allocColWidths[10])+"s",
+			"%"+strconv.Itoa(allocColWidths[9])+"s %"+strconv.Itoa(allocColWidths[10])+"s %"+strconv.Itoa(allocColWidths[11])+"s",
 			marker,
 			centerTrunc(a.filterHex, fw),
 			a.activeProvers,
@@ -1748,7 +1754,8 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 			a.dataShards,
 			"~"+formatQUIL(a.estimatedReward)+" Q/f",
 			workerStr,
-			displayStatus,
+			a.statusName,
+			modeStr,
 			a.nextAction,
 			a.defaultAction,
 		)
