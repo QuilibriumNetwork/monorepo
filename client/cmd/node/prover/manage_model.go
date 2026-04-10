@@ -1046,6 +1046,24 @@ func (m *manageModel) processRefreshData(
 
 		allocs = append(allocs, row)
 	}
+
+	// Add rows for workers with empty filters (idle workers not assigned to any shard).
+	if workerInfo != nil {
+		for _, w := range workerInfo.GetWorkerInfo() {
+			if len(w.GetFilter()) == 0 {
+				allocs = append(allocs, allocationRow{
+					filterKey:       fmt.Sprintf("worker:%d", w.GetCoreId()),
+					filterHex:       "",
+					status:          0,
+					statusName:      "Idle",
+					shardSize:       big.NewInt(0),
+					estimatedReward: big.NewInt(0),
+					workerID:        int(w.GetCoreId()),
+					manuallyManaged: w.GetManuallyManaged(),
+				})
+			}
+		}
+	}
 	m.allocations = allocs
 
 	// Build available shards: those from ShardInfo where not allocated.
@@ -1524,8 +1542,12 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		if m.allocSelected[a.filterKey] {
 			marker = "[x]"
 		}
+		workerStr := "-"
+		if a.workerID >= 0 {
+			workerStr = strconv.Itoa(a.workerID)
+		}
 		line := fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(fw)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
-			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"d %"+strconv.Itoa(STATUS_WIDTH)+"s "+
+			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(STATUS_WIDTH)+"s "+
 			"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
 			marker,
 			centerTrunc(a.filterHex, fw),
@@ -1534,7 +1556,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 			formatStorage(a.shardSize.Uint64()),
 			a.dataShards,
 			"~"+formatQUIL(a.estimatedReward)+" Q/f",
-			a.workerID,
+			workerStr,
 			displayStatus,
 			a.nextAction,
 			a.defaultAction,
