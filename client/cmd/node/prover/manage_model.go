@@ -147,6 +147,7 @@ type manageKeyMap struct {
 	Resume       key.Binding
 	ToggleManual key.Binding
 	Refresh      key.Binding
+	Sort         key.Binding
 	Quit         key.Binding
 }
 
@@ -175,25 +176,26 @@ const ACTION_FRAME_DELAY = 360
 
 func newManageKeyMap() manageKeyMap {
 	return manageKeyMap{
-		Up:        key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
-		Down:      key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
-		Tab:       key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch")),
-		Select:    key.NewBinding(key.WithKeys("space"), key.WithHelp("spc", "select")),
-		SelectAll: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "sel all")),
-		Join:      key.NewBinding(key.WithKeys("J"), key.WithHelp("J", "join")),
-		Leave:     key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "leave")),
-		Confirm:   key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "confirm")),
-		Reject:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "reject")),
-		Pause:     key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
-		Resume:    key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "resume")),
+		Up:           key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
+		Down:         key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+		Tab:          key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch")),
+		Select:       key.NewBinding(key.WithKeys("space"), key.WithHelp("spc", "select")),
+		SelectAll:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "sel all")),
+		Join:         key.NewBinding(key.WithKeys("J"), key.WithHelp("J", "join")),
+		Leave:        key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "leave")),
+		Confirm:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "confirm")),
+		Reject:       key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "reject")),
+		Pause:        key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
+		Resume:       key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "resume")),
 		ToggleManual: key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "mode")),
 		Refresh:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
+		Sort:         key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "sort")),
 		Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
 func (k manageKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Quit}
+	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Sort, k.Quit}
 }
 
 func (k manageKeyMap) FullHelp() [][]key.Binding { return nil }
@@ -290,6 +292,17 @@ type manageModel struct {
 	awaitDeadline       time.Time
 	awaitStartTime      time.Time
 
+	// Sort state per panel (-1 = no explicit sort).
+	allocSortCol int
+	allocSortAsc bool
+	availSortCol int
+	availSortAsc bool
+
+	// Sort selection mode (entered via 's' key).
+	sortMode         bool // column selection active
+	sortOrderMode    bool // sort order prompt active (sub-state of sortMode)
+	sortHighlightCol int  // 0-based column index highlighted in sortMode
+
 	// UI.
 	width          int
 	height         int
@@ -316,6 +329,10 @@ func newManageModel(client protobufs.NodeServiceClient) manageModel {
 		autoManaged:   true, // derived from server data on first refresh
 		allocSelected: make(map[string]bool),
 		availSelected: make(map[string]bool),
+		allocSortCol:  7, // Worker column, descending
+		allocSortAsc:  true,
+		availSortCol:  6, // Reward column, descending
+		availSortAsc:  false,
 	}
 }
 
@@ -695,6 +712,12 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.joinPickerActive {
 		return m.handleJoinPickerKey(msg)
 	}
+	if m.sortMode && m.sortOrderMode {
+		return m.handleSortOrderKey(msg)
+	}
+	if m.sortMode {
+		return m.handleSortModeKey(msg)
+	}
 
 	switch {
 	case key.Matches(msg, m.keyMap.Quit):
@@ -771,13 +794,13 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keyMap.Down):
 		if m.focus == allocationsPanel {
-			filtered := m.filteredAllocations()
-			if m.allocCursor < len(filtered)-1 {
+			sorted := m.sortedAllocations()
+			if m.allocCursor < len(sorted)-1 {
 				m.allocCursor++
 			}
 		} else {
-			filtered := m.filteredAvailable()
-			if m.availCursor < len(filtered)-1 {
+			sorted := m.sortedAvailable()
+			if m.availCursor < len(sorted)-1 {
 				m.availCursor++
 			}
 		}
@@ -861,6 +884,11 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		newState := !row.manuallyManaged
 		return m, doToggleManual(m.client, uint32(row.workerID), newState)
+
+	case key.Matches(msg, m.keyMap.Sort):
+		m.sortMode = true
+		m.sortOrderMode = false
+		m.sortHighlightCol = 0
 	}
 
 	return m, nil
@@ -1081,6 +1109,209 @@ func (m manageModel) filteredAvailable() []shardRow {
 	return out
 }
 
+// sortedAllocations returns filtered allocations sorted by the active sort column.
+func (m manageModel) sortedAllocations() []allocationRow {
+	rows := m.filteredAllocations()
+	if m.allocSortCol < 0 {
+		return rows
+	}
+	sorted := make([]allocationRow, len(rows))
+	copy(sorted, rows)
+	col := m.allocSortCol
+	asc := m.allocSortAsc
+	sort.SliceStable(sorted, func(i, j int) bool {
+		a, b := sorted[i], sorted[j]
+		switch col {
+		case 0: // Select – selected items first
+			ai := m.allocSelected[a.filterKey]
+			bi := m.allocSelected[b.filterKey]
+			if asc {
+				return !ai && bi
+			}
+			return ai && !bi
+		case 1: // Filter
+			if asc {
+				return a.filterHex < b.filterHex
+			}
+			return a.filterHex > b.filterHex
+		case 2: // Provers
+			if asc {
+				return a.activeProvers < b.activeProvers
+			}
+			return a.activeProvers > b.activeProvers
+		case 3: // Ring
+			if asc {
+				return a.ring < b.ring
+			}
+			return a.ring > b.ring
+		case 4: // Size
+			c := a.shardSize.Cmp(b.shardSize)
+			if asc {
+				return c < 0
+			}
+			return c > 0
+		case 5: // Shards
+			if asc {
+				return a.dataShards < b.dataShards
+			}
+			return a.dataShards > b.dataShards
+		case 6: // Reward
+			c := a.estimatedReward.Cmp(b.estimatedReward)
+			if asc {
+				return c < 0
+			}
+			return c > 0
+		case 7: // Worker
+			if asc {
+				return a.workerID < b.workerID
+			}
+			return a.workerID > b.workerID
+		case 8: // Status
+			if asc {
+				return a.status < b.status
+			}
+			return a.status > b.status
+		case 9: // Next Action
+			if asc {
+				return a.nextAction < b.nextAction
+			}
+			return a.nextAction > b.nextAction
+		case 10: // Default Action
+			if asc {
+				return a.defaultAction < b.defaultAction
+			}
+			return a.defaultAction > b.defaultAction
+		}
+		return false
+	})
+	return sorted
+}
+
+// sortedAvailable returns filtered available shards sorted by the active sort column.
+func (m manageModel) sortedAvailable() []shardRow {
+	rows := m.filteredAvailable()
+	if m.availSortCol < 0 {
+		return rows
+	}
+	sorted := make([]shardRow, len(rows))
+	copy(sorted, rows)
+	col := m.availSortCol
+	asc := m.availSortAsc
+	sort.SliceStable(sorted, func(i, j int) bool {
+		a, b := sorted[i], sorted[j]
+		switch col {
+		case 0: // Select – selected items first
+			ai := m.availSelected[a.filterKey]
+			bi := m.availSelected[b.filterKey]
+			if asc {
+				return !ai && bi
+			}
+			return ai && !bi
+		case 1: // Filter
+			if asc {
+				return a.filterHex < b.filterHex
+			}
+			return a.filterHex > b.filterHex
+		case 2: // Provers
+			if asc {
+				return a.activeProvers < b.activeProvers
+			}
+			return a.activeProvers > b.activeProvers
+		case 3: // Ring
+			if asc {
+				return a.ring < b.ring
+			}
+			return a.ring > b.ring
+		case 4: // Size
+			c := a.shardSize.Cmp(b.shardSize)
+			if asc {
+				return c < 0
+			}
+			return c > 0
+		case 5: // Shards
+			if asc {
+				return a.dataShards < b.dataShards
+			}
+			return a.dataShards > b.dataShards
+		case 6: // Reward
+			c := a.estimatedReward.Cmp(b.estimatedReward)
+			if asc {
+				return c < 0
+			}
+			return c > 0
+		}
+		return false
+	})
+	return sorted
+}
+
+// activePanelColCount returns the number of sortable columns in the focused panel.
+func (m manageModel) activePanelColCount() int {
+	if m.focus == allocationsPanel {
+		return 11 // Select, Filter, Provers, Ring, Size, Shards, Reward, Worker, Status, Next Action, Default Action
+	}
+	return 7 // Select, Filter, Provers, Ring, Size, Shards, Reward
+}
+
+// handleSortModeKey processes key events while column selection is active.
+func (m manageModel) handleSortModeKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	rightKey := key.NewBinding(key.WithKeys("right"))
+	leftKey := key.NewBinding(key.WithKeys("left"))
+	enterKey := key.NewBinding(key.WithKeys("enter"))
+	escKey := key.NewBinding(key.WithKeys("esc"))
+
+	numCols := m.activePanelColCount()
+
+	switch {
+	case key.Matches(msg, rightKey):
+		m.sortHighlightCol = (m.sortHighlightCol + 1) % numCols
+	case key.Matches(msg, leftKey):
+		m.sortHighlightCol = (m.sortHighlightCol - 1 + numCols) % numCols
+	case key.Matches(msg, enterKey):
+		m.sortOrderMode = true
+	case key.Matches(msg, escKey), key.Matches(msg, m.keyMap.Quit):
+		m.sortMode = false
+		m.sortOrderMode = false
+		m.sortHighlightCol = 0
+	}
+	return m, nil
+}
+
+// handleSortOrderKey processes key events while the sort order prompt is active.
+func (m manageModel) handleSortOrderKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	enterKey := key.NewBinding(key.WithKeys("enter"))
+	aKey := key.NewBinding(key.WithKeys("a", "A"))
+	dKey := key.NewBinding(key.WithKeys("d", "D"))
+	escKey := key.NewBinding(key.WithKeys("esc"))
+
+	switch {
+	case key.Matches(msg, enterKey), key.Matches(msg, aKey):
+		m.applySort(true)
+		m.sortMode = false
+		m.sortOrderMode = false
+	case key.Matches(msg, dKey):
+		m.applySort(false)
+		m.sortMode = false
+		m.sortOrderMode = false
+	case key.Matches(msg, escKey), key.Matches(msg, m.keyMap.Quit):
+		m.sortMode = false
+		m.sortOrderMode = false
+		m.sortHighlightCol = 0
+	}
+	return m, nil
+}
+
+// applySort applies the selected column and direction to the active panel.
+func (m *manageModel) applySort(asc bool) {
+	if m.focus == allocationsPanel {
+		m.allocSortCol = m.sortHighlightCol
+		m.allocSortAsc = asc
+	} else {
+		m.availSortCol = m.sortHighlightCol
+		m.availSortAsc = asc
+	}
+}
+
 // View renders the full TUI.
 func (m manageModel) View() tea.View {
 	v := tea.NewView(m.renderView())
@@ -1206,12 +1437,27 @@ func (m manageModel) renderView() string {
 		}
 	}
 
+	var sortHint string
+	if m.sortMode && m.sortOrderMode {
+		sortHint = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
+			"Sort order: [Enter/a] Ascending (default)  [d] Descending  [Esc] Cancel",
+		)
+	} else if m.sortMode {
+		sortHint = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
+			"Sort: [←/→] Move column  [Enter] Confirm  [Esc] Cancel",
+		)
+	}
+
 	helpLine := m.help.View(m.keyMap)
 	footer := statusLine
 	if footer != "" {
 		footer += "  "
 	}
-	footer += helpLine
+	if sortHint != "" {
+		footer += sortHint
+	} else {
+		footer += helpLine
+	}
 
 	doc.WriteString(mFooterStyle.Width(m.width).Render(footer))
 
@@ -1219,7 +1465,7 @@ func (m manageModel) renderView() string {
 }
 
 func (m manageModel) renderAllocationsPanel(width, height int) string {
-	filtered := m.filteredAllocations()
+	filtered := m.sortedAllocations()
 	if len(filtered) == 0 {
 		return "  No allocations"
 	}
@@ -1232,15 +1478,29 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	if fw > FILTER_WIDTH {
 		fw = FILTER_WIDTH
 	}
-	fws := strconv.Itoa(fw)
 
-	// Column header.
-	var hdr string
-	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s "+
-		"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(STATUS_WIDTH)+"s "+
-		"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
-		"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward", "Worker", "Status", "Next Action", "Default Action")
-	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
+	// Build column header with sort indicators and sort-mode column highlighting.
+	allocColNames := []string{"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward", "Worker", "Status", "Next Action", "Default Action"}
+	allocColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH, WORKER_WIDTH, STATUS_WIDTH, NEXT_ACTION_WIDTH, DEFAULT_ACTION_WIDTH}
+	var hdrParts []string
+	for i, name := range allocColNames {
+		w := allocColWidths[i]
+		displayName := name
+		if m.allocSortCol == i {
+			indicator := "^|"
+			if !m.allocSortAsc {
+				indicator = "v|"
+			}
+			displayName = indicator + name
+		}
+		cell := fmt.Sprintf("%*s", w, displayName)
+		if m.sortMode && m.focus == allocationsPanel && m.sortHighlightCol == i {
+			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Background(mPrimaryColor).Foreground(mTextColor).Render(cell))
+		} else {
+			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Render(cell))
+		}
+	}
+	lines := []string{strings.Join(hdrParts, " ")}
 
 	// Compute visible window.
 	visibleRows := height - 1 // minus header
@@ -1264,7 +1524,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		if m.allocSelected[a.filterKey] {
 			marker = "[x]"
 		}
-		line := fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
+		line := fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(fw)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
 			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"d %"+strconv.Itoa(STATUS_WIDTH)+"s "+
 			"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
 			marker,
@@ -1289,7 +1549,7 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 }
 
 func (m manageModel) renderAvailablePanel(width, height int) string {
-	filtered := m.filteredAvailable()
+	filtered := m.sortedAvailable()
 	if len(filtered) == 0 {
 		return "  No available shards"
 	}
@@ -1301,12 +1561,29 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	if fw > FILTER_WIDTH {
 		fw = FILTER_WIDTH
 	}
-	fws := strconv.Itoa(fw)
 
-	var hdr string
-	hdr = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"s %"+strconv.Itoa(RING_WIDTH)+"s %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"s %"+strconv.Itoa(REWARD_WIDTH)+"s",
-		"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward")
-	lines := []string{lipgloss.NewStyle().Bold(true).Render(hdr)}
+	// Build column header with sort indicators and sort-mode column highlighting.
+	availColNames := []string{"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward"}
+	availColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH}
+	var hdrParts []string
+	for i, name := range availColNames {
+		w := availColWidths[i]
+		displayName := name
+		if m.availSortCol == i {
+			indicator := "^|"
+			if !m.availSortAsc {
+				indicator = "v|"
+			}
+			displayName = indicator + name
+		}
+		cell := fmt.Sprintf("%*s", w, displayName)
+		if m.sortMode && m.focus == availablePanel && m.sortHighlightCol == i {
+			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Background(mPrimaryColor).Foreground(mTextColor).Render(cell))
+		} else {
+			hdrParts = append(hdrParts, lipgloss.NewStyle().Bold(true).Render(cell))
+		}
+	}
+	lines := []string{strings.Join(hdrParts, " ")}
 
 	visibleRows := height - 1
 	if visibleRows < 1 {
@@ -1326,7 +1603,7 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		if m.availSelected[s.filterKey] {
 			marker = "[x]"
 		}
-		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
+		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(fw)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
 			marker,
 			centerTrunc(s.filterHex, fw),
 			s.activeProvers,
