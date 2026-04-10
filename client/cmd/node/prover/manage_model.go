@@ -205,6 +205,7 @@ type manageKeyMap struct {
 	Refresh      key.Binding
 	Sort         key.Binding
 	Filter       key.Binding
+	Help         key.Binding
 	Quit         key.Binding
 }
 
@@ -249,12 +250,13 @@ func newManageKeyMap() manageKeyMap {
 		Refresh:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
 		Sort:         key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "sort")),
 		Filter:       key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "filter")),
+		Help:         key.NewBinding(key.WithKeys("h"), key.WithHelp("h", "help")),
 		Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
 func (k manageKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Sort, k.Filter, k.Quit}
+	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Sort, k.Filter, k.Help, k.Quit}
 }
 
 func (k manageKeyMap) FullHelp() [][]key.Binding { return nil }
@@ -386,6 +388,7 @@ type manageModel struct {
 	actionInFlight bool
 	help           help.Model
 	keyMap         manageKeyMap
+	showHelp       bool
 }
 
 func newManageModel(client protobufs.NodeServiceClient) manageModel {
@@ -845,6 +848,74 @@ func (m manageModel) applicableActionsLabel() string {
 
 // renderHelpLine renders the key-binding help line with applicable action keys
 // highlighted in the primary color and inapplicable ones dimmed.
+func (m manageModel) renderHelpScreen() string {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(mTextColor).Background(mPrimaryColor).Padding(0, 1)
+	sectionStyle := lipgloss.NewStyle().Bold(true).Foreground(mPrimaryColor)
+	keyStyle := lipgloss.NewStyle().Foreground(mTextColor).Bold(true)
+	dimStyle := lipgloss.NewStyle().Foreground(mHelpColor)
+	noteStyle := lipgloss.NewStyle().Foreground(mFilterColor)
+
+	kv := func(k, v string) string {
+		return keyStyle.Render(fmt.Sprintf("%-14s", k)) + dimStyle.Render(v)
+	}
+
+	var b strings.Builder
+	b.WriteString(titleStyle.Width(m.width).Render(" Shard Manager — Help") + "\n")
+	b.WriteString("\n")
+
+	b.WriteString(sectionStyle.Render("Navigation") + "\n")
+	b.WriteString("  " + kv("↑ / k", "Move cursor up") + "\n")
+	b.WriteString("  " + kv("↓ / j", "Move cursor down") + "\n")
+	b.WriteString("  " + kv("Tab", "Switch between Allocations and Available Shards panels") + "\n")
+	b.WriteString("  " + kv("Space", "Toggle selection on cursor row (advances cursor)") + "\n")
+	b.WriteString("  " + kv("a", "Select all / deselect all rows in current panel") + "\n")
+	b.WriteString("\n")
+
+	b.WriteString(sectionStyle.Render("Actions — Allocations panel") + "\n")
+	b.WriteString("  " + kv("l", "Leave  — request to leave an Active allocation (status 2)") + "\n")
+	b.WriteString("  " + kv("c", "Confirm — confirm a pending Join/Leave once the window opens") + "\n")
+	b.WriteString("  " + kv("r", "Reject  — reject a pending Join/Leave") + "\n")
+	b.WriteString("  " + kv("p", "Pause   — pause an Active allocation (status 2)") + "\n")
+	b.WriteString("  " + kv("u", "Resume  — resume a Paused allocation (status 3)") + "\n")
+	b.WriteString("  " + kv("M", "Toggle manual / auto worker management on cursor row") + "\n")
+	b.WriteString("  " + noteStyle.Render("  Multi-select with Space or 'a' to batch Leave/Confirm/Reject/Pause/Resume.") + "\n")
+	b.WriteString("\n")
+
+	b.WriteString(sectionStyle.Render("Actions — Available Shards panel") + "\n")
+	b.WriteString("  " + kv("J", "Join    — open worker picker for selected shard(s)") + "\n")
+	b.WriteString("  " + noteStyle.Render("  At least one free (unassigned) worker must exist to join.") + "\n")
+	b.WriteString("\n")
+
+	b.WriteString(sectionStyle.Render("Sort mode  (press s)") + "\n")
+	b.WriteString("  " + kv("← / →", "Move highlight to previous / next column") + "\n")
+	b.WriteString("  " + kv("Enter", "Confirm column, then choose sort order") + "\n")
+	b.WriteString("  " + kv("a", "Ascending order") + "\n")
+	b.WriteString("  " + kv("d", "Descending order") + "\n")
+	b.WriteString("  " + kv("Esc", "Cancel sort mode") + "\n")
+	b.WriteString("\n")
+
+	b.WriteString(sectionStyle.Render("Filter mode  (press f)") + "\n")
+	b.WriteString("  " + kv("← / →", "Move highlight to previous / next filterable column") + "\n")
+	b.WriteString("  " + kv("Enter", "Open filter editor for highlighted column") + "\n")
+	b.WriteString("  " + kv("Del", "Clear filter on highlighted column") + "\n")
+	b.WriteString("  " + kv("x", "Disable all filters in current panel") + "\n")
+	b.WriteString("  " + kv("Esc", "Close filter mode") + "\n")
+	b.WriteString("  " + noteStyle.Render("  Filter editor: text columns accept a substring; numeric columns accept") + "\n")
+	b.WriteString("  " + noteStyle.Render("  an expression like \"> 47\", \"< 100\", or a comma list \"1,5,7\";") + "\n")
+	b.WriteString("  " + noteStyle.Render("  select columns toggle values with Space, confirm with Enter.") + "\n")
+	b.WriteString("\n")
+
+	b.WriteString(sectionStyle.Render("General") + "\n")
+	b.WriteString("  " + kv("R", "Force data refresh") + "\n")
+	b.WriteString("  " + kv("h", "Toggle this help screen") + "\n")
+	b.WriteString("  " + kv("q / Ctrl+C", "Quit") + "\n")
+
+	footer := dimStyle.Render("Press h to return")
+	b.WriteString("\n" + mFooterStyle.Width(m.width).Render(footer))
+
+	return b.String()
+}
+
 func (m manageModel) renderHelpLine() string {
 	applicable := map[string]bool{}
 	if !m.actionInFlight {
@@ -883,6 +954,7 @@ func (m manageModel) renderHelpLine() string {
 		{m.keyMap.Refresh, ""},
 		{m.keyMap.Sort, ""},
 		{m.keyMap.Filter, "Filter"},
+		{m.keyMap.Help, ""},
 		{m.keyMap.Quit, ""},
 	}
 
@@ -1214,6 +1286,10 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keyMap.Quit):
 		return m, tea.Quit
+
+	case key.Matches(msg, m.keyMap.Help):
+		m.showHelp = !m.showHelp
+		return m, nil
 
 	case key.Matches(msg, m.keyMap.Tab):
 		if m.focus == allocationsPanel {
@@ -2144,6 +2220,10 @@ func (m manageModel) renderView() string {
 
 	if m.joinPickerActive {
 		return m.renderJoinPicker()
+	}
+
+	if m.showHelp {
+		return m.renderHelpScreen()
 	}
 
 	var doc strings.Builder
