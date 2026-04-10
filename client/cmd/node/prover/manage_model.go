@@ -562,14 +562,14 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // selectedAllocRows returns the allocation rows that are currently selected.
 // If none are selected, returns just the cursor row.
 func (m *manageModel) selectedAllocRows() []allocationRow {
-	filtered := m.filteredAllocations()
-	if len(filtered) == 0 {
+	sorted := m.sortedAllocations()
+	if len(sorted) == 0 {
 		return nil
 	}
 
 	// Collect selected rows in display order.
 	var selected []allocationRow
-	for _, row := range filtered {
+	for _, row := range sorted {
 		if m.allocSelected[row.filterKey] {
 			selected = append(selected, row)
 		}
@@ -579,8 +579,8 @@ func (m *manageModel) selectedAllocRows() []allocationRow {
 	}
 
 	// No selections — use cursor row.
-	if m.allocCursor < len(filtered) {
-		return []allocationRow{filtered[m.allocCursor]}
+	if m.allocCursor < len(sorted) {
+		return []allocationRow{sorted[m.allocCursor]}
 	}
 	return nil
 }
@@ -588,13 +588,13 @@ func (m *manageModel) selectedAllocRows() []allocationRow {
 // selectedAvailRows returns the available shard rows that are currently selected.
 // If none are selected, returns just the cursor row.
 func (m *manageModel) selectedAvailRows() []shardRow {
-	filtered := m.filteredAvailable()
-	if len(filtered) == 0 {
+	sorted := m.sortedAvailable()
+	if len(sorted) == 0 {
 		return nil
 	}
 
 	var selected []shardRow
-	for _, row := range filtered {
+	for _, row := range sorted {
 		if m.availSelected[row.filterKey] {
 			selected = append(selected, row)
 		}
@@ -603,8 +603,8 @@ func (m *manageModel) selectedAvailRows() []shardRow {
 		return selected
 	}
 
-	if m.availCursor < len(filtered) {
-		return []shardRow{filtered[m.availCursor]}
+	if m.availCursor < len(sorted) {
+		return []shardRow{sorted[m.availCursor]}
 	}
 	return nil
 }
@@ -776,8 +776,8 @@ func (m manageModel) renderHelpLine() string {
 			for a := range m.applicableAllocActions() {
 				applicable[a] = true
 			}
-			filtered := m.filteredAllocations()
-			if m.allocCursor < len(filtered) && filtered[m.allocCursor].workerID >= 0 {
+			sorted := m.sortedAllocations()
+			if m.allocCursor < len(sorted) && sorted[m.allocCursor].workerID >= 0 {
 				applicable["ToggleManual"] = true
 			}
 		} else {
@@ -871,29 +871,29 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keyMap.Select):
 		if m.focus == allocationsPanel {
-			filtered := m.filteredAllocations()
-			if m.allocCursor < len(filtered) {
-				k := filtered[m.allocCursor].filterKey
+			sorted := m.sortedAllocations()
+			if m.allocCursor < len(sorted) {
+				k := sorted[m.allocCursor].filterKey
 				if m.allocSelected[k] {
 					delete(m.allocSelected, k)
 				} else {
 					m.allocSelected[k] = true
 				}
 				// Advance cursor after toggle.
-				if m.allocCursor < len(filtered)-1 {
+				if m.allocCursor < len(sorted)-1 {
 					m.allocCursor++
 				}
 			}
 		} else {
-			filtered := m.filteredAvailable()
-			if m.availCursor < len(filtered) {
-				k := filtered[m.availCursor].filterKey
+			sorted := m.sortedAvailable()
+			if m.availCursor < len(sorted) {
+				k := sorted[m.availCursor].filterKey
 				if m.availSelected[k] {
 					delete(m.availSelected, k)
 				} else {
 					m.availSelected[k] = true
 				}
-				if m.availCursor < len(filtered)-1 {
+				if m.availCursor < len(sorted)-1 {
 					m.availCursor++
 				}
 			}
@@ -901,20 +901,20 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keyMap.SelectAll):
 		if m.focus == allocationsPanel {
-			filtered := m.filteredAllocations()
-			allSelected := len(m.allocSelected) == len(filtered) && len(filtered) > 0
+			sorted := m.sortedAllocations()
+			allSelected := len(m.allocSelected) == len(sorted) && len(sorted) > 0
 			m.allocSelected = make(map[string]bool)
 			if !allSelected {
-				for _, row := range filtered {
+				for _, row := range sorted {
 					m.allocSelected[row.filterKey] = true
 				}
 			}
 		} else {
-			filtered := m.filteredAvailable()
-			allSelected := len(m.availSelected) == len(filtered) && len(filtered) > 0
+			sorted := m.sortedAvailable()
+			allSelected := len(m.availSelected) == len(sorted) && len(sorted) > 0
 			m.availSelected = make(map[string]bool)
 			if !allSelected {
-				for _, row := range filtered {
+				for _, row := range sorted {
 					m.availSelected[row.filterKey] = true
 				}
 			}
@@ -1070,11 +1070,11 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.statusIsError = true
 			return m, nil
 		}
-		filtered := m.filteredAllocations()
-		if m.allocCursor >= len(filtered) {
+		sorted := m.sortedAllocations()
+		if m.allocCursor >= len(sorted) {
 			return m, nil
 		}
-		row := filtered[m.allocCursor]
+		row := sorted[m.allocCursor]
 		if row.workerID < 0 {
 			m.statusMsg = "No worker assigned to this allocation"
 			m.statusIsError = true
@@ -1284,18 +1284,15 @@ func (m *manageModel) processRefreshData(
 			})
 		}
 	}
-	// Sort by estimated reward descending.
-	sort.Slice(avail, func(i, j int) bool {
-		return avail[i].estimatedReward.Cmp(avail[j].estimatedReward) > 0
-	})
+
 	m.available = avail
 
 	// Clamp cursors.
-	if filtered := m.filteredAllocations(); m.allocCursor >= len(filtered) {
-		m.allocCursor = max(0, len(filtered)-1)
+	if sorted := m.sortedAllocations(); m.allocCursor >= len(sorted) {
+		m.allocCursor = max(0, len(sorted)-1)
 	}
-	if filtered := m.filteredAvailable(); m.availCursor >= len(filtered) {
-		m.availCursor = max(0, len(filtered)-1)
+	if sorted := m.sortedAvailable(); m.availCursor >= len(sorted) {
+		m.availCursor = max(0, len(sorted)-1)
 	}
 }
 
@@ -1584,12 +1581,12 @@ func (m manageModel) renderView() string {
 	availHeight := panelBudget - allocHeight
 
 	// Allocations panel.
-	filteredAllocs := m.filteredAllocations()
+	sortedAllocs := m.sortedAllocations()
 	activePerFrame := big.NewInt(0)
 	joiningPerFrame := big.NewInt(0)
 	pausedPerFrame := big.NewInt(0)
 	leavingPerFrame := big.NewInt(0)
-	for _, a := range filteredAllocs {
+	for _, a := range sortedAllocs {
 		switch a.status {
 		case 1:
 			joiningPerFrame.Add(joiningPerFrame, a.estimatedReward)
@@ -1609,7 +1606,7 @@ func (m manageModel) renderView() string {
 	totalPerFrame.Add(totalPerFrame, leavingPerFrame)
 
 	allocTitle := fmt.Sprintf("Allocations (%d) Rewards: Total ~%s QUIL/day = Joining ~%s QUIL/day + Active ~%s QUIL/day + Paused ~%s QUIL/day + Leaving ~%s QUIL/day",
-		len(filteredAllocs), formatQUILDaily(totalPerFrame), formatQUILDaily(joiningPerFrame), formatQUILDaily(activePerFrame),
+		len(sortedAllocs), formatQUILDaily(totalPerFrame), formatQUILDaily(joiningPerFrame), formatQUILDaily(activePerFrame),
 		formatQUILDaily(pausedPerFrame), formatQUILDaily(leavingPerFrame))
 	if n := len(m.allocSelected); n > 0 {
 		allocTitle += fmt.Sprintf(" [%d selected]", n)
@@ -1626,7 +1623,7 @@ func (m manageModel) renderView() string {
 	doc.WriteString("\n")
 
 	// Available panel.
-	availTitle := fmt.Sprintf(" Available Shards (%d)", len(m.filteredAvailable()))
+	availTitle := fmt.Sprintf(" Available Shards (%d)", len(m.sortedAvailable()))
 	if n := len(m.availSelected); n > 0 {
 		availTitle += fmt.Sprintf(" [%d selected]", n)
 	}
@@ -1674,8 +1671,8 @@ func (m manageModel) renderView() string {
 }
 
 func (m manageModel) renderAllocationsPanel(width, height int) string {
-	filtered := m.sortedAllocations()
-	if len(filtered) == 0 {
+	sorted := m.sortedAllocations()
+	if len(sorted) == 0 {
 		return "  No allocations"
 	}
 
@@ -1719,15 +1716,15 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	if visibleRows < 1 {
 		visibleRows = 1
 	}
-	m.allocOffset = clampOffset(m.allocOffset, m.allocCursor, visibleRows, len(filtered))
+	m.allocOffset = clampOffset(m.allocOffset, m.allocCursor, visibleRows, len(sorted))
 
 	end := m.allocOffset + visibleRows
-	if end > len(filtered) {
-		end = len(filtered)
+	if end > len(sorted) {
+		end = len(sorted)
 	}
 
 	for i := m.allocOffset; i < end; i++ {
-		a := filtered[i]
+		a := sorted[i]
 		displayStatus := a.statusName
 		if a.manuallyManaged {
 			displayStatus += " [M]"
@@ -1765,8 +1762,8 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 }
 
 func (m manageModel) renderAvailablePanel(width, height int) string {
-	filtered := m.sortedAvailable()
-	if len(filtered) == 0 {
+	sorted := m.sortedAvailable()
+	if len(sorted) == 0 {
 		return "  No available shards"
 	}
 
@@ -1808,15 +1805,15 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	if visibleRows < 1 {
 		visibleRows = 1
 	}
-	m.availOffset = clampOffset(m.availOffset, m.availCursor, visibleRows, len(filtered))
+	m.availOffset = clampOffset(m.availOffset, m.availCursor, visibleRows, len(sorted))
 
 	end := m.availOffset + visibleRows
-	if end > len(filtered) {
-		end = len(filtered)
+	if end > len(sorted) {
+		end = len(sorted)
 	}
 
 	for i := m.availOffset; i < end; i++ {
-		s := filtered[i]
+		s := sorted[i]
 		var line string
 		marker := "[ ]"
 		if m.availSelected[s.filterKey] {
