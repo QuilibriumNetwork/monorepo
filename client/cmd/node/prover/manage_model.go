@@ -167,9 +167,9 @@ const DEFAULT_ACTION_WIDTH = 16
 // Fixed column widths excluding filter (with inter-column spaces).
 const allocFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
 	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + WORKER_WIDTH +
-	STATUS_WIDTH + NEXT_ACTION_WIDTH + DEFAULT_ACTION_WIDTH + 10 + 2 // 10 spaces between 11 columns and 2 external borders
+	STATUS_WIDTH + NEXT_ACTION_WIDTH + DEFAULT_ACTION_WIDTH + 10 + 2 + 2 // 10 spaces between 11 columns, 2 external borders and 2-char sort order indicator
 const availFixedWidth = SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH +
-	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + 6 + 2 // 6 spaces between 7 columns and 2 external borders
+	SIZE_WIDTH + SHARDS_WIDTH + REWARD_WIDTH + 6 + 2 + 2 // 6 spaces between 7 columns, 2 external borders and 2-char sort order indicator
 const minFilterWidth = 12
 
 const ACTION_FRAME_DELAY = 360
@@ -1500,6 +1500,9 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 	// Build column header with sort indicators and sort-mode column highlighting.
 	allocColNames := []string{"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward", "Worker", "Status", "Next Action", "Default Action"}
 	allocColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH, WORKER_WIDTH, STATUS_WIDTH, NEXT_ACTION_WIDTH, DEFAULT_ACTION_WIDTH}
+	if m.allocSortCol >= 0 && m.allocSortCol < len(allocColWidths) {
+		allocColWidths[m.allocSortCol] += 2
+	}
 	var hdrParts []string
 	for i, name := range allocColNames {
 		w := allocColWidths[i]
@@ -1546,9 +1549,9 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 		if a.workerID >= 0 {
 			workerStr = strconv.Itoa(a.workerID)
 		}
-		line := fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(fw)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d "+
-			"%"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s %"+strconv.Itoa(WORKER_WIDTH)+"s %"+strconv.Itoa(STATUS_WIDTH)+"s "+
-			"%"+strconv.Itoa(NEXT_ACTION_WIDTH)+"s %"+strconv.Itoa(DEFAULT_ACTION_WIDTH)+"s",
+		line := fmt.Sprintf("%"+strconv.Itoa(allocColWidths[0])+"s %"+strconv.Itoa(allocColWidths[1])+"s %"+strconv.Itoa(allocColWidths[2])+"d %"+strconv.Itoa(allocColWidths[3])+"d "+
+			"%"+strconv.Itoa(allocColWidths[4])+"s %"+strconv.Itoa(allocColWidths[5])+"d %"+strconv.Itoa(allocColWidths[6])+"s %"+strconv.Itoa(allocColWidths[7])+"s %"+strconv.Itoa(allocColWidths[8])+"s "+
+			"%"+strconv.Itoa(allocColWidths[9])+"s %"+strconv.Itoa(allocColWidths[10])+"s",
 			marker,
 			centerTrunc(a.filterHex, fw),
 			a.activeProvers,
@@ -1587,6 +1590,9 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 	// Build column header with sort indicators and sort-mode column highlighting.
 	availColNames := []string{"Select", "Filter", "Provers", "Ring", "Size", "Shards", "Reward"}
 	availColWidths := []int{SELECT_WIDTH, fw, PROVERS_WIDTH, RING_WIDTH, SIZE_WIDTH, SHARDS_WIDTH, REWARD_WIDTH}
+	if m.availSortCol >= 0 && m.availSortCol < len(availColWidths) {
+		availColWidths[m.availSortCol] += 2
+	}
 	var hdrParts []string
 	for i, name := range availColNames {
 		w := availColWidths[i]
@@ -1625,7 +1631,7 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		if m.availSelected[s.filterKey] {
 			marker = "[x]"
 		}
-		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(fw)+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
+		line = fmt.Sprintf("%"+strconv.Itoa(availColWidths[0])+"s %"+strconv.Itoa(availColWidths[1])+"s %"+strconv.Itoa(availColWidths[2])+"d %"+strconv.Itoa(availColWidths[3])+"d %"+strconv.Itoa(availColWidths[4])+"s %"+strconv.Itoa(availColWidths[5])+"d %"+strconv.Itoa(availColWidths[6])+"s",
 			marker,
 			centerTrunc(s.filterHex, fw),
 			s.activeProvers,
