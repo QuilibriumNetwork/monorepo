@@ -1575,8 +1575,8 @@ func (m manageModel) renderView() string {
 	if innerWidth < 20 {
 		innerWidth = 20
 	}
-	// Reserve: header(1) + alloc title(1) + alloc border(2) + avail title(1) + avail border(2) + status(1) + help(1) = 9
-	panelBudget := m.height - 9
+	// Reserve: header(1) + alloc title(1) + alloc border(2) + avail title(1) + avail border(2) + help(1) + status(1) = 10
+	panelBudget := m.height - 10
 	if panelBudget < 4 {
 		panelBudget = 4
 	}
@@ -1641,6 +1641,22 @@ func (m manageModel) renderView() string {
 	}
 	doc.WriteString("\n")
 
+	// Actions line (key bindings or sort hint).
+	var actionsLine string
+	if m.sortMode && m.sortOrderMode {
+		actionsLine = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
+			"Sort order: [Enter/a] Ascending (default)  [d] Descending  [Esc] Cancel",
+		)
+	} else if m.sortMode {
+		actionsLine = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
+			"Sort: [←/→] Move column  [Enter] Confirm  [Esc] Cancel",
+		)
+	} else {
+		actionsLine = m.renderHelpLine()
+	}
+	doc.WriteString(mFooterStyle.Width(m.width).Render(actionsLine))
+	doc.WriteString("\n")
+
 	// Status line.
 	statusLine := ""
 	if m.actionInFlight {
@@ -1652,30 +1668,7 @@ func (m manageModel) renderView() string {
 			statusLine = mStatusSuccessStyle.Render(m.statusMsg)
 		}
 	}
-
-	var sortHint string
-	if m.sortMode && m.sortOrderMode {
-		sortHint = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
-			"Sort order: [Enter/a] Ascending (default)  [d] Descending  [Esc] Cancel",
-		)
-	} else if m.sortMode {
-		sortHint = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
-			"Sort: [←/→] Move column  [Enter] Confirm  [Esc] Cancel",
-		)
-	}
-
-	helpLine := m.renderHelpLine()
-	footer := statusLine
-	if footer != "" {
-		footer += "  "
-	}
-	if sortHint != "" {
-		footer += sortHint
-	} else {
-		footer += helpLine
-	}
-
-	doc.WriteString(mFooterStyle.Width(m.width).Render(footer))
+	doc.WriteString(mFooterStyle.Width(m.width).Render(statusLine))
 
 	return doc.String()
 }
