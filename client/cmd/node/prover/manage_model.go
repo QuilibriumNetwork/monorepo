@@ -205,6 +205,7 @@ type manageKeyMap struct {
 	Refresh      key.Binding
 	Sort         key.Binding
 	Filter       key.Binding
+	ColorCoding  key.Binding
 	Help         key.Binding
 	Quit         key.Binding
 }
@@ -250,13 +251,14 @@ func newManageKeyMap() manageKeyMap {
 		Refresh:      key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "refresh")),
 		Sort:         key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "sort")),
 		Filter:       key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "filter")),
+		ColorCoding:  key.NewBinding(key.WithKeys("C"), key.WithHelp("C", "colors")),
 		Help:         key.NewBinding(key.WithKeys("h"), key.WithHelp("h", "help")),
 		Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
 func (k manageKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Sort, k.Filter, k.Help, k.Quit}
+	return []key.Binding{k.Tab, k.Up, k.Down, k.Select, k.SelectAll, k.Join, k.Leave, k.Confirm, k.Reject, k.Pause, k.Resume, k.ToggleManual, k.Refresh, k.Sort, k.Filter, k.ColorCoding, k.Help, k.Quit}
 }
 
 func (k manageKeyMap) FullHelp() [][]key.Binding { return nil }
@@ -295,7 +297,59 @@ var (
 	mStatusSuccessStyle = lipgloss.NewStyle().Foreground(mSuccessColor)
 	mStatusErrorStyle   = lipgloss.NewStyle().Foreground(mErrorColor)
 	mFilterColor        = lipgloss.Color("#ffaa00") // amber: active filter indicator
+
+	// Ring gradient: green (ring 0) → yellow-green → yellow → orange → red (ring 4+).
+	mRingColor0 = lipgloss.Color("#00ff00")
+	mRingColor1 = lipgloss.Color("#88ff00")
+	mRingColor2 = lipgloss.Color("#ffff00")
+	mRingColor3 = lipgloss.Color("#ff8800")
+	mRingColor4 = lipgloss.Color("#ff0000")
+
+	// Status colors.
+	mStatusActiveColor  = lipgloss.Color("#00ff00")
+	mStatusJoiningColor = lipgloss.Color("#88ff88")
+	mStatusLeavingColor = lipgloss.Color("#ff8800")
+	mStatusIdleColor    = lipgloss.Color("#ff4444")
+
+	// Mode colors.
+	mModeAutoColor   = lipgloss.Color("#00ff00")
+	mModeManualColor = lipgloss.Color("#ff8800")
 )
+
+func ringStyle(ring uint32) lipgloss.Style {
+	switch ring {
+	case 0:
+		return lipgloss.NewStyle().Foreground(mRingColor0)
+	case 1:
+		return lipgloss.NewStyle().Foreground(mRingColor1)
+	case 2:
+		return lipgloss.NewStyle().Foreground(mRingColor2)
+	case 3:
+		return lipgloss.NewStyle().Foreground(mRingColor3)
+	default:
+		return lipgloss.NewStyle().Foreground(mRingColor4)
+	}
+}
+
+func statusStyle(name string) lipgloss.Style {
+	switch strings.ToLower(name) {
+	case "active":
+		return lipgloss.NewStyle().Foreground(mStatusActiveColor)
+	case "joining":
+		return lipgloss.NewStyle().Foreground(mStatusJoiningColor)
+	case "leaving":
+		return lipgloss.NewStyle().Foreground(mStatusLeavingColor)
+	default: // idle / unknown
+		return lipgloss.NewStyle().Foreground(mStatusIdleColor)
+	}
+}
+
+func modeStyle(mode string) lipgloss.Style {
+	if mode == "M" {
+		return lipgloss.NewStyle().Foreground(mModeManualColor)
+	}
+	return lipgloss.NewStyle().Foreground(mModeAutoColor)
+}
 
 // Model.
 
@@ -389,6 +443,7 @@ type manageModel struct {
 	help           help.Model
 	keyMap         manageKeyMap
 	showHelp       bool
+	colorCoding    bool
 }
 
 func newManageModel(client protobufs.NodeServiceClient) manageModel {
@@ -404,6 +459,7 @@ func newManageModel(client protobufs.NodeServiceClient) manageModel {
 		spinner:         s,
 		help:            h,
 		autoManaged:     true, // derived from server data on first refresh
+		colorCoding:     true,
 		allocSelected:   make(map[string]bool),
 		availSelected:   make(map[string]bool),
 		allocSortCol:    7, // Worker column, descending
@@ -907,6 +963,7 @@ func (m manageModel) renderHelpScreen() string {
 
 	b.WriteString(sectionStyle.Render("General") + "\n")
 	b.WriteString("  " + kv("R", "Force data refresh") + "\n")
+	b.WriteString("  " + kv("C", "Toggle color-coding of Ring, Status and Mode columns") + "\n")
 	b.WriteString("  " + kv("h", "Toggle this help screen") + "\n")
 	b.WriteString("  " + kv("q / Ctrl+C", "Quit") + "\n")
 
@@ -954,6 +1011,7 @@ func (m manageModel) renderHelpLine() string {
 		{m.keyMap.Refresh, ""},
 		{m.keyMap.Sort, ""},
 		{m.keyMap.Filter, "Filter"},
+		{m.keyMap.ColorCoding, "ColorCoding"},
 		{m.keyMap.Help, ""},
 		{m.keyMap.Quit, ""},
 	}
@@ -969,6 +1027,13 @@ func (m manageModel) renderHelpLine() string {
 			// Use a distinct amber color when filtering is enabled.
 			if filtersActive {
 				parts = append(parts, lipgloss.NewStyle().Foreground(mFilterColor).Bold(true).Render(text))
+			} else {
+				parts = append(parts, lipgloss.NewStyle().Foreground(mHelpColor).Render(text))
+			}
+		case e.action == "ColorCoding":
+			// Highlight in green when color-coding is on, match normal help color when off.
+			if m.colorCoding {
+				parts = append(parts, lipgloss.NewStyle().Foreground(mStatusActiveColor).Render(text))
 			} else {
 				parts = append(parts, lipgloss.NewStyle().Foreground(mHelpColor).Render(text))
 			}
@@ -1289,6 +1354,10 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keyMap.Help):
 		m.showHelp = !m.showHelp
+		return m, nil
+
+	case key.Matches(msg, m.keyMap.ColorCoding):
+		m.colorCoding = !m.colorCoding
 		return m, nil
 
 	case key.Matches(msg, m.keyMap.Tab):
@@ -2512,24 +2581,50 @@ func (m manageModel) renderAllocationsPanel(width, height int) string {
 			marker = "[x]"
 		}
 		workerStr := strconv.Itoa(a.workerID) // -1 for no worker assigned
-		line := fmt.Sprintf("%"+strconv.Itoa(allocColWidths[0])+"s %"+strconv.Itoa(allocColWidths[1])+"s %"+strconv.Itoa(allocColWidths[2])+"d %"+strconv.Itoa(allocColWidths[3])+"d "+
-			"%"+strconv.Itoa(allocColWidths[4])+"s %"+strconv.Itoa(allocColWidths[5])+"d %"+strconv.Itoa(allocColWidths[6])+"s %"+strconv.Itoa(allocColWidths[7])+"s %"+strconv.Itoa(allocColWidths[8])+"s "+
-			"%"+strconv.Itoa(allocColWidths[9])+"s %"+strconv.Itoa(allocColWidths[10])+"s %"+strconv.Itoa(allocColWidths[11])+"s",
-			marker,
-			centerTrunc(a.filterHex, fw),
-			a.activeProvers,
-			a.ring,
-			fmt.Sprintf("%.1f", float64(a.shardSize.Uint64())/float64(1024*1024)),
-			a.dataShards,
-			"~"+formatQUIL(a.estimatedReward),
-			workerStr,
-			a.statusName,
-			modeStr,
-			a.nextAction,
-			a.defaultAction,
-		)
-		if i == m.allocCursor && m.focus == allocationsPanel {
+		selected := i == m.allocCursor && m.focus == allocationsPanel
+		var line string
+		if selected {
+			line = fmt.Sprintf("%"+strconv.Itoa(allocColWidths[0])+"s %"+strconv.Itoa(allocColWidths[1])+"s %"+strconv.Itoa(allocColWidths[2])+"d %"+strconv.Itoa(allocColWidths[3])+"d "+
+				"%"+strconv.Itoa(allocColWidths[4])+"s %"+strconv.Itoa(allocColWidths[5])+"d %"+strconv.Itoa(allocColWidths[6])+"s %"+strconv.Itoa(allocColWidths[7])+"s %"+strconv.Itoa(allocColWidths[8])+"s "+
+				"%"+strconv.Itoa(allocColWidths[9])+"s %"+strconv.Itoa(allocColWidths[10])+"s %"+strconv.Itoa(allocColWidths[11])+"s",
+				marker,
+				centerTrunc(a.filterHex, fw),
+				a.activeProvers,
+				a.ring,
+				fmt.Sprintf("%.1f", float64(a.shardSize.Uint64())/float64(1024*1024)),
+				a.dataShards,
+				"~"+formatQUIL(a.estimatedReward),
+				workerStr,
+				a.statusName,
+				modeStr,
+				a.nextAction,
+				a.defaultAction,
+			)
 			line = mSelectedStyle.Width(width).Render(line)
+		} else {
+			ringCell := fmt.Sprintf("%"+strconv.Itoa(allocColWidths[3])+"d", a.ring)
+			statusCell := fmt.Sprintf("%"+strconv.Itoa(allocColWidths[8])+"s", a.statusName)
+			modeCell := fmt.Sprintf("%"+strconv.Itoa(allocColWidths[9])+"s", modeStr)
+			if m.colorCoding {
+				ringCell = ringStyle(a.ring).Render(ringCell)
+				statusCell = statusStyle(a.statusName).Render(statusCell)
+				modeCell = modeStyle(modeStr).Render(modeCell)
+			}
+			cells := []string{
+				fmt.Sprintf("%"+strconv.Itoa(allocColWidths[0])+"s", marker),
+				fmt.Sprintf("%"+strconv.Itoa(allocColWidths[1])+"s", centerTrunc(a.filterHex, fw)),
+				fmt.Sprintf("%"+strconv.Itoa(allocColWidths[2])+"d", a.activeProvers),
+				ringCell,
+				fmt.Sprintf("%"+strconv.Itoa(allocColWidths[4])+"s", fmt.Sprintf("%.1f", float64(a.shardSize.Uint64())/float64(1024*1024))),
+				fmt.Sprintf("%"+strconv.Itoa(allocColWidths[5])+"d", a.dataShards),
+				fmt.Sprintf("%"+strconv.Itoa(allocColWidths[6])+"s", "~"+formatQUIL(a.estimatedReward)),
+				fmt.Sprintf("%"+strconv.Itoa(allocColWidths[7])+"s", workerStr),
+				statusCell,
+				modeCell,
+				fmt.Sprintf("%"+strconv.Itoa(allocColWidths[10])+"s", a.nextAction),
+				fmt.Sprintf("%"+strconv.Itoa(allocColWidths[11])+"s", a.defaultAction),
+			}
+			line = strings.Join(cells, " ")
 		}
 		lines = append(lines, line)
 	}
@@ -2617,17 +2712,32 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		if m.availSelected[s.filterKey] {
 			marker = "[x]"
 		}
-		line = fmt.Sprintf("%"+strconv.Itoa(availColWidths[0])+"s %"+strconv.Itoa(availColWidths[1])+"s %"+strconv.Itoa(availColWidths[2])+"d %"+strconv.Itoa(availColWidths[3])+"d %"+strconv.Itoa(availColWidths[4])+"s %"+strconv.Itoa(availColWidths[5])+"d %"+strconv.Itoa(availColWidths[6])+"s",
-			marker,
-			centerTrunc(s.filterHex, fw),
-			s.activeProvers,
-			s.ring,
-			fmt.Sprintf("%.1f", float64(s.shardSize.Uint64())/float64(1024*1024)),
-			s.dataShards,
-			"~"+formatQUIL(s.estimatedReward),
-		)
 		if i == m.availCursor && m.focus == availablePanel {
+			line = fmt.Sprintf("%"+strconv.Itoa(availColWidths[0])+"s %"+strconv.Itoa(availColWidths[1])+"s %"+strconv.Itoa(availColWidths[2])+"d %"+strconv.Itoa(availColWidths[3])+"d %"+strconv.Itoa(availColWidths[4])+"s %"+strconv.Itoa(availColWidths[5])+"d %"+strconv.Itoa(availColWidths[6])+"s",
+				marker,
+				centerTrunc(s.filterHex, fw),
+				s.activeProvers,
+				s.ring,
+				fmt.Sprintf("%.1f", float64(s.shardSize.Uint64())/float64(1024*1024)),
+				s.dataShards,
+				"~"+formatQUIL(s.estimatedReward),
+			)
 			line = mSelectedStyle.Width(width).Render(line)
+		} else {
+			ringCell := fmt.Sprintf("%"+strconv.Itoa(availColWidths[3])+"d", s.ring)
+			if m.colorCoding {
+				ringCell = ringStyle(s.ring).Render(ringCell)
+			}
+			cells := []string{
+				fmt.Sprintf("%"+strconv.Itoa(availColWidths[0])+"s", marker),
+				fmt.Sprintf("%"+strconv.Itoa(availColWidths[1])+"s", centerTrunc(s.filterHex, fw)),
+				fmt.Sprintf("%"+strconv.Itoa(availColWidths[2])+"d", s.activeProvers),
+				ringCell,
+				fmt.Sprintf("%"+strconv.Itoa(availColWidths[4])+"s", fmt.Sprintf("%.1f", float64(s.shardSize.Uint64())/float64(1024*1024))),
+				fmt.Sprintf("%"+strconv.Itoa(availColWidths[5])+"d", s.dataShards),
+				fmt.Sprintf("%"+strconv.Itoa(availColWidths[6])+"s", "~"+formatQUIL(s.estimatedReward)),
+			}
+			line = strings.Join(cells, " ")
 		}
 		lines = append(lines, line)
 	}
