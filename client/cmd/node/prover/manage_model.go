@@ -239,8 +239,8 @@ func newManageKeyMap() manageKeyMap {
 		Up:           key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
 		Down:         key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
 		Tab:          key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch")),
-		Select:       key.NewBinding(key.WithKeys("space"), key.WithHelp("spc", "select")),
-		SelectAll:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "sel all")),
+		Select:       key.NewBinding(key.WithKeys("space"), key.WithHelp("space", "toggle")),
+		SelectAll:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "all/none")),
 		Join:         key.NewBinding(key.WithKeys("J"), key.WithHelp("J", "join")),
 		Leave:        key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "leave")),
 		Confirm:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "confirm")),
@@ -944,18 +944,18 @@ func (m manageModel) renderHelpScreen() string {
 
 	b.WriteString(sectionStyle.Render("Sort mode  (press s)") + "\n")
 	b.WriteString("  " + kv("← / →", "Move highlight to previous / next column") + "\n")
-	b.WriteString("  " + kv("Enter", "Confirm column, then choose sort order") + "\n")
+	b.WriteString("  " + kv("enter", "Confirm column, then choose sort order") + "\n")
 	b.WriteString("  " + kv("a", "Ascending order") + "\n")
 	b.WriteString("  " + kv("d", "Descending order") + "\n")
-	b.WriteString("  " + kv("Esc", "Cancel sort mode") + "\n")
+	b.WriteString("  " + kv("esc", "Cancel sort mode") + "\n")
 	b.WriteString("\n")
 
 	b.WriteString(sectionStyle.Render("Filter mode  (press f)") + "\n")
 	b.WriteString("  " + kv("← / →", "Move highlight to previous / next filterable column") + "\n")
-	b.WriteString("  " + kv("Enter", "Open filter editor for highlighted column") + "\n")
-	b.WriteString("  " + kv("Del", "Clear filter on highlighted column") + "\n")
+	b.WriteString("  " + kv("enter", "Open filter editor for highlighted column") + "\n")
+	b.WriteString("  " + kv("del", "Clear filter on highlighted column") + "\n")
 	b.WriteString("  " + kv("x", "Disable all filters in current panel") + "\n")
-	b.WriteString("  " + kv("Esc", "Close filter mode") + "\n")
+	b.WriteString("  " + kv("esc", "Close filter mode") + "\n")
 	b.WriteString("  " + noteStyle.Render("  Filter editor: text columns accept a substring; numeric columns accept") + "\n")
 	b.WriteString("  " + noteStyle.Render("  an expression like \"> 47\", \"< 100\", or a comma list \"1,5,7\";") + "\n")
 	b.WriteString("  " + noteStyle.Render("  select columns toggle values with Space, confirm with Enter.") + "\n")
@@ -1021,7 +1021,7 @@ func (m manageModel) renderHelpLine() string {
 	var parts []string
 	for _, e := range entries {
 		h := e.b.Help()
-		text := h.Key + " " + h.Desc
+		text := "[" + h.Key + "] " + h.Desc
 		switch {
 		case e.action == "Filter":
 			// Use a distinct amber color when filtering is enabled.
@@ -2406,7 +2406,7 @@ func (m manageModel) renderView() string {
 			colName = availColNames[colIdx]
 		}
 		actionsLine = lipgloss.NewStyle().Foreground(mFilterColor).Bold(true).Render(
-			fmt.Sprintf("Filter [%s]: [←/→] Column  [Enter] Edit  [Del] Clear  [x] Disable all  [Esc] Close", colName),
+			fmt.Sprintf("Filter [%s]: [←/→] column  [enter] edit  [del] clear  [x] disable all  [esc] close", colName),
 		)
 		if m.actionInFlight {
 			statusLine = m.spinner.View() + " " + m.statusMsg
@@ -2419,11 +2419,11 @@ func (m manageModel) renderView() string {
 		}
 	case m.sortMode && m.sortOrderMode:
 		actionsLine = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
-			"Sort order: [Enter/a] Ascending (default)  [d] Descending  [Esc] Cancel",
+			"Sort order: [enter/a] ascending (default)  [d] descending  [esc] cancel",
 		)
 	case m.sortMode:
 		actionsLine = lipgloss.NewStyle().Foreground(mPrimaryColor).Bold(true).Render(
-			"Sort: [←/→] Move column  [Enter] Confirm  [Esc] Cancel",
+			"Sort: [←/→] Move column  [enter] apply  [esc] cancel",
 		)
 	default:
 		actionsLine = m.renderHelpLine()
@@ -2473,7 +2473,7 @@ func (m manageModel) renderFilterEditLines() (string, string) {
 		}
 		actionsLine := fmt.Sprintf("Filter [%s]: %s", colName, strings.Join(itemParts, "  "))
 		statusLine := lipgloss.NewStyle().Foreground(mHelpColor).Render(
-			"←/→: navigate  Space: toggle  a: all/none  Enter: apply  Esc: cancel",
+			"[←/→] column  [space] toggle  [a] all/none  [enter] apply  [esc] cancel",
 		)
 		return actionsLine, statusLine
 	}
@@ -2483,7 +2483,7 @@ func (m manageModel) renderFilterEditLines() (string, string) {
 	actionsLine := lipgloss.NewStyle().Foreground(mFilterColor).Bold(true).Render(
 		fmt.Sprintf("Filter [%s]: %s%s", colName, m.filterEditInput, cursor),
 	)
-	hint := "Enter: apply  Esc: cancel"
+	hint := "[enter] apply  [esc] cancel"
 	if kind == filterColNumeric {
 		hint = "Numeric: >N  >=N  <N  <=N  =N  or  N1,N2,...    " + hint
 	}
