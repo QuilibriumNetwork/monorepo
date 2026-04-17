@@ -560,11 +560,7 @@ func PrintVersion(network uint8, char string, ver string) {
 		schar = "   "
 	}
 
-	patch := GetPatchNumber()
 	patchString := ""
-	if patch != 0x00 {
-		patchString = fmt.Sprintf("-p%d", patch)
-	}
 	if network != 0 {
 		patchString = fmt.Sprintf("-b%d", GetRCNumber())
 	}

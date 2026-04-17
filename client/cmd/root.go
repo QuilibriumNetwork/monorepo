@@ -142,8 +142,11 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 				count := 0
 
 				for i := 1; i <= len(config.Signatories); i++ {
-					// Try var data path first for signature files
-					signatureFile := filepath.Join(varDataPath, fmt.Sprintf("%s.dgst.sig.%d", filepath.Base(ex), i))
+					// Try var data path first for signature files. Use the
+					// standardized release filename (qclient-<ver>-<os>-<arch>)
+					// rather than the running executable's basename, since
+					// signatures on disk are named after the release artifact.
+					signatureFile := filepath.Join(varDataPath, fmt.Sprintf("%s.dgst.sig.%d", StandardizedQClientFileName, i))
 					sig, err := os.ReadFile(signatureFile)
 					if err != nil {
 						// Fall back to checking next to executable
