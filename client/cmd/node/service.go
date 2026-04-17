@@ -470,7 +470,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=quilibrium
+User=%s
 EnvironmentFile=%s
 ExecStart=%s --config %s
 Restart=always
@@ -478,15 +478,15 @@ RestartSec=10
 ExecStop=/bin/kill -s SIGINT $MAINPID
 ExecReload=/bin/kill -s SIGINT $MAINPID && %s --config %s
 KillSignal=SIGINT
-RestartSignal=SIGINT
+RestartKillSignal=SIGINT
 FinalKillSignal=SIGKILL
-KillSignal=SIGKILL
+SendSIGKILL=yes
 TimeoutStopSec=240
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-`, envPath, binaryPath, configPath, binaryPath, configPath)
+`, NodeUser.Username, envPath, binaryPath, configPath, binaryPath, configPath)
 
 	// Write service file
 	servicePath := "/etc/systemd/system/" + serviceName + ".service"
