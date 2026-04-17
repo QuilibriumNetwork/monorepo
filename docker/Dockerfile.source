@@ -63,11 +63,11 @@ COPY emp-ot emp-ot
 
 RUN bash install-emp.sh
 
-# Fix emp-tool to be static and install
-RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make -j$(nproc) && make install
+# Fix emp-tool to be static and install (build only in build/ so we never pick up a host CMakeCache.txt from COPY)
+RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && rm -rf build CMakeCache.txt CMakeFiles Makefile cmake_install.cmake CTestTestfile.cmake install_manifest.txt && mkdir -p build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && make -j$(nproc) && make install
 
 # Install emp-ot
-RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make -j$(nproc) && make install
+RUN cd emp-ot && rm -rf build CMakeCache.txt CMakeFiles Makefile cmake_install.cmake CTestTestfile.cmake install_manifest.txt && mkdir -p build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && make -j$(nproc) && make install
 
 # -----------------------------------------------------------------------------
 # Stage: go-base

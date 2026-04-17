@@ -17,6 +17,8 @@ fi
 
 for tool in ${TOOLS[@]};do
     cd $tool
+    # Drop stale configure output (e.g. host paths after repo move or COPY into Docker).
+    rm -rf CMakeCache.txt CMakeFiles Makefile cmake_install.cmake CTestTestfile.cmake install_manifest.txt
     cmake .
     make -j4
     make install
