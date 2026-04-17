@@ -8,6 +8,21 @@ type ClientConfig struct {
 	PublicRpc       bool   `yaml:"publicRpc"`
 	CustomRpc       string `yaml:"customRpc"`
 	NodeSymlinkName string `yaml:"nodeSymlinkName"`
+	NodeServiceName string `yaml:"nodeServiceName"`
+	// NodeInstallDir is the root directory for the node binary tree and
+	// environment file. Defaults to /var/quilibrium. The actual binaries
+	// live under <NodeInstallDir>/bin/node/<version>/.
+	NodeInstallDir string `yaml:"nodeInstallDir"`
+	// NodeLogDir is the directory where node logs are written and rotated.
+	// Defaults to /var/log/quilibrium.
+	NodeLogDir string `yaml:"nodeLogDir"`
+	// NodeSymlinkDir is the directory where the node binary symlink
+	// (quilibrium-node) is created. Defaults to /usr/local/bin.
+	NodeSymlinkDir string `yaml:"nodeSymlinkDir"`
+	// NodeConfigsDir is the directory that holds named node configs.
+	// Defaults to $HOME/.quilibrium/configs (resolved from the invoking
+	// sudo user's home directory).
+	NodeConfigsDir string `yaml:"nodeConfigsDir"`
 }
 
 type NodeConfig struct {

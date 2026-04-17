@@ -21,6 +21,7 @@ var (
 	NodeDataPath           = filepath.Join(BinaryPath, string(ReleaseTypeNode))
 	NodeEnvPath            = filepath.Join(RootQuilibriumPath, "quilibrium.env")
 	NodeServiceName        = "quilibrium-node"
+	DefaultNodeServiceName = "quilibrium-node"
 	DefaultNodeSymlinkPath = filepath.Join(DefaultSymlinkDir, NodeServiceName)
 	LogPath                = "/var/log/quilibrium"
 )
@@ -57,6 +58,20 @@ func GetPrivKeyFromConfig(cfg *config.Config) (crypto.PrivKey, error) {
 
 func IsExistingNodeVersion(version string) bool {
 	return FileExists(filepath.Join(NodeDataPath, version))
+}
+
+// GetNodeServiceName returns the user-configured systemd/launchd service name,
+// falling back to DefaultNodeServiceName when unset or when the config cannot
+// be read. It is used for Linux systemd unit operations; callers that must
+// reference the fixed binary/package name (e.g. the /usr/local/bin symlink,
+// the macOS launchd label, or logrotate) should continue to use
+// DefaultNodeServiceName directly.
+func GetNodeServiceName() string {
+	cfg, err := LoadClientConfig()
+	if err != nil || cfg == nil || cfg.NodeServiceName == "" {
+		return DefaultNodeServiceName
+	}
+	return cfg.NodeServiceName
 }
 
 func CheckForSystemd() bool {
@@ -148,7 +163,58 @@ func LoadNodeConfig(configDirectory string) (*config.Config, error) {
 		return LoadDefaultNodeConfig()
 	}
 
-	return config.LoadConfig(configDirectory, "", false)
+	resolved, err := ResolveNodeConfigDir(configDirectory)
+	if err != nil {
+		return nil, err
+	}
+
+	return config.LoadConfig(resolved, "", false)
+}
+
+// ResolveNodeConfigDir resolves the value passed to --config into an absolute
+// filesystem path, without creating anything on disk. It accepts either a
+// named config (looked up under ~/.quilibrium/configs/<name>) or a direct
+// path (absolute or relative to the current working directory). The resolved
+// directory must exist and contain both config.yml and keys.yml, otherwise an
+// error is returned explaining what was checked.
+func ResolveNodeConfigDir(value string) (string, error) {
+	if value == "" {
+		return "", fmt.Errorf("config directory not specified")
+	}
+
+	namedPath := filepath.Join(GetNodeConfigHomeDir(), value)
+	if info, err := os.Stat(namedPath); err == nil && info.IsDir() {
+		if !HasNodeConfigFiles(namedPath) {
+			return "", fmt.Errorf(
+				"%s: %s", ErrNotValidConfigDirMessage, namedPath,
+			)
+		}
+		return namedPath, nil
+	}
+
+	if info, err := os.Stat(value); err == nil {
+		if !info.IsDir() {
+			return "", fmt.Errorf(
+				"config path is not a directory: %s", value,
+			)
+		}
+		abs, err := filepath.Abs(value)
+		if err != nil {
+			abs = value
+		}
+		if !HasNodeConfigFiles(abs) {
+			return "", fmt.Errorf(
+				"%s: %s", ErrNotValidConfigDirMessage, abs,
+			)
+		}
+		return abs, nil
+	}
+
+	return "", fmt.Errorf(
+		"config directory not found: %q (looked for a named config at %s "+
+			"and as a filesystem path)",
+		value, namedPath,
+	)
 }
 
 // HasNodeConfigFiles checks if a directory contains both config.yml and

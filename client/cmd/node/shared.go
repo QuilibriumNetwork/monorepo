@@ -122,7 +122,7 @@ func printSuccessMessage(version string) {
 	fmt.Fprintf(os.Stdout, "Binary symlinked to %s\n", utils.DefaultNodeSymlinkPath)
 	fmt.Fprintf(os.Stdout, "Log directory: %s\n", utils.LogPath)
 	fmt.Fprintf(os.Stdout, "Environment file: /etc/default/quilibrium-node\n")
-	fmt.Fprintf(os.Stdout, "Service file: /etc/systemd/system/quilibrium-node.service\n")
+	fmt.Fprintln(os.Stdout, "Service file: /etc/systemd/system/"+utils.GetNodeServiceName()+".service")
 
 	fmt.Fprintf(os.Stdout, "\nConfiguration:\n")
 	fmt.Fprintf(os.Stdout, "  To create a new configuration:\n")
@@ -131,7 +131,7 @@ func printSuccessMessage(version string) {
 	fmt.Fprintf(os.Stdout, "\n  To use an existing configuration:\n")
 	fmt.Fprintf(os.Stdout, "    qclient node config import [name] /path/to/your/existing/config --default\n")
 	fmt.Fprintf(os.Stdout, "    # Or modify the service file to point to your existing config:\n")
-	fmt.Fprintf(os.Stdout, "    sudo nano /etc/systemd/system/"+utils.NodeServiceName+".service\n")
+	fmt.Fprintf(os.Stdout, "    sudo nano /etc/systemd/system/"+utils.GetNodeServiceName()+".service\n")
 	fmt.Fprintf(os.Stdout, "    # Then reload systemd:\n")
 	fmt.Fprintf(os.Stdout, "    sudo systemctl daemon-reload\n")
 
@@ -143,7 +143,7 @@ func printSuccessMessage(version string) {
 	fmt.Fprintf(os.Stdout, "\nTo manually start the node (must create a config first), you can run:\n")
 	fmt.Fprintf(os.Stdout, "  "+utils.NodeServiceName+" --config "+ConfigDirs+"/myconfig/\n")
 	fmt.Fprintf(os.Stdout, "  # Or use systemd service using the default config:\n")
-	fmt.Fprintf(os.Stdout, "  sudo systemctl start "+utils.NodeServiceName+"\n")
+	fmt.Fprintf(os.Stdout, "  sudo systemctl start "+utils.GetNodeServiceName()+"\n")
 
 	fmt.Fprintf(os.Stdout, "\nFor more options, run:\n")
 	fmt.Fprintf(os.Stdout, "  "+utils.NodeServiceName+" --help\n")

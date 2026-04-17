@@ -24,5 +24,10 @@ var ClientConfigPrintCmd = &cobra.Command{
 		fmt.Printf("Signature Check: %v\n", config.SignatureCheck)
 		fmt.Printf("Quiet: %v\n", config.Quiet)
 		fmt.Printf("Public RPC: %v\n", config.PublicRpc)
+		serviceName := config.NodeServiceName
+		if serviceName == "" {
+			serviceName = utils.DefaultNodeServiceName
+		}
+		fmt.Printf("Node Service Name: %s\n", serviceName)
 	},
 }

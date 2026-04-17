@@ -15,4 +15,5 @@ func init() {
 	ConfigCmd.AddCommand(ClientConfigPublicRpcCmd)
 	ConfigCmd.AddCommand(ClientConfigSetCustomRpcCmd)
 	ConfigCmd.AddCommand(ClientConfigSignatureCheckCmd)
+	ConfigCmd.AddCommand(ClientConfigServiceNameCmd)
 }

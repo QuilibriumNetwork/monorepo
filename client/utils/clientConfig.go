@@ -13,11 +13,12 @@ func CreateDefaultConfig() {
 
 	fmt.Printf("Creating default config: %s\n", configPath)
 	SaveClientConfig(&ClientConfig{
-		DataDir:        ClientDataPath,
-		SymlinkPath:    DefaultQClientSymlinkPath,
-		SignatureCheck: true,
-		PublicRpc:      false,
-		CustomRpc:      "",
+		DataDir:         ClientDataPath,
+		SymlinkPath:     DefaultQClientSymlinkPath,
+		SignatureCheck:  true,
+		PublicRpc:       false,
+		CustomRpc:       "",
+		NodeServiceName: DefaultNodeServiceName,
 	})
 
 	sudoUser, err := GetCurrentSudoUser()
@@ -35,11 +36,12 @@ func LoadClientConfig() (*ClientConfig, error) {
 	// Create default config if it doesn't exist
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		config := &ClientConfig{
-			DataDir:        ClientDataPath,
-			SymlinkPath:    filepath.Join(ClientDataPath, "current"),
-			SignatureCheck: true,
-			PublicRpc:      false,
-			CustomRpc:      "",
+			DataDir:         ClientDataPath,
+			SymlinkPath:     filepath.Join(ClientDataPath, "current"),
+			SignatureCheck:  true,
+			PublicRpc:       false,
+			CustomRpc:       "",
+			NodeServiceName: DefaultNodeServiceName,
 		}
 		if err := SaveClientConfig(config); err != nil {
 			return nil, err
@@ -56,6 +58,11 @@ func LoadClientConfig() (*ClientConfig, error) {
 	config := &ClientConfig{}
 	if err := yaml.Unmarshal(data, config); err != nil {
 		return nil, err
+	}
+
+	// Backfill for configs that pre-date the NodeServiceName field.
+	if config.NodeServiceName == "" {
+		config.NodeServiceName = DefaultNodeServiceName
 	}
 
 	return config, nil
