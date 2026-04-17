@@ -4,6 +4,7 @@ type ClientConfig struct {
 	DataDir         string `yaml:"dataDir"`
 	SymlinkPath     string `yaml:"symlinkPath"`
 	SignatureCheck  bool   `yaml:"signatureCheck"`
+	Quiet           bool   `yaml:"quiet"`
 	PublicRpc       bool   `yaml:"publicRpc"`
 	CustomRpc       string `yaml:"customRpc"`
 	NodeSymlinkName string `yaml:"nodeSymlinkName"`

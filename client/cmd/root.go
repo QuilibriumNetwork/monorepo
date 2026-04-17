@@ -85,7 +85,9 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 			varDataPath := filepath.Join(utils.ClientDataPath, config.GetVersionString())
 			digestPath := filepath.Join(varDataPath, StandardizedQClientFileName+".dgst")
 
-			fmt.Printf("Checking signature for %s\n", digestPath)
+			if !clientConfig.Quiet {
+				fmt.Printf("Checking signature for %s\n", digestPath)
+			}
 
 			// Try to read digest from var data path first
 			digest, err := os.ReadFile(digestPath)
@@ -165,12 +167,16 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 					os.Exit(1)
 				}
 
-				fmt.Println("Signature check passed")
+				if !clientConfig.Quiet {
+					fmt.Println("Signature check passed")
+				}
 			}
 		} else {
-			fmt.Println("Signature check bypassed, be sure you know what you're doing")
-			fmt.Println("----------------------------------------------------------")
-			fmt.Println("")
+			if !clientConfig.Quiet {
+				fmt.Println("Signature check bypassed, be sure you know what you're doing")
+				fmt.Println("----------------------------------------------------------")
+				fmt.Println("")
+			}
 		}
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
@@ -251,4 +257,5 @@ func init() {
 	rootCmd.AddCommand(DownloadSignaturesCmd)
 	rootCmd.AddCommand(LinkCmd)
 	rootCmd.AddCommand(VersionCmd)
+	rootCmd.AddCommand(QuietCmd)
 }

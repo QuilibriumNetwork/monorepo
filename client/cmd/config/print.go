@@ -22,6 +22,7 @@ var ClientConfigPrintCmd = &cobra.Command{
 		fmt.Printf("Data Directory: %s\n", config.DataDir)
 		fmt.Printf("Symlink Path: %s\n", config.SymlinkPath)
 		fmt.Printf("Signature Check: %v\n", config.SignatureCheck)
+		fmt.Printf("Quiet: %v\n", config.Quiet)
 		fmt.Printf("Public RPC: %v\n", config.PublicRpc)
 	},
 }
