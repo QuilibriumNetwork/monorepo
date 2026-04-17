@@ -29,5 +29,13 @@ var ClientConfigPrintCmd = &cobra.Command{
 			serviceName = utils.DefaultNodeServiceName
 		}
 		fmt.Printf("Node Service Name: %s\n", serviceName)
+
+		fmt.Printf("Node Install Dir: %s\n", utils.GetNodeInstallDir())
+		fmt.Printf("  Node Binary Dir: %s\n", utils.GetNodeBinaryDir())
+		fmt.Printf("  Node Env File:   %s\n", utils.GetNodeEnvFilePath())
+		fmt.Printf("Node Log Dir:     %s\n", utils.GetNodeLogDir())
+		fmt.Printf("Node Symlink Dir: %s\n", utils.GetNodeSymlinkDir())
+		fmt.Printf("  Node Symlink:   %s\n", utils.GetNodeSymlinkPath())
+		fmt.Printf("Node Configs Dir: %s\n", utils.GetNodeConfigsDir())
 	},
 }

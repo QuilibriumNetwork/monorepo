@@ -135,8 +135,9 @@ func cleanNodeBinaries() {
 
 // RemoveNodeBinary removes a specific version's binary directory.
 func RemoveNodeBinary(version string) error {
+	binDir := utils.GetNodeBinaryDir()
 	// Determine which version is currently active via the symlink
-	target, err := os.Readlink(utils.DefaultNodeSymlinkPath)
+	target, err := os.Readlink(utils.GetNodeSymlinkPath())
 	if err == nil {
 		dir := filepath.Dir(target)
 		currentVersion := filepath.Base(dir)
@@ -145,9 +146,9 @@ func RemoveNodeBinary(version string) error {
 		}
 	}
 
-	versionDir := filepath.Join(utils.NodeDataPath, version)
+	versionDir := filepath.Join(binDir, version)
 	if _, err := os.Stat(versionDir); os.IsNotExist(err) {
-		return fmt.Errorf("version %s not found in %s", version, utils.NodeDataPath)
+		return fmt.Errorf("version %s not found in %s", version, binDir)
 	}
 
 	return os.RemoveAll(versionDir)

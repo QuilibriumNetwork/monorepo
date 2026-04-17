@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/user"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -48,7 +47,7 @@ var NodeCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		NodeUser = userLookup
-		ConfigDirs = filepath.Join(userLookup.HomeDir, ".quilibrium", "configs")
+		ConfigDirs = utils.GetNodeConfigsDir()
 		if ConfigDirectory != "" {
 			NodeConfig, err = utils.LoadNodeConfig(ConfigDirectory)
 			if err != nil {

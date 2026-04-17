@@ -72,28 +72,39 @@ func uninstallNode() {
 	fmt.Println("Removing node service...")
 	removeNodeService()
 
+	binDir := utils.GetNodeBinaryDir()
+	symlinkPath := utils.GetNodeSymlinkPath()
+	logDir := utils.GetNodeLogDir()
+	envPath := utils.GetNodeEnvFilePath()
+
 	// 3. Remove all binaries
 	fmt.Println("Removing node binaries...")
-	if err := os.RemoveAll(utils.NodeDataPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not remove binaries at %s: %v\n", utils.NodeDataPath, err)
+	if err := os.RemoveAll(binDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove binaries at %s: %v\n", binDir, err)
 	}
 
 	// 4. Remove symlink
 	fmt.Println("Removing node symlink...")
-	if err := os.Remove(utils.DefaultNodeSymlinkPath); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Warning: could not remove symlink at %s: %v\n", utils.DefaultNodeSymlinkPath, err)
+	if err := os.Remove(symlinkPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove symlink at %s: %v\n", symlinkPath, err)
 	}
 
 	// 5. Remove logs
 	fmt.Println("Removing log files...")
-	if err := os.RemoveAll(utils.LogPath); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Warning: could not remove logs at %s: %v\n", utils.LogPath, err)
+	if err := os.RemoveAll(logDir); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove logs at %s: %v\n", logDir, err)
 	}
 
 	// 6. Remove logrotate config
 	logrotateConfig := "/etc/logrotate.d/" + utils.NodeServiceName
 	if err := os.Remove(logrotateConfig); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Warning: could not remove logrotate config at %s: %v\n", logrotateConfig, err)
+	}
+
+	// 7. Remove environment file
+	fmt.Println("Removing environment file...")
+	if err := os.Remove(envPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove environment file at %s: %v\n", envPath, err)
 	}
 
 	fmt.Println()
@@ -112,7 +123,7 @@ func stopNodeService() {
 			fmt.Fprintf(os.Stderr, "  Note: could not stop service (may not be running): %v\n", err)
 		}
 	} else {
-		cmd := exec.Command("sudo", "systemctl", "stop", utils.NodeServiceName)
+		cmd := exec.Command("sudo", "systemctl", "stop", utils.GetNodeServiceName())
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "  Note: could not stop service (may not be running): %v\n", err)
 		}
@@ -121,12 +132,13 @@ func stopNodeService() {
 
 func removeNodeService() {
 	if OsType == "linux" {
+		serviceName := utils.GetNodeServiceName()
 		// Disable service first
-		disableCmd := exec.Command("sudo", "systemctl", "disable", utils.NodeServiceName)
+		disableCmd := exec.Command("sudo", "systemctl", "disable", serviceName)
 		disableCmd.Run() // ignore error
 
 		// Remove service file
-		servicePath := "/etc/systemd/system/" + utils.NodeServiceName + ".service"
+		servicePath := "/etc/systemd/system/" + serviceName + ".service"
 		if err := os.Remove(servicePath); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "  Warning: could not remove service file: %v\n", err)
 		}

@@ -23,7 +23,7 @@ Examples:
 			return
 		}
 
-		logDir := utils.LogPath
+		logDir := utils.GetNodeLogDir()
 		entries, err := os.ReadDir(logDir)
 		if err != nil {
 			if os.IsNotExist(err) {

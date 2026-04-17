@@ -43,7 +43,7 @@ Examples:
   qclient node log view --lines 200  # show last 200 lines
   qclient node log view --follow     # follow log output`,
 	Run: func(cmd *cobra.Command, args []string) {
-		logFile := filepath.Join(utils.LogPath, "quilibrium-node.log")
+		logFile := filepath.Join(utils.GetNodeLogDir(), "quilibrium-node.log")
 
 		if _, err := os.Stat(logFile); os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "Log file not found: %s\n", logFile)
