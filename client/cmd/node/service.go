@@ -555,6 +555,23 @@ func installMacOSService() {
 </plist>`
 
 	// Prepare template data
+	// Resolve the active node config's logger.path for launchd's
+	// StandardOutPath/StandardErrorPath. If the active config has no
+	// logger block, fall back to the per-config default directory so
+	// launchd still has a stable place to send stdout/stderr; the node
+	// itself will log to stdout in that case, which launchd will capture.
+	logPath := utils.DefaultNodeLogDirForConfig(utils.DefaultNodeConfigName)
+	if resolved, err := utils.ResolveActiveNodeLog(); err == nil {
+		if resolved.FileBased {
+			logPath = resolved.LogDir
+		} else if resolved.ConfigName != "" {
+			logPath = utils.DefaultNodeLogDirForConfig(resolved.ConfigName)
+		}
+	}
+	if err := os.MkdirAll(logPath, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not create log dir %s: %v\n", logPath, err)
+	}
+
 	data := struct {
 		Label       string
 		DataPath    string
@@ -566,7 +583,7 @@ func installMacOSService() {
 		Label:       fmt.Sprintf("com.quilibrium.node"),
 		DataPath:    utils.GetNodeBinaryDir(),
 		ServiceName: "node",
-		LogPath:     utils.GetNodeLogDir(),
+		LogPath:     logPath,
 		BinaryPath:  utils.GetNodeSymlinkPath(),
 		ConfigPath:  filepath.Join(utils.GetNodeConfigsDir(), "default"),
 	}

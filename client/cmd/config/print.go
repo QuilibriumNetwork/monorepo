@@ -33,7 +33,17 @@ var ClientConfigPrintCmd = &cobra.Command{
 		fmt.Printf("Node Install Dir: %s\n", utils.GetNodeInstallDir())
 		fmt.Printf("  Node Binary Dir: %s\n", utils.GetNodeBinaryDir())
 		fmt.Printf("  Node Env File:   %s\n", utils.GetNodeEnvFilePath())
-		fmt.Printf("Node Log Dir:     %s\n", utils.GetNodeLogDir())
+		// Node log location lives in the node config's logger.path, not
+		// the client config. Show the active one for convenience.
+		if resolved, err := utils.ResolveActiveNodeLog(); err == nil {
+			if resolved.FileBased {
+				fmt.Printf("Node Log Dir:     %s (from %s/config.yml)\n",
+					resolved.LogDir, resolved.ConfigDir)
+			} else {
+				fmt.Printf("Node Log Dir:     (none; active config %q has no logger block, node logs to system log)\n",
+					resolved.ConfigName)
+			}
+		}
 		fmt.Printf("Node Symlink Dir: %s\n", utils.GetNodeSymlinkDir())
 		fmt.Printf("  Node Symlink:   %s\n", utils.GetNodeSymlinkPath())
 		fmt.Printf("Node Configs Dir: %s\n", utils.GetNodeConfigsDir())

@@ -37,46 +37,38 @@ func setOwnership() {
 	}
 }
 
-// setupLogRotation creates a logrotate configuration file for the Quilibrium node
-func setupLogRotation() error {
-	// Check if we need sudo privileges for creating logrotate config
-	if err := utils.CheckAndRequestSudo("Creating logrotate configuration requires root privileges"); err != nil {
+// ensureNodeLogDirs makes sure the active node config has a logger
+// block and that its log directory exists with the right ownership so
+// the node can start writing to it immediately. Rotation itself is
+// handled in-process by the node's lumberjack-based logger — we don't
+// install a logrotate rule.
+func ensureNodeLogDirs() error {
+	if err := utils.CheckAndRequestSudo("Preparing node log directory requires root privileges"); err != nil {
 		return fmt.Errorf("failed to get sudo privileges: %w", err)
 	}
 
-	logDir := utils.GetNodeLogDir()
-	// Create logrotate configuration
-	configContent := fmt.Sprintf(`%s/*.log {
-    daily
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    create 0640 %s %s
-    postrotate
-        systemctl reload quilibrium-node >/dev/null 2>&1 || true
-    endscript
-}`, logDir, NodeUser.Username, NodeUser.Username)
-
-	// Write the configuration file
-	configPath := "/etc/logrotate.d/" + utils.NodeServiceName
-	if err := utils.WriteFile(configPath, configContent); err != nil {
-		return fmt.Errorf("failed to create logrotate configuration: %w", err)
-	}
-
-	// Create log directory with proper permissions
-	if err := utils.ValidateAndCreateDir(logDir, NodeUser); err != nil {
-		return fmt.Errorf("failed to create log directory: %w", err)
-	}
-
-	// Set ownership of log directory
-	err := utils.ChownPath(logDir, NodeUser, true)
+	activeDir, err := utils.GetDefaultNodeConfigDir()
 	if err != nil {
-		return fmt.Errorf("failed to set log directory ownership: %w", err)
+		return fmt.Errorf("resolving active node config dir: %w", err)
+	}
+	activeLogDir, modified, err := utils.EnsureNodeConfigLogger(activeDir)
+	if err != nil {
+		return fmt.Errorf("ensuring logger block on active config: %w", err)
+	}
+	if modified {
+		fmt.Fprintf(os.Stdout,
+			"Populated logger block in %s/config.yml (logger.path=%s)\n",
+			activeDir, activeLogDir,
+		)
 	}
 
-	fmt.Fprintf(os.Stdout, "Created log rotation configuration at %s\n", configPath)
+	if err := utils.ValidateAndCreateDir(activeLogDir, NodeUser); err != nil {
+		return fmt.Errorf("failed to create log directory %s: %w", activeLogDir, err)
+	}
+	if err := utils.ChownPath(activeLogDir, NodeUser, true); err != nil {
+		return fmt.Errorf("failed to set ownership on %s: %w", activeLogDir, err)
+	}
+
 	return nil
 }
 
@@ -113,9 +105,10 @@ func finishInstallation(version string) {
 		fmt.Fprintf(os.Stderr, "Error creating symlink: %v\n", err)
 	}
 
-	// Set up log rotation
-	if err := setupLogRotation(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: Failed to set up log rotation: %v\n", err)
+	// Ensure the node's log directory exists (rotation is handled by
+	// the node itself, so no logrotate rule is installed).
+	if err := ensureNodeLogDirs(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to prepare log directory: %v\n", err)
 	}
 
 	// Print success message
@@ -127,7 +120,11 @@ func printSuccessMessage(version string) {
 	fmt.Fprintf(os.Stdout, "\nSuccessfully installed Quilibrium node %s\n", version)
 	fmt.Fprintf(os.Stdout, "Binary download directory: %s\n", filepath.Join(utils.GetNodeBinaryDir(), version))
 	fmt.Fprintf(os.Stdout, "Binary symlinked to %s\n", utils.GetNodeSymlinkPath())
-	fmt.Fprintf(os.Stdout, "Log directory: %s\n", utils.GetNodeLogDir())
+	if resolved, err := utils.ResolveActiveNodeLog(); err == nil && resolved.FileBased {
+		fmt.Fprintf(os.Stdout, "Log directory: %s\n", resolved.LogDir)
+	} else {
+		fmt.Fprintf(os.Stdout, "Log directory: (no logger block in active node config; using system log)\n")
+	}
 	fmt.Fprintf(os.Stdout, "Environment file: %s\n", utils.GetNodeEnvFilePath())
 	fmt.Fprintln(os.Stdout, "Service file: /etc/systemd/system/"+utils.GetNodeServiceName()+".service")
 

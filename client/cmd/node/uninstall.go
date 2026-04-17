@@ -27,7 +27,7 @@ The following will be removed:
   - All node binaries and signatures
   - Node symlink
   - Log files
-  - Logrotate configuration
+  - Any leftover legacy logrotate configuration from older installs
 
 The following will NOT be removed:
   - Configuration files (~/.quilibrium/configs/)
@@ -74,7 +74,19 @@ func uninstallNode() {
 
 	binDir := utils.GetNodeBinaryDir()
 	symlinkPath := utils.GetNodeSymlinkPath()
-	logDir := utils.GetNodeLogDir()
+	logDirs := utils.ResolveAllNodeLogDirs()
+	if resolved, err := utils.ResolveActiveNodeLog(); err == nil && resolved.FileBased {
+		present := false
+		for _, d := range logDirs {
+			if d == resolved.LogDir {
+				present = true
+				break
+			}
+		}
+		if !present {
+			logDirs = append(logDirs, resolved.LogDir)
+		}
+	}
 	envPath := utils.GetNodeEnvFilePath()
 
 	// 3. Remove all binaries
@@ -91,14 +103,18 @@ func uninstallNode() {
 
 	// 5. Remove logs
 	fmt.Println("Removing log files...")
-	if err := os.RemoveAll(logDir); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Warning: could not remove logs at %s: %v\n", logDir, err)
+	for _, logDir := range logDirs {
+		if err := os.RemoveAll(logDir); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove logs at %s: %v\n", logDir, err)
+		}
 	}
 
-	// 6. Remove logrotate config
-	logrotateConfig := "/etc/logrotate.d/" + utils.NodeServiceName
-	if err := os.Remove(logrotateConfig); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Warning: could not remove logrotate config at %s: %v\n", logrotateConfig, err)
+	// 6. Best-effort removal of any legacy logrotate config left over
+	// from previous qclient versions. Current installs don't create
+	// one; the node rotates its own logs.
+	legacyLogrotate := "/etc/logrotate.d/" + utils.NodeServiceName
+	if err := os.Remove(legacyLogrotate); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: could not remove legacy logrotate config at %s: %v\n", legacyLogrotate, err)
 	}
 
 	// 7. Remove environment file

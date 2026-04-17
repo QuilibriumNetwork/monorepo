@@ -426,9 +426,12 @@ func LoadConfig(configPath string, proverKey string, skipGenesisCheck bool) (
 }
 
 func SaveConfig(configPath string, config *Config) error {
+	// O_TRUNC is important: without it, writing a shorter YAML on top
+	// of an existing longer file would leave trailing garbage after the
+	// encoded document.
 	file, err := os.OpenFile(
 		filepath.Join(configPath, "config.yml"),
-		os.O_CREATE|os.O_RDWR,
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
 		os.FileMode(0600),
 	)
 	if err != nil {

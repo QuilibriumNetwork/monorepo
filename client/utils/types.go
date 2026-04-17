@@ -13,9 +13,6 @@ type ClientConfig struct {
 	// environment file. Defaults to /var/quilibrium. The actual binaries
 	// live under <NodeInstallDir>/bin/node/<version>/.
 	NodeInstallDir string `yaml:"nodeInstallDir"`
-	// NodeLogDir is the directory where node logs are written and rotated.
-	// Defaults to /var/log/quilibrium.
-	NodeLogDir string `yaml:"nodeLogDir"`
 	// NodeSymlinkDir is the directory where the node binary symlink
 	// (quilibrium-node) is created. Defaults to /usr/local/bin.
 	NodeSymlinkDir string `yaml:"nodeSymlinkDir"`

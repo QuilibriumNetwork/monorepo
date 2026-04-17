@@ -60,8 +60,8 @@ func IsExistingNodeVersion(version string) bool {
 // falling back to DefaultNodeServiceName when unset or when the config cannot
 // be read. It is used for Linux systemd unit operations; callers that must
 // reference the fixed binary/package name (e.g. the /usr/local/bin symlink,
-// the macOS launchd label, or logrotate) should continue to use
-// DefaultNodeServiceName directly.
+// the macOS launchd label, or cleanup of legacy logrotate configs)
+// should continue to use DefaultNodeServiceName directly.
 func GetNodeServiceName() string {
 	cfg, err := LoadClientConfig()
 	if err != nil || cfg == nil || cfg.NodeServiceName == "" {
@@ -81,6 +81,12 @@ func CheckForSystemd() bool {
 // call GetNodeConfigsDir directly.
 func GetNodeConfigHomeDir() string {
 	return GetNodeConfigsDir()
+}
+
+// GetDefaultNodeConfigSymlink returns the path of the "default" symlink that
+// the node follows to locate its active configuration directory.
+func GetDefaultNodeConfigSymlink() string {
+	return filepath.Join(GetNodeConfigHomeDir(), "default")
 }
 
 func GetDefaultNodeConfigDir() (string, error) {

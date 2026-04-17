@@ -20,10 +20,14 @@ var (
 
 	ConfigDirectory string
 	NodeConfig      *config.Config
+	// NodeConfigDir is the absolute directory holding the active node
+	// config.yml (either the resolved --config value or the default
+	// config's symlink target). Subcommands that write to config.yml
+	// should use this, not the bare "default" symlink.
+	NodeConfigDir string
 
-	NodeUser        *user.User
-	ConfigDirs      string
-	NodeConfigToRun string
+	NodeUser   *user.User
+	ConfigDirs string
 )
 
 // NodeCmd represents the node command
@@ -49,6 +53,12 @@ var NodeCmd = &cobra.Command{
 		NodeUser = userLookup
 		ConfigDirs = utils.GetNodeConfigsDir()
 		if ConfigDirectory != "" {
+			resolved, rErr := utils.ResolveNodeConfigDir(ConfigDirectory)
+			if rErr != nil {
+				fmt.Printf("error resolving node config: %s\n", rErr)
+				os.Exit(1)
+			}
+			NodeConfigDir = resolved
 			NodeConfig, err = utils.LoadNodeConfig(ConfigDirectory)
 			if err != nil {
 				fmt.Printf("error loading node config: %s\n", err)
@@ -70,8 +80,19 @@ var NodeCmd = &cobra.Command{
 					os.Exit(1)
 				}
 			}
+			// Resolve the default symlink to an absolute path so writes
+			// target the actual config directory rather than the
+			// symlink path (which breaks if the symlink is later
+			// re-pointed mid-operation).
+			if dir, dErr := utils.GetDefaultNodeConfigDir(); dErr == nil {
+				NodeConfigDir = dir
+			} else {
+				NodeConfigDir = utils.GetDefaultNodeConfigSymlink()
+			}
 		}
 		proverCmd.NodeConfig = NodeConfig
+		configCmd.NodeConfig = NodeConfig
+		configCmd.ActiveNodeConfigDir = NodeConfigDir
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()

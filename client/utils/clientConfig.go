@@ -20,7 +20,6 @@ func CreateDefaultConfig() {
 		CustomRpc:       "",
 		NodeServiceName: DefaultNodeServiceName,
 		NodeInstallDir:  DefaultNodeInstallDir,
-		NodeLogDir:      DefaultNodeLogDir,
 		NodeSymlinkDir:  DefaultNodeSymlinkDir,
 	})
 
@@ -46,7 +45,6 @@ func LoadClientConfig() (*ClientConfig, error) {
 			CustomRpc:       "",
 			NodeServiceName: DefaultNodeServiceName,
 			NodeInstallDir:  DefaultNodeInstallDir,
-			NodeLogDir:      DefaultNodeLogDir,
 			NodeSymlinkDir:  DefaultNodeSymlinkDir,
 		}
 		if err := SaveClientConfig(config); err != nil {
@@ -74,9 +72,6 @@ func LoadClientConfig() (*ClientConfig, error) {
 	}
 	if config.NodeInstallDir == "" {
 		config.NodeInstallDir = DefaultNodeInstallDir
-	}
-	if config.NodeLogDir == "" {
-		config.NodeLogDir = DefaultNodeLogDir
 	}
 	if config.NodeSymlinkDir == "" {
 		config.NodeSymlinkDir = DefaultNodeSymlinkDir

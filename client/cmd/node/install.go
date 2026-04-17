@@ -13,10 +13,9 @@ import (
 // directories. Empty string means "unchanged" (leave the existing config
 // value, or its default, alone).
 var (
-	installDirFlag  string
-	logDirFlag      string
-	symlinkDirFlag  string
-	configsDirFlag  string
+	installDirFlag string
+	symlinkDirFlag string
+	configsDirFlag string
 )
 
 // installCmd represents the command to install the Quilibrium node
@@ -70,12 +69,19 @@ var NodeInstallCmd = &cobra.Command{
 		                Binaries go to <install-dir>/bin/node/<version>/ and
 		                the systemd EnvironmentFile lives at
 		                <install-dir>/quilibrium.env.
-		--log-dir       Log directory (defaults to /var/log/quilibrium).
 		--symlink-dir   Directory holding the quilibrium-node symlink
 		                (defaults to /usr/local/bin). Make sure this is on
 		                your $PATH if you change it.
 		--configs-dir   Directory holding named node configs (defaults to
 		                ~/.quilibrium/configs).
+
+	The node log directory is not a qclient setting; it lives in the
+	node config's logger.path. On install, qclient ensures the active
+	node config has a logger block pointing to
+	/var/log/quilibrium/<config-name>/ and creates that directory with
+	the correct ownership. Change the log location later with:
+
+		qclient node config set logger.path /custom/log/dir
 
 	Passing a flag updates the saved config. If the node is already
 	installed and the new value differs from the current one, the new
@@ -103,15 +109,16 @@ var NodeInstallCmd = &cobra.Command{
 		qclient node auto-update status
 
 	## Log Management
-	Logging uses system logging with logrotate installed by default.
+	Logs are controlled by the active node config's logger block and
+	written (and rotated) by the node itself via its lumberjack-based
+	logger. qclient does not install a separate logrotate rule.
 
-	Logs are installed to /var/log/quilibrium
+	The default log directory is /var/log/quilibrium/<config-name>/.
 
-	The logrotate config is installed to /etc/logrotate.d/quilibrium
+	You can view and clean logs with:
 
-	You can view the logs with:
-
-		qclient node logs [version]
+		qclient node log view
+		qclient node log clean
 
 When installing with this command, if no version is specified, the latest version will be installed.
 
@@ -126,7 +133,7 @@ Examples:
   	qclient node install 2.1.0
 
   	# Install into a custom directory tree
-  	qclient node install --install-dir /opt/quilibrium --log-dir /var/log/quil
+  	qclient node install --install-dir /opt/quilibrium
 `,
 	Args: cobra.RangeArgs(0, 1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -143,7 +150,7 @@ Examples:
 			os.Exit(1)
 		}
 
-		// Apply any --install-dir / --log-dir / --symlink-dir / --configs-dir
+		// Apply any --install-dir / --symlink-dir / --configs-dir
 		// overrides to the persisted client config before we start laying
 		// files down, so every subsequent path lookup reads the new value.
 		if err := applyInstallDirFlags(); err != nil {
@@ -226,8 +233,8 @@ func InstallByVersion(version string) error {
 	return nil
 }
 
-// applyInstallDirFlags persists any --install-dir/--log-dir/--symlink-dir
-// /--configs-dir overrides to the client config. It validates that each
+// applyInstallDirFlags persists any --install-dir/--symlink-dir/
+// --configs-dir overrides to the client config. It validates that each
 // supplied path is absolute and warns (but does not block) when an
 // existing installation would need to be rebuilt for the change to take
 // full effect.
@@ -249,7 +256,6 @@ func applyInstallDirFlags() error {
 		prevResolved string
 	}{
 		{"install-dir", installDirFlag, &cfg.NodeInstallDir, utils.GetNodeInstallDir()},
-		{"log-dir", logDirFlag, &cfg.NodeLogDir, utils.GetNodeLogDir()},
 		{"symlink-dir", symlinkDirFlag, &cfg.NodeSymlinkDir, utils.GetNodeSymlinkDir()},
 		{"configs-dir", configsDirFlag, &cfg.NodeConfigsDir, utils.GetNodeConfigsDir()},
 	}
@@ -298,11 +304,6 @@ func init() {
 		&installDirFlag, "install-dir", "",
 		"Root install directory for node binaries and the env file "+
 			"(defaults to /var/quilibrium). Persisted to qclient config.",
-	)
-	NodeInstallCmd.Flags().StringVar(
-		&logDirFlag, "log-dir", "",
-		"Directory for node logs (defaults to /var/log/quilibrium). "+
-			"Persisted to qclient config.",
 	)
 	NodeInstallCmd.Flags().StringVar(
 		&symlinkDirFlag, "symlink-dir", "",
