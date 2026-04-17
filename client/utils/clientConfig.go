@@ -19,6 +19,9 @@ func CreateDefaultConfig() {
 		PublicRpc:       false,
 		CustomRpc:       "",
 		NodeServiceName: DefaultNodeServiceName,
+		NodeInstallDir:  DefaultNodeInstallDir,
+		NodeLogDir:      DefaultNodeLogDir,
+		NodeSymlinkDir:  DefaultNodeSymlinkDir,
 	})
 
 	sudoUser, err := GetCurrentSudoUser()
@@ -42,6 +45,9 @@ func LoadClientConfig() (*ClientConfig, error) {
 			PublicRpc:       false,
 			CustomRpc:       "",
 			NodeServiceName: DefaultNodeServiceName,
+			NodeInstallDir:  DefaultNodeInstallDir,
+			NodeLogDir:      DefaultNodeLogDir,
+			NodeSymlinkDir:  DefaultNodeSymlinkDir,
 		}
 		if err := SaveClientConfig(config); err != nil {
 			return nil, err
@@ -60,9 +66,20 @@ func LoadClientConfig() (*ClientConfig, error) {
 		return nil, err
 	}
 
-	// Backfill for configs that pre-date the NodeServiceName field.
+	// Backfill fields that may be missing from older configs. Callers
+	// (e.g. the path accessors) also apply defaults lazily, but doing it
+	// here keeps LoadClientConfig's return value self-consistent.
 	if config.NodeServiceName == "" {
 		config.NodeServiceName = DefaultNodeServiceName
+	}
+	if config.NodeInstallDir == "" {
+		config.NodeInstallDir = DefaultNodeInstallDir
+	}
+	if config.NodeLogDir == "" {
+		config.NodeLogDir = DefaultNodeLogDir
+	}
+	if config.NodeSymlinkDir == "" {
+		config.NodeSymlinkDir = DefaultNodeSymlinkDir
 	}
 
 	return config, nil

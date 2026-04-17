@@ -143,7 +143,7 @@ Examples:
 // installNode installs the Quilibrium node
 func InstallNode(version string) {
 	// Create installation directory
-	if err := utils.ValidateAndCreateDir(utils.NodeDataPath, NodeUser); err != nil {
+	if err := utils.ValidateAndCreateDir(utils.GetNodeBinaryDir(), NodeUser); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating installation directory: %v\n", err)
 		return
 	}
@@ -166,7 +166,7 @@ func InstallNode(version string) {
 // installByVersion installs a specific version of the Quilibrium node
 func InstallByVersion(version string) error {
 
-	versionDir := filepath.Join(utils.NodeDataPath, version)
+	versionDir := filepath.Join(utils.GetNodeBinaryDir(), version)
 	if err := utils.ValidateAndCreateDir(versionDir, NodeUser); err != nil {
 		return fmt.Errorf("failed to create version directory: %w", err)
 	}

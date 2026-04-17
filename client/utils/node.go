@@ -18,12 +18,8 @@ import (
 var (
 	NetworkConfigOverride  string
 	DefaultNodeConfigName  = "node-quickstart"
-	NodeDataPath           = filepath.Join(BinaryPath, string(ReleaseTypeNode))
-	NodeEnvPath            = filepath.Join(RootQuilibriumPath, "quilibrium.env")
 	NodeServiceName        = "quilibrium-node"
 	DefaultNodeServiceName = "quilibrium-node"
-	DefaultNodeSymlinkPath = filepath.Join(DefaultSymlinkDir, NodeServiceName)
-	LogPath                = "/var/log/quilibrium"
 )
 
 func GetPeerIDFromConfig(cfg *config.Config) peer.ID {
@@ -57,7 +53,7 @@ func GetPrivKeyFromConfig(cfg *config.Config) (crypto.PrivKey, error) {
 }
 
 func IsExistingNodeVersion(version string) bool {
-	return FileExists(filepath.Join(NodeDataPath, version))
+	return FileExists(filepath.Join(GetNodeBinaryDir(), version))
 }
 
 // GetNodeServiceName returns the user-configured systemd/launchd service name,
@@ -80,20 +76,11 @@ func CheckForSystemd() bool {
 	return err == nil
 }
 
+// GetNodeConfigHomeDir is retained as a thin wrapper over
+// GetNodeConfigsDir so older callers continue to compile. New code should
+// call GetNodeConfigsDir directly.
 func GetNodeConfigHomeDir() string {
-	userLookup, err := GetCurrentSudoUser()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting current user: %v\n", err)
-		os.Exit(1)
-	}
-
-	path := filepath.Join(userLookup.HomeDir, ".quilibrium", "configs")
-
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		ValidateAndCreateDir(path, userLookup)
-	}
-
-	return path
+	return GetNodeConfigsDir()
 }
 
 func GetDefaultNodeConfigDir() (string, error) {

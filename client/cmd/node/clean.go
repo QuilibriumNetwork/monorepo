@@ -56,7 +56,7 @@ func cleanNodeLogs() {
 		return
 	}
 
-	logDir := utils.LogPath
+	logDir := utils.GetNodeLogDir()
 	entries, err := os.ReadDir(logDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -91,16 +91,17 @@ func cleanNodeBinaries() {
 		return
 	}
 
+	binDir := utils.GetNodeBinaryDir()
 	// Determine which version is currently active via the symlink
 	currentVersion := ""
-	target, err := os.Readlink(utils.DefaultNodeSymlinkPath)
+	target, err := os.Readlink(utils.GetNodeSymlinkPath())
 	if err == nil {
-		// target looks like /var/quilibrium/bin/node/<version>/node-<version>-<os>-<arch>
+		// target looks like <install>/bin/node/<version>/node-<version>-<os>-<arch>
 		dir := filepath.Dir(target)
 		currentVersion = filepath.Base(dir)
 	}
 
-	entries, err := os.ReadDir(utils.NodeDataPath)
+	entries, err := os.ReadDir(binDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			fmt.Println("No node binaries directory found.")
@@ -118,7 +119,7 @@ func cleanNodeBinaries() {
 		if entry.Name() == currentVersion {
 			continue
 		}
-		path := filepath.Join(utils.NodeDataPath, entry.Name())
+		path := filepath.Join(binDir, entry.Name())
 		if err := os.RemoveAll(path); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not remove %s: %v\n", entry.Name(), err)
 			continue
@@ -126,7 +127,7 @@ func cleanNodeBinaries() {
 		removed++
 	}
 
-	fmt.Printf("Removed %d old version(s) from %s\n", removed, utils.NodeDataPath)
+	fmt.Printf("Removed %d old version(s) from %s\n", removed, binDir)
 	if currentVersion != "" {
 		fmt.Printf("Kept current version: %s\n", currentVersion)
 	}

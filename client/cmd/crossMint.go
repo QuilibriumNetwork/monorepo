@@ -22,8 +22,9 @@ import (
 )
 
 var (
-	NodeConfig      *config.Config
-	ConfigDirectory string
+	NodeConfig              *config.Config
+	ConfigDirectory         string
+	resolvedConfigDirectory string
 )
 
 var CrossMintCmd = &cobra.Command{
@@ -44,8 +45,18 @@ var CrossMintCmd = &cobra.Command{
 		var nodeConfig *config.Config
 		var err error
 		if ConfigDirectory != "" && ConfigDirectory != "default" {
-			nodeConfig, err = utils.LoadNodeConfig(ConfigDirectory)
+			resolvedConfigDirectory, err = utils.ResolveNodeConfigDir(ConfigDirectory)
+			if err != nil {
+				fmt.Printf("error loading node config: %s\n", err)
+				os.Exit(1)
+			}
+			nodeConfig, err = utils.LoadNodeConfig(resolvedConfigDirectory)
 		} else {
+			resolvedConfigDirectory, err = utils.GetDefaultNodeConfigDir()
+			if err != nil {
+				fmt.Printf("error loading node config: %s\n", err)
+				os.Exit(1)
+			}
 			nodeConfig, err = utils.LoadDefaultNodeConfig()
 		}
 		if err != nil {
@@ -88,7 +99,7 @@ var CrossMintCmd = &cobra.Command{
 		// account if it was changed.
 		if !filepath.IsAbs(NodeConfig.Key.KeyStoreFile.Path) {
 			NodeConfig.Key.KeyStoreFile.Path = filepath.Join(
-				ConfigDirectory,
+				resolvedConfigDirectory,
 				filepath.Base(NodeConfig.Key.KeyStoreFile.Path),
 			)
 		}

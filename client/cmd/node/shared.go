@@ -29,11 +29,11 @@ func determineVersion(args []string) string {
 
 // setOwnership sets the ownership of directories to the node user
 func setOwnership() {
-
+	binDir := utils.GetNodeBinaryDir()
 	// Change ownership of installation directory
-	err := utils.ChownPath(utils.NodeDataPath, NodeUser, true)
+	err := utils.ChownPath(binDir, NodeUser, true)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: Failed to change ownership of %s: %v\n", utils.NodeDataPath, err)
+		fmt.Fprintf(os.Stderr, "Warning: Failed to change ownership of %s: %v\n", binDir, err)
 	}
 }
 
@@ -44,6 +44,7 @@ func setupLogRotation() error {
 		return fmt.Errorf("failed to get sudo privileges: %w", err)
 	}
 
+	logDir := utils.GetNodeLogDir()
 	// Create logrotate configuration
 	configContent := fmt.Sprintf(`%s/*.log {
     daily
@@ -56,7 +57,7 @@ func setupLogRotation() error {
     postrotate
         systemctl reload quilibrium-node >/dev/null 2>&1 || true
     endscript
-}`, utils.LogPath, NodeUser.Username, NodeUser.Username)
+}`, logDir, NodeUser.Username, NodeUser.Username)
 
 	// Write the configuration file
 	configPath := "/etc/logrotate.d/" + utils.NodeServiceName
@@ -65,12 +66,12 @@ func setupLogRotation() error {
 	}
 
 	// Create log directory with proper permissions
-	if err := utils.ValidateAndCreateDir(utils.LogPath, NodeUser); err != nil {
+	if err := utils.ValidateAndCreateDir(logDir, NodeUser); err != nil {
 		return fmt.Errorf("failed to create log directory: %w", err)
 	}
 
 	// Set ownership of log directory
-	err := utils.ChownPath(utils.LogPath, NodeUser, true)
+	err := utils.ChownPath(logDir, NodeUser, true)
 	if err != nil {
 		return fmt.Errorf("failed to set log directory ownership: %w", err)
 	}
@@ -86,23 +87,29 @@ func finishInstallation(version string) {
 	normalizedBinaryName := "node-" + version + "-" + OsType + "-" + Arch
 
 	// Finish installation
-	nodeBinaryPath := filepath.Join(utils.NodeDataPath, version, normalizedBinaryName)
+	nodeBinaryPath := filepath.Join(utils.GetNodeBinaryDir(), version, normalizedBinaryName)
 	fmt.Printf("Making binary executable: %s\n", nodeBinaryPath)
 	// Make the binary executable
 	if err := utils.ChmodPath(nodeBinaryPath, 0755, "executable"); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: Failed to make binary executable: %v\n", err)
 	}
 
+	symlinkPath := utils.GetNodeSymlinkPath()
 	// Check if we need sudo privileges for creating symlink in system directory
-	if strings.HasPrefix(utils.DefaultNodeSymlinkPath, "/usr/") || strings.HasPrefix(utils.DefaultNodeSymlinkPath, "/bin/") || strings.HasPrefix(utils.DefaultNodeSymlinkPath, "/sbin/") {
-		if err := utils.CheckAndRequestSudo(fmt.Sprintf("Creating symlink at %s requires root privileges", utils.DefaultNodeSymlinkPath)); err != nil {
+	if strings.HasPrefix(symlinkPath, "/usr/") || strings.HasPrefix(symlinkPath, "/bin/") || strings.HasPrefix(symlinkPath, "/sbin/") {
+		if err := utils.CheckAndRequestSudo(fmt.Sprintf("Creating symlink at %s requires root privileges", symlinkPath)); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to get sudo privileges: %v\n", err)
 			return
 		}
 	}
 
+	// Ensure the symlink directory exists for non-standard locations.
+	if err := utils.ValidateAndCreateDir(utils.GetNodeSymlinkDir(), NodeUser); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to create symlink directory %s: %v\n", utils.GetNodeSymlinkDir(), err)
+	}
+
 	// Create symlink using the utils package
-	if err := utils.CreateSymlink(nodeBinaryPath, utils.DefaultNodeSymlinkPath); err != nil {
+	if err := utils.CreateSymlink(nodeBinaryPath, symlinkPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating symlink: %v\n", err)
 	}
 
@@ -118,10 +125,10 @@ func finishInstallation(version string) {
 // printSuccessMessage prints a success message after installation
 func printSuccessMessage(version string) {
 	fmt.Fprintf(os.Stdout, "\nSuccessfully installed Quilibrium node %s\n", version)
-	fmt.Fprintf(os.Stdout, "Binary download directory: %s\n", filepath.Join(utils.NodeDataPath, version))
-	fmt.Fprintf(os.Stdout, "Binary symlinked to %s\n", utils.DefaultNodeSymlinkPath)
-	fmt.Fprintf(os.Stdout, "Log directory: %s\n", utils.LogPath)
-	fmt.Fprintf(os.Stdout, "Environment file: /etc/default/quilibrium-node\n")
+	fmt.Fprintf(os.Stdout, "Binary download directory: %s\n", filepath.Join(utils.GetNodeBinaryDir(), version))
+	fmt.Fprintf(os.Stdout, "Binary symlinked to %s\n", utils.GetNodeSymlinkPath())
+	fmt.Fprintf(os.Stdout, "Log directory: %s\n", utils.GetNodeLogDir())
+	fmt.Fprintf(os.Stdout, "Environment file: %s\n", utils.GetNodeEnvFilePath())
 	fmt.Fprintln(os.Stdout, "Service file: /etc/systemd/system/"+utils.GetNodeServiceName()+".service")
 
 	fmt.Fprintf(os.Stdout, "\nConfiguration:\n")
