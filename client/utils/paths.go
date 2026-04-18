@@ -58,6 +58,22 @@ func DefaultNodeSymlinkDir() string {
 	return "/usr/local/bin"
 }
 
+// DefaultQClientInstallDir returns the OS-appropriate default root for
+// the qclient binary tree: /opt/quilibrium on Linux, /usr/local/quilibrium
+// on macOS. Matches the node install root so both trees live together.
+func DefaultQClientInstallDir() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/usr/local/quilibrium"
+	default:
+		return "/opt/quilibrium"
+	}
+}
+
+// LegacyQClientBinaryDir is the pre-FHS-split qclient binary root. Kept
+// only for detecting legacy installs so we can warn the user.
+const LegacyQClientBinaryDir = "/var/quilibrium/bin/qclient"
+
 // loadConfigOrDefault returns the persisted client config, or a zero-value
 // config if loading fails. Path accessors are best-effort: callers should
 // always get a usable default even when the config file is missing or
@@ -127,6 +143,38 @@ func GetNodeSymlinkDir() string {
 // of `quilibrium-node` keeps working regardless of the service name.
 func GetNodeSymlinkPath() string {
 	return filepath.Join(GetNodeSymlinkDir(), DefaultNodeServiceName)
+}
+
+// GetQClientInstallDir returns the configured qclient install root.
+// Resolution order: cfg.QClientInstallDir → legacy cfg.DataDir's parent
+// (for back-compat with configs that pre-date QClientInstallDir and
+// still pin DataDir to /var/quilibrium/bin/qclient) → OS-appropriate
+// default.
+func GetQClientInstallDir() string {
+	cfg := loadConfigOrDefault()
+	if cfg.QClientInstallDir != "" {
+		return cfg.QClientInstallDir
+	}
+	// cfg.DataDir historically points at <install>/bin/qclient. If it
+	// is set, reverse-derive the install root so existing configs
+	// keep working without rewrites.
+	if cfg.DataDir != "" {
+		// Expect layout <install>/bin/qclient; strip the trailing
+		// "bin/qclient" when present.
+		dir := filepath.Clean(cfg.DataDir)
+		parent := filepath.Dir(dir)          // <install>/bin
+		grandparent := filepath.Dir(parent)  // <install>
+		if filepath.Base(dir) == string(ReleaseTypeQClient) && filepath.Base(parent) == "bin" {
+			return grandparent
+		}
+	}
+	return DefaultQClientInstallDir()
+}
+
+// GetQClientBinaryDir returns the directory that holds versioned
+// qclient binary subdirectories, e.g. <install>/bin/qclient.
+func GetQClientBinaryDir() string {
+	return filepath.Join(GetQClientInstallDir(), "bin", string(ReleaseTypeQClient))
 }
 
 // GetNodeConfigsDir returns the configured node configs directory, or the

@@ -12,12 +12,12 @@ func CreateDefaultConfig() {
 	configPath := GetConfigPath()
 
 	fmt.Printf("Creating default config: %s\n", configPath)
-	// Leave NodeInstallDir / NodeStateDir / NodeSymlinkDir empty here so
-	// the OS-aware helpers in paths.go supply the current defaults
-	// lazily. Persisting them would pin the user to whatever default
-	// was in effect at config-creation time.
+	// Leave NodeInstallDir / NodeStateDir / NodeSymlinkDir /
+	// QClientInstallDir / DataDir empty here so the OS-aware helpers
+	// in paths.go supply the current defaults lazily. Persisting them
+	// would pin the user to whatever default was in effect at
+	// config-creation time.
 	SaveClientConfig(&ClientConfig{
-		DataDir:         ClientDataPath,
 		SymlinkPath:     DefaultQClientSymlinkPath,
 		SignatureCheck:  true,
 		PublicRpc:       false,
@@ -37,12 +37,12 @@ func CreateDefaultConfig() {
 func LoadClientConfig() (*ClientConfig, error) {
 	configPath := GetConfigPath()
 
-	// Create default config if it doesn't exist. Leave the node path
-	// fields empty so OS-aware defaults from paths.go apply lazily.
+	// Create default config if it doesn't exist. Leave node and
+	// qclient path fields empty so OS-aware defaults from paths.go
+	// apply lazily.
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		config := &ClientConfig{
-			DataDir:         ClientDataPath,
-			SymlinkPath:     filepath.Join(ClientDataPath, "current"),
+			SymlinkPath:     DefaultQClientSymlinkPath,
 			SignatureCheck:  true,
 			PublicRpc:       false,
 			CustomRpc:       "",

@@ -109,9 +109,10 @@ func GetDefaultNodeConfigDir() (string, error) {
 			)
 		}
 
-		fmt.Printf("Default node config directory does not exist, creating it\n")
+		fmt.Printf("Default node config directory does not exist, creating it...")
 		// if neither exists, create it
 		CreateDefaultNodeConfig(DefaultNodeConfigName)
+		fmt.Printf(" done\n")
 		return configPath, nil
 	}
 	// Check if the config path is a symlink

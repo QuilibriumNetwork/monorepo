@@ -1,10 +1,12 @@
 package node
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
@@ -14,10 +16,11 @@ import (
 // directories. Empty string means "unchanged" (leave the existing config
 // value, or its default, alone).
 var (
-	installDirFlag string
-	stateDirFlag   string
-	symlinkDirFlag string
-	configsDirFlag string
+	installDirFlag  string
+	stateDirFlag    string
+	symlinkDirFlag  string
+	configsDirFlag  string
+	interactiveFlag bool
 )
 
 // ExitUnlessSudoForInstall exits immediately if the process is not running
@@ -167,6 +170,10 @@ Examples:
 
   	# Install into a custom directory tree
   	qclient node install --install-dir /opt/quilibrium
+
+  	# Interactively prompt for every install setting
+  	qclient node install --interactive
+  	qclient node install -i
 `,
 	Args: cobra.RangeArgs(0, 1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -175,6 +182,20 @@ Examples:
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			return
+		}
+
+		// If --interactive was passed, prompt the user for every
+		// install-time setting before we persist anything. The prompts
+		// write back into the same flag variables so the rest of this
+		// command sees them exactly as if they'd been passed on the CLI.
+		var interactiveVersion string
+		if interactiveFlag {
+			v, err := runInteractiveInstallPrompts(args)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			interactiveVersion = v
 		}
 
 		// Apply any --install-dir / --state-dir / --symlink-dir /
@@ -188,8 +209,14 @@ Examples:
 
 		warnLegacyInstallLayout()
 
-		// Determine version to install
-		version := determineVersion(args)
+		// Determine version to install. Interactive mode wins over
+		// positional args when the user selected something there.
+		var version string
+		if interactiveVersion != "" {
+			version = interactiveVersion
+		} else {
+			version = determineVersion(args)
+		}
 
 		// Download and install the node
 		if version == "latest" {
@@ -367,14 +394,26 @@ func warnLegacyInstallLayout() {
 		defaultInstall, defaultState,
 	)
 	if pinnedLegacyInstall || pinnedLegacyState {
+		var pins []string
+		var flagsToDrop []string
+		if pinnedLegacyInstall {
+			pins = append(pins, fmt.Sprintf("install-dir=%s", resolvedInstall))
+			flagsToDrop = append(flagsToDrop, "--install-dir")
+		}
+		if pinnedLegacyState {
+			pins = append(pins, fmt.Sprintf("state-dir=%s", resolvedState))
+			flagsToDrop = append(flagsToDrop, "--state-dir")
+		}
 		fmt.Fprintf(os.Stderr,
-			"  Your qclient config currently pins install-dir=%s, state-dir=%s;\n"+
+			"  Your qclient config currently pins %s to the legacy layout;\n"+
 				"  this install will keep writing there.\n",
-			resolvedInstall, resolvedState,
+			strings.Join(pins, ", "),
 		)
-		fmt.Fprintln(os.Stderr,
-			"  To adopt the new defaults, run 'sudo qclient node uninstall' "+
-				"then reinstall without --install-dir/--state-dir.")
+		fmt.Fprintf(os.Stderr,
+			"  To adopt the new default(s), run 'sudo qclient node uninstall' "+
+				"then reinstall without %s.\n",
+			strings.Join(flagsToDrop, "/"),
+		)
 	} else if legacyTreeExists {
 		fmt.Fprintf(os.Stderr,
 			"  A legacy install tree was detected under %s but this install "+
@@ -418,4 +457,125 @@ func init() {
 		"Directory holding named node configs (defaults to "+
 			"~/.quilibrium/configs). Persisted to qclient config.",
 	)
+	NodeInstallCmd.Flags().BoolVarP(
+		&interactiveFlag, "interactive", "i", false,
+		"Prompt for each install setting (version and directories) "+
+			"instead of requiring flags. Pressing Enter at a prompt "+
+			"keeps the current/default value.",
+	)
+}
+
+// runInteractiveInstallPrompts walks the user through each install-time
+// setting and writes the answers back into the same package-level flag
+// variables that --install-dir / --state-dir / --symlink-dir /
+// --configs-dir populate. It returns the version string the user
+// selected (or "" to fall back to the positional arg / "latest").
+//
+// Each prompt shows the currently effective value in brackets; an empty
+// response keeps that value.
+func runInteractiveInstallPrompts(args []string) (string, error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Fprintln(os.Stdout, "Interactive install. Press Enter to accept the shown default.")
+	fmt.Fprintln(os.Stdout)
+
+	versionDefault := "latest"
+	if len(args) == 1 && strings.TrimSpace(args[0]) != "" {
+		versionDefault = strings.TrimSpace(args[0])
+	}
+	version, err := promptString(reader, "Node version to install", versionDefault)
+	if err != nil {
+		return "", err
+	}
+
+	dirPrompts := []struct {
+		label  string
+		target *string
+		cur    string
+	}{
+		{"Install directory (binaries)", &installDirFlag, utils.GetNodeInstallDir()},
+		{"State directory (env file / mutable state)", &stateDirFlag, utils.GetNodeStateDir()},
+		{"Symlink directory (must be on $PATH)", &symlinkDirFlag, utils.GetNodeSymlinkDir()},
+		{"Configs directory (named node configs)", &configsDirFlag, utils.GetNodeConfigsDir()},
+	}
+
+	for _, p := range dirPrompts {
+		val, err := promptAbsPath(reader, p.label, p.cur)
+		if err != nil {
+			return "", err
+		}
+		if val != p.cur {
+			*p.target = val
+		}
+	}
+
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintf(os.Stdout, "Summary:\n")
+	fmt.Fprintf(os.Stdout, "  version       : %s\n", version)
+	fmt.Fprintf(os.Stdout, "  install-dir   : %s\n", effective(installDirFlag, utils.GetNodeInstallDir()))
+	fmt.Fprintf(os.Stdout, "  state-dir     : %s\n", effective(stateDirFlag, utils.GetNodeStateDir()))
+	fmt.Fprintf(os.Stdout, "  symlink-dir   : %s\n", effective(symlinkDirFlag, utils.GetNodeSymlinkDir()))
+	fmt.Fprintf(os.Stdout, "  configs-dir   : %s\n", effective(configsDirFlag, utils.GetNodeConfigsDir()))
+	fmt.Fprintln(os.Stdout)
+
+	ok, err := promptYesNo(reader, "Proceed with these settings?", true)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("install cancelled by user")
+	}
+
+	return version, nil
+}
+
+func effective(flagVal, current string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return current
+}
+
+func promptString(r *bufio.Reader, label, def string) (string, error) {
+	fmt.Fprintf(os.Stdout, "%s [%s]: ", label, def)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("reading input: %w", err)
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return def, nil
+	}
+	return line, nil
+}
+
+func promptAbsPath(r *bufio.Reader, label, def string) (string, error) {
+	for {
+		val, err := promptString(r, label, def)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(val) {
+			fmt.Fprintf(os.Stderr, "  path must be absolute, got %q\n", val)
+			continue
+		}
+		return val, nil
+	}
+}
+
+func promptYesNo(r *bufio.Reader, label string, def bool) (bool, error) {
+	hint := "[y/N]"
+	if def {
+		hint = "[Y/n]"
+	}
+	fmt.Fprintf(os.Stdout, "%s %s: ", label, hint)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return false, fmt.Errorf("reading input: %w", err)
+	}
+	line = strings.TrimSpace(strings.ToLower(line))
+	if line == "" {
+		return def, nil
+	}
+	return line == "y" || line == "yes", nil
 }

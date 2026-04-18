@@ -13,14 +13,14 @@ import (
 var BaseReleaseURL = "https://releases.quilibrium.com"
 
 // releaseBaseDir returns the base directory that holds versioned
-// subdirectories for the given release type. For node releases this
-// respects the user's configured install directory; the qclient itself
-// keeps its fixed layout under /var/quilibrium/bin/qclient.
+// subdirectories for the given release type. Both node and qclient
+// respect the user's configured install directory; defaults are
+// OS-aware (see GetNodeBinaryDir / GetQClientBinaryDir).
 func releaseBaseDir(releaseType ReleaseType) string {
 	if releaseType == ReleaseTypeNode {
 		return GetNodeBinaryDir()
 	}
-	return filepath.Join(BinaryPath, string(releaseType))
+	return GetQClientBinaryDir()
 }
 
 // DownloadRelease downloads a specific release file

@@ -19,7 +19,8 @@ var ClientConfigPrintCmd = &cobra.Command{
 		}
 
 		// Print the config in a readable format
-		fmt.Printf("Data Directory: %s\n", config.DataDir)
+		fmt.Printf("QClient Install Dir: %s\n", utils.GetQClientInstallDir())
+		fmt.Printf("  QClient Binary Dir: %s\n", utils.GetQClientBinaryDir())
 		fmt.Printf("Symlink Path: %s\n", config.SymlinkPath)
 		fmt.Printf("Signature Check: %v\n", config.SignatureCheck)
 		fmt.Printf("Quiet: %v\n", config.Quiet)

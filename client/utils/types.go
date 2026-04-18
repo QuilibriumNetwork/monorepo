@@ -9,6 +9,12 @@ type ClientConfig struct {
 	CustomRpc       string `yaml:"customRpc"`
 	NodeSymlinkName string `yaml:"nodeSymlinkName"`
 	NodeServiceName string `yaml:"nodeServiceName"`
+	// QClientInstallDir is the root directory for the qclient binary
+	// tree. Defaults to /opt/quilibrium on Linux and
+	// /usr/local/quilibrium on macOS. Binaries live under
+	// <QClientInstallDir>/bin/qclient/<version>/. When empty, the
+	// legacy cfg.DataDir is consulted for back-compat.
+	QClientInstallDir string `yaml:"qclientInstallDir"`
 	// NodeInstallDir is the root directory for the node binary tree.
 	// Defaults to /opt/quilibrium on Linux and /usr/local/quilibrium on
 	// macOS. The actual binaries live under

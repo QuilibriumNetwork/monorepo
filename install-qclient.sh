@@ -7,11 +7,26 @@
 
 # Check if the script is run with sudo privileges
 if [ "$EUID" -ne 0 ]; then
-    echo "This script must be run as root (use sudo) to install the Quilibrium client to /var/quilibrium/ directory"
+    echo "This script must be run as root (use sudo) to install the Quilibrium client under the system install root and create /usr/local/bin/qclient"
     exit 1
 fi
 
 BASE_URL="https://releases.quilibrium.com"
+
+# Legacy pre-FHS-split install root. Used only to detect existing
+# installs so we can warn the user; new installs do not land here.
+LEGACY_QCLIENT_BIN_DIR="/var/quilibrium/bin/qclient"
+
+# default_install_root prints the OS-appropriate default install root
+# for qclient. Matches DefaultQClientInstallDir() in client/utils/paths.go:
+#   Linux: /opt/quilibrium  (FHS)
+#   macOS: /usr/local/quilibrium (Homebrew-style)
+default_install_root() {
+    case "$(uname -s)" in
+        Darwin) echo "/usr/local/quilibrium" ;;
+        *)      echo "/opt/quilibrium" ;;
+    esac
+}
 
 # Function to detect OS and architecture
 detect_os_arch() {
@@ -93,12 +108,34 @@ download_release_file() {
 
 # Parse command line arguments
 DRY_RUN=false
+INSTALL_ROOT_OVERRIDE=""
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --dry-run)
             DRY_RUN=true
             echo "[DRY RUN] enabled"
             shift
+            ;;
+        --install-dir)
+            INSTALL_ROOT_OVERRIDE="$2"
+            shift 2
+            ;;
+        --install-dir=*)
+            INSTALL_ROOT_OVERRIDE="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            cat <<EOF
+Usage: install-qclient.sh [options]
+
+Options:
+  --install-dir PATH  Install root (defaults to /opt/quilibrium on Linux,
+                      /usr/local/quilibrium on macOS). Binaries go to
+                      <install-dir>/bin/qclient/<version>/.
+  --dry-run           Print actions without downloading or modifying files.
+  -h, --help          Show this help.
+EOF
+            exit 0
             ;;
         *)
             echo "Unknown option: $1"
@@ -115,12 +152,37 @@ echo "Detected OS and architecture: $OS_ARCH"
 LATEST_VERSION=$(get_latest_release "$OS_ARCH")
 echo "Latest release version: $LATEST_VERSION"
 
-# Download binary, digest, and signatures
+# Resolve the install root. Precedence:
+#   1. --install-dir flag
+#   2. OS-appropriate default (Linux: /opt/quilibrium, macOS: /usr/local/quilibrium)
+if [ -n "$INSTALL_ROOT_OVERRIDE" ]; then
+    INSTALL_ROOT="$INSTALL_ROOT_OVERRIDE"
+else
+    INSTALL_ROOT="$(default_install_root)"
+fi
 
-INSTALL_DIR="/var/quilibrium/bin/qclient/$LATEST_VERSION"
+QCLIENT_BIN_DIR="$INSTALL_ROOT/bin/qclient"
+INSTALL_DIR="$QCLIENT_BIN_DIR/$LATEST_VERSION"
+
+echo "Install root: $INSTALL_ROOT"
+echo "QClient binary dir: $QCLIENT_BIN_DIR"
+
+# Warn if a pre-FHS-split install is still on disk. Files are NOT moved.
+if [ "$QCLIENT_BIN_DIR" != "$LEGACY_QCLIENT_BIN_DIR" ] && [ -d "$LEGACY_QCLIENT_BIN_DIR" ]; then
+    echo
+    echo "Notice: a legacy qclient install was detected under $LEGACY_QCLIENT_BIN_DIR."
+    echo "  This install will use the new default ($QCLIENT_BIN_DIR)."
+    echo "  Files under $LEGACY_QCLIENT_BIN_DIR are NOT moved automatically;"
+    echo "  remove them manually once you've verified the new install."
+    echo
+fi
 
 # Ensure the install directory exists
-sudo mkdir -p "$INSTALL_DIR"
+if [ "$DRY_RUN" = true ]; then
+    echo "[DRY RUN] mkdir -p $INSTALL_DIR"
+else
+    sudo mkdir -p "$INSTALL_DIR"
+fi
 
 # Get the list of release files for the detected OS and architecture
 echo "Fetching release files for $OS_ARCH..."

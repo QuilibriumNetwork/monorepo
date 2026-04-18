@@ -81,9 +81,9 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 
 			checksum := sha3.Sum256(b)
 
-			// First check var data path for signatures
-			varDataPath := filepath.Join(utils.ClientDataPath, config.GetVersionString())
-			digestPath := filepath.Join(varDataPath, StandardizedQClientFileName+".dgst")
+			// First check the qclient binary directory for signatures.
+			versionDataPath := filepath.Join(utils.GetQClientBinaryDir(), config.GetVersionString())
+			digestPath := filepath.Join(versionDataPath, StandardizedQClientFileName+".dgst")
 
 			if !clientConfig.Quiet {
 				fmt.Printf("Checking signature for %s\n", digestPath)
@@ -146,7 +146,7 @@ It provides commands for installing, updating, and managing Quilibrium nodes.`,
 					// standardized release filename (qclient-<ver>-<os>-<arch>)
 					// rather than the running executable's basename, since
 					// signatures on disk are named after the release artifact.
-					signatureFile := filepath.Join(varDataPath, fmt.Sprintf("%s.dgst.sig.%d", StandardizedQClientFileName, i))
+					signatureFile := filepath.Join(versionDataPath, fmt.Sprintf("%s.dgst.sig.%d", StandardizedQClientFileName, i))
 					sig, err := os.ReadFile(signatureFile)
 					if err != nil {
 						// Fall back to checking next to executable

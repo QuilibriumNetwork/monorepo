@@ -35,7 +35,7 @@ Example: qclient link`,
 		}
 
 		// Check if the current executable is in the expected location
-		expectedPrefix := utils.ClientDataPath
+		expectedPrefix := utils.GetQClientBinaryDir()
 
 		// Check if the current executable is in the expected location
 		if !strings.HasPrefix(execPath, expectedPrefix) {
@@ -77,7 +77,9 @@ func moveExecutableToStandardLocation(execPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to get version info: %w", err)
 	}
-	destDir := filepath.Join(utils.ClientDataPath, "bin", version.Version)
+	// NB: historical layout — keep the extra "bin" segment to match
+	// what older qclient link behavior produced.
+	destDir := filepath.Join(utils.GetQClientBinaryDir(), "bin", version.Version)
 
 	// Create the standard location directory if it doesn't exist
 	currentUser, err := utils.GetCurrentSudoUser()
