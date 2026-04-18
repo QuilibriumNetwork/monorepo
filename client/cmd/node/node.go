@@ -121,6 +121,8 @@ func init() {
 	NodeCmd.AddCommand(NodeUninstallCmd)
 	NodeCmd.AddCommand(NodeLinkCmd)
 	NodeCmd.AddCommand(logCmd.LogCmd)
+	NodeCmd.AddCommand(NodeGrpcCmd)
+	NodeCmd.AddCommand(NodeRestCmd)
 
 	for _, c := range ServiceAliasCommands() {
 		NodeCmd.AddCommand(c)
