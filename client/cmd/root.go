@@ -262,4 +262,5 @@ func init() {
 	rootCmd.AddCommand(UninstallCmd)
 	rootCmd.AddCommand(VersionCmd)
 	rootCmd.AddCommand(QuietCmd)
+	rootCmd.AddCommand(DevCmd)
 }
