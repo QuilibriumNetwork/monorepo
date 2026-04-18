@@ -77,9 +77,9 @@ var NodeInstallCmd = &cobra.Command{
 
 	The node log directory is not a qclient setting; it lives in the
 	node config's logger.path. On install, qclient ensures the active
-	node config has a logger block pointing to
-	/var/log/quilibrium/<config-name>/ and creates that directory with
-	the correct ownership. Change the log location later with:
+	node config has a logger block pointing to a .logs directory next to
+	that config's config.yml and creates that directory with the correct
+	ownership. Change the log location later with:
 
 		qclient node config set logger.path /custom/log/dir
 
@@ -113,7 +113,7 @@ var NodeInstallCmd = &cobra.Command{
 	written (and rotated) by the node itself via its lumberjack-based
 	logger. qclient does not install a separate logrotate rule.
 
-	The default log directory is /var/log/quilibrium/<config-name>/.
+	The default log directory is <config-dir>/.logs/.
 
 	You can view and clean logs with:
 

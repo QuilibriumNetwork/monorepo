@@ -11,12 +11,10 @@ import (
 // original hard-coded locations so upgrading users see no behavior change.
 const (
 	DefaultNodeInstallDir = "/var/quilibrium"
-	// DefaultNodeLogRoot is the parent directory under which each node
-	// config gets its own log subdirectory (DefaultNodeLogRoot/<config>/).
-	// Individual log file locations are controlled by the node config's
-	// logger.path field; this constant is only used when generating a
-	// sensible default for that field at install/create time.
-	DefaultNodeLogRoot    = "/var/log/quilibrium"
+	// DefaultNodeLogRelDir is the directory name for file logs under each
+	// node config directory (the folder containing config.yml) when
+	// logger.path is populated by qclient defaults.
+	DefaultNodeLogRelDir = ".logs"
 	DefaultNodeSymlinkDir = "/usr/local/bin"
 	// DefaultNodeConfigsSubdir is the subdirectory of the user's home
 	// directory where node configs live when no override is set.
@@ -58,11 +56,11 @@ func GetNodeEnvFilePath() string {
 }
 
 // DefaultNodeLogDirForConfig returns the default logger directory for a
-// node config of the given name, e.g. /var/log/quilibrium/<name>. This is
-// the value qclient writes into the node config's logger.path when
-// creating/installing a config.
-func DefaultNodeLogDirForConfig(configName string) string {
-	return filepath.Join(DefaultNodeLogRoot, configName)
+// node config located at configDir (the directory containing config.yml),
+// i.e. <configDir>/.logs. This is the value qclient writes into the node
+// config's logger.path when creating/installing a config.
+func DefaultNodeLogDirForConfig(configDir string) string {
+	return filepath.Join(configDir, DefaultNodeLogRelDir)
 }
 
 // GetNodeSymlinkDir returns the directory where the node binary symlink is

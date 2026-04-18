@@ -284,7 +284,7 @@ func checkServiceStatus() {
 		}
 	} else {
 		// Linux systemd command
-		cmd := exec.Command("sudo", "systemctl", "status", utils.GetNodeServiceName())
+		cmd := exec.Command("sudo", "systemctl", "--no-pager", "status", utils.GetNodeServiceName())
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -560,13 +560,17 @@ func installMacOSService() {
 	// logger block, fall back to the per-config default directory so
 	// launchd still has a stable place to send stdout/stderr; the node
 	// itself will log to stdout in that case, which launchd will capture.
-	logPath := utils.DefaultNodeLogDirForConfig(utils.DefaultNodeConfigName)
+	logPath := utils.DefaultNodeLogDirForConfig(filepath.Join(
+		utils.GetNodeConfigsDir(), utils.DefaultNodeConfigName,
+	))
 	if resolved, err := utils.ResolveActiveNodeLog(); err == nil {
 		if resolved.FileBased {
 			logPath = resolved.LogDir
-		} else if resolved.ConfigName != "" {
-			logPath = utils.DefaultNodeLogDirForConfig(resolved.ConfigName)
+		} else if resolved.ConfigDir != "" {
+			logPath = utils.DefaultNodeLogDirForConfig(resolved.ConfigDir)
 		}
+	} else if dir, err := utils.GetDefaultNodeConfigDir(); err == nil {
+		logPath = utils.DefaultNodeLogDirForConfig(dir)
 	}
 	if err := os.MkdirAll(logPath, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not create log dir %s: %v\n", logPath, err)

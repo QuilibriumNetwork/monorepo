@@ -14,8 +14,8 @@ import (
 // logger.maxSize 50` etc.
 const (
 	DefaultLoggerMaxSize    = 100 // megabytes per file before rotation
-	DefaultLoggerMaxBackups = 7   // rotated files to keep
-	DefaultLoggerMaxAge     = 14  // days to keep rotated files
+	DefaultLoggerMaxBackups = 5   // rotated files to keep
+	DefaultLoggerMaxAge     = 30  // days to keep rotated files
 	DefaultLoggerCompress   = true
 )
 
@@ -131,16 +131,15 @@ func resolveNodeLogForDir(configDir string) (ResolvedNodeLog, error) {
 }
 
 // EnsureNodeConfigLogger makes sure the config.yml at configDir has a
-// logger block pointing at a per-config directory under
-// DefaultNodeLogRoot. If a logger block already exists, the function
-// leaves it untouched and returns the existing path. The returned
-// boolean reports whether the config was modified on disk.
+// logger block pointing at DefaultNodeLogDirForConfig(configDir). If a
+// logger block already exists, the function leaves it untouched and
+// returns the existing path. The returned boolean reports whether the
+// config was modified on disk.
 func EnsureNodeConfigLogger(configDir string) (string, bool, error) {
 	abs, err := filepath.EvalSymlinks(configDir)
 	if err != nil {
 		abs = configDir
 	}
-	name := filepath.Base(abs)
 
 	cfg, err := config.NewConfig(filepath.Join(abs, "config.yml"))
 	if err != nil {
@@ -152,7 +151,7 @@ func EnsureNodeConfigLogger(configDir string) (string, bool, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = &config.LogConfig{}
 	}
-	cfg.Logger.Path = DefaultNodeLogDirForConfig(name)
+	cfg.Logger.Path = DefaultNodeLogDirForConfig(abs)
 	if cfg.Logger.MaxSize == 0 {
 		cfg.Logger.MaxSize = DefaultLoggerMaxSize
 	}

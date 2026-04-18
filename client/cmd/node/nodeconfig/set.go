@@ -33,7 +33,7 @@ Supported keys:
 Examples:
   qclient node config set engine.statsMultiaddr /dns/stats.quilibrium.com/tcp/443
   qclient node config set --config mynode engine.statsMultiaddr /dns/stats.quilibrium.com/tcp/443
-  qclient node config set logger.path /var/log/quilibrium/mynode
+  qclient node config set logger.path /path/to/my/logs
   qclient node config set logger.compress true
   qclient node config set logger.logFilters p2p=debug,engine=warn
 `,
