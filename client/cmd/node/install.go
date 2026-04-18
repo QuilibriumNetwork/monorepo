@@ -16,11 +16,12 @@ import (
 // directories. Empty string means "unchanged" (leave the existing config
 // value, or its default, alone).
 var (
-	installDirFlag  string
-	stateDirFlag    string
-	symlinkDirFlag  string
-	configsDirFlag  string
-	interactiveFlag bool
+	installDirFlag   string
+	stateDirFlag     string
+	symlinkDirFlag   string
+	configsDirFlag   string
+	serviceNameFlag  string
+	interactiveFlag  bool
 )
 
 // ExitUnlessSudoForInstall exits immediately if the process is not running
@@ -110,6 +111,9 @@ var NodeInstallCmd = &cobra.Command{
 		                your $PATH if you change it.
 		--configs-dir   Directory holding named node configs (defaults to
 		                ~/.quilibrium/configs).
+		--service-name  Name of the systemd service unit for the node
+		                (defaults to "quilibrium-node"). Can also be
+		                changed later via 'qclient config service-name'.
 
 	The node log directory is not a qclient setting; it lives in the
 	node config's logger.path. On install, qclient ensures the active
@@ -347,6 +351,28 @@ func applyInstallDirFlags() error {
 		changed = true
 	}
 
+	if serviceNameFlag != "" {
+		if err := utils.ValidateNodeServiceName(serviceNameFlag); err != nil {
+			return fmt.Errorf("--service-name: %w", err)
+		}
+		if cfg.NodeServiceName != serviceNameFlag {
+			if nodeInstalled {
+				fmt.Fprintf(os.Stderr,
+					"Warning: --service-name changes %s -> %s, but an "+
+						"existing node installation was detected. The new "+
+						"value has been saved to the qclient config and "+
+						"will take effect on the next install/update; the "+
+						"previously installed service unit has not been "+
+						"renamed. Use 'qclient config service-name' to "+
+						"migrate an installed unit in place.\n",
+					cfg.NodeServiceName, serviceNameFlag,
+				)
+			}
+			cfg.NodeServiceName = serviceNameFlag
+			changed = true
+		}
+	}
+
 	if !changed {
 		return nil
 	}
@@ -457,6 +483,11 @@ func init() {
 		"Directory holding named node configs (defaults to "+
 			"~/.quilibrium/configs). Persisted to qclient config.",
 	)
+	NodeInstallCmd.Flags().StringVar(
+		&serviceNameFlag, "service-name", "",
+		"Name of the systemd service unit for the node (defaults to "+
+			"\"quilibrium-node\"). Persisted to qclient config.",
+	)
 	NodeInstallCmd.Flags().BoolVarP(
 		&interactiveFlag, "interactive", "i", false,
 		"Prompt for each install setting (version and directories) "+
@@ -509,6 +540,17 @@ func runInteractiveInstallPrompts(args []string) (string, error) {
 		}
 	}
 
+	curServiceName := utils.GetNodeServiceName()
+	svcName, err := promptServiceName(
+		reader, "Service name (systemd unit name)", curServiceName,
+	)
+	if err != nil {
+		return "", err
+	}
+	if svcName != curServiceName {
+		serviceNameFlag = svcName
+	}
+
 	fmt.Fprintln(os.Stdout)
 	fmt.Fprintf(os.Stdout, "Summary:\n")
 	fmt.Fprintf(os.Stdout, "  version       : %s\n", version)
@@ -516,6 +558,7 @@ func runInteractiveInstallPrompts(args []string) (string, error) {
 	fmt.Fprintf(os.Stdout, "  state-dir     : %s\n", effective(stateDirFlag, utils.GetNodeStateDir()))
 	fmt.Fprintf(os.Stdout, "  symlink-dir   : %s\n", effective(symlinkDirFlag, utils.GetNodeSymlinkDir()))
 	fmt.Fprintf(os.Stdout, "  configs-dir   : %s\n", effective(configsDirFlag, utils.GetNodeConfigsDir()))
+	fmt.Fprintf(os.Stdout, "  service-name  : %s\n", effective(serviceNameFlag, utils.GetNodeServiceName()))
 	fmt.Fprintln(os.Stdout)
 
 	ok, err := promptYesNo(reader, "Proceed with these settings?", true)
@@ -557,6 +600,20 @@ func promptAbsPath(r *bufio.Reader, label, def string) (string, error) {
 		}
 		if !filepath.IsAbs(val) {
 			fmt.Fprintf(os.Stderr, "  path must be absolute, got %q\n", val)
+			continue
+		}
+		return val, nil
+	}
+}
+
+func promptServiceName(r *bufio.Reader, label, def string) (string, error) {
+	for {
+		val, err := promptString(r, label, def)
+		if err != nil {
+			return "", err
+		}
+		if err := utils.ValidateNodeServiceName(val); err != nil {
+			fmt.Fprintf(os.Stderr, "  %v\n", err)
 			continue
 		}
 		return val, nil

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 
 	"github.com/pkg/errors"
 
@@ -62,6 +63,22 @@ func IsExistingNodeVersion(version string) bool {
 // reference the fixed binary/package name (e.g. the /usr/local/bin symlink,
 // the macOS launchd label, or cleanup of legacy logrotate configs)
 // should continue to use DefaultNodeServiceName directly.
+// nodeServiceNameRegex restricts service names to characters that are safe
+// for systemd unit filenames and shell invocation.
+var nodeServiceNameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// ValidateNodeServiceName returns an error when name contains characters
+// that are unsafe for systemd unit filenames / shell invocation.
+func ValidateNodeServiceName(name string) error {
+	if !nodeServiceNameRegex.MatchString(name) {
+		return fmt.Errorf(
+			"invalid service name %q. Allowed characters: letters, digits, '.', '_', '-'",
+			name,
+		)
+	}
+	return nil
+}
+
 func GetNodeServiceName() string {
 	cfg, err := LoadClientConfig()
 	if err != nil || cfg == nil || cfg.NodeServiceName == "" {

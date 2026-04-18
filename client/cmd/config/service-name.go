@@ -4,18 +4,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/cmd/node"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
-
-// serviceNameRegex restricts service names to characters that are safe for
-// systemd unit filenames and shell invocation. It intentionally disallows
-// whitespace, path separators, and shell metacharacters.
-var serviceNameRegex = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 var ClientConfigServiceNameCmd = &cobra.Command{
 	Use:   "service-name [name]",
@@ -56,11 +50,8 @@ Examples:
 		}
 
 		newName := strings.TrimSpace(args[0])
-		if !serviceNameRegex.MatchString(newName) {
-			fmt.Fprintf(os.Stderr,
-				"Error: invalid service name %q. Allowed characters: letters, digits, '.', '_', '-'\n",
-				newName,
-			)
+		if err := utils.ValidateNodeServiceName(newName); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
