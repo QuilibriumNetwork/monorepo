@@ -32,7 +32,41 @@ type ClientConfig struct {
 	// Defaults to $HOME/.quilibrium/configs (resolved from the invoking
 	// sudo user's home directory).
 	NodeConfigsDir string `yaml:"nodeConfigsDir"`
+
+	// Backup holds S3-compatible node backup settings. Populate via
+	// `qclient node backup config`.
+	Backup NodeBackupConfig `yaml:"backup"`
 }
+
+// NodeBackupConfig holds S3-compatible object storage settings used by
+// `qclient node backup`. Credentials are stored alongside the rest of
+// the qclient configuration.
+type NodeBackupConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	AccessKeyID     string `yaml:"accessKeyId"`
+	SecretAccessKey string `yaml:"secretAccessKey"`
+	Endpoint        string `yaml:"endpoint"`
+	Bucket          string `yaml:"bucket"`
+	// BucketPrefix is an optional key prefix inside the bucket, used
+	// when the bucket is shared with other data and backups should be
+	// namespaced (e.g. "quilibrium/backups"). All object keys and the
+	// per-config manifest are written under this prefix. Leading and
+	// trailing slashes are tolerated on input and normalized away.
+	// Empty means "store at the bucket root" (current behavior).
+	BucketPrefix string `yaml:"bucketPrefix"`
+	Region       string `yaml:"region"`
+	// UsePathStyle controls S3 path-style addressing
+	// (bucket.host vs host/bucket). Most S3-compatible providers
+	// require path-style; defaults to true.
+	UsePathStyle bool `yaml:"usePathStyle"`
+}
+
+// Default values for NodeBackupConfig.
+const (
+	DefaultBackupEndpoint     = "https://qstorage.quilibrium.com"
+	DefaultBackupRegion       = "q-world-1"
+	DefaultBackupUsePathStyle = true
+)
 
 type NodeConfig struct {
 	ClientConfig

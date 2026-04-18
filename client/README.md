@@ -155,6 +155,12 @@ Top-level groups: `node`, `config`, `token`, `hypergraph`, `compute`,
 | `service [command]` | Manage the Quilibrium node service (systemd/launchd) |
 | `grpc enable` / `grpc disable` | Set/clear `listenGrpcMultiaddr` |
 | `rest enable` / `rest disable` | Set/clear `listenRESTMultiaddr` |
+| `backup enable` / `backup disable` | Toggle node backups to S3-compatible storage |
+| `backup config` | Interactively configure S3 credentials, endpoint, bucket, optional bucket prefix (namespace inside the bucket, e.g. `quilibrium/backups`), region, path-style |
+| `backup config print` | Print the backup configuration (credentials masked) |
+| `backup schedule [cron\|disable]` | Install/print/remove a crontab entry for `backup run` (default `0 * * * *`) |
+| `backup run` | Upload config dir + store/ + worker-store/* to S3 as-is (no compression) |
+| `backup restore [--name] [--force] [--dry-run] [--path-map OLD=NEW]` | Download objects back to their recorded paths. Automatically remaps absolute paths across hosts/OSes (Linux ↔ macOS, different `$HOME`, different install/state dirs) using host context recorded in `manifest.json`, and rewrites embedded paths in the restored `config.yml` (logger, alias, key, db). Use `--path-map` for any leftover absolute prefixes that auto-detection can't cover. |
 
 #### `qclient node config` — Manage node configuration
 

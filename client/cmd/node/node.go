@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	backupCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/backup"
 	logCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/log"
 	configCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/nodeconfig"
 	proverCmd "source.quilibrium.com/quilibrium/monorepo/client/cmd/node/prover"
@@ -123,6 +124,7 @@ func init() {
 	NodeCmd.AddCommand(logCmd.LogCmd)
 	NodeCmd.AddCommand(NodeGrpcCmd)
 	NodeCmd.AddCommand(NodeRestCmd)
+	NodeCmd.AddCommand(backupCmd.BackupCmd)
 
 	for _, c := range ServiceAliasCommands() {
 		NodeCmd.AddCommand(c)
