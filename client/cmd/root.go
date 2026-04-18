@@ -259,6 +259,7 @@ func init() {
 	rootCmd.AddCommand(CrossMintCmd)
 	rootCmd.AddCommand(DownloadSignaturesCmd)
 	rootCmd.AddCommand(LinkCmd)
+	rootCmd.AddCommand(UninstallCmd)
 	rootCmd.AddCommand(VersionCmd)
 	rootCmd.AddCommand(QuietCmd)
 }
