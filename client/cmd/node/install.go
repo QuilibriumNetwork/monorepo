@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
@@ -17,6 +18,32 @@ var (
 	symlinkDirFlag string
 	configsDirFlag string
 )
+
+// ExitUnlessSudoForInstall exits immediately if the process is not running
+// with elevated privileges. NodeCmd.PersistentPreRun calls this for install
+// before any other node setup (config load, default config creation, etc.).
+func ExitUnlessSudoForInstall() {
+	if utils.IsSudo() {
+		return
+	}
+	osLabel, details := sudoInstallMessageForGOOS(runtime.GOOS)
+	fmt.Fprintf(os.Stderr, "This command must be run with sudo on %s before any install steps.\n\n", osLabel)
+	fmt.Fprintln(os.Stderr, "  sudo qclient node install")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, details)
+	os.Exit(1)
+}
+
+func sudoInstallMessageForGOOS(goos string) (osLabel string, details string) {
+	switch goos {
+	case "linux":
+		return "Linux", "Sudo is required to write under /var (default install root), install a systemd unit and environment file, place the quilibrium-node symlink (often under /usr/local/bin), and set ownership for binaries and logs."
+	case "darwin":
+		return "macOS", "Sudo is required to write under /var (default install root), install a launchd plist, place the quilibrium-node symlink (often under /usr/local/bin), and set ownership for binaries and logs."
+	default:
+		return goos, fmt.Sprintf("Sudo is required on %s to install system paths, the node service, binaries, and related config.", goos)
+	}
+}
 
 // installCmd represents the command to install the Quilibrium node
 var NodeInstallCmd = &cobra.Command{
@@ -142,12 +169,6 @@ Examples:
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			return
-		}
-
-		if !utils.IsSudo() {
-			fmt.Println("This command must be run with sudo: sudo qclient node install")
-			fmt.Println("Sudo is required to install the node binary, logging, systemd (on Linux) service, and create the config directory.")
-			os.Exit(1)
 		}
 
 		// Apply any --install-dir / --symlink-dir / --configs-dir

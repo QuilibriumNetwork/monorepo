@@ -36,6 +36,12 @@ var NodeCmd = &cobra.Command{
 	Short: "Quilibrium node commands",
 	Long:  `Run Quilibrium node commands.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Install must be sudo from the first moment: skip root/node init
+		// (config load, default config creation, etc.) until privileges are OK.
+		if cmd == NodeInstallCmd {
+			ExitUnlessSudoForInstall()
+		}
+
 		// Store reference to parent's PersistentPreRun to call it first
 		parent := cmd.Parent()
 		if parent != nil && parent.PersistentPreRun != nil {
