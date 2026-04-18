@@ -4,22 +4,59 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
-// Default install-time paths. These are the values used when the client
-// config does not specify an override. They intentionally match the
-// original hard-coded locations so upgrading users see no behavior change.
+// Default install-time paths. These intentionally follow the FHS on
+// Linux and Homebrew-style conventions on macOS so binaries, state,
+// and symlinks land in the locations users expect for a system-wide
+// install managed by sudo + systemd/launchd.
 const (
-	DefaultNodeInstallDir = "/var/quilibrium"
-	// DefaultNodeLogRelDir is the directory name for file logs under each
-	// node config directory (the folder containing config.yml) when
-	// logger.path is populated by qclient defaults.
+	// LegacyNodeInstallDir is the pre-FHS-split install root. It is
+	// kept only for detecting legacy installs so we can warn the user;
+	// new installs should not land here.
+	LegacyNodeInstallDir = "/var/quilibrium"
+
+	// DefaultNodeLogRelDir is the directory name for file logs under
+	// each node config directory (the folder containing config.yml)
+	// when logger.path is populated by qclient defaults.
 	DefaultNodeLogRelDir = ".logs"
-	DefaultNodeSymlinkDir = "/usr/local/bin"
+
 	// DefaultNodeConfigsSubdir is the subdirectory of the user's home
 	// directory where node configs live when no override is set.
 	DefaultNodeConfigsSubdir = ".quilibrium/configs"
 )
+
+// DefaultNodeInstallDir returns the OS-appropriate default root for
+// node binaries: /opt/quilibrium on Linux (FHS), /usr/local/quilibrium
+// on macOS (Homebrew-style). Unknown GOOS falls back to the Linux
+// default.
+func DefaultNodeInstallDir() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/usr/local/quilibrium"
+	default:
+		return "/opt/quilibrium"
+	}
+}
+
+// DefaultNodeStateDir returns the OS-appropriate default root for
+// mutable node state (env file, future state/spool): /var/lib/quilibrium
+// on Linux (FHS), /usr/local/var/quilibrium on macOS.
+func DefaultNodeStateDir() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/usr/local/var/quilibrium"
+	default:
+		return "/var/lib/quilibrium"
+	}
+}
+
+// DefaultNodeSymlinkDir returns the directory where the node symlink
+// is created. /usr/local/bin on both Linux and macOS.
+func DefaultNodeSymlinkDir() string {
+	return "/usr/local/bin"
+}
 
 // loadConfigOrDefault returns the persisted client config, or a zero-value
 // config if loading fails. Path accessors are best-effort: callers should
@@ -34,13 +71,24 @@ func loadConfigOrDefault() *ClientConfig {
 }
 
 // GetNodeInstallDir returns the configured node install root, or the
-// default /var/quilibrium when unset.
+// OS-appropriate default when unset.
 func GetNodeInstallDir() string {
 	cfg := loadConfigOrDefault()
 	if cfg.NodeInstallDir != "" {
 		return cfg.NodeInstallDir
 	}
-	return DefaultNodeInstallDir
+	return DefaultNodeInstallDir()
+}
+
+// GetNodeStateDir returns the configured node state root, or the
+// OS-appropriate default when unset. The env file and any future
+// mutable node state live here.
+func GetNodeStateDir() string {
+	cfg := loadConfigOrDefault()
+	if cfg.NodeStateDir != "" {
+		return cfg.NodeStateDir
+	}
+	return DefaultNodeStateDir()
 }
 
 // GetNodeBinaryDir returns the directory that holds versioned node binary
@@ -49,10 +97,10 @@ func GetNodeBinaryDir() string {
 	return filepath.Join(GetNodeInstallDir(), "bin", string(ReleaseTypeNode))
 }
 
-// GetNodeEnvFilePath returns the path to the systemd EnvironmentFile used
-// by the node service, e.g. <install>/quilibrium.env.
+// GetNodeEnvFilePath returns the path to the systemd EnvironmentFile
+// used by the node service, e.g. <state>/quilibrium.env.
 func GetNodeEnvFilePath() string {
-	return filepath.Join(GetNodeInstallDir(), "quilibrium.env")
+	return filepath.Join(GetNodeStateDir(), "quilibrium.env")
 }
 
 // DefaultNodeLogDirForConfig returns the default logger directory for a
@@ -70,7 +118,7 @@ func GetNodeSymlinkDir() string {
 	if cfg.NodeSymlinkDir != "" {
 		return cfg.NodeSymlinkDir
 	}
-	return DefaultNodeSymlinkDir
+	return DefaultNodeSymlinkDir()
 }
 
 // GetNodeSymlinkPath returns the full path of the node binary symlink,
@@ -109,7 +157,6 @@ func ensureDirExistsForSudoUser(path string) {
 	}
 	userLookup, err := GetCurrentSudoUser()
 	if err != nil {
-		// Fall back to best-effort mkdir without chown.
 		_ = os.MkdirAll(path, 0755)
 		return
 	}

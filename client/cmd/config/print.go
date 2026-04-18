@@ -32,6 +32,7 @@ var ClientConfigPrintCmd = &cobra.Command{
 
 		fmt.Printf("Node Install Dir: %s\n", utils.GetNodeInstallDir())
 		fmt.Printf("  Node Binary Dir: %s\n", utils.GetNodeBinaryDir())
+		fmt.Printf("Node State Dir:   %s\n", utils.GetNodeStateDir())
 		fmt.Printf("  Node Env File:   %s\n", utils.GetNodeEnvFilePath())
 		// Node log location lives in the node config's logger.path, not
 		// the client config. Show the active one for convenience.

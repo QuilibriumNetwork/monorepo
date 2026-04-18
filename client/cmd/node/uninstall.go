@@ -2,14 +2,23 @@ package node
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"source.quilibrium.com/quilibrium/monorepo/client/utils"
 )
+
+// isDirNotEmpty reports whether err represents a non-empty-directory
+// error from os.Remove. Used so uninstall can silently skip removing
+// a state dir that still has user files in it.
+func isDirNotEmpty(err error) bool {
+	return errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST)
+}
 
 var (
 	Force bool
@@ -117,10 +126,19 @@ func uninstallNode() {
 		fmt.Fprintf(os.Stderr, "Warning: could not remove legacy logrotate config at %s: %v\n", legacyLogrotate, err)
 	}
 
-	// 7. Remove environment file
+	// 7. Remove environment file, and the state dir itself if empty.
 	fmt.Println("Removing environment file...")
 	if err := os.Remove(envPath); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Warning: could not remove environment file at %s: %v\n", envPath, err)
+	}
+	stateDir := utils.GetNodeStateDir()
+	if err := os.Remove(stateDir); err != nil && !os.IsNotExist(err) {
+		// Non-empty or permission error: leave it alone, but only
+		// report unexpected errors (ENOTEMPTY is expected when the
+		// user has other state files in there).
+		if !isDirNotEmpty(err) {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove state directory at %s: %v\n", stateDir, err)
+		}
 	}
 
 	fmt.Println()

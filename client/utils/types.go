@@ -9,10 +9,16 @@ type ClientConfig struct {
 	CustomRpc       string `yaml:"customRpc"`
 	NodeSymlinkName string `yaml:"nodeSymlinkName"`
 	NodeServiceName string `yaml:"nodeServiceName"`
-	// NodeInstallDir is the root directory for the node binary tree and
-	// environment file. Defaults to /var/quilibrium. The actual binaries
-	// live under <NodeInstallDir>/bin/node/<version>/.
+	// NodeInstallDir is the root directory for the node binary tree.
+	// Defaults to /opt/quilibrium on Linux and /usr/local/quilibrium on
+	// macOS. The actual binaries live under
+	// <NodeInstallDir>/bin/node/<version>/.
 	NodeInstallDir string `yaml:"nodeInstallDir"`
+	// NodeStateDir is the root directory for mutable node state
+	// (currently the systemd EnvironmentFile). Defaults to
+	// /var/lib/quilibrium on Linux and /usr/local/var/quilibrium on
+	// macOS.
+	NodeStateDir string `yaml:"nodeStateDir"`
 	// NodeSymlinkDir is the directory where the node binary symlink
 	// (quilibrium-node) is created. Defaults to /usr/local/bin.
 	NodeSymlinkDir string `yaml:"nodeSymlinkDir"`

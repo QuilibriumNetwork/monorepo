@@ -15,6 +15,7 @@ import (
 // value, or its default, alone).
 var (
 	installDirFlag string
+	stateDirFlag   string
 	symlinkDirFlag string
 	configsDirFlag string
 )
@@ -37,9 +38,9 @@ func ExitUnlessSudoForInstall() {
 func sudoInstallMessageForGOOS(goos string) (osLabel string, details string) {
 	switch goos {
 	case "linux":
-		return "Linux", "Sudo is required to write under /var (default install root), install a systemd unit and environment file, place the quilibrium-node symlink (often under /usr/local/bin), and set ownership for binaries and logs."
+		return "Linux", "Sudo is required to write binaries under /opt/quilibrium (default install root), write the environment file under /var/lib/quilibrium (default state root), install a systemd unit, place the quilibrium-node symlink (often under /usr/local/bin), and set ownership for binaries and logs."
 	case "darwin":
-		return "macOS", "Sudo is required to write under /var (default install root), install a launchd plist, place the quilibrium-node symlink (often under /usr/local/bin), and set ownership for binaries and logs."
+		return "macOS", "Sudo is required to write binaries under /usr/local/quilibrium (default install root), write the environment file under /usr/local/var/quilibrium (default state root), install a launchd plist, place the quilibrium-node symlink (often under /usr/local/bin), and set ownership for binaries and logs."
 	default:
 		return goos, fmt.Sprintf("Sudo is required on %s to install system paths, the node service, binaries, and related config.", goos)
 	}
@@ -92,10 +93,15 @@ var NodeInstallCmd = &cobra.Command{
 	to the qclient config, so later commands (service, log, clean, etc.)
 	read the same values automatically:
 
-		--install-dir   Root install directory (defaults to /var/quilibrium).
-		                Binaries go to <install-dir>/bin/node/<version>/ and
-		                the systemd EnvironmentFile lives at
-		                <install-dir>/quilibrium.env.
+		--install-dir   Root install directory for node binaries (defaults
+		                to /opt/quilibrium on Linux and
+		                /usr/local/quilibrium on macOS). Binaries go to
+		                <install-dir>/bin/node/<version>/.
+		--state-dir     Root directory for mutable node state (defaults
+		                to /var/lib/quilibrium on Linux and
+		                /usr/local/var/quilibrium on macOS). The systemd
+		                EnvironmentFile lives at
+		                <state-dir>/quilibrium.env.
 		--symlink-dir   Directory holding the quilibrium-node symlink
 		                (defaults to /usr/local/bin). Make sure this is on
 		                your $PATH if you change it.
@@ -171,13 +177,16 @@ Examples:
 			return
 		}
 
-		// Apply any --install-dir / --symlink-dir / --configs-dir
-		// overrides to the persisted client config before we start laying
-		// files down, so every subsequent path lookup reads the new value.
+		// Apply any --install-dir / --state-dir / --symlink-dir /
+		// --configs-dir overrides to the persisted client config before
+		// we start laying files down, so every subsequent path lookup
+		// reads the new value.
 		if err := applyInstallDirFlags(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+
+		warnLegacyInstallLayout()
 
 		// Determine version to install
 		version := determineVersion(args)
@@ -277,6 +286,7 @@ func applyInstallDirFlags() error {
 		prevResolved string
 	}{
 		{"install-dir", installDirFlag, &cfg.NodeInstallDir, utils.GetNodeInstallDir()},
+		{"state-dir", stateDirFlag, &cfg.NodeStateDir, utils.GetNodeStateDir()},
 		{"symlink-dir", symlinkDirFlag, &cfg.NodeSymlinkDir, utils.GetNodeSymlinkDir()},
 		{"configs-dir", configsDirFlag, &cfg.NodeConfigsDir, utils.GetNodeConfigsDir()},
 	}
@@ -320,11 +330,83 @@ func applyInstallDirFlags() error {
 	return nil
 }
 
+// warnLegacyInstallLayout emits a one-shot warning when the install
+// would land in (or leave behind) the pre-FHS-split /var/quilibrium
+// layout. No files are moved; the user is told how to opt in to the
+// new defaults or explicitly pin to the old path.
+func warnLegacyInstallLayout() {
+	cfg, err := utils.LoadClientConfig()
+	if err != nil {
+		return
+	}
+
+	resolvedInstall := utils.GetNodeInstallDir()
+	resolvedState := utils.GetNodeStateDir()
+
+	pinnedLegacyInstall := cfg.NodeInstallDir == utils.LegacyNodeInstallDir
+	pinnedLegacyState := cfg.NodeStateDir == utils.LegacyNodeInstallDir
+	legacyTreeExists := utils.FileExists(
+		filepath.Join(utils.LegacyNodeInstallDir, "bin", "node"),
+	) || utils.FileExists(
+		filepath.Join(utils.LegacyNodeInstallDir, "quilibrium.env"),
+	)
+
+	if !pinnedLegacyInstall && !pinnedLegacyState && !legacyTreeExists {
+		return
+	}
+
+	defaultInstall := utils.DefaultNodeInstallDir()
+	defaultState := utils.DefaultNodeStateDir()
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr,
+		"Notice: the default install layout has moved off "+
+			utils.LegacyNodeInstallDir+".")
+	fmt.Fprintf(os.Stderr,
+		"  New defaults: binaries at %s, env/state at %s.\n",
+		defaultInstall, defaultState,
+	)
+	if pinnedLegacyInstall || pinnedLegacyState {
+		fmt.Fprintf(os.Stderr,
+			"  Your qclient config currently pins install-dir=%s, state-dir=%s;\n"+
+				"  this install will keep writing there.\n",
+			resolvedInstall, resolvedState,
+		)
+		fmt.Fprintln(os.Stderr,
+			"  To adopt the new defaults, run 'sudo qclient node uninstall' "+
+				"then reinstall without --install-dir/--state-dir.")
+	} else if legacyTreeExists {
+		fmt.Fprintf(os.Stderr,
+			"  A legacy install tree was detected under %s but this install "+
+				"will use the new defaults (%s and %s).\n",
+			utils.LegacyNodeInstallDir, resolvedInstall, resolvedState,
+		)
+		fmt.Fprintf(os.Stderr,
+			"  To stay on the legacy layout, rerun with "+
+				"--install-dir %s --state-dir %s.\n",
+			utils.LegacyNodeInstallDir, utils.LegacyNodeInstallDir,
+		)
+		fmt.Fprintf(os.Stderr,
+			"  Files under %s are NOT moved automatically; remove them "+
+				"manually once you've verified the new install.\n",
+			utils.LegacyNodeInstallDir,
+		)
+	}
+	fmt.Fprintln(os.Stderr)
+}
+
 func init() {
 	NodeInstallCmd.Flags().StringVar(
 		&installDirFlag, "install-dir", "",
-		"Root install directory for node binaries and the env file "+
-			"(defaults to /var/quilibrium). Persisted to qclient config.",
+		"Root install directory for node binaries (defaults to "+
+			"/opt/quilibrium on Linux, /usr/local/quilibrium on macOS). "+
+			"Persisted to qclient config.",
+	)
+	NodeInstallCmd.Flags().StringVar(
+		&stateDirFlag, "state-dir", "",
+		"Root directory for mutable node state / env file (defaults "+
+			"to /var/lib/quilibrium on Linux, /usr/local/var/quilibrium "+
+			"on macOS). Persisted to qclient config.",
 	)
 	NodeInstallCmd.Flags().StringVar(
 		&symlinkDirFlag, "symlink-dir", "",

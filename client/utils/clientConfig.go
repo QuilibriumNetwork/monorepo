@@ -12,6 +12,10 @@ func CreateDefaultConfig() {
 	configPath := GetConfigPath()
 
 	fmt.Printf("Creating default config: %s\n", configPath)
+	// Leave NodeInstallDir / NodeStateDir / NodeSymlinkDir empty here so
+	// the OS-aware helpers in paths.go supply the current defaults
+	// lazily. Persisting them would pin the user to whatever default
+	// was in effect at config-creation time.
 	SaveClientConfig(&ClientConfig{
 		DataDir:         ClientDataPath,
 		SymlinkPath:     DefaultQClientSymlinkPath,
@@ -19,8 +23,6 @@ func CreateDefaultConfig() {
 		PublicRpc:       false,
 		CustomRpc:       "",
 		NodeServiceName: DefaultNodeServiceName,
-		NodeInstallDir:  DefaultNodeInstallDir,
-		NodeSymlinkDir:  DefaultNodeSymlinkDir,
 	})
 
 	sudoUser, err := GetCurrentSudoUser()
@@ -35,7 +37,8 @@ func CreateDefaultConfig() {
 func LoadClientConfig() (*ClientConfig, error) {
 	configPath := GetConfigPath()
 
-	// Create default config if it doesn't exist
+	// Create default config if it doesn't exist. Leave the node path
+	// fields empty so OS-aware defaults from paths.go apply lazily.
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		config := &ClientConfig{
 			DataDir:         ClientDataPath,
@@ -44,8 +47,6 @@ func LoadClientConfig() (*ClientConfig, error) {
 			PublicRpc:       false,
 			CustomRpc:       "",
 			NodeServiceName: DefaultNodeServiceName,
-			NodeInstallDir:  DefaultNodeInstallDir,
-			NodeSymlinkDir:  DefaultNodeSymlinkDir,
 		}
 		if err := SaveClientConfig(config); err != nil {
 			return nil, err
@@ -64,17 +65,14 @@ func LoadClientConfig() (*ClientConfig, error) {
 		return nil, err
 	}
 
-	// Backfill fields that may be missing from older configs. Callers
-	// (e.g. the path accessors) also apply defaults lazily, but doing it
-	// here keeps LoadClientConfig's return value self-consistent.
+	// Backfill fields that may be missing from older configs. Only
+	// backfill the service name here; leave NodeInstallDir /
+	// NodeStateDir / NodeSymlinkDir empty so the OS-aware path
+	// accessors apply current defaults. Older configs that already
+	// have an explicit NodeInstallDir (e.g. the legacy
+	// /var/quilibrium) keep their persisted value untouched.
 	if config.NodeServiceName == "" {
 		config.NodeServiceName = DefaultNodeServiceName
-	}
-	if config.NodeInstallDir == "" {
-		config.NodeInstallDir = DefaultNodeInstallDir
-	}
-	if config.NodeSymlinkDir == "" {
-		config.NodeSymlinkDir = DefaultNodeSymlinkDir
 	}
 
 	return config, nil
