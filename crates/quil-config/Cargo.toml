@@ -1,0 +1,12 @@
+[package]
+name = "quil-config"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Configuration parsing for the Quilibrium node"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+hex = "0.4"
+thiserror = "2"

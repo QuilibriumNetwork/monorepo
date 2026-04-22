@@ -1,0 +1,160 @@
+//! Consensus event loop bootstrap for the global chain.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tracing::info;
+
+use quil_consensus::committee::{DynamicCommittee, Replicas};
+use quil_consensus::event_handler::{Consumer, ConsensusStore, HotStuffEventHandler};
+use quil_consensus::event_loop::{EventLoop, EventLoopHandle};
+use quil_consensus::forest::Forks;
+use quil_consensus::leader_provider::LeaderProvider;
+use quil_consensus::pacemaker::{
+    HotStuffPacemaker, ParticipantConsumer, StaticProposalDurationProvider,
+    TimeoutConfig, TimeoutController,
+};
+use quil_consensus::safety_rules::SafetyRules;
+use quil_consensus::signer::Signer;
+use quil_consensus::state_producer::StateProducer;
+
+use crate::consensus_types::{GlobalState, GlobalVote};
+
+/// Configuration for the consensus event loop.
+pub struct ConsensusConfig {
+    pub filter: Vec<u8>,
+    pub min_timeout: Duration,
+    pub max_timeout: Duration,
+    pub timeout_adjustment_factor: f64,
+    pub happy_path_max_round_failures: u64,
+    pub max_rebroadcast_interval: Duration,
+    pub proposal_duration: Duration,
+}
+
+impl Default for ConsensusConfig {
+    fn default() -> Self {
+        Self {
+            filter: vec![0x00],
+            min_timeout: Duration::from_secs(10),
+            max_timeout: Duration::from_secs(60),
+            timeout_adjustment_factor: 1.5,
+            happy_path_max_round_failures: 3,
+            max_rebroadcast_interval: Duration::from_secs(30),
+            proposal_duration: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Spawn the global consensus event loop. Returns the handle for
+/// submitting proposals, QCs, TCs, and timeouts.
+pub fn spawn_global_consensus(
+    config: ConsensusConfig,
+    signer: Arc<dyn Signer<GlobalState, GlobalVote>>,
+    consensus_store: Arc<dyn ConsensusStore<GlobalVote>>,
+    committee: Arc<dyn Replicas>,
+    dynamic_committee: Arc<dyn DynamicCommittee>,
+    leader_provider: Arc<dyn LeaderProvider<GlobalState>>,
+    notifier: Arc<dyn Consumer<GlobalState, GlobalVote>>,
+    participant_consumer: Arc<dyn ParticipantConsumer<GlobalState, GlobalVote>>,
+) -> quil_types::error::Result<ConsensusComponents> {
+    // Timeout config
+    let timeout_cfg = TimeoutConfig::new(
+        config.min_timeout,
+        config.max_timeout,
+        config.timeout_adjustment_factor,
+        config.happy_path_max_round_failures,
+        config.max_rebroadcast_interval,
+    )?;
+    let timeout_ctrl = TimeoutController::new(timeout_cfg);
+
+    let duration_provider = Arc::new(StaticProposalDurationProvider::new(config.proposal_duration));
+
+    // Pacemaker
+    let pacemaker = HotStuffPacemaker::<GlobalState, GlobalVote>::new(
+        config.filter.clone(),
+        timeout_ctrl,
+        duration_provider,
+        participant_consumer,
+        consensus_store.clone(),
+    )?;
+
+    // Safety rules — shared between handler and state producer
+    let safety_rules = Arc::new(Mutex::new(SafetyRules::<GlobalState, GlobalVote>::new(
+        config.filter,
+        signer,
+        consensus_store,
+        dynamic_committee,
+    )?));
+
+    let state_producer = Arc::new(StateProducer::new(
+        safety_rules.clone(),
+        leader_provider,
+    ));
+
+    info!("consensus components ready");
+
+    Ok(ConsensusComponents {
+        pacemaker: Arc::new(Mutex::new(pacemaker)),
+        state_producer,
+        safety_rules,
+        committee,
+        notifier,
+    })
+}
+
+/// Pre-assembled consensus components. The caller starts the event
+/// loop by providing the genesis/trusted root state.
+pub struct ConsensusComponents {
+    pub pacemaker: Arc<Mutex<HotStuffPacemaker<GlobalState, GlobalVote>>>,
+    pub state_producer: Arc<StateProducer<GlobalState, GlobalVote>>,
+    pub safety_rules: Arc<Mutex<SafetyRules<GlobalState, GlobalVote>>>,
+    pub committee: Arc<dyn Replicas>,
+    pub notifier: Arc<dyn Consumer<GlobalState, GlobalVote>>,
+}
+
+impl ConsensusComponents {
+    /// Start the consensus event loop with a trusted root state
+    /// (genesis or latest finalized frame).
+    pub fn start(
+        self,
+        trusted_root: quil_consensus::models::CertifiedState<GlobalState>,
+        finalizer: Arc<dyn quil_consensus::forest::Finalizer>,
+        follower: Arc<dyn quil_consensus::forest::FollowerConsumer<GlobalState>>,
+    ) -> quil_types::error::Result<EventLoopHandle<GlobalState, GlobalVote>> {
+        let forks = Forks::<GlobalState>::new(trusted_root, finalizer, follower)?;
+
+        let handler = Arc::new(HotStuffEventHandler::new(
+            self.pacemaker,
+            self.state_producer,
+            Arc::new(Mutex::new(forks)),
+            self.safety_rules,
+            self.committee,
+            self.notifier,
+        ));
+
+        let (event_loop, handle) = EventLoop::new(handler, Instant::now());
+
+        tokio::spawn(async move {
+            if let Err(e) = event_loop.run().await {
+                tracing::error!(error = %e, "consensus event loop exited with error");
+            }
+        });
+
+        info!("global consensus event loop running");
+        Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consensus_config_default_values() {
+        let c = ConsensusConfig::default();
+        assert_eq!(c.filter, vec![0x00]);
+        assert_eq!(c.min_timeout, Duration::from_secs(10));
+        assert_eq!(c.max_timeout, Duration::from_secs(60));
+        assert_eq!(c.proposal_duration, Duration::from_secs(10));
+    }
+}

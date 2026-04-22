@@ -1,5 +1,112 @@
 use wasm_bindgen::prelude::*;
-use bls48581::{init, commit_raw, prove_raw, verify_raw, bls_keygen, bls_sign, bls_verify, bls_aggregate, prove_multiple, verify_multiple, Multiproof, BlsKeygenOutput, BlsAggregateOutput};
+use bls48581::{
+    init, commit_raw, prove_raw, verify_raw, bls_keygen, bls_sign, bls_verify, bls_aggregate,
+    prove_multiple, verify_multiple, Multiproof, BlsKeygenOutput, BlsAggregateOutput,
+    bls_scalar_random, bls_scalar_mul, bls_scalar_add, bls_scalar_sub, bls_scalar_neg,
+    bls_scalar_inv, bls_scalar_from_u64, bls_scalar_to_g1, bls_g1_add,
+    bls_scalar_to_g8, bls_g8_add,
+};
+
+// ============================================================
+// Threshold-BLS scalar / G1 helpers used by qkms-sdk's BLS-N session.
+// All scalars are 73-byte BE hex strings; G1 points are 74-byte compressed hex.
+// Errors are returned in-band as `{"error": "..."}` JSON.
+// ============================================================
+
+fn err_obj(msg: &str) -> String {
+    serde_json::json!({ "error": msg }).to_string()
+}
+
+fn parse_hex(name: &str, s: &str) -> Result<Vec<u8>, String> {
+    hex::decode(s).map_err(|e| format!("Failed to decode {}: {}", name, e))
+}
+
+#[wasm_bindgen]
+pub fn js_bls_scalar_random() -> String {
+    serde_json::json!(hex::encode(bls_scalar_random())).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_scalar_mul(a: &str, b: &str) -> String {
+    let a = match parse_hex("a", a) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let b = match parse_hex("b", b) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let r = bls_scalar_mul(&a, &b);
+    if r.is_empty() { return err_obj("bls_scalar_mul: invalid input"); }
+    serde_json::json!(hex::encode(r)).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_scalar_add(a: &str, b: &str) -> String {
+    let a = match parse_hex("a", a) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let b = match parse_hex("b", b) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let r = bls_scalar_add(&a, &b);
+    if r.is_empty() { return err_obj("bls_scalar_add: invalid input"); }
+    serde_json::json!(hex::encode(r)).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_scalar_sub(a: &str, b: &str) -> String {
+    let a = match parse_hex("a", a) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let b = match parse_hex("b", b) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let r = bls_scalar_sub(&a, &b);
+    if r.is_empty() { return err_obj("bls_scalar_sub: invalid input"); }
+    serde_json::json!(hex::encode(r)).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_scalar_neg(a: &str) -> String {
+    let a = match parse_hex("a", a) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let r = bls_scalar_neg(&a);
+    if r.is_empty() { return err_obj("bls_scalar_neg: invalid input"); }
+    serde_json::json!(hex::encode(r)).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_scalar_inv(a: &str) -> String {
+    let a = match parse_hex("a", a) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let r = bls_scalar_inv(&a);
+    if r.is_empty() { return err_obj("bls_scalar_inv: zero or invalid input"); }
+    serde_json::json!(hex::encode(r)).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_scalar_from_u64(v: u64) -> String {
+    serde_json::json!(hex::encode(bls_scalar_from_u64(v))).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_scalar_to_g1(scalar: &str) -> String {
+    let s = match parse_hex("scalar", scalar) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let r = bls_scalar_to_g1(&s);
+    if r.is_empty() { return err_obj("bls_scalar_to_g1: invalid input"); }
+    serde_json::json!(hex::encode(r)).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_g1_add(a: &str, b: &str) -> String {
+    let a = match parse_hex("a", a) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let b = match parse_hex("b", b) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let r = bls_g1_add(&a, &b);
+    if r.is_empty() { return err_obj("bls_g1_add: invalid input"); }
+    serde_json::json!(hex::encode(r)).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_scalar_to_g8(scalar: &str) -> String {
+    let s = match parse_hex("scalar", scalar) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let r = bls_scalar_to_g8(&s);
+    if r.is_empty() { return err_obj("bls_scalar_to_g8: invalid input"); }
+    serde_json::json!(hex::encode(r)).to_string()
+}
+
+#[wasm_bindgen]
+pub fn js_bls_g8_add(a: &str, b: &str) -> String {
+    let a = match parse_hex("a", a) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let b = match parse_hex("b", b) { Ok(v) => v, Err(e) => return err_obj(&e) };
+    let r = bls_g8_add(&a, &b);
+    if r.is_empty() { return err_obj("bls_g8_add: invalid input"); }
+    serde_json::json!(hex::encode(r)).to_string()
+}
 
 // Initialize the BLS48581 singleton
 #[wasm_bindgen]

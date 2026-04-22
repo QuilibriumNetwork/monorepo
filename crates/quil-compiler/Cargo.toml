@@ -1,0 +1,11 @@
+[package]
+name = "quil-compiler"
+version = "0.1.0"
+edition = "2021"
+description = "QCL circuit compiler — lexer, parser, AST, SSA, boolean circuit generation"
+
+[dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+thiserror = "2"

@@ -1,0 +1,19 @@
+[package]
+name = "quil-hypergraph-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "UniFFI bindings for quil-hypergraph, exposing CRDT operations to Go via C FFI"
+
+[lib]
+crate-type = ["lib", "staticlib"]
+name = "quil_hypergraph_ffi"
+
+[dependencies]
+quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
+quil-types = { path = "../quil-types" }
+uniffi = { version = "0.28.3", features = ["cli"] }
+sha2 = "0.10"
+
+[build-dependencies]
+uniffi = { version = "0.28.3", features = ["build"] }

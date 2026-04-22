@@ -14,7 +14,6 @@ crate-type = ["lib", "staticlib"]
 name = "dkls23_ffi"
 
 [dependencies]
-uniffi = { version = "0.28.3", features = ["cli"] }
 dkls23 = { path = "../dkls23" }
 k256 = { version = "0.13", features = ["ecdsa", "serde"] }
 p256 = { version = "0.13", features = ["ecdsa", "serde"] }
@@ -24,6 +23,12 @@ rand = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 thiserror = "1.0"
+
+# uniffi (and its CLI/build dep) is only used by the Go binding flow.
+# It is excluded from wasm32 builds so dkls23-wasm can depend on this crate
+# without pulling in clap/filesystem/etc. which don't compile to wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+uniffi = { version = "0.28.3", features = ["cli"] }
 
 [build-dependencies]
 uniffi = { version = "0.28.3", features = ["build"] }

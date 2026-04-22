@@ -1,0 +1,20 @@
+namespace quil_tries_ffi {
+    // Tree creation/manipulation
+    sequence<u8> new_tree();
+    sequence<u8> insert(sequence<u8> tree_bytes, sequence<u8> key, sequence<u8> value);
+    sequence<u8> delete_key(sequence<u8> tree_bytes, sequence<u8> key);
+
+    // Lookup
+    sequence<u8>? get_value(sequence<u8> tree_bytes, sequence<u8> key);
+
+    // Commitment (returns 64-byte root hash)
+    sequence<u8> commit(sequence<u8> tree_bytes, sequence<u8> prover_key);
+
+    // Serialization roundtrip
+    sequence<u8> serialize_tree(sequence<u8> tree_bytes);
+    sequence<u8> deserialize_tree_ffi(sequence<u8> serialized);
+
+    // Proof generation and verification
+    sequence<u8> prove(sequence<u8> tree_bytes, sequence<u8> key, sequence<u8> prover_key);
+    boolean verify_proof(sequence<u8> root, sequence<u8> key, sequence<u8> value, sequence<u8> proof, sequence<u8> prover_key);
+};

@@ -46,6 +46,12 @@ replace github.com/libp2p/go-libp2p-kad-dht => ../go-libp2p-kad-dht
 
 replace source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub => ../go-libp2p-blossomsub
 
+replace source.quilibrium.com/quilibrium/monorepo/quil-tries-ffi => ../quil-tries-ffi
+
+replace source.quilibrium.com/quilibrium/monorepo/quil-keys-ffi => ../quil-keys-ffi
+
+replace source.quilibrium.com/quilibrium/monorepo/quil-hypergraph-ffi => ../quil-hypergraph-ffi
+
 require (
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -75,6 +81,9 @@ require (
 	source.quilibrium.com/quilibrium/monorepo/types v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/utils v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/vdf v0.0.0-00010101000000-000000000000
+	source.quilibrium.com/quilibrium/monorepo/quil-tries-ffi v0.0.0-00010101000000-000000000000
+	source.quilibrium.com/quilibrium/monorepo/quil-keys-ffi v0.0.0-00010101000000-000000000000
+	source.quilibrium.com/quilibrium/monorepo/quil-hypergraph-ffi v0.0.0-00010101000000-000000000000
 	source.quilibrium.com/quilibrium/monorepo/verenc v0.0.0-00010101000000-000000000000
 )
 

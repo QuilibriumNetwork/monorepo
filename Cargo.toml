@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # and limitations under the License.
 [workspace]
+resolver = "2"
 members = [
     "crates/vdf",
     "crates/channel",
@@ -26,8 +27,34 @@ members = [
     "crates/bulletproofs",
     "crates/verenc",
     "crates/ferret",
-    "crates/dkls23_ffi"
+    "crates/dkls23_ffi",
+    "crates/dkls23-wasm",
+    "crates/dkls23",
+    "crates/quil-types",
+    "crates/quil-config",
+    "crates/quil-lifecycle",
+    "crates/quil-crypto",
+    "crates/quil-tries",
+    "crates/quil-tries-ffi",
+    "crates/quil-store",
+    "crates/quil-hypergraph",
+    "crates/quil-keys",
+    "crates/quil-keys-ffi",
+    "crates/quil-hypergraph-ffi",
+    "crates/quil-consensus",
+    "crates/quil-p2p",
+    "crates/quil-execution",
+    "crates/quil-engine",
+    "crates/quil-rpc",
+    "crates/quil-node",
+    "crates/quil-compiler",
+    "crates/quil-wallet",
+    "crates/libp2p-identity",
 ]
+
+[patch.crates-io]
+# Fork libp2p-identity to add Ed448 (KeyType=4) support for Quilibrium peer IDs
+libp2p-identity = { path = "crates/libp2p-identity" }
 
 [profile.release]
 # rpath = false is important to make Go bindings work

@@ -1,0 +1,17 @@
+[package]
+name = "quil-lifecycle"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Component lifecycle management for the Quilibrium node"
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+thiserror = "2"
+anyhow = "1"
+
+[dev-dependencies]
+async-trait = "0.1"

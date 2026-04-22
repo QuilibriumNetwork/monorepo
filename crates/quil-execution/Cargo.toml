@@ -1,0 +1,31 @@
+[package]
+name = "quil-execution"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Execution engines (Global, Token, Compute, Hypergraph) for the Quilibrium node"
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+quil-config = { path = "../quil-config" }
+quil-crypto = { path = "../quil-crypto" }
+once_cell = "1"
+quil-tries = { path = "../quil-tries" }
+quil-hypergraph = { path = "../quil-hypergraph" }
+quil-store = { path = "../quil-store" }
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+thiserror = "2"
+num-bigint = "0.4"
+num-traits = "0.2"
+hex = "0.4"
+prost = "0.13"
+sha2 = "0.10"
+bs58 = "0.5"
+metrics = "0.24"
+
+[dev-dependencies]
+tempfile = "3"
+quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
+quil-engine = { path = "../quil-engine" }
+quil-p2p = { path = "../quil-p2p" }

@@ -1,0 +1,21 @@
+[package]
+name = "quil-keys"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "File-based key management for the Quilibrium node"
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+quil-config = { path = "../quil-config" }
+quil-crypto = { path = "../quil-crypto" }
+aes-gcm = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+hex = "0.4"
+rand = "0.8"
+thiserror = "2"
+tracing = "0.1"
+sha2 = "0.10"
+ed448-rust = { path = "../ed448-rust" }
+ed448-goldilocks-plus = "0.16.0"

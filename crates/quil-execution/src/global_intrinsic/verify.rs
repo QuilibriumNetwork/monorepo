@@ -1,0 +1,843 @@
+//! Prover op verify implementations. These wire together the signing
+//! message construction, domain hash, state lookups, and BLS signature
+//! verification into complete verify paths.
+//!
+//! Each verify function takes:
+//! - The decoded canonical-bytes op struct
+//! - A `VectorCommitmentTree` for the prover vertex (loaded externally)
+//! - A `VectorCommitmentTree` for the allocation vertex (loaded externally)
+//! - A `&dyn KeyManager` for signature verification
+//!
+//! The calling code (the global intrinsic dispatcher) is responsible for
+//! loading the vertex trees from the hypergraph CRDT. This module only
+//! does the pure verification logic.
+
+use quil_types::crypto::{KeyManager, KeyType};
+use quil_types::error::{QuilError, Result};
+
+use crate::global_schema::{read_field, read_type};
+use super::prover_filter_ops::{ProverLeave, ProverPause, ProverResume};
+use super::prover_join::ProverJoin;
+use super::prover_ops::{ProverConfirm, ProverReject};
+use super::prover_verify;
+use super::materialize::prover_address_from_pubkey;
+
+/// Verify a `ProverPause` operation.
+///
+/// Go equivalent: `ProverPause::Verify` at
+/// `global_prover_pause.go:324`.
+///
+/// Steps:
+/// 1. Check the prover vertex exists and is a Prover type
+/// 2. Read the prover's public key from the vertex tree
+/// 3. Compute the allocation address and check it exists with status=1 (active)
+/// 4. Build the signing message and domain hash
+/// 5. Verify the BLS48-581 G1 signature
+pub fn verify_prover_pause(
+    op: &ProverPause,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    allocation_tree: Option<&quil_tries::VectorCommitmentTree>,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    // 1. Check vertex type
+    let vertex_type = read_type(prover_tree).ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover pause: prover vertex has no type hash".into())
+    })?;
+    if vertex_type != "prover:Prover" {
+        return Err(QuilError::InvalidArgument(format!(
+            "verify prover pause: expected prover:Prover, got {}",
+            vertex_type
+        )));
+    }
+
+    // 2. Read public key
+    let pubkey = read_field(prover_tree, "prover:Prover", "PublicKey").ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover pause: no PublicKey in prover vertex".into())
+    })?;
+
+    // 3. Check allocation status = 1 (active)
+    if let Some(alloc_tree) = allocation_tree {
+        let status_bytes = read_field(alloc_tree, "allocation:ProverAllocation", "Status");
+        let status = status_bytes.as_ref().and_then(|b| b.first().copied()).unwrap_or(0);
+        if status != 1 {
+            return Err(QuilError::InvalidArgument(format!(
+                "verify prover pause: allocation status is {} (expected 1=active)",
+                status
+            )));
+        }
+    }
+
+    // 4. Build signing message and domain
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover pause: missing signature".into())
+    })?;
+
+    let message = prover_verify::single_filter_signing_message(&op.filter, op.frame_number);
+    let domain = prover_verify::prover_pause_domain()?;
+
+    // 5. Verify BLS48-581 G1 signature
+    key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &pubkey,
+        &message,
+        &sig.signature,
+        &domain,
+    )
+}
+
+/// Verify a `ProverResume` operation. Same shape as pause.
+pub fn verify_prover_resume(
+    op: &ProverResume,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    allocation_tree: Option<&quil_tries::VectorCommitmentTree>,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    let vertex_type = read_type(prover_tree).ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover resume: no type hash".into())
+    })?;
+    if vertex_type != "prover:Prover" {
+        return Err(QuilError::InvalidArgument("verify prover resume: wrong type".into()));
+    }
+
+    let pubkey = read_field(prover_tree, "prover:Prover", "PublicKey").ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover resume: no PublicKey".into())
+    })?;
+
+    // Check allocation status = 2 (paused) for resume
+    if let Some(alloc_tree) = allocation_tree {
+        let status = read_field(alloc_tree, "allocation:ProverAllocation", "Status")
+            .and_then(|b| b.first().copied())
+            .unwrap_or(0);
+        if status != 2 {
+            return Err(QuilError::InvalidArgument(format!(
+                "verify prover resume: allocation status is {} (expected 2=paused)",
+                status
+            )));
+        }
+    }
+
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover resume: missing signature".into())
+    })?;
+
+    let message = prover_verify::single_filter_signing_message(&op.filter, op.frame_number);
+    let domain = prover_verify::prover_resume_domain()?;
+
+    key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &pubkey,
+        &message,
+        &sig.signature,
+        &domain,
+    )
+}
+
+/// Verify a `ProverLeave` operation.
+pub fn verify_prover_leave(
+    op: &ProverLeave,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    let vertex_type = read_type(prover_tree).ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover leave: no type hash".into())
+    })?;
+    if vertex_type != "prover:Prover" {
+        return Err(QuilError::InvalidArgument("verify prover leave: wrong type".into()));
+    }
+
+    let pubkey = read_field(prover_tree, "prover:Prover", "PublicKey").ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover leave: no PublicKey".into())
+    })?;
+
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover leave: missing signature".into())
+    })?;
+
+    let message = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
+    let domain = prover_verify::prover_leave_domain()?;
+
+    key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &pubkey,
+        &message,
+        &sig.signature,
+        &domain,
+    )
+}
+
+// =====================================================================
+// ProverJoin structural validation
+// =====================================================================
+
+/// VDF proof size per filter (516 bytes per filter).
+pub const PROOF_CHUNK_SIZE: usize = 516;
+/// Minimum filter length in bytes.
+pub const MIN_FILTER_LEN: usize = 32;
+/// Maximum frames a join request can be older than current frame.
+pub const JOIN_FRESHNESS_WINDOW: u64 = 10;
+
+/// Structural validation for ProverJoin — checks everything that
+/// doesn't require external dependencies (frame store, VDF prover).
+///
+/// Checks:
+/// 1. All filters are >= 32 bytes
+/// 2. Proof size == 516 * len(filters)
+/// 3. frame_number + 10 >= current_frame (not too stale)
+/// 4. Signature-with-PoP is present
+/// 5. Public key in signature is non-empty
+/// 6. Prover address derivation succeeds
+pub fn validate_prover_join_structural(
+    op: &ProverJoin,
+    current_frame_number: u64,
+) -> Result<ProverJoinValidation> {
+    // 1. Filter sizes
+    for (i, filter) in op.filters.iter().enumerate() {
+        if filter.len() < MIN_FILTER_LEN {
+            return Err(QuilError::InvalidArgument(format!(
+                "prover join: filter {} is {} bytes (min {})",
+                i,
+                filter.len(),
+                MIN_FILTER_LEN
+            )));
+        }
+    }
+
+    // 2. Proof size
+    let expected_proof_size = PROOF_CHUNK_SIZE * op.filters.len();
+    if op.proof.len() != expected_proof_size {
+        return Err(QuilError::InvalidArgument(format!(
+            "prover join: proof size {} != expected {} (516 * {} filters)",
+            op.proof.len(),
+            expected_proof_size,
+            op.filters.len()
+        )));
+    }
+
+    // 3. Freshness
+    if op.frame_number + JOIN_FRESHNESS_WINDOW < current_frame_number {
+        return Err(QuilError::InvalidArgument(format!(
+            "prover join: request frame {} is too old (current {})",
+            op.frame_number, current_frame_number
+        )));
+    }
+
+    // 4. Signature present
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("prover join: missing signature with PoP".into())
+    })?;
+
+    // 5. Public key non-empty
+    let public_key = sig.public_key.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("prover join: signature has no public key".into())
+    })?;
+    if public_key.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "prover join: empty public key".into(),
+        ));
+    }
+
+    // 6. Derive prover address
+    let prover_address = prover_address_from_pubkey(public_key)?;
+
+    Ok(ProverJoinValidation {
+        public_key: public_key.clone(),
+        prover_address,
+        filter_count: op.filters.len(),
+    })
+}
+
+/// Full ProverJoin verification including VDF multi-proof.
+///
+/// Requires:
+/// - `frame_output`: the VDF output of the frame referenced by `op.frame_number`
+/// - `frame_difficulty`: the difficulty of that frame
+/// - `frame_prover`: the VDF prover for multi-proof verification
+///
+/// This is the complete verify path that Go's `ProverJoin.Verify` runs.
+pub fn verify_prover_join_vdf(
+    op: &ProverJoin,
+    current_frame_number: u64,
+    frame_output: &[u8],
+    frame_difficulty: u32,
+    frame_prover: &dyn quil_types::crypto::FrameProver,
+) -> Result<bool> {
+    // 1. Structural validation
+    let validation = validate_prover_join_structural(op, current_frame_number)?;
+
+    // 2. Compute challenge from frame output
+    use sha2::Digest;
+    let challenge: [u8; 32] = sha2::Sha256::digest(frame_output).into();
+
+    // 3. Build ID list: for each filter, id = prover_address || filter || index_be
+    let mut ids: Vec<Vec<u8>> = Vec::with_capacity(op.filters.len());
+    for (idx, filter) in op.filters.iter().enumerate() {
+        let mut id = Vec::with_capacity(32 + filter.len() + 4);
+        id.extend_from_slice(&validation.prover_address);
+        id.extend_from_slice(filter);
+        id.extend_from_slice(&(idx as u32).to_be_bytes());
+        ids.push(id);
+    }
+
+    // 4. Split proof into 516-byte chunks
+    let mut solutions: Vec<Vec<u8>> = Vec::with_capacity(op.filters.len());
+    for i in 0..op.filters.len() {
+        solutions.push(op.proof[i * PROOF_CHUNK_SIZE..(i + 1) * PROOF_CHUNK_SIZE].to_vec());
+    }
+
+    // 5. Verify VDF multi-proof
+    let id_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_slice()).collect();
+    let sol_refs: Vec<&[u8]> = solutions.iter().map(|s| s.as_slice()).collect();
+
+    frame_prover.verify_multi_proof(
+        &challenge,
+        frame_difficulty,
+        &id_refs,
+        &sol_refs,
+    )
+}
+
+/// Output of structural validation — carries the derived values
+/// forward so the caller doesn't need to recompute them.
+pub struct ProverJoinValidation {
+    /// The BLS48-581 public key from the signature.
+    pub public_key: Vec<u8>,
+    /// The 32-byte prover address derived from the public key.
+    pub prover_address: [u8; 32],
+    /// Number of filters (= number of allocations to create).
+    pub filter_count: usize,
+}
+
+/// Verify a `ProverUpdate` operation. The signing message is just the
+/// delegate_address; the domain is PROVER_UPDATE (but Go actually
+/// uses an empty domain for updates — the signature covers just the
+/// delegate address bytes with the addressed-signature's address as
+/// context).
+pub fn verify_prover_update(
+    op: &super::prover_ops::ProverUpdate,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    let vertex_type = read_type(prover_tree).ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover update: no type hash".into())
+    })?;
+    if vertex_type != "prover:Prover" {
+        return Err(QuilError::InvalidArgument("verify prover update: wrong type".into()));
+    }
+
+    let pubkey = read_field(prover_tree, "prover:Prover", "PublicKey").ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover update: no PublicKey".into())
+    })?;
+
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover update: missing signature".into())
+    })?;
+
+    // ProverUpdate signing message is just the delegate_address
+    let message = &op.delegate_address;
+    // Domain is empty for updates (Go code uses SignWithDomain with empty domain)
+    let domain = [];
+
+    key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &pubkey,
+        message,
+        &sig.signature,
+        &domain,
+    )
+}
+
+/// Verify a `ProverConfirm` operation. Same BLS signature check as
+/// the filter ops, but uses multi-filter signing message and the
+/// PROVER_CONFIRM domain.
+pub fn verify_prover_confirm(
+    op: &ProverConfirm,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    let vertex_type = read_type(prover_tree).ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover confirm: no type hash".into())
+    })?;
+    if vertex_type != "prover:Prover" {
+        return Err(QuilError::InvalidArgument("verify prover confirm: wrong type".into()));
+    }
+
+    let pubkey = read_field(prover_tree, "prover:Prover", "PublicKey").ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover confirm: no PublicKey".into())
+    })?;
+
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover confirm: missing signature".into())
+    })?;
+
+    let message = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
+    let domain = prover_verify::prover_confirm_domain()?;
+
+    key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &pubkey,
+        &message,
+        &sig.signature,
+        &domain,
+    )
+}
+
+/// Validate ProverConfirm timing constraints. Called during invoke_step
+/// with the allocation tree loaded. Mirrors Go's frame window checks in
+/// `global_prover_confirm.go:492-574`.
+///
+/// - Join confirm (status=0): must wait 360-720 frames after JoinFrameNumber
+/// - Leave confirm (status=3): must wait 360-720 frames after LeaveFrameNumber
+pub fn validate_confirm_timing(
+    frame_number: u64,
+    allocation_tree: &quil_tries::VectorCommitmentTree,
+) -> Result<()> {
+    let cls = "allocation:ProverAllocation";
+    let status = crate::global_schema::read_field(allocation_tree, cls, "Status")
+        .and_then(|b| b.first().copied())
+        .unwrap_or(255);
+
+    match status {
+        0 => {
+            // Joining — check JoinFrameNumber timing
+            let join_frame_bytes = crate::global_schema::read_field(
+                allocation_tree, cls, "JoinFrameNumber",
+            ).unwrap_or_default();
+            if join_frame_bytes.len() != 8 {
+                return Err(QuilError::InvalidArgument(
+                    "confirm: missing JoinFrameNumber".into(),
+                ));
+            }
+            let join_frame = u64::from_be_bytes(join_frame_bytes.try_into().unwrap());
+            let frames_since = frame_number.saturating_sub(join_frame);
+            if frames_since < 360 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "confirm: must wait 360 frames after join (only {} elapsed)",
+                    frames_since
+                )));
+            }
+            if frames_since > 720 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "confirm: join confirmation window expired (720 frames, {} elapsed)",
+                    frames_since
+                )));
+            }
+            Ok(())
+        }
+        3 => {
+            // Leaving — check LeaveFrameNumber timing
+            let leave_frame_bytes = crate::global_schema::read_field(
+                allocation_tree, cls, "LeaveFrameNumber",
+            ).unwrap_or_default();
+            if leave_frame_bytes.len() != 8 {
+                return Err(QuilError::InvalidArgument(
+                    "confirm: missing LeaveFrameNumber".into(),
+                ));
+            }
+            let leave_frame = u64::from_be_bytes(leave_frame_bytes.try_into().unwrap());
+            let frames_since = frame_number.saturating_sub(leave_frame);
+            if frames_since < 360 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "confirm: must wait 360 frames after leave (only {} elapsed)",
+                    frames_since
+                )));
+            }
+            if frames_since > 720 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "confirm: leave confirmation window expired (720 frames, {} elapsed)",
+                    frames_since
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(QuilError::InvalidArgument(format!(
+            "confirm: invalid allocation status {} (expected 0=joining or 3=leaving)",
+            status
+        ))),
+    }
+}
+
+/// Verify a `ProverReject` operation.
+pub fn verify_prover_reject(
+    op: &ProverReject,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    let vertex_type = read_type(prover_tree).ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover reject: no type hash".into())
+    })?;
+    if vertex_type != "prover:Prover" {
+        return Err(QuilError::InvalidArgument("verify prover reject: wrong type".into()));
+    }
+
+    let pubkey = read_field(prover_tree, "prover:Prover", "PublicKey").ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover reject: no PublicKey".into())
+    })?;
+
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("verify prover reject: missing signature".into())
+    })?;
+
+    let message = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
+    let domain = prover_verify::prover_reject_domain()?;
+
+    key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &pubkey,
+        &message,
+        &sig.signature,
+        &domain,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::BigInt;
+    use crate::global_schema::{TYPE_HASH_PROVER, TYPE_HASH_ALLOCATION};
+    use super::super::addressed_signature::AddressedSignature;
+
+    // Stub key manager that always accepts/rejects
+    struct AcceptKeyManager;
+    impl KeyManager for AcceptKeyManager {
+        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct RejectKeyManager;
+    impl KeyManager for RejectKeyManager {
+        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    fn make_prover_tree() -> quil_tries::VectorCommitmentTree {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        // Type hash at [0xFF; 32]
+        tree.insert(&[0xFFu8; 32], &TYPE_HASH_PROVER, &[], &BigInt::from(32)).unwrap();
+        // PublicKey at order 0 → key 0x00
+        tree.insert(&[0x00], &vec![0xAAu8; 585], &[], &BigInt::from(585)).unwrap();
+        // Status at order 1 → key 0x04
+        tree.insert(&[0x04], &[1u8], &[], &BigInt::from(1)).unwrap();
+        tree
+    }
+
+    fn make_allocation_tree(status: u8) -> quil_tries::VectorCommitmentTree {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0xFFu8; 32], &TYPE_HASH_ALLOCATION, &[], &BigInt::from(32)).unwrap();
+        // Status at order 1 → key 0x04
+        tree.insert(&[0x04], &[status], &[], &BigInt::from(1)).unwrap();
+        tree
+    }
+
+    fn sample_pause() -> ProverPause {
+        ProverPause {
+            filter: vec![0xAAu8; 32],
+            frame_number: 42,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // verify_prover_pause
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pause_verify_accepts_with_accept_key_manager() {
+        let prover_tree = make_prover_tree();
+        let alloc_tree = make_allocation_tree(1); // active
+        let result = verify_prover_pause(
+            &sample_pause(),
+            &prover_tree,
+            Some(&alloc_tree),
+            &AcceptKeyManager,
+        );
+        assert_eq!(result.unwrap(), true);
+    }
+
+    #[test]
+    fn pause_verify_rejects_with_reject_key_manager() {
+        let prover_tree = make_prover_tree();
+        let alloc_tree = make_allocation_tree(1);
+        let result = verify_prover_pause(
+            &sample_pause(),
+            &prover_tree,
+            Some(&alloc_tree),
+            &RejectKeyManager,
+        );
+        assert_eq!(result.unwrap(), false);
+    }
+
+    #[test]
+    fn pause_verify_rejects_non_active_allocation() {
+        let prover_tree = make_prover_tree();
+        let alloc_tree = make_allocation_tree(2); // paused, not active
+        let result = verify_prover_pause(
+            &sample_pause(),
+            &prover_tree,
+            Some(&alloc_tree),
+            &AcceptKeyManager,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pause_verify_rejects_missing_signature() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_pause();
+        op.public_key_signature_bls48581 = None;
+        let result = verify_prover_pause(&op, &prover_tree, None, &AcceptKeyManager);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pause_verify_rejects_wrong_vertex_type() {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0xFFu8; 32], &TYPE_HASH_ALLOCATION, &[], &BigInt::from(32)).unwrap();
+        tree.insert(&[0x00], &vec![0xAAu8; 585], &[], &BigInt::from(585)).unwrap();
+        let result = verify_prover_pause(&sample_pause(), &tree, None, &AcceptKeyManager);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pause_verify_rejects_missing_pubkey() {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0xFFu8; 32], &TYPE_HASH_PROVER, &[], &BigInt::from(32)).unwrap();
+        // No pubkey inserted
+        let result = verify_prover_pause(&sample_pause(), &tree, None, &AcceptKeyManager);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_prover_resume
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resume_verify_accepts_paused_allocation() {
+        let prover_tree = make_prover_tree();
+        let alloc_tree = make_allocation_tree(2); // paused
+        let op = ProverResume {
+            filter: vec![0xAAu8; 32],
+            frame_number: 43,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+        };
+        assert!(verify_prover_resume(&op, &prover_tree, Some(&alloc_tree), &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn resume_verify_rejects_active_allocation() {
+        let prover_tree = make_prover_tree();
+        let alloc_tree = make_allocation_tree(1); // active, not paused
+        let op = ProverResume {
+            filter: vec![0xAAu8; 32],
+            frame_number: 43,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+        };
+        assert!(verify_prover_resume(&op, &prover_tree, Some(&alloc_tree), &AcceptKeyManager).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_prover_leave
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn leave_verify_accepts_with_accept_key_manager() {
+        let prover_tree = make_prover_tree();
+        let op = ProverLeave {
+            filters: vec![vec![0xAAu8; 32]],
+            frame_number: 100,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+        };
+        assert!(verify_prover_leave(&op, &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn leave_verify_rejects_with_reject_key_manager() {
+        let prover_tree = make_prover_tree();
+        let op = ProverLeave {
+            filters: vec![vec![0xAAu8; 32]],
+            frame_number: 100,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+        };
+        assert!(!verify_prover_leave(&op, &prover_tree, &RejectKeyManager).unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_prover_confirm
+    // -----------------------------------------------------------------
+
+    fn sample_confirm() -> ProverConfirm {
+        ProverConfirm {
+            filter: vec![],
+            frame_number: 500,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+            filters: vec![vec![0xDDu8; 32]],
+        }
+    }
+
+    #[test]
+    fn confirm_verify_accepts_with_accept_key_manager() {
+        let prover_tree = make_prover_tree();
+        assert!(verify_prover_confirm(&sample_confirm(), &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn confirm_verify_rejects_with_reject_key_manager() {
+        let prover_tree = make_prover_tree();
+        assert!(!verify_prover_confirm(&sample_confirm(), &prover_tree, &RejectKeyManager).unwrap());
+    }
+
+    #[test]
+    fn confirm_verify_rejects_missing_signature() {
+        let prover_tree = make_prover_tree();
+        let mut op = sample_confirm();
+        op.public_key_signature_bls48581 = None;
+        assert!(verify_prover_confirm(&op, &prover_tree, &AcceptKeyManager).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_prover_reject
+    // -----------------------------------------------------------------
+
+    fn sample_reject() -> ProverReject {
+        ProverReject {
+            filter: vec![],
+            frame_number: 600,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+            filters: vec![vec![0xEEu8; 32]],
+        }
+    }
+
+    #[test]
+    fn reject_verify_accepts_with_accept_key_manager() {
+        let prover_tree = make_prover_tree();
+        assert!(verify_prover_reject(&sample_reject(), &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    #[test]
+    fn reject_verify_rejects_with_reject_key_manager() {
+        let prover_tree = make_prover_tree();
+        assert!(!verify_prover_reject(&sample_reject(), &prover_tree, &RejectKeyManager).unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // validate_prover_join_structural
+    // -----------------------------------------------------------------
+
+    use super::super::sig_with_pop::SignatureWithPop;
+
+    fn sample_join(filters: Vec<Vec<u8>>) -> ProverJoin {
+        let proof_size = PROOF_CHUNK_SIZE * filters.len();
+        ProverJoin {
+            filters,
+            frame_number: 100,
+            public_key_signature_bls48581: Some(SignatureWithPop {
+                signature: vec![0xAAu8; 74],
+                public_key: Some(vec![0xBBu8; 585]),
+                pop_signature: vec![0xCCu8; 74],
+            }),
+            delegate_address: vec![],
+            merge_targets: vec![],
+            proof: vec![0xDDu8; proof_size],
+        }
+    }
+
+    #[test]
+    fn join_structural_accepts_valid_join() {
+        let op = sample_join(vec![vec![0x01u8; 32], vec![0x02u8; 48]]);
+        let result = validate_prover_join_structural(&op, 105);
+        assert!(result.is_ok());
+        let v = result.unwrap();
+        assert_eq!(v.public_key.len(), 585);
+        assert_eq!(v.prover_address.len(), 32);
+        assert_eq!(v.filter_count, 2);
+    }
+
+    #[test]
+    fn join_structural_rejects_short_filter() {
+        let op = sample_join(vec![vec![0x01u8; 31]]); // 31 < 32
+        assert!(validate_prover_join_structural(&op, 105).is_err());
+    }
+
+    #[test]
+    fn join_structural_rejects_wrong_proof_size() {
+        let mut op = sample_join(vec![vec![0x01u8; 32]]);
+        op.proof = vec![0u8; 100]; // should be 516
+        assert!(validate_prover_join_structural(&op, 105).is_err());
+    }
+
+    #[test]
+    fn join_structural_rejects_stale_request() {
+        let op = sample_join(vec![vec![0x01u8; 32]]);
+        // op.frame_number=100, current=111 → 100+10=110 < 111 → stale
+        assert!(validate_prover_join_structural(&op, 111).is_err());
+    }
+
+    #[test]
+    fn join_structural_accepts_at_freshness_boundary() {
+        let op = sample_join(vec![vec![0x01u8; 32]]);
+        // op.frame_number=100, current=110 → 100+10=110 >= 110 → ok
+        assert!(validate_prover_join_structural(&op, 110).is_ok());
+    }
+
+    #[test]
+    fn join_structural_rejects_missing_signature() {
+        let mut op = sample_join(vec![vec![0x01u8; 32]]);
+        op.public_key_signature_bls48581 = None;
+        assert!(validate_prover_join_structural(&op, 105).is_err());
+    }
+
+    #[test]
+    fn join_structural_rejects_missing_public_key() {
+        let mut op = sample_join(vec![vec![0x01u8; 32]]);
+        op.public_key_signature_bls48581.as_mut().unwrap().public_key = None;
+        assert!(validate_prover_join_structural(&op, 105).is_err());
+    }
+
+    #[test]
+    fn join_structural_prover_address_is_deterministic() {
+        let op = sample_join(vec![vec![0x01u8; 32]]);
+        let v1 = validate_prover_join_structural(&op, 105).unwrap();
+        let v2 = validate_prover_join_structural(&op, 105).unwrap();
+        assert_eq!(v1.prover_address, v2.prover_address);
+    }
+
+    #[test]
+    fn join_structural_empty_filters_with_empty_proof() {
+        let op = ProverJoin {
+            filters: vec![],
+            frame_number: 100,
+            public_key_signature_bls48581: Some(SignatureWithPop {
+                signature: vec![0xAAu8; 74],
+                public_key: Some(vec![0xBBu8; 585]),
+                pop_signature: vec![0xCCu8; 74],
+            }),
+            delegate_address: vec![],
+            merge_targets: vec![],
+            proof: vec![], // 0 filters → 0 proof
+        };
+        let v = validate_prover_join_structural(&op, 105).unwrap();
+        assert_eq!(v.filter_count, 0);
+    }
+}

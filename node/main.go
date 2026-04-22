@@ -155,6 +155,16 @@ var (
 		"",
 		"per-component log levels, comma-separated (e.g. \"bootstrap=debug,peerMonitor=warn\")",
 	)
+	exportDB = flag.String(
+		"export-db",
+		"",
+		"export the database to a portable binary file at the given path and exit",
+	)
+	migrateDB = flag.String(
+		"migrate-db",
+		"",
+		"migrate the Pebble database directly to RocksDB at the given path and exit (no extra disk needed beyond the target)",
+	)
 
 	// *char flags
 	blockchar         = "█"
@@ -525,6 +535,24 @@ func main() {
 		}
 		if err := db.Close(); err != nil {
 			logger.Fatal("failed to close database", zap.Error(err))
+		}
+		return
+	}
+
+	if *exportDB != "" {
+		if err := store.ExportDatabaseFromConfig(
+			nodeConfig, uint(*core), *exportDB,
+		); err != nil {
+			logger.Fatal("failed to export database", zap.Error(err))
+		}
+		return
+	}
+
+	if *migrateDB != "" {
+		if err := store.MigrateToRocksDBFromConfig(
+			nodeConfig, *migrateDB,
+		); err != nil {
+			logger.Fatal("failed to migrate database", zap.Error(err))
 		}
 		return
 	}

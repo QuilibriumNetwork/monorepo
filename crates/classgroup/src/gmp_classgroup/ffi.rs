@@ -21,7 +21,6 @@
 pub use super::super::gmp::mpz::Mpz;
 use super::super::gmp::mpz::{mp_bitcnt_t, mp_limb_t};
 use libc::{c_int, c_long, c_ulong, c_void, size_t};
-// pub use c_ulong;
 use std::{mem, usize};
 // We use the unsafe versions to avoid unnecessary allocations.
 extern "C" {
@@ -42,10 +41,7 @@ extern "C" {
     fn __gmpz_mul_ui(p: *mut Mpz, a: *const Mpz, b: c_ulong);
     fn __gmpz_addmul(rop: *mut Mpz, op1: *const Mpz, op2: *const Mpz);
     fn __gmpz_set(rop: *mut Mpz, op: *const Mpz);
-    //fn __fmpz_set_mpz(rop: *mut Mpz, op: *const Mpz);
-    //fn __fmpz_get_mpz(rop: *mut Mpz, op: *const Mpz);
     fn __gmpz_cmpabs(rop: *const Mpz, op: *const Mpz) -> usize;
-    //fn __gmpz_sgn(rop: *const Mpz) -> usize;
     fn __gmpz_mul_2exp(rop: *mut Mpz, op1: *const Mpz, op2: mp_bitcnt_t);
     fn __gmpz_sub(rop: *mut Mpz, op1: *const Mpz, op2: *const Mpz);
     fn __gmpz_submul(rop: *mut Mpz, op1: *const Mpz, op2: *const Mpz);
@@ -128,11 +124,6 @@ pub fn mpz_gcdext(gcd: &mut Mpz, s: &mut Mpz, t: &mut Mpz, a: &Mpz, b: &Mpz) {
     unsafe { __gmpz_gcdext(gcd, s, t, a, b) }
 }
 
-//#[inline]
-//pub fn fmpz_xgcd_partial(gcd: &mut Mpz, s: &mut Mpz, t: &mut Mpz, a: &Mpz, b: &Mpz) {
-//    unsafe { __fmpz_xgcd_partial(gcd, s, t, a, b) }
-//}
-
 #[inline]
 pub fn mpz_gcdext_null(gcd: &mut Mpz, s: &mut Mpz, a: &Mpz, b: &Mpz) {
     unsafe { __gmpz_gcdext(gcd, s, std::ptr::null_mut(), a, b) }
@@ -141,12 +132,7 @@ pub fn mpz_gcdext_null(gcd: &mut Mpz, s: &mut Mpz, a: &Mpz, b: &Mpz) {
 /// Doubles `rop` in-place
 #[inline]
 pub fn mpz_double(rop: &mut Mpz) {
-    if true {
-        // slightly faster
-        unsafe { __gmpz_mul_2exp(rop, rop, 1) }
-    } else {
-        unsafe { __gmpz_add(rop, rop, rop) }
-    }
+    unsafe { __gmpz_mul_2exp(rop, rop, 1) }
 }
 
 #[inline]
@@ -229,11 +215,6 @@ pub fn mpz_mul_ui(rop: &mut Mpz, op1: &Mpz, op2: u64) {
     unsafe { __gmpz_mul_ui(rop, op1, op2) }
 }
 
-//#[inline]
-//pub fn mpz_sgn(rop: &Mpz) -> usize {
-//    unsafe { __gmpz_sgn(rop) }
-//}
-
 #[inline]
 pub fn gmp_nudupl(a: &mut Mpz, b: &mut Mpz, c: &mut Mpz, times: u64) {
     unsafe {
@@ -245,16 +226,6 @@ pub fn gmp_nudupl(a: &mut Mpz, b: &mut Mpz, c: &mut Mpz, times: u64) {
 pub fn mpz_cmpabs(rop: &Mpz, op1: &Mpz) -> usize {
     unsafe { __gmpz_cmpabs(rop, op1) }
 }
-
-//#[inline]
-//pub fn fmpz_get_mpz(rop: &mut Mpz, op1: &Mpz) {
-//    unsafe { __fmpz_get_mpz(rop, op1) }
-//}
-//
-//#[inline]
-//pub fn fmpz_set_mpz(rop: &mut Mpz, op1: &Mpz) {
-//    unsafe { __fmpz_set_mpz(rop, op1) }
-//}
 
 #[inline]
 pub fn mpz_set(rop: &mut Mpz, op1: &Mpz) {
@@ -283,18 +254,6 @@ pub fn mpz_fdiv_q(q: &mut Mpz, n: &Mpz, d: &Mpz) {
         unsafe { __gmpz_tdiv_q(q, n, d) }
     } else {
         unsafe { __gmpz_fdiv_q(q, n, d) }
-    }
-}
-
-/// Sets `rop` to `(-1) * op`
-#[inline]
-#[cfg(none)]
-pub fn mpz_neg(rop: &mut Mpz) {
-    assert!(mem::size_of::<Mpz>() == mem::size_of::<MpzStruct>());
-    unsafe {
-        let ptr = rop as *mut _ as *mut MpzStruct;
-        let v = (*ptr).mp_size;
-        (*ptr).mp_size = -v;
     }
 }
 

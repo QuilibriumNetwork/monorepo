@@ -1,0 +1,17 @@
+namespace quil_hypergraph_ffi {
+    // Shard key computation
+    sequence<u8> shard_key_for_location(sequence<u8> l2_address);
+    sequence<u8> compute_bloom_filter_indices(sequence<u8> key, u32 num_buckets, u32 num_hashes);
+
+    // CRDT operations (handle-based)
+    u64 create_crdt();
+    void destroy_crdt(u64 handle);
+
+    // Set operations
+    void set_vertex(u64 handle, string set_type, string phase_type, sequence<u8> shard_l1, sequence<u8> shard_l2, sequence<u8> key, sequence<u8> value);
+    sequence<u8>? get_vertex(u64 handle, string set_type, string phase_type, sequence<u8> shard_l1, sequence<u8> shard_l2, sequence<u8> key);
+    void delete_vertex(u64 handle, string set_type, string phase_type, sequence<u8> shard_l1, sequence<u8> shard_l2, sequence<u8> key);
+
+    // Commit
+    sequence<u8> commit_phase(u64 handle, u64 frame_number);
+};

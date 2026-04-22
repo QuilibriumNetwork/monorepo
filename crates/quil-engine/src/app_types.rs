@@ -1,0 +1,479 @@
+//! Concrete consensus type instantiations for app shard chains.
+//!
+//! Mirrors `consensus_types.rs` (GlobalState/GlobalVote) but for the
+//! per-shard HotStuff consensus. Each app shard runs its own
+//! `EventLoop<AppShardState, AppShardVote>`.
+//!
+//! - `AppShardState` — wraps an AppShardFrameHeader, implements `Unique`
+//! - `AppShardVote` — a BLS signature over a shard proposal hash
+
+use std::fmt;
+use std::sync::Arc;
+
+use quil_consensus::models::{
+    AggregatedSignature, CertifiedState, Identity, QuorumCertificate,
+    State, TimeoutCertificate, Unique,
+};
+use quil_consensus::signature_aggregator::TimeoutSignerInfo;
+use quil_types::error::Result;
+
+use crate::voting_provider::VotingProviderFactory;
+
+// =====================================================================
+// AppShardState — unique identity for a shard frame
+// =====================================================================
+
+/// App shard chain state = an app shard frame header. The "unique
+/// identity" is hex(SHA3-256(output)), matching Go's `getIdentifier`
+/// on `AppShardFrame`.
+#[derive(Clone)]
+pub struct AppShardState {
+    pub filter: Vec<u8>,
+    pub frame_number: u64,
+    pub rank: u64,
+    pub timestamp: i64,
+    pub difficulty: u32,
+    pub output: Vec<u8>,
+    pub parent_selector: Vec<u8>,
+    pub prover: Vec<u8>,
+    pub requests_root: Vec<u8>,
+    pub state_roots: Vec<Vec<u8>>,
+    pub signature: Vec<u8>,
+    pub fee_multiplier: u64,
+    /// Cached identity (hex of sha3-256 of output).
+    identity_cache: String,
+}
+
+impl AppShardState {
+    pub fn new(
+        filter: Vec<u8>,
+        frame_number: u64,
+        rank: u64,
+        timestamp: i64,
+        difficulty: u32,
+        output: Vec<u8>,
+        parent_selector: Vec<u8>,
+        prover: Vec<u8>,
+        requests_root: Vec<u8>,
+        state_roots: Vec<Vec<u8>>,
+        signature: Vec<u8>,
+        fee_multiplier: u64,
+    ) -> Self {
+        let identity_cache = compute_output_identity(&output);
+        Self {
+            filter,
+            frame_number,
+            rank,
+            timestamp,
+            difficulty,
+            output,
+            parent_selector,
+            prover,
+            requests_root,
+            state_roots,
+            signature,
+            fee_multiplier,
+            identity_cache,
+        }
+    }
+
+    /// Create from a proto FrameHeader (used by both global and app shard frames).
+    pub fn from_header(
+        header: &quil_types::proto::global::FrameHeader,
+        filter: &[u8],
+    ) -> Self {
+        let identity_cache = compute_output_identity(&header.output);
+        Self {
+            filter: filter.to_vec(),
+            frame_number: header.frame_number,
+            rank: header.rank,
+            timestamp: header.timestamp,
+            difficulty: header.difficulty,
+            output: header.output.clone(),
+            parent_selector: header.parent_selector.clone(),
+            prover: header.prover.clone(),
+            requests_root: header.requests_root.clone(),
+            state_roots: header.state_roots.clone(),
+            signature: header
+                .public_key_signature_bls48581
+                .as_ref()
+                .map(|s| s.signature.clone())
+                .unwrap_or_default(),
+            fee_multiplier: header.fee_multiplier_vote,
+            identity_cache,
+        }
+    }
+}
+
+fn compute_output_identity(output: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(output))
+}
+
+impl fmt::Debug for AppShardState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppShardState")
+            .field("filter", &hex::encode(&self.filter))
+            .field("frame", &self.frame_number)
+            .field("rank", &self.rank)
+            .finish()
+    }
+}
+
+impl Unique for AppShardState {
+    fn identity(&self) -> &Identity {
+        &self.identity_cache
+    }
+
+    fn rank(&self) -> u64 {
+        self.rank
+    }
+
+    fn source(&self) -> &Identity {
+        // Leak the hex-encoded prover address for trait compatibility.
+        // In production this would be cached in the struct.
+        Box::leak(Box::new(hex::encode(&self.prover)))
+    }
+
+    fn timestamp(&self) -> u64 {
+        self.timestamp as u64
+    }
+
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+}
+
+// =====================================================================
+// AppShardVote — BLS signature over a shard proposal
+// =====================================================================
+
+/// App shard vote = a BLS48-581 signature over a shard proposal hash.
+/// Mirrors ProposalVote on the wire but typed for the consensus layer.
+#[derive(Clone)]
+pub struct AppShardVote {
+    /// Identity of the state being voted on.
+    identity: Identity,
+    rank: u64,
+    /// Voter's identity (hex-encoded prover address).
+    source: Identity,
+    timestamp: u64,
+    pub signature_bytes: Vec<u8>,
+    pub bitmask: Vec<u8>,
+    /// Filter of the shard this vote belongs to.
+    pub filter: Vec<u8>,
+}
+
+impl AppShardVote {
+    pub fn new(
+        proposal_identity: Identity,
+        rank: u64,
+        voter_identity: Identity,
+        timestamp: u64,
+        signature: Vec<u8>,
+        bitmask: Vec<u8>,
+        filter: Vec<u8>,
+    ) -> Self {
+        Self {
+            identity: proposal_identity,
+            rank,
+            source: voter_identity,
+            timestamp,
+            signature_bytes: signature,
+            bitmask,
+            filter,
+        }
+    }
+}
+
+impl fmt::Debug for AppShardVote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppShardVote")
+            .field("rank", &self.rank)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl Unique for AppShardVote {
+    fn identity(&self) -> &Identity { &self.identity }
+    fn rank(&self) -> u64 { self.rank }
+    fn source(&self) -> &Identity { &self.source }
+    fn timestamp(&self) -> u64 { self.timestamp }
+    fn signature(&self) -> &[u8] { &self.signature_bytes }
+}
+
+// =====================================================================
+// Type aliases
+// =====================================================================
+
+/// Type alias for the app shard consensus event loop handle.
+pub type AppEventLoopHandle =
+    quil_consensus::event_loop::EventLoopHandle<AppShardState, AppShardVote>;
+
+// =====================================================================
+// AppShardVoteFactory — builds votes, QCs, TCs for app shards
+// =====================================================================
+
+/// Factory for building concrete app shard consensus artifacts.
+pub struct AppShardVoteFactory {
+    pub filter: Vec<u8>,
+}
+
+impl VotingProviderFactory<AppShardState, AppShardVote> for AppShardVoteFactory {
+    fn make_vote(
+        &self,
+        state_rank: u64,
+        state_id: &Identity,
+        signature: Vec<u8>,
+        voter_address: &[u8],
+    ) -> Result<AppShardVote> {
+        Ok(AppShardVote::new(
+            state_id.clone(),
+            state_rank,
+            hex::encode(voter_address),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            signature,
+            Vec::new(),
+            self.filter.clone(),
+        ))
+    }
+
+    fn make_timeout_vote(
+        &self,
+        rank: u64,
+        newest_qc_rank: u64,
+        signature: Vec<u8>,
+        voter_address: &[u8],
+    ) -> Result<AppShardVote> {
+        Ok(AppShardVote::new(
+            format!("timeout-{}-{}", rank, newest_qc_rank),
+            rank,
+            hex::encode(voter_address),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            signature,
+            Vec::new(),
+            self.filter.clone(),
+        ))
+    }
+
+    fn make_quorum_certificate(
+        &self,
+        state: &State<AppShardState>,
+        aggregated_sig: Arc<dyn AggregatedSignature>,
+    ) -> Result<Arc<dyn QuorumCertificate>> {
+        Ok(Arc::new(AppShardQC {
+            filter: self.filter.clone(),
+            rank: state.rank,
+            frame_number: state.state.frame_number,
+            identity: state.identifier.clone(),
+            timestamp: state.timestamp,
+            agg_sig: aggregated_sig,
+        }))
+    }
+
+    fn make_timeout_certificate(
+        &self,
+        rank: u64,
+        newest_qc: Arc<dyn QuorumCertificate>,
+        signers: Vec<TimeoutSignerInfo>,
+        aggregated_sig: Arc<dyn AggregatedSignature>,
+    ) -> Result<Arc<dyn TimeoutCertificate>> {
+        let latest_ranks: Vec<u64> = signers.iter().map(|s| s.newest_qc_rank).collect();
+        Ok(Arc::new(AppShardTC {
+            filter: self.filter.clone(),
+            rank,
+            latest_ranks,
+            latest_qc: newest_qc,
+            agg_sig: aggregated_sig,
+        }))
+    }
+}
+
+// =====================================================================
+// Concrete QC / TC types for app shards
+// =====================================================================
+
+#[derive(Debug)]
+struct AppShardQC {
+    filter: Vec<u8>,
+    rank: u64,
+    frame_number: u64,
+    identity: Identity,
+    timestamp: u64,
+    agg_sig: Arc<dyn AggregatedSignature>,
+}
+
+impl QuorumCertificate for AppShardQC {
+    fn filter(&self) -> &[u8] { &self.filter }
+    fn rank(&self) -> u64 { self.rank }
+    fn frame_number(&self) -> u64 { self.frame_number }
+    fn identity(&self) -> &Identity { &self.identity }
+    fn timestamp(&self) -> u64 { self.timestamp }
+    fn aggregated_signature(&self) -> &dyn AggregatedSignature { self.agg_sig.as_ref() }
+    fn equals(&self, other: &dyn QuorumCertificate) -> bool {
+        self.rank == other.rank() && self.identity == *other.identity()
+    }
+}
+
+#[derive(Debug)]
+struct AppShardTC {
+    filter: Vec<u8>,
+    rank: u64,
+    latest_ranks: Vec<u64>,
+    latest_qc: Arc<dyn QuorumCertificate>,
+    agg_sig: Arc<dyn AggregatedSignature>,
+}
+
+impl TimeoutCertificate for AppShardTC {
+    fn filter(&self) -> &[u8] { &self.filter }
+    fn rank(&self) -> u64 { self.rank }
+    fn latest_ranks(&self) -> &[u64] { &self.latest_ranks }
+    fn latest_quorum_cert(&self) -> &dyn QuorumCertificate { self.latest_qc.as_ref() }
+    fn aggregated_signature(&self) -> &dyn AggregatedSignature { self.agg_sig.as_ref() }
+    fn equals(&self, other: &dyn TimeoutCertificate) -> bool {
+        self.rank == other.rank()
+    }
+}
+
+// =====================================================================
+// Genesis certified state builder for app shards
+// =====================================================================
+
+/// Build a genesis `CertifiedState<AppShardState>` for bootstrapping
+/// a shard's consensus event loop. Uses the latest stored shard frame
+/// as the trusted root.
+pub fn build_app_genesis_certified_state(
+    filter: &[u8],
+    frame_number: u64,
+    output: &[u8],
+) -> CertifiedState<AppShardState> {
+    let state = AppShardState::new(
+        filter.to_vec(),
+        frame_number,
+        0,       // genesis rank
+        0,       // timestamp
+        50000,   // default difficulty
+        output.to_vec(),
+        vec![0u8; 32],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        0,
+    );
+    let identity = state.identity_cache.clone();
+
+    CertifiedState {
+        state: State {
+            rank: 0,
+            identifier: identity.clone(),
+            proposer_id: String::new(),
+            parent_qc_identity: identity.clone(),
+            parent_qc_rank: 0,
+            timestamp: 0,
+            state,
+        },
+        certifying_qc_identity: identity,
+        certifying_qc_rank: 0,
+    }
+}
+
+// =====================================================================
+// Genesis QC for app shards (needed by ConsensusStore bootstrap)
+// =====================================================================
+
+/// A minimal genesis QC for app shard consensus bootstrapping.
+#[derive(Debug)]
+pub struct AppGenesisQC {
+    pub filter: Vec<u8>,
+}
+
+impl QuorumCertificate for AppGenesisQC {
+    fn filter(&self) -> &[u8] { &self.filter }
+    fn rank(&self) -> u64 { 0 }
+    fn frame_number(&self) -> u64 { 0 }
+    fn identity(&self) -> &Identity {
+        use std::sync::OnceLock;
+        static ID: OnceLock<Identity> = OnceLock::new();
+        ID.get_or_init(|| "app-genesis".into())
+    }
+    fn timestamp(&self) -> u64 { 0 }
+    fn aggregated_signature(&self) -> &dyn AggregatedSignature { &EmptyAggSig }
+    fn equals(&self, o: &dyn QuorumCertificate) -> bool { o.rank() == 0 }
+}
+
+#[derive(Debug)]
+struct EmptyAggSig;
+impl AggregatedSignature for EmptyAggSig {
+    fn signature(&self) -> &[u8] { &[] }
+    fn public_key(&self) -> &[u8] { &[] }
+    fn bitmask(&self) -> &[u8] { &[] }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_shard_state_identity_is_deterministic() {
+        let s1 = AppShardState::new(
+            vec![1], 10, 0, 1000, 50000,
+            vec![0xAAu8; 64], vec![], vec![], vec![], vec![], vec![], 0,
+        );
+        let s2 = AppShardState::new(
+            vec![1], 10, 0, 1000, 50000,
+            vec![0xAAu8; 64], vec![], vec![], vec![], vec![], vec![], 0,
+        );
+        assert_eq!(s1.identity(), s2.identity());
+        assert!(!s1.identity().is_empty());
+    }
+
+    #[test]
+    fn app_shard_state_unique_trait() {
+        let s = AppShardState::new(
+            vec![1, 2], 42, 5, 1000, 100000,
+            vec![0xBBu8; 64], vec![], vec![0xCCu8; 585], vec![], vec![],
+            vec![0xDDu8; 74], 100,
+        );
+        assert_eq!(s.rank(), 5);
+        assert_eq!(s.timestamp(), 1000);
+        assert_eq!(s.signature(), &[0xDDu8; 74][..]);
+    }
+
+    #[test]
+    fn app_shard_vote_unique_trait() {
+        let v = AppShardVote::new(
+            "proposal-abc".into(), 7, "voter-xyz".into(),
+            5000, vec![0xEEu8; 74], vec![0x01], vec![1, 2],
+        );
+        assert_eq!(v.identity(), "proposal-abc");
+        assert_eq!(v.rank(), 7);
+        assert_eq!(v.source(), "voter-xyz");
+        assert_eq!(v.timestamp(), 5000);
+        assert_eq!(v.signature(), &[0xEEu8; 74][..]);
+    }
+
+    #[test]
+    fn genesis_certified_state_rank_zero() {
+        let cs = build_app_genesis_certified_state(&[1, 2, 3], 0, &[0xAAu8; 32]);
+        assert_eq!(cs.state.rank, 0);
+        assert_eq!(cs.certifying_qc_rank, 0);
+        assert_eq!(cs.state.state.filter, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn vote_factory_make_vote() {
+        let f = AppShardVoteFactory { filter: vec![1, 2] };
+        let vote = f.make_vote(5, &"state-5".into(), vec![0xAAu8; 74], &[0xBBu8; 32]).unwrap();
+        assert_eq!(vote.rank(), 5);
+        assert_eq!(vote.filter, vec![1, 2]);
+        assert!(!vote.signature_bytes.is_empty());
+    }
+}

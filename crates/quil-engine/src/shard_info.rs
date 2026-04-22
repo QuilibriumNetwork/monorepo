@@ -1,0 +1,852 @@
+//! Shard info discovery module. Port of
+//! `node/consensus/global/shard_info.go` (463 lines).
+//!
+//! Builds a list of shard entries enriched with prover-count, ring,
+//! and estimated reward data. The per-shard reward formula matches
+//! `proof_of_meaningful_work.go`:
+//!
+//! ```text
+//! per_ring  = (basis * shard_size / world_bytes) / (2^(ring+1) * sqrt(data_shards))
+//! per_prover = per_ring / 8
+//! ```
+//!
+//! The module is designed so that the pure-math helpers
+//! (`compute_shard_reward`, `isqrt`) are independently testable,
+//! while the orchestration (`get_shard_info`, `build_shard_entries`)
+//! works against trait objects for the prover registry and shards
+//! store.
+
+use std::collections::{HashMap, HashSet};
+
+use num_bigint::BigInt;
+use num_traits::{One, Zero};
+
+use quil_types::consensus::{
+    ProverInfo, ProverRegistry, ProverStatus, ShardDetail,
+};
+use quil_types::error::Result;
+use quil_types::store::{ShardInfo, ShardsStore};
+
+use crate::rewards::pomw_basis;
+
+/// Per-shard reward units (8 billion sub-units per QUIL).
+const QUIL_TOKEN_UNITS: u64 = 8_000_000_000;
+
+/// Ring size constant: each ring holds up to 8 provers.
+const MAX_RING_SIZE: u64 = 8;
+
+// ---------------------------------------------------------------------------
+// ShardEntry — internal intermediate representation
+// ---------------------------------------------------------------------------
+
+/// Intermediate shard data built during `build_shard_entries`, before
+/// conversion to the public `ShardDetail` type.
+#[derive(Debug, Clone)]
+pub struct ShardEntry {
+    /// Shard filter bytes (L2 prefix + sub-shard prefix bytes).
+    pub filter: Vec<u8>,
+    /// Total state size in bytes for this shard.
+    pub size: BigInt,
+    /// Number of data sub-shards.
+    pub data_shards: u64,
+    /// Total active + joining provers on this shard.
+    pub total_active: usize,
+    /// Provers sharing this prover's ring (or the joiner ring).
+    pub provers_on_ring: usize,
+    /// Whether the local prover is allocated to this shard.
+    pub is_allocated: bool,
+    /// Ring assignment (0-based).
+    pub ring: u8,
+}
+
+/// Raw shard size info returned by the size-fetching callbacks.
+#[derive(Debug, Clone)]
+pub struct ShardSizeEntry {
+    pub prefix: Vec<u32>,
+    pub size: Vec<u8>,
+    pub data_shards: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Ring calculation helpers (mirrors worker_allocator.go)
+// ---------------------------------------------------------------------------
+
+/// Ring metadata for a shard, computed from the total count of
+/// active + joining provers.
+#[derive(Debug, Clone, Copy)]
+struct ShardRingInfo {
+    /// Ring of the last existing prover (position count-1).
+    current_ring: u8,
+    /// Ring a new joiner would land on (position count).
+    joiner_ring: u8,
+    /// Provers sharing the last existing prover's ring.
+    active_on_current_ring: u64,
+    /// Provers that would share the joiner's ring (existing + joiner).
+    active_on_joiner_ring: u64,
+}
+
+/// Compute ring metadata from a total count of active+joining provers.
+fn compute_shard_ring_info(total_active_joining: usize) -> ShardRingInfo {
+    let mut ri = ShardRingInfo {
+        current_ring: 0,
+        joiner_ring: 0,
+        active_on_current_ring: 0,
+        active_on_joiner_ring: 0,
+    };
+
+    if total_active_joining > 0 {
+        ri.current_ring = ((total_active_joining - 1) / 8) as u8;
+    }
+    ri.joiner_ring = (total_active_joining / 8) as u8;
+
+    ri.active_on_current_ring = (total_active_joining % 8) as u64;
+    if ri.active_on_current_ring == 0 && total_active_joining > 0 {
+        ri.active_on_current_ring = 8;
+    }
+
+    ri.active_on_joiner_ring = (total_active_joining % 8) as u64 + 1;
+
+    ri
+}
+
+/// Determine the ring and on-ring count for a shard entry.
+///
+/// - `total_candidates`: number of active+joining provers on the shard.
+/// - `is_allocated`: whether the local prover is allocated to this shard.
+/// - `self_address`: the local prover's address (may be empty).
+/// - `candidate_addrs`: sorted candidate addresses (only used when
+///   `is_allocated && !self_address.is_empty()`).
+///
+/// Returns `(ring, on_ring)`.
+pub fn resolve_prover_ring(
+    total_candidates: usize,
+    is_allocated: bool,
+    self_address: &[u8],
+    candidate_addrs: &[Vec<u8>],
+) -> (u8, usize) {
+    let ri = compute_shard_ring_info(total_candidates);
+
+    if !is_allocated || self_address.is_empty() {
+        return (ri.joiner_ring, ri.active_on_joiner_ring as usize);
+    }
+
+    // Find this prover's actual rank in the sorted candidate list.
+    for (rank, addr) in candidate_addrs.iter().enumerate() {
+        if addr.as_slice() == self_address {
+            let ring = (rank / 8) as u8;
+            let ring_start = rank - (rank % 8);
+            let mut on_ring = total_candidates - ring_start;
+            if on_ring > 8 {
+                on_ring = 8;
+            }
+            return (ring, on_ring);
+        }
+    }
+
+    // Prover allocated but not in the active/joining candidate list
+    // (e.g. leaving or paused). Fall back to the last existing prover's ring.
+    (ri.current_ring, ri.active_on_current_ring as usize)
+}
+
+// ---------------------------------------------------------------------------
+// isqrt — integer square root
+// ---------------------------------------------------------------------------
+
+/// Integer square root of `n` using Newton's method.
+///
+/// Returns the largest integer `x` such that `x * x <= n`.
+/// Matches Go's `isqrt` in `shard_info.go`.
+pub fn isqrt(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    // Use u128 internally to avoid overflow for large u64 values.
+    let n128 = n as u128;
+    let mut x = n128;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n128 / x) / 2;
+    }
+    x as u64
+}
+
+/// Integer square root for `BigInt`. Uses Newton's method.
+/// Returns the largest `BigInt` `x` such that `x * x <= n`.
+/// Returns zero for non-positive inputs.
+pub fn isqrt_big(n: &BigInt) -> BigInt {
+    if *n <= BigInt::zero() {
+        return BigInt::zero();
+    }
+
+    let one = BigInt::one();
+    let two = &one + &one;
+    let mut x = n.clone();
+    let mut y = (&x + &one) / &two;
+    while y < x {
+        x = y.clone();
+        y = (&x + n / &x) / &two;
+    }
+    x
+}
+
+// ---------------------------------------------------------------------------
+// compute_shard_reward — per-prover per-frame reward estimate
+// ---------------------------------------------------------------------------
+
+/// Compute the per-prover per-frame reward estimate for a shard.
+///
+/// Formula (matching `proof_of_meaningful_work.go` Materialize):
+/// ```text
+/// factor    = shard_size * basis / world_bytes
+/// divisor   = 2^(ring + 1)
+/// factor   /= divisor
+/// factor   /= sqrt(data_shards)   [when data_shards > 1]
+/// factor   /= 8                   [constant max ring size]
+/// ```
+///
+/// Returns zero for degenerate inputs.
+pub fn compute_shard_reward(
+    basis: &BigInt,
+    shard_size: &BigInt,
+    world_bytes: &BigInt,
+    ring: u8,
+    data_shards: u64,
+) -> BigInt {
+    if basis.is_zero() || world_bytes.is_zero() || data_shards == 0 {
+        return BigInt::zero();
+    }
+
+    // factor = shard_size * basis / world_bytes
+    let mut factor = shard_size * basis;
+    factor /= world_bytes;
+
+    // divisor = 2^(ring+1)
+    let ring_exp = (ring as u32) + 1;
+    if ring_exp >= 64 {
+        // Would overflow u64; reward is negligible.
+        return BigInt::zero();
+    }
+    let divisor: u64 = 1u64 << ring_exp;
+    factor /= BigInt::from(divisor);
+
+    // sqrt(data_shards) — matches sqrt(shardCount) in reward module.
+    if data_shards > 1 {
+        let sqrt_val = isqrt(data_shards);
+        if sqrt_val > 0 {
+            factor /= BigInt::from(sqrt_val);
+        }
+    }
+
+    // Divide by constant max ring size (partially filled rings still split by 8).
+    factor /= BigInt::from(MAX_RING_SIZE);
+
+    factor
+}
+
+// ---------------------------------------------------------------------------
+// build_shard_entries — iterate shards and enrich with registry data
+// ---------------------------------------------------------------------------
+
+/// Sort key for ring assignment candidates. Mirrors Go's sort in
+/// `buildShardEntries`: joinFrame ASC, seniority DESC, address ASC.
+#[derive(Debug, Clone)]
+struct RingCandidate {
+    join_frame: u64,
+    seniority: u64,
+    address: Vec<u8>,
+}
+
+/// Build shard entries from raw shard data and a size-fetching function.
+///
+/// This is the core of `GetShardInfo`: for each shard, fetch sub-shard
+/// sizes, filter by allocation, look up provers from the registry, and
+/// compute the ring assignment.
+///
+/// `get_sizes` is a closure that takes `(shard_key, &ShardInfo)` and
+/// returns a list of `ShardSizeEntry` items.
+pub fn build_shard_entries<F>(
+    shards: &[ShardInfo],
+    get_sizes: &F,
+    allocated_filters: &HashSet<Vec<u8>>,
+    self_address: &[u8],
+    include_all: bool,
+    prover_registry: &dyn ProverRegistry,
+) -> (Vec<ShardEntry>, BigInt)
+where
+    F: Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>>,
+{
+    let mut world_bytes = BigInt::zero();
+    let mut entries = Vec::new();
+
+    for shard_info in shards {
+        let shard_key = &shard_info.shard_key;
+        let resp = match get_sizes(shard_key, shard_info) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        for shard in &resp {
+            let size = BigInt::from_bytes_be(num_bigint::Sign::Plus, &shard.size);
+            if size.is_zero() {
+                continue;
+            }
+            world_bytes += &size;
+
+            // Build filter: L2 part of shard_key + prefix bytes.
+            // In the Rust ShardInfo, shard_key = L1 ++ L2. L1 is always
+            // 1 byte, so L2 = shard_key[1..].
+            let l2 = if shard_key.len() > 1 {
+                &shard_key[1..]
+            } else {
+                &shard_key[..]
+            };
+            let mut bp = l2.to_vec();
+            for &p in &shard.prefix {
+                bp.push(p as u8);
+            }
+
+            let is_alloc = allocated_filters.contains(&bp);
+
+            if !include_all && !is_alloc {
+                continue;
+            }
+
+            let prs = match prover_registry.get_provers(&bp) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Build sorted ring candidates.
+            let mut candidates: Vec<RingCandidate> = Vec::new();
+            for pr in &prs {
+                for alloc in &pr.allocations {
+                    if alloc.confirmation_filter != bp {
+                        continue;
+                    }
+                    if alloc.status == ProverStatus::Active
+                        || alloc.status == ProverStatus::Joining
+                    {
+                        let jf = if alloc.join_frame_number == 0
+                            && alloc.join_confirm_frame_number != 0
+                        {
+                            alloc.join_confirm_frame_number
+                        } else {
+                            alloc.join_frame_number
+                        };
+                        candidates.push(RingCandidate {
+                            join_frame: jf,
+                            seniority: pr.seniority,
+                            address: pr.address.clone(),
+                        });
+                    }
+                    break;
+                }
+            }
+
+            // Sort: joinFrame ASC, seniority DESC, address ASC.
+            candidates.sort_by(|a, b| {
+                a.join_frame
+                    .cmp(&b.join_frame)
+                    .then_with(|| b.seniority.cmp(&a.seniority))
+                    .then_with(|| a.address.cmp(&b.address))
+            });
+
+            let candidate_addrs: Vec<Vec<u8>> =
+                candidates.iter().map(|c| c.address.clone()).collect();
+
+            let (ring, on_ring) = resolve_prover_ring(
+                candidates.len(),
+                is_alloc,
+                self_address,
+                &candidate_addrs,
+            );
+
+            entries.push(ShardEntry {
+                filter: bp,
+                size,
+                data_shards: shard.data_shards,
+                total_active: candidates.len(),
+                provers_on_ring: on_ring,
+                is_allocated: is_alloc,
+                ring,
+            });
+        }
+    }
+
+    (entries, world_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// get_shard_info — top-level orchestration
+// ---------------------------------------------------------------------------
+
+/// Build the full shard info response.
+///
+/// This is the Rust equivalent of `GlobalConsensusEngine.GetShardInfo`.
+/// It reads the latest frame from the clock store, builds the list of
+/// shards from the shards store, enriches each with prover registry
+/// data, and computes estimated rewards.
+///
+/// Returns `(shard_details, difficulty, pomw_basis_value, frame_number)`.
+///
+/// # Arguments
+/// * `include_all` — when false, only return shards the local prover
+///   is allocated to.
+/// * `self_address` — local prover address (empty slice if unknown).
+/// * `allocated_filters` — set of filters this prover is actively on.
+/// * `current_frame` — current frame number from the prover registry.
+/// * `clock_store` — for fetching the latest global frame.
+/// * `shards_store` — for enumerating application shards.
+/// * `prover_registry` — for looking up provers per shard.
+/// * `get_sizes` — closure to fetch sub-shard size data.
+pub fn get_shard_info<F>(
+    include_all: bool,
+    self_address: &[u8],
+    allocated_filters: &HashSet<Vec<u8>>,
+    difficulty: u64,
+    frame_number: u64,
+    shards_store: &dyn ShardsStore,
+    prover_registry: &dyn ProverRegistry,
+    get_sizes: &F,
+) -> Result<(Vec<ShardDetail>, u64, BigInt, u64)>
+where
+    F: Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>>,
+{
+    let app_shards = shards_store.range_app_shards()?;
+
+    // Consolidate into high-level L2 shards (dedup by shard_key).
+    let mut shard_map: HashMap<Vec<u8>, ShardInfo> = HashMap::new();
+    for s in &app_shards {
+        shard_map.entry(s.shard_key.clone()).or_insert_with(|| s.clone());
+    }
+    let shards: Vec<ShardInfo> = shard_map.into_values().collect();
+
+    let (entries, world_bytes) = build_shard_entries(
+        &shards,
+        get_sizes,
+        allocated_filters,
+        self_address,
+        include_all,
+        prover_registry,
+    );
+
+    if world_bytes.is_zero() {
+        return Ok((Vec::new(), difficulty, BigInt::zero(), frame_number));
+    }
+
+    let basis = pomw_basis(difficulty, world_bytes.to_u64_saturating(), QUIL_TOKEN_UNITS);
+
+    let details: Vec<ShardDetail> = entries
+        .iter()
+        .map(|entry| {
+            let est = compute_shard_reward(
+                &basis,
+                &entry.size,
+                &world_bytes,
+                entry.ring,
+                entry.data_shards,
+            );
+            ShardDetail {
+                filter: entry.filter.clone(),
+                shard_size: entry.size.clone(),
+                active_provers: entry.total_active as u32,
+                ring: entry.ring as u32,
+                estimated_reward: est,
+                is_allocated: entry.is_allocated,
+                data_shards: entry.data_shards,
+            }
+        })
+        .collect();
+
+    Ok((details, difficulty, basis, frame_number))
+}
+
+/// Extension trait on BigInt for saturating u64 conversion.
+trait BigIntSaturatingU64 {
+    fn to_u64_saturating(&self) -> u64;
+}
+
+impl BigIntSaturatingU64 for BigInt {
+    fn to_u64_saturating(&self) -> u64 {
+        use num_traits::ToPrimitive;
+        self.to_u64().unwrap_or(u64::MAX)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Allocation filter builder
+// ---------------------------------------------------------------------------
+
+/// Build the set of confirmation filters this prover is actively
+/// allocated to, mirroring the Go logic in `GetShardInfo` that
+/// skips joining allocations older than 720 frames and leaving
+/// allocations older than 720 frames.
+pub fn build_allocated_filters(
+    prover: &ProverInfo,
+    current_frame: u64,
+) -> HashSet<Vec<u8>> {
+    let mut filters = HashSet::new();
+
+    for alloc in &prover.allocations {
+        if alloc.status == ProverStatus::Joining
+            && current_frame > alloc.join_frame_number + 720
+        {
+            continue;
+        }
+        if alloc.status == ProverStatus::Left
+            && current_frame > alloc.leave_frame_number + 720
+        {
+            continue;
+        }
+        if alloc.status == ProverStatus::Active
+            || alloc.status == ProverStatus::Joining
+        {
+            filters.insert(alloc.confirmation_filter.clone());
+        }
+    }
+
+    filters
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- isqrt ----
+
+    #[test]
+    fn isqrt_zero() {
+        assert_eq!(isqrt(0), 0);
+    }
+
+    #[test]
+    fn isqrt_one() {
+        assert_eq!(isqrt(1), 1);
+    }
+
+    #[test]
+    fn isqrt_perfect_squares() {
+        assert_eq!(isqrt(4), 2);
+        assert_eq!(isqrt(9), 3);
+        assert_eq!(isqrt(16), 4);
+        assert_eq!(isqrt(25), 5);
+        assert_eq!(isqrt(100), 10);
+        assert_eq!(isqrt(10000), 100);
+        assert_eq!(isqrt(1_000_000), 1_000);
+    }
+
+    #[test]
+    fn isqrt_non_perfect() {
+        // isqrt(2) = 1, isqrt(3) = 1
+        assert_eq!(isqrt(2), 1);
+        assert_eq!(isqrt(3), 1);
+        // isqrt(5) = 2, isqrt(8) = 2
+        assert_eq!(isqrt(5), 2);
+        assert_eq!(isqrt(8), 2);
+        // isqrt(99) = 9
+        assert_eq!(isqrt(99), 9);
+        // isqrt(101) = 10
+        assert_eq!(isqrt(101), 10);
+    }
+
+    #[test]
+    fn isqrt_large() {
+        // Test with a large perfect square near u64 range.
+        // (2^32 - 1)^2 = 18_446_744_065_119_617_025
+        let val: u64 = 18_446_744_065_119_617_025;
+        assert_eq!(isqrt(val), 4_294_967_295);
+
+        // Large non-perfect squares.
+        assert_eq!(isqrt(1_000_000_000_000u64), 1_000_000);
+        assert_eq!(isqrt(1_000_000_000_001u64), 1_000_000);
+    }
+
+    // ---- isqrt_big ----
+
+    #[test]
+    fn isqrt_big_zero_and_negative() {
+        assert_eq!(isqrt_big(&BigInt::zero()), BigInt::zero());
+        assert_eq!(isqrt_big(&BigInt::from(-5)), BigInt::zero());
+    }
+
+    #[test]
+    fn isqrt_big_perfect_squares() {
+        assert_eq!(isqrt_big(&BigInt::from(1u64)), BigInt::from(1u64));
+        assert_eq!(isqrt_big(&BigInt::from(4u64)), BigInt::from(2u64));
+        assert_eq!(isqrt_big(&BigInt::from(9u64)), BigInt::from(3u64));
+        assert_eq!(isqrt_big(&BigInt::from(10000u64)), BigInt::from(100u64));
+    }
+
+    #[test]
+    fn isqrt_big_non_perfect() {
+        // isqrt(2) = 1
+        assert_eq!(isqrt_big(&BigInt::from(2u64)), BigInt::from(1u64));
+        // isqrt(99) = 9
+        assert_eq!(isqrt_big(&BigInt::from(99u64)), BigInt::from(9u64));
+    }
+
+    // ---- compute_shard_reward ----
+
+    #[test]
+    fn compute_shard_reward_zero_basis() {
+        let r = compute_shard_reward(
+            &BigInt::zero(),
+            &BigInt::from(1000u64),
+            &BigInt::from(10000u64),
+            0,
+            1,
+        );
+        assert!(r.is_zero());
+    }
+
+    #[test]
+    fn compute_shard_reward_zero_world() {
+        let r = compute_shard_reward(
+            &BigInt::from(1000u64),
+            &BigInt::from(1000u64),
+            &BigInt::zero(),
+            0,
+            1,
+        );
+        assert!(r.is_zero());
+    }
+
+    #[test]
+    fn compute_shard_reward_zero_data_shards() {
+        let r = compute_shard_reward(
+            &BigInt::from(1000u64),
+            &BigInt::from(1000u64),
+            &BigInt::from(10000u64),
+            0,
+            0,
+        );
+        assert!(r.is_zero());
+    }
+
+    #[test]
+    fn compute_shard_reward_basic() {
+        // basis = 1_000_000, shard_size = 500, world_bytes = 1000
+        // factor = 500 * 1_000_000 / 1000 = 500_000
+        // ring=0: divisor = 2^1 = 2 → 500_000/2 = 250_000
+        // data_shards=1: no sqrt division
+        // /8 → 250_000/8 = 31_250
+        let r = compute_shard_reward(
+            &BigInt::from(1_000_000u64),
+            &BigInt::from(500u64),
+            &BigInt::from(1000u64),
+            0,
+            1,
+        );
+        assert_eq!(r, BigInt::from(31_250u64));
+    }
+
+    #[test]
+    fn compute_shard_reward_higher_ring() {
+        // Same as basic but ring=1: divisor = 2^2 = 4
+        // factor = 500_000 / 4 = 125_000
+        // /8 → 125_000 / 8 = 15_625
+        let r = compute_shard_reward(
+            &BigInt::from(1_000_000u64),
+            &BigInt::from(500u64),
+            &BigInt::from(1000u64),
+            1,
+            1,
+        );
+        assert_eq!(r, BigInt::from(15_625u64));
+    }
+
+    #[test]
+    fn compute_shard_reward_with_sqrt_shards() {
+        // basis = 1_000_000, shard_size = 1000, world_bytes = 1000
+        // factor = 1000 * 1_000_000 / 1000 = 1_000_000
+        // ring=0: divisor=2 → 500_000
+        // data_shards=4: sqrt(4)=2 → 250_000
+        // /8 → 31_250
+        let r = compute_shard_reward(
+            &BigInt::from(1_000_000u64),
+            &BigInt::from(1000u64),
+            &BigInt::from(1000u64),
+            0,
+            4,
+        );
+        assert_eq!(r, BigInt::from(31_250u64));
+    }
+
+    #[test]
+    fn compute_shard_reward_ring_halves() {
+        // Increasing ring should halve the reward each time.
+        let basis = BigInt::from(10_000_000u64);
+        let size = BigInt::from(1000u64);
+        let world = BigInt::from(1000u64);
+
+        let r0 = compute_shard_reward(&basis, &size, &world, 0, 1);
+        let r1 = compute_shard_reward(&basis, &size, &world, 1, 1);
+        let r2 = compute_shard_reward(&basis, &size, &world, 2, 1);
+
+        // Each successive ring halves the reward (integer division).
+        assert_eq!(&r0 / 2, r1, "ring 1 should be half of ring 0");
+        assert_eq!(&r1 / 2, r2, "ring 2 should be half of ring 1");
+    }
+
+    // ---- resolve_prover_ring ----
+
+    #[test]
+    fn resolve_ring_not_allocated() {
+        // Not allocated: returns joiner ring.
+        let (ring, on_ring) = resolve_prover_ring(10, false, &[], &[]);
+        // 10 provers: joiner_ring = 10/8 = 1, active_on_joiner = 10%8 +1 = 3
+        assert_eq!(ring, 1);
+        assert_eq!(on_ring, 3);
+    }
+
+    #[test]
+    fn resolve_ring_allocated_found() {
+        let addrs: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i]).collect();
+        // Prover at index 3 → ring 0 (3/8=0), on_ring = min(10-0, 8) = 8
+        let (ring, on_ring) = resolve_prover_ring(10, true, &[3u8], &addrs);
+        assert_eq!(ring, 0);
+        assert_eq!(on_ring, 8);
+
+        // Prover at index 8 → ring 1 (8/8=1), ring_start=8, on_ring=10-8=2
+        let (ring, on_ring) = resolve_prover_ring(10, true, &[8u8], &addrs);
+        assert_eq!(ring, 1);
+        assert_eq!(on_ring, 2);
+    }
+
+    #[test]
+    fn resolve_ring_allocated_not_found() {
+        // Prover allocated but not in candidate list (leaving/paused).
+        let addrs: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i]).collect();
+        let (ring, on_ring) = resolve_prover_ring(10, true, &[99u8], &addrs);
+        // Falls back to current_ring: (10-1)/8 = 1,
+        // active_on_current_ring: 10%8 = 2
+        assert_eq!(ring, 1);
+        assert_eq!(on_ring, 2);
+    }
+
+    #[test]
+    fn resolve_ring_empty_shard() {
+        let (ring, on_ring) = resolve_prover_ring(0, false, &[], &[]);
+        assert_eq!(ring, 0);
+        assert_eq!(on_ring, 1);
+    }
+
+    // ---- compute_shard_ring_info ----
+
+    #[test]
+    fn ring_info_boundaries() {
+        // 0 provers
+        let ri = compute_shard_ring_info(0);
+        assert_eq!(ri.current_ring, 0);
+        assert_eq!(ri.joiner_ring, 0);
+        assert_eq!(ri.active_on_current_ring, 0);
+        assert_eq!(ri.active_on_joiner_ring, 1);
+
+        // 1 prover
+        let ri = compute_shard_ring_info(1);
+        assert_eq!(ri.current_ring, 0);
+        assert_eq!(ri.joiner_ring, 0);
+        assert_eq!(ri.active_on_current_ring, 1);
+        assert_eq!(ri.active_on_joiner_ring, 2);
+
+        // 8 provers (full ring 0)
+        let ri = compute_shard_ring_info(8);
+        assert_eq!(ri.current_ring, 0);
+        assert_eq!(ri.joiner_ring, 1);
+        assert_eq!(ri.active_on_current_ring, 8);
+        assert_eq!(ri.active_on_joiner_ring, 1);
+
+        // 9 provers (ring 0 full, ring 1 has 1)
+        let ri = compute_shard_ring_info(9);
+        assert_eq!(ri.current_ring, 1);
+        assert_eq!(ri.joiner_ring, 1);
+        assert_eq!(ri.active_on_current_ring, 1);
+        assert_eq!(ri.active_on_joiner_ring, 2);
+
+        // 16 provers (ring 0 + ring 1 full)
+        let ri = compute_shard_ring_info(16);
+        assert_eq!(ri.current_ring, 1);
+        assert_eq!(ri.joiner_ring, 2);
+        assert_eq!(ri.active_on_current_ring, 8);
+        assert_eq!(ri.active_on_joiner_ring, 1);
+    }
+
+    // ---- build_allocated_filters ----
+
+    #[test]
+    fn build_filters_active_allocations() {
+        use quil_types::consensus::ProverAllocationInfo;
+
+        let prover = ProverInfo {
+            public_key: vec![],
+            address: vec![1, 2, 3],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![
+                ProverAllocationInfo {
+                    status: ProverStatus::Active,
+                    confirmation_filter: vec![0xAA, 0xBB],
+                    rejection_filter: vec![],
+                    join_frame_number: 100,
+                    leave_frame_number: 0,
+                    pause_frame_number: 0,
+                    resume_frame_number: 0,
+                    kick_frame_number: 0,
+                    join_confirm_frame_number: 0,
+                    join_reject_frame_number: 0,
+                    leave_confirm_frame_number: 0,
+                    leave_reject_frame_number: 0,
+                    last_active_frame_number: 0,
+                    vertex_address: vec![],
+                },
+                ProverAllocationInfo {
+                    status: ProverStatus::Joining,
+                    confirmation_filter: vec![0xCC, 0xDD],
+                    rejection_filter: vec![],
+                    join_frame_number: 900,
+                    leave_frame_number: 0,
+                    pause_frame_number: 0,
+                    resume_frame_number: 0,
+                    kick_frame_number: 0,
+                    join_confirm_frame_number: 0,
+                    join_reject_frame_number: 0,
+                    leave_confirm_frame_number: 0,
+                    leave_reject_frame_number: 0,
+                    last_active_frame_number: 0,
+                    vertex_address: vec![],
+                },
+                // Joining but expired (join_frame=100, current=1000 > 100+720)
+                ProverAllocationInfo {
+                    status: ProverStatus::Joining,
+                    confirmation_filter: vec![0xEE],
+                    rejection_filter: vec![],
+                    join_frame_number: 100,
+                    leave_frame_number: 0,
+                    pause_frame_number: 0,
+                    resume_frame_number: 0,
+                    kick_frame_number: 0,
+                    join_confirm_frame_number: 0,
+                    join_reject_frame_number: 0,
+                    leave_confirm_frame_number: 0,
+                    leave_reject_frame_number: 0,
+                    last_active_frame_number: 0,
+                    vertex_address: vec![],
+                },
+            ],
+            available_storage: 0,
+            seniority: 100,
+            delegate_address: vec![],
+        };
+
+        let filters = build_allocated_filters(&prover, 1000);
+        assert!(filters.contains(&vec![0xAA, 0xBB]));
+        assert!(filters.contains(&vec![0xCC, 0xDD]));
+        // Expired joining allocation should be excluded.
+        assert!(!filters.contains(&vec![0xEE]));
+    }
+}
