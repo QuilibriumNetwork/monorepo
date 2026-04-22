@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"math/big"
+	"slices"
 	"sort"
 	"sync"
 
@@ -413,7 +414,7 @@ func (m *Manager) DecideJoins(
 
 	// If no shards remain, we should warn
 	if len(shards) == 0 {
-		m.logger.Warn("no shards available to decide")
+		m.logger.Warn("no shards available to decide on automatic joins")
 		return nil
 	}
 
@@ -532,6 +533,82 @@ func (m *Manager) DecideJoins(
 		m.logger.Info("decided on pending joins")
 		return m.workerMgr.DecideAllocations(nil, confirm)
 	}
+}
+
+// DecideJoins aims to accept valid manual pending joins.
+func (m *Manager) DecideManualJoins(
+	shards []ShardDescriptor,
+	pending [][]byte,
+) error {
+	if len(pending) == 0 {
+		return nil
+	}
+
+	availableWorkers, err := m.unallocatedWorkerCount()
+	if err != nil {
+		return errors.Wrap(err, "decide manual joins")
+	}
+
+	// If no shards remain, we should warn
+	if len(shards) == 0 {
+		m.logger.Warn("no shards available to decide on manual joins")
+		return nil
+	}
+
+	filters := make([]string, len(shards))
+	for _, s := range shards {
+		filters = append(filters, hex.EncodeToString(s.Filter))
+	}
+
+	reject := make([][]byte, 0, len(pending))
+	confirm := make([][]byte, 0, len(pending))
+
+	for _, p := range pending {
+		if len(p) == 0 {
+			continue
+		}
+		if len(reject) > 99 {
+			break
+		}
+		if len(confirm) > 99 {
+			break
+		}
+
+		key := hex.EncodeToString(p)
+		ok := slices.Contains(filters, key)
+		if !ok {
+			// If a pending shard is missing, we should reject it. This could happen
+			// if shard-out produces a bunch of divisions.
+			pc := make([]byte, len(p))
+			copy(pc, p)
+			reject = append(reject, pc)
+			m.logger.Debug("added missing shard to join reject list", zap.String("shard", hex.EncodeToString(p)))
+			continue
+		}
+
+		pc := make([]byte, len(p))
+		copy(pc, p)
+		confirm = append(confirm, pc)
+		m.logger.Debug("added shard to join confirm list", zap.String("shard", hex.EncodeToString(p)))
+
+	}
+
+	if availableWorkers == 0 && len(confirm) > 0 {
+		m.logger.Info(
+			"skipping confirmations due to lack of available workers",
+			zap.Int("pending_confirmations", len(confirm)),
+		)
+		confirm = nil
+	} else if availableWorkers > 0 && len(confirm) > availableWorkers {
+		m.logger.Warn(
+			"limiting confirmations due to worker capacity",
+			zap.Int("pending_confirmations", len(confirm)),
+			zap.Int("available_workers", availableWorkers),
+		)
+		confirm = confirm[:availableWorkers]
+	}
+	m.logger.Info("decided on manual pending joins")
+	return m.workerMgr.DecideAllocations(reject, confirm)
 }
 
 func (m *Manager) unallocatedWorkerCount() (int, error) {
@@ -747,7 +824,7 @@ func (m *Manager) DecideLeaves(
 			pc := make([]byte, len(p))
 			copy(pc, p)
 			confirm = append(confirm, pc)
-			m.logger.Debug("added shard to leave confirn list", zap.String("shard", hex.EncodeToString(pc)))
+			m.logger.Debug("added shard to leave confirm list", zap.String("shard", hex.EncodeToString(pc)))
 			continue
 		}
 
@@ -770,4 +847,33 @@ func (m *Manager) DecideLeaves(
 
 	m.logger.Info("decided on pending leaves")
 	return m.workerMgr.DecideLeave(reject, confirm)
+}
+
+// DecidemManualLeaves aims to confirm pending leaves after 360 frames.
+func (m *Manager) DecideManualLeaves(
+	pendingLeaves [][]byte,
+) error {
+	if len(pendingLeaves) == 0 {
+		return nil
+	}
+
+	confirm := make([][]byte, 0, len(pendingLeaves))
+
+	for _, p := range pendingLeaves {
+		if len(p) == 0 {
+			continue
+		}
+		if len(confirm) > 99 {
+			break
+		}
+
+		pc := make([]byte, len(p))
+		copy(pc, p)
+		confirm = append(confirm, pc)
+		m.logger.Debug("added shard to leave confirm list", zap.String("shard", hex.EncodeToString(pc)))
+
+	}
+
+	m.logger.Info("decided on pending manual leaves")
+	return m.workerMgr.DecideLeave(nil, confirm)
 }

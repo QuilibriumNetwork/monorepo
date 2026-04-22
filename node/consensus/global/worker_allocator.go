@@ -194,24 +194,22 @@ func (w *WorkerAllocator) evaluateForProposals(
 	}
 
 	w.logAllocationStatus(snapshot)
-	pendingFilters := snapshot.pendingFilters
-	proposalDescriptors := snapshot.proposalDescriptors
 	decideDescriptors := snapshot.decideDescriptors
 	worldBytes := snapshot.worldBytes
 
 	// Filter out manually-managed workers from auto-management decisions.
-	if mmFilters := w.engine.workerManager.ManuallyManagedFilters(); len(mmFilters) > 0 {
-		pendingFilters = filterByteSlices(pendingFilters, mmFilters)
-		snapshot.leaveProposalCandidates = filterDescriptors(snapshot.leaveProposalCandidates, mmFilters)
-		snapshot.pendingLeaveFilters = filterByteSlices(snapshot.pendingLeaveFilters, mmFilters)
-	}
+	mmFilters := w.engine.workerManager.ManuallyManagedFilters()
+	joiningExclFilters, joiningInclFilters := filterByteSlices(snapshot.pendingFilters, mmFilters)
+	leavingExclFilters, leavingInclFilters := filterByteSlices(snapshot.pendingLeaveFilters, mmFilters)
+	proposalDescriptorsExclFilters, proposalDescriptorsInclFilters := filterDescriptors(snapshot.proposalDescriptors, mmFilters)
+	leaveProposalCandidatesExclFilters, _ := filterDescriptors(snapshot.leaveProposalCandidates, mmFilters)
 
 	joinProposedThisCycle := false
-	if len(proposalDescriptors) != 0 && allowProposals {
+	if len(proposalDescriptorsExclFilters) != 0 && allowProposals {
 		if canPropose {
 			proposals, err := w.proposer.PlanAndAllocate(
 				uint64(data.Frame.Header.Difficulty),
-				proposalDescriptors,
+				proposalDescriptorsExclFilters,
 				100,
 				worldBytes,
 				data.Frame.Header.FrameNumber,
@@ -252,11 +250,11 @@ func (w *WorkerAllocator) evaluateForProposals(
 				zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
 			)
 		}
-	} else if len(proposalDescriptors) != 0 && !allowProposals {
+	} else if len(proposalDescriptorsExclFilters) != 0 && !allowProposals {
 		w.engine.logger.Info(
 			"skipping join proposals",
 			zap.String("reason", "all workers have local filters but some may not be allocated in registry"),
-			zap.Int("unallocated_shards", len(proposalDescriptors)),
+			zap.Int("unallocated_shards", len(proposalDescriptorsExclFilters)),
 			zap.Uint64("frame_number", data.Frame.Header.FrameNumber),
 		)
 	}
@@ -265,17 +263,44 @@ func (w *WorkerAllocator) evaluateForProposals(
 		w.checkAndSubmitSeniorityMerge(self, data.Frame.Header.FrameNumber)
 	}
 
-	if len(pendingFilters) != 0 {
+	// Decide on manual joins
+	if len(joiningInclFilters) != 0 {
+		// Build a descriptor list that excludes self's active allocations.
+		pendingSet := make(map[string]struct{}, len(joiningInclFilters))
+		for _, pf := range joiningInclFilters {
+			pendingSet[string(pf)] = struct{}{}
+		}
+		decideCandidates := slices.Clone(proposalDescriptorsInclFilters)
+		for _, d := range decideDescriptors {
+			if _, isPending := pendingSet[string(d.Filter)]; isPending {
+				decideCandidates = append(decideCandidates, d)
+			}
+		}
+		if err := w.proposer.DecideManualJoins(
+			decideCandidates,
+			joiningInclFilters,
+		); err != nil {
+			w.engine.logger.Error("could not decide on manual joins", zap.Error(err))
+		} else {
+			w.engine.logger.Info(
+				"decided on manual joins",
+				zap.Int("joins", len(joiningInclFilters)),
+			)
+		}
+	}
+
+	// Decide on automatic joins
+	if len(joiningExclFilters) != 0 {
 		// Build a descriptor list that excludes self's active allocations.
 		// DecideJoins computes bestScore from this list — if we include
 		// active allocations, their high scores cause perpetual rejection
 		// of pending joins (the proposer compares against shards it can't
 		// actually switch to, creating an infinite propose-reject loop).
-		pendingSet := make(map[string]struct{}, len(pendingFilters))
-		for _, pf := range pendingFilters {
+		pendingSet := make(map[string]struct{}, len(joiningExclFilters))
+		for _, pf := range joiningExclFilters {
 			pendingSet[string(pf)] = struct{}{}
 		}
-		decideCandidates := slices.Clone(proposalDescriptors)
+		decideCandidates := slices.Clone(proposalDescriptorsExclFilters)
 		for _, d := range decideDescriptors {
 			if _, isPending := pendingSet[string(d.Filter)]; isPending {
 				decideCandidates = append(decideCandidates, d)
@@ -284,24 +309,24 @@ func (w *WorkerAllocator) evaluateForProposals(
 		if err := w.proposer.DecideJoins(
 			uint64(data.Frame.Header.Difficulty),
 			decideCandidates,
-			pendingFilters,
+			joiningExclFilters,
 			worldBytes,
 		); err != nil {
 			w.engine.logger.Error("could not decide shard allocations", zap.Error(err))
 		} else {
 			w.engine.logger.Info(
 				"decided on joins",
-				zap.Int("joins", len(pendingFilters)),
+				zap.Int("joins", len(joiningExclFilters)),
 			)
 		}
 	}
 
 	// Leave rebalancing: propose leaves for overcrowded shards
-	if len(snapshot.leaveProposalCandidates) > 0 && canPropose && !joinProposedThisCycle {
+	if len(leaveProposalCandidatesExclFilters) > 0 && canPropose && !joinProposedThisCycle {
 		leaveFilters, err := w.proposer.PlanLeaves(
 			uint64(data.Frame.Header.Difficulty),
-			snapshot.leaveProposalCandidates,
-			proposalDescriptors,
+			leaveProposalCandidatesExclFilters,
+			proposalDescriptorsExclFilters,
 			worldBytes,
 		)
 		if err != nil {
@@ -315,14 +340,28 @@ func (w *WorkerAllocator) evaluateForProposals(
 		}
 	}
 
-	// Decide pending leaves in the 360-720 frame window
-	if len(snapshot.pendingLeaveFilters) > 0 {
+	// Decide on manual leaves
+	if len(leavingInclFilters) > 0 {
+		if err := w.proposer.DecideManualLeaves(
+			leavingInclFilters,
+		); err != nil {
+			w.engine.logger.Error("could not decide on manual leaves", zap.Error(err))
+		} else {
+			w.engine.logger.Info(
+				"decided on manual leaves",
+				zap.Int("leaves", len(leavingInclFilters)),
+			)
+		}
+	}
+
+	// Decide on automatic leaves
+	if len(leavingExclFilters) > 0 {
 		// Build decideCandidates for leaves: unallocated shards + leaving shard descriptors
-		pendingLeaveSet := make(map[string]struct{}, len(snapshot.pendingLeaveFilters))
-		for _, pf := range snapshot.pendingLeaveFilters {
+		pendingLeaveSet := make(map[string]struct{}, len(leavingExclFilters))
+		for _, pf := range leavingExclFilters {
 			pendingLeaveSet[string(pf)] = struct{}{}
 		}
-		leaveDecideCandidates := slices.Clone(proposalDescriptors)
+		leaveDecideCandidates := slices.Clone(proposalDescriptorsExclFilters)
 		for _, d := range decideDescriptors {
 			if _, isLeaving := pendingLeaveSet[string(d.Filter)]; isLeaving {
 				leaveDecideCandidates = append(leaveDecideCandidates, d)
@@ -331,14 +370,14 @@ func (w *WorkerAllocator) evaluateForProposals(
 		if err := w.proposer.DecideLeaves(
 			uint64(data.Frame.Header.Difficulty),
 			leaveDecideCandidates,
-			snapshot.pendingLeaveFilters,
+			leavingExclFilters,
 			worldBytes,
 		); err != nil {
 			w.engine.logger.Error("could not decide leaves", zap.Error(err))
 		} else {
 			w.engine.logger.Info(
 				"decided on leaves",
-				zap.Int("leaves", len(snapshot.pendingLeaveFilters)),
+				zap.Int("leaves", len(leavingExclFilters)),
 			)
 		}
 	}
@@ -1246,26 +1285,33 @@ func (w *WorkerAllocator) getAppShardsFromProver(
 	return response, nil
 }
 
-// filterByteSlices removes entries whose hex encoding appears in the exclude set.
-func filterByteSlices(items [][]byte, exclude map[string]struct{}) [][]byte {
-	out := make([][]byte, 0, len(items))
+// filterByteSlices splits the items set into a set excluding and a set including entries in the exclude set.
+func filterByteSlices(items [][]byte, exclude map[string]struct{}) ([][]byte, [][]byte) {
+	excl := make([][]byte, 0, len(items))
+	incl := make([][]byte, 0, len(items))
 	for _, item := range items {
 		if _, skip := exclude[hex.EncodeToString(item)]; !skip {
-			out = append(out, item)
+			excl = append(excl, item)
+		} else {
+			incl = append(incl, item)
 		}
 	}
-	return out
+	return excl, incl
 }
 
-// filterDescriptors removes ShardDescriptors whose filter hex appears in the exclude set.
-func filterDescriptors(descs []provers.ShardDescriptor, exclude map[string]struct{}) []provers.ShardDescriptor {
-	out := make([]provers.ShardDescriptor, 0, len(descs))
+// filterDescriptors splits ShardDescriptors set into a set excluding and a set including entries in the exclude set.
+func filterDescriptors(descs []provers.ShardDescriptor, exclude map[string]struct{}) ([]provers.ShardDescriptor,
+	[]provers.ShardDescriptor) {
+	excl := make([]provers.ShardDescriptor, 0, len(descs))
+	incl := make([]provers.ShardDescriptor, 0, len(descs))
 	for _, d := range descs {
 		if _, skip := exclude[hex.EncodeToString(d.Filter)]; !skip {
-			out = append(out, d)
+			excl = append(excl, d)
+		} else {
+			incl = append(incl, d)
 		}
 	}
-	return out
+	return excl, incl
 }
 
 // --- Methods moved from global_consensus_engine.go ---
