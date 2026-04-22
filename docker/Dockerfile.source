@@ -22,21 +22,47 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     make \
-    protobuf-compiler \
-    clang \
     autoconf \
     automake \
     libtool \
     libssl-dev \
     libflint-dev \
+    protobuf-compiler \
+    clang \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
-# Stage: flint-builder
-# Purpose: Build FLINT library (slowest component)
+# Stage: gmp-builder
+# Purpose: Build GMP from source as a static, PIC archive. FLINT's static
+# code references internal `__gmpn_*` symbols that aren't guaranteed to be
+# exported by every distro's libgmp.so — users running the binary on a
+# host whose libgmp differs from our build image hit runtime
+# `symbol lookup error: undefined symbol: __gmpn_modexact_1_odd` failures.
+# Bundling GMP into the static link removes that dependency entirely.
 # -----------------------------------------------------------------------------
-FROM base AS flint-builder
+FROM base AS gmp-builder
+
+ARG GMP_VERSION=6.3.0
+RUN wget https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz && \
+    tar -xf gmp-${GMP_VERSION}.tar.xz && \
+    cd gmp-${GMP_VERSION} && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-static \
+        --disable-shared \
+        --with-pic \
+        CFLAGS="-O3" && \
+    make -j$(nproc) && \
+    make install
+
+# -----------------------------------------------------------------------------
+# Stage: flint-builder
+# Purpose: Build FLINT library (slowest component). Inherits the static GMP
+# from gmp-builder so FLINT's static archive links against the same GMP we
+# bundle into the final binary.
+# -----------------------------------------------------------------------------
+FROM gmp-builder AS flint-builder
 
 RUN git clone --branch flint-3.0 --depth 1 https://github.com/flintlib/flint.git && \
     cd flint && \
@@ -47,7 +73,7 @@ RUN git clone --branch flint-3.0 --depth 1 https://github.com/flintlib/flint.git
     --with-mpfr=/usr/local \
     --enable-static \
     --disable-shared \
-    CFLAGS="-O3" && \
+    CFLAGS="-O3 -fPIC" && \
     make -j$(nproc) && \
     make install
 
@@ -111,6 +137,8 @@ RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi
 # Purpose: Aggregate built libraries (Flint + EMP)
 # -----------------------------------------------------------------------------
 FROM base AS libs-context
+# flint-builder inherits from gmp-builder, so copying its /usr/local brings
+# both libflint.a and libgmp.a along in one shot.
 COPY --from=flint-builder /usr/local /usr/local
 COPY --from=emp-builder /usr/local /usr/local
 

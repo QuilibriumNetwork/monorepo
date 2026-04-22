@@ -21,12 +21,12 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     make \
-    protobuf-compiler \
-    clang \
     autoconf \
     automake \
     libtool \
     libssl-dev \
+    protobuf-compiler \
+    clang \
     python3 \
     python-is-python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -46,7 +46,28 @@ RUN apt update && apt install -y wget && \
 
 ENV PATH=$PATH:/usr/local/go/bin
 
-# Build FLINT from source with AVX-512
+# Build GMP from source as a static, PIC archive before FLINT. FLINT's
+# static code references internal `__gmpn_*` symbols that aren't
+# guaranteed to be exported by every host's libgmp.so, so bundle a known
+# GMP into the binary instead of depending on the distro one at runtime.
+ARG GMP_VERSION=6.3.0
+RUN wget https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz && \
+    tar -xf gmp-${GMP_VERSION}.tar.xz && \
+    cd gmp-${GMP_VERSION} && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-static \
+        --disable-shared \
+        --with-pic \
+        CFLAGS="-march=skylake-avx512 -mtune=skylake-avx512 -O3" && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && \
+    rm -rf gmp-${GMP_VERSION} gmp-${GMP_VERSION}.tar.xz
+
+# Build FLINT from source with AVX-512. Links against the static GMP we
+# just installed via --with-gmp=/usr/local. -fPIC lets the static archive
+# slot into the Rust-compiled PIE binary.
 RUN git clone https://github.com/flintlib/flint.git && \
     cd flint && \
     git checkout flint-3.0 && \
@@ -58,7 +79,7 @@ RUN git clone https://github.com/flintlib/flint.git && \
 	      --enable-avx512 \
         --enable-static \
         --disable-shared \
-        CFLAGS="-march=skylake-avx512 -mtune=skylake-avx512 -O3" && \
+        CFLAGS="-march=skylake-avx512 -mtune=skylake-avx512 -O3 -fPIC" && \
     make -j$(nproc) && \
     make install && \
     cd .. && \
