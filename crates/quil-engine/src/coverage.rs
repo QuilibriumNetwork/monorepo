@@ -412,7 +412,7 @@ impl CoverageMonitor {
                 };
                 if streak.count >= effective_grace {
                     any_halted = true;
-                    tracing::warn!(
+                    tracing::debug!(
                         filter = hex::encode(&summary.filter),
                         active,
                         streak = streak.count,
