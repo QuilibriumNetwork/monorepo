@@ -114,7 +114,7 @@ impl ArchiveClient {
                 return Err(e.into());
             }
         };
-        info!(%addr, "archive client connected (mTLS)");
+        debug!(%addr, "archive client connected (mTLS)");
         Ok(Self {
             inner: GlobalServiceClient::new(channel),
             endpoint: addr.to_string(),
