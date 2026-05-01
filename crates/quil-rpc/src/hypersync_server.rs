@@ -25,45 +25,146 @@ use quil_types::proto::application::{
     HypergraphSyncError, HypergraphSyncLeavesResponse, HypergraphSyncQuery,
     HypergraphSyncResponse, LeafData,
 };
-use quil_types::store::ShardKey;
+use quil_types::store::{ShardKey, SnapshotReadable};
 
 const DEFAULT_LEAF_PAGE_SIZE: usize = 1000;
 
 /// HyperSync server implementation.
 pub struct HyperSyncServer {
     hg_store: Arc<RocksHypergraphStore>,
+    /// Optional in-process CRDT used to validate the client's
+    /// `expected_root` against the snapshot generation registry.
+    /// When `None`, sync requests are served against the latest live
+    /// tree (legacy behavior). When `Some` and a request carries a
+    /// non-empty `expected_root`, the server rejects the request if no
+    /// matching snapshot generation exists — mirroring Go's
+    /// `hg.snapshotMgr.acquire(shardKey, expectedRoot)` at
+    /// `hypergraph/sync_client_driven.go:184`.
+    crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
 }
 
 impl HyperSyncServer {
     pub fn new(hg_store: Arc<RocksHypergraphStore>) -> Self {
-        Self { hg_store }
+        Self { hg_store, crdt: None }
+    }
+
+    /// Attach an in-process CRDT so the server can validate
+    /// `expected_root` against the snapshot generation registry.
+    pub fn with_crdt(mut self, crdt: Arc<quil_hypergraph::HypergraphCrdt>) -> Self {
+        self.crdt = Some(crdt);
+        self
     }
 }
 
-/// Load the tree for the given phase from the hypergraph store and
-/// commit it to compute fresh commitments. Returns `None` if the
+/// Load the tree for the given phase + shard key from a
+/// `SnapshotReadable` source (live store OR a captured DB-snapshot)
+/// and commit it to compute fresh commitments. Returns `None` if the
 /// tree doesn't exist (empty node).
+///
+/// Previously this ignored the request's shard_key and always served
+/// the global-prover shard (`L1=[0;3], L2=[0xff;32]`). That silently
+/// returned the wrong tree for any other shard, breaking multi-shard
+/// sync — a Go client requesting a non-global shard would get back
+/// leaves for the global shard and fail commitment verification.
+///
+/// The `source` parameter accepts either the live store or a
+/// generation-bound `SnapshotReadable` — point-in-time reads under
+/// concurrent writes are achieved by passing the latter.
 fn load_tree_for_phase(
-    hg_store: &RocksHypergraphStore,
+    source: &dyn SnapshotReadable,
     phase: HypergraphPhaseSet,
+    shard: ShardKey,
 ) -> Option<VectorCommitmentTree> {
-    let shard = ShardKey {
-        l1: [0u8; 3],
-        l2: [0xffu8; 32],
-    };
     let (set_str, phase_str) = match phase {
         HypergraphPhaseSet::VertexAdds => ("vertex", "adds"),
         HypergraphPhaseSet::VertexRemoves => ("vertex", "removes"),
         HypergraphPhaseSet::HyperedgeAdds => ("hyperedge", "adds"),
         HypergraphPhaseSet::HyperedgeRemoves => ("hyperedge", "removes"),
     };
-    let blob = hg_store.load_tree_blob(set_str, phase_str, &shard).ok().flatten()?;
+    let blob = source.load_tree_blob(set_str, phase_str, &shard).ok().flatten()?;
     let root = deserialize_tree(&blob).ok().flatten()?;
     let mut t = VectorCommitmentTree::new();
     t.root = Some(root);
     let prover = quil_crypto::KzgInclusionProver;
     t.commit(&prover);
     Some(t)
+}
+
+/// Parse a pagination continuation token. Mirrors Go's
+/// `parseContToken` at `hypergraph/sync_client_driven.go:456-470`:
+/// the token is the ASCII hex encoding of a 4-byte big-endian int32.
+/// Returns `None` for an empty token (meaning "start from 0") or on
+/// malformed input.
+fn parse_continuation_token(token: &[u8]) -> Option<usize> {
+    if token.is_empty() {
+        return None;
+    }
+    let s = std::str::from_utf8(token).ok()?;
+    if s.len() != 8 {
+        return None;
+    }
+    let mut buf = [0u8; 4];
+    for i in 0..4 {
+        let hi = hex_nibble(s.as_bytes()[2 * i])?;
+        let lo = hex_nibble(s.as_bytes()[2 * i + 1])?;
+        buf[i] = (hi << 4) | lo;
+    }
+    Some(u32::from_be_bytes(buf) as usize)
+}
+
+/// Emit a pagination continuation token for `idx`. Mirrors Go's
+/// `makeContToken` at `:472-474`: ASCII hex of 4 big-endian bytes.
+fn make_continuation_token(idx: usize) -> Vec<u8> {
+    let be = (idx as u32).to_be_bytes();
+    let mut out = Vec::with_capacity(8);
+    for b in be {
+        out.push(hex_char(b >> 4));
+        out.push(hex_char(b & 0x0f));
+    }
+    out
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_char(n: u8) -> u8 {
+    match n {
+        0..=9 => b'0' + n,
+        10..=15 => b'a' + (n - 10),
+        _ => b'?',
+    }
+}
+
+/// Canonical global-prover shard key. Fallback when the request
+/// omits a shard key, matching the implicit default on the Go side.
+fn global_prover_shard() -> ShardKey {
+    ShardKey {
+        l1: [0u8; 3],
+        l2: [0xffu8; 32],
+    }
+}
+
+/// Resolve a request's shard key into the backing store's `ShardKey`.
+/// Proto carries the 32-byte shard_address; we derive the 3-byte L1
+/// bloom via SHAKE256-based `GetBloomFilterIndices(addr, 256, 3)` —
+/// matching Go's `node/store/hypergraph.go:2083` and
+/// `quil_hypergraph::addressing::shard_key_for_location`.
+/// Empty → global prover shard.
+fn shard_key_from_bytes(shard_bytes: &[u8]) -> ShardKey {
+    if shard_bytes.is_empty() {
+        return global_prover_shard();
+    }
+    let mut l2 = [0u8; 32];
+    let n = shard_bytes.len().min(32);
+    l2[..n].copy_from_slice(&shard_bytes[..n]);
+    let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&l2, 256, 3);
+    ShardKey { l1, l2 }
 }
 
 /// Navigate from the tree root to the node at `path` (sequence of
@@ -264,13 +365,62 @@ impl HypergraphComparisonService for HyperSyncServer {
         request: Request<Streaming<HypergraphSyncQuery>>,
     ) -> Result<Response<Self::PerformSyncStream>, Status> {
         let hg_store = self.hg_store.clone();
+        let crdt = self.crdt.clone();
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<HypergraphSyncResponse, Status>>(16);
 
         tokio::spawn(async move {
             // Cache one tree per phase so the client can stream
             // multi-phase queries on the same RPC without reloading.
-            let mut trees: HashMap<i32, VectorCommitmentTree> = HashMap::new();
+            // Cache tree per (phase, shard_key) — single cache on
+            // phase alone would cross-serve shards.
+            let mut trees: HashMap<(i32, ShardKey), VectorCommitmentTree> = HashMap::new();
+
+            // Mirrors Go's `hg.snapshotMgr.acquire(shardKey, expectedRoot)`
+            // at `hypergraph/sync_client_driven.go:184`. When the client
+            // pinned a specific root, reject the query if no matching
+            // generation exists in the registry. On match, return the
+            // generation handle whose `db_snapshot` (if Some) the
+            // caller should use as the tree-read source — this gives
+            // point-in-time-consistent reads under concurrent writes
+            // to the live store. When no generation-bound snapshot
+            // exists, the caller falls back to the live store.
+            let acquire_snapshot_for = |expected_root: &[u8]|
+                -> Result<Option<quil_hypergraph::GenerationHandle>, HypergraphSyncResponse>
+            {
+                if expected_root.is_empty() {
+                    return Ok(None);
+                }
+                if let Some(c) = crdt.as_ref() {
+                    match c.acquire_snapshot(expected_root) {
+                        Some(handle) => Ok(Some(handle)),
+                        None => Err(err_response(
+                            format!(
+                                "expected_root {} not in snapshot registry",
+                                hex::encode(expected_root),
+                            ),
+                            Vec::new(),
+                        )),
+                    }
+                } else {
+                    // No CRDT bound → can't validate, accept (legacy).
+                    Ok(None)
+                }
+            };
+
+            // Resolve the read source for a sync request: the bound
+            // DB-snapshot when the generation has one, otherwise the
+            // live store.
+            let read_source = |handle: &Option<quil_hypergraph::GenerationHandle>|
+                -> std::sync::Arc<dyn SnapshotReadable>
+            {
+                if let Some(h) = handle {
+                    if let Some(snap) = h.db_snapshot.clone() {
+                        return snap;
+                    }
+                }
+                hg_store.clone() as std::sync::Arc<dyn SnapshotReadable>
+            };
 
             while let Some(query) = inbound.next().await {
                 let query = match query {
@@ -283,14 +433,28 @@ impl HypergraphComparisonService for HyperSyncServer {
 
                 let response = match query.request {
                     Some(hypergraph_sync_query::Request::GetBranch(req)) => {
+                        let handle = match acquire_snapshot_for(&req.expected_root) {
+                            Ok(h) => h,
+                            Err(err) => {
+                                if tx.send(Ok(err)).await.is_err() { break; }
+                                continue;
+                            }
+                        };
+                        let source = read_source(&handle);
                         let phase = HypergraphPhaseSet::try_from(req.phase_set)
                             .unwrap_or(HypergraphPhaseSet::VertexAdds);
-                        if !trees.contains_key(&req.phase_set) {
-                            if let Some(t) = load_tree_for_phase(&hg_store, phase) {
-                                trees.insert(req.phase_set, t);
+                        let shard = shard_key_from_bytes(&req.shard_key);
+                        // Cache key is (phase, shard) — a single cache
+                        // keyed only on phase would mix shards and serve
+                        // the wrong tree after the first request for a
+                        // different shard.
+                        let cache_key: (i32, ShardKey) = (req.phase_set, shard.clone());
+                        if !trees.contains_key(&cache_key) {
+                            if let Some(t) = load_tree_for_phase(source.as_ref(), phase, shard.clone()) {
+                                trees.insert(cache_key.clone(), t);
                             }
                         }
-                        match trees.get(&req.phase_set) {
+                        match trees.get(&cache_key) {
                             Some(tree) => {
                                 if req.path.is_empty() {
                                     HypergraphSyncResponse {
@@ -332,14 +496,24 @@ impl HypergraphComparisonService for HyperSyncServer {
                         }
                     }
                     Some(hypergraph_sync_query::Request::GetLeaves(req)) => {
+                        let handle = match acquire_snapshot_for(&req.expected_root) {
+                            Ok(h) => h,
+                            Err(err) => {
+                                if tx.send(Ok(err)).await.is_err() { break; }
+                                continue;
+                            }
+                        };
+                        let source = read_source(&handle);
                         let phase = HypergraphPhaseSet::try_from(req.phase_set)
                             .unwrap_or(HypergraphPhaseSet::VertexAdds);
-                        if !trees.contains_key(&req.phase_set) {
-                            if let Some(t) = load_tree_for_phase(&hg_store, phase) {
-                                trees.insert(req.phase_set, t);
+                        let shard = shard_key_from_bytes(&req.shard_key);
+                        let cache_key: (i32, ShardKey) = (req.phase_set, shard.clone());
+                        if !trees.contains_key(&cache_key) {
+                            if let Some(t) = load_tree_for_phase(source.as_ref(), phase, shard.clone()) {
+                                trees.insert(cache_key.clone(), t);
                             }
                         }
-                        match trees.get(&req.phase_set) {
+                        match trees.get(&cache_key) {
                             Some(tree) => match tree.root.as_ref() {
                                 Some(root) => {
                                     // Navigate to the requested subtree root.
@@ -356,14 +530,17 @@ impl HypergraphComparisonService for HyperSyncServer {
                                         Some(node) => {
                                             let leaves = collect_leaves(node);
 
-                                            let start = if req.continuation_token.is_empty() {
-                                                0usize
-                                            } else {
-                                                String::from_utf8_lossy(&req.continuation_token)
-                                                    .trim()
-                                                    .parse::<usize>()
-                                                    .unwrap_or(0)
-                                            };
+                                            // Continuation token format — must match Go at
+                                            // `hypergraph/sync_client_driven.go:456-474`:
+                                            // hex-encoded ASCII of a 4-byte big-endian int32.
+                                            // Go sends "000003e8" for index 1000; parsing
+                                            // that as decimal (old behavior) would fall back
+                                            // to 0 via unwrap_or, serving page 0 forever and
+                                            // corrupting cross-impl sync.
+                                            let start = parse_continuation_token(
+                                                &req.continuation_token,
+                                            )
+                                            .unwrap_or(0);
                                             let max = if req.max_leaves == 0 {
                                                 DEFAULT_LEAF_PAGE_SIZE
                                             } else {
@@ -372,7 +549,7 @@ impl HypergraphComparisonService for HyperSyncServer {
                                             let end = (start + max).min(leaves.len());
                                             let page = leaves[start..end].to_vec();
                                             let cont = if end < leaves.len() {
-                                                end.to_string().into_bytes()
+                                                make_continuation_token(end)
                                             } else {
                                                 Vec::new()
                                             };

@@ -62,13 +62,13 @@ impl<S: Unique, V: Unique> StateProducer<S, V> {
                 if e.is_no_vote() {
                     QuilError::NoVote(format!(
                         "unsafe to vote for own proposal on top of {}: {}",
-                        qc.identity(),
+                        hex::encode(qc.identity()),
                         e
                     ))
                 } else {
                     QuilError::Consensus(format!(
                         "could not build state proposal on top of {}: {}",
-                        qc.identity(),
+                        hex::encode(qc.identity()),
                         e
                     ))
                 }
@@ -86,13 +86,13 @@ impl<S: Unique, V: Unique> StateProducer<S, V> {
                 if e.is_no_vote() {
                     QuilError::NoVote(format!(
                         "unsafe to sign own proposal on top of {}: {}",
-                        qc.identity(),
+                        hex::encode(qc.identity()),
                         e
                     ))
                 } else {
                     QuilError::Consensus(format!(
                         "could not vote on state proposal on top of {}: {}",
-                        qc.identity(),
+                        hex::encode(qc.identity()),
                         e
                     ))
                 }
@@ -120,6 +120,7 @@ fn state_from<S: Unique>(
     state.parent_qc_rank = parent_qc.rank();
     Proposal {
         state,
+        parent_quorum_certificate: Arc::clone(parent_qc),
         previous_rank_timeout_certificate: previous_rank_timeout_cert,
     }
 }
@@ -228,13 +229,13 @@ mod tests {
             }
             Ok(State {
                 rank,
-                identifier: format!("state-{}", rank),
-                proposer_id: "leader".into(),
+                identifier: format!("state-{}", rank).into_bytes(),
+                proposer_id: b"leader".to_vec(),
                 parent_qc_identity: prior_state.clone(),
                 parent_qc_rank: rank.saturating_sub(1),
                 timestamp: 0,
                 state: AppState {
-                    id: format!("state-{}", rank),
+                    id: format!("state-{}", rank).into_bytes(),
                     rank,
                 },
             })
@@ -271,7 +272,7 @@ mod tests {
                 });
             }
             Ok(TVote {
-                id: format!("vote-{}", proposal.state.rank),
+                id: format!("vote-{}", proposal.state.rank).into_bytes(),
                 rank: proposal.state.rank,
             })
         }
@@ -298,13 +299,13 @@ mod tests {
         let sp = producer.make_state_proposal(5, qc, None).unwrap();
         assert_eq!(sp.proposal.state.rank, 5);
         assert_eq!(sp.proposal.state.parent_qc_rank, 4);
-        assert_eq!(sp.proposal.state.parent_qc_identity, "parent-4");
+        assert_eq!(sp.proposal.state.parent_qc_identity, b"parent-4".to_vec());
         assert_eq!(sp.vote.rank, 5);
         let calls = lp.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, 5);
         assert_eq!(calls[0].1, b"filter");
-        assert_eq!(calls[0].2, "parent-4");
+        assert_eq!(calls[0].2, b"parent-4".to_vec());
     }
 
     #[test]

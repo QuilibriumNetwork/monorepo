@@ -15,8 +15,9 @@ use std::fmt;
 use quil_consensus::models::{Identity, Unique};
 
 /// Global chain state = a frame header. The "unique identity" is the
-/// hex-encoded SHA3-256 of the output field, matching Go's
-/// `getIdentifier` on `GlobalFrame`.
+/// 32-byte big-endian Poseidon hash of the `output` field, matching
+/// Go's `GlobalFrame.Identity()` at `protobufs/global.go:142-149`
+/// (`poseidon.HashBytes(g.Header.Output).FillBytes(make([]byte, 32))`).
 #[derive(Clone)]
 pub struct GlobalState {
     pub frame_number: u64,
@@ -29,10 +30,25 @@ pub struct GlobalState {
     pub prover_tree_commitment: Vec<u8>,
     pub requests_root: Vec<u8>,
     pub signature: Vec<u8>,
-    /// Cached identity (hex of SHA-256 of output). Avoids re-hashing on every call.
-    identity_cache: String,
-    /// Cached source (hex-encoded prover address). Avoids re-encoding on every call.
-    source_cache: String,
+    /// Inbound message bundles attached to this proposal, decoded
+    /// into the prost proto type used by the materializer. Populated
+    /// by the leader at `prove_next_state` (canonical bytes from
+    /// `MessageCollector` → `decode_message_bundle`), carried through
+    /// the consensus state, embedded into the wire `GlobalFrame.requests`
+    /// field by `on_own_proposal`, and reconstituted on the receiver
+    /// via `wire_proposal_to_signed`. The `on_finalized_state` hook
+    /// re-attaches them to the persisted frame so the materializer
+    /// iterates them on finalization to apply transactions
+    /// (ProverJoin/Confirm/Leave, token, compute, hypergraph).
+    /// Without this, requests_root is hashed from collected messages
+    /// but the wire frame ships an empty requests Vec — receivers'
+    /// materializers see no work to do and the registry never
+    /// updates.
+    pub messages: Vec<quil_types::proto::global::MessageBundle>,
+    /// Cached identity (raw 32-byte Poseidon of `output`).
+    identity_cache: Vec<u8>,
+    /// Cached source (raw prover bytes).
+    source_cache: Vec<u8>,
 }
 
 impl GlobalState {
@@ -51,7 +67,7 @@ impl GlobalState {
         signature: Vec<u8>,
     ) -> Self {
         let identity_cache = compute_output_identity(&output);
-        let source_cache = hex::encode(&prover);
+        let source_cache = prover.clone();
         Self {
             frame_number,
             rank,
@@ -63,15 +79,28 @@ impl GlobalState {
             prover_tree_commitment,
             requests_root,
             signature,
+            messages: Vec::new(),
             identity_cache,
             source_cache,
         }
     }
 
+    /// Attach the leader's collected message bundles to this state.
+    /// Called in `prove_next_state` after `MessageCollector::collect_for_rank`
+    /// so the wire-encode path in `on_own_proposal` can populate
+    /// `GlobalFrame.requests`.
+    pub fn with_messages(
+        mut self,
+        messages: Vec<quil_types::proto::global::MessageBundle>,
+    ) -> Self {
+        self.messages = messages;
+        self
+    }
+
     /// Create from a prost GlobalFrameHeader.
     pub fn from_header(h: &quil_types::proto::global::GlobalFrameHeader) -> Self {
         let identity_cache = compute_output_identity(&h.output);
-        let source_cache = hex::encode(&h.prover);
+        let source_cache = h.prover.clone();
         Self {
             frame_number: h.frame_number,
             rank: h.rank,
@@ -87,6 +116,7 @@ impl GlobalState {
                 .as_ref()
                 .map(|s| s.signature.clone())
                 .unwrap_or_default(),
+            messages: Vec::new(),
             identity_cache,
             source_cache,
         }
@@ -97,9 +127,15 @@ impl GlobalState {
     }
 }
 
-fn compute_output_identity(output: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(output))
+/// Compute the 32-byte big-endian Poseidon hash of a frame's `output`
+/// field. Mirrors Go's `GlobalFrame.Identity()` at
+/// `protobufs/global.go:142-149`. Panics on poseidon failure (an
+/// empty `output` is an unrecoverable consensus invariant violation
+/// that Go would also fail on).
+fn compute_output_identity(output: &[u8]) -> Vec<u8> {
+    quil_crypto::poseidon::hash_bytes_to_32(output)
+        .expect("poseidon hash of frame output must succeed")
+        .to_vec()
 }
 
 impl fmt::Debug for GlobalState {
@@ -134,6 +170,17 @@ impl Unique for GlobalState {
 }
 
 /// Global chain vote = a BLS48-581 aggregate signature over a proposal.
+///
+/// Semantics mirror Go's `protobufs/global.go::ProposalVote`:
+/// - `identity` = signer/voter id (the address that produced the vote)
+/// - `source` = the proposal id this vote points to (what's being voted for)
+///
+/// The cache and vote-collector code in `quil-consensus` keys by signer
+/// (i.e. `vote.identity()`) and asserts `vote.source() == state.identifier`,
+/// so the labels here must follow the Go convention exactly. Earlier
+/// drafts of this port had the labels swapped, which made the votes
+/// cache flag every distinct voter for the same proposal as a
+/// double-vote and prevented QC formation.
 #[derive(Clone)]
 pub struct GlobalVote {
     identity: Identity,
@@ -153,10 +200,11 @@ impl GlobalVote {
         signature: Vec<u8>,
         bitmask: Vec<u8>,
     ) -> Self {
+        // Match Go: identity = voter, source = proposal id.
         Self {
-            identity: proposal_identity,
+            identity: voter_identity,
             rank,
-            source: voter_identity,
+            source: proposal_identity,
             timestamp,
             signature_bytes: signature,
             bitmask,
@@ -220,9 +268,12 @@ pub fn wire_proposal_to_signed(
             "GlobalProposal: embedded frame missing header".into(),
         )
     })?;
+    let frame_requests = frame.requests;
 
     // 2. Build GlobalState (identity = SHA-256(output), source = hex(prover))
-    let state = GlobalState::from_header(&header);
+    //    plus the inbound message bundles so the materializer sees
+    //    them when this state is finalized.
+    let state = GlobalState::from_header(&header).with_messages(frame_requests);
     let identifier = state.compute_identity();
 
     // 3. Convert the wire QC to a trait object — the event loop accepts it
@@ -240,7 +291,7 @@ pub fn wire_proposal_to_signed(
     let consensus_state = quil_consensus::models::State {
         rank: wire.vote.rank,
         identifier: identifier.clone(),
-        proposer_id: hex::encode(&wire.vote.address),
+        proposer_id: wire.vote.address.clone(),
         parent_qc_identity,
         parent_qc_rank,
         timestamp: wire.vote.timestamp,
@@ -251,7 +302,7 @@ pub fn wire_proposal_to_signed(
     let vote = GlobalVote::new(
         identifier,
         wire.vote.rank,
-        hex::encode(&wire.vote.address),
+        wire.vote.address.clone(),
         wire.vote.timestamp,
         wire.vote.signature,
         Vec::new(),
@@ -259,6 +310,7 @@ pub fn wire_proposal_to_signed(
 
     let proposal = quil_consensus::models::Proposal {
         state: consensus_state,
+        parent_quorum_certificate: std::sync::Arc::clone(&parent_qc),
         previous_rank_timeout_certificate: prior_tc.clone(),
     };
     let signed = quil_consensus::models::SignedProposal { proposal, vote };
@@ -277,14 +329,14 @@ pub fn build_genesis_certified_state(
 
     // Genesis QC identity = Poseidon(output)
     let qc_identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-        .map(|h| hex::encode(h))
+        .map(|h| h.to_vec())
         .unwrap_or_default();
 
     quil_consensus::models::CertifiedState {
         state: quil_consensus::models::State {
             rank: header.rank,
             identifier: identity,
-            proposer_id: hex::encode(&header.prover),
+            proposer_id: header.prover.clone(),
             parent_qc_identity: qc_identity.clone(),
             parent_qc_rank: header.rank.saturating_sub(1),
             timestamp: header.timestamp as u64,
@@ -351,16 +403,16 @@ mod tests {
     #[test]
     fn global_vote_unique_trait() {
         let vote = GlobalVote::new(
-            "proposal-hash".into(),
+            b"proposal-hash".to_vec(),
             3,
-            "voter-id".into(),
+            b"voter-id".to_vec(),
             5000,
             vec![0xAAu8; 74],
             vec![0x01],
         );
-        assert_eq!(vote.identity(), "proposal-hash");
+        assert_eq!(vote.identity().as_slice(), b"proposal-hash");
         assert_eq!(vote.rank(), 3);
-        assert_eq!(vote.source(), "voter-id");
+        assert_eq!(vote.source().as_slice(), b"voter-id");
         assert_eq!(vote.timestamp(), 5000);
         assert_eq!(vote.signature(), &[0xAAu8; 74][..]);
     }

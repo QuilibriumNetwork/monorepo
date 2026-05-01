@@ -263,12 +263,12 @@ mod tests {
             rank,
             latest_quorum_certificate: Arc::new(StubQc {
                 rank: rank.saturating_sub(1),
-                id: format!("qc-{}", rank - 1),
+                id: format!("qc-{}", rank - 1).into_bytes(),
             }),
             prior_rank_timeout_certificate: None,
             vote: V {
-                id: format!("to-{}", rank),
-                src: "self".into(),
+                id: format!("to-{}", rank).into_bytes(),
+                src: b"self".to_vec(),
                 rank,
             },
             timeout_tick: 0,

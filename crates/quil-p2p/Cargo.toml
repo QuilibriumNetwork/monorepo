@@ -36,6 +36,7 @@ ed448-rust = { path = "../ed448-rust" }
 libp2p-identity = { version = "0.2", features = ["ed448"] }
 void = "1"
 snow = "0.9"
+bs58 = "0.5"
 
 [build-dependencies]
 prost-build = "0.13"

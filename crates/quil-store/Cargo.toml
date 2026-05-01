@@ -8,6 +8,8 @@ description = "RocksDB-backed storage implementations for the Quilibrium node"
 [dependencies]
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
+quil-hypergraph = { path = "../quil-hypergraph" }
+quil-crypto = { path = "../quil-crypto" }
 rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
 prost = "0.13"
 thiserror = "2"

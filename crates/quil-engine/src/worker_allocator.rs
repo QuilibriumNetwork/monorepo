@@ -21,8 +21,9 @@ use crate::worker::WorkerInfo;
 pub const PROPOSAL_TIMEOUT_FRAMES: u64 = 10;
 /// Pending join/leave not confirmed within this many frames → clear.
 pub const PENDING_FILTER_GRACE_FRAMES: u64 = 720;
-/// Confirm join after this many frames.
-pub const CONFIRM_WINDOW_FRAMES: u64 = 360;
+// Confirm window lives on `ProverLifecycle` so testnet bootstraps can
+// override it to a small value. Mainnet default is 360 — see
+// `crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES`.
 /// Minimum frames between join attempts.
 ///
 /// Single source of truth — ProverLifecycle consults
@@ -50,6 +51,21 @@ pub struct WorkerAllocator {
     local_prover_address: Vec<u8>,
     /// Last frame where a join was attempted (debounce).
     last_join_attempt_frame: std::sync::atomic::AtomicU64,
+    /// Last frame where a forced-reject batch was emitted. Used by
+    /// `ProverLifecycle::evaluate` to cool down excess-pending-join
+    /// rejections (matches Go's `engine.lastRejectFrame` at
+    /// `worker_allocator.go:1395-1412`).
+    last_reject_frame: std::sync::atomic::AtomicU64,
+    /// Last frame where a seniority-merge attempt was made. Matches
+    /// Go's `lastSeniorityMergeFrame` (worker_allocator.go:980-998) —
+    /// 10-frame cooldown between attempts.
+    last_seniority_merge_frame: std::sync::atomic::AtomicU64,
+    /// Cached aggregated-seniority estimate for our local peer IDs
+    /// (own + any `multisig_prover_enrollment_paths`), computed once at
+    /// startup from `seniority_compat::get_aggregated_seniority`. Matches
+    /// Go's `estimateSeniorityFromConfig` return value. `u64::MAX`
+    /// sentinel means "not yet computed"; lifecycle treats that as 0.
+    config_seniority_estimate: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerAllocator {
@@ -63,7 +79,51 @@ impl WorkerAllocator {
             prover_registry,
             local_prover_address,
             last_join_attempt_frame: std::sync::atomic::AtomicU64::new(0),
+            last_reject_frame: std::sync::atomic::AtomicU64::new(0),
+            last_seniority_merge_frame: std::sync::atomic::AtomicU64::new(0),
+            config_seniority_estimate: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// Cached config-derived seniority estimate. Computed once at
+    /// startup by the node binary (which has the config + local peer
+    /// key available). 0 if not wired.
+    pub fn config_seniority_estimate(&self) -> u64 {
+        let v = self
+            .config_seniority_estimate
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if v == u64::MAX { 0 } else { v }
+    }
+
+    /// Record the config-derived seniority estimate at startup.
+    pub fn set_config_seniority_estimate(&self, estimate: u64) {
+        self.config_seniority_estimate
+            .store(estimate, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Most recent frame at which a seniority-merge attempt was made.
+    pub fn last_seniority_merge_attempt(&self) -> u64 {
+        self.last_seniority_merge_frame
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that this node emitted a seniority merge at `frame_number`.
+    pub fn set_last_seniority_merge_attempt(&self, frame_number: u64) {
+        self.last_seniority_merge_frame
+            .store(frame_number, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Most recent frame at which this node emitted a forced-reject
+    /// batch for excess pending joins.
+    pub fn last_reject_attempt(&self) -> u64 {
+        self.last_reject_frame
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that this node emitted a forced-reject at `frame_number`.
+    pub fn set_last_reject_attempt(&self, frame_number: u64) {
+        self.last_reject_frame
+            .store(frame_number, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Most recent frame at which this node emitted a join proposal.
@@ -116,15 +176,31 @@ impl WorkerAllocator {
 
             match alloc_by_filter.get(&worker.filter) {
                 Some(alloc) => {
+                    // Tier-5 #8/#9: compute desired_allocated AFTER the
+                    // expired-join/leave reset, mirroring Go's
+                    // worker_allocator.go:421-422 + 781-816. Paused
+                    // counts as "desired allocated" alongside Active —
+                    // the registry maintains the filter binding while
+                    // the worker pauses.
+                    let mut desired_allocated = matches!(
+                        alloc.status,
+                        ProverStatus::Active | ProverStatus::Paused
+                    );
+
                     match alloc.status {
                         ProverStatus::Active | ProverStatus::Paused => {
                             // Confirmed allocation — worker is correctly assigned
                         }
                         ProverStatus::Joining => {
-                            // Pending join — check if it's been too long
+                            // Tier-5 #9: expired join (frame >
+                            // join_frame + 720) is implicitly rejected —
+                            // clear allocated flag so the proposer
+                            // restarts a fresh join. Mirrors Go's
+                            // worker_allocator.go:781-784.
                             if alloc.join_frame_number > 0
                                 && frame_number > alloc.join_frame_number + PENDING_FILTER_GRACE_FRAMES
                             {
+                                desired_allocated = false;
                                 info!(
                                     core_id = worker.core_id,
                                     filter = hex::encode(&worker.filter),
@@ -136,6 +212,7 @@ impl WorkerAllocator {
                         }
                         ProverStatus::Left | ProverStatus::Rejected | ProverStatus::Kicked => {
                             // Allocation ended — clear immediately
+                            desired_allocated = false;
                             info!(
                                 core_id = worker.core_id,
                                 filter = hex::encode(&worker.filter),
@@ -146,10 +223,24 @@ impl WorkerAllocator {
                         }
                         _ => {}
                     }
+
+                    // Plumb desired_allocated → WorkerInfo.allocated.
+                    // The lifecycle layer reads this for
+                    // unallocatedWorkerCount → decide_joins
+                    // availableWorkers cap (Go proposer.go:537-553).
+                    if worker.allocated != desired_allocated {
+                        let _ = self
+                            .worker_manager
+                            .set_allocated(worker.core_id, desired_allocated);
+                    }
                 }
                 None => {
                     // Worker has a filter but no matching registry allocation.
                     // This means our proposal was never picked up.
+                    // Filter-pinned but unallocated — flag accordingly.
+                    if worker.allocated {
+                        let _ = self.worker_manager.set_allocated(worker.core_id, false);
+                    }
                     if worker.pending_filter_frame > 0
                         && frame_number > worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES
                     {
@@ -195,7 +286,16 @@ impl WorkerAllocator {
         idle_workers.sort();
 
         for alloc in &prover.allocations {
-            if alloc.status != ProverStatus::Active && alloc.status != ProverStatus::Joining {
+            // Only spawn the per-shard worker (which boots an
+            // AppConsensusEngine) once the allocation is *Active*.
+            // While the alloc is `Joining`, the registry has no
+            // Active prover under this filter, so the engine's
+            // `leader_for_rank(0)` lookup fails with "shard trie
+            // empty" and the consensus event loop exits — leaving
+            // the worker zombie-ed (filter assigned, engine dead)
+            // until the next deallocate. Active is the first state
+            // where leader election can resolve, so wait for it.
+            if alloc.status != ProverStatus::Active {
                 continue;
             }
             if assigned_filters.contains(&alloc.confirmation_filter) {
@@ -332,6 +432,7 @@ mod tests {
                     total_storage: 0,
                     manually_managed: false,
                     pending_filter_frame: 0,
+                    allocated: !f.is_empty(),
                 })
                 .collect())
         }

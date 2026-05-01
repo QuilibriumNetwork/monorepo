@@ -244,7 +244,7 @@ impl WeightedSignatureAggregatorImpl {
 impl WeightedSignatureAggregator for WeightedSignatureAggregatorImpl {
     fn verify(&self, signer_id: &Identity, sig: &[u8]) -> Result<()> {
         let info = self.id_to_info.get(signer_id).ok_or_else(|| {
-            QuilError::InvalidSigner(format!("{} is not an authorized signer", signer_id))
+            QuilError::InvalidSigner(format!("{} is not an authorized signer", hex::encode(signer_id)))
         })?;
         let ok = self.aggregator.verify_signature_raw(
             &info.public_key,
@@ -255,7 +255,7 @@ impl WeightedSignatureAggregator for WeightedSignatureAggregatorImpl {
         if !ok {
             return Err(QuilError::InvalidSignature(format!(
                 "invalid signature from {}",
-                signer_id
+                hex::encode(signer_id)
             )));
         }
         Ok(())
@@ -263,13 +263,13 @@ impl WeightedSignatureAggregator for WeightedSignatureAggregatorImpl {
 
     fn trusted_add(&self, signer_id: &Identity, sig: &[u8]) -> Result<u64> {
         let info = self.id_to_info.get(signer_id).ok_or_else(|| {
-            QuilError::InvalidSigner(format!("{} is not an authorized signer", signer_id))
+            QuilError::InvalidSigner(format!("{} is not an authorized signer", hex::encode(signer_id)))
         })?;
         let mut guard = self.state.write().unwrap();
         if guard.collected.contains_key(signer_id) {
             return Err(QuilError::DuplicatedSigner(format!(
                 "signature from {} was already added",
-                signer_id
+                hex::encode(signer_id)
             )));
         }
         guard.collected.insert(signer_id.clone(), sig.to_vec());
@@ -403,7 +403,7 @@ impl TimeoutSignatureAggregator for TimeoutSignatureAggregatorImpl {
         newest_qc_rank: u64,
     ) -> Result<u64> {
         let info = self.id_to_info.get(signer_id).ok_or_else(|| {
-            QuilError::InvalidSigner(format!("{} is not an authorized signer", signer_id))
+            QuilError::InvalidSigner(format!("{} is not an authorized signer", hex::encode(signer_id)))
         })?;
 
         // Fast check: already added?
@@ -412,7 +412,7 @@ impl TimeoutSignatureAggregator for TimeoutSignatureAggregatorImpl {
             if guard.signatures.contains_key(signer_id) {
                 return Err(QuilError::DuplicatedSigner(format!(
                     "signature from {} was already added",
-                    signer_id
+                    hex::encode(signer_id)
                 )));
             }
         }
@@ -428,7 +428,7 @@ impl TimeoutSignatureAggregator for TimeoutSignatureAggregatorImpl {
         if !valid {
             return Err(QuilError::InvalidSignature(format!(
                 "invalid signature from {}",
-                signer_id
+                hex::encode(signer_id)
             )));
         }
 
@@ -437,7 +437,7 @@ impl TimeoutSignatureAggregator for TimeoutSignatureAggregatorImpl {
         if guard.signatures.contains_key(signer_id) {
             return Err(QuilError::DuplicatedSigner(format!(
                 "signature from {} was already added",
-                signer_id
+                hex::encode(signer_id)
             )));
         }
         guard.signatures.insert(
@@ -642,21 +642,21 @@ mod tests {
     #[test]
     fn verify_unknown_signer_is_invalid_signer() {
         let agg = build_agg(vec![("alice", b"pkA", 1)]);
-        let err = agg.verify(&"bob".to_string(), b"good").unwrap_err();
+        let err = agg.verify(&b"bob".to_vec(), b"good").unwrap_err();
         assert!(err.is_invalid_signer());
     }
 
     #[test]
     fn verify_bad_signature_is_invalid_signature() {
         let agg = build_agg(vec![("alice", b"pkA", 1)]);
-        let err = agg.verify(&"alice".to_string(), b"bad").unwrap_err();
+        let err = agg.verify(&b"alice".to_vec(), b"bad").unwrap_err();
         assert!(err.is_invalid_signature());
     }
 
     #[test]
     fn verify_good_signature_succeeds() {
         let agg = build_agg(vec![("alice", b"pkA", 1)]);
-        agg.verify(&"alice".to_string(), b"good").unwrap();
+        agg.verify(&b"alice".to_vec(), b"good").unwrap();
     }
 
     #[test]
@@ -666,9 +666,9 @@ mod tests {
             ("bob", b"pkB", 5),
         ]);
         assert_eq!(agg.total_weight(), 0);
-        let w1 = agg.trusted_add(&"alice".to_string(), b"good").unwrap();
+        let w1 = agg.trusted_add(&b"alice".to_vec(), b"good").unwrap();
         assert_eq!(w1, 3);
-        let w2 = agg.trusted_add(&"bob".to_string(), b"good").unwrap();
+        let w2 = agg.trusted_add(&b"bob".to_vec(), b"good").unwrap();
         assert_eq!(w2, 8);
         assert_eq!(agg.total_weight(), 8);
     }
@@ -676,8 +676,8 @@ mod tests {
     #[test]
     fn trusted_add_duplicate_errors() {
         let agg = build_agg(vec![("alice", b"pkA", 3)]);
-        agg.trusted_add(&"alice".to_string(), b"good").unwrap();
-        let err = agg.trusted_add(&"alice".to_string(), b"good").unwrap_err();
+        agg.trusted_add(&b"alice".to_vec(), b"good").unwrap();
+        let err = agg.trusted_add(&b"alice".to_vec(), b"good").unwrap_err();
         assert!(err.is_duplicated_signer());
         // Weight stays unchanged after duplicate.
         assert_eq!(agg.total_weight(), 3);
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn trusted_add_unknown_signer_errors() {
         let agg = build_agg(vec![("alice", b"pkA", 3)]);
-        let err = agg.trusted_add(&"stranger".to_string(), b"good").unwrap_err();
+        let err = agg.trusted_add(&b"stranger".to_vec(), b"good").unwrap_err();
         assert!(err.is_invalid_signer());
     }
 
@@ -705,15 +705,15 @@ mod tests {
             ("carol", b"pkC", 1),
         ]);
         // Add in reverse order.
-        agg.trusted_add(&"carol".to_string(), b"sC").unwrap();
-        agg.trusted_add(&"alice".to_string(), b"sA").unwrap();
-        agg.trusted_add(&"bob".to_string(), b"sB").unwrap();
+        agg.trusted_add(&b"carol".to_vec(), b"sC").unwrap();
+        agg.trusted_add(&b"alice".to_vec(), b"sA").unwrap();
+        agg.trusted_add(&b"bob".to_vec(), b"sB").unwrap();
         let (signers, agg_sig) = agg.aggregate().unwrap();
         // Stable ordering: by original index (alice, bob, carol).
         assert_eq!(signers.len(), 3);
-        assert_eq!(signers[0].identity(), "alice");
-        assert_eq!(signers[1].identity(), "bob");
-        assert_eq!(signers[2].identity(), "carol");
+        assert_eq!(signers[0].identity(), &b"alice".to_vec());
+        assert_eq!(signers[1].identity(), &b"bob".to_vec());
+        assert_eq!(signers[2].identity(), &b"carol".to_vec());
         // Aggregated sig is the concatenation in that same order.
         assert_eq!(agg_sig.signature(), b"sAsBsC");
         assert_eq!(agg_sig.public_key(), b"pkApkBpkC");
@@ -812,9 +812,9 @@ mod tests {
         );
         assert_eq!(agg.rank(), 5);
         assert_eq!(agg.total_weight(), 0);
-        let w1 = agg.verify_and_add(&"alice".to_string(), b"sA", 4).unwrap();
+        let w1 = agg.verify_and_add(&b"alice".to_vec(), b"sA", 4).unwrap();
         assert_eq!(w1, 3);
-        let w2 = agg.verify_and_add(&"bob".to_string(), b"sB", 3).unwrap();
+        let w2 = agg.verify_and_add(&b"bob".to_vec(), b"sB", 3).unwrap();
         assert_eq!(w2, 8);
         assert_eq!(agg.total_weight(), 8);
     }
@@ -822,9 +822,9 @@ mod tests {
     #[test]
     fn timeout_duplicate_signer_errors() {
         let agg = build_timeout_agg(5, vec![("alice", b"pkA", 3)]);
-        agg.verify_and_add(&"alice".to_string(), b"sA", 4).unwrap();
+        agg.verify_and_add(&b"alice".to_vec(), b"sA", 4).unwrap();
         let err = agg
-            .verify_and_add(&"alice".to_string(), b"sA", 4)
+            .verify_and_add(&b"alice".to_vec(), b"sA", 4)
             .unwrap_err();
         assert!(err.is_duplicated_signer());
     }
@@ -833,7 +833,7 @@ mod tests {
     fn timeout_unknown_signer_errors() {
         let agg = build_timeout_agg(5, vec![("alice", b"pkA", 3)]);
         let err = agg
-            .verify_and_add(&"stranger".to_string(), b"sig", 4)
+            .verify_and_add(&b"stranger".to_vec(), b"sig", 4)
             .unwrap_err();
         assert!(err.is_invalid_signer());
     }
@@ -856,7 +856,7 @@ mod tests {
         )
         .unwrap();
         let err = agg
-            .verify_and_add(&"alice".to_string(), b"bad", 4)
+            .verify_and_add(&b"alice".to_vec(), b"bad", 4)
             .unwrap_err();
         assert!(err.is_invalid_signature());
     }
@@ -878,17 +878,17 @@ mod tests {
                 ("carol", b"pkC", 1),
             ],
         );
-        agg.verify_and_add(&"alice".to_string(), b"sA", 9).unwrap();
-        agg.verify_and_add(&"carol".to_string(), b"sC", 7).unwrap();
-        agg.verify_and_add(&"bob".to_string(), b"sB", 8).unwrap();
+        agg.verify_and_add(&b"alice".to_vec(), b"sA", 9).unwrap();
+        agg.verify_and_add(&b"carol".to_vec(), b"sC", 7).unwrap();
+        agg.verify_and_add(&b"bob".to_vec(), b"sB", 8).unwrap();
         let (signers, _sig) = agg.aggregate().unwrap();
         // Stable order by index: alice (9), bob (8), carol (7).
         assert_eq!(signers.len(), 3);
-        assert_eq!(signers[0].signer, "alice");
+        assert_eq!(signers[0].signer, b"alice".to_vec());
         assert_eq!(signers[0].newest_qc_rank, 9);
-        assert_eq!(signers[1].signer, "bob");
+        assert_eq!(signers[1].signer, b"bob".to_vec());
         assert_eq!(signers[1].newest_qc_rank, 8);
-        assert_eq!(signers[2].signer, "carol");
+        assert_eq!(signers[2].signer, b"carol".to_vec());
         assert_eq!(signers[2].newest_qc_rank, 7);
     }
 }

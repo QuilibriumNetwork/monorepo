@@ -32,11 +32,13 @@ pub use conversions::{
 };
 
 pub use vertex_ops::{
-    vertex_add_cost_from_proof_count, vertex_add_cost_from_raw_len,
-    vertex_add_domain_separator, vertex_add_signing_message, vertex_read_addresses,
-    vertex_remove_cost, vertex_remove_domain_separator, vertex_remove_signing_message,
-    vertex_write_addresses, MAX_VERTEX_ADD_DISK_SIZE, VERENC_PROOF_CHARGE_BYTES,
-    VERTEX_ADD_TAG, VERTEX_REMOVE_COST, VERTEX_REMOVE_TAG,
+    encrypted_to_vertex_tree, vertex_add_cost_from_proof_count,
+    vertex_add_cost_from_raw_len, vertex_add_domain_separator,
+    vertex_add_signing_message, vertex_read_addresses, vertex_remove_cost,
+    vertex_remove_domain_separator, vertex_remove_signing_message,
+    vertex_write_addresses, MAX_VERTEX_ADD_DISK_SIZE, VERENC_COMPRESSED_BYTES,
+    VERENC_PROOF_BYTES, VERENC_PROOF_CHARGE_BYTES, VERTEX_ADD_TAG,
+    VERTEX_REMOVE_COST, VERTEX_REMOVE_TAG,
 };
 
 pub use dispatch::{

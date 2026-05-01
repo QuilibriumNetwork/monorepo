@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use quil_consensus::leader_provider::LeaderProvider;
 use quil_consensus::models::{Identity, State};
 use quil_types::consensus::{DifficultyAdjuster, ProverRegistry};
-use quil_types::crypto::FrameProver;
+use quil_types::crypto::{FrameProver, InclusionProver, Signer};
 use quil_types::error::{QuilError, Result};
 use quil_types::store::ClockStore;
 
@@ -36,6 +36,17 @@ pub struct GlobalLeaderProvider {
     local_prover_address: Vec<u8>,
     /// This node's BLS48-581 public key (585 bytes).
     local_public_key: Vec<u8>,
+    /// BLS48-581 signer used by `ProveGlobalFrameHeader` to sign the
+    /// (challenge || output) payload under the "global" domain. Mirrors
+    /// Go's `provingKey qcrypto.Signer` parameter at
+    /// `vdf/wesolowski_frame_prover.go:402`.
+    signer: Arc<dyn Signer>,
+    /// KZG-style inclusion prover used to commit the request tree.
+    /// Mirrors Go's `p.engine.inclusionProver` at
+    /// `consensus_leader_provider.go:307`. The explicit `+ Send + Sync`
+    /// bound is required because `VectorCommitmentTree::commit` walks
+    /// branches in parallel via rayon.
+    inclusion_prover: Arc<dyn InclusionProver + Send + Sync>,
 }
 
 impl GlobalLeaderProvider {
@@ -47,6 +58,8 @@ impl GlobalLeaderProvider {
         message_collector: Arc<MessageCollector>,
         local_prover_address: Vec<u8>,
         local_public_key: Vec<u8>,
+        signer: Arc<dyn Signer>,
+        inclusion_prover: Arc<dyn InclusionProver + Send + Sync>,
     ) -> Self {
         Self {
             prover_registry,
@@ -56,6 +69,8 @@ impl GlobalLeaderProvider {
             message_collector,
             local_prover_address,
             local_public_key,
+            signer,
+            inclusion_prover,
         }
     }
 
@@ -79,47 +94,63 @@ impl GlobalLeaderProvider {
         }
     }
 
-    /// Compute the QC identity from a quorum certificate's selector.
-    /// In Go this is `models.Identity(qc.Selector)` which is raw bytes
-    /// cast to a string. In Rust the Identity is a hex string.
+    /// Compute the QC identity. Mirror of Go's
+    /// `QuorumCertificate.Identity()` at `protobufs/global.go:46-48`
+    /// which returns `models.Identity(g.Selector)` — i.e. the Selector
+    /// bytes interpreted as the identity directly (Go strings are byte
+    /// sequences).
     fn qc_identity(
         qc: &quil_types::proto::global::QuorumCertificate,
     ) -> Identity {
-        hex::encode(&qc.selector)
+        qc.selector.clone()
     }
 
-    /// Compute the identity of a GlobalFrame, matching Go's
-    /// `GlobalFrame.Identity()`: Poseidon hash of the output, returned
-    /// as the raw 32-byte value hex-encoded. Note: `GlobalState::compute_identity()`
-    /// uses SHA-256 for the consensus-layer `Unique` trait; this method mirrors
-    /// the Go `Identity()` used for frame-to-QC matching.
+    /// Compute the identity of a GlobalFrame. Mirror of Go's
+    /// `GlobalFrame.Identity()` at `protobufs/global.go:142-149`:
+    /// `poseidon.HashBytes(g.Header.Output).FillBytes(make([]byte, 32))`.
     fn frame_identity(header: &quil_types::proto::global::GlobalFrameHeader) -> Identity {
         match quil_crypto::poseidon::hash_bytes_to_32(&header.output) {
-            Ok(hash) => hex::encode(hash),
-            Err(_) => String::new(),
+            Ok(hash) => hash.to_vec(),
+            Err(_) => Vec::new(),
         }
     }
 
-    /// Build a SHA-256 root over collected message payloads. This is a
-    /// simplified stand-in for the full VectorCommitmentTree-based
-    /// request root used in Go. Each message is hashed individually,
-    /// then the hashes are concatenated and hashed again to produce
-    /// the root. An empty message set produces an empty root.
-    fn compute_requests_root(messages: &[Vec<u8>]) -> Vec<u8> {
-        if messages.is_empty() {
-            return Vec::new();
-        }
-
-        // Hash each message with SHA-256 (mirrors Go's sha3.Sum256 per
-        // message, but we use SHA-256 to stay consistent with the rest
-        // of the Rust port; the full VCT-based root will replace this).
-        let mut combined = Vec::with_capacity(messages.len() * 32);
+    /// Build the request root: a `VectorCommitmentTree` over the
+    /// collected MessageBundle payloads, keyed by `sha3_256(payload)`.
+    /// Mirrors Go's `consensus_leader_provider.go:256-307`:
+    ///
+    /// ```go
+    ///   requestTree := &tries.VectorCommitmentTree{}
+    ///   for _, msgData := range collectedMessages {
+    ///     id := sha3.Sum256(msgData)
+    ///     requestTree.Insert(id[:], msgData, nil, big.NewInt(0))
+    ///   }
+    ///   requestRoot := requestTree.Commit(inclusionProver, false)
+    /// ```
+    ///
+    /// Empty inputs yield the canonical empty-root `[0u8; 64]` produced
+    /// by `VectorCommitmentTree::commit` on an empty tree. Insert
+    /// failures are logged and skipped, matching Go's `if err != nil`
+    /// soft-fail (a single bad bundle does not abort the whole frame).
+    fn compute_requests_root(&self, messages: &[Vec<u8>]) -> Vec<u8> {
+        use sha3::{Digest as _, Sha3_256};
+        let mut tree = quil_tries::VectorCommitmentTree::new();
         for msg in messages {
-            let hash = Sha256::digest(msg);
-            combined.extend_from_slice(&hash);
+            let id: [u8; 32] = Sha3_256::digest(msg).into();
+            if let Err(e) = tree.insert(
+                &id,
+                msg,
+                &[],
+                &num_bigint::BigInt::from(0),
+            ) {
+                tracing::warn!(
+                    error = %e,
+                    "failed to add global request to tree",
+                );
+                continue;
+            }
         }
-        let root = Sha256::digest(&combined);
-        root.to_vec()
+        tree.commit(self.inclusion_prover.as_ref())
     }
 }
 
@@ -164,7 +195,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         if !leaders.is_empty() {
             tracing::debug!(
                 count = leaders.len(),
-                first = %leaders[0],
+                first = %hex::encode(&leaders[0]),
                 "determined next global leaders",
             );
         }
@@ -206,9 +237,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         } else {
             // Fetch the candidate frame that matches the QC's
             // frame number + the caller's prior_state_id as selector.
-            let selector_bytes = hex::decode(prior_state_id).unwrap_or_default();
+            // `prior_state_id` is already raw 32-byte Identity bytes
+            // (post-Tier-1 fix). Mirrors Go's `[]byte(priorState)` at
+            // `consensus_leader_provider.go:99-101`.
             self.clock_store
-                .get_global_clock_frame_candidate(latest_qc.frame_number, &selector_bytes)
+                .get_global_clock_frame_candidate(latest_qc.frame_number, prior_state_id)
                 .or_else(|_| {
                     // Fall back to the canonical frame at this number
                     self.clock_store.get_global_clock_frame(latest_qc.frame_number)
@@ -236,7 +269,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 if prior_header.frame_number == latest_qc.frame_number {
                     return Err(QuilError::Consensus(format!(
                         "fork detected at rank {} (local: {}, qc: {})",
-                        latest_qc.rank, prior_identity, qc_id,
+                        latest_qc.rank,
+                        hex::encode(&prior_identity),
+                        hex::encode(&qc_id),
                     )));
                 }
             }
@@ -248,7 +283,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 prior_header.rank,
                 hex::encode(&prior_header.parent_selector),
                 rank,
-                prior_state_id,
+                hex::encode(prior_state_id),
             )));
         }
 
@@ -269,7 +304,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // ------------------------------------------------------------------
         // 4. Compute request root from collected messages
         // ------------------------------------------------------------------
-        let requests_root = Self::compute_requests_root(&messages);
+        let requests_root = self.compute_requests_root(&messages);
 
         // ------------------------------------------------------------------
         // 5. Verify this node is an active prover and find our index
@@ -302,22 +337,33 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         );
 
         // ------------------------------------------------------------------
-        // 7. Compute parent selector from prior frame output
-        // ------------------------------------------------------------------
-        let parent_selector = if prior_header.output.len() == VDF_OUTPUT_LEN {
-            Self::compute_parent_selector(&prior_header.output).to_vec()
-        } else {
-            prior_header.parent_selector.clone()
-        };
-
-        // ------------------------------------------------------------------
-        // 8. VDF prove -- this blocks for seconds
-        // ------------------------------------------------------------------
+        // 7. VDF prove + sign — blocks for seconds.
+        //
+        // ProveGlobalFrameHeader internally computes
+        //   parent     = poseidon(previous_frame.output[:516])
+        //   challenge  = sha3(frame# || timestamp || difficulty ||
+        //                     parent || commitments... || prover_root ||
+        //                     request_root)
+        //   output     = WesolowskiSolve(challenge, difficulty)
+        //   signature  = signer.SignWithDomain(challenge||output, "global")
+        //
+        // shard `commitments` and `prover_root` here are still
+        // placeholders pending Tier 2 wiring of the materializer's
+        // shardCommitments + proverRoot output. `requests_root` is the
+        // partial commit we already have. Once Tier 2 lands, these
+        // become the real values. (See audit BLOCKER list, Tier 2.)
+        let prover_index_u8 = prover_index.map(|i| i as u8).unwrap_or(0);
+        let commitments: Vec<Vec<u8>> = Vec::new();
+        let prover_root: Vec<u8> = Vec::new();
         let header = self.frame_prover.prove_global_frame_header(
-            frame_number,
-            &parent_selector,
+            prior_header,
+            &commitments,
+            &prover_root,
+            &requests_root,
+            self.signer.as_ref(),
+            timestamp,
             difficulty as u32,
-            &self.local_public_key,
+            prover_index_u8,
         )?;
 
         // ------------------------------------------------------------------
@@ -328,6 +374,18 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // runs during the consensus commit path, not during proving).
         // Similarly, the signature is populated by the consensus signing
         // step after the proposal is voted on.
+        // Decode each canonical bundle into a prost `MessageBundle`
+        // (the proto type the materializer expects). Bundles that
+        // fail decode are skipped — `requests_root` was hashed over
+        // the canonical bytes, so a partial set here would mismatch,
+        // but in practice the same `decode_message_bundle` call has
+        // already round-tripped these on every other replica's
+        // receive path, so a leader-side failure indicates the same
+        // bundle would also fail downstream.
+        let proto_messages: Vec<quil_types::proto::global::MessageBundle> = messages
+            .iter()
+            .filter_map(|raw| crate::consensus_wire::decode_message_bundle(raw).ok())
+            .collect();
         let state = GlobalState::new(
             frame_number,
             rank,
@@ -339,7 +397,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             Vec::new(), // prover_tree_commitment — populated after hypergraph commit
             requests_root,
             Vec::new(), // signature — populated by consensus signing step
-        );
+        )
+        // Attach the collected messages so they ride with the proposal
+        // into `GlobalFrame.requests` and reach every replica's
+        // materializer on finalization.
+        .with_messages(proto_messages);
 
         // ------------------------------------------------------------------
         // 10. Build and return State<GlobalState>
@@ -349,7 +411,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         tracing::info!(
             frame = frame_number,
             rank,
-            identifier = %identifier,
+            identifier = %hex::encode(&identifier),
             "proved global frame",
         );
 

@@ -2,6 +2,7 @@ pub mod app_engine;
 pub mod app_glue;
 pub mod app_shard_cache;
 pub mod app_types;
+pub mod app_vote_aggregation;
 pub mod bls_signature_aggregator;
 pub mod bls_verifier;
 pub mod committee;

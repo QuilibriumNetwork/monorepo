@@ -63,14 +63,14 @@ impl<S: Unique> StateSignerDecoder<S> for DynamicCommitteeStateSignerDecoder<S> 
                     .map_err(|e2| {
                         QuilError::Consensus(format!(
                             "could not retrieve identities for state {} with QC rank {} for parent {}: {}",
-                            state.identifier, state.parent_qc_rank, state.parent_qc_identity, e2
+                            hex::encode(&state.identifier), state.parent_qc_rank, hex::encode(&state.parent_qc_identity), e2
                         ))
                     })?
             }
             Err(e) => {
                 return Err(QuilError::Consensus(format!(
                     "unexpected error retrieving identities for state {}: {}",
-                    state.identifier, e
+                    hex::encode(&state.identifier), e
                 )))
             }
         };
@@ -174,13 +174,13 @@ mod tests {
     fn make_state(rank: u64, parent_id: &str, parent_rank: u64) -> State<AppState> {
         State {
             rank,
-            identifier: format!("state-{}", rank),
-            proposer_id: "leader".into(),
+            identifier: format!("state-{}", rank).into_bytes(),
+            proposer_id: b"leader".to_vec(),
             parent_qc_identity: parent_id.into(),
             parent_qc_rank: parent_rank,
             timestamp: 0,
             state: AppState {
-                id: format!("state-{}", rank),
+                id: format!("state-{}", rank).into_bytes(),
                 rank,
             },
         }
@@ -334,8 +334,8 @@ mod tests {
         let bitmask = vec![0b0000_0101];
         let subset = decode_from_bitmask(full, &bitmask);
         assert_eq!(subset.len(), 2);
-        let ids: Vec<&str> = subset.iter().map(|m| m.identity().as_str()).collect();
-        assert!(ids.contains(&"alice"));
-        assert!(ids.contains(&"carol"));
+        let ids: Vec<&Identity> = subset.iter().map(|m| m.identity()).collect();
+        assert!(ids.contains(&&b"alice".to_vec()));
+        assert!(ids.contains(&&b"carol".to_vec()));
     }
 }

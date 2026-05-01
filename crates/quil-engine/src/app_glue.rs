@@ -68,16 +68,32 @@ pub enum AppConsensusEvent {
 // =====================================================================
 
 /// Consumer for app shard consensus events. Serializes votes,
-/// timeouts, and proposals for network publication and emits
-/// events to the engine's main loop.
+/// timeouts, and proposals for network publication and emits events
+/// to the engine's main loop. The aggregator is held in a `OnceLock`
+/// because it depends on the event-loop handle, which itself is only
+/// available after the consumer has been constructed.
 pub struct AppConsumer {
     filter: Vec<u8>,
     event_tx: mpsc::UnboundedSender<AppConsensusEvent>,
+    aggregator: std::sync::OnceLock<std::sync::Arc<crate::app_vote_aggregation::AppVoteAggregation>>,
 }
 
 impl AppConsumer {
     pub fn new(filter: Vec<u8>, event_tx: mpsc::UnboundedSender<AppConsensusEvent>) -> Self {
-        Self { filter, event_tx }
+        Self {
+            filter,
+            event_tx,
+            aggregator: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Install the per-shard vote aggregator. Idempotent — only the
+    /// first set takes effect.
+    pub fn set_aggregator(
+        &self,
+        agg: std::sync::Arc<crate::app_vote_aggregation::AppVoteAggregation>,
+    ) {
+        let _ = self.aggregator.set(agg);
     }
 }
 
@@ -137,21 +153,29 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
     }
 
     fn on_own_vote(&self, vote: &AppShardVote, recipient_id: &Identity) {
-        debug!(
+        info!(
             filter = hex::encode(&self.filter),
             rank = vote.rank(),
-            recipient = %recipient_id,
+            recipient = %hex::encode(recipient_id),
             "produced shard vote"
         );
-        // Serialize vote to wire format for network publishing
+
+        // Tally the local vote so a small or single-member committee
+        // can form a QC without a network round-trip.
+        if let Some(agg) = self.aggregator.get() {
+            agg.handle_vote(vote.clone());
+        }
+
+        // Wire encoding: selector = proposal id (Source()), address =
+        // voter id (Identity()).
         let wire_vote = crate::consensus_wire::ProposalVote {
             filter: self.filter.clone(),
             rank: vote.rank(),
             frame_number: vote.rank(),
-            selector: hex::decode(vote.identity()).unwrap_or_default(),
+            selector: vote.source().clone(),
             timestamp: vote.timestamp(),
             signature: vote.signature_bytes.clone(),
-            address: hex::decode(vote.source()).unwrap_or_default(),
+            address: vote.identity().clone(),
         };
         if let Ok(bytes) = wire_vote.to_canonical_bytes() {
             let _ = self.event_tx.send(AppConsensusEvent::OwnVote {
@@ -168,6 +192,9 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
             "produced shard timeout"
         );
         let wire_qc = crate::consensus_wire::QuorumCertificate::genesis(0, self.filter.clone());
+        // Timeout vote: selector is empty (the timeout binds to
+        // (rank, newest_qc_rank), not a specific proposal); address
+        // is the voter's identity.
         let wire_vote = crate::consensus_wire::ProposalVote {
             filter: self.filter.clone(),
             rank: timeout.rank,
@@ -175,7 +202,7 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
             selector: Vec::new(),
             timestamp: 0,
             signature: timeout.vote.signature_bytes.clone(),
-            address: hex::decode(timeout.vote.source()).unwrap_or_default(),
+            address: timeout.vote.identity().clone(),
         };
         let wire_ts = crate::consensus_wire::TimeoutState {
             latest_quorum_certificate: wire_qc,
@@ -204,7 +231,15 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
             rank,
             "produced shard proposal"
         );
-        // The frame data is the VDF output — publish it on the shard's
+
+        // Hand the proposal to the rank's vote collector so it can
+        // transition to the verifying state and tally subsequent
+        // votes against this proposal's identifier.
+        if let Some(agg) = self.aggregator.get() {
+            agg.handle_proposal(proposal);
+        }
+
+        // The frame data is the VDF output, published on the shard's
         // frame bitmask. The full AppShardFrame (header + requests)
         // is assembled and serialized by the leader provider.
         let frame_data = proposal.proposal.state.state.output.clone();
@@ -336,7 +371,7 @@ impl Finalizer for AppFinalizer {
     fn make_final(&self, state_id: &Identity) -> Result<()> {
         info!(
             filter = hex::encode(&self.filter),
-            state = %state_id,
+            state = %hex::encode(state_id),
             "shard make_final"
         );
         Ok(())
@@ -461,7 +496,9 @@ impl ConsensusStateCodec<AppShardVote> for AppConsensusCodec {
         Ok(LivenessState {
             filter: filter.clone(),
             current_rank,
-            latest_quorum_certificate: Arc::new(AppGenesisQC { filter }),
+            latest_quorum_certificate: Arc::new(
+                AppGenesisQC::for_output(filter, &vec![0u8; 32]),
+            ),
             prior_rank_timeout_certificate: None,
         })
     }
@@ -493,7 +530,9 @@ mod tests {
         let state = LivenessState {
             filter: vec![4, 5],
             current_rank: 99,
-            latest_quorum_certificate: Arc::new(AppGenesisQC { filter: vec![4, 5] }),
+            latest_quorum_certificate: Arc::new(
+                AppGenesisQC::for_output(vec![4, 5], &vec![0u8; 32]),
+            ),
             prior_rank_timeout_certificate: None,
         };
         let bytes = codec.encode_liveness_state(&state).unwrap();

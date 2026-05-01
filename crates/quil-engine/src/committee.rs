@@ -26,31 +26,28 @@ use quil_consensus::models::{Identity, WeightedIdentity};
 use quil_types::consensus::ProverRegistry;
 use quil_types::error::{QuilError, Result};
 
-/// Default quorum threshold (2N/3 rounded up). Matches Go's
-/// `consensus_committee.go` semantics.
+/// Quorum threshold: integer-floor `(total * 2) / 3`. Byte-identical
+/// to other implementations; a ceil variant would fork consensus on
+/// any committee whose weight isn't divisible by 3.
 fn quorum_threshold(total: u64) -> u64 {
-    // `ceil(2N/3)` via integer math.
-    (2 * total + 2) / 3
+    (total * 2) / 3
 }
 
-/// Default timeout threshold (N/3 rounded up). A replica can
-/// contribute to a timeout certificate once >1/3 of the committee
-/// has signaled.
+/// Timeout threshold: same `(total * 2) / 3`. A replica can
+/// contribute to a timeout certificate once > 2/3 of the weight has
+/// signalled.
 fn timeout_threshold(total: u64) -> u64 {
-    (total + 2) / 3
+    (total * 2) / 3
 }
 
-/// Encode a raw prover address as a lowercase hex `Identity` string.
+/// Convert a raw prover address into an `Identity` (raw bytes — same value).
 pub fn address_to_identity(address: &[u8]) -> Identity {
-    hex::encode(address)
+    address.to_vec()
 }
 
-/// Decode an `Identity` back to a raw 32-byte address. Returns
-/// `QuilError::InvalidArgument` if the string isn't valid hex.
+/// Identity bytes are the raw address.
 pub fn identity_to_address(id: &Identity) -> Result<Vec<u8>> {
-    hex::decode(id).map_err(|e| {
-        QuilError::InvalidArgument(format!("identity {} is not valid hex: {}", id, e))
-    })
+    Ok(id.clone())
 }
 
 /// Concrete weighted identity backed by an active prover entry.
@@ -88,20 +85,26 @@ pub struct ProverRegistryCommittee {
     registry: Arc<dyn ProverRegistry>,
     filter: Vec<u8>,
     self_id: Identity,
+    self_public_key: Vec<u8>,
 }
 
 impl ProverRegistryCommittee {
-    /// Construct a committee view for `filter`. `self_address` is the
-    /// raw 32-byte prover address of the local node.
+    /// Construct a committee view for `filter`. `self_public_key`
+    /// is used to seed the local node into `active_identities()`
+    /// with weight 0 if the registry hasn't yet observed its
+    /// ProverConfirm; the real key is used so signatures still
+    /// authenticate.
     pub fn new(
         registry: Arc<dyn ProverRegistry>,
         filter: Vec<u8>,
         self_address: &[u8],
+        self_public_key: Vec<u8>,
     ) -> Self {
         Self {
             registry,
             filter,
             self_id: address_to_identity(self_address),
+            self_public_key,
         }
     }
 
@@ -110,35 +113,48 @@ impl ProverRegistryCommittee {
         &self.filter
     }
 
-    /// List active provers under this committee's filter. Each
-    /// entry becomes a [`ProverIdentity`] with `weight = seniority`
-    /// (matching Quilibrium's stake-by-seniority model) and
-    /// `public_key = prover.public_key`.
+    /// List active provers under this committee's filter. Each entry
+    /// becomes a [`ProverIdentity`] with `weight = seniority`. If the
+    /// local node is missing from the registry's view, it is appended
+    /// with weight 0 so its self-vote authenticates against its real
+    /// public key.
     fn active_identities(&self) -> Result<Vec<Box<dyn WeightedIdentity>>> {
         let active = self.registry.get_active_provers(&self.filter)?;
-        let out: Vec<Box<dyn WeightedIdentity>> = active
+        let mut self_seen = false;
+        let mut out: Vec<Box<dyn WeightedIdentity>> = active
             .into_iter()
             .map(|p| {
-                Box::new(ProverIdentity::new(&p.address, p.public_key, p.seniority.max(1)))
+                if address_to_identity(&p.address) == self.self_id {
+                    self_seen = true;
+                }
+                Box::new(ProverIdentity::new(&p.address, p.public_key, p.seniority))
                     as Box<dyn WeightedIdentity>
             })
             .collect();
+        if !self_seen && !self.self_public_key.is_empty() {
+            out.push(Box::new(ProverIdentity::new(
+                &self.self_id,
+                self.self_public_key.clone(),
+                0,
+            )) as Box<dyn WeightedIdentity>);
+        }
         Ok(out)
     }
 
-    /// Total stake-weight across the active committee. Used by
-    /// [`quorum_threshold_for_rank`] / [`timeout_threshold_for_rank`].
+    /// Total stake-weight across the active committee. The seeded
+    /// self entry contributes 0, so the threshold derived here agrees
+    /// with the identity list from [`active_identities`].
     fn total_weight(&self) -> Result<u64> {
         let active = self.registry.get_active_provers(&self.filter)?;
-        Ok(active.iter().map(|p| p.seniority.max(1)).sum())
+        Ok(active.iter().map(|p| p.seniority).sum())
     }
 }
 
 impl Replicas for ProverRegistryCommittee {
     fn leader_for_rank(&self, rank: u64) -> Result<Identity> {
-        // Quilibrium's leader selection uses the registry's
-        // ordered-prover walk seeded by a hash input. We map `rank`
-        // into a 32-byte seed via big-endian embedding + zero pad.
+        // Leader selection walks the registry in seniority order
+        // seeded by a 32-byte hash input; map `rank` via big-endian
+        // embedding + zero pad.
         let mut seed = [0u8; 32];
         seed[24..].copy_from_slice(&rank.to_be_bytes());
         let leader_address = self.registry.get_next_prover(&seed, &self.filter)?;
@@ -173,17 +189,24 @@ impl Replicas for ProverRegistryCommittee {
         participant_id: &Identity,
     ) -> Result<Box<dyn WeightedIdentity>> {
         let address = identity_to_address(participant_id)?;
-        match self.registry.get_prover_info(&address)? {
-            Some(p) => Ok(Box::new(ProverIdentity::new(
+        if let Some(p) = self.registry.get_prover_info(&address)? {
+            return Ok(Box::new(ProverIdentity::new(
                 &p.address,
                 p.public_key,
-                p.seniority.max(1),
-            ))),
-            None => Err(QuilError::InvalidSigner(format!(
-                "prover {} not in committee",
-                participant_id
-            ))),
+                p.seniority,
+            )));
         }
+        if participant_id == &self.self_id && !self.self_public_key.is_empty() {
+            return Ok(Box::new(ProverIdentity::new(
+                &self.self_id,
+                self.self_public_key.clone(),
+                0,
+            )));
+        }
+        Err(QuilError::InvalidSigner(format!(
+            "prover {} not in committee",
+            hex::encode(participant_id)
+        )))
     }
 }
 
@@ -192,11 +215,6 @@ impl DynamicCommittee for ProverRegistryCommittee {
         &self,
         _state_id: &Identity,
     ) -> Result<Vec<Box<dyn WeightedIdentity>>> {
-        // Dynamic committees can shift between ranks, but Quilibrium's
-        // registry is rank-indexed; the committee membership for a
-        // state is identical to the committee membership at that
-        // state's rank. Since we don't carry rank information through
-        // `state_id` alone, we fall back to the current-active set.
         self.active_identities()
     }
 
@@ -205,8 +223,6 @@ impl DynamicCommittee for ProverRegistryCommittee {
         _state_id: &Identity,
         participant_id: &Identity,
     ) -> Result<Box<dyn WeightedIdentity>> {
-        // Same reasoning as `identities_by_state` — fall back to
-        // the rank-based lookup.
         self.identity_by_rank(0, participant_id)
     }
 }
@@ -330,32 +346,33 @@ mod tests {
 
     // ---------- threshold math ----------
 
+    // Go uses integer floor division for both thresholds:
+    // `(total * 2) / 3`. Interop requires byte-identical values.
     #[test]
-    fn quorum_threshold_matches_go_ceil_2n_3() {
-        assert_eq!(quorum_threshold(1), 1);
+    fn quorum_threshold_matches_go_floor_2n_3() {
+        assert_eq!(quorum_threshold(1), 0);
         assert_eq!(quorum_threshold(3), 2);
-        assert_eq!(quorum_threshold(4), 3);
+        assert_eq!(quorum_threshold(4), 2);
         assert_eq!(quorum_threshold(6), 4);
         assert_eq!(quorum_threshold(9), 6);
-        assert_eq!(quorum_threshold(100), 67);
+        assert_eq!(quorum_threshold(10), 6);
+        assert_eq!(quorum_threshold(100), 66);
     }
 
     #[test]
-    fn timeout_threshold_matches_go_ceil_n_3() {
-        assert_eq!(timeout_threshold(1), 1);
-        assert_eq!(timeout_threshold(3), 1);
-        assert_eq!(timeout_threshold(4), 2);
-        assert_eq!(timeout_threshold(6), 2);
-        assert_eq!(timeout_threshold(9), 3);
-        assert_eq!(timeout_threshold(100), 34);
+    fn timeout_threshold_matches_quorum_threshold() {
+        // Go's `TimeoutThresholdForRank` is also `(total * 2) / 3`.
+        for n in [1u64, 3, 4, 6, 9, 10, 100] {
+            assert_eq!(timeout_threshold(n), quorum_threshold(n));
+        }
     }
 
     // ---------- identity encoding ----------
 
     #[test]
-    fn address_to_identity_is_lowercase_hex() {
+    fn address_to_identity_is_raw_bytes() {
         let id = address_to_identity(&[0xAB, 0xCD, 0xEF]);
-        assert_eq!(id, "abcdef");
+        assert_eq!(id, vec![0xAB, 0xCD, 0xEF]);
     }
 
     #[test]
@@ -366,12 +383,6 @@ mod tests {
         assert_eq!(decoded, addr);
     }
 
-    #[test]
-    fn identity_to_address_rejects_invalid_hex() {
-        let err = identity_to_address(&"not-hex".to_string()).unwrap_err();
-        assert!(matches!(err, QuilError::InvalidArgument(_)));
-    }
-
     // ---------- Replicas impl ----------
 
     fn make_committee(
@@ -379,7 +390,7 @@ mod tests {
         self_addr: Vec<u8>,
     ) -> ProverRegistryCommittee {
         let registry = StubRegistry::with(provers);
-        ProverRegistryCommittee::new(registry, b"test-filter".to_vec(), &self_addr)
+        ProverRegistryCommittee::new(registry, b"test-filter".to_vec(), &self_addr, Vec::new())
     }
 
     #[test]
@@ -393,6 +404,7 @@ mod tests {
             registry,
             b"f".to_vec(),
             &[1; 32],
+            Vec::new(),
         );
         let leader = committee.leader_for_rank(5).unwrap();
         assert_eq!(leader, address_to_identity(&[2; 32]));
@@ -415,7 +427,8 @@ mod tests {
 
     #[test]
     fn committee_quorum_threshold_uses_total_seniority() {
-        // Three provers with seniorities 3, 3, 3 → total 9 → quorum 6.
+        // Three provers with seniorities 3, 3, 3 → total 9 → 2N/3 = 6.
+        // Go uses the same `(total * 2) / 3` for both quorum and timeout.
         let provers = vec![
             make_prover(1, 10, 3),
             make_prover(2, 11, 3),
@@ -423,7 +436,7 @@ mod tests {
         ];
         let committee = make_committee(provers, vec![1; 32]);
         assert_eq!(committee.quorum_threshold_for_rank(0).unwrap(), 6);
-        assert_eq!(committee.timeout_threshold_for_rank(0).unwrap(), 3);
+        assert_eq!(committee.timeout_threshold_for_rank(0).unwrap(), 6);
     }
 
     #[test]
@@ -480,7 +493,7 @@ mod tests {
             vec![1; 32],
         );
         let ids = committee
-            .identities_by_state(&"state-5".to_string())
+            .identities_by_state(&b"state-5".to_vec())
             .unwrap();
         assert_eq!(ids.len(), 2);
     }

@@ -24,7 +24,7 @@ use crate::models::Identity;
 pub fn make_vote_message(filter: &[u8], rank: u64, state_id: &Identity) -> Vec<u8> {
     let mut out = Vec::with_capacity(filter.len() + state_id.len() + 8);
     out.extend_from_slice(filter);
-    out.extend_from_slice(state_id.as_bytes());
+    out.extend_from_slice(state_id);
     out.extend_from_slice(&rank.to_be_bytes());
     out
 }
@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn vote_message_layout() {
         let filter = b"filter";
-        let state_id: Identity = "s1".into();
+        let state_id: Identity = b"s1".to_vec();
         let msg = make_vote_message(filter, 0x0102030405060708, &state_id);
         // filter(6) + "s1"(2) + 8 bytes big-endian rank = 16 bytes
         assert_eq!(msg.len(), 16);
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn empty_filter_is_fine() {
         let empty: Vec<u8> = Vec::new();
-        let vote = make_vote_message(&empty, 7, &"state".to_string());
+        let vote = make_vote_message(&empty, 7, &b"state".to_vec());
         // "state" (5) + 8-byte rank = 13
         assert_eq!(vote.len(), 13);
         let to = make_timeout_message(&empty, 7, 3);
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn different_ranks_produce_different_messages() {
         let filter = b"f";
-        let state_id = "s".to_string();
+        let state_id = b"s".to_vec();
         let a = make_vote_message(filter, 1, &state_id);
         let b = make_vote_message(filter, 2, &state_id);
         assert_ne!(a, b);

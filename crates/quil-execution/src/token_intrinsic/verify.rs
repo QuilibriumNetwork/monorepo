@@ -14,14 +14,102 @@
 
 use num_bigint::BigInt;
 use num_traits::One;
-use quil_types::crypto::BulletproofProver;
+use quil_types::crypto::{BulletproofProver, DecafConstructor};
 use quil_types::error::{QuilError, Result};
+
+use super::transaction::{RecipientBundle, Transaction, TransactionInput, TransactionOutput};
 
 
 /// Maximum number of inputs or outputs in a single transaction.
 pub const MAX_IO_COUNT: usize = 100;
 /// Range proof bit size (128 bits — covers values up to 2^128).
 pub const RANGE_PROOF_BIT_SIZE: u64 = 128;
+
+// =====================================================================
+// Transaction challenge / transcript construction
+// =====================================================================
+
+/// Build the Schnorr-signature challenge transcript bytes that feed
+/// into each input's hidden signature verification.
+///
+/// Mirrors Go's `Transaction.GetChallenge` at
+/// `node/execution/intrinsics/token/token_intrinsic_transaction.go:1446-1467`
+/// byte-for-byte:
+///
+/// ```text
+/// transcript = Domain
+///   || foreach output:
+///        Commitment
+///     || FrameNumber
+///     || RecipientOutput.CoinBalance
+///     || RecipientOutput.Mask
+///     || RecipientOutput.OneTimeKey
+///     || RecipientOutput.VerificationKey
+///     || (if len(AdditionalReference) == 64) AdditionalReference || AdditionalReferenceKey
+/// ```
+///
+/// The returned bytes are NOT the challenge itself — they're the input
+/// to Decaf448 `hash_to_scalar`. Call `compute_transaction_challenge`
+/// for the scalar. This is split out so callers can inspect / log the
+/// pre-hash bytes if debugging cross-implementation mismatches.
+///
+/// Each output's `recipient_output` field is nested canonical bytes of
+/// a `RecipientBundle` — we decode it here so the transcript layout
+/// matches Go's struct-field order exactly.
+pub fn build_transaction_transcript(tx: &Transaction) -> Result<Vec<u8>> {
+    let mut transcript = Vec::with_capacity(tx.domain.len() + tx.outputs.len() * 256);
+    transcript.extend_from_slice(&tx.domain);
+
+    for (idx, out_bytes) in tx.outputs.iter().enumerate() {
+        let out = TransactionOutput::from_canonical_bytes(out_bytes).map_err(|e| {
+            QuilError::InvalidArgument(format!(
+                "transaction transcript: output {idx} decode: {e}"
+            ))
+        })?;
+
+        transcript.extend_from_slice(&out.commitment);
+        transcript.extend_from_slice(&out.frame_number);
+
+        let recipient = RecipientBundle::from_canonical_bytes(&out.recipient_output).map_err(|e| {
+            QuilError::InvalidArgument(format!(
+                "transaction transcript: output {idx} recipient decode: {e}"
+            ))
+        })?;
+
+        // Go layout: CoinBalance || Mask || OneTimeKey || VerificationKey
+        // (note this is NOT the same order as RecipientBundle's canonical
+        // bytes layout, which is OneTimeKey || VerificationKey || CoinBalance
+        // || Mask. Must follow Go's transcript ordering.)
+        transcript.extend_from_slice(&recipient.coin_balance);
+        transcript.extend_from_slice(&recipient.mask);
+        transcript.extend_from_slice(&recipient.one_time_key);
+        transcript.extend_from_slice(&recipient.verification_key);
+
+        // AdditionalReference is only appended when it's exactly 64 bytes —
+        // matches Go's `len(o.RecipientOutput.AdditionalReference) == 64`
+        // guard at :1456. Shorter/absent → both fields skipped.
+        if recipient.additional_reference.len() == 64 {
+            transcript.extend_from_slice(&recipient.additional_reference);
+            transcript.extend_from_slice(&recipient.additional_reference_key);
+        }
+    }
+
+    Ok(transcript)
+}
+
+/// Compute the transaction challenge scalar. Equivalent to Go's
+/// `Transaction.GetChallenge() -> Private()` — the Decaf448
+/// `hash_to_scalar` of the transcript bytes from
+/// `build_transaction_transcript`. The resulting scalar is passed as
+/// the `transcript` (confusingly named, but matches Go) argument to
+/// `verify_input_hidden_signature`.
+pub fn compute_transaction_challenge(
+    tx: &Transaction,
+    decaf: &dyn DecafConstructor,
+) -> Result<Vec<u8>> {
+    let transcript = build_transaction_transcript(tx)?;
+    decaf.hash_to_scalar(&transcript)
+}
 
 // =====================================================================
 // Transaction input hidden signature verification
@@ -37,8 +125,13 @@ pub const RANGE_PROOF_BIT_SIZE: u64 = 128;
 /// - `[224..280]`: point (verification key)
 /// - `[280..336]`: commitment
 ///
-/// The `transcript` is the transaction's challenge bytes (computed
-/// from SHA3 of the domain + input commitments + output commitments).
+/// `transcript` is the **scalar** produced by Decaf448 `hash_to_scalar`
+/// over the transcript bytes — call `compute_transaction_challenge`
+/// to produce it correctly. Historical note: a prior comment here
+/// described the transcript as "SHA3 of the domain + input + output
+/// commitments", which was wrong in both the hash algorithm and the
+/// field layout. Go hashes with Decaf's `HashToScalar` over a specific
+/// per-output sequence (see `build_transaction_transcript`).
 pub fn verify_input_hidden_signature(
     bp: &dyn BulletproofProver,
     signature: &[u8],
@@ -233,12 +326,297 @@ pub fn verify_mint_transaction_crypto(
     if !bp.sum_check(input_commitments, &[], output_commitments, &[]) { return Ok(false); }
     Ok(true)
 }
+/// Build the transcript bytes for a MintTransaction (see Go
+/// `MintTransaction.GetChallenge` at `token_intrinsic_mint_transaction.go:2666-2692`).
+///
+/// Differs from the standard transcript in that it includes per-input
+/// proofs *before* the domain/outputs section and lays out outputs in a
+/// slightly different field order (AdditionalReference immediately
+/// after FrameNumber).
+pub fn build_mint_transaction_transcript(
+    domain: &[u8],
+    input_proofs: &[Vec<Vec<u8>>],
+    outputs: &[super::mint::MintTransactionOutput],
+    recipients: &[RecipientBundle],
+) -> Result<Vec<u8>> {
+    if outputs.len() != recipients.len() {
+        return Err(QuilError::InvalidArgument(
+            "build_mint_transaction_transcript: output/recipient length mismatch".into(),
+        ));
+    }
+    let mut t = Vec::new();
+    for proofs in input_proofs {
+        for p in proofs {
+            t.extend_from_slice(p);
+        }
+    }
+    t.extend_from_slice(domain);
+    for (o, r) in outputs.iter().zip(recipients.iter()) {
+        t.extend_from_slice(&o.commitment);
+        t.extend_from_slice(&o.frame_number);
+        if r.additional_reference.len() == 64 {
+            t.extend_from_slice(&r.additional_reference);
+            t.extend_from_slice(&r.additional_reference_key);
+        }
+        t.extend_from_slice(&r.coin_balance);
+        t.extend_from_slice(&r.mask);
+        t.extend_from_slice(&r.one_time_key);
+        t.extend_from_slice(&r.verification_key);
+    }
+    Ok(t)
+}
+
+/// Build the transcript bytes for a PendingTransaction (see Go
+/// `PendingTransaction.GetChallenge` at
+/// `token_intrinsic_pending_transaction.go:1532-1559`).
+///
+/// The pending transcript has two recipient bundles (to, refund) per
+/// output and an Expiration u64 appended after the commitment.
+pub fn build_pending_transaction_transcript(
+    domain: &[u8],
+    outputs: &[super::pending::PendingTransactionOutput],
+    to_recipients: &[RecipientBundle],
+    refund_recipients: &[RecipientBundle],
+) -> Result<Vec<u8>> {
+    if outputs.len() != to_recipients.len() || outputs.len() != refund_recipients.len() {
+        return Err(QuilError::InvalidArgument(
+            "build_pending_transaction_transcript: output/recipient length mismatch".into(),
+        ));
+    }
+    let mut t = Vec::new();
+    t.extend_from_slice(domain);
+    for ((o, to), refund) in outputs
+        .iter()
+        .zip(to_recipients.iter())
+        .zip(refund_recipients.iter())
+    {
+        t.extend_from_slice(&o.commitment);
+        t.extend_from_slice(&o.expiration.to_be_bytes());
+        t.extend_from_slice(&o.frame_number);
+        if to.additional_reference.len() == 64 {
+            t.extend_from_slice(&to.additional_reference);
+            t.extend_from_slice(&to.additional_reference_key);
+        }
+        t.extend_from_slice(&to.coin_balance);
+        t.extend_from_slice(&to.mask);
+        t.extend_from_slice(&to.one_time_key);
+        t.extend_from_slice(&to.verification_key);
+        if refund.additional_reference.len() == 64 {
+            t.extend_from_slice(&refund.additional_reference);
+            t.extend_from_slice(&refund.additional_reference_key);
+        }
+        t.extend_from_slice(&refund.coin_balance);
+        t.extend_from_slice(&refund.mask);
+        t.extend_from_slice(&refund.one_time_key);
+        t.extend_from_slice(&refund.verification_key);
+    }
+    Ok(t)
+}
+
+// =====================================================================
+// Non-divisible propagation check
+// =====================================================================
+
+/// For a non-divisible token, each output's `AdditionalReference` /
+/// `AdditionalReferenceKey` must equal the last 128 bytes of the
+/// matching input's last proof (`proofs[-1][:64]` and `[64:128]`).
+///
+/// Port of `token_intrinsic_transaction.go:1532-1541`:
+/// ```go
+/// if tx.config.Behavior&Divisible == 0 {
+///     if !bytes.Equal(
+///         o.RecipientOutput.AdditionalReference,
+///         tx.Inputs[i].Proofs[len(tx.Inputs[i].Proofs)-1][:64],
+///     ) || !bytes.Equal(
+///         o.RecipientOutput.AdditionalReferenceKey,
+///         tx.Inputs[i].Proofs[len(tx.Inputs[i].Proofs)-1][64:],
+///     ) {
+///         return false, errors.Wrap(errors.New("invalid reference"), ...)
+///     }
+/// }
+/// ```
+pub fn check_non_divisible_propagation(
+    behavior: u16,
+    inputs: &[TransactionInput],
+    outputs: &[TransactionOutput],
+    recipients: &[RecipientBundle],
+) -> Result<()> {
+    // Only applies to non-divisible tokens
+    if behavior & super::constants::DIVISIBLE != 0 {
+        return Ok(());
+    }
+    if inputs.len() != outputs.len() || inputs.len() != recipients.len() {
+        return Err(QuilError::InvalidArgument(
+            "non-divisible propagation: input/output/recipient length mismatch".into(),
+        ));
+    }
+    for (i, r) in recipients.iter().enumerate() {
+        let proofs = &inputs[i].proofs;
+        let last = proofs.last().ok_or_else(|| {
+            QuilError::InvalidArgument(format!(
+                "non-divisible propagation: input {} has no proofs",
+                i
+            ))
+        })?;
+        if last.len() < 128 {
+            return Err(QuilError::InvalidArgument(format!(
+                "non-divisible propagation: input {} last proof too short ({} < 128)",
+                i,
+                last.len()
+            )));
+        }
+        if r.additional_reference != last[..64]
+            || r.additional_reference_key != last[64..128]
+        {
+            return Err(QuilError::InvalidArgument(format!(
+                "non-divisible propagation: output {} reference mismatch",
+                i
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::token_intrinsic::constants::QUIL_BEHAVIOR;
     use quil_types::crypto::RangeProofResult;
+
+    // =================================================================
+    // Transcript construction tests
+    // =================================================================
+
+    fn mk_recipient(extra: Option<(&[u8; 64], &[u8])>) -> Vec<u8> {
+        let mut rb = RecipientBundle {
+            one_time_key: vec![0x11u8; 56],
+            verification_key: vec![0x22u8; 56],
+            coin_balance: vec![0x33u8; 16],
+            mask: vec![0x44u8; 56],
+            additional_reference: vec![],
+            additional_reference_key: vec![],
+        };
+        if let Some((r, k)) = extra {
+            rb.additional_reference = r.to_vec();
+            rb.additional_reference_key = k.to_vec();
+        }
+        rb.to_canonical_bytes().unwrap()
+    }
+
+    fn mk_output(recipient_bytes: Vec<u8>) -> Vec<u8> {
+        let out = TransactionOutput {
+            frame_number: 42u64.to_be_bytes().to_vec(),
+            commitment: vec![0x55u8; 56],
+            recipient_output: recipient_bytes,
+        };
+        out.to_canonical_bytes().unwrap()
+    }
+
+    #[test]
+    fn transcript_layout_matches_go_field_order() {
+        // Go's transcript for one output without AdditionalReference:
+        //   domain || commitment || frame_number || coin_balance || mask
+        //         || one_time_key || verification_key
+        let tx = Transaction {
+            domain: vec![0xAAu8; 32],
+            inputs: vec![],
+            outputs: vec![mk_output(mk_recipient(None))],
+            fees: vec![],
+            range_proof: vec![],
+            traversal_proof: vec![],
+        };
+
+        let transcript = build_transaction_transcript(&tx).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0xAAu8; 32]);           // domain
+        expected.extend_from_slice(&[0x55u8; 56]);           // commitment
+        expected.extend_from_slice(&42u64.to_be_bytes());    // frame_number
+        expected.extend_from_slice(&[0x33u8; 16]);           // coin_balance
+        expected.extend_from_slice(&[0x44u8; 56]);           // mask
+        expected.extend_from_slice(&[0x11u8; 56]);           // one_time_key
+        expected.extend_from_slice(&[0x22u8; 56]);           // verification_key
+
+        assert_eq!(transcript, expected);
+    }
+
+    #[test]
+    fn transcript_appends_additional_reference_only_at_64_bytes() {
+        // Go: `if len(o.RecipientOutput.AdditionalReference) == 64` —
+        // 63 or 65 bytes must NOT trigger the append.
+        let ref_64 = [0xBBu8; 64];
+        let key_bytes = vec![0xCCu8; 48];
+
+        let tx = Transaction {
+            domain: vec![],
+            inputs: vec![],
+            outputs: vec![mk_output(mk_recipient(Some((&ref_64, &key_bytes))))],
+            fees: vec![],
+            range_proof: vec![],
+            traversal_proof: vec![],
+        };
+        let with_ref = build_transaction_transcript(&tx).unwrap();
+
+        // Same tx with shorter reference — should NOT append.
+        let mut rb_short = RecipientBundle {
+            one_time_key: vec![0x11u8; 56],
+            verification_key: vec![0x22u8; 56],
+            coin_balance: vec![0x33u8; 16],
+            mask: vec![0x44u8; 56],
+            additional_reference: vec![0xBBu8; 63],
+            additional_reference_key: vec![0xCCu8; 48],
+        };
+        let tx_short = Transaction {
+            domain: vec![],
+            inputs: vec![],
+            outputs: vec![mk_output(rb_short.to_canonical_bytes().unwrap())],
+            fees: vec![],
+            range_proof: vec![],
+            traversal_proof: vec![],
+        };
+        let without_ref = build_transaction_transcript(&tx_short).unwrap();
+
+        assert_eq!(
+            with_ref.len(),
+            without_ref.len() + 64 + key_bytes.len(),
+            "64-byte AdditionalReference appends ref + ref_key; shorter does not"
+        );
+        // And longer than 64 must also NOT append.
+        rb_short.additional_reference = vec![0xBBu8; 65];
+        let tx_long = Transaction {
+            domain: vec![],
+            inputs: vec![],
+            outputs: vec![mk_output(rb_short.to_canonical_bytes().unwrap())],
+            fees: vec![],
+            range_proof: vec![],
+            traversal_proof: vec![],
+        };
+        let long = build_transaction_transcript(&tx_long).unwrap();
+        assert_eq!(long.len(), without_ref.len(), "≠64 bytes = skip");
+    }
+
+    #[test]
+    fn transcript_multiple_outputs_concatenates_in_order() {
+        let tx = Transaction {
+            domain: vec![0xDD; 8],
+            inputs: vec![],
+            outputs: vec![
+                mk_output(mk_recipient(None)),
+                mk_output(mk_recipient(None)),
+                mk_output(mk_recipient(None)),
+            ],
+            fees: vec![],
+            range_proof: vec![],
+            traversal_proof: vec![],
+        };
+
+        let t = build_transaction_transcript(&tx).unwrap();
+        // Per-output contribution is fixed size with no AdditionalReference:
+        //   56 (commitment) + 8 (frame) + 16 + 56 + 56 + 56 = 248 bytes.
+        let per_output = 248;
+        assert_eq!(t.len(), 8 /* domain */ + 3 * per_output);
+    }
+
 
     // Stub prover that always accepts/rejects
     struct AcceptProver;

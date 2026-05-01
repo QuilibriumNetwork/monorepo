@@ -34,7 +34,7 @@ pub fn ensure_vote_for_state<S: Unique, V: Unique>(
     if vote.rank() != state.rank {
         return Err(QuilError::IncompatibleRank(format!(
             "vote {} has rank {} while state's rank is {}",
-            vote.identity(),
+            hex::encode(vote.identity()),
             vote.rank(),
             state.rank
         )));
@@ -42,9 +42,9 @@ pub fn ensure_vote_for_state<S: Unique, V: Unique>(
     if vote.source() != &state.identifier {
         return Err(QuilError::IncompatibleState(format!(
             "expecting votes for state {}, but vote {} is for state {}",
-            state.identifier,
-            vote.identity(),
-            vote.source()
+            hex::encode(&state.identifier),
+            hex::encode(vote.identity()),
+            hex::encode(vote.source())
         )));
     }
     Ok(())
@@ -116,14 +116,14 @@ impl<S: Unique, V: Unique> VoteProcessor<S, V> {
             return Err(if e.is_invalid_signer() {
                 QuilError::InvalidVote(format!(
                     "vote {} for rank {} is not signed by an authorized participant: {}",
-                    vote.identity(),
+                    hex::encode(vote.identity()),
                     vote.rank(),
                     e
                 ))
             } else if e.is_invalid_signature() {
                 QuilError::InvalidVote(format!(
                     "vote {} for rank {} has an invalid proving signature: {}",
-                    vote.identity(),
+                    hex::encode(vote.identity()),
                     vote.rank(),
                     e
                 ))
@@ -143,7 +143,7 @@ impl<S: Unique, V: Unique> VoteProcessor<S, V> {
             .map_err(|e| {
                 QuilError::Consensus(format!(
                     "unexpected exception adding signature from vote {} to proving aggregator: {}",
-                    vote.identity(),
+                    hex::encode(vote.identity()),
                     e
                 ))
             })?;
@@ -253,7 +253,7 @@ mod tests {
     impl WeightedSignatureAggregator for StubAgg {
         fn verify(&self, signer_id: &Identity, sig: &[u8]) -> Result<()> {
             if !self.valid_signers.contains(signer_id) {
-                return Err(QuilError::InvalidSigner(format!("{}", signer_id)));
+                return Err(QuilError::InvalidSigner(hex::encode(signer_id)));
             }
             if self.invalid_sigs.iter().any(|s| s == sig) {
                 return Err(QuilError::InvalidSignature("bad sig".into()));
@@ -263,7 +263,7 @@ mod tests {
         fn trusted_add(&self, signer_id: &Identity, _sig: &[u8]) -> Result<u64> {
             let mut added = self.added.lock().unwrap();
             if added.contains(signer_id) {
-                return Err(QuilError::DuplicatedSigner(signer_id.clone()));
+                return Err(QuilError::DuplicatedSigner(hex::encode(signer_id)));
             }
             added.push(signer_id.clone());
             let mut t = self.total.lock().unwrap();

@@ -145,12 +145,25 @@ pub trait FrameProver: Send + Sync {
         header: &crate::proto::global::FrameHeader,
     ) -> Result<Vec<u8>>;
 
+    /// Build a new `GlobalFrameHeader` for `previous_frame.frame_number + 1`.
+    /// Mirrors Go's `WesolowskiFrameProver.ProveGlobalFrameHeader` at
+    /// `vdf/wesolowski_frame_prover.go:397-493` exactly:
+    ///
+    ///   parent     = poseidon(previous_frame.output[:516])
+    ///   challenge  = sha3(frame#||timestamp||difficulty||parent||
+    ///                     commitments...||prover_root||request_root)
+    ///   output     = WesolowskiSolve(challenge, difficulty)
+    ///   signature  = signer.SignWithDomain(challenge||output, "global")
     fn prove_global_frame_header(
         &self,
-        frame_number: u64,
-        parent_selector: &[u8],
+        previous_frame: &crate::proto::global::GlobalFrameHeader,
+        commitments: &[Vec<u8>],
+        prover_root: &[u8],
+        request_root: &[u8],
+        signer: &dyn Signer,
+        timestamp: i64,
         difficulty: u32,
-        prover: &[u8],
+        prover_index: u8,
     ) -> Result<crate::proto::global::GlobalFrameHeader>;
 
     fn verify_global_frame_header(
@@ -173,6 +186,42 @@ pub trait FrameProver: Send + Sync {
         ids: &[&[u8]],
         alleged_solutions: &[&[u8]],
     ) -> Result<bool>;
+
+    /// Verify the BLS aggregate signature carried by an app-shard frame
+    /// header. Mirrors Go
+    /// `WesolowskiFrameProver.VerifyFrameHeaderSignature` at
+    /// `vdf/wesolowski_frame_prover.go:327-395`.
+    ///
+    /// Returns `Ok(true)` when the signature verifies against the
+    /// signers' aggregated pubkey. If `ids` is `Some`, additionally
+    /// verifies the multi-proof carried in the signature bytes past
+    /// offset 74.
+    ///
+    /// Default implementation returns an error — callers should use a
+    /// real `WesolowskiFrameProver` when BLS verify is required.
+    fn verify_frame_header_signature(
+        &self,
+        _header: &crate::proto::global::FrameHeader,
+        _bls: &dyn BlsConstructor,
+        _ids: Option<&[&[u8]]>,
+    ) -> Result<bool> {
+        Err(crate::error::QuilError::Internal(
+            "FrameProver::verify_frame_header_signature not implemented".into(),
+        ))
+    }
+
+    /// Verify the BLS aggregate signature on a `GlobalFrameHeader`.
+    /// Mirrors Go `WesolowskiFrameProver.VerifyGlobalHeaderSignature`
+    /// at `vdf/wesolowski_frame_prover.go:565-640`.
+    fn verify_global_header_signature(
+        &self,
+        _header: &crate::proto::global::GlobalFrameHeader,
+        _bls: &dyn BlsConstructor,
+    ) -> Result<bool> {
+        Err(crate::error::QuilError::Internal(
+            "FrameProver::verify_global_header_signature not implemented".into(),
+        ))
+    }
 }
 
 /// Result of a range proof generation.

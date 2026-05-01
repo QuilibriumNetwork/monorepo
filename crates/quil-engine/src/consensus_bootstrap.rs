@@ -33,13 +33,29 @@ pub struct ConsensusConfig {
 
 impl Default for ConsensusConfig {
     fn default() -> Self {
+        // Mostly Go's values at
+        // `consensus/participant/participant.go:46-106`:
+        //   - min_replica_timeout = 36s
+        //   - max_replica_timeout = 3 min
+        //   - timeout_adjustment_factor = 1.2
+        //   - happy_path_max_round_failures = 6
+        //   - max_rebroadcast_interval = 28s
+        // …with `proposal_duration` bumped from Go's 8s to 10s.
+        // Go's 8s was slow in practice (its propose path adds many
+        // ms of overhead the Rust port doesn't have), so an 8s nominal
+        // delay translated to ~10s wall-clock there. In Rust the
+        // delay is exact, so we set it explicitly to the target 10s
+        // cadence the chain is calibrated around.
+        // Critically, proposal_duration < min_timeout — otherwise the
+        // round-timeout fires at or before the leader's first
+        // broadcast and every rank ends in a timeout instead of a QC.
         Self {
             filter: vec![0x00],
-            min_timeout: Duration::from_secs(10),
-            max_timeout: Duration::from_secs(60),
-            timeout_adjustment_factor: 1.5,
-            happy_path_max_round_failures: 3,
-            max_rebroadcast_interval: Duration::from_secs(30),
+            min_timeout: Duration::from_secs(36),
+            max_timeout: Duration::from_secs(180),
+            timeout_adjustment_factor: 1.2,
+            happy_path_max_round_failures: 6,
+            max_rebroadcast_interval: Duration::from_secs(28),
             proposal_duration: Duration::from_secs(10),
         }
     }
@@ -132,7 +148,19 @@ impl ConsensusComponents {
             self.notifier,
         ));
 
-        let (event_loop, handle) = EventLoop::new(handler, Instant::now());
+        // Delay consensus loop start by 45s so the BlossomSub mesh has
+        // time to form before the leader broadcasts its first proposal.
+        // BlossomSub heartbeats every 1s and we observed first network
+        // message arrival ~25–30s after startup on the local 4-node
+        // bootstrap; a 20s delay was not enough to clear that
+        // formation latency. Without the delay, the leader's initial
+        // GlobalProposal lands on a bitmask that has zero peers
+        // grafted into the mesh — followers never see the proposal,
+        // never vote, and the chain stalls at rank 1.
+        let (event_loop, handle) = EventLoop::new(
+            handler,
+            Instant::now() + std::time::Duration::from_secs(45),
+        );
 
         tokio::spawn(async move {
             if let Err(e) = event_loop.run().await {

@@ -67,6 +67,10 @@ struct WorkerState {
     /// When true, the lifecycle skips this worker during
     /// auto-allocation; operators pin filters via external tooling.
     manually_managed: bool,
+    /// Whether the worker's filter is fully active in the registry
+    /// (allocation Status=Active or Paused). Mirrors Go's
+    /// `WorkerInfo.Allocated` field.
+    allocated: bool,
     cancel: CancellationToken,
     tx: mpsc::Sender<MasterToWorker>,
     handle: Option<JoinHandle<()>>,
@@ -340,6 +344,7 @@ impl ThreadWorkerManager {
             filter: Vec::new(),
             pending_filter_frame: 0,
             manually_managed: false,
+            allocated: false,
             cancel,
             tx,
             handle: Some(handle),
@@ -396,6 +401,7 @@ impl WorkerManager for ThreadWorkerManager {
                 total_storage: 0,
                 manually_managed: w.manually_managed,
                 pending_filter_frame: w.pending_filter_frame,
+                allocated: w.allocated,
             })
             .collect())
     }
@@ -416,6 +422,14 @@ impl WorkerManager for ThreadWorkerManager {
         let mut workers = self.workers.lock().unwrap();
         if let Some(w) = workers.get_mut(&core_id) {
             w.manually_managed = manually_managed;
+        }
+        Ok(())
+    }
+
+    fn set_allocated(&self, core_id: u32, allocated: bool) -> Result<()> {
+        let mut workers = self.workers.lock().unwrap();
+        if let Some(w) = workers.get_mut(&core_id) {
+            w.allocated = allocated;
         }
         Ok(())
     }

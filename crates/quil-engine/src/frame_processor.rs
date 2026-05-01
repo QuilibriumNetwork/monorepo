@@ -54,12 +54,25 @@ pub fn process_global_frame_with_rewards(
     );
 
     for (i, bundle) in frame.requests.iter().enumerate() {
-        // Serialize the bundle to protobuf bytes (prost encoding).
-        // Go uses `req.ToCanonicalBytes()` which is its own format,
-        // but the engine's ProcessMessage accepts both — we use prost
-        // for now and can switch to canonical bytes when the full
-        // canonical MessageBundle encoder is wired for prost types.
-        let request_bytes = bundle.encode_to_vec();
+        // Re-encode the proto bundle as canonical bytes (Quilibrium's
+        // big-endian framing with type prefix `0x0312`) — the
+        // execution engines decode via
+        // `CanonicalMessageBundle::from_canonical_bytes`; feeding them
+        // prost wire bytes silently fails the type-prefix check and
+        // skips every message (matches Go's `ToCanonicalBytes()` path).
+        let request_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(
+                    frame = frame_number,
+                    index = i,
+                    error = %e,
+                    "skipping bundle that failed canonical encoding",
+                );
+                skipped += 1;
+                continue;
+            }
+        };
 
         if request_bytes.is_empty() {
             warn!(frame = frame_number, index = i, "empty request bytes");
@@ -177,7 +190,13 @@ pub fn process_global_frame_with_fees(
     let mut skipped = 0usize;
 
     for (i, bundle) in frame.requests.iter().enumerate() {
-        let request_bytes = bundle.encode_to_vec();
+        let request_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+            Ok(b) => b,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
         if request_bytes.is_empty() {
             skipped += 1;
             continue;

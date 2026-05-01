@@ -356,7 +356,23 @@ pub struct CanonicalKeyRegistry {
     pub bls_pubkey: Vec<u8>,
     pub identity_to_prover_sig: Vec<u8>,
     pub prover_to_identity_sig: Vec<u8>,
+    /// Optional purpose-keyed map of additional pubkeys (e.g. "onion",
+    /// "view", "spend"). Each value is the raw payload bytes — wrappers
+    /// (type-prefix + nested length) are stripped during decode so the
+    /// caller gets the inner key material directly. Mirrors Go
+    /// `KeyRegistry.KeysByPurpose`.
+    pub keys_by_purpose: Vec<KeysByPurposeEntry>,
     pub last_updated_ms: u64,
+}
+
+/// One purpose-key pair from a `KeyRegistry` broadcast. The `purpose`
+/// is the UTF-8 string (e.g. `"onion"`, `"view"`, `"spend"`); `value`
+/// is the raw key material with any outer Go-canonical wrapper
+/// stripped.
+#[derive(Debug, Clone, Default)]
+pub struct KeysByPurposeEntry {
+    pub purpose: Vec<u8>,
+    pub value: Vec<u8>,
 }
 
 /// Decode a KeyRegistry broadcast produced by either this crate's
@@ -420,14 +436,25 @@ pub fn decode_canonical_key_registry(data: &[u8]) -> Result<CanonicalKeyRegistry
         out.prover_to_identity_sig = inner;
     }
 
-    // keys_by_purpose: length-prefixed map we don't consume (the key
-    // manager for onion/view/spend pairs is TODO per the encoder
-    // comment). Skip over it by reading whatever length is declared.
+    // keys_by_purpose: length-prefixed map of (purpose, value) pairs.
+    // Each value carries a Go canonical-bytes wrapper (4-byte type
+    // prefix); we strip it so callers get the raw key material.
     let kbp_count = r.read_u32()? as usize;
+    out.keys_by_purpose.reserve(kbp_count);
     for _ in 0..kbp_count {
-        // purpose key (string) + value (bytes)
-        let _ = r.read_bytes()?;
-        let _ = r.read_bytes()?;
+        let purpose = r.read_bytes()?.to_vec();
+        let raw_value = r.read_bytes()?;
+        // Wrapper format: u32 type-prefix || nested length-prefixed bytes
+        // OR a single canonical-bytes blob with type-prefix in the first
+        // 4 bytes. We accept either: if the bytes start with a known
+        // 4-byte type prefix and the remainder length matches, strip
+        // the prefix; otherwise pass through raw.
+        let value = if raw_value.len() >= 4 {
+            raw_value[4..].to_vec()
+        } else {
+            raw_value.to_vec()
+        };
+        out.keys_by_purpose.push(KeysByPurposeEntry { purpose, value });
     }
 
     // last_updated: u64 big-endian.

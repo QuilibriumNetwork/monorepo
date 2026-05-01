@@ -237,6 +237,26 @@ impl QuorumCertificate {
             aggregate_signature: AggregateSignature::empty(),
         }
     }
+
+    /// Build a wire `QuorumCertificate` from a `dyn quil_consensus::models::
+    /// QuorumCertificate` trait object. Used by producer paths that need to
+    /// embed a previously-aggregated QC (e.g. the latest QC inside a
+    /// `TimeoutState`) into wire bytes.
+    pub fn from_trait_object(qc: &dyn quil_consensus::models::QuorumCertificate) -> Self {
+        let agg = qc.aggregated_signature();
+        Self {
+            filter: qc.filter().to_vec(),
+            rank: qc.rank(),
+            frame_number: qc.frame_number(),
+            selector: qc.identity().clone(),
+            timestamp: qc.timestamp(),
+            aggregate_signature: AggregateSignature {
+                public_key: agg.public_key().to_vec(),
+                signature: agg.signature().to_vec(),
+                bitmask: agg.bitmask().to_vec(),
+            },
+        }
+    }
 }
 
 // =====================================================================
@@ -298,6 +318,30 @@ impl TimeoutCertificate {
         let aggregate_signature = AggregateSignature::from_canonical_bytes(&agg_bytes, &mut ac)?;
         Ok(Self { filter, rank, latest_ranks, latest_quorum_certificate, timestamp, aggregate_signature })
     }
+
+    /// Build a wire `TimeoutCertificate` from a `dyn quil_consensus::models::
+    /// TimeoutCertificate` trait object. The embedded QC is converted via
+    /// [`QuorumCertificate::from_trait_object`].
+    pub fn from_trait_object(tc: &dyn quil_consensus::models::TimeoutCertificate) -> Self {
+        let agg = tc.aggregated_signature();
+        let latest_quorum_certificate =
+            Some(QuorumCertificate::from_trait_object(tc.latest_quorum_cert()));
+        Self {
+            filter: tc.filter().to_vec(),
+            rank: tc.rank(),
+            latest_ranks: tc.latest_ranks().to_vec(),
+            latest_quorum_certificate,
+            // Go's TC embeds no separate timestamp on the trait surface;
+            // wire field defaults to 0 (matches Go behavior — the per-replica
+            // timestamps live inside the embedded QC and signers).
+            timestamp: 0,
+            aggregate_signature: AggregateSignature {
+                public_key: agg.public_key().to_vec(),
+                signature: agg.signature().to_vec(),
+                bitmask: agg.bitmask().to_vec(),
+            },
+        }
+    }
 }
 
 // =====================================================================
@@ -326,7 +370,7 @@ impl QuorumCertificate {
             filter: self.filter,
             rank: self.rank,
             frame_number: self.frame_number,
-            identity: hex::encode(&self.selector),
+            identity: self.selector.clone(),
             timestamp: self.timestamp,
             agg_sig: Arc::new(WireAggregateSignature {
                 public_key: self.aggregate_signature.public_key,
@@ -536,6 +580,73 @@ impl TimeoutState {
 /// [u32 requests_root_len][requests_root]
 /// [u32 prover_len][prover]
 /// [u32 signature_len][signature]
+/// Encode a `GlobalFrame` proto into Quilibrium canonical bytes.
+/// Mirror of `decode_global_frame` — the wire format is documented
+/// in the doc-comment of `decode_global_frame`. Used by
+/// `GlobalConsumer::on_own_proposal` to produce the proposal's
+/// embedded frame bytes that go into `GlobalProposal.state`.
+pub fn encode_global_frame(
+    frame: &quil_types::proto::global::GlobalFrame,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_u32(&mut out, GLOBAL_FRAME_TYPE);
+    let header = frame
+        .header
+        .as_ref()
+        .ok_or_else(|| QuilError::InvalidArgument("GlobalFrame: missing header".into()))?;
+    let header_bytes = encode_frame_header(header)?;
+    put_bytes(&mut out, &header_bytes);
+    // For now we publish a frame with no inline requests — the
+    // bundle list grows in `make_state_proposal` once the message
+    // collector → leader provider hand-off is fully wired. Receivers
+    // tolerate `req_count = 0`.
+    put_u32(&mut out, frame.requests.len() as u32);
+    for bundle in &frame.requests {
+        let bundle_bytes = proto_message_bundle_to_canonical_bytes(bundle)?;
+        put_bytes(&mut out, &bundle_bytes);
+    }
+    Ok(out)
+}
+
+/// Encode a `GlobalFrameHeader` proto into Quilibrium canonical bytes
+/// (type prefix `0x0309`). Mirror of `decode_frame_header`.
+fn encode_frame_header(
+    header: &quil_types::proto::global::GlobalFrameHeader,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_u32(&mut out, GLOBAL_FRAME_HEADER_TYPE);
+    put_u64(&mut out, header.frame_number);
+    put_u64(&mut out, header.rank);
+    out.extend_from_slice(&header.timestamp.to_be_bytes());
+    put_u32(&mut out, header.difficulty);
+    put_bytes(&mut out, &header.output);
+    put_bytes(&mut out, &header.parent_selector);
+    put_u32(&mut out, header.global_commitments.len() as u32);
+    for c in &header.global_commitments {
+        put_bytes(&mut out, c);
+    }
+    put_bytes(&mut out, &header.prover_tree_commitment);
+    put_bytes(&mut out, &header.requests_root);
+    put_bytes(&mut out, &header.prover);
+    let sig_bytes: Vec<u8> = match header.public_key_signature_bls48581.as_ref() {
+        None => Vec::new(),
+        Some(sig) => {
+            let agg = AggregateSignature {
+                signature: sig.signature.clone(),
+                public_key: sig
+                    .public_key
+                    .as_ref()
+                    .map(|p| p.key_value.clone())
+                    .unwrap_or_default(),
+                bitmask: sig.bitmask.clone(),
+            };
+            agg.to_canonical_bytes()
+        }
+    };
+    put_bytes(&mut out, &sig_bytes);
+    Ok(out)
+}
+
 pub fn decode_global_frame(
     data: &[u8],
 ) -> Result<quil_types::proto::global::GlobalFrame> {
@@ -551,17 +662,191 @@ pub fn decode_global_frame(
     let header_bytes = read_bytes(data, &mut c)?;
     let header = decode_frame_header(&header_bytes)?;
 
-    // Requests are MessageBundle canonical bytes. Skip them for header-only
-    // decode — the execution pipeline processes requests separately via
-    // frame_processor::process_global_frame which reads from the stored frame.
-    // We include request count for validation but leave the proto requests empty
-    // since converting canonical bytes → proto MessageBundle is complex.
-    let _req_count = read_u32(data, &mut c)?;
+    // Requests: each entry is a length-prefixed MessageBundle in canonical
+    // bytes form (see Go: protobufs/global.go GlobalFrame.FromCanonicalBytes).
+    let req_count = read_u32(data, &mut c)? as usize;
+    if req_count > 100 {
+        return Err(QuilError::InvalidArgument(format!(
+            "GlobalFrame: invalid requests count {}", req_count
+        )));
+    }
+    let mut requests = Vec::with_capacity(req_count);
+    for _ in 0..req_count {
+        let bundle_bytes = read_bytes(data, &mut c)?;
+        let bundle = decode_message_bundle(&bundle_bytes)?;
+        requests.push(bundle);
+    }
 
     Ok(quil_types::proto::global::GlobalFrame {
         header: Some(header),
-        requests: Vec::new(), // populated separately by execution pipeline
+        requests,
     })
+}
+
+/// Decode canonical-bytes MessageBundle into the prost proto type.
+///
+/// Inner request payloads are routed by their type discriminator and
+/// converted to proto via existing canonical→proto converters in
+/// `quil_execution::global_intrinsic`. Variants without converters
+/// (token, hypergraph, compute, frame_header, kick, seniority_merge,
+/// alt_shard_update, shard_split, shard_merge) are preserved as
+/// length-correct `MessageRequest::default()` entries so downstream
+/// consumers see the right bundle structure even when the inner oneof
+/// cannot yet be reconstructed. The bundle `timestamp` is always
+/// populated.
+pub fn decode_message_bundle(
+    data: &[u8],
+) -> Result<quil_types::proto::global::MessageBundle> {
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+    use quil_types::proto::global as pb;
+
+    let canonical = CanonicalMessageBundle::from_canonical_bytes(data)?;
+    let mut requests = Vec::with_capacity(canonical.requests.len());
+    for entry in &canonical.requests {
+        match entry {
+            None => requests.push(pb::MessageRequest::default()),
+            Some(req) => requests.push(canonical_request_to_proto(req)),
+        }
+    }
+    Ok(pb::MessageBundle {
+        requests,
+        timestamp: canonical.timestamp,
+    })
+}
+
+/// Route a CanonicalMessageRequest's inner bytes to the appropriate
+/// proto variant via inner_type_prefix. Returns a default (`request:
+/// None`) `MessageRequest` for variants whose canonical→proto
+/// converters are not yet ported.
+fn canonical_request_to_proto(
+    req: &quil_execution::message_envelope::CanonicalMessageRequest,
+) -> quil_types::proto::global::MessageRequest {
+    use quil_execution::global_intrinsic::{conversions, prover_filter_ops, prover_join, prover_ops};
+    use quil_types::proto::global::{message_request::Request, MessageRequest};
+
+    let inner = &req.inner_bytes;
+    let request: Option<Request> = match req.inner_type_prefix {
+        prover_join::TYPE_PROVER_JOIN => prover_join::ProverJoin::from_canonical_bytes(inner)
+            .ok()
+            .map(|j| Request::Join(conversions::prover_join_to_proto(&j))),
+        prover_filter_ops::TYPE_PROVER_LEAVE => prover_filter_ops::ProverLeave::from_canonical_bytes(inner)
+            .ok()
+            .map(|l| Request::Leave(conversions::prover_leave_to_proto(&l))),
+        prover_filter_ops::TYPE_PROVER_PAUSE => prover_filter_ops::ProverPause::from_canonical_bytes(inner)
+            .ok()
+            .map(|p| Request::Pause(conversions::prover_pause_to_proto(&p))),
+        prover_filter_ops::TYPE_PROVER_RESUME => prover_filter_ops::ProverResume::from_canonical_bytes(inner)
+            .ok()
+            .map(|r| Request::Resume(conversions::prover_resume_to_proto(&r))),
+        prover_ops::TYPE_PROVER_CONFIRM => prover_ops::ProverConfirm::from_canonical_bytes(inner)
+            .ok()
+            .map(|c| Request::Confirm(conversions::prover_confirm_to_proto(&c))),
+        prover_ops::TYPE_PROVER_REJECT => prover_ops::ProverReject::from_canonical_bytes(inner)
+            .ok()
+            .map(|r| Request::Reject(conversions::prover_reject_to_proto(&r))),
+        prover_ops::TYPE_PROVER_UPDATE => prover_ops::ProverUpdate::from_canonical_bytes(inner)
+            .ok()
+            .map(|u| Request::Update(conversions::prover_update_to_proto(&u))),
+        // The remaining 22 variants (Kick, TokenDeploy/Update, Transaction,
+        // PendingTransaction, MintTransaction, HypergraphDeploy/Update,
+        // VertexAdd/Remove, HyperedgeAdd/Remove, ComputeDeploy/Update,
+        // CodeDeploy/Execute/Finalize, Shard, AltShardUpdate, SeniorityMerge,
+        // ShardSplit, ShardMerge) require canonical→proto converters that
+        // are not yet ported. The bundle structure (count + timestamp) is
+        // preserved; the inner oneof is left None until those converters
+        // land.
+        _ => None,
+    };
+    MessageRequest {
+        timestamp: 0,
+        request,
+    }
+}
+
+// =====================================================================
+// Proto MessageBundle → canonical bytes
+// =====================================================================
+//
+// The `decode_global_frame` path turns canonical-bytes bundles into prost
+// proto types (losing the original wire bytes). When a downstream consumer
+// — most importantly the frame materializer — needs to feed bundles to the
+// execution engines (which expect canonical bytes per Go's
+// `req.ToCanonicalBytes()`), we re-serialize from proto.
+//
+// Only the variants whose canonical→proto and proto→canonical converters
+// are both ported survive the round-trip. Unsupported variants in a bundle
+// are skipped with a `None` slot so the bundle structure (count +
+// timestamp) is preserved.
+
+/// Re-encode a proto `MessageBundle` as canonical bytes (type prefix
+/// `0x0312`). Used by the frame materializer to feed bundles to the
+/// execution engines, which expect canonical-bytes input matching Go's
+/// `req.ToCanonicalBytes()`.
+///
+/// Variants without a `_to_canonical_bytes` ↔ `_from_proto` round-trip
+/// are emitted as empty (`None`) slots.
+pub fn proto_message_bundle_to_canonical_bytes(
+    bundle: &quil_types::proto::global::MessageBundle,
+) -> Result<Vec<u8>> {
+    use quil_execution::message_envelope::{
+        CanonicalMessageBundle, CanonicalMessageRequest,
+    };
+
+    let mut requests: Vec<Option<CanonicalMessageRequest>> = Vec::with_capacity(bundle.requests.len());
+    for req in &bundle.requests {
+        match proto_message_request_to_canonical(req) {
+            Some(canon_req) => requests.push(Some(canon_req)),
+            None => requests.push(None),
+        }
+    }
+
+    CanonicalMessageBundle {
+        requests,
+        timestamp: bundle.timestamp,
+    }
+    .to_canonical_bytes()
+}
+
+/// Build a `CanonicalMessageRequest` from a proto `MessageRequest`.
+/// Returns `None` if the proto's oneof variant has no inverse converter
+/// yet (alongside the other 22 variants the canonical→proto path drops).
+fn proto_message_request_to_canonical(
+    req: &quil_types::proto::global::MessageRequest,
+) -> Option<quil_execution::message_envelope::CanonicalMessageRequest> {
+    use quil_execution::global_intrinsic::conversions;
+    use quil_execution::message_envelope::CanonicalMessageRequest;
+    use quil_types::proto::global::message_request::Request;
+
+    let inner = req.request.as_ref()?;
+    let inner_bytes = match inner {
+        Request::Join(p) => conversions::prover_join_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::Leave(p) => conversions::prover_leave_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::Pause(p) => conversions::prover_pause_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::Resume(p) => conversions::prover_resume_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::Confirm(p) => conversions::prover_confirm_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::Reject(p) => conversions::prover_reject_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::Update(p) => conversions::prover_update_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        // Other 22 variants — Kick, TokenDeploy, Transaction, etc. — do
+        // not yet have proto→canonical converters. Symmetric with
+        // `canonical_request_to_proto` which also doesn't handle them.
+        _ => return None,
+    };
+
+    CanonicalMessageRequest::wrap(inner_bytes).ok()
 }
 
 const GLOBAL_FRAME_HEADER_TYPE: u32 = 0x0309;
@@ -724,5 +1009,114 @@ mod tests {
         put_u32(&mut data, GLOBAL_PROPOSAL_TYPE);
         data.extend_from_slice(&[0; 100]);
         assert_eq!(peek_consensus_type(&data), Some(GLOBAL_PROPOSAL_TYPE));
+    }
+
+    #[test]
+    fn decode_global_frame_round_trips_two_bundles() {
+        use quil_execution::global_intrinsic::frame_header::GlobalFrameHeader as CanonicalGlobalHeader;
+        use quil_execution::global_intrinsic::prover_filter_ops::ProverPause;
+        use quil_execution::global_intrinsic::AddressedSignature;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+
+        // Build two MessageBundles in canonical-bytes form. One bundle
+        // carries a routable ProverPause (we expect a populated oneof
+        // after decode), the other has an opaque inner type to exercise
+        // the fallback `request: None` path.
+        let pause_bytes = ProverPause {
+            filter: vec![0xAAu8; 32],
+            frame_number: 7,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+        }
+        .to_canonical_bytes()
+        .unwrap();
+
+        let bundle1 = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest::wrap(pause_bytes).unwrap())],
+            timestamp: 1_700_000_000,
+        };
+        // Opaque inner type 0xDEAD with non-empty payload — routes via
+        // the unknown-variant fallback (request stays None).
+        let mut opaque_inner = Vec::new();
+        put_u32(&mut opaque_inner, 0xDEAD);
+        opaque_inner.extend_from_slice(&[0xEEu8; 16]);
+        let bundle2 = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest::wrap(opaque_inner).unwrap())],
+            timestamp: -42,
+        };
+
+        let bundle1_bytes = bundle1.to_canonical_bytes().unwrap();
+        let bundle2_bytes = bundle2.to_canonical_bytes().unwrap();
+
+        // Build a GlobalFrameHeader in canonical bytes form.
+        let header = CanonicalGlobalHeader {
+            frame_number: 12345,
+            rank: 1,
+            timestamp: 1_700_000_001,
+            difficulty: 100_000,
+            output: vec![0x01; 32],
+            parent_selector: vec![0x02; 32],
+            global_commitments: vec![vec![0x03; 32]],
+            prover_tree_commitment: vec![0x04; 32],
+            requests_root: vec![0x05; 32],
+            prover: vec![0x06; 32],
+            public_key_signature_bls48581: Vec::new(),
+        };
+        let header_bytes = header.to_canonical_bytes().unwrap();
+
+        // Frame wire format: [u32 type][u32 hdr_len][hdr][u32 req_count]
+        //   [for each req: u32 len, bytes].
+        let mut frame = Vec::new();
+        put_u32(&mut frame, GLOBAL_FRAME_TYPE);
+        put_bytes(&mut frame, &header_bytes);
+        put_u32(&mut frame, 2);
+        put_bytes(&mut frame, &bundle1_bytes);
+        put_bytes(&mut frame, &bundle2_bytes);
+
+        let decoded = decode_global_frame(&frame).expect("decode");
+        let h = decoded.header.as_ref().expect("header");
+        assert_eq!(h.frame_number, 12345);
+        assert_eq!(h.rank, 1);
+
+        assert_eq!(decoded.requests.len(), 2);
+        assert_eq!(decoded.requests[0].timestamp, 1_700_000_000);
+        assert_eq!(decoded.requests[1].timestamp, -42);
+
+        // Bundle 1 has a single request that should decode into a
+        // populated `Pause` variant.
+        assert_eq!(decoded.requests[0].requests.len(), 1);
+        let req0 = &decoded.requests[0].requests[0];
+        match &req0.request {
+            Some(quil_types::proto::global::message_request::Request::Pause(p)) => {
+                assert_eq!(p.frame_number, 7);
+                assert_eq!(p.filter, vec![0xAAu8; 32]);
+            }
+            other => panic!("expected Pause variant, got {:?}", other.is_some()),
+        }
+
+        // Bundle 2 has a single request whose inner type is unknown to
+        // the router — it should be a default-shaped MessageRequest
+        // (request: None) so the bundle structure is preserved.
+        assert_eq!(decoded.requests[1].requests.len(), 1);
+        let req1 = &decoded.requests[1].requests[0];
+        assert!(req1.request.is_none());
+    }
+
+    #[test]
+    fn decode_global_frame_rejects_too_many_requests() {
+        // header_len=0 (still bogus header — but we never get to header
+        // parsing because count check fires first... actually we do
+        // parse the header. Use a minimal valid header.)
+        use quil_execution::global_intrinsic::frame_header::GlobalFrameHeader as CanonicalGlobalHeader;
+        let header = CanonicalGlobalHeader::default();
+        let header_bytes = header.to_canonical_bytes().unwrap();
+
+        let mut frame = Vec::new();
+        put_u32(&mut frame, GLOBAL_FRAME_TYPE);
+        put_bytes(&mut frame, &header_bytes);
+        put_u32(&mut frame, 101); // exceeds the 100 cap mirror'd from Go
+        assert!(decode_global_frame(&frame).is_err());
     }
 }

@@ -13,25 +13,39 @@ fn main() {
     // dropped as "unused" because the references in `libclassgroup.rlib`
     // haven't been seen yet — leaving mpfr_*/fmpz_* symbols unresolved.
     //
-    // Flint is forced static: `libflint-dev` in the apt base stage ships
-    // a `libflint.so` whose ABI diverges from the source-built flint-3.0
-    // under `/usr/local/lib/libflint.a` that vdf.cpp was written against
-    // (e.g. `_fmpz_clear_mpz` was renamed in newer FLINT). macOS Homebrew
-    // only has dynamic flint, so stay with `rustc-link-arg` there.
+    // Flint and GMP are both forced static on Linux:
+    //   * `libflint-dev` in the apt base ships a `libflint.so` with an ABI
+    //     that diverges from the source-built flint-3.0 under
+    //     `/usr/local/lib/libflint.a` that vdf.cpp was written against
+    //     (e.g. `_fmpz_clear_mpz` was renamed in newer FLINT).
+    //   * FLINT's static archive references GMP-internal `__gmpn_*` symbols
+    //     that aren't guaranteed to be exported by every host's libgmp.so,
+    //     producing runtime `symbol lookup error: undefined symbol:
+    //     __gmpn_modexact_1_odd` on downstream machines. Bundling the
+    //     source-built static GMP (see gmp-builder stage in the Dockerfiles)
+    //     makes the binary self-contained.
+    //
+    // Link order matters for static resolution: flint depends on gmp and
+    // mpfr, so those must come AFTER `-lflint` on the link line.
+    //
+    // macOS Homebrew provides dynamic libs only. Use `rustc-link-lib`
+    // rather than `rustc-link-arg` so the `-l` flags propagate to
+    // downstream test binaries that link `classgroup.rlib` — `link-arg`
+    // only applies to the emitting crate's own binaries.
     if target == "aarch64-apple-darwin" {
-        println!("cargo:rustc-link-arg=-lgmp");
-        println!("cargo:rustc-link-arg=-lflint");
-        println!("cargo:rustc-link-arg=-lmpfr");
+        println!("cargo:rustc-link-lib=gmp");
+        println!("cargo:rustc-link-lib=flint");
+        println!("cargo:rustc-link-lib=mpfr");
     } else {
         println!("cargo:rustc-link-lib=static=flint");
         println!("cargo:rustc-link-lib=mpfr");
-        println!("cargo:rustc-link-lib=gmp");
+        println!("cargo:rustc-link-lib=static=gmp");
     }
 
     if target == "aarch64-apple-darwin" {
         println!("cargo:rustc-link-search=/opt/homebrew/Cellar/gmp/6.3.0/lib");
-        println!("cargo:rustc-link-search=/opt/homebrew/Cellar/flint/3.1.3-p1/lib");
-        println!("cargo:rustc-link-search=/opt/homebrew/Cellar/mpfr/4.2.1/lib");
+        println!("cargo:rustc-link-search=/opt/homebrew/Cellar/flint/3.4.0/lib");
+        println!("cargo:rustc-link-search=/opt/homebrew/Cellar/mpfr/4.2.2/lib");
     } else if target == "aarch64-unknown-linux-gnu" {
         println!("cargo:rustc-link-search=/usr/local/lib");
         println!("cargo:rustc-link-search=/usr/lib/aarch64-linux-gnu/");
@@ -46,11 +60,11 @@ fn main() {
         .cpp(true)
         .file("src/vdf.cpp")
         .flag("-I/opt/homebrew/Cellar/gmp/6.3.0/include")
-        .flag("-I/opt/homebrew/Cellar/flint/3.1.3-p1/include")
-        .flag("-I/opt/homebrew/Cellar/mpfr/4.2.1/include")
+        .flag("-I/opt/homebrew/Cellar/flint/3.4.0/include")
+        .flag("-I/opt/homebrew/Cellar/mpfr/4.2.2/include")
         .flag("-L/opt/homebrew/Cellar/gmp/6.3.0/lib")
-        .flag("-L/opt/homebrew/Cellar/flint/3.1.3-p1/lib")
-        .flag("-L/opt/homebrew/Cellar/mpfr/4.2.1/lib")
+        .flag("-L/opt/homebrew/Cellar/flint/3.4.0/lib")
+        .flag("-L/opt/homebrew/Cellar/mpfr/4.2.2/lib")
         .flag("-lgmp")
         .flag("-lflint")
         .flag("-lmpfr")

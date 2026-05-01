@@ -15,5 +15,5 @@ pub use clock::RocksClockStore;
 pub use token::RocksTokenStore;
 pub use key::RocksKeyStore;
 pub use shards::RocksShardsStore;
-pub use hypergraph::RocksHypergraphStore;
+pub use hypergraph::{RocksHypergraphSnapshot, RocksHypergraphStore};
 pub use dispatch::RocksInboxStore;

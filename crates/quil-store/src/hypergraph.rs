@@ -21,6 +21,13 @@ impl RocksHypergraphStore {
         Self { db }
     }
 
+    /// Capture a point-in-time snapshot of all tree blobs. The returned
+    /// handle reflects the store's state at the moment of capture and
+    /// is immune to subsequent writes through this store.
+    pub fn capture_snapshot(&self) -> Result<Arc<RocksHypergraphSnapshot>> {
+        Ok(Arc::new(RocksHypergraphSnapshot::capture(&self.db)?))
+    }
+
     /// Save a fully-serialized vector commitment tree as a single blob,
     /// keyed by `(set_type, phase_type, shard_key)`. The bytes should be
     /// the output of `quil_tries::serialize_tree`.
@@ -123,7 +130,86 @@ impl RocksHypergraphStore {
 }
 
 use std::collections::HashMap;
-use quil_types::store::{ChangeRecord, HypergraphStore, Transaction};
+use quil_types::store::{ChangeRecord, HypergraphStore, SnapshotReadable, Transaction};
+
+use crate::encoding::HG_TREE_BLOB_PREFIX;
+
+/// Frozen-bytes snapshot of all hypergraph tree blobs at capture time.
+///
+/// Lifetime / ownership choice: rocksdb 0.22's `Snapshot<'a>` borrows
+/// the `DB`, and binding it to an `Arc<DB>` would require either a
+/// self-referential struct or unsafe lifetime erasure. Rather than
+/// reach for those, we copy every `(set, phase, shard) → tree_blob`
+/// entry from the live store into a `HashMap` at publish time. This
+/// mirrors the semantic Go gets from Pebble's MVCC snapshot — reads
+/// against the snapshot reflect the publish-time state, immune to
+/// later writes — at the cost of holding O(num_shards * num_phases)
+/// blobs in memory per retained generation. With
+/// `MAX_GENERATIONS = 10` and the typical handful of active shards
+/// per node, this stays small. Per-vertex underlying-data blobs are
+/// NOT captured because the sync server doesn't read them; the trait
+/// only exposes `load_tree_blob`.
+pub struct RocksHypergraphSnapshot {
+    /// Key: full `hypergraph_tree_blob_key` bytes. Value: tree blob.
+    blobs: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl RocksHypergraphSnapshot {
+    /// Walk the live DB and copy every tree-blob entry into memory.
+    /// Iterates only the `HG_TREE_BLOB_PREFIX` range, so cost is
+    /// proportional to the number of (set, phase, shard) tuples — not
+    /// the entire DB.
+    pub fn capture(db: &rocksdb::DB) -> Result<Self> {
+        let prefix = [HG_TREE_BLOB_PREFIX];
+        let iter = db.iterator(rocksdb::IteratorMode::From(
+            &prefix,
+            rocksdb::Direction::Forward,
+        ));
+        let mut blobs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        for entry in iter {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            blobs.insert(k.into_vec(), v.into_vec());
+        }
+        Ok(Self { blobs })
+    }
+
+    /// Number of tree blobs frozen in this snapshot. Test hook.
+    #[doc(hidden)]
+    pub fn blob_count(&self) -> usize {
+        self.blobs.len()
+    }
+}
+
+impl SnapshotReadable for RocksHypergraphSnapshot {
+    fn load_tree_blob(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &quil_types::store::ShardKey,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
+        Ok(self.blobs.get(&key).cloned())
+    }
+}
+
+/// Live-store adapter — lets the sync server call the same
+/// `SnapshotReadable` interface against the current DB when no
+/// generation-bound snapshot is available. Reads always go to the
+/// live store, so concurrent writes ARE visible (unlike a captured
+/// snapshot). Use this only as the fallback path.
+impl SnapshotReadable for RocksHypergraphStore {
+    fn load_tree_blob(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &quil_types::store::ShardKey,
+    ) -> Result<Option<Vec<u8>>> {
+        RocksHypergraphStore::load_tree_blob(self, set_type, phase_type, shard_key)
+    }
+}
 
 /// RocksDB Transaction — wraps a WriteBatch for atomicity.
 pub(crate) struct RocksTxn {
@@ -279,12 +365,15 @@ impl HypergraphStore for RocksHypergraphStore {
             if commit_idx >= 4 {
                 continue;
             }
-            // Derive L1 bloom filter from L2 (shard_address) via XOR fold,
-            // matching quil_hypergraph::addressing::shard_key_for_location.
-            let mut l1 = [0u8; 3];
-            for (i, &b) in shard_address.iter().enumerate() {
-                l1[i % 3] ^= b;
-            }
+            // Derive L1 bloom filter from L2 (shard_address) via
+            // SHAKE256-based GetBloomFilterIndices(addr, 256, 3),
+            // matching Go's `node/store/hypergraph.go:2083` and
+            // `quil_hypergraph::addressing::get_bloom_filter_indices`.
+            let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(
+                shard_address,
+                256,
+                3,
+            );
             let mut l2 = [0u8; 32];
             l2.copy_from_slice(shard_address);
             let sk = ShardKey { l1, l2 };
@@ -443,6 +532,11 @@ impl HypergraphStore for RocksHypergraphStore {
     fn track_change(&self, _txn: &dyn Transaction, _key: &[u8], _old_value: Option<&[u8]>, _frame_number: u64, _phase_type: &str, _set_type: &str, _shard_key: &ShardKey) -> Result<()> { Ok(()) }
     fn get_changes(&self, _frame_start: u64, _frame_end: u64, _phase_type: &str, _set_type: &str, _shard_key: &ShardKey) -> Result<Vec<ChangeRecord>> { Ok(vec![]) }
     fn untrack_change(&self, _txn: &dyn Transaction, _key: &[u8], _frame_number: u64, _phase_type: &str, _set_type: &str, _shard_key: &ShardKey) -> Result<()> { Ok(()) }
+
+    fn capture_tree_snapshot(&self) -> Result<Option<Arc<dyn SnapshotReadable>>> {
+        let snap = RocksHypergraphSnapshot::capture(&self.db)?;
+        Ok(Some(Arc::new(snap) as Arc<dyn SnapshotReadable>))
+    }
 }
 
 #[cfg(test)]
@@ -537,5 +631,74 @@ mod tests {
         assert_eq!(collected[0].0, keys[0]);
         assert_eq!(collected[1].0, keys[1]);
         assert_eq!(collected[2].0, keys[2]);
+    }
+
+    /// End-to-end check that `capture_tree_snapshot` is point-in-time:
+    /// reads through the captured snapshot reflect the bytes at capture
+    /// time, regardless of subsequent live-store writes.
+    #[test]
+    fn test_capture_tree_snapshot_is_point_in_time() {
+        let tmp = TempDir::new().unwrap();
+        let db = RocksDb::open(tmp.path()).unwrap();
+        let store = RocksHypergraphStore::new(Arc::new(db).inner());
+
+        let shard = ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
+
+        // Stage some pre-capture data across multiple phases/shards.
+        store.save_tree_blob("vertex", "adds", &shard, b"v-adds-pre").unwrap();
+        store.save_tree_blob("vertex", "removes", &shard, b"v-removes-pre").unwrap();
+
+        // Capture.
+        let snap = store.capture_snapshot().unwrap();
+
+        // Mutate the live store AFTER capture.
+        store.save_tree_blob("vertex", "adds", &shard, b"v-adds-POST").unwrap();
+        // Add a new shard entirely after capture; the snapshot must
+        // not see it.
+        let new_shard = ShardKey {
+            l1: [1u8; 3],
+            l2: [0u8; 32],
+        };
+        store
+            .save_tree_blob("hyperedge", "adds", &new_shard, b"new-shard")
+            .unwrap();
+
+        // Snapshot must still see the pre-mutation bytes for the
+        // shard that existed at capture time.
+        let snap_dyn: &dyn SnapshotReadable = snap.as_ref();
+        assert_eq!(
+            snap_dyn
+                .load_tree_blob("vertex", "adds", &shard)
+                .unwrap()
+                .as_deref(),
+            Some(&b"v-adds-pre"[..]),
+            "snapshot must reflect pre-mutation bytes"
+        );
+        assert_eq!(
+            snap_dyn
+                .load_tree_blob("vertex", "removes", &shard)
+                .unwrap()
+                .as_deref(),
+            Some(&b"v-removes-pre"[..])
+        );
+        // The post-capture insert is invisible through the snapshot.
+        assert!(snap_dyn
+            .load_tree_blob("hyperedge", "adds", &new_shard)
+            .unwrap()
+            .is_none());
+
+        // The live store DOES see the new state — confirming we
+        // really did mutate the underlying DB after capture.
+        assert_eq!(
+            store.load_tree_blob("vertex", "adds", &shard).unwrap().as_deref(),
+            Some(&b"v-adds-POST"[..])
+        );
+
+        // Sanity: the snapshot covers exactly the pre-capture blobs
+        // (2 entries: v-adds-pre and v-removes-pre).
+        assert_eq!(snap.blob_count(), 2);
     }
 }

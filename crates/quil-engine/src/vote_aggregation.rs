@@ -196,7 +196,7 @@ impl VoteAggregationConsumer<GlobalVote> for LoggingVoteConsumer {
     fn on_vote_processed(&self, vote: &GlobalVote) {
         debug!(
             rank = vote.rank(),
-            source = %vote.source(),
+            source = %hex::encode(vote.source()),
             "vote processed by aggregator"
         );
     }
@@ -204,7 +204,7 @@ impl VoteAggregationConsumer<GlobalVote> for LoggingVoteConsumer {
     fn on_invalid_vote_detected(&self, vote: &GlobalVote, reason: &str) {
         warn!(
             rank = vote.rank(),
-            source = %vote.source(),
+            source = %hex::encode(vote.source()),
             reason,
             "invalid vote from peer"
         );
@@ -213,26 +213,28 @@ impl VoteAggregationConsumer<GlobalVote> for LoggingVoteConsumer {
     fn on_double_voting_detected(&self, first: &GlobalVote, conflicting: &GlobalVote) {
         warn!(
             rank = conflicting.rank(),
-            source = %conflicting.source(),
-            first_id = %first.identity(),
-            conflicting_id = %conflicting.identity(),
+            source = %hex::encode(conflicting.source()),
+            first_id = %hex::encode(first.identity()),
+            conflicting_id = %hex::encode(conflicting.identity()),
             "double-voting detected"
         );
     }
 }
 
 /// Convert a wire `ProposalVote` into the typed `GlobalVote` the
-/// aggregator accepts. The selector bytes become the proposal
-/// identity (hex), and the voter's raw 32-byte address becomes the
-/// source identity (hex). Signature is the raw BLS signature bytes
-/// already unwrapped from `BLS48581AddressedSignature`.
+/// aggregator accepts. The selector bytes (the proposal id this
+/// vote points at) populate `GlobalVote::source`, and the voter's
+/// raw 32-byte address populates `GlobalVote::identity` — matching
+/// Go's `ProposalVote.Source()` / `Identity()` semantics. Signature
+/// is the raw BLS bytes already unwrapped from
+/// `BLS48581AddressedSignature`.
 pub fn wire_vote_to_global_vote(
     wire: crate::consensus_wire::ProposalVote,
 ) -> GlobalVote {
     GlobalVote::new(
-        hex::encode(&wire.selector),
+        wire.selector.clone(),
         wire.rank,
-        hex::encode(&wire.address),
+        wire.address.clone(),
         wire.timestamp,
         wire.signature,
         Vec::new(),

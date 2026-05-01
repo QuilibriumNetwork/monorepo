@@ -128,11 +128,42 @@ impl FileKeyManager {
                 signers.insert(KeyType::Bls48581G2, signer_g2);
                 tracing::info!(key_id = %stored.id, key_type = ?key_type, "loaded BLS48581 key");
             }
-            _ => {
+            KeyType::Ed448 => {
+                // Ed448 peer key used for KeyRegistry cross-signatures
+                // and (derived → Ed25519) for the quil mTLS cert.
+                // Keystore may carry a 57-byte seed without the matching
+                // public half; derive it if the stored value is empty.
+                let pk = if public_bytes.is_empty() {
+                    quil_crypto::Ed448Signer::derive_public(&private_bytes)?
+                } else {
+                    public_bytes
+                };
+                let signer = quil_crypto::Ed448Signer::from_bytes(&private_bytes, &pk)?;
+                let mut signers = self.signers.write().unwrap();
+                signers.insert(KeyType::Ed448, Box::new(signer));
+                tracing::info!(key_id = %stored.id, "loaded Ed448 key");
+            }
+            KeyType::X448 | KeyType::Decaf448 => {
+                // Agreement keys (onion / view / spend). These are
+                // stored for KeyRegistry publication but don't need a
+                // Signer trait — they produce shared secrets, not
+                // signatures. Keep them in the raw-bytes table only.
                 tracing::debug!(
                     key_id = %stored.id,
                     key_type = ?key_type,
-                    "skipping non-BLS key (not yet needed)"
+                    "loaded agreement key (signing not applicable)"
+                );
+            }
+            // Extended key types not used by mainnet today — load into
+            // the raw store for Go parity so a future Go→Rust handoff
+            // doesn't drop them, but skip Signer-trait wiring.
+            KeyType::Secp256k1Sha256
+            | KeyType::Secp256k1Sha3
+            | KeyType::Ed25519 => {
+                tracing::debug!(
+                    key_id = %stored.id,
+                    key_type = ?key_type,
+                    "loaded non-prover key (Signer wiring deferred)"
                 );
             }
         }

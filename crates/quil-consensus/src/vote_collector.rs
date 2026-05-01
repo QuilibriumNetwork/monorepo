@@ -143,7 +143,7 @@ impl<S: Unique, V: Unique> VoteCollector<S, V> {
             }
             Err(e) => Err(QuilError::Consensus(format!(
                 "internal error adding vote {} to cache: {}",
-                vote.identity(),
+                hex::encode(vote.identity()),
                 e
             ))),
         }
@@ -193,7 +193,7 @@ impl<S: Unique, V: Unique> VoteCollector<S, V> {
         if proposal.proposal.state.rank != self.rank {
             return Err(QuilError::Consensus(format!(
                 "this VoteCollector requires a proposal for rank {} but received state {} with rank {}",
-                self.rank, proposal.proposal.state.identifier, proposal.proposal.state.rank
+                self.rank, hex::encode(&proposal.proposal.state.identifier), proposal.proposal.state.rank
             )));
         }
 
@@ -236,7 +236,7 @@ impl<S: Unique, V: Unique> VoteCollector<S, V> {
             (self.processor_factory)(proposal).map_err(|e| {
                 QuilError::Consensus(format!(
                     "failed to create VerifyingVoteProcessor for state {}: {}",
-                    proposal.proposal.state.identifier, e
+                    hex::encode(&proposal.proposal.state.identifier), e
                 ))
             })?;
         let processor = Arc::new(VoteProcessor::new(

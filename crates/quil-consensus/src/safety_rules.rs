@@ -145,7 +145,7 @@ impl<S: Unique, V: Unique> SafetyRules<S, V> {
         if state.proposer_id != current_leader {
             return Err(QuilError::Consensus(format!(
                 "incorrect proposal, proposer {} differs from leader {} for rank {}",
-                state.proposer_id, current_leader, cur_rank
+                hex::encode(&state.proposer_id), hex::encode(&current_leader), cur_rank
             )));
         }
 
@@ -170,7 +170,7 @@ impl<S: Unique, V: Unique> SafetyRules<S, V> {
                 Err(e) => {
                     return Err(QuilError::Consensus(format!(
                         "internal error retrieving identity of proposer {} at state {}: {}",
-                        state.proposer_id, state.identifier, e
+                        hex::encode(&state.proposer_id), hex::encode(&state.identifier), e
                     )));
                 }
             }
@@ -184,7 +184,7 @@ impl<S: Unique, V: Unique> SafetyRules<S, V> {
                 Err(e) if e.is_invalid_signer() => {
                     return Err(QuilError::NoVote(format!(
                         "I am not authorized to vote for state {}: {}",
-                        state.identifier, e
+                        hex::encode(&state.identifier), e
                     )));
                 }
                 Err(e) => {
@@ -433,7 +433,7 @@ impl<S: Unique, V: Unique> SafetyRulesT<S, V> for SafetyRules<S, V> {
         if &unsigned.state.proposer_id != self_id {
             return Err(QuilError::Consensus(format!(
                 "can't sign proposal for someone else's state, proposer: {}, self: {}",
-                unsigned.state.proposer_id, self_id
+                hex::encode(&unsigned.state.proposer_id), hex::encode(self_id)
             )));
         }
         let rank = unsigned.state.rank;
@@ -562,7 +562,7 @@ mod tests {
             if self.ejected.contains(pid) {
                 return Err(QuilError::InvalidSigner(format!(
                     "{} ejected",
-                    pid
+                    hex::encode(pid)
                 )));
             }
             Ok(Box::new(StubIdentity { id: pid.clone() }))
@@ -581,7 +581,7 @@ mod tests {
             pid: &Identity,
         ) -> Result<Box<dyn WeightedIdentity>> {
             if self.ejected.contains(pid) {
-                return Err(QuilError::InvalidSigner(format!("{} ejected", pid)));
+                return Err(QuilError::InvalidSigner(format!("{} ejected", hex::encode(pid))));
             }
             Ok(Box::new(StubIdentity { id: pid.clone() }))
         }
@@ -645,8 +645,8 @@ mod tests {
                 latest_quorum_certificate: newest_qc,
                 prior_rank_timeout_certificate: prior,
                 vote: TestVote {
-                    id: format!("timeout-{}", cur_rank),
-                    source: "self".into(),
+                    id: format!("timeout-{}", cur_rank).into_bytes(),
+                    source: b"self".to_vec(),
                     rank: cur_rank,
                 },
                 timeout_tick: 0,
@@ -660,13 +660,13 @@ mod tests {
         Proposal {
             state: State {
                 rank,
-                identifier: format!("state-{}", rank),
+                identifier: format!("state-{}", rank).into_bytes(),
                 proposer_id: leader.into(),
-                parent_qc_identity: format!("qc-{}", parent_qc_rank),
+                parent_qc_identity: format!("qc-{}", parent_qc_rank).into_bytes(),
                 parent_qc_rank,
                 timestamp: 0,
                 state: TestState {
-                    id: format!("state-{}", rank),
+                    id: format!("state-{}", rank).into_bytes(),
                     source: leader.into(),
                     rank,
                 },
@@ -683,7 +683,7 @@ mod tests {
         SignedProposal {
             proposal: make_proposal(rank, parent_qc_rank, leader),
             vote: TestVote {
-                id: format!("vote-{}", rank),
+                id: format!("vote-{}", rank).into_bytes(),
                 source: leader.into(),
                 rank,
             },
@@ -693,7 +693,7 @@ mod tests {
     fn make_rules(
         self_id: &str,
         leader: &str,
-        ejected: Vec<String>,
+        ejected: Vec<Identity>,
     ) -> SafetyRules<TestState, TestVote> {
         let committee: Arc<dyn DynamicCommittee> = Arc::new(StubCommittee {
             self_id: self_id.into(),

@@ -14,9 +14,11 @@ pub mod manager;
 pub mod metrics;
 pub mod message_envelope;
 pub mod prover_registry;
+pub mod seniority_compat;
 pub mod token_engine;
 pub mod token_intrinsic;
 pub mod traversal_proof;
+pub mod turtle;
 
 pub use engines::{EngineType, ExecutionMode};
 pub use global_schema::{

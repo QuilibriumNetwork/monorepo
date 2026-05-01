@@ -93,7 +93,24 @@ impl ArchiveClient {
 
         debug!(%addr, "dialing archive node (mTLS)");
         let connector = QuilTlsConnector::new(client_config);
-        let channel = endpoint.connect_with_connector(connector).await?;
+        let channel = match endpoint.connect_with_connector(connector).await {
+            Ok(ch) => ch,
+            Err(e) => {
+                // Walk the std::error::Error source chain so the actual
+                // failure (rustls / DNS / TCP refused / handshake)
+                // appears in logs. Tonic's Display impl strips this.
+                use std::error::Error as _;
+                let mut chain = format!("{}", e);
+                let mut src: Option<&(dyn std::error::Error + 'static)> = e.source();
+                while let Some(s) = src {
+                    chain.push_str(" -> ");
+                    chain.push_str(&format!("{}", s));
+                    src = s.source();
+                }
+                tracing::warn!(%addr, error_chain = %chain, "connect_mtls failed (full chain)");
+                return Err(e.into());
+            }
+        };
         info!(%addr, "archive client connected (mTLS)");
         Ok(Self {
             inner: GlobalServiceClient::new(channel),

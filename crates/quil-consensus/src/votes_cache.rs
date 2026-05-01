@@ -92,7 +92,7 @@ impl<V: Unique> VotesCache<V> {
                 if same_source && same_sig {
                     return Err(QuilError::RepeatedVote(format!(
                         "duplicate vote {} at rank {}",
-                        vote.identity(),
+                        hex::encode(vote.identity()),
                         self.rank
                     )));
                 }
@@ -100,9 +100,9 @@ impl<V: Unique> VotesCache<V> {
                 return Err(QuilError::DoubleVote(format!(
                     "vote equivocation at rank {}: voter {} (existing signed_by={}, new signed_by={})",
                     self.rank,
-                    vote.identity(),
-                    first.vote.source(),
-                    vote.source()
+                    hex::encode(vote.identity()),
+                    hex::encode(first.vote.source()),
+                    hex::encode(vote.source())
                 )));
             }
             let idx = guard.votes.len();
@@ -243,7 +243,7 @@ mod tests {
         let c: VotesCache<V> = VotesCache::new(5);
         let v1 = vote("v1", "alice", 5, b"sig1");
         c.add_vote(v1.clone()).unwrap();
-        let got = c.get_vote(&"v1".to_string()).unwrap();
+        let got = c.get_vote(&b"v1".to_vec()).unwrap();
         assert_eq!(got.sig, v1.sig);
     }
 
@@ -255,9 +255,9 @@ mod tests {
         c.add_vote(vote("v3", "carol", 5, b"s3")).unwrap();
         let all = c.all();
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].id, "v1");
-        assert_eq!(all[1].id, "v2");
-        assert_eq!(all[2].id, "v3");
+        assert_eq!(all[0].id, b"v1".to_vec());
+        assert_eq!(all[1].id, b"v2".to_vec());
+        assert_eq!(all[2].id, b"v3".to_vec());
     }
 
     #[test]

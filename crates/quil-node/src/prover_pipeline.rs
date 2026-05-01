@@ -40,6 +40,24 @@ pub struct ProverPipeline {
     pub prover_address: [u8; 32],
     pub ed448_seed: Option<[u8; 57]>,
     pub p2p_handle: quil_p2p::node::P2PHandle,
+    /// Ed448 seeds loaded from `config.engine.multisig_prover_enrollment_paths`
+    /// plus the local peer's own Ed448 seed, used to build merge
+    /// helpers for `ProverSeniorityMerge`. Each seed signs the local
+    /// BLS prover pubkey with the `PROVER_SENIORITY_MERGE` domain so
+    /// on-chain materialization can attribute historical seniority
+    /// from the old peer keys.
+    pub multisig_ed448_seeds: Vec<[u8; 57]>,
+    /// Optional delegate address for ProverJoin emissions. Mirrors Go's
+    /// `config.Engine.DelegateAddress` at
+    /// `node/consensus/global/worker_allocator.go:1483-1490` —
+    /// hex-decoded when set, empty `Vec::new()` when unset. Empty is
+    /// the default and is functionally equivalent to "delegate ==
+    /// prover_address" inside the materializer (the join handler
+    /// substitutes `prover_address` when `len(DelegateAddress) != 32`),
+    /// but the canonical-bytes wire form differs — preserve byte-level
+    /// parity with default Go nodes by leaving this empty unless the
+    /// operator explicitly configured a delegate.
+    pub delegate_address: Vec<u8>,
 }
 
 impl ProverPipeline {
@@ -99,6 +117,14 @@ impl ProverPipeline {
                 tokio::spawn(async move {
                     if let Err(e) = me.submit_reject(filters, frame_number).await {
                         warn!(frame = frame_number, %e, "RejectLeaves submission failed");
+                    }
+                });
+            }
+            LifecycleAction::ProposeSeniorityMerge { frame_number } => {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = me.submit_seniority_merge(frame_number).await {
+                        warn!(frame = frame_number, %e, "ProposeSeniorityMerge submission failed");
                     }
                 });
             }
@@ -246,7 +272,7 @@ impl ProverPipeline {
             filters: filters.clone(),
             frame_number,
             public_key_signature_bls48581: None,
-            delegate_address: self.prover_address.to_vec(),
+            delegate_address: self.delegate_address.clone(),
             merge_targets: vec![],
             proof: all_proofs.clone(),
         };
@@ -264,7 +290,7 @@ impl ProverPipeline {
                 public_key: Some(self.bls_pubkey.clone()),
                 pop_signature,
             }),
-            delegate_address: self.prover_address.to_vec(),
+            delegate_address: self.delegate_address.clone(),
             merge_targets: vec![],
             proof: all_proofs,
         };
@@ -279,6 +305,15 @@ impl ProverPipeline {
         quil_engine::metrics::inc_prover_joins_submitted();
 
         self.publish_prover_message(bytes).await?;
+
+        // Publish succeeded — NOW burn the 4-frame cooldown. Setting
+        // this earlier (in lifecycle's evaluate) would waste join
+        // opportunities whenever an archive is unreachable or a VDF
+        // self-verify fails: the next eligible frame would be gated
+        // by a cooldown from a join that never actually reached the
+        // network. Matches Go's post-success set at
+        // `worker_allocator.go:224`.
+        self.lifecycle.record_join_attempt(lifecycle_frame);
 
         // Persist the pending frame on each worker so reconcile can tell
         // "proposal in flight" from "orphaned". Uses `lifecycle_frame`
@@ -417,6 +452,79 @@ impl ProverPipeline {
         self.publish_prover_message(bytes).await
     }
 
+    /// Submit a `ProverSeniorityMerge` to raise on-chain seniority.
+    /// Mirrors Go's `submitSeniorityMerge` at `worker_allocator.go:1725-1783`
+    /// and `ProverSeniorityMerge.Prove` at `global_prover_seniority_merge.go:270-349`.
+    ///
+    /// Flow:
+    ///   1. Each helper Ed448 key signs the local BLS prover pubkey
+    ///      with the `PROVER_SENIORITY_MERGE` domain.
+    ///   2. Build `SeniorityMerge` records (key_type=Ed448, pubkey, sig).
+    ///   3. BLS-sign `frame_number_be || concat(helper_pubkeys)` with the
+    ///      poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_SENIORITY_MERGE")
+    ///      domain.
+    ///   4. Wrap in `ProverSeniorityMerge` with our addressed BLS sig.
+    ///   5. Publish via `publish_prover_message`.
+    async fn submit_seniority_merge(&self, frame_number: u64) -> Result<()> {
+        if self.multisig_ed448_seeds.is_empty() {
+            return Err(QuilError::Internal(
+                "seniority merge: no multisig Ed448 seeds loaded".into(),
+            ));
+        }
+
+        let merge_domain_tag: &[u8] = b"PROVER_SENIORITY_MERGE";
+
+        // Build one SeniorityMerge record per helper seed.
+        let mut merge_targets: Vec<quil_execution::global_intrinsic::SeniorityMerge> =
+            Vec::with_capacity(self.multisig_ed448_seeds.len());
+        for seed in &self.multisig_ed448_seeds {
+            let helper_pubkey = quil_p2p::ed448_identity::derive_public_key(seed);
+            // Ed448 signer from seed; signs the BLS prover pubkey with
+            // PROVER_SENIORITY_MERGE as Ed448 context.
+            let helper_signer = quil_crypto::Ed448Signer::from_bytes(seed, &helper_pubkey)?;
+            let helper_sig = <quil_crypto::Ed448Signer as Signer>::sign_with_domain(
+                &helper_signer,
+                &self.bls_pubkey,
+                merge_domain_tag,
+            )?;
+
+            merge_targets.push(quil_execution::global_intrinsic::SeniorityMerge {
+                signature: helper_sig,
+                // KeyType::Ed448 = 0 in quil_types::crypto::KeyType.
+                key_type: quil_types::crypto::KeyType::Ed448 as u32,
+                prover_public_key: helper_pubkey,
+            });
+        }
+
+        // BLS-sign `frame_be || helper_pubkeys_concat` under the
+        // PROVER_SENIORITY_MERGE domain.
+        let mut message: Vec<u8> = Vec::with_capacity(8 + merge_targets.len() * 57);
+        message.extend_from_slice(&frame_number.to_be_bytes());
+        for mt in &merge_targets {
+            message.extend_from_slice(&mt.prover_public_key);
+        }
+        let bls_signer = self.bls_signer()?;
+        let domain = Self::domain(merge_domain_tag)?;
+        let bls_sig = bls_signer.sign_with_domain(&message, &domain)?;
+
+        let merge = quil_execution::global_intrinsic::ProverSeniorityMerge {
+            frame_number,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: bls_sig,
+                address: self.prover_address.to_vec(),
+            }),
+            merge_targets,
+        };
+        let bytes = merge.to_canonical_bytes()?;
+
+        info!(
+            frame = frame_number,
+            helpers = self.multisig_ed448_seeds.len(),
+            "submitting ProverSeniorityMerge"
+        );
+        self.publish_prover_message(bytes).await
+    }
+
     async fn submit_leave(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
         // Go's leave message format differs — length-prefixed:
         //   u32(num_filters) || for each: u32(len) || filter || u64(frame).
@@ -451,6 +559,17 @@ impl ProverPipeline {
     /// Wrap in MessageBundle and publish via gRPC to archives (primary path)
     /// plus BlossomSub GLOBAL_PROVER (fallback). Mirrors Go's
     /// `publishProverMessage` behavior.
+    ///
+    /// Fan-out semantics: gRPC submissions are dispatched to every known
+    /// archive endpoint concurrently. The BlossomSub broadcast runs in
+    /// parallel with the gRPC fan-out via `tokio::join!`. Returns `Ok`
+    /// when *at least one* path succeeded — either an archive accepted
+    /// the submission, or the BlossomSub publish was dispatched without
+    /// error (an empty mesh still counts as success because BlossomSub
+    /// buffers the message for late-joining peers, matching Go). Returns
+    /// `Err(QuilError::P2p)` only when *every* archive failed AND the
+    /// BlossomSub publish itself failed (channel closed, behaviour
+    /// rejected the message, etc.).
     async fn publish_prover_message(&self, inner_bytes: Vec<u8>) -> Result<()> {
         let req = CanonicalMessageRequest::wrap(inner_bytes)?;
         let now_ms = std::time::SystemTime::now()
@@ -463,37 +582,241 @@ impl ProverPipeline {
         };
         let bundle_bytes = bundle.to_canonical_bytes()?;
 
-        let mut grpc_ok = false;
-        if let Some(seed) = self.ed448_seed {
-            let addrs = self.archive_pool.get_all().await;
-            for addr in &addrs {
-                // Archive peer-info multiaddrs use the pubsub port (:8336);
-                // the gRPC stream service listens on :8340.
-                let stream_addr = addr.replace(":8336", ":8340");
-                match ArchiveClient::connect_mtls(&stream_addr, &seed).await {
-                    Ok(mut client) => {
-                        match client.submit_global_message(bundle_bytes.clone()).await {
-                            Ok(()) => {
-                                info!(%stream_addr, "prover message submitted via gRPC");
-                                grpc_ok = true;
-                            }
-                            Err(e) => warn!(%stream_addr, %e, "gRPC submit rejected"),
+        // Fan out to archives concurrently. Each closure connects + submits
+        // independently so a slow / unreachable archive does not block the
+        // others. The closure returns Ok(()) on a successful submit and
+        // Err(_) on either connect or submit failure.
+        let archive_addrs = if self.ed448_seed.is_some() {
+            self.archive_pool.get_all().await
+        } else {
+            Vec::new()
+        };
+        let archive_count = archive_addrs.len();
+
+        let grpc_future = {
+            let bundle_bytes = bundle_bytes.clone();
+            let seed_opt = self.ed448_seed;
+            async move {
+                if seed_opt.is_none() || archive_addrs.is_empty() {
+                    return 0usize;
+                }
+                let seed = seed_opt.unwrap();
+                let bytes = bundle_bytes;
+                let submit = move |stream_addr: String, bytes: Vec<u8>| {
+                    // `seed` is `[u8; 57]: Copy`, so each invocation gets its
+                    // own value moved into the returned future.
+                    let seed = seed;
+                    async move {
+                        match ArchiveClient::connect_mtls(&stream_addr, &seed).await {
+                            Ok(mut client) => match client.submit_global_message(bytes).await {
+                                Ok(()) => Ok(stream_addr),
+                                Err(e) => Err((stream_addr, format!("submit rejected: {e}"))),
+                            },
+                            Err(e) => Err((stream_addr, format!("connect failed: {e}"))),
                         }
                     }
-                    Err(e) => warn!(%stream_addr, %e, "archive connect failed"),
-                }
+                };
+                fan_out_to_archives(archive_addrs, bytes, submit).await
+            }
+        };
+
+        // BlossomSub publish runs concurrently with the gRPC fan-out.
+        // `P2PHandle::publish` is fallible (channel closed / behaviour
+        // rejected the message). An empty mesh / no peers is *not* an
+        // error — Go's behaviour also silently buffers in that case.
+        let bs_future = self
+            .p2p_handle
+            .publish(GLOBAL_PROVER_BITMASK.to_vec(), bundle_bytes);
+
+        let (grpc_ok_count, bs_result) = tokio::join!(grpc_future, bs_future);
+        let p2p_ok = bs_result.is_ok();
+        if let Err(ref e) = bs_result {
+            warn!(error = %e, "BlossomSub publish failed for prover message");
+        }
+
+        if archive_count > 0 && grpc_ok_count == 0 {
+            warn!(
+                archive_count,
+                "no archive accepted submission — relying on BlossomSub fallback"
+            );
+        }
+
+        combine_publish_outcome(grpc_ok_count, p2p_ok)
+    }
+}
+
+/// Combine fan-out outcomes into a final result. Returns `Err` only when
+/// every archive failed AND the BlossomSub publish failed. Empty-mesh /
+/// no-peer scenarios feed in as `p2p_ok = true` because the swarm
+/// successfully accepted the message for buffered redelivery.
+fn combine_publish_outcome(archive_ok_count: usize, p2p_ok: bool) -> Result<()> {
+    if archive_ok_count == 0 && !p2p_ok {
+        return Err(QuilError::P2p(
+            "publish_prover_message: all paths failed (no archive accepted, BlossomSub publish failed)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fan out a submission to every archive endpoint concurrently.
+///
+/// `submit` is a closure that takes a single `(stream_addr, payload)` and
+/// returns `Ok(stream_addr)` on success or `Err((stream_addr, reason))`.
+/// Returns the number of successful submissions.
+///
+/// Extracted as a free function so unit tests can substitute a closure
+/// without needing a real `ArchiveClient` / mTLS handshake.
+async fn fan_out_to_archives<F, Fut>(
+    archive_addrs: Vec<String>,
+    bundle_bytes: Vec<u8>,
+    submit: F,
+) -> usize
+where
+    F: Fn(String, Vec<u8>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<String, (String, String)>>
+        + Send
+        + 'static,
+{
+    let mut handles = Vec::with_capacity(archive_addrs.len());
+    for addr in archive_addrs {
+        // Archive peer-info multiaddrs use the pubsub port (:8336);
+        // the gRPC stream service listens on :8340.
+        let stream_addr = addr.replace(":8336", ":8340");
+        let bytes = bundle_bytes.clone();
+        let submit = submit.clone();
+        handles.push(tokio::spawn(async move { submit(stream_addr, bytes).await }));
+    }
+    let mut ok_count = 0usize;
+    for h in handles {
+        match h.await {
+            Ok(Ok(addr)) => {
+                info!(%addr, "prover message submitted via gRPC");
+                ok_count += 1;
+            }
+            Ok(Err((addr, reason))) => {
+                warn!(%addr, %reason, "gRPC submit failed");
+            }
+            Err(e) => {
+                warn!(error = %e, "gRPC submit task join error");
             }
         }
+    }
+    ok_count
+}
 
-        // Always broadcast via BlossomSub regardless — if gRPC succeeded this
-        // is a redundant relay; if it didn't, this is the only path.
-        self.p2p_handle
-            .publish(GLOBAL_PROVER_BITMASK.to_vec(), bundle_bytes)
-            .await;
+#[cfg(test)]
+mod tests {
+    use super::fan_out_to_archives;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-        if !grpc_ok && self.ed448_seed.is_some() {
-            warn!("no archive accepted submission — relying on BlossomSub fallback");
-        }
-        Ok(())
+    /// Verify that fan-out attempts every archive and counts every success.
+    #[tokio::test]
+    async fn publish_prover_message_fans_out_to_all_archives() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let submit = move |addr: String, _bytes: Vec<u8>| {
+            let calls = calls_clone.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, (String, String)>(addr)
+            }
+        };
+        let addrs = vec![
+            "1.2.3.4:8336".to_string(),
+            "5.6.7.8:8336".to_string(),
+            "9.10.11.12:8336".to_string(),
+        ];
+        let ok = fan_out_to_archives(addrs, vec![0xAA; 16], submit).await;
+        assert_eq!(ok, 3, "expected 3 successful submissions");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "expected 3 closure invocations (one per archive)"
+        );
+    }
+
+    /// Verify partial-failure semantics: when one archive rejects, the
+    /// others still succeed and the success count reflects only the good
+    /// path.
+    #[tokio::test]
+    async fn publish_prover_message_falls_back_when_one_archive_fails() {
+        let submit = move |addr: String, _bytes: Vec<u8>| async move {
+            if addr.starts_with("5.") {
+                Err::<String, (String, String)>((addr, "simulated reject".to_string()))
+            } else {
+                Ok::<String, (String, String)>(addr)
+            }
+        };
+        let addrs = vec![
+            "1.2.3.4:8336".to_string(),
+            "5.6.7.8:8336".to_string(),
+            "9.10.11.12:8336".to_string(),
+        ];
+        let ok = fan_out_to_archives(addrs, vec![0xBB; 16], submit).await;
+        assert_eq!(
+            ok, 2,
+            "expected 2 successes when 1 of 3 archives rejects (rest must still attempt)"
+        );
+    }
+
+    /// All-fail scenario: every archive errors, so the success count is
+    /// zero. Caller treats this as the trigger to log "relying on
+    /// BlossomSub fallback".
+    #[tokio::test]
+    async fn publish_prover_message_all_archives_fail() {
+        let submit = move |addr: String, _bytes: Vec<u8>| async move {
+            Err::<String, (String, String)>((addr, "simulated reject".to_string()))
+        };
+        let addrs = vec!["1.2.3.4:8336".to_string(), "5.6.7.8:8336".to_string()];
+        let ok = fan_out_to_archives(addrs, vec![0xCC; 16], submit).await;
+        assert_eq!(ok, 0, "expected 0 successes when every archive fails");
+    }
+
+    /// Empty archive list: no submissions attempted, success count zero,
+    /// no panics.
+    #[tokio::test]
+    async fn publish_prover_message_empty_archive_list() {
+        let submit = move |addr: String, _bytes: Vec<u8>| async move {
+            Ok::<String, (String, String)>(addr)
+        };
+        let ok = fan_out_to_archives(Vec::new(), vec![0xDD; 16], submit).await;
+        assert_eq!(ok, 0, "expected 0 successes with no archive endpoints");
+    }
+
+    /// When every archive fails AND the BlossomSub publish itself fails,
+    /// `publish_prover_message` must surface an error so the caller can
+    /// react. This mirrors `publish_prover_message`'s combine-step using
+    /// the same outcome-combining helper to avoid having to wire a full
+    /// `ProverPipeline` (which has many heavyweight deps unrelated to the
+    /// publish-result path under test).
+    #[tokio::test]
+    async fn publish_prover_message_returns_err_when_all_paths_fail() {
+        // Empty archive list means archive_ok_count == 0.
+        let submit = move |addr: String, _bytes: Vec<u8>| async move {
+            Err::<String, (String, String)>((addr, "no archive".into()))
+        };
+        let archive_ok = fan_out_to_archives(Vec::new(), vec![0xEE; 16], submit).await;
+        assert_eq!(archive_ok, 0);
+
+        // Simulate a P2P publish failure with the test stub.
+        let handle = quil_p2p::node::P2PHandle::for_test(true);
+        let p2p_result = handle.publish(vec![0u8; 3], vec![0xEE; 16]).await;
+        assert!(p2p_result.is_err(), "stub configured to fail must return Err");
+        let p2p_ok = p2p_result.is_ok();
+
+        let combined = super::combine_publish_outcome(archive_ok, p2p_ok);
+        assert!(
+            combined.is_err(),
+            "all-paths-fail must return Err — got {:?}",
+            combined
+        );
+        // And: success on either path keeps the result Ok (empty-mesh /
+        // fire-and-forget compatibility — Go semantics).
+        let handle_ok = quil_p2p::node::P2PHandle::for_test(false);
+        let p2p_result_ok = handle_ok.publish(vec![0u8; 3], vec![0xEE; 16]).await;
+        assert!(p2p_result_ok.is_ok(), "stub OK path must return Ok");
+        assert!(super::combine_publish_outcome(0, true).is_ok());
+        assert!(super::combine_publish_outcome(2, false).is_ok());
     }
 }

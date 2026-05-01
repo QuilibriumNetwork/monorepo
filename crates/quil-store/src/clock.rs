@@ -72,7 +72,11 @@ impl RocksClockStore {
                 batch.put(&req_key, request.encode_to_vec());
             }
             let current_latest = self.get_latest_frame_number();
-            if frame_number > current_latest.unwrap_or(0) {
+            // Match `put_global_frame` (and the earliest check below):
+            // when no frames exist yet, this IS the latest. The previous
+            // form `> unwrap_or(0)` silently dropped the latest-index
+            // update for genesis at frame 0 on an empty store.
+            if current_latest.is_none() || frame_number > current_latest.unwrap() {
                 batch.put(encoding::clock_global_latest_index(), frame_number.to_be_bytes());
             }
             let current_earliest = self.get_earliest_frame_number();
@@ -115,7 +119,13 @@ impl RocksClockStore {
         let earliest_key = encoding::clock_global_earliest_index();
         let current_latest = self.get_latest_frame_number();
         let current_earliest = self.get_earliest_frame_number();
-        let update_latest = frame_number > current_latest.unwrap_or(0);
+        // Mirror the earliest check: if no frames are stored yet, this
+        // IS the latest; otherwise compare. The previous form
+        // `frame_number > unwrap_or(0)` collapsed "no frames" to "latest
+        // is 0" and silently dropped the index update for the very
+        // first stored frame at frame 0 (which is exactly the testnet
+        // genesis case).
+        let update_latest = current_latest.is_none() || frame_number > current_latest.unwrap();
         let update_earliest = current_earliest.is_none() || frame_number < current_earliest.unwrap();
 
         // If the caller provided a RocksClockTxn, stage into it so the
@@ -233,10 +243,13 @@ impl RocksClockStore {
                 .map_err(|e| QuilError::Store(e.to_string()))?;
         }
 
-        // Update latest index
+        // Update latest index. Must use `is_none() ||` form so that
+        // the very first stored QC (genesis at rank 0) actually sets
+        // the index — `> unwrap_or(0)` collapses "no QC yet" to "rank
+        // is 0" and silently drops the update for rank-0 genesis.
         let latest_key = encoding::clock_quorum_certificate_latest_index(filter);
         let current = self.read_u64_index(&latest_key);
-        if qc.rank > current.unwrap_or(0) {
+        if current.is_none() || qc.rank > current.unwrap() {
             let val = qc.rank.to_be_bytes();
             if let Some(txn) = txn {
                 txn.set(&latest_key, &val)?;
@@ -469,8 +482,54 @@ impl store::ClockStore for RocksClockStore {
     fn put_global_clock_frame(&self, f: &proto::global::GlobalFrame, t: &dyn store::Transaction) -> Result<()> {
         self.put_global_frame_via_txn(f, t)
     }
-    fn put_global_clock_frame_candidate(&self, _: &proto::global::GlobalFrame, _t: &dyn store::Transaction) -> Result<()> { Ok(()) }
-    fn get_global_clock_frame_candidate(&self, n: u64, _: &[u8]) -> Result<proto::global::GlobalFrame> { self.get_global_frame(n) }
+    fn put_global_clock_frame_candidate(
+        &self,
+        frame: &proto::global::GlobalFrame,
+        _t: &dyn store::Transaction,
+    ) -> Result<()> {
+        // Store the candidate keyed by (frame_number, identity).
+        // Identity = Poseidon(output) — same derivation as
+        // `GlobalState::compute_identity` in quil-engine. Without this
+        // entry, `prove_next_state` for rank N+1 cannot resolve its
+        // unfinalized prior frame, and the leader's event loop exits
+        // with "building on fork or needs sync" the moment its own
+        // QC arrives.
+        let header = match frame.header.as_ref() {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+        let identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+            .map(|h| h.to_vec())
+            .unwrap_or_default();
+        let frame_number = header.frame_number;
+        let key = encoding::clock_global_frame_candidate_key(frame_number, &identity);
+        let bytes = {
+            use prost::Message as _;
+            frame.encode_to_vec()
+        };
+        self.db
+            .put(&key, &bytes)
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(())
+    }
+    fn get_global_clock_frame_candidate(
+        &self,
+        frame_number: u64,
+        selector: &[u8],
+    ) -> Result<proto::global::GlobalFrame> {
+        let key = encoding::clock_global_frame_candidate_key(frame_number, selector);
+        if let Some(bytes) = self
+            .db
+            .get(&key)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+        {
+            return proto::global::GlobalFrame::decode(bytes.as_slice())
+                .map_err(|e| QuilError::Serialization(e.to_string()));
+        }
+        // Fall back to the canonical frame at this number for legacy
+        // callers that pass an unknown selector.
+        self.get_global_frame(frame_number)
+    }
     fn delete_global_clock_frame_range(&self, _: u64, _: u64) -> Result<()> { Ok(()) }
     fn reset_global_clock_frames(&self) -> Result<()> { Ok(()) }
     fn get_latest_certified_global_state(&self) -> Result<proto::global::GlobalProposal> { Err(QuilError::NotFound("stub".into())) }
@@ -497,7 +556,11 @@ impl store::ClockStore for RocksClockStore {
         if with_clock_batch(t, |b| b.put(&key, &data)) {
             let latest_key = encoding::clock_quorum_certificate_latest_index(&[]);
             let current = self.read_u64_index(&latest_key);
-            if qc.rank > current.unwrap_or(0) {
+            // `is_none() ||` form so genesis QC at rank 0 actually
+            // sets the index. The `> unwrap_or(0)` form silently
+            // dropped the index update for rank-0 — see line 249 for
+            // the matching fix on the inherent path.
+            if current.is_none() || qc.rank > current.unwrap() {
                 let _ = with_clock_batch(t, |b| b.put(&latest_key, qc.rank.to_be_bytes()));
             }
             return Ok(());
@@ -521,7 +584,11 @@ impl store::ClockStore for RocksClockStore {
     fn commit_shard_clock_frame(&self, filter: &[u8], frame_number: u64, _selector: &[u8], t: &dyn store::Transaction, _backfill: bool) -> Result<()> {
         let idx_key = encoding::clock_shard_latest_index(filter);
         let current = self.read_u64_index(&idx_key);
-        if frame_number > current.unwrap_or(0) {
+        // Same fix-pattern as `put_global_frame` / `put_quorum_certificate`:
+        // when no shard frame has been committed yet, this IS the
+        // latest. `> unwrap_or(0)` would silently drop the index
+        // update for the very first commit at frame 0.
+        if current.is_none() || frame_number > current.unwrap() {
             if with_clock_batch(t, |b| b.put(&idx_key, frame_number.to_be_bytes())) {
                 return Ok(());
             }

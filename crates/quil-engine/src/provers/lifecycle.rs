@@ -18,8 +18,9 @@
 //!     affected prover address per frame. The single cooldown timer
 //!     lives on the `WorkerAllocator`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use num_bigint::BigInt;
 use tracing::info;
 
@@ -32,7 +33,10 @@ use crate::worker::WorkerManager;
 use crate::worker_allocator::WorkerAllocator;
 
 /// Confirm window for pending joins/leaves (matches Go's 360 frames).
-pub const CONFIRM_WINDOW_FRAMES: u64 = 360;
+/// This is the mainnet default; testnet bootstraps may override via
+/// [`ProverLifecycle::set_confirm_window_frames`] so a 4-node smoke
+/// test doesn't need to wait an hour for each join cycle.
+pub const DEFAULT_CONFIRM_WINDOW_FRAMES: u64 = 360;
 /// Cap on join filters per cycle (matches Go's 100).
 pub const MAX_PROPOSALS_PER_CYCLE: usize = 100;
 /// Max proposals per single PlanAndAllocate call in Go (worker_allocator.go:215).
@@ -73,6 +77,12 @@ pub enum LifecycleAction {
     /// Submit a ProverReject for these leave filters (stay on shard).
     RejectLeaves {
         filters: Vec<Vec<u8>>,
+        frame_number: u64,
+    },
+    /// Submit a ProverSeniorityMerge to raise on-chain seniority. The
+    /// caller (prover pipeline) owns the multisig helper Ed448 signers
+    /// loaded at startup — the frame number is the only per-call data.
+    ProposeSeniorityMerge {
         frame_number: u64,
     },
 }
@@ -119,6 +129,10 @@ impl std::fmt::Debug for LifecycleAction {
                 .field("filters", &hex_list(filters))
                 .field("frame_number", frame_number)
                 .finish(),
+            Self::ProposeSeniorityMerge { frame_number } => f
+                .debug_struct("ProposeSeniorityMerge")
+                .field("frame_number", frame_number)
+                .finish(),
         }
     }
 }
@@ -148,15 +162,29 @@ pub struct ProverLifecycle {
     /// Shared halt state — proposals pause while any shard is in a
     /// coverage halt. Populated by the coverage-event subscriber.
     halt_state: Arc<HaltState>,
-    /// Network halt threshold (from CoverageThresholds). Shards with
-    /// `active_count <= halt_threshold + 1` are considered "halt risk"
-    /// and get priority allocation under the RewardGreedy strategy —
-    /// free workers cover them first, and ring-2+ workers will leave
-    /// their current shard to free up capacity.
-    ///
-    /// Defaults to `u64::MAX` (halt-risk override disabled) until the
-    /// caller wires in the real threshold via `set_halt_threshold`.
-    halt_threshold: u64,
+    /// Real per-shard byte sizes keyed by confirmation filter, derived
+    /// from `ShardsStore::range_app_shards`. Tier-5 #3: used to populate
+    /// `ShardDescriptor.size` in `build_proposal_descriptors` and
+    /// `build_decide_descriptors` so reward scoring matches Go's
+    /// `shard.Size.Uint64()` from `worker_allocator.go:855-893`.
+    /// Falls back to the registry's prover-count proxy when empty.
+    shard_sizes_by_filter: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Frame window between a join (or leave) proposal and its
+    /// confirm/reject. Defaults to `DEFAULT_CONFIRM_WINDOW_FRAMES`
+    /// (360, mainnet); can be lowered to a small value for testnet
+    /// bootstraps via `set_confirm_window_frames`.
+    confirm_window_frames: AtomicU64,
+    /// Optional `ShardsStore` handle. When wired, `evaluate` calls
+    /// `range_app_shards` on each tick and treats every (shard_key,
+    /// prefix) entry as a known confirmation filter. This is what
+    /// lets the proposer see app shards that exist in genesis but
+    /// have no provers allocated yet (mirrors Go's
+    /// `worker_allocator.go:599` flow). Without this, the proposer
+    /// only sees filters that already have at least one allocation
+    /// in the registry — which on a fresh testnet means only the
+    /// global filter, which is explicitly skipped, so no joins
+    /// are ever proposed.
+    shards_store: RwLock<Option<Arc<dyn quil_types::store::ShardsStore>>>,
 }
 
 impl ProverLifecycle {
@@ -175,17 +203,51 @@ impl ProverLifecycle {
             units: proposer::DEFAULT_UNITS,
             allocator,
             halt_state,
-            halt_threshold: u64::MAX,
+            shard_sizes_by_filter: RwLock::new(HashMap::new()),
+            confirm_window_frames: AtomicU64::new(DEFAULT_CONFIRM_WINDOW_FRAMES),
+            shards_store: RwLock::new(None),
         }
     }
 
-    /// Wire the coverage-halt threshold (from `CoverageThresholds`)
-    /// into the lifecycle. Enables the RewardGreedy halt-risk
-    /// override: free workers and ring-2+ allocations will cover /
-    /// leave for shards on the verge of halting, bypassing normal
-    /// reward scoring.
-    pub fn set_halt_threshold(&mut self, threshold: u64) {
-        self.halt_threshold = threshold;
+    /// Wire a `ShardsStore` so `evaluate` can discover shards that
+    /// have no allocations yet. Mainnet's worker allocator does this
+    /// by iterating the local shards-store on every frame; we mirror
+    /// that without the gRPC sub-shard fetch step (the local store
+    /// already has the canonical set of shards on every node).
+    pub fn set_shards_store(
+        &self,
+        shards_store: Arc<dyn quil_types::store::ShardsStore>,
+    ) {
+        if let Ok(mut guard) = self.shards_store.write() {
+            *guard = Some(shards_store);
+        }
+    }
+
+    /// Override the confirm window. Mainnet uses 360 frames (the
+    /// default); testnet bootstraps lower this so the join → confirm
+    /// cycle finishes in minutes instead of an hour. Mainnet nodes
+    /// must NOT call this — they require the full 360-frame
+    /// observation window for the protocol to be sound.
+    pub fn set_confirm_window_frames(&self, frames: u64) {
+        self.confirm_window_frames
+            .store(frames, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current confirm window — see `set_confirm_window_frames`.
+    pub fn confirm_window_frames(&self) -> u64 {
+        self.confirm_window_frames
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Populate the per-shard byte size map. Caller is the consensus
+    /// loop, which calls `range_app_shards` once per frame and passes
+    /// the resulting `filter → size` map here. Without this, the
+    /// proposer falls back to the registry's prover-count proxy and
+    /// reward scoring diverges from Go.
+    pub fn set_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
+        if let Ok(mut guard) = self.shard_sizes_by_filter.write() {
+            *guard = sizes;
+        }
     }
 
     /// Mark initial sync as complete. Proposals are gated on this.
@@ -213,6 +275,65 @@ impl ProverLifecycle {
     /// Configure reward strategy.
     pub fn set_strategy(&mut self, strategy: Strategy) {
         self.strategy = strategy;
+    }
+
+    /// Record a successful `ProverJoin` submission at `frame_number`.
+    /// Called by the pipeline AFTER `publish_prover_message` succeeds
+    /// so transient archive failures don't burn the 4-frame join
+    /// cooldown and skip legitimate retry opportunities. Matches Go's
+    /// post-success cooldown semantics at `worker_allocator.go:224`.
+    pub fn record_join_attempt(&self, frame_number: u64) {
+        self.allocator.set_last_join_attempt(frame_number);
+    }
+
+    /// Port of Go's `selectExcessPendingFilters` at
+    /// `worker_allocator.go:1319-1385`. Returns filters that should be
+    /// force-rejected because the number of non-expired pending joins
+    /// exceeds our worker capacity minus active allocations.
+    ///
+    /// Go uses `config.Engine.DataWorkerCount` for capacity; we use the
+    /// total worker count (`workers.len()`) which is equivalent since
+    /// workers are provisioned from `data_worker_count`.
+    ///
+    /// Mirrors Go's `rand.Shuffle(pending)` so each node submits an
+    /// independent random subset of excess filters — over time this
+    /// converges every shard's pending list back to capacity without
+    /// any single shard being preferentially rejected.
+    fn select_excess_pending_filters(
+        &self,
+        active_filters: &[Vec<u8>],
+        joining_filters: &[(Vec<u8>, u64)],
+        worker_capacity: usize,
+    ) -> Vec<Vec<u8>> {
+        if worker_capacity == 0 {
+            return Vec::new();
+        }
+
+        let active = active_filters.len();
+        let last_observed = self.last_observed_frame.load(Ordering::Relaxed);
+
+        let mut pending: Vec<Vec<u8>> = joining_filters.iter()
+            .filter(|(filter, join_frame)| {
+                if filter.is_empty() { return false; }
+                // Skip expired joins — implicitly rejected.
+                last_observed <= *join_frame + crate::worker_allocator::PENDING_FILTER_GRACE_FRAMES
+            })
+            .map(|(f, _)| f.clone())
+            .collect();
+
+        let allowed = worker_capacity.saturating_sub(active);
+        if pending.len() <= allowed {
+            return Vec::new();
+        }
+
+        let excess = pending.len() - allowed;
+        // Random shuffle — matches Go's `rand.Shuffle(pending)` at
+        // worker_allocator.go:1380-1382.
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        pending.shuffle(&mut rng);
+        pending.truncate(excess);
+        pending
     }
 
     /// Port of Go's `joinProposalReady` at `worker_allocator.go:1273-1317`.
@@ -287,6 +408,44 @@ impl ProverLifecycle {
         let prover_info = registry.get_prover_info(&self.prover_address)?;
         let workers = worker_manager.range_workers()?;
 
+        // Discover shard filters from the local `ShardsStore`.
+        // Mainnet seeds many shards at genesis (per
+        // `genesis.go:177-194`) and Go's `worker_allocator.go:599`
+        // iterates them via `RangeAppShards()` to surface filters
+        // that have no allocations yet. Without this step the
+        // proposer would never see those shards because
+        // `get_prover_shard_summaries` only includes filters with
+        // at least one allocation. The filter for each entry is
+        // `shard_key || prefix.byte()` (Go: `shardInfo.L2 ||
+        // byte(p)` for each `p` in `shard.Prefix`).
+        let shards_store_filters: Vec<Vec<u8>> = match self
+            .shards_store
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+        {
+            Some(ss) => match ss.range_app_shards() {
+                Ok(shards) => shards
+                    .into_iter()
+                    .map(|s| {
+                        // Wire filter = L2 || prefix.byte() per Go
+                        // (`worker_allocator.go:758`). The shards-store
+                        // returns shard_key = L1(3) || L2(32); strip
+                        // the leading 3 bytes of L1.
+                        let l2_start = if s.shard_key.len() >= 3 { 3 } else { 0 };
+                        let mut filter = s.shard_key[l2_start..].to_vec();
+                        for p in &s.prefix {
+                            filter.push(*p as u8);
+                        }
+                        filter
+                    })
+                    .filter(|f| !f.is_empty())
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+
         // Partition self's allocations by status.
         let mut joining_filters: Vec<(Vec<u8>, u64)> = Vec::new();
         let mut active_filters: Vec<Vec<u8>> = Vec::new();
@@ -320,38 +479,25 @@ impl ProverLifecycle {
         //   ring — used only to splice in pending-to-decide entries.
         // - `allocated_descriptors`: shards *we are on*, scored with the
         //   current ring — used for plan_leaves.
-        let proposal_descriptors = build_proposal_descriptors(&summaries, &all_our_filters);
-        let decide_all_descriptors = build_decide_descriptors(&summaries);
+        let shard_sizes_snapshot = self
+            .shard_sizes_by_filter
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let proposal_descriptors = build_proposal_descriptors(
+            &summaries,
+            &all_our_filters,
+            &shard_sizes_snapshot,
+            &shards_store_filters,
+        );
+        let decide_all_descriptors =
+            build_decide_descriptors(&summaries, &shard_sizes_snapshot);
         let allocated_descriptors: Vec<ShardDescriptor> = decide_all_descriptors.iter()
             .filter(|d| all_our_filters.contains(&d.filter))
             .cloned()
             .collect();
 
         let world_bytes = compute_world_bytes_from_summaries(&summaries);
-
-        // Identify halt-risk shards the node could cover: not halted
-        // yet, but within one departure of the halt threshold. Empty
-        // unless `set_halt_threshold` has been wired. Used only under
-        // `Strategy::RewardGreedy` — DataGreedy already prioritizes
-        // small/underserved shards by size. Excludes shards we're
-        // already allocated to and shards that are currently halted
-        // (the halt_state gate takes precedence).
-        let halt_risk_filters: std::collections::HashSet<Vec<u8>> =
-            if self.strategy == Strategy::RewardGreedy && self.halt_threshold != u64::MAX {
-                summaries.iter()
-                    .filter(|s| {
-                        if s.filter.is_empty() { return false; }
-                        if all_our_filters.contains(&s.filter) { return false; }
-                        if self.halt_state.is_halted(&s.filter) { return false; }
-                        let active = s.status_counts
-                            .get(&ProverStatus::Active).copied().unwrap_or(0);
-                        (active as u64) <= self.halt_threshold.saturating_add(1)
-                    })
-                    .map(|s| s.filter.clone())
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            };
 
         // Go's allowProposals: a free worker exists (matches
         // `worker_allocator.go:171-181`). Only gates Propose{Join,Leave};
@@ -369,41 +515,102 @@ impl ProverLifecycle {
         let mut actions: Vec<LifecycleAction> = Vec::new();
         let mut join_proposed_this_cycle = false;
 
+        // Seniority-merge check — matches Go's `checkAndSubmitSeniorityMerge`
+        // at worker_allocator.go:963-1011. When our on-chain seniority
+        // trails the config-derived estimate (from
+        // `compat::GetAggregatedSeniority` across own + enrolled peer
+        // IDs) and both the join- and seniority-merge cooldowns (10
+        // frames each) have elapsed, emit a `ProposeSeniorityMerge`
+        // action. The pipeline owns the multisig Ed448 signer set and
+        // produces the signed `ProverSeniorityMerge` message from this
+        // trigger.
+        let config_estimate = self.allocator.config_seniority_estimate();
+        let current_seniority = prover_info.as_ref().map(|p| p.seniority).unwrap_or(0);
+        if config_estimate > current_seniority && prover_info.is_some() {
+            let last_merge = self.allocator.last_seniority_merge_attempt();
+            let last_join = self.allocator.last_join_attempt();
+            const MERGE_COOLDOWN: u64 = 10;
+            let merge_cd_ok =
+                last_merge == 0 || frame_number.saturating_sub(last_merge) >= MERGE_COOLDOWN;
+            let join_cd_ok =
+                last_join == 0 || frame_number.saturating_sub(last_join) >= MERGE_COOLDOWN;
+            if merge_cd_ok && join_cd_ok {
+                info!(
+                    frame = frame_number,
+                    current_seniority,
+                    config_estimate,
+                    delta = config_estimate - current_seniority,
+                    "emitting ProverSeniorityMerge to raise on-chain seniority"
+                );
+                // Record attempt eagerly so duplicate evaluates within
+                // the cooldown don't re-emit; the pipeline will log if
+                // the actual submission fails.
+                self.allocator.set_last_seniority_merge_attempt(frame_number);
+                actions.push(LifecycleAction::ProposeSeniorityMerge { frame_number });
+            }
+        }
+
+        // 0) Excess-pending-joins check — matches Go's
+        //    `checkExcessPendingJoins` / `selectExcessPendingFilters` /
+        //    `rejectExcessPending` (worker_allocator.go:1024-1436).
+        //    When the number of non-expired Joining allocations exceeds
+        //    (worker_capacity - active_allocations), force-reject the
+        //    excess so the prover's pending filters don't grow unbounded
+        //    after a shard freeze. Has its own cooldown separate from the
+        //    join cooldown (4 frames between reject batches).
+        let excess_rejects =
+            self.select_excess_pending_filters(&active_filters, &joining_filters, workers.len());
+        if !excess_rejects.is_empty() {
+            let last_reject = self.allocator.last_reject_attempt();
+            let cooldown_ok = last_reject == 0
+                || (frame_number > last_reject
+                    && frame_number - last_reject >= crate::worker_allocator::JOIN_COOLDOWN_FRAMES);
+            if cooldown_ok {
+                let mut filters = excess_rejects;
+                if filters.len() > MAX_PROPOSALS_PER_CYCLE {
+                    filters.truncate(MAX_PROPOSALS_PER_CYCLE);
+                }
+                info!(
+                    frame = frame_number,
+                    rejections = filters.len(),
+                    "forced rejection of excess pending joins"
+                );
+                self.allocator.set_last_reject_attempt(frame_number);
+                actions.push(LifecycleAction::RejectJoins { filters, frame_number });
+            } else {
+                tracing::debug!(
+                    frame = frame_number,
+                    last_reject,
+                    "deferring forced join rejections — cooldown"
+                );
+            }
+        }
+
         // 1) ProposeJoin — gated on allowProposals && canPropose.
-        //    Mirrors worker_allocator.go:210-247.
-        //
-        //    RewardGreedy halt-risk override: if any halt-risk shards
-        //    are available, assign free workers to them first (ordered
-        //    most-urgent first) before running normal reward-scored
-        //    plan_and_allocate on the remaining workers/shards.
+        //    Mirrors worker_allocator.go:210-247. Pure score-driven —
+        //    Go has no halt-risk override; coverage halts are handled
+        //    upstream by the coverage monitor's halt-grace logic.
         if !proposal_descriptors.is_empty() && allow_proposals {
             if can_propose {
-                let (mut halt_risk_proposals, remaining_workers, remaining_descriptors) =
-                    allocate_halt_risk(
-                        &proposal_descriptors,
-                        &halt_risk_filters,
-                        &summaries,
-                        &free_worker_ids,
-                    );
-
-                let scored_proposals = proposer::plan_and_allocate(
-                    &remaining_descriptors,
+                let proposals = proposer::plan_and_allocate(
+                    &proposal_descriptors,
                     difficulty,
                     &world_bytes,
                     self.units,
-                    &remaining_workers,
-                    MAX_PROPOSALS_PER_CYCLE.saturating_sub(halt_risk_proposals.len()),
+                    &free_worker_ids,
+                    MAX_PROPOSALS_PER_CYCLE,
                     self.strategy,
                 );
-                halt_risk_proposals.extend(scored_proposals);
-                let proposals = halt_risk_proposals;
 
                 if !proposals.is_empty() {
-                    // Reserve the cooldown slot on success, matching
-                    // worker_allocator.go:224. Only set when we actually
-                    // emit a join — bare Decide actions don't consume it.
+                    // Cooldown set in `ProverPipeline::submit_join`
+                    // AFTER `publish_prover_message` succeeds. Setting
+                    // here would burn the 4-frame cooldown on every
+                    // transient archive/VDF failure, matching Go's
+                    // post-success semantics at worker_allocator.go:224
+                    // (where the bump is gated on `err == nil &&
+                    // len(proposals) > 0`).
                     let prev_attempt = self.allocator.last_join_attempt();
-                    self.allocator.set_last_join_attempt(frame_number);
                     join_proposed_this_cycle = true;
 
                     let worker_ids: Vec<u32> = proposals.iter().map(|p| p.worker_id).collect();
@@ -435,8 +642,9 @@ impl ProverLifecycle {
 
         // 2) DecideJoins — independent of cooldown. Matches
         //    worker_allocator.go:268-297.
+        let confirm_window = self.confirm_window_frames();
         let ready_join_filters: Vec<Vec<u8>> = joining_filters.iter()
-            .filter(|(_, jf)| frame_number >= *jf + CONFIRM_WINDOW_FRAMES)
+            .filter(|(_, jf)| frame_number >= *jf + confirm_window)
             .map(|(f, _)| f.clone())
             .collect();
 
@@ -449,6 +657,13 @@ impl ProverLifecycle {
                 }
             }
 
+            // Tier-5 #5: cap confirmations at unallocated worker count
+            // (Go `proposer.go:518-531`). `unallocatedWorkerCount` =
+            // count(workers where !allocated). Mirrors Go's gate so a
+            // node with more pending confirms than free workers doesn't
+            // commit to allocations it can't service.
+            let available_workers = workers.iter().filter(|w| !w.allocated).count();
+
             let (reject, confirm) = proposer::decide_joins(
                 &decide_candidates,
                 &ready_join_filters,
@@ -456,6 +671,7 @@ impl ProverLifecycle {
                 &world_bytes,
                 self.units,
                 self.strategy,
+                available_workers,
             );
 
             if !reject.is_empty() {
@@ -475,19 +691,14 @@ impl ProverLifecycle {
         // 3) ProposeLeave — gated on canPropose && !joinProposedThisCycle.
         //    Matches worker_allocator.go:299-316. Go also updates
         //    lastJoinAttemptFrame on successful leave proposals (L310)
-        //    so we mirror that here.
-        //
-        //    RewardGreedy halt-risk override: if halt-risk shards are
-        //    available, also propose to leave our ring-2+ active
-        //    allocations (they're on well-covered shards, so it's safe
-        //    to vacate them) so we free up capacity to cover the
-        //    halt-risk shard on a subsequent cycle.
+        //    so we mirror that here. Pure score-driven — Go has no
+        //    halt-risk override.
         if can_propose
             && !join_proposed_this_cycle
             && !active_filters.is_empty()
             && !proposal_descriptors.is_empty()
         {
-            let mut leave_candidates = proposer::plan_leaves(
+            let leave_candidates = proposer::plan_leaves(
                 &allocated_descriptors,
                 &proposal_descriptors,
                 difficulty,
@@ -496,36 +707,10 @@ impl ProverLifecycle {
                 self.strategy,
             );
 
-            // Halt-risk override: augment leave list with ring-2+
-            // allocations up to the number of halt-risk shards we'd
-            // want to cover. Deduplicates against whatever plan_leaves
-            // already produced.
-            if !halt_risk_filters.is_empty() {
-                let mut already_leaving: std::collections::HashSet<Vec<u8>> =
-                    leave_candidates.iter().cloned().collect();
-                let mut budget = halt_risk_filters.len();
-                let mut ring_heavy: Vec<(u8, Vec<u8>)> = allocated_descriptors.iter()
-                    .filter(|d| d.ring >= 2)
-                    .filter(|d| !already_leaving.contains(&d.filter))
-                    .map(|d| (d.ring, d.filter.clone()))
-                    .collect();
-                // Highest ring (most over-covered) first; then filter bytes for
-                // deterministic ordering on ties.
-                ring_heavy.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-                for (_ring, filter) in ring_heavy {
-                    if budget == 0 { break; }
-                    if already_leaving.insert(filter.clone()) {
-                        leave_candidates.push(filter);
-                        budget -= 1;
-                    }
-                }
-            }
-
             if !leave_candidates.is_empty() {
                 self.allocator.set_last_join_attempt(frame_number);
                 info!(
                     leave_proposals = leave_candidates.len(),
-                    halt_risk_shards = halt_risk_filters.len(),
                     frame = frame_number,
                     "proposing leaves for overcrowded shards"
                 );
@@ -539,7 +724,7 @@ impl ProverLifecycle {
         // 4) DecideLeaves — independent of cooldown. Matches
         //    worker_allocator.go:318-344.
         let ready_leave_filters: Vec<Vec<u8>> = leaving_filters.iter()
-            .filter(|(_, lf)| frame_number >= *lf + CONFIRM_WINDOW_FRAMES)
+            .filter(|(_, lf)| frame_number >= *lf + confirm_window)
             .map(|(f, _)| f.clone())
             .collect();
 
@@ -575,29 +760,70 @@ impl ProverLifecycle {
 /// scored with the joiner ring (predicted ring after we join).
 ///
 /// Mirrors Go's `proposalDescriptors` at `worker_allocator.go:857-868`.
+/// `shard_sizes` overrides the registry's `total_size` (which is just a
+/// prover-count proxy) with real shard byte sizes from the shards
+/// store — Tier-5 #3.
 fn build_proposal_descriptors(
     summaries: &[ProverShardSummary],
     our_filters: &[Vec<u8>],
+    shard_sizes: &HashMap<Vec<u8>, u64>,
+    shards_store_filters: &[Vec<u8>],
 ) -> Vec<ShardDescriptor> {
-    summaries.iter().filter_map(|s| {
+    let mut out: Vec<ShardDescriptor> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::new();
+    for s in summaries {
         if s.filter.is_empty() {
-            return None;
+            continue;
         }
         if our_filters.contains(&s.filter) {
-            return None;
+            continue;
         }
         let active = s.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0);
         let joining = s.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0);
         let total = (active + joining) as usize;
         let ri = proposer::compute_shard_ring_info(total);
-        Some(ShardDescriptor {
+        let size = shard_sizes
+            .get(&s.filter)
+            .copied()
+            .unwrap_or_else(|| if s.total_size > 0 { s.total_size } else { 1 })
+            .max(1);
+        out.push(ShardDescriptor {
             filter: s.filter.clone(),
-            size: if s.total_size > 0 { s.total_size } else { 1 },
+            size,
             ring: ri.joiner_ring,
             shards: 1,
             active_on_ring: ri.active_on_joiner_ring,
-        })
-    }).collect()
+        });
+        seen.insert(s.filter.clone());
+    }
+    // Surface shards-store-only filters (no allocations yet) as
+    // empty-ring descriptors. Mirrors Go's worker allocator at
+    // `worker_allocator.go:763-868` where `proverRegistry.GetProvers(bp)`
+    // returns an empty list for unallocated shards but the descriptor
+    // is still built (with active=joining=0, ring=0) so the proposer
+    // can score and pick it.
+    for filter in shards_store_filters {
+        if filter.is_empty() {
+            continue;
+        }
+        if seen.contains(filter) {
+            continue;
+        }
+        if our_filters.contains(filter) {
+            continue;
+        }
+        let ri = proposer::compute_shard_ring_info(0);
+        let size = shard_sizes.get(filter).copied().unwrap_or(1).max(1);
+        out.push(ShardDescriptor {
+            filter: filter.clone(),
+            size,
+            ring: ri.joiner_ring,
+            shards: 1,
+            active_on_ring: ri.active_on_joiner_ring,
+        });
+    }
+    out
 }
 
 /// Build descriptors for every shard scored with its *current* ring.
@@ -605,7 +831,11 @@ fn build_proposal_descriptors(
 /// entries are spliced in) and for plan_leaves (allocated view).
 ///
 /// Mirrors Go's `decideDescriptors` at `worker_allocator.go:884-893`.
-fn build_decide_descriptors(summaries: &[ProverShardSummary]) -> Vec<ShardDescriptor> {
+/// Tier-5 #3: see `build_proposal_descriptors` doc.
+fn build_decide_descriptors(
+    summaries: &[ProverShardSummary],
+    shard_sizes: &HashMap<Vec<u8>, u64>,
+) -> Vec<ShardDescriptor> {
     summaries.iter().filter_map(|s| {
         if s.filter.is_empty() {
             return None;
@@ -614,90 +844,19 @@ fn build_decide_descriptors(summaries: &[ProverShardSummary]) -> Vec<ShardDescri
         let joining = s.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0);
         let total = (active + joining) as usize;
         let ri = proposer::compute_shard_ring_info(total);
+        let size = shard_sizes
+            .get(&s.filter)
+            .copied()
+            .unwrap_or_else(|| if s.total_size > 0 { s.total_size } else { 1 })
+            .max(1);
         Some(ShardDescriptor {
             filter: s.filter.clone(),
-            size: if s.total_size > 0 { s.total_size } else { 1 },
+            size,
             ring: ri.current_ring,
             shards: 1,
             active_on_ring: ri.active_on_current_ring,
         })
     }).collect()
-}
-
-/// RewardGreedy halt-risk override: pre-assign free workers to
-/// halt-risk shards (ordered most-urgent first) before normal reward
-/// scoring. Returns `(proposals_for_halt_risk, remaining_worker_ids,
-/// remaining_descriptors)`.
-///
-/// Urgency order: lowest active count first; ties broken by smallest
-/// shard size (cheapest to help), then filter bytes (deterministic).
-fn allocate_halt_risk(
-    proposal_descriptors: &[ShardDescriptor],
-    halt_risk_filters: &std::collections::HashSet<Vec<u8>>,
-    summaries: &[ProverShardSummary],
-    free_worker_ids: &[u32],
-) -> (Vec<proposer::Proposal>, Vec<u32>, Vec<ShardDescriptor>) {
-    if halt_risk_filters.is_empty() || free_worker_ids.is_empty() {
-        return (Vec::new(), free_worker_ids.to_vec(), proposal_descriptors.to_vec());
-    }
-
-    // Build (active_count, size, descriptor) tuples for halt-risk
-    // descriptors so we can order by urgency.
-    let active_by_filter: std::collections::HashMap<Vec<u8>, u64> = summaries.iter()
-        .map(|s| {
-            let active = s.status_counts
-                .get(&ProverStatus::Active).copied().unwrap_or(0) as u64;
-            (s.filter.clone(), active)
-        })
-        .collect();
-
-    let mut halt_risk_ordered: Vec<(u64, u64, ShardDescriptor)> = proposal_descriptors.iter()
-        .filter(|d| halt_risk_filters.contains(&d.filter))
-        .map(|d| {
-            let active = active_by_filter.get(&d.filter).copied().unwrap_or(0);
-            (active, d.size, d.clone())
-        })
-        .collect();
-    halt_risk_ordered.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.filter.cmp(&b.2.filter))
-    });
-
-    let mut proposals: Vec<proposer::Proposal> = Vec::new();
-    let mut consumed_workers: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut consumed_filters: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-
-    let mut worker_iter = free_worker_ids.iter().copied();
-    for (_active, _size, d) in halt_risk_ordered {
-        let Some(worker_id) = worker_iter.next() else { break; };
-        consumed_workers.insert(worker_id);
-        consumed_filters.insert(d.filter.clone());
-        // Halt-risk assignments bypass reward scoring — expected_reward
-        // is zero (PoMW reward is still computed at claim time based on
-        // actual shard state). shards_denominator follows the joiner
-        // ring view like normal allocations.
-        proposals.push(proposer::Proposal {
-            worker_id,
-            filter: d.filter.clone(),
-            expected_reward: BigInt::from(0),
-            world_state_bytes: 0,
-            shard_size_bytes: d.size,
-            ring: d.ring,
-            shards_denominator: d.shards as u64,
-        });
-    }
-
-    let remaining_workers: Vec<u32> = free_worker_ids.iter()
-        .copied()
-        .filter(|id| !consumed_workers.contains(id))
-        .collect();
-    let remaining_descriptors: Vec<ShardDescriptor> = proposal_descriptors.iter()
-        .filter(|d| !consumed_filters.contains(&d.filter))
-        .cloned()
-        .collect();
-
-    (proposals, remaining_workers, remaining_descriptors)
 }
 
 fn compute_world_bytes_from_summaries(summaries: &[ProverShardSummary]) -> BigInt {

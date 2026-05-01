@@ -29,25 +29,25 @@ pub const MAINNET_GENESIS_FRAME_NUMBER: u64 = 244200;
 
 /// Beacon seniority value for mainnet genesis.
 ///
-/// This is the output of `compat.GetAggregatedSeniority()` for the beacon
-/// prover's peer ID at genesis. It is deterministic from the embedded
-/// retro JSONs and `mainnet_244200_seniority.json`.
+/// This is the output of `compat::GetAggregatedSeniority([beacon_peer_id])`
+/// for the beacon prover at genesis. The same seniority is applied to
+/// ALL genesis provers (beacon + archive peers), matching Go's
+/// `establishMainnetGenesisProvers` at `genesis.go:858`.
 ///
-/// The same seniority is applied to ALL genesis provers (beacon + archive
-/// peers), matching Go's `establishMainnetGenesisProvers` at genesis.go:858.
+/// Deterministic derivation from the embedded retro JSONs:
+///   * First retro (`reward=157208`): `10*6*60*24*92 / (157208/157208)` = 7,948,800
+///   * Second retro (feb+mar+apr+may present): `10*6*60*24*(29+31+30+31)` = 10,454,400
+///   * Third retro (present): `10*6*60*24*30` = 2,592,000
+///   * Fourth retro (present): `10*6*60*24*31` = 2,678,400
+///   * Sum: 23,673,600
 ///
-/// This constant MUST match the Go output exactly, or the prover tree
-/// commitment will diverge and the node will be incompatible.
-///
-/// To verify: run the Go node with debug logging and check
-/// `GetAggregatedSeniority result` for the beacon peer ID, or compute
-/// `compat.GetAggregatedSeniority` offline using the beacon Ed448 key
-/// from `mainnet_genesis.json`.
-///
-/// FIXME(genesis): This value must be verified against a running Go node.
-/// If the ProverTreeCommitment in the genesis frame does not match Go,
-/// this constant is wrong and must be updated.
-pub const MAINNET_BEACON_SENIORITY: u64 = 10_886_400;
+/// `mainnet_244200_seniority.json` may additionally raise this via
+/// `max(retro_sum, mainnet_entry)` — the `seniority_compat` module
+/// handles both. The constant must be whatever Go would compute;
+/// `mainnet_beacon_seniority_matches_compat_table` asserts it at
+/// build time so any divergence fails loudly instead of silently
+/// producing an incompatible genesis prover tree commitment.
+pub const MAINNET_BEACON_SENIORITY: u64 = 23_673_600;
 
 /// Parsed genesis data from JSON.
 #[derive(Debug, Clone, Deserialize)]
@@ -624,6 +624,7 @@ pub fn initialize_testnet_genesis_state(
     local_bls_pubkey: &[u8],
     difficulty: u32,
     clock_store: &dyn ClockStore,
+    shards_store: &dyn quil_types::store::ShardsStore,
     hypergraph: &Arc<HypergraphCrdt>,
     inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
 ) -> Result<(global::GlobalFrame, global::QuorumCertificate)> {
@@ -656,10 +657,64 @@ pub fn initialize_testnet_genesis_state(
     for pubkey in &prover_pubkeys {
         add_genesis_prover(&state, pubkey, 1000, 0)?;
     }
+
+    // Mirror Go's testnet branch (`genesis.go:265-446`): seed the
+    // QUIL_TOKEN domain with six placeholder vertices and write six
+    // app-shard records keyed by `(QUIL_TOKEN_ADDRESS, path=0..5)`.
+    // Without these the testnet has no app shards in `shards_store`,
+    // so a non-global prover joining the network has nothing to
+    // propose joining — `build_proposal_descriptors` only sees the
+    // global filter (which it explicitly filters out). This is the
+    // implicit shard data Go produces at testnet bootstrap.
+    let quil_token_domain = quil_execution::domains::QUIL_TOKEN;
+    let va_disc = hypergraph_state::vertex_adds_discriminator()?;
+    for i in 0u8..6 {
+        let mut address = [0u8; 32];
+        address[0] = i;
+        // 64-byte zero blob matches Go's `make([]byte, 64)` payload.
+        state.set(&quil_token_domain[..], &address, &va_disc, 0, vec![0u8; 64])?;
+    }
+
     state.commit()?;
 
     // 5. Commit hypergraph and extract roots
     let roots = hypergraph.commit(0)?;
+
+    // Persist the six QUIL token app-shard records to the shards
+    // store. The shards-store entries are what the worker allocator
+    // iterates via `range_app_shards` to discover available shards
+    // — they're the source of truth for "what shards exist", separate
+    // from the prover registry's view of "who is allocated where".
+    //
+    // `shard_key` mirrors Go's `L1 || L2` layout: a 3-byte bloom
+    // filter index (L1) followed by the 32-byte address (L2). The
+    // shards-store reader hardcodes a 35-byte shard_key length, so
+    // writing a bare 32-byte L2 here causes 3 bytes of the encoded
+    // prefix u32 to be folded into the shard_key on readback.
+    let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(
+        &quil_token_domain[..],
+        256,
+        3,
+    );
+    let mut quil_shard_key = Vec::with_capacity(3 + quil_token_domain.len());
+    quil_shard_key.extend_from_slice(&l1);
+    quil_shard_key.extend_from_slice(&quil_token_domain[..]);
+    {
+        let txn = clock_store.new_transaction(false)?;
+        for path in 0u32..6 {
+            shards_store.put_app_shard(
+                txn.as_ref(),
+                &quil_types::store::ShardInfo {
+                    shard_key: quil_shard_key.clone(),
+                    prefix: vec![path],
+                    size: Vec::new(),
+                    data_shards: 0,
+                    commitment: Vec::new(),
+                },
+            )?;
+        }
+        txn.commit()?;
+    }
 
     // Build 256 commitment trees from all shard roots
     let mut commitment_trees: Vec<quil_tries::VectorCommitmentTree> =
@@ -870,6 +925,7 @@ pub fn initialize_genesis(
             local_bls_pubkey,
             difficulty,
             clock_store,
+            shards_store,
             hypergraph,
             inclusion_prover,
         )
@@ -1101,6 +1157,52 @@ mod tests {
         );
     }
 
+    /// Deterministic verification of MAINNET_BEACON_SENIORITY against
+    /// the compat table that's now fully ported from Go. Computes the
+    /// beacon peer ID from the Ed448 key in mainnet_genesis.json and
+    /// runs it through `seniority_compat::get_aggregated_seniority` —
+    /// the same function Go's `establishMainnetGenesisProvers` calls.
+    ///
+    /// If this assertion ever fails, MAINNET_BEACON_SENIORITY was
+    /// wrong and the genesis prover tree commitment would diverge
+    /// from Go's, making the Rust node unable to join mainnet.
+    #[test]
+    fn mainnet_beacon_seniority_matches_compat_table() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let genesis = get_mainnet_genesis_data().unwrap();
+
+        // Beacon Ed448 key is a 57-byte public key (not a 114-byte
+        // priv+pub pair), so we derive the peer ID directly from it
+        // via the same path quil_p2p uses.
+        let ed448_pub = b64
+            .decode(&genesis.beacon_ed448_key)
+            .expect("beacon Ed448 key not valid base64");
+        assert_eq!(
+            ed448_pub.len(),
+            57,
+            "beacon_ed448_key is {}B, expected 57B Ed448 pubkey",
+            ed448_pub.len()
+        );
+
+        let peer_id_bytes = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed448_pub);
+        let peer_id_str = bs58::encode(&peer_id_bytes).into_string();
+
+        let computed =
+            quil_execution::seniority_compat::get_aggregated_seniority(&[peer_id_str.clone()]);
+
+        assert_eq!(
+            computed, MAINNET_BEACON_SENIORITY,
+            "MAINNET_BEACON_SENIORITY ({}) does not match compat table result ({}) \
+             for beacon peer {}. Either the constant is wrong or the compat \
+             table (crates/quil-execution/src/seniority_compat.rs) diverges \
+             from Go's `compat::GetAggregatedSeniority`. Fix one or the other \
+             — genesis frame commitment depends on this value.",
+            MAINNET_BEACON_SENIORITY,
+            computed,
+            peer_id_str
+        );
+    }
+
     #[test]
     fn establish_mainnet_genesis_provers_creates_six_provers() {
         let crdt = test_crdt();
@@ -1156,6 +1258,43 @@ mod tests {
     // -----------------------------------------------------------------
     // Testnet genesis tests
     // -----------------------------------------------------------------
+
+    /// Minimal no-op ShardsStore stub for testnet-genesis tests. The
+    /// actual put/range behavior is exercised by integration tests
+    /// against `RocksShardsStore`; here we just need a writable
+    /// destination.
+    struct StubShardsStore;
+    impl ShardsStore for StubShardsStore {
+        fn range_app_shards(&self) -> quil_types::error::Result<Vec<quil_types::store::ShardInfo>> {
+            Ok(vec![])
+        }
+        fn get_app_shards(
+            &self,
+            _: &[u8],
+            _: &[u32],
+        ) -> quil_types::error::Result<Vec<quil_types::store::ShardInfo>> {
+            Ok(vec![])
+        }
+        fn put_app_shard(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &quil_types::store::ShardInfo,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn delete_app_shard(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &[u8],
+            _: &[u32],
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stub_shards_store() -> StubShardsStore {
+        StubShardsStore
+    }
 
     /// Minimal in-memory ClockStore for testnet genesis tests.
     struct TestClockStore {
@@ -1370,12 +1509,14 @@ mod tests {
         let clock_store = TestClockStore::new();
         let pubkey = vec![0xEEu8; 585];
 
+        let shards_store = stub_shards_store();
         let (frame, qc) = initialize_testnet_genesis_state(
             1,    // network
             "",   // empty seed -> use local key
             &pubkey,
             10000, // difficulty
             &clock_store,
+            &shards_store,
             &crdt,
             &NoopInclusionProver,
         )
@@ -1433,14 +1574,15 @@ mod tests {
         let clock_store = TestClockStore::new();
         let pubkey = vec![0xFFu8; 585];
 
+        let shards_store = stub_shards_store();
         // First call
         let (frame1, _qc1) = initialize_testnet_genesis_state(
-            1, "", &pubkey, 10000, &clock_store, &crdt, &NoopInclusionProver,
+            1, "", &pubkey, 10000, &clock_store, &shards_store, &crdt, &NoopInclusionProver,
         ).unwrap();
 
         // Second call should return existing frame
         let (frame2, _qc2) = initialize_testnet_genesis_state(
-            1, "", &pubkey, 10000, &clock_store, &crdt, &NoopInclusionProver,
+            1, "", &pubkey, 10000, &clock_store, &shards_store, &crdt, &NoopInclusionProver,
         ).unwrap();
 
         assert_eq!(
@@ -1456,37 +1598,7 @@ mod tests {
         let pubkey = vec![0xAAu8; 585];
 
         // network=1 should go to testnet path
-        // We need a ShardsStore mock too; use a simple stub that does nothing
-        struct StubShardsStore;
-        impl ShardsStore for StubShardsStore {
-            fn range_app_shards(&self) -> quil_types::error::Result<Vec<quil_types::store::ShardInfo>> {
-                Ok(vec![])
-            }
-            fn get_app_shards(
-                &self,
-                _: &[u8],
-                _: &[u32],
-            ) -> quil_types::error::Result<Vec<quil_types::store::ShardInfo>> {
-                Ok(vec![])
-            }
-            fn put_app_shard(
-                &self,
-                _: &dyn quil_types::store::Transaction,
-                _: &quil_types::store::ShardInfo,
-            ) -> quil_types::error::Result<()> {
-                Ok(())
-            }
-            fn delete_app_shard(
-                &self,
-                _: &dyn quil_types::store::Transaction,
-                _: &[u8],
-                _: &[u32],
-            ) -> quil_types::error::Result<()> {
-                Ok(())
-            }
-        }
-
-        let shards_store = StubShardsStore;
+        let shards_store = stub_shards_store();
 
         let (frame, _qc) = initialize_genesis(
             1, "", &pubkey, 10000, &clock_store, &shards_store, &crdt, &NoopInclusionProver,

@@ -99,10 +99,172 @@ pub fn pending_type_hash(domain: &[u8]) -> Result<[u8; 32]> {
     quil_crypto::poseidon::hash_bytes_to_32(&preimage)
 }
 
+/// Build the per-output `pending:PendingTransaction` vertex tree.
+///
+/// Mirrors Go `buildPendingTransactionTrees` at
+/// `token_intrinsic_pending_transaction.go:1085-1297`. Layout:
+///
+/// | Index | Field                         | Size |
+/// |-------|-------------------------------|------|
+/// | 0     | FrameNumber                   |   8  |
+/// | 1<<2  | Commitment                    |  56  |
+/// | 2<<2  | To.OneTimeKey                 |  56  |
+/// | 3<<2  | Refund.OneTimeKey             |  56  |
+/// | 4<<2  | To.VerificationKey            |  56  |
+/// | 5<<2  | Refund.VerificationKey        |  56  |
+/// | 6<<2  | To.CoinBalance                |  56  |
+/// | 7<<2  | Refund.CoinBalance            |  56  |
+/// | 8<<2  | To.Mask                       |  56  |
+/// | 9<<2  | Refund.Mask                   |  56  |
+/// | 10<<2 | To.AdditionalReference (opt)  |  56  |
+/// | 11<<2 | To.AdditionalReferenceKey     |  56  |
+/// | 12<<2 | Refund.AdditionalReference    |  56  |
+/// | 13<<2 | Refund.AdditionalReferenceKey |  56  |
+/// | 14<<2 | Expiration (when Expirable)   |   8  |
+/// | 0xFF*32 | type hash (pending:PT)      |  32  |
+///
+/// The To-side AdditionalReference branch occupies indices 10-13 and
+/// pushes Expiration (when Expirable) to index 14. Without
+/// AdditionalReference, Expiration sits at index 10.
+pub fn create_pending_transaction_tree(
+    frame_number: &[u8],
+    commitment: &[u8],
+    to: &super::transaction::RecipientBundle,
+    refund: &super::transaction::RecipientBundle,
+    expiration: u64,
+    expirable: bool,
+    pending_type: &[u8; 32],
+) -> Result<quil_tries::VectorCommitmentTree> {
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+
+    // Index 0: FrameNumber
+    tree.insert(&[0x00], frame_number, &[], &BigInt::from(8))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+
+    // Index 1<<2: Commitment
+    tree.insert(&[1u8 << 2], commitment, &[], &BigInt::from(56))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+
+    // Indices 2..=9: dual-recipient OneTimeKey/VK/CoinBalance/Mask
+    tree.insert(&[2u8 << 2], &to.one_time_key, &[], &BigInt::from(56))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+    tree.insert(&[3u8 << 2], &refund.one_time_key, &[], &BigInt::from(56))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+    tree.insert(&[4u8 << 2], &to.verification_key, &[], &BigInt::from(56))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+    tree.insert(&[5u8 << 2], &refund.verification_key, &[], &BigInt::from(56))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+    tree.insert(&[6u8 << 2], &to.coin_balance, &[], &BigInt::from(56))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+    tree.insert(&[7u8 << 2], &refund.coin_balance, &[], &BigInt::from(56))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+    tree.insert(&[8u8 << 2], &to.mask, &[], &BigInt::from(56))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+    tree.insert(&[9u8 << 2], &refund.mask, &[], &BigInt::from(56))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+
+    // Indices 10..=14: AdditionalReference (To-side gates) + Expiration
+    if to.additional_reference.len() == 64 {
+        tree.insert(&[10u8 << 2], &to.additional_reference, &[], &BigInt::from(56))
+            .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+        tree.insert(&[11u8 << 2], &to.additional_reference_key, &[], &BigInt::from(56))
+            .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+        tree.insert(&[12u8 << 2], &refund.additional_reference, &[], &BigInt::from(56))
+            .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+        tree.insert(&[13u8 << 2], &refund.additional_reference_key, &[], &BigInt::from(56))
+            .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+        if expirable {
+            let exp = expiration.to_be_bytes();
+            tree.insert(&[14u8 << 2], &exp, &[], &BigInt::from(8))
+                .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+        }
+    } else if expirable {
+        // No AdditionalReference: Expiration goes to index 10.
+        let exp = expiration.to_be_bytes();
+        tree.insert(&[10u8 << 2], &exp, &[], &BigInt::from(8))
+            .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+    }
+
+    // Type marker at [0xFF; 32]
+    tree.insert(&[0xFFu8; 32], pending_type, &[], &BigInt::from(32))
+        .map_err(|e| QuilError::Internal(format!("pending tree: {}", e)))?;
+
+    Ok(tree)
+}
+
 /// Compute the spent address from an input's verification key.
 /// `poseidon(verification_key)` → 32 bytes.
 pub fn spent_address(verification_key: &[u8]) -> Result<[u8; 32]> {
     quil_crypto::poseidon::hash_bytes_to_32(verification_key)
+}
+
+/// Outer-tree key for the serialized `TokenConfigurationMetadata` blob.
+/// Matches Go `token_intrinsic.go:228` where Deploy/Update writes via
+/// `[]byte{16 << 2}` into the metadata vertex tree.
+pub const TOKEN_CONFIG_OUTER_KEY: [u8; 1] = [16u8 << 2]; // 0x40
+
+/// Apply a TokenDeploy / TokenUpdate by writing a freshly-built
+/// `TokenConfigurationMetadata` tree into the metadata vertex's outer
+/// tree at `[16 << 2]`.
+///
+/// Mirrors Go `TokenIntrinsic.Deploy` at `token_intrinsic.go:208-248`:
+/// 1. Read existing metadata vertex tree (or start a fresh one for
+///    initial deploy).
+/// 2. Build the inner `TokenConfigurationMetadata` tree from the
+///    `TokenConfiguration`.
+/// 3. Commit the inner tree, serialize via the same Go-tree format the
+///    consensus layer reads back, insert at outer key `[0x40]` with
+///    the inner-commitment as commit metadata.
+/// 4. Write the resulting outer tree under
+///    `(domain, HYPERGRAPH_METADATA_ADDRESS)` in vertex-adds.
+///
+/// Returns the address of the metadata vertex that was written.
+pub fn materialize_token_deploy(
+    state: &crate::hypergraph_state::HypergraphState,
+    domain: &[u8],
+    config: &super::config::TokenConfiguration,
+    frame_number: u64,
+    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+) -> Result<[u8; 32]> {
+    let metadata_addr = crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
+    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+
+    // Load existing outer tree if present (Update path) — start from
+    // empty otherwise (initial Deploy path).
+    let mut outer = match state.get(domain, &metadata_addr, &va_disc)? {
+        Some(blob) if !blob.is_empty() => {
+            let root = quil_tries::deserialize_go_tree(&blob).map_err(|e| {
+                QuilError::Internal(format!(
+                    "token deploy: outer tree deserialize: {e}"
+                ))
+            })?;
+            quil_tries::VectorCommitmentTree { root }
+        }
+        _ => quil_tries::VectorCommitmentTree::new(),
+    };
+
+    // Build the inner config tree.
+    let mut inner = super::metadata_schema::build_token_configuration_metadata_tree(config)?;
+    let inner_commit = inner.commit(inclusion_prover);
+    let inner_blob = quil_tries::serialize_go_tree(inner.root.as_ref()).map_err(|e| {
+        QuilError::Internal(format!("token deploy: inner tree serialize: {e}"))
+    })?;
+
+    let inner_size = BigInt::from(inner_blob.len() as u64);
+    outer
+        .insert(&TOKEN_CONFIG_OUTER_KEY, &inner_blob, &inner_commit, &inner_size)
+        .map_err(|e| QuilError::Internal(format!("token deploy: outer insert: {e}")))?;
+
+    // Re-commit the outer tree so the materialized blob carries the
+    // updated inclusion proofs.
+    let _ = outer.commit(inclusion_prover);
+
+    let outer_blob = quil_tries::serialize_go_tree(outer.root.as_ref()).map_err(|e| {
+        QuilError::Internal(format!("token deploy: outer serialize: {e}"))
+    })?;
+
+    state.set(domain, &metadata_addr, &va_disc, frame_number, outer_blob)?;
+    Ok(metadata_addr)
 }
 
 /// Extract the verification key from a standard transaction input

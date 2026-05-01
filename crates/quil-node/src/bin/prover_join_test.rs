@@ -171,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
                 let pv = ed448_rust::PrivateKey::from(s);
                 let m = quil_p2p::encode_canonical_peer_info(&pi, &pk, &[]);
                 if let Ok(sig) = pv.sign(&m, None) {
-                    h.publish(bm.clone(), quil_p2p::encode_canonical_peer_info(&pi, &pk, &sig)).await;
+                    let _ = h.publish(bm.clone(), quil_p2p::encode_canonical_peer_info(&pi, &pk, &sig)).await;
                     info!("published signed PeerInfo");
                 }
 
@@ -191,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
                             &p2i_sig,
                             now_ms as u64,
                         );
-                        h.publish(bm.clone(), kr).await;
+                        let _ = h.publish(bm.clone(), kr).await;
                         info!("published KeyRegistry");
                     }
                 }
@@ -488,7 +488,9 @@ async fn main() -> anyhow::Result<()> {
                                                 }
                                             }
                                             // Also publish via BlossomSub as fallback
-                                            p2p_handle.publish(vec![0u8; 3], bytes).await;
+                                            if let Err(e) = p2p_handle.publish(vec![0u8; 3], bytes).await {
+                                                warn!(error = %e, "ProverJoin BlossomSub publish failed");
+                                            }
                                             info!(submitted_grpc = submitted, "ProverJoin published via BlossomSub too");
                                             *phase.lock().await = Phase::WaitingForJoinReceipt;
                                         }
@@ -596,7 +598,9 @@ async fn main() -> anyhow::Result<()> {
                                 };
                                 match bundle.to_canonical_bytes() {
                                     Ok(bytes) => {
-                                        p2p_handle.publish(vec![0u8; 3], bytes).await;
+                                        if let Err(e) = p2p_handle.publish(vec![0u8; 3], bytes).await {
+                                            warn!(error = %e, "ProverConfirm BlossomSub publish failed");
+                                        }
                                         info!("ProverConfirm published as MessageBundle!");
                                         *phase.lock().await = Phase::Done;
                                     }

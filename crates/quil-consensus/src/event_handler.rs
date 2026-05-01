@@ -32,8 +32,7 @@ pub trait EventHandler<S: Unique, V: Unique>: Send + Sync {
     fn on_partial_timeout_certificate(&mut self, rank: u64) -> Result<()>;
 }
 
-/// Notifications emitted by the consensus engine. Mirror of Go's
-/// `consensus.Consumer[StateT, VoteT]`.
+/// Notifications emitted by the consensus engine.
 pub trait Consumer<S: Unique, V: Unique>: Send + Sync {
     /// Called when the event handler starts up.
     fn on_start(&self, _current_rank: u64) {}
@@ -119,29 +118,11 @@ pub trait ConsensusStore<V: Unique>: Send + Sync {
 // HotStuffEventHandler: concrete central state machine
 // =====================================================================
 
-/// Central HotStuff event-handler state machine. Mirror of Go's
-/// `consensus/eventhandler/event_handler.go::EventHandler[StateT, VoteT, PeerIDT, CollectedT]`.
-///
-/// The event handler wires together:
-/// - a [`Pacemaker`] for rank tracking and timeout control,
-/// - a [`Forks`] forest for 2-chain finalization,
-/// - a [`SafetyRulesT`] guard for vote / timeout production,
-/// - a [`StateProducer`] for leader-side proposal construction,
-/// - a [`Replicas`] committee view,
-/// - a [`Consumer`] for outbound notifications to the communicator.
-///
-/// Each subcomponent lives behind an `Arc<Mutex<_>>` — the event loop
-/// is single-threaded in Go and Rust alike, but we use Mutex rather
-/// than RefCell so the event handler remains `Send + Sync` and can be
-/// shared through tokio task handles.
-///
-/// The public API mirrors Go exactly:
-/// - [`on_receive_quorum_certificate`](HotStuffEventHandler::on_receive_quorum_certificate)
-/// - [`on_receive_timeout_certificate`](HotStuffEventHandler::on_receive_timeout_certificate)
-/// - [`on_receive_proposal`](HotStuffEventHandler::on_receive_proposal)
-/// - [`on_local_timeout`](HotStuffEventHandler::on_local_timeout)
-/// - [`on_partial_timeout_certificate_created`](HotStuffEventHandler::on_partial_timeout_certificate_created)
-/// - [`start`](HotStuffEventHandler::start)
+/// Central HotStuff event-handler state machine wiring the
+/// pacemaker, forks forest, safety rules, state producer, committee,
+/// and outbound consumer. Each subcomponent sits behind
+/// `Arc<Mutex<_>>` so the handler stays `Send + Sync` and can be
+/// shared through task handles.
 pub struct HotStuffEventHandler<S: Unique, V: Unique> {
     pacemaker: Arc<Mutex<dyn Pacemaker>>,
     state_producer: Arc<StateProducer<S, V>>,
@@ -149,6 +130,12 @@ pub struct HotStuffEventHandler<S: Unique, V: Unique> {
     safety_rules: Arc<Mutex<dyn SafetyRulesT<S, V>>>,
     committee: Arc<dyn Replicas>,
     notifier: Arc<dyn Consumer<S, V>>,
+    /// Highest rank a proposal has already been produced for.
+    /// Several paths (fresh QC, fresh TC, local timeout, start) can
+    /// drive `propose_for_new_rank_if_primary` for the same rank;
+    /// without this guard the state producer runs twice and the
+    /// second invocation drains an empty message-collector snapshot.
+    last_proposed_rank: std::sync::atomic::AtomicU64,
 }
 
 impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
@@ -167,12 +154,13 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             safety_rules,
             committee,
             notifier,
+            last_proposed_rank: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Handle a freshly-validated quorum certificate from the network,
-    /// internal vote aggregator, or embedded in a timeout state. Mirror
-    /// of Go's `OnReceiveQuorumCertificate`.
+    /// Handle a freshly-validated quorum certificate from the
+    /// network, internal vote aggregator, or embedded in a timeout
+    /// state.
     pub fn on_receive_quorum_certificate(&self, qc: Arc<dyn QuorumCertificate>) -> Result<()> {
         let cur_rank = self.current_rank();
         self.notifier
@@ -193,8 +181,7 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         result
     }
 
-    /// Handle a freshly-validated timeout certificate. Mirror of Go's
-    /// `OnReceiveTimeoutCertificate`.
+    /// Handle a freshly-validated timeout certificate.
     pub fn on_receive_timeout_certificate(&self, tc: Arc<dyn TimeoutCertificate>) -> Result<()> {
         let cur_rank = self.current_rank();
         self.notifier
@@ -221,17 +208,12 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         result
     }
 
-    /// Handle a proposal received from another consensus participant.
-    /// Mirror of Go's `OnReceiveProposal`.
-    ///
-    /// The event handler:
-    /// 1. Drops stale proposals (below finalized rank).
-    /// 2. Adds the state to the forest (may trigger finalization).
-    /// 3. Processes the parent QC and optional prior-rank TC through
-    ///    the pacemaker (may advance rank).
-    /// 4. Votes if the proposal is for the current rank.
-    /// 5. Emits an own proposal if the rank advanced and this node is
-    ///    the new leader.
+    /// Handle a proposal received from another consensus
+    /// participant. Drops stale proposals, adds the state to the
+    /// forest, feeds parent QC + optional prior-rank TC into the
+    /// pacemaker, votes if the proposal targets the current rank,
+    /// and proposes if rank advanced and this node is the new
+    /// leader.
     pub fn on_receive_proposal(&self, proposal: &SignedProposal<S, V>) -> Result<()> {
         let cur_rank = self.current_rank();
         self.notifier.on_receive_proposal(cur_rank, proposal);
@@ -251,25 +233,22 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
                 .map_err(|e| {
                     QuilError::Consensus(format!(
                         "cannot add proposal to forks ({}): {}",
-                        proposal.proposal.state.identifier, e
+                        hex::encode(&proposal.proposal.state.identifier), e
                     ))
                 })?;
         }
 
-        // Feed parent-QC ingredients into the pacemaker. Our Rust
         // `State` only carries `parent_qc_rank` + `parent_qc_identity`,
-        // not the full QC trait object. For now we skip the pacemaker
-        // parent-QC feed and rely on the compliance layer + event
-        // handler to present an independent QC via
-        // `on_receive_quorum_certificate`. The partial-TC path still
-        // feeds the TC through the pacemaker.
+        // not the full QC trait object — the parent-QC feed comes
+        // through `on_receive_quorum_certificate`. The partial-TC
+        // path is fed through the pacemaker here.
         if let Some(tc) = &proposal.proposal.previous_rank_timeout_certificate {
             let mut pm = self.pacemaker.lock().unwrap();
             pm.receive_timeout_certificate(Some(Arc::clone(tc)))
                 .map_err(|e| {
                     QuilError::Consensus(format!(
                         "could not process TC for state {}: {}",
-                        proposal.proposal.state.identifier, e
+                        hex::encode(&proposal.proposal.state.identifier), e
                     ))
                 })?;
         }
@@ -289,11 +268,18 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         result
     }
 
-    /// Handle a local timeout event. Mirror of Go's `OnLocalTimeout`.
+    /// Handle a local timeout event.
     pub fn on_local_timeout(&self) -> Result<()> {
         let cur_rank = self.current_rank();
         self.notifier.on_local_timeout(cur_rank);
         let result = self.broadcast_timeout_state_if_authorized();
+        // Re-arm the pacemaker's timer so the event loop schedules a
+        // rebroadcast tick at `now + rebroadcast_interval` rather than
+        // entering a tight busy-loop on the (already-elapsed) deadline.
+        {
+            let mut pm = self.pacemaker.lock().unwrap();
+            pm.rearm_after_local_timeout();
+        }
         self.notifier.on_event_processed();
         result.map_err(|e| {
             QuilError::Consensus(format!(
@@ -303,20 +289,19 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         })
     }
 
+    /// Instant at which the pacemaker's next local timeout fires.
+    /// Used by the event loop's `sleep_until` arm to drive the timer.
+    pub fn current_round_deadline(&self) -> Instant {
+        self.pacemaker.lock().unwrap().current_round_deadline()
+    }
+
     /// Handle a partial-TC notification from the timeout aggregator.
-    /// Mirror of Go's `OnPartialTimeoutCertificateCreated`.
-    ///
-    /// The event handler:
-    /// 1. Feeds the embedded newest QC into the pacemaker (may advance
-    ///    the rank).
-    /// 2. Feeds the optional prior-rank TC into the pacemaker.
-    /// 3. If the pacemaker is still at the partial's rank, broadcasts
-    ///    a local timeout to help the network converge.
-    ///
-    /// Note: in the partial-TC path, Go explicitly does NOT propose a
-    /// new state even after rank change, because partial TC means
-    /// superminority has timed out — any proposal we'd make would
-    /// struggle to reach quorum. We only broadcast our own timeout.
+    /// Feeds embedded newest QC + optional prior-rank TC into the
+    /// pacemaker, then broadcasts a local timeout if still at the
+    /// partial's rank to help the network converge. A partial TC
+    /// (>1/3 weight timed out) deliberately does NOT trigger a new
+    /// proposal here — any such proposal would struggle to reach
+    /// quorum.
     pub fn on_partial_timeout_certificate_created(
         &self,
         partial: &PartialTimeoutCertificateCreated,
@@ -359,11 +344,19 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         result
     }
 
-    /// Start the event handler. Mirror of Go's `Start`. In Rust, the
-    /// pacemaker's timer is owned by the event loop (not the pacemaker
-    /// itself), so this reduces to firing `on_start` and attempting an
-    /// initial proposal if we're primary.
+    /// Start the event handler — fire `on_start` and attempt an
+    /// initial proposal if this node is primary. The pacemaker's
+    /// timer is owned by the event loop.
     pub fn start(&self) -> Result<()> {
+        // Reset the pacemaker's deadline to "now + min_timeout" so
+        // the first round's timer starts when the event loop runs,
+        // not when the pacemaker was constructed (which can be much
+        // earlier — e.g. waiting for the BlossomSub mesh to form
+        // before producing the genesis proposal).
+        {
+            let mut pm = self.pacemaker.lock().unwrap();
+            pm.rearm_after_local_timeout();
+        }
         self.notifier.on_start(self.current_rank());
         let result = self.propose_for_new_rank_if_primary();
         self.notifier.on_event_processed();
@@ -440,6 +433,18 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             return Ok(());
         }
 
+        // Idempotency: skip if we already proposed for this rank.
+        // See `last_proposed_rank` doc — without this, prove_next_state
+        // runs twice per rank and the second invocation's drained-but-
+        // discarded message bundle results in the broadcast proposal
+        // having no requests.
+        let prior = self
+            .last_proposed_rank
+            .load(std::sync::atomic::Ordering::Acquire);
+        if cur_rank <= prior {
+            return Ok(());
+        }
+
         // Check that we know the parent state referenced by the newest QC.
         let parent_known = self
             .forks
@@ -489,20 +494,44 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             }
         };
 
-        // `target_publication_time` hook. The Rust pacemaker trait doesn't
-        // currently expose a `target_publication_time` method on the trait
-        // itself (only `HotStuffPacemaker` has it as an inherent method),
-        // so we fall back to `start` until the event loop wiring supplies
-        // the concrete pacemaker type.
-        let target_publication = start;
+        // Ask the pacemaker for the proposal's target broadcast
+        // time. With `StaticProposalDurationProvider`, this is
+        // `start + proposal_duration` (10s mainnet) — the publisher
+        // sleeps until then before broadcasting so the chain
+        // advances at a steady cadence rather than VDF-as-fast.
+        let target_publication = {
+            let pm = self.pacemaker.lock().unwrap();
+            pm.target_publication_time(
+                signed.proposal.state.rank,
+                start,
+                &signed.proposal.state.parent_qc_identity,
+            )
+        };
+
+        // Mark this rank as proposed *before* notifying — if
+        // on_own_proposal triggers any path that re-enters this fn
+        // (e.g. on_receive_proposal called below), the idempotency
+        // check at the top will short-circuit instead of producing a
+        // second draft proposal.
+        self.last_proposed_rank
+            .store(cur_rank, std::sync::atomic::Ordering::Release);
 
         self.notifier.on_own_proposal(&signed, target_publication);
+
+        // Re-inject our own proposal so it lands in `Forks` and the
+        // leader's self-vote path runs. Without this, the next-rank
+        // `parent_known` check fails because the proposal was never
+        // added to the forest. `on_receive_proposal` short-circuits
+        // when rank is unchanged, so the path is bounded.
+        self.on_receive_proposal(&signed)?;
+
         Ok(())
     }
 
     fn process_state_for_current_rank(&self, proposal: &SignedProposal<S, V>) -> Result<()> {
         let cur_rank = self.current_rank();
-        if proposal.proposal.state.rank != cur_rank {
+        let proposal_rank = proposal.proposal.state.rank;
+        if proposal_rank != cur_rank {
             return Ok(());
         }
         let next_leader = self
@@ -532,6 +561,19 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
                 "won't vote for proposal, no parent state for this proposal".into(),
             ));
         }
+
+        // The proposer's vote was already produced inside
+        // `sign_own_proposal` (which advanced
+        // `latest_acknowledged_rank`); re-running `produce_vote`
+        // would trip the "already voted in rank N" safety check.
+        // Emit the already-signed vote directly so it reaches the
+        // local aggregator.
+        let self_id = self.committee.self_identity().clone();
+        if proposal.proposal.state.proposer_id == self_id {
+            self.notifier.on_own_vote(&proposal.vote, next_leader);
+            return Ok(());
+        }
+
         let own_vote = {
             let mut sr = self.safety_rules.lock().unwrap();
             match sr.produce_vote(proposal, cur_rank) {
@@ -734,7 +776,7 @@ mod tests {
                 return Err(clone_err(e));
             }
             Ok(AppVote {
-                id: format!("vote-{}", proposal.proposal.state.rank),
+                id: format!("vote-{}", proposal.proposal.state.rank).into_bytes(),
                 rank: proposal.proposal.state.rank,
             })
         }
@@ -753,7 +795,7 @@ mod tests {
                 latest_quorum_certificate: newest_qc,
                 prior_rank_timeout_certificate: prior,
                 vote: AppVote {
-                    id: format!("to-{}", cur_rank),
+                    id: format!("to-{}", cur_rank).into_bytes(),
                     rank: cur_rank,
                 },
                 timeout_tick: 0,
@@ -765,7 +807,7 @@ mod tests {
         ) -> Result<AppVote> {
             self.sign_own_calls += 1;
             Ok(AppVote {
-                id: format!("own-vote-{}", proposal.state.rank),
+                id: format!("own-vote-{}", proposal.state.rank).into_bytes(),
                 rank: proposal.state.rank,
             })
         }
@@ -785,7 +827,7 @@ mod tests {
     struct StubLeaderProvider;
     impl LeaderProvider<AppState> for StubLeaderProvider {
         fn get_next_leaders(&self, _prior: Option<&State<AppState>>) -> Result<Vec<Identity>> {
-            Ok(vec!["leader".into()])
+            Ok(vec![b"leader".to_vec()])
         }
         fn prove_next_state(
             &self,
@@ -795,13 +837,13 @@ mod tests {
         ) -> Result<State<AppState>> {
             Ok(State {
                 rank,
-                identifier: format!("state-{}", rank),
-                proposer_id: "leader".into(),
+                identifier: format!("state-{}", rank).into_bytes(),
+                proposer_id: b"leader".to_vec(),
                 parent_qc_identity: prior_state.clone(),
                 parent_qc_rank: rank.saturating_sub(1),
                 timestamp: 0,
                 state: AppState {
-                    id: format!("state-{}", rank),
+                    id: format!("state-{}", rank).into_bytes(),
                     rank,
                 },
             })
@@ -985,10 +1027,14 @@ mod tests {
                     timestamp: 0,
                     state: AppState { id: state_id.into(), rank },
                 },
+                parent_quorum_certificate: Arc::new(StubQc {
+                    rank: parent_qc_rank,
+                    id: parent_qc_id.into(),
+                }),
                 previous_rank_timeout_certificate: None,
             },
             vote: AppVote {
-                id: format!("proposer-vote-{}", rank),
+                id: format!("proposer-vote-{}", rank).into_bytes(),
                 rank,
             },
         }

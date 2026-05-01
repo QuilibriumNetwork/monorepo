@@ -356,8 +356,8 @@ mod tests {
         assert!(!s.add_vote(vote("v1", "alice", 10))); // duplicate
         assert!(s.add_vote(vote("v2", "alice", 10)));
         assert_eq!(s.ordered_votes().len(), 2);
-        assert_eq!(s.ordered_votes()[0].id, "v1");
-        assert_eq!(s.ordered_votes()[1].id, "v2");
+        assert_eq!(s.ordered_votes()[0].id, b"v1".to_vec());
+        assert_eq!(s.ordered_votes()[1].id, b"v2".to_vec());
     }
 
     #[test]
@@ -380,7 +380,7 @@ mod tests {
         pv.add_vote(vote("v3", "alice", 1));
         let sources: Vec<_> = pv.sources().cloned().collect();
         assert_eq!(sources.len(), 2);
-        let alice = pv.take_source(&"alice".to_string()).unwrap();
+        let alice = pv.take_source(&b"alice".to_vec()).unwrap();
         assert_eq!(alice.ordered_votes().len(), 2);
     }
 

@@ -3,10 +3,11 @@ use std::time::Duration;
 use futures::StreamExt;
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
+use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
 use quil_config::P2PConfig;
@@ -231,7 +232,11 @@ impl P2PNode {
                                 for (bp_peer, bp_addr) in &bootstrap_peers {
                                     if !swarm.is_connected(bp_peer) {
                                         swarm.behaviour_mut().kademlia.add_address(bp_peer, bp_addr.clone());
-                                        let _ = swarm.dial(bp_addr.clone());
+                                        let opts = DialOpts::unknown_peer_id()
+                                            .address(bp_addr.clone())
+                                            .allocate_new_port()
+                                            .build();
+                                        let _ = swarm.dial(opts);
                                     }
                                 }
                             }
@@ -274,7 +279,11 @@ impl P2PNode {
                                     for (bp_peer, bp_addr) in &bootstrap_peers {
                                         debug!(%bp_peer, %bp_addr, "dialing bootstrap peer");
                                         swarm.behaviour_mut().kademlia.add_address(bp_peer, bp_addr.clone());
-                                        if let Err(e) = swarm.dial(bp_addr.clone()) {
+                                        let opts = DialOpts::unknown_peer_id()
+                                            .address(bp_addr.clone())
+                                            .allocate_new_port()
+                                            .build();
+                                        if let Err(e) = swarm.dial(opts) {
                                             debug!(%e, %bp_peer, "dial failed");
                                         }
                                     }
@@ -368,7 +377,10 @@ impl P2PNode {
                                                     connected = connected_count,
                                                     "kad: new peer with addresses, dialing"
                                                 );
-                                                let _ = swarm.dial(*peer);
+                                                let opts = DialOpts::peer_id(*peer)
+                                                    .allocate_new_port()
+                                                    .build();
+                                                let _ = swarm.dial(opts);
                                             }
                                         }
                                         libp2p::kad::Event::OutboundQueryProgressed { result, .. } => {
@@ -391,7 +403,10 @@ impl P2PNode {
                                                             swarm.behaviour_mut().kademlia
                                                                 .add_address(&peer_info.peer_id, addr.clone());
                                                         }
-                                                        let _ = swarm.dial(peer_info.peer_id);
+                                                        let opts = DialOpts::peer_id(peer_info.peer_id)
+                                                            .allocate_new_port()
+                                                            .build();
+                                                        let _ = swarm.dial(opts);
                                                     }
                                                 }
                                                 libp2p::kad::QueryResult::GetProviders(Ok(
@@ -404,7 +419,10 @@ impl P2PNode {
                                                     let local = *swarm.local_peer_id();
                                                     for provider_peer in providers.iter() {
                                                         if *provider_peer != local && !swarm.is_connected(provider_peer) {
-                                                            let _ = swarm.dial(*provider_peer);
+                                                            let opts = DialOpts::peer_id(*provider_peer)
+                                                                .allocate_new_port()
+                                                                .build();
+                                                            let _ = swarm.dial(opts);
                                                         }
                                                     }
                                                 }
@@ -461,9 +479,15 @@ impl P2PNode {
                             Some(P2PCommand::Unsubscribe(bitmask)) => {
                                 swarm.behaviour_mut().blossomsub.unsubscribe(&bitmask);
                             }
-                            Some(P2PCommand::Publish { bitmask, data }) => {
-                                if let Err(e) = swarm.behaviour_mut().blossomsub.publish(bitmask, data) {
+                            Some(P2PCommand::Publish { bitmask, data, ack }) => {
+                                let result = swarm.behaviour_mut().blossomsub.publish(bitmask, data);
+                                if let Err(ref e) = result {
                                     tracing::debug!(error = %e, "BlossomSub publish failed");
+                                }
+                                if let Some(ack) = ack {
+                                    // Receiver may have dropped (caller didn't await);
+                                    // treat that as best-effort fire-and-forget.
+                                    let _ = ack.send(result);
                                 }
                             }
                             Some(P2PCommand::BlacklistPeer(peer_id)) => {
@@ -505,8 +529,40 @@ impl P2PHandle {
 
     /// Publish data to a bitmask topic. This is the send path —
     /// broadcasts the data to all peers subscribed to the bitmask.
-    pub async fn publish(&self, bitmask: Vec<u8>, data: Vec<u8>) {
-        let _ = self.cmd_tx.send(P2PCommand::Publish { bitmask, data }).await;
+    ///
+    /// Returns `Ok(())` for empty-mesh / no-peer scenarios (BlossomSub
+    /// silently buffers — Go does the same) and on every successful
+    /// dispatch. Returns `Err` only on _true_ failures: the swarm
+    /// command channel is closed (e.g. shutdown), the swarm loop has
+    /// exited without acknowledging the publish, or the underlying
+    /// BlossomSub behaviour rejected the message (e.g. local node not
+    /// subscribed to the bitmask).
+    pub async fn publish(
+        &self,
+        bitmask: Vec<u8>,
+        data: Vec<u8>,
+    ) -> quil_types::error::Result<()> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(P2PCommand::Publish {
+                bitmask,
+                data,
+                ack: Some(ack_tx),
+            })
+            .await
+            .map_err(|_| QuilError::P2p(
+                "p2p command channel closed (swarm shutting down?)".into(),
+            ))?;
+        match ack_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(QuilError::P2p(format!(
+                "blossomsub publish failed: {}",
+                reason
+            ))),
+            Err(_) => Err(QuilError::P2p(
+                "p2p swarm dropped publish ack (event loop exited)".into(),
+            )),
+        }
     }
 
     /// Blacklist a peer — future connections will be denied.
@@ -528,12 +584,52 @@ impl P2PHandle {
     pub fn observed_addresses(&self) -> Vec<String> {
         self.observed_addrs.read().unwrap().clone()
     }
+
+    /// Construct a stub `P2PHandle` for tests that exercise callers of
+    /// `publish` without booting a real libp2p swarm. The handle's
+    /// command-receiver task simply acks every publish with a fixed
+    /// outcome (`Ok` if `fail_on_publish` is `false`, `Err` otherwise).
+    /// The peer ID is a random placeholder — sufficient for code
+    /// that only uses publish/peer_count.
+    #[doc(hidden)]
+    pub fn for_test(fail_on_publish: bool) -> Self {
+        let peer_id = PeerId::random();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2PCommand>(16);
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let P2PCommand::Publish { ack, .. } = cmd {
+                    if let Some(ack) = ack {
+                        let _ = ack.send(if fail_on_publish {
+                            Err("test stub: simulated publish failure".to_string())
+                        } else {
+                            Ok(())
+                        });
+                    }
+                }
+                // other commands are silently consumed
+            }
+        });
+        Self {
+            peer_id,
+            cmd_tx,
+            observed_addrs: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            peer_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
 }
 
 enum P2PCommand {
     Subscribe(Vec<u8>),
     Unsubscribe(Vec<u8>),
-    Publish { bitmask: Vec<u8>, data: Vec<u8> },
+    Publish {
+        bitmask: Vec<u8>,
+        data: Vec<u8>,
+        /// Optional oneshot used by `P2PHandle::publish` so callers can
+        /// observe true publish failures (channel closed, behaviour
+        /// rejected the message, etc.). Empty-mesh / no-peers scenarios
+        /// remain `Ok` — the swarm event loop just buffers nothing.
+        ack: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    },
     BlacklistPeer(PeerId),
     Shutdown,
 }
@@ -549,9 +645,25 @@ struct NodeBehaviour {
     autonat: libp2p::autonat::Behaviour,
 }
 
-/// Compute message ID as SHA-256 of data (matching Go implementation).
+/// Compute message ID matching Go's `DefaultMsgIdFn` at
+/// `go-libp2p-blossomsub/pubsub.go:1321-1326`:
+///
+/// ```go
+/// h := sha256.New()
+/// h.Write(pmsg.Data)
+/// return h.Sum([]byte{0x01})
+/// ```
+///
+/// `hash.Hash.Sum(b)` APPENDS the digest to `b`, so the result is
+/// `[0x01, SHA256(data)...]` — 33 bytes, leading byte 0x01. Rust nodes
+/// that emit the 32-byte digest alone would compute dedup IDs that
+/// never match Go's for the same payload, corrupting IHAVE/IWANT
+/// gossip and causing message-routing divergence across the network.
 pub fn message_id(data: &[u8]) -> Vec<u8> {
-    Sha256::digest(data).to_vec()
+    let mut id = Vec::with_capacity(33);
+    id.push(0x01);
+    id.extend_from_slice(&Sha256::digest(data));
+    id
 }
 
 /// Returns `true` if the multiaddr's IP component is publicly routable

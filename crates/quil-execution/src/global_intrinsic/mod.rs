@@ -26,15 +26,19 @@
 //! canonical-bytes module plus the per-op state-transition logic.
 
 pub mod addressed_signature;
+pub mod alt_shard_update_materialize;
 pub mod consensus_types;
 pub mod conversions;
 pub mod frame_header;
 pub mod intrinsic;
+pub mod kick_verify;
 pub mod materialize;
 pub mod proof_types;
 pub mod prover_filter_ops;
 pub mod prover_join;
 pub mod prover_ops;
+pub mod prover_shard_update;
+pub mod prover_update_materialize;
 pub mod prover_verify;
 pub mod seniority_merge;
 pub mod sig_with_pop;
@@ -57,10 +61,4 @@ pub use prover_ops::{
     ProverConfirm, ProverReject, ProverKick, ProverUpdate, ProverSeniorityMerge,
     ShardSplit, ShardMerge, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT, TYPE_PROVER_KICK,
     TYPE_PROVER_UPDATE, TYPE_PROVER_SENIORITY_MERGE, TYPE_SHARD_SPLIT, TYPE_SHARD_MERGE,
-};
-pub use consensus_types::{
-    TYPE_ALT_SHARD_UPDATE, TYPE_GLOBAL_PROPOSAL, TYPE_APP_SHARD_PROPOSAL,
-    TYPE_QUORUM_CERTIFICATE, TYPE_TIMEOUT_STATE, TYPE_TIMEOUT_CERTIFICATE,
-    AltShardUpdate, GlobalProposal, AppShardProposal, QuorumCertificate,
-    TimeoutState, TimeoutCertificate,
 };

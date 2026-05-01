@@ -80,7 +80,7 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
             return Err(QuilError::InvalidQuorumCertificate(format!(
                 "aggregated QC signature failed verification at rank {} (state {})",
                 qc.rank(),
-                qc.identity()
+                hex::encode(qc.identity())
             )));
         }
         Ok(())

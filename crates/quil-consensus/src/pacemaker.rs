@@ -124,6 +124,34 @@ pub trait Pacemaker: Send + Sync {
         &mut self,
         tc: Option<Arc<dyn TimeoutCertificate>>,
     ) -> Result<Option<NextRank>>;
+
+    /// Instant at which the next local timeout fires. Used by the
+    /// event loop to drive the timer. Implementations that don't need
+    /// a real timer may return `Instant::now() + Duration::from_secs(60 * 60 * 24 * 365)`
+    /// or similar.
+    fn current_round_deadline(&self) -> Instant {
+        Instant::now() + Duration::from_secs(60 * 60 * 24 * 365)
+    }
+
+    /// Advance the deadline after a local timeout fires (without a
+    /// rank change). The pacemaker should use its rebroadcast interval
+    /// to schedule the next rebroadcast.
+    fn rearm_after_local_timeout(&mut self) {}
+
+    /// Target publication time for a leader's proposal at `rank`.
+    /// Mirror of Go's `Pacemaker.TargetPublicationTime`. Default
+    /// returns `time_entered`, i.e. publish immediately — concrete
+    /// impls override to add the configured `proposal_duration`
+    /// so the chain advances at a steady cadence rather than
+    /// VDF-as-fast-as-possible.
+    fn target_publication_time(
+        &self,
+        _rank: u64,
+        time_entered: Instant,
+        _parent_id: &Identity,
+    ) -> Instant {
+        time_entered
+    }
 }
 
 /// Truncated exponential backoff timeout configuration. Mirror of
@@ -453,6 +481,10 @@ pub struct HotStuffPacemaker<S: Unique, V: Unique> {
     rank_tracker: RankTracker<V>,
     notifier: Arc<dyn ParticipantConsumer<S, V>>,
     duration_provider: Arc<dyn ProposalDurationProvider>,
+    /// Instant at which the next local timeout fires. Updated on
+    /// construction (initial timer for the boot rank), on rank change
+    /// (QC- or TC-triggered), and on local timeout fire (rebroadcast).
+    current_deadline: Instant,
 }
 
 impl<S: Unique, V: Unique> HotStuffPacemaker<S, V> {
@@ -464,11 +496,16 @@ impl<S: Unique, V: Unique> HotStuffPacemaker<S, V> {
         store: Arc<dyn ConsensusStore<V>>,
     ) -> Result<Self> {
         let rank_tracker = RankTracker::new(filter, store)?;
+        let initial_rank = rank_tracker.current_rank();
+        let timer_info = timeout_control.start_timeout(initial_rank);
+        let current_deadline = timer_info.start_time + timer_info.duration;
+        notifier.on_starting_timeout(timer_info.start_time, current_deadline);
         Ok(Self {
             timeout_control,
             rank_tracker,
             notifier,
             duration_provider,
+            current_deadline,
         })
     }
 
@@ -528,6 +565,7 @@ impl<S: Unique, V: Unique> Pacemaker for HotStuffPacemaker<S, V> {
 
         let timer_info = self.timeout_control.start_timeout(resulting_rank);
         let end = timer_info.start_time + timer_info.duration;
+        self.current_deadline = end;
         self.notifier.on_starting_timeout(timer_info.start_time, end);
         Ok(Some(NextRank {
             rank: timer_info.rank,
@@ -563,12 +601,39 @@ impl<S: Unique, V: Unique> Pacemaker for HotStuffPacemaker<S, V> {
 
         let timer_info = self.timeout_control.start_timeout(resulting_rank);
         let end = timer_info.start_time + timer_info.duration;
+        self.current_deadline = end;
         self.notifier.on_starting_timeout(timer_info.start_time, end);
         Ok(Some(NextRank {
             rank: timer_info.rank,
             start: timer_info.start_time,
             end,
         }))
+    }
+
+    fn current_round_deadline(&self) -> Instant {
+        self.current_deadline
+    }
+
+    fn rearm_after_local_timeout(&mut self) {
+        // Mirror Go's rebroadcast behavior: on each timer tick (no rank
+        // change), schedule the next tick at `now + rebroadcast_interval`.
+        let interval = Duration::from_secs_f64(
+            self.timeout_control.rebroadcast_interval_ms() / 1000.0,
+        );
+        self.current_deadline = Instant::now() + interval;
+    }
+
+    fn target_publication_time(
+        &self,
+        rank: u64,
+        time_entered: Instant,
+        parent_id: &Identity,
+    ) -> Instant {
+        // Delegate to the configured `ProposalDurationProvider` so the
+        // leader spaces its broadcasts by `proposal_duration` (10s
+        // mainnet) rather than firing as fast as VDF allows.
+        self.duration_provider
+            .target_publication_time(rank, time_entered, parent_id)
     }
 }
 
@@ -932,7 +997,7 @@ mod tests {
     fn static_proposal_duration_adds_exact_offset() {
         let p = StaticProposalDurationProvider::new(Duration::from_millis(250));
         let entered = Instant::now();
-        let target = p.target_publication_time(5, entered, &"parent".to_string());
+        let target = p.target_publication_time(5, entered, &b"parent".to_vec());
         // Target is exactly `entered + 250ms`.
         assert_eq!(target - entered, Duration::from_millis(250));
     }
@@ -942,7 +1007,7 @@ mod tests {
         let p = no_proposal_delay();
         assert_eq!(p.duration(), Duration::ZERO);
         let entered = Instant::now();
-        let target = p.target_publication_time(0, entered, &"p".to_string());
+        let target = p.target_publication_time(0, entered, &b"p".to_vec());
         assert_eq!(target, entered);
     }
 
@@ -951,8 +1016,8 @@ mod tests {
         // Different ranks must produce the same delta.
         let p = StaticProposalDurationProvider::new(Duration::from_secs(1));
         let entered = Instant::now();
-        let t1 = p.target_publication_time(1, entered, &"p".to_string());
-        let t2 = p.target_publication_time(1000, entered, &"p".to_string());
+        let t1 = p.target_publication_time(1, entered, &b"p".to_vec());
+        let t2 = p.target_publication_time(1000, entered, &b"p".to_vec());
         assert_eq!(t1, t2);
     }
 

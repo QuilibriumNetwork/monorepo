@@ -33,6 +33,10 @@ struct RemoteWorkerState {
     pending_filter_frame: u64,
     /// Operator-set: skip this worker during auto-allocation.
     manually_managed: bool,
+    /// Whether the worker's filter is fully active in the registry
+    /// (allocation Status=Active or Paused). Mirrors Go's
+    /// `WorkerInfo.Allocated` field.
+    allocated: bool,
     /// gRPC channel (lazily connected).
     channel: Option<Channel>,
     /// Whether the worker is reachable.
@@ -92,6 +96,7 @@ impl RemoteWorkerManager {
                 filter: Vec::new(),
                 pending_filter_frame: 0,
                 manually_managed: false,
+                allocated: false,
                 channel: None,
                 connected: false,
             });
@@ -257,6 +262,7 @@ impl WorkerManager for RemoteWorkerManager {
                 total_storage: 0,
                 manually_managed: w.manually_managed,
                 pending_filter_frame: w.pending_filter_frame,
+                allocated: w.allocated,
             })
             .collect())
     }
@@ -277,6 +283,14 @@ impl WorkerManager for RemoteWorkerManager {
         let mut workers = self.workers.lock().unwrap();
         if let Some(w) = workers.get_mut(&core_id) {
             w.manually_managed = manually_managed;
+        }
+        Ok(())
+    }
+
+    fn set_allocated(&self, core_id: u32, allocated: bool) -> Result<()> {
+        let mut workers = self.workers.lock().unwrap();
+        if let Some(w) = workers.get_mut(&core_id) {
+            w.allocated = allocated;
         }
         Ok(())
     }

@@ -80,6 +80,12 @@ impl Ed448Identity {
         hex::encode(&self.peer_id_bytes)
     }
 
+    /// Get the peer ID as a base58 string — the canonical libp2p
+    /// `QmX...` form, identical to Go's `peer.ID(...).String()`.
+    pub fn peer_id_base58(&self) -> String {
+        bs58::encode(&self.peer_id_bytes).into_string()
+    }
+
     /// Get the config-format hex string (114 bytes: seed + public).
     pub fn to_config_hex(&self) -> String {
         let mut combined = Vec::with_capacity(114);

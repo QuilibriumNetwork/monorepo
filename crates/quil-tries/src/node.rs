@@ -212,6 +212,20 @@ impl VectorCommitmentNode {
             }
         }
     }
+
+    /// Collect every leaf in this sub-tree into `out`. Mirrors Go's
+    /// `tries.GetAllPreloadedLeaves` — used by hyperedge iteration to
+    /// enumerate the extrinsic atoms (prover allocations, etc).
+    pub fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a LeafNode>) {
+        match self {
+            VectorCommitmentNode::Leaf(leaf) => out.push(leaf),
+            VectorCommitmentNode::Branch(branch) => {
+                for child in branch.children.iter().flatten() {
+                    child.collect_leaves(out);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -72,33 +72,87 @@ impl FrameProver for WesolowskiFrameProver {
 
     fn prove_global_frame_header(
         &self,
-        frame_number: u64,
-        parent_selector: &[u8],
+        previous_frame: &global::GlobalFrameHeader,
+        commitments: &[Vec<u8>],
+        prover_root: &[u8],
+        request_root: &[u8],
+        signer: &dyn quil_types::crypto::Signer,
+        timestamp: i64,
         difficulty: u32,
-        prover: &[u8],
+        prover_index: u8,
     ) -> Result<global::GlobalFrameHeader> {
-        let mut challenge = Vec::new();
-        challenge.extend_from_slice(&frame_number.to_be_bytes());
-        challenge.extend_from_slice(parent_selector);
-        challenge.extend_from_slice(prover);
+        use sha3::{Digest, Sha3_256};
+        if previous_frame.output.len() < 516 {
+            return Err(QuilError::InvalidArgument(format!(
+                "previous frame output too short: {} (need ≥ 516)",
+                previous_frame.output.len()
+            )));
+        }
+        // parent = poseidon(previousFrame.Output[:516]).FillBytes(32)
+        let parent = crate::poseidon::hash_bytes_to_32(&previous_frame.output[..516])?;
 
-        let output = vdf::wesolowski_solve(self.int_size_bits, &challenge, difficulty);
+        let new_frame_number = previous_frame.frame_number + 1;
+
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&new_frame_number.to_be_bytes());
+        input.extend_from_slice(&(timestamp as u64).to_be_bytes());
+        input.extend_from_slice(&difficulty.to_be_bytes());
+        input.extend_from_slice(&parent);
+        for c in commitments {
+            input.extend_from_slice(c);
+        }
+        input.extend_from_slice(prover_root);
+        input.extend_from_slice(request_root);
+
+        let b: [u8; 32] = Sha3_256::digest(&input).into();
+        let output = vdf::wesolowski_solve(self.int_size_bits, &b, difficulty);
+
+        let mut sign_payload = Vec::with_capacity(32 + output.len());
+        sign_payload.extend_from_slice(&b);
+        sign_payload.extend_from_slice(&output);
+
+        let signature_bytes = signer.sign_with_domain(&sign_payload, b"global")?;
+
+        // Build the BLS aggregate signature carrier — only BLS48-581
+        // signers populate it; mirror Go's `switch pubkeyType`.
+        let bls_sig = match signer.key_type() {
+            quil_types::crypto::KeyType::Bls48581G1
+            | quil_types::crypto::KeyType::Bls48581G2 => {
+                let mut bitmask = vec![0u8; 32];
+                let byte_idx = (prover_index / 8) as usize;
+                let bit_idx = prover_index % 8;
+                if byte_idx < bitmask.len() {
+                    bitmask[byte_idx] |= 1u8 << bit_idx;
+                }
+                Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                    bitmask,
+                    signature: signature_bytes,
+                    public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
+                        key_value: signer.public_key().to_vec(),
+                    }),
+                })
+            }
+            other => {
+                return Err(QuilError::Crypto(format!(
+                    "unsupported proving key type: {:?}", other
+                )));
+            }
+        };
+
+        let cloned_commitments: Vec<Vec<u8>> = commitments.iter().cloned().collect();
 
         Ok(global::GlobalFrameHeader {
-            frame_number,
+            frame_number: new_frame_number,
             rank: 0,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
+            timestamp,
             difficulty,
             output,
-            parent_selector: parent_selector.to_vec(),
-            global_commitments: Vec::new(),
-            prover_tree_commitment: Vec::new(),
-            requests_root: Vec::new(),
-            prover: prover.to_vec(),
-            public_key_signature_bls48581: None,
+            parent_selector: parent.to_vec(),
+            global_commitments: cloned_commitments,
+            prover_tree_commitment: prover_root.to_vec(),
+            requests_root: request_root.to_vec(),
+            prover: signer.public_key().to_vec(),
+            public_key_signature_bls48581: bls_sig,
         })
     }
 
@@ -179,6 +233,129 @@ impl FrameProver for WesolowskiFrameProver {
             difficulty,
             &ids_vec,
             &solutions_vec,
+        ))
+    }
+
+    fn verify_frame_header_signature(
+        &self,
+        header: &global::FrameHeader,
+        bls: &dyn quil_types::crypto::BlsConstructor,
+        ids: Option<&[&[u8]]>,
+    ) -> Result<bool> {
+        // Mirrors Go `WesolowskiFrameProver.VerifyFrameHeaderSignature`:
+        //   1. payload = MakeVoteMessage(address, rank, identity=poseidon(output))
+        //   2. BLS verify signature[:74] against the aggregated pubkey under
+        //      context = "appshard" || address
+        //   3. If ids given, verify the multi-proof tail
+        let sig = match header.public_key_signature_bls48581.as_ref() {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let pubkey_bytes = sig.public_key.as_ref()
+            .map(|k| k.key_value.as_slice())
+            .unwrap_or(&[]);
+        if pubkey_bytes.is_empty() || sig.signature.len() < 74 {
+            return Ok(false);
+        }
+
+        // identity = poseidon(output).FillBytes(32) — 32 raw bytes,
+        // matching Go's `models.Identity = string` (a byte sequence).
+        let identity = crate::poseidon::hash_bytes_to_32(&header.output)?;
+
+        // MakeVoteMessage: filter || identity_raw || rank:u64(BE)
+        let mut payload = Vec::with_capacity(header.address.len() + 32 + 8);
+        payload.extend_from_slice(&header.address);
+        payload.extend_from_slice(&identity);
+        payload.extend_from_slice(&header.rank.to_be_bytes());
+
+        let mut domain = Vec::with_capacity(8 + header.address.len());
+        domain.extend_from_slice(b"appshard");
+        domain.extend_from_slice(&header.address);
+
+        if !bls.verify_signature_raw(
+            pubkey_bytes,
+            &sig.signature[..74],
+            &payload,
+            &domain,
+        ) {
+            return Ok(false);
+        }
+
+        // Count set bits in bitmask. Multiproof verify is only required
+        // when more than one signer contributed (bitmask has >1 set bit).
+        let set_bits: u32 = sig.bitmask.iter().map(|b| b.count_ones()).sum();
+        if sig.signature.len() == 74 && set_bits != 1 {
+            return Ok(false);
+        }
+        if sig.signature.len() == 74 && ids.is_none() {
+            return Ok(true);
+        }
+
+        // Parse + verify the multi-proof carried past byte 74.
+        let ids = match ids {
+            Some(i) => i,
+            None => return Ok(true),
+        };
+        let mp = &sig.signature[74..];
+        if mp.len() < 4 {
+            return Ok(false);
+        }
+        let mut cursor = 0usize;
+        let mp_count =
+            u32::from_be_bytes(mp[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        let mut multiproofs: Vec<&[u8]> = Vec::with_capacity(mp_count);
+        for _ in 0..mp_count {
+            if cursor + 516 > mp.len() {
+                return Ok(false);
+            }
+            multiproofs.push(&mp[cursor..cursor + 516]);
+            cursor += 516;
+        }
+
+        use sha3::{Digest, Sha3_256};
+        let challenge_bytes: [u8; 32] = Sha3_256::digest(&header.parent_selector).into();
+
+        self.verify_multi_proof(
+            &challenge_bytes,
+            header.difficulty,
+            ids,
+            &multiproofs,
+        )
+    }
+
+    fn verify_global_header_signature(
+        &self,
+        header: &global::GlobalFrameHeader,
+        bls: &dyn quil_types::crypto::BlsConstructor,
+    ) -> Result<bool> {
+        // Mirrors Go `WesolowskiFrameProver.VerifyGlobalHeaderSignature`:
+        //   payload = MakeVoteMessage(nil, rank, identity=poseidon(output))
+        //   BLS verify against pubkey with context = "global"
+        let sig = match header.public_key_signature_bls48581.as_ref() {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let pubkey_bytes = sig.public_key.as_ref()
+            .map(|k| k.key_value.as_slice())
+            .unwrap_or(&[]);
+        if pubkey_bytes.is_empty() || sig.signature.is_empty() {
+            return Ok(false);
+        }
+
+        let identity = crate::poseidon::hash_bytes_to_32(&header.output)?;
+
+        // filter = nil for global frames; raw identity bytes (32) +
+        // rank big-endian.
+        let mut payload = Vec::with_capacity(32 + 8);
+        payload.extend_from_slice(&identity);
+        payload.extend_from_slice(&header.rank.to_be_bytes());
+
+        Ok(bls.verify_signature_raw(
+            pubkey_bytes,
+            &sig.signature,
+            &payload,
+            b"global",
         ))
     }
 }

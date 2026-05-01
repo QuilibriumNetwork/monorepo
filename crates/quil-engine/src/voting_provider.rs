@@ -1,6 +1,4 @@
-//! BLS-backed [`VotingProvider`] implementation. Mirror of
-//! `node/consensus/global/consensus_voting_provider.go::GlobalVotingProvider`
-//! + `node/consensus/app/consensus_voting_provider.go::AppVotingProvider`.
+//! BLS-backed [`VotingProvider`] implementation.
 //!
 //! The voting provider is the application's signing hook. Given a
 //! state or a rank, it produces a vote using the local BLS proving
@@ -80,29 +78,54 @@ pub trait VotingProviderFactory<S: Unique, V: Unique>: Send + Sync {
 /// so adapter crates can plug in any scheme.
 pub type AddressDerivation = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 
-/// Generic BLS voting provider. Mirror of Go's `GlobalVotingProvider`.
-///
-/// Construction takes:
+/// Generic BLS voting provider. Construction takes:
 /// - a local `Signer` (usually `Bls48581Signer`)
 /// - a vote / timeout domain separation tag pair
 /// - an [`AddressDerivation`] callback
 /// - a factory that builds concrete vote/QC/TC instances
 pub struct BlsVotingProvider<S: Unique, V: Unique, F: VotingProviderFactory<S, V>> {
-    signer: Box<dyn Signer>,
+    signer: Arc<dyn Signer>,
     vote_domain: Vec<u8>,
     timeout_domain: Vec<u8>,
     derive_address: AddressDerivation,
     factory: Arc<F>,
+    /// Filter included in the canonical vote / timeout message. Empty
+    /// for the global chain; the 32-byte shard filter for an
+    /// app-shard provider. Must match the filter the verifier uses
+    /// in `make_vote_message(filter, rank, identity)`.
+    sign_filter: Vec<u8>,
     _marker: std::marker::PhantomData<(fn() -> S, fn() -> V)>,
 }
 
 impl<S: Unique, V: Unique, F: VotingProviderFactory<S, V>> BlsVotingProvider<S, V, F> {
+    /// Construct a global-chain voting provider (signs with empty
+    /// filter). Equivalent to `new_with_filter(..., Vec::new())`.
     pub fn new(
-        signer: Box<dyn Signer>,
+        signer: Arc<dyn Signer>,
         vote_domain: Vec<u8>,
         timeout_domain: Vec<u8>,
         derive_address: AddressDerivation,
         factory: Arc<F>,
+    ) -> Self {
+        Self::new_with_filter(
+            signer,
+            vote_domain,
+            timeout_domain,
+            derive_address,
+            factory,
+            Vec::new(),
+        )
+    }
+
+    /// Construct a voting provider that signs vote / timeout messages
+    /// with the given filter.
+    pub fn new_with_filter(
+        signer: Arc<dyn Signer>,
+        vote_domain: Vec<u8>,
+        timeout_domain: Vec<u8>,
+        derive_address: AddressDerivation,
+        factory: Arc<F>,
+        sign_filter: Vec<u8>,
     ) -> Self {
         Self {
             signer,
@@ -110,6 +133,7 @@ impl<S: Unique, V: Unique, F: VotingProviderFactory<S, V>> BlsVotingProvider<S, 
             timeout_domain,
             derive_address,
             factory,
+            sign_filter,
             _marker: std::marker::PhantomData,
         }
     }
@@ -123,9 +147,10 @@ impl<S: Unique, V: Unique, F: VotingProviderFactory<S, V>> VotingProvider<S, V>
     for BlsVotingProvider<S, V, F>
 {
     fn sign_vote(&self, state: &State<S>) -> Result<V> {
-        // Canonical vote message: Go mirrors use `nil` as filter for
-        // the global shard; we preserve that (empty filter here).
-        let msg = make_vote_message(&[], state.rank, &state.identifier);
+        // Canonical vote message: filter is `self.sign_filter` —
+        // empty (`nil` in Go) for the global chain, the 32-byte
+        // shard filter for app shards.
+        let msg = make_vote_message(&self.sign_filter, state.rank, &state.identifier);
         let sig = self
             .signer
             .sign_with_domain(&msg, &self.vote_domain)
@@ -141,9 +166,10 @@ impl<S: Unique, V: Unique, F: VotingProviderFactory<S, V>> VotingProvider<S, V>
         current_rank: u64,
         newest_qc_rank: u64,
     ) -> Result<V> {
-        // Go's global voting provider also ignores the filter and
-        // uses `nil` — we match that exactly.
-        let msg = make_timeout_message(&[], current_rank, newest_qc_rank);
+        // Match `sign_vote`: include `self.sign_filter` so the per-rank
+        // timeout aggregator can verify signatures against the same
+        // canonical message bytes the signer produced.
+        let msg = make_timeout_message(&self.sign_filter, current_rank, newest_qc_rank);
         let sig = self
             .signer
             .sign_with_domain(&msg, &self.timeout_domain)
@@ -234,7 +260,7 @@ mod tests {
             voter_address: &[u8],
         ) -> Result<TestVote> {
             let v = TestVote {
-                id: format!("vote-{}", state_rank),
+                id: format!("vote-{}", state_rank).into_bytes(),
                 source: state_id.clone(),
                 rank: state_rank,
                 sig: signature,
@@ -252,8 +278,8 @@ mod tests {
             voter_address: &[u8],
         ) -> Result<TestVote> {
             let v = TestVote {
-                id: format!("to-{}-{}", rank, newest_qc_rank),
-                source: format!("to-source-{}", rank),
+                id: format!("to-{}-{}", rank, newest_qc_rank).into_bytes(),
+                source: format!("to-source-{}", rank).into_bytes(),
                 rank,
                 sig: signature,
                 voter_address: voter_address.to_vec(),
@@ -411,7 +437,7 @@ mod tests {
         let bls = Bls48581KeyConstructor;
         let (signer, _pk) = bls.new_key().unwrap();
         BlsVotingProvider::new(
-            signer,
+            Arc::from(signer),
             b"test-vote".to_vec(),
             b"test-timeout".to_vec(),
             identity_derive(),
@@ -423,8 +449,8 @@ mod tests {
         State {
             rank,
             identifier: id.into(),
-            proposer_id: "leader".into(),
-            parent_qc_identity: "parent".into(),
+            proposer_id: b"leader".to_vec(),
+            parent_qc_identity: b"parent".to_vec(),
             parent_qc_rank: rank.saturating_sub(1),
             timestamp: 0,
             state: AppState { id: id.into(), rank },
@@ -442,7 +468,7 @@ mod tests {
         let state = make_state(5, "state-5");
         let vote = provider.sign_vote(&state).unwrap();
         assert_eq!(vote.rank, 5);
-        assert_eq!(vote.source, "state-5");
+        assert_eq!(vote.source.as_slice(), b"state-5");
         // Signature was actually produced — it's non-empty.
         assert!(!vote.sig.is_empty());
         // Voter address was derived from the BLS public key.
@@ -459,7 +485,7 @@ mod tests {
         let bls = Bls48581KeyConstructor;
         let (signer, pk) = bls.new_key().unwrap();
         let provider = BlsVotingProvider::new(
-            signer,
+            Arc::from(signer),
             b"test-vote".to_vec(),
             b"test-timeout".to_vec(),
             identity_derive(),
@@ -469,7 +495,7 @@ mod tests {
         let vote = provider.sign_vote(&state).unwrap();
 
         // Reconstruct the canonical message and verify.
-        let msg = make_vote_message(&[], 42, &"s-42".to_string());
+        let msg = make_vote_message(&[], 42, &b"s-42".to_vec());
         assert!(bls.verify_signature_raw(&pk, &vote.sig, &msg, b"test-vote"));
     }
 
@@ -479,7 +505,7 @@ mod tests {
         let bls = Bls48581KeyConstructor;
         let (signer, pk) = bls.new_key().unwrap();
         let provider = BlsVotingProvider::new(
-            signer,
+            Arc::from(signer),
             b"test-vote".to_vec(),
             b"test-timeout".to_vec(),
             identity_derive(),
@@ -499,7 +525,7 @@ mod tests {
         let bls = Bls48581KeyConstructor;
         let (signer, pk) = bls.new_key().unwrap();
         let provider = BlsVotingProvider::new(
-            signer,
+            Arc::from(signer),
             b"dom-A".to_vec(),
             b"dom-B".to_vec(),
             identity_derive(),
@@ -516,7 +542,7 @@ mod tests {
         // domain separation is the point — different domain → a
         // signature over `msg_timeout` does NOT verify as a signature
         // over `msg_vote` under the vote domain).
-        let msg_vote = make_vote_message(&[], 1, &"x".to_string());
+        let msg_vote = make_vote_message(&[], 1, &b"x".to_vec());
         assert!(bls.verify_signature_raw(&pk, &vote_sig, &msg_vote, b"dom-A"));
         // Cross-domain verify fails.
         assert!(!bls.verify_signature_raw(&pk, &vote_sig, &msg_vote, b"dom-B"));

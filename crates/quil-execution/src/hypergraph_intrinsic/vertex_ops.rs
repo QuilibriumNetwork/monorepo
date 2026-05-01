@@ -42,6 +42,140 @@ pub const VERENC_PROOF_CHARGE_BYTES: i64 = 55;
 pub const MAX_VERTEX_ADD_DISK_SIZE: usize = 5 * 1024 * 1024;
 
 // =====================================================================
+// EncryptedToVertexTree (Go `types/hypergraph/vertex_data.go:14-31`)
+// =====================================================================
+
+/// MPCitH `VerEncProof` proof-form byte length (Go
+/// `MPCitHVerEncProofFromBytes` size check).
+pub const VERENC_PROOF_BYTES: usize = 9268;
+/// MPCitH `VerEnc` compressed-form byte length (Go
+/// `MPCitHVerEncFromBytes` size check).
+pub const VERENC_COMPRESSED_BYTES: usize = 621;
+
+/// Parse the offsets used by `MPCitHVerEncProofFromBytes`:
+/// - blinding_pubkey: [0..57)
+/// - encryption_key: [57..114)
+/// - statement: [114..171)
+/// - challenge: [171..235)
+/// - polycom: 23 × 57-byte points starting at 235
+/// - ctexts: 42 × (57+56+8) starting at 1546
+/// - shares_rands: 22 × (56+56+8) starting at 6628
+fn parse_verenc_proof_full(data: &[u8]) -> Option<verenc::VerencProof> {
+    if data.len() != VERENC_PROOF_BYTES {
+        return None;
+    }
+    let blinding_pubkey = data[0..57].to_vec();
+    let encryption_key = data[57..114].to_vec();
+    let statement = data[114..171].to_vec();
+    let challenge = data[171..235].to_vec();
+    let mut polycom = Vec::with_capacity(23);
+    for i in 0..23 {
+        polycom.push(data[235 + i * 57..292 + i * 57].to_vec());
+    }
+    let mut ctexts = Vec::with_capacity(42);
+    for i in 0..42 {
+        let base = 1546 + i * (57 + 56 + 8);
+        let c1 = data[base..base + 57].to_vec();
+        let c2 = data[base + 57..base + 113].to_vec();
+        let i_be = u64::from_be_bytes(data[base + 113..base + 121].try_into().ok()?);
+        ctexts.push(verenc::VerencCiphertext { c1, c2, i: i_be });
+    }
+    let mut shares_rands = Vec::with_capacity(22);
+    for i in 0..22 {
+        let base = 6628 + i * (56 + 56 + 8);
+        let s1 = data[base..base + 56].to_vec();
+        let s2 = data[base + 56..base + 112].to_vec();
+        let i_be = u64::from_be_bytes(data[base + 112..base + 120].try_into().ok()?);
+        shares_rands.push(verenc::VerencShare { s1, s2, i: i_be });
+    }
+    Some(verenc::VerencProof {
+        blinding_pubkey,
+        encryption_key,
+        statement,
+        challenge,
+        polycom,
+        ctexts,
+        shares_rands,
+    })
+}
+
+/// Serialize a `CompressedCiphertext` + blinding_pubkey + statement to
+/// the 621-byte `MPCitHVerEnc.ToBytes()` layout.
+fn serialize_compressed(
+    cc: &verenc::CompressedCiphertext,
+    blinding_pubkey: &[u8],
+    statement: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(VERENC_COMPRESSED_BYTES);
+    for ct in &cc.ctexts {
+        out.extend_from_slice(&ct.c1);
+        out.extend_from_slice(&ct.c2);
+    }
+    for a in &cc.aux {
+        out.extend_from_slice(a);
+    }
+    out.extend_from_slice(blinding_pubkey);
+    out.extend_from_slice(statement);
+    out
+}
+
+/// Convert a single VerEnc-proof or already-compressed-VerEnc input
+/// into `(compressed_bytes, statement_bytes)`. For 9268-byte inputs
+/// we run `verenc_compress`; for 621-byte inputs we extract the
+/// statement at offset [564..621] and return the input as-is.
+///
+/// Returns `None` for any other input length (Go silently drops these).
+fn compress_one_proof(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    match data.len() {
+        VERENC_PROOF_BYTES => {
+            let proof = parse_verenc_proof_full(data)?;
+            let blinding_pubkey = proof.blinding_pubkey.clone();
+            let statement = proof.statement.clone();
+            let cc = verenc::verenc_compress(proof);
+            let compressed =
+                serialize_compressed(&cc, &blinding_pubkey, &statement);
+            Some((compressed, statement))
+        }
+        VERENC_COMPRESSED_BYTES => {
+            let statement = data[564..621].to_vec();
+            Some((data.to_vec(), statement))
+        }
+        _ => None,
+    }
+}
+
+/// Build a `VertexAdd.Data` vertex tree. Mirrors Go
+/// `EncryptedToVertexTree` at `types/hypergraph/vertex_data.go:14-31`.
+///
+/// Each compressed `Encrypted.ToBytes()` is inserted at key
+/// `BE u64 index`, with the `GetStatement()` bytes as the leaf
+/// statement and a fixed leaf size of 55.
+///
+/// Input format: a slice of per-proof byte vectors as decoded by
+/// [`split_vertex_add_proof_chunks`]. Each chunk may be either
+/// 9268-byte VerEncProof (we compress) or 621-byte compressed VerEnc
+/// (we use as-is).
+pub fn encrypted_to_vertex_tree(
+    proofs: &[Vec<u8>],
+    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+) -> Result<quil_tries::VectorCommitmentTree> {
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    for (i, chunk) in proofs.iter().enumerate() {
+        let (compressed, statement) = match compress_one_proof(chunk) {
+            Some(x) => x,
+            None => continue,
+        };
+        let key = (i as u64).to_be_bytes();
+        tree.insert(&key, &compressed, &statement, &BigInt::from(55))
+            .map_err(|e| {
+                QuilError::Internal(format!("vertex tree insert: {}", e))
+            })?;
+    }
+    let _ = tree.commit(inclusion_prover);
+    Ok(tree)
+}
+
+// =====================================================================
 // Cost calculation
 // =====================================================================
 
@@ -395,6 +529,53 @@ mod tests {
             vertex_add_domain_separator(&domain).unwrap(),
             vertex_remove_domain_separator(&domain).unwrap()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // EncryptedToVertexTree
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn encrypted_to_vertex_tree_keys_are_be_u64_indices() {
+        use quil_types::crypto::NoopInclusionProver;
+        // Use 621-byte already-compressed inputs so we exercise the
+        // pass-through path without needing the full proof->compressed
+        // crypto pipeline.
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        for i in 0..3u8 {
+            let mut chunk = vec![0u8; VERENC_COMPRESSED_BYTES];
+            // Tag the chunk with a per-index byte so we can confirm
+            // round-tripping into the tree.
+            chunk[0] = i;
+            // Statement at [564..621] — give it a recognizable pattern.
+            for b in &mut chunk[564..621] {
+                *b = i ^ 0xA5;
+            }
+            chunks.push(chunk);
+        }
+        let tree = encrypted_to_vertex_tree(&chunks, &NoopInclusionProver).unwrap();
+        // Each chunk lives at key = BE u64 index
+        for (i, _chunk) in chunks.iter().enumerate() {
+            let key = (i as u64).to_be_bytes();
+            let stored = tree.get(&key).expect("entry must exist");
+            assert_eq!(stored.len(), VERENC_COMPRESSED_BYTES);
+            assert_eq!(stored[0], i as u8);
+        }
+    }
+
+    #[test]
+    fn encrypted_to_vertex_tree_skips_wrong_size_chunks() {
+        use quil_types::crypto::NoopInclusionProver;
+        let chunks: Vec<Vec<u8>> = vec![
+            vec![0u8; VERENC_COMPRESSED_BYTES],
+            vec![0u8; 100],            // junk size — skipped
+            vec![1u8; VERENC_COMPRESSED_BYTES],
+        ];
+        let tree = encrypted_to_vertex_tree(&chunks, &NoopInclusionProver).unwrap();
+        // Index 0 and 2 present; index 1 absent.
+        assert!(tree.get(&0u64.to_be_bytes()).is_some());
+        assert!(tree.get(&1u64.to_be_bytes()).is_none());
+        assert!(tree.get(&2u64.to_be_bytes()).is_some());
     }
 
     // -----------------------------------------------------------------

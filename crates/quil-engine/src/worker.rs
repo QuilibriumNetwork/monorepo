@@ -30,6 +30,17 @@ pub trait WorkerManager: Send + Sync {
         let _ = (core_id, manually_managed);
         Ok(())
     }
+
+    /// Set the `allocated` flag — true when the worker's filter has a
+    /// confirmed Active or Paused allocation in the registry, false
+    /// when filter-pinned but awaiting confirm. Mirrors Go's
+    /// `WorkerInfo.Allocated` field. The lifecycle layer reads this
+    /// to compute `unallocatedWorkerCount`, which caps confirms in
+    /// `decide_joins`.
+    fn set_allocated(&self, core_id: u32, allocated: bool) -> Result<()> {
+        let _ = (core_id, allocated);
+        Ok(())
+    }
 }
 
 /// Information about a worker process.
@@ -45,4 +56,14 @@ pub struct WorkerInfo {
     /// Used for expiry: if `frame_number - pending_filter_frame > 10`, the
     /// proposal timed out and the filter should be cleared.
     pub pending_filter_frame: u64,
+    /// Whether the worker's filter is fully active in the registry
+    /// (allocation Status=Active or Paused). When false but `filter` is
+    /// set, the worker is "filter-pinned" awaiting confirm or has just
+    /// been provisioned for a pending allocation.
+    ///
+    /// Mirrors Go's `WorkerInfo.Allocated` field at
+    /// `types/store/worker.go:10`. `unallocatedWorkerCount` in
+    /// `proposer.go:537-553` counts workers with `!Allocated` — the
+    /// availableWorkers cap in `decide_joins` derives from this count.
+    pub allocated: bool,
 }

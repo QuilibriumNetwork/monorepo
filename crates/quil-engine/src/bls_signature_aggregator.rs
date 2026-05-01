@@ -317,8 +317,8 @@ mod tests {
         // Sign and submit each member's signature.
         for (name, signer) in [("alice", &signers[0]), ("bob", &signers[1]), ("carol", &signers[2])] {
             let sig = signer.sign_with_domain(&msg, &ds_tag).unwrap();
-            weighted.verify(&name.to_string(), &sig).unwrap();
-            let total = weighted.trusted_add(&name.to_string(), &sig).unwrap();
+            weighted.verify(&name.as_bytes().to_vec(), &sig).unwrap();
+            let total = weighted.trusted_add(&name.as_bytes().to_vec(), &sig).unwrap();
             assert!(total > 0);
         }
         assert_eq!(weighted.total_weight(), 3);

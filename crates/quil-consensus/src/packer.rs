@@ -233,7 +233,7 @@ mod tests {
         // Decode the subset from the bitmask.
         let full = packer.committees.identities_by_rank(0).unwrap();
         let subset_ids = decode_signer_indices(&full, &indices);
-        assert_eq!(subset_ids, vec!["alice".to_string(), "bob".to_string()]);
+        assert_eq!(subset_ids, vec![b"alice".to_vec(), b"bob".to_vec()]);
         // Reconstruct StateSignatureData through unpack.
         let subset: Vec<Box<dyn WeightedIdentity>> = subset_ids
             .into_iter()

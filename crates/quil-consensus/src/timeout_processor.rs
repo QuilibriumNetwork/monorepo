@@ -391,11 +391,11 @@ mod tests {
             _newest_qc_rank: u64,
         ) -> Result<u64> {
             if !self.valid_signers.contains(signer_id) {
-                return Err(QuilError::InvalidSigner(signer_id.clone()));
+                return Err(QuilError::InvalidSigner(hex::encode(signer_id)));
             }
             let mut added = self.added.lock().unwrap();
             if added.contains(signer_id) {
-                return Err(QuilError::DuplicatedSigner(signer_id.clone()));
+                return Err(QuilError::DuplicatedSigner(hex::encode(signer_id)));
             }
             added.push(signer_id.clone());
             let mut t = self.total.lock().unwrap();
@@ -453,10 +453,10 @@ mod tests {
             self.tc_built.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::new(StubTc {
                 rank,
-                id: format!("tc-{}", rank),
+                id: format!("tc-{}", rank).into_bytes(),
                 latest_qc: StubQc {
                     rank: rank.saturating_sub(1),
-                    id: format!("qc-{}", rank - 1),
+                    id: format!("qc-{}", rank - 1).into_bytes(),
                 },
             }))
         }
@@ -468,7 +468,7 @@ mod tests {
             rank,
             latest_quorum_certificate: Arc::new(StubQc {
                 rank: qc_rank,
-                id: format!("qc-{}", qc_rank),
+                id: format!("qc-{}", qc_rank).into_bytes(),
             }),
             prior_rank_timeout_certificate: None,
             vote: TVote {

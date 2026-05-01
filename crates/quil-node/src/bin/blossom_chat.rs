@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(clap::Parser)]
 struct Args {
@@ -88,7 +88,9 @@ async fn main() -> anyhow::Result<()> {
             _ = interval.tick() => {
                 count += 1;
                 let msg = format!("rust-ping-{}-{}", args.port, count);
-                p2p_handle.publish(test_bitmask.clone(), msg.as_bytes().to_vec()).await;
+                if let Err(e) = p2p_handle.publish(test_bitmask.clone(), msg.as_bytes().to_vec()).await {
+                    warn!(error = %e, "publish failed");
+                }
                 info!(msg = %msg, "[SEND]");
             }
             _ = token.cancelled() => break,

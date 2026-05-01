@@ -656,10 +656,14 @@ mod tests {
         }
         fn prove_global_frame_header(
             &self,
-            _: u64,
+            _: &quil_types::proto::global::GlobalFrameHeader,
+            _: &[Vec<u8>],
             _: &[u8],
+            _: &[u8],
+            _: &dyn quil_types::crypto::Signer,
+            _: i64,
             _: u32,
-            _: &[u8],
+            _: u8,
         ) -> Result<quil_types::proto::global::GlobalFrameHeader> {
             Err(QuilError::Internal("stub".into()))
         }

@@ -50,10 +50,7 @@ use crate::message_collector::MessageCollector;
 use crate::message_router::{classify_consensus_message, ConsensusMessageKind};
 use crate::voting_provider::{AddressDerivation, BlsVotingProvider};
 
-/// Message queue capacities matching Go's constants.
 const CONSENSUS_QUEUE_SIZE: usize = 1000;
-
-/// Maximum app messages per rank (matches Go's maxAppMessagesPerRank).
 const MAX_APP_MESSAGES_PER_RANK: usize = 100;
 
 // =====================================================================
@@ -556,6 +553,7 @@ impl AppConsensusEngine {
             self.prover_registry.clone(),
             filter.clone(),
             &self.local_prover_address,
+            self.local_bls_pubkey.clone(),
         ));
 
         // BLS voting provider
@@ -570,16 +568,27 @@ impl AppConsensusEngine {
         let timeout_domain = quil_crypto::poseidon::hash_bytes_to_32(b"APP_CONSENSUS_TIMEOUT")
             .unwrap_or_default()
             .to_vec();
+        // Hold onto the vote domain so we can later build an
+        // `AppVoteAggregation` without rederiving it.
+        let vote_domain_for_agg = vote_domain.clone();
 
         let factory = Arc::new(AppShardVoteFactory { filter: filter.clone() });
+        // Use `new_with_filter` so vote / timeout signing uses the
+        // shard's own filter — the per-shard `AppVoteAggregation`
+        // verifier expects `make_vote_message(filter, rank, identity)`
+        // with the matching filter, and the global default of empty
+        // filter would cause every leader self-vote to fail BLS
+        // verification.
         let voting_provider: Arc<dyn quil_consensus::voting_provider::VotingProvider<AppShardState, AppShardVote>> =
-            Arc::new(BlsVotingProvider::<AppShardState, AppShardVote, AppShardVoteFactory>::new(
-                bls_signer,
+            Arc::new(BlsVotingProvider::<AppShardState, AppShardVote, AppShardVoteFactory>::new_with_filter(
+                Arc::from(bls_signer),
                 vote_domain,
                 timeout_domain,
                 derive_address,
                 factory,
+                filter.clone(),
             ));
+        let voting_provider_for_agg = voting_provider.clone();
         let signer: Arc<dyn quil_consensus::signer::Signer<AppShardState, AppShardVote>> =
             Arc::new(VotingProviderSigner::new(voting_provider));
 
@@ -596,9 +605,16 @@ impl AppConsensusEngine {
             Duration::from_secs(10),
         ));
 
-        // Consumer/notifier
+        // Consumer/notifier — keep a concrete `Arc<AppConsumer>` so we
+        // can install the vote aggregator after the event loop spawns
+        // (the aggregator needs the loop handle, which the loop only
+        // gives us after construction).
+        let consumer_concrete = Arc::new(AppConsumer::new(
+            filter.clone(),
+            self.consensus_event_tx.clone(),
+        ));
         let consumer: Arc<dyn quil_consensus::event_handler::Consumer<AppShardState, AppShardVote>> =
-            Arc::new(AppConsumer::new(filter.clone(), self.consensus_event_tx.clone()));
+            consumer_concrete.clone();
         let participant: Arc<dyn quil_consensus::pacemaker::ParticipantConsumer<AppShardState, AppShardVote>> =
             Arc::new(AppParticipantConsumer::new(filter.clone()));
 
@@ -649,7 +665,11 @@ impl AppConsensusEngine {
             Arc::new(AppFollower::new(filter.clone(), self.consensus_event_tx.clone()));
         let forks = Forks::<AppShardState>::new(trusted_root, finalizer, follower)?;
 
-        // Event handler
+        // Event handler — keep a concrete `committee_for_agg` clone so
+        // the vote aggregator (built post-handler) sees the same
+        // committee instance the event handler uses for self-id /
+        // quorum thresholds.
+        let committee_for_agg = committee.clone();
         let handler = Arc::new(HotStuffEventHandler::new(
             Arc::new(Mutex::new(pacemaker)),
             state_producer,
@@ -662,10 +682,32 @@ impl AppConsensusEngine {
         // Event loop
         let (event_loop, handle) = EventLoop::new(handler, Instant::now());
 
+        // Per-shard vote aggregator. Its
+        // `OnQuorumCertificateCreated` callback feeds formed QCs
+        // back into the event loop via `handle`.
+        {
+            use std::sync::OnceLock;
+            let bls_ctor: Arc<dyn quil_types::crypto::BlsConstructor> =
+                Arc::new(quil_crypto::Bls48581KeyConstructor);
+            let handle_cell: Arc<OnceLock<crate::app_types::AppEventLoopHandle>> =
+                Arc::new(OnceLock::new());
+            let _ = handle_cell.set(handle.clone());
+            let agg = Arc::new(crate::app_vote_aggregation::AppVoteAggregation::new(
+                filter.clone(),
+                committee_for_agg,
+                voting_provider_for_agg,
+                handle_cell,
+                bls_ctor,
+                vote_domain_for_agg,
+            ));
+            consumer_concrete.set_aggregator(agg);
+        }
+
+        let filter_for_loop = filter.clone();
         tokio::spawn(async move {
             if let Err(e) = event_loop.run().await {
                 tracing::error!(
-                    filter = hex::encode(&filter),
+                    filter = hex::encode(&filter_for_loop),
                     error = %e,
                     "shard consensus event loop exited with error"
                 );
@@ -676,7 +718,7 @@ impl AppConsensusEngine {
     }
 
     // ---------------------------------------------------------------
-    // Message handlers — mirror Go's app/message_processors.go
+    // Message handlers
     // ---------------------------------------------------------------
 
     /// Handle a consensus protocol message (proposal/vote/timeout).
@@ -1327,12 +1369,25 @@ impl quil_consensus::event_handler::ConsensusStore<AppShardVote> for AppMemConse
     ) -> Result<quil_consensus::models::LivenessState> {
         match self.liveness.lock().unwrap().clone() {
             Some(state) => Ok(state),
+            // Mirror the bootstrap fixup applied in `consensus_activation`
+            // for the global chain: `current_rank` starts at 1 so the
+            // event handler's happy-path check `qc.rank() + 1 == cur_rank`
+            // passes against the rank-0 genesis QC. With `current_rank=0`
+            // here the loop falls into the recovery branch which
+            // requires a `prior_rank_tc` — none exists on a fresh
+            // shard, so the engine exits with "expecting TC because QC
+            // (0) is not for prior rank (0 - 1)".
             None => Ok(quil_consensus::models::LivenessState {
                 filter: filter.to_vec(),
-                current_rank: 0,
-                latest_quorum_certificate: Arc::new(AppGenesisQC {
-                    filter: filter.to_vec(),
-                }),
+                current_rank: 1,
+                // Identity must match the genesis `AppShardState` from
+                // `build_app_genesis_certified_state` (output =
+                // 32 zero bytes for a fresh shard with no stored
+                // frame). Otherwise the event handler can't resolve
+                // the parent state and the leader silently waits.
+                latest_quorum_certificate: Arc::new(
+                    AppGenesisQC::for_output(filter.to_vec(), &vec![0u8; 32]),
+                ),
                 prior_rank_timeout_certificate: None,
             }),
         }
@@ -1572,7 +1627,7 @@ fn wire_qc_to_trait(
         filter: filter.to_vec(),
         rank: wire.rank,
         frame_number: wire.frame_number,
-        identity: hex::encode(&wire.selector),
+        identity: wire.selector.clone(),
         timestamp: wire.timestamp,
         agg_sig: Arc::new(WireAggSig::from(&wire.aggregate_signature)),
     })
@@ -1588,9 +1643,10 @@ fn wire_tc_to_trait(
     // zero-valued genesis QC if the wire TC has no embedded QC.
     let latest_qc: Arc<dyn QuorumCertificate> = match &wire.latest_quorum_certificate {
         Some(inner) => wire_qc_to_trait(inner, filter),
-        None => Arc::new(crate::app_types::AppGenesisQC {
-            filter: filter.to_vec(),
-        }),
+        None => Arc::new(crate::app_types::AppGenesisQC::for_output(
+            filter.to_vec(),
+            &vec![0u8; 32],
+        )),
     };
 
     Arc::new(WireTC {

@@ -167,7 +167,7 @@ impl<S: Unique, V: Unique> Validator<S, V> for ConsensusValidator<S, V> {
         if state.proposer_id != leader {
             return Err(QuilError::InvalidProposal(format!(
                 "proposer {} is not leader {} for rank {}",
-                state.proposer_id, leader, state.rank
+                hex::encode(&state.proposer_id), hex::encode(&leader), state.rank
             )));
         }
 
@@ -383,7 +383,7 @@ mod tests {
                         weight: *w,
                     }) as Box<dyn WeightedIdentity>
                 })
-                .ok_or_else(|| QuilError::InvalidSigner(participant_id.clone()))
+                .ok_or_else(|| QuilError::InvalidSigner(hex::encode(participant_id)))
         }
     }
 
@@ -569,12 +569,12 @@ mod tests {
             proposal: Proposal {
                 state: State {
                     rank,
-                    identifier: format!("s-{}", rank),
+                    identifier: format!("s-{}", rank).into_bytes(),
                     proposer_id: proposer.into(),
-                    parent_qc_identity: format!("parent-{}", parent_qc_rank),
+                    parent_qc_identity: format!("parent-{}", parent_qc_rank).into_bytes(),
                     parent_qc_rank,
                     timestamp: 0,
-                    state: AppState { id: format!("s-{}", rank), rank },
+                    state: AppState { id: format!("s-{}", rank).into_bytes(), rank },
                 },
                 previous_rank_timeout_certificate: None,
             },
@@ -672,7 +672,7 @@ mod tests {
         let v = build_validator(committee_of_3(), StubVerifier::ok());
         let vote = AppVote { id: "alice".into(), rank: 5, payload: vec![1, 2] };
         let voter = v.validate_vote(&vote).unwrap();
-        assert_eq!(voter.identity(), "alice");
+        assert_eq!(voter.identity().as_slice(), b"alice");
     }
 
     #[test]

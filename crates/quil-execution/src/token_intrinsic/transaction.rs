@@ -133,6 +133,29 @@ impl Transaction {
             traversal_proof: read_lp(data, &mut c)?,
         })
     }
+
+    /// Byte-size cost basis for fee computation. Ports Go
+    /// `Transaction.GetCost` at `token_intrinsic_transaction.go:991-1014`.
+    pub fn get_cost(&self) -> Result<num_bigint::BigInt> {
+        use num_bigint::BigInt;
+        let mut size = BigInt::from(self.domain.len() as u64);
+        size += BigInt::from(self.range_proof.len() as u64);
+        size += BigInt::from(self.traversal_proof.len() as u64);
+        for raw in &self.outputs {
+            let out = TransactionOutput::from_canonical_bytes(raw)?;
+            let r = RecipientBundle::from_canonical_bytes(&out.recipient_output)?;
+            size += BigInt::from(8u64); // frame number
+            size += BigInt::from(out.commitment.len() as u64);
+            size += BigInt::from(r.coin_balance.len() as u64);
+            size += BigInt::from(r.mask.len() as u64);
+            size += BigInt::from(r.one_time_key.len() as u64);
+            size += BigInt::from(r.verification_key.len() as u64);
+            if r.additional_reference.len() == 64 {
+                size += BigInt::from(120u64);
+            }
+        }
+        Ok(size)
+    }
 }
 
 #[cfg(test)]

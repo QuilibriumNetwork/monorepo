@@ -547,6 +547,19 @@ pub trait HypergraphStore: Send + Sync {
         set_type: &str,
         shard_key: &ShardKey,
     ) -> Result<()>;
+
+    /// Capture a point-in-time snapshot of all known per-shard tree
+    /// blobs. Used by the snapshot manager to bind a published root to
+    /// the exact backing-store state at publish time, so concurrent
+    /// writes after the publish do not corrupt the bytes a sync client
+    /// receives. Returns `None` if the implementation cannot capture a
+    /// snapshot (default behaviour); callers fall back to the live
+    /// store. Mirrors Go `TreeBackingStore.NewDBSnapshot`.
+    fn capture_tree_snapshot(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn SnapshotReadable>>> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,4 +579,26 @@ pub struct ChangeRecord {
     pub key: Vec<u8>,
     pub old_value: Option<Vec<u8>>,
     pub frame: u64,
+}
+
+/// Point-in-time read interface for hypergraph trees, used by the
+/// snapshot manager. A `SnapshotReadable` reflects the state of the
+/// hypergraph store at the moment it was captured: subsequent writes
+/// to the live store are NOT visible through this interface.
+///
+/// Mirror of Go's `tries.DBSnapshot` (`hypergraph/snapshot_manager.go`)
+/// at the level the sync server actually consumes — `load_tree_for_phase`
+/// only ever calls `load_tree_blob`, so that's the only required
+/// method. Additional read methods can be added as future sync code
+/// paths require them; in the meantime callers must still go to the
+/// live store for anything not covered here.
+pub trait SnapshotReadable: Send + Sync {
+    /// Load the serialized tree blob for `(set_type, phase_type, shard_key)`
+    /// as it existed when the snapshot was captured, or `None` if absent.
+    fn load_tree_blob(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+    ) -> Result<Option<Vec<u8>>>;
 }

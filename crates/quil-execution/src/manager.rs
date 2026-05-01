@@ -14,6 +14,13 @@ use crate::engines::*;
 /// appropriate engine based on domain address.
 pub struct ExecutionEngineManager {
     engines: RwLock<HashMap<String, Box<dyn ShardExecutionEngine>>>,
+    /// Shared CRDT used by the global/token/hypergraph engines (when
+    /// constructed with `new_with_crypto`). Held here so callers can
+    /// trigger a frame-keyed `commit` after processing all bundles —
+    /// this is what flushes the in-memory phase trees to the on-disk
+    /// hypergraph store, making new vertices visible to
+    /// `prover_registry::refresh_from_store` and to peer HyperSync.
+    crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
 }
 
 impl ExecutionEngineManager {
@@ -31,7 +38,7 @@ impl ExecutionEngineManager {
             );
         }
 
-        Self::build(engines, inclusion_prover, include_global)
+        Self::build(engines, inclusion_prover, include_global, None)
     }
 
     /// Create with full dependencies for real signature verification
@@ -62,6 +69,7 @@ impl ExecutionEngineManager {
         mut engines: HashMap<String, Box<dyn ShardExecutionEngine>>,
         _inclusion_prover: Arc<dyn InclusionProver>,
         include_global: bool,
+        crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
     ) -> Self {
         let mode = if include_global { ExecutionMode::Global } else { ExecutionMode::Application };
 
@@ -69,7 +77,7 @@ impl ExecutionEngineManager {
         engines.insert("compute".into(), Box::new(ComputeExecutionEngine::new(mode)));
         engines.insert("hypergraph".into(), Box::new(HypergraphExecutionEngine::new(mode)));
 
-        Self { engines: RwLock::new(engines) }
+        Self { engines: RwLock::new(engines), crdt }
     }
 
     fn build_with_crdt(
@@ -85,10 +93,24 @@ impl ExecutionEngineManager {
         )));
         engines.insert("compute".into(), Box::new(ComputeExecutionEngine::new(mode)));
         engines.insert("hypergraph".into(), Box::new(HypergraphExecutionEngine::new_with_state(
-            mode, crdt,
+            mode, crdt.clone(),
         )));
 
-        Self { engines: RwLock::new(engines) }
+        Self { engines: RwLock::new(engines), crdt: Some(crdt) }
+    }
+
+    /// Persist the in-memory hypergraph phase trees for the given
+    /// frame to the underlying store. Mirrors Go's
+    /// `frame_materializer.go:316` `hg.Commit(frame)` after the
+    /// per-bundle `state.Commit()` calls. Without this flush, the
+    /// `RocksHypergraphStore::load_tree_blob` reads the previous
+    /// frame's trees, so new vertices stay invisible to the prover
+    /// registry refresh and to peer HyperSync.
+    pub fn commit_frame(&self, frame_number: u64) -> Result<()> {
+        if let Some(ref crdt) = self.crdt {
+            crdt.commit(frame_number)?;
+        }
+        Ok(())
     }
 
     /// Get an engine by name.

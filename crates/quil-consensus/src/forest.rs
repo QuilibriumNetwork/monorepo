@@ -55,7 +55,7 @@ pub trait Vertex: Send + Sync + std::fmt::Debug {
 
 /// Invalid-vertex error. Mirror of Go's `InvalidVertexError`.
 #[derive(Debug, thiserror::Error)]
-#[error("invalid vertex {id} at level {level}: {msg}")]
+#[error("invalid vertex {} at level {level}: {msg}", hex::encode(.id))]
 pub struct InvalidVertexError {
     pub id: Identity,
     pub level: u64,
@@ -75,7 +75,7 @@ impl InvalidVertexError {
 /// Missing-parent error. Benign from the perspective of Forks (no-op);
 /// typically surfaces when a state references a pruned ancestor.
 #[derive(Debug, thiserror::Error)]
-#[error("missing state at rank {rank}, id={id}")]
+#[error("missing state at rank {rank}, id={}", hex::encode(.id))]
 pub struct MissingStateError {
     pub rank: u64,
     pub id: Identity,
@@ -364,7 +364,7 @@ impl LevelledForest {
         if new_pid != stored_pid {
             return Err(InvalidVertexError::of(
                 vertex.as_ref(),
-                format!("parent ID conflicts with stored parent ({}!={})", new_pid, stored_pid),
+                format!("parent ID conflicts with stored parent ({}!={})", hex::encode(&new_pid), hex::encode(&stored_pid)),
             ));
         }
         if new_plevel != stored_plevel {
@@ -509,7 +509,7 @@ impl<S: Unique> Forks<S> {
             .map_err(|e| {
                 QuilError::Consensus(format!(
                     "invalid root state {}: {}",
-                    root_state.identifier, e
+                    hex::encode(&root_state.identifier), e
                 ))
             })?;
         let root_container: Arc<dyn Vertex> = Arc::new(StateContainer::new(Arc::new(root_state)));
@@ -607,7 +607,7 @@ impl<S: Unique> Forks<S> {
         if !self.forest.has_vertex(&state.parent_qc_identity) {
             return Err(QuilError::NotFound(format!(
                 "missing parent state at rank {}, id={}",
-                state.parent_qc_rank, state.parent_qc_identity
+                state.parent_qc_rank, hex::encode(&state.parent_qc_identity)
             )));
         }
         Ok(())
@@ -709,7 +709,7 @@ impl<S: Unique> Forks<S> {
                 return Err(QuilError::NotFound(format!(
                     "missing state at rank {}, id={}",
                     certified_state.state.parent_qc_rank,
-                    certified_state.state.parent_qc_identity
+                    hex::encode(&certified_state.state.parent_qc_identity)
                 )));
             }
         };
@@ -763,7 +763,7 @@ impl<S: Unique> Forks<S> {
             let Some(state) = self.state_index.get(&cur_id).cloned() else {
                 return Err(QuilError::Consensus(format!(
                     "failed to get state (rank={}, id={}) for finalization",
-                    cur_rank, cur_id
+                    cur_rank, hex::encode(&cur_id)
                 )));
             };
             rev_stack.push(Arc::clone(&state));
@@ -774,7 +774,7 @@ impl<S: Unique> Forks<S> {
         if cur_rank == last_finalized.rank && cur_id != last_finalized.identifier {
             return Err(QuilError::Consensus(format!(
                 "byzantine: finalizing states with rank {} at conflicting forks: {} and {}",
-                cur_rank, cur_id, last_finalized.identifier
+                cur_rank, hex::encode(&cur_id), hex::encode(&last_finalized.identifier)
             )));
         }
 
@@ -860,8 +860,8 @@ mod tests {
     fn leveled_forest_add_and_get() {
         let mut f = LevelledForest::new(0);
         f.add_vertex(v("a", 1, "root", 0));
-        assert!(f.has_vertex(&"a".to_string()));
-        assert!(!f.has_vertex(&"unknown".to_string()));
+        assert!(f.has_vertex(&b"a".to_vec()));
+        assert!(!f.has_vertex(&b"unknown".to_vec()));
         assert_eq!(f.get_size(), 1);
     }
 
@@ -870,14 +870,14 @@ mod tests {
         let mut f = LevelledForest::new(0);
         // Add a child before its parent — creates an empty parent container.
         f.add_vertex(v("a", 2, "p", 1));
-        assert!(!f.has_vertex(&"p".to_string())); // empty, doesn't count
+        assert!(!f.has_vertex(&b"p".to_vec())); // empty, doesn't count
         // Then add the parent.
         f.add_vertex(v("p", 1, "root", 0));
-        assert!(f.has_vertex(&"p".to_string()));
+        assert!(f.has_vertex(&b"p".to_vec()));
         // Children list should include "a".
-        let children = f.get_children(&"p".to_string());
+        let children = f.get_children(&b"p".to_vec());
         assert_eq!(children.len(), 1);
-        assert_eq!(children[0].vertex_id(), &"a".to_string());
+        assert_eq!(children[0].vertex_id(), &b"a".to_vec());
     }
 
     #[test]
@@ -895,9 +895,9 @@ mod tests {
         f.add_vertex(v("c", 3, "b", 2));
         assert_eq!(f.get_size(), 3);
         f.prune_up_to_level(2).unwrap();
-        assert!(!f.has_vertex(&"a".to_string()));
-        assert!(f.has_vertex(&"b".to_string()));
-        assert!(f.has_vertex(&"c".to_string()));
+        assert!(!f.has_vertex(&b"a".to_vec()));
+        assert!(f.has_vertex(&b"b".to_vec()));
+        assert!(f.has_vertex(&b"c".to_vec()));
     }
 
     #[test]
@@ -984,10 +984,10 @@ mod tests {
         forks.add_certified_state(certified(state(1, "A", "genesis", 0))).unwrap();
         forks.add_certified_state(certified(state(2, "B", "A", 1))).unwrap();
         assert_eq!(forks.finalized_rank(), 1);
-        assert_eq!(forks.finalized_state().identifier, "A");
+        assert_eq!(forks.finalized_state().identifier, b"A".to_vec());
         assert_eq!(finalizer.count.load(Ordering::SeqCst), 1);
         let finalized = consumer.finalized.lock().unwrap();
-        assert_eq!(finalized.as_slice(), &["A".to_string()]);
+        assert_eq!(finalized.as_slice(), &[b"A".to_vec()]);
     }
 
     #[test]

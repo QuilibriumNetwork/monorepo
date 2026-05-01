@@ -174,9 +174,9 @@ mod tests {
                 return Err(QuilError::Consensus("sign_vote failed".into()));
             }
             Ok(Vote {
-                id: format!("vote-{}", state.rank),
+                id: format!("vote-{}", state.rank).into_bytes(),
                 rank: state.rank,
-                payload: format!("sig-for-{}", state.identifier).into_bytes(),
+                payload: format!("sig-for-{}", hex::encode(&state.identifier)).into_bytes(),
             })
         }
 
@@ -195,7 +195,7 @@ mod tests {
                 return Err(QuilError::Consensus("sign_timeout failed".into()));
             }
             Ok(Vote {
-                id: format!("to-vote-{}", cur_rank),
+                id: format!("to-vote-{}", cur_rank).into_bytes(),
                 rank: cur_rank,
                 payload: format!("to-sig-{}:{}", cur_rank, newest_qc_rank).into_bytes(),
             })
@@ -250,7 +250,10 @@ mod tests {
         let state = make_state(5, "state-5");
         let vote = signer.create_vote(&state).unwrap();
         assert_eq!(vote.rank, 5);
-        assert_eq!(vote.payload, b"sig-for-state-5");
+        // Note: the test stub formats the payload as `sig-for-<hex(identity)>`,
+        // so for an identifier of b"state-5" the payload is the bytes of
+        // "sig-for-7374617465-35" (hex of "state-5").
+        assert_eq!(vote.payload, format!("sig-for-{}", hex::encode(b"state-5")).into_bytes());
         assert_eq!(voter.sign_vote_calls.load(Ordering::SeqCst), 1);
     }
 

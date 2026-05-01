@@ -40,8 +40,8 @@ pub struct AppShardState {
     pub state_roots: Vec<Vec<u8>>,
     pub signature: Vec<u8>,
     pub fee_multiplier: u64,
-    /// Cached identity (hex of sha3-256 of output).
-    identity_cache: String,
+    /// Cached identity (sha3-256 of output, raw bytes).
+    identity_cache: Identity,
 }
 
 impl AppShardState {
@@ -105,9 +105,12 @@ impl AppShardState {
     }
 }
 
-fn compute_output_identity(output: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(output))
+/// 32-byte Poseidon hash of a frame's `output` field — the
+/// canonical identity used by `AppShardFrame` / `GlobalFrame`.
+fn compute_output_identity(output: &[u8]) -> Identity {
+    quil_crypto::poseidon::hash_bytes_to_32(output)
+        .expect("poseidon hash of shard frame output must succeed")
+        .to_vec()
 }
 
 impl fmt::Debug for AppShardState {
@@ -130,9 +133,8 @@ impl Unique for AppShardState {
     }
 
     fn source(&self) -> &Identity {
-        // Leak the hex-encoded prover address for trait compatibility.
-        // In production this would be cached in the struct.
-        Box::leak(Box::new(hex::encode(&self.prover)))
+        // The prover bytes ARE the source identity.
+        &self.prover
     }
 
     fn timestamp(&self) -> u64 {
@@ -174,10 +176,14 @@ impl AppShardVote {
         bitmask: Vec<u8>,
         filter: Vec<u8>,
     ) -> Self {
+        // `identity` = voter, `source` = proposal id —
+        // `VoteCollector::process_cached_votes` filters cached
+        // entries by `source() == state.identifier`, so swapping
+        // these would drop every leader self-vote.
         Self {
-            identity: proposal_identity,
+            identity: voter_identity,
             rank,
-            source: voter_identity,
+            source: proposal_identity,
             timestamp,
             signature_bytes: signature,
             bitmask,
@@ -231,7 +237,7 @@ impl VotingProviderFactory<AppShardState, AppShardVote> for AppShardVoteFactory 
         Ok(AppShardVote::new(
             state_id.clone(),
             state_rank,
-            hex::encode(voter_address),
+            voter_address.to_vec(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -250,9 +256,9 @@ impl VotingProviderFactory<AppShardState, AppShardVote> for AppShardVoteFactory 
         voter_address: &[u8],
     ) -> Result<AppShardVote> {
         Ok(AppShardVote::new(
-            format!("timeout-{}-{}", rank, newest_qc_rank),
+            format!("timeout-{}-{}", rank, newest_qc_rank).into_bytes(),
             rank,
-            hex::encode(voter_address),
+            voter_address.to_vec(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -374,7 +380,7 @@ pub fn build_app_genesis_certified_state(
         state: State {
             rank: 0,
             identifier: identity.clone(),
-            proposer_id: String::new(),
+            proposer_id: Vec::new(),
             parent_qc_identity: identity.clone(),
             parent_qc_rank: 0,
             timestamp: 0,
@@ -390,20 +396,36 @@ pub fn build_app_genesis_certified_state(
 // =====================================================================
 
 /// A minimal genesis QC for app shard consensus bootstrapping.
+///
+/// The QC's `identity` MUST equal the genesis `AppShardState`'s
+/// identity (`compute_output_identity(state.output)` =
+/// `Sha256(output)`). Otherwise the event handler's parent-state
+/// lookup at `event_handler.rs:469` (`forks.get_state(qc.identity())`)
+/// returns `None`, the leader silently skips proposing, and the shard
+/// just times out forever at rank 1.
 #[derive(Debug)]
 pub struct AppGenesisQC {
     pub filter: Vec<u8>,
+    pub identity: Identity,
+}
+
+impl AppGenesisQC {
+    /// Build a genesis QC whose identity matches the genesis
+    /// `AppShardState` produced from the given output bytes. Pass the
+    /// same `output` you handed to `build_app_genesis_certified_state`.
+    pub fn for_output(filter: Vec<u8>, output: &[u8]) -> Self {
+        Self {
+            filter,
+            identity: compute_output_identity(output),
+        }
+    }
 }
 
 impl QuorumCertificate for AppGenesisQC {
     fn filter(&self) -> &[u8] { &self.filter }
     fn rank(&self) -> u64 { 0 }
     fn frame_number(&self) -> u64 { 0 }
-    fn identity(&self) -> &Identity {
-        use std::sync::OnceLock;
-        static ID: OnceLock<Identity> = OnceLock::new();
-        ID.get_or_init(|| "app-genesis".into())
-    }
+    fn identity(&self) -> &Identity { &self.identity }
     fn timestamp(&self) -> u64 { 0 }
     fn aggregated_signature(&self) -> &dyn AggregatedSignature { &EmptyAggSig }
     fn equals(&self, o: &dyn QuorumCertificate) -> bool { o.rank() == 0 }
@@ -450,12 +472,12 @@ mod tests {
     #[test]
     fn app_shard_vote_unique_trait() {
         let v = AppShardVote::new(
-            "proposal-abc".into(), 7, "voter-xyz".into(),
+            b"proposal-abc".to_vec(), 7, b"voter-xyz".to_vec(),
             5000, vec![0xEEu8; 74], vec![0x01], vec![1, 2],
         );
-        assert_eq!(v.identity(), "proposal-abc");
+        assert_eq!(v.identity().as_slice(), b"proposal-abc");
         assert_eq!(v.rank(), 7);
-        assert_eq!(v.source(), "voter-xyz");
+        assert_eq!(v.source().as_slice(), b"voter-xyz");
         assert_eq!(v.timestamp(), 5000);
         assert_eq!(v.signature(), &[0xEEu8; 74][..]);
     }

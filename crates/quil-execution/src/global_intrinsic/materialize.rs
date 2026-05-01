@@ -283,7 +283,12 @@ pub fn set_reward_balance(
 }
 
 /// Add `amount` to the reward balance. Reads the current balance,
-/// adds `amount`, writes back.
+/// adds `amount`, writes back as a fixed-width 32-byte big-endian
+/// integer. Mirrors Go's
+/// `node/execution/intrinsics/global/global_prover_shard_update.go:467-468`
+/// (`balanceBytes := make([]byte, 32); currentBalance.FillBytes(balanceBytes)`).
+/// Writing minimal-length bytes here would change the leaf size on
+/// the first issuance and diverge the prover-tree commitment from Go.
 pub fn add_to_reward_balance(
     reward_tree: &mut quil_tries::VectorCommitmentTree,
     amount: &num_bigint::BigInt,
@@ -297,7 +302,20 @@ pub fn add_to_reward_balance(
     };
     let new_balance = current + amount;
     let (_, new_bytes) = new_balance.to_bytes_be();
-    set_reward_balance(reward_tree, &new_bytes)
+    // Right-align into 32 bytes (matches Go's `FillBytes(make([]byte, 32))`).
+    let mut padded = [0u8; 32];
+    if new_bytes.len() <= 32 {
+        padded[32 - new_bytes.len()..].copy_from_slice(&new_bytes);
+    } else {
+        // Mathematically a balance >2^256 cannot exist on-chain (issuance
+        // is bounded), but be safe: surface the divergence rather than
+        // silently truncate.
+        return Err(quil_types::error::QuilError::InvalidArgument(format!(
+            "reward balance overflow: {} bytes (max 32)",
+            new_bytes.len()
+        )));
+    }
+    set_reward_balance(reward_tree, &padded)
 }
 
 /// Create or update a reward vertex tree with a delegate address.
@@ -318,7 +336,10 @@ pub fn set_reward_delegate_address(
 /// KickFrameNumber=frame_number, Seniority=0.
 ///
 /// Kicked provers lose their seniority — this prevents re-joining
-/// with accumulated seniority after an equivocation.
+/// with accumulated seniority after an equivocation. Go's
+/// `ProverKick.Materialize` and `evictProver` do NOT zero seniority,
+/// which is a bug — Rust fixes it deliberately. PublicKey and
+/// AvailableStorage are left alone.
 ///
 /// The caller is also responsible for kicking all allocations
 /// (calling `materialize_prover_kick_allocation` for each).
@@ -333,7 +354,8 @@ pub fn materialize_prover_kick(
         "KickFrameNumber",
         &frame_number.to_be_bytes(),
     )?;
-    // Zero out seniority — kicked provers lose accumulated seniority
+    // Zero out seniority — kicked provers lose accumulated seniority.
+    // Go misses this; Rust intentionally diverges to fix the bug.
     write_field(prover_tree, "prover:Prover", "Seniority", &0u64.to_be_bytes())?;
     Ok(())
 }
@@ -445,6 +467,112 @@ pub fn materialize_prover_join(
         prover_address,
         allocations,
     })
+}
+
+/// Address for a spent ProverJoin merge marker.
+/// `poseidon("PROVER_JOIN_MERGE" || merge_target_pubkey) → 32 bytes`.
+///
+/// This is **distinct** from
+/// [`spent_seniority_merge_address`] — `ProverJoin` consumes merge
+/// targets via the `PROVER_JOIN_MERGE` domain, while `ProverSeniorityMerge`
+/// uses `PROVER_SENIORITY_MERGE`. Mirrors Go's
+/// `global_prover_join.go:160-163` and `:531-534`.
+pub fn spent_join_merge_address(merge_target_pubkey: &[u8]) -> Result<[u8; 32]> {
+    let mut preimage = Vec::with_capacity(17 + merge_target_pubkey.len());
+    preimage.extend_from_slice(b"PROVER_JOIN_MERGE");
+    preimage.extend_from_slice(merge_target_pubkey);
+    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+}
+
+/// Build the hyperedge data blob linking a prover to its initial
+/// allocations.
+///
+/// The blob is a serialized `VectorCommitmentTree` (Go's
+/// `SerializeNonLazyTree` format) whose leaf keys are the 64-byte atom
+/// IDs (`appAddr || dataAddr`) of each allocation vertex. The leaf
+/// values mirror Go's `vertex.ToBytes()` —
+/// `0x00 || appAddr(32) || dataAddr(32) || commitment(64) || size(32)`
+/// — but the Rust port reads back only the keys (ID list) so any
+/// minor commitment divergence in the value bytes does not affect
+/// kick-time iteration. The commitment + size are computed via
+/// `NoopInclusionProver` here; the consumer (`get_hyperedge_extrinsic_ids`)
+/// only inspects keys.
+///
+/// Mirrors Go `ProverJoin.Materialize` at
+/// `node/execution/intrinsics/global/global_prover_join.go:402-425, 526-528`.
+pub fn build_prover_allocation_hyperedge_blob(
+    prover_address: &[u8; 32],
+    allocations: &[([u8; 32], &quil_tries::VectorCommitmentTree)],
+) -> Result<Vec<u8>> {
+    use num_bigint::BigInt;
+    use quil_types::crypto::InclusionProver;
+
+    // The hyperedge atom IDs are `(GLOBAL_INTRINSIC_ADDRESS, allocation_address)`.
+    // We reuse the same convention as `genesis.rs` for byte-for-byte
+    // parity with the existing on-chain hyperedge format.
+    let app_addr = crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+
+    // Tiny stand-in inclusion prover: emits a deterministic 64-byte
+    // commitment from the input bytes (no real KZG). The hyperedge
+    // consumer (`get_hyperedge_extrinsic_ids`) reads only the leaf
+    // **keys**, so the value commitment is informational.
+    struct LocalProver;
+    impl InclusionProver for LocalProver {
+        fn commit_raw(&self, data: &[u8], _: u64) -> quil_types::error::Result<Vec<u8>> {
+            use sha2::{Digest, Sha512};
+            let mut h = Sha512::new();
+            h.update(data);
+            Ok(h.finalize().to_vec())
+        }
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> quil_types::error::Result<Vec<u8>> { Ok(vec![0u8; 64]) }
+        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> quil_types::error::Result<bool> { Ok(true) }
+        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64)
+            -> quil_types::error::Result<Box<dyn quil_types::crypto::Multiproof>>
+        { Err(quil_types::error::QuilError::Internal("not impl".into())) }
+        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+    }
+
+    let mut ext_tree = quil_tries::VectorCommitmentTree::new();
+    for (alloc_addr, alloc_tree) in allocations {
+        let mut atom_id = [0u8; 64];
+        atom_id[..32].copy_from_slice(&app_addr);
+        atom_id[32..].copy_from_slice(alloc_addr);
+
+        // value = vertex.ToBytes() shape (0x00 + appAddr + dataAddr + commitment + size32).
+        // Compute the allocation tree's commitment by walking a clone-equivalent.
+        // Since VectorCommitmentTree doesn't implement Clone, serialize +
+        // deserialize a fresh copy to avoid mutating the input.
+        let blob = crate::prover_registry::vertex_tree_to_blob(alloc_tree);
+        let mut tmp = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+        let alloc_commitment = tmp.commit(&LocalProver);
+
+        let alloc_size = alloc_tree
+            .root
+            .as_ref()
+            .map(|n| n.size().clone())
+            .unwrap_or_else(|| BigInt::from(0));
+        let mut size_bytes = [0u8; 32];
+        let (_, sb) = alloc_size.to_bytes_be();
+        let off = 32usize.saturating_sub(sb.len());
+        size_bytes[off..].copy_from_slice(&sb[..std::cmp::min(sb.len(), 32)]);
+
+        let mut atom_bytes = Vec::with_capacity(161);
+        atom_bytes.push(0x00);
+        atom_bytes.extend_from_slice(&app_addr);
+        atom_bytes.extend_from_slice(alloc_addr);
+        atom_bytes.extend_from_slice(&alloc_commitment);
+        atom_bytes.extend_from_slice(&size_bytes);
+
+        ext_tree.insert(
+            &atom_id,
+            &atom_bytes,
+            &[],
+            &BigInt::from(atom_bytes.len() as u64),
+        )?;
+    }
+
+    let _ = prover_address; // hyperedge address is the prover address (passed by caller)
+    Ok(crate::prover_registry::vertex_tree_to_blob(&ext_tree))
 }
 
 // =====================================================================

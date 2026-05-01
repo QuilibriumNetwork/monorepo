@@ -40,11 +40,23 @@ pub struct ConsensusActivationParams {
     pub local_prover_address: Vec<u8>,
     pub local_bls_pubkey: Vec<u8>,
     pub bls_signer: Box<dyn quil_types::crypto::Signer>,
+    pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver + Send + Sync>,
     pub genesis_frame: quil_types::proto::global::GlobalFrame,
     pub publisher: Option<Arc<dyn crate::consensus_glue::ConsensusPublisher>>,
     /// Optional callback invoked by the forks tree when a state is
     /// finalized. Used to prune per-rank aggregator state.
     pub on_finalized_state: Option<crate::consensus_glue::FinalizedStateHook>,
+    /// Hook invoked when a state is added to the forks tree (before
+    /// finalization). The wired callback writes the corresponding
+    /// `GlobalFrame` to the clock store as a candidate so the leader
+    /// can chain rank+1 proposals on top of its own as-yet-unfinalized
+    /// state.
+    pub on_incorporated_state: Option<crate::consensus_glue::IncorporatedStateHook>,
+    /// Hook fired when a QC is observed (received over the wire or
+    /// constructed locally). The wired callback persists the QC to
+    /// the clock store so `prove_next_state` for rank+1 can resolve
+    /// the latest-QC frame_number/identity.
+    pub on_qc_observed: Option<crate::consensus_glue::QcObservedHook>,
 }
 
 /// What `activate_consensus` produces: the event-loop handle plus
@@ -61,6 +73,11 @@ pub struct ConsensusActivation {
 pub fn activate_consensus(params: ConsensusActivationParams) -> Result<ConsensusActivation> {
     let config = ConsensusConfig::default();
 
+    // The bls_signer is consumed: leader_provider needs it to sign the
+    // (challenge||output) payload inside ProveGlobalFrameHeader. Convert
+    // the Box<dyn Signer> into Arc<dyn Signer> so it can be shared.
+    let signer: Arc<dyn quil_types::crypto::Signer> = Arc::from(params.bls_signer);
+
     let leader_provider = Arc::new(GlobalLeaderProvider::new(
         params.prover_registry.clone(),
         params.frame_prover,
@@ -69,12 +86,22 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
         params.message_collector,
         params.local_prover_address.clone(),
         params.local_bls_pubkey.clone(),
+        signer.clone(),
+        params.inclusion_prover,
     ));
 
+    // Global consensus uses the empty filter — `SharedProverRegistry`
+    // routes `get_ordered_provers([])` / `get_next_prover([])` through
+    // the global cache (every distinct prover address). Passing
+    // `vec![0x00]` here would route through the per-filter cache,
+    // which is keyed by 32-byte allocation `confirmation_filter` and
+    // has no entry for that specific 1-byte filter — leader election
+    // then errors with "shard trie empty" and the event loop exits.
     let committee = Arc::new(ProverRegistryCommittee::new(
         params.prover_registry,
-        vec![0x00],
+        Vec::new(),
         &params.local_prover_address,
+        params.local_bls_pubkey.clone(),
     ));
 
     // BLS voting provider
@@ -97,7 +124,7 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
     let factory = Arc::new(GlobalVoteFactory);
     let voting_provider: Arc<dyn quil_consensus::voting_provider::VotingProvider<GlobalState, GlobalVote>> = Arc::new(
         BlsVotingProvider::<GlobalState, GlobalVote, GlobalVoteFactory>::new(
-            params.bls_signer,
+            signer.clone(),
             vote_domain,
             timeout_domain,
             derive_address,
@@ -107,17 +134,86 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
     let signer: Arc<dyn quil_consensus::signer::Signer<GlobalState, GlobalVote>> =
         Arc::new(VotingProviderSigner::new(voting_provider.clone()));
 
+    // Keep a clone of the publisher so the follower can broadcast
+    // ProverKick messages on equivocation.
+    let publisher_for_follower = params.publisher.clone();
     let consumer: Arc<dyn quil_consensus::event_handler::Consumer<GlobalState, GlobalVote>> =
-        match params.publisher {
-            Some(p) => Arc::new(GlobalConsumer::with_publisher(p)),
-            None => Arc::new(GlobalConsumer::new()),
+        match (params.publisher, params.on_qc_observed) {
+            (Some(p), Some(qc_hook)) => {
+                Arc::new(GlobalConsumer::with_publisher_and_qc_hook(p, qc_hook))
+            }
+            (Some(p), None) => Arc::new(GlobalConsumer::with_publisher(p)),
+            (None, _) => Arc::new(GlobalConsumer::new()),
         };
     let participant: Arc<
         dyn quil_consensus::pacemaker::ParticipantConsumer<GlobalState, GlobalVote>,
     > = Arc::new(GlobalParticipantConsumer);
 
-    let store: Arc<dyn quil_consensus::event_handler::ConsensusStore<GlobalVote>> =
-        Arc::new(MemConsensusStore::new());
+    // Seed the in-memory store with a genesis liveness state so the
+    // pacemaker's RankTracker can boot. The HotStuff event loop calls
+    // `store.get_liveness_state(filter)` on construction; without a
+    // pre-existing record it returns NotFound and activation aborts
+    // with "could not load liveness data". Mirror Go's startup path
+    // which writes this record before spawning the loop on a fresh
+    // testnet/devnet bootstrap.
+    let mem_store = Arc::new(MemConsensusStore::new());
+    {
+        let frame_identity: Vec<u8> = match params.genesis_frame.header.as_ref() {
+            Some(h) => quil_crypto::poseidon::hash_bytes_to_32(&h.output)
+                .map(|hash| hash.to_vec())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let genesis_qc = crate::consensus_wire::QuorumCertificate::genesis(
+            0, // genesis frame number
+            frame_identity,
+        );
+        let genesis_qc_obj: Arc<dyn quil_consensus::models::QuorumCertificate> =
+            genesis_qc.into_trait_object();
+        // current_rank starts at 1: the genesis QC is for rank 0, and
+        // the event handler's happy-path check at
+        // `event_handler.rs:457` requires `qc.rank() + 1 == cur_rank`.
+        // With cur_rank = 0 and genesis_qc.rank = 0, the check fails
+        // and execution falls into the recovery path which demands a
+        // prior_rank_tc — none exists at genesis, so the loop exits
+        // with "expected prior_rank_tc to be Some". Setting cur_rank
+        // to 1 makes the leader at rank 1 see the genesis QC as the
+        // proper "previous-round QC" and proceed to propose frame 1.
+        let liveness = quil_consensus::models::LivenessState {
+            filter: Vec::new(),
+            current_rank: 1,
+            latest_quorum_certificate: genesis_qc_obj,
+            prior_rank_timeout_certificate: None,
+        };
+        if let Err(e) = quil_consensus::event_handler::ConsensusStore::<GlobalVote>::put_liveness_state(
+            mem_store.as_ref(),
+            &liveness,
+        ) {
+            return Err(QuilError::Consensus(format!(
+                "failed to seed genesis liveness state: {}", e
+            )));
+        }
+
+        // Same story for safety data: SafetyRules calls
+        // `store.get_consensus_state(filter)` on construction. Seed it
+        // with the genesis defaults so a fresh testnet bootstrap doesn't
+        // abort with "could not load safety data".
+        let consensus_state = quil_consensus::models::ConsensusState::<GlobalVote> {
+            filter: Vec::new(),
+            finalized_rank: 0,
+            latest_acknowledged_rank: 0,
+            latest_timeout: None,
+        };
+        if let Err(e) = quil_consensus::event_handler::ConsensusStore::<GlobalVote>::put_consensus_state(
+            mem_store.as_ref(),
+            &consensus_state,
+        ) {
+            return Err(QuilError::Consensus(format!(
+                "failed to seed genesis consensus state: {}", e
+            )));
+        }
+    }
+    let store: Arc<dyn quil_consensus::event_handler::ConsensusStore<GlobalVote>> = mem_store;
 
     let components = spawn_global_consensus(
         config,
@@ -138,11 +234,13 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
     );
 
     let finalizer: Arc<dyn quil_consensus::forest::Finalizer> = Arc::new(GlobalFinalizer);
-    let follower: Arc<dyn quil_consensus::forest::FollowerConsumer<GlobalState>> =
-        match params.on_finalized_state {
-            Some(hook) => Arc::new(GlobalFollower::with_on_finalized(hook)),
-            None => Arc::new(GlobalFollower::new()),
-        };
+    let follower: Arc<dyn quil_consensus::forest::FollowerConsumer<GlobalState>> = Arc::new(
+        GlobalFollower::with_hooks(
+            params.on_finalized_state,
+            params.on_incorporated_state,
+            publisher_for_follower,
+        ),
+    );
 
     let handle = components.start(certified_root, finalizer, follower)?;
     info!("HotStuff consensus event loop running");
@@ -172,7 +270,7 @@ impl VotingProviderFactory<GlobalState, GlobalVote> for GlobalVoteFactory {
         Ok(GlobalVote::new(
             state_id.clone(),
             state_rank,
-            hex::encode(voter_address),
+            voter_address.to_vec(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -190,9 +288,9 @@ impl VotingProviderFactory<GlobalState, GlobalVote> for GlobalVoteFactory {
         voter_address: &[u8],
     ) -> Result<GlobalVote> {
         Ok(GlobalVote::new(
-            String::new(),
+            Vec::new(),
             rank,
-            hex::encode(voter_address),
+            voter_address.to_vec(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

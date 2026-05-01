@@ -73,12 +73,12 @@ impl<V: Unique> TimeoutStatesCache<V> {
             if timeouts_equal(first, &timeout) {
                 return Err(QuilError::RepeatedTimeout(format!(
                     "duplicate timeout from {} at rank {}",
-                    voter, self.rank
+                    hex::encode(&voter), self.rank
                 )));
             }
             return Err(QuilError::DoubleTimeout(format!(
                 "timeout equivocation by replica {} at rank {}",
-                voter, self.rank
+                hex::encode(&voter), self.rank
             )));
         }
         guard.insert(voter, timeout);
@@ -149,7 +149,7 @@ mod tests {
             rank,
             latest_quorum_certificate: Arc::new(StubQc {
                 rank: qc_rank,
-                id: format!("qc-{}", qc_rank),
+                id: format!("qc-{}", qc_rank).into_bytes(),
             }),
             prior_rank_timeout_certificate: None,
             vote: V {
@@ -206,7 +206,7 @@ mod tests {
         c.add_timeout(make_to("alice", 5, 4, b"s1")).unwrap();
         c.add_timeout(make_to("bob", 5, 4, b"s2")).unwrap();
         assert_eq!(c.size(), 2);
-        assert!(c.get_timeout(&"alice".to_string()).is_some());
+        assert!(c.get_timeout(&b"alice".to_vec()).is_some());
         assert_eq!(c.all().len(), 2);
     }
 }

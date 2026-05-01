@@ -217,7 +217,7 @@ mod tests {
     fn tc(rank: u64, qc_rank: u64) -> Arc<dyn TimeoutCertificate> {
         Arc::new(StubTc {
             rank,
-            latest_qc: StubQc { rank: qc_rank, id: format!("qc-{}", qc_rank) },
+            latest_qc: StubQc { rank: qc_rank, id: format!("qc-{}", qc_rank).into_bytes() },
         })
     }
 

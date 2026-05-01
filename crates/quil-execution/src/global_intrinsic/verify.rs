@@ -12,6 +12,8 @@
 //! loading the vertex trees from the hypergraph CRDT. This module only
 //! does the pure verification logic.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use quil_types::crypto::{KeyManager, KeyType};
 use quil_types::error::{QuilError, Result};
 
@@ -21,6 +23,28 @@ use super::prover_join::ProverJoin;
 use super::prover_ops::{ProverConfirm, ProverReject};
 use super::prover_verify;
 use super::materialize::prover_address_from_pubkey;
+
+/// Minimum frames after a join/leave before a Confirm can be applied.
+/// Mainnet uses 360 (`global_prover_confirm.go:507`); testnet/devnet
+/// override to a smaller value via [`set_confirm_window_frames`] so a
+/// 4-node smoke test doesn't have to wait an hour for joins to settle.
+pub static MIN_CONFIRM_FRAMES: AtomicU64 = AtomicU64::new(360);
+/// Maximum frames after a join/leave before a Confirm is rejected as
+/// expired. Default 720; clamped to `>= MIN_CONFIRM_FRAMES + 1` by the
+/// setter so a misconfiguration can't produce an empty window.
+pub static MAX_CONFIRM_FRAMES: AtomicU64 = AtomicU64::new(720);
+
+/// Override the confirm-timing window. Call once at startup before
+/// any frames are processed; the values are read on every confirm
+/// without further locking. Passing `min == 0` keeps mainnet defaults.
+pub fn set_confirm_window_frames(min: u64, max: u64) {
+    if min == 0 {
+        return;
+    }
+    let max = max.max(min + 1);
+    MIN_CONFIRM_FRAMES.store(min, Ordering::Relaxed);
+    MAX_CONFIRM_FRAMES.store(max, Ordering::Relaxed);
+}
 
 /// Verify a `ProverPause` operation.
 ///
@@ -307,6 +331,103 @@ pub struct ProverJoinValidation {
     pub filter_count: usize,
 }
 
+/// Verify the BLS signatures on a `ProverJoin`. Mirrors Go's
+/// `ProverJoin.Verify` at `global_prover_join.go:1095-1146`. Structural
+/// validation is assumed to have already passed — the caller supplies
+/// the resulting `ProverJoinValidation`.
+///
+/// Checks:
+/// 1. BLS sig over `concat(filters) || frame_number_be_u64` with domain
+///    `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_JOIN")`.
+/// 2. Proof-of-possession: BLS sig over pubkey with ASCII domain
+///    `"BLS48_POP_SK"` (Go uses the domain bytes literally, not a
+///    poseidon hash — matches `global_prover_join.go:1093`).
+/// 3. Each merge target's signature over pubkey with Ed448 context
+///    `"PROVER_JOIN_MERGE"` (skipped for already-consumed targets).
+///
+/// Go skips merge-sig verification when the merge's spent-vertex
+/// already exists in the hypergraph (replay guard). This port takes
+/// `consumed_merge_check` as an optional closure — callers with a live
+/// hypergraph can pass one; otherwise all non-empty merges are verified.
+pub fn verify_prover_join_signatures(
+    op: &ProverJoin,
+    validation: &ProverJoinValidation,
+    key_manager: &dyn KeyManager,
+    consumed_merge_check: Option<&dyn Fn(&[u8]) -> bool>,
+) -> Result<bool> {
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("prover join verify: missing signature".into())
+    })?;
+
+    // 1. Main join signature over concat(filters) || frame_be_u64.
+    let join_domain = super::prover_verify::prover_join_domain()?;
+    let join_message = super::prover_verify::prover_join_signing_message(
+        &op.filters,
+        op.frame_number,
+    );
+    let ok = key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &validation.public_key,
+        &join_message,
+        &sig.signature,
+        &join_domain,
+    )?;
+    if !ok {
+        return Ok(false);
+    }
+
+    // 2. Proof of possession: sig over pubkey itself with the literal
+    //    domain bytes "BLS48_POP_SK" (no poseidon wrapping in Go).
+    const POP_DOMAIN: &[u8] = b"BLS48_POP_SK";
+    let ok = key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &validation.public_key,
+        &validation.public_key,
+        &sig.pop_signature,
+        POP_DOMAIN,
+    )?;
+    if !ok {
+        return Ok(false);
+    }
+
+    // 3. Merge target signatures — each signs the local BLS pubkey
+    //    with an Ed448 (or other) key under the "PROVER_JOIN_MERGE"
+    //    domain. Skip targets whose spent-vertex already exists.
+    const MERGE_DOMAIN: &[u8] = b"PROVER_JOIN_MERGE";
+    for mt in &op.merge_targets {
+        if let Some(check) = consumed_merge_check {
+            if check(&mt.prover_public_key) {
+                continue;
+            }
+        }
+        let key_type = match mt.key_type {
+            0 => KeyType::Ed448,
+            1 => KeyType::X448,
+            2 => KeyType::Bls48581G1,
+            3 => KeyType::Bls48581G2,
+            4 => KeyType::Decaf448,
+            other => {
+                return Err(QuilError::InvalidArgument(format!(
+                    "prover join verify: merge target has unknown key_type {}",
+                    other
+                )));
+            }
+        };
+        let ok = key_manager.validate_signature(
+            key_type,
+            &mt.prover_public_key,
+            &validation.public_key,
+            &mt.signature,
+            MERGE_DOMAIN,
+        )?;
+        if !ok {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
 /// Verify a `ProverUpdate` operation. The signing message is just the
 /// delegate_address; the domain is PROVER_UPDATE (but Go actually
 /// uses an empty domain for updates — the signature covers just the
@@ -332,10 +453,11 @@ pub fn verify_prover_update(
         QuilError::InvalidArgument("verify prover update: missing signature".into())
     })?;
 
-    // ProverUpdate signing message is just the delegate_address
+    // ProverUpdate signing message is just the delegate_address.
+    // Domain matches Go's `global_prover_update.go:378` —
+    // `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_UPDATE")`.
     let message = &op.delegate_address;
-    // Domain is empty for updates (Go code uses SignWithDomain with empty domain)
-    let domain = [];
+    let domain = super::prover_update_materialize::prover_update_domain()?;
 
     key_manager.validate_signature(
         KeyType::Bls48581G1,
@@ -407,19 +529,53 @@ pub fn validate_confirm_timing(
                     "confirm: missing JoinFrameNumber".into(),
                 ));
             }
-            let join_frame = u64::from_be_bytes(join_frame_bytes.try_into().unwrap());
-            let frames_since = frame_number.saturating_sub(join_frame);
-            if frames_since < 360 {
-                return Err(QuilError::InvalidArgument(format!(
-                    "confirm: must wait 360 frames after join (only {} elapsed)",
-                    frames_since
-                )));
+            let mut join_frame = u64::from_be_bytes(join_frame_bytes.try_into().unwrap());
+
+            // Tier-5 #11: 2.1 transition window. Joins between
+            // 244100..255840 must wait until frame 255840 to confirm.
+            // Once frame 255840 hits, those joins immediately become
+            // eligible (they all "catch up" at once). Joins ≥ 255840
+            // fall through to the normal 360..720 window. Mirrors Go's
+            // `global_prover_confirm.go:507-546`.
+            const TRANSITION_END: u64 =
+                crate::token_intrinsic::constants::FRAME_2_1_EXTENDED_ENROLL_END;
+            const TRANSITION_BEGIN: u64 = 244_100;
+            if join_frame >= TRANSITION_BEGIN && join_frame < TRANSITION_END {
+                if frame_number < TRANSITION_END {
+                    return Err(QuilError::InvalidArgument(
+                        "confirm: cannot confirm before frame 255840 (2.1 enrollment window)"
+                            .into(),
+                    ));
+                }
+                // Clamp join_frame so the resulting window starts at
+                // (TRANSITION_END - 360). For joins newer than the
+                // floor, leave them alone so they get the full 360.
+                if join_frame < TRANSITION_END - 360 {
+                    join_frame = TRANSITION_END - 360;
+                }
             }
-            if frames_since > 720 {
-                return Err(QuilError::InvalidArgument(format!(
-                    "confirm: join confirmation window expired (720 frames, {} elapsed)",
-                    frames_since
-                )));
+
+            // Joins ≥ (TRANSITION_END - 360) OR ≤ 244100 follow the
+            // normal MIN..MAX window (360..720 on mainnet; configurable
+            // for testnet via `set_confirm_window_frames`). Joins inside
+            // the transition band were either rejected above or
+            // clamped.
+            if join_frame >= TRANSITION_END - 360 || join_frame <= TRANSITION_BEGIN {
+                let min = MIN_CONFIRM_FRAMES.load(Ordering::Relaxed);
+                let max = MAX_CONFIRM_FRAMES.load(Ordering::Relaxed);
+                let frames_since = frame_number.saturating_sub(join_frame);
+                if frames_since < min {
+                    return Err(QuilError::InvalidArgument(format!(
+                        "confirm: must wait {} frames after join (only {} elapsed)",
+                        min, frames_since
+                    )));
+                }
+                if frames_since > max {
+                    return Err(QuilError::InvalidArgument(format!(
+                        "confirm: join confirmation window expired ({} frames, {} elapsed)",
+                        max, frames_since
+                    )));
+                }
             }
             Ok(())
         }
@@ -435,16 +591,18 @@ pub fn validate_confirm_timing(
             }
             let leave_frame = u64::from_be_bytes(leave_frame_bytes.try_into().unwrap());
             let frames_since = frame_number.saturating_sub(leave_frame);
-            if frames_since < 360 {
+            let min = MIN_CONFIRM_FRAMES.load(Ordering::Relaxed);
+            let max = MAX_CONFIRM_FRAMES.load(Ordering::Relaxed);
+            if frames_since < min {
                 return Err(QuilError::InvalidArgument(format!(
-                    "confirm: must wait 360 frames after leave (only {} elapsed)",
-                    frames_since
+                    "confirm: must wait {} frames after leave (only {} elapsed)",
+                    min, frames_since
                 )));
             }
-            if frames_since > 720 {
+            if frames_since > max {
                 return Err(QuilError::InvalidArgument(format!(
-                    "confirm: leave confirmation window expired (720 frames, {} elapsed)",
-                    frames_since
+                    "confirm: leave confirmation window expired ({} frames, {} elapsed)",
+                    max, frames_since
                 )));
             }
             Ok(())
@@ -480,6 +638,300 @@ pub fn verify_prover_reject(
     let message = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
     let domain = prover_verify::prover_reject_domain()?;
 
+    key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &pubkey,
+        &message,
+        &sig.signature,
+        &domain,
+    )
+}
+
+// =====================================================================
+// ShardSplit / ShardMerge / ProverSeniorityMerge verify
+// =====================================================================
+//
+// These three ops share the AddressedSignature → prover_tree pubkey
+// lookup pattern used by ProverUpdate/Confirm/Reject. Prior to these
+// helpers, the dispatcher in `intrinsic.rs` routed all three through
+// `peek_global_message_kind` which only validated the type prefix —
+// leaving their BLS signatures unverified and allowing consensus
+// bypass (forged shard rebalancing, forged seniority merges).
+
+/// Compute `poseidon(GLOBAL_INTRINSIC_ADDRESS || tag)`.
+fn intrinsic_domain(tag: &[u8]) -> Result<[u8; 32]> {
+    let mut preimage = Vec::with_capacity(32 + tag.len());
+    preimage.extend_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
+    preimage.extend_from_slice(tag);
+    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+}
+
+/// Shared pattern: recover pubkey from `prover_tree`, check address
+/// binding `poseidon(pubkey) == sig.address`, then BLS-verify under
+/// the given message + domain. Returns `Ok(false)` on any check
+/// failure (not `Err`) so the dispatcher rejects the op uniformly.
+fn verify_addressed_bls(
+    sig_address: &[u8],
+    signature: &[u8],
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    message: &[u8],
+    domain: &[u8; 32],
+    key_manager: &dyn KeyManager,
+    op_name: &str,
+) -> Result<bool> {
+    if sig_address.len() != 32 {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op_name}: signature address must be 32 bytes, got {}",
+            sig_address.len()
+        )));
+    }
+    let vertex_type = read_type(prover_tree).ok_or_else(|| {
+        QuilError::InvalidArgument(format!("{op_name}: no type hash"))
+    })?;
+    if vertex_type != "prover:Prover" {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op_name}: expected prover:Prover, got {vertex_type}"
+        )));
+    }
+    let pubkey = read_field(prover_tree, "prover:Prover", "PublicKey")
+        .ok_or_else(|| {
+            QuilError::InvalidArgument(format!("{op_name}: no PublicKey"))
+        })?;
+    // Address binding: poseidon(pubkey) == sig.address. Without this
+    // check, a malicious message could claim signer_address=A but sign
+    // with the private key of signer B, and BLS-verify would succeed
+    // against B's registered pubkey.
+    let addr = prover_address_from_pubkey(&pubkey)?;
+    if addr.as_slice() != sig_address {
+        return Ok(false);
+    }
+    key_manager.validate_signature(
+        KeyType::Bls48581G1,
+        &pubkey,
+        message,
+        signature,
+        domain,
+    )
+}
+
+/// Verify a `ShardSplit` op. Mirrors Go's `ShardSplitOp.Verify` at
+/// `global_shard_split.go:53-133`:
+///   - shard_address 32–63 bytes
+///   - proposed_shards has 2–8 entries, each of parent_len+1 or
+///     parent_len+2 and prefixed by shard_address
+///   - BLS sig over `frame_be_u64 || shard_address` with domain
+///     `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_SPLIT")`
+pub fn verify_shard_split(
+    op: &super::prover_ops::ShardSplit,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    if op.shard_address.len() < 32 || op.shard_address.len() > 63 {
+        return Err(QuilError::InvalidArgument(format!(
+            "shard split: shard_address must be 32-63 bytes, got {}",
+            op.shard_address.len()
+        )));
+    }
+    if op.proposed_shards.len() < 2 || op.proposed_shards.len() > 8 {
+        return Err(QuilError::InvalidArgument(format!(
+            "shard split: proposed_shards must have 2-8 entries, got {}",
+            op.proposed_shards.len()
+        )));
+    }
+    let parent_len = op.shard_address.len();
+    for shard in &op.proposed_shards {
+        if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
+            return Err(QuilError::InvalidArgument(format!(
+                "shard split: proposed shard length {} invalid for parent length {}",
+                shard.len(),
+                parent_len
+            )));
+        }
+        if !shard.starts_with(&op.shard_address) {
+            return Err(QuilError::InvalidArgument(
+                "shard split: proposed shard must share parent prefix".into(),
+            ));
+        }
+    }
+
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("shard split: missing signature".into())
+    })?;
+
+    let mut message = Vec::with_capacity(8 + op.shard_address.len());
+    message.extend_from_slice(&op.frame_number.to_be_bytes());
+    message.extend_from_slice(&op.shard_address);
+
+    let domain = intrinsic_domain(b"SHARD_SPLIT")?;
+
+    verify_addressed_bls(
+        &sig.address,
+        &sig.signature,
+        prover_tree,
+        &message,
+        &domain,
+        key_manager,
+        "shard split",
+    )
+}
+
+/// Verify a `ShardMerge` op. Mirrors Go's `ShardMergeOp.Verify` at
+/// `global_shard_merge.go:51-125`:
+///   - parent_address 32 bytes
+///   - shard_addresses has 2–8 entries, each parent_len+1 or parent_len+2
+///     and each prefixed by parent_address
+///   - BLS sig over `frame_be_u64 || parent_address` with domain
+///     `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_MERGE")`
+pub fn verify_shard_merge(
+    op: &super::prover_ops::ShardMerge,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    if op.parent_address.len() < 32 || op.parent_address.len() > 63 {
+        return Err(QuilError::InvalidArgument(format!(
+            "shard merge: parent_address must be 32-63 bytes, got {}",
+            op.parent_address.len()
+        )));
+    }
+    if op.shard_addresses.len() < 2 || op.shard_addresses.len() > 8 {
+        return Err(QuilError::InvalidArgument(format!(
+            "shard merge: shard_addresses must have 2-8 entries, got {}",
+            op.shard_addresses.len()
+        )));
+    }
+    let parent_len = op.parent_address.len();
+    for shard in &op.shard_addresses {
+        if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
+            return Err(QuilError::InvalidArgument(format!(
+                "shard merge: child shard length {} invalid for parent length {}",
+                shard.len(),
+                parent_len
+            )));
+        }
+        if !shard.starts_with(&op.parent_address) {
+            return Err(QuilError::InvalidArgument(
+                "shard merge: child shard must share parent prefix".into(),
+            ));
+        }
+    }
+
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("shard merge: missing signature".into())
+    })?;
+
+    let mut message = Vec::with_capacity(8 + op.parent_address.len());
+    message.extend_from_slice(&op.frame_number.to_be_bytes());
+    message.extend_from_slice(&op.parent_address);
+
+    let domain = intrinsic_domain(b"SHARD_MERGE")?;
+
+    verify_addressed_bls(
+        &sig.address,
+        &sig.signature,
+        prover_tree,
+        &message,
+        &domain,
+        key_manager,
+        "shard merge",
+    )
+}
+
+/// Verify a `ProverSeniorityMerge` op. Partial port of Go's
+/// `ProverSeniorityMerge.Verify` at
+/// `global_prover_seniority_merge.go:391-618`.
+///
+/// Checks:
+///   - addressed signature present, address 32 bytes
+///   - 10-frame freshness: `op.frame_number + 10 >= current_frame_number`
+///   - each merge-target signs `pubKeyBytes` with its own `key_type` under
+///     the literal ASCII domain `"PROVER_SENIORITY_MERGE"`
+///   - main BLS sig over `frame_be_u64 || concat(helper_pubkeys)` under
+///     domain `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_SENIORITY_MERGE")`
+///   - address-binding: `poseidon(pubKeyBytes) == sig.address`
+///
+/// NOT checked here (requires hypergraph state the dispatcher doesn't
+/// have): spent-merge tombstones, `mergeSeniority > existingSeniority`
+/// via the compat table. Those run in the materialize path.
+pub fn verify_prover_seniority_merge(
+    op: &super::prover_ops::ProverSeniorityMerge,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    current_frame_number: u64,
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    if op.merge_targets.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "prover seniority merge: no merge targets".into(),
+        ));
+    }
+    let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+        QuilError::InvalidArgument("prover seniority merge: missing signature".into())
+    })?;
+    if sig.address.len() != 32 {
+        return Err(QuilError::InvalidArgument(
+            "prover seniority merge: invalid address length".into(),
+        ));
+    }
+    // Freshness: 10-frame window matching Go's `p.FrameNumber+10 < frameNumber`.
+    if op.frame_number + 10 < current_frame_number {
+        return Err(QuilError::InvalidArgument(
+            "prover seniority merge: outdated request".into(),
+        ));
+    }
+
+    // Read the registered pubkey and verify address binding. Mirrors
+    // Go's `poseidon(pubKeyBytes) == sig.Address` check at :447-457.
+    let vertex_type = read_type(prover_tree).ok_or_else(|| {
+        QuilError::InvalidArgument("prover seniority merge: no type hash".into())
+    })?;
+    if vertex_type != "prover:Prover" {
+        return Err(QuilError::InvalidArgument(format!(
+            "prover seniority merge: expected prover:Prover, got {vertex_type}"
+        )));
+    }
+    let pubkey = read_field(prover_tree, "prover:Prover", "PublicKey").ok_or_else(|| {
+        QuilError::InvalidArgument("prover seniority merge: no PublicKey".into())
+    })?;
+    let addr = prover_address_from_pubkey(&pubkey)?;
+    if addr.as_slice() != sig.address.as_slice() {
+        return Ok(false);
+    }
+
+    // Each merge target signs `pubkey` with its own key under the
+    // literal ASCII domain — mirrors Go's :462-468.
+    const MERGE_TARGET_DOMAIN: &[u8] = b"PROVER_SENIORITY_MERGE";
+    for mt in &op.merge_targets {
+        let key_type = match mt.key_type {
+            0 => KeyType::Ed448,
+            1 => KeyType::X448,
+            2 => KeyType::Bls48581G1,
+            3 => KeyType::Bls48581G2,
+            4 => KeyType::Decaf448,
+            other => {
+                return Err(QuilError::InvalidArgument(format!(
+                    "prover seniority merge: merge target has unknown key_type {other}"
+                )));
+            }
+        };
+        let ok = key_manager.validate_signature(
+            key_type,
+            &mt.prover_public_key,
+            &pubkey,
+            &mt.signature,
+            MERGE_TARGET_DOMAIN,
+        )?;
+        if !ok {
+            return Ok(false);
+        }
+    }
+
+    // Main BLS sig over `frame_be || concat(helper_pubkeys)` under
+    // the poseidon-wrapped domain.
+    let mut message = Vec::with_capacity(8);
+    message.extend_from_slice(&op.frame_number.to_be_bytes());
+    for mt in &op.merge_targets {
+        message.extend_from_slice(&mt.prover_public_key);
+    }
+    let domain = intrinsic_domain(b"PROVER_SENIORITY_MERGE")?;
     key_manager.validate_signature(
         KeyType::Bls48581G1,
         &pubkey,
@@ -839,5 +1291,70 @@ mod tests {
         };
         let v = validate_prover_join_structural(&op, 105).unwrap();
         assert_eq!(v.filter_count, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Tier-5 #11: 2.1 transition window in validate_confirm_timing
+    // -----------------------------------------------------------------
+
+    fn make_alloc_tree_with_join_frame(status: u8, join_frame: u64)
+        -> quil_tries::VectorCommitmentTree
+    {
+        // ConfirmationFilter at order 2 → key 0x08; JoinFrameNumber at order 4 → key 0x10.
+        // Use schema-driven keys to be safe.
+        let mut tree = make_allocation_tree(status);
+        let cls = "allocation:ProverAllocation";
+        let join_key = crate::global_schema::field_key(cls, "JoinFrameNumber").unwrap();
+        tree.insert(&join_key, &join_frame.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
+        tree
+    }
+
+    /// Joins inside the 2.1 transition window (244100..255840) cannot
+    /// confirm before frame 255840.
+    #[test]
+    fn confirm_timing_blocks_transition_window_before_255840() {
+        let alloc = make_alloc_tree_with_join_frame(0, 244_500);
+        // frame_number < 255840 → must error.
+        let res = validate_confirm_timing(255_000, &alloc);
+        assert!(res.is_err(), "must reject confirm before 255840");
+    }
+
+    /// Joins inside the transition window get clamped at frame 255840
+    /// so they all confirm immediately once the cutover frame hits.
+    #[test]
+    fn confirm_timing_admits_transition_window_at_255840() {
+        // Join in the middle of the band; once frame_number hits
+        // 255840, the clamped join_frame becomes 255840-360, so
+        // frames_since == 360 → allowed.
+        let alloc = make_alloc_tree_with_join_frame(0, 244_200);
+        let res = validate_confirm_timing(255_840, &alloc);
+        assert!(res.is_ok(), "must admit transition-window join at 255840: {res:?}");
+    }
+
+    /// Pre-transition joins (< 244100) follow the normal 360..720 window.
+    #[test]
+    fn confirm_timing_normal_window_pre_transition() {
+        let alloc = make_alloc_tree_with_join_frame(0, 200_000);
+
+        // Too early.
+        assert!(validate_confirm_timing(200_300, &alloc).is_err());
+        // In the window.
+        assert!(validate_confirm_timing(200_400, &alloc).is_ok());
+        // Past the window.
+        assert!(validate_confirm_timing(200_800, &alloc).is_err());
+    }
+
+    /// Joins after the cutover (≥ 255840) follow the normal 360..720
+    /// window — the transition logic does not affect them.
+    #[test]
+    fn confirm_timing_normal_window_post_transition() {
+        let alloc = make_alloc_tree_with_join_frame(0, 256_000);
+
+        // Too early.
+        assert!(validate_confirm_timing(256_200, &alloc).is_err());
+        // In the window (frames_since = 360).
+        assert!(validate_confirm_timing(256_360, &alloc).is_ok());
+        // Past 720 frames.
+        assert!(validate_confirm_timing(256_721, &alloc).is_err());
     }
 }

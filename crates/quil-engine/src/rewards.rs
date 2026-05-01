@@ -165,20 +165,13 @@ impl RewardIssuance for OptRewardIssuance {
                 let divisor_u64: u64 = 1u64 << (ring as u32 + 1);
                 let divisor_bi = BigInt::from(divisor_u64);
 
-                // factor = state_size / world_state_bytes, applied
-                // against `basis`: `factor * basis = state_size *
-                // basis / world`. Divide by `divisor`.
-                let num = BigInt::from(alloc.state_size) * &basis;
-                let step1 = num / &world_bi;
-                let step2 = step1 / &divisor_bi;
-
-                // shard_factor = shards ^ (1/2). Use integer sqrt
-                // with 53-bit pre-scale (same trick as `pomw_basis`
-                // generation=1). `shards=0` is treated as an error
-                // in Go; we short-circuit to zero contribution.
                 if alloc.shards == 0 {
                     continue;
                 }
+
+                // shard_factor = shards^(1/2) carrying POMW_SCALE_BITS
+                // fractional bits. Same trick as `pomw_basis`
+                // generation=1.
                 let shards_scaled =
                     BigInt::from(alloc.shards) << (2u32 * POMW_SCALE_BITS);
                 let shards_sqrt = shards_scaled.sqrt();
@@ -186,11 +179,32 @@ impl RewardIssuance for OptRewardIssuance {
                     continue;
                 }
 
-                // Divide step2 by shard_factor. Because shard_factor
-                // carries `POMW_SCALE_BITS` fractional bits, we need
-                // to pre-scale step2 by the same amount to keep the
-                // quotient's magnitude correct.
-                let step3 = (step2 << POMW_SCALE_BITS) / shards_sqrt;
+                // Match Go's `decimal.Decimal` chain (88-104 of
+                // `optimized_proof_of_meaningful_work.go`): each
+                // intermediate `Div` keeps full decimal precision and
+                // only the final `result.BigInt()` truncates. To match
+                // this in integer arithmetic, fuse the chain into a
+                // single division and pre-scale by `POMW_SCALE_BITS` so
+                // the `shards_sqrt` factor cancels:
+                //
+                //   step3 = (state_size * basis * 2^POMW_SCALE_BITS)
+                //         / (world * divisor * shards_sqrt)
+                //
+                // shards_sqrt carries POMW_SCALE_BITS fractional bits;
+                // dividing by it removes those bits, so we pre-multiply
+                // by 2^POMW_SCALE_BITS to land back at integer scale.
+                // The fused division has at most one truncation —
+                // matching Go's "single BigInt() conversion at the end"
+                // far more closely than the previous three sequential
+                // truncations.
+                let num = BigInt::from(alloc.state_size)
+                    * &basis
+                    << POMW_SCALE_BITS;
+                let denom = &world_bi * &divisor_bi * &shards_sqrt;
+                if denom.is_zero() {
+                    continue;
+                }
+                let step3 = num / denom;
 
                 total += step3;
             }

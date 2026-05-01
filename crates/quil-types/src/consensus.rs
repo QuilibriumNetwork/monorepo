@@ -219,6 +219,16 @@ pub trait ProverRegistry: Send + Sync {
     fn refresh(&self) -> Result<()>;
     fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>>;
     fn get_prover_shard_summaries(&self) -> Result<Vec<ProverShardSummary>>;
+    /// Advance the registry's view of the current frame. Mirrors Go's
+    /// `ProverRegistry.ProcessStateTransition` — Go also walks the
+    /// frame's state changeset to update its in-memory cache; the
+    /// Rust port refreshes the cache via `refresh_from_store` on a
+    /// separate cadence, so the trait method only bumps the frame
+    /// counter. Implementations that maintain incremental caches may
+    /// override to do more work.
+    fn process_state_transition(&self, _frame_number: u64) -> Result<()> {
+        Ok(())
+    }
     fn prune_orphan_joins(&self, frame_number: u64) -> Result<()>;
     fn evict_inactive_provers(
         &self,

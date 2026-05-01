@@ -64,8 +64,8 @@ mod tests {
     fn contains_works() {
         let set = AppendOnlyIdentifierSet::new();
         set.add("alice".into());
-        assert!(set.contains(&"alice".to_string()));
-        assert!(!set.contains(&"bob".to_string()));
+        assert!(set.contains(&b"alice".to_vec()));
+        assert!(!set.contains(&b"bob".to_vec()));
     }
 
     #[test]

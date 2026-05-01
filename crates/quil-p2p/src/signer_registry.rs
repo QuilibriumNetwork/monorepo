@@ -121,6 +121,7 @@ mod tests {
             bls_pubkey: vec![0x22; 585],
             identity_to_prover_sig: vec![0x33; 114],
             prover_to_identity_sig: vec![0x44; 74],
+            keys_by_purpose: Vec::new(),
             last_updated_ms: 1,
         };
         reg.update(entry);

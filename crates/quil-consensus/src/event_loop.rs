@@ -253,13 +253,28 @@ impl<S: Unique, V: Unique> EventLoop<S, V> {
         // order — that enforces the Go priority: cancellation →
         // local timeout → partial TC → QC → TC → proposal.
         loop {
+            // Re-read the pacemaker's deadline each iteration. It can
+            // shift when the rank advances or when a local timeout
+            // fires (rebroadcast).
+            let deadline = self.event_handler.current_round_deadline();
             tokio::select! {
                 biased;
 
                 // 1. Cancellation.
                 _ = self.cancellation.cancelled() => return Ok(()),
 
-                // 2. Local timeout. Top priority.
+                // 2a. Pacemaker timer fired — drive `on_local_timeout`.
+                //     Top priority alongside the explicit notify path.
+                _ = sleep_until(deadline.into()) => {
+                    if let Err(e) = self.event_handler.on_local_timeout() {
+                        return Err(QuilError::Consensus(format!(
+                            "could not process timeout: {}",
+                            e
+                        )));
+                    }
+                }
+
+                // 2b. Local timeout via explicit notify (test driver).
                 _ = self.local_timeout_notify.notified() => {
                     if let Err(e) = self.event_handler.on_local_timeout() {
                         return Err(QuilError::Consensus(format!(
@@ -315,7 +330,7 @@ impl<S: Unique, V: Unique> EventLoop<S, V> {
                     if let Err(e) = self.event_handler.on_receive_proposal(&queued.proposal) {
                         return Err(QuilError::Consensus(format!(
                             "could not process proposal {}: {}",
-                            queued.proposal.proposal.state.identifier, e
+                            hex::encode(&queued.proposal.proposal.state.identifier), e
                         )));
                     }
                 }
@@ -644,6 +659,10 @@ mod tests {
                     timestamp: 0,
                     state: AppState { id: "s1".into(), rank: 1 },
                 },
+                parent_quorum_certificate: Arc::new(StubQc {
+                    rank: 0,
+                    id: "genesis".into(),
+                }),
                 previous_rank_timeout_certificate: None,
             },
             vote: AppVote { id: "v".into(), rank: 1 },

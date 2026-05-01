@@ -5,8 +5,14 @@
 //! Port of `node/consensus/provers/proposer.go`.
 
 use num_bigint::BigInt;
-use num_traits::{One, Signed, Zero};
+use num_traits::Zero;
 use std::collections::HashMap;
+
+// Re-export the canonical PoMW basis from the rewards module so all
+// scoring callers use the same algorithm as Go's `reward.PomwBasis`.
+// The local `pomw_basis` below is preserved for backward compatibility
+// with existing callers but delegates to the canonical implementation.
+use crate::rewards::pomw_basis as canonical_pomw_basis;
 
 /// Reward strategy for shard selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,50 +98,73 @@ pub fn compute_shard_ring_info(total_active_joining: usize) -> ShardRingInfo {
 
 /// PoMW basis calculation.
 ///
-/// Returns `(1_125_899_906_842_624 / world_state_bytes) ^ (1 / 2^generation) * units`
-/// where `generation` = number of times difficulty can be divided by 10000.
+/// Compute the PoMW basis. Delegates to the canonical implementation
+/// in `crate::rewards::pomw_basis` so proposer scoring matches the
+/// reward issuance calculator (Go's `reward.PomwBasis`).
 ///
-/// Port of Go's `reward.PomwBasis` at `node/consensus/reward/proof_of_meaningful_work.go:87-126`.
+/// Previously this module had its own implementation that differed
+/// in scaling at generation ≥ 2. That divergence caused different
+/// nodes to produce different `plan_and_allocate`/`decide_joins`
+/// outcomes for the same difficulty + world bytes. Forwarding to the
+/// canonical version eliminates that drift.
 pub fn pomw_basis(difficulty: u64, world_state_bytes: u64, units: u64) -> BigInt {
-    if world_state_bytes == 0 {
-        return BigInt::zero();
-    }
-
-    // Work in fixed-point with 53-bit precision (matches Go's decimal library precision arg).
-    let normalized_num = BigInt::from(1_125_899_906_842_624u64);
-    let scale = BigInt::from(1u64 << 53);
-    let normalized_scaled = (&normalized_num * &scale) / BigInt::from(world_state_bytes);
-
-    // Compute generation from difficulty (log_10000 count)
-    let mut generation = 0u32;
-    let mut difflog = difficulty;
-    while difflog >= 10_000 {
-        difflog /= 10_000;
-        generation += 1;
-    }
-
-    // Apply integer sqrt `generation` times to approximate (normalized)^(1/2^generation).
-    let mut result = normalized_scaled;
-    for _ in 0..generation {
-        result = integer_sqrt(&(&result * &scale));
-    }
-
-    let final_result = (&result * BigInt::from(units)) / &scale;
-    final_result
+    canonical_pomw_basis(difficulty, world_state_bytes, units)
 }
 
-/// Integer square root via Newton's method.
-fn integer_sqrt(n: &BigInt) -> BigInt {
-    if n.is_zero() || n.is_negative() {
+/// 53-bit precision integer square root, mirroring Go's
+/// `decimal.PowWithPrecision(1/2, 53)` used in
+/// `node/consensus/provers/proposer.go:367-373`. Pre-scales the input
+/// by 2^(2*53) before integer sqrt so the result carries 53 fractional
+/// bits — matching shopspring's effective working precision.
+///
+/// Used by `score_shards` to divide reward by `sqrt(shards)`. The
+/// integer-only Newton's method we previously used produced visibly
+/// different scores for `shards > 1`, which can flip the `bestScore *
+/// 67/100` threshold in `decide_joins` and cause split-brain
+/// confirm/reject decisions across nodes.
+fn shards_sqrt_53bit(shards: u64) -> BigInt {
+    if shards == 0 {
         return BigInt::zero();
     }
-    let mut x: BigInt = n.clone();
-    let mut y: BigInt = (&x + BigInt::one()) >> 1u32;
-    while y < x {
-        x = y.clone();
-        y = (&x + n / &x) >> 1u32;
+    let scaled = BigInt::from(shards) << (2u32 * 53u32);
+    scaled.sqrt()
+}
+
+#[cfg(test)]
+mod sqrt_tests {
+    use super::*;
+    use num_traits::ToPrimitive;
+
+    /// Tier-5 #4: 53-bit-precision sqrt mirrors Go's
+    /// `decimal.PowWithPrecision(1/2, 53)`. For perfect squares the
+    /// post-shift integer should equal sqrt(shards) within rounding.
+    #[test]
+    fn shards_sqrt_53bit_perfect_squares() {
+        for shards in [1u64, 4, 9, 16, 100, 1024, 10_000] {
+            let r = shards_sqrt_53bit(shards);
+            // r ≈ sqrt(shards) << 53; shift back to compare.
+            let approx = (&r >> 53u32).to_u64().unwrap_or(0);
+            let expected = (shards as f64).sqrt() as u64;
+            // Allow off-by-one rounding either direction.
+            assert!(
+                approx + 1 >= expected && expected + 1 >= approx,
+                "shards={shards} expected~{expected} got {approx}"
+            );
+        }
     }
-    x
+
+    /// Sqrt monotonic and non-zero for non-zero input.
+    #[test]
+    fn shards_sqrt_53bit_monotonic() {
+        let a = shards_sqrt_53bit(4);
+        let b = shards_sqrt_53bit(16);
+        let c = shards_sqrt_53bit(64);
+        assert!(a < b);
+        assert!(b < c);
+        assert!(!a.is_zero());
+        // Zero in → zero out (degenerate path).
+        assert!(shards_sqrt_53bit(0).is_zero());
+    }
 }
 
 /// Score shards by expected reward.
@@ -169,15 +198,22 @@ fn score_shards(
                     continue;
                 }
 
-                // shards sqrt (integer approximation)
-                let shards_sqrt = integer_sqrt(&BigInt::from(effective_shards));
+                // shards sqrt with 53-bit fractional precision —
+                // matches Go's `decimal.PowWithPrecision(1/2, 53)` at
+                // `proposer.go:367-373`. The result has 53 fractional
+                // bits, so we shift `factor` left by 53 before dividing
+                // and the final score lands at integer scale.
+                let shards_sqrt = shards_sqrt_53bit(effective_shards);
                 if shards_sqrt.is_zero() {
                     scores.push(Scored { idx: i, score: BigInt::zero() });
                     continue;
                 }
 
-                // score = factor / divisor / shards_sqrt / 8
-                let score = factor / BigInt::from(divisor) / &shards_sqrt / BigInt::from(8);
+                // score = (factor << 53) / divisor / shards_sqrt / 8
+                let score = (factor << 53u32)
+                    / BigInt::from(divisor)
+                    / &shards_sqrt
+                    / BigInt::from(8);
                 score
             }
         };
@@ -270,6 +306,11 @@ pub fn plan_and_allocate(
 /// matching Go's `decideCandidates` at `worker_allocator.go:268-283`.
 /// Passing self's active allocations here causes perpetual rejection of
 /// pending joins (they score < 67% of the allocations' inflated bestScore).
+///
+/// `available_workers` is the count of unallocated worker slots. When
+/// nothing is rejected (all pending pass the threshold), Go caps
+/// confirms at this number and drops the rest — see
+/// `proposer.go:518-531`. `usize::MAX` disables the cap.
 pub fn decide_joins(
     candidate_shards: &[ShardDescriptor],
     pending: &[Vec<u8>],
@@ -277,6 +318,7 @@ pub fn decide_joins(
     world_bytes: &BigInt,
     units: u64,
     strategy: Strategy,
+    available_workers: usize,
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     if pending.is_empty() {
         return (Vec::new(), Vec::new());
@@ -327,6 +369,19 @@ pub fn decide_joins(
                     confirm.push(p.clone());
                 }
             }
+        }
+    }
+
+    // availableWorkers cap (Go `proposer.go:518-531`): only applied when
+    // no rejections — Go submits reject XOR confirm in a single
+    // DecideAllocations call, so the cap is consulted only on the
+    // confirm path. If we have zero free workers, drop all confirms; if
+    // we have some, truncate to capacity.
+    if reject.is_empty() && !confirm.is_empty() && available_workers != usize::MAX {
+        if available_workers == 0 {
+            confirm.clear();
+        } else if confirm.len() > available_workers {
+            confirm.truncate(available_workers);
         }
     }
 
@@ -551,6 +606,7 @@ mod tests {
             &BigInt::from(1_000_000),
             DEFAULT_UNITS,
             Strategy::RewardGreedy,
+            usize::MAX,
         );
         assert_eq!(reject.len(), 1);
         assert!(confirm.is_empty());
@@ -611,6 +667,7 @@ mod tests {
         let pending = vec![vec![0x02]];
         let (reject, confirm) = decide_joins(
             &shards, &pending, 50000, &BigInt::from(300_000), DEFAULT_UNITS, Strategy::RewardGreedy,
+            usize::MAX,
         );
         assert!(reject.is_empty(), "best shard should not be rejected");
         assert_eq!(confirm.len(), 1);
@@ -626,6 +683,7 @@ mod tests {
         let pending = vec![vec![0x01]];
         let (reject, confirm) = decide_joins(
             &shards, &pending, 50000, &BigInt::from(250_000), DEFAULT_UNITS, Strategy::RewardGreedy,
+            usize::MAX,
         );
         assert_eq!(reject.len(), 1);
         assert_eq!(reject[0], vec![0x01], "inferior shard should be rejected");
@@ -641,6 +699,7 @@ mod tests {
         let pending = vec![vec![0x02]];
         let (reject, confirm) = decide_joins(
             &shards, &pending, 50000, &BigInt::from(200_000), DEFAULT_UNITS, Strategy::RewardGreedy,
+            usize::MAX,
         );
         assert!(reject.is_empty(), "tied shard should not be rejected");
         assert_eq!(confirm.len(), 1);
@@ -657,6 +716,7 @@ mod tests {
         let pending = vec![vec![0xAA], vec![0xBB], vec![0xCC]];
         let (reject, confirm) = decide_joins(
             &shards, &pending, 50000, &BigInt::from(170_000), DEFAULT_UNITS, Strategy::DataGreedy,
+            usize::MAX,
         );
         let reject_hex: Vec<String> = reject.iter().map(hex::encode).collect();
         let confirm_hex: Vec<String> = confirm.iter().map(hex::encode).collect();
@@ -672,10 +732,46 @@ mod tests {
         let pending = vec![vec![0xDE, 0xAD, 0xBE, 0xEF]];
         let (reject, confirm) = decide_joins(
             &shards, &pending, 50000, &BigInt::from(100_000), DEFAULT_UNITS, Strategy::RewardGreedy,
+            usize::MAX,
         );
         assert!(confirm.is_empty());
         assert_eq!(reject.len(), 1);
         assert_eq!(reject[0], vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    /// Tier-5 #5: when no rejections, confirms cap at `available_workers`.
+    /// `0` workers → drop all confirms; `N` workers → truncate to N.
+    #[test]
+    fn decide_joins_caps_confirms_by_available_workers() {
+        let shards = vec![
+            make_shard(vec![0x01], 100_000, 0, 1),
+            make_shard(vec![0x02], 100_000, 0, 1),
+            make_shard(vec![0x03], 100_000, 0, 1),
+        ];
+        let pending = vec![vec![0x01], vec![0x02], vec![0x03]];
+
+        // available_workers = 0 → all confirms dropped.
+        let (reject0, confirm0) = decide_joins(
+            &shards, &pending, 50000, &BigInt::from(300_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, 0,
+        );
+        assert!(reject0.is_empty());
+        assert!(confirm0.is_empty(), "no workers → no confirms");
+
+        // available_workers = 1 → exactly 1 confirm.
+        let (reject1, confirm1) = decide_joins(
+            &shards, &pending, 50000, &BigInt::from(300_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, 1,
+        );
+        assert!(reject1.is_empty());
+        assert_eq!(confirm1.len(), 1);
+
+        // usize::MAX disables the cap (parity with prior behavior).
+        let (_, confirm_max) = decide_joins(
+            &shards, &pending, 50000, &BigInt::from(300_000),
+            DEFAULT_UNITS, Strategy::RewardGreedy, usize::MAX,
+        );
+        assert_eq!(confirm_max.len(), 3);
     }
 
     #[test]

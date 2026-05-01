@@ -10,10 +10,12 @@
 //! - `mint` — MintTransactionInput, MintTransactionOutput, MintTransaction
 
 pub mod config;
+pub mod config_resolver;
 pub mod constants;
 pub mod conversions;
 pub mod deploy;
 pub mod materialize;
+pub mod metadata_schema;
 pub mod mint;
 pub mod pending;
 pub mod transaction;

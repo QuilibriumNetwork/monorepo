@@ -27,10 +27,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use quil_types::consensus::{ProverShardSummary, ProverStatus};
+use quil_types::consensus::{ProverInfo, ProverShardSummary, ProverStatus};
 
 /// Per-shard "has been in a low-coverage state for N frames" record.
-/// Mirror of Go's `coverageStreak` struct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoverageStreak {
     /// Frame at which the streak began.
@@ -54,8 +53,7 @@ impl CoverageStreak {
     }
 }
 
-/// Halt threshold configuration for a coverage monitor. Mirror of
-/// the fields Go computes in `ensureCoverageThresholds`.
+/// Halt threshold configuration for a coverage monitor.
 #[derive(Debug, Clone, Copy)]
 pub struct CoverageThresholds {
     /// Minimum active provers on a shard. If a shard drops to this
@@ -71,8 +69,7 @@ pub struct CoverageThresholds {
 
 impl CoverageThresholds {
     /// Mainnet defaults: 3-prover halt, 6-prover min, 32-prover max,
-    /// 360-frame grace window. Mirror of the Go constants in
-    /// `ensureCoverageThresholds` for `P2P.Network == 0`.
+    /// 360-frame grace window.
     pub fn mainnet() -> Self {
         Self {
             halt_threshold: 3,
@@ -97,8 +94,6 @@ impl CoverageThresholds {
 }
 
 /// Thread-safe tracker for per-shard low-coverage streaks.
-/// Mirror of Go's `lowCoverageStreak` map + `lowCoverageStreakMu`
-/// lock.
 #[derive(Debug, Default)]
 pub struct LowCoverageStreakTracker {
     streaks: Mutex<HashMap<Vec<u8>, CoverageStreak>>,
@@ -112,12 +107,9 @@ impl LowCoverageStreakTracker {
     }
 
     /// Bump the streak for `shard_key` at `frame`. If no streak
-    /// exists, create a new one covering `frame`. Mirror of Go's
-    /// `bumpStreak`.
-    ///
-    /// Count is advanced by `frame - last_frame` to avoid
-    /// double-counting under single-slot fork choice (multiple
-    /// candidates at the same frame).
+    /// exists, create a new one covering `frame`. Count advances by
+    /// `frame - last_frame` to avoid double-counting under
+    /// single-slot fork choice.
     pub fn bump(&self, shard_key: &[u8], frame: u64) -> CoverageStreak {
         let mut guard = self.streaks.lock().unwrap();
         match guard.get_mut(shard_key) {
@@ -137,8 +129,7 @@ impl LowCoverageStreakTracker {
     }
 
     /// Clear the streak for `shard_key`. Called when a shard's
-    /// coverage recovers above the halt threshold. Mirror of Go's
-    /// `clearStreak`.
+    /// coverage recovers above the halt threshold.
     pub fn clear(&self, shard_key: &[u8]) {
         let mut guard = self.streaks.lock().unwrap();
         guard.remove(shard_key);
@@ -162,19 +153,81 @@ impl LowCoverageStreakTracker {
     pub fn get(&self, shard_key: &[u8]) -> Option<CoverageStreak> {
         self.streaks.lock().unwrap().get(shard_key).copied()
     }
+
+    /// Reconstruct streak data from each prover's allocations after
+    /// a restart. On a fresh process the in-memory streak map is
+    /// empty; without reconstruction an eviction pass run before any
+    /// new frame would treat every stale allocation as freshly
+    /// inactive and kick it. Computes per-shard
+    /// `(active_count, max_last_active)` and seeds
+    /// `count = current_frame - last_active` for shards below the
+    /// halt threshold or with `staleness > 1`.
+    ///
+    /// Should normally be invoked once at startup before any
+    /// frame-driven streak updates.
+    pub fn reconstruct(
+        &self,
+        provers: &[ProverInfo],
+        current_frame: u64,
+        halt_threshold: u64,
+    ) {
+        let mut effective_coverage: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut last_frame: HashMap<Vec<u8>, u64> = HashMap::new();
+
+        for p in provers {
+            for alloc in &p.allocations {
+                let key = alloc.confirmation_filter.clone();
+                if !effective_coverage.contains_key(&key) {
+                    effective_coverage.insert(key.clone(), 0);
+                    last_frame.insert(key.clone(), alloc.last_active_frame_number);
+                }
+                if alloc.status == ProverStatus::Active {
+                    *effective_coverage.entry(key.clone()).or_insert(0) += 1;
+                    let entry = last_frame.entry(key).or_insert(0);
+                    if alloc.last_active_frame_number > *entry {
+                        *entry = alloc.last_active_frame_number;
+                    }
+                }
+            }
+        }
+
+        let mut guard = self.streaks.lock().unwrap();
+        for (shard_key, coverage) in effective_coverage {
+            let last = last_frame.get(&shard_key).copied().unwrap_or(0);
+            let staleness = current_frame.saturating_sub(last);
+            if coverage <= halt_threshold {
+                // Currently halted — record full staleness as the streak.
+                guard.insert(
+                    shard_key,
+                    CoverageStreak {
+                        start_frame: last,
+                        last_frame: current_frame,
+                        count: staleness,
+                    },
+                );
+            } else if staleness > 1 {
+                // Recovered but stale — record gap so eviction subtracts it.
+                guard.insert(
+                    shard_key,
+                    CoverageStreak {
+                        start_frame: last,
+                        last_frame: current_frame,
+                        count: staleness,
+                    },
+                );
+            }
+        }
+    }
 }
 
 /// Compute the eviction-suppression durations for each shard.
-/// Mirror of Go's `computeShardHaltDurations`.
 ///
 /// Semantics:
-/// - Shards currently at or below `halt_threshold` → `u64::MAX`.
-///   Eviction is fully suppressed for these shards regardless of
-///   streak state.
-/// - Shards with a non-empty streak but currently above the halt
-///   threshold → their streak count. The eviction path subtracts
-///   this from the inactivity window, giving recently-recovered
-///   shards a grace period proportional to how long they were halted.
+/// - Shards at or below `halt_threshold` → `u64::MAX` (eviction
+///   fully suppressed).
+/// - Shards with a non-empty streak but above the halt threshold →
+///   their streak count, giving recently-recovered shards a grace
+///   period proportional to how long they were halted.
 /// - Shards with no streak and above the halt threshold → no entry
 ///   (normal eviction rules apply).
 pub fn compute_shard_halt_durations(
@@ -221,11 +274,16 @@ use quil_types::consensus::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-// Coverage action constants (matching Go).
-const HALT_THRESHOLD: usize = 3;
+// Coverage action constants.
 const MAX_PROVERS_FOR_SPLIT: usize = 32;
 const MIN_PROVERS_FOR_MERGE: usize = 2;
 const STREAK_THRESHOLD: u64 = 10;
+
+/// Frame at which the +720 grace-frame extension expires
+/// (`FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END (262_340) + 360 (halt_grace_frames)`).
+/// Before this frame, halt detection allows
+/// `halt_grace_frames + 720` streak count before declaring a halt.
+pub const EXTENDED_ENROLL_HALT_GRACE_END: u64 = 262_700;
 
 /// Per-shard coverage action determined by [`CoverageMonitor::check_shard_coverage`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +360,17 @@ impl CoverageMonitor {
         self.thresholds
     }
 
+    /// Seed the per-shard streak map from each prover's
+    /// `last_active_frame_number`. Mirror of Go's `ensureStreakMap`.
+    /// Should be called once at startup, before any frame-driven
+    /// `check`/`check_shard_coverage` runs, so that an eviction pass on
+    /// the first post-restart frame doesn't immediately kick provers
+    /// that were already stale before the restart.
+    pub fn reconstruct_streaks(&self, provers: &[ProverInfo], current_frame: u64) {
+        self.streaks
+            .reconstruct(provers, current_frame, self.thresholds.halt_threshold);
+    }
+
     /// Run a coverage check for the given frame. Called by the event
     /// distributor when a new global head is finalized.
     ///
@@ -330,7 +399,18 @@ impl CoverageMonitor {
             if active <= self.thresholds.halt_threshold {
                 // Low coverage — bump streak
                 let streak = self.streaks.bump(&summary.filter, frame_number);
-                if streak.count >= self.thresholds.halt_grace_frames {
+                // Mainnet extended-enrollment window: before frame
+                // 262_700 (FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 360),
+                // grant an additional 720 grace frames before halting.
+                // Mirrors Go `coverage_monitor.go:222-226`.
+                let effective_grace = if frame_number
+                    < EXTENDED_ENROLL_HALT_GRACE_END
+                {
+                    self.thresholds.halt_grace_frames + 720
+                } else {
+                    self.thresholds.halt_grace_frames
+                };
+                if streak.count >= effective_grace {
                     any_halted = true;
                     tracing::warn!(
                         filter = hex::encode(&summary.filter),
@@ -430,7 +510,10 @@ impl CoverageMonitor {
             .unwrap_or(0);
 
         // --- Halt: critically low coverage ---
-        if active <= HALT_THRESHOLD {
+        // Network-aware: mainnet=3, testnet=0 or 1 depending on
+        // `minimumProvers`.
+        let halt_threshold = self.thresholds.halt_threshold as usize;
+        if active <= halt_threshold {
             let streak = self.bump_streak(filter, frame_number);
             if streak.count >= STREAK_THRESHOLD {
                 return CoverageAction::Halt {
@@ -438,14 +521,14 @@ impl CoverageMonitor {
                     reason: format!(
                         "shard has {} active provers (<= halt threshold {}) \
                          for {} consecutive frames",
-                        active, HALT_THRESHOLD, streak.count,
+                        active, halt_threshold, streak.count,
                     ),
                 };
             }
             return CoverageAction::NeedMoreProvers {
                 filter: filter.to_vec(),
                 current: active,
-                needed: HALT_THRESHOLD + 1,
+                needed: halt_threshold + 1,
             };
         }
 
@@ -687,6 +770,42 @@ mod tests {
         }
     }
 
+    fn alloc(
+        filter: &[u8],
+        status: ProverStatus,
+        last_active: u64,
+    ) -> quil_types::consensus::ProverAllocationInfo {
+        quil_types::consensus::ProverAllocationInfo {
+            status,
+            confirmation_filter: filter.to_vec(),
+            rejection_filter: vec![],
+            join_frame_number: 0,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: last_active,
+            vertex_address: vec![],
+        }
+    }
+
+    fn prover_with(allocs: Vec<quil_types::consensus::ProverAllocationInfo>) -> ProverInfo {
+        ProverInfo {
+            public_key: vec![],
+            address: vec![],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: allocs,
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: vec![],
+        }
+    }
+
     // =================================================================
     // CoverageStreak
     // =================================================================
@@ -782,6 +901,80 @@ mod tests {
         let t = LowCoverageStreakTracker::new();
         t.clear(b"unknown"); // no panic
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn reconstruct_seeds_streak_for_halted_shard() {
+        // Shard with only 2 active provers (below halt_threshold=3) → seeded.
+        let t = LowCoverageStreakTracker::new();
+        let p1 = prover_with(vec![alloc(b"shard-a", ProverStatus::Active, 90)]);
+        let p2 = prover_with(vec![alloc(b"shard-a", ProverStatus::Active, 95)]);
+        t.reconstruct(&[p1, p2], 100, 3);
+        let s = t.get(b"shard-a").expect("streak present");
+        // staleness = 100 - 95 (max last_active) = 5
+        assert_eq!(s.count, 5);
+        assert_eq!(s.last_frame, 100);
+    }
+
+    #[test]
+    fn reconstruct_seeds_streak_for_recovered_but_stale_shard() {
+        // Shard recovered (4 active > halt_threshold=3) but max
+        // last_active is far in the past (staleness > 1) → seeded.
+        let t = LowCoverageStreakTracker::new();
+        let provers: Vec<ProverInfo> = (0..4)
+            .map(|i| {
+                prover_with(vec![alloc(b"shard-r", ProverStatus::Active, 50 + i as u64)])
+            })
+            .collect();
+        t.reconstruct(&provers, 200, 3);
+        let s = t.get(b"shard-r").expect("streak present");
+        // staleness = 200 - 53 = 147
+        assert_eq!(s.count, 147);
+    }
+
+    #[test]
+    fn reconstruct_no_seed_when_recovered_and_fresh() {
+        // Shard recovered AND fresh (staleness <= 1) → no streak entry.
+        let t = LowCoverageStreakTracker::new();
+        let provers: Vec<ProverInfo> = (0..4)
+            .map(|_| prover_with(vec![alloc(b"shard-ok", ProverStatus::Active, 100)]))
+            .collect();
+        t.reconstruct(&provers, 100, 3);
+        assert!(t.get(b"shard-ok").is_none());
+    }
+
+    #[test]
+    fn reconstruct_uses_max_last_active_per_shard() {
+        // Two provers on same shard with different last_active. Streak
+        // staleness should use the *latest* last_active.
+        let t = LowCoverageStreakTracker::new();
+        let p1 = prover_with(vec![alloc(b"shard-x", ProverStatus::Active, 30)]);
+        let p2 = prover_with(vec![alloc(b"shard-x", ProverStatus::Active, 80)]);
+        t.reconstruct(&[p1, p2], 100, 3);
+        let s = t.get(b"shard-x").expect("streak present");
+        // Below halt_threshold (2 active <= 3): staleness = 100 - 80 = 20
+        assert_eq!(s.count, 20);
+    }
+
+    #[test]
+    fn reconstruct_ignores_non_active_allocations_for_count() {
+        // Joining/leaving allocations don't contribute to active
+        // coverage but still contribute their last_active when a
+        // record exists. Halt status driven by Active count only.
+        let t = LowCoverageStreakTracker::new();
+        let p_active1 = prover_with(vec![alloc(b"shard-y", ProverStatus::Active, 90)]);
+        let p_active2 = prover_with(vec![alloc(b"shard-y", ProverStatus::Active, 91)]);
+        let p_active3 = prover_with(vec![alloc(b"shard-y", ProverStatus::Active, 92)]);
+        let p_active4 = prover_with(vec![alloc(b"shard-y", ProverStatus::Active, 93)]);
+        let p_joining = prover_with(vec![alloc(b"shard-y", ProverStatus::Joining, 95)]);
+        // 4 active → above halt_threshold=3, staleness = 100 - 93 = 7 → seed.
+        t.reconstruct(
+            &[p_active1, p_active2, p_active3, p_active4, p_joining],
+            100,
+            3,
+        );
+        let s = t.get(b"shard-y").expect("streak present");
+        assert_eq!(s.count, 7);
     }
 
     #[test]

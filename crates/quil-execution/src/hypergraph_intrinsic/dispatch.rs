@@ -439,14 +439,16 @@ pub fn zero_fee() -> BigInt {
 // Deploy installs a new hypergraph schema + RDF definition. Update
 // mutates configuration on an existing hypergraph.
 //
-// The Go node validates the RDF schema via TurtleRDFParser at deploy
-// time (~1100 LOC of Turtle parsing). The Rust node accepts the bytes
-// and persists them without RDF-level validation — materialization
-// and downstream vertex/hyperedge ops still succeed, but conformance
-// checks against the schema are not yet enforced. Post-deploy the
-// schema bytes are recoverable via `GetVertexData` using the
-// deployment's canonical identifier, so clients that need them have
-// access.
+// Go validates the RDF schema via TurtleRDFParser at deploy time
+// (~1100 LOC of Turtle graph parsing built on rdf2go). Rust runs a
+// lighter structural validator (`validate_rdf_schema_bytes`) that
+// catches the common malformed shapes — missing PREFIX, no class
+// declaration, non-integer qcl:size/qcl:order, unbalanced IRIs and
+// strings, missing triple terminators. Authoritative parsing still
+// lives downstream when vertex ops hash fields against the schema;
+// the validator here is a deploy-time prefilter so corrupt schemas
+// fail fast instead of silently accepting and breaking every later
+// vertex op.
 
 /// Output of a successful Deploy dispatch.
 #[derive(Debug, Clone)]
@@ -477,11 +479,169 @@ pub fn decode_and_validate_deploy(input: &[u8]) -> Result<DispatchedDeploy> {
     }
     let deploy = HypergraphDeploy::from_canonical_bytes(input)?;
     deploy.validate()?;
-    // TODO: parse RDF schema (Turtle subset) and persist it under a
-    // well-known deploy address so PutVertex can validate against it.
-    // Until then the schema is accepted as an opaque blob — Deploy
-    // succeeds, downstream conformance checks are deferred.
+    // Run both a cheap structural scan and the full Turtle parser.
+    // The structural scan rejects bytes that obviously aren't Turtle
+    // (no `.` terminators, unbalanced `<>`/`""`); the parser rejects
+    // schemas that *look* like Turtle but don't yield any class
+    // definitions. Mirrors Go's deploy-time call into
+    // `TurtleRDFParser.GetTags` for class/field extraction.
+    validate_rdf_schema_bytes(&deploy.rdf_schema)?;
     Ok(DispatchedDeploy { deploy })
+}
+
+/// Structural Turtle-RDF validator. Mirrors the surface checks Go's
+/// `TurtleRDFParser.Validate` performs (parse → graph), without porting
+/// the full RDF graph engine. Catches the common malformed-deploy
+/// shapes:
+///
+/// 1. Non-empty + valid UTF-8 + ≤ 10_000 bytes (Go fuzz-test cap)
+/// 2. At least one `PREFIX` / `@prefix` declaration (every Quilibrium
+///    schema declares `rdf:`/`rdfs:`/`qcl:`/...)
+/// 3. At least one `rdfs:Class` declaration (every schema has at least
+///    one type)
+/// 4. Every `qcl:size N` and `qcl:order N` parses as a non-negative
+///    integer
+/// 5. Triple terminators (`.`) present
+/// 6. Brace/bracket balance: balanced `<...>` IRIs and `"..."` strings
+///
+/// Authoritative parsing still happens downstream when vertex ops
+/// hash fields against the schema; this validator just rejects
+/// blatantly-broken documents so deploy fails fast instead of
+/// poisoning every subsequent vertex op.
+fn validate_rdf_schema_bytes(schema: &[u8]) -> Result<()> {
+    if schema.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "hypergraph deploy: empty RDF schema".into(),
+        ));
+    }
+    const MAX_SCHEMA_BYTES: usize = 10_000;
+    if schema.len() > MAX_SCHEMA_BYTES {
+        return Err(QuilError::InvalidArgument(format!(
+            "hypergraph deploy: RDF schema too large ({} > {} bytes)",
+            schema.len(),
+            MAX_SCHEMA_BYTES
+        )));
+    }
+    let text = std::str::from_utf8(schema).map_err(|_| {
+        QuilError::InvalidArgument("hypergraph deploy: RDF schema is not valid UTF-8".into())
+    })?;
+    if !text.contains('.') {
+        return Err(QuilError::InvalidArgument(
+            "hypergraph deploy: RDF schema missing triple terminators".into(),
+        ));
+    }
+
+    // Prefix / BASE declarations
+    let has_prefix = text.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("@prefix") || t.starts_with("PREFIX") || t.starts_with("BASE") || t.starts_with("@base")
+    });
+    if !has_prefix {
+        return Err(QuilError::InvalidArgument(
+            "hypergraph deploy: RDF schema has no PREFIX or BASE declaration".into(),
+        ));
+    }
+
+    // At least one class declaration. Schemas use either `rdfs:Class`
+    // or the IRI form `<http://www.w3.org/2000/01/rdf-schema#Class>`.
+    if !text.contains("rdfs:Class")
+        && !text.contains("<http://www.w3.org/2000/01/rdf-schema#Class>")
+    {
+        return Err(QuilError::InvalidArgument(
+            "hypergraph deploy: RDF schema declares no rdfs:Class".into(),
+        ));
+    }
+
+    // qcl:size N / qcl:order N — N must be a non-negative integer.
+    for (kw, label) in [("qcl:size", "size"), ("qcl:order", "order")] {
+        for occurrence in text.split(kw).skip(1) {
+            // Skip whitespace, take the next token until the
+            // first non-digit.
+            let trimmed = occurrence.trim_start();
+            if trimmed.is_empty() {
+                return Err(QuilError::InvalidArgument(format!(
+                    "hypergraph deploy: RDF schema has unterminated qcl:{}", label
+                )));
+            }
+            let token: String = trimmed.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if token.is_empty() {
+                return Err(QuilError::InvalidArgument(format!(
+                    "hypergraph deploy: RDF schema qcl:{} not followed by integer", label
+                )));
+            }
+            if token.parse::<u64>().is_err() {
+                return Err(QuilError::InvalidArgument(format!(
+                    "hypergraph deploy: RDF schema qcl:{} value '{}' is not a u64",
+                    label, token
+                )));
+            }
+        }
+    }
+
+    // IRI bracket balance: every `<` outside a string literal must
+    // close with `>`. Cheap state-machine scan ignoring `"..."`.
+    let mut iri_open = 0i64;
+    let mut in_string = false;
+    let mut prev_was_escape = false;
+    for c in text.chars() {
+        if in_string {
+            if prev_was_escape {
+                prev_was_escape = false;
+                continue;
+            }
+            match c {
+                '\\' => prev_was_escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '<' => iri_open += 1,
+            '>' => iri_open -= 1,
+            _ => {}
+        }
+        if iri_open < 0 {
+            return Err(QuilError::InvalidArgument(
+                "hypergraph deploy: RDF schema has unmatched '>'".into(),
+            ));
+        }
+    }
+    if iri_open != 0 {
+        return Err(QuilError::InvalidArgument(format!(
+            "hypergraph deploy: RDF schema has {} unclosed '<' IRIs",
+            iri_open
+        )));
+    }
+    if in_string {
+        return Err(QuilError::InvalidArgument(
+            "hypergraph deploy: RDF schema has unterminated string literal".into(),
+        ));
+    }
+
+    // Full-parser semantic check: the structural scan above only
+    // rejects byte-level garbage. The Turtle parser walks the document
+    // into class/field tuples and verifies each `qcl:size` /
+    // `qcl:order` literal is a valid integer, that every IRI/string is
+    // well-balanced at statement granularity, and that the document
+    // produces at least one class. This catches schemas that pass the
+    // cheap structural scan but would explode downstream when vertex
+    // ops parse them.
+    let parsed = crate::turtle::parse_turtle_schema(text).map_err(|e| {
+        QuilError::InvalidArgument(format!(
+            "hypergraph deploy: RDF schema failed Turtle parse: {e}"
+        ))
+    })?;
+    if parsed.classes.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "hypergraph deploy: RDF schema parsed without any rdfs:Class".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Decode + structurally validate a `HypergraphUpdate`.
@@ -964,5 +1124,86 @@ mod tests {
     fn lock_state_try_lock_message_rejects_short_input() {
         let s = HypergraphLockState::new();
         assert!(s.try_lock_message(&[]).is_err());
+    }
+
+    // ----- RDF schema validator -----
+
+    #[test]
+    fn rdf_validator_accepts_minimal_valid_schema() {
+        let schema = br#"
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix qcl: <https://types.quilibrium.com/qcl/> .
+:Foo a rdfs:Class .
+:Bar a rdfs:Property ;
+  rdfs:domain qcl:Uint ;
+  qcl:size 8 ;
+  qcl:order 0 ;
+  rdfs:range :Foo .
+"#;
+        assert!(validate_rdf_schema_bytes(schema).is_ok());
+    }
+
+    #[test]
+    fn rdf_validator_rejects_no_prefix() {
+        let schema = br#":Foo a rdfs:Class ."#;
+        assert!(validate_rdf_schema_bytes(schema).is_err());
+    }
+
+    #[test]
+    fn rdf_validator_rejects_no_class_decl() {
+        let schema = br#"
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix qcl: <https://types.quilibrium.com/qcl/> .
+:NoClassesHere qcl:order 0 .
+"#;
+        assert!(validate_rdf_schema_bytes(schema).is_err());
+    }
+
+    #[test]
+    fn rdf_validator_rejects_non_integer_order() {
+        let schema = br#"
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix qcl: <https://types.quilibrium.com/qcl/> .
+:Foo a rdfs:Class ; qcl:order abc .
+"#;
+        assert!(validate_rdf_schema_bytes(schema).is_err());
+    }
+
+    #[test]
+    fn rdf_validator_rejects_unbalanced_iri() {
+        let schema = br#"
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema# .
+:Foo a rdfs:Class .
+"#;
+        assert!(validate_rdf_schema_bytes(schema).is_err());
+    }
+
+    #[test]
+    fn rdf_validator_rejects_unterminated_string() {
+        let schema = br#"
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:Foo a rdfs:Class ; rdfs:comment "this never closes ;
+:Bar a rdfs:Class .
+"#;
+        assert!(validate_rdf_schema_bytes(schema).is_err());
+    }
+
+    #[test]
+    fn rdf_validator_rejects_too_large() {
+        let schema = vec![b'.'; 10_001];
+        assert!(validate_rdf_schema_bytes(&schema).is_err());
+    }
+
+    #[test]
+    fn rdf_validator_rejects_non_utf8() {
+        let schema = vec![0xFFu8, 0xFE, 0xFD];
+        assert!(validate_rdf_schema_bytes(&schema).is_err());
+    }
+
+    #[test]
+    fn rdf_validator_rejects_no_dot() {
+        let schema = b"@prefix rdfs <http://x/> rdfs:Class";
+        assert!(validate_rdf_schema_bytes(schema).is_err());
     }
 }

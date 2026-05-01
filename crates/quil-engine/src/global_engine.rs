@@ -32,7 +32,7 @@ pub struct GlobalConsensusEngine {
 
     // -- Crypto --
     pub frame_prover: Arc<dyn FrameProver>,
-    pub inclusion_prover: Arc<dyn InclusionProver>,
+    pub inclusion_prover: Arc<dyn InclusionProver + Send + Sync>,
     pub key_manager: Arc<dyn KeyManager>,
 
     // -- Consensus sub-components --
@@ -72,7 +72,7 @@ impl GlobalConsensusEngine {
         hypergraph_store: Arc<dyn HypergraphStore>,
         shards_store: Arc<dyn ShardsStore>,
         frame_prover: Arc<dyn FrameProver>,
-        inclusion_prover: Arc<dyn InclusionProver>,
+        inclusion_prover: Arc<dyn InclusionProver + Send + Sync>,
         key_manager: Arc<dyn KeyManager>,
         signer_registry: Arc<dyn SignerRegistry>,
         prover_registry: Arc<dyn ProverRegistry>,
@@ -166,9 +166,12 @@ impl GlobalConsensusEngine {
             local_prover_address: self.prover_address.clone(),
             local_bls_pubkey,
             bls_signer,
+            inclusion_prover: Arc::clone(&self.inclusion_prover),
             genesis_frame,
             publisher,
             on_finalized_state: None,
+            on_incorporated_state: None,
+            on_qc_observed: None,
         };
 
         let activation = consensus_activation::activate_consensus(params)?;

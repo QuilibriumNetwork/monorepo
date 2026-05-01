@@ -109,6 +109,32 @@ impl LazyVectorCommitmentTree {
         Ok(())
     }
 
+    /// Delete a key from the tree.
+    ///
+    /// Loads from the store if needed, performs the in-memory delete (with
+    /// branch-merge-on-collapse via [`VectorCommitmentTree::delete`]), then
+    /// marks the tree dirty so the next `commit` persists the new root.
+    /// Returns `Err(QuilError::NotFound)` when the key is absent — matches
+    /// Go's `LazyVectorCommitmentTree.Delete` contract at
+    /// `types/tries/lazy_proof_tree.go:2038`.
+    ///
+    /// Note: Go's lazy variant issues per-node `DeleteNode` calls against
+    /// the backing store as it walks. The Rust port uses a load-all /
+    /// save-all strategy — `commit` rewrites the entire serialized root,
+    /// so individual store-level deletes aren't required to keep the
+    /// store consistent. If we ever switch to per-node lazy persistence
+    /// here, this method must mirror Go's per-step `DeleteNode` calls.
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.ensure_loaded()?;
+        let mut inner = self.inner.write().unwrap();
+        let tree = inner.as_mut().ok_or_else(|| {
+            QuilError::Internal("lazy tree: inner tree missing after load".into())
+        })?;
+        tree.delete(key)?;
+        *self.dirty.write().unwrap() = true;
+        Ok(())
+    }
+
     /// Get a value by key. Loads from store if not already loaded.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.ensure_loaded()?;
@@ -443,5 +469,117 @@ mod tests {
         let txn = NoopTxn;
         let root = tree.commit(&txn, &prover).unwrap();
         assert_eq!(root, vec![0u8; 64]);
+    }
+
+    // =========================================================
+    // Delete tests — store-backed code path
+    // =========================================================
+
+    #[test]
+    fn lazy_tree_delete_existing_leaf_removes_it() {
+        let store = Arc::new(MemStore::new());
+        let tree = LazyVectorCommitmentTree::new(
+            store, "vertex", "adds", test_shard(), vec![],
+        );
+        tree.insert(b"key-1", b"v1", &[], &BigInt::from(2)).unwrap();
+        tree.insert(b"key-2", b"v2", &[], &BigInt::from(2)).unwrap();
+        tree.delete(b"key-1").unwrap();
+        assert_eq!(tree.get(b"key-1").unwrap(), None);
+        assert_eq!(tree.get(b"key-2").unwrap(), Some(b"v2".to_vec()));
+        assert!(tree.is_dirty());
+    }
+
+    #[test]
+    fn lazy_tree_delete_returns_notfound_for_missing_key() {
+        let store = Arc::new(MemStore::new());
+        let tree = LazyVectorCommitmentTree::new(
+            store, "vertex", "adds", test_shard(), vec![],
+        );
+        tree.insert(b"key-1", b"v1", &[], &BigInt::from(2)).unwrap();
+        let err = tree.delete(b"missing").unwrap_err();
+        assert!(matches!(err, QuilError::NotFound(_)));
+    }
+
+    #[test]
+    fn lazy_tree_delete_collapses_branch_with_single_remaining_child() {
+        let store = Arc::new(MemStore::new());
+        let tree = LazyVectorCommitmentTree::new(
+            store, "vertex", "adds", test_shard(), vec![],
+        );
+        tree.insert(b"alpha", b"a", &[], &BigInt::from(1)).unwrap();
+        tree.insert(b"bravo", b"b", &[], &BigInt::from(1)).unwrap();
+        // Two-leaf tree → branch root.
+        let (leaves_before, _) = tree.get_metadata();
+        assert_eq!(leaves_before, 2);
+
+        tree.delete(b"alpha").unwrap();
+
+        // After collapse the only thing left is one leaf — `get_metadata`
+        // returns (1, 1) for a single-leaf root.
+        let (leaves_after, longest_after) = tree.get_metadata();
+        assert_eq!(leaves_after, 1);
+        assert_eq!(longest_after, 1);
+        assert_eq!(tree.get(b"bravo").unwrap(), Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn lazy_tree_delete_then_commit_yields_same_root_as_fresh_insert() {
+        // Property-style equivalent on the lazy wrapper: build tree A
+        // with k1+k2+k3, delete k2, commit. Build tree B with k1+k3,
+        // commit. Roots must match — exercises the store-backed code
+        // path including serialization round-trip on commit.
+        let prover = StubProver;
+        let shard = test_shard();
+
+        let store_a = Arc::new(MemStore::new());
+        let tree_a = LazyVectorCommitmentTree::new(
+            store_a, "vertex", "adds", shard.clone(), vec![],
+        );
+        tree_a.insert(b"key-aa", b"v-aa", &[], &BigInt::from(4)).unwrap();
+        tree_a.insert(b"key-bb", b"v-bb", &[], &BigInt::from(4)).unwrap();
+        tree_a.insert(b"key-cc", b"v-cc", &[], &BigInt::from(4)).unwrap();
+        tree_a.delete(b"key-bb").unwrap();
+        let txn_a = NoopTxn;
+        let root_a = tree_a.commit(&txn_a, &prover).unwrap();
+
+        let store_b = Arc::new(MemStore::new());
+        let tree_b = LazyVectorCommitmentTree::new(
+            store_b, "vertex", "adds", shard, vec![],
+        );
+        tree_b.insert(b"key-aa", b"v-aa", &[], &BigInt::from(4)).unwrap();
+        tree_b.insert(b"key-cc", b"v-cc", &[], &BigInt::from(4)).unwrap();
+        let txn_b = NoopTxn;
+        let root_b = tree_b.commit(&txn_b, &prover).unwrap();
+
+        assert_eq!(root_a, root_b);
+    }
+
+    #[test]
+    fn lazy_tree_delete_from_unloaded_loads_and_succeeds() {
+        // Ensure `delete` triggers `ensure_loaded` — first tree commits,
+        // second tree opens fresh against the same store and must be
+        // able to delete a key without an explicit `get`/`insert` call
+        // beforehand.
+        let store = Arc::new(MemStore::new());
+        let prover = StubProver;
+        let shard = test_shard();
+
+        let tree1 = LazyVectorCommitmentTree::new(
+            store.clone(), "vertex", "adds", shard.clone(), vec![],
+        );
+        tree1.insert(b"k1", b"v1", &[], &BigInt::from(2)).unwrap();
+        tree1.insert(b"k2", b"v2", &[], &BigInt::from(2)).unwrap();
+        let txn = NoopTxn;
+        tree1.commit(&txn, &prover).unwrap();
+
+        let tree2 = LazyVectorCommitmentTree::new(
+            store, "vertex", "adds", shard, vec![],
+        );
+        assert!(!tree2.is_loaded());
+        tree2.delete(b"k1").unwrap();
+        assert!(tree2.is_loaded());
+        assert!(tree2.is_dirty());
+        assert_eq!(tree2.get(b"k1").unwrap(), None);
+        assert_eq!(tree2.get(b"k2").unwrap(), Some(b"v2".to_vec()));
     }
 }

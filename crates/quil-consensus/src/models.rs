@@ -1,8 +1,13 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-/// Identity is a hex-encoded hash string identifying a consensus object.
-pub type Identity = String;
+/// Identity is the raw byte sequence identifying a consensus object —
+/// for `GlobalFrame` it's the 32-byte big-endian Poseidon hash of the
+/// frame output, for QCs it's the `Selector` field, etc. Mirrors Go's
+/// `models.Identity = string` (Go strings are arbitrary byte
+/// sequences); we use `Vec<u8>` so we can hold the raw bytes without
+/// UTF-8 lossiness.
+pub type Identity = Vec<u8>;
 
 /// All consensus objects must implement Unique for identification and ordering.
 pub trait Unique: Send + Sync + Clone + Debug + 'static {
@@ -64,9 +69,17 @@ pub struct State<S: Unique> {
 /// The TC is held behind an `Arc` so the proposal can be cloned cheaply while
 /// the trait object stays shared. `None` means the proposer entered the
 /// current rank via the happy-path QC rather than a recovery-path TC.
+///
+/// `parent_quorum_certificate` is the QC the proposed state builds on top
+/// of (the QC for `parent_qc_identity` at `parent_qc_rank`). The wire
+/// `GlobalProposal` carries this verbatim so receivers can verify the
+/// proposal lineage; the in-memory shape carries the trait object so the
+/// outbound publisher can serialize it without re-fetching from the QC
+/// store.
 #[derive(Debug, Clone)]
 pub struct Proposal<S: Unique> {
     pub state: State<S>,
+    pub parent_quorum_certificate: Arc<dyn QuorumCertificate>,
     pub previous_rank_timeout_certificate: Option<Arc<dyn TimeoutCertificate>>,
 }
 
