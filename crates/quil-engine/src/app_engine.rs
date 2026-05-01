@@ -206,7 +206,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
 
         // Collect pending messages
         let messages = self.message_collector.collect_for_rank(rank);
-        info!(
+        debug!(
             filter = hex::encode(&self.filter),
             frame = frame_number,
             rank,
