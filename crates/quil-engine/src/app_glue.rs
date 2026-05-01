@@ -136,7 +136,7 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
         current_rank: u64,
         tc: &dyn TimeoutCertificate,
     ) {
-        info!(
+        debug!(
             filter = hex::encode(&self.filter),
             rank = current_rank,
             tc_rank = tc.rank(),
@@ -145,7 +145,7 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
     }
 
     fn on_local_timeout(&self, current_rank: u64) {
-        warn!(
+        debug!(
             filter = hex::encode(&self.filter),
             rank = current_rank,
             "shard local timeout"
@@ -153,7 +153,7 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
     }
 
     fn on_own_vote(&self, vote: &AppShardVote, recipient_id: &Identity) {
-        info!(
+        debug!(
             filter = hex::encode(&self.filter),
             rank = vote.rank(),
             recipient = %hex::encode(recipient_id),
@@ -186,7 +186,7 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
     }
 
     fn on_own_timeout(&self, timeout: &TimeoutState<AppShardVote>) {
-        info!(
+        debug!(
             filter = hex::encode(&self.filter),
             rank = timeout.rank,
             "produced shard timeout"
@@ -225,7 +225,7 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
     ) {
         let frame = proposal.proposal.state.state.frame_number;
         let rank = proposal.proposal.state.rank;
-        info!(
+        debug!(
             filter = hex::encode(&self.filter),
             frame,
             rank,
