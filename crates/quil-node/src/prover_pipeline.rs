@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use quil_engine::provers::lifecycle::{LifecycleAction, ProverLifecycle};
 use quil_engine::worker::WorkerManager;
@@ -690,7 +690,7 @@ where
     for h in handles {
         match h.await {
             Ok(Ok(addr)) => {
-                info!(%addr, "prover message submitted via gRPC");
+                debug!(%addr, "prover message submitted via gRPC");
                 ok_count += 1;
             }
             Ok(Err((addr, reason))) => {
