@@ -96,10 +96,10 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration first so logger paths / filters come from it.
     let config = quil_config::load_config(&args.config)?;
 
-    // Initialize logging matching Go's zap console encoder format
-    // (tab-separated ts \t level \t target:line \t msg \t {fields}).
-    // Per-core file separation (`master.log` / `worker-N.log`) and
-    // retention (maxAge, maxBackups) mirror lumberjack behavior.
+    // Initialize logging in tab-separated console format:
+    //   ts \t level \t target:line \t msg \t {fields}.
+    // Per-core file separation (`master.log` / `worker-N.log`) plus
+    // size/age retention (maxAge, maxBackups).
     //
     // `_log_guard` must be held alive until shutdown so the async
     // file appender gets a chance to flush; we bind it with a `_`
@@ -457,9 +457,8 @@ async fn run_master_node(
     // 3b. Testnet/devnet genesis bootstrap
     //
     // For non-mainnet networks the node bootstraps its own genesis
-    // state locally (no archive to sync from). Mirrors Go's
-    // `createStubGenesis` path at `node/main.go` when network != 0.
-    // Skipped if genesis frame already exists in the clock store.
+    // state locally (no archive to sync from). Skipped if a genesis
+    // frame already exists in the clock store.
     // ---------------------------------------------------------------
     let clock_store_dyn: &dyn quil_types::store::ClockStore = clock_store.as_ref();
     if network != 0 && clock_store_dyn.get_global_clock_frame(0).is_err() {
@@ -526,7 +525,13 @@ async fn run_master_node(
         config.p2p.listen_multiaddr.clone()
     };
 
-    let p2p_node = quil_p2p::node::P2PNode::new(&config.p2p)?;
+    // CLI `--network` is the source of truth — override the YAML's
+    // `p2p.network` so a single config file can be reused across
+    // networks without the BlossomSub protocol id falling back to
+    // the mainnet variant on testnet runs.
+    let mut p2p_config = config.p2p.clone();
+    p2p_config.network = network;
+    let p2p_node = quil_p2p::node::P2PNode::new(&p2p_config)?;
     let peer_id = p2p_node.peer_id;
     info!(
         key_type = if config.p2p.peer_priv_key.is_empty() { "generated Ed448" } else { "loaded from config" },
@@ -792,8 +797,8 @@ async fn run_master_node(
     // has a BLS proving key and is an active prover. For now we create
     // the prover registry and message collector, but defer the full
     // HotStuff event loop until the node has synced enough state to
-    // determine its role. The consensus components (Phase 3A) are ready
-    // to be wired when this node becomes an active prover.
+    // determine its role. The consensus components are ready to be
+    // wired when this node becomes an active prover.
     let prover_registry = Arc::new(quil_execution::SharedProverRegistry::new());
     {
         let pr = prover_registry.clone();
@@ -970,13 +975,131 @@ async fn run_master_node(
                 worker_cores = thread_mgr.num_worker_cores(),
                 "thread worker manager ready (local mode)"
             );
+            // Drain `WorkerToMaster` events from the in-process worker
+            // threads. Mirrors the gRPC `submitShardFrameToMaster` path
+            // Go uses across worker/master processes — here both live in
+            // one process, so we forward the events directly to the
+            // master's BlossomSub publish path.
+            //
+            // `ShardFrameFinalized` becomes a `MessageBundle{Shard:
+            // header}` published on `GLOBAL_PROVER` so global archives
+            // credit our shard work toward rewards.
+            //
+            // TODO (multi-prover): when an app engine activates for a
+            // filter, the master also needs to *subscribe* to the four
+            // per-shard bitmasks (frame, consensus, prover, dispatch)
+            // and route incoming peer messages to the right
+            // `AppEngineHandle` by filter. Single-prover finalization
+            // works without this because no peers send shard messages,
+            // but multi-prover quorums require it.
+            if let Some(mut master_rx) = thread_mgr.take_master_rx() {
+                let drain_p2p = p2p_handle.clone();
+                let drain_cancel = token.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = drain_cancel.cancelled() => break,
+                            event = master_rx.recv() => {
+                                let Some(event) = event else { break; };
+                                use quil_engine::thread_worker::WorkerToMaster;
+                                match event {
+                                    WorkerToMaster::ShardFrameFinalized {
+                                        core_id,
+                                        filter,
+                                        header_canonical_bytes,
+                                    } => {
+                                        let req = match quil_execution::message_envelope::CanonicalMessageRequest::wrap(
+                                            header_canonical_bytes,
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                warn!(core_id, filter = %hex::encode(&filter), error = %e,
+                                                    "shard finalize: bad FrameHeader bytes — dropping coverage publish");
+                                                continue;
+                                            }
+                                        };
+                                        let timestamp = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as i64;
+                                        let bundle = quil_execution::message_envelope::CanonicalMessageBundle {
+                                            requests: vec![Some(req)],
+                                            timestamp,
+                                        };
+                                        match bundle.to_canonical_bytes() {
+                                            Ok(bytes) => {
+                                                if let Err(e) = drain_p2p
+                                                    .publish(
+                                                        quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
+                                                        bytes,
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!(core_id, filter = %hex::encode(&filter),
+                                                        error = %e, "GLOBAL_PROVER publish failed");
+                                                }
+                                            }
+                                            Err(e) => warn!(core_id, error = %e,
+                                                "shard finalize: bundle encode failed"),
+                                        }
+                                    }
+                                    WorkerToMaster::FrameProduced { core_id, filter, frame_data, .. } => {
+                                        // Per-shard frame bitmask = filter itself.
+                                        // Self-loopback is handled in thread_worker
+                                        // before we get here.
+                                        if let Err(e) = drain_p2p
+                                            .publish(
+                                                quil_engine::bitmasks::shard_frame_bitmask(&filter),
+                                                frame_data,
+                                            )
+                                            .await
+                                        {
+                                            warn!(core_id, filter = %hex::encode(&filter),
+                                                error = %e, "shard frame publish failed");
+                                        }
+                                    }
+                                    WorkerToMaster::VoteProduced { core_id, filter, vote_data } => {
+                                        // Per-shard consensus bitmask = `0x00 || filter`.
+                                        if let Err(e) = drain_p2p
+                                            .publish(
+                                                quil_engine::bitmasks::shard_consensus_bitmask(&filter),
+                                                vote_data,
+                                            )
+                                            .await
+                                        {
+                                            warn!(core_id, filter = %hex::encode(&filter),
+                                                error = %e, "shard vote publish failed");
+                                        }
+                                    }
+                                    WorkerToMaster::TimeoutProduced { core_id, filter, timeout_data } => {
+                                        if let Err(e) = drain_p2p
+                                            .publish(
+                                                quil_engine::bitmasks::shard_consensus_bitmask(&filter),
+                                                timeout_data,
+                                            )
+                                            .await
+                                        {
+                                            warn!(core_id, filter = %hex::encode(&filter),
+                                                error = %e, "shard timeout publish failed");
+                                        }
+                                    }
+                                    WorkerToMaster::Ready { .. }
+                                    | WorkerToMaster::ShardHeartbeat { .. } => {
+                                        // No-op — informational only.
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    info!("worker→master drain task stopped");
+                });
+            }
             thread_mgr as Arc<dyn quil_engine::worker::WorkerManager>
         };
 
-    // Pre-allocate idle workers for each available core (matching Go's
-    // startup behavior where worker processes are spawned immediately).
-    // Workers start idle (empty filter) and get assigned shards by the
-    // lifecycle when join proposals are accepted.
+    // Pre-allocate idle workers for each available core so they're
+    // online from startup. Workers start idle (empty filter) and get
+    // assigned shards by the lifecycle when join proposals are accepted.
     {
         let num_cores = match worker_manager.check_workers_connected() {
             Ok(ids) => ids.len() as u32,
@@ -1005,13 +1128,12 @@ async fn run_master_node(
     ));
 
     // Compute the config-derived seniority estimate from the mainnet
-    // compat table — matches Go's `estimateSeniorityFromConfig`. Uses
-    // our local libp2p peer ID plus any peer IDs derived from the
-    // configs listed in `engine.multisig_prover_enrollment_paths`.
-    // Result is cached on the allocator; lifecycle consults it when
-    // deciding whether a seniority merge would raise our on-chain
-    // seniority. We compute this only on mainnet (P2P.Network == 0)
-    // to match Go's `RebuildPeerSeniority` scoping.
+    // compat table. Uses our local libp2p peer ID plus any peer IDs
+    // derived from the configs listed in
+    // `engine.multisig_prover_enrollment_paths`. Result is cached on
+    // the allocator; lifecycle consults it when deciding whether a
+    // seniority merge would raise our on-chain seniority. Computed
+    // only on mainnet (P2P.Network == 0).
     if config.p2p.network == 0 {
         let mut peer_ids: Vec<String> = Vec::new();
         let pk_bytes = hex::decode(&config.p2p.peer_priv_key).unwrap_or_default();
@@ -1122,8 +1244,8 @@ async fn run_master_node(
     }
     let prover_lifecycle = Arc::new(lifecycle_inner);
     // Wire the shards store so `evaluate` can discover shards that
-    // have no allocations yet (mirrors Go's `worker_allocator.go:599`
-    // path that calls `RangeAppShards` on the local store).
+    // have no allocations yet — calls `RangeAppShards` on the local
+    // store.
     prover_lifecycle.set_shards_store(
         _shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>,
     );
@@ -1131,8 +1253,7 @@ async fn run_master_node(
     // Periodic eviction of inactive provers. Only archive nodes perform
     // eviction (non-archives receive the resulting updates via sync).
     // Guarded by HaltState so evictions don't cascade during a halt
-    // window — mirrors Go's `global_consensus_engine.go` gating at the
-    // commit path (see memory `Bug #17`).
+    // window.
     if archive_mode {
         let pr_for_evict: Arc<dyn quil_types::consensus::ProverRegistry> =
             prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>;
@@ -1265,24 +1386,48 @@ async fn run_master_node(
     };
     // Build set of valid genesis prover ADDRESSES (Poseidon hash of BLS pubkey)
     // The frame header's `prover` field is the 32-byte address, not the raw key.
+    //
+    // On mainnet (network = 0) the allowlist is the embedded mainnet genesis
+    // (5 archive peers + the beacon). On testnet/devnet (network != 0) the
+    // allowlist is derived from `config.engine.genesis_seed` — the same hex
+    // blob the Go node uses to build its testnet bootstrap provers. Without
+    // this branch the testnet rejects every legitimate global frame as
+    // "INVALID PROVER" because mainnet keys never match testnet archives.
     let genesis_prover_addrs: std::collections::HashSet<Vec<u8>> = {
         let mut addrs = std::collections::HashSet::new();
-        if let Ok(data) = quil_engine::genesis::get_mainnet_genesis_data() {
-            // Beacon BLS key → address
-            if let Ok(beacon_key) = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &data.beacon_bls48581_key,
-            ) {
-                if let Ok(addr) = quil_crypto::poseidon::hash_bytes_to_32(&beacon_key) {
-                    addrs.insert(addr.to_vec());
-                }
-            }
-            // Archive peer BLS keys → addresses
-            for (_pid, pubkey_hex) in &data.archive_peers {
-                if let Ok(key) = hex::decode(pubkey_hex) {
-                    if let Ok(addr) = quil_crypto::poseidon::hash_bytes_to_32(&key) {
+        if network == 0 {
+            if let Ok(data) = quil_engine::genesis::get_mainnet_genesis_data() {
+                if let Ok(beacon_key) = base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &data.beacon_bls48581_key,
+                ) {
+                    if let Ok(addr) = quil_crypto::poseidon::hash_bytes_to_32(&beacon_key) {
                         addrs.insert(addr.to_vec());
                     }
+                }
+                for (_pid, pubkey_hex) in &data.archive_peers {
+                    if let Ok(key) = hex::decode(pubkey_hex) {
+                        if let Ok(addr) = quil_crypto::poseidon::hash_bytes_to_32(&key) {
+                            addrs.insert(addr.to_vec());
+                        }
+                    }
+                }
+            }
+        } else {
+            match quil_engine::genesis::resolve_testnet_prover_keys(
+                network,
+                &config.engine.genesis_seed,
+                &bls_pubkey,
+            ) {
+                Ok(keys) => {
+                    for key in &keys {
+                        if let Ok(addr) = quil_crypto::poseidon::hash_bytes_to_32(key) {
+                            addrs.insert(addr.to_vec());
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, network = network, "could not resolve testnet genesis provers");
                 }
             }
         }
@@ -1298,8 +1443,7 @@ async fn run_master_node(
     // Always includes our local peer-private key seed; extra seeds are
     // loaded from `config.engine.multisig_prover_enrollment_paths`. The
     // pipeline signs the local BLS prover pubkey once per seed under
-    // the `PROVER_SENIORITY_MERGE` domain — matching Go's
-    // `buildMergeHelpers` at `worker_allocator.go:1619-1721`.
+    // the `PROVER_SENIORITY_MERGE` domain.
     let mut multisig_ed448_seeds: Vec<[u8; 57]> = Vec::new();
     {
         let bytes = hex::decode(&config.p2p.peer_priv_key).unwrap_or_default();
@@ -1326,12 +1470,10 @@ async fn run_master_node(
     // poller on_frame callback and the BlossomSub message-receive loop
     // can dispatch lifecycle actions.
     // Hex-decode the configured delegate address (empty string =
-    // empty Vec). Mirrors Go's `worker_allocator.go:1483-1490`. A
-    // misconfigured delegate is downgraded to a warning + default
-    // empty rather than aborting, so a typo doesn't take the node
-    // down — Go logs and aborts the join attempt; we'd rather emit
-    // an empty-delegate join (semantically equivalent) than refuse
-    // to join.
+    // empty Vec). A misconfigured delegate is downgraded to a warning
+    // + default empty rather than aborting, so a typo doesn't take
+    // the node down — emit an empty-delegate join (semantically
+    // equivalent) instead of refusing to join.
     let delegate_address: Vec<u8> = {
         let raw = config.engine.delegate_address.trim();
         if raw.is_empty() {
@@ -1344,7 +1486,7 @@ async fn run_master_node(
                         delegate_address = raw,
                         %e,
                         "config.engine.delegate_address is not valid hex; \
-                         defaulting to empty (matches Go behavior when unset)"
+                         defaulting to empty"
                     );
                     Vec::new()
                 }
@@ -1368,9 +1510,9 @@ async fn run_master_node(
     });
 
     // Shard orchestration subscriber: watches for ShardSplitEligible /
-    // ShardMergeEligible events and submits signed canonical
-    // messages via the prover pipeline. Mirrors Go's coverage
-    // monitor → shard orchestrator handoff.
+    // ShardMergeEligible events and submits signed canonical messages
+    // via the prover pipeline (the coverage-monitor → shard-orchestrator
+    // handoff).
     {
         let mut rx = global_event_distributor.subscribe("shard-orchestrator");
         let pp = prover_pipeline.clone();
@@ -1579,11 +1721,11 @@ async fn run_master_node(
                         warn!(error = %e, "prover registry refresh failed");
                     }
                     // Reconstruct coverage streaks from synced prover
-                    // data — mirrors Go's `ensureStreakMap` (called once
-                    // at startup before any frame-driven check). Without
-                    // this, the first eviction pass after a restart
-                    // would interpret all previously-stale allocations
-                    // as freshly inactive and kick them immediately.
+                    // data once at startup, before any frame-driven check.
+                    // Without this, the first eviction pass after a
+                    // restart would interpret all previously-stale
+                    // allocations as freshly inactive and kick them
+                    // immediately.
                     {
                         let pr_for_streak = sync_pr.clone();
                         let cov = sync_cov.clone();
@@ -1820,15 +1962,13 @@ async fn run_master_node(
                                 // local aggregation or wire receive), persist
                                 // it to the clock store so the leader's
                                 // `prove_next_state` for rank+1 finds the
-                                // correct latest QC. Mirrors Go's
-                                // `OnQuorumCertificateTriggeredRankChange` at
-                                // `consensus_protocol.go:622`.
+                                // correct latest QC.
                                 let qc_observed_hook: quil_engine::consensus_glue::QcObservedHook = {
                                     let cs = sync_cs.clone();
                                     Arc::new(move |qc| {
-                                        // Mirror NoTxn shim — clock store's
-                                        // QC writer doesn't require atomicity
-                                        // with anything else here.
+                                        // NoTxn shim — clock store's QC writer
+                                        // doesn't require atomicity with
+                                        // anything else here.
                                         struct NoTxn2;
                                         impl quil_types::store::Transaction for NoTxn2 {
                                             fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> { Ok(None) }
@@ -1988,8 +2128,7 @@ async fn run_master_node(
 
     // Broadcast channel for GlobalService::StreamGlobalMessages.
     // Construction here (before recv loop) so the recv loop can
-    // feed it; the gRPC server takes a clone later. 256 buffer
-    // matches Go's.
+    // feed it; the gRPC server takes a clone later.
     let global_msg_tx: tokio::sync::broadcast::Sender<
         quil_types::proto::global::StreamGlobalMessagesResponse,
     > = tokio::sync::broadcast::channel(
@@ -2029,12 +2168,9 @@ async fn run_master_node(
     let pa_for_recv = prover_address;
     let p2p_for_recv = p2p_handle.clone();
 
-    // Per-bitmask validator gate (mirrors Go's
-    // `pubsub.RegisterValidator` calls in
-    // `node/consensus/global/message_router.go`). Malformed bytes are
-    // dropped here so the dispatch loop below stays cheap. Topics
-    // without a registered validator fall through unchanged, preserving
-    // existing behaviour for any bitmask we haven't ported yet.
+    // Per-bitmask validator gate. Malformed bytes are dropped here so
+    // the dispatch loop below stays cheap. Topics without a registered
+    // validator fall through unchanged.
     let message_router = Arc::new(quil_engine::message_router::MessageRouter::new());
     message_router.register_validator(
         GLOBAL_PEER_INFO.to_vec(),
@@ -2066,7 +2202,7 @@ async fn run_master_node(
         loop {
             tokio::select! {
                 _ = status_timer.tick() => {
-                    // Periodic status log matching Go's allocation status pattern
+                    // Periodic allocation status snapshot.
                     let peer_count = p2p_for_recv.peer_count();
                     let latest_frame = clock_store_recv.get_latest_global_frame()
                         .ok()
@@ -2129,9 +2265,8 @@ async fn run_master_node(
                                 },
                             );
 
-                            // Per-topic validator gate. Malformed
-                            // bytes are dropped before they reach a
-                            // queue (mirrors Go's pubsub.Validator).
+                            // Per-topic validator gate. Malformed bytes are
+                            // dropped before they reach a queue.
                             // Unregistered topics fall through.
                             if !router_for_recv
                                 .route(&received.bitmask, &received.data)
@@ -2327,7 +2462,7 @@ async fn run_master_node(
                                 }
                             }
                             GLOBAL_FRAME => {
-                                // Try canonical bytes first (Go publishes in canonical format),
+                                // Try canonical bytes first (the wire format),
                                 // fall back to proto decode (archive poller uses proto).
                                 let frame_result: std::result::Result<quil_types::proto::global::GlobalFrame, _> =
                                     quil_engine::consensus_wire::decode_global_frame(&received.data)
@@ -2600,9 +2735,9 @@ async fn run_master_node(
             }
         }
         // Submit handler: peers that submit a MessageBundle via gRPC
-        // (Go's primary path — see `ArchiveClient::submit_global_message`)
-        // get their payload routed into the same MessageCollector that
-        // BlossomSub GLOBAL_PROVER traffic feeds.
+        // (`ArchiveClient::submit_global_message`) get their payload
+        // routed into the same MessageCollector that BlossomSub
+        // GLOBAL_PROVER traffic feeds.
         //
         // Peer identity is extracted by `peer_auth_interceptor` from
         // the TLS client cert's SAN (if any) and attached to the
@@ -2664,7 +2799,6 @@ async fn run_master_node(
 
         // GlobalShardsProvider: walks the 4 phase trees for a given
         // shard key and returns per-phase (commit, size_be, leaf_count).
-        // Mirrors Go's services.go:313-368 tree-walk.
         let global_shards_provider: quil_rpc::global_service::GlobalShardsProvider = {
             let store = hg_store.clone();
             let prover = inclusion_prover.clone();
@@ -2776,7 +2910,7 @@ async fn run_master_node(
         // Traversal proof generator: look up the tree blob for
         // (domain, atom_type, phase_type), deserialize, run
         // prove_multiple against the requested keys, and return
-        // canonical bytes. Matches Go's `HypergraphCRDT.CreateTraversalProof`.
+        // canonical bytes.
         {
             let store = hg_store.clone();
             let prover_for_tp = inclusion_prover.clone();
@@ -2812,8 +2946,7 @@ async fn run_master_node(
 
         // Send handler: verify Ed448 authentication over payload under
         // the NODE_AUTHENTICATION||domain prefix, then route the payload
-        // to the correct BlossomSub bitmask. Mirrors Go's
-        // `RPCServer::Send` (see node/rpc/node_rpc_server.go:567).
+        // to the correct BlossomSub bitmask.
         if let Some(seed) = mtls_seed {
             let send_p2p = p2p_handle.clone();
             let peer_ed448_pub = quil_p2p::ed448_identity::derive_public_key(&seed);
@@ -2983,7 +3116,7 @@ async fn run_master_node(
         ));
         let node_rpc = node_rpc_builder;
 
-        // Mirrors Go's layout (see node/consensus/global/services.go):
+        // gRPC layout:
         //   * NodeService is user-facing (qclient / admin) and served
         //     plaintext at ListenGRPCMultiaddr (default 127.0.0.1:8337).
         //   * Global, Hypergraph, AppShard, KeyRegistry, Connectivity
@@ -3068,8 +3201,7 @@ async fn run_master_node(
 
             // DispatchService — inbox + hub CRDT for qclient message
             // send/retrieve/show/delete. Backed by the existing
-            // RocksInboxStore; registered on the same mTLS listener
-            // Go uses (see node/consensus/global/services.go:545,167).
+            // RocksInboxStore; registered on the same mTLS listener.
             let inbox_store = Arc::new(quil_store::RocksInboxStore::new(db_arc.inner()));
             let dispatch_service = tonic::service::interceptor::InterceptedService::new(
                 quil_types::proto::global::dispatch_service_server::DispatchServiceServer::new(
@@ -3488,16 +3620,13 @@ fn extract_stream_addr(pubsub_ma: &str, stream_listen: &str) -> Option<String> {
 }
 
 /// Bridges `quil_engine::consensus_glue::ConsensusPublisher` to BlossomSub.
-/// Proposals go on `GLOBAL_FRAME`, votes and timeouts on `GLOBAL_CONSENSUS`,
-/// matching what Go does at `global_consensus_engine.go:publishProposalVote`
-/// and `publishFrame`.
+/// Proposals go on `GLOBAL_FRAME`, votes and timeouts on `GLOBAL_CONSENSUS`.
 struct BlossomsubConsensusPublisher {
     p2p_handle: quil_p2p::node::P2PHandle,
     /// Self-loopback for consensus messages so the local
     /// `vote_aggregator` / event-loop dispatcher sees the leader's
     /// own proposals (BlossomSub does not echo self-published
-    /// messages). Mirrors Go's `MessageHub` re-injecting the local
-    /// node's outbound proposal into the inbound queue.
+    /// messages).
     loopback_tx: tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
     self_peer_id: Vec<u8>,
 }
@@ -3543,12 +3672,10 @@ impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPubl
 
     fn publish_prover_message(&self, data: Vec<u8>) {
         // `data` is a `MessageRequest`-wrapped inner payload (built by
-        // `consensus_glue::wrap_message_request`). Mirror Go's
-        // `publishProverMessage` (`global_consensus_engine.go:154-159`)
-        // by wrapping in a `MessageBundle` envelope and publishing on
-        // the GLOBAL_PROVER bitmask. The full Go path also routes via
-        // archive gRPC when a non-archive node is configured; the
-        // BlossomSub broadcast covers archive nodes here.
+        // `consensus_glue::wrap_message_request`). Wrap it in a
+        // `MessageBundle` envelope and publish on the GLOBAL_PROVER
+        // bitmask. Non-archive nodes can additionally route over
+        // archive gRPC; the BlossomSub broadcast covers archive nodes.
         let handle = self.p2p_handle.clone();
         let bitmask = quil_engine::bitmasks::GLOBAL_PROVER.to_vec();
         tokio::spawn(async move {

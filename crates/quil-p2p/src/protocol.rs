@@ -7,10 +7,31 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/blossomsub.pb.rs"));
 }
 
-/// Protocol ID for BlossomSub v2.1.0
+/// Protocol ID for BlossomSub v2.1.0 on mainnet (`network = 0`).
 pub const PROTOCOL_ID: &str = "/blossomsub/2.1.0";
 
-/// Maximum RPC message size (16 MiB, matching Go default).
+/// Protocol ID for `network`. Mainnet (`0`) keeps the bare ID; every
+/// other network suffixes `-network-N` so isolated chains never see
+/// each other's traffic at the libp2p stream-negotiation layer.
+pub fn protocol_id_for_network(network: u8) -> String {
+    if network == 0 {
+        PROTOCOL_ID.to_string()
+    } else {
+        format!("{}-network-{}", PROTOCOL_ID, network)
+    }
+}
+
+/// Same as [`protocol_id_for_network`] but returns a `StreamProtocol`.
+pub fn stream_protocol_for_network(network: u8) -> libp2p::StreamProtocol {
+    if network == 0 {
+        libp2p::StreamProtocol::new(PROTOCOL_ID)
+    } else {
+        libp2p::StreamProtocol::try_from_owned(protocol_id_for_network(network))
+            .expect("network-suffixed BlossomSub protocol ID is well-formed")
+    }
+}
+
+/// Maximum RPC message size (16 MiB).
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Encode an RPC message to bytes with a length prefix (unsigned varint).
@@ -145,7 +166,7 @@ pub fn publish_rpc(messages: Vec<pb::Message>) -> pb::Rpc {
 }
 
 // ---------------------------------------------------------------------------
-// Varint encoding (unsigned LEB128, matching Go's protobuf varint)
+// Varint encoding (unsigned LEB128 protobuf varint)
 // ---------------------------------------------------------------------------
 
 fn encode_varint(mut value: u64, buf: &mut Vec<u8>) {

@@ -148,7 +148,7 @@ impl P2PNode {
                     )
                     .with_push_listen_addr_updates(true),
                 );
-                let mut blossomsub = BlossomSubBehaviour::new();
+                let mut blossomsub = BlossomSubBehaviour::new(network);
                 // Set signing identity so published messages pass Go's
                 // StrictSign verification (WithStrictSignatureVerification(true)).
                 let local_peer_id = key.public().to_peer_id();
@@ -295,7 +295,6 @@ impl P2PNode {
                                     }
 
                                     // Advertise ourselves on the network namespace
-                                    // (mirrors Go's util.Advertise)
                                     let ns = "quilibrium-2.0.2-dusk-mainnet";
                                     let ns_hash = Sha256::digest(ns.as_bytes());
                                     let mut mh = vec![0x12u8, 0x20];
@@ -346,6 +345,7 @@ impl P2PNode {
                                         agent = %info.agent_version,
                                         protos = proto_list.len(),
                                         routable = routable.len(),
+                                        protocols = ?proto_list,
                                         "identified peer"
                                     );
                                     // Only feed publicly routable addresses into Kademlia.
@@ -531,8 +531,8 @@ impl P2PHandle {
     /// broadcasts the data to all peers subscribed to the bitmask.
     ///
     /// Returns `Ok(())` for empty-mesh / no-peer scenarios (BlossomSub
-    /// silently buffers — Go does the same) and on every successful
-    /// dispatch. Returns `Err` only on _true_ failures: the swarm
+    /// silently buffers) and on every successful dispatch. Returns
+    /// `Err` only on _true_ failures: the swarm
     /// command channel is closed (e.g. shutdown), the swarm loop has
     /// exited without acknowledging the publish, or the underlying
     /// BlossomSub behaviour rejected the message (e.g. local node not
@@ -645,20 +645,10 @@ struct NodeBehaviour {
     autonat: libp2p::autonat::Behaviour,
 }
 
-/// Compute message ID matching Go's `DefaultMsgIdFn` at
-/// `go-libp2p-blossomsub/pubsub.go:1321-1326`:
-///
-/// ```go
-/// h := sha256.New()
-/// h.Write(pmsg.Data)
-/// return h.Sum([]byte{0x01})
-/// ```
-///
-/// `hash.Hash.Sum(b)` APPENDS the digest to `b`, so the result is
-/// `[0x01, SHA256(data)...]` — 33 bytes, leading byte 0x01. Rust nodes
-/// that emit the 32-byte digest alone would compute dedup IDs that
-/// never match Go's for the same payload, corrupting IHAVE/IWANT
-/// gossip and causing message-routing divergence across the network.
+/// Compute the BlossomSub message ID: `[0x01, SHA256(data)...]` —
+/// 33 bytes, leading byte 0x01. Other implementations that emit the
+/// 32-byte digest alone would compute non-matching dedup IDs for the
+/// same payload, corrupting IHAVE/IWANT gossip.
 pub fn message_id(data: &[u8]) -> Vec<u8> {
     let mut id = Vec::with_capacity(33);
     id.push(0x01);

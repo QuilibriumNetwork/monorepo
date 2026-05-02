@@ -1,14 +1,9 @@
 //! Thread-based worker manager with CPU core pinning.
 //!
-//! Replaces Go's process-based workers with core-pinned OS threads.
 //! Each worker thread runs its own single-threaded tokio runtime and
-//! communicates with the master via `tokio::sync::mpsc` channels.
-//!
-//! Key design differences from Go:
-//! - Threads instead of processes (no fork/exec overhead)
-//! - Channel IPC instead of gRPC (zero serialization overhead)
-//! - Core affinity via `core_affinity` crate
-//! - Per-thread tokio runtime (`new_current_thread`) for isolation
+//! communicates with the master via `tokio::sync::mpsc` channels. Core
+//! affinity is set via the `core_affinity` crate; `new_current_thread`
+//! gives each worker its own isolated runtime.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -50,6 +45,29 @@ pub enum WorkerToMaster {
         frame_number: u64,
         frame_data: Vec<u8>,
     },
+    /// Shard frame finalized — canonical FrameHeader bytes for the
+    /// master to wrap in a `MessageBundle{Shard: header}` and publish
+    /// on `GLOBAL_PROVER`.
+    ShardFrameFinalized {
+        core_id: u32,
+        filter: Vec<u8>,
+        header_canonical_bytes: Vec<u8>,
+    },
+    /// Worker produced a vote — to be published on the per-shard
+    /// consensus bitmask (`0x00 || filter`) so peers can collect it.
+    /// Self-loopback to own engine is handled at the worker thread.
+    VoteProduced {
+        core_id: u32,
+        filter: Vec<u8>,
+        vote_data: Vec<u8>,
+    },
+    /// Worker produced a timeout — to be published on the per-shard
+    /// consensus bitmask. Same self-loopback semantics as VoteProduced.
+    TimeoutProduced {
+        core_id: u32,
+        filter: Vec<u8>,
+        timeout_data: Vec<u8>,
+    },
     /// Periodic heartbeat from an active shard worker.
     ShardHeartbeat {
         core_id: u32,
@@ -68,8 +86,7 @@ struct WorkerState {
     /// auto-allocation; operators pin filters via external tooling.
     manually_managed: bool,
     /// Whether the worker's filter is fully active in the registry
-    /// (allocation Status=Active or Paused). Mirrors Go's
-    /// `WorkerInfo.Allocated` field.
+    /// (allocation Status=Active or Paused).
     allocated: bool,
     cancel: CancellationToken,
     tx: mpsc::Sender<MasterToWorker>,
@@ -236,20 +253,37 @@ impl ThreadWorkerManager {
                                                         bls_signer: (deps.bls_signer_factory)(),
                                                         reward_greedy: deps.reward_greedy,
                                                     };
-                                                    let (engine, _handle) = crate::app_engine::AppConsensusEngine::new(
+                                                    let (engine, app_handle) = crate::app_engine::AppConsensusEngine::new(
                                                         core_id,
                                                         filter_clone.clone(),
                                                         engine_deps,
                                                         event_tx,
                                                     );
 
-                                                    // Forward engine events to master
+                                                    // Forward engine events to master AND self-loopback
+                                                    // own proposals/votes/timeouts back to the engine's
+                                                    // input. BlossomSub silently drops self-published
+                                                    // messages, so without explicit loopback the
+                                                    // proposer's own vote never reaches its own
+                                                    // vote_aggregator and a 1-of-1 quorum (single-prover
+                                                    // case) can never close — consensus stalls in
+                                                    // rank-timeout loops indefinitely.
                                                     let master_tx_events = master_tx_clone.clone();
+                                                    let loopback_handle = app_handle.clone();
                                                     let _filter_for_events = filter_clone.clone();
                                                     tokio::spawn(async move {
                                                         while let Some(event) = event_rx.recv().await {
                                                             match event {
                                                                 crate::app_engine::AppEngineEvent::FrameProduced { filter, frame_number, frame_data } => {
+                                                                    // Self-loopback: feed our own proposal back to
+                                                                    // the engine's Frame input so the participant
+                                                                    // observes its own proposal in the consensus
+                                                                    // pipeline.
+                                                                    loopback_handle.send(
+                                                                        crate::app_engine::AppEngineMessage::Frame(
+                                                                            frame_data.clone(),
+                                                                        ),
+                                                                    );
                                                                     let _ = master_tx_events.send(
                                                                         WorkerToMaster::FrameProduced {
                                                                             core_id,
@@ -259,10 +293,51 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     ).await;
                                                                 }
+                                                                crate::app_engine::AppEngineEvent::VoteProduced { filter, vote_data } => {
+                                                                    // Self-loopback so own vote reaches own
+                                                                    // vote_aggregator (critical for single-prover
+                                                                    // 1-of-1 QC formation).
+                                                                    loopback_handle.send(
+                                                                        crate::app_engine::AppEngineMessage::Consensus(
+                                                                            vote_data.clone(),
+                                                                        ),
+                                                                    );
+                                                                    let _ = master_tx_events.send(
+                                                                        WorkerToMaster::VoteProduced {
+                                                                            core_id,
+                                                                            filter,
+                                                                            vote_data,
+                                                                        }
+                                                                    ).await;
+                                                                }
+                                                                crate::app_engine::AppEngineEvent::TimeoutProduced { filter, timeout_data } => {
+                                                                    loopback_handle.send(
+                                                                        crate::app_engine::AppEngineMessage::Consensus(
+                                                                            timeout_data.clone(),
+                                                                        ),
+                                                                    );
+                                                                    let _ = master_tx_events.send(
+                                                                        WorkerToMaster::TimeoutProduced {
+                                                                            core_id,
+                                                                            filter,
+                                                                            timeout_data,
+                                                                        }
+                                                                    ).await;
+                                                                }
+                                                                crate::app_engine::AppEngineEvent::ShardFrameFinalized { filter, header_canonical_bytes } => {
+                                                                    let _ = master_tx_events.send(
+                                                                        WorkerToMaster::ShardFrameFinalized {
+                                                                            core_id,
+                                                                            filter,
+                                                                            header_canonical_bytes,
+                                                                        }
+                                                                    ).await;
+                                                                }
                                                                 _ => {
-                                                                    // Other events (votes, timeouts, equivocations)
-                                                                    // are handled by the engine internally or
-                                                                    // forwarded as needed.
+                                                                    // Equivocation/Halted/AncestorSyncRequested/
+                                                                    // ParentSealed — informational; engine handles
+                                                                    // them internally or they require no master
+                                                                    // mediation in local mode.
                                                                     debug!(core_id, "engine event: {:?}", event);
                                                                 }
                                                             }

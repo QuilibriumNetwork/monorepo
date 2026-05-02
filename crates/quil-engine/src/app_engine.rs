@@ -87,6 +87,14 @@ pub enum AppEngineEvent {
         frame_number: u64,
         frame_data: Vec<u8>,
     },
+    /// Shard frame finalized — emit the canonical FrameHeader bytes so
+    /// the master can publish them on `GLOBAL_PROVER` (mirroring Go's
+    /// `submitShardFrameToMaster` → `publishProverMessage` path so app
+    /// shard work is credited toward rewards by global archives).
+    ShardFrameFinalized {
+        filter: Vec<u8>,
+        header_canonical_bytes: Vec<u8>,
+    },
     /// Engine produced a vote for a proposal.
     VoteProduced {
         filter: Vec<u8>,
@@ -221,7 +229,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             .as_millis() as i64;
 
         // Compute fee multiplier vote: base from sliding window +
-        // traffic adjustment. Matches Go's adjustFeeForTraffic().
+        // traffic adjustment.
         let previous_timestamp_ms = self.clock_store
             .get_latest_shard_clock_frame(&self.filter)
             .ok()
@@ -926,8 +934,8 @@ impl AppConsensusEngine {
     /// Handle a global frame message (for time sync).
     ///
     /// Extracts the global frame number and difficulty, then aligns
-    /// the shard frame number if behind. Mirrors Go's time-sync logic
-    /// where shard frame N is produced alongside global frame N+1.
+    /// the shard frame number if behind. Shard frame N is produced
+    /// alongside global frame N+1.
     fn handle_global_frame_message(&mut self, data: &[u8]) {
         if data.len() < 4 {
             return;
@@ -1037,6 +1045,69 @@ impl AppConsensusEngine {
                     "shard frame finalized"
                 );
                 self.shard_frame_number = frame_number;
+                // Load the finalized frame, build canonical FrameHeader
+                // bytes, and emit `ShardFrameFinalized` so the master can
+                // wrap them in a `MessageBundle{Shard: header}` and publish
+                // on `GLOBAL_PROVER`. Without this the archives never see
+                // our shard work and no rewards are credited.
+                match self
+                    .clock_store
+                    .get_shard_clock_frame(&self.filter, frame_number, false)
+                {
+                    Ok(frame) => {
+                        if let Some(h) = frame.header.as_ref() {
+                            let sig_bytes = h
+                                .public_key_signature_bls48581
+                                .as_ref()
+                                .map(|s| s.signature.clone())
+                                .unwrap_or_default();
+                            let canonical_header =
+                                quil_execution::global_intrinsic::frame_header::FrameHeader {
+                                    address: h.address.clone(),
+                                    frame_number: h.frame_number,
+                                    rank: h.rank,
+                                    timestamp: h.timestamp,
+                                    difficulty: h.difficulty,
+                                    output: h.output.clone(),
+                                    parent_selector: h.parent_selector.clone(),
+                                    requests_root: h.requests_root.clone(),
+                                    state_roots: h.state_roots.clone(),
+                                    prover: h.prover.clone(),
+                                    fee_multiplier_vote: h.fee_multiplier_vote as i64,
+                                    public_key_signature_bls48581: sig_bytes,
+                                };
+                            match canonical_header.to_canonical_bytes() {
+                                Ok(bytes) => {
+                                    let _ = self
+                                        .event_tx
+                                        .send(AppEngineEvent::ShardFrameFinalized {
+                                            filter: self.filter.clone(),
+                                            header_canonical_bytes: bytes,
+                                        })
+                                        .await;
+                                }
+                                Err(e) => warn!(
+                                    core_id = self.core_id,
+                                    frame = frame_number,
+                                    error = %e,
+                                    "failed to encode finalized FrameHeader",
+                                ),
+                            }
+                        } else {
+                            warn!(
+                                core_id = self.core_id,
+                                frame = frame_number,
+                                "finalized shard frame missing header — skipping coverage publish",
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
+                        core_id = self.core_id,
+                        frame = frame_number,
+                        error = %e,
+                        "failed to load finalized shard frame for coverage publish",
+                    ),
+                }
                 // Flush spillover for the next rank
                 self.flush_deferred_messages(rank + 1);
                 // Check for missing ancestors and request sync if needed
@@ -1403,7 +1474,7 @@ impl quil_consensus::event_handler::ConsensusStore<AppShardVote> for AppMemConse
 }
 
 // =====================================================================
-// Message validation — mirror Go's app/message_validation.go
+// Message validation
 // =====================================================================
 
 // Re-export from the canonical location in quil-types.

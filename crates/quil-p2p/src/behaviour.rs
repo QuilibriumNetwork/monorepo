@@ -93,7 +93,6 @@ pub struct BlossomSubBehaviour {
     /// Sequence number counter for published messages.
     seqno_counter: std::sync::atomic::AtomicU64,
     /// Peer blacklist — connections from/to these peers are denied.
-    /// Mirrors Go's connection gater.
     blacklisted_peers: HashSet<PeerId>,
     /// Peer scores for mesh management decisions.
     scorer: crate::scoring::PeerScorer,
@@ -115,10 +114,13 @@ pub struct BlossomSubBehaviour {
     composites: HashMap<Vec<u8>, CompositeMeshEntry>,
     /// Reverse index: slice bitmask -> list of composite bitmask keys managing it.
     slice_to_composite: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// Negotiated protocol ID. Mainnet uses `/blossomsub/2.1.0`;
+    /// other networks suffix `-network-N` (e.g. testnet → `-network-1`).
+    protocol: libp2p::StreamProtocol,
 }
 
 impl BlossomSubBehaviour {
-    pub fn new() -> Self {
+    pub fn new(network: u8) -> Self {
         Self {
             subscriptions: HashSet::new(),
             peer_subscriptions: HashMap::new(),
@@ -148,6 +150,7 @@ impl BlossomSubBehaviour {
             validators: HashMap::new(),
             composites: HashMap::new(),
             slice_to_composite: HashMap::new(),
+            protocol: crate::protocol::stream_protocol_for_network(network),
         }
     }
 
@@ -181,9 +184,9 @@ impl BlossomSubBehaviour {
             info!(bitmask = hex::encode(&bitmask), "subscribed to bitmask");
             self.rebuild_subscribe_rpc();
 
-            // Establish composite mesh state for multi-slice bitmasks. Mirrors
-            // Go's JoinComposite. Single-slice bitmasks fall through to the
-            // simple per-slice mesh maintenance in `heartbeat`.
+            // Establish composite mesh state for multi-slice bitmasks.
+            // Single-slice bitmasks fall through to the simple per-slice
+            // mesh maintenance in `heartbeat`.
             let slices = crate::bitmask::slice_bitmask(&bitmask);
             if slices.len() > 1 {
                 self.join_composite(bitmask.clone(), slices);
@@ -236,7 +239,7 @@ impl BlossomSubBehaviour {
         }
 
         // Build the protobuf message with signing fields.
-        // Go's BlossomSub with StrictSign requires: from, seqno, signature, key.
+        // BlossomSub StrictSign requires: from, seqno, signature, key.
         let seqno = self.seqno_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .to_be_bytes()
@@ -465,9 +468,8 @@ impl BlossomSubBehaviour {
                 // A GRAFT is addressed to a slice bitmask. Accept it if
                 // either (a) we are subscribed to that exact bitmask
                 // (single-slice case) or (b) the slice is composite-managed
-                // (multi-slice case — Go's bs.mesh[slice] exists because
-                // rebuildSliceMeshes populated it). This mirrors Go's
-                // `bs.mesh[string(bitmask)]` check.
+                // (multi-slice case — slice mesh exists because
+                // rebuild_slice_meshes populated it).
                 let is_subscribed = self.subscriptions.contains(&graft.bitmask);
                 let is_composite_slice =
                     self.slice_to_composite.contains_key(&graft.bitmask);
@@ -475,9 +477,8 @@ impl BlossomSubBehaviour {
                     continue;
                 }
 
-                // Always add to the simple slice mesh (matches Go's
-                // fall-through behaviour — the per-slice mesh map still
-                // exists and is used for forwarding on the wire).
+                // Always add to the simple slice mesh — the per-slice
+                // mesh map is used for forwarding on the wire.
                 self.mesh
                     .entry(graft.bitmask.clone())
                     .or_default()
@@ -486,7 +487,7 @@ impl BlossomSubBehaviour {
 
                 // If this slice is managed by one or more composites,
                 // classify the peer as same/broker based on its
-                // subscription set. Mirrors Go blossomsub.go:1052-1084.
+                // subscription set.
                 if let Some(comp_keys) =
                     self.slice_to_composite.get(&graft.bitmask).cloned()
                 {
@@ -515,7 +516,7 @@ impl BlossomSubBehaviour {
                 // mesh — brokers remain in every slice mesh so traffic can
                 // still bridge.  Only actually remove from the slice mesh
                 // when the peer is not managed by any composite (or has
-                // fully dropped out of them).  Mirrors Go blossomsub.go:1112-1144.
+                // fully dropped out of them).
                 let composite_managed =
                     self.slice_to_composite.contains_key(&prune.bitmask);
                 if composite_managed {
@@ -661,7 +662,6 @@ impl BlossomSubBehaviour {
     /// Establish composite mesh state for a multi-slice bitmask. Selects up
     /// to D peers, preferring peers subscribed to ALL slices (same), and
     /// filling any remainder with peers subscribed to SOME slices (broker).
-    /// Mirrors Go's JoinComposite.
     pub(crate) fn join_composite(
         &mut self,
         bitmask: Vec<u8>,
@@ -728,7 +728,6 @@ impl BlossomSubBehaviour {
 
     /// Tear down a composite mesh — remove state, clean up reverse index,
     /// and drop per-slice meshes that are no longer composite-managed.
-    /// Mirrors Go's LeaveComposite.
     pub(crate) fn leave_composite(&mut self, bitmask: &[u8]) {
         let comp = match self.composites.remove(bitmask) {
             Some(c) => c,
@@ -760,8 +759,8 @@ impl BlossomSubBehaviour {
     }
 
     /// Classify a peer as `Same` (subscribed to every slice of the composite)
-    /// or `Broker` (subscribed to at least one but not all). Mirrors Go's
-    /// classifyPeer — on missing data we fall back to Broker.
+    /// or `Broker` (subscribed to at least one but not all). On missing data
+    /// we fall back to Broker.
     fn classify_peer(&self, peer: &PeerId, composite_key: &[u8]) -> PeerClass {
         let comp = match self.composites.get(composite_key) {
             Some(c) => c,
@@ -779,10 +778,9 @@ impl BlossomSubBehaviour {
     }
 
     /// Rebuild per-slice mesh sets from composite.{same, broker} membership.
-    /// Mirrors Go's rebuildSliceMeshes: every composite peer (same + broker)
-    /// is present in every slice mesh, because brokers intentionally bridge
-    /// non-subscribed slices — messages carry the full bitmask and overlap
-    /// the broker's actual subscription.
+    /// Every composite peer (same + broker) is present in every slice mesh,
+    /// because brokers intentionally bridge non-subscribed slices — messages
+    /// carry the full bitmask and overlap the broker's actual subscription.
     fn rebuild_slice_meshes(&mut self, composite_key: &[u8]) {
         let comp = match self.composites.get(composite_key) {
             Some(c) => c,
@@ -1176,7 +1174,7 @@ impl BlossomSubBehaviour {
 
 impl Default for BlossomSubBehaviour {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
@@ -1196,7 +1194,7 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                 std::io::ErrorKind::PermissionDenied, "peer blacklisted"
             )));
         }
-        Ok(BlossomSubHandler::new())
+        Ok(BlossomSubHandler::new(self.protocol.clone()))
     }
 
     fn handle_established_outbound_connection(
@@ -1212,7 +1210,7 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                 std::io::ErrorKind::PermissionDenied, "peer blacklisted"
             )));
         }
-        Ok(BlossomSubHandler::new())
+        Ok(BlossomSubHandler::new(self.protocol.clone()))
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
@@ -1223,8 +1221,7 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                     .or_default()
                     .push(e.connection_id);
 
-                // Send subscriptions immediately as a "hello packet"
-                // (matches Go's getHelloPacket() behavior in comm.go)
+                // Send subscriptions immediately as a "hello packet".
                 if let Some(rpc_data) = &self.pending_subscribe_rpc {
                     self.events.push_back(ToSwarm::NotifyHandler {
                         peer_id: e.peer_id,
@@ -1329,7 +1326,7 @@ mod composite_tests {
     #[test]
     fn graft_of_peer_subscribed_to_all_slices_classified_as_same() {
         let (bitmask, slices) = two_slice_bitmask();
-        let mut bh = BlossomSubBehaviour::new();
+        let mut bh = BlossomSubBehaviour::new(0);
         // We must be subscribed before handle_rpc will consider the GRAFT.
         bh.subscriptions.insert(bitmask.clone());
         // Pre-register composite state for the bitmask.
@@ -1351,7 +1348,7 @@ mod composite_tests {
     #[test]
     fn prune_of_single_slice_demotes_same_to_broker_and_keeps_in_other_slices() {
         let (bitmask, slices) = two_slice_bitmask();
-        let mut bh = BlossomSubBehaviour::new();
+        let mut bh = BlossomSubBehaviour::new(0);
         bh.subscriptions.insert(bitmask.clone());
         bh.join_composite(bitmask.clone(), slices.clone());
 
@@ -1379,7 +1376,7 @@ mod composite_tests {
     #[test]
     fn graft_of_peer_subscribed_to_some_slices_classified_as_broker() {
         let (bitmask, slices) = two_slice_bitmask();
-        let mut bh = BlossomSubBehaviour::new();
+        let mut bh = BlossomSubBehaviour::new(0);
         bh.subscriptions.insert(bitmask.clone());
         bh.join_composite(bitmask.clone(), slices.clone());
 
@@ -1399,7 +1396,7 @@ mod composite_tests {
     #[test]
     fn graft_after_partial_prune_restores_same_when_fully_subscribed() {
         let (bitmask, slices) = two_slice_bitmask();
-        let mut bh = BlossomSubBehaviour::new();
+        let mut bh = BlossomSubBehaviour::new(0);
         bh.subscriptions.insert(bitmask.clone());
         bh.join_composite(bitmask.clone(), slices.clone());
 

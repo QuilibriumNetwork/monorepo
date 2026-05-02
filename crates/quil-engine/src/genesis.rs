@@ -1,8 +1,5 @@
 //! Genesis loading and initialization — parses the embedded mainnet genesis
 //! JSON, seeds the prover registry, and stores the initial frame + QC.
-//!
-//! Port of `node/consensus/global/genesis.go` (initializeGenesis, lines 94-512)
-//! and the prover seeding functions (lines 773-1133).
 
 use std::sync::Arc;
 
@@ -31,8 +28,7 @@ pub const MAINNET_GENESIS_FRAME_NUMBER: u64 = 244200;
 ///
 /// This is the output of `compat::GetAggregatedSeniority([beacon_peer_id])`
 /// for the beacon prover at genesis. The same seniority is applied to
-/// ALL genesis provers (beacon + archive peers), matching Go's
-/// `establishMainnetGenesisProvers` at `genesis.go:858`.
+/// ALL genesis provers (beacon + archive peers).
 ///
 /// Deterministic derivation from the embedded retro JSONs:
 ///   * First retro (`reward=157208`): `10*6*60*24*92 / (157208/157208)` = 7,948,800
@@ -43,10 +39,10 @@ pub const MAINNET_GENESIS_FRAME_NUMBER: u64 = 244200;
 ///
 /// `mainnet_244200_seniority.json` may additionally raise this via
 /// `max(retro_sum, mainnet_entry)` — the `seniority_compat` module
-/// handles both. The constant must be whatever Go would compute;
-/// `mainnet_beacon_seniority_matches_compat_table` asserts it at
-/// build time so any divergence fails loudly instead of silently
-/// producing an incompatible genesis prover tree commitment.
+/// handles both. The constant must match the canonical compat table;
+/// `mainnet_beacon_seniority_matches_compat_table` asserts it at build
+/// time so any divergence fails loudly instead of silently producing
+/// an incompatible genesis prover tree commitment.
 pub const MAINNET_BEACON_SENIORITY: u64 = 23_673_600;
 
 /// Parsed genesis data from JSON.
@@ -188,13 +184,10 @@ pub fn verify_genesis_frame(frame: &global::GlobalFrame) -> Result<bool> {
 }
 
 // =========================================================================
-// Full genesis initialization (port of initializeGenesis + helpers)
+// Full genesis initialization
 // =========================================================================
 
 /// Initialize the full genesis state for mainnet.
-///
-/// This is the Rust port of Go's `initializeGenesis()` at
-/// `node/consensus/global/genesis.go:94-512`. It:
 ///
 /// 1. Checks if the genesis frame already exists in `clock_store`. If yes,
 ///    returns it along with the latest QC.
@@ -322,7 +315,7 @@ pub fn initialize_genesis_state(
         header.global_commitments[i] = commitment_trees[i].commit(inclusion_prover);
     }
 
-    // 7. Set empty signature payload (matches Go: avoids panics on header readers)
+    // 7. Set empty signature payload — avoids panics on header readers.
     header.public_key_signature_bls48581 = Some(keys::Bls48581AggregateSignature {
         signature: Vec::new(),
         public_key: Some(keys::Bls48581g2PublicKey {
@@ -344,8 +337,6 @@ pub fn initialize_genesis_state(
 }
 
 /// Build the genesis QuorumCertificate for a genesis frame.
-///
-/// Port of the QC construction at genesis.go:465-478.
 fn make_genesis_qc(frame: &global::GlobalFrame) -> global::QuorumCertificate {
     let header = frame.header.as_ref().unwrap();
 
@@ -371,22 +362,20 @@ fn make_genesis_qc(frame: &global::GlobalFrame) -> global::QuorumCertificate {
 }
 
 // =========================================================================
-// Prover seeding (port of establishMainnetGenesisProvers + addGenesisProver)
+// Prover seeding
 // =========================================================================
 
-/// Seed genesis provers into the hypergraph.
-///
-/// Port of Go's `establishMainnetGenesisProvers` at genesis.go:773-866.
-/// Creates Prover + ProverAllocation vertices for the beacon prover and
-/// each archive peer, all with the same aggregated seniority.
+/// Seed genesis provers into the hypergraph. Creates Prover +
+/// ProverAllocation vertices for the beacon prover and each archive
+/// peer, all with the same aggregated seniority.
 fn establish_mainnet_genesis_provers(
     state: &HypergraphState,
     genesis_data: &GenesisData,
 ) -> Result<()> {
     let b64 = base64::engine::general_purpose::STANDARD;
 
-    // The Go code decodes the beacon Ed448 key -> peer ID -> seniority lookup.
-    // We hard-code the result as MAINNET_BEACON_SENIORITY.
+    // The aggregated-seniority lookup over the beacon Ed448 peer ID
+    // resolves to MAINNET_BEACON_SENIORITY.
     let seniority = MAINNET_BEACON_SENIORITY;
 
     debug!(
@@ -426,9 +415,7 @@ fn establish_mainnet_genesis_provers(
     Ok(())
 }
 
-/// Add a single genesis prover to the hypergraph state.
-///
-/// Port of Go's `addGenesisProver` at genesis.go:868-1133. Creates:
+/// Add a single genesis prover to the hypergraph state. Creates:
 ///
 /// - **Prover vertex**: PublicKey, Status=1 (Active), AvailableStorage=0,
 ///   Seniority, at `poseidon(pubkey)` within `GLOBAL_INTRINSIC_ADDRESS`.
@@ -454,7 +441,6 @@ fn add_genesis_prover(
     let prover_address = materialize::prover_address_from_pubkey(pubkey)?;
 
     // --- Build Prover vertex tree ---
-    // Port of genesis.go:892-960
     let mut prover_tree = quil_tries::VectorCommitmentTree::new();
     let prover_cls = "prover:Prover";
 
@@ -483,20 +469,20 @@ fn add_genesis_prover(
         &seniority.to_be_bytes(),
     )?;
 
-    // Note: Go does NOT set JoinFrameNumber or KickFrameNumber on the prover
-    // vertex at genesis. Only the allocation gets frame number fields.
+    // JoinFrameNumber and KickFrameNumber are intentionally not set on
+    // the prover vertex at genesis — only the allocation carries those.
 
     // Serialize and store prover vertex
     let prover_blob = prover_registry::vertex_tree_to_blob(&prover_tree);
     state.set(domain, &prover_address, &va_disc, frame_number, prover_blob)?;
 
     // --- Build ProverAllocation vertex tree ---
-    // Port of genesis.go:982-1082
     let alloc_cls = "allocation:ProverAllocation";
 
-    // Compute allocation address: poseidon("PROVER_ALLOCATION" || pubkey || nil)
-    // Go: poseidon.HashBytes(slices.Concat([]byte("PROVER_ALLOCATION"), pubkey, nil))
-    // The nil (empty filter) means the concat is just "PROVER_ALLOCATION" || pubkey
+    // Compute allocation address:
+    //   poseidon("PROVER_ALLOCATION" || pubkey || filter)
+    // For genesis the filter is empty, so the concat is just
+    // "PROVER_ALLOCATION" || pubkey.
     let alloc_address = materialize::allocation_address(pubkey, &[])?;
 
     let mut alloc_tree = quil_tries::VectorCommitmentTree::new();
@@ -510,11 +496,10 @@ fn add_genesis_prover(
     // Status = 1 (Active)
     write_field(&mut alloc_tree, alloc_cls, "Status", &[materialize::STATUS_ACTIVE])?;
 
-    // ConfirmationFilter = nil (empty, global shard allocation)
-    // Go sets nil here — we pass empty bytes. write_field handles empty values.
+    // ConfirmationFilter = nil (empty, global shard allocation).
     write_field(&mut alloc_tree, alloc_cls, "ConfirmationFilter", &[])?;
 
-    // JoinFrameNumber = 0 (Go: frameNumberBytes with BigEndian 0)
+    // JoinFrameNumber = 0
     write_field(&mut alloc_tree, alloc_cls, "JoinFrameNumber", &0u64.to_be_bytes())?;
 
     // JoinConfirmFrameNumber = 0
@@ -533,21 +518,13 @@ fn add_genesis_prover(
     state.set(domain, &alloc_address, &va_disc, frame_number, alloc_blob)?;
 
     // --- Build Hyperedge connecting prover to allocation ---
-    // Port of genesis.go:975-1130
     //
-    // Go creates a Hyperedge at (GLOBAL_INTRINSIC_ADDRESS, proverAddress),
-    // then adds the allocation atom to its extrinsic tree:
-    //   hyperedge := NewHyperedge(GLOBAL_INTRINSIC_ADDRESS, proverAddress)
-    //   allocationAtom := NewVertex(GLOBAL_INTRINSIC_ADDRESS, allocAddress,
-    //       allocTree.Commit(prover, false), allocTree.GetSize())
-    //   hyperedge.AddExtrinsic(allocationAtom)
+    // Hyperedge lives at (GLOBAL_INTRINSIC_ADDRESS, proverAddress); the
+    // allocation atom is added to its extrinsic tree.
     //
-    // The hyperedge extrinsic tree stores each atom at key = atom.GetID()
-    // (64 bytes: appAddr || dataAddr) with value = atom.ToBytes()
+    // The extrinsic tree stores each atom at key = atom ID
+    // (64 bytes: appAddr || dataAddr) with value = atom bytes
     // (0x00 || appAddr[32] || dataAddr[32] || commitment[64] || size[32] = 161 bytes).
-    //
-    // In the Rust CRDT, add_hyperedge takes a Location and raw data bytes.
-    // The data is the serialized extrinsic tree.
 
     // Build the extrinsic tree for the hyperedge.
     // Key = allocation atom ID (GLOBAL_INTRINSIC_ADDRESS || alloc_address)
@@ -597,16 +574,13 @@ fn add_genesis_prover(
 }
 
 // =========================================================================
-// Testnet / devnet genesis (port of createStubGenesis + establishTestnetGenesisProvers)
+// Testnet / devnet genesis
 // =========================================================================
 
 /// Default difficulty for testnet/devnet genesis when none is specified.
 const DEFAULT_TESTNET_DIFFICULTY: u32 = 10000;
 
 /// Initialize genesis state for a testnet or devnet network.
-///
-/// Port of Go's `createStubGenesis()` (genesis.go:514-614) and
-/// `establishTestnetGenesisProvers()` (genesis.go:616-736).
 ///
 /// Unlike the mainnet path, this creates a fresh genesis at frame 0 with:
 /// - Empty parent selector (32 zero bytes)
@@ -658,20 +632,19 @@ pub fn initialize_testnet_genesis_state(
         add_genesis_prover(&state, pubkey, 1000, 0)?;
     }
 
-    // Mirror Go's testnet branch (`genesis.go:265-446`): seed the
-    // QUIL_TOKEN domain with six placeholder vertices and write six
-    // app-shard records keyed by `(QUIL_TOKEN_ADDRESS, path=0..5)`.
-    // Without these the testnet has no app shards in `shards_store`,
-    // so a non-global prover joining the network has nothing to
-    // propose joining — `build_proposal_descriptors` only sees the
-    // global filter (which it explicitly filters out). This is the
-    // implicit shard data Go produces at testnet bootstrap.
+    // Seed the QUIL_TOKEN domain with six placeholder vertices and
+    // write six app-shard records keyed by
+    // `(QUIL_TOKEN_ADDRESS, path=0..5)`. Without these the testnet has
+    // no app shards in `shards_store`, so a non-global prover joining
+    // the network has nothing to propose joining —
+    // `build_proposal_descriptors` only sees the global filter (which
+    // it explicitly filters out).
     let quil_token_domain = quil_execution::domains::QUIL_TOKEN;
     let va_disc = hypergraph_state::vertex_adds_discriminator()?;
     for i in 0u8..6 {
         let mut address = [0u8; 32];
         address[0] = i;
-        // 64-byte zero blob matches Go's `make([]byte, 64)` payload.
+        // 64-byte zero blob is the placeholder payload.
         state.set(&quil_token_domain[..], &address, &va_disc, 0, vec![0u8; 64])?;
     }
 
@@ -686,11 +659,11 @@ pub fn initialize_testnet_genesis_state(
     // — they're the source of truth for "what shards exist", separate
     // from the prover registry's view of "who is allocated where".
     //
-    // `shard_key` mirrors Go's `L1 || L2` layout: a 3-byte bloom
-    // filter index (L1) followed by the 32-byte address (L2). The
-    // shards-store reader hardcodes a 35-byte shard_key length, so
-    // writing a bare 32-byte L2 here causes 3 bytes of the encoded
-    // prefix u32 to be folded into the shard_key on readback.
+    // `shard_key` layout: a 3-byte bloom filter index (L1) followed
+    // by the 32-byte address (L2). The shards-store reader hardcodes
+    // a 35-byte shard_key length, so writing a bare 32-byte L2 here
+    // causes 3 bytes of the encoded prefix u32 to be folded into the
+    // shard_key on readback.
     let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(
         &quil_token_domain[..],
         256,
@@ -809,7 +782,7 @@ pub fn initialize_testnet_genesis_state(
 /// - If `genesis_seed` is non-empty and `network != 99`: hex-decode the seed
 ///   and split into 585-byte BLS48-581 public keys.
 /// - Otherwise: use `local_bls_pubkey` as the single prover.
-fn resolve_testnet_prover_keys(
+pub fn resolve_testnet_prover_keys(
     network: u8,
     genesis_seed: &str,
     local_bls_pubkey: &[u8],
@@ -838,9 +811,7 @@ fn resolve_testnet_prover_keys(
 }
 
 /// Create ProverReward vertices in the QUIL token domain for each prover.
-///
-/// Port of the reward creation loop in Go's `establishTestnetGenesisProvers`
-/// (genesis.go:650-713). Each prover gets:
+/// Each prover gets:
 /// - A reward vertex at `poseidon(QUIL_TOKEN_ADDRESS || prover_address)`
 ///   within the QUIL_TOKEN domain
 /// - DelegateAddress set to the reward address itself
@@ -1158,14 +1129,13 @@ mod tests {
     }
 
     /// Deterministic verification of MAINNET_BEACON_SENIORITY against
-    /// the compat table that's now fully ported from Go. Computes the
-    /// beacon peer ID from the Ed448 key in mainnet_genesis.json and
-    /// runs it through `seniority_compat::get_aggregated_seniority` —
-    /// the same function Go's `establishMainnetGenesisProvers` calls.
+    /// the canonical compat table. Computes the beacon peer ID from
+    /// the Ed448 key in mainnet_genesis.json and runs it through
+    /// `seniority_compat::get_aggregated_seniority`.
     ///
     /// If this assertion ever fails, MAINNET_BEACON_SENIORITY was
     /// wrong and the genesis prover tree commitment would diverge
-    /// from Go's, making the Rust node unable to join mainnet.
+    /// from the canonical one, making the node unable to join mainnet.
     #[test]
     fn mainnet_beacon_seniority_matches_compat_table() {
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -1194,9 +1164,8 @@ mod tests {
             computed, MAINNET_BEACON_SENIORITY,
             "MAINNET_BEACON_SENIORITY ({}) does not match compat table result ({}) \
              for beacon peer {}. Either the constant is wrong or the compat \
-             table (crates/quil-execution/src/seniority_compat.rs) diverges \
-             from Go's `compat::GetAggregatedSeniority`. Fix one or the other \
-             — genesis frame commitment depends on this value.",
+             table (crates/quil-execution/src/seniority_compat.rs) is broken. \
+             Fix one or the other — genesis frame commitment depends on this value.",
             MAINNET_BEACON_SENIORITY,
             computed,
             peer_id_str

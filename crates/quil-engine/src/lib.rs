@@ -66,4 +66,33 @@ pub mod bitmasks {
     pub const GLOBAL_PEER_INFO: &[u8] = &[0x00, 0x00, 0x00, 0x00];
     /// Global alert channel (16 zero bytes).
     pub const GLOBAL_ALERT: &[u8] = &[0u8; 16];
+
+    /// Per-shard frame bitmask = the shard's address/filter itself.
+    pub fn shard_frame_bitmask(filter: &[u8]) -> Vec<u8> {
+        filter.to_vec()
+    }
+
+    /// Per-shard consensus bitmask = `0x00 || filter`.
+    pub fn shard_consensus_bitmask(filter: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(1 + filter.len());
+        v.push(0u8);
+        v.extend_from_slice(filter);
+        v
+    }
+
+    /// Per-shard prover bitmask = `0x00 0x00 0x00 || filter`.
+    pub fn shard_prover_bitmask(filter: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(3 + filter.len());
+        v.extend_from_slice(&[0u8, 0u8, 0u8]);
+        v.extend_from_slice(filter);
+        v
+    }
+
+    /// Per-shard dispatch bitmask = `0x00 0x00 || filter`.
+    pub fn shard_dispatch_bitmask(filter: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(2 + filter.len());
+        v.extend_from_slice(&[0u8, 0u8]);
+        v.extend_from_slice(filter);
+        v
+    }
 }

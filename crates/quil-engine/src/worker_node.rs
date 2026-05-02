@@ -184,20 +184,34 @@ impl WorkerOnlyNode {
                                 let Some(ev) = ev else { break; };
                                 use crate::app_engine::AppEngineEvent::*;
                                 match ev {
-                                    FrameProduced { frame_data, .. } => {
-                                        publish(crate::bitmasks::GLOBAL_FRAME.to_vec(), frame_data).await;
+                                    FrameProduced { filter, frame_data, .. } => {
+                                        // Publish on the per-shard frame bitmask
+                                        // so peers subscribed to the shard receive
+                                        // it; the GLOBAL_FRAME publish is kept for
+                                        // back-compat with older subscribers.
+                                        publish(crate::bitmasks::GLOBAL_FRAME.to_vec(), frame_data.clone()).await;
+                                        publish(crate::bitmasks::shard_frame_bitmask(&filter), frame_data).await;
                                     }
-                                    VoteProduced { vote_data, .. } => {
-                                        publish(crate::bitmasks::GLOBAL_CONSENSUS.to_vec(), vote_data).await;
+                                    VoteProduced { filter, vote_data, .. } => {
+                                        publish(crate::bitmasks::GLOBAL_CONSENSUS.to_vec(), vote_data.clone()).await;
+                                        publish(crate::bitmasks::shard_consensus_bitmask(&filter), vote_data).await;
                                     }
-                                    TimeoutProduced { timeout_data, .. } => {
-                                        publish(crate::bitmasks::GLOBAL_CONSENSUS.to_vec(), timeout_data).await;
+                                    TimeoutProduced { filter, timeout_data, .. } => {
+                                        publish(crate::bitmasks::GLOBAL_CONSENSUS.to_vec(), timeout_data.clone()).await;
+                                        publish(crate::bitmasks::shard_consensus_bitmask(&filter), timeout_data).await;
                                     }
                                     // Internal signals — no network publish.
                                     EquivocationDetected { .. }
                                     | Halted { .. }
                                     | AncestorSyncRequested { .. }
-                                    | ParentSealed { .. } => {}
+                                    | ParentSealed { .. }
+                                    | ShardFrameFinalized { .. } => {
+                                        // Proxy mode: master handles
+                                        // GLOBAL_PROVER publish via its
+                                        // own drain task; workers
+                                        // forwarding through PubSubProxy
+                                        // would double-publish.
+                                    }
                                 }
                             }
                         }

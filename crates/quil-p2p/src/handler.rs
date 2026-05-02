@@ -18,11 +18,6 @@ use tracing::debug;
 use crate::protocol;
 use crate::protocol::pb;
 
-/// Protocol ID for BlossomSub.
-/// v2.1.0 is what active network peers use. Bootstrap-only peers may
-/// only have v2.0.0, but they don't send BlossomSub messages anyway.
-const PROTOCOL: StreamProtocol = StreamProtocol::new("/blossomsub/2.1.0");
-
 /// Messages from the behaviour to the handler.
 #[derive(Debug, Clone)]
 pub struct HandlerIn {
@@ -41,6 +36,9 @@ pub enum HandlerOut {
 
 /// BlossomSub connection handler.
 pub struct BlossomSubHandler {
+    /// Negotiated protocol ID — network-aware (e.g. mainnet
+    /// `/blossomsub/2.1.0`, testnet `/blossomsub/2.1.0-network-1`).
+    protocol: StreamProtocol,
     /// Inbound substream (reading RPCs from peer).
     inbound: Option<InboundState>,
     /// Outbound substream (writing RPCs to peer).
@@ -71,8 +69,9 @@ enum OutboundState {
 }
 
 impl BlossomSubHandler {
-    pub fn new() -> Self {
+    pub fn new(protocol: StreamProtocol) -> Self {
         Self {
+            protocol,
             inbound: None,
             outbound: None,
             send_queue: VecDeque::new(),
@@ -84,8 +83,8 @@ impl BlossomSubHandler {
     }
 
     /// Create a handler with initial data to send (subscription RPC).
-    pub fn with_initial_data(initial_rpc: Vec<u8>) -> Self {
-        let mut h = Self::new();
+    pub fn with_initial_data(protocol: StreamProtocol, initial_rpc: Vec<u8>) -> Self {
+        let mut h = Self::new(protocol);
         if !initial_rpc.is_empty() {
             h.send_queue.push_back(initial_rpc);
         }
@@ -204,12 +203,6 @@ impl BlossomSubHandler {
     }
 }
 
-impl Default for BlossomSubHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ConnectionHandler for BlossomSubHandler {
     type FromBehaviour = HandlerIn;
     type ToBehaviour = HandlerOut;
@@ -219,7 +212,7 @@ impl ConnectionHandler for BlossomSubHandler {
     type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(ReadyUpgrade::new(PROTOCOL), ())
+        SubstreamProtocol::new(ReadyUpgrade::new(self.protocol.clone()), ())
     }
 
     fn connection_keep_alive(&self) -> bool {
@@ -290,7 +283,7 @@ impl ConnectionHandler for BlossomSubHandler {
             self.outbound_requested = true;
             debug!(queue_len = self.send_queue.len(), "requesting outbound BlossomSub stream");
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(ReadyUpgrade::new(PROTOCOL), ()),
+                protocol: SubstreamProtocol::new(ReadyUpgrade::new(self.protocol.clone()), ()),
             });
         }
 
