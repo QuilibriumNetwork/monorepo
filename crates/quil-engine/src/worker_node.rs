@@ -520,10 +520,18 @@ fn is_process_alive(_pid: u32) -> bool {
 // Helper: compute worker listen address from config
 // =====================================================================
 
-/// Compute the gRPC listen address for a worker from config.
+/// Compute the gRPC listen address for a worker from config. Always
+/// returns a parseable `host:port` socket address — never a libp2p
+/// multiaddr — so callers can `.parse::<SocketAddr>()` without
+/// preprocessing.
 ///
-/// Uses `data_worker_stream_multiaddrs[core_id - 1]` if available,
-/// otherwise computes from base: `base_port + core_id`.
+/// Resolution order:
+///   1. `data_worker_stream_multiaddrs[core_id - 1]` if set. Accepts
+///      either `host:port` directly (used as-is) or a libp2p multiaddr
+///      `/ip4/HOST/tcp/PORT` (extracted into `HOST:PORT`).
+///   2. Fallback `0.0.0.0:base_port + core_id`, with overflow saturated
+///      at `u16::MAX` so an out-of-range core id surfaces as a
+///      port-collision rather than a panic.
 pub fn worker_listen_addr(
     core_id: u32,
     _base_listen: &str,
@@ -531,11 +539,45 @@ pub fn worker_listen_addr(
     stream_multiaddrs: &[String],
 ) -> String {
     if let Some(addr) = stream_multiaddrs.get((core_id - 1) as usize) {
+        // Multiaddr form `/ip4/HOST/tcp/PORT` (or `/ip6/.../tcp/...`)
+        // → extract `HOST:PORT`. Anything that already looks like a
+        // socket address (contains a `:` and no leading `/`) is used
+        // verbatim.
+        if let Some(socket) = multiaddr_to_socket_addr(addr) {
+            return socket;
+        }
         return addr.clone();
     }
-    // Compute from base
-    let port = base_stream_port + core_id as u16;
+    // Compute from base; saturate on overflow so an oversized core id
+    // doesn't panic — the resulting port collision is easier to
+    // diagnose than a binary abort mid-startup.
+    let port = base_stream_port.saturating_add(core_id.min(u16::MAX as u32) as u16);
     format!("0.0.0.0:{}", port)
+}
+
+/// Pull a `host:port` socket address out of a libp2p multiaddr like
+/// `/ip4/10.0.0.1/tcp/32501` or `/ip6/::1/tcp/32501`. Returns `None`
+/// for shapes we don't understand; callers fall back to using the
+/// input verbatim.
+fn multiaddr_to_socket_addr(ma: &str) -> Option<String> {
+    if !ma.starts_with('/') {
+        return None;
+    }
+    let parts: Vec<&str> = ma.trim_start_matches('/').split('/').collect();
+    // Need at least: ipX, addr, tcp, port.
+    if parts.len() < 4 {
+        return None;
+    }
+    let host = match parts[0] {
+        "ip4" => parts[1].to_string(),
+        "ip6" => format!("[{}]", parts[1]),
+        _ => return None,
+    };
+    if parts[2] != "tcp" && parts[2] != "udp" {
+        return None;
+    }
+    let port = parts[3];
+    Some(format!("{}:{}", host, port))
 }
 
 /// Compute the master's gRPC endpoint from config.
@@ -568,18 +610,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_listen_addr_from_explicit_config() {
+    fn worker_listen_addr_from_explicit_multiaddr_extracts_socket() {
+        // Multiaddr inputs are flattened to `host:port` so the caller
+        // can `.parse::<SocketAddr>()` directly. Returning the raw
+        // multiaddr (the previous behaviour) crashed workers at
+        // startup with "invalid socket address syntax".
         let addrs = vec![
             "/ip4/10.0.0.1/tcp/32501".to_string(),
             "/ip4/10.0.0.2/tcp/32502".to_string(),
         ];
         assert_eq!(
             worker_listen_addr(1, "/ip4/0.0.0.0/tcp/%d", 32500, &addrs),
-            "/ip4/10.0.0.1/tcp/32501"
+            "10.0.0.1:32501"
         );
         assert_eq!(
             worker_listen_addr(2, "/ip4/0.0.0.0/tcp/%d", 32500, &addrs),
-            "/ip4/10.0.0.2/tcp/32502"
+            "10.0.0.2:32502"
+        );
+    }
+
+    #[test]
+    fn worker_listen_addr_passes_through_socket_form_unchanged() {
+        let addrs = vec!["10.0.0.1:32501".to_string()];
+        assert_eq!(
+            worker_listen_addr(1, "/ip4/0.0.0.0/tcp/%d", 32500, &addrs),
+            "10.0.0.1:32501"
+        );
+    }
+
+    #[test]
+    fn worker_listen_addr_handles_ipv6_multiaddr() {
+        let addrs = vec!["/ip6/::1/tcp/32501".to_string()];
+        assert_eq!(
+            worker_listen_addr(1, "/ip4/0.0.0.0/tcp/%d", 32500, &addrs),
+            "[::1]:32501"
         );
     }
 
@@ -594,5 +658,18 @@ mod tests {
             worker_listen_addr(3, "/ip4/0.0.0.0/tcp/%d", 32500, &addrs),
             "0.0.0.0:32503"
         );
+    }
+
+    #[test]
+    fn worker_listen_addr_high_core_id_does_not_panic() {
+        // High core ids (e.g. 168) used to combine with a high base
+        // port and overflow `u16`. Saturating is fine — the operator
+        // sees a port collision rather than a panicked worker.
+        let addrs: Vec<String> = vec![];
+        let result = worker_listen_addr(168, "/ip4/0.0.0.0/tcp/%d", 32500, &addrs);
+        assert_eq!(result, "0.0.0.0:32668");
+        // Saturate near the top of u16.
+        let result = worker_listen_addr(1000, "/ip4/0.0.0.0/tcp/%d", 65000, &addrs);
+        assert_eq!(result, "0.0.0.0:65535");
     }
 }
