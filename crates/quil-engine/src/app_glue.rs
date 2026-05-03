@@ -384,12 +384,25 @@ impl Finalizer for AppFinalizer {
 
 pub struct AppFollower {
     filter: Vec<u8>,
-    event_tx: mpsc::UnboundedSender<AppConsensusEvent>,
+    /// Internal consensus events (proposal/vote/timeout/etc).
+    consensus_event_tx: mpsc::UnboundedSender<AppConsensusEvent>,
+    /// Direct publisher for finalized-frame canonical bytes. Invoked
+    /// synchronously from `on_finalized_state` so the rewards path
+    /// doesn't depend on internal channel scheduling.
+    coverage_publish: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
 }
 
 impl AppFollower {
-    pub fn new(filter: Vec<u8>, event_tx: mpsc::UnboundedSender<AppConsensusEvent>) -> Self {
-        Self { filter, event_tx }
+    pub fn new(
+        filter: Vec<u8>,
+        consensus_event_tx: mpsc::UnboundedSender<AppConsensusEvent>,
+        coverage_publish: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    ) -> Self {
+        Self {
+            filter,
+            consensus_event_tx,
+            coverage_publish,
+        }
     }
 }
 
@@ -408,8 +421,48 @@ impl FollowerConsumer<AppShardState> for AppFollower {
             filter = hex::encode(&self.filter),
             frame = state.state.frame_number,
             rank = state.rank,
-            "shard state finalized (follower)"
+            "shard state finalized"
         );
+
+        // Build the canonical FrameHeader directly from the finalized
+        // state's fields and emit `ShardFrameFinalized` to the master.
+        // Avoids hopping through the consensus event loop, which keeps
+        // coverage publication unblocked during peak load.
+        let canonical_header = quil_execution::global_intrinsic::frame_header::FrameHeader {
+            address: state.state.filter.clone(),
+            frame_number: state.state.frame_number,
+            rank: state.rank,
+            timestamp: state.state.timestamp,
+            difficulty: state.state.difficulty,
+            output: state.state.output.clone(),
+            parent_selector: state.state.parent_selector.clone(),
+            requests_root: state.state.requests_root.clone(),
+            state_roots: state.state.state_roots.clone(),
+            prover: state.state.prover.clone(),
+            fee_multiplier_vote: state.state.fee_multiplier as i64,
+            public_key_signature_bls48581: state.state.signature.clone(),
+        };
+        match canonical_header.to_canonical_bytes() {
+            Ok(bytes) => {
+                if let Some(publisher) = self.coverage_publish.as_ref() {
+                    publisher(bytes);
+                }
+            }
+            Err(e) => warn!(
+                filter = hex::encode(&self.filter),
+                error = %e,
+                "failed to encode finalized FrameHeader for coverage publish"
+            ),
+        }
+
+        // Also feed the bookkeeping event into the consensus loop —
+        // a future caller might depend on the `Finalized` arm in
+        // `handle_consensus_event` (currently a no-op for publish).
+        let _ = self.consensus_event_tx.send(AppConsensusEvent::Finalized {
+            frame_number: state.state.frame_number,
+            rank: state.rank,
+            state_id: state.identifier.clone(),
+        });
     }
 
     fn on_double_propose_detected(
@@ -423,7 +476,7 @@ impl FollowerConsumer<AppShardState> for AppFollower {
             second_frame = second.state.frame_number,
             "SHARD DOUBLE PROPOSE DETECTED — equivocation"
         );
-        let _ = self.event_tx.send(AppConsensusEvent::DoublePropose {
+        let _ = self.consensus_event_tx.send(AppConsensusEvent::DoublePropose {
             first_frame: first.state.frame_number,
             second_frame: second.state.frame_number,
         });

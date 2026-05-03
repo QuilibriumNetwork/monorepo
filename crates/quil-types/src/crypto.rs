@@ -131,13 +131,24 @@ pub trait KeyManager: Send + Sync {
 
 /// VDF-based frame header prover.
 pub trait FrameProver: Send + Sync {
+    /// Build a new app-shard `FrameHeader` for `previous_frame_output`'s
+    /// successor. The VDF challenge is `sha3(address || frame_number ||
+    /// timestamp || difficulty || fee_multiplier_vote || parent ||
+    /// requests_root || state_roots... || prover)` where `parent =
+    /// poseidon(previous_frame_output[:516])`. Including timestamp +
+    /// fee_multiplier ensures distinct ranks within the same frame
+    /// produce distinct VDF outputs and therefore distinct identities.
     fn prove_frame_header(
         &self,
-        filter: &[u8],
-        frame_number: u64,
-        parent_selector: &[u8],
-        difficulty: u32,
+        previous_frame_output: &[u8],
+        address: &[u8],
+        requests_root: &[u8],
+        state_roots: &[Vec<u8>],
         prover: &[u8],
+        timestamp: i64,
+        difficulty: u32,
+        fee_multiplier_vote: u64,
+        frame_number: u64,
     ) -> Result<crate::proto::global::FrameHeader>;
 
     fn verify_frame_header(

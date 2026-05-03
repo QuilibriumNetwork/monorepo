@@ -171,6 +171,40 @@ impl ExecutionEngineManager {
         }
     }
 
+    /// Acquire address locks for a message by routing to the
+    /// appropriate engine. Used by app shard frame production to build
+    /// the per-message `tx_map` that feeds `requests_root`.
+    pub fn lock(
+        &self,
+        frame_number: u64,
+        address: &[u8],
+        message: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        let engine_name = self.select_engine(address)?;
+        let engines = self.engines.read().unwrap();
+        if let Some(engine) = engines.get(&engine_name) {
+            engine.lock(frame_number, address, message)
+        } else {
+            Err(QuilError::NotFound(format!(
+                "engine '{}' not found",
+                engine_name
+            )))
+        }
+    }
+
+    /// Release any address locks held by every registered engine.
+    /// Mirrors Go's `executionManager.Unlock()` post-loop call: at
+    /// frame production time we call this once after the per-message
+    /// `lock` loop completes so no engine holds stale locks across
+    /// frames.
+    pub fn unlock(&self) -> Result<()> {
+        let engines = self.engines.read().unwrap();
+        for engine in engines.values() {
+            engine.unlock()?;
+        }
+        Ok(())
+    }
+
     /// Get the cost of a message by routing to the appropriate engine.
     pub fn get_cost(&self, message: &[u8]) -> Result<BigInt> {
         // For global frames, all messages route to the global engine.

@@ -41,6 +41,12 @@ pub type OwnMultiaddrsGetter = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 /// Used by `GetRandomPeer` and `GetNetworkInfo`.
 pub type PeerListGetter = Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>;
 
+/// Async result type for proxy peer-management operations. Closures
+/// returning these must own a clone of the underlying P2P handle so
+/// they can `await` an oneshot ack from the swarm command loop.
+pub type AsyncResult<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>;
+
 /// Handle to the master's P2P stack. Only the operations the proxy
 /// truly needs are referenced here so that this crate doesn't leak
 /// libp2p internals.
@@ -51,6 +57,22 @@ pub struct P2pHandleShim {
     pub subscribe: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
     pub unsubscribe: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
     pub peer_count: Arc<dyn Fn() -> usize + Send + Sync>,
+    /// Read a peer's score (`peer_id_bytes` is libp2p PeerId in raw
+    /// byte form). Returns `0.0` if the peer is unknown / channel down.
+    pub get_peer_score: Arc<dyn Fn(Vec<u8>) -> AsyncResult<f64> + Send + Sync>,
+    /// Replace a peer's application score.
+    pub set_peer_score: Arc<dyn Fn(Vec<u8>, f64) + Send + Sync>,
+    /// Add `delta` to a peer's application score.
+    pub add_peer_score: Arc<dyn Fn(Vec<u8>, f64) + Send + Sync>,
+    /// Disconnect + redial a peer.
+    pub reconnect: Arc<dyn Fn(Vec<u8>) -> AsyncResult<()> + Send + Sync>,
+    /// Re-trigger Kademlia bootstrap.
+    pub bootstrap: Arc<dyn Fn() -> AsyncResult<()> + Send + Sync>,
+    /// Re-trigger Kademlia peer discovery.
+    pub discover_peers: Arc<dyn Fn() -> AsyncResult<()> + Send + Sync>,
+    /// Is this peer currently connected? Sync because libp2p exposes
+    /// connected status via swarm state we can mirror in a counter.
+    pub is_peer_connected: Arc<dyn Fn(Vec<u8>) -> bool + Send + Sync>,
 }
 
 /// PubSubProxy service implementation.
@@ -314,35 +336,51 @@ impl PubSubProxy for PubSubProxyServer {
         Ok(Response::new(pb::NetworkInfoResponse { network_info }))
     }
 
-    // ----------------- Peer scoring (stubbed) -----------------
+    // ----------------- Peer scoring -----------------
 
     async fn get_peer_score(
         &self,
-        _request: Request<pb::GetPeerScoreRequest>,
+        request: Request<pb::GetPeerScoreRequest>,
     ) -> Result<Response<pb::GetPeerScoreResponse>, Status> {
-        Ok(Response::new(pb::GetPeerScoreResponse { score: 0 }))
+        let req = request.into_inner();
+        let score = (self.p2p.get_peer_score)(req.peer_id)
+            .await
+            .map_err(|e| Status::internal(format!("get_peer_score: {}", e)))?;
+        // Proto stores score as int64 (Go libp2p's score is float, but
+        // serializes to int after rounding for transport).
+        Ok(Response::new(pb::GetPeerScoreResponse {
+            score: score.round() as i64,
+        }))
     }
 
     async fn set_peer_score(
         &self,
-        _request: Request<pb::SetPeerScoreRequest>,
+        request: Request<pb::SetPeerScoreRequest>,
     ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        (self.p2p.set_peer_score)(req.peer_id, req.score as f64);
         Ok(Response::new(()))
     }
 
     async fn add_peer_score(
         &self,
-        _request: Request<pb::AddPeerScoreRequest>,
+        request: Request<pb::AddPeerScoreRequest>,
     ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        (self.p2p.add_peer_score)(req.peer_id, req.score_delta as f64);
         Ok(Response::new(()))
     }
 
-    // ----------------- Connection management (stubbed) -----------------
+    // ----------------- Connection management -----------------
 
     async fn reconnect(
         &self,
-        _request: Request<pb::ReconnectRequest>,
+        request: Request<pb::ReconnectRequest>,
     ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        (self.p2p.reconnect)(req.peer_id)
+            .await
+            .map_err(|e| Status::internal(format!("reconnect: {}", e)))?;
         Ok(Response::new(()))
     }
 
@@ -350,6 +388,9 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         _request: Request<()>,
     ) -> Result<Response<()>, Status> {
+        (self.p2p.bootstrap)()
+            .await
+            .map_err(|e| Status::internal(format!("bootstrap: {}", e)))?;
         Ok(Response::new(()))
     }
 
@@ -357,16 +398,18 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         _request: Request<()>,
     ) -> Result<Response<()>, Status> {
+        (self.p2p.discover_peers)()
+            .await
+            .map_err(|e| Status::internal(format!("discover_peers: {}", e)))?;
         Ok(Response::new(()))
     }
 
     async fn is_peer_connected(
         &self,
-        _request: Request<pb::IsPeerConnectedRequest>,
+        request: Request<pb::IsPeerConnectedRequest>,
     ) -> Result<Response<pb::IsPeerConnectedResponse>, Status> {
-        // Without a per-peer lookup, report connected iff we have any
-        // peers. Workers use this mainly as a "can I reach anyone?" check.
-        let connected = (self.p2p.peer_count)() > 0;
+        let req = request.into_inner();
+        let connected = (self.p2p.is_peer_connected)(req.peer_id);
         Ok(Response::new(pb::IsPeerConnectedResponse { connected }))
     }
 

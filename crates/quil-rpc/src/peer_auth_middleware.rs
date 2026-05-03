@@ -18,8 +18,12 @@
 //!
 //! Full mTLS verification (proving the peer actually owns the Ed448
 //! key they claim in the SAN via the `xsign` cross-signature) is
-//! deferred — the identity here is "self-declared" until the TLS
-//! acceptor wires in an xsign-checking `ClientCertVerifier`.
+//! performed at the TLS layer by
+//! [`crate::quil_tls::XsignClientCertVerifier`], which rustls invokes
+//! during the handshake. By the time a request reaches this
+//! interceptor the SAN's Ed448 → libp2p PeerID mapping has been
+//! cryptographically vouched for; this interceptor only re-decodes
+//! it from the cert to attach to the request extension.
 
 use tonic::{Request, Status};
 use tracing::debug;

@@ -1036,8 +1036,18 @@ impl GlobalIntrinsic {
             // not invoke any FrameProver methods.
             struct StubFrameProver;
             impl quil_types::crypto::FrameProver for StubFrameProver {
-                fn prove_frame_header(&self, _: &[u8], _: u64, _: &[u8], _: u32, _: &[u8])
-                    -> Result<quil_types::proto::global::FrameHeader>
+                fn prove_frame_header(
+                    &self,
+                    _: &[u8],
+                    _: &[u8],
+                    _: &[u8],
+                    _: &[Vec<u8>],
+                    _: &[u8],
+                    _: i64,
+                    _: u32,
+                    _: u64,
+                    _: u64,
+                ) -> Result<quil_types::proto::global::FrameHeader>
                 { Err(QuilError::Internal("stub".into())) }
                 fn verify_frame_header(&self, _: &quil_types::proto::global::FrameHeader)
                     -> Result<Vec<u8>>

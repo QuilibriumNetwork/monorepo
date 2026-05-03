@@ -396,17 +396,6 @@ type manageModel struct {
 	joinPickerSelected map[uint32]bool
 	joinPickerFilters  [][]byte
 
-	// Free workers (no filter assigned), refreshed each data fetch.
-	freeWorkers []uint32
-
-	// Join worker picker state.
-	joinPickerActive   bool
-	joinPickerCursor   int
-	joinPickerOffset   int
-	joinPickerWorkers  []uint32
-	joinPickerSelected map[uint32]bool
-	joinPickerFilters  [][]byte
-
 	// Await state for multi-phase action tracking.
 	awaitAction         string
 	awaitFilters        [][]byte
@@ -2723,7 +2712,7 @@ func (m manageModel) renderAvailablePanel(width, height int) string {
 		if m.availSelected[s.filterKey] {
 			marker = "[x]"
 		}
-		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+fws+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
+		line = fmt.Sprintf("%"+strconv.Itoa(SELECT_WIDTH)+"s %"+strconv.Itoa(availColWidths[1])+"s %"+strconv.Itoa(PROVERS_WIDTH)+"d %"+strconv.Itoa(RING_WIDTH)+"d %"+strconv.Itoa(SIZE_WIDTH)+"s %"+strconv.Itoa(SHARDS_WIDTH)+"d %"+strconv.Itoa(REWARD_WIDTH)+"s",
 			marker,
 			centerTrunc(s.filterHex, fw),
 			s.activeProvers,

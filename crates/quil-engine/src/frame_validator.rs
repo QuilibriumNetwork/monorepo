@@ -641,10 +641,14 @@ mod tests {
         fn prove_frame_header(
             &self,
             _: &[u8],
-            _: u64,
             _: &[u8],
+            _: &[u8],
+            _: &[Vec<u8>],
+            _: &[u8],
+            _: i64,
             _: u32,
-            _: &[u8],
+            _: u64,
+            _: u64,
         ) -> Result<quil_types::proto::global::FrameHeader> {
             Err(QuilError::Internal("stub".into()))
         }

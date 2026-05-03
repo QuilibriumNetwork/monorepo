@@ -17,46 +17,79 @@ impl WesolowskiFrameProver {
 impl FrameProver for WesolowskiFrameProver {
     fn prove_frame_header(
         &self,
-        filter: &[u8],
-        frame_number: u64,
-        parent_selector: &[u8],
-        difficulty: u32,
+        previous_frame_output: &[u8],
+        address: &[u8],
+        requests_root: &[u8],
+        state_roots: &[Vec<u8>],
         prover: &[u8],
+        timestamp: i64,
+        difficulty: u32,
+        fee_multiplier_vote: u64,
+        frame_number: u64,
     ) -> Result<global::FrameHeader> {
-        // Build the challenge from filter || frame_number || parent_selector || prover
-        let mut challenge = Vec::new();
-        challenge.extend_from_slice(filter);
-        challenge.extend_from_slice(&frame_number.to_be_bytes());
-        challenge.extend_from_slice(parent_selector);
-        challenge.extend_from_slice(prover);
+        use sha3::{Digest, Sha3_256};
 
+        // parent = poseidon(previous_frame_output[:516]).
+        // The previous frame's output may be empty (e.g. genesis) — fall
+        // back to a 32-byte zero parent in that case to keep encoding
+        // stable.
+        let parent: Vec<u8> = if previous_frame_output.len() >= 516 {
+            crate::poseidon::hash_bytes_to_32(&previous_frame_output[..516])
+                .map_err(|e| QuilError::Crypto(format!("parent poseidon: {}", e)))?
+                .to_vec()
+        } else {
+            vec![0u8; 32]
+        };
+
+        let mut input = Vec::new();
+        input.extend_from_slice(address);
+        input.extend_from_slice(&frame_number.to_be_bytes());
+        input.extend_from_slice(&(timestamp as u64).to_be_bytes());
+        input.extend_from_slice(&difficulty.to_be_bytes());
+        input.extend_from_slice(&fee_multiplier_vote.to_be_bytes());
+        input.extend_from_slice(&parent);
+        input.extend_from_slice(requests_root);
+        for sr in state_roots {
+            input.extend_from_slice(sr);
+        }
+        input.extend_from_slice(prover);
+
+        let challenge: [u8; 32] = Sha3_256::digest(&input).into();
         let output = vdf::wesolowski_solve(self.int_size_bits, &challenge, difficulty);
 
         Ok(global::FrameHeader {
-            address: filter.to_vec(),
+            address: address.to_vec(),
             frame_number,
             rank: 0,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
+            timestamp,
             difficulty,
             output,
-            parent_selector: parent_selector.to_vec(),
-            requests_root: Vec::new(),
-            state_roots: Vec::new(),
+            parent_selector: parent,
+            requests_root: requests_root.to_vec(),
+            state_roots: state_roots.to_vec(),
             prover: prover.to_vec(),
-            fee_multiplier_vote: 0,
+            fee_multiplier_vote,
             public_key_signature_bls48581: None,
         })
     }
 
     fn verify_frame_header(&self, header: &global::FrameHeader) -> Result<Vec<u8>> {
-        let mut challenge = Vec::new();
-        challenge.extend_from_slice(&header.address);
-        challenge.extend_from_slice(&header.frame_number.to_be_bytes());
-        challenge.extend_from_slice(&header.parent_selector);
-        challenge.extend_from_slice(&header.prover);
+        use sha3::{Digest, Sha3_256};
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&header.address);
+        input.extend_from_slice(&header.frame_number.to_be_bytes());
+        input.extend_from_slice(&(header.timestamp as u64).to_be_bytes());
+        input.extend_from_slice(&header.difficulty.to_be_bytes());
+        input.extend_from_slice(&header.fee_multiplier_vote.to_be_bytes());
+        input.extend_from_slice(&header.parent_selector);
+        input.extend_from_slice(&header.requests_root);
+        for sr in &header.state_roots {
+            input.extend_from_slice(sr);
+        }
+        input.extend_from_slice(&header.prover);
+
+        let challenge: [u8; 32] = Sha3_256::digest(&input).into();
 
         if vdf::wesolowski_verify(
             self.int_size_bits,

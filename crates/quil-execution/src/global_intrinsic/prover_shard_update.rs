@@ -672,7 +672,18 @@ mod tests {
         // stub FrameProver — unused by materialize directly
         struct NoopFrameProver;
         impl FrameProver for NoopFrameProver {
-            fn prove_frame_header(&self, _: &[u8], _: u64, _: &[u8], _: u32, _: &[u8]) -> Result<quil_types::proto::global::FrameHeader> {
+            fn prove_frame_header(
+                &self,
+                _: &[u8],
+                _: &[u8],
+                _: &[u8],
+                _: &[Vec<u8>],
+                _: &[u8],
+                _: i64,
+                _: u32,
+                _: u64,
+                _: u64,
+            ) -> Result<quil_types::proto::global::FrameHeader> {
                 Err(QuilError::InvalidArgument("noop".into()))
             }
             fn verify_frame_header(&self, _: &quil_types::proto::global::FrameHeader) -> Result<Vec<u8>> { Ok(Vec::new()) }

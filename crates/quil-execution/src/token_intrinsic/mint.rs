@@ -3,25 +3,38 @@
 //!
 //! Ports `node/execution/intrinsics/token/token_intrinsic_mint_transaction.go`.
 //!
-//! What's implemented here:
-//! - Canonical bytes round-trip for all three types
-//! - `verify_authority` — verification for the `MintWithAuthority`
-//!   behavior (genesis + coinbase mints).
-//! - `materialize_authority` — writes each output as a coin vertex at
-//!   `domain || poseidon(verification_key)` plus a spent marker at
-//!   `domain || poseidon(proof)`.
-//! - `verify_pomw_input` + `verify_mint_transaction_pomw` — the full
-//!   13-check PoMW verify chain (spend check, traversal proof, BLS
-//!   signature, multiproof, hidden-Schnorr, etc.) + tx-level wrapper
-//!   that resolves reward-roots from ClockStore (QUIL) or hypergraph
-//!   shard commits (non-QUIL).
-//! - `materialize_pomw` — decrements the prover reward balance before
-//!   creating coin trees (the PoMW supply invariant).
+//! All five mint behaviors that the Go node ships are implemented here:
 //!
-//! Behaviors still stubbed (not used by QUIL mainnet):
-//! - MintWithProof / VerkleMultiproofWithSignature variant
-//! - MintWithSignature
-//! - MintWithPayment
+//! Verify (per-input + tx-level wrappers):
+//! - `verify_authority` — `MintWithAuthority` (genesis + coinbase),
+//!   the canonical 9-check chain (Go `verifyWithMintWithAuthority`).
+//! - `verify_with_signature` / `verify_mint_transaction_signature` —
+//!   `MintWithSignature`. Same 9 input checks as authority plus the
+//!   per-output `output[i].VerificationKey == input[i].proofs[0][32..88]`
+//!   constraint (Go `MintTransactionOutput.Verify` line 2061-2070).
+//! - `verify_verkle_multiproof_input` /
+//!   `verify_mint_transaction_verkle` — `MintWithProof +
+//!   VerkleMultiproofWithSignature` (Go
+//!   `verifyWithVerkleMultiproofSignature`).
+//! - `verify_with_payment_input` / `verify_mint_transaction_payment` —
+//!   `MintWithPayment` (free-mint and paid-mint flows; nested
+//!   PendingTransaction verification is delegated to a caller-supplied
+//!   closure).
+//! - `verify_pomw_input` + `verify_mint_transaction_pomw` — the
+//!   13-check `MintWithProof + ProofOfMeaningfulWork` chain.
+//!
+//! Materialize:
+//! - `materialize_authority` — shared output writer for Authority,
+//!   Signature, Verkle, and Payment variants. Writes each output as a
+//!   coin vertex plus a spent marker per input at `poseidon(proofs[0])`.
+//! - `materialize_pomw` — the PoMW supply-invariant variant; decrements
+//!   the prover reward balance for each input before delegating coin
+//!   creation to `materialize_authority`.
+//!
+//! Wire format: all variants share the same canonical-bytes triple
+//! (0x050D / 0x050E / 0x050F). The variant in force is selected by the
+//! token's `MintStrategy.MintBehavior` (+ `ProofBasis` for `MintWithProof`)
+//! at runtime via `TokenConfigResolver::mint_variant_for_domain`.
 
 use quil_types::crypto::{
     BulletproofProver, DecafConstructor, InclusionProver, KeyManager, KeyType,
@@ -512,13 +525,19 @@ pub fn verify_authority(
 // just in a slightly different order. `verify_authority` already
 // implements the full chain, so the signature variant delegates.
 
-/// Verify a `MintWithSignature` MintTransaction. Functionally
-/// identical to `verify_authority` — the per-input checks are the same
-/// (structural + balance + spend-image uniqueness + authority-signed
-/// proof + key-image consistency + hidden Schnorr). Callers should
-/// still perform the hypergraph spend-check (poseidon(proof) vertex
-/// not present) out-of-band; both variants rely on the same batch
-/// double-spend set inside the transaction.
+/// Verify a `MintWithSignature` MintTransaction.
+///
+/// At the per-input level this runs the same 9-check chain as
+/// `verify_authority`. In addition, per Go
+/// `MintTransactionOutput.Verify` (lines 2060-2071), every output must
+/// satisfy `output[i].RecipientOutput.VerificationKey ==
+/// input[i].proofs[0][32..88]` — the signature variant binds each
+/// minted coin's recipient VK to the key image carried in the proof.
+///
+/// Callers should still perform the hypergraph spend-check
+/// (`poseidon(proof)` vertex not present) out-of-band — see
+/// `verify_mint_transaction_signature` which runs both the input
+/// chain and the per-output spend check + per-input spend check.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_with_signature(
     tx: &MintTransaction,
@@ -530,7 +549,7 @@ pub fn verify_with_signature(
     decaf: &dyn DecafConstructor,
     key_manager: &dyn KeyManager,
 ) -> Result<bool> {
-    verify_authority(
+    let ok = verify_authority(
         tx,
         frame_number,
         authority_key_type,
@@ -539,7 +558,47 @@ pub fn verify_with_signature(
         bulletproof_prover,
         decaf,
         key_manager,
-    )
+    )?;
+    if !ok {
+        return Ok(false);
+    }
+
+    // Per-output: VerificationKey must equal proofs[0][32..88] from the
+    // matching input. Non-divisible tokens enforce input-count ==
+    // output-count via `validate_mint_transaction_structural`; for
+    // divisible tokens we still match by index where present.
+    if tx.inputs.len() != tx.outputs.len() {
+        // Signature mints carry a 1:1 binding between input proofs and
+        // output VKs. Go relies on the non-divisible structural check
+        // for this; for divisible tokens with mismatched counts there
+        // is no way to bind the recipient VK to a specific input, so
+        // reject defensively.
+        return Err(QuilError::InvalidArgument(format!(
+            "mint signature: inputs/outputs length mismatch ({} != {})",
+            tx.inputs.len(),
+            tx.outputs.len()
+        )));
+    }
+    for (idx, raw_out) in tx.outputs.iter().enumerate() {
+        let out = MintTransactionOutput::from_canonical_bytes(raw_out)?;
+        let recipient = super::transaction::RecipientBundle::from_canonical_bytes(
+            &out.recipient_output,
+        )?;
+        let input = MintTransactionInput::from_canonical_bytes(&tx.inputs[idx])?;
+        if input.proofs.is_empty() || input.proofs[0].len() < 88 {
+            return Err(QuilError::InvalidArgument(
+                "mint signature: input.proofs[0] too short for VK image".into(),
+            ));
+        }
+        if recipient.verification_key != input.proofs[0][32..88] {
+            return Err(QuilError::InvalidArgument(format!(
+                "mint signature: output[{}].VerificationKey does not match input[{}].proofs[0][32..88]",
+                idx, idx
+            )));
+        }
+    }
+
+    Ok(true)
 }
 
 // =====================================================================
@@ -902,6 +961,267 @@ fn bigint_bytes_equal(a: &[u8], b: &[u8]) -> bool {
         &s[i..]
     }
     strip(a) == strip(b)
+}
+
+// =====================================================================
+// Tx-level verify wrappers — Signature / Verkle / Payment
+// =====================================================================
+//
+// These mirror `verify_mint_transaction_pomw` in shape: they compose
+// the per-input verifier with the auxiliary cross-tx checks Go's
+// `MintTransaction.Verify` performs (per-output spend check, per-input
+// spend check, key-image batch double-spend, output frame-number /
+// recipient field validation, etc.) so the engine dispatch only has to
+// route by variant rather than re-implement those wrappers inline.
+
+/// Per-output spend check — for each output `o`, the vertex at
+/// `tx.domain || poseidon(o.RecipientOutput.VerificationKey)` must
+/// NOT exist in the hypergraph. Mirrors Go
+/// `MintTransaction.Verify` lines 2754-2767.
+fn verify_outputs_not_spent(
+    tx: &MintTransaction,
+    decoded_outputs: &[MintTransactionOutput],
+    hypergraph: &Arc<HypergraphCrdt>,
+) -> Result<()> {
+    if tx.domain.len() < 32 {
+        return Err(QuilError::InvalidArgument(format!(
+            "mint: tx.domain.len() = {} (< 32)", tx.domain.len()
+        )));
+    }
+    let mut app = [0u8; 32];
+    app.copy_from_slice(&tx.domain[..32]);
+    for (idx, raw_out) in decoded_outputs.iter().enumerate() {
+        let recipient = super::transaction::RecipientBundle::from_canonical_bytes(
+            &raw_out.recipient_output,
+        )?;
+        if recipient.verification_key.is_empty() {
+            return Err(QuilError::InvalidArgument(format!(
+                "mint: output[{}] missing verification key", idx
+            )));
+        }
+        let spend_addr = quil_crypto::poseidon::hash_bytes_to_32(
+            &recipient.verification_key,
+        )?;
+        let loc = quil_hypergraph::addressing::Location {
+            app_address: app,
+            data_address: spend_addr,
+        };
+        if hypergraph.lookup_vertex(&loc) {
+            return Err(QuilError::InvalidArgument(format!(
+                "mint: output[{}] verification key already used (vertex exists)",
+                idx
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Per-input spend check + per-batch key-image uniqueness — for each
+/// input the vertex at `tx.domain || poseidon(proofs[0])` must NOT
+/// exist, and key images (signature[56*4..56*5]) must be unique within
+/// the batch. Mirrors the loop at Go `MintTransaction.Verify`
+/// lines 2727-2745.
+fn verify_inputs_not_spent_and_unique(
+    tx: &MintTransaction,
+    decoded_inputs: &[MintTransactionInput],
+    hypergraph: &Arc<HypergraphCrdt>,
+) -> Result<()> {
+    let mut app = [0u8; 32];
+    app.copy_from_slice(&tx.domain[..32]);
+    let mut seen_key_images: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::new();
+    for (idx, input) in decoded_inputs.iter().enumerate() {
+        if input.proofs.is_empty() {
+            return Err(QuilError::InvalidArgument(format!(
+                "mint: input[{}] has no proofs", idx
+            )));
+        }
+        let spend_addr = quil_crypto::poseidon::hash_bytes_to_32(&input.proofs[0])?;
+        let loc = quil_hypergraph::addressing::Location {
+            app_address: app,
+            data_address: spend_addr,
+        };
+        if hypergraph.lookup_vertex(&loc) {
+            return Err(QuilError::InvalidArgument(format!(
+                "mint: input[{}] proof already spent (vertex exists)", idx
+            )));
+        }
+        if input.signature.len() < 56 * 5 {
+            return Err(QuilError::InvalidArgument(format!(
+                "mint: input[{}] signature shorter than 56*5 bytes", idx
+            )));
+        }
+        let key_image = input.signature[56 * 4..56 * 5].to_vec();
+        if !seen_key_images.insert(key_image) {
+            return Err(QuilError::InvalidArgument(format!(
+                "mint: input[{}] duplicate key image (double-spend)", idx
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build the output transcript shared by Signature, Verkle, and
+/// Payment per-input verifies. Wraps the verify-module helper so the
+/// tx-level wrappers don't have to redo recipient decoding.
+fn build_signature_style_transcript(
+    tx: &MintTransaction,
+    decoded_inputs: &[MintTransactionInput],
+    decoded_outputs: &[MintTransactionOutput],
+) -> Result<Vec<u8>> {
+    let recipients: Vec<super::transaction::RecipientBundle> = decoded_outputs
+        .iter()
+        .map(|o| super::transaction::RecipientBundle::from_canonical_bytes(&o.recipient_output))
+        .collect::<Result<Vec<_>>>()?;
+    let input_proofs: Vec<Vec<Vec<u8>>> =
+        decoded_inputs.iter().map(|i| i.proofs.clone()).collect();
+    super::verify::build_mint_transaction_transcript(
+        &tx.domain, &input_proofs, decoded_outputs, &recipients,
+    )
+}
+
+/// Decode all inputs + outputs from canonical bytes. Used by the
+/// tx-level verify wrappers.
+fn decode_inputs_outputs(
+    tx: &MintTransaction,
+) -> Result<(Vec<MintTransactionInput>, Vec<MintTransactionOutput>)> {
+    let mut inputs = Vec::with_capacity(tx.inputs.len());
+    for raw in &tx.inputs {
+        inputs.push(MintTransactionInput::from_canonical_bytes(raw)?);
+    }
+    let mut outputs = Vec::with_capacity(tx.outputs.len());
+    for raw in &tx.outputs {
+        outputs.push(MintTransactionOutput::from_canonical_bytes(raw)?);
+    }
+    Ok((inputs, outputs))
+}
+
+/// Top-level verify for a `MintWithSignature` MintTransaction. Mirrors
+/// the input + output loops in Go `MintTransaction.Verify`
+/// (`token_intrinsic_mint_transaction.go:2696`) for the Signature
+/// variant: structural validation, per-input + per-output spend checks
+/// against the hypergraph, key-image batch uniqueness, the per-input
+/// 9-check chain, and the per-output `VK == proofs[0][32..88]` binding.
+///
+/// Returns `Ok(())` if every check passes, `Err` on the first failure.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_mint_transaction_signature(
+    tx: &MintTransaction,
+    frame_number: u64,
+    authority_key_type: u32,
+    authority_public_key: &[u8],
+    token_behavior: u16,
+    hypergraph: &Arc<HypergraphCrdt>,
+    bulletproof_prover: &dyn BulletproofProver,
+    decaf: &dyn DecafConstructor,
+    key_manager: &dyn KeyManager,
+) -> Result<()> {
+    let (decoded_inputs, decoded_outputs) = decode_inputs_outputs(tx)?;
+
+    // Output spend check (per-output VK not already a vertex).
+    verify_outputs_not_spent(tx, &decoded_outputs, hypergraph)?;
+    // Input spend check + batch double-spend.
+    verify_inputs_not_spent_and_unique(tx, &decoded_inputs, hypergraph)?;
+
+    let ok = verify_with_signature(
+        tx,
+        frame_number,
+        authority_key_type,
+        authority_public_key,
+        token_behavior,
+        bulletproof_prover,
+        decaf,
+        key_manager,
+    )?;
+    if !ok {
+        return Err(QuilError::InvalidArgument(
+            "mint signature: verify chain rejected".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Top-level verify for `MintWithProof + VerkleMultiproofWithSignature`.
+/// Mirrors Go's `MintTransaction.Verify` for the verkle variant:
+/// resolves the verkle root, per-input + per-output spend checks,
+/// builds the output transcript, runs `verify_verkle_multiproof_input`
+/// per input, then runs the bulletproof range/sum check (callers can
+/// run that separately via `verify::verify_mint_transaction_crypto` if
+/// they prefer to share the call site with PoMW).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_mint_transaction_verkle(
+    tx: &MintTransaction,
+    verkle_root: &[u8],
+    token_behavior: u16,
+    hypergraph: &Arc<HypergraphCrdt>,
+    inclusion_prover: &(dyn InclusionProver + Sync),
+    bulletproof_prover: &dyn BulletproofProver,
+) -> Result<()> {
+    super::verify::validate_mint_transaction_structural(
+        tx.inputs.len(),
+        tx.outputs.len(),
+        &tx.fees,
+        token_behavior,
+    )?;
+
+    let (decoded_inputs, decoded_outputs) = decode_inputs_outputs(tx)?;
+    verify_outputs_not_spent(tx, &decoded_outputs, hypergraph)?;
+    verify_inputs_not_spent_and_unique(tx, &decoded_inputs, hypergraph)?;
+
+    let transcript = build_signature_style_transcript(tx, &decoded_inputs, &decoded_outputs)?;
+    for input in &decoded_inputs {
+        verify_verkle_multiproof_input(
+            input,
+            &transcript,
+            verkle_root,
+            inclusion_prover,
+            bulletproof_prover,
+        )?;
+    }
+    Ok(())
+}
+
+/// Top-level verify for `MintWithPayment`. The nested PendingTransaction
+/// verification is delegated to a caller-supplied closure — same pattern
+/// as `verify_with_payment_input` — so this module doesn't have to
+/// import the engine-level `verify_pending_transaction` machinery.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_mint_transaction_payment<F>(
+    tx: &MintTransaction,
+    config: &MintWithPaymentConfig<'_>,
+    token_behavior: u16,
+    hypergraph: &Arc<HypergraphCrdt>,
+    decaf: &dyn DecafConstructor,
+    bulletproof_prover: &dyn BulletproofProver,
+    mut verify_nested_pending: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8], usize, &[u8]) -> Result<NestedPendingResult>,
+{
+    super::verify::validate_mint_transaction_structural(
+        tx.inputs.len(),
+        tx.outputs.len(),
+        &tx.fees,
+        token_behavior,
+    )?;
+
+    let (decoded_inputs, decoded_outputs) = decode_inputs_outputs(tx)?;
+    verify_outputs_not_spent(tx, &decoded_outputs, hypergraph)?;
+    verify_inputs_not_spent_and_unique(tx, &decoded_inputs, hypergraph)?;
+
+    let transcript = build_signature_style_transcript(tx, &decoded_inputs, &decoded_outputs)?;
+    for (idx, input) in decoded_inputs.iter().enumerate() {
+        verify_with_payment_input(
+            input,
+            &transcript,
+            idx,
+            config,
+            decaf,
+            bulletproof_prover,
+            |nested, output_idx, payment_addr| verify_nested_pending(nested, output_idx, payment_addr),
+        )?;
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -2089,10 +2409,36 @@ mod tests {
     // --- Non-authority variant smoke tests ---
 
     #[test]
-    fn verify_with_signature_delegates_to_authority() {
-        // Signature variant is functionally identical to Authority —
-        // running it on a valid authority mint tx should succeed.
+    fn verify_with_signature_runs_authority_chain_plus_vk_binding() {
+        // Signature variant runs the full Authority 9-check chain
+        // PLUS the per-output `output[i].VK == input[i].proofs[0][32..88]`
+        // constraint. The default fixture has output VK = 0x22 but
+        // input proofs[0][32..88] = 0xAA (the key image), so verify
+        // must reject.
         let tx = build_valid_authority_mint();
+        let err = verify_with_signature(
+            &tx, 10, KeyType::Bls48581G1 as u32,
+            &vec![0xDDu8; 97],
+            super::super::constants::QUIL_BEHAVIOR,
+            &AcceptBulletproofs, &StubDecaf, &AcceptKm,
+        );
+        assert!(err.is_err(), "signature variant must enforce output VK binding");
+    }
+
+    #[test]
+    fn verify_with_signature_accepts_when_output_vk_matches_proof_image() {
+        // Build the same fixture but make output VK = key image (the
+        // signature variant's binding constraint).
+        let mut tx = build_valid_authority_mint();
+        let key_image = vec![0xAAu8; 56]; // matches signature[56*4..56*5] in the fixture
+        let mut out = MintTransactionOutput::from_canonical_bytes(&tx.outputs[0]).unwrap();
+        let mut recipient = super::super::transaction::RecipientBundle::from_canonical_bytes(
+            &out.recipient_output,
+        )
+        .unwrap();
+        recipient.verification_key = key_image.clone();
+        out.recipient_output = recipient.to_canonical_bytes().unwrap();
+        tx.outputs[0] = out.to_canonical_bytes().unwrap();
         let ok = verify_with_signature(
             &tx, 10, KeyType::Bls48581G1 as u32,
             &vec![0xDDu8; 97],

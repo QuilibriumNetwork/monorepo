@@ -154,17 +154,38 @@ impl FileKeyManager {
                     "loaded agreement key (signing not applicable)"
                 );
             }
-            // Extended key types not used by mainnet today — load into
-            // the raw store for Go parity so a future Go→Rust handoff
-            // doesn't drop them, but skip Signer-trait wiring.
-            KeyType::Secp256k1Sha256
-            | KeyType::Secp256k1Sha3
-            | KeyType::Ed25519 => {
-                tracing::debug!(
-                    key_id = %stored.id,
-                    key_type = ?key_type,
-                    "loaded non-prover key (Signer wiring deferred)"
-                );
+            KeyType::Ed25519 => {
+                let pk = if public_bytes.is_empty() {
+                    quil_crypto::Ed25519Signer::derive_public(&private_bytes)?
+                } else {
+                    public_bytes
+                };
+                let signer = quil_crypto::Ed25519Signer::from_bytes(&private_bytes, &pk)?;
+                let mut signers = self.signers.write().unwrap();
+                signers.insert(KeyType::Ed25519, Box::new(signer));
+                tracing::info!(key_id = %stored.id, "loaded Ed25519 key");
+            }
+            KeyType::Secp256k1Sha256 => {
+                let pk = if public_bytes.is_empty() {
+                    quil_crypto::Secp256k1Signer::derive_public(&private_bytes)?
+                } else {
+                    public_bytes
+                };
+                let signer = quil_crypto::Secp256k1Signer::sha256(&private_bytes, &pk)?;
+                let mut signers = self.signers.write().unwrap();
+                signers.insert(KeyType::Secp256k1Sha256, Box::new(signer));
+                tracing::info!(key_id = %stored.id, "loaded Secp256k1Sha256 key");
+            }
+            KeyType::Secp256k1Sha3 => {
+                let pk = if public_bytes.is_empty() {
+                    quil_crypto::Secp256k1Signer::derive_public(&private_bytes)?
+                } else {
+                    public_bytes
+                };
+                let signer = quil_crypto::Secp256k1Signer::sha3(&private_bytes, &pk)?;
+                let mut signers = self.signers.write().unwrap();
+                signers.insert(KeyType::Secp256k1Sha3, Box::new(signer));
+                tracing::info!(key_id = %stored.id, "loaded Secp256k1Sha3 key");
             }
         }
 
@@ -377,8 +398,24 @@ impl KeyManager for FileKeyManager {
                     KeyType::Bls48581G1 | KeyType::Bls48581G2 => {
                         self.bls_constructor.from_bytes(&private, &public)
                     }
-                    _ => Err(QuilError::Crypto(format!(
-                        "unsupported key type: {:?}",
+                    KeyType::Ed448 => {
+                        let s = quil_crypto::Ed448Signer::from_bytes(&private, &public)?;
+                        Ok(Box::new(s))
+                    }
+                    KeyType::Ed25519 => {
+                        let s = quil_crypto::Ed25519Signer::from_bytes(&private, &public)?;
+                        Ok(Box::new(s))
+                    }
+                    KeyType::Secp256k1Sha256 => {
+                        let s = quil_crypto::Secp256k1Signer::sha256(&private, &public)?;
+                        Ok(Box::new(s))
+                    }
+                    KeyType::Secp256k1Sha3 => {
+                        let s = quil_crypto::Secp256k1Signer::sha3(&private, &public)?;
+                        Ok(Box::new(s))
+                    }
+                    KeyType::X448 | KeyType::Decaf448 => Err(QuilError::Crypto(format!(
+                        "no signer for agreement-only key type {:?}",
                         key_type
                     ))),
                 }

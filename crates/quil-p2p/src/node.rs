@@ -494,6 +494,51 @@ impl P2PNode {
                                 debug!(%peer_id, "blacklisting peer");
                                 swarm.behaviour_mut().blossomsub.blacklist_peer(peer_id);
                             }
+                            Some(P2PCommand::GetPeerScore { peer, ack }) => {
+                                let s = swarm.behaviour().blossomsub.scorer.score(&peer);
+                                let _ = ack.send(s);
+                            }
+                            Some(P2PCommand::SetPeerScore { peer, score }) => {
+                                swarm.behaviour_mut()
+                                    .blossomsub.scorer
+                                    .set_application_score(peer, score);
+                            }
+                            Some(P2PCommand::AddPeerScore { peer, delta }) => {
+                                swarm.behaviour_mut()
+                                    .blossomsub.scorer
+                                    .add_application_score(peer, delta);
+                            }
+                            Some(P2PCommand::Reconnect { peer, ack }) => {
+                                let _ = swarm.disconnect_peer_id(peer);
+                                let res = match swarm.dial(peer) {
+                                    Ok(()) => Ok(()),
+                                    Err(e) => Err(format!("dial: {}", e)),
+                                };
+                                let _ = ack.send(res);
+                            }
+                            Some(P2PCommand::Bootstrap { ack }) => {
+                                let res = swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .bootstrap()
+                                    .map(|_| ())
+                                    .map_err(|e| format!("kad bootstrap: {}", e));
+                                let _ = ack.send(res);
+                            }
+                            Some(P2PCommand::DiscoverPeers { ack }) => {
+                                // Trigger a Kademlia random-walk-style query
+                                // by asking for closest peers to a fresh
+                                // random key. `get_closest_peers` accepts
+                                // any `Into<Vec<u8>>` key — we pass the
+                                // 32 random bytes directly.
+                                let mut key_bytes = [0u8; 32];
+                                rand::Rng::fill(&mut rand::thread_rng(), &mut key_bytes);
+                                swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .get_closest_peers(key_bytes.to_vec());
+                                let _ = ack.send(Ok(()));
+                            }
                             Some(P2PCommand::Shutdown) | None => {
                                 debug!("P2P swarm shutting down");
                                 break;
@@ -570,6 +615,81 @@ impl P2PHandle {
         let _ = self.cmd_tx.send(P2PCommand::BlacklistPeer(peer_id)).await;
     }
 
+    /// Read the current score for a peer (computed weighted score plus
+    /// any operator-applied application score). Returns `0.0` if the
+    /// command channel has shut down.
+    pub async fn get_peer_score(&self, peer: PeerId) -> f64 {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(P2PCommand::GetPeerScore { peer, ack: tx })
+            .await
+            .is_err()
+        {
+            return 0.0;
+        }
+        rx.await.unwrap_or(0.0)
+    }
+
+    /// Replace a peer's application score.
+    pub async fn set_peer_score(&self, peer: PeerId, score: f64) {
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::SetPeerScore { peer, score })
+            .await;
+    }
+
+    /// Add `delta` to a peer's application score.
+    pub async fn add_peer_score(&self, peer: PeerId, delta: f64) {
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::AddPeerScore { peer, delta })
+            .await;
+    }
+
+    /// Disconnect and immediately redial a peer.
+    pub async fn reconnect_peer(&self, peer: PeerId) -> quil_types::error::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(P2PCommand::Reconnect { peer, ack: tx })
+            .await
+            .map_err(|_| QuilError::P2p("p2p command channel closed".into()))?;
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(QuilError::P2p(format!("reconnect failed: {}", e))),
+            Err(_) => Err(QuilError::P2p("reconnect ack dropped".into())),
+        }
+    }
+
+    /// Re-trigger Kademlia bootstrap.
+    pub async fn bootstrap(&self) -> quil_types::error::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(P2PCommand::Bootstrap { ack: tx })
+            .await
+            .map_err(|_| QuilError::P2p("p2p command channel closed".into()))?;
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(QuilError::P2p(format!("bootstrap failed: {}", e))),
+            Err(_) => Err(QuilError::P2p("bootstrap ack dropped".into())),
+        }
+    }
+
+    /// Re-trigger Kademlia peer discovery via a random-walk closest-peers
+    /// query.
+    pub async fn discover_peers(&self) -> quil_types::error::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(P2PCommand::DiscoverPeers { ack: tx })
+            .await
+            .map_err(|_| QuilError::P2p("p2p command channel closed".into()))?;
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(QuilError::P2p(format!("discover_peers failed: {}", e))),
+            Err(_) => Err(QuilError::P2p("discover_peers ack dropped".into())),
+        }
+    }
+
     /// Number of currently connected peers.
     pub fn peer_count(&self) -> usize {
         self.peer_count.load(std::sync::atomic::Ordering::Relaxed)
@@ -631,6 +751,28 @@ enum P2PCommand {
         ack: Option<oneshot::Sender<std::result::Result<(), String>>>,
     },
     BlacklistPeer(PeerId),
+    /// Read a peer's current score (computed + application override).
+    GetPeerScore {
+        peer: PeerId,
+        ack: oneshot::Sender<f64>,
+    },
+    /// Replace a peer's application score override.
+    SetPeerScore { peer: PeerId, score: f64 },
+    /// Add `delta` to a peer's application score override.
+    AddPeerScore { peer: PeerId, delta: f64 },
+    /// Disconnect + redial a peer.
+    Reconnect {
+        peer: PeerId,
+        ack: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Re-trigger Kademlia bootstrap.
+    Bootstrap {
+        ack: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Re-trigger Kademlia peer discovery via random walk.
+    DiscoverPeers {
+        ack: oneshot::Sender<std::result::Result<(), String>>,
+    },
     Shutdown,
 }
 

@@ -21,8 +21,8 @@ use quil_consensus::event_handler::HotStuffEventHandler;
 use quil_consensus::event_loop::EventLoop;
 use quil_consensus::forest::Forks;
 use quil_consensus::models::{
-    AggregatedSignature, Identity, QuorumCertificate, State,
-    TimeoutCertificate, Unique,
+    AggregatedSignature, Identity, Proposal, QuorumCertificate, SignedProposal,
+    State, TimeoutCertificate, Unique,
 };
 use quil_consensus::pacemaker::{
     HotStuffPacemaker, StaticProposalDurationProvider, TimeoutConfig, TimeoutController,
@@ -134,7 +134,7 @@ pub enum AppEngineEvent {
 
 /// Handle for sending messages to an app engine. Cloneable — the
 /// master holds one, and it can be shared across message routing tasks.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AppEngineHandle {
     pub filter: Vec<u8>,
     msg_tx: mpsc::Sender<AppEngineMessage>,
@@ -164,6 +164,16 @@ struct AppLeaderProvider {
     local_public_key: Vec<u8>,
     current_difficulty: Arc<std::sync::atomic::AtomicU32>,
     reward_greedy: bool,
+    /// Per-shard hypergraph CRDT used to compute `state_roots` per
+    /// frame. Optional: when missing the leader emits the
+    /// 4 × 64-byte zero placeholder.
+    hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Execution engine used to derive per-message locked-address sets
+    /// for `requests_root`. Required for Go interop on non-empty frames.
+    execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    /// Inclusion prover for `requests_root` tree commit.
+    inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
+    app_address: Vec<u8>,
 }
 
 impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeaderProvider {
@@ -204,24 +214,17 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             "producing shard frame"
         );
 
-        // Get parent selector
-        let parent_selector = self.clock_store
+        // Pull previous frame's full output for `parent` derivation.
+        // Empty for the first frame (genesis); the prover handles that
+        // by emitting a 32-byte zero parent.
+        let previous_frame_output = self.clock_store
             .get_latest_shard_clock_frame(&self.filter)
             .ok()
-            .and_then(|f| f.header.as_ref().map(|h| h.parent_selector.clone()))
-            .unwrap_or_else(|| vec![0u8; 32]);
+            .and_then(|f| f.header.as_ref().map(|h| h.output.clone()))
+            .unwrap_or_default();
 
         let difficulty = self.current_difficulty
             .load(std::sync::atomic::Ordering::Relaxed);
-
-        // Compute VDF proof (blocking)
-        let header = self.frame_prover.prove_frame_header(
-            &self.filter,
-            frame_number,
-            &parent_selector,
-            difficulty,
-            &self.local_public_key,
-        )?;
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -243,6 +246,92 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             self.reward_greedy,
         );
 
+        // Per-frame shard state roots: 4 × 64-byte phase commitments
+        // (vertex_adds / vertex_removes / hyperedge_adds /
+        // hyperedge_removes) from the hypergraph CRDT for this shard.
+        // Mirrors Go's `hypergraph.CommitShard(frame_number, app_address)`
+        // path: a real (non-empty) commit returns the four roots; an
+        // empty/missing shard returns four 64-byte zero placeholders.
+        // After commit, the live add-tree root is published as a
+        // snapshot generation so sync clients can pin against the same
+        // state our header advertises (`hypergraph/snapshot_manager.go`).
+        let zero_roots = || vec![vec![0u8; 64]; 4];
+        let state_roots: Vec<Vec<u8>> = match self.hypergraph.as_ref() {
+            Some(hg) => {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(
+                    &self.filter[..self.filter.len().min(32)],
+                    256,
+                    3,
+                );
+                let mut l2 = [0u8; 32];
+                let copy_len = self.filter.len().min(32);
+                l2[..copy_len].copy_from_slice(&self.filter[..copy_len]);
+                let shard_key = quil_types::store::ShardKey { l1, l2 };
+                match hg.commit(frame_number) {
+                    Ok(by_shard) => {
+                        let four = by_shard.get(&shard_key).cloned().unwrap_or_else(zero_roots);
+                        // Pad up to 4 in case CommitShard returned fewer.
+                        let mut out = four;
+                        while out.len() < 4 {
+                            out.push(vec![0u8; 64]);
+                        }
+                        // Publish the shard's vertex-adds root as a
+                        // snapshot generation so sync clients pinning
+                        // this header can fetch matching CRDT data.
+                        if !out[0].is_empty() && out[0].iter().any(|b| *b != 0) {
+                            hg.publish_snapshot(out[0].clone(), frame_number);
+                        }
+                        out
+                    }
+                    Err(e) => {
+                        warn!(
+                            filter = hex::encode(&self.filter),
+                            frame = frame_number,
+                            error = %e,
+                            "hypergraph commit failed — emitting zero state_roots"
+                        );
+                        zero_roots()
+                    }
+                }
+            }
+            None => zero_roots(),
+        };
+
+        // Per-frame requests root over the messages included in this
+        // proposal. Mirrors Go's `calculateRequestsRoot` +
+        // `executionManager.Lock` flow: for each message,
+        //   hash    = sha3_256(payload)
+        //   address = self.app_address[..32]   (per Go message_processors.go:1318-1322)
+        //   payload = the raw MessageBundle bytes
+        // Then call `execution_engine.lock(frame, address, payload)`
+        // to get the locked-address vector and insert
+        // `(hash, concat(locked_addresses))` into a
+        // `VectorCommitmentTree`. The final root is
+        // `sha3_256(tree.commit())[..32] || serialize_non_lazy(tree)`.
+        // Empty messages → 64-byte zero buffer, matching Go.
+        let requests_root: Vec<u8> = compute_requests_root(
+            &messages,
+            &self.app_address,
+            frame_number,
+            self.execution_engine.as_deref(),
+            self.inclusion_prover.as_deref(),
+        )?;
+
+        // Compute VDF proof (blocking). Including timestamp + fee in
+        // the challenge ensures consecutive ranks within the same frame
+        // produce distinct outputs and therefore distinct identities.
+        let header = self.frame_prover.prove_frame_header(
+            &previous_frame_output,
+            &self.filter,
+            &requests_root,
+            &state_roots,
+            &self.local_public_key,
+            now_ms,
+            difficulty,
+            fee_multiplier_vote,
+            frame_number,
+        )?;
+
         let state = AppShardState::new(
             self.filter.clone(),
             frame_number,
@@ -252,8 +341,8 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             header.output.clone(),
             header.parent_selector.clone(),
             self.local_public_key.clone(),
-            Vec::new(),   // requests_root — filled from message aggregation
-            Vec::new(),   // state_roots — filled after CRDT commit
+            requests_root,
+            state_roots,
             Vec::new(),   // signature — filled during signing
             fee_multiplier_vote,
         );
@@ -285,6 +374,24 @@ pub struct AppEngineDeps {
     pub local_bls_pubkey: Vec<u8>,
     pub bls_signer: Box<dyn quil_types::crypto::Signer>,
     pub reward_greedy: bool,
+    /// Callback for publishing finalized canonical FrameHeader bytes
+    /// on `GLOBAL_PROVER` for reward attribution. See
+    /// `WorkerConsensusDeps::coverage_publish`.
+    pub coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// Hypergraph CRDT used to derive per-frame shard `state_roots`
+    /// (4 phase commitments) for the FrameHeader VDF challenge. When
+    /// absent the engine falls back to 4 × 64-byte zero placeholders —
+    /// fine for tests but breaks Go peers' VDF verification on real
+    /// shards with state.
+    pub hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Execution engine used to compute the per-message locked-address
+    /// vectors (`tx_map`) that feed `requests_root`. Required for Go
+    /// VDF interop on non-empty frames; without it `requests_root`
+    /// reduces to a tree over `(msg.hash, "")` pairs which doesn't
+    /// match Go's commitment.
+    pub execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    /// Inclusion prover used to commit the `requests_root` tree.
+    pub inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
 }
 
 /// App shard consensus engine. Owns a HotStuff event loop and
@@ -304,6 +411,9 @@ pub struct AppConsensusEngine {
     message_collector: Arc<MessageCollector>,
     fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager>,
     reward_greedy: bool,
+    hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
 
     // Consensus state
     current_difficulty: Arc<std::sync::atomic::AtomicU32>,
@@ -327,12 +437,23 @@ pub struct AppConsensusEngine {
     // Channels
     cancel: CancellationToken,
     msg_rx: Option<mpsc::Receiver<AppEngineMessage>>,
-    event_tx: mpsc::Sender<AppEngineEvent>,
+    event_tx: mpsc::UnboundedSender<AppEngineEvent>,
     consensus_event_rx: Option<mpsc::UnboundedReceiver<AppConsensusEvent>>,
     consensus_event_tx: mpsc::UnboundedSender<AppConsensusEvent>,
 
     // HotStuff event loop handle (set after consensus starts)
     consensus_handle: Option<AppEventLoopHandle>,
+
+    // Per-shard vote aggregator — set after consensus starts so peer
+    // votes received over the network can be tallied alongside the
+    // local self-loopback path.
+    vote_aggregator: Option<Arc<crate::app_vote_aggregation::AppVoteAggregation>>,
+
+    // Per-shard timeout aggregator. Populated alongside `vote_aggregator`
+    // in `start_consensus`; receives wire timeout states from
+    // `handle_timeout_state` so peer timeouts can form a TC.
+    timeout_aggregator:
+        Option<Arc<crate::app_timeout_aggregation::AppTimeoutAggregation>>,
 
     // Identity
     local_prover_address: Vec<u8>,
@@ -340,6 +461,10 @@ pub struct AppConsensusEngine {
 
     // Halt state
     halted: bool,
+
+    /// Callback that publishes finalized FrameHeader canonical bytes
+    /// on `GLOBAL_PROVER`. Optional so legacy/test paths still work.
+    coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
 }
 
 impl AppConsensusEngine {
@@ -348,7 +473,7 @@ impl AppConsensusEngine {
         core_id: u32,
         filter: Vec<u8>,
         deps: AppEngineDeps,
-        event_tx: mpsc::Sender<AppEngineEvent>,
+        event_tx: mpsc::UnboundedSender<AppEngineEvent>,
     ) -> (Self, AppEngineHandle) {
         let (msg_tx, msg_rx) = mpsc::channel(CONSENSUS_QUEUE_SIZE);
         let (consensus_event_tx, consensus_event_rx) = mpsc::unbounded_channel();
@@ -372,6 +497,9 @@ impl AppConsensusEngine {
             message_collector: deps.message_collector,
             fee_manager: deps.fee_manager,
             reward_greedy: deps.reward_greedy,
+            hypergraph: deps.hypergraph,
+            execution_engine: deps.execution_engine,
+            inclusion_prover: deps.inclusion_prover,
             current_difficulty: Arc::new(std::sync::atomic::AtomicU32::new(50000)),
             current_rank: 0,
             shard_frame_number: 0,
@@ -387,9 +515,12 @@ impl AppConsensusEngine {
             consensus_event_rx: Some(consensus_event_rx),
             consensus_event_tx,
             consensus_handle: None,
+            vote_aggregator: None,
+            timeout_aggregator: None,
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: false,
+            coverage_publish: deps.coverage_publish,
         };
         (engine, handle)
     }
@@ -435,8 +566,10 @@ impl AppConsensusEngine {
 
         // Start the HotStuff event loop for this shard
         match self.start_consensus(bls_signer) {
-            Ok(handle) => {
+            Ok((handle, vote_agg, timeout_agg)) => {
                 self.consensus_handle = Some(handle);
+                self.vote_aggregator = Some(vote_agg);
+                self.timeout_aggregator = Some(timeout_agg);
                 info!(
                     core_id = self.core_id,
                     filter = hex::encode(&self.filter),
@@ -539,7 +672,11 @@ impl AppConsensusEngine {
     fn start_consensus(
         &self,
         bls_signer: Box<dyn quil_types::crypto::Signer>,
-    ) -> Result<AppEventLoopHandle> {
+    ) -> Result<(
+        AppEventLoopHandle,
+        Arc<crate::app_vote_aggregation::AppVoteAggregation>,
+        Arc<crate::app_timeout_aggregation::AppTimeoutAggregation>,
+    )> {
         let filter = self.filter.clone();
 
         // Leader provider
@@ -554,6 +691,10 @@ impl AppConsensusEngine {
             local_public_key: self.local_bls_pubkey.clone(),
             current_difficulty: self.current_difficulty.clone(),
             reward_greedy: self.reward_greedy,
+            hypergraph: self.hypergraph.clone(),
+            execution_engine: self.execution_engine.clone(),
+            inclusion_prover: self.inclusion_prover.clone(),
+            app_address: self.app_address.clone(),
         });
 
         // Committee (from prover registry for this shard)
@@ -576,9 +717,12 @@ impl AppConsensusEngine {
         let timeout_domain = quil_crypto::poseidon::hash_bytes_to_32(b"APP_CONSENSUS_TIMEOUT")
             .unwrap_or_default()
             .to_vec();
-        // Hold onto the vote domain so we can later build an
-        // `AppVoteAggregation` without rederiving it.
+        // Hold onto the vote and timeout domains so we can later build
+        // the per-shard `AppVoteAggregation` and `AppTimeoutAggregation`
+        // without rederiving them.
         let vote_domain_for_agg = vote_domain.clone();
+        let vote_domain_for_to = vote_domain.clone();
+        let timeout_domain_for_to = timeout_domain.clone();
 
         let factory = Arc::new(AppShardVoteFactory { filter: filter.clone() });
         // Use `new_with_filter` so vote / timeout signing uses the
@@ -597,6 +741,7 @@ impl AppConsensusEngine {
                 filter.clone(),
             ));
         let voting_provider_for_agg = voting_provider.clone();
+        let voting_provider_for_to = voting_provider.clone();
         let signer: Arc<dyn quil_consensus::signer::Signer<AppShardState, AppShardVote>> =
             Arc::new(VotingProviderSigner::new(voting_provider));
 
@@ -670,7 +815,11 @@ impl AppConsensusEngine {
         let finalizer: Arc<dyn quil_consensus::forest::Finalizer> =
             Arc::new(AppFinalizer::new(filter.clone()));
         let follower: Arc<dyn quil_consensus::forest::FollowerConsumer<AppShardState>> =
-            Arc::new(AppFollower::new(filter.clone(), self.consensus_event_tx.clone()));
+            Arc::new(AppFollower::new(
+                filter.clone(),
+                self.consensus_event_tx.clone(),
+                self.coverage_publish.clone(),
+            ));
         let forks = Forks::<AppShardState>::new(trusted_root, finalizer, follower)?;
 
         // Event handler — keep a concrete `committee_for_agg` clone so
@@ -692,24 +841,40 @@ impl AppConsensusEngine {
 
         // Per-shard vote aggregator. Its
         // `OnQuorumCertificateCreated` callback feeds formed QCs
-        // back into the event loop via `handle`.
-        {
+        // back into the event loop via `handle`. We also keep an
+        // `Arc` clone on the engine so peer votes routed via
+        // `handle_vote` reach the same aggregator.
+        let (vote_aggregator_for_engine, timeout_aggregator_for_engine) = {
             use std::sync::OnceLock;
             let bls_ctor: Arc<dyn quil_types::crypto::BlsConstructor> =
                 Arc::new(quil_crypto::Bls48581KeyConstructor);
             let handle_cell: Arc<OnceLock<crate::app_types::AppEventLoopHandle>> =
                 Arc::new(OnceLock::new());
             let _ = handle_cell.set(handle.clone());
+            let committee_for_to = committee_for_agg.clone();
             let agg = Arc::new(crate::app_vote_aggregation::AppVoteAggregation::new(
                 filter.clone(),
                 committee_for_agg,
                 voting_provider_for_agg,
-                handle_cell,
-                bls_ctor,
+                handle_cell.clone(),
+                bls_ctor.clone(),
                 vote_domain_for_agg,
             ));
-            consumer_concrete.set_aggregator(agg);
-        }
+            consumer_concrete.set_aggregator(agg.clone());
+
+            let to_agg = Arc::new(
+                crate::app_timeout_aggregation::AppTimeoutAggregation::new(
+                    filter.clone(),
+                    committee_for_to,
+                    voting_provider_for_to,
+                    handle_cell,
+                    bls_ctor,
+                    vote_domain_for_to,
+                    timeout_domain_for_to,
+                ),
+            );
+            (agg, to_agg)
+        };
 
         let filter_for_loop = filter.clone();
         tokio::spawn(async move {
@@ -722,7 +887,11 @@ impl AppConsensusEngine {
             }
         });
 
-        Ok(handle)
+        Ok((
+            handle,
+            vote_aggregator_for_engine,
+            timeout_aggregator_for_engine,
+        ))
     }
 
     // ---------------------------------------------------------------
@@ -765,76 +934,233 @@ impl AppConsensusEngine {
     }
 
     fn handle_app_shard_proposal(&mut self, data: &[u8]) {
-        // Decode AppShardProposal from canonical bytes
-        match AppShardProposal::from_canonical_bytes(data) {
-            Ok(_proposal) => {
-                debug!(
-                    core_id = self.core_id,
-                    rank = self.current_rank,
-                    "received shard proposal"
-                );
-                // Cache the proposal by rank. The proposal's state
-                // contains frame data; cached for later retrieval by
-                // the event loop or pop_cached_proposal().
-                self.cache_proposal(self.current_rank, data.to_vec());
-
-                // Full event loop submission requires deserializing the
-                // proposal's inner `state` bytes into an AppShardFrame proto,
-                // then constructing a SignedProposal<AppShardState, AppShardVote>
-                // with the decoded state + parent QC + vote. Until the full
-                // AppShardFrame canonical-bytes codec is wired, proposals are
-                // cached by rank and retrieved via pop_cached_proposal().
-                debug!(
-                    core_id = self.core_id,
-                    rank = self.current_rank,
-                    "proposal cached; event loop submission deferred pending AppShardFrame deserialization"
-                );
-            }
+        // Decode AppShardProposal from canonical bytes (full reconstruction).
+        let proposal = match AppShardProposal::from_canonical_bytes(data) {
+            Ok(p) => p,
             Err(e) => {
                 debug!(
                     core_id = self.core_id,
                     error = %e,
                     "failed to decode shard proposal"
                 );
+                return;
             }
+        };
+
+        // Reject proposals for other shards. Master subscribes to the
+        // per-shard consensus bitmask which is filter-prefixed, so this
+        // is a defense-in-depth check.
+        if !proposal.header.address.is_empty() && proposal.header.address != self.app_address {
+            debug!(
+                core_id = self.core_id,
+                proposal_address = %hex::encode(&proposal.header.address),
+                local_address = %hex::encode(&self.app_address),
+                "dropping shard proposal addressed to a different shard"
+            );
+            return;
+        }
+
+        debug!(
+            core_id = self.core_id,
+            rank = proposal.header.rank,
+            frame = proposal.header.frame_number,
+            "received shard proposal"
+        );
+
+        // Always keep the raw bytes cached by rank — replay/resync paths
+        // re-emit them from `pop_cached_proposal()`.
+        self.cache_proposal(proposal.header.rank, data.to_vec());
+
+        // Build the proto FrameHeader needed by `AppShardState::from_header`.
+        let proto_header = quil_types::proto::global::FrameHeader {
+            address: proposal.header.address.clone(),
+            frame_number: proposal.header.frame_number,
+            rank: proposal.header.rank,
+            timestamp: proposal.header.timestamp,
+            difficulty: proposal.header.difficulty,
+            output: proposal.header.output.clone(),
+            parent_selector: proposal.header.parent_selector.clone(),
+            requests_root: proposal.header.requests_root.clone(),
+            state_roots: proposal.header.state_roots.clone(),
+            prover: proposal.header.prover.clone(),
+            fee_multiplier_vote: proposal.header.fee_multiplier_vote as u64,
+            // Re-wrapping the canonical-bytes BLS sig into the prost
+            // wrapper would require parsing it; the consensus pipeline
+            // doesn't read this field via the proto, so leave it None.
+            public_key_signature_bls48581: None,
+        };
+
+        let state = AppShardState::from_header(&proto_header, &self.filter);
+        // Override the signature with the raw bytes from the canonical
+        // sig blob — `from_header` reads via the prost wrapper which we
+        // intentionally left empty.
+        let state = {
+            let sig = proposal.header.public_key_signature_bls48581.clone();
+            AppShardState::new(
+                state.filter.clone(),
+                state.frame_number,
+                state.rank,
+                proposal.header.timestamp,
+                state.difficulty,
+                state.output.clone(),
+                state.parent_selector.clone(),
+                state.prover.clone(),
+                state.requests_root.clone(),
+                state.state_roots.clone(),
+                sig,
+                state.fee_multiplier,
+            )
+        };
+        let identity = state.identity().clone();
+
+        // Embed the parent QC and prior TC as trait objects so the
+        // forks tree's parent-state lookup matches what the safety
+        // rules expect.
+        let parent_qc = wire_qc_to_trait(&proposal.parent_qc, &self.filter);
+        let prior_tc: Option<Arc<dyn TimeoutCertificate>> = proposal
+            .prior_tc
+            .as_ref()
+            .map(|tc| wire_tc_to_trait(tc, &self.filter));
+
+        // Build the proposer identity from the wire vote's address —
+        // the leader's vote always rides along with the proposal, and
+        // its `address` field is the proposer's identity.
+        let proposer_id: Identity = if !proposal.vote.address.is_empty() {
+            proposal.vote.address.clone()
+        } else if !proposal.header.prover.is_empty() {
+            proposal.header.prover.clone()
+        } else {
+            Vec::new()
+        };
+
+        let typed_state = State {
+            rank: proposal.header.rank,
+            identifier: identity.clone(),
+            proposer_id: proposer_id.clone(),
+            parent_qc_identity: parent_qc.identity().clone(),
+            parent_qc_rank: parent_qc.rank(),
+            timestamp: proposal.header.timestamp as u64,
+            state,
+        };
+
+        // Build the leader's own vote ride-along from the wire payload.
+        let vote = AppShardVote::new(
+            identity,
+            proposal.header.rank,
+            proposal.vote.address.clone(),
+            proposal.vote.timestamp,
+            proposal.vote.signature.clone(),
+            Vec::new(),
+            self.filter.clone(),
+        );
+
+        let signed = SignedProposal {
+            proposal: Proposal {
+                state: typed_state,
+                parent_quorum_certificate: parent_qc,
+                previous_rank_timeout_certificate: prior_tc,
+            },
+            vote,
+        };
+
+        // Spawn a fire-and-forget task to push into the event loop —
+        // `submit_proposal` is async, the engine run loop is sync at
+        // this call site. Cloning the handle is cheap (Arc-backed).
+        if let Some(handle) = self.consensus_handle.as_ref() {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                if !handle.submit_proposal(signed).await {
+                    debug!("shard event loop rejected proposal (cancelled?)");
+                }
+            });
+        } else {
+            debug!(
+                core_id = self.core_id,
+                "shard proposal received but consensus handle not yet ready"
+            );
         }
     }
 
     fn handle_vote(&mut self, data: &[u8]) {
-        match consensus_wire::ProposalVote::from_canonical_bytes(data) {
-            Ok(vote) => {
-                debug!(
-                    core_id = self.core_id,
-                    rank = vote.rank,
-                    "received shard vote"
-                );
-                // Cache the vote for the consensus layer's vote collector.
-                // The HotStuff event handler's vote aggregator will
-                // accumulate votes and construct QCs automatically.
-                // Direct clock store persistence uses proto types and
-                // transactions — done during finalization.
-            }
+        let wire_vote = match consensus_wire::ProposalVote::from_canonical_bytes(data) {
+            Ok(v) => v,
             Err(e) => {
                 debug!(error = %e, "failed to decode vote");
+                return;
             }
+        };
+
+        // Drop votes for other shards.
+        if !wire_vote.filter.is_empty() && wire_vote.filter != self.filter {
+            debug!(
+                core_id = self.core_id,
+                vote_filter = %hex::encode(&wire_vote.filter),
+                local_filter = %hex::encode(&self.filter),
+                "dropping vote addressed to a different shard"
+            );
+            return;
+        }
+
+        debug!(
+            core_id = self.core_id,
+            rank = wire_vote.rank,
+            "received shard vote"
+        );
+
+        // Feed the vote into the per-shard aggregator. When the
+        // weighted threshold is met the aggregator's
+        // `OnQuorumCertificateCreated` callback pushes the resulting QC
+        // back into the event loop.
+        if let Some(agg) = self.vote_aggregator.as_ref() {
+            let typed_vote =
+                crate::app_vote_aggregation::wire_vote_to_app_shard_vote(
+                    wire_vote,
+                    self.filter.clone(),
+                );
+            agg.handle_vote(typed_vote);
+        } else {
+            debug!(
+                core_id = self.core_id,
+                "shard vote received but aggregator not yet wired"
+            );
         }
     }
 
     fn handle_timeout_state(&mut self, data: &[u8]) {
-        match consensus_wire::TimeoutState::from_canonical_bytes(data) {
-            Ok(ts) => {
-                debug!(
-                    core_id = self.core_id,
-                    tick = ts.timeout_tick,
-                    "received shard timeout state"
-                );
-                // Timeout states are processed by the HotStuff event
-                // handler's timeout aggregator. Clock store persistence
-                // happens via proto types during finalization.
-            }
+        let ts = match consensus_wire::TimeoutState::from_canonical_bytes(data) {
+            Ok(t) => t,
             Err(e) => {
                 debug!(error = %e, "failed to decode timeout state");
+                return;
             }
+        };
+
+        if !ts.vote.filter.is_empty() && ts.vote.filter != self.filter {
+            debug!(
+                core_id = self.core_id,
+                "dropping timeout addressed to a different shard"
+            );
+            return;
+        }
+
+        debug!(
+            core_id = self.core_id,
+            tick = ts.timeout_tick,
+            rank = ts.vote.rank,
+            "received shard timeout state"
+        );
+
+        if let Some(agg) = self.timeout_aggregator.as_ref() {
+            let typed = crate::app_timeout_aggregation::wire_timeout_to_app_typed(
+                ts,
+                self.filter.clone(),
+            );
+            agg.handle_timeout(typed);
+        } else {
+            debug!(
+                core_id = self.core_id,
+                "shard timeout received but aggregator not yet wired"
+            );
         }
     }
 
@@ -1083,8 +1409,7 @@ impl AppConsensusEngine {
                                         .send(AppEngineEvent::ShardFrameFinalized {
                                             filter: self.filter.clone(),
                                             header_canonical_bytes: bytes,
-                                        })
-                                        .await;
+                                        });
                                 }
                                 Err(e) => warn!(
                                     core_id = self.core_id,
@@ -1129,7 +1454,7 @@ impl AppConsensusEngine {
                     filter: self.filter.clone(),
                     first_frame,
                     second_frame,
-                }).await;
+                });
             }
 
             AppConsensusEvent::RankChange { old_rank, new_rank } => {
@@ -1147,14 +1472,14 @@ impl AppConsensusEngine {
                 let _ = self.event_tx.send(AppEngineEvent::VoteProduced {
                     filter: self.filter.clone(),
                     vote_data: data,
-                }).await;
+                });
             }
 
             AppConsensusEvent::OwnTimeout { data } => {
                 let _ = self.event_tx.send(AppEngineEvent::TimeoutProduced {
                     filter: self.filter.clone(),
                     timeout_data: data,
-                }).await;
+                });
             }
 
             AppConsensusEvent::OwnProposal { data, frame_number, rank } => {
@@ -1169,7 +1494,7 @@ impl AppConsensusEngine {
                     filter: self.filter.clone(),
                     frame_number,
                     frame_data: data,
-                }).await;
+                });
             }
         }
     }
@@ -1294,7 +1619,7 @@ impl AppConsensusEngine {
         let _ = self.event_tx.send(AppEngineEvent::ParentSealed {
             filter: self.filter.clone(),
             parent_rank,
-        }).await;
+        });
 
         // Prune old pending parents (same cutoff as proposals)
         let cutoff = self.current_rank.saturating_sub(10);
@@ -1364,7 +1689,7 @@ impl AppConsensusEngine {
         let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
             filter: self.filter.clone(),
             missing_frames: missing.to_vec(),
-        }).await;
+        });
     }
 
     // ---------------------------------------------------------------
@@ -1577,38 +1902,116 @@ impl AppConsensusEngine {
 // =====================================================================
 
 mod consensus_wire_ext {
+    use crate::consensus_wire::{
+        ProposalVote as WireVote, QuorumCertificate as WireQc,
+        TimeoutCertificate as WireTc,
+    };
+    use quil_execution::global_intrinsic::frame_header::FrameHeader as CanonicalFrameHeader;
     use quil_types::error::{QuilError, Result};
 
-    /// Minimal AppShardProposal decode — just enough to validate structure.
+    const TYPE_APP_SHARD_PROPOSAL: u32 = 0x0318;
+    const TYPE_APP_SHARD_FRAME: u32 = 0x030F;
+
+    /// Fully-decoded AppShardProposal — mirrors Go's
+    /// `protobufs.AppShardProposal.FromCanonicalBytes`.
     pub struct AppShardProposal {
-        pub _state: Vec<u8>,
-        pub _parent_qc: Vec<u8>,
-        pub _prior_tc: Vec<u8>,
-        pub _vote: Vec<u8>,
+        /// Decoded `AppShardFrame` header.
+        pub header: CanonicalFrameHeader,
+        /// Inner state bytes (the AppShardFrame canonical-bytes payload).
+        /// We keep them around in case downstream wants to re-cache the
+        /// raw proposal bytes by rank.
+        #[allow(dead_code)]
+        pub state_bytes: Vec<u8>,
+        pub parent_qc: WireQc,
+        pub prior_tc: Option<WireTc>,
+        pub vote: WireVote,
     }
 
-    const TYPE_APP_SHARD_PROPOSAL: u32 = 0x0318;
+    fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32> {
+        if *cursor + 4 > data.len() {
+            return Err(QuilError::Serialization("short u32 read".into()));
+        }
+        let v = u32::from_be_bytes(data[*cursor..*cursor + 4].try_into().unwrap());
+        *cursor += 4;
+        Ok(v)
+    }
+
+    fn read_lp(data: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
+        let len = read_u32(data, cursor)? as usize;
+        if *cursor + len > data.len() {
+            return Err(QuilError::Serialization(format!(
+                "short read of {} bytes at offset {} (have {})",
+                len,
+                *cursor,
+                data.len(),
+            )));
+        }
+        let v = data[*cursor..*cursor + len].to_vec();
+        *cursor += len;
+        Ok(v)
+    }
 
     impl AppShardProposal {
         pub fn from_canonical_bytes(data: &[u8]) -> Result<Self> {
             if data.len() < 4 {
                 return Err(QuilError::Serialization("too short".into()));
             }
-            let tp = u32::from_be_bytes(data[..4].try_into().unwrap());
+            let mut c = 0usize;
+            let tp = read_u32(data, &mut c)?;
             if tp != TYPE_APP_SHARD_PROPOSAL {
-                return Err(QuilError::Serialization(
-                    format!("expected AppShardProposal type 0x{:08x}, got 0x{:08x}",
-                            TYPE_APP_SHARD_PROPOSAL, tp),
-                ));
+                return Err(QuilError::Serialization(format!(
+                    "expected AppShardProposal type 0x{:08x}, got 0x{:08x}",
+                    TYPE_APP_SHARD_PROPOSAL, tp,
+                )));
             }
-            // The rest is opaque for structural validation
+
+            let state_bytes = read_lp(data, &mut c)?;
+            let header = decode_app_shard_frame_header(&state_bytes)?;
+
+            let parent_qc_bytes = read_lp(data, &mut c)?;
+            let parent_qc = WireQc::from_canonical_bytes(&parent_qc_bytes)?;
+
+            let prior_tc_bytes = read_lp(data, &mut c)?;
+            let prior_tc = if prior_tc_bytes.is_empty() {
+                None
+            } else {
+                Some(WireTc::from_canonical_bytes(&prior_tc_bytes)?)
+            };
+
+            let vote_bytes = read_lp(data, &mut c)?;
+            let vote = WireVote::from_canonical_bytes(&vote_bytes)?;
+
             Ok(Self {
-                _state: data[4..].to_vec(),
-                _parent_qc: Vec::new(),
-                _prior_tc: Vec::new(),
-                _vote: Vec::new(),
+                header,
+                state_bytes,
+                parent_qc,
+                prior_tc,
+                vote,
             })
         }
+    }
+
+    /// Decode the canonical-bytes payload of an `AppShardFrame` enough
+    /// to extract the embedded `FrameHeader`. Mirrors Go's
+    /// `protobufs.AppShardFrame.FromCanonicalBytes`. The request list is
+    /// skipped — proposals carry the full bundle on the wire but the
+    /// consensus pipeline only needs the header.
+    fn decode_app_shard_frame_header(data: &[u8]) -> Result<CanonicalFrameHeader> {
+        let mut c = 0usize;
+        let tp = read_u32(data, &mut c)?;
+        if tp != TYPE_APP_SHARD_FRAME {
+            return Err(QuilError::Serialization(format!(
+                "expected AppShardFrame type 0x{:08x}, got 0x{:08x}",
+                TYPE_APP_SHARD_FRAME, tp,
+            )));
+        }
+        let header_bytes = read_lp(data, &mut c)?;
+        if header_bytes.is_empty() {
+            return Err(QuilError::Serialization(
+                "AppShardFrame: empty header".into(),
+            ));
+        }
+        CanonicalFrameHeader::from_canonical_bytes(&header_bytes)
     }
 }
 
@@ -1686,6 +2089,88 @@ impl TimeoutCertificate for WireTC {
     fn equals(&self, other: &dyn TimeoutCertificate) -> bool {
         self.rank == other.rank()
     }
+}
+
+/// Build the per-frame `requests_root` for an app shard proposal.
+///
+/// Mirrors Go's `calculateRequestsRoot` (with the
+/// `addAppMessage` framing from `message_processors.go:1316-1322`):
+///
+/// - per message: `hash = sha3_256(payload)`, address = the shard's
+///   32-byte app address, payload = the raw MessageBundle bytes
+///   collected from the dispatch bitmask;
+/// - call `execution_engine.lock(frame, address, payload)` to get the
+///   locked-address vector;
+/// - insert `(hash, concat(locked_addresses))` into a
+///   `VectorCommitmentTree`;
+/// - prepend `sha3_256(tree.commit(prover))[..32]` to
+///   `serialize_non_lazy(tree)`.
+///
+/// Zero messages → 64-byte zero buffer, matching Go.
+///
+/// Returns `Err` if the engine has messages to commit but the
+/// execution engine or inclusion prover are missing — those are
+/// required for byte-for-byte parity with Go peers during VDF
+/// challenge verification.
+fn compute_requests_root(
+    messages: &[Vec<u8>],
+    app_address: &[u8],
+    frame_number: u64,
+    execution_engine: Option<&quil_execution::ExecutionEngineManager>,
+    inclusion_prover: Option<&dyn quil_types::crypto::InclusionProver>,
+) -> Result<Vec<u8>> {
+    use sha3::{Digest, Sha3_256};
+
+    if messages.is_empty() {
+        return Ok(vec![0u8; 64]);
+    }
+
+    let exec = execution_engine.ok_or_else(|| {
+        QuilError::Consensus(
+            "compute_requests_root: execution engine not wired but messages present".into(),
+        )
+    })?;
+    let prover = inclusion_prover.ok_or_else(|| {
+        QuilError::Consensus(
+            "compute_requests_root: inclusion prover not wired but messages present".into(),
+        )
+    })?;
+
+    // Snapshot the address bytes Go uses for the lock call — the shard's
+    // 32-byte app address (Poseidon hash of the filter).
+    let addr_for_lock: Vec<u8> = if app_address.len() >= 32 {
+        app_address[..32].to_vec()
+    } else {
+        app_address.to_vec()
+    };
+
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    for payload in messages {
+        let hash: [u8; 32] = Sha3_256::digest(payload).into();
+        let locked = exec
+            .lock(frame_number, &addr_for_lock, payload)
+            .unwrap_or_else(|_| Vec::new());
+        let value: Vec<u8> = locked.into_iter().flatten().collect();
+        tree.insert(&hash, &value, &[], &num_bigint::BigInt::from(0))?;
+    }
+    // Mirror Go's `executionManager.Unlock()` call after the per-message
+    // lock loop completes.
+    let _ = exec.unlock();
+
+    let commitment = tree.commit(prover);
+    if commitment.len() != 64 && commitment.len() != 74 {
+        return Err(QuilError::Consensus(format!(
+            "requests_root: invalid commitment length {}",
+            commitment.len()
+        )));
+    }
+    let commit_hash = Sha3_256::digest(&commitment);
+
+    let mut serialized = quil_tries::serialize_tree(tree.root.as_ref())?;
+    let mut out = Vec::with_capacity(32 + serialized.len());
+    out.extend_from_slice(&commit_hash);
+    out.append(&mut serialized);
+    Ok(out)
 }
 
 /// Convert a decoded wire-format `QuorumCertificate` into a trait object
@@ -1787,14 +2272,14 @@ mod tests {
     }
 
     #[test]
-    fn app_shard_proposal_type_check() {
-        let data = 0x0318u32.to_be_bytes();
-        assert!(AppShardProposal::from_canonical_bytes(&data).is_ok());
+    fn app_shard_proposal_wrong_type() {
+        let data = 0x0317u32.to_be_bytes();
+        assert!(AppShardProposal::from_canonical_bytes(&data).is_err());
     }
 
     #[test]
-    fn app_shard_proposal_wrong_type() {
-        let data = 0x0317u32.to_be_bytes();
+    fn app_shard_proposal_too_short() {
+        let data = [0u8; 2];
         assert!(AppShardProposal::from_canonical_bytes(&data).is_err());
     }
 }

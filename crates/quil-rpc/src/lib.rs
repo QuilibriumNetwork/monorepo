@@ -29,5 +29,5 @@ pub use prover_counts::{
 pub use node_service::{NodeRpcServer, SendHandler, TraversalProofGenerator, WorkerControl, WorkerEntry};
 pub use quil_tls::{
     build_quil_server_tls_config, build_quil_tls_cert, AcceptAnyClientCert, QuilTlsCert,
-    QuilTlsError,
+    QuilTlsError, XsignClientCertVerifier,
 };

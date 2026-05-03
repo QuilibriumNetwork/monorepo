@@ -589,6 +589,14 @@ async fn run_master_node(
     let peer_info_cache: Arc<std::sync::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >> = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    // filter → AppEngineHandle registry. Populated by the worker→master
+    // drain task on `WorkerToMaster::ShardActivated` and cleared on
+    // `ShardDeactivated`. Read by the inbound BlossomSub recv loop to
+    // route per-shard frame / consensus / prover / dispatch messages
+    // to the right engine in multi-prover deployments.
+    let shard_engines: Arc<std::sync::RwLock<
+        std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
+    >> = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     // SignerRegistry — populated from inbound KeyRegistry broadcasts
     // on GLOBAL_PEER_INFO. Consumed by consensus message verification
     // (BLS signatures from peers whose identity↔prover binding we've
@@ -957,6 +965,49 @@ async fn run_master_node(
         } else {
             // LOCAL MODE: core-pinned threads
             let thread_mgr = Arc::new(quil_engine::thread_worker::ThreadWorkerManager::new());
+            // Closure invoked by AppFollower from inside the consensus
+            // event loop: wraps a finalized FrameHeader (canonical
+            // bytes) in a `MessageBundle{Shard: header}` and publishes
+            // on `GLOBAL_PROVER`. Spawning the actual publish keeps the
+            // call non-blocking from the consensus side.
+            let coverage_p2p = p2p_handle.clone();
+            let coverage_publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> =
+                Arc::new(move |header_canonical_bytes: Vec<u8>| {
+                    let req = match quil_execution::message_envelope::CanonicalMessageRequest::wrap(
+                        header_canonical_bytes,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(error = %e, "coverage publish: bad FrameHeader bytes");
+                            return;
+                        }
+                    };
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    let bundle = quil_execution::message_envelope::CanonicalMessageBundle {
+                        requests: vec![Some(req)],
+                        timestamp,
+                    };
+                    match bundle.to_canonical_bytes() {
+                        Ok(bytes) => {
+                            let p2p = coverage_p2p.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = p2p
+                                    .publish(
+                                        quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
+                                        bytes,
+                                    )
+                                    .await
+                                {
+                                    warn!(error = %e, "coverage publish: GLOBAL_PROVER publish failed");
+                                }
+                            });
+                        }
+                        Err(e) => warn!(error = %e, "coverage publish: bundle encode failed"),
+                    }
+                });
             thread_mgr.set_consensus_deps(quil_engine::thread_worker::WorkerConsensusDeps {
                 prover_registry: prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
                 frame_prover: frame_prover.clone(),
@@ -970,6 +1021,10 @@ async fn run_master_node(
                         .expect("BLS signer should be available")
                 }),
                 reward_greedy,
+                coverage_publish: Some(coverage_publish),
+                hypergraph: Some(crdt.clone()),
+                execution_engine: Some(exec_manager.clone()),
+                inclusion_prover: Some(inclusion_prover.clone()),
             });
             info!(
                 worker_cores = thread_mgr.num_worker_cores(),
@@ -995,6 +1050,7 @@ async fn run_master_node(
             if let Some(mut master_rx) = thread_mgr.take_master_rx() {
                 let drain_p2p = p2p_handle.clone();
                 let drain_cancel = token.clone();
+                let drain_shard_engines = shard_engines.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -1002,6 +1058,13 @@ async fn run_master_node(
                             event = master_rx.recv() => {
                                 let Some(event) = event else { break; };
                                 use quil_engine::thread_worker::WorkerToMaster;
+                                // Each publish is dispatched as a fire-and-forget
+                                // task: the swarm's `publish().await` can block on
+                                // an internal mesh send, and back-pressure here
+                                // would propagate all the way to the per-shard
+                                // consensus event handler (engine→master event_tx
+                                // is bounded), stalling QC processing and
+                                // finalization.
                                 match event {
                                     WorkerToMaster::ShardFrameFinalized {
                                         core_id,
@@ -1028,16 +1091,20 @@ async fn run_master_node(
                                         };
                                         match bundle.to_canonical_bytes() {
                                             Ok(bytes) => {
-                                                if let Err(e) = drain_p2p
-                                                    .publish(
-                                                        quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
-                                                        bytes,
-                                                    )
-                                                    .await
-                                                {
-                                                    warn!(core_id, filter = %hex::encode(&filter),
-                                                        error = %e, "GLOBAL_PROVER publish failed");
-                                                }
+                                                let p2p = drain_p2p.clone();
+                                                let filter_owned = filter.clone();
+                                                tokio::spawn(async move {
+                                                    if let Err(e) = p2p
+                                                        .publish(
+                                                            quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
+                                                            bytes,
+                                                        )
+                                                        .await
+                                                    {
+                                                        warn!(core_id, filter = %hex::encode(&filter_owned),
+                                                            error = %e, "GLOBAL_PROVER publish failed");
+                                                    }
+                                                });
                                             }
                                             Err(e) => warn!(core_id, error = %e,
                                                 "shard finalize: bundle encode failed"),
@@ -1047,41 +1114,97 @@ async fn run_master_node(
                                         // Per-shard frame bitmask = filter itself.
                                         // Self-loopback is handled in thread_worker
                                         // before we get here.
-                                        if let Err(e) = drain_p2p
-                                            .publish(
-                                                quil_engine::bitmasks::shard_frame_bitmask(&filter),
-                                                frame_data,
-                                            )
-                                            .await
-                                        {
-                                            warn!(core_id, filter = %hex::encode(&filter),
-                                                error = %e, "shard frame publish failed");
-                                        }
+                                        let p2p = drain_p2p.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = p2p
+                                                .publish(
+                                                    quil_engine::bitmasks::shard_frame_bitmask(&filter),
+                                                    frame_data,
+                                                )
+                                                .await
+                                            {
+                                                warn!(core_id, filter = %hex::encode(&filter),
+                                                    error = %e, "shard frame publish failed");
+                                            }
+                                        });
                                     }
                                     WorkerToMaster::VoteProduced { core_id, filter, vote_data } => {
                                         // Per-shard consensus bitmask = `0x00 || filter`.
-                                        if let Err(e) = drain_p2p
-                                            .publish(
-                                                quil_engine::bitmasks::shard_consensus_bitmask(&filter),
-                                                vote_data,
-                                            )
-                                            .await
-                                        {
-                                            warn!(core_id, filter = %hex::encode(&filter),
-                                                error = %e, "shard vote publish failed");
-                                        }
+                                        let p2p = drain_p2p.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = p2p
+                                                .publish(
+                                                    quil_engine::bitmasks::shard_consensus_bitmask(&filter),
+                                                    vote_data,
+                                                )
+                                                .await
+                                            {
+                                                warn!(core_id, filter = %hex::encode(&filter),
+                                                    error = %e, "shard vote publish failed");
+                                            }
+                                        });
                                     }
                                     WorkerToMaster::TimeoutProduced { core_id, filter, timeout_data } => {
-                                        if let Err(e) = drain_p2p
-                                            .publish(
-                                                quil_engine::bitmasks::shard_consensus_bitmask(&filter),
-                                                timeout_data,
-                                            )
-                                            .await
+                                        let p2p = drain_p2p.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = p2p
+                                                .publish(
+                                                    quil_engine::bitmasks::shard_consensus_bitmask(&filter),
+                                                    timeout_data,
+                                                )
+                                                .await
+                                            {
+                                                warn!(core_id, filter = %hex::encode(&filter),
+                                                    error = %e, "shard timeout publish failed");
+                                            }
+                                        });
+                                    }
+                                    WorkerToMaster::ShardActivated { core_id, filter, handle } => {
+                                        // Register the engine handle so the
+                                        // recv loop can dispatch peer
+                                        // messages to it.
                                         {
-                                            warn!(core_id, filter = %hex::encode(&filter),
-                                                error = %e, "shard timeout publish failed");
+                                            let mut map = drain_shard_engines.write().unwrap();
+                                            map.insert(filter.clone(), handle);
                                         }
+                                        // Subscribe BlossomSub to the four
+                                        // per-shard bitmasks. Without these
+                                        // subscriptions our mesh peers won't
+                                        // forward shard traffic to us, so
+                                        // peer votes / proposals / frames /
+                                        // dispatches never reach the engine.
+                                        let p2p = drain_p2p.clone();
+                                        let filter_for_sub = filter.clone();
+                                        tokio::spawn(async move {
+                                            p2p.subscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
+                                            p2p.subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
+                                            p2p.subscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
+                                            p2p.subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
+                                        });
+                                        info!(
+                                            core_id,
+                                            filter = %hex::encode(&filter),
+                                            "registered shard engine + subscribed per-shard bitmasks"
+                                        );
+                                    }
+                                    WorkerToMaster::ShardDeactivated { core_id, filter } => {
+                                        {
+                                            let mut map = drain_shard_engines.write().unwrap();
+                                            map.remove(&filter);
+                                        }
+                                        let p2p = drain_p2p.clone();
+                                        let filter_for_sub = filter.clone();
+                                        tokio::spawn(async move {
+                                            p2p.unsubscribe(quil_engine::bitmasks::shard_frame_bitmask(&filter_for_sub)).await;
+                                            p2p.unsubscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
+                                            p2p.unsubscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
+                                            p2p.unsubscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
+                                        });
+                                        info!(
+                                            core_id,
+                                            filter = %hex::encode(&filter),
+                                            "deregistered shard engine + unsubscribed per-shard bitmasks"
+                                        );
                                     }
                                     WorkerToMaster::Ready { .. }
                                     | WorkerToMaster::ShardHeartbeat { .. } => {
@@ -2149,6 +2272,7 @@ async fn run_master_node(
     let va_for_recv = vote_aggregator.clone();
     let ta_for_recv = timeout_aggregator.clone();
     let pic_for_recv = peer_info_cache.clone();
+    let shard_engines_for_recv = shard_engines.clone();
     let sr_for_recv = signer_registry.clone();
     let lrf_for_recv = last_received_frame.clone();
     let lhf_for_recv = last_global_head_frame.clone();
@@ -2683,8 +2807,51 @@ async fn run_master_node(
                                 mc_for_recv.add_message(current_rank, received.data.clone());
                             }
                             _ => {
-                                // App shard or relay traffic — forwarded by mesh,
-                                // no local handler needed for non-subscribed bitmasks.
+                                // Per-shard routing: if the bitmask matches one
+                                // of the four bitmasks for an active shard
+                                // engine on this node, forward the bytes to
+                                // the engine via its `AppEngineHandle`. The
+                                // worker thread loops own messages back via
+                                // `app_handle.send(...)`, so we must not also
+                                // route self-published messages here — the
+                                // BlossomSub mesh already drops self-echoes.
+                                let bm = received.bitmask.as_slice();
+                                // Snapshot the active filter set under the read
+                                // lock, then drop it before doing per-handle
+                                // sends (the channel is bounded; sends are
+                                // try_send).
+                                let entries: Vec<(Vec<u8>, quil_engine::app_engine::AppEngineHandle)> = {
+                                    let map = shard_engines_for_recv.read().unwrap();
+                                    map.iter()
+                                        .map(|(f, h)| (f.clone(), h.clone()))
+                                        .collect()
+                                };
+                                let mut routed = false;
+                                for (filter, handle) in &entries {
+                                    if bm == quil_engine::bitmasks::shard_consensus_bitmask(filter).as_slice() {
+                                        handle.send(quil_engine::app_engine::AppEngineMessage::Consensus(received.data.clone()));
+                                        routed = true;
+                                        break;
+                                    }
+                                    if bm == quil_engine::bitmasks::shard_frame_bitmask(filter).as_slice() {
+                                        handle.send(quil_engine::app_engine::AppEngineMessage::Frame(received.data.clone()));
+                                        routed = true;
+                                        break;
+                                    }
+                                    if bm == quil_engine::bitmasks::shard_prover_bitmask(filter).as_slice() {
+                                        handle.send(quil_engine::app_engine::AppEngineMessage::Prover(received.data.clone()));
+                                        routed = true;
+                                        break;
+                                    }
+                                    if bm == quil_engine::bitmasks::shard_dispatch_bitmask(filter).as_slice() {
+                                        handle.send(quil_engine::app_engine::AppEngineMessage::Dispatch(received.data.clone()));
+                                        routed = true;
+                                        break;
+                                    }
+                                }
+                                if !routed {
+                                    // Non-shard traffic (e.g. mesh relay) — no local handler.
+                                }
                             }
                             }
                         }
@@ -3232,6 +3399,13 @@ async fn run_master_node(
                 let p2p_sub = p2p_for_proxy.clone();
                 let p2p_unsub = p2p_for_proxy.clone();
                 let p2p_count = p2p_for_proxy.clone();
+                let p2p_get_score = p2p_for_proxy.clone();
+                let p2p_set_score = p2p_for_proxy.clone();
+                let p2p_add_score = p2p_for_proxy.clone();
+                let p2p_reconnect = p2p_for_proxy.clone();
+                let p2p_bootstrap = p2p_for_proxy.clone();
+                let p2p_discover = p2p_for_proxy.clone();
+                let p2p_is_connected = p2p_for_proxy.clone();
                 let shim = quil_rpc::pubsub_proxy::P2pHandleShim {
                     peer_id_bytes,
                     publish: Arc::new(move |bitmask, data| {
@@ -3251,6 +3425,54 @@ async fn run_master_node(
                         tokio::spawn(async move { h.unsubscribe(bitmask).await; });
                     }),
                     peer_count: Arc::new(move || p2p_count.peer_count()),
+                    get_peer_score: Arc::new(move |pid_bytes| {
+                        let h = p2p_get_score.clone();
+                        Box::pin(async move {
+                            let peer = quil_p2p::PeerId::from_bytes(&pid_bytes)
+                                .map_err(|e| format!("invalid peer id: {}", e))?;
+                            Ok(h.get_peer_score(peer).await)
+                        })
+                    }),
+                    set_peer_score: Arc::new(move |pid_bytes, score| {
+                        let h = p2p_set_score.clone();
+                        if let Ok(peer) = quil_p2p::PeerId::from_bytes(&pid_bytes) {
+                            tokio::spawn(async move { h.set_peer_score(peer, score).await; });
+                        }
+                    }),
+                    add_peer_score: Arc::new(move |pid_bytes, delta| {
+                        let h = p2p_add_score.clone();
+                        if let Ok(peer) = quil_p2p::PeerId::from_bytes(&pid_bytes) {
+                            tokio::spawn(async move { h.add_peer_score(peer, delta).await; });
+                        }
+                    }),
+                    reconnect: Arc::new(move |pid_bytes| {
+                        let h = p2p_reconnect.clone();
+                        Box::pin(async move {
+                            let peer = quil_p2p::PeerId::from_bytes(&pid_bytes)
+                                .map_err(|e| format!("invalid peer id: {}", e))?;
+                            h.reconnect_peer(peer)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                    }),
+                    bootstrap: Arc::new(move || {
+                        let h = p2p_bootstrap.clone();
+                        Box::pin(async move {
+                            h.bootstrap().await.map_err(|e| e.to_string())
+                        })
+                    }),
+                    discover_peers: Arc::new(move || {
+                        let h = p2p_discover.clone();
+                        Box::pin(async move {
+                            h.discover_peers().await.map_err(|e| e.to_string())
+                        })
+                    }),
+                    // No per-peer connected lookup yet — approximate via
+                    // peer_count > 0 to satisfy "can we reach anyone?"
+                    // queries until a connected-peers enumerator lands.
+                    is_peer_connected: Arc::new(move |_pid| {
+                        p2p_is_connected.peer_count() > 0
+                    }),
                 };
                 let ma_getter_handle = p2p_handle.clone();
                 let own_multiaddrs: quil_rpc::pubsub_proxy::OwnMultiaddrsGetter =
@@ -3402,18 +3624,63 @@ async fn run_worker_node(
 ) -> anyhow::Result<()> {
     info!(core_id, parent_process, "worker node starting");
 
-    // Open the same database as the master (shared filesystem in
-    // cluster mode, or local for same-machine workers).
-    let db_path = if config.db.path.is_empty() {
-        std::path::PathBuf::from(".config/store")
-    } else {
-        std::path::PathBuf::from(&config.db.path)
+    // Resolve the per-worker store path. Worker processes can NOT
+    // share the master's RocksDB directory: RocksDB takes an exclusive
+    // file lock per `LOCK` file, so a second `open` against the same
+    // path fails. Each worker must own its own store.
+    //
+    // Resolution order, matching Go:
+    //   1. Explicit `db.worker_paths[idx]` (idx is `core_id - 1`, since
+    //      core 0 is the master).
+    //   2. `db.worker_path_prefix` with the literal token `%d`
+    //      substituted with the core id.
+    //   3. Fallback: `<db.path or .config/store>/worker-<core_id>`.
+    let db_path: std::path::PathBuf = {
+        let idx = core_id.saturating_sub(1) as usize;
+        if let Some(p) = config.db.worker_paths.get(idx).filter(|s| !s.is_empty()) {
+            std::path::PathBuf::from(p)
+        } else if !config.db.worker_path_prefix.is_empty() {
+            std::path::PathBuf::from(
+                config.db.worker_path_prefix.replace("%d", &core_id.to_string()),
+            )
+        } else {
+            let base = if config.db.path.is_empty() {
+                std::path::PathBuf::from(".config/store")
+            } else {
+                std::path::PathBuf::from(&config.db.path)
+            };
+            base.join(format!("worker-{}", core_id))
+        }
     };
+    info!(core_id, db_path = %db_path.display(), "worker store path resolved");
     std::fs::create_dir_all(&db_path)?;
     let db = quil_store::RocksDb::open(&db_path)?;
     let db_arc = Arc::new(db);
     let clock_store: Arc<dyn quil_types::store::ClockStore> =
         Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
+    let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
+
+    // Crypto + CRDT + execution engines so this worker can produce
+    // app shard frame headers byte-for-byte identical to Go's. Each
+    // worker process owns its own RocksDB store (per `worker_path_prefix`)
+    // and therefore its own crdt + execution manager — exactly what Go
+    // does for cluster-mode workers.
+    let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
+        Arc::new(quil_crypto::KzgInclusionProver);
+    let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =
+        Arc::new(quil_crypto::Bls48581KeyConstructor);
+    let key_manager: Arc<dyn quil_types::crypto::KeyManager> =
+        Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+        hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+        inclusion_prover.clone(),
+    ));
+    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new_with_crypto(
+        inclusion_prover.clone(),
+        key_manager.clone(),
+        crdt.clone(),
+        true,
+    ));
 
     // Key management — same keys as master
     let bls_ctor = quil_crypto::Bls48581KeyConstructor;
@@ -3481,7 +3748,8 @@ async fn run_worker_node(
         bls_pubkey,
         signer_factory,
         reward_greedy,
-    );
+    )
+    .with_state_engines(crdt, exec_manager, inclusion_prover);
 
     // When proxy mode is enabled, dial the master's PubSubProxy on
     // the peer mTLS listener and install it as the worker's publish

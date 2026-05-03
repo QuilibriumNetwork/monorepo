@@ -61,14 +61,21 @@ pub struct WorkerOnlyNode {
     local_bls_pubkey: Vec<u8>,
     bls_signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync>,
     reward_greedy: bool,
+    /// Per-worker hypergraph CRDT — required for state_roots.
+    hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Per-worker execution manager — required for requests_root.
+    execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    /// Per-worker inclusion prover — required for requests_root tree
+    /// commit.
+    inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
     /// Current engine handle (set after Respawn).
     engine_handle: std::sync::Mutex<Option<AppEngineHandle>>,
     /// Channel for engine events back to the master stream.
-    engine_event_tx: mpsc::Sender<crate::app_engine::AppEngineEvent>,
+    engine_event_tx: mpsc::UnboundedSender<crate::app_engine::AppEngineEvent>,
     /// Optional receiver for engine events — consumed by the
     /// publish pump when proxy mode is enabled. When `None`, the
     /// worker runs receive-only (legacy behavior).
-    engine_event_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::app_engine::AppEngineEvent>>>,
+    engine_event_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<crate::app_engine::AppEngineEvent>>>,
     /// Optional publish path (via master's PubSubProxy). When set,
     /// engine-produced messages are forwarded to the master for
     /// broadcast.
@@ -88,7 +95,7 @@ impl WorkerOnlyNode {
         bls_signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync>,
         reward_greedy: bool,
     ) -> Self {
-        let (engine_event_tx, engine_event_rx) = mpsc::channel(256);
+        let (engine_event_tx, engine_event_rx) = mpsc::unbounded_channel();
         Self {
             config,
             cancel: CancellationToken::new(),
@@ -101,11 +108,29 @@ impl WorkerOnlyNode {
             local_bls_pubkey,
             bls_signer_factory,
             reward_greedy,
+            hypergraph: None,
+            execution_engine: None,
+            inclusion_prover: None,
             engine_handle: std::sync::Mutex::new(None),
             engine_event_tx,
             engine_event_rx: std::sync::Mutex::new(Some(engine_event_rx)),
             publish_fn: None,
         }
+    }
+
+    /// Attach the per-worker hypergraph CRDT, execution manager, and
+    /// inclusion prover. These are required for byte-for-byte
+    /// header parity (state_roots + requests_root) with Go peers.
+    pub fn with_state_engines(
+        mut self,
+        hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
+        execution_engine: Arc<quil_execution::ExecutionEngineManager>,
+        inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
+    ) -> Self {
+        self.hypergraph = Some(hypergraph);
+        self.execution_engine = Some(execution_engine);
+        self.inclusion_prover = Some(inclusion_prover);
+        self
     }
 
     /// Supply a publish path (typically backed by a `ProxyPubSub`).
@@ -261,6 +286,20 @@ impl WorkerOnlyNode {
             local_bls_pubkey: self.local_bls_pubkey.clone(),
             bls_signer: (self.bls_signer_factory)(),
             reward_greedy: self.reward_greedy,
+            // Cluster-mode worker: master mediates GLOBAL_PROVER via
+            // gRPC. App shard finalize → master path needs separate
+            // wiring; leave None until that's ported.
+            coverage_publish: None,
+            // Per-worker CRDT + execution manager + inclusion prover
+            // for byte-for-byte header parity with Go: state_roots from
+            // the worker's own hypergraph commit, requests_root from
+            // the worker's own execution-manager Lock loop. Each
+            // worker owns its own RocksDB store (per
+            // `db.worker_path_prefix`) and therefore its own
+            // CRDT/exec-mgr instance, mirroring Go's cluster mode.
+            hypergraph: self.hypergraph.clone(),
+            execution_engine: self.execution_engine.clone(),
+            inclusion_prover: self.inclusion_prover.clone(),
         };
 
         let (engine, handle) = AppConsensusEngine::new(

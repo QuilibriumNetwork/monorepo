@@ -73,6 +73,24 @@ pub enum WorkerToMaster {
         core_id: u32,
         filter: Vec<u8>,
     },
+    /// A shard worker has spun up an `AppConsensusEngine` for `filter`.
+    /// The master uses this to populate a `filter → AppEngineHandle`
+    /// registry so peer messages on the per-shard bitmasks can be
+    /// routed to the right engine, and to subscribe BlossomSub to the
+    /// per-shard frame/consensus/prover/dispatch bitmasks.
+    ShardActivated {
+        core_id: u32,
+        filter: Vec<u8>,
+        handle: crate::app_engine::AppEngineHandle,
+    },
+    /// A shard worker has torn down its `AppConsensusEngine` for
+    /// `filter`. Master removes the registry entry and unsubscribes
+    /// from per-shard bitmasks (no peer here will produce or relay
+    /// shard messages once we leave it).
+    ShardDeactivated {
+        core_id: u32,
+        filter: Vec<u8>,
+    },
 }
 
 /// State of a single worker thread.
@@ -108,6 +126,20 @@ pub struct WorkerConsensusDeps {
     pub bls_signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync>,
     /// Whether the node uses reward-greedy strategy for fee adjustment.
     pub reward_greedy: bool,
+    /// Callback that publishes finalized canonical FrameHeader bytes
+    /// on `GLOBAL_PROVER` so archives credit our shard work toward
+    /// rewards. AppFollower invokes this directly from the consensus
+    /// event loop to avoid hopping through the worker→master channel
+    /// chain.
+    pub coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// Hypergraph CRDT used to derive per-frame `state_roots` for the
+    /// FrameHeader VDF challenge.
+    pub hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Execution engine for the per-message `Lock` calls that feed
+    /// `requests_root`.
+    pub execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    /// Inclusion prover for the `requests_root` tree commit.
+    pub inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -241,7 +273,7 @@ impl ThreadWorkerManager {
 
                                                 if let Some(ref deps) = deps {
                                                     // Create the AppConsensusEngine with full HotStuff integration
-                                                    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+                                                    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
                                                     let engine_deps = crate::app_engine::AppEngineDeps {
                                                         clock_store: deps.clock_store.clone(),
                                                         prover_registry: deps.prover_registry.clone(),
@@ -252,6 +284,10 @@ impl ThreadWorkerManager {
                                                         local_bls_pubkey: deps.local_bls_pubkey.clone(),
                                                         bls_signer: (deps.bls_signer_factory)(),
                                                         reward_greedy: deps.reward_greedy,
+                                                        coverage_publish: deps.coverage_publish.clone(),
+                                                        hypergraph: deps.hypergraph.clone(),
+                                                        execution_engine: deps.execution_engine.clone(),
+                                                        inclusion_prover: deps.inclusion_prover.clone(),
                                                     };
                                                     let (engine, app_handle) = crate::app_engine::AppConsensusEngine::new(
                                                         core_id,
@@ -259,6 +295,18 @@ impl ThreadWorkerManager {
                                                         engine_deps,
                                                         event_tx,
                                                     );
+
+                                                    // Tell the master a shard engine just came online.
+                                                    // The master uses this handle to route peer
+                                                    // consensus / frame / prover / dispatch messages
+                                                    // back to the worker thread.
+                                                    let _ = master_tx_clone.send(
+                                                        WorkerToMaster::ShardActivated {
+                                                            core_id,
+                                                            filter: filter_clone.clone(),
+                                                            handle: app_handle.clone(),
+                                                        }
+                                                    ).await;
 
                                                     // Forward engine events to master AND self-loopback
                                                     // own proposals/votes/timeouts back to the engine's
@@ -344,16 +392,32 @@ impl ThreadWorkerManager {
                                                         }
                                                     });
 
-                                                    // Run the engine — this blocks until cancelled
+                                                    // Spawn the engine as its own task so it schedules
+                                                    // independently of the cancellation watcher and any
+                                                    // tasks spawned by the inner consensus event loop.
+                                                    // Sharing a task via `tokio::select!` here was making
+                                                    // the engine's own select starve under load.
                                                     let bls_signer = (deps.bls_signer_factory)();
+                                                    let mut engine_handle = tokio::spawn(async move {
+                                                        engine.run(bls_signer).await;
+                                                    });
                                                     tokio::select! {
                                                         _ = ec.cancelled() => {
                                                             info!(core_id, "app engine cancelled");
+                                                            engine_handle.abort();
                                                         }
-                                                        _ = engine.run(bls_signer) => {
+                                                        _ = &mut engine_handle => {
                                                             info!(core_id, "app engine exited");
                                                         }
                                                     }
+                                                    // Tell the master to evict the routing entry +
+                                                    // unsubscribe from per-shard bitmasks.
+                                                    let _ = master_tx_clone.send(
+                                                        WorkerToMaster::ShardDeactivated {
+                                                            core_id,
+                                                            filter: filter_clone.clone(),
+                                                        }
+                                                    ).await;
                                                 } else {
                                                     // No consensus deps — heartbeat-only mode
                                                     loop {

@@ -200,6 +200,12 @@ pub struct PeerScorer {
     pub params: PeerScoreParams,
     /// IP colocation tracking: IP -> set of peers.
     peer_ips: HashMap<IpAddr, HashSet<PeerId>>,
+    /// Externally-supplied per-peer score adjustment, summed into
+    /// `score()` alongside the computed weighted score. Operators
+    /// inject these via the proxy `SetPeerScore` / `AddPeerScore` RPCs
+    /// to override or augment automatic scoring (e.g. boost a known
+    /// archive, penalize a misbehaving peer).
+    application_score: HashMap<PeerId, f64>,
 }
 
 impl PeerScorer {
@@ -209,19 +215,47 @@ impl PeerScorer {
             thresholds,
             params,
             peer_ips: HashMap::new(),
+            application_score: HashMap::new(),
         }
+    }
+
+    /// Set the application-level score for a peer, replacing any prior
+    /// value. Pass `0.0` to clear the override.
+    pub fn set_application_score(&mut self, peer: PeerId, score: f64) {
+        if score == 0.0 {
+            self.application_score.remove(&peer);
+        } else {
+            self.application_score.insert(peer, score);
+        }
+    }
+
+    /// Add `delta` to the peer's application score (creating the
+    /// entry if missing).
+    pub fn add_application_score(&mut self, peer: PeerId, delta: f64) {
+        let entry = self.application_score.entry(peer).or_insert(0.0);
+        *entry += delta;
+        if *entry == 0.0 {
+            self.application_score.remove(&peer);
+        }
+    }
+
+    /// Application score for a peer, or 0.0 if unset.
+    pub fn application_score(&self, peer: &PeerId) -> f64 {
+        self.application_score.get(peer).copied().unwrap_or(0.0)
     }
 
     // -- Scoring ----------------------------------------------------------
 
-    /// Compute the score for a peer using weighted parameters (P1..P7).
+    /// Compute the score for a peer using weighted parameters (P1..P7),
+    /// plus any operator-supplied application score adjustment.
     pub fn score(&self, peer: &PeerId) -> f64 {
+        let app = self.application_score.get(peer).copied().unwrap_or(0.0);
         let pstats = match self.stats.get(peer) {
             Some(s) => s,
-            None => return 0.0,
+            None => return app,
         };
 
-        let mut score = 0.0;
+        let mut score = app;
 
         for (bitmask, bstats) in &pstats.bitmasks {
             let bp = match self.params.bitmasks.get(bitmask) {

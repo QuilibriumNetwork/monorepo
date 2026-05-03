@@ -95,7 +95,7 @@ pub struct BlossomSubBehaviour {
     /// Peer blacklist — connections from/to these peers are denied.
     blacklisted_peers: HashSet<PeerId>,
     /// Peer scores for mesh management decisions.
-    scorer: crate::scoring::PeerScorer,
+    pub scorer: crate::scoring::PeerScorer,
     /// Fanout: bitmasks we publish to but aren't subscribed to.
     fanout: HashMap<Vec<u8>, HashSet<PeerId>>,
     /// Last fanout publish time per bitmask.
