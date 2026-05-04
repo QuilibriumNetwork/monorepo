@@ -381,6 +381,69 @@ impl FileKeyManager {
             .ok_or_else(|| QuilError::NotFound("q-peer-key not found".into()))?;
         self.decrypt_private_key(&stored.private_key)
     }
+
+    /// Decrypt and return a signer for a specific key id from the
+    /// keystore. Disambiguates entries that share a `KeyType` (e.g.
+    /// multiple Ed448 keys), which `get_signer(KeyType)` cannot.
+    pub fn get_signer_by_id(&self, id: &str) -> Result<Box<dyn Signer>> {
+        let stored = {
+            let map = self.stored_keys.read().unwrap();
+            map.get(id).cloned().ok_or_else(|| {
+                QuilError::NotFound(format!("no key with id {:?}", id))
+            })?
+        };
+
+        let private_bytes = self.decrypt_private_key(&stored.private_key)?;
+        let public_bytes = hex::decode(&stored.public_key)
+            .map_err(|e| QuilError::Crypto(format!("invalid public key hex: {}", e)))?;
+
+        let key_type = match stored.key_type {
+            0 => KeyType::Ed448,
+            1 => KeyType::X448,
+            2 => KeyType::Bls48581G1,
+            3 => KeyType::Bls48581G2,
+            4 => KeyType::Decaf448,
+            _ => {
+                return Err(QuilError::Crypto(format!(
+                    "unknown key type for id {:?}: {}",
+                    id, stored.key_type
+                )))
+            }
+        };
+
+        match key_type {
+            KeyType::Bls48581G1 | KeyType::Bls48581G2 => {
+                self.bls_constructor.from_bytes(&private_bytes, &public_bytes)
+            }
+            KeyType::Ed448 => {
+                let pk = if public_bytes.is_empty() {
+                    quil_crypto::Ed448Signer::derive_public(&private_bytes)?
+                } else {
+                    public_bytes
+                };
+                Ok(Box::new(quil_crypto::Ed448Signer::from_bytes(
+                    &private_bytes,
+                    &pk,
+                )?))
+            }
+            KeyType::Ed25519 => Ok(Box::new(quil_crypto::Ed25519Signer::from_bytes(
+                &private_bytes,
+                &public_bytes,
+            )?)),
+            KeyType::Secp256k1Sha256 => Ok(Box::new(quil_crypto::Secp256k1Signer::sha256(
+                &private_bytes,
+                &public_bytes,
+            )?)),
+            KeyType::Secp256k1Sha3 => Ok(Box::new(quil_crypto::Secp256k1Signer::sha3(
+                &private_bytes,
+                &public_bytes,
+            )?)),
+            KeyType::X448 | KeyType::Decaf448 => Err(QuilError::Crypto(format!(
+                "no signer for agreement-only key type {:?}",
+                key_type
+            ))),
+        }
+    }
 }
 
 impl KeyManager for FileKeyManager {

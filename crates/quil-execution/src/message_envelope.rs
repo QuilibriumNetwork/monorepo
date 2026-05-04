@@ -301,6 +301,92 @@ mod tests {
         p.to_canonical_bytes().unwrap()
     }
 
+    #[test]
+    fn proto_to_canonical_leave_round_trips() {
+        use quil_types::proto::global as pb;
+        use quil_types::proto::keys as keys_pb;
+
+        let leave_pb = pb::ProverLeave {
+            filters: vec![vec![0x01u8; 8], vec![0x02u8; 16]],
+            frame_number: 9_999_999,
+            public_key_signature_bls48581: Some(keys_pb::Bls48581AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: vec![0xCCu8; 32],
+            }),
+        };
+        let request_pb = pb::MessageRequest {
+            request: Some(pb::message_request::Request::Leave(leave_pb.clone())),
+            timestamp: 0,
+        };
+        let bundle_pb = pb::MessageBundle {
+            requests: vec![request_pb],
+            timestamp: 1_700_000_000_000,
+        };
+
+        let canonical = proto_message_bundle_to_canonical_bytes(&bundle_pb).unwrap();
+
+        let decoded = CanonicalMessageBundle::from_canonical_bytes(&canonical).unwrap();
+        assert_eq!(decoded.requests.len(), 1);
+        assert_eq!(decoded.timestamp, 1_700_000_000_000);
+
+        let req = decoded.requests[0].as_ref().expect("request present");
+        let leave_decoded = crate::global_intrinsic::prover_filter_ops::ProverLeave
+            ::from_canonical_bytes(&req.inner_bytes)
+            .unwrap();
+        assert_eq!(leave_decoded.filters, leave_pb.filters);
+        assert_eq!(leave_decoded.frame_number, leave_pb.frame_number);
+        let sig = leave_decoded
+            .public_key_signature_bls48581
+            .expect("sig present");
+        assert_eq!(sig.signature, vec![0xBBu8; 74]);
+        assert_eq!(sig.address, vec![0xCCu8; 32]);
+    }
+
+    #[test]
+    fn proto_to_canonical_confirm_matches_handcrafted() {
+        use quil_types::proto::global as pb;
+        use quil_types::proto::keys as keys_pb;
+        use crate::global_intrinsic::prover_ops::ProverConfirm;
+
+        let confirm_pb = pb::ProverConfirm {
+            filter: vec![],
+            frame_number: 12345,
+            public_key_signature_bls48581: Some(keys_pb::Bls48581AddressedSignature {
+                signature: vec![0xAAu8; 74],
+                address: vec![0xDDu8; 32],
+            }),
+            filters: vec![vec![0x10u8; 8]],
+        };
+        let bundle_pb = pb::MessageBundle {
+            requests: vec![pb::MessageRequest {
+                request: Some(pb::message_request::Request::Confirm(confirm_pb)),
+                timestamp: 0,
+            }],
+            timestamp: 42,
+        };
+
+        let canonical_via_dispatch =
+            proto_message_bundle_to_canonical_bytes(&bundle_pb).unwrap();
+
+        let confirm_handcrafted = ProverConfirm {
+            filter: vec![],
+            frame_number: 12345,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xAAu8; 74],
+                address: vec![0xDDu8; 32],
+            }),
+            filters: vec![vec![0x10u8; 8]],
+        };
+        let confirm_inner = confirm_handcrafted.to_canonical_bytes().unwrap();
+        let bundle_handcrafted = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest::wrap(confirm_inner).unwrap())],
+            timestamp: 42,
+        };
+        let canonical_handcrafted = bundle_handcrafted.to_canonical_bytes().unwrap();
+
+        assert_eq!(canonical_via_dispatch, canonical_handcrafted);
+    }
+
     // -- MessageRequest --
 
     #[test]

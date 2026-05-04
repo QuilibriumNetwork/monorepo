@@ -529,7 +529,9 @@ impl ProverLifecycle {
             None => Vec::new(),
         };
 
-        // Partition self's allocations by status.
+        // Joining / Left allocations past the 720-frame grace are
+        // implicitly rejected on-chain. Skip them everywhere — including
+        // `all_our_filters` — so the slot can be re-proposed.
         let mut joining_filters: Vec<(Vec<u8>, u64)> = Vec::new();
         let mut active_filters: Vec<Vec<u8>> = Vec::new();
         let mut leaving_filters: Vec<(Vec<u8>, u64)> = Vec::new();
@@ -537,18 +539,36 @@ impl ProverLifecycle {
 
         if let Some(ref prover) = prover_info {
             for alloc in &prover.allocations {
-                all_our_filters.push(alloc.confirmation_filter.clone());
                 match alloc.status {
                     ProverStatus::Joining => {
-                        joining_filters.push((alloc.confirmation_filter.clone(), alloc.join_frame_number));
+                        if frame_number
+                            > alloc.join_frame_number
+                                + crate::worker_allocator::PENDING_FILTER_GRACE_FRAMES
+                        {
+                            continue;
+                        }
+                        all_our_filters.push(alloc.confirmation_filter.clone());
+                        joining_filters
+                            .push((alloc.confirmation_filter.clone(), alloc.join_frame_number));
                     }
                     ProverStatus::Active => {
+                        all_our_filters.push(alloc.confirmation_filter.clone());
                         active_filters.push(alloc.confirmation_filter.clone());
                     }
                     ProverStatus::Left => {
-                        leaving_filters.push((alloc.confirmation_filter.clone(), alloc.leave_frame_number));
+                        if frame_number
+                            > alloc.leave_frame_number
+                                + crate::worker_allocator::PENDING_FILTER_GRACE_FRAMES
+                        {
+                            continue;
+                        }
+                        all_our_filters.push(alloc.confirmation_filter.clone());
+                        leaving_filters
+                            .push((alloc.confirmation_filter.clone(), alloc.leave_frame_number));
                     }
-                    _ => {}
+                    _ => {
+                        all_our_filters.push(alloc.confirmation_filter.clone());
+                    }
                 }
             }
         }
@@ -1658,6 +1678,60 @@ mod proposal_loop_tests {
         assert!(
             !actions.is_empty(),
             "actions should emit once tree is synced; got empty"
+        );
+    }
+
+    /// Joining allocations past the 720-frame grace window are
+    /// implicitly rejected on-chain; they must not block fresh joins
+    /// for the same filter, count toward excess-pending, or appear in
+    /// `decide_joins`.
+    #[test]
+    fn expired_joins_are_skipped() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(idle_worker(1));
+
+        // Joined at frame 10, current frame 800 → 790 frames past join,
+        // well over the 720-frame grace.
+        let allocs = vec![alloc(filter_bytes(0xA1), ProverStatus::Joining, 10)];
+        reg.set_prover(prover(address.clone(), allocs));
+        // Only the expired-shard summary; no alternatives. Without the
+        // skip, `proposal_descriptors` would be empty → no
+        // `ProposeJoin` could fire.
+        reg.set_summaries(vec![shard_summary(filter_bytes(0xA1), 1)]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(800);
+
+        let actions = lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+
+        // Expired joins must not be force-rejected.
+        assert_eq!(
+            count_rejects(&actions),
+            0,
+            "expired joins must not be force-rejected; got {:?}",
+            actions
+        );
+
+        let proposed_filters: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            proposed_filters,
+            vec![filter_bytes(0xA1)],
+            "expected fresh ProposeJoin for shard whose prior join expired; got {:?}",
+            actions
         );
     }
 

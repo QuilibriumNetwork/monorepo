@@ -17,15 +17,14 @@ pub struct Ed448Signer {
 }
 
 impl Ed448Signer {
-    /// Construct an Ed448 signer from a stored 57-byte private key and
-    /// its matching 57-byte public key.
+    /// Accepts both encodings of the private key:
+    ///   * 57 bytes — raw seed.
+    ///   * 114 bytes — circl/Go layout: `seed(57) || pubkey(57)`. The
+    ///     trailing pubkey is dropped; the seed is what `ed448-rust`
+    ///     consumes.
+    /// `public_key` must be 57 bytes.
     pub fn from_bytes(private_key: &[u8], public_key: &[u8]) -> Result<Self> {
-        if private_key.len() != 57 {
-            return Err(QuilError::Crypto(format!(
-                "Ed448: invalid private key length {}",
-                private_key.len()
-            )));
-        }
+        let seed = normalize_ed448_seed(private_key)?;
         if public_key.len() != 57 {
             return Err(QuilError::Crypto(format!(
                 "Ed448: invalid public key length {}",
@@ -33,26 +32,31 @@ impl Ed448Signer {
             )));
         }
         Ok(Self {
-            secret_key: private_key.to_vec(),
+            secret_key: seed,
             public_key: public_key.to_vec(),
         })
     }
 
-    /// Derive the 57-byte Ed448 public key from a 57-byte private key
-    /// by running SHAKE-256 expansion per RFC 8032. Useful when the
-    /// keystore only has the private half.
+    /// Accepts the same 57- or 114-byte forms as `from_bytes` and
+    /// derives the matching 57-byte public key.
     pub fn derive_public(private_key: &[u8]) -> Result<Vec<u8>> {
-        if private_key.len() != 57 {
-            return Err(QuilError::Crypto(format!(
-                "Ed448: invalid private key length {}",
-                private_key.len()
-            )));
-        }
+        let seed_vec = normalize_ed448_seed(private_key)?;
         let mut seed = [0u8; 57];
-        seed.copy_from_slice(private_key);
+        seed.copy_from_slice(&seed_vec);
         let sk = PrivateKey::from(seed);
         let pk: PublicKey = (&sk).into();
         Ok(pk.as_byte().to_vec())
+    }
+}
+
+fn normalize_ed448_seed(private_key: &[u8]) -> Result<Vec<u8>> {
+    match private_key.len() {
+        57 => Ok(private_key.to_vec()),
+        114 => Ok(private_key[..57].to_vec()),
+        n => Err(QuilError::Crypto(format!(
+            "Ed448: invalid private key length {}",
+            n
+        ))),
     }
 }
 
@@ -132,4 +136,74 @@ pub fn peer_id_multihash_from_ed448_pubkey(pubkey: &[u8]) -> Vec<u8> {
     mh.push(0x20); // digest length (32)
     mh.extend_from_slice(&digest);
     mh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_seed() -> [u8; 57] {
+        let mut s = [0u8; 57];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        s
+    }
+
+    #[test]
+    fn from_bytes_accepts_57_byte_seed() {
+        let seed = fresh_seed();
+        let pk = Ed448Signer::derive_public(&seed).unwrap();
+        let signer = Ed448Signer::from_bytes(&seed, &pk).unwrap();
+        assert_eq!(signer.private_key().len(), 57);
+    }
+
+    #[test]
+    fn from_bytes_accepts_114_byte_circl_form() {
+        let seed = fresh_seed();
+        let pk = Ed448Signer::derive_public(&seed).unwrap();
+        let mut circl = Vec::with_capacity(114);
+        circl.extend_from_slice(&seed);
+        circl.extend_from_slice(&pk);
+        let signer = Ed448Signer::from_bytes(&circl, &pk).unwrap();
+        assert_eq!(signer.private_key().len(), 57);
+        assert_eq!(signer.private_key(), &seed[..]);
+    }
+
+    #[test]
+    fn derive_public_accepts_114_byte_circl_form() {
+        let seed = fresh_seed();
+        let pk_from_seed = Ed448Signer::derive_public(&seed).unwrap();
+        let mut circl = Vec::with_capacity(114);
+        circl.extend_from_slice(&seed);
+        circl.extend_from_slice(&pk_from_seed);
+        let pk_from_circl = Ed448Signer::derive_public(&circl).unwrap();
+        assert_eq!(pk_from_seed, pk_from_circl);
+    }
+
+    #[test]
+    fn from_bytes_rejects_other_lengths() {
+        let pk = vec![0u8; 57];
+        assert!(Ed448Signer::from_bytes(&[0u8; 32], &pk).is_err());
+        assert!(Ed448Signer::from_bytes(&[0u8; 64], &pk).is_err());
+        assert!(Ed448Signer::from_bytes(&[0u8; 113], &pk).is_err());
+        assert!(Ed448Signer::from_bytes(&[0u8; 115], &pk).is_err());
+    }
+
+    #[test]
+    fn signing_with_57_and_114_seed_inputs_is_equivalent() {
+        let seed = fresh_seed();
+        let pk = Ed448Signer::derive_public(&seed).unwrap();
+        let mut circl = Vec::with_capacity(114);
+        circl.extend_from_slice(&seed);
+        circl.extend_from_slice(&pk);
+
+        let s57 = Ed448Signer::from_bytes(&seed, &pk).unwrap();
+        let s114 = Ed448Signer::from_bytes(&circl, &pk).unwrap();
+
+        let msg = b"test message";
+        let sig57 = s57.sign_with_domain(msg, b"ctx").unwrap();
+        let sig114 = s114.sign_with_domain(msg, b"ctx").unwrap();
+        assert_eq!(sig57, sig114);
+    }
 }

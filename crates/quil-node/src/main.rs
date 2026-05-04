@@ -3128,12 +3128,21 @@ async fn run_master_node(
             node_rpc_builder = node_rpc_builder.with_traversal_proof_generator(gen);
         }
 
-        // Send handler: verify Ed448 authentication over payload under
-        // the NODE_AUTHENTICATION||domain prefix, then route the payload
-        // to the correct BlossomSub bitmask.
-        if let Some(seed) = mtls_seed {
+        // Send handler: verify Ed448 authentication over the payload
+        // under the NODE_AUTHENTICATION||domain context, then route
+        // the payload to the correct BlossomSub bitmask. The pubkey
+        // is taken from the keystore's `q-peer-key` so qclient (which
+        // signs with that same key) authenticates correctly. Falls
+        // back to deriving from `mtls_seed` if the key isn't present.
+        let peer_ed448_pub: Option<Vec<u8>> = file_key_manager
+            .get_signer_by_id("q-peer-key")
+            .ok()
+            .map(|s| s.public_key().to_vec())
+            .or_else(|| mtls_seed.as_ref().map(|seed| {
+                quil_p2p::ed448_identity::derive_public_key(seed)
+            }));
+        if let Some(peer_ed448_pub) = peer_ed448_pub {
             let send_p2p = p2p_handle.clone();
-            let peer_ed448_pub = quil_p2p::ed448_identity::derive_public_key(&seed);
             let send_handler: quil_rpc::SendHandler = Arc::new(
                 move |domain: Vec<u8>, payload: Vec<u8>, authentication: Vec<u8>|
                 -> std::pin::Pin<
