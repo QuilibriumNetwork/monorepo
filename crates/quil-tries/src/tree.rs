@@ -314,6 +314,15 @@ fn commit_node<'a>(
                         commit_node(child, prover, recalculate);
                     }
                 });
+
+            // Aggregate `size` from children. `leaf_count` and
+            // `longest_branch` are maintained at insert/delete time.
+            let mut aggregate = num_bigint::BigInt::from(0u64);
+            for child in branch.children.iter().flatten() {
+                aggregate += child.size();
+            }
+            branch.size = aggregate;
+
             branch.commit(prover, recalculate)
         }
     }

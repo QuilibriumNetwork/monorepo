@@ -336,18 +336,91 @@ impl ProverLifecycle {
         pending
     }
 
-    /// Port of Go's `joinProposalReady` at `worker_allocator.go:1273-1317`.
-    /// Returns `(ready, reason_if_not)`.
-    fn join_proposal_ready(&self, frame_number: u64) -> (bool, &'static str) {
+    /// Pick auto-managed Active filters to leave when the prover holds
+    /// Returns lowest-scoring active filters when the auto-managed
+    /// active count exceeds non-manually-managed worker capacity.
+    /// Manually-managed pins are excluded entirely.
+    fn select_excess_active_filters(
+        &self,
+        active_filters: &[Vec<u8>],
+        workers: &[crate::worker::WorkerInfo],
+        allocated_descriptors: &[ShardDescriptor],
+        difficulty: u64,
+        world_bytes: &BigInt,
+    ) -> Vec<Vec<u8>> {
+        let mm_filters: std::collections::HashSet<Vec<u8>> = workers
+            .iter()
+            .filter(|w| w.manually_managed && !w.filter.is_empty())
+            .map(|w| w.filter.clone())
+            .collect();
+
+        let auto_capacity = workers.iter().filter(|w| !w.manually_managed).count();
+
+        let auto_active_count = active_filters
+            .iter()
+            .filter(|f| !mm_filters.contains(*f))
+            .count();
+
+        if auto_active_count <= auto_capacity {
+            return Vec::new();
+        }
+        let surplus = auto_active_count - auto_capacity;
+
+        let ranked = proposer::rank_allocated_by_score_ascending(
+            allocated_descriptors,
+            difficulty,
+            world_bytes,
+            self.units,
+            self.strategy,
+            &mm_filters,
+        );
+
+        // Unscored (no registry summary) actives go first — they're
+        // already disconnected from any reward.
+        let ranked_set: std::collections::HashSet<Vec<u8>> =
+            ranked.iter().map(|(f, _)| f.clone()).collect();
+        let mut unscored: Vec<Vec<u8>> = active_filters
+            .iter()
+            .filter(|f| !mm_filters.contains(*f) && !ranked_set.contains(*f))
+            .cloned()
+            .collect();
+        unscored.sort();
+
+        let mut picks: Vec<Vec<u8>> = Vec::with_capacity(surplus);
+        picks.extend(unscored.into_iter().take(surplus));
+        if picks.len() < surplus {
+            for (f, _) in ranked {
+                if picks.len() == surplus {
+                    break;
+                }
+                picks.push(f);
+            }
+        }
+        picks.truncate(MAX_PROPOSALS_PER_CYCLE);
+        picks
+    }
+
+    /// Returns `Some(reason)` if the prover tree isn't fresh enough
+    /// at `frame_number` for any lifecycle action.
+    fn tree_synced(&self, frame_number: u64) -> Option<&'static str> {
         if self.last_observed_frame.load(Ordering::Relaxed) == 0 {
-            return (false, "awaiting initial frame");
+            return Some("awaiting initial frame");
         }
         if !self.initial_sync_complete.load(Ordering::Relaxed) {
-            return (false, "awaiting prover root sync");
+            return Some("awaiting prover root sync");
         }
         let verified = self.prover_root_verified_frame.load(Ordering::Relaxed);
         if verified == 0 || verified < frame_number {
-            return (false, "latest frame not yet verified");
+            return Some("latest frame not yet verified");
+        }
+        None
+    }
+
+    /// Returns `(ready, reason_if_not)` for the propose paths. Layered
+    /// on top of `tree_synced`.
+    fn join_proposal_ready(&self, frame_number: u64) -> (bool, &'static str) {
+        if let Some(reason) = self.tree_synced(frame_number) {
+            return (false, reason);
         }
         if self.halt_state.any_halted() {
             return (false, "shard coverage halt active");
@@ -400,6 +473,16 @@ impl ProverLifecycle {
             return Ok(Vec::new());
         }
         if self.prover_address.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // No actions emit until the registry view is current.
+        if let Some(reason) = self.tree_synced(frame_number) {
+            tracing::debug!(
+                frame = frame_number,
+                reason,
+                "skipping lifecycle evaluation — tree not synced"
+            );
             return Ok(Vec::new());
         }
 
@@ -583,6 +666,47 @@ impl ProverLifecycle {
                     last_reject,
                     "deferring forced join rejections — cooldown"
                 );
+            }
+        }
+
+        // Surplus-active leave: proactively shed the worst-scoring
+        // active filters when count exceeds auto-managed worker
+        // capacity. Shares the join cooldown.
+        if !active_filters.is_empty() && !join_proposed_this_cycle {
+            let surplus = self.select_excess_active_filters(
+                &active_filters,
+                &workers,
+                &allocated_descriptors,
+                difficulty,
+                &world_bytes,
+            );
+            if !surplus.is_empty() {
+                let last_join = self.allocator.last_join_attempt();
+                let cooldown_ok = last_join == 0
+                    || (frame_number > last_join
+                        && frame_number - last_join
+                            >= crate::worker_allocator::JOIN_COOLDOWN_FRAMES);
+                if cooldown_ok {
+                    self.allocator.set_last_join_attempt(frame_number);
+                    info!(
+                        frame = frame_number,
+                        leaves = surplus.len(),
+                        "proposing leaves for surplus actives (worker count reduced)"
+                    );
+                    actions.push(LifecycleAction::ProposeLeave {
+                        filters: surplus,
+                        frame_number,
+                    });
+                    // Don't propose joins or score-driven leaves in
+                    // the same cycle as a surplus-active leave.
+                    join_proposed_this_cycle = true;
+                } else {
+                    tracing::debug!(
+                        frame = frame_number,
+                        last_join,
+                        "deferring surplus-active leaves — cooldown"
+                    );
+                }
             }
         }
 
@@ -864,4 +988,715 @@ fn compute_world_bytes_from_summaries(summaries: &[ProverShardSummary]) -> BigIn
         .map(|s| if s.total_size > 0 { s.total_size } else { 1 })
         .sum();
     BigInt::from(total.max(1))
+}
+
+#[cfg(test)]
+mod proposal_loop_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use quil_types::consensus::{
+        ProverAllocationInfo, ProverInfo, ProverShardSummary, ProverStatus,
+    };
+
+    use crate::halt_state::HaltState;
+    use crate::worker::{WorkerInfo, WorkerManager};
+    use crate::worker_allocator::{WorkerAllocator, JOIN_COOLDOWN_FRAMES};
+
+    struct ConfigurableRegistry {
+        prover: Mutex<Option<ProverInfo>>,
+        summaries: Mutex<Vec<ProverShardSummary>>,
+        current_frame: std::sync::atomic::AtomicU64,
+    }
+
+    impl ConfigurableRegistry {
+        fn new() -> Self {
+            Self {
+                prover: Mutex::new(None),
+                summaries: Mutex::new(Vec::new()),
+                current_frame: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn set_prover(&self, info: ProverInfo) {
+            *self.prover.lock().unwrap() = Some(info);
+        }
+
+        fn set_summaries(&self, s: Vec<ProverShardSummary>) {
+            *self.summaries.lock().unwrap() = s;
+        }
+
+        #[allow(dead_code)]
+        fn set_current_frame(&self, frame: u64) {
+            self.current_frame.store(frame, Ordering::Relaxed);
+        }
+    }
+
+    impl ProverRegistry for ConfigurableRegistry {
+        fn refresh(&self) -> Result<()> { Ok(()) }
+        fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
+        fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> {
+            Ok(self.prover.lock().unwrap().clone())
+        }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
+        fn get_active_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
+        fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(0) }
+        fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
+        fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
+        fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> Result<()> { Ok(()) }
+        fn get_prover_shard_summaries(&self) -> Result<Vec<ProverShardSummary>> {
+            Ok(self.summaries.lock().unwrap().clone())
+        }
+        fn prune_orphan_joins(&self, _: u64) -> Result<()> { Ok(()) }
+        fn evict_inactive_provers(&self, _: u64, _: u64, _: &HashMap<String, u64>) -> Result<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+        fn current_frame(&self) -> u64 {
+            self.current_frame.load(Ordering::Relaxed)
+        }
+    }
+
+    struct ConfigurableWorkerManager {
+        workers: Mutex<HashMap<u32, WorkerInfo>>,
+    }
+
+    impl ConfigurableWorkerManager {
+        fn new() -> Self {
+            Self { workers: Mutex::new(HashMap::new()) }
+        }
+
+        fn add(&self, info: WorkerInfo) {
+            self.workers.lock().unwrap().insert(info.core_id, info);
+        }
+    }
+
+    impl WorkerManager for ConfigurableWorkerManager {
+        fn allocate_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+            let mut g = self.workers.lock().unwrap();
+            let entry = g.entry(core_id).or_insert(WorkerInfo {
+                core_id,
+                filter: vec![],
+                available_storage: 0,
+                total_storage: 0,
+                manually_managed: false,
+                pending_filter_frame: 0,
+                allocated: false,
+            });
+            entry.filter = filter.to_vec();
+            entry.allocated = !filter.is_empty();
+            Ok(())
+        }
+        fn deallocate_worker(&self, core_id: u32) -> Result<()> {
+            self.workers.lock().unwrap().remove(&core_id);
+            Ok(())
+        }
+        fn check_workers_connected(&self) -> Result<Vec<u32>> {
+            Ok(self.workers.lock().unwrap().keys().copied().collect())
+        }
+        fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
+            let mut out: Vec<WorkerInfo> =
+                self.workers.lock().unwrap().values().cloned().collect();
+            out.sort_by_key(|w| w.core_id);
+            Ok(out)
+        }
+        fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+            self.allocate_worker(core_id, filter)
+        }
+    }
+
+    fn make_lifecycle(
+        prover_address: Vec<u8>,
+        wm: Arc<dyn WorkerManager>,
+        reg: Arc<dyn ProverRegistry>,
+    ) -> Arc<ProverLifecycle> {
+        let allocator = Arc::new(WorkerAllocator::new(wm, reg, prover_address.clone()));
+        let halt = Arc::new(HaltState::new());
+        let lifecycle = Arc::new(ProverLifecycle::new(prover_address, allocator, halt));
+        lifecycle.set_confirm_window_frames(2);
+        lifecycle.set_sync_complete();
+        lifecycle
+    }
+
+    fn idle_worker(core_id: u32) -> WorkerInfo {
+        WorkerInfo {
+            core_id,
+            filter: vec![],
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        }
+    }
+
+    fn allocated_worker(core_id: u32, filter: Vec<u8>) -> WorkerInfo {
+        WorkerInfo {
+            core_id,
+            filter,
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: true,
+        }
+    }
+
+    fn alloc(filter: Vec<u8>, status: ProverStatus, join_frame: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status,
+            confirmation_filter: filter,
+            rejection_filter: vec![],
+            join_frame_number: join_frame,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: if status == ProverStatus::Active { join_frame + 1 } else { 0 },
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 0,
+            vertex_address: vec![],
+        }
+    }
+
+    fn prover(address: Vec<u8>, allocations: Vec<ProverAllocationInfo>) -> ProverInfo {
+        ProverInfo {
+            public_key: vec![0xAA; 74],
+            address,
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations,
+            available_storage: 1 << 30,
+            seniority: 0,
+            delegate_address: vec![],
+        }
+    }
+
+    fn shard_summary(filter: Vec<u8>, active: u32) -> ProverShardSummary {
+        let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+        if active > 0 {
+            counts.insert(ProverStatus::Active, active);
+        }
+        ProverShardSummary {
+            filter,
+            status_counts: counts,
+            total_size: 1_000_000,
+        }
+    }
+
+    fn filter_bytes(byte: u8) -> Vec<u8> {
+        vec![byte; 8]
+    }
+
+    fn count_proposed_joins(actions: &[LifecycleAction]) -> usize {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.len()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn count_rejects(actions: &[LifecycleAction]) -> usize {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::RejectJoins { filters, .. } => Some(filters.len()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn count_proposed_leaves(actions: &[LifecycleAction]) -> usize {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.len()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn join_cooldown_blocks_then_releases() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+        reg.set_summaries(vec![
+            shard_summary(filter_bytes(0x01), 1),
+            shard_summary(filter_bytes(0x02), 1),
+            shard_summary(filter_bytes(0x03), 1),
+            shard_summary(filter_bytes(0x04), 1),
+        ]);
+        reg.set_prover(prover(address.clone(), vec![]));
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(count_proposed_joins(&actions) > 0, "expected joins on first cycle");
+
+        lifecycle.record_join_attempt(100);
+
+        for offset in 1..JOIN_COOLDOWN_FRAMES {
+            let f = 100 + offset;
+            lifecycle.set_prover_root_verified_frame(f);
+            let actions = lifecycle.evaluate(f, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            assert_eq!(
+                count_proposed_joins(&actions),
+                0,
+                "join cooldown breached at frame {} (offset {})",
+                f,
+                offset
+            );
+        }
+
+        let after_cd = 100 + JOIN_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(after_cd);
+        let actions = lifecycle.evaluate(after_cd, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(
+            count_proposed_joins(&actions) > 0,
+            "expected joins to resume past cooldown"
+        );
+    }
+
+    #[test]
+    fn excess_pending_joins_get_rejected() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // capacity=2, active=1, allowed_pending=1, pending=4 → 3 rejects.
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xB1)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 50),
+            alloc(filter_bytes(0xB2), ProverStatus::Joining, 99),
+            alloc(filter_bytes(0xB3), ProverStatus::Joining, 99),
+            alloc(filter_bytes(0xB4), ProverStatus::Joining, 99),
+            alloc(filter_bytes(0xB5), ProverStatus::Joining, 99),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(vec![
+            shard_summary(filter_bytes(0xA1), 1),
+            shard_summary(filter_bytes(0xB2), 1),
+            shard_summary(filter_bytes(0xB3), 1),
+            shard_summary(filter_bytes(0xB4), 1),
+            shard_summary(filter_bytes(0xB5), 1),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let rejected = count_rejects(&actions);
+        assert_eq!(
+            rejected, 3,
+            "expected 3 excess pending joins rejected (capacity=2, active=1, allowed=1, pending=4 → excess=3); got {} in {:?}",
+            rejected, actions
+        );
+    }
+
+    /// `plan_leaves` is score-driven: leaves emit when an allocated
+    /// shard scores < 67% of the best unallocated alternative.
+    #[test]
+    fn overcrowded_actives_get_leave_proposed() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+        wm.add(allocated_worker(3, filter_bytes(0xA3)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        // Allocated 0xA1..0xA3 at ring 8 (very low score),
+        // unallocated 0xC0/0xC1 at ring 0 (high score).
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xA1), 64, 1_000_000),
+            crowded(filter_bytes(0xA2), 64, 1_000_000),
+            crowded(filter_bytes(0xA3), 64, 1_000_000),
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let proposed = count_proposed_leaves(&actions);
+        assert!(
+            proposed > 0,
+            "expected ProposeLeave when allocated shards score below the 67% threshold of unallocated alternatives; got {:?}",
+            actions
+        );
+    }
+
+    #[test]
+    fn joins_never_exceed_free_worker_count() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // 1 free worker, 1 already allocated, 10 candidate shards.
+        wm.add(idle_worker(1));
+        wm.add(allocated_worker(2, filter_bytes(0xA1)));
+
+        let allocs = vec![alloc(filter_bytes(0xA1), ProverStatus::Active, 10)];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let mut summaries = Vec::new();
+        summaries.push(shard_summary(filter_bytes(0xA1), 1));
+        for i in 0..10u8 {
+            summaries.push(shard_summary(filter_bytes(0x10 + i), 1));
+        }
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let proposed = count_proposed_joins(&actions);
+        assert_eq!(
+            proposed, 1,
+            "expected at most 1 join (only 1 free worker); got {} in {:?}",
+            proposed, actions
+        );
+    }
+
+    #[test]
+    fn moving_to_fewer_cores_proposes_leaves_for_surplus() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        for i in 1..=4u32 {
+            let f = filter_bytes(0xA0 + i as u8);
+            wm.add(allocated_worker(i, f));
+        }
+
+        let mut allocs = Vec::new();
+        let mut summaries = Vec::new();
+        for i in 1..=10u8 {
+            let f = filter_bytes(0xA0 + i);
+            allocs.push(alloc(f.clone(), ProverStatus::Active, 10));
+            // Higher index → more crowded → lower score → picked first.
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, i as u32 * 2);
+            summaries.push(ProverShardSummary {
+                filter: f,
+                status_counts: counts,
+                total_size: 1_000_000,
+            });
+        }
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let proposed = count_proposed_leaves(&actions);
+        assert_eq!(
+            proposed, 6,
+            "expected 6 leaves for 10 actives on 4 workers; got {} in {:?}",
+            proposed, actions
+        );
+    }
+
+    /// Counterpart: when the active count exactly matches the worker
+    /// count, no surplus, no leaves.
+    #[test]
+    fn at_capacity_no_excess_active_leaves() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        for i in 1..=4u32 {
+            let f = filter_bytes(0xA0 + i as u8);
+            wm.add(allocated_worker(i, f));
+        }
+
+        let mut allocs = Vec::new();
+        let mut summaries = Vec::new();
+        for i in 1..=4u8 {
+            let f = filter_bytes(0xA0 + i);
+            allocs.push(alloc(f.clone(), ProverStatus::Active, 10));
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, 4);
+            summaries.push(ProverShardSummary {
+                filter: f,
+                status_counts: counts,
+                total_size: 1_000_000,
+            });
+        }
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let proposed = count_proposed_leaves(&actions);
+        assert_eq!(
+            proposed, 0,
+            "no surplus expected when active count == worker count; got {} in {:?}",
+            proposed, actions
+        );
+    }
+
+    #[test]
+    fn manually_managed_filters_never_surplus_leaved() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        let pinned_filter = filter_bytes(0xA1);
+        let mut mm_worker = allocated_worker(1, pinned_filter.clone());
+        mm_worker.manually_managed = true;
+        wm.add(mm_worker);
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+
+        let mut allocs = Vec::new();
+        let mut summaries = Vec::new();
+        for i in 1..=5u8 {
+            let f = filter_bytes(0xA0 + i);
+            allocs.push(alloc(f.clone(), ProverStatus::Active, 10));
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, 4);
+            summaries.push(ProverShardSummary {
+                filter: f,
+                status_counts: counts,
+                total_size: 1_000_000,
+            });
+        }
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let leaves: Vec<&Vec<Vec<u8>>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters),
+                _ => None,
+            })
+            .collect();
+        assert!(!leaves.is_empty(), "expected ProposeLeave for surplus");
+        for filter_set in &leaves {
+            for f in *filter_set {
+                assert_ne!(
+                    f, &pinned_filter,
+                    "manually-managed filter must not be in leave set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn excess_active_leave_respects_cooldown() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        for i in 1..=2u32 {
+            let f = filter_bytes(0xA0 + i as u8);
+            wm.add(allocated_worker(i, f));
+        }
+
+        let mut allocs = Vec::new();
+        let mut summaries = Vec::new();
+        for i in 1..=8u8 {
+            let f = filter_bytes(0xA0 + i);
+            allocs.push(alloc(f.clone(), ProverStatus::Active, 10));
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, 4);
+            summaries.push(ProverShardSummary {
+                filter: f,
+                status_counts: counts,
+                total_size: 1_000_000,
+            });
+        }
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(200);
+
+        let actions = lifecycle.evaluate(200, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(count_proposed_leaves(&actions) > 0, "expected leaves on first cycle");
+
+        for offset in 1..JOIN_COOLDOWN_FRAMES {
+            let f = 200 + offset;
+            lifecycle.set_prover_root_verified_frame(f);
+            let actions = lifecycle.evaluate(f, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            assert_eq!(
+                count_proposed_leaves(&actions),
+                0,
+                "surplus-active leave fired during cooldown at frame {}",
+                f
+            );
+        }
+
+        let after_cd = 200 + JOIN_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(after_cd);
+        let actions = lifecycle.evaluate(after_cd, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(
+            count_proposed_leaves(&actions) > 0,
+            "expected surplus-active leaves to resume past cooldown"
+        );
+    }
+
+    #[test]
+    fn unsynced_tree_emits_nothing() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(idle_worker(1));
+        wm.add(allocated_worker(2, filter_bytes(0xA1)));
+        wm.add(allocated_worker(3, filter_bytes(0xA2)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Joining, 10),
+            alloc(filter_bytes(0xA4), ProverStatus::Joining, 10),
+            alloc(filter_bytes(0xA5), ProverStatus::Joining, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+        let mut summaries = Vec::new();
+        for i in 1..=5u8 {
+            summaries.push(shard_summary(filter_bytes(0xA0 + i), 1));
+        }
+        for i in 0..5u8 {
+            summaries.push(shard_summary(filter_bytes(0xC0 + i), 1));
+        }
+        reg.set_summaries(summaries);
+
+        // Construct without the usual sync setup so the gate is honest.
+        let allocator = Arc::new(WorkerAllocator::new(
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+            address.clone(),
+        ));
+        let halt = Arc::new(HaltState::new());
+        let lifecycle = Arc::new(ProverLifecycle::new(address, allocator, halt));
+        lifecycle.set_confirm_window_frames(2);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(
+            actions.is_empty(),
+            "unsynced tree must emit no actions; got {:?}",
+            actions
+        );
+
+        lifecycle.set_sync_complete();
+        lifecycle.set_prover_root_verified_frame(50);
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(
+            actions.is_empty(),
+            "stale verified frame must emit no actions; got {:?}",
+            actions
+        );
+
+        lifecycle.set_prover_root_verified_frame(100);
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(
+            !actions.is_empty(),
+            "actions should emit once tree is synced; got empty"
+        );
+    }
+
+    #[test]
+    fn no_free_workers_means_no_joins() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+        wm.add(allocated_worker(3, filter_bytes(0xA3)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let mut summaries = Vec::new();
+        for i in 0..20u8 {
+            summaries.push(shard_summary(filter_bytes(0xA1 + i), 1));
+        }
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let proposed = count_proposed_joins(&actions);
+        assert_eq!(
+            proposed, 0,
+            "fully-allocated node must not propose joins; got {} in {:?}",
+            proposed, actions
+        );
+    }
 }

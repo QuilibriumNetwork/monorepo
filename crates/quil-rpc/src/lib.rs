@@ -7,6 +7,7 @@ pub mod hypergraph_sync_probe;
 pub mod hypersync_server;
 pub mod node_service;
 pub mod peer_auth_middleware;
+pub mod peer_dial;
 pub mod prover_counts;
 pub mod proxy_pubsub;
 pub mod pubsub_proxy;

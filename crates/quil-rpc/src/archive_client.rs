@@ -26,7 +26,10 @@ use tower::Service;
 use tracing::{debug, info};
 
 use quil_types::proto::global::global_service_client::GlobalServiceClient;
-use quil_types::proto::global::{GetGlobalFrameRequest, GlobalFrame, SubmitGlobalMessageRequest};
+use quil_types::proto::global::{
+    AppShardInfo, GetAppShardsRequest, GetGlobalFrameRequest, GlobalFrame,
+    SubmitGlobalMessageRequest,
+};
 
 use crate::quil_tls::{build_quil_tls_cert, QuilTlsError};
 
@@ -133,6 +136,19 @@ impl ArchiveClient {
             .submit_global_message(SubmitGlobalMessageRequest { data })
             .await?;
         Ok(())
+    }
+
+    pub async fn get_app_shards(
+        &mut self,
+        shard_key: Vec<u8>,
+        prefix: Vec<u32>,
+    ) -> Result<Vec<AppShardInfo>, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_app_shards(GetAppShardsRequest { shard_key, prefix })
+            .await?
+            .into_inner();
+        Ok(resp.info)
     }
 
     /// Fetch a single global frame. Pass `frame_number = 0` to request the

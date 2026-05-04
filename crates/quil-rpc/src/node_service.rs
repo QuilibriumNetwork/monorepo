@@ -63,8 +63,19 @@ pub struct NodeRpcServer {
     /// Optional handler for `NodeService::Send` — verifies
     /// authentication and routes the MessageBundle.
     pub send_handler_fn: Option<SendHandler>,
+    /// When unset, `peer_score` in `GetNodeInfo` returns 0.
+    pub peer_score_provider: Option<PeerScoreProvider>,
     pub workers: Arc<std::sync::RwLock<Vec<WorkerEntry>>>,
 }
+
+/// Async closure returning the local node's peer-score as `f64`. The
+/// handler casts to `u64` by truncation.
+pub type PeerScoreProvider = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = f64> + Send>,
+        > + Send
+        + Sync,
+>;
 
 /// Closure signature for traversal-proof generation.
 pub type TraversalProofGenerator = Arc<
@@ -125,8 +136,14 @@ impl NodeRpcServer {
             peer_info_snapshot: None,
             traversal_proof_generator: None,
             send_handler_fn: None,
+            peer_score_provider: None,
             workers: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    pub fn with_peer_score_provider(mut self, provider: PeerScoreProvider) -> Self {
+        self.peer_score_provider = Some(provider);
+        self
     }
 
     pub fn with_peer_id(mut self, peer_id: String) -> Self {
@@ -276,10 +293,14 @@ impl NodeService for NodeRpcServer {
         &self,
         _request: Request<node::GetNodeInfoRequest>,
     ) -> Result<Response<node::NodeInfoResponse>, Status> {
-        let workers = self.workers.read().unwrap();
-        let running = workers.len() as u32;
-        let allocated = workers.iter().filter(|w| w.allocated).count() as u32;
-        drop(workers);
+        // The non-Send `RwLockReadGuard` must not cross the
+        // peer-score `await` below.
+        let (running, allocated) = {
+            let workers = self.workers.read().unwrap();
+            let running = workers.len() as u32;
+            let allocated = workers.iter().filter(|w| w.allocated).count() as u32;
+            (running, allocated)
+        };
 
         let mut seniority_bytes = vec![0u8; 8];
         let mut shard_allocations = Vec::new();
@@ -322,9 +343,21 @@ impl NodeService for NodeRpcServer {
             }
         }
 
+        let peer_score = match &self.peer_score_provider {
+            Some(provider) => {
+                let score = provider().await;
+                if score.is_finite() && score >= 0.0 {
+                    score as u64
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+
         Ok(Response::new(node::NodeInfoResponse {
             peer_id: self.peer_id.clone(),
-            peer_score: 0,
+            peer_score,
             version: self.version.clone(),
             peer_seniority: seniority_bytes,
             running_workers: running,
@@ -372,16 +405,11 @@ impl NodeService for NodeRpcServer {
         let Some(bundle) = req.request else {
             return Err(Status::invalid_argument("request required"));
         };
-        // Serialize the MessageBundle proto as the payload. Go's
-        // `ToCanonicalBytes` produces a different layout, but for
-        // this admin endpoint the same serialization on both sides
-        // suffices — the payload is forwarded as-is via BlossomSub
-        // and peers run the Rust decoder.
-        use prost::Message;
-        let mut payload: Vec<u8> = Vec::new();
-        bundle
-            .encode(&mut payload)
-            .map_err(|e| Status::internal(format!("encode: {e}")))?;
+        // The signing payload is canonical-bytes, not prost-encoded.
+        let payload = quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(
+            &bundle,
+        )
+        .map_err(|e| Status::internal(format!("canonicalize: {e}")))?;
         handler(req.domain, payload, req.authentication)
             .await
             .map_err(|e| Status::unauthenticated(format!("send rejected: {e}")))?;

@@ -104,4 +104,12 @@ pub trait PeerInfoManager: Send + Sync {
 
     /// Process received peer info.
     fn handle_peer_info(&self, info: &crate::proto::node::PeerInfo) -> Result<()>;
+
+    /// Default implementation scans the broadcast snapshot; override
+    /// for O(1) when a per-peer index is available.
+    fn get_peer_info_for(&self, peer_id: &[u8]) -> Option<crate::proto::node::PeerInfo> {
+        self.get_peer_info()
+            .into_iter()
+            .find(|p| p.peer_id == peer_id)
+    }
 }

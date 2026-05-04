@@ -167,6 +167,36 @@ mod sqrt_tests {
     }
 }
 
+/// Returns `(filter, score)` ascending. Filters in `excluded` are
+/// dropped from the result.
+pub fn rank_allocated_by_score_ascending(
+    allocated_shards: &[ShardDescriptor],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    excluded: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<(Vec<u8>, BigInt)> {
+    if allocated_shards.is_empty() {
+        return Vec::new();
+    }
+    let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
+    let scores = score_shards(allocated_shards, &basis, world_bytes, strategy);
+    let mut out: Vec<(Vec<u8>, BigInt)> = scores
+        .into_iter()
+        .filter_map(|sc| {
+            let filter = allocated_shards[sc.idx].filter.clone();
+            if excluded.contains(&filter) {
+                None
+            } else {
+                Some((filter, sc.score))
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
+
 /// Score shards by expected reward.
 ///
 /// Port of Go's `scoreShards` at `node/consensus/provers/proposer.go:326-392`.

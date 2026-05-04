@@ -179,6 +179,99 @@ impl CanonicalMessageBundle {
 }
 
 // =====================================================================
+// Proto → canonical bytes (signing / authentication path)
+// =====================================================================
+
+/// Encode a proto `MessageRequest`'s oneof variant as canonical inner
+/// bytes (the per-op type-prefixed envelope). Used by the
+/// `NodeService.Send` authentication path which signs over canonical
+/// bytes, not over the proto wire format.
+pub fn proto_message_request_to_canonical_inner_bytes(
+    pb: &quil_types::proto::global::MessageRequest,
+) -> quil_types::error::Result<Vec<u8>> {
+    use quil_types::proto::global::message_request::Request as Inner;
+
+    let inner = pb.request.as_ref().ok_or_else(|| {
+        quil_types::error::QuilError::InvalidArgument(
+            "MessageRequest: missing oneof".into(),
+        )
+    })?;
+
+    match inner {
+        Inner::Join(p) => {
+            crate::global_intrinsic::conversions::prover_join_from_proto(p)
+                .to_canonical_bytes()
+        }
+        Inner::Leave(p) => {
+            crate::global_intrinsic::conversions::prover_leave_from_proto(p)
+                .to_canonical_bytes()
+        }
+        Inner::Pause(p) => {
+            crate::global_intrinsic::conversions::prover_pause_from_proto(p)
+                .to_canonical_bytes()
+        }
+        Inner::Resume(p) => {
+            crate::global_intrinsic::conversions::prover_resume_from_proto(p)
+                .to_canonical_bytes()
+        }
+        Inner::Confirm(p) => {
+            crate::global_intrinsic::conversions::prover_confirm_from_proto(p)
+                .to_canonical_bytes()
+        }
+        Inner::Reject(p) => {
+            crate::global_intrinsic::conversions::prover_reject_from_proto(p)
+                .to_canonical_bytes()
+        }
+        Inner::Update(p) => {
+            crate::global_intrinsic::conversions::prover_update_from_proto(p)
+                .to_canonical_bytes()
+        }
+        // Variants below haven't had `*_from_proto` helpers ported yet.
+        Inner::SeniorityMerge(_)
+        | Inner::Kick(_)
+        | Inner::TokenDeploy(_)
+        | Inner::TokenUpdate(_)
+        | Inner::Transaction(_)
+        | Inner::PendingTransaction(_)
+        | Inner::MintTransaction(_)
+        | Inner::HypergraphDeploy(_)
+        | Inner::HypergraphUpdate(_)
+        | Inner::VertexAdd(_)
+        | Inner::VertexRemove(_)
+        | Inner::HyperedgeAdd(_)
+        | Inner::HyperedgeRemove(_)
+        | Inner::ComputeDeploy(_)
+        | Inner::ComputeUpdate(_)
+        | Inner::CodeDeploy(_)
+        | Inner::CodeExecute(_)
+        | Inner::CodeFinalize(_)
+        | Inner::Shard(_)
+        | Inner::AltShardUpdate(_)
+        | Inner::ShardSplit(_)
+        | Inner::ShardMerge(_) => Err(quil_types::error::QuilError::Internal(
+            "proto_message_request_to_canonical_inner_bytes: variant not yet supported"
+                .into(),
+        )),
+    }
+}
+
+/// Encode a proto `MessageBundle` as canonical bytes.
+pub fn proto_message_bundle_to_canonical_bytes(
+    pb: &quil_types::proto::global::MessageBundle,
+) -> quil_types::error::Result<Vec<u8>> {
+    let mut requests: Vec<Option<CanonicalMessageRequest>> = Vec::with_capacity(pb.requests.len());
+    for req in &pb.requests {
+        let inner_bytes = proto_message_request_to_canonical_inner_bytes(req)?;
+        requests.push(Some(CanonicalMessageRequest::wrap(inner_bytes)?));
+    }
+    let bundle = CanonicalMessageBundle {
+        requests,
+        timestamp: pb.timestamp,
+    };
+    bundle.to_canonical_bytes()
+}
+
+// =====================================================================
 // Tests
 // =====================================================================
 

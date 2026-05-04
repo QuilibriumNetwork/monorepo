@@ -517,6 +517,11 @@ impl PeerInfoManager for InMemoryPeerInfoManager {
         peers.insert(info.peer_id.clone(), info.clone());
         Ok(())
     }
+
+    fn get_peer_info_for(&self, peer_id: &[u8]) -> Option<PeerInfo> {
+        let peers = self.peers.read().unwrap();
+        peers.get(peer_id).cloned()
+    }
 }
 
 #[cfg(test)]

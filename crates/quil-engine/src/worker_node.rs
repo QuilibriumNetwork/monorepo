@@ -559,7 +559,7 @@ pub fn worker_listen_addr(
 /// `/ip4/10.0.0.1/tcp/32501` or `/ip6/::1/tcp/32501`. Returns `None`
 /// for shapes we don't understand; callers fall back to using the
 /// input verbatim.
-fn multiaddr_to_socket_addr(ma: &str) -> Option<String> {
+pub fn multiaddr_to_socket_addr(ma: &str) -> Option<String> {
     if !ma.starts_with('/') {
         return None;
     }

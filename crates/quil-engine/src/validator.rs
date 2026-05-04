@@ -565,6 +565,11 @@ mod tests {
         proposer: &str,
         parent_qc_rank: u64,
     ) -> SignedProposal<AppState, AppVote> {
+        let parent_qc = std::sync::Arc::new(StubQc {
+            rank: parent_qc_rank,
+            id: format!("parent-{}", parent_qc_rank).into_bytes(),
+            agg: StubAgg { bitmask: bitmask_of(&[true, true, true]) },
+        });
         SignedProposal {
             proposal: Proposal {
                 state: State {
@@ -577,6 +582,7 @@ mod tests {
                     state: AppState { id: format!("s-{}", rank).into_bytes(), rank },
                 },
                 previous_rank_timeout_certificate: None,
+                parent_quorum_certificate: parent_qc,
             },
             vote: AppVote { id: proposer.into(), rank, payload: vec![] },
         }

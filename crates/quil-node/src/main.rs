@@ -382,7 +382,8 @@ async fn run_master_node(
     // ---------------------------------------------------------------
     let clock_store = Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
     let token_store = Arc::new(quil_store::RocksTokenStore::new(db_arc.inner()));
-    let _key_store = Arc::new(quil_store::RocksKeyStore::new(db_arc.inner()));
+    let key_store: Arc<quil_store::RocksKeyStore> =
+        Arc::new(quil_store::RocksKeyStore::new(db_arc.inner()));
     let _shards_store = Arc::new(quil_store::RocksShardsStore::new(db_arc.inner()));
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
 
@@ -1025,6 +1026,13 @@ async fn run_master_node(
                 hypergraph: Some(crdt.clone()),
                 execution_engine: Some(exec_manager.clone()),
                 inclusion_prover: Some(inclusion_prover.clone()),
+                // Tag each in-process worker thread for logging so its
+                // events route to `worker-N.log` and carry `coreId=N`
+                // even when the master and workers share one process.
+                worker_init: Some(Arc::new(|core_id: u32| {
+                    crate::logging::set_worker_core_id(core_id);
+                    crate::logging::register_worker_log_file(core_id);
+                })),
             });
             info!(
                 worker_cores = thread_mgr.num_worker_cores(),
@@ -3020,7 +3028,7 @@ async fn run_master_node(
             Arc::new(ClockStoreFrameLookup(clock_store.clone())),
         )
         .with_submit_handler(submit_handler.clone())
-        .with_shards_store(shards_store)
+        .with_shards_store(shards_store.clone())
         .with_worker_snapshot(global_worker_snap)
         .with_global_shards_provider(global_shards_provider)
         .with_message_broadcast(global_msg_tx.clone());
@@ -3071,6 +3079,15 @@ async fn run_master_node(
             let pic = peer_info_cache.clone();
             node_rpc_builder = node_rpc_builder.with_peer_info_snapshot(Arc::new(move || {
                 pic.read().unwrap().values().cloned().collect()
+            }));
+        }
+        {
+            let p2p_handle_for_score = p2p_handle.clone();
+            let self_peer_id_for_score = p2p_handle.peer_id;
+            node_rpc_builder = node_rpc_builder.with_peer_score_provider(Arc::new(move || {
+                let h = p2p_handle_for_score.clone();
+                let pid = self_peer_id_for_score;
+                Box::pin(async move { h.get_peer_score(pid).await })
             }));
         }
 
@@ -3237,48 +3254,250 @@ async fn run_master_node(
         }
         node_rpc_builder = node_rpc_builder.with_workers_view(workers_view.clone());
 
-        // ShardInfoProvider — backs NodeService::get_shard_info.
-        // Implements the trait by walking ProverShardSummary from the
-        // registry: active prover count per shard, size, etc.
-        struct PrReshardInfoProvider {
+        // ShardInfoProvider for NodeService::get_shard_info.
+        // Reads from the local hypergraph; on non-archive
+        // `include_all` requests with incomplete local data, dials
+        // the latest frame's prover and fetches sizes via
+        // GlobalService::GetAppShards.
+        struct LocalShardInfoProvider {
             registry: Arc<dyn quil_types::consensus::ProverRegistry>,
+            clock_store: Arc<dyn quil_types::store::ClockStore>,
+            crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+            shards_store: Arc<dyn quil_types::store::ShardsStore>,
+            self_address: Vec<u8>,
             last_received_frame: Arc<std::sync::atomic::AtomicU64>,
+            key_store: Arc<dyn quil_types::store::KeyStore>,
+            peer_info_lookup: Arc<dyn Fn(&[u8]) -> Vec<String> + Send + Sync>,
+            ed448_seed: Option<[u8; 57]>,
+            archive_mode: bool,
         }
-        impl quil_types::consensus::ShardInfoProvider for PrReshardInfoProvider {
+        impl quil_types::consensus::ShardInfoProvider for LocalShardInfoProvider {
             fn get_shard_info(
                 &self,
-                _include_all: bool,
+                include_all: bool,
             ) -> quil_types::error::Result<(
                 Vec<quil_types::consensus::ShardDetail>,
                 u64,
                 num_bigint::BigInt,
                 u64,
             )> {
-                use quil_types::consensus::{ProverStatus, ShardDetail};
-                let summaries = self.registry.get_prover_shard_summaries()?;
-                let mut details = Vec::with_capacity(summaries.len());
-                for s in &summaries {
-                    let active = s.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0) as u32;
-                    let ring = ((active.saturating_sub(1)) / 8) as u32;
-                    details.push(ShardDetail {
-                        filter: s.filter.clone(),
-                        shard_size: num_bigint::BigInt::from(s.total_size.max(1)),
-                        active_provers: active,
-                        ring,
-                        estimated_reward: num_bigint::BigInt::from(0),
-                        is_allocated: false,
-                        data_shards: 1,
-                    });
+                let (difficulty, frame_number) = match self
+                    .clock_store
+                    .get_latest_global_clock_frame()
+                {
+                    Ok(frame) => {
+                        let h = frame.header.unwrap_or_default();
+                        (h.difficulty as u64, h.frame_number)
+                    }
+                    Err(_) => (
+                        0u64,
+                        self.last_received_frame
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    ),
+                };
+
+                // Skip allocations past the 720-frame grace window.
+                let mut allocated_filters: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
+                let current_frame = self.registry.current_frame();
+                let provers = self
+                    .registry
+                    .get_provers(&self.self_address)
+                    .unwrap_or_default();
+                for pr in &provers {
+                    if pr.address != self.self_address {
+                        continue;
+                    }
+                    for alloc in &pr.allocations {
+                        use quil_types::consensus::ProverStatus;
+                        if alloc.status == ProverStatus::Joining
+                            && current_frame > alloc.join_frame_number + 720
+                        {
+                            continue;
+                        }
+                        if alloc.status == ProverStatus::Left
+                            && current_frame > alloc.leave_frame_number + 720
+                        {
+                            continue;
+                        }
+                        if alloc.status == ProverStatus::Active
+                            || alloc.status == ProverStatus::Joining
+                        {
+                            allocated_filters
+                                .insert(alloc.confirmation_filter.clone());
+                        }
+                    }
                 }
-                let frame = self.last_received_frame.load(std::sync::atomic::Ordering::Relaxed);
-                Ok((details, 0, num_bigint::BigInt::from(0), frame))
+
+                let local_get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
+                    self.crdt.clone(),
+                    self.shards_store.clone(),
+                );
+
+                let local_result = quil_engine::shard_info::get_shard_info(
+                    include_all,
+                    &self.self_address,
+                    &allocated_filters,
+                    difficulty,
+                    frame_number,
+                    self.shards_store.as_ref(),
+                    self.registry.as_ref(),
+                    &local_get_sizes,
+                );
+
+                // Remote fallback: include_all on a non-archive node
+                // requires fetching sizes for shards we don't hold.
+                // Mirrors `shard_info.go:117-138`.
+                let local_incomplete = match &local_result {
+                    Ok((details, _diff, basis, _frame)) => {
+                        details.is_empty() || basis.sign() == num_bigint::Sign::NoSign
+                    }
+                    Err(_) => true,
+                };
+                if !(include_all && !self.archive_mode && local_incomplete) {
+                    return local_result;
+                }
+                let Some(seed) = self.ed448_seed else {
+                    return local_result;
+                };
+
+                // `block_in_place` keeps the multi-thread runtime
+                // alive while we await the dial + prefetch.
+                use std::collections::HashMap;
+                let key_store = self.key_store.clone();
+                let peer_info_lookup = self.peer_info_lookup.clone();
+                let clock_store = self.clock_store.clone();
+                let shards_store = self.shards_store.clone();
+                let prefetched: Result<
+                    HashMap<Vec<u8>, Vec<quil_types::proto::global::AppShardInfo>>,
+                    quil_types::error::QuilError,
+                > = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        let frame = clock_store
+                            .get_latest_global_clock_frame()
+                            .map_err(|e| quil_types::error::QuilError::Internal(
+                                format!("remote shard info: latest frame: {e}"),
+                            ))?;
+                        let mut client = quil_rpc::peer_dial::dial_latest_frame_prover(
+                            &frame,
+                            key_store,
+                            move |peer_id| peer_info_lookup(peer_id),
+                            &seed,
+                        )
+                        .await?;
+
+                        // One RPC per parent shard suffices — GetAppShards
+                        // returns the full sub-shard breakdown.
+                        let mut unique: HashMap<Vec<u8>, ()> = HashMap::new();
+                        for s in shards_store.range_app_shards()? {
+                            unique.insert(s.shard_key, ());
+                        }
+
+                        let mut out: HashMap<Vec<u8>, Vec<quil_types::proto::global::AppShardInfo>> =
+                            HashMap::with_capacity(unique.len());
+                        for shard_key in unique.into_keys() {
+                            match client
+                                .get_app_shards(shard_key.clone(), Vec::new())
+                                .await
+                            {
+                                Ok(infos) => {
+                                    out.insert(shard_key, infos);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        error = %e,
+                                        "remote shard info: get_app_shards failed for one shard",
+                                    );
+                                }
+                            }
+                        }
+                        Ok::<_, quil_types::error::QuilError>(out)
+                    })
+                });
+
+                let prefetched = match prefetched {
+                    Ok(map) => map,
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "remote shard info fallback failed; returning local result",
+                        );
+                        return local_result;
+                    }
+                };
+
+                let prefetched = std::sync::Arc::new(prefetched);
+                let remote_get_sizes = {
+                    let prefetched = prefetched.clone();
+                    move |shard_key: &[u8],
+                          shard_info: &quil_types::store::ShardInfo|
+                          -> quil_types::error::Result<
+                        Vec<quil_engine::shard_info::ShardSizeEntry>,
+                    > {
+                        let infos = match prefetched.get(shard_key) {
+                            Some(v) => v.clone(),
+                            None => return Ok(Vec::new()),
+                        };
+                        let mut out = Vec::with_capacity(infos.len().max(1));
+                        if infos.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        for info in infos {
+                            out.push(quil_engine::shard_info::ShardSizeEntry {
+                                prefix: if info.prefix.is_empty() {
+                                    shard_info.prefix.clone()
+                                } else {
+                                    info.prefix
+                                },
+                                size: info.size,
+                                data_shards: info.data_shards,
+                            });
+                        }
+                        Ok(out)
+                    }
+                };
+
+                quil_engine::shard_info::get_shard_info(
+                    include_all,
+                    &self.self_address,
+                    &allocated_filters,
+                    difficulty,
+                    frame_number,
+                    self.shards_store.as_ref(),
+                    self.registry.as_ref(),
+                    &remote_get_sizes,
+                )
             }
         }
+
+        let pic_for_lookup = peer_info_cache.clone();
+        let peer_info_lookup: Arc<dyn Fn(&[u8]) -> Vec<String> + Send + Sync> =
+            Arc::new(move |peer_id: &[u8]| -> Vec<String> {
+                let map = pic_for_lookup.read().unwrap();
+                match map.get(peer_id) {
+                    Some(info) => info
+                        .reachability
+                        .first()
+                        .map(|r| r.stream_multiaddrs.clone())
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            });
+
         node_rpc_builder = node_rpc_builder.with_shard_info_provider(Arc::new(
-            PrReshardInfoProvider {
+            LocalShardInfoProvider {
                 registry: prover_registry.clone()
                     as Arc<dyn quil_types::consensus::ProverRegistry>,
+                clock_store: clock_store.clone()
+                    as Arc<dyn quil_types::store::ClockStore>,
+                crdt: crdt.clone(),
+                shards_store: shards_store.clone(),
+                self_address: prover_address.to_vec(),
                 last_received_frame: last_received_frame.clone(),
+                key_store: key_store.clone() as Arc<dyn quil_types::store::KeyStore>,
+                peer_info_lookup,
+                ed448_seed: mtls_seed,
+                archive_mode,
             },
         ));
         let node_rpc = node_rpc_builder;

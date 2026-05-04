@@ -293,11 +293,11 @@ where
             }
             world_bytes += &size;
 
-            // Build filter: L2 part of shard_key + prefix bytes.
-            // In the Rust ShardInfo, shard_key = L1 ++ L2. L1 is always
-            // 1 byte, so L2 = shard_key[1..].
-            let l2 = if shard_key.len() > 1 {
-                &shard_key[1..]
+            // `ShardInfo.shard_key` is 35 bytes: `L1[3] ++ L2[32]`.
+            let l2 = if shard_key.len() >= 35 {
+                &shard_key[3..35]
+            } else if shard_key.len() > 3 {
+                &shard_key[3..]
             } else {
                 &shard_key[..]
             };
@@ -460,6 +460,33 @@ where
         .collect();
 
     Ok((details, difficulty, basis, frame_number))
+}
+
+/// `get_sizes` closure for `get_shard_info` that reads sizes from the
+/// local hypergraph CRDT. Falls back to treating the parent shard as
+/// the only sub-shard when the layout is empty.
+pub fn local_app_shard_get_sizes(
+    crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shards_store: std::sync::Arc<dyn ShardsStore>,
+) -> impl Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>> + Send + Sync {
+    move |shard_key: &[u8], shard_info: &ShardInfo| -> Result<Vec<ShardSizeEntry>> {
+        let mut sub_shards = shards_store.get_app_shards(shard_key, &[])?;
+        if sub_shards.is_empty() {
+            sub_shards = vec![shard_info.clone()];
+        }
+
+        let mut out = Vec::with_capacity(sub_shards.len());
+        for sub in &sub_shards {
+            if let Some(meta) = crate::app_shard_metadata::get_app_shard_metadata(&crdt, sub) {
+                out.push(ShardSizeEntry {
+                    prefix: sub.prefix.clone(),
+                    size: meta.size,
+                    data_shards: meta.data_shards,
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Extension trait on BigInt for saturating u64 conversion.

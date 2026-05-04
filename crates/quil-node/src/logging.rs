@@ -1,34 +1,121 @@
-//! Log formatting + file rotation matching Go's zap Console encoder.
-//!
-//! Users have tooling built around the Go log line shape:
+//! Tab-separated log lines with a JSON tail; `coreId` always present.
 //!
 //! ```text
 //! 2026-04-22T01:00:00Z  info  quil_node:490  P2P identity ready  {"coreId": 0, "peer_id": "Qm..."}
 //! ```
 //!
-//! Separators are tabs. Each field matches Go's `zap.NewProductionEncoderConfig`
-//! with `TimeKey="ts"`, `EncodeTime = RFC3339`, `EncodeLevel = Lowercase`,
-//! `EncodeCaller = ShortCaller`. The trailing block is a JSON object of
-//! structured fields; `coreId` is always present so Go parsers that key off
-//! it keep working.
-//!
-//! Per-core file separation (`master.log` / `worker-N.log`) and retention
-//! mirror `utils/logging/file_logger.go`. Rotation honors the `maxAge`
-//! (days) knob via `tracing_appender::rolling::daily`; `maxSize` and
-//! `maxBackups` fall through to a post-rotation reaper. `compress` is
-//! noted but not yet implemented (TODO: gzip reaped rotations).
+//! Per-core file separation (`master.log` / `worker-N.log`) plus
+//! size + age + backup retention.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use tracing::{Event, Subscriber};
+use tracing_appender::non_blocking::NonBlocking;
 use tracing_subscriber::fmt::{
-    format::Writer, FmtContext, FormatEvent, FormatFields, FormattedFields,
+    format::Writer, FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter,
 };
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+
+// Worker threads are pinned to one OS thread; a thread-local
+// `core_id` covers every event the worker emits between `.await`
+// yields.
+
+std::thread_local! {
+    static WORKER_CORE_ID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn set_worker_core_id(core_id: u32) {
+    WORKER_CORE_ID.with(|cell| cell.set(Some(core_id)));
+}
+
+pub fn current_worker_core_id() -> Option<u32> {
+    WORKER_CORE_ID.with(|cell| cell.get())
+}
+
+struct PerCoreFiles {
+    /// Used when no thread tag is set or the tagged worker hasn't
+    /// registered a file yet.
+    master: NonBlocking,
+    workers: RwLock<HashMap<u32, NonBlocking>>,
+    dir: Option<PathBuf>,
+    max_size: i32,
+    max_backups: i32,
+    max_age: i32,
+    compress: bool,
+    /// Held to keep the master appender alive for the process
+    /// lifetime.
+    _master_guard: tracing_appender::non_blocking::WorkerGuard,
+}
+
+static PER_CORE_FILES: OnceLock<Arc<PerCoreFiles>> = OnceLock::new();
+
+/// First call wins per `core_id`; subsequent calls are a no-op.
+pub fn register_worker_log_file(core_id: u32) {
+    let Some(files) = PER_CORE_FILES.get() else {
+        return;
+    };
+    {
+        let map = files.workers.read().unwrap();
+        if map.contains_key(&core_id) {
+            return;
+        }
+    }
+    let Some(dir) = files.dir.as_ref() else {
+        return;
+    };
+    let filename = log_filename_for_core(core_id);
+    let path = dir.join(&filename);
+    let rotate = build_rotating(
+        path.as_path(),
+        files.max_size,
+        files.max_backups,
+        files.compress,
+    );
+    let (nb, guard) = tracing_appender::non_blocking(rotate);
+    // `WorkerGuard` must outlive emission for the worker's lifetime.
+    Box::leak(Box::new(guard));
+    let mut map = files.workers.write().unwrap();
+    map.entry(core_id).or_insert(nb);
+
+    if let Some(dir) = files.dir.as_ref() {
+        spawn_log_reaper(dir.clone(), &filename, files.max_age, 0);
+    }
+}
+
+#[derive(Clone)]
+struct PerCoreFileWriter {
+    files: Arc<PerCoreFiles>,
+}
+
+impl<'a> MakeWriter<'a> for PerCoreFileWriter {
+    type Writer = WorkerRoutedWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        let id = current_worker_core_id();
+        let nb = id
+            .and_then(|cid| self.files.workers.read().unwrap().get(&cid).cloned())
+            .unwrap_or_else(|| self.files.master.clone());
+        WorkerRoutedWriter { inner: nb }
+    }
+}
+
+struct WorkerRoutedWriter {
+    inner: NonBlocking,
+}
+
+impl Write for WorkerRoutedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Format events as `<ts>\t<level>\t<target>\t<message>\t{<fields>}`.
 /// `<ts>` is UTC RFC3339 matching Go's `TimeEncoderOfLayout(time.RFC3339)`.
@@ -86,11 +173,15 @@ where
         let message = visitor.message.unwrap_or_default();
         write!(writer, "{}\t", message)?;
 
-        // Fields — JSON object, always with coreId.
+        // Fields — JSON object, always with coreId. The thread-local
+        // override, set by worker threads at spawn, takes priority so
+        // events emitted from in-process workers carry the worker's
+        // own core id rather than the master's `0`.
         let mut fields = visitor.fields;
+        let core_id = current_worker_core_id().unwrap_or(self.core_id);
         fields.insert(
             "coreId".to_string(),
-            serde_json::Value::Number(self.core_id.into()),
+            serde_json::Value::Number(core_id.into()),
         );
 
         // Include span fields (everything up the active span stack).
@@ -222,8 +313,7 @@ pub fn build_env_filter(
         .unwrap_or_else(|_| EnvFilter::new(base))
 }
 
-/// Per-core filename — `master.log` for `core_id=0`, `worker-N.log`
-/// otherwise. Matches Go's `filenameForCore`.
+/// `master.log` for `core_id=0`, `worker-N.log` otherwise.
 pub fn log_filename_for_core(core_id: u32) -> String {
     if core_id == 0 {
         "master.log".to_string()
@@ -232,25 +322,14 @@ pub fn log_filename_for_core(core_id: u32) -> String {
     }
 }
 
-/// Initialize logging. If `cfg.path` is empty, logs go to stderr with
-/// the zap-console formatter. Otherwise a rotating file is opened at
-/// `<cfg.path>/<core>.log` and stderr is kept as a mirror so
-/// operators still see output when watching a terminal.
+/// `cfg.path` empty → stderr only. Otherwise opens a rotating file
+/// at `<cfg.path>/<core>.log` and keeps stderr as a mirror.
 ///
-/// Rotation semantics (match `utils/logging/file_logger.go` →
-/// `lumberjack`):
-///   * `max_size` (MB) — primary rotation trigger. When the active
-///     file surpasses this size, it's renamed with a timestamp suffix
-///     and a new file is created. If 0, falls back to daily rotation.
-///   * `max_backups` — keep at most N rotated files; older ones are
-///     deleted on rotation (via `file-rotate`'s `FileLimit::MaxFiles`).
-///     0 means unlimited.
-///   * `max_age` (days) — background reaper deletes rotated files
-///     older than N days.
-///   * `compress` — rotated files are gzip'd immediately on rotation.
-///
-/// Returns a `WorkerGuard` that must be held alive for the life of
-/// the process; dropping it flushes the file appender.
+/// Rotation:
+///   * `max_size` MB — rotation trigger (0 → daily).
+///   * `max_backups` — rotated files retained (0 → 1024 cap).
+///   * `max_age` days — reaper deletes older rotations.
+///   * `compress` — gzip on rotation.
 pub fn init_logging(
     cfg: &quil_config::LogConfig,
     core_id: u32,
@@ -259,8 +338,6 @@ pub fn init_logging(
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = build_env_filter(debug, &cfg.log_filters, cli_filter);
 
-    // stderr layer — always on so systemd / terminal operators see
-    // logs regardless of file configuration.
     let stderr_layer = tracing_subscriber::fmt::layer()
         .event_format(ZapConsoleFormat::new(core_id))
         .with_writer(std::io::stderr)
@@ -279,55 +356,32 @@ pub fn init_logging(
     let filename = log_filename_for_core(core_id);
     let log_path = dir.join(&filename);
 
-    // Build the rotation policy. file-rotate does size-based rotation
-    // with timestamp-suffixed rotated files and optional gzip compression
-    // on rotate — matching lumberjack's semantics.
-    let content_limit = if cfg.max_size > 0 {
-        // Go's lumberjack treats MaxSize as MB.
-        file_rotate::ContentLimit::BytesSurpassed((cfg.max_size as usize) * 1024 * 1024)
-    } else {
-        // No explicit size — fall back to daily rotation so files
-        // don't grow unbounded.
-        file_rotate::ContentLimit::Time(file_rotate::TimeFrequency::Daily)
-    };
-
-    let file_limit = if cfg.max_backups > 0 {
-        file_rotate::suffix::FileLimit::MaxFiles(cfg.max_backups as usize)
-    } else {
-        // Go's default when MaxBackups is 0 is "retain all" — we
-        // still want some upper bound to prevent runaway disk use;
-        // pick a conservative cap that the reaper can further prune.
-        file_rotate::suffix::FileLimit::MaxFiles(1024)
-    };
-
-    let compression = if cfg.compress {
-        // `OnRotate(0)` gzips every rotated file immediately; the
-        // argument is the number of unrotated files to keep uncompressed.
-        file_rotate::compression::Compression::OnRotate(0)
-    } else {
-        file_rotate::compression::Compression::None
-    };
-
-    let rotate = file_rotate::FileRotate::new(
+    let rotate = build_rotating(
         log_path.as_path(),
-        file_rotate::suffix::AppendTimestamp::default(file_limit),
-        content_limit,
-        compression,
-        #[cfg(unix)]
-        None,
+        cfg.max_size,
+        cfg.max_backups,
+        cfg.compress,
     );
 
     let (non_blocking, guard) = tracing_appender::non_blocking(rotate);
 
+    let _ = PER_CORE_FILES.set(Arc::new(PerCoreFiles {
+        master: non_blocking.clone(),
+        workers: RwLock::new(HashMap::new()),
+        dir: Some(dir.to_path_buf()),
+        max_size: cfg.max_size,
+        max_backups: cfg.max_backups,
+        max_age: cfg.max_age,
+        compress: cfg.compress,
+        _master_guard: guard,
+    }));
+    let files = PER_CORE_FILES.get().expect("PerCoreFiles just set").clone();
+
     let file_layer = tracing_subscriber::fmt::layer()
         .event_format(ZapConsoleFormat::new(core_id))
-        .with_writer(non_blocking)
+        .with_writer(PerCoreFileWriter { files })
         .with_ansi(false);
 
-    // Age reaper: `max_age` (days) isn't a first-class field of
-    // file-rotate; run a periodic sweep that removes rotated files
-    // older than the cutoff. Keeps `max_backups` enforcement in
-    // file-rotate itself.
     spawn_log_reaper(dir.to_path_buf(), &filename, cfg.max_age, 0);
 
     tracing_subscriber::registry()
@@ -335,12 +389,43 @@ pub fn init_logging(
         .with(stderr_layer)
         .with(file_layer)
         .init();
-    Some(guard)
+    // Master appender is held by `PER_CORE_FILES`.
+    None
 }
 
-/// Background task: periodically delete rotated log files older than
-/// `max_age` days or beyond the `max_backups` count. Mirrors
-/// lumberjack's retention logic.
+fn build_rotating(
+    log_path: &Path,
+    max_size: i32,
+    max_backups: i32,
+    compress: bool,
+) -> file_rotate::FileRotate<file_rotate::suffix::AppendTimestamp> {
+    let content_limit = if max_size > 0 {
+        file_rotate::ContentLimit::BytesSurpassed((max_size as usize) * 1024 * 1024)
+    } else {
+        file_rotate::ContentLimit::Time(file_rotate::TimeFrequency::Daily)
+    };
+    let file_limit = if max_backups > 0 {
+        file_rotate::suffix::FileLimit::MaxFiles(max_backups as usize)
+    } else {
+        file_rotate::suffix::FileLimit::MaxFiles(1024)
+    };
+    let compression = if compress {
+        file_rotate::compression::Compression::OnRotate(0)
+    } else {
+        file_rotate::compression::Compression::None
+    };
+    file_rotate::FileRotate::new(
+        log_path,
+        file_rotate::suffix::AppendTimestamp::default(file_limit),
+        content_limit,
+        compression,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+/// Periodically delete rotated log files older than `max_age` days
+/// or beyond the `max_backups` count.
 fn spawn_log_reaper(dir: std::path::PathBuf, base: &str, max_age: i32, max_backups: i32) {
     if max_age <= 0 && max_backups <= 0 {
         return;
@@ -372,8 +457,7 @@ fn reap_once(
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        // Rolling daily files look like `master.log.YYYY-MM-DD` — only
-        // reap those that belong to our base and have a date suffix.
+        // Skip the live file; only reap rotated suffixed files.
         if !name.starts_with(base) || name == base {
             continue;
         }

@@ -11,6 +11,57 @@ use crate::node::VectorCommitmentNode;
 use crate::serialize::{deserialize_tree, serialize_tree};
 use crate::tree::VectorCommitmentTree;
 
+/// `leaf_count` is `1` for leaves; for branches it's the accumulated
+/// count.
+#[derive(Debug, Clone)]
+pub struct NodeMetadata {
+    pub commitment: Vec<u8>,
+    pub leaf_count: u64,
+    pub size: BigInt,
+}
+
+fn walk_path(
+    node: &VectorCommitmentNode,
+    path: &[i32],
+    depth: usize,
+) -> Option<NodeMetadata> {
+    match node {
+        VectorCommitmentNode::Leaf(leaf) => {
+            if depth == path.len() {
+                Some(NodeMetadata {
+                    commitment: leaf.commitment.clone(),
+                    leaf_count: 1,
+                    size: leaf.size.clone(),
+                })
+            } else {
+                None
+            }
+        }
+        VectorCommitmentNode::Branch(branch) => {
+            let mut d = depth;
+            for &p in &branch.prefix {
+                if d >= path.len() || path[d] != p {
+                    return None;
+                }
+                d += 1;
+            }
+            if d == path.len() {
+                return Some(NodeMetadata {
+                    commitment: branch.commitment.clone(),
+                    leaf_count: branch.leaf_count as u64,
+                    size: branch.size.clone(),
+                });
+            }
+            let nibble = path[d];
+            if !(0..crate::BRANCH_NODES as i32).contains(&nibble) {
+                return None;
+            }
+            let child = branch.children[nibble as usize].as_deref()?;
+            walk_path(child, path, d + 1)
+        }
+    }
+}
+
 /// A lazy-loaded vector commitment tree backed by persistent storage.
 ///
 /// On first access (insert, get, commit), the tree loads its root from
@@ -199,6 +250,25 @@ impl LazyVectorCommitmentTree {
             },
             None => BigInt::zero(),
         }
+    }
+
+    /// Walk to the node at the given 6-bit nibble path. Returns
+    /// `None` when the path doesn't land exactly on a branch or leaf
+    /// (truncated mid-prefix, missing child, or past a leaf).
+    pub fn get_node_metadata_at_path(
+        &self,
+        path: &[i32],
+    ) -> Result<Option<NodeMetadata>> {
+        self.ensure_loaded()?;
+        let inner = self.inner.read().unwrap();
+        let tree = match inner.as_ref() {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let Some(root) = tree.root.as_ref() else {
+            return Ok(None);
+        };
+        Ok(walk_path(root, path, 0))
     }
 
     /// Get (leaf_count, longest_branch) metadata.
@@ -440,6 +510,71 @@ mod tests {
         let txn2 = NoopTxn;
         let root2 = tree2.commit(&txn2, &prover).unwrap();
         assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn metadata_at_path_empty_tree_is_none() {
+        let store = Arc::new(MemStore::new());
+        let tree = LazyVectorCommitmentTree::new(
+            store, "vertex", "adds", test_shard(), vec![],
+        );
+        let m = tree.get_node_metadata_at_path(&[]).unwrap();
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn metadata_at_path_empty_returns_root_branch_for_multi_leaf() {
+        // `branch.size` only aggregates during commit.
+        let store = Arc::new(MemStore::new());
+        let prover = StubProver;
+        let tree = LazyVectorCommitmentTree::new(
+            store, "vertex", "adds", test_shard(), vec![],
+        );
+        // Diverge at depth 0 to force the root to be a branch.
+        tree.insert(&[0x00], b"a", &[], &BigInt::from(1)).unwrap();
+        tree.insert(&[0xFC], b"b", &[], &BigInt::from(2)).unwrap();
+        let txn = NoopTxn;
+        tree.commit(&txn, &prover).unwrap();
+
+        let m = tree
+            .get_node_metadata_at_path(&[])
+            .unwrap()
+            .expect("root branch must exist");
+        assert_eq!(m.leaf_count, 2);
+        assert_eq!(m.size, BigInt::from(3));
+    }
+
+    #[test]
+    fn metadata_at_path_single_leaf_returns_none_at_nonempty_path() {
+        // Single-leaf tree collapses so the leaf sits at root.
+        let store = Arc::new(MemStore::new());
+        let tree = LazyVectorCommitmentTree::new(
+            store, "vertex", "adds", test_shard(), vec![],
+        );
+        tree.insert(&[0xAB], b"v", &[], &BigInt::from(7)).unwrap();
+        let m = tree.get_node_metadata_at_path(&[42]).unwrap();
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn metadata_at_path_descends_into_branch_child() {
+        let store = Arc::new(MemStore::new());
+        let prover = StubProver;
+        let tree = LazyVectorCommitmentTree::new(
+            store, "vertex", "adds", test_shard(), vec![],
+        );
+        // 0xAB's first nibble is 42; 0x00's first nibble is 0.
+        tree.insert(&[0xAB], b"big", &[], &BigInt::from(11)).unwrap();
+        tree.insert(&[0x00], b"x", &[], &BigInt::from(1)).unwrap();
+        let txn = NoopTxn;
+        tree.commit(&txn, &prover).unwrap();
+
+        let m = tree
+            .get_node_metadata_at_path(&[42])
+            .unwrap()
+            .expect("child at slot 42 must exist");
+        assert!(m.leaf_count >= 1);
+        assert_eq!(m.size, BigInt::from(11));
     }
 
     #[test]

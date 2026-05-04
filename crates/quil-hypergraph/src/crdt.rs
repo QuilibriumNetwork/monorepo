@@ -101,6 +101,28 @@ impl HypergraphCrdt {
         self.store.set_covered_prefix(prefix)
     }
 
+    /// Returns `[vertex_adds, vertex_removes, hyperedge_adds,
+    /// hyperedge_removes]` metadata at the path. Absent trees and
+    /// missing nodes contribute `None`.
+    pub fn phase_set_metadata_at_path(
+        &self,
+        shard_key: &ShardKey,
+        full_path: &[i32],
+    ) -> Result<[Option<quil_tries::NodeMetadata>; 4]> {
+        let sets = self.phase_sets.read().unwrap();
+        let read_one = |tree: Option<&LazyVectorCommitmentTree>| -> Result<Option<quil_tries::NodeMetadata>> {
+            match tree {
+                Some(t) => t.get_node_metadata_at_path(full_path),
+                None => Ok(None),
+            }
+        };
+        let va = read_one(sets.vertex_adds.get(shard_key))?;
+        let vr = read_one(sets.vertex_removes.get(shard_key))?;
+        let ha = read_one(sets.hyperedge_adds.get(shard_key))?;
+        let hr = read_one(sets.hyperedge_removes.get(shard_key))?;
+        Ok([va, vr, ha, hr])
+    }
+
     /// Record a published root in the snapshot registry. Mirrors Go
     /// `HypergraphCRDT.PublishSnapshot`. The Rust port uses an in-
     /// memory registry of recent (root, frame_number) pairs without

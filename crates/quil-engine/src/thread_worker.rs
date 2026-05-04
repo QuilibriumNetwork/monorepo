@@ -140,6 +140,8 @@ pub struct WorkerConsensusDeps {
     pub execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
     /// Inclusion prover for the `requests_root` tree commit.
     pub inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
+    /// Invoked once on each worker thread after core-affinity pinning.
+    pub worker_init: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -216,6 +218,12 @@ impl ThreadWorkerManager {
                 if (core_id as usize) < core_ids.len() {
                     if !core_affinity::set_for_current(core_ids[core_id as usize]) {
                         warn!(core_id, "failed to pin thread to core");
+                    }
+                }
+
+                if let Some(deps) = consensus_deps.as_ref() {
+                    if let Some(init) = deps.worker_init.as_ref() {
+                        init(core_id);
                     }
                 }
 
