@@ -142,6 +142,25 @@ pub struct WorkerConsensusDeps {
     pub inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
     /// Invoked once on each worker thread after core-affinity pinning.
     pub worker_init: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    /// Builds the per-worker store + CRDT + execution-engine bundle.
+    /// Called once on the worker thread after `worker_init`. When
+    /// present, its outputs override the shared `clock_store`,
+    /// `hypergraph`, `execution_engine`, and `inclusion_prover`
+    /// fields on this struct for that worker. The master keeps its
+    /// own global state; each worker writes app-shard frames and
+    /// shard data into its own RocksDB.
+    pub worker_state_builder:
+        Option<Arc<dyn Fn(u32) -> std::result::Result<WorkerOwnedDeps, String> + Send + Sync>>,
+}
+
+/// Per-worker state: each worker thread owns its own RocksDB and the
+/// stores / CRDT / execution engine layered on top.
+#[derive(Clone)]
+pub struct WorkerOwnedDeps {
+    pub clock_store: Arc<dyn quil_types::store::ClockStore>,
+    pub hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
+    pub execution_engine: Arc<quil_execution::ExecutionEngineManager>,
+    pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -227,6 +246,29 @@ impl ThreadWorkerManager {
                     }
                 }
 
+                // Confirms per-worker log routing is wired: this line
+                // emits from the worker's OS thread and must land in
+                // `worker-<core_id>.log`. If the file stays empty
+                // after spawn, the routing is broken (thread-local
+                // tag missing, file registry not populated, etc).
+                info!(core_id, "worker thread up");
+
+                let worker_owned: Option<WorkerOwnedDeps> =
+                    consensus_deps
+                        .as_ref()
+                        .and_then(|d| d.worker_state_builder.as_ref())
+                        .and_then(|b| match b(core_id) {
+                            Ok(o) => Some(o),
+                            Err(e) => {
+                                tracing::error!(
+                                    core_id,
+                                    error = %e,
+                                    "worker_state_builder failed; falling back to shared state",
+                                );
+                                None
+                            }
+                        });
+
                 // Create per-thread tokio runtime
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -276,14 +318,34 @@ impl ThreadWorkerManager {
                                             let master_tx_clone = master_tx.clone();
                                             let filter_clone = filter.clone();
                                             let deps = consensus_deps.clone();
+                                            let owned = worker_owned.clone();
                                             tokio::spawn(async move {
                                                 info!(core_id, filter = hex::encode(&filter_clone), "app engine spawned");
 
                                                 if let Some(ref deps) = deps {
+                                                    // Per-worker state when wired; otherwise
+                                                    // the master's shared state.
+                                                    let clock_store = owned
+                                                        .as_ref()
+                                                        .map(|o| o.clock_store.clone())
+                                                        .unwrap_or_else(|| deps.clock_store.clone());
+                                                    let hypergraph = owned
+                                                        .as_ref()
+                                                        .map(|o| Some(o.hypergraph.clone()))
+                                                        .unwrap_or_else(|| deps.hypergraph.clone());
+                                                    let execution_engine = owned
+                                                        .as_ref()
+                                                        .map(|o| Some(o.execution_engine.clone()))
+                                                        .unwrap_or_else(|| deps.execution_engine.clone());
+                                                    let inclusion_prover = owned
+                                                        .as_ref()
+                                                        .map(|o| Some(o.inclusion_prover.clone()))
+                                                        .unwrap_or_else(|| deps.inclusion_prover.clone());
+
                                                     // Create the AppConsensusEngine with full HotStuff integration
                                                     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
                                                     let engine_deps = crate::app_engine::AppEngineDeps {
-                                                        clock_store: deps.clock_store.clone(),
+                                                        clock_store,
                                                         prover_registry: deps.prover_registry.clone(),
                                                         frame_prover: deps.frame_prover.clone(),
                                                         message_collector: deps.message_collector.clone(),
@@ -293,9 +355,9 @@ impl ThreadWorkerManager {
                                                         bls_signer: (deps.bls_signer_factory)(),
                                                         reward_greedy: deps.reward_greedy,
                                                         coverage_publish: deps.coverage_publish.clone(),
-                                                        hypergraph: deps.hypergraph.clone(),
-                                                        execution_engine: deps.execution_engine.clone(),
-                                                        inclusion_prover: deps.inclusion_prover.clone(),
+                                                        hypergraph,
+                                                        execution_engine,
+                                                        inclusion_prover,
                                                     };
                                                     let (engine, app_handle) = crate::app_engine::AppConsensusEngine::new(
                                                         core_id,

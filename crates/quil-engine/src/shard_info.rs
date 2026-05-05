@@ -876,4 +876,378 @@ mod tests {
         // Expired joining allocation should be excluded.
         assert!(!filters.contains(&vec![0xEE]));
     }
+
+    // ---- end-to-end integration ----------------------------------------
+    //
+    // Drives the production path: hypergraph CRDT (with vertices) +
+    // ShardsStore (with persisted shard entries) → `get_shard_info`
+    // with the same `local_app_shard_get_sizes` closure that
+    // `LocalShardInfoProvider` uses. Asserts non-zero size, non-zero
+    // basis, and a populated reward — the values the qclient
+    // `prover manage` TUI displays.
+
+    use std::sync::{Arc, Mutex};
+
+    use quil_hypergraph::{HypergraphCrdt, Location};
+    use quil_types::consensus::{
+        ProverAllocationInfo, ProverInfo, ProverShardSummary, ProverStatus,
+    };
+    use quil_types::crypto::{InclusionProver, Multiproof};
+    use quil_types::error::{QuilError, Result as QResult};
+    use quil_types::store::{
+        ChangeRecord, HypergraphStore, ShardKey as TypedShardKey, ShardsStore as ShardsStoreTrait,
+        Transaction,
+    };
+
+    struct E2EShardsStore {
+        shards: Mutex<Vec<ShardInfo>>,
+    }
+
+    impl E2EShardsStore {
+        fn new() -> Self {
+            Self { shards: Mutex::new(Vec::new()) }
+        }
+        fn push(&self, info: ShardInfo) {
+            self.shards.lock().unwrap().push(info);
+        }
+    }
+
+    impl ShardsStoreTrait for E2EShardsStore {
+        fn range_app_shards(&self) -> QResult<Vec<ShardInfo>> {
+            Ok(self.shards.lock().unwrap().clone())
+        }
+        fn get_app_shards(&self, shard_key: &[u8], _prefix: &[u32]) -> QResult<Vec<ShardInfo>> {
+            Ok(self
+                .shards
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.shard_key == shard_key)
+                .cloned()
+                .collect())
+        }
+        fn put_app_shard(&self, _: &dyn Transaction, shard: &ShardInfo) -> QResult<()> {
+            self.shards.lock().unwrap().push(shard.clone());
+            Ok(())
+        }
+        fn delete_app_shard(&self, _: &dyn Transaction, _key: &[u8], _prefix: &[u32]) -> QResult<()> {
+            Ok(())
+        }
+    }
+
+    struct E2EHgStore {
+        nodes: Mutex<HashMap<String, Vec<u8>>>,
+    }
+    impl E2EHgStore {
+        fn new() -> Self { Self { nodes: Mutex::new(HashMap::new()) } }
+        fn key(set: &str, phase: &str, shard: &TypedShardKey, k: &[u8]) -> String {
+            format!("{}/{}/{:?}{:?}/{:?}", set, phase, shard.l1, shard.l2, k)
+        }
+    }
+    struct NoopTxn;
+    impl Transaction for NoopTxn {
+        fn get(&self, _: &[u8]) -> QResult<Option<Vec<u8>>> { Ok(None) }
+        fn set(&self, _: &[u8], _: &[u8]) -> QResult<()> { Ok(()) }
+        fn commit(self: Box<Self>) -> QResult<()> { Ok(()) }
+        fn delete(&self, _: &[u8]) -> QResult<()> { Ok(()) }
+        fn abort(self: Box<Self>) -> QResult<()> { Ok(()) }
+        fn new_iter(&self, _: &[u8], _: &[u8]) -> QResult<Box<dyn quil_types::store::Iterator>> {
+            Err(QuilError::Internal("noop".into()))
+        }
+        fn delete_range(&self, _: &[u8], _: &[u8]) -> QResult<()> { Ok(()) }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+    impl HypergraphStore for E2EHgStore {
+        fn new_transaction(&self, _: bool) -> QResult<Box<dyn Transaction>> { Ok(Box::new(NoopTxn)) }
+        fn get_node_by_key(&self, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8]) -> QResult<Option<Vec<u8>>> {
+            Ok(self.nodes.lock().unwrap().get(&Self::key(set, phase, shard, k)).cloned())
+        }
+        fn get_node_by_path(&self, _: &str, _: &str, _: &TypedShardKey, _: &[i32]) -> QResult<Option<Vec<u8>>> { Ok(None) }
+        fn insert_node(&self, _: &dyn Transaction, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8], _: &[i32], data: &[u8]) -> QResult<()> {
+            self.nodes.lock().unwrap().insert(Self::key(set, phase, shard, k), data.to_vec());
+            Ok(())
+        }
+        fn save_root(&self, _: &dyn Transaction, _: &str, _: &str, _: &TypedShardKey, _: &[u8]) -> QResult<()> { Ok(()) }
+        fn delete_node(&self, _: &dyn Transaction, _: &str, _: &str, _: &TypedShardKey, _: &[u8], _: &[i32]) -> QResult<()> { Ok(()) }
+        fn set_covered_prefix(&self, _: &[i32]) -> QResult<()> { Ok(()) }
+        fn set_shard_commit(&self, _: &dyn Transaction, _: u64, _: &str, _: &str, _: &[u8], _: &[u8]) -> QResult<()> { Ok(()) }
+        fn get_shard_commit(&self, _: u64, _: &str, _: &str, _: &[u8]) -> QResult<Vec<u8>> { Ok(vec![]) }
+        fn get_root_commits(&self, _: u64) -> QResult<HashMap<TypedShardKey, Vec<Vec<u8>>>> { Ok(HashMap::new()) }
+        fn load_vertex_underlying_raw(&self, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8]) -> QResult<Option<Vec<u8>>> {
+            Ok(self.nodes.lock().unwrap().get(&Self::key(set, phase, shard, k)).cloned())
+        }
+        fn apply_snapshot(&self, _: &str) -> QResult<()> { Ok(()) }
+        fn set_alt_shard_commit(&self, _: &dyn Transaction, _: u64, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> QResult<()> { Ok(()) }
+        fn get_latest_alt_shard_commit(&self, _: &[u8]) -> QResult<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> { Ok((vec![], vec![], vec![], vec![])) }
+        fn range_alt_shard_addresses(&self) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
+        fn reap_old_changesets(&self, _: &dyn Transaction, _: u64) -> QResult<()> { Ok(()) }
+        fn track_change(&self, _: &dyn Transaction, _: &[u8], _: Option<&[u8]>, _: u64, _: &str, _: &str, _: &TypedShardKey) -> QResult<()> { Ok(()) }
+        fn get_changes(&self, _: u64, _: u64, _: &str, _: &str, _: &TypedShardKey) -> QResult<Vec<ChangeRecord>> { Ok(vec![]) }
+        fn untrack_change(&self, _: &dyn Transaction, _: &[u8], _: u64, _: &str, _: &str, _: &TypedShardKey) -> QResult<()> { Ok(()) }
+    }
+
+    struct StubInclusion;
+    impl InclusionProver for StubInclusion {
+        fn commit_raw(&self, data: &[u8], _: u64) -> QResult<Vec<u8>> {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            data.hash(&mut h);
+            let hash = h.finish().to_be_bytes();
+            let mut out = vec![0u8; 64];
+            out[..8].copy_from_slice(&hash);
+            Ok(out)
+        }
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> QResult<Vec<u8>> { Ok(vec![0u8; 64]) }
+        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> QResult<bool> { Ok(true) }
+        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> QResult<Box<dyn Multiproof>> {
+            Err(QuilError::Internal("nope".into()))
+        }
+        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+    }
+
+    struct StubRegistry {
+        prover_addr: Vec<u8>,
+        prover_pubkey: Vec<u8>,
+    }
+    impl ProverRegistry for StubRegistry {
+        fn refresh(&self) -> QResult<()> { Ok(()) }
+        fn get_all_active_app_shard_provers(&self) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
+        fn get_prover_info(&self, _: &[u8]) -> QResult<Option<ProverInfo>> { Ok(None) }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> QResult<Vec<u8>> { Ok(vec![]) }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
+        fn get_active_provers(&self, _: &[u8]) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
+        fn get_prover_count(&self, _: &[u8]) -> QResult<usize> { Ok(0) }
+        fn get_provers(&self, filter: &[u8]) -> QResult<Vec<ProverInfo>> {
+            // Single Active prover on every queried filter.
+            Ok(vec![ProverInfo {
+                public_key: self.prover_pubkey.clone(),
+                address: self.prover_addr.clone(),
+                status: ProverStatus::Active,
+                kick_frame_number: 0,
+                allocations: vec![ProverAllocationInfo {
+                    status: ProverStatus::Active,
+                    confirmation_filter: filter.to_vec(),
+                    rejection_filter: vec![],
+                    join_frame_number: 1,
+                    leave_frame_number: 0,
+                    pause_frame_number: 0,
+                    resume_frame_number: 0,
+                    kick_frame_number: 0,
+                    join_confirm_frame_number: 2,
+                    join_reject_frame_number: 0,
+                    leave_confirm_frame_number: 0,
+                    leave_reject_frame_number: 0,
+                    last_active_frame_number: 100,
+                    vertex_address: vec![],
+                }],
+                available_storage: 1 << 30,
+                seniority: 0,
+                delegate_address: vec![],
+            }])
+        }
+        fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
+        fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> QResult<()> { Ok(()) }
+        fn get_prover_shard_summaries(&self) -> QResult<Vec<ProverShardSummary>> { Ok(vec![]) }
+        fn prune_orphan_joins(&self, _: u64) -> QResult<()> { Ok(()) }
+        fn evict_inactive_provers(
+            &self,
+            _: u64,
+            _: u64,
+            _: &HashMap<String, u64>,
+        ) -> QResult<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+        fn current_frame(&self) -> u64 { 100 }
+    }
+
+    #[test]
+    fn end_to_end_get_shard_info_reports_real_size_and_reward() {
+        // Build the full chain that the production
+        // `LocalShardInfoProvider` exercises.
+        let hg_store: Arc<dyn HypergraphStore> = Arc::new(E2EHgStore::new());
+        let prover: Arc<dyn InclusionProver> = Arc::new(StubInclusion);
+        let crdt = Arc::new(HypergraphCrdt::new(hg_store, prover));
+
+        // Insert a vertex so `vertex_adds` has a leaf with non-zero size.
+        let mut app_address = [0xCDu8; 32];
+        app_address[0] = 0xAB;
+        let location = Location {
+            app_address,
+            data_address: [0x11u8; 32],
+        };
+        let payload = b"some-vertex-payload-for-size-check";
+        crdt.add_vertex(&location, payload).unwrap();
+
+        // Persist the shard entry the way the global intrinsic would
+        // — `shard_key = L1 || L2`, no sub-prefix.
+        let typed_key = quil_hypergraph::addressing::shard_key_for_location(&location);
+        let mut shard_key_bytes = Vec::with_capacity(35);
+        shard_key_bytes.extend_from_slice(&typed_key.l1);
+        shard_key_bytes.extend_from_slice(&typed_key.l2);
+        let shards_store = Arc::new(E2EShardsStore::new());
+        shards_store.push(ShardInfo {
+            shard_key: shard_key_bytes.clone(),
+            prefix: vec![],
+            size: vec![],
+            data_shards: 0,
+            commitment: vec![],
+        });
+
+        // Stub a registry that returns 1 Active prover for any filter.
+        let prover_addr = vec![0x77u8; 32];
+        let registry = StubRegistry {
+            prover_addr: prover_addr.clone(),
+            prover_pubkey: vec![0xBBu8; 74],
+        };
+
+        let get_sizes = local_app_shard_get_sizes(
+            crdt.clone(),
+            shards_store.clone() as Arc<dyn ShardsStoreTrait>,
+        );
+
+        // Mirror what `LocalShardInfoProvider` builds: we are the
+        // single allocated prover, so include the shard via
+        // allocated_filters. (`include_all=false` would also include
+        // it; `include_all=true` includes everything.)
+        let allocated_filters: HashSet<Vec<u8>> =
+            std::iter::once(typed_key.l2.to_vec()).collect();
+
+        let (details, difficulty, basis, frame_number) = get_shard_info(
+            true,           // include_all
+            &prover_addr,
+            &allocated_filters,
+            10_000,         // difficulty (non-zero so basis > 0)
+            123,            // frame_number
+            shards_store.as_ref(),
+            &registry,
+            &get_sizes,
+        )
+        .expect("get_shard_info must succeed");
+
+        // Sanity: non-zero output everywhere.
+        assert_eq!(difficulty, 10_000);
+        assert_eq!(frame_number, 123);
+        assert!(
+            !details.is_empty(),
+            "details must not be empty — TUI shows zero rows otherwise"
+        );
+        assert!(
+            !basis.is_zero(),
+            "pomw_basis must be non-zero — reward depends on it"
+        );
+
+        let entry = &details[0];
+        assert!(
+            !entry.shard_size.is_zero(),
+            "shard_size must be non-zero — TUI shows 0 otherwise"
+        );
+        assert_eq!(
+            entry.shard_size,
+            num_bigint::BigInt::from(payload.len()),
+            "shard_size should match the inserted vertex payload length"
+        );
+        assert!(
+            entry.data_shards >= 1,
+            "data_shards must be >= 1 — TUI shows 0 otherwise"
+        );
+        assert!(
+            entry.active_provers >= 1,
+            "active_provers must be >= 1 — TUI shows 0 otherwise"
+        );
+        assert!(
+            !entry.estimated_reward.is_zero(),
+            "estimated_reward must be non-zero — TUI shows 0 otherwise"
+        );
+    }
+
+    /// A non-archive prover allocated to one shard out of many. The
+    /// local hypergraph only carries data for that one shard; the
+    /// other shard entries score zero locally and get dropped. The
+    /// remote-fallback trigger logic in `LocalShardInfoProvider`
+    /// should kick in because `details.len() < shard_count`. This
+    /// test pins down the *signal* the trigger relies on: that local
+    /// `get_shard_info` returns fewer entries than the unique shard
+    /// count, so the trigger has something to detect.
+    #[test]
+    fn partial_local_returns_fewer_entries_than_shards() {
+        let hg_store: Arc<dyn HypergraphStore> = Arc::new(E2EHgStore::new());
+        let prover: Arc<dyn InclusionProver> = Arc::new(StubInclusion);
+        let crdt = Arc::new(HypergraphCrdt::new(hg_store, prover));
+
+        // Insert vertex on one shard.
+        let mut a1 = [0xCDu8; 32];
+        a1[0] = 0xAB;
+        let loc_a = Location { app_address: a1, data_address: [0x11u8; 32] };
+        crdt.add_vertex(&loc_a, b"data-a").unwrap();
+
+        // Persist three shard entries — only the first has trie data.
+        let mut shard_key = |a: &[u8; 32]| {
+            let typed = quil_hypergraph::addressing::shard_key_for_location(&Location {
+                app_address: *a,
+                data_address: [0u8; 32],
+            });
+            let mut out = Vec::with_capacity(35);
+            out.extend_from_slice(&typed.l1);
+            out.extend_from_slice(&typed.l2);
+            out
+        };
+        let mut a2 = [0xEFu8; 32];
+        a2[0] = 0x12;
+        let mut a3 = [0x77u8; 32];
+        a3[0] = 0x55;
+
+        let shards_store = Arc::new(E2EShardsStore::new());
+        for app in [a1, a2, a3] {
+            shards_store.push(ShardInfo {
+                shard_key: shard_key(&app),
+                prefix: vec![],
+                size: vec![],
+                data_shards: 0,
+                commitment: vec![],
+            });
+        }
+
+        let prover_addr = vec![0x77u8; 32];
+        let registry = StubRegistry {
+            prover_addr: prover_addr.clone(),
+            prover_pubkey: vec![0xBBu8; 74],
+        };
+        let get_sizes = local_app_shard_get_sizes(
+            crdt.clone(),
+            shards_store.clone() as Arc<dyn ShardsStoreTrait>,
+        );
+        let allocated_filters: HashSet<Vec<u8>> = HashSet::new();
+
+        let (details, _diff, basis, _frame) = get_shard_info(
+            true,
+            &prover_addr,
+            &allocated_filters,
+            10_000,
+            123,
+            shards_store.as_ref(),
+            &registry,
+            &get_sizes,
+        )
+        .expect("get_shard_info");
+
+        // Three unique shard_keys persisted; only one has data.
+        let unique_shard_keys: std::collections::HashSet<Vec<u8>> = shards_store
+            .shards
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.shard_key.clone())
+            .collect();
+        assert_eq!(unique_shard_keys.len(), 3);
+        assert!(!basis.is_zero(), "basis must be non-zero (one shard has data)");
+        assert!(
+            details.len() < unique_shard_keys.len(),
+            "details ({}) must be fewer than shards ({}) — this is the \
+             signal `LocalShardInfoProvider` uses to trigger the remote \
+             fallback",
+            details.len(),
+            unique_shard_keys.len()
+        );
+    }
 }

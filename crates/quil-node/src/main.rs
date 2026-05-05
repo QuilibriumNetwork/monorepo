@@ -1009,6 +1009,85 @@ async fn run_master_node(
                         Err(e) => warn!(error = %e, "coverage publish: bundle encode failed"),
                     }
                 });
+            // Per-worker state builder: each thread-mode worker opens
+            // its own RocksDB (resolved from db.worker_paths /
+            // worker_path_prefix / fallback) and builds its own
+            // clock_store, hypergraph CRDT, and execution engine on
+            // top. Master keeps its own global stores untouched.
+            let worker_db_base = config.db.path.clone();
+            let worker_paths_cfg = config.db.worker_paths.clone();
+            let worker_path_prefix_cfg = config.db.worker_path_prefix.clone();
+            let worker_state_builder: Arc<
+                dyn Fn(u32) -> std::result::Result<
+                    quil_engine::thread_worker::WorkerOwnedDeps,
+                    String,
+                > + Send
+                    + Sync,
+            > = Arc::new(move |core_id: u32| {
+                let path: std::path::PathBuf = {
+                    let idx = core_id.saturating_sub(1) as usize;
+                    if let Some(p) = worker_paths_cfg.get(idx).filter(|s| !s.is_empty()) {
+                        std::path::PathBuf::from(p)
+                    } else if !worker_path_prefix_cfg.is_empty() {
+                        std::path::PathBuf::from(
+                            worker_path_prefix_cfg.replace("%d", &core_id.to_string()),
+                        )
+                    } else {
+                        let base = if worker_db_base.is_empty() {
+                            std::path::PathBuf::from(".config/store")
+                        } else {
+                            std::path::PathBuf::from(&worker_db_base)
+                        };
+                        base.join(format!("worker-{}", core_id))
+                    }
+                };
+                std::fs::create_dir_all(&path).map_err(|e| {
+                    format!("worker {} mkdir {}: {e}", core_id, path.display())
+                })?;
+                let db = quil_store::RocksDb::open(&path).map_err(|e| {
+                    format!("worker {} open db {}: {e}", core_id, path.display())
+                })?;
+                let db_arc = Arc::new(db);
+                let clock_store: Arc<dyn quil_types::store::ClockStore> = Arc::new(
+                    quil_store::RocksClockStore::new(db_arc.inner()),
+                );
+                let hg_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(
+                    quil_store::RocksHypergraphStore::new(db_arc.inner()),
+                );
+                let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
+                    Arc::new(quil_crypto::KzgInclusionProver);
+                let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                    hg_store,
+                    inclusion_prover.clone(),
+                ));
+                // Workers don't sign or verify identities — a default
+                // key manager satisfies the execution engine's
+                // `KeyManager` requirement for state materialization.
+                let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =
+                    Arc::new(quil_crypto::Bls48581KeyConstructor);
+                let worker_key_manager: Arc<dyn quil_types::crypto::KeyManager> =
+                    Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
+                let exec_manager = Arc::new(
+                    quil_execution::ExecutionEngineManager::new_with_crypto(
+                        inclusion_prover.clone(),
+                        worker_key_manager,
+                        crdt.clone(),
+                        true,
+                    ),
+                );
+                tracing::info!(
+                    core_id,
+                    path = %path.display(),
+                    "worker state initialized"
+                );
+                Ok(quil_engine::thread_worker::WorkerOwnedDeps {
+                    clock_store,
+                    hypergraph: crdt,
+                    execution_engine: exec_manager,
+                    inclusion_prover,
+                })
+            });
+
             thread_mgr.set_consensus_deps(quil_engine::thread_worker::WorkerConsensusDeps {
                 prover_registry: prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
                 frame_prover: frame_prover.clone(),
@@ -1023,16 +1102,16 @@ async fn run_master_node(
                 }),
                 reward_greedy,
                 coverage_publish: Some(coverage_publish),
+                // Master's global state, used as fallback when the
+                // per-worker builder fails or isn't wired.
                 hypergraph: Some(crdt.clone()),
                 execution_engine: Some(exec_manager.clone()),
                 inclusion_prover: Some(inclusion_prover.clone()),
-                // Tag each in-process worker thread for logging so its
-                // events route to `worker-N.log` and carry `coreId=N`
-                // even when the master and workers share one process.
                 worker_init: Some(Arc::new(|core_id: u32| {
                     crate::logging::set_worker_core_id(core_id);
                     crate::logging::register_worker_log_file(core_id);
                 })),
+                worker_state_builder: Some(worker_state_builder),
             });
             info!(
                 worker_cores = thread_mgr.num_worker_cores(),
@@ -3134,14 +3213,27 @@ async fn run_master_node(
         // is taken from the keystore's `q-peer-key` so qclient (which
         // signs with that same key) authenticates correctly. Falls
         // back to deriving from `mtls_seed` if the key isn't present.
-        let peer_ed448_pub: Option<Vec<u8>> = file_key_manager
-            .get_signer_by_id("q-peer-key")
-            .ok()
-            .map(|s| s.public_key().to_vec())
-            .or_else(|| mtls_seed.as_ref().map(|seed| {
-                quil_p2p::ed448_identity::derive_public_key(seed)
-            }));
+        let (peer_ed448_pub, peer_key_source): (Option<Vec<u8>>, &'static str) =
+            match file_key_manager.get_signer_by_id("q-peer-key") {
+                Ok(s) => (Some(s.public_key().to_vec()), "keystore q-peer-key"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "q-peer-key not loaded; Send will fall back to mtls_seed");
+                    match mtls_seed.as_ref() {
+                        Some(seed) => (
+                            Some(quil_p2p::ed448_identity::derive_public_key(seed)),
+                            "config.p2p.peer_priv_key (mtls_seed)",
+                        ),
+                        None => (None, ""),
+                    }
+                }
+            };
         if let Some(peer_ed448_pub) = peer_ed448_pub {
+            tracing::info!(
+                pubkey_prefix = %hex::encode(&peer_ed448_pub[..peer_ed448_pub.len().min(8)]),
+                pubkey_len = peer_ed448_pub.len(),
+                source = peer_key_source,
+                "Send authentication pubkey wired"
+            );
             let send_p2p = p2p_handle.clone();
             let send_handler: quil_rpc::SendHandler = Arc::new(
                 move |domain: Vec<u8>, payload: Vec<u8>, authentication: Vec<u8>|
@@ -3166,8 +3258,17 @@ async fn run_master_node(
                         // "context" arg of RFC 8032 (pre-hashed = false).
                         let pk = ed448_rust::PublicKey::try_from(ed448_pub.as_slice())
                             .map_err(|e| format!("bad pubkey: {:?}", e))?;
-                        pk.verify(&payload, &authentication, Some(&context))
-                            .map_err(|e| format!("authentication failed: {:?}", e))?;
+                        if let Err(e) = pk.verify(&payload, &authentication, Some(&context)) {
+                            tracing::warn!(
+                                pubkey_prefix = %hex::encode(&ed448_pub[..ed448_pub.len().min(8)]),
+                                payload_len = payload.len(),
+                                auth_len = authentication.len(),
+                                domain_prefix = %hex::encode(&domain[..domain.len().min(8)]),
+                                error = ?e,
+                                "Send Ed448 verify failed"
+                            );
+                            return Err(format!("authentication failed: {:?}", e));
+                        }
 
                         // Route: global domain → GLOBAL_PROVER, else bloom-
                         // filter indices.
@@ -3354,16 +3455,32 @@ async fn run_master_node(
                     &local_get_sizes,
                 );
 
-                // Remote fallback: include_all on a non-archive node
-                // requires fetching sizes for shards we don't hold.
-                // Mirrors `shard_info.go:117-138`.
+                // Remote fallback. Two triggers, matching Go:
+                //   * basis == 0       — local data is empty everywhere.
+                //   * include_all && !archive && partial local — we got
+                //     entries for some shards but not all (typical
+                //     non-archive: only its allocated shards have data).
+                let expected_shards: usize = self
+                    .shards_store
+                    .range_app_shards()
+                    .map(|v| {
+                        let mut keys: std::collections::HashSet<Vec<u8>> =
+                            std::collections::HashSet::new();
+                        for s in v {
+                            keys.insert(s.shard_key);
+                        }
+                        keys.len()
+                    })
+                    .unwrap_or(0);
                 let local_incomplete = match &local_result {
                     Ok((details, _diff, basis, _frame)) => {
-                        details.is_empty() || basis.sign() == num_bigint::Sign::NoSign
+                        let entries_below_shards =
+                            include_all && !self.archive_mode && details.len() < expected_shards;
+                        basis.sign() == num_bigint::Sign::NoSign || entries_below_shards
                     }
                     Err(_) => true,
                 };
-                if !(include_all && !self.archive_mode && local_incomplete) {
+                if !local_incomplete {
                     return local_result;
                 }
                 let Some(seed) = self.ed448_seed else {

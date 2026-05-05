@@ -602,11 +602,23 @@ impl ProverLifecycle {
 
         let world_bytes = compute_world_bytes_from_summaries(&summaries);
 
-        // Go's allowProposals: a free worker exists (matches
-        // `worker_allocator.go:171-181`). Only gates Propose{Join,Leave};
-        // Decide{Joins,Leaves} always run.
+        // A worker counts as free only when:
+        //   * its filter slot is empty,
+        //   * it isn't manually-managed,
+        //   * and it has no in-flight proposal (`pending_filter_frame`
+        //     stays set until the registry commits the join and the
+        //     reconciler installs the filter, or until 10 frames pass
+        //     and the proposal times out).
+        // The third condition prevents over-proposing while a join is
+        // still in flight: between `submit_join` (which records the
+        // pending frame) and registry confirmation, the worker has an
+        // empty filter but a non-zero pending frame.
         let free_worker_ids: Vec<u32> = workers.iter()
-            .filter(|w| w.filter.is_empty() && !w.manually_managed)
+            .filter(|w| {
+                w.filter.is_empty()
+                    && !w.manually_managed
+                    && w.pending_filter_frame == 0
+            })
             .map(|w| w.core_id)
             .collect();
         let allow_proposals = !free_worker_ids.is_empty();
@@ -1678,6 +1690,45 @@ mod proposal_loop_tests {
         assert!(
             !actions.is_empty(),
             "actions should emit once tree is synced; got empty"
+        );
+    }
+
+    /// Workers with a non-zero `pending_filter_frame` (an in-flight
+    /// join proposal that hasn't been confirmed in the registry yet)
+    /// must NOT be counted as free. Without this gate, the lifecycle
+    /// proposes another join for the same worker on the next cycle,
+    /// piling up pending allocations.
+    #[test]
+    fn workers_with_pending_filter_frame_are_not_free() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // Worker has empty filter (registry hasn't confirmed yet) but
+        // a pending proposal recorded by submit_join.
+        let mut pending_worker = idle_worker(1);
+        pending_worker.pending_filter_frame = 95;
+        wm.add(pending_worker);
+
+        reg.set_prover(prover(address.clone(), vec![]));
+        reg.set_summaries(vec![
+            shard_summary(filter_bytes(0xC0), 1),
+            shard_summary(filter_bytes(0xC1), 1),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            count_proposed_joins(&actions),
+            0,
+            "must not propose joins for workers with in-flight proposals; got {:?}",
+            actions
         );
     }
 

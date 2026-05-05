@@ -27,20 +27,40 @@ fn walk_path(
 ) -> Option<NodeMetadata> {
     match node {
         VectorCommitmentNode::Leaf(leaf) => {
-            if depth == path.len() {
-                Some(NodeMetadata {
-                    commitment: leaf.commitment.clone(),
-                    leaf_count: 1,
-                    size: leaf.size.clone(),
-                })
-            } else {
-                None
+            // A leaf matches if the queried path is a prefix of the
+            // leaf's full nibble path. Prefix-compressed tries collapse
+            // single-leaf subtrees to the root, so a deeper-than-leaf
+            // query must still find the leaf when its key starts with
+            // the queried prefix.
+            let leaf_path = crate::nibble::get_full_path(&leaf.key);
+            if path.len().saturating_sub(depth) > leaf_path.len() {
+                return None;
             }
+            for i in depth..path.len() {
+                if leaf_path[i] != path[i] {
+                    return None;
+                }
+            }
+            Some(NodeMetadata {
+                commitment: leaf.commitment.clone(),
+                leaf_count: 1,
+                size: leaf.size.clone(),
+            })
         }
         VectorCommitmentNode::Branch(branch) => {
             let mut d = depth;
             for &p in &branch.prefix {
-                if d >= path.len() || path[d] != p {
+                // Branch's compressed prefix extends beyond the query.
+                // Everything under this branch has the query as a
+                // prefix, so the branch's aggregate is what we want.
+                if d >= path.len() {
+                    return Some(NodeMetadata {
+                        commitment: branch.commitment.clone(),
+                        leaf_count: branch.leaf_count as u64,
+                        size: branch.size.clone(),
+                    });
+                }
+                if path[d] != p {
                     return None;
                 }
                 d += 1;
@@ -545,15 +565,26 @@ mod tests {
     }
 
     #[test]
-    fn metadata_at_path_single_leaf_returns_none_at_nonempty_path() {
-        // Single-leaf tree collapses so the leaf sits at root.
+    fn metadata_at_path_single_leaf_matches_prefix() {
+        // Single-leaf tree: the leaf sits at root after prefix
+        // compression. Walking with a path that's a prefix of the
+        // leaf's key must still return the leaf.
         let store = Arc::new(MemStore::new());
         let tree = LazyVectorCommitmentTree::new(
             store, "vertex", "adds", test_shard(), vec![],
         );
         tree.insert(&[0xAB], b"v", &[], &BigInt::from(7)).unwrap();
-        let m = tree.get_node_metadata_at_path(&[42]).unwrap();
-        assert!(m.is_none());
+        // 0xAB's first nibble is 42.
+        let m = tree
+            .get_node_metadata_at_path(&[42])
+            .unwrap()
+            .expect("leaf must match prefix");
+        assert_eq!(m.leaf_count, 1);
+        assert_eq!(m.size, BigInt::from(7));
+
+        // Mismatched nibble still returns None.
+        let m_miss = tree.get_node_metadata_at_path(&[0]).unwrap();
+        assert!(m_miss.is_none());
     }
 
     #[test]

@@ -245,14 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_with_vertex_returns_well_formed_metadata() {
-        // Single-vertex shards collapse so the leaf sits at root —
-        // walking the L2 path returns `None` and we fall back to
-        // the zero-metadata shape. Multi-leaf path-walk coverage
-        // lives in `lazy_tree`'s own tests.
-        //
-        // Here we only assert that the call returns a well-formed
-        // `AppShardMetadata` for a populated shard.
+    fn shard_with_vertex_reports_nonzero_metadata() {
         let crdt = make_crdt();
 
         let mut app_address = [0xCDu8; 32];
@@ -261,7 +254,8 @@ mod tests {
             app_address,
             data_address: [0x11u8; 32],
         };
-        crdt.add_vertex(&location, b"some-vertex-payload").unwrap();
+        let payload = b"some-vertex-payload";
+        crdt.add_vertex(&location, payload).unwrap();
 
         let typed = quil_hypergraph::addressing::shard_key_for_location(&location);
         let mut shard_key_bytes = Vec::with_capacity(35);
@@ -277,11 +271,11 @@ mod tests {
         };
 
         let meta = get_app_shard_metadata(&crdt, &shard).expect("valid key");
-        // Well-formed shape: 4 phase commitments, prefix matches.
         assert_eq!(meta.commitments.len(), 4);
         for c in &meta.commitments {
             assert_eq!(c.len(), 64, "phase commitment must be 64 bytes");
         }
-        assert_eq!(meta.prefix, Vec::<u32>::new());
+        assert_eq!(meta.size_bigint(), num_bigint::BigInt::from(payload.len()));
+        assert_eq!(meta.data_shards, 1);
     }
 }
