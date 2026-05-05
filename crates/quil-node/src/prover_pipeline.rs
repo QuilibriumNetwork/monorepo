@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use quil_engine::provers::lifecycle::{LifecycleAction, ProverLifecycle};
 use quil_engine::worker::WorkerManager;
@@ -83,7 +83,7 @@ impl ProverPipeline {
             LifecycleAction::ConfirmJoins { filters, frame_number } => {
                 let me = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_confirm(filters, frame_number).await {
+                    if let Err(e) = me.submit_confirm(filters, frame_number, "join").await {
                         warn!(frame = frame_number, %e, "ConfirmJoins submission failed");
                     }
                 });
@@ -91,7 +91,7 @@ impl ProverPipeline {
             LifecycleAction::RejectJoins { filters, frame_number } => {
                 let me = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_reject(filters, frame_number).await {
+                    if let Err(e) = me.submit_reject(filters, frame_number, "join").await {
                         warn!(frame = frame_number, %e, "RejectJoins submission failed");
                     }
                 });
@@ -107,7 +107,7 @@ impl ProverPipeline {
             LifecycleAction::ConfirmLeaves { filters, frame_number } => {
                 let me = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_confirm(filters, frame_number).await {
+                    if let Err(e) = me.submit_confirm(filters, frame_number, "leave").await {
                         warn!(frame = frame_number, %e, "ConfirmLeaves submission failed");
                     }
                 });
@@ -115,7 +115,7 @@ impl ProverPipeline {
             LifecycleAction::RejectLeaves { filters, frame_number } => {
                 let me = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = me.submit_reject(filters, frame_number).await {
+                    if let Err(e) = me.submit_reject(filters, frame_number, "leave").await {
                         warn!(frame = frame_number, %e, "RejectLeaves submission failed");
                     }
                 });
@@ -326,7 +326,7 @@ impl ProverPipeline {
         Ok(())
     }
 
-    async fn submit_confirm(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
+    async fn submit_confirm(&self, filters: Vec<Vec<u8>>, frame_number: u64, action: &str) -> Result<()> {
         // Go: sign(concat(filters) || u64(frame_number), PROVER_CONFIRM_domain).
         // See global_prover_confirm.go:302-325.
         let mut msg = Vec::new();
@@ -348,12 +348,12 @@ impl ProverPipeline {
         };
         let bytes = confirm.to_canonical_bytes()?;
 
-        info!(frame = frame_number, filter_count = filters.len(), "submitting ProverConfirm");
+        info!(frame = frame_number, filter_count = filters.len(), action, "submitting ProverConfirm");
         quil_engine::metrics::inc_prover_confirms_submitted();
         self.publish_prover_message(bytes).await
     }
 
-    async fn submit_reject(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
+    async fn submit_reject(&self, filters: Vec<Vec<u8>>, frame_number: u64, action: &str) -> Result<()> {
         // Go: sign(concat(filters) || u64(frame_number), PROVER_REJECT_domain).
         // See global_prover_reject.go:260-295.
         let mut msg = Vec::new();
@@ -375,7 +375,7 @@ impl ProverPipeline {
         };
         let bytes = reject.to_canonical_bytes()?;
 
-        info!(frame = frame_number, filter_count = filters.len(), "submitting ProverReject");
+        info!(frame = frame_number, filter_count = filters.len(), action, "submitting ProverReject");
         quil_engine::metrics::inc_prover_rejects_submitted();
         self.publish_prover_message(bytes).await
     }
@@ -407,7 +407,7 @@ impl ProverPipeline {
             }),
         };
         let bytes = split.to_canonical_bytes()?;
-        info!(
+        debug!(
             frame = frame_number,
             shard = hex::encode(&shard_address),
             "submitting ShardSplit"
@@ -443,7 +443,7 @@ impl ProverPipeline {
             }),
         };
         let bytes = merge.to_canonical_bytes()?;
-        info!(
+        debug!(
             frame = frame_number,
             parent = hex::encode(&parent_address),
             "submitting ShardMerge"
@@ -690,7 +690,7 @@ where
     for h in handles {
         match h.await {
             Ok(Ok(addr)) => {
-                info!(%addr, "prover message submitted via gRPC");
+                debug!(%addr, "prover message submitted via gRPC");
                 ok_count += 1;
             }
             Ok(Err((addr, reason))) => {

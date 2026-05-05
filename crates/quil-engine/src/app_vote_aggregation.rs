@@ -126,7 +126,7 @@ impl AppVoteAggregation {
         let filter_for_log = hex::encode(&self.filter);
         Arc::new(move |qc: Arc<dyn QuorumCertificate>| {
             if let Some(handle) = handle_cell.get() {
-                tracing::info!(
+                tracing::debug!(
                     filter = %filter_for_log,
                     rank = qc.rank(),
                     frame = qc.frame_number(),
