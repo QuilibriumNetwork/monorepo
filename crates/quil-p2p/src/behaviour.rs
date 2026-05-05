@@ -282,7 +282,7 @@ impl BlossomSubBehaviour {
                     msg.signature = sig.clone();
                     let encoded_key = keypair.public().encode_protobuf();
                     msg.key = encoded_key.clone();
-                    tracing::info!(
+                    tracing::debug!(
                         sig_len = sig.len(),
                         key_len = encoded_key.len(),
                         from_len = msg.from.len(),
@@ -351,7 +351,7 @@ impl BlossomSubBehaviour {
                     // INFO-level log if peer subscribes to a bitmask we also
                     // subscribe to (likely a master/validator).
                     if self.subscriptions.contains(&sub.bitmask) {
-                        info!(
+                        debug!(
                             %peer,
                             bitmask = hex::encode(&sub.bitmask),
                             "MATCH: peer subscribed to one of our bitmasks (likely master)"
@@ -384,7 +384,7 @@ impl BlossomSubBehaviour {
         for msg in rpc.publish {
             let msg_id = crate::node::message_id(&msg.data);
             let is_subbed = self.subscriptions.contains(&msg.bitmask);
-            info!(
+            debug!(
                 %peer,
                 bitmask = hex::encode(&msg.bitmask),
                 bytes = msg.data.len(),
@@ -631,7 +631,7 @@ impl BlossomSubBehaviour {
     pub fn send_subscriptions_to_peer(&mut self, peer: PeerId) {
         if let Some(rpc_data) = &self.pending_subscribe_rpc {
             if self.connected_peers.contains_key(&peer) {
-                info!(%peer, "sending subscription RPC (Identify confirmed BlossomSub)");
+                debug!(%peer, "sending subscription RPC (Identify confirmed BlossomSub)");
                 self.events.push_back(ToSwarm::NotifyHandler {
                     peer_id: peer,
                     handler: NotifyHandler::Any,
@@ -1259,7 +1259,7 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                 let subs = rpc.subscriptions.len();
                 let msgs = rpc.publish.len();
                 if subs > 0 || msgs > 0 {
-                    info!(%peer_id, subs, msgs, "behaviour received RPC with data from handler");
+                    debug!(%peer_id, subs, msgs, "behaviour received RPC with data from handler");
                 }
                 self.handle_rpc(peer_id, rpc);
             }
