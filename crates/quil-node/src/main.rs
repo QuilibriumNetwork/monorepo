@@ -2426,8 +2426,18 @@ async fn run_master_node(
                                 let a = info.allocations.iter()
                                     .filter(|a| a.status == quil_types::consensus::ProverStatus::Active)
                                     .count();
+                                // Joining allocations past the
+                                // 720-frame grace are implicitly
+                                // rejected on-chain — exclude them
+                                // here so the count matches the
+                                // lifecycle's view (and the TUI's).
                                 let p = info.allocations.iter()
-                                    .filter(|a| a.status == quil_types::consensus::ProverStatus::Joining)
+                                    .filter(|a| {
+                                        a.status == quil_types::consensus::ProverStatus::Joining
+                                            && latest_frame
+                                                <= a.join_frame_number
+                                                    + quil_engine::worker_allocator::PENDING_FILTER_GRACE_FRAMES
+                                    })
                                     .count();
                                 (a, p, info.allocations.len())
                             }

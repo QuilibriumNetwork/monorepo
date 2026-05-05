@@ -91,7 +91,15 @@ impl FileKeyManager {
         // Decrypt and populate signers
         for (id, stored) in &keys {
             if let Err(e) = self.load_signer(stored) {
-                tracing::warn!(key_id = %id, error = %e, "failed to load key");
+                // Legacy keys.yml from Go nodes can carry an entry
+                // with `id: ""` and no payload (an old bootstrap
+                // bug). Drop the warn for that one — it's expected
+                // and otherwise spams every startup.
+                if id.is_empty() {
+                    tracing::debug!(error = %e, "skipping empty-id legacy key entry");
+                } else {
+                    tracing::warn!(key_id = %id, error = %e, "failed to load key");
+                }
             }
         }
 
