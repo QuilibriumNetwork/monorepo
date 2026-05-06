@@ -426,20 +426,25 @@ fn build_rotating(
 
 /// Periodically delete rotated log files older than `max_age` days
 /// or beyond the `max_backups` count.
+///
+/// Uses `std::thread` rather than `tokio::spawn` because workers
+/// register their per-core log files from non-tokio thread context
+/// during init (the worker's `current_thread` runtime hasn't been
+/// entered yet). Reaping is pure sync I/O so a plain thread is fine.
 fn spawn_log_reaper(dir: std::path::PathBuf, base: &str, max_age: i32, max_backups: i32) {
     if max_age <= 0 && max_backups <= 0 {
         return;
     }
     let base = base.to_string();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-        loop {
-            interval.tick().await;
+    std::thread::Builder::new()
+        .name(format!("log-reaper-{}", base))
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
             if let Err(e) = reap_once(&dir, &base, max_age, max_backups) {
                 eprintln!("log reaper: {}", e);
             }
-        }
-    });
+        })
+        .ok();
 }
 
 fn reap_once(
