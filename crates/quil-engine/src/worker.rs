@@ -3,7 +3,29 @@ use quil_types::error::Result;
 /// Worker manager: coordinates data worker processes for parallel
 /// proof computation across shards.
 pub trait WorkerManager: Send + Sync {
-    fn allocate_worker(&self, core_id: u32, filter: &[u8]) -> Result<()>;
+    /// Bind `core_id` to `filter` and (re)start the consensus engine.
+    /// Equivalent to `set_worker_filter(core_id, filter, true)`.
+    /// Kept as the default for callers that always want full
+    /// consensus startup (e.g. dataWorkerFilters config-load).
+    fn allocate_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+        self.set_worker_filter(core_id, filter, true)
+    }
+
+    /// Bind `core_id` to `filter`. `start_consensus`:
+    ///   * `true`  — also (re)start `AppConsensusEngine` for this
+    ///     filter. Use for `Active`/`Paused` allocations.
+    ///   * `false` — record the filter binding only; do NOT spawn a
+    ///     consensus engine. Use for `Joining` allocations whose
+    ///     prover isn't Active yet (the engine's `leader_for_rank`
+    ///     would die immediately). Mirrors Go's
+    ///     `worker.Filter`-set / `worker.Allocated=false` state.
+    fn set_worker_filter(
+        &self,
+        core_id: u32,
+        filter: &[u8],
+        start_consensus: bool,
+    ) -> Result<()>;
+
     fn deallocate_worker(&self, core_id: u32) -> Result<()>;
     fn check_workers_connected(&self) -> Result<Vec<u32>>;
     fn range_workers(&self) -> Result<Vec<WorkerInfo>>;

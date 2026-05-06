@@ -1117,7 +1117,12 @@ mod proposal_loop_tests {
     }
 
     impl WorkerManager for ConfigurableWorkerManager {
-        fn allocate_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+        fn set_worker_filter(
+            &self,
+            core_id: u32,
+            filter: &[u8],
+            start_consensus: bool,
+        ) -> Result<()> {
             let mut g = self.workers.lock().unwrap();
             let entry = g.entry(core_id).or_insert(WorkerInfo {
                 core_id,
@@ -1129,7 +1134,7 @@ mod proposal_loop_tests {
                 allocated: false,
             });
             entry.filter = filter.to_vec();
-            entry.allocated = !filter.is_empty();
+            entry.allocated = !filter.is_empty() && start_consensus;
             Ok(())
         }
         fn deallocate_worker(&self, core_id: u32) -> Result<()> {

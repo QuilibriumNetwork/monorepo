@@ -209,7 +209,12 @@ impl RemoteWorkerManager {
 }
 
 impl WorkerManager for RemoteWorkerManager {
-    fn allocate_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+    fn set_worker_filter(
+        &self,
+        core_id: u32,
+        filter: &[u8],
+        start_consensus: bool,
+    ) -> Result<()> {
         {
             let mut workers = self.workers.lock().unwrap();
             if let Some(w) = workers.get_mut(&core_id) {
@@ -221,15 +226,17 @@ impl WorkerManager for RemoteWorkerManager {
             }
         }
 
-        // Send respawn asynchronously
+        // Remote-mode workers run in separate processes. The actual
+        // consensus-engine spawn happens via the worker process itself
+        // when it connects back; this manager just records the
+        // binding. `start_consensus=false` semantics (filter-pinned,
+        // engine off) is informational here — the remote process
+        // checks alloc status itself before booting consensus.
         let filter = filter.to_vec();
-        let _self_ref = &self;
-        // Since WorkerManager trait is sync, we can't await here.
-        // The caller should use the async connect_all + send_respawn flow.
-        // For now, log the intent.
         info!(
             core_id,
             filter = hex::encode(&filter),
+            start_consensus,
             "queued remote worker allocation (respawn pending)"
         );
         Ok(())

@@ -248,6 +248,23 @@ impl WorkerAllocator {
                     // unallocatedWorkerCount → decide_joins
                     // availableWorkers cap (Go proposer.go:537-553).
                     if worker.allocated != desired_allocated {
+                        // Joining → Active transition: the engine
+                        // wasn't started when we filter-pinned the
+                        // worker (start_consensus=false). Now that
+                        // the prover is Active, kick off the
+                        // AppConsensusEngine for this filter.
+                        if !worker.allocated && desired_allocated {
+                            info!(
+                                core_id = worker.core_id,
+                                filter = hex::encode(&worker.filter),
+                                "alloc transitioned to Active — starting consensus engine"
+                            );
+                            self.worker_manager.set_worker_filter(
+                                worker.core_id,
+                                &worker.filter,
+                                true,
+                            )?;
+                        }
                         let _ = self
                             .worker_manager
                             .set_allocated(worker.core_id, desired_allocated);
@@ -304,31 +321,76 @@ impl WorkerAllocator {
             .collect();
         idle_workers.sort();
 
+        // Manually-managed-but-unbound workers — the operator picked
+        // these via the TUI's worker-selector at join time. We
+        // consume them first when binding new Joining/Active
+        // allocations to filters, so the user's selection is
+        // honored. Sorted ascending so `pop()` gives the
+        // highest-numbered first (matches `idle_workers` ordering;
+        // operators typically pick contiguous low-numbered workers).
+        let mut manual_pending: Vec<u32> = self
+            .worker_manager
+            .range_workers()?
+            .iter()
+            .filter(|w| w.filter.is_empty() && w.manually_managed)
+            .map(|w| w.core_id)
+            .collect();
+        manual_pending.sort();
+
         for alloc in &prover.allocations {
-            // Only spawn the per-shard worker (which boots an
-            // AppConsensusEngine) once the allocation is *Active*.
-            // While the alloc is `Joining`, the registry has no
-            // Active prover under this filter, so the engine's
-            // `leader_for_rank(0)` lookup fails with "shard trie
-            // empty" and the consensus event loop exits — leaving
-            // the worker zombie-ed (filter assigned, engine dead)
-            // until the next deallocate. Active is the first state
-            // where leader election can resolve, so wait for it.
-            if alloc.status != ProverStatus::Active {
+            // Bind the filter for any non-expired allocation —
+            // including Joining — so the TUI and the user can see
+            // which worker owns which filter from the moment the
+            // join lands. Mirrors Go's `worker_allocator.go:404-440`
+            // where `freeWorkers[0]` gets `worker.Filter = alloc.ConfirmationFilter`
+            // regardless of status, and `worker.Allocated` separately
+            // tracks Active/Paused.
+            //
+            // Skip terminal states and allocations past the 720-frame
+            // grace window (those won't ever confirm).
+            match alloc.status {
+                ProverStatus::Active | ProverStatus::Paused | ProverStatus::Joining => {}
+                _ => continue,
+            }
+            if alloc.status == ProverStatus::Joining
+                && alloc.join_frame_number > 0
+                && frame_number > alloc.join_frame_number + PENDING_FILTER_GRACE_FRAMES
+            {
                 continue;
             }
             if assigned_filters.contains(&alloc.confirmation_filter) {
                 continue;
             }
-            if let Some(core_id) = idle_workers.pop() {
+            // Prefer a manually-pending (user-picked) worker before
+            // falling back to the auto-managed idle pool.
+            let pick = manual_pending.pop().or_else(|| idle_workers.pop());
+            if let Some(core_id) = pick {
+                let start_consensus = matches!(
+                    alloc.status,
+                    ProverStatus::Active | ProverStatus::Paused
+                );
+                let manual = !manual_pending
+                    .contains(&core_id)  // we just popped it
+                    && self
+                        .worker_manager
+                        .range_workers()
+                        .ok()
+                        .and_then(|ws| ws.into_iter().find(|w| w.core_id == core_id))
+                        .map(|w| w.manually_managed)
+                        .unwrap_or(false);
                 info!(
                     core_id,
                     filter = hex::encode(&alloc.confirmation_filter),
                     status = ?alloc.status,
+                    start_consensus,
+                    manual,
                     "assigning shard to worker"
                 );
-                self.worker_manager
-                    .allocate_worker(core_id, &alloc.confirmation_filter)?;
+                self.worker_manager.set_worker_filter(
+                    core_id,
+                    &alloc.confirmation_filter,
+                    start_consensus,
+                )?;
             }
         }
 
@@ -421,7 +483,12 @@ mod tests {
     }
 
     impl WorkerManager for MockWorkerManager {
-        fn allocate_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+        fn set_worker_filter(
+            &self,
+            core_id: u32,
+            filter: &[u8],
+            _start_consensus: bool,
+        ) -> Result<()> {
             self.workers
                 .lock()
                 .unwrap()

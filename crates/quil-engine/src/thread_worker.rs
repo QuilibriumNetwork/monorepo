@@ -20,9 +20,20 @@ use crate::worker::{WorkerInfo, WorkerManager};
 /// Message from master to worker.
 #[derive(Debug)]
 pub enum MasterToWorker {
-    /// Assign a new filter (shard) to this worker. The worker should
-    /// tear down any existing consensus engine and start a new one.
-    Respawn { filter: Vec<u8> },
+    /// Assign a new filter (shard) to this worker.
+    ///
+    /// `start_consensus`:
+    ///   * `true`  — tear down any existing engine and (re)spawn the
+    ///     `AppConsensusEngine`. Used for `Active`/`Paused`
+    ///     allocations.
+    ///   * `false` — record the filter binding for TUI visibility,
+    ///     cancel any running engine, but do NOT spawn a new one.
+    ///     Used while an allocation is `Joining` and there is no
+    ///     Active prover under this filter yet (the engine's
+    ///     `leader_for_rank` would fail and the loop would die).
+    ///     Mirrors Go's `worker.Filter`-set / `worker.Allocated=false`
+    ///     state from `worker_allocator.go:421-440`.
+    Respawn { filter: Vec<u8>, start_consensus: bool },
     /// Request the worker to compute a join proof.
     CreateJoinProof {
         challenge: [u8; 32],
@@ -288,7 +299,7 @@ impl ThreadWorkerManager {
                         tokio::select! {
                             cmd = rx.recv() => {
                                 match cmd {
-                                    Some(MasterToWorker::Respawn { filter }) => {
+                                    Some(MasterToWorker::Respawn { filter, start_consensus }) => {
                                         // Stop existing engine if any
                                         if let Some(cancel) = engine_cancel.take() {
                                             cancel.cancel();
@@ -299,6 +310,18 @@ impl ThreadWorkerManager {
                                         if filter.is_empty() {
                                             info!(core_id, "worker idle (no filter)");
                                             current_filter.clear();
+                                        } else if !start_consensus {
+                                            // Filter binding only — engine
+                                            // not started until allocation
+                                            // becomes Active (mirrors
+                                            // Go's worker.Allocated=false
+                                            // state).
+                                            info!(
+                                                core_id,
+                                                filter = hex::encode(&filter),
+                                                "worker filter pinned (consensus deferred until Active)"
+                                            );
+                                            current_filter = filter.clone();
                                         } else {
                                             info!(
                                                 core_id,
@@ -562,7 +585,12 @@ impl ThreadWorkerManager {
 }
 
 impl WorkerManager for ThreadWorkerManager {
-    fn allocate_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+    fn set_worker_filter(
+        &self,
+        core_id: u32,
+        filter: &[u8],
+        start_consensus: bool,
+    ) -> Result<()> {
         let mut workers = self.workers.lock().unwrap();
 
         // Spawn if not already running
@@ -576,6 +604,7 @@ impl WorkerManager for ThreadWorkerManager {
             w.filter = filter.to_vec();
             let _ = w.tx.try_send(MasterToWorker::Respawn {
                 filter: filter.to_vec(),
+                start_consensus,
             });
         }
 
