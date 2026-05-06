@@ -160,6 +160,57 @@ pub fn genesis_archive_peers() -> Result<Vec<(String, Vec<u8>)>> {
     Ok(peers)
 }
 
+/// Static QUIC multiaddrs for the genesis archive peers.
+///
+/// `genesis_archive_peers()` only carries `(peer_id, bls_pubkey)` —
+/// the network address is normally learned via PeerInfo gossip after
+/// libp2p bootstrap fans out. On a fresh node where the libp2p mesh
+/// hasn't converged yet, the archive pool stays empty and the
+/// shard-info remote fallback has nowhere to dial.
+///
+/// These addresses are hardcoded operator-known endpoints for the
+/// genesis archives — they should be kept in sync with mainnet
+/// operator records. Update when an operator rotates IPs.
+pub fn genesis_archive_static_multiaddrs() -> Vec<&'static str> {
+    vec![
+        "/ip4/192.69.222.130/udp/8336/quic-v1/p2p/QmcKQjpQmLpbDsiif2MuakhHFyxWvqYauPsJDaXnLav7PJ",
+        "/ip4/191.96.166.157/udp/8336/quic-v1/p2p/QmestbFp8PddwRk6ysBRrmWZEiHun5aRidHkqFxgeFaWVK",
+        "/ip4/109.94.96.255/udp/8336/quic-v1/p2p/QmZKERVN8UkwLp9mPCZw4aaRx9N8Ewnkv7VQh1zyZwBSir",
+        "/ip4/147.124.199.194/udp/8336/quic-v1/p2p/QmS3xJKbAmQxDiry9HpXV6bJyRvyd47pbufpZwEmgY1cy6",
+        "/ip4/192.154.103.90/udp/8336/quic-v1/p2p/QmcuXdV3mdgwmhUv9kzRnZmjJyBwE7erNWVo8Q2ikrcjzX",
+    ]
+}
+
+/// Helper: extract `(peer_id_str, ip_str)` from each genesis-archive
+/// QUIC multiaddr. Used by `main.rs` to derive the corresponding
+/// `host:8340` mTLS endpoints to seed the archive pool.
+pub fn genesis_archive_static_ips() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for ma in genesis_archive_static_multiaddrs() {
+        let parts: Vec<&str> = ma.trim_start_matches('/').split('/').collect();
+        let mut ip: Option<String> = None;
+        let mut peer: Option<String> = None;
+        let mut i = 0;
+        while i < parts.len() {
+            match parts[i] {
+                "ip4" | "ip6" if i + 1 < parts.len() => {
+                    ip = Some(parts[i + 1].to_string());
+                    i += 2;
+                }
+                "p2p" if i + 1 < parts.len() => {
+                    peer = Some(parts[i + 1].to_string());
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        if let (Some(p), Some(a)) = (peer, ip) {
+            out.push((p, a));
+        }
+    }
+    out
+}
+
 /// Verify that a frame from the store matches the expected genesis.
 /// Returns Ok(true) if the frame matches, Ok(false) if it doesn't,
 /// or Err if genesis data can't be loaded.

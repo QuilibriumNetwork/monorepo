@@ -461,13 +461,44 @@ async fn run_master_node(
     info!("execution engines initialized with BLS48-581 + Ed448 signature verification");
 
     // ---------------------------------------------------------------
-    // 3b. Testnet/devnet genesis bootstrap
+    // 3b. Genesis bootstrap (mainnet + testnet/devnet)
     //
-    // For non-mainnet networks the node bootstraps its own genesis
-    // state locally (no archive to sync from). Skipped if a genesis
-    // frame already exists in the clock store.
+    // Both networks bootstrap their genesis state locally on a fresh
+    // node. Without this, `shards_store.range_app_shards()` returns
+    // empty and the GetShardInfo RPC has no parent shards to query
+    // (the archive remote-fallback then has nothing to fetch).
+    // Mirrors Go's `node/consensus/global/genesis.go:177-209` which
+    // applies `initial_commitments` from `mainnet_genesis.json` to
+    // PutAppShard for every (L1, L2, Path) combo.
+    //
+    // `initialize_genesis_state` is idempotent: if the genesis frame
+    // already exists, it short-circuits.
     // ---------------------------------------------------------------
     let clock_store_dyn: &dyn quil_types::store::ClockStore = clock_store.as_ref();
+    if network == 0 {
+        info!("bootstrapping mainnet genesis frame");
+        match quil_engine::genesis::initialize_genesis_state(
+            clock_store_dyn,
+            _shards_store.as_ref() as &dyn quil_types::store::ShardsStore,
+            &crdt,
+            inclusion_prover.as_ref(),
+        ) {
+            Ok((frame, _qc)) => {
+                let fn_ = frame
+                    .header
+                    .as_ref()
+                    .map(|h| h.frame_number)
+                    .unwrap_or(0);
+                info!(frame_number = fn_, "mainnet genesis ready");
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to initialize mainnet genesis: {}",
+                    e
+                ));
+            }
+        }
+    }
     if network != 0 && clock_store_dyn.get_global_clock_frame(0).is_err() {
         info!(
             network = network,
@@ -1568,6 +1599,33 @@ async fn run_master_node(
     // ARCHIVE_SERVICE_CAPABILITY_ID. The poller spawned below picks one as
     // its source and forward-polls the chain head.
     let archive_pool = std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new());
+
+    // Pre-seed the archive pool with the hardcoded mTLS endpoints
+    // for the 5 genesis archive peers. The shard-info remote fallback
+    // (and any other archive-pool consumer) needs at least one
+    // reachable endpoint before the libp2p mesh converges and starts
+    // delivering PeerInfo gossip. mTLS gRPC convention is TCP/8340.
+    //
+    // These IPs are mainnet-only — testnets/devnets have their own
+    // genesis archives, which we don't seed statically (they're
+    // ephemeral; PeerInfo gossip handles them).
+    if network == 0 {
+        let pool = archive_pool.clone();
+        let static_ips = quil_engine::genesis::genesis_archive_static_ips();
+        if !static_ips.is_empty() {
+            tokio::spawn(async move {
+                for (peer_id, ip) in static_ips {
+                    let endpoint = format!("{}:8340", ip);
+                    pool.add(endpoint.clone()).await;
+                    tracing::debug!(
+                        peer = %peer_id,
+                        endpoint = %endpoint,
+                        "seeded archive pool with static genesis-archive mTLS endpoint"
+                    );
+                }
+            });
+        }
+    }
 
     // Load genesis archive peer IDs for validation (5 archives + beacon)
     let genesis_archive_peer_ids: std::collections::HashSet<Vec<u8>> = {
@@ -3410,6 +3468,15 @@ async fn run_master_node(
             peer_info_lookup: Arc<dyn Fn(&[u8]) -> Vec<String> + Send + Sync>,
             ed448_seed: Option<[u8; 57]>,
             archive_mode: bool,
+            /// Pool of mTLS archive endpoints discovered via the
+            /// genesis-archive PeerInfo gossip. Used as a fallback
+            /// when `dial_latest_frame_prover` fails — typically on a
+            /// fresh node where the prover-tree CRDT (and therefore
+            /// the key registry) hasn't synced yet, so we can't
+            /// resolve `frame.header.prover` to an Ed448 identity
+            /// key. Mirrors the chicken-and-egg fix for HyperSync
+            /// (bug #7 in the v2.1.0.20 branch).
+            archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
         }
         impl quil_types::consensus::ShardInfoProvider for LocalShardInfoProvider {
             fn get_shard_info(
@@ -3524,39 +3591,105 @@ async fn run_master_node(
                 let peer_info_lookup = self.peer_info_lookup.clone();
                 let clock_store = self.clock_store.clone();
                 let shards_store = self.shards_store.clone();
+                let archive_pool = self.archive_pool.clone();
                 let prefetched: Result<
                     HashMap<Vec<u8>, Vec<quil_types::proto::global::AppShardInfo>>,
                     quil_types::error::QuilError,
                 > = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async move {
-                        let frame = clock_store
-                            .get_latest_global_clock_frame()
-                            .map_err(|e| quil_types::error::QuilError::Internal(
-                                format!("remote shard info: latest frame: {e}"),
-                            ))?;
-                        let mut client = quil_rpc::peer_dial::dial_latest_frame_prover(
-                            &frame,
-                            key_store,
-                            move |peer_id| peer_info_lookup(peer_id),
-                            &seed,
-                        )
-                        .await?;
-
-                        // One RPC per parent shard suffices — GetAppShards
-                        // returns the full sub-shard breakdown.
+                        // Gather the unique parent shard_keys we want
+                        // sized — same set in both fallback paths.
                         let mut unique: HashMap<Vec<u8>, ()> = HashMap::new();
                         for s in shards_store.range_app_shards()? {
                             unique.insert(s.shard_key, ());
                         }
+                        let unique_keys: Vec<Vec<u8>> = unique.into_keys().collect();
 
+                        // Primary path: dial the latest frame's
+                        // prover via key registry + peer info. Fails
+                        // on a fresh node when those caches are empty.
+                        let mut client_opt: Option<quil_rpc::ArchiveClient> =
+                            match clock_store.get_latest_global_clock_frame() {
+                                Ok(frame) => {
+                                    match quil_rpc::peer_dial::dial_latest_frame_prover(
+                                        &frame,
+                                        key_store,
+                                        move |peer_id| peer_info_lookup(peer_id),
+                                        &seed,
+                                    )
+                                    .await
+                                    {
+                                        Ok(c) => Some(c),
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                error = %e,
+                                                "shard info: dial_latest_frame_prover failed, will try archive pool"
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        error = %e,
+                                        "shard info: no latest frame yet, will try archive pool"
+                                    );
+                                    None
+                                }
+                            };
+
+                        // Fallback: try mTLS endpoints from the
+                        // archive pool. These are populated from
+                        // genesis-archive PeerInfo gossip and don't
+                        // require the prover tree / key registry to
+                        // be synced. Mirrors the HyperSync chicken-
+                        // and-egg fix.
+                        if client_opt.is_none() {
+                            let endpoints = archive_pool.get_all().await;
+                            for ep in &endpoints {
+                                match quil_rpc::ArchiveClient::connect_mtls(ep, &seed).await {
+                                    Ok(c) => {
+                                        tracing::debug!(
+                                            endpoint = %ep,
+                                            "shard info: archive-pool fallback dial succeeded"
+                                        );
+                                        client_opt = Some(c);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            endpoint = %ep,
+                                            error = %e,
+                                            "shard info: archive-pool fallback dial failed"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut client = client_opt.ok_or_else(|| {
+                            quil_types::error::QuilError::Internal(
+                                "shard info: no archive endpoint reachable for fallback".into(),
+                            )
+                        })?;
+
+                        tracing::debug!(
+                            unique_keys = unique_keys.len(),
+                            "shard info: about to fetch GetAppShards for unique parent keys"
+                        );
                         let mut out: HashMap<Vec<u8>, Vec<quil_types::proto::global::AppShardInfo>> =
-                            HashMap::with_capacity(unique.len());
-                        for shard_key in unique.into_keys() {
+                            HashMap::with_capacity(unique_keys.len());
+                        for shard_key in unique_keys {
                             match client
                                 .get_app_shards(shard_key.clone(), Vec::new())
                                 .await
                             {
                                 Ok(infos) => {
+                                    tracing::debug!(
+                                        shard_key_hex = %hex::encode(&shard_key),
+                                        infos = infos.len(),
+                                        "shard info: GetAppShards returned"
+                                    );
                                     out.insert(shard_key, infos);
                                 }
                                 Err(e) => {
@@ -3567,6 +3700,10 @@ async fn run_master_node(
                                 }
                             }
                         }
+                        tracing::debug!(
+                            keys = out.len(),
+                            "shard info: prefetched remote shard data"
+                        );
                         Ok::<_, quil_types::error::QuilError>(out)
                     })
                 });
@@ -3654,6 +3791,7 @@ async fn run_master_node(
                 peer_info_lookup,
                 ed448_seed: mtls_seed,
                 archive_mode,
+                archive_pool: archive_pool.clone(),
             },
         ));
         let node_rpc = node_rpc_builder;
