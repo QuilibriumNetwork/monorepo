@@ -70,16 +70,64 @@ impl P2PNode {
         let peer_id = PeerId::from_public_key(&keypair.public());
         debug!(%peer_id, "initialized P2P identity");
 
+        // Rewrite `/dnsaddr/<host>/...` → `/dns/<host>/...` at parse
+        // time. The `/dnsaddr/` protocol is libp2p's TXT-record peer
+        // discovery scheme (`_dnsaddr.<host>`), which is not deployed
+        // for the Quilibrium bootstrap hosts and consistently returns
+        // "No matching records found." Go dropped `/dnsaddr/` and
+        // expects a plain A/AAAA lookup — `/dns/` does exactly that.
+        //
+        // Additionally, the Quilibrium `/dnsaddr/` bootstrap entries
+        // were authored with the transport segment omitted (just
+        // `.../udp/8339/p2p/<peer>`) on the assumption that the TXT
+        // records would supply `/quic-v1/`. Once we rewrite to
+        // `/dns/`, libp2p resolves to a bare `/ip4/.../udp/8339/p2p/...`
+        // which it can't dial ("Unsupported resolved address"). Inject
+        // `/quic-v1/` between `/udp/<port>` and `/p2p/<id>` for any
+        // address that came in as `/dnsaddr/`.
         let bootstrap_peers = config
             .bootstrap_peers
             .iter()
             .filter_map(|addr_str| {
-                let addr: Multiaddr = addr_str.parse().ok()?;
-                let peer_id = addr.iter().find_map(|p| match p {
+                let raw: Multiaddr = addr_str.parse().ok()?;
+                let was_dnsaddr = raw
+                    .iter()
+                    .any(|p| matches!(p, Protocol::Dnsaddr(_)));
+                let mut rewritten = Multiaddr::empty();
+                let mut last_was_udp = false;
+                let mut quic_inserted = false;
+                for proto in raw.iter() {
+                    match proto {
+                        Protocol::Dnsaddr(host) => {
+                            rewritten.push(Protocol::Dns(host));
+                            last_was_udp = false;
+                        }
+                        Protocol::Udp(_) => {
+                            rewritten.push(proto);
+                            last_was_udp = true;
+                        }
+                        other => {
+                            // Quilibrium `/dnsaddr/` entries omit the
+                            // QUIC marker that TXT records would have
+                            // supplied — synthesize it.
+                            if was_dnsaddr
+                                && last_was_udp
+                                && !quic_inserted
+                                && !matches!(other, Protocol::QuicV1 | Protocol::Quic)
+                            {
+                                rewritten.push(Protocol::QuicV1);
+                                quic_inserted = true;
+                            }
+                            rewritten.push(other);
+                            last_was_udp = false;
+                        }
+                    }
+                }
+                let peer_id = rewritten.iter().find_map(|p| match p {
                     Protocol::P2p(id) => Some(id),
                     _ => None,
                 })?;
-                Some((peer_id, addr))
+                Some((peer_id, rewritten))
             })
             .collect();
 
@@ -367,17 +415,35 @@ impl P2PNode {
                                         libp2p::kad::Event::RoutingUpdated { peer, addresses, .. } => {
                                             let addr_count = addresses.len();
                                             let connected_count = swarm.connected_peers().count();
-                                            if addr_count > 0
+                                            // Only dial publicly-routable addresses.
+                                            // Kademlia's routing table accumulates
+                                            // peer records from FIND_NODE responses,
+                                            // which often include 127.0.0.1 / RFC1918
+                                            // listeners that are unreachable from us
+                                            // and just generate EINVAL/ECONNREFUSED
+                                            // dial spam.
+                                            let routable: Vec<libp2p::Multiaddr> = addresses
+                                                .iter()
+                                                .filter(|a| is_routable(a))
+                                                .cloned()
+                                                .collect();
+                                            if !routable.is_empty()
                                                 && !swarm.is_connected(&peer)
                                                 && connected_count < 50
                                             {
                                                 debug!(
                                                     %peer,
                                                     addrs = addr_count,
+                                                    routable_addrs = routable.len(),
                                                     connected = connected_count,
                                                     "kad: new peer with addresses, dialing"
                                                 );
+                                                // `.addresses(...)` defaults
+                                                // `extend_addresses_through_behaviour=false`
+                                                // — exactly what we want here so the
+                                                // dial sticks to the filtered set.
                                                 let opts = DialOpts::peer_id(*peer)
+                                                    .addresses(routable)
                                                     .allocate_new_port()
                                                     .build();
                                                 let _ = swarm.dial(opts);
@@ -399,11 +465,20 @@ impl P2PNode {
                                                         .take(2.max(10usize.saturating_sub(connected_count)))
                                                         .collect();
                                                     for peer_info in with_addrs {
-                                                        for addr in peer_info.addrs.iter().filter(|a| is_routable(a)) {
+                                                        let routable: Vec<libp2p::Multiaddr> = peer_info.addrs
+                                                            .iter()
+                                                            .filter(|a| is_routable(a))
+                                                            .cloned()
+                                                            .collect();
+                                                        if routable.is_empty() {
+                                                            continue;
+                                                        }
+                                                        for addr in &routable {
                                                             swarm.behaviour_mut().kademlia
                                                                 .add_address(&peer_info.peer_id, addr.clone());
                                                         }
                                                         let opts = DialOpts::peer_id(peer_info.peer_id)
+                                                            .addresses(routable)
                                                             .allocate_new_port()
                                                             .build();
                                                         let _ = swarm.dial(opts);
@@ -416,15 +491,19 @@ impl P2PNode {
                                                         count = providers.len(),
                                                         "kad: found providers (Quilibrium peers)"
                                                     );
-                                                    let local = *swarm.local_peer_id();
-                                                    for provider_peer in providers.iter() {
-                                                        if *provider_peer != local && !swarm.is_connected(provider_peer) {
-                                                            let opts = DialOpts::peer_id(*provider_peer)
-                                                                .allocate_new_port()
-                                                                .build();
-                                                            let _ = swarm.dial(opts);
-                                                        }
-                                                    }
+                                                    // Note: we don't dial provider
+                                                    // peers directly here — the
+                                                    // FoundProviders event doesn't
+                                                    // include addresses, and
+                                                    // `DialOpts::peer_id` alone would
+                                                    // pull unfiltered records from
+                                                    // kademlia (loopback / RFC1918)
+                                                    // and spam EINVAL/ECONNREFUSED.
+                                                    // We rely on the subsequent
+                                                    // `RoutingUpdated` event (which
+                                                    // does carry addresses) to do a
+                                                    // routable-filtered dial.
+                                                    let _ = providers;
                                                 }
                                                 libp2p::kad::QueryResult::GetProviders(Ok(
                                                     libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }

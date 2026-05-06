@@ -254,6 +254,14 @@ pub fn initialize_genesis_state(
 
         let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&key_bytes, 256, 3);
 
+        // shard_key layout in the rocks store is L1[3] || L2[32].
+        // Without the L1 prefix, range_app_shards mis-slices 3 bytes
+        // of the encoded path as part of the returned shard_key,
+        // which empties the TUI "available shards" panel.
+        let mut shard_key = Vec::with_capacity(3 + key_bytes.len());
+        shard_key.extend_from_slice(&l1);
+        shard_key.extend_from_slice(&key_bytes);
+
         // Store app shard entries (64x64 grid for each bloom index)
         let txn = clock_store.new_transaction(false)?;
         for i in 0..64u32 {
@@ -261,7 +269,7 @@ pub fn initialize_genesis_state(
                 shards_store.put_app_shard(
                     txn.as_ref(),
                     &quil_types::store::ShardInfo {
-                        shard_key: key_bytes.clone(),
+                        shard_key: shard_key.clone(),
                         prefix: vec![i, j],
                         size: Vec::new(),
                         data_shards: 0,

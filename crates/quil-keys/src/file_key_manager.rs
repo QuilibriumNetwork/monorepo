@@ -34,6 +34,13 @@ pub struct FileKeyManager {
     stored_keys: RwLock<HashMap<String, StoredKey>>,
     signers: RwLock<HashMap<KeyType, Box<dyn Signer>>>,
     bls_constructor: Box<dyn BlsConstructor>,
+    /// Hex-encoded `config.p2p.peer_priv_key`. Go's
+    /// `FileKeyManager.GetSigningKey("q-peer-key")` special-cases this
+    /// id and constructs the Ed448 signer from this config field
+    /// rather than reading `keys.yml`. Mirroring that lets a Go-style
+    /// config (where keys.yml has no `q-peer-key` entry) still serve
+    /// the Send RPC and other peer-key consumers.
+    peer_priv_key_hex: RwLock<Option<String>>,
 }
 
 impl FileKeyManager {
@@ -64,6 +71,7 @@ impl FileKeyManager {
             stored_keys: RwLock::new(HashMap::new()),
             signers: RwLock::new(HashMap::new()),
             bls_constructor,
+            peer_priv_key_hex: RwLock::new(None),
         };
 
         // Load existing keys from disk
@@ -381,8 +389,49 @@ impl FileKeyManager {
         Ok(())
     }
 
+    /// Wire up the hex `config.p2p.peer_priv_key`. After this is
+    /// called, `q-peer-key` lookups (`get_signer_by_id`, `get_peer_key`,
+    /// `get_peer_id`) resolve from the config field, mirroring Go's
+    /// `FileKeyManager.GetSigningKey("q-peer-key")` special case.
+    /// Empty input is treated as "unset".
+    pub fn set_peer_priv_key_hex(&self, hex_str: &str) {
+        let mut guard = self.peer_priv_key_hex.write().unwrap();
+        *guard = if hex_str.is_empty() {
+            None
+        } else {
+            Some(hex_str.to_string())
+        };
+    }
+
+    /// Decode `config.p2p.peer_priv_key` into the canonical
+    /// `(seed[57], pubkey[57])` pair. Mirrors Go's `GetSigningKey`
+    /// at `node/keys/file.go:306-315`: the hex blob is `seed || pubkey`
+    /// (114 bytes total), and the seed is what we pass to the Ed448
+    /// signer constructor. Returns `None` when no peer key has been
+    /// wired up.
+    fn decoded_peer_priv_key(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let guard = self.peer_priv_key_hex.read().unwrap();
+        let Some(hex_str) = guard.as_deref() else {
+            return Ok(None);
+        };
+        let bytes = hex::decode(hex_str)
+            .map_err(|e| QuilError::Crypto(format!("peer_priv_key invalid hex: {}", e)))?;
+        if bytes.len() < 114 {
+            return Err(QuilError::Crypto(format!(
+                "peer_priv_key too short: {} bytes, expected ≥114",
+                bytes.len()
+            )));
+        }
+        let seed = bytes[..57].to_vec();
+        let pub_key = bytes[57..114].to_vec();
+        Ok(Some((seed, pub_key)))
+    }
+
     /// Get the peer private key bytes for P2P identity (Ed448).
     pub fn get_peer_key(&self) -> Result<Vec<u8>> {
+        if let Some((seed, _)) = self.decoded_peer_priv_key()? {
+            return Ok(seed);
+        }
         let keys = self.stored_keys.read().unwrap();
         let stored = keys
             .get("q-peer-key")
@@ -394,6 +443,17 @@ impl FileKeyManager {
     /// keystore. Disambiguates entries that share a `KeyType` (e.g.
     /// multiple Ed448 keys), which `get_signer(KeyType)` cannot.
     pub fn get_signer_by_id(&self, id: &str) -> Result<Box<dyn Signer>> {
+        // Special case: "q-peer-key" comes from config.p2p.peer_priv_key,
+        // not the keystore. Mirrors Go's `FileKeyManager.GetSigningKey`
+        // at node/keys/file.go:306. Fall back to the keystore lookup
+        // only if the config field hasn't been wired up.
+        if id == "q-peer-key" {
+            if let Some((seed, pub_key)) = self.decoded_peer_priv_key()? {
+                let signer = quil_crypto::Ed448Signer::from_bytes(&seed, &pub_key)?;
+                return Ok(Box::new(signer));
+            }
+        }
+
         let stored = {
             let map = self.stored_keys.read().unwrap();
             map.get(id).cloned().ok_or_else(|| {
@@ -515,6 +575,9 @@ impl KeyManager for FileKeyManager {
     }
 
     fn get_peer_id(&self) -> Result<Vec<u8>> {
+        if let Some((_, pub_key)) = self.decoded_peer_priv_key()? {
+            return Ok(peer_id_from_ed448(&pub_key));
+        }
         let keys = self.stored_keys.read().unwrap();
         let stored = keys
             .get("q-peer-key")

@@ -421,6 +421,12 @@ async fn run_master_node(
         Box::new(bls_ctor),
     )?);
 
+    // Mirror Go's special-case for `q-peer-key`: it lives in
+    // `config.p2p.peer_priv_key`, not `keys.yml`. Wiring the hex
+    // here lets the keystore resolve `q-peer-key` lookups (Send RPC
+    // outer auth, peer ID derivation) on Go-style configs.
+    file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
+
     // Auto-create all standard keys if missing
     file_key_manager.ensure_standard_keys()?;
     let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
@@ -4065,6 +4071,7 @@ async fn run_worker_node(
         proving_key_id,
         Box::new(bls_ctor),
     )?);
+    file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
     let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
     let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&bls_pubkey)?;
 
