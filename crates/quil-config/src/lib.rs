@@ -148,8 +148,15 @@ pub fn load_config(config_dir: &Path) -> Result<Config, ConfigError> {
         config.key.key_store_file.encryption_key = hex::encode(key_bytes);
         config.key.key_store_file.create_if_missing = true;
 
-        // Set DB path (matching Go)
+        // Set DB paths (matching Go's `config/config.go:285-286`).
+        // Both `path` and `worker_path_prefix` live INSIDE the config
+        // directory — without this the worker stores leak to cwd.
         config.db.path = config_dir.join("store").to_string_lossy().to_string();
+        config.db.worker_path_prefix = config_dir
+            .join("worker-store")
+            .join("%d")
+            .to_string_lossy()
+            .to_string();
 
         // Save config.yml
         save_config(config_dir, &config)?;
@@ -168,6 +175,20 @@ pub fn load_config(config_dir: &Path) -> Result<Config, ConfigError> {
     }
     if config.db.path.is_empty() {
         config.db.path = config_dir.join("store").to_string_lossy().to_string();
+    }
+    // `apply_defaults` set worker_path_prefix to the bare
+    // `"worker-store/%d"` literal if it was missing from the YAML.
+    // That value is cwd-relative and lands worker stores outside the
+    // config dir. Promote it to `<config_dir>/worker-store/%d` so it
+    // mirrors Go's `LoadConfig` write-time default.
+    if config.db.worker_path_prefix.is_empty()
+        || config.db.worker_path_prefix == "worker-store/%d"
+    {
+        config.db.worker_path_prefix = config_dir
+            .join("worker-store")
+            .join("%d")
+            .to_string_lossy()
+            .to_string();
     }
 
     Ok(config)

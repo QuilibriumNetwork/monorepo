@@ -266,7 +266,7 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
     }
 
     fn on_finalization(&self, proof: &FinalityProof<AppShardState>) {
-        info!(
+        debug!(
             filter = hex::encode(&self.filter),
             frame = proof.state.state.frame_number,
             rank = proof.state.rank,
@@ -369,7 +369,7 @@ impl AppFinalizer {
 
 impl Finalizer for AppFinalizer {
     fn make_final(&self, state_id: &Identity) -> Result<()> {
-        info!(
+        debug!(
             filter = hex::encode(&self.filter),
             state = %hex::encode(state_id),
             "shard make_final"
@@ -417,7 +417,7 @@ impl FollowerConsumer<AppShardState> for AppFollower {
     }
 
     fn on_finalized_state(&self, state: &State<AppShardState>) {
-        info!(
+        debug!(
             filter = hex::encode(&self.filter),
             frame = state.state.frame_number,
             rank = state.rank,

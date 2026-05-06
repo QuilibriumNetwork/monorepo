@@ -1363,7 +1363,7 @@ impl AppConsensusEngine {
     async fn handle_consensus_event(&mut self, event: AppConsensusEvent) {
         match event {
             AppConsensusEvent::Finalized { frame_number, rank, state_id: _ } => {
-                info!(
+                debug!(
                     core_id = self.core_id,
                     filter = hex::encode(&self.filter),
                     frame = frame_number,
@@ -1483,7 +1483,7 @@ impl AppConsensusEngine {
             }
 
             AppConsensusEvent::OwnProposal { data, frame_number, rank } => {
-                info!(
+                debug!(
                     core_id = self.core_id,
                     filter = hex::encode(&self.filter),
                     frame = frame_number,

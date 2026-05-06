@@ -543,7 +543,7 @@ pub struct GlobalFinalizer;
 
 impl Finalizer for GlobalFinalizer {
     fn make_final(&self, state_id: &Identity) -> Result<()> {
-        tracing::info!(state = %hex::encode(state_id), "make_final");
+        tracing::debug!(state = %hex::encode(state_id), "make_final");
         Ok(())
     }
 }
