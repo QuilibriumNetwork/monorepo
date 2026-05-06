@@ -375,26 +375,20 @@ impl ProverLifecycle {
             &mm_filters,
         );
 
-        // Unscored (no registry summary) actives go first — they're
-        // already disconnected from any reward.
-        let ranked_set: std::collections::HashSet<Vec<u8>> =
-            ranked.iter().map(|(f, _)| f.clone()).collect();
-        let mut unscored: Vec<Vec<u8>> = active_filters
-            .iter()
-            .filter(|f| !mm_filters.contains(*f) && !ranked_set.contains(*f))
-            .cloned()
-            .collect();
-        unscored.sort();
-
-        let mut picks: Vec<Vec<u8>> = Vec::with_capacity(surplus);
-        picks.extend(unscored.into_iter().take(surplus));
-        if picks.len() < surplus {
-            for (f, _) in ranked {
-                if picks.len() == surplus {
-                    break;
-                }
-                picks.push(f);
+        // Pick lowest-scoring `surplus` filters from `ranked`. A
+        // filter that's `Active` but absent from `allocated_descriptors`
+        // is, in practice, a size-0 shard (build_decide_descriptors
+        // skipped it). Mirroring Go's `worker_allocator.go:821-824` —
+        // where `if size == 0 { continue }` lands BEFORE
+        // `leaveProposalCandidates = append(...)` — we deliberately
+        // do NOT pick those for leave. They count toward
+        // auto_active_count for capacity but stay put.
+        let mut picks: Vec<Vec<u8>> = Vec::with_capacity(surplus.min(ranked.len()));
+        for (f, _) in ranked {
+            if picks.len() == surplus {
+                break;
             }
+            picks.push(f);
         }
         picks.truncate(MAX_PROPOSALS_PER_CYCLE);
         picks
@@ -935,18 +929,26 @@ fn build_proposal_descriptors(
         if our_filters.contains(&s.filter) {
             continue;
         }
+        // Skip empty shards (size == 0). Mirrors Go's
+        // `worker_allocator.go` which `continue`s when
+        // `new(big.Int).SetBytes(shard.Size) == 0`. Without this,
+        // freshly-genesis'd shards default to size=1 and look join-
+        // worthy, causing the lifecycle to propose joins on shards
+        // with no actual data.
+        let raw_size = shard_sizes
+            .get(&s.filter)
+            .copied()
+            .unwrap_or(s.total_size);
+        if raw_size == 0 {
+            continue;
+        }
         let active = s.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0);
         let joining = s.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0);
         let total = (active + joining) as usize;
         let ri = proposer::compute_shard_ring_info(total);
-        let size = shard_sizes
-            .get(&s.filter)
-            .copied()
-            .unwrap_or_else(|| if s.total_size > 0 { s.total_size } else { 1 })
-            .max(1);
         out.push(ShardDescriptor {
             filter: s.filter.clone(),
-            size,
+            size: raw_size,
             ring: ri.joiner_ring,
             shards: 1,
             active_on_ring: ri.active_on_joiner_ring,
@@ -958,7 +960,8 @@ fn build_proposal_descriptors(
     // `worker_allocator.go:763-868` where `proverRegistry.GetProvers(bp)`
     // returns an empty list for unallocated shards but the descriptor
     // is still built (with active=joining=0, ring=0) so the proposer
-    // can score and pick it.
+    // can score and pick it. Skip when no real size is known — Go's
+    // `if size == 0 { continue }` applies here too.
     for filter in shards_store_filters {
         if filter.is_empty() {
             continue;
@@ -969,11 +972,14 @@ fn build_proposal_descriptors(
         if our_filters.contains(filter) {
             continue;
         }
+        let raw_size = shard_sizes.get(filter).copied().unwrap_or(0);
+        if raw_size == 0 {
+            continue;
+        }
         let ri = proposer::compute_shard_ring_info(0);
-        let size = shard_sizes.get(filter).copied().unwrap_or(1).max(1);
         out.push(ShardDescriptor {
             filter: filter.clone(),
-            size,
+            size: raw_size,
             ring: ri.joiner_ring,
             shards: 1,
             active_on_ring: ri.active_on_joiner_ring,
@@ -996,18 +1002,24 @@ fn build_decide_descriptors(
         if s.filter.is_empty() {
             return None;
         }
+        // Skip empty shards. Same reasoning as build_proposal_descriptors:
+        // Go's worker_allocator skips when `size == 0`, and decide
+        // scoring on a phantom-sized shard would otherwise produce
+        // garbage rejection / leave decisions.
+        let raw_size = shard_sizes
+            .get(&s.filter)
+            .copied()
+            .unwrap_or(s.total_size);
+        if raw_size == 0 {
+            return None;
+        }
         let active = s.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0);
         let joining = s.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0);
         let total = (active + joining) as usize;
         let ri = proposer::compute_shard_ring_info(total);
-        let size = shard_sizes
-            .get(&s.filter)
-            .copied()
-            .unwrap_or_else(|| if s.total_size > 0 { s.total_size } else { 1 })
-            .max(1);
         Some(ShardDescriptor {
             filter: s.filter.clone(),
-            size,
+            size: raw_size,
             ring: ri.current_ring,
             shards: 1,
             active_on_ring: ri.active_on_current_ring,

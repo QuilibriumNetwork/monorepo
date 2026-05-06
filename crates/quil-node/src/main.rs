@@ -1902,7 +1902,35 @@ async fn run_master_node(
                 // Evaluate prover lifecycle (join/confirm/leave) and
                 // dispatch any resulting action through the submission
                 // pipeline (VDF + sign + submit on a background task).
-                pl_for_poller.set_prover_root_verified_frame(frame_num);
+                //
+                // Only mark this frame as verified if the local prover
+                // tree commitment matches the frame's. On a fresh wipe
+                // before sync catches up, the local global-shard
+                // vertex_adds tree is empty (or genesis), so the match
+                // fails and the lifecycle stays gated. Mirrors the
+                // semantic of FrameMaterializer::verify_prover_root.
+                if let (Ok(commits), Some(expected)) = (
+                    quil_types::store::HypergraphStore::get_root_commits(
+                        hg_for_poller.as_ref(),
+                        frame_num,
+                    ),
+                    frame.header.as_ref().map(|h| &h.prover_tree_commitment),
+                ) {
+                    let global_shard = quil_types::store::ShardKey {
+                        l1: [0u8; 3],
+                        l2: [0u8; 32],
+                    };
+                    if let Some(phases) = commits.get(&global_shard) {
+                        if let Some(local) = phases.first() {
+                            if !local.is_empty()
+                                && !expected.is_empty()
+                                && local == expected
+                            {
+                                pl_for_poller.set_prover_root_verified_frame(frame_num);
+                            }
+                        }
+                    }
+                }
                 match pl_for_poller.evaluate(
                     frame_num,
                     frame_difficulty as u64,
@@ -1978,14 +2006,22 @@ async fn run_master_node(
                 // Initial full sync — skipped when we're an archive
                 // since the local genesis path already populated the
                 // hypergraph store with the prover tree.
+                let mut initial_sync_data_ok = sync_archive_mode;
                 if !sync_archive_mode {
                     if let Some(addr) = sync_pool.get_all().await.first() {
                         info!("starting initial prover tree sync");
-                        let _ = quil_rpc::ensure_prover_tree(
+                        match quil_rpc::ensure_prover_tree(
                             addr, &seed,
                             quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
                             sync_hg.clone(),
-                        ).await;
+                        ).await {
+                            Ok(_) => {
+                                initial_sync_data_ok = true;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "initial prover tree sync failed; lifecycle gate stays held");
+                            }
+                        }
                     // Refresh prover registry from synced data
                     let pr = sync_pr.clone();
                     let hs2 = sync_hg.clone();
@@ -2025,8 +2061,21 @@ async fn run_master_node(
                     }
                     } // end of `if let Some(addr) { ... }`
                 } // end of `if !sync_archive_mode { ... }`
-                sync_pl.set_sync_complete();
-                info!("initial prover tree sync complete, lifecycle enabled");
+                // Only flip the lifecycle gate when we actually have
+                // prover-tree data to evaluate against. On a fresh
+                // wipe with no reachable archive (or sync error), the
+                // local registry is empty — toggling sync_complete
+                // here would let the lifecycle propose joins for
+                // every shard before we know what we already own.
+                if initial_sync_data_ok {
+                    sync_pl.set_sync_complete();
+                    info!("initial prover tree sync complete, lifecycle enabled");
+                } else {
+                    warn!(
+                        "no prover-tree data available; lifecycle gate held — \
+                         will retry via the periodic sync task"
+                    );
+                }
 
                     // Check if we're an active prover and build genesis QC.
                     // Try store first, fall back to embedded mainnet genesis.
@@ -2385,6 +2434,12 @@ async fn run_master_node(
                                         } else {
                                             debug!("incremental sync: tree unchanged");
                                         }
+                                        // Recovery path: if the initial sync at
+                                        // startup failed (no archive reachable
+                                        // yet, transient error), the lifecycle
+                                        // gate stayed held. Unblock it now that
+                                        // we have data.
+                                        sync_pl.set_sync_complete();
                                     }
                                     Err(e) => warn!(error = %e, "incremental prover tree sync failed"),
                                 }
@@ -2836,7 +2891,31 @@ async fn run_master_node(
                                                         let frame_difficulty = frame.header.as_ref()
                                                             .map(|h| h.difficulty)
                                                             .unwrap_or(0);
-                                                        pl_for_recv.set_prover_root_verified_frame(frame_num);
+                                                        // Mark frame as verified only on local-vs-frame
+                                                        // prover-tree commitment match. See poller path
+                                                        // (~line 1905) for rationale.
+                                                        if let (Ok(commits), Some(expected)) = (
+                                                            quil_types::store::HypergraphStore::get_root_commits(
+                                                                hg_store_for_recv.as_ref(),
+                                                                frame_num,
+                                                            ),
+                                                            frame.header.as_ref().map(|h| &h.prover_tree_commitment),
+                                                        ) {
+                                                            let global_shard = quil_types::store::ShardKey {
+                                                                l1: [0u8; 3],
+                                                                l2: [0u8; 32],
+                                                            };
+                                                            if let Some(phases) = commits.get(&global_shard) {
+                                                                if let Some(local) = phases.first() {
+                                                                    if !local.is_empty()
+                                                                        && !expected.is_empty()
+                                                                        && local == expected
+                                                                    {
+                                                                        pl_for_recv.set_prover_root_verified_frame(frame_num);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                         match pl_for_recv.evaluate(
                                                             frame_num,
                                                             frame_difficulty as u64,
