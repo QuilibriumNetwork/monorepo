@@ -42,14 +42,20 @@ impl KeyManager for DefaultKeyManager {
                     )));
                 }
 
-                // Domain-separated message: the signer used sign_with_domain
-                // which appends the domain to the context. The Go code passes
-                // `domain` as the Ed448 "context" parameter.
+                // Go's `Ed448Key.SignWithDomain` (node/keys/ed448_key.go)
+                // signs `concat(domain, message)` under pure Ed448 with
+                // an empty RFC 8032 ctx. `ValidateSignature` in
+                // node/keys/inmem.go verifies the same way. Mirror that
+                // exactly here — passing `domain` as the RFC ctx
+                // produces a different signature and would never verify
+                // a Go-signed payload.
                 let pk = ed448_rust::PublicKey::try_from(public_key)
                     .map_err(|e| QuilError::Internal(format!("Ed448 key decode: {:?}", e)))?;
 
-                let ctx = if domain.is_empty() { None } else { Some(domain) };
-                match pk.verify(message, signature, ctx) {
+                let mut digest = Vec::with_capacity(domain.len() + message.len());
+                digest.extend_from_slice(domain);
+                digest.extend_from_slice(message);
+                match pk.verify(&digest, signature, None) {
                     Ok(()) => Ok(true),
                     Err(_) => Ok(false),
                 }
@@ -174,6 +180,41 @@ mod tests {
             Ok(false) => {}
             Err(_) => {}
             Ok(true) => panic!("should not validate garbage"),
+        }
+    }
+
+    #[test]
+    fn ed448_sign_with_domain_round_trips_through_validate_signature() {
+        // The whole point of this round-trip: Ed448Signer::sign_with_domain
+        // must match exactly what DefaultKeyManager::validate_signature
+        // verifies. Both follow Go's `Ed448Key.SignWithDomain` /
+        // inmem.go ValidateSignature scheme — pure Ed448 over
+        // concat(domain, message) with empty RFC ctx.
+        let m = km(false);
+        let seed = [0x42u8; 57];
+        let pk = crate::Ed448Signer::derive_public(&seed).unwrap();
+        let signer = crate::Ed448Signer::from_bytes(&seed, &pk).unwrap();
+
+        for domain in [&b""[..], &b"NODE_AUTHENTICATION"[..], &[0xFFu8; 32][..]] {
+            let msg = b"hello-from-the-rust-port";
+            let sig = signer.sign_with_domain(msg, domain).unwrap();
+            let ok = m
+                .validate_signature(KeyType::Ed448, &pk, msg, &sig, domain)
+                .unwrap();
+            assert!(
+                ok,
+                "validate_signature must accept what sign_with_domain produced (domain.len()={})",
+                domain.len()
+            );
+
+            // Same signature must NOT verify under a different domain.
+            let other_domain = b"DIFFERENT_DOMAIN";
+            if domain != other_domain {
+                let bad = m
+                    .validate_signature(KeyType::Ed448, &pk, msg, &sig, other_domain)
+                    .unwrap();
+                assert!(!bad, "different-domain verify must fail");
+            }
         }
     }
 

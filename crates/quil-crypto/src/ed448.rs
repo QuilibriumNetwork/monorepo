@@ -2,9 +2,10 @@
 //! identity and KeyRegistry cross-signatures. Mirrors Go's
 //! `crypto.KeyTypeEd448` path.
 //!
-//! `domain` is passed through as the Ed448 context parameter (per
-//! RFC 8032 §8.3), matching how `DefaultKeyManager` verifies these
-//! signatures in `key_manager.rs`.
+//! `sign_with_domain(message, domain)` matches Go's
+//! `Ed448Key.SignWithDomain`: it signs `concat(domain, message)`
+//! under pure Ed448 with an empty RFC 8032 ctx. Verifiers must
+//! reconstruct the same `concat(domain, message)` digest.
 
 use ed448_rust::{PrivateKey, PublicKey};
 use quil_types::crypto::{KeyType, Signer};
@@ -81,9 +82,17 @@ impl Signer for Ed448Signer {
         let mut seed = [0u8; 57];
         seed.copy_from_slice(&self.secret_key);
         let sk = PrivateKey::from(seed);
-        let ctx = if domain.is_empty() { None } else { Some(domain) };
+        // Go's `Ed448Key.SignWithDomain` signs `concat(domain, message)`
+        // with an empty Ed448 context (`ed448.PrivateKey.Sign` with
+        // `crypto.Hash(0)` opts maps to pure Ed448, ctx=""). Mirror
+        // that exactly — passing `domain` as the RFC 8032 ctx
+        // parameter would produce a mathematically different (and
+        // Go-incompatible) signature.
+        let mut digest = Vec::with_capacity(domain.len() + message.len());
+        digest.extend_from_slice(domain);
+        digest.extend_from_slice(message);
         let sig = sk
-            .sign(message, ctx)
+            .sign(&digest, None)
             .map_err(|e| QuilError::Crypto(format!("Ed448 sign failed: {:?}", e)))?;
         Ok(sig.to_vec())
     }

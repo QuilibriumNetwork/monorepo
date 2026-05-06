@@ -3259,21 +3259,35 @@ async fn run_master_node(
                         if payload.is_empty() {
                             return Err("empty payload".into());
                         }
-                        // NODE_AUTHENTICATION || domain is the verification
-                        // context fed to ed448 sign/verify.
-                        let mut context = Vec::with_capacity(19 + 32);
-                        context.extend_from_slice(b"NODE_AUTHENTICATION");
-                        context.extend_from_slice(&domain);
-                        // Ed448 verify payload with the context as the
-                        // "context" arg of RFC 8032 (pre-hashed = false).
+                        // Go's `SignWithDomain` signs concat(prefix,
+                        // body) with an empty Ed448 context. Match
+                        // that — passing the prefix as the RFC 8032
+                        // ctx parameter would not verify Go-produced
+                        // signatures.
+                        let mut digest = Vec::with_capacity(19 + 32 + payload.len());
+                        digest.extend_from_slice(b"NODE_AUTHENTICATION");
+                        digest.extend_from_slice(&domain);
+                        digest.extend_from_slice(&payload);
                         let pk = ed448_rust::PublicKey::try_from(ed448_pub.as_slice())
                             .map_err(|e| format!("bad pubkey: {:?}", e))?;
-                        if let Err(e) = pk.verify(&payload, &authentication, Some(&context)) {
+                        if let Err(e) = pk.verify(&digest, &authentication, None) {
+                            // Hex of the first/last 16 bytes of the
+                            // signed payload — enough to verify the
+                            // type prefix (0x0312) and trailing
+                            // timestamp + sig envelope without
+                            // dumping the entire (possibly large)
+                            // body. Cross-checks against qclient's
+                            // own log if it dumps its bundle.
+                            let head_n = payload.len().min(16);
+                            let tail_n = payload.len().saturating_sub(16);
                             tracing::warn!(
-                                pubkey_prefix = %hex::encode(&ed448_pub[..ed448_pub.len().min(8)]),
+                                pubkey = %hex::encode(&ed448_pub),
                                 payload_len = payload.len(),
+                                payload_head = %hex::encode(&payload[..head_n]),
+                                payload_tail = %hex::encode(&payload[tail_n..]),
                                 auth_len = authentication.len(),
-                                domain_prefix = %hex::encode(&domain[..domain.len().min(8)]),
+                                auth_prefix = %hex::encode(&authentication[..authentication.len().min(8)]),
+                                domain = %hex::encode(&domain),
                                 error = ?e,
                                 "Send Ed448 verify failed"
                             );
