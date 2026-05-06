@@ -126,25 +126,41 @@ pub fn resolve_prover_ring(
 ) -> (u8, usize) {
     let ri = compute_shard_ring_info(total_candidates);
 
-    if !is_allocated || self_address.is_empty() {
-        return (ri.joiner_ring, ri.active_on_joiner_ring as usize);
-    }
-
-    // Find this prover's actual rank in the sorted candidate list.
-    for (rank, addr) in candidate_addrs.iter().enumerate() {
-        if addr.as_slice() == self_address {
-            let ring = (rank / 8) as u8;
-            let ring_start = rank - (rank % 8);
-            let mut on_ring = total_candidates - ring_start;
-            if on_ring > 8 {
-                on_ring = 8;
+    // Try the rank lookup first — if `self_address` is in the
+    // candidate list we know our rank regardless of whether the
+    // caller's `is_allocated` view of us is up-to-date. The
+    // `is_allocated` flag was previously gating this branch, which
+    // produced a real off-by-one: when the caller's
+    // `allocated_filters` lookup missed (e.g. registry-derived
+    // confirmation_filter bytes diverging from the shards-store
+    // `bp` reconstruction by even one trailing byte), we skipped
+    // straight to `joiner_ring` and reported "ring N+1" for what
+    // was actually rank N.
+    if !self_address.is_empty() {
+        for (rank, addr) in candidate_addrs.iter().enumerate() {
+            if addr.as_slice() == self_address {
+                let ring = (rank / 8) as u8;
+                let ring_start = rank - (rank % 8);
+                let mut on_ring = total_candidates - ring_start;
+                if on_ring > 8 {
+                    on_ring = 8;
+                }
+                return (ring, on_ring);
             }
-            return (ring, on_ring);
         }
     }
 
-    // Prover allocated but not in the active/joining candidate list
-    // (e.g. leaving or paused). Fall back to the last existing prover's ring.
+    // Not in the candidate list. Two sub-cases:
+    //   * `is_allocated == false` → we genuinely aren't on this
+    //     shard. Predict the ring we'd land in if we joined now.
+    //   * `is_allocated == true` but missing from candidates → the
+    //     allocation exists but the registry's per-shard prover
+    //     list is lagging. Fall back to `current_ring` (Go-parity
+    //     with `worker_allocator.go::resolveProverRing`'s tail
+    //     branch).
+    if !is_allocated || self_address.is_empty() {
+        return (ri.joiner_ring, ri.active_on_joiner_ring as usize);
+    }
     (ri.current_ring, ri.active_on_current_ring as usize)
 }
 
