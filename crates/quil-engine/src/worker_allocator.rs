@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tracing::info;
+use tracing::{debug, info};
 
 use quil_types::consensus::{ProverRegistry, ProverStatus};
 use quil_types::error::Result;
@@ -210,16 +210,35 @@ impl WorkerAllocator {
                                 self.worker_manager.deallocate_worker(worker.core_id)?;
                             }
                         }
-                        ProverStatus::Left | ProverStatus::Rejected | ProverStatus::Kicked => {
-                            // Allocation ended — clear immediately
+                        ProverStatus::Rejected | ProverStatus::Kicked => {
+                            // Allocation terminally ended — clear
+                            // immediately. `Rejected` = join was
+                            // rejected; `Kicked` = leave-confirmed
+                            // (alloc status byte 5) OR evicted.
+                            //
+                            // NOTE: `ProverStatus::Left` deliberately
+                            // does NOT belong here. For allocations,
+                            // byte 3 → `ProverStatus::Left` actually
+                            // carries Go's "Leaving" semantics (see
+                            // map_allocation_status comment in
+                            // prover_registry.rs:962). The allocation
+                            // is still in flight — the worker must
+                            // stay bound until a Confirm flips it to
+                            // byte 5 (`Kicked`), or a Reject flips it
+                            // back to byte 1 (`Active`).
                             desired_allocated = false;
-                            info!(
+                            debug!(
                                 core_id = worker.core_id,
                                 filter = hex::encode(&worker.filter),
                                 status = ?alloc.status,
                                 "allocation ended, clearing worker"
                             );
                             self.worker_manager.deallocate_worker(worker.core_id)?;
+                        }
+                        ProverStatus::Left => {
+                            // "Leaving" in Go semantics — keep the
+                            // worker bound until Confirm/Reject
+                            // resolves. Falls through to no-op.
                         }
                         _ => {}
                     }
