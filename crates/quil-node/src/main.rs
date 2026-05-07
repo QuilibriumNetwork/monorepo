@@ -2540,6 +2540,7 @@ async fn run_master_node(
                         .unwrap_or(0);
                     let (active, pending, total_allocs) = {
                         use quil_types::consensus::ProverRegistry;
+                        let grace = quil_engine::worker_allocator::PENDING_FILTER_GRACE_FRAMES;
                         match pr_for_recv.get_prover_info(&pa_for_recv) {
                             Ok(Some(info)) => {
                                 let a = info.allocations.iter()
@@ -2554,11 +2555,42 @@ async fn run_master_node(
                                     .filter(|a| {
                                         a.status == quil_types::consensus::ProverStatus::Joining
                                             && latest_frame
-                                                <= a.join_frame_number
-                                                    + quil_engine::worker_allocator::PENDING_FILTER_GRACE_FRAMES
+                                                <= a.join_frame_number + grace
                                     })
                                     .count();
-                                (a, p, info.allocations.len())
+                                // Total = live allocations only:
+                                //   * Active / Paused — currently bound.
+                                //   * Joining (within 720-frame grace).
+                                //   * Left (= Go's "Leaving", within grace).
+                                // Drops Rejected/Kicked terminal states
+                                // and any Joining/Leaving past the
+                                // grace window, since the TUI's
+                                // alloc list does the same. Without
+                                // this, the count drifts upward as
+                                // expired entries accumulate.
+                                let total = info.allocations.iter()
+                                    .filter(|a| {
+                                        match a.status {
+                                            quil_types::consensus::ProverStatus::Active
+                                            | quil_types::consensus::ProverStatus::Paused => true,
+                                            quil_types::consensus::ProverStatus::Joining => {
+                                                a.join_frame_number == 0
+                                                    || latest_frame
+                                                        <= a.join_frame_number + grace
+                                            }
+                                            // Rust enum's `Left` is Go's
+                                            // "Leaving" — alloc still
+                                            // in flight until Confirm/Reject.
+                                            quil_types::consensus::ProverStatus::Left => {
+                                                a.leave_frame_number == 0
+                                                    || latest_frame
+                                                        <= a.leave_frame_number + grace
+                                            }
+                                            _ => false,
+                                        }
+                                    })
+                                    .count();
+                                (a, p, total)
                             }
                             _ => (0, 0, 0),
                         }

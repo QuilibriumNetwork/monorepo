@@ -612,13 +612,23 @@ impl WorkerManager for ThreadWorkerManager {
     }
 
     fn deallocate_worker(&self, core_id: u32) -> Result<()> {
+        // Drop the filter binding and stop any running consensus
+        // engine, but KEEP the worker thread alive in the HashMap so
+        // it shows up in `range_workers()` as Idle. Without this,
+        // every expired-Joining / Rejected / Kicked allocation
+        // disappeared from `GetWorkerInfo` permanently and the TUI
+        // top-pane lost rows it should have kept as "Idle".
         let mut workers = self.workers.lock().unwrap();
-        if let Some(mut w) = workers.remove(&core_id) {
-            w.cancel.cancel();
-            if let Some(handle) = w.handle.take() {
-                // Give the thread up to 5 seconds to finish
-                let _ = handle.join();
-            }
+        if let Some(w) = workers.get_mut(&core_id) {
+            w.filter.clear();
+            w.allocated = false;
+            w.pending_filter_frame = 0;
+            // Send empty-filter Respawn so the worker tears down its
+            // engine and goes idle without exiting the loop.
+            let _ = w.tx.try_send(MasterToWorker::Respawn {
+                filter: Vec::new(),
+                start_consensus: true,
+            });
         }
         Ok(())
     }
@@ -718,9 +728,12 @@ mod tests {
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].core_id, 1);
 
-        // Deallocate
+        // Deallocate — worker stays listed (now Idle) so the TUI's
+        // top pane keeps showing it. Filter is cleared.
         mgr.deallocate_worker(1).unwrap();
         let workers = mgr.range_workers().unwrap();
-        assert!(workers.is_empty());
+        assert_eq!(workers.len(), 1);
+        assert!(workers[0].filter.is_empty());
+        assert!(!workers[0].allocated);
     }
 }

@@ -126,41 +126,27 @@ pub fn resolve_prover_ring(
 ) -> (u8, usize) {
     let ri = compute_shard_ring_info(total_candidates);
 
-    // Try the rank lookup first — if `self_address` is in the
-    // candidate list we know our rank regardless of whether the
-    // caller's `is_allocated` view of us is up-to-date. The
-    // `is_allocated` flag was previously gating this branch, which
-    // produced a real off-by-one: when the caller's
-    // `allocated_filters` lookup missed (e.g. registry-derived
-    // confirmation_filter bytes diverging from the shards-store
-    // `bp` reconstruction by even one trailing byte), we skipped
-    // straight to `joiner_ring` and reported "ring N+1" for what
-    // was actually rank N.
-    if !self_address.is_empty() {
-        for (rank, addr) in candidate_addrs.iter().enumerate() {
-            if addr.as_slice() == self_address {
-                let ring = (rank / 8) as u8;
-                let ring_start = rank - (rank % 8);
-                let mut on_ring = total_candidates - ring_start;
-                if on_ring > 8 {
-                    on_ring = 8;
-                }
-                return (ring, on_ring);
-            }
-        }
-    }
-
-    // Not in the candidate list. Two sub-cases:
-    //   * `is_allocated == false` → we genuinely aren't on this
-    //     shard. Predict the ring we'd land in if we joined now.
-    //   * `is_allocated == true` but missing from candidates → the
-    //     allocation exists but the registry's per-shard prover
-    //     list is lagging. Fall back to `current_ring` (Go-parity
-    //     with `worker_allocator.go::resolveProverRing`'s tail
-    //     branch).
     if !is_allocated || self_address.is_empty() {
         return (ri.joiner_ring, ri.active_on_joiner_ring as usize);
     }
+
+    // Find this prover's actual rank in the sorted candidate list.
+    for (rank, addr) in candidate_addrs.iter().enumerate() {
+        if addr.as_slice() == self_address {
+            let ring = (rank / 8) as u8;
+            let ring_start = rank - (rank % 8);
+            let mut on_ring = total_candidates - ring_start;
+            if on_ring > 8 {
+                on_ring = 8;
+            }
+            return (ring, on_ring);
+        }
+    }
+
+    // Allocated but not in the active/joining candidate list (leaving
+    // / paused). Fall back to the last-existing-prover's ring. Go
+    // parity with `worker_allocator.go::resolveProverRing`'s tail
+    // branch.
     (ri.current_ring, ri.active_on_current_ring as usize)
 }
 
@@ -371,9 +357,21 @@ where
             let candidate_addrs: Vec<Vec<u8>> =
                 candidates.iter().map(|c| c.address.clone()).collect();
 
+            // Derive is_alloc from the candidate list (the registry's
+            // authoritative per-shard prover view), not just from the
+            // caller-supplied allocated_filters byte set. This handles
+            // the case where the local prover_info's `confirmation_filter`
+            // doesn't byte-match the reconstructed `bp` — we may still be
+            // listed under this shard in the registry's filter cache. The
+            // ring math then correctly returns rank-based, and the
+            // TUI shelves the row in the upper "Allocations" panel.
+            let in_candidates = !self_address.is_empty()
+                && candidate_addrs.iter().any(|a| a.as_slice() == self_address);
+            let real_is_alloc = is_alloc || in_candidates;
+
             let (ring, on_ring) = resolve_prover_ring(
                 candidates.len(),
-                is_alloc,
+                real_is_alloc,
                 self_address,
                 &candidate_addrs,
             );
@@ -384,7 +382,7 @@ where
                 data_shards: shard.data_shards,
                 total_active: candidates.len(),
                 provers_on_ring: on_ring,
-                is_allocated: is_alloc,
+                is_allocated: real_is_alloc,
                 ring,
             });
         }
