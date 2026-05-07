@@ -42,7 +42,21 @@ pub struct ShardDescriptor {
     pub shards: u64,
     /// Number of provers sharing this ring (including joiner if applicable).
     pub active_on_ring: u64,
+    /// Total Active+Joining provers on the shard (independent of
+    /// ring assignment). Used for halt-risk prioritization in
+    /// `plan_and_allocate`: shards at or below
+    /// `HALT_RISK_PROVER_COUNT` are picked before any reward-greedy
+    /// candidate, since losing a prover from such a shard halts the
+    /// network and zeroes everyone's reward.
+    pub total_active_joining: u64,
 }
+
+/// Provers-per-shard ceiling that classifies a shard as halt-risk.
+/// At/under this count, losing a single prover risks dropping below
+/// the consensus quorum and halting the shard. Auto-allocation
+/// prioritizes joining these shards over picking the highest
+/// reward-greedy candidate.
+pub const HALT_RISK_PROVER_COUNT: u64 = 3;
 
 /// A proposed shard allocation.
 #[derive(Debug, Clone)]
@@ -301,6 +315,28 @@ pub fn plan_and_allocate(
             start = end;
         }
     }
+
+    // Halt-risk priority: any shard at or under
+    // `HALT_RISK_PROVER_COUNT` (with size > 0) jumps to the front of
+    // the picking order regardless of its reward-greedy score. The
+    // scored ordering is preserved within each bucket so internal
+    // tie-breaking still flows from `score_shards`. Without this
+    // pass, a high-size 8-prover shard outscores a 3-prover shard
+    // and the auto-allocator continues piling onto already-healthy
+    // shards while halt-risk ones lose their last prover and the
+    // network halts.
+    let mut halt_risk: Vec<Scored> = Vec::new();
+    let mut other: Vec<Scored> = Vec::new();
+    for s in scores {
+        let d = &shards[s.idx];
+        if d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT {
+            halt_risk.push(s);
+        } else {
+            other.push(s);
+        }
+    }
+    let mut scores = halt_risk;
+    scores.extend(other);
 
     let limit = max_allocations
         .min(free_worker_ids.len())
@@ -612,8 +648,8 @@ mod tests {
     #[test]
     fn score_data_greedy_by_size() {
         let shards = vec![
-            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1 },
-            ShardDescriptor { filter: vec![2], size: 200, ring: 0, shards: 1, active_on_ring: 1 },
+            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16 },
+            ShardDescriptor { filter: vec![2], size: 200, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16 },
         ];
         let scores = score_shards(
             &shards,
@@ -645,14 +681,140 @@ mod tests {
     #[test]
     fn plan_leaves_empty_when_no_unallocated() {
         let allocated = vec![
-            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1 },
+            ShardDescriptor { filter: vec![1], size: 100, ring: 0, shards: 1, active_on_ring: 1, total_active_joining: 16 },
         ];
         let result = plan_leaves(&allocated, &[], 50000, &BigInt::from(1_000_000), DEFAULT_UNITS, Strategy::RewardGreedy);
         assert!(result.is_empty());
     }
 
     fn make_shard(filter: Vec<u8>, size: u64, ring: u8, shards: u64) -> ShardDescriptor {
-        ShardDescriptor { filter, size, ring, shards, active_on_ring: 1 }
+        // Default `total_active_joining` = 16 so the shard is NOT
+        // halt-risk in tests that don't care about that bucket.
+        ShardDescriptor {
+            filter,
+            size,
+            ring,
+            shards,
+            active_on_ring: 1,
+            total_active_joining: 16,
+        }
+    }
+
+    #[test]
+    fn plan_and_allocate_prefers_halt_risk_over_higher_reward() {
+        // A high-size, healthy (8-prover) shard would normally
+        // outscore a small 3-prover shard. Verify the halt-risk
+        // bucket pulls the 3-prover shard ahead of it.
+        let healthy = ShardDescriptor {
+            filter: vec![1],
+            size: 10_000_000,
+            ring: 1,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 8,
+        };
+        let halt_risk = ShardDescriptor {
+            filter: vec![2],
+            size: 1_000_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 4,
+            total_active_joining: 3,
+        };
+        let result = plan_and_allocate(
+            &[healthy, halt_risk],
+            50_000,
+            &BigInt::from(20_000_000u64),
+            DEFAULT_UNITS,
+            &[1],
+            1,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].filter, vec![2], "halt-risk shard must be picked first");
+    }
+
+    #[test]
+    fn plan_and_allocate_falls_back_to_reward_after_halt_risk_filled() {
+        // Two halt-risk shards + one healthy. With 3 free workers and
+        // max_allocations=3, all three should be picked. Halt-risk
+        // first, healthy last.
+        let healthy = ShardDescriptor {
+            filter: vec![3],
+            size: 10_000_000,
+            ring: 1,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 8,
+        };
+        let halt_a = ShardDescriptor {
+            filter: vec![1],
+            size: 500_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 2,
+            total_active_joining: 1,
+        };
+        let halt_b = ShardDescriptor {
+            filter: vec![2],
+            size: 700_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 3,
+            total_active_joining: 2,
+        };
+        let result = plan_and_allocate(
+            &[healthy, halt_a, halt_b],
+            50_000,
+            &BigInt::from(20_000_000u64),
+            DEFAULT_UNITS,
+            &[1, 2, 3],
+            3,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(result.len(), 3);
+        // First two picks must be the halt-risk shards (order between
+        // them depends on score; both fall in the halt-risk bucket).
+        let first_two: std::collections::HashSet<Vec<u8>> = result[0..2]
+            .iter()
+            .map(|p| p.filter.clone())
+            .collect();
+        assert!(first_two.contains(&vec![1u8]));
+        assert!(first_two.contains(&vec![2u8]));
+        assert_eq!(result[2].filter, vec![3], "healthy shard last");
+    }
+
+    #[test]
+    fn plan_and_allocate_skips_zero_size_halt_risk_shards() {
+        // size=0 must NOT be promoted into the halt-risk bucket —
+        // a shard with no data isn't worth saving.
+        let zero_halt = ShardDescriptor {
+            filter: vec![1],
+            size: 0,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 1,
+        };
+        let normal = ShardDescriptor {
+            filter: vec![2],
+            size: 100_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+        };
+        let result = plan_and_allocate(
+            &[zero_halt, normal],
+            50_000,
+            &BigInt::from(1_000_000u64),
+            DEFAULT_UNITS,
+            &[1],
+            1,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].filter, vec![2]);
     }
 
     #[test]

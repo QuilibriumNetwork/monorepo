@@ -952,6 +952,7 @@ fn build_proposal_descriptors(
             ring: ri.joiner_ring,
             shards: 1,
             active_on_ring: ri.active_on_joiner_ring,
+            total_active_joining: total as u64,
         });
         seen.insert(s.filter.clone());
     }
@@ -983,6 +984,9 @@ fn build_proposal_descriptors(
             ring: ri.joiner_ring,
             shards: 1,
             active_on_ring: ri.active_on_joiner_ring,
+            // 0 active+joining → halt-risk-eligible. The proposer's
+            // bucket-by-halt-risk pass picks these first.
+            total_active_joining: 0,
         });
     }
     out
@@ -1023,6 +1027,7 @@ fn build_decide_descriptors(
             ring: ri.current_ring,
             shards: 1,
             active_on_ring: ri.active_on_current_ring,
+            total_active_joining: total as u64,
         })
     }).collect()
 }
