@@ -549,7 +549,7 @@ impl ProverLifecycle {
                         all_our_filters.push(alloc.confirmation_filter.clone());
                         active_filters.push(alloc.confirmation_filter.clone());
                     }
-                    ProverStatus::Left => {
+                    ProverStatus::Leaving => {
                         if frame_number
                             > alloc.leave_frame_number
                                 + crate::worker_allocator::PENDING_FILTER_GRACE_FRAMES
