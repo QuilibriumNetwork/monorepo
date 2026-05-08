@@ -535,7 +535,7 @@ pub fn build_allocated_filters(
         {
             continue;
         }
-        if alloc.status == ProverStatus::Left
+        if alloc.status == ProverStatus::Leaving
             && current_frame > alloc.leave_frame_number + 720
         {
             continue;

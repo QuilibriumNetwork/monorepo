@@ -959,7 +959,7 @@ fn map_prover_status(byte: u8) -> Option<ProverStatus> {
         0 => Some(ProverStatus::Joining),
         1 => Some(ProverStatus::Active),
         2 => Some(ProverStatus::Paused),
-        3 => Some(ProverStatus::Left), // Rust "Left" = Go "Leaving"
+        3 => Some(ProverStatus::Leaving),
         // 4 is "left" for provers — Go skips the vertex.
         _ => None,
     }
@@ -971,7 +971,7 @@ fn map_allocation_status(byte: u8) -> ProverStatus {
         0 => ProverStatus::Joining,
         1 => ProverStatus::Active,
         2 => ProverStatus::Paused,
-        3 => ProverStatus::Left,
+        3 => ProverStatus::Leaving,
         4 => ProverStatus::Rejected,
         5 => ProverStatus::Kicked,
         _ => ProverStatus::Unknown,

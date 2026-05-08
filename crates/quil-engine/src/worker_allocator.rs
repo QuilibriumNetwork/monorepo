@@ -216,16 +216,14 @@ impl WorkerAllocator {
                             // rejected; `Kicked` = leave-confirmed
                             // (alloc status byte 5) OR evicted.
                             //
-                            // NOTE: `ProverStatus::Left` deliberately
-                            // does NOT belong here. For allocations,
-                            // byte 3 → `ProverStatus::Left` actually
-                            // carries Go's "Leaving" semantics (see
-                            // map_allocation_status comment in
-                            // prover_registry.rs:962). The allocation
-                            // is still in flight — the worker must
-                            // stay bound until a Confirm flips it to
-                            // byte 5 (`Kicked`), or a Reject flips it
-                            // back to byte 1 (`Active`).
+                            // `ProverStatus::Leaving` deliberately
+                            // does NOT belong here — it's the
+                            // in-flight state (alloc status byte 3,
+                            // matching Go's `ProverStatusLeaving`).
+                            // The allocation isn't terminal yet; the
+                            // worker must stay bound until a Confirm
+                            // flips it to `Kicked` or a Reject flips
+                            // it back to `Active`.
                             desired_allocated = false;
                             debug!(
                                 core_id = worker.core_id,
@@ -235,10 +233,9 @@ impl WorkerAllocator {
                             );
                             self.worker_manager.deallocate_worker(worker.core_id)?;
                         }
-                        ProverStatus::Left => {
-                            // "Leaving" in Go semantics — keep the
-                            // worker bound until Confirm/Reject
-                            // resolves. Falls through to no-op.
+                        ProverStatus::Leaving => {
+                            // Leave in flight — keep the worker bound
+                            // until Confirm/Reject resolves.
                         }
                         _ => {}
                     }

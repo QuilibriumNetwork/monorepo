@@ -122,7 +122,12 @@ pub trait EventDistributor: Send + Sync {
 // Prover registry
 // ---------------------------------------------------------------------------
 
-/// Prover status in the registry.
+/// Prover status in the registry. Matches Go's
+/// `types/consensus/prover_registry.go::ProverStatus` 1:1 by name.
+///
+/// IMPORTANT: `Leaving` means **in flight, awaiting Confirm/Reject**
+/// (trie byte 3) — it is NOT a terminal state. The terminal
+/// "leave-confirmed" / evicted state is `Kicked` (trie byte 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ProverStatus {
@@ -130,7 +135,7 @@ pub enum ProverStatus {
     Joining = 1,
     Active = 2,
     Paused = 3,
-    Left = 4,
+    Leaving = 4,
     Rejected = 5,
     Kicked = 6,
 }

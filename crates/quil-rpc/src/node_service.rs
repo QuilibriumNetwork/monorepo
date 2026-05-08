@@ -316,7 +316,7 @@ impl NodeService for NodeRpcServer {
                         ProverStatus::Joining
                         | ProverStatus::Active
                         | ProverStatus::Paused
-                        | ProverStatus::Left => {} // Left = Leaving in Go (status 4)
+                        | ProverStatus::Leaving => {}
                         _ => continue,
                     }
                     // Skip expired joins (grace = 720 frames).
@@ -326,7 +326,7 @@ impl NodeService for NodeRpcServer {
                         continue;
                     }
                     // Skip expired leaves (grace = 720 frames).
-                    if alloc.status == ProverStatus::Left
+                    if alloc.status == ProverStatus::Leaving
                         && current_frame > alloc.leave_frame_number + 720
                     {
                         continue;

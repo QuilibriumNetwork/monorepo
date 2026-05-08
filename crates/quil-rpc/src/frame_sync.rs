@@ -153,6 +153,15 @@ pub struct ArchivePollerConfig {
     pub call_timeout: Duration,
     /// Optional callback fired for each frame after storage.
     pub on_frame: Option<OnFrameCallback>,
+    /// When true, the poller forward-fills every missed frame
+    /// between the previously-seen head and the current head — the
+    /// archive case where retaining full history is the point.
+    /// When false (typical operator), the poller jumps straight to
+    /// `head` on each tick: catching up on hundreds of thousands of
+    /// genesis-to-tip frames just to start processing the latest
+    /// state is wasted bandwidth, and the prover-tree sync provides
+    /// the registry view we actually need.
+    pub forward_fill: bool,
 }
 
 impl Default for ArchivePollerConfig {
@@ -161,6 +170,7 @@ impl Default for ArchivePollerConfig {
             poll_interval: Duration::from_secs(1),
             call_timeout: Duration::from_secs(30),
             on_frame: None,
+            forward_fill: false,
         }
     }
 }
@@ -262,7 +272,9 @@ pub fn spawn_archive_poller(
             }
 
             // 2. Forward-fill any missed frames in (last_frame, new_number).
-            if last_frame > 0 && new_number > last_frame + 1 {
+            //    Archive nodes need the full history; everyone else
+            //    just wants to start from the current head.
+            if config.forward_fill && last_frame > 0 && new_number > last_frame + 1 {
                 let mut catchup_failed = false;
                 for fn_ in (last_frame + 1)..new_number {
                     match tokio::time::timeout(

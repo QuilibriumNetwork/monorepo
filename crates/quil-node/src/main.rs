@@ -1899,38 +1899,23 @@ async fn run_master_node(
                     tracing::warn!(error = %e, "worker allocation failed");
                 }
 
-                // Evaluate prover lifecycle (join/confirm/leave) and
-                // dispatch any resulting action through the submission
-                // pipeline (VDF + sign + submit on a background task).
+                // Advance the lifecycle's "verified frame" marker. The
+                // initial prover-tree sync already proved our root
+                // matches the network (`commitments_match==true` —
+                // see the spawn at the bottom of `main.rs`). From
+                // that point on, every successfully-processed frame
+                // either applies new prover messages (and our tree
+                // moves with it) or is a no-op for prover state.
+                // Either way we stay in sync; drift is caught by the
+                // 5-minute periodic incremental sync.
                 //
-                // Only mark this frame as verified if the local prover
-                // tree commitment matches the frame's. On a fresh wipe
-                // before sync catches up, the local global-shard
-                // vertex_adds tree is empty (or genesis), so the match
-                // fails and the lifecycle stays gated. Mirrors the
-                // semantic of FrameMaterializer::verify_prover_root.
-                if let (Ok(commits), Some(expected)) = (
-                    quil_types::store::HypergraphStore::get_root_commits(
-                        hg_for_poller.as_ref(),
-                        frame_num,
-                    ),
-                    frame.header.as_ref().map(|h| &h.prover_tree_commitment),
-                ) {
-                    let global_shard = quil_types::store::ShardKey {
-                        l1: [0u8; 3],
-                        l2: [0u8; 32],
-                    };
-                    if let Some(phases) = commits.get(&global_shard) {
-                        if let Some(local) = phases.first() {
-                            if !local.is_empty()
-                                && !expected.is_empty()
-                                && local == expected
-                            {
-                                pl_for_poller.set_prover_root_verified_frame(frame_num);
-                            }
-                        }
-                    }
-                }
+                // The earlier strict per-frame commitment check
+                // required `crdt.commit(frame_num)` to have run AND
+                // matched the frame's `prover_tree_commitment`, which
+                // only happened on the rare frames where we applied
+                // prover messages — leaving the lifecycle gate held
+                // perpetually for non-archive nodes.
+                pl_for_poller.set_prover_root_verified_frame(frame_num);
                 match pl_for_poller.evaluate(
                     frame_num,
                     frame_difficulty as u64,
@@ -1948,6 +1933,7 @@ async fn run_master_node(
                     }
                 }
             })),
+            forward_fill: archive_mode,
             ..Default::default()
         };
         quil_rpc::spawn_archive_poller(
@@ -2578,10 +2564,9 @@ async fn run_master_node(
                                                     || latest_frame
                                                         <= a.join_frame_number + grace
                                             }
-                                            // Rust enum's `Left` is Go's
-                                            // "Leaving" — alloc still
-                                            // in flight until Confirm/Reject.
-                                            quil_types::consensus::ProverStatus::Left => {
+                                            // Leaving = alloc still in flight
+                                            // until Confirm/Reject.
+                                            quil_types::consensus::ProverStatus::Leaving => {
                                                 a.leave_frame_number == 0
                                                     || latest_frame
                                                         <= a.leave_frame_number + grace
@@ -2923,31 +2908,12 @@ async fn run_master_node(
                                                         let frame_difficulty = frame.header.as_ref()
                                                             .map(|h| h.difficulty)
                                                             .unwrap_or(0);
-                                                        // Mark frame as verified only on local-vs-frame
-                                                        // prover-tree commitment match. See poller path
-                                                        // (~line 1905) for rationale.
-                                                        if let (Ok(commits), Some(expected)) = (
-                                                            quil_types::store::HypergraphStore::get_root_commits(
-                                                                hg_store_for_recv.as_ref(),
-                                                                frame_num,
-                                                            ),
-                                                            frame.header.as_ref().map(|h| &h.prover_tree_commitment),
-                                                        ) {
-                                                            let global_shard = quil_types::store::ShardKey {
-                                                                l1: [0u8; 3],
-                                                                l2: [0u8; 32],
-                                                            };
-                                                            if let Some(phases) = commits.get(&global_shard) {
-                                                                if let Some(local) = phases.first() {
-                                                                    if !local.is_empty()
-                                                                        && !expected.is_empty()
-                                                                        && local == expected
-                                                                    {
-                                                                        pl_for_recv.set_prover_root_verified_frame(frame_num);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
+                                                        // Once initial prover-tree sync proved
+                                                        // commitment match, advance the
+                                                        // verified-frame marker on every
+                                                        // successfully-handled frame. See poller
+                                                        // path for rationale.
+                                                        pl_for_recv.set_prover_root_verified_frame(frame_num);
                                                         match pl_for_recv.evaluate(
                                                             frame_num,
                                                             frame_difficulty as u64,
@@ -3633,7 +3599,7 @@ async fn run_master_node(
                         {
                             continue;
                         }
-                        if alloc.status == ProverStatus::Left
+                        if alloc.status == ProverStatus::Leaving
                             && current_frame > alloc.leave_frame_number + 720
                         {
                             continue;

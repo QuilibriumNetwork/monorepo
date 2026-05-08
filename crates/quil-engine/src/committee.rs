@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn dynamic_committee_inactive_prover_excluded() {
         let mut inactive = make_prover(9, 20, 1);
-        inactive.status = ProverStatus::Left;
+        inactive.status = ProverStatus::Leaving;
         let committee = make_committee(
             vec![make_prover(1, 10, 1), inactive],
             vec![1; 32],
