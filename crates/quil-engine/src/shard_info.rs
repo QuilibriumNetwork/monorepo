@@ -290,10 +290,6 @@ where
 
         for shard in &resp {
             let size = BigInt::from_bytes_be(num_bigint::Sign::Plus, &shard.size);
-            if size.is_zero() {
-                continue;
-            }
-            world_bytes += &size;
 
             // `ShardInfo.shard_key` is 35 bytes: `L1[3] ++ L2[32]`.
             let l2 = if shard_key.len() >= 35 {
@@ -309,6 +305,21 @@ where
             }
 
             let is_alloc = allocated_filters.contains(&bp);
+
+            // Skip size-zero shards from world_bytes accumulation
+            // (Go parity), but still emit an entry when we're
+            // allocated to it — otherwise the TUI's
+            // `rewardByFilter[filterHex]` lookup misses and a
+            // freshly-Joining row shows reward=0 with the row
+            // disconnected from any size/provers/ring data. The
+            // entry's reward will be 0 anyway when size=0; what
+            // matters is that the alloc row enriches.
+            if size.is_zero() && !is_alloc {
+                continue;
+            }
+            if !size.is_zero() {
+                world_bytes += &size;
+            }
 
             if !include_all && !is_alloc {
                 continue;

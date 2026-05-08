@@ -331,7 +331,7 @@ impl InMemoryProverRegistry {
             all
         } else {
             // Per-filter view: provers with an Active allocation under
-            // this filter — not Joining/Left/Kicked.
+            // this filter — not Joining/Leaving/Rejected/Kicked.
             let Some(addrs) = self.filter_cache.get(filter) else {
                 return Vec::new();
             };
@@ -952,8 +952,9 @@ fn read_bytes(node: &VectorCommitmentNode, class: &str, field: &str) -> Vec<u8> 
 }
 
 /// Map the raw RDF status byte for `prover:Prover` to our enum.
-/// Returns `None` for byte 4 (the Go code's "Left" — it `continue`s
-/// and excludes the prover from the cache entirely).
+/// Returns `None` for byte 4 (the prover-level "left/terminal" value
+/// — Go's deserializer `continue`s past it and excludes the prover
+/// from the cache entirely; we mirror that with `None`).
 fn map_prover_status(byte: u8) -> Option<ProverStatus> {
     match byte {
         0 => Some(ProverStatus::Joining),

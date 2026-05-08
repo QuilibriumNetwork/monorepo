@@ -118,10 +118,11 @@ pub fn materialize_prover_leave(
 
 /// Compute the aggregate prover status from a set of allocation statuses.
 ///
-/// Priority: Active(1) > Joining(0) > Leaving(3) > Paused(2) > Left(4)
+/// Priority: Active(1) > Joining(0) > Leaving(3) > Paused(2) > Kicked(4)
 ///
 /// Returns the new prover status byte. If `allocation_statuses` is
-/// empty, returns `STATUS_KICKED` (4 = left, no allocations).
+/// empty, returns `STATUS_KICKED` (byte 4 — the rolled-up
+/// "all allocations terminal / no longer participating" value).
 pub fn compute_aggregate_prover_status(allocation_statuses: &[u8]) -> u8 {
     if allocation_statuses.is_empty() {
         return STATUS_KICKED; // 4 = left
@@ -176,7 +177,7 @@ pub fn update_prover_status_from_allocations(
 ///
 /// - **Confirm join** (status 0→1): set Status=Active,
 ///   JoinConfirmFrameNumber, LastActiveFrameNumber.
-/// - **Confirm leave** (status 3→4): set Status=Left,
+/// - **Confirm leave** (status 3→4): set Status=Kicked,
 ///   LeaveConfirmFrameNumber.
 ///
 /// Returns `Err` if the allocation is not in status 0 or 3.

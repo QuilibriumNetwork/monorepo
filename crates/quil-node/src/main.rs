@@ -2547,7 +2547,7 @@ async fn run_master_node(
                                 // Total = live allocations only:
                                 //   * Active / Paused — currently bound.
                                 //   * Joining (within 720-frame grace).
-                                //   * Left (= Go's "Leaving", within grace).
+                                //   * Leaving (within 720-frame grace).
                                 // Drops Rejected/Kicked terminal states
                                 // and any Joining/Leaving past the
                                 // grace window, since the TUI's

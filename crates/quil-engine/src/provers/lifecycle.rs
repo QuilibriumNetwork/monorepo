@@ -337,9 +337,12 @@ impl ProverLifecycle {
     }
 
     /// Pick auto-managed Active filters to leave when the prover holds
-    /// Returns lowest-scoring active filters when the auto-managed
-    /// active count exceeds non-manually-managed worker capacity.
-    /// Manually-managed pins are excluded entirely.
+    /// Returns lowest-scoring active filters when total active allocs
+    /// exceed total worker capacity. Manually-managed pins are
+    /// protected — they're never picked as leave candidates — but
+    /// they DO count toward capacity (an idle manual worker is still
+    /// a worker, capable of hosting whichever filter the operator
+    /// pins next).
     fn select_excess_active_filters(
         &self,
         active_filters: &[Vec<u8>],
@@ -354,17 +357,22 @@ impl ProverLifecycle {
             .map(|w| w.filter.clone())
             .collect();
 
-        let auto_capacity = workers.iter().filter(|w| !w.manually_managed).count();
+        // Total worker capacity, NOT auto-only. The previous
+        // `!w.manually_managed` filter caused phantom-surplus leaves
+        // during the TUI's manual-join window — when the operator
+        // flips workers to manual *before* the matching alloc lands,
+        // those workers are idle (`filter.is_empty()` so absent from
+        // `mm_filters`) and the surplus calc subtracted them from
+        // capacity while still counting all actives, falsely
+        // concluding "too many allocs, propose leave."
+        let total_capacity = workers.len();
 
-        let auto_active_count = active_filters
-            .iter()
-            .filter(|f| !mm_filters.contains(*f))
-            .count();
+        let total_active_count = active_filters.len();
 
-        if auto_active_count <= auto_capacity {
+        if total_active_count <= total_capacity {
             return Vec::new();
         }
-        let surplus = auto_active_count - auto_capacity;
+        let surplus = total_active_count - total_capacity;
 
         let ranked = proposer::rank_allocated_by_score_ascending(
             allocated_descriptors,
@@ -523,7 +531,7 @@ impl ProverLifecycle {
             None => Vec::new(),
         };
 
-        // Joining / Left allocations past the 720-frame grace are
+        // Joining / Leaving allocations past the 720-frame grace are
         // implicitly rejected on-chain. Skip them everywhere — including
         // `all_our_filters` — so the slot can be re-proposed.
         let mut joining_filters: Vec<(Vec<u8>, u64)> = Vec::new();
@@ -1651,6 +1659,65 @@ mod proposal_loop_tests {
         assert!(
             count_proposed_leaves(&actions) > 0,
             "expected surplus-active leaves to resume past cooldown"
+        );
+    }
+
+    /// Regression: TUI's manual-join window flips workers to
+    /// `manually_managed=true` *before* the matching alloc lands.
+    /// Those workers are idle (filter empty) so absent from
+    /// `mm_filters`. Old code subtracted them from `auto_capacity`
+    /// while still counting all actives, falsely concluding "more
+    /// allocs than auto workers can host" and proposing leaves on
+    /// allocations whose intended worker was the just-flagged
+    /// manual one.
+    #[test]
+    fn manual_idle_workers_do_not_trigger_phantom_surplus_leaves() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // 8 workers, 2 of which the operator just marked manual
+        // (still idle — no filter assigned yet because the join
+        // hasn't materialized).
+        for i in 1..=6u32 {
+            let f = filter_bytes(0xA0 + i as u8);
+            wm.add(allocated_worker(i, f));
+        }
+        for i in 7..=8u32 {
+            let mut w = idle_worker(i);
+            w.manually_managed = true;
+            wm.add(w);
+        }
+
+        // 6 existing Active allocations matching the auto workers.
+        let mut allocs = Vec::new();
+        let mut summaries = Vec::new();
+        for i in 1..=6u8 {
+            let f = filter_bytes(0xA0 + i);
+            allocs.push(alloc(f.clone(), ProverStatus::Active, 10));
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, 4);
+            summaries.push(ProverShardSummary {
+                filter: f,
+                status_counts: counts,
+                total_size: 1_000_000,
+            });
+        }
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            count_proposed_leaves(&actions),
+            0,
+            "marking idle workers manual must not trigger phantom-surplus leaves"
         );
     }
 
