@@ -777,7 +777,7 @@ dependencies = [
  "base64 0.22.1",
  "criterion 0.4.0",
  "ed448-goldilocks-plus 0.11.2",
- "ed448-rust 0.1.2",
+ "ed448-rust",
  "hex 0.4.3",
  "hkdf",
  "hmac",
@@ -798,7 +798,7 @@ dependencies = [
  "base64 0.22.1",
  "channel",
  "ed448-goldilocks-plus 0.11.2",
- "ed448-rust 0.1.2",
+ "ed448-rust",
  "getrandom 0.2.15",
  "hkdf",
  "rand 0.8.5",
@@ -1445,6 +1445,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2 0.10.8",
  "subtle",
@@ -1505,22 +1506,6 @@ dependencies = [
  "signature",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "ed448-rust"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5428b9b8138c483798ceb6a21004de0f24e3a2311195f13829ce1d059037d703"
-dependencies = [
- "lazy_static",
- "num-bigint 0.4.6",
- "num-integer",
- "num-traits",
- "opaque-debug 0.3.1",
- "rand_core 0.6.4",
- "sha3 0.9.1",
- "subtle",
 ]
 
 [[package]]
@@ -2781,7 +2766,7 @@ dependencies = [
  "bs58",
  "criterion 0.5.1",
  "ed25519-dalek",
- "ed448-rust 0.1.2",
+ "ed448-rust",
  "hex-literal",
  "hkdf",
  "k256",
@@ -3971,6 +3956,7 @@ name = "quil-consensus"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex 0.4.3",
  "quil-types",
  "thiserror 2.0.12",
  "tokio",
@@ -3984,10 +3970,12 @@ version = "0.1.0"
 dependencies = [
  "bls48581",
  "channel",
+ "ed25519-dalek",
  "ed448-bulletproofs",
- "ed448-rust 0.1.2",
+ "ed448-rust",
  "ff_ce",
  "hex 0.4.3",
+ "k256",
  "num-bigint 0.4.6",
  "poseidon-rs",
  "quil-types",
@@ -4003,8 +3991,9 @@ name = "quil-engine"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "bs58",
  "core_affinity",
- "ed448-rust 0.1.2",
+ "ed448-rust",
  "hex 0.4.3",
  "http 1.4.0",
  "libc",
@@ -4029,6 +4018,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.8",
+ "sha3 0.10.8",
  "thiserror 2.0.12",
  "tokio",
  "tokio-util",
@@ -4049,6 +4039,7 @@ dependencies = [
  "once_cell",
  "prost",
  "quil-config",
+ "quil-consensus",
  "quil-crypto",
  "quil-engine",
  "quil-hypergraph",
@@ -4056,17 +4047,21 @@ dependencies = [
  "quil-store",
  "quil-tries",
  "quil-types",
+ "serde",
+ "serde_json",
  "sha2 0.10.8",
  "tempfile",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
+ "verenc",
 ]
 
 [[package]]
 name = "quil-hypergraph"
 version = "0.1.0"
 dependencies = [
+ "hex 0.4.3",
  "num-bigint 0.4.6",
  "num-traits",
  "quil-tries",
@@ -4094,7 +4089,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "ed448-goldilocks-plus 0.16.0",
- "ed448-rust 0.1.2",
+ "ed448-rust",
  "hex 0.4.3",
  "quil-config",
  "quil-crypto",
@@ -4141,7 +4136,7 @@ dependencies = [
  "bs58",
  "chrono",
  "clap 4.5.4",
- "ed448-rust 0.1.2",
+ "ed448-rust",
  "file-rotate",
  "flate2",
  "hex 0.4.3",
@@ -4181,7 +4176,8 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
- "ed448-rust 0.1.2",
+ "bs58",
+ "ed448-rust",
  "futures",
  "hex 0.4.3",
  "libp2p",
@@ -4207,7 +4203,7 @@ dependencies = [
  "async-stream",
  "base64 0.22.1",
  "ed25519-dalek",
- "ed448-rust 0.1.1",
+ "ed448-rust",
  "hex 0.4.3",
  "http 1.4.0",
  "hyper 1.9.0",
@@ -4227,6 +4223,8 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "sha2 0.10.8",
  "tempfile",
  "thiserror 2.0.12",
@@ -4249,6 +4247,8 @@ dependencies = [
  "num-bigint 0.4.6",
  "prost",
  "quil-config",
+ "quil-crypto",
+ "quil-hypergraph",
  "quil-types",
  "rocksdb",
  "serde_json",
