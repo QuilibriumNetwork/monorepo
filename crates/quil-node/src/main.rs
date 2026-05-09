@@ -1003,6 +1003,12 @@ async fn run_master_node(
         } else {
             // LOCAL MODE: core-pinned threads
             let thread_mgr = Arc::new(quil_engine::thread_worker::ThreadWorkerManager::new());
+            // Persistent worker registry — survives restarts so the
+            // operator's `manually_managed` flag and the
+            // worker→filter binding don't reset every reboot.
+            let worker_store: Arc<dyn quil_types::store::WorkerStore> =
+                Arc::new(quil_store::RocksWorkerStore::new(db_arc.inner()));
+            thread_mgr.set_worker_store(worker_store);
             // Closure invoked by AppFollower from inside the consensus
             // event loop: wraps a finalized FrameHeader (canonical
             // bytes) in a `MessageBundle{Shard: header}` and publishes
@@ -1340,6 +1346,57 @@ async fn run_master_node(
                     }
                     info!("worker→master drain task stopped");
                 });
+            }
+            // Restore persisted worker state (manually_managed flag +
+            // assigned filter) before any pre-allocation runs. This
+            // makes the operator's intent stick across restarts —
+            // matches Go's `loadWorkersFromStore` flow.
+            let persisted = thread_mgr.load_all_persisted();
+            if !persisted.is_empty() {
+                info!(
+                    count = persisted.len(),
+                    "restoring persisted worker state from store"
+                );
+                for entry in persisted {
+                    // Resurrect the binding (filter pinned, no
+                    // consensus engine yet — `worker_allocator` will
+                    // re-attach the engine when the registry alloc
+                    // for this filter is observed Active).
+                    if !entry.filter.is_empty() {
+                        if let Err(e) = quil_engine::worker::WorkerManager::set_worker_filter(
+                            thread_mgr.as_ref(),
+                            entry.core_id,
+                            &entry.filter,
+                            false,
+                        ) {
+                            warn!(
+                                core_id = entry.core_id,
+                                error = %e,
+                                "failed to restore worker filter from store"
+                            );
+                        }
+                    }
+                    if entry.manually_managed {
+                        if let Err(e) = quil_engine::worker::WorkerManager::set_manually_managed(
+                            thread_mgr.as_ref(),
+                            entry.core_id,
+                            true,
+                        ) {
+                            warn!(
+                                core_id = entry.core_id,
+                                error = %e,
+                                "failed to restore manually_managed flag"
+                            );
+                        }
+                    }
+                    if entry.pending_filter_frame > 0 {
+                        let _ = quil_engine::worker::WorkerManager::set_pending_filter_frame(
+                            thread_mgr.as_ref(),
+                            entry.core_id,
+                            entry.pending_filter_frame,
+                        );
+                    }
+                }
             }
             thread_mgr as Arc<dyn quil_engine::worker::WorkerManager>
         };

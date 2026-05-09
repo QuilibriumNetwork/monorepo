@@ -392,6 +392,30 @@ pub trait KeyStore: Send + Sync {
     ) -> Result<proto::keys::KeyRegistry>;
 }
 
+/// Persisted per-worker state. Mirrors Go's `store.WorkerInfo` —
+/// kept on disk so that `manually_managed` and the assigned
+/// `filter` survive node restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedWorkerInfo {
+    pub core_id: u32,
+    pub filter: Vec<u8>,
+    pub manually_managed: bool,
+    pub allocated: bool,
+    pub pending_filter_frame: u64,
+}
+
+/// Worker registry storage. Persists `(core_id, filter,
+/// manually_managed, allocated, pending_filter_frame)` so the
+/// operator's intent (manual mode + which shard the worker is
+/// pinned to) carries across restarts. Mirrors Go's
+/// `store.WorkerStore`.
+pub trait WorkerStore: Send + Sync {
+    fn get_worker(&self, core_id: u32) -> Result<Option<PersistedWorkerInfo>>;
+    fn put_worker(&self, worker: &PersistedWorkerInfo) -> Result<()>;
+    fn delete_worker(&self, core_id: u32) -> Result<()>;
+    fn range_workers(&self) -> Result<Vec<PersistedWorkerInfo>>;
+}
+
 /// Application shard metadata storage.
 pub trait ShardsStore: Send + Sync {
     fn range_app_shards(&self) -> Result<Vec<ShardInfo>>;

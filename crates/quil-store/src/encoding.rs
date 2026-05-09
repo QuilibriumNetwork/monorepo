@@ -23,6 +23,11 @@ pub const CONSENSUS: u8 = 0x0C;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
+// Worker store sub-prefixes (second byte) — Go parity with
+// `node/store/constants.go:172-173`.
+pub const WORKER_BY_CORE: u8 = 0x00;
+pub const WORKER_BY_FILTER: u8 = 0x01;
+
 // -----------------------------------------------------------------------
 // Clock store indexes (second byte) — from Go's constants.go:23-76
 // -----------------------------------------------------------------------

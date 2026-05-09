@@ -185,6 +185,11 @@ pub struct ThreadWorkerManager {
     num_cores: u32,
     /// Shared consensus dependencies — set after construction.
     consensus_deps: Mutex<Option<Arc<WorkerConsensusDeps>>>,
+    /// Optional persistent registry — when wired, every state
+    /// change (filter assigned, manually_managed flipped) is
+    /// flushed so it survives restarts. Mirrors Go's
+    /// `engine.workerStore` plumbing.
+    worker_store: Mutex<Option<Arc<dyn quil_types::store::WorkerStore>>>,
 }
 
 impl ThreadWorkerManager {
@@ -210,6 +215,7 @@ impl ThreadWorkerManager {
             master_tx,
             num_cores,
             consensus_deps: Mutex::new(None),
+            worker_store: Mutex::new(None),
         }
     }
 
@@ -217,6 +223,58 @@ impl ThreadWorkerManager {
     /// the prover registry and frame prover are initialized.
     pub fn set_consensus_deps(&self, deps: WorkerConsensusDeps) {
         *self.consensus_deps.lock().unwrap() = Some(Arc::new(deps));
+    }
+
+    /// Wire a persistent worker registry. Once set, every
+    /// `set_worker_filter` / `set_manually_managed` /
+    /// `deallocate_worker` call also writes through to the store, so
+    /// the operator's intent (manual mode + filter pin) carries
+    /// across restarts.
+    pub fn set_worker_store(&self, store: Arc<dyn quil_types::store::WorkerStore>) {
+        *self.worker_store.lock().unwrap() = Some(store);
+    }
+
+    /// Returns persisted worker state for the given core, when a
+    /// store is wired and an entry exists.
+    pub fn load_persisted(
+        &self,
+        core_id: u32,
+    ) -> Option<quil_types::store::PersistedWorkerInfo> {
+        self.worker_store
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.get_worker(core_id).ok().flatten())
+    }
+
+    /// All persisted entries (sorted by core_id). Empty when no
+    /// store is wired.
+    pub fn load_all_persisted(&self) -> Vec<quil_types::store::PersistedWorkerInfo> {
+        self.worker_store
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.range_workers().ok())
+            .unwrap_or_default()
+    }
+
+    fn persist_worker(&self, w: &WorkerState) {
+        if let Some(store) = self.worker_store.lock().unwrap().as_ref() {
+            let info = quil_types::store::PersistedWorkerInfo {
+                core_id: w.core_id,
+                filter: w.filter.clone(),
+                manually_managed: w.manually_managed,
+                allocated: w.allocated,
+                pending_filter_frame: w.pending_filter_frame,
+            };
+            if let Err(e) = store.put_worker(&info) {
+                tracing::warn!(
+                    core_id = w.core_id,
+                    error = %e,
+                    "worker_store put failed"
+                );
+            }
+        }
     }
 
     /// Take the master-side receiver. Call once during startup to get
@@ -591,23 +649,29 @@ impl WorkerManager for ThreadWorkerManager {
         filter: &[u8],
         start_consensus: bool,
     ) -> Result<()> {
-        let mut workers = self.workers.lock().unwrap();
+        let snapshot = {
+            let mut workers = self.workers.lock().unwrap();
 
-        // Spawn if not already running
-        if !workers.contains_key(&core_id) {
-            let state = self.spawn_worker(core_id)?;
-            workers.insert(core_id, state);
+            // Spawn if not already running
+            if !workers.contains_key(&core_id) {
+                let state = self.spawn_worker(core_id)?;
+                workers.insert(core_id, state);
+            }
+
+            if let Some(w) = workers.get_mut(&core_id) {
+                w.filter = filter.to_vec();
+                let _ = w.tx.try_send(MasterToWorker::Respawn {
+                    filter: filter.to_vec(),
+                    start_consensus,
+                });
+                Some(snapshot_state(w))
+            } else {
+                None
+            }
+        };
+        if let Some(snap) = snapshot {
+            self.persist_worker(&snap);
         }
-
-        // Send respawn command with the filter (non-blocking)
-        if let Some(w) = workers.get_mut(&core_id) {
-            w.filter = filter.to_vec();
-            let _ = w.tx.try_send(MasterToWorker::Respawn {
-                filter: filter.to_vec(),
-                start_consensus,
-            });
-        }
-
         Ok(())
     }
 
@@ -618,17 +682,25 @@ impl WorkerManager for ThreadWorkerManager {
         // every expired-Joining / Rejected / Kicked allocation
         // disappeared from `GetWorkerInfo` permanently and the TUI
         // top-pane lost rows it should have kept as "Idle".
-        let mut workers = self.workers.lock().unwrap();
-        if let Some(w) = workers.get_mut(&core_id) {
-            w.filter.clear();
-            w.allocated = false;
-            w.pending_filter_frame = 0;
-            // Send empty-filter Respawn so the worker tears down its
-            // engine and goes idle without exiting the loop.
-            let _ = w.tx.try_send(MasterToWorker::Respawn {
-                filter: Vec::new(),
-                start_consensus: true,
-            });
+        let snapshot = {
+            let mut workers = self.workers.lock().unwrap();
+            if let Some(w) = workers.get_mut(&core_id) {
+                w.filter.clear();
+                w.allocated = false;
+                w.pending_filter_frame = 0;
+                // Send empty-filter Respawn so the worker tears down
+                // its engine and goes idle without exiting the loop.
+                let _ = w.tx.try_send(MasterToWorker::Respawn {
+                    filter: Vec::new(),
+                    start_consensus: true,
+                });
+                Some(snapshot_state(w))
+            } else {
+                None
+            }
+        };
+        if let Some(snap) = snapshot {
+            self.persist_worker(&snap);
         }
         Ok(())
     }
@@ -659,27 +731,75 @@ impl WorkerManager for ThreadWorkerManager {
     }
 
     fn set_pending_filter_frame(&self, core_id: u32, frame: u64) -> Result<()> {
-        let mut workers = self.workers.lock().unwrap();
-        if let Some(w) = workers.get_mut(&core_id) {
-            w.pending_filter_frame = frame;
+        let snapshot = {
+            let mut workers = self.workers.lock().unwrap();
+            workers.get_mut(&core_id).map(|w| {
+                w.pending_filter_frame = frame;
+                snapshot_state(w)
+            })
+        };
+        if let Some(snap) = snapshot {
+            self.persist_worker(&snap);
         }
         Ok(())
     }
 
     fn set_manually_managed(&self, core_id: u32, manually_managed: bool) -> Result<()> {
-        let mut workers = self.workers.lock().unwrap();
-        if let Some(w) = workers.get_mut(&core_id) {
-            w.manually_managed = manually_managed;
+        let mut changed = false;
+        let snapshot = {
+            let mut workers = self.workers.lock().unwrap();
+            workers.get_mut(&core_id).map(|w| {
+                changed = w.manually_managed != manually_managed;
+                w.manually_managed = manually_managed;
+                snapshot_state(w)
+            })
+        };
+        if changed {
+            // Mode flips are operator-driven and rare — log at info
+            // so the toggle is visible in operator diagnostics.
+            info!(
+                core_id,
+                mode = if manually_managed { "manual" } else { "auto" },
+                "worker management mode changed"
+            );
+        }
+        if let Some(snap) = snapshot {
+            self.persist_worker(&snap);
         }
         Ok(())
     }
 
     fn set_allocated(&self, core_id: u32, allocated: bool) -> Result<()> {
-        let mut workers = self.workers.lock().unwrap();
-        if let Some(w) = workers.get_mut(&core_id) {
-            w.allocated = allocated;
+        let snapshot = {
+            let mut workers = self.workers.lock().unwrap();
+            workers.get_mut(&core_id).map(|w| {
+                w.allocated = allocated;
+                snapshot_state(w)
+            })
+        };
+        if let Some(snap) = snapshot {
+            self.persist_worker(&snap);
         }
         Ok(())
+    }
+}
+
+/// Capture the persistable subset of a `WorkerState` while we hold
+/// the lock. The struct returned is `Send` and can outlive the
+/// mutex guard, letting `persist_worker` write through without
+/// re-acquiring the lock.
+fn snapshot_state(w: &WorkerState) -> WorkerState {
+    WorkerState {
+        core_id: w.core_id,
+        filter: w.filter.clone(),
+        pending_filter_frame: w.pending_filter_frame,
+        manually_managed: w.manually_managed,
+        allocated: w.allocated,
+        cancel: w.cancel.clone(),
+        tx: w.tx.clone(),
+        // Don't move/clone the join handle — it's tied to the live
+        // worker thread and the snapshot is a read-only view.
+        handle: None,
     }
 }
 
