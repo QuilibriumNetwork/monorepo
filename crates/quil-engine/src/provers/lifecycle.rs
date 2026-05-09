@@ -706,9 +706,20 @@ impl ProverLifecycle {
                 if filters.len() > MAX_PROPOSALS_PER_CYCLE {
                     filters.truncate(MAX_PROPOSALS_PER_CYCLE);
                 }
+                let reject_summary: Vec<String> = filters
+                    .iter()
+                    .map(|f| hex::encode(&f[..f.len().min(8)]))
+                    .collect();
+                let allowed = workers.len().saturating_sub(active_filters.len());
                 info!(
                     frame = frame_number,
+                    active_count = active_filters.len(),
+                    pending_count = joining_filters.len(),
+                    worker_capacity = workers.len(),
+                    allowed_pending = allowed,
                     rejections = filters.len(),
+                    ?reject_summary,
+                    reason = "pending join count exceeds remaining worker capacity",
                     "forced rejection of excess pending joins"
                 );
                 self.allocator.set_last_reject_attempt(frame_number);
@@ -741,10 +752,23 @@ impl ProverLifecycle {
                             >= crate::worker_allocator::JOIN_COOLDOWN_FRAMES);
                 if cooldown_ok {
                     self.allocator.set_last_join_attempt(frame_number);
+                    let mm_count = workers
+                        .iter()
+                        .filter(|w| w.manually_managed && !w.filter.is_empty())
+                        .count();
+                    let leave_summary: Vec<String> = surplus
+                        .iter()
+                        .map(|f| hex::encode(&f[..f.len().min(8)]))
+                        .collect();
                     info!(
                         frame = frame_number,
-                        leaves = surplus.len(),
-                        "proposing leaves for surplus actives (worker count reduced)"
+                        active_count = active_filters.len(),
+                        worker_capacity = workers.len(),
+                        manually_managed_pinned = mm_count,
+                        surplus = surplus.len(),
+                        ?leave_summary,
+                        reason = "capacity reduction (active count exceeds worker count)",
+                        "proposing leaves for surplus actives"
                     );
                     actions.push(LifecycleAction::ProposeLeave {
                         filters: surplus,
@@ -768,6 +792,50 @@ impl ProverLifecycle {
         //    Go has no halt-risk override; coverage halts are handled
         //    upstream by the coverage monitor's halt-grace logic.
         if !proposal_descriptors.is_empty() && allow_proposals {
+            // Operator-visibility pass: the proposer only sees what
+            // ends up in `proposal_descriptors`. Halt-risk shards we
+            // are already on (skipped in `build_proposal_descriptors`
+            // because `our_filters` matches) or shards with no size
+            // data both look identical to "not picked" downstream.
+            // This log makes the candidate-side picture explicit so a
+            // missing prioritization can be traced to the right
+            // cause: candidate filtering vs. picker output.
+            let proposal_halt_risk = proposal_descriptors
+                .iter()
+                .filter(|d| d.size > 0
+                    && d.total_active_joining <= proposer::HALT_RISK_PROVER_COUNT)
+                .count();
+            let our_halt_risk = summaries
+                .iter()
+                .filter(|s| {
+                    if !all_our_filters.contains(&s.filter) { return false; }
+                    let raw_size = shard_sizes_snapshot.get(&s.filter).copied().unwrap_or(0);
+                    if raw_size == 0 { return false; }
+                    let active = s.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0);
+                    let joining = s.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0);
+                    (active + joining) as u64 <= proposer::HALT_RISK_PROVER_COUNT
+                })
+                .count();
+            let no_size_count = summaries
+                .iter()
+                .filter(|s| !s.filter.is_empty()
+                    && !all_our_filters.contains(&s.filter)
+                    && shard_sizes_snapshot.get(&s.filter).copied().unwrap_or(0) == 0)
+                .count();
+            info!(
+                frame = frame_number,
+                free_workers = free_worker_ids.len(),
+                total_workers = workers.len(),
+                candidates = proposal_descriptors.len(),
+                halt_risk_among_candidates = proposal_halt_risk,
+                halt_risk_among_our_shards = our_halt_risk,
+                summaries_skipped_no_size = no_size_count,
+                can_propose,
+                skip_reason,
+                strategy = ?self.strategy,
+                "auto-allocation candidate snapshot"
+            );
+
             if can_propose {
                 let proposals = proposer::plan_and_allocate(
                     &proposal_descriptors,
@@ -886,9 +954,17 @@ impl ProverLifecycle {
 
             if !leave_candidates.is_empty() {
                 self.allocator.set_last_join_attempt(frame_number);
+                let leave_summary: Vec<String> = leave_candidates
+                    .iter()
+                    .map(|f| hex::encode(&f[..f.len().min(8)]))
+                    .collect();
                 info!(
-                    leave_proposals = leave_candidates.len(),
                     frame = frame_number,
+                    allocated = allocated_descriptors.len(),
+                    unallocated_candidates = proposal_descriptors.len(),
+                    leave_proposals = leave_candidates.len(),
+                    ?leave_summary,
+                    reason = "score-driven (allocated below 67% of best unallocated)",
                     "proposing leaves for overcrowded shards"
                 );
                 actions.push(LifecycleAction::ProposeLeave {

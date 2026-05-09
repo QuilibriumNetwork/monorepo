@@ -405,6 +405,16 @@ impl NodeService for NodeRpcServer {
         let Some(bundle) = req.request else {
             return Err(Status::invalid_argument("request required"));
         };
+        // Summarise what's in the bundle so the operator can see
+        // which TUI action drove the call (Join / Leave / Confirm /
+        // etc.) rather than just an opaque "send".
+        let action_summary = describe_message_bundle(&bundle);
+        tracing::info!(
+            domain_len = req.domain.len(),
+            requests = bundle.requests.len(),
+            actions = %action_summary,
+            "Send RPC received"
+        );
         // The signing payload is canonical-bytes, not prost-encoded.
         let payload = quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(
             &bundle,
@@ -729,6 +739,13 @@ impl NodeService for NodeRpcServer {
         if req.filters.is_empty() {
             return Err(Status::invalid_argument("filters must be non-empty"));
         }
+        let filter_hexes: Vec<String> = req.filters.iter().map(hex::encode).collect();
+        tracing::info!(
+            filter_count = req.filters.len(),
+            filters = ?filter_hexes,
+            delegate_len = req.delegate.len(),
+            "RequestJoin RPC received"
+        );
         ctl.request_join(req.filters, req.delegate)
             .await
             .map_err(|e| Status::internal(format!("request_join: {e}")))?;
@@ -743,6 +760,11 @@ impl NodeService for NodeRpcServer {
             Status::unavailable("worker control not wired")
         })?;
         let req = request.into_inner();
+        tracing::info!(
+            core_id = req.core_id,
+            mode = if req.manually_managed { "manual" } else { "auto" },
+            "SetManuallyManaged RPC received"
+        );
         ctl.set_manually_managed(req.core_id, req.manually_managed)
             .map_err(|e| Status::internal(format!("set_manually_managed: {e}")))?;
         Ok(Response::new(node::SetManuallyManagedResponse {}))
@@ -784,8 +806,52 @@ impl NodeService for NodeRpcServer {
         if req.data.is_empty() {
             return Err(Status::invalid_argument("empty message"));
         }
+        tracing::info!(byte_len = req.data.len(), "SubmitMessage RPC received");
         handler(req.data)
             .map_err(|e| Status::invalid_argument(format!("submit rejected: {e}")))?;
         Ok(Response::new(node::SubmitMessageResponse {}))
     }
+}
+
+/// Render a brief, comma-separated tag list of the request kinds in
+/// a `MessageBundle` so `Send` RPC log lines tell the operator what
+/// action fired (e.g. "Join,Confirm").
+fn describe_message_bundle(bundle: &global::MessageBundle) -> String {
+    use global::message_request::Request as R;
+    let mut tags: Vec<&'static str> = Vec::with_capacity(bundle.requests.len());
+    for r in &bundle.requests {
+        tags.push(match &r.request {
+            None => "None",
+            Some(R::Join(_)) => "Join",
+            Some(R::Leave(_)) => "Leave",
+            Some(R::Pause(_)) => "Pause",
+            Some(R::Resume(_)) => "Resume",
+            Some(R::Confirm(_)) => "Confirm",
+            Some(R::Reject(_)) => "Reject",
+            Some(R::Kick(_)) => "Kick",
+            Some(R::Update(_)) => "Update",
+            Some(R::TokenDeploy(_)) => "TokenDeploy",
+            Some(R::TokenUpdate(_)) => "TokenUpdate",
+            Some(R::Transaction(_)) => "Transaction",
+            Some(R::PendingTransaction(_)) => "PendingTransaction",
+            Some(R::MintTransaction(_)) => "MintTransaction",
+            Some(R::HypergraphDeploy(_)) => "HypergraphDeploy",
+            Some(R::HypergraphUpdate(_)) => "HypergraphUpdate",
+            Some(R::VertexAdd(_)) => "VertexAdd",
+            Some(R::VertexRemove(_)) => "VertexRemove",
+            Some(R::HyperedgeAdd(_)) => "HyperedgeAdd",
+            Some(R::HyperedgeRemove(_)) => "HyperedgeRemove",
+            Some(R::ComputeDeploy(_)) => "ComputeDeploy",
+            Some(R::ComputeUpdate(_)) => "ComputeUpdate",
+            Some(R::CodeDeploy(_)) => "CodeDeploy",
+            Some(R::CodeExecute(_)) => "CodeExecute",
+            Some(R::CodeFinalize(_)) => "CodeFinalize",
+            Some(R::Shard(_)) => "Shard",
+            Some(R::AltShardUpdate(_)) => "AltShardUpdate",
+            Some(R::SeniorityMerge(_)) => "SeniorityMerge",
+            Some(R::ShardSplit(_)) => "ShardSplit",
+            Some(R::ShardMerge(_)) => "ShardMerge",
+        });
+    }
+    tags.join(",")
 }

@@ -335,6 +335,21 @@ pub fn plan_and_allocate(
             other.push(s);
         }
     }
+    let halt_risk_total = halt_risk.len();
+    let other_total = other.len();
+    let halt_risk_top: Vec<String> = halt_risk
+        .iter()
+        .take(8)
+        .map(|s| {
+            let d = &shards[s.idx];
+            format!(
+                "{}:provers={},size={}",
+                hex::encode(&d.filter[..d.filter.len().min(8)]),
+                d.total_active_joining,
+                d.size,
+            )
+        })
+        .collect();
     let mut scores = halt_risk;
     scores.extend(other);
 
@@ -347,7 +362,7 @@ pub fn plan_and_allocate(
     sorted_workers.sort();
 
     let wb = world_bytes.try_into().unwrap_or(0u64);
-    (0..limit)
+    let proposals: Vec<Proposal> = (0..limit)
         .map(|k| {
             let sel = &shards[scores[k].idx];
             Proposal {
@@ -360,7 +375,53 @@ pub fn plan_and_allocate(
                 shards_denominator: sel.shards,
             }
         })
-        .collect()
+        .collect();
+
+    // Surface the halt-risk partition outcome so operators can
+    // confirm prioritization is working when halt-risk shards exist
+    // among the candidates. Picked entries are listed with their
+    // halt-risk classification so deviations from "halt-risk first"
+    // are visible in the log without needing per-shard debug.
+    let halt_risk_picked = proposals
+        .iter()
+        .filter(|p| {
+            let d = shards
+                .iter()
+                .find(|s| s.filter == p.filter);
+            matches!(d, Some(d) if d.size > 0 && d.total_active_joining <= HALT_RISK_PROVER_COUNT)
+        })
+        .count();
+    let picks_summary: Vec<String> = proposals
+        .iter()
+        .map(|p| {
+            let halt = shards
+                .iter()
+                .any(|s| s.filter == p.filter
+                    && s.size > 0
+                    && s.total_active_joining <= HALT_RISK_PROVER_COUNT);
+            format!(
+                "core={}:filter={}{}",
+                p.worker_id,
+                hex::encode(&p.filter[..p.filter.len().min(8)]),
+                if halt { ":halt-risk" } else { "" },
+            )
+        })
+        .collect();
+    if halt_risk_total > 0 || !proposals.is_empty() {
+        tracing::info!(
+            free_workers = free_worker_ids.len(),
+            candidates = shards.len(),
+            halt_risk_total,
+            halt_risk_picked,
+            other_total,
+            picked = proposals.len(),
+            ?halt_risk_top,
+            ?picks_summary,
+            strategy = ?strategy,
+            "plan_and_allocate decision"
+        );
+    }
+    proposals
 }
 
 /// Decide whether to confirm or reject pending joins.
@@ -495,7 +556,34 @@ pub fn plan_leaves(
     candidates.sort_by(|a, b| a.1.cmp(&b.1));
 
     // Cap at 3 (matches Go's `limit := 3`)
-    candidates.into_iter().take(3).map(|(f, _)| f).collect()
+    let picks: Vec<Vec<u8>> = candidates.iter().take(3).map(|(f, _)| f.clone()).collect();
+
+    if !picks.is_empty() {
+        let picks_summary: Vec<String> = candidates
+            .iter()
+            .take(3)
+            .map(|(f, score)| {
+                format!(
+                    "{}:score={}",
+                    hex::encode(&f[..f.len().min(8)]),
+                    score.to_str_radix(10),
+                )
+            })
+            .collect();
+        tracing::info!(
+            allocated = allocated_shards.len(),
+            unallocated = unallocated_shards.len(),
+            best_unalloc_score = %best_unalloc.to_str_radix(10),
+            threshold = %threshold.to_str_radix(10),
+            below_threshold = candidates.len(),
+            picked = picks.len(),
+            ?picks_summary,
+            strategy = ?strategy,
+            "plan_leaves: proposing score-driven leaves (allocated shards below 67% of best unallocated)"
+        );
+    }
+
+    picks
 }
 
 /// Decide whether to confirm or reject pending leaves.
