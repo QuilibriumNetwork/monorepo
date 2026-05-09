@@ -1851,6 +1851,9 @@ async fn run_master_node(
         let lhf_for_poller = last_global_head_frame.clone();
         let pp_for_poller = prover_pipeline.clone();
         let hg_for_poller = hg_store.clone();
+        let crdt_for_poller = crdt.clone();
+        let shards_store_for_poller: Arc<dyn quil_types::store::ShardsStore> =
+            _shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
         let poller_config = quil_rpc::ArchivePollerConfig {
             on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
                 let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
@@ -1916,6 +1919,71 @@ async fn run_master_node(
                 // prover messages — leaving the lifecycle gate held
                 // perpetually for non-archive nodes.
                 pl_for_poller.set_prover_root_verified_frame(frame_num);
+
+                // Refresh the lifecycle's per-filter byte-size map
+                // before evaluating. Without this the proposer falls
+                // back to `summary.total_size` which is a prover-
+                // count proxy (sum of status_counts), not bytes —
+                // joins fire on shards with no actual data, and
+                // halt-risk priority can't tell apart "0 bytes
+                // because empty" from "real bytes." We walk the
+                // local hypergraph the same way the
+                // GetShardInfo RPC does (`local_app_shard_get_sizes`).
+                {
+                    use std::collections::HashMap;
+                    let get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
+                        crdt_for_poller.clone(),
+                        shards_store_for_poller.clone(),
+                    );
+                    let mut sizes_by_filter: HashMap<Vec<u8>, u64> = HashMap::new();
+                    if let Ok(shards) = shards_store_for_poller.range_app_shards() {
+                        // Dedupe to one entry per parent shard_key
+                        // (range_app_shards returns one row per
+                        // sub-shard).
+                        let mut seen: std::collections::HashSet<Vec<u8>> =
+                            std::collections::HashSet::new();
+                        for s in shards {
+                            if !seen.insert(s.shard_key.clone()) {
+                                continue;
+                            }
+                            if let Ok(sub_sizes) = get_sizes(&s.shard_key, &s) {
+                                for entry in sub_sizes {
+                                    // `entry.size` is a big-endian
+                                    // byte representation of the
+                                    // shard's byte count. Saturate
+                                    // at u64::MAX for absurdly large
+                                    // shards rather than wrap.
+                                    let mut bytes: u64 = 0;
+                                    for &b in entry.size.iter() {
+                                        bytes = bytes
+                                            .saturating_mul(256)
+                                            .saturating_add(b as u64);
+                                    }
+                                    if bytes == 0 {
+                                        continue;
+                                    }
+                                    // Reconstruct the `bp` filter the
+                                    // proposer keys on: L2[32] +
+                                    // prefix bytes.
+                                    let l2 = if s.shard_key.len() >= 35 {
+                                        &s.shard_key[3..35]
+                                    } else if s.shard_key.len() > 3 {
+                                        &s.shard_key[3..]
+                                    } else {
+                                        &s.shard_key[..]
+                                    };
+                                    let mut bp = l2.to_vec();
+                                    for &p in &entry.prefix {
+                                        bp.push(p as u8);
+                                    }
+                                    sizes_by_filter.insert(bp, bytes);
+                                }
+                            }
+                        }
+                    }
+                    pl_for_poller.set_shard_sizes(sizes_by_filter);
+                }
+
                 match pl_for_poller.evaluate(
                     frame_num,
                     frame_difficulty as u64,

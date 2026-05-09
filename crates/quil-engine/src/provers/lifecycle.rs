@@ -568,9 +568,28 @@ impl ProverLifecycle {
                         leaving_filters
                             .push((alloc.confirmation_filter.clone(), alloc.leave_frame_number));
                     }
-                    _ => {
+                    ProverStatus::Paused => {
+                        // We still own the alloc; the worker is just
+                        // paused. Keep it in `all_our_filters` so we
+                        // don't propose joining the same shard, but
+                        // don't add to active_filters (no auto-leave
+                        // / surplus pressure) or joining/leaving
+                        // (no decide-pending action).
                         all_our_filters.push(alloc.confirmation_filter.clone());
                     }
+                    // Rejected / Kicked / Unknown / past-grace
+                    // Joining/Leaving — terminal or invalid. Treat
+                    // as "doesn't exist": don't push to
+                    // `all_our_filters`, otherwise they leak into
+                    // `allocated_descriptors` (via the
+                    // `all_our_filters.contains(&d.filter)` filter)
+                    // and `plan_leaves` may emit a ProverLeave for
+                    // an allocation that's already terminal — which
+                    // the network rejects but the user sees as a
+                    // leave for "a non-applicable shard."
+                    ProverStatus::Rejected
+                    | ProverStatus::Kicked
+                    | ProverStatus::Unknown => {}
                 }
             }
         }
@@ -937,19 +956,20 @@ fn build_proposal_descriptors(
         if our_filters.contains(&s.filter) {
             continue;
         }
-        // Skip empty shards (size == 0). Mirrors Go's
-        // `worker_allocator.go` which `continue`s when
-        // `new(big.Int).SetBytes(shard.Size) == 0`. Without this,
-        // freshly-genesis'd shards default to size=1 and look join-
-        // worthy, causing the lifecycle to propose joins on shards
-        // with no actual data.
-        let raw_size = shard_sizes
-            .get(&s.filter)
-            .copied()
-            .unwrap_or(s.total_size);
-        if raw_size == 0 {
-            continue;
-        }
+        // Skip shards we don't have real byte-size data for. The
+        // registry's `total_size` is a prover-count proxy (sum of
+        // status_counts; see `prover_registry.rs:450`), NOT bytes —
+        // falling back to it lets joins fire on shards that have
+        // provers but zero actual data, exactly the symptom users
+        // report. Only consider a shard a join candidate when
+        // `shard_sizes` has a real entry > 0. Mirrors Go's
+        // `worker_allocator.go` which uses
+        // `new(big.Int).SetBytes(shard.Size)` from the shards-store
+        // and `continue`s on zero.
+        let raw_size = match shard_sizes.get(&s.filter).copied() {
+            Some(n) if n > 0 => n,
+            _ => continue,
+        };
         let active = s.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0);
         let joining = s.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0);
         let total = (active + joining) as usize;
@@ -1014,17 +1034,15 @@ fn build_decide_descriptors(
         if s.filter.is_empty() {
             return None;
         }
-        // Skip empty shards. Same reasoning as build_proposal_descriptors:
-        // Go's worker_allocator skips when `size == 0`, and decide
-        // scoring on a phantom-sized shard would otherwise produce
-        // garbage rejection / leave decisions.
-        let raw_size = shard_sizes
-            .get(&s.filter)
-            .copied()
-            .unwrap_or(s.total_size);
-        if raw_size == 0 {
-            return None;
-        }
+        // Same byte-size requirement as `build_proposal_descriptors`.
+        // `s.total_size` is a prover-count proxy, not bytes — using
+        // it as a fallback would let `plan_leaves` and `decide_joins`
+        // score shards on phantom data and emit incorrect
+        // leave/reject decisions.
+        let raw_size = match shard_sizes.get(&s.filter).copied() {
+            Some(n) if n > 0 => n,
+            _ => return None,
+        };
         let active = s.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0);
         let joining = s.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0);
         let total = (active + joining) as usize;
@@ -1173,12 +1191,37 @@ mod proposal_loop_tests {
         wm: Arc<dyn WorkerManager>,
         reg: Arc<dyn ProverRegistry>,
     ) -> Arc<ProverLifecycle> {
-        let allocator = Arc::new(WorkerAllocator::new(wm, reg, prover_address.clone()));
+        let allocator =
+            Arc::new(WorkerAllocator::new(wm, reg.clone(), prover_address.clone()));
         let halt = Arc::new(HaltState::new());
         let lifecycle = Arc::new(ProverLifecycle::new(prover_address, allocator, halt));
         lifecycle.set_confirm_window_frames(2);
         lifecycle.set_sync_complete();
+        // Seed byte-sizes from the registry's summaries. Tests
+        // typically `set_summaries` before constructing the
+        // lifecycle, so this captures their intent.
+        seed_sizes_from_registry(&lifecycle, reg.as_ref());
         lifecycle
+    }
+
+    /// Seed the lifecycle's per-filter byte-size map from the
+    /// registry's summaries. Production wires this from the local
+    /// hypergraph each frame; tests call it after `set_summaries`
+    /// so the proposer's size-zero skip doesn't drop every shard.
+    /// Each summary's `total_size` is reused as the byte-size hint
+    /// (in tests it's just whatever the test wrote — fine).
+    fn seed_sizes_from_registry(
+        lc: &ProverLifecycle,
+        reg: &dyn ProverRegistry,
+    ) {
+        use std::collections::HashMap;
+        let summaries = reg.get_prover_shard_summaries().unwrap_or_default();
+        let sizes: HashMap<Vec<u8>, u64> = summaries
+            .iter()
+            .filter(|s| !s.filter.is_empty() && s.total_size > 0)
+            .map(|s| (s.filter.clone(), s.total_size))
+            .collect();
+        lc.set_shard_sizes(sizes);
     }
 
     fn idle_worker(core_id: u32) -> WorkerInfo {
