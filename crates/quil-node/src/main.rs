@@ -3879,9 +3879,24 @@ async fn run_master_node(
                 };
 
                 // Skip allocations past the 720-frame grace window.
+                //
+                // Uses `frame_number` (already resolved above to the
+                // latest stored or last-received frame), NOT
+                // `registry.current_frame()`. The registry's internal
+                // counter only advances when the materializer calls
+                // `process_state_transition`; a node that's
+                // observing frames without materializing them keeps
+                // that counter stale at 0 (or whatever was last
+                // materialized), which makes
+                // `current_frame > join_frame + 720` false for
+                // already-expired allocs. Result: `IsAllocated`
+                // leaks as true for shards the user once attempted
+                // but where the join has long since expired, and
+                // the TUI excludes those shards from its Available
+                // panel. Using the actual current frame fixes the
+                // expiry check for every observer mode.
                 let mut allocated_filters: std::collections::HashSet<Vec<u8>> =
                     std::collections::HashSet::new();
-                let current_frame = self.registry.current_frame();
                 let provers = self
                     .registry
                     .get_provers(&self.self_address)
@@ -3893,12 +3908,12 @@ async fn run_master_node(
                     for alloc in &pr.allocations {
                         use quil_types::consensus::ProverStatus;
                         if alloc.status == ProverStatus::Joining
-                            && current_frame > alloc.join_frame_number + 720
+                            && frame_number > alloc.join_frame_number + 720
                         {
                             continue;
                         }
                         if alloc.status == ProverStatus::Leaving
-                            && current_frame > alloc.leave_frame_number + 720
+                            && frame_number > alloc.leave_frame_number + 720
                         {
                             continue;
                         }

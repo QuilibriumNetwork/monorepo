@@ -310,7 +310,32 @@ impl NodeService for NodeRpcServer {
                 let s = info.seniority;
                 seniority_bytes = s.to_be_bytes().to_vec();
 
-                let current_frame = registry.current_frame();
+                // Use the latest observed frame for the 720-frame
+                // grace check, NOT `registry.current_frame()` — the
+                // registry's internal counter only advances when the
+                // materializer calls `process_state_transition`. On
+                // a node that observes frames without materializing
+                // them (or before the first materialize cycle), the
+                // counter stays at 0, the expiry check
+                // `current_frame > join_frame + 720` is always
+                // false, and `GetNodeInfo` returns historical
+                // Joining/Leaving allocs that should have been
+                // pruned. The TUI applies its own filter on top so
+                // the Available panel is correct, but other
+                // consumers and the prover-status command get
+                // misleading data. Prefer the local store's latest
+                // global frame; fall back to `last_received_frame`
+                // (updated by both the BlossomSub recv loop and the
+                // archive poller) if no clock-store snapshot is
+                // available.
+                let current_frame = self
+                    .clock_store
+                    .as_ref()
+                    .and_then(|cs| cs.get_latest_global_clock_frame().ok())
+                    .and_then(|f| f.header.map(|h| h.frame_number))
+                    .unwrap_or_else(|| {
+                        self.last_received_frame.load(Ordering::Relaxed)
+                    });
                 for alloc in &info.allocations {
                     match alloc.status {
                         ProverStatus::Joining
