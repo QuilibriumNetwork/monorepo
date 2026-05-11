@@ -491,6 +491,18 @@ type manageModel struct {
 	lastFetchFailedAt  time.Time
 	consecutiveFailures int
 
+	// Cached auxiliary RPC responses. `fetchRPCData` returns a
+	// dataRefreshMsg with err=nil whenever GetNodeInfo succeeds,
+	// even if GetShardInfo or GetWorkerInfo failed (those are
+	// silently nil-on-error). Without caching, a single transient
+	// GetShardInfo or GetWorkerInfo failure between successful
+	// fetches blanks `m.available` / `m.freeWorkers` and flashes
+	// the Available and worker-status panels. Holding the prior
+	// raw response lets `processRefreshData` substitute it in for
+	// the nil one so the panels stay stable across blips.
+	cachedShardInfo  *protobufs.GetShardInfoResponse
+	cachedWorkerInfo *protobufs.WorkerInfoResponse
+
 	// Pending broadcast accumulator. Batched (Pause/Resume) and
 	// multi-filter actions append here on each successful broadcast,
 	// then the await loop tracks every accumulated filter — not just
@@ -1890,6 +1902,13 @@ func (m manageModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // shouldn't rely on that. If the contract ever loosens (e.g.
 // streaming refresh, partial response), the prior version would
 // nil-pointer-deref on `nodeInfo.GetPeerId()`.
+//
+// Auxiliary RPC caching: `shardInfo` and `workerInfo` are both
+// silently nil-on-error in `fetchRPCData`. When that happens we
+// substitute the prior cached response so the dependent panels
+// (Available shards, free workers, worker mode) don't blank between
+// refreshes. Fresh data updates the cache; missing data falls back
+// to it.
 func (m *manageModel) processRefreshData(
 	nodeInfo *protobufs.NodeInfoResponse,
 	shardInfo *protobufs.GetShardInfoResponse,
@@ -1899,6 +1918,20 @@ func (m *manageModel) processRefreshData(
 		// Nothing to merge — leave model state untouched so the
 		// prior good values continue to render.
 		return
+	}
+
+	// Aux-response cache: prefer fresh data, fall back to cached.
+	// We update the cache only when fresh data arrives so a string
+	// of failures doesn't gradually clear it.
+	if shardInfo != nil {
+		m.cachedShardInfo = shardInfo
+	} else {
+		shardInfo = m.cachedShardInfo
+	}
+	if workerInfo != nil {
+		m.cachedWorkerInfo = workerInfo
+	} else {
+		workerInfo = m.cachedWorkerInfo
 	}
 	// Header.
 	m.peerId = nodeInfo.GetPeerId()
