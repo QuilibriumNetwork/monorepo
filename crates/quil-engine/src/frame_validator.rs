@@ -576,6 +576,7 @@ mod tests {
         }
         fn get_prover_shard_summaries(
             &self,
+            _frame_number: u64,
         ) -> Result<Vec<quil_types::consensus::ProverShardSummary>> {
             Ok(Vec::new())
         }

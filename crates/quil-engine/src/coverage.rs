@@ -383,9 +383,12 @@ impl CoverageMonitor {
         }
         self.last_checked_frame.store(frame_number, Ordering::Relaxed);
 
-        // Get per-shard summaries from the prover registry
+        // Get per-shard summaries from the prover registry.
+        // Pass the current frame so expired Joining/Leaving allocs
+        // are dropped from `status_counts` — without that, a shard
+        // whose pending joiners all timed out still looks healthy.
         let summaries = self.prover_registry
-            .get_prover_shard_summaries()
+            .get_prover_shard_summaries(frame_number)
             .unwrap_or_default();
 
         let mut any_halted = false;
@@ -446,9 +449,13 @@ impl CoverageMonitor {
     }
 
     /// Get the current halt durations without running a check.
-    pub fn current_halt_durations(&self) -> HashMap<Vec<u8>, u64> {
+    /// `frame_number` is used to filter expired Joining/Leaving
+    /// allocs from the per-shard counts — pass the latest received
+    /// frame or `last_checked_frame` if you want point-in-time
+    /// consistency with the last `check()` call.
+    pub fn current_halt_durations(&self, frame_number: u64) -> HashMap<Vec<u8>, u64> {
         let summaries = self.prover_registry
-            .get_prover_shard_summaries()
+            .get_prover_shard_summaries(frame_number)
             .unwrap_or_default();
         compute_shard_halt_durations(&self.streaks, &summaries, &self.thresholds)
     }
@@ -462,7 +469,7 @@ impl CoverageMonitor {
     /// merging (too few provers). Returns proposed actions.
     pub fn check_split_merge(&self, frame_number: u64) -> Vec<ShardAction> {
         let summaries = self.prover_registry
-            .get_prover_shard_summaries()
+            .get_prover_shard_summaries(frame_number)
             .unwrap_or_default();
 
         let mut actions = Vec::new();
@@ -606,7 +613,7 @@ impl CoverageMonitor {
         // Determine which filters to check: explicit list or all shards.
         let filters: Vec<Vec<u8>> = if req.filters.is_empty() {
             self.prover_registry
-                .get_prover_shard_summaries()
+                .get_prover_shard_summaries(req.frame_number)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|s| s.filter)

@@ -662,7 +662,7 @@ mod tests {
             fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> Result<()> { Ok(()) }
             fn refresh(&self) -> Result<()> { Ok(()) }
             fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
-            fn get_prover_shard_summaries(&self) -> Result<Vec<quil_types::consensus::ProverShardSummary>> { Ok(Vec::new()) }
+            fn get_prover_shard_summaries(&self, _frame_number: u64) -> Result<Vec<quil_types::consensus::ProverShardSummary>> { Ok(Vec::new()) }
             fn prune_orphan_joins(&self, _: u64) -> Result<()> { Ok(()) }
             fn evict_inactive_provers(&self, _: u64, _: u64, _: &std::collections::HashMap<String, u64>) -> Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
             fn current_frame(&self) -> u64 { 0 }

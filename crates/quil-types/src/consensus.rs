@@ -223,7 +223,22 @@ pub trait ProverRegistry: Send + Sync {
     ) -> Result<()>;
     fn refresh(&self) -> Result<()>;
     fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>>;
-    fn get_prover_shard_summaries(&self) -> Result<Vec<ProverShardSummary>>;
+    /// Per-filter prover count grouped by allocation status, with the
+    /// 720-frame grace check applied so expired Joining/Leaving
+    /// allocations don't inflate `status_counts`. Halt-risk
+    /// classification reads `Joining` count from these summaries —
+    /// without the expiry filter, a shard whose pending joins all
+    /// timed out still looks "halt-risk-safe" (lots of pending
+    /// provers) and the auto-allocator skips it.
+    ///
+    /// `frame_number` is the latest received frame (NOT the
+    /// registry's internal `current_frame` — that one only advances
+    /// when the materializer runs, so it lags on observer-only
+    /// nodes).
+    fn get_prover_shard_summaries(
+        &self,
+        frame_number: u64,
+    ) -> Result<Vec<ProverShardSummary>>;
     /// Advance the registry's view of the current frame. Mirrors Go's
     /// `ProverRegistry.ProcessStateTransition` — Go also walks the
     /// frame's state changeset to update its in-memory cache; the

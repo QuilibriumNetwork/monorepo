@@ -531,7 +531,7 @@ impl ProverLifecycle {
         }
 
         // Gather inputs
-        let summaries = registry.get_prover_shard_summaries()?;
+        let summaries = registry.get_prover_shard_summaries(frame_number)?;
         let prover_info = registry.get_prover_info(&self.prover_address)?;
         let workers = worker_manager.range_workers()?;
 
@@ -1355,7 +1355,10 @@ mod proposal_loop_tests {
         fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
         fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
         fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> Result<()> { Ok(()) }
-        fn get_prover_shard_summaries(&self) -> Result<Vec<ProverShardSummary>> {
+        fn get_prover_shard_summaries(
+            &self,
+            _frame_number: u64,
+        ) -> Result<Vec<ProverShardSummary>> {
             Ok(self.summaries.lock().unwrap().clone())
         }
         fn prune_orphan_joins(&self, _: u64) -> Result<()> { Ok(()) }
@@ -1449,7 +1452,10 @@ mod proposal_loop_tests {
         reg: &dyn ProverRegistry,
     ) {
         use std::collections::HashMap;
-        let summaries = reg.get_prover_shard_summaries().unwrap_or_default();
+        // Test helper — test `ConfigurableRegistry` ignores
+        // frame_number for summaries.
+        let _ = lc; // keep parameter used for future test-side gating
+        let summaries = reg.get_prover_shard_summaries(0).unwrap_or_default();
         let sizes: HashMap<Vec<u8>, u64> = summaries
             .iter()
             .filter(|s| !s.filter.is_empty() && s.total_size > 0)

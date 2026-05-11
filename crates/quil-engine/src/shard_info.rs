@@ -267,6 +267,15 @@ struct RingCandidate {
 ///
 /// `get_sizes` is a closure that takes `(shard_key, &ShardInfo)` and
 /// returns a list of `ShardSizeEntry` items.
+///
+/// `frame_number` anchors the 720-frame expiry check inside the
+/// per-shard candidate loop. The caller's pre-built
+/// `allocated_filters` set already applies this expiry; the candidate
+/// loop has its own independent path (`get_provers(bp)` →
+/// per-allocation filter match) that ALSO needs the check, otherwise
+/// expired Joining allocs leak into `in_candidates → is_alloc` and
+/// the server reports `IsAllocated=true` for shards the user has
+/// long since timed out of.
 pub fn build_shard_entries<F>(
     shards: &[ShardInfo],
     get_sizes: &F,
@@ -274,6 +283,7 @@ pub fn build_shard_entries<F>(
     self_address: &[u8],
     include_all: bool,
     prover_registry: &dyn ProverRegistry,
+    frame_number: u64,
 ) -> (Vec<ShardEntry>, BigInt)
 where
     F: Fn(&[u8], &ShardInfo) -> Result<Vec<ShardSizeEntry>>,
@@ -331,11 +341,25 @@ where
             };
 
             // Build sorted ring candidates.
+            //
+            // Skip expired Joining allocs (status still Joining on
+            // chain because no Confirm/Reject landed within the
+            // 720-frame grace window). Without this guard, an
+            // expired Joining alloc still in the prover's allocation
+            // list would push the local prover into `candidates`
+            // and downstream code (line 379-381) would compute
+            // `in_candidates = true → real_is_alloc = true`, leaking
+            // the shard out of the TUI's Available panel.
             let mut candidates: Vec<RingCandidate> = Vec::new();
             for pr in &prs {
                 for alloc in &pr.allocations {
                     if alloc.confirmation_filter != bp {
                         continue;
+                    }
+                    if alloc.status == ProverStatus::Joining
+                        && frame_number > alloc.join_frame_number + 720
+                    {
+                        break;
                     }
                     if alloc.status == ProverStatus::Active
                         || alloc.status == ProverStatus::Joining
@@ -454,6 +478,7 @@ where
         self_address,
         include_all,
         prover_registry,
+        frame_number,
     );
 
     if world_bytes.is_zero() {
@@ -1073,7 +1098,7 @@ mod tests {
         }
         fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
         fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> QResult<()> { Ok(()) }
-        fn get_prover_shard_summaries(&self) -> QResult<Vec<ProverShardSummary>> { Ok(vec![]) }
+        fn get_prover_shard_summaries(&self, _: u64) -> QResult<Vec<ProverShardSummary>> { Ok(vec![]) }
         fn prune_orphan_joins(&self, _: u64) -> QResult<()> { Ok(()) }
         fn evict_inactive_provers(
             &self,

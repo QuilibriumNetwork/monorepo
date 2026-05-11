@@ -563,8 +563,13 @@ impl WorkerAllocator {
     }
 
     /// Check if this node should propose a join for unallocated shards.
-    /// Returns the filters that need join proposals.
-    pub fn pending_join_filters(&self) -> Result<Vec<Vec<u8>>> {
+    /// Returns the filters of allocations currently Joining and still
+    /// within the 720-frame grace window. Allocations whose Joining
+    /// status has already expired (no Confirm/Reject within
+    /// `PENDING_FILTER_GRACE_FRAMES`) are excluded so the caller
+    /// doesn't re-propose them — they're effectively rejected and
+    /// will be replaced by fresh proposals.
+    pub fn pending_join_filters(&self, frame_number: u64) -> Result<Vec<Vec<u8>>> {
         let prover_info = self
             .prover_registry
             .get_prover_info(&self.local_prover_address)?;
@@ -576,7 +581,10 @@ impl WorkerAllocator {
         Ok(prover
             .allocations
             .iter()
-            .filter(|a| a.status == ProverStatus::Joining)
+            .filter(|a| {
+                a.status == ProverStatus::Joining
+                    && frame_number <= a.join_frame_number + PENDING_FILTER_GRACE_FRAMES
+            })
             .map(|a| a.confirmation_filter.clone())
             .collect())
     }
@@ -730,7 +738,7 @@ mod tests {
         fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
         fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
         fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> Result<()> { Ok(()) }
-        fn get_prover_shard_summaries(&self) -> Result<Vec<ProverShardSummary>> { Ok(vec![]) }
+        fn get_prover_shard_summaries(&self, _: u64) -> Result<Vec<ProverShardSummary>> { Ok(vec![]) }
         fn prune_orphan_joins(&self, _: u64) -> Result<()> { Ok(()) }
         fn evict_inactive_provers(&self, _: u64, _: u64, _: &std::collections::HashMap<String, u64>) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
         fn current_frame(&self) -> u64 { 0 }

@@ -312,7 +312,7 @@ mod tests {
         fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> {
             self.get_active_provers(&[])
         }
-        fn get_prover_shard_summaries(&self) -> Result<Vec<ProverShardSummary>> {
+        fn get_prover_shard_summaries(&self, _frame_number: u64) -> Result<Vec<ProverShardSummary>> {
             Ok(vec![])
         }
         fn prune_orphan_joins(&self, _frame_number: u64) -> Result<()> {

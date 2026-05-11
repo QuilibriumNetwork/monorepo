@@ -409,8 +409,22 @@ impl InMemoryProverRegistry {
         out
     }
 
-    /// Per-filter prover count grouped by allocation status.
-    pub fn get_prover_shard_summaries(&self) -> Vec<ProverShardSummary> {
+    /// Per-filter prover count grouped by allocation status, with
+    /// the 720-frame grace window applied to Joining and Leaving
+    /// allocations. Expired pending allocs are NOT counted — Go's
+    /// reference protocol treats them as implicitly rejected (for
+    /// Joining) or implicitly left (for Leaving) and any subsystem
+    /// that consults these summaries must see the same effective
+    /// state.
+    ///
+    /// Without this filter, the halt-risk classifier in the
+    /// allocator's proposer sees inflated `total_active_joining`
+    /// counts and incorrectly believes a half-dead shard is healthy.
+    pub fn get_prover_shard_summaries(
+        &self,
+        frame_number: u64,
+    ) -> Vec<ProverShardSummary> {
+        const GRACE: u64 = 720;
         let mut out: Vec<ProverShardSummary> = Vec::with_capacity(self.filter_cache.len());
         for (filter_key, addrs) in &self.filter_cache {
             if filter_key.is_empty() || addrs.is_empty() {
@@ -423,20 +437,31 @@ impl InMemoryProverRegistry {
                 };
                 let mut counted = false;
                 for alloc in &info.allocations {
-                    if !alloc.confirmation_filter.is_empty()
-                        && alloc.confirmation_filter == *filter_key
+                    let filter_matches = (!alloc.confirmation_filter.is_empty()
+                        && alloc.confirmation_filter == *filter_key)
+                        || (!alloc.rejection_filter.is_empty()
+                            && alloc.rejection_filter == *filter_key);
+                    if !filter_matches {
+                        continue;
+                    }
+                    // Drop expired pending states so callers (halt-
+                    // risk classification, TUI prover counts) see the
+                    // same effective view as the lifecycle.
+                    if alloc.status == ProverStatus::Joining
+                        && frame_number > alloc.join_frame_number + GRACE
                     {
-                        *status_counts.entry(alloc.status).or_insert(0) += 1;
                         counted = true;
                         break;
                     }
-                    if !alloc.rejection_filter.is_empty()
-                        && alloc.rejection_filter == *filter_key
+                    if alloc.status == ProverStatus::Leaving
+                        && frame_number > alloc.leave_frame_number + GRACE
                     {
-                        *status_counts.entry(alloc.status).or_insert(0) += 1;
                         counted = true;
                         break;
                     }
+                    *status_counts.entry(alloc.status).or_insert(0) += 1;
+                    counted = true;
+                    break;
                 }
                 if !counted {
                     *status_counts.entry(info.status).or_insert(0) += 1;
@@ -850,12 +875,15 @@ impl ProverRegistryTrait for SharedProverRegistry {
             .collect())
     }
 
-    fn get_prover_shard_summaries(&self) -> QuilResult<Vec<ProverShardSummary>> {
+    fn get_prover_shard_summaries(
+        &self,
+        frame_number: u64,
+    ) -> QuilResult<Vec<ProverShardSummary>> {
         let guard = self
             .inner
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-        Ok(guard.get_prover_shard_summaries())
+        Ok(guard.get_prover_shard_summaries(frame_number))
     }
 
     fn process_state_transition(&self, frame_number: u64) -> QuilResult<()> {
@@ -1503,7 +1531,7 @@ mod tests {
         let mut reg = InMemoryProverRegistry::new();
         reg.refresh(&store);
 
-        let summaries = reg.get_prover_shard_summaries();
+        let summaries = reg.get_prover_shard_summaries(0);
         assert_eq!(summaries.len(), 1);
         let sum = &summaries[0];
         assert_eq!(sum.filter, filter);
@@ -1573,7 +1601,7 @@ mod tests {
         assert!(evict.is_empty());
 
         // Summaries round-trip through the trait.
-        let sums = trait_obj.get_prover_shard_summaries().unwrap();
+        let sums = trait_obj.get_prover_shard_summaries(0).unwrap();
         assert_eq!(sums.len(), 1);
 
         // current_frame starts at 0, can be set.
