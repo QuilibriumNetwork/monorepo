@@ -320,22 +320,22 @@ impl NodeService for NodeRpcServer {
                 // `current_frame > join_frame + 720` is always
                 // false, and `GetNodeInfo` returns historical
                 // Joining/Leaving allocs that should have been
-                // pruned. The TUI applies its own filter on top so
-                // the Available panel is correct, but other
-                // consumers and the prover-status command get
-                // misleading data. Prefer the local store's latest
-                // global frame; fall back to `last_received_frame`
-                // (updated by both the BlossomSub recv loop and the
-                // archive poller) if no clock-store snapshot is
-                // available.
+                // pruned.
+                //
+                // Take the max of the clock-store's latest frame and
+                // `last_received_frame`. Either alone can lag in
+                // valid observer scenarios — the clock-store is only
+                // updated post-materialize, and `last_received_frame`
+                // is 0 until the first wire frame arrives. The max
+                // is always the freshest source.
+                let lrf = self.last_received_frame.load(Ordering::Relaxed);
                 let current_frame = self
                     .clock_store
                     .as_ref()
                     .and_then(|cs| cs.get_latest_global_clock_frame().ok())
                     .and_then(|f| f.header.map(|h| h.frame_number))
-                    .unwrap_or_else(|| {
-                        self.last_received_frame.load(Ordering::Relaxed)
-                    });
+                    .map(|fn_stored| fn_stored.max(lrf))
+                    .unwrap_or(lrf);
                 for alloc in &info.allocations {
                     match alloc.status {
                         ProverStatus::Joining

@@ -32,6 +32,12 @@ pub struct P2PNode {
     /// If a new Ed448 key was generated, the hex-encoded config key (228 chars).
     /// The caller should persist this in the config file.
     pub generated_key_hex: Option<String>,
+    /// BlossomSub runtime params resolved from operator config at
+    /// construction time. Plumbed into `BlossomSubBehaviour` in
+    /// `start()` so operators can tune heartbeat / prune backoff /
+    /// history length / IWANT follow-up timeout from `P2PConfig`
+    /// without a rebuild.
+    blossomsub_params: crate::BlossomsubParams,
 }
 
 impl P2PNode {
@@ -137,6 +143,7 @@ impl P2PNode {
             bootstrap_peers,
             network: config.network,
             generated_key_hex,
+            blossomsub_params: crate::BlossomsubParams::from_p2p_config(config),
         })
     }
 
@@ -150,6 +157,7 @@ impl P2PNode {
             .map_err(|e| QuilError::P2p(format!("invalid listen address: {}", e)))?;
 
         let network = self.network;
+        let blossomsub_params = self.blossomsub_params.clone();
 
         let mut swarm = SwarmBuilder::with_existing_identity(self.keypair)
             .with_tokio()
@@ -196,7 +204,8 @@ impl P2PNode {
                     )
                     .with_push_listen_addr_updates(true),
                 );
-                let mut blossomsub = BlossomSubBehaviour::new(network);
+                let mut blossomsub =
+                    BlossomSubBehaviour::with_params(network, blossomsub_params.clone());
                 // Set signing identity so published messages pass Go's
                 // StrictSign verification (WithStrictSignatureVerification(true)).
                 let local_peer_id = key.public().to_peer_id();

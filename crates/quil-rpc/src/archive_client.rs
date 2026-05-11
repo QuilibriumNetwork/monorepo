@@ -89,7 +89,13 @@ impl ArchiveClient {
         let url = format!("http://{}", addr);
         let endpoint = Endpoint::from_shared(url)
             .map_err(|e| ArchiveClientError::InvalidEndpoint(e.to_string()))?
-            .connect_timeout(Duration::from_secs(3))
+            // 10s connect (was 3s). Over WAN with 200-300ms RTT
+            // the TLS handshake plus Ed448 cross-signature
+            // verification can routinely take 1.5-2.5s; a 3s
+            // budget left no margin for a single congestion event
+            // during the handshake. Matches the plaintext path's
+            // 10s timeout.
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(15))
             .tcp_nodelay(true)
             .keep_alive_while_idle(true);

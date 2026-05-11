@@ -117,10 +117,46 @@ pub struct BlossomSubBehaviour {
     /// Negotiated protocol ID. Mainnet uses `/blossomsub/2.1.0`;
     /// other networks suffix `-network-N` (e.g. testnet → `-network-1`).
     protocol: libp2p::StreamProtocol,
+    /// Runtime-tunable mesh/gossip parameters. Replaces direct
+    /// reads from `crate::params::*` so operators can override
+    /// timings via `P2PConfig` (heartbeat interval, prune backoff,
+    /// history length, etc.) without a rebuild.
+    pub(crate) params: crate::BlossomsubParams,
+    /// Pending IWANT requests: msg_id → (peer asked, sent_at,
+    /// other peers that also advertised this message). On
+    /// heartbeat, if an entry has been pending past
+    /// `params.iwant_followup_time`, retry from another advertiser
+    /// if one exists, otherwise drop the entry and let the message
+    /// be considered unrecoverable through gossip (consensus-layer
+    /// rebroadcast remains the second-line recovery).
+    pending_iwants: HashMap<Vec<u8>, PendingIwant>,
+}
+
+/// Per-message IWANT tracking entry.
+pub(crate) struct PendingIwant {
+    /// Peer we sent the IWANT to.
+    pub asked: PeerId,
+    /// When the IWANT was sent.
+    pub sent_at: Instant,
+    /// Other peers that also advertised this message (from IHAVE).
+    /// On follow-up timeout we pop from here for the retry.
+    pub other_advertisers: Vec<PeerId>,
+    /// Bitmask for the message — needed to source from
+    /// `peer_subscriptions` if `other_advertisers` is exhausted.
+    pub bitmask: Vec<u8>,
 }
 
 impl BlossomSubBehaviour {
     pub fn new(network: u8) -> Self {
+        Self::with_params(network, crate::BlossomsubParams::default())
+    }
+
+    /// Construct with custom mesh/gossip parameters. Use this
+    /// (typically with `BlossomsubParams::from_p2p_config(...)`) when
+    /// runtime overrides from operator config should apply.
+    pub fn with_params(network: u8, params: crate::BlossomsubParams) -> Self {
+        let mcache_len = params.history_length;
+        let mcache_gossip = params.history_gossip;
         Self {
             subscriptions: HashSet::new(),
             peer_subscriptions: HashMap::new(),
@@ -129,8 +165,8 @@ impl BlossomSubBehaviour {
             events: VecDeque::new(),
             seen_messages: HashSet::new(),
             mcache: crate::blossomsub::MessageCache::new(
-                crate::params::HISTORY_LENGTH,
-                crate::params::HISTORY_GOSSIP,
+                mcache_len,
+                mcache_gossip,
             ),
             last_heartbeat: Instant::now(),
             pending_subscribe_rpc: None,
@@ -151,6 +187,8 @@ impl BlossomSubBehaviour {
             composites: HashMap::new(),
             slice_to_composite: HashMap::new(),
             protocol: crate::protocol::stream_protocol_for_network(network),
+            params,
+            pending_iwants: HashMap::new(),
         }
     }
 
@@ -394,6 +432,9 @@ impl BlossomSubBehaviour {
             if !self.seen_messages.insert(msg_id.clone()) {
                 continue; // Dedup
             }
+            // Message arrived — clear any pending IWANT for it so
+            // the heartbeat doesn't retry uselessly.
+            self.pending_iwants.remove(&msg_id);
 
             // Run per-bitmask validator if registered.
             if let Some(validator) = self.validators.get(&msg.bitmask) {
@@ -565,12 +606,48 @@ impl BlossomSubBehaviour {
                 }
             }
 
-            // Respond to IHAVE with IWANT for messages we haven't seen
+            // Respond to IHAVE with IWANT for messages we haven't
+            // seen. Records each new IWANT in `pending_iwants` so
+            // the heartbeat can detect drops and retry from another
+            // advertiser. If a message_id is already pending
+            // (different peer also advertised it), add this peer to
+            // the candidates list instead of issuing a duplicate
+            // IWANT — when the current IWANT times out we'll switch
+            // to one of these.
+            let now = Instant::now();
             let mut wanted: Vec<Vec<u8>> = Vec::new();
             for ihave in &control.ihave {
                 for msg_id in &ihave.message_i_ds {
-                    if !self.seen_messages.contains(msg_id) {
-                        wanted.push(msg_id.clone());
+                    if self.seen_messages.contains(msg_id) {
+                        continue;
+                    }
+                    match self.pending_iwants.get_mut(msg_id) {
+                        Some(entry) => {
+                            if entry.asked != peer
+                                && !entry.other_advertisers.contains(&peer)
+                                && entry.other_advertisers.len() < 8
+                            {
+                                entry.other_advertisers.push(peer);
+                            }
+                        }
+                        None => {
+                            // Cap pending IWANT count to bound
+                            // memory under IHAVE-flood. Standard
+                            // gossipsub uses 5000.
+                            if self.pending_iwants.len() >= 5000 {
+                                continue;
+                            }
+                            self.pending_iwants.insert(
+                                msg_id.clone(),
+                                PendingIwant {
+                                    asked: peer,
+                                    sent_at: now,
+                                    other_advertisers: Vec::new(),
+                                    bitmask: ihave.bitmask.clone(),
+                                },
+                            );
+                            wanted.push(msg_id.clone());
+                        }
                     }
                 }
             }
@@ -799,8 +876,103 @@ impl BlossomSubBehaviour {
         }
     }
 
+    /// Walk `pending_iwants` and, for every entry whose IWANT
+    /// has been outstanding longer than
+    /// `params.iwant_followup_time`, either retry from another
+    /// advertiser (popping it from `other_advertisers`) or drop the
+    /// entry entirely. Records a behaviour penalty on the
+    /// original responder so the scoring path can PRUNE chronic
+    /// missers. Without this, an IWANT lost on the wire is
+    /// silently abandoned and the requesting node never recovers
+    /// the message via gossip — relying instead on the slower
+    /// consensus-layer rebroadcast (28s) which is too late for
+    /// vote-aggregation deadlines on WAN.
+    fn process_iwant_followups(&mut self) {
+        let now = Instant::now();
+        let timeout = self.params.iwant_followup_time;
+        let mut retries: Vec<(PeerId, Vec<u8>)> = Vec::new();
+        let mut expired_msg_ids: Vec<Vec<u8>> = Vec::new();
+        let mut penalize_peers: Vec<PeerId> = Vec::new();
+
+        // First pass: collect work without mutating the map (avoid
+        // double-borrow issues with retries borrowing peer IDs that
+        // also live in the same map).
+        for (msg_id, entry) in self.pending_iwants.iter() {
+            if now.duration_since(entry.sent_at) < timeout {
+                continue;
+            }
+            // Penalize the peer that didn't deliver; their gossip
+            // ad was effectively a lie. One penalty per missed IWANT.
+            penalize_peers.push(entry.asked);
+            // Pick a different advertiser, preferring connected
+            // peers we're not already locked-out of.
+            let next = entry
+                .other_advertisers
+                .iter()
+                .copied()
+                .find(|p| self.connected_peers.contains_key(p) && *p != entry.asked);
+            match next {
+                Some(p) => retries.push((p, msg_id.clone())),
+                None => expired_msg_ids.push(msg_id.clone()),
+            }
+        }
+
+        for peer in &penalize_peers {
+            self.scorer.add_invalid(peer, &[]);
+        }
+
+        // Drop expired entries with no remaining advertiser.
+        for id in &expired_msg_ids {
+            self.pending_iwants.remove(id);
+        }
+
+        // Re-issue IWANTs to the new advertisers. Group by peer so
+        // we send one RPC per target. Also rotate the pending entry
+        // to the new peer with a fresh `sent_at`.
+        let mut by_peer: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
+        for (peer, msg_id) in retries {
+            by_peer.entry(peer).or_default().push(msg_id.clone());
+            if let Some(entry) = self.pending_iwants.get_mut(&msg_id) {
+                // Remove the new asked peer from candidates so we
+                // don't bounce back to it next round.
+                entry.other_advertisers.retain(|p| *p != peer);
+                entry.asked = peer;
+                entry.sent_at = now;
+            }
+        }
+        for (target, ids) in by_peer {
+            let iwant_rpc = pb::Rpc {
+                subscriptions: Vec::new(),
+                publish: Vec::new(),
+                control: Some(pb::ControlMessage {
+                    ihave: Vec::new(),
+                    iwant: vec![pb::ControlIWant { message_i_ds: ids }],
+                    graft: Vec::new(),
+                    prune: Vec::new(),
+                    idontwant: Vec::new(),
+                }),
+            };
+            let encoded = protocol::encode_rpc(&iwant_rpc);
+            if self.connected_peers.contains_key(&target) {
+                self.events.push_back(ToSwarm::NotifyHandler {
+                    peer_id: target,
+                    handler: NotifyHandler::Any,
+                    event: HandlerIn { rpc_data: encoded },
+                });
+            }
+        }
+    }
+
     fn heartbeat(&mut self) {
         self.heartbeat_ticks += 1;
+
+        // 0a. IWANT follow-up. For every pending IWANT older than
+        // `params.iwant_followup_time`, either retry from another
+        // peer that advertised the same message, or drop it if no
+        // candidates remain. Penalize the original responder so its
+        // score reflects the missed gossip response — repeated
+        // offenders get PRUNE'd via the score path.
+        self.process_iwant_followups();
 
         // 0. Direct peer maintenance — reconnect missing, graft into meshes.
         if !self.direct_peers.is_empty() {
@@ -852,7 +1024,7 @@ impl BlossomSubBehaviour {
         self.backoffs.retain(|_, expiry| *expiry > now);
 
         // 3. Expire stale fanout entries
-        let fanout_ttl = crate::params::FANOUT_TTL;
+        let fanout_ttl = self.params.fanout_ttl;
         let expired_fanout: Vec<Vec<u8>> = self.fanout_last_pub
             .iter()
             .filter(|(_, last)| now.duration_since(**last) > fanout_ttl)
@@ -896,7 +1068,7 @@ impl BlossomSubBehaviour {
             }
 
             // 4b. If under-subscribed (< D_LO): GRAFT from available peers
-            if mesh.len() < crate::params::D_LO {
+            if mesh.len() < self.params.d_lo {
                 let needed = crate::params::D - mesh.len();
                 let candidates: Vec<PeerId> = self
                     .peer_subscriptions
@@ -926,7 +1098,7 @@ impl BlossomSubBehaviour {
             }
 
             // 4c. If over-subscribed (> D_HI): PRUNE excess peers
-            if mesh.len() > crate::params::D_HI {
+            if mesh.len() > self.params.d_hi {
                 let excess = mesh.len() - crate::params::D;
                 let outbound = self.outbound_peers
                     .get(bitmask)
@@ -942,7 +1114,7 @@ impl BlossomSubBehaviour {
 
                 // Protect top D_SCORE peers and outbound peers
                 let mut protected: HashSet<PeerId> = HashSet::new();
-                for (peer, _) in scored.iter().take(crate::params::D_SCORE) {
+                for (peer, _) in scored.iter().take(self.params.d_score) {
                     protected.insert(*peer);
                 }
                 for peer in &outbound {
@@ -1013,7 +1185,7 @@ impl BlossomSubBehaviour {
                         && self.scorer.score(p) >= self.scorer.thresholds.gossip_threshold
                 })
                 .map(|(p, _)| *p)
-                .take(crate::params::D_LAZY)
+                .take(self.params.d_lazy)
                 .collect();
 
             if !gossip_peers.is_empty() {
@@ -1062,7 +1234,7 @@ impl BlossomSubBehaviour {
         let mut need_peers = false;
         for bitmask in &subscriptions {
             let mesh_count = self.mesh.get(bitmask).map(|m| m.len()).unwrap_or(0);
-            if mesh_count < crate::params::D_LO {
+            if mesh_count < self.params.d_lo {
                 need_peers = true;
                 break;
             }
@@ -1152,7 +1324,7 @@ impl BlossomSubBehaviour {
 
     /// Send a PRUNE message to a peer for a bitmask.
     fn send_prune(&mut self, peer: &PeerId, bitmask: &[u8]) {
-        let backoff_secs = crate::params::PRUNE_BACKOFF.as_secs();
+        let backoff_secs = self.params.prune_backoff.as_secs();
         let rpc = protocol::prune_rpc(&[bitmask.to_vec()], backoff_secs);
         let encoded = protocol::encode_rpc(&rpc);
         if let Some(conns) = self.connected_peers.get(peer) {
@@ -1165,7 +1337,7 @@ impl BlossomSubBehaviour {
                 // Set backoff
                 self.backoffs.insert(
                     (*peer, bitmask.to_vec()),
-                    Instant::now() + crate::params::PRUNE_BACKOFF,
+                    Instant::now() + self.params.prune_backoff,
                 );
             }
         }
@@ -1241,6 +1413,32 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                         for mesh in self.mesh.values_mut() {
                             mesh.remove(&e.peer_id);
                         }
+                        // Reset pending IWANTs that were waiting on
+                        // this peer — there's no point waiting for a
+                        // disconnected peer's gossip response. If
+                        // another advertiser exists, the next
+                        // heartbeat's `process_iwant_followups`
+                        // picks them up (entry stays). If this peer
+                        // was the only advertiser, drop the entry.
+                        let dropped_peer = e.peer_id;
+                        let mut drop_ids: Vec<Vec<u8>> = Vec::new();
+                        for (msg_id, entry) in self.pending_iwants.iter_mut() {
+                            if entry.asked == dropped_peer {
+                                // Force expiry on next heartbeat so the
+                                // follow-up logic picks a different
+                                // peer, by zeroing `sent_at`.
+                                entry.sent_at =
+                                    Instant::now() - self.params.iwant_followup_time;
+                                if entry.other_advertisers.is_empty() {
+                                    drop_ids.push(msg_id.clone());
+                                }
+                            } else {
+                                entry.other_advertisers.retain(|p| *p != dropped_peer);
+                            }
+                        }
+                        for id in drop_ids {
+                            self.pending_iwants.remove(&id);
+                        }
                     }
                 }
             }
@@ -1274,7 +1472,7 @@ impl NetworkBehaviour for BlossomSubBehaviour {
         _cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         // Run heartbeat
-        if self.last_heartbeat.elapsed() >= crate::params::HEARTBEAT_INTERVAL {
+        if self.last_heartbeat.elapsed() >= self.params.heartbeat_interval {
             self.heartbeat();
             self.last_heartbeat = Instant::now();
         }

@@ -110,7 +110,7 @@ pub async fn probe_perform_sync(
     let url = format!("http://{}", addr);
     let endpoint = Endpoint::from_shared(url)
         .map_err(|e| HyperSyncProbeError::InvalidEndpoint(e.to_string()))?
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .tcp_nodelay(true)
         .keep_alive_while_idle(true);
@@ -226,7 +226,7 @@ pub async fn probe_pull_root_leaves(
     let url = format!("http://{}", addr);
     let endpoint = Endpoint::from_shared(url)
         .map_err(|e| HyperSyncProbeError::InvalidEndpoint(e.to_string()))?
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
         .tcp_nodelay(true)
         .keep_alive_while_idle(true);
@@ -410,7 +410,7 @@ pub async fn probe_build_local_tree(
     let url = format!("http://{}", addr);
     let endpoint = Endpoint::from_shared(url)
         .map_err(|e| HyperSyncProbeError::InvalidEndpoint(e.to_string()))?
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(10))
         // The full pull can take ~10 minutes; budget generously.
         .timeout(Duration::from_secs(20 * 60))
         .tcp_nodelay(true)
@@ -615,7 +615,7 @@ pub async fn build_local_tree_with_handle(
     let url = format!("http://{}", addr);
     let endpoint = Endpoint::from_shared(url)
         .map_err(|e| HyperSyncProbeError::InvalidEndpoint(e.to_string()))?
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20 * 60))
         .tcp_nodelay(true)
         .keep_alive_while_idle(true);
@@ -799,7 +799,7 @@ pub async fn probe_inspect_vertex_data(
     let url = format!("http://{}", addr);
     let endpoint = Endpoint::from_shared(url)
         .map_err(|e| HyperSyncProbeError::InvalidEndpoint(e.to_string()))?
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
         .tcp_nodelay(true)
         .keep_alive_while_idle(true);
@@ -1181,7 +1181,7 @@ pub async fn ensure_prover_tree_incremental(
     let url = format!("http://{}", addr);
     let endpoint = Endpoint::from_shared(url)
         .map_err(|e| HyperSyncProbeError::InvalidEndpoint(e.to_string()))?
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(5 * 60))
         .tcp_nodelay(true)
         .keep_alive_while_idle(true);

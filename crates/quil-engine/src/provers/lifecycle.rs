@@ -510,6 +510,23 @@ impl ProverLifecycle {
         registry: &dyn ProverRegistry,
         worker_manager: &dyn WorkerManager,
     ) -> Result<Vec<LifecycleAction>> {
+        // Reject bogus zero-frame inputs. Mainnet genesis is frame
+        // 244200, never 0; a `frame_number == 0` arriving here means
+        // the caller resolved a malformed header (e.g. archive
+        // returned a frame with no header or header.frame_number=0)
+        // or read a cold-start `last_received_frame` that hasn't
+        // been populated yet. Either way, propose-path cooldown
+        // logic compares `frame_number <= last_join_attempt` and a
+        // zero input shifts the comparison into "always cooldown
+        // active," silently blocking every join proposal. Bail
+        // before doing any work.
+        if frame_number == 0 {
+            tracing::debug!(
+                "skipping lifecycle evaluation — frame_number is 0 (degenerate input)"
+            );
+            return Ok(Vec::new());
+        }
+
         self.set_last_observed_frame(frame_number);
 
         // Unconditional gates — nothing to emit.

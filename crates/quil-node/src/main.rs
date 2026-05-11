@@ -2012,7 +2012,17 @@ async fn run_master_node(
             on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
                 let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                 let frame_difficulty = frame.header.as_ref().map(|h| h.difficulty).unwrap_or(0);
-                lrf_for_poller.store(frame_num, std::sync::atomic::Ordering::Relaxed);
+                // Skip bogus frames (no header or frame_number=0):
+                // storing 0 to `last_received_frame` would regress
+                // it (it's a plain `store`, not `fetch_max`), and
+                // the lifecycle's evaluate guards against 0 anyway.
+                if frame_num == 0 {
+                    tracing::debug!(
+                        "archive poller: dropping frame with frame_number=0"
+                    );
+                    return;
+                }
+                lrf_for_poller.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
                 lhf_for_poller.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
 
                 // Process frame messages through execution pipeline
@@ -3178,7 +3188,12 @@ async fn run_master_node(
                                         match clock_store_recv.put_global_frame(&frame, None) {
                                             Ok(()) => {
                                                 frames_received += 1;
-                                                lrf_for_recv.store(frame_num, std::sync::atomic::Ordering::Relaxed);
+                                                // `fetch_max` not `store`: never
+                                                // regress lrf below an
+                                                // already-seen value (e.g. if a
+                                                // stale duplicate frame arrives
+                                                // out-of-order via BlossomSub).
+                                                lrf_for_recv.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
                                                 lhf_for_recv.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
                                                 // Process through execution pipeline with reward issuance
                                                 match quil_engine::frame_processor::process_global_frame_with_rewards(
@@ -3863,19 +3878,30 @@ async fn run_master_node(
                 num_bigint::BigInt,
                 u64,
             )> {
+                // Resolve `frame_number` to the freshest known
+                // source. The clock-store reports the latest frame
+                // that has been STORED (post-materialize); a node
+                // that's observing frames without storing them, or
+                // one whose clock-store row is missing/blank for any
+                // reason, would return 0 from this path even though
+                // the BlossomSub recv / archive poller has been
+                // updating `last_received_frame` for many frames.
+                // Taking the max of both sources protects the
+                // downstream expiry check, the gRPC response
+                // `frame_number` (which the TUI reads), and the
+                // 720-frame grace logic in this function.
+                let lrf = self
+                    .last_received_frame
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let (difficulty, frame_number) = match self
                     .clock_store
                     .get_latest_global_clock_frame()
                 {
                     Ok(frame) => {
                         let h = frame.header.unwrap_or_default();
-                        (h.difficulty as u64, h.frame_number)
+                        (h.difficulty as u64, h.frame_number.max(lrf))
                     }
-                    Err(_) => (
-                        0u64,
-                        self.last_received_frame
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    ),
+                    Err(_) => (0u64, lrf),
                 };
 
                 // Skip allocations past the 720-frame grace window.
