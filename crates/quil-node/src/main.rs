@@ -646,6 +646,17 @@ async fn run_master_node(
     // ---------------------------------------------------------------
     // 5b. PeerInfo publishing (every 5 minutes + immediate)
     // ---------------------------------------------------------------
+
+    // Deferred worker-manager handle for per-worker reachability
+    // advertisements. The PeerInfo broadcaster spawns here (before
+    // `worker_manager` exists). Once `worker_manager` is constructed
+    // ~250 lines below, it's published into this OnceLock. The next
+    // PeerInfo tick picks it up. First tick (immediate at startup)
+    // may publish without per-worker entries; subsequent ticks
+    // include them.
+    let pi_worker_manager: Arc<std::sync::OnceLock<
+        Arc<dyn quil_engine::worker::WorkerManager>,
+    >> = Arc::new(std::sync::OnceLock::new());
     {
         let pi_handle = p2p_handle.clone();
         let pi_token = token.clone();
@@ -675,6 +686,17 @@ async fn run_master_node(
         let pi_p2p_handle = p2p_handle.clone();
         let pi_last_received = last_received_frame.clone();
         let pi_last_head = last_global_head_frame.clone();
+        // Per-worker multiaddrs — used in process-mode (each worker
+        // is its own OS process with its own ports). In thread mode
+        // (the default for the Rust port) all these arrays are empty
+        // and per-worker reachability falls back to the master's
+        // addresses.
+        let pi_worker_p2p_multiaddrs = config.engine.data_worker_p2p_multiaddrs.clone();
+        let pi_worker_stream_multiaddrs = config.engine.data_worker_stream_multiaddrs.clone();
+        let pi_worker_announce_p2p = config.engine.data_worker_announce_p2p_multiaddrs.clone();
+        let pi_worker_announce_stream =
+            config.engine.data_worker_announce_stream_multiaddrs.clone();
+        let pi_worker_manager_slot = Arc::clone(&pi_worker_manager);
         let mut pi_caps: Vec<quil_p2p::CanonicalCapability> = exec_manager
             .get_supported_capabilities()
             .into_iter()
@@ -723,13 +745,38 @@ async fn run_master_node(
                 } else {
                     vec![]
                 };
+                // Master reachability with the global-filter `[0xFF;32]`
+                // convention. Then per-worker reachabilities (one per
+                // running worker with a non-empty filter), populated
+                // from the worker manager once it's available.
+                let mut reachability = vec![quil_p2p::CanonicalReachability {
+                    filter: vec![0xFF; 32], // global filter
+                    pubsub_multiaddrs: vec![pubsub_addr.clone()],
+                    stream_multiaddrs: stream_addrs.clone(),
+                }];
+                if let Some(wm) = pi_worker_manager_slot.get() {
+                    if let Ok(workers) = wm.range_workers() {
+                        let pairs: Vec<(u32, Vec<u8>)> = workers
+                            .into_iter()
+                            .filter(|w| !w.filter.is_empty())
+                            .map(|w| (w.core_id, w.filter))
+                            .collect();
+                        reachability.extend(quil_p2p::build_worker_reachability(
+                            &pairs,
+                            &pubsub_addr,
+                            &stream_addrs,
+                            &pi_worker_p2p_multiaddrs,
+                            &pi_worker_stream_multiaddrs,
+                            &pi_worker_announce_p2p,
+                            &pi_worker_announce_stream,
+                        ));
+                    }
+                }
+                let worker_reachability_count = reachability.len().saturating_sub(1);
+
                 let info = quil_p2p::CanonicalPeerInfo {
                     peer_id: pi_peer_id_bytes.clone(),
-                    reachability: vec![quil_p2p::CanonicalReachability {
-                        filter: vec![0xFF; 32], // global filter
-                        pubsub_multiaddrs: vec![pubsub_addr],
-                        stream_multiaddrs: stream_addrs,
-                    }],
+                    reachability,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -784,6 +831,7 @@ async fn run_master_node(
                         capabilities = pi_caps.len(),
                         signed = pi_ed448_seed.is_some(),
                         pubkey_len = pi_ed448_pubkey.len(),
+                        worker_reachability = worker_reachability_count,
                         "published PeerInfo"
                     );
                 }
@@ -1423,6 +1471,49 @@ async fn run_master_node(
             info!(workers = worker_count, "pre-allocated idle workers");
         }
     }
+
+    // Apply `engine.data_worker_filters` from YAML config. Runs AFTER
+    // persisted-restore and AFTER idle pre-allocation, so:
+    //   * a fresh node pins config-declared filters and marks those
+    //     workers manually_managed=true;
+    //   * a restart with a prior persisted/gRPC-driven assignment
+    //     keeps that runtime state (persisted wins, see
+    //     `worker_allocator::apply_config_worker_filters` docs).
+    // This integration is *additional* to Go's behavior — Go only
+    // uses `data_worker_filters` for PeerInfo reachability
+    // advertisement, not worker pinning. The auto-allocator's
+    // manual_pending pool consumes these workers when matching
+    // registry allocations land.
+    {
+        let cfg_filters = &config.engine.data_worker_filters;
+        let stats = quil_engine::worker_allocator::apply_config_worker_filters(
+            worker_manager.as_ref(),
+            cfg_filters,
+        );
+        if !cfg_filters.is_empty() {
+            info!(
+                declared = cfg_filters.len(),
+                applied = stats.applied,
+                skipped_existing = stats.skipped_existing,
+                skipped_missing_core = stats.skipped_missing_core,
+                skipped_empty = stats.skipped_empty,
+                invalid = stats.invalid,
+                "applied engine.data_worker_filters"
+            );
+        }
+    }
+
+    // Publish the worker_manager handle to the PeerInfo broadcaster.
+    // From this point on, every PeerInfo tick advertises a
+    // per-worker reachability for each running worker with a
+    // non-empty filter. Thread-mode workers (the default) share the
+    // master's addresses; process-mode workers (when
+    // `engine.data_worker_p2p_multiaddrs` or
+    // `engine.data_worker_stream_multiaddrs` is configured) advertise
+    // their own ports. See
+    // `quil_p2p::peer_info::build_worker_reachability` for the
+    // selection rules.
+    let _ = pi_worker_manager.set(worker_manager.clone());
 
     // Worker allocator — reconciles registry vs running workers
     let worker_allocator = Arc::new(quil_engine::worker_allocator::WorkerAllocator::new(
@@ -2561,6 +2652,75 @@ async fn run_master_node(
                 }
             });
             info!("periodic prover tree sync task spawned (5-minute interval)");
+        }
+
+        // Periodic archive-direct shard info refresh. Drives the
+        // lifecycle's `ProposeJoin`/`ProposeLeave` gate: until the
+        // first successful `GetAppShards` response lands, the
+        // lifecycle short-circuits all auto-pick paths. After that,
+        // every 60 frames (~10 min on mainnet) we refresh — frame-
+        // anchored so a stalled chain doesn't burn endpoints.
+        //
+        // Distinct from `LocalShardInfoProvider`'s dial-out fallback:
+        // that path is "try local first." For auto-allocation we
+        // require archive-sourced sizes because the local node may
+        // not have visibility into shards it isn't a member of.
+        {
+            let pool = archive_pool.clone();
+            let lifecycle = prover_lifecycle.clone();
+            let last_frame = last_received_frame.clone();
+            let cancel = token.clone();
+            let seed_for_refresh = seed;
+            tokio::spawn(async move {
+                const REFRESH_CADENCE_FRAMES: u64 = 60;
+                let mut last_refresh_frame: u64 = 0;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Skip,
+                );
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
+                    let now_frame = last_frame.load(std::sync::atomic::Ordering::Relaxed);
+                    let needs_initial = !lifecycle.shard_info_loaded();
+                    let cadence_due = last_refresh_frame > 0
+                        && now_frame >= last_refresh_frame + REFRESH_CADENCE_FRAMES;
+                    if !needs_initial && !cadence_due {
+                        continue;
+                    }
+                    match quil_rpc::fetch_shard_sizes_from_archive(
+                        &pool,
+                        &seed_for_refresh,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(sizes) => {
+                            let count = sizes.len();
+                            lifecycle.replace_shard_sizes(sizes);
+                            last_refresh_frame = now_frame.max(1);
+                            info!(
+                                shards = count,
+                                frame = now_frame,
+                                initial = needs_initial,
+                                "shard_info refresh: cache updated"
+                            );
+                        }
+                        Err(quil_rpc::ShardInfoRefreshError::PoolEmpty) => {
+                            // Archive pool not yet populated by PeerInfo
+                            // gossip — log at debug, retry next tick.
+                            tracing::debug!("shard_info refresh: archive pool empty, retrying");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "shard_info refresh failed (will retry)");
+                        }
+                    }
+                }
+                info!("shard_info refresh task stopped");
+            });
+            info!("shard_info refresh task spawned (frame-anchored, 60-frame cadence)");
         }
     } else {
         warn!("no Ed448 seed available — archive poller disabled (production archives require mTLS)");

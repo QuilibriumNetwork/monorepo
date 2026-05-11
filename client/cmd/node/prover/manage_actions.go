@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"sync"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
@@ -13,20 +15,50 @@ import (
 
 var globalDomain = bytes.Repeat([]byte{0xff}, 32)
 
+// rpcTimeout is the per-call deadline applied to every NodeService RPC
+// initiated by the TUI. Without this, a hung node would block the
+// corresponding tea command forever and the user would see no
+// feedback at all. Set generously — VDF-bearing operations like
+// RequestJoin can legitimately take a while on the server side.
+const rpcTimeout = 15 * time.Second
+
+// joinRpcTimeout is the longer ceiling specifically for RequestJoin,
+// which includes VDF computation on the node side.
+const joinRpcTimeout = 90 * time.Second
+
+// withTimeout returns a context with `rpcTimeout` plus its cancel fn.
+// Callers must defer the cancel fn.
+func withTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), rpcTimeout)
+}
+
+func withTimeoutD(d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), d)
+}
+
 // doJoin sends a RequestJoin RPC with one or more filters.
-// VDF computation happens on the node side and may take a long time.
+// VDF computation happens on the node side and may take a long time,
+// so a longer dedicated timeout applies (vs the default `rpcTimeout`).
+//
+// The returned `actionResultMsg` carries the raw filters so the
+// caller can hook the await-confirm loop just like Leave/Confirm/etc.
+// — RPC ack means "node accepted the request," not "alloc landed
+// on chain," and the await loop is what observes the latter.
 func doJoin(client protobufs.NodeServiceClient, filters [][]byte) tea.Cmd {
 	return func() tea.Msg {
+		ctx, cancel := withTimeoutD(joinRpcTimeout)
+		defer cancel()
 		_, err := client.RequestJoin(
-			context.Background(),
+			ctx,
 			&protobufs.RequestJoinRequest{
 				Filters: filters,
 			},
 		)
 		return actionResultMsg{
-			action: "Join",
-			filter: fmt.Sprintf("%d filter(s)", len(filters)),
-			err:    err,
+			action:     "Join",
+			filter:     fmt.Sprintf("%d filter(s)", len(filters)),
+			filtersRaw: filters,
+			err:        err,
 		}
 	}
 }
@@ -259,8 +291,10 @@ func doResume(client protobufs.NodeServiceClient, filter []byte, originalStatus 
 // doToggleManual sends a SetManuallyManaged RPC for the given worker.
 func doToggleManual(client protobufs.NodeServiceClient, coreId uint32, manual bool) tea.Cmd {
 	return func() tea.Msg {
+		ctx, cancel := withTimeout()
+		defer cancel()
 		_, err := client.SetManuallyManaged(
-			context.Background(),
+			ctx,
 			&protobufs.SetManuallyManagedRequest{
 				CoreId:          coreId,
 				ManuallyManaged: manual,
@@ -271,23 +305,54 @@ func doToggleManual(client protobufs.NodeServiceClient, coreId uint32, manual bo
 }
 
 // doMarkWorkersManual marks one or more workers as manually managed.
-// Fire-and-forget: the result message is handled silently.
+//
+// Parallelized — each worker gets its own goroutine with a bounded
+// context, so a single hung RPC doesn't serialize the batch. Returns
+// a per-worker failure list so the Update layer can surface partial
+// failures rather than just "first error" (which was lossy and gave
+// the user no idea which workers actually changed).
 func doMarkWorkersManual(client protobufs.NodeServiceClient, workerIDs []uint32) tea.Cmd {
 	return func() tea.Msg {
-		var firstErr error
+		type result struct {
+			id  uint32
+			err error
+		}
+		ch := make(chan result, len(workerIDs))
+		var wg sync.WaitGroup
 		for _, id := range workerIDs {
-			_, err := client.SetManuallyManaged(
-				context.Background(),
-				&protobufs.SetManuallyManagedRequest{
-					CoreId:          id,
-					ManuallyManaged: true,
-				},
-			)
-			if err != nil && firstErr == nil {
-				firstErr = err
+			wg.Add(1)
+			go func(id uint32) {
+				defer wg.Done()
+				ctx, cancel := withTimeout()
+				defer cancel()
+				_, err := client.SetManuallyManaged(
+					ctx,
+					&protobufs.SetManuallyManagedRequest{
+						CoreId:          id,
+						ManuallyManaged: true,
+					},
+				)
+				ch <- result{id: id, err: err}
+			}(id)
+		}
+		wg.Wait()
+		close(ch)
+
+		var failed []uint32
+		var firstErr error
+		for r := range ch {
+			if r.err != nil {
+				failed = append(failed, r.id)
+				if firstErr == nil {
+					firstErr = r.err
+				}
 			}
 		}
-		return markManualMsg{workerIDs: workerIDs, err: firstErr}
+		return markManualMsg{
+			workerIDs: workerIDs,
+			failedIDs: failed,
+			err:       firstErr,
+		}
 	}
 }
 
@@ -306,13 +371,22 @@ func sendAction(client protobufs.NodeServiceClient, prepared actionPreparedMsg) 
 	}
 }
 
-// checkAllocationStatus polls the node to see if ANY of the given filters
-// have changed from originalStatus.
+// checkAllocationStatus polls the node and returns a per-filter
+// outcome for every awaited filter. The caller (Update) aggregates
+// these across retries and decides when to surface
+// `actionConfirmedMsg`.
+//
+// Outcome rules per filter:
+//   - status == originalStatus → unsettled (will retry)
+//   - status != originalStatus → settled, outcome = status name
+//   - filter absent from allocations → settled, outcome = "Removed"
+//
+// On RPC error, returns `awaitResultMsg{err}` with no per-filter
+// data; the caller decides whether to retry or surface.
 func checkAllocationStatus(
 	client protobufs.NodeServiceClient,
 	action string,
-	filters [][]byte,
-	originalStatus uint32,
+	entries []awaitFilterEntry,
 ) tea.Cmd {
 	return func() tea.Msg {
 		nodeInfo, shardInfo, _, err := fetchRPCData(client)
@@ -325,56 +399,59 @@ func checkAllocationStatus(
 			currentFrame = shardInfo.GetFrameNumber()
 		}
 
-		// Check if at least one filter has changed status.
-		for _, filter := range filters {
-			for _, alloc := range nodeInfo.GetShardAllocations() {
-				if !bytes.Equal(alloc.GetFilter(), filter) {
-					continue
-				}
-				if alloc.GetStatus() != originalStatus {
-					newName, ok := allocationStatusNames[alloc.GetStatus()]
-					if !ok {
-						newName = fmt.Sprintf("Unknown(%d)", alloc.GetStatus())
-					}
-					return actionConfirmedMsg{
-						action:    action,
-						filter:    truncHex(hex.EncodeToString(filter)),
-						newStatus: newName,
-						frame:     currentFrame,
-					}
-				}
-			}
-		}
-
-		// All filters still have original status (or were removed).
-		// Check if any were removed entirely.
-		allocByFilter := make(map[string]bool)
+		// Index current allocations by filter for O(N) per-filter
+		// resolution rather than the prior O(N*M) nested loop.
+		byFilter := make(
+			map[string]*protobufs.ShardAllocationInfo, len(nodeInfo.GetShardAllocations()),
+		)
 		for _, alloc := range nodeInfo.GetShardAllocations() {
-			allocByFilter[hex.EncodeToString(alloc.GetFilter())] = true
-		}
-		for _, filter := range filters {
-			if !allocByFilter[hex.EncodeToString(filter)] {
-				return actionConfirmedMsg{
-					action:    action,
-					filter:    truncHex(hex.EncodeToString(filter)),
-					newStatus: "Removed",
-					frame:     currentFrame,
-				}
-			}
+			byFilter[hex.EncodeToString(alloc.GetFilter())] = alloc
 		}
 
+		outcomes := make([]filterOutcome, 0, len(entries))
+		for _, e := range entries {
+			key := hex.EncodeToString(e.filter)
+			alloc, present := byFilter[key]
+			switch {
+			case !present:
+				outcomes = append(outcomes, filterOutcome{
+					filter:  e.filter,
+					outcome: "Removed",
+					settled: true,
+				})
+			case alloc.GetStatus() != e.originalStatus:
+				name, ok := allocationStatusNames[alloc.GetStatus()]
+				if !ok {
+					name = fmt.Sprintf("Unknown(%d)", alloc.GetStatus())
+				}
+				outcomes = append(outcomes, filterOutcome{
+					filter:  e.filter,
+					outcome: name,
+					settled: true,
+				})
+			default:
+				outcomes = append(outcomes, filterOutcome{
+					filter:  e.filter,
+					settled: false,
+				})
+			}
+		}
 		return awaitResultMsg{
 			action:    action,
-			unchanged: true,
 			frame:     currentFrame,
+			perFilter: outcomes,
 		}
 	}
 }
 
 // getFrameNumber fetches the current frame number from the node.
+// Uses a bounded context so a hung node fails fast instead of
+// freezing the dispatching tea command.
 func getFrameNumber(client protobufs.NodeServiceClient) (uint64, error) {
+	ctx, cancel := withTimeout()
+	defer cancel()
 	info, err := client.GetShardInfo(
-		context.Background(),
+		ctx,
 		&protobufs.GetShardInfoRequest{},
 	)
 	if err != nil {

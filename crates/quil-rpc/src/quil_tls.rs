@@ -365,11 +365,10 @@ mod tests {
 
     fn cert_der_from_seed(seed: &[u8; 57]) -> Vec<u8> {
         let tls = build_quil_tls_cert(seed).unwrap();
-        rustls_pemfile::certs(&mut tls.cert_pem.as_bytes())
-            .next()
-            .unwrap()
-            .unwrap()
-            .to_vec()
+        let pem = tls.cert_pem.clone();
+        let mut reader = pem.as_bytes();
+        let cert = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+        cert.to_vec()
     }
 
     #[test]

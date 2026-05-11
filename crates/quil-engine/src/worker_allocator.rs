@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use quil_types::consensus::{ProverRegistry, ProverStatus};
 use quil_types::error::Result;
@@ -16,6 +16,174 @@ use quil_types::error::Result;
 use crate::worker::WorkerManager;
 #[cfg(test)]
 use crate::worker::WorkerInfo;
+
+// =====================================================================
+// Config-driven static filter pinning
+// =====================================================================
+
+/// Result of applying `engine.data_worker_filters` from config.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConfigFilterApplyStats {
+    /// Workers we successfully pinned + marked manually_managed.
+    pub applied: usize,
+    /// Slots skipped because the worker already had a non-empty filter
+    /// (persisted state from a prior gRPC edit takes precedence).
+    pub skipped_existing: usize,
+    /// Slots skipped because no worker exists at that core_id (more
+    /// filters than worker threads).
+    pub skipped_missing_core: usize,
+    /// Entries skipped because they were empty or whitespace.
+    pub skipped_empty: usize,
+    /// Entries skipped because hex decode failed.
+    pub invalid: usize,
+}
+
+/// Apply `engine.data_worker_filters` to the worker manager. Each
+/// entry is a hex string (with optional `0x` prefix); index `i` in the
+/// array maps to `core_id = i + 1` (core 0 is the master).
+///
+/// Behavior:
+///
+/// - Empty / whitespace entries are skipped — they encode "operator
+///   deliberately wants worker (i+1) left idle / auto-managed."
+/// - Invalid hex is logged and counted as `invalid`. Decoding is
+///   tolerant: leading `0x` (any case) is stripped first.
+/// - If no worker exists at `core_id` (the operator declared more
+///   filters than CPU cores), the entry is skipped with a warning.
+/// - **Persisted state wins**: if a worker already has a non-empty
+///   `filter` (restored from the worker store from a prior gRPC edit,
+///   or already pinned by some earlier startup step), config does NOT
+///   override it. This means an operator who flipped the assignment
+///   via `NodeService::set_manually_managed` + `request_join` keeps
+///   their runtime decision across restarts.
+/// - Otherwise: pin the filter with `set_worker_filter(core_id,
+///   filter, start_consensus=false)` and mark the worker
+///   `manually_managed=true`. `start_consensus=false` because we
+///   don't yet know whether a matching registry allocation exists —
+///   the auto-allocator will start the consensus engine when it
+///   observes the alloc transition to Active.
+///
+/// **NOTE on parity with Go.** Go's reference uses
+/// `engine.DataWorkerFilters` only to build per-shard PeerInfo
+/// reachability advertisements (see
+/// `node/consensus/global/global_consensus_engine.go:1596-1610`). Worker
+/// allocation in Go comes from the prover registry alone. This Rust
+/// behavior is an *extension* — operators who set
+/// `dataWorkerFilters` in YAML get declarative worker→filter pinning
+/// in addition to the PeerInfo advertisement role. Both behaviors
+/// share the same config field but are wired independently. (PeerInfo
+/// integration of `data_worker_filters` is a separate, currently
+/// unwired gap.)
+pub fn apply_config_worker_filters(
+    worker_manager: &dyn WorkerManager,
+    config_filters: &[String],
+) -> ConfigFilterApplyStats {
+    let mut stats = ConfigFilterApplyStats::default();
+
+    if config_filters.is_empty() {
+        return stats;
+    }
+
+    // Snapshot current worker state (post-persisted-restore,
+    // post-pre-allocation). We read once instead of per-iteration to
+    // avoid a race where a concurrent reconcile mutates the workers
+    // mid-pass; the startup ordering already guarantees the
+    // allocator's reconcile loop hasn't started, but this is also
+    // simpler and cheaper.
+    let current: HashMap<u32, Vec<u8>> = match worker_manager.range_workers() {
+        Ok(v) => v.into_iter().map(|w| (w.core_id, w.filter)).collect(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "apply_config_worker_filters: range_workers failed; aborting"
+            );
+            return stats;
+        }
+    };
+
+    for (i, hex_str) in config_filters.iter().enumerate() {
+        let trimmed = hex_str.trim();
+        let stripped = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        if stripped.is_empty() {
+            stats.skipped_empty += 1;
+            continue;
+        }
+
+        let filter_bytes = match hex::decode(stripped) {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => {
+                // Decoded successfully to zero bytes — treat as empty.
+                stats.skipped_empty += 1;
+                continue;
+            }
+            Err(e) => {
+                stats.invalid += 1;
+                warn!(
+                    index = i,
+                    value = %hex_str,
+                    error = %e,
+                    "data_worker_filters: invalid hex; skipping"
+                );
+                continue;
+            }
+        };
+
+        let core_id = (i as u32) + 1;
+        let Some(existing) = current.get(&core_id) else {
+            stats.skipped_missing_core += 1;
+            warn!(
+                index = i,
+                core_id,
+                "data_worker_filters: no worker at core_id; skipping (more filters than CPU cores?)"
+            );
+            continue;
+        };
+
+        if !existing.is_empty() {
+            stats.skipped_existing += 1;
+            debug!(
+                core_id,
+                existing_filter = hex::encode(existing),
+                config_filter = hex::encode(&filter_bytes),
+                "data_worker_filters: worker already has a filter; persisted state wins"
+            );
+            continue;
+        }
+
+        // `start_consensus=false`: don't spin up the AppConsensusEngine
+        // yet. The auto-allocator's first reconcile pass will start
+        // the engine when it observes the registry alloc for this
+        // filter transition to Active.
+        if let Err(e) = worker_manager.set_worker_filter(core_id, &filter_bytes, false) {
+            warn!(
+                core_id,
+                error = %e,
+                "data_worker_filters: set_worker_filter failed; skipping"
+            );
+            continue;
+        }
+        if let Err(e) = worker_manager.set_manually_managed(core_id, true) {
+            warn!(
+                core_id,
+                error = %e,
+                "data_worker_filters: set_manually_managed failed (filter still pinned)"
+            );
+            // Don't bail out — the filter pin succeeded; the manual
+            // flag is best-effort. Operator can re-flip via gRPC.
+        }
+        stats.applied += 1;
+        info!(
+            core_id,
+            filter = hex::encode(&filter_bytes),
+            "data_worker_filters: pinned worker to declared filter (manually_managed=true)"
+        );
+    }
+
+    stats
+}
 
 /// Proposal never landed in the registry within this many frames → clear.
 pub const PROPOSAL_TIMEOUT_FRAMES: u64 = 10;
@@ -467,8 +635,14 @@ mod tests {
     use quil_types::consensus::*;
     use std::sync::Mutex;
 
+    #[derive(Default)]
+    struct MockWorkerState {
+        filter: Vec<u8>,
+        manually_managed: bool,
+    }
+
     struct MockWorkerManager {
-        workers: Mutex<HashMap<u32, Vec<u8>>>,
+        workers: Mutex<HashMap<u32, MockWorkerState>>,
     }
 
     impl MockWorkerManager {
@@ -486,10 +660,9 @@ mod tests {
             filter: &[u8],
             _start_consensus: bool,
         ) -> Result<()> {
-            self.workers
-                .lock()
-                .unwrap()
-                .insert(core_id, filter.to_vec());
+            let mut workers = self.workers.lock().unwrap();
+            let entry = workers.entry(core_id).or_default();
+            entry.filter = filter.to_vec();
             Ok(())
         }
 
@@ -508,20 +681,27 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(&id, f)| WorkerInfo {
+                .map(|(&id, w)| WorkerInfo {
                     core_id: id,
-                    filter: f.clone(),
+                    filter: w.filter.clone(),
                     available_storage: 0,
                     total_storage: 0,
-                    manually_managed: false,
+                    manually_managed: w.manually_managed,
                     pending_filter_frame: 0,
-                    allocated: !f.is_empty(),
+                    allocated: !w.filter.is_empty(),
                 })
                 .collect())
         }
 
         fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
             self.allocate_worker(core_id, filter)
+        }
+
+        fn set_manually_managed(&self, core_id: u32, manually_managed: bool) -> Result<()> {
+            let mut workers = self.workers.lock().unwrap();
+            let entry = workers.entry(core_id).or_default();
+            entry.manually_managed = manually_managed;
+            Ok(())
         }
     }
 
@@ -641,5 +821,155 @@ mod tests {
 
         // Worker should have been deallocated
         assert!(wm.range_workers().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // apply_config_worker_filters
+    // -----------------------------------------------------------------
+
+    fn find_worker(wm: &MockWorkerManager, core_id: u32) -> WorkerInfo {
+        wm.range_workers()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.core_id == core_id)
+            .expect("worker not found")
+    }
+
+    #[test]
+    fn apply_config_worker_filters_empty_config_is_noop() {
+        let wm = MockWorkerManager::new();
+        wm.allocate_worker(1, &[]).unwrap();
+
+        let stats = apply_config_worker_filters(&wm, &[]);
+        assert_eq!(stats, ConfigFilterApplyStats::default());
+
+        let w = find_worker(&wm, 1);
+        assert!(w.filter.is_empty());
+        assert!(!w.manually_managed);
+    }
+
+    #[test]
+    fn apply_config_worker_filters_pins_idle_workers_with_manual_flag() {
+        let wm = MockWorkerManager::new();
+        wm.allocate_worker(1, &[]).unwrap();
+        wm.allocate_worker(2, &[]).unwrap();
+        wm.allocate_worker(3, &[]).unwrap();
+
+        // Index 0 -> core 1, index 1 -> core 2, index 2 (empty) -> skip.
+        let cfg = vec![
+            "0xaabbccdd".into(),
+            "11223344".into(),
+            "".into(),
+        ];
+
+        let stats = apply_config_worker_filters(&wm, &cfg);
+        assert_eq!(stats.applied, 2);
+        assert_eq!(stats.skipped_empty, 1);
+        assert_eq!(stats.skipped_existing, 0);
+        assert_eq!(stats.skipped_missing_core, 0);
+        assert_eq!(stats.invalid, 0);
+
+        let w1 = find_worker(&wm, 1);
+        assert_eq!(w1.filter, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        assert!(w1.manually_managed);
+
+        let w2 = find_worker(&wm, 2);
+        assert_eq!(w2.filter, vec![0x11, 0x22, 0x33, 0x44]);
+        assert!(w2.manually_managed);
+
+        let w3 = find_worker(&wm, 3);
+        assert!(w3.filter.is_empty());
+        assert!(!w3.manually_managed);
+    }
+
+    #[test]
+    fn apply_config_worker_filters_persisted_state_wins_over_config() {
+        let wm = MockWorkerManager::new();
+        // Core 1 was already pinned (persisted-restore happened
+        // before this call). Operator's gRPC-driven assignment should
+        // survive a YAML override.
+        wm.allocate_worker(1, &[0xDE, 0xAD]).unwrap();
+        wm.allocate_worker(2, &[]).unwrap();
+
+        let cfg = vec!["0xbeef".into(), "0xcafe".into()];
+        let stats = apply_config_worker_filters(&wm, &cfg);
+        assert_eq!(stats.applied, 1, "only core 2 should apply");
+        assert_eq!(stats.skipped_existing, 1);
+
+        let w1 = find_worker(&wm, 1);
+        assert_eq!(w1.filter, vec![0xDE, 0xAD], "core 1 unchanged");
+        assert!(!w1.manually_managed, "core 1 manual flag untouched");
+
+        let w2 = find_worker(&wm, 2);
+        assert_eq!(w2.filter, vec![0xCA, 0xFE]);
+        assert!(w2.manually_managed);
+    }
+
+    #[test]
+    fn apply_config_worker_filters_skips_missing_cores() {
+        let wm = MockWorkerManager::new();
+        wm.allocate_worker(1, &[]).unwrap();
+
+        // 3 filters but only 1 worker -> 2 skipped_missing_core.
+        let cfg = vec!["aa".into(), "bb".into(), "cc".into()];
+        let stats = apply_config_worker_filters(&wm, &cfg);
+        assert_eq!(stats.applied, 1);
+        assert_eq!(stats.skipped_missing_core, 2);
+
+        let w1 = find_worker(&wm, 1);
+        assert_eq!(w1.filter, vec![0xAA]);
+    }
+
+    #[test]
+    fn apply_config_worker_filters_invalid_hex_is_counted_and_logged() {
+        let wm = MockWorkerManager::new();
+        wm.allocate_worker(1, &[]).unwrap();
+        wm.allocate_worker(2, &[]).unwrap();
+
+        let cfg = vec!["not hex at all".into(), "bb".into()];
+        let stats = apply_config_worker_filters(&wm, &cfg);
+        assert_eq!(stats.applied, 1, "core 2 still pins");
+        assert_eq!(stats.invalid, 1);
+
+        let w1 = find_worker(&wm, 1);
+        assert!(w1.filter.is_empty(), "invalid entry leaves core 1 idle");
+        assert!(!w1.manually_managed);
+
+        let w2 = find_worker(&wm, 2);
+        assert_eq!(w2.filter, vec![0xBB]);
+        assert!(w2.manually_managed);
+    }
+
+    #[test]
+    fn apply_config_worker_filters_strips_0x_prefix_case_insensitive() {
+        let wm = MockWorkerManager::new();
+        wm.allocate_worker(1, &[]).unwrap();
+        wm.allocate_worker(2, &[]).unwrap();
+        wm.allocate_worker(3, &[]).unwrap();
+
+        let cfg = vec![
+            "0xab".into(),
+            "0XCD".into(),
+            "ef".into(),
+        ];
+        let stats = apply_config_worker_filters(&wm, &cfg);
+        assert_eq!(stats.applied, 3);
+
+        assert_eq!(find_worker(&wm, 1).filter, vec![0xAB]);
+        assert_eq!(find_worker(&wm, 2).filter, vec![0xCD]);
+        assert_eq!(find_worker(&wm, 3).filter, vec![0xEF]);
+    }
+
+    #[test]
+    fn apply_config_worker_filters_whitespace_only_entry_is_empty() {
+        let wm = MockWorkerManager::new();
+        wm.allocate_worker(1, &[]).unwrap();
+
+        let cfg = vec!["   ".into()];
+        let stats = apply_config_worker_filters(&wm, &cfg);
+        assert_eq!(stats.applied, 0);
+        assert_eq!(stats.skipped_empty, 1);
+
+        assert!(find_worker(&wm, 1).filter.is_empty());
     }
 }

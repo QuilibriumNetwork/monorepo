@@ -68,8 +68,10 @@ func getNodeClient() (protobufs.NodeServiceClient, *grpc.ClientConn, error) {
 // workerByFilter calls GetWorkerInfo and returns a map from hex-encoded filter
 // to core_id. Returns an empty map on error.
 func workerByFilter(client protobufs.NodeServiceClient) map[string]uint32 {
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancel()
 	resp, err := client.GetWorkerInfo(
-		context.Background(),
+		ctx,
 		&protobufs.GetWorkerInfoRequest{},
 	)
 	m := make(map[string]uint32)
@@ -115,8 +117,14 @@ func sendProverMessage(
 		return errors.Wrap(err, "send prover message: sign")
 	}
 
+	// Bounded context — Send can be expensive (signature verification
+	// + BlossomSub publish chain on the node side) but should not be
+	// open-ended; a hung node would otherwise freeze the TUI's
+	// broadcast step indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancel()
 	_, err = client.Send(
-		context.Background(),
+		ctx,
 		&protobufs.SendRequest{
 			Domain:         domain,
 			Request:        bundle,

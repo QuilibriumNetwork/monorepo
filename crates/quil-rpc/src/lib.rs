@@ -12,10 +12,12 @@ pub mod prover_counts;
 pub mod proxy_pubsub;
 pub mod pubsub_proxy;
 pub mod quil_tls;
+pub mod shard_info_refresh;
 pub mod stub_services;
 
 pub use archive_client::{ArchiveClient, ArchiveClientError};
 pub use frame_sync::{spawn_archive_poller, ArchiveEndpointPool, ArchivePollerConfig};
+pub use shard_info_refresh::{fetch_shard_sizes_from_archive, ShardInfoRefreshError};
 pub use global_service::{FrameLookup, GlobalRpcServer, SubmitHandler};
 pub use hypergraph_sync_probe::{
     build_local_tree_with_handle, encode_shard_key, ensure_prover_tree, ensure_prover_tree_fresh,

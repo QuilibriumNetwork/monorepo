@@ -83,6 +83,87 @@ pub struct CanonicalCapability {
     pub additional_metadata: Vec<u8>,
 }
 
+/// Build per-worker `Reachability` records to attach to a published
+/// `PeerInfo`. One record per `(core_id, filter)` pair with a
+/// non-empty filter.
+///
+/// Mode selection (mirrors Go's `workerPatterns()` at
+/// `node/consensus/global/global_consensus_engine.go:1585-1647`):
+///
+/// - **Process mode** — if either `worker_p2p_multiaddrs` or
+///   `worker_stream_multiaddrs` contains a non-empty entry, the node
+///   is running workers as separate processes with their own ports.
+///   For each worker, the reachability uses that worker's own
+///   addresses: announce variant first (`worker_announce_p2p[i]` /
+///   `worker_announce_stream[i]`), then listen variant
+///   (`worker_p2p_multiaddrs[i]` / `worker_stream_multiaddrs[i]`),
+///   then falling back to master's addresses if neither is set for
+///   that index.
+///
+/// - **Thread mode** — otherwise, workers run as in-process tokio
+///   tasks sharing the master's BlossomSub instance. Each worker's
+///   reachability uses the master's `pubsub_addr` and `stream_addrs`
+///   verbatim; only the filter varies. This is the default for the
+///   Rust port.
+///
+/// Index `i` into the per-worker config arrays corresponds to
+/// `core_id = i + 1` (core 0 is reserved for the master). Workers with
+/// an empty filter are skipped (idle workers don't advertise).
+pub fn build_worker_reachability(
+    workers: &[(u32, Vec<u8>)],
+    master_pubsub_addr: &str,
+    master_stream_addrs: &[String],
+    worker_p2p_multiaddrs: &[String],
+    worker_stream_multiaddrs: &[String],
+    worker_announce_p2p: &[String],
+    worker_announce_stream: &[String],
+) -> Vec<CanonicalReachability> {
+    let process_mode = worker_p2p_multiaddrs.iter().any(|s| !s.is_empty())
+        || worker_stream_multiaddrs.iter().any(|s| !s.is_empty());
+
+    let mut out = Vec::with_capacity(workers.len());
+    for (core_id, filter) in workers {
+        if filter.is_empty() {
+            continue;
+        }
+        let idx = (*core_id as usize).saturating_sub(1);
+
+        let (pubsub_addrs, stream_addrs) = if process_mode {
+            let pubsub = worker_announce_p2p
+                .get(idx)
+                .filter(|s| !s.is_empty())
+                .or_else(|| worker_p2p_multiaddrs.get(idx).filter(|s| !s.is_empty()))
+                .cloned()
+                .unwrap_or_else(|| master_pubsub_addr.to_string());
+
+            // Stream: explicit announce > explicit listen > master fallback.
+            let stream_addr = worker_announce_stream
+                .get(idx)
+                .filter(|s| !s.is_empty())
+                .or_else(|| worker_stream_multiaddrs.get(idx).filter(|s| !s.is_empty()))
+                .cloned();
+
+            let stream_vec = match stream_addr {
+                Some(s) => vec![s],
+                None => master_stream_addrs.to_vec(),
+            };
+            (vec![pubsub], stream_vec)
+        } else {
+            (
+                vec![master_pubsub_addr.to_string()],
+                master_stream_addrs.to_vec(),
+            )
+        };
+
+        out.push(CanonicalReachability {
+            filter: filter.clone(),
+            pubsub_multiaddrs: pubsub_addrs,
+            stream_multiaddrs: stream_addrs,
+        });
+    }
+    out
+}
+
 /// Decode a `PeerInfo` from the canonical big-endian format used by Go's
 /// `protobufs.PeerInfo.ToCanonicalBytes()`.
 pub fn decode_canonical_peer_info(data: &[u8]) -> Result<CanonicalPeerInfo> {
@@ -776,5 +857,217 @@ mod tests {
             }
             other => panic!("expected PeerInfo, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // build_worker_reachability
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn worker_reachability_thread_mode_repeats_master_addrs() {
+        let workers = vec![
+            (1u32, vec![0xAA; 32]),
+            (2u32, vec![0xBB; 32]),
+        ];
+        let master_pubsub = "/ip4/1.2.3.4/udp/8336/quic-v1";
+        let master_stream = vec!["/ip4/1.2.3.4/tcp/8340".to_string()];
+
+        let r = build_worker_reachability(
+            &workers,
+            master_pubsub,
+            &master_stream,
+            &[], // no worker-specific p2p multiaddrs -> thread mode
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].filter, vec![0xAA; 32]);
+        assert_eq!(
+            r[0].pubsub_multiaddrs,
+            vec!["/ip4/1.2.3.4/udp/8336/quic-v1".to_string()]
+        );
+        assert_eq!(
+            r[0].stream_multiaddrs,
+            vec!["/ip4/1.2.3.4/tcp/8340".to_string()]
+        );
+        assert_eq!(r[1].filter, vec![0xBB; 32]);
+        assert_eq!(r[1].pubsub_multiaddrs, r[0].pubsub_multiaddrs);
+        assert_eq!(r[1].stream_multiaddrs, r[0].stream_multiaddrs);
+    }
+
+    #[test]
+    fn worker_reachability_process_mode_uses_per_worker_addrs() {
+        let workers = vec![
+            (1u32, vec![0xAA; 32]),
+            (2u32, vec![0xBB; 32]),
+        ];
+        let master_pubsub = "/ip4/1.2.3.4/udp/8336/quic-v1";
+        let master_stream = vec!["/ip4/1.2.3.4/tcp/8340".to_string()];
+        let worker_p2p = vec![
+            "/ip4/10.0.0.1/udp/25000/quic-v1".to_string(),
+            "/ip4/10.0.0.1/udp/25001/quic-v1".to_string(),
+        ];
+        let worker_stream = vec![
+            "/ip4/10.0.0.1/tcp/32500".to_string(),
+            "/ip4/10.0.0.1/tcp/32501".to_string(),
+        ];
+
+        let r = build_worker_reachability(
+            &workers,
+            master_pubsub,
+            &master_stream,
+            &worker_p2p,
+            &worker_stream,
+            &[],
+            &[],
+        );
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            r[0].pubsub_multiaddrs,
+            vec!["/ip4/10.0.0.1/udp/25000/quic-v1".to_string()]
+        );
+        assert_eq!(
+            r[0].stream_multiaddrs,
+            vec!["/ip4/10.0.0.1/tcp/32500".to_string()]
+        );
+        assert_eq!(
+            r[1].pubsub_multiaddrs,
+            vec!["/ip4/10.0.0.1/udp/25001/quic-v1".to_string()]
+        );
+        assert_eq!(
+            r[1].stream_multiaddrs,
+            vec!["/ip4/10.0.0.1/tcp/32501".to_string()]
+        );
+    }
+
+    #[test]
+    fn worker_reachability_process_mode_announce_overrides_listen() {
+        let workers = vec![(1u32, vec![0xAA; 32])];
+        let master_pubsub = "/ip4/1.2.3.4/udp/8336/quic-v1";
+        let master_stream = vec!["/ip4/1.2.3.4/tcp/8340".to_string()];
+        let worker_p2p = vec!["/ip4/10.0.0.1/udp/25000/quic-v1".to_string()];
+        let worker_stream = vec!["/ip4/10.0.0.1/tcp/32500".to_string()];
+        let worker_announce_p2p = vec!["/ip4/203.0.113.1/udp/25000/quic-v1".to_string()];
+        let worker_announce_stream = vec!["/ip4/203.0.113.1/tcp/32500".to_string()];
+
+        let r = build_worker_reachability(
+            &workers,
+            master_pubsub,
+            &master_stream,
+            &worker_p2p,
+            &worker_stream,
+            &worker_announce_p2p,
+            &worker_announce_stream,
+        );
+        assert_eq!(
+            r[0].pubsub_multiaddrs,
+            vec!["/ip4/203.0.113.1/udp/25000/quic-v1".to_string()]
+        );
+        assert_eq!(
+            r[0].stream_multiaddrs,
+            vec!["/ip4/203.0.113.1/tcp/32500".to_string()]
+        );
+    }
+
+    #[test]
+    fn worker_reachability_process_mode_missing_index_falls_back_to_master() {
+        // Worker at core_id=3 but only 2 entries in the config arrays.
+        // Should fall back to master's addresses.
+        let workers = vec![(3u32, vec![0xCC; 32])];
+        let master_pubsub = "/ip4/1.2.3.4/udp/8336/quic-v1";
+        let master_stream = vec!["/ip4/1.2.3.4/tcp/8340".to_string()];
+        let worker_p2p = vec![
+            "/ip4/10.0.0.1/udp/25000/quic-v1".to_string(),
+            "/ip4/10.0.0.1/udp/25001/quic-v1".to_string(),
+        ];
+        let worker_stream = vec![
+            "/ip4/10.0.0.1/tcp/32500".to_string(),
+            "/ip4/10.0.0.1/tcp/32501".to_string(),
+        ];
+
+        let r = build_worker_reachability(
+            &workers,
+            master_pubsub,
+            &master_stream,
+            &worker_p2p,
+            &worker_stream,
+            &[],
+            &[],
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r[0].pubsub_multiaddrs,
+            vec!["/ip4/1.2.3.4/udp/8336/quic-v1".to_string()]
+        );
+        assert_eq!(
+            r[0].stream_multiaddrs,
+            vec!["/ip4/1.2.3.4/tcp/8340".to_string()]
+        );
+    }
+
+    #[test]
+    fn worker_reachability_skips_empty_filters() {
+        let workers = vec![
+            (1u32, vec![]),         // idle
+            (2u32, vec![0xBB; 32]), // active
+            (3u32, vec![]),         // idle
+        ];
+        let master_pubsub = "/ip4/1.2.3.4/udp/8336/quic-v1";
+        let master_stream = vec!["/ip4/1.2.3.4/tcp/8340".to_string()];
+
+        let r = build_worker_reachability(
+            &workers,
+            master_pubsub,
+            &master_stream,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(r.len(), 1, "only the active worker should be advertised");
+        assert_eq!(r[0].filter, vec![0xBB; 32]);
+    }
+
+    #[test]
+    fn worker_reachability_empty_workers_returns_empty() {
+        let r = build_worker_reachability(
+            &[],
+            "/ip4/1.2.3.4/udp/8336/quic-v1",
+            &["/ip4/1.2.3.4/tcp/8340".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn worker_reachability_partial_per_worker_only_p2p_triggers_process_mode() {
+        // Edge: only stream_multiaddrs is non-empty. Should still be
+        // process mode (Go behavior at global_consensus_engine.go:1613).
+        let workers = vec![(1u32, vec![0xAA; 32])];
+        let master_pubsub = "/ip4/1.2.3.4/udp/8336/quic-v1";
+        let master_stream = vec!["/ip4/1.2.3.4/tcp/8340".to_string()];
+
+        let r = build_worker_reachability(
+            &workers,
+            master_pubsub,
+            &master_stream,
+            &[], // p2p empty
+            &["/ip4/10.0.0.1/tcp/32500".to_string()], // stream non-empty -> process mode
+            &[],
+            &[],
+        );
+        // p2p falls back to master because the per-worker p2p is empty.
+        assert_eq!(
+            r[0].pubsub_multiaddrs,
+            vec!["/ip4/1.2.3.4/udp/8336/quic-v1".to_string()]
+        );
+        assert_eq!(
+            r[0].stream_multiaddrs,
+            vec!["/ip4/10.0.0.1/tcp/32500".to_string()]
+        );
     }
 }

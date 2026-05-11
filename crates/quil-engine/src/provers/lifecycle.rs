@@ -185,6 +185,17 @@ pub struct ProverLifecycle {
     /// global filter, which is explicitly skipped, so no joins
     /// are ever proposed.
     shards_store: RwLock<Option<Arc<dyn quil_types::store::ShardsStore>>>,
+    /// Set to true after the first successful `GetAppShards` refresh.
+    /// Gates `ProposeJoin` and `ProposeLeave`: the lifecycle must not
+    /// auto-pick shards while it lacks any remote-sourced size data,
+    /// because picking on a default-zero or registry-derived guess
+    /// produces low-quality decisions. Local-only sources (registry
+    /// summaries, shards-store) populate `shard_sizes_by_filter`
+    /// independently but do NOT flip this flag — only a successful
+    /// archive fetch via `replace_shard_sizes` does. Confirm / leave-
+    /// confirm / seniority-merge paths run regardless of this gate
+    /// since they depend on local pending state, not shard sizes.
+    shard_info_loaded: AtomicBool,
 }
 
 impl ProverLifecycle {
@@ -206,6 +217,7 @@ impl ProverLifecycle {
             shard_sizes_by_filter: RwLock::new(HashMap::new()),
             confirm_window_frames: AtomicU64::new(DEFAULT_CONFIRM_WINDOW_FRAMES),
             shards_store: RwLock::new(None),
+            shard_info_loaded: AtomicBool::new(false),
         }
     }
 
@@ -244,10 +256,40 @@ impl ProverLifecycle {
     /// the resulting `filter → size` map here. Without this, the
     /// proposer falls back to the registry's prover-count proxy and
     /// reward scoring diverges from Go.
+    ///
+    /// **Does NOT flip `shard_info_loaded`** — this is the local-only
+    /// path (shards-store + registry summaries). To unblock the
+    /// `ProposeJoin` / `ProposeLeave` gate, call `replace_shard_sizes`
+    /// after a successful remote `GetAppShards` fetch.
     pub fn set_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
         if let Ok(mut guard) = self.shard_sizes_by_filter.write() {
             *guard = sizes;
         }
+    }
+
+    /// Replace the per-shard size map with the result of a successful
+    /// remote `GetAppShards` fetch and flip `shard_info_loaded` to
+    /// true. After the first successful call, `ProposeJoin` and
+    /// `ProposeLeave` are eligible to fire.
+    ///
+    /// Missing-from-refresh filters are dropped: the entire cache is
+    /// replaced atomically with the fresh map. Callers that want to
+    /// preserve previously-known sizes for filters absent in the
+    /// refresh response must merge before calling this.
+    pub fn replace_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
+        if let Ok(mut guard) = self.shard_sizes_by_filter.write() {
+            *guard = sizes;
+        }
+        self.shard_info_loaded.store(true, Ordering::Relaxed);
+    }
+
+    /// True once the lifecycle has successfully consumed at least one
+    /// remote `GetAppShards` response. Until this is set,
+    /// `ProposeJoin` and `ProposeLeave` paths short-circuit (no
+    /// auto-pick decisions). Used both as the gate inside `evaluate`
+    /// and exposed for observability.
+    pub fn shard_info_loaded(&self) -> bool {
+        self.shard_info_loaded.load(Ordering::Relaxed)
     }
 
     /// Mark initial sync as complete. Proposals are gated on this.
@@ -648,6 +690,22 @@ impl ProverLifecycle {
         // evaluate so both propose paths see the same decision.
         let (can_propose, skip_reason) = self.join_proposal_ready(frame_number);
 
+        // Remote `GetAppShards` gate. Auto-pick decisions (join,
+        // surplus-leave, score-leave) require shard size data sourced
+        // from an archive — local registry summaries and the local
+        // shards-store are NOT authoritative for this purpose. Until
+        // we've consumed at least one successful `GetAppShards`
+        // refresh, all propose paths short-circuit. Confirm/leave-
+        // confirm and seniority-merge paths run regardless since
+        // they depend on local pending state, not shard sizes.
+        let shard_info_ready = self.shard_info_loaded();
+        if !shard_info_ready {
+            tracing::debug!(
+                frame = frame_number,
+                "deferring auto-allocation: no remote GetAppShards data yet"
+            );
+        }
+
         let mut actions: Vec<LifecycleAction> = Vec::new();
         let mut join_proposed_this_cycle = false;
 
@@ -736,7 +794,7 @@ impl ProverLifecycle {
         // Surplus-active leave: proactively shed the worst-scoring
         // active filters when count exceeds auto-managed worker
         // capacity. Shares the join cooldown.
-        if !active_filters.is_empty() && !join_proposed_this_cycle {
+        if shard_info_ready && !active_filters.is_empty() && !join_proposed_this_cycle {
             let surplus = self.select_excess_active_filters(
                 &active_filters,
                 &workers,
@@ -791,7 +849,7 @@ impl ProverLifecycle {
         //    Mirrors worker_allocator.go:210-247. Pure score-driven —
         //    Go has no halt-risk override; coverage halts are handled
         //    upstream by the coverage monitor's halt-grace logic.
-        if !proposal_descriptors.is_empty() && allow_proposals {
+        if shard_info_ready && !proposal_descriptors.is_empty() && allow_proposals {
             // Operator-visibility pass: the proposer only sees what
             // ends up in `proposal_descriptors`. Halt-risk shards we
             // are already on (skipped in `build_proposal_descriptors`
@@ -887,6 +945,14 @@ impl ProverLifecycle {
 
         // 2) DecideJoins — independent of cooldown. Matches
         //    worker_allocator.go:268-297.
+        //
+        // Bucketed by mode: filters bound to manually_managed workers
+        // are confirmed at window-maturity regardless of score; if
+        // there are more manual-bound pending allocs than available
+        // workers, the excess is rejected on capacity grounds only
+        // (no score-based reject). Filters bound to auto workers or
+        // currently unbound flow through the existing score-driven
+        // `decide_joins` against the remaining capacity.
         let confirm_window = self.confirm_window_frames();
         let ready_join_filters: Vec<Vec<u8>> = joining_filters.iter()
             .filter(|(_, jf)| frame_number >= *jf + confirm_window)
@@ -894,13 +960,17 @@ impl ProverLifecycle {
             .collect();
 
         if !ready_join_filters.is_empty() {
-            let pending_set: std::collections::HashSet<Vec<u8>> = ready_join_filters.iter().cloned().collect();
-            let mut decide_candidates = proposal_descriptors.clone();
-            for d in &decide_all_descriptors {
-                if pending_set.contains(&d.filter) {
-                    decide_candidates.push(d.clone());
-                }
-            }
+            let manual_bound_filters: std::collections::HashSet<Vec<u8>> = workers
+                .iter()
+                .filter(|w| w.manually_managed && !w.filter.is_empty())
+                .map(|w| w.filter.clone())
+                .collect();
+
+            let (manual_ready, auto_ready): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+                ready_join_filters
+                    .iter()
+                    .cloned()
+                    .partition(|f| manual_bound_filters.contains(f));
 
             // Tier-5 #5: cap confirmations at unallocated worker count
             // (Go `proposer.go:518-531`). `unallocatedWorkerCount` =
@@ -909,25 +979,76 @@ impl ProverLifecycle {
             // commit to allocations it can't service.
             let available_workers = workers.iter().filter(|w| !w.allocated).count();
 
-            let (reject, confirm) = proposer::decide_joins(
+            // Manual bucket: confirm up to capacity, reject excess
+            // (capacity-only, deterministic lexicographic order so
+            // ties resolve identically across nodes).
+            let (manual_confirm, manual_reject): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
+                let mut sorted = manual_ready;
+                sorted.sort();
+                if sorted.len() <= available_workers {
+                    (sorted, Vec::new())
+                } else {
+                    let confirms: Vec<Vec<u8>> = sorted
+                        .iter()
+                        .take(available_workers)
+                        .cloned()
+                        .collect();
+                    let rejects: Vec<Vec<u8>> = sorted
+                        .into_iter()
+                        .skip(available_workers)
+                        .collect();
+                    (confirms, rejects)
+                }
+            };
+
+            // Auto bucket: existing score-driven decide_joins with
+            // capacity reduced by manual confirms already committed.
+            let auto_capacity = available_workers.saturating_sub(manual_confirm.len());
+            let mut decide_candidates = proposal_descriptors.clone();
+            let pending_set: std::collections::HashSet<Vec<u8>> =
+                auto_ready.iter().cloned().collect();
+            for d in &decide_all_descriptors {
+                if pending_set.contains(&d.filter) {
+                    decide_candidates.push(d.clone());
+                }
+            }
+            let (auto_reject, auto_confirm) = proposer::decide_joins(
                 &decide_candidates,
-                &ready_join_filters,
+                &auto_ready,
                 difficulty,
                 &world_bytes,
                 self.units,
                 self.strategy,
-                available_workers,
+                auto_capacity,
             );
 
-            if !reject.is_empty() {
+            let mut combined_reject = manual_reject;
+            combined_reject.extend(auto_reject);
+            let mut combined_confirm = manual_confirm;
+            combined_confirm.extend(auto_confirm);
+
+            // Per-message cap: each LifecycleAction maps 1:1 to a
+            // submitted canonical-bytes message, which is single-type
+            // (ConfirmJoins or RejectJoins) and capped at 100
+            // filters. Manual entries are placed first so they
+            // survive truncation; truncated filters stay Joining and
+            // re-enter the decision on the next frame.
+            if combined_reject.len() > MAX_PROPOSALS_PER_CYCLE {
+                combined_reject.truncate(MAX_PROPOSALS_PER_CYCLE);
+            }
+            if combined_confirm.len() > MAX_PROPOSALS_PER_CYCLE {
+                combined_confirm.truncate(MAX_PROPOSALS_PER_CYCLE);
+            }
+
+            if !combined_reject.is_empty() {
                 actions.push(LifecycleAction::RejectJoins {
-                    filters: reject,
+                    filters: combined_reject,
                     frame_number,
                 });
             }
-            if !confirm.is_empty() {
+            if !combined_confirm.is_empty() {
                 actions.push(LifecycleAction::ConfirmJoins {
-                    filters: confirm,
+                    filters: combined_confirm,
                     frame_number,
                 });
             }
@@ -938,7 +1059,8 @@ impl ProverLifecycle {
         //    lastJoinAttemptFrame on successful leave proposals (L310)
         //    so we mirror that here. Pure score-driven — Go has no
         //    halt-risk override.
-        if can_propose
+        if shard_info_ready
+            && can_propose
             && !join_proposed_this_cycle
             && !active_filters.is_empty()
             && !proposal_descriptors.is_empty()
@@ -976,30 +1098,66 @@ impl ProverLifecycle {
 
         // 4) DecideLeaves — independent of cooldown. Matches
         //    worker_allocator.go:318-344.
+        //
+        // Bucketed by mode: filters bound to manually_managed workers
+        // confirm at window-maturity unconditionally (operator drove
+        // the leave via gRPC, so the registry-side score should not
+        // veto). Auto-bound and unbound leaves flow through the
+        // existing score-driven `decide_leaves`.
         let ready_leave_filters: Vec<Vec<u8>> = leaving_filters.iter()
             .filter(|(_, lf)| frame_number >= *lf + confirm_window)
             .map(|(f, _)| f.clone())
             .collect();
 
         if !ready_leave_filters.is_empty() {
-            let (reject, confirm) = proposer::decide_leaves(
+            let manual_bound_filters: std::collections::HashSet<Vec<u8>> = workers
+                .iter()
+                .filter(|w| w.manually_managed && !w.filter.is_empty())
+                .map(|w| w.filter.clone())
+                .collect();
+
+            let (manual_ready, auto_ready): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+                ready_leave_filters
+                    .iter()
+                    .cloned()
+                    .partition(|f| manual_bound_filters.contains(f));
+
+            // Auto bucket: score-driven decide_leaves on auto/unbound.
+            let (mut auto_reject, auto_confirm) = proposer::decide_leaves(
                 &decide_all_descriptors,
-                &ready_leave_filters,
+                &auto_ready,
                 difficulty,
                 &world_bytes,
                 self.units,
                 self.strategy,
             );
 
-            if !reject.is_empty() {
+            // Manual bucket: always confirm at window, no auto-reject.
+            // Append after auto confirms; preserves a stable
+            // confirm-order for the per-frame log.
+            let mut combined_confirm = auto_confirm;
+            combined_confirm.extend(manual_ready);
+
+            // Per-message cap: each LifecycleAction maps 1:1 to a
+            // submitted canonical-bytes message (single-type, 100
+            // filters max). Truncated filters stay Leaving and
+            // re-enter the decision on the next frame.
+            if auto_reject.len() > MAX_PROPOSALS_PER_CYCLE {
+                auto_reject.truncate(MAX_PROPOSALS_PER_CYCLE);
+            }
+            if combined_confirm.len() > MAX_PROPOSALS_PER_CYCLE {
+                combined_confirm.truncate(MAX_PROPOSALS_PER_CYCLE);
+            }
+
+            if !auto_reject.is_empty() {
                 actions.push(LifecycleAction::RejectLeaves {
-                    filters: reject,
+                    filters: auto_reject,
                     frame_number,
                 });
             }
-            if !confirm.is_empty() {
+            if !combined_confirm.is_empty() {
                 actions.push(LifecycleAction::ConfirmLeaves {
-                    filters: confirm,
+                    filters: combined_confirm,
                     frame_number,
                 });
             }
@@ -1297,7 +1455,11 @@ mod proposal_loop_tests {
             .filter(|s| !s.filter.is_empty() && s.total_size > 0)
             .map(|s| (s.filter.clone(), s.total_size))
             .collect();
-        lc.set_shard_sizes(sizes);
+        // Use `replace_shard_sizes` (not `set_shard_sizes`) so the
+        // `shard_info_loaded` gate flips to true. Tests simulate a
+        // fully-synced node that has already consumed a GetAppShards
+        // refresh; without this, every propose path short-circuits.
+        lc.replace_shard_sizes(sizes);
     }
 
     fn idle_worker(core_id: u32) -> WorkerInfo {
@@ -2031,5 +2193,309 @@ mod proposal_loop_tests {
             "fully-allocated node must not propose joins; got {} in {:?}",
             proposed, actions
         );
+    }
+
+    fn count_confirms(actions: &[LifecycleAction]) -> Vec<Vec<u8>> {
+        actions
+            .iter()
+            .flat_map(|a| match a {
+                LifecycleAction::ConfirmJoins { filters, .. } => filters.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn count_reject_filters(actions: &[LifecycleAction]) -> Vec<Vec<u8>> {
+        actions
+            .iter()
+            .flat_map(|a| match a {
+                LifecycleAction::RejectJoins { filters, .. } => filters.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn manual_worker(core_id: u32, filter: Vec<u8>) -> WorkerInfo {
+        WorkerInfo {
+            core_id,
+            filter,
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: true,
+            pending_filter_frame: 0,
+            allocated: false,
+        }
+    }
+
+    /// Gate: with `shard_info_loaded == false`, the lifecycle must
+    /// emit zero ProposeJoin / ProposeLeave actions regardless of how
+    /// good the candidates look. Confirms still run when their window
+    /// matures.
+    #[test]
+    fn no_propose_paths_fire_without_shard_info_refresh() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+
+        let mut summaries = Vec::new();
+        for i in 1..=3u8 {
+            summaries.push(shard_summary(filter_bytes(0xA0 + i), 1));
+        }
+        reg.set_prover(prover(address.clone(), Vec::new()));
+        reg.set_summaries(summaries);
+
+        // NOTE: deliberately NOT using `make_lifecycle` because that
+        // helper flips `shard_info_loaded`. Build the lifecycle bare
+        // so the gate is still false.
+        let allocator = Arc::new(WorkerAllocator::new(
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+            address.clone(),
+        ));
+        let halt = Arc::new(HaltState::new());
+        let lifecycle = ProverLifecycle::new(address, allocator, halt);
+        lifecycle.set_confirm_window_frames(2);
+        lifecycle.set_sync_complete();
+        lifecycle.set_prover_root_verified_frame(100);
+        // Even with local shard sizes, the GetAppShards gate is closed.
+        lifecycle.set_shard_sizes({
+            let mut m = HashMap::new();
+            m.insert(filter_bytes(0xA1), 1_000_000);
+            m
+        });
+
+        assert!(!lifecycle.shard_info_loaded(), "gate must default to closed");
+
+        let actions = lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+
+        assert_eq!(
+            count_proposed_joins(&actions),
+            0,
+            "ProposeJoin must not fire while GetAppShards gate is closed; got {:?}",
+            actions
+        );
+        assert_eq!(
+            count_proposed_leaves(&actions),
+            0,
+            "ProposeLeave must not fire while GetAppShards gate is closed; got {:?}",
+            actions
+        );
+
+        // After replace_shard_sizes, the gate opens. (We re-supply the
+        // same map to keep the test minimal.)
+        let mut sizes = HashMap::new();
+        for i in 1..=3u8 {
+            sizes.insert(filter_bytes(0xA0 + i), 1_000_000);
+        }
+        lifecycle.replace_shard_sizes(sizes);
+        assert!(lifecycle.shard_info_loaded(), "gate opens after replace_shard_sizes");
+
+        // Bump verified frame so `tree_synced` passes at frame 101.
+        lifecycle.set_prover_root_verified_frame(101);
+        let actions2 = lifecycle
+            .evaluate(101, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert!(
+            count_proposed_joins(&actions2) > 0,
+            "ProposeJoin should fire once gate is open and free workers exist; got {:?}",
+            actions2
+        );
+    }
+
+    /// Manual-bucket confirm: when a Joining alloc reaches confirm
+    /// window AND its filter is bound to a manually_managed worker,
+    /// the lifecycle confirms it unconditionally — no score-based
+    /// reject even if a higher-scoring alternative exists.
+    #[test]
+    fn manual_bound_join_confirms_at_window_without_score_reject() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        let manual_filter = filter_bytes(0xA1);
+        // Worker 1 is manually pinned to the alloc we'll confirm.
+        wm.add(manual_worker(1, manual_filter.clone()));
+
+        // Alloc is Joining, ready to confirm. Set join_frame to 50 so
+        // at frame 100 the confirm-window (default 2 frames in tests)
+        // has long passed.
+        let allocs = vec![alloc(manual_filter.clone(), ProverStatus::Joining, 50)];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        // Add a competing summary with higher size — would normally
+        // beat the manual filter on score-greedy reward ranking and
+        // cause a reject in auto mode.
+        let mut summaries = vec![ProverShardSummary {
+            filter: manual_filter.clone(),
+            status_counts: {
+                let mut m = HashMap::new();
+                m.insert(ProverStatus::Joining, 1);
+                m
+            },
+            total_size: 1, // tiny — would lose score-greedy
+        }];
+        summaries.push(shard_summary(filter_bytes(0xB1), 5));
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+
+        let confirms = count_confirms(&actions);
+        let rejects = count_reject_filters(&actions);
+
+        assert!(
+            confirms.contains(&manual_filter),
+            "manual-bound alloc must be in confirm set regardless of score; got confirms={:?}, rejects={:?}",
+            confirms, rejects
+        );
+        assert!(
+            !rejects.contains(&manual_filter),
+            "manual-bound alloc must NEVER be score-rejected; got rejects={:?}",
+            rejects
+        );
+    }
+
+    /// Per-message 100-filter cap is enforced even when the manual
+    /// bucket alone exceeds it. The combined Confirm/Reject lists
+    /// must not exceed `MAX_PROPOSALS_PER_CYCLE`. Truncated filters
+    /// stay Joining and are re-evaluated next frame.
+    #[test]
+    fn bucketed_confirms_respect_100_filter_cap() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // 150 manual workers, each pinned to a unique filter. All
+        // are unallocated, so available_workers = 150.
+        let mut filters = Vec::with_capacity(150);
+        for i in 0..150u32 {
+            // Filter bytes: i serialized into a 4-byte head + zeros.
+            let mut f = i.to_be_bytes().to_vec();
+            f.resize(8, 0);
+            filters.push(f.clone());
+            wm.add(manual_worker(i + 1, f));
+        }
+
+        // 150 ready Joining allocs.
+        let mut allocs = Vec::with_capacity(150);
+        let mut summaries = Vec::with_capacity(150);
+        for f in &filters {
+            allocs.push(alloc(f.clone(), ProverStatus::Joining, 50));
+            summaries.push(ProverShardSummary {
+                filter: f.clone(),
+                status_counts: {
+                    let mut m = HashMap::new();
+                    m.insert(ProverStatus::Joining, 1);
+                    m
+                },
+                total_size: 1_000_000,
+            });
+        }
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+
+        let confirms = count_confirms(&actions);
+        assert!(
+            confirms.len() <= MAX_PROPOSALS_PER_CYCLE,
+            "ConfirmJoins must respect 100-filter cap, got {}",
+            confirms.len()
+        );
+        let rejects = count_reject_filters(&actions);
+        assert!(
+            rejects.len() <= MAX_PROPOSALS_PER_CYCLE,
+            "RejectJoins must respect 100-filter cap, got {}",
+            rejects.len()
+        );
+    }
+
+    /// Manual-bucket capacity overflow: more manual-bound Joining
+    /// allocs than `available_workers` triggers a capacity-only
+    /// reject of the lexicographically-latest excess (deterministic
+    /// ordering for cross-node consistency).
+    #[test]
+    fn manual_bound_join_capacity_overflow_rejects_excess() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        let f1 = filter_bytes(0xA1);
+        let f2 = filter_bytes(0xA2);
+        let f3 = filter_bytes(0xA3);
+
+        // Three manually-pinned workers but only 2 are not yet
+        // allocated. available_workers = count(workers where
+        // !allocated) so we deliberately mark one as allocated.
+        let mut w1 = manual_worker(1, f1.clone());
+        w1.allocated = true; // already serving — consumes capacity
+        wm.add(w1);
+        wm.add(manual_worker(2, f2.clone()));
+        wm.add(manual_worker(3, f3.clone()));
+
+        // Three Joining allocs, all manual-bound, all ready.
+        let allocs = vec![
+            alloc(f1.clone(), ProverStatus::Joining, 50),
+            alloc(f2.clone(), ProverStatus::Joining, 50),
+            alloc(f3.clone(), ProverStatus::Joining, 50),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let mut summaries = Vec::new();
+        for f in [&f1, &f2, &f3] {
+            summaries.push(ProverShardSummary {
+                filter: f.clone(),
+                status_counts: {
+                    let mut m = HashMap::new();
+                    m.insert(ProverStatus::Joining, 1);
+                    m
+                },
+                total_size: 1_000_000,
+            });
+        }
+        reg.set_summaries(summaries);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+
+        let confirms = count_confirms(&actions);
+        let rejects = count_reject_filters(&actions);
+
+        // 2 available workers → confirm 2 (lexicographically first),
+        // reject 1.
+        assert_eq!(confirms.len(), 2, "expected 2 confirms, got {:?}", confirms);
+        assert_eq!(rejects.len(), 1, "expected 1 reject, got {:?}", rejects);
+        // Lexicographic order: f1, f2, f3 — so the LAST one (f3) is rejected.
+        assert_eq!(rejects[0], f3, "expected lexicographically-last filter rejected");
     }
 }

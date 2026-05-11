@@ -94,7 +94,7 @@ impl ArchiveEndpointPool {
 
     /// Pick the next non-blacklisted endpoint round-robin. Returns `None` if
     /// the pool is empty.
-    async fn next(&self) -> Option<String> {
+    pub(crate) async fn next(&self) -> Option<String> {
         let mut inner = self.inner.lock().await;
         if inner.endpoints.is_empty() {
             return None;
