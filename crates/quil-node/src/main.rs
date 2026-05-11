@@ -384,7 +384,13 @@ async fn run_master_node(
     let token_store = Arc::new(quil_store::RocksTokenStore::new(db_arc.inner()));
     let key_store: Arc<quil_store::RocksKeyStore> =
         Arc::new(quil_store::RocksKeyStore::new(db_arc.inner()));
-    let _shards_store = Arc::new(quil_store::RocksShardsStore::new(db_arc.inner()));
+    // Trait-object handle so the shard_info refresh task (lower in
+    // this fn) can hold a `&dyn ShardsStore` for enumerating
+    // shard_keys against archives. A second `Arc<dyn ShardsStore>`
+    // is built later for the gRPC server's `GetAppShards` handler;
+    // both share the same underlying RocksDB column family.
+    let shards_store: Arc<dyn quil_types::store::ShardsStore> =
+        Arc::new(quil_store::RocksShardsStore::new(db_arc.inner()));
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
 
     // Check latest stored frame
@@ -479,7 +485,7 @@ async fn run_master_node(
         info!("bootstrapping mainnet genesis frame");
         match quil_engine::genesis::initialize_genesis_state(
             clock_store_dyn,
-            _shards_store.as_ref() as &dyn quil_types::store::ShardsStore,
+            shards_store.as_ref() as &dyn quil_types::store::ShardsStore,
             &crdt,
             inclusion_prover.as_ref(),
         ) {
@@ -511,7 +517,7 @@ async fn run_master_node(
             &bls_pubkey,
             0, // difficulty=0 triggers DEFAULT_TESTNET_DIFFICULTY
             clock_store_dyn,
-            _shards_store.as_ref() as &dyn quil_types::store::ShardsStore,
+            shards_store.as_ref() as &dyn quil_types::store::ShardsStore,
             &crdt,
             inclusion_prover.as_ref(),
         ) {
@@ -1642,7 +1648,7 @@ async fn run_master_node(
     // have no allocations yet — calls `RangeAppShards` on the local
     // store.
     prover_lifecycle.set_shards_store(
-        _shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>,
+        shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>,
     );
 
     // Periodic eviction of inactive provers. Only archive nodes perform
@@ -2001,7 +2007,7 @@ async fn run_master_node(
         let hg_for_poller = hg_store.clone();
         let crdt_for_poller = crdt.clone();
         let shards_store_for_poller: Arc<dyn quil_types::store::ShardsStore> =
-            _shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
+            shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
         let poller_config = quil_rpc::ArchivePollerConfig {
             on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
                 let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
@@ -2671,6 +2677,7 @@ async fn run_master_node(
             let last_frame = last_received_frame.clone();
             let cancel = token.clone();
             let seed_for_refresh = seed;
+            let shards_store_for_refresh = shards_store.clone();
             tokio::spawn(async move {
                 const REFRESH_CADENCE_FRAMES: u64 = 60;
                 let mut last_refresh_frame: u64 = 0;
@@ -2693,6 +2700,7 @@ async fn run_master_node(
                     match quil_rpc::fetch_shard_sizes_from_archive(
                         &pool,
                         &seed_for_refresh,
+                        shards_store_for_refresh.as_ref(),
                         None,
                     )
                     .await
@@ -2712,6 +2720,11 @@ async fn run_master_node(
                             // Archive pool not yet populated by PeerInfo
                             // gossip — log at debug, retry next tick.
                             tracing::debug!("shard_info refresh: archive pool empty, retrying");
+                        }
+                        Err(quil_rpc::ShardInfoRefreshError::NoLocalShards) => {
+                            // Local shards-store empty — genesis not
+                            // yet seeded, or the wrong network ID.
+                            tracing::debug!("shard_info refresh: local shards-store empty, retrying");
                         }
                         Err(e) => {
                             warn!(error = %e, "shard_info refresh failed (will retry)");

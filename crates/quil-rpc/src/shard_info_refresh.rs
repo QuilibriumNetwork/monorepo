@@ -14,18 +14,31 @@
 //! dial out on miss" fallback) — the contract here is "always go to
 //! the archive."
 //!
-//! Picks endpoints round-robin from `ArchiveEndpointPool`. Blacklists
-//! endpoints that fail at the transport layer; rotates without
-//! blacklist on application-layer errors ("not currently syncable").
-//! Returns the first successful fetch; gives up after exhausting all
-//! endpoints in a single attempt cycle.
+//! **Per-shard enumeration is required.** Go's `GetAppShards` server
+//! (`node/consensus/global/services.go:230-247`) rejects requests
+//! with empty `ShardKey` from any remote caller with "invalid shard
+//! key" — the only way to enumerate every shard is to call the RPC
+//! once per known 35-byte `L1‖L2` shard_key, mirroring Go's
+//! `getRemoteAppShards` loop in `shard_info.go:117-138`. The caller
+//! must therefore know the set of shard_keys up front. We pull that
+//! list from the local `ShardsStore` (which is seeded from genesis,
+//! so even a fresh node has the canonical set).
+//!
+//! Picks endpoints round-robin from `ArchiveEndpointPool`. Rotates
+//! without blacklist on application-layer errors ("not currently
+//! syncable"). Within a single endpoint, per-shard failures are
+//! logged and skipped rather than aborting the whole batch — partial
+//! data is acceptable per the lifecycle's "propose over what we have"
+//! contract.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use num_bigint::BigUint;
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+use quil_types::store::ShardsStore;
 
 use crate::archive_client::{ArchiveClient, ArchiveClientError};
 use crate::frame_sync::ArchiveEndpointPool;
@@ -34,58 +47,99 @@ use crate::frame_sync::ArchiveEndpointPool;
 pub enum ShardInfoRefreshError {
     #[error("archive endpoint pool empty")]
     PoolEmpty,
+    #[error("local shards store empty — no shard keys to query")]
+    NoLocalShards,
+    #[error("local shards store error: {0}")]
+    LocalStoreFailed(String),
     #[error("all archive endpoints failed; last error: {0}")]
     AllEndpointsFailed(String),
 }
 
-/// Dial one archive at a time until one succeeds. On success, decode
-/// the `AppShardInfo` list into a `filter → size` map and return.
+/// Enumerate shard_keys from the local `ShardsStore`, then dial one
+/// archive at a time and request `GetAppShards` for each shard_key
+/// in turn. Aggregates all returned `(filter, size)` pairs into a
+/// single map.
+///
+/// Behaviors:
+/// - Local shard_keys are deduplicated. Each `RangeAppShards` row
+///   carries one (shard_key, prefix) pair, but multiple rows can
+///   share the same 35-byte shard_key (with different prefixes); we
+///   only need one RPC per unique shard_key since the response
+///   includes every sub-shard under that L2.
+/// - Per-shard RPC failures within a connected endpoint are logged
+///   and skipped — partial data is preferable to aborting the entire
+///   refresh (the lifecycle's "propose over what we have" contract).
+/// - Endpoint-level transport failures rotate to the next endpoint.
+///   The first endpoint to return at least one successful per-shard
+///   result wins; the partial map is returned.
 ///
 /// The wire filter is constructed from `shard_key[3..]` (L2, 32 bytes)
 /// concatenated with one byte per `prefix` element — matching the
 /// existing filter encoding used by the lifecycle's local
-/// `shards_store` consumer at `provers/lifecycle.rs:515-524`. The
-/// `AppShardInfo.size` field is a BigInt-encoded byte string; we
-/// parse via `num_bigint::BigUint::from_bytes_be` and saturate to
-/// `u64::MAX` if the value overflows.
+/// `shards_store` consumer at `provers/lifecycle.rs:515-524` and Go's
+/// `buildShardEntries` at `shard_info.go:191-194`.
+///
+/// `AppShardInfo.size` is a BigInt-encoded byte string; we parse via
+/// `num_bigint::BigUint::from_bytes_be` and saturate to `u64::MAX` if
+/// the value overflows.
 ///
 /// `cap_per_attempt` bounds the number of endpoints we try before
 /// giving up in this call. `None` means "every endpoint in the pool."
 pub async fn fetch_shard_sizes_from_archive(
     pool: &Arc<ArchiveEndpointPool>,
     ed448_seed: &[u8; 57],
+    shards_store: &dyn ShardsStore,
     cap_per_attempt: Option<usize>,
 ) -> Result<HashMap<Vec<u8>, u64>, ShardInfoRefreshError> {
     let pool_size = pool.len().await;
     if pool_size == 0 {
         return Err(ShardInfoRefreshError::PoolEmpty);
     }
-    let max_attempts = cap_per_attempt.unwrap_or(pool_size).max(1);
 
+    // Local shard_key enumeration. Mainnet genesis seeds many
+    // shards; even a brand-new node should have non-empty local
+    // shards-store state.
+    let local = shards_store
+        .range_app_shards()
+        .map_err(|e| ShardInfoRefreshError::LocalStoreFailed(e.to_string()))?;
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut shard_keys: Vec<Vec<u8>> = Vec::new();
+    for s in local {
+        if s.shard_key.len() == 35 && seen.insert(s.shard_key.clone()) {
+            shard_keys.push(s.shard_key);
+        }
+    }
+    if shard_keys.is_empty() {
+        return Err(ShardInfoRefreshError::NoLocalShards);
+    }
+
+    let max_attempts = cap_per_attempt.unwrap_or(pool_size).max(1);
     let mut last_err: Option<String> = None;
     for attempt in 0..max_attempts {
         let Some(endpoint) = pool.next().await else {
             break;
         };
 
-        match try_one_endpoint(&endpoint, ed448_seed).await {
-            Ok(map) => {
+        match try_one_endpoint(&endpoint, ed448_seed, &shard_keys).await {
+            Ok(map) if !map.is_empty() => {
                 info!(
                     %endpoint,
-                    shards = map.len(),
+                    shard_keys = shard_keys.len(),
+                    shards_filtered = map.len(),
                     attempt,
                     "shard_info refresh: success"
                 );
                 return Ok(map);
             }
+            Ok(_) => {
+                // Connected but got zero filters back — likely all
+                // per-shard calls failed individually. Rotate.
+                let msg = "endpoint returned no shard sizes".to_string();
+                warn!(%endpoint, attempt, %msg, "shard_info refresh: empty result, rotating");
+                last_err = Some(msg);
+            }
             Err(e) => {
                 let msg = format!("{e}");
-                // Application-layer "not currently syncable" — rotate,
-                // do NOT blacklist (the operator may flip the archive
-                // on later). Network-layer failures are not handled
-                // specially here since we just rotate to the next
-                // endpoint either way; the frame_sync poller is the
-                // authoritative blacklist owner.
                 if msg.contains("not currently syncable") {
                     debug!(%endpoint, "shard_info refresh: not currently syncable, rotating");
                 } else {
@@ -106,27 +160,43 @@ pub async fn fetch_shard_sizes_from_archive(
     ))
 }
 
+/// Enumerate `shard_keys` against a single endpoint. Returns
+/// whatever sizes were successfully fetched; per-shard errors are
+/// logged and skipped (partial OK).
 async fn try_one_endpoint(
     endpoint: &str,
     ed448_seed: &[u8; 57],
+    shard_keys: &[Vec<u8>],
 ) -> Result<HashMap<Vec<u8>, u64>, ArchiveClientError> {
     let mut client = ArchiveClient::connect_mtls(endpoint, ed448_seed).await?;
-    // Empty shard_key + empty prefix → server returns the full app
-    // shard list (`global_service.rs:185-193`).
-    let infos = client.get_app_shards(Vec::new(), Vec::new()).await?;
-
-    let mut out: HashMap<Vec<u8>, u64> = HashMap::with_capacity(infos.len());
-    for info in infos {
-        let Some(filter) = build_filter(&info.shard_key, &info.prefix) else {
-            // Malformed shard_key (must be 35 bytes for L1||L2); skip.
-            continue;
+    let mut out: HashMap<Vec<u8>, u64> = HashMap::new();
+    for shard_key in shard_keys {
+        let infos = match client.get_app_shards(shard_key.clone(), Vec::new()).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(
+                    %endpoint,
+                    shard_key = hex::encode(shard_key),
+                    error = %e,
+                    "shard_info refresh: per-shard call failed, skipping"
+                );
+                continue;
+            }
         };
-        // Empty filter would collide with the global plane; skip.
-        if filter.is_empty() {
-            continue;
+        // Server omits `shard_key` in the response when the request
+        // had a non-empty key (see services.go:261:
+        // `includeShardKey := len(req.ShardKey) != 35`). Use our
+        // copy from the request to build the wire filter.
+        for info in infos {
+            let Some(filter) = build_filter(shard_key, &info.prefix) else {
+                continue;
+            };
+            if filter.is_empty() {
+                continue;
+            }
+            let size = bigint_to_u64_saturating(&info.size);
+            out.insert(filter, size);
         }
-        let size = bigint_to_u64_saturating(&info.size);
-        out.insert(filter, size);
     }
     Ok(out)
 }
