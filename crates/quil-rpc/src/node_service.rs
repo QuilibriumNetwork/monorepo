@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tonic::{Request, Response, Status};
 
-use quil_types::consensus::{ProverRegistry, ProverStatus, ShardInfoProvider};
+use quil_engine::current_frame::CurrentFrame;
+use quil_types::consensus::{ProverRegistry, ShardInfoProvider};
 use quil_types::proto::{global, node};
 use quil_types::proto::node::node_service_server::NodeService;
 use quil_types::store::{ClockStore, TokenStore};
@@ -32,7 +33,11 @@ pub struct NodeRpcServer {
     pub peer_id: String,
     pub version: Vec<u8>,
     pub patch_number: Vec<u8>,
-    pub last_received_frame: Arc<AtomicU64>,
+    /// Source of truth for "what frame is this node on right now."
+    /// Use `current_frame.effective()` for any consumer that needs
+    /// the current frame — the `last_received_frame` field on the
+    /// `NodeInfoResponse` proto is populated from this same value.
+    pub current_frame: Arc<CurrentFrame>,
     pub last_global_head_frame: Arc<AtomicU64>,
     pub prover_address: Vec<u8>,
     pub reachable: bool,
@@ -121,7 +126,7 @@ impl NodeRpcServer {
             peer_id: String::new(),
             version: vec![2, 1, 0],
             patch_number: vec![23],
-            last_received_frame: Arc::new(AtomicU64::new(0)),
+            current_frame: CurrentFrame::new(),
             last_global_head_frame: Arc::new(AtomicU64::new(0)),
             prover_address: Vec::new(),
             reachable: false,
@@ -152,10 +157,10 @@ impl NodeRpcServer {
     }
     pub fn with_frame_counters(
         mut self,
-        last_received: Arc<AtomicU64>,
+        current_frame: Arc<CurrentFrame>,
         last_head: Arc<AtomicU64>,
     ) -> Self {
-        self.last_received_frame = last_received;
+        self.current_frame = current_frame;
         self.last_global_head_frame = last_head;
         self
     }
@@ -310,50 +315,20 @@ impl NodeService for NodeRpcServer {
                 let s = info.seniority;
                 seniority_bytes = s.to_be_bytes().to_vec();
 
-                // Use the latest observed frame for the 720-frame
-                // grace check, NOT `registry.current_frame()` — the
-                // registry's internal counter only advances when the
-                // materializer calls `process_state_transition`. On
-                // a node that observes frames without materializing
-                // them (or before the first materialize cycle), the
-                // counter stays at 0, the expiry check
-                // `current_frame > join_frame + 720` is always
-                // false, and `GetNodeInfo` returns historical
-                // Joining/Leaving allocs that should have been
-                // pruned.
-                //
-                // Take the max of the clock-store's latest frame and
-                // `last_received_frame`. Either alone can lag in
-                // valid observer scenarios — the clock-store is only
-                // updated post-materialize, and `last_received_frame`
-                // is 0 until the first wire frame arrives. The max
-                // is always the freshest source.
-                let lrf = self.last_received_frame.load(Ordering::Relaxed);
-                let current_frame = self
-                    .clock_store
-                    .as_ref()
-                    .and_then(|cs| cs.get_latest_global_clock_frame().ok())
-                    .and_then(|f| f.header.map(|h| h.frame_number))
-                    .map(|fn_stored| fn_stored.max(lrf))
-                    .unwrap_or(lrf);
+                // Use the shared `current_frame.effective()` for the
+                // 720-frame grace check. This is the single source
+                // of truth — populated by the BlossomSub receive
+                // loop, archive poller, and frame materializer, so
+                // it stays fresh on any node regardless of its
+                // role (archive, observer, or full prover) and
+                // regardless of where the latest frame came from.
+                let current_frame = self.current_frame.effective();
                 for alloc in &info.allocations {
-                    match alloc.status {
-                        ProverStatus::Joining
-                        | ProverStatus::Active
-                        | ProverStatus::Paused
-                        | ProverStatus::Leaving => {}
-                        _ => continue,
-                    }
-                    // Skip expired joins (grace = 720 frames).
-                    if alloc.status == ProverStatus::Joining
-                        && current_frame > alloc.join_frame_number + 720
-                    {
-                        continue;
-                    }
-                    // Skip expired leaves (grace = 720 frames).
-                    if alloc.status == ProverStatus::Leaving
-                        && current_frame > alloc.leave_frame_number + 720
-                    {
+                    // Only return live (non-terminal, non-expired)
+                    // allocations. `is_live` applies the 720-frame
+                    // grace check for Joining/Leaving and excludes
+                    // Rejected/Kicked terminal states.
+                    if !alloc.is_live(current_frame) {
                         continue;
                     }
                     shard_allocations.push(node::ShardAllocationInfo {
@@ -388,7 +363,7 @@ impl NodeService for NodeRpcServer {
             running_workers: running,
             allocated_workers: allocated,
             patch_number: self.patch_number.clone(),
-            last_received_frame: self.last_received_frame.load(Ordering::Relaxed),
+            last_received_frame: self.current_frame.effective(),
             last_global_head_frame: self.last_global_head_frame.load(Ordering::Relaxed),
             reachable: self.reachable,
             shard_allocations,

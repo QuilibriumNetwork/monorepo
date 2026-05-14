@@ -421,6 +421,11 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             proposer_id: address_to_identity(&self.local_prover_address),
             parent_qc_identity: prior_state_id.clone(),
             parent_qc_rank: rank.saturating_sub(1),
+            // Leader-side construction: `prove_next_state` doesn't
+            // receive the parent QC trait object. The QC arc is
+            // populated on the receiver side from the wire-decoded
+            // proposal.
+            parent_quorum_certificate: None,
             timestamp: timestamp as u64,
             state,
         })

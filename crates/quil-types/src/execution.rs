@@ -40,6 +40,14 @@ pub struct StateChange {
 
 /// A shard execution engine that validates, processes, and proves messages.
 pub trait ShardExecutionEngine: Send + Sync {
+    /// Downcast hook for mutating concrete-type configuration after
+    /// construction (e.g. installing optional intrinsic dependencies).
+    /// Default: returns `None`, callers must check before
+    /// downcasting. Implementations: `fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> { Some(self) }`.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
     /// Human-readable engine name (e.g. "global", "token", "compute", "hypergraph").
     fn get_name(&self) -> &str;
 

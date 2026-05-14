@@ -3990,6 +3990,7 @@ dependencies = [
 name = "quil-engine"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bs58",
  "core_affinity",
@@ -4002,6 +4003,7 @@ dependencies = [
  "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
+ "parking_lot",
  "prost",
  "quil-config",
  "quil-consensus",
@@ -4024,6 +4026,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
+ "tracing-subscriber",
  "vdf",
 ]
 
@@ -4132,6 +4135,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "base64 0.22.1",
  "bs58",
  "chrono",
@@ -4143,6 +4147,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "num-bigint 0.4.6",
+ "parking_lot",
  "prost",
  "quil-config",
  "quil-consensus",

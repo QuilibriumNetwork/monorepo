@@ -36,14 +36,6 @@ pub fn register_engine_metrics() {
         "Number of messages waiting to be processed"
     );
     describe_gauge!(
-        "engine_last_received_frame",
-        "Highest frame number received from the network"
-    );
-    describe_gauge!(
-        "engine_last_head_frame",
-        "Highest head frame observed across archive peers"
-    );
-    describe_gauge!(
         "engine_active_shards",
         "Count of shards with at least one active prover"
     );
@@ -169,14 +161,6 @@ pub fn update_engine_metrics(frame: u64, rank: u64, difficulty: u64, pending: u6
     gauge!("engine_pending_messages").set(pending as f64);
 }
 
-#[inline]
-pub fn set_last_received_frame(n: u64) {
-    gauge!("engine_last_received_frame").set(n as f64);
-}
-#[inline]
-pub fn set_last_head_frame(n: u64) {
-    gauge!("engine_last_head_frame").set(n as f64);
-}
 #[inline]
 pub fn set_active_shards(n: u64) {
     gauge!("engine_active_shards").set(n as f64);

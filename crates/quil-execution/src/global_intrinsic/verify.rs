@@ -359,12 +359,25 @@ pub fn verify_prover_join_signatures(
         QuilError::InvalidArgument("prover join verify: missing signature".into())
     })?;
 
-    // 1. Main join signature over concat(filters) || frame_be_u64.
+    // 1. Main join signature.
+    //
+    // Go signs the full canonical-bytes of the ProverJoin with
+    // `PublicKeySignatureBls48581 = nil` — NOT just
+    // `concat(filters) || frame_be_u64`. See
+    // `node/execution/intrinsics/global/global_prover_join.go:1074-1102`:
+    //
+    //     joinClone := p.ToProtobuf()
+    //     joinClone.PublicKeySignatureBls48581 = nil
+    //     joinMessage, err := joinClone.ToCanonicalBytes()
+    //     ...
+    //     keyManager.ValidateSignature(.., joinMessage, sig, domain)
+    //
+    // Signing `concat(filters) || frame_be_u64` (the previous Rust
+    // impl) would reject every Go-signed join in production.
     let join_domain = super::prover_verify::prover_join_domain()?;
-    let join_message = super::prover_verify::prover_join_signing_message(
-        &op.filters,
-        op.frame_number,
-    );
+    let mut clone = op.clone();
+    clone.public_key_signature_bls48581 = None;
+    let join_message = clone.to_canonical_bytes()?;
     let ok = key_manager.validate_signature(
         KeyType::Bls48581G1,
         &validation.public_key,

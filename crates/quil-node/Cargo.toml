@@ -18,6 +18,7 @@ name = "blossom-chat"
 path = "src/bin/blossom_chat.rs"
 
 [dependencies]
+async-trait = "0.1"
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-lifecycle = { path = "../quil-lifecycle" }
@@ -54,6 +55,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 async-stream = "0.3"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3"

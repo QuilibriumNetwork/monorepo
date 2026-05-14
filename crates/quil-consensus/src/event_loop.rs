@@ -253,6 +253,13 @@ impl<S: Unique, V: Unique> EventLoop<S, V> {
         // order — that enforces the Go priority: cancellation →
         // local timeout → partial TC → QC → TC → proposal.
         loop {
+            // Yield to the runtime each iteration. Single-prover
+            // committees (quorum_threshold = 0) can otherwise drive
+            // propose → self-vote → QC → propose at full CPU without
+            // ever yielding, starving sibling tasks (notably the engine
+            // run-loop that surfaces AppEngineEvent to subscribers).
+            tokio::task::yield_now().await;
+
             // Re-read the pacemaker's deadline each iteration. It can
             // shift when the rank advances or when a local timeout
             // fires (rebroadcast).
@@ -544,7 +551,7 @@ mod tests {
     struct NoopFollower;
     impl FollowerConsumer<AppState> for NoopFollower {
         fn on_state_incorporated(&self, _s: &State<AppState>) {}
-        fn on_finalized_state(&self, _s: &State<AppState>) {}
+        fn on_finalized_state(&self, _c: &CertifiedState<AppState>) {}
         fn on_double_propose_detected(
             &self,
             _a: &State<AppState>,
@@ -559,6 +566,7 @@ mod tests {
             proposer_id: "leader".into(),
             parent_qc_identity: "genesis".into(),
             parent_qc_rank: 0,
+            parent_quorum_certificate: None,
             timestamp: 0,
             state: AppState { id: "genesis".into(), rank: 0 },
         };
@@ -566,6 +574,7 @@ mod tests {
             state: genesis,
             certifying_qc_identity: "genesis".into(),
             certifying_qc_rank: 0,
+            certifying_quorum_certificate: None,
         };
         let forks = Forks::new(
             root_cert,
@@ -656,6 +665,7 @@ mod tests {
                     proposer_id: "leader".into(),
                     parent_qc_identity: "genesis".into(),
                     parent_qc_rank: 0,
+                    parent_quorum_certificate: None,
                     timestamp: 0,
                     state: AppState { id: "s1".into(), rank: 1 },
                 },

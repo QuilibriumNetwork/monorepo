@@ -649,7 +649,8 @@ impl FollowerConsumer<GlobalState> for GlobalFollower {
         }
     }
 
-    fn on_finalized_state(&self, state: &State<GlobalState>) {
+    fn on_finalized_state(&self, certified: &CertifiedState<GlobalState>) {
+        let state = &certified.state;
         tracing::info!(
             frame = state.state.frame_number,
             rank = state.rank,
@@ -861,11 +862,17 @@ pub fn certified_state_from_frame(
             proposer_id: header.prover.clone(),
             parent_qc_identity: header.parent_selector.clone(),
             parent_qc_rank: header.rank.saturating_sub(1),
+            // Frame-only reconstruction — the parent QC trait object
+            // isn't available without a clock-store lookup. Callers
+            // that need the QC arc should reconstruct it via the
+            // wire-decoded Proposal path instead.
+            parent_quorum_certificate: None,
             timestamp: header.timestamp as u64,
             state: gs,
         },
         certifying_qc_identity: identity,
         certifying_qc_rank: header.rank,
+        certifying_quorum_certificate: None,
     })
 }
 
@@ -961,6 +968,7 @@ mod tests {
             proposer_id,
             parent_qc_identity: vec![0u8; 32],
             parent_qc_rank: 0,
+            parent_quorum_certificate: None,
             timestamp: 1700000000,
             state: inner,
         }

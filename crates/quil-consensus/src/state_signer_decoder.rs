@@ -178,6 +178,7 @@ mod tests {
             proposer_id: b"leader".to_vec(),
             parent_qc_identity: parent_id.into(),
             parent_qc_rank: parent_rank,
+            parent_quorum_certificate: None,
             timestamp: 0,
             state: AppState {
                 id: format!("state-{}", rank).into_bytes(),
@@ -267,6 +268,7 @@ mod tests {
             proposer_id: "leader".into(),
             parent_qc_identity: "".into(),
             parent_qc_rank: 0,
+            parent_quorum_certificate: None,
             timestamp: 0,
             state: AppState { id: "genesis".into(), rank: 0 },
         };

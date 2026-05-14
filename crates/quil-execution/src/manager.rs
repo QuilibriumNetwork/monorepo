@@ -123,6 +123,40 @@ impl ExecutionEngineManager {
         }
     }
 
+    /// Install frame-header deps onto the global engine's intrinsic.
+    /// Must be called for the materializer to apply shard-coverage
+    /// proofs (LastActiveFrameNumber advance + reward distribution).
+    /// Without this, `invoke_frame_header` is a silent no-op.
+    pub fn install_global_frame_header_deps(
+        &self,
+        prover_registry: Arc<dyn quil_types::consensus::ProverRegistry>,
+        reward_issuance: Arc<dyn quil_types::consensus::RewardIssuance>,
+        bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor>,
+        inclusion_prover: Arc<dyn InclusionProver>,
+    ) -> Result<()> {
+        let mut engines = self.engines.write().unwrap();
+        let engine = engines
+            .get_mut("global")
+            .ok_or_else(|| QuilError::NotFound("engine 'global' not found".into()))?;
+        let any = engine.as_any_mut().ok_or_else(|| {
+            QuilError::Internal(
+                "global engine does not support as_any_mut downcast".into(),
+            )
+        })?;
+        let global = any.downcast_mut::<GlobalExecutionEngine>().ok_or_else(|| {
+            QuilError::Internal(
+                "global engine is not a GlobalExecutionEngine".into(),
+            )
+        })?;
+        global.install_frame_header_deps(
+            prover_registry,
+            reward_issuance,
+            bls_constructor,
+            inclusion_prover,
+        );
+        Ok(())
+    }
+
     /// Get all supported capabilities across all engines.
     pub fn get_supported_capabilities(&self) -> Vec<node::Capability> {
         let engines = self.engines.read().unwrap();

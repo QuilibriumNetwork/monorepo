@@ -424,7 +424,6 @@ impl InMemoryProverRegistry {
         &self,
         frame_number: u64,
     ) -> Vec<ProverShardSummary> {
-        const GRACE: u64 = 720;
         let mut out: Vec<ProverShardSummary> = Vec::with_capacity(self.filter_cache.len());
         for (filter_key, addrs) in &self.filter_cache {
             if filter_key.is_empty() || addrs.is_empty() {
@@ -444,18 +443,11 @@ impl InMemoryProverRegistry {
                     if !filter_matches {
                         continue;
                     }
-                    // Drop expired pending states so callers (halt-
-                    // risk classification, TUI prover counts) see the
-                    // same effective view as the lifecycle.
-                    if alloc.status == ProverStatus::Joining
-                        && frame_number > alloc.join_frame_number + GRACE
-                    {
-                        counted = true;
-                        break;
-                    }
-                    if alloc.status == ProverStatus::Leaving
-                        && frame_number > alloc.leave_frame_number + GRACE
-                    {
+                    // Drop expired pending states (effective_status
+                    // applies the 720-frame grace) so callers see the
+                    // same view as the lifecycle.
+                    let eff = alloc.effective_status(frame_number);
+                    if eff.is_expired() {
                         counted = true;
                         break;
                     }
@@ -606,16 +598,12 @@ impl InMemoryProverRegistry {
 #[derive(Clone)]
 pub struct SharedProverRegistry {
     inner: Arc<RwLock<InMemoryProverRegistry>>,
-    /// Current global frame number. Stored outside the `RwLock` for
-    /// cheap `current_frame()` access.
-    current_frame: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SharedProverRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(InMemoryProverRegistry::new())),
-            current_frame: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -641,7 +629,7 @@ impl SharedProverRegistry {
     /// - Only run on archive nodes (Go gates this on `ArchiveMode`)
     /// - Only run when no shard halt is active (Go gates on `!anyHalted`)
     /// - Commit the state changeset after this call returns
-    pub fn evict_inactive_provers_into_state(
+    pub fn evict_inactive_provers(
         &self,
         frame_number: u64,
         inactivity_threshold: u64,
@@ -745,11 +733,6 @@ impl SharedProverRegistry {
         }
 
         Ok(evicted)
-    }
-
-    pub fn set_current_frame(&self, frame: u64) {
-        self.current_frame
-            .store(frame, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Access the inner registry under a read lock. Use sparingly —
@@ -886,16 +869,6 @@ impl ProverRegistryTrait for SharedProverRegistry {
         Ok(guard.get_prover_shard_summaries(frame_number))
     }
 
-    fn process_state_transition(&self, frame_number: u64) -> QuilResult<()> {
-        // Mirrors Go `ProverRegistry.ProcessStateTransition` minus the
-        // changeset walk: the Rust port keeps its cache in sync via
-        // `refresh_from_store` on a separate cadence, so here we only
-        // need to advance the registry's frame counter so subsequent
-        // calls to `current_frame()` return the right value.
-        self.set_current_frame(frame_number);
-        Ok(())
-    }
-
     fn prune_orphan_joins(&self, frame_number: u64) -> QuilResult<()> {
         let mut guard = self
             .inner
@@ -905,38 +878,6 @@ impl ProverRegistryTrait for SharedProverRegistry {
         Ok(())
     }
 
-    fn evict_inactive_provers(
-        &self,
-        frame_number: u64,
-        inactivity_threshold: u64,
-        shard_halt_durations: &HashMap<String, u64>,
-    ) -> QuilResult<Vec<Vec<u8>>> {
-        // The trait takes `HashMap<String, u64>` (filter as hex
-        // string or similar stringly key). The inherent method works
-        // in raw bytes. Convert by interpreting each String key as
-        // hex. If decoding fails, skip that entry.
-        let mut halt_bytes: HashMap<Vec<u8>, u64> = HashMap::with_capacity(shard_halt_durations.len());
-        for (k, v) in shard_halt_durations {
-            if let Ok(decoded) = hex::decode(k) {
-                halt_bytes.insert(decoded, *v);
-            }
-        }
-        let guard = self
-            .inner
-            .read()
-            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-        // Trait method returns candidates only — the trait signature
-        // doesn't carry a HypergraphState. Callers with state in scope
-        // should use the inherent `evict_inactive_provers_into_state`
-        // helper, which both finds candidates AND applies the kick
-        // mutations.
-        Ok(guard.find_eviction_candidates(frame_number, inactivity_threshold, &halt_bytes))
-    }
-
-    fn current_frame(&self) -> u64 {
-        self.current_frame
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,24 +1535,13 @@ mod tests {
         trait_obj.prune_orphan_joins(1000).unwrap();
         assert_eq!(trait_obj.get_prover_count(&filter).unwrap(), 1);
 
-        // evict_inactive_provers with no halts, threshold larger than
-        // the inactive window → no candidates.
-        let empty: HashMap<String, u64> = HashMap::new();
-        let evict = trait_obj.evict_inactive_provers(100, 10000, &empty).unwrap();
-        assert!(evict.is_empty());
-
         // Summaries round-trip through the trait.
         let sums = trait_obj.get_prover_shard_summaries(0).unwrap();
         assert_eq!(sums.len(), 1);
-
-        // current_frame starts at 0, can be set.
-        assert_eq!(trait_obj.current_frame(), 0);
-        shared.set_current_frame(12345);
-        assert_eq!(trait_obj.current_frame(), 12345);
     }
 
     #[test]
-    fn evict_inactive_provers_into_state_kicks_candidates() {
+    fn evict_inactive_provers_kicks_candidates() {
         // Setup: one Active prover with one Active allocation whose
         // LastActiveFrameNumber is 100. Frame=1000, threshold=500 →
         // 900 inactive frames > 500 → eviction candidate. Run the
@@ -1672,7 +1602,7 @@ mod tests {
 
         let halts: HashMap<Vec<u8>, u64> = HashMap::new();
         let evicted = shared
-            .evict_inactive_provers_into_state(1000, 500, &halts, &state)
+            .evict_inactive_provers(1000, 500, &halts, &state)
             .unwrap();
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0], prover_addr.to_vec());

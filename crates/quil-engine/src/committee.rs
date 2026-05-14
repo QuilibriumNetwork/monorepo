@@ -230,104 +230,22 @@ impl DynamicCommittee for ProverRegistryCommittee {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::consensus::{ProverInfo, ProverShardSummary, ProverStatus};
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use quil_types::consensus::{ProverInfo, ProverStatus};
 
-    // ---------- registry stub ----------
-    struct StubRegistry {
-        provers: Mutex<Vec<ProverInfo>>,
-        /// Configurable leader returned by `get_next_prover` regardless
-        /// of input seed (simpler than faking the full ring hash walk).
-        next_leader: Mutex<Option<Vec<u8>>>,
-    }
+    use crate::test_support::TestProverRegistry;
 
+    // Small helpers replacing the legacy `StubRegistry::with*` constructors;
+    // `TestProverRegistry` is shared with worker_allocator/shard_info/lifecycle
+    // tests so the trait impl stays in sync across the crate.
+    struct StubRegistry;
     impl StubRegistry {
         fn with(provers: Vec<ProverInfo>) -> Arc<dyn ProverRegistry> {
-            Arc::new(Self {
-                provers: Mutex::new(provers),
-                next_leader: Mutex::new(None),
-            })
+            Arc::new(TestProverRegistry::with_provers(provers))
         }
         fn with_leader(provers: Vec<ProverInfo>, leader: Vec<u8>) -> Arc<dyn ProverRegistry> {
-            Arc::new(Self {
-                provers: Mutex::new(provers),
-                next_leader: Mutex::new(Some(leader)),
-            })
-        }
-    }
-
-    impl ProverRegistry for StubRegistry {
-        fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>> {
-            let guard = self.provers.lock().unwrap();
-            Ok(guard.iter().find(|p| p.address == address).cloned())
-        }
-        fn get_next_prover(&self, _input: &[u8; 32], _filter: &[u8]) -> Result<Vec<u8>> {
-            if let Some(addr) = self.next_leader.lock().unwrap().clone() {
-                Ok(addr)
-            } else {
-                // Fall back to first prover in list.
-                let guard = self.provers.lock().unwrap();
-                Ok(guard
-                    .first()
-                    .map(|p| p.address.clone())
-                    .unwrap_or_default())
-            }
-        }
-        fn get_ordered_provers(&self, _input: &[u8; 32], _filter: &[u8]) -> Result<Vec<Vec<u8>>> {
-            let guard = self.provers.lock().unwrap();
-            Ok(guard.iter().map(|p| p.address.clone()).collect())
-        }
-        fn get_active_provers(&self, _filter: &[u8]) -> Result<Vec<ProverInfo>> {
-            let guard = self.provers.lock().unwrap();
-            Ok(guard
-                .iter()
-                .filter(|p| p.status == ProverStatus::Active)
-                .cloned()
-                .collect())
-        }
-        fn get_prover_count(&self, _filter: &[u8]) -> Result<usize> {
-            Ok(self.provers.lock().unwrap().len())
-        }
-        fn get_provers(&self, _filter: &[u8]) -> Result<Vec<ProverInfo>> {
-            Ok(self.provers.lock().unwrap().clone())
-        }
-        fn get_provers_by_status(
-            &self,
-            _filter: &[u8],
-            status: ProverStatus,
-        ) -> Result<Vec<ProverInfo>> {
-            let guard = self.provers.lock().unwrap();
-            Ok(guard.iter().filter(|p| p.status == status).cloned().collect())
-        }
-        fn update_prover_activity(
-            &self,
-            _address: &[u8],
-            _filter: &[u8],
-            _frame_number: u64,
-        ) -> Result<()> {
-            Ok(())
-        }
-        fn refresh(&self) -> Result<()> { Ok(()) }
-        fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> {
-            self.get_active_provers(&[])
-        }
-        fn get_prover_shard_summaries(&self, _frame_number: u64) -> Result<Vec<ProverShardSummary>> {
-            Ok(vec![])
-        }
-        fn prune_orphan_joins(&self, _frame_number: u64) -> Result<()> {
-            Ok(())
-        }
-        fn evict_inactive_provers(
-            &self,
-            _frame_number: u64,
-            _inactivity_threshold: u64,
-            _shard_halt_durations: &HashMap<String, u64>,
-        ) -> Result<Vec<Vec<u8>>> {
-            Ok(vec![])
-        }
-        fn current_frame(&self) -> u64 {
-            0
+            let r = TestProverRegistry::with_provers(provers);
+            r.set_next_prover(leader);
+            Arc::new(r)
         }
     }
 
@@ -475,13 +393,14 @@ mod tests {
     }
 
     #[test]
-    fn committee_zero_seniority_gets_weight_one() {
-        // Seniority=0 is pinned to weight=1 so newly-joined provers
-        // can still contribute to quorum.
+    fn committee_seniority_passes_through_to_weight() {
+        // Matches Go's `ConsensusWeightedIdentity.Weight() → c.prover.Seniority`
+        // (consensus_protocol.go:114-116) — no zero-pin. A prover with
+        // seniority 0 has weight 0 and contributes 0 to total weight.
         let committee = make_committee(vec![make_prover(1, 10, 0)], vec![1; 32]);
         let ids = committee.identities_by_rank(0).unwrap();
-        assert_eq!(ids[0].weight(), 1);
-        assert_eq!(committee.total_weight().unwrap(), 1);
+        assert_eq!(ids[0].weight(), 0);
+        assert_eq!(committee.total_weight().unwrap(), 0);
     }
 
     // ---------- DynamicCommittee impl ----------

@@ -93,6 +93,41 @@ impl GlobalExecutionEngine {
         }
     }
 
+    /// Install the prover_registry + reward_issuance + hypergraph
+    /// dependencies that `invoke_frame_header` needs to actually
+    /// mutate state. Without this call, FrameHeader requests
+    /// (shard-coverage attributions) reach `invoke_frame_header` but
+    /// return `Ok(())` early — no `LastActiveFrameNumber` advance, no
+    /// reward distribution, no eviction tracking. Mirrors Go's
+    /// `materializer.NewProverShardUpdateMaterializer` wiring.
+    ///
+    /// The hypergraph dep is needed for `shard_metadata_for_address`
+    /// (the per-ring reward calculation reads state size / shard
+    /// count from the CRDT). It's normally available because the
+    /// engine was built `new_with_intrinsic(.., crdt)`, but the
+    /// intrinsic's internal hypergraph slot is separate from the
+    /// engine's `crdt` field and has to be set independently.
+    pub fn install_frame_header_deps(
+        &mut self,
+        prover_registry: Arc<dyn quil_types::consensus::ProverRegistry>,
+        reward_issuance: Arc<dyn quil_types::consensus::RewardIssuance>,
+        bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor>,
+        inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
+    ) {
+        if let Some(intrinsic) = self.intrinsic.take() {
+            let mut updated = intrinsic
+                .with_frame_header_deps(prover_registry, reward_issuance);
+            if let Some(crdt) = self.crdt.clone() {
+                updated = updated.with_kick_verify_deps(
+                    bls_constructor,
+                    crdt,
+                    inclusion_prover,
+                );
+            }
+            self.intrinsic = Some(updated);
+        }
+    }
+
     /// Create with full dependencies for real signature verification
     /// and state materialization.
     pub fn new_with_intrinsic(
@@ -111,6 +146,10 @@ impl GlobalExecutionEngine {
 }
 
 impl ShardExecutionEngine for GlobalExecutionEngine {
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn get_name(&self) -> &str {
         "global"
     }

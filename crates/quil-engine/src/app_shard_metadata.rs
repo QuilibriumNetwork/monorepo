@@ -102,93 +102,9 @@ mod tests {
     use std::sync::Arc;
 
     use quil_hypergraph::Location;
-    use quil_types::crypto::{InclusionProver, Multiproof};
-    use quil_types::error::{QuilError, Result};
-    use quil_types::store::{ChangeRecord, HypergraphStore, Transaction};
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    struct MemStore {
-        nodes: Mutex<HashMap<String, Vec<u8>>>,
-        roots: Mutex<HashMap<String, Vec<u8>>>,
-    }
-    impl MemStore {
-        fn new() -> Self {
-            Self {
-                nodes: Mutex::new(HashMap::new()),
-                roots: Mutex::new(HashMap::new()),
-            }
-        }
-        fn node_key(set: &str, phase: &str, shard: &ShardKey, key: &[u8]) -> String {
-            format!("n/{}/{}/{:?}{:?}/{:?}", set, phase, shard.l1, shard.l2, key)
-        }
-        fn root_key(set: &str, phase: &str, shard: &ShardKey) -> String {
-            format!("r/{}/{}/{:?}{:?}", set, phase, shard.l1, shard.l2)
-        }
-    }
-    struct NoopTxn;
-    impl Transaction for NoopTxn {
-        fn get(&self, _: &[u8]) -> Result<Option<Vec<u8>>> { Ok(None) }
-        fn set(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-        fn commit(self: Box<Self>) -> Result<()> { Ok(()) }
-        fn delete(&self, _: &[u8]) -> Result<()> { Ok(()) }
-        fn abort(self: Box<Self>) -> Result<()> { Ok(()) }
-        fn new_iter(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn quil_types::store::Iterator>> {
-            Err(QuilError::Internal("noop iter".into()))
-        }
-        fn delete_range(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-        fn as_any(&self) -> &dyn std::any::Any { self }
-    }
-    impl HypergraphStore for MemStore {
-        fn new_transaction(&self, _: bool) -> Result<Box<dyn Transaction>> { Ok(Box::new(NoopTxn)) }
-        fn get_node_by_key(&self, set: &str, phase: &str, shard: &ShardKey, key: &[u8]) -> Result<Option<Vec<u8>>> {
-            Ok(self.nodes.lock().unwrap().get(&Self::node_key(set, phase, shard, key)).cloned())
-        }
-        fn get_node_by_path(&self, _: &str, _: &str, _: &ShardKey, _: &[i32]) -> Result<Option<Vec<u8>>> { Ok(None) }
-        fn insert_node(&self, _: &dyn Transaction, set: &str, phase: &str, shard: &ShardKey, key: &[u8], _: &[i32], data: &[u8]) -> Result<()> {
-            self.nodes.lock().unwrap().insert(Self::node_key(set, phase, shard, key), data.to_vec());
-            Ok(())
-        }
-        fn save_root(&self, _: &dyn Transaction, set: &str, phase: &str, shard: &ShardKey, data: &[u8]) -> Result<()> {
-            self.roots.lock().unwrap().insert(Self::root_key(set, phase, shard), data.to_vec());
-            Ok(())
-        }
-        fn delete_node(&self, _: &dyn Transaction, _: &str, _: &str, _: &ShardKey, _: &[u8], _: &[i32]) -> Result<()> { Ok(()) }
-        fn set_covered_prefix(&self, _: &[i32]) -> Result<()> { Ok(()) }
-        fn set_shard_commit(&self, _: &dyn Transaction, _: u64, _: &str, _: &str, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-        fn get_shard_commit(&self, _: u64, _: &str, _: &str, _: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn get_root_commits(&self, _: u64) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> { Ok(HashMap::new()) }
-        fn load_vertex_underlying_raw(&self, set: &str, phase: &str, shard: &ShardKey, key: &[u8]) -> Result<Option<Vec<u8>>> {
-            Ok(self.nodes.lock().unwrap().get(&Self::node_key(set, phase, shard, key)).cloned())
-        }
-        fn apply_snapshot(&self, _: &str) -> Result<()> { Ok(()) }
-        fn set_alt_shard_commit(&self, _: &dyn Transaction, _: u64, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-        fn get_latest_alt_shard_commit(&self, _: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> { Ok((vec![], vec![], vec![], vec![])) }
-        fn range_alt_shard_addresses(&self) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn reap_old_changesets(&self, _: &dyn Transaction, _: u64) -> Result<()> { Ok(()) }
-        fn track_change(&self, _: &dyn Transaction, _: &[u8], _: Option<&[u8]>, _: u64, _: &str, _: &str, _: &ShardKey) -> Result<()> { Ok(()) }
-        fn get_changes(&self, _: u64, _: u64, _: &str, _: &str, _: &ShardKey) -> Result<Vec<ChangeRecord>> { Ok(vec![]) }
-        fn untrack_change(&self, _: &dyn Transaction, _: &[u8], _: u64, _: &str, _: &str, _: &ShardKey) -> Result<()> { Ok(()) }
-    }
-    struct StubProver;
-    impl InclusionProver for StubProver {
-        fn commit_raw(&self, data: &[u8], _: u64) -> Result<Vec<u8>> {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            data.hash(&mut h);
-            let hash = h.finish().to_be_bytes();
-            let mut out = vec![0u8; 64];
-            out[..8].copy_from_slice(&hash);
-            Ok(out)
-        }
-        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
-            Err(QuilError::Internal("multiproof not supported".into()))
-        }
-        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
-    }
+    use quil_hypergraph::testing::{MemStore, StubProver};
+    use quil_types::crypto::InclusionProver;
+    use quil_types::store::HypergraphStore;
 
     fn make_crdt() -> Arc<HypergraphCrdt> {
         let store: Arc<dyn HypergraphStore> = Arc::new(MemStore::new());

@@ -227,6 +227,7 @@ mod tests {
             proposer_id: "leader".into(),
             parent_qc_identity: "parent".into(),
             parent_qc_rank: rank.saturating_sub(1),
+            parent_quorum_certificate: None,
             timestamp: 0,
             state: AppState { id: id.into(), rank },
         })

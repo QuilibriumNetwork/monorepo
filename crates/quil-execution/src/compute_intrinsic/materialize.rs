@@ -408,69 +408,9 @@ pub fn materialize_code_finalize_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
-    use quil_types::crypto::{InclusionProver, Multiproof};
-    use quil_types::store::{
-        ChangeRecord, HypergraphStore, ShardKey, Transaction,
-        Iterator as KvIterator,
-    };
-
-    // -- Stub infrastructure (same as hypergraph_state tests) ----------
-
-    struct MemStore {
-        nodes: StdMutex<HashMap<String, Vec<u8>>>,
-    }
-    impl MemStore {
-        fn new() -> Self {
-            Self {
-                nodes: StdMutex::new(HashMap::new()),
-            }
-        }
-    }
-    struct NoopTxn;
-    impl Transaction for NoopTxn {
-        fn get(&self, _: &[u8]) -> Result<Option<Vec<u8>>> { Ok(None) }
-        fn set(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-        fn commit(self: Box<Self>) -> Result<()> { Ok(()) }
-        fn delete(&self, _: &[u8]) -> Result<()> { Ok(()) }
-        fn abort(self: Box<Self>) -> Result<()> { Ok(()) }
-        fn new_iter(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn KvIterator>> {
-            Err(QuilError::Internal("iterator not supported on in-memory state".into()))
-        }
-        fn delete_range(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-        fn as_any(&self) -> &dyn std::any::Any { self }
-    }
-    impl HypergraphStore for MemStore {
-        fn new_transaction(&self, _: bool) -> Result<Box<dyn Transaction>> { Ok(Box::new(NoopTxn)) }
-        fn get_node_by_key(&self, _: &str, _: &str, _: &ShardKey, _: &[u8]) -> Result<Option<Vec<u8>>> { Ok(None) }
-        fn get_node_by_path(&self, _: &str, _: &str, _: &ShardKey, _: &[i32]) -> Result<Option<Vec<u8>>> { Ok(None) }
-        fn load_vertex_underlying_raw(&self, _: &str, _: &str, _: &ShardKey, _: &[u8]) -> Result<Option<Vec<u8>>> { Ok(None) }
-        fn insert_node(&self, _: &dyn Transaction, _: &str, _: &str, _: &ShardKey, _: &[u8], _: &[i32], _: &[u8]) -> Result<()> { Ok(()) }
-        fn save_root(&self, _: &dyn Transaction, _: &str, _: &str, _: &ShardKey, _: &[u8]) -> Result<()> { Ok(()) }
-        fn delete_node(&self, _: &dyn Transaction, _: &str, _: &str, _: &ShardKey, _: &[u8], _: &[i32]) -> Result<()> { Ok(()) }
-        fn set_covered_prefix(&self, _: &[i32]) -> Result<()> { Ok(()) }
-        fn set_shard_commit(&self, _: &dyn Transaction, _: u64, _: &str, _: &str, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-        fn get_shard_commit(&self, _: u64, _: &str, _: &str, _: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn get_root_commits(&self, _: u64) -> Result<HashMap<ShardKey, Vec<Vec<u8>>>> { Ok(HashMap::new()) }
-        fn apply_snapshot(&self, _: &str) -> Result<()> { Ok(()) }
-        fn set_alt_shard_commit(&self, _: &dyn Transaction, _: u64, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
-        fn get_latest_alt_shard_commit(&self, _: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> { Ok((vec![], vec![], vec![], vec![])) }
-        fn range_alt_shard_addresses(&self) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn reap_old_changesets(&self, _: &dyn Transaction, _: u64) -> Result<()> { Ok(()) }
-        fn track_change(&self, _: &dyn Transaction, _: &[u8], _: Option<&[u8]>, _: u64, _: &str, _: &str, _: &ShardKey) -> Result<()> { Ok(()) }
-        fn get_changes(&self, _: u64, _: u64, _: &str, _: &str, _: &ShardKey) -> Result<Vec<ChangeRecord>> { Ok(vec![]) }
-        fn untrack_change(&self, _: &dyn Transaction, _: &[u8], _: u64, _: &str, _: &str, _: &ShardKey) -> Result<()> { Ok(()) }
-    }
-    struct StubProver;
-    impl InclusionProver for StubProver {
-        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> { Err(QuilError::Internal("batch multiproof generation not supported".into())) }
-        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
-    }
+    use quil_hypergraph::testing::{MemStore, StubProver};
 
     fn stub_state() -> HypergraphState {
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(

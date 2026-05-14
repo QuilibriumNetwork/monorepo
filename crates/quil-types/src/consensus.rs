@@ -162,6 +162,121 @@ pub struct ProverAllocationInfo {
     pub vertex_address: Vec<u8>,
 }
 
+/// Number of frames an allocation has to be Confirmed or Rejected
+/// before the protocol implicitly treats it as expired. Joining
+/// allocations past `join_frame_number + GRACE` are effectively
+/// rejected; Leaving allocations past `leave_frame_number + GRACE`
+/// are effectively left. Mirrors Go's
+/// `worker_allocator.go::PENDING_FILTER_GRACE_FRAMES`.
+pub const ALLOCATION_GRACE_FRAMES: u64 = 720;
+
+/// The effective state of an allocation at a given frame, with the
+/// 720-frame grace window applied. Prefer this over reading
+/// `alloc.status` directly anywhere the protocol's implicit
+/// expiry semantics matter (TUI panels, server `is_allocated`
+/// flags, halt-risk classification, lifecycle decisions). Open-
+/// coding the grace check at each call site is a known regression
+/// source — `EffectiveStatus` is the single source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveStatus {
+    /// Status byte = Joining, still within the 720-frame grace.
+    Joining,
+    Active,
+    Paused,
+    /// Status byte = Leaving, still within the 720-frame grace.
+    Leaving,
+    /// Status byte = Joining but past `join_frame + 720`. Treated
+    /// as implicitly rejected by the protocol.
+    ExpiredJoining,
+    /// Status byte = Leaving but past `leave_frame + 720`. Treated
+    /// as implicitly left.
+    ExpiredLeaving,
+    Rejected,
+    Kicked,
+    Unknown,
+}
+
+impl EffectiveStatus {
+    /// True when the prover currently OWNS this allocation slot —
+    /// the user can't Join the same filter again because they
+    /// already have an alloc. Used by TUI Available-panel filtering.
+    pub fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::Joining | Self::Active | Self::Paused | Self::Leaving
+        )
+    }
+
+    /// True when the allocation should count toward "currently
+    /// working on this shard" for IsAllocated flags and ring
+    /// computation. Excludes Paused and Leaving (the user owns the
+    /// slot but isn't producing).
+    pub fn is_allocated(self) -> bool {
+        matches!(self, Self::Joining | Self::Active)
+    }
+
+    /// True for Joining/Leaving allocations whose grace window has
+    /// elapsed without a Confirm/Reject landing on chain.
+    pub fn is_expired(self) -> bool {
+        matches!(self, Self::ExpiredJoining | Self::ExpiredLeaving)
+    }
+
+    /// True for terminal end-states the registry will never
+    /// transition out of.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Rejected | Self::Kicked | Self::ExpiredJoining | Self::ExpiredLeaving
+        )
+    }
+}
+
+impl ProverAllocationInfo {
+    /// Resolve `status` + frame-number fields into the protocol's
+    /// effective state at `current_frame`. Applies the 720-frame
+    /// grace window for Joining/Leaving.
+    pub fn effective_status(&self, current_frame: u64) -> EffectiveStatus {
+        match self.status {
+            ProverStatus::Joining => {
+                if self.join_frame_number > 0
+                    && current_frame > self.join_frame_number + ALLOCATION_GRACE_FRAMES
+                {
+                    EffectiveStatus::ExpiredJoining
+                } else {
+                    EffectiveStatus::Joining
+                }
+            }
+            ProverStatus::Active => EffectiveStatus::Active,
+            ProverStatus::Paused => EffectiveStatus::Paused,
+            ProverStatus::Leaving => {
+                if self.leave_frame_number > 0
+                    && current_frame > self.leave_frame_number + ALLOCATION_GRACE_FRAMES
+                {
+                    EffectiveStatus::ExpiredLeaving
+                } else {
+                    EffectiveStatus::Leaving
+                }
+            }
+            ProverStatus::Rejected => EffectiveStatus::Rejected,
+            ProverStatus::Kicked => EffectiveStatus::Kicked,
+            ProverStatus::Unknown => EffectiveStatus::Unknown,
+        }
+    }
+
+    /// Shorthand: is this allocation in any "live" state (owned by
+    /// the prover) at `current_frame`?
+    pub fn is_live(&self, current_frame: u64) -> bool {
+        self.effective_status(current_frame).is_live()
+    }
+
+    /// Shorthand: should this allocation flip `IsAllocated=true`
+    /// in `GetShardInfo` responses at `current_frame`? True only
+    /// for Active and non-expired Joining.
+    pub fn is_allocated(&self, current_frame: u64) -> bool {
+        self.effective_status(current_frame).is_allocated()
+    }
+}
+
 /// Complete prover information.
 #[derive(Debug, Clone)]
 pub struct ProverInfo {
@@ -215,14 +330,30 @@ pub trait ProverRegistry: Send + Sync {
         filter: &[u8],
         status: ProverStatus,
     ) -> Result<Vec<ProverInfo>>;
+    /// Touch the prover's last-active-frame counter under `filter`.
+    /// Default: no-op (test stubs don't care; only the persistent
+    /// registry overrides). Production maintains an in-memory cache
+    /// of allocation activity that drives eviction.
     fn update_prover_activity(
         &self,
-        address: &[u8],
-        filter: &[u8],
-        frame_number: u64,
-    ) -> Result<()>;
-    fn refresh(&self) -> Result<()>;
-    fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>>;
+        _address: &[u8],
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Repopulate the registry's in-memory cache from the persistent
+    /// store. Default: no-op (test stubs hold their state directly).
+    fn refresh(&self) -> Result<()> {
+        Ok(())
+    }
+    /// All Active provers across every non-empty filter. Default
+    /// implementation falls back to `get_active_provers(&[])` so
+    /// test stubs don't need to special-case "any filter" semantics.
+    /// Production overrides to walk the per-prover cache directly.
+    fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> {
+        self.get_active_provers(&[])
+    }
     /// Per-filter prover count grouped by allocation status, with the
     /// 720-frame grace check applied so expired Joining/Leaving
     /// allocations don't inflate `status_counts`. Halt-risk
@@ -239,24 +370,13 @@ pub trait ProverRegistry: Send + Sync {
         &self,
         frame_number: u64,
     ) -> Result<Vec<ProverShardSummary>>;
-    /// Advance the registry's view of the current frame. Mirrors Go's
-    /// `ProverRegistry.ProcessStateTransition` — Go also walks the
-    /// frame's state changeset to update its in-memory cache; the
-    /// Rust port refreshes the cache via `refresh_from_store` on a
-    /// separate cadence, so the trait method only bumps the frame
-    /// counter. Implementations that maintain incremental caches may
-    /// override to do more work.
-    fn process_state_transition(&self, _frame_number: u64) -> Result<()> {
+    /// Drop stale Joining vertices that never confirmed.
+    /// Default: no-op (test stubs don't track orphan lifecycle).
+    /// Production walks the prover cache and removes entries past
+    /// the 720-frame grace.
+    fn prune_orphan_joins(&self, _frame_number: u64) -> Result<()> {
         Ok(())
     }
-    fn prune_orphan_joins(&self, frame_number: u64) -> Result<()>;
-    fn evict_inactive_provers(
-        &self,
-        frame_number: u64,
-        inactivity_threshold: u64,
-        shard_halt_durations: &HashMap<String, u64>,
-    ) -> Result<Vec<Vec<u8>>>;
-    fn current_frame(&self) -> u64;
 }
 
 // ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ mod worker;
 pub mod import;
 pub mod migration;
 pub mod disk_monitor;
+pub mod testing;
 
 pub use rocksdb_store::{RocksDb, RocksTransaction, RocksIterator};
 pub use clock::RocksClockStore;

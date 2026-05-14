@@ -57,6 +57,21 @@ pub struct ConsensusActivationParams {
     /// the clock store so `prove_next_state` for rank+1 can resolve
     /// the latest-QC frame_number/identity.
     pub on_qc_observed: Option<crate::consensus_glue::QcObservedHook>,
+    /// Override the consensus configuration. Production callers
+    /// leave this at `None` to use the default 45s startup delay +
+    /// 10s proposal duration. Integration tests set
+    /// `startup_delay: Duration::ZERO` so the event loop runs
+    /// immediately.
+    pub config_override: Option<ConsensusConfig>,
+    /// Override the genesis quorum certificate seeded into the
+    /// liveness store. Production passes `None` and accepts the
+    /// default empty-signature genesis (the happy path embeds it
+    /// but never re-verifies). Integration tests that drive the
+    /// loop into timeout/recovery paths need a real BLS-aggregated
+    /// signature here — otherwise `BlsConsensusVerifier::verify_quorum_certificate`
+    /// rejects the embedded genesis QC and the chain stalls.
+    pub genesis_qc_override:
+        Option<crate::consensus_wire::QuorumCertificate>,
 }
 
 /// What `activate_consensus` produces: the event-loop handle plus
@@ -71,7 +86,7 @@ pub struct ConsensusActivation {
 
 /// Start the consensus event loop.
 pub fn activate_consensus(params: ConsensusActivationParams) -> Result<ConsensusActivation> {
-    let config = ConsensusConfig::default();
+    let config = params.config_override.clone().unwrap_or_default();
 
     // The bls_signer is consumed: leader_provider needs it to sign the
     // (challenge||output) payload inside ProveGlobalFrameHeader. Convert
@@ -164,10 +179,12 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
                 .unwrap_or_default(),
             None => Vec::new(),
         };
-        let genesis_qc = crate::consensus_wire::QuorumCertificate::genesis(
-            0, // genesis frame number
-            frame_identity,
-        );
+        let genesis_qc = params.genesis_qc_override.clone().unwrap_or_else(|| {
+            crate::consensus_wire::QuorumCertificate::genesis(
+                0, // genesis frame number
+                frame_identity,
+            )
+        });
         let genesis_qc_obj: Arc<dyn quil_consensus::models::QuorumCertificate> =
             genesis_qc.into_trait_object();
         // current_rank starts at 1: the genesis QC is for rank 0, and

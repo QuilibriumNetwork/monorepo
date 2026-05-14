@@ -452,6 +452,7 @@ mod tests {
             proposer_id: b"leader".to_vec(),
             parent_qc_identity: b"parent".to_vec(),
             parent_qc_rank: rank.saturating_sub(1),
+            parent_quorum_certificate: None,
             timestamp: 0,
             state: AppState { id: id.into(), rank },
         }

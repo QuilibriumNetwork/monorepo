@@ -331,3 +331,129 @@ pub fn spawn_archive_poller(
         info!("archive frame poller stopped");
     })
 }
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn add_then_get_all_returns_endpoints_in_order() {
+        let pool = ArchiveEndpointPool::new();
+        pool.add("a.example.com:443".into()).await;
+        pool.add("b.example.com:443".into()).await;
+        let all = pool.get_all().await;
+        assert_eq!(all, vec!["a.example.com:443", "b.example.com:443"]);
+    }
+
+    #[tokio::test]
+    async fn add_dedups_existing_endpoint() {
+        let pool = ArchiveEndpointPool::new();
+        pool.add("a.example.com:443".into()).await;
+        pool.add("a.example.com:443".into()).await;
+        assert_eq!(pool.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn next_rotates_round_robin() {
+        let pool = ArchiveEndpointPool::new();
+        for ep in ["a:1", "b:1", "c:1"] {
+            pool.add(ep.into()).await;
+        }
+        let picks: Vec<_> = vec![
+            pool.next().await,
+            pool.next().await,
+            pool.next().await,
+            pool.next().await,
+        ];
+        // First three should hit every endpoint once.
+        let mut sorted = picks
+            .iter()
+            .take(3)
+            .map(|o| o.clone().unwrap())
+            .collect::<Vec<_>>();
+        sorted.sort();
+        assert_eq!(sorted, vec!["a:1", "b:1", "c:1"]);
+        // Fourth wraps to "a:1" again.
+        assert_eq!(picks[3].as_deref(), Some("a:1"));
+    }
+
+    #[tokio::test]
+    async fn blacklist_removes_endpoint_from_rotation() {
+        let pool = ArchiveEndpointPool::new();
+        pool.add("a:1".into()).await;
+        pool.add("b:1".into()).await;
+        pool.blacklist("a:1").await;
+        // After blacklist, only "b:1" comes out — and re-add is rejected.
+        assert_eq!(pool.next().await.as_deref(), Some("b:1"));
+        assert_eq!(pool.next().await.as_deref(), Some("b:1"));
+        pool.add("a:1".into()).await;
+        assert_eq!(
+            pool.get_all().await,
+            vec!["b:1"],
+            "blacklisted endpoint must not be re-addable"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_returns_none_on_empty_pool() {
+        let pool = ArchiveEndpointPool::new();
+        assert!(pool.next().await.is_none());
+    }
+
+    /// `wait_nonempty` must release as soon as an endpoint arrives,
+    /// without spinning. Models the poller's startup ordering: spawn
+    /// poller → PeerInfo discovery feeds endpoint → poller resumes.
+    #[tokio::test]
+    async fn wait_nonempty_releases_on_add() {
+        let pool = Arc::new(ArchiveEndpointPool::new());
+        let cancel = CancellationToken::new();
+        let waiter_pool = pool.clone();
+        let waiter_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_pool.wait_nonempty(&waiter_cancel).await;
+            std::time::Instant::now()
+        });
+        // Give the waiter time to park.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let added_at = std::time::Instant::now();
+        pool.add("x:1".into()).await;
+        let released_at = waiter.await.expect("waiter join");
+        // Should release within a few ms after add.
+        let gap = released_at.saturating_duration_since(added_at);
+        assert!(
+            gap < Duration::from_millis(200),
+            "wait_nonempty took {gap:?} to release after add — expected <200ms"
+        );
+    }
+
+    /// Cancellation must unblock `wait_nonempty` even with no
+    /// endpoints — otherwise shutdown hangs.
+    #[tokio::test]
+    async fn wait_nonempty_respects_cancellation() {
+        let pool = Arc::new(ArchiveEndpointPool::new());
+        let cancel = CancellationToken::new();
+        let waiter_pool = pool.clone();
+        let waiter_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_pool.wait_nonempty(&waiter_cancel).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("cancellation must unblock wait_nonempty")
+            .expect("waiter join");
+    }
+
+    /// Poller config defaults must match Go's behavior: 1s tick,
+    /// 30s call timeout, no forward-fill on a fresh non-archive node.
+    /// A drift here silently changes catch-up semantics in production.
+    #[test]
+    fn default_config_matches_go_poll_frames_from_archive() {
+        let cfg = ArchivePollerConfig::default();
+        assert_eq!(cfg.poll_interval, Duration::from_secs(1));
+        assert_eq!(cfg.call_timeout, Duration::from_secs(30));
+        assert!(cfg.on_frame.is_none());
+        assert!(!cfg.forward_fill);
+    }
+}

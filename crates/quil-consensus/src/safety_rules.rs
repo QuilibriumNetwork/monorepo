@@ -664,6 +664,7 @@ mod tests {
                 proposer_id: leader.into(),
                 parent_qc_identity: format!("qc-{}", parent_qc_rank).into_bytes(),
                 parent_qc_rank,
+                parent_quorum_certificate: None,
                 timestamp: 0,
                 state: TestState {
                     id: format!("state-{}", rank).into_bytes(),
@@ -671,6 +672,10 @@ mod tests {
                     rank,
                 },
             },
+            parent_quorum_certificate: Arc::new(StubQc {
+                rank: parent_qc_rank,
+                identity: format!("qc-{}", parent_qc_rank).into_bytes(),
+            }),
             previous_rank_timeout_certificate: None,
         }
     }

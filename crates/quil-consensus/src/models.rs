@@ -54,6 +54,12 @@ pub trait WeightedIdentity: Send + Sync + Debug {
 }
 
 /// A consensus state (block), parameterized over the application state type.
+///
+/// `parent_quorum_certificate` mirrors Go's `models.State.ParentQuorumCertificate` —
+/// the QC at the parent's rank that certified the parent. `None` only for
+/// genesis (no parent). The `parent_qc_identity` / `parent_qc_rank` fields
+/// are kept as a redundant shortcut for callers that only need the
+/// reference without paying for QC trait-object dispatch / serialization.
 #[derive(Debug, Clone)]
 pub struct State<S: Unique> {
     pub rank: u64,
@@ -61,6 +67,7 @@ pub struct State<S: Unique> {
     pub proposer_id: Identity,
     pub parent_qc_identity: Identity,
     pub parent_qc_rank: u64,
+    pub parent_quorum_certificate: Option<Arc<dyn QuorumCertificate>>,
     pub timestamp: u64,
     pub state: S,
 }
@@ -91,11 +98,20 @@ pub struct SignedProposal<S: Unique, V: Unique> {
 }
 
 /// A certified state: state + the QC that certifies it.
+///
+/// `certifying_quorum_certificate` mirrors Go's
+/// `models.CertifiedState.CertifyingQuorumCertificate` — the QC at this
+/// state's rank that aggregated the supermajority votes proving the
+/// state. `None` is allowed for genesis / legacy paths that construct
+/// CertifiedStates without the QC trait object; production paths
+/// populate it so consumers (e.g. `AppFollower` for coverage emission)
+/// can read the aggregated signature directly.
 #[derive(Debug, Clone)]
 pub struct CertifiedState<S: Unique> {
     pub state: State<S>,
     pub certifying_qc_identity: Identity,
     pub certifying_qc_rank: u64,
+    pub certifying_quorum_certificate: Option<Arc<dyn QuorumCertificate>>,
 }
 
 /// Timeout state broadcast by a node when its local timer fires.

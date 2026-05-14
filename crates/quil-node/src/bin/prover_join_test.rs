@@ -294,8 +294,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 info!(provers = reg.read(|r| r.distinct_provers()), "registry loaded");
 
+                // 0 frame_number is OK here — the diagnostic
+                // binary doesn't care about expiry filtering of
+                // Joining/Leaving for the shard population it
+                // reports.
                 let sums: Vec<quil_types::consensus::ProverShardSummary> =
-                    reg.read(|r| r.get_prover_shard_summaries());
+                    reg.read(|r| r.get_prover_shard_summaries(0));
                 let mut cands: Vec<(u32, Vec<u8>)> = sums.iter().map(|s| {
                     let a = s.status_counts.get(&quil_types::consensus::ProverStatus::Active).copied().unwrap_or(0);
                     (a, s.filter.clone())

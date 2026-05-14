@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use quil_types::crypto::{InclusionProver, Multiproof};
 use quil_types::error::{QuilError, Result};
 use quil_types::store::{
     ChangeRecord, HypergraphStore, Iterator as KvIterator, ShardKey, Transaction,
@@ -47,11 +48,11 @@ impl MemStore {
     }
 
     fn node_key(set: &str, phase: &str, shard: &ShardKey, key: &[u8]) -> String {
-        format!("{}/{}/{:?}/{:?}", set, phase, shard.l1, key)
+        format!("{}/{}/{:?}{:?}/{:?}", set, phase, shard.l1, shard.l2, key)
     }
 
     fn root_key(set: &str, phase: &str, shard: &ShardKey) -> String {
-        format!("root/{}/{}/{:?}", set, phase, shard.l1)
+        format!("root/{}/{}/{:?}{:?}", set, phase, shard.l1, shard.l2)
     }
 }
 
@@ -93,4 +94,29 @@ impl HypergraphStore for MemStore {
     fn track_change(&self, _: &dyn Transaction, _: &[u8], _: Option<&[u8]>, _: u64, _: &str, _: &str, _: &ShardKey) -> Result<()> { Ok(()) }
     fn get_changes(&self, _: u64, _: u64, _: &str, _: &str, _: &ShardKey) -> Result<Vec<ChangeRecord>> { Ok(vec![]) }
     fn untrack_change(&self, _: &dyn Transaction, _: &[u8], _: u64, _: &str, _: &str, _: &ShardKey) -> Result<()> { Ok(()) }
+}
+
+/// Minimal `InclusionProver` for tests that need a deterministic
+/// 64-byte commitment over arbitrary input bytes. Uses the standard
+/// library's `DefaultHasher` so the result is stable within a process
+/// run; the leading 8 bytes are the hash, the rest is zero-padded.
+pub struct StubProver;
+
+impl InclusionProver for StubProver {
+    fn commit_raw(&self, data: &[u8], _: u64) -> Result<Vec<u8>> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        data.hash(&mut h);
+        let hash = h.finish().to_be_bytes();
+        let mut out = vec![0u8; 64];
+        out[..8].copy_from_slice(&hash);
+        Ok(out)
+    }
+    fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
+    fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
+    fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+        Err(QuilError::Internal("batch multiproof generation not supported".into()))
+    }
+    fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
 }

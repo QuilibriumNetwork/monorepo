@@ -216,11 +216,23 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
     /// leader.
     pub fn on_receive_proposal(&self, proposal: &SignedProposal<S, V>) -> Result<()> {
         let cur_rank = self.current_rank();
+        tracing::debug!(
+            cur_rank,
+            proposal_rank = proposal.proposal.state.rank,
+            proposer = %hex::encode(&proposal.proposal.state.proposer_id),
+            "received proposal",
+        );
         self.notifier.on_receive_proposal(cur_rank, proposal);
 
         // Drop stale proposals.
         let finalized = self.forks.lock().unwrap().finalized_rank();
         if proposal.proposal.state.rank < finalized {
+            tracing::debug!(
+                cur_rank,
+                proposal_rank = proposal.proposal.state.rank,
+                finalized,
+                "dropping stale proposal",
+            );
             self.notifier.on_event_processed();
             return Ok(());
         }
@@ -430,6 +442,12 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
 
         let self_id = self.committee.self_identity().clone();
         if self_id != current_leader {
+            tracing::debug!(
+                cur_rank,
+                self_id = %hex::encode(&self_id),
+                leader = %hex::encode(&current_leader),
+                "not the leader for this rank — skipping proposal",
+            );
             return Ok(());
         }
 
@@ -442,6 +460,11 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             .last_proposed_rank
             .load(std::sync::atomic::Ordering::Acquire);
         if cur_rank <= prior {
+            tracing::debug!(
+                cur_rank,
+                last_proposed = prior,
+                "already proposed for this or a later rank — skipping",
+            );
             return Ok(());
         }
 
@@ -453,6 +476,12 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             .get_state(newest_qc.identity())
             .is_some();
         if !parent_known {
+            tracing::debug!(
+                cur_rank,
+                qc_rank = newest_qc.rank(),
+                qc_identity = %hex::encode(newest_qc.identity()),
+                "parent state not in forks tree — skipping proposal",
+            );
             return Ok(());
         }
 
@@ -485,7 +514,14 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             .make_state_proposal(cur_rank, Arc::clone(&newest_qc), prior_tc)
         {
             Ok(sp) => sp,
-            Err(e) if e.is_no_vote() => return Ok(()),
+            Err(e) if e.is_no_vote() => {
+                tracing::debug!(
+                    cur_rank,
+                    error = %e,
+                    "safety rules said NoVote — skipping proposal",
+                );
+                return Ok(());
+            }
             Err(e) => {
                 return Err(QuilError::Consensus(format!(
                     "can not make state proposal for curRank {}: {}",
@@ -532,6 +568,11 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         let cur_rank = self.current_rank();
         let proposal_rank = proposal.proposal.state.rank;
         if proposal_rank != cur_rank {
+            tracing::debug!(
+                proposal_rank,
+                cur_rank,
+                "proposal rank does not match current rank — skipping vote",
+            );
             return Ok(());
         }
         let next_leader = self
@@ -550,6 +591,11 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         cur_rank: u64,
         next_leader: &Identity,
     ) -> Result<()> {
+        tracing::debug!(
+            cur_rank,
+            parent_id = %hex::encode(&proposal.proposal.state.parent_qc_identity),
+            "entering own_vote",
+        );
         let parent_known = self
             .forks
             .lock()
@@ -557,6 +603,11 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             .get_state(&proposal.proposal.state.parent_qc_identity)
             .is_some();
         if !parent_known {
+            tracing::warn!(
+                cur_rank,
+                parent_id = %hex::encode(&proposal.proposal.state.parent_qc_identity),
+                "won't vote for proposal — no parent state in forks",
+            );
             return Err(QuilError::Consensus(
                 "won't vote for proposal, no parent state for this proposal".into(),
             ));
@@ -578,7 +629,14 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             let mut sr = self.safety_rules.lock().unwrap();
             match sr.produce_vote(proposal, cur_rank) {
                 Ok(v) => v,
-                Err(e) if e.is_no_vote() => return Ok(()),
+                Err(e) if e.is_no_vote() => {
+                    tracing::debug!(
+                        cur_rank,
+                        error = %e,
+                        "safety rules said NoVote on follower vote — skipping",
+                    );
+                    return Ok(());
+                }
                 Err(e) => {
                     return Err(QuilError::Consensus(format!("could not produce vote: {}", e)))
                 }
@@ -841,6 +899,7 @@ mod tests {
                 proposer_id: b"leader".to_vec(),
                 parent_qc_identity: prior_state.clone(),
                 parent_qc_rank: rank.saturating_sub(1),
+                parent_quorum_certificate: None,
                 timestamp: 0,
                 state: AppState {
                     id: format!("state-{}", rank).into_bytes(),
@@ -924,7 +983,7 @@ mod tests {
     struct NoopFollower;
     impl FollowerConsumer<AppState> for NoopFollower {
         fn on_state_incorporated(&self, _s: &State<AppState>) {}
-        fn on_finalized_state(&self, _s: &State<AppState>) {}
+        fn on_finalized_state(&self, _c: &CertifiedState<AppState>) {}
         fn on_double_propose_detected(&self, _a: &State<AppState>, _b: &State<AppState>) {}
     }
 
@@ -958,6 +1017,7 @@ mod tests {
             proposer_id: "leader".into(),
             parent_qc_identity: "genesis".into(),
             parent_qc_rank: 0,
+            parent_quorum_certificate: None,
             timestamp: 0,
             state: AppState { id: "genesis".into(), rank: 0 },
         };
@@ -965,6 +1025,7 @@ mod tests {
             state: genesis,
             certifying_qc_identity: "genesis".into(),
             certifying_qc_rank: 0,
+            certifying_quorum_certificate: None,
         };
         let forks =
             Forks::new(root_cert, Arc::new(NoopFinalizer), Arc::new(NoopFollower)).unwrap();
@@ -1024,6 +1085,7 @@ mod tests {
                     proposer_id: "leader".into(),
                     parent_qc_identity: parent_qc_id.into(),
                     parent_qc_rank,
+                    parent_quorum_certificate: None,
                     timestamp: 0,
                     state: AppState { id: state_id.into(), rank },
                 },
@@ -1194,11 +1256,13 @@ mod tests {
                         proposer_id: "leader".into(),
                         parent_qc_identity: "genesis".into(),
                         parent_qc_rank: 0,
+                        parent_quorum_certificate: None,
                         timestamp: 0,
                         state: AppState { id: "state-4".into(), rank: 4 },
                     },
                     certifying_qc_identity: "state-4".into(),
                     certifying_qc_rank: 4,
+                    certifying_quorum_certificate: None,
                 })
                 .ok();
         }

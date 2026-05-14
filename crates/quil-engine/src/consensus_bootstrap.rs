@@ -21,6 +21,7 @@ use quil_consensus::state_producer::StateProducer;
 use crate::consensus_types::{GlobalState, GlobalVote};
 
 /// Configuration for the consensus event loop.
+#[derive(Clone)]
 pub struct ConsensusConfig {
     pub filter: Vec<u8>,
     pub min_timeout: Duration,
@@ -29,6 +30,12 @@ pub struct ConsensusConfig {
     pub happy_path_max_round_failures: u64,
     pub max_rebroadcast_interval: Duration,
     pub proposal_duration: Duration,
+    /// Grace period before the consensus event loop emits its first
+    /// proposal. Production needs this for the BlossomSub mesh to
+    /// finish forming (~25-30s of formation latency observed); tests
+    /// should set it to `Duration::ZERO` so the loop runs
+    /// immediately under `tokio::time::pause()`.
+    pub startup_delay: Duration,
 }
 
 impl Default for ConsensusConfig {
@@ -57,6 +64,7 @@ impl Default for ConsensusConfig {
             happy_path_max_round_failures: 6,
             max_rebroadcast_interval: Duration::from_secs(28),
             proposal_duration: Duration::from_secs(10),
+            startup_delay: Duration::from_secs(45),
         }
     }
 }
@@ -115,6 +123,7 @@ pub fn spawn_global_consensus(
         safety_rules,
         committee,
         notifier,
+        startup_delay: config.startup_delay,
     })
 }
 
@@ -126,6 +135,9 @@ pub struct ConsensusComponents {
     pub safety_rules: Arc<Mutex<SafetyRules<GlobalState, GlobalVote>>>,
     pub committee: Arc<dyn Replicas>,
     pub notifier: Arc<dyn Consumer<GlobalState, GlobalVote>>,
+    /// Startup grace period for the event loop. Production uses 45s
+    /// (mesh formation latency); tests set `Duration::ZERO`.
+    pub startup_delay: Duration,
 }
 
 impl ConsensusComponents {
@@ -148,19 +160,19 @@ impl ConsensusComponents {
             self.notifier,
         ));
 
-        // Delay consensus loop start by 45s so the BlossomSub mesh has
-        // time to form before the leader broadcasts its first proposal.
-        // BlossomSub heartbeats every 1s and we observed first network
-        // message arrival ~25–30s after startup on the local 4-node
+        // Delay consensus loop start by `startup_delay` so the
+        // BlossomSub mesh has time to form before the leader
+        // broadcasts its first proposal. Production uses 45s
+        // (BlossomSub heartbeats every 1s; first network message
+        // arrival observed ~25-30s after startup on a local 4-node
         // bootstrap; a 20s delay was not enough to clear that
-        // formation latency. Without the delay, the leader's initial
-        // GlobalProposal lands on a bitmask that has zero peers
-        // grafted into the mesh — followers never see the proposal,
-        // never vote, and the chain stalls at rank 1.
-        let (event_loop, handle) = EventLoop::new(
-            handler,
-            Instant::now() + std::time::Duration::from_secs(45),
-        );
+        // formation latency). Without sufficient delay, the
+        // leader's initial GlobalProposal lands on a bitmask that
+        // has zero peers grafted into the mesh — followers never
+        // see the proposal, never vote, and the chain stalls at
+        // rank 1. Tests can set `startup_delay = Duration::ZERO`
+        // to skip the wait entirely.
+        let (event_loop, handle) = EventLoop::new(handler, Instant::now() + self.startup_delay);
 
         tokio::spawn(async move {
             if let Err(e) = event_loop.run().await {
@@ -180,9 +192,15 @@ mod tests {
     #[test]
     fn consensus_config_default_values() {
         let c = ConsensusConfig::default();
+        // Mirrors Go's participant.go:46-106; proposal_duration bumped
+        // from 8s to 10s (see Default impl docstring).
         assert_eq!(c.filter, vec![0x00]);
-        assert_eq!(c.min_timeout, Duration::from_secs(10));
-        assert_eq!(c.max_timeout, Duration::from_secs(60));
+        assert_eq!(c.min_timeout, Duration::from_secs(36));
+        assert_eq!(c.max_timeout, Duration::from_secs(180));
+        assert_eq!(c.timeout_adjustment_factor, 1.2);
+        assert_eq!(c.happy_path_max_round_failures, 6);
+        assert_eq!(c.max_rebroadcast_interval, Duration::from_secs(28));
         assert_eq!(c.proposal_duration, Duration::from_secs(10));
+        assert_eq!(c.startup_delay, Duration::from_secs(45));
     }
 }

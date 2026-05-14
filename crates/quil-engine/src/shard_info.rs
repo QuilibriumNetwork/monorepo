@@ -340,30 +340,17 @@ where
                 Err(_) => continue,
             };
 
-            // Build sorted ring candidates.
-            //
-            // Skip expired Joining allocs (status still Joining on
-            // chain because no Confirm/Reject landed within the
-            // 720-frame grace window). Without this guard, an
-            // expired Joining alloc still in the prover's allocation
-            // list would push the local prover into `candidates`
-            // and downstream code (line 379-381) would compute
-            // `in_candidates = true → real_is_alloc = true`, leaking
-            // the shard out of the TUI's Available panel.
+            // Build sorted ring candidates. Only Active + non-
+            // expired Joining count (per `is_allocated`); expired
+            // Joining allocs are implicitly rejected by the
+            // protocol and must not push the prover into the ring.
             let mut candidates: Vec<RingCandidate> = Vec::new();
             for pr in &prs {
                 for alloc in &pr.allocations {
                     if alloc.confirmation_filter != bp {
                         continue;
                     }
-                    if alloc.status == ProverStatus::Joining
-                        && frame_number > alloc.join_frame_number + 720
-                    {
-                        break;
-                    }
-                    if alloc.status == ProverStatus::Active
-                        || alloc.status == ProverStatus::Joining
-                    {
+                    if alloc.is_allocated(frame_number) {
                         let jf = if alloc.join_frame_number == 0
                             && alloc.join_confirm_frame_number != 0
                         {
@@ -563,27 +550,12 @@ pub fn build_allocated_filters(
     prover: &ProverInfo,
     current_frame: u64,
 ) -> HashSet<Vec<u8>> {
-    let mut filters = HashSet::new();
-
-    for alloc in &prover.allocations {
-        if alloc.status == ProverStatus::Joining
-            && current_frame > alloc.join_frame_number + 720
-        {
-            continue;
-        }
-        if alloc.status == ProverStatus::Leaving
-            && current_frame > alloc.leave_frame_number + 720
-        {
-            continue;
-        }
-        if alloc.status == ProverStatus::Active
-            || alloc.status == ProverStatus::Joining
-        {
-            filters.insert(alloc.confirmation_filter.clone());
-        }
-    }
-
-    filters
+    prover
+        .allocations
+        .iter()
+        .filter(|a| a.is_allocated(current_frame))
+        .map(|a| a.confirmation_filter.clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,8 +1033,6 @@ mod tests {
         prover_pubkey: Vec<u8>,
     }
     impl ProverRegistry for StubRegistry {
-        fn refresh(&self) -> QResult<()> { Ok(()) }
-        fn get_all_active_app_shard_provers(&self) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
         fn get_prover_info(&self, _: &[u8]) -> QResult<Option<ProverInfo>> { Ok(None) }
         fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> QResult<Vec<u8>> { Ok(vec![]) }
         fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
@@ -1097,18 +1067,7 @@ mod tests {
             }])
         }
         fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
-        fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> QResult<()> { Ok(()) }
         fn get_prover_shard_summaries(&self, _: u64) -> QResult<Vec<ProverShardSummary>> { Ok(vec![]) }
-        fn prune_orphan_joins(&self, _: u64) -> QResult<()> { Ok(()) }
-        fn evict_inactive_provers(
-            &self,
-            _: u64,
-            _: u64,
-            _: &HashMap<String, u64>,
-        ) -> QResult<Vec<Vec<u8>>> {
-            Ok(vec![])
-        }
-        fn current_frame(&self) -> u64 { 100 }
     }
 
     #[test]

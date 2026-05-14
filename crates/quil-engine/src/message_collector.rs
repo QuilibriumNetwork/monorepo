@@ -354,8 +354,11 @@ mod tests {
 
     #[test]
     fn spillover_drains_on_collect() {
-        // collect_for_rank(rank) drains spillover entries for ranks
-        // <= rank and merges them into the returned message list.
+        // `collect_for_rank(rank)` drains every live buffer and every
+        // spillover bucket for ranks `<= rank`, then caps the merged
+        // result at `MAX_MESSAGES_PER_FRAME` (proposals can't carry
+        // more than the per-frame cap regardless of how much was
+        // queued).
         let mc = MessageCollector::new();
         // Fill rank 0 to capacity + spill 2.
         for i in 0..MAX_MESSAGES_PER_FRAME + 2 {
@@ -368,17 +371,16 @@ mod tests {
         }
         assert_eq!(mc.spillover_count(1), 3);
 
-        // Collect rank 1 → drains rank 1 buffer + spillover for ranks
-        // 0 AND 1. Rank 0's live buffer is NOT drained (collect targets
-        // a single rank's buffer); only rank 0's spillover comes along.
+        // Total queued = 2 * MAX + 5 = 205. After collect, the merged
+        // set is truncated to MAX_MESSAGES_PER_FRAME.
         let msgs = mc.collect_for_rank(1);
-        assert_eq!(
-            msgs.len(),
-            MAX_MESSAGES_PER_FRAME + 3 + 2,
-            "expected rank-1 live buffer + spillover for ranks <= 1"
-        );
+        assert_eq!(msgs.len(), MAX_MESSAGES_PER_FRAME);
+        // Both spillover buckets drain on collect.
         assert_eq!(mc.spillover_count(0), 0);
         assert_eq!(mc.spillover_count(1), 0);
+        // Live buffers also drain (single rank-view: producer & consumer share).
+        assert_eq!(mc.pending_count(0), 0);
+        assert_eq!(mc.pending_count(1), 0);
     }
 
     #[test]
@@ -398,13 +400,16 @@ mod tests {
         mc.add_message(15, b"recent".to_vec());
         mc.add_message(20, b"new".to_vec());
 
-        mc.collect_for_rank(20);
-        // Rank 1 should be pruned (20 - 10 = 10, 1 < 10)
+        let msgs = mc.collect_for_rank(20);
+        // Producer and consumer share a single rank view: collect_for_rank
+        // drains EVERY live rank `<= rank`, not just the target rank.
+        // All three ranks (1, 15, 20) drain.
+        assert_eq!(msgs.len(), 3);
+        // Retention prune: rank 1 < 20 - RETENTION_WINDOW(10) → bucket dropped.
         assert_eq!(mc.pending_count(1), 0);
-        // Rank 15 is within window (15 >= 10), still has its message
-        assert_eq!(mc.pending_count(15), 1);
-        // Total: rank 15's message (rank 20 was drained by collect)
-        assert_eq!(mc.total_pending(), 1);
+        // Rank 15 stays inside the retention window but is now empty.
+        assert_eq!(mc.pending_count(15), 0);
+        assert_eq!(mc.total_pending(), 0);
     }
 
     #[test]

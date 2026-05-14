@@ -212,22 +212,38 @@ pub struct AllocationSnapshot {
 }
 
 /// Tracks the mapping between workers and their shard assignments.
+/// The cooldown kinds tracked by [`WorkerAllocator`]. Each gates a
+/// distinct proposer side-effect (join, forced-reject batch,
+/// seniority merge). Adding a new cooldown is a single enum variant
+/// plus a `[AtomicU64; N]` constant update — no parallel
+/// getter/setter pair to maintain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cooldown {
+    /// Last frame at which a ProverJoin was proposed. 4-frame
+    /// cooldown — `ProverLifecycle::propose_ready` reads this.
+    Join = 0,
+    /// Last frame at which a forced-reject batch was emitted for
+    /// excess pending joins. Matches Go's `engine.lastRejectFrame`
+    /// at `worker_allocator.go:1395-1412`.
+    Reject = 1,
+    /// Last frame at which a seniority-merge attempt was made.
+    /// 10-frame cooldown (worker_allocator.go:980-998).
+    SeniorityMerge = 2,
+}
+
+const COOLDOWN_KINDS: usize = 3;
+
 pub struct WorkerAllocator {
     worker_manager: Arc<dyn WorkerManager>,
     prover_registry: Arc<dyn ProverRegistry>,
     /// This node's prover address (32 bytes).
     local_prover_address: Vec<u8>,
-    /// Last frame where a join was attempted (debounce).
-    last_join_attempt_frame: std::sync::atomic::AtomicU64,
-    /// Last frame where a forced-reject batch was emitted. Used by
-    /// `ProverLifecycle::evaluate` to cool down excess-pending-join
-    /// rejections (matches Go's `engine.lastRejectFrame` at
-    /// `worker_allocator.go:1395-1412`).
-    last_reject_frame: std::sync::atomic::AtomicU64,
-    /// Last frame where a seniority-merge attempt was made. Matches
-    /// Go's `lastSeniorityMergeFrame` (worker_allocator.go:980-998) —
-    /// 10-frame cooldown between attempts.
-    last_seniority_merge_frame: std::sync::atomic::AtomicU64,
+    /// Per-`Cooldown` last-attempt-frame counter. Indexed by
+    /// `Cooldown as usize`. A separate `[AtomicU64; N]` instead of
+    /// a `HashMap` because the kind set is small, fixed, and
+    /// known at compile time — no need to pay for hashing or
+    /// allocation on every access.
+    cooldowns: [std::sync::atomic::AtomicU64; COOLDOWN_KINDS],
     /// Cached aggregated-seniority estimate for our local peer IDs
     /// (own + any `multisig_prover_enrollment_paths`), computed once at
     /// startup from `seniority_compat::get_aggregated_seniority`. Matches
@@ -246,9 +262,11 @@ impl WorkerAllocator {
             worker_manager,
             prover_registry,
             local_prover_address,
-            last_join_attempt_frame: std::sync::atomic::AtomicU64::new(0),
-            last_reject_frame: std::sync::atomic::AtomicU64::new(0),
-            last_seniority_merge_frame: std::sync::atomic::AtomicU64::new(0),
+            cooldowns: [
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+            ],
             config_seniority_estimate: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -269,45 +287,47 @@ impl WorkerAllocator {
             .store(estimate, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Most recent frame at which a seniority-merge attempt was made.
+    /// Most recent frame at which this node attempted `kind`. The
+    /// canonical read for cooldown gates — see
+    /// `LifecycleReadiness::propose_ready`.
+    pub fn last_attempt(&self, kind: Cooldown) -> u64 {
+        self.cooldowns[kind as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record an attempt of `kind` at `frame_number`. Monotonic via
+    /// `fetch_max` so out-of-order callers can't accidentally
+    /// regress the cooldown clock.
+    pub fn record_attempt(&self, kind: Cooldown, frame_number: u64) {
+        self.cooldowns[kind as usize]
+            .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // ---------------------------------------------------------------
+    // Compatibility shims — callers gradually migrating to the
+    // `Cooldown` enum can keep using these named methods.
+    // ---------------------------------------------------------------
+
     pub fn last_seniority_merge_attempt(&self) -> u64 {
-        self.last_seniority_merge_frame
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.last_attempt(Cooldown::SeniorityMerge)
     }
-
-    /// Record that this node emitted a seniority merge at `frame_number`.
     pub fn set_last_seniority_merge_attempt(&self, frame_number: u64) {
-        self.last_seniority_merge_frame
-            .store(frame_number, std::sync::atomic::Ordering::Relaxed);
+        self.record_attempt(Cooldown::SeniorityMerge, frame_number);
     }
-
-    /// Most recent frame at which this node emitted a forced-reject
-    /// batch for excess pending joins.
     pub fn last_reject_attempt(&self) -> u64 {
-        self.last_reject_frame
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.last_attempt(Cooldown::Reject)
     }
-
-    /// Record that this node emitted a forced-reject at `frame_number`.
     pub fn set_last_reject_attempt(&self, frame_number: u64) {
-        self.last_reject_frame
-            .store(frame_number, std::sync::atomic::Ordering::Relaxed);
+        self.record_attempt(Cooldown::Reject, frame_number);
     }
-
-    /// Most recent frame at which this node emitted a join proposal.
-    /// Single source of truth for the join-proposal cooldown gate —
-    /// `ProverLifecycle::join_proposal_ready` reads this.
     pub fn last_join_attempt(&self) -> u64 {
-        self.last_join_attempt_frame
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.last_attempt(Cooldown::Join)
     }
 
     /// Record that this node emitted a join proposal at `frame_number`.
     /// Called by ProverLifecycle just before it returns ProposeJoin so
     /// the next 4 frames are cooled down.
     pub fn set_last_join_attempt(&self, frame_number: u64) {
-        self.last_join_attempt_frame
-            .store(frame_number, std::sync::atomic::Ordering::Relaxed);
+        self.record_attempt(Cooldown::Join, frame_number);
     }
 
     /// Called on each new global frame. Reconciles the prover registry's
@@ -360,13 +380,12 @@ impl WorkerAllocator {
                             // Confirmed allocation — worker is correctly assigned
                         }
                         ProverStatus::Joining => {
-                            // Tier-5 #9: expired join (frame >
-                            // join_frame + 720) is implicitly rejected —
-                            // clear allocated flag so the proposer
-                            // restarts a fresh join. Mirrors Go's
-                            // worker_allocator.go:781-784.
-                            if alloc.join_frame_number > 0
-                                && frame_number > alloc.join_frame_number + PENDING_FILTER_GRACE_FRAMES
+                            // Expired Joining → implicitly rejected
+                            // by the protocol; clear the worker.
+                            // Uses `effective_status` to consolidate
+                            // the 720-frame grace check.
+                            if alloc.effective_status(frame_number)
+                                == quil_types::consensus::EffectiveStatus::ExpiredJoining
                             {
                                 desired_allocated = false;
                                 info!(
@@ -511,17 +530,15 @@ impl WorkerAllocator {
             // regardless of status, and `worker.Allocated` separately
             // tracks Active/Paused.
             //
-            // Skip terminal states and allocations past the 720-frame
-            // grace window (those won't ever confirm).
-            match alloc.status {
-                ProverStatus::Active | ProverStatus::Paused | ProverStatus::Joining => {}
+            // Skip terminal states and allocations past the
+            // 720-frame grace (won't ever confirm). One predicate
+            // covers both via `effective_status`.
+            use quil_types::consensus::EffectiveStatus;
+            match alloc.effective_status(frame_number) {
+                EffectiveStatus::Active
+                | EffectiveStatus::Paused
+                | EffectiveStatus::Joining => {}
                 _ => continue,
-            }
-            if alloc.status == ProverStatus::Joining
-                && alloc.join_frame_number > 0
-                && frame_number > alloc.join_frame_number + PENDING_FILTER_GRACE_FRAMES
-            {
-                continue;
             }
             if assigned_filters.contains(&alloc.confirmation_filter) {
                 continue;
@@ -582,8 +599,8 @@ impl WorkerAllocator {
             .allocations
             .iter()
             .filter(|a| {
-                a.status == ProverStatus::Joining
-                    && frame_number <= a.join_frame_number + PENDING_FILTER_GRACE_FRAMES
+                a.effective_status(frame_number)
+                    == quil_types::consensus::EffectiveStatus::Joining
             })
             .map(|a| a.confirmation_filter.clone())
             .collect())
@@ -641,108 +658,8 @@ impl WorkerAllocator {
 mod tests {
     use super::*;
     use quil_types::consensus::*;
-    use std::sync::Mutex;
 
-    #[derive(Default)]
-    struct MockWorkerState {
-        filter: Vec<u8>,
-        manually_managed: bool,
-    }
-
-    struct MockWorkerManager {
-        workers: Mutex<HashMap<u32, MockWorkerState>>,
-    }
-
-    impl MockWorkerManager {
-        fn new() -> Self {
-            Self {
-                workers: Mutex::new(HashMap::new()),
-            }
-        }
-    }
-
-    impl WorkerManager for MockWorkerManager {
-        fn set_worker_filter(
-            &self,
-            core_id: u32,
-            filter: &[u8],
-            _start_consensus: bool,
-        ) -> Result<()> {
-            let mut workers = self.workers.lock().unwrap();
-            let entry = workers.entry(core_id).or_default();
-            entry.filter = filter.to_vec();
-            Ok(())
-        }
-
-        fn deallocate_worker(&self, core_id: u32) -> Result<()> {
-            self.workers.lock().unwrap().remove(&core_id);
-            Ok(())
-        }
-
-        fn check_workers_connected(&self) -> Result<Vec<u32>> {
-            Ok(self.workers.lock().unwrap().keys().copied().collect())
-        }
-
-        fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
-            Ok(self
-                .workers
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(&id, w)| WorkerInfo {
-                    core_id: id,
-                    filter: w.filter.clone(),
-                    available_storage: 0,
-                    total_storage: 0,
-                    manually_managed: w.manually_managed,
-                    pending_filter_frame: 0,
-                    allocated: !w.filter.is_empty(),
-                })
-                .collect())
-        }
-
-        fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
-            self.allocate_worker(core_id, filter)
-        }
-
-        fn set_manually_managed(&self, core_id: u32, manually_managed: bool) -> Result<()> {
-            let mut workers = self.workers.lock().unwrap();
-            let entry = workers.entry(core_id).or_default();
-            entry.manually_managed = manually_managed;
-            Ok(())
-        }
-    }
-
-    struct MockRegistry {
-        prover: Mutex<Option<ProverInfo>>,
-    }
-
-    impl MockRegistry {
-        fn with_prover(info: ProverInfo) -> Self {
-            Self {
-                prover: Mutex::new(Some(info)),
-            }
-        }
-    }
-
-    impl ProverRegistry for MockRegistry {
-        fn refresh(&self) -> Result<()> { Ok(()) }
-        fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
-        fn get_prover_info(&self, _addr: &[u8]) -> Result<Option<ProverInfo>> {
-            Ok(self.prover.lock().unwrap().clone())
-        }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn get_active_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
-        fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(0) }
-        fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
-        fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
-        fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> Result<()> { Ok(()) }
-        fn get_prover_shard_summaries(&self, _: u64) -> Result<Vec<ProverShardSummary>> { Ok(vec![]) }
-        fn prune_orphan_joins(&self, _: u64) -> Result<()> { Ok(()) }
-        fn evict_inactive_provers(&self, _: u64, _: u64, _: &std::collections::HashMap<String, u64>) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn current_frame(&self) -> u64 { 0 }
-    }
+    use crate::test_support::{TestProverRegistry, TestWorkerManager as MockWorkerManager};
 
     fn make_alloc(filter: Vec<u8>) -> ProverAllocationInfo {
         ProverAllocationInfo {
@@ -766,7 +683,7 @@ mod tests {
     #[test]
     fn no_prover_does_nothing() {
         let wm = Arc::new(MockWorkerManager::new());
-        let reg = Arc::new(MockRegistry { prover: Mutex::new(None) });
+        let reg = Arc::new(TestProverRegistry::new());
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         alloc.on_new_frame(100).unwrap();
         assert!(wm.range_workers().unwrap().is_empty());
@@ -793,7 +710,7 @@ mod tests {
             delegate_address: vec![],
         };
 
-        let reg = Arc::new(MockRegistry::with_prover(prover));
+        let reg = Arc::new(TestProverRegistry::with_prover(prover));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         alloc.on_new_frame(101).unwrap();
 
@@ -821,7 +738,7 @@ mod tests {
             delegate_address: vec![],
         };
 
-        let reg = Arc::new(MockRegistry::with_prover(prover));
+        let reg = Arc::new(TestProverRegistry::with_prover(prover));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         // Frame must be > PENDING_FILTER_GRACE_FRAMES (720) for orphaned
         // filters with pending_filter_frame=0 to be cleared.

@@ -263,6 +263,7 @@ mod tests {
             proposer_id: "p".into(),
             parent_qc_identity: "p".into(),
             parent_qc_rank: 2,
+            parent_quorum_certificate: None,
             timestamp: 0,
             state: AppState { id: "s1".into(), rank: 3 },
         });
@@ -272,6 +273,7 @@ mod tests {
             proposer_id: "p".into(),
             parent_qc_identity: "p".into(),
             parent_qc_rank: 4,
+            parent_quorum_certificate: None,
             timestamp: 0,
             state: AppState { id: "s2".into(), rank: 5 },
         });

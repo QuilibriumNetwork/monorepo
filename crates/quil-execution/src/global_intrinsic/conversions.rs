@@ -13,7 +13,11 @@ use super::prover_ops::{
     ProverUpdate,
 };
 use super::seniority_merge::SeniorityMerge;
+use super::frame_header::FrameHeader;
 use super::sig_with_pop::SignatureWithPop;
+use crate::hypergraph_intrinsic::canonical::{
+    AggregateSignature as CanonicalAggregateSignature, Bls48581G2PublicKey,
+};
 
 // =====================================================================
 // AddressedSignature ↔ Bls48581AddressedSignature
@@ -420,5 +424,92 @@ mod tests {
         let j2 = ProverJoin::from_canonical_bytes(&cb).unwrap();
         let pb2 = prover_join_to_proto(&j2);
         assert_eq!(pb2, pb);
+    }
+}
+
+// =====================================================================
+// FrameHeader ↔ proto FrameHeader (Shard variant of MessageRequest)
+// =====================================================================
+
+/// Convert a proto FrameHeader (`Request::Shard` variant) to its
+/// canonical-bytes counterpart. Used by the materializer when
+/// re-serializing a bundle that contains shard-coverage proofs.
+pub fn frame_header_from_proto(pb: &pb::FrameHeader) -> FrameHeader {
+    let agg_bytes: Vec<u8> = pb
+        .public_key_signature_bls48581
+        .as_ref()
+        .and_then(|sig_pb| {
+            // Convert proto aggregate sig → canonical aggregate sig → bytes.
+            let pk = sig_pb.public_key.as_ref().and_then(|p| {
+                if p.key_value.is_empty() {
+                    None
+                } else {
+                    Some(Bls48581G2PublicKey {
+                        key_value: p.key_value.clone(),
+                    })
+                }
+            });
+            let canon = CanonicalAggregateSignature {
+                signature: sig_pb.signature.clone(),
+                public_key: pk,
+                bitmask: sig_pb.bitmask.clone(),
+            };
+            canon.to_canonical_bytes().ok()
+        })
+        .unwrap_or_default();
+
+    FrameHeader {
+        address: pb.address.clone(),
+        frame_number: pb.frame_number,
+        rank: pb.rank,
+        timestamp: pb.timestamp,
+        difficulty: pb.difficulty,
+        output: pb.output.clone(),
+        parent_selector: pb.parent_selector.clone(),
+        requests_root: pb.requests_root.clone(),
+        state_roots: pb.state_roots.clone(),
+        prover: pb.prover.clone(),
+        fee_multiplier_vote: pb.fee_multiplier_vote as i64,
+        public_key_signature_bls48581: agg_bytes,
+    }
+}
+
+/// Convert a canonical FrameHeader to its proto representation. Used
+/// by `consensus_wire::canonical_request_to_proto` when surfacing a
+/// bundle's Shard variant for downstream materialization.
+pub fn frame_header_to_proto(h: &FrameHeader) -> pb::FrameHeader {
+    let sig_pb = if h.public_key_signature_bls48581.is_empty() {
+        None
+    } else {
+        // Canonical sig bytes decode → split into signature/pubkey/bitmask
+        // for the proto. If decoding fails, treat as no signature.
+        match CanonicalAggregateSignature::from_canonical_bytes(
+            &h.public_key_signature_bls48581,
+        ) {
+            Ok(canon) => Some(keys_pb::Bls48581AggregateSignature {
+                signature: canon.signature,
+                public_key: canon.public_key.map(|pk| {
+                    keys_pb::Bls48581g2PublicKey {
+                        key_value: pk.key_value,
+                    }
+                }),
+                bitmask: canon.bitmask,
+            }),
+            Err(_) => None,
+        }
+    };
+    pb::FrameHeader {
+        address: h.address.clone(),
+        frame_number: h.frame_number,
+        rank: h.rank,
+        timestamp: h.timestamp,
+        difficulty: h.difficulty,
+        output: h.output.clone(),
+        parent_selector: h.parent_selector.clone(),
+        requests_root: h.requests_root.clone(),
+        state_roots: h.state_roots.clone(),
+        prover: h.prover.clone(),
+        fee_multiplier_vote: h.fee_multiplier_vote as u64,
+        public_key_signature_bls48581: sig_pb,
     }
 }

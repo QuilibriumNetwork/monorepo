@@ -118,6 +118,12 @@ fn state_from<S: Unique>(
     // linking it back. Go reconstructs this via `StateFrom`.
     state.parent_qc_identity = parent_qc.identity().clone();
     state.parent_qc_rank = parent_qc.rank();
+    // Note: `state.parent_quorum_certificate` stays as the leader
+    // provider left it (typically `None`). Populating it here would
+    // mean the leader's locally-held State carries the QC arc, but
+    // peers' wire-decoded copies don't — divergence we'd rather
+    // avoid since it complicates equality checks. Receivers populate
+    // the field on the wire-decode side (`consensus_types.rs`).
     Proposal {
         state,
         parent_quorum_certificate: Arc::clone(parent_qc),
@@ -233,6 +239,7 @@ mod tests {
                 proposer_id: b"leader".to_vec(),
                 parent_qc_identity: prior_state.clone(),
                 parent_qc_rank: rank.saturating_sub(1),
+                parent_quorum_certificate: None,
                 timestamp: 0,
                 state: AppState {
                     id: format!("state-{}", rank).into_bytes(),

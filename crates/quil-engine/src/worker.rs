@@ -89,3 +89,82 @@ pub struct WorkerInfo {
     /// availableWorkers cap in `decide_joins` derives from this count.
     pub allocated: bool,
 }
+
+/// Classified snapshot of every worker known to a `WorkerManager`,
+/// taken once and consulted by the lifecycle, the allocator, and
+/// RPC handlers. Centralizing the partitioning avoids the subtle
+/// drift that arose when individual sites inlined their own
+/// `range_workers().iter().filter(...)` calls.
+///
+/// Iterator helpers borrow from `all`, so they're zero-cost — no
+/// extra allocations to walk a single bucket. Use `snapshot` to
+/// build one; pass it by reference where consumers only need to
+/// inspect, by value where they want to retain it across an
+/// asynchronous boundary.
+#[derive(Debug, Clone)]
+pub struct WorkerView {
+    /// Every worker in `range_workers()` order.
+    pub all: Vec<WorkerInfo>,
+}
+
+impl WorkerView {
+    /// Take a snapshot from a worker manager. On error, returns an
+    /// empty view — matching the existing pattern in main.rs and
+    /// the RPC layer, where individual call sites silently bailed
+    /// to an empty `Vec` if `range_workers` failed.
+    pub fn snapshot(wm: &dyn WorkerManager) -> Self {
+        Self {
+            all: wm.range_workers().unwrap_or_default(),
+        }
+    }
+
+    /// Construct directly from a worker list. Useful for tests or
+    /// for sites that already hold a `Vec<WorkerInfo>` (e.g. the
+    /// RPC server's pre-cached workers_view).
+    pub fn from_workers(all: Vec<WorkerInfo>) -> Self {
+        Self { all }
+    }
+
+    /// Total number of workers.
+    pub fn count(&self) -> usize {
+        self.all.len()
+    }
+
+    /// Number of workers whose filter is set (allocated or
+    /// filter-pinned-awaiting-confirm). The RPC layer's
+    /// `allocated_workers` field maps to this.
+    pub fn filter_set_count(&self) -> usize {
+        self.filter_set().count()
+    }
+
+    /// Workers with `manually_managed = true`. The lifecycle skips
+    /// these during auto-allocation.
+    pub fn manual(&self) -> impl Iterator<Item = &WorkerInfo> {
+        self.all.iter().filter(|w| w.manually_managed)
+    }
+
+    /// Workers eligible for auto-allocation: empty filter AND not
+    /// manually managed AND no pending proposal in flight. The
+    /// lifecycle's "free worker" cap is `free_auto().count()`.
+    pub fn free_auto(&self) -> impl Iterator<Item = &WorkerInfo> {
+        self.all
+            .iter()
+            .filter(|w| w.filter.is_empty() && !w.manually_managed && w.pending_filter_frame == 0)
+    }
+
+    /// Workers whose filter field is non-empty (either confirmed
+    /// allocations or filter-pinned awaiting confirm).
+    pub fn filter_set(&self) -> impl Iterator<Item = &WorkerInfo> {
+        self.all.iter().filter(|w| !w.filter.is_empty())
+    }
+
+    /// Workers awaiting a pending proposal: empty filter but
+    /// `pending_filter_frame > 0`. These should be considered
+    /// "in flight" for capacity calculations but neither free nor
+    /// allocated.
+    pub fn pending(&self) -> impl Iterator<Item = &WorkerInfo> {
+        self.all
+            .iter()
+            .filter(|w| w.filter.is_empty() && w.pending_filter_frame > 0)
+    }
+}

@@ -23,9 +23,10 @@ use quil_types::consensus::ProverRegistry;
 use quil_types::error::{QuilError, Result};
 use quil_types::store::{ClockStore, HypergraphStore};
 
+use crate::current_frame::CurrentFrame;
 use crate::rewards::{get_baseline_fee, QUIL_TOKEN_UNITS};
 
-/// Concrete prover registry handle exposing the `evict_inactive_provers_into_state`
+/// Concrete prover registry handle exposing the `evict_inactive_provers`
 /// helper that the trait can't carry (the trait has no `HypergraphState`
 /// parameter). Wired separately via `with_eviction_registry`.
 type ConcreteProverRegistry = quil_execution::prover_registry::SharedProverRegistry;
@@ -45,8 +46,11 @@ pub struct FrameMaterializer {
     hypergraph_store: Arc<dyn HypergraphStore>,
     /// Reward issuance calculator.
     _reward_issuance: Arc<dyn quil_types::consensus::RewardIssuance>,
-    /// Coverage monitor for halt duration computation. Keyed by hex-encoded filter.
-    coverage_halt_durations: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    /// Coverage monitor for halt duration computation. Keyed by
+    /// raw filter bytes — matches `CoverageMonitor::check`'s return
+    /// type so no hex round-trip is needed when the caller wires
+    /// the two together.
+    coverage_halt_durations: Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, u64>>>,
 
     /// Last materialized frame number (idempotency guard).
     last_materialized_frame: AtomicU64,
@@ -66,12 +70,18 @@ pub struct FrameMaterializer {
     eviction_grace_frames: u64,
 
     /// Concrete `SharedProverRegistry` reference for the mutating
-    /// `evict_inactive_provers_into_state` path. When set, archive
+    /// `evict_inactive_provers` path. When set, archive
     /// nodes apply Status=4 + KickFrameNumber to evicted prover and
     /// allocation vertices via `HypergraphState`. When `None`, eviction
     /// falls back to the trait method which only finds candidates
     /// (matching Go's `EvictInactiveProvers` read+write semantics).
     eviction_registry: Option<Arc<ConcreteProverRegistry>>,
+
+    /// Shared node-level current-frame tracker. The materializer
+    /// calls `current_frame.materialize(N)` after `process_state_transition`
+    /// completes so every consumer of "what frame are we on" sees
+    /// the new value as soon as state has been applied.
+    current_frame: Option<Arc<CurrentFrame>>,
 }
 
 /// Results from materializing a frame.
@@ -116,7 +126,17 @@ impl FrameMaterializer {
             archive_mode,
             eviction_grace_frames: 360,
             eviction_registry: None,
+            current_frame: None,
         }
+    }
+
+    /// Wire the shared `CurrentFrame` so the materializer can
+    /// advertise post-materialize frame advancement to every
+    /// other consumer that reads the current frame (RPC handlers,
+    /// shard-info provider, lifecycle, peer-info publisher).
+    pub fn with_current_frame(mut self, current_frame: Arc<CurrentFrame>) -> Self {
+        self.current_frame = Some(current_frame);
+        self
     }
 
     /// Wire the concrete prover registry for mutating eviction. Without
@@ -224,6 +244,32 @@ impl FrameMaterializer {
                 &baseline / &cost_basis
             };
 
+            // Signature verification gate.
+            //
+            // `validate_message` runs the per-op verifier (BLS sig,
+            // PoP, merge-target sigs for joins; addressed-sig for
+            // confirms/leaves/etc.); `process_message` only
+            // structurally invokes `invoke_step`. Without this gate
+            // an attacker can forge any prover-admin signature and
+            // the materializer would write the bogus state into the
+            // hypergraph CRDT.
+            //
+            // Mirrors Go's `ExecutionEngineManager.ValidateMessage`
+            // gate before `ProcessMessage` at
+            // `execution/engine_manager.go:processFrameMessages`.
+            if let Err(e) = self.execution_manager.validate_message(
+                frame_number,
+                &address,
+                &bundle_bytes,
+            ) {
+                debug!(
+                    frame = frame_number,
+                    error = %e,
+                    "skipping message that failed signature validation"
+                );
+                skipped += 1;
+                continue;
+            }
             match self.execution_manager.process_message(
                 frame_number,
                 &fee_multiplier,
@@ -242,11 +288,16 @@ impl FrameMaterializer {
             }
         }
 
-        // 4. Process state transition (mirrors Go's
-        // `proverRegistry.ProcessStateTransition` at line 257). Comes
-        // BEFORE PruneOrphanJoins per Go's ordering.
-        if let Err(e) = self.prover_registry.process_state_transition(frame_number) {
-            warn!(frame = frame_number, error = %e, "process state transition failed");
+        // 4. Advance the shared current-frame tracker so RPC handlers,
+        // shard-info, peer-info, and the lifecycle observe the new
+        // materialized frame immediately. Replaces Go's
+        // `proverRegistry.ProcessStateTransition` (the in-memory
+        // cache is refreshed by a separate `refresh_from_store`
+        // task, so the only thing that needed to advance here was
+        // the frame counter — `CurrentFrame.materialize` is now
+        // that counter).
+        if let Some(cf) = &self.current_frame {
+            cf.materialize(frame_number);
         }
 
         // 5. Prune orphan joins from prover registry
@@ -267,18 +318,11 @@ impl FrameMaterializer {
             let has_active_halt = self.has_active_coverage_halt();
             if !has_active_halt {
                 if let Some(eviction_reg) = self.eviction_registry.as_ref() {
-                    // Build raw-byte halt durations from hex keys.
-                    let mut halt_bytes: std::collections::HashMap<Vec<u8>, u64> =
-                        std::collections::HashMap::new();
-                    for (k, v) in self.coverage_halt_durations.lock().unwrap().iter() {
-                        if let Ok(decoded) = hex::decode(k) {
-                            halt_bytes.insert(decoded, *v);
-                        }
-                    }
+                    let halt_bytes = self.coverage_halt_durations.lock().unwrap().clone();
                     let state = quil_execution::hypergraph_state::HypergraphState::new(
                         self.hypergraph.clone(),
                     );
-                    match eviction_reg.evict_inactive_provers_into_state(
+                    match eviction_reg.evict_inactive_provers(
                         frame_number,
                         self.eviction_grace_frames,
                         &halt_bytes,
@@ -302,14 +346,16 @@ impl FrameMaterializer {
                         }
                     }
                 } else {
-                    let halt_durations = self.coverage_halt_durations.lock().unwrap().clone();
-                    if let Err(e) = self.prover_registry.evict_inactive_provers(
-                        frame_number,
-                        self.eviction_grace_frames,
-                        &halt_durations,
-                    ) {
-                        warn!(frame = frame_number, error = %e, "eviction failed");
-                    }
+                    // Without a concrete-typed `eviction_registry`,
+                    // the materializer can't construct a
+                    // `HypergraphState` to mutate prover/allocation
+                    // vertices. Skip eviction entirely — there's no
+                    // useful read-only path here. Production wires
+                    // the registry via `with_eviction_registry`.
+                    debug!(
+                        frame = frame_number,
+                        "skipping eviction — no concrete registry wired"
+                    );
                 }
             }
         }
@@ -455,11 +501,12 @@ impl FrameMaterializer {
         durations.values().any(|&d| d == u64::MAX)
     }
 
-    /// Update coverage halt durations. Called by the coverage monitor.
-    /// Keys are hex-encoded filter bytes.
+    /// Update coverage halt durations. Called by the coverage
+    /// monitor; keys are raw filter bytes (matching the monitor's
+    /// `check()` return type).
     pub fn set_coverage_halt_durations(
         &self,
-        durations: std::collections::HashMap<String, u64>,
+        durations: std::collections::HashMap<Vec<u8>, u64>,
     ) {
         *self.coverage_halt_durations.lock().unwrap() = durations;
     }

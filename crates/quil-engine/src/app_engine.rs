@@ -353,6 +353,11 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             proposer_id: crate::committee::address_to_identity(&self.local_prover_address),
             parent_qc_identity: prior_state_id.clone(),
             parent_qc_rank: rank.saturating_sub(1),
+            // Leader-side construction: the parent QC trait object
+            // is attached to the wrapping `Proposal`, not threaded
+            // through `LeaderProvider::prove_next_state`. Receivers
+            // populate the field on the wire-decode side.
+            parent_quorum_certificate: None,
             timestamp: now_ms as u64,
             state,
         })
@@ -1039,6 +1044,13 @@ impl AppConsensusEngine {
             proposer_id: proposer_id.clone(),
             parent_qc_identity: parent_qc.identity().clone(),
             parent_qc_rank: parent_qc.rank(),
+            // Mirror Go's `models.State.ParentQuorumCertificate` so
+            // downstream consumers (notably `AppFollower` on
+            // finalization) can read the aggregated signature without
+            // a QC-store lookup. The QC is the one the proposal
+            // carried as its parent_qc — same Arc cloned twice into
+            // the State and the wrapping Proposal below.
+            parent_quorum_certificate: Some(parent_qc.clone()),
             timestamp: proposal.header.timestamp as u64,
             state,
         };
@@ -1057,19 +1069,33 @@ impl AppConsensusEngine {
         let signed = SignedProposal {
             proposal: Proposal {
                 state: typed_state,
-                parent_quorum_certificate: parent_qc,
-                previous_rank_timeout_certificate: prior_tc,
+                parent_quorum_certificate: parent_qc.clone(),
+                previous_rank_timeout_certificate: prior_tc.clone(),
             },
             vote,
         };
 
-        // Spawn a fire-and-forget task to push into the event loop —
-        // `submit_proposal` is async, the engine run loop is sync at
-        // this call site. Cloning the handle is cheap (Arc-backed).
+        // Surface the proposal's parent QC (and optional prior TC) to
+        // the event loop BEFORE submitting the proposal itself — the
+        // event handler's `on_receive_proposal` deliberately ignores
+        // the embedded parent QC and relies on a separate
+        // `on_receive_quorum_certificate` to advance the pacemaker.
+        // Without this, peers stay at rank N forever while the leader
+        // (which formed the QC locally via its vote aggregator) races
+        // ahead to rank N+1, and votes for rank N+1 are rejected with
+        // "proposal rank does not match current rank". Mirror of the
+        // global e2e harness's WireMsg::Proposal arm.
         if let Some(handle) = self.consensus_handle.as_ref() {
             let handle = handle.clone();
+            let qc_for_submit = parent_qc.clone();
+            let tc_for_submit = prior_tc.clone();
+            let signed_for_submit = signed;
             tokio::spawn(async move {
-                if !handle.submit_proposal(signed).await {
+                handle.submit_quorum_certificate(qc_for_submit);
+                if let Some(tc) = tc_for_submit {
+                    handle.submit_timeout_certificate(tc);
+                }
+                if !handle.submit_proposal(signed_for_submit).await {
                     debug!("shard event loop rejected proposal (cancelled?)");
                 }
             });
@@ -1362,7 +1388,12 @@ impl AppConsensusEngine {
 
     async fn handle_consensus_event(&mut self, event: AppConsensusEvent) {
         match event {
-            AppConsensusEvent::Finalized { frame_number, rank, state_id: _ } => {
+            AppConsensusEvent::Finalized {
+                frame_number,
+                rank,
+                state_id: _,
+                canonical_header_bytes,
+            } => {
                 debug!(
                     core_id = self.core_id,
                     filter = hex::encode(&self.filter),
@@ -1371,67 +1402,26 @@ impl AppConsensusEngine {
                     "shard frame finalized"
                 );
                 self.shard_frame_number = frame_number;
-                // Load the finalized frame, build canonical FrameHeader
-                // bytes, and emit `ShardFrameFinalized` so the master can
-                // wrap them in a `MessageBundle{Shard: header}` and publish
-                // on `GLOBAL_PROVER`. Without this the archives never see
-                // our shard work and no rewards are credited.
-                match self
-                    .clock_store
-                    .get_shard_clock_frame(&self.filter, frame_number, false)
-                {
-                    Ok(frame) => {
-                        if let Some(h) = frame.header.as_ref() {
-                            let sig_bytes = h
-                                .public_key_signature_bls48581
-                                .as_ref()
-                                .map(|s| s.signature.clone())
-                                .unwrap_or_default();
-                            let canonical_header =
-                                quil_execution::global_intrinsic::frame_header::FrameHeader {
-                                    address: h.address.clone(),
-                                    frame_number: h.frame_number,
-                                    rank: h.rank,
-                                    timestamp: h.timestamp,
-                                    difficulty: h.difficulty,
-                                    output: h.output.clone(),
-                                    parent_selector: h.parent_selector.clone(),
-                                    requests_root: h.requests_root.clone(),
-                                    state_roots: h.state_roots.clone(),
-                                    prover: h.prover.clone(),
-                                    fee_multiplier_vote: h.fee_multiplier_vote as i64,
-                                    public_key_signature_bls48581: sig_bytes,
-                                };
-                            match canonical_header.to_canonical_bytes() {
-                                Ok(bytes) => {
-                                    let _ = self
-                                        .event_tx
-                                        .send(AppEngineEvent::ShardFrameFinalized {
-                                            filter: self.filter.clone(),
-                                            header_canonical_bytes: bytes,
-                                        });
-                                }
-                                Err(e) => warn!(
-                                    core_id = self.core_id,
-                                    frame = frame_number,
-                                    error = %e,
-                                    "failed to encode finalized FrameHeader",
-                                ),
-                            }
-                        } else {
-                            warn!(
-                                core_id = self.core_id,
-                                frame = frame_number,
-                                "finalized shard frame missing header — skipping coverage publish",
-                            );
-                        }
-                    }
-                    Err(e) => warn!(
+                // The follower already encoded the canonical FrameHeader
+                // for `coverage_publish`; forward those same bytes as
+                // `ShardFrameFinalized` so the master can wrap them in
+                // a `MessageBundle{Shard: header}` and publish on
+                // `GLOBAL_PROVER`. Re-loading from the clock store
+                // would require shard-frame persistence that hasn't
+                // happened yet at this point in the pipeline.
+                if let Some(bytes) = canonical_header_bytes {
+                    let _ = self
+                        .event_tx
+                        .send(AppEngineEvent::ShardFrameFinalized {
+                            filter: self.filter.clone(),
+                            header_canonical_bytes: bytes,
+                        });
+                } else {
+                    warn!(
                         core_id = self.core_id,
                         frame = frame_number,
-                        error = %e,
-                        "failed to load finalized shard frame for coverage publish",
-                    ),
+                        "finalized state has no canonical header bytes — skipping coverage publish",
+                    );
                 }
                 // Flush spillover for the next rank
                 self.flush_deferred_messages(rank + 1);

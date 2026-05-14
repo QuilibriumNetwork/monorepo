@@ -383,11 +383,17 @@ pub fn build_app_genesis_certified_state(
             proposer_id: Vec::new(),
             parent_qc_identity: identity.clone(),
             parent_qc_rank: 0,
+            // Genesis has no parent QC.
+            parent_quorum_certificate: None,
             timestamp: 0,
             state,
         },
         certifying_qc_identity: identity,
         certifying_qc_rank: 0,
+        // Genesis CertifiedState — bootstrap trusted-root pattern.
+        // No real aggregated signature; populated by `genesis_qc_override`
+        // path when callers want a real QC trait object.
+        certifying_quorum_certificate: None,
     }
 }
 
@@ -475,9 +481,12 @@ mod tests {
             b"proposal-abc".to_vec(), 7, b"voter-xyz".to_vec(),
             5000, vec![0xEEu8; 74], vec![0x01], vec![1, 2],
         );
-        assert_eq!(v.identity().as_slice(), b"proposal-abc");
+        // `identity` = voter, `source` = proposal id (see
+        // `AppShardVote::new` comment: VoteCollector filters cached
+        // entries by `source() == state.identifier`).
+        assert_eq!(v.identity().as_slice(), b"voter-xyz");
         assert_eq!(v.rank(), 7);
-        assert_eq!(v.source().as_slice(), b"voter-xyz");
+        assert_eq!(v.source().as_slice(), b"proposal-abc");
         assert_eq!(v.timestamp(), 5000);
         assert_eq!(v.signature(), &[0xEEu8; 74][..]);
     }

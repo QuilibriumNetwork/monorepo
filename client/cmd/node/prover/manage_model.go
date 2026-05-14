@@ -618,14 +618,11 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// filters so the operator sees on-chain confirmation, not
 		// just RPC ack.
 		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("%s failed: %v", msg.action, msg.err)
-			m.statusIsError = true
-			m.statusSticky = true
-			if cmd := m.advanceQueue(); cmd != nil {
-				return m, cmd
-			}
-			m.actionInFlight = false
-			return m, fetchData(m.client)
+			return m.handleActionFailure(
+				fmt.Sprintf("%s failed", msg.action),
+				msg.err,
+				fetchData(m.client),
+			)
 		}
 		// For Join we await on-chain landing — originalStatus = 0
 		// (sentinel) because Join targets filters that don't yet
@@ -651,14 +648,11 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case actionPreparedMsg:
 		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("%s failed: %v", msg.action, msg.err)
-			m.statusIsError = true
-			m.statusSticky = true
-			if cmd := m.advanceQueue(); cmd != nil {
-				return m, cmd
-			}
-			m.actionInFlight = false
-			return m, nil
+			return m.handleActionFailure(
+				fmt.Sprintf("%s failed", msg.action),
+				msg.err,
+				nil,
+			)
 		}
 		if m.actionTotal > 1 {
 			m.statusMsg = fmt.Sprintf("Broadcasting %s (%d/%d)...", msg.action, m.actionIndex, m.actionTotal)
@@ -669,14 +663,11 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case actionBroadcastMsg:
 		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("%s broadcast failed: %v", msg.action, msg.err)
-			m.statusIsError = true
-			m.statusSticky = true
-			if cmd := m.advanceQueue(); cmd != nil {
-				return m, cmd
-			}
-			m.actionInFlight = false
-			return m, fetchData(m.client)
+			return m.handleActionFailure(
+				fmt.Sprintf("%s broadcast failed", msg.action),
+				msg.err,
+				fetchData(m.client),
+			)
 		}
 		// Accumulate per-broadcast filters so the await loop sees
 		// every filter in a batch (Pause/Resume queue), not just
@@ -1340,6 +1331,29 @@ func firstUnchangedFilterHex(outcomes []filterOutcome) string {
 		}
 	}
 	return "n/a"
+}
+
+// handleActionFailure consolidates the failure-cleanup pattern
+// shared by every actionResultMsg / actionPreparedMsg /
+// actionBroadcastMsg case in Update. Sets a sticky error status,
+// advances the action queue if more work is pending, otherwise
+// clears the in-flight flag and returns `fallback` (usually a
+// fresh data fetch, sometimes nil).
+//
+// Before this helper, each phase open-coded the same 7-line
+// sequence; the only variation was the failure-prefix string and
+// the fallback cmd. Diff drift between phases (some set
+// statusSticky, others didn't) was a recurring source of
+// inconsistent UI behavior after partial-batch failures.
+func (m *manageModel) handleActionFailure(failurePrefix string, err error, fallback tea.Cmd) (tea.Model, tea.Cmd) {
+	m.statusMsg = fmt.Sprintf("%s: %v", failurePrefix, err)
+	m.statusIsError = true
+	m.statusSticky = true
+	if cmd := m.advanceQueue(); cmd != nil {
+		return m, cmd
+	}
+	m.actionInFlight = false
+	return m, fallback
 }
 
 // advanceQueue starts the next queued action if any remain.

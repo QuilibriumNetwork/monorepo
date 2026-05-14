@@ -10,7 +10,7 @@ use quil_keys::KeyManager as _;
 
 mod logging;
 
-mod prover_pipeline;
+mod prover_message_transport_prod;
 
 /// Quilibrium Node — Rust implementation
 #[derive(Parser, Debug)]
@@ -624,23 +624,45 @@ async fn run_master_node(
         }
     }
 
-    // Frame tracking for PeerInfo — updated by frame receive loop and archive poller
-    let last_received_frame = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Frame tracking — single source of truth for "what frame is
+    // this node on right now." Updated by the BlossomSub receive
+    // loop (`observe`), archive poller (`observe`), and frame
+    // materializer (`materialize`). Read by RPC handlers,
+    // shard-info, peer-info publisher, lifecycle, eviction, and
+    // every other site that previously took `max(clock_store, lrf)`.
+    let current_frame = quil_engine::current_frame::CurrentFrame::new();
+    // Seed from any frame already persisted to the clock store so
+    // RPC consumers can read a sensible current frame *immediately*
+    // at startup — before the first BlossomSub frame arrives. The
+    // `observe` call is monotonic, so a later live frame can still
+    // advance it.
+    if let Ok(frame) = clock_store.get_latest_global_frame() {
+        if let Some(h) = frame.header.as_ref() {
+            current_frame.observe(h.frame_number);
+        }
+    }
     // PeerInfo cache populated by the GLOBAL_PEER_INFO recv path.
     // Read by NodeService::get_peer_info so CLI tools can enumerate
     // the peers this node has observed on the network. Keyed by the
     // raw peer_id bytes; last-write-wins.
-    let peer_info_cache: Arc<std::sync::RwLock<
+    // parking_lot::RwLock instead of std::sync::RwLock: smaller +
+    // faster, no poisoning (so `.read()` / `.write()` return guards
+    // directly without `.unwrap()`), and better fairness under
+    // contention. This is a strict ergonomics + perf upgrade, NOT
+    // an async-fix — parking_lot's lock is still blocking from
+    // tokio's view. Switch to `tokio::sync::RwLock` if reads need
+    // to yield instead of block.
+    let peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
-    >> = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     // filter → AppEngineHandle registry. Populated by the worker→master
     // drain task on `WorkerToMaster::ShardActivated` and cleared on
     // `ShardDeactivated`. Read by the inbound BlossomSub recv loop to
     // route per-shard frame / consensus / prover / dispatch messages
     // to the right engine in multi-prover deployments.
-    let shard_engines: Arc<std::sync::RwLock<
+    let shard_engines: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
-    >> = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     // SignerRegistry — populated from inbound KeyRegistry broadcasts
     // on GLOBAL_PEER_INFO. Consumed by consensus message verification
     // (BLS signatures from peers whose identity↔prover binding we've
@@ -690,7 +712,7 @@ async fn run_master_node(
         let pi_stream_listen = config.p2p.stream_listen_multiaddr.clone();
         let pi_listen_fallback = listen_addr.clone();
         let pi_p2p_handle = p2p_handle.clone();
-        let pi_last_received = last_received_frame.clone();
+        let pi_current_frame = current_frame.clone();
         let pi_last_head = last_global_head_frame.clone();
         // Per-worker multiaddrs — used in process-mode (each worker
         // is its own OS process with its own ports). In thread mode
@@ -761,12 +783,12 @@ async fn run_master_node(
                     stream_multiaddrs: stream_addrs.clone(),
                 }];
                 if let Some(wm) = pi_worker_manager_slot.get() {
-                    if let Ok(workers) = wm.range_workers() {
-                        let pairs: Vec<(u32, Vec<u8>)> = workers
-                            .into_iter()
-                            .filter(|w| !w.filter.is_empty())
-                            .map(|w| (w.core_id, w.filter))
-                            .collect();
+                    let view = quil_engine::worker::WorkerView::snapshot(wm.as_ref());
+                    let pairs: Vec<(u32, Vec<u8>)> = view
+                        .filter_set()
+                        .map(|w| (w.core_id, w.filter.clone()))
+                        .collect();
+                    if !pairs.is_empty() {
                         reachability.extend(quil_p2p::build_worker_reachability(
                             &pairs,
                             &pubsub_addr,
@@ -796,7 +818,7 @@ async fn run_master_node(
                     // path, not used here.
                     public_key: Vec::new(),
                     signature: Vec::new(),
-                    last_received_frame: pi_last_received.load(std::sync::atomic::Ordering::Relaxed),
+                    last_received_frame: pi_current_frame.effective(),
                     last_global_head_frame: pi_last_head.load(std::sync::atomic::Ordering::Relaxed),
                 };
 
@@ -1348,7 +1370,7 @@ async fn run_master_node(
                                         // recv loop can dispatch peer
                                         // messages to it.
                                         {
-                                            let mut map = drain_shard_engines.write().unwrap();
+                                            let mut map = drain_shard_engines.write();
                                             map.insert(filter.clone(), handle);
                                         }
                                         // Subscribe BlossomSub to the four
@@ -1373,7 +1395,7 @@ async fn run_master_node(
                                     }
                                     WorkerToMaster::ShardDeactivated { core_id, filter } => {
                                         {
-                                            let mut map = drain_shard_engines.write().unwrap();
+                                            let mut map = drain_shard_engines.write();
                                             map.remove(&filter);
                                         }
                                         let p2p = drain_p2p.clone();
@@ -1601,16 +1623,18 @@ async fn run_master_node(
 
     // Prover lifecycle coordinator — evaluates join/confirm/leave on each frame.
     // Pulls cooldown state off the WorkerAllocator (single source of truth).
-    let mut lifecycle_inner = quil_engine::provers::lifecycle::ProverLifecycle::new(
-        prover_address.to_vec(),
-        worker_allocator.clone(),
-        halt_state.clone(),
-    );
-    lifecycle_inner.set_strategy(if reward_greedy {
+    let strategy = if reward_greedy {
         quil_engine::provers::proposer::Strategy::RewardGreedy
     } else {
         quil_engine::provers::proposer::Strategy::DataGreedy
-    });
+    };
+    let lifecycle_inner = quil_engine::provers::lifecycle::ProverLifecycle::new(
+        prover_address.to_vec(),
+        worker_allocator.clone(),
+        halt_state.clone(),
+        current_frame.clone(),
+        strategy,
+    );
     // Testnet/devnet bootstraps drop the join-confirm window from
     // mainnet's 360 frames (one hour at 10s/frame) to a handful of
     // frames so a local smoke test sees a join → confirm cycle in
@@ -1651,64 +1675,54 @@ async fn run_master_node(
         shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>,
     );
 
-    // Periodic eviction of inactive provers. Only archive nodes perform
-    // eviction (non-archives receive the resulting updates via sync).
-    // Guarded by HaltState so evictions don't cascade during a halt
-    // window.
-    if archive_mode {
-        let pr_for_evict: Arc<dyn quil_types::consensus::ProverRegistry> =
-            prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>;
-        let cov_for_evict = coverage_monitor.clone();
-        let hs_for_evict = halt_state.clone();
-        let lrf_for_evict = last_received_frame.clone();
-        let cancel = token.clone();
-        // Go uses inactivityThreshold = 360 frames (~1h at 10s frames) —
-        // after which a non-reporting prover is considered inactive.
-        const INACTIVITY_THRESHOLD_FRAMES: u64 = 360;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = interval.tick() => {}
-                }
-                if hs_for_evict.any_halted() {
-                    debug!(
-                        halted = hs_for_evict.halted_count(),
-                        "skipping eviction during coverage halt"
-                    );
-                    continue;
-                }
-                let frame = lrf_for_evict.load(std::sync::atomic::Ordering::Relaxed);
-                if frame == 0 {
-                    continue;
-                }
-                let halt_durations = cov_for_evict.check(frame);
-                let halt_map: std::collections::HashMap<String, u64> = halt_durations
-                    .into_iter()
-                    .map(|(k, v)| (hex::encode(&k), v))
-                    .collect();
-                match pr_for_evict.evict_inactive_provers(
-                    frame,
-                    INACTIVITY_THRESHOLD_FRAMES,
-                    &halt_map,
-                ) {
-                    Ok(evicted) if !evicted.is_empty() => {
-                        info!(
-                            count = evicted.len(),
-                            frame,
-                            "evicted inactive provers"
-                        );
-                        quil_engine::metrics::inc_evictions(evicted.len() as u64);
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "eviction failed"),
-                }
+    // FrameMaterializer — archive nodes only. The materializer is
+    // the canonical post-finalize processor for global frames:
+    // commits the hypergraph, verifies the prover root, processes
+    // message bundles through the execution manager, prunes orphan
+    // joins, evicts inactive provers, persists alt-shard updates,
+    // and publishes the post-materialize snapshot for worker sync.
+    //
+    // Per the architecture: archives materialize global frames;
+    // workers materialize app-shard frames (a separate path);
+    // non-archive masters only consume the materialized state via
+    // sync from archives and do not materialize themselves.
+    let frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>> =
+        if archive_mode {
+            let reward_issuer: Arc<dyn quil_types::consensus::RewardIssuance> =
+                Arc::new(quil_engine::OptRewardIssuance);
+            // Install frame-header deps on the global intrinsic so
+            // `invoke_frame_header` actually mutates state on
+            // shard-coverage ingest (LastActiveFrameNumber advance +
+            // reward distribution). Without this, FrameHeader bundle
+            // entries silently no-op at intrinsic.rs:974-980 and
+            // archives never credit prover shard work — eviction
+            // and rewards would silently break.
+            let bls_for_intrinsic: Arc<dyn quil_types::crypto::BlsConstructor> =
+                Arc::new(quil_crypto::Bls48581KeyConstructor);
+            if let Err(e) = exec_manager.install_global_frame_header_deps(
+                prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+                reward_issuer.clone(),
+                bls_for_intrinsic,
+                inclusion_prover.clone(),
+            ) {
+                warn!(error = %e, "install_global_frame_header_deps failed — shard coverage attribution will be a no-op");
             }
-        });
-        info!("archive-mode eviction scheduler spawned (halt-gated)");
-    }
+            let m = quil_engine::frame_materializer::FrameMaterializer::new(
+                exec_manager.clone(),
+                prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+                clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+                crdt.clone(),
+                hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+                reward_issuer,
+                prover_address.to_vec(),
+                archive_mode,
+            )
+            .with_eviction_registry(prover_registry.clone())
+            .with_current_frame(current_frame.clone());
+            Some(Arc::new(m))
+        } else {
+            None
+        };
 
     // ---------------------------------------------------------------
     // 6. Message receive loop
@@ -1922,19 +1936,25 @@ async fn run_master_node(
         }
     };
 
-    let prover_pipeline = Arc::new(prover_pipeline::ProverPipeline {
+    // Production transport: gRPC fan-out to archives + BlossomSub publish.
+    let prover_message_transport: Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport> =
+        Arc::new(crate::prover_message_transport_prod::ProdProverMessageTransport {
+            archive_pool: archive_pool.clone(),
+            clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+            p2p_handle: p2p_handle.clone(),
+            ed448_seed: mtls_seed,
+        });
+
+    let prover_pipeline = Arc::new(quil_engine::prover_pipeline::ProverPipeline {
         lifecycle: prover_lifecycle.clone(),
         worker_manager: worker_manager.clone(),
-        archive_pool: archive_pool.clone(),
-        clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
         frame_prover: frame_prover.clone(),
         key_manager: file_key_manager.clone() as Arc<dyn quil_keys::KeyManager + Send + Sync>,
         bls_pubkey: bls_pubkey.clone(),
         prover_address,
-        ed448_seed: mtls_seed,
-        p2p_handle: p2p_handle.clone(),
         multisig_ed448_seeds,
         delegate_address,
+        transport: prover_message_transport,
     });
 
     // Shard orchestration subscriber: watches for ShardSplitEligible /
@@ -1944,7 +1964,7 @@ async fn run_master_node(
     {
         let mut rx = global_event_distributor.subscribe("shard-orchestrator");
         let pp = prover_pipeline.clone();
-        let lrf = last_received_frame.clone();
+        let cf_for_orch = current_frame.clone();
         let cancel = token.clone();
         tokio::spawn(async move {
             loop {
@@ -1953,7 +1973,7 @@ async fn run_master_node(
                     _ = cancel.cancelled() => break,
                     maybe_event = rx.recv() => {
                         let Some(event) = maybe_event else { break };
-                        let frame = lrf.load(std::sync::atomic::Ordering::Relaxed);
+                        let frame = cf_for_orch.effective();
                         if frame == 0 {
                             debug!("shard event received before any frame — ignoring");
                             continue;
@@ -2001,7 +2021,7 @@ async fn run_master_node(
         let pr_for_poller = prover_registry.clone();
         let wm_for_poller = worker_manager.clone();
         let cov_for_poller = coverage_monitor.clone();
-        let lrf_for_poller = last_received_frame.clone();
+        let cf_for_poller = current_frame.clone();
         let lhf_for_poller = last_global_head_frame.clone();
         let pp_for_poller = prover_pipeline.clone();
         let hg_for_poller = hg_store.clone();
@@ -2013,16 +2033,15 @@ async fn run_master_node(
                 let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                 let frame_difficulty = frame.header.as_ref().map(|h| h.difficulty).unwrap_or(0);
                 // Skip bogus frames (no header or frame_number=0):
-                // storing 0 to `last_received_frame` would regress
-                // it (it's a plain `store`, not `fetch_max`), and
-                // the lifecycle's evaluate guards against 0 anyway.
+                // `current_frame.observe(0)` is a no-op, and the
+                // lifecycle's evaluate guards against 0 anyway.
                 if frame_num == 0 {
                     tracing::debug!(
                         "archive poller: dropping frame with frame_number=0"
                     );
                     return;
                 }
-                lrf_for_poller.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
+                cf_for_poller.observe(frame_num);
                 lhf_for_poller.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
 
                 // Process frame messages through execution pipeline
@@ -2145,7 +2164,7 @@ async fn run_master_node(
                             }
                         }
                     }
-                    pl_for_poller.set_shard_sizes(sizes_by_filter);
+                    pl_for_poller.set_local_shard_sizes(sizes_by_filter);
                 }
 
                 match pl_for_poller.evaluate(
@@ -2198,7 +2217,7 @@ async fn run_master_node(
             let sync_va = vote_aggregator.clone();
             let sync_ta = timeout_aggregator.clone();
             let sync_cov = coverage_monitor.clone();
-            let sync_lrf = last_received_frame.clone();
+            let sync_cf = current_frame.clone();
             let sync_lhf = last_global_head_frame.clone();
             let sync_archive_mode = archive_mode;
             tokio::spawn(async move {
@@ -2348,8 +2367,10 @@ async fn run_master_node(
                                     let va_cell = sync_va.clone();
                                     let ta_cell = sync_ta.clone();
                                     let cs_for_fin = sync_cs.clone();
-                                    let lrf_for_fin = sync_lrf.clone();
+                                    let cf_for_fin = sync_cf.clone();
                                     let lhf_for_fin = sync_lhf.clone();
+                                    let materializer_for_fin = frame_materializer.clone();
+                                    let cov_for_fin = sync_cov.clone();
                                     Arc::new(move |state| {
                                         if let Some(va) = va_cell.get() {
                                             va.advance_min_active_rank(state.rank);
@@ -2421,17 +2442,43 @@ async fn run_master_node(
                                         }
                                         // Bump head-frame atomics so PeerInfo
                                         // advertises the real chain head.
-                                        // `fetch_max` keeps these monotonic
-                                        // even if finalization callbacks
-                                        // arrive slightly out of order.
-                                        lrf_for_fin.fetch_max(
-                                            app.frame_number,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        // `observe` / `fetch_max` keep these
+                                        // monotonic even if finalization
+                                        // callbacks arrive out of order.
+                                        cf_for_fin.observe(app.frame_number);
                                         lhf_for_fin.fetch_max(
                                             app.frame_number,
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
+
+                                        // Archive nodes materialize the
+                                        // finalized global frame: commit the
+                                        // hypergraph, verify the prover root,
+                                        // process bundles through execution,
+                                        // prune orphan joins, evict inactive
+                                        // provers, persist alt-shard updates,
+                                        // and publish the post-materialize
+                                        // snapshot for workers + non-archive
+                                        // peers to sync against. Non-archive
+                                        // master threads skip this (their
+                                        // `materializer_for_fin` is None);
+                                        // they pull materialized state from
+                                        // archives via the archive poller.
+                                        if let Some(m) = &materializer_for_fin {
+                                            // Refresh halt durations right
+                                            // before materialize so the
+                                            // eviction step inside skips
+                                            // halted shards correctly.
+                                            let halts = cov_for_fin.check(app.frame_number);
+                                            m.set_coverage_halt_durations(halts);
+                                            if let Err(e) = m.materialize(&frame) {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    frame = app.frame_number,
+                                                    "frame materialize failed"
+                                                );
+                                            }
+                                        }
                                     })
                                 };
 
@@ -2575,6 +2622,8 @@ async fn run_master_node(
                                         on_finalized_state: Some(finalized_hook),
                                         on_incorporated_state: Some(incorporated_hook),
                                         on_qc_observed: Some(qc_observed_hook),
+                                        config_override: None,
+                                        genesis_qc_override: None,
                                     },
                                 ) {
                                     Ok(activation) => {
@@ -2684,7 +2733,7 @@ async fn run_master_node(
         {
             let pool = archive_pool.clone();
             let lifecycle = prover_lifecycle.clone();
-            let last_frame = last_received_frame.clone();
+            let cf_for_refresh = current_frame.clone();
             let cancel = token.clone();
             let seed_for_refresh = seed;
             let shards_store_for_refresh = shards_store.clone();
@@ -2700,7 +2749,7 @@ async fn run_master_node(
                         _ = cancel.cancelled() => break,
                         _ = interval.tick() => {}
                     }
-                    let now_frame = last_frame.load(std::sync::atomic::Ordering::Relaxed);
+                    let now_frame = cf_for_refresh.effective();
                     let needs_initial = !lifecycle.shard_info_loaded();
                     let cadence_due = last_refresh_frame > 0
                         && now_frame >= last_refresh_frame + REFRESH_CADENCE_FRAMES;
@@ -2717,7 +2766,7 @@ async fn run_master_node(
                     {
                         Ok(sizes) => {
                             let count = sizes.len();
-                            lifecycle.replace_shard_sizes(sizes);
+                            lifecycle.set_remote_shard_sizes(sizes);
                             last_refresh_frame = now_frame.max(1);
                             info!(
                                 shards = count,
@@ -2774,7 +2823,7 @@ async fn run_master_node(
     let pic_for_recv = peer_info_cache.clone();
     let shard_engines_for_recv = shard_engines.clone();
     let sr_for_recv = signer_registry.clone();
-    let lrf_for_recv = last_received_frame.clone();
+    let cf_for_recv = current_frame.clone();
     let lhf_for_recv = last_global_head_frame.clone();
     let genesis_archive_peer_ids_for_recv = genesis_archive_peer_ids.clone();
     let genesis_prover_addrs_for_recv = genesis_prover_addrs.clone();
@@ -2833,56 +2882,28 @@ async fn run_master_node(
                         .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
                         .unwrap_or(0);
                     let (active, pending, total_allocs) = {
-                        use quil_types::consensus::ProverRegistry;
-                        let grace = quil_engine::worker_allocator::PENDING_FILTER_GRACE_FRAMES;
+                        use quil_types::consensus::{EffectiveStatus, ProverRegistry};
                         match pr_for_recv.get_prover_info(&pa_for_recv) {
                             Ok(Some(info)) => {
-                                let a = info.allocations.iter()
-                                    .filter(|a| a.status == quil_types::consensus::ProverStatus::Active)
-                                    .count();
-                                // Joining allocations past the
-                                // 720-frame grace are implicitly
-                                // rejected on-chain — exclude them
-                                // here so the count matches the
-                                // lifecycle's view (and the TUI's).
-                                let p = info.allocations.iter()
-                                    .filter(|a| {
-                                        a.status == quil_types::consensus::ProverStatus::Joining
-                                            && latest_frame
-                                                <= a.join_frame_number + grace
-                                    })
-                                    .count();
-                                // Total = live allocations only:
-                                //   * Active / Paused — currently bound.
-                                //   * Joining (within 720-frame grace).
-                                //   * Leaving (within 720-frame grace).
-                                // Drops Rejected/Kicked terminal states
-                                // and any Joining/Leaving past the
-                                // grace window, since the TUI's
-                                // alloc list does the same. Without
-                                // this, the count drifts upward as
-                                // expired entries accumulate.
-                                let total = info.allocations.iter()
-                                    .filter(|a| {
-                                        match a.status {
-                                            quil_types::consensus::ProverStatus::Active
-                                            | quil_types::consensus::ProverStatus::Paused => true,
-                                            quil_types::consensus::ProverStatus::Joining => {
-                                                a.join_frame_number == 0
-                                                    || latest_frame
-                                                        <= a.join_frame_number + grace
-                                            }
-                                            // Leaving = alloc still in flight
-                                            // until Confirm/Reject.
-                                            quil_types::consensus::ProverStatus::Leaving => {
-                                                a.leave_frame_number == 0
-                                                    || latest_frame
-                                                        <= a.leave_frame_number + grace
-                                            }
-                                            _ => false,
+                                let mut a = 0usize;
+                                let mut p = 0usize;
+                                let mut total = 0usize;
+                                for alloc in &info.allocations {
+                                    match alloc.effective_status(latest_frame) {
+                                        EffectiveStatus::Active => {
+                                            a += 1;
+                                            total += 1;
                                         }
-                                    })
-                                    .count();
+                                        EffectiveStatus::Joining => {
+                                            p += 1;
+                                            total += 1;
+                                        }
+                                        EffectiveStatus::Paused | EffectiveStatus::Leaving => {
+                                            total += 1;
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 (a, p, total)
                             }
                             _ => (0, 0, 0),
@@ -2957,7 +2978,7 @@ async fn run_master_node(
                                         // Cache last-seen PeerInfo per peer_id. Bounded
                                         // implicitly by the peer set size (last-write-wins).
                                         if !info.peer_id.is_empty() {
-                                            let mut cache = pic_for_recv.write().unwrap();
+                                            let mut cache = pic_for_recv.write();
                                             cache.insert(info.peer_id.clone(), info.clone());
                                         }
                                         // Only ARCHIVE-capable peers go into the
@@ -3188,12 +3209,13 @@ async fn run_master_node(
                                         match clock_store_recv.put_global_frame(&frame, None) {
                                             Ok(()) => {
                                                 frames_received += 1;
-                                                // `fetch_max` not `store`: never
-                                                // regress lrf below an
-                                                // already-seen value (e.g. if a
-                                                // stale duplicate frame arrives
-                                                // out-of-order via BlossomSub).
-                                                lrf_for_recv.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
+                                                // `observe` / `fetch_max` never
+                                                // regress these counters below
+                                                // an already-seen value (e.g.
+                                                // if a stale duplicate frame
+                                                // arrives out-of-order via
+                                                // BlossomSub).
+                                                cf_for_recv.observe(frame_num);
                                                 lhf_for_recv.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
                                                 // Process through execution pipeline with reward issuance
                                                 match quil_engine::frame_processor::process_global_frame_with_rewards(
@@ -3372,7 +3394,7 @@ async fn run_master_node(
                                 // sends (the channel is bounded; sends are
                                 // try_send).
                                 let entries: Vec<(Vec<u8>, quil_engine::app_engine::AppEngineHandle)> = {
-                                    let map = shard_engines_for_recv.read().unwrap();
+                                    let map = shard_engines_for_recv.read();
                                     map.iter()
                                         .map(|(f, h)| (f.clone(), h.clone()))
                                         .collect()
@@ -3464,7 +3486,7 @@ async fn run_master_node(
         // Plaintext connections or connections without a parseable
         // Ed448-derived cert fall into that path.
         let submit_mc = message_collector.clone();
-        let submit_lrf = last_received_frame.clone();
+        let submit_cf = current_frame.clone();
         let submit_handler: quil_rpc::SubmitHandler = Arc::new(
             move |request: tonic::Request<quil_types::proto::global::SubmitGlobalMessageRequest>| {
                 let auth = request
@@ -3480,7 +3502,7 @@ async fn run_master_node(
                     quil_engine::metrics::inc_grpc_submits_rejected();
                     return Err("empty payload".into());
                 }
-                let rank = submit_lrf.load(std::sync::atomic::Ordering::Relaxed);
+                let rank = submit_cf.effective();
                 let accepted = submit_mc.add_message(rank, data);
                 if accepted {
                     tracing::debug!(peer = %auth.peer_id, rank, "accepted gRPC submit");
@@ -3500,8 +3522,8 @@ async fn run_master_node(
         let global_worker_snap: quil_rpc::global_service::WorkerSnapshotFn = {
             let wm = worker_manager.clone();
             Arc::new(move || {
-                wm.range_workers()
-                    .unwrap_or_default()
+                quil_engine::worker::WorkerView::snapshot(wm.as_ref())
+                    .all
                     .into_iter()
                     .map(|w| quil_types::proto::global::GlobalGetWorkerInfoResponseItem {
                         core_id: w.core_id,
@@ -3583,13 +3605,13 @@ async fn run_master_node(
         // submission. Its submit_message handler shares the same
         // message-collector path as the gRPC global submit.
         let node_submit_mc = message_collector.clone();
-        let node_submit_lrf = last_received_frame.clone();
+        let node_submit_cf = current_frame.clone();
         let user_submit_handler: quil_rpc::node_service::UserSubmitHandler = Arc::new(
             move |data: Vec<u8>| -> Result<(), String> {
                 if data.is_empty() {
                     return Err("empty message".into());
                 }
-                let rank = node_submit_lrf.load(std::sync::atomic::Ordering::Relaxed);
+                let rank = node_submit_cf.effective();
                 if node_submit_mc.add_message(rank, data) {
                     Ok(())
                 } else {
@@ -3600,7 +3622,7 @@ async fn run_master_node(
         let mut node_rpc_builder = quil_rpc::NodeRpcServer::new()
             .with_peer_id(peer_id.to_string())
             .with_frame_counters(
-                last_received_frame.clone(),
+                current_frame.clone(),
                 last_global_head_frame.clone(),
             )
             .with_prover_address(prover_address.to_vec())
@@ -3621,7 +3643,7 @@ async fn run_master_node(
         {
             let pic = peer_info_cache.clone();
             node_rpc_builder = node_rpc_builder.with_peer_info_snapshot(Arc::new(move || {
-                pic.read().unwrap().values().cloned().collect()
+                pic.read().values().cloned().collect()
             }));
         }
         {
@@ -3770,8 +3792,8 @@ async fn run_master_node(
         // WorkerManager + prover pipeline.
         struct WorkerControlBridge {
             worker_manager: Arc<dyn quil_engine::worker::WorkerManager>,
-            prover_pipeline: Arc<prover_pipeline::ProverPipeline>,
-            last_received_frame: Arc<std::sync::atomic::AtomicU64>,
+            prover_pipeline: Arc<quil_engine::prover_pipeline::ProverPipeline>,
+            current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
         }
         impl quil_rpc::WorkerControl for WorkerControlBridge {
             fn set_manually_managed(
@@ -3792,9 +3814,7 @@ async fn run_master_node(
                 Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
             > {
                 let pp = self.prover_pipeline.clone();
-                let frame = self
-                    .last_received_frame
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let frame = self.current_frame.effective();
                 Box::pin(async move {
                     if frame == 0 {
                         return Err("no frames received yet".into());
@@ -3808,7 +3828,7 @@ async fn run_master_node(
         node_rpc_builder = node_rpc_builder.with_worker_control(Arc::new(WorkerControlBridge {
             worker_manager: worker_manager.clone(),
             prover_pipeline: prover_pipeline.clone(),
-            last_received_frame: last_received_frame.clone(),
+            current_frame: current_frame.clone(),
         }));
 
         // Workers view — keeps NodeService::get_worker_info and
@@ -3823,8 +3843,9 @@ async fn run_master_node(
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
                 loop {
                     interval.tick().await;
-                    if let Ok(list) = wm.range_workers() {
-                        let entries: Vec<quil_rpc::WorkerEntry> = list
+                    let entries: Vec<quil_rpc::WorkerEntry> =
+                        quil_engine::worker::WorkerView::snapshot(wm.as_ref())
+                            .all
                             .into_iter()
                             .map(|w| quil_rpc::WorkerEntry {
                                 core_id: w.core_id,
@@ -3835,6 +3856,7 @@ async fn run_master_node(
                                 allocated: !w.filter.is_empty(),
                             })
                             .collect();
+                    {
                         *view.write().unwrap() = entries;
                     }
                 }
@@ -3853,7 +3875,7 @@ async fn run_master_node(
             crdt: Arc<quil_hypergraph::HypergraphCrdt>,
             shards_store: Arc<dyn quil_types::store::ShardsStore>,
             self_address: Vec<u8>,
-            last_received_frame: Arc<std::sync::atomic::AtomicU64>,
+            current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
             key_store: Arc<dyn quil_types::store::KeyStore>,
             peer_info_lookup: Arc<dyn Fn(&[u8]) -> Vec<String> + Send + Sync>,
             ed448_seed: Option<[u8; 57]>,
@@ -3878,79 +3900,43 @@ async fn run_master_node(
                 num_bigint::BigInt,
                 u64,
             )> {
-                // Resolve `frame_number` to the freshest known
-                // source. The clock-store reports the latest frame
-                // that has been STORED (post-materialize); a node
-                // that's observing frames without storing them, or
-                // one whose clock-store row is missing/blank for any
-                // reason, would return 0 from this path even though
-                // the BlossomSub recv / archive poller has been
-                // updating `last_received_frame` for many frames.
-                // Taking the max of both sources protects the
-                // downstream expiry check, the gRPC response
-                // `frame_number` (which the TUI reads), and the
-                // 720-frame grace logic in this function.
-                let lrf = self
-                    .last_received_frame
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                // Use the shared `current_frame.effective()` as the
+                // source of truth — populated by every observer
+                // path (BlossomSub recv, archive poller, finalize
+                // hook, materializer). Pull the difficulty from
+                // the clock-store header (the only place it lives)
+                // but don't let a missing clock-store row leave
+                // `frame_number` at 0 when `current_frame` knows
+                // better.
+                let cf = self.current_frame.effective();
                 let (difficulty, frame_number) = match self
                     .clock_store
                     .get_latest_global_clock_frame()
                 {
                     Ok(frame) => {
                         let h = frame.header.unwrap_or_default();
-                        (h.difficulty as u64, h.frame_number.max(lrf))
+                        (h.difficulty as u64, h.frame_number.max(cf))
                     }
-                    Err(_) => (0u64, lrf),
+                    Err(_) => (0u64, cf),
                 };
 
-                // Skip allocations past the 720-frame grace window.
-                //
-                // Uses `frame_number` (already resolved above to the
-                // latest stored or last-received frame), NOT
-                // `registry.current_frame()`. The registry's internal
-                // counter only advances when the materializer calls
-                // `process_state_transition`; a node that's
-                // observing frames without materializing them keeps
-                // that counter stale at 0 (or whatever was last
-                // materialized), which makes
-                // `current_frame > join_frame + 720` false for
-                // already-expired allocs. Result: `IsAllocated`
-                // leaks as true for shards the user once attempted
-                // but where the join has long since expired, and
-                // the TUI excludes those shards from its Available
-                // panel. Using the actual current frame fixes the
-                // expiry check for every observer mode.
-                let mut allocated_filters: std::collections::HashSet<Vec<u8>> =
-                    std::collections::HashSet::new();
+                // Collect the filters this prover is currently
+                // allocated to. `is_allocated` applies the 720-frame
+                // grace window — Active or non-expired Joining only.
                 let provers = self
                     .registry
                     .get_provers(&self.self_address)
                     .unwrap_or_default();
-                for pr in &provers {
-                    if pr.address != self.self_address {
-                        continue;
-                    }
-                    for alloc in &pr.allocations {
-                        use quil_types::consensus::ProverStatus;
-                        if alloc.status == ProverStatus::Joining
-                            && frame_number > alloc.join_frame_number + 720
-                        {
-                            continue;
-                        }
-                        if alloc.status == ProverStatus::Leaving
-                            && frame_number > alloc.leave_frame_number + 720
-                        {
-                            continue;
-                        }
-                        if alloc.status == ProverStatus::Active
-                            || alloc.status == ProverStatus::Joining
-                        {
-                            allocated_filters
-                                .insert(alloc.confirmation_filter.clone());
-                        }
-                    }
-                }
+                let allocated_filters: std::collections::HashSet<Vec<u8>> = provers
+                    .iter()
+                    .filter(|pr| pr.address == self.self_address)
+                    .flat_map(|pr| {
+                        pr.allocations
+                            .iter()
+                            .filter(|a| a.is_allocated(frame_number))
+                            .map(|a| a.confirmation_filter.clone())
+                    })
+                    .collect();
 
                 let local_get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
                     self.crdt.clone(),
@@ -4182,7 +4168,7 @@ async fn run_master_node(
         let pic_for_lookup = peer_info_cache.clone();
         let peer_info_lookup: Arc<dyn Fn(&[u8]) -> Vec<String> + Send + Sync> =
             Arc::new(move |peer_id: &[u8]| -> Vec<String> {
-                let map = pic_for_lookup.read().unwrap();
+                let map = pic_for_lookup.read();
                 match map.get(peer_id) {
                     Some(info) => info
                         .reachability
@@ -4202,7 +4188,7 @@ async fn run_master_node(
                 crdt: crdt.clone(),
                 shards_store: shards_store.clone(),
                 self_address: prover_address.to_vec(),
-                last_received_frame: last_received_frame.clone(),
+                current_frame: current_frame.clone(),
                 key_store: key_store.clone() as Arc<dyn quil_types::store::KeyStore>,
                 peer_info_lookup,
                 ed448_seed: mtls_seed,

@@ -435,4 +435,64 @@ mod tests {
         let vote = compute_fee_multiplier_vote(&m, &[1], 15_000, 10_000, true);
         assert_eq!(vote, 180); // 200 - 10% = 180
     }
+
+    /// Side-by-side comparison: with identical inputs (fee manager
+    /// state, timestamps), `reward_greedy=true` adjusts the fee toward
+    /// the protocol target while `reward_greedy=false` leaves the
+    /// base unchanged. This is the "data-greedy vs reward-greedy"
+    /// behavioral divergence — the same chain state can yield two
+    /// distinct `fee_multiplier_vote` numbers depending on the local
+    /// node's strategy. Frame headers carry whichever value the
+    /// proposing node chose, so a mixed-strategy committee will see
+    /// vote spread.
+    #[test]
+    fn reward_greedy_vs_data_greedy_diverge_on_off_target_cadence() {
+        let m = mgr(10);
+        // Prime the sliding window so base_fee > 1.
+        for f in 1..=3u64 {
+            m.add_frame_fee_vote(&[7], f, 500).unwrap();
+        }
+        // Off-target cadence: 5s (50% faster than 10s target → capped
+        // at 10% drop).
+        let now = 30_000i64;
+        let prev = 25_000i64;
+        let reward_greedy = compute_fee_multiplier_vote(&m, &[7], now, prev, true);
+        let data_greedy = compute_fee_multiplier_vote(&m, &[7], now, prev, false);
+        assert_ne!(
+            reward_greedy, data_greedy,
+            "strategies must produce different votes on off-target cadence"
+        );
+        // Reward-greedy applies the 10% downward cap on a base of 500.
+        assert_eq!(reward_greedy, 450, "reward_greedy=500 - 10% = 450");
+        // Data-greedy passes the base through untouched.
+        assert_eq!(data_greedy, 500, "data_greedy passes base through");
+
+        // Symmetry check: on slower-than-target cadence the
+        // reward-greedy strategy raises the fee while data-greedy
+        // again leaves it alone.
+        let now_slow = 50_000i64;
+        let prev_slow = 30_000i64; // 20s gap
+        let rg_slow = compute_fee_multiplier_vote(&m, &[7], now_slow, prev_slow, true);
+        let dg_slow = compute_fee_multiplier_vote(&m, &[7], now_slow, prev_slow, false);
+        assert_eq!(rg_slow, 550, "reward_greedy raises 500 → 550 on slow cadence");
+        assert_eq!(dg_slow, 500, "data_greedy untouched on slow cadence");
+    }
+
+    /// On-target cadence: the two strategies *agree*. This is the
+    /// no-arbitrage case — if everyone proposes exactly on target,
+    /// reward-greedy has no incentive to deviate from data-greedy.
+    /// Useful as a regression sentinel: if a future refactor makes
+    /// reward-greedy diverge here, fee dispersion would creep in even
+    /// when the chain is healthy.
+    #[test]
+    fn reward_greedy_vs_data_greedy_agree_on_target_cadence() {
+        let m = mgr(10);
+        m.add_frame_fee_vote(&[9], 1, 750).unwrap();
+        let now = 20_000i64;
+        let prev = 10_000i64; // exactly 10s
+        let rg = compute_fee_multiplier_vote(&m, &[9], now, prev, true);
+        let dg = compute_fee_multiplier_vote(&m, &[9], now, prev, false);
+        assert_eq!(rg, dg, "strategies agree on target cadence");
+        assert_eq!(rg, 750);
+    }
 }

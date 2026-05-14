@@ -176,11 +176,9 @@ impl Unique for GlobalState {
 /// - `source` = the proposal id this vote points to (what's being voted for)
 ///
 /// The cache and vote-collector code in `quil-consensus` keys by signer
-/// (i.e. `vote.identity()`) and asserts `vote.source() == state.identifier`,
-/// so the labels here must follow the Go convention exactly. Earlier
-/// drafts of this port had the labels swapped, which made the votes
-/// cache flag every distinct voter for the same proposal as a
-/// double-vote and prevented QC formation.
+/// (i.e. `vote.identity()`) and asserts `vote.source() == state.identifier`.
+/// Swapping the two would cause the votes cache to flag every distinct
+/// voter for the same proposal as a double-vote and prevent QC formation.
 #[derive(Clone)]
 pub struct GlobalVote {
     identity: Identity,
@@ -288,12 +286,20 @@ pub fn wire_proposal_to_signed(
         wire.prior_rank_timeout_certificate.clone().map(|tc| tc.into_trait_object());
 
     // 5. Build the State<GlobalState>
+    //
+    // `parent_quorum_certificate` is the QC the wire proposal carried
+    // in `wire.latest_quorum_certificate`; the same Arc is cloned into
+    // both the State and the wrapping Proposal so consumers reading
+    // the QC off the state see the same aggregated signature the
+    // proposer signed against. Mirrors Go's
+    // `models.State.ParentQuorumCertificate`.
     let consensus_state = quil_consensus::models::State {
         rank: wire.vote.rank,
         identifier: identifier.clone(),
         proposer_id: wire.vote.address.clone(),
         parent_qc_identity,
         parent_qc_rank,
+        parent_quorum_certificate: Some(std::sync::Arc::clone(&parent_qc)),
         timestamp: wire.vote.timestamp,
         state,
     };
@@ -339,11 +345,16 @@ pub fn build_genesis_certified_state(
             proposer_id: header.prover.clone(),
             parent_qc_identity: qc_identity.clone(),
             parent_qc_rank: header.rank.saturating_sub(1),
+            // Genesis trusted-root: no parent QC trait object
+            // available (the seeded genesis QC is constructed separately
+            // and threaded through `genesis_qc_override`).
+            parent_quorum_certificate: None,
             timestamp: header.timestamp as u64,
             state,
         },
         certifying_qc_identity: qc_identity,
         certifying_qc_rank: header.rank,
+        certifying_quorum_certificate: None,
     }
 }
 
@@ -410,9 +421,10 @@ mod tests {
             vec![0xAAu8; 74],
             vec![0x01],
         );
-        assert_eq!(vote.identity().as_slice(), b"proposal-hash");
+        // `identity` = voter, `source` = proposal id — matches Go.
+        assert_eq!(vote.identity().as_slice(), b"voter-id");
         assert_eq!(vote.rank(), 3);
-        assert_eq!(vote.source().as_slice(), b"voter-id");
+        assert_eq!(vote.source().as_slice(), b"proposal-hash");
         assert_eq!(vote.timestamp(), 5000);
         assert_eq!(vote.signature(), &[0xAAu8; 74][..]);
     }

@@ -532,69 +532,15 @@ mod tests {
 
     // ---- test stubs ----
 
-    #[derive(Default)]
-    struct StubProverRegistry;
-    impl ProverRegistryTrait for StubProverRegistry {
-        fn get_prover_info(&self, _: &[u8]) -> Result<Option<quil_types::consensus::ProverInfo>> {
-            Ok(None)
-        }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> {
-            Err(QuilError::NotFound("stub".into()))
-        }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> {
-            Ok(Vec::new())
-        }
-        fn get_active_provers(
-            &self,
-            _: &[u8],
-        ) -> Result<Vec<quil_types::consensus::ProverInfo>> {
-            Ok(Vec::new())
-        }
-        fn get_prover_count(&self, _: &[u8]) -> Result<usize> {
-            Ok(0)
-        }
-        fn get_provers(&self, _: &[u8]) -> Result<Vec<quil_types::consensus::ProverInfo>> {
-            Ok(Vec::new())
-        }
-        fn get_provers_by_status(
-            &self,
-            _: &[u8],
-            _: quil_types::consensus::ProverStatus,
-        ) -> Result<Vec<quil_types::consensus::ProverInfo>> {
-            Ok(Vec::new())
-        }
-        fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> Result<()> {
-            Ok(())
-        }
-        fn refresh(&self) -> Result<()> {
-            Ok(())
-        }
-        fn get_all_active_app_shard_provers(
-            &self,
-        ) -> Result<Vec<quil_types::consensus::ProverInfo>> {
-            Ok(Vec::new())
-        }
-        fn get_prover_shard_summaries(
-            &self,
-            _frame_number: u64,
-        ) -> Result<Vec<quil_types::consensus::ProverShardSummary>> {
-            Ok(Vec::new())
-        }
-        fn prune_orphan_joins(&self, _: u64) -> Result<()> {
-            Ok(())
-        }
-        fn evict_inactive_provers(
-            &self,
-            _: u64,
-            _: u64,
-            _: &std::collections::HashMap<String, u64>,
-        ) -> Result<Vec<Vec<u8>>> {
-            Ok(Vec::new())
-        }
-        fn current_frame(&self) -> u64 {
-            0
-        }
-    }
+    // Shared stub from `crate::test_support`. Replaces a 60-line
+    // local impl that re-declared every trait method as a no-op /
+    // empty return. `get_next_prover` differs slightly — the
+    // shared stub returns an empty Vec when no provers are
+    // registered, whereas the frame_validator tests previously
+    // returned a "stub" NotFound error. Empty Vec is equivalent
+    // for these tests: the validator's caller treats both as "no
+    // leader" and skips further checks.
+    type StubProverRegistry = crate::test_support::TestProverRegistry;
 
     #[derive(Default)]
     struct StubBls;

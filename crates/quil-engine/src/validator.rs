@@ -578,6 +578,7 @@ mod tests {
                     proposer_id: proposer.into(),
                     parent_qc_identity: format!("parent-{}", parent_qc_rank).into_bytes(),
                     parent_qc_rank,
+                    parent_quorum_certificate: Some(parent_qc.clone()),
                     timestamp: 0,
                     state: AppState { id: format!("s-{}", rank).into_bytes(), rank },
                 },

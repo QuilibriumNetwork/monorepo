@@ -29,7 +29,7 @@ use quil_types::error::Result;
 
 use crate::halt_state::HaltState;
 use crate::provers::proposer::{self, ShardDescriptor, Strategy};
-use crate::worker::WorkerManager;
+use crate::worker::{WorkerManager, WorkerView};
 use crate::worker_allocator::WorkerAllocator;
 
 /// Confirm window for pending joins/leaves (matches Go's 360 frames).
@@ -137,6 +137,184 @@ impl std::fmt::Debug for LifecycleAction {
     }
 }
 
+/// Allocations partitioned by their effective status at a given
+/// frame. Lifecycle's `evaluate` collects these once and dispatches
+/// each downstream subroutine against the appropriate slice. Pulling
+/// the partitioning out of the inline match expression makes it
+/// testable in isolation — important because mis-bucketing has been
+/// a recurring source of regressions (bug #14, #15 in the v2.1.0.20
+/// branch — `tree.Delete` was wrongly removing expired Joining
+/// allocs that should have been bucketed as ExpiredJoining and left
+/// alone).
+#[derive(Debug, Default)]
+pub struct AllocationBuckets {
+    /// Allocs in Joining (still within grace) — eligible for confirm.
+    pub joining: Vec<(Vec<u8>, u64)>,
+    /// Allocs in Active — drive surplus / leave decisions.
+    pub active: Vec<Vec<u8>>,
+    /// Allocs in Leaving (still within grace) — eligible for leave-confirm.
+    pub leaving: Vec<(Vec<u8>, u64)>,
+    /// Every filter we own (Joining, Active, Paused, Leaving) but
+    /// NOT terminal/expired. The "are we already on this shard" set.
+    pub all_ours: Vec<Vec<u8>>,
+}
+
+impl AllocationBuckets {
+    /// Partition a prover's allocation list by effective status at
+    /// `frame_number`. Terminal and expired statuses (Rejected,
+    /// Kicked, ExpiredJoining, ExpiredLeaving, Unknown) are
+    /// excluded from every bucket — the lifecycle treats them as
+    /// "doesn't exist," which prevents `plan_leaves` from
+    /// proposing a Leave for an allocation the network already
+    /// considers terminal.
+    pub fn from_allocations(
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        frame_number: u64,
+    ) -> Self {
+        use quil_types::consensus::EffectiveStatus;
+        let mut buckets = AllocationBuckets::default();
+        for alloc in allocations {
+            match alloc.effective_status(frame_number) {
+                EffectiveStatus::Joining => {
+                    buckets.all_ours.push(alloc.confirmation_filter.clone());
+                    buckets
+                        .joining
+                        .push((alloc.confirmation_filter.clone(), alloc.join_frame_number));
+                }
+                EffectiveStatus::Active => {
+                    buckets.all_ours.push(alloc.confirmation_filter.clone());
+                    buckets.active.push(alloc.confirmation_filter.clone());
+                }
+                EffectiveStatus::Leaving => {
+                    buckets.all_ours.push(alloc.confirmation_filter.clone());
+                    buckets.leaving.push((
+                        alloc.confirmation_filter.clone(),
+                        alloc.leave_frame_number,
+                    ));
+                }
+                EffectiveStatus::Paused => {
+                    // We still own the alloc — keep it in `all_ours`
+                    // so the proposer doesn't re-propose joining the
+                    // same shard — but neither active (no
+                    // surplus/leave pressure) nor joining/leaving
+                    // (no decide-pending action).
+                    buckets.all_ours.push(alloc.confirmation_filter.clone());
+                }
+                // Terminal / past-grace. Treat as "doesn't exist":
+                // don't push anywhere, otherwise these would leak
+                // into `allocated_descriptors` and `plan_leaves`
+                // may emit a Leave for an allocation that's already
+                // terminal on-chain.
+                EffectiveStatus::ExpiredJoining
+                | EffectiveStatus::ExpiredLeaving
+                | EffectiveStatus::Rejected
+                | EffectiveStatus::Kicked
+                | EffectiveStatus::Unknown => {}
+            }
+        }
+        buckets
+    }
+}
+
+/// Snapshot of every gate the lifecycle consults when deciding what
+/// to emit on a given frame. Populated once at the top of
+/// [`ProverLifecycle::evaluate`] (and exposed via
+/// [`ProverLifecycle::readiness_for`] for diagnostics) so each
+/// downstream branch consults a single, consistent set of conditions
+/// rather than re-reading atomics one by one. Each gate carries the
+/// *positive* meaning ("ok to proceed") and the readiness checkers
+/// below report the first failure as a stable `&'static str` reason
+/// suitable for logging.
+#[derive(Debug, Clone, Copy)]
+pub struct LifecycleReadiness {
+    /// Frame the readiness was evaluated at. Lets callers cross-check
+    /// the readiness snapshot against the frame they intend to act on.
+    pub frame_number: u64,
+    /// At least one frame has been observed (via BlossomSub recv,
+    /// archive poller, or startup clock-store seed). Cold-start
+    /// nodes will fail this gate.
+    pub frame_seen: bool,
+    /// Initial prover-tree sync has reported completion. Set by
+    /// the bootstrap path once we've drained the initial archive
+    /// fetch.
+    pub initial_sync_complete: bool,
+    /// The local prover-tree root commitment has been verified at
+    /// or past `frame_number` against an archive snapshot.
+    pub tree_verified: bool,
+    /// No coverage halt is currently active. While halted, the
+    /// lifecycle defers all propose/confirm actions to avoid making
+    /// allocation decisions on stale shard data.
+    pub no_halt: bool,
+    /// Initial `GetAppShards` refresh has completed at least once.
+    /// Gates auto-pick branches (Propose*) but NOT confirm/seniority
+    /// branches (those depend only on local pending state).
+    pub shard_info_loaded: bool,
+    /// Enough frames have elapsed since the last join attempt to
+    /// allow another. Driven by `WorkerAllocator::last_join_attempt`
+    /// + `JOIN_COOLDOWN_FRAMES`.
+    pub join_cooldown_ok: bool,
+    /// This node has a non-empty prover address (loaded from keys).
+    /// Without one we can't sign anything.
+    pub identity_known: bool,
+    /// VDF proof generation is NOT currently in flight. While a
+    /// proof is being computed, the lifecycle defers all evaluation
+    /// to avoid layering an additional join proposal on top of an
+    /// expensive in-progress computation.
+    pub proof_idle: bool,
+}
+
+impl LifecycleReadiness {
+    /// Minimum readiness for any lifecycle action (including
+    /// confirms and seniority-merge): the local view must be valid
+    /// and the registry must be current at the target frame.
+    /// Returns `Err(reason)` on the first failing gate; reasons are
+    /// stable strings suitable for trace logging.
+    pub fn baseline_ready(&self) -> std::result::Result<(), &'static str> {
+        if !self.proof_idle {
+            return Err("proof in progress");
+        }
+        if !self.identity_known {
+            return Err("prover address not set");
+        }
+        if !self.frame_seen {
+            return Err("awaiting initial frame");
+        }
+        if !self.initial_sync_complete {
+            return Err("awaiting prover root sync");
+        }
+        if !self.tree_verified {
+            return Err("latest frame not yet verified");
+        }
+        Ok(())
+    }
+
+    /// Propose-time readiness: baseline + no halt + cooldown
+    /// elapsed. Required for any path that submits a `Propose*`
+    /// message (join, leave, shard split/merge).
+    pub fn propose_ready(&self) -> std::result::Result<(), &'static str> {
+        self.baseline_ready()?;
+        if !self.no_halt {
+            return Err("shard coverage halt active");
+        }
+        if !self.join_cooldown_ok {
+            return Err("cooldown between join attempts");
+        }
+        Ok(())
+    }
+
+    /// Auto-pick readiness: propose_ready + initial `GetAppShards`
+    /// data is in. Required for paths that automatically choose
+    /// shards from the remote-sourced size cache (vs. confirming a
+    /// proposal that came in over the wire).
+    pub fn auto_pick_ready(&self) -> std::result::Result<(), &'static str> {
+        self.propose_ready()?;
+        if !self.shard_info_loaded {
+            return Err("shard info not yet loaded");
+        }
+        Ok(())
+    }
+}
+
 /// Tracks the lifecycle state for this node's prover.
 pub struct ProverLifecycle {
     /// This node's prover address (32 bytes, Poseidon hash of BLS pubkey).
@@ -151,24 +329,49 @@ pub struct ProverLifecycle {
     /// Matches Go's `materializer.proverRootVerifiedFrame`. Gates
     /// proposals on the registry being current.
     prover_root_verified_frame: AtomicU64,
-    /// The most recently observed frame number.
-    last_observed_frame: AtomicU64,
-    /// Reward strategy. Matches `config.engine.data_greedy`.
-    pub strategy: Strategy,
+    /// Shared node-level current-frame tracker. Consulted by the
+    /// readiness snapshot for the `frame_seen` gate; populated by
+    /// the BlossomSub recv path, archive poller, finalize hook,
+    /// and frame materializer. Replaces the lifecycle's prior
+    /// `last_observed_frame: AtomicU64` — that mirror was a
+    /// duplicate of the same value and had to be set by callers
+    /// of `evaluate`, which was a synchronization invariant
+    /// they often forgot.
+    current_frame: Arc<crate::current_frame::CurrentFrame>,
+    /// Reward strategy. Matches `config.engine.data_greedy`. Set
+    /// at construction; treated as immutable for the lifetime of
+    /// the lifecycle (production never changes it after startup,
+    /// and the previous `&mut self` setter forced every holder
+    /// into a `mut` binding for a one-time init write).
+    strategy: Strategy,
     /// Issuance units constant (default 8_000_000_000).
-    pub units: u64,
+    units: u64,
     /// WorkerAllocator holds the single-source-of-truth join cooldown timer.
     allocator: Arc<WorkerAllocator>,
     /// Shared halt state — proposals pause while any shard is in a
     /// coverage halt. Populated by the coverage-event subscriber.
     halt_state: Arc<HaltState>,
-    /// Real per-shard byte sizes keyed by confirmation filter, derived
-    /// from `ShardsStore::range_app_shards`. Tier-5 #3: used to populate
-    /// `ShardDescriptor.size` in `build_proposal_descriptors` and
-    /// `build_decide_descriptors` so reward scoring matches Go's
-    /// `shard.Size.Uint64()` from `worker_allocator.go:855-893`.
-    /// Falls back to the registry's prover-count proxy when empty.
-    shard_sizes_by_filter: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Per-shard byte sizes derived from the local hypergraph CRDT
+    /// (`local_app_shard_get_sizes` walks `vertex_adds`). Authoritative
+    /// for shards this node holds data for — everything else is 0 and
+    /// excluded by the writer at the point of insertion. Refreshed
+    /// every frame by the archive poller's `on_frame` closure.
+    ///
+    /// **Split from a previous single-cache design**: a single
+    /// `shard_sizes_by_filter` field was overwritten on each
+    /// `set_local_shard_sizes` / `set_remote_shard_sizes` call. The per-frame
+    /// local writer clobbered the (~60-frame-cadence) remote writer,
+    /// leaving the lifecycle with a near-empty score map for 59 out
+    /// of every 60 frames. Splitting into two caches lets each writer
+    /// own its source-of-truth without racing.
+    local_shard_sizes: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Per-shard byte sizes from the most recent successful
+    /// `GetAppShards` archive fetch. Authoritative for shards we are
+    /// NOT allocated to (the local cache would have 0 / missing
+    /// entries for those). Refreshed every 60 frames or on first-
+    /// success by the `shard_info_refresh` task; setting it flips the
+    /// `shard_info_loaded` gate.
+    remote_shard_sizes: RwLock<HashMap<Vec<u8>, u64>>,
     /// Frame window between a join (or leave) proposal and its
     /// confirm/reject. Defaults to `DEFAULT_CONFIRM_WINDOW_FRAMES`
     /// (360, mainnet); can be lowered to a small value for testnet
@@ -185,36 +388,45 @@ pub struct ProverLifecycle {
     /// global filter, which is explicitly skipped, so no joins
     /// are ever proposed.
     shards_store: RwLock<Option<Arc<dyn quil_types::store::ShardsStore>>>,
-    /// Set to true after the first successful `GetAppShards` refresh.
-    /// Gates `ProposeJoin` and `ProposeLeave`: the lifecycle must not
-    /// auto-pick shards while it lacks any remote-sourced size data,
-    /// because picking on a default-zero or registry-derived guess
-    /// produces low-quality decisions. Local-only sources (registry
-    /// summaries, shards-store) populate `shard_sizes_by_filter`
-    /// independently but do NOT flip this flag — only a successful
-    /// archive fetch via `replace_shard_sizes` does. Confirm / leave-
-    /// confirm / seniority-merge paths run regardless of this gate
-    /// since they depend on local pending state, not shard sizes.
+    /// Set to true after the first successful `GetAppShards` refresh
+    /// (`set_remote_shard_sizes`). Gates `ProposeJoin` and `ProposeLeave`:
+    /// the lifecycle must not auto-pick shards while it lacks any
+    /// remote-sourced size data, because picking on local-only data
+    /// (which is 0 for shards we're not on) makes "empty" shards look
+    /// identical to genuinely-uninteresting ones. The local cache
+    /// (`set_local_shard_sizes`) does NOT flip this flag — local data is
+    /// only authoritative for shards we already hold. Confirm /
+    /// leave-confirm / seniority-merge paths run regardless of this
+    /// gate since they depend on local pending state, not shard sizes.
     shard_info_loaded: AtomicBool,
 }
 
 impl ProverLifecycle {
+    /// Construct a lifecycle backed by the given `CurrentFrame`
+    /// tracker. The lifecycle reads from the tracker for the
+    /// `frame_seen` readiness gate; it never writes back, so any
+    /// site that already advances the shared tracker (BlossomSub
+    /// recv, archive poller, materializer) covers the lifecycle
+    /// automatically.
     pub fn new(
         prover_address: Vec<u8>,
         allocator: Arc<WorkerAllocator>,
         halt_state: Arc<HaltState>,
+        current_frame: Arc<crate::current_frame::CurrentFrame>,
+        strategy: Strategy,
     ) -> Self {
         Self {
             prover_address,
             proof_in_progress: AtomicBool::new(false),
             initial_sync_complete: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
-            last_observed_frame: AtomicU64::new(0),
-            strategy: Strategy::RewardGreedy,
+            current_frame,
+            strategy,
             units: proposer::DEFAULT_UNITS,
             allocator,
             halt_state,
-            shard_sizes_by_filter: RwLock::new(HashMap::new()),
+            local_shard_sizes: RwLock::new(HashMap::new()),
+            remote_shard_sizes: RwLock::new(HashMap::new()),
             confirm_window_frames: AtomicU64::new(DEFAULT_CONFIRM_WINDOW_FRAMES),
             shards_store: RwLock::new(None),
             shard_info_loaded: AtomicBool::new(false),
@@ -251,36 +463,57 @@ impl ProverLifecycle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Populate the per-shard byte size map. Caller is the consensus
-    /// loop, which calls `range_app_shards` once per frame and passes
-    /// the resulting `filter → size` map here. Without this, the
-    /// proposer falls back to the registry's prover-count proxy and
-    /// reward scoring diverges from Go.
+    /// Populate the **local** per-shard byte size map (sizes derived
+    /// from this node's CRDT vertex-adds). Caller is the archive
+    /// poller's `on_frame` closure; it computes sizes per frame via
+    /// `local_app_shard_get_sizes`. Routes to `local_shard_sizes`
+    /// only — the remote cache is untouched.
     ///
-    /// **Does NOT flip `shard_info_loaded`** — this is the local-only
-    /// path (shards-store + registry summaries). To unblock the
-    /// `ProposeJoin` / `ProposeLeave` gate, call `replace_shard_sizes`
-    /// after a successful remote `GetAppShards` fetch.
-    pub fn set_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
-        if let Ok(mut guard) = self.shard_sizes_by_filter.write() {
+    /// **Does NOT flip `shard_info_loaded`** — local data is only
+    /// authoritative for shards we already hold; to unblock the
+    /// `ProposeJoin` / `ProposeLeave` gate, the remote refresh task
+    /// must succeed at least once via `set_remote_shard_sizes`.
+    pub fn set_local_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
+        if let Ok(mut guard) = self.local_shard_sizes.write() {
             *guard = sizes;
         }
     }
 
-    /// Replace the per-shard size map with the result of a successful
-    /// remote `GetAppShards` fetch and flip `shard_info_loaded` to
-    /// true. After the first successful call, `ProposeJoin` and
-    /// `ProposeLeave` are eligible to fire.
+    /// Populate the **remote** per-shard byte size map (sizes from a
+    /// successful `GetAppShards` archive fetch) and flip
+    /// `shard_info_loaded` to true. After the first successful call,
+    /// `ProposeJoin` and `ProposeLeave` are eligible to fire.
     ///
-    /// Missing-from-refresh filters are dropped: the entire cache is
-    /// replaced atomically with the fresh map. Callers that want to
-    /// preserve previously-known sizes for filters absent in the
-    /// refresh response must merge before calling this.
-    pub fn replace_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
-        if let Ok(mut guard) = self.shard_sizes_by_filter.write() {
+    /// Missing-from-refresh filters are dropped from the remote
+    /// cache: the entire remote map is replaced atomically with the
+    /// fresh fetch. The local cache is untouched, so partial remote
+    /// refreshes do NOT lose local data for shards we hold.
+    pub fn set_remote_shard_sizes(&self, sizes: HashMap<Vec<u8>, u64>) {
+        if let Ok(mut guard) = self.remote_shard_sizes.write() {
             *guard = sizes;
         }
         self.shard_info_loaded.store(true, Ordering::Relaxed);
+    }
+
+    /// Merged read of the two size caches. Remote entries form the
+    /// base map (authoritative for shards we're not on); local
+    /// entries override / fill in (authoritative for shards we
+    /// hold). Cloned per call — typical map sizes are O(thousands)
+    /// at most, called once per `evaluate` (~10 s cadence), so the
+    /// alloc cost is negligible. Returned by value so callers
+    /// don't hold either lock during proposal building.
+    pub fn merged_shard_sizes(&self) -> HashMap<Vec<u8>, u64> {
+        let mut merged = self
+            .remote_shard_sizes
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if let Ok(local) = self.local_shard_sizes.read() {
+            for (k, v) in local.iter() {
+                merged.insert(k.clone(), *v);
+            }
+        }
+        merged
     }
 
     /// True once the lifecycle has successfully consumed at least one
@@ -307,16 +540,6 @@ impl ProverLifecycle {
     /// frame height.
     pub fn set_prover_root_verified_frame(&self, frame: u64) {
         self.prover_root_verified_frame.store(frame, Ordering::Relaxed);
-    }
-
-    /// Update the most recently observed frame number.
-    pub fn set_last_observed_frame(&self, frame: u64) {
-        self.last_observed_frame.fetch_max(frame, Ordering::Relaxed);
-    }
-
-    /// Configure reward strategy.
-    pub fn set_strategy(&mut self, strategy: Strategy) {
-        self.strategy = strategy;
     }
 
     /// Record a successful `ProverJoin` submission at `frame_number`.
@@ -352,13 +575,16 @@ impl ProverLifecycle {
         }
 
         let active = active_filters.len();
-        let last_observed = self.last_observed_frame.load(Ordering::Relaxed);
+        let last_observed = self.current_frame.effective();
 
         let mut pending: Vec<Vec<u8>> = joining_filters.iter()
             .filter(|(filter, join_frame)| {
                 if filter.is_empty() { return false; }
-                // Skip expired joins — implicitly rejected.
-                last_observed <= *join_frame + crate::worker_allocator::PENDING_FILTER_GRACE_FRAMES
+                // Skip expired joins — implicitly rejected. Uses
+                // the same grace constant as `effective_status`.
+                last_observed
+                    <= *join_frame
+                        + quil_types::consensus::ALLOCATION_GRACE_FRAMES
             })
             .map(|(f, _)| f.clone())
             .collect();
@@ -444,54 +670,31 @@ impl ProverLifecycle {
         picks
     }
 
-    /// Returns `Some(reason)` if the prover tree isn't fresh enough
-    /// at `frame_number` for any lifecycle action.
-    fn tree_synced(&self, frame_number: u64) -> Option<&'static str> {
-        if self.last_observed_frame.load(Ordering::Relaxed) == 0 {
-            return Some("awaiting initial frame");
-        }
-        if !self.initial_sync_complete.load(Ordering::Relaxed) {
-            return Some("awaiting prover root sync");
-        }
-        let verified = self.prover_root_verified_frame.load(Ordering::Relaxed);
-        if verified == 0 || verified < frame_number {
-            return Some("latest frame not yet verified");
-        }
-        None
-    }
-
-    /// Returns `(ready, reason_if_not)` for the propose paths. Layered
-    /// on top of `tree_synced`.
-    fn join_proposal_ready(&self, frame_number: u64) -> (bool, &'static str) {
-        if let Some(reason) = self.tree_synced(frame_number) {
-            return (false, reason);
-        }
-        if self.halt_state.any_halted() {
-            return (false, "shard coverage halt active");
-        }
+    /// Snapshot every lifecycle gate at once, returning a single
+    /// `LifecycleReadiness` struct that branches in `evaluate` can
+    /// consult uniformly. Centralizing gate logic here keeps "why
+    /// didn't I propose this frame" answerable from one place — no
+    /// more `Option<&'static str>` ↔ `(bool, &'static str)` jumble.
+    pub fn readiness_for(&self, frame_number: u64) -> LifecycleReadiness {
         let last_attempt = self.allocator.last_join_attempt();
-        if last_attempt != 0 {
-            if frame_number <= last_attempt {
-                tracing::debug!(
-                    last_attempt,
-                    frame_number,
-                    "join cooldown: frame not newer than last attempt"
-                );
-                return (false, "waiting for newer frame");
-            }
-            let gap = frame_number - last_attempt;
-            if gap < crate::worker_allocator::JOIN_COOLDOWN_FRAMES {
-                tracing::debug!(
-                    last_attempt,
-                    frame_number,
-                    gap,
-                    required = crate::worker_allocator::JOIN_COOLDOWN_FRAMES,
-                    "join cooldown active"
-                );
-                return (false, "cooldown between join attempts");
-            }
+        let join_cooldown_ok = last_attempt == 0
+            || (frame_number > last_attempt
+                && frame_number - last_attempt
+                    >= crate::worker_allocator::JOIN_COOLDOWN_FRAMES);
+        LifecycleReadiness {
+            frame_number,
+            frame_seen: self.current_frame.is_ready(),
+            initial_sync_complete: self.initial_sync_complete.load(Ordering::Relaxed),
+            tree_verified: {
+                let verified = self.prover_root_verified_frame.load(Ordering::Relaxed);
+                verified > 0 && verified >= frame_number
+            },
+            no_halt: !self.halt_state.any_halted(),
+            shard_info_loaded: self.shard_info_loaded(),
+            join_cooldown_ok,
+            identity_known: !self.prover_address.is_empty(),
+            proof_idle: !self.proof_in_progress.load(Ordering::Relaxed),
         }
-        (true, "")
     }
 
     /// Evaluate the current frame and determine what lifecycle actions
@@ -527,22 +730,22 @@ impl ProverLifecycle {
             return Ok(Vec::new());
         }
 
-        self.set_last_observed_frame(frame_number);
+        // `CurrentFrame` is advanced upstream by the BlossomSub
+        // recv path / archive poller / materializer — every
+        // reachable production caller of `evaluate` has already
+        // observed `frame_number`. Tests seed `current_frame`
+        // explicitly in their lifecycle constructor.
 
-        // Unconditional gates — nothing to emit.
-        if self.proof_in_progress.load(Ordering::Relaxed) {
-            return Ok(Vec::new());
-        }
-        if self.prover_address.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // No actions emit until the registry view is current.
-        if let Some(reason) = self.tree_synced(frame_number) {
+        // Take a single snapshot of every gate up-front and consult
+        // it via the readiness helpers below. This collapses what
+        // used to be 3+ independent atomic reads scattered through
+        // the function into one consistent view per call.
+        let readiness = self.readiness_for(frame_number);
+        if let Err(reason) = readiness.baseline_ready() {
             tracing::debug!(
                 frame = frame_number,
                 reason,
-                "skipping lifecycle evaluation — tree not synced"
+                "skipping lifecycle evaluation — baseline gate"
             );
             return Ok(Vec::new());
         }
@@ -551,6 +754,7 @@ impl ProverLifecycle {
         let summaries = registry.get_prover_shard_summaries(frame_number)?;
         let prover_info = registry.get_prover_info(&self.prover_address)?;
         let workers = worker_manager.range_workers()?;
+        let worker_view = WorkerView::from_workers(workers.clone());
 
         // Discover shard filters from the local `ShardsStore`.
         // Mainnet seeds many shards at genesis (per
@@ -591,67 +795,16 @@ impl ProverLifecycle {
         };
 
         // Joining / Leaving allocations past the 720-frame grace are
-        // implicitly rejected on-chain. Skip them everywhere — including
-        // `all_our_filters` — so the slot can be re-proposed.
-        let mut joining_filters: Vec<(Vec<u8>, u64)> = Vec::new();
-        let mut active_filters: Vec<Vec<u8>> = Vec::new();
-        let mut leaving_filters: Vec<(Vec<u8>, u64)> = Vec::new();
-        let mut all_our_filters: Vec<Vec<u8>> = Vec::new();
-
-        if let Some(ref prover) = prover_info {
-            for alloc in &prover.allocations {
-                match alloc.status {
-                    ProverStatus::Joining => {
-                        if frame_number
-                            > alloc.join_frame_number
-                                + crate::worker_allocator::PENDING_FILTER_GRACE_FRAMES
-                        {
-                            continue;
-                        }
-                        all_our_filters.push(alloc.confirmation_filter.clone());
-                        joining_filters
-                            .push((alloc.confirmation_filter.clone(), alloc.join_frame_number));
-                    }
-                    ProverStatus::Active => {
-                        all_our_filters.push(alloc.confirmation_filter.clone());
-                        active_filters.push(alloc.confirmation_filter.clone());
-                    }
-                    ProverStatus::Leaving => {
-                        if frame_number
-                            > alloc.leave_frame_number
-                                + crate::worker_allocator::PENDING_FILTER_GRACE_FRAMES
-                        {
-                            continue;
-                        }
-                        all_our_filters.push(alloc.confirmation_filter.clone());
-                        leaving_filters
-                            .push((alloc.confirmation_filter.clone(), alloc.leave_frame_number));
-                    }
-                    ProverStatus::Paused => {
-                        // We still own the alloc; the worker is just
-                        // paused. Keep it in `all_our_filters` so we
-                        // don't propose joining the same shard, but
-                        // don't add to active_filters (no auto-leave
-                        // / surplus pressure) or joining/leaving
-                        // (no decide-pending action).
-                        all_our_filters.push(alloc.confirmation_filter.clone());
-                    }
-                    // Rejected / Kicked / Unknown / past-grace
-                    // Joining/Leaving — terminal or invalid. Treat
-                    // as "doesn't exist": don't push to
-                    // `all_our_filters`, otherwise they leak into
-                    // `allocated_descriptors` (via the
-                    // `all_our_filters.contains(&d.filter)` filter)
-                    // and `plan_leaves` may emit a ProverLeave for
-                    // an allocation that's already terminal — which
-                    // the network rejects but the user sees as a
-                    // leave for "a non-applicable shard."
-                    ProverStatus::Rejected
-                    | ProverStatus::Kicked
-                    | ProverStatus::Unknown => {}
-                }
-            }
-        }
+        // implicitly rejected on-chain. The buckets helper filters
+        // them out — see `AllocationBuckets::from_allocations`.
+        let buckets = prover_info
+            .as_ref()
+            .map(|p| AllocationBuckets::from_allocations(&p.allocations, frame_number))
+            .unwrap_or_default();
+        let joining_filters = buckets.joining;
+        let active_filters = buckets.active;
+        let leaving_filters = buckets.leaving;
+        let all_our_filters = buckets.all_ours;
 
         // Build separate descriptor views.
         //
@@ -662,11 +815,10 @@ impl ProverLifecycle {
         //   ring — used only to splice in pending-to-decide entries.
         // - `allocated_descriptors`: shards *we are on*, scored with the
         //   current ring — used for plan_leaves.
-        let shard_sizes_snapshot = self
-            .shard_sizes_by_filter
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        // Merged view: remote sizes (authoritative for shards we're
+        // not on) overlaid by local sizes (authoritative for shards
+        // we hold data for). See `merged_shard_sizes` for the rule.
+        let shard_sizes_snapshot = self.merged_shard_sizes();
         let proposal_descriptors = build_proposal_descriptors(
             &summaries,
             &all_our_filters,
@@ -693,29 +845,25 @@ impl ProverLifecycle {
         // still in flight: between `submit_join` (which records the
         // pending frame) and registry confirmation, the worker has an
         // empty filter but a non-zero pending frame.
-        let free_worker_ids: Vec<u32> = workers.iter()
-            .filter(|w| {
-                w.filter.is_empty()
-                    && !w.manually_managed
-                    && w.pending_filter_frame == 0
-            })
-            .map(|w| w.core_id)
-            .collect();
+        let free_worker_ids: Vec<u32> = worker_view.free_auto().map(|w| w.core_id).collect();
         let allow_proposals = !free_worker_ids.is_empty();
 
-        // Go's canPropose (cooldown + readiness). Checked once per
-        // evaluate so both propose paths see the same decision.
-        let (can_propose, skip_reason) = self.join_proposal_ready(frame_number);
+        // Go's canPropose (cooldown + readiness + halt). The
+        // readiness snapshot was captured at the top of evaluate;
+        // both propose paths see the same decision.
+        let propose_check = readiness.propose_ready();
+        let can_propose = propose_check.is_ok();
+        let skip_reason = propose_check.err().unwrap_or("");
 
         // Remote `GetAppShards` gate. Auto-pick decisions (join,
         // surplus-leave, score-leave) require shard size data sourced
         // from an archive — local registry summaries and the local
         // shards-store are NOT authoritative for this purpose. Until
         // we've consumed at least one successful `GetAppShards`
-        // refresh, all propose paths short-circuit. Confirm/leave-
+        // refresh, all auto-pick paths short-circuit. Confirm/leave-
         // confirm and seniority-merge paths run regardless since
         // they depend on local pending state, not shard sizes.
-        let shard_info_ready = self.shard_info_loaded();
+        let shard_info_ready = readiness.shard_info_loaded;
         if !shard_info_ready {
             tracing::debug!(
                 frame = frame_number,
@@ -1317,9 +1465,173 @@ fn compute_world_bytes_from_summaries(summaries: &[ProverShardSummary]) -> BigIn
 }
 
 #[cfg(test)]
+mod buckets_tests {
+    use super::*;
+    use quil_types::consensus::{ALLOCATION_GRACE_FRAMES, ProverAllocationInfo, ProverStatus};
+
+    fn alloc(
+        filter: u8,
+        status: ProverStatus,
+        join: u64,
+        leave: u64,
+    ) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status,
+            confirmation_filter: vec![filter],
+            rejection_filter: Vec::new(),
+            join_frame_number: join,
+            leave_frame_number: leave,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 0,
+            vertex_address: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn buckets_partition_by_effective_status_at_frame() {
+        let allocations = vec![
+            alloc(0x01, ProverStatus::Joining, 100, 0),
+            alloc(0x02, ProverStatus::Active, 50, 0),
+            alloc(0x03, ProverStatus::Leaving, 50, 500),
+            alloc(0x04, ProverStatus::Paused, 50, 0),
+        ];
+        let b = AllocationBuckets::from_allocations(&allocations, 600);
+        assert_eq!(b.joining.len(), 1, "1 joining within grace");
+        assert_eq!(b.active.len(), 1);
+        assert_eq!(b.leaving.len(), 1, "1 leaving within grace");
+        // joining + active + leaving + paused all owned
+        assert_eq!(b.all_ours.len(), 4);
+    }
+
+    #[test]
+    fn expired_joining_and_leaving_are_excluded_from_all_ours() {
+        // Joining at frame 1 — by frame 1 + GRACE + 1, it's expired.
+        let allocations = vec![
+            alloc(0x01, ProverStatus::Joining, 1, 0),
+            // Leaving at frame 2 — by frame 2 + GRACE + 1, it's expired.
+            alloc(0x02, ProverStatus::Leaving, 1, 2),
+        ];
+        let b = AllocationBuckets::from_allocations(
+            &allocations,
+            ALLOCATION_GRACE_FRAMES + 100,
+        );
+        assert!(b.joining.is_empty(), "expired joining excluded");
+        assert!(b.leaving.is_empty(), "expired leaving excluded");
+        assert!(b.all_ours.is_empty(), "expired allocs not in all_ours");
+    }
+
+    #[test]
+    fn rejected_and_kicked_excluded() {
+        let allocations = vec![
+            alloc(0x01, ProverStatus::Rejected, 100, 0),
+            alloc(0x02, ProverStatus::Kicked, 100, 0),
+        ];
+        let b = AllocationBuckets::from_allocations(&allocations, 200);
+        assert!(b.all_ours.is_empty());
+        assert!(b.joining.is_empty());
+        assert!(b.active.is_empty());
+        assert!(b.leaving.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shard_size_cache_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::halt_state::HaltState;
+    use crate::worker_allocator::WorkerAllocator;
+    use crate::test_support::{TestProverRegistry, TestWorkerManager};
+
+    fn make_lifecycle() -> ProverLifecycle {
+        let wm = Arc::new(TestWorkerManager::new());
+        let reg = Arc::new(TestProverRegistry::new());
+        let allocator = Arc::new(WorkerAllocator::new(wm, reg, vec![0xAA; 32]));
+        let halt = Arc::new(HaltState::new());
+        let cf = crate::current_frame::CurrentFrame::new();
+        ProverLifecycle::new(vec![0xAA; 32], allocator, halt, cf, Strategy::RewardGreedy)
+    }
+
+    /// The bug this split fixes: a per-frame local writer used to
+    /// clobber the periodic remote writer's data. The split caches
+    /// + merged-read guarantee that calling `set_local_shard_sizes` (per
+    /// frame) cannot evict remote-sourced entries the lifecycle
+    /// needs for proposal scoring.
+    #[test]
+    fn local_writer_does_not_clobber_remote_entries() {
+        let lc = make_lifecycle();
+        // Remote refresh: sizes for shards A, B, C, D (we hold
+        // none of them — typical fresh-node state).
+        let mut remote = HashMap::new();
+        remote.insert(b"shard-A".to_vec(), 1000);
+        remote.insert(b"shard-B".to_vec(), 2000);
+        remote.insert(b"shard-C".to_vec(), 3000);
+        remote.insert(b"shard-D".to_vec(), 4000);
+        lc.set_remote_shard_sizes(remote);
+        assert!(lc.shard_info_loaded(), "gate flips on first remote refresh");
+
+        // Per-frame local writer: we only hold data for shard A.
+        // In the old single-cache design, this would have shrunk
+        // the cache from 4 entries to 1, losing B/C/D.
+        let mut local = HashMap::new();
+        local.insert(b"shard-A".to_vec(), 1500); // newer, larger local value
+        lc.set_local_shard_sizes(local);
+
+        let merged = lc.merged_shard_sizes();
+        assert_eq!(merged.len(), 4, "remote entries B/C/D must survive");
+        assert_eq!(merged.get(b"shard-A".as_ref()), Some(&1500),
+            "local value wins for shards we hold");
+        assert_eq!(merged.get(b"shard-B".as_ref()), Some(&2000));
+        assert_eq!(merged.get(b"shard-C".as_ref()), Some(&3000));
+        assert_eq!(merged.get(b"shard-D".as_ref()), Some(&4000));
+    }
+
+    #[test]
+    fn remote_replace_drops_stale_remote_entries() {
+        let lc = make_lifecycle();
+        let mut remote1 = HashMap::new();
+        remote1.insert(b"A".to_vec(), 100);
+        remote1.insert(b"B".to_vec(), 200);
+        lc.set_remote_shard_sizes(remote1);
+
+        // A subsequent remote fetch shouldn't carry stale B.
+        let mut remote2 = HashMap::new();
+        remote2.insert(b"A".to_vec(), 150);
+        lc.set_remote_shard_sizes(remote2);
+
+        let merged = lc.merged_shard_sizes();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get(b"A".as_ref()), Some(&150));
+        assert!(merged.get(b"B".as_ref()).is_none(),
+            "stale remote entries are dropped on the next replace");
+    }
+
+    #[test]
+    fn local_only_data_is_available_before_remote_refresh() {
+        let lc = make_lifecycle();
+        // No remote yet (fresh-startup state). The gate stays
+        // closed but the lifecycle still has access to local
+        // sizes for its own held shards.
+        let mut local = HashMap::new();
+        local.insert(b"shard-A".to_vec(), 500);
+        lc.set_local_shard_sizes(local);
+
+        assert!(!lc.shard_info_loaded(),
+            "local writer must not flip the gate");
+        let merged = lc.merged_shard_sizes();
+        assert_eq!(merged.get(b"shard-A".as_ref()), Some(&500));
+    }
+}
+
+#[cfg(test)]
 mod proposal_loop_tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use quil_types::consensus::{
@@ -1327,118 +1639,16 @@ mod proposal_loop_tests {
     };
 
     use crate::halt_state::HaltState;
+    use crate::test_support::TestProverRegistry;
     use crate::worker::{WorkerInfo, WorkerManager};
     use crate::worker_allocator::{WorkerAllocator, JOIN_COOLDOWN_FRAMES};
 
-    struct ConfigurableRegistry {
-        prover: Mutex<Option<ProverInfo>>,
-        summaries: Mutex<Vec<ProverShardSummary>>,
-        current_frame: std::sync::atomic::AtomicU64,
-    }
+    /// Local alias — `TestProverRegistry` is the shared crate-wide
+    /// mock; the existing tests refer to it by this name.
+    type ConfigurableRegistry = TestProverRegistry;
 
-    impl ConfigurableRegistry {
-        fn new() -> Self {
-            Self {
-                prover: Mutex::new(None),
-                summaries: Mutex::new(Vec::new()),
-                current_frame: std::sync::atomic::AtomicU64::new(0),
-            }
-        }
-
-        fn set_prover(&self, info: ProverInfo) {
-            *self.prover.lock().unwrap() = Some(info);
-        }
-
-        fn set_summaries(&self, s: Vec<ProverShardSummary>) {
-            *self.summaries.lock().unwrap() = s;
-        }
-
-        #[allow(dead_code)]
-        fn set_current_frame(&self, frame: u64) {
-            self.current_frame.store(frame, Ordering::Relaxed);
-        }
-    }
-
-    impl ProverRegistry for ConfigurableRegistry {
-        fn refresh(&self) -> Result<()> { Ok(()) }
-        fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
-        fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> {
-            Ok(self.prover.lock().unwrap().clone())
-        }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8]) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn get_active_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
-        fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(0) }
-        fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
-        fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> { Ok(vec![]) }
-        fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> Result<()> { Ok(()) }
-        fn get_prover_shard_summaries(
-            &self,
-            _frame_number: u64,
-        ) -> Result<Vec<ProverShardSummary>> {
-            Ok(self.summaries.lock().unwrap().clone())
-        }
-        fn prune_orphan_joins(&self, _: u64) -> Result<()> { Ok(()) }
-        fn evict_inactive_provers(&self, _: u64, _: u64, _: &HashMap<String, u64>) -> Result<Vec<Vec<u8>>> {
-            Ok(vec![])
-        }
-        fn current_frame(&self) -> u64 {
-            self.current_frame.load(Ordering::Relaxed)
-        }
-    }
-
-    struct ConfigurableWorkerManager {
-        workers: Mutex<HashMap<u32, WorkerInfo>>,
-    }
-
-    impl ConfigurableWorkerManager {
-        fn new() -> Self {
-            Self { workers: Mutex::new(HashMap::new()) }
-        }
-
-        fn add(&self, info: WorkerInfo) {
-            self.workers.lock().unwrap().insert(info.core_id, info);
-        }
-    }
-
-    impl WorkerManager for ConfigurableWorkerManager {
-        fn set_worker_filter(
-            &self,
-            core_id: u32,
-            filter: &[u8],
-            start_consensus: bool,
-        ) -> Result<()> {
-            let mut g = self.workers.lock().unwrap();
-            let entry = g.entry(core_id).or_insert(WorkerInfo {
-                core_id,
-                filter: vec![],
-                available_storage: 0,
-                total_storage: 0,
-                manually_managed: false,
-                pending_filter_frame: 0,
-                allocated: false,
-            });
-            entry.filter = filter.to_vec();
-            entry.allocated = !filter.is_empty() && start_consensus;
-            Ok(())
-        }
-        fn deallocate_worker(&self, core_id: u32) -> Result<()> {
-            self.workers.lock().unwrap().remove(&core_id);
-            Ok(())
-        }
-        fn check_workers_connected(&self) -> Result<Vec<u32>> {
-            Ok(self.workers.lock().unwrap().keys().copied().collect())
-        }
-        fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
-            let mut out: Vec<WorkerInfo> =
-                self.workers.lock().unwrap().values().cloned().collect();
-            out.sort_by_key(|w| w.core_id);
-            Ok(out)
-        }
-        fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
-            self.allocate_worker(core_id, filter)
-        }
-    }
+    /// Local alias — `TestWorkerManager` is the shared mock.
+    type ConfigurableWorkerManager = crate::test_support::TestWorkerManager;
 
     fn make_lifecycle(
         prover_address: Vec<u8>,
@@ -1448,7 +1658,21 @@ mod proposal_loop_tests {
         let allocator =
             Arc::new(WorkerAllocator::new(wm, reg.clone(), prover_address.clone()));
         let halt = Arc::new(HaltState::new());
-        let lifecycle = Arc::new(ProverLifecycle::new(prover_address, allocator, halt));
+        let current_frame = crate::current_frame::CurrentFrame::new();
+        // Seed `frame_seen` for the test harness — production
+        // advances current_frame via the BlossomSub recv path
+        // before any `evaluate` call lands. Tests bypass that
+        // path, so we observe a sentinel here to keep the gate
+        // open. Subsequent test-driven evaluates advance it
+        // naturally inside `CurrentFrame`'s monotonic `fetch_max`.
+        current_frame.observe(1);
+        let lifecycle = Arc::new(ProverLifecycle::new(
+            prover_address,
+            allocator,
+            halt,
+            current_frame,
+            Strategy::RewardGreedy,
+        ));
         lifecycle.set_confirm_window_frames(2);
         lifecycle.set_sync_complete();
         // Seed byte-sizes from the registry's summaries. Tests
@@ -1478,11 +1702,11 @@ mod proposal_loop_tests {
             .filter(|s| !s.filter.is_empty() && s.total_size > 0)
             .map(|s| (s.filter.clone(), s.total_size))
             .collect();
-        // Use `replace_shard_sizes` (not `set_shard_sizes`) so the
+        // Use `set_remote_shard_sizes` (not `set_local_shard_sizes`) so the
         // `shard_info_loaded` gate flips to true. Tests simulate a
         // fully-synced node that has already consumed a GetAppShards
         // refresh; without this, every propose path short-circuits.
-        lc.replace_shard_sizes(sizes);
+        lc.set_remote_shard_sizes(sizes);
     }
 
     fn idle_worker(core_id: u32) -> WorkerInfo {
@@ -2059,7 +2283,15 @@ mod proposal_loop_tests {
             address.clone(),
         ));
         let halt = Arc::new(HaltState::new());
-        let lifecycle = Arc::new(ProverLifecycle::new(address, allocator, halt));
+        let current_frame = crate::current_frame::CurrentFrame::new();
+        current_frame.observe(1); // test-harness seed; see make_lifecycle
+        let lifecycle = Arc::new(ProverLifecycle::new(
+            address,
+            allocator,
+            halt,
+            current_frame,
+            Strategy::RewardGreedy,
+        ));
         lifecycle.set_confirm_window_frames(2);
 
         let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
@@ -2279,12 +2511,20 @@ mod proposal_loop_tests {
             address.clone(),
         ));
         let halt = Arc::new(HaltState::new());
-        let lifecycle = ProverLifecycle::new(address, allocator, halt);
+        let current_frame = crate::current_frame::CurrentFrame::new();
+        current_frame.observe(1); // test-harness seed; see make_lifecycle
+        let lifecycle = ProverLifecycle::new(
+            address,
+            allocator,
+            halt,
+            current_frame,
+            Strategy::RewardGreedy,
+        );
         lifecycle.set_confirm_window_frames(2);
         lifecycle.set_sync_complete();
         lifecycle.set_prover_root_verified_frame(100);
         // Even with local shard sizes, the GetAppShards gate is closed.
-        lifecycle.set_shard_sizes({
+        lifecycle.set_local_shard_sizes({
             let mut m = HashMap::new();
             m.insert(filter_bytes(0xA1), 1_000_000);
             m
@@ -2309,14 +2549,14 @@ mod proposal_loop_tests {
             actions
         );
 
-        // After replace_shard_sizes, the gate opens. (We re-supply the
+        // After set_remote_shard_sizes, the gate opens. (We re-supply the
         // same map to keep the test minimal.)
         let mut sizes = HashMap::new();
         for i in 1..=3u8 {
             sizes.insert(filter_bytes(0xA0 + i), 1_000_000);
         }
-        lifecycle.replace_shard_sizes(sizes);
-        assert!(lifecycle.shard_info_loaded(), "gate opens after replace_shard_sizes");
+        lifecycle.set_remote_shard_sizes(sizes);
+        assert!(lifecycle.shard_info_loaded(), "gate opens after set_remote_shard_sizes");
 
         // Bump verified frame so `tree_synced` passes at frame 101.
         lifecycle.set_prover_root_verified_frame(101);

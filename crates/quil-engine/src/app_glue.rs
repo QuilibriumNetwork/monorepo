@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use quil_consensus::event_handler::Consumer;
 use quil_consensus::forest::{Finalizer, FollowerConsumer};
 use quil_consensus::models::{
-    FinalityProof, Identity, QuorumCertificate, SignedProposal,
+    CertifiedState, FinalityProof, Identity, QuorumCertificate, SignedProposal,
     State, TimeoutCertificate, TimeoutState, Unique,
 };
 use quil_consensus::pacemaker::ParticipantConsumer;
@@ -35,6 +35,12 @@ pub enum AppConsensusEvent {
         frame_number: u64,
         rank: u64,
         state_id: Identity,
+        /// Canonical FrameHeader bytes for the finalized state.
+        /// Carried through from `on_finalized_state` so the
+        /// engine's consumer can emit `ShardFrameFinalized`
+        /// without re-loading and re-encoding the frame.
+        /// `None` if encoding failed.
+        canonical_header_bytes: Option<Vec<u8>>,
     },
     /// A double-propose was detected — equivocation evidence.
     DoublePropose {
@@ -74,14 +80,22 @@ pub enum AppConsensusEvent {
 /// available after the consumer has been constructed.
 pub struct AppConsumer {
     filter: Vec<u8>,
+    /// Poseidon(filter) — peers compare an inbound proposal's
+    /// FrameHeader.address against this; encoding our own proposal
+    /// with `address = filter` would have peers reject every proposal.
+    app_address: Vec<u8>,
     event_tx: mpsc::UnboundedSender<AppConsensusEvent>,
     aggregator: std::sync::OnceLock<std::sync::Arc<crate::app_vote_aggregation::AppVoteAggregation>>,
 }
 
 impl AppConsumer {
     pub fn new(filter: Vec<u8>, event_tx: mpsc::UnboundedSender<AppConsensusEvent>) -> Self {
+        let app_address = quil_crypto::poseidon::hash_bytes_to_32(&filter)
+            .map(|h| h.to_vec())
+            .unwrap_or_default();
         Self {
             filter,
+            app_address,
             event_tx,
             aggregator: std::sync::OnceLock::new(),
         }
@@ -239,12 +253,111 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
             agg.handle_proposal(proposal);
         }
 
-        // The frame data is the VDF output, published on the shard's
-        // frame bitmask. The full AppShardFrame (header + requests)
-        // is assembled and serialized by the leader provider.
-        let frame_data = proposal.proposal.state.state.output.clone();
+        // Build canonical `AppShardProposal` (0x0318) bytes so peers'
+        // `handle_app_shard_proposal` can fully reconstruct the
+        // SignedProposal + parent QC + prior TC + vote and feed it
+        // into their own event loop. Without this, the data we emit
+        // here is unparseable on the wire and peers never vote.
+        let st = &proposal.proposal.state.state;
+        let canonical_header = quil_execution::global_intrinsic::frame_header::FrameHeader {
+            // Peers compare against `app_address = Poseidon(filter)`,
+            // not the raw filter (see `handle_app_shard_proposal`).
+            address: self.app_address.clone(),
+            frame_number: st.frame_number,
+            rank: proposal.proposal.state.rank,
+            timestamp: st.timestamp,
+            difficulty: st.difficulty,
+            output: st.output.clone(),
+            parent_selector: st.parent_selector.clone(),
+            requests_root: st.requests_root.clone(),
+            state_roots: st.state_roots.clone(),
+            prover: st.prover.clone(),
+            fee_multiplier_vote: st.fee_multiplier as i64,
+            public_key_signature_bls48581: st.signature.clone(),
+        };
+        let header_bytes = match canonical_header.to_canonical_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    filter = hex::encode(&self.filter),
+                    error = %e,
+                    "could not encode FrameHeader for AppShardProposal"
+                );
+                return;
+            }
+        };
+
+        // AppShardFrame canonical bytes: [u32 0x030F][lp header_bytes]
+        const TYPE_APP_SHARD_FRAME: u32 = 0x030F;
+        const TYPE_APP_SHARD_PROPOSAL: u32 = 0x0318;
+        let mut state_bytes = Vec::with_capacity(header_bytes.len() + 8);
+        state_bytes.extend_from_slice(&TYPE_APP_SHARD_FRAME.to_be_bytes());
+        state_bytes.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+        state_bytes.extend_from_slice(&header_bytes);
+
+        // Wire-format parent QC / prior TC / leader vote.
+        let parent_qc_wire = crate::consensus_wire::QuorumCertificate::from_trait_object(
+            proposal.proposal.parent_quorum_certificate.as_ref(),
+        );
+        let parent_qc_bytes = match parent_qc_wire.to_canonical_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(filter = hex::encode(&self.filter), error = %e, "encode parent QC failed");
+                return;
+            }
+        };
+        let prior_tc_bytes: Vec<u8> = match proposal
+            .proposal
+            .previous_rank_timeout_certificate
+            .as_ref()
+        {
+            Some(tc) => {
+                let wire =
+                    crate::consensus_wire::TimeoutCertificate::from_trait_object(tc.as_ref());
+                match wire.to_canonical_bytes() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(filter = hex::encode(&self.filter), error = %e, "encode prior TC failed");
+                        return;
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+
+        let v = &proposal.vote;
+        let wire_vote = crate::consensus_wire::ProposalVote {
+            filter: self.filter.clone(),
+            rank: v.rank(),
+            frame_number: rank, // shard votes mirror Go: frame_number == rank
+            selector: v.source().clone(),
+            timestamp: v.timestamp(),
+            signature: v.signature_bytes.clone(),
+            address: v.identity().clone(),
+        };
+        let vote_bytes = match wire_vote.to_canonical_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(filter = hex::encode(&self.filter), error = %e, "encode leader vote failed");
+                return;
+            }
+        };
+
+        let mut out = Vec::with_capacity(
+            16 + state_bytes.len() + parent_qc_bytes.len() + prior_tc_bytes.len() + vote_bytes.len(),
+        );
+        out.extend_from_slice(&TYPE_APP_SHARD_PROPOSAL.to_be_bytes());
+        out.extend_from_slice(&(state_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&state_bytes);
+        out.extend_from_slice(&(parent_qc_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&parent_qc_bytes);
+        out.extend_from_slice(&(prior_tc_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&prior_tc_bytes);
+        out.extend_from_slice(&(vote_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&vote_bytes);
+
         let _ = self.event_tx.send(AppConsensusEvent::OwnProposal {
-            data: frame_data,
+            data: out,
             frame_number: frame,
             rank,
         });
@@ -272,10 +385,17 @@ impl Consumer<AppShardState, AppShardVote> for AppConsumer {
             rank = proof.state.rank,
             "shard state finalized"
         );
+        // ParticipantConsumer path — canonical bytes already emitted
+        // via `on_finalized_state`. This event is the
+        // `FinalityProof`-driven duplicate that the Forks tree fires
+        // after both 2-chain rule and full 3-chain (depending on the
+        // consensus configuration); no separate canonical encoding
+        // is plumbed through here.
         let _ = self.event_tx.send(AppConsensusEvent::Finalized {
             frame_number: proof.state.state.frame_number,
             rank: proof.state.rank,
             state_id: proof.state.identifier.clone(),
+            canonical_header_bytes: None,
         });
     }
 
@@ -416,7 +536,8 @@ impl FollowerConsumer<AppShardState> for AppFollower {
         );
     }
 
-    fn on_finalized_state(&self, state: &State<AppShardState>) {
+    fn on_finalized_state(&self, certified: &CertifiedState<AppShardState>) {
+        let state = &certified.state;
         debug!(
             filter = hex::encode(&self.filter),
             frame = state.state.frame_number,
@@ -426,8 +547,8 @@ impl FollowerConsumer<AppShardState> for AppFollower {
 
         // Build the canonical FrameHeader directly from the finalized
         // state's fields and emit `ShardFrameFinalized` to the master.
-        // Avoids hopping through the consensus event loop, which keeps
-        // coverage publication unblocked during peak load.
+        // The signature carried in the header is the proposer's BLS
+        // authorship signature stored on the state at proposal time.
         let canonical_header = quil_execution::global_intrinsic::frame_header::FrameHeader {
             address: state.state.filter.clone(),
             frame_number: state.state.frame_number,
@@ -442,26 +563,31 @@ impl FollowerConsumer<AppShardState> for AppFollower {
             fee_multiplier_vote: state.state.fee_multiplier as i64,
             public_key_signature_bls48581: state.state.signature.clone(),
         };
-        match canonical_header.to_canonical_bytes() {
+        let header_bytes: Option<Vec<u8>> = match canonical_header.to_canonical_bytes() {
             Ok(bytes) => {
                 if let Some(publisher) = self.coverage_publish.as_ref() {
-                    publisher(bytes);
+                    publisher(bytes.clone());
                 }
+                Some(bytes)
             }
-            Err(e) => warn!(
-                filter = hex::encode(&self.filter),
-                error = %e,
-                "failed to encode finalized FrameHeader for coverage publish"
-            ),
-        }
+            Err(e) => {
+                warn!(
+                    filter = hex::encode(&self.filter),
+                    error = %e,
+                    "failed to encode finalized FrameHeader for coverage publish"
+                );
+                None
+            }
+        };
 
-        // Also feed the bookkeeping event into the consensus loop —
-        // a future caller might depend on the `Finalized` arm in
-        // `handle_consensus_event` (currently a no-op for publish).
+        // Pass the canonical bytes through the bookkeeping event so
+        // `handle_consensus_event` can emit `ShardFrameFinalized`
+        // without re-loading and re-encoding the frame.
         let _ = self.consensus_event_tx.send(AppConsensusEvent::Finalized {
             frame_number: state.state.frame_number,
             rank: state.rank,
             state_id: state.identifier.clone(),
+            canonical_header_bytes: header_bytes,
         });
     }
 

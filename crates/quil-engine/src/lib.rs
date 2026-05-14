@@ -16,6 +16,7 @@ pub mod consensus_store;
 pub mod consensus_types;
 pub mod consensus_wire;
 pub mod coverage;
+pub mod current_frame;
 pub mod shard_rebalancer;
 pub mod difficulty;
 pub mod engine_state;
@@ -39,6 +40,8 @@ pub mod rewards;
 pub mod thread_worker;
 pub mod time_reel;
 pub mod timeout_aggregation;
+pub mod prover_message_transport;
+pub mod prover_pipeline;
 pub mod provers;
 pub mod shard_info;
 pub mod worker_allocator;
@@ -47,6 +50,12 @@ pub mod validator;
 pub mod vote_aggregation;
 pub mod voting_provider;
 pub mod worker;
+
+/// Test support mocks (TestProverRegistry, TestWorkerManager).
+/// Exposed for integration tests in `tests/`; hidden from public
+/// docs since these are not part of the production API.
+#[doc(hidden)]
+pub mod test_support;
 
 pub use global_engine::GlobalConsensusEngine;
 pub use app_engine::AppConsensusEngine;

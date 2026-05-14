@@ -747,10 +747,15 @@ fn canonical_request_to_proto(
         prover_ops::TYPE_PROVER_UPDATE => prover_ops::ProverUpdate::from_canonical_bytes(inner)
             .ok()
             .map(|u| Request::Update(conversions::prover_update_to_proto(&u))),
-        // The remaining 22 variants (Kick, TokenDeploy/Update, Transaction,
+        quil_execution::global_intrinsic::TYPE_FRAME_HEADER => {
+            quil_execution::global_intrinsic::FrameHeader::from_canonical_bytes(inner)
+                .ok()
+                .map(|h| Request::Shard(conversions::frame_header_to_proto(&h)))
+        }
+        // The remaining 21 variants (Kick, TokenDeploy/Update, Transaction,
         // PendingTransaction, MintTransaction, HypergraphDeploy/Update,
         // VertexAdd/Remove, HyperedgeAdd/Remove, ComputeDeploy/Update,
-        // CodeDeploy/Execute/Finalize, Shard, AltShardUpdate, SeniorityMerge,
+        // CodeDeploy/Execute/Finalize, AltShardUpdate, SeniorityMerge,
         // ShardSplit, ShardMerge) require canonical→proto converters that
         // are not yet ported. The bundle structure (count + timestamp) is
         // preserved; the inner oneof is left None until those converters
@@ -840,7 +845,10 @@ fn proto_message_request_to_canonical(
         Request::Update(p) => conversions::prover_update_from_proto(p)
             .to_canonical_bytes()
             .ok()?,
-        // Other 22 variants — Kick, TokenDeploy, Transaction, etc. — do
+        Request::Shard(p) => conversions::frame_header_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        // Other 21 variants — Kick, TokenDeploy, Transaction, etc. — do
         // not yet have proto→canonical converters. Symmetric with
         // `canonical_request_to_proto` which also doesn't handle them.
         _ => return None,

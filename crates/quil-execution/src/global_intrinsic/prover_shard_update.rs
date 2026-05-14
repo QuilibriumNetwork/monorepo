@@ -464,6 +464,34 @@ mod tests {
         }
     }
 
+    /// Seed an allocation vertex blob into state so
+    /// `update_allocation_activity` (which short-circuits on
+    /// missing blob, by design — it only updates existing
+    /// allocations) can run end-to-end. Production seeds this
+    /// blob via `materialize_prover_join` at join time.
+    fn seed_alloc_blob(state: &HypergraphState, prover: &ProverInfo, filter: &[u8]) {
+        use crate::global_intrinsic::materialize::materialize_prover_join;
+        let output = materialize_prover_join(
+            &prover.public_key,
+            &[filter.to_vec()],
+            1, // arbitrary join_frame; the test overwrites later
+            prover.seniority,
+        )
+        .unwrap();
+        let (alloc_addr, alloc_tree) = output.allocations.first().unwrap();
+        let alloc_blob = vertex_tree_to_blob(alloc_tree);
+        let va_disc = vertex_adds_discriminator().unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                alloc_addr,
+                &va_disc,
+                1,
+                alloc_blob,
+            )
+            .unwrap();
+    }
+
     fn fake_header(filter: Vec<u8>, frame_number: u64) -> FrameHeader {
         FrameHeader {
             address: filter,
@@ -621,6 +649,8 @@ mod tests {
         let state = make_state();
         let filter = vec![0xAAu8; 32];
         let p = fake_prover(1, 1, 0, &filter);
+        // update_allocation_activity only mutates an existing alloc blob.
+        seed_alloc_blob(&state, &p, &filter);
         update_allocation_activity(&state, 77, &p, &filter).unwrap();
         let alloc_addr = allocation_address(&p.public_key, &filter).unwrap();
         let va_disc = vertex_adds_discriminator().unwrap();
@@ -641,6 +671,9 @@ mod tests {
         let state = make_state();
         let filter = vec![0xAAu8; 32];
         let p = fake_prover(1, 1, 0, &filter);
+        // materialize_prover_shard_update → update_allocation_activity
+        // requires an existing alloc blob (it only mutates, doesn't create).
+        seed_alloc_blob(&state, &p, &filter);
         let header = fake_header(filter.clone(), 10);
 
         // stub deps (prover registry + frame prover are unused by
@@ -650,6 +683,9 @@ mod tests {
         // NB: prover_registry and frame_prover are passed as `Arc` but
         // ignored by materialize (it uses active_provers / bitmask
         // directly). We pass dummy impls.
+        // Minimal stub: every read returns empty/None. The trait
+        // defaults cover refresh / update_prover_activity /
+        // prune_orphan_joins / get_all_active_app_shard_provers.
         struct NoopRegistry;
         impl ProverRegistry for NoopRegistry {
             fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> { Ok(None) }
@@ -659,13 +695,7 @@ mod tests {
             fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(0) }
             fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
             fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
-            fn update_prover_activity(&self, _: &[u8], _: &[u8], _: u64) -> Result<()> { Ok(()) }
-            fn refresh(&self) -> Result<()> { Ok(()) }
-            fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> { Ok(Vec::new()) }
             fn get_prover_shard_summaries(&self, _frame_number: u64) -> Result<Vec<quil_types::consensus::ProverShardSummary>> { Ok(Vec::new()) }
-            fn prune_orphan_joins(&self, _: u64) -> Result<()> { Ok(()) }
-            fn evict_inactive_provers(&self, _: u64, _: u64, _: &std::collections::HashMap<String, u64>) -> Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
-            fn current_frame(&self) -> u64 { 0 }
         }
         let registry: Arc<dyn ProverRegistry> = Arc::new(NoopRegistry);
 

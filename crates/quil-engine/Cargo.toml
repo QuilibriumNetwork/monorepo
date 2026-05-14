@@ -40,7 +40,10 @@ metrics = "0.24"
 tonic = "0.12"
 libc = "0.2"
 http = "1"
+async-trait = "0.1"
 
 [dev-dependencies]
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 bs58 = "0.5"
+parking_lot = "0.12"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

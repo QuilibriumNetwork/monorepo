@@ -453,9 +453,17 @@ impl<S: Unique> Vertex for StateContainer<S> {
 /// Callback for emitting finalization events. Mirror of Go's
 /// `FollowerConsumer` minus the double-propose notifications (we report
 /// those via a separate callback).
+///
+/// `on_finalized_state` receives a `CertifiedState<S>` rather than
+/// bare `State<S>` so the implementor can read the certifying QC's
+/// aggregated signature directly (mirrors Go's
+/// `models.CertifiedState.CertifyingQuorumCertificate`). Use
+/// `certified.state` for the actual state; the certifying QC is on
+/// `certified.certifying_quorum_certificate` when the upstream path
+/// populates it.
 pub trait FollowerConsumer<S: Unique>: Send + Sync {
     fn on_state_incorporated(&self, state: &State<S>);
-    fn on_finalized_state(&self, state: &State<S>);
+    fn on_finalized_state(&self, certified: &CertifiedState<S>);
     fn on_double_propose_detected(&self, first: &State<S>, second: &State<S>);
 }
 
@@ -667,6 +675,12 @@ impl<S: Unique> Forks<S> {
             state: (*parent).clone(),
             certifying_qc_identity: state.parent_qc_identity.clone(),
             certifying_qc_rank: state.parent_qc_rank,
+            // The certifying QC for `parent` is THIS state's
+            // parent_quorum_certificate (which is a QC at `parent`'s
+            // rank certifying `parent`). Forwarding the trait object
+            // is what lets `on_finalized_state` consumers read the
+            // aggregate without a QC-store lookup.
+            certifying_quorum_certificate: state.parent_quorum_certificate.clone(),
         };
         self.check_for_advancing_finalization(&certified_parent)?;
         Ok(())
@@ -729,10 +743,24 @@ impl<S: Unique> Forks<S> {
         });
         self.forest.prune_up_to_level(self.finalized_rank())?;
 
-        // Emit notifications in rank-ascending order.
+        // Emit notifications in rank-ascending order. The
+        // `CertifiedState` view passed to consumers carries the
+        // state plus the rank+identity references for the certifying
+        // QC. `certifying_quorum_certificate` is left `None` here —
+        // consumers that need the aggregate signature look it up by
+        // `certifying_qc_identity` against a QC store. Mirror of Go's
+        // `OnFinalizedState(*State)`, which delegates the QC lookup
+        // to `OnQuorumCertificateTriggeredRankChange` for header
+        // mutation.
         for state in to_finalize {
+            let certified_view = CertifiedState {
+                state: (*state).clone(),
+                certifying_qc_identity: state.identifier.clone(),
+                certifying_qc_rank: state.rank,
+                certifying_quorum_certificate: None,
+            };
             self.finalization_callback.make_final(&state.identifier)?;
-            self.notifier.on_finalized_state(&state);
+            self.notifier.on_finalized_state(&certified_view);
         }
         Ok(())
     }
@@ -915,6 +943,7 @@ mod tests {
             proposer_id: "leader".into(),
             parent_qc_identity: parent_id.into(),
             parent_qc_rank: parent_rank,
+            parent_quorum_certificate: None,
             timestamp: 0,
             state: AppState {
                 id: id.into(),
@@ -928,6 +957,7 @@ mod tests {
         CertifiedState {
             certifying_qc_identity: s.identifier.clone(),
             certifying_qc_rank: s.rank,
+            certifying_quorum_certificate: None,
             state: s,
         }
     }
@@ -953,8 +983,8 @@ mod tests {
         fn on_state_incorporated(&self, state: &State<AppState>) {
             self.incorporated.lock().unwrap().push(state.identifier.clone());
         }
-        fn on_finalized_state(&self, state: &State<AppState>) {
-            self.finalized.lock().unwrap().push(state.identifier.clone());
+        fn on_finalized_state(&self, certified: &CertifiedState<AppState>) {
+            self.finalized.lock().unwrap().push(certified.state.identifier.clone());
         }
         fn on_double_propose_detected(
             &self,
