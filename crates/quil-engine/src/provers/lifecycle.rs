@@ -1045,6 +1045,20 @@ impl ProverLifecycle {
                     && !all_our_filters.contains(&s.filter)
                     && shard_sizes_snapshot.get(&s.filter).copied().unwrap_or(0) == 0)
                 .count();
+            // Registry-health signals. `summaries_count == 0` together
+            // with a non-zero `candidates` is the smoking gun for an
+            // empty/clobbered prover registry: every descriptor in
+            // that case came from `build_proposal_descriptors`'
+            // shards-store fallback (loop 2) which writes
+            // `total_active_joining: 0` — so the proposer treats every
+            // shard as halt-risk-eligible. `phantom_descriptors` is
+            // the count of descriptors carrying that
+            // shards-store-only `total_active_joining == 0` marker.
+            let summaries_count = summaries.len();
+            let phantom_descriptors = proposal_descriptors
+                .iter()
+                .filter(|d| d.total_active_joining == 0)
+                .count();
             info!(
                 frame = frame_number,
                 free_workers = free_worker_ids.len(),
@@ -1053,6 +1067,8 @@ impl ProverLifecycle {
                 halt_risk_among_candidates = proposal_halt_risk,
                 halt_risk_among_our_shards = our_halt_risk,
                 summaries_skipped_no_size = no_size_count,
+                summaries_count,
+                phantom_descriptors,
                 can_propose,
                 skip_reason,
                 strategy = ?self.strategy,

@@ -292,7 +292,20 @@ impl LazyVectorCommitmentTree {
         // commit atomically. Writes are idempotent: same vk always
         // resolves to the same RocksDB row, so re-committing a tree
         // with unchanged leaves is a no-op write of identical bytes.
+        //
+        // Skip empty-value leaves: serialize_tree drops leaf values, so
+        // a reload yields an in-memory tree whose unchanged leaves have
+        // empty `value` fields. Writing those back would clobber the
+        // per-vertex row that already holds the canonical content
+        // (written by an earlier commit or by HyperSync), erasing every
+        // prover/allocation record this code path is supposed to
+        // preserve. A genuinely empty in-memory value only occurs for
+        // the removes-tree presence sentinel, which carries no
+        // underlying content to persist either way.
         for (vk, value) in tree.leaves() {
+            if value.is_empty() {
+                continue;
+            }
             self.store.insert_node(
                 txn,
                 &self.set_type,
@@ -579,6 +592,77 @@ mod tests {
         let saved = store.roots.lock().unwrap().get(&root_key).cloned();
         assert!(saved.is_some());
         assert!(!saved.unwrap().is_empty());
+    }
+
+    #[test]
+    fn reload_then_commit_preserves_per_vertex_values() {
+        // Regression: production saw `auto-allocation candidate
+        // snapshot { halt_risk_among_candidates: 3098 }` out of 3098
+        // candidates, where reality was ~250. Root cause:
+        // `serialize_tree` drops leaf values into the tree blob, so a
+        // reload yields an in-memory tree whose unchanged leaves have
+        // empty `value` fields. The pre-fix commit iterated
+        // `tree.leaves()` unconditionally, writing those empty bytes
+        // back into the per-vertex keyspace — clobbering every
+        // prover/allocation underlying_data row. The next registry
+        // refresh decoded empty bytes, produced no summaries, and the
+        // proposer treated every shard as halt-risk-eligible.
+        let store = Arc::new(MemStore::new());
+        let prover = StubProver;
+        let shard = test_shard();
+        let hash_target = vec![0xABu8; 64];
+
+        // First lifecycle: insert and commit. Per-vertex row for
+        // `key-survivor` now holds `value-survivor`.
+        let tree1 = LazyVectorCommitmentTree::new(
+            store.clone(), "vertex", "adds", shard.clone(), vec![],
+        );
+        tree1
+            .insert(b"key-survivor", b"value-survivor", &hash_target, &BigInt::from(7))
+            .unwrap();
+        let txn = NoopTxn;
+        tree1.commit(&txn, &prover).unwrap();
+
+        // Second lifecycle: open a fresh handle so ensure_loaded
+        // re-reads the (value-stripped) tree blob. Insert an unrelated
+        // key with its own value, then commit. The bug would have
+        // walked every loaded-from-blob leaf and overwritten its
+        // per-vertex row with empty bytes.
+        let tree2 = LazyVectorCommitmentTree::new(
+            store.clone(), "vertex", "adds", shard.clone(), vec![],
+        );
+        tree2
+            .insert(b"key-new", b"value-new", &hash_target, &BigInt::from(3))
+            .unwrap();
+        let txn2 = NoopTxn;
+        tree2.commit(&txn2, &prover).unwrap();
+
+        // Verify per-vertex row for the loaded-but-unchanged leaf is
+        // still intact. Reading via the store mirror is the only way to
+        // catch the regression: `tree.get` falls back to the per-vertex
+        // store when the in-memory leaf value is empty, so it would
+        // mask a clobbered row that retained the original bytes.
+        let scope = MemStore::vertex_scope("vertex", "adds", &shard);
+        let survivor_value = store
+            .per_vertex
+            .lock()
+            .unwrap()
+            .get(&(scope.clone(), b"key-survivor".to_vec()))
+            .cloned();
+        assert_eq!(
+            survivor_value.as_deref(),
+            Some(&b"value-survivor"[..]),
+            "loaded-from-blob leaf must not overwrite per-vertex with empty bytes"
+        );
+
+        // And the freshly-inserted leaf's value lands in per-vertex.
+        let new_value = store
+            .per_vertex
+            .lock()
+            .unwrap()
+            .get(&(scope, b"key-new".to_vec()))
+            .cloned();
+        assert_eq!(new_value.as_deref(), Some(&b"value-new"[..]));
     }
 
     #[test]
