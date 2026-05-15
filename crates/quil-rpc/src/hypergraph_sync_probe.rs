@@ -946,123 +946,31 @@ fn walk_subtree(index: usize, node: &VectorCommitmentNode, depth: usize) {
     }
 }
 
-/// High-level helper: try to load a previously persisted prover tree from
-/// the local hypergraph store. If absent or its commitment no longer
-/// matches the server's claimed root, pull a fresh copy from `addr`,
-/// verify, and persist. The shard key is the global prover shard
-/// `{L1=[0;3], L2=[0xff;32]}`.
+/// High-level helper: ensure the local hypergraph store holds the
+/// server's current prover tree for `phase`. Always performs at least
+/// one server commitment comparison — a cached local blob is only
+/// trusted when its commitment matches the server's. Pulls a diff (or
+/// a full fresh copy) into the store otherwise. The shard key is the
+/// global prover shard `{L1=[0;3], L2=[0xff;32]}`.
+///
+/// Delegates to [`ensure_prover_tree_incremental`] so the startup and
+/// archive-discovery paths use the same compare-then-fetch flow as the
+/// periodic refresher. The earlier behavior — returning
+/// `commitments_match: true` purely on the existence of a deserializable
+/// cached blob — produced a bug where the genesis bootstrap path wrote
+/// 7 prover leaves into the tree blob, the next call to this function
+/// short-circuited on that blob, and the lifecycle gate flipped open
+/// against a 7-leaf view of the world. The proposer then treated every
+/// real shard as halt-risk (loop-2 phantom descriptors with
+/// `total_active_joining = 0`) and piled every worker onto whichever
+/// shard reward-greedy picked first.
 pub async fn ensure_prover_tree(
     addr: &str,
     ed448_seed: &[u8; 57],
     phase: HypergraphPhaseSet,
     hg_store: Arc<RocksHypergraphStore>,
 ) -> Result<BuildTreeStats, HyperSyncProbeError> {
-    let shard = ShardKey {
-        l1: [0u8; 3],
-        l2: [0xffu8; 32],
-    };
-    let phase_str = match phase {
-        HypergraphPhaseSet::VertexAdds => "adds",
-        HypergraphPhaseSet::VertexRemoves => "removes",
-        HypergraphPhaseSet::HyperedgeAdds => "adds",
-        HypergraphPhaseSet::HyperedgeRemoves => "removes",
-    };
-    let set_str = match phase {
-        HypergraphPhaseSet::VertexAdds | HypergraphPhaseSet::VertexRemoves => "vertex",
-        HypergraphPhaseSet::HyperedgeAdds | HypergraphPhaseSet::HyperedgeRemoves => "hyperedge",
-    };
-
-    // 1. Try the cached blob.
-    if let Ok(Some(bytes)) = hg_store.load_tree_blob(set_str, phase_str, &shard) {
-        info!(
-            cached_bytes = bytes.len(),
-            ?phase,
-            "loading prover tree from local store"
-        );
-        match deserialize_tree(&bytes) {
-            Ok(Some(_root)) => {
-                // We *could* recompute the commitment to verify integrity
-                // here, but that's the expensive step. Trust the on-disk
-                // blob; corruption will be caught when we next compare to
-                // a server.
-                let mut stats = BuildTreeStats::default();
-                stats.commitments_match = true;
-                stats.leaves_pulled = 0; // unknown without walking
-                info!(?phase, "prover tree loaded from store, skipping network sync");
-                return Ok(stats);
-            }
-            Ok(None) => {
-                // The blob exists but represents the empty tree
-                // (`TYPE_NIL`, 1 byte). That's a fully valid cached state
-                // for phases the network has no leaves in — treat it as
-                // an instant cache hit, not a fall-through.
-                let mut stats = BuildTreeStats::default();
-                stats.commitments_match = true;
-                stats.leaves_pulled = 0;
-                info!(?phase, "empty cached phase, skipping network sync");
-                return Ok(stats);
-            }
-            Err(e) => {
-                warn!(?phase, error = %e, "stored tree blob deserialize failed, falling through");
-            }
-        }
-    }
-
-    // 2. Network sync.
-    info!(?phase, "no cached tree, syncing from archive");
-    let (stats, tree, vertex_data) =
-        build_local_tree_with_handle(addr, ed448_seed, phase, 0).await?;
-
-    if !stats.commitments_match {
-        warn!(?phase, "fresh sync produced commitment that does not match server root, NOT persisting");
-        return Ok(stats);
-    }
-
-    // 3. Persist the committed tree blob.
-    let serialized = match serialize_tree(tree.root.as_ref()) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(?phase, error = %e, "serialize_tree failed");
-            return Ok(stats);
-        }
-    };
-    let blob_size = serialized.len();
-    match hg_store.save_tree_blob(set_str, phase_str, &shard, &serialized) {
-        Ok(()) => info!(?phase, blob_size, "prover tree persisted"),
-        Err(e) => warn!(?phase, error = %e, "save_tree_blob failed"),
-    }
-
-    // 4. Persist per-vertex underlying_data sub-trees. Each one is the
-    // Go wire-format `SerializeNonLazyTree` blob. A later reader can
-    // decode it via `quil_tries::deserialize_go_tree` to answer prover
-    // registry queries without re-pulling from the network.
-    let mut persisted_vertices = 0usize;
-    let mut persisted_bytes = 0u64;
-    for entry in &vertex_data {
-        match hg_store.save_vertex_underlying(
-            set_str,
-            phase_str,
-            &shard,
-            &entry.key,
-            &entry.underlying_data,
-        ) {
-            Ok(()) => {
-                persisted_vertices += 1;
-                persisted_bytes += entry.underlying_data.len() as u64;
-            }
-            Err(e) => {
-                warn!(?phase, error = %e, "save_vertex_underlying failed");
-                break;
-            }
-        }
-    }
-    info!(
-        ?phase,
-        persisted_vertices,
-        persisted_bytes,
-        "per-vertex data persisted"
-    );
-    Ok(stats)
+    ensure_prover_tree_incremental(addr, ed448_seed, phase, hg_store).await
 }
 
 /// Like [`ensure_prover_tree`] but always does a network sync, ignoring any
