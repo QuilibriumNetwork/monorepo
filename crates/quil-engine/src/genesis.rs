@@ -175,7 +175,7 @@ pub fn genesis_archive_static_multiaddrs() -> Vec<&'static str> {
     vec![
         "/ip4/192.69.222.130/udp/8336/quic-v1/p2p/QmcKQjpQmLpbDsiif2MuakhHFyxWvqYauPsJDaXnLav7PJ",
         "/ip4/191.96.166.157/udp/8336/quic-v1/p2p/QmestbFp8PddwRk6ysBRrmWZEiHun5aRidHkqFxgeFaWVK",
-        "/ip4/109.94.96.255/udp/8336/quic-v1/p2p/QmZKERVN8UkwLp9mPCZw4aaRx9N8Ewnkv7VQh1zyZwBSir",
+        "/ip4/146.0.74.72/udp/8336/quic-v1/p2p/QmZKERVN8UkwLp9mPCZw4aaRx9N8Ewnkv7VQh1zyZwBSir",
         "/ip4/147.124.199.194/udp/8336/quic-v1/p2p/QmS3xJKbAmQxDiry9HpXV6bJyRvyd47pbufpZwEmgY1cy6",
         "/ip4/192.154.103.90/udp/8336/quic-v1/p2p/QmcuXdV3mdgwmhUv9kzRnZmjJyBwE7erNWVo8Q2ikrcjzX",
     ]
