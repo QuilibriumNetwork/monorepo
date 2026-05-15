@@ -407,14 +407,21 @@ fn location_from_domain_address(domain: &[u8], address: &[u8]) -> Result<Locatio
 /// implements the `HypergraphStore` trait.
 pub struct InMemoryHypergraphStore {
     nodes: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    per_vertex: std::sync::Mutex<std::collections::HashMap<(String, Vec<u8>), Vec<u8>>>,
 }
 
 impl InMemoryHypergraphStore {
     pub fn new() -> Self {
-        Self { nodes: std::sync::Mutex::new(std::collections::HashMap::new()) }
+        Self {
+            nodes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            per_vertex: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
     fn key(s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8]) -> String {
         format!("{}/{}/{:?}/{:?}", s, p, sk.l1, k)
+    }
+    fn scope(s: &str, p: &str, sk: &quil_types::store::ShardKey) -> String {
+        format!("{}/{}/{:?}", s, p, sk.l1)
     }
 }
 
@@ -437,7 +444,11 @@ impl quil_types::store::HypergraphStore for InMemoryHypergraphStore {
     }
     fn get_node_by_path(&self, _: &str, _: &str, _: &quil_types::store::ShardKey, _: &[i32]) -> Result<Option<Vec<u8>>> { Ok(None) }
     fn insert_node(&self, _: &dyn quil_types::store::Transaction, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8], _: &[i32], d: &[u8]) -> Result<()> {
-        self.nodes.lock().unwrap().insert(Self::key(s, p, sk, k), d.to_vec()); Ok(())
+        self.nodes.lock().unwrap().insert(Self::key(s, p, sk, k), d.to_vec());
+        if k != [0xFFu8; 32] {
+            self.per_vertex.lock().unwrap().insert((Self::scope(s, p, sk), k.to_vec()), d.to_vec());
+        }
+        Ok(())
     }
     fn save_root(&self, _: &dyn quil_types::store::Transaction, _: &str, _: &str, _: &quil_types::store::ShardKey, _: &[u8]) -> Result<()> { Ok(()) }
     fn delete_node(&self, _: &dyn quil_types::store::Transaction, _: &str, _: &str, _: &quil_types::store::ShardKey, _: &[u8], _: &[i32]) -> Result<()> { Ok(()) }
@@ -447,6 +458,22 @@ impl quil_types::store::HypergraphStore for InMemoryHypergraphStore {
     fn get_root_commits(&self, _: u64) -> Result<std::collections::HashMap<quil_types::store::ShardKey, Vec<Vec<u8>>>> { Ok(std::collections::HashMap::new()) }
     fn load_vertex_underlying_raw(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.nodes.lock().unwrap().get(&Self::key(s, p, sk, k)).cloned())
+    }
+    fn save_vertex_underlying(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8], d: &[u8]) -> Result<()> {
+        self.nodes.lock().unwrap().insert(Self::key(s, p, sk, k), d.to_vec());
+        self.per_vertex.lock().unwrap().insert((Self::scope(s, p, sk), k.to_vec()), d.to_vec());
+        Ok(())
+    }
+    fn for_each_vertex_underlying(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, callback: &mut dyn FnMut(Vec<u8>, Vec<u8>)) -> Result<usize> {
+        let scope = Self::scope(s, p, sk);
+        let mut count = 0usize;
+        for ((sc, vk), v) in self.per_vertex.lock().unwrap().iter() {
+            if sc == &scope {
+                callback(vk.clone(), v.clone());
+                count += 1;
+            }
+        }
+        Ok(count)
     }
     fn apply_snapshot(&self, _: &str) -> Result<()> { Ok(()) }
     fn set_alt_shard_commit(&self, _: &dyn quil_types::store::Transaction, _: u64, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }

@@ -516,6 +516,32 @@ pub trait HypergraphStore: Send + Sync {
         vertex_key: &[u8],
     ) -> Result<Option<Vec<u8>>>;
 
+    /// Persist one vertex's underlying data blob to the per-vertex
+    /// keyspace. Mirrors Go's `SetVertexData` —
+    /// `vertex_key` is the 64-byte `domain || address` identifier and
+    /// `data` is the Go-serialized sub-tree blob. The per-vertex
+    /// keyspace is the canonical record of vertex content; the lazy
+    /// commitment tree blob is metadata-only.
+    fn save_vertex_underlying(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        data: &[u8],
+    ) -> Result<()>;
+
+    /// Iterate every `(vertex_key, data)` pair persisted for the given
+    /// `(set, phase, shard)`. The callback receives owned bytes.
+    /// Returns the count of entries visited.
+    fn for_each_vertex_underlying(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<usize>;
+
     fn apply_snapshot(&self, db_path: &str) -> Result<()>;
 
     fn set_alt_shard_commit(

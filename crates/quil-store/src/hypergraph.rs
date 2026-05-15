@@ -393,6 +393,31 @@ impl HypergraphStore for RocksHypergraphStore {
         self.load_vertex_underlying(set_type, phase_type, shard_key, vertex_key)
     }
 
+    fn save_vertex_underlying(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        data: &[u8],
+    ) -> Result<()> {
+        RocksHypergraphStore::save_vertex_underlying(
+            self, set_type, phase_type, shard_key, vertex_key, data,
+        )
+    }
+
+    fn for_each_vertex_underlying(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<usize> {
+        RocksHypergraphStore::for_each_vertex_underlying(
+            self, set_type, phase_type, shard_key, |vk, data| callback(vk, data),
+        )
+    }
+
     fn apply_snapshot(&self, _db_path: &str) -> Result<()> { Ok(()) }
 
     fn set_alt_shard_commit(

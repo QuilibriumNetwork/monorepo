@@ -959,11 +959,20 @@ mod tests {
 
     struct E2EHgStore {
         nodes: Mutex<HashMap<String, Vec<u8>>>,
+        per_vertex: Mutex<HashMap<(String, Vec<u8>), Vec<u8>>>,
     }
     impl E2EHgStore {
-        fn new() -> Self { Self { nodes: Mutex::new(HashMap::new()) } }
+        fn new() -> Self {
+            Self {
+                nodes: Mutex::new(HashMap::new()),
+                per_vertex: Mutex::new(HashMap::new()),
+            }
+        }
         fn key(set: &str, phase: &str, shard: &TypedShardKey, k: &[u8]) -> String {
             format!("{}/{}/{:?}{:?}/{:?}", set, phase, shard.l1, shard.l2, k)
+        }
+        fn scope(set: &str, phase: &str, shard: &TypedShardKey) -> String {
+            format!("{}/{}/{:?}{:?}", set, phase, shard.l1, shard.l2)
         }
     }
     struct NoopTxn;
@@ -987,6 +996,9 @@ mod tests {
         fn get_node_by_path(&self, _: &str, _: &str, _: &TypedShardKey, _: &[i32]) -> QResult<Option<Vec<u8>>> { Ok(None) }
         fn insert_node(&self, _: &dyn Transaction, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8], _: &[i32], data: &[u8]) -> QResult<()> {
             self.nodes.lock().unwrap().insert(Self::key(set, phase, shard, k), data.to_vec());
+            if k != [0xFFu8; 32] {
+                self.per_vertex.lock().unwrap().insert((Self::scope(set, phase, shard), k.to_vec()), data.to_vec());
+            }
             Ok(())
         }
         fn save_root(&self, _: &dyn Transaction, _: &str, _: &str, _: &TypedShardKey, _: &[u8]) -> QResult<()> { Ok(()) }
@@ -997,6 +1009,22 @@ mod tests {
         fn get_root_commits(&self, _: u64) -> QResult<HashMap<TypedShardKey, Vec<Vec<u8>>>> { Ok(HashMap::new()) }
         fn load_vertex_underlying_raw(&self, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8]) -> QResult<Option<Vec<u8>>> {
             Ok(self.nodes.lock().unwrap().get(&Self::key(set, phase, shard, k)).cloned())
+        }
+        fn save_vertex_underlying(&self, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8], d: &[u8]) -> QResult<()> {
+            self.nodes.lock().unwrap().insert(Self::key(set, phase, shard, k), d.to_vec());
+            self.per_vertex.lock().unwrap().insert((Self::scope(set, phase, shard), k.to_vec()), d.to_vec());
+            Ok(())
+        }
+        fn for_each_vertex_underlying(&self, set: &str, phase: &str, shard: &TypedShardKey, callback: &mut dyn FnMut(Vec<u8>, Vec<u8>)) -> QResult<usize> {
+            let scope = Self::scope(set, phase, shard);
+            let mut count = 0usize;
+            for ((s, vk), v) in self.per_vertex.lock().unwrap().iter() {
+                if s == &scope {
+                    callback(vk.clone(), v.clone());
+                    count += 1;
+                }
+            }
+            Ok(count)
         }
         fn apply_snapshot(&self, _: &str) -> QResult<()> { Ok(()) }
         fn set_alt_shard_commit(&self, _: &dyn Transaction, _: u64, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> QResult<()> { Ok(()) }

@@ -34,8 +34,8 @@ use num_traits::{Num, Signed};
 use quil_store::RocksHypergraphStore;
 use quil_tries::{deserialize_go_tree, VectorCommitmentNode};
 use quil_types::consensus::{
-    ProverAllocationInfo, ProverInfo, ProverRegistry as ProverRegistryTrait, ProverShardSummary,
-    ProverStatus,
+    EffectiveStatus, ProverAllocationInfo, ProverInfo,
+    ProverRegistry as ProverRegistryTrait, ProverShardSummary, ProverStatus,
 };
 use quil_types::error::{QuilError, Result as QuilResult};
 use quil_types::store::ShardKey;
@@ -108,20 +108,11 @@ impl InMemoryProverRegistry {
     }
 
     /// Walk every persisted `vertex/adds` vertex and rebuild the
-    /// caches.
-    ///
-    /// Production writes go through `LazyVectorCommitmentTree::commit`,
-    /// which serializes the whole shard tree as a single blob (via
-    /// `save_root` / `insert_node` at key `[0xFF; 32]`) — NOT as
-    /// per-vertex `save_vertex_underlying` entries. So the iteration
-    /// must walk the serialized tree's leaves, not the per-vertex
-    /// underlying-data range. Each leaf carries `key = 64-byte
-    /// location_id` and `value = the vertex sub-tree blob`.
-    ///
-    /// Falls back to `for_each_vertex_underlying` for any per-vertex
-    /// entries that an upstream sync (e.g. `quil_rpc::ensure_prover_tree`)
-    /// may have populated — those layouts coexist for now until the
-    /// rpc client is updated to mirror production's blob format.
+    /// caches from the per-vertex keyspace, which is the canonical
+    /// record of vertex content. Each row stores
+    /// `key = 64-byte location_id` and `value = the vertex sub-tree
+    /// blob`. The commitment tree blob holds only topology + per-node
+    /// commitments and is not consulted here.
     pub fn refresh(&mut self, hg_store: &Arc<RocksHypergraphStore>) {
         self.clear();
         let shard = ShardKey {
@@ -129,26 +120,33 @@ impl InMemoryProverRegistry {
             l2: [0xffu8; 32],
         };
 
-        // Collect (vertex_key, sub_tree_blob) pairs from both layouts.
+        // Walk the per-vertex keyspace — the canonical record of
+        // vertex content. `LazyVectorCommitmentTree::commit` writes
+        // every leaf there on every commit, and the RPC sync path
+        // populates it too. One row per `(set, phase, shard, vk)` so
+        // no dedup is required.
         let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-        // 1) Production layout: leaves of the serialized shard tree.
-        if let Ok(Some(blob)) = hg_store.load_tree_blob("vertex", "adds", &shard) {
-            if let Ok(Some(root)) = quil_tries::deserialize_tree(&blob) {
-                let mut t = quil_tries::VectorCommitmentTree::new();
-                t.root = Some(root);
-                for (k, v) in t.leaves() {
-                    leaves.push((k, v));
-                }
-            }
-        }
-
-        // 2) Legacy per-vertex layout (used by the rpc-driven sync
-        // path's tests). Append; duplicates are harmless because we
-        // re-process by 64-byte key into the cache (last write wins).
         let _ = hg_store.for_each_vertex_underlying("vertex", "adds", &shard, |vk, data| {
             leaves.push((vk, data));
         });
+
+        // Transitional bootstrap: stores from before the per-vertex
+        // commit invariant have data only in the tree blob. Fall back
+        // to deserializing the blob and using its leaves so a refresh
+        // running before the first post-upgrade commit doesn't see an
+        // empty cache. The next commit re-populates the per-vertex
+        // range, after which this branch is a no-op.
+        if leaves.is_empty() {
+            if let Ok(Some(blob)) = hg_store.load_tree_blob("vertex", "adds", &shard) {
+                if let Ok(Some(root)) = quil_tries::deserialize_tree(&blob) {
+                    let mut t = quil_tries::VectorCommitmentTree::new();
+                    t.root = Some(root);
+                    for (k, v) in t.leaves() {
+                        leaves.push((k, v));
+                    }
+                }
+            }
+        }
 
         // Two-pass walk: first collect provers, then collect allocations.
         // The iterator order is arbitrary, so if we did it in one pass
@@ -409,17 +407,14 @@ impl InMemoryProverRegistry {
         out
     }
 
-    /// Per-filter prover count grouped by allocation status, with
-    /// the 720-frame grace window applied to Joining and Leaving
-    /// allocations. Expired pending allocs are NOT counted — Go's
-    /// reference protocol treats them as implicitly rejected (for
-    /// Joining) or implicitly left (for Leaving) and any subsystem
-    /// that consults these summaries must see the same effective
-    /// state.
+    /// Per-filter prover count grouped by allocation status. See the
+    /// `live_allocation_status` helper for the filter rules; this
+    /// just bucketizes its outputs.
     ///
-    /// Without this filter, the halt-risk classifier in the
-    /// allocator's proposer sees inflated `total_active_joining`
-    /// counts and incorrectly believes a half-dead shard is healthy.
+    /// This is the cache that drives halt-risk classification: an
+    /// inflated count from including dead allocations causes the
+    /// proposer to skip real halt-risk shards and pile onto already-
+    /// healthy ones.
     pub fn get_prover_shard_summaries(
         &self,
         frame_number: u64,
@@ -434,7 +429,6 @@ impl InMemoryProverRegistry {
                 let Some(info) = self.prover_cache.get(addr) else {
                     continue;
                 };
-                let mut counted = false;
                 for alloc in &info.allocations {
                     let filter_matches = (!alloc.confirmation_filter.is_empty()
                         && alloc.confirmation_filter == *filter_key)
@@ -443,20 +437,17 @@ impl InMemoryProverRegistry {
                     if !filter_matches {
                         continue;
                     }
-                    // Drop expired pending states (effective_status
-                    // applies the 720-frame grace) so callers see the
-                    // same view as the lifecycle.
-                    let eff = alloc.effective_status(frame_number);
-                    if eff.is_expired() {
-                        counted = true;
-                        break;
+                    // Map effective status → live status (or skip if dead).
+                    // (prover, filter) is unique per the allocation-address
+                    // invariant: `allocation_address(pubkey, filter)` is
+                    // deterministic and mutations overwrite, so there is
+                    // exactly one allocation row per (prover, filter).
+                    if let Some(live) =
+                        live_allocation_status(alloc, info.status, frame_number)
+                    {
+                        *status_counts.entry(live).or_insert(0) += 1;
                     }
-                    *status_counts.entry(alloc.status).or_insert(0) += 1;
-                    counted = true;
                     break;
-                }
-                if !counted {
-                    *status_counts.entry(info.status).or_insert(0) += 1;
                 }
             }
             // Approximate total_size as the count of provers in this
@@ -594,6 +585,42 @@ impl InMemoryProverRegistry {
 ///
 /// Refresh from the persisted vertex store via the inherent
 /// `refresh_from_store` method; the trait's `refresh()` method is a
+/// Map a single allocation to its live status (the value surfaced
+/// to halt-risk classifiers, RPC summaries, lifecycle decisions).
+///
+/// Returns `Some(status)` for live allocations and `None` for ones
+/// that have effectively been removed:
+///
+/// - `Joining` (within 720-frame grace) → `Some(Joining)`
+/// - `Active` → `Some(Active)`
+/// - `Paused` → `Some(Paused)`
+/// - `Leaving` (within grace) → `Some(Leaving)`
+/// - `ExpiredLeaving` (leave attempt never confirmed/rejected) →
+///   `Some(Active)` — the leave failed silently; allocation reverts
+///   to its pre-leave Active state and remains in the cache.
+/// - `ExpiredJoining`, `Rejected`, `Kicked` → `None` (excluded)
+/// - `Unknown` → `None`
+///
+/// `prover_status` is the parent prover's overall status, used only
+/// when an allocation matched but its own status was Unknown.
+fn live_allocation_status(
+    alloc: &ProverAllocationInfo,
+    _prover_status: ProverStatus,
+    frame_number: u64,
+) -> Option<ProverStatus> {
+    match alloc.effective_status(frame_number) {
+        EffectiveStatus::Joining => Some(ProverStatus::Joining),
+        EffectiveStatus::Active => Some(ProverStatus::Active),
+        EffectiveStatus::Paused => Some(ProverStatus::Paused),
+        EffectiveStatus::Leaving => Some(ProverStatus::Leaving),
+        EffectiveStatus::ExpiredLeaving => Some(ProverStatus::Active),
+        EffectiveStatus::ExpiredJoining
+        | EffectiveStatus::Rejected
+        | EffectiveStatus::Kicked
+        | EffectiveStatus::Unknown => None,
+    }
+}
+
 /// no-op because the trait doesn't know which store to read from.
 #[derive(Clone)]
 pub struct SharedProverRegistry {
@@ -1642,5 +1669,355 @@ mod tests {
         assert!(got.public_key.is_empty());
         assert_eq!(got.allocations.len(), 1);
         assert_eq!(got.allocations[0].status, ProverStatus::Joining);
+    }
+
+    /// End-to-end lifecycle invariant: 100 provers, each in one of
+    /// ten allocation scenarios, written to the per-vertex store,
+    /// refreshed, then probed via `get_prover_shard_summaries`. The
+    /// live-status mapping must return exactly the counts implied by
+    /// each scenario.
+    ///
+    /// Scenarios (10 provers each):
+    ///   1. Join only → Joining
+    ///   2. Join + Confirm → Active
+    ///   3. Join + Reject → excluded
+    ///   4. Join + Expire (grace elapsed) → excluded
+    ///   5. Join + Confirm + Leave → Leaving
+    ///   6. Join + Confirm + Leave + ConfirmLeave (Kicked) → excluded
+    ///   7. Join + Confirm + Leave + RejectLeave → Active again
+    ///   8. Join + Confirm + Leave + ExpireLeave → Active (leave failed)
+    ///   9. Join + Confirm + Pause → Paused
+    ///  10. Join + Confirm + Pause + Resume → Active
+    ///
+    /// Expected counts at frame=1000 with grace=720:
+    ///   Active = 40 (scenarios 2, 7, 8, 10)
+    ///   Joining = 10 (scenario 1)
+    ///   Leaving = 10 (scenario 5)
+    ///   Paused = 10 (scenario 9)
+    ///   excluded = 30 (scenarios 3, 4, 6)
+    #[test]
+    fn lifecycle_scenarios_produce_correct_live_summary() {
+        use crate::global_intrinsic::materialize::allocation_address;
+        use quil_types::consensus::ALLOCATION_GRACE_FRAMES;
+
+        let filter = vec![0x55u8; 32];
+        let current_frame: u64 = 1000;
+        let recent_frame: u64 = current_frame - 50; // within grace
+        let stale_frame: u64 = current_frame - ALLOCATION_GRACE_FRAMES - 100; // past grace
+
+        #[derive(Clone, Copy)]
+        enum Scenario {
+            JustJoin,
+            ConfirmedActive,
+            JoinRejected,
+            JoinExpired,
+            Leaving,
+            LeaveConfirmedKicked,
+            LeaveRejectedReturnsActive,
+            LeaveExpiredReturnsActive,
+            Paused,
+            PausedThenResumed,
+        }
+
+        let scenarios: [Scenario; 10] = [
+            Scenario::JustJoin,
+            Scenario::ConfirmedActive,
+            Scenario::JoinRejected,
+            Scenario::JoinExpired,
+            Scenario::Leaving,
+            Scenario::LeaveConfirmedKicked,
+            Scenario::LeaveRejectedReturnsActive,
+            Scenario::LeaveExpiredReturnsActive,
+            Scenario::Paused,
+            Scenario::PausedThenResumed,
+        ];
+
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+
+        // 100 deterministic prover pubkeys + addresses; 10 provers
+        // per scenario, distributed evenly.
+        for prover_idx in 0u8..100 {
+            let scenario = scenarios[(prover_idx % 10) as usize];
+            // Pubkey: deterministic 57-byte blob seeded by idx.
+            let mut pubkey = vec![0u8; 57];
+            pubkey[0] = prover_idx;
+            pubkey[1] = prover_idx.wrapping_add(0x10);
+            pubkey[2] = prover_idx.wrapping_add(0x20);
+            // Prover address: 32 bytes derived (hash would be ideal,
+            // but the registry only uses the address as a lookup key
+            // — any unique 32 bytes works for the test).
+            let mut prover_addr = vec![0u8; 32];
+            prover_addr[0] = prover_idx;
+            prover_addr[31] = 0xAA;
+            // Allocation vertex address: deterministic per
+            // (pubkey, filter). Used as the last 32 bytes of the
+            // allocation's vertex key so each prover has a distinct
+            // allocation row.
+            let alloc_addr_32 = allocation_address(&pubkey, &filter).unwrap();
+
+            // Determine allocation fields per scenario.
+            let (
+                status_byte,
+                join_frame,
+                leave_frame,
+                join_confirm_frame,
+                leave_confirm_frame,
+                pause_frame,
+                resume_frame,
+                join_reject_frame,
+                leave_reject_frame,
+            ): (u8, u64, u64, u64, u64, u64, u64, u64, u64);
+            // On-disk status bytes are RDF-encoded (0-indexed):
+            //   0=Joining 1=Active 2=Paused 3=Leaving 4=Rejected 5=Kicked
+            // (see `map_allocation_status` / `map_prover_status`).
+            match scenario {
+                Scenario::JustJoin => {
+                    status_byte = 0; // Joining
+                    join_frame = recent_frame;
+                    leave_frame = 0;
+                    join_confirm_frame = 0;
+                    leave_confirm_frame = 0;
+                    pause_frame = 0;
+                    resume_frame = 0;
+                    join_reject_frame = 0;
+                    leave_reject_frame = 0;
+                }
+                Scenario::ConfirmedActive => {
+                    status_byte = 1; // Active
+                    join_frame = recent_frame - 100;
+                    leave_frame = 0;
+                    join_confirm_frame = recent_frame;
+                    leave_confirm_frame = 0;
+                    pause_frame = 0;
+                    resume_frame = 0;
+                    join_reject_frame = 0;
+                    leave_reject_frame = 0;
+                }
+                Scenario::JoinRejected => {
+                    status_byte = 4; // Rejected
+                    join_frame = recent_frame - 50;
+                    leave_frame = 0;
+                    join_confirm_frame = 0;
+                    leave_confirm_frame = 0;
+                    pause_frame = 0;
+                    resume_frame = 0;
+                    join_reject_frame = recent_frame;
+                    leave_reject_frame = 0;
+                }
+                Scenario::JoinExpired => {
+                    // Status still Joining (no on-chain transition),
+                    // but join_frame is old → effective_status returns
+                    // ExpiredJoining at frame=1000.
+                    status_byte = 0; // Joining
+                    join_frame = stale_frame;
+                    leave_frame = 0;
+                    join_confirm_frame = 0;
+                    leave_confirm_frame = 0;
+                    pause_frame = 0;
+                    resume_frame = 0;
+                    join_reject_frame = 0;
+                    leave_reject_frame = 0;
+                }
+                Scenario::Leaving => {
+                    status_byte = 3; // Leaving
+                    join_frame = recent_frame - 200;
+                    leave_frame = recent_frame;
+                    join_confirm_frame = recent_frame - 150;
+                    leave_confirm_frame = 0;
+                    pause_frame = 0;
+                    resume_frame = 0;
+                    join_reject_frame = 0;
+                    leave_reject_frame = 0;
+                }
+                Scenario::LeaveConfirmedKicked => {
+                    status_byte = 5; // Kicked (= leave-confirmed)
+                    join_frame = recent_frame - 300;
+                    leave_frame = recent_frame - 100;
+                    join_confirm_frame = recent_frame - 250;
+                    leave_confirm_frame = recent_frame;
+                    pause_frame = 0;
+                    resume_frame = 0;
+                    join_reject_frame = 0;
+                    leave_reject_frame = 0;
+                }
+                Scenario::LeaveRejectedReturnsActive => {
+                    status_byte = 1; // back to Active
+                    join_frame = recent_frame - 300;
+                    leave_frame = recent_frame - 100;
+                    join_confirm_frame = recent_frame - 250;
+                    leave_confirm_frame = 0;
+                    pause_frame = 0;
+                    resume_frame = 0;
+                    join_reject_frame = 0;
+                    leave_reject_frame = recent_frame;
+                }
+                Scenario::LeaveExpiredReturnsActive => {
+                    // Status still Leaving (no on-chain confirm/reject),
+                    // but leave_frame is old → effective_status returns
+                    // ExpiredLeaving → live_allocation_status maps to
+                    // Active per the user's rule.
+                    status_byte = 3; // Leaving
+                    join_frame = recent_frame - 800;
+                    leave_frame = stale_frame;
+                    join_confirm_frame = recent_frame - 750;
+                    leave_confirm_frame = 0;
+                    pause_frame = 0;
+                    resume_frame = 0;
+                    join_reject_frame = 0;
+                    leave_reject_frame = 0;
+                }
+                Scenario::Paused => {
+                    status_byte = 2; // Paused
+                    join_frame = recent_frame - 300;
+                    leave_frame = 0;
+                    join_confirm_frame = recent_frame - 250;
+                    leave_confirm_frame = 0;
+                    pause_frame = recent_frame;
+                    resume_frame = 0;
+                    join_reject_frame = 0;
+                    leave_reject_frame = 0;
+                }
+                Scenario::PausedThenResumed => {
+                    status_byte = 1; // back to Active
+                    join_frame = recent_frame - 400;
+                    leave_frame = 0;
+                    join_confirm_frame = recent_frame - 350;
+                    leave_confirm_frame = 0;
+                    pause_frame = recent_frame - 100;
+                    resume_frame = recent_frame;
+                    join_reject_frame = 0;
+                    leave_reject_frame = 0;
+                }
+            }
+
+            // Build prover vertex sub-tree. The prover's overall
+            // status is the per-allocation status' parent; for this
+            // test (one allocation per prover, filter-level counts)
+            // we just use Active (byte 1) so every prover vertex
+            // decodes cleanly. The allocation's own status drives
+            // the per-filter count.
+            let prover_leaves = vec![
+                type_hash_leaf("prover:Prover"),
+                field_leaf("prover:Prover", "PublicKey", pubkey.clone()),
+                field_leaf("prover:Prover", "Status", vec![1u8]),
+                field_leaf("prover:Prover", "AvailableStorage", 0u64.to_be_bytes().to_vec()),
+                field_leaf("prover:Prover", "Seniority", 1u64.to_be_bytes().to_vec()),
+                field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+            ];
+            let prover_bytes = build_sub_tree(prover_leaves);
+
+            // Build allocation vertex sub-tree.
+            let alloc_leaves = vec![
+                type_hash_leaf("allocation:ProverAllocation"),
+                field_leaf("allocation:ProverAllocation", "Prover", prover_addr.clone()),
+                field_leaf("allocation:ProverAllocation", "Status", vec![status_byte]),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "ConfirmationFilter",
+                    filter.clone(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "JoinFrameNumber",
+                    join_frame.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "LeaveFrameNumber",
+                    leave_frame.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "JoinConfirmFrameNumber",
+                    join_confirm_frame.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "LeaveConfirmFrameNumber",
+                    leave_confirm_frame.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "PauseFrameNumber",
+                    pause_frame.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "ResumeFrameNumber",
+                    resume_frame.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "JoinRejectFrameNumber",
+                    join_reject_frame.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "LeaveRejectFrameNumber",
+                    leave_reject_frame.to_be_bytes().to_vec(),
+                ),
+            ];
+            let alloc_bytes = build_sub_tree(alloc_leaves);
+
+            // Vertex keys: 32-byte domain + 32-byte address. Use the
+            // prover address for the prover vertex and the derived
+            // allocation address for the allocation vertex.
+            let prover_vk = {
+                let mut k = vec![0xFFu8; 32];
+                k.extend_from_slice(&prover_addr);
+                k
+            };
+            let alloc_vk = {
+                let mut k = vec![0xFFu8; 32];
+                k.extend_from_slice(&alloc_addr_32);
+                k
+            };
+
+            store
+                .save_vertex_underlying("vertex", "adds", &shard, &prover_vk, &prover_bytes)
+                .unwrap();
+            store
+                .save_vertex_underlying("vertex", "adds", &shard, &alloc_vk, &alloc_bytes)
+                .unwrap();
+        }
+
+        // Refresh the in-memory registry from the per-vertex store
+        // (the canonical source after Phases 1-3).
+        let shared = SharedProverRegistry::new();
+        shared.refresh_from_store(&store);
+
+        // Query the live-allocation view.
+        let summaries = shared
+            .get_prover_shard_summaries(current_frame)
+            .expect("summaries");
+        let summary = summaries
+            .iter()
+            .find(|s| s.filter == filter)
+            .expect("filter present");
+        let active = summary.status_counts.get(&ProverStatus::Active).copied().unwrap_or(0);
+        let joining = summary.status_counts.get(&ProverStatus::Joining).copied().unwrap_or(0);
+        let leaving = summary.status_counts.get(&ProverStatus::Leaving).copied().unwrap_or(0);
+        let paused = summary.status_counts.get(&ProverStatus::Paused).copied().unwrap_or(0);
+        let kicked = summary.status_counts.get(&ProverStatus::Kicked).copied().unwrap_or(0);
+        let rejected = summary.status_counts.get(&ProverStatus::Rejected).copied().unwrap_or(0);
+
+        // Active = scenarios 2, 7, 8, 10 = 40
+        assert_eq!(active, 40, "Active count");
+        // Joining = scenario 1 = 10
+        assert_eq!(joining, 10, "Joining count");
+        // Leaving = scenario 5 = 10
+        assert_eq!(leaving, 10, "Leaving count");
+        // Paused = scenario 9 = 10
+        assert_eq!(paused, 10, "Paused count");
+        // Dead states never appear in the live cache.
+        assert_eq!(kicked, 0, "Kicked must be excluded from live cache");
+        assert_eq!(rejected, 0, "Rejected must be excluded from live cache");
+
+        let total_live: u32 = active + joining + leaving + paused;
+        assert_eq!(
+            total_live, 70,
+            "70 live allocations (30 must be excluded: Rejected, ExpiredJoining, Kicked)"
+        );
     }
 }

@@ -31,7 +31,13 @@ fn serialize_node(w: &mut Vec<u8>, node: Option<&VectorCommitmentNode>) -> Resul
         Some(VectorCommitmentNode::Leaf(leaf)) => {
             w.push(TYPE_LEAF);
             write_length_prefixed(w, &leaf.key)?;
-            write_length_prefixed(w, &leaf.value)?;
+            // Vertex content lives in the per-vertex keyspace; the
+            // commitment tree blob carries only topology + per-node
+            // commitments + leaf metadata. Emit a zero-length value
+            // so the on-disk shape stays stable and deserialize sees
+            // an empty value (callers needing the data look it up
+            // via `load_vertex_underlying_raw`).
+            write_length_prefixed(w, &[])?;
             write_length_prefixed(w, &leaf.hash_target)?;
             write_length_prefixed(w, &leaf.commitment)?;
             let size_bytes = leaf.size.to_signed_bytes_be();
@@ -203,7 +209,12 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_leaf() {
+    fn test_roundtrip_leaf_metadata_only() {
+        // Leaf serialization deliberately drops `value` — vertex
+        // content lives in the per-vertex keyspace. The tree blob
+        // round-trips key, hash_target, commitment, and size; on
+        // deserialize, value is empty and callers fetch from the
+        // per-vertex store.
         let mut leaf = LeafNode {
             key: vec![1, 2, 3],
             value: vec![4, 5, 6],
@@ -212,6 +223,7 @@ mod tests {
             size: BigInt::from(100),
         };
         leaf.compute_commitment();
+        let original_commitment = leaf.commitment.clone();
 
         let node = VectorCommitmentNode::Leaf(leaf);
         let data = serialize_tree(Some(&node)).unwrap();
@@ -220,7 +232,8 @@ mod tests {
         match result {
             VectorCommitmentNode::Leaf(l) => {
                 assert_eq!(l.key, vec![1, 2, 3]);
-                assert_eq!(l.value, vec![4, 5, 6]);
+                assert!(l.value.is_empty(), "leaf value must be stripped on disk");
+                assert_eq!(l.commitment, original_commitment);
                 assert_eq!(l.size, BigInt::from(100));
             }
             _ => panic!("expected leaf"),
@@ -268,10 +281,15 @@ mod tests {
             ) -> bool { true }
         }
 
+        // Outer-tree leaves carry a non-empty `hash_target` so the
+        // commitment depends on hash_target rather than `value` — the
+        // production invariant that lets us strip values from the
+        // serialized blob without disturbing root commitments.
         let mut tree = VectorCommitmentTree::new();
         for i in 0u8..16 {
             let key = vec![i, i.wrapping_add(1), i.wrapping_add(2), 0xAB];
-            tree.insert(&key, &[i, i, i], &[], &BigInt::from(i as i64 + 1)).unwrap();
+            let hash_target = vec![i; 64];
+            tree.insert(&key, &[i, i, i], &hash_target, &BigInt::from(i as i64 + 1)).unwrap();
         }
         let prover = StubProver;
         let original_root = tree.commit(&prover);

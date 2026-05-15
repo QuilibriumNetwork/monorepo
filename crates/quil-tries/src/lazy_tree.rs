@@ -207,18 +207,52 @@ impl LazyVectorCommitmentTree {
     }
 
     /// Get a value by key. Loads from store if not already loaded.
+    ///
+    /// The commitment tree blob carries only metadata, not vertex
+    /// content. If the in-memory leaf has an empty `value` (typical
+    /// post-reload state because serialize drops values), this
+    /// queries the per-vertex keyspace. The empty-marker case (a
+    /// fresh in-memory insert of an intentionally empty value, e.g.
+    /// the removes-tree presence sentinel) is preserved: only return
+    /// the per-vertex content when it actually exists, otherwise
+    /// surface the original in-tree value (empty bytes).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.ensure_loaded()?;
         let inner = self.inner.read().unwrap();
         let tree = inner.as_ref().ok_or_else(|| {
             QuilError::Internal("lazy tree: inner tree missing after load".into())
         })?;
-        Ok(tree.get(key).map(|v| v.to_vec()))
+        match tree.get(key) {
+            Some(v) if !v.is_empty() => Ok(Some(v.to_vec())),
+            Some(v) => {
+                let original = v.to_vec();
+                drop(inner);
+                match self.store.load_vertex_underlying_raw(
+                    &self.set_type,
+                    &self.phase_type,
+                    &self.shard_key,
+                    key,
+                )? {
+                    Some(stored) => Ok(Some(stored)),
+                    None => Ok(Some(original)),
+                }
+            }
+            None => Ok(None),
+        }
     }
 
-    /// Commit the tree: compute all KZG commitments and write the
-    /// serialized root back to the store via the provided transaction.
-    /// Returns the root commitment bytes (64 bytes).
+    /// Commit the tree: compute all KZG commitments and persist both
+    /// the (metadata-only) tree blob and each leaf's vertex data to
+    /// the store via the provided transaction. Returns the root
+    /// commitment bytes (64 bytes).
+    ///
+    /// Layout mirror of Go's separation: the tree blob stores topology
+    /// + per-node commitments only; vertex content lives in the
+    /// per-vertex keyspace (`hypergraph_vertex_data_key`). Every leaf
+    /// is written to that keyspace on every commit so consumers
+    /// rebuilding state (e.g. `SharedProverRegistry::refresh`) have a
+    /// single canonical source for vertex data and never need to
+    /// reconcile the tree blob against a separate per-vertex range.
     pub fn commit(
         &self,
         txn: &dyn Transaction,
@@ -233,7 +267,7 @@ impl LazyVectorCommitmentTree {
         // Compute commitments
         let root_commitment = tree.commit(prover);
 
-        // Serialize the tree and save root to store
+        // Serialize the tree (metadata + leaf keys) and save the root.
         let serialized = serialize_tree(tree.root.as_ref())?;
         let root_key = [0xFFu8; 32];
         self.store.save_root(
@@ -243,8 +277,6 @@ impl LazyVectorCommitmentTree {
             &self.shard_key,
             &serialized,
         )?;
-
-        // Also store the node data for lookup
         self.store.insert_node(
             txn,
             &self.set_type,
@@ -254,6 +286,23 @@ impl LazyVectorCommitmentTree {
             &[],
             &serialized,
         )?;
+
+        // Persist every leaf's vertex data into the per-vertex
+        // keyspace. Same txn so the tree blob and the per-vertex rows
+        // commit atomically. Writes are idempotent: same vk always
+        // resolves to the same RocksDB row, so re-committing a tree
+        // with unchanged leaves is a no-op write of identical bytes.
+        for (vk, value) in tree.leaves() {
+            self.store.insert_node(
+                txn,
+                &self.set_type,
+                &self.phase_type,
+                &self.shard_key,
+                &vk,
+                &[],
+                &value,
+            )?;
+        }
 
         *self.dirty.write().unwrap() = false;
 
@@ -332,6 +381,7 @@ mod tests {
     struct MemStore {
         nodes: Mutex<HashMap<String, Vec<u8>>>,
         roots: Mutex<HashMap<String, Vec<u8>>>,
+        per_vertex: Mutex<HashMap<(String, Vec<u8>), Vec<u8>>>,
     }
 
     impl MemStore {
@@ -339,6 +389,7 @@ mod tests {
             Self {
                 nodes: Mutex::new(HashMap::new()),
                 roots: Mutex::new(HashMap::new()),
+                per_vertex: Mutex::new(HashMap::new()),
             }
         }
 
@@ -347,6 +398,9 @@ mod tests {
         }
         fn root_key(set: &str, phase: &str, shard: &ShardKey) -> String {
             format!("root/{}/{}/{:?}", set, phase, shard.l1)
+        }
+        fn vertex_scope(set: &str, phase: &str, shard: &ShardKey) -> String {
+            format!("{}/{}/{:?}", set, phase, shard.l1)
         }
     }
 
@@ -376,6 +430,10 @@ mod tests {
         fn insert_node(&self, _: &dyn Transaction, set: &str, phase: &str, shard: &ShardKey, key: &[u8], _: &[i32], data: &[u8]) -> Result<()> {
             let k = Self::node_key(set, phase, shard, key);
             self.nodes.lock().unwrap().insert(k, data.to_vec());
+            if key != [0xFFu8; 32] {
+                let scope = Self::vertex_scope(set, phase, shard);
+                self.per_vertex.lock().unwrap().insert((scope, key.to_vec()), data.to_vec());
+            }
             Ok(())
         }
         fn save_root(&self, _: &dyn Transaction, set: &str, phase: &str, shard: &ShardKey, data: &[u8]) -> Result<()> {
@@ -391,6 +449,24 @@ mod tests {
         fn load_vertex_underlying_raw(&self, set: &str, phase: &str, shard: &ShardKey, key: &[u8]) -> Result<Option<Vec<u8>>> {
             let k = Self::node_key(set, phase, shard, key);
             Ok(self.nodes.lock().unwrap().get(&k).cloned())
+        }
+        fn save_vertex_underlying(&self, set: &str, phase: &str, shard: &ShardKey, key: &[u8], data: &[u8]) -> Result<()> {
+            let k = Self::node_key(set, phase, shard, key);
+            self.nodes.lock().unwrap().insert(k, data.to_vec());
+            let scope = Self::vertex_scope(set, phase, shard);
+            self.per_vertex.lock().unwrap().insert((scope, key.to_vec()), data.to_vec());
+            Ok(())
+        }
+        fn for_each_vertex_underlying(&self, set: &str, phase: &str, shard: &ShardKey, callback: &mut dyn FnMut(Vec<u8>, Vec<u8>)) -> Result<usize> {
+            let scope = Self::vertex_scope(set, phase, shard);
+            let mut count = 0usize;
+            for ((s, vk), v) in self.per_vertex.lock().unwrap().iter() {
+                if s == &scope {
+                    callback(vk.clone(), v.clone());
+                    count += 1;
+                }
+            }
+            Ok(count)
         }
         fn apply_snapshot(&self, _: &str) -> Result<()> { Ok(()) }
         fn set_alt_shard_commit(&self, _: &dyn Transaction, _: u64, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
@@ -511,11 +587,19 @@ mod tests {
         let prover = StubProver;
         let shard = test_shard();
 
+        // Production outer-tree leaves carry a non-empty `hash_target`
+        // (the sub-tree commitment); the leaf commitment is then
+        // `SHA-512(0x00 || key || hash_target)` and independent of
+        // `value`. This test mirrors that invariant — `value` is only
+        // the sub-tree blob, looked up through the per-vertex store
+        // after reload.
+        let hash_target = vec![0xABu8; 64];
+
         // First tree: insert and commit
         let tree1 = LazyVectorCommitmentTree::new(
             store.clone(), "vertex", "adds", shard.clone(), vec![],
         );
-        tree1.insert(b"key-1", b"value-1", &[], &BigInt::from(7)).unwrap();
+        tree1.insert(b"key-1", b"value-1", &hash_target, &BigInt::from(7)).unwrap();
         let txn = NoopTxn;
         let root1 = tree1.commit(&txn, &prover).unwrap();
 
