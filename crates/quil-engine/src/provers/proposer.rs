@@ -750,6 +750,106 @@ mod tests {
         assert_eq!(scores[1].score, BigInt::from(200));
     }
 
+    /// Data-greedy and reward-greedy must produce DIFFERENT picking
+    /// orders on inputs where the two metrics diverge. Reward-greedy
+    /// divides by `2^(ring+1)`, so a big shard at a high enough ring
+    /// loses to a smaller low-ring shard. Data-greedy ignores ring
+    /// and picks the biggest. This pins the behavioral split that
+    /// the `Strategy` flag exists to express — regressing it would
+    /// silently make both strategies behave the same and the
+    /// operator's choice would stop mattering.
+    #[test]
+    fn strategies_diverge_when_ring_and_size_disagree() {
+        // Size ratio 100×; ring penalty ratio 2^9 / 2 = 256×.
+        // Reward-greedy: big = 1_000_000 / 512 ≈ 1953;
+        //                small = 10_000 / 2 = 5000 → small wins.
+        // Data-greedy: 1_000_000 > 10_000 → big wins.
+        let big_high_ring = ShardDescriptor {
+            filter: vec![0xAA],
+            size: 1_000_000,
+            ring: 8,             // divisor = 2^9 = 512
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+        };
+        let small_low_ring = ShardDescriptor {
+            filter: vec![0xBB],
+            size: 10_000,
+            ring: 0,             // divisor = 2
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+        };
+        let shards = vec![big_high_ring, small_low_ring];
+        let basis = BigInt::from(1u64) << 50;
+        let world_bytes = BigInt::from(1u64) << 30;
+
+        // Data-greedy: score = size, so the big shard wins.
+        let data_scored = score_shards(&shards, &basis, &world_bytes, Strategy::DataGreedy);
+        assert_eq!(data_scored[0].score, BigInt::from(1_000_000u64));
+        assert_eq!(data_scored[1].score, BigInt::from(10_000u64));
+        let data_winner = data_scored
+            .iter()
+            .max_by(|a, b| a.score.cmp(&b.score))
+            .unwrap()
+            .idx;
+        assert_eq!(data_winner, 0, "data-greedy picks the big shard");
+
+        // Reward-greedy: the ring penalty beats the size advantage.
+        let reward_scored = score_shards(&shards, &basis, &world_bytes, Strategy::RewardGreedy);
+        let reward_winner = reward_scored
+            .iter()
+            .max_by(|a, b| a.score.cmp(&b.score))
+            .unwrap()
+            .idx;
+        assert_eq!(reward_winner, 1, "reward-greedy picks the small low-ring shard");
+
+        // The winners are DIFFERENT — the strategy flag matters.
+        assert_ne!(data_winner, reward_winner);
+    }
+
+    /// Inputs where size and ring agree on the same winner: both
+    /// strategies converge. Pins the no-divergence regime so a
+    /// future scoring tweak that *adds* divergence here would also
+    /// be caught.
+    #[test]
+    fn strategies_agree_when_ring_and_size_align() {
+        // Both shards at ring=0; size differs. Reward-greedy and
+        // data-greedy should agree on which is better.
+        let big = ShardDescriptor {
+            filter: vec![0xAA],
+            size: 1_000_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+        };
+        let small = ShardDescriptor {
+            filter: vec![0xBB],
+            size: 10_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+        };
+        let shards = vec![big, small];
+        let basis = BigInt::from(1u64) << 50;
+        let world_bytes = BigInt::from(1u64) << 30;
+
+        for strategy in [Strategy::DataGreedy, Strategy::RewardGreedy] {
+            let scored = score_shards(&shards, &basis, &world_bytes, strategy);
+            let winner = scored
+                .iter()
+                .max_by(|a, b| a.score.cmp(&b.score))
+                .unwrap()
+                .idx;
+            assert_eq!(
+                winner, 0,
+                "{strategy:?} should pick the big shard when ring matches"
+            );
+        }
+    }
+
     #[test]
     fn decide_joins_all_reject_when_no_valid_scores() {
         let pending = vec![vec![1, 2, 3]];

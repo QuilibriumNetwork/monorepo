@@ -2762,3 +2762,186 @@ mod proposal_loop_tests {
         assert_eq!(rejects[0], f3, "expected lexicographically-last filter rejected");
     }
 }
+
+/// End-to-end halt-risk descriptor build path: synthesize
+/// `ProverShardSummary` inputs that model the registry's live view
+/// after Phase 4 filtering, then run them through
+/// `build_proposal_descriptors` and the proposer's halt-risk bucket.
+///
+/// Pins the upstream link in the user-reported bug: a shard with N
+/// real provers but stale/expired allocations must NOT have those
+/// dead allocations inflate `total_active_joining` past the halt-risk
+/// threshold — that was the failure mode causing the proposer to
+/// skip real halt-risk shards and pile onto healthy ones. With
+/// `get_prover_shard_summaries` now applying the live-status filter,
+/// the summaries reaching `build_proposal_descriptors` carry only
+/// live counts, and the halt-risk bucket sees the right set.
+#[cfg(test)]
+mod halt_risk_descriptor_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use num_bigint::BigInt;
+    use quil_types::consensus::{ProverShardSummary, ProverStatus};
+    use crate::provers::proposer::{plan_and_allocate, Strategy, HALT_RISK_PROVER_COUNT};
+
+    fn summary(filter: &[u8], counts: &[(ProverStatus, u32)]) -> ProverShardSummary {
+        let mut status_counts = HashMap::new();
+        for (status, n) in counts {
+            status_counts.insert(*status, *n);
+        }
+        let total_size: u64 = status_counts.values().map(|&c| c as u64).sum();
+        ProverShardSummary {
+            filter: filter.to_vec(),
+            status_counts,
+            total_size,
+        }
+    }
+
+    fn sizes(entries: &[(&[u8], u64)]) -> HashMap<Vec<u8>, u64> {
+        entries.iter().map(|(f, s)| (f.to_vec(), *s)).collect()
+    }
+
+    /// A shard whose registry view shows 3 Active provers should
+    /// arrive at `plan_and_allocate` with `total_active_joining = 3`
+    /// — at-or-below the halt-risk threshold — and get picked ahead
+    /// of a healthy 8-Active shard that has higher reward score.
+    #[test]
+    fn build_descriptors_surfaces_halt_risk_at_three_active() {
+        let halt_filter: &[u8] = b"halt-shard\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let healthy_filter: &[u8] = b"healthy-shard\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let summaries = vec![
+            summary(halt_filter, &[(ProverStatus::Active, 3)]),
+            summary(healthy_filter, &[(ProverStatus::Active, 8)]),
+        ];
+        let shard_sizes = sizes(&[
+            (halt_filter, 500_000),
+            (healthy_filter, 10_000_000),
+        ]);
+        let our_filters: Vec<Vec<u8>> = Vec::new();
+        let shards_store_filters: Vec<Vec<u8>> = Vec::new();
+
+        let descriptors = super::build_proposal_descriptors(
+            &summaries,
+            &our_filters,
+            &shard_sizes,
+            &shards_store_filters,
+        );
+        assert_eq!(descriptors.len(), 2);
+
+        let halt = descriptors.iter().find(|d| d.filter == halt_filter).unwrap();
+        let healthy = descriptors.iter().find(|d| d.filter == healthy_filter).unwrap();
+        assert_eq!(halt.total_active_joining, 3, "halt-risk shard prover count");
+        assert_eq!(healthy.total_active_joining, 8, "healthy shard prover count");
+        assert!(halt.total_active_joining <= HALT_RISK_PROVER_COUNT);
+        assert!(healthy.total_active_joining > HALT_RISK_PROVER_COUNT);
+
+        let proposals = plan_and_allocate(
+            &descriptors,
+            50_000,
+            &BigInt::from(20_000_000u64),
+            1_000_000,
+            &[0],
+            1,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].filter, halt_filter,
+            "halt-risk shard must be picked before the healthier reward shard"
+        );
+    }
+
+    /// `total_active_joining` is the sum of Active + Joining only —
+    /// Leaving and Paused do not delay halt-risk classification.
+    /// Verifies the descriptor build path applies that arithmetic
+    /// (since Leaving/Paused provers aren't producing or imminently
+    /// going to produce, counting them would mask a real halt-risk).
+    #[test]
+    fn build_descriptors_excludes_leaving_and_paused_from_halt_count() {
+        let filter: &[u8] = b"mixed-shard\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        // 3 Active + 5 Leaving + 5 Paused. Total live = 13, but
+        // Active+Joining = 3 → still halt-risk.
+        let summaries = vec![summary(
+            filter,
+            &[
+                (ProverStatus::Active, 3),
+                (ProverStatus::Leaving, 5),
+                (ProverStatus::Paused, 5),
+            ],
+        )];
+        let shard_sizes = sizes(&[(filter, 500_000)]);
+        let our_filters: Vec<Vec<u8>> = Vec::new();
+        let shards_store_filters: Vec<Vec<u8>> = Vec::new();
+
+        let descriptors = super::build_proposal_descriptors(
+            &summaries,
+            &our_filters,
+            &shard_sizes,
+            &shards_store_filters,
+        );
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(
+            descriptors[0].total_active_joining, 3,
+            "Leaving and Paused must not inflate the halt-risk count"
+        );
+        assert!(descriptors[0].total_active_joining <= HALT_RISK_PROVER_COUNT);
+    }
+
+    /// Joining counts toward the halt-risk denominator — pending
+    /// joiners are imminent producers. 1 Active + 3 Joining = 4 is
+    /// just past the threshold; the shard should NOT be classified
+    /// as halt-risk.
+    #[test]
+    fn build_descriptors_joining_counts_toward_threshold() {
+        let filter: &[u8] = b"joining-shard\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let summaries = vec![summary(
+            filter,
+            &[
+                (ProverStatus::Active, 1),
+                (ProverStatus::Joining, 3),
+            ],
+        )];
+        let shard_sizes = sizes(&[(filter, 500_000)]);
+        let our_filters: Vec<Vec<u8>> = Vec::new();
+        let shards_store_filters: Vec<Vec<u8>> = Vec::new();
+
+        let descriptors = super::build_proposal_descriptors(
+            &summaries,
+            &our_filters,
+            &shard_sizes,
+            &shards_store_filters,
+        );
+        assert_eq!(descriptors[0].total_active_joining, 4);
+        assert!(
+            descriptors[0].total_active_joining > HALT_RISK_PROVER_COUNT,
+            "1 Active + 3 Joining = 4 is past the halt-risk threshold of {}",
+            HALT_RISK_PROVER_COUNT
+        );
+    }
+
+    /// Shards with no real byte-size data are dropped at descriptor
+    /// build time even when the summary shows live provers. Without
+    /// this, the proposer would chase shards whose archive doesn't
+    /// yet have size info reported — wasted joins.
+    #[test]
+    fn build_descriptors_drops_zero_size_halt_risk_shards() {
+        let filter_no_size: &[u8] = b"no-size-shard\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let filter_real: &[u8] = b"real-shard\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let summaries = vec![
+            summary(filter_no_size, &[(ProverStatus::Active, 2)]),
+            summary(filter_real, &[(ProverStatus::Active, 2)]),
+        ];
+        let shard_sizes = sizes(&[(filter_real, 500_000)]); // no entry for filter_no_size
+        let our_filters: Vec<Vec<u8>> = Vec::new();
+        let shards_store_filters: Vec<Vec<u8>> = Vec::new();
+
+        let descriptors = super::build_proposal_descriptors(
+            &summaries,
+            &our_filters,
+            &shard_sizes,
+            &shards_store_filters,
+        );
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].filter, filter_real);
+    }
+}
