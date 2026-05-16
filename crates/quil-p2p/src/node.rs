@@ -263,7 +263,15 @@ impl P2PNode {
             std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
         let observed_addrs_writer = observed_addrs.clone();
 
-        tokio::spawn(async move {
+        // Bind the JoinHandle so we can surface panics. The event-loop
+        // task owns `cmd_rx` and the swarm; a panic anywhere inside it
+        // (e.g. a poisoned-lock `unwrap`, a libp2p invariant failure,
+        // an unexpected event-stream error) drops `cmd_rx`, after which
+        // every `cmd_tx.send().await` returns the misleading
+        // "p2p command channel closed (swarm shutting down?)" error.
+        // Without this, the panic is silently swallowed because the
+        // bare `tokio::spawn` discards the handle.
+        let swarm_task = tokio::spawn(async move {
             debug!("P2P swarm event loop started");
             let mut bootstrapped = false;
             let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
@@ -633,6 +641,41 @@ impl P2PNode {
                             }
                         }
                     }
+                }
+            }
+        });
+
+        // Watcher: surface panics or unexpected exits from the swarm
+        // task. A clean break (Shutdown command or all senders dropped)
+        // is logged at info; a panic is logged at error with the panic
+        // payload so operators can see why coverage publishes started
+        // failing.
+        tokio::spawn(async move {
+            match swarm_task.await {
+                Ok(()) => {
+                    tracing::info!("P2P swarm event loop exited cleanly");
+                }
+                Err(join_err) if join_err.is_panic() => {
+                    let payload = join_err.into_panic();
+                    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    tracing::error!(
+                        panic = %msg,
+                        "P2P swarm event loop panicked — all subsequent \
+                         publish/subscribe/peer-score commands will fail \
+                         with 'p2p command channel closed'"
+                    );
+                }
+                Err(join_err) => {
+                    tracing::error!(
+                        error = %join_err,
+                        "P2P swarm event loop terminated with JoinError"
+                    );
                 }
             }
         });
