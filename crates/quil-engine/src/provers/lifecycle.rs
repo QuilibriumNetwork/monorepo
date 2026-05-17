@@ -953,7 +953,7 @@ impl ProverLifecycle {
                 }
                 let reject_summary: Vec<String> = filters
                     .iter()
-                    .map(|f| hex::encode(&f[..f.len().min(8)]))
+                    .map(hex::encode)
                     .collect();
                 let allowed = workers.len().saturating_sub(active_filters.len());
                 info!(
@@ -1003,7 +1003,7 @@ impl ProverLifecycle {
                         .count();
                     let leave_summary: Vec<String> = surplus
                         .iter()
-                        .map(|f| hex::encode(&f[..f.len().min(8)]))
+                        .map(hex::encode)
                         .collect();
                     info!(
                         frame = frame_number,
@@ -1356,7 +1356,7 @@ impl ProverLifecycle {
                 self.allocator.set_last_join_attempt(frame_number);
                 let leave_summary: Vec<String> = leave_candidates
                     .iter()
-                    .map(|f| hex::encode(&f[..f.len().min(8)]))
+                    .map(hex::encode)
                     .collect();
                 info!(
                     frame = frame_number,

@@ -108,12 +108,27 @@ pub trait WorkerControl: Send + Sync {
     fn set_manually_managed(&self, core_id: u32, manually_managed: bool) -> Result<(), String>;
 
     /// Force an immediate `ProverJoin` for the given filters,
-    /// bypassing the lifecycle's cooldown + readiness gate. Returns
-    /// after the canonical message has been submitted (or fails with
-    /// an error explaining why).
+    /// bypassing the lifecycle's cooldown + readiness gate. Returns as
+    /// soon as the request has been validated and (when `worker_ids`
+    /// is supplied) the target workers are pinned — the VDF, sign,
+    /// and publish work runs in a detached background task. RPC ack
+    /// means "request queued, workers pinned", NOT "message on the
+    /// wire". The TUI's await-confirm loop observes alloc landing
+    /// separately.
+    ///
+    /// `worker_ids` is optional. When non-empty it MUST be parallel
+    /// to `filters` (one entry per filter, in order). Each
+    /// `(filters[i], worker_ids[i])` pair is pre-bound synchronously
+    /// so the reconcile pass matches each landing allocation back to
+    /// its intended worker via `worker.filter == alloc.filter` —
+    /// closing the prior bug where the reconciler `pop()`ed from
+    /// `manual_pending` / `idle_workers` with no knowledge of which
+    /// manual worker the operator picked for which filter. When
+    /// empty, falls back to the legacy reconcile-side pick.
     fn request_join<'a>(
         &'a self,
         filters: Vec<Vec<u8>>,
+        worker_ids: Vec<u32>,
         delegate: Vec<u8>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
@@ -739,14 +754,22 @@ impl NodeService for NodeRpcServer {
         if req.filters.is_empty() {
             return Err(Status::invalid_argument("filters must be non-empty"));
         }
+        if !req.worker_ids.is_empty() && req.worker_ids.len() != req.filters.len() {
+            return Err(Status::invalid_argument(format!(
+                "worker_ids length ({}) must match filters length ({}) when provided",
+                req.worker_ids.len(),
+                req.filters.len()
+            )));
+        }
         let filter_hexes: Vec<String> = req.filters.iter().map(hex::encode).collect();
         tracing::info!(
             filter_count = req.filters.len(),
             filters = ?filter_hexes,
+            worker_ids = ?req.worker_ids,
             delegate_len = req.delegate.len(),
             "RequestJoin RPC received"
         );
-        ctl.request_join(req.filters, req.delegate)
+        ctl.request_join(req.filters, req.worker_ids, req.delegate)
             .await
             .map_err(|e| Status::internal(format!("request_join: {e}")))?;
         Ok(Response::new(node::RequestJoinResponse {}))

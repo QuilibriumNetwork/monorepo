@@ -344,7 +344,7 @@ pub fn plan_and_allocate(
             let d = &shards[s.idx];
             format!(
                 "{}:provers={},size={}",
-                hex::encode(&d.filter[..d.filter.len().min(8)]),
+                hex::encode(&d.filter),
                 d.total_active_joining,
                 d.size,
             )
@@ -402,7 +402,7 @@ pub fn plan_and_allocate(
             format!(
                 "core={}:filter={}{}",
                 p.worker_id,
-                hex::encode(&p.filter[..p.filter.len().min(8)]),
+                hex::encode(&p.filter),
                 if halt { ":halt-risk" } else { "" },
             )
         })
@@ -565,7 +565,7 @@ pub fn plan_leaves(
             .map(|(f, score)| {
                 format!(
                     "{}:score={}",
-                    hex::encode(&f[..f.len().min(8)]),
+                    hex::encode(f),
                     score.to_str_radix(10),
                 )
             })

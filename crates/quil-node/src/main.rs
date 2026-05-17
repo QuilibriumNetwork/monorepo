@@ -3809,19 +3809,74 @@ async fn run_master_node(
             fn request_join<'a>(
                 &'a self,
                 filters: Vec<Vec<u8>>,
+                worker_ids: Vec<u32>,
                 _delegate: Vec<u8>,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
             > {
                 let pp = self.prover_pipeline.clone();
+                let wm = self.worker_manager.clone();
                 let frame = self.current_frame.effective();
                 Box::pin(async move {
                     if frame == 0 {
                         return Err("no frames received yet".into());
                     }
-                    pp.submit_join(filters, &[], frame)
-                        .await
-                        .map_err(|e| e.to_string())
+                    if filters.is_empty() {
+                        return Err("filters must be non-empty".into());
+                    }
+
+                    // Pre-pin the target workers synchronously. The
+                    // reconciler then matches each landing allocation
+                    // to its intended worker via filter, instead of
+                    // arbitrarily popping from `manual_pending`. With
+                    // `start_consensus=false` the worker binds to the
+                    // filter but doesn't start its app consensus
+                    // engine — the reconciler restarts it with
+                    // `start_consensus=true` when the alloc transitions
+                    // from Joining to Active. `set_pending_filter_frame`
+                    // anchors the proposal-timeout window.
+                    if !worker_ids.is_empty() {
+                        if worker_ids.len() != filters.len() {
+                            return Err(format!(
+                                "worker_ids length ({}) must match filters length ({})",
+                                worker_ids.len(),
+                                filters.len()
+                            ));
+                        }
+                        for (filter, &core_id) in filters.iter().zip(worker_ids.iter()) {
+                            wm.set_worker_filter(core_id, filter, false)
+                                .map_err(|e| format!(
+                                    "pre-pin worker {core_id}: {e}"
+                                ))?;
+                            wm.set_pending_filter_frame(core_id, frame)
+                                .map_err(|e| format!(
+                                    "set_pending_filter_frame {core_id}: {e}"
+                                ))?;
+                        }
+                    }
+
+                    // Spawn the slow path (VDF + sign + publish) so
+                    // the RPC ack returns immediately. Without this
+                    // the TUI's gRPC call blocks for the full VDF
+                    // duration and any further keystrokes / commands
+                    // queue behind it. Failures from the detached task
+                    // are logged here; the TUI's await-confirm loop
+                    // separately observes whether the alloc actually
+                    // landed on chain.
+                    let filters_for_task = filters.clone();
+                    let worker_ids_for_task = worker_ids.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = pp
+                            .submit_join(filters_for_task, &worker_ids_for_task, frame)
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "request_join detached submit_join failed"
+                            );
+                        }
+                    });
+                    Ok(())
                 })
             }
         }
@@ -3921,8 +3976,18 @@ async fn run_master_node(
                 };
 
                 // Collect the filters this prover is currently
-                // allocated to. `is_allocated` applies the 720-frame
-                // grace window — Active or non-expired Joining only.
+                // "associated with" for TUI display purposes — Joining
+                // (non-expired), Active, Paused, and Leaving (non-
+                // expired). Diverges intentionally from `is_allocated`
+                // (Active+Joining only): a Leaving prover is still
+                // occupying their ring slot until the 360-frame
+                // confirm window completes, so the TUI must show the
+                // reward they are actually still earning at their
+                // current rank — not what a *fresh* joiner would get
+                // (which is what `resolve_prover_ring` falls back to
+                // when `is_alloc=false`, producing the visible bug
+                // where 8 other provers + 1 leaving self displays as
+                // ring 1, the joiner ring).
                 let provers = self
                     .registry
                     .get_provers(&self.self_address)
@@ -3933,7 +3998,7 @@ async fn run_master_node(
                     .flat_map(|pr| {
                         pr.allocations
                             .iter()
-                            .filter(|a| a.is_allocated(frame_number))
+                            .filter(|a| a.is_live(frame_number))
                             .map(|a| a.confirmation_filter.clone())
                     })
                     .collect();

@@ -340,17 +340,34 @@ where
                 Err(_) => continue,
             };
 
-            // Build sorted ring candidates. Only Active + non-
-            // expired Joining count (per `is_allocated`); expired
-            // Joining allocs are implicitly rejected by the
-            // protocol and must not push the prover into the ring.
+            // Build sorted ring candidates for TUI display.
+            //
+            // Includes Joining, Active, Paused, and Leaving (all
+            // "live" states — `is_live`). Expired Joining/Leaving and
+            // terminal states (Rejected, Kicked) are correctly
+            // excluded — those provers no longer hold the slot.
+            //
+            // Diverges intentionally from Go's `shard_info.go:221`
+            // and from the `is_allocated` rule (Active+Joining only).
+            // The strict Active+Joining filter is right for the
+            // *protocol's* ring-assignment math (a Leaving prover
+            // makes room for a fresh joiner who lands at the tail
+            // rank), but wrong for display: until the 360-frame
+            // leave-confirm window elapses, the leaving prover is
+            // still on whatever ring they were on and still earning
+            // that ring's reward. Filtering them out of the candidate
+            // list silently shifts every other prover's rank by one
+            // and makes `resolve_prover_ring` fall through to its
+            // "not in candidates" tail branch, returning the
+            // *post-leave* network's last-prover ring rather than
+            // the leaver's actual current rank.
             let mut candidates: Vec<RingCandidate> = Vec::new();
             for pr in &prs {
                 for alloc in &pr.allocations {
                     if alloc.confirmation_filter != bp {
                         continue;
                     }
-                    if alloc.is_allocated(frame_number) {
+                    if alloc.is_live(frame_number) {
                         let jf = if alloc.join_frame_number == 0
                             && alloc.join_confirm_frame_number != 0
                         {

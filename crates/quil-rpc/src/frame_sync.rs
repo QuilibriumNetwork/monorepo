@@ -16,9 +16,9 @@
 //! - Go: `pollFramesFromArchive` (lines 2161-2231)
 //! - Go discovery: `tryDiscoverArchiveEndpoint` (lines 2237-2335)
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
@@ -49,12 +49,26 @@ pub struct ArchiveEndpointPool {
     notify: Notify,
 }
 
+/// How long a blacklisted endpoint stays banned before becoming
+/// eligible again. Short enough that transient network blips don't
+/// permanently drain the pool, long enough that we don't hammer a
+/// struggling endpoint into the ground. The previous design had no
+/// TTL — a single timeout permanently removed the endpoint, and
+/// `add()` rejected re-adds from PeerInfo discovery, so over hours
+/// of uptime the pool gradually drained to zero and every archive
+/// call surfaced as `"connect_mtls failed: transport error: deadline
+/// has expired"` even though the endpoints had long since recovered.
+const BLACKLIST_TTL: Duration = Duration::from_secs(60);
+
 struct ArchiveEndpointPoolInner {
     /// All known archive endpoints we haven't blacklisted yet, in arrival
     /// order. The poller's "next" pointer rotates through this list.
     endpoints: Vec<String>,
-    /// Endpoints that have failed too many times to be retried this run.
-    blacklist: HashSet<String>,
+    /// Endpoints that have failed recently. Each entry records the
+    /// instant of the most recent failure; entries older than
+    /// `BLACKLIST_TTL` are eligible to be restored on the next pool
+    /// operation.
+    blacklist: HashMap<String, Instant>,
     /// Index into `endpoints` for the next pick.
     cursor: usize,
 }
@@ -64,17 +78,27 @@ impl ArchiveEndpointPool {
         Self {
             inner: Mutex::new(ArchiveEndpointPoolInner {
                 endpoints: Vec::new(),
-                blacklist: HashSet::new(),
+                blacklist: HashMap::new(),
                 cursor: 0,
             }),
             notify: Notify::new(),
         }
     }
 
-    /// Add an archive endpoint if it isn't already known or blacklisted.
+    /// Add an archive endpoint if it isn't already known or currently
+    /// blacklisted. An endpoint whose blacklist entry has expired is
+    /// accepted (the entry is dropped) — that's how recovery from a
+    /// transient outage flows back through `add()` after PeerInfo
+    /// re-advertises the same address.
     pub async fn add(&self, endpoint: String) {
         let mut inner = self.inner.lock().await;
-        if inner.blacklist.contains(&endpoint) || inner.endpoints.contains(&endpoint) {
+        if let Some(ts) = inner.blacklist.get(&endpoint) {
+            if ts.elapsed() < BLACKLIST_TTL {
+                return;
+            }
+            inner.blacklist.remove(&endpoint);
+        }
+        if inner.endpoints.contains(&endpoint) {
             return;
         }
         info!(%endpoint, total = inner.endpoints.len() + 1, "archive endpoint added");
@@ -93,9 +117,26 @@ impl ArchiveEndpointPool {
     }
 
     /// Pick the next non-blacklisted endpoint round-robin. Returns `None` if
-    /// the pool is empty.
+    /// the pool is empty. Opportunistically restores endpoints whose
+    /// blacklist entry has aged past `BLACKLIST_TTL`, so a temporarily
+    /// dead archive can be retried without waiting for PeerInfo
+    /// re-discovery.
     pub(crate) async fn next(&self) -> Option<String> {
         let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+        let expired: Vec<String> = inner
+            .blacklist
+            .iter()
+            .filter(|(_, ts)| now.duration_since(**ts) >= BLACKLIST_TTL)
+            .map(|(e, _)| e.clone())
+            .collect();
+        for e in expired {
+            inner.blacklist.remove(&e);
+            if !inner.endpoints.contains(&e) {
+                debug!(endpoint = %e, "restoring expired-blacklist endpoint");
+                inner.endpoints.push(e);
+            }
+        }
         if inner.endpoints.is_empty() {
             return None;
         }
@@ -104,7 +145,7 @@ impl ArchiveEndpointPool {
         for i in 0..len {
             let idx = (start + i) % len;
             let candidate = inner.endpoints[idx].clone();
-            if !inner.blacklist.contains(&candidate) {
+            if !inner.blacklist.contains_key(&candidate) {
                 inner.cursor = (idx + 1) % len;
                 return Some(candidate);
             }
@@ -114,7 +155,7 @@ impl ArchiveEndpointPool {
 
     async fn blacklist(&self, endpoint: &str) {
         let mut inner = self.inner.lock().await;
-        inner.blacklist.insert(endpoint.to_string());
+        inner.blacklist.insert(endpoint.to_string(), Instant::now());
         inner.endpoints.retain(|e| e != endpoint);
         debug!(%endpoint, "blacklisted archive endpoint");
     }
@@ -383,14 +424,77 @@ mod pool_tests {
         pool.add("a:1".into()).await;
         pool.add("b:1".into()).await;
         pool.blacklist("a:1").await;
-        // After blacklist, only "b:1" comes out — and re-add is rejected.
+        // After blacklist, only "b:1" comes out and `add()` rejects the
+        // re-add while the blacklist entry is still fresh.
         assert_eq!(pool.next().await.as_deref(), Some("b:1"));
         assert_eq!(pool.next().await.as_deref(), Some("b:1"));
         pool.add("a:1".into()).await;
         assert_eq!(
             pool.get_all().await,
             vec!["b:1"],
-            "blacklisted endpoint must not be re-addable"
+            "freshly-blacklisted endpoint must not be re-addable"
+        );
+    }
+
+    /// Regression: prior to the TTL fix a single timeout permanently
+    /// removed an endpoint and `add()` rejected re-adds for the rest of
+    /// the process lifetime. Over hours of uptime the pool drained and
+    /// every archive call surfaced as `connect_mtls failed: transport
+    /// error: deadline has expired`. After the fix an expired
+    /// blacklist entry is dropped and the endpoint becomes eligible
+    /// again — both via opportunistic restoration in `next()` and via
+    /// PeerInfo's re-`add()`.
+    #[tokio::test]
+    async fn blacklist_expires_after_ttl() {
+        let pool = ArchiveEndpointPool::new();
+        pool.add("a:1".into()).await;
+        pool.blacklist("a:1").await;
+        assert!(pool.next().await.is_none(), "still blacklisted within TTL");
+
+        // Backdate the blacklist entry past the TTL by mutating the
+        // inner state directly. Real time would take 60s — too long
+        // for a unit test.
+        {
+            let mut inner = pool.inner.lock().await;
+            let past = Instant::now() - (BLACKLIST_TTL + Duration::from_secs(1));
+            inner.blacklist.insert("a:1".to_string(), past);
+        }
+
+        // `next()` opportunistically restores the expired endpoint.
+        assert_eq!(
+            pool.next().await.as_deref(),
+            Some("a:1"),
+            "expired-blacklist endpoint must be restored"
+        );
+        assert_eq!(pool.get_all().await, vec!["a:1"]);
+    }
+
+    /// Mirror of the above for the `add()` recovery path: PeerInfo
+    /// gossip re-advertising an endpoint after its blacklist entry
+    /// expired must re-enter the pool.
+    #[tokio::test]
+    async fn add_accepts_after_blacklist_expires() {
+        let pool = ArchiveEndpointPool::new();
+        pool.add("a:1".into()).await;
+        pool.blacklist("a:1").await;
+        pool.add("a:1".into()).await;
+        assert!(
+            pool.get_all().await.is_empty(),
+            "add() rejected while blacklist is fresh"
+        );
+
+        // Backdate the blacklist entry past the TTL.
+        {
+            let mut inner = pool.inner.lock().await;
+            let past = Instant::now() - (BLACKLIST_TTL + Duration::from_secs(1));
+            inner.blacklist.insert("a:1".to_string(), past);
+        }
+
+        pool.add("a:1".into()).await;
+        assert_eq!(
+            pool.get_all().await,
+            vec!["a:1"],
+            "expired-blacklist endpoint must accept re-add"
         );
     }
 
