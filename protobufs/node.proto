@@ -294,6 +294,14 @@ message GetShardInfoResponse {
 message RequestJoinRequest {
   repeated bytes filters = 1;
   bytes delegate = 2;
+  // Optional: worker IDs to pre-pin each filter to, parallel to
+  // `filters` (worker_ids[i] is the worker the operator selected for
+  // filters[i]). When set, the server immediately binds each filter to
+  // its target worker before kicking off VDF — the post-VDF reconcile
+  // then matches each landing allocation to its intended worker by
+  // filter, instead of arbitrarily picking from `manual_pending`. Set
+  // to empty (or omit) to fall back to the legacy reconcile-side pick.
+  repeated uint32 worker_ids = 3;
 }
 
 message RequestJoinResponse {
