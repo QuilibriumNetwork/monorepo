@@ -89,6 +89,49 @@ PLATFORM="${QUIL_PLATFORM:-$(detect_platform)}"
 TARGET_TRIPLE="${TARGET_TRIPLE:-$(detect_target_triple)}"
 
 # ---------------------------------------------------------------
+# Resolve native library paths
+# ---------------------------------------------------------------
+# `crates/classgroup/build.rs` and `crates/ferret/build.rs` expect
+# either env-var overrides (`FLINT_DIR`, `GMP_DIR`, `MPFR_DIR`,
+# `OPENSSL_DIR`) or a working `brew --prefix <lib>` on macOS. Linux
+# uses `/usr/local` (where the Dockerfile gmp/flint builder stages
+# install) so no shell-level setup is required.
+#
+# Static-linking flint on macOS is special because Homebrew's flint
+# package ships only the dynamic library. The Rust build.rs falls
+# back to dynamic linking when `FLINT_DIR` is unset (binary then
+# depends on `libflint.dylib` at runtime). For a self-contained
+# binary, point `FLINT_DIR` at an install root containing
+# `lib/libflint.a` or an in-tree source build (libflint.a at the
+# root + headers under src/). We try `~/src/flint` automatically as
+# a developer-convenience default.
+os_name="$(uname | tr '[:upper:]' '[:lower:]')"
+if [[ "$os_name" == "darwin" ]]; then
+    if [[ -z "${FLINT_DIR:-}" ]]; then
+        if [[ -f "$HOME/src/flint/libflint.a" ]]; then
+            export FLINT_DIR="$HOME/src/flint"
+            echo "node/build.sh: auto-detected FLINT_DIR=$FLINT_DIR (in-tree source build)"
+        elif [[ -f "/opt/homebrew/lib/libflint.a" ]]; then
+            export FLINT_DIR="/opt/homebrew"
+        else
+            cat <<EOF >&2
+node/build.sh: FLINT_DIR is not set and no static libflint.a was found.
+The macOS build will fall back to DYNAMIC libflint linkage, producing a
+binary that needs \`libflint.dylib\` (from \`brew install flint\`) on every
+host it runs on. For a self-contained binary, build flint from source:
+    git clone https://github.com/flintlib/flint && cd flint
+    ./bootstrap.sh
+    ./configure --enable-static --disable-shared \\
+        --with-gmp=\$(brew --prefix gmp) \\
+        --with-mpfr=\$(brew --prefix mpfr)
+    make -j\$(sysctl -n hw.ncpu)
+then re-run with FLINT_DIR=\$PWD.
+EOF
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------
 pushd "$ROOT_DIR" > /dev/null

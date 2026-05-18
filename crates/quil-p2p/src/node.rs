@@ -159,12 +159,30 @@ impl P2PNode {
         let network = self.network;
         let blossomsub_params = self.blossomsub_params.clone();
 
+        // yamux multiplexer configured with a higher per-connection
+        // stream cap and a 30-second window timeout. Default
+        // `max_num_streams` is 8192; we've seen production
+        // accumulate that many on a single connection during
+        // chronic-mesh-shortage events that flood
+        // `BlossomSubEvent::NeedPeers` and (previously unthrottled)
+        // trigger one Kademlia `get_providers` per event. The query
+        // throttle below caps the new-stream rate; raising the
+        // yamux cap is the second half — a defense for any future
+        // path that opens streams faster than they're acked.
+        // Surfaces as yamux's
+        // `ConnectionError::TooManyStreams ("maximum number of
+        // streams reached")` in logs.
+        let yamux_config_fn = || {
+            let mut cfg = libp2p::yamux::Config::default();
+            cfg.set_max_num_streams(65536);
+            cfg
+        };
         let mut swarm = SwarmBuilder::with_existing_identity(self.keypair)
             .with_tokio()
             .with_tcp(
                 libp2p::tcp::Config::default(),
                 libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
+                yamux_config_fn,
             )
             .map_err(|e| QuilError::P2p(format!("tcp: {}", e)))?
             .with_quic()
@@ -277,6 +295,21 @@ impl P2PNode {
             let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
             discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut discovery_count = 0u32;
+            // Throttle NeedPeers-driven Kademlia discovery. BlossomSub
+            // can fire `NeedPeers` repeatedly when the mesh is short
+            // of peers (bootstrap, partition, sustained churn); each
+            // event used to fire `kademlia.get_providers` with no
+            // rate-limit, opening DHT substreams to many peers. Burst
+            // floods pushed per-connection stream counts past yamux's
+            // 8192 cap, breaking connections with "maximum number of
+            // streams reached". The periodic `discovery_timer` below
+            // already runs the same query every 30 s, so this
+            // throttle suppresses redundant NeedPeers re-issues
+            // inside the window. 30 s matches the timer cadence —
+            // any tighter is wasteful, any looser delays recovery
+            // from a real partition.
+            let need_peers_throttle = Duration::from_secs(30);
+            let mut last_need_peers_query: Option<std::time::Instant> = None;
             loop {
                 tokio::select! {
                     _ = discovery_timer.tick() => {
@@ -552,14 +585,31 @@ impl P2PNode {
                                         debug!(%peer_id, bitmask = hex::encode(&bitmask), "peer unsubscribed");
                                     }
                                     BlossomSubEvent::NeedPeers { connected, .. } => {
-                                        // BlossomSub needs more mesh peers — trigger DHT discovery
-                                        debug!(connected, "BlossomSub needs peers, triggering DHT discovery");
-                                        let ns = "quilibrium-2.0.2-dusk-mainnet";
-                                        let ns_hash = Sha256::digest(ns.as_bytes());
-                                        let mut mh = vec![0x12u8, 0x20];
-                                        mh.extend_from_slice(&ns_hash);
-                                        let key = libp2p::kad::RecordKey::new(&mh);
-                                        swarm.behaviour_mut().kademlia.get_providers(key);
+                                        // BlossomSub needs more mesh peers — trigger DHT
+                                        // discovery, but throttled. Unthrottled,
+                                        // sustained NeedPeers floods opened enough
+                                        // kademlia substreams per connection to hit
+                                        // yamux's 8192-stream cap.
+                                        let now = std::time::Instant::now();
+                                        let throttled = match last_need_peers_query {
+                                            Some(prev) => now.duration_since(prev) < need_peers_throttle,
+                                            None => false,
+                                        };
+                                        if throttled {
+                                            debug!(
+                                                connected,
+                                                "BlossomSub needs peers — DHT query throttled (recent query in flight)"
+                                            );
+                                        } else {
+                                            debug!(connected, "BlossomSub needs peers, triggering DHT discovery");
+                                            let ns = "quilibrium-2.0.2-dusk-mainnet";
+                                            let ns_hash = Sha256::digest(ns.as_bytes());
+                                            let mut mh = vec![0x12u8, 0x20];
+                                            mh.extend_from_slice(&ns_hash);
+                                            let key = libp2p::kad::RecordKey::new(&mh);
+                                            swarm.behaviour_mut().kademlia.get_providers(key);
+                                            last_need_peers_query = Some(now);
+                                        }
                                     }
                                 },
                                 _ => {}
