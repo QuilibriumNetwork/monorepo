@@ -15,52 +15,52 @@ fn main() {
     // dropped as "unused" because the references in `libclassgroup.rlib`
     // haven't been seen yet — leaving mpfr_*/fmpz_* symbols unresolved.
     //
-    // Flint, MPFR, and GMP are all forced static on every supported
-    // host so the produced binary is self-contained — users don't
-    // need a matching `libgmp.dylib` / `libflint.so` installed at
-    // runtime, which previously broke fresh installs (`brew install
-    // gmp` is a hard prerequisite if we link dynamically). The
-    // earlier macOS path was dynamic against pinned Homebrew Cellar
-    // version paths (`gmp/6.3.0`, `flint/3.4.0`, `mpfr/4.2.2`),
-    // which broke on every Homebrew minor-version bump.
+    // Link-library declarations are split per target. Linux and
+    // macOS resolve GMP/FLINT/MPFR through entirely different supply
+    // chains (apt + dockerized source builds on Linux; Homebrew on
+    // macOS), and the mix of static vs dynamic that's correct on one
+    // is broken on the other.
     //
-    // Notes on static linking on each host:
-    //   * GMP: `libflint.a` references GMP-internal `__gmpn_*`
-    //     symbols that aren't part of GMP's public ABI. Linking the
-    //     same static GMP we built FLINT against keeps the resolution
-    //     consistent (otherwise users see `symbol lookup error:
-    //     undefined symbol: __gmpn_modexact_1_odd` at runtime). On
-    //     Linux this is the source-built static `libgmp.a` under
-    //     `/usr/local/lib` (see gmp-builder stage in the Dockerfiles);
-    //     on macOS it's Homebrew's `libgmp.a`.
-    //   * FLINT: Linux's `libflint-dev` apt package ships a shared
-    //     library whose ABI diverges from the source-built
-    //     `libflint.a` under `/usr/local/lib` that `vdf.cpp` was
-    //     written against (e.g. `_fmpz_clear_mpz` was renamed in
-    //     newer FLINT). Static link keeps us on the version we
-    //     pinned.
+    // Linux (both arches): `libflint.a` and `libgmp.a` are static —
+    // FLINT references GMP-internal `__gmpn_*` symbols that aren't
+    // part of GMP's public ABI, so linking the same source-built
+    // static GMP that FLINT was built against avoids runtime
+    // `undefined symbol: __gmpn_modexact_1_odd`. `mpfr` stays
+    // DYNAMIC on Linux: every working Linux build prior to the
+    // macOS-self-contained-binary work was `static=flint`,
+    // `mpfr` (dynamic), `static=gmp`. Forcing `static=mpfr` here
+    // pulled GMP's public exports in twice (once through
+    // `libmpfr.a`'s internal copy, once through the explicit
+    // `static=gmp`) and produced `__gmpz_export redeclared` link
+    // failures on Linux. (The macOS path is fine with all three
+    // static because Homebrew's `libmpfr.a` doesn't repackage GMP.)
+    //
+    // macOS: GMP and MPFR are unconditionally static (Homebrew ships
+    // `.a` for both). FLINT is conditionally static — Homebrew's
+    // flint formula ships only `libflint.dylib`, so a default `brew
+    // install flint` can't satisfy `static=flint`. Users wanting a
+    // self-contained binary set `FLINT_DIR=<path>` pointing at an
+    // install root containing `lib/libflint.a` (or an in-tree source
+    // build with `libflint.a` at the root). When `FLINT_DIR` is unset
+    // the macOS link falls back to dynamic and the binary needs
+    // `libflint.dylib` at runtime.
     //
     // Link order matters for static resolution: flint depends on gmp
     // and mpfr, so those must come AFTER `-lflint` on the link line.
-    //
-    // On macOS, `flint` is special-cased: Homebrew's flint formula
-    // ships only `libflint.dylib` (no static archive), so a default
-    // `brew install flint` can't satisfy `static=flint`. Users
-    // wanting a self-contained binary set `FLINT_DIR=<path>` pointing
-    // at an install root containing `lib/libflint.a` (built with
-    // `./configure --enable-static --disable-shared`). When
-    // `FLINT_DIR` is unset on macOS the link falls back to dynamic
-    // and the produced binary needs `libflint.dylib` at runtime.
-    // GMP and MPFR are unconditionally static everywhere (Homebrew
-    // ships `.a` for both).
-    let flint_static_on_macos = env::var("FLINT_DIR").is_ok();
-    if target == "aarch64-apple-darwin" && !flint_static_on_macos {
-        println!("cargo:rustc-link-lib=flint");
+    if target == "aarch64-apple-darwin" {
+        let flint_static_on_macos = env::var("FLINT_DIR").is_ok();
+        if flint_static_on_macos {
+            println!("cargo:rustc-link-lib=static=flint");
+        } else {
+            println!("cargo:rustc-link-lib=flint");
+        }
+        println!("cargo:rustc-link-lib=static=mpfr");
+        println!("cargo:rustc-link-lib=static=gmp");
     } else {
         println!("cargo:rustc-link-lib=static=flint");
+        println!("cargo:rustc-link-lib=mpfr");
+        println!("cargo:rustc-link-lib=static=gmp");
     }
-    println!("cargo:rustc-link-lib=static=mpfr");
-    println!("cargo:rustc-link-lib=static=gmp");
 
     if target == "aarch64-apple-darwin" {
         // Resolve Homebrew install prefixes dynamically. The previous
