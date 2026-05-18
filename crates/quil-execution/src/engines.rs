@@ -646,6 +646,36 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                                 "transaction: bulletproof range/sum verify failed".into(),
                             ));
                         }
+
+                        // Double-spend gate. The per-input hidden
+                        // Schnorr signature proves commitment
+                        // knowledge but does NOT prove the coin
+                        // hasn't already been consumed.
+                        // `materialize_transaction` writes a spent
+                        // marker per input at `poseidon(vk)`
+                        // (idempotent — same vk → same address), but
+                        // the marker write doesn't ITSELF block a
+                        // replay: re-submitting the same transaction
+                        // would re-run materialize and re-emit
+                        // output pending trees from already-spent
+                        // inputs. Mirrors the gate Go enforces in
+                        // `token_intrinsic_transaction.go::Verify`
+                        // and matches the long-defined-but-unused
+                        // `check_input_not_double_spent` helper.
+                        for (idx, raw) in tx.inputs.iter().enumerate() {
+                            let input = crate::token_intrinsic::TransactionInput::from_canonical_bytes(raw)?;
+                            let not_spent = crate::token_intrinsic::spent_check::check_input_not_double_spent(
+                                state,
+                                _address,
+                                &input.signature,
+                            )?;
+                            if !not_spent {
+                                return Err(QuilError::InvalidArgument(format!(
+                                    "transaction: input {} already spent (double-spend)",
+                                    idx
+                                )));
+                            }
+                        }
                     }
 
                     let mat_outputs = parse_tx_outputs(&tx.outputs, _frame_number)?;
@@ -1590,6 +1620,66 @@ impl HypergraphExecutionEngine {
             None => return Ok(()), // no state = skip
         };
         let msg = hg_dispatch::decode_and_validate(inner_bytes)?;
+
+        // Authority gate. The dispatch layer's `validate_structural`
+        // is signature-free (its own comment: "Safe to call on
+        // untrusted input"), and full per-domain WritePublicKey
+        // signature verification (matching
+        // `node/execution/intrinsics/hypergraph/hypergraph_vertex_add.go::Verify`
+        // lines 208-221) requires looking up the hypergraph
+        // deployment config keyed by domain. That lookup isn't yet
+        // wired in the Rust port — but in the meantime two hard
+        // checks close the realistic attack surface:
+        //
+        //   1. The inner message's `domain` MUST match the routing
+        //      `domain` parameter. The dispatcher reaches this
+        //      function only after the upstream engine selector
+        //      routed by `domain`; an inner message claiming a
+        //      different domain is a routing-spoof attempt.
+        //
+        //   2. The inner message's `domain` MUST NOT be a
+        //      system-managed address (the global intrinsic at
+        //      `[0xFF;32]`, compute at `[0xCC;32]`, or QUIL token).
+        //      Those shards are written exclusively by their
+        //      intrinsic materializers — never by user
+        //      VertexAdd/VertexRemove/HyperedgeAdd/HyperedgeRemove.
+        //      Allowing a hypergraph op to write a ProverAllocation
+        //      vertex into the global allocation shard would forge
+        //      registry entries without going through ProverJoin's
+        //      BLS+POP path.
+        //
+        // TODO: load the hypergraph's `WritePublicKey` from the
+        // deployment config vertex (Go's `h.config.WritePublicKey`)
+        // and run an Ed448 verify of `signature` over
+        // `domain ‖ data_address ‖ data...` with context
+        // `domain ‖ "VERTEX_ADD"` here (and equivalents for the
+        // three other ops). The current gate is necessary but not
+        // sufficient for user-deployed hypergraphs — it stops
+        // forging into system shards, not impersonating a
+        // hypergraph's owner.
+        let inner_domain: &[u8] = match &msg {
+            hg_dispatch::DispatchedMessage::VertexAdd(v) => &v.domain,
+            hg_dispatch::DispatchedMessage::VertexRemove(v) => &v.domain,
+            hg_dispatch::DispatchedMessage::HyperedgeAdd(h) => &h.domain,
+            hg_dispatch::DispatchedMessage::HyperedgeRemove(h) => &h.domain,
+        };
+        if inner_domain != domain {
+            return Err(QuilError::InvalidArgument(format!(
+                "hypergraph: inner-domain/routing-domain mismatch (inner={}, routing={})",
+                hex::encode(inner_domain),
+                hex::encode(domain),
+            )));
+        }
+        if inner_domain == &crate::domains::GLOBAL[..]
+            || inner_domain == &crate::domains::COMPUTE[..]
+            || inner_domain == &crate::domains::QUIL_TOKEN[..]
+        {
+            return Err(QuilError::InvalidArgument(format!(
+                "hypergraph: write to system-managed domain {} rejected",
+                hex::encode(inner_domain),
+            )));
+        }
+
         let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
         let vr_disc = crate::hypergraph_state::vertex_removes_discriminator()?;
         let ha_disc = crate::hypergraph_state::hyperedge_adds_discriminator()?;

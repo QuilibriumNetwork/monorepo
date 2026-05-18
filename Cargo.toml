@@ -55,6 +55,13 @@ members = [
 [patch.crates-io]
 # Fork libp2p-identity to add Ed448 (KeyType=4) support for Quilibrium peer IDs
 libp2p-identity = { path = "crates/libp2p-identity" }
+# Local patch for libp2p-autonat 0.13.0 — one-line fix for a server-side
+# panic at `v1/behaviour/as_server.rs:304` ("Peer is connected.") that
+# fires when an inbound dial-back request races with the sender's
+# disconnect, killing the entire swarm event loop. Upstream master
+# still has the bug. See the crate's
+# `src/v1/behaviour/as_server.rs` for the patched lines.
+libp2p-autonat = { path = "crates/libp2p-autonat" }
 
 [profile.release]
 # rpath = false is important to make Go bindings work

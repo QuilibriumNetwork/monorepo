@@ -291,17 +291,45 @@ pub fn validator_global_peer_info() -> TopicValidator {
                 if info.peer_id.is_empty() {
                     return false;
                 }
-                // Ed448 pubkey on the wire is 57 bytes. The decoder
-                // accepts empty (e.g. unsigned bootstrap PeerInfo), but
-                // anything non-empty must match.
-                if !info.public_key.is_empty() && info.public_key.len() != 57 {
+                // Ed448 pubkey + signature are required. The previous
+                // "lenient" behavior accepted PeerInfo with empty
+                // pubkey/signature, which let any peer publish a
+                // PeerInfo claiming any peer_id + any capabilities
+                // (including ARCHIVE_SERVICE_CAPABILITY_ID) without
+                // proving they hold the corresponding private key.
+                // The recv-path then trusted the peer_id claim and
+                // added the attacker's address to the archive pool —
+                // a genesis-archive impersonation vector. Match Go's
+                // `validatePeerInfoSignature` (rejects empty sig or
+                // pubkey at `global_consensus_engine.go:2559`).
+                if info.public_key.len() != 57 {
                     return false;
                 }
-                // Ed448 signature is 114 bytes; same lenient rule.
-                if !info.signature.is_empty() && info.signature.len() != 114 {
+                if info.signature.len() != 114 {
                     return false;
                 }
-                true
+                // Cryptographic verification. The signing payload is
+                // the canonical PeerInfo wire encoding with the
+                // signature field cleared (Go encodes with
+                // `p.Signature = nil` then signs the result, then
+                // re-encodes with the signature filled in).
+                let signing_payload = quil_p2p::encode_canonical_peer_info(
+                    &info,
+                    &info.public_key,
+                    &[],
+                );
+                let pubkey_arr: [u8; 57] = match info.public_key.as_slice().try_into() {
+                    Ok(a) => a,
+                    Err(_) => return false,
+                };
+                let pubkey = ed448_rust::PublicKey::from(pubkey_arr);
+                // Go uses `domain = []byte{}` (empty context). Ed448
+                // distinguishes None (no context) from Some(&[])
+                // (empty context); Go's empty-byte-slice maps to
+                // Some(&[]).
+                pubkey
+                    .verify(&signing_payload, &info.signature, Some(&[]))
+                    .is_ok()
             }
             Ok(quil_p2p::PeerInfoMessage::KeyRegistry) => {
                 // Round-trip through the full KeyRegistry decoder so

@@ -1480,7 +1480,17 @@ async fn run_master_node(
     // Pre-allocate idle workers for each available core so they're
     // online from startup. Workers start idle (empty filter) and get
     // assigned shards by the lifecycle when join proposals are accepted.
-    {
+    //
+    // Archive mode skips this entirely. Per the architecture
+    // (re-stated at the `frame_materializer` block below): archives
+    // materialize global frames; workers materialize app-shard frames
+    // — a separate role. An archive node spawning app-shard workers
+    // would be every-role-at-once, which is wrong: an archive's job
+    // is to retain global history and serve sync, not to compete
+    // for shard rewards. The other gates (lifecycle.evaluate,
+    // worker_allocator.on_new_frame) are also archive-skipped in
+    // their respective call sites below.
+    if !archive_mode {
         let num_cores = match worker_manager.check_workers_connected() {
             Ok(ids) => ids.len() as u32,
             Err(_) => 0,
@@ -1498,6 +1508,8 @@ async fn run_master_node(
             }
             info!(workers = worker_count, "pre-allocated idle workers");
         }
+    } else {
+        info!("archive mode: skipping worker pre-allocation (archives don't run app-shard workers)");
     }
 
     // Apply `engine.data_worker_filters` from YAML config. Runs AFTER
@@ -1512,7 +1524,11 @@ async fn run_master_node(
     // advertisement, not worker pinning. The auto-allocator's
     // manual_pending pool consumes these workers when matching
     // registry allocations land.
-    {
+    // Skip in archive mode for the same reason as the pre-allocate
+    // block above: archives don't run app-shard workers, so applying
+    // config-declared shard filters would spawn workers an archive
+    // shouldn't have.
+    if !archive_mode {
         let cfg_filters = &config.engine.data_worker_filters;
         let stats = quil_engine::worker_allocator::apply_config_worker_filters(
             worker_manager.as_ref(),
@@ -1529,6 +1545,11 @@ async fn run_master_node(
                 "applied engine.data_worker_filters"
             );
         }
+    } else if !config.engine.data_worker_filters.is_empty() {
+        info!(
+            declared = config.engine.data_worker_filters.len(),
+            "archive mode: ignoring engine.data_worker_filters (archives don't run app-shard workers)"
+        );
     }
 
     // Publish the worker_manager handle to the PeerInfo broadcaster.
@@ -2028,6 +2049,7 @@ async fn run_master_node(
         let crdt_for_poller = crdt.clone();
         let shards_store_for_poller: Arc<dyn quil_types::store::ShardsStore> =
             shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
+        let archive_mode_poller = archive_mode;
         let poller_config = quil_rpc::ArchivePollerConfig {
             on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
                 let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
@@ -2079,10 +2101,17 @@ async fn run_master_node(
                     }
                 }
 
-                // Trigger worker allocation reconciliation
+                // Trigger worker allocation reconciliation. Skip in
+                // archive mode — archives don't run app-shard workers,
+                // so the reconciler has nothing to do and calling it
+                // would resurface the no-workers-spawned-yet pathways
+                // that produced phantom worker allocations on prior
+                // versions.
                 cov_for_poller.check(frame_num);
-                if let Err(e) = wa_for_poller.on_new_frame(frame_num) {
-                    tracing::warn!(error = %e, "worker allocation failed");
+                if !archive_mode_poller {
+                    if let Err(e) = wa_for_poller.on_new_frame(frame_num) {
+                        tracing::warn!(error = %e, "worker allocation failed");
+                    }
                 }
 
                 // Advance the lifecycle's "verified frame" marker. The
@@ -2167,20 +2196,27 @@ async fn run_master_node(
                     pl_for_poller.set_local_shard_sizes(sizes_by_filter);
                 }
 
-                match pl_for_poller.evaluate(
-                    frame_num,
-                    frame_difficulty as u64,
-                    pr_for_poller.as_ref() as &dyn quil_types::consensus::ProverRegistry,
-                    wm_for_poller.as_ref(),
-                ) {
-                    Ok(actions) => {
-                        for action in actions {
-                            tracing::info!(frame = frame_num, ?action, "prover lifecycle action");
-                            pp_for_poller.dispatch(action);
+                // Skip lifecycle evaluation on archives — they don't
+                // propose joins/leaves, don't dispatch through the
+                // prover pipeline, and the evaluate() output would
+                // be ignored anyway since there are no workers to
+                // bind allocations to.
+                if !archive_mode_poller {
+                    match pl_for_poller.evaluate(
+                        frame_num,
+                        frame_difficulty as u64,
+                        pr_for_poller.as_ref() as &dyn quil_types::consensus::ProverRegistry,
+                        wm_for_poller.as_ref(),
+                    ) {
+                        Ok(actions) => {
+                            for action in actions {
+                                tracing::info!(frame = frame_num, ?action, "prover lifecycle action");
+                                pp_for_poller.dispatch(action);
+                            }
                         }
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "prover lifecycle evaluation skipped");
+                        Err(e) => {
+                            tracing::debug!(error = %e, "prover lifecycle evaluation skipped");
+                        }
                     }
                 }
             })),
@@ -2837,6 +2873,7 @@ async fn run_master_node(
     let pl_for_recv = prover_lifecycle.clone();
     let pr_for_recv = prover_registry.clone();
     let wm_for_recv = worker_manager.clone();
+    let archive_mode_recv = archive_mode;
     let reward_issuer = Arc::new(quil_engine::OptRewardIssuance);
     let pa_for_recv = prover_address;
     let p2p_for_recv = p2p_handle.clone();
@@ -3234,12 +3271,18 @@ async fn run_master_node(
                                                             "received + processed GlobalFrame"
                                                         );
                                                         // Trigger coverage check + worker allocation
+                                                        // (skip the reconciler on archives — they
+                                                        // don't run app-shard workers).
                                                         coverage_for_recv.check(frame_num);
-                                                        if let Err(e) = wa_for_recv.on_new_frame(frame_num) {
-                                                            warn!(error = %e, "worker allocation failed");
+                                                        if !archive_mode_recv {
+                                                            if let Err(e) = wa_for_recv.on_new_frame(frame_num) {
+                                                                warn!(error = %e, "worker allocation failed");
+                                                            }
                                                         }
                                                         // Evaluate prover lifecycle (join/confirm/leave) and
                                                         // dispatch any resulting action via the pipeline.
+                                                        // Archives skip — no workers to bind allocations to
+                                                        // and no shard reward to chase.
                                                         let frame_difficulty = frame.header.as_ref()
                                                             .map(|h| h.difficulty)
                                                             .unwrap_or(0);
@@ -3249,20 +3292,22 @@ async fn run_master_node(
                                                         // successfully-handled frame. See poller
                                                         // path for rationale.
                                                         pl_for_recv.set_prover_root_verified_frame(frame_num);
-                                                        match pl_for_recv.evaluate(
-                                                            frame_num,
-                                                            frame_difficulty as u64,
-                                                            pr_for_recv.as_ref(),
-                                                            wm_for_recv.as_ref(),
-                                                        ) {
-                                                            Ok(actions) => {
-                                                                for action in actions {
-                                                                    info!(frame = frame_num, ?action, "prover lifecycle action");
-                                                                    pp_for_recv.dispatch(action);
+                                                        if !archive_mode_recv {
+                                                            match pl_for_recv.evaluate(
+                                                                frame_num,
+                                                                frame_difficulty as u64,
+                                                                pr_for_recv.as_ref(),
+                                                                wm_for_recv.as_ref(),
+                                                            ) {
+                                                                Ok(actions) => {
+                                                                    for action in actions {
+                                                                        info!(frame = frame_num, ?action, "prover lifecycle action");
+                                                                        pp_for_recv.dispatch(action);
+                                                                    }
                                                                 }
-                                                            }
-                                                            Err(e) => {
-                                                                debug!(error = %e, "prover lifecycle evaluation skipped");
+                                                                Err(e) => {
+                                                                    debug!(error = %e, "prover lifecycle evaluation skipped");
+                                                                }
                                                             }
                                                         }
                                                     }

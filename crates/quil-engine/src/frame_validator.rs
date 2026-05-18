@@ -258,24 +258,33 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
             return Err(QuilError::InvalidArgument("bitmask is nil".into()));
         }
 
-        // 1. VDF proof verification. The returned bitmask names which
-        // active-prover indices were aggregated into the header's
-        // signature.
-        let bits = match self.frame_prover.verify_global_frame_header(header) {
-            Ok(b) => b,
-            Err(e) => {
-                debug!(
-                    frame_number = header.frame_number,
-                    parent_selector = %hex::encode(&header.parent_selector),
-                    error = %e,
-                    "frame verification failed"
-                );
-                return Err(QuilError::Crypto(format!(
-                    "global frame header verification: {}",
-                    e
-                )));
-            }
-        };
+        // 1. VDF proof verification. The trait's return value is the
+        // VDF output (not a bitmask) — we discard it; the participant
+        // bitmask comes from the BLS aggregate signature carrier
+        // directly (mirroring Go's
+        // `WesolowskiFrameProver.VerifyGlobalFrameHeader` which
+        // returns `GetSetBitIndices(sig.Bitmask)` after the VDF check).
+        // Treating the VDF output as a participant bitmask (the prior
+        // bug) caused every prover whose index byte happened to
+        // appear in the 516-byte VDF output to be included in the
+        // aggregate — for a typical committee size on a uniformly-
+        // looking VDF output this is "approximately all of them",
+        // letting an attacker pair any committee subset with a
+        // matching forged `pk.key_value`.
+        if let Err(e) = self.frame_prover.verify_global_frame_header(header) {
+            debug!(
+                frame_number = header.frame_number,
+                parent_selector = %hex::encode(&header.parent_selector),
+                error = %e,
+                "frame verification failed"
+            );
+            return Err(QuilError::Crypto(format!(
+                "global frame header verification: {}",
+                e
+            )));
+        }
+        let participant_indices: Vec<usize> =
+            quil_consensus::bitmask::set_bit_indices(&sig.bitmask).collect();
 
         // 2. Aggregate-key check.
         // Go uses `proverRegistry.GetActiveProvers(nil)` for the
@@ -285,8 +294,7 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
         let mut active_public_keys: Vec<&[u8]> = Vec::new();
         let mut throwaway: Vec<&[u8]> = Vec::new();
         for (i, prover) in active.iter().enumerate() {
-            // bits is `Vec<u8>`, each byte an index into `active`.
-            if bits.iter().any(|&b| b as usize == i) {
+            if participant_indices.contains(&i) {
                 active_public_keys.push(&prover.public_key);
                 // Matches Go's quirky pattern of passing the frame's
                 // own signature as the "throwaway" signature list
@@ -310,6 +318,45 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
             return Err(QuilError::Crypto(
                 "could not verify aggregated keys".into(),
             ));
+        }
+
+        // 3. BLS signature verification. The aggregate-key check
+        // above only proves the *claimed* aggregate pubkey is
+        // consistent with the bitmask, not that the signature bytes
+        // are a valid signature under that aggregate key. Without
+        // this final check, an attacker who can produce a valid VDF
+        // could pair any committee subset (named via the bitmask)
+        // with a matching forged `pk.key_value` and arbitrary
+        // `sig.signature` bytes, and the frame would validate.
+        //
+        // Mirrors Go's `WesolowskiFrameProver.VerifyGlobalHeaderSignature`
+        // (which Go's validator should call but does not — see audit
+        // notes; we close the gap here rather than copy Go's omission).
+        match self
+            .frame_prover
+            .verify_global_header_signature(header, self.bls_constructor.as_ref())
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    frame_number = header.frame_number,
+                    "global frame BLS signature verification rejected"
+                );
+                return Err(QuilError::Crypto(
+                    "global frame BLS signature verification rejected".into(),
+                ));
+            }
+            Err(e) => {
+                debug!(
+                    frame_number = header.frame_number,
+                    error = %e,
+                    "global frame BLS signature verification errored"
+                );
+                return Err(QuilError::Crypto(format!(
+                    "global frame BLS signature verification: {}",
+                    e
+                )));
+            }
         }
 
         debug!(
@@ -375,31 +422,52 @@ impl AppFrameValidator for BlsAppFrameValidator {
             }
         }
 
-        // 1. VDF proof verification.
-        let bits = match self.frame_prover.verify_frame_header(header) {
-            Ok(b) => b,
-            Err(e) => {
-                debug!(
-                    frame_number = header.frame_number,
-                    address = %hex::encode(&header.address),
-                    parent_selector = %hex::encode(&header.parent_selector),
-                    error = %e,
-                    "frame verification failed"
-                );
-                return Err(QuilError::Crypto(format!(
-                    "frame header verification: {}",
-                    e
-                )));
-            }
-        };
+        // 1. VDF proof verification. The trait's return value is
+        // the VDF output, not a participant bitmask — discard it.
+        // The actual participant indices come from the BLS aggregate
+        // signature carrier (mirroring Go's
+        // `WesolowskiFrameProver.VerifyFrameHeader` which returns
+        // `GetSetBitIndices(sig.Bitmask)`). See the matching comment
+        // on `BlsGlobalFrameValidator::validate` above for why the
+        // previous behavior (treating the VDF output as a bitmask)
+        // was a soundness bug.
+        if let Err(e) = self.frame_prover.verify_frame_header(header) {
+            debug!(
+                frame_number = header.frame_number,
+                address = %hex::encode(&header.address),
+                parent_selector = %hex::encode(&header.parent_selector),
+                error = %e,
+                "frame verification failed"
+            );
+            return Err(QuilError::Crypto(format!(
+                "frame header verification: {}",
+                e
+            )));
+        }
 
-        // 2. Aggregate-key check (only if a BLS signature is attached).
+        // 2. Aggregate-key check. Required for every post-genesis
+        // frame. The previous behavior wrapped this entire block in
+        // `if let Some(sig) = ...`, so a frame with the signature
+        // field omitted entirely would pass the validator after only
+        // the VDF check (and VDF alone is publicly computable —
+        // anyone can solve a Wesolowski problem given the inputs).
+        // Genesis frames carry no signature by design (mirroring
+        // `BlsGlobalFrameValidator` above which exempts
+        // `frame_number == 0`).
+        if header.frame_number != 0 && header.public_key_signature_bls48581.is_none() {
+            return Err(QuilError::InvalidArgument(
+                "app shard frame missing BLS signature (post-genesis frames must be signed)".into(),
+            ));
+        }
         if let Some(sig) = header.public_key_signature_bls48581.as_ref() {
             let Some(pk) = sig.public_key.as_ref() else {
                 return Err(QuilError::InvalidArgument(
                     "signature has no public key".into(),
                 ));
             };
+
+            let participant_indices: Vec<usize> =
+                quil_consensus::bitmask::set_bit_indices(&sig.bitmask).collect();
 
             let active = self.prover_registry.get_active_provers(&header.address)?;
 
@@ -415,7 +483,7 @@ impl AppFrameValidator for BlsAppFrameValidator {
             let mut active_public_keys: Vec<&[u8]> = Vec::new();
             let mut throwaway_list: Vec<&[u8]> = Vec::new();
             for (i, prover) in active.iter().enumerate() {
-                if bits.iter().any(|&b| b as usize == i) {
+                if participant_indices.contains(&i) {
                     active_public_keys.push(&prover.public_key);
                     throwaway_list.push(&throwaway_public);
                 }
@@ -431,12 +499,48 @@ impl AppFrameValidator for BlsAppFrameValidator {
                     address = %hex::encode(&header.address),
                     expected = %hex::encode(&pk.key_value),
                     actual = %hex::encode(&aggregate.public_key),
-                    bitmask = %hex::encode(&bits),
+                    bitmask = %hex::encode(&sig.bitmask),
                     "could not verify aggregated keys"
                 );
                 return Err(QuilError::Crypto(
                     "could not verify aggregated keys".into(),
                 ));
+            }
+
+            // BLS signature verification. See the matching comment in
+            // `BlsGlobalFrameValidator::validate` — the aggregate-key
+            // consistency check alone doesn't prove `sig.signature`
+            // is a valid signature under the aggregate key. Without
+            // this an attacker pairs a real-subset bitmask + matching
+            // aggregate pubkey with arbitrary signature bytes.
+            match self.frame_prover.verify_frame_header_signature(
+                header,
+                self.bls_constructor.as_ref(),
+                None,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!(
+                        frame_number = header.frame_number,
+                        address = %hex::encode(&header.address),
+                        "app shard frame BLS signature rejected"
+                    );
+                    return Err(QuilError::Crypto(
+                        "app shard frame BLS signature rejected".into(),
+                    ));
+                }
+                Err(e) => {
+                    debug!(
+                        frame_number = header.frame_number,
+                        address = %hex::encode(&header.address),
+                        error = %e,
+                        "app shard frame BLS signature errored"
+                    );
+                    return Err(QuilError::Crypto(format!(
+                        "app shard frame BLS signature: {}",
+                        e
+                    )));
+                }
             }
         }
 

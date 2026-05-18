@@ -172,21 +172,48 @@ impl ArchiveClient {
     }
 }
 
-/// rustls verifier that accepts any server certificate. Used because
-/// Quilibrium peers self-sign with Ed25519-derived keys; trust is established
-/// at the application layer via the cross-signature in the cert's SAN.
+/// rustls verifier for archive server certs. Quilibrium peers
+/// self-sign with Ed25519-derived keys, so the standard PKI path
+/// can't be used — but we are NOT "accept any cert". Trust is
+/// established at the application layer via the Ed448 xsign
+/// cross-signature embedded in the cert's SAN DNS name. The
+/// previous implementation accepted ANY syntactically-valid cert
+/// here, which (combined with PeerInfo gossip carrying an
+/// attacker-controlled peer_id) opened a genesis-archive
+/// impersonation path: a malicious peer could advertise an archive
+/// capability under any peer_id and pass the mTLS handshake with
+/// their own unrelated cert.
+///
+/// This verifier now runs the same xsign verification that the
+/// server-side [`crate::quil_tls::XsignClientCertVerifier`] applies
+/// to client certs — proving the cert's SAN really was issued by
+/// the Ed448 key it claims. Pairing each archive_pool entry with
+/// its expected peer_id (so a mismatch between the certificate's
+/// xsign-derived Ed448 pubkey and the expected genesis-archive
+/// identity could be rejected) is a useful next-layer hardening
+/// but requires plumbing the expected peer_id through the pool +
+/// poller call chain. Today the PeerInfo signature check
+/// (`validator_global_peer_info` in `quil-engine`) already ensures
+/// nobody can publish a PeerInfo claiming the genesis-archive
+/// peer_id without holding its Ed448 signing key, so the
+/// impersonation chain is already broken at the gossip layer.
 #[derive(Debug)]
 pub struct AcceptAnyServerCert;
 
 impl ServerCertVerifier for AcceptAnyServerCert {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        // Apply the Quilibrium xsign check to the presented cert.
+        // Identical to the server-side client-auth verifier — the
+        // mTLS handshake is symmetric: each side proves SAN-derived
+        // identity to the other.
+        crate::quil_tls::XsignClientCertVerifier::verify_xsign(end_entity.as_ref())?;
         Ok(ServerCertVerified::assertion())
     }
 

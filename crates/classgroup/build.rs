@@ -1,5 +1,7 @@
 use cc;
 use std::env;
+use std::path::Path;
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -13,79 +15,209 @@ fn main() {
     // dropped as "unused" because the references in `libclassgroup.rlib`
     // haven't been seen yet — leaving mpfr_*/fmpz_* symbols unresolved.
     //
-    // Flint and GMP are both forced static on Linux:
-    //   * `libflint-dev` in the apt base ships a `libflint.so` with an ABI
-    //     that diverges from the source-built flint-3.0 under
-    //     `/usr/local/lib/libflint.a` that vdf.cpp was written against
-    //     (e.g. `_fmpz_clear_mpz` was renamed in newer FLINT).
-    //   * FLINT's static archive references GMP-internal `__gmpn_*` symbols
-    //     that aren't guaranteed to be exported by every host's libgmp.so,
-    //     producing runtime `symbol lookup error: undefined symbol:
-    //     __gmpn_modexact_1_odd` on downstream machines. Bundling the
-    //     source-built static GMP (see gmp-builder stage in the Dockerfiles)
-    //     makes the binary self-contained.
+    // Flint, MPFR, and GMP are all forced static on every supported
+    // host so the produced binary is self-contained — users don't
+    // need a matching `libgmp.dylib` / `libflint.so` installed at
+    // runtime, which previously broke fresh installs (`brew install
+    // gmp` is a hard prerequisite if we link dynamically). The
+    // earlier macOS path was dynamic against pinned Homebrew Cellar
+    // version paths (`gmp/6.3.0`, `flint/3.4.0`, `mpfr/4.2.2`),
+    // which broke on every Homebrew minor-version bump.
     //
-    // Link order matters for static resolution: flint depends on gmp and
-    // mpfr, so those must come AFTER `-lflint` on the link line.
+    // Notes on static linking on each host:
+    //   * GMP: `libflint.a` references GMP-internal `__gmpn_*`
+    //     symbols that aren't part of GMP's public ABI. Linking the
+    //     same static GMP we built FLINT against keeps the resolution
+    //     consistent (otherwise users see `symbol lookup error:
+    //     undefined symbol: __gmpn_modexact_1_odd` at runtime). On
+    //     Linux this is the source-built static `libgmp.a` under
+    //     `/usr/local/lib` (see gmp-builder stage in the Dockerfiles);
+    //     on macOS it's Homebrew's `libgmp.a`.
+    //   * FLINT: Linux's `libflint-dev` apt package ships a shared
+    //     library whose ABI diverges from the source-built
+    //     `libflint.a` under `/usr/local/lib` that `vdf.cpp` was
+    //     written against (e.g. `_fmpz_clear_mpz` was renamed in
+    //     newer FLINT). Static link keeps us on the version we
+    //     pinned.
     //
-    // macOS Homebrew provides dynamic libs only. Use `rustc-link-lib`
-    // rather than `rustc-link-arg` so the `-l` flags propagate to
-    // downstream test binaries that link `classgroup.rlib` — `link-arg`
-    // only applies to the emitting crate's own binaries.
-    if target == "aarch64-apple-darwin" {
-        println!("cargo:rustc-link-lib=gmp");
+    // Link order matters for static resolution: flint depends on gmp
+    // and mpfr, so those must come AFTER `-lflint` on the link line.
+    //
+    // On macOS, `flint` is special-cased: Homebrew's flint formula
+    // ships only `libflint.dylib` (no static archive), so a default
+    // `brew install flint` can't satisfy `static=flint`. Users
+    // wanting a self-contained binary set `FLINT_DIR=<path>` pointing
+    // at an install root containing `lib/libflint.a` (built with
+    // `./configure --enable-static --disable-shared`). When
+    // `FLINT_DIR` is unset on macOS the link falls back to dynamic
+    // and the produced binary needs `libflint.dylib` at runtime.
+    // GMP and MPFR are unconditionally static everywhere (Homebrew
+    // ships `.a` for both).
+    let flint_static_on_macos = env::var("FLINT_DIR").is_ok();
+    if target == "aarch64-apple-darwin" && !flint_static_on_macos {
         println!("cargo:rustc-link-lib=flint");
-        println!("cargo:rustc-link-lib=mpfr");
     } else {
         println!("cargo:rustc-link-lib=static=flint");
-        println!("cargo:rustc-link-lib=mpfr");
-        println!("cargo:rustc-link-lib=static=gmp");
     }
+    println!("cargo:rustc-link-lib=static=mpfr");
+    println!("cargo:rustc-link-lib=static=gmp");
 
     if target == "aarch64-apple-darwin" {
-        println!("cargo:rustc-link-search=/opt/homebrew/Cellar/gmp/6.3.0/lib");
-        println!("cargo:rustc-link-search=/opt/homebrew/Cellar/flint/3.4.0/lib");
-        println!("cargo:rustc-link-search=/opt/homebrew/Cellar/mpfr/4.2.2/lib");
+        // Resolve Homebrew install prefixes dynamically. The previous
+        // hardcoded `/opt/homebrew/Cellar/gmp/6.3.0/lib`-style paths
+        // broke on every minor version bump and were impossible to
+        // override without editing build.rs. `brew --prefix LIB`
+        // returns a stable per-package symlink
+        // (e.g. `/opt/homebrew/opt/gmp`) that survives version
+        // upgrades. Env var override (`GMP_DIR`/`FLINT_DIR`/`MPFR_DIR`)
+        // lets users on non-Homebrew installs (MacPorts,
+        // source-builds, vendored prefixes) point at their own
+        // install root.
+        let gmp = resolve_lib_root("gmp", "GMP_DIR");
+        let mpfr = resolve_lib_root("mpfr", "MPFR_DIR");
+        let (flint_lib_dir, flint_include) = resolve_flint();
+
+        println!("cargo:rustc-link-search=native={}/lib", gmp);
+        println!("cargo:rustc-link-search=native={}", flint_lib_dir);
+        println!("cargo:rustc-link-search=native={}/lib", mpfr);
+
+        let inc_gmp = format!("-I{}/include", gmp);
+        let inc_flint = format!("-I{}", flint_include);
+        let inc_mpfr = format!("-I{}/include", mpfr);
+        cc::Build::new()
+            .cpp(true)
+            .file("src/vdf.cpp")
+            .flag(&inc_gmp)
+            .flag(&inc_flint)
+            .flag(&inc_mpfr)
+            .compile("vdf");
     } else if target == "aarch64-unknown-linux-gnu" {
-        println!("cargo:rustc-link-search=/usr/local/lib");
-        println!("cargo:rustc-link-search=/usr/lib/aarch64-linux-gnu/");
+        println!("cargo:rustc-link-search=native=/usr/local/lib");
+        println!("cargo:rustc-link-search=native=/usr/lib/aarch64-linux-gnu/");
+        cc::Build::new()
+            .cpp(true)
+            .file("src/vdf.cpp")
+            .static_flag(true)
+            .flag("-lflint")
+            .flag("-lmpfr")
+            .compile("vdf");
     } else if target == "x86_64-unknown-linux-gnu" {
-        println!("cargo:rustc-link-search=/usr/local/lib");
-        println!("cargo:rustc-link-search=/usr/lib/");
+        println!("cargo:rustc-link-search=native=/usr/local/lib");
+        println!("cargo:rustc-link-search=native=/usr/lib/");
+        cc::Build::new()
+            .cpp(true)
+            .file("src/vdf.cpp")
+            .static_flag(true)
+            .flag("-lflint")
+            .flag("-lmpfr")
+            .compile("vdf");
     } else {
         panic!("unsupported target {target}");
     }
-    if target == "aarch64-apple-darwin" {
-      cc::Build::new()
-        .cpp(true)
-        .file("src/vdf.cpp")
-        .flag("-I/opt/homebrew/Cellar/gmp/6.3.0/include")
-        .flag("-I/opt/homebrew/Cellar/flint/3.4.0/include")
-        .flag("-I/opt/homebrew/Cellar/mpfr/4.2.2/include")
-        .flag("-L/opt/homebrew/Cellar/gmp/6.3.0/lib")
-        .flag("-L/opt/homebrew/Cellar/flint/3.4.0/lib")
-        .flag("-L/opt/homebrew/Cellar/mpfr/4.2.2/lib")
-        .flag("-lgmp")
-        .flag("-lflint")
-        .flag("-lmpfr")
-        .compile("vdf");
-    } else if target == "aarch64-unknown-linux-gnu" {
-      cc::Build::new()
-        .cpp(true)
-        .file("src/vdf.cpp")
-        .static_flag(true)
-        .flag("-lflint")
-        .flag("-lmpfr")
-        .compile("vdf");
-    } else if target == "x86_64-unknown-linux-gnu" {
-      cc::Build::new()
-        .cpp(true)
-        .file("src/vdf.cpp")
-        .static_flag(true)
-        .flag("-lflint")
-        .flag("-lmpfr")
-        .compile("vdf");
+}
+
+/// Resolve flint's library-search dir and header-include dir,
+/// supporting two layouts:
+///
+///   * **Install prefix**  (`make install --prefix=PFX`): archive at
+///     `<PFX>/lib/libflint.a`, headers at `<PFX>/include/flint/*.h`.
+///   * **In-tree source build** (no install step): archive at
+///     `<ROOT>/libflint.a`, headers flat in `<ROOT>/src/` with no
+///     `flint/` subdirectory. The user's `~/src/flint` is this shape.
+///
+/// For the in-tree layout the include directive `#include <flint/fmpz.h>`
+/// won't resolve directly — there's no `flint/` directory. We create
+/// a shim under `$OUT_DIR/flint-shim` whose `flint` entry symlinks to
+/// `<ROOT>/src`, so `-I$OUT_DIR/flint-shim` makes the header path
+/// resolve to `<ROOT>/src/fmpz.h`.
+///
+/// Returns `(lib_search_dir, header_include_dir)`. Panics with an
+/// actionable message if neither layout is present.
+fn resolve_flint() -> (String, String) {
+    println!("cargo:rerun-if-env-changed=FLINT_DIR");
+    let root = if let Ok(p) = env::var("FLINT_DIR") {
+        if p.is_empty() {
+            resolve_lib_root("flint", "FLINT_DIR")
+        } else {
+            p
+        }
     } else {
-        panic!("unsupported target {target}");
+        resolve_lib_root("flint", "FLINT_DIR")
+    };
+
+    let install_a = format!("{root}/lib/libflint.a");
+    let source_a = format!("{root}/libflint.a");
+
+    if Path::new(&install_a).exists() {
+        return (format!("{root}/lib"), format!("{root}/include"));
+    }
+    if Path::new(&source_a).exists() {
+        // Synthesize <OUT_DIR>/flint-shim/flint -> <root>/src so that
+        // `#include <flint/fmpz.h>` resolves. unix-only, but this
+        // branch is only reachable on macOS today and Linux uses the
+        // install-prefix layout shipped by the gmp/flint builders.
+        let out_dir = env::var("OUT_DIR").expect("cargo OUT_DIR");
+        let shim_root = format!("{out_dir}/flint-shim");
+        let shim_dir = format!("{shim_root}/flint");
+        let src_dir = format!("{root}/src");
+        // `create_dir_all` is idempotent; remove any stale symlink
+        // before re-creating so we always point at the current src/.
+        std::fs::create_dir_all(&shim_root)
+            .unwrap_or_else(|e| panic!("create_dir_all {shim_root}: {e}"));
+        if Path::new(&shim_dir).exists() || Path::new(&shim_dir).is_symlink() {
+            std::fs::remove_file(&shim_dir).or_else(|_| std::fs::remove_dir_all(&shim_dir))
+                .unwrap_or_else(|e| panic!("remove stale shim {shim_dir}: {e}"));
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&src_dir, &shim_dir)
+            .unwrap_or_else(|e| panic!("symlink {src_dir} -> {shim_dir}: {e}"));
+        return (root, shim_root);
+    }
+
+    panic!(
+        "FLINT at {root} contains neither lib/libflint.a (install-prefix \
+         layout) nor libflint.a (in-tree source-build layout). Set \
+         FLINT_DIR to a directory containing one of those, e.g. a \
+         flint source tree where `./configure --enable-static` then \
+         `make` has been run."
+    );
+}
+
+/// Resolve a Homebrew-installed library's root directory. Checks
+/// `<env_var>` first (so users can point at non-Homebrew locations)
+/// and falls back to `brew --prefix <pkg>`. Panics with an actionable
+/// message if neither resolves.
+fn resolve_lib_root(pkg: &str, env_var: &str) -> String {
+    println!("cargo:rerun-if-env-changed={env_var}");
+    if let Ok(p) = env::var(env_var) {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    let out = Command::new("brew").args(["--prefix", pkg]).output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8(o.stdout)
+                .unwrap_or_else(|e| panic!("brew --prefix {pkg}: utf8 decode failed: {e}"));
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                panic!(
+                    "brew --prefix {pkg} returned empty; install with `brew install {pkg}` \
+                     or set {env_var} to the install root containing lib/lib{pkg}.a"
+                );
+            }
+            trimmed.to_string()
+        }
+        Ok(o) => panic!(
+            "brew --prefix {pkg} failed (exit {:?}): {}; install with `brew install {pkg}` \
+             or set {env_var} to the install root containing lib/lib{pkg}.a",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => panic!(
+            "could not invoke `brew --prefix {pkg}`: {e}; install Homebrew and run \
+             `brew install {pkg}`, or set {env_var} to the install root containing \
+             lib/lib{pkg}.a"
+        ),
     }
 }

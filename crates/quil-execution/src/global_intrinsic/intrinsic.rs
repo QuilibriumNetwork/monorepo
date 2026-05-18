@@ -316,10 +316,157 @@ impl GlobalIntrinsic {
                 }
             }
             TYPE_FRAME_HEADER => {
-                // FrameHeader BLS aggregate signature is verified
-                // upstream at the consensus-layer frame validator
-                // before the bundle reaches here.
+                // FrameHeader carries a shard-coverage proof that
+                // governs `LastActiveFrameNumber` advancement (so the
+                // named participants escape eviction) and per-ring
+                // reward issuance. The previous comment claimed the
+                // BLS aggregate signature was "verified upstream at
+                // the consensus-layer frame validator" — that's only
+                // true for the *outer* GlobalFrame (whose validator
+                // is `BlsGlobalFrameValidator`). Bundled FrameHeader
+                // ops inside the global frame's request list were
+                // not signature-checked anywhere, so a global frame
+                // proposer could include FrameHeaders crediting
+                // arbitrary provers for shard work they never did.
+                //
+                // Full verification only runs when all crypto deps
+                // are installed (mirroring the `TYPE_PROVER_KICK`
+                // branch above). Otherwise we fall back to a
+                // structural-only check — the materializer side
+                // re-runs the same check via `invoke_frame_header`
+                // once the full deps are wired.
                 crate::global_engine::peek_global_message_kind(input)?;
+                let op = super::frame_header::FrameHeader::from_canonical_bytes(input)?;
+                if let (Some(pr), Some(fp), Some(bls)) = (
+                    self.prover_registry.as_deref(),
+                    self.frame_prover.as_deref(),
+                    self.bls_constructor.as_deref(),
+                ) {
+                    let sig = match op.public_key_signature_bls48581.is_empty() {
+                        true => return Err(QuilError::InvalidArgument(
+                            "FrameHeader op missing BLS aggregate signature".into(),
+                        )),
+                        false => crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
+                            &op.public_key_signature_bls48581,
+                        ).map_err(|e| QuilError::InvalidArgument(format!(
+                            "FrameHeader: aggregate signature decode failed: {e}"
+                        )))?,
+                    };
+                    // Materialize the wire FrameHeader for the
+                    // signature-verification helper. The op we hold
+                    // is the global-intrinsic carrier; the helper
+                    // expects the proto shape that the consensus
+                    // engine signs over.
+                    let header = quil_types::proto::global::FrameHeader {
+                        address: op.address.clone(),
+                        frame_number: op.frame_number,
+                        timestamp: op.timestamp,
+                        difficulty: op.difficulty,
+                        fee_multiplier_vote: op.fee_multiplier_vote as u64,
+                        parent_selector: op.parent_selector.clone(),
+                        requests_root: op.requests_root.clone(),
+                        state_roots: op.state_roots.clone(),
+                        prover: op.prover.clone(),
+                        output: op.output.clone(),
+                        rank: op.rank,
+                        public_key_signature_bls48581: Some(
+                            quil_types::proto::keys::Bls48581AggregateSignature {
+                                public_key: Some(
+                                    quil_types::proto::keys::Bls48581g2PublicKey {
+                                        key_value: sig.public_key.as_ref()
+                                            .map(|k| k.key_value.clone())
+                                            .unwrap_or_default(),
+                                    },
+                                ),
+                                signature: sig.signature.clone(),
+                                bitmask: sig.bitmask.clone(),
+                            },
+                        ),
+                    };
+
+                    // Aggregate-pubkey consistency check: the bitmask
+                    // names a subset of active provers, and their
+                    // pubkey aggregate must equal the signature's
+                    // declared aggregate pubkey. Mirrors what the
+                    // outer frame validator does for GlobalFrame.
+                    let active = pr.get_active_provers(&op.address).map_err(|e| {
+                        QuilError::Internal(format!(
+                            "FrameHeader: get_active_provers: {e}"
+                        ))
+                    })?;
+                    let participant_indices: Vec<usize> =
+                        quil_consensus::bitmask::set_bit_indices(&sig.bitmask).collect();
+                    let (_throwaway_signer, throwaway_pub) = bls
+                        .new_key()
+                        .map_err(|e| QuilError::Crypto(format!(
+                            "FrameHeader: throwaway key: {e}"
+                        )))?;
+                    let mut active_pks: Vec<&[u8]> = Vec::new();
+                    let mut throwaway_list: Vec<&[u8]> = Vec::new();
+                    for (i, prover) in active.iter().enumerate() {
+                        if participant_indices.contains(&i) {
+                            active_pks.push(&prover.public_key);
+                            throwaway_list.push(&throwaway_pub);
+                        }
+                    }
+                    let aggregate = bls
+                        .aggregate(&active_pks, &throwaway_list)
+                        .map_err(|e| QuilError::Crypto(format!(
+                            "FrameHeader: aggregate: {e}"
+                        )))?;
+                    let sig_pubkey_bytes: &[u8] = sig.public_key.as_ref()
+                        .map(|k| k.key_value.as_slice())
+                        .unwrap_or(&[]);
+                    if aggregate.public_key.as_slice() != sig_pubkey_bytes {
+                        return Err(QuilError::Crypto(
+                            "FrameHeader: aggregate pubkey does not match signature's declared pubkey".into(),
+                        ));
+                    }
+
+                    // BLS aggregate signature + per-signer VDF
+                    // multiproof verification. App shard frame
+                    // signatures are dual: signature[0..74] is the
+                    // BLS aggregate that proves "the committee
+                    // collectively signed this frame", and
+                    // signature[74..] is a tail of per-signer
+                    // Wesolowski multiproofs (one 516-byte proof per
+                    // set bit in `bitmask`), each tying a specific
+                    // signer's address to the challenge
+                    // `SHA3-256(parent_selector)` under the frame
+                    // difficulty. Passing the active prover
+                    // addresses as `ids` triggers the multiproof
+                    // tail check inside
+                    // `verify_frame_header_signature` (mirroring
+                    // Go's `global_prover_shard_update.go:265-282`
+                    // which calls
+                    // `frameProver.VerifyFrameHeader(header, bls,
+                    // ids)` with the same ids).
+                    //
+                    // Without the multiproof check an attacker who
+                    // can shape the bitmask + aggregate pubkey to
+                    // match a real committee subset can still claim
+                    // shard coverage without any signer actually
+                    // doing the per-slot Wesolowski work. With it,
+                    // each named participant must have produced
+                    // their own valid VDF proof.
+                    let ids: Vec<&[u8]> = active
+                        .iter()
+                        .map(|p| p.address.as_slice())
+                        .collect();
+                    match fp.verify_frame_header_signature(&header, bls, Some(&ids)) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(QuilError::Crypto(
+                                "FrameHeader: BLS signature / multiproof verification rejected".into(),
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(QuilError::Crypto(format!(
+                                "FrameHeader: BLS signature / multiproof verification: {e}"
+                            )));
+                        }
+                    }
+                }
                 Ok(true)
             }
             _ => Err(QuilError::InvalidArgument(format!(

@@ -18,6 +18,7 @@ pub mod materialize;
 pub mod metadata_schema;
 pub mod mint;
 pub mod pending;
+pub mod spent_check;
 pub mod transaction;
 pub mod verify;
 
