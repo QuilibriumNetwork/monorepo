@@ -947,7 +947,7 @@ name = "classgroup"
 version = "0.1.0"
 dependencies = [
  "cc",
- "criterion 0.5.1",
+ "criterion 0.3.6",
  "libc",
  "num-traits",
 ]
@@ -2269,7 +2269,7 @@ dependencies = [
  "hyper 1.9.0",
  "libc",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2786,8 +2786,6 @@ dependencies = [
 [[package]]
 name = "libp2p-kad"
 version = "0.46.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ced237d0bd84bbebb7c2cad4c073160dacb4fe40534963c32ed6d4c6bb7702a3"
 dependencies = [
  "arrayvec",
  "asynchronous-codec",
@@ -4334,7 +4332,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
@@ -4371,7 +4369,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -5905,7 +5903,7 @@ version = "0.1.0"
 dependencies = [
  "bit-vec",
  "classgroup",
- "criterion 0.5.1",
+ "criterion 0.3.6",
  "hex 0.3.2",
  "num-traits",
  "sha2 0.8.2",

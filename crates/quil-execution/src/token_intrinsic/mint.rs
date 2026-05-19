@@ -1548,9 +1548,13 @@ pub struct PomwRewardContext {
     /// domain this is the frame's `ProverTreeCommitment`; for any
     /// other token domain it's the `vertex_adds` shard commit.
     pub reward_root: Vec<u8>,
-    /// The address to hash into the leaf commit derivation. For QUIL
-    /// this is `poseidon(QUIL_TOKEN_ADDRESS || poseidon(pubkey))`;
-    /// otherwise it's `poseidon(pubkey)`.
+    /// The leaf's on-chain address — bound to the OWNER prover
+    /// (the prover whose work produced the reward), not the signer.
+    /// For QUIL this is `poseidon(QUIL_TOKEN_ADDRESS ‖ owner_address)`;
+    /// for other tokens it's the owner address directly. Spend
+    /// authority is enforced by a separate `DelegateAddress` field
+    /// check inside `verify_pomw_input`, not by binding the address
+    /// to the signer's pubkey.
     pub delegated_address: [u8; 32],
     /// The domain to use when verifying the traversal proof. For
     /// QUIL this is `GLOBAL_INTRINSIC_ADDRESS` (0xFF × 32); for
@@ -1559,44 +1563,55 @@ pub struct PomwRewardContext {
 }
 
 /// Compute the address + root domain derivations from the tx domain
-/// and delegated pubkey. Extracted for easy testing.
+/// and the OWNER prover address. The on-chain reward vertex's leaf
+/// key is bound to the owner (the prover whose work produced the
+/// rewards), independent of who is signing the spend — this is what
+/// makes delegate-spend work without rewriting the leaf.
 ///
-/// Mirrors the Go branch at `token_intrinsic_mint_transaction.go:
-/// 1732-1794`.
+/// Diverges from the original derivation, which hashed the signer's
+/// pubkey here and effectively pinned spend authority to "signer is
+/// the prover themselves". Spend authority is now enforced by a
+/// separate check on the leaf's `DelegateAddress` field (see
+/// `verify_pomw_input` step 11) rather than baked into the leaf
+/// address.
 pub fn derive_pomw_addressing(
     tx_domain: &[u8],
-    delegated_pubkey: &[u8],
-) -> Result<(/* prover_root_domain */ [u8; 32], /* delegated_address */ [u8; 32])> {
+    owner_prover_address: &[u8],
+) -> Result<(/* prover_root_domain */ [u8; 32], /* leaf_owner_address */ [u8; 32])> {
     if tx_domain.len() != 32 {
         return Err(QuilError::InvalidArgument(format!(
             "pomw: tx domain must be 32 bytes, got {}",
             tx_domain.len()
         )));
     }
-    if delegated_pubkey.len() != BLS48581_G2_PUBKEY_LEN {
+    if owner_prover_address.len() != PROVER_ADDR_LEN {
         return Err(QuilError::InvalidArgument(format!(
-            "pomw: delegated pubkey must be {} bytes, got {}",
-            BLS48581_G2_PUBKEY_LEN,
-            delegated_pubkey.len()
+            "pomw: owner prover address must be {} bytes, got {}",
+            PROVER_ADDR_LEN,
+            owner_prover_address.len()
         )));
     }
-
-    let base_addr = quil_crypto::poseidon::hash_bytes_to_32(delegated_pubkey)?;
 
     let mut prover_root_domain = [0u8; 32];
     prover_root_domain.copy_from_slice(&tx_domain[..32]);
 
     if tx_domain == QUIL_TOKEN_ADDR {
-        // QUIL special case: reroot under the global intrinsic
-        // domain and rehash address with the QUIL token prefix.
+        // QUIL special case: reward leaves live under the global
+        // intrinsic domain at `poseidon(QUIL_TOKEN_ADDR ‖ owner)`
+        // — exactly where `materialize::reward_address` writes them
+        // at join time.
         prover_root_domain = GLOBAL_ADDR;
         let mut preimage = Vec::with_capacity(64);
         preimage.extend_from_slice(&QUIL_TOKEN_ADDR);
-        preimage.extend_from_slice(&base_addr);
-        let delegated = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
-        Ok((prover_root_domain, delegated))
+        preimage.extend_from_slice(owner_prover_address);
+        let leaf_owner_address = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+        Ok((prover_root_domain, leaf_owner_address))
     } else {
-        Ok((prover_root_domain, base_addr))
+        // Non-QUIL: the leaf-owner address is the owner prover
+        // address directly under the token's domain.
+        let mut leaf_owner_address = [0u8; 32];
+        leaf_owner_address.copy_from_slice(owner_prover_address);
+        Ok((prover_root_domain, leaf_owner_address))
     }
 }
 
@@ -1771,15 +1786,23 @@ pub fn verify_pomw_input(
     // 5. Decode the traversal proof from proofs[0].
     let traversal = parse_go_traversal_proof(&input.proofs[0])?;
 
-    // 6. Extract delegated pubkey and BLS signature.
+    // 6. Extract owner prover address, signer pubkey, and BLS sig.
+    // `pubkey` is the SIGNER's pubkey (may be the prover's own or a
+    // configured delegate's). `owner_prover_address` is the prover
+    // whose reward vertex is being spent — the leaf address derives
+    // from this, not from the signer's pubkey.
+    let owner_prover_address = &input.proofs[1][..PROVER_ADDR_LEN];
     let pubkey = &input.proofs[1][PROVER_ADDR_LEN..PROVER_ADDR_LEN + BLS48581_G2_PUBKEY_LEN];
     let signature =
         &input.proofs[1][PROVER_ADDR_LEN + BLS48581_G2_PUBKEY_LEN
             ..PROVER_ADDR_LEN + BLS48581_G2_PUBKEY_LEN + BLS48581_G1_SIG_LEN];
 
-    // 7. Compute the addressing derivation.
-    let (prover_root_domain, delegated_address) =
-        derive_pomw_addressing(tx_domain, pubkey)?;
+    // 7. Compute the addressing derivation. `leaf_owner_address` is
+    // the reward vertex's location on chain — bound to the owner,
+    // not the signer. Spend authority is verified separately in
+    // step 11 below by reading the leaf's `DelegateAddress` field.
+    let (prover_root_domain, leaf_owner_address) =
+        derive_pomw_addressing(tx_domain, owner_prover_address)?;
 
     // 8. Verify the traversal proof against `reward_root`.
     if !verify_traversal_proof(inclusion_prover, reward_root, &traversal)? {
@@ -1829,17 +1852,69 @@ pub fn verify_pomw_input(
         ));
     }
 
-    // 10. Verify address derivation at the leaf.
+    // 10. Verify address derivation at the leaf. The recomputed leaf
+    // commit uses the OWNER-derived address — proving the
+    // `last_y` blob is the reward vertex content for this prover's
+    // on-chain leaf.
     verify_pomw_address_derivation(
         &prover_root_domain,
-        &delegated_address,
+        &leaf_owner_address,
         last_y,
         last_commit,
     )?;
 
-    // 11. BLS48-581 G2 signature over Signature[56*4..56*5] (the key
+    // 11. Spend authority. Parse the leaf value (`last_y`) as the
+    // reward sub-tree, read its `DelegateAddress` field, and verify
+    // `poseidon(signer_pubkey) == DelegateAddress`. This is the
+    // single rule that covers both self-spend and delegate-spend:
+    //
+    //   * Self-spend: the owner never configured a delegate. Join-time
+    //     materialize wrote `DelegateAddress = prover.address =
+    //     poseidon(prover_pubkey)`. The signer is the prover, so
+    //     `poseidon(signer_pubkey) == DelegateAddress` holds.
+    //
+    //   * Delegate-spend: the owner set `delegate_address =
+    //     poseidon(delegate_pubkey)` via `ProverJoin.DelegateAddress`
+    //     (or rotated to it via `ProverUpdate`). Only a signer whose
+    //     pubkey hashes to the configured delegate address can pass
+    //     this check.
+    //
+    // The original derivation (pre-fork) baked spend authority into
+    // the leaf address by deriving it from `poseidon(signer_pubkey)`,
+    // which made the `DelegateAddress` field informational only. This
+    // hard-fork change moves authority out of the address into an
+    // explicit check, letting delegate-spend actually work.
+    let signer_addr = quil_crypto::poseidon::hash_bytes_to_32(pubkey)?;
+    let leaf_subtree = crate::prover_registry::rebuild_vertex_tree_from_blob(last_y);
+    let delegate_address_field = crate::global_schema::read_field(
+        &leaf_subtree,
+        "reward:ProverReward",
+        "DelegateAddress",
+    )
+    .ok_or_else(|| {
+        QuilError::InvalidArgument(
+            "pomw: reward vertex missing DelegateAddress field".into(),
+        )
+    })?;
+    if delegate_address_field.len() != 32 {
+        return Err(QuilError::InvalidArgument(format!(
+            "pomw: reward vertex DelegateAddress is {} bytes (expected 32)",
+            delegate_address_field.len()
+        )));
+    }
+    if signer_addr.as_slice() != delegate_address_field.as_slice() {
+        return Err(QuilError::InvalidArgument(
+            "pomw: signer pubkey does not match the reward vertex's DelegateAddress \
+             (signer is neither the owner nor the configured delegate)"
+                .into(),
+        ));
+    }
+
+    // 12. BLS48-581 G2 signature over Signature[56*4..56*5] (the key
     // image / point component of the hidden signature), keyed by
-    // `pubkey` and signed under tx_domain.
+    // `pubkey` and signed under tx_domain. Proves the signer holds
+    // the private key for the `pubkey` whose hash we just matched
+    // against `DelegateAddress`.
     let key_image = &input.signature[4 * DECAF_ELEM_LEN..5 * DECAF_ELEM_LEN];
     let bls_ok = key_manager.validate_signature(
         KeyType::Bls48581G1,

@@ -62,14 +62,27 @@ case "$os_type" in
     "Darwin")
         # Check if the architecture is ARM
         if [[ "$(uname -m)" == "arm64" ]]; then
-            # MacOS ld doesn't support -Bstatic and -Bdynamic, so it's
-            # important that there is only a static version of the
-            # library available at the resolved path. The hardcoded
-            # `/usr/local/lib` + `Cellar/openssl@3/3.6.1` paths that
-            # were here previously broke on every Homebrew minor-
-            # version bump and were wrong for the Apple Silicon
-            # `/opt/homebrew` layout — `brew --prefix` returns the
-            # stable per-package symlink that survives upgrades.
+            # macOS `ld` has no `-Bstatic` / `-Bdynamic` toggles and,
+            # given both forms in the same `-L` directory, prefers
+            # `.dylib` over `.a`. That's how we ended up shipping a
+            # qclient with a runtime dependency on `libchannel.dylib`
+            # — the `channel` crate declares
+            # `crate-type = ["lib", "staticlib", "cdylib"]`, so
+            # `cargo build --release` produces both
+            # `target/release/libchannel.a` AND
+            # `.../libchannel.dylib`, and `-lchannel` quietly picked
+            # the dynamic one. The hardcoded
+            # `/opt/homebrew/Cellar/openssl@3/3.6.1` path had the
+            # same hazard for the openssl libs — Homebrew ships
+            # both .a and .dylib in `lib/`.
+            #
+            # To force static linkage we pass each archive as an
+            # explicit absolute file path instead of `-l<name>`;
+            # macOS ld treats positional `.a` paths as archives,
+            # bypassing the dylib-preference rule entirely. Only
+            # `-lstdc++`, `-ldl`, `-lm` remain as `-l` flags — those
+            # are Apple system libraries that ship dylib-only and
+            # are always present on any macOS install.
             GMP_PREFIX="$(resolve_lib_prefix gmp GMP_DIR)"
             MPFR_PREFIX="$(resolve_lib_prefix mpfr MPFR_DIR)"
             OPENSSL_PREFIX="$(resolve_lib_prefix openssl@3 OPENSSL_DIR)"
@@ -79,6 +92,7 @@ case "$os_type" in
             # layout (`<dir>/libflint.a`). Otherwise fall back to
             # Homebrew's dynamic libflint.
             FLINT_LIB_DIR=""
+            FLINT_STATIC_OK=1
             if [[ -n "${FLINT_DIR:-}" ]]; then
                 if [[ -f "$FLINT_DIR/lib/libflint.a" ]]; then
                     FLINT_LIB_DIR="$FLINT_DIR/lib"
@@ -90,8 +104,70 @@ case "$os_type" in
                 fi
             else
                 FLINT_LIB_DIR="$(resolve_lib_prefix flint FLINT_DIR)/lib"
+                if [[ ! -f "$FLINT_LIB_DIR/libflint.a" ]]; then
+                    FLINT_STATIC_OK=0
+                fi
             fi
-            go build -ldflags "-linkmode 'external' -extldflags '-L$BINARIES_DIR -L$FLINT_LIB_DIR -L$GMP_PREFIX/lib -L$MPFR_PREFIX/lib -L$OPENSSL_PREFIX/lib -lbls48581 -lvdf -lchannel -lferret -lverenc -lbulletproofs -ldl -lm -lflint -lgmp -lmpfr -lstdc++ -lcrypto -lssl'" "$@"
+
+            # Sanity-check: every Rust-side archive must exist at the
+            # exact path we're about to pass to ld. Fail loudly if
+            # cargo hasn't been run yet — better than a confusing
+            # linker error.
+            for name in vdf channel ferret verenc bulletproofs bls48581; do
+                if [[ ! -f "$BINARIES_DIR/lib${name}.a" ]]; then
+                    echo "client/build.sh: missing $BINARIES_DIR/lib${name}.a — run \`cargo build --release\` first" >&2
+                    exit 1
+                fi
+            done
+
+            # Same check for the native static archives. The libgmp
+            # / libmpfr / libcrypto / libssl `.a` files all ship with
+            # their respective Homebrew formulas (and with any
+            # standard `make install --prefix=...` build).
+            for path in \
+                "$GMP_PREFIX/lib/libgmp.a" \
+                "$MPFR_PREFIX/lib/libmpfr.a" \
+                "$OPENSSL_PREFIX/lib/libcrypto.a" \
+                "$OPENSSL_PREFIX/lib/libssl.a"
+            do
+                if [[ ! -f "$path" ]]; then
+                    echo "client/build.sh: missing static archive $path" >&2
+                    exit 1
+                fi
+            done
+
+            # Build the explicit archive list. Order matters: callers
+            # before callees (libbls48581 / libvdf / libchannel /
+            # libferret / libverenc / libbulletproofs depend on
+            # libflint / libgmp / libmpfr / libcrypto / libssl).
+            archives=(
+                "$BINARIES_DIR/libbls48581.a"
+                "$BINARIES_DIR/libvdf.a"
+                "$BINARIES_DIR/libchannel.a"
+                "$BINARIES_DIR/libferret.a"
+                "$BINARIES_DIR/libverenc.a"
+                "$BINARIES_DIR/libbulletproofs.a"
+            )
+            if [[ "$FLINT_STATIC_OK" == "1" ]]; then
+                archives+=("$FLINT_LIB_DIR/libflint.a")
+            fi
+            archives+=(
+                "$GMP_PREFIX/lib/libgmp.a"
+                "$MPFR_PREFIX/lib/libmpfr.a"
+                "$OPENSSL_PREFIX/lib/libcrypto.a"
+                "$OPENSSL_PREFIX/lib/libssl.a"
+            )
+
+            extldflags="${archives[*]} -ldl -lm -lstdc++"
+            # Fallback flint linkage when no static archive is
+            # available — emits a dylib dependency the binary
+            # carries at runtime. Document the gap loudly.
+            if [[ "$FLINT_STATIC_OK" != "1" ]]; then
+                extldflags="-L$FLINT_LIB_DIR -lflint $extldflags"
+                echo "client/build.sh: warning — linking libflint DYNAMICALLY (no libflint.a found at $FLINT_LIB_DIR); produced binary will need libflint.dylib at runtime" >&2
+            fi
+
+            go build -ldflags "-linkmode 'external' -extldflags '$extldflags'" "$@"
         else
             echo "Unsupported platform"
             exit 1

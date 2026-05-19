@@ -62,6 +62,15 @@ libp2p-identity = { path = "crates/libp2p-identity" }
 # still has the bug. See the crate's
 # `src/v1/behaviour/as_server.rs` for the patched lines.
 libp2p-autonat = { path = "crates/libp2p-autonat" }
+# Local patch for libp2p-kad 0.46.2 (the version libp2p 0.54.1
+# pulls in transitively) — bumps the per-handler
+# `MAX_NUM_STREAMS` cap from 32 to 256 so a single peer can hold
+# more simultaneous inbound kad substreams. The upstream constant
+# is private and unconfigurable; on a busy DHT the 32-cap caused
+# warnings at handler.rs:534 ("New inbound substream … exceeds
+# inbound substream limit. … Dropping new substream.") and lost
+# DHT queries. See `crates/libp2p-kad/src/handler.rs:43`.
+libp2p-kad = { path = "crates/libp2p-kad" }
 
 [profile.release]
 # rpath = false is important to make Go bindings work
