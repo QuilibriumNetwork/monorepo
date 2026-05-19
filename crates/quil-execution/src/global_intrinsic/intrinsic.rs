@@ -504,22 +504,46 @@ impl GlobalIntrinsic {
         match type_prefix {
             TYPE_PROVER_PAUSE => {
                 let op = ProverPause::from_canonical_bytes(input)?;
-                self.invoke_filter_op(frame_number, &op.filter, &op.public_key_signature_bls48581, state, &va_disc, |alloc_tree, fn_| {
-                    materialize::materialize_prover_pause(alloc_tree, fn_)
-                })
+                self.invoke_filter_op(
+                    frame_number,
+                    &op.filter,
+                    &op.public_key_signature_bls48581,
+                    state,
+                    &va_disc,
+                    |prover_tree, alloc_tree| verify::verify_prover_pause(
+                        &op, prover_tree, alloc_tree, self.key_manager.as_ref(),
+                    ),
+                    |alloc_tree, fn_| materialize::materialize_prover_pause(alloc_tree, fn_),
+                )
             }
             TYPE_PROVER_RESUME => {
                 let op = ProverResume::from_canonical_bytes(input)?;
-                self.invoke_filter_op(frame_number, &op.filter, &op.public_key_signature_bls48581, state, &va_disc, |alloc_tree, fn_| {
-                    materialize::materialize_prover_resume(alloc_tree, fn_)
-                })
+                self.invoke_filter_op(
+                    frame_number,
+                    &op.filter,
+                    &op.public_key_signature_bls48581,
+                    state,
+                    &va_disc,
+                    |prover_tree, alloc_tree| verify::verify_prover_resume(
+                        &op, prover_tree, alloc_tree, self.key_manager.as_ref(),
+                    ),
+                    |alloc_tree, fn_| materialize::materialize_prover_resume(alloc_tree, fn_),
+                )
             }
             TYPE_PROVER_LEAVE => {
                 let op = ProverLeave::from_canonical_bytes(input)?;
                 for filter in &op.filters {
-                    self.invoke_filter_op(frame_number, filter, &op.public_key_signature_bls48581, state, &va_disc, |alloc_tree, fn_| {
-                        materialize::materialize_prover_leave(alloc_tree, fn_)
-                    })?;
+                    self.invoke_filter_op(
+                        frame_number,
+                        filter,
+                        &op.public_key_signature_bls48581,
+                        state,
+                        &va_disc,
+                        |prover_tree, _alloc_tree| verify::verify_prover_leave(
+                            &op, prover_tree, self.key_manager.as_ref(),
+                        ),
+                        |alloc_tree, fn_| materialize::materialize_prover_leave(alloc_tree, fn_),
+                    )?;
                 }
                 Ok(())
             }
@@ -528,19 +552,37 @@ impl GlobalIntrinsic {
                 // Confirm applies to each filter in the confirm message.
                 // Validate timing window (360-720 frames) before materializing.
                 for filter in &op.filters {
-                    self.invoke_filter_op(frame_number, filter, &op.public_key_signature_bls48581, state, &va_disc, |alloc_tree, fn_| {
-                        // Check timing constraints first
-                        verify::validate_confirm_timing(fn_, alloc_tree)?;
-                        materialize::materialize_prover_confirm(alloc_tree, fn_)
-                    })?;
+                    self.invoke_filter_op(
+                        frame_number,
+                        filter,
+                        &op.public_key_signature_bls48581,
+                        state,
+                        &va_disc,
+                        |prover_tree, _alloc_tree| verify::verify_prover_confirm(
+                            &op, prover_tree, self.key_manager.as_ref(),
+                        ),
+                        |alloc_tree, fn_| {
+                            // Check timing constraints first
+                            verify::validate_confirm_timing(fn_, alloc_tree)?;
+                            materialize::materialize_prover_confirm(alloc_tree, fn_)
+                        },
+                    )?;
                 }
                 Ok(())
             }
             TYPE_PROVER_REJECT => {
                 let op = ProverReject::from_canonical_bytes(input)?;
-                self.invoke_filter_op(frame_number, &op.filter, &op.public_key_signature_bls48581, state, &va_disc, |alloc_tree, fn_| {
-                    materialize::materialize_prover_reject(alloc_tree, fn_)
-                })
+                self.invoke_filter_op(
+                    frame_number,
+                    &op.filter,
+                    &op.public_key_signature_bls48581,
+                    state,
+                    &va_disc,
+                    |prover_tree, _alloc_tree| verify::verify_prover_reject(
+                        &op, prover_tree, self.key_manager.as_ref(),
+                    ),
+                    |alloc_tree, fn_| materialize::materialize_prover_reject(alloc_tree, fn_),
+                )
             }
             TYPE_PROVER_JOIN => {
                 let op = ProverJoin::from_canonical_bytes(input)?;
@@ -608,6 +650,10 @@ impl GlobalIntrinsic {
         addressed_sig: &Option<super::addressed_signature::AddressedSignature>,
         state: &HypergraphState,
         va_disc: &[u8; 32],
+        verify_sig: impl FnOnce(
+            &quil_tries::VectorCommitmentTree,
+            Option<&quil_tries::VectorCommitmentTree>,
+        ) -> Result<bool>,
         mutate: impl FnOnce(&mut quil_tries::VectorCommitmentTree, u64) -> Result<()>,
     ) -> Result<()> {
         let prover_address = addressed_sig
@@ -646,6 +692,19 @@ impl GlobalIntrinsic {
             .ok_or_else(|| QuilError::InvalidArgument("invoke_step: allocation not found".into()))?;
 
         let mut alloc_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&alloc_data);
+
+        // Defense-in-depth: re-run the op-specific signature verification
+        // against the freshly loaded prover/alloc trees. The engine-side
+        // `validate()` already runs this at message-admission time, but
+        // it returns Ok(true) for filter ops when the prover tree wasn't
+        // loadable from state (intrinsic.rs:178-247). The materializer
+        // is the last gate before state mutation — verify here so a
+        // future validate-side bypass can't admit unsigned ops.
+        if !verify_sig(&prover_tree, Some(&alloc_tree))? {
+            return Err(QuilError::InvalidArgument(
+                "invoke_step: signature verification failed at materialize".into(),
+            ));
+        }
 
         // Apply the mutation
         mutate(&mut alloc_tree, frame_number)?;
@@ -970,8 +1029,36 @@ impl GlobalIntrinsic {
         frame_number: u64,
         op: &super::prover_ops::ProverUpdate,
         state: &HypergraphState,
-        _va_disc: &[u8; 32],
+        va_disc: &[u8; 32],
     ) -> Result<()> {
+        // Defense-in-depth signature re-verification — see invoke_filter_op
+        // for the rationale. `validate()` may have returned Ok(true) without
+        // checking the signature if the prover tree wasn't loadable from
+        // state at admission time.
+        let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
+            QuilError::InvalidArgument("invoke_update: missing signature".into())
+        })?;
+        if sig.address.len() != 32 {
+            return Err(QuilError::InvalidArgument(
+                "invoke_update: invalid prover address length".into(),
+            ));
+        }
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+        let prover_data = state.get(domain, &sig.address, va_disc)?.ok_or_else(|| {
+            QuilError::InvalidArgument("invoke_update: prover not found".into())
+        })?;
+        if prover_data.is_empty() {
+            return Err(QuilError::InvalidArgument(
+                "invoke_update: prover has no data".into(),
+            ));
+        }
+        let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
+        if !verify::verify_prover_update(op, &prover_tree, self.key_manager.as_ref())? {
+            return Err(QuilError::InvalidArgument(
+                "invoke_update: signature verification failed at materialize".into(),
+            ));
+        }
+
         super::prover_update_materialize::materialize_prover_update(op, frame_number, state)
     }
 

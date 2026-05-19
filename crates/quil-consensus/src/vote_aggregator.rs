@@ -160,6 +160,14 @@ struct VoteCollectorsInner<S: Unique, V: Unique> {
     collectors: HashMap<u64, Arc<dyn VoteCollector<S, V>>>,
 }
 
+/// Upper bound on how far ahead of `lowest_retained_rank` a peer-supplied
+/// rank may go before we refuse to allocate a collector for it. Without
+/// this, a misbehaving peer can flood proposals/votes at attacker-set
+/// ranks (`u64::MAX`) and balloon `collectors` because pruning only
+/// catches up when QCs finalize. 1024 ranks is generous for any
+/// realistic pipeline depth while keeping the per-shard map bounded.
+pub const MAX_RANK_LOOKAHEAD: u64 = 1024;
+
 impl<S: Unique, V: Unique> VoteCollectors<S, V> {
     pub fn new(lowest_retained_rank: u64, factory: VoteCollectorFactory<S, V>) -> Self {
         Self {
@@ -175,7 +183,8 @@ impl<S: Unique, V: Unique> VoteCollectors<S, V> {
     /// - `Ok((collector, created))` — `created == true` if the collector
     ///   was newly constructed.
     /// - `Err(QuilError::NotFound)` — if `rank` is below the pruning
-    ///   threshold. The Go side uses a dedicated `BelowPrunedThresholdError`
+    ///   threshold or above `lowest_retained_rank + MAX_RANK_LOOKAHEAD`.
+    ///   The Go side uses a dedicated `BelowPrunedThresholdError`
     ///   sentinel; we reuse `NotFound` for now and the caller is expected
     ///   to swallow it.
     pub fn get_or_create(&self, rank: u64) -> Result<(Arc<dyn VoteCollector<S, V>>, bool)> {
@@ -186,6 +195,12 @@ impl<S: Unique, V: Unique> VoteCollectors<S, V> {
                 return Err(QuilError::NotFound(format!(
                     "cannot retrieve collector for pruned rank {} (lowest retained rank {})",
                     rank, guard.lowest_retained_rank
+                )));
+            }
+            if rank > guard.lowest_retained_rank.saturating_add(MAX_RANK_LOOKAHEAD) {
+                return Err(QuilError::NotFound(format!(
+                    "rank {} exceeds lookahead {} above lowest retained rank {}",
+                    rank, MAX_RANK_LOOKAHEAD, guard.lowest_retained_rank
                 )));
             }
             if let Some(clr) = guard.collectors.get(&rank) {
@@ -207,6 +222,12 @@ impl<S: Unique, V: Unique> VoteCollectors<S, V> {
             return Err(QuilError::NotFound(format!(
                 "cannot retrieve collector for pruned rank {} (lowest retained rank {})",
                 rank, guard.lowest_retained_rank
+            )));
+        }
+        if rank > guard.lowest_retained_rank.saturating_add(MAX_RANK_LOOKAHEAD) {
+            return Err(QuilError::NotFound(format!(
+                "rank {} exceeds lookahead {} above lowest retained rank {}",
+                rank, MAX_RANK_LOOKAHEAD, guard.lowest_retained_rank
             )));
         }
         if let Some(clr) = guard.collectors.get(&rank) {

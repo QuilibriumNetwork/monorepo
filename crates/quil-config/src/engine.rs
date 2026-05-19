@@ -111,7 +111,14 @@ fn default_worker_base_stream_port() -> u16 { 32500 }
 fn default_worker_memory_limit() -> i64 { 1792 * 1024 * 1024 }
 fn default_sync_timeout_ms() -> u64 { 4000 }
 fn default_sync_candidates() -> i32 { 8 }
-fn default_sync_msg_limit() -> i32 { 600 * 1024 * 1024 }
+// 64 MiB — matches the de-facto cap hardcoded in
+// `quil-rpc/src/hypergraph_sync_probe.rs`. Was 600 MiB before, which
+// is far larger than any legitimate sync message and would have been
+// a DoS amplifier (a malicious peer could send a single ~half-gig
+// payload and force us to allocate before failing). The `sync_message_limits`
+// field isn't wired into any tonic client yet, but anyone who wires
+// it up later will inherit this sane default.
+fn default_sync_msg_limit() -> i32 { 64 * 1024 * 1024 }
 fn default_reward_strategy() -> String { "reward-greedy".into() }
 fn default_alert_key() -> String {
     "3ade80f96515e34caaf0c346b842d1f82d2841840f27e12826f4c14326a6bd15d13796c0421f8c440809fceb66c0a5c3c88f93deae16ee3100".into()

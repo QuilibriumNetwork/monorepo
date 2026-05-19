@@ -594,7 +594,7 @@ engine:
     #[test]
     fn grpc_message_limits_defaults_scale_with_sync_limit() {
         let g = GrpcMessageLimitsConfig::default();
-        let expected = 600 * 1024 * 1024;
+        let expected = 64 * 1024 * 1024;
         assert_eq!(g.max_recv_msg_size, expected);
         assert_eq!(g.max_send_msg_size, expected);
     }

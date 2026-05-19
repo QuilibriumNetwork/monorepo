@@ -63,6 +63,19 @@ impl<V: Unique> TimeoutCollectors<V> {
                     rank, guard.lowest_retained_rank
                 )));
             }
+            // Mirror VoteCollectors::MAX_RANK_LOOKAHEAD: reject ranks far
+            // above the prune cursor so a peer can't flood our map with
+            // attacker-set future ranks (e.g., u64::MAX).
+            if rank > guard.lowest_retained_rank.saturating_add(
+                crate::vote_aggregator::MAX_RANK_LOOKAHEAD,
+            ) {
+                return Err(QuilError::NotFound(format!(
+                    "rank {} exceeds lookahead {} above lowest retained rank {}",
+                    rank,
+                    crate::vote_aggregator::MAX_RANK_LOOKAHEAD,
+                    guard.lowest_retained_rank
+                )));
+            }
             if let Some(clr) = guard.collectors.get(&rank) {
                 return Ok((Arc::clone(clr), false));
             }
@@ -80,6 +93,16 @@ impl<V: Unique> TimeoutCollectors<V> {
             return Err(QuilError::NotFound(format!(
                 "cannot retrieve collector for pruned rank {} (lowest retained rank {})",
                 rank, guard.lowest_retained_rank
+            )));
+        }
+        if rank > guard.lowest_retained_rank.saturating_add(
+            crate::vote_aggregator::MAX_RANK_LOOKAHEAD,
+        ) {
+            return Err(QuilError::NotFound(format!(
+                "rank {} exceeds lookahead {} above lowest retained rank {}",
+                rank,
+                crate::vote_aggregator::MAX_RANK_LOOKAHEAD,
+                guard.lowest_retained_rank
             )));
         }
         if let Some(clr) = guard.collectors.get(&rank) {

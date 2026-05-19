@@ -8,7 +8,7 @@ use libp2p::swarm::NetworkBehaviour;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use quil_config::P2PConfig;
 use quil_types::error::QuilError;
@@ -248,27 +248,60 @@ impl P2PNode {
             })
             .build();
 
-        // Listen on QUIC and TCP (use configured or default port)
-        let port = listen_multiaddr.to_string()
-            .split('/')
-            .filter_map(|s| s.parse::<u16>().ok())
-            .last()
-            .unwrap_or(8336);
-
-        let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port)
-            .parse()
-            .unwrap();
-        match swarm.listen_on(quic_addr.clone()) {
-            Ok(_) => debug!(%quic_addr, "QUIC listener starting"),
-            Err(e) => debug!(error = format!("{:?}", e), "failed to start QUIC listener"),
+        // Respect the configured transport: a user who set
+        // `listen_multiaddr = "/ip4/0.0.0.0/tcp/8336"` doesn't want a
+        // QUIC listener silently bound on UDP/8336 too. Walk the
+        // configured multiaddr's protocol stack and only start the
+        // listeners it actually names; if neither TCP nor QUIC is
+        // present (e.g. malformed config), fall back to the historic
+        // "listen on both" default so we don't leave the node
+        // unreachable.
+        use libp2p::multiaddr::Protocol;
+        let mut want_tcp: Option<u16> = None;
+        let mut want_quic: Option<u16> = None;
+        let mut last_udp_port: Option<u16> = None;
+        for proto in listen_multiaddr.iter() {
+            match proto {
+                Protocol::Tcp(port) => want_tcp = Some(port),
+                Protocol::Udp(port) => last_udp_port = Some(port),
+                Protocol::QuicV1 | Protocol::Quic => {
+                    if let Some(p) = last_udp_port {
+                        want_quic = Some(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if want_tcp.is_none() && want_quic.is_none() {
+            let port = listen_multiaddr
+                .to_string()
+                .split('/')
+                .filter_map(|s| s.parse::<u16>().ok())
+                .last()
+                .unwrap_or(8336);
+            warn!(
+                listen = %listen_multiaddr,
+                fallback_port = port,
+                "listen multiaddr names no transport — defaulting to TCP+QUIC for backward compat"
+            );
+            want_tcp = Some(port);
+            want_quic = Some(port);
         }
 
-        let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port)
-            .parse()
-            .unwrap();
-        match swarm.listen_on(tcp_addr.clone()) {
-            Ok(_) => debug!(%tcp_addr, "TCP listener starting"),
-            Err(e) => debug!(error = format!("{:?}", e), "failed to start TCP listener"),
+        if let Some(port) = want_quic {
+            let quic_addr: Multiaddr =
+                format!("/ip4/0.0.0.0/udp/{}/quic-v1", port).parse().unwrap();
+            match swarm.listen_on(quic_addr.clone()) {
+                Ok(_) => debug!(%quic_addr, "QUIC listener starting"),
+                Err(e) => debug!(error = format!("{:?}", e), "failed to start QUIC listener"),
+            }
+        }
+        if let Some(port) = want_tcp {
+            let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse().unwrap();
+            match swarm.listen_on(tcp_addr.clone()) {
+                Ok(_) => debug!(%tcp_addr, "TCP listener starting"),
+                Err(e) => debug!(error = format!("{:?}", e), "failed to start TCP listener"),
+            }
         }
 
         let peer_id = self.peer_id;

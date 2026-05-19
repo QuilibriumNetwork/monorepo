@@ -14,7 +14,7 @@ use libp2p::swarm::{
     THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 use libp2p::{Multiaddr, PeerId};
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::blossomsub::CompositeMeshEntry;
 use crate::handler::{BlossomSubHandler, HandlerIn, HandlerOut};
@@ -385,6 +385,25 @@ impl BlossomSubBehaviour {
         for sub in &rpc.subscriptions {
             let subs = self.peer_subscriptions.entry(peer).or_default();
             if sub.subscribe {
+                // Per-peer subscription cap. Without this a peer can
+                // spam SUBSCRIBE for thousands of fake bitmasks and
+                // balloon `peer_subscriptions`. 256 is well above any
+                // reasonable composite-mesh slice fan-out (typical
+                // node subscribes to ~1-64 bitmasks).
+                const MAX_SUBSCRIPTIONS_PER_PEER: usize = 256;
+                if !subs.contains(&sub.bitmask)
+                    && subs.len() >= MAX_SUBSCRIPTIONS_PER_PEER
+                {
+                    debug!(
+                        %peer,
+                        bitmask = hex::encode(&sub.bitmask),
+                        existing = subs.len(),
+                        cap = MAX_SUBSCRIPTIONS_PER_PEER,
+                        "rejecting subscription: per-peer cap reached"
+                    );
+                    self.scorer.add_penalty(&peer, 1.0);
+                    continue;
+                }
                 if subs.insert(sub.bitmask.clone()) {
                     // INFO-level log if peer subscribes to a bitmask we also
                     // subscribe to (likely a master/validator).
@@ -505,6 +524,11 @@ impl BlossomSubBehaviour {
         // Control messages
         if let Some(control) = rpc.control {
             let mut composite_touched = false;
+            // Cache the score once per peer per handle_rpc call — Go's
+            // handleGraft does the same (line 984). The score doesn't
+            // change mid-iteration over a single peer's GRAFT batch.
+            let peer_score = self.scorer.score(&peer);
+            let now = Instant::now();
             for graft in &control.graft {
                 // A GRAFT is addressed to a slice bitmask. Accept it if
                 // either (a) we are subscribed to that exact bitmask
@@ -515,11 +539,78 @@ impl BlossomSubBehaviour {
                 let is_composite_slice =
                     self.slice_to_composite.contains_key(&graft.bitmask);
                 if !is_subscribed && !is_composite_slice {
+                    // Spam hardening: ignore GRAFTs for unknown bitmasks.
+                    // Mirrors Go's `handleGraft` early continue at
+                    // blossomsub.go:995-1000.
                     continue;
                 }
 
-                // Always add to the simple slice mesh — the per-slice
-                // mesh map is used for forwarding on the wire.
+                // We don't GRAFT to/from direct peers — they're always
+                // pinned in the mesh by config. A GRAFT from a direct
+                // peer is a misconfiguration; warn and ignore (Go:
+                // blossomsub.go:1008-1017).
+                if self.direct_peers.contains(&peer) {
+                    warn!(%peer, bitmask = hex::encode(&graft.bitmask),
+                        "GRAFT: ignoring request from direct peer");
+                    continue;
+                }
+
+                // Backoff enforcement: a previously-PRUNE'd peer must
+                // wait `prune_backoff` before re-GRAFTing. Re-GRAFT
+                // attempts add a behavioural penalty so repeat
+                // offenders get scored down. Mirrors Go's
+                // blossomsub.go:1020-1037.
+                if let Some(&expire) = self.backoffs.get(&(peer, graft.bitmask.clone())) {
+                    if now < expire {
+                        debug!(%peer, bitmask = hex::encode(&graft.bitmask),
+                            "GRAFT: ignoring backed-off peer");
+                        self.scorer.add_penalty(&peer, 1.0);
+                        // Refresh the backoff so the offender doesn't
+                        // get a free retry window.
+                        self.backoffs.insert(
+                            (peer, graft.bitmask.clone()),
+                            now + self.params.prune_backoff,
+                        );
+                        continue;
+                    }
+                }
+
+                // Score gate: never GRAFT a peer with negative score.
+                // Mirrors Go's blossomsub.go:1040-1050.
+                if peer_score < 0.0 {
+                    debug!(%peer, score = peer_score,
+                        bitmask = hex::encode(&graft.bitmask),
+                        "GRAFT: ignoring negative-score peer");
+                    self.backoffs.insert(
+                        (peer, graft.bitmask.clone()),
+                        now + self.params.prune_backoff,
+                    );
+                    continue;
+                }
+
+                // Dhi cap: refuse new mesh entries once the slice is
+                // saturated, unless the peer is one we dialed out to
+                // (defense against love-bombing / sybil takeover).
+                // Mirrors Go's blossomsub.go:1086-1093.
+                let mesh_len = self.mesh.get(&graft.bitmask).map(|m| m.len()).unwrap_or(0);
+                let is_outbound = self
+                    .outbound_peers
+                    .get(&graft.bitmask)
+                    .map_or(false, |s| s.contains(&peer));
+                if mesh_len >= self.params.d_hi && !is_outbound {
+                    debug!(%peer, mesh_len, d_hi = self.params.d_hi,
+                        bitmask = hex::encode(&graft.bitmask),
+                        "GRAFT: at Dhi for inbound peer");
+                    self.backoffs.insert(
+                        (peer, graft.bitmask.clone()),
+                        now + self.params.prune_backoff,
+                    );
+                    continue;
+                }
+
+                // All gates passed — add to the simple slice mesh.
+                // The per-slice mesh map is used for forwarding on
+                // the wire.
                 self.mesh
                     .entry(graft.bitmask.clone())
                     .or_default()
@@ -614,9 +705,23 @@ impl BlossomSubBehaviour {
             // the candidates list instead of issuing a duplicate
             // IWANT — when the current IWANT times out we'll switch
             // to one of these.
-            let now = Instant::now();
+            // IHAVE / IWANT score gating. Mirrors Go's `handleIHave`
+            // (blossomsub.go:858-864) and `handleIWant`
+            // (blossomsub.go:930-936): below-`gossip_threshold` peers
+            // are ignored for both directions so a low-scoring peer
+            // can't burn our bandwidth on gossip rounds. `peer_score`
+            // was already captured above for the GRAFT path.
+            let gossip_allowed =
+                peer_score >= self.scorer.thresholds.gossip_threshold;
+            if !gossip_allowed {
+                debug!(%peer, score = peer_score,
+                    "IHAVE/IWANT: ignoring below-threshold peer");
+            }
             let mut wanted: Vec<Vec<u8>> = Vec::new();
             for ihave in &control.ihave {
+                if !gossip_allowed {
+                    break;
+                }
                 for msg_id in &ihave.message_i_ds {
                     if self.seen_messages.contains(msg_id) {
                         continue;
@@ -673,8 +778,13 @@ impl BlossomSubBehaviour {
                 }
             }
 
-            // Serve IWANT requests from message cache
+            // Serve IWANT requests from message cache (only if peer is
+            // at/above the gossip threshold — see IHAVE/IWANT gate
+            // comment above).
             for iwant in &control.iwant {
+                if !gossip_allowed {
+                    break;
+                }
                 let mut msgs = Vec::new();
                 for msg_id in &iwant.message_i_ds {
                     if let Some((bitmask, data)) = self.mcache.get(msg_id) {

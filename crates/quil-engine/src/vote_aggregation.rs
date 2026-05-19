@@ -81,8 +81,13 @@ impl VoteAggregation {
     /// [`GlobalVote`]) to the collector for its rank.
     pub fn handle_vote(&self, vote: GlobalVote) {
         let rank = vote.rank();
-        if rank < self.min_active_rank.load(Ordering::Relaxed) {
+        let min = self.min_active_rank.load(Ordering::Relaxed);
+        if rank < min {
             debug!(rank, "dropping vote below finalized rank");
+            return;
+        }
+        if rank > min.saturating_add(quil_consensus::vote_aggregator::MAX_RANK_LOOKAHEAD) {
+            debug!(rank, min, "dropping vote far above finalized rank (lookahead exceeded)");
             return;
         }
         let collector = self.get_or_create(rank);
@@ -96,8 +101,13 @@ impl VoteAggregation {
     /// underlying weighted aggregator on the first valid proposal.
     pub fn handle_proposal(&self, sp: &SignedProposal<GlobalState, GlobalVote>) {
         let rank = sp.proposal.state.rank;
-        if rank < self.min_active_rank.load(Ordering::Relaxed) {
+        let min = self.min_active_rank.load(Ordering::Relaxed);
+        if rank < min {
             debug!(rank, "dropping proposal below finalized rank");
+            return;
+        }
+        if rank > min.saturating_add(quil_consensus::vote_aggregator::MAX_RANK_LOOKAHEAD) {
+            debug!(rank, min, "dropping proposal far above finalized rank (lookahead exceeded)");
             return;
         }
         let collector = self.get_or_create(rank);

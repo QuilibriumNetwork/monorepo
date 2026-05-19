@@ -4,6 +4,76 @@ use std::sync::Arc;
 use quil_types::error::{QuilError, Result};
 use quil_types::store;
 
+/// Detected on-disk layout of a key-value store directory. The Rust
+/// node uses RocksDB; the Go node used Pebble. Both write SST/MANIFEST
+/// files but their `OPTIONS-*` file headers identify the engine. We
+/// scan the OPTIONS file rather than trying to open with RocksDB
+/// because opening a Pebble store as RocksDB produces a confusing
+/// "Corruption" error far from the actual cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreFormat {
+    /// Directory does not exist, is empty, or has no OPTIONS file.
+    Empty,
+    /// `OPTIONS-NNNNNN` file contains `rocksdb_version=` — this is a
+    /// store the Rust node wrote and can reopen directly.
+    RocksDb,
+    /// `OPTIONS-NNNNNN` file contains `pebble_version=` — this is the
+    /// Go node's old format.
+    Pebble,
+    /// Directory exists and has files but no recognizable OPTIONS
+    /// header. Treat as unknown to avoid clobbering user data.
+    Unknown,
+}
+
+/// Sniff the on-disk format of a key-value store directory.
+///
+/// Looks for the Pebble/RocksDB `OPTIONS-NNNNNN` file (both engines
+/// write one) and reads its `[Version]` block to distinguish them.
+/// Pebble emits `pebble_version=` and RocksDB emits `rocksdb_version=`
+/// in the same `[Version]` section.
+pub fn detect_store_format(path: &Path) -> StoreFormat {
+    if !path.exists() {
+        return StoreFormat::Empty;
+    }
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return StoreFormat::Unknown,
+    };
+    let mut had_any_file = false;
+    let mut had_options = false;
+    for entry in entries.flatten() {
+        had_any_file = true;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("OPTIONS-") {
+            continue;
+        }
+        had_options = true;
+        // Only need the first few KB — version section is at the top.
+        let mut buf = Vec::with_capacity(8 * 1024);
+        if let Ok(mut f) = std::fs::File::open(entry.path()) {
+            use std::io::Read;
+            let _ = f.take(8 * 1024).read_to_end(&mut buf);
+        }
+        let head = String::from_utf8_lossy(&buf);
+        if head.contains("rocksdb_version=") {
+            return StoreFormat::RocksDb;
+        }
+        if head.contains("pebble_version=") {
+            return StoreFormat::Pebble;
+        }
+    }
+    if !had_any_file {
+        StoreFormat::Empty
+    } else if had_options {
+        // OPTIONS file existed but had neither version marker.
+        StoreFormat::Unknown
+    } else {
+        // Files but no OPTIONS — could be partial init.
+        StoreFormat::Unknown
+    }
+}
+
 /// RocksDB-backed key-value store.
 pub struct RocksDb {
     db: Arc<rocksdb::DB>,
@@ -28,6 +98,25 @@ impl RocksDb {
         let migrations = crate::migration::rust_node_migrations();
         crate::migration::run_migrations(&db, &migrations)?;
 
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Open the database at `primary_path` as a read-only secondary
+    /// instance. Lets us read from a store that another process holds
+    /// the primary lock on — used by `--node-info` so a running node
+    /// doesn't block the CLI inspection. `secondary_path` is a separate
+    /// writable directory where the secondary instance stores its
+    /// catch-up bookkeeping; pass a temp dir.
+    ///
+    /// Callers should invoke
+    /// [`rocksdb::DB::try_catch_up_with_primary`] before reading to
+    /// pick up the primary's latest committed state.
+    pub fn open_as_secondary(primary_path: &Path, secondary_path: &Path) -> Result<Self> {
+        let mut opts = rocksdb::Options::default();
+        opts.set_max_open_files(64);
+        let db = rocksdb::DB::open_as_secondary(&opts, primary_path, secondary_path)
+            .map_err(|e| QuilError::Store(format!("failed to open rocksdb as secondary: {}", e)))?;
+        // Skip migrations on secondary — only the primary may write.
         Ok(Self { db: Arc::new(db) })
     }
 
