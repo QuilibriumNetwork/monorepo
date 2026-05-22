@@ -1246,7 +1246,9 @@ async fn run_master_node(
     // Broadcast halt-state changes to every active app shard engine
     // AND every standalone worker process. In-process thread-mode
     // engines receive via the `shard_engines` map; standalone workers
-    // receive via the `SetHalted` DataIPC RPC.
+    // receive via the `SetHalted` DataIPC RPC, looked up through
+    // `remote_worker_manager_for_halt` (populated later by the
+    // cluster-mode branch of the worker_manager setup).
     //
     // Two firings:
     //   1. Edge-triggered: when `halt_state.watch_any_halted()` flips,
@@ -1255,11 +1257,14 @@ async fn run_master_node(
     //      worker reconnects and the initial-connect race where a
     //      worker boots mid-halt and would otherwise stay halted=false
     //      until the next edge transition.
+    let remote_worker_manager_for_halt: Arc<
+        std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>,
+    > = Arc::new(std::sync::OnceLock::new());
     {
         let mut rx = halt_state.watch_any_halted();
         let engines = shard_engines.clone();
         let cancel = token.clone();
-        let remote_mgr_for_halt = remote_worker_manager_for_halt.clone();
+        let remote_mgr_cell = remote_worker_manager_for_halt.clone();
         let halt_state_for_periodic = halt_state.clone();
         tokio::spawn(async move {
             let mut periodic = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1270,13 +1275,17 @@ async fn run_master_node(
                     res = rx.changed() => {
                         if res.is_err() { break; }
                         let halted = *rx.borrow();
-                        let map = engines.read();
-                        let count = map.len();
-                        for (_filter, handle) in map.iter() {
-                            handle.set_halted(halted);
-                        }
-                        drop(map);
-                        if let Some(mgr) = remote_mgr_for_halt.as_ref() {
+                        // Scope the read guard: parking_lot::RwLockReadGuard
+                        // is !Send, so it must drop before any .await.
+                        let count = {
+                            let map = engines.read();
+                            let n = map.len();
+                            for (_filter, handle) in map.iter() {
+                                handle.set_halted(halted);
+                            }
+                            n
+                        };
+                        if let Some(mgr) = remote_mgr_cell.get() {
                             mgr.broadcast_set_halted(halted).await;
                         }
                         info!(
@@ -1292,12 +1301,13 @@ async fn run_master_node(
                         }
                         // Re-push to every engine + remote worker so a
                         // freshly-connected worker picks up the halt.
-                        let map = engines.read();
-                        for (_filter, handle) in map.iter() {
-                            handle.set_halted(true);
+                        {
+                            let map = engines.read();
+                            for (_filter, handle) in map.iter() {
+                                handle.set_halted(true);
+                            }
                         }
-                        drop(map);
-                        if let Some(mgr) = remote_mgr_for_halt.as_ref() {
+                        if let Some(mgr) = remote_mgr_cell.get() {
                             mgr.broadcast_set_halted(true).await;
                         }
                     }
@@ -1326,9 +1336,6 @@ async fn run_master_node(
     let reward_greedy = config.engine.reward_strategy == "reward-greedy";
     let fkm_for_factory = file_key_manager.clone();
 
-    let mut remote_worker_manager_for_halt: Option<
-        Arc<quil_engine::remote_worker::RemoteWorkerManager>,
-    > = None;
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> =
         if !config.engine.data_worker_stream_multiaddrs.is_empty() {
             // CLUSTER MODE: remote workers via gRPC
@@ -1354,7 +1361,9 @@ async fn run_master_node(
                 remote_workers = config.engine.data_worker_stream_multiaddrs.len(),
                 "remote worker manager ready (cluster mode)"
             );
-            remote_worker_manager_for_halt = Some(remote_mgr.clone());
+            // Publish to the halt broadcaster spawned above so it can
+            // SetHalted across standalone workers when coverage halts.
+            let _ = remote_worker_manager_for_halt.set(remote_mgr.clone());
             remote_mgr as Arc<dyn quil_engine::worker::WorkerManager>
         } else {
             // LOCAL MODE: core-pinned threads
