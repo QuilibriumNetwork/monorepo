@@ -32,14 +32,8 @@ const DEFAULT_LEAF_PAGE_SIZE: usize = 1000;
 /// HyperSync server implementation.
 pub struct HyperSyncServer {
     hg_store: Arc<RocksHypergraphStore>,
-    /// Optional in-process CRDT used to validate the client's
-    /// `expected_root` against the snapshot generation registry.
-    /// When `None`, sync requests are served against the latest live
-    /// tree (legacy behavior). When `Some` and a request carries a
-    /// non-empty `expected_root`, the server rejects the request if no
-    /// matching snapshot generation exists — mirroring Go's
-    /// `hg.snapshotMgr.acquire(shardKey, expectedRoot)` at
-    /// `hypergraph/sync_client_driven.go:184`.
+    /// When set, sync requests with a non-empty `expected_root` are
+    /// validated against the snapshot generation registry.
     crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
 }
 
@@ -48,53 +42,138 @@ impl HyperSyncServer {
         Self { hg_store, crdt: None }
     }
 
-    /// Attach an in-process CRDT so the server can validate
-    /// `expected_root` against the snapshot generation registry.
     pub fn with_crdt(mut self, crdt: Arc<quil_hypergraph::HypergraphCrdt>) -> Self {
         self.crdt = Some(crdt);
         self
     }
 }
 
-/// Load the tree for the given phase + shard key from a
-/// `SnapshotReadable` source (live store OR a captured DB-snapshot)
-/// and commit it to compute fresh commitments. Returns `None` if the
-/// tree doesn't exist (empty node).
-///
-/// Previously this ignored the request's shard_key and always served
-/// the global-prover shard (`L1=[0;3], L2=[0xff;32]`). That silently
-/// returned the wrong tree for any other shard, breaking multi-shard
-/// sync — a Go client requesting a non-global shard would get back
-/// leaves for the global shard and fail commitment verification.
-///
-/// The `source` parameter accepts either the live store or a
-/// generation-bound `SnapshotReadable` — point-in-time reads under
-/// concurrent writes are achieved by passing the latter.
-fn load_tree_for_phase(
-    source: &dyn SnapshotReadable,
-    phase: HypergraphPhaseSet,
-    shard: ShardKey,
-) -> Option<VectorCommitmentTree> {
-    let (set_str, phase_str) = match phase {
+fn phase_strings(phase: HypergraphPhaseSet) -> (&'static str, &'static str) {
+    match phase {
         HypergraphPhaseSet::VertexAdds => ("vertex", "adds"),
         HypergraphPhaseSet::VertexRemoves => ("vertex", "removes"),
         HypergraphPhaseSet::HyperedgeAdds => ("hyperedge", "adds"),
         HypergraphPhaseSet::HyperedgeRemoves => ("hyperedge", "removes"),
+    }
+}
+
+/// Deserialize the captured-at-snapshot-time tree blob, if present.
+/// `Ok(Some)` = served from the snapshot (point-in-time consistent);
+/// `Ok(None)` = no blob in snapshot (caller may try the live store).
+fn load_tree_from_snapshot(
+    snap: &std::sync::Arc<dyn quil_types::store::SnapshotReadable>,
+    phase: HypergraphPhaseSet,
+    shard: &ShardKey,
+) -> Result<Option<VectorCommitmentTree>, quil_types::error::QuilError> {
+    let (set_str, phase_str) = phase_strings(phase);
+    let blob = match snap.load_tree_blob(set_str, phase_str, shard)? {
+        Some(b) if !b.is_empty() => b,
+        _ => return Ok(None),
     };
-    let blob = source.load_tree_blob(set_str, phase_str, &shard).ok().flatten()?;
-    let root = deserialize_tree(&blob).ok().flatten()?;
+    let root = quil_tries::deserialize_tree(&blob)?;
+    let mut t = VectorCommitmentTree::new();
+    t.root = root;
+    Ok(Some(t))
+}
+
+/// Bounded-eager load of a phase tree's top two levels (~1 + 64 +
+/// 64×64 reads). Returns `None` if no root is stored.
+fn load_tree_for_phase(
+    hg_store: &std::sync::Arc<quil_store::RocksHypergraphStore>,
+    phase: HypergraphPhaseSet,
+    shard: ShardKey,
+) -> Option<VectorCommitmentTree> {
+    let (set_str, phase_str) = phase_strings(phase);
+    let lazy = quil_tries::LazyVectorCommitmentTree::new(
+        std::sync::Arc::clone(hg_store)
+            as std::sync::Arc<dyn quil_types::store::HypergraphStore>,
+        set_str.to_string(),
+        phase_str.to_string(),
+        shard.clone(),
+        Vec::new(),
+    );
+    let root_result = lazy.load_root_and_two_levels();
+    let root = match root_result {
+        Ok(Some(node)) => node,
+        Ok(None) => {
+            tracing::info!(
+                set = %set_str, phase = %phase_str,
+                "sync server: load_tree_for_phase returned None (no root in store)",
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                set = %set_str, phase = %phase_str, error = %e,
+                "sync server: load_tree_for_phase errored",
+            );
+            return None;
+        }
+    };
+    let (root_commit_hex, child_count_loaded, leaf_count_loaded) = match &root {
+        quil_tries::VectorCommitmentNode::Branch(b) => (
+            hex::encode(&b.commitment),
+            b.children.iter().filter(|c| c.is_some()).count(),
+            b.leaf_count as u64,
+        ),
+        quil_tries::VectorCommitmentNode::Leaf(l) => (
+            hex::encode(&l.commitment),
+            0usize,
+            1u64,
+        ),
+    };
     let mut t = VectorCommitmentTree::new();
     t.root = Some(root);
+
+    // Diagnostic: detect lazy-load truncation or stale-cache divergence
+    // by comparing loaded-leaf count + recomputed commit to stored values.
+    let collected = if let Some(root_ref) = t.root.as_ref() {
+        collect_leaves(root_ref).len() as u64
+    } else { 0 };
+    let leaves_match = collected == leaf_count_loaded;
+
+    let mut t_for_recompute = VectorCommitmentTree::new();
+    t_for_recompute.root = t.root.clone();
+    // Solo leaf encoding strips `value` to avoid double-storing the vertex
+    // blob — hydrate from the per-vertex keyspace so recompute sees the
+    // same input that `tree.commit` originally saw.
+    if let Some(root) = t_for_recompute.root.as_mut() {
+        hydrate_leaf_values(root, hg_store.as_ref(), set_str, phase_str, &shard);
+    }
     let prover = quil_crypto::KzgInclusionProver;
-    t.commit(&prover);
+    let recomputed = t_for_recompute.commit(&prover);
+    let recomputed_hex = hex::encode(&recomputed);
+    let stored_commit = if let Some(quil_tries::VectorCommitmentNode::Branch(b)) = t.root.as_ref() {
+        b.commitment.clone()
+    } else { Vec::new() };
+    let commits_match = recomputed == stored_commit;
+
+    tracing::info!(
+        set = %set_str, phase = %phase_str,
+        root_commit = %root_commit_hex,
+        recomputed_commit = %recomputed_hex,
+        commits_match,
+        children_loaded = child_count_loaded,
+        leaf_count_meta = leaf_count_loaded,
+        leaves_collected = collected,
+        leaves_match,
+        "sync server: load_tree_for_phase loaded root (diagnostic)",
+    );
+    if !commits_match || !leaves_match {
+        tracing::warn!(
+            set = %set_str, phase = %phase_str,
+            commits_match,
+            leaves_match,
+            stored_commit_prefix = %hex::encode(&stored_commit[..stored_commit.len().min(16)]),
+            recomputed_prefix = %hex::encode(&recomputed[..recomputed.len().min(16)]),
+            "sync server: tree state divergence — clients will see commitment mismatch",
+        );
+    }
     Some(t)
 }
 
-/// Parse a pagination continuation token. Mirrors Go's
-/// `parseContToken` at `hypergraph/sync_client_driven.go:456-470`:
-/// the token is the ASCII hex encoding of a 4-byte big-endian int32.
-/// Returns `None` for an empty token (meaning "start from 0") or on
-/// malformed input.
+/// Pagination continuation token — ASCII hex of a 4-byte big-endian
+/// int32. Empty token means "start from 0".
 fn parse_continuation_token(token: &[u8]) -> Option<usize> {
     if token.is_empty() {
         return None;
@@ -112,8 +191,6 @@ fn parse_continuation_token(token: &[u8]) -> Option<usize> {
     Some(u32::from_be_bytes(buf) as usize)
 }
 
-/// Emit a pagination continuation token for `idx`. Mirrors Go's
-/// `makeContToken` at `:472-474`: ASCII hex of 4 big-endian bytes.
 fn make_continuation_token(idx: usize) -> Vec<u8> {
     let be = (idx as u32).to_be_bytes();
     let mut out = Vec::with_capacity(8);
@@ -141,8 +218,7 @@ fn hex_char(n: u8) -> u8 {
     }
 }
 
-/// Canonical global-prover shard key. Fallback when the request
-/// omits a shard key, matching the implicit default on the Go side.
+/// Canonical global-prover shard key. Fallback when a request omits one.
 fn global_prover_shard() -> ShardKey {
     ShardKey {
         l1: [0u8; 3],
@@ -150,15 +226,20 @@ fn global_prover_shard() -> ShardKey {
     }
 }
 
-/// Resolve a request's shard key into the backing store's `ShardKey`.
-/// Proto carries the 32-byte shard_address; we derive the 3-byte L1
-/// bloom via SHAKE256-based `GetBloomFilterIndices(addr, 256, 3)` —
-/// matching Go's `node/store/hypergraph.go:2083` and
-/// `quil_hypergraph::addressing::shard_key_for_location`.
-/// Empty → global prover shard.
+/// Decode the wire shard key (Go's `slices.Concat(L1[:], L2[:])`):
+/// - empty → global prover shard
+/// - 35 bytes → canonical `L1=bytes[0..3], L2=bytes[3..35]`
+/// - other → take up to 32 bytes as L2 and derive L1 from the address
 fn shard_key_from_bytes(shard_bytes: &[u8]) -> ShardKey {
     if shard_bytes.is_empty() {
         return global_prover_shard();
+    }
+    if shard_bytes.len() == 35 {
+        let mut l1 = [0u8; 3];
+        l1.copy_from_slice(&shard_bytes[..3]);
+        let mut l2 = [0u8; 32];
+        l2.copy_from_slice(&shard_bytes[3..35]);
+        return ShardKey { l1, l2 };
     }
     let mut l2 = [0u8; 32];
     let n = shard_bytes.len().min(32);
@@ -167,14 +248,7 @@ fn shard_key_from_bytes(shard_bytes: &[u8]) -> ShardKey {
     ShardKey { l1, l2 }
 }
 
-/// Navigate from the tree root to the node at `path` (sequence of
-/// 0-63 child indices). Returns:
-/// - `NavResult::Found(node)`: an exact match — `path` terminates at `node`.
-/// - `NavResult::PrefixMatch(node)`: a branch whose `full_path` extends
-///   the requested path (the common ancestor). Caller returns this
-///   branch with its compressed prefix, matching Go's behavior at
-///   `hypergraph/sync_client_driven.go:getBranch`.
-/// - `NavResult::Missing`: no node covers `path`.
+/// Navigation outcome when walking from the root along a 6-bit path.
 enum NavResult<'a> {
     Found(&'a VectorCommitmentNode),
     PrefixMatch {
@@ -184,8 +258,6 @@ enum NavResult<'a> {
     Missing,
 }
 
-/// Walk from `node` along `remaining`, accumulating the traversed
-/// path segment in `full_path`.
 fn navigate<'a>(
     node: &'a VectorCommitmentNode,
     remaining: &[i32],
@@ -195,25 +267,11 @@ fn navigate<'a>(
         return NavResult::Found(node);
     }
     match node {
-        // A leaf reached before consuming the full path — the requested
-        // path doesn't exist in this tree.
         VectorCommitmentNode::Leaf(_) => NavResult::Missing,
         VectorCommitmentNode::Branch(branch) => {
-            // Consume as many of `remaining` as match this branch's
-            // compressed prefix.
             let prefix = &branch.prefix;
             let shared = prefix.len().min(remaining.len());
-            // The branch's prefix is the edge from the parent — but
-            // in our store the prefix contains the nibbles *below*
-            // the parent. Two cases:
-            //   1. remaining starts with prefix → descend via the
-            //      next nibble after prefix.
-            //   2. prefix extends beyond remaining → the requested
-            //      path lands inside this branch's compressed edge;
-            //      we return the branch itself with its full_path
-            //      so the client learns where it is.
             if remaining.len() < prefix.len() {
-                // Check that remaining is a proper prefix of the branch's prefix.
                 if &prefix[..remaining.len()] == remaining {
                     let mut fp = full_path;
                     fp.extend_from_slice(prefix);
@@ -252,8 +310,6 @@ fn navigate<'a>(
     }
 }
 
-/// Build the wire `HypergraphSyncBranchResponse` for a branch node
-/// located at `full_path`.
 fn branch_to_response(
     node: &VectorCommitmentNode,
     full_path: Vec<i32>,
@@ -295,7 +351,6 @@ fn branch_to_response(
     }
 }
 
-/// Build a "root" response for a tree whose root matches an empty path.
 fn root_response(tree: &VectorCommitmentTree) -> HypergraphSyncBranchResponse {
     match &tree.root {
         None => HypergraphSyncBranchResponse {
@@ -315,8 +370,36 @@ fn root_response(tree: &VectorCommitmentTree) -> HypergraphSyncBranchResponse {
     }
 }
 
-/// Flatten all leaves under `node` into a list. Order is a stable
-/// depth-first walk — child index low → high.
+/// Rehydrate each leaf's `value` from the per-vertex keyspace; solo
+/// encoding strips it to avoid double-storing the vertex blob.
+fn hydrate_leaf_values(
+    node: &mut VectorCommitmentNode,
+    hg_store: &quil_store::RocksHypergraphStore,
+    set_str: &str,
+    phase_str: &str,
+    shard: &ShardKey,
+) {
+    match node {
+        VectorCommitmentNode::Leaf(leaf) => {
+            if !leaf.value.is_empty() {
+                return;
+            }
+            if let Ok(Some(v)) =
+                hg_store.load_vertex_underlying(set_str, phase_str, shard, &leaf.key)
+            {
+                leaf.value = v;
+            }
+        }
+        VectorCommitmentNode::Branch(branch) => {
+            for child in branch.children.iter_mut() {
+                if let Some(c) = child.as_mut() {
+                    hydrate_leaf_values(c, hg_store, set_str, phase_str, shard);
+                }
+            }
+        }
+    }
+}
+
 fn collect_leaves(node: &VectorCommitmentNode) -> Vec<LeafData> {
     match node {
         VectorCommitmentNode::Leaf(leaf) => vec![LeafData {
@@ -370,21 +453,16 @@ impl HypergraphComparisonService for HyperSyncServer {
         let (tx, rx) = mpsc::channel::<Result<HypergraphSyncResponse, Status>>(16);
 
         tokio::spawn(async move {
-            // Cache one tree per phase so the client can stream
-            // multi-phase queries on the same RPC without reloading.
-            // Cache tree per (phase, shard_key) — single cache on
-            // phase alone would cross-serve shards.
-            let mut trees: HashMap<(i32, ShardKey), VectorCommitmentTree> = HashMap::new();
+            // Cache tree per (phase, shard, snapshot_root) so multi-phase
+            // streams don't reload, shards never cross-serve, and a
+            // pinned `expected_root` gets a distinct tree from the
+            // live-store fallback.
+            let mut trees: HashMap<(i32, ShardKey, Vec<u8>), VectorCommitmentTree> = HashMap::new();
 
-            // Mirrors Go's `hg.snapshotMgr.acquire(shardKey, expectedRoot)`
-            // at `hypergraph/sync_client_driven.go:184`. When the client
-            // pinned a specific root, reject the query if no matching
-            // generation exists in the registry. On match, return the
-            // generation handle whose `db_snapshot` (if Some) the
-            // caller should use as the tree-read source — this gives
-            // point-in-time-consistent reads under concurrent writes
-            // to the live store. When no generation-bound snapshot
-            // exists, the caller falls back to the live store.
+            // When the client pinned `expected_root`, require a matching
+            // snapshot generation. The returned handle's `db_snapshot`
+            // gives point-in-time reads under concurrent writes; without
+            // a CRDT bound we can't validate, so accept (legacy).
             let acquire_snapshot_for = |expected_root: &[u8]|
                 -> Result<Option<quil_hypergraph::GenerationHandle>, HypergraphSyncResponse>
             {
@@ -403,23 +481,33 @@ impl HypergraphComparisonService for HyperSyncServer {
                         )),
                     }
                 } else {
-                    // No CRDT bound → can't validate, accept (legacy).
                     Ok(None)
                 }
             };
 
-            // Resolve the read source for a sync request: the bound
-            // DB-snapshot when the generation has one, otherwise the
-            // live store.
-            let read_source = |handle: &Option<quil_hypergraph::GenerationHandle>|
-                -> std::sync::Arc<dyn SnapshotReadable>
-            {
+            // Load the tree for this request, preferring the
+            // generation-bound snapshot when one is available so reads
+            // are point-in-time consistent under concurrent writes.
+            // Falls back to the live store on snapshot miss or decode
+            // failure.
+            let load_tree_for_request = |
+                handle: &Option<quil_hypergraph::GenerationHandle>,
+                phase: HypergraphPhaseSet,
+                shard: &ShardKey,
+            | -> Option<VectorCommitmentTree> {
                 if let Some(h) = handle {
-                    if let Some(snap) = h.db_snapshot.clone() {
-                        return snap;
+                    if let Some(snap) = h.db_snapshot.as_ref() {
+                        match load_tree_from_snapshot(snap, phase, shard) {
+                            Ok(Some(t)) => return Some(t),
+                            Ok(None) => {}
+                            Err(e) => warn!(
+                                error = %e,
+                                "snapshot tree decode failed, falling back to live store",
+                            ),
+                        }
                     }
                 }
-                hg_store.clone() as std::sync::Arc<dyn SnapshotReadable>
+                load_tree_for_phase(&hg_store, phase, shard.clone())
             };
 
             while let Some(query) = inbound.next().await {
@@ -440,17 +528,17 @@ impl HypergraphComparisonService for HyperSyncServer {
                                 continue;
                             }
                         };
-                        let source = read_source(&handle);
                         let phase = HypergraphPhaseSet::try_from(req.phase_set)
                             .unwrap_or(HypergraphPhaseSet::VertexAdds);
                         let shard = shard_key_from_bytes(&req.shard_key);
-                        // Cache key is (phase, shard) — a single cache
-                        // keyed only on phase would mix shards and serve
-                        // the wrong tree after the first request for a
-                        // different shard.
-                        let cache_key: (i32, ShardKey) = (req.phase_set, shard.clone());
+                        let snapshot_id = handle
+                            .as_ref()
+                            .map(|h| h.root.clone())
+                            .unwrap_or_default();
+                        let cache_key: (i32, ShardKey, Vec<u8>) =
+                            (req.phase_set, shard.clone(), snapshot_id);
                         if !trees.contains_key(&cache_key) {
-                            if let Some(t) = load_tree_for_phase(source.as_ref(), phase, shard.clone()) {
+                            if let Some(t) = load_tree_for_request(&handle, phase, &shard) {
                                 trees.insert(cache_key.clone(), t);
                             }
                         }
@@ -503,20 +591,23 @@ impl HypergraphComparisonService for HyperSyncServer {
                                 continue;
                             }
                         };
-                        let source = read_source(&handle);
                         let phase = HypergraphPhaseSet::try_from(req.phase_set)
                             .unwrap_or(HypergraphPhaseSet::VertexAdds);
                         let shard = shard_key_from_bytes(&req.shard_key);
-                        let cache_key: (i32, ShardKey) = (req.phase_set, shard.clone());
+                        let snapshot_id = handle
+                            .as_ref()
+                            .map(|h| h.root.clone())
+                            .unwrap_or_default();
+                        let cache_key: (i32, ShardKey, Vec<u8>) =
+                            (req.phase_set, shard.clone(), snapshot_id);
                         if !trees.contains_key(&cache_key) {
-                            if let Some(t) = load_tree_for_phase(source.as_ref(), phase, shard.clone()) {
+                            if let Some(t) = load_tree_for_request(&handle, phase, &shard) {
                                 trees.insert(cache_key.clone(), t);
                             }
                         }
                         match trees.get(&cache_key) {
                             Some(tree) => match tree.root.as_ref() {
                                 Some(root) => {
-                                    // Navigate to the requested subtree root.
                                     let subtree_node = if req.path.is_empty() {
                                         Some(root as &VectorCommitmentNode)
                                     } else {
@@ -530,13 +621,6 @@ impl HypergraphComparisonService for HyperSyncServer {
                                         Some(node) => {
                                             let leaves = collect_leaves(node);
 
-                                            // Continuation token format — must match Go at
-                                            // `hypergraph/sync_client_driven.go:456-474`:
-                                            // hex-encoded ASCII of a 4-byte big-endian int32.
-                                            // Go sends "000003e8" for index 1000; parsing
-                                            // that as decimal (old behavior) would fall back
-                                            // to 0 via unwrap_or, serving page 0 forever and
-                                            // corrupting cross-impl sync.
                                             let start = parse_continuation_token(
                                                 &req.continuation_token,
                                             )
@@ -547,7 +631,30 @@ impl HypergraphComparisonService for HyperSyncServer {
                                                 req.max_leaves as usize
                                             };
                                             let end = (start + max).min(leaves.len());
-                                            let page = leaves[start..end].to_vec();
+                                            let mut page = leaves[start..end].to_vec();
+                                            // Hydrate stripped values from per-vertex keyspace
+                                            // so the client can recompute leaf commitments.
+                                            let (set_str, phase_str) = match phase {
+                                                HypergraphPhaseSet::VertexAdds => ("vertex", "adds"),
+                                                HypergraphPhaseSet::VertexRemoves => ("vertex", "removes"),
+                                                HypergraphPhaseSet::HyperedgeAdds => ("hyperedge", "adds"),
+                                                HypergraphPhaseSet::HyperedgeRemoves => ("hyperedge", "removes"),
+                                            };
+                                            for leaf in page.iter_mut() {
+                                                if !leaf.value.is_empty() {
+                                                    continue;
+                                                }
+                                                if let Ok(Some(v)) = hg_store
+                                                    .load_vertex_underlying(
+                                                        set_str,
+                                                        phase_str,
+                                                        &shard,
+                                                        &leaf.key,
+                                                    )
+                                                {
+                                                    leaf.value = v;
+                                                }
+                                            }
                                             let cont = if end < leaves.len() {
                                                 make_continuation_token(end)
                                             } else {
@@ -645,6 +752,8 @@ mod tests {
             leaf_count,
             size: num_bigint::BigInt::from(leaf_count as u64),
             longest_branch: 1,
+            full_prefix: Vec::new(),
+            fully_loaded: true,
         })
     }
 

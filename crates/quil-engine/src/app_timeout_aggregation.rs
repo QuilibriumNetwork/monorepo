@@ -60,12 +60,17 @@ impl AppTimeoutAggregation {
         vote_domain: Vec<u8>,
         timeout_domain: Vec<u8>,
     ) -> Self {
-        // Validator wraps a Verifier built from BLS + the vote domain so
-        // QC validation inside `TimeoutProcessor::process` matches the
-        // verifier the inbound event loop runs.
+        // Validator wraps a Verifier built from BLS + distinct
+        // vote/timeout domains so that both QC validation (signed under
+        // vote_domain) and TC validation (signed under timeout_domain)
+        // succeed inside `TimeoutProcessor::process`.
         let raw: Arc<dyn SignatureAggregator> =
             Arc::new(BlsSignatureAggregator::new(bls.clone()));
-        let verifier = Arc::new(BlsConsensusVerifier::new(raw, vote_domain));
+        let verifier = Arc::new(BlsConsensusVerifier::new_with_timeout_domain(
+            raw,
+            vote_domain,
+            timeout_domain.clone(),
+        ));
         let committee_as_replicas: Arc<dyn Replicas> = committee.clone();
         let validator: Arc<dyn Validator<AppShardState, AppShardVote>> = Arc::new(
             ConsensusValidator::<AppShardState, AppShardVote>::new(

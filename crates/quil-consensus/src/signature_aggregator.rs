@@ -74,6 +74,22 @@ pub trait WeightedSignatureAggregator: Send + Sync {
     /// `Err`.
     fn trusted_add(&self, signer_id: &Identity, sig: &[u8]) -> Result<u64>;
 
+    /// Variant of `trusted_add` that also carries a per-signer aux
+    /// payload (e.g. an app shard voter's 516-byte VDF multi-proof
+    /// contribution). The aggregator stores aux per signer alongside
+    /// the BLS signature and packs them into the final wire blob
+    /// during `aggregate()`. Default impl drops the aux and forwards
+    /// to `trusted_add` — callers that don't need aux (e.g. global
+    /// consensus) get the existing behavior.
+    fn trusted_add_with_aux(
+        &self,
+        signer_id: &Identity,
+        sig: &[u8],
+        _aux: &[u8],
+    ) -> Result<u64> {
+        self.trusted_add(signer_id, sig)
+    }
+
     /// Current total weight of all collected signatures.
     fn total_weight(&self) -> u64;
 
@@ -120,6 +136,79 @@ pub struct TimeoutSignerInfo {
     pub signer: Identity,
 }
 
+/// Wraps an existing [`AggregatedSignature`] and overrides its bitmask.
+/// Raw BLS aggregators (the production one in `quil-engine`) don't know
+/// about committee membership, so they return an empty bitmask. The
+/// committee-aware [`WeightedSignatureAggregatorImpl`] and
+/// [`TimeoutSignatureAggregatorImpl`] use this wrapper at aggregation
+/// time to encode "which committee indices contributed" into the
+/// signature object — without that, the downstream validator's weight
+/// check `decode_signers` errors with "bitmask length 0 too short for
+/// committee size N".
+#[derive(Debug)]
+pub struct BitmaskedAggregatedSignature {
+    inner: Arc<dyn AggregatedSignature>,
+    bitmask: Vec<u8>,
+}
+
+impl BitmaskedAggregatedSignature {
+    pub fn new(inner: Arc<dyn AggregatedSignature>, bitmask: Vec<u8>) -> Self {
+        Self { inner, bitmask }
+    }
+}
+
+impl AggregatedSignature for BitmaskedAggregatedSignature {
+    fn signature(&self) -> &[u8] { self.inner.signature() }
+    fn public_key(&self) -> &[u8] { self.inner.public_key() }
+    fn bitmask(&self) -> &[u8] { &self.bitmask }
+}
+
+/// [`AggregatedSignature`] carrying a fully-packed wire blob:
+/// `bls_agg(74) || u32_be(count) || concat(multi_proofs)`. Used when
+/// the weighted aggregator has collected per-signer VDF multi-proof
+/// aux payloads from app-shard votes — the packed blob matches Go's
+/// `FrameHeader.PublicKeySignatureBLS48581.Signature` layout exactly.
+/// The aggregated pubkey and committee bitmask travel alongside.
+#[derive(Debug)]
+pub struct PackedAggregatedSignature {
+    signature_packed: Vec<u8>,
+    public_key: Vec<u8>,
+    bitmask: Vec<u8>,
+}
+
+impl PackedAggregatedSignature {
+    pub fn new(signature_packed: Vec<u8>, public_key: Vec<u8>, bitmask: Vec<u8>) -> Self {
+        Self { signature_packed, public_key, bitmask }
+    }
+}
+
+impl AggregatedSignature for PackedAggregatedSignature {
+    fn signature(&self) -> &[u8] { &self.signature_packed }
+    fn public_key(&self) -> &[u8] { &self.public_key }
+    fn bitmask(&self) -> &[u8] { &self.bitmask }
+}
+
+/// Build a packed bitmask from `committee_size` total slots, with bit
+/// `index` set for each entry in `signer_indices`. Bytes are big-endian
+/// (Go layout: byte 0 holds bits 0-7, byte 1 holds bits 8-15, etc.).
+/// Returns an empty `Vec` when the committee is empty.
+pub fn build_bitmask(committee_size: usize, signer_indices: &[usize]) -> Vec<u8> {
+    if committee_size == 0 {
+        return Vec::new();
+    }
+    let len = (committee_size + 7) / 8;
+    let mut bm = vec![0u8; len];
+    for &i in signer_indices {
+        if i >= committee_size {
+            continue;
+        }
+        let byte = i / 8;
+        let bit = i % 8;
+        bm[byte] |= 1u8 << bit;
+    }
+    bm
+}
+
 // =====================================================================
 // WeightedSignatureAggregatorImpl: concrete committee-aware wrapper
 // =====================================================================
@@ -159,6 +248,11 @@ impl WeightedIdentity for StoredIdentity {
 struct WeightedAggState {
     /// Identities whose signatures have been collected so far.
     collected: HashMap<Identity, Vec<u8>>,
+    /// Per-signer auxiliary payload (e.g. VDF multi-proof). Parallel
+    /// to `collected`; absent entries are treated as empty during
+    /// aggregation. Packed into the final wire blob in committee-
+    /// index order.
+    aux: HashMap<Identity, Vec<u8>>,
     total_weight: u64,
 }
 
@@ -235,6 +329,7 @@ impl WeightedSignatureAggregatorImpl {
             ds_tag,
             state: RwLock::new(WeightedAggState {
                 collected: HashMap::new(),
+                aux: HashMap::new(),
                 total_weight: 0,
             }),
         })
@@ -262,6 +357,15 @@ impl WeightedSignatureAggregator for WeightedSignatureAggregatorImpl {
     }
 
     fn trusted_add(&self, signer_id: &Identity, sig: &[u8]) -> Result<u64> {
+        self.trusted_add_with_aux(signer_id, sig, &[])
+    }
+
+    fn trusted_add_with_aux(
+        &self,
+        signer_id: &Identity,
+        sig: &[u8],
+        aux: &[u8],
+    ) -> Result<u64> {
         let info = self.id_to_info.get(signer_id).ok_or_else(|| {
             QuilError::InvalidSigner(format!("{} is not an authorized signer", hex::encode(signer_id)))
         })?;
@@ -273,6 +377,9 @@ impl WeightedSignatureAggregator for WeightedSignatureAggregatorImpl {
             )));
         }
         guard.collected.insert(signer_id.clone(), sig.to_vec());
+        if !aux.is_empty() {
+            guard.aux.insert(signer_id.clone(), aux.to_vec());
+        }
         guard.total_weight += info.weight;
         Ok(guard.total_weight)
     }
@@ -313,8 +420,61 @@ impl WeightedSignatureAggregator for WeightedSignatureAggregatorImpl {
                 Box::new((*stored).clone()) as Box<dyn WeightedIdentity>
             })
             .collect();
+        let indices: Vec<usize> = tuples.iter().map(|(idx, _, _, _)| *idx).collect();
 
-        let agg_sig = self.aggregator.aggregate(&pks, &sigs)?;
+        let raw_agg = self.aggregator.aggregate(&pks, &sigs)?;
+        // Wrap with a bitmask identifying which committee positions
+        // contributed. Without this the downstream validator's
+        // `decode_signers` weight check rejects the QC for "bitmask
+        // length 0 too short for committee size N".
+        let bitmask = build_bitmask(self.ids.len(), &indices);
+
+        // App shard votes carry per-voter VDF multi-proof contributions
+        // in their `aux` payload. When any signer supplied a multi-proof,
+        // pack the final signature blob as Go does:
+        //   bls_agg(74) || u32_be(count) || concat(multi_proofs)
+        // The multi-proofs are emitted in committee-index order so the
+        // verifier's `verify_multi_proof` walks them in lockstep with
+        // the bitmask-derived participant ids.
+        let any_aux = tuples
+            .iter()
+            .any(|(_, _, _, stored)| {
+                guard
+                    .aux
+                    .get(stored.identity())
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+            });
+        let agg_sig: Arc<dyn AggregatedSignature> = if any_aux {
+            let mut multi_proofs: Vec<Vec<u8>> = Vec::with_capacity(tuples.len());
+            for (_, _, _, stored) in &tuples {
+                let mp = guard
+                    .aux
+                    .get(stored.identity())
+                    .cloned()
+                    .unwrap_or_default();
+                multi_proofs.push(mp);
+            }
+            let mut packed: Vec<u8> = Vec::with_capacity(
+                raw_agg.signature().len()
+                    + 4
+                    + multi_proofs.iter().map(|v| v.len()).sum::<usize>(),
+            );
+            packed.extend_from_slice(raw_agg.signature());
+            let count = u32::try_from(multi_proofs.len()).unwrap_or(0);
+            packed.extend_from_slice(&count.to_be_bytes());
+            for mp in &multi_proofs {
+                packed.extend_from_slice(mp);
+            }
+            Arc::new(PackedAggregatedSignature::new(
+                packed,
+                raw_agg.public_key().to_vec(),
+                bitmask,
+            ))
+        } else {
+            Arc::new(BitmaskedAggregatedSignature::new(raw_agg, bitmask))
+                as Arc<dyn AggregatedSignature>
+        };
         Ok((signers, agg_sig))
     }
 }
@@ -496,8 +656,18 @@ impl TimeoutSignatureAggregator for TimeoutSignatureAggregatorImpl {
                 signer: id.clone(),
             })
             .collect();
+        let indices: Vec<usize> = tuples.iter().map(|(idx, _, _, _, _)| *idx).collect();
 
-        let agg_sig = self.aggregator.aggregate(&pks, &sigs)?;
+        let raw_agg = self.aggregator.aggregate(&pks, &sigs)?;
+        // Same as `WeightedSignatureAggregatorImpl::aggregate` — wrap
+        // the raw BLS aggregate with a bitmask so the downstream TC
+        // validator (`validate_timeout_certificate`) can decode the
+        // signer subset against committee size. `id_to_info.len()` is
+        // the count of authorized signers passed to `new`.
+        let bitmask = build_bitmask(self.id_to_info.len(), &indices);
+        let agg_sig: Arc<dyn AggregatedSignature> = Arc::new(
+            BitmaskedAggregatedSignature::new(raw_agg, bitmask),
+        );
         Ok((signers, agg_sig))
     }
 }

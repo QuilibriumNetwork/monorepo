@@ -238,6 +238,35 @@ impl QuorumCertificate {
         }
     }
 
+    /// Build a wire `QuorumCertificate` from the proto representation
+    /// stored in the clock store (the form produced by
+    /// `RocksClockStore::get_quorum_certificate`). Used by the
+    /// activation path to feed a real BLS-aggregated QC into the
+    /// pacemaker on restart so the loop boots with a verifiable
+    /// previous-round QC rather than a zero-signature stub.
+    pub fn from_proto(qc: &quil_types::proto::global::QuorumCertificate) -> Self {
+        let (public_key, signature, bitmask) = match qc.aggregate_signature.as_ref() {
+            Some(agg) => (
+                agg.public_key.as_ref().map(|pk| pk.key_value.clone()).unwrap_or_default(),
+                agg.signature.clone(),
+                agg.bitmask.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        Self {
+            filter: qc.filter.clone(),
+            rank: qc.rank,
+            frame_number: qc.frame_number,
+            selector: qc.selector.clone(),
+            timestamp: qc.timestamp,
+            aggregate_signature: AggregateSignature {
+                public_key,
+                signature,
+                bitmask,
+            },
+        }
+    }
+
     /// Build a wire `QuorumCertificate` from a `dyn quil_consensus::models::
     /// QuorumCertificate` trait object. Used by producer paths that need to
     /// embed a previously-aggregated QC (e.g. the latest QC inside a

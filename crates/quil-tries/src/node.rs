@@ -27,7 +27,11 @@ pub struct LeafNode {
 pub struct BranchNode {
     /// Compressed prefix nibbles (relative to parent).
     pub prefix: Vec<i32>,
-    /// 64 children, None if absent.
+    /// 64 children. Semantics depend on [`Self::fully_loaded`]:
+    /// - `fully_loaded = true`: `None` means the slot is genuinely empty.
+    /// - `fully_loaded = false`: `None` means "not yet loaded from store"
+    ///   — the lazy walker calls `get_node_by_path(full_prefix + [i])`
+    ///   to fetch on demand. `Some(...)` always means resident.
     pub children: [Option<Box<VectorCommitmentNode>>; BRANCH_NODES],
     /// KZG or SHA-512 commitment.
     pub commitment: Vec<u8>,
@@ -37,6 +41,18 @@ pub struct BranchNode {
     pub leaf_count: usize,
     /// Depth of the longest chain of children.
     pub longest_branch: usize,
+    /// Absolute nibble path from the tree root through this branch's
+    /// prefix. Needed for lazy walks that must compute child paths
+    /// (`full_prefix + [i]`) without re-traversing from the root.
+    /// In-memory branches built via `BranchNode::new` start with an
+    /// empty `full_prefix`; the lazy tree fills it in as it walks.
+    pub full_prefix: Vec<i32>,
+    /// True when every child slot reflects the on-disk state (no
+    /// further `get_node_by_path` calls needed to enumerate). In-memory
+    /// trees that don't have a backing store are always fully loaded.
+    /// Lazy walks set this to `false` after a load-by-path returns
+    /// just the branch metadata.
+    pub fully_loaded: bool,
 }
 
 impl LeafNode {
@@ -64,7 +80,9 @@ impl LeafNode {
 }
 
 impl BranchNode {
-    /// Empty branch with the given prefix.
+    /// Empty branch with the given prefix. In-memory trees that have no
+    /// backing store use this constructor; `fully_loaded` defaults to
+    /// `true` so callers don't trigger phantom loads.
     pub fn new(prefix: Vec<i32>) -> Self {
         Self {
             prefix,
@@ -73,6 +91,8 @@ impl BranchNode {
             size: BigInt::zero(),
             leaf_count: 0,
             longest_branch: 0,
+            full_prefix: Vec::new(),
+            fully_loaded: true,
         }
     }
 

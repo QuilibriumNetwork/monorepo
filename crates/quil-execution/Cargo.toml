@@ -33,6 +33,7 @@ tempfile = "3"
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-engine = { path = "../quil-engine" }
 quil-p2p = { path = "../quil-p2p" }
+ed448-rust = { path = "../ed448-rust" }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }

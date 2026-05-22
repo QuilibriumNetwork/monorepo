@@ -1265,6 +1265,7 @@ impl AppShardHarness {
                 inclusion_prover: Some(
                     Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>,
                 ),
+                kv_db: None,
             };
 
             let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
@@ -4033,6 +4034,7 @@ async fn tier2_composite_end_to_end() {
             inclusion_prover: Some(
                 Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>,
             ),
+            kv_db: None,
         };
         let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
             core_id,
@@ -4309,6 +4311,7 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
             inclusion_prover: Some(
                 Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>,
             ),
+            kv_db: None,
         };
 
         let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(

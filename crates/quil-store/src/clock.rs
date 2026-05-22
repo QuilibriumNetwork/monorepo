@@ -494,6 +494,14 @@ impl store::ClockStore for RocksClockStore {
         // unfinalized prior frame, and the leader's event loop exits
         // with "building on fork or needs sync" the moment its own
         // QC arrives.
+        //
+        // Layout mirrors Go's `PebbleClockStore.PutGlobalClockFrameCandidate`
+        // (`node/store/clock.go:1143`): the header is stored alone at the
+        // candidate key, and each request bundle goes to its own
+        // `clockGlobalFrameRequestCandidateKey`. Storing the whole
+        // GlobalFrame at the candidate key produces decode errors on
+        // read (the getter expects a GlobalFrameHeader).
+        use prost::Message as _;
         let header = match frame.header.as_ref() {
             Some(h) => h,
             None => return Ok(()),
@@ -502,14 +510,25 @@ impl store::ClockStore for RocksClockStore {
             .map(|h| h.to_vec())
             .unwrap_or_default();
         let frame_number = header.frame_number;
+
+        let header_bytes = header.encode_to_vec();
         let key = encoding::clock_global_frame_candidate_key(frame_number, &identity);
-        let bytes = {
-            use prost::Message as _;
-            frame.encode_to_vec()
-        };
         self.db
-            .put(&key, &bytes)
+            .put(&key, &header_bytes)
             .map_err(|e| QuilError::Store(e.to_string()))?;
+
+        for (i, request) in frame.requests.iter().enumerate() {
+            let idx = i as u16;
+            let req_key = encoding::clock_global_frame_request_candidate_key(
+                &identity,
+                frame_number,
+                idx,
+            );
+            let req_bytes = request.encode_to_vec();
+            self.db
+                .put(&req_key, &req_bytes)
+                .map_err(|e| QuilError::Store(e.to_string()))?;
+        }
         Ok(())
     }
     fn get_global_clock_frame_candidate(
@@ -517,25 +536,228 @@ impl store::ClockStore for RocksClockStore {
         frame_number: u64,
         selector: &[u8],
     ) -> Result<proto::global::GlobalFrame> {
+        // Mirror Go's `PebbleClockStore.GetGlobalClockFrameCandidate`
+        // (`node/store/clock.go:1193`). Go stores the candidate as
+        // `proto.Marshal(frame.Header)` at the candidate key — i.e.
+        // just the `GlobalFrameHeader` — and the request bundles
+        // separately under `clockGlobalFrameRequestCandidateKey`.
+        // Reading the candidate key as a `GlobalFrame` directly was a
+        // silent bug: prost decoded zero-valued defaults for the
+        // non-matching fields and the caller proceeded with an empty
+        // frame, which the forks tree quietly rejected.
         let key = encoding::clock_global_frame_candidate_key(frame_number, selector);
-        if let Some(bytes) = self
+        let header_bytes = match self
             .db
             .get(&key)
             .map_err(|e| QuilError::Store(e.to_string()))?
         {
-            return proto::global::GlobalFrame::decode(bytes.as_slice())
-                .map_err(|e| QuilError::Serialization(e.to_string()));
+            Some(b) => b,
+            None => return self.get_global_frame(frame_number),
+        };
+        // Read as GlobalFrameHeader (Go's format). If that fails, an
+        // older Rust build wrote the whole GlobalFrame at this key —
+        // try that fallback and extract the header. Recovers stores
+        // touched by the pre-fix put_global_clock_frame_candidate.
+        let (header, embedded_requests) =
+            match proto::global::GlobalFrameHeader::decode(header_bytes.as_slice()) {
+                Ok(h) if h.frame_number != 0 || frame_number == 0 => (h, Vec::new()),
+                _ => {
+                    // The header-as-GlobalFrame decode either errored or
+                    // produced a frame_number=0 header that doesn't match
+                    // our lookup, which is the prost signature of a
+                    // wire-type mismatch. Try the full GlobalFrame layout.
+                    let frame = proto::global::GlobalFrame::decode(header_bytes.as_slice())
+                        .map_err(|e| QuilError::Serialization(format!(
+                            "candidate decode at frame {}: {}", frame_number, e
+                        )))?;
+                    let h = frame.header.ok_or_else(|| QuilError::NotFound(format!(
+                        "candidate at frame {} has no header", frame_number
+                    )))?;
+                    (h, frame.requests)
+                }
+            };
+
+        // Reassemble the per-frame request bundles. Each request is
+        // stored at a separate `[0x00, 0xF8, selector, frame, idx]`
+        // key; iterate by index until the first miss.
+        let mut requests: Vec<proto::global::MessageBundle> = embedded_requests;
+        if requests.is_empty() {
+            for i in 0u16.. {
+                let req_key = encoding::clock_global_frame_request_candidate_key(
+                    selector, frame_number, i,
+                );
+                let req_bytes = match self
+                    .db
+                    .get(&req_key)
+                    .map_err(|e| QuilError::Store(e.to_string()))?
+                {
+                    Some(b) => b,
+                    None => break,
+                };
+                let bundle = proto::global::MessageBundle::decode(req_bytes.as_slice())
+                    .map_err(|e| QuilError::Serialization(format!(
+                        "candidate request {} decode at frame {}: {}",
+                        i, frame_number, e
+                    )))?;
+                requests.push(bundle);
+            }
         }
-        // Fall back to the canonical frame at this number for legacy
-        // callers that pass an unknown selector.
-        self.get_global_frame(frame_number)
+
+        Ok(proto::global::GlobalFrame {
+            header: Some(header),
+            requests,
+        })
     }
-    fn delete_global_clock_frame_range(&self, _: u64, _: u64) -> Result<()> { Ok(()) }
-    fn reset_global_clock_frames(&self) -> Result<()> { Ok(()) }
-    fn get_latest_certified_global_state(&self) -> Result<proto::global::GlobalProposal> { Err(QuilError::NotFound("stub".into())) }
-    fn get_earliest_certified_global_state(&self) -> Result<proto::global::GlobalProposal> { Err(QuilError::NotFound("stub".into())) }
-    fn get_certified_global_state(&self, _: u64) -> Result<proto::global::GlobalProposal> { Err(QuilError::NotFound("stub".into())) }
-    fn put_certified_global_state(&self, _: &proto::global::GlobalProposal, _t: &dyn store::Transaction) -> Result<()> { Ok(()) }
+    fn delete_global_clock_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()> {
+        let lower = encoding::clock_global_frame_key(min_frame);
+        let upper = encoding::clock_global_frame_key(max_frame);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range(&lower, &upper);
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn reset_global_clock_frames(&self) -> Result<()> {
+        let lo = encoding::clock_global_frame_key(0);
+        let hi = encoding::clock_global_frame_key(20_000_000);
+        let earliest = encoding::clock_global_earliest_index();
+        let latest = encoding::clock_global_latest_index();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range(&lo, &hi);
+        batch.delete(&earliest);
+        batch.delete(&latest);
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_latest_certified_global_state(&self) -> Result<proto::global::GlobalProposal> {
+        let key = encoding::clock_global_certified_state_latest_index();
+        let rank = self.read_u64_index(&key)
+            .ok_or_else(|| QuilError::NotFound("no certified global state".into()))?;
+        <Self as store::ClockStore>::get_certified_global_state(self, rank)
+    }
+    fn get_earliest_certified_global_state(&self) -> Result<proto::global::GlobalProposal> {
+        let key = encoding::clock_global_certified_state_earliest_index();
+        let rank = self.read_u64_index(&key)
+            .ok_or_else(|| QuilError::NotFound("no certified global state".into()))?;
+        <Self as store::ClockStore>::get_certified_global_state(self, rank)
+    }
+    fn get_certified_global_state(&self, rank: u64) -> Result<proto::global::GlobalProposal> {
+        let key = encoding::clock_global_certified_state_key(rank);
+        let data = self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))?
+            .ok_or_else(|| QuilError::NotFound(format!("certified global state at rank {} not found", rank)))?;
+        if data.len() != 24 {
+            return Err(QuilError::Serialization(format!(
+                "certified global state at rank {} has unexpected length {} (want 24)",
+                rank, data.len(),
+            )));
+        }
+        let frame_number = u64::from_be_bytes(data[..8].try_into().unwrap());
+        let qc_rank = u64::from_be_bytes(data[8..16].try_into().unwrap());
+        let tc_rank = u64::from_be_bytes(data[16..24].try_into().unwrap());
+
+        // Mirror Go: assemble GlobalProposal from individually-stored
+        // sub-records. Missing sub-records are tolerated (sentinel
+        // 0xFFFFFFFFFFFFFFFF means "no QC/TC was recorded"), so the
+        // proposal can still be returned with whatever's present.
+        let mut proposal = proto::global::GlobalProposal::default();
+
+        if frame_number != u64::MAX {
+            if let Ok(frame) = self.get_global_frame(frame_number) {
+                if let Some(header) = frame.header.as_ref() {
+                    if let Ok(vote) = <Self as store::ClockStore>::get_proposal_vote(
+                        self,
+                        &[],
+                        header.rank,
+                        &header.prover,
+                    ) {
+                        proposal.vote = Some(vote);
+                    }
+                }
+                proposal.state = Some(frame);
+            }
+        }
+        if qc_rank != u64::MAX {
+            if let Ok(qc) = <Self as store::ClockStore>::get_quorum_certificate(self, &[], qc_rank) {
+                proposal.parent_quorum_certificate = Some(qc);
+            }
+        }
+        if tc_rank != u64::MAX {
+            if let Ok(tc) = <Self as store::ClockStore>::get_timeout_certificate(self, &[], tc_rank) {
+                proposal.prior_rank_timeout_certificate = Some(tc);
+            }
+        }
+        Ok(proposal)
+    }
+    fn put_certified_global_state(
+        &self,
+        state: &proto::global::GlobalProposal,
+        txn: &dyn store::Transaction,
+    ) -> Result<()> {
+        let mut rank: u64 = 0;
+        let mut frame_number: u64 = u64::MAX;
+        let mut qc_rank: u64 = u64::MAX;
+        let mut tc_rank: u64 = u64::MAX;
+
+        if let Some(frame) = state.state.as_ref() {
+            if let Some(header) = frame.header.as_ref() {
+                if header.rank > rank {
+                    rank = header.rank;
+                }
+                frame_number = header.frame_number;
+            }
+            self.put_global_frame(frame, Some(txn))?;
+            if let Some(vote) = state.vote.as_ref() {
+                <Self as store::ClockStore>::put_proposal_vote(self, txn, vote)?;
+            }
+        }
+        if let Some(qc) = state.parent_quorum_certificate.as_ref() {
+            if qc.rank > rank {
+                rank = qc.rank;
+            }
+            qc_rank = qc.rank;
+            <Self as store::ClockStore>::put_quorum_certificate(self, qc, txn)?;
+        }
+        if let Some(tc) = state.prior_rank_timeout_certificate.as_ref() {
+            if tc.rank > rank {
+                rank = tc.rank;
+            }
+            tc_rank = tc.rank;
+            <Self as store::ClockStore>::put_timeout_certificate(self, tc, txn)?;
+        }
+
+        let key = encoding::clock_global_certified_state_key(rank);
+        let mut value = Vec::with_capacity(24);
+        value.extend_from_slice(&frame_number.to_be_bytes());
+        value.extend_from_slice(&qc_rank.to_be_bytes());
+        value.extend_from_slice(&tc_rank.to_be_bytes());
+
+        let earliest_key = encoding::clock_global_certified_state_earliest_index();
+        let latest_key = encoding::clock_global_certified_state_latest_index();
+        let current_earliest = self.read_u64_index(&earliest_key);
+        let current_latest = self.read_u64_index(&latest_key);
+        let update_earliest = current_earliest.is_none() || rank < current_earliest.unwrap();
+        let update_latest = current_latest.is_none() || rank > current_latest.unwrap();
+
+        let staged = with_clock_batch(txn, |b| {
+            b.put(&key, &value);
+            if update_earliest {
+                b.put(&earliest_key, rank.to_be_bytes());
+            }
+            if update_latest {
+                b.put(&latest_key, rank.to_be_bytes());
+            }
+        });
+        if staged {
+            return Ok(());
+        }
+
+        // Non-Rocks txn: fall through to direct writes.
+        txn.set(&key, &value)?;
+        if update_earliest {
+            txn.set(&earliest_key, &rank.to_be_bytes())?;
+        }
+        if update_latest {
+            txn.set(&latest_key, &rank.to_be_bytes())?;
+        }
+        Ok(())
+    }
     fn get_latest_quorum_certificate(&self, f: &[u8]) -> Result<proto::global::QuorumCertificate> {
         let key = encoding::clock_quorum_certificate_latest_index(f);
         let rank = self.read_u64_index(&key).ok_or_else(|| QuilError::NotFound("no QC".into()))?;
@@ -545,7 +767,13 @@ impl store::ClockStore for RocksClockStore {
         proto::global::QuorumCertificate::decode(data.as_slice())
             .map_err(|e| QuilError::Serialization(e.to_string()))
     }
-    fn get_quorum_certificate(&self, _: &[u8], _: u64) -> Result<proto::global::QuorumCertificate> { Err(QuilError::NotFound("stub".into())) }
+    fn get_quorum_certificate(&self, filter: &[u8], rank: u64) -> Result<proto::global::QuorumCertificate> {
+        let qc_key = encoding::clock_quorum_certificate_key(rank, filter);
+        let data = self.db.get(&qc_key).map_err(|e| QuilError::Store(e.to_string()))?
+            .ok_or_else(|| QuilError::NotFound(format!("QC not found at rank {}", rank)))?;
+        proto::global::QuorumCertificate::decode(data.as_slice())
+            .map_err(|e| QuilError::Serialization(e.to_string()))
+    }
     fn put_quorum_certificate(&self, qc: &proto::global::QuorumCertificate, t: &dyn store::Transaction) -> Result<()> {
         // Empty filter = global; the existing inherent method writes
         // both the QC row and the latest-index marker, and now honors
@@ -567,9 +795,56 @@ impl store::ClockStore for RocksClockStore {
         }
         self.put_quorum_certificate(qc, &[], None)
     }
-    fn get_latest_timeout_certificate(&self, _: &[u8]) -> Result<proto::global::TimeoutCertificate> { Err(QuilError::NotFound("stub".into())) }
-    fn get_timeout_certificate(&self, _: &[u8], _: u64) -> Result<proto::global::TimeoutCertificate> { Err(QuilError::NotFound("stub".into())) }
-    fn put_timeout_certificate(&self, _: &proto::global::TimeoutCertificate, _t: &dyn store::Transaction) -> Result<()> { Ok(()) }
+    fn get_latest_timeout_certificate(&self, filter: &[u8]) -> Result<proto::global::TimeoutCertificate> {
+        let idx = encoding::clock_timeout_certificate_latest_index(filter);
+        let rank = self.read_u64_index(&idx)
+            .ok_or_else(|| QuilError::NotFound("no timeout certificates stored".into()))?;
+        <Self as store::ClockStore>::get_timeout_certificate(self, filter, rank)
+    }
+    fn get_timeout_certificate(&self, filter: &[u8], rank: u64) -> Result<proto::global::TimeoutCertificate> {
+        let key = encoding::clock_timeout_certificate_key(rank, filter);
+        let data = self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))?
+            .ok_or_else(|| QuilError::NotFound(format!("TC not found at rank {}", rank)))?;
+        proto::global::TimeoutCertificate::decode(data.as_slice())
+            .map_err(|e| QuilError::Serialization(e.to_string()))
+    }
+    fn put_timeout_certificate(
+        &self,
+        tc: &proto::global::TimeoutCertificate,
+        txn: &dyn store::Transaction,
+    ) -> Result<()> {
+        let filter = tc.filter.as_slice();
+        let key = encoding::clock_timeout_certificate_key(tc.rank, filter);
+        let data = tc.encode_to_vec();
+        let earliest_key = encoding::clock_timeout_certificate_earliest_index(filter);
+        let latest_key = encoding::clock_timeout_certificate_latest_index(filter);
+        let current_earliest = self.read_u64_index(&earliest_key);
+        let current_latest = self.read_u64_index(&latest_key);
+        let update_earliest = current_earliest.is_none() || tc.rank < current_earliest.unwrap();
+        let update_latest = current_latest.is_none() || tc.rank > current_latest.unwrap();
+
+        let staged = with_clock_batch(txn, |b| {
+            b.put(&key, &data);
+            if update_earliest {
+                b.put(&earliest_key, tc.rank.to_be_bytes());
+            }
+            if update_latest {
+                b.put(&latest_key, tc.rank.to_be_bytes());
+            }
+        });
+        if staged {
+            return Ok(());
+        }
+        // Non-Rocks txn fallback: direct DB writes.
+        self.db.put(&key, &data).map_err(|e| QuilError::Store(e.to_string()))?;
+        if update_earliest {
+            self.db.put(&earliest_key, tc.rank.to_be_bytes()).map_err(|e| QuilError::Store(e.to_string()))?;
+        }
+        if update_latest {
+            self.db.put(&latest_key, tc.rank.to_be_bytes()).map_err(|e| QuilError::Store(e.to_string()))?;
+        }
+        Ok(())
+    }
     fn get_latest_shard_clock_frame(&self, filter: &[u8]) -> Result<proto::global::AppShardFrame> {
         let idx_key = encoding::clock_shard_latest_index(filter);
         let fn_ = self.read_u64_index(&idx_key).ok_or_else(|| QuilError::NotFound("no shard frame".into()))?;
@@ -581,18 +856,47 @@ impl store::ClockStore for RocksClockStore {
             .ok_or_else(|| QuilError::NotFound("shard frame not found".into()))?;
         proto::global::AppShardFrame::decode(data.as_slice()).map_err(|e| QuilError::Serialization(e.to_string()))
     }
-    fn commit_shard_clock_frame(&self, filter: &[u8], frame_number: u64, _selector: &[u8], t: &dyn store::Transaction, _backfill: bool) -> Result<()> {
-        let idx_key = encoding::clock_shard_latest_index(filter);
-        let current = self.read_u64_index(&idx_key);
-        // Same fix-pattern as `put_global_frame` / `put_quorum_certificate`:
-        // when no shard frame has been committed yet, this IS the
-        // latest. `> unwrap_or(0)` would silently drop the index
-        // update for the very first commit at frame 0.
-        if current.is_none() || frame_number > current.unwrap() {
-            if with_clock_batch(t, |b| b.put(&idx_key, frame_number.to_be_bytes())) {
-                return Ok(());
+    fn commit_shard_clock_frame(&self, filter: &[u8], frame_number: u64, selector: &[u8], t: &dyn store::Transaction, backfill: bool) -> Result<()> {
+        // Copy the staged frame to the canonical key so subsequent
+        // `get_shard_clock_frame` / `get_latest_shard_clock_frame`
+        // calls can find it. Without this, the leader at rank N+1
+        // would never see rank N's frame: stage writes to the staged
+        // key only, and commit previously only bumped the latest
+        // index pointer — leaving the canonical key empty.
+        //
+        // Mirrors Go's `PebbleClockStore.CommitShardClockFrame`
+        // (`node/store/clock.go:1475`), which writes the parent-index
+        // key as the VALUE at the canonical frame key. We instead
+        // write the frame proto directly to keep `get_shard_clock_frame`
+        // single-hop; Go's legacy frame format is the same shape, and
+        // Go's GetShardClockFrame already accepts a non-pointer value
+        // at the canonical key (the `else` branch at clock.go:1290).
+        let staged_key = encoding::clock_shard_staged_key(selector, frame_number);
+        if let Some(staged_bytes) = self
+            .db
+            .get(&staged_key)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+        {
+            let canonical_key = encoding::clock_shard_frame_key(filter, frame_number);
+            if !with_clock_batch(t, |b| b.put(&canonical_key, &staged_bytes)) {
+                self.db
+                    .put(&canonical_key, &staged_bytes)
+                    .map_err(|e| QuilError::Store(e.to_string()))?;
             }
-            self.db.put(&idx_key, frame_number.to_be_bytes()).map_err(|e| QuilError::Store(e.to_string()))?;
+        }
+
+        // Update the latest-index pointer (skipped during backfill,
+        // matching Go).
+        if !backfill {
+            let idx_key = encoding::clock_shard_latest_index(filter);
+            let current = self.read_u64_index(&idx_key);
+            if current.is_none() || frame_number > current.unwrap() {
+                if !with_clock_batch(t, |b| b.put(&idx_key, frame_number.to_be_bytes())) {
+                    self.db
+                        .put(&idx_key, frame_number.to_be_bytes())
+                        .map_err(|e| QuilError::Store(e.to_string()))?;
+                }
+            }
         }
         Ok(())
     }
@@ -615,8 +919,64 @@ impl store::ClockStore for RocksClockStore {
         let key = encoding::clock_shard_latest_index(filter);
         self.db.put(&key, &n.to_be_bytes()).map_err(|e| QuilError::Store(e.to_string()))
     }
-    fn delete_shard_clock_frame_range(&self, _filter: &[u8], _min: u64, _max: u64) -> Result<()> { Ok(()) }
-    fn reset_shard_clock_frames(&self, _filter: &[u8]) -> Result<()> { Ok(()) }
+    fn delete_shard_clock_frame_range(
+        &self,
+        filter: &[u8],
+        from_frame: u64,
+        to_frame: u64,
+    ) -> Result<()> {
+        let zeros = [0u8; 32];
+        let ones = [0xffu8; 32];
+        let mut batch = rocksdb::WriteBatch::default();
+        for i in from_frame..to_frame {
+            // Shard parent index entries — delete the entire selector
+            // range for this frame.
+            let parent_lo = encoding::clock_shard_parent_index_key(filter, i, &zeros);
+            let parent_hi = encoding::clock_shard_parent_index_key(filter, i, &ones);
+            batch.delete_range(&parent_lo, &parent_hi);
+
+            // The shard frame itself.
+            let shard_key = encoding::clock_shard_frame_key(filter, i);
+            batch.delete(&shard_key);
+
+            // Prover-trie keys are not contiguous in `frame_number`
+            // order — scan the per-ring entries and delete each.
+            let mut ring: u16 = 0;
+            loop {
+                let trie_key = encoding::clock_prover_trie_key(filter, ring, i);
+                match self.db.get(&trie_key) {
+                    Ok(Some(_)) => batch.delete(&trie_key),
+                    Ok(None) => break,
+                    Err(e) => return Err(QuilError::Store(e.to_string())),
+                }
+                ring = match ring.checked_add(1) {
+                    Some(n) => n,
+                    None => break,
+                };
+            }
+
+            // Total-distance entries — same selector-range form.
+            let td_lo = encoding::clock_data_total_distance_key(filter, i, &zeros);
+            let td_hi = encoding::clock_data_total_distance_key(filter, i, &ones);
+            batch.delete_range(&td_lo, &td_hi);
+        }
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn reset_shard_clock_frames(&self, filter: &[u8]) -> Result<()> {
+        let lo = encoding::clock_shard_frame_key(filter, 0);
+        let hi = encoding::clock_shard_frame_key(filter, 200_000);
+        // Go's reset deletes both the earliest (clockDataEarliestIndex)
+        // and the latest (clockShardLatestIndex). The Rust port doesn't
+        // distinguish a separate "data earliest" index — the shard
+        // store's earliest is implicit on the first frame written. We
+        // only need to clear the latest-index marker.
+        let latest = encoding::clock_shard_latest_index(filter);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range(&lo, &hi);
+        batch.delete(&latest);
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(())
+    }
     fn get_latest_certified_app_shard_state(&self, filter: &[u8]) -> Result<proto::global::AppShardProposal> {
         let idx_key = encoding::clock_app_certified_state_latest_index(filter);
         let rank = self.read_u64_index(&idx_key).ok_or_else(|| QuilError::NotFound("no app state".into()))?;

@@ -72,6 +72,14 @@ pub struct ConsensusActivationParams {
     /// rejects the embedded genesis QC and the chain stalls.
     pub genesis_qc_override:
         Option<crate::consensus_wire::QuorumCertificate>,
+    /// Backing KV store for persistent consensus + liveness state.
+    /// `None` falls back to an in-memory store (tests, ad-hoc
+    /// bootstraps); production wires this to the node's RocksDB
+    /// so safety / liveness state survives restarts. Without
+    /// persistence, a node that restarts after a crash forgets
+    /// `finalized_rank` and could vote for a conflicting QC —
+    /// a real safety hazard, not just a perf concern.
+    pub kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
 }
 
 /// What `activate_consensus` produces: the event-loop handle plus
@@ -125,15 +133,21 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
             .unwrap_or_default()
             .to_vec()
     });
-    let vote_domain =
-        quil_crypto::poseidon::hash_bytes_to_32(b"GLOBAL_CONSENSUS_VOTE")
-            .unwrap_or_default()
-            .to_vec();
+    // Domain separation tags — MUST match Go byte-for-byte so QCs and
+    // TCs produced by either side cross-verify. Go uses literal ASCII
+    // (`node/consensus/global/consensus_voting_provider.go:111,155`):
+    //   - vote:    `[]byte("global")`
+    //   - timeout: `[]byte("globaltimeout")`
+    // Earlier we used poseidon hashes of `"GLOBAL_CONSENSUS_VOTE"` /
+    // `"GLOBAL_CONSENSUS_TIMEOUT"`; that's domain-correct between two
+    // Rust nodes but unable to verify any QC formed by Go (which is
+    // exactly what a migrated store ships — the persisted rank-N QC
+    // was signed by Go before migration, and every restart embeds it
+    // as `latest_quorum_certificate` in every outgoing timeout, so
+    // every node rejects every timeout and the chain stalls).
+    let vote_domain = b"global".to_vec();
     let vote_domain_for_return = vote_domain.clone();
-    let timeout_domain =
-        quil_crypto::poseidon::hash_bytes_to_32(b"GLOBAL_CONSENSUS_TIMEOUT")
-            .unwrap_or_default()
-            .to_vec();
+    let timeout_domain = b"globaltimeout".to_vec();
     let timeout_domain_for_return = timeout_domain.clone();
 
     let factory = Arc::new(GlobalVoteFactory);
@@ -171,58 +185,116 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
     // with "could not load liveness data". Mirror Go's startup path
     // which writes this record before spawning the loop on a fresh
     // testnet/devnet bootstrap.
-    let mem_store = Arc::new(MemConsensusStore::new());
-    {
+    // Choose backing store. Production wires `kv_db = Some(...)`
+    // so safety + liveness state survive restarts; tests pass
+    // `None` for a transient in-memory store.
+    let store: Arc<dyn quil_consensus::event_handler::ConsensusStore<GlobalVote>> =
+        match params.kv_db.as_ref() {
+            Some(kv) => Arc::new(crate::consensus_store::KvConsensusStore::new(
+                kv.clone(),
+                Arc::new(crate::consensus_glue::GlobalConsensusCodec),
+                Arc::new(|_filter: &[u8]| panic!(
+                    "bootstrap_consensus closure invoked — should be seeded \
+                     before first read; see consensus_activation.rs"
+                )),
+                Arc::new(|_filter: &[u8]| panic!(
+                    "bootstrap_liveness closure invoked — should be seeded \
+                     before first read; see consensus_activation.rs"
+                )),
+            )),
+            None => Arc::new(MemConsensusStore::new()),
+        };
+    let seed_store = store.clone();
+    // If the persistent store already has consensus state for this
+    // filter, leave it alone — overwriting on every restart would
+    // erase the finalized_rank / latest_QC the previous run worked
+    // hard to advance. Only seed when the store is fresh.
+    // The pacemaker and safety_rules both read state keyed by
+    // `config.filter`. For global consensus that's empty (matching
+    // Go's `nil` filter on CONSENSUS keys), but the test path passes
+    // a `config_override`, so use whatever the live config carries
+    // rather than hardcoding empty.
+    let consensus_filter: Vec<u8> = config.filter.clone();
+    let needs_seed: bool = match params.kv_db.as_ref() {
+        Some(kv) => {
+            let key = quil_store::encoding::consensus_state_key(&consensus_filter);
+            match kv.get(&key) {
+                Ok(Some(_)) => false,
+                _ => true,
+            }
+        }
+        None => true,
+    };
+    if needs_seed {
+        // For migrated stores the "genesis_frame" caller passes is
+        // actually the LATEST finalized frame (see the comment on
+        // `build_genesis_certified_state` — same misnomer). The QC
+        // identity must hash the *current* trusted root's header
+        // output, not the literal genesis output, otherwise the
+        // event handler's parent-QC check fails the moment a real
+        // proposal arrives.
         let frame_identity: Vec<u8> = match params.genesis_frame.header.as_ref() {
             Some(h) => quil_crypto::poseidon::hash_bytes_to_32(&h.output)
                 .map(|hash| hash.to_vec())
                 .unwrap_or_default(),
             None => Vec::new(),
         };
-        let genesis_qc = params.genesis_qc_override.clone().unwrap_or_else(|| {
+        // Where we are in the chain. A fresh testnet bootstrap has
+        // rank=0 here; a node migrated from a Go store has whatever
+        // rank its latest finalized frame carries (e.g. 414).
+        let trusted_rank: u64 = params
+            .genesis_frame
+            .header
+            .as_ref()
+            .map(|h| h.rank)
+            .unwrap_or(0);
+
+        // Seed QC for the trusted root. Identity = poseidon(output)
+        // (matches `build_genesis_certified_state`'s `qc_identity`),
+        // rank = `trusted_rank` so the event handler's
+        // `qc.rank() + 1 == cur_rank` happy-path check accepts it as
+        // the previous-round QC. Caller override (a real QC loaded
+        // from store) takes precedence.
+        let seed_qc = params.genesis_qc_override.clone().unwrap_or_else(|| {
             crate::consensus_wire::QuorumCertificate::genesis(
-                0, // genesis frame number
-                frame_identity,
+                trusted_rank,
+                frame_identity.clone(),
             )
         });
-        let genesis_qc_obj: Arc<dyn quil_consensus::models::QuorumCertificate> =
-            genesis_qc.into_trait_object();
-        // current_rank starts at 1: the genesis QC is for rank 0, and
-        // the event handler's happy-path check at
-        // `event_handler.rs:457` requires `qc.rank() + 1 == cur_rank`.
-        // With cur_rank = 0 and genesis_qc.rank = 0, the check fails
-        // and execution falls into the recovery path which demands a
-        // prior_rank_tc — none exists at genesis, so the loop exits
-        // with "expected prior_rank_tc to be Some". Setting cur_rank
-        // to 1 makes the leader at rank 1 see the genesis QC as the
-        // proper "previous-round QC" and proceed to propose frame 1.
+        let seed_qc_obj: Arc<dyn quil_consensus::models::QuorumCertificate> =
+            seed_qc.into_trait_object();
+        // current_rank = trusted_rank + 1 so the leader at the next
+        // rank sees the seed QC as its previous-round QC. On a fresh
+        // testnet bootstrap (trusted_rank=0) this is 1, matching
+        // pre-migration behaviour. On a migrated store
+        // (trusted_rank=414) this is 415.
         let liveness = quil_consensus::models::LivenessState {
-            filter: Vec::new(),
-            current_rank: 1,
-            latest_quorum_certificate: genesis_qc_obj,
+            filter: consensus_filter.clone(),
+            current_rank: trusted_rank.saturating_add(1),
+            latest_quorum_certificate: seed_qc_obj,
             prior_rank_timeout_certificate: None,
         };
         if let Err(e) = quil_consensus::event_handler::ConsensusStore::<GlobalVote>::put_liveness_state(
-            mem_store.as_ref(),
+            seed_store.as_ref(),
             &liveness,
         ) {
             return Err(QuilError::Consensus(format!(
-                "failed to seed genesis liveness state: {}", e
+                "failed to seed liveness state: {}", e
             )));
         }
 
-        // Same story for safety data: SafetyRules calls
-        // `store.get_consensus_state(filter)` on construction. Seed it
-        // with the genesis defaults so a fresh testnet bootstrap doesn't
-        // abort with "could not load safety data".
+        // Safety data: finalized_rank tracks the highest rank we've
+        // committed locally. For a migrated store that's `trusted_rank`
+        // (everything up to and including it is on disk). For a fresh
+        // bootstrap it's 0.
         let consensus_state = quil_consensus::models::ConsensusState::<GlobalVote> {
-            filter: Vec::new(),
-            finalized_rank: 0,
-            latest_acknowledged_rank: 0,
+            filter: consensus_filter.clone(),
+            finalized_rank: trusted_rank,
+            latest_acknowledged_rank: trusted_rank,
             latest_timeout: None,
         };
         if let Err(e) = quil_consensus::event_handler::ConsensusStore::<GlobalVote>::put_consensus_state(
-            mem_store.as_ref(),
+            seed_store.as_ref(),
             &consensus_state,
         ) {
             return Err(QuilError::Consensus(format!(
@@ -230,7 +302,8 @@ pub fn activate_consensus(params: ConsensusActivationParams) -> Result<Consensus
             )));
         }
     }
-    let store: Arc<dyn quil_consensus::event_handler::ConsensusStore<GlobalVote>> = mem_store;
+    // `store` was created above; `seed_store` is the same Arc.
+    drop(seed_store);
 
     let components = spawn_global_consensus(
         config,

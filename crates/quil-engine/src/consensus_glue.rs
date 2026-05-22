@@ -824,20 +824,94 @@ impl ConsensusStateCodec<GlobalVote> for GlobalConsensusCodec {
     }
 
     fn encode_liveness_state(&self, state: &LivenessState) -> Result<Vec<u8>> {
+        // Layout: filter_len(u32) + filter + current_rank(u64) +
+        // qc_bytes_len(u32) + qc_canonical_bytes +
+        // tc_bytes_len(u32) + tc_canonical_bytes (0 if absent)
         let mut out = Vec::new();
         out.extend_from_slice(&(state.filter.len() as u32).to_be_bytes());
         out.extend_from_slice(&state.filter);
         out.extend_from_slice(&state.current_rank.to_be_bytes());
+
+        let qc = crate::consensus_wire::QuorumCertificate::from_trait_object(
+            state.latest_quorum_certificate.as_ref(),
+        );
+        let qc_bytes = qc.to_canonical_bytes()?;
+        out.extend_from_slice(&(qc_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&qc_bytes);
+
+        match state.prior_rank_timeout_certificate.as_ref() {
+            Some(tc) => {
+                let wire_tc = crate::consensus_wire::TimeoutCertificate::from_trait_object(tc.as_ref());
+                let tc_bytes = wire_tc.to_canonical_bytes()?;
+                out.extend_from_slice(&(tc_bytes.len() as u32).to_be_bytes());
+                out.extend_from_slice(&tc_bytes);
+            }
+            None => {
+                out.extend_from_slice(&0u32.to_be_bytes());
+            }
+        }
         Ok(out)
     }
 
-    fn decode_liveness_state(&self, _bytes: &[u8]) -> Result<LivenessState> {
-        // LivenessState requires a non-optional Arc<dyn QuorumCertificate>.
-        // For bootstrap/cold-start, we'd need a genesis QC. For now,
-        // return an error — the store falls back to the bootstrap closure.
-        Err(QuilError::InvalidArgument(
-            "liveness decode: use bootstrap closure for cold start".into(),
-        ))
+    fn decode_liveness_state(&self, bytes: &[u8]) -> Result<LivenessState> {
+        fn need(bytes: &[u8], off: usize, n: usize, what: &str) -> Result<()> {
+            if off + n > bytes.len() {
+                return Err(QuilError::InvalidArgument(format!(
+                    "liveness decode: short read at {} (need {})", what, n
+                )));
+            }
+            Ok(())
+        }
+        need(bytes, 0, 4, "filter_len")?;
+        let filter_len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let mut off = 4;
+        need(bytes, off, filter_len, "filter")?;
+        let filter = bytes[off..off + filter_len].to_vec();
+        off += filter_len;
+        need(bytes, off, 8, "current_rank")?;
+        let current_rank = u64::from_be_bytes(bytes[off..off + 8].try_into().unwrap());
+        off += 8;
+        need(bytes, off, 4, "qc_len")?;
+        let qc_len = u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        need(bytes, off, qc_len, "qc_bytes")?;
+        let qc_bytes = &bytes[off..off + qc_len];
+        off += qc_len;
+        let qc = crate::consensus_wire::QuorumCertificate::from_canonical_bytes(qc_bytes)?;
+        need(bytes, off, 4, "tc_len")?;
+        let tc_len = u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        let prior_tc = if tc_len == 0 {
+            None
+        } else {
+            need(bytes, off, tc_len, "tc_bytes")?;
+            let tc_bytes = &bytes[off..off + tc_len];
+            let tc = crate::consensus_wire::TimeoutCertificate::from_canonical_bytes(tc_bytes)?;
+            // Compat: an older binary persisted TCs without a populated
+            // signer bitmask (the `BlsAggregatedSignature` wrapper used
+            // to return `&[]`). Restoring such a TC into the pacemaker
+            // would embed it as `prior_rank_TC` in our next outgoing
+            // timeout, and peers running the bitmask-aware build would
+            // reject it for "bitmask length 0 too short for committee
+            // size N". Drop it on restore; local timeout aggregation
+            // will re-form a valid TC once enough peer timeouts arrive
+            // for the recovery rank.
+            if tc.aggregate_signature.bitmask.is_empty() {
+                tracing::warn!(
+                    rank = tc.rank,
+                    "dropping persisted prior_rank_TC with empty bitmask (old format)",
+                );
+                None
+            } else {
+                Some(tc.into_trait_object())
+            }
+        };
+        Ok(LivenessState {
+            filter,
+            current_rank,
+            latest_quorum_certificate: qc.into_trait_object(),
+            prior_rank_timeout_certificate: prior_tc,
+        })
     }
 }
 

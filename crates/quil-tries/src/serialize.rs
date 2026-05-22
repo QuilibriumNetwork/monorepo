@@ -21,6 +21,103 @@ pub fn deserialize_tree(data: &[u8]) -> Result<Option<VectorCommitmentNode>> {
     deserialize_node(&mut cursor)
 }
 
+/// Per-node lazy storage encoding: branch children are NOT included —
+/// they live at their own keys and are fetched on demand via the by-path
+/// index. Leaf value is also stripped (the per-vertex keyspace owns it).
+pub fn serialize_node_solo(node: &VectorCommitmentNode) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(128);
+    match node {
+        VectorCommitmentNode::Leaf(leaf) => {
+            buf.push(TYPE_LEAF);
+            write_length_prefixed(&mut buf, &leaf.key)?;
+            write_length_prefixed(&mut buf, &[])?;
+            write_length_prefixed(&mut buf, &leaf.hash_target)?;
+            write_length_prefixed(&mut buf, &leaf.commitment)?;
+            let size_bytes = leaf.size.to_signed_bytes_be();
+            write_length_prefixed(&mut buf, &size_bytes)?;
+        }
+        VectorCommitmentNode::Branch(branch) => {
+            buf.push(TYPE_BRANCH);
+            buf.extend_from_slice(&(branch.prefix.len() as u32).to_be_bytes());
+            for &p in &branch.prefix {
+                buf.extend_from_slice(&(p as i32).to_be_bytes());
+            }
+            write_length_prefixed(&mut buf, &branch.commitment)?;
+            let size_bytes = branch.size.to_signed_bytes_be();
+            write_length_prefixed(&mut buf, &size_bytes)?;
+            buf.extend_from_slice(&(branch.leaf_count as i64).to_be_bytes());
+            buf.extend_from_slice(&(branch.longest_branch as i32).to_be_bytes());
+        }
+    }
+    Ok(buf)
+}
+
+/// Inverse of [`serialize_node_solo`]. Branch children come back empty;
+/// the lazy walker loads them individually.
+pub fn deserialize_node_solo(data: &[u8]) -> Result<VectorCommitmentNode> {
+    let mut r = io::Cursor::new(data);
+    let mut type_byte = [0u8; 1];
+    r.read_exact(&mut type_byte)
+        .map_err(|e| QuilError::Serialization(e.to_string()))?;
+    match type_byte[0] {
+        TYPE_LEAF => {
+            let key = read_length_prefixed(&mut r)?;
+            let value = read_length_prefixed(&mut r)?;
+            let hash_target = read_length_prefixed(&mut r)?;
+            let commitment = read_length_prefixed(&mut r)?;
+            let size_bytes = read_length_prefixed(&mut r)?;
+            let size = if size_bytes.is_empty() {
+                BigInt::zero()
+            } else {
+                BigInt::from_signed_bytes_be(&size_bytes)
+            };
+            Ok(VectorCommitmentNode::Leaf(LeafNode {
+                key,
+                value,
+                hash_target,
+                commitment,
+                size,
+            }))
+        }
+        TYPE_BRANCH => {
+            let prefix_len = read_u32(&mut r)? as usize;
+            let mut prefix = Vec::with_capacity(prefix_len);
+            for _ in 0..prefix_len {
+                prefix.push(read_i32(&mut r)?);
+            }
+            let commitment = read_length_prefixed(&mut r)?;
+            let size_bytes = read_length_prefixed(&mut r)?;
+            let size = if size_bytes.is_empty() {
+                BigInt::zero()
+            } else {
+                BigInt::from_signed_bytes_be(&size_bytes)
+            };
+            let leaf_count = read_i64(&mut r)? as usize;
+            let longest_branch = read_i32(&mut r)? as usize;
+            let children: [Option<Box<VectorCommitmentNode>>; 64] =
+                std::array::from_fn(|_| None);
+            // `full_prefix` is filled in by the walker from its descent path.
+            Ok(VectorCommitmentNode::Branch(BranchNode {
+                prefix,
+                children,
+                commitment,
+                size,
+                leaf_count,
+                longest_branch,
+                full_prefix: Vec::new(),
+                fully_loaded: false,
+            }))
+        }
+        // TYPE_NIL is invalid in solo format — a non-existent node is
+        // represented by absence from the by-key index, not by a nil
+        // record.
+        other => Err(QuilError::Serialization(format!(
+            "deserialize_node_solo: unexpected node type byte {}",
+            other
+        ))),
+    }
+}
+
 /// Serialize a node to a writer.
 fn serialize_node(w: &mut Vec<u8>, node: Option<&VectorCommitmentNode>) -> Result<()> {
     match node {
@@ -31,13 +128,18 @@ fn serialize_node(w: &mut Vec<u8>, node: Option<&VectorCommitmentNode>) -> Resul
         Some(VectorCommitmentNode::Leaf(leaf)) => {
             w.push(TYPE_LEAF);
             write_length_prefixed(w, &leaf.key)?;
-            // Vertex content lives in the per-vertex keyspace; the
-            // commitment tree blob carries only topology + per-node
-            // commitments + leaf metadata. Emit a zero-length value
-            // so the on-disk shape stays stable and deserialize sees
-            // an empty value (callers needing the data look it up
-            // via `load_vertex_underlying_raw`).
-            write_length_prefixed(w, &[])?;
+            // Include the full leaf value. `add_vertex` writes leaves
+            // with `hash_target = []`, so the leaf commitment is
+            // `SHA512(0x00 || key || value)`. Stripping `value` here
+            // (the previous behaviour, mirrored from per-node solo
+            // encoding where the per-vertex keyspace holds the bytes)
+            // breaks every subsequent `tree.commit(prover)` reload —
+            // the recompute hashes `SHA512(key || empty)` and the
+            // root diverges from what we just wrote. The whole-tree
+            // blob is a local cache, so duplicating the value here
+            // is cheap compared with the cost of saving a broken
+            // commitment on every sync.
+            write_length_prefixed(w, &leaf.value)?;
             write_length_prefixed(w, &leaf.hash_target)?;
             write_length_prefixed(w, &leaf.commitment)?;
             let size_bytes = leaf.size.to_signed_bytes_be();
@@ -134,6 +236,9 @@ fn deserialize_node<R: Read>(r: &mut R) -> Result<Option<VectorCommitmentNode>> 
             let leaf_count = read_i64(r)? as usize;
             let longest_branch = read_i32(r)? as usize;
 
+            // Whole-tree deserialization always returns a fully-loaded
+            // tree (every child has been read inline). The walker can
+            // skip lazy fetches for these branches.
             Ok(Some(VectorCommitmentNode::Branch(BranchNode {
                 prefix,
                 children,
@@ -141,6 +246,8 @@ fn deserialize_node<R: Read>(r: &mut R) -> Result<Option<VectorCommitmentNode>> 
                 size,
                 leaf_count,
                 longest_branch,
+                full_prefix: Vec::new(),
+                fully_loaded: true,
             })))
         }
         other => Err(QuilError::Serialization(format!(
@@ -209,12 +316,205 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_leaf_metadata_only() {
-        // Leaf serialization deliberately drops `value` — vertex
-        // content lives in the per-vertex keyspace. The tree blob
-        // round-trips key, hash_target, commitment, and size; on
-        // deserialize, value is empty and callers fetch from the
-        // per-vertex store.
+    fn solo_leaf_round_trip() {
+        let mut leaf = LeafNode {
+            key: vec![0xAA, 0xBB, 0xCC, 0xDD],
+            value: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            hash_target: vec![0x01; 32],
+            commitment: vec![0x02; 64],
+            size: BigInt::from(0x1234_5678i64),
+        };
+        leaf.compute_commitment();
+        let node = VectorCommitmentNode::Leaf(leaf.clone());
+        let bytes = serialize_node_solo(&node).unwrap();
+        let back = deserialize_node_solo(&bytes).unwrap();
+        match back {
+            VectorCommitmentNode::Leaf(l) => {
+                assert_eq!(l.key, leaf.key);
+                // Solo format drops the value (matches whole-tree blob).
+                assert!(l.value.is_empty());
+                assert_eq!(l.hash_target, leaf.hash_target);
+                assert_eq!(l.commitment, leaf.commitment);
+                assert_eq!(l.size, leaf.size);
+            }
+            _ => panic!("expected leaf"),
+        }
+    }
+
+    #[test]
+    fn solo_branch_round_trip_drops_children() {
+        // Build a branch with two non-empty children and verify that
+        // serialize_node_solo writes a fixed-size record that does NOT
+        // include child data. On deserialize, all children come back
+        // as None — the lazy walker will load them via the path index.
+        let child_leaf = LeafNode {
+            key: vec![0x01, 0x02],
+            value: vec![],
+            hash_target: vec![0x33; 32],
+            commitment: vec![0x44; 64],
+            size: BigInt::from(5),
+        };
+        let mut children: [Option<Box<VectorCommitmentNode>>; 64] =
+            std::array::from_fn(|_| None);
+        children[7] = Some(Box::new(VectorCommitmentNode::Leaf(child_leaf.clone())));
+        children[42] = Some(Box::new(VectorCommitmentNode::Leaf(child_leaf)));
+        let branch = BranchNode {
+            prefix: vec![3, 5, 7],
+            children,
+            commitment: vec![0xFF; 64],
+            size: BigInt::from(0x9999_8888_7777_i64),
+            leaf_count: 12,
+            longest_branch: 9,
+            full_prefix: Vec::new(),
+            fully_loaded: true,
+        };
+        let node = VectorCommitmentNode::Branch(branch.clone());
+        let bytes = serialize_node_solo(&node).unwrap();
+        let back = deserialize_node_solo(&bytes).unwrap();
+        match back {
+            VectorCommitmentNode::Branch(b) => {
+                assert_eq!(b.prefix, branch.prefix);
+                assert_eq!(b.commitment, branch.commitment);
+                assert_eq!(b.size, branch.size);
+                assert_eq!(b.leaf_count, branch.leaf_count);
+                assert_eq!(b.longest_branch, branch.longest_branch);
+                // Children are NOT in the on-disk solo record.
+                assert!(b.children.iter().all(|c| c.is_none()));
+            }
+            _ => panic!("expected branch"),
+        }
+
+        // Sanity: the solo format is *much* smaller than the whole-tree
+        // format for the same branch with two children.
+        let whole_tree_bytes = serialize_tree(Some(&node)).unwrap();
+        assert!(
+            bytes.len() < whole_tree_bytes.len(),
+            "solo {} should be smaller than whole-tree {}",
+            bytes.len(),
+            whole_tree_bytes.len()
+        );
+    }
+
+    /// Hand-build the byte sequence the Go migrator
+    /// (`translateGoNodeToRustSolo` at
+    /// `node/store/migrate_to_rocksdb.go`) emits for a leaf, then
+    /// verify `deserialize_node_solo` parses it correctly. Guards
+    /// against drift between the migrator's emission and Rust's
+    /// reader.
+    #[test]
+    fn migrator_leaf_output_round_trips() {
+        // Sample leaf: key=[0xAA,0xBB], hash_target=[0x11;32],
+        // commitment=[0x22;64], size=0xDEAD (big-endian: 0xDE, 0xAD).
+        // Value field is empty (migrator strips it).
+        let key = vec![0xAA, 0xBB];
+        let hash_target = vec![0x11u8; 32];
+        let commitment = vec![0x22u8; 64];
+        // 0xDEAD = 57005. Go's `big.Int.Bytes()` would emit
+        // [0xDE, 0xAD] (high bit set), and the Go migrator's
+        // `goUnsignedToRustSignedBigInt` prepends 0x00 so Rust's
+        // `BigInt::from_signed_bytes_be` reads it as positive.
+        let size_bytes = vec![0x00, 0xDE, 0xAD];
+
+        let mut emitted = Vec::<u8>::new();
+        emitted.push(TYPE_LEAF);
+        // key
+        emitted.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        emitted.extend_from_slice(&key);
+        // empty value (migrator: writeLenPrefixedU64(out, nil))
+        emitted.extend_from_slice(&0u64.to_be_bytes());
+        // hash_target
+        emitted.extend_from_slice(&(hash_target.len() as u64).to_be_bytes());
+        emitted.extend_from_slice(&hash_target);
+        // commitment
+        emitted.extend_from_slice(&(commitment.len() as u64).to_be_bytes());
+        emitted.extend_from_slice(&commitment);
+        // size (forwarded as raw bytes — for non-negative sizes < 2^63
+        // the bytes are identical to BigInt::from_signed_bytes_be).
+        emitted.extend_from_slice(&(size_bytes.len() as u64).to_be_bytes());
+        emitted.extend_from_slice(&size_bytes);
+
+        let parsed = deserialize_node_solo(&emitted).expect("parse leaf");
+        match parsed {
+            VectorCommitmentNode::Leaf(l) => {
+                assert_eq!(l.key, key);
+                assert!(l.value.is_empty(), "value must be empty after migration");
+                assert_eq!(l.hash_target, hash_target);
+                assert_eq!(l.commitment, commitment);
+                assert_eq!(l.size, BigInt::from(0xDEADi32));
+            }
+            _ => panic!("expected leaf"),
+        }
+    }
+
+    /// Same idea for branches. The migrator's emission MUST NOT
+    /// include the pathLength + fullPrefix prefix that Go's on-disk
+    /// format has — the walker computes full_prefix from descent.
+    #[test]
+    fn migrator_branch_output_round_trips() {
+        // Branch with local prefix=[1, 2, 3], commitment, size, etc.
+        let prefix: Vec<i32> = vec![1, 2, 3];
+        let commitment = vec![0x33u8; 64];
+        let size_bytes = vec![0x01, 0x02]; // 258
+        let leaf_count: i64 = 7;
+        let longest_branch: i32 = 3;
+
+        let mut emitted = Vec::<u8>::new();
+        emitted.push(TYPE_BRANCH);
+        emitted.extend_from_slice(&(prefix.len() as u32).to_be_bytes());
+        for &p in &prefix {
+            emitted.extend_from_slice(&p.to_be_bytes());
+        }
+        emitted.extend_from_slice(&(commitment.len() as u64).to_be_bytes());
+        emitted.extend_from_slice(&commitment);
+        emitted.extend_from_slice(&(size_bytes.len() as u64).to_be_bytes());
+        emitted.extend_from_slice(&size_bytes);
+        emitted.extend_from_slice(&leaf_count.to_be_bytes());
+        emitted.extend_from_slice(&longest_branch.to_be_bytes());
+
+        let parsed = deserialize_node_solo(&emitted).expect("parse branch");
+        match parsed {
+            VectorCommitmentNode::Branch(b) => {
+                assert_eq!(b.prefix, prefix);
+                assert!(
+                    b.children.iter().all(|c| c.is_none()),
+                    "children must be empty after migration",
+                );
+                assert_eq!(b.commitment, commitment);
+                assert_eq!(b.size, BigInt::from(258i32));
+                assert_eq!(b.leaf_count, leaf_count as usize);
+                assert_eq!(b.longest_branch, longest_branch as usize);
+                assert!(
+                    !b.fully_loaded,
+                    "migrated branches must report fully_loaded=false so the walker fetches children",
+                );
+            }
+            _ => panic!("expected branch"),
+        }
+    }
+
+    #[test]
+    fn solo_rejects_nil_type_byte() {
+        match deserialize_node_solo(&[TYPE_NIL]) {
+            Ok(_) => panic!("expected error for TYPE_NIL in solo format"),
+            Err(e) => {
+                let msg = format!("{}", e);
+                assert!(
+                    msg.contains("unexpected node type byte"),
+                    "got {}",
+                    msg
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_leaf_preserves_value_when_hash_target_empty() {
+        // `add_vertex` (and friends) insert leaves with empty
+        // `hash_target`, so the leaf commitment depends on `value`.
+        // The whole-tree blob must preserve `value` byte-for-byte
+        // so the post-reload `tree.commit(prover)` recomputes the
+        // same `SHA512(0x00 || key || value)`. Stripping it broke
+        // every sync persistence round-trip.
         let mut leaf = LeafNode {
             key: vec![1, 2, 3],
             value: vec![4, 5, 6],
@@ -224,6 +524,7 @@ mod tests {
         };
         leaf.compute_commitment();
         let original_commitment = leaf.commitment.clone();
+        let original_value = leaf.value.clone();
 
         let node = VectorCommitmentNode::Leaf(leaf);
         let data = serialize_tree(Some(&node)).unwrap();
@@ -232,7 +533,7 @@ mod tests {
         match result {
             VectorCommitmentNode::Leaf(l) => {
                 assert_eq!(l.key, vec![1, 2, 3]);
-                assert!(l.value.is_empty(), "leaf value must be stripped on disk");
+                assert_eq!(l.value, original_value, "blob must round-trip the leaf value");
                 assert_eq!(l.commitment, original_commitment);
                 assert_eq!(l.size, BigInt::from(100));
             }

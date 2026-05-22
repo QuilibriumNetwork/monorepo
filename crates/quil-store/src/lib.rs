@@ -5,7 +5,7 @@ mod key;
 mod shards;
 mod hypergraph;
 mod dispatch;
-mod encoding;
+pub mod encoding;
 mod worker;
 pub mod import;
 pub mod migration;

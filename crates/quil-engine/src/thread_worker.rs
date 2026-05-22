@@ -162,6 +162,11 @@ pub struct WorkerConsensusDeps {
     /// shard data into its own RocksDB.
     pub worker_state_builder:
         Option<Arc<dyn Fn(u32) -> std::result::Result<WorkerOwnedDeps, String> + Send + Sync>>,
+    /// Master-side KV-store handle, used when no per-worker
+    /// `worker_state_builder` is wired. App-shard `ConsensusState` and
+    /// `LivenessState` are persisted here so a restart preserves
+    /// finalized rank / latest QC.
+    pub kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
 }
 
 /// Per-worker state: each worker thread owns its own RocksDB and the
@@ -172,6 +177,12 @@ pub struct WorkerOwnedDeps {
     pub hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
     pub execution_engine: Arc<quil_execution::ExecutionEngineManager>,
     pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
+    /// Per-worker KV-store handle used by the app-shard consensus
+    /// engine for persisting `ConsensusState` / `LivenessState`.
+    /// Optional — `worker_state_builder` implementations that don't
+    /// expose a KV handle leave this `None` and the engine falls
+    /// back to the in-memory consensus stub.
+    pub kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -422,6 +433,10 @@ impl ThreadWorkerManager {
                                                         .as_ref()
                                                         .map(|o| Some(o.inclusion_prover.clone()))
                                                         .unwrap_or_else(|| deps.inclusion_prover.clone());
+                                                    let kv_db = owned
+                                                        .as_ref()
+                                                        .and_then(|o| o.kv_db.clone())
+                                                        .or_else(|| deps.kv_db.clone());
 
                                                     // Create the AppConsensusEngine with full HotStuff integration
                                                     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -439,6 +454,7 @@ impl ThreadWorkerManager {
                                                         hypergraph,
                                                         execution_engine,
                                                         inclusion_prover,
+                                                        kv_db,
                                                     };
                                                     let (engine, app_handle) = crate::app_engine::AppConsensusEngine::new(
                                                         core_id,

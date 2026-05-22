@@ -133,6 +133,7 @@ impl ExecutionEngineManager {
         reward_issuance: Arc<dyn quil_types::consensus::RewardIssuance>,
         bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor>,
         inclusion_prover: Arc<dyn InclusionProver>,
+        frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
     ) -> Result<()> {
         let mut engines = self.engines.write().unwrap();
         let engine = engines
@@ -153,6 +154,7 @@ impl ExecutionEngineManager {
             reward_issuance,
             bls_constructor,
             inclusion_prover,
+            frame_prover,
         );
         Ok(())
     }

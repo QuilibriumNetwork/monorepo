@@ -29,10 +29,7 @@ impl FrameProver for WesolowskiFrameProver {
     ) -> Result<global::FrameHeader> {
         use sha3::{Digest, Sha3_256};
 
-        // parent = poseidon(previous_frame_output[:516]).
-        // The previous frame's output may be empty (e.g. genesis) — fall
-        // back to a 32-byte zero parent in that case to keep encoding
-        // stable.
+        // parent = poseidon(previous_frame_output[:516]); zero on genesis.
         let parent: Vec<u8> = if previous_frame_output.len() >= 516 {
             crate::poseidon::hash_bytes_to_32(&previous_frame_output[..516])
                 .map_err(|e| QuilError::Crypto(format!("parent poseidon: {}", e)))?
@@ -275,27 +272,28 @@ impl FrameProver for WesolowskiFrameProver {
         bls: &dyn quil_types::crypto::BlsConstructor,
         ids: Option<&[&[u8]]>,
     ) -> Result<bool> {
-        // Mirrors Go `WesolowskiFrameProver.VerifyFrameHeaderSignature`:
-        //   1. payload = MakeVoteMessage(address, rank, identity=poseidon(output))
-        //   2. BLS verify signature[:74] against the aggregated pubkey under
-        //      context = "appshard" || address
-        //   3. If ids given, verify the multi-proof tail
         let sig = match header.public_key_signature_bls48581.as_ref() {
             Some(s) => s,
-            None => return Ok(false),
+            None => {
+                tracing::warn!("verify_frame_header_signature: missing signature struct");
+                return Ok(false);
+            }
         };
         let pubkey_bytes = sig.public_key.as_ref()
             .map(|k| k.key_value.as_slice())
             .unwrap_or(&[]);
         if pubkey_bytes.is_empty() || sig.signature.len() < 74 {
+            tracing::warn!(
+                pubkey_len = pubkey_bytes.len(),
+                sig_len = sig.signature.len(),
+                "verify_frame_header_signature: pubkey empty or sig < 74 bytes"
+            );
             return Ok(false);
         }
 
-        // identity = poseidon(output).FillBytes(32) — 32 raw bytes,
-        // matching Go's `models.Identity = string` (a byte sequence).
         let identity = crate::poseidon::hash_bytes_to_32(&header.output)?;
 
-        // MakeVoteMessage: filter || identity_raw || rank:u64(BE)
+        // payload = address || identity || rank_be (MakeVoteMessage)
         let mut payload = Vec::with_capacity(header.address.len() + 32 + 8);
         payload.extend_from_slice(&header.address);
         payload.extend_from_slice(&identity);
@@ -311,26 +309,44 @@ impl FrameProver for WesolowskiFrameProver {
             &payload,
             &domain,
         ) {
+            tracing::warn!(
+                header_address_prefix = %hex::encode(&header.address[..header.address.len().min(16)]),
+                rank = header.rank,
+                output_prefix = %hex::encode(&header.output[..header.output.len().min(8)]),
+                identity_prefix = %hex::encode(&identity[..16]),
+                pubkey_prefix = %hex::encode(&pubkey_bytes[..pubkey_bytes.len().min(16)]),
+                sig_prefix = %hex::encode(&sig.signature[..16]),
+                domain = %String::from_utf8_lossy(&domain[..8]),
+                payload_len = payload.len(),
+                "verify_frame_header_signature: BLS verify of agg sig over vote-message payload FAILED"
+            );
             return Ok(false);
         }
 
-        // Count set bits in bitmask. Multiproof verify is only required
-        // when more than one signer contributed (bitmask has >1 set bit).
+        // Multiproof verify is only required for multi-signer aggregates.
         let set_bits: u32 = sig.bitmask.iter().map(|b| b.count_ones()).sum();
         if sig.signature.len() == 74 && set_bits != 1 {
+            tracing::warn!(
+                set_bits,
+                bitmask_hex = %hex::encode(&sig.bitmask),
+                "verify_frame_header_signature: 74-byte sig must have exactly 1 set bit"
+            );
             return Ok(false);
         }
         if sig.signature.len() == 74 && ids.is_none() {
             return Ok(true);
         }
 
-        // Parse + verify the multi-proof carried past byte 74.
         let ids = match ids {
             Some(i) => i,
             None => return Ok(true),
         };
         let mp = &sig.signature[74..];
         if mp.len() < 4 {
+            tracing::warn!(
+                tail_len = mp.len(),
+                "verify_frame_header_signature: multi-proof tail < 4 bytes (no count prefix)"
+            );
             return Ok(false);
         }
         let mut cursor = 0usize;
@@ -340,6 +356,12 @@ impl FrameProver for WesolowskiFrameProver {
         let mut multiproofs: Vec<&[u8]> = Vec::with_capacity(mp_count);
         for _ in 0..mp_count {
             if cursor + 516 > mp.len() {
+                tracing::warn!(
+                    mp_count,
+                    cursor,
+                    tail_len = mp.len(),
+                    "verify_frame_header_signature: multi-proof tail truncated"
+                );
                 return Ok(false);
             }
             multiproofs.push(&mp[cursor..cursor + 516]);
@@ -349,12 +371,25 @@ impl FrameProver for WesolowskiFrameProver {
         use sha3::{Digest, Sha3_256};
         let challenge_bytes: [u8; 32] = Sha3_256::digest(&header.parent_selector).into();
 
-        self.verify_multi_proof(
+        let result = self.verify_multi_proof(
             &challenge_bytes,
             header.difficulty,
             ids,
             &multiproofs,
-        )
+        );
+        if let Ok(false) = result {
+            tracing::warn!(
+                mp_count,
+                ids_count = ids.len(),
+                difficulty = header.difficulty,
+                challenge_prefix = %hex::encode(&challenge_bytes[..16]),
+                parent_selector_prefix = %hex::encode(
+                    &header.parent_selector[..header.parent_selector.len().min(16)]
+                ),
+                "verify_frame_header_signature: multi-proof verify returned false"
+            );
+        }
+        result
     }
 
     fn verify_global_header_signature(

@@ -99,6 +99,38 @@ impl<S: Unique, V: Unique> Validator<S, V> for ConsensusValidator<S, V> {
 
         let threshold = self.committee.quorum_threshold_for_rank(qc.rank())?;
         if total_weight < threshold {
+            // Diagnostic: dump the full committee snapshot at this
+            // rank so we can see whether the running node's `Replicas`
+            // view matches the one a static `inspect_committee`
+            // produces. Threshold computed from a stale or extra-
+            // padded committee would produce a `required` value that
+            // doesn't match what the network agreed on at QC time.
+            let dump = self.committee.identities_by_rank(qc.rank()).ok();
+            let committee_summary: String = dump
+                .as_ref()
+                .map(|members| {
+                    members
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "{}={}",
+                                &hex::encode(m.identity())[..16.min(m.identity().len() * 2)],
+                                m.weight()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_else(|| "n/a".into());
+            tracing::warn!(
+                rank = qc.rank(),
+                bitmask = %hex::encode(bitmask),
+                total_weight,
+                threshold,
+                committee_size = dump.as_ref().map(|m| m.len()).unwrap_or(0),
+                committee = %committee_summary,
+                "QC weight-check failed — dumping committee snapshot",
+            );
             return Err(QuilError::InvalidQuorumCertificate(format!(
                 "QC signers have insufficient weight {} (required {})",
                 total_weight, threshold

@@ -7,6 +7,7 @@
 //! - `types`: Rust representations of the five hypergraph messages plus
 //!   the aggregate-signature envelope.
 
+pub mod auth;
 pub mod canonical;
 pub mod conversions;
 pub mod dispatch;
@@ -46,6 +47,8 @@ pub use dispatch::{
     is_mutating_op, lock_addresses_for_input, peek_message_kind, DispatchedMessage,
     HypergraphLockState, MessageKind,
 };
+
+pub use auth::{verify_op_signature, AuthCheck, HypergraphConfigResolver, OpForAuth};
 
 pub use hyperedge_ops::{
     assert_hyperedge_domain_matches, extract_hyperedge_id,

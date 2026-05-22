@@ -1,29 +1,42 @@
-//! ProverShardUpdate (a.k.a. FrameHeader) Validate + Materialize.
-//! Port of
-//! `node/execution/intrinsics/global/global_prover_shard_update.go`.
-//!
-//! A `ProverShardUpdate` carries a finalized app-shard frame header.
-//! Its validate path confirms the header is well-formed and that the
-//! next frame number is its successor. Its materialize path:
-//!
-//! 1. Uses the frame prover to verify the aggregate BLS signature and
-//!    extract a participant bitmask over the shard's active provers.
-//! 2. Rejects the header if participation is < 2/3.
-//! 3. Computes per-ring reward shares via the reward-issuance
-//!    calculator, using the shard's world-state size / shard count.
-//! 4. Adds each ring's share to every participant's reward vertex.
-//! 5. Updates each participating allocation's `LastActiveFrameNumber`.
-//!
-//! Ring assignment rules mirror `computeRingAssignments` in Go: sort
-//! active provers by `JoinFrameNumber` ascending (falling back to
-//! `JoinConfirmFrameNumber` if Join is 0), tie-break by seniority
-//! descending, then address ascending. The rank determines the ring
-//! via `floor(rank / ringGroupSize)`.
+//! ProverShardUpdate (FrameHeader) Validate + Materialize.
+//! Verifies aggregate BLS signature, enforces 2/3 participation,
+//! computes per-ring reward shares, credits participants, and updates
+//! `LastActiveFrameNumber`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use num_bigint::BigInt;
+
+/// When set, `apply_reward` logs credits applied to this address.
+pub static LOCAL_PROVER_ADDRESS: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Read the current reward balance for `prover_address` from the CRDT.
+pub fn read_reward_balance_for(
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    prover_address: &[u8],
+) -> Result<BigInt> {
+    use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+    use super::materialize::reward_address;
+    use crate::prover_registry::rebuild_vertex_tree_from_blob;
+
+    let state = HypergraphState::new(crdt.clone());
+    let reward_addr = reward_address(prover_address)?;
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let va_disc = vertex_adds_discriminator()?;
+
+    let blob = state.get(domain, &reward_addr, &va_disc)?;
+    let tree = match blob {
+        Some(b) if !b.is_empty() => rebuild_vertex_tree_from_blob(&b),
+        _ => return Ok(BigInt::from(0)),
+    };
+    let bytes = super::materialize::read_reward_balance(&tree);
+    if bytes.is_empty() {
+        Ok(BigInt::from(0))
+    } else {
+        Ok(BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes))
+    }
+}
 
 use quil_types::consensus::{ProverAllocation, ProverInfo, ProverRegistry, RewardIssuance};
 use quil_types::crypto::FrameProver;
@@ -39,51 +52,130 @@ use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 use crate::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
 
 /// Hypergraph metadata for the shard under `FrameHeader.address`.
-///
-/// Go equivalent: the return tuple of `hypergraph.GetMetadataAtKey`
-/// (`size`, `leaf_count`). The Rust consensus engine doesn't yet expose
-/// a clean trait for this, so the caller precomputes and passes it in.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ShardMetadata {
-    /// Total shard state size in bytes.
     pub state_size: u64,
-    /// Number of leaves (app shards) under this shard key. Zero
-    /// becomes `DEFAULT_SHARD_LEAVES` = 1 to match Go.
+    /// Zero becomes `DEFAULT_SHARD_LEAVES` = 1.
     pub shard_count: u64,
 }
 
-/// Context built from a frame header during validation. Holds the
-/// subset of provers whose participation bit is set in the aggregate
-/// signature, grouped by ring.
-///
-/// Go equivalent: `shardUpdateContext` at
-/// `global_prover_shard_update.go:227`.
+/// Participants from a frame header, grouped by ring.
 #[derive(Debug, Clone)]
 pub struct ShardUpdateContext {
-    /// The full list of active provers for the shard (in registry order).
     pub active_provers: Vec<ProverInfo>,
-    /// Indices into `active_provers` of the participants.
     pub participant_indices: Vec<usize>,
-    /// Indices per ring (sorted within each ring).
     pub participants_by_ring: HashMap<u8, Vec<usize>>,
-    /// Ring assignment per prover address (hex-encoded for map keys —
-    /// Go uses raw bytes but Rust `HashMap<Vec<u8>, _>` works too).
     pub ring_by_prover_address: HashMap<Vec<u8>, u8>,
     pub state_size: u64,
     pub shard_count: u64,
 }
 
-/// Build the per-frame context. Verifies the BLS aggregate signature
-/// via `frame_prover`, rejects on < 2/3 participation, and computes
-/// ring assignments.
+/// Verify a finalized shard FrameHeader's three-layer attestation:
+/// leader VDF, aggregate BLS over `make_vote_message(address, rank,
+/// poseidon(output))`, and per-participant VDF multi-proofs over
+/// `sha3(parent_selector)`. Returns the participant bitmask.
 ///
-/// Go equivalent: `buildContext` at
-/// `global_prover_shard_update.go:236`. We split the frame-prover
-/// verification into a caller-provided `participant_indices` closure
-/// because the Rust `FrameProver` trait's `verify_frame_header` returns
-/// a single bytes payload, not a `[]uint8` participant bitmask. The
-/// caller therefore plugs in a concrete implementation that produces
-/// the bitmask — the `quil-engine` frame validator has one today.
+/// `active_provers` must be in the same order the consensus committee
+/// used at this rank — the bitmask indexes into this list.
+pub fn verify_frame_header_attestation(
+    frame_header: &FrameHeader,
+    frame_prover: &dyn quil_types::crypto::FrameProver,
+    bls: &dyn quil_types::crypto::BlsConstructor,
+    active_provers: &[ProverInfo],
+) -> Result<Vec<u8>> {
+    if frame_header.public_key_signature_bls48581.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "frame header attestation: missing aggregate signature".into(),
+        ));
+    }
+    let agg = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
+        &frame_header.public_key_signature_bls48581,
+    )?;
+    let agg_pubkey = agg
+        .public_key
+        .clone()
+        .ok_or_else(|| {
+            QuilError::InvalidArgument(
+                "frame header attestation: aggregate signature missing pubkey".into(),
+            )
+        })?;
+    if agg.bitmask.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "frame header attestation: aggregate signature bitmask empty".into(),
+        ));
+    }
+
+    let proto = quil_types::proto::global::FrameHeader {
+        address: frame_header.address.clone(),
+        frame_number: frame_header.frame_number,
+        rank: frame_header.rank,
+        timestamp: frame_header.timestamp,
+        difficulty: frame_header.difficulty,
+        output: frame_header.output.clone(),
+        parent_selector: frame_header.parent_selector.clone(),
+        requests_root: frame_header.requests_root.clone(),
+        state_roots: frame_header.state_roots.clone(),
+        prover: frame_header.prover.clone(),
+        fee_multiplier_vote: frame_header.fee_multiplier_vote as u64,
+        public_key_signature_bls48581: Some(
+            quil_types::proto::keys::Bls48581AggregateSignature {
+                signature: agg.signature.clone(),
+                public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
+                    key_value: agg_pubkey.key_value.clone(),
+                }),
+                bitmask: agg.bitmask.clone(),
+            },
+        ),
+    };
+
+    frame_prover.verify_frame_header(&proto)?;
+
+    let participant_ids: Vec<Vec<u8>> = {
+        let indices = quil_consensus::bitmask::set_bit_indices(&agg.bitmask)
+            .filter_map(|i| u32::try_from(i).ok().map(|x| x as usize))
+            .collect::<Vec<_>>();
+        let mut out = Vec::with_capacity(indices.len());
+        for idx in indices {
+            if idx >= active_provers.len() {
+                return Err(QuilError::InvalidArgument(format!(
+                    "frame header attestation: bitmask index {} ≥ active provers {}",
+                    idx,
+                    active_provers.len()
+                )));
+            }
+            out.push(active_provers[idx].address.clone());
+        }
+        out
+    };
+    let id_refs: Vec<&[u8]> = participant_ids.iter().map(|v| v.as_slice()).collect();
+    // 74-byte aggregate = single signer, no multi-proofs to verify.
+    let ids_arg: Option<&[&[u8]]> = if agg.signature.len() == 74 {
+        if id_refs.len() != 1 {
+            return Err(QuilError::InvalidSignature(
+                "frame header attestation: 74-byte signature requires exactly 1 participant".into(),
+            ));
+        }
+        None
+    } else {
+        Some(&id_refs)
+    };
+    let valid = frame_prover.verify_frame_header_signature(
+        &proto,
+        bls,
+        ids_arg,
+    )?;
+    if !valid {
+        return Err(QuilError::InvalidSignature(
+            "frame header attestation: aggregate BLS + multi-proof check failed".into(),
+        ));
+    }
+
+    Ok(agg.bitmask)
+}
+
+/// Build the per-frame context: groups participants by ring and
+/// enforces 2/3 participation. The caller passes in the already-verified
+/// bitmask (see `verify_frame_header_attestation`).
 pub fn build_shard_update_context(
     frame_header: &FrameHeader,
     active_provers: Vec<ProverInfo>,
@@ -377,6 +469,27 @@ fn apply_reward(
 
     let blob = vertex_tree_to_blob(&reward_tree);
     state.set(domain, &reward_addr, &va_disc, frame_number, blob)?;
+
+    // Surface the credit when it lands on the node's own prover.
+    // Reads the post-credit balance back from the same tree so the
+    // operator sees both the delta and the running total.
+    if let Some(local) = LOCAL_PROVER_ADDRESS.get() {
+        if !local.is_empty() && local.as_slice() == prover.address.as_slice() {
+            let total_bytes = super::materialize::read_reward_balance(&reward_tree);
+            let new_total = if total_bytes.is_empty() {
+                BigInt::from(0)
+            } else {
+                BigInt::from_bytes_be(num_bigint::Sign::Plus, &total_bytes)
+            };
+            tracing::info!(
+                frame = frame_number,
+                prover = %hex::encode(&prover.address),
+                delta = %share,
+                new_balance = %new_total,
+                "reward credited to local prover"
+            );
+        }
+    }
 
     Ok(())
 }

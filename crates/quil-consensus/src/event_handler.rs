@@ -451,6 +451,16 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             return Ok(());
         }
 
+        // From here down, we ARE the leader for this rank. Any skip is
+        // a recovery-stalling event: peers are waiting on our proposal
+        // and nothing else can fill in. Log at info so an operator can
+        // see why the leader isn't producing.
+        tracing::info!(
+            cur_rank,
+            qc_rank = newest_qc.rank(),
+            "we are leader for this rank — attempting proposal",
+        );
+
         // Idempotency: skip if we already proposed for this rank.
         // See `last_proposed_rank` doc — without this, prove_next_state
         // runs twice per rank and the second invocation's drained-but-
@@ -460,10 +470,10 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             .last_proposed_rank
             .load(std::sync::atomic::Ordering::Acquire);
         if cur_rank <= prior {
-            tracing::debug!(
+            tracing::info!(
                 cur_rank,
                 last_proposed = prior,
-                "already proposed for this or a later rank — skipping",
+                "leader skipping: already proposed for this or a later rank",
             );
             return Ok(());
         }
@@ -476,11 +486,11 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
             .get_state(newest_qc.identity())
             .is_some();
         if !parent_known {
-            tracing::debug!(
+            tracing::warn!(
                 cur_rank,
                 qc_rank = newest_qc.rank(),
                 qc_identity = %hex::encode(newest_qc.identity()),
-                "parent state not in forks tree — skipping proposal",
+                "leader skipping: parent state not in forks tree",
             );
             return Ok(());
         }
@@ -515,10 +525,10 @@ impl<S: Unique, V: Unique> HotStuffEventHandler<S, V> {
         {
             Ok(sp) => sp,
             Err(e) if e.is_no_vote() => {
-                tracing::debug!(
+                tracing::warn!(
                     cur_rank,
                     error = %e,
-                    "safety rules said NoVote — skipping proposal",
+                    "leader skipping: safety rules returned NoVote",
                 );
                 return Ok(());
             }

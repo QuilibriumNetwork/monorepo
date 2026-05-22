@@ -27,3 +27,4 @@ num-bigint = "0.4"
 hex = "0.4"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 k256 = { version = "0.13.4", features = ["ecdsa"] }
+tracing = "0.1"

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use quil_consensus::event_loop::EventLoopHandle;
 use quil_consensus::models::{TimeoutCertificate, TimeoutState, Unique};
@@ -61,12 +61,17 @@ impl TimeoutAggregation {
         vote_domain: Vec<u8>,
         timeout_domain: Vec<u8>,
     ) -> Self {
-        // The validator needs a Verifier; reuse BlsConsensusVerifier with
-        // the vote domain (for QC verification in validate_qc) — matches
-        // the validator used by the inbound event loop.
+        // The validator needs a Verifier that can check both QCs
+        // (signed with vote_domain) and TCs (signed with timeout_domain).
+        // Pre-fix it used vote_domain for both, which silently broke
+        // TC validation as soon as a real TC arrived.
         let raw: Arc<dyn SignatureAggregator> =
             Arc::new(BlsSignatureAggregator::new(bls.clone()));
-        let verifier = Arc::new(BlsConsensusVerifier::new(raw, vote_domain));
+        let verifier = Arc::new(BlsConsensusVerifier::new_with_timeout_domain(
+            raw,
+            vote_domain,
+            timeout_domain.clone(),
+        ));
         let committee_as_replicas: Arc<dyn Replicas> = committee.clone();
         let validator: Arc<dyn Validator<GlobalState, GlobalVote>> = Arc::new(
             ConsensusValidator::<GlobalState, GlobalVote>::new(
@@ -89,19 +94,28 @@ impl TimeoutAggregation {
     /// Feed a reconstructed `TimeoutState` to its rank's processor.
     pub fn handle_timeout(&self, ts: TimeoutState<GlobalVote>) {
         let rank = ts.rank;
-        if rank < self.min_active_rank.load(Ordering::Relaxed) {
-            debug!(rank, "dropping timeout below finalized rank");
+        let voter = hex::encode(ts.vote.identity());
+        let qc_rank = ts.latest_quorum_certificate.rank();
+        let min_active = self.min_active_rank.load(Ordering::Relaxed);
+        if rank < min_active {
+            info!(rank, min_active, voter = %voter, "dropping timeout below finalized rank");
             return;
         }
+        info!(rank, qc_rank, voter = %voter, "ingesting timeout");
         let proc = match self.get_or_create(rank) {
             Ok(p) => p,
             Err(e) => {
-                debug!(rank, error = %e, "timeout processor build failed");
+                warn!(rank, error = %e, "timeout processor build failed");
                 return;
             }
         };
         if let Err(e) = proc.process(ts) {
-            debug!(rank, error = %e, "timeout processor rejected timeout");
+            // Surface rejections at info: a stuck chain usually means
+            // every peer's timeout is being rejected for the same
+            // reason (sig domain mismatch, identity not in registry,
+            // etc.), and the only way to spot that without recompiling
+            // for debug logs is to print it here.
+            info!(rank, voter = %voter, error = %e, "timeout processor rejected timeout");
         }
     }
 

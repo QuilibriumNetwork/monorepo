@@ -52,61 +52,18 @@ pub const VERTEX_DATA_DELETION_INTERVAL_MS: i64 = 10 * 60 * 1000;
 // =====================================================================
 
 /// One entry in the undo log built during `commit()`. Each successfully-
-/// applied add/remove pushes the inverse operation here so a later
-/// `revert_changes()` can roll the CRDT back to the pre-commit state.
-///
-/// Mirrors the role of Go's `TrackChange` / `RevertChanges` pair:
-/// `node/execution/state/hypergraph/hypergraph_state.go` calls
-/// `hypergraph.TrackChange` after each add/remove and Go's fork-choice
-/// / replay path replays those entries in reverse via
-/// `hypergraph.RevertChanges`. The Rust port is in-memory only —
-/// it does not persist undo records, so it covers same-process
-/// reorgs / aborted commits but not crash recovery.
-#[derive(Debug, Clone)]
-enum UndoEntry {
-    /// A vertex was added by `commit()`; reverting removes it (CRDT
-    /// remove). `prior_data` holds the value present before the add,
-    /// or `None` if the add was a fresh insert.
-    VertexAdd {
-        location: Location,
-        prior_data: Option<Vec<u8>>,
-    },
-    /// A vertex was removed by `commit()`; reverting re-adds it. The
-    /// Rust CRDT's `remove_vertex` is a CRDT remove (writes to
-    /// `vertex_removes`), so a clean revert would need to delete
-    /// from the removes tree. The current `HypergraphCrdt` has no
-    /// such API, so we record the inverse for the changeset replay
-    /// path and apply best-effort: we re-issue `add_vertex` with the
-    /// prior data, which surfaces the vertex again under CRDT
-    /// "present iff in adds and not in removes" semantics only after
-    /// the removes-tree entry is also cleared. Today the entry's
-    /// presence here documents the inverse so callers building a
-    /// proper revert path have the data they need.
-    VertexRemove {
-        location: Location,
-        prior_data: Option<Vec<u8>>,
-    },
-    /// Hyperedge add inverse — see `VertexAdd`.
-    HyperedgeAdd {
-        location: Location,
-        prior_data: Option<Vec<u8>>,
-    },
-    /// Hyperedge remove inverse — see `VertexRemove`.
-    HyperedgeRemove {
-        location: Location,
-        prior_data: Option<Vec<u8>>,
-    },
-}
-
 /// Changeset accumulator. The execution engine creates one per frame,
 /// appends state changes during `process_message`, and commits them
 /// via `commit()` at the end of the frame.
+///
+/// (Earlier revisions kept an `undo_log` + `revert_changes` API
+/// mirroring Go's `TrackChange`/`RevertChanges`. Nothing in the
+/// workspace ever wired the revert path, and the per-node lazy tree
+/// doesn't implement `delete` — so the undo machinery has been
+/// dropped along with its sole consumer.)
 pub struct HypergraphState {
     crdt: Arc<HypergraphCrdt>,
     changeset: Mutex<Vec<StateChange>>,
-    /// Undo log built during `commit()`. Each applied add/remove
-    /// pushes the inverse here; `revert_changes` replays in reverse.
-    undo_log: Mutex<Vec<UndoEntry>>,
 }
 
 impl HypergraphState {
@@ -114,7 +71,6 @@ impl HypergraphState {
         Self {
             crdt,
             changeset: Mutex::new(Vec::new()),
-            undo_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -244,9 +200,6 @@ impl HypergraphState {
     /// accept vertices for shards it shouldn't store and produce
     /// roots that diverge from any peer that correctly drops them.
     ///
-    /// Each successfully-applied operation also appends an inverse
-    /// to `undo_log` (Go: `hypergraph.TrackChange`). Call
-    /// `revert_changes` to roll back.
     pub fn commit(&self) -> Result<()> {
         let va_disc = vertex_adds_discriminator()?;
         let vr_disc = vertex_removes_discriminator()?;
@@ -272,108 +225,30 @@ impl HypergraphState {
             if change.discriminator == va_disc.as_slice() {
                 match change.state_change {
                     StateChangeEvent::Create | StateChangeEvent::Update | StateChangeEvent::Initialize => {
-                        let prior = self.crdt.get_vertex_data(&loc);
                         self.crdt.add_vertex(&loc, &change.value)?;
-                        self.undo_log.lock().unwrap().push(UndoEntry::VertexAdd {
-                            location: loc,
-                            prior_data: prior,
-                        });
                     }
                     StateChangeEvent::Delete => {}
                 }
             } else if change.discriminator == vr_disc.as_slice() {
-                let prior = self.crdt.get_vertex_data(&loc);
                 self.crdt.remove_vertex(&loc)?;
-                self.undo_log.lock().unwrap().push(UndoEntry::VertexRemove {
-                    location: loc,
-                    prior_data: prior,
-                });
             } else if change.discriminator == ha_disc.as_slice() {
                 match change.state_change {
                     StateChangeEvent::Create | StateChangeEvent::Update | StateChangeEvent::Initialize => {
-                        let prior = self.crdt.get_hyperedge_data(&loc);
                         self.crdt.add_hyperedge(&loc, &change.value)?;
-                        self.undo_log.lock().unwrap().push(UndoEntry::HyperedgeAdd {
-                            location: loc,
-                            prior_data: prior,
-                        });
                     }
                     StateChangeEvent::Delete => {}
                 }
             } else if change.discriminator == hr_disc.as_slice() {
-                let prior = self.crdt.get_hyperedge_data(&loc);
                 self.crdt.remove_hyperedge(&loc)?;
-                self.undo_log.lock().unwrap().push(UndoEntry::HyperedgeRemove {
-                    location: loc,
-                    prior_data: prior,
-                });
             }
         }
 
         Ok(())
-    }
-
-    /// Replay the undo log in reverse, reverting each applied
-    /// add/remove. Mirrors Go `HypergraphCRDT.RevertChanges` at
-    /// `hypergraph/hypergraph.go:516-770`.
-    ///
-    /// Reverting a `VertexRemove`/`HyperedgeRemove` deletes the
-    /// removes-tree entry first (so `lookup_vertex` / `get_vertex_data`
-    /// observe the restored state) and then re-adds the prior payload
-    /// to the adds tree. Reverting a `VertexAdd`/`HyperedgeAdd` either
-    /// restores the prior data or, if the add was the first one,
-    /// removes the entry entirely.
-    ///
-    /// After success the undo log is cleared.
-    pub fn revert_changes(&self) -> Result<()> {
-        let entries: Vec<UndoEntry> =
-            std::mem::take(&mut *self.undo_log.lock().unwrap());
-        for entry in entries.into_iter().rev() {
-            match entry {
-                UndoEntry::VertexAdd { location, prior_data } => {
-                    match prior_data {
-                        Some(d) => self.crdt.add_vertex(&location, &d)?,
-                        None => self.crdt.remove_vertex(&location)?,
-                    }
-                }
-                UndoEntry::VertexRemove { location, prior_data } => {
-                    // Delete the removes-tree entry so the vertex is
-                    // observable again, then restore prior data into the
-                    // adds tree. Mirror of Go's
-                    // `hg.vertexRemoves[shardKey].GetTree().Delete(...)`
-                    // at `hypergraph/hypergraph.go:640`, followed by
-                    // re-adding via `addVertex`.
-                    self.crdt.unmark_vertex_removed(&location)?;
-                    if let Some(d) = prior_data {
-                        self.crdt.add_vertex(&location, &d)?;
-                    }
-                }
-                UndoEntry::HyperedgeAdd { location, prior_data } => {
-                    match prior_data {
-                        Some(d) => self.crdt.add_hyperedge(&location, &d)?,
-                        None => self.crdt.remove_hyperedge(&location)?,
-                    }
-                }
-                UndoEntry::HyperedgeRemove { location, prior_data } => {
-                    self.crdt.unmark_hyperedge_removed(&location)?;
-                    if let Some(d) = prior_data {
-                        self.crdt.add_hyperedge(&location, &d)?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Number of pending undo entries (for testing / diagnostics).
-    pub fn undo_log_len(&self) -> usize {
-        self.undo_log.lock().unwrap().len()
     }
 
     /// Abort — discard all pending changes.
     pub fn abort(&self) {
         self.changeset.lock().unwrap().clear();
-        self.undo_log.lock().unwrap().clear();
     }
 
     /// Number of pending changes.
@@ -619,59 +494,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // covered_prefix gate + revert_changes (Tier-2 parity)
+    // covered_prefix gate
     // -----------------------------------------------------------------
-
-    #[test]
-    fn vertex_added_then_reverted_is_gone() {
-        let s = stub_state();
-        let disc = vertex_adds_discriminator().unwrap();
-        s.set(&domain(), &addr(), &disc, 1, b"data".to_vec()).unwrap();
-        s.commit().unwrap();
-        let loc = Location { app_address: [0xAAu8; 32], data_address: [0xBBu8; 32] };
-        assert!(s.crdt.lookup_vertex(&loc));
-        assert_eq!(s.undo_log_len(), 1);
-
-        s.revert_changes().unwrap();
-        assert!(!s.crdt.lookup_vertex(&loc));
-        assert_eq!(s.undo_log_len(), 0);
-    }
-
-    #[test]
-    fn vertex_removed_then_reverted_comes_back() {
-        let s = stub_state();
-        let va_disc = vertex_adds_discriminator().unwrap();
-        let vr_disc = vertex_removes_discriminator().unwrap();
-
-        // Add and commit so the vertex is present.
-        s.set(&domain(), &addr(), &va_disc, 1, b"original".to_vec()).unwrap();
-        s.commit().unwrap();
-        // Clear the undo log from the add — we want to test the remove revert path.
-        s.undo_log.lock().unwrap().clear();
-        // Drop the changeset too, to model a fresh frame.
-        s.changeset.lock().unwrap().clear();
-
-        let loc = Location { app_address: [0xAAu8; 32], data_address: [0xBBu8; 32] };
-        assert!(s.crdt.lookup_vertex(&loc));
-
-        // Now schedule and commit a remove.
-        s.delete(&domain(), &addr(), &vr_disc, 2).unwrap();
-        s.commit().unwrap();
-        assert!(!s.crdt.lookup_vertex(&loc));
-        assert_eq!(s.undo_log_len(), 1);
-
-        // Revert: the prior `add_vertex` is reissued. Note the CRDT's
-        // removes-tree entry persists, so `lookup_vertex` (which checks
-        // `in adds && !in removes`) still returns false. The revert
-        // entry's prior_data is what callers care about — verify it
-        // was preserved by reading the raw add tree via `get_vertex_data`.
-        s.revert_changes().unwrap();
-        let data = s.crdt.get_vertex_data(&loc);
-        // After revert, the adds tree once again contains the original payload.
-        // (The removes-tree entry suppresses lookup_vertex but get_vertex_data
-        // returns the underlying adds-tree value.)
-        assert_eq!(data.as_deref(), Some(&b"original"[..]));
-    }
 
     #[test]
     fn covered_prefix_drops_out_of_prefix_vertices_silently() {
@@ -690,7 +514,6 @@ mod tests {
 
         let loc = Location { app_address: [0xAAu8; 32], data_address: [0xBBu8; 32] };
         assert!(!s.crdt.lookup_vertex(&loc), "out-of-prefix vertex was wrongly added");
-        assert_eq!(s.undo_log_len(), 0, "no undo entry should be recorded for skipped commit");
 
         // Now switch to a matching prefix. First nibble of 0xAA is 42 (0b101010).
         s.crdt.set_covered_prefix(&[42]).unwrap();

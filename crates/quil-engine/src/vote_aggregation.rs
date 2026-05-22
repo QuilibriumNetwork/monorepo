@@ -81,18 +81,20 @@ impl VoteAggregation {
     /// [`GlobalVote`]) to the collector for its rank.
     pub fn handle_vote(&self, vote: GlobalVote) {
         let rank = vote.rank();
+        let voter_hex = hex::encode(<GlobalVote as quil_consensus::models::Unique>::identity(&vote));
         let min = self.min_active_rank.load(Ordering::Relaxed);
         if rank < min {
-            debug!(rank, "dropping vote below finalized rank");
+            tracing::info!(rank, voter = %voter_hex, min, "vote dropped: below finalized rank");
             return;
         }
         if rank > min.saturating_add(quil_consensus::vote_aggregator::MAX_RANK_LOOKAHEAD) {
-            debug!(rank, min, "dropping vote far above finalized rank (lookahead exceeded)");
+            tracing::info!(rank, voter = %voter_hex, min, "vote dropped: far above finalized rank");
             return;
         }
         let collector = self.get_or_create(rank);
-        if let Err(e) = collector.add_vote(vote) {
-            debug!(rank, error = %e, "vote collector rejected vote");
+        match collector.add_vote(vote) {
+            Ok(()) => tracing::info!(rank, voter = %voter_hex, "ingesting vote"),
+            Err(e) => tracing::info!(rank, voter = %voter_hex, error = %e, "vote rejected by collector"),
         }
     }
 

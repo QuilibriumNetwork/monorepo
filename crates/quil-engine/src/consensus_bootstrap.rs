@@ -57,7 +57,14 @@ impl Default for ConsensusConfig {
         // round-timeout fires at or before the leader's first
         // broadcast and every rank ends in a timeout instead of a QC.
         Self {
-            filter: vec![0x00],
+            // Global consensus filter — Go uses nil/empty here and
+            // writes its CONSENSUS-namespace keys with no suffix
+            // (`node/store/consensus.go:40`, callers in
+            // `node/consensus/global/genesis.go:489,498` and
+            // `node/consensus/global/global_consensus_engine.go:806,919`).
+            // Rust must match so a future migrator can translate
+            // those keys 1:1.
+            filter: Vec::new(),
             min_timeout: Duration::from_secs(36),
             max_timeout: Duration::from_secs(180),
             timeout_adjustment_factor: 1.2,
@@ -194,7 +201,9 @@ mod tests {
         let c = ConsensusConfig::default();
         // Mirrors Go's participant.go:46-106; proposal_duration bumped
         // from 8s to 10s (see Default impl docstring).
-        assert_eq!(c.filter, vec![0x00]);
+        // Empty filter matches Go's global consensus key layout
+        // (no filter suffix on CONSENSUS_STATE / LIVENESS keys).
+        assert_eq!(c.filter, Vec::<u8>::new());
         assert_eq!(c.min_timeout, Duration::from_secs(36));
         assert_eq!(c.max_timeout, Duration::from_secs(180));
         assert_eq!(c.timeout_adjustment_factor, 1.2);

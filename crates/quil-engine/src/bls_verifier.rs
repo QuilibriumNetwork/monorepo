@@ -28,12 +28,42 @@ use quil_types::error::{QuilError, Result};
 /// into another.
 pub struct BlsConsensusVerifier {
     aggregator: Arc<dyn SignatureAggregator>,
-    ds_tag: Vec<u8>,
+    /// Domain separator used for QC verification. Mirrors the
+    /// `vote_domain` the voters signed under.
+    vote_ds_tag: Vec<u8>,
+    /// Domain separator used for TC verification. Mirrors the
+    /// `timeout_domain` the timeout votes were signed under.
+    timeout_ds_tag: Vec<u8>,
 }
 
 impl BlsConsensusVerifier {
+    /// Construct a verifier whose vote_domain is used for both QC and
+    /// TC checks. Kept for backwards-compat with tests; production
+    /// should call [`Self::new_with_timeout_domain`].
     pub fn new(aggregator: Arc<dyn SignatureAggregator>, ds_tag: Vec<u8>) -> Self {
-        Self { aggregator, ds_tag }
+        Self {
+            aggregator,
+            vote_ds_tag: ds_tag.clone(),
+            timeout_ds_tag: ds_tag,
+        }
+    }
+
+    /// Construct a verifier with distinct domains for QC and TC. QCs
+    /// are aggregates of votes (signed with `vote_domain`), TCs are
+    /// aggregates of timeout votes (signed with `timeout_domain`).
+    /// Using the same tag for both was a latent bug — a TC formed under
+    /// the timeout domain would never verify against the vote-domain
+    /// `ds_tag`.
+    pub fn new_with_timeout_domain(
+        aggregator: Arc<dyn SignatureAggregator>,
+        vote_domain: Vec<u8>,
+        timeout_domain: Vec<u8>,
+    ) -> Self {
+        Self {
+            aggregator,
+            vote_ds_tag: vote_domain,
+            timeout_ds_tag: timeout_domain,
+        }
     }
 }
 
@@ -70,13 +100,31 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
         let agg = qc.aggregated_signature();
         let pk = agg.public_key();
         let sig = agg.signature();
+        let bitmask = agg.bitmask();
         if pk.is_empty() {
             return Err(QuilError::InsufficientSignatures(
                 "QC has no aggregated public key".into(),
             ));
         }
-        let ok = self.aggregator.verify_signature_raw(pk, sig, &msg, &self.ds_tag);
+        let ok = self.aggregator.verify_signature_raw(pk, sig, &msg, &self.vote_ds_tag);
         if !ok {
+            // Dump details so an operator can compare what voters signed
+            // vs what we're verifying. The two most common asymmetries
+            // are (a) `identity` re-derivation diverging between
+            // proposer and verifier, and (b) `ds_tag` mismatch.
+            tracing::warn!(
+                rank = qc.rank(),
+                filter_len = qc.filter().len(),
+                identity = %hex::encode(qc.identity()),
+                msg = %hex::encode(&msg),
+                ds_tag = %hex::encode(&self.vote_ds_tag),
+                pk_len = pk.len(),
+                pk_head = %hex::encode(&pk[..pk.len().min(16)]),
+                sig_len = sig.len(),
+                sig_head = %hex::encode(&sig[..sig.len().min(16)]),
+                bitmask = %hex::encode(bitmask),
+                "QC verification failed — dumping inputs",
+            );
             return Err(QuilError::InvalidQuorumCertificate(format!(
                 "aggregated QC signature failed verification at rank {} (state {})",
                 qc.rank(),
@@ -121,7 +169,7 @@ impl<V: Unique> Verifier<V> for BlsConsensusVerifier {
             &pk_refs,
             sig,
             &msg_refs,
-            &self.ds_tag,
+            &self.timeout_ds_tag,
         );
         if !ok {
             return Err(QuilError::InvalidTimeoutCertificate(format!(

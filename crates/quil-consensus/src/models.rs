@@ -16,6 +16,17 @@ pub trait Unique: Send + Sync + Clone + Debug + 'static {
     fn source(&self) -> &Identity;
     fn timestamp(&self) -> u64;
     fn signature(&self) -> &[u8];
+
+    /// Optional per-vote auxiliary payload. App shard votes use this
+    /// to carry a 516-byte VDF multi-proof contribution (PoMW). The
+    /// signature aggregator concatenates these in committee-index
+    /// order past the BLS aggregate to form the wire-level frame
+    /// signature blob: `bls_agg(74) || u32(count) || concat(aux)`.
+    /// Vote types that don't carry aux data (global votes) return
+    /// the default empty slice.
+    fn aux(&self) -> &[u8] {
+        &[]
+    }
 }
 
 /// Aggregated BLS signature with bitmask.

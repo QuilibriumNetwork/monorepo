@@ -12,9 +12,11 @@ mod logging;
 
 mod prover_message_transport_prod;
 
+mod release_check;
+
 /// Quilibrium Node — Rust implementation
 #[derive(Parser, Debug)]
-#[command(name = "quil-node", version, about)]
+#[command(name = "quil-node", version = quil_config::VERSION_STRING, about)]
 struct Args {
     /// Configuration directory path
     #[arg(short, long, default_value = ".config")]
@@ -80,8 +82,16 @@ struct Args {
     #[arg(long)]
     prometheus_server: Option<String>,
 
-    /// Enable or disable signature validation
-    #[arg(long, default_value_t = true)]
+    /// Enable or disable signature validation (default true, override
+    /// with `QUILIBRIUM_SIGNATURE_CHECK=false` or `--signature-check=false`)
+    #[arg(
+        long,
+        env = "QUILIBRIUM_SIGNATURE_CHECK",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
     signature_check: bool,
 
     /// Per-component log levels, comma-separated (e.g. "bootstrap=debug,peer_monitor=warn")
@@ -202,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
             0
         };
 
-        println!("Version: {}", env!("CARGO_PKG_VERSION"));
+        println!("Version: {}", quil_config::VERSION_STRING);
         println!("Peer ID: {}", peer_id_b58);
         println!("Prover Address: {}", hex::encode(&prover_address));
         println!("BLS Public Key: {}...{}", hex::encode(&bls_pubkey[..8]), hex::encode(&bls_pubkey[bls_pubkey.len()-8..]));
@@ -249,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
         // The metrics crate doesn't have a built-in dump; print known counters
         println!("# Quilibrium Node Metrics");
         println!("# (run with --prometheus-server to expose via HTTP)");
-        println!("quil_node_version{{version=\"{}\"}} 1", env!("CARGO_PKG_VERSION"));
+        println!("quil_node_version{{version=\"{}\"}} 1", quil_config::VERSION_STRING);
         if let Some(ref filter) = args.metrics_filter {
             println!("# Filtered by: {}", filter);
         }
@@ -315,13 +325,48 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = quil_config::VERSION_STRING,
         core = args.core,
         network = args.network,
         "starting quil-node"
     );
 
     info!(config_dir = %args.config.display(), "loaded configuration");
+
+    // Verify the binary against `.dgst` + per-signatory `.dgst.sig.N`
+    // using hardcoded Ed448 public keys. Fails closed; skipped on
+    // Windows and when --signature-check=false.
+    if args.signature_check {
+        if cfg!(target_os = "windows") {
+            info!("signature check not available for windows yet, skipping");
+        } else {
+            match std::env::current_exe() {
+                Ok(exe) => match release_check::verify_release_signatures(&exe) {
+                    Ok(count) => info!(
+                        valid_signatures = count,
+                        total_signatories = release_check::SIGNATORIES.len(),
+                        "signature check passed"
+                    ),
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            "signature check failed — are you running this from source? \
+                             (use --signature-check=false or QUILIBRIUM_SIGNATURE_CHECK=false)"
+                        );
+                        return Err(anyhow::anyhow!("signature check failed: {}", e));
+                    }
+                },
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "could not determine executable path for signature check: {}",
+                        e
+                    ));
+                }
+            }
+        }
+    } else {
+        info!("signature check disabled, skipping");
+    }
 
     // Create cancellation token for coordinated shutdown
     let token = CancellationToken::new();
@@ -380,11 +425,13 @@ async fn main() -> anyhow::Result<()> {
             run_dht_node(&config, token).await
         }
         (0, false) => {
-            info!("starting as master node");
+            // Archive mode comes from --archive OR engine.archiveMode.
+            let archive_mode = args.archive || config.engine.archive_mode;
+            info!(archive = archive_mode, "starting as master node");
             run_master_node(
                 &config,
                 &args.config,
-                args.archive,
+                archive_mode,
                 args.network,
                 token,
                 metrics_handle.clone(),
@@ -514,10 +561,9 @@ async fn run_master_node(
         Box::new(bls_ctor),
     )?);
 
-    // Mirror Go's special-case for `q-peer-key`: it lives in
-    // `config.p2p.peer_priv_key`, not `keys.yml`. Wiring the hex
-    // here lets the keystore resolve `q-peer-key` lookups (Send RPC
-    // outer auth, peer ID derivation) on Go-style configs.
+    // `q-peer-key` lives in `config.p2p.peer_priv_key`, not `keys.yml` —
+    // wire it through so keystore lookups (Send RPC outer auth, peer ID
+    // derivation) work on Go-style configs.
     file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
 
     // Auto-create all standard keys if missing
@@ -525,6 +571,10 @@ async fn run_master_node(
     let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
 
     let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&bls_pubkey)?;
+    // Publish the local prover address to the execution layer's static
+    // so `apply_reward` can surface incoming credits to the operator.
+    let _ = quil_execution::global_intrinsic::prover_shard_update::LOCAL_PROVER_ADDRESS
+        .set(prover_address.to_vec());
     info!(
         prover_address = hex::encode(&prover_address),
         bls_pubkey_len = bls_pubkey.len(),
@@ -545,6 +595,75 @@ async fn run_master_node(
         hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
         inclusion_prover.clone(),
     ));
+    // Pre-create the lazy tree for the global prover shard so the
+    // first commit materializes its root. Without this, migrated
+    // stores skip the shard and the sync server returns None for the
+    // tree blob.
+    crdt.ensure_all_phase_trees(&quil_types::store::ShardKey {
+        l1: [0u8; 3],
+        l2: [0xffu8; 32],
+    });
+    info!("global prover shard primed in CRDT phase_sets");
+
+    // Same prime for every app shard the local shards-store knows
+    // about. Without this, the QUIL-token shard's lazy trees never
+    // get inserted into `phase_sets` (no in-process mutation happens
+    // on a freshly migrated store), so `phase_set_metadata_at_path`
+    // returns `None` for every prefix and `GetAppShards` reports
+    // `size=0` + zero commitments to remote pollers. Their lifecycle
+    // then drops every candidate in `build_proposal_descriptors` and
+    // no `ProposeJoin` ever fires. All four phase sets are primed
+    // because remote callers verify commitments across all phases,
+    // not just vertex_adds.
+    {
+        let mut primed_keys: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+        let mut primed_count = 0usize;
+        if let Ok(shards) = shards_store.range_app_shards() {
+            for s in shards {
+                if s.shard_key.len() != 35 {
+                    continue;
+                }
+                if !primed_keys.insert(s.shard_key.clone()) {
+                    continue;
+                }
+                let mut l1 = [0u8; 3];
+                l1.copy_from_slice(&s.shard_key[..3]);
+                let mut l2 = [0u8; 32];
+                l2.copy_from_slice(&s.shard_key[3..35]);
+                crdt.ensure_all_phase_trees(&quil_types::store::ShardKey { l1, l2 });
+                primed_count += 1;
+            }
+        }
+        info!(shards = primed_count, "app shards primed in CRDT phase_sets");
+    }
+    // Eagerly run one commit at startup so the per-shard tree blob
+    // lands at `[0x2F, vertex, adds, {l1=[0;3], l2=[0xff;32]}]`
+    // before any sync probe arrives. Without an eager commit the
+    // tree blob isn't written until the first finalized frame is
+    // materialized, leaving an interval (sometimes several minutes
+    // on the seed nodes) where non-archive peers receive
+    // "no tree data available" and fall into perpetual fresh-sync
+    // retries.
+    match crdt.commit(0) {
+        Ok(commits) => {
+            let global_shard = quil_types::store::ShardKey {
+                l1: [0u8; 3],
+                l2: [0xffu8; 32],
+            };
+            let root_hex = commits
+                .get(&global_shard)
+                .and_then(|p| p.first())
+                .map(|r| hex::encode(r))
+                .unwrap_or_else(|| "<no root>".into());
+            info!(
+                shards = commits.len(),
+                global_prover_root = %root_hex,
+                "primed hypergraph tree blobs at startup",
+            );
+        }
+        Err(e) => warn!(error = %e, "startup hypergraph commit failed"),
+    }
     let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new_with_crypto(
         inclusion_prover.clone(),
         key_manager.clone(),
@@ -553,20 +672,8 @@ async fn run_master_node(
     ));
     info!("execution engines initialized with BLS48-581 + Ed448 signature verification");
 
-    // ---------------------------------------------------------------
-    // 3b. Genesis bootstrap (mainnet + testnet/devnet)
-    //
-    // Both networks bootstrap their genesis state locally on a fresh
-    // node. Without this, `shards_store.range_app_shards()` returns
-    // empty and the GetShardInfo RPC has no parent shards to query
-    // (the archive remote-fallback then has nothing to fetch).
-    // Mirrors Go's `node/consensus/global/genesis.go:177-209` which
-    // applies `initial_commitments` from `mainnet_genesis.json` to
-    // PutAppShard for every (L1, L2, Path) combo.
-    //
-    // `initialize_genesis_state` is idempotent: if the genesis frame
-    // already exists, it short-circuits.
-    // ---------------------------------------------------------------
+    // 3b. Genesis bootstrap (mainnet + testnet/devnet). Idempotent:
+    // skips if the genesis frame already exists.
     let clock_store_dyn: &dyn quil_types::store::ClockStore = clock_store.as_ref();
     if network == 0 {
         info!("bootstrapping mainnet genesis frame");
@@ -756,7 +863,26 @@ async fn run_master_node(
     // observed).
     let signer_registry: Arc<quil_p2p::SignerRegistry> =
         Arc::new(quil_p2p::SignerRegistry::new());
-    let last_global_head_frame = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Seed from the local clock store so PeerInfo broadcasts our
+    // real head on the first publish. Without this, restart leaves
+    // the atomic at 0 until a new frame arrives over the network —
+    // peers then see `head_frame=0` in our PeerInfo, can't form a
+    // quorum on rank N+1 because they assume we have no state, and
+    // consensus stalls. Loading the local latest from RocksDB
+    // (which the migration already populated to e.g. 414) closes
+    // the gap immediately.
+    let initial_head_frame: u64 = clock_store
+        .get_latest_global_frame()
+        .ok()
+        .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
+        .unwrap_or(0);
+    if initial_head_frame > 0 {
+        info!(
+            head_frame = initial_head_frame,
+            "seeded last_global_head_frame from local clock store",
+        );
+    }
+    let last_global_head_frame = Arc::new(std::sync::atomic::AtomicU64::new(initial_head_frame));
 
     // ---------------------------------------------------------------
     // 5b. PeerInfo publishing (every 5 minutes + immediate)
@@ -1117,6 +1243,36 @@ async fn run_master_node(
         });
     }
 
+    // Broadcast halt-state changes to every active app shard engine.
+    // Each engine forwards the flag to its `AppLeaderProvider`, which
+    // short-circuits `prove_next_state` during coverage halts.
+    {
+        let mut rx = halt_state.watch_any_halted();
+        let engines = shard_engines.clone();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    res = rx.changed() => {
+                        if res.is_err() { break; }
+                        let halted = *rx.borrow();
+                        let map = engines.read();
+                        let count = map.len();
+                        for (_filter, handle) in map.iter() {
+                            handle.set_halted(halted);
+                        }
+                        info!(
+                            halted,
+                            engines = count,
+                            "broadcast halt state to app shard engines"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     // Wire prover-only mode into the message collector
     // (the collector checks this flag on each add_message call)
     let mc_prover_only = message_collector.clone();
@@ -1291,6 +1447,10 @@ async fn run_master_node(
                     hypergraph: crdt,
                     execution_engine: exec_manager,
                     inclusion_prover,
+                    // Each worker writes consensus + liveness state
+                    // into its own RocksDB. Mirrors the per-worker
+                    // clock/hypergraph stores above.
+                    kv_db: Some(db_arc.clone() as Arc<dyn quil_types::store::KvDb>),
                 })
             });
 
@@ -1318,32 +1478,29 @@ async fn run_master_node(
                     crate::logging::register_worker_log_file(core_id);
                 })),
                 worker_state_builder: Some(worker_state_builder),
+                // Master's RocksDB doubles as the persistent backing
+                // for app-shard `ConsensusState` / `LivenessState` —
+                // workers writing through the master path (no
+                // per-worker DB) land here. Per-worker builds can
+                // override via `WorkerOwnedDeps::kv_db`.
+                kv_db: Some(db_arc.clone() as Arc<dyn quil_types::store::KvDb>),
             });
             info!(
                 worker_cores = thread_mgr.num_worker_cores(),
                 "thread worker manager ready (local mode)"
             );
-            // Drain `WorkerToMaster` events from the in-process worker
-            // threads. Mirrors the gRPC `submitShardFrameToMaster` path
-            // Go uses across worker/master processes — here both live in
-            // one process, so we forward the events directly to the
-            // master's BlossomSub publish path.
-            //
-            // `ShardFrameFinalized` becomes a `MessageBundle{Shard:
-            // header}` published on `GLOBAL_PROVER` so global archives
-            // credit our shard work toward rewards.
-            //
-            // TODO (multi-prover): when an app engine activates for a
-            // filter, the master also needs to *subscribe* to the four
-            // per-shard bitmasks (frame, consensus, prover, dispatch)
-            // and route incoming peer messages to the right
-            // `AppEngineHandle` by filter. Single-prover finalization
-            // works without this because no peers send shard messages,
-            // but multi-prover quorums require it.
+            // Drain `WorkerToMaster` events from in-process worker
+            // threads and forward to the master's BlossomSub publish
+            // path. `ShardFrameFinalized` becomes a
+            // `MessageBundle{Shard: header}` on `GLOBAL_PROVER`.
+            // Per-shard bitmask subscriptions are wired on
+            // `ShardActivated`; inbound routing dispatches by filter
+            // through `shard_engines` in the recv loop below.
             if let Some(mut master_rx) = thread_mgr.take_master_rx() {
                 let drain_p2p = p2p_handle.clone();
                 let drain_cancel = token.clone();
                 let drain_shard_engines = shard_engines.clone();
+                let drain_halt = halt_state.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -1364,6 +1521,24 @@ async fn run_master_node(
                                         filter,
                                         header_canonical_bytes,
                                     } => {
+                                        // Decode for a positive log line so the operator
+                                        // can see each rewardable proof going out. The
+                                        // bytes are consumed by `wrap` below; decode a
+                                        // borrowed view first.
+                                        if let Ok(h) =
+                                            quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(
+                                                &header_canonical_bytes,
+                                            )
+                                        {
+                                            info!(
+                                                core_id,
+                                                filter = %hex::encode(&filter),
+                                                frame = h.frame_number,
+                                                rank = h.rank,
+                                                prover = %hex::encode(&h.prover),
+                                                "submitting reward proof to GLOBAL_PROVER"
+                                            );
+                                        }
                                         let req = match quil_execution::message_envelope::CanonicalMessageRequest::wrap(
                                             header_canonical_bytes,
                                         ) {
@@ -1453,6 +1628,14 @@ async fn run_master_node(
                                         });
                                     }
                                     WorkerToMaster::ShardActivated { core_id, filter, handle } => {
+                                        // Push the current halt state to the
+                                        // freshly-activated engine before
+                                        // registering it. Without this the
+                                        // engine boots with halted=false and
+                                        // happily proposes frames during a
+                                        // network-wide halt window until the
+                                        // next halt-state transition arrives.
+                                        handle.set_halted(drain_halt.any_halted());
                                         // Register the engine handle so the
                                         // recv loop can dispatch peer
                                         // messages to it.
@@ -1511,10 +1694,22 @@ async fn run_master_node(
                 });
             }
             // Restore persisted worker state (manually_managed flag +
-            // assigned filter) before any pre-allocation runs. This
-            // makes the operator's intent stick across restarts —
-            // matches Go's `loadWorkersFromStore` flow.
-            let persisted = thread_mgr.load_all_persisted();
+            // assigned filter) before any pre-allocation runs, so the
+            // operator's intent sticks across restarts.
+            //
+            // Archive mode skips the restore — `set_worker_filter`
+            // would otherwise spawn worker threads, and archives don't
+            // run app-shard workers. A subsequent return to non-archive
+            // will pick
+            // them up again because we don't delete them here.
+            let persisted = if archive_mode {
+                if !thread_mgr.load_all_persisted().is_empty() {
+                    info!("archive mode: skipping persisted worker restore");
+                }
+                Vec::new()
+            } else {
+                thread_mgr.load_all_persisted()
+            };
             if !persisted.is_empty() {
                 info!(
                     count = persisted.len(),
@@ -1600,21 +1795,11 @@ async fn run_master_node(
     }
 
     // Apply `engine.data_worker_filters` from YAML config. Runs AFTER
-    // persisted-restore and AFTER idle pre-allocation, so:
-    //   * a fresh node pins config-declared filters and marks those
-    //     workers manually_managed=true;
-    //   * a restart with a prior persisted/gRPC-driven assignment
-    //     keeps that runtime state (persisted wins, see
-    //     `worker_allocator::apply_config_worker_filters` docs).
-    // This integration is *additional* to Go's behavior — Go only
-    // uses `data_worker_filters` for PeerInfo reachability
-    // advertisement, not worker pinning. The auto-allocator's
-    // manual_pending pool consumes these workers when matching
-    // registry allocations land.
-    // Skip in archive mode for the same reason as the pre-allocate
-    // block above: archives don't run app-shard workers, so applying
-    // config-declared shard filters would spawn workers an archive
-    // shouldn't have.
+    // persisted-restore and idle pre-allocation:
+    //   * fresh node pins config filters with manually_managed=true;
+    //   * restart with prior persisted/gRPC assignment keeps it
+    //     (persisted wins).
+    // Skipped in archive mode for the same reason as pre-allocation.
     if !archive_mode {
         let cfg_filters = &config.engine.data_worker_filters;
         let stats = quil_engine::worker_allocator::apply_config_worker_filters(
@@ -1703,6 +1888,48 @@ async fn run_master_node(
             aggregated_seniority = estimate,
             "computed config-derived seniority estimate"
         );
+    }
+
+    // Proactive worker allocation reconcile — fire as soon as the
+    // background prover registry refresh has data, independent of
+    // any archive sync. This is the path that pulls workers out of
+    // "filter pinned, consensus deferred" state on startup based on
+    // the LOCALLY persisted prover registry, rather than waiting
+    // for the first global frame to arrive from the archive poller
+    // (which can take 5+ minutes during PeerInfo discovery).
+    //
+    // Archive nodes don't host app-shard workers, so skip the call
+    // there — matches the gate inside the archive poller.
+    if !archive_mode {
+        let wa_for_init = worker_allocator.clone();
+        let pr_for_init = prover_registry.clone();
+        let lhf_for_init = last_global_head_frame.clone();
+        let token_for_init = token.clone();
+        tokio::spawn(async move {
+            // The background refresh at startup is spawn_blocking and
+            // typically finishes in well under a second. Poll up to
+            // ~5s for `distinct_provers() > 0`; on a fresh node with
+            // an empty registry this just gives up silently and the
+            // archive-poller path picks it up later.
+            for _ in 0..50 {
+                if token_for_init.is_cancelled() { return; }
+                let count = pr_for_init.read(|r| r.distinct_provers());
+                if count > 0 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let frame = lhf_for_init.load(std::sync::atomic::Ordering::Relaxed);
+            if frame > 0 {
+                if let Err(e) = wa_for_init.on_new_frame(frame) {
+                    warn!(
+                        error = %e,
+                        frame,
+                        "early worker reconcile failed"
+                    );
+                } else {
+                    info!(frame, "early worker reconcile complete (off local registry)");
+                }
+            }
+        });
     }
 
     // Shared slot for the consensus event-loop handle, populated by the
@@ -1812,6 +2039,7 @@ async fn run_master_node(
                 reward_issuer.clone(),
                 bls_for_intrinsic,
                 inclusion_prover.clone(),
+                frame_prover.clone(),
             ) {
                 warn!(error = %e, "install_global_frame_header_deps failed — shard coverage attribution will be a no-op");
             }
@@ -1934,15 +2162,10 @@ async fn run_master_node(
         }
         ids
     };
-    // Build set of valid genesis prover ADDRESSES (Poseidon hash of BLS pubkey)
-    // The frame header's `prover` field is the 32-byte address, not the raw key.
-    //
-    // On mainnet (network = 0) the allowlist is the embedded mainnet genesis
-    // (5 archive peers + the beacon). On testnet/devnet (network != 0) the
-    // allowlist is derived from `config.engine.genesis_seed` — the same hex
-    // blob the Go node uses to build its testnet bootstrap provers. Without
-    // this branch the testnet rejects every legitimate global frame as
-    // "INVALID PROVER" because mainnet keys never match testnet archives.
+    // Valid genesis prover ADDRESSES (Poseidon(BLS pubkey)). The frame
+    // header's `prover` field is the 32-byte address, not the raw key.
+    // Mainnet uses embedded genesis (5 archive peers + beacon);
+    // testnet/devnet uses `config.engine.genesis_seed`.
     let genesis_prover_addrs: std::collections::HashSet<Vec<u8>> = {
         let mut addrs = std::collections::HashSet::new();
         if network == 0 {
@@ -2335,6 +2558,7 @@ async fn run_master_node(
             let sync_mc = message_collector.clone();
             let sync_bls_pub = bls_pubkey.clone();
             let sync_pa = prover_address;
+            let sync_crdt = crdt.clone();
             let sync_p2p = p2p_handle.clone();
             let sync_ch = consensus_handle.clone();
             let sync_va = vote_aggregator.clone();
@@ -2343,6 +2567,7 @@ async fn run_master_node(
             let sync_cf = current_frame.clone();
             let sync_lhf = last_global_head_frame.clone();
             let sync_archive_mode = archive_mode;
+            let sync_db_for_consensus: Arc<dyn quil_types::store::KvDb> = db_arc.clone();
             tokio::spawn(async move {
                 // Archive nodes ARE the source of truth — they don't wait
                 // for some other archive to be discovered before activating
@@ -2438,12 +2663,63 @@ async fn run_master_node(
                 }
 
                     // Check if we're an active prover and build genesis QC.
-                    // Try store first, fall back to embedded mainnet genesis.
-                    let genesis_frame_result = sync_cs.get_latest_global_frame()
-                        .or_else(|_| {
-                            info!("no global frame in store, loading embedded mainnet genesis");
-                            quil_engine::genesis::load_mainnet_genesis()
+                    // Try the latest QC's candidate frame first (an
+                    // unfinalized rank-N candidate that the network
+                    // never committed but a QC was already formed on
+                    // — typical at the head of a chain mid-round).
+                    // Falling back to the latest *committed* global
+                    // frame would seed the forks tree at rank N-1,
+                    // leaving the leader at rank N+1 unable to find
+                    // the parent state and consensus stuck timing out.
+                    let genesis_frame_result = {
+                        use quil_types::store::ClockStore;
+                        let cs_trait: &dyn ClockStore = sync_cs.as_ref();
+                        let latest_qc = cs_trait.get_latest_quorum_certificate(&[]);
+                        match &latest_qc {
+                            Ok(qc) => info!(
+                                rank = qc.rank,
+                                frame_number = qc.frame_number,
+                                selector = %hex::encode(&qc.selector),
+                                "bootstrap: latest QC in store",
+                            ),
+                            Err(e) => warn!(
+                                error = %e,
+                                "bootstrap: no latest QC in store",
+                            ),
+                        }
+                        let candidate = latest_qc.ok().and_then(|qc| {
+                            match cs_trait
+                                .get_global_clock_frame_candidate(qc.frame_number, &qc.selector)
+                            {
+                                Ok(frame) => Some(frame),
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        rank = qc.rank,
+                                        frame_number = qc.frame_number,
+                                        selector = %hex::encode(&qc.selector),
+                                        "bootstrap: candidate frame lookup failed — falling back to committed",
+                                    );
+                                    None
+                                }
+                            }
                         });
+                        match candidate {
+                            Some(frame) => {
+                                info!(
+                                    rank = frame.header.as_ref().map(|h| h.rank).unwrap_or(0),
+                                    frame_number = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0),
+                                    "bootstrapping from latest QC candidate frame",
+                                );
+                                Ok(frame)
+                            }
+                            None => sync_cs.get_latest_global_frame()
+                                .or_else(|_| {
+                                    info!("no global frame in store, loading embedded mainnet genesis");
+                                    quil_engine::genesis::load_mainnet_genesis()
+                                }),
+                        }
+                    };
 
                     // Only nodes registered as global provers (i.e. with
                     // an allocation on the empty filter) should run the
@@ -2468,9 +2744,16 @@ async fn run_master_node(
                         }
                     };
                     if !is_global_prover {
-                        info!(
-                            "not a global prover — skipping global consensus event loop activation",
-                        );
+                        if sync_archive_mode {
+                            info!(
+                                "archive mode — skipping global consensus event loop activation \
+                                 (archives observe global frames via the poller, not via consensus)",
+                            );
+                        } else {
+                            info!(
+                                "not a global prover — skipping global consensus event loop activation",
+                            );
+                        }
                     } else if genesis_frame_result.is_ok() {
                         if let Ok(genesis_frame) = genesis_frame_result {
                             if let Ok(bls_signer) = sync_km.get_signer(quil_types::crypto::KeyType::Bls48581G1) {
@@ -2653,18 +2936,23 @@ async fn run_master_node(
                                         }
                                         let no_txn = NoTxn;
                                         let cs_trait: &dyn quil_types::store::ClockStore = cs.as_ref();
-                                        tracing::debug!(
-                                            frame = app.frame_number,
-                                            rank = app.rank,
-                                            "persisting candidate frame",
-                                        );
-                                        if let Err(e) = cs_trait.put_global_clock_frame_candidate(&frame, &no_txn) {
-                                            tracing::debug!(
+                                        let identity = quil_crypto::poseidon::hash_bytes_to_32(&app.output)
+                                            .map(hex::encode)
+                                            .unwrap_or_else(|_| "<poseidon-failed>".into());
+                                        match cs_trait.put_global_clock_frame_candidate(&frame, &no_txn) {
+                                            Ok(()) => tracing::info!(
+                                                frame = app.frame_number,
+                                                rank = app.rank,
+                                                identity = %identity,
+                                                "persisted candidate frame",
+                                            ),
+                                            Err(e) => tracing::warn!(
                                                 error = %e,
                                                 frame = app.frame_number,
                                                 rank = app.rank,
+                                                identity = %identity,
                                                 "failed to persist candidate frame",
-                                            );
+                                            ),
                                         }
                                     })
                                 };
@@ -2728,6 +3016,40 @@ async fn run_master_node(
                                         }
                                     })
                                 };
+                                // Load the persisted QC for the trusted
+                                // root's rank so the pacemaker boots
+                                // with a real BLS-aggregated QC instead
+                                // of a zero-signature stub (which peers
+                                // would reject on signature verify).
+                                let trusted_rank_for_qc: u64 = genesis_frame
+                                    .header
+                                    .as_ref()
+                                    .map(|h| h.rank)
+                                    .unwrap_or(0);
+                                let genesis_qc_override = {
+                                    use quil_types::store::ClockStore;
+                                    let cs_trait: &dyn ClockStore = sync_cs.as_ref();
+                                    match cs_trait.get_quorum_certificate(&[], trusted_rank_for_qc) {
+                                        Ok(qc_proto) => {
+                                            info!(
+                                                rank = qc_proto.rank,
+                                                frame_number = qc_proto.frame_number,
+                                                "seeding consensus with persisted QC",
+                                            );
+                                            Some(quil_engine::consensus_wire::QuorumCertificate::from_proto(&qc_proto))
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                rank = trusted_rank_for_qc,
+                                                error = %e,
+                                                "no persisted QC at trusted rank — \
+                                                 falling back to stub genesis QC \
+                                                 (peers will reject embedded QC)",
+                                            );
+                                            None
+                                        }
+                                    }
+                                };
                                 match quil_engine::consensus_activation::activate_consensus(
                                     quil_engine::consensus_activation::ConsensusActivationParams {
                                         prover_registry: sync_pr.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
@@ -2746,7 +3068,14 @@ async fn run_master_node(
                                         on_incorporated_state: Some(incorporated_hook),
                                         on_qc_observed: Some(qc_observed_hook),
                                         config_override: None,
-                                        genesis_qc_override: None,
+                                        genesis_qc_override,
+                                        // Persist consensus + liveness
+                                        // state in the node's RocksDB so
+                                        // finalized_rank / latest_qc
+                                        // survive restarts (without this
+                                        // a restart can re-vote for a
+                                        // conflicting QC).
+                                        kv_db: Some(sync_db_for_consensus.clone()),
                                     },
                                 ) {
                                     Ok(activation) => {
@@ -2781,6 +3110,21 @@ async fn run_master_node(
                                                     activation.timeout_domain,
                                                 ),
                                             );
+                                            // Seed the aggregators' min_active_rank
+                                            // to the bootstrap rank. Without this they
+                                            // sit at 0 and the `rank > min + MAX_RANK_LOOKAHEAD`
+                                            // guard drops every peer vote/timeout for a
+                                            // chain that has already advanced more than
+                                            // 1024 ranks past genesis — symptom: the
+                                            // leader proposes, peers presumably vote, but
+                                            // the aggregator silently discards every
+                                            // vote and the chain perpetual-times-out.
+                                            va.advance_min_active_rank(trusted_rank_for_qc);
+                                            ta.advance_min_active_rank(trusted_rank_for_qc);
+                                            info!(
+                                                bootstrap_rank = trusted_rank_for_qc,
+                                                "seeded vote + timeout aggregator min_active_rank",
+                                            );
                                             let va_ok = sync_va.set(va).is_ok();
                                             let ta_ok = sync_ta.set(ta).is_ok();
                                             if va_ok && ta_ok {
@@ -2804,7 +3148,24 @@ async fn run_master_node(
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
+                            // Archives have full history locally — they
+                            // don't need to incremental-sync the prover
+                            // tree from peers, and on a fresh post-
+                            // migration topology this just trades "no
+                            // tree data available" errors with other
+                            // freshly-migrated archives.
+                            if sync_archive_mode {
+                                continue;
+                            }
                             if let Some(addr) = sync_pool.get_all().await.first() {
+                                // Snapshot the local reward balance before the
+                                // sync pulls fresh leaves. Compared against the
+                                // post-sync balance to surface credits that
+                                // arrived via peer data (i.e. not driven by
+                                // local `apply_reward`).
+                                let pre_balance = quil_execution::global_intrinsic::prover_shard_update::
+                                    read_reward_balance_for(&sync_crdt, &sync_pa)
+                                    .unwrap_or_else(|_| num_bigint::BigInt::from(0));
                                 match quil_rpc::ensure_prover_tree_incremental(
                                     addr, &seed,
                                     quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
@@ -2821,6 +3182,23 @@ async fn run_master_node(
                                             let pr = sync_pr.clone();
                                             let hs3 = sync_hg.clone();
                                             let _ = tokio::task::spawn_blocking(move || pr.refresh_from_store(&hs3)).await;
+
+                                            // Compare reward balance for the
+                                            // local prover before/after; log
+                                            // when it changed so the operator
+                                            // sees synced-in credits.
+                                            let post_balance = quil_execution::global_intrinsic::prover_shard_update::
+                                                read_reward_balance_for(&sync_crdt, &sync_pa)
+                                                .unwrap_or_else(|_| num_bigint::BigInt::from(0));
+                                            if post_balance != pre_balance {
+                                                let delta = &post_balance - &pre_balance;
+                                                info!(
+                                                    prover = %hex::encode(&sync_pa),
+                                                    delta = %delta,
+                                                    new_balance = %post_balance,
+                                                    "local prover reward balance updated by sync"
+                                                );
+                                            }
                                         } else {
                                             debug!("incremental sync: tree unchanged");
                                         }
@@ -2957,6 +3335,7 @@ async fn run_master_node(
     // Use the CLI-supplied network value (`--network`); the YAML's
     // `p2p.network` field is left at 0 in shared configs.
     let network_for_recv: u8 = network;
+    let archive_mode_for_recv: bool = archive_mode;
     let pl_for_recv = prover_lifecycle.clone();
     let pr_for_recv = prover_registry.clone();
     let wm_for_recv = worker_manager.clone();
@@ -3164,7 +3543,20 @@ async fn run_master_node(
                                             // loads the cached blob from
                                             // RocksDB or pulls + verifies +
                                             // persists from this archive.
-                                            if is_new && archive_peers_seen.len() == 1 {
+                                            // Skip in archive mode — archives
+                                            // have full history locally and
+                                            // the legacy whole-tree blob
+                                            // sync path isn't populated by
+                                            // migrated stores (per-vertex
+                                            // data at `0x30` is, but blob
+                                            // cache at `0x2F` is not), so
+                                            // calling this against another
+                                            // archive that's also fresh
+                                            // from migration just trades
+                                            // "no tree data available"
+                                            // errors back and forth.
+                                            if is_new && archive_peers_seen.len() == 1
+                                                && !archive_mode_for_recv {
                                                 if let (Some(seed), Some(addr)) =
                                                     (mtls_seed_for_recv, first_addr)
                                                 {
@@ -3441,11 +3833,24 @@ async fn run_master_node(
                                                 match quil_engine::consensus_wire::GlobalProposal::from_canonical_bytes(&received.data) {
                                                     Ok(wire) => {
                                                         match quil_engine::consensus_types::wire_proposal_to_signed(wire) {
-                                                            Ok((sp, qc, tc)) => {
+                                                            Ok((sp, qc, _tc)) => {
                                                                 handle.submit_quorum_certificate(qc);
-                                                                if let Some(tc) = tc {
-                                                                    handle.submit_timeout_certificate(tc);
-                                                                }
+                                                                // Skip pre-submitting the
+                                                                // proposal's
+                                                                // `previous_rank_timeout_certificate`.
+                                                                // Same hazard as the TimeoutState
+                                                                // path below: an unvalidated TC
+                                                                // would land in the pacemaker's
+                                                                // newest-TC tracker and be
+                                                                // embedded into our own next
+                                                                // outgoing timeout. Validation
+                                                                // happens later in
+                                                                // `validate_proposal` →
+                                                                // `validate_timeout_certificate`,
+                                                                // and a real TC will surface via
+                                                                // the local timeout aggregator's
+                                                                // `on_tc_created` callback once
+                                                                // enough peer timeouts arrive.
                                                                 // Feed into the rank's vote collector
                                                                 // so the proposer's self-vote counts
                                                                 // toward quorum and subsequent
@@ -3482,17 +3887,20 @@ async fn run_master_node(
                                             quil_engine::consensus_wire::TIMEOUT_STATE_TYPE => {
                                                 match quil_engine::consensus_wire::TimeoutState::from_canonical_bytes(&received.data) {
                                                     Ok(ts) => {
-                                                        // Also surface the embedded QC/prior-TC so
-                                                        // the event loop fast-forwards even before
-                                                        // local TC aggregation completes.
+                                                        // Fast-forward the newest-QC tracker.
+                                                        // Safe: bad QCs fail later validation.
                                                         let qc_for_handle = ts.latest_quorum_certificate.clone().into_trait_object();
                                                         handle.submit_quorum_certificate(qc_for_handle);
-                                                        if let Some(tc) = ts.prior_rank_timeout_certificate.clone() {
-                                                            handle.submit_timeout_certificate(tc.into_trait_object());
-                                                        }
-                                                        // Route into the per-rank timeout processor
-                                                        // so individual TO signatures aggregate to
-                                                        // a local TC.
+                                                        // DO NOT auto-submit the embedded
+                                                        // `prior_rank_timeout_certificate` —
+                                                        // a malformed TC would land in our
+                                                        // pacemaker's newest-TC tracker and
+                                                        // get embedded into our next timeout,
+                                                        // which peers then reject. Outgoing
+                                                        // TCs source from clock store
+                                                        // (previously validated). Local
+                                                        // aggregation forms a valid TC once
+                                                        // peer timeouts arrive.
                                                         if let Some(agg) = ta_for_recv.get() {
                                                             let typed = quil_engine::timeout_aggregation::wire_timeout_to_typed(ts);
                                                             agg.handle_timeout(typed);
@@ -3721,6 +4129,31 @@ async fn run_master_node(
             })
         };
 
+        // AppShardsProvider: for each (shard_key, prefix), derive size
+        // / data_shards / commitments from the live VertexAdds tree via
+        // `app_shard_metadata::get_app_shard_metadata`. Without this,
+        // `GetAppShards` returns `size=0` for every entry (the
+        // shards-store on Rust persists only the prefix path bytes),
+        // and a polling node's lifecycle silently drops every join
+        // candidate (`build_proposal_descriptors` requires size>0).
+        let app_shards_provider: quil_rpc::global_service::AppShardsProvider = {
+            let crdt = crdt.clone();
+            Arc::new(move |shard_key: &[u8], prefix: &[u32]| {
+                let info = quil_types::store::ShardInfo {
+                    shard_key: shard_key.to_vec(),
+                    prefix: prefix.to_vec(),
+                    size: Vec::new(),
+                    data_shards: 0,
+                    commitment: Vec::new(),
+                };
+                let meta = quil_engine::app_shard_metadata::get_app_shard_metadata(
+                    crdt.as_ref(),
+                    &info,
+                )?;
+                Some((meta.size, meta.data_shards, meta.commitments))
+            })
+        };
+
         let grpc_server = quil_rpc::GlobalRpcServer::new(
             Arc::new(ClockStoreFrameLookup(clock_store.clone())),
         )
@@ -3728,6 +4161,7 @@ async fn run_master_node(
         .with_shards_store(shards_store.clone())
         .with_worker_snapshot(global_worker_snap)
         .with_global_shards_provider(global_shards_provider)
+        .with_app_shards_provider(app_shards_provider)
         .with_message_broadcast(global_msg_tx.clone());
         let hypersync = quil_rpc::hypersync_server::HyperSyncServer::new(hg_store.clone());
 
@@ -3867,11 +4301,9 @@ async fn run_master_node(
                         if payload.is_empty() {
                             return Err("empty payload".into());
                         }
-                        // Go's `SignWithDomain` signs concat(prefix,
-                        // body) with an empty Ed448 context. Match
-                        // that — passing the prefix as the RFC 8032
-                        // ctx parameter would not verify Go-produced
-                        // signatures.
+                        // SignWithDomain signs `prefix || body` with an
+                        // empty Ed448 context — passing the prefix as
+                        // the RFC 8032 ctx wouldn't verify.
                         let mut digest = Vec::with_capacity(19 + 32 + payload.len());
                         digest.extend_from_slice(b"NODE_AUTHENTICATION");
                         digest.extend_from_slice(&domain);
@@ -4107,19 +4539,12 @@ async fn run_master_node(
                     Err(_) => (0u64, cf),
                 };
 
-                // Collect the filters this prover is currently
-                // "associated with" for TUI display purposes — Joining
-                // (non-expired), Active, Paused, and Leaving (non-
-                // expired). Diverges intentionally from `is_allocated`
-                // (Active+Joining only): a Leaving prover is still
-                // occupying their ring slot until the 360-frame
-                // confirm window completes, so the TUI must show the
-                // reward they are actually still earning at their
-                // current rank — not what a *fresh* joiner would get
-                // (which is what `resolve_prover_ring` falls back to
-                // when `is_alloc=false`, producing the visible bug
-                // where 8 other provers + 1 leaving self displays as
-                // ring 1, the joiner ring).
+                // Collect filters this prover is currently associated
+                // with for TUI display: Joining (non-expired), Active,
+                // Paused, and Leaving (non-expired). Differs from
+                // `is_allocated` (Active+Joining only) — a Leaving
+                // prover is still earning at their current rank until
+                // the 360-frame confirm window completes.
                 let provers = self
                     .registry
                     .get_provers(&self.self_address)
@@ -4151,11 +4576,10 @@ async fn run_master_node(
                     &local_get_sizes,
                 );
 
-                // Remote fallback. Two triggers, matching Go:
-                //   * basis == 0       — local data is empty everywhere.
-                //   * include_all && !archive && partial local — we got
-                //     entries for some shards but not all (typical
-                //     non-archive: only its allocated shards have data).
+                // Remote fallback triggers:
+                //   * basis == 0 — local data is empty everywhere.
+                //   * include_all && !archive && partial local — got
+                //     some shards but not all (typical non-archive).
                 let expected_shards: usize = self
                     .shards_store
                     .range_app_shards()
@@ -4741,12 +5165,10 @@ async fn run_worker_node(
     // file lock per `LOCK` file, so a second `open` against the same
     // path fails. Each worker must own its own store.
     //
-    // Resolution order, matching Go:
-    //   1. Explicit `db.worker_paths[idx]` (idx is `core_id - 1`, since
-    //      core 0 is the master).
-    //   2. `db.worker_path_prefix` with the literal token `%d`
-    //      substituted with the core id.
-    //   3. Fallback: `<db.path or .config/store>/worker-<core_id>`.
+    // Resolution order:
+    //   1. `db.worker_paths[core_id - 1]` (core 0 is master).
+    //   2. `db.worker_path_prefix` with `%d` → core id.
+    //   3. `<db.path or .config/store>/worker-<core_id>`.
     let db_path: std::path::PathBuf = {
         let idx = core_id.saturating_sub(1) as usize;
         if let Some(p) = config.db.worker_paths.get(idx).filter(|s| !s.is_empty()) {
@@ -4772,11 +5194,9 @@ async fn run_worker_node(
         Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
 
-    // Crypto + CRDT + execution engines so this worker can produce
-    // app shard frame headers byte-for-byte identical to Go's. Each
-    // worker process owns its own RocksDB store (per `worker_path_prefix`)
-    // and therefore its own crdt + execution manager — exactly what Go
-    // does for cluster-mode workers.
+    // Per-worker crypto + CRDT + execution engines. Each worker
+    // process owns its own RocksDB store (per `worker_path_prefix`)
+    // and therefore its own crdt + execution manager.
     let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
         Arc::new(quil_crypto::KzgInclusionProver);
     let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =

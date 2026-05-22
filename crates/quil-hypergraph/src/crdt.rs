@@ -89,6 +89,41 @@ impl HypergraphCrdt {
         self.covered_prefix.read().unwrap().clone()
     }
 
+    /// Ensure a lazy tree exists in `phase_sets.vertex_adds` for the
+    /// given shard. Used at startup on archive/global-prover nodes so
+    /// that `commit` includes the shard even when no in-process
+    /// `add_vertex` happened this session — without this, a migrated
+    /// store with persisted trie nodes for the shard is invisible to
+    /// `commit`, so the sync server's `load_tree_blob` lookup
+    /// (`hypergraph_tree_blob_key`) never gets a value and remote
+    /// peers see "no tree data available".
+    pub fn ensure_vertex_adds_tree(&self, shard_key: &ShardKey) {
+        let mut sets = self.phase_sets.write().unwrap();
+        Self::ensure_tree(
+            &mut sets.vertex_adds,
+            &self.store,
+            "vertex",
+            "adds",
+            shard_key,
+        );
+    }
+
+    /// Prime all four phase-set trees for a shard. Used at startup for
+    /// migrated shards whose on-disk trie nodes exist but were never
+    /// touched by an in-process mutation this session — without
+    /// priming, `phase_set_metadata_at_path` returns `None` for that
+    /// shard and `GetAppShards` reports size=0 / zero commitments per
+    /// phase. Mutations (`add_vertex` / `remove_vertex` /
+    /// `add_hyperedge` / `remove_hyperedge`) auto-populate via
+    /// `ensure_tree`, so this is only the cold-start gap-filler.
+    pub fn ensure_all_phase_trees(&self, shard_key: &ShardKey) {
+        let mut sets = self.phase_sets.write().unwrap();
+        Self::ensure_tree(&mut sets.vertex_adds, &self.store, "vertex", "adds", shard_key);
+        Self::ensure_tree(&mut sets.vertex_removes, &self.store, "vertex", "removes", shard_key);
+        Self::ensure_tree(&mut sets.hyperedge_adds, &self.store, "hyperedge", "adds", shard_key);
+        Self::ensure_tree(&mut sets.hyperedge_removes, &self.store, "hyperedge", "removes", shard_key);
+    }
+
     /// Update the covered nibble prefix and forward to the backing
     /// store. Mirrors Go `HypergraphCRDT.SetCoveredPrefix` (without
     /// the per-tree `CoveredPrefix` field assignment, which the
@@ -303,47 +338,6 @@ impl HypergraphCrdt {
             *size -= &value_size;
         }
 
-        Ok(())
-    }
-
-    /// Reverse a previous `remove_vertex` by deleting the removes-tree
-    /// entry. Used by `RevertChanges` after replaying a vertex add for
-    /// a previously-removed vertex. Mirrors Go
-    /// `hg.vertexRemoves[shardKey].GetTree().Delete(...)` at
-    /// `hypergraph/hypergraph.go:640`.
-    ///
-    /// Returns `Ok(())` whether or not a removes entry existed (matching
-    /// the idempotent CRDT semantic on the call site).
-    pub fn unmark_vertex_removed(&self, location: &Location) -> Result<()> {
-        let shard_key = shard_key_for_location(location);
-        let id = location.to_id();
-        let mut sets = self.phase_sets.write().unwrap();
-        if let Some(tree) = sets.vertex_removes.get_mut(&shard_key) {
-            // Tree::delete returns NotFound when the key isn't present;
-            // swallow it because the caller treats this as idempotent.
-            match tree.delete(&id) {
-                Ok(()) => {}
-                Err(quil_types::error::QuilError::NotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    /// Reverse a previous `remove_hyperedge`. Mirror of Go
-    /// `hg.hyperedgeRemoves[shardKey].GetTree().Delete(...)` at
-    /// `hypergraph/hypergraph.go:616`.
-    pub fn unmark_hyperedge_removed(&self, location: &Location) -> Result<()> {
-        let shard_key = shard_key_for_location(location);
-        let id = location.to_id();
-        let mut sets = self.phase_sets.write().unwrap();
-        if let Some(tree) = sets.hyperedge_removes.get_mut(&shard_key) {
-            match tree.delete(&id) {
-                Ok(()) => {}
-                Err(quil_types::error::QuilError::NotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
         Ok(())
     }
 

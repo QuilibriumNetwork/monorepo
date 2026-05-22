@@ -113,37 +113,20 @@ impl ProverRegistryCommittee {
         &self.filter
     }
 
-    /// List active provers under this committee's filter. Each entry
-    /// becomes a [`ProverIdentity`] with `weight = seniority`. If the
-    /// local node is missing from the registry's view, it is appended
-    /// with weight 0 so its self-vote authenticates against its real
-    /// public key.
+    /// Active provers under this committee's filter, in
+    /// sorted-address order. Mirrors Go's
+    /// `AppConsensusEngine.IdentitiesByRank`.
     fn active_identities(&self) -> Result<Vec<Box<dyn WeightedIdentity>>> {
         let active = self.registry.get_active_provers(&self.filter)?;
-        let mut self_seen = false;
-        let mut out: Vec<Box<dyn WeightedIdentity>> = active
+        Ok(active
             .into_iter()
             .map(|p| {
-                if address_to_identity(&p.address) == self.self_id {
-                    self_seen = true;
-                }
                 Box::new(ProverIdentity::new(&p.address, p.public_key, p.seniority))
                     as Box<dyn WeightedIdentity>
             })
-            .collect();
-        if !self_seen && !self.self_public_key.is_empty() {
-            out.push(Box::new(ProverIdentity::new(
-                &self.self_id,
-                self.self_public_key.clone(),
-                0,
-            )) as Box<dyn WeightedIdentity>);
-        }
-        Ok(out)
+            .collect())
     }
 
-    /// Total stake-weight across the active committee. The seeded
-    /// self entry contributes 0, so the threshold derived here agrees
-    /// with the identity list from [`active_identities`].
     fn total_weight(&self) -> Result<u64> {
         let active = self.registry.get_active_provers(&self.filter)?;
         Ok(active.iter().map(|p| p.seniority).sum())

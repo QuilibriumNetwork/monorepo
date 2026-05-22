@@ -5,6 +5,7 @@ pub mod app_shard_metadata;
 pub mod app_timeout_aggregation;
 pub mod app_types;
 pub mod app_vote_aggregation;
+pub mod multi_proof_cache;
 pub mod bls_signature_aggregator;
 pub mod bls_verifier;
 pub mod committee;

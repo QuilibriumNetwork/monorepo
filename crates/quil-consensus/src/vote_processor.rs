@@ -136,10 +136,15 @@ impl<S: Unique, V: Unique> VoteProcessor<S, V> {
             return Ok(());
         }
 
-        // Add to aggregator. TrustedAdd returns the new total.
+        // Add to aggregator. TrustedAdd returns the new total. Pass
+        // the vote's aux payload through so app-shard votes' VDF
+        // multi-proof contributions get stored alongside their BLS
+        // sig and packed into the aggregate blob at QC time. Global
+        // votes (no aux) take the empty-slice default and behave
+        // identically to plain `trusted_add`.
         let total_weight = self
             .proving_sig_aggregator
-            .trusted_add(vote.identity(), vote.signature())
+            .trusted_add_with_aux(vote.identity(), vote.signature(), vote.aux())
             .map_err(|e| {
                 QuilError::Consensus(format!(
                     "unexpected exception adding signature from vote {} to proving aggregator: {}",

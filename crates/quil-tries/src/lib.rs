@@ -11,7 +11,9 @@ pub use go_format::{deserialize_go_tree, serialize_go_tree};
 pub use lazy_tree::{LazyVectorCommitmentTree, NodeMetadata};
 pub use nibble::{get_full_path, get_next_nibble};
 pub use node::{BranchNode, LeafNode, VectorCommitmentNode};
-pub use serialize::{deserialize_tree, serialize_tree};
+pub use serialize::{
+    deserialize_node_solo, deserialize_tree, serialize_node_solo, serialize_tree,
+};
 pub use tree::{MultiKeyTraversalProof, TraversalSubProof, VectorCommitmentTree};
 
 /// 64-way branching factor (6 bits per nibble).

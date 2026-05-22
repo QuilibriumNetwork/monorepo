@@ -174,6 +174,7 @@ impl GlobalConsensusEngine {
             on_qc_observed: None,
             config_override: None,
             genesis_qc_override: None,
+            kv_db: None,
         };
 
         let activation = consensus_activation::activate_consensus(params)?;

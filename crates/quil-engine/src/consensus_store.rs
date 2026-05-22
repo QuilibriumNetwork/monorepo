@@ -16,19 +16,23 @@
 //!
 //! # Key layout
 //!
-//! Keys are prefixed with a module tag (`0x01` for consensus, `0x02`
-//! for liveness) followed by the filter bytes. This keeps entries
-//! for different shards isolated in the KV store.
+//! Keys live under the workspace-wide CONSENSUS namespace
+//! (`0x0C`) with sub-discriminators that match the Go store layout
+//! (`node/store/consensus.go:40,118`):
+//!
+//! - `[0x0C, 0x00, filter]` — consensus state (safety-rules view)
+//! - `[0x0C, 0x01, filter]` — liveness state (pacemaker view)
+//!
+//! Builder functions live in `quil_store::encoding` so the layout
+//! definition has a single source of truth shared with the migrator.
 
 use std::sync::Arc;
 
 use quil_consensus::event_handler::ConsensusStore;
 use quil_consensus::models::{ConsensusState, LivenessState, Unique};
+use quil_store::encoding::{consensus_liveness_key, consensus_state_key};
 use quil_types::error::{QuilError, Result};
 use quil_types::store::KvDb;
-
-const CONSENSUS_STATE_PREFIX: u8 = 0x01;
-const LIVENESS_STATE_PREFIX: u8 = 0x02;
 
 /// Encode/decode callbacks for the opaque QC / TC references inside
 /// [`ConsensusState`] / [`LivenessState`]. The codec is
@@ -54,21 +58,8 @@ pub trait ConsensusStateCodec<V: Unique>: Send + Sync {
     fn decode_liveness_state(&self, bytes: &[u8]) -> Result<LivenessState>;
 }
 
-/// Build the KV key for a consensus-state entry under `filter`.
-fn consensus_state_key(filter: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(1 + filter.len());
-    k.push(CONSENSUS_STATE_PREFIX);
-    k.extend_from_slice(filter);
-    k
-}
-
-/// Build the KV key for a liveness-state entry under `filter`.
-fn liveness_state_key(filter: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(1 + filter.len());
-    k.push(LIVENESS_STATE_PREFIX);
-    k.extend_from_slice(filter);
-    k
-}
+// Key builders live in `quil_store::encoding` — imported above as
+// `consensus_state_key` / `consensus_liveness_key`.
 
 /// KV-backed [`ConsensusStore`] implementation.
 pub struct KvConsensusStore<V: Unique, C: ConsensusStateCodec<V>> {
@@ -117,7 +108,7 @@ impl<V: Unique, C: ConsensusStateCodec<V>> ConsensusStore<V> for KvConsensusStor
     }
 
     fn get_liveness_state(&self, filter: &[u8]) -> Result<LivenessState> {
-        let key = liveness_state_key(filter);
+        let key = consensus_liveness_key(filter);
         match self.db.get(&key)? {
             Some(bytes) => self.codec.decode_liveness_state(&bytes),
             None => Ok((self.bootstrap_liveness)(filter)),
@@ -125,7 +116,7 @@ impl<V: Unique, C: ConsensusStateCodec<V>> ConsensusStore<V> for KvConsensusStor
     }
 
     fn put_liveness_state(&self, state: &LivenessState) -> Result<()> {
-        let key = liveness_state_key(&state.filter);
+        let key = consensus_liveness_key(&state.filter);
         let bytes = self.codec.encode_liveness_state(state)?;
         self.db.set(&key, &bytes)
     }

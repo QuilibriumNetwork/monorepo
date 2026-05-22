@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
@@ -23,6 +24,7 @@ use quil_consensus::voting_provider::{OnQuorumCertificateCreated, VotingProvider
 use quil_types::crypto::BlsConstructor;
 use quil_types::error::QuilError;
 
+use crate::app_glue::QcStore;
 use crate::app_types::{AppShardState, AppShardVote};
 use crate::bls_signature_aggregator::BlsSignatureAggregator;
 use crate::committee::ProverRegistryCommittee;
@@ -32,28 +34,42 @@ use crate::committee::ProverRegistryCommittee;
 /// `QuorumCertificate` submitted to the shard's HotStuff event loop.
 pub struct AppVoteAggregation {
     filter: Vec<u8>,
+    /// Wire FrameHeader.address; equal to `filter`. Used as the
+    /// payload-address field in `make_vote_message`.
+    app_address: Vec<u8>,
     committee: Arc<ProverRegistryCommittee>,
     voting_provider: Arc<dyn VotingProvider<AppShardState, AppShardVote>>,
     consensus_handle: Arc<OnceLock<EventLoopHandle<AppShardState, AppShardVote>>>,
     bls: Arc<dyn BlsConstructor>,
     vote_domain: Vec<u8>,
     collectors: Mutex<HashMap<u64, Arc<VoteCollector<AppShardState, AppShardVote>>>>,
-    /// Highest rank we've seen finalized via a QC. Collectors below
-    /// this are pruned.
     min_active_rank: AtomicU64,
+    /// Floor on the wall-clock interval between observing a rank's
+    /// proposal and submitting its QC — paces single-prover shards.
+    proposal_duration: Duration,
+    /// Rank → first-observed instant, consulted at QC formation to
+    /// defer submission until `entry + proposal_duration`.
+    rank_entry_times: Arc<Mutex<HashMap<u64, Instant>>>,
+    /// QC cache shared with `AppFollower::on_finalized_state` for
+    /// certifying-QC rehydration.
+    qc_store: Arc<QcStore>,
 }
 
 impl AppVoteAggregation {
     pub fn new(
         filter: Vec<u8>,
+        app_address: Vec<u8>,
         committee: Arc<ProverRegistryCommittee>,
         voting_provider: Arc<dyn VotingProvider<AppShardState, AppShardVote>>,
         consensus_handle: Arc<OnceLock<EventLoopHandle<AppShardState, AppShardVote>>>,
         bls: Arc<dyn BlsConstructor>,
         vote_domain: Vec<u8>,
+        proposal_duration: Duration,
+        qc_store: Arc<QcStore>,
     ) -> Self {
         Self {
             filter,
+            app_address,
             committee,
             voting_provider,
             consensus_handle,
@@ -61,6 +77,9 @@ impl AppVoteAggregation {
             vote_domain,
             collectors: Mutex::new(HashMap::new()),
             min_active_rank: AtomicU64::new(0),
+            proposal_duration,
+            rank_entry_times: Arc::new(Mutex::new(HashMap::new())),
+            qc_store,
         }
     }
 
@@ -85,6 +104,16 @@ impl AppVoteAggregation {
             debug!(rank, "dropping shard proposal below finalized rank");
             return;
         }
+        // First-observed instant pegs the QC submission floor.
+        self.rank_entry_times
+            .lock()
+            .unwrap()
+            .entry(rank)
+            .or_insert_with(Instant::now);
+        // Cache the parent QC; the forest doesn't carry it through
+        // to `on_finalized_state`.
+        self.qc_store
+            .insert(Arc::clone(&sp.proposal.parent_quorum_certificate));
         let collector = self.get_or_create(rank);
         if let Err(e) = collector.process_state(sp) {
             debug!(rank, error = %e, "shard vote collector rejected proposal");
@@ -99,6 +128,9 @@ impl AppVoteAggregation {
         }
         let mut map = self.collectors.lock().unwrap();
         map.retain(|r, _| *r >= rank);
+        let mut times = self.rank_entry_times.lock().unwrap();
+        times.retain(|r, _| *r >= rank);
+        self.qc_store.advance_min_active_rank(rank);
     }
 
     fn get_or_create(&self, rank: u64) -> Arc<VoteCollector<AppShardState, AppShardVote>> {
@@ -124,18 +156,69 @@ impl AppVoteAggregation {
     fn make_on_qc_created(&self) -> OnQuorumCertificateCreated {
         let handle_cell = self.consensus_handle.clone();
         let filter_for_log = hex::encode(&self.filter);
+        let app_address_for_log = hex::encode(
+            &self.app_address[..self.app_address.len().min(8)],
+        );
+        let proposal_duration = self.proposal_duration;
+        let rank_entry_times = Arc::clone(&self.rank_entry_times);
+        let qc_store = Arc::clone(&self.qc_store);
         Arc::new(move |qc: Arc<dyn QuorumCertificate>| {
-            if let Some(handle) = handle_cell.get() {
-                tracing::debug!(
-                    filter = %filter_for_log,
-                    rank = qc.rank(),
-                    frame = qc.frame_number(),
-                    "submitting locally-aggregated shard QC to event loop"
-                );
-                handle.submit_quorum_certificate(qc);
-            } else {
-                warn!(rank = qc.rank(), "shard QC formed but event loop handle not yet published");
+            qc_store.insert(Arc::clone(&qc));
+            let rank = qc.rank();
+            let agg = qc.aggregated_signature();
+            tracing::debug!(
+                filter = %filter_for_log,
+                app_address = %app_address_for_log,
+                rank,
+                bitmask_hex = %hex::encode(agg.bitmask()),
+                sig_len = agg.signature().len(),
+                "shard QC formed"
+            );
+            let entry = rank_entry_times
+                .lock()
+                .unwrap()
+                .get(&rank)
+                .copied();
+            let target = entry.map(|t| t + proposal_duration);
+            let now = Instant::now();
+            let delay = target
+                .map(|t| t.saturating_duration_since(now))
+                .unwrap_or(Duration::ZERO);
+
+            let handle_cell = handle_cell.clone();
+            let filter_for_log = filter_for_log.clone();
+            let frame = qc.frame_number();
+            if delay.is_zero() {
+                if let Some(handle) = handle_cell.get() {
+                    tracing::debug!(
+                        filter = %filter_for_log,
+                        rank,
+                        frame,
+                        "submitting locally-aggregated shard QC to event loop"
+                    );
+                    handle.submit_quorum_certificate(qc);
+                } else {
+                    warn!(rank, "shard QC formed but event loop handle not yet published");
+                }
+                return;
             }
+            // Pace single-prover shards: defer QC submission until
+            // `proposal_duration` after the rank was entered.
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Some(handle) = handle_cell.get() {
+                    tracing::debug!(
+                        filter = %filter_for_log,
+                        rank,
+                        frame,
+                        delayed_ms = delay.as_millis() as u64,
+                        "submitting locally-aggregated shard QC after proposal-duration delay"
+                    );
+                    handle.submit_quorum_certificate(qc);
+                } else {
+                    warn!(rank, "shard QC formed but event loop handle not yet published");
+                }
+            });
         })
     }
 
@@ -143,14 +226,12 @@ impl AppVoteAggregation {
         let committee = self.committee.clone();
         let bls = self.bls.clone();
         let vote_domain = self.vote_domain.clone();
-        let filter = self.filter.clone();
+        let app_address = self.app_address.clone();
         Arc::new(move |sp: &SignedProposal<AppShardState, AppShardVote>| {
             let rank = sp.proposal.state.rank;
             let identity = &sp.proposal.state.identifier;
 
-            // App-shard votes are scoped to the shard filter; the
-            // global path uses an empty filter.
-            let message = make_vote_message(&filter, rank, identity);
+            let message = make_vote_message(&app_address, rank, identity);
 
             let ids = committee.identities_by_rank(rank)?;
             let pks: Vec<Vec<u8>> = ids.iter().map(|id| id.public_key().to_vec()).collect();

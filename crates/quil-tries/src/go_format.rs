@@ -191,6 +191,8 @@ impl<'a> GoCursor<'a> {
             size,
             leaf_count,
             longest_branch,
+            full_prefix: Vec::new(),
+            fully_loaded: true,
         })
     }
 }

@@ -155,9 +155,10 @@ pub struct AggregateSignature {
 }
 
 impl AggregateSignature {
-    /// Go limit: `sigLen > 74+(516*64)`. We treat that as the valid
-    /// upper bound on decode.
-    const MAX_SIG_LEN: usize = 74 + 516 * 64;
+    /// Single-signer: 74 bytes. Multi-signer: 74 + 4-byte count + N×516
+    /// multi-proofs (N ≤ 64). Diverges from Go's limit — see
+    /// `from_canonical_bytes`.
+    const MAX_SIG_LEN: usize = 78 + 516 * 64;
     /// Decoded public key length when present — 4-byte type prefix +
     /// 585 key bytes.
     const WRAPPED_PUBKEY_LEN: usize = 4 + Bls48581G2PublicKey::KEY_VALUE_LEN;
@@ -191,13 +192,15 @@ impl AggregateSignature {
         )?;
 
         let sig_len = read_u32(data, &mut cursor)? as usize;
-        // Matches Go's exact condition:
-        //   sigLen != 74 && (sigLen > MAX || (sigLen-74)%516 != 0)
-        // which lets 74 bytes through unconditionally and otherwise
-        // requires a multiple of 516 above that base.
-        if sig_len != 74
-            && (sig_len > Self::MAX_SIG_LEN || sig_len < 74 || (sig_len - 74) % 516 != 0)
-        {
+        // Wire formats: 74 (single signer) or 78 + N×516 (aggregate +
+        // u32 count + N multi-proofs). Diverges from Go's canonical
+        // gate, which omits the count prefix and would reject every
+        // multi-prover signature its own verifier produces.
+        let valid_single = sig_len == 74;
+        let valid_multi = sig_len >= 78
+            && sig_len <= Self::MAX_SIG_LEN
+            && (sig_len - 78) % 516 == 0;
+        if !valid_single && !valid_multi {
             return Err(QuilError::InvalidArgument(format!(
                 "BLS48581AggregateSignature: invalid signature length {}",
                 sig_len

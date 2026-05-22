@@ -212,7 +212,7 @@ impl FrameMaterializer {
             let bundle_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
                 Ok(b) => b,
                 Err(e) => {
-                    debug!(
+                    info!(
                         frame = frame_number,
                         error = %e,
                         "skipping bundle that failed canonical encoding"
@@ -222,9 +222,19 @@ impl FrameMaterializer {
                 }
             };
             if bundle_bytes.len() < 4 {
+                info!(
+                    frame = frame_number,
+                    "skipping bundle: encoded payload < 4 bytes (no type prefix)"
+                );
                 skipped += 1;
                 continue;
             }
+            let request_type = u32::from_be_bytes([
+                bundle_bytes[0],
+                bundle_bytes[1],
+                bundle_bytes[2],
+                bundle_bytes[3],
+            ]);
 
             // Per-bundle cost basis → baseline fee, mirroring Go.
             let cost_basis = self
@@ -262,8 +272,9 @@ impl FrameMaterializer {
                 &address,
                 &bundle_bytes,
             ) {
-                debug!(
+                info!(
                     frame = frame_number,
+                    request_type = format!("0x{:08x}", request_type),
                     error = %e,
                     "skipping message that failed signature validation"
                 );
@@ -278,8 +289,9 @@ impl FrameMaterializer {
             ) {
                 Ok(_) => processed += 1,
                 Err(e) => {
-                    debug!(
+                    info!(
                         frame = frame_number,
+                        request_type = format!("0x{:08x}", request_type),
                         error = %e,
                         "skipping message that failed processing"
                     );
@@ -404,12 +416,16 @@ impl FrameMaterializer {
 
         match self.hypergraph.commit(frame_number) {
             Ok(commits) => {
-                // Find the global prover shard (zero L1 key)
-                // The commit returns phase roots for each shard.
-                // Phase 0 (vertex adds) of the global shard is the prover root.
+                // Find the global prover shard. Mirrors Go's
+                // `ensureGenesisProvers` (`global_consensus_engine.go:751`):
+                // L1=[0;3], L2=[0xff;32]. The earlier port used L2=[0;32]
+                // which doesn't match any committed shard — the lookup
+                // always returned None, the snapshot registry stayed
+                // empty, and the sync server replied "no tree data
+                // available" to every fresh-sync probe.
                 let global_shard = ShardKey {
                     l1: [0u8; 3],
-                    l2: [0u8; 32],
+                    l2: [0xffu8; 32],
                 };
                 if let Some(phase_roots) = commits.get(&global_shard) {
                     if let Some(root) = phase_roots.first() {

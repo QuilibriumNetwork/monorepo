@@ -113,10 +113,12 @@ impl GlobalExecutionEngine {
         reward_issuance: Arc<dyn quil_types::consensus::RewardIssuance>,
         bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor>,
         inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
+        frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
     ) {
         if let Some(intrinsic) = self.intrinsic.take() {
             let mut updated = intrinsic
-                .with_frame_header_deps(prover_registry, reward_issuance);
+                .with_frame_header_deps(prover_registry, reward_issuance)
+                .with_frame_prover(frame_prover);
             if let Some(crdt) = self.crdt.clone() {
                 updated = updated.with_kick_verify_deps(
                     bls_constructor,
@@ -1571,6 +1573,8 @@ pub struct HypergraphExecutionEngine {
     mode: ExecutionMode,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
     inclusion_prover: Arc<dyn InclusionProver>,
+    config_resolver:
+        Option<Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver>>,
 }
 
 impl HypergraphExecutionEngine {
@@ -1579,6 +1583,7 @@ impl HypergraphExecutionEngine {
             mode,
             state: None,
             inclusion_prover: Arc::new(NoopInclusionProver),
+            config_resolver: None,
         }
     }
 
@@ -1591,6 +1596,7 @@ impl HypergraphExecutionEngine {
             mode,
             state: Some(state),
             inclusion_prover: Arc::new(NoopInclusionProver),
+            config_resolver: None,
         }
     }
 
@@ -1599,6 +1605,19 @@ impl HypergraphExecutionEngine {
         inclusion_prover: Arc<dyn InclusionProver>,
     ) -> Self {
         self.inclusion_prover = inclusion_prover;
+        self
+    }
+
+    /// Plumb a resolver so vertex/hyperedge ops are signature-verified
+    /// against the hypergraph's `WritePublicKey`. Without one, the
+    /// engine only enforces the routing-domain + system-shard gate;
+    /// any holder of a valid Ed448 key can write to a user-deployed
+    /// hypergraph.
+    pub fn with_config_resolver(
+        mut self,
+        resolver: Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver>,
+    ) -> Self {
+        self.config_resolver = Some(resolver);
         self
     }
 
@@ -1621,42 +1640,15 @@ impl HypergraphExecutionEngine {
         };
         let msg = hg_dispatch::decode_and_validate(inner_bytes)?;
 
-        // Authority gate. The dispatch layer's `validate_structural`
-        // is signature-free (its own comment: "Safe to call on
-        // untrusted input"), and full per-domain WritePublicKey
-        // signature verification (matching
-        // `node/execution/intrinsics/hypergraph/hypergraph_vertex_add.go::Verify`
-        // lines 208-221) requires looking up the hypergraph
-        // deployment config keyed by domain. That lookup isn't yet
-        // wired in the Rust port — but in the meantime two hard
-        // checks close the realistic attack surface:
-        //
-        //   1. The inner message's `domain` MUST match the routing
-        //      `domain` parameter. The dispatcher reaches this
-        //      function only after the upstream engine selector
-        //      routed by `domain`; an inner message claiming a
-        //      different domain is a routing-spoof attempt.
-        //
-        //   2. The inner message's `domain` MUST NOT be a
-        //      system-managed address (the global intrinsic at
-        //      `[0xFF;32]`, compute at `[0xCC;32]`, or QUIL token).
-        //      Those shards are written exclusively by their
-        //      intrinsic materializers — never by user
-        //      VertexAdd/VertexRemove/HyperedgeAdd/HyperedgeRemove.
-        //      Allowing a hypergraph op to write a ProverAllocation
-        //      vertex into the global allocation shard would forge
-        //      registry entries without going through ProverJoin's
-        //      BLS+POP path.
-        //
-        // TODO: load the hypergraph's `WritePublicKey` from the
-        // deployment config vertex (Go's `h.config.WritePublicKey`)
-        // and run an Ed448 verify of `signature` over
-        // `domain ‖ data_address ‖ data...` with context
-        // `domain ‖ "VERTEX_ADD"` here (and equivalents for the
-        // three other ops). The current gate is necessary but not
-        // sufficient for user-deployed hypergraphs — it stops
-        // forging into system shards, not impersonating a
-        // hypergraph's owner.
+        // Authority gate. Three layers:
+        //   1. Inner message `domain` matches routing `domain`.
+        //   2. Domain is not a system-managed address (global,
+        //      compute, QUIL token — written exclusively by their
+        //      intrinsic materializers).
+        //   3. Ed448 signature verifies against the hypergraph's
+        //      `WritePublicKey` (when a resolver is configured).
+        //      Without #3, any valid Ed448 key can impersonate a
+        //      hypergraph owner.
         let inner_domain: &[u8] = match &msg {
             hg_dispatch::DispatchedMessage::VertexAdd(v) => &v.domain,
             hg_dispatch::DispatchedMessage::VertexRemove(v) => &v.domain,
@@ -1679,6 +1671,7 @@ impl HypergraphExecutionEngine {
                 hex::encode(inner_domain),
             )));
         }
+        self.verify_op_authority(&msg)?;
 
         let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
         let vr_disc = crate::hypergraph_state::vertex_removes_discriminator()?;
@@ -1740,6 +1733,85 @@ impl HypergraphExecutionEngine {
             }
         }
         Ok(())
+    }
+
+    /// Resolve the hypergraph's `WritePublicKey` for the inner-domain
+    /// and Ed448-verify the op's signature. Behavior by resolver state:
+    ///
+    /// - `None` (no resolver configured): logs a warning and accepts.
+    ///   Existing system-shard gate is still enforced upstream.
+    /// - `Some` but `write_public_key(domain) == None`: rejects.
+    ///   An op against an undeployed hypergraph is always invalid.
+    /// - `Some` and key resolves: rejects on signature mismatch.
+    fn verify_op_authority(
+        &self,
+        msg: &hg_dispatch::DispatchedMessage,
+    ) -> Result<()> {
+        use crate::hypergraph_intrinsic::auth::{
+            verify_op_signature, AuthCheck, OpForAuth,
+        };
+        let op = match msg {
+            hg_dispatch::DispatchedMessage::VertexAdd(v) => OpForAuth::VertexAdd(v),
+            hg_dispatch::DispatchedMessage::VertexRemove(v) => OpForAuth::VertexRemove(v),
+            hg_dispatch::DispatchedMessage::HyperedgeAdd(h) => {
+                let commit = self.compute_hyperedge_commit(&h.value)?;
+                let check = verify_op_signature(
+                    self.config_resolver.as_ref(),
+                    &OpForAuth::HyperedgeAdd { op: h, commit: &commit },
+                )?;
+                return Self::auth_check_to_result(check, "hyperedge_add");
+            }
+            hg_dispatch::DispatchedMessage::HyperedgeRemove(h) => OpForAuth::HyperedgeRemove(h),
+        };
+        let check = verify_op_signature(self.config_resolver.as_ref(), &op)?;
+        let label = match msg {
+            hg_dispatch::DispatchedMessage::VertexAdd(_) => "vertex_add",
+            hg_dispatch::DispatchedMessage::VertexRemove(_) => "vertex_remove",
+            hg_dispatch::DispatchedMessage::HyperedgeRemove(_) => "hyperedge_remove",
+            hg_dispatch::DispatchedMessage::HyperedgeAdd(_) => unreachable!(),
+        };
+        Self::auth_check_to_result(check, label)
+    }
+
+    fn auth_check_to_result(
+        check: crate::hypergraph_intrinsic::auth::AuthCheck,
+        op_label: &str,
+    ) -> Result<()> {
+        use crate::hypergraph_intrinsic::auth::AuthCheck;
+        match check {
+            AuthCheck::Verified => Ok(()),
+            AuthCheck::NoResolver => {
+                tracing::warn!(
+                    op = op_label,
+                    "hypergraph: no config resolver — write-signature unverified",
+                );
+                Ok(())
+            }
+            AuthCheck::UnknownDomain => Err(QuilError::InvalidArgument(format!(
+                "hypergraph {}: unknown deployment (no write key resolves)",
+                op_label,
+            ))),
+            AuthCheck::Invalid => Err(QuilError::InvalidArgument(format!(
+                "hypergraph {}: signature does not verify against write key",
+                op_label,
+            ))),
+        }
+    }
+
+    /// Commit the extrinsic tree carried in a hyperedge atom's `value`.
+    /// Layout: `[0x01][32 app_address][32 data_address][tree_bytes]`
+    /// where `tree_bytes` is Go's `SerializeNonLazyTree` wire format.
+    fn compute_hyperedge_commit(&self, value: &[u8]) -> Result<Vec<u8>> {
+        use crate::hypergraph_intrinsic::hyperedge_ops::HYPEREDGE_MIN_VALUE_LEN;
+        if value.len() < HYPEREDGE_MIN_VALUE_LEN {
+            return Err(QuilError::InvalidArgument(
+                "hyperedge commit: value too short".into(),
+            ));
+        }
+        let tree_bytes = &value[HYPEREDGE_MIN_VALUE_LEN..];
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.root = quil_tries::deserialize_go_tree(tree_bytes)?;
+        Ok(tree.commit(self.inclusion_prover.as_ref()))
     }
 }
 

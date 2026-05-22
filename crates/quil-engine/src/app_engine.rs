@@ -72,6 +72,13 @@ pub enum AppEngineMessage {
     GlobalFrame(Vec<u8>),
     /// A peer info message.
     PeerInfo(Vec<u8>),
+    /// Update the engine's halted flag. Set to `true` when the network
+    /// (or this filter specifically) is in a coverage halt — the
+    /// leader's pre-propose gate observes this and skips producing
+    /// frames so the halt window doesn't keep producing rewardable
+    /// shard work. Mirrors Go's behavior where the app workers stop
+    /// frame production while any shard is halted.
+    SetHalted(bool),
 }
 
 // =====================================================================
@@ -145,6 +152,13 @@ impl AppEngineHandle {
     pub fn send(&self, msg: AppEngineMessage) {
         let _ = self.msg_tx.try_send(msg);
     }
+
+    /// Tell the engine whether the network is in a coverage halt. The
+    /// engine forwards the value to its leader provider so propose
+    /// attempts during the halt window are skipped.
+    pub fn set_halted(&self, halted: bool) {
+        let _ = self.msg_tx.try_send(AppEngineMessage::SetHalted(halted));
+    }
 }
 
 // =====================================================================
@@ -174,6 +188,10 @@ struct AppLeaderProvider {
     /// Inclusion prover for `requests_root` tree commit.
     inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
     app_address: Vec<u8>,
+    /// Shared halt flag (set by the engine's `SetHalted` handler).
+    /// `prove_next_state` short-circuits when set so the leader stops
+    /// producing frames during coverage halts.
+    halted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeaderProvider {
@@ -196,6 +214,18 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         _filter: &[u8],
         prior_state_id: &Identity,
     ) -> Result<State<AppShardState>> {
+        // Coverage halt gate. Mirrors Go's `app_consensus_engine.go`
+        // which stops producing frames while the network is in a
+        // halt window — without this the workers keep accruing
+        // rewardable shard work during a halt and the network can't
+        // recover cleanly. The engine flips this flag from
+        // `AppEngineMessage::SetHalted` driven by the master's
+        // halt-state watcher.
+        if self.halted.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(QuilError::Consensus(
+                "coverage halt active — skipping shard frame production".into(),
+            ));
+        }
         // Get latest shard frame number
         let prior_frame_number = self.clock_store
             .get_latest_shard_clock_frame(&self.filter)
@@ -397,6 +427,13 @@ pub struct AppEngineDeps {
     pub execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
     /// Inclusion prover used to commit the `requests_root` tree.
     pub inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
+    /// Backing KV store for persistent consensus + liveness state. When
+    /// `Some`, app shard `ConsensusState` (finalized_rank /
+    /// latest_acknowledged_rank) and `LivenessState` (current_rank /
+    /// latest_QC) survive restarts. `None` falls back to the in-memory
+    /// stub — fine for tests, dangerous in production because a
+    /// restart can re-vote for a conflicting QC after a crash.
+    pub kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
 }
 
 /// App shard consensus engine. Owns a HotStuff event loop and
@@ -464,12 +501,19 @@ pub struct AppConsensusEngine {
     local_prover_address: Vec<u8>,
     local_bls_pubkey: Vec<u8>,
 
-    // Halt state
-    halted: bool,
+    // Halt state — shared with the leader provider so it can short
+    // circuit `prove_next_state` during a coverage halt. Atomic so
+    // the read path (consensus event loop on a separate thread) and
+    // the write path (engine's recv loop) don't need locks.
+    halted: Arc<std::sync::atomic::AtomicBool>,
 
     /// Callback that publishes finalized FrameHeader canonical bytes
     /// on `GLOBAL_PROVER`. Optional so legacy/test paths still work.
     coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+
+    /// Backing KV store for persistent consensus + liveness state.
+    /// `None` falls back to the in-memory stub.
+    kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
 }
 
 impl AppConsensusEngine {
@@ -483,9 +527,10 @@ impl AppConsensusEngine {
         let (msg_tx, msg_rx) = mpsc::channel(CONSENSUS_QUEUE_SIZE);
         let (consensus_event_tx, consensus_event_rx) = mpsc::unbounded_channel();
 
-        let app_address = quil_crypto::poseidon::hash_bytes_to_32(&filter)
-            .map(|h| h.to_vec())
-            .unwrap_or_default();
+        // Wire FrameHeader.address AND `get_active_provers` lookup
+        // key: same 32-byte shard filter, matches the allocation's
+        // `confirmation_filter`.
+        let app_address = filter.clone();
 
         let handle = AppEngineHandle {
             filter: filter.clone(),
@@ -524,8 +569,9 @@ impl AppConsensusEngine {
             timeout_aggregator: None,
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
-            halted: false,
+            halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             coverage_publish: deps.coverage_publish,
+            kv_db: deps.kv_db,
         };
         (engine, handle)
     }
@@ -566,6 +612,22 @@ impl AppConsensusEngine {
             }
             Err(_) => {
                 info!(core_id = self.core_id, "no stored shard frames, starting fresh");
+                // Clear stale persisted consensus state for this shard.
+                // `KvConsensusStore` persists the pacemaker's
+                // `LivenessState` (current_rank, latest QC) across
+                // restart, but the forks tree is in-memory only. If the
+                // previous session advanced the rank without ever
+                // committing a shard frame (single-prover shards with no
+                // wire-QC peer to drive the commit path), the new event
+                // loop boots with the old `current_rank` while the
+                // forks tree is empty → every proposal fails with
+                // `leader skipping: parent state not in forks tree`.
+                // Deleting both keys here forces the bootstrap closure
+                // (rank=1, genesis QC) to fire on first read.
+                if let Some(kv) = self.kv_db.as_ref() {
+                    let _ = kv.delete(&quil_store::encoding::consensus_liveness_key(&self.filter));
+                    let _ = kv.delete(&quil_store::encoding::consensus_state_key(&self.filter));
+                }
             }
         }
 
@@ -630,6 +692,20 @@ impl AppConsensusEngine {
                         Some(AppEngineMessage::PeerInfo(data)) => {
                             self.handle_peer_info_message(&data);
                         }
+                        Some(AppEngineMessage::SetHalted(halted)) => {
+                            let prev = self.halted.swap(
+                                halted,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            if prev != halted {
+                                info!(
+                                    core_id = self.core_id,
+                                    filter = hex::encode(&self.filter),
+                                    halted,
+                                    "shard halt state changed"
+                                );
+                            }
+                        }
                         None => {
                             info!(core_id = self.core_id, "message channel closed");
                             break;
@@ -684,6 +760,61 @@ impl AppConsensusEngine {
     )> {
         let filter = self.filter.clone();
 
+        // Identify the rank + output of the latest finalized shard
+        // frame. These pin the trusted root of the forks tree AND
+        // seed the bootstrap `LivenessState` so the leader's first
+        // proposal at `current_rank = genesis_rank + 1` can find its
+        // parent state in the tree. On a brand-new shard with no
+        // stored frames this is (0, zero-bytes), matching the legacy
+        // genesis bootstrap. On a resumed shard it's the actual
+        // rank/output of the most recent finalized frame.
+        let (genesis_output, genesis_rank) = self.clock_store
+            .get_latest_shard_clock_frame(&filter)
+            .ok()
+            .and_then(|f| f.header.as_ref().map(|h| (h.output.clone(), h.rank)))
+            .unwrap_or_else(|| (vec![0u8; 32], 0));
+
+        // Liveness-gap reset: if the persisted
+        // `LivenessState.current_rank` sits more than one rank above
+        // the latest finalized frame's rank, the previous session
+        // advanced through one or more rounds without finalizing
+        // (timeouts, equivocations, peer dropout). The persisted
+        // `latest_quorum_certificate` then references a state that's
+        // not in the forks tree we'll seed below (and not in any
+        // clock-frame entry either), so the leader at `current_rank`
+        // logs `parent state not in forks tree` and never proposes.
+        //
+        // Wipe the persisted liveness + consensus rows so the
+        // bootstrap closures below rebuild them at
+        // `current_rank = genesis_rank + 1` with the trusted root's
+        // identity as the latest QC. The unfinalized rank progression
+        // is discarded — the network is free to re-form a QC for the
+        // same logical work at a higher rank, and the per-shard
+        // pacemaker's timeout backoff resets anyway.
+        if let Some(kv) = self.kv_db.as_ref() {
+            let liveness_key = quil_store::encoding::consensus_liveness_key(&filter);
+            let codec = crate::app_glue::AppConsensusCodec { filter: filter.clone() };
+            let persisted_rank: Option<u64> = match kv.get(&liveness_key) {
+                Ok(Some(bytes)) => crate::consensus_store::ConsensusStateCodec::<AppShardVote>::decode_liveness_state(&codec, &bytes)
+                    .ok()
+                    .map(|l| l.current_rank),
+                _ => None,
+            };
+            if let Some(persisted) = persisted_rank {
+                if persisted > genesis_rank.saturating_add(1) {
+                    info!(
+                        core_id = self.core_id,
+                        filter = hex::encode(&filter),
+                        persisted_current_rank = persisted,
+                        trusted_rank = genesis_rank,
+                        "resetting persisted liveness: current_rank ahead of latest finalized frame"
+                    );
+                    let _ = kv.delete(&liveness_key);
+                    let _ = kv.delete(&quil_store::encoding::consensus_state_key(&filter));
+                }
+            }
+        }
+
         // Leader provider
         let leader_provider = Arc::new(AppLeaderProvider {
             filter: filter.clone(),
@@ -700,6 +831,7 @@ impl AppConsensusEngine {
             execution_engine: self.execution_engine.clone(),
             inclusion_prover: self.inclusion_prover.clone(),
             app_address: self.app_address.clone(),
+            halted: self.halted.clone(),
         });
 
         // Committee (from prover registry for this shard)
@@ -716,12 +848,17 @@ impl AppConsensusEngine {
                 .unwrap_or_default()
                 .to_vec()
         });
-        let vote_domain = quil_crypto::poseidon::hash_bytes_to_32(b"APP_CONSENSUS_VOTE")
-            .unwrap_or_default()
-            .to_vec();
-        let timeout_domain = quil_crypto::poseidon::hash_bytes_to_32(b"APP_CONSENSUS_TIMEOUT")
-            .unwrap_or_default()
-            .to_vec();
+        // App shard domain separation — MUST match Go byte-for-byte
+        // (`node/consensus/app/consensus_voting_provider.go:139,211`).
+        // Go appends the app address so different shards have distinct
+        // domains; we mirror that here using `self.app_address`. Using
+        // a poseidon hash like the earlier Rust port would do is
+        // safe between two Rust nodes but breaks the moment any peer
+        // (or a migrated store carrying Go-signed QCs) shows up.
+        let mut vote_domain = b"appshard".to_vec();
+        vote_domain.extend_from_slice(&self.app_address);
+        let mut timeout_domain = b"appshardtimeout".to_vec();
+        timeout_domain.extend_from_slice(&self.app_address);
         // Hold onto the vote and timeout domains so we can later build
         // the per-shard `AppVoteAggregation` and `AppTimeoutAggregation`
         // without rederiving them.
@@ -730,21 +867,57 @@ impl AppConsensusEngine {
         let timeout_domain_for_to = timeout_domain.clone();
 
         let factory = Arc::new(AppShardVoteFactory { filter: filter.clone() });
-        // Use `new_with_filter` so vote / timeout signing uses the
-        // shard's own filter — the per-shard `AppVoteAggregation`
-        // verifier expects `make_vote_message(filter, rank, identity)`
-        // with the matching filter, and the global default of empty
-        // filter would cause every leader self-vote to fail BLS
-        // verification.
-        let voting_provider: Arc<dyn quil_consensus::voting_provider::VotingProvider<AppShardState, AppShardVote>> =
-            Arc::new(BlsVotingProvider::<AppShardState, AppShardVote, AppShardVoteFactory>::new_with_filter(
-                Arc::from(bls_signer),
-                vote_domain,
-                timeout_domain,
-                derive_address,
-                factory,
+
+        // Shared multi-proof precomputer. Populated asynchronously by
+        // `AppParticipantConsumer`'s rank-change hooks (which run
+        // `tokio::task::spawn_blocking`), consumed synchronously by
+        // the `MultiProofProvider` below during `sign_vote`. Single-
+        // prover shards short-circuit inside the precomputer so the
+        // cache stays empty and votes take the 74-byte aggregate path.
+        let multi_proof_precomputer = Arc::new(
+            crate::multi_proof_cache::ShardMultiProofPrecomputer::new(
+                self.frame_prover.clone(),
+                self.prover_registry.clone(),
+                self.local_prover_address.clone(),
                 filter.clone(),
-            ));
+            ),
+        );
+        // Multi-proof producer: invoked at every `sign_vote` to attach
+        // this voter's 516-byte VDF contribution. A cache miss
+        // returns empty (vote sent without aux); for multi-prover
+        // shards that means the QC won't include this voter's
+        // multi-proof share — but precompute is kicked off on every
+        // rank change so misses only happen if the vote arrives
+        // faster than the VDF completes.
+        let multi_proof_provider: crate::voting_provider::MultiProofProvider<AppShardState> = {
+            let precomputer = multi_proof_precomputer.clone();
+            Arc::new(move |state: &State<AppShardState>| -> Vec<u8> {
+                precomputer.get_for_state(state)
+            })
+        };
+
+        // Use `new_with_filter` so vote / timeout signing uses the
+        // shard's `app_address` (poseidon(filter)) — both the local
+        // `AppVoteAggregation` and the global archive
+        // `verify_frame_header_signature` reconstruct the message
+        // from `header.address`, which the wire frame carries as
+        // `app_address`. Passing the raw `filter` here would sign
+        // over one buffer (filter || identity || rank) while every
+        // verifier reconstructs another (app_address || identity ||
+        // rank), and every aggregate BLS check would fail. Mirrors
+        // Go's `consensus_voting_provider.go:204-211`.
+        let voting_provider: Arc<dyn quil_consensus::voting_provider::VotingProvider<AppShardState, AppShardVote>> =
+            Arc::new(
+                BlsVotingProvider::<AppShardState, AppShardVote, AppShardVoteFactory>::new_with_filter(
+                    Arc::from(bls_signer),
+                    vote_domain,
+                    timeout_domain,
+                    derive_address,
+                    factory,
+                    self.app_address.clone(),
+                )
+                .with_multi_proof_provider(multi_proof_provider),
+            );
         let voting_provider_for_agg = voting_provider.clone();
         let voting_provider_for_to = voting_provider.clone();
         let signer: Arc<dyn quil_consensus::signer::Signer<AppShardState, AppShardVote>> =
@@ -773,12 +946,82 @@ impl AppConsensusEngine {
         ));
         let consumer: Arc<dyn quil_consensus::event_handler::Consumer<AppShardState, AppShardVote>> =
             consumer_concrete.clone();
+        // Build the shared multi-proof precomputer. Used by:
+        //  - `AppParticipantConsumer` to fire-and-forget compute on
+        //    every rank change (off the consensus thread)
+        //  - `MultiProofProvider` to do sync cache lookups during
+        //    `sign_vote`
+        // Single-prover shards short-circuit inside the precomputer
+        // (no committee work → no entries cached).
+        let multi_proof_precomputer = Arc::new(
+            crate::multi_proof_cache::ShardMultiProofPrecomputer::new(
+                self.frame_prover.clone(),
+                self.prover_registry.clone(),
+                self.local_prover_address.clone(),
+                filter.clone(),
+            ),
+        );
         let participant: Arc<dyn quil_consensus::pacemaker::ParticipantConsumer<AppShardState, AppShardVote>> =
-            Arc::new(AppParticipantConsumer::new(filter.clone()));
+            Arc::new(
+                AppParticipantConsumer::new(filter.clone())
+                    .with_multi_proof_precomputer(
+                        multi_proof_precomputer.clone(),
+                        self.current_difficulty.clone(),
+                    ),
+            );
 
-        // Consensus store (in-memory for now — per-shard state is small)
+        // Consensus store: persistent if a KV backend is wired in
+        // (production), in-memory stub otherwise (tests).
         let store: Arc<dyn quil_consensus::event_handler::ConsensusStore<AppShardVote>> =
-            Arc::new(AppMemConsensusStore::new(filter.clone()));
+            match self.kv_db.as_ref() {
+                Some(kv) => Arc::new(crate::consensus_store::KvConsensusStore::new(
+                    kv.clone(),
+                    Arc::new(crate::app_glue::AppConsensusCodec { filter: filter.clone() }),
+                    {
+                        // Bootstrap consensus state for a fresh shard:
+                        // finalized at the trusted root's rank (0 for
+                        // a true genesis bootstrap, the latest
+                        // finalized frame's rank on resume), no later
+                        // timeout yet.
+                        let bootstrap_rank = genesis_rank;
+                        Arc::new(move |f: &[u8]| quil_consensus::models::ConsensusState::<AppShardVote> {
+                            filter: f.to_vec(),
+                            finalized_rank: bootstrap_rank,
+                            latest_acknowledged_rank: bootstrap_rank,
+                            latest_timeout: None,
+                        })
+                    },
+                    {
+                        // Bootstrap liveness so the leader's first
+                        // proposal lands on top of the trusted root.
+                        // `current_rank = genesis_rank + 1` matches
+                        // the forks tree's seed (built below at
+                        // `genesis_rank` with identity
+                        // `poseidon(genesis_output)`), and the QC
+                        // identity must hash the same output. Without
+                        // both, the parent-state lookup at
+                        // `event_handler.rs:469` misses and every
+                        // proposal aborts as `parent state not in
+                        // forks tree`.
+                        let filter_cap = filter.clone();
+                        let bootstrap_rank = genesis_rank;
+                        let bootstrap_output = genesis_output.clone();
+                        Arc::new(move |_f: &[u8]| quil_consensus::models::LivenessState {
+                            filter: filter_cap.clone(),
+                            current_rank: bootstrap_rank.saturating_add(1),
+                            latest_quorum_certificate: Arc::new(
+                                crate::app_types::AppGenesisQC::for_output(
+                                    filter_cap.clone(),
+                                    &bootstrap_output,
+                                    bootstrap_rank,
+                                ),
+                            ),
+                            prior_rank_timeout_certificate: None,
+                        })
+                    },
+                )),
+                None => Arc::new(AppMemConsensusStore::new(filter.clone())),
+            };
 
         // Pacemaker
         let pacemaker = HotStuffPacemaker::<AppShardState, AppShardVote>::new(
@@ -804,26 +1047,129 @@ impl AppConsensusEngine {
             leader_provider as Arc<dyn quil_consensus::leader_provider::LeaderProvider<AppShardState>>,
         ));
 
-        // Build genesis certified state
-        let genesis_output = self.clock_store
-            .get_latest_shard_clock_frame(&filter)
-            .ok()
-            .and_then(|f| f.header.as_ref().map(|h| h.output.clone()))
-            .unwrap_or_else(|| vec![0u8; 32]);
+        // Trusted root for the forks tree, anchored at the latest
+        // finalized shard frame's (rank, output). The bootstrap
+        // closures above feed the consensus event loop a matching
+        // `LivenessState` (`current_rank = genesis_rank + 1`, QC
+        // identity = `poseidon(genesis_output)`) so the leader's
+        // first parent-state lookup resolves against this entry.
         let trusted_root = build_app_genesis_certified_state(
             &filter,
             self.shard_frame_number,
             &genesis_output,
+            genesis_rank,
+        );
+        info!(
+            core_id = self.core_id,
+            filter = hex::encode(&filter),
+            trusted_rank = genesis_rank,
+            shard_frame = self.shard_frame_number,
+            "seeding forks tree with trusted root",
         );
 
         // Forks
         let finalizer: Arc<dyn quil_consensus::forest::Finalizer> =
             Arc::new(AppFinalizer::new(filter.clone()));
+        // Stage proposed shard frames on incorporation so the next-rank
+        // leader can chain a proposal on top via `prove_next_state`.
+        // Mirrors the global path: without this, the leader at rank
+        // N+1 can't find its rank-N parent and falls into perpetual
+        // timeout. Hook writes via `stage_shard_clock_frame`
+        // (`clock_shard_staged_key`) keyed by the state's identifier,
+        // which matches the QC's `selector` so the QC-arrival commit
+        // can later locate it.
+        let incorp_clock_store = Arc::clone(&self.clock_store);
+        let incorp_filter = filter.clone();
+        let incorporated_hook: crate::app_glue::AppIncorporatedStateHook =
+            Arc::new(move |state| {
+                let s = &state.state;
+                let header = quil_types::proto::global::FrameHeader {
+                    address: s.filter.clone(),
+                    frame_number: s.frame_number,
+                    rank: state.rank,
+                    timestamp: s.timestamp,
+                    difficulty: s.difficulty,
+                    output: s.output.clone(),
+                    parent_selector: s.parent_selector.clone(),
+                    requests_root: s.requests_root.clone(),
+                    state_roots: s.state_roots.clone(),
+                    prover: s.prover.clone(),
+                    fee_multiplier_vote: s.fee_multiplier,
+                    // Signature is reconstructed later when the QC's
+                    // aggregate sig is applied; the staged frame
+                    // doesn't need it (the next-rank leader only
+                    // reads identity-bearing fields like `output`).
+                    public_key_signature_bls48581: None,
+                    ..Default::default()
+                };
+                let frame = quil_types::proto::global::AppShardFrame {
+                    header: Some(header),
+                    requests: Vec::new(),
+                };
+                // NoTxn shim — stage write goes direct to RocksDB.
+                struct NoTxn;
+                impl quil_types::store::Transaction for NoTxn {
+                    fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> { Ok(None) }
+                    fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+                    fn commit(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
+                    fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+                    fn abort(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
+                    fn new_iter(
+                        &self,
+                        _: &[u8],
+                        _: &[u8],
+                    ) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
+                        Err(quil_types::error::QuilError::NotFound("noop".into()))
+                    }
+                    fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+                    fn as_any(&self) -> &dyn std::any::Any { self }
+                }
+                let no_txn = NoTxn;
+                let identity = quil_crypto::poseidon::hash_bytes_to_32(&s.output)
+                    .map(|h| h.to_vec())
+                    .unwrap_or_default();
+                match incorp_clock_store.stage_shard_clock_frame(
+                    &identity,
+                    &frame,
+                    &no_txn,
+                ) {
+                    Ok(()) => tracing::info!(
+                        filter = hex::encode(&incorp_filter),
+                        frame = s.frame_number,
+                        rank = state.rank,
+                        identity = %hex::encode(&identity),
+                        "staged shard frame candidate",
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        filter = hex::encode(&incorp_filter),
+                        frame = s.frame_number,
+                        rank = state.rank,
+                        "failed to stage shard frame candidate",
+                    ),
+                }
+            });
+        // Shared QC cache: populated by the vote aggregator (locally
+        // formed QCs + peer proposal parent QCs), read by the
+        // follower on finalization to rehydrate the certifying QC
+        // the forest strips. Seeded with the genesis/trusted-root QC
+        // so the first finalization at the trusted rank still has
+        // an aggregate sig (empty bitmask, empty bls bytes — but
+        // valid canonical encoding) to ship.
+        let qc_store = Arc::new(crate::app_glue::QcStore::new());
+        qc_store.insert(Arc::new(crate::app_types::AppGenesisQC::for_output(
+            filter.clone(),
+            &genesis_output,
+            genesis_rank,
+        )));
         let follower: Arc<dyn quil_consensus::forest::FollowerConsumer<AppShardState>> =
-            Arc::new(AppFollower::new(
+            Arc::new(AppFollower::with_incorporated_hook(
                 filter.clone(),
+                self.app_address.clone(),
                 self.consensus_event_tx.clone(),
                 self.coverage_publish.clone(),
+                Some(incorporated_hook),
+                qc_store.clone(),
             ));
         let forks = Forks::<AppShardState>::new(trusted_root, finalizer, follower)?;
 
@@ -859,11 +1205,18 @@ impl AppConsensusEngine {
             let committee_for_to = committee_for_agg.clone();
             let agg = Arc::new(crate::app_vote_aggregation::AppVoteAggregation::new(
                 filter.clone(),
+                self.app_address.clone(),
                 committee_for_agg,
                 voting_provider_for_agg,
                 handle_cell.clone(),
                 bls_ctor.clone(),
                 vote_domain_for_agg,
+                // Same `proposal_duration` the pacemaker uses for its
+                // `target_publication_time` (10s). The aggregator
+                // delays QC submission so single-prover shards don't
+                // race past this cadence — see `make_on_qc_created`.
+                Duration::from_secs(10),
+                qc_store.clone(),
             ));
             consumer_concrete.set_aggregator(agg.clone());
 
@@ -905,7 +1258,7 @@ impl AppConsensusEngine {
 
     /// Handle a consensus protocol message (proposal/vote/timeout).
     fn handle_consensus_message(&mut self, data: &[u8]) {
-        if self.halted || data.len() < 4 {
+        if self.halted.load(std::sync::atomic::Ordering::Relaxed) || data.len() < 4 {
             return;
         }
 
@@ -1199,6 +1552,58 @@ impl AppConsensusEngine {
                     rank = child_rank,
                     "received shard QC"
                 );
+
+                // Commit the QC'd frame so the next-rank leader can
+                // chain a proposal on top via `prove_next_state`
+                // (which reads `GetLatestShardClockFrame`). Mirrors
+                // Go's `OnQuorumCertificateTriggeredRankChange`
+                // (`node/consensus/app/app_consensus_engine.go:2843`):
+                // after the QC arrives, the QC's own frame is
+                // committed (latest-index advances). We rely on the
+                // staged frame written by `AppFollower`'s incorporated
+                // hook keyed by the same selector (= state identity =
+                // qc.selector).
+                match self.clock_store.new_transaction(false) {
+                    Ok(txn) => {
+                        if let Err(e) = self.clock_store.commit_shard_clock_frame(
+                            &self.filter,
+                            qc.frame_number,
+                            &qc.selector,
+                            txn.as_ref(),
+                            false,
+                        ) {
+                            warn!(
+                                core_id = self.core_id,
+                                rank = qc.rank,
+                                frame = qc.frame_number,
+                                error = %e,
+                                "failed to commit shard frame on QC",
+                            );
+                        } else if let Err(e) = txn.commit() {
+                            warn!(
+                                core_id = self.core_id,
+                                rank = qc.rank,
+                                frame = qc.frame_number,
+                                error = %e,
+                                "shard frame commit txn failed",
+                            );
+                        } else {
+                            info!(
+                                core_id = self.core_id,
+                                rank = qc.rank,
+                                frame = qc.frame_number,
+                                identity = %hex::encode(&qc.selector),
+                                "committed shard frame on QC",
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
+                        core_id = self.core_id,
+                        error = %e,
+                        "could not create txn for QC commit",
+                    ),
+                }
+
                 if let Some(ref handle) = self.consensus_handle {
                     let qc_trait = wire_qc_to_trait(&qc, &self.filter);
                     handle.submit_quorum_certificate(qc_trait);
@@ -1233,7 +1638,7 @@ impl AppConsensusEngine {
 
     /// Handle a prover message (MessageBundle containing prover ops).
     fn handle_prover_message(&mut self, data: &[u8]) {
-        if self.halted || data.len() < 4 {
+        if self.halted.load(std::sync::atomic::Ordering::Relaxed) || data.len() < 4 {
             return;
         }
         // Add to message collector for inclusion in next frame
@@ -1242,7 +1647,7 @@ impl AppConsensusEngine {
 
     /// Handle a frame message (AppShardFrame from another prover).
     fn handle_frame_message(&mut self, data: &[u8]) {
-        if self.halted {
+        if self.halted.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         if let Ok(frame) = prost::Message::decode(data) {
@@ -1276,7 +1681,7 @@ impl AppConsensusEngine {
 
     /// Handle a dispatch message (token/compute/hypergraph operation).
     fn handle_dispatch_message(&mut self, data: &[u8]) {
-        if self.halted || data.len() < 4 {
+        if self.halted.load(std::sync::atomic::Ordering::Relaxed) || data.len() < 4 {
             return;
         }
         // Dispatch messages are collected for inclusion in frames
@@ -1391,7 +1796,7 @@ impl AppConsensusEngine {
             AppConsensusEvent::Finalized {
                 frame_number,
                 rank,
-                state_id: _,
+                state_id,
                 canonical_header_bytes,
             } => {
                 debug!(
@@ -1402,6 +1807,57 @@ impl AppConsensusEngine {
                     "shard frame finalized"
                 );
                 self.shard_frame_number = frame_number;
+
+                // Promote the staged frame keyed by `state_id` to the
+                // canonical clock-store record. The wire-QC path in
+                // `handle_quorum_certificate` does the same when a QC
+                // arrives from a peer; but in a single-prover shard
+                // (or any case where the QC forms locally before any
+                // peer sends one), `handle_quorum_certificate` never
+                // fires. Without this commit, `prove_next_state` keeps
+                // reading the genesis frame from the store and every
+                // rank re-proposes `frame=1`, so the shard never
+                // advances past its first frame.
+                match self.clock_store.new_transaction(false) {
+                    Ok(txn) => {
+                        if let Err(e) = self.clock_store.commit_shard_clock_frame(
+                            &self.filter,
+                            frame_number,
+                            &state_id,
+                            txn.as_ref(),
+                            false,
+                        ) {
+                            warn!(
+                                core_id = self.core_id,
+                                rank,
+                                frame = frame_number,
+                                error = %e,
+                                "failed to commit finalized shard frame",
+                            );
+                        } else if let Err(e) = txn.commit() {
+                            warn!(
+                                core_id = self.core_id,
+                                rank,
+                                frame = frame_number,
+                                error = %e,
+                                "finalized shard frame txn failed",
+                            );
+                        } else {
+                            info!(
+                                core_id = self.core_id,
+                                rank,
+                                frame = frame_number,
+                                identity = %hex::encode(&state_id),
+                                "committed finalized shard frame",
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
+                        core_id = self.core_id,
+                        error = %e,
+                        "could not create txn for finalized commit",
+                    ),
+                }
                 // The follower already encoded the canonical FrameHeader
                 // for `coverage_publish`; forward those same bytes as
                 // `ShardFrameFinalized` so the master can wrap them in
@@ -1772,7 +2228,7 @@ impl quil_consensus::event_handler::ConsensusStore<AppShardVote> for AppMemConse
                 // frame). Otherwise the event handler can't resolve
                 // the parent state and the leader silently waits.
                 latest_quorum_certificate: Arc::new(
-                    AppGenesisQC::for_output(filter.to_vec(), &vec![0u8; 32]),
+                    AppGenesisQC::for_output(filter.to_vec(), &vec![0u8; 32], 0),
                 ),
                 prior_rank_timeout_certificate: None,
             }),
@@ -2192,6 +2648,7 @@ fn wire_tc_to_trait(
         None => Arc::new(crate::app_types::AppGenesisQC::for_output(
             filter.to_vec(),
             &vec![0u8; 32],
+            0,
         )),
     };
 

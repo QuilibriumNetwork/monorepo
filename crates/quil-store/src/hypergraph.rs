@@ -7,7 +7,9 @@ use crate::encoding::{
     hypergraph_alt_shard_address_index_key, hypergraph_alt_shard_address_prefix,
     hypergraph_alt_shard_commit_key, hypergraph_alt_shard_commit_latest_key,
     hypergraph_shard_commit_frame_prefix, hypergraph_shard_commit_key,
-    hypergraph_tree_blob_key, hypergraph_vertex_data_key, hypergraph_vertex_data_prefix,
+    hypergraph_tree_blob_key, hypergraph_tree_node_by_key,
+    hypergraph_tree_node_by_path, hypergraph_tree_node_by_path_prefix,
+    hypergraph_vertex_data_key, hypergraph_vertex_data_prefix,
     HG_VERTEX_ADDS_SHARD_COMMIT,
 };
 
@@ -274,30 +276,111 @@ impl HypergraphStore for RocksHypergraphStore {
         }))
     }
 
-    fn get_node_by_key(&self, set_type: &str, phase_type: &str, shard_key: &ShardKey, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // Root sentinel: key = [0xFF; 32]
+    fn get_node_by_key(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        // The `[0xFF; 32]` "root sentinel" key is the legacy whole-tree
+        // backend's handshake — it expects `load_tree_blob` to return
+        // the entire serialized tree under prefix 0x2F. The per-node
+        // lazy backend doesn't use that sentinel: it walks via
+        // `get_node_by_path` from the empty path. We keep the sentinel
+        // route working so any caller still on the old API path picks
+        // up the tree, but new callers should not rely on it.
         if key == [0xFFu8; 32] {
             return self.load_tree_blob(set_type, phase_type, shard_key);
         }
-        self.load_vertex_underlying(set_type, phase_type, shard_key, key)
+        // Per-node lookup at `[0x33, set, phase, l1, l2, key]`.
+        let db_key = hypergraph_tree_node_by_key(set_type, phase_type, shard_key, key);
+        self.db
+            .get(&db_key)
+            .map_err(|e| QuilError::Store(e.to_string()))
     }
 
-    fn get_node_by_path(&self, _set_type: &str, _phase_type: &str, _shard_key: &ShardKey, _path: &[i32]) -> Result<Option<Vec<u8>>> {
-        // Path-based lookup not used by the lazy tree implementation
-        Ok(None)
-    }
-
-    fn insert_node(&self, txn: &dyn Transaction, set_type: &str, phase_type: &str, shard_key: &ShardKey, key: &[u8], _path: &[i32], data: &[u8]) -> Result<()> {
-        let db_key = if key == [0xFFu8; 32] {
-            hypergraph_tree_blob_key(set_type, phase_type, shard_key)
-        } else {
-            hypergraph_vertex_data_key(set_type, phase_type, shard_key, key)
+    fn get_node_by_path(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        path: &[i32],
+    ) -> Result<Option<Vec<u8>>> {
+        // SeekGE on the by-path index. Prefix-compressed branches mean
+        // the deepest covering node may live at a path longer than
+        // `path` itself — its by-path key starts with the requested
+        // path bytes. So we seek to `requested_path_key` and check the
+        // first entry that still has the `prefix` (per-shard) byte
+        // sequence as its prefix.
+        let prefix = hypergraph_tree_node_by_path_prefix(set_type, phase_type, shard_key);
+        let requested = hypergraph_tree_node_by_path(set_type, phase_type, shard_key, path);
+        let mut iter = self.db.raw_iterator();
+        iter.seek(&requested);
+        if !iter.valid() {
+            return Ok(None);
+        }
+        let found_key = match iter.key() {
+            Some(k) => k.to_vec(),
+            None => return Ok(None),
         };
-        if with_rocks_batch(txn, |b| b.put(&db_key, data)) {
+        if !found_key.starts_with(&prefix) {
+            return Ok(None);
+        }
+        // The found key must also extend `requested` — otherwise we've
+        // walked PAST the requested subtree to an unrelated path.
+        if !found_key.starts_with(&requested) {
+            return Ok(None);
+        }
+        // Value is the by-key key for that node — deref to fetch.
+        let by_key = match iter.value() {
+            Some(v) => v.to_vec(),
+            None => return Ok(None),
+        };
+        self.db
+            .get(&by_key)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
+    fn insert_node(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        key: &[u8],
+        path: &[i32],
+        data: &[u8],
+    ) -> Result<()> {
+        // Root sentinel keeps its legacy blob route for backward compat.
+        if key == [0xFFu8; 32] {
+            let db_key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
+            if with_rocks_batch(txn, |b| b.put(&db_key, data)) {
+                return Ok(());
+            }
+            return self
+                .db
+                .put(&db_key, data)
+                .map_err(|e| QuilError::Store(e.to_string()));
+        }
+        // Per-node: write the by-key entry and the by-path pointer
+        // atomically. Pointer value is the by-key key — the lazy
+        // walker SeekGEs the by-path index and then `Get`s the by-key
+        // entry. This is exactly Go's dual-index scheme.
+        let by_key = hypergraph_tree_node_by_key(set_type, phase_type, shard_key, key);
+        let by_path = hypergraph_tree_node_by_path(set_type, phase_type, shard_key, path);
+        let by_key_for_pointer = by_key.clone();
+        if with_rocks_batch(txn, |b| {
+            b.put(&by_key, data);
+            b.put(&by_path, &by_key_for_pointer);
+        }) {
             return Ok(());
         }
         self.db
-            .put(&db_key, data)
+            .put(&by_key, data)
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        self.db
+            .put(&by_path, &by_key_for_pointer)
             .map_err(|e| QuilError::Store(e.to_string()))
     }
 
@@ -311,21 +394,52 @@ impl HypergraphStore for RocksHypergraphStore {
             .map_err(|e| QuilError::Store(e.to_string()))
     }
 
-    fn delete_node(&self, txn: &dyn Transaction, set_type: &str, phase_type: &str, shard_key: &ShardKey, key: &[u8], _path: &[i32]) -> Result<()> {
-        let db_key = if key == [0xFFu8; 32] {
-            hypergraph_tree_blob_key(set_type, phase_type, shard_key)
-        } else {
-            hypergraph_vertex_data_key(set_type, phase_type, shard_key, key)
-        };
-        if with_rocks_batch(txn, |b| b.delete(&db_key)) {
+    fn delete_node(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        key: &[u8],
+        path: &[i32],
+    ) -> Result<()> {
+        if key == [0xFFu8; 32] {
+            let db_key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
+            if with_rocks_batch(txn, |b| b.delete(&db_key)) {
+                return Ok(());
+            }
+            return self
+                .db
+                .delete(&db_key)
+                .map_err(|e| QuilError::Store(e.to_string()));
+        }
+        let by_key = hypergraph_tree_node_by_key(set_type, phase_type, shard_key, key);
+        let by_path = hypergraph_tree_node_by_path(set_type, phase_type, shard_key, path);
+        if with_rocks_batch(txn, |b| {
+            b.delete(&by_key);
+            b.delete(&by_path);
+        }) {
             return Ok(());
         }
         self.db
-            .delete(&db_key)
+            .delete(&by_key)
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        self.db
+            .delete(&by_path)
             .map_err(|e| QuilError::Store(e.to_string()))
     }
 
-    fn set_covered_prefix(&self, _prefix: &[i32]) -> Result<()> { Ok(()) }
+    fn set_covered_prefix(&self, prefix: &[i32]) -> Result<()> {
+        // Go serializes `[]int` as a series of big-endian int64s via
+        // `binary.Write(buf, BigEndian, []int64{...})` — mirror that
+        // exactly so a future Rust-reads-Go-data path stays compatible.
+        let mut buf = Vec::with_capacity(prefix.len() * 8);
+        for &p in prefix {
+            buf.extend_from_slice(&(p as i64).to_be_bytes());
+        }
+        let key = crate::encoding::hypergraph_covered_prefix_key();
+        self.db.put(&key, &buf).map_err(|e| QuilError::Store(e.to_string()))
+    }
 
     fn set_shard_commit(&self, txn: &dyn Transaction, frame_number: u64, phase_type: &str, set_type: &str, shard_address: &[u8], commitment: &[u8]) -> Result<()> {
         let key = hypergraph_shard_commit_key(frame_number, phase_type, set_type, shard_address);
@@ -418,7 +532,66 @@ impl HypergraphStore for RocksHypergraphStore {
         )
     }
 
-    fn apply_snapshot(&self, _db_path: &str) -> Result<()> { Ok(()) }
+    fn apply_snapshot(&self, db_path: &str) -> Result<()> {
+        // Mirror of Go's `PebbleHypergraphStore.ApplySnapshot`
+        // (`node/store/hypergraph.go:2110`). The peer's snapshot was
+        // dropped at `<db_path>/snapshot` as a self-contained DB; bulk-
+        // copy every key into the active store, then remove the temp
+        // directory. Idempotent — if the snapshot dir is missing, just
+        // clean up anything stale and return Ok.
+        use std::path::Path;
+        let snap_dir = Path::new(db_path).join("snapshot");
+        let cleanup = |dir: &Path| {
+            let _ = std::fs::remove_dir_all(dir);
+        };
+        match std::fs::metadata(&snap_dir) {
+            Ok(md) if md.is_dir() => {}
+            _ => {
+                cleanup(&snap_dir);
+                return Ok(());
+            }
+        }
+
+        // Open the snapshot DB read-only so we don't trigger compactions
+        // or stray writes against the staging area.
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(false);
+        let src = rocksdb::DB::open_for_read_only(&opts, &snap_dir, true)
+            .map_err(|e| {
+                cleanup(&snap_dir);
+                QuilError::Store(format!("apply snapshot: open src: {}", e))
+            })?;
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut count: usize = 0;
+        const CHUNK: usize = 100;
+        for entry in src.iterator(rocksdb::IteratorMode::Start) {
+            let (k, v) = match entry {
+                Ok(p) => p,
+                Err(e) => {
+                    cleanup(&snap_dir);
+                    return Err(QuilError::Store(format!("apply snapshot: iter: {}", e)));
+                }
+            };
+            batch.put(&k, &v);
+            count += 1;
+            if count % CHUNK == 0 {
+                let to_commit = std::mem::take(&mut batch);
+                if let Err(e) = self.db.write(to_commit) {
+                    cleanup(&snap_dir);
+                    return Err(QuilError::Store(format!("apply snapshot: write: {}", e)));
+                }
+            }
+        }
+        // Final commit for the remainder.
+        if let Err(e) = self.db.write(batch) {
+            cleanup(&snap_dir);
+            return Err(QuilError::Store(format!("apply snapshot: final write: {}", e)));
+        }
+        cleanup(&snap_dir);
+        tracing::info!(keys = count, "imported snapshot via raw key/value copy");
+        Ok(())
+    }
 
     fn set_alt_shard_commit(
         &self,
@@ -553,10 +726,161 @@ impl HypergraphStore for RocksHypergraphStore {
         }
         Ok(out)
     }
-    fn reap_old_changesets(&self, _txn: &dyn Transaction, _frame_number: u64) -> Result<()> { Ok(()) }
-    fn track_change(&self, _txn: &dyn Transaction, _key: &[u8], _old_value: Option<&[u8]>, _frame_number: u64, _phase_type: &str, _set_type: &str, _shard_key: &ShardKey) -> Result<()> { Ok(()) }
-    fn get_changes(&self, _frame_start: u64, _frame_end: u64, _phase_type: &str, _set_type: &str, _shard_key: &ShardKey) -> Result<Vec<ChangeRecord>> { Ok(vec![]) }
-    fn untrack_change(&self, _txn: &dyn Transaction, _key: &[u8], _frame_number: u64, _phase_type: &str, _set_type: &str, _shard_key: &ShardKey) -> Result<()> { Ok(()) }
+    fn reap_old_changesets(&self, txn: &dyn Transaction, frame_number: u64) -> Result<()> {
+        // Mirror Go's `ReapOldChangesets` (`node/store/hypergraph.go:1830`):
+        // (1) enumerate every shard for which a `VERTEX_ADDS_TREE_ROOT`
+        // exists, then (2) for each of the four change-record discriminators
+        // delete all entries for that shard with `frame_number` < `frame_number`.
+        if frame_number == 0 {
+            return Ok(());
+        }
+        let (start, end) = crate::encoding::hypergraph_tree_roots_iter_bounds();
+        let mut shard_keys: Vec<Vec<u8>> = Vec::new();
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+            &start,
+            rocksdb::Direction::Forward,
+        ));
+        for entry in iter {
+            let (k, _v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if k.as_ref() >= end.as_slice() {
+                break;
+            }
+            // Strip the [HYPERGRAPH_SHARD, change_type] prefix.
+            if k.len() <= 2 {
+                continue;
+            }
+            shard_keys.push(k[2..].to_vec());
+        }
+
+        let change_types = [
+            crate::encoding::HG_VERTEX_ADDS_CHANGE_RECORD,
+            crate::encoding::HG_VERTEX_REMOVES_CHANGE_RECORD,
+            crate::encoding::HG_HYPEREDGE_ADDS_CHANGE_RECORD,
+            crate::encoding::HG_HYPEREDGE_REMOVES_CHANGE_RECORD,
+        ];
+        for change_type in change_types {
+            for sk in &shard_keys {
+                let mut start_key = Vec::with_capacity(2 + sk.len() + 8);
+                start_key.push(crate::encoding::HYPERGRAPH_SHARD);
+                start_key.push(change_type);
+                start_key.extend_from_slice(sk);
+                start_key.extend_from_slice(&0u64.to_be_bytes());
+                let mut end_key = Vec::with_capacity(2 + sk.len() + 8);
+                end_key.push(crate::encoding::HYPERGRAPH_SHARD);
+                end_key.push(change_type);
+                end_key.extend_from_slice(sk);
+                end_key.extend_from_slice(&frame_number.to_be_bytes());
+                txn.delete_range(&start_key, &end_key)?;
+            }
+        }
+        Ok(())
+    }
+    fn track_change(
+        &self,
+        txn: &dyn Transaction,
+        key: &[u8],
+        old_value: Option<&[u8]>,
+        frame_number: u64,
+        phase_type: &str,
+        set_type: &str,
+        shard_key: &ShardKey,
+    ) -> Result<()> {
+        // Mirror Go's `TrackChange` (`node/store/hypergraph.go:1714`):
+        // write the serialized `oldValue` tree blob (empty if `nil`) under
+        // a per-(set/phase/shard/frame/key) change-record key.
+        let change_key = crate::encoding::hypergraph_change_record_key(
+            set_type, phase_type, shard_key, frame_number, key,
+        )
+        .ok_or_else(|| QuilError::InvalidArgument(format!(
+            "track_change: unknown set/phase pair ({}, {})", set_type, phase_type,
+        )))?;
+        let value: &[u8] = old_value.unwrap_or(&[]);
+        if with_rocks_batch(txn, |b| b.put(&change_key, value)) {
+            return Ok(());
+        }
+        self.db.put(&change_key, value).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_changes(
+        &self,
+        frame_start: u64,
+        frame_end: u64,
+        phase_type: &str,
+        set_type: &str,
+        shard_key: &ShardKey,
+    ) -> Result<Vec<ChangeRecord>> {
+        // Mirror Go's `GetChanges` (`node/store/hypergraph.go:1886`):
+        // range-scan `[HYPERGRAPH_SHARD, change_type, l1, l2,
+        // frame_start..=frame_end]`, parse the suffix into frame + key,
+        // and return the records reversed for rollback-friendly order.
+        let change_type = crate::encoding::change_record_type_byte(set_type, phase_type)
+            .ok_or_else(|| QuilError::InvalidArgument(format!(
+                "get_changes: unknown set/phase pair ({}, {})", set_type, phase_type,
+            )))?;
+        let mut start_key = Vec::with_capacity(2 + 3 + 32 + 8);
+        start_key.push(crate::encoding::HYPERGRAPH_SHARD);
+        start_key.push(change_type);
+        start_key.extend_from_slice(&shard_key.l1);
+        start_key.extend_from_slice(&shard_key.l2);
+        start_key.extend_from_slice(&frame_start.to_be_bytes());
+
+        let mut end_key = Vec::with_capacity(2 + 3 + 32 + 8);
+        end_key.push(crate::encoding::HYPERGRAPH_SHARD);
+        end_key.push(change_type);
+        end_key.extend_from_slice(&shard_key.l1);
+        end_key.extend_from_slice(&shard_key.l2);
+        // Go's iterator is exclusive-end with `frameEnd + 1`. Saturate
+        // on overflow rather than wrap to 0 — wrapping would produce a
+        // key strictly less than `start_key` and immediately terminate
+        // the scan, silently returning no changes.
+        end_key.extend_from_slice(&frame_end.saturating_add(1).to_be_bytes());
+
+        let header_len = 2 + 3 + 32;
+        let mut changes: Vec<ChangeRecord> = Vec::new();
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+            &start_key,
+            rocksdb::Direction::Forward,
+        ));
+        for entry in iter {
+            let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
+            if k.as_ref() >= end_key.as_slice() {
+                break;
+            }
+            if k.len() < header_len + 8 {
+                continue;
+            }
+            let frame_number = u64::from_be_bytes(k[header_len..header_len + 8].try_into().unwrap());
+            let original_key = k[header_len + 8..].to_vec();
+            let old_value = if v.is_empty() { None } else { Some(v.to_vec()) };
+            changes.push(ChangeRecord {
+                key: original_key,
+                old_value,
+                frame: frame_number,
+            });
+        }
+        changes.reverse();
+        Ok(changes)
+    }
+    fn untrack_change(
+        &self,
+        txn: &dyn Transaction,
+        key: &[u8],
+        frame_number: u64,
+        phase_type: &str,
+        set_type: &str,
+        shard_key: &ShardKey,
+    ) -> Result<()> {
+        // Mirror Go's `UntrackChange` (`node/store/hypergraph.go:1961`).
+        let change_key = crate::encoding::hypergraph_change_record_key(
+            set_type, phase_type, shard_key, frame_number, key,
+        )
+        .ok_or_else(|| QuilError::InvalidArgument(format!(
+            "untrack_change: unknown set/phase pair ({}, {})", set_type, phase_type,
+        )))?;
+        if with_rocks_batch(txn, |b| b.delete(&change_key)) {
+            return Ok(());
+        }
+        self.db.delete(&change_key).map_err(|e| QuilError::Store(e.to_string()))
+    }
 
     fn capture_tree_snapshot(&self) -> Result<Option<Arc<dyn SnapshotReadable>>> {
         let snap = RocksHypergraphSnapshot::capture(&self.db)?;

@@ -400,6 +400,20 @@ impl<V: Unique> RankTracker<V> {
             // follow-on fresh QC will catch up. The pacemaker's liveness
             // will be slightly slower in this edge case, but safety is
             // preserved.
+            //
+            // BUT: if this TC is for rank `current_rank - 1`, it's the
+            // freshly-aggregated TC that justified our most recent
+            // advance, and it should replace whatever we had as
+            // `prior_rank_TC` (which on a restored-from-disk pacemaker
+            // might be a stale TC from a previous binary version with
+            // an empty bitmask). Without this, our next outgoing
+            // timeout still embeds the bad TC and peers reject it.
+            if tc.rank() + 1 == rank {
+                self.liveness_state.prior_rank_timeout_certificate = Some(tc);
+                self.store
+                    .put_liveness_state(&self.liveness_state)
+                    .map_err(|e| QuilError::Consensus(format!("could not persist liveness state: {}", e)))?;
+            }
             return Ok(rank);
         }
         let new_rank = tc.rank() + 1;

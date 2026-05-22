@@ -401,6 +401,8 @@ mod tests {
             size: BigInt::from(0),
             leaf_count: 0,
             longest_branch: 0,
+            full_prefix: Vec::new(),
+            fully_loaded: true,
         })
     }
 

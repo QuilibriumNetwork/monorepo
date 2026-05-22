@@ -300,6 +300,10 @@ impl WorkerOnlyNode {
             hypergraph: self.hypergraph.clone(),
             execution_engine: self.execution_engine.clone(),
             inclusion_prover: self.inclusion_prover.clone(),
+            // Cluster mode: worker process owns its own DB and can
+            // back this with a real KV handle once the wiring is in
+            // place. Until then, fall through to the in-memory store.
+            kv_db: None,
         };
 
         let (engine, handle) = AppConsensusEngine::new(

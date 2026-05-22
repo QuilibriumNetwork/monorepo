@@ -42,6 +42,22 @@ pub trait VotingProviderFactory<S: Unique, V: Unique>: Send + Sync {
         voter_address: &[u8],
     ) -> Result<V>;
 
+    /// Like `make_vote` but also attaches an `aux` payload (app-shard
+    /// votes use this to carry their 516-byte VDF multi-proof
+    /// contribution). The default impl drops `aux` and forwards to
+    /// `make_vote` — vote types that don't carry aux data get the
+    /// existing behavior.
+    fn make_vote_with_aux(
+        &self,
+        state_rank: u64,
+        state_id: &Identity,
+        signature: Vec<u8>,
+        voter_address: &[u8],
+        _aux: Vec<u8>,
+    ) -> Result<V> {
+        self.make_vote(state_rank, state_id, signature, voter_address)
+    }
+
     /// Build a concrete timeout vote from a timeout signature.
     fn make_timeout_vote(
         &self,
@@ -78,6 +94,21 @@ pub trait VotingProviderFactory<S: Unique, V: Unique>: Send + Sync {
 /// so adapter crates can plug in any scheme.
 pub type AddressDerivation = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 
+/// Producer of a per-vote VDF multi-proof contribution for app-shard
+/// consensus. Invoked at `sign_vote` time, given the state being
+/// voted on (which exposes `parent_selector`, `difficulty`, and
+/// `rank`). Returns 516-byte multi-proof bytes or empty when the
+/// voter shouldn't contribute (single-prover shards, or the voter is
+/// the leader for this rank).
+///
+/// Multi-proof computation is a VDF — expensive in proportion to
+/// difficulty — so production callers wire this to a cache populated
+/// asynchronously on rank change. The closure runs synchronously in
+/// `sign_vote`, so it should return quickly (cache hit) or return
+/// empty if the work isn't ready yet.
+pub type MultiProofProvider<S> =
+    Arc<dyn Fn(&State<S>) -> Vec<u8> + Send + Sync>;
+
 /// Generic BLS voting provider. Construction takes:
 /// - a local `Signer` (usually `Bls48581Signer`)
 /// - a vote / timeout domain separation tag pair
@@ -94,6 +125,12 @@ pub struct BlsVotingProvider<S: Unique, V: Unique, F: VotingProviderFactory<S, V
     /// app-shard provider. Must match the filter the verifier uses
     /// in `make_vote_message(filter, rank, identity)`.
     sign_filter: Vec<u8>,
+    /// Optional per-vote multi-proof producer. When set, each
+    /// `sign_vote` call invokes it to attach a 516-byte VDF
+    /// contribution to the vote — collected by the aggregator and
+    /// packed into the QC's wire signature. Wired only on app-shard
+    /// providers; the global chain leaves it unset.
+    multi_proof_provider: Option<MultiProofProvider<S>>,
     _marker: std::marker::PhantomData<(fn() -> S, fn() -> V)>,
 }
 
@@ -134,8 +171,18 @@ impl<S: Unique, V: Unique, F: VotingProviderFactory<S, V>> BlsVotingProvider<S, 
             derive_address,
             factory,
             sign_filter,
+            multi_proof_provider: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Attach a multi-proof producer used during `sign_vote`. Each
+    /// vote invokes the provider with the state being voted on; the
+    /// returned bytes ride along as the vote's `aux` payload and are
+    /// concatenated into the QC's signature blob by the aggregator.
+    pub fn with_multi_proof_provider(mut self, provider: MultiProofProvider<S>) -> Self {
+        self.multi_proof_provider = Some(provider);
+        self
     }
 
     fn voter_address(&self) -> Vec<u8> {
@@ -156,8 +203,17 @@ impl<S: Unique, V: Unique, F: VotingProviderFactory<S, V>> VotingProvider<S, V>
             .sign_with_domain(&msg, &self.vote_domain)
             .map_err(|e| QuilError::Crypto(format!("could not sign vote: {}", e)))?;
         let voter_address = self.voter_address();
-        self.factory
-            .make_vote(state.rank, &state.identifier, sig, &voter_address)
+        let aux = match self.multi_proof_provider.as_ref() {
+            Some(p) => p(state),
+            None => Vec::new(),
+        };
+        self.factory.make_vote_with_aux(
+            state.rank,
+            &state.identifier,
+            sig,
+            &voter_address,
+            aux,
+        )
     }
 
     fn sign_timeout_vote(

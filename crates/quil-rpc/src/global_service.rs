@@ -50,6 +50,17 @@ pub type WorkerSnapshotFn =
 pub type GlobalShardsProvider =
     Arc<dyn Fn(&[u8; 3], &[u8; 32]) -> [(Vec<u8>, Vec<u8>, u64); 4] + Send + Sync>;
 
+/// Per-shard metadata provider used by [`GlobalRpcServer::get_app_shards`]:
+/// given a 35-byte `shard_key` (L1[3]||L2[32]) and a `prefix` path,
+/// returns `(size_be, data_shards, commitments[4])` derived from the
+/// local hypergraph CRDT's VertexAdds tree. Returns `None` for malformed
+/// keys; entries with no data return zero size/count and 64-byte zero
+/// commitments. Mirrors Go's `services.go:GetAppShards` which fills
+/// these from the engine-side shard metadata.
+pub type AppShardsProvider = Arc<
+    dyn Fn(&[u8], &[u32]) -> Option<(Vec<u8>, u64, [Vec<u8>; 4])> + Send + Sync,
+>;
+
 /// gRPC GlobalService implementation. Serves frames from the clock
 /// store so other nodes can sync from us.
 pub struct GlobalRpcServer {
@@ -58,6 +69,7 @@ pub struct GlobalRpcServer {
     shards_store: Option<Arc<dyn ShardsStore>>,
     worker_snapshot: Option<WorkerSnapshotFn>,
     global_shards: Option<GlobalShardsProvider>,
+    app_shards: Option<AppShardsProvider>,
     /// Broadcast channel for `StreamGlobalMessages`. Producers
     /// (BlossomSub recv loop) send each received message; every
     /// connected streamer gets a `Receiver` clone.
@@ -72,12 +84,18 @@ impl GlobalRpcServer {
             shards_store: None,
             worker_snapshot: None,
             global_shards: None,
+            app_shards: None,
             message_broadcast: None,
         }
     }
 
     pub fn with_global_shards_provider(mut self, p: GlobalShardsProvider) -> Self {
         self.global_shards = Some(p);
+        self
+    }
+
+    pub fn with_app_shards_provider(mut self, p: AppShardsProvider) -> Self {
+        self.app_shards = Some(p);
         self
     }
 
@@ -192,14 +210,30 @@ impl GlobalService for GlobalRpcServer {
                 .map_err(|e| Status::internal(format!("range_app_shards: {e}")))?
         };
         let include_shard_key = req.shard_key.len() != 35;
+        // `RocksShardsStore` only persists the prefix path bytes — it
+        // doesn't carry `size`, `data_shards`, or `commitment`. Fill
+        // those in by consulting the live CRDT via the provider, which
+        // walks the per-shard phase trees and reads the root metadata.
+        // Without this, every entry would report `size=0` and the
+        // caller's `build_proposal_descriptors` filters it out → no
+        // ProposeJoin ever fires.
         let info: Vec<global::AppShardInfo> = shards
             .into_iter()
-            .map(|s| global::AppShardInfo {
-                shard_key: if include_shard_key { s.shard_key } else { Vec::new() },
-                prefix: s.prefix,
-                size: s.size,
-                data_shards: s.data_shards,
-                commitment: s.commitment,
+            .map(|s| {
+                let (size, data_shards, commitment) = match &self.app_shards {
+                    Some(p) => match p(&s.shard_key, &s.prefix) {
+                        Some((sz, ds, cm)) => (sz, ds, cm.to_vec()),
+                        None => (Vec::new(), 0, (0..4).map(|_| vec![0u8; 64]).collect()),
+                    },
+                    None => (s.size, s.data_shards, s.commitment),
+                };
+                global::AppShardInfo {
+                    shard_key: if include_shard_key { s.shard_key } else { Vec::new() },
+                    prefix: s.prefix,
+                    size,
+                    data_shards,
+                    commitment,
+                }
             })
             .collect();
         Ok(Response::new(global::GetAppShardsResponse { info }))

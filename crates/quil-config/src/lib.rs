@@ -4,6 +4,7 @@ mod engine;
 mod keys;
 mod logger;
 mod p2p;
+mod version;
 
 pub use config::*;
 pub use db::*;
@@ -11,6 +12,7 @@ pub use engine::*;
 pub use keys::*;
 pub use logger::*;
 pub use p2p::*;
+pub use version::*;
 
 use serde::{Deserialize, Deserializer};
 use std::path::Path;

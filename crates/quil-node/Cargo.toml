@@ -38,7 +38,7 @@ hex = "0.4"
 bs58 = "0.5"
 base64 = "0.22"
 ed448-rust = { path = "../ed448-rust" }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
@@ -48,6 +48,7 @@ chrono = "0.4"
 serde_json = "1"
 file-rotate = "0.7"
 anyhow = "1"
+thiserror = "2"
 sha2 = "0.10"
 sha3 = "0.10"
 num-bigint = "0.4"

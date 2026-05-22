@@ -1,21 +1,5 @@
-//! Diagnostic probe for `HypergraphComparisonService.PerformSync`.
-//!
-//! This is the bidirectional-streaming RPC that drives prover-tree sync.
-//! Before porting the full LazyVectorCommitmentTree we want to verify:
-//!
-//! 1. Our generated `HypergraphComparisonServiceClient` works against the
-//!    same archive nodes that already serve `GlobalService.GetGlobalFrame`.
-//! 2. The `shard_key = L1(3) || L2(32)` encoding is correct for the global
-//!    prover tree shard `{L1: [0;3], L2: [0xff;32]}`.
-//! 3. The wire-level branch responses can be received and decoded.
-//!
-//! The probe sends a single `HypergraphSyncGetBranchRequest` with the empty
-//! path (which means "the root") and the `VertexAdds` phase. It logs whatever
-//! the server returns.
-//!
-//! This is intentionally read-only and stateless. It is not the real
-//! HyperSync client — that needs the LazyVectorCommitmentTree port to
-//! recursively walk and reconstruct the tree.
+//! Diagnostic probe for `HypergraphComparisonService.PerformSync` —
+//! pulls the global prover tree's `VertexAdds` root and pages leaves.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,9 +41,7 @@ pub enum HyperSyncProbeError {
     EmptyResponse,
 }
 
-/// Wire encoding of `tries.ShardKey{L1, L2}` as a flat byte slice. The Go
-/// code uses `slices.Concat(L1[:], L2[:])` for the same purpose
-/// (`node/rpc/hypergraph_sync_rpc_server_test.go:2095`).
+/// Wire encoding of `tries.ShardKey{L1, L2}` as a flat 35-byte slice.
 pub fn encode_shard_key(l1: &[u8; 3], l2: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(35);
     out.extend_from_slice(l1);
@@ -67,9 +49,7 @@ pub fn encode_shard_key(l1: &[u8; 3], l2: &[u8; 32]) -> Vec<u8> {
     out
 }
 
-/// The shard key for the global prover tree:
-/// `L1 = [0;3], L2 = [0xff;32]`. Mirrors
-/// `node/consensus/global/global_consensus_engine.go:ensureGenesisProvers`.
+/// Global prover tree shard key: `L1 = [0;3], L2 = [0xff;32]`.
 pub fn global_prover_shard_key() -> Vec<u8> {
     encode_shard_key(&[0u8; 3], &[0xffu8; 32])
 }
@@ -81,23 +61,15 @@ pub struct ProberStats {
     pub root_full_path_len: usize,
     pub root_child_count: usize,
     pub root_leaf_count: u64,
-    /// Number of leaves actually pulled (may be less than `root_leaf_count`
-    /// if we stop early).
     pub leaves_pulled: u64,
-    /// Total bytes of `value` data across pulled leaves.
     pub leaves_value_bytes: u64,
-    /// Total bytes of `underlying_data` across pulled leaves (vertex tree
-    /// payloads).
     pub leaves_underlying_bytes: u64,
-    /// Number of paginated GetLeaves calls performed.
     pub leaves_pages: u32,
-    /// Set if we stopped before exhausting the leaves.
     pub stopped_early: bool,
 }
 
-/// Connect to an archive endpoint via Quilibrium mTLS and send one
-/// `PerformSync` request for the root branch of the global prover tree's
-/// `VertexAdds` phase. Log whatever the server sends back.
+/// Send one `PerformSync` `GetBranch` for the global prover tree's
+/// `VertexAdds` root over the archive's mTLS channel and log the response.
 pub async fn probe_perform_sync(
     addr: &str,
     ed448_seed: &[u8; 57],
@@ -119,15 +91,12 @@ pub async fn probe_perform_sync(
     let channel: Channel = endpoint.connect_with_connector(connector).await?;
     info!(%addr, "hypersync probe connected");
 
-    // Default tonic client caps decoded messages at 4 MiB. Archive nodes
-    // can return HyperSync responses up to ~48 MiB when hyperedge leaves
-    // carry large underlying_data blobs. 64 MiB gives plenty of headroom.
+    // Bump message size from the 4 MiB default — HyperSync responses can
+    // exceed 48 MiB when hyperedge leaves carry large underlying_data.
     let mut client = HypergraphComparisonServiceClient::new(channel)
         .max_decoding_message_size(64 * 1024 * 1024)
         .max_encoding_message_size(64 * 1024 * 1024);
 
-    // Build the request stream: one HypergraphSyncGetBranchRequest with the
-    // global prover shard key and an empty path (= root).
     let (tx, rx) = tokio::sync::mpsc::channel::<HypergraphSyncQuery>(4);
     let req_stream = ReceiverStream::new(rx);
 
@@ -146,7 +115,6 @@ pub async fn probe_perform_sync(
         HyperSyncProbeError::Rpc(tonic::Status::cancelled("request stream closed"))
     })?;
 
-    // Open the bidirectional stream and read the first response.
     debug!(%addr, "calling PerformSync");
     let response = client
         .perform_sync(Request::new(req_stream))
@@ -201,19 +169,13 @@ pub async fn probe_perform_sync(
         }
     }
 
-    // Close the request stream by dropping `tx`. The server stream may end
-    // immediately after.
     drop(tx);
 
     Ok(())
 }
 
-/// Walk the global prover tree's `VertexAdds` phase by pulling leaves
-/// directly under the root path. Mirrors what Go's `fetchAndIntegrateLeaves`
-/// does for a node with no local data: page through `GetLeaves` against the
-/// root, with `max_leaves = 1000`, until exhausted or `max_pages` reached.
-///
-/// Returns counts; does not store anything yet.
+/// Page `GetLeaves` against the global prover tree root until exhausted
+/// or `max_pages` reached. Returns counts; stores nothing.
 pub async fn probe_pull_root_leaves(
     addr: &str,
     ed448_seed: &[u8; 57],
@@ -234,23 +196,19 @@ pub async fn probe_pull_root_leaves(
     let channel: Channel = endpoint.connect_with_connector(connector).await?;
     info!(%addr, ?phase, "leaf puller connected");
 
-    // Default tonic client caps decoded messages at 4 MiB. Archive nodes
-    // can return HyperSync responses up to ~48 MiB when hyperedge leaves
-    // carry large underlying_data blobs. 64 MiB gives plenty of headroom.
+    // Bump from the 4 MiB default — HyperSync responses can exceed 48 MiB.
     let mut client = HypergraphComparisonServiceClient::new(channel)
         .max_decoding_message_size(64 * 1024 * 1024)
         .max_encoding_message_size(64 * 1024 * 1024);
 
-    // Build a request stream we control. The first message must be queued
-    // BEFORE calling `perform_sync`, otherwise tonic's bidirectional stream
-    // setup blocks waiting for it.
+    // The first message must be queued BEFORE `perform_sync`, or the
+    // bidi stream setup blocks.
     let (tx, rx) = tokio::sync::mpsc::channel::<HypergraphSyncQuery>(8);
     let req_stream = ReceiverStream::new(rx);
 
     let shard_key = global_prover_shard_key();
     let phase_i32 = phase as i32;
 
-    // Step 1: GetBranch root — queue before opening the stream.
     tx.send(HypergraphSyncQuery {
         request: Some(hypergraph_sync_query::Request::GetBranch(
             HypergraphSyncGetBranchRequest {
@@ -298,9 +256,8 @@ pub async fn probe_pull_root_leaves(
         "root branch ready, paginating leaves"
     );
 
-    // Step 2: page GetLeaves with the same path the server returned (the
-    // canonical compressed root path), since asking with [] would walk
-    // through the whole compressed prefix again.
+    // Page GetLeaves against the server-returned canonical root path —
+    // an empty path would re-walk the whole compressed prefix.
     let mut continuation: Vec<u8> = Vec::new();
     let leaves_path = root_branch.full_path.clone();
     for page in 0..max_pages {
@@ -386,18 +343,10 @@ pub struct BuildTreeStats {
     pub commitments_match: bool,
 }
 
-/// Pull every leaf under the global prover tree's `phase` from `addr`,
-/// insert each into a fresh in-memory `VectorCommitmentTree`, then call
-/// `tree.commit(prover)` and compare the result to the server's claimed
-/// root commitment.
-///
-/// If `max_pages == 0`, pulls until the server returns no continuation
-/// token. Otherwise stops at `max_pages` paginated requests.
-///
-/// Even with all leaves pulled, the local commitment may differ from the
-/// server's if our prefix-compressed Patricia trie diverges from Go's. The
-/// returned `commitments_match` flag is the byte-identical-port milestone
-/// gate.
+/// Pull all leaves under `phase`, rebuild the tree locally, and compare
+/// the recomputed root to the server's. `max_pages == 0` means
+/// "until exhausted". The `commitments_match` flag gates byte-identical
+/// port correctness.
 pub async fn probe_build_local_tree(
     addr: &str,
     ed448_seed: &[u8; 57],
@@ -419,9 +368,7 @@ pub async fn probe_build_local_tree(
     let channel: Channel = endpoint.connect_with_connector(connector).await?;
     info!(%addr, ?phase, max_pages, "tree builder connected");
 
-    // Default tonic client caps decoded messages at 4 MiB. Archive nodes
-    // can return HyperSync responses up to ~48 MiB when hyperedge leaves
-    // carry large underlying_data blobs. 64 MiB gives plenty of headroom.
+    // Bump from the 4 MiB default — HyperSync responses can exceed 48 MiB.
     let mut client = HypergraphComparisonServiceClient::new(channel)
         .max_decoding_message_size(64 * 1024 * 1024)
         .max_encoding_message_size(64 * 1024 * 1024);
@@ -432,7 +379,6 @@ pub async fn probe_build_local_tree(
     let shard_key = global_prover_shard_key();
     let phase_i32 = phase as i32;
 
-    // Queue the GetBranch root request before opening the bidi stream.
     tx.send(HypergraphSyncQuery {
         request: Some(hypergraph_sync_query::Request::GetBranch(
             HypergraphSyncGetBranchRequest {
@@ -555,7 +501,6 @@ pub async fn probe_build_local_tree(
         "all requested leaves pulled, computing local root commitment"
     );
 
-    // Compute the local root commitment.
     let prover = KzgInclusionProver;
     let commit_start = Instant::now();
     let local_root = tree.commit(&prover);
@@ -585,21 +530,16 @@ pub async fn probe_build_local_tree(
     Ok(stats)
 }
 
-/// One per-vertex record captured during `build_local_tree_with_handle`:
-/// the leaf's main-tree key and its serialized `underlying_data` sub-tree.
-/// The sub-tree is the Go `SerializeNonLazyTree` wire format; parse it
-/// with `quil_tries::deserialize_go_tree`. Vertices without any
-/// `underlying_data` are skipped — those leaves carry no per-vertex
-/// state to persist.
+/// A leaf's key and serialized vertex sub-tree
+/// (Go `SerializeNonLazyTree` format; parse with `deserialize_go_tree`).
+/// Leaves with no per-vertex data are skipped.
 pub struct VertexDataEntry {
     pub key: Vec<u8>,
     pub underlying_data: Vec<u8>,
 }
 
-/// Same as `probe_build_local_tree` but additionally returns the
-/// constructed tree AND the per-leaf `underlying_data` blobs alongside
-/// the stats so the caller can persist or query them. The tree has had
-/// `commit` called on it, so all branch commitments are populated.
+/// Like `probe_build_local_tree` but also returns the committed tree
+/// and per-leaf `underlying_data` blobs.
 pub async fn build_local_tree_with_handle(
     addr: &str,
     ed448_seed: &[u8; 57],
@@ -623,9 +563,7 @@ pub async fn build_local_tree_with_handle(
     let channel: Channel = endpoint.connect_with_connector(connector).await?;
     info!(%addr, ?phase, max_pages, "tree builder connected (with-handle)");
 
-    // Default tonic client caps decoded messages at 4 MiB. Archive nodes
-    // can return HyperSync responses up to ~48 MiB when hyperedge leaves
-    // carry large underlying_data blobs. 64 MiB gives plenty of headroom.
+    // Bump from the 4 MiB default — HyperSync responses can exceed 48 MiB.
     let mut client = HypergraphComparisonServiceClient::new(channel)
         .max_decoding_message_size(64 * 1024 * 1024)
         .max_encoding_message_size(64 * 1024 * 1024);
@@ -678,10 +616,6 @@ pub async fn build_local_tree_with_handle(
         "server root branch acquired (with-handle)"
     );
 
-    // Empty-tree short circuit: if the server reports no root commitment
-    // AND zero leaves, the phase has nothing to sync. Mark as matched and
-    // return an empty local tree rather than computing a zero-commit that
-    // won't equal the server's empty bytes.
     if stats.server_root_commitment.is_empty() && stats.server_leaf_count == 0 {
         stats.commitments_match = true;
         stats.local_root_commitment.clear();
@@ -783,10 +717,8 @@ pub async fn build_local_tree_with_handle(
     Ok((stats, tree, vertex_data))
 }
 
-/// Pull a few leaves from the global prover tree and parse each leaf's
-/// `underlying_data` as a Go-format vector commitment sub-tree. Logs the
-/// per-leaf structure so we can see what's inside a prover/allocation
-/// vertex. Purely diagnostic — does not persist anything.
+/// Pull and log a handful of leaves' `underlying_data` sub-trees.
+/// Diagnostic only — persists nothing.
 pub async fn probe_inspect_vertex_data(
     addr: &str,
     ed448_seed: &[u8; 57],
@@ -1183,6 +1115,25 @@ pub async fn ensure_prover_tree_incremental(
         }
     }
 
+    // If the local tree has children at indices the server doesn't, the
+    // incremental flow cannot reconcile — the stale subtrees would still
+    // contribute to the recomputed root. Trigger a full sync.
+    let server_indices: std::collections::HashSet<i32> =
+        root_branch.children.iter().map(|c| c.index).collect();
+    let has_local_only_children = local_map
+        .keys()
+        .any(|idx| !server_indices.contains(idx));
+    if has_local_only_children {
+        info!(
+            ?phase,
+            local_children = local_map.len(),
+            server_children = server_indices.len(),
+            "local tree has children server lacks, falling back to full sync"
+        );
+        drop(tx);
+        return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store).await;
+    }
+
     if changed_children.is_empty() {
         // All children match but root commitment differs — structural issue.
         // Fall back to full sync for safety.
@@ -1279,8 +1230,13 @@ pub async fn ensure_prover_tree_incremental(
     if !stats.commitments_match {
         warn!(
             ?phase,
-            "incremental sync commitment still doesn't match after leaf update, may need full sync"
+            local = hex::encode(&new_root[..new_root.len().min(16)]),
+            server = hex::encode(
+                &stats.server_root_commitment[..stats.server_root_commitment.len().min(16)]
+            ),
+            "incremental sync commitment still doesn't match after leaf update, falling back to full sync"
         );
+        return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store).await;
     }
 
     // Step 7: Persist updated tree
