@@ -336,6 +336,10 @@ pub struct CoverageMonitor {
     prover_only_mode: Arc<AtomicBool>,
     /// Last frame where a coverage check ran (debounce).
     last_checked_frame: AtomicU64,
+    /// Per-shard halt state we've already emitted to the event
+    /// distributor. Used to detect transitions and emit Halt /
+    /// Resume events only on the leading / trailing edge.
+    emitted_halted: Mutex<std::collections::HashSet<Vec<u8>>>,
 }
 
 impl CoverageMonitor {
@@ -352,6 +356,7 @@ impl CoverageMonitor {
             streaks: Arc::new(LowCoverageStreakTracker::new()),
             prover_only_mode,
             last_checked_frame: AtomicU64::new(0),
+            emitted_halted: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -392,6 +397,8 @@ impl CoverageMonitor {
             .unwrap_or_default();
 
         let mut any_halted = false;
+        let mut currently_halted: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
 
         for summary in &summaries {
             let active = summary.status_counts
@@ -405,7 +412,6 @@ impl CoverageMonitor {
                 // Mainnet extended-enrollment window: before frame
                 // 262_700 (FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 360),
                 // grant an additional 720 grace frames before halting.
-                // Mirrors Go `coverage_monitor.go:222-226`.
                 let effective_grace = if frame_number
                     < EXTENDED_ENROLL_HALT_GRACE_END
                 {
@@ -415,6 +421,7 @@ impl CoverageMonitor {
                 };
                 if streak.count >= effective_grace {
                     any_halted = true;
+                    currently_halted.insert(summary.filter.clone());
                     tracing::debug!(
                         filter = hex::encode(&summary.filter),
                         active,
@@ -432,6 +439,46 @@ impl CoverageMonitor {
                     );
                     self.streaks.clear(&summary.filter);
                 }
+            }
+        }
+
+        // Emit edge-triggered CoverageHalt / CoverageResume events to the
+        // distributor. The `halt_state` subscriber in the node binary
+        // consumes these and broadcasts `set_halted(true|false)` to every
+        // app shard engine. Without this emission, halts detected here
+        // never propagate to workers and they keep producing frames.
+        {
+            let mut emitted = self.emitted_halted.lock().unwrap();
+            // Newly-halted filters.
+            for filter in &currently_halted {
+                if !emitted.contains(filter) {
+                    self.event_distributor.publish(ControlEvent {
+                        event_type: ControlEventType::CoverageHalt,
+                        data: ControlEventData::Coverage {
+                            filter: filter.clone(),
+                            duration: u64::MAX,
+                        },
+                    });
+                    crate::metrics::inc_coverage_halts_entered();
+                    emitted.insert(filter.clone());
+                }
+            }
+            // Filters that were halted but no longer are.
+            let cleared: Vec<Vec<u8>> = emitted
+                .iter()
+                .filter(|f| !currently_halted.contains(*f))
+                .cloned()
+                .collect();
+            for filter in cleared {
+                self.event_distributor.publish(ControlEvent {
+                    event_type: ControlEventType::CoverageResume,
+                    data: ControlEventData::Coverage {
+                        filter: filter.clone(),
+                        duration: 0,
+                    },
+                });
+                crate::metrics::inc_coverage_resumes();
+                emitted.remove(&filter);
             }
         }
 

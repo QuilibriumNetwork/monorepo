@@ -167,6 +167,35 @@ impl RemoteWorkerManager {
         }
     }
 
+    /// Send a SetHalted command to every connected remote worker.
+    /// Fire-and-forget per-worker — a failure on one doesn't abort
+    /// the others. Mirrors the in-process broadcaster's behavior of
+    /// pushing the flag to every active engine regardless of
+    /// reachability.
+    pub async fn broadcast_set_halted(&self, halted: bool) {
+        let channels: Vec<(u32, Channel)> = {
+            let workers = self.workers.lock().unwrap();
+            workers
+                .iter()
+                .filter_map(|(&core_id, w)| w.channel.clone().map(|c| (core_id, c)))
+                .collect()
+        };
+        for (core_id, channel) in channels {
+            let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel);
+            let request = tonic::Request::new(
+                quil_types::proto::node::SetHaltedRequest { halted },
+            );
+            match client.set_halted(request).await {
+                Ok(_) => {
+                    info!(core_id, halted, "remote worker SetHalted ack");
+                }
+                Err(e) => {
+                    warn!(core_id, error = %e, halted, "remote worker SetHalted failed");
+                }
+            }
+        }
+    }
+
     /// Send a Respawn command to a remote worker via gRPC.
     #[allow(dead_code)]
     async fn send_respawn(&self, core_id: u32, filter: &[u8]) -> Result<()> {

@@ -83,14 +83,14 @@ struct Args {
     prometheus_server: Option<String>,
 
     /// Enable or disable signature validation (default true, override
-    /// with `QUILIBRIUM_SIGNATURE_CHECK=false` or `--signature-check=false`)
+    /// with `QUILIBRIUM_SIGNATURE_CHECK=false` or
+    /// `--signature-check=false`). Both flag and env must be set with
+    /// an explicit value — bare `--signature-check` is not accepted.
     #[arg(
         long,
         env = "QUILIBRIUM_SIGNATURE_CHECK",
         default_value_t = true,
         action = clap::ArgAction::Set,
-        num_args = 0..=1,
-        default_missing_value = "true",
     )]
     signature_check: bool,
 
@@ -1243,14 +1243,27 @@ async fn run_master_node(
         });
     }
 
-    // Broadcast halt-state changes to every active app shard engine.
-    // Each engine forwards the flag to its `AppLeaderProvider`, which
-    // short-circuits `prove_next_state` during coverage halts.
+    // Broadcast halt-state changes to every active app shard engine
+    // AND every standalone worker process. In-process thread-mode
+    // engines receive via the `shard_engines` map; standalone workers
+    // receive via the `SetHalted` DataIPC RPC.
+    //
+    // Two firings:
+    //   1. Edge-triggered: when `halt_state.watch_any_halted()` flips,
+    //      push the new value immediately.
+    //   2. Periodic resync (every 30s) while a halt is active: covers
+    //      worker reconnects and the initial-connect race where a
+    //      worker boots mid-halt and would otherwise stay halted=false
+    //      until the next edge transition.
     {
         let mut rx = halt_state.watch_any_halted();
         let engines = shard_engines.clone();
         let cancel = token.clone();
+        let remote_mgr_for_halt = remote_worker_manager_for_halt.clone();
+        let halt_state_for_periodic = halt_state.clone();
         tokio::spawn(async move {
+            let mut periodic = tokio::time::interval(std::time::Duration::from_secs(30));
+            periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -1262,11 +1275,31 @@ async fn run_master_node(
                         for (_filter, handle) in map.iter() {
                             handle.set_halted(halted);
                         }
+                        drop(map);
+                        if let Some(mgr) = remote_mgr_for_halt.as_ref() {
+                            mgr.broadcast_set_halted(halted).await;
+                        }
                         info!(
                             halted,
                             engines = count,
                             "broadcast halt state to app shard engines"
                         );
+                    }
+                    _ = periodic.tick() => {
+                        let halted = halt_state_for_periodic.any_halted();
+                        if !halted {
+                            continue;
+                        }
+                        // Re-push to every engine + remote worker so a
+                        // freshly-connected worker picks up the halt.
+                        let map = engines.read();
+                        for (_filter, handle) in map.iter() {
+                            handle.set_halted(true);
+                        }
+                        drop(map);
+                        if let Some(mgr) = remote_mgr_for_halt.as_ref() {
+                            mgr.broadcast_set_halted(true).await;
+                        }
                     }
                 }
             }
@@ -1293,6 +1326,9 @@ async fn run_master_node(
     let reward_greedy = config.engine.reward_strategy == "reward-greedy";
     let fkm_for_factory = file_key_manager.clone();
 
+    let mut remote_worker_manager_for_halt: Option<
+        Arc<quil_engine::remote_worker::RemoteWorkerManager>,
+    > = None;
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> =
         if !config.engine.data_worker_stream_multiaddrs.is_empty() {
             // CLUSTER MODE: remote workers via gRPC
@@ -1318,6 +1354,7 @@ async fn run_master_node(
                 remote_workers = config.engine.data_worker_stream_multiaddrs.len(),
                 "remote worker manager ready (cluster mode)"
             );
+            remote_worker_manager_for_halt = Some(remote_mgr.clone());
             remote_mgr as Arc<dyn quil_engine::worker::WorkerManager>
         } else {
             // LOCAL MODE: core-pinned threads
@@ -1521,6 +1558,21 @@ async fn run_master_node(
                                         filter,
                                         header_canonical_bytes,
                                     } => {
+                                        // Drop reward-proof submissions during a coverage
+                                        // halt. The engine's per-message halt gates stop
+                                        // new consensus from advancing, but a finalize
+                                        // event already in-flight when the halt arrived
+                                        // can still race through and emit here. Suppress
+                                        // the publish so we don't credit shard work that
+                                        // shouldn't have happened during the halt window.
+                                        if drain_halt.any_halted() {
+                                            debug!(
+                                                core_id,
+                                                filter = %hex::encode(&filter),
+                                                "suppressing GLOBAL_PROVER publish — coverage halt active"
+                                            );
+                                            continue;
+                                        }
                                         // Decode for a positive log line so the operator
                                         // can see each rewardable proof going out. The
                                         // bytes are consumed by `wrap` below; decode a
@@ -1582,6 +1634,11 @@ async fn run_master_node(
                                         // Per-shard frame bitmask = filter itself.
                                         // Self-loopback is handled in thread_worker
                                         // before we get here.
+                                        if drain_halt.any_halted() {
+                                            debug!(core_id, filter = %hex::encode(&filter),
+                                                "suppressing shard frame publish — coverage halt active");
+                                            continue;
+                                        }
                                         let p2p = drain_p2p.clone();
                                         tokio::spawn(async move {
                                             if let Err(e) = p2p
@@ -1598,6 +1655,11 @@ async fn run_master_node(
                                     }
                                     WorkerToMaster::VoteProduced { core_id, filter, vote_data } => {
                                         // Per-shard consensus bitmask = `0x00 || filter`.
+                                        if drain_halt.any_halted() {
+                                            debug!(core_id, filter = %hex::encode(&filter),
+                                                "suppressing shard vote publish — coverage halt active");
+                                            continue;
+                                        }
                                         let p2p = drain_p2p.clone();
                                         tokio::spawn(async move {
                                             if let Err(e) = p2p
@@ -1613,6 +1675,11 @@ async fn run_master_node(
                                         });
                                     }
                                     WorkerToMaster::TimeoutProduced { core_id, filter, timeout_data } => {
+                                        if drain_halt.any_halted() {
+                                            debug!(core_id, filter = %hex::encode(&filter),
+                                                "suppressing shard timeout publish — coverage halt active");
+                                            continue;
+                                        }
                                         let p2p = drain_p2p.clone();
                                         tokio::spawn(async move {
                                             if let Err(e) = p2p

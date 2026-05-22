@@ -374,7 +374,19 @@ message CreateJoinProofResponse {
   bytes response = 1;
 }
 
+message SetHaltedRequest {
+  bool halted = 1;
+}
+
+message SetHaltedResponse {
+}
+
 service DataIPCService {
   rpc Respawn(RespawnRequest) returns (RespawnResponse);
   rpc CreateJoinProof(CreateJoinProofRequest) returns (CreateJoinProofResponse);
+  // SetHalted broadcasts the master's coverage-halt verdict to a
+  // standalone worker process. The worker forwards the flag to its
+  // local engine so prove_next_state and consensus-message handlers
+  // short-circuit while halted. Idempotent — same value is a no-op.
+  rpc SetHalted(SetHaltedRequest) returns (SetHaltedResponse);
 }

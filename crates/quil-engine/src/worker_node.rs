@@ -80,6 +80,12 @@ pub struct WorkerOnlyNode {
     /// engine-produced messages are forwarded to the master for
     /// broadcast.
     publish_fn: Option<PublishFn>,
+    /// Worker-local mirror of the master's coverage-halt verdict
+    /// (set via the `SetHalted` IPC RPC). The publish pump consults
+    /// this to drop in-flight FrameProduced / VoteProduced /
+    /// TimeoutProduced events that the engine emitted just before
+    /// receiving its own `set_halted(true)`.
+    local_halted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WorkerOnlyNode {
@@ -115,6 +121,7 @@ impl WorkerOnlyNode {
             engine_event_tx,
             engine_event_rx: std::sync::Mutex::new(Some(engine_event_rx)),
             publish_fn: None,
+            local_halted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -201,6 +208,7 @@ impl WorkerOnlyNode {
             let rx_opt = self.engine_event_rx.lock().unwrap().take();
             if let Some(mut rx) = rx_opt {
                 let pump_cancel = self.cancel.clone();
+                let halt_flag = self.local_halted.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -208,8 +216,19 @@ impl WorkerOnlyNode {
                             ev = rx.recv() => {
                                 let Some(ev) = ev else { break; };
                                 use crate::app_engine::AppEngineEvent::*;
+                                // Suppress network publishes while the master
+                                // reports a coverage halt. The engine's own
+                                // halt gate handles new consensus, but an
+                                // event already in flight can still hit this
+                                // pump.
+                                let halted = halt_flag.load(std::sync::atomic::Ordering::Relaxed);
                                 match ev {
                                     FrameProduced { filter, frame_data, .. } => {
+                                        if halted {
+                                            tracing::debug!(filter = %hex::encode(&filter),
+                                                "suppressing standalone shard frame publish — halt active");
+                                            continue;
+                                        }
                                         // Publish on the per-shard frame bitmask
                                         // so peers subscribed to the shard receive
                                         // it; the GLOBAL_FRAME publish is kept for
@@ -218,10 +237,20 @@ impl WorkerOnlyNode {
                                         publish(crate::bitmasks::shard_frame_bitmask(&filter), frame_data).await;
                                     }
                                     VoteProduced { filter, vote_data, .. } => {
+                                        if halted {
+                                            tracing::debug!(filter = %hex::encode(&filter),
+                                                "suppressing standalone shard vote publish — halt active");
+                                            continue;
+                                        }
                                         publish(crate::bitmasks::GLOBAL_CONSENSUS.to_vec(), vote_data.clone()).await;
                                         publish(crate::bitmasks::shard_consensus_bitmask(&filter), vote_data).await;
                                     }
                                     TimeoutProduced { filter, timeout_data, .. } => {
+                                        if halted {
+                                            tracing::debug!(filter = %hex::encode(&filter),
+                                                "suppressing standalone shard timeout publish — halt active");
+                                            continue;
+                                        }
                                         publish(crate::bitmasks::GLOBAL_CONSENSUS.to_vec(), timeout_data.clone()).await;
                                         publish(crate::bitmasks::shard_consensus_bitmask(&filter), timeout_data).await;
                                     }
@@ -399,6 +428,31 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         );
         Ok(tonic::Response::new(
             quil_types::proto::node::CreateJoinProofResponse { response: proof },
+        ))
+    }
+
+    async fn set_halted(
+        &self,
+        request: tonic::Request<quil_types::proto::node::SetHaltedRequest>,
+    ) -> std::result::Result<
+        tonic::Response<quil_types::proto::node::SetHaltedResponse>,
+        tonic::Status,
+    > {
+        let halted = request.into_inner().halted;
+        // Forward to the local engine if one is running. A standalone
+        // worker without an active engine has nothing to gate; the call
+        // becomes a no-op until the next Respawn boots the engine.
+        let handle = self.worker.engine_handle.lock().unwrap().clone();
+        if let Some(h) = handle {
+            h.set_halted(halted);
+        }
+        // Mirror the flag onto the worker's local view so any
+        // local publish path (publish_fn pump) can also gate on it.
+        self.worker
+            .local_halted
+            .store(halted, std::sync::atomic::Ordering::Relaxed);
+        Ok(tonic::Response::new(
+            quil_types::proto::node::SetHaltedResponse {},
         ))
     }
 }
