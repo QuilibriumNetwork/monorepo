@@ -538,8 +538,13 @@ mod tests {
         assert!(!outcome.should_dispatch());
     }
 
+    // 57 bytes of 0xBB pass the length gate but do not decode to a valid
+    // Ed448 point, so `PublicKey::from([u8; 57])` panics inside the
+    // validator (see `crates/ed448-rust/src/public_key.rs:167`). The
+    // router's `catch_unwind` turns that panic into `Rejected`, which is
+    // the observable contract we pin here.
     #[test]
-    fn router_validator_passes_well_formed_peer_info() {
+    fn router_validator_rejects_invalid_pubkey_point() {
         let r = MessageRouter::new();
         r.register_validator(
             bitmasks::GLOBAL_PEER_INFO.to_vec(),
@@ -556,6 +561,39 @@ mod tests {
         let pubkey = vec![0xBB; 57]; // 57 == Ed448 pubkey length
         let sig = vec![0xCC; 114];   // 114 == Ed448 signature length
         let bytes = quil_p2p::encode_canonical_peer_info(&info, &pubkey, &sig);
+
+        let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &bytes);
+        assert_eq!(outcome, RouteOutcome::Rejected);
+    }
+
+    #[test]
+    fn router_validator_passes_well_formed_peer_info() {
+        let r = MessageRouter::new();
+        r.register_validator(
+            bitmasks::GLOBAL_PEER_INFO.to_vec(),
+            validator_global_peer_info(),
+        );
+
+        let privkey = ed448_rust::PrivateKey::new(&mut rand::rngs::OsRng);
+        let pubkey_bytes = ed448_rust::PublicKey::from(&privkey).as_byte().to_vec();
+
+        let info = quil_p2p::CanonicalPeerInfo {
+            peer_id: vec![0xAA; 38],
+            timestamp: 1_700_000_000_000,
+            version: vec![2, 1, 0],
+            patch_number: vec![20],
+            ..Default::default()
+        };
+        // Sign the canonical encoding with the signature field cleared,
+        // matching what `validator_global_peer_info` reconstructs at
+        // verify-time (see signing_payload above). The validator passes
+        // `Some(&[])` as context, so we must sign with the same.
+        let signing_payload = quil_p2p::encode_canonical_peer_info(&info, &pubkey_bytes, &[]);
+        let sig = privkey
+            .sign(&signing_payload, Some(&[]))
+            .expect("sign must succeed")
+            .to_vec();
+        let bytes = quil_p2p::encode_canonical_peer_info(&info, &pubkey_bytes, &sig);
 
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &bytes);
         assert_eq!(outcome, RouteOutcome::Accepted, "well-formed PeerInfo must be accepted");
