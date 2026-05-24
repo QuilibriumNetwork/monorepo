@@ -53,6 +53,8 @@ fn build_test_exec_manager(
         inclusion_prover.clone(),
     ));
     let stubs = quil_execution::testing::NoopExecutionCrypto::new();
+    let hg_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
+        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
     quil_execution::ExecutionEngineManager::new(
         inclusion_prover,
         stubs.key_manager.clone(),
@@ -61,6 +63,7 @@ fn build_test_exec_manager(
         stubs.decaf_constructor,
         stubs.circuit_compiler,
         stubs.clock_store,
+        hg_resolver,
         include_global,
     )
 }
@@ -703,6 +706,7 @@ pub fn build_node(
         on_qc_observed: Some(qc_observed_hook),
         config_override: Some(cfg),
         genesis_qc_override: Some(genesis_qc),
+        kv_db: None,
     };
 
     let activation = quil_engine::consensus_activation::activate_consensus(params)
@@ -967,6 +971,7 @@ async fn single_archive_node_activates_consensus() {
         on_qc_observed: None,
         config_override: Some(cfg),
         genesis_qc_override: None,
+        kv_db: None,
     };
 
     let activation = quil_engine::consensus_activation::activate_consensus(params)
@@ -1836,6 +1841,8 @@ pub fn build_tier2_archive_rig_with_key_manager(
     //    tier-2 archive happy-path tests don't exercise the QUIL PoMW
     //    mint path or compute / token verify chains.
     let exec_stubs = quil_execution::testing::NoopExecutionCrypto::new();
+    let exec_hg_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
+        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
     let exec_manager = Arc::new(ExecutionEngineManager::new(
         inclusion_prover.clone(),
         exec_key_manager,
@@ -1844,6 +1851,7 @@ pub fn build_tier2_archive_rig_with_key_manager(
         exec_stubs.decaf_constructor,
         exec_stubs.circuit_compiler,
         exec_stubs.clock_store,
+        exec_hg_resolver,
         /* include_global */ true,
     ));
     // Wire frame-header deps so `invoke_frame_header` actually
@@ -1854,12 +1862,15 @@ pub fn build_tier2_archive_rig_with_key_manager(
         Arc::new(quil_engine::OptRewardIssuance);
     let bls_for_intrinsic: Arc<dyn quil_types::crypto::BlsConstructor> =
         Arc::new(quil_crypto::Bls48581KeyConstructor);
+    let frame_prover_for_intrinsic: Arc<dyn quil_types::crypto::FrameProver> =
+        Arc::new(StubFrameProver);
     exec_manager
         .install_global_frame_header_deps(
             prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
             reward_issuer_for_intrinsic,
             bls_for_intrinsic,
             inclusion_prover.clone(),
+            frame_prover_for_intrinsic,
         )
         .expect("install_global_frame_header_deps");
 
