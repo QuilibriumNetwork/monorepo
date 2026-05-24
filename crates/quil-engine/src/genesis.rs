@@ -847,7 +847,8 @@ pub fn resolve_testnet_prover_keys(
     local_bls_pubkey: &[u8],
 ) -> Result<Vec<Vec<u8>>> {
     if network != 99 && !genesis_seed.is_empty() {
-        let seed_bytes = hex::decode(genesis_seed).map_err(|e| {
+        let stripped: String = genesis_seed.split_whitespace().collect();
+        let seed_bytes = hex::decode(&stripped).map_err(|e| {
             QuilError::Internal(format!("failed to decode genesis seed hex: {}", e))
         })?;
         if seed_bytes.len() % 585 != 0 {
@@ -1468,6 +1469,46 @@ mod tests {
     fn resolve_testnet_prover_keys_invalid_length() {
         let bad_seed = hex::encode(vec![0xAA; 100]); // not a multiple of 585
         let result = resolve_testnet_prover_keys(1, &bad_seed, &[0xCC; 585]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_strips_embedded_spaces() {
+        // YAML folded scalars (`>` / `>-`) join lines with single spaces.
+        let key_a = vec![0xAAu8; 585];
+        let key_b = vec![0xBBu8; 585];
+        let seed_hex = format!("{} {}", hex::encode(&key_a), hex::encode(&key_b));
+
+        let keys = resolve_testnet_prover_keys(1, &seed_hex, &[0xCC; 585]).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], key_a);
+        assert_eq!(keys[1], key_b);
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_strips_mixed_whitespace() {
+        // Newlines, tabs, and leading/trailing whitespace must all be tolerated.
+        let key_a = vec![0xAAu8; 585];
+        let key_b = vec![0xBBu8; 585];
+        let seed_hex = format!(
+            "  {}\n\t{}\n",
+            hex::encode(&key_a),
+            hex::encode(&key_b),
+        );
+
+        let keys = resolve_testnet_prover_keys(1, &seed_hex, &[0xCC; 585]).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], key_a);
+        assert_eq!(keys[1], key_b);
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_invalid_hex_char_still_errors() {
+        // Non-whitespace garbage should still produce a decode error,
+        // confirming the whitespace strip is not masking other invalid input.
+        let valid = hex::encode(vec![0xAAu8; 585]);
+        let seed_hex = format!("{} ZZ", valid);
+        let result = resolve_testnet_prover_keys(1, &seed_hex, &[0xCC; 585]);
         assert!(result.is_err());
     }
 
