@@ -133,6 +133,15 @@ pub fn verify_code_finalize(
     // 2. State-change domain + address length checks. Each
     //    `state_changes` entry is a nested StateTransition canonical
     //    blob; decode and confirm the field widths match.
+    //
+    //    Also enforce that every state change targets THIS compute
+    //    app's domain. A verified finalize that claims writes into
+    //    other domains (token, global, hypergraph, or some other
+    //    compute app) would let a compute-domain owner mutate state
+    //    outside their own scope. Materialization implicitly routes
+    //    by destination domain, so the practical blast radius is
+    //    small today; this check keeps the verify contract explicit
+    //    so a future materialize refactor can't widen it.
     for (i, sc_bytes) in finalize.state_changes.iter().enumerate() {
         let sc = super::ops::StateTransition::from_canonical_bytes(sc_bytes)
             .map_err(|e| {
@@ -155,6 +164,15 @@ pub fn verify_code_finalize(
                  state change"
                     .into(),
             ));
+        }
+        if sc.domain.as_slice() != compute_app_domain.as_slice() {
+            return Err(QuilError::InvalidArgument(format!(
+                "verify: invalid code finalize: state change {} targets \
+                 domain {} which differs from compute app domain {}",
+                i,
+                hex::encode(&sc.domain),
+                hex::encode(compute_app_domain),
+            )));
         }
     }
 
@@ -646,7 +664,11 @@ mod tests {
         CodeFinalize {
             rendezvous: [0x55u8; 32],
             results: vec![sample_execution_result(b"op-1")],
-            state_changes: vec![sample_state_change([0xAAu8; 32], vec![0xBBu8; 32])],
+            // State change domain must match the compute app domain
+            // used when calling verify_code_finalize below
+            // ([0xDD; 32]). Cross-domain writes are rejected by the
+            // verify path.
+            state_changes: vec![sample_state_change([0xDDu8; 32], vec![0xBBu8; 32])],
             proof_of_execution: vec![0xCCu8; 114], // ed448 sig length
             message_output: vec![],
         }
@@ -681,10 +703,23 @@ mod tests {
     fn finalize_verify_rejects_bad_state_change_address_length() {
         let mut f = sample_finalize();
         // Replace state change with one whose address is not 32 bytes.
-        f.state_changes = vec![sample_state_change([0xAAu8; 32], vec![0xBBu8; 31])];
+        f.state_changes = vec![sample_state_change([0xDDu8; 32], vec![0xBBu8; 31])];
         let domain = [0xDDu8; 32];
         let pk = vec![0xEEu8; 57];
         assert!(verify_code_finalize(&f, &domain, &pk, &AcceptKeyManager).is_err());
+    }
+
+    #[test]
+    fn finalize_verify_rejects_cross_domain_state_change() {
+        // State changes targeting other domains must be rejected.
+        // The signed-finalize would otherwise let a compute-domain
+        // key mutate state in another domain.
+        let mut f = sample_finalize();
+        f.state_changes = vec![sample_state_change([0xAAu8; 32], vec![0xBBu8; 32])];
+        let domain = [0xDDu8; 32];
+        let pk = vec![0xEEu8; 57];
+        let err = verify_code_finalize(&f, &domain, &pk, &AcceptKeyManager).unwrap_err();
+        assert!(format!("{err}").contains("differs from compute app domain"));
     }
 
     #[test]

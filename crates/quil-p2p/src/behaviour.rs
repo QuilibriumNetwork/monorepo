@@ -78,8 +78,16 @@ pub struct BlossomSubBehaviour {
     mesh: HashMap<Vec<u8>, HashSet<PeerId>>,
     /// Pending events to emit.
     events: VecDeque<ToSwarm<BlossomSubEvent, HandlerIn>>,
-    /// Seen message IDs (dedup).
-    seen_messages: HashSet<Vec<u8>>,
+    /// Seen message IDs (dedup). LRU so the OLDEST entry evicts on
+    /// insert when full, instead of clearing the whole set. The
+    /// previous `HashSet::clear()` on overflow re-admitted any
+    /// message still propagating in the mesh, causing each receiver
+    /// to re-forward to its D mesh peers and burning bandwidth.
+    seen_messages: lru::LruCache<Vec<u8>, ()>,
+    /// Per-peer record of which message IDs that peer has announced
+    /// `IDONTWANT` for. We skip forwarding those messages to them.
+    /// Bounded per-peer LRU to cap memory under adversarial input.
+    peer_idontwant: HashMap<PeerId, lru::LruCache<Vec<u8>, ()>>,
     /// Message cache for IHAVE/IWANT.
     mcache: crate::blossomsub::MessageCache,
     /// Last heartbeat.
@@ -163,7 +171,16 @@ impl BlossomSubBehaviour {
             connected_peers: HashMap::new(),
             mesh: HashMap::new(),
             events: VecDeque::new(),
-            seen_messages: HashSet::new(),
+            // Capacity sized to comfortably cover a full mcache window
+            // worth of distinct messages at peak rate without forcing
+            // eviction. Go's pubsub uses time-based eviction; the LRU
+            // size here is the rough equivalent for a steady-state
+            // dedup horizon. 10k entries ≈ a few minutes of traffic at
+            // typical message rates and keeps memory bounded.
+            seen_messages: lru::LruCache::new(
+                std::num::NonZeroUsize::new(10_000).unwrap(),
+            ),
+            peer_idontwant: HashMap::new(),
             mcache: crate::blossomsub::MessageCache::new(
                 mcache_len,
                 mcache_gossip,
@@ -272,9 +289,14 @@ impl BlossomSubBehaviour {
 
         let msg_id = crate::node::message_id(&data);
 
-        if !self.seen_messages.insert(msg_id.clone()) {
+        // `LruCache::put` returns `Some(old_value)` when overwriting
+        // an existing key — for dedup we treat "already present" as
+        // "skip". `peek` is a non-promoting read; `put` promotes on
+        // insert.
+        if self.seen_messages.contains(&msg_id) {
             return Ok(());
         }
+        self.seen_messages.put(msg_id.clone(), ());
 
         // Build the protobuf message with signing fields.
         // BlossomSub StrictSign requires: from, seqno, signature, key.
@@ -448,9 +470,10 @@ impl BlossomSubBehaviour {
                 subbed = is_subbed,
                 "received published message"
             );
-            if !self.seen_messages.insert(msg_id.clone()) {
+            if self.seen_messages.contains(&msg_id) {
                 continue; // Dedup
             }
+            self.seen_messages.put(msg_id.clone(), ());
             // Message arrived — clear any pending IWANT for it so
             // the heartbeat doesn't retry uselessly.
             self.pending_iwants.remove(&msg_id);
@@ -495,13 +518,28 @@ impl BlossomSubBehaviour {
                 ));
             }
 
-            // Forward to mesh peers (excluding source)
-            if let Some(mesh_peers) = self.mesh.get(&msg.bitmask) {
+            // Forward to mesh peers (excluding source and peers that
+            // have announced IDONTWANT for this message id).
+            let msg_size = msg.data.len();
+            let msg_bitmask = msg.bitmask.clone();
+            if let Some(mesh_peers) = self.mesh.get(&msg_bitmask) {
                 let forward_rpc = protocol::publish_rpc(vec![msg]);
                 let encoded = protocol::encode_rpc(&forward_rpc);
+                let idontwant_peers: Vec<PeerId> = mesh_peers
+                    .iter()
+                    .filter(|p| **p != peer)
+                    .filter(|p| {
+                        self.peer_idontwant
+                            .get(p)
+                            .map(|c| c.contains(&msg_id))
+                            .unwrap_or(false)
+                    })
+                    .copied()
+                    .collect();
                 let targets: Vec<(PeerId, ConnectionId)> = mesh_peers
                     .iter()
                     .filter(|p| **p != peer)
+                    .filter(|p| !idontwant_peers.contains(p))
                     .filter_map(|p| {
                         self.connected_peers
                             .get(p)
@@ -509,6 +547,13 @@ impl BlossomSubBehaviour {
                             .map(|c| (*p, *c))
                     })
                     .collect();
+                if !idontwant_peers.is_empty() {
+                    tracing::trace!(
+                        bitmask = hex::encode(&msg_bitmask),
+                        skipped = idontwant_peers.len(),
+                        "suppressed forward to IDONTWANT peers",
+                    );
+                }
                 for (target, conn) in targets {
                     self.events.push_back(ToSwarm::NotifyHandler {
                         peer_id: target,
@@ -517,6 +562,51 @@ impl BlossomSubBehaviour {
                             rpc_data: encoded.clone(),
                         },
                     });
+                }
+
+                // Announce IDONTWANT to remaining mesh peers (other
+                // than the source we just received from) for large
+                // messages, so future copies on the gossip / IHAVE
+                // path don't get re-pushed to us. Per BlossomSub
+                // 2.0+: only emit when payload size exceeds the
+                // configured threshold — small messages don't
+                // benefit from the round-trip avoidance.
+                if msg_size >= self.params.idont_want_message_threshold {
+                    let idontwant_targets: Vec<(PeerId, ConnectionId)> = mesh_peers
+                        .iter()
+                        .filter(|p| **p != peer)
+                        .filter_map(|p| {
+                            self.connected_peers
+                                .get(p)
+                                .and_then(|c| c.first())
+                                .map(|c| (*p, *c))
+                        })
+                        .collect();
+                    if !idontwant_targets.is_empty() {
+                        let idontwant_rpc = pb::Rpc {
+                            subscriptions: Vec::new(),
+                            publish: Vec::new(),
+                            control: Some(pb::ControlMessage {
+                                ihave: Vec::new(),
+                                iwant: Vec::new(),
+                                graft: Vec::new(),
+                                prune: Vec::new(),
+                                idontwant: vec![pb::ControlIDontWant {
+                                    message_i_ds: vec![msg_id.clone()],
+                                }],
+                            }),
+                        };
+                        let encoded_idontwant = protocol::encode_rpc(&idontwant_rpc);
+                        for (target, conn) in idontwant_targets {
+                            self.events.push_back(ToSwarm::NotifyHandler {
+                                peer_id: target,
+                                handler: NotifyHandler::Any,
+                                event: HandlerIn {
+                                    rpc_data: encoded_idontwant.clone(),
+                                },
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -807,6 +897,31 @@ impl BlossomSubBehaviour {
                             handler: NotifyHandler::Any,
                             event: HandlerIn { rpc_data: encoded },
                         });
+                    }
+                }
+            }
+
+            // Track inbound IDONTWANTs so we skip forwarding the
+            // listed message IDs to this peer on subsequent receive
+            // paths. Per-peer LRU bounded to the configured max
+            // IDONTWANT message count so a malicious peer can't blow
+            // out memory by enumerating message IDs.
+            if !control.idontwant.is_empty() {
+                let cap = self
+                    .params
+                    .max_idont_want_messages
+                    .max(1);
+                let cache = self
+                    .peer_idontwant
+                    .entry(peer)
+                    .or_insert_with(|| {
+                        lru::LruCache::new(
+                            std::num::NonZeroUsize::new(cap).unwrap(),
+                        )
+                    });
+                for idw in &control.idontwant {
+                    for msg_id in &idw.message_i_ds {
+                        cache.put(msg_id.clone(), ());
                     }
                 }
             }
@@ -1123,11 +1238,11 @@ impl BlossomSubBehaviour {
             }
         }
 
-        // 1. Shift message cache (expire old entries)
+        // 1. Shift message cache (expire old entries). `seen_messages`
+        // is an LRU bounded at construction; no clear() needed —
+        // overflow evicts the oldest entry per insert, preserving
+        // dedup for messages still propagating in the mesh.
         self.mcache.shift();
-        if self.seen_messages.len() > 10_000 {
-            self.seen_messages.clear();
-        }
 
         // 2. Expire stale backoffs
         let now = Instant::now();
@@ -1520,6 +1635,7 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                     if conns.is_empty() {
                         self.connected_peers.remove(&e.peer_id);
                         self.peer_subscriptions.remove(&e.peer_id);
+                        self.peer_idontwant.remove(&e.peer_id);
                         for mesh in self.mesh.values_mut() {
                             mesh.remove(&e.peer_id);
                         }

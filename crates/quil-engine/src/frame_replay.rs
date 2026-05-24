@@ -80,14 +80,38 @@ pub fn replay_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quil_hypergraph::testing::MemStore;
+    use quil_types::crypto::InclusionProver;
     use std::sync::Arc;
+
+    fn build_exec_manager() -> quil_execution::ExecutionEngineManager {
+        let inclusion_prover: Arc<dyn InclusionProver> =
+            Arc::new(quil_crypto::KzgInclusionProver);
+        let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
+            Arc::new(MemStore::new());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg_store,
+            inclusion_prover.clone(),
+        ));
+        let stubs = quil_execution::testing::NoopExecutionCrypto::new();
+        let hg_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
+        quil_execution::ExecutionEngineManager::new(
+            inclusion_prover,
+            stubs.key_manager.clone(),
+            crdt,
+            stubs.bulletproof_prover,
+            stubs.decaf_constructor,
+            stubs.circuit_compiler,
+            stubs.clock_store,
+            hg_resolver,
+            true,
+        )
+    }
 
     #[test]
     fn replay_empty_frames() {
-        let exec = quil_execution::ExecutionEngineManager::new(
-            Arc::new(quil_crypto::KzgInclusionProver),
-            true,
-        );
+        let exec = build_exec_manager();
         let result = replay_frames(&exec, &[], &BigInt::from(1));
         assert_eq!(result.frames_replayed, 0);
         assert_eq!(result.errors, 0);
@@ -95,10 +119,7 @@ mod tests {
 
     #[test]
     fn replay_frame_without_messages() {
-        let exec = quil_execution::ExecutionEngineManager::new(
-            Arc::new(quil_crypto::KzgInclusionProver),
-            true,
-        );
+        let exec = build_exec_manager();
         let frame = GlobalFrame {
             header: Some(quil_types::proto::global::GlobalFrameHeader {
                 frame_number: 1,

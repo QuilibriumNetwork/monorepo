@@ -92,6 +92,22 @@ pub trait ClockStore: Send + Sync {
         frame_number: u64,
         selector: &[u8],
     ) -> Result<proto::global::GlobalFrame>;
+    /// Returns up to `limit` candidate frames in
+    /// `[min_frame_number, max_frame_number]` (any selector). Used as
+    /// a fallback when the certified frame isn't available — mirrors
+    /// Go's `RangeGlobalClockFrameCandidates` at
+    /// `clock_store.go:RangeGlobalClockFrameCandidates`. Default
+    /// implementation returns an empty vec for backends that don't
+    /// store candidates; kick-verify treats that as "no fallback
+    /// available" and surfaces the certified-fetch error.
+    fn range_global_clock_frame_candidates(
+        &self,
+        _min_frame_number: u64,
+        _max_frame_number: u64,
+        _limit: usize,
+    ) -> Result<Vec<proto::global::GlobalFrame>> {
+        Ok(Vec::new())
+    }
     fn delete_global_clock_frame_range(
         &self,
         min_frame: u64,

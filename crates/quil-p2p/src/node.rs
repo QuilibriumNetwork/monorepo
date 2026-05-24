@@ -38,6 +38,21 @@ pub struct P2PNode {
     /// history length / IWANT follow-up timeout from `P2PConfig`
     /// without a rebuild.
     blossomsub_params: crate::BlossomsubParams,
+    /// Optional pubsub signing identity, distinct from the libp2p
+    /// host `keypair`. When set, pubsub messages are signed with this
+    /// keypair and `msg.from` carries its derived peer ID; the host
+    /// itself still uses `keypair` for connection-level identity.
+    ///
+    /// Standalone worker processes set this to the real prover key
+    /// while using a deterministic synthetic key for `keypair` (see
+    /// [`Self::new_for_worker`]). When `None`, pubsub signs with the
+    /// host's own keypair (the master / single-node default).
+    pubsub_signing_keypair: Option<Keypair>,
+    /// Pubsub `from` peer ID. Mirrors `pubsub_signing_keypair`: when
+    /// that field is set, this is the peer ID derived from the
+    /// signing keypair's public key. `None` falls back to the host's
+    /// own peer ID.
+    pubsub_from_peer_id: Option<PeerId>,
 }
 
 impl P2PNode {
@@ -144,7 +159,114 @@ impl P2PNode {
             network: config.network,
             generated_key_hex,
             blossomsub_params: crate::BlossomsubParams::from_p2p_config(config),
+            pubsub_signing_keypair: None,
+            pubsub_from_peer_id: None,
         })
+    }
+
+    /// Construct a P2P node for a standalone worker process.
+    ///
+    /// The libp2p host identity (used for connections + peer store)
+    /// is a deterministic synthetic Ed448 key derived from the real
+    /// prover key and `core_id` (mirrors `node/p2p/blossomsub.go:477-496`).
+    /// This avoids peer-id collisions between the master and its
+    /// workers all running off the same prover key.
+    ///
+    /// Pubsub messages are signed with the REAL prover key and carry
+    /// the real prover's peer ID in `msg.from`, so peers attribute
+    /// messages to the node regardless of which worker emitted them.
+    pub fn new_for_worker(
+        p2p: &P2PConfig,
+        core_id: u32,
+    ) -> quil_types::error::Result<Self> {
+        if p2p.peer_priv_key.is_empty() {
+            return Err(QuilError::P2p(
+                "worker p2p requires p2p.peerPrivKey to be set".into(),
+            ));
+        }
+        // Real prover key: parse the same hex blob the master uses.
+        let real_bytes = hex::decode(&p2p.peer_priv_key)
+            .map_err(|e| QuilError::P2p(format!("invalid peer_priv_key hex: {}", e)))?;
+        let real_seed: [u8; 57] = match real_bytes.len() {
+            114 => {
+                let mut s = [0u8; 57];
+                s.copy_from_slice(&real_bytes[..57]);
+                s
+            }
+            57 => {
+                let mut s = [0u8; 57];
+                s.copy_from_slice(&real_bytes);
+                s
+            }
+            n => {
+                return Err(QuilError::P2p(format!(
+                    "worker p2p: peer_priv_key must be 57 or 114 bytes, got {}",
+                    n
+                )));
+            }
+        };
+        let real_keypair = Keypair::ed448_from_bytes(&real_seed)
+            .map_err(|e| QuilError::P2p(format!("real ed448 key: {}", e)))?;
+        let real_peer_id = real_keypair.public().to_peer_id();
+
+        // Synthetic worker key for host identity.
+        let worker_identity =
+            crate::ed448_identity::derive_worker_identity(&real_seed, core_id)?;
+        let mut worker_seed = [0u8; 57];
+        worker_seed.copy_from_slice(&worker_identity.private_key);
+        let worker_keypair = Keypair::ed448_from_bytes(&worker_seed)
+            .map_err(|e| QuilError::P2p(format!("worker ed448 key: {}", e)))?;
+        let worker_peer_id = worker_keypair.public().to_peer_id();
+
+        tracing::info!(
+            core_id,
+            worker_peer_id = %worker_peer_id,
+            real_peer_id = %real_peer_id,
+            "derived worker p2p identity (synthetic host, real signing)"
+        );
+
+        // Reuse the master's bootstrap-peer parsing logic by calling
+        // `new_with_options` first, then swap in the worker-specific
+        // identity + signing config.
+        let mut base = Self::new_with_options(p2p, false)?;
+        base.keypair = worker_keypair;
+        base.peer_id = worker_peer_id;
+        base.pubsub_signing_keypair = Some(real_keypair);
+        base.pubsub_from_peer_id = Some(real_peer_id);
+        Ok(base)
+    }
+
+    /// Compute a standalone worker's libp2p listen address. Prefers an
+    /// explicit per-worker entry from `data_worker_p2p_multiaddrs`,
+    /// falls back to formatting `data_worker_base_listen_multiaddr`
+    /// with `data_worker_base_p2p_port + core_id - 1`.
+    pub fn worker_listen_multiaddr(
+        engine: &quil_config::EngineConfig,
+        core_id: u32,
+    ) -> quil_types::error::Result<String> {
+        let idx = core_id.saturating_sub(1) as usize;
+        if idx < engine.data_worker_p2p_multiaddrs.len() {
+            let m = &engine.data_worker_p2p_multiaddrs[idx];
+            if !m.is_empty() {
+                return Ok(m.clone());
+            }
+        }
+        if engine.data_worker_base_p2p_port > 0 {
+            let port = engine
+                .data_worker_base_p2p_port
+                .saturating_add(core_id.saturating_sub(1) as u16);
+            if engine.data_worker_base_listen_multiaddr.contains("%d") {
+                return Ok(engine
+                    .data_worker_base_listen_multiaddr
+                    .replace("%d", &port.to_string()));
+            }
+        }
+        Err(QuilError::P2p(format!(
+            "worker p2p listen address unresolvable for core_id {}: \
+             neither data_worker_p2p_multiaddrs[{}] nor \
+             data_worker_base_p2p_port is configured",
+            core_id, idx,
+        )))
     }
 
     /// Start the P2P swarm.
@@ -158,6 +280,8 @@ impl P2PNode {
 
         let network = self.network;
         let blossomsub_params = self.blossomsub_params.clone();
+        let pubsub_signing_keypair = self.pubsub_signing_keypair.clone();
+        let pubsub_from_peer_id = self.pubsub_from_peer_id;
 
         // yamux multiplexer configured with a higher per-connection
         // stream cap and a 30-second window timeout. Default
@@ -226,8 +350,18 @@ impl P2PNode {
                     BlossomSubBehaviour::with_params(network, blossomsub_params.clone());
                 // Set signing identity so published messages pass Go's
                 // StrictSign verification (WithStrictSignatureVerification(true)).
-                let local_peer_id = key.public().to_peer_id();
-                blossomsub.set_signing_identity(local_peer_id, key.clone());
+                // Pubsub signing identity. Workers use the REAL
+                // prover key here so `msg.from` carries the prover's
+                // peer ID; the libp2p host (`key`) is the synthetic
+                // worker key for connection-level identity.
+                let (sign_peer_id, sign_key) = match (
+                    pubsub_from_peer_id,
+                    pubsub_signing_keypair.clone(),
+                ) {
+                    (Some(pid), Some(kp)) => (pid, kp),
+                    _ => (key.public().to_peer_id(), key.clone()),
+                };
+                blossomsub.set_signing_identity(sign_peer_id, sign_key);
                 // Pre-subscribe to global bitmasks so subscription RPCs
                 // are sent as soon as peers connect (before command channel)
                 blossomsub.subscribe(vec![0x00]);                   // GLOBAL_CONSENSUS

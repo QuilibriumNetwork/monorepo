@@ -69,9 +69,22 @@ pub fn read_lp(buf: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
 }
 
 /// Read an array of length-prefixed byte slices.
+///
+/// The element count is read as a u32 from the wire, which is then
+/// used as `Vec::with_capacity(n)`. A malicious sender specifying
+/// `n = 0xFFFFFFFF` would otherwise trigger a multi-gigabyte
+/// allocation before the per-element bounds check fires. Cap the
+/// pre-allocation against `(buf.len() - cursor) / MIN_ENTRY_BYTES`:
+/// each entry carries at least its own 4-byte length prefix, so the
+/// remaining buffer can hold at most that many entries. We then use
+/// `with_capacity(min(n, ceiling))` — the loop still iterates n times
+/// and read_lp's bounds check will fail before we exceed the buffer.
 pub fn read_array(buf: &[u8], cursor: &mut usize) -> Result<Vec<Vec<u8>>> {
     let n = read_u32(buf, cursor)? as usize;
-    let mut out = Vec::with_capacity(n);
+    const MIN_ENTRY_BYTES: usize = 4; // one u32 length prefix per entry
+    let max_possible = buf.len().saturating_sub(*cursor) / MIN_ENTRY_BYTES;
+    let alloc_hint = n.min(max_possible);
+    let mut out = Vec::with_capacity(alloc_hint);
     for _ in 0..n {
         out.push(read_lp(buf, cursor)?);
     }

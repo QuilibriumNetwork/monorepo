@@ -14,39 +14,33 @@ use crate::engines::*;
 /// appropriate engine based on domain address.
 pub struct ExecutionEngineManager {
     engines: RwLock<HashMap<String, Box<dyn ShardExecutionEngine>>>,
-    /// Shared CRDT used by the global/token/hypergraph engines (when
-    /// constructed with `new_with_crypto`). Held here so callers can
-    /// trigger a frame-keyed `commit` after processing all bundles —
-    /// this is what flushes the in-memory phase trees to the on-disk
-    /// hypergraph store, making new vertices visible to
-    /// `prover_registry::refresh_from_store` and to peer HyperSync.
-    crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Shared CRDT used by the global/token/hypergraph engines. Held
+    /// here so callers can trigger a frame-keyed `commit` after
+    /// processing all bundles — this is what flushes the in-memory
+    /// phase trees to the on-disk hypergraph store, making new
+    /// vertices visible to `prover_registry::refresh_from_store` and
+    /// to peer HyperSync.
+    crdt: Arc<quil_hypergraph::HypergraphCrdt>,
 }
 
 impl ExecutionEngineManager {
-    /// Build a manager with all engines initialized.
+    /// Build a manager with all engines initialized. Every engine is
+    /// constructed with mandatory crypto + store providers — no silent
+    /// crypto-less fallback. Production callers MUST supply real
+    /// implementations; tests can wire noop stubs from
+    /// `crate::testing::NoopExecutionCrypto`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        inclusion_prover: Arc<dyn InclusionProver>,
-        include_global: bool,
-    ) -> Self {
-        let mut engines: HashMap<String, Box<dyn ShardExecutionEngine>> = HashMap::new();
-
-        if include_global {
-            engines.insert(
-                "global".into(),
-                Box::new(GlobalExecutionEngine::new(inclusion_prover.clone())),
-            );
-        }
-
-        Self::build(engines, inclusion_prover, include_global, None)
-    }
-
-    /// Create with full dependencies for real signature verification
-    /// and state materialization on all engines.
-    pub fn new_with_crypto(
         inclusion_prover: Arc<dyn InclusionProver>,
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver>,
+        decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor>,
+        circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
+        clock_store: Arc<dyn quil_types::store::ClockStore>,
+        hypergraph_config_resolver: Arc<
+            dyn crate::hypergraph_intrinsic::HypergraphConfigResolver,
+        >,
         include_global: bool,
     ) -> Self {
         let mut engines: HashMap<String, Box<dyn ShardExecutionEngine>> = HashMap::new();
@@ -56,47 +50,56 @@ impl ExecutionEngineManager {
                 "global".into(),
                 Box::new(GlobalExecutionEngine::new_with_intrinsic(
                     inclusion_prover.clone(),
-                    key_manager,
+                    key_manager.clone(),
                     crdt.clone(),
                 )),
             );
         }
 
-        Self::build_with_crdt(engines, inclusion_prover, crdt, include_global)
-    }
+        let mode = if include_global {
+            ExecutionMode::Global
+        } else {
+            ExecutionMode::Application
+        };
 
-    fn build(
-        mut engines: HashMap<String, Box<dyn ShardExecutionEngine>>,
-        _inclusion_prover: Arc<dyn InclusionProver>,
-        include_global: bool,
-        crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
-    ) -> Self {
-        let mode = if include_global { ExecutionMode::Global } else { ExecutionMode::Application };
+        engines.insert(
+            "token".into(),
+            Box::new(TokenExecutionEngine::new_with_state(
+                mode,
+                inclusion_prover.clone(),
+                crdt.clone(),
+                bulletproof_prover.clone(),
+                decaf_constructor,
+                key_manager.clone(),
+                clock_store,
+            )),
+        );
+        engines.insert(
+            "compute".into(),
+            Box::new(ComputeExecutionEngine::new_with_state(
+                mode,
+                crdt.clone(),
+                bulletproof_prover,
+                key_manager.clone(),
+                circuit_compiler,
+            )),
+        );
+        engines.insert(
+            "hypergraph".into(),
+            Box::new(
+                HypergraphExecutionEngine::new_with_state(
+                    mode,
+                    crdt.clone(),
+                    hypergraph_config_resolver,
+                )
+                .with_key_manager(key_manager),
+            ),
+        );
 
-        engines.insert("token".into(), Box::new(TokenExecutionEngine::new(mode)));
-        engines.insert("compute".into(), Box::new(ComputeExecutionEngine::new(mode)));
-        engines.insert("hypergraph".into(), Box::new(HypergraphExecutionEngine::new(mode)));
-
-        Self { engines: RwLock::new(engines), crdt }
-    }
-
-    fn build_with_crdt(
-        mut engines: HashMap<String, Box<dyn ShardExecutionEngine>>,
-        inclusion_prover: Arc<dyn InclusionProver>,
-        crdt: Arc<quil_hypergraph::HypergraphCrdt>,
-        include_global: bool,
-    ) -> Self {
-        let mode = if include_global { ExecutionMode::Global } else { ExecutionMode::Application };
-
-        engines.insert("token".into(), Box::new(TokenExecutionEngine::new_with_state(
-            mode, inclusion_prover.clone(), crdt.clone(),
-        )));
-        engines.insert("compute".into(), Box::new(ComputeExecutionEngine::new(mode)));
-        engines.insert("hypergraph".into(), Box::new(HypergraphExecutionEngine::new_with_state(
-            mode, crdt.clone(),
-        )));
-
-        Self { engines: RwLock::new(engines), crdt: Some(crdt) }
+        Self {
+            engines: RwLock::new(engines),
+            crdt,
+        }
     }
 
     /// Persist the in-memory hypergraph phase trees for the given
@@ -107,9 +110,7 @@ impl ExecutionEngineManager {
     /// frame's trees, so new vertices stay invisible to the prover
     /// registry refresh and to peer HyperSync.
     pub fn commit_frame(&self, frame_number: u64) -> Result<()> {
-        if let Some(ref crdt) = self.crdt {
-            crdt.commit(frame_number)?;
-        }
+        self.crdt.commit(frame_number)?;
         Ok(())
     }
 
@@ -276,10 +277,31 @@ impl ExecutionEngineManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quil_hypergraph::testing::MemStore;
     use quil_types::crypto::NoopInclusionProver;
 
     fn build_manager(include_global: bool) -> ExecutionEngineManager {
-        ExecutionEngineManager::new(Arc::new(NoopInclusionProver), include_global)
+        let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
+        let mem_store: Arc<dyn quil_types::store::HypergraphStore> =
+            Arc::new(MemStore::new());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            mem_store,
+            inclusion_prover.clone(),
+        ));
+        let stubs = crate::testing::NoopExecutionCrypto::new();
+        let hg_resolver: Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver> =
+            Arc::new(crate::testing::NoopHypergraphConfigResolver);
+        ExecutionEngineManager::new(
+            inclusion_prover,
+            stubs.key_manager.clone(),
+            crdt,
+            stubs.bulletproof_prover,
+            stubs.decaf_constructor,
+            stubs.circuit_compiler,
+            stubs.clock_store,
+            hg_resolver,
+            include_global,
+        )
     }
 
     // =================================================================

@@ -28,7 +28,7 @@ quil-hypergraph = { path = "../quil-hypergraph" }
 quil-keys = { path = "../quil-keys" }
 quil-p2p = { path = "../quil-p2p" }
 quil-consensus = { path = "../quil-consensus" }
-quil-execution = { path = "../quil-execution" }
+quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-engine = { path = "../quil-engine" }
 quil-rpc = { path = "../quil-rpc" }
 quil-tries = { path = "../quil-tries" }

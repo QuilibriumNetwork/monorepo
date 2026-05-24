@@ -663,6 +663,90 @@ pub fn decode_and_validate_update(input: &[u8]) -> Result<DispatchedUpdate> {
     Ok(DispatchedUpdate { update })
 }
 
+/// RDF schema evolution validator. Mirrors Go
+/// `HypergraphIntrinsic.validateRDFSchemaUpdate` at
+/// `hypergraph_intrinsic.go:300-346`. Rejects any update whose new
+/// schema removes a class, removes a field from an existing class, or
+/// changes a field's order/size/rdf_type/range_class. Adding new
+/// classes or new fields to existing classes is allowed.
+///
+/// Both inputs are raw Turtle bytes; the parser is the same one used
+/// at deploy time. Returns Err on any divergence; Ok(()) means the
+/// new schema is a strict superset of the old.
+pub fn validate_rdf_schema_evolution(old_schema: &[u8], new_schema: &[u8]) -> Result<()> {
+    if old_schema.is_empty() {
+        // No prior schema → any new schema is permitted (deploy-style
+        // first update). Matches Go's behaviour at
+        // `hypergraph_intrinsic.go:612` where the check only runs
+        // when `existingRDFSchema != ""`.
+        return Ok(());
+    }
+    let old_text = std::str::from_utf8(old_schema).map_err(|_| {
+        QuilError::InvalidArgument(
+            "hypergraph update: prior RDF schema is not valid UTF-8".into(),
+        )
+    })?;
+    let new_text = std::str::from_utf8(new_schema).map_err(|_| {
+        QuilError::InvalidArgument(
+            "hypergraph update: new RDF schema is not valid UTF-8".into(),
+        )
+    })?;
+    let old_parsed = crate::turtle::parse_turtle_schema(old_text).map_err(|e| {
+        QuilError::InvalidArgument(format!(
+            "hypergraph update: prior schema failed Turtle parse: {e}"
+        ))
+    })?;
+    let new_parsed = crate::turtle::parse_turtle_schema(new_text).map_err(|e| {
+        QuilError::InvalidArgument(format!(
+            "hypergraph update: new schema failed Turtle parse: {e}"
+        ))
+    })?;
+    for (class_name, old_class) in &old_parsed.classes {
+        let new_class = new_parsed.classes.get(class_name).ok_or_else(|| {
+            QuilError::InvalidArgument(format!(
+                "hypergraph update: class '{class_name}' was removed"
+            ))
+        })?;
+        for (field_name, old_field) in &old_class.fields {
+            let new_field = new_class.fields.get(field_name).ok_or_else(|| {
+                QuilError::InvalidArgument(format!(
+                    "hypergraph update: field '{field_name}' was removed from \
+                     class '{class_name}'"
+                ))
+            })?;
+            if old_field.order != new_field.order {
+                return Err(QuilError::InvalidArgument(format!(
+                    "hypergraph update: field '{class_name}.{field_name}' \
+                     order changed from {} to {}",
+                    old_field.order, new_field.order,
+                )));
+            }
+            if old_field.size != new_field.size {
+                return Err(QuilError::InvalidArgument(format!(
+                    "hypergraph update: field '{class_name}.{field_name}' \
+                     size changed from {} to {}",
+                    old_field.size, new_field.size,
+                )));
+            }
+            if old_field.rdf_type != new_field.rdf_type {
+                return Err(QuilError::InvalidArgument(format!(
+                    "hypergraph update: field '{class_name}.{field_name}' \
+                     rdf_type changed from '{}' to '{}'",
+                    old_field.rdf_type, new_field.rdf_type,
+                )));
+            }
+            if old_field.range_class != new_field.range_class {
+                return Err(QuilError::InvalidArgument(format!(
+                    "hypergraph update: field '{class_name}.{field_name}' \
+                     range_class changed from '{}' to '{}'",
+                    old_field.range_class, new_field.range_class,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Top-level dispatch: try deploy first, then update. Returns `Ok(None)`
 /// when the input isn't a deploy/update message (caller should try
 /// other kinds). Use this from execution engines that may see a mix

@@ -164,6 +164,17 @@ impl GlobalIntrinsic {
     /// structural validation + signature verification (when prover
     /// trees are available).
     ///
+    /// Per-op `frame_number` freshness gating only applies to ops
+    /// whose Go counterpart enforces it: `ProverJoin` (10-frame
+    /// window in `validate_prover_join_structural`) and
+    /// `ProverSeniorityMerge` (10-frame window in
+    /// `verify_prover_seniority_merge`). The other ops
+    /// (Pause/Resume/Confirm/Reject/Update/ShardSplit/Merge) do not
+    /// have per-op replay windows; the frame orchestrator handles
+    /// ordering. ProverConfirm/Reject's 360-720 window is a timing
+    /// constraint relative to JoinFrameNumber, not a freshness gate
+    /// (enforced by `validate_confirm_timing`).
+    ///
     /// `prover_tree` and `allocation_tree` are optional — when `None`,
     /// only structural validation runs (no signature check). The
     /// engine passes these in after loading from the CRDT.
@@ -207,27 +218,115 @@ impl GlobalIntrinsic {
             TYPE_PROVER_LEAVE => {
                 let op = ProverLeave::from_canonical_bytes(input)?;
                 if let Some(pt) = prover_tree {
-                    return verify::verify_prover_leave(
+                    let sig_ok = verify::verify_prover_leave(
                         &op, pt, self.key_manager.as_ref(),
-                    );
+                    )?;
+                    if !sig_ok {
+                        return Ok(false);
+                    }
+                    // Require at least one allocation in the leave's
+                    // filters to be Status=1 (active) before accepting.
+                    // Go enforces this at
+                    // `global_prover_leave.go:395-436`. Without it,
+                    // verify accepts a leave for an already-left
+                    // prover; materialize rejects → consensus split.
+                    if let Some(hg) = self.hypergraph.as_ref() {
+                        let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
+                        let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+                        let pubkey = crate::global_schema::read_field(pt, "prover:Prover", "PublicKey")
+                            .ok_or_else(|| QuilError::InvalidArgument(
+                                "ProverLeave: prover vertex missing PublicKey".into(),
+                            ))?;
+                        verify::verify_prover_leave_has_active_allocation(
+                            &op,
+                            &pubkey,
+                            |addr: &[u8; 32]| -> quil_types::error::Result<Option<quil_tries::VectorCommitmentTree>> {
+                                let blob = hg_state.get(domain, addr, &va_disc)?;
+                                Ok(blob.and_then(|b| if b.is_empty() { None }
+                                    else { Some(crate::prover_registry::rebuild_vertex_tree_from_blob(&b)) }))
+                            },
+                        )?;
+                    }
+                    return Ok(true);
                 }
                 Ok(true)
             }
             TYPE_PROVER_CONFIRM => {
                 let op = ProverConfirm::from_canonical_bytes(input)?;
                 if let Some(pt) = prover_tree {
-                    return verify::verify_prover_confirm(
+                    let sig_ok = verify::verify_prover_confirm(
                         &op, pt, self.key_manager.as_ref(),
-                    );
+                    )?;
+                    if !sig_ok {
+                        return Ok(false);
+                    }
+                    // Timing window enforcement. Mirrors Go
+                    // `global_prover_confirm.go:492-574`. For each
+                    // filter, load the allocation tree and check the
+                    // 360-720 frame window. The check has to run at
+                    // validate time — if it only ran at invoke_step,
+                    // validate would accept a stale confirm that
+                    // materialize then rejects, splitting consensus.
+                    // When the hypergraph CRDT is wired, we look up
+                    // per-filter allocation trees and enforce timing
+                    // here.
+                    if let Some(hg) = self.hypergraph.as_ref() {
+                        let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
+                        let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+                        let pubkey = crate::global_schema::read_field(pt, "prover:Prover", "PublicKey")
+                            .ok_or_else(|| QuilError::InvalidArgument(
+                                "ProverConfirm: prover vertex missing PublicKey".into(),
+                            ))?;
+                        for filter in &op.filters {
+                            let alloc_addr =
+                                super::materialize::allocation_address(&pubkey, filter)?;
+                            let blob = hg_state.get(domain, &alloc_addr, &va_disc)?;
+                            let Some(blob) = blob else { continue };
+                            if blob.is_empty() {
+                                continue;
+                            }
+                            let alloc_tree =
+                                crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+                            verify::validate_confirm_timing(frame_number, &alloc_tree)?;
+                        }
+                    }
+                    return Ok(true);
                 }
                 Ok(true)
             }
             TYPE_PROVER_REJECT => {
                 let op = ProverReject::from_canonical_bytes(input)?;
                 if let Some(pt) = prover_tree {
-                    return verify::verify_prover_reject(
+                    let sig_ok = verify::verify_prover_reject(
                         &op, pt, self.key_manager.as_ref(),
-                    );
+                    )?;
+                    if !sig_ok {
+                        return Ok(false);
+                    }
+                    // Same timing window as confirm. ProverReject
+                    // applies to a single filter (the `op.filter`
+                    // field, not `filters[]`).
+                    if let Some(hg) = self.hypergraph.as_ref() {
+                        let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
+                        let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+                        let pubkey = crate::global_schema::read_field(pt, "prover:Prover", "PublicKey")
+                            .ok_or_else(|| QuilError::InvalidArgument(
+                                "ProverReject: prover vertex missing PublicKey".into(),
+                            ))?;
+                        let alloc_addr =
+                            super::materialize::allocation_address(&pubkey, &op.filter)?;
+                        if let Some(blob) = hg_state.get(domain, &alloc_addr, &va_disc)? {
+                            if !blob.is_empty() {
+                                let alloc_tree =
+                                    crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+                                verify::validate_confirm_timing(frame_number, &alloc_tree)?;
+                            }
+                        }
+                    }
+                    return Ok(true);
                 }
                 Ok(true)
             }
@@ -237,14 +336,87 @@ impl GlobalIntrinsic {
                 // BLS48-581 G1 signature + proof-of-possession + merge
                 // target signatures — mirrors Go's
                 // `ProverJoin.Verify` at `global_prover_join.go:1095-1146`.
-                // VDF multi-proof is a separate call
-                // (`verify_prover_join_vdf`) made once the frame store
-                // lookup resolves `frame_output` + `frame_difficulty`.
-                verify::verify_prover_join_signatures(
+                let sigs_ok = verify::verify_prover_join_signatures(
                     &op,
                     &v,
                     self.key_manager.as_ref(),
                     None, // no live hypergraph here for consumed-merge check
+                )?;
+                if !sigs_ok {
+                    return Ok(false);
+                }
+                // Kicked-prover gate. When the validator caller
+                // supplied an existing prover vertex tree, reject the
+                // join if `KickFrameNumber != 0`. Without this,
+                // validate would accept; materialize would reject;
+                // and consensus would split between nodes that did vs
+                // did not run materialization.
+                if let Some(pt) = prover_tree {
+                    verify::verify_prover_join_not_kicked(pt)?;
+                }
+                // Existing-allocation expiry gate. For each filter
+                // in the join, check the prover's current allocation:
+                // it must be status=4 (left/kicked) OR expired
+                // (>= 720 frames since JoinFrameNumber). Requires a
+                // hypergraph CRDT reference to load per-filter
+                // allocation vertices — when absent, this check is
+                // skipped and the materialize-time fallback catches
+                // it (less ideal — validate/materialize mismatch — but
+                // consistent with how other state lookups in this
+                // dispatcher degrade gracefully).
+                if let Some(hg) = self.hypergraph.as_ref() {
+                    let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
+                    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+                    verify::verify_prover_join_allocations_expired(
+                        &op,
+                        &v.public_key,
+                        frame_number,
+                        |alloc_addr: &[u8; 32]| -> quil_types::error::Result<Option<quil_tries::VectorCommitmentTree>> {
+                            let blob = hg_state.get(domain, alloc_addr, &va_disc)?;
+                            Ok(blob.and_then(|b| {
+                                if b.is_empty() { None }
+                                else { Some(crate::prover_registry::rebuild_vertex_tree_from_blob(&b)) }
+                            }))
+                        },
+                    )?;
+                }
+                // VDF multi-proof chain. Go's `ProverJoin.Verify` runs
+                // this unconditionally — without it, anyone can craft
+                // a ProverJoin with a valid BLS signature but bogus
+                // VDF proof and pass validation. Look up the
+                // referenced frame's output + difficulty from the
+                // clock store; the verify chain is gated on both the
+                // clock store and the frame prover being installed
+                // (mandatory in production but the intrinsic can be
+                // constructed without them in legacy test setups).
+                let frame_prover = self.frame_prover.as_ref().ok_or_else(|| {
+                    QuilError::Internal(
+                        "ProverJoin: frame_prover not installed — cannot verify VDF".into(),
+                    )
+                })?;
+                let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+                    QuilError::Internal(
+                        "ProverJoin: clock_store not installed — cannot look up referenced frame".into(),
+                    )
+                })?;
+                let referenced = clock_store
+                    .get_global_clock_frame(op.frame_number)
+                    .map_err(|e| QuilError::InvalidArgument(format!(
+                        "ProverJoin: referenced frame {} not in clock store: {}",
+                        op.frame_number, e,
+                    )))?;
+                let header = referenced.header.as_ref().ok_or_else(|| {
+                    QuilError::InvalidArgument(
+                        "ProverJoin: referenced frame has no header".into(),
+                    )
+                })?;
+                verify::verify_prover_join_vdf(
+                    &op,
+                    frame_number,
+                    &header.output,
+                    header.difficulty,
+                    frame_prover.as_ref(),
                 )
             }
             TYPE_PROVER_UPDATE => {
@@ -264,18 +436,55 @@ impl GlobalIntrinsic {
             }
             TYPE_SHARD_SPLIT => {
                 let op = super::prover_ops::ShardSplit::from_canonical_bytes(input)?;
-                if let Some(pt) = prover_tree {
-                    return verify::verify_shard_split(&op, pt, self.key_manager.as_ref());
+                // Fail-closed. No prover_tree means we couldn't
+                // resolve the signer's BLS pubkey, so the BLS verify
+                // can't run. Reject rather than accept on faith.
+                let pt = prover_tree.ok_or_else(|| QuilError::InvalidArgument(
+                    "ShardSplit: prover tree unavailable — cannot verify signature".into(),
+                ))?;
+                let sig_ok = verify::verify_shard_split(&op, pt, self.key_manager.as_ref())?;
+                if !sig_ok {
+                    return Ok(false);
                 }
-                // No prover_tree loaded → structural-only; the caller
-                // must load the signer's tree and re-run verify before
-                // accepting. Matches how other signed ops handle this.
+                // Signer must be an active global prover. Mirrors Go
+                // `global_shard_split.go:92-102`.
+                if let Some(hg) = self.hypergraph.as_ref() {
+                    let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
+                    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+                    verify::verify_shard_op_signer_is_active_global(
+                        pt,
+                        |addr: &[u8; 32]| -> quil_types::error::Result<Option<quil_tries::VectorCommitmentTree>> {
+                            let blob = hg_state.get(domain, addr, &va_disc)?;
+                            Ok(blob.and_then(|b| if b.is_empty() { None }
+                                else { Some(crate::prover_registry::rebuild_vertex_tree_from_blob(&b)) }))
+                        },
+                    )?;
+                }
                 Ok(true)
             }
             TYPE_SHARD_MERGE => {
                 let op = super::prover_ops::ShardMerge::from_canonical_bytes(input)?;
-                if let Some(pt) = prover_tree {
-                    return verify::verify_shard_merge(&op, pt, self.key_manager.as_ref());
+                let pt = prover_tree.ok_or_else(|| QuilError::InvalidArgument(
+                    "ShardMerge: prover tree unavailable — cannot verify signature".into(),
+                ))?;
+                let sig_ok = verify::verify_shard_merge(&op, pt, self.key_manager.as_ref())?;
+                if !sig_ok {
+                    return Ok(false);
+                }
+                // Signer must be an active global prover.
+                if let Some(hg) = self.hypergraph.as_ref() {
+                    let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
+                    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+                    verify::verify_shard_op_signer_is_active_global(
+                        pt,
+                        |addr: &[u8; 32]| -> quil_types::error::Result<Option<quil_tries::VectorCommitmentTree>> {
+                            let blob = hg_state.get(domain, addr, &va_disc)?;
+                            Ok(blob.and_then(|b| if b.is_empty() { None }
+                                else { Some(crate::prover_registry::rebuild_vertex_tree_from_blob(&b)) }))
+                        },
+                    )?;
                 }
                 Ok(true)
             }
@@ -283,10 +492,28 @@ impl GlobalIntrinsic {
                 // This is the *outer* `ProverSeniorityMerge` (0x031A),
                 // not the inner `SeniorityMerge` target record (0x0310).
                 let op = super::prover_ops::ProverSeniorityMerge::from_canonical_bytes(input)?;
-                if let Some(pt) = prover_tree {
-                    return verify::verify_prover_seniority_merge(
-                        &op, pt, frame_number, self.key_manager.as_ref(),
-                    );
+                let pt = prover_tree.ok_or_else(|| QuilError::InvalidArgument(
+                    "ProverSeniorityMerge: prover tree unavailable — cannot verify signature".into(),
+                ))?;
+                let sigs_ok = verify::verify_prover_seniority_merge(
+                    &op, pt, frame_number, self.key_manager.as_ref(),
+                )?;
+                if !sigs_ok {
+                    return Ok(false);
+                }
+                // Spent-merge tombstone check. Two provers must not
+                // be able to both pass verify with the same
+                // merge_target — otherwise the target's seniority
+                // would be claimed twice (one prover passes
+                // materialize, the other diverges).
+                if let Some(hg) = self.hypergraph.as_ref() {
+                    let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
+                    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+                    verify::verify_prover_seniority_merge_spent_markers(
+                        &op,
+                        |addr: &[u8; 32]| hg_state.get(domain, addr, &va_disc),
+                    )?;
                 }
                 Ok(true)
             }
@@ -319,6 +546,7 @@ impl GlobalIntrinsic {
                 ) {
                     super::kick_verify::verify_prover_kick_full(
                         &op, frame_number, cs, fp, bls, hg, ip,
+                        self.prover_registry.as_deref(),
                     )?;
                     Ok(true)
                 } else {
@@ -327,18 +555,31 @@ impl GlobalIntrinsic {
             }
             TYPE_FRAME_HEADER => {
                 // FrameHeader op governs `LastActiveFrameNumber`
-                // advancement and per-ring reward issuance. Full
-                // verification requires prover_registry +
-                // frame_prover + bls_constructor; otherwise falls
-                // back to structural-only and the materializer
-                // re-runs the check via `invoke_frame_header`.
+                // advancement and per-ring reward issuance — both are
+                // load-bearing for consensus + reward accounting.
+                // Verification REQUIRES prover_registry + frame_prover
+                // + bls_constructor. Missing any of them is a hard
+                // error (fail-closed), not a soft skip back to
+                // structural-only — a structural-only fall-back
+                // silently accepts forged FrameHeaders.
                 crate::global_engine::peek_global_message_kind(input)?;
                 let op = super::frame_header::FrameHeader::from_canonical_bytes(input)?;
-                if let (Some(pr), Some(fp), Some(bls)) = (
-                    self.prover_registry.as_deref(),
-                    self.frame_prover.as_deref(),
-                    self.bls_constructor.as_deref(),
-                ) {
+                let pr = self.prover_registry.as_deref().ok_or_else(|| {
+                    QuilError::Internal(
+                        "FrameHeader: prover_registry not installed — cannot verify".into(),
+                    )
+                })?;
+                let fp = self.frame_prover.as_deref().ok_or_else(|| {
+                    QuilError::Internal(
+                        "FrameHeader: frame_prover not installed — cannot verify".into(),
+                    )
+                })?;
+                let bls = self.bls_constructor.as_deref().ok_or_else(|| {
+                    QuilError::Internal(
+                        "FrameHeader: bls_constructor not installed — cannot verify".into(),
+                    )
+                })?;
+                {
                     let sig = match op.public_key_signature_bls48581.is_empty() {
                         true => return Err(QuilError::InvalidArgument(
                             "FrameHeader op missing BLS aggregate signature".into(),
@@ -1112,6 +1353,18 @@ impl GlobalIntrinsic {
         }
         let mut prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
 
+        // Defense-in-depth — re-verify the BLS signature against the
+        // prover tree's pubkey before mutating. validate_message
+        // already ran this on the bundle, but a buggy/dropped validate
+        // path shouldn't bypass authority enforcement at materialize.
+        if !verify::verify_prover_seniority_merge(
+            op, &prover_tree, frame_number, self.key_manager.as_ref(),
+        )? {
+            return Err(QuilError::InvalidArgument(
+                "invoke_step seniority_merge: signature verification failed".into(),
+            ));
+        }
+
         // Collect merge target public keys
         let merge_target_pubkeys: Vec<Vec<u8>> = op.merge_targets
             .iter()
@@ -1202,32 +1455,25 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
         _va_disc: &[u8; 32],
     ) -> Result<()> {
-        // Run the full ProverShardUpdate materialize chain when all
-        // deps are installed. Falls back to acknowledge-only when the
-        // dispatcher is configured without prover_registry +
-        // reward_issuance + hypergraph (the consensus engine wires
-        // these via `with_frame_header_deps` + `with_kick_verify_deps`).
-        let (Some(pr), Some(ri), Some(hg)) = (
-            self.prover_registry.as_ref(),
-            self.reward_issuance.as_ref(),
-            self.hypergraph.as_ref(),
-        ) else {
-            return Ok(());
-        };
-
-        // Verify the FrameHeader's three-layer attestation before
-        // materializing: leader VDF + aggregate BLS + per-participant
-        // VDF multi-proofs. Each participant must have contributed
-        // their own VDF proof (PoMW) — without this an archive would
-        // credit shard work on the leader's signature alone.
-        let (Some(fp), Some(bls)) = (
-            self.frame_prover.as_ref(),
-            self.bls_constructor.as_ref(),
-        ) else {
-            return Err(QuilError::InvalidArgument(
-                "invoke_frame_header: missing frame_prover or bls_constructor for attestation verify".into(),
-            ));
-        };
+        // Verify FIRST, materialize SECOND. The attestation check
+        // requires frame_prover + bls_constructor + prover_registry —
+        // these MUST be installed; absence is a fail-closed Err.
+        // Silently acking an unverified FrameHeader would let
+        // a forged frame slip past materialize on any node missing
+        // these deps.
+        //
+        // Materialize-only deps (reward_issuance, hypergraph) are
+        // archive-mode extras: when absent, we skip the state
+        // mutations but only AFTER the attestation has verified.
+        let fp = self.frame_prover.as_ref().ok_or_else(|| QuilError::Internal(
+            "invoke_frame_header: frame_prover not installed — cannot verify attestation".into(),
+        ))?;
+        let bls = self.bls_constructor.as_ref().ok_or_else(|| QuilError::Internal(
+            "invoke_frame_header: bls_constructor not installed — cannot verify attestation".into(),
+        ))?;
+        let pr = self.prover_registry.as_ref().ok_or_else(|| QuilError::Internal(
+            "invoke_frame_header: prover_registry not installed — cannot resolve active provers".into(),
+        ))?;
         let active_provers = pr
             .get_active_provers(&op.address)
             .map_err(|e| QuilError::InvalidArgument(format!(
@@ -1241,6 +1487,15 @@ impl GlobalIntrinsic {
         ).map_err(|e| QuilError::InvalidArgument(format!(
             "invoke_frame_header: frame header attestation invalid: {e}"
         )))?;
+
+        // Now that verification has passed, gate further state writes
+        // on the archive-mode deps.
+        let (Some(ri), Some(hg)) = (
+            self.reward_issuance.as_ref(),
+            self.hypergraph.as_ref(),
+        ) else {
+            return Ok(());
+        };
 
         // Expand bitmask → participant indices (matches Go's
         // GetSetBitIndices). The materialize helper validates each
@@ -1343,9 +1598,36 @@ impl GlobalIntrinsic {
         &self,
         _frame_number: u64,
         op: &super::prover_ops::ShardSplit,
-        _state: &HypergraphState,
-        _va_disc: &[u8; 32],
+        state: &HypergraphState,
+        va_disc: &[u8; 32],
     ) -> Result<()> {
+        // Defense-in-depth — re-verify the BLS signature against the
+        // prover tree's pubkey. validate_message already ran this on
+        // the bundle; this is the second wall.
+        let prover_address = op
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(|s| s.address.clone())
+            .ok_or_else(|| QuilError::InvalidArgument(
+                "invoke_shard_split: missing signature".into(),
+            ))?;
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+        let prover_data = state.get(domain, &prover_address, va_disc)?
+            .ok_or_else(|| QuilError::InvalidArgument(
+                "invoke_shard_split: prover not found".into(),
+            ))?;
+        if prover_data.is_empty() {
+            return Err(QuilError::InvalidArgument(
+                "invoke_shard_split: prover has no data".into(),
+            ));
+        }
+        let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
+        if !verify::verify_shard_split(op, &prover_tree, self.key_manager.as_ref())? {
+            return Err(QuilError::InvalidArgument(
+                "invoke_shard_split: signature verification failed".into(),
+            ));
+        }
+
         let output = materialize::materialize_shard_split(
             &op.shard_address,
             &op.proposed_shards,
@@ -1384,9 +1666,34 @@ impl GlobalIntrinsic {
         &self,
         _frame_number: u64,
         op: &super::prover_ops::ShardMerge,
-        _state: &HypergraphState,
-        _va_disc: &[u8; 32],
+        state: &HypergraphState,
+        va_disc: &[u8; 32],
     ) -> Result<()> {
+        // Defense-in-depth — see invoke_shard_split.
+        let prover_address = op
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(|s| s.address.clone())
+            .ok_or_else(|| QuilError::InvalidArgument(
+                "invoke_shard_merge: missing signature".into(),
+            ))?;
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+        let prover_data = state.get(domain, &prover_address, va_disc)?
+            .ok_or_else(|| QuilError::InvalidArgument(
+                "invoke_shard_merge: prover not found".into(),
+            ))?;
+        if prover_data.is_empty() {
+            return Err(QuilError::InvalidArgument(
+                "invoke_shard_merge: prover has no data".into(),
+            ));
+        }
+        let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
+        if !verify::verify_shard_merge(op, &prover_tree, self.key_manager.as_ref())? {
+            return Err(QuilError::InvalidArgument(
+                "invoke_shard_merge: signature verification failed".into(),
+            ));
+        }
+
         let output = materialize::materialize_shard_merge(
             &op.shard_addresses,
             &op.parent_address,
@@ -1516,7 +1823,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_join_structural() {
+    fn validate_join_without_frame_prover_rejects() {
+        // ProverJoin validation requires the VDF chain. Without a
+        // frame_prover + clock_store installed on the intrinsic,
+        // validate must return Err — accepting joins on structural+BLS
+        // alone would let forged VDF proofs through.
         let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
         let join = crate::global_intrinsic::ProverJoin {
             filters: vec![vec![0x01u8; 32]],
@@ -1534,7 +1845,14 @@ mod tests {
         }
         .to_canonical_bytes()
         .unwrap();
-        assert!(gi.validate(105, &join, None, None).unwrap());
+        let err = gi.validate(105, &join, None, None).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("frame_prover not installed")
+                || msg.contains("clock_store not installed"),
+            "expected fail-closed error about missing deps, got: {}",
+            msg,
+        );
     }
 
     #[test]

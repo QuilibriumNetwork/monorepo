@@ -148,7 +148,17 @@ impl CanonicalMessageBundle {
         expect_tp(read_u32(data, &mut c)?, TYPE_MESSAGE_BUNDLE, "MessageBundle")?;
 
         let num_requests = read_u32(data, &mut c)? as usize;
-        let mut requests = Vec::with_capacity(num_requests);
+        // Cap pre-allocation against the remaining buffer: every
+        // entry consumes at least a 4-byte length prefix, so the
+        // buffer cannot contain more than that many entries. Without
+        // this cap, a malicious peer specifying num_requests =
+        // 0xFFFFFFFF would trigger a ~96GB allocation
+        // (Vec<Option<...>> on 64-bit) before the per-entry bounds
+        // check ever runs.
+        const MIN_ENTRY_BYTES: usize = 4;
+        let max_possible = data.len().saturating_sub(c) / MIN_ENTRY_BYTES;
+        let alloc_hint = num_requests.min(max_possible);
+        let mut requests = Vec::with_capacity(alloc_hint);
         for _ in 0..num_requests {
             let req_len = read_u32(data, &mut c)? as usize;
             if req_len > 0 {

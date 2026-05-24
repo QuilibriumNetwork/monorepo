@@ -8,6 +8,26 @@ use quil_types::error::{QuilError, Result};
 use crate::node::{BranchNode, LeafNode, VectorCommitmentNode};
 use crate::{TYPE_BRANCH, TYPE_LEAF, TYPE_NIL};
 
+/// Maximum legitimate prefix length for a tree node. A vector
+/// commitment tree path is at most 64 nibbles (32-byte addresses,
+/// 4 bits/nibble × 64 = 256 bits). 256 gives generous headroom over
+/// the legitimate max while rejecting deserialization bombs that
+/// would otherwise cause `Vec::with_capacity(u32::MAX)` to attempt a
+/// 16GB allocation.
+const MAX_TREE_PREFIX_LEN: usize = 256;
+
+/// Maximum legitimate length for a length-prefixed field in a node
+/// (leaf value, commitment, size_bytes). 16MB is well over any
+/// realistic field size while still preventing OOM via a crafted
+/// u64 length prefix on untrusted input.
+const MAX_LENGTH_PREFIXED_FIELD: usize = 16 * 1024 * 1024;
+
+/// Maximum recursion depth for nested branches. Tree paths are at
+/// most 64 nibbles, so even pathologically-unbalanced trees can't
+/// exceed 64 in depth via legitimate construction. 128 provides
+/// headroom; deeper inputs are rejected to prevent stack overflow.
+const MAX_DESERIALIZE_DEPTH: usize = 128;
+
 /// Serialize a tree to bytes.
 pub fn serialize_tree(root: Option<&VectorCommitmentNode>) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
@@ -18,7 +38,7 @@ pub fn serialize_tree(root: Option<&VectorCommitmentNode>) -> Result<Vec<u8>> {
 /// Deserialize a tree from bytes.
 pub fn deserialize_tree(data: &[u8]) -> Result<Option<VectorCommitmentNode>> {
     let mut cursor = io::Cursor::new(data);
-    deserialize_node(&mut cursor)
+    deserialize_node_at_depth(&mut cursor, 0)
 }
 
 /// Per-node lazy storage encoding: branch children are NOT included —
@@ -81,6 +101,12 @@ pub fn deserialize_node_solo(data: &[u8]) -> Result<VectorCommitmentNode> {
         }
         TYPE_BRANCH => {
             let prefix_len = read_u32(&mut r)? as usize;
+            if prefix_len > MAX_TREE_PREFIX_LEN {
+                return Err(QuilError::Serialization(format!(
+                    "tree deserialize: prefix length {} exceeds max {}",
+                    prefix_len, MAX_TREE_PREFIX_LEN,
+                )));
+            }
             let mut prefix = Vec::with_capacity(prefix_len);
             for _ in 0..prefix_len {
                 prefix.push(read_i32(&mut r)?);
@@ -176,8 +202,20 @@ fn serialize_node(w: &mut Vec<u8>, node: Option<&VectorCommitmentNode>) -> Resul
     }
 }
 
-/// Deserialize a node from a reader.
-fn deserialize_node<R: Read>(r: &mut R) -> Result<Option<VectorCommitmentNode>> {
+/// Deserialize a node from a reader. The depth counter caps nesting
+/// to prevent stack overflow on a crafted serialized tree (see
+/// `MAX_DESERIALIZE_DEPTH`). External entrypoint `deserialize_tree`
+/// invokes this with depth=0.
+fn deserialize_node_at_depth<R: Read>(
+    r: &mut R,
+    depth: usize,
+) -> Result<Option<VectorCommitmentNode>> {
+    if depth > MAX_DESERIALIZE_DEPTH {
+        return Err(QuilError::Serialization(format!(
+            "tree deserialize: nesting depth exceeded {}",
+            MAX_DESERIALIZE_DEPTH,
+        )));
+    }
     let mut type_byte = [0u8; 1];
     r.read_exact(&mut type_byte)
         .map_err(|e| QuilError::Serialization(e.to_string()))?;
@@ -207,6 +245,12 @@ fn deserialize_node<R: Read>(r: &mut R) -> Result<Option<VectorCommitmentNode>> 
         TYPE_BRANCH => {
             // Prefix
             let prefix_len = read_u32(r)? as usize;
+            if prefix_len > MAX_TREE_PREFIX_LEN {
+                return Err(QuilError::Serialization(format!(
+                    "tree deserialize: prefix length {} exceeds max {}",
+                    prefix_len, MAX_TREE_PREFIX_LEN,
+                )));
+            }
             let mut prefix = Vec::with_capacity(prefix_len);
             for _ in 0..prefix_len {
                 prefix.push(read_i32(r)?);
@@ -216,7 +260,7 @@ fn deserialize_node<R: Read>(r: &mut R) -> Result<Option<VectorCommitmentNode>> 
             let mut children: [Option<Box<VectorCommitmentNode>>; 64] =
                 std::array::from_fn(|_| None);
             for slot in children.iter_mut() {
-                if let Some(child) = deserialize_node(r)? {
+                if let Some(child) = deserialize_node_at_depth(r, depth + 1)? {
                     *slot = Some(Box::new(child));
                 }
             }
@@ -269,6 +313,12 @@ fn write_length_prefixed(w: &mut Vec<u8>, data: &[u8]) -> Result<()> {
 
 fn read_length_prefixed<R: Read>(r: &mut R) -> Result<Vec<u8>> {
     let len = read_u64(r)? as usize;
+    if len > MAX_LENGTH_PREFIXED_FIELD {
+        return Err(QuilError::Serialization(format!(
+            "tree deserialize: length-prefixed field {} exceeds max {}",
+            len, MAX_LENGTH_PREFIXED_FIELD,
+        )));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)
         .map_err(|e| QuilError::Serialization(e.to_string()))?;

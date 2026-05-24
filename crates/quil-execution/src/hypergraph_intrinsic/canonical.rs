@@ -436,6 +436,16 @@ impl HypergraphUpdate {
         }
         Ok(())
     }
+
+    /// Canonical-bytes encoding with `public_key_signature_bls48581`
+    /// cleared. This is the byte sequence the BLS aggregate signature
+    /// covers — Go's `proto.Clone(updatePb).PublicKeySignatureBls48581
+    /// = nil; updateWithoutSignature.ToCanonicalBytes()`.
+    pub fn to_canonical_bytes_without_signature(&self) -> Result<Vec<u8>> {
+        let mut without = self.clone();
+        without.public_key_signature_bls48581 = None;
+        without.to_canonical_bytes()
+    }
 }
 
 // =====================================================================
@@ -757,9 +767,12 @@ mod tests {
 
     #[test]
     fn aggregate_sig_round_trip_multi_signer_sig_size() {
-        // Multi-signer aggregate: base 74 + n*516 bytes for n extra signers.
+        // Multi-signer aggregate wire format: 74 (BLS agg) + 4 (u32
+        // count) + N × 516 (multi-proofs). Diverges from Go's canonical
+        // gate (no count prefix) but matches what `verify_frame_header_signature`
+        // actually consumes — see canonical.rs::from_canonical_bytes.
         let sig = AggregateSignature {
-            signature: vec![0x22u8; 74 + 516 * 3],
+            signature: vec![0x22u8; 78 + 516 * 3],
             public_key: Some(sample_pubkey()),
             bitmask: vec![0xF0],
         };

@@ -39,15 +39,34 @@ use super::{
 /// always invalid).
 pub trait HypergraphConfigResolver: Send + Sync {
     fn write_public_key(&self, domain: &[u8]) -> Option<Vec<u8>>;
+    /// The BLS48-581 G1 owner public key for `domain`, used to verify
+    /// `HypergraphUpdate` signatures. `None` means either the
+    /// deployment isn't known, or no owner key was set at deploy time
+    /// (immutable hypergraph — all updates rejected). Default returns
+    /// `None` so existing test resolvers compile unchanged.
+    fn owner_public_key(&self, _domain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    /// The prior RDF schema bytes for `domain`. Returned for
+    /// `HypergraphUpdate` schema-evolution checks: new schema must be
+    /// a strict superset (no removed classes/fields, no changed
+    /// field metadata). `None` means no prior schema is recorded
+    /// (deploy-style first update — evolution check is skipped).
+    fn prior_rdf_schema(&self, _domain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Outcome of [`verify_op_signature`].
+///
+/// A resolver is mandatory at engine construction. An op against an
+/// unknown hypergraph yields `UnknownDomain` (hard reject) — there is
+/// no soft-fail path. Engines that can't supply a resolver must fail
+/// to construct, not silently admit unverified writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthCheck {
     /// Signature verified against the resolved write key.
     Verified,
-    /// No resolver configured — caller decides whether to allow.
-    NoResolver,
     /// Resolver returned no key for this domain — the deployment is
     /// unknown to this node, op must be rejected.
     UnknownDomain,
@@ -69,12 +88,9 @@ pub enum AuthCheck {
 ///
 /// `commit` is only needed for HyperedgeAdd; pass `None` for other ops.
 pub fn verify_op_signature(
-    resolver: Option<&Arc<dyn HypergraphConfigResolver>>,
+    resolver: &Arc<dyn HypergraphConfigResolver>,
     op: &OpForAuth<'_>,
 ) -> Result<AuthCheck> {
-    let Some(resolver) = resolver else {
-        return Ok(AuthCheck::NoResolver);
-    };
     let domain = op.domain();
     let Some(write_key) = resolver.write_public_key(domain) else {
         return Ok(AuthCheck::UnknownDomain);
@@ -95,6 +111,14 @@ pub fn verify_op_signature(
             &v.signature[..],
         ),
         OpForAuth::HyperedgeAdd { op: h, commit } => {
+            // Hyperedge domain-binding must be enforced BEFORE
+            // signature verification. Mirrors Go
+            // `hypergraph_hyperedge_add.go:161-164`. Without this
+            // check, a valid write-key signature on a payload whose
+            // embedded hyperedgeID points to a different domain
+            // passes verification — a cross-domain unauthorized
+            // write.
+            h.check_domain()?;
             let id = {
                 if h.value.len() < HYPEREDGE_MIN_VALUE_LEN {
                     return Err(QuilError::InvalidArgument(
@@ -112,6 +136,10 @@ pub fn verify_op_signature(
             )
         }
         OpForAuth::HyperedgeRemove(h) => {
+            // Same domain-binding check as HyperedgeAdd. Mirrors Go
+            // `hypergraph_hyperedge_remove.go` domain enforcement
+            // before signature verify.
+            h.check_domain()?;
             if h.value.len() < HYPEREDGE_MIN_VALUE_LEN {
                 return Err(QuilError::InvalidArgument(
                     "hyperedge remove auth: value too short".into(),
@@ -132,6 +160,52 @@ pub fn verify_op_signature(
     signed.extend_from_slice(&message);
 
     if quil_crypto::ed448_verify(&write_key, &signed, signature) {
+        Ok(AuthCheck::Verified)
+    } else {
+        Ok(AuthCheck::Invalid)
+    }
+}
+
+/// Verify the BLS48-581 aggregate signature on a `HypergraphUpdate`
+/// against the owner public key resolved for `domain`. Mirrors Go's
+/// `HypergraphIntrinsic.Deploy` path for the "existing hypergraph,
+/// update path" branch:
+///
+/// ```go
+/// validSig, err := h.keyManager.ValidateSignature(
+///     crypto.KeyTypeBLS48581G1,
+///     h.config.OwnerPublicKey,
+///     message,                         // canonical bytes with sig nilified
+///     updatePb.PublicKeySignatureBls48581.Signature,
+///     slices.Concat(domain[:], []byte("HYPERGRAPH_UPDATE")),
+/// )
+/// ```
+///
+/// `update_bytes_without_sig` must be the canonical-bytes encoding of
+/// the `HypergraphUpdate` with its `public_key_signature_bls48581`
+/// field cleared. Callers produce this via
+/// `HypergraphUpdate.to_canonical_bytes_without_signature()`.
+pub fn verify_update_signature(
+    resolver: &Arc<dyn HypergraphConfigResolver>,
+    domain: &[u8],
+    update_bytes_without_sig: &[u8],
+    signature: &[u8],
+    key_manager: &dyn quil_types::crypto::KeyManager,
+) -> Result<AuthCheck> {
+    let Some(owner_key) = resolver.owner_public_key(domain) else {
+        return Ok(AuthCheck::UnknownDomain);
+    };
+    let mut domain_sep = Vec::with_capacity(domain.len() + b"HYPERGRAPH_UPDATE".len());
+    domain_sep.extend_from_slice(domain);
+    domain_sep.extend_from_slice(b"HYPERGRAPH_UPDATE");
+    let ok = key_manager.validate_signature(
+        quil_types::crypto::KeyType::Bls48581G1,
+        &owner_key,
+        update_bytes_without_sig,
+        signature,
+        &domain_sep,
+    )?;
+    if ok {
         Ok(AuthCheck::Verified)
     } else {
         Ok(AuthCheck::Invalid)
@@ -201,7 +275,7 @@ mod tests {
             signature: sig,
         };
         let resolver: Arc<dyn HypergraphConfigResolver> = Arc::new(StaticResolver(pubkey));
-        let check = verify_op_signature(Some(&resolver), &OpForAuth::VertexRemove(&op)).unwrap();
+        let check = verify_op_signature(&resolver, &OpForAuth::VertexRemove(&op)).unwrap();
         assert_eq!(check, AuthCheck::Verified);
     }
 
@@ -221,19 +295,8 @@ mod tests {
             signature: sig,
         };
         let resolver: Arc<dyn HypergraphConfigResolver> = Arc::new(StaticResolver(other));
-        let check = verify_op_signature(Some(&resolver), &OpForAuth::VertexRemove(&op)).unwrap();
+        let check = verify_op_signature(&resolver, &OpForAuth::VertexRemove(&op)).unwrap();
         assert_eq!(check, AuthCheck::Invalid);
-    }
-
-    #[test]
-    fn missing_resolver_reports_no_resolver() {
-        let op = VertexRemove {
-            domain: vec![0u8; 32],
-            data_address: vec![0u8; 32],
-            signature: vec![0u8; 114],
-        };
-        let check = verify_op_signature(None, &OpForAuth::VertexRemove(&op)).unwrap();
-        assert_eq!(check, AuthCheck::NoResolver);
     }
 
     #[test]
@@ -250,7 +313,7 @@ mod tests {
             signature: vec![0u8; 114],
         };
         let resolver: Arc<dyn HypergraphConfigResolver> = Arc::new(NoneResolver);
-        let check = verify_op_signature(Some(&resolver), &OpForAuth::VertexRemove(&op)).unwrap();
+        let check = verify_op_signature(&resolver, &OpForAuth::VertexRemove(&op)).unwrap();
         assert_eq!(check, AuthCheck::UnknownDomain);
     }
 }

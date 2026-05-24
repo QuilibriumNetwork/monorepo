@@ -156,6 +156,41 @@ pub fn verify_prover_resume(
     )
 }
 
+/// ProverLeave active-allocation gate. Mirrors Go
+/// `global_prover_leave.go:395-436`. Without this, a leave for a
+/// prover that is already left/kicked passes verify but fails
+/// materialize — splitting consensus between nodes that run
+/// materialize and those that don't.
+///
+/// `lookup_alloc` returns the per-filter allocation tree (None if no
+/// vertex exists). At least one allocation in the leave's filters
+/// must be Status=1 (active) for the leave to be accepted.
+pub fn verify_prover_leave_has_active_allocation<F>(
+    op: &ProverLeave,
+    pubkey: &[u8],
+    mut lookup_alloc: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8; 32]) -> Result<Option<quil_tries::VectorCommitmentTree>>,
+{
+    const STATUS_ACTIVE: u8 = 1;
+    for filter in &op.filters {
+        let alloc_addr = super::materialize::allocation_address(pubkey, filter)?;
+        let Some(alloc_tree) = lookup_alloc(&alloc_addr)? else {
+            continue;
+        };
+        let status = read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
+            .and_then(|b| b.first().copied())
+            .unwrap_or(4);
+        if status == STATUS_ACTIVE {
+            return Ok(());
+        }
+    }
+    Err(QuilError::InvalidArgument(
+        "ProverLeave verify: no active allocations found for any of the requested filters".into(),
+    ))
+}
+
 /// Verify a `ProverLeave` operation.
 pub fn verify_prover_leave(
     op: &ProverLeave,
@@ -441,6 +476,188 @@ pub fn verify_prover_join_signatures(
     Ok(true)
 }
 
+/// Active-global-prover gate for ShardSplit / ShardMerge. Mirrors Go
+/// `global_shard_split.go:92-102` (and the matching
+/// `global_shard_merge.go` lines). The signer must be a registered
+/// prover AND have at least one allocation with empty
+/// ConfirmationFilter (the global filter) at Status=ACTIVE (=1).
+/// Revoked / paused / kicked provers can otherwise produce
+/// signature-valid splits/merges that pass verify but should fail at
+/// materialize.
+///
+/// The prover-tree existence already gates "registered" — the
+/// `verify_addressed_bls` helper rejects with `prover vertex not
+/// found`. This helper layers on the active-status check.
+pub fn verify_shard_op_signer_is_active_global<F>(
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    mut lookup_alloc: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8; 32]) -> Result<Option<quil_tries::VectorCommitmentTree>>,
+{
+    let pubkey = read_field(prover_tree, "prover:Prover", "PublicKey").ok_or_else(|| {
+        QuilError::InvalidArgument(
+            "verify shard op: prover vertex missing PublicKey".into(),
+        )
+    })?;
+    let global_filter: Vec<u8> = Vec::new();
+    let alloc_addr = super::materialize::allocation_address(&pubkey, &global_filter)?;
+    let Some(alloc_tree) = lookup_alloc(&alloc_addr)? else {
+        return Err(QuilError::InvalidArgument(
+            "verify shard op: signer has no global allocation — not an active global prover"
+                .into(),
+        ));
+    };
+    let status = read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
+        .and_then(|b| b.first().copied())
+        .unwrap_or(4);
+    const STATUS_ACTIVE: u8 = 1;
+    if status != STATUS_ACTIVE {
+        return Err(QuilError::InvalidArgument(format!(
+            "verify shard op: signer's global allocation is not active (status={})",
+            status,
+        )));
+    }
+    Ok(())
+}
+
+/// ProverSeniorityMerge spent-merge deduplication gate. Mirrors Go
+/// `global_prover_seniority_merge.go:476-540`. For each merge target,
+/// look up two tombstone vertices in the global domain:
+///
+///   - `spent_seniority_merge_address(target_pubkey)` —
+///     PROVER_SENIORITY_MERGE was already consumed.
+///   - `spent_join_merge_address(target_pubkey)` —
+///     PROVER_JOIN_MERGE consumed the same target during a
+///     ProverJoin's merge_targets list.
+///
+/// Finding EITHER marker means the merge target has already been
+/// claimed by some prover; allowing the current op would split the
+/// target's seniority between two provers. Without this gate, two
+/// provers could both pass verify with the same merge_target, both
+/// pass into a frame, then materialize would reject one — splitting
+/// consensus on which prover ends up with the seniority.
+///
+/// `lookup_tombstone` is invoked for each target's spent address. The
+/// caller threads state through it. Returning `Ok(Some(_))` means
+/// "marker exists"; `Ok(None)` means "fresh, may merge".
+pub fn verify_prover_seniority_merge_spent_markers<F>(
+    op: &super::prover_ops::ProverSeniorityMerge,
+    mut lookup_tombstone: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8; 32]) -> Result<Option<Vec<u8>>>,
+{
+    for mt in &op.merge_targets {
+        let join_marker = super::materialize::spent_join_merge_address(&mt.prover_public_key)?;
+        if lookup_tombstone(&join_marker)?.is_some() {
+            return Err(QuilError::InvalidArgument(
+                "ProverSeniorityMerge verify: merge target already consumed by \
+                 a prior ProverJoin (PROVER_JOIN_MERGE tombstone)".into(),
+            ));
+        }
+        let seniority_marker =
+            super::materialize::spent_seniority_merge_address(&mt.prover_public_key)?;
+        if lookup_tombstone(&seniority_marker)?.is_some() {
+            return Err(QuilError::InvalidArgument(
+                "ProverSeniorityMerge verify: merge target already consumed by \
+                 a prior ProverSeniorityMerge (PROVER_SENIORITY_MERGE tombstone)".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// ProverJoin kicked-prover gate. Mirrors Go
+/// `global_prover_join.go:972-988`: if the existing prover vertex has
+/// a non-zero `KickFrameNumber`, the join must be rejected. A
+/// previously-kicked prover cannot rejoin with the same public key
+/// (otherwise eviction-for-malice has no teeth).
+///
+/// Without this gate at verify time, a kicked prover's join would
+/// pass BLS+VDF validation, only to be rejected at materialize on
+/// nodes that ran materialization — splitting consensus between
+/// validators that did and did not run materialize.
+pub fn verify_prover_join_not_kicked(
+    prover_tree: &quil_tries::VectorCommitmentTree,
+) -> Result<()> {
+    let kf_bytes =
+        read_field(prover_tree, "allocation:ProverAllocation", "KickFrameNumber")
+            .or_else(|| read_field(prover_tree, "prover:Prover", "KickFrameNumber"));
+    let Some(kf_bytes) = kf_bytes else {
+        return Ok(());
+    };
+    if kf_bytes.len() != 8 {
+        return Ok(());
+    }
+    let kf = u64::from_be_bytes(kf_bytes.try_into().unwrap());
+    if kf != 0 {
+        return Err(QuilError::InvalidArgument(format!(
+            "ProverJoin verify: prover has been previously kicked \
+             (KickFrameNumber={})",
+            kf,
+        )));
+    }
+    Ok(())
+}
+
+/// ProverJoin existing-allocation expiry gate. Mirrors Go
+/// `global_prover_join.go:990-1069`. For each filter in the join, the
+/// prover's existing allocation (if any) must be either status=4
+/// (left/kicked) OR expired (`frame_number >= JoinFrameNumber + 720`).
+/// Otherwise the prover is trying to claim coverage on a shard they
+/// are already on, which would double-count their PoMW.
+///
+/// `lookup_alloc` is the per-allocation tree loader the caller
+/// supplies — it lets this helper stay free of state-store coupling.
+/// Pass `Ok(None)` for filters with no existing allocation vertex.
+pub fn verify_prover_join_allocations_expired<F>(
+    op: &ProverJoin,
+    pubkey: &[u8],
+    frame_number: u64,
+    mut lookup_alloc: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8; 32]) -> Result<Option<quil_tries::VectorCommitmentTree>>,
+{
+    for filter in &op.filters {
+        let alloc_addr = super::materialize::allocation_address(pubkey, filter)?;
+        let Some(alloc_tree) = lookup_alloc(&alloc_addr)? else {
+            continue;
+        };
+        let status = read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
+            .and_then(|b| b.first().copied())
+            .unwrap_or(4);
+        if status == 4 {
+            continue;
+        }
+        let jf_bytes = read_field(&alloc_tree, "allocation:ProverAllocation", "JoinFrameNumber")
+            .ok_or_else(|| QuilError::InvalidArgument(format!(
+                "ProverJoin verify: existing allocation for filter is active \
+                 (status={}) with no JoinFrameNumber — refusing to rejoin",
+                status,
+            )))?;
+        if jf_bytes.len() != 8 {
+            return Err(QuilError::InvalidArgument(format!(
+                "ProverJoin verify: existing allocation has malformed \
+                 JoinFrameNumber ({} bytes)",
+                jf_bytes.len(),
+            )));
+        }
+        let jf = u64::from_be_bytes(jf_bytes.try_into().unwrap());
+        const REJOIN_WINDOW: u64 = 720;
+        if frame_number < jf.saturating_add(REJOIN_WINDOW) {
+            return Err(QuilError::InvalidArgument(format!(
+                "ProverJoin verify: existing allocation still active \
+                 (status={}, frames_since_join={})",
+                status,
+                frame_number.saturating_sub(jf),
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Verify a `ProverUpdate` operation. The signing message is just the
 /// delegate_address; the domain is PROVER_UPDATE (but Go actually
 /// uses an empty domain for updates — the signature covers just the
@@ -465,6 +682,23 @@ pub fn verify_prover_update(
     let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
         QuilError::InvalidArgument("verify prover update: missing signature".into())
     })?;
+
+    // Address-binding cross-check. Mirrors Go
+    // `global_prover_update.go:364-375`: derive
+    // `poseidon(pubkey_from_tree)` and assert it equals the address
+    // declared by the op's signature. Without this, the prover tree
+    // could be looked up by ONE address, but the signature could
+    // claim a DIFFERENT address — bypassing per-prover authority.
+    if sig.address.len() != 32 {
+        return Err(QuilError::InvalidArgument(format!(
+            "verify prover update: signature.address must be 32 bytes, got {}",
+            sig.address.len(),
+        )));
+    }
+    let derived_addr = prover_address_from_pubkey(&pubkey)?;
+    if derived_addr.as_slice() != sig.address.as_slice() {
+        return Ok(false);
+    }
 
     // ProverUpdate signing message is just the delegate_address.
     // Domain matches Go's `global_prover_update.go:378` —

@@ -48,7 +48,10 @@ struct RemoteWorkerState {
 /// Implements the `WorkerManager` trait so it can be used as a
 /// drop-in replacement for `ThreadWorkerManager`.
 pub struct RemoteWorkerManager {
-    workers: Mutex<HashMap<u32, RemoteWorkerState>>,
+    /// Shared so background tasks spawned from `set_worker_filter`
+    /// (which only has `&self`) can re-acquire the channel to issue
+    /// the Respawn RPC after this method returns.
+    workers: std::sync::Arc<Mutex<HashMap<u32, RemoteWorkerState>>>,
     /// Master's stream endpoint for workers to connect back.
     master_endpoint: String,
     /// Channel for receiving events from remote workers.
@@ -103,7 +106,7 @@ impl RemoteWorkerManager {
         }
 
         Self {
-            workers: Mutex::new(workers),
+            workers: std::sync::Arc::new(Mutex::new(workers)),
             master_endpoint,
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
@@ -197,8 +200,7 @@ impl RemoteWorkerManager {
     }
 
     /// Send a Respawn command to a remote worker via gRPC.
-    #[allow(dead_code)]
-    async fn send_respawn(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+    pub async fn send_respawn(&self, core_id: u32, filter: &[u8]) -> Result<()> {
         let channel = {
             let workers = self.workers.lock().unwrap();
             workers.get(&core_id)
@@ -244,30 +246,74 @@ impl WorkerManager for RemoteWorkerManager {
         filter: &[u8],
         start_consensus: bool,
     ) -> Result<()> {
-        {
+        let connected = {
             let mut workers = self.workers.lock().unwrap();
             if let Some(w) = workers.get_mut(&core_id) {
                 w.filter = filter.to_vec();
+                w.channel.is_some()
             } else {
                 return Err(QuilError::InvalidArgument(
                     format!("no remote worker with core_id {}", core_id)
                 ));
             }
+        };
+
+        // `start_consensus=false` (Joining alloc, no Active prover yet)
+        // intentionally skips the Respawn — the worker stays idle until
+        // the allocation transitions to Active.
+        if !start_consensus {
+            info!(
+                core_id,
+                filter = hex::encode(filter),
+                "remote worker filter recorded (consensus not yet started)"
+            );
+            return Ok(());
+        }
+        if !connected {
+            // Worker hasn't connected yet. The next `connect_all` /
+            // reconnect cycle is responsible for re-issuing the
+            // Respawn once the channel comes up.
+            info!(
+                core_id,
+                filter = hex::encode(filter),
+                "remote worker not yet connected — Respawn deferred"
+            );
+            return Ok(());
         }
 
-        // Remote-mode workers run in separate processes. The actual
-        // consensus-engine spawn happens via the worker process itself
-        // when it connects back; this manager just records the
-        // binding. `start_consensus=false` semantics (filter-pinned,
-        // engine off) is informational here — the remote process
-        // checks alloc status itself before booting consensus.
-        let filter = filter.to_vec();
-        info!(
-            core_id,
-            filter = hex::encode(&filter),
-            start_consensus,
-            "queued remote worker allocation (respawn pending)"
-        );
+        // Fire the Respawn RPC. set_worker_filter is sync but invoked
+        // from async contexts; spawn the call so this returns
+        // immediately and the lifecycle loop doesn't block on a
+        // potentially slow worker.
+        let workers = self.workers.clone();
+        let filter_owned = filter.to_vec();
+        tokio::spawn(async move {
+            let channel = {
+                let guard = workers.lock().unwrap();
+                guard.get(&core_id).and_then(|w| w.channel.clone())
+            };
+            let Some(channel) = channel else {
+                warn!(core_id, "remote worker channel disappeared before Respawn");
+                return;
+            };
+            let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel);
+            let request = tonic::Request::new(quil_types::proto::node::RespawnRequest {
+                filter: filter_owned.clone(),
+            });
+            match client.respawn(request).await {
+                Ok(_) => info!(
+                    core_id,
+                    filter = hex::encode(&filter_owned),
+                    "remote worker respawned"
+                ),
+                Err(e) => warn!(
+                    core_id,
+                    filter = hex::encode(&filter_owned),
+                    error = %e,
+                    "remote worker Respawn RPC failed"
+                ),
+            }
+        });
         Ok(())
     }
 

@@ -43,8 +43,10 @@ pub use vertex_ops::{
 };
 
 pub use dispatch::{
-    check_sufficient_fee, decode_and_validate, decode_message, dispatch_cost,
-    is_mutating_op, lock_addresses_for_input, peek_message_kind, DispatchedMessage,
+    check_sufficient_fee, decode_and_validate, decode_and_validate_deploy,
+    decode_and_validate_update, decode_message, dispatch_cost, is_mutating_op,
+    lock_addresses_for_input, peek_message_kind, validate_rdf_schema_evolution,
+    DispatchedDeploy, DispatchedDeployOrUpdate, DispatchedMessage, DispatchedUpdate,
     HypergraphLockState, MessageKind,
 };
 

@@ -80,6 +80,27 @@ pub fn process_global_frame_with_rewards(
             continue;
         }
 
+        // Validate before processing — runs structural + signature
+        // verification per the engine's per-op Verify hooks.
+        // process_message alone re-verifies only a subset of ops, so
+        // skipping validate would silently accept unsigned join /
+        // kick / seniority_merge / shard_split / shard_merge /
+        // frame_header messages.
+        if let Err(e) = execution_manager.validate_message(
+            frame_number,
+            &GLOBAL_ADDRESS,
+            &request_bytes,
+        ) {
+            debug!(
+                frame = frame_number,
+                index = i,
+                error = %e,
+                "rejecting message that failed validation",
+            );
+            skipped += 1;
+            continue;
+        }
+
         match execution_manager.process_message(
             frame_number,
             fee_multiplier,
@@ -228,6 +249,21 @@ pub fn process_global_frame_with_fees(
             }
         };
 
+        // Validate before processing.
+        if let Err(e) = execution_manager.validate_message(
+            frame_number,
+            &GLOBAL_ADDRESS,
+            &request_bytes,
+        ) {
+            debug!(
+                frame = frame_number,
+                error = %e,
+                "rejecting message that failed validation",
+            );
+            skipped += 1;
+            continue;
+        }
+
         match execution_manager.process_message(
             frame_number,
             &fee_multiplier,
@@ -259,12 +295,33 @@ pub fn process_global_frame_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use quil_types::crypto::NoopInclusionProver;
+    use quil_hypergraph::testing::MemStore;
+    use quil_types::crypto::{InclusionProver, NoopInclusionProver};
     use quil_types::proto::global::{GlobalFrameHeader, MessageBundle, MessageRequest};
+    use std::sync::Arc;
 
     fn mgr() -> ExecutionEngineManager {
-        ExecutionEngineManager::new(Arc::new(NoopInclusionProver), true)
+        let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
+        let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
+            Arc::new(MemStore::new());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg_store,
+            inclusion_prover.clone(),
+        ));
+        let stubs = quil_execution::testing::NoopExecutionCrypto::new();
+        let hg_resolver: std::sync::Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
+            std::sync::Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
+        ExecutionEngineManager::new(
+            inclusion_prover,
+            stubs.key_manager.clone(),
+            crdt,
+            stubs.bulletproof_prover,
+            stubs.decaf_constructor,
+            stubs.circuit_compiler,
+            stubs.clock_store,
+            hg_resolver,
+            true,
+        )
     }
 
     fn empty_frame(frame_number: u64) -> GlobalFrame {

@@ -445,6 +445,22 @@ impl GlobalConsensusEngine {
     ) -> Result<usize> {
         let mut processed = 0;
         for (address, message) in messages {
+            // Validate before processing. Per-op Verify hooks re-run
+            // structural + signature checks; skipping validate would
+            // let the materialize path silently accept unsigned /
+            // spoofed join/kick/seniority/shard/frame_header messages.
+            if let Err(e) = self.execution_manager.validate_message(
+                frame_number,
+                address,
+                message,
+            ) {
+                warn!(
+                    frame = frame_number,
+                    error = %e,
+                    "rejecting message that failed validation"
+                );
+                continue;
+            }
             match self.execution_manager.process_message(
                 frame_number,
                 fee_multiplier,
@@ -476,6 +492,15 @@ pub fn process_message_batch(
 ) -> quil_types::error::Result<usize> {
     let mut processed = 0;
     for (address, message) in messages {
+        // Validate before processing.
+        if let Err(e) = execution_manager.validate_message(
+            frame_number,
+            address,
+            message,
+        ) {
+            tracing::debug!(error = %e, "rejecting message that failed validation");
+            continue;
+        }
         match execution_manager.process_message(
             frame_number,
             fee_multiplier,
@@ -494,13 +519,34 @@ pub fn process_message_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::crypto::NoopInclusionProver;
     use quil_execution::message_envelope::{
         CanonicalMessageBundle, CanonicalMessageRequest,
     };
+    use quil_hypergraph::testing::MemStore;
+    use quil_types::crypto::{InclusionProver, NoopInclusionProver};
 
     fn build_manager() -> ExecutionEngineManager {
-        ExecutionEngineManager::new(Arc::new(NoopInclusionProver), true)
+        let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
+        let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
+            Arc::new(MemStore::new());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg_store,
+            inclusion_prover.clone(),
+        ));
+        let stubs = quil_execution::testing::NoopExecutionCrypto::new();
+        let hg_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
+        ExecutionEngineManager::new(
+            inclusion_prover,
+            stubs.key_manager.clone(),
+            crdt,
+            stubs.bulletproof_prover,
+            stubs.decaf_constructor,
+            stubs.circuit_compiler,
+            stubs.clock_store,
+            hg_resolver,
+            true,
+        )
     }
 
     #[test]
@@ -542,7 +588,11 @@ mod tests {
     }
 
     #[test]
-    fn process_batch_routes_hypergraph_vertex_add_bundle() {
+    fn process_batch_rejects_hypergraph_vertex_add_with_unknown_domain() {
+        // With a noop config resolver the hypergraph engine cannot
+        // resolve the Ed448 WritePublicKey for the target domain, so
+        // verify returns AuthCheck::UnknownDomain and the message is
+        // rejected at validate time.
         let mgr = build_manager();
         let inner = quil_execution::hypergraph_intrinsic::VertexAdd {
             domain: vec![0x11u8; 32],
@@ -567,7 +617,7 @@ mod tests {
             &mgr, 1, &num_bigint::BigInt::from(1),
             &[(hg_addr, bundle)],
         ).unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, 0, "expected unverified hypergraph op to be rejected");
     }
 
     #[test]

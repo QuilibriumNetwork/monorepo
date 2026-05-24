@@ -664,10 +664,39 @@ async fn run_master_node(
         }
         Err(e) => warn!(error = %e, "startup hypergraph commit failed"),
     }
-    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new_with_crypto(
+    // ExecutionEngineManager::new takes the full crypto + store
+    // provider set as mandatory inputs. Production bulletproof prover
+    // ships in `quil_crypto::Decaf448BulletproofProver`; the Decaf448
+    // constructor and circuit compiler aren't wired to real
+    // implementations yet (no production impl exists in the Rust
+    // tree), so we plug in the testing-stubs noop variants. Those
+    // engines' verify paths return `false` for every signature, so
+    // any signed op fails closed rather than silently passing.
+    let bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver> =
+        Arc::new(quil_crypto::Decaf448BulletproofProver);
+    let decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor> =
+        Arc::new(quil_execution::testing::NoopDecafConstructor);
+    let circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler> =
+        Arc::new(quil_execution::testing::NoopCircuitCompiler);
+    let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> =
+        clock_store.clone();
+    // Hypergraph engine requires a config resolver. A real resolver
+    // would look up the HypergraphDeploy config vertex for each
+    // domain; that materialization isn't wired yet, so we use the
+    // fail-closed noop (returns None → AuthCheck::UnknownDomain →
+    // engine rejects all hypergraph write ops). Swap in a real
+    // resolver once the deploy materialization lands.
+    let hypergraph_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
+        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
+    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new(
         inclusion_prover.clone(),
         key_manager.clone(),
         crdt.clone(),
+        bulletproof_prover,
+        decaf_constructor,
+        circuit_compiler,
+        clock_store_for_exec,
+        hypergraph_resolver,
         true,
     ));
     info!("execution engines initialized with BLS48-581 + Ed448 signature verification");
@@ -1475,11 +1504,30 @@ async fn run_master_node(
                     Arc::new(quil_crypto::Bls48581KeyConstructor);
                 let worker_key_manager: Arc<dyn quil_types::crypto::KeyManager> =
                     Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
+                // Bulletproof prover is real; Decaf448 / circuit
+                // compiler still use the noop stubs (no production
+                // impl yet). See the analogous block in the master
+                // setup above for the rationale.
+                let bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver> =
+                    Arc::new(quil_crypto::Decaf448BulletproofProver);
+                let decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor> =
+                    Arc::new(quil_execution::testing::NoopDecafConstructor);
+                let circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler> =
+                    Arc::new(quil_execution::testing::NoopCircuitCompiler);
+                let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> =
+                    clock_store.clone();
+                let hypergraph_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
+                    Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
                 let exec_manager = Arc::new(
-                    quil_execution::ExecutionEngineManager::new_with_crypto(
+                    quil_execution::ExecutionEngineManager::new(
                         inclusion_prover.clone(),
                         worker_key_manager,
                         crdt.clone(),
+                        bulletproof_prover,
+                        decaf_constructor,
+                        circuit_compiler,
+                        clock_store_for_exec,
+                        hypergraph_resolver,
                         true,
                     ),
                 );
@@ -2671,10 +2719,17 @@ async fn run_master_node(
                 if !sync_archive_mode {
                     if let Some(addr) = sync_pool.get_all().await.first() {
                         info!("starting initial prover tree sync");
+                        // Initial bootstrap sync — no verified frame
+                        // yet to pin against. Empty expected_root
+                        // means "trust the archive's latest snapshot".
+                        // Subsequent periodic syncs DO pin against the
+                        // most-recent verified frame's
+                        // prover_tree_commitment.
                         match quil_rpc::ensure_prover_tree(
                             addr, &seed,
                             quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
                             sync_hg.clone(),
+                            &[],
                         ).await {
                             Ok(_) => {
                                 initial_sync_data_ok = true;
@@ -3242,10 +3297,23 @@ async fn run_master_node(
                                 let pre_balance = quil_execution::global_intrinsic::prover_shard_update::
                                     read_reward_balance_for(&sync_crdt, &sync_pa)
                                     .unwrap_or_else(|_| num_bigint::BigInt::from(0));
+                                // Pin the sync to the latest verified
+                                // frame's prover_tree_commitment.
+                                // Without this, a malicious archive
+                                // could serve a self-consistent fake
+                                // snapshot at any root — the post-sync
+                                // server-claim match only proves
+                                // internal consistency, not authority.
+                                let expected_root = sync_cs
+                                    .get_latest_global_frame()
+                                    .ok()
+                                    .and_then(|f| f.header.map(|h| h.prover_tree_commitment))
+                                    .unwrap_or_default();
                                 match quil_rpc::ensure_prover_tree_incremental(
                                     addr, &seed,
                                     quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
                                     sync_hg.clone(),
+                                    &expected_root,
                                 ).await {
                                     Ok(stats) => {
                                         if stats.leaves_pulled > 0 {
@@ -3637,14 +3705,25 @@ async fn run_master_node(
                                                     (mtls_seed_for_recv, first_addr)
                                                 {
                                                     let store = hg_store_for_recv.clone();
+                                                    let cs = clock_store_recv.clone();
                                                     tokio::spawn(async move {
                                                         use quil_types::proto::application::HypergraphPhaseSet::*;
+                                                        // Pin sync against the most-recent verified
+                                                        // frame's prover_tree_commitment (when
+                                                        // available). Empty during bootstrap before
+                                                        // any frame is stored.
+                                                        let expected_root = cs
+                                                            .get_latest_global_frame()
+                                                            .ok()
+                                                            .and_then(|f| f.header.map(|h| h.prover_tree_commitment))
+                                                            .unwrap_or_default();
                                                         for phase in [VertexAdds, VertexRemoves, HyperedgeAdds, HyperedgeRemoves] {
                                                             match quil_rpc::ensure_prover_tree(
                                                                 &addr,
                                                                 &seed,
                                                                 phase,
                                                                 store.clone(),
+                                                                &expected_root,
                                                             ).await {
                                                                 Ok(stats) => {
                                                                     info!(
@@ -5131,87 +5210,71 @@ async fn run_master_node(
                 None
             };
 
-            let tls_config_for_srv = mtls_seed
-                .and_then(|s| quil_rpc::build_quil_server_tls_config(&s).ok());
-
-            if let Some(tls_config) = tls_config_for_srv {
-                tokio::spawn(async move {
-                    info!(addr = %addr, "starting peer gRPC (mTLS)");
-                    let listener = match tokio::net::TcpListener::bind(addr).await {
-                        Ok(l) => l,
-                        Err(e) => {
-                            warn!(error = %e, "peer gRPC bind failed");
-                            return;
-                        }
-                    };
-                    let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-                    let incoming = async_stream::stream! {
-                        loop {
-                            let (tcp, _peer) = match listener.accept().await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    warn!(error = %e, "peer gRPC accept failed");
-                                    continue;
-                                }
-                            };
-                            let acceptor = tls_acceptor.clone();
-                            match acceptor.accept(tcp).await {
-                                Ok(tls) => yield Ok::<_, std::io::Error>(tls),
-                                Err(e) => {
-                                    debug!(error = %e, "TLS handshake failed");
-                                    continue;
-                                }
+            // mTLS is mandatory for the peer gRPC listener — every peer
+            // dialer (archive client, standalone worker, peer-to-peer
+            // RPCs) expects an Ed448-backed TLS certificate and would
+            // reject a plaintext server. Refuse to start rather than
+            // silently bringing up an unreachable listener.
+            let seed = mtls_seed.ok_or_else(|| anyhow::anyhow!(
+                "peer gRPC requires an Ed448 identity — set `p2p.peerPrivKey` \
+                 to a 57-byte hex seed (or 114-byte seed+pubkey). Without it \
+                 no peer can authenticate against this node.",
+            ))?;
+            let tls_config = quil_rpc::build_quil_server_tls_config(&seed)
+                .map_err(|e| anyhow::anyhow!(
+                    "peer gRPC mTLS config init failed: {} — check `p2p.peerPrivKey`", e
+                ))?;
+            tokio::spawn(async move {
+                info!(addr = %addr, "starting peer gRPC (mTLS)");
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        warn!(error = %e, "peer gRPC bind failed");
+                        return;
+                    }
+                };
+                let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+                let incoming = async_stream::stream! {
+                    loop {
+                        let (tcp, _peer) = match listener.accept().await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(error = %e, "peer gRPC accept failed");
+                                continue;
+                            }
+                        };
+                        let acceptor = tls_acceptor.clone();
+                        match acceptor.accept(tcp).await {
+                            Ok(tls) => yield Ok::<_, std::io::Error>(tls),
+                            Err(e) => {
+                                debug!(error = %e, "TLS handshake failed");
+                                continue;
                             }
                         }
-                    };
-                    let mut builder = tonic::transport::Server::builder()
-                        .add_service(global_service)
-                        .add_service(hypersync_service)
-                        .add_service(app_shard_service)
-                        .add_service(key_registry_service)
-                        .add_service(connectivity_service)
-                        .add_service(dispatch_service)
-                        .add_service(mixnet_service);
-                    if let Some(pp) = pubsub_proxy_service {
-                        info!("registering PubSubProxy on peer gRPC listener");
-                        builder = builder.add_service(pp);
                     }
-                    let res = builder
-                        .serve_with_incoming_shutdown(incoming, async move {
-                            peer_grpc_token.cancelled().await;
-                        })
-                        .await;
-                    match res {
-                        Ok(()) => info!("peer gRPC stopped"),
-                        Err(e) => warn!(error = %e, "peer gRPC error"),
-                    }
-                });
-            } else {
-                tokio::spawn(async move {
-                    info!(addr = %addr, "starting peer gRPC (plaintext — no Ed448 seed; peers will reject)");
-                    let mut builder = tonic::transport::Server::builder()
-                        .add_service(global_service)
-                        .add_service(hypersync_service)
-                        .add_service(app_shard_service)
-                        .add_service(key_registry_service)
-                        .add_service(connectivity_service)
-                        .add_service(dispatch_service)
-                        .add_service(mixnet_service);
-                    if let Some(pp) = pubsub_proxy_service {
-                        info!("registering PubSubProxy on peer gRPC listener (plaintext)");
-                        builder = builder.add_service(pp);
-                    }
-                    let res = builder
-                        .serve_with_shutdown(addr, async move {
-                            peer_grpc_token.cancelled().await;
-                        })
-                        .await;
-                    match res {
-                        Ok(()) => info!("peer gRPC stopped"),
-                        Err(e) => warn!(error = %e, "peer gRPC error"),
-                    }
-                });
-            }
+                };
+                let mut builder = tonic::transport::Server::builder()
+                    .add_service(global_service)
+                    .add_service(hypersync_service)
+                    .add_service(app_shard_service)
+                    .add_service(key_registry_service)
+                    .add_service(connectivity_service)
+                    .add_service(dispatch_service)
+                    .add_service(mixnet_service);
+                if let Some(pp) = pubsub_proxy_service {
+                    info!("registering PubSubProxy on peer gRPC listener");
+                    builder = builder.add_service(pp);
+                }
+                let res = builder
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        peer_grpc_token.cancelled().await;
+                    })
+                    .await;
+                match res {
+                    Ok(()) => info!("peer gRPC stopped"),
+                    Err(e) => warn!(error = %e, "peer gRPC error"),
+                }
+            });
         } else {
             warn!(addr = %stream_addr, "invalid peer gRPC listen address, server disabled");
         }
@@ -5283,10 +5346,28 @@ async fn run_worker_node(
         hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
         inclusion_prover.clone(),
     ));
-    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new_with_crypto(
+    // Same crypto setup as the master node — bulletproof is real;
+    // Decaf / circuit compiler are still noop stubs pending production
+    // impls. See the master block earlier in this file for rationale.
+    let bulletproof_prover_worker: Arc<dyn quil_types::crypto::BulletproofProver> =
+        Arc::new(quil_crypto::Decaf448BulletproofProver);
+    let decaf_constructor_worker: Arc<dyn quil_types::crypto::DecafConstructor> =
+        Arc::new(quil_execution::testing::NoopDecafConstructor);
+    let circuit_compiler_worker: Arc<dyn quil_types::execution::CircuitCompiler> =
+        Arc::new(quil_execution::testing::NoopCircuitCompiler);
+    let clock_store_for_exec_worker: Arc<dyn quil_types::store::ClockStore> =
+        clock_store.clone();
+    let hypergraph_resolver_worker: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
+        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
+    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new(
         inclusion_prover.clone(),
         key_manager.clone(),
         crdt.clone(),
+        bulletproof_prover_worker,
+        decaf_constructor_worker,
+        circuit_compiler_worker,
+        clock_store_for_exec_worker,
+        hypergraph_resolver_worker,
         true,
     ));
 
@@ -5334,8 +5415,11 @@ async fn run_worker_node(
         &config.engine.data_worker_stream_multiaddrs,
     );
 
-    // Master endpoint
-    let master_endpoint = quil_engine::worker_node::master_grpc_endpoint(&config.engine);
+    // Master endpoint — derived from p2p.stream_listen_multiaddr.
+    // In a cluster, the worker's config has that field pointed at the
+    // master's stream listener; on single-machine setups it's the
+    // local `/ip4/0.0.0.0/tcp/8340` and gets rewritten to localhost.
+    let master_endpoint = quil_engine::worker_node::master_grpc_endpoint(&config);
 
     let worker_config = quil_engine::worker_node::WorkerNodeConfig {
         core_id,
@@ -5360,22 +5444,22 @@ async fn run_worker_node(
     )
     .with_state_engines(crdt, exec_manager, inclusion_prover);
 
-    // When proxy mode is enabled, dial the master's PubSubProxy on
-    // the peer mTLS listener and install it as the worker's publish
-    // path. Engine-produced events (FrameProduced, VoteProduced,
-    // TimeoutProduced) will flow back to the master for broadcast.
+    // Outbound pubsub. Two mutually exclusive modes:
+    //   * `engine.enable_master_proxy = true`  → dial the master's
+    //     PubSubProxy on the peer mTLS listener and route all pubsub
+    //     through it. Used when one machine should be the only mesh
+    //     participant (homogenous LAN layouts, gateway-style setups).
+    //   * `engine.enable_master_proxy = false` → the worker spins up
+    //     its own libp2p instance with a synthetic peer key (per
+    //     `node/p2p/blossomsub.go:473-496`) and joins the mesh
+    //     directly. Pubsub messages are signed with the REAL prover
+    //     key so peers attribute them to the prover, not the worker
+    //     host. Required for multi-machine clusters where workers and
+    //     master live on different hosts.
     if config.engine.enable_master_proxy {
-        let master_addr = quil_engine::worker_node::master_grpc_endpoint(&config.engine);
-        // mTLS for the proxy connection requires the same Ed448 cert
-        // derivation archive_client uses — that path lives in
-        // `quil-rpc::archive_client` today and isn't wired as a
-        // reusable `tonic::transport::ClientTlsConfig`. Until that's
-        // extracted, the worker connects plaintext to the master's
-        // peer gRPC listener, which is acceptable when master and
-        // workers are on the same machine (the common standalone
-        // layout) and the master is running in plaintext peer mode.
-        let endpoint_url = format!("http://{}", master_addr);
-        match quil_rpc::proxy_pubsub::ProxyPubSub::connect(endpoint_url, None).await {
+        let master_addr = quil_engine::worker_node::master_grpc_endpoint(&config);
+        // `master_addr` is already `http://host:port`.
+        match quil_rpc::proxy_pubsub::ProxyPubSub::connect(master_addr.clone(), None).await {
             Ok(proxy) => {
                 let proxy = Arc::new(proxy);
                 info!(master = %master_addr, "worker connected to master PubSubProxy");
@@ -5398,7 +5482,77 @@ async fn run_worker_node(
         }
     }
 
+    // Worker-owned p2p when proxy is off. Carry the receiver out of
+    // this scope so we can spawn the routing task after the worker is
+    // wrapped in an Arc.
+    let worker_owned_p2p: Option<(
+        Arc<quil_p2p::P2PHandle>,
+        tokio::sync::mpsc::Receiver<quil_p2p::ReceivedMessage>,
+    )> = if !config.engine.enable_master_proxy {
+        let p2p_node = quil_p2p::P2PNode::new_for_worker(&config.p2p, core_id)
+            .map_err(|e| anyhow::anyhow!("worker p2p node init: {}", e))?;
+        let worker_listen = quil_p2p::P2PNode::worker_listen_multiaddr(
+            &config.engine,
+            core_id,
+        )
+        .map_err(|e| anyhow::anyhow!("worker p2p listen addr: {}", e))?;
+        info!(core_id, listen = %worker_listen, "starting worker-owned p2p");
+        let (handle, rx) = p2p_node
+            .start(&worker_listen)
+            .await
+            .map_err(|e| anyhow::anyhow!("worker p2p start: {}", e))?;
+        let handle = Arc::new(handle);
+        // Pre-subscribe to the global bitmasks so peer global frames /
+        // votes / prover messages reach this worker.
+        for bm in [
+            quil_engine::bitmasks::GLOBAL_CONSENSUS,
+            quil_engine::bitmasks::GLOBAL_FRAME,
+            quil_engine::bitmasks::GLOBAL_PROVER,
+            quil_engine::bitmasks::GLOBAL_PEER_INFO,
+        ] {
+            handle.subscribe(bm.to_vec()).await;
+        }
+        // Wire publish_fn → worker's own p2p.
+        let p2p_for_publish = handle.clone();
+        let publish_fn: quil_engine::worker_node::PublishFn =
+            Arc::new(move |bitmask, data| {
+                let h = p2p_for_publish.clone();
+                Box::pin(async move {
+                    if let Err(e) = h.publish(bitmask, data).await {
+                        warn!(error = %e, "worker p2p publish failed");
+                    }
+                })
+            });
+        worker_node = worker_node
+            .with_publish_fn(publish_fn)
+            .with_p2p_handle(handle.clone());
+        Some((handle, rx))
+    } else {
+        None
+    };
+
     let worker = Arc::new(worker_node);
+
+    // Route incoming pubsub messages from the worker's own p2p into
+    // the active engine. The worker's `route_message` dispatches by
+    // bitmask pattern; if no engine is active yet, the message is
+    // silently dropped.
+    if let Some((_handle, mut rx)) = worker_owned_p2p {
+        let route_token = token.clone();
+        let route_worker = worker.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = route_token.cancelled() => break,
+                    maybe_msg = rx.recv() => {
+                        let Some(msg) = maybe_msg else { break };
+                        route_worker.route_message(&msg.data, &msg.bitmask);
+                    }
+                }
+            }
+            info!("worker p2p routing task stopped");
+        });
+    }
 
     info!(core_id, "worker node initialized, starting event loop");
 

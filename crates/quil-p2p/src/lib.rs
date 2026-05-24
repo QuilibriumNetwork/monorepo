@@ -19,6 +19,7 @@ pub use behaviour::ValidationResult;
 pub use bitmask::slice_bitmask;
 pub use libp2p::PeerId;
 pub use ed448_identity::Ed448Identity;
+pub use node::{P2PHandle, P2PNode, ReceivedMessage};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
     build_worker_reachability, classify_peer_info_message, decode_canonical_key_registry,
@@ -96,6 +97,11 @@ pub struct BlossomsubParams {
     pub unsubscribe_backoff: std::time::Duration,
     pub iwant_followup_time: std::time::Duration,
     pub idont_want_message_threshold: usize,
+    /// Per-peer cap on cached IDONTWANT message IDs. Used to bound
+    /// the per-peer LRU that tracks which messages a remote peer has
+    /// asked us not to send. A malicious peer could otherwise
+    /// enumerate IDs and balloon our memory.
+    pub max_idont_want_messages: usize,
 }
 
 impl Default for BlossomsubParams {
@@ -117,6 +123,7 @@ impl Default for BlossomsubParams {
             unsubscribe_backoff: params::UNSUBSCRIBE_BACKOFF,
             iwant_followup_time: params::IWANT_FOLLOWUP_TIME,
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
+            max_idont_want_messages: 5000,
         }
     }
 }
@@ -165,6 +172,11 @@ impl BlossomsubParams {
                 cfg.idont_want_message_threshold as usize
             } else {
                 d.idont_want_message_threshold
+            },
+            max_idont_want_messages: if cfg.max_idont_want_messages > 0 {
+                cfg.max_idont_want_messages as usize
+            } else {
+                d.max_idont_want_messages
             },
         }
     }

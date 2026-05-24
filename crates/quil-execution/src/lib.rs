@@ -15,6 +15,8 @@ pub mod metrics;
 pub mod message_envelope;
 pub mod prover_registry;
 pub mod seniority_compat;
+#[cfg(any(test, feature = "testing-stubs"))]
+pub mod testing;
 pub mod token_engine;
 pub mod token_intrinsic;
 pub mod traversal_proof;

@@ -330,8 +330,8 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
         // `sig.signature` bytes, and the frame would validate.
         //
         // Mirrors Go's `WesolowskiFrameProver.VerifyGlobalHeaderSignature`
-        // (which Go's validator should call but does not — see audit
-        // notes; we close the gap here rather than copy Go's omission).
+        // (which Go's validator should call but does not; we close
+        // the gap here rather than copy Go's omission).
         match self
             .frame_prover
             .verify_global_header_signature(header, self.bls_constructor.as_ref())

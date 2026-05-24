@@ -556,10 +556,10 @@ impl quil_keys::KeyManager for TestKeyManager {
 // =====================================================================
 
 /// Trivial [`quil_types::crypto::KeyManager`] for tests: every
-/// `validate_signature` returns `Ok(true)`. Used by
-/// `ExecutionEngineManager::new_with_crypto` so the materializer can
-/// process ProverJoin / ProverConfirm bundles without the test having
-/// to produce byte-identical BLS aggregate signatures.
+/// `validate_signature` returns `Ok(true)`. Plumbed into
+/// [`quil_execution::ExecutionEngineManager::new`] so the materializer
+/// can process ProverJoin / ProverConfirm bundles without the test
+/// having to produce byte-identical BLS aggregate signatures.
 ///
 /// Not suitable for any production-bug verification path — by
 /// definition it ignores cryptographic state. Wrap a real BLS verifier

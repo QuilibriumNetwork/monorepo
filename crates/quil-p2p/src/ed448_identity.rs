@@ -123,6 +123,50 @@ pub fn derive_public_key(seed: &[u8; 57]) -> Vec<u8> {
     pubkey.as_byte().to_vec()
 }
 
+/// Derive a deterministic worker Ed448 identity from a real prover
+/// private key and a core ID. Each (real_priv, core_id) pair yields a
+/// stable synthetic identity across restarts.
+///
+/// Mirrors Go's `node/p2p/blossomsub.go:473-496`:
+///
+/// ```text
+/// seed = SHAKE256(real_priv || "/worker/<core_id>")[:64]
+/// key  = Ed448(seed)
+/// ```
+///
+/// The synthetic key is used as the worker's libp2p host identity
+/// (peer ID for connection / peerstore), so a master + N workers all
+/// running off the same prover key do not collide on a single peer
+/// ID. Pubsub messages are signed separately with the REAL prover
+/// key so `msg.from` carries the prover's true peer ID — see
+/// `P2PNode::new_for_worker`.
+pub fn derive_worker_identity(
+    real_priv: &[u8; 57],
+    core_id: u32,
+) -> Result<Ed448Identity> {
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    let mut shake = sha3::Shake256::default();
+    shake.update(real_priv);
+    shake.update(format!("/worker/{}", core_id).as_bytes());
+    let mut reader = shake.finalize_xof();
+    let mut seed_64 = [0u8; 64];
+    reader.read(&mut seed_64);
+    // Ed448 takes a 57-byte seed; truncate the 64-byte SHAKE output.
+    let mut seed_57 = [0u8; 57];
+    seed_57.copy_from_slice(&seed_64[..57]);
+
+    let priv_key = ed448_rust::PrivateKey::from(seed_57);
+    let pub_key = ed448_rust::PublicKey::from(&priv_key);
+    let private_key = seed_57.to_vec();
+    let public_key = pub_key.as_byte().to_vec();
+    let peer_id_bytes = derive_peer_id_bytes(&public_key);
+    Ok(Ed448Identity {
+        private_key,
+        public_key,
+        peer_id_bytes,
+    })
+}
+
 /// Derive a libp2p peer ID from an Ed448 public key.
 ///
 /// Process:

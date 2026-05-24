@@ -34,6 +34,38 @@ use quil_engine::test_support::TestProverRegistry;
 use quil_store::testing::InMemoryClockStore;
 
 // ===================================================================
+// Test helper — ExecutionEngineManager built with noop crypto stubs.
+// ===================================================================
+
+/// Construct an `ExecutionEngineManager` slotted with the
+/// `quil_execution::testing::NoopExecutionCrypto` stubs. The new
+/// `ExecutionEngineManager::new` requires every crypto trait + clock
+/// store, so tests pull in this builder rather than constructing
+/// engines manually.
+fn build_test_exec_manager(
+    inclusion_prover: Arc<dyn InclusionProver>,
+    include_global: bool,
+) -> quil_execution::ExecutionEngineManager {
+    let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
+        Arc::new(quil_hypergraph::testing::MemStore::new());
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+        hg_store,
+        inclusion_prover.clone(),
+    ));
+    let stubs = quil_execution::testing::NoopExecutionCrypto::new();
+    quil_execution::ExecutionEngineManager::new(
+        inclusion_prover,
+        stubs.key_manager.clone(),
+        crdt,
+        stubs.bulletproof_prover,
+        stubs.decaf_constructor,
+        stubs.circuit_compiler,
+        stubs.clock_store,
+        include_global,
+    )
+}
+
+// ===================================================================
 // Stub FrameProver — deterministic outputs, real BLS signing.
 // ===================================================================
 
@@ -1256,12 +1288,10 @@ impl AppShardHarness {
                 // Empty buffer → 64-byte zero requests_root, so the
                 // existing wave of tests that send no messages still
                 // works.
-                execution_engine: Some(Arc::new(
-                    quil_execution::ExecutionEngineManager::new(
-                        Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
-                        /* include_global */ false,
-                    ),
-                )),
+                execution_engine: Some(Arc::new(build_test_exec_manager(
+                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
+                    /* include_global */ false,
+                ))),
                 inclusion_prover: Some(
                     Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>,
                 ),
@@ -1801,10 +1831,19 @@ pub fn build_tier2_archive_rig_with_key_manager(
     // 5. KeyManager (quil_types::crypto::KeyManager — verifies sigs).
     //    Caller-provided so adversarial tests can plug in real BLS
     //    verification; happy-path tests use AcceptAllKeyManager.
-    let exec_manager = Arc::new(ExecutionEngineManager::new_with_crypto(
+    //    Other crypto providers (bulletproof / decaf / circuit
+    //    compiler / clock store) come from the test stub bundle —
+    //    tier-2 archive happy-path tests don't exercise the QUIL PoMW
+    //    mint path or compute / token verify chains.
+    let exec_stubs = quil_execution::testing::NoopExecutionCrypto::new();
+    let exec_manager = Arc::new(ExecutionEngineManager::new(
         inclusion_prover.clone(),
         exec_key_manager,
         crdt.clone(),
+        exec_stubs.bulletproof_prover,
+        exec_stubs.decaf_constructor,
+        exec_stubs.circuit_compiler,
+        exec_stubs.clock_store,
         /* include_global */ true,
     ));
     // Wire frame-header deps so `invoke_frame_header` actually
@@ -4025,12 +4064,10 @@ async fn tier2_composite_end_to_end() {
             reward_greedy: true,
             coverage_publish,
             hypergraph: None,
-            execution_engine: Some(Arc::new(
-                quil_execution::ExecutionEngineManager::new(
-                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
-                    false,
-                ),
-            )),
+            execution_engine: Some(Arc::new(build_test_exec_manager(
+                Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
+                false,
+            ))),
             inclusion_prover: Some(
                 Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>,
             ),
@@ -4302,12 +4339,10 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
             reward_greedy: true,
             coverage_publish,
             hypergraph: None,
-            execution_engine: Some(Arc::new(
-                quil_execution::ExecutionEngineManager::new(
-                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
-                    false,
-                ),
-            )),
+            execution_engine: Some(Arc::new(build_test_exec_manager(
+                Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
+                false,
+            ))),
             inclusion_prover: Some(
                 Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver + Send + Sync>,
             ),

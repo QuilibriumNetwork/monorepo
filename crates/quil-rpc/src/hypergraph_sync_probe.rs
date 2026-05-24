@@ -73,6 +73,7 @@ pub struct ProberStats {
 pub async fn probe_perform_sync(
     addr: &str,
     ed448_seed: &[u8; 57],
+    expected_root: &[u8],
 ) -> Result<(), HyperSyncProbeError> {
     let client_config = build_quil_client_config(ed448_seed)
         .map_err(|e| HyperSyncProbeError::TlsInit(format!("{}", e)))?;
@@ -107,7 +108,7 @@ pub async fn probe_perform_sync(
                 shard_key,
                 phase_set: HypergraphPhaseSet::VertexAdds as i32,
                 path: Vec::new(),
-                expected_root: Vec::new(),
+                expected_root: expected_root.to_vec(),
             },
         )),
     };
@@ -181,6 +182,7 @@ pub async fn probe_pull_root_leaves(
     ed448_seed: &[u8; 57],
     phase: HypergraphPhaseSet,
     max_pages: u32,
+    expected_root: &[u8],
 ) -> Result<ProberStats, HyperSyncProbeError> {
     let client_config = build_quil_client_config(ed448_seed)
         .map_err(|e| HyperSyncProbeError::TlsInit(format!("{}", e)))?;
@@ -215,7 +217,7 @@ pub async fn probe_pull_root_leaves(
                 shard_key: shard_key.clone(),
                 phase_set: phase_i32,
                 path: Vec::new(),
-                expected_root: Vec::new(),
+                expected_root: expected_root.to_vec(),
             },
         )),
     })
@@ -269,7 +271,7 @@ pub async fn probe_pull_root_leaves(
                     path: leaves_path.clone(),
                     max_leaves: 1000,
                     continuation_token: continuation.clone(),
-                    expected_root: Vec::new(),
+                    expected_root: expected_root.to_vec(),
                 },
             )),
         })
@@ -352,6 +354,7 @@ pub async fn probe_build_local_tree(
     ed448_seed: &[u8; 57],
     phase: HypergraphPhaseSet,
     max_pages: u32,
+    expected_root: &[u8],
 ) -> Result<BuildTreeStats, HyperSyncProbeError> {
     let client_config = build_quil_client_config(ed448_seed)
         .map_err(|e| HyperSyncProbeError::TlsInit(format!("{}", e)))?;
@@ -385,7 +388,7 @@ pub async fn probe_build_local_tree(
                 shard_key: shard_key.clone(),
                 phase_set: phase_i32,
                 path: Vec::new(),
-                expected_root: Vec::new(),
+                expected_root: expected_root.to_vec(),
             },
         )),
     })
@@ -441,7 +444,7 @@ pub async fn probe_build_local_tree(
                     path: leaves_path.clone(),
                     max_leaves: 1000,
                     continuation_token: continuation.clone(),
-                    expected_root: Vec::new(),
+                    expected_root: expected_root.to_vec(),
                 },
             )),
         })
@@ -508,6 +511,28 @@ pub async fn probe_build_local_tree(
     stats.local_root_commitment = local_root.clone();
     stats.commitments_match = local_root == stats.server_root_commitment;
 
+    // If the caller pinned an expected_root from a verified frame's
+    // `prover_tree_commitment`, the locally-reconstructed root MUST
+    // match it. The server-claim match (above) only confirms internal
+    // consistency of what the peer sent; without this gate a
+    // malicious peer can serve a self-consistent fake snapshot at any
+    // root.
+    if !expected_root.is_empty() && local_root != expected_root {
+        warn!(
+            %addr,
+            local = hex::encode(&local_root),
+            expected = hex::encode(expected_root),
+            "synced tree root does NOT match caller-supplied expected_root \
+             (frame's prover_tree_commitment) — rejecting"
+        );
+        stats.commitments_match = false;
+        return Err(HyperSyncProbeError::Rpc(tonic::Status::data_loss(format!(
+            "HyperSync: synced root {} does not match expected {}",
+            hex::encode(&local_root),
+            hex::encode(expected_root),
+        ))));
+    }
+
     if stats.commitments_match {
         info!(
             %addr,
@@ -545,6 +570,7 @@ pub async fn build_local_tree_with_handle(
     ed448_seed: &[u8; 57],
     phase: HypergraphPhaseSet,
     max_pages: u32,
+    expected_root: &[u8],
 ) -> Result<
     (BuildTreeStats, VectorCommitmentTree, Vec<VertexDataEntry>),
     HyperSyncProbeError,
@@ -580,7 +606,7 @@ pub async fn build_local_tree_with_handle(
                 shard_key: shard_key.clone(),
                 phase_set: phase_i32,
                 path: Vec::new(),
-                expected_root: Vec::new(),
+                expected_root: expected_root.to_vec(),
             },
         )),
     })
@@ -643,7 +669,7 @@ pub async fn build_local_tree_with_handle(
                     path: leaves_path.clone(),
                     max_leaves: 1000,
                     continuation_token: continuation.clone(),
-                    expected_root: Vec::new(),
+                    expected_root: expected_root.to_vec(),
                 },
             )),
         })
@@ -714,6 +740,24 @@ pub async fn build_local_tree_with_handle(
     stats.local_root_commitment = local_root.clone();
     stats.commitments_match = local_root == stats.server_root_commitment;
 
+    // See probe_build_local_tree for rationale. The expected_root pin
+    // must match the locally-reconstructed root or the sync result is
+    // rejected.
+    if !expected_root.is_empty() && local_root != expected_root {
+        warn!(
+            %addr,
+            local = hex::encode(&local_root),
+            expected = hex::encode(expected_root),
+            "synced tree root does NOT match expected_root — rejecting"
+        );
+        stats.commitments_match = false;
+        return Err(HyperSyncProbeError::Rpc(tonic::Status::data_loss(format!(
+            "HyperSync: synced root {} does not match expected {}",
+            hex::encode(&local_root),
+            hex::encode(expected_root),
+        ))));
+    }
+
     Ok((stats, tree, vertex_data))
 }
 
@@ -724,6 +768,7 @@ pub async fn probe_inspect_vertex_data(
     ed448_seed: &[u8; 57],
     phase: HypergraphPhaseSet,
     leaves_to_inspect: usize,
+    expected_root: &[u8],
 ) -> Result<(), HyperSyncProbeError> {
     let client_config = build_quil_client_config(ed448_seed)
         .map_err(|e| HyperSyncProbeError::TlsInit(format!("{}", e)))?;
@@ -755,7 +800,7 @@ pub async fn probe_inspect_vertex_data(
                 shard_key: shard_key.clone(),
                 phase_set: phase_i32,
                 path: Vec::new(),
-                expected_root: Vec::new(),
+                expected_root: expected_root.to_vec(),
             },
         )),
     })
@@ -782,7 +827,7 @@ pub async fn probe_inspect_vertex_data(
                 path: root_branch.full_path.clone(),
                 max_leaves: leaves_to_inspect as u32,
                 continuation_token: Vec::new(),
-                expected_root: Vec::new(),
+                expected_root: expected_root.to_vec(),
             },
         )),
     })
@@ -901,8 +946,9 @@ pub async fn ensure_prover_tree(
     ed448_seed: &[u8; 57],
     phase: HypergraphPhaseSet,
     hg_store: Arc<RocksHypergraphStore>,
+    expected_root: &[u8],
 ) -> Result<BuildTreeStats, HyperSyncProbeError> {
-    ensure_prover_tree_incremental(addr, ed448_seed, phase, hg_store).await
+    ensure_prover_tree_incremental(addr, ed448_seed, phase, hg_store, expected_root).await
 }
 
 /// Like [`ensure_prover_tree`] but always does a network sync, ignoring any
@@ -913,6 +959,7 @@ pub async fn ensure_prover_tree_fresh(
     ed448_seed: &[u8; 57],
     phase: HypergraphPhaseSet,
     hg_store: Arc<RocksHypergraphStore>,
+    expected_root: &[u8],
 ) -> Result<BuildTreeStats, HyperSyncProbeError> {
     let shard = ShardKey {
         l1: [0u8; 3],
@@ -931,7 +978,7 @@ pub async fn ensure_prover_tree_fresh(
 
     info!(?phase, "fresh sync from archive (bypassing cache)");
     let (stats, tree, vertex_data) =
-        build_local_tree_with_handle(addr, ed448_seed, phase, 0).await?;
+        build_local_tree_with_handle(addr, ed448_seed, phase, 0, expected_root).await?;
 
     if !stats.commitments_match {
         warn!(?phase, "fresh sync commitment mismatch, NOT persisting");
@@ -972,6 +1019,7 @@ pub async fn ensure_prover_tree_incremental(
     ed448_seed: &[u8; 57],
     phase: HypergraphPhaseSet,
     hg_store: Arc<RocksHypergraphStore>,
+    expected_root: &[u8],
 ) -> Result<BuildTreeStats, HyperSyncProbeError> {
     let shard = ShardKey {
         l1: [0u8; 3],
@@ -1001,13 +1049,13 @@ pub async fn ensure_prover_tree_incremental(
                 }
                 _ => {
                     info!(?phase, "cached tree invalid, falling back to full sync");
-                    return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store).await;
+                    return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store, expected_root).await;
                 }
             }
         }
         _ => {
             info!(?phase, "no cached tree, falling back to full sync");
-            return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store).await;
+            return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store, expected_root).await;
         }
     };
 
@@ -1044,7 +1092,7 @@ pub async fn ensure_prover_tree_incremental(
                 shard_key: shard_key.clone(),
                 phase_set: phase_i32,
                 path: Vec::new(),
-                expected_root: Vec::new(),
+                expected_root: expected_root.to_vec(),
             },
         )),
     })
@@ -1057,13 +1105,31 @@ pub async fn ensure_prover_tree_incremental(
         Some(hypergraph_sync_response::Response::Branch(b)) => b,
         _ => {
             warn!(%addr, "unexpected root response in incremental sync");
-            return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store).await;
+            return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store, expected_root).await;
         }
     };
 
     let mut stats = BuildTreeStats::default();
     stats.server_root_commitment = root_branch.commitment.clone();
     stats.server_leaf_count = root_branch.leaf_count;
+
+    // When expected_root is pinned, the server's offered root must
+    // match it. Reject early — no point pulling leaves against a
+    // snapshot we already know diverges from the verified frame's
+    // prover_tree_commitment.
+    if !expected_root.is_empty() && root_branch.commitment != expected_root {
+        warn!(
+            %addr,
+            server_root = hex::encode(&root_branch.commitment),
+            expected = hex::encode(expected_root),
+            "incremental sync: server root does NOT match expected_root — rejecting"
+        );
+        return Err(HyperSyncProbeError::Rpc(tonic::Status::data_loss(format!(
+            "HyperSync incremental: server root {} does not match expected {}",
+            hex::encode(&root_branch.commitment),
+            hex::encode(expected_root),
+        ))));
+    }
 
     // Step 3: Compare root commitments — if equal, tree is up to date
     if local_commitment == root_branch.commitment {
@@ -1131,7 +1197,7 @@ pub async fn ensure_prover_tree_incremental(
             "local tree has children server lacks, falling back to full sync"
         );
         drop(tx);
-        return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store).await;
+        return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store, expected_root).await;
     }
 
     if changed_children.is_empty() {
@@ -1139,7 +1205,7 @@ pub async fn ensure_prover_tree_incremental(
         // Fall back to full sync for safety.
         info!(?phase, "all children match but root differs, falling back to full sync");
         drop(tx);
-        return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store).await;
+        return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store, expected_root).await;
     }
 
     info!(
@@ -1168,7 +1234,7 @@ pub async fn ensure_prover_tree_incremental(
                         path: child_path.clone(),
                         max_leaves: 1000,
                         continuation_token: continuation.clone(),
-                        expected_root: Vec::new(),
+                        expected_root: expected_root.to_vec(),
                     },
                 )),
             })
@@ -1236,7 +1302,24 @@ pub async fn ensure_prover_tree_incremental(
             ),
             "incremental sync commitment still doesn't match after leaf update, falling back to full sync"
         );
-        return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store).await;
+        return ensure_prover_tree_fresh(addr, ed448_seed, phase, hg_store, expected_root).await;
+    }
+
+    // Final guard against caller's pinned expected_root. The earlier
+    // early-reject covered the server's claimed root; this catches
+    // any divergence introduced during the leaf pull.
+    if !expected_root.is_empty() && new_root != expected_root {
+        warn!(
+            ?phase,
+            local = hex::encode(&new_root[..new_root.len().min(16)]),
+            expected = hex::encode(&expected_root[..expected_root.len().min(16)]),
+            "incremental sync: post-leaf-pull root does NOT match expected_root — rejecting"
+        );
+        return Err(HyperSyncProbeError::Rpc(tonic::Status::data_loss(format!(
+            "HyperSync incremental: post-pull root {} does not match expected {}",
+            hex::encode(&new_root),
+            hex::encode(expected_root),
+        ))));
     }
 
     // Step 7: Persist updated tree

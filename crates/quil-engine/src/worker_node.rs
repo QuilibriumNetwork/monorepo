@@ -37,10 +37,11 @@ pub struct WorkerNodeConfig {
     pub parent_pid: Option<u32>,
 }
 
-/// Handle to the master's PubSubProxy — used by a standalone worker
-/// to publish engine-produced events (FrameProduced, VoteProduced,
-/// TimeoutProduced) back into the p2p network. Wrapped in an
-/// abstraction so this crate doesn't depend on `quil-rpc`.
+/// Publish-side hook for the standalone worker's outbound traffic.
+/// Today this is wired to the master's PubSubProxy; once each worker
+/// runs its own libp2p instance with a synthetic peer key (per
+/// `node/p2p/blossomsub.go` lines ~452-496), this will dispatch to
+/// the worker's own p2p handle instead.
 pub type PublishFn = Arc<
     dyn Fn(Vec<u8>, Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send
@@ -80,6 +81,16 @@ pub struct WorkerOnlyNode {
     /// engine-produced messages are forwarded to the master for
     /// broadcast.
     publish_fn: Option<PublishFn>,
+    /// Worker-owned libp2p handle. Present when running in
+    /// standalone mode WITHOUT `engine.enable_master_proxy` — the
+    /// worker joins the mesh directly with a synthetic peer ID, and
+    /// `respawn` toggles per-shard bitmask subscriptions on it
+    /// without needing the master.
+    worker_p2p: Option<Arc<quil_p2p::P2PHandle>>,
+    /// Currently-subscribed shard bitmasks on the worker-owned p2p.
+    /// Tracked so a Respawn that swaps filters drops the old
+    /// subscriptions before adding new ones.
+    active_shard_subscriptions: std::sync::Mutex<Vec<Vec<u8>>>,
     /// Worker-local mirror of the master's coverage-halt verdict
     /// (set via the `SetHalted` IPC RPC). The publish pump consults
     /// this to drop in-flight FrameProduced / VoteProduced /
@@ -121,6 +132,8 @@ impl WorkerOnlyNode {
             engine_event_tx,
             engine_event_rx: std::sync::Mutex::new(Some(engine_event_rx)),
             publish_fn: None,
+            worker_p2p: None,
+            active_shard_subscriptions: std::sync::Mutex::new(Vec::new()),
             local_halted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -140,11 +153,21 @@ impl WorkerOnlyNode {
         self
     }
 
-    /// Supply a publish path (typically backed by a `ProxyPubSub`).
+    /// Supply a publish path (typically backed by a `ProxyPubSub`
+    /// today, the worker's own libp2p once that port lands).
     /// Enables the worker to forward engine-produced messages
     /// upstream. Must be called before `run()`.
     pub fn with_publish_fn(mut self, publish: PublishFn) -> Self {
         self.publish_fn = Some(publish);
+        self
+    }
+
+    /// Supply the worker's own libp2p handle (standalone, non-proxy
+    /// mode). [`Self::respawn`] uses it to subscribe to per-shard
+    /// bitmasks when the engine activates and to unsubscribe on
+    /// teardown.
+    pub fn with_p2p_handle(mut self, handle: Arc<quil_p2p::P2PHandle>) -> Self {
+        self.worker_p2p = Some(handle);
         self
     }
 
@@ -287,11 +310,13 @@ impl WorkerOnlyNode {
     pub async fn respawn(&self, filter: Vec<u8>) -> Result<()> {
         let core_id = self.config.core_id;
 
-        // Stop existing engine
+        // Stop existing engine and drop subscriptions for the
+        // outgoing filter.
         {
             let mut handle = self.engine_handle.lock().unwrap();
-            *handle = None; // Drop the old handle
+            *handle = None;
         }
+        self.unsubscribe_active_shards().await;
 
         if filter.is_empty() {
             info!(core_id, "worker set to idle (no filter)");
@@ -337,7 +362,7 @@ impl WorkerOnlyNode {
 
         let (engine, handle) = AppConsensusEngine::new(
             core_id,
-            filter,
+            filter.clone(),
             deps,
             self.engine_event_tx.clone(),
         );
@@ -354,26 +379,100 @@ impl WorkerOnlyNode {
             engine.run(bls_signer).await;
         });
 
+        // Subscribe to per-shard bitmasks on the worker's own p2p so
+        // peer-published shard traffic flows in. No-op when running in
+        // proxy mode (worker_p2p is None there).
+        self.subscribe_to_shard_bitmasks(&filter).await;
+
         Ok(())
     }
 
-    /// Route an incoming message from the master to the active engine.
-    pub fn route_message(&self, data: &[u8], bitmask: &[u8]) {
-        let handle = self.engine_handle.lock().unwrap();
-        if let Some(ref h) = *handle {
-            // Route based on bitmask type
-            if bitmask.len() <= 1 {
-                h.send(AppEngineMessage::GlobalFrame(data.to_vec()));
-            } else if bitmask.len() <= 2 {
-                h.send(AppEngineMessage::Frame(data.to_vec()));
-            } else if bitmask.len() <= 3 {
-                h.send(AppEngineMessage::Prover(data.to_vec()));
-            } else if bitmask.len() <= 4 {
-                h.send(AppEngineMessage::PeerInfo(data.to_vec()));
-            } else {
-                h.send(AppEngineMessage::Consensus(data.to_vec()));
-            }
+    /// Subscribe to all four per-shard bitmasks for `filter` on the
+    /// worker-owned p2p handle. Tracks the subscriptions so the next
+    /// respawn can unsubscribe them.
+    async fn subscribe_to_shard_bitmasks(&self, filter: &[u8]) {
+        let Some(p2p) = self.worker_p2p.clone() else { return };
+        let bitmasks = vec![
+            crate::bitmasks::shard_frame_bitmask(filter),
+            crate::bitmasks::shard_consensus_bitmask(filter),
+            crate::bitmasks::shard_prover_bitmask(filter),
+            crate::bitmasks::shard_dispatch_bitmask(filter),
+        ];
+        for bm in &bitmasks {
+            p2p.subscribe(bm.clone()).await;
         }
+        let mut tracked = self.active_shard_subscriptions.lock().unwrap();
+        *tracked = bitmasks;
+    }
+
+    /// Inverse of [`Self::subscribe_to_shard_bitmasks`]. Idempotent —
+    /// safe to call when nothing was previously subscribed.
+    async fn unsubscribe_active_shards(&self) {
+        let Some(p2p) = self.worker_p2p.clone() else { return };
+        let previous: Vec<Vec<u8>> = {
+            let mut tracked = self.active_shard_subscriptions.lock().unwrap();
+            std::mem::take(&mut *tracked)
+        };
+        for bm in previous {
+            p2p.unsubscribe(bm).await;
+        }
+    }
+
+    /// Route an incoming message from the master to the active engine.
+    /// Bitmask dispatch:
+    ///   - `[0x00, 0x00, 0x00, 0x00]` → global peer info
+    ///   - `[0x00, 0x00, 0x00]`       → global prover
+    ///   - `[0x00, 0x00]`             → global frame
+    ///   - `[0x00]`                   → global consensus
+    ///   - `shard_frame_bitmask(f)`     → Frame
+    ///   - `shard_consensus_bitmask(f)` → Consensus
+    ///   - `shard_prover_bitmask(f)`    → Prover
+    ///   - `shard_dispatch_bitmask(f)`  → Dispatch
+    pub fn route_message(&self, data: &[u8], bitmask: &[u8]) {
+        let handle = {
+            let guard = self.engine_handle.lock().unwrap();
+            guard.clone()
+        };
+        let Some(h) = handle else { return };
+        // Globals are detected by their fixed prefix-of-zeros shape.
+        match bitmask {
+            crate::bitmasks::GLOBAL_PEER_INFO => {
+                h.send(AppEngineMessage::PeerInfo(data.to_vec()));
+                return;
+            }
+            crate::bitmasks::GLOBAL_PROVER => {
+                h.send(AppEngineMessage::Prover(data.to_vec()));
+                return;
+            }
+            crate::bitmasks::GLOBAL_FRAME => {
+                h.send(AppEngineMessage::GlobalFrame(data.to_vec()));
+                return;
+            }
+            crate::bitmasks::GLOBAL_CONSENSUS => {
+                h.send(AppEngineMessage::Consensus(data.to_vec()));
+                return;
+            }
+            _ => {}
+        }
+        // Per-shard bitmask routing. Compare against the engine's
+        // own filter — a message tagged with another shard's filter
+        // would still be delivered to this engine but the engine's
+        // app-address gate (`handle_app_shard_proposal` et al.)
+        // drops it.
+        let filter = &h.filter;
+        if bitmask == crate::bitmasks::shard_frame_bitmask(filter).as_slice() {
+            h.send(AppEngineMessage::Frame(data.to_vec()));
+        } else if bitmask == crate::bitmasks::shard_consensus_bitmask(filter).as_slice() {
+            h.send(AppEngineMessage::Consensus(data.to_vec()));
+        } else if bitmask == crate::bitmasks::shard_prover_bitmask(filter).as_slice() {
+            h.send(AppEngineMessage::Prover(data.to_vec()));
+        } else if bitmask == crate::bitmasks::shard_dispatch_bitmask(filter).as_slice() {
+            h.send(AppEngineMessage::Dispatch(data.to_vec()));
+        }
+        // Unknown bitmask shape — silently drop. Logging every drop
+        // is noisy because the master fans out all peer pubsub to
+        // every standalone worker; the worker only cares about its
+        // own filter's bitmasks.
     }
 
     /// Stop the worker node.
@@ -640,27 +739,55 @@ pub fn multiaddr_to_socket_addr(ma: &str) -> Option<String> {
 
 /// Compute the master's gRPC endpoint from config.
 ///
-/// Uses `data_worker_base_stream_port` as the master's gRPC port,
-/// with the master address derived from the base listen multiaddr.
-/// If the base multiaddr is `/ip4/0.0.0.0/tcp/%d`, the master
-/// is on localhost. For remote clusters, the master address should
-/// be explicitly configured.
-pub fn master_grpc_endpoint(config: &quil_config::EngineConfig) -> String {
-    // Extract host from data_worker_base_listen_multiaddr
-    let host = config.data_worker_base_listen_multiaddr
-        .split('/')
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find(|w| w[0] == "ip4" || w[0] == "ip6")
-        .map(|w| w[1].to_string())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+/// Uses `p2p.stream_listen_multiaddr` — on the worker's config in a
+/// cluster setup, this points at the master's gRPC stream listener.
+/// A host of `0.0.0.0` is rewritten to `127.0.0.1` so single-machine
+/// (master+worker on the same host) layouts keep working unchanged.
+///
+/// Returns an `http://host:port` URL ready to pass to `tonic`.
+pub fn master_grpc_endpoint(config: &quil_config::Config) -> String {
+    // p2p.stream_listen_multiaddr defaults to /ip4/0.0.0.0/tcp/8340.
+    let ma = config.p2p.stream_listen_multiaddr.trim();
+    let default_port: u16 = 8340;
+    if let Some(endpoint) = multiaddr_to_http_endpoint(ma, default_port) {
+        return endpoint;
+    }
+    tracing::warn!(
+        stream_listen = %ma,
+        "p2p.stream_listen_multiaddr does not parse — falling back to localhost",
+    );
+    format!("http://127.0.0.1:{}", default_port)
+}
 
-    // Master's stream port (same as the base — workers offset from this)
-    let port = config.data_worker_base_stream_port;
-
-    // If host is 0.0.0.0, use localhost (workers connect to master)
-    let resolved_host = if host == "0.0.0.0" { "127.0.0.1" } else { &host };
-    format!("http://{}:{}", resolved_host, port)
+/// Parse a multiaddr like `/ip4/10.0.0.5/tcp/32500` into
+/// `http://10.0.0.5:32500`. Returns `None` if the address can't be
+/// extracted. `0.0.0.0` is rewritten to `127.0.0.1` so single-machine
+/// layouts (master listens on all interfaces) still resolve to a
+/// dialable host. `default_port` is used only when the multiaddr is
+/// missing a tcp/udp port component.
+fn multiaddr_to_http_endpoint(ma: &str, default_port: u16) -> Option<String> {
+    let parts: Vec<&str> = ma.split('/').filter(|s| !s.is_empty()).collect();
+    let mut host: Option<String> = None;
+    let mut port: Option<String> = None;
+    let mut i = 0;
+    while i + 1 < parts.len() {
+        match parts[i] {
+            "ip4" => host = Some(parts[i + 1].to_string()),
+            "ip6" => host = Some(format!("[{}]", parts[i + 1])),
+            "dns" | "dns4" | "dns6" => host = Some(parts[i + 1].to_string()),
+            "tcp" | "udp" => port = Some(parts[i + 1].to_string()),
+            _ => {}
+        }
+        i += 2;
+    }
+    let mut h = host?;
+    if h == "0.0.0.0" {
+        h = "127.0.0.1".to_string();
+    } else if h == "[::]" {
+        h = "[::1]".to_string();
+    }
+    let p = port.unwrap_or_else(|| default_port.to_string());
+    Some(format!("http://{}:{}", h, p))
 }
 
 #[cfg(test)]
@@ -729,5 +856,64 @@ mod tests {
         // Saturate near the top of u16.
         let result = worker_listen_addr(1000, "/ip4/0.0.0.0/tcp/%d", 65000, &addrs);
         assert_eq!(result, "0.0.0.0:65535");
+    }
+
+    fn config_with_stream(ma: &str) -> quil_config::Config {
+        let mut c = quil_config::Config::default();
+        c.p2p.stream_listen_multiaddr = ma.to_string();
+        c
+    }
+
+    #[test]
+    fn master_endpoint_rewrites_unspecified_v4_to_localhost() {
+        // Single-machine: master listens on 0.0.0.0; the worker's
+        // dial target must be 127.0.0.1.
+        let c = config_with_stream("/ip4/0.0.0.0/tcp/8340");
+        assert_eq!(master_grpc_endpoint(&c), "http://127.0.0.1:8340");
+    }
+
+    #[test]
+    fn master_endpoint_cluster_uses_remote_master_ip() {
+        // Cluster: worker's config has stream_listen_multiaddr pointed
+        // at the master on a different machine.
+        let c = config_with_stream("/ip4/10.0.0.5/tcp/8340");
+        assert_eq!(master_grpc_endpoint(&c), "http://10.0.0.5:8340");
+    }
+
+    #[test]
+    fn master_endpoint_honors_non_default_port() {
+        let c = config_with_stream("/ip4/10.0.0.5/tcp/40000");
+        assert_eq!(master_grpc_endpoint(&c), "http://10.0.0.5:40000");
+    }
+
+    #[test]
+    fn master_endpoint_ipv6() {
+        let c = config_with_stream("/ip6/::1/tcp/8340");
+        assert_eq!(master_grpc_endpoint(&c), "http://[::1]:8340");
+    }
+
+    #[test]
+    fn master_endpoint_ipv6_unspecified_rewritten_to_loopback() {
+        // Multiaddrs encode IPv6 without brackets — the wire form is
+        // /ip6/::/tcp/8340. The parser brackets it for the URL, and
+        // the "all interfaces" sentinel `[::]` gets rewritten to the
+        // loopback `[::1]` so single-machine layouts work.
+        let c = config_with_stream("/ip6/::/tcp/8340");
+        assert_eq!(master_grpc_endpoint(&c), "http://[::1]:8340");
+    }
+
+    #[test]
+    fn master_endpoint_dns() {
+        let c = config_with_stream("/dns4/master.local/tcp/8340");
+        assert_eq!(master_grpc_endpoint(&c), "http://master.local:8340");
+    }
+
+    #[test]
+    fn master_endpoint_falls_back_when_unparseable() {
+        // Garbage falls back to localhost with a warn log rather than
+        // panicking — the worker still starts and the operator sees
+        // the misconfig in logs.
+        let c = config_with_stream("not-a-multiaddr");
+        assert_eq!(master_grpc_endpoint(&c), "http://127.0.0.1:8340");
     }
 }

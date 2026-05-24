@@ -5,6 +5,13 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Execution engines (Global, Token, Compute, Hypergraph) for the Quilibrium node"
 
+[features]
+# Expose the noop crypto/store stubs used by execution-engine tests to
+# satisfy the now-mandatory `Arc<dyn ...>` constructor parameters.
+# Downstream crates that need to build a manager in their own tests
+# pull this feature in as a dev-dependency.
+testing-stubs = []
+
 [dependencies]
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
@@ -34,6 +41,7 @@ quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-engine = { path = "../quil-engine" }
 quil-p2p = { path = "../quil-p2p" }
 ed448-rust = { path = "../ed448-rust" }
+proptest = "1"
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }

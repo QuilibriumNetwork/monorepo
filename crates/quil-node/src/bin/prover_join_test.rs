@@ -283,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
                         &addr, &ed448_seed,
                         quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
                         s,
+                        &[], // test binary: no expected_root pin
                     ).await;
                 }
 
@@ -538,6 +539,7 @@ async fn main() -> anyhow::Result<()> {
                             &addr, &ed448_seed,
                             quil_types::proto::application::HypergraphPhaseSet::VertexAdds,
                             hs.clone(),
+                            &[], // test binary: no expected_root pin
                         ).await;
 
                         let reg = Arc::new(quil_execution::SharedProverRegistry::new());

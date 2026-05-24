@@ -100,6 +100,7 @@ pub fn verify_prover_kick_full(
     bls: &dyn quil_types::crypto::BlsConstructor,
     hypergraph: &quil_hypergraph::HypergraphCrdt,
     inclusion_prover: &dyn quil_types::crypto::InclusionProver,
+    prover_registry: Option<&dyn quil_types::consensus::ProverRegistry>,
 ) -> Result<()> {
     // 1. Structural checks on the two conflicting frames.
     if !verify_equivocation_structural(kick)? {
@@ -116,14 +117,35 @@ pub fn verify_prover_kick_full(
     verify_conflicting_frame_bls(&kick.conflicting_frame_2, tp, frame_prover, bls)?;
 
     // 3. Load frame N-1 and verify traversal proof against its
-    //    ProverTreeCommitment. Go falls back to RangeGlobalClockFrameCandidates
-    //    if the direct fetch fails — we surface the error.
+    //    ProverTreeCommitment. Fall back to the candidate range
+    //    lookup if the certified frame isn't present — matches Go's
+    //    `RangeGlobalClockFrameCandidates` recovery at
+    //    `global_prover_kick.go:400-426`. Without the fallback,
+    //    validators reject valid kicks at chain-reorg boundaries
+    //    where the certified frame hasn't settled yet but candidates
+    //    are available.
     if frame_number == 0 {
         return Err(QuilError::InvalidArgument(
             "prover kick: frame_number must be > 0".into(),
         ));
     }
-    let prev_frame = clock_store.get_global_clock_frame(frame_number - 1)?;
+    let prev_frame = match clock_store.get_global_clock_frame(frame_number - 1) {
+        Ok(f) => f,
+        Err(e) => {
+            let candidates = clock_store
+                .range_global_clock_frame_candidates(frame_number - 1, frame_number - 1, 1)
+                .map_err(|range_e| QuilError::InvalidArgument(format!(
+                    "prover kick: previous frame {} not certified ({e}) and \
+                     candidate fallback failed: {range_e}",
+                    frame_number - 1,
+                )))?;
+            candidates.into_iter().next().ok_or_else(|| QuilError::InvalidArgument(format!(
+                "prover kick: previous frame {} not certified ({e}) and \
+                 no candidates available",
+                frame_number - 1,
+            )))?
+        }
+    };
     let prev_header = prev_frame.header.ok_or_else(|| QuilError::InvalidArgument(
         "prover kick: previous frame has no header".into(),
     ))?;
@@ -166,9 +188,22 @@ pub fn verify_prover_kick_full(
     // [][]byte with one entry since commitment is the multiproof root).
     let commit_refs: Vec<&[u8]> = vec![&kick.commitment, &kick.commitment];
     let eval_refs: Vec<&[u8]> = evals.iter().map(|e| e.as_slice()).collect();
-    // Indices 0 + 1 mirror the (PublicKey, Status) field order in the
-    // prover:Prover type.
-    let indices: [u64; 2] = [0, 1];
+    // Schema-driven field-order lookup. Hardcoding the indices
+    // `[0, 1]` would mean a future RDF schema reorder (PublicKey or
+    // Status moving) breaks consensus between Rust and Go nodes since
+    // each side picks its own ordering. Reading from
+    // `crate::global_schema::field_tag` keeps the indices in lockstep
+    // with the source-of-truth schema definition that every other
+    // lookup in the codebase uses.
+    let pk_tag = crate::global_schema::field_tag("prover:Prover", "PublicKey")
+        .ok_or_else(|| QuilError::Internal(
+            "ProverKick: prover:Prover.PublicKey missing from schema".into(),
+        ))?;
+    let status_tag = crate::global_schema::field_tag("prover:Prover", "Status")
+        .ok_or_else(|| QuilError::Internal(
+            "ProverKick: prover:Prover.Status missing from schema".into(),
+        ))?;
+    let indices: [u64; 2] = [pk_tag.order as u64, status_tag.order as u64];
     if !inclusion_prover.verify_multiple(
         &commit_refs,
         &eval_refs,
@@ -189,7 +224,147 @@ pub fn verify_prover_kick_full(
     // short-circuiting here.)
     let _ = hypergraph; // reserved for a future explicit spend/vertex lookup.
 
+    // Current-status pre-gate. A second kick of a prover who is
+    // already Status=4 (kicked/left) validates but materializes as a
+    // no-op — splitting consensus on whether the op was processed.
+    // Reject the kick if the kicked prover's current status is
+    // already 4. We read directly from the CRDT (the kick is
+    // validated before any changeset would be applied, so going
+    // through HypergraphState's changeset layer adds no value and
+    // the CRDT doesn't impl Clone needed for Arc-wrapping).
+    let prover_addr_bytes = quil_crypto::poseidon::hash_bytes_to_32(
+        &kick.kicked_prover_public_key,
+    )?;
+    let mut prover_loc_id = [0u8; 64];
+    prover_loc_id[..32].copy_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
+    prover_loc_id[32..].copy_from_slice(&prover_addr_bytes);
+    let prover_loc = quil_hypergraph::Location::from_id(&prover_loc_id);
+    if let Some(blob) = hypergraph.get_vertex_data(&prover_loc) {
+        if !blob.is_empty() {
+            let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            if let Some(status_bytes) =
+                crate::global_schema::read_field(&prover_tree, "prover:Prover", "Status")
+            {
+                if let Some(&status) = status_bytes.first() {
+                    const STATUS_KICKED: u8 = 4;
+                    if status == STATUS_KICKED {
+                        return Err(QuilError::InvalidArgument(
+                            "ProverKick: kicked prover already has Status=4 — \
+                             refusing to double-kick (avoids consensus split on \
+                             whether the materialize was a no-op)".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Bitmask-overlap check. Without this, anyone can submit two
+    // BLS-valid frames signed by arbitrary signer sets and have the
+    // network kick any prover whose pubkey they paste into
+    // `kicked_prover_public_key`. Go enforces this at
+    // `global_prover_kick.go:597-643`.
+    if let Some(pr) = prover_registry {
+        let (filter1, bitmask1) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_1)?;
+        let (filter2, bitmask2) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_2)?;
+        if filter1 != filter2 {
+            return Err(QuilError::InvalidArgument(
+                "ProverKick: conflicting frames have different filters/addresses".into(),
+            ));
+        }
+        verify_kick_bitmask_overlap(kick, &filter1, &bitmask1, &bitmask2, pr)?;
+    }
+
     Ok(())
+}
+
+/// ProverKick bitmask-overlap check. Mirrors Go
+/// `global_prover_kick.go:597-643`. An equivocation kick requires
+/// that the kicked prover actually signed BOTH conflicting frames —
+/// otherwise anyone with two BLS-valid frames signed by anyone can
+/// kick any prover.
+///
+/// Steps:
+///   1. Extract each frame's BLS aggregate signature bitmask.
+///   2. Compute the kicked prover's address = `poseidon(pubkey)`.
+///   3. Look up active provers for the frame's filter/address via
+///      `prover_registry.get_active_provers`.
+///   4. Find the kicked prover's index in that set.
+///   5. Check both bitmasks have that bit set.
+///
+/// Returns `Ok(())` only when the overlap is confirmed. `prover_filter`
+/// is the filter or shard address that both conflicting frames
+/// reference (already verified equal by the structural check).
+pub fn verify_kick_bitmask_overlap(
+    kick: &ProverKick,
+    prover_filter: &[u8],
+    bitmask1: &[u8],
+    bitmask2: &[u8],
+    prover_registry: &dyn quil_types::consensus::ProverRegistry,
+) -> Result<()> {
+    let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(
+        &kick.kicked_prover_public_key,
+    )?;
+    let active = prover_registry
+        .get_active_provers(prover_filter)
+        .map_err(|e| QuilError::InvalidArgument(format!(
+            "ProverKick: get_active_provers failed: {e}"
+        )))?;
+    let index = active
+        .iter()
+        .position(|p| p.address.as_slice() == prover_addr.as_slice())
+        .ok_or_else(|| QuilError::InvalidArgument(
+            "ProverKick: kicked prover not in active set for the conflicting frames' filter".into(),
+        ))?;
+    let byte_index = index / 8;
+    let bit_index = index % 8;
+    let b = 1u8 << bit_index;
+    let b1 = bitmask1.get(byte_index).copied().unwrap_or(0);
+    let b2 = bitmask2.get(byte_index).copied().unwrap_or(0);
+    if (b & b1) == 0 || (b & b2) == 0 {
+        return Err(QuilError::InvalidArgument(format!(
+            "ProverKick: no bitmask overlap — kicked prover (index {}) \
+             not present in both conflicting frames' aggregate signatures \
+             (b1={:08b} b2={:08b})",
+            index, b1, b2,
+        )));
+    }
+    Ok(())
+}
+
+/// Extract `(filter_or_address, bitmask)` from one conflicting frame's
+/// canonical bytes. Returns Err on decode failure. For
+/// `TYPE_GLOBAL_FRAME_HEADER` the "filter" is the empty address (global
+/// frames are not per-shard). For `TYPE_FRAME_HEADER` (app shard) it's
+/// the header's `address` field.
+pub fn extract_kick_frame_filter_and_bitmask(
+    frame_bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if frame_bytes.len() < 4 {
+        return Err(QuilError::InvalidArgument(
+            "ProverKick: conflicting frame too short".into(),
+        ));
+    }
+    let tp = u32::from_be_bytes(frame_bytes[..4].try_into().unwrap());
+    if tp == GLOBAL_FRAME_HEADER_TYPE {
+        // GlobalFrameHeader has no per-shard filter — Go uses an
+        // empty/global filter for active-prover lookups in this case.
+        let header = super::frame_header::GlobalFrameHeader::from_canonical_bytes(frame_bytes)?;
+        let agg = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
+            &header.public_key_signature_bls48581,
+        )?;
+        Ok((Vec::new(), agg.bitmask))
+    } else if tp == FRAME_HEADER_TYPE {
+        let header = super::frame_header::FrameHeader::from_canonical_bytes(frame_bytes)?;
+        let agg = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
+            &header.public_key_signature_bls48581,
+        )?;
+        Ok((header.address, agg.bitmask))
+    } else {
+        Err(QuilError::InvalidArgument(format!(
+            "ProverKick: conflicting frame has unknown type prefix 0x{:08x}", tp
+        )))
+    }
 }
 
 /// Verify the BLS aggregate signature on a single conflicting frame,
