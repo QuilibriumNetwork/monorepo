@@ -1,0 +1,151 @@
+name: Setup native deps (FLINT, EMP-tool, EMP-OT)
+description: |
+  Installs the system packages, FLINT (static), and EMP-tool/EMP-OT (static)
+  needed to build the Rust workspace. Handles linux (apt) and macOS
+  (Homebrew). FLINT is built from source on both — Homebrew ships only a
+  dynamic libflint, and we want a fully-static link on macOS so the
+  release binary doesn't depend on libflint.dylib at runtime.
+
+  Outputs:
+    flint-dir: install root for FLINT. On macOS this is
+      $GITHUB_WORKSPACE/src/flint (consumed by node/build.sh via FLINT_DIR).
+      On linux it's /usr/local (build.rs picks it up automatically).
+
+outputs:
+  flint-dir:
+    description: FLINT install root (set FLINT_DIR to this value on macOS)
+    value: ${{ steps.flint-paths.outputs.flint-dir }}
+
+runs:
+  using: composite
+  steps:
+    # -------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------
+    - name: apt install (linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
+          cmake \
+          pkg-config \
+          libgmp-dev \
+          libmpfr-dev \
+          libssl-dev \
+          m4 \
+          autoconf \
+          automake \
+          libtool \
+          git
+
+    - name: brew install (macos)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew update
+        brew install gmp mpfr openssl@3 cmake autoconf automake libtool m4 pkg-config
+
+    # -------------------------------------------------------------
+    # Resolve FLINT install paths per OS
+    # -------------------------------------------------------------
+    - name: Resolve FLINT paths
+      id: flint-paths
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
+          echo "flint-dir=$GITHUB_WORKSPACE/src/flint" >> "$GITHUB_OUTPUT"
+          echo "flint-prefix=$GITHUB_WORKSPACE/src/flint" >> "$GITHUB_OUTPUT"
+        else
+          echo "flint-dir=/usr/local" >> "$GITHUB_OUTPUT"
+          echo "flint-prefix=/usr/local" >> "$GITHUB_OUTPUT"
+        fi
+
+    # -------------------------------------------------------------
+    # FLINT 3.0 — built from source, cached per OS/arch
+    # -------------------------------------------------------------
+    - name: Cache FLINT install
+      id: cache-flint
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ steps.flint-paths.outputs.flint-prefix }}/lib/libflint.*
+          ${{ steps.flint-paths.outputs.flint-prefix }}/include/flint
+          ${{ steps.flint-paths.outputs.flint-prefix }}/lib/pkgconfig/flint.pc
+        key: flint-3.0-${{ runner.os }}-${{ runner.arch }}-v1
+
+    - name: Build FLINT 3.0 (linux)
+      if: runner.os == 'Linux' && steps.cache-flint.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        FLINT_TMP="$(mktemp -d)"
+        git clone --depth 1 --branch flint-3.0 https://github.com/flintlib/flint.git "$FLINT_TMP"
+        pushd "$FLINT_TMP"
+        ./bootstrap.sh
+        ./configure \
+          --prefix=/usr/local \
+          --with-gmp=/usr/local \
+          --with-mpfr=/usr/local \
+          --enable-static --disable-shared \
+          CFLAGS="-O3"
+        make -j"$(nproc)"
+        sudo make install
+        popd
+        rm -rf "$FLINT_TMP"
+
+    - name: Build FLINT 3.0 (macos)
+      if: runner.os == 'macOS' && steps.cache-flint.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        FLINT_PREFIX="${{ steps.flint-paths.outputs.flint-prefix }}"
+        mkdir -p "$(dirname "$FLINT_PREFIX")"
+        FLINT_TMP="$(mktemp -d)"
+        git clone --depth 1 --branch flint-3.0 https://github.com/flintlib/flint.git "$FLINT_TMP"
+        pushd "$FLINT_TMP"
+        ./bootstrap.sh
+        ./configure \
+          --prefix="$FLINT_PREFIX" \
+          --with-gmp="$(brew --prefix gmp)" \
+          --with-mpfr="$(brew --prefix mpfr)" \
+          --enable-static --disable-shared \
+          CFLAGS="-O3"
+        make -j"$(sysctl -n hw.ncpu)"
+        make install
+        popd
+        rm -rf "$FLINT_TMP"
+
+    # -------------------------------------------------------------
+    # EMP-tool + EMP-OT — in-tree sources, cmake build/install,
+    # cached on the source-tree SHA so cache invalidates if those
+    # directories change.
+    # -------------------------------------------------------------
+    - name: Cache EMP-tool / EMP-OT install
+      id: cache-emp
+      uses: actions/cache@v4
+      with:
+        path: |
+          /usr/local/include/emp-tool
+          /usr/local/include/emp-ot
+          /usr/local/lib/libemp-tool.*
+          /usr/local/lib/cmake/emp-tool
+          /usr/local/lib/cmake/emp-ot
+        key: emp-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('emp-tool/**', 'emp-ot/**') }}
+
+    - name: Build EMP-tool + EMP-OT
+      if: steps.cache-emp.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        # Patch emp-tool's CMakeLists to build a STATIC library — matches
+        # scripts/install-deps-ubuntu.sh:60–79 and ensures the ferret
+        # crate links statically.
+        sed -i.bak 's|add_library(${NAME} SHARED ${sources})|add_library(${NAME} STATIC ${sources})|g' emp-tool/CMakeLists.txt
+        rm -f emp-tool/CMakeLists.txt.bak
+
+        cmake -S emp-tool -B emp-tool/build -DCMAKE_INSTALL_PREFIX=/usr/local
+        cmake --build emp-tool/build -j
+        sudo cmake --install emp-tool/build
+
+        cmake -S emp-ot -B emp-ot/build -DCMAKE_INSTALL_PREFIX=/usr/local
+        cmake --build emp-ot/build -j
+        sudo cmake --install emp-ot/build
