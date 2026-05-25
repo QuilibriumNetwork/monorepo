@@ -835,23 +835,32 @@ async fn run_master_node(
     // GLOBAL_FRAME subscription is archive-only — non-archive nodes
     // get the chain head via the archive poller and don't need the
     // gossip firehose (matches Go's behavior). Subscribing on a
-    // non-archive would just feed backfill / out-of-order frames
-    // into the receive loop for no benefit.
-    // Archive nodes subscribe to GLOBAL_FRAME + GLOBAL_PROVER for full
-    // gossip participation — they're the authoritative processors.
-    // Non-archive nodes skip both: they get global frames from the
-    // archive poller and submit prover messages via direct gRPC.
-    // GLOBAL_CONSENSUS and GLOBAL_PEER_INFO are universal.
+    // In Go, all global-bitmask subscriptions except GLOBAL_PEER_INFO
+    // are gated on `isConsensusParticipant()` which is `ArchiveMode ||
+    // Network == 99`. Non-archive nodes receive frames from the
+    // archive poller, submit prover messages via direct gRPC, and
+    // participate in per-shard consensus only (subscribed dynamically
+    // by the AppConsensusEngine). Subscribing to GLOBAL_CONSENSUS on
+    // a non-archive causes every global-frame vote/proposal from every
+    // archive to be relayed through the non-archive — massive
+    // bandwidth and processing overhead with zero benefit.
+    //
+    // Archives also do a bulk subscribe to `[0xFF; 32]` (catches all
+    // shard traffic via bloom overlap) for the app-frames queue.
     if archive_mode {
         p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec()).await;
+        p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec()).await;
         p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec()).await;
+        // Bulk shard subscription — mirrors Go's `bytes.Repeat([]byte{0xff}, 32)`
+        // inside `subscribeToGlobalConsensus`. Catches all per-shard frame/
+        // consensus/prover traffic via bloom-filter overlap.
+        p2p_handle.subscribe(vec![0xFFu8; 32]).await;
     }
-    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec()).await;
     p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
     if archive_mode {
-        info!("subscribed to all global bitmasks (archive mode)");
+        info!("subscribed to all global + bulk shard bitmasks (archive mode)");
     } else {
-        info!("subscribed to global consensus + peer info bitmasks (non-archive — GLOBAL_FRAME and GLOBAL_PROVER via direct RPC only)");
+        info!("subscribed to GLOBAL_PEER_INFO only (non-archive)");
     }
 
     // Apply engine blacklist — deny connections from blacklisted peers.

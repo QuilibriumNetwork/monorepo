@@ -175,6 +175,7 @@ struct AppLeaderProvider {
     message_collector: Arc<MessageCollector>,
     fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager>,
     local_prover_address: Vec<u8>,
+    #[allow(dead_code)]
     local_public_key: Vec<u8>,
     current_difficulty: Arc<std::sync::atomic::AtomicU32>,
     reward_greedy: bool,
@@ -350,12 +351,17 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // Compute VDF proof (blocking). Including timestamp + fee in
         // the challenge ensures consecutive ranks within the same frame
         // produce distinct outputs and therefore distinct identities.
+        // Go passes `getProverAddress()` = `poseidon(pubkey)` (32 bytes)
+        // as the `prover` field in the frame header, NOT the raw G2
+        // public key (585 bytes). Using the raw pubkey would produce
+        // headers that other nodes can't match to the prover registry
+        // (which is keyed by poseidon address).
         let header = self.frame_prover.prove_frame_header(
             &previous_frame_output,
             &self.filter,
             &requests_root,
             &state_roots,
-            &self.local_public_key,
+            &self.local_prover_address,
             now_ms,
             difficulty,
             fee_multiplier_vote,
@@ -370,7 +376,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             difficulty,
             header.output.clone(),
             header.parent_selector.clone(),
-            self.local_public_key.clone(),
+            self.local_prover_address.clone(),
             requests_root,
             state_roots,
             Vec::new(),   // signature — filled during signing
