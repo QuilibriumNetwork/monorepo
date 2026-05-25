@@ -979,7 +979,7 @@ mod tests {
                 difficulty: 100000,
                 output: vec![0xAAu8; 516],
                 parent_selector: vec![0xBBu8; 32],
-                prover: vec![0xCCu8; 585],
+                prover: vec![0xCCu8; 32],
                 ..Default::default()
             }),
             ..Default::default()

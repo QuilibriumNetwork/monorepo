@@ -393,7 +393,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             difficulty as u32,
             header.output.clone(),
             header.parent_selector.clone(),
-            self.local_public_key.clone(),
+            self.local_prover_address.clone(),
             Vec::new(), // prover_tree_commitment — populated after hypergraph commit
             requests_root,
             Vec::new(), // signature — populated by consensus signing step

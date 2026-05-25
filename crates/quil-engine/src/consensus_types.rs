@@ -371,7 +371,7 @@ mod tests {
             difficulty: 50000,
             output: vec![0xAAu8; 516],
             parent_selector: vec![0xBBu8; 32],
-            prover: vec![0xCCu8; 585],
+            prover: vec![0xCCu8; 32],
             prover_tree_commitment: vec![0xDDu8; 64],
             requests_root: vec![0xEEu8; 64],
             ..Default::default()
