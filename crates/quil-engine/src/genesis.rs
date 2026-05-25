@@ -1473,6 +1473,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_testnet_prover_keys_empty_seed_uses_local() {
+        let local_key = vec![0xDDu8; 585];
+        let keys = resolve_testnet_prover_keys(1, "", &local_key).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], local_key);
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_network_99_uses_local() {
+        let seed_hex = hex::encode(vec![0xAAu8; 585]);
+        let local_key = vec![0xDDu8; 585];
+        let keys = resolve_testnet_prover_keys(99, &seed_hex, &local_key).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], local_key);
+    }
+
+    #[test]
     fn resolve_testnet_prover_keys_strips_embedded_spaces() {
         // YAML folded scalars (`>` / `>-`) join lines with single spaces.
         let key_a = vec![0xAAu8; 585];
@@ -1510,23 +1527,6 @@ mod tests {
         let seed_hex = format!("{} ZZ", valid);
         let result = resolve_testnet_prover_keys(1, &seed_hex, &[0xCC; 585]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn resolve_testnet_prover_keys_empty_seed_uses_local() {
-        let local_key = vec![0xDDu8; 585];
-        let keys = resolve_testnet_prover_keys(1, "", &local_key).unwrap();
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0], local_key);
-    }
-
-    #[test]
-    fn resolve_testnet_prover_keys_network_99_uses_local() {
-        let seed_hex = hex::encode(vec![0xAAu8; 585]);
-        let local_key = vec![0xDDu8; 585];
-        let keys = resolve_testnet_prover_keys(99, &seed_hex, &local_key).unwrap();
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0], local_key);
     }
 
     #[test]

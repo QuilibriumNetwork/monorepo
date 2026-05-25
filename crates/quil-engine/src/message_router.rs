@@ -538,11 +538,10 @@ mod tests {
         assert!(!outcome.should_dispatch());
     }
 
-    // 57 bytes of 0xBB pass the length gate but do not decode to a valid
-    // Ed448 point, so `PublicKey::from([u8; 57])` panics inside the
-    // validator (see `crates/ed448-rust/src/public_key.rs:167`). The
-    // router's `catch_unwind` turns that panic into `Rejected`, which is
-    // the observable contract we pin here.
+    /// Pins the `catch_unwind` -> `Rejected` contract: an invalid Ed448
+    /// public-key point (all 0xBB bytes) is NOT a valid curve point, so
+    /// `PublicKey::from(...)` may panic or `verify` will fail — either
+    /// way the validator must reject.
     #[test]
     fn router_validator_rejects_invalid_pubkey_point() {
         let r = MessageRouter::new();

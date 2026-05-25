@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use quil_types::error::{QuilError, Result};
 
@@ -257,6 +257,17 @@ impl WorkerManager for RemoteWorkerManager {
                 ));
             }
         };
+
+        // Empty filter = idle slot reservation (e.g. startup
+        // pre-allocation at main.rs that creates `cores - 1` empty
+        // slots before any shard work is assigned). There is no
+        // consensus engine to (re)spawn for an empty filter; just
+        // record the binding. Falls through `start_consensus` and
+        // `connected` checks because both are irrelevant here.
+        if filter.is_empty() {
+            debug!(core_id, "remote worker idle slot recorded (no filter)");
+            return Ok(());
+        }
 
         // `start_consensus=false` (Joining alloc, no Active prover yet)
         // intentionally skips the Respawn — the worker stays idle until

@@ -19,7 +19,8 @@ use quil_types::store::ClockStore;
 
 const GLOBAL_PROVER_BITMASK: &[u8] = &[0x00, 0x00, 0x00];
 
-/// Production transport: gRPC fan-out to archives + BlossomSub publish.
+/// Production transport: gRPC fan-out to archives, optionally also
+/// BlossomSub publish.
 pub struct ProdProverMessageTransport {
     pub archive_pool: Arc<ArchiveEndpointPool>,
     pub clock_store: Arc<dyn ClockStore>,
@@ -28,6 +29,11 @@ pub struct ProdProverMessageTransport {
     /// Ed448 identity (e.g. read-only client mode); in that case the
     /// gRPC fan-out is skipped and only BlossomSub carries the bundle.
     pub ed448_seed: Option<[u8; 57]>,
+    /// When false, the BlossomSub publish on GLOBAL_PROVER is skipped
+    /// and messages are sent exclusively via direct gRPC to archives.
+    /// Non-archive nodes have no need to gossip prover messages — they
+    /// don't subscribe to GLOBAL_PROVER either (matching Go).
+    pub publish_to_blossomsub: bool,
 }
 
 #[async_trait]
@@ -95,13 +101,20 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             }
         };
 
-        // BlossomSub publish runs concurrently with the gRPC fan-out.
-        // `P2PHandle::publish` is fallible (channel closed / behaviour
-        // rejected the message). An empty mesh / no peers is *not* an
-        // error — Go's behaviour also silently buffers in that case.
-        let bs_future = self
-            .p2p_handle
-            .publish(GLOBAL_PROVER_BITMASK.to_vec(), bundle_bytes);
+        // BlossomSub publish runs concurrently with the gRPC fan-out
+        // when enabled. Non-archive nodes skip the gossip publish
+        // because they don't subscribe to GLOBAL_PROVER — publishing
+        // into a topic you haven't joined is wasteful and unreliable.
+        // Archive nodes publish on both paths for maximum dissemination.
+        let publish_bs = self.publish_to_blossomsub;
+        let bs_handle = self.p2p_handle.clone();
+        let bs_bytes = bundle_bytes;
+        let bs_future = async move {
+            if !publish_bs {
+                return Ok(());
+            }
+            bs_handle.publish(GLOBAL_PROVER_BITMASK.to_vec(), bs_bytes).await
+        };
 
         let (grpc_ok_count, bs_result) = tokio::join!(grpc_future, bs_future);
         let p2p_ok = bs_result.is_ok();

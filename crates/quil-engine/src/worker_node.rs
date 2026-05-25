@@ -25,16 +25,46 @@ use quil_types::store::ClockStore;
 use crate::app_engine::{AppConsensusEngine, AppEngineDeps, AppEngineHandle, AppEngineMessage};
 use crate::message_collector::MessageCollector;
 
+/// Async factory for the gRPC channel that the worker uses to stream
+/// from the master. The worker spawns a reconnect loop and calls this
+/// each time it needs a fresh channel. main.rs supplies an
+/// implementation that wires up Quilibrium's mTLS scheme (Ed448
+/// client cert + self-signed acceptor) since the master's listener
+/// requires mTLS; a plaintext fallback is available for single-machine
+/// dev setups.
+pub type MasterChannelFactory = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            tonic::transport::Channel,
+                            Box<dyn std::error::Error + Send + Sync>,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 /// Configuration for a worker-only node.
 pub struct WorkerNodeConfig {
     /// This worker's core ID (1, 2, 3, ...).
     pub core_id: u32,
-    /// Master's gRPC endpoint for message streaming.
+    /// Master's gRPC endpoint for message streaming (informational —
+    /// used for log lines; the actual channel is built by
+    /// `channel_factory`).
     pub master_endpoint: String,
     /// This worker's gRPC listen address (for Respawn commands).
     pub listen_addr: String,
     /// Parent process ID (for monitoring).
     pub parent_pid: Option<u32>,
+    /// Builds a fresh gRPC channel to the master. main.rs wires this
+    /// to a closure that uses quil-rpc's `build_quil_client_config` +
+    /// `QuilTlsConnector` so the worker presents the same Ed448 cert
+    /// shape the master's peer-gRPC listener requires. `None`
+    /// disables the worker→master stream (worker still serves
+    /// DataIPC; used in tests and during master-less bring-up).
+    pub channel_factory: Option<MasterChannelFactory>,
 }
 
 /// Publish-side hook for the standalone worker's outbound traffic.
@@ -212,17 +242,23 @@ impl WorkerOnlyNode {
             }
         });
 
-        // 3. Connect to master for message streaming
-        let master_endpoint = self.config.master_endpoint.clone();
-        let worker_ref = self.clone();
-        let stream_cancel = self.cancel.clone();
-        tokio::spawn(async move {
-            stream_global_messages_from_master(
-                &master_endpoint,
-                worker_ref,
-                stream_cancel,
-            ).await;
-        });
+        // 3. Connect to master for message streaming. Skipped when no
+        // factory is supplied (single-process tests, etc.).
+        if let Some(factory) = self.config.channel_factory.clone() {
+            let master_endpoint = self.config.master_endpoint.clone();
+            let worker_ref = self.clone();
+            let stream_cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                stream_global_messages_from_master(
+                    &master_endpoint,
+                    factory,
+                    worker_ref,
+                    stream_cancel,
+                ).await;
+            });
+        } else {
+            info!("no channel factory — worker will not stream from master");
+        }
 
         // 3b. Spawn the publish pump — if a PublishFn was supplied
         // (proxy mode), drain engine events and forward them to the
@@ -562,6 +598,7 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
 
 async fn stream_global_messages_from_master(
     master_endpoint: &str,
+    channel_factory: MasterChannelFactory,
     worker: Arc<WorkerOnlyNode>,
     cancel: CancellationToken,
 ) {
@@ -575,54 +612,47 @@ async fn stream_global_messages_from_master(
 
         info!(endpoint = master_endpoint, "connecting to master for message stream");
 
-        match tonic::transport::Channel::from_shared(master_endpoint.to_string()) {
-            Ok(channel_builder) => {
-                match channel_builder.connect().await {
-                    Ok(channel) => {
-                        info!("connected to master, starting message stream");
-                        backoff = Duration::from_secs(1); // reset backoff
+        match channel_factory().await {
+            Ok(channel) => {
+                info!("connected to master, starting message stream");
+                backoff = Duration::from_secs(1); // reset backoff
 
-                        let mut client = quil_types::proto::global::global_service_client::GlobalServiceClient::new(channel);
-                        let request = tonic::Request::new(
-                            quil_types::proto::global::StreamGlobalMessagesRequest {},
-                        );
+                let mut client = quil_types::proto::global::global_service_client::GlobalServiceClient::new(channel);
+                let request = tonic::Request::new(
+                    quil_types::proto::global::StreamGlobalMessagesRequest {},
+                );
 
-                        match client.stream_global_messages(request).await {
-                            Ok(response) => {
-                                let mut stream = response.into_inner();
-                                loop {
-                                    tokio::select! {
-                                        msg = stream.message() => {
-                                            match msg {
-                                                Ok(Some(resp)) => {
-                                                    worker.route_message(&resp.data, &resp.bitmask);
-                                                }
-                                                Ok(None) => {
-                                                    info!("master stream ended");
-                                                    break;
-                                                }
-                                                Err(e) => {
-                                                    warn!(error = %e, "master stream error");
-                                                    break;
-                                                }
-                                            }
+                match client.stream_global_messages(request).await {
+                    Ok(response) => {
+                        let mut stream = response.into_inner();
+                        loop {
+                            tokio::select! {
+                                msg = stream.message() => {
+                                    match msg {
+                                        Ok(Some(resp)) => {
+                                            worker.route_message(&resp.data, &resp.bitmask);
                                         }
-                                        _ = cancel.cancelled() => return,
+                                        Ok(None) => {
+                                            info!("master stream ended");
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "master stream error");
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "failed to start message stream");
+                                _ = cancel.cancelled() => return,
                             }
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "failed to connect to master");
+                        warn!(error = %e, "failed to start message stream");
                     }
                 }
             }
             Err(e) => {
-                warn!(error = %e, "invalid master endpoint");
+                warn!(error = %e, "failed to connect to master");
             }
         }
 
@@ -682,33 +712,45 @@ fn is_process_alive(_pid: u32) -> bool {
 /// multiaddr — so callers can `.parse::<SocketAddr>()` without
 /// preprocessing.
 ///
-/// Resolution order:
+/// Resolution order (decreasing preference):
 ///   1. `data_worker_stream_multiaddrs[core_id - 1]` if set. Accepts
-///      either `host:port` directly (used as-is) or a libp2p multiaddr
+///      either `host:port` directly or a libp2p multiaddr
 ///      `/ip4/HOST/tcp/PORT` (extracted into `HOST:PORT`).
-///   2. Fallback `0.0.0.0:base_port + core_id`, with overflow saturated
-///      at `u16::MAX` so an out-of-range core id surfaces as a
-///      port-collision rather than a panic.
+///   2. `data_worker_base_listen_multiaddr` template with `%d` →
+///      `data_worker_base_stream_port + (core_id - 1)`. Core 1 gets
+///      `base_stream_port` itself.
+///   3. Same as (2) but with the serde defaults for those two fields
+///      (which is what you get when the config doesn't set them).
 pub fn worker_listen_addr(
     core_id: u32,
-    _base_listen: &str,
+    base_listen: &str,
     base_stream_port: u16,
     stream_multiaddrs: &[String],
 ) -> String {
-    if let Some(addr) = stream_multiaddrs.get((core_id - 1) as usize) {
-        // Multiaddr form `/ip4/HOST/tcp/PORT` (or `/ip6/.../tcp/...`)
-        // → extract `HOST:PORT`. Anything that already looks like a
-        // socket address (contains a `:` and no leading `/`) is used
-        // verbatim.
-        if let Some(socket) = multiaddr_to_socket_addr(addr) {
+    // Tier 1: explicit per-worker stream multiaddr.
+    let idx = core_id.saturating_sub(1) as usize;
+    if let Some(addr) = stream_multiaddrs.get(idx) {
+        if !addr.is_empty() {
+            if let Some(socket) = multiaddr_to_socket_addr(addr) {
+                return socket;
+            }
+            return addr.clone();
+        }
+    }
+    // Tier 2 / 3: construct from template. Core 1 → base_stream_port,
+    // core 2 → base_stream_port + 1, etc. Use the template's `%d`
+    // replacement so the host portion matches what the operator configured.
+    let port = base_stream_port
+        .saturating_add(core_id.saturating_sub(1).min(u16::MAX as u32) as u16);
+    if base_listen.contains("%d") {
+        // Template has `%d` — build a multiaddr, then extract `host:port`
+        // so the return value is always a socket address (the caller
+        // `.parse::<SocketAddr>()`s it).
+        let ma = base_listen.replace("%d", &port.to_string());
+        if let Some(socket) = multiaddr_to_socket_addr(&ma) {
             return socket;
         }
-        return addr.clone();
     }
-    // Compute from base; saturate on overflow so an oversized core id
-    // doesn't panic — the resulting port collision is easier to
-    // diagnose than a binary abort mid-startup.
-    let port = base_stream_port.saturating_add(core_id.min(u16::MAX as u32) as u16);
     format!("0.0.0.0:{}", port)
 }
 
@@ -834,25 +876,25 @@ mod tests {
 
     #[test]
     fn worker_listen_addr_from_base_port() {
+        // core_id=1 gets base_stream_port itself; core_id=N gets
+        // base_stream_port + (N-1).
         let addrs: Vec<String> = vec![];
         assert_eq!(
             worker_listen_addr(1, "/ip4/0.0.0.0/tcp/%d", 32500, &addrs),
-            "0.0.0.0:32501"
+            "0.0.0.0:32500"
         );
         assert_eq!(
             worker_listen_addr(3, "/ip4/0.0.0.0/tcp/%d", 32500, &addrs),
-            "0.0.0.0:32503"
+            "0.0.0.0:32502"
         );
     }
 
     #[test]
     fn worker_listen_addr_high_core_id_does_not_panic() {
-        // High core ids (e.g. 168) used to combine with a high base
-        // port and overflow `u16`. Saturating is fine — the operator
-        // sees a port collision rather than a panicked worker.
         let addrs: Vec<String> = vec![];
+        // core_id=168 → base + 167 = 32667
         let result = worker_listen_addr(168, "/ip4/0.0.0.0/tcp/%d", 32500, &addrs);
-        assert_eq!(result, "0.0.0.0:32668");
+        assert_eq!(result, "0.0.0.0:32667");
         // Saturate near the top of u16.
         let result = worker_listen_addr(1000, "/ip4/0.0.0.0/tcp/%d", 65000, &addrs);
         assert_eq!(result, "0.0.0.0:65535");

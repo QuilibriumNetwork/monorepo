@@ -831,12 +831,27 @@ async fn run_master_node(
     let (consensus_loopback_tx, mut consensus_loopback_rx) =
         tokio::sync::mpsc::channel::<quil_p2p::node::ReceivedMessage>(256);
 
-    // Subscribe to all global bitmasks — must subscribe before publishing
-    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec()).await;
+    // GLOBAL_FRAME subscription is archive-only — non-archive nodes
+    // get the chain head via the archive poller and don't need the
+    // gossip firehose (matches Go's behavior). Subscribing on a
+    // non-archive would just feed backfill / out-of-order frames
+    // into the receive loop for no benefit.
+    // Archive nodes subscribe to GLOBAL_FRAME + GLOBAL_PROVER for full
+    // gossip participation — they're the authoritative processors.
+    // Non-archive nodes skip both: they get global frames from the
+    // archive poller and submit prover messages via direct gRPC.
+    // GLOBAL_CONSENSUS and GLOBAL_PEER_INFO are universal.
+    if archive_mode {
+        p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec()).await;
+        p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec()).await;
+    }
     p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec()).await;
-    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec()).await;
     p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
-    info!("subscribed to global frame, consensus, prover, and peer info bitmasks");
+    if archive_mode {
+        info!("subscribed to all global bitmasks (archive mode)");
+    } else {
+        info!("subscribed to global consensus + peer info bitmasks (non-archive — GLOBAL_FRAME and GLOBAL_PROVER via direct RPC only)");
+    }
 
     // Apply engine blacklist — deny connections from blacklisted peers.
     // Blacklist entries are peer ID strings (Qm... multihash format).
@@ -2178,6 +2193,7 @@ async fn run_master_node(
                 archive_mode,
             )
             .with_eviction_registry(prover_registry.clone())
+            .with_rocks_hg_store(hg_store.clone())
             .with_current_frame(current_frame.clone());
             Some(Arc::new(m))
         } else {
@@ -2391,13 +2407,17 @@ async fn run_master_node(
         }
     };
 
-    // Production transport: gRPC fan-out to archives + BlossomSub publish.
+    // Production transport: gRPC fan-out to archives. Archive nodes
+    // also publish on BlossomSub for maximum dissemination; non-archive
+    // nodes skip the gossip publish (they don't subscribe to
+    // GLOBAL_PROVER so publishing into it is wasteful and unreliable).
     let prover_message_transport: Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport> =
         Arc::new(crate::prover_message_transport_prod::ProdProverMessageTransport {
             archive_pool: archive_pool.clone(),
             clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
             p2p_handle: p2p_handle.clone(),
             ed448_seed: mtls_seed,
+            publish_to_blossomsub: archive_mode,
         });
 
     let prover_pipeline = Arc::new(quil_engine::prover_pipeline::ProverPipeline {
@@ -3519,6 +3539,19 @@ async fn run_master_node(
         let mut router_drops: u64 = 0;
         let mut status_timer = tokio::time::interval(std::time::Duration::from_secs(30));
         status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Track the highest frame number we've fully executed (through
+        // the execution manager + lifecycle). New frames arriving via
+        // gossip can be wildly out of order; only execute consecutive
+        // frames starting from `last_executed + 1` so prover-state
+        // dependent ops (ProverConfirm/Resume against a prover the
+        // previous frame registered) don't fail spuriously. Seeded
+        // from the latest frame already in the clock store so a
+        // restart picks up where it left off.
+        let mut last_executed_frame: u64 = clock_store_recv
+            .get_latest_global_frame()
+            .ok()
+            .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
+            .unwrap_or(0);
         loop {
             tokio::select! {
                 _ = status_timer.tick() => {
@@ -3888,70 +3921,108 @@ async fn run_master_node(
                                                 // BlossomSub).
                                                 cf_for_recv.observe(frame_num);
                                                 lhf_for_recv.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
-                                                // Process through execution pipeline with reward issuance
-                                                match quil_engine::frame_processor::process_global_frame_with_rewards(
-                                                    &exec_mgr_for_recv,
-                                                    &frame,
-                                                    &num_bigint::BigInt::from(1),
-                                                    Some(reward_issuer.as_ref() as &dyn quil_types::consensus::RewardIssuance),
-                                                    Some(pr_for_recv.as_ref() as &dyn quil_types::consensus::ProverRegistry),
-                                                ) {
-                                                    Ok((applied, skipped)) => {
-                                                        info!(
-                                                            frame = frame_num,
-                                                            total = frames_received,
-                                                            applied,
-                                                            skipped,
-                                                            "received + processed GlobalFrame"
-                                                        );
-                                                        // Trigger coverage check + worker allocation
-                                                        // (skip the reconciler on archives — they
-                                                        // don't run app-shard workers).
-                                                        coverage_for_recv.check(frame_num);
-                                                        if !archive_mode_recv {
-                                                            if let Err(e) = wa_for_recv.on_new_frame(frame_num) {
-                                                                warn!(error = %e, "worker allocation failed");
-                                                            }
+
+                                                // Frame execution dispatches on node mode:
+                                                //
+                                                //   * Archive nodes need contiguous frame
+                                                //     history (clients sync from us; gaps
+                                                //     break their replay). We drain the
+                                                //     clock store in order from
+                                                //     `last_executed + 1` forward and
+                                                //     wait for missing predecessors.
+                                                //
+                                                //   * Non-archive nodes only need to
+                                                //     follow the chain head. BlossomSub
+                                                //     gossip is unordered; stale / backfill
+                                                //     frames are noise. We skip any frame
+                                                //     whose number is not strictly newer
+                                                //     than what we've already executed,
+                                                //     and never wait for missing
+                                                //     predecessors — they're already past.
+                                                let frames_to_execute: Vec<(u64, quil_types::proto::global::GlobalFrame)> =
+                                                if archive_mode_recv {
+                                                    let mut out = Vec::new();
+                                                    loop {
+                                                        let next_num = last_executed_frame.saturating_add(1);
+                                                        match clock_store_recv.get_global_frame(next_num) {
+                                                            Ok(f) => out.push((next_num, f)),
+                                                            Err(_) => break,
                                                         }
-                                                        // Evaluate prover lifecycle (join/confirm/leave) and
-                                                        // dispatch any resulting action via the pipeline.
-                                                        // Archives skip — no workers to bind allocations to
-                                                        // and no shard reward to chase.
-                                                        let frame_difficulty = frame.header.as_ref()
-                                                            .map(|h| h.difficulty)
-                                                            .unwrap_or(0);
-                                                        // Once initial prover-tree sync proved
-                                                        // commitment match, advance the
-                                                        // verified-frame marker on every
-                                                        // successfully-handled frame. See poller
-                                                        // path for rationale.
-                                                        pl_for_recv.set_prover_root_verified_frame(frame_num);
-                                                        if !archive_mode_recv {
-                                                            match pl_for_recv.evaluate(
-                                                                frame_num,
-                                                                frame_difficulty as u64,
-                                                                pr_for_recv.as_ref(),
-                                                                wm_for_recv.as_ref(),
-                                                            ) {
-                                                                Ok(actions) => {
-                                                                    for action in actions {
-                                                                        info!(frame = frame_num, ?action, "prover lifecycle action");
-                                                                        pp_for_recv.dispatch(action);
+                                                        last_executed_frame = next_num;
+                                                    }
+                                                    if frame_num > last_executed_frame {
+                                                        debug!(
+                                                            frame = frame_num,
+                                                            awaiting = last_executed_frame + 1,
+                                                            "archive: stored out-of-order frame, awaiting predecessor"
+                                                        );
+                                                    }
+                                                    out
+                                                } else if frame_num > last_executed_frame {
+                                                    last_executed_frame = frame_num;
+                                                    vec![(frame_num, frame.clone())]
+                                                } else {
+                                                    debug!(
+                                                        frame = frame_num,
+                                                        last_executed = last_executed_frame,
+                                                        "non-archive: skipping stale/backfill frame",
+                                                    );
+                                                    Vec::new()
+                                                };
+
+                                                for (exec_num, exec_frame) in frames_to_execute {
+                                                    match quil_engine::frame_processor::process_global_frame_with_rewards(
+                                                        &exec_mgr_for_recv,
+                                                        &exec_frame,
+                                                        &num_bigint::BigInt::from(1),
+                                                        Some(reward_issuer.as_ref() as &dyn quil_types::consensus::RewardIssuance),
+                                                        Some(pr_for_recv.as_ref() as &dyn quil_types::consensus::ProverRegistry),
+                                                    ) {
+                                                        Ok((applied, skipped)) => {
+                                                            info!(
+                                                                frame = exec_num,
+                                                                total = frames_received,
+                                                                applied,
+                                                                skipped,
+                                                                "received + processed GlobalFrame"
+                                                            );
+                                                            coverage_for_recv.check(exec_num);
+                                                            if !archive_mode_recv {
+                                                                if let Err(e) = wa_for_recv.on_new_frame(exec_num) {
+                                                                    warn!(error = %e, "worker allocation failed");
+                                                                }
+                                                            }
+                                                            let frame_difficulty = exec_frame.header.as_ref()
+                                                                .map(|h| h.difficulty)
+                                                                .unwrap_or(0);
+                                                            pl_for_recv.set_prover_root_verified_frame(exec_num);
+                                                            if !archive_mode_recv {
+                                                                match pl_for_recv.evaluate(
+                                                                    exec_num,
+                                                                    frame_difficulty as u64,
+                                                                    pr_for_recv.as_ref(),
+                                                                    wm_for_recv.as_ref(),
+                                                                ) {
+                                                                    Ok(actions) => {
+                                                                        for action in actions {
+                                                                            info!(frame = exec_num, ?action, "prover lifecycle action");
+                                                                            pp_for_recv.dispatch(action);
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        debug!(error = %e, "prover lifecycle evaluation skipped");
                                                                     }
                                                                 }
-                                                                Err(e) => {
-                                                                    debug!(error = %e, "prover lifecycle evaluation skipped");
-                                                                }
                                                             }
                                                         }
-                                                    }
-                                                    Err(e) => {
-                                                        info!(
-                                                            frame = frame_num,
-                                                            total = frames_received,
-                                                            error = %e,
-                                                            "received GlobalFrame (processing failed)"
-                                                        );
+                                                        Err(e) => {
+                                                            info!(
+                                                                frame = exec_num,
+                                                                total = frames_received,
+                                                                error = %e,
+                                                                "received GlobalFrame (processing failed)"
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
@@ -5421,11 +5492,64 @@ async fn run_worker_node(
     // local `/ip4/0.0.0.0/tcp/8340` and gets rewritten to localhost.
     let master_endpoint = quil_engine::worker_node::master_grpc_endpoint(&config);
 
+    // Worker's Ed448 seed for mTLS to the master. The master's
+    // GlobalService listener requires mTLS; without a seed configured
+    // here the worker would dial plaintext and the master's TLS
+    // acceptor would immediately close the connection (surfaces as
+    // "h2 protocol error" in the worker logs).
+    let worker_mtls_seed: Option<[u8; 57]> = {
+        let bytes = hex::decode(&config.p2p.peer_priv_key).unwrap_or_default();
+        if bytes.len() >= 57 {
+            let mut seed = [0u8; 57];
+            seed.copy_from_slice(&bytes[..57]);
+            Some(seed)
+        } else {
+            None
+        }
+    };
+    if worker_mtls_seed.is_none() {
+        warn!(
+            "worker has no Ed448 seed configured (p2p.peerPrivKey empty or short); \
+             will dial master in plaintext — only works against a plaintext-allowing \
+             master (single-machine dev only)",
+        );
+    }
+    let factory_endpoint = master_endpoint.clone();
+    let channel_factory: quil_engine::worker_node::MasterChannelFactory = Arc::new(move || {
+        let endpoint_str = factory_endpoint.clone();
+        let seed = worker_mtls_seed;
+        Box::pin(async move {
+            use tonic::transport::Endpoint;
+            let endpoint = Endpoint::from_shared(endpoint_str)
+                .map_err(|e| Box::new(std::io::Error::other(format!("endpoint: {}", e)))
+                    as Box<dyn std::error::Error + Send + Sync>)?
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .keep_alive_while_idle(true);
+            match seed {
+                Some(seed) => {
+                    let client_config = quil_rpc::build_quil_client_config(&seed)
+                        .map_err(|e| Box::new(std::io::Error::other(format!("tls cfg: {}", e)))
+                            as Box<dyn std::error::Error + Send + Sync>)?;
+                    let connector = quil_rpc::QuilTlsConnector::new(client_config);
+                    let channel = endpoint.connect_with_connector(connector).await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    Ok(channel)
+                }
+                None => {
+                    let channel = endpoint.connect().await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    Ok(channel)
+                }
+            }
+        })
+    });
+
     let worker_config = quil_engine::worker_node::WorkerNodeConfig {
         core_id,
         master_endpoint,
         listen_addr,
         parent_pid: if parent_process > 0 { Some(parent_process) } else { None },
+        channel_factory: Some(channel_factory),
     };
 
     let reward_greedy = config.engine.reward_strategy == "reward-greedy";
@@ -5502,12 +5626,14 @@ async fn run_worker_node(
             .await
             .map_err(|e| anyhow::anyhow!("worker p2p start: {}", e))?;
         let handle = Arc::new(handle);
-        // Pre-subscribe to the global bitmasks so peer global frames /
-        // votes / prover messages reach this worker.
+        // Workers subscribe to GLOBAL_CONSENSUS (shard consensus
+        // messages) and GLOBAL_PEER_INFO (peer discovery). GLOBAL_FRAME
+        // and GLOBAL_PROVER are deliberately omitted — workers receive
+        // global frames via the master gRPC message stream, and prover
+        // messages route via direct gRPC to archives rather than
+        // BlossomSub gossip.
         for bm in [
             quil_engine::bitmasks::GLOBAL_CONSENSUS,
-            quil_engine::bitmasks::GLOBAL_FRAME,
-            quil_engine::bitmasks::GLOBAL_PROVER,
             quil_engine::bitmasks::GLOBAL_PEER_INFO,
         ] {
             handle.subscribe(bm.to_vec()).await;

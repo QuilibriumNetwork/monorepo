@@ -69,6 +69,10 @@ pub struct FrameMaterializer {
     /// Eviction grace period in frames.
     eviction_grace_frames: u64,
 
+    /// Concrete backing store for `refresh_from_store` — used after
+    /// `commit_frame` to rebuild the prover-registry cache from the
+    /// just-flushed RocksDB trees.
+    rocks_hg_store: Option<Arc<quil_store::RocksHypergraphStore>>,
     /// Concrete `SharedProverRegistry` reference for the mutating
     /// `evict_inactive_provers` path. When set, archive
     /// nodes apply Status=4 + KickFrameNumber to evicted prover and
@@ -125,6 +129,7 @@ impl FrameMaterializer {
             _prover_address: prover_address,
             archive_mode,
             eviction_grace_frames: 360,
+            rocks_hg_store: None,
             eviction_registry: None,
             current_frame: None,
         }
@@ -148,6 +153,18 @@ impl FrameMaterializer {
         registry: Arc<ConcreteProverRegistry>,
     ) -> Self {
         self.eviction_registry = Some(registry);
+        self
+    }
+
+    /// Supply the concrete RocksDB hypergraph store so the
+    /// materializer can `refresh_from_store` on the prover registry
+    /// after `commit_frame`. Without this, the cache refresh before
+    /// eviction is skipped and the eviction reads stale data.
+    pub fn with_rocks_hg_store(
+        mut self,
+        store: Arc<quil_store::RocksHypergraphStore>,
+    ) -> Self {
+        self.rocks_hg_store = Some(store);
         self
     }
 
@@ -312,12 +329,33 @@ impl FrameMaterializer {
             cf.materialize(frame_number);
         }
 
-        // 5. Prune orphan joins from prover registry
+        // 5. Flush CRDT phase trees to the backing store + rebuild
+        // the prover-registry cache. The global engine's per-bundle
+        // `state.commit()` already pushed changes into the CRDT's
+        // in-memory phase trees, but `refresh_from_store` reads from
+        // the on-disk backing store. `commit_frame` flushes the
+        // in-memory trees to RocksDB so the next `refresh_from_store`
+        // sees fresh `LastActiveFrameNumber` values. Without this,
+        // eviction (step 7) runs against a stale cache and evicts
+        // provers that are actually still active (shard proof arrived
+        // this frame but the cache never saw it). Mirrors Go's
+        // `ProcessStateTransition(st, frameNumber)` at
+        // `frame_materializer.go:257`.
+        if let Err(e) = self.execution_manager.commit_frame(frame_number) {
+            warn!(frame = frame_number, error = %e, "CRDT commit_frame failed");
+        }
+        if let (Some(eviction_reg), Some(rocks_store)) =
+            (self.eviction_registry.as_ref(), self.rocks_hg_store.as_ref())
+        {
+            eviction_reg.refresh_from_store(rocks_store);
+        }
+
+        // 6. Prune orphan joins from prover registry
         if let Err(e) = self.prover_registry.prune_orphan_joins(frame_number) {
             warn!(frame = frame_number, error = %e, "prune orphan joins failed");
         }
 
-        // 5. Evict inactive provers (archive mode only, no active halt).
+        // 7. Evict inactive provers (archive mode only, no active halt).
         //
         // Tier-5 #1: route through the *mutating* helper so prover and
         // allocation vertices actually get marked Status=4 +
