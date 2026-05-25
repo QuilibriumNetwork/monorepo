@@ -94,6 +94,17 @@ impl<S: Unique, V: Unique> ConsensusValidator<S, V> {
 
 impl<S: Unique, V: Unique> Validator<S, V> for ConsensusValidator<S, V> {
     fn validate_quorum_certificate(&self, qc: &dyn QuorumCertificate) -> Result<()> {
+        // Genesis QCs (rank 0) are trusted — they carry
+        // `AggregateSignature::empty()` (all-zero pk/sig, 0xFF bitmask)
+        // which can't pass BLS verification. Every node seeds the same
+        // genesis QC at startup; re-verifying it would stall the
+        // chain at rank 1 because the first proposal embeds the
+        // genesis QC as its parent. Matches Go's implicit trust: the
+        // genesis QC enters the liveness store at startup and is
+        // never re-verified by the consensus loop.
+        if qc.rank() == 0 {
+            return Ok(());
+        }
         let bitmask = qc.aggregated_signature().bitmask();
         let (_subset, total_weight) = self.decode_signers(qc.rank(), bitmask)?;
 

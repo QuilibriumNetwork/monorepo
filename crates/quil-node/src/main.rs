@@ -2904,17 +2904,28 @@ async fn run_master_node(
                             _ => false,
                         }
                     };
-                    if !is_global_prover {
-                        if sync_archive_mode {
-                            info!(
-                                "archive mode — skipping global consensus event loop activation \
-                                 (archives observe global frames via the poller, not via consensus)",
-                            );
-                        } else {
-                            info!(
-                                "not a global prover — skipping global consensus event loop activation",
-                            );
-                        }
+                    // Global consensus (HotStuff over the global frame
+                    // chain) is archive-only. In Go this is gated on
+                    // `isConsensusParticipant() = ArchiveMode || Network == 99`.
+                    // Non-archive provers participate in per-shard consensus
+                    // (via AppConsensusEngine) but NOT in global consensus —
+                    // they receive finalized global frames from the archive
+                    // poller. Running the global event loop on a non-archive
+                    // produces proposals/votes on GLOBAL_CONSENSUS that
+                    // (a) flood the mesh, (b) get looped back to the receive
+                    // dispatch and forwarded to workers, (c) cause QC
+                    // verification failures with genesis-shaped all-zero
+                    // signatures.
+                    let is_consensus_participant = sync_archive_mode || network == 99;
+                    if !is_consensus_participant {
+                        info!(
+                            "non-archive, non-devnet — skipping global consensus event loop activation \
+                             (global frames arrive via the archive poller)",
+                        );
+                    } else if !is_global_prover {
+                        info!(
+                            "archive/devnet but not a global prover — skipping global consensus activation",
+                        );
                     } else if genesis_frame_result.is_ok() {
                         if let Ok(genesis_frame) = genesis_frame_result {
                             if let Ok(bls_signer) = sync_km.get_signer(quil_types::crypto::KeyType::Bls48581G1) {
@@ -3630,16 +3641,41 @@ async fn run_master_node(
                 } => {
                     match msg {
                         Some(received) => {
-                            // Fan out every received global message to
-                            // any connected StreamGlobalMessages
-                            // subscriber. Send failure (no subscribers)
-                            // is benign and ignored.
-                            let _ = gmtx_for_recv.send(
-                                quil_types::proto::global::StreamGlobalMessagesResponse {
-                                    data: received.data.clone(),
-                                    bitmask: received.bitmask.clone(),
-                                },
-                            );
+                            // Forward to connected StreamGlobalMessages
+                            // subscribers (workers) — ONLY peer-info.
+                            //
+                            // In Go, `broadcastGlobalMessage` is called
+                            // from GLOBAL_FRAME, GLOBAL_PROVER, and
+                            // GLOBAL_PEER_INFO handlers. But on a
+                            // non-archive master those handlers don't
+                            // fire (not subscribed). The only messages
+                            // arriving here are GLOBAL_PEER_INFO (from
+                            // the mesh) and GLOBAL_CONSENSUS (from the
+                            // self-loopback when the master produces
+                            // its own proposals/votes). Workers don't
+                            // need either — they get global frames
+                            // from the archive poller, prover messages
+                            // via direct gRPC, and per-shard consensus
+                            // from their own mesh subscriptions.
+                            // Forwarding the loopback's
+                            // GLOBAL_CONSENSUS was the source of QC
+                            // verification failures (all-zero sig/pk,
+                            // 0xFF bitmask from genesis QC data) and
+                            // OOM (on archive masters, the [0xFF;32]
+                            // catch-all subscription fed every shard's
+                            // traffic into the broadcast channel).
+                            //
+                            // The only bitmask workers still need from
+                            // the master stream is GLOBAL_PEER_INFO
+                            // (peer discovery for their own mesh).
+                            if received.bitmask.as_slice() == GLOBAL_PEER_INFO {
+                                let _ = gmtx_for_recv.send(
+                                    quil_types::proto::global::StreamGlobalMessagesResponse {
+                                        data: received.data.clone(),
+                                        bitmask: received.bitmask.clone(),
+                                    },
+                                );
+                            }
 
                             // Per-topic validator gate. Malformed bytes are
                             // dropped before they reach a queue.
