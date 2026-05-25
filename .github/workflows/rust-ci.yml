@@ -31,6 +31,9 @@ jobs:
       # Toolchain channel is read from rust-toolchain.toml at the repo
       # root. Update that file, not this workflow, to bump Rust.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Don't let the action set RUSTFLAGS
+          rustflags: ""
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -54,6 +57,9 @@ jobs:
       - uses: ./.github/actions/setup-native-deps
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Don't let the action set RUSTFLAGS
+          rustflags: ""
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -104,6 +110,9 @@ jobs:
         uses: ./.github/actions/setup-native-deps
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Don't let the action set RUSTFLAGS
+          rustflags: ""
 
       - uses: Swatinem/rust-cache@v2
         with:
