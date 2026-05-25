@@ -15,7 +15,7 @@ pub struct Config {
     pub db: DbConfig,
     #[serde(default, deserialize_with = "crate::deserialize_null_default")]
     pub logger: LogConfig,
-    #[serde(default)]
+    #[serde(default, alias = "listenGRPCMultiaddr")]
     pub listen_grpc_multiaddr: String,
     #[serde(default, rename = "listenRESTMultiaddr")]
     pub listen_rest_multiaddr: String,

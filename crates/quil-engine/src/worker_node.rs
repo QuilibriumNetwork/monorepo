@@ -127,6 +127,14 @@ pub struct WorkerOnlyNode {
     /// TimeoutProduced events that the engine emitted just before
     /// receiving its own `set_halted(true)`.
     local_halted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Syncer for the global prover tree. Used before materializing
+    /// frames whose `ProverTreeCommitment` mismatches the worker's
+    /// local root. Without this, remote workers start with an empty
+    /// CRDT and can't resolve leader rotation or verify FrameHeaders.
+    prover_tree_syncer: Option<Arc<dyn crate::prover_tree_syncer::ProverTreeSyncer>>,
+    /// Cooldown frame to avoid sync-storms: after a sync attempt,
+    /// skip further attempts until frame_number >= cooldown_until.
+    sync_cooldown_until: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerOnlyNode {
@@ -165,6 +173,8 @@ impl WorkerOnlyNode {
             worker_p2p: None,
             active_shard_subscriptions: std::sync::Mutex::new(Vec::new()),
             local_halted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prover_tree_syncer: None,
+            sync_cooldown_until: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -180,6 +190,17 @@ impl WorkerOnlyNode {
         self.hypergraph = Some(hypergraph);
         self.execution_engine = Some(execution_engine);
         self.inclusion_prover = Some(inclusion_prover);
+        self
+    }
+
+    /// Attach a prover-tree syncer. Remote workers MUST have this
+    /// wired — without it the CRDT starts empty and the worker can't
+    /// resolve leader rotation or verify FrameHeaders.
+    pub fn with_prover_tree_syncer(
+        mut self,
+        syncer: Arc<dyn crate::prover_tree_syncer::ProverTreeSyncer>,
+    ) -> Self {
+        self.prover_tree_syncer = Some(syncer);
         self
     }
 
@@ -210,6 +231,28 @@ impl WorkerOnlyNode {
             listen = %self.config.listen_addr,
             "worker node starting"
         );
+
+        // 0. Initial prover-tree sync from archive. Remote workers
+        // start with an empty CRDT; without this sync the prover
+        // registry is empty and the worker can't resolve leader
+        // rotation or verify FrameHeaders. Mirrors Go's startup-time
+        // `HyperSyncSelf` in `AppConsensusEngine.Start`.
+        if let Some(syncer) = self.prover_tree_syncer.as_ref() {
+            info!("performing initial prover-tree sync from archive");
+            match syncer.sync_prover_tree(&[]).await {
+                Ok(_converged) => {
+                    if let Err(e) = self.prover_registry.refresh() {
+                        warn!(error = %e, "prover registry refresh after initial sync failed");
+                    }
+                    info!("initial prover-tree sync complete");
+                }
+                Err(e) => {
+                    warn!(error = %e, "initial prover-tree sync failed — worker may have stale/empty prover state");
+                }
+            }
+        } else {
+            warn!("no prover-tree syncer wired — worker will run with stale/empty prover state");
+        }
 
         // 1. Start parent process monitor (if parent PID given)
         if let Some(parent_pid) = self.config.parent_pid {
@@ -288,11 +331,11 @@ impl WorkerOnlyNode {
                                                 "suppressing standalone shard frame publish — halt active");
                                             continue;
                                         }
-                                        // Publish on the per-shard frame bitmask
-                                        // so peers subscribed to the shard receive
-                                        // it; the GLOBAL_FRAME publish is kept for
-                                        // back-compat with older subscribers.
-                                        publish(crate::bitmasks::GLOBAL_FRAME.to_vec(), frame_data.clone()).await;
+                                        // Go publishes ONLY on the per-shard frame
+                                        // bitmask (`appFilter`), NOT on GLOBAL_FRAME.
+                                        // Publishing on GLOBAL_FRAME would broadcast
+                                        // shard-specific frames to every mesh peer
+                                        // (massive amplification for no benefit).
                                         publish(crate::bitmasks::shard_frame_bitmask(&filter), frame_data).await;
                                     }
                                     VoteProduced { filter, vote_data, .. } => {
@@ -301,7 +344,9 @@ impl WorkerOnlyNode {
                                                 "suppressing standalone shard vote publish — halt active");
                                             continue;
                                         }
-                                        publish(crate::bitmasks::GLOBAL_CONSENSUS.to_vec(), vote_data.clone()).await;
+                                        // Per-shard only — Go uses
+                                        // `[0x00] || appFilter`, NOT
+                                        // `GLOBAL_CONSENSUS = [0x00]`.
                                         publish(crate::bitmasks::shard_consensus_bitmask(&filter), vote_data).await;
                                     }
                                     TimeoutProduced { filter, timeout_data, .. } => {
@@ -310,7 +355,6 @@ impl WorkerOnlyNode {
                                                 "suppressing standalone shard timeout publish — halt active");
                                             continue;
                                         }
-                                        publish(crate::bitmasks::GLOBAL_CONSENSUS.to_vec(), timeout_data.clone()).await;
                                         publish(crate::bitmasks::shard_consensus_bitmask(&filter), timeout_data).await;
                                     }
                                     // Internal signals — no network publish.
@@ -452,6 +496,134 @@ impl WorkerOnlyNode {
         for bm in previous {
             p2p.unsubscribe(bm).await;
         }
+    }
+
+    /// Check whether the incoming global frame's
+    /// `prover_tree_commitment` matches the worker's local CRDT root.
+    /// On mismatch, fires the blocking sync. Called from the master
+    /// stream receive loop BEFORE routing the message to the engine.
+    async fn maybe_sync_before_global_frame(&self, data: &[u8]) {
+        // Minimal decode: just need `prover_tree_commitment` from the
+        // GlobalFrame header. Use proto decode — the master stream
+        // sends proto-encoded frames.
+        let frame: quil_types::proto::global::GlobalFrame = match prost::Message::decode(data) {
+            Ok(f) => f,
+            Err(_) => {
+                // Also try canonical decode in case master sends that format.
+                match crate::consensus_wire::decode_global_frame(data) {
+                    Ok(f) => f,
+                    Err(_) => return, // can't decode → skip check, route anyway
+                }
+            }
+        };
+        let Some(header) = frame.header.as_ref() else { return };
+        let expected = &header.prover_tree_commitment;
+        if expected.is_empty() {
+            return;
+        }
+        // Compute local root from CRDT.
+        let local_root = match self.hypergraph.as_ref() {
+            Some(hg) => {
+                use quil_types::store::ShardKey;
+                let shard = ShardKey {
+                    l1: [0u8; 3],
+                    l2: [0xFFu8; 32], // GLOBAL_INTRINSIC_ADDRESS
+                };
+                hg.compute_shard_root("vertex", "adds", &shard)
+            }
+            None => Vec::new(),
+        };
+        if local_root.is_empty() || local_root == expected.as_slice() {
+            return;
+        }
+        // Root mismatch — sync.
+        self.perform_blocking_prover_sync(header.frame_number, expected).await;
+    }
+
+    /// Blocking prover-tree sync. Mirrors Go's
+    /// `AppConsensusEngine.performBlockingGlobalHypersync`: calls the
+    /// syncer up to 3 times with 500ms delay, checks convergence,
+    /// refreshes the prover registry after each attempt. The 5-frame
+    /// cooldown (`sync_cooldown_until`) prevents sync-storms.
+    async fn perform_blocking_prover_sync(
+        &self,
+        frame_number: u64,
+        expected_root: &[u8],
+    ) {
+        const MAX_ATTEMPTS: usize = 3;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+        const COOLDOWN_FRAMES: u64 = 5;
+
+        let cooldown = self.sync_cooldown_until.load(std::sync::atomic::Ordering::Relaxed);
+        if frame_number < cooldown {
+            tracing::debug!(
+                frame = frame_number,
+                cooldown_until = cooldown,
+                "prover tree sync: cooldown active, skipping"
+            );
+            return;
+        }
+
+        let Some(syncer) = self.prover_tree_syncer.as_ref() else {
+            warn!("prover tree sync: no syncer wired — worker will run with stale/empty prover tree");
+            return;
+        };
+
+        info!(
+            frame = frame_number,
+            expected = hex::encode(expected_root),
+            "performing blocking prover tree sync before materialization"
+        );
+
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(RETRY_DELAY).await;
+                info!(
+                    attempt = attempt + 1,
+                    "retrying prover tree sync"
+                );
+            }
+            match syncer.sync_prover_tree(expected_root).await {
+                Ok(true) => {
+                    info!(
+                        attempt = attempt + 1,
+                        "prover tree sync converged"
+                    );
+                    // Refresh the prover registry from the just-synced store.
+                    if let Err(e) = self.prover_registry.refresh() {
+                        warn!(error = %e, "prover registry refresh after sync failed");
+                    }
+                    self.sync_cooldown_until.store(
+                        frame_number.saturating_add(COOLDOWN_FRAMES),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    return;
+                }
+                Ok(false) => {
+                    warn!(
+                        attempt = attempt + 1,
+                        "prover tree sync completed but roots still diverge"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        "prover tree sync failed"
+                    );
+                }
+            }
+        }
+        // All attempts exhausted. Set cooldown and move on — the next
+        // frame will retry after the cooldown window.
+        self.sync_cooldown_until.store(
+            frame_number.saturating_add(COOLDOWN_FRAMES),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        warn!(
+            frame = frame_number,
+            "prover tree sync did not converge after {MAX_ATTEMPTS} attempts"
+        );
     }
 
     /// Route an incoming message from the master to the active engine.
@@ -630,6 +802,14 @@ async fn stream_global_messages_from_master(
                                 msg = stream.message() => {
                                     match msg {
                                         Ok(Some(resp)) => {
+                                            // For GLOBAL_FRAME messages, check the
+                                            // prover-tree root before routing. If
+                                            // mismatched, do a blocking sync so the
+                                            // worker's CRDT is current before the
+                                            // engine materializes.
+                                            if resp.bitmask.as_slice() == crate::bitmasks::GLOBAL_FRAME {
+                                                worker.maybe_sync_before_global_frame(&resp.data).await;
+                                            }
                                             worker.route_message(&resp.data, &resp.bitmask);
                                         }
                                         Ok(None) => {

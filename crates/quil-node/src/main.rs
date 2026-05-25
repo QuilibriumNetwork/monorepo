@@ -11,6 +11,7 @@ use quil_keys::KeyManager as _;
 mod logging;
 
 mod prover_message_transport_prod;
+mod prover_tree_syncer_prod;
 
 mod release_check;
 
@@ -5491,6 +5492,8 @@ async fn run_worker_node(
     // master's stream listener; on single-machine setups it's the
     // local `/ip4/0.0.0.0/tcp/8340` and gets rewritten to localhost.
     let master_endpoint = quil_engine::worker_node::master_grpc_endpoint(&config);
+    // Clone for the syncer (master_endpoint gets moved into WorkerNodeConfig).
+    let master_endpoint_for_syncer = master_endpoint.clone();
 
     // Worker's Ed448 seed for mTLS to the master. The master's
     // GlobalService listener requires mTLS; without a seed configured
@@ -5568,6 +5571,30 @@ async fn run_worker_node(
     )
     .with_state_engines(crdt, exec_manager, inclusion_prover);
 
+    // Wire the prover-tree syncer so the worker can sync the global
+    // prover tree from the master at startup and before materializing
+    // frames with a prover-root mismatch. In Go, workers call
+    // `HyperSyncSelf` which dials the master's
+    // HypergraphComparisonService. We reuse the master_endpoint (the
+    // same one the gRPC message stream connects to — port 8340).
+    if let Some(seed) = worker_mtls_seed {
+        // Extract `host:port` from the master endpoint URL
+        // (`http://host:port`) for the syncer.
+        let stream_addr = master_endpoint_for_syncer
+            .strip_prefix("http://")
+            .unwrap_or(&master_endpoint_for_syncer)
+            .to_string();
+        let syncer: Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer> =
+            Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
+                master_stream_addr: stream_addr,
+                hg_store: hg_store.clone(),
+                ed448_seed: seed,
+            });
+        worker_node = worker_node.with_prover_tree_syncer(syncer);
+    } else {
+        warn!("worker has no mTLS seed — prover-tree sync will be unavailable");
+    }
+
     // Outbound pubsub. Two mutually exclusive modes:
     //   * `engine.enable_master_proxy = true`  → dial the master's
     //     PubSubProxy on the peer mTLS listener and route all pubsub
@@ -5626,18 +5653,17 @@ async fn run_worker_node(
             .await
             .map_err(|e| anyhow::anyhow!("worker p2p start: {}", e))?;
         let handle = Arc::new(handle);
-        // Workers subscribe to GLOBAL_CONSENSUS (shard consensus
-        // messages) and GLOBAL_PEER_INFO (peer discovery). GLOBAL_FRAME
-        // and GLOBAL_PROVER are deliberately omitted — workers receive
-        // global frames via the master gRPC message stream, and prover
-        // messages route via direct gRPC to archives rather than
-        // BlossomSub gossip.
-        for bm in [
-            quil_engine::bitmasks::GLOBAL_CONSENSUS,
-            quil_engine::bitmasks::GLOBAL_PEER_INFO,
-        ] {
-            handle.subscribe(bm.to_vec()).await;
-        }
+        // Workers subscribe to GLOBAL_PEER_INFO only (peer discovery).
+        // GLOBAL_FRAME, GLOBAL_PROVER, and GLOBAL_CONSENSUS are
+        // deliberately omitted:
+        //   - GLOBAL_FRAME: received via master gRPC stream
+        //   - GLOBAL_PROVER: submitted via direct gRPC to archives
+        //   - GLOBAL_CONSENSUS: workers participate in PER-SHARD
+        //     consensus only (subscribed dynamically on Respawn via
+        //     `subscribe_to_shard_bitmasks`). Subscribing to GLOBAL
+        //     causes every worker to relay every shard's votes/
+        //     proposals — massive amplification with zero benefit.
+        handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
         // Wire publish_fn → worker's own p2p.
         let p2p_for_publish = handle.clone();
         let publish_fn: quil_engine::worker_node::PublishFn =

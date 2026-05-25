@@ -55,13 +55,13 @@ pub struct P2PConfig {
     pub max_ihave_length: i32,
     #[serde(default)]
     pub max_ihave_messages: i32,
-    #[serde(default)]
+    #[serde(default, alias = "maxIDontWantMessages")]
     pub max_idont_want_messages: i32,
     #[serde(default, alias = "iWantFollowupTime", deserialize_with = "crate::deserialize_go_duration_ms")]
     pub iwant_followup_time_ms: u64,
-    #[serde(default)]
+    #[serde(default, alias = "iDontWantMessageThreshold")]
     pub idont_want_message_threshold: i32,
-    #[serde(default)]
+    #[serde(default, alias = "iDontWantMessageTTL")]
     pub idont_want_message_ttl: i32,
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,

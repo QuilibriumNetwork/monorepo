@@ -17,17 +17,17 @@ pub struct EngineConfig {
     pub stats_multiaddr: String,
     #[serde(default = "default_worker_base_listen")]
     pub data_worker_base_listen_multiaddr: String,
-    #[serde(default = "default_worker_base_p2p_port")]
+    #[serde(default = "default_worker_base_p2p_port", alias = "dataWorkerBaseP2PPort")]
     pub data_worker_base_p2p_port: u16,
     #[serde(default = "default_worker_base_stream_port")]
     pub data_worker_base_stream_port: u16,
     #[serde(default = "default_worker_memory_limit")]
     pub data_worker_memory_limit: i64,
-    #[serde(default)]
+    #[serde(default, alias = "dataWorkerP2PMultiaddrs")]
     pub data_worker_p2p_multiaddrs: Vec<String>,
     #[serde(default)]
     pub data_worker_stream_multiaddrs: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "dataWorkerAnnounceP2PMultiaddrs")]
     pub data_worker_announce_p2p_multiaddrs: Vec<String>,
     #[serde(default)]
     pub data_worker_announce_stream_multiaddrs: Vec<String>,

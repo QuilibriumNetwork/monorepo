@@ -580,6 +580,52 @@ impl HypergraphCrdt {
         self.shard_metadata.read().unwrap().get(&shard_key).cloned()
     }
 
+    /// Compute the current root commitment for a single phase set
+    /// (e.g. vertex-adds) of a single shard. Lightweight alternative
+    /// to `commit()` — reads from the in-memory tree without writing
+    /// anything to the store. Returns an empty vec if the shard/phase
+    /// has no tree loaded.
+    /// Compute the current root commitment for a single phase set
+    /// (e.g. vertex-adds) of a single shard. Lightweight alternative
+    /// to `commit()` — reads from the in-memory tree without writing
+    /// to RocksDB. Returns an empty vec if the shard/phase has no
+    /// tree loaded.
+    pub fn compute_shard_root(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+    ) -> Vec<u8> {
+        let sets = self.phase_sets.read().unwrap();
+        let tree = match (set_type, phase_type) {
+            ("vertex", "adds") => sets.vertex_adds.get(shard_key),
+            ("vertex", "removes") => sets.vertex_removes.get(shard_key),
+            ("hyperedge", "adds") => sets.hyperedge_adds.get(shard_key),
+            ("hyperedge", "removes") => sets.hyperedge_removes.get(shard_key),
+            _ => None,
+        };
+        let Some(t) = tree else {
+            return Vec::new();
+        };
+        // Use a no-op transaction — we only want the in-memory
+        // commitment, not a store write. `commit` loads the root
+        // if needed, walks dirty nodes, and returns the root hash.
+        struct NoopTxn;
+        impl quil_types::store::Transaction for NoopTxn {
+            fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> { Ok(None) }
+            fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+            fn commit(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
+            fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+            fn abort(self: Box<Self>) -> quil_types::error::Result<()> { Ok(()) }
+            fn new_iter(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
+                Err(quil_types::error::QuilError::Internal("noop".into()))
+            }
+            fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> { Ok(()) }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+        t.commit(&NoopTxn, self.prover.as_ref()).unwrap_or_default()
+    }
+
     /// Look up whether a vertex exists (in adds and not in removes).
     pub fn lookup_vertex(&self, location: &Location) -> bool {
         self.get_vertex_data(location).is_some()

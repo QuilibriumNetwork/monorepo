@@ -51,6 +51,7 @@ pub mod validator;
 pub mod vote_aggregation;
 pub mod voting_provider;
 pub mod worker;
+pub mod prover_tree_syncer;
 
 /// Test support mocks (TestProverRegistry, TestWorkerManager).
 /// Exposed for integration tests in `tests/`; hidden from public
