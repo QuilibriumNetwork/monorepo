@@ -79,6 +79,10 @@ jobs:
   # ------------------------------------------------------------------
   release-build:
     name: release-build (${{ matrix.name }})
+    # Gate the (slow, matrixed) release builds on `cargo check` passing —
+    # no point burning three runners on a release build if the workspace
+    # doesn't even compile in debug.
+    needs: build
     strategy:
       fail-fast: false
       matrix:
