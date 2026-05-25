@@ -38,14 +38,37 @@ runs:
           autoconf \
           automake \
           libtool \
-          git
+          git \
+          unzip \
+          curl
+
+    # protoc from apt is too old for prost-build; pull the official
+    # release binary directly. Pinned version — bump as needed.
+    - name: Install protoc (linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        PROTOC_VERSION: "28.3"
+      run: |
+        case "$RUNNER_ARCH" in
+          X64)   PROTOC_ARCH=linux-x86_64 ;;
+          ARM64) PROTOC_ARCH=linux-aarch_64 ;;
+          *) echo "unsupported runner arch: $RUNNER_ARCH" >&2; exit 1 ;;
+        esac
+        TMP="$(mktemp -d)"
+        curl -fsSL -o "$TMP/protoc.zip" \
+          "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
+        sudo unzip -o "$TMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
+        sudo chmod +x /usr/local/bin/protoc
+        rm -rf "$TMP"
+        protoc --version
 
     - name: brew install (macos)
       if: runner.os == 'macOS'
       shell: bash
       run: |
         brew update
-        brew install gmp mpfr openssl@3 cmake autoconf automake libtool m4 pkg-config
+        brew install gmp mpfr openssl@3 cmake autoconf automake libtool m4 pkg-config protobuf
 
     # -------------------------------------------------------------
     # Resolve FLINT install paths per OS
