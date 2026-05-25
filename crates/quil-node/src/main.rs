@@ -3698,14 +3698,30 @@ async fn run_master_node(
                             // Per-topic validator gate. Malformed bytes are
                             // dropped before they reach a queue.
                             // Unregistered topics fall through.
-                            if !router_for_recv
-                                .route(&received.bitmask, &received.data)
-                                .should_dispatch()
-                            {
+                            let route_outcome = router_for_recv
+                                .route(&received.bitmask, &received.data);
+                            if !route_outcome.should_dispatch() {
                                 router_drops += 1;
-                                if router_drops <= 5 || router_drops % 1000 == 0 {
-                                    debug!(
-                                        bitmask = %hex::encode(&received.bitmask),
+                                // Categorize for operator visibility.
+                                let topic = match received.bitmask.as_slice() {
+                                    GLOBAL_PEER_INFO => "peer_info",
+                                    GLOBAL_PROVER => "prover",
+                                    GLOBAL_FRAME => "frame",
+                                    GLOBAL_CONSENSUS => "consensus",
+                                    GLOBAL_ALERT => "alert",
+                                    _ => "shard/unknown",
+                                };
+                                let type_prefix = if received.data.len() >= 4 {
+                                    format!("0x{:08x}", u32::from_be_bytes(
+                                        received.data[..4].try_into().unwrap_or([0;4])
+                                    ))
+                                } else {
+                                    format!("short({}B)", received.data.len())
+                                };
+                                if router_drops <= 10 || router_drops % 1000 == 0 {
+                                    info!(
+                                        topic,
+                                        type_prefix,
                                         len = received.data.len(),
                                         total_dropped = router_drops,
                                         "router validator dropped message",

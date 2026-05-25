@@ -240,27 +240,11 @@ impl MessageRouter {
         let Some(validator) = validator else {
             return RouteOutcome::Unvalidated;
         };
-        // catch_unwind so that a panicking validator drops the message
-        // rather than killing whatever loop is running route().
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validator(data)));
         match result {
             Ok(true) => RouteOutcome::Accepted,
-            Ok(false) => {
-                debug!(
-                    bitmask = %hex::encode(bitmask),
-                    len = data.len(),
-                    prefix = %hex::encode(&data[..core::cmp::min(4, data.len())]),
-                    "validator rejected message",
-                );
-                RouteOutcome::Rejected
-            }
-            Err(_) => {
-                debug!(
-                    bitmask = %hex::encode(bitmask),
-                    "validator panicked, dropping message",
-                );
-                RouteOutcome::Rejected
-            }
+            Ok(false) => RouteOutcome::Rejected,
+            Err(_) => RouteOutcome::Rejected,
         }
     }
 }
