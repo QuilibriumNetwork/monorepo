@@ -109,6 +109,9 @@ pub enum ControlEventData {
         filter: Vec<u8>,
         proposed: Vec<Vec<u8>>,
     },
+    Alert {
+        message: String,
+    },
 }
 
 /// Distributes control events to subscribers.

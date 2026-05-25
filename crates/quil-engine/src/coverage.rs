@@ -512,6 +512,22 @@ impl CoverageMonitor {
         self.prover_only_mode.load(Ordering::Relaxed)
     }
 
+    /// Handle a verified `GlobalAlert`. This is a fire alarm — ALL
+    /// consensus (global AND app-shard) must stop immediately. Sets
+    /// prover-only mode and publishes a `Halt` event (NOT
+    /// `CoverageHalt` — this is a hard stop, not a per-shard
+    /// coverage issue) so every engine ceases producing frames.
+    pub fn emit_alert(&self, message: &str) {
+        self.prover_only_mode.store(true, Ordering::SeqCst);
+        self.event_distributor.publish(ControlEvent {
+            event_type: ControlEventType::Halt,
+            data: ControlEventData::Alert {
+                message: message.to_string(),
+            },
+        });
+        tracing::error!(message, "GLOBAL ALERT — hard halt activated, all frame production stopped");
+    }
+
     /// Check for shards that need splitting (too many provers) or
     /// merging (too few provers). Returns proposed actions.
     pub fn check_split_merge(&self, frame_number: u64) -> Vec<ShardAction> {

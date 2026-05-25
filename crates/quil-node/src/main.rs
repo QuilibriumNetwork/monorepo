@@ -857,10 +857,11 @@ async fn run_master_node(
         p2p_handle.subscribe(vec![0xFFu8; 32]).await;
     }
     p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
+    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec()).await;
     if archive_mode {
         info!("subscribed to all global + bulk shard bitmasks (archive mode)");
     } else {
-        info!("subscribed to GLOBAL_PEER_INFO only (non-archive)");
+        info!("subscribed to GLOBAL_PEER_INFO + GLOBAL_ALERT (non-archive)");
     }
 
     // Apply engine blacklist — deny connections from blacklisted peers.
@@ -1250,6 +1251,21 @@ async fn run_master_node(
                                     quil_engine::metrics::inc_coverage_halts_entered();
                                     quil_engine::metrics::set_halted_shards(hs.halted_count() as u64);
                                 }
+                            }
+                            (
+                                quil_types::consensus::ControlEventType::Halt,
+                                quil_types::consensus::ControlEventData::Alert { message },
+                            ) => {
+                                // Hard halt — ALL shards stop. This is
+                                // a fire alarm, not a per-shard
+                                // coverage issue. Permanent for this
+                                // process lifetime; operator must
+                                // restart after the alert is resolved.
+                                error!(
+                                    message = %message,
+                                    "GLOBAL ALERT — hard halt, stopping all shard engines"
+                                );
+                                hs.hard_halt();
                             }
                             (
                                 quil_types::consensus::ControlEventType::CoverageResume,
@@ -2224,6 +2240,7 @@ async fn run_master_node(
     const GLOBAL_FRAME: &[u8] = &[0x00, 0x00];
     const GLOBAL_PROVER: &[u8] = &[0x00, 0x00, 0x00];
     const GLOBAL_PEER_INFO: &[u8] = &[0x00, 0x00, 0x00, 0x00];
+    const GLOBAL_ALERT: &[u8] = &[0u8; 16];
 
     // Resolve our Ed448 seed (57 bytes) for the mTLS cert. The peer key in
     // config is either 57 bytes (raw seed) or 114 bytes (seed + pubkey).
@@ -3513,6 +3530,7 @@ async fn run_master_node(
     let lhf_for_recv = last_global_head_frame.clone();
     let genesis_archive_peer_ids_for_recv = genesis_archive_peer_ids.clone();
     let genesis_prover_addrs_for_recv = genesis_prover_addrs.clone();
+    let alert_pubkey_for_recv: Vec<u8> = hex::decode(&config.engine.alert_key).unwrap_or_default();
     // Mainnet validates archive-capability claims against the
     // hardcoded genesis archive peer IDs. Testnet/devnet bootstraps
     // can't use that list (those keys aren't theirs), so the receive
@@ -4190,6 +4208,48 @@ async fn run_master_node(
                                 prover_msgs_received += 1;
                                 let current_rank = frames_received;
                                 mc_for_recv.add_message(current_rank, received.data.clone());
+                            }
+                            GLOBAL_ALERT => {
+                                // Mirrors Go's alert validation at
+                                // `message_validation.go:641-657` +
+                                // `handleAlertMessage` at
+                                // `message_processors.go:810`. The
+                                // alert's Ed448 signature must verify
+                                // against the configured `alertKey`
+                                // with domain `"GLOBAL_ALERT" || message`.
+                                // Canonical format:
+                                //   [u32 type=0x0911][u32 msg_len][msg][u32 sig_len][sig]
+                                if alert_pubkey_for_recv.is_empty() || alert_pubkey_for_recv.len() != 57 {
+                                    debug!("GLOBAL_ALERT received but no valid alertKey configured — dropping");
+                                } else if received.data.len() >= 12 {
+                                    let d = &received.data;
+                                    let mut c = 4usize; // skip type prefix
+                                    let msg_len = u32::from_be_bytes(d[c..c+4].try_into().unwrap_or([0;4])) as usize;
+                                    c += 4;
+                                    if msg_len <= 1000 && c + msg_len + 4 <= d.len() {
+                                        let msg = &d[c..c+msg_len];
+                                        c += msg_len;
+                                        let sig_len = u32::from_be_bytes(d[c..c+4].try_into().unwrap_or([0;4])) as usize;
+                                        c += 4;
+                                        if sig_len == 114 && c + sig_len <= d.len() {
+                                            let sig = &d[c..c+sig_len];
+                                            let mut signed = Vec::with_capacity(b"GLOBAL_ALERT".len() + msg_len);
+                                            signed.extend_from_slice(b"GLOBAL_ALERT");
+                                            signed.extend_from_slice(msg);
+                                            if quil_crypto::ed448_verify(&alert_pubkey_for_recv, &signed, sig) {
+                                                let msg_str = String::from_utf8_lossy(msg);
+                                                warn!(message = %msg_str, "GLOBAL ALERT (verified)");
+                                                coverage_for_recv.emit_alert(&msg_str);
+                                            } else {
+                                                debug!("GLOBAL ALERT rejected — signature invalid");
+                                            }
+                                        } else {
+                                            debug!(sig_len, "GLOBAL ALERT rejected — bad signature length");
+                                        }
+                                    } else {
+                                        debug!(msg_len, "GLOBAL ALERT rejected — bad message length");
+                                    }
+                                }
                             }
                             _ => {
                                 // Per-shard routing: if the bitmask matches one
@@ -5709,6 +5769,7 @@ async fn run_worker_node(
         //     causes every worker to relay every shard's votes/
         //     proposals — massive amplification with zero benefit.
         handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
+        handle.subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec()).await;
         // Wire publish_fn → worker's own p2p.
         let p2p_for_publish = handle.clone();
         let publish_fn: quil_engine::worker_node::PublishFn =

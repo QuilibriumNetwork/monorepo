@@ -94,6 +94,20 @@ impl HaltState {
         self.halted_shards.read().unwrap().len()
     }
 
+    /// Hard halt — triggered by a verified `GlobalAlert`. Inserts a
+    /// sentinel entry that `any_halted()` will always see as true,
+    /// and fires the watch channel so every shard engine's
+    /// `set_halted(true)` fires immediately. Unlike per-shard halts,
+    /// a hard halt is permanent for this process lifetime — there is
+    /// no "resume" path for a global alert. The operator must restart
+    /// the node after the alert is resolved.
+    pub fn hard_halt(&self) {
+        let sentinel = b"__GLOBAL_ALERT_HARD_HALT__".to_vec();
+        let mut guard = self.halted_shards.write().unwrap();
+        guard.insert(sentinel);
+        let _ = self.any_halted_tx.send(true);
+    }
+
     /// Apply a single control event to the state. Returns `true` if
     /// the event changed state (so callers can decide whether to log).
     /// Sends the new `any_halted()` value on the watch channel when

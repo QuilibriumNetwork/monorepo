@@ -362,13 +362,18 @@ impl P2PNode {
                     _ => (key.public().to_peer_id(), key.clone()),
                 };
                 blossomsub.set_signing_identity(sign_peer_id, sign_key);
-                // Pre-subscribe to global bitmasks so subscription RPCs
-                // are sent as soon as peers connect (before command channel)
-                blossomsub.subscribe(vec![0x00]);                   // GLOBAL_CONSENSUS
-                blossomsub.subscribe(vec![0x00, 0x00]);             // GLOBAL_FRAME
-                blossomsub.subscribe(vec![0x00, 0x00, 0x00]);       // GLOBAL_PROVER
-                blossomsub.subscribe(vec![0x00, 0x00, 0x00, 0x00]); // GLOBAL_PEER_INFO
-                blossomsub.subscribe(vec![0u8; 16]);                // GLOBAL_ALERT
+                // Do NOT pre-subscribe to global bitmasks here. The
+                // caller (`main.rs` or `run_worker_node`) selects
+                // subscriptions based on node role:
+                //   - Archive: all global + [0xFF;32] bulk shard
+                //   - Non-archive master: GLOBAL_PEER_INFO only
+                //   - Worker: GLOBAL_PEER_INFO only (per-shard added
+                //     dynamically on Respawn)
+                //
+                // Pre-subscribing here bypasses those gates and causes
+                // every node to receive and relay ALL global traffic
+                // regardless of role — the root cause of bandwidth
+                // explosion on non-archive clusters.
                 let autonat = libp2p::autonat::Behaviour::new(
                     local_peer_id,
                     libp2p::autonat::Config::default(),
