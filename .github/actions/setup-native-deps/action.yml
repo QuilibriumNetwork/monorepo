@@ -85,6 +85,21 @@ runs:
           echo "flint-prefix=/usr/local" >> "$GITHUB_OUTPUT"
         fi
 
+    # actions/cache restores files as the unprivileged runner user. The
+    # /usr/local/{lib,include} subtrees default to root-owned on the
+    # runner, so a cache populated by `sudo make install` cannot be
+    # restored on the next run — tar fails with
+    # "Cannot mkdir / Cannot open: Permission denied" on
+    # /usr/local/lib/pkgconfig, /usr/local/include/flint, etc. Pre-chown
+    # the install subtrees so both the cache restore and our own
+    # install commands below can write without sudo.
+    - name: Make /usr/local install dirs writable (linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo mkdir -p /usr/local/lib/pkgconfig /usr/local/lib/cmake /usr/local/include
+        sudo chown -R "$(id -u):$(id -g)" /usr/local/lib /usr/local/include
+
     # -------------------------------------------------------------
     # FLINT 3.0 — built from source, cached per OS/arch
     # -------------------------------------------------------------
@@ -113,7 +128,11 @@ runs:
           --enable-static --disable-shared \
           CFLAGS="-O3"
         make -j"$(nproc)"
-        sudo make install
+        # No sudo: /usr/local/{lib,include} was chowned to the runner
+        # user in "Make /usr/local install dirs writable" above so the
+        # resulting files are runner-owned and a later cache restore
+        # can write them back without permission errors.
+        make install
         popd
         rm -rf "$FLINT_TMP"
 
@@ -165,10 +184,16 @@ runs:
         sed -i.bak 's|add_library(${NAME} SHARED ${sources})|add_library(${NAME} STATIC ${sources})|g' emp-tool/CMakeLists.txt
         rm -f emp-tool/CMakeLists.txt.bak
 
+        # On Linux /usr/local/{lib,include} were chowned to the runner
+        # user above, so cmake --install can write without sudo and the
+        # resulting files restore cleanly from the EMP cache on later
+        # runs. macOS still needs sudo to write under /usr/local.
+        if [[ "$RUNNER_OS" == "Linux" ]]; then SUDO=""; else SUDO="sudo"; fi
+
         cmake -S emp-tool -B emp-tool/build -DCMAKE_INSTALL_PREFIX=/usr/local
         cmake --build emp-tool/build -j
-        sudo cmake --install emp-tool/build
+        $SUDO cmake --install emp-tool/build
 
         cmake -S emp-ot -B emp-ot/build -DCMAKE_INSTALL_PREFIX=/usr/local
         cmake --build emp-ot/build -j
-        sudo cmake --install emp-ot/build
+        $SUDO cmake --install emp-ot/build
