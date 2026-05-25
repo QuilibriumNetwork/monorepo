@@ -102,7 +102,12 @@ fn main() {
             .flag("-lmpfr")
             .compile("vdf");
     } else if target == "x86_64-unknown-linux-gnu" {
+        // Ubuntu/Debian put apt's libgmp.a under the multiarch dir
+        // (/usr/lib/x86_64-linux-gnu/), not directly in /usr/lib. Without
+        // this search path rustc fails with "could not find native static
+        // library `gmp`". Mirrors the aarch64 branch above.
         println!("cargo:rustc-link-search=native=/usr/local/lib");
+        println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu/");
         println!("cargo:rustc-link-search=native=/usr/lib/");
         cc::Build::new()
             .cpp(true)
