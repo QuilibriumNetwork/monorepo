@@ -3,6 +3,7 @@ node/node
 node/lunchtime-*
 vouchers/
 ceremony-client
+.config*
 .DS_Store
 *.mprof
 .env
