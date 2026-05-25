@@ -93,12 +93,16 @@ runs:
     # /usr/local/lib/pkgconfig, /usr/local/include/flint, etc. Pre-chown
     # the install subtrees so both the cache restore and our own
     # install commands below can write without sudo.
+    #
+    # /usr/local/cmake is also chowned because emp-tool/emp-ot install
+    # their cmake config files there (DESTINATION cmake/ relative to
+    # CMAKE_INSTALL_PREFIX=/usr/local), not under lib/cmake/.
     - name: Make /usr/local install dirs writable (linux)
       if: runner.os == 'Linux'
       shell: bash
       run: |
-        sudo mkdir -p /usr/local/lib/pkgconfig /usr/local/lib/cmake /usr/local/include
-        sudo chown -R "$(id -u):$(id -g)" /usr/local/lib /usr/local/include
+        sudo mkdir -p /usr/local/lib/pkgconfig /usr/local/lib/cmake /usr/local/include /usr/local/cmake
+        sudo chown -R "$(id -u):$(id -g)" /usr/local/lib /usr/local/include /usr/local/cmake
 
     # -------------------------------------------------------------
     # FLINT 3.0 — built from source, cached per OS/arch
