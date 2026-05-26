@@ -1,6 +1,9 @@
+pub(crate) mod allocator_and_lifecycle;
 pub(crate) mod engines;
 pub(crate) mod frame_pipeline;
 pub(crate) mod keys;
 pub(crate) mod networking;
 pub(crate) mod peer_info_publisher;
+pub(crate) mod runtime_state;
 pub(crate) mod storage;
+pub(crate) mod worker_manager;
