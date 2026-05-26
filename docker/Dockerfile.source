@@ -167,7 +167,12 @@ WORKDIR /opt/ceremonyclient
 # Rust workspace files (rarely change)
 COPY Cargo.toml Cargo.lock ./
 
-# Rust crate sources (needed by cargo build in generate.sh)
+# Rust crate sources (needed by cargo build in gen-rust below).
+# BuildKit normalizes mtimes on COPY, so cargo's mtime-based fingerprint
+# check inside the target/ cache mount may over-rebuild. The cache mount
+# still provides value for the registry/git caches and for cargo's
+# content-derived intermediate artifacts; full mtime-based incrementality
+# would require a host-side mtime normalization step (e.g. git restore-mtime).
 COPY crates crates
 
 # Gen-* module directories (Go wrappers + generate.sh scripts)
@@ -196,43 +201,43 @@ COPY go-libp2p-kad-dht/go.mod go-libp2p-kad-dht/go.sum go-libp2p-kad-dht/
 COPY go-libp2p-blossomsub/go.mod go-libp2p-blossomsub/go.sum go-libp2p-blossomsub/
 
 # -----------------------------------------------------------------------------
-# Parallel Generation Stages
+# Stage: gen-rust
+# Purpose: Single cargo invocation that builds all seven leaf crates plus
+# their uniffi-generated Go bindings. Shared workspace dependencies (quil-types,
+# ed448-rust, classgroup, etc.) compile exactly once instead of seven times
+# across parallel stages.
+#
+# Three cache mounts:
+# - cargo-registry / cargo-git: shared across all stages and across the
+#   non-avx512 + avx512 Dockerfiles (pure function of Cargo.lock, identical
+#   downloaded source for both).
+# - cargo-target-rust: per-stage; sharing the target dir with stages that
+#   have a different -p set would cause cargo fingerprint thrash.
+#
+# The cache-mounted /opt/ceremonyclient/target is NOT part of this stage's
+# filesystem, so the .a artifacts are copied to /out/ before the mount
+# unmounts. Downstream stages COPY --from=gen-rust /out/*.a instead.
 # -----------------------------------------------------------------------------
-
-FROM common-context AS gen-channel
-WORKDIR /opt/ceremonyclient/channel
-RUN go mod download
-RUN ./generate.sh
-
-FROM common-context AS gen-vdf
-WORKDIR /opt/ceremonyclient/vdf
-RUN go mod download
-RUN ./generate.sh
-
-FROM common-context AS gen-ferret
-WORKDIR /opt/ceremonyclient/ferret
-RUN go mod download
-RUN ./generate.sh
-
-FROM common-context AS gen-bls48581
-WORKDIR /opt/ceremonyclient/bls48581
-RUN go mod download
-RUN ./generate.sh
-
-FROM common-context AS gen-rpm
-WORKDIR /opt/ceremonyclient/rpm
-RUN go mod download
-RUN ./generate.sh
-
-FROM common-context AS gen-verenc
-WORKDIR /opt/ceremonyclient/verenc
-RUN go mod download
-RUN ./generate.sh
-
-FROM common-context AS gen-bulletproofs
-WORKDIR /opt/ceremonyclient/bulletproofs
-RUN go mod download
-RUN ./generate.sh
+FROM common-context AS gen-rust
+WORKDIR /opt/ceremonyclient
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-rust,target=/opt/ceremonyclient/target \
+    cargo build --release \
+        -p channel -p vdf -p ferret -p bls48581 \
+        -p rpm -p verenc -p ed448-bulletproofs && \
+    mkdir -p /out && \
+    cp target/release/libchannel.a \
+       target/release/libvdf.a \
+       target/release/libferret.a \
+       target/release/libbls48581.a \
+       target/release/librpm.a \
+       target/release/libverenc.a \
+       target/release/libbulletproofs.a \
+       /out/ && \
+    for d in channel vdf ferret bls48581 rpm verenc bulletproofs; do \
+        uniffi-bindgen-go "crates/$d/src/lib.udl" -o "/opt/ceremonyclient/$d/generated"; \
+    done
 
 # -----------------------------------------------------------------------------
 # Stage: build-context
@@ -247,27 +252,17 @@ COPY --exclude=node \
     --exclude=sidecar \
     --exclude=qns-api . .
 
-# Copy generated artifacts back (overwrites source dirs with generated versions)
-COPY --from=gen-channel /opt/ceremonyclient/channel /opt/ceremonyclient/channel
-COPY --from=gen-channel /opt/ceremonyclient/target/release/libchannel.a /opt/ceremonyclient/target/release/libchannel.a
-
-COPY --from=gen-vdf /opt/ceremonyclient/vdf /opt/ceremonyclient/vdf
-COPY --from=gen-vdf /opt/ceremonyclient/target/release/libvdf.a /opt/ceremonyclient/target/release/libvdf.a
-
-COPY --from=gen-ferret /opt/ceremonyclient/ferret /opt/ceremonyclient/ferret
-COPY --from=gen-ferret /opt/ceremonyclient/target/release/libferret.a /opt/ceremonyclient/target/release/libferret.a
-
-COPY --from=gen-bls48581 /opt/ceremonyclient/bls48581 /opt/ceremonyclient/bls48581
-COPY --from=gen-bls48581 /opt/ceremonyclient/target/release/libbls48581.a /opt/ceremonyclient/target/release/libbls48581.a
-
-COPY --from=gen-rpm /opt/ceremonyclient/rpm /opt/ceremonyclient/rpm
-COPY --from=gen-rpm /opt/ceremonyclient/target/release/librpm.a /opt/ceremonyclient/target/release/librpm.a
-
-COPY --from=gen-verenc /opt/ceremonyclient/verenc /opt/ceremonyclient/verenc
-COPY --from=gen-verenc /opt/ceremonyclient/target/release/libverenc.a /opt/ceremonyclient/target/release/libverenc.a
-
-COPY --from=gen-bulletproofs /opt/ceremonyclient/bulletproofs /opt/ceremonyclient/bulletproofs
-COPY --from=gen-bulletproofs /opt/ceremonyclient/target/release/libbulletproofs.a /opt/ceremonyclient/target/release/libbulletproofs.a
+# Copy generated artifacts back (overwrites source dirs with generated bindings).
+# The .a files come from /out/ because gen-rust's target/ is a cache mount,
+# not part of its filesystem.
+COPY --from=gen-rust /opt/ceremonyclient/channel /opt/ceremonyclient/channel
+COPY --from=gen-rust /opt/ceremonyclient/vdf /opt/ceremonyclient/vdf
+COPY --from=gen-rust /opt/ceremonyclient/ferret /opt/ceremonyclient/ferret
+COPY --from=gen-rust /opt/ceremonyclient/bls48581 /opt/ceremonyclient/bls48581
+COPY --from=gen-rust /opt/ceremonyclient/rpm /opt/ceremonyclient/rpm
+COPY --from=gen-rust /opt/ceremonyclient/verenc /opt/ceremonyclient/verenc
+COPY --from=gen-rust /opt/ceremonyclient/bulletproofs /opt/ceremonyclient/bulletproofs
+COPY --from=gen-rust /out/ /opt/ceremonyclient/target/release/
 
 # -----------------------------------------------------------------------------
 # Stage: build-node
@@ -279,10 +274,20 @@ WORKDIR /opt/ceremonyclient/node
 # installs the binary at node/build/<platform>/node. The wildcard
 # copy lets this same Dockerfile serve amd64/arm64 Linux builds
 # without a platform switch.
-RUN ./build.sh && cp build/*/node /usr/bin/node
+# build.sh writes the final binary to node/build/<platform>/, outside
+# the cache-mounted target/, so the cp after the && finds it on the
+# real filesystem.
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-node,target=/opt/ceremonyclient/target \
+    ./build.sh && cp build/*/node /usr/bin/node
 
 # -----------------------------------------------------------------------------
 # Stage: build-qclient
+# Go cache mounts persist /root/.cache/go-build (compiled object cache) and
+# /root/go/pkg/mod (module download cache) across docker builds. Without
+# them, any invalidation of build-context (e.g., a file added to crates/)
+# triggers a full from-scratch Go rebuild here.
 # -----------------------------------------------------------------------------
 FROM build-context AS build-qclient
 ARG TARGETOS
@@ -290,14 +295,20 @@ ARG TARGETARCH
 
 COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
-RUN go mod download
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    go mod download
 
 COPY ./client /opt/ceremonyclient/client
 WORKDIR /opt/ceremonyclient/client
-RUN go mod download
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    go mod download
 
 ARG BINARIES_DIR=/opt/ceremonyclient/target/release
-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh -o qclient
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh -o qclient
 RUN cp qclient /usr/bin
 
 # -----------------------------------------------------------------------------
@@ -309,16 +320,22 @@ ARG TARGETARCH
 
 COPY ./node /opt/ceremonyclient/node
 WORKDIR /opt/ceremonyclient/node
-RUN go mod download
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    go mod download
 
 COPY ./qns-api /opt/ceremonyclient/qns-api
 WORKDIR /opt/ceremonyclient/qns-api
-RUN go mod download
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    go mod download
 
 ARG BINARIES_DIR=/opt/ceremonyclient/target/release
 ENV ROOT_DIR=/opt/ceremonyclient
 ENV CEREMONYCLIENT_DIR=/opt/ceremonyclient
-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh -o qns-api ./cmd/api
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh -o qns-api ./cmd/api
 RUN cp qns-api /usr/bin
 
 # -----------------------------------------------------------------------------
