@@ -288,14 +288,8 @@ impl LifecycleReadiness {
         Ok(())
     }
 
-    /// Propose-time readiness: baseline + no halt + cooldown
-    /// elapsed. Required for any path that submits a `Propose*`
-    /// message (join, leave, shard split/merge).
     pub fn propose_ready(&self) -> std::result::Result<(), &'static str> {
         self.baseline_ready()?;
-        if !self.no_halt {
-            return Err("shard coverage halt active");
-        }
         if !self.join_cooldown_ok {
             return Err("cooldown between join attempts");
         }
