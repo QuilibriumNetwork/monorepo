@@ -2271,16 +2271,37 @@ async fn run_master_node(
     // its source and forward-polls the chain head.
     let archive_pool = std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new());
 
-    // Pre-seed the archive pool with the hardcoded mTLS endpoints
-    // for the 5 genesis archive peers. The shard-info remote fallback
-    // (and any other archive-pool consumer) needs at least one
-    // reachable endpoint before the libp2p mesh converges and starts
-    // delivering PeerInfo gossip. mTLS gRPC convention is TCP/8340.
-    //
-    // These IPs are mainnet-only — testnets/devnets have their own
-    // genesis archives, which we don't seed statically (they're
-    // ephemeral; PeerInfo gossip handles them).
-    if network == 0 {
+    // Pre-seed the archive pool. Precedence matches the Go node
+    // (`node/main.go:737-741`):
+    //   1. If `engine.archiveEndpoints` is non-empty, use those.
+    //   2. Else, on mainnet (network == 0), fall back to the hardcoded
+    //      genesis-archive static IPs.
+    //   3. Else, nothing — PeerInfo gossip will populate the pool once
+    //      the libp2p mesh converges.
+    // The pool needs at least one reachable endpoint before the mesh
+    // converges so the shard-info remote fallback (and any other
+    // archive-pool consumer) has somewhere to dial. mTLS gRPC
+    // convention is TCP/8340.
+    if !config.engine.archive_endpoints.is_empty() {
+        for raw in &config.engine.archive_endpoints {
+            match archive_multiaddr_to_host_port(raw, network) {
+                Some(endpoint) => {
+                    archive_pool.add(endpoint.clone()).await;
+                    tracing::debug!(
+                        multiaddr = %raw,
+                        endpoint = %endpoint,
+                        "seeded archive pool from engine.archiveEndpoints"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        multiaddr = %raw,
+                        "skipping invalid engine.archiveEndpoints entry (expected /ip4|ip6|dns4|dns6|dns/.../tcp/PORT)"
+                    );
+                }
+            }
+        }
+    } else if network == 0 {
         let pool = archive_pool.clone();
         let static_ips = quil_engine::genesis::genesis_archive_static_ips();
         if !static_ips.is_empty() {
@@ -5883,6 +5904,65 @@ fn multiaddr_to_host_port_with_network(ma: &str, network: u8) -> Option<String> 
     Some(format!("{}:{}", ip, port))
 }
 
+/// Parse a libp2p multiaddr string from `engine.archiveEndpoints` into a
+/// `host:port` the mTLS gRPC client can dial. Matches what the Go node's
+/// `manet.ToNetAddr` accepts for archive client setup: `/ip4/`, `/ip6/`,
+/// `/dns4/`, `/dns6/`, `/dns/` over `/tcp/PORT`. Bare `host:port` is
+/// rejected so configs round-trip between Go and Rust.
+///
+/// IP forms apply the same private/loopback/unspecified filtering as
+/// `multiaddr_to_host_port_with_network` (gated on `network`). DNS forms
+/// pass the hostname through verbatim — the gRPC client resolves at dial
+/// time, which mirrors `manet.ToNetAddr`'s behavior.
+fn archive_multiaddr_to_host_port(ma: &str, network: u8) -> Option<String> {
+    let parts: Vec<&str> = ma.trim_start_matches('/').split('/').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    if parts[2] != "tcp" {
+        return None;
+    }
+    let port: u16 = parts[3].parse().ok()?;
+    let allow_private = network != 0;
+    match parts[0] {
+        "ip4" => {
+            let ip: std::net::Ipv4Addr = parts[1].parse().ok()?;
+            let reject = if allow_private {
+                ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
+            } else {
+                ip.is_loopback() || ip.is_private() || ip.is_link_local()
+                    || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
+            };
+            if reject {
+                return None;
+            }
+            Some(format!("{}:{}", ip, port))
+        }
+        "ip6" => {
+            let ip: std::net::Ipv6Addr = parts[1].parse().ok()?;
+            let reject = if allow_private {
+                ip.is_unspecified() || ip.is_multicast()
+            } else {
+                ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+                    || (ip.segments()[0] & 0xfe00) == 0xfc00  // unique-local fc00::/7
+                    || (ip.segments()[0] & 0xffc0) == 0xfe80  // link-local fe80::/10
+            };
+            if reject {
+                return None;
+            }
+            Some(format!("[{}]:{}", ip, port))
+        }
+        "dns4" | "dns6" | "dns" => {
+            let host = parts[1];
+            if host.is_empty() {
+                return None;
+            }
+            Some(format!("{}:{}", host, port))
+        }
+        _ => None,
+    }
+}
+
 /// Build a stream multiaddr by extracting the IP from a pubsub multiaddr and
 /// combining it with the port/protocol from the stream listen pattern.
 ///
@@ -6034,4 +6114,93 @@ async fn run_dht_node(
     info!("DHT node shut down");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_multiaddr_accepts_ip4() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/8340", 0),
+            Some("1.2.3.4:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_accepts_ip6() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip6/2001:db8::1/tcp/8340", 0),
+            Some("[2001:db8::1]:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_accepts_dns4() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/dns4/archive.example.com/tcp/8340", 0),
+            Some("archive.example.com:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_accepts_dns6() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/dns6/archive.example.com/tcp/8340", 0),
+            Some("archive.example.com:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_accepts_dns() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/dns/archive.example.com/tcp/8340", 0),
+            Some("archive.example.com:8340".into())
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_rejects_bare_host_port() {
+        assert_eq!(archive_multiaddr_to_host_port("archive.example.com:8340", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("1.2.3.4:8340", 0), None);
+    }
+
+    #[test]
+    fn archive_multiaddr_rejects_non_tcp() {
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4/udp/8340", 0), None);
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/1.2.3.4/udp/8340/quic-v1", 0),
+            None
+        );
+    }
+
+    #[test]
+    fn archive_multiaddr_rejects_malformed() {
+        assert_eq!(archive_multiaddr_to_host_port("", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4//tcp/8340", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/1.2.3.4/tcp/notaport", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/dns4//tcp/8340", 0), None);
+    }
+
+    #[test]
+    fn archive_multiaddr_rejects_private_ip_on_mainnet() {
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/192.168.1.1/tcp/8340", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/10.0.0.1/tcp/8340", 0), None);
+        assert_eq!(archive_multiaddr_to_host_port("/ip4/127.0.0.1/tcp/8340", 0), None);
+    }
+
+    #[test]
+    fn archive_multiaddr_allows_private_ip_on_devnet() {
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/192.168.1.1/tcp/8340", 1),
+            Some("192.168.1.1:8340".into())
+        );
+        assert_eq!(
+            archive_multiaddr_to_host_port("/ip4/127.0.0.1/tcp/8340", 1),
+            Some("127.0.0.1:8340".into())
+        );
+    }
 }

@@ -53,6 +53,12 @@ pub struct EngineConfig {
     pub delegate_address: String,
     #[serde(default)]
     pub rewards_address: String,
+    /// Libp2p multiaddrs of archive nodes to seed the archive endpoint
+    /// pool with at startup. Accepted shapes: `/ip4/.../tcp/PORT`,
+    /// `/ip6/.../tcp/PORT`, `/dns4/host/tcp/PORT`, `/dns6/host/tcp/PORT`,
+    /// `/dns/host/tcp/PORT`. The archive mTLS port convention is 8340.
+    /// Plain `host:port` is NOT accepted — this matches the Go node
+    /// (`node/main.go:736-795`) so configs round-trip between Go and Rust.
     #[serde(default)]
     pub archive_endpoints: Vec<String>,
     #[serde(default)]
