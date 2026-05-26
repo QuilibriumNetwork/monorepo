@@ -309,312 +309,41 @@ async fn run_master_node(
     token: CancellationToken,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 ) -> anyhow::Result<()> {
-    let master_node::storage::StorageHandles {
-        db_path: _db_path,
-        db_arc,
-        clock_store,
-        token_store,
-        key_store,
-        shards_store,
-        hg_store,
-    } = master_node::storage::init(config, archive_mode)?;
+    let storage = master_node::storage::init(config, archive_mode)?;
+    let db_arc = storage.db_arc.clone();
+    let clock_store = storage.clock_store.clone();
+    let token_store = storage.token_store.clone();
+    let key_store = storage.key_store.clone();
+    let shards_store = storage.shards_store.clone();
+    let hg_store = storage.hg_store.clone();
 
-    let master_node::keys::KeyHandles {
-        file_key_manager,
-        bls_pubkey,
-        prover_address,
-    } = master_node::keys::init(config, config_dir)?;
+    let keys = master_node::keys::init(config, config_dir)?;
+    let file_key_manager = keys.file_key_manager.clone();
+    let bls_pubkey = keys.bls_pubkey.clone();
+    let prover_address = keys.prover_address;
 
-    // ---------------------------------------------------------------
-    // 3. Create execution engines with full crypto verification
-    // ---------------------------------------------------------------
-    let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
-        Arc::new(quil_crypto::KzgInclusionProver);
-    let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
-    let key_manager: Arc<dyn quil_types::crypto::KeyManager> =
-        Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
-    // CRDT backed by RocksDB for real persistence
-    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
-        hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
-        inclusion_prover.clone(),
-    ));
-    // Pre-create the lazy tree for the global prover shard so the
-    // first commit materializes its root. Without this, migrated
-    // stores skip the shard and the sync server returns None for the
-    // tree blob.
-    crdt.ensure_all_phase_trees(&quil_types::store::ShardKey {
-        l1: [0u8; 3],
-        l2: [0xffu8; 32],
-    });
-    info!("global prover shard primed in CRDT phase_sets");
+    let engines = master_node::engines::init_engines(&storage);
+    let inclusion_prover = engines.inclusion_prover.clone();
+    let _key_manager = engines.key_manager.clone();
+    let crdt = engines.crdt.clone();
+    let exec_manager = engines.exec_manager.clone();
+    master_node::engines::bootstrap_genesis(network, config, &storage, &engines, &bls_pubkey)?;
 
-    // Same prime for every app shard the local shards-store knows
-    // about. Without this, the QUIL-token shard's lazy trees never
-    // get inserted into `phase_sets` (no in-process mutation happens
-    // on a freshly migrated store), so `phase_set_metadata_at_path`
-    // returns `None` for every prefix and `GetAppShards` reports
-    // `size=0` + zero commitments to remote pollers. Their lifecycle
-    // then drops every candidate in `build_proposal_descriptors` and
-    // no `ProposeJoin` ever fires. All four phase sets are primed
-    // because remote callers verify commitments across all phases,
-    // not just vertex_adds.
-    {
-        let mut primed_keys: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
-        let mut primed_count = 0usize;
-        if let Ok(shards) = shards_store.range_app_shards() {
-            for s in shards {
-                if s.shard_key.len() != 35 {
-                    continue;
-                }
-                if !primed_keys.insert(s.shard_key.clone()) {
-                    continue;
-                }
-                let mut l1 = [0u8; 3];
-                l1.copy_from_slice(&s.shard_key[..3]);
-                let mut l2 = [0u8; 32];
-                l2.copy_from_slice(&s.shard_key[3..35]);
-                crdt.ensure_all_phase_trees(&quil_types::store::ShardKey { l1, l2 });
-                primed_count += 1;
-            }
-        }
-        info!(shards = primed_count, "app shards primed in CRDT phase_sets");
-    }
-    // Eagerly run one commit at startup so the per-shard tree blob
-    // lands at `[0x2F, vertex, adds, {l1=[0;3], l2=[0xff;32]}]`
-    // before any sync probe arrives. Without an eager commit the
-    // tree blob isn't written until the first finalized frame is
-    // materialized, leaving an interval (sometimes several minutes
-    // on the seed nodes) where non-archive peers receive
-    // "no tree data available" and fall into perpetual fresh-sync
-    // retries.
-    match crdt.commit(0) {
-        Ok(commits) => {
-            let global_shard = quil_types::store::ShardKey {
-                l1: [0u8; 3],
-                l2: [0xffu8; 32],
-            };
-            let root_hex = commits
-                .get(&global_shard)
-                .and_then(|p| p.first())
-                .map(|r| hex::encode(r))
-                .unwrap_or_else(|| "<no root>".into());
-            info!(
-                shards = commits.len(),
-                global_prover_root = %root_hex,
-                "primed hypergraph tree blobs at startup",
-            );
-        }
-        Err(e) => warn!(error = %e, "startup hypergraph commit failed"),
-    }
-    // ExecutionEngineManager::new takes the full crypto + store
-    // provider set as mandatory inputs. Production bulletproof prover
-    // ships in `quil_crypto::Decaf448BulletproofProver`; the Decaf448
-    // constructor and circuit compiler aren't wired to real
-    // implementations yet (no production impl exists in the Rust
-    // tree), so we plug in the testing-stubs noop variants. Those
-    // engines' verify paths return `false` for every signature, so
-    // any signed op fails closed rather than silently passing.
-    let bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver> =
-        Arc::new(quil_crypto::Decaf448BulletproofProver);
-    let decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor> =
-        Arc::new(quil_execution::testing::NoopDecafConstructor);
-    let circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler> =
-        Arc::new(quil_execution::testing::NoopCircuitCompiler);
-    let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> =
-        clock_store.clone();
-    // Hypergraph engine requires a config resolver. A real resolver
-    // would look up the HypergraphDeploy config vertex for each
-    // domain; that materialization isn't wired yet, so we use the
-    // fail-closed noop (returns None → AuthCheck::UnknownDomain →
-    // engine rejects all hypergraph write ops). Swap in a real
-    // resolver once the deploy materialization lands.
-    let hypergraph_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
-        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
-    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new(
-        inclusion_prover.clone(),
-        key_manager.clone(),
-        crdt.clone(),
-        bulletproof_prover,
-        decaf_constructor,
-        circuit_compiler,
-        clock_store_for_exec,
-        hypergraph_resolver,
-        true,
-    ));
-    info!("execution engines initialized with BLS48-581 + Ed448 signature verification");
 
-    // 3b. Genesis bootstrap (mainnet + testnet/devnet). Idempotent:
-    // skips if the genesis frame already exists.
-    let clock_store_dyn: &dyn quil_types::store::ClockStore = clock_store.as_ref();
-    if network == 0 {
-        info!("bootstrapping mainnet genesis frame");
-        match quil_engine::genesis::initialize_genesis_state(
-            clock_store_dyn,
-            shards_store.as_ref() as &dyn quil_types::store::ShardsStore,
-            &crdt,
-            inclusion_prover.as_ref(),
-        ) {
-            Ok((frame, _qc)) => {
-                let fn_ = frame
-                    .header
-                    .as_ref()
-                    .map(|h| h.frame_number)
-                    .unwrap_or(0);
-                info!(frame_number = fn_, "mainnet genesis ready");
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "failed to initialize mainnet genesis: {}",
-                    e
-                ));
-            }
-        }
-    }
-    if network != 0 && clock_store_dyn.get_global_clock_frame(0).is_err() {
-        info!(
-            network = network,
-            "bootstrapping testnet/devnet genesis frame"
-        );
-        let genesis_seed = &config.engine.genesis_seed;
-        match quil_engine::genesis::initialize_testnet_genesis_state(
-            network,
-            genesis_seed,
-            &bls_pubkey,
-            0, // difficulty=0 triggers DEFAULT_TESTNET_DIFFICULTY
-            clock_store_dyn,
-            shards_store.as_ref() as &dyn quil_types::store::ShardsStore,
-            &crdt,
-            inclusion_prover.as_ref(),
-        ) {
-            Ok((frame, _qc)) => {
-                let fn_ = frame
-                    .header
-                    .as_ref()
-                    .map(|h| h.frame_number)
-                    .unwrap_or(0);
-                info!(
-                    frame_number = fn_,
-                    "testnet genesis established"
-                );
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "failed to initialize testnet genesis: {}",
-                    e
-                ));
-            }
-        }
-    }
+    let master_node::frame_pipeline::FramePipeline {
+        frame_prover,
+        frame_validator,
+        fee_manager,
+    } = master_node::frame_pipeline::init();
 
-    // ---------------------------------------------------------------
-    // 4. Create frame pipeline with VDF verification
-    // ---------------------------------------------------------------
-    let frame_prover: Arc<dyn quil_types::crypto::FrameProver> =
-        Arc::new(quil_crypto::WesolowskiFrameProver::new(2048));
-    let bls_for_verify: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
-    let frame_validator = quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
-        frame_prover.clone(),
-        bls_for_verify,
-    );
-
-    let _difficulty = quil_engine::AsertDifficultyAdjuster::new(0, 0, 0);
-    let fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager> =
-        Arc::new(quil_engine::InMemoryDynamicFeeManager::new(360));
-    let _time_reel = quil_engine::GlobalTimeReel::new();
-
-    info!("VDF frame prover ready (Wesolowski, 2048-bit)");
-
-    // ---------------------------------------------------------------
-    // 5. Start P2P networking
-    // ---------------------------------------------------------------
-    let listen_addr = if config.p2p.listen_multiaddr.is_empty() {
-        "/ip4/0.0.0.0/udp/8336/quic-v1".to_string()
-    } else {
-        config.p2p.listen_multiaddr.clone()
-    };
-
-    // CLI `--network` is the source of truth — override the YAML's
-    // `p2p.network` so a single config file can be reused across
-    // networks without the BlossomSub protocol id falling back to
-    // the mainnet variant on testnet runs.
-    let mut p2p_config = config.p2p.clone();
-    p2p_config.network = network;
-    let p2p_node = quil_p2p::node::P2PNode::new(&p2p_config)?;
-    let peer_id = p2p_node.peer_id;
-    info!(
-        key_type = if config.p2p.peer_priv_key.is_empty() { "generated Ed448" } else { "loaded from config" },
-        %peer_id,
-        "P2P identity ready"
-    );
-
-    // Persist newly generated Ed448 key to config
-    if let Some(key_hex) = &p2p_node.generated_key_hex {
-        let mut updated_config = config.clone();
-        updated_config.p2p.peer_priv_key = key_hex.clone();
-        if let Err(e) = quil_config::save_config(config_dir, &updated_config) {
-            warn!(error = %e, "failed to save generated peer key to config");
-        } else {
-            info!("saved new Ed448 peer key to config (peer ID is now stable)");
-        }
-    }
-
-    info!(%peer_id, "starting P2P networking");
-
-    let (p2p_handle, mut msg_rx) = p2p_node.start(&listen_addr).await?;
-    info!(listen = %listen_addr, "P2P swarm started");
-
-    // Self-loopback channel for consensus messages — used by
-    // `BlossomsubConsensusPublisher::publish_consensus` to feed the
-    // local node's own outbound proposal/vote back into the dispatcher
-    // (BlossomSub does not echo self-published messages, so without
-    // this the proposer's own state never reaches its own
-    // `vote_aggregator` / event_loop).
-    let (consensus_loopback_tx, mut consensus_loopback_rx) =
-        tokio::sync::mpsc::channel::<quil_p2p::node::ReceivedMessage>(256);
-
-    // GLOBAL_FRAME subscription is archive-only — non-archive nodes
-    // get the chain head via the archive poller and don't need the
-    // gossip firehose (matches Go's behavior). Subscribing on a
-    // In Go, all global-bitmask subscriptions except GLOBAL_PEER_INFO
-    // are gated on `isConsensusParticipant()` which is `ArchiveMode ||
-    // Network == 99`. Non-archive nodes receive frames from the
-    // archive poller, submit prover messages via direct gRPC, and
-    // participate in per-shard consensus only (subscribed dynamically
-    // by the AppConsensusEngine). Subscribing to GLOBAL_CONSENSUS on
-    // a non-archive causes every global-frame vote/proposal from every
-    // archive to be relayed through the non-archive — massive
-    // bandwidth and processing overhead with zero benefit.
-    //
-    // Archives also do a bulk subscribe to `[0xFF; 32]` (catches all
-    // shard traffic via bloom overlap) for the app-frames queue.
-    if archive_mode {
-        p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec()).await;
-        p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec()).await;
-        p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec()).await;
-        // Bulk shard subscription — mirrors Go's `bytes.Repeat([]byte{0xff}, 32)`
-        // inside `subscribeToGlobalConsensus`. Catches all per-shard frame/
-        // consensus/prover traffic via bloom-filter overlap.
-        p2p_handle.subscribe(vec![0xFFu8; 32]).await;
-    }
-    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
-    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec()).await;
-    if archive_mode {
-        info!("subscribed to all global + bulk shard bitmasks (archive mode)");
-    } else {
-        info!("subscribed to GLOBAL_PEER_INFO + GLOBAL_ALERT (non-archive)");
-    }
-
-    // Apply engine blacklist — deny connections from blacklisted peers.
-    // Blacklist entries are peer ID strings (Qm... multihash format).
-    for peer_str in &config.engine.blacklist {
-        if let Ok(peer_id) = peer_str.parse::<quil_p2p::PeerId>() {
-            p2p_handle.blacklist_peer(peer_id).await;
-            info!(peer = %peer_id, "blacklisted peer from config");
-        }
-    }
+    let master_node::networking::P2pHandles {
+        p2p_handle,
+        mut msg_rx,
+        peer_id,
+        consensus_loopback_tx,
+        mut consensus_loopback_rx,
+        listen_addr,
+    } = master_node::networking::init(config, config_dir, network, archive_mode).await?;
 
     // Frame tracking — single source of truth for "what frame is
     // this node on right now." Updated by the BlossomSub receive
