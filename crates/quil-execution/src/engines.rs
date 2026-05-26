@@ -136,11 +136,14 @@ impl GlobalExecutionEngine {
         inclusion_prover: Arc<dyn InclusionProver>,
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        clock_store: Arc<dyn quil_types::store::ClockStore>,
     ) -> Self {
         let state = Arc::new(crate::hypergraph_state::HypergraphState::new(crdt.clone()));
+        let intrinsic = crate::global_intrinsic::intrinsic::GlobalIntrinsic::new(key_manager)
+            .with_clock_store(clock_store);
         Self {
             inclusion_prover,
-            intrinsic: Some(crate::global_intrinsic::intrinsic::GlobalIntrinsic::new(key_manager)),
+            intrinsic: Some(intrinsic),
             crdt: Some(crdt),
             state: Some(state),
         }

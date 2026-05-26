@@ -159,6 +159,18 @@ impl GlobalIntrinsic {
         self
     }
 
+    /// Install the clock store used by ProverJoin validation to look up
+    /// the referenced frame's output + difficulty for the VDF verify
+    /// chain. Without it, every ProverJoin in `validate` fails closed
+    /// with "clock_store not installed".
+    pub fn with_clock_store(
+        mut self,
+        clock_store: Arc<dyn ClockStore>,
+    ) -> Self {
+        self.clock_store = Some(clock_store);
+        self
+    }
+
     /// Validate a canonical-bytes global op message. Decodes the
     /// message, dispatches by type prefix, and runs the per-op
     /// structural validation + signature verification (when prover

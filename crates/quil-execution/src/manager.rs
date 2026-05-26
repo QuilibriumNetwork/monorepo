@@ -52,6 +52,7 @@ impl ExecutionEngineManager {
                     inclusion_prover.clone(),
                     key_manager.clone(),
                     crdt.clone(),
+                    clock_store.clone(),
                 )),
             );
         }
