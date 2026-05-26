@@ -130,6 +130,24 @@ impl GlobalExecutionEngine {
         }
     }
 
+    /// Install only the `frame_prover` on the intrinsic. This is the
+    /// minimum that ProverJoin validation needs
+    /// (`verify_prover_join_vdf` in `GlobalIntrinsic::validate`); the
+    /// broader `install_frame_header_deps` also wires materializer-side
+    /// registry/issuance/kick deps and is only needed on nodes that
+    /// locally materialize global frames (archives). Non-archive
+    /// masters call this so the archive-poller callback can pass
+    /// ProverJoin validation without taking on archive-only
+    /// materialization.
+    pub fn install_frame_prover(
+        &mut self,
+        frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
+    ) {
+        if let Some(intrinsic) = self.intrinsic.take() {
+            self.intrinsic = Some(intrinsic.with_frame_prover(frame_prover));
+        }
+    }
+
     /// Create with full dependencies for real signature verification
     /// and state materialization.
     pub fn new_with_intrinsic(

@@ -2175,39 +2175,41 @@ async fn run_master_node(
         shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>,
     );
 
-    // FrameMaterializer — archive nodes only. The materializer is
-    // the canonical post-finalize processor for global frames:
-    // commits the hypergraph, verifies the prover root, processes
-    // message bundles through the execution manager, prunes orphan
-    // joins, evicts inactive provers, persists alt-shard updates,
-    // and publishes the post-materialize snapshot for worker sync.
-    //
     // Per the architecture: archives materialize global frames;
     // workers materialize app-shard frames (a separate path);
     // non-archive masters only consume the materialized state via
     // sync from archives and do not materialize themselves.
+    //
+    // Archive nodes get the FrameMaterializer (the canonical
+    // post-finalize processor: commits the hypergraph, verifies the
+    // prover root, processes message bundles, prunes orphan joins,
+    // evicts inactive provers, persists alt-shard updates, publishes
+    // post-materialize snapshots) plus the full frame-header deps on
+    // the intrinsic so `invoke_frame_header` mutates state on
+    // shard-coverage ingest (LastActiveFrameNumber advance + reward
+    // distribution). That full install already wires `frame_prover`.
+    //
+    // Non-archive masters install only `frame_prover` — the minimum
+    // their archive-poller path needs so `process_global_frame` →
+    // `validate_message` → the intrinsic's `TYPE_PROVER_JOIN` arm
+    // doesn't fail closed with "frame_prover not installed".
+    let reward_issuer: Arc<dyn quil_types::consensus::RewardIssuance> =
+        Arc::new(quil_engine::OptRewardIssuance);
+    if archive_mode {
+        let bls_for_intrinsic: Arc<dyn quil_types::crypto::BlsConstructor> =
+            Arc::new(quil_crypto::Bls48581KeyConstructor);
+        exec_manager.install_global_frame_header_deps(
+            prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+            reward_issuer.clone(),
+            bls_for_intrinsic,
+            inclusion_prover.clone(),
+            frame_prover.clone(),
+        ).expect("failed to install global frame header dependencies");
+    } else {
+        exec_manager.install_global_frame_prover(frame_prover.clone()).expect("failed to install global frame prover");
+    }
     let frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>> =
         if archive_mode {
-            let reward_issuer: Arc<dyn quil_types::consensus::RewardIssuance> =
-                Arc::new(quil_engine::OptRewardIssuance);
-            // Install frame-header deps on the global intrinsic so
-            // `invoke_frame_header` actually mutates state on
-            // shard-coverage ingest (LastActiveFrameNumber advance +
-            // reward distribution). Without this, FrameHeader bundle
-            // entries silently no-op at intrinsic.rs:974-980 and
-            // archives never credit prover shard work — eviction
-            // and rewards would silently break.
-            let bls_for_intrinsic: Arc<dyn quil_types::crypto::BlsConstructor> =
-                Arc::new(quil_crypto::Bls48581KeyConstructor);
-            if let Err(e) = exec_manager.install_global_frame_header_deps(
-                prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
-                reward_issuer.clone(),
-                bls_for_intrinsic,
-                inclusion_prover.clone(),
-                frame_prover.clone(),
-            ) {
-                warn!(error = %e, "install_global_frame_header_deps failed — shard coverage attribution will be a no-op");
-            }
             let m = quil_engine::frame_materializer::FrameMaterializer::new(
                 exec_manager.clone(),
                 prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
