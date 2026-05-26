@@ -45,23 +45,15 @@ fn main() {
     // the macOS link falls back to dynamic and the binary needs
     // `libflint.dylib` at runtime.
     //
-    // Link order matters for static resolution: flint depends on gmp
-    // and mpfr, so those must come AFTER `-lflint` on the link line.
-    if target == "aarch64-apple-darwin" {
-        let flint_static_on_macos = env::var("FLINT_DIR").is_ok();
-        if flint_static_on_macos {
-            println!("cargo:rustc-link-lib=static=flint");
-        } else {
-            println!("cargo:rustc-link-lib=flint");
-        }
-        println!("cargo:rustc-link-lib=static=mpfr");
-        println!("cargo:rustc-link-lib=static=gmp");
-    } else {
-        println!("cargo:rustc-link-lib=static=flint");
-        println!("cargo:rustc-link-lib=mpfr");
-        println!("cargo:rustc-link-lib=static=gmp");
-    }
-
+    // Link order matters for static resolution: vdf depends on
+    // flint/gmp/mpfr, and flint depends on gmp/mpfr. With static
+    // archives, ld only extracts members whose exports satisfy
+    // currently-unresolved symbols, so the dependent archives must
+    // appear BEFORE the dependencies on the link line. cc's
+    // `compile("vdf")` emits `cargo:rustc-link-lib=static=vdf` at the
+    // time it's called — so we must call it BEFORE the flint/mpfr/gmp
+    // link-lib prints, otherwise libvdf ends up after libgmp on the
+    // link line and gmp members referenced only by vdf go unresolved.
     if target == "aarch64-apple-darwin" {
         // Resolve Homebrew install prefixes dynamically. The previous
         // hardcoded `/opt/homebrew/Cellar/gmp/6.3.0/lib`-style paths
@@ -91,6 +83,15 @@ fn main() {
             .flag(&inc_flint)
             .flag(&inc_mpfr)
             .compile("vdf");
+
+        let flint_static_on_macos = env::var("FLINT_DIR").is_ok();
+        if flint_static_on_macos {
+            println!("cargo:rustc-link-lib=static=flint");
+        } else {
+            println!("cargo:rustc-link-lib=flint");
+        }
+        println!("cargo:rustc-link-lib=static=mpfr");
+        println!("cargo:rustc-link-lib=static=gmp");
     } else if target == "aarch64-unknown-linux-gnu" {
         println!("cargo:rustc-link-search=native=/usr/local/lib");
         println!("cargo:rustc-link-search=native=/usr/lib/aarch64-linux-gnu/");
@@ -101,6 +102,9 @@ fn main() {
             .flag("-lflint")
             .flag("-lmpfr")
             .compile("vdf");
+        println!("cargo:rustc-link-lib=static=flint");
+        println!("cargo:rustc-link-lib=mpfr");
+        println!("cargo:rustc-link-lib=static=gmp");
     } else if target == "x86_64-unknown-linux-gnu" {
         // Ubuntu/Debian put apt's libgmp.a under the multiarch dir
         // (/usr/lib/x86_64-linux-gnu/), not directly in /usr/lib. Without
@@ -116,6 +120,9 @@ fn main() {
             .flag("-lflint")
             .flag("-lmpfr")
             .compile("vdf");
+        println!("cargo:rustc-link-lib=static=flint");
+        println!("cargo:rustc-link-lib=mpfr");
+        println!("cargo:rustc-link-lib=static=gmp");
     } else {
         panic!("unsupported target {target}");
     }

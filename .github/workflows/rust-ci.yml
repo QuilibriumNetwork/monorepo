@@ -86,7 +86,6 @@ jobs:
       # 8 individually-named tests). Keep that list in one place rather
       # than splitting between YAML and config.
       - name: cargo nextest run --workspace
-        if: false # temporarily disabled due to test linking issue
         run: cargo nextest run --workspace --locked --no-fail-fast --exclude channelwasm --config-file .nextest.toml
 
   # ------------------------------------------------------------------

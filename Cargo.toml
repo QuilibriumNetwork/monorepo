@@ -78,3 +78,42 @@ rpath = false
 lto   = true
 debug = false
 # panic = 'abort'
+
+# Test profile overrides.
+#
+# Cryptography tests are 10-100x slower in unoptimized builds because the
+# hand-rolled big-int, pairing, FFT, OT, and bulletproof code (and the
+# heavy third-party curve/hash crates) need inlining and const
+# propagation to be fast. The overrides below compile those packages
+# with optimizations when building tests; Swatinem/rust-cache caches
+# the resulting artifacts so the cost is paid once. Debug assertions
+# and overflow checks remain on. `cargo build`/`cargo check` are
+# unaffected — they use profile.dev.
+
+# All third-party dependencies. `*` matches every package except the
+# one currently being built, so workspace members still need explicit
+# overrides below.
+[profile.test.package."*"]
+opt-level = 3
+
+# Workspace crates whose own code is the hot path in tests.
+[profile.test.package.bls48581]
+opt-level = 3
+[profile.test.package.dkls23]
+opt-level = 3
+[profile.test.package.dkls23_ffi]
+opt-level = 3
+[profile.test.package.ed448-bulletproofs]
+opt-level = 3
+[profile.test.package.classgroup]
+opt-level = 3
+[profile.test.package.vdf]
+opt-level = 3
+[profile.test.package.ferret]
+opt-level = 3
+[profile.test.package.channel]
+opt-level = 3
+[profile.test.package.verenc]
+opt-level = 3
+[profile.test.package.rpm]
+opt-level = 3
