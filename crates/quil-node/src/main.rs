@@ -15,6 +15,18 @@ mod prover_tree_syncer_prod;
 
 mod release_check;
 
+mod util;
+
+mod blossomsub_consensus_publisher;
+
+mod dht_node;
+
+mod worker_node;
+
+mod diagnostic;
+
+mod master_node;
+
 /// Quilibrium Node — Rust implementation
 #[derive(Parser, Debug)]
 #[command(name = "quil-node", version = quil_config::VERSION_STRING, about)]
@@ -128,142 +140,15 @@ async fn main() -> anyhow::Result<()> {
     // ---------------------------------------------------------------
     // Diagnostic flags that print info and exit
     // ---------------------------------------------------------------
-
-    if args.peer_id {
-        // libp2p peer ID — multihash of the Ed448 identity public key,
-        // base58-encoded. Matches what the prover-manage TUI and the
-        // NodeService RPC report. (The Poseidon-of-BLS-pubkey is a
-        // separate "prover address" identifier; see --node-info.)
-        let pk_bytes = hex::decode(&config.p2p.peer_priv_key).unwrap_or_default();
-        if pk_bytes.len() < 57 {
-            return Err(anyhow::anyhow!(
-                "config.p2p.peer_priv_key is missing or shorter than 57 bytes",
-            ));
-        }
-        let mut seed = [0u8; 57];
-        seed.copy_from_slice(&pk_bytes[..57]);
-        let pubkey = quil_p2p::ed448_identity::derive_public_key(&seed);
-        let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&pubkey);
-        println!("{}", bs58::encode(&peer_id).into_string());
-        return Ok(());
-    }
-
-    if args.node_info {
-        let bls_ctor = quil_crypto::Bls48581KeyConstructor;
-        let keys_path = config.key.key_store_file.path.clone();
-        let proving_key_id = if config.engine.proving_key_id.is_empty() {
-            "q-prover-key".to_string()
-        } else {
-            config.engine.proving_key_id.clone()
-        };
-        let fkm = quil_keys::FileKeyManager::new(
-            PathBuf::from(&keys_path),
-            &config.key.key_store_file.encryption_key,
-            proving_key_id,
-            Box::new(bls_ctor),
-        )?;
-        let bls_pubkey = fkm.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
-        let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&bls_pubkey)?;
-
-        // Peer ID — base58-encoded libp2p multihash derived from the
-        // Ed448 identity key. This is what shows up in the prover-manage
-        // TUI and the NodeService GetNodeInfo RPC; the BLS-derived
-        // prover address is a separate identifier.
-        let peer_id_b58 = {
-            let pk_bytes = hex::decode(&config.p2p.peer_priv_key).unwrap_or_default();
-            if pk_bytes.len() >= 57 {
-                let mut seed = [0u8; 57];
-                seed.copy_from_slice(&pk_bytes[..57]);
-                let pubkey = quil_p2p::ed448_identity::derive_public_key(&seed);
-                let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&pubkey);
-                bs58::encode(&peer_id).into_string()
-            } else {
-                String::from("<no ed448 peer key configured>")
-            }
-        };
-
-        let db_path = if config.db.path.is_empty() {
-            PathBuf::from(".config/store")
-        } else {
-            PathBuf::from(&config.db.path)
-        };
-        // Read the latest committed frame number even when the running
-        // node holds the primary lock by opening as a read-only
-        // secondary. `try_catch_up_with_primary` pulls in everything
-        // the primary has flushed since it started so we don't return
-        // a stale-by-hours value.
-        let frame_number = if db_path.exists() {
-            let secondary_dir = std::env::temp_dir()
-                .join(format!("quil-node-info-secondary-{}", std::process::id()));
-            std::fs::create_dir_all(&secondary_dir).ok();
-            let result = quil_store::RocksDb::open_as_secondary(&db_path, &secondary_dir)
-                .ok()
-                .and_then(|d| {
-                    let _ = d.inner().try_catch_up_with_primary();
-                    let cs = quil_store::RocksClockStore::new(d.inner());
-                    cs.get_latest_global_frame()
-                        .ok()
-                        .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
-                })
-                .unwrap_or(0);
-            // Cleanup the secondary scratch dir; ignore errors.
-            std::fs::remove_dir_all(&secondary_dir).ok();
-            result
-        } else {
-            0
-        };
-
-        println!("Version: {}", quil_config::VERSION_STRING);
-        println!("Peer ID: {}", peer_id_b58);
-        println!("Prover Address: {}", hex::encode(&prover_address));
-        println!("BLS Public Key: {}...{}", hex::encode(&bls_pubkey[..8]), hex::encode(&bls_pubkey[bls_pubkey.len()-8..]));
-        println!("Frame Number: {}", frame_number);
-        println!("Network: {}", args.network);
-        return Ok(());
-    }
-
-    if args.peer_info {
-        let peer_id_b58 = {
-            let pk_bytes = hex::decode(&config.p2p.peer_priv_key).unwrap_or_default();
-            if pk_bytes.len() >= 57 {
-                let mut seed = [0u8; 57];
-                seed.copy_from_slice(&pk_bytes[..57]);
-                let pubkey = quil_p2p::ed448_identity::derive_public_key(&seed);
-                let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&pubkey);
-                bs58::encode(&peer_id).into_string()
-            } else {
-                String::from("<no ed448 peer key configured>")
-            }
-        };
-        let bls_ctor = quil_crypto::Bls48581KeyConstructor;
-        let keys_path = config.key.key_store_file.path.clone();
-        let proving_key_id = if config.engine.proving_key_id.is_empty() {
-            "q-prover-key".to_string()
-        } else {
-            config.engine.proving_key_id.clone()
-        };
-        let fkm = quil_keys::FileKeyManager::new(
-            PathBuf::from(&keys_path),
-            &config.key.key_store_file.encryption_key,
-            proving_key_id,
-            Box::new(bls_ctor),
-        )?;
-        let bls_pubkey = fkm.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
-        println!("Peer ID: {}", peer_id_b58);
-        println!("BLS Public Key Length: {} bytes", bls_pubkey.len());
-        println!("Listen Multiaddr: {}", config.p2p.listen_multiaddr);
-        return Ok(());
-    }
-
-    if args.metrics {
-        // Collect and print all registered metrics
-        // The metrics crate doesn't have a built-in dump; print known counters
-        println!("# Quilibrium Node Metrics");
-        println!("# (run with --prometheus-server to expose via HTTP)");
-        println!("quil_node_version{{version=\"{}\"}} 1", quil_config::VERSION_STRING);
-        if let Some(ref filter) = args.metrics_filter {
-            println!("# Filtered by: {}", filter);
-        }
+    let diag_flags = diagnostic::DiagnosticFlags {
+        peer_id: args.peer_id,
+        node_info: args.node_info,
+        peer_info: args.peer_info,
+        metrics: args.metrics,
+        metrics_filter: args.metrics_filter.clone(),
+        network: args.network,
+    };
+    if diagnostic::handle_diagnostic_flags(&diag_flags, &config)? {
         return Ok(());
     }
 
@@ -385,37 +270,7 @@ async fn main() -> anyhow::Result<()> {
     // Pipe mode uses zero extra disk:
     //   ./node --export-db - | ./quil-node --import-db -
     if let Some(ref import_path) = args.import_db {
-        let db_path = if config.db.path.is_empty() {
-            PathBuf::from(".config/store")
-        } else {
-            PathBuf::from(&config.db.path)
-        };
-        std::fs::create_dir_all(&db_path)?;
-        let db = quil_store::RocksDb::open(&db_path)?;
-
-        let result = if import_path.to_str() == Some("-") {
-            // Streaming mode: read from stdin (zero extra disk)
-            info!("importing from stdin (pipe mode — zero extra disk)");
-            let stdin = std::io::stdin().lock();
-            quil_store::import::import_from_reader(db.inner().as_ref(), stdin)?
-        } else {
-            // File mode: validate first, then import
-            info!(path = %import_path.display(), "importing from file");
-            match quil_store::import::validate_export_file(import_path) {
-                Ok(count) => info!(entries = count, "export file validated"),
-                Err(e) => {
-                    error!(error = %e, "invalid export file");
-                    return Err(e.into());
-                }
-            }
-            quil_store::import::import_database(db.inner().as_ref(), import_path)?
-        };
-
-        info!(
-            entries = result.entries,
-            data_gb = format!("{:.2}", result.data_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
-            "import complete — start the node normally (without --import-db)"
-        );
+        diagnostic::run_import(import_path, &config)?;
         return Ok(());
     }
 
@@ -423,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
     match (args.core, args.dht_only) {
         (_, true) => {
             info!("starting in DHT-only mode");
-            run_dht_node(&config, token).await
+            dht_node::run(&config, token).await
         }
         (0, false) => {
             // Archive mode comes from --archive OR engine.archiveMode.
@@ -441,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
         }
         (core_id, false) => {
             info!(core_id, "starting as worker node");
-            run_worker_node(&config, core_id, args.parent_process, token).await
+            worker_node::run(&config, core_id, args.parent_process, token).await
         }
     }
 }
@@ -454,133 +309,21 @@ async fn run_master_node(
     token: CancellationToken,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 ) -> anyhow::Result<()> {
-    // ---------------------------------------------------------------
-    // 1. Open database
-    // ---------------------------------------------------------------
-    let db_path = if config.db.path.is_empty() {
-        PathBuf::from(".config/store")
-    } else {
-        PathBuf::from(&config.db.path)
-    };
+    let master_node::storage::StorageHandles {
+        db_path: _db_path,
+        db_arc,
+        clock_store,
+        token_store,
+        key_store,
+        shards_store,
+        hg_store,
+    } = master_node::storage::init(config, archive_mode)?;
 
-    // Detect the on-disk store format BEFORE we let RocksDB touch the
-    // path. The Go node wrote Pebble; the Rust node writes RocksDB.
-    // Opening a Pebble dir with RocksDB produces a confusing
-    // "Corruption" error far from the real cause.
-    //
-    // Policy:
-    //   - non-archive nodes: wipe & let RocksDB recreate. State is
-    //     recoverable from peers via hypersync.
-    //   - archive nodes: refuse to wipe — that store is the canonical
-    //     copy and must be migrated, not deleted. Tell the user to
-    //     run the conversion tool.
-    match quil_store::detect_store_format(&db_path) {
-        quil_store::StoreFormat::Pebble => {
-            if archive_mode {
-                return Err(anyhow::anyhow!(
-                    "detected Go-Pebble store at {} but this node is in archive mode — \
-                     refusing to wipe. Run the Pebble→RocksDB conversion tool first, \
-                     or move the directory aside and re-hypersync from another archive.",
-                    db_path.display()
-                ));
-            }
-            warn!(
-                path = %db_path.display(),
-                "detected legacy Go-Pebble store; wiping for fresh RocksDB init \
-                 (non-archive node — state will be re-synced from peers)"
-            );
-            std::fs::remove_dir_all(&db_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to wipe legacy Pebble store at {}: {}",
-                    db_path.display(),
-                    e
-                )
-            })?;
-        }
-        quil_store::StoreFormat::Unknown => {
-            return Err(anyhow::anyhow!(
-                "store path {} exists but is neither RocksDB nor Pebble — \
-                 refusing to touch it. Move it aside if you want a clean start.",
-                db_path.display()
-            ));
-        }
-        quil_store::StoreFormat::RocksDb | quil_store::StoreFormat::Empty => { /* OK */ }
-    }
-
-    std::fs::create_dir_all(&db_path)?;
-    let db = quil_store::RocksDb::open(&db_path)?;
-    let db_arc = Arc::new(db);
-    info!(path = %db_path.display(), "opened database");
-
-    // ---------------------------------------------------------------
-    // 2. Create stores
-    // ---------------------------------------------------------------
-    let clock_store = Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
-    let token_store = Arc::new(quil_store::RocksTokenStore::new(db_arc.inner()));
-    let key_store: Arc<quil_store::RocksKeyStore> =
-        Arc::new(quil_store::RocksKeyStore::new(db_arc.inner()));
-    // Trait-object handle so the shard_info refresh task (lower in
-    // this fn) can hold a `&dyn ShardsStore` for enumerating
-    // shard_keys against archives. A second `Arc<dyn ShardsStore>`
-    // is built later for the gRPC server's `GetAppShards` handler;
-    // both share the same underlying RocksDB column family.
-    let shards_store: Arc<dyn quil_types::store::ShardsStore> =
-        Arc::new(quil_store::RocksShardsStore::new(db_arc.inner()));
-    let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
-
-    // Check latest stored frame
-    match clock_store.get_latest_global_frame() {
-        Ok(frame) => {
-            let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
-            info!(frame = frame_num, "resuming from stored state");
-        }
-        Err(_) => {
-            info!("no stored frames — will sync from network");
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // 2b. Key management — load or create BLS prover key from keys.yml
-    // ---------------------------------------------------------------
-    let keys_path = if config.key.key_store_file.path.is_empty() {
-        config_dir.join("keys.yml")
-    } else {
-        PathBuf::from(&config.key.key_store_file.path)
-    };
-
-    let bls_ctor = quil_crypto::Bls48581KeyConstructor;
-    let proving_key_id = if config.engine.proving_key_id.is_empty() {
-        "default-proving-key".to_string()
-    } else {
-        config.engine.proving_key_id.clone()
-    };
-
-    let file_key_manager = Arc::new(quil_keys::FileKeyManager::new(
-        keys_path,
-        &config.key.key_store_file.encryption_key,
-        proving_key_id,
-        Box::new(bls_ctor),
-    )?);
-
-    // `q-peer-key` lives in `config.p2p.peer_priv_key`, not `keys.yml` —
-    // wire it through so keystore lookups (Send RPC outer auth, peer ID
-    // derivation) work on Go-style configs.
-    file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
-
-    // Auto-create all standard keys if missing
-    file_key_manager.ensure_standard_keys()?;
-    let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
-
-    let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&bls_pubkey)?;
-    // Publish the local prover address to the execution layer's static
-    // so `apply_reward` can surface incoming credits to the operator.
-    let _ = quil_execution::global_intrinsic::prover_shard_update::LOCAL_PROVER_ADDRESS
-        .set(prover_address.to_vec());
-    info!(
-        prover_address = hex::encode(&prover_address),
-        bls_pubkey_len = bls_pubkey.len(),
-        "BLS prover identity ready"
-    );
+    let master_node::keys::KeyHandles {
+        file_key_manager,
+        bls_pubkey,
+        prover_address,
+    } = master_node::keys::init(config, config_dir)?;
 
     // ---------------------------------------------------------------
     // 3. Create execution engines with full crypto verification
@@ -1036,7 +779,7 @@ async fn run_master_node(
                     vec![pi_announce_stream.clone()]
                 } else if !pi_stream_listen.is_empty() {
                     // Derive from pubsub addr IP + stream port
-                    extract_stream_addr(&pubsub_addr, &pi_stream_listen)
+                    crate::util::multiaddr::extract_stream_addr(&pubsub_addr, &pi_stream_listen)
                         .into_iter().collect()
                 } else {
                     vec![]
@@ -2286,7 +2029,7 @@ async fn run_master_node(
     // convention is TCP/8340.
     if !config.engine.archive_endpoints.is_empty() {
         for raw in &config.engine.archive_endpoints {
-            match archive_multiaddr_to_host_port(raw, network) {
+            match crate::util::multiaddr::archive_multiaddr_to_host_port(raw, network) {
                 Some(endpoint) => {
                     archive_pool.add(endpoint.clone()).await;
                     tracing::debug!(
@@ -2970,7 +2713,7 @@ async fn run_master_node(
                         if let Ok(genesis_frame) = genesis_frame_result {
                             if let Ok(bls_signer) = sync_km.get_signer(quil_types::crypto::KeyType::Bls48581G1) {
                                 let publisher: Arc<dyn quil_engine::consensus_glue::ConsensusPublisher> =
-                                    Arc::new(BlossomsubConsensusPublisher {
+                                    Arc::new(crate::blossomsub_consensus_publisher::BlossomsubConsensusPublisher {
                                         p2p_handle: sync_p2p.clone(),
                                         loopback_tx: consensus_loopback_tx.clone(),
                                         self_peer_id: peer_id.to_bytes(),
@@ -3816,7 +3559,7 @@ async fn run_master_node(
                                             let mut first_addr: Option<String> = None;
                                             for reach in &info.reachability {
                                                 for ma in &reach.stream_multiaddrs {
-                                                    if let Some(addr) = multiaddr_to_host_port_with_network(ma, network_for_recv) {
+                                                    if let Some(addr) = crate::util::multiaddr::multiaddr_to_host_port_with_network(ma, network_for_recv) {
                                                         if first_addr.is_none() {
                                                             first_addr = Some(addr.clone());
                                                         }
@@ -5521,620 +5264,9 @@ async fn run_master_node(
     Ok(())
 }
 
-async fn run_worker_node(
-    config: &quil_config::Config,
-    core_id: u32,
-    parent_process: u32,
-    token: CancellationToken,
-) -> anyhow::Result<()> {
-    info!(core_id, parent_process, "worker node starting");
-
-    // Resolve the per-worker store path. Worker processes can NOT
-    // share the master's RocksDB directory: RocksDB takes an exclusive
-    // file lock per `LOCK` file, so a second `open` against the same
-    // path fails. Each worker must own its own store.
-    //
-    // Resolution order:
-    //   1. `db.worker_paths[core_id - 1]` (core 0 is master).
-    //   2. `db.worker_path_prefix` with `%d` → core id.
-    //   3. `<db.path or .config/store>/worker-<core_id>`.
-    let db_path: std::path::PathBuf = {
-        let idx = core_id.saturating_sub(1) as usize;
-        if let Some(p) = config.db.worker_paths.get(idx).filter(|s| !s.is_empty()) {
-            std::path::PathBuf::from(p)
-        } else if !config.db.worker_path_prefix.is_empty() {
-            std::path::PathBuf::from(
-                config.db.worker_path_prefix.replace("%d", &core_id.to_string()),
-            )
-        } else {
-            let base = if config.db.path.is_empty() {
-                std::path::PathBuf::from(".config/store")
-            } else {
-                std::path::PathBuf::from(&config.db.path)
-            };
-            base.join(format!("worker-{}", core_id))
-        }
-    };
-    info!(core_id, db_path = %db_path.display(), "worker store path resolved");
-    std::fs::create_dir_all(&db_path)?;
-    let db = quil_store::RocksDb::open(&db_path)?;
-    let db_arc = Arc::new(db);
-    let clock_store: Arc<dyn quil_types::store::ClockStore> =
-        Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
-    let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
-
-    // Per-worker crypto + CRDT + execution engines. Each worker
-    // process owns its own RocksDB store (per `worker_path_prefix`)
-    // and therefore its own crdt + execution manager.
-    let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
-        Arc::new(quil_crypto::KzgInclusionProver);
-    let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
-    let key_manager: Arc<dyn quil_types::crypto::KeyManager> =
-        Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
-    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
-        hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
-        inclusion_prover.clone(),
-    ));
-    // Same crypto setup as the master node — bulletproof is real;
-    // Decaf / circuit compiler are still noop stubs pending production
-    // impls. See the master block earlier in this file for rationale.
-    let bulletproof_prover_worker: Arc<dyn quil_types::crypto::BulletproofProver> =
-        Arc::new(quil_crypto::Decaf448BulletproofProver);
-    let decaf_constructor_worker: Arc<dyn quil_types::crypto::DecafConstructor> =
-        Arc::new(quil_execution::testing::NoopDecafConstructor);
-    let circuit_compiler_worker: Arc<dyn quil_types::execution::CircuitCompiler> =
-        Arc::new(quil_execution::testing::NoopCircuitCompiler);
-    let clock_store_for_exec_worker: Arc<dyn quil_types::store::ClockStore> =
-        clock_store.clone();
-    let hypergraph_resolver_worker: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
-        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
-    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new(
-        inclusion_prover.clone(),
-        key_manager.clone(),
-        crdt.clone(),
-        bulletproof_prover_worker,
-        decaf_constructor_worker,
-        circuit_compiler_worker,
-        clock_store_for_exec_worker,
-        hypergraph_resolver_worker,
-        true,
-    ));
-
-    // Key management — same keys as master
-    let bls_ctor = quil_crypto::Bls48581KeyConstructor;
-    let keys_path = config.key.key_store_file.path.clone();
-    let proving_key_id = if config.engine.proving_key_id.is_empty() {
-        "q-prover-key".to_string()
-    } else {
-        config.engine.proving_key_id.clone()
-    };
-    let file_key_manager = Arc::new(quil_keys::FileKeyManager::new(
-        PathBuf::from(&keys_path),
-        &config.key.key_store_file.encryption_key,
-        proving_key_id,
-        Box::new(bls_ctor),
-    )?);
-    file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
-    let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
-    let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&bls_pubkey)?;
-
-    // Shared prover registry (syncs from store)
-    let prover_registry = Arc::new(quil_execution::SharedProverRegistry::new());
-
-    // Frame prover
-    let frame_prover: Arc<dyn quil_types::crypto::FrameProver> =
-        Arc::new(quil_crypto::WesolowskiFrameProver::new(2048));
-    let message_collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
-    let fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager> =
-        Arc::new(quil_engine::InMemoryDynamicFeeManager::new(360));
-
-    // BLS signer factory
-    let fkm = file_key_manager.clone();
-    let signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync> =
-        Arc::new(move || {
-            fkm.get_signer(quil_types::crypto::KeyType::Bls48581G1)
-                .expect("BLS signer should be available")
-        });
-
-    // Compute worker listen address from config
-    let listen_addr = quil_engine::worker_node::worker_listen_addr(
-        core_id,
-        &config.engine.data_worker_base_listen_multiaddr,
-        config.engine.data_worker_base_stream_port,
-        &config.engine.data_worker_stream_multiaddrs,
-    );
-
-    // Master endpoint — derived from p2p.stream_listen_multiaddr.
-    // In a cluster, the worker's config has that field pointed at the
-    // master's stream listener; on single-machine setups it's the
-    // local `/ip4/0.0.0.0/tcp/8340` and gets rewritten to localhost.
-    let master_endpoint = quil_engine::worker_node::master_grpc_endpoint(&config);
-    // Clone for the syncer (master_endpoint gets moved into WorkerNodeConfig).
-    let master_endpoint_for_syncer = master_endpoint.clone();
-
-    // Worker's Ed448 seed for mTLS to the master. The master's
-    // GlobalService listener requires mTLS; without a seed configured
-    // here the worker would dial plaintext and the master's TLS
-    // acceptor would immediately close the connection (surfaces as
-    // "h2 protocol error" in the worker logs).
-    let worker_mtls_seed: Option<[u8; 57]> = {
-        let bytes = hex::decode(&config.p2p.peer_priv_key).unwrap_or_default();
-        if bytes.len() >= 57 {
-            let mut seed = [0u8; 57];
-            seed.copy_from_slice(&bytes[..57]);
-            Some(seed)
-        } else {
-            None
-        }
-    };
-    if worker_mtls_seed.is_none() {
-        warn!(
-            "worker has no Ed448 seed configured (p2p.peerPrivKey empty or short); \
-             will dial master in plaintext — only works against a plaintext-allowing \
-             master (single-machine dev only)",
-        );
-    }
-    let factory_endpoint = master_endpoint.clone();
-    let channel_factory: quil_engine::worker_node::MasterChannelFactory = Arc::new(move || {
-        let endpoint_str = factory_endpoint.clone();
-        let seed = worker_mtls_seed;
-        Box::pin(async move {
-            use tonic::transport::Endpoint;
-            let endpoint = Endpoint::from_shared(endpoint_str)
-                .map_err(|e| Box::new(std::io::Error::other(format!("endpoint: {}", e)))
-                    as Box<dyn std::error::Error + Send + Sync>)?
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .keep_alive_while_idle(true);
-            match seed {
-                Some(seed) => {
-                    let client_config = quil_rpc::build_quil_client_config(&seed)
-                        .map_err(|e| Box::new(std::io::Error::other(format!("tls cfg: {}", e)))
-                            as Box<dyn std::error::Error + Send + Sync>)?;
-                    let connector = quil_rpc::QuilTlsConnector::new(client_config);
-                    let channel = endpoint.connect_with_connector(connector).await
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                    Ok(channel)
-                }
-                None => {
-                    let channel = endpoint.connect().await
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                    Ok(channel)
-                }
-            }
-        })
-    });
-
-    let worker_config = quil_engine::worker_node::WorkerNodeConfig {
-        core_id,
-        master_endpoint,
-        listen_addr,
-        parent_pid: if parent_process > 0 { Some(parent_process) } else { None },
-        channel_factory: Some(channel_factory),
-    };
-
-    let reward_greedy = config.engine.reward_strategy == "reward-greedy";
-
-    let mut worker_node = quil_engine::worker_node::WorkerOnlyNode::new(
-        worker_config,
-        clock_store,
-        prover_registry as Arc<dyn quil_types::consensus::ProverRegistry>,
-        frame_prover,
-        message_collector,
-        fee_manager,
-        prover_address.to_vec(),
-        bls_pubkey,
-        signer_factory,
-        reward_greedy,
-    )
-    .with_state_engines(crdt, exec_manager, inclusion_prover);
-
-    // Wire the prover-tree syncer so the worker can sync the global
-    // prover tree from the master at startup and before materializing
-    // frames with a prover-root mismatch. In Go, workers call
-    // `HyperSyncSelf` which dials the master's
-    // HypergraphComparisonService. We reuse the master_endpoint (the
-    // same one the gRPC message stream connects to — port 8340).
-    if let Some(seed) = worker_mtls_seed {
-        // Extract `host:port` from the master endpoint URL
-        // (`http://host:port`) for the syncer.
-        let stream_addr = master_endpoint_for_syncer
-            .strip_prefix("http://")
-            .unwrap_or(&master_endpoint_for_syncer)
-            .to_string();
-        let syncer: Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer> =
-            Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
-                master_stream_addr: stream_addr,
-                hg_store: hg_store.clone(),
-                ed448_seed: seed,
-            });
-        worker_node = worker_node.with_prover_tree_syncer(syncer);
-    } else {
-        warn!("worker has no mTLS seed — prover-tree sync will be unavailable");
-    }
-
-    // Outbound pubsub. Two mutually exclusive modes:
-    //   * `engine.enable_master_proxy = true`  → dial the master's
-    //     PubSubProxy on the peer mTLS listener and route all pubsub
-    //     through it. Used when one machine should be the only mesh
-    //     participant (homogenous LAN layouts, gateway-style setups).
-    //   * `engine.enable_master_proxy = false` → the worker spins up
-    //     its own libp2p instance with a synthetic peer key (per
-    //     `node/p2p/blossomsub.go:473-496`) and joins the mesh
-    //     directly. Pubsub messages are signed with the REAL prover
-    //     key so peers attribute them to the prover, not the worker
-    //     host. Required for multi-machine clusters where workers and
-    //     master live on different hosts.
-    if config.engine.enable_master_proxy {
-        let master_addr = quil_engine::worker_node::master_grpc_endpoint(&config);
-        // `master_addr` is already `http://host:port`.
-        match quil_rpc::proxy_pubsub::ProxyPubSub::connect(master_addr.clone(), None).await {
-            Ok(proxy) => {
-                let proxy = Arc::new(proxy);
-                info!(master = %master_addr, "worker connected to master PubSubProxy");
-                let proxy_for_publish = proxy.clone();
-                let publish_fn: quil_engine::worker_node::PublishFn =
-                    Arc::new(move |bitmask, data| {
-                        let p = proxy_for_publish.clone();
-                        Box::pin(async move {
-                            if let Err(e) = p.publish(bitmask, data).await {
-                                warn!(error = %e, "proxy publish failed");
-                            }
-                        })
-                    });
-                worker_node = worker_node.with_publish_fn(publish_fn);
-            }
-            Err(e) => {
-                warn!(error = ?e, master = %master_addr,
-                    "worker proxy connect failed — running receive-only");
-            }
-        }
-    }
-
-    // Worker-owned p2p when proxy is off. Carry the receiver out of
-    // this scope so we can spawn the routing task after the worker is
-    // wrapped in an Arc.
-    let worker_owned_p2p: Option<(
-        Arc<quil_p2p::P2PHandle>,
-        tokio::sync::mpsc::Receiver<quil_p2p::ReceivedMessage>,
-    )> = if !config.engine.enable_master_proxy {
-        let p2p_node = quil_p2p::P2PNode::new_for_worker(&config.p2p, core_id)
-            .map_err(|e| anyhow::anyhow!("worker p2p node init: {}", e))?;
-        let worker_listen = quil_p2p::P2PNode::worker_listen_multiaddr(
-            &config.engine,
-            core_id,
-        )
-        .map_err(|e| anyhow::anyhow!("worker p2p listen addr: {}", e))?;
-        info!(core_id, listen = %worker_listen, "starting worker-owned p2p");
-        let (handle, rx) = p2p_node
-            .start(&worker_listen)
-            .await
-            .map_err(|e| anyhow::anyhow!("worker p2p start: {}", e))?;
-        let handle = Arc::new(handle);
-        // Workers subscribe to GLOBAL_PEER_INFO only (peer discovery).
-        // GLOBAL_FRAME, GLOBAL_PROVER, and GLOBAL_CONSENSUS are
-        // deliberately omitted:
-        //   - GLOBAL_FRAME: received via master gRPC stream
-        //   - GLOBAL_PROVER: submitted via direct gRPC to archives
-        //   - GLOBAL_CONSENSUS: workers participate in PER-SHARD
-        //     consensus only (subscribed dynamically on Respawn via
-        //     `subscribe_to_shard_bitmasks`). Subscribing to GLOBAL
-        //     causes every worker to relay every shard's votes/
-        //     proposals — massive amplification with zero benefit.
-        handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
-        handle.subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec()).await;
-        // Wire publish_fn → worker's own p2p.
-        let p2p_for_publish = handle.clone();
-        let publish_fn: quil_engine::worker_node::PublishFn =
-            Arc::new(move |bitmask, data| {
-                let h = p2p_for_publish.clone();
-                Box::pin(async move {
-                    if let Err(e) = h.publish(bitmask, data).await {
-                        warn!(error = %e, "worker p2p publish failed");
-                    }
-                })
-            });
-        worker_node = worker_node
-            .with_publish_fn(publish_fn)
-            .with_p2p_handle(handle.clone());
-        Some((handle, rx))
-    } else {
-        None
-    };
-
-    let worker = Arc::new(worker_node);
-
-    // Route incoming pubsub messages from the worker's own p2p into
-    // the active engine. The worker's `route_message` dispatches by
-    // bitmask pattern; if no engine is active yet, the message is
-    // silently dropped.
-    if let Some((_handle, mut rx)) = worker_owned_p2p {
-        let route_token = token.clone();
-        let route_worker = worker.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = route_token.cancelled() => break,
-                    maybe_msg = rx.recv() => {
-                        let Some(msg) = maybe_msg else { break };
-                        route_worker.route_message(&msg.data, &msg.bitmask);
-                    }
-                }
-            }
-            info!("worker p2p routing task stopped");
-        });
-    }
-
-    info!(core_id, "worker node initialized, starting event loop");
-
-    // Run the worker — blocks until cancelled or parent dies
-    let worker_for_stop = worker.clone();
-    tokio::select! {
-        result = worker.run() => {
-            if let Err(e) = result {
-                error!(core_id, error = %e, "worker node exited with error");
-            }
-        }
-        _ = token.cancelled() => {
-            info!(core_id, "worker node received shutdown signal");
-            worker_for_stop.stop();
-        }
-    }
-
-    info!(core_id, "worker node shut down");
-    Ok(())
-}
-
-/// Convert a `/ip4/X/tcp/Y` multiaddr string into `X:Y`. Returns `None` for
-/// unsupported multiaddr shapes (DNS, IPv6, non-TCP) so we don't try to dial
-/// non-routable archive endpoints. Filters loopback and private ranges since
-/// those would only resolve to our own machine.
-fn multiaddr_to_host_port(ma: &str) -> Option<String> {
-    multiaddr_to_host_port_with_network(ma, 0)
-}
-
-/// Like `multiaddr_to_host_port`, but on testnet/devnet (network != 0)
-/// accepts RFC1918 private addresses (192.168.x.x, 10.x.x.x, etc.) and
-/// loopback. Mainnet still rejects them so a misconfigured archive
-/// doesn't poison the pool with unroutable peers.
-fn multiaddr_to_host_port_with_network(ma: &str, network: u8) -> Option<String> {
-    let parts: Vec<&str> = ma.trim_start_matches('/').split('/').collect();
-    if parts.len() < 4 {
-        return None;
-    }
-    if parts[0] != "ip4" || parts[2] != "tcp" {
-        return None;
-    }
-    let ip: std::net::Ipv4Addr = parts[1].parse().ok()?;
-    let allow_private = network != 0;
-    let reject = if allow_private {
-        ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
-    } else {
-        ip.is_loopback() || ip.is_private() || ip.is_link_local()
-            || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
-    };
-    if reject {
-        return None;
-    }
-    let port: u16 = parts[3].parse().ok()?;
-    Some(format!("{}:{}", ip, port))
-}
-
-/// Parse a libp2p multiaddr string from `engine.archiveEndpoints` into a
-/// `host:port` the mTLS gRPC client can dial. Matches what the Go node's
-/// `manet.ToNetAddr` accepts for archive client setup: `/ip4/`, `/ip6/`,
-/// `/dns4/`, `/dns6/`, `/dns/` over `/tcp/PORT`. Bare `host:port` is
-/// rejected so configs round-trip between Go and Rust.
-///
-/// IP forms apply the same private/loopback/unspecified filtering as
-/// `multiaddr_to_host_port_with_network` (gated on `network`). DNS forms
-/// pass the hostname through verbatim — the gRPC client resolves at dial
-/// time, which mirrors `manet.ToNetAddr`'s behavior.
-fn archive_multiaddr_to_host_port(ma: &str, network: u8) -> Option<String> {
-    let parts: Vec<&str> = ma.trim_start_matches('/').split('/').collect();
-    if parts.len() < 4 {
-        return None;
-    }
-    if parts[2] != "tcp" {
-        return None;
-    }
-    let port: u16 = parts[3].parse().ok()?;
-    let allow_private = network != 0;
-    match parts[0] {
-        "ip4" => {
-            let ip: std::net::Ipv4Addr = parts[1].parse().ok()?;
-            let reject = if allow_private {
-                ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
-            } else {
-                ip.is_loopback() || ip.is_private() || ip.is_link_local()
-                    || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
-            };
-            if reject {
-                return None;
-            }
-            Some(format!("{}:{}", ip, port))
-        }
-        "ip6" => {
-            let ip: std::net::Ipv6Addr = parts[1].parse().ok()?;
-            let reject = if allow_private {
-                ip.is_unspecified() || ip.is_multicast()
-            } else {
-                ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
-                    || (ip.segments()[0] & 0xfe00) == 0xfc00  // unique-local fc00::/7
-                    || (ip.segments()[0] & 0xffc0) == 0xfe80  // link-local fe80::/10
-            };
-            if reject {
-                return None;
-            }
-            Some(format!("[{}]:{}", ip, port))
-        }
-        "dns4" | "dns6" | "dns" => {
-            let host = parts[1];
-            if host.is_empty() {
-                return None;
-            }
-            Some(format!("{}:{}", host, port))
-        }
-        _ => None,
-    }
-}
-
-/// Build a stream multiaddr by extracting the IP from a pubsub multiaddr and
-/// combining it with the port/protocol from the stream listen pattern.
-///
-/// IP precedence: prefer the pubsub IP (it's the address peers actually
-/// see us on); if that's a wildcard or loopback, fall back to the stream
-/// listen IP (covers testnet bootstraps where listen_multiaddr is
-/// `/ip4/0.0.0.0/...` but stream_listen has the real LAN IP).
-fn extract_stream_addr(pubsub_ma: &str, stream_listen: &str) -> Option<String> {
-    let pub_parts: Vec<&str> = pubsub_ma.trim_start_matches('/').split('/').collect();
-    let stream_parts: Vec<&str> = stream_listen.trim_start_matches('/').split('/').collect();
-
-    if stream_parts.len() < 4 {
-        return None;
-    }
-    let protocol = stream_parts[2]; // "tcp"
-    let port = stream_parts[3]; // "8340"
-
-    let pub_ip = if pub_parts.len() >= 2 && pub_parts[0] == "ip4" {
-        Some(pub_parts[1])
-    } else {
-        None
-    };
-    let stream_ip = if stream_parts.len() >= 2 && stream_parts[0] == "ip4" {
-        Some(stream_parts[1])
-    } else {
-        None
-    };
-
-    let usable = |ip: &str| -> bool {
-        ip != "0.0.0.0" && ip != "127.0.0.1"
-    };
-
-    let ip = match (pub_ip, stream_ip) {
-        (Some(p), _) if usable(p) => p,
-        (_, Some(s)) if usable(s) => s,
-        _ => return None,
-    };
-
-    Some(format!("/ip4/{}/{}/{}", ip, protocol, port))
-}
-
-/// Bridges `quil_engine::consensus_glue::ConsensusPublisher` to BlossomSub.
-/// Proposals go on `GLOBAL_FRAME`, votes and timeouts on `GLOBAL_CONSENSUS`.
-struct BlossomsubConsensusPublisher {
-    p2p_handle: quil_p2p::node::P2PHandle,
-    /// Self-loopback for consensus messages so the local
-    /// `vote_aggregator` / event-loop dispatcher sees the leader's
-    /// own proposals (BlossomSub does not echo self-published
-    /// messages).
-    loopback_tx: tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
-    self_peer_id: Vec<u8>,
-}
-
-impl quil_engine::consensus_glue::ConsensusPublisher for BlossomsubConsensusPublisher {
-    fn publish_frame(&self, data: Vec<u8>) {
-        let handle = self.p2p_handle.clone();
-        let bitmask = quil_engine::bitmasks::GLOBAL_FRAME.to_vec();
-        tokio::spawn(async move {
-            if let Err(e) = handle.publish(bitmask, data).await {
-                tracing::warn!(error = %e, "publish_frame failed");
-            }
-        });
-    }
-
-    fn publish_consensus(&self, data: Vec<u8>) {
-        let handle = self.p2p_handle.clone();
-        let bitmask = quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec();
-        // Self-loopback: send the same payload onto the local receive
-        // channel so the dispatcher's GLOBAL_CONSENSUS arm processes
-        // it (vote_aggregator + event_loop). This is essential for the
-        // proposer's own proposal/vote to reach its own aggregator,
-        // since BlossomSub silently drops self-published messages.
-        let loopback = self.loopback_tx.clone();
-        let self_id = self.self_peer_id.clone();
-        let data_for_loopback = data.clone();
-        let bitmask_for_loopback = bitmask.clone();
-        tokio::spawn(async move {
-            let _ = loopback
-                .send(quil_p2p::node::ReceivedMessage {
-                    bitmask: bitmask_for_loopback,
-                    data: data_for_loopback,
-                    from: self_id,
-                })
-                .await;
-        });
-        tokio::spawn(async move {
-            if let Err(e) = handle.publish(bitmask, data).await {
-                tracing::warn!(error = %e, "publish_consensus failed");
-            }
-        });
-    }
-
-    fn publish_prover_message(&self, data: Vec<u8>) {
-        // `data` is a `MessageRequest`-wrapped inner payload (built by
-        // `consensus_glue::wrap_message_request`). Wrap it in a
-        // `MessageBundle` envelope and publish on the GLOBAL_PROVER
-        // bitmask. Non-archive nodes can additionally route over
-        // archive gRPC; the BlossomSub broadcast covers archive nodes.
-        let handle = self.p2p_handle.clone();
-        let bitmask = quil_engine::bitmasks::GLOBAL_PROVER.to_vec();
-        tokio::spawn(async move {
-            // Decode the MessageRequest envelope so we can re-wrap
-            // it inside a MessageBundle.
-            let req = match quil_execution::message_envelope::CanonicalMessageRequest::from_canonical_bytes(&data) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(error = %e, "publish_prover_message: bad MessageRequest envelope");
-                    return;
-                }
-            };
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let bundle = quil_execution::message_envelope::CanonicalMessageBundle {
-                requests: vec![Some(req)],
-                timestamp,
-            };
-            match bundle.to_canonical_bytes() {
-                Ok(bytes) => {
-                    if let Err(e) = handle.publish(bitmask, bytes).await {
-                        tracing::warn!(error = %e, "publish_prover_message failed");
-                    }
-                }
-                Err(e) => tracing::error!(error = %e, "publish_prover_message: bundle encode failed"),
-            }
-        });
-    }
-}
-
-async fn run_dht_node(
-    config: &quil_config::Config,
-    token: CancellationToken,
-) -> anyhow::Result<()> {
-    let listen_addr = if config.p2p.listen_multiaddr.is_empty() {
-        "/ip4/0.0.0.0/udp/8336/quic-v1"
-    } else {
-        &config.p2p.listen_multiaddr
-    };
-
-    let p2p_node = quil_p2p::node::P2PNode::new(&config.p2p)?;
-    info!(peer_id = %p2p_node.peer_id, "starting DHT node");
-
-    let (p2p_handle, _msg_rx) = p2p_node.start(listen_addr).await?;
-    info!("DHT node running");
-
-    token.cancelled().await;
-    p2p_handle.shutdown().await;
-    info!("DHT node shut down");
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::util::multiaddr::archive_multiaddr_to_host_port;
 
     #[test]
     fn archive_multiaddr_accepts_ip4() {
