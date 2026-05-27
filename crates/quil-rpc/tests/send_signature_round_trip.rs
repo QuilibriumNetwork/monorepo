@@ -55,7 +55,13 @@ fn ed448_sign_verify_over_canonical_bundle_matches_send_handler() {
 
     let pk = ed448_rust::PublicKey::try_from(pk_bytes.as_slice())
         .expect("decode pubkey");
-    pk.verify(&payload, &signature, Some(&context))
+    // Go's Ed448Key.SignWithDomain signs `concat(domain, message)` with
+    // empty context (pure Ed448, not Ed448ctx). Our Ed448Signer mirrors
+    // that. Verify the same way — concatenate, then verify with None.
+    let mut signed_payload = Vec::with_capacity(context.len() + payload.len());
+    signed_payload.extend_from_slice(&context);
+    signed_payload.extend_from_slice(&payload);
+    pk.verify(&signed_payload, &signature, None)
         .expect("verify must pass over canonical bytes Rust produces");
 }
 
@@ -136,7 +142,10 @@ fn ed448_simple_round_trip() {
         signer.sign_with_domain(payload, context).unwrap()
     };
     let pk = ed448_rust::PublicKey::try_from(pk_bytes.as_slice()).unwrap();
-    pk.verify(payload, &sig, Some(context))
+    let mut signed = Vec::with_capacity(context.len() + payload.len());
+    signed.extend_from_slice(context);
+    signed.extend_from_slice(payload);
+    pk.verify(&signed, &sig, None)
         .expect("simple Ed448 sign/verify must round-trip");
 }
 
@@ -177,19 +186,20 @@ fn ed448_verify_rejects_when_payload_byte_is_flipped() {
     let last = payload.len() - 1;
     payload[last] ^= 0x01;
 
+    // sign_with_domain signs concat(context, payload) with None ctx.
+    // Verify the same way — concat then verify with None.
     let pk = ed448_rust::PublicKey::try_from(pk_bytes.as_slice()).unwrap();
+    let mut signed = Vec::with_capacity(context.len() + payload.len());
+    signed.extend_from_slice(&context);
+    signed.extend_from_slice(&payload);
     assert!(
-        pk.verify(&payload, &signature, Some(&context)).is_err(),
+        pk.verify(&signed, &signature, None).is_err(),
         "verify must reject tampered payload"
     );
 }
 
 #[test]
 fn ed448_verify_rejects_when_context_differs() {
-    // Verify rejects when sign-time and verify-time contexts differ —
-    // confirms the context binding actually does something. (If it
-    // were ignored, the user's "different keys" theory wouldn't be
-    // the only failure mode.)
     let payload = b"some payload";
     let mut seed = [0u8; 57];
     seed[0] = 0xAA;
@@ -202,9 +212,14 @@ fn ed448_verify_rejects_when_context_differs() {
         signer.sign_with_domain(payload, b"context-A").unwrap()
     };
 
+    // sign_with_domain signed concat("context-A", payload) with None.
+    // Verify with concat("context-B", payload) — must reject.
     let pk = ed448_rust::PublicKey::try_from(pk_bytes.as_slice()).unwrap();
+    let mut wrong_signed = Vec::new();
+    wrong_signed.extend_from_slice(b"context-B");
+    wrong_signed.extend_from_slice(payload);
     assert!(
-        pk.verify(payload, &signature, Some(b"context-B")).is_err(),
+        pk.verify(&wrong_signed, &signature, None).is_err(),
         "verify must reject when context differs from sign-time"
     );
 }

@@ -962,7 +962,8 @@ mod tests {
         assert_eq!(pm.current_rank(), 6);
         assert_eq!(consumer.qc_triggered.load(Ordering::SeqCst), 1);
         assert_eq!(consumer.rank_changes.load(Ordering::SeqCst), 1);
-        assert_eq!(consumer.timeouts_started.load(Ordering::SeqCst), 1);
+        // 2 = one from constructor (initial rank timeout) + one from QC.
+        assert_eq!(consumer.timeouts_started.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -976,7 +977,8 @@ mod tests {
         let res = pm.receive_quorum_certificate(qc2).unwrap();
         assert!(res.is_none());
         assert_eq!(pm.current_rank(), 6);
-        // Consumer saw exactly one rank change, one timeout start.
+        // Consumer saw exactly one rank change, two timeout starts
+        // (one from constructor, one from QC).
         assert_eq!(consumer.rank_changes.load(Ordering::SeqCst), 1);
     }
 

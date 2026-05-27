@@ -266,65 +266,70 @@ impl Default for MessageRouter {
 /// key plus a 585-byte BLS48-581 prover key.
 pub fn validator_global_peer_info() -> TopicValidator {
     Arc::new(|data: &[u8]| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
         match quil_p2p::classify_peer_info_message(data) {
             Ok(quil_p2p::PeerInfoMessage::PeerInfo(info)) => {
-                // libp2p peer ids are encoded as 38-byte CIDs; reject
-                // anything that isn't plausibly an identity. Empty
-                // peer-ids would let arbitrary attacker traffic
-                // populate the cache.
                 if info.peer_id.is_empty() {
                     return false;
                 }
-                // Ed448 pubkey + signature are required. The previous
-                // "lenient" behavior accepted PeerInfo with empty
-                // pubkey/signature, which let any peer publish a
-                // PeerInfo claiming any peer_id + any capabilities
-                // (including ARCHIVE_SERVICE_CAPABILITY_ID) without
-                // proving they hold the corresponding private key.
-                // The recv-path then trusted the peer_id claim and
-                // added the attacker's address to the archive pool —
-                // a genesis-archive impersonation vector. Match Go's
-                // `validatePeerInfoSignature` (rejects empty sig or
-                // pubkey at `global_consensus_engine.go:2559`).
                 if info.public_key.len() != 57 {
                     return false;
                 }
                 if info.signature.len() != 114 {
                     return false;
                 }
-                // Cryptographic verification. The signing payload is
-                // the canonical PeerInfo wire encoding with the
-                // signature field cleared (Go encodes with
-                // `p.Signature = nil` then signs the result, then
-                // re-encodes with the signature filled in).
+                // Timestamp validation (mirrors Go message_validation.go:522-548).
+                // Hard-reject if older than 1 minute; ignore stale (>1s) or
+                // far-future (>5min).
+                if info.timestamp < now_ms - 60_000 {
+                    return false;
+                }
+                if info.timestamp < now_ms - 1_000 {
+                    return false;
+                }
+                if info.timestamp > now_ms + 300_000 {
+                    return false;
+                }
                 let signing_payload = quil_p2p::encode_canonical_peer_info(
                     &info,
                     &info.public_key,
                     &[],
                 );
-                let pubkey_arr: [u8; 57] = match info.public_key.as_slice().try_into() {
-                    Ok(a) => a,
+                let pubkey = match ed448_rust::PublicKey::try_from(
+                    info.public_key.as_slice(),
+                ) {
+                    Ok(pk) => pk,
                     Err(_) => return false,
                 };
-                let pubkey = ed448_rust::PublicKey::from(pubkey_arr);
-                // Go uses `domain = []byte{}` (empty context). Ed448
-                // distinguishes None (no context) from Some(&[])
-                // (empty context); Go's empty-byte-slice maps to
-                // Some(&[]).
+                // Go: ValidateSignature(Ed448, pk, msg, sig, []byte{})
+                // which does ed448.Verify(pk, concat(domain, msg), sig, "")
+                // where domain=[] and context="" → pure Ed448, no context.
                 pubkey
-                    .verify(&signing_payload, &info.signature, Some(&[]))
+                    .verify(&signing_payload, &info.signature, None)
                     .is_ok()
             }
             Ok(quil_p2p::PeerInfoMessage::KeyRegistry) => {
-                // Round-trip through the full KeyRegistry decoder so
-                // mid-message corruption is caught (the cheap classify
-                // path only inspects the type prefix).
                 match quil_p2p::decode_canonical_key_registry(data) {
                     Ok(reg) => {
                         if !reg.ed448_pubkey.is_empty() && reg.ed448_pubkey.len() != 57 {
                             return false;
                         }
                         if !reg.bls_pubkey.is_empty() && reg.bls_pubkey.len() != 585 {
+                            return false;
+                        }
+                        // Timestamp validation (mirrors Go message_validation.go:562-577).
+                        let ts = reg.last_updated_ms as i64;
+                        if ts < now_ms - 60_000 {
+                            return false;
+                        }
+                        if ts < now_ms - 1_000 {
+                            return false;
+                        }
+                        if ts > now_ms + 5_000 {
                             return false;
                         }
                         true
