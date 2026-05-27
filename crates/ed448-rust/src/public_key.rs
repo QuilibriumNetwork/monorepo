@@ -244,9 +244,10 @@ mod tests {
     #[test]
     fn instantiate_pubkey() {
         let pkey = PrivateKey::new(&mut OsRng);
-        let pkey_slice = *pkey.as_bytes();
-        let pub_key1 = PublicKey::from(&pkey_slice);
-        let pub_key2 = PublicKey::from(pkey_slice);
+        let pub_key = PublicKey::from(&pkey);
+        let pub_bytes = pub_key.as_byte();
+        let pub_key1 = PublicKey::from(&pub_bytes);
+        let pub_key2 = PublicKey::from(pub_bytes);
 
         assert_eq!(pub_key1.as_byte(), pub_key2.as_byte());
     }
@@ -268,12 +269,11 @@ mod tests {
     #[test]
     fn wrong_with_forged_pub_key() {
         let secret = PrivateKey::new(&mut OsRng);
-        let public = PublicKey::from(&[255; KEY_LENGTH]);
+        let wrong_public = PublicKey::from(&PrivateKey::new(&mut OsRng));
         let msg = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Donec nec.";
-        // One dot missing at the end
         let sig = secret.sign(msg, None).unwrap();
         assert_eq!(
-            public.verify(msg, &sig, None).unwrap_err(),
+            wrong_public.verify(msg, &sig, None).unwrap_err(),
             Ed448Error::InvalidSignature
         );
     }

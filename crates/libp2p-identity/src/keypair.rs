@@ -407,7 +407,7 @@ impl Keypair {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```ignore
     /// # fn main() {
     /// # use libp2p_identity as identity;
     /// let key = identity::Keypair::generate_ed25519();

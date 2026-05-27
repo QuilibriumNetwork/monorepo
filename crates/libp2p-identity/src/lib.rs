@@ -71,6 +71,7 @@ mod peer_id;
     feature = "ecdsa",
     feature = "secp256k1",
     feature = "ed25519",
+    feature = "ed448",
     feature = "rsa"
 ))]
 impl zeroize::Zeroize for proto::PrivateKey {
@@ -83,6 +84,7 @@ impl zeroize::Zeroize for proto::PrivateKey {
     feature = "ecdsa",
     feature = "secp256k1",
     feature = "ed25519",
+    feature = "ed448",
     feature = "rsa"
 ))]
 impl From<&PublicKey> for proto::PublicKey {

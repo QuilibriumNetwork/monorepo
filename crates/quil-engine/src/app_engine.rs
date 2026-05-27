@@ -533,10 +533,9 @@ impl AppConsensusEngine {
         let (msg_tx, msg_rx) = mpsc::channel(CONSENSUS_QUEUE_SIZE);
         let (consensus_event_tx, consensus_event_rx) = mpsc::unbounded_channel();
 
-        // Wire FrameHeader.address AND `get_active_provers` lookup
-        // key: same 32-byte shard filter, matches the allocation's
-        // `confirmation_filter`.
-        let app_address = filter.clone();
+        let app_address = quil_crypto::poseidon::hash_bytes_to_32(&filter)
+            .map(|h| h.to_vec())
+            .unwrap_or_else(|_| filter.clone());
 
         let handle = AppEngineHandle {
             filter: filter.clone(),
@@ -931,7 +930,7 @@ impl AppConsensusEngine {
 
         // Timeout config
         let timeout_cfg = TimeoutConfig::new(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             Duration::from_secs(60),
             1.5,
             3,

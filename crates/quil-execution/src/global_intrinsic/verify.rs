@@ -323,9 +323,9 @@ pub fn verify_prover_join_vdf(
     // 1. Structural validation
     let validation = validate_prover_join_structural(op, current_frame_number)?;
 
-    // 2. Compute challenge from frame output
-    use sha2::Digest;
-    let challenge: [u8; 32] = sha2::Sha256::digest(frame_output).into();
+    // 2. Compute challenge from frame output (Go: sha3.Sum256)
+    use sha3::Digest;
+    let challenge: [u8; 32] = sha3::Sha3_256::digest(frame_output).into();
 
     // 3. Build ID list: for each filter, id = prover_address || filter || index_be
     let mut ids: Vec<Vec<u8>> = Vec::with_capacity(op.filters.len());

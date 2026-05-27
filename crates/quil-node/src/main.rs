@@ -3572,6 +3572,7 @@ async fn run_master_node(
     tokio::spawn(async move {
         let mut frames_received: u64 = 0;
         let mut peer_infos_received: u64 = 0;
+        let mut peer_info_digest_cache: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         let mut archive_peers_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut consensus_msgs_received: u64 = 0;
         let mut prover_msgs_received: u64 = 0;
@@ -3735,8 +3736,23 @@ async fn run_master_node(
                                 match quil_p2p::classify_peer_info_message(&received.data) {
                                     Ok(quil_p2p::PeerInfoMessage::PeerInfo(info)) => {
                                         peer_infos_received += 1;
-                                        // Cache last-seen PeerInfo per peer_id. Bounded
-                                        // implicitly by the peer set size (last-write-wins).
+                                        // Dedup: hash PeerInfo with timestamp zeroed
+                                        // (mirrors Go's hashPeerInfo). Skip if seen.
+                                        let mut dedup_info = info.clone();
+                                        dedup_info.timestamp = 0;
+                                        let dedup_payload = quil_p2p::encode_canonical_peer_info(
+                                            &dedup_info,
+                                            &dedup_info.public_key,
+                                            &dedup_info.signature,
+                                        );
+                                        use sha2::Digest as _;
+                                        let digest: [u8; 32] = sha2::Sha256::digest(&dedup_payload).into();
+                                        if !peer_info_digest_cache.insert(digest) {
+                                            continue;
+                                        }
+                                        if peer_info_digest_cache.len() > 10_000 {
+                                            peer_info_digest_cache.clear();
+                                        }
                                         if !info.peer_id.is_empty() {
                                             let mut cache = pic_for_recv.write();
                                             cache.insert(info.peer_id.clone(), info.clone());
