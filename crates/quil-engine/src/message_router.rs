@@ -565,20 +565,24 @@ mod tests {
         let privkey = ed448_rust::PrivateKey::new(&mut rand::rngs::OsRng);
         let pubkey_bytes = ed448_rust::PublicKey::from(&privkey).as_byte().to_vec();
 
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         let info = quil_p2p::CanonicalPeerInfo {
             peer_id: vec![0xAA; 38],
-            timestamp: 1_700_000_000_000,
+            timestamp: now_ms,
             version: vec![2, 1, 0],
             patch_number: vec![20],
             ..Default::default()
         };
         // Sign the canonical encoding with the signature field cleared,
         // matching what `validator_global_peer_info` reconstructs at
-        // verify-time (see signing_payload above). The validator passes
-        // `Some(&[])` as context, so we must sign with the same.
+        // verify-time. The validator uses pure Ed448 (context=None) to
+        // match Go's `ValidateSignature` with domain=[] context="".
         let signing_payload = quil_p2p::encode_canonical_peer_info(&info, &pubkey_bytes, &[]);
         let sig = privkey
-            .sign(&signing_payload, Some(&[]))
+            .sign(&signing_payload, None)
             .expect("sign must succeed")
             .to_vec();
         let bytes = quil_p2p::encode_canonical_peer_info(&info, &pubkey_bytes, &sig);
