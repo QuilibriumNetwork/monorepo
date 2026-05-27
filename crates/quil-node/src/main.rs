@@ -1675,7 +1675,37 @@ async fn run_master_node(
     // ---------------------------------------------------------------
     // 7. gRPC service
     // ---------------------------------------------------------------
-    {
+    master_node::grpc::spawn_all(master_node::grpc::GrpcArgs {
+        config: config.clone(),
+        network,
+        archive_mode,
+        token: token.clone(),
+        db_arc: db_arc.clone(),
+        clock_store: clock_store.clone(),
+        hg_store: hg_store.clone(),
+        message_collector: message_collector.clone(),
+        current_frame: current_frame.clone(),
+        last_global_head_frame: last_global_head_frame.clone(),
+        prover_address,
+        token_store: token_store.clone(),
+        prover_registry: prover_registry.clone(),
+        prover_pipeline: prover_pipeline.clone(),
+        worker_manager: worker_manager.clone(),
+        inclusion_prover: inclusion_prover.clone(),
+        peer_id,
+        p2p_handle: p2p_handle.clone(),
+        file_key_manager: file_key_manager.clone(),
+        mtls_seed,
+        crdt: crdt.clone(),
+        peer_info_cache: peer_info_cache.clone(),
+        key_store: key_store.clone(),
+        metrics_handle: metrics_handle.clone(),
+        global_msg_tx: global_msg_tx.clone(),
+        archive_pool: archive_pool.clone(),
+    })?;
+
+    #[allow(unreachable_code, dead_code, clippy::diverging_sub_expression)]
+    if false {
         let grpc_addr = if config.listen_grpc_multiaddr.is_empty() {
             "0.0.0.0:8337".to_string()
         } else {

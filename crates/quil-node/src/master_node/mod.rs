@@ -2,6 +2,7 @@ pub(crate) mod allocator_and_lifecycle;
 pub(crate) mod archive_sync;
 pub(crate) mod engines;
 pub(crate) mod frame_pipeline;
+pub(crate) mod grpc;
 pub(crate) mod keys;
 pub(crate) mod message_loop;
 pub(crate) mod networking;
