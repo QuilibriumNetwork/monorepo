@@ -3,9 +3,6 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-// Import KeyManager trait for get_signer_by_id
-use quil_keys::KeyManager as _;
-
 pub(crate) struct GrpcArgs {
     pub config: quil_config::Config,
     pub network: u8,

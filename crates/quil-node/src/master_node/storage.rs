@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 pub(crate) struct StorageHandles {
+    #[allow(dead_code)]
     pub db_path: PathBuf,
     pub db_arc: Arc<quil_store::RocksDb>,
     pub clock_store: Arc<quil_store::RocksClockStore>,
